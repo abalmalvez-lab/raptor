@@ -12,11 +12,14 @@ import pytest
 from core.llm.model_data import (
     ANTHROPIC_CACHE_READ_MULTIPLIER,
     ANTHROPIC_CACHE_WRITE_MULTIPLIER,
+    ANTHROPIC_CACHE_WRITE_5M_MULTIPLIER,
+    ANTHROPIC_CACHE_WRITE_1H_MULTIPLIER,
     MODEL_COSTS,
     MODEL_LIMITS,
     context_window_for,
     max_output_for,
     price_for,
+    rpm_for,
 )
 
 
@@ -78,11 +81,15 @@ def test_price_for_unknown_honours_explicit_default() -> None:
 # --- Anthropic cache multipliers ---------------------------------------
 
 def test_anthropic_cache_multipliers_match_anthropic_docs() -> None:
-    """Cache writes are 1.25x input rate; cache reads are 0.1x.
-    Documented at https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+    """5-min cache writes are 1.25x input; 1-hour writes are 2x;
+    cache reads/refreshes are 0.1x.
+    Ref: platform.claude.com/docs/en/about-claude/pricing#prompt-caching
     """
-    assert ANTHROPIC_CACHE_WRITE_MULTIPLIER == 1.25
+    assert ANTHROPIC_CACHE_WRITE_5M_MULTIPLIER == 1.25
+    assert ANTHROPIC_CACHE_WRITE_1H_MULTIPLIER == 2.0
     assert ANTHROPIC_CACHE_READ_MULTIPLIER == 0.1
+    # Backward-compat alias defaults to 5-minute tier
+    assert ANTHROPIC_CACHE_WRITE_MULTIPLIER == ANTHROPIC_CACHE_WRITE_5M_MULTIPLIER
 
 
 # --- table consistency --------------------------------------------------
@@ -99,3 +106,191 @@ def test_every_priced_model_has_limits() -> None:
         f"models in MODEL_COSTS but not MODEL_LIMITS: {only_in_costs}")
     assert not only_in_limits, (
         f"models in MODEL_LIMITS but not MODEL_COSTS: {only_in_limits}")
+
+
+# ---------------------------------------------------------------------------
+# Bedrock model-id support — limits + price helpers handle Bedrock
+# prefixes without needing per-region duplicate entries.  Future Claude
+# additions only require the bare entry; Bedrock variants pick up
+# automatically.
+# ---------------------------------------------------------------------------
+
+def test_context_window_handles_bedrock_regional_prefix():
+    from core.llm.model_data import context_window_for
+    bare = context_window_for("claude-opus-4-7")
+    assert context_window_for("us.anthropic.claude-opus-4-7") == bare
+    assert context_window_for("eu.anthropic.claude-opus-4-7") == bare
+    assert context_window_for("au.anthropic.claude-opus-4-7") == bare
+    assert context_window_for("apac.anthropic.claude-opus-4-7") == bare
+    assert context_window_for("global.anthropic.claude-opus-4-7") == bare
+
+
+def test_max_output_handles_bedrock_regional_prefix():
+    from core.llm.model_data import max_output_for
+    bare = max_output_for("claude-haiku-4-5")
+    assert max_output_for("us.anthropic.claude-haiku-4-5") == bare
+    assert max_output_for("global.anthropic.claude-haiku-4-5") == bare
+
+
+def test_price_for_global_bedrock_matches_direct_api():
+    """``global.anthropic.<model>`` should price identically to the
+    direct-API form (AWS docs: global CRIS = direct Anthropic pricing)."""
+    from core.llm.model_data import price_for
+    bare = price_for("claude-opus-4-7")
+    assert price_for("global.anthropic.claude-opus-4-7") == bare
+    assert price_for("global.anthropic.claude-sonnet-4-6") \
+        == price_for("claude-sonnet-4-6")
+    assert price_for("global.anthropic.claude-haiku-4-5") \
+        == price_for("claude-haiku-4-5")
+
+
+def test_price_for_regional_bedrock_applies_surcharge():
+    """For models with a known global-CRIS SKU, regional prefix gets
+    the ~10% surcharge per AWS pricing page."""
+    from core.llm.model_data import price_for
+    bare_in, bare_out = price_for("claude-opus-4-7")
+    for prefix in ("us.", "eu.", "au.", "apac."):
+        in_price, out_price = price_for(
+            f"{prefix}anthropic.claude-opus-4-7",
+        )
+        assert abs(in_price - bare_in * 1.10) < 1e-9, (
+            f"{prefix}anthropic.claude-opus-4-7 input price "
+            f"{in_price} != {bare_in} × 1.10"
+        )
+        assert abs(out_price - bare_out * 1.10) < 1e-9
+
+
+def test_price_for_regional_bedrock_no_surcharge_when_geo_only():
+    """For a model NOT on the global-CRIS allowlist, regional prefix
+    is the base — no 1.10× surcharge (per owen10380's nuance: geo-only
+    models have no cheaper global baseline)."""
+    from core.llm.model_data import price_for
+    # claude-opus-4-5 is legacy; no global CRIS SKU verified.
+    bare = price_for("claude-opus-4-5")
+    # Regional with bare-not-in-CRIS-list → 1.0× multiplier
+    assert price_for("us.anthropic.claude-opus-4-5") == bare
+
+
+def test_regional_surcharge_applies_to_dated_ids():
+    """The global-CRIS allowlist holds bare names, so the dated suffix
+    must be normalised before the membership test — a dated regional
+    id otherwise booked at 1.0× (~10% under-booking) while its undated
+    form booked 1.10×."""
+    from core.llm.model_data import (
+        _BEDROCK_REGIONAL_SURCHARGE,
+        _bedrock_cost_multiplier,
+    )
+    assert _bedrock_cost_multiplier(
+        "us.anthropic.claude-opus-4-7-20260115",
+    ) == _BEDROCK_REGIONAL_SURCHARGE
+    # Adjacent behaviour unchanged: undated regional still surcharged,
+    # global-prefixed and non-CRIS models still 1.0× (dated or not).
+    assert _bedrock_cost_multiplier(
+        "us.anthropic.claude-opus-4-7",
+    ) == _BEDROCK_REGIONAL_SURCHARGE
+    assert _bedrock_cost_multiplier(
+        "global.anthropic.claude-opus-4-7-20260115",
+    ) == 1.0
+    assert _bedrock_cost_multiplier(
+        "us.anthropic.claude-opus-4-5-20250415",
+    ) == 1.0
+    assert _bedrock_cost_multiplier("claude-opus-4-7-20260115") == 1.0
+
+
+def test_price_for_unknown_bedrock_model_returns_default():
+    """A Bedrock id whose BARE name isn't in MODEL_COSTS returns the
+    default — no spurious cost tracking from a hallucinated entry."""
+    from core.llm.model_data import price_for
+    assert price_for("us.anthropic.claude-opus-9-9") == (0.0, 0.0)
+    assert price_for(
+        "us.anthropic.claude-opus-9-9", default=(-1.0, -1.0),
+    ) == (-1.0, -1.0)
+
+
+# --- rpm_for ---------------------------------------------------------------
+
+def test_rpm_for_returns_table_value() -> None:
+    """rpm_for() returns the exact rpm from MODEL_LIMITS for every model."""
+    for model, limits in MODEL_LIMITS.items():
+        assert rpm_for(model) == limits["rpm"], (
+            f"rpm_for({model!r}) returned {rpm_for(model)}, "
+            f"expected {limits['rpm']}")
+
+
+def test_rpm_for_unknown_returns_default() -> None:
+    assert rpm_for("does-not-exist") == 0
+
+
+def test_rpm_for_honours_explicit_default() -> None:
+    assert rpm_for("does-not-exist", default=42) == 42
+
+
+def test_rpm_for_handles_bedrock_prefix() -> None:
+    anthropic = next(m for m in MODEL_LIMITS if m.startswith("claude-"))
+    bare = rpm_for(anthropic)
+    assert bare > 0
+    assert rpm_for(f"us.anthropic.{anthropic}") == bare
+    assert rpm_for(f"global.anthropic.{anthropic}") == bare
+
+
+def test_rpm_for_handles_dated_alias() -> None:
+    anthropic = next(m for m in MODEL_LIMITS if m.startswith("claude-"))
+    bare = rpm_for(anthropic)
+    assert rpm_for(f"{anthropic}-20250515") == bare
+
+
+def test_every_model_has_rpm() -> None:
+    """Every entry in MODEL_LIMITS must carry an ``rpm`` key so the
+    parallel executor can derive a safe concurrency cap."""
+    missing = [m for m, v in MODEL_LIMITS.items() if "rpm" not in v]
+    assert not missing, f"MODEL_LIMITS entries missing rpm: {missing}"
+
+
+class TestCanonicalResolvers:
+    def test_limits_resolve_bedrock_forms(self):
+        from core.llm.model_data import MODEL_LIMITS, resolve_model_limits
+        bare = next(iter(MODEL_LIMITS))
+        for form in (bare, f"anthropic.{bare}", f"us.anthropic.{bare}"):
+            got = resolve_model_limits(form)
+            assert got == MODEL_LIMITS[bare], form
+
+    def test_costs_resolve_bedrock_forms_with_multiplier(self):
+        from core.llm.model_data import (
+            MODEL_COSTS,
+            _bedrock_cost_multiplier,
+            resolve_model_costs,
+        )
+        bare = next(iter(MODEL_COSTS))
+        for form in (f"anthropic.{bare}", f"us.anthropic.{bare}"):
+            got = resolve_model_costs(form)
+            mult = _bedrock_cost_multiplier(form)
+            assert got == {k: v * mult for k, v in MODEL_COSTS[bare].items()}, form
+
+    def test_unknown_model_resolves_none(self):
+        from core.llm.model_data import resolve_model_costs, resolve_model_limits
+        assert resolve_model_limits("no-such-model-xyz") is None
+        assert resolve_model_costs("no-such-model-xyz") is None
+
+
+# --- canonical resolution chain adoption ---------------------------------
+
+
+def test_limit_and_price_helpers_resolve_bedrock_dated_ids() -> None:
+    """context_window_for / max_output_for / rpm_for / price_for must
+    resolve through the canonical exact → dated-alias → bedrock-strip
+    chain (_resolve_model_entry). Two independently re-inlined lookup
+    ladders have each caused a production failure ($0 Bedrock cost
+    booking; a 4096-token completion ceiling), so every helper must
+    give the dated Bedrock form the same answer as the bare name."""
+    bare = "claude-opus-4-6"
+    dated_bedrock = "us.anthropic.claude-opus-4-6-20251101"
+    assert context_window_for(dated_bedrock) == context_window_for(bare)
+    assert max_output_for(dated_bedrock) == max_output_for(bare)
+    assert rpm_for(dated_bedrock) == rpm_for(bare)
+    bare_price = price_for(bare)
+    bedrock_price = price_for(dated_bedrock)
+    # Prices match up to the regional-CRIS multiplier the canonical
+    # chain applies for regional Bedrock ids with a global SKU.
+    ratio = bedrock_price[0] / bare_price[0]
+    assert ratio in (1.0, 1.10)
+    assert bedrock_price[1] / bare_price[1] == ratio

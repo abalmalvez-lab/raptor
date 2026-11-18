@@ -1,0 +1,956 @@
+"""Tests for core.inventory.sink_discovery."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from core.inventory.call_graph import CallSite, FileCallGraph
+from core.inventory.sink_discovery import (
+    DANGEROUS_TARGETS,
+    _is_dangerous,
+    _is_language_builtin,
+    discover_sinks,
+)
+
+
+# ── _is_dangerous ───────────────────────────────────────────────────
+
+class TestIsDangerous:
+    def test_full_chain_match(self):
+        assert _is_dangerous(["subprocess", "Popen"]) == "subprocess.Popen"
+
+    def test_qualified_pair_match(self):
+        assert _is_dangerous(["os", "system"]) == "os.system"
+
+    def test_bare_name_match(self):
+        assert _is_dangerous(["popen"]) == "popen"
+
+    def test_c_exec_family(self):
+        assert _is_dangerous(["execve"]) == "execve"
+
+    def test_lua_sinks(self):
+        assert _is_dangerous(["os", "execute"]) == "os.execute"
+        assert _is_dangerous(["io", "popen"]) == "io.popen"
+        assert _is_dangerous(["loadstring"]) == "loadstring"
+        assert _is_dangerous(["dofile"]) == "dofile"
+
+    def test_detection_surface_family(self):
+        # Incident regression: audit/security-event writers were not
+        # sinks, so a function selecting BSM audit masks looked
+        # "sink-unreachable" and a confirmed audit-evasion defect in
+        # it was triage-skipped without any LLM review.
+        assert _is_dangerous(["au_user_mask"]) == "au_user_mask"
+        assert _is_dangerous(["getacna"]) == "getacna"
+        assert _is_dangerous(["syslog"]) == "syslog"
+        assert _is_dangerous(["updwtmp"]) == "updwtmp"
+        assert _is_dangerous(["audit_log_user_message"]) == (
+            "audit_log_user_message"
+        )
+
+    def test_not_dangerous(self):
+        assert _is_dangerous(["print"]) is None
+        assert _is_dangerous(["os", "path", "join"]) is None
+        assert _is_dangerous(["json", "loads"]) is None
+
+    def test_deep_chain_method_not_bare_match(self):
+        """Multi-element chains don't bare-match — self.helper.system() is not C's system()."""
+        assert _is_dangerous(["self", "helper", "system"]) is None
+
+    def test_nixio_exec(self):
+        assert _is_dangerous(["nixio", "exec"]) == "nixio.exec"
+
+
+# ── _is_language_builtin ────────────────────────────────────────────
+
+class TestIsLanguageBuiltin:
+    def test_js_builtins(self):
+        assert _is_language_builtin("Promise.all")
+        assert _is_language_builtin("Array.isArray")
+        assert _is_language_builtin("JSON.parse")
+
+    def test_python_builtins(self):
+        assert _is_language_builtin("os.path.join")
+        assert _is_language_builtin("json.loads")
+
+    def test_lua_builtins(self):
+        assert _is_language_builtin("table.insert")
+        assert _is_language_builtin("string.format")
+
+    def test_not_builtin(self):
+        assert not _is_language_builtin("uci.get")
+        assert not _is_language_builtin("rpc.declare")
+        assert not _is_language_builtin("custom.framework.call")
+
+
+# ── DANGEROUS_TARGETS ───────────────────────────────────────────────
+
+class TestDangerousTargets:
+    def test_includes_source_level_sinks(self):
+        assert "subprocess.Popen" in DANGEROUS_TARGETS
+        assert "os.execute" in DANGEROUS_TARGETS
+        assert "loadstring" in DANGEROUS_TARGETS
+
+    def test_includes_c_exec_funcs(self):
+        # These come from core.function_taxonomy.EXEC_FUNCS
+        assert "execve" in DANGEROUS_TARGETS
+        assert "popen" in DANGEROUS_TARGETS
+
+
+# ── discover_sinks ──────────────────────────────────────────────────
+
+def _make_graph(calls: list[tuple]) -> FileCallGraph:
+    """Build a FileCallGraph from (caller, chain, line) tuples."""
+    return FileCallGraph(
+        imports={},
+        calls=[
+            CallSite(
+                line=line,
+                chain=chain,
+                caller=caller,
+            )
+            for caller, chain, line in calls
+        ],
+        indirection=set(),
+    )
+
+
+class TestDiscoverSinks:
+    def test_direct_sinks_found(self):
+        graphs = {
+            "app.lua": _make_graph([
+                ("handler", ["os", "execute"], 10),
+                ("helper", ["print"], 20),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.direct_sinks) == 1
+        s = result.direct_sinks[0]
+        assert s.file == "app.lua"
+        assert s.function == "handler"
+        assert s.target == "os.execute"
+        assert s.line == 10
+
+    def test_transitive_reachability(self):
+        graphs = {
+            "util.lua": _make_graph([
+                ("exec_cmd", ["os", "execute"], 10),
+                ("run_task", ["exec_cmd"], 20),
+                ("main", ["run_task"], 30),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.direct_sinks) == 1
+        assert len(result.transitive_reach) == 2
+
+        by_func = {t.function: t for t in result.transitive_reach}
+        assert "run_task" in by_func
+        assert by_func["run_task"].distance == 1
+        assert "os.execute" in by_func["run_task"].sinks
+
+        assert "main" in by_func
+        assert by_func["main"].distance == 2
+        assert "os.execute" in by_func["main"].sinks
+
+    def test_max_depth_limits_traversal(self):
+        graphs = {
+            "deep.lua": _make_graph([
+                ("sink", ["os", "execute"], 1),
+                ("d1", ["sink"], 2),
+                ("d2", ["d1"], 3),
+                ("d3", ["d2"], 4),
+            ]),
+        }
+        result = discover_sinks(graphs, max_depth=1)
+        assert len(result.transitive_reach) == 1
+        assert result.transitive_reach[0].function == "d1"
+
+    def test_framework_api_discovery(self):
+        calls = []
+        for i in range(10):
+            calls.append((f"fn_{i}", ["uci", "get"], i * 10))
+        graphs = {
+            f"file_{i}.lua": _make_graph([
+                (f"fn_{i}", ["uci", "get"], i * 10),
+            ])
+            for i in range(10)
+        }
+        result = discover_sinks(graphs, framework_threshold=5, framework_min_files=3)
+        api_names = [f.name for f in result.framework_apis]
+        assert "uci.get" in api_names
+
+    def test_framework_builtin_excluded(self):
+        graphs = {
+            f"file_{i}.py": _make_graph([
+                (f"fn_{i}", ["json", "loads"], i * 10),
+            ])
+            for i in range(10)
+        }
+        result = discover_sinks(graphs, framework_threshold=5, framework_min_files=3)
+        api_names = [f.name for f in result.framework_apis]
+        assert "json.loads" not in api_names
+
+    def test_framework_min_files_filter(self):
+        # All calls in one file — should be filtered out
+        graphs = {
+            "single.lua": _make_graph([
+                (f"fn_{i}", ["custom", "api"], i * 10)
+                for i in range(20)
+            ]),
+        }
+        result = discover_sinks(graphs, framework_threshold=5, framework_min_files=3)
+        api_names = [f.name for f in result.framework_apis]
+        assert "custom.api" not in api_names
+
+    def test_no_dangerous_calls(self):
+        graphs = {
+            "safe.lua": _make_graph([
+                ("fn1", ["print"], 1),
+                ("fn2", ["table", "insert"], 2),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.direct_sinks) == 0
+        assert len(result.transitive_reach) == 0
+
+    def test_multiple_sinks_same_function(self):
+        graphs = {
+            "multi.lua": _make_graph([
+                ("handler", ["os", "execute"], 10),
+                ("handler", ["io", "popen"], 15),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.direct_sinks) == 2
+        targets = {s.target for s in result.direct_sinks}
+        assert "os.execute" in targets
+        assert "io.popen" in targets
+
+    def test_as_dict_shape(self):
+        graphs = {
+            "a.lua": _make_graph([
+                ("sink_caller", ["os", "execute"], 1),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        d = result.as_dict()
+        assert "direct_sinks" in d
+        assert "transitive_reach" in d
+        assert "framework_apis" in d
+        assert "dangerous_target_usage" in d
+        assert d["direct_sinks"][0]["target"] == "os.execute"
+
+    def test_cross_file_edge_resolved(self):
+        """Cross-file calls are linked via function name index."""
+        graphs = {
+            "a.lua": _make_graph([
+                ("caller_a", ["remote_fn"], 1),
+            ]),
+            "b.lua": _make_graph([
+                ("remote_fn", ["os", "execute"], 10),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.direct_sinks) == 1
+        assert len(result.transitive_reach) == 1
+        assert result.transitive_reach[0].function == "caller_a"
+
+
+    def test_diamond_graph_merges_sinks(self):
+        """main -> A -> sink1, main -> B -> sink2: main sees both."""
+        graphs = {
+            "d.lua": _make_graph([
+                ("sink1", ["os", "execute"], 1),
+                ("sink2", ["io", "popen"], 2),
+                ("A", ["sink1"], 3),
+                ("B", ["sink2"], 4),
+                ("main", ["A"], 5),
+                ("main", ["B"], 6),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        by_func = {t.function: t for t in result.transitive_reach}
+        assert "main" in by_func
+        assert set(by_func["main"].sinks) == {"os.execute", "io.popen"}
+
+    def test_cycle_does_not_infinite_loop(self):
+        """A -> B -> A with B calling os.execute: terminates, both reachable."""
+        graphs = {
+            "cyc.lua": _make_graph([
+                ("B", ["os", "execute"], 1),
+                ("A", ["B"], 2),
+                ("B", ["A"], 3),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        by_func = {t.function: t for t in result.transitive_reach}
+        assert "A" in by_func
+        assert "os.execute" in by_func["A"].sinks
+
+    def test_empty_chain_no_crash(self):
+        """CallSite with empty chain should not crash discover_sinks."""
+        graphs = {
+            "e.lua": _make_graph([
+                ("fn", [], 1),
+                ("fn", ["os", "execute"], 2),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.direct_sinks) == 1
+
+    def test_self_eval_not_dangerous(self):
+        """self.eval() should not match — it's a method call, not builtin eval."""
+        assert _is_dangerous(["self", "eval"]) is None
+        assert _is_dangerous(["model", "eval"]) is None
+        assert _is_dangerous(["this", "system"]) is None
+
+    def test_bare_eval_is_dangerous(self):
+        """Bare eval() (single-element chain) should match."""
+        assert _is_dangerous(["eval"]) == "eval"
+        assert _is_dangerous(["popen"]) == "popen"
+
+    def test_non_dir_target_returns_empty(self):
+        """discover_sinks_for_target with non-dir path returns empty result."""
+        from core.inventory.sink_discovery import discover_sinks_for_target
+        result = discover_sinks_for_target(Path("/nonexistent/path"))
+        assert len(result.direct_sinks) == 0
+        assert len(result.transitive_reach) == 0
+
+
+class TestDiscoverSinksForTarget:
+    def test_real_target_lua(self):
+        """Integration test on openwrt-luci (skip if not available)."""
+        target = Path("/data/openwrt-luci")
+        if not target.exists():
+            pytest.skip("openwrt-luci not available")
+
+        from core.inventory.sink_discovery import discover_sinks_for_target
+
+        result = discover_sinks_for_target(target, languages={"lua"})
+        assert len(result.direct_sinks) > 0
+        targets = {s.target for s in result.direct_sinks}
+        assert targets & {"os.execute", "io.popen", "loadstring", "loadfile"}
+
+
+class TestChainReconstruction:
+    def test_linear_chain(self):
+        """main → run_task → exec_cmd → os.execute produces a 2-hop chain."""
+        graphs = {
+            "util.lua": _make_graph([
+                ("exec_cmd", ["os", "execute"], 10),
+                ("run_task", ["exec_cmd"], 20),
+                ("main", ["run_task"], 30),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        by_func = {t.function: t for t in result.transitive_reach}
+
+        main_chain = by_func["main"].chain
+        assert main_chain is not None
+        assert len(main_chain) == 2
+        assert main_chain[0].function == "run_task"
+        assert main_chain[1].function == "exec_cmd"
+
+        run_chain = by_func["run_task"].chain
+        assert run_chain is not None
+        assert len(run_chain) == 1
+        assert run_chain[0].function == "exec_cmd"
+
+    def test_chain_serialization(self):
+        """Chains appear in as_dict() output."""
+        graphs = {
+            "a.lua": _make_graph([
+                ("sink_fn", ["os", "execute"], 1),
+                ("caller", ["sink_fn"], 2),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        d = result.as_dict()
+        tr = d["transitive_reach"]
+        assert len(tr) == 1
+        assert "chain" in tr[0]
+        assert tr[0]["chain"][0]["function"] == "sink_fn"
+
+    def test_cross_file_chain(self):
+        """Chain works across files."""
+        graphs = {
+            "a.lua": _make_graph([
+                ("caller_a", ["remote_fn"], 1),
+            ]),
+            "b.lua": _make_graph([
+                ("remote_fn", ["os", "execute"], 10),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.transitive_reach) == 1
+        chain = result.transitive_reach[0].chain
+        assert chain is not None
+        assert len(chain) == 1
+        assert chain[0].function == "remote_fn"
+        assert chain[0].file == "b.lua"
+
+    def test_no_chain_for_direct_sinks(self):
+        """Direct sink callers don't appear in transitive_reach."""
+        graphs = {
+            "a.lua": _make_graph([
+                ("handler", ["os", "execute"], 10),
+            ]),
+        }
+        result = discover_sinks(graphs)
+        assert len(result.transitive_reach) == 0
+        assert len(result.direct_sinks) == 1
+
+
+class TestDiscoveryWalkBounds:
+    """Symlink refusal + per-file/aggregate byte budgets on the walk."""
+
+    TAINTED = "import os\n\ndef handler(x):\n    os.system(x)\n"
+
+    def test_symlinked_file_not_read(self, tmp_path):
+        from core.inventory.sink_discovery import discover_sinks_for_target
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "evil.py").write_text(self.TAINTED)
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "m.py").symlink_to(outside / "evil.py")
+        result = discover_sinks_for_target(target)
+        assert len(result.direct_sinks) == 0
+
+    def test_oversize_file_skipped_small_still_processed(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.inventory.sink_discovery as sd
+        monkeypatch.setattr(sd, "_PER_FILE_CAP", 256)
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "small.py").write_text(self.TAINTED)
+        (target / "big.py").write_text(
+            self.TAINTED + "# " + "x" * 512 + "\n")
+        result = sd.discover_sinks_for_target(target)
+        files = {s.file for s in result.direct_sinks}
+        assert files == {"small.py"}
+
+    def test_aggregate_budget_stops_walk(self, tmp_path, monkeypatch):
+        import core.inventory.sink_discovery as sd
+        monkeypatch.setattr(sd, "_AGGREGATE_CAP", 4)
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.TAINTED)
+        result = sd.discover_sinks_for_target(target)
+        assert len(result.direct_sinks) == 0
+
+    def test_within_budget_unchanged(self, tmp_path):
+        from core.inventory.sink_discovery import discover_sinks_for_target
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "m.py").write_text(self.TAINTED)
+        result = discover_sinks_for_target(target)
+        assert {s.target for s in result.direct_sinks} == {"os.system"}
+
+    def test_iter_source_files_skips_symlinked_files(self, tmp_path):
+        from core.inventory.sink_discovery import _iter_source_files
+        (tmp_path / "real.py").write_text("x = 1\n")
+        (tmp_path / "link.py").symlink_to(tmp_path / "real.py")
+        names = {p.name for p in _iter_source_files(tmp_path)}
+        assert names == {"real.py"}
+
+
+class TestFullDictRoundTrip:
+    """to_full_dict/from_full_dict must be lossless — the audit prep
+    cache reloads the discovery result from it on resumed segments."""
+
+    def _result(self):
+        from core.inventory.sink_discovery import (
+            ChainHop,
+            FrameworkAPI,
+            SinkDiscoveryResult,
+            SinkInfo,
+            TransitiveReach,
+            UnreachableVerdict,
+        )
+        return SinkDiscoveryResult(
+            direct_sinks=[
+                SinkInfo(file="a.py", function="run", line=3,
+                         target="os.system"),
+                SinkInfo(file="b.py", function="wrap", line=9,
+                         target="wrapper of: os.system", direct=False),
+            ],
+            transitive_reach=[
+                TransitiveReach(
+                    file="a.py", function="entry", distance=2,
+                    sinks=["os.system"],
+                    chain=[
+                        ChainHop(file="a.py", function="mid"),
+                        ChainHop(file="a.py", function="run"),
+                    ],
+                ),
+                TransitiveReach(
+                    file="c.py", function="lone", distance=1,
+                    sinks=["eval"], chain=[],
+                ),
+            ],
+            framework_apis=[
+                FrameworkAPI(name="app.route", caller_count=7,
+                             files=["a.py", "b.py"]),
+            ],
+            dangerous_target_counts={"os.system": 1},
+            unreachable_eligible={
+                ("d.py", "idle"): UnreachableVerdict(
+                    file="d.py", function="idle", eligible=True,
+                    reason="no transitive reach, no indirection",
+                ),
+                ("e.py", "cb"): UnreachableVerdict(
+                    file="e.py", function="cb", eligible=False,
+                    reason="indirection flags: ['fn_pointer']",
+                ),
+            },
+        )
+
+    def test_round_trip_is_lossless(self):
+        import json as _json
+
+        from core.inventory.sink_discovery import SinkDiscoveryResult
+        orig = self._result()
+        # Through JSON, as the prep cache stores it.
+        blob = _json.loads(_json.dumps(orig.to_full_dict()))
+        back = SinkDiscoveryResult.from_full_dict(blob)
+        assert back.to_full_dict() == orig.to_full_dict()
+        # The lossy fields as_dict drops survive the full round trip.
+        assert [s.direct for s in back.direct_sinks] == [True, False]
+        assert back.unreachable_eligible is not None
+        assert back.unreachable_eligible[("d.py", "idle")].eligible
+        assert not back.unreachable_eligible[("e.py", "cb")].eligible
+        # The operator/context-map shape is identical too.
+        assert back.as_dict() == orig.as_dict()
+
+    def test_round_trip_none_unreachable(self):
+        from core.inventory.sink_discovery import SinkDiscoveryResult
+        orig = SinkDiscoveryResult([], [], [], {})
+        back = SinkDiscoveryResult.from_full_dict(orig.to_full_dict())
+        assert back.unreachable_eligible is None
+        assert back.to_full_dict() == orig.to_full_dict()
+
+
+class TestIterDiscoverySourceFiles:
+    def test_yields_the_walk_input_set(self, tmp_path):
+        from core.inventory.sink_discovery import (
+            iter_discovery_source_files,
+        )
+        (tmp_path / "a.py").write_text("import os\nos.system('x')\n")
+        (tmp_path / "notes.txt").write_text("not source\n")
+        rels = [rel for _p, rel, _l in
+                iter_discovery_source_files(tmp_path)]
+        assert rels == ["a.py"]
+
+    def test_respects_scope_dirs(self, tmp_path):
+        from core.inventory.sink_discovery import (
+            iter_discovery_source_files,
+        )
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "in.py").write_text("x = 1\n")
+        (tmp_path / "out.py").write_text("y = 2\n")
+        rels = [rel for _p, rel, _l in iter_discovery_source_files(
+            tmp_path, scope_dirs=[str(tmp_path / "src")],
+        )]
+        assert rels == [str(Path("src") / "in.py")]
+
+    def test_respects_aggregate_budget(self, tmp_path, monkeypatch):
+        import core.inventory.sink_discovery as sd
+        (tmp_path / "a.py").write_text("x = 1\n")
+        (tmp_path / "b.py").write_text("y = 2\n")
+        monkeypatch.setattr(sd, "_AGGREGATE_CAP", 7)
+        rels = [rel for _p, rel, _l in
+                sd.iter_discovery_source_files(tmp_path)]
+        assert len(rels) == 1
+
+    def test_stats_admission_identical_to_break_path(
+        self, tmp_path, monkeypatch,
+    ):
+        """The fingerprint (no stats) and discovery (stats) paths must
+        admit the SAME file set under truncation — otherwise the prep
+        cache serves extractions for a different input set."""
+        import core.inventory.sink_discovery as sd
+        for name in ("a.py", "b.py", "c.py"):
+            (tmp_path / name).write_text("x = 1\n")
+        size = (tmp_path / "a.py").stat().st_size
+        # Budget fits exactly one file; the second permanently closes
+        # admission even though a same-size file would still "fit"
+        # nothing (and even a smaller one must not sneak in).
+        monkeypatch.setattr(sd, "_AGGREGATE_CAP", size)
+        plain = [rel for _p, rel, _l in
+                 sd.iter_discovery_source_files(tmp_path)]
+        stats: dict = {}
+        counted = [rel for _p, rel, _l in
+                   sd.iter_discovery_source_files(tmp_path, stats=stats)]
+        assert counted == plain
+        assert len(counted) == 1
+        assert stats["truncated"] is True
+        assert stats["admitted_files"] == 1
+        assert stats["admitted_bytes"] == size
+        assert stats["skipped_files"] == 2
+        assert stats["skipped_bytes"] == 2 * size
+        assert stats["budget_bytes"] == size
+
+    def test_stats_no_truncation_below_budget(self, tmp_path):
+        from core.inventory.sink_discovery import (
+            iter_discovery_source_files,
+        )
+        (tmp_path / "a.py").write_text("x = 1\n")
+        stats: dict = {}
+        rels = [rel for _p, rel, _l in
+                iter_discovery_source_files(tmp_path, stats=stats)]
+        assert rels == ["a.py"]
+        assert stats["truncated"] is False
+        assert stats["admitted_files"] == 1
+        assert stats["skipped_files"] == 0
+        assert stats["skipped_bytes"] == 0
+
+
+class TestDiscoveryTruncationMarker:
+    """Two directions of the aggregate byte budget's honest-incomplete
+    marker: below budget nothing changes; at/over budget the result
+    carries a structured truncation record, the marker rides both
+    serialisations, and no eligible=True verdict survives (a truncated
+    call graph must never mint sink-unreachable claims)."""
+
+    TAINTED = "import os\n\ndef handler(x):\n    os.system(x)\n"
+    LONELY = "def lonely():\n    print('x')\n"
+
+    def test_below_budget_no_marker_eligible_survives(self, tmp_path):
+        from core.inventory.sink_discovery import (
+            discover_sinks_for_target,
+        )
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.LONELY)
+        result = discover_sinks_for_target(target)
+        assert result.truncation is None
+        assert "truncation" not in result.as_dict()
+        assert result.unreachable_eligible is not None
+        assert result.unreachable_eligible[("b.py", "lonely")].eligible
+
+    def test_truncation_marker_and_fail_closed_verdicts(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.inventory.sink_discovery as sd
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.LONELY)
+        (target / "c.py").write_text(self.TAINTED)
+        # Fits the first walked file only.
+        sizes = sorted(
+            p.stat().st_size for p in target.iterdir()
+        )
+        monkeypatch.setattr(sd, "_AGGREGATE_CAP", max(sizes))
+        result = sd.discover_sinks_for_target(target)
+
+        assert result.truncation is not None
+        assert result.truncation["reason"] == "aggregate_byte_budget"
+        assert result.truncation["skipped_files"] >= 1
+        assert result.truncation["skipped_bytes"] > 0
+        assert result.truncation["admitted_files"] >= 1
+        # The marker is in-band in BOTH serialisations.
+        assert result.as_dict()["truncation"] == result.truncation
+        assert result.to_full_dict()["truncation"] == result.truncation
+        # Fail-closed: no eligible=True verdict survives truncation.
+        assert result.unreachable_eligible is not None
+        for verdict in result.unreachable_eligible.values():
+            assert verdict.eligible is False
+
+    def test_truncation_round_trips_the_prep_cache_shape(
+        self, tmp_path, monkeypatch,
+    ):
+        import json as _json
+
+        import core.inventory.sink_discovery as sd
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.TAINTED)
+        monkeypatch.setattr(
+            sd, "_AGGREGATE_CAP",
+            (target / "a.py").stat().st_size,
+        )
+        orig = sd.discover_sinks_for_target(target)
+        assert orig.truncation is not None
+        blob = _json.loads(_json.dumps(orig.to_full_dict()))
+        back = sd.SinkDiscoveryResult.from_full_dict(blob)
+        assert back.truncation == orig.truncation
+        assert back.to_full_dict() == orig.to_full_dict()
+
+    def test_untruncated_full_dict_round_trip_has_no_marker(self):
+        from core.inventory.sink_discovery import SinkDiscoveryResult
+        orig = SinkDiscoveryResult([], [], [], {})
+        back = SinkDiscoveryResult.from_full_dict(orig.to_full_dict())
+        assert back.truncation is None
+
+
+# ── discovery summary log ───────────────────────────────────────────
+
+class TestDiscoverySummaryLog:
+    """The unreachable-verdict summary must partition one pool with
+    explicit units: verdicts are per (file, function), and eligible +
+    indirection-blocked always sum to the pool size."""
+
+    def test_log_counts_partition_the_verdict_pool(self, caplog) -> None:
+        import logging
+
+        graphs = {
+            "app.lua": _make_graph([
+                ("handler", ["os", "execute"], 10),
+                ("lonely", ["print"], 20),
+            ]),
+            "cb.c": FileCallGraph(
+                imports={},
+                calls=[CallSite(line=5, chain=["helper"],
+                                caller="cb_user")],
+                indirection={"fn_pointer"},
+            ),
+        }
+        with caplog.at_level(
+            logging.INFO, logger="core.inventory.sink_discovery",
+        ):
+            result = discover_sinks(graphs)
+
+        record = next(
+            r for r in caplog.records
+            if r.msg.startswith("sink_discovery:")
+        )
+        message = record.getMessage()
+        assert "functions have no sink path" in message
+        assert "eligible for sink_unreachable scope-narrowing" in message
+        assert "blocked by indirection" in message
+
+        # args: direct, transitive, framework, pool, eligible, blocked
+        _d, _t, _f, pool, eligible, blocked = record.args
+        assert pool == eligible + blocked
+        assert pool == len(result.unreachable_eligible)
+        assert eligible == sum(
+            1 for v in result.unreachable_eligible.values() if v.eligible
+        )
+        # Fixture ground truth: lonely is eligible, cb_user is blocked.
+        assert result.unreachable_eligible[("app.lua", "lonely")].eligible
+        assert not result.unreachable_eligible[("cb.c", "cb_user")].eligible
+
+
+class TestJvmMobileLanguagesEnumerated:
+    """scala/kotlin/swift walkers exist and are builder-wired; the
+    discovery walk must not silently skip their files (zero sinks and
+    reach for those languages in /understand --map and audit review
+    selection)."""
+
+    @staticmethod
+    def _target(tmp_path):
+        (tmp_path / "A.kt").write_text(
+            'fun run(cmd: String) { ProcessBuilder(cmd).start() }\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "B.scala").write_text(
+            'object B { def go(c: String): Unit = '
+            '{ Runtime.getRuntime().exec(c) } }\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "C.swift").write_text(
+            'func launch() {\n    let p = Process()\n    p.launch()\n}\n',
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_discovery_walk_yields_jvm_mobile_files(self, tmp_path):
+        from core.inventory.sink_discovery import iter_discovery_source_files
+
+        target = self._target(tmp_path)
+        langs = {lang for _, _, lang in iter_discovery_source_files(target)}
+        assert {"kotlin", "scala", "swift"} <= langs
+
+    def test_kotlin_process_builder_is_a_direct_sink(self, tmp_path):
+        # The Kotlin walker is tree-sitter-only (no regex fallback):
+        # without the runtime + grammar wheel the file degrades to an
+        # empty call graph and contributes zero sinks by design. Skip
+        # on bare installs (CI's fast tier has no tree-sitter).
+        pytest.importorskip("tree_sitter")
+        pytest.importorskip("tree_sitter_kotlin")
+        from core.inventory.sink_discovery import discover_sinks_for_target
+
+        target = self._target(tmp_path)
+        result = discover_sinks_for_target(target, languages={"kotlin"})
+        assert any(
+            s.target == "ProcessBuilder" for s in result.direct_sinks
+        ), "kotlin file contributed no sinks"
+
+
+class TestCallGraphWiringClosure:
+    """The builder's call-graph dispatch and sink discovery's extractor
+    map are two hand-maintained enumerations over the SAME producer
+    registry (core.inventory.call_graph's extract_call_graph_*
+    walkers). A walker wired in one but not the other regrows the
+    defect this closure exists to pin: files of a whole language get
+    call graphs in the inventory but contribute zero sinks/reach to
+    discovery (or vice versa). Enumerate the real producers
+    mechanically and assert both consumers cover every one."""
+
+    @staticmethod
+    def _producers() -> set[str]:
+        import core.inventory.call_graph as cg
+
+        producers = {
+            name for name in dir(cg)
+            if name.startswith("extract_call_graph_")
+            and callable(getattr(cg, name))
+        }
+        assert len(producers) >= 14, "producer enumeration broke"
+        return producers
+
+    def test_discovery_extractors_cover_every_producer(self):
+        from functools import partial
+
+        from core.inventory.sink_discovery import (
+            _get_call_graph_extractors,
+        )
+
+        wired = set()
+        for fn in _get_call_graph_extractors().values():
+            target = fn.func if isinstance(fn, partial) else fn
+            wired.add(target.__name__)
+        missing = self._producers() - wired
+        assert not missing, (
+            f"call-graph producers not wired into sink discovery: "
+            f"{sorted(missing)} — their languages contribute zero "
+            f"sinks/reach"
+        )
+
+    def test_builder_dispatch_covers_every_producer(self):
+        from pathlib import Path
+
+        import core.inventory.builder as builder_mod
+
+        source = Path(builder_mod.__file__).read_text(encoding="utf-8")
+        missing = {
+            name for name in self._producers()
+            if f"{name}(" not in source
+        }
+        assert not missing, (
+            f"call-graph producers not invoked by the builder "
+            f"dispatch: {sorted(missing)} — their languages get empty "
+            f"call_graph records"
+        )
+
+
+# ── fn-pointer-field defense keyed on language, not suffix ──────────
+
+class TestIndirectFieldCallLanguageKey:
+    """A .h header routes to the C grammar and gets a C call graph;
+    the fn-pointer-field guard filtered on the .c suffix, so identical
+    ctx->cb(...) code earned sink_unreachable scope-narrowing in a
+    header but was blocked in a .c file — the exact triage-skip the
+    guard was landed to close, one file-extension outside it."""
+
+    @staticmethod
+    def _cb_graph():
+        return FileCallGraph(calls=[
+            CallSite(caller="run_cb", chain=["o", "cb"], line=2),
+        ])
+
+    def test_header_field_call_blocked_like_c_file(self):
+        res = discover_sinks({
+            "lib/helper.h": self._cb_graph(),
+            "lib/helper.c": self._cb_graph(),
+        })
+        for key in (("lib/helper.h", "run_cb"), ("lib/helper.c", "run_cb")):
+            v = res.unreachable_eligible[key]
+            assert not v.eligible
+            assert "function-pointer field" in v.reason
+
+    def test_resolved_language_map_wins_over_suffix(self):
+        # A header content-refined to cpp keeps the documented C++
+        # member-call decline (a.b() is an ordinary method call).
+        res = discover_sinks(
+            {"lib/helper.h": self._cb_graph()},
+            file_languages={"lib/helper.h": "cpp"},
+        )
+        v = res.unreachable_eligible[("lib/helper.h", "run_cb")]
+        assert v.eligible
+
+    def test_c_language_map_blocks(self):
+        res = discover_sinks(
+            {"lib/helper.h": self._cb_graph()},
+            file_languages={"lib/helper.h": "c"},
+        )
+        v = res.unreachable_eligible[("lib/helper.h", "run_cb")]
+        assert not v.eligible
+
+    def test_python_method_chain_still_eligible(self):
+        res = discover_sinks({"pkg/mod.py": FileCallGraph(calls=[
+            CallSite(caller="wrapper", chain=["self", "helper"], line=3),
+        ])})
+        v = res.unreachable_eligible[("pkg/mod.py", "wrapper")]
+        assert v.eligible
+
+
+class TestPerFileCapDisclosure:
+    """Two-direction pin on the per-file byte cap: an under-cap tree
+    walks whole with no warning; an over-cap file is skipped WITH a
+    loud once-per-walk disclosure naming the count and an example —
+    previously a silent skip, so an amalgamation-shaped file (sinks
+    and all) vanished from the context map with no trace. The
+    fingerprint consumer (budget_warning=False) stays silent by
+    design."""
+
+    TAINTED = "import os\n\ndef handler(x):\n    os.system(x)\n"
+
+    def test_under_cap_no_warning(self, tmp_path, caplog):
+        import logging
+
+        import core.inventory.sink_discovery as sd
+        (tmp_path / "a.py").write_text(self.TAINTED)
+        with caplog.at_level(
+            logging.WARNING, logger="core.inventory.sink_discovery",
+        ):
+            rels = [rel for _p, rel, _l in
+                    sd.iter_discovery_source_files(
+                        tmp_path, budget_warning=True)]
+        assert rels == ["a.py"]
+        assert "per-file byte cap" not in caplog.text
+
+    def test_over_cap_skip_warns_once_with_example(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        import logging
+
+        import core.inventory.sink_discovery as sd
+        monkeypatch.setattr(sd, "_PER_FILE_CAP", 64)
+        (tmp_path / "small.py").write_text(self.TAINTED)
+        (tmp_path / "big1.py").write_text("# " + "x" * 128 + "\n")
+        (tmp_path / "big2.py").write_text("# " + "y" * 128 + "\n")
+        with caplog.at_level(
+            logging.WARNING, logger="core.inventory.sink_discovery",
+        ):
+            rels = [rel for _p, rel, _l in
+                    sd.iter_discovery_source_files(
+                        tmp_path, budget_warning=True)]
+        assert rels == ["small.py"]
+        hits = [r for r in caplog.records
+                if "per-file byte cap" in r.getMessage()]
+        assert len(hits) == 1, "one disclosure per walk, not per file"
+        msg = hits[0].getMessage()
+        assert "2 file(s)" in msg
+        assert "big" in msg
+
+    def test_fingerprint_consumer_stays_silent(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        import logging
+
+        import core.inventory.sink_discovery as sd
+        monkeypatch.setattr(sd, "_PER_FILE_CAP", 64)
+        (tmp_path / "big.py").write_text("# " + "x" * 128 + "\n")
+        with caplog.at_level(
+            logging.WARNING, logger="core.inventory.sink_discovery",
+        ):
+            list(sd.iter_discovery_source_files(tmp_path))
+        assert "per-file byte cap" not in caplog.text

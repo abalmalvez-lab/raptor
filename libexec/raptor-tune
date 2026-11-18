@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Show or update RAPTOR resource tuning.
 
 Usage:
@@ -7,12 +9,12 @@ Usage:
   raptor-tune balanced       Rewrite tuning.json with conservative values
   raptor-tune default        Rewrite tuning.json to shipped defaults
 """
-import json
-import os
 import sys
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -21,12 +23,19 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
 
-from core.json import load_json_with_comments
-from core.tuning import load_tuning, _DEFAULTS, _detect_available_cpus
+from core.json import load_json_with_comments  # noqa: E402
+from core.tuning import (  # noqa: E402
+    _DEFAULTS,
+    _detect_available_cpus,
+    _rewrite_tuning,
+    load_tuning,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TUNING_PATH = _REPO_ROOT / "tuning.json"
@@ -53,10 +62,13 @@ def _max_values() -> dict:
     return {
         "codeql_ram_mb": codeql_ram_mb,
         "codeql_threads": cpus,
+        "joern_heap_mb": max(1024, ram // 2) if ram else 8192,
         "max_semgrep_workers": max(2, cpus),
         "max_codeql_workers": max(1, min(cpus // 2, 8, codeql_worker_ram_cap)),
-        "max_agentic_parallel": max(2, cpus),
         "max_fuzz_parallel": max(1, cpus // 2),
+        # "use all available resources" extends to the LLM account:
+        # max asserts the account's quota belongs to this host's runs.
+        "llm_account_posture": "solo",
     }
 
 
@@ -68,15 +80,24 @@ def _balanced_values() -> dict:
     return {
         "codeql_ram_mb": max(2048, min(ram // 8, 8192)) if ram else 4096,
         "codeql_threads": max(1, cpus // 2),
+        "joern_heap_mb": max(1024, min(ram // 8, 8192)) if ram else 2048,
         "max_semgrep_workers": max(1, cpus // 4),
         "max_codeql_workers": 1,
-        "max_agentic_parallel": 2,
         "max_fuzz_parallel": 1,
+        "llm_account_posture": "shared",
     }
 
 
 def _default_values() -> dict:
-    return dict(_DEFAULTS)
+    out = dict(_DEFAULTS)
+    # Profiles OWN the posture (each profile IS a sharing stance:
+    # balanced/default leave headroom, max claims everything), so a
+    # retune resets a hand-edited posture rather than preserving it
+    # like the operator-only passthrough keys. The preserved
+    # max_llm_workers override still beats posture at read time, so
+    # an operator's explicit worker count survives any retune.
+    out["llm_account_posture"] = "shared"
+    return out
 
 
 def _with_defaults(producer):
@@ -109,38 +130,22 @@ _PROFILES = {
     "default": (_default_values, "shipped defaults"),
 }
 
-_COMMENTS = {
-    "codeql_ram_mb": "MB of RAM for CodeQL analysis",
-    "codeql_threads": "CPUs for CodeQL (0 = all available)",
-    "max_semgrep_workers": "parallel Semgrep scans (auto = half available CPUs)",
-    "max_codeql_workers": "parallel CodeQL DB builds (auto = half available CPUs, capped)",
-    "max_agentic_parallel": "parallel Claude Code agents for analysis",
-    "max_fuzz_parallel": "ceiling for AFL++ parallel instances (auto = half available CPUs)",
-}
-
-_KEY_ORDER = [
-    "codeql_ram_mb",
-    "codeql_threads",
-    "max_semgrep_workers",
-    "max_codeql_workers",
-    "max_agentic_parallel",
-    "max_fuzz_parallel",
-]
-
-
 def _write_tuning(values: dict) -> None:
-    """Write tuning.json with inline aligned comments."""
-    entries = []
-    for i, key in enumerate(_KEY_ORDER):
-        val_str = json.dumps(values[key])
-        comma = "," if i < len(_KEY_ORDER) - 1 else ""
-        entries.append((f'  "{key}": {val_str}{comma}', _COMMENTS[key]))
-    col = max(len(e) for e, _ in entries) + 2
-    lines = ["{"]
-    for entry, comment in entries:
-        lines.append(f"{entry:<{col}}// {comment}")
-    lines.append("}")
-    _TUNING_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    """Rewrite tuning.json for a preset via core.tuning's canonical writer.
+
+    Layer the preset values over the CURRENT file contents so valid
+    operator-set keys the presets don't produce (the passthrough keys
+    such as max_llm_workers / throttle_cooldown_s) survive the rewrite
+    — a retune must not silently delete unrelated operator config.
+    Delegating to core.tuning's writer also gets its key order,
+    comments, and atomic tmp+rename for free, so this CLI can never
+    drift from the substrate's own rewrite behaviour or leave a torn
+    file for a concurrent load_tuning() to read.
+    """
+    existing = load_json_with_comments(_TUNING_PATH)
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(values)
+    _rewrite_tuning(merged, _TUNING_PATH)
 
 
 def _show() -> None:
@@ -155,12 +160,21 @@ def _show() -> None:
     print()
 
     fields = [
+        ("codeql_enabled", t.codeql_enabled, ""),
         ("codeql_ram_mb", t.codeql_ram_mb, "MB"),
         ("codeql_threads", t.codeql_threads, "CPUs"),
+        ("codeql_max_disk_cache_mb", t.codeql_max_disk_cache_mb, "MB"),
+        ("joern_enabled", t.joern_enabled, ""),
+        ("joern_heap_mb", t.joern_heap_mb, "MB"),
+        ("joern_heap_ceiling_mb", t.joern_heap_ceiling_mb, "MB"),
+        ("joern_cpg_timeout_s", t.joern_cpg_timeout_s, "s"),
+        ("joern_import_timeout_s", t.joern_import_timeout_s, "s"),
+        ("joern_query_timeout_s", t.joern_query_timeout_s, "s"),
         ("max_semgrep_workers", t.max_semgrep_workers, ""),
         ("max_codeql_workers", t.max_codeql_workers, ""),
-        ("max_agentic_parallel", t.max_agentic_parallel, ""),
         ("max_fuzz_parallel", t.max_fuzz_parallel, ""),
+        ("max_inventory_workers", t.max_inventory_workers, ""),
+        ("max_json_memo_mb", t.max_json_memo_mb, "MB"),
     ]
     for name, value, unit in fields:
         raw_val = raw.get(name, _DEFAULTS.get(name))
@@ -168,10 +182,29 @@ def _show() -> None:
             shown = value
             if name == "codeql_threads" and value == 0:
                 shown = f"all {info['cpus']}" if info["cpus"] else "all"
+            if name == "joern_cpg_timeout_s" and value == 0:
+                # The auto sentinel: the number is derived from the
+                # in-scope source size at CPG-build time, not here.
+                shown, unit = "derived at build time", ""
+            if name == "joern_import_timeout_s" and value == 0:
+                # The auto sentinel: derived from the serialized CPG
+                # size at import time, not here.
+                shown, unit = "derived at import time", ""
             display = f"auto ({shown}{' ' + unit if unit else ''})"
         else:
             display = f"{value}{' ' + unit if unit else ''}"
         print(f"  {name:25s} {display}")
+
+    # Passthrough keys are consumed raw by core/llm/concurrency.py —
+    # show the file values (or their documented defaults) so the
+    # operator can see what a profile set without opening the file.
+    passthrough = [
+        ("max_llm_workers", raw.get("max_llm_workers", "auto"), ""),
+        ("llm_account_posture", raw.get("llm_account_posture", "shared"), ""),
+        ("throttle_cooldown_s", raw.get("throttle_cooldown_s", 30), "s"),
+    ]
+    for name, value, unit in passthrough:
+        print(f"  {name:25s} {value}{' ' + unit if unit else ''}")
 
 
 def main() -> int:
@@ -197,7 +230,12 @@ def main() -> int:
     print(f"tuning.json updated: {description}")
     print()
 
-    for key in _KEY_ORDER:
+    # _DEFAULTS iterates in its declaration order — the same order the
+    # canonical writer emits (profile-set extra keys such as
+    # llm_account_posture follow, matching the writer's key order).
+    echo_keys = list(_DEFAULTS) + [
+        k for k in values if k not in _DEFAULTS]
+    for key in echo_keys:
         val = values[key]
         print(f"  {key:25s} {val}")
 

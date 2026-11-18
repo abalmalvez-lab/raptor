@@ -1,0 +1,191 @@
+"""import_runtime: external gcov/lcov/coverage.py coverage → store (Phase 4)."""
+
+from __future__ import annotations
+
+import json
+
+from core.coverage.importer import import_runtime
+from core.coverage.store import CoverageStore
+from core.coverage.store_summary import store_view
+
+
+def _store(tmp_path):
+    return CoverageStore(tmp_path / "coverage.json", target="zip:x")
+
+
+_C_CHECKLIST = {"files": [
+    {"path": "src/foo.c", "lines": 10, "items": [
+        {"name": "main", "kind": "function", "line_start": 1, "line_end": 6}]},
+]}
+
+
+def test_gcov_marks_runtime_coverage(tmp_path):
+    s = _store(tmp_path)
+    s.import_inventory_meta(_C_CHECKLIST)
+    gdir = tmp_path / "gcov"
+    gdir.mkdir()
+    (gdir / "foo.c.gcov").write_text(
+        "        -:    0:Source:src/foo.c\n"
+        "        5:    1:int main(void){\n"
+        "        5:    2:  return 0;\n"
+        "    #####:    3:  dead();\n")
+    n = import_runtime(s, gdir, _C_CHECKLIST)
+    assert n >= 1
+    assert s.who_checked("src/foo.c", 1) == ["gcov"]
+    assert s.who_checked("src/foo.c", 3) == []                 # never-executed
+    # Runtime category lights up; the function reads as runtime-covered.
+    assert s.function_covered("src/foo.c", 1, 6, category="runtime") is True
+    view = store_view(s, _C_CHECKLIST)
+    assert view["functions_by_category"]["runtime"] == 1
+
+
+def test_gcov_abs_path_normalised_to_inventory(tmp_path):
+    s = _store(tmp_path)
+    s.import_inventory_meta(_C_CHECKLIST)
+    g = tmp_path / "foo.c.gcov"
+    g.write_text(
+        "        -:    0:Source:/abs/build/src/foo.c\n"   # absolute build path
+        "        9:    1:int main(void){\n")
+    import_runtime(s, g, _C_CHECKLIST)
+    assert s.who_checked("src/foo.c", 1) == ["gcov"]           # matched to inventory
+
+
+def test_coverage_py_marks_runtime(tmp_path):
+    checklist = {"files": [{"path": "pkg/mod.py", "lines": 8, "items": [
+        {"name": "f", "kind": "function", "line_start": 1, "line_end": 4}]}]}
+    s = _store(tmp_path)
+    s.import_inventory_meta(checklist)
+    cov = tmp_path / "coverage.json"
+    cov.write_text(json.dumps({"files": {
+        "pkg/mod.py": {"executed_lines": [1, 2, 3]}}}))
+    n = import_runtime(s, cov, checklist)
+    assert n >= 1
+    assert s.who_checked("pkg/mod.py", 2) == ["coverage.py"]
+    assert s.function_covered("pkg/mod.py", 1, 4, category="runtime") is True
+
+
+def test_lcov_info_marks_runtime(tmp_path):
+    s = _store(tmp_path)
+    s.import_inventory_meta(_C_CHECKLIST)
+    info = tmp_path / "cov.info"
+    info.write_text("SF:src/foo.c\nDA:1,4\nDA:2,0\nend_of_record\n")
+    import_runtime(s, info, _C_CHECKLIST)
+    assert s.who_checked("src/foo.c", 1) == ["lcov"]
+    assert s.who_checked("src/foo.c", 2) == []                 # DA count 0
+
+
+def test_runtime_marks_coalesce_into_runs(tmp_path):
+    # Contiguous executed lines mark as one interval, not one per line.
+    s = _store(tmp_path)
+    s.import_inventory_meta(_C_CHECKLIST)
+    info = tmp_path / "cov.info"
+    info.write_text("SF:src/foo.c\n" + "".join(
+        f"DA:{i},1\n" for i in range(1, 7)) + "end_of_record\n")
+    n = import_runtime(s, info, _C_CHECKLIST)
+    assert n == 1                                              # 1..6 -> one run
+    assert s.covered_lines("src/foo.c") == [[1, 6]]
+
+
+def test_import_runtime_unknown_format_noop(tmp_path):
+    s = _store(tmp_path)
+    assert import_runtime(s, tmp_path / "nope.txt", _C_CHECKLIST) == 0
+
+
+def test_import_runtime_skips_non_inventory_files(tmp_path):
+    # Source paths that don't resolve to an inventory file are skipped — the
+    # store stays inventory-anchored (no system-header / non-target pollution).
+    s = _store(tmp_path)
+    s.import_inventory_meta(_C_CHECKLIST)              # only src/foo.c
+    g = tmp_path / "sys.h.gcov"
+    g.write_text("        -:    0:Source:/usr/include/sys.h\n"
+                 "        3:    1:x\n")
+    assert import_runtime(s, g, _C_CHECKLIST) == 0
+    assert "/usr/include/sys.h" not in s.files()      # non-inventory file not added
+    assert s.who_checked("src/foo.c", 1) == []        # nothing mis-attributed
+
+
+def test_fuzz_record_reaches_store_as_runtime(tmp_path):
+    """coverage-fuzz.json (post tool-field fix) imports like any per-tool
+    record: reached functions land as function-precise runtime marks."""
+    import json
+
+    from core.coverage.importer import import_run_dir
+    from core.coverage.store import CoverageStore
+
+    run = tmp_path / "fuzz-1"
+    run.mkdir()
+    (run / "coverage-fuzz.json").write_text(json.dumps({
+        "tool": "fuzz",
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "files_examined": ["a.c"],
+        "functions_analysed": [{"file": "a.c", "function": "f1"}],
+        "files": {"a.c": {"functions": {"f1": {"reached": True}}}},
+    }))
+    checklist = {"files": [{"path": "a.c", "lines": 30, "items": [
+        {"name": "f1", "line_start": 1, "line_end": 10},
+        {"name": "f2", "line_start": 12, "line_end": 20},
+    ]}]}
+    store = CoverageStore(tmp_path / "coverage.json")
+    import_run_dir(store, run, checklist)
+    assert "fuzz" in store.who_checked("a.c", 5)
+    # runtime category, runtime-tested depth — never counts as LLM review
+    from core.coverage.registry import classify
+    assert classify("fuzz") == ("runtime", "runtime-tested")
+
+
+def test_system_header_not_mapped_onto_target_file_by_basename(tmp_path):
+    """A gcov section for /usr/include/zlib.h must NOT flip the
+    target's src/zlib.h runtime-covered just because the basename is
+    unique in the inventory — the basename fallback is for relative
+    paths; absolute out-of-tree paths only match via a component-
+    aligned suffix (which /usr/include/... never satisfies)."""
+    from core.coverage.importer import mark_runtime
+
+    checklist = {"files": [
+        {"path": "src/zlib.h", "lines": 20, "items": [
+            {"name": "inflate", "kind": "function",
+             "line_start": 10, "line_end": 12}]},
+    ]}
+    s = _store(tmp_path)
+    s.import_inventory_meta(checklist)
+    n = mark_runtime(
+        s, {"/usr/include/zlib.h": [10, 11, 12]}, checklist, "gcov")
+    assert n == 0
+    assert s.who_checked("src/zlib.h", 10) == []
+    assert s.function_covered("src/zlib.h", 10, 12) is False
+
+
+def test_in_tree_absolute_path_still_matches_by_suffix(tmp_path):
+    """Equality direction: absolute paths INTO the tree keep matching
+    (component-aligned suffix), so real gcov output is unaffected."""
+    from core.coverage.importer import mark_runtime
+
+    checklist = {"files": [
+        {"path": "src/zlib.h", "lines": 20, "items": [
+            {"name": "inflate", "kind": "function",
+             "line_start": 10, "line_end": 12}]},
+    ]}
+    s = _store(tmp_path)
+    s.import_inventory_meta(checklist)
+    n = mark_runtime(
+        s, {"/home/user/proj/src/zlib.h": [10, 11]}, checklist, "gcov")
+    assert n == 1
+    assert s.who_checked("src/zlib.h", 10) == ["gcov"]
+
+
+def test_gcov_multi_source_sections_attributed_per_file(tmp_path):
+    """One .gcov artifact can carry MULTIPLE Source: sections; each
+    section's executed lines must go to ITS file, not all to the last
+    one (which both overstated the last file's coverage and dropped
+    the first file's)."""
+    from core.coverage.parsers.gcov import parse_gcov
+
+    g = tmp_path / "combined.gcov"
+    g.write_text(
+        "        -:    0:Source:first.c\n"
+        "        7:   10:covered();\n"
+        "        -:    0:Source:second.c\n"
+        "    #####:   10:never();\n"
+        "        3:   20:covered();\n")
+    out = parse_gcov(g)
+    assert out == {"first.c": {10}, "second.c": {20}}

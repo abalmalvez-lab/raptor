@@ -1,0 +1,540 @@
+"""Hash-addressed persistence for :class:`~core.witness.types.Witness`
+records and their underlying bytes.
+
+Storage layout under the configured root directory::
+
+    {root}/
+        manifests/
+            <sha256>.json           # Witness.to_dict() per hash (latest)
+            <sha256>.history.jsonl  # superseded manifests for that hash
+        blobs/
+            <sha256>.bin            # raw bytes (de-duplicated by hash)
+
+Same bytes seen by multiple pipelines collapse to a single blob —
+the hash key naturally de-duplicates. Manifests are keyed by the
+same hash, so a replayed identical byte-sequence is last-writer-wins
+on ``<sha256>.json``; the superseded record's provenance is appended
+to ``<sha256>.history.jsonl`` rather than erased.
+
+The store is process-local: no concurrent-writer locking. Each
+pipeline run gets its own ``{out_dir}/witnesses/`` root, so
+concurrent runs on the same host don't collide. Within a single
+run, callers are expected to be sequential — same as the existing
+finding-record producers in the project.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import stat as _stat_mod
+from pathlib import Path
+
+from core.atomic_fs import write_bytes_atomically, write_text_atomically
+from core.json import append_jsonl, load_json
+from core.source.streams import owned_fd, preserving_stream_error
+from core.witness.provenance import (
+    PROVENANCE_KEY as _PROVENANCE_TOKEN_KEY,
+)
+from core.witness.provenance import (
+    stamp_witness_manifest,
+    verify_witness_manifest,
+)
+from core.witness.types import Witness, compute_bytes_hash
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+logger = logging.getLogger(__name__)
+
+
+class WitnessStoreError(Exception):
+    """Raised when a store operation fails in a way the caller
+    needs to surface (bad hash, missing blob, etc.). Distinct
+    exception type so callers can catch witness-store errors
+    specifically without swallowing arbitrary OSErrors."""
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# Byte budget for a single witness manifest — small JSON documents.
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+
+# Byte budget for a single witness blob. Witness bytes are crash
+# inputs, PoC stdin/stdout captures, and symbolic-execution results
+# (whose own transport ceiling is 64 MiB) — real blobs measure
+# kilobytes to low megabytes. Stores live in run output trees a
+# disk-staging attacker can pre-populate, and cross-run discovery
+# walks SIBLING runs' stores, so an unbudgeted read hands memory
+# control to any prior run's directory. Enforced symmetrically: put
+# refuses to persist what get_bytes would refuse to return. Trade-off,
+# both directions: lower starts refusing plausible large captures
+# (fuzz artifacts near the symex ceiling); higher stops bounding the
+# consumer's memory in any useful way (the fail direction is an
+# OOM-killed consumer, not a wrong verdict).
+_MAX_BLOB_BYTES = 64 * 1024 * 1024
+
+
+def _valid_hash_key(bytes_hash: str) -> bool:
+    """Whether *bytes_hash* is a plain SHA-256 hex digest.
+
+    The hash is interpolated into on-disk paths
+    (``manifests/<hash>.json`` / ``blobs/<hash>.bin``) — anything but
+    hex digits could traverse outside the store root (``../``), so
+    the shape is validated BEFORE any filesystem use.
+    """
+    return (
+        isinstance(bytes_hash, str)
+        and len(bytes_hash) == 64
+        and all(c in _HEX_DIGITS for c in bytes_hash)
+    )
+
+
+class WitnessStore:
+    """Read/write Witness records + their bytes, hash-addressed.
+
+    Construct with a root directory; the store creates the manifest
+    and blob sub-directories on demand. ``root`` is typically
+    ``{run_out_dir}/witnesses/`` so each pipeline run's witnesses
+    cluster together.
+
+    Operations:
+
+    * :meth:`put` — store bytes + an associated Witness; idempotent
+      on (hash, source, observed_outcome, produced_by) — putting a
+      duplicate is a no-op for the blob and overwrites the manifest
+      with the most recent record (timestamps cumulate via the
+      index).
+    * :meth:`get_bytes` — load the raw bytes for a hash.
+    * :meth:`get_witness` — load a Witness record by hash.
+    * :meth:`list_witnesses` — iterate every Witness in the store.
+    * :meth:`has` — quick existence check.
+
+    Failures (missing file, malformed JSON) raise
+    :class:`WitnessStoreError`. The store does *not* swallow errors
+    silently — a caller that gets a Witness back can rely on its
+    manifest having parsed cleanly.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self._manifests_dir = self.root / "manifests"
+        self._blobs_dir = self.root / "blobs"
+
+    def _ensure_dirs(self) -> None:
+        """Create the manifest + blob directories if absent.
+
+        Called lazily on the first write rather than eagerly in
+        ``__init__`` so constructing a store object for a path
+        that doesn't yet exist (e.g. dry-runs / planning) doesn't
+        side-effect the filesystem.
+        """
+        self._manifests_dir.mkdir(parents=True, exist_ok=True)
+        self._blobs_dir.mkdir(parents=True, exist_ok=True)
+
+    def put(self, witness: Witness, data: bytes) -> Path:
+        """Persist ``witness`` and ``data``. Returns the blob path.
+
+        Validates four invariants before touching disk:
+
+        1. ``witness.bytes_hash == sha256(data)`` — catches the
+           producer bug of hashing a transformed copy of the bytes.
+        2. If ``witness.bytes_len`` is set (non-zero), it matches
+           ``len(data)``. If left at default ``0``, the store
+           stamps it from the actual length.
+        3. ``witness.outcome_detail`` is JSON-serialisable.
+           Pre-check catches non-serialisable values
+           (:class:`pathlib.Path`, :class:`datetime`, ``bytes``,
+           etc.) with a clear ``WitnessStoreError`` *before* the
+           blob is written, so a serialisation failure can't leave
+           an orphan blob.
+
+        Blob writes are idempotent — if the same hash is put again,
+        the existing blob is reused (no rewrite). Both blob and
+        manifest writes are atomic via the temp-file + rename
+        pattern; a process killed mid-write leaves the on-disk
+        state at "before the put started", never a partial /
+        corrupt artefact.
+        """
+        # Budget symmetry with get_bytes: never persist a blob the
+        # reader would refuse to return (evidence written but
+        # permanently unreadable — the same persisted-but-unreadable
+        # trap the allow_nan pre-check below closes for manifests).
+        if len(data) > _MAX_BLOB_BYTES:
+            msg = (
+                f"witness blob is {len(data)} bytes — exceeds the "
+                f"{_MAX_BLOB_BYTES}-byte blob budget get_bytes "
+                f"enforces; truncate or summarise the capture at the "
+                f"producer"
+            )
+            raise WitnessStoreError(msg)
+
+        expected = compute_bytes_hash(data)
+        if expected != witness.bytes_hash:
+            msg = (
+                f"witness.bytes_hash {witness.bytes_hash[:16]!r}... "
+                f"does not match sha256(data) {expected[:16]!r}...; "
+                "fix the producer to use compute_bytes_hash on the "
+                "actual bytes being stored"
+            )
+            raise WitnessStoreError(msg)
+
+        # Enforce bytes_len agreement when caller set it. Pre-fix
+        # the store accepted (and persisted) a caller-supplied
+        # bytes_len that disagreed with len(data) — silent corruption
+        # of the manifest, which downstream consumers trust.
+        if witness.bytes_len and witness.bytes_len != len(data):
+            msg = (
+                f"witness.bytes_len ({witness.bytes_len}) does not "
+                f"match len(data) ({len(data)}); pass bytes_len=0 to "
+                f"let the store stamp it, or fix the producer"
+            )
+            raise WitnessStoreError(msg)
+        if witness.bytes_len == 0 and data:
+            witness.bytes_len = len(data)
+
+        # Pre-serialise the manifest so non-JSON-safe values in
+        # ``outcome_detail`` fail loudly here, not after we've
+        # already written the blob. Common offenders:
+        # :class:`pathlib.Path`, :class:`datetime`, ``bytes``,
+        # custom classes — and non-finite floats (``allow_nan=False``:
+        # the default would happily WRITE ``NaN``, which the strict
+        # loader in :meth:`get_witness` then rejects forever —
+        # evidence persisted but permanently unreadable). The fix at
+        # the call site is to stringify / sanitise.
+        manifest_dict = witness.to_dict()
+        # Witness-provenance stamp: manifests live inside run output
+        # trees a disk-staging attacker can pre-populate, and their
+        # projections feed threat-status flips via collect_outcomes.
+        # Consumers that grant mechanical weight verify this content
+        # MAC on read; no usable key → unstamped (records demote to
+        # evidence-only weight downstream, never an error here).
+        stamp_witness_manifest(manifest_dict)
+        try:
+            manifest_text = (
+                json.dumps(manifest_dict, indent=2, allow_nan=False) + "\n"
+            )
+        except (TypeError, ValueError) as exc:
+            msg = (
+                f"witness manifest is not JSON-serialisable "
+                f"({type(exc).__name__}: {exc}); convert any "
+                f"Path / datetime / bytes / custom-class / non-finite "
+                f"float values in outcome_detail to strings before "
+                f"constructing the Witness"
+            )
+            raise WitnessStoreError(msg) from exc
+
+        self._ensure_dirs()
+
+        blob_path = self._blobs_dir / f"{witness.bytes_hash}.bin"
+        manifest_path = self._manifests_dir / f"{witness.bytes_hash}.json"
+
+        # Atomic blob write: witness blob is the durable per-scan
+        # artefact; a torn write would leave a partial blob that
+        # dedup would trust as canonical for that hash. The shared
+        # primitive's PID+TID+random tempfile suffix keeps
+        # concurrent same-hash puts from racing on one tempfile
+        # (previously N callers raised FileNotFoundError on the
+        # second os.replace; end state was still correct via
+        # dedup-by-hash, but the exceptions surfaced up).
+        if not blob_path.exists():
+            write_bytes_atomically(blob_path, data, tmp_prefix=".blob-")
+
+        # Same-hash manifests are last-writer-wins, but the SUPERSEDED
+        # record's provenance (source / outcome / produced_by) must
+        # not be erased: replaying identical bytes from a different
+        # pipeline used to silently destroy e.g. the fuzzer's
+        # sanitizer-report provenance for that hash. Preserve the
+        # prior record by appending it to a per-hash history trail
+        # before the overwrite. Best-effort: a malformed prior
+        # manifest (nothing trustworthy to preserve) or a failed
+        # append is logged, never blocks the put.
+        if manifest_path.is_file():
+            prior = load_json(manifest_path, max_bytes=_MAX_MANIFEST_BYTES)
+            # Timestamp-insensitive compare: a pure refresh (same
+            # provenance, new clock reading) is an idempotent
+            # overwrite, not a supersession worth a history row. The
+            # provenance token is excluded for the same reason — it is
+            # derived from the content (timestamp included), so a pure
+            # refresh re-mints a different token without any
+            # provenance-worthy change underneath.
+            _volatile = ("timestamp", _PROVENANCE_TOKEN_KEY)
+            if isinstance(prior, dict) and (
+                {k: v for k, v in prior.items() if k not in _volatile}
+                != {k: v for k, v in manifest_dict.items()
+                    if k not in _volatile}
+            ):
+                history_path = (
+                    self._manifests_dir / f"{witness.bytes_hash}.history.jsonl"
+                )
+                try:
+                    append_jsonl(history_path, prior, compact=True)
+                except (OSError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        "WitnessStore.put: could not preserve superseded "
+                        "manifest for %s: %s",
+                        witness.bytes_hash[:16], exc,
+                    )
+
+        # Atomic manifest write. Same reasoning: a torn manifest
+        # left get_witness raising forever with no recovery path
+        # other than manual cleanup.
+        write_text_atomically(
+            manifest_path, manifest_text, tmp_prefix=".manifest-",
+        )
+
+        logger.debug(
+            "WitnessStore.put: hash=%s len=%d source=%s outcome=%s",
+            witness.bytes_hash[:16],
+            witness.bytes_len,
+            witness.source.value,
+            witness.observed_outcome.value,
+        )
+
+        return blob_path
+
+    def has(self, bytes_hash: str) -> bool:
+        """True iff a manifest with ``bytes_hash`` exists in the store."""
+        if not _valid_hash_key(bytes_hash):
+            return False
+        return (self._manifests_dir / f"{bytes_hash}.json").is_file()
+
+    def get_bytes(self, bytes_hash: str) -> bytes:
+        """Load the raw bytes for ``bytes_hash``, VERIFIED.
+
+        Raises :class:`WitnessStoreError` if the hash key is not a
+        plain SHA-256 hex digest (it becomes an on-disk path), if the
+        blob is missing, not a regular file, or over the
+        ``_MAX_BLOB_BYTES`` budget (refused BEFORE buffering — the
+        blast radius of a planted oversize blob is a refusal, not an
+        OOM-killed consumer), or if the loaded bytes do not hash to
+        ``bytes_hash`` — the store is hash-addressed, so content that
+        fails its own address is a planted/corrupt blob, not evidence.
+        """
+        if not _valid_hash_key(bytes_hash):
+            raise WitnessStoreError(
+                f"invalid bytes_hash {str(bytes_hash)[:32]!r}: expected "
+                f"a 64-char SHA-256 hex digest"
+            )
+        blob_path = self._blobs_dir / f"{bytes_hash}.bin"
+        # Gated read on the OPEN fd: manifests are budgeted in this
+        # same file, and blobs face the same disk-staging attacker
+        # (stores in prior runs' output trees reach every consumer
+        # via cross-run discovery). Pre-fix the whole blob was
+        # buffered BEFORE the hash check, so a planted multi-GB blob
+        # (sparse plants cost the attacker no disk) OOM-killed the
+        # consumer instead of being refused — integrity was covered,
+        # memory was not. fstat the fd actually read (a by-name check
+        # can be swapped), refuse non-regular files without blocking
+        # (O_NONBLOCK: a planted FIFO must not hang the consumer),
+        # refuse over-budget sizes before reading a byte, and
+        # re-check after a capped read so growth during the read is
+        # refused too.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        adopted = False
+
+        def close_blob(value: int) -> None:
+            try:
+                os.close(value)
+            except OSError as exc:
+                if adopted:
+                    msg = f"cannot read blob at {blob_path}: {exc}"
+                    raise WitnessStoreError(msg) from exc
+
+        try:
+            fd = os.open(str(blob_path), flags)
+        except FileNotFoundError:
+            msg = (
+                f"blob not found for hash {bytes_hash[:16]!r}... "
+                f"(expected at {blob_path})"
+            )
+            raise WitnessStoreError(msg) from None
+        except OSError as exc:
+            msg = f"cannot open blob at {blob_path}: {exc}"
+            raise WitnessStoreError(msg) from exc
+        with owned_fd(fd, close_fd=close_blob):
+            st = os.fstat(fd)
+            if not _stat_mod.S_ISREG(st.st_mode):
+                msg = f"blob at {blob_path} is not a regular file"
+                raise WitnessStoreError(msg)
+            if st.st_size > _MAX_BLOB_BYTES:
+                msg = (
+                    f"blob at {blob_path} is {st.st_size} bytes — "
+                    f"exceeds the {_MAX_BLOB_BYTES}-byte blob budget; "
+                    f"refusing to buffer it (planted or corrupt blob)"
+                )
+                raise WitnessStoreError(msg)
+            try:
+                stream = os.fdopen(fd, "rb", closefd=False)
+                adopted = True
+                with preserving_stream_error(stream) as fh:
+                    data = fh.read(_MAX_BLOB_BYTES + 1)
+            except OSError as exc:
+                msg = f"cannot read blob at {blob_path}: {exc}"
+                raise WitnessStoreError(msg) from exc
+        if len(data) > _MAX_BLOB_BYTES:
+            msg = (
+                f"blob at {blob_path} grew past the "
+                f"{_MAX_BLOB_BYTES}-byte blob budget during read"
+            )
+            raise WitnessStoreError(msg)
+        actual = compute_bytes_hash(data)
+        if actual.lower() != bytes_hash.lower():
+            raise WitnessStoreError(
+                f"blob at {blob_path} does not match its address: "
+                f"expected {bytes_hash[:16]!r}..., content hashes to "
+                f"{actual[:16]!r}... — corrupt or planted blob"
+            )
+        return data
+
+    def get_witness(self, bytes_hash: str) -> Witness:
+        """Load the Witness record for ``bytes_hash``.
+
+        Raises :class:`WitnessStoreError` if the hash key is invalid,
+        the manifest is missing or malformed, or the manifest's own
+        ``bytes_hash`` disagrees with the address it was loaded from
+        (a planted manifest claiming someone else's hash).
+        """
+        if not _valid_hash_key(bytes_hash):
+            raise WitnessStoreError(
+                f"invalid bytes_hash {str(bytes_hash)[:32]!r}: expected "
+                f"a 64-char SHA-256 hex digest"
+            )
+        manifest_path = self._manifests_dir / f"{bytes_hash}.json"
+        if not manifest_path.is_file():
+            msg = (
+                f"manifest not found for hash {bytes_hash[:16]!r}... "
+                f"(expected at {manifest_path})"
+            )
+            raise WitnessStoreError(msg)
+        try:
+            data = load_json(
+                manifest_path, strict=True,
+                max_bytes=_MAX_MANIFEST_BYTES,
+            )
+            if data is None:
+                # strict load_json still returns None (no raise) for a
+                # missing file — the is_file check above can race a
+                # concurrent delete; keep the WitnessStoreError
+                # contract instead of crashing in from_dict.
+                msg = (
+                    f"manifest at {manifest_path} vanished during read"
+                )
+                raise WitnessStoreError(msg)
+            if not isinstance(data, dict):
+                # A JSON array/string/number parses fine under strict
+                # load_json but from_dict would raise AttributeError —
+                # outside the WitnessStoreError contract.
+                msg = (
+                    f"manifest at {manifest_path} is not a JSON object "
+                    f"(got {type(data).__name__})"
+                )
+                raise WitnessStoreError(msg)
+            witness = Witness.from_dict(data)
+        except json.JSONDecodeError as exc:
+            msg = f"manifest at {manifest_path} is malformed JSON: {exc}"
+            raise WitnessStoreError(msg) from exc
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            # TypeError / AttributeError: field values with the wrong
+            # shape inside an otherwise-object manifest (e.g. a string
+            # where from_dict expects a dict) — same contract as any
+            # other invalid structure.
+            msg = f"manifest at {manifest_path} has invalid structure: {exc}"
+            raise WitnessStoreError(msg) from exc
+        if witness.bytes_hash.lower() != bytes_hash.lower():
+            raise WitnessStoreError(
+                f"manifest at {manifest_path} claims bytes_hash "
+                f"{witness.bytes_hash[:16]!r}... — inconsistent with "
+                f"its address; refusing the record"
+            )
+        # Mechanical-provenance annotation (never a refusal): consumers
+        # that grant provenance weight — threat-status flips via
+        # collect_outcomes — read this; everyone else keeps the record
+        # at evidence weight regardless.
+        witness.provenance_verified = verify_witness_manifest(data)
+        return witness
+
+    def list_witnesses(self) -> Iterator[Witness]:
+        """Iterate every Witness in the store.
+
+        Skips manifests that fail to parse AND manifests whose
+        filename is not a valid hash address or disagrees with the
+        record's own ``bytes_hash`` (logs at WARNING) — enumeration
+        must not launder planted records that a direct
+        :meth:`get_witness` would refuse. Use :meth:`get_witness` for
+        a specific hash if strict-load semantics are needed.
+        """
+        if not self._manifests_dir.is_dir():
+            return
+        for manifest in sorted(self._manifests_dir.glob("*.json")):
+            if not _valid_hash_key(manifest.stem):
+                logger.warning(
+                    "WitnessStore: skipping manifest with non-hash "
+                    "name %s", manifest,
+                )
+                continue
+            try:
+                data = load_json(
+                    manifest, strict=True,
+                    max_bytes=_MAX_MANIFEST_BYTES,
+                )
+                if data is None:
+                    # Missing-file race (glob → delete → load):
+                    # strict load_json returns None instead of
+                    # raising; skip like any other unreadable row.
+                    logger.warning(
+                        "WitnessStore: skipping vanished manifest %s",
+                        manifest,
+                    )
+                    continue
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "WitnessStore: skipping non-object manifest %s",
+                        manifest,
+                    )
+                    continue
+                witness = Witness.from_dict(data)
+            except (json.JSONDecodeError, KeyError, ValueError,
+                    TypeError, AttributeError, OSError) as exc:
+                # AttributeError: wrong-shaped field values inside an
+                # object manifest — must skip the row, not abort the
+                # whole enumeration and drop every later valid witness.
+                logger.warning(
+                    "WitnessStore: skipping malformed manifest %s: %s",
+                    manifest, exc,
+                )
+                continue
+            if witness.bytes_hash.lower() != manifest.stem.lower():
+                logger.warning(
+                    "WitnessStore: skipping manifest %s claiming "
+                    "bytes_hash %s (inconsistent with its address)",
+                    manifest, witness.bytes_hash[:16],
+                )
+                continue
+            # Same annotation as get_witness: unverified records still
+            # enumerate (evidence weight), they just carry no
+            # mechanical provenance.
+            witness.provenance_verified = verify_witness_manifest(data)
+            yield witness
+
+    def blob_path(self, bytes_hash: str) -> Path | None:
+        """Return the path to the raw bytes blob, or ``None`` if
+        the store doesn't have one for this hash.
+
+        Useful when a consumer wants to pass the bytes to a tool
+        that takes a filename (gcc, gdb, etc.) rather than reading
+        them into memory. NOTE: this path is returned unverified;
+        callers that act on the CONTENT should use :meth:`get_bytes`
+        (which verifies the hash) or recompute it themselves.
+        """
+        if not _valid_hash_key(bytes_hash):
+            return None
+        path = self._blobs_dir / f"{bytes_hash}.bin"
+        return path if path.is_file() else None

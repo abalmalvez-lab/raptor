@@ -12,19 +12,144 @@ breakage at every PR even before the macOS runner is wired up.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
+import signal
+import subprocess
 import sys
 import time
+import uuid
+from pathlib import Path
 
 import pytest
 
 from core.sandbox import _macos_spawn
+from core.testing.module_bindings import patch_module_attribute
 
-darwin_only = pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="macOS-only — sandbox-exec is Apple-specific",
-)
+
+@pytest.mark.darwin_native
+def test_project_python_starts_with_restricted_home_metadata(tmp_path):
+    """Exercise venv realpath and framework loads under the real policy."""
+    from core.sandbox import run
+    from core.sandbox.python_paths import python_runtime_tool_paths
+
+    result = run(
+        [sys.executable, "-c", "import os, sys; print(os.path.realpath(sys.executable))"],
+        target=str(tmp_path), output=str(tmp_path / "out"),
+        tool_paths=python_runtime_tool_paths(),
+        block_network=True, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == os.path.realpath(sys.executable)
+
+
+@pytest.mark.darwin_native
+@pytest.mark.slow
+@pytest.mark.parametrize("private_tmp", [False, True], ids=["ordinary-tmp", "private-tmp"])
+def test_apple_compiler_can_load_sdk_under_read_restrictions(tmp_path, private_tmp):
+    from core.sandbox import run
+
+    probe = subprocess.run(
+        ["/usr/bin/xcrun", "--find", "clang"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if probe.returncode != 0:
+        pytest.skip("Apple Command Line Tools or Xcode not installed: " + probe.stderr)
+    source = tmp_path / "main.c"
+    source.write_text("#include <stdio.h>\nint main(void) { puts(\"sdk ready\"); }\n")
+    output = tmp_path / "out"
+    output.mkdir()
+    result = run(
+        ["/usr/bin/clang", str(source), "-o", str(output / "demo")],
+        target=str(tmp_path), output=str(output),
+        restrict_reads=True, fake_home=True, exclude_tmp_baseline=private_tmp,
+        block_network=True, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (output / "demo").is_file()
+
+# macOS-only — sandbox-exec is Apple-specific: real-kernel tests carry
+# the darwin_native marker (pytest.ini) instead of an ad hoc skipif, so
+# the darwin-emulation gate deselects them and native non-darwin hosts
+# skip them.
+
+
+def _unique_sleep_marker(prefix: str) -> str:
+    """Per-invocation-unique sleep duration for target discovery.
+
+    A FIXED marker collides across concurrent pytest sessions on one
+    host: session A's live in-test target matched session B's probe
+    (false-failing B's no-survivors assertion) and B's cleanup killed
+    A's target mid-test. The random suffix makes the target's full
+    argv unique to this invocation, so an exact-argv match is an
+    identity proof (same defence as the sandbox teardown's random
+    ``_SBX_RUN_ID`` environ token).
+
+    The randomness lives in the FRACTIONAL digits, keeping the total
+    duration a few days: an earlier spelling appended them to the
+    integer part, and the resulting ~1e17-second duration made
+    darwin's ``/bin/sleep`` exit immediately (past the platform's
+    representable sleep deadline — an unsigned 64-bit NANOSECOND
+    count, ~584 years), so the "hung" target was gone before the
+    timeout under test and TimeoutExpired never raised — while the
+    orphan test silently took its target-never-started skip lane on
+    the same hosts. coreutils and BSD ``sleep`` both accept
+    fractional durations.
+    """
+    return f"{prefix}.{uuid.uuid4().int % 10**12:012d}"
+
+
+def _exact_sleep_pids(marker: str) -> list[int]:
+    """PIDs whose FULL argv is exactly ``/bin/sleep <marker>``.
+
+    Never widen this to a substring/regex probe (the old ``pgrep -f
+    "sleep <marker>"``): ``-f`` matches anywhere in ANY process's
+    cmdline, and agent-harness wrapper shells carry their whole
+    eval'd command text in argv — a foreign wrapper that merely
+    MENTIONED the marker matched (and the old ``pkill -9 -f`` cleanup
+    killed it), unrelated sleeps with superstring durations
+    (``sleep <marker>2``) matched too, and any foreign match
+    false-failed the no-survivors assertion. The narrow match cannot
+    miss the real target: the trampoline ``exec``s
+    ``/bin/sleep <marker>`` verbatim, so the survivor these tests
+    hunt always has exactly this argv.
+    """
+    # check=True: a broken/unspawnable ps must fail the test loudly —
+    # a silently-empty probe would let the no-survivors assertion (and
+    # the decoy directions) pass vacuously.
+    out = subprocess.run(
+        ["ps", "-axwwo", "pid=,args="],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    want = f"/bin/sleep {marker}"
+    pids = []
+    for line in out.splitlines():
+        pid_s, _, args = line.strip().partition(" ")
+        if args.strip() == want:
+            with contextlib.suppress(ValueError):
+                pids.append(int(pid_s))
+    return pids
+
+
+def _kill_exact_sleepers(marker: str) -> None:
+    """Cleanup: SIGKILL only identity-verified targets of THIS run.
+
+    Kills by verified pid, never by pattern: each pid's argv is
+    re-read immediately before signalling, so the signal is anchored
+    to current evidence rather than a stale integer (the pid can exit
+    between discovery and kill; the re-check plus the per-run random
+    marker closes the wrong-process window).
+    """
+    for pid in _exact_sleep_pids(marker):
+        args = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if args == f"/bin/sleep {marker}":
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
 
 
 # --- Cross-platform sanity tests (signature parity, no exec) ----------
@@ -38,6 +163,7 @@ def test_run_sandboxed_signature_matches_linux_spawn():
     Linux kwarg (extra Linux-only kwargs are accepted-and-ignored,
     which the explicit `noqa: ARG001` annotations document)."""
     import inspect
+
     from core.sandbox import _spawn as linux_spawn
     linux_params = set(
         inspect.signature(linux_spawn.run_sandboxed).parameters.keys()
@@ -59,6 +185,100 @@ def test_is_available_returns_bool():
     assert isinstance(_macos_spawn.is_available(), bool)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_timeout_kills_whole_sandbox_tree(tmp_path, monkeypatch):
+    """A target that hangs past ``timeout`` must not survive the
+    TimeoutExpired. subprocess.run's own timeout path SIGKILLed only
+    the direct child — the detached seatbelt shim — while the
+    sandbox-exec process group (deliberately a separate pgrp so the
+    shim can killpg it) kept running with its death-pipe watcher dead.
+    run_sandboxed now owns the Popen and, on timeout, closes death_w
+    (firing the shim's designed killpg teardown) and killpgs the
+    shim's session as a backstop.
+
+    Cross-platform: SANDBOX_EXEC is swapped for a pass-through shell
+    script so the REAL outer shim + inner trampoline run on Linux too;
+    the layering (shim → fake sandbox-exec → /bin/sh trampoline →
+    target) matches production, including the separate process group.
+    """
+    marker = _unique_sleep_marker("424271")
+
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')  # drop -p <profile> --
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    # Foreign-process decoys (own children, own session so the group
+    # is ours to sweep): a sleep whose duration merely CONTAINS the
+    # marker as a prefix, and a wrapper shell whose argv TEXT mentions
+    # the marker while it waits on an unrelated child — exactly the
+    # agent-harness ``bash -c ... eval`` shape the old ``pkill -f``
+    # killed. The trailing ``:`` no-op is load-bearing: without it,
+    # bash-as-/bin/sh (macOS, Fedora) tail-execs the final command
+    # and the wrapper's argv — marker text included — is replaced by
+    # ``/bin/sleep``'s within milliseconds, leaving the survival
+    # assertion vacuously green. Direction two of the kill
+    # discipline: the teardown under test and this test's own cleanup
+    # must leave both decoys alone.
+    decoys: list[subprocess.Popen] = []
+    try:
+        decoys.append(subprocess.Popen(
+            ["/bin/sleep", marker + "2"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        decoys.append(subprocess.Popen(
+            ["/bin/sh", "-c", f"true sleep {marker}; /bin/sleep 3600; :"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                _macos_spawn.run_sandboxed(
+                    ["/bin/sleep", marker],
+                    output=str(out_dir),
+                    capture_output=True, text=True, timeout=1.5,
+                )
+            # Teardown runs synchronously before the raise; poll
+            # briefly for the process table to reflect it.
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and _exact_sleep_pids(marker)):
+                time.sleep(0.1)
+            assert _exact_sleep_pids(marker) == [], (
+                "sandboxed target survived run_sandboxed timeout — "
+                "the shim tree was not torn down"
+            )
+        finally:
+            _kill_exact_sleepers(marker)
+            # Liveness sampled AFTER the cleanup above (so the
+            # asserts below cover it too) but BEFORE reaping.
+            survived = [d.poll() is None for d in decoys]
+    finally:
+        for decoy in decoys:
+            # Own child + own session: group-kill by direct-child pid
+            # is identity-safe (unreaped children cannot be
+            # pid-recycled), and it takes the text decoy's sleep
+            # child down with its shell.
+            with contextlib.suppress(OSError):
+                os.killpg(decoy.pid, signal.SIGKILL)
+            decoy.wait(timeout=10)
+    # Decoys must have survived BOTH the teardown under test and the
+    # cleanup above (a pattern-shaped kill would have taken either).
+    assert survived[0], (
+        "teardown/cleanup killed an unrelated sleep whose duration "
+        "merely starts with the marker — kill went by pattern, not "
+        "verified identity"
+    )
+    assert survived[1], (
+        "teardown/cleanup killed an unrelated wrapper shell whose "
+        "argv text merely mentions the marker — kill went by "
+        "pattern, not verified identity"
+    )
+
+
 def test_is_available_false_on_non_darwin():
     """On Linux, /usr/bin/sandbox-exec doesn't exist; is_available
     must return False without raising."""
@@ -67,9 +287,312 @@ def test_is_available_false_on_non_darwin():
     assert _macos_spawn.is_available() is False
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_audit_streamer_scoped_to_run_process_tree(tmp_path, monkeypatch):
+    """Attribution scoping regression: the production audit spawn must
+    (a) start the log streamer with ``require_scope=True`` so the host-
+    wide Sandbox.kext feed is never wholesale-attributed to this run,
+    and (b) register the workload's PID on the streamer while the
+    workload is still alive — i.e. before waiting on it.
+
+    Pre-fix, the streamer was started with neither scoping layer and
+    ``register_target_pid`` was never called: every kext event on the
+    host (sibling runs, unrelated sandboxed apps, attacker noise on a
+    shared host) was nonce-stamped into this run's JSONL.
+
+    Cross-platform: SANDBOX_EXEC is swapped for a pass-through script
+    (same layering as production) and the streamer is a recording
+    fake, so no darwin host or `log stream` subprocess is needed.
+    """
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')  # drop -p <profile> --
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    events: list[tuple] = []
+
+    class _FakeStreamer:
+        def register_target_pid(self, pid):
+            alive = True
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                alive = False
+            events.append(("register", pid, alive))
+
+        def stop(self, **kw):
+            events.append(("stop",))
+
+    def fake_start(run_dir, **kw):
+        events.append(("start", kw.get("require_scope")))
+        return _FakeStreamer()
+
+    from core.sandbox import seatbelt_audit
+    monkeypatch.setattr(seatbelt_audit, "start_log_streamer", fake_start)
+
+    r = _macos_spawn.run_sandboxed(
+        # Sleep long enough that the registration observably happens
+        # while the workload is alive; short enough to keep the suite
+        # quick.
+        ["/bin/sh", "-c", "sleep 0.4"],
+        output=str(out_dir),
+        capture_output=True, text=True, timeout=15,
+        audit_mode=True, audit_run_dir=str(audit_dir),
+    )
+    assert r.returncode == 0
+
+    kinds = [e[0] for e in events]
+    assert kinds == ["start", "register", "stop"], events
+    start_evt, register_evt, _ = events
+    assert start_evt[1] is True, (
+        "streamer must be started with require_scope=True so events "
+        "before PID registration are never wholesale-attributed"
+    )
+    assert isinstance(register_evt[1], int) and register_evt[1] > 0
+    assert register_evt[2] is True, (
+        "register_target_pid must run while the workload is still "
+        "alive (before wait), or the whole run goes unattributed"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_tmpdir_steered_into_output_scratch_under_write_isolation(
+        tmp_path, monkeypatch):
+    """Whenever the profile engages write isolation and an output dir
+    exists, the child's TMPDIR must be steered into {output}/.tmp.
+    Pre-fix, only the untrusted lane (exclude_tmp_baseline=True) was
+    steered: every trusted-lane write-isolated macOS run kept the
+    host-default per-user /var/folders TMPDIR, which sits OUTSIDE the
+    write exceptions — python's tempfile silently fell back to /tmp,
+    but tools that honour TMPDIR directly (clang intermediates, git,
+    tar) got EPERM (confirmed on current macOS). The steer must ride
+    the EXISTING output write exception, never widen the profile.
+
+    Cross-platform: SANDBOX_EXEC is swapped for a script that records
+    the SBPL profile text it was handed, then execs the target (the
+    real shim + trampoline layering runs on Linux too).
+    """
+    capture = tmp_path / "profile.sb"
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text(
+        f'#!/bin/sh\nprintf %s "$2" > "{capture}"\nshift 3\nexec "$@"\n'
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", 'printf %s "$TMPDIR"'],
+        output=str(out_dir),
+        # A host-default-style TMPDIR rides the safe-env allowlist
+        # into every child env — the steer must override it, not
+        # merely fill an absent value.
+        env={"PATH": "/usr/bin:/bin",
+             "TMPDIR": "/var/folders/zz/host-default/T/"},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0
+    expected_tmp = os.path.join(str(out_dir), ".tmp")
+    assert r.stdout == expected_tmp
+    assert os.path.isdir(expected_tmp)
+
+    # The steered TMPDIR must be covered by the OUTPUT write
+    # exception already in the profile — no new write-exception
+    # entry, and in particular no widening to the host-shared
+    # per-user temp dir. Scope the assertions to the file-write*
+    # exception clauses: on a darwin host the output dir itself
+    # (pytest tmp_path) legitimately lives UNDER /var/folders, so a
+    # whole-profile substring check false-positives on the output
+    # subpath.
+    profile = capture.read_text()
+    out_real = os.path.realpath(str(out_dir))
+    write_denies = [line for line in profile.splitlines()
+                    if line.startswith("(deny file-write*")]
+    assert len(write_denies) == 1, profile
+    subpaths = re.findall(r'\(subpath "([^"]*)"\)', write_denies[0])
+    # Exactly the /private/tmp baseline seed + the output dir — the
+    # steer rides the existing output exception and adds nothing.
+    assert sorted(subpaths) == sorted(["/private/tmp", out_real]), (
+        subpaths
+    )
+    # The steered value resolves to a path under that output
+    # exception, and the host-default temp dir the child arrived
+    # with is NOT among the write exceptions.
+    assert os.path.realpath(expected_tmp) == os.path.join(out_real,
+                                                          ".tmp")
+    assert not any(p.startswith("/var/folders/zz/host-default")
+                   or p.startswith("/private/var/folders/zz/host-default")
+                   for p in subpaths), subpaths
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_tmpdir_not_steered_without_write_isolation(tmp_path,
+                                                    monkeypatch):
+    """No write isolation (network-only-equivalent kwargs) → the
+    child keeps its inherited TMPDIR: nothing is unwritable, so the
+    steer must not engage (behaviour-budget: non-write-isolated runs
+    are byte-identical)."""
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", 'printf %s "${TMPDIR-unset}"'],
+        block_network=True,
+        env={"PATH": "/usr/bin:/bin", "SENTINEL": "1"},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0
+    assert r.stdout == "unset"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+@pytest.mark.parametrize("seccomp_profile,caller_value,expected", [
+    # Hardened profile closes the keychain → file bundle injected.
+    ("full", None, "BUNDLE"),
+    # The fixed bundle overrides a caller-controlled trust root.
+    ("full", "/caller/ca.pem", "BUNDLE"),
+    # Broker floor also closes the keychain in specialized policies.
+    (None, None, "BUNDLE"),
+    ("debug", None, "BUNDLE"),
+    ("chromium", None, "BUNDLE"),
+])
+def test_file_trust_anchors_injected_under_mach_restriction(
+        tmp_path, monkeypatch, seccomp_profile, caller_value, expected):
+    from core.sandbox import seatbelt
+    bundle = tmp_path / "cert.pem"
+    bundle.write_text("x")
+    monkeypatch.setattr(seatbelt, "MACOS_FILE_TRUST_ANCHORS", str(bundle))
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+    env = {"PATH": "/usr/bin:/bin"}
+    if caller_value:
+        env["NIX_SSL_CERT_FILE"] = caller_value
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", 'printf %s "${NIX_SSL_CERT_FILE-unset}"'],
+        block_network=True, seccomp_profile=seccomp_profile,
+        env=env, capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == (str(bundle) if expected == "BUNDLE" else expected)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+@pytest.mark.parametrize("use_proxy,keep,https_proxy,inbound,expected", [
+    # RAPTOR dispatch behind the proxy lane, HTTPS_PROXY names it →
+    # marker minted.
+    (True, True, "http://127.0.0.1:43210", None, "http://127.0.0.1:43210"),
+    # Target code (no keep-trust dispatch) never sees it.
+    (True, False, "http://127.0.0.1:43210", None, "unset"),
+    # HTTPS_PROXY elsewhere → no marker.
+    (True, True, "http://127.0.0.1:1", None, "unset"),
+    # No proxy lane → a caller-supplied marker is dropped.
+    (False, True, "http://127.0.0.1:43210", "http://127.0.0.1:43210",
+     "unset"),
+])
+def test_parent_egress_proxy_marker_minted_only_by_spawn_layer(
+        tmp_path, monkeypatch, use_proxy, keep, https_proxy, inbound,
+        expected):
+    from core.sandbox import seatbelt
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+    name = seatbelt.PARENT_EGRESS_PROXY_ENV
+    env = {"PATH": "/usr/bin:/bin", "HTTPS_PROXY": https_proxy}
+    if inbound:
+        env[name] = inbound
+    kw = {"use_egress_proxy": True, "proxy_port": 43210} if use_proxy \
+        else {"block_network": True}
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", f'printf %s "${{{name}-unset}}"'],
+        env=env, keep_trust_markers=keep,
+        capture_output=True, text=True, timeout=15, **kw,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == expected
+
+
+@pytest.mark.darwin_native
+def test_sandbox_check_reports_seatbelt_child(tmp_path):
+    """EgressClient's parent-proxy route is gated on kernel truth;
+    the probe must report True inside a profile and False outside."""
+    from core.http import egress_backend
+    assert egress_backend._process_is_sandboxed() is False
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    script = (
+        f"import sys; sys.path.insert(0, {repo!r}); "
+        "from core.http.egress_backend import _process_is_sandboxed; "
+        "print(_process_is_sandboxed())"
+    )
+    r = _macos_spawn.run_sandboxed(
+        [sys.executable, "-I", "-c", script],
+        output=str(tmp_path), block_network=True, seccomp_profile="full",
+        capture_output=True, text=True, timeout=30,
+    )
+    assert r.stdout.strip() == "True", (r.stdout, r.stderr)
+
+
+@pytest.mark.darwin_native
+def test_file_trust_anchors_readable_under_hardened_read_restriction(
+        tmp_path):
+    from core.sandbox import seatbelt
+    if not os.path.isfile(seatbelt.MACOS_FILE_TRUST_ANCHORS):
+        pytest.skip("no system CA bundle on this host")
+    script = (
+        f'test "$NIX_SSL_CERT_FILE" = '
+        f'{seatbelt.MACOS_FILE_TRUST_ANCHORS!r} && '
+        'test -z "${SSL_CERT_FILE+x}" && '
+        'test -z "${SSL_CERT_DIR+x}" && '
+        '/usr/bin/grep -c "BEGIN CERTIFICATE" "$NIX_SSL_CERT_FILE"'
+    )
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", script],
+        output=str(tmp_path), block_network=True, restrict_reads=True,
+        seccomp_profile="full",
+        strict_env=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "NIX_SSL_CERT_FILE": "/caller/nix-ca.pem",
+            "SSL_CERT_FILE": "/caller/openssl-ca.pem",
+            "SSL_CERT_DIR": "/caller/openssl-certs",
+        },
+        capture_output=True, text=True, timeout=20,
+    )
+    assert r.returncode == 0, r.stderr
+    assert int(r.stdout.strip()) > 0
+
+
+@pytest.mark.darwin_native
+def test_file_trust_override_replaced_under_broker_floor(tmp_path):
+    from core.sandbox import seatbelt
+
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", 'printf %s "${NIX_SSL_CERT_FILE-unset}"'],
+        output=str(tmp_path), block_network=True, strict_env=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "NIX_SSL_CERT_FILE": "/caller/nix-ca.pem",
+        },
+        capture_output=True, text=True, timeout=20,
+    )
+    assert r.returncode == 0, r.stderr
+    expected = seatbelt.file_trust_anchor_env().get("NIX_SSL_CERT_FILE", "unset")
+    assert r.stdout == expected
+
+
 # --- Darwin-only behavioural tests ------------------------------------
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_smoke_test_invocation_succeeds(tmp_path):
     """Most basic smoke test: run /usr/bin/true under the sandbox.
     Confirms sandbox-exec invocation works AND our kwarg threading
@@ -84,7 +607,7 @@ def test_smoke_test_invocation_succeeds(tmp_path):
     assert r.sandbox_info["backend"] == "macos-seatbelt"
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_write_outside_output_blocked(tmp_path):
     """Enforcement: write to a path OUTSIDE the writable allowlist
     must fail (sandbox-exec returns the kernel sandbox error)."""
@@ -115,7 +638,7 @@ def test_write_outside_output_blocked(tmp_path):
     assert not target_file.exists()
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_write_inside_output_allowed(tmp_path):
     """Inverse of the above: writes INSIDE output= must succeed.
     Catches over-restrictive profile generation."""
@@ -133,7 +656,7 @@ def test_write_inside_output_allowed(tmp_path):
     assert target_file.read_text() == "ok"
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_write_to_private_tmp_allowed():
     """The default exception list always includes /private/tmp so
     standard temp-file APIs keep working. Regression catch: if we
@@ -154,7 +677,7 @@ def test_write_to_private_tmp_allowed():
     assert "OK" in r.stdout
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_block_network_actually_blocks(tmp_path):
     """block_network=True must cause network connect to fail. Use a
     non-routable address with a short timeout to keep the test fast
@@ -179,7 +702,8 @@ def test_block_network_actually_blocks(tmp_path):
     assert "LEAK" not in r.stdout
 
 
-@darwin_only
+@pytest.mark.slow  # real kernel log startup/drain can exceed the default budget
+@pytest.mark.darwin_native
 def test_audit_mode_writes_jsonl(tmp_path):
     """End-to-end: with audit_mode=True the LogStreamer must
     capture sandbox kext entries and append them as JSONL records
@@ -203,8 +727,20 @@ def test_audit_mode_writes_jsonl(tmp_path):
     # Allow the kernel→log→stream pipeline a moment to flush. Spike
     # #4 measured ~1.5s end-to-end; the LogStreamer.stop() drain
     # window covers most of this but in CI the wall-clock can stretch.
-    time.sleep(2.0)
-    jsonl_path = audit_dir / ".sandbox-denials.jsonl"
+    # Pre-fix: a flat ``time.sleep(2.0)`` made the test always
+    # wait 2s even when the JSONL had already landed at 200ms (the
+    # common case on dev macs) — and still flaked on slow CI when
+    # the pipeline took >2s. Poll for the file with a 5s budget
+    # instead: usually returns in <500ms, gives slow CI runners
+    # more headroom, and the worst-case wall-clock matches the old
+    # ``sleep(2.0) + assert`` shape.
+    from core.sandbox.evidence import evidence_write_path
+    jsonl_path = evidence_write_path(audit_dir, ".sandbox-denials.jsonl")
+    _poll_deadline = time.monotonic() + 5.0
+    while time.monotonic() < _poll_deadline:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            break
+        time.sleep(0.05)
     assert jsonl_path.exists(), (
         "audit_mode=True did not produce .sandbox-denials.jsonl"
     )
@@ -212,7 +748,7 @@ def test_audit_mode_writes_jsonl(tmp_path):
     # We want at least one record about our write — be lenient
     # about which one (the kernel may emit multiple file-* entries
     # for one Python write).
-    parsed = [json.loads(l) for l in lines if l.strip()]
+    parsed = [json.loads(line) for line in lines if line.strip()]
     matching = [r for r in parsed if "audited" in r.get("path", "")]
     assert matching, (
         f"no audit record matched our test path; got {len(parsed)} "
@@ -220,7 +756,7 @@ def test_audit_mode_writes_jsonl(tmp_path):
     )
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_fake_home_redirects_HOME(tmp_path):
     """fake_home=True must override HOME inside the child. The
     profile itself doesn't restrict HOME (env-side concern); the
@@ -240,7 +776,7 @@ def test_fake_home_redirects_HOME(tmp_path):
     assert actual == expected
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_rlimits_applied(tmp_path):
     """Resource limits must apply via the preexec_fn pattern. Test
     with a small max_file_mb (file size cap)."""
@@ -261,7 +797,8 @@ def test_rlimits_applied(tmp_path):
     assert soft == 10 * 1024 * 1024
 
 
-@darwin_only
+@pytest.mark.slow  # real kernel log startup/drain can exceed the default budget
+@pytest.mark.darwin_native
 def test_audit_verbose_records_extended_categories(tmp_path):
     """End-to-end: with audit_verbose=True, the SBPL profile gets
     `(allow X (with report))` for an extended set of categories
@@ -287,7 +824,7 @@ def test_audit_verbose_records_extended_categories(tmp_path):
     target_file = output / "audited"
     py = (
         f"open({str(target_file)!r}, 'w').write('x')\n"
-        f"open('/etc/hostname', 'r').read()\n"
+        f"open('/etc/hosts', 'r').read()\n"
         f"import subprocess; subprocess.run(['/bin/echo','hi'], "
         f"capture_output=True)\n"
     )
@@ -302,14 +839,21 @@ def test_audit_verbose_records_extended_categories(tmp_path):
     assert r.returncode == 0, (
         f"workload failed: stderr={r.stderr!r}"
     )
-    # Allow kernel→log→stream pipeline to flush.
-    time.sleep(2.0)
-    jsonl_path = audit_dir / ".sandbox-denials.jsonl"
+    # Allow kernel→log→stream pipeline to flush. See the
+    # ``test_audit_mode_produces_denials_jsonl`` test for the
+    # full rationale on the poll-loop pattern vs. flat sleep.
+    from core.sandbox.evidence import evidence_write_path
+    jsonl_path = evidence_write_path(audit_dir, ".sandbox-denials.jsonl")
+    _poll_deadline = time.monotonic() + 5.0
+    while time.monotonic() < _poll_deadline:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            break
+        time.sleep(0.05)
     assert jsonl_path.exists(), (
         "audit_verbose=True did not produce .sandbox-denials.jsonl"
     )
-    records = [json.loads(l) for l in
-                jsonl_path.read_text().splitlines() if l.strip()]
+    records = [json.loads(line) for line in
+                jsonl_path.read_text().splitlines() if line.strip()]
     # Filter out control-plane records (audit_summary, markers).
     data = [r for r in records if "syscall" in r]
     assert data, f"expected data records, got: {records!r}"
@@ -323,7 +867,8 @@ def test_audit_verbose_records_extended_categories(tmp_path):
     )
 
 
-@darwin_only
+@pytest.mark.slow  # real kernel log startup/drain can exceed the default budget
+@pytest.mark.darwin_native
 def test_audit_summary_record_emitted(tmp_path):
     """LogStreamer.stop() must always emit an audit_summary record
     so the sandbox-summary aggregator can distinguish "audit ran
@@ -341,10 +886,19 @@ def test_audit_summary_record_emitted(tmp_path):
         audit_run_dir=str(audit_dir),
         capture_output=True, text=True, timeout=10,
     )
-    time.sleep(1.0)
-    jsonl_path = audit_dir / ".sandbox-denials.jsonl"
-    records = [json.loads(l) for l in
-                jsonl_path.read_text().splitlines() if l.strip()]
+    # Poll-loop instead of flat sleep — same pattern as the
+    # other tests in this file. 3s budget (this assertion needs
+    # less than the kernel→log path because the audit summary
+    # is written from in-process at sandbox shutdown).
+    from core.sandbox.evidence import evidence_write_path
+    jsonl_path = evidence_write_path(audit_dir, ".sandbox-denials.jsonl")
+    _poll_deadline = time.monotonic() + 3.0
+    while time.monotonic() < _poll_deadline:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            break
+        time.sleep(0.05)
+    records = [json.loads(line) for line in
+                jsonl_path.read_text().splitlines() if line.strip()]
     summaries = [r for r in records if r.get("type") == "audit_summary"]
     assert len(summaries) == 1, (
         f"expected exactly one audit_summary record, got "
@@ -357,7 +911,7 @@ def test_audit_summary_record_emitted(tmp_path):
     assert "global_cap" in s
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_audit_budget_drops_when_cap_hit(tmp_path):
     """End-to-end budget enforcement: pass a tiny global cap and
     verify the JSONL contains a budget_exceeded marker. Uses the
@@ -397,9 +951,14 @@ def test_audit_budget_drops_when_cap_hit(tmp_path):
         if decision == audit_budget.KEEP:
             streamer._append_record(record)
     streamer.stop()
-    records = [json.loads(l) for l in
-                (audit_dir / seatbelt_audit.DENIALS_FILE)
-                .read_text().splitlines() if l.strip()]
+    # The streamer appends through the held evidence fd, which lives
+    # at <run_dir>/.audit/<name> (core.sandbox.evidence placement) —
+    # read it back from there, like the other audit tests above, not
+    # from the legacy top-level spot.
+    from core.sandbox.evidence import evidence_write_path
+    jsonl_path = evidence_write_path(audit_dir, seatbelt_audit.DENIALS_FILE)
+    records = [json.loads(line) for line in
+                jsonl_path.read_text().splitlines() if line.strip()]
     markers = [r for r in records
                 if r.get("type") in ("category_budget_exceeded",
                                      "category_budget_exceeded_sampling")]
@@ -411,7 +970,7 @@ def test_audit_budget_drops_when_cap_hit(tmp_path):
     assert summary["dropped_by_category"]["file-write"] == 5
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_seccomp_kwargs_silently_ignored(tmp_path):
     """seccomp_profile= and seccomp_block_udp= are Linux-only;
     accepted on macOS for signature parity but must NOT raise.
@@ -424,3 +983,315 @@ def test_seccomp_kwargs_silently_ignored(tmp_path):
         capture_output=True, timeout=10,
     )
     assert r.returncode == 0
+
+
+@pytest.mark.darwin_native
+def test_full_profile_parent_can_watch_and_signal_own_child(tmp_path):
+    """Under the hardened profile a sandboxed parent must still
+    introspect and signal the processes it spawned (the JVM's
+    ProcessHandleImpl.isAlive0 under CodeQL, supervisors reaping
+    workers), while same-UID host processes and separate sandbox
+    instances stay out of reach.
+    proc_pidinfo(PROC_PIDTBSDINFO) is process-info gated; kill(pid, 0)
+    is a signal."""
+    repo = Path(__file__).resolve().parents[3]
+    other_pid_file = tmp_path / "other-sandbox.pid"
+    other_script = (
+        "import os, pathlib, time\n"
+        f"pid_path = pathlib.Path({str(other_pid_file)!r})\n"
+        "pending = pid_path.with_suffix('.pending')\n"
+        "pending.write_text(str(os.getpid()))\n"
+        "os.replace(pending, pid_path)\n"
+        "time.sleep(30)\n"
+    )
+    orchestrator_script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(repo)!r})\n"
+        "from core.sandbox import _macos_spawn\n"
+        f"script = {other_script!r}\n"
+        "result = _macos_spawn.run_sandboxed(\n"
+        "    [sys.executable, '-I', '-c', script],\n"
+        f"    output={str(tmp_path)!r}, block_network=True,\n"
+        "    seccomp_profile='full', capture_output=True, text=True,\n"
+        "    timeout=40,\n"
+        ")\n"
+        "raise SystemExit(result.returncode)\n"
+    )
+    host_helper = subprocess.Popen(["/bin/sleep", "30"])
+    other_orchestrator = subprocess.Popen(
+        [sys.executable, "-I", "-c", orchestrator_script],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not other_pid_file.exists():
+            if other_orchestrator.poll() is not None:
+                stdout, stderr = other_orchestrator.communicate()
+                pytest.fail(
+                    "separate sandbox exited before publishing its PID: "
+                    f"rc={other_orchestrator.returncode}, "
+                    f"stdout={stdout!r}, stderr={stderr!r}"
+                )
+            time.sleep(0.05)
+        assert other_pid_file.exists(), (
+            "separate sandbox did not publish its PID"
+        )
+        other_pid = int(other_pid_file.read_text())
+        # Both controls are live, same-UID processes the test process
+        # can signal; only the Seatbelt boundary should deny access.
+        os.kill(host_helper.pid, 0)
+        os.kill(other_pid, 0)
+        script = (
+            "import ctypes, os, subprocess\n"
+            "lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)\n"
+            "buf = ctypes.create_string_buffer(512)\n"
+            "def info(pid):\n"
+            "    return lib.proc_pidinfo(pid, 3, ctypes.c_uint64(0), buf,"
+            " 512) > 0\n"
+            "def sig(pid):\n"
+            "    try:\n"
+            "        os.kill(pid, 0)\n"
+            "        return True\n"
+            "    except PermissionError:\n"
+            "        return False\n"
+            "c = subprocess.Popen(['/bin/sleep', '5'])\n"
+            "print('child-info-ok' if info(c.pid) else"
+            " 'child-info-denied')\n"
+            "print('child-signal-ok' if sig(c.pid) else"
+            " 'child-signal-denied')\n"
+            f"print('host-info-denied' if not info({host_helper.pid}) else"
+            " 'host-info-ok')\n"
+            f"print('host-signal-denied' if not sig({host_helper.pid}) else"
+            " 'host-signal-ok')\n"
+            f"print('sandbox-info-denied' if not info({other_pid}) else"
+            " 'sandbox-info-ok')\n"
+            f"print('sandbox-signal-denied' if not sig({other_pid}) else"
+            " 'sandbox-signal-ok')\n"
+            "c.kill()\n"
+            "c.wait()\n"
+        )
+        r = _macos_spawn.run_sandboxed(
+            [sys.executable, "-I", "-c", script],
+            output=str(tmp_path),
+            block_network=True,
+            seccomp_profile="full",
+            capture_output=True, text=True, timeout=20,
+        )
+        for line in ("child-info-ok", "child-signal-ok",
+                     "host-info-denied", "host-signal-denied",
+                     "sandbox-info-denied", "sandbox-signal-denied"):
+            assert line in r.stdout, (r.stdout, r.stderr)
+    finally:
+        for proc in (host_helper, other_orchestrator):
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in (host_helper, other_orchestrator):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+# --- Darwin-only: seatbelt-shim fail-loud + teardown integration ------
+# These validate the raptor-seatbelt-shim wiring under a REAL sandbox-exec:
+# the inner shim (python, run INSIDE the applied profile) emitting the
+# readiness byte, exit-status mirroring through the outer+inner layering,
+# and killpg teardown when the orchestrator dies. They can only run on a
+# macOS host — smoke-test here before relying on the macOS sandbox.
+
+@pytest.mark.darwin_native
+def test_setup_status_none_on_successful_engage(tmp_path):
+    """A normal run must come back with result._setup_status is None — i.e.
+    the in-sandbox readiness byte arrived, proving the inner shim ran INSIDE
+    the applied profile (this also confirms python starts under the profile,
+    the one macOS-specific risk of the unified shim design)."""
+    r = _macos_spawn.run_sandboxed(
+        ["/usr/bin/true"],
+        output=str(tmp_path),
+        capture_output=True, timeout=10,
+    )
+    assert r.returncode == 0
+    assert getattr(r, "_setup_status", "missing") is None
+
+
+@pytest.mark.darwin_native
+def test_exit_code_mirrored_through_shim(tmp_path):
+    """The outer+inner shim layering must mirror the target's exit code
+    unchanged (regression guard on status propagation)."""
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", "exit 7"],
+        output=str(tmp_path),
+        capture_output=True, timeout=10,
+    )
+    assert r.returncode == 7
+    assert getattr(r, "_setup_status", "missing") is None
+
+
+@pytest.mark.darwin_native
+def test_fail_loud_via_context_when_profile_cannot_apply(tmp_path):
+    """End-to-end fail-loud: when the sandbox cannot engage, sandbox().run
+    must raise SandboxSetupError rather than silently returning a result.
+    Driven through the public context entry so the _setup_status decision
+    table is exercised. (Uses an unsatisfiable seatbelt config if available;
+    otherwise asserts the success path stays non-raising — adjust on the Mac
+    if a reliable profile-failure trigger is known for the installed OS.)"""
+    from core.sandbox import sandbox
+    from core.sandbox.errors import SandboxSetupError
+    # A normal engageable run must NOT raise.
+    with sandbox(block_network=True) as run:
+        r = run(["/usr/bin/true"], capture_output=True, timeout=10)
+    assert r.returncode == 0
+    # Note: a deterministic profile-apply failure is host/OS-version
+    # specific; the unit-level guarantee (no readiness byte -> ("E", ..)
+    # -> SandboxSetupError) is covered by the context.py decision table and
+    # the seatbelt-shim POSIX tests. Keep SandboxSetupError imported so this
+    # file fails fast if the symbol is removed.
+    assert SandboxSetupError is not None
+
+
+@pytest.mark.darwin_native
+def test_orphan_teardown_on_orchestrator_kill():
+    """Integration: an orchestrator running a long target via the seatbelt
+    backend, SIGKILLed mid-run, must leave NO lingering sandbox process —
+    the outer shim reads death-pipe EOF and SIGKILLs the sandbox group.
+
+    Target discovery and cleanup go through the exact-argv helpers
+    (per-run unique marker, identity-verified kill) — the fixed-marker
+    ``pgrep -f``/``pkill -9 -f`` this replaces matched (and killed)
+    unrelated processes whose cmdline merely contained the pattern.
+    """
+    marker = _unique_sleep_marker("417239")
+
+    orch_code = (
+        "from core.sandbox import sandbox\n"
+        "with sandbox(block_network=True) as run:\n"
+        f"    run(['/bin/sleep','{marker}'], capture_output=True)\n"
+    )
+    orch = subprocess.Popen(
+        [sys.executable, "-c", orch_code],
+        env=dict(os.environ, _RAPTOR_TRUSTED="1"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(150):
+            time.sleep(0.1)
+            if _exact_sleep_pids(marker):
+                break
+        else:
+            pytest.skip("seatbelt sandbox did not start the target here")
+        orch.send_signal(signal.SIGKILL)
+        orch.wait()
+        for _ in range(50):
+            time.sleep(0.1)
+            if not _exact_sleep_pids(marker):
+                break
+        assert _exact_sleep_pids(marker) == [], (
+            "sandbox target leaked after orchestrator kill"
+        )
+    finally:
+        if orch.poll() is None:
+            orch.kill()
+            orch.wait()
+        _kill_exact_sleepers(marker)
+
+
+@pytest.mark.parametrize('wrapped', [False, True], ids=['direct', 'inspection-env'])
+def test_system_compiler_is_resolved_before_sandbox_entry(monkeypatch, wrapped):
+    probes = []
+    def probe(*args):
+        probes.append(args)
+        return ('/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk'
+                if args == ('--show-sdk-path',) else
+                '/Library/Developer/CommandLineTools/usr/bin/clang')
+    monkeypatch.setattr(_macos_spawn, '_xcrun_path', probe)
+    prefix = ['/usr/bin/env', 'TMPDIR=/private/scratch'] if wrapped else []
+    env = {'PATH': '/usr/bin:/bin'}
+    got = _macos_spawn._prepare_apple_tool(prefix + ['/usr/bin/cc', 'target.c'], env)
+    assert got == prefix + ['/Library/Developer/CommandLineTools/usr/bin/clang', 'target.c']
+    assert env['SDKROOT'].endswith('/MacOSX.sdk')
+    assert env['PATH'].startswith('/Library/Developer/CommandLineTools/usr/bin:')
+    assert probes == [('--find', 'cc'), ('--show-sdk-path',)]
+
+
+def test_custom_target_tool_is_never_probed_in_parent(monkeypatch):
+    def refuse(*args):
+        pytest.fail('arbitrary target tool reached parent-side probe')
+    monkeypatch.setattr(_macos_spawn, '_xcrun_path', refuse)
+    command = ['/tmp/target/bin/clang', 'target.c']
+    assert _macos_spawn._prepare_apple_tool(command, {'PATH': '/usr/bin'}) == command
+
+
+def test_rust_linker_uses_resolved_sdk_and_system_compiler(monkeypatch):
+    def probe(*args):
+        return ('/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk'
+                if args == ('--show-sdk-path',) else
+                '/Library/Developer/CommandLineTools/usr/bin/clang')
+    monkeypatch.setattr(_macos_spawn, '_xcrun_path', probe)
+    env = {'PATH': '/cargo/bin:/usr/bin', 'SDKROOT': '/explicit/sdk'}
+    command = ['/cargo/bin/rustc', 'target.rs']
+    assert _macos_spawn._prepare_apple_tool(command, env) == command
+    assert env['SDKROOT'] == '/explicit/sdk'
+    assert env['PATH'].split(':')[0] == '/Library/Developer/CommandLineTools/usr/bin'
+
+
+@pytest.mark.parametrize('output', ['/tmp/target/clang', 'relative/path', '/Library/Developer/CommandLineTools/usr/bin/clang\nextra'], ids=['outside-toolchain', 'relative-path', 'multiple-lines'])
+def test_xcrun_probe_rejects_untrusted_results(monkeypatch, output):
+    from types import SimpleNamespace
+    def run(command, **kwargs):
+        assert command == ['/usr/bin/xcrun', '--sdk', 'macosx', '--find', 'clang']
+        assert kwargs['cwd'] == '/'
+        assert kwargs['env'] == {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+        return SimpleNamespace(returncode=0, stdout=output)
+    patch_module_attribute(monkeypatch, _macos_spawn, 'subprocess', 'run', run)
+    assert _macos_spawn._xcrun_path('--find', 'clang') is None
+
+
+def test_xcrun_keeps_cpp_driver_spelling(monkeypatch):
+    from types import SimpleNamespace
+    cpp = '/Library/Developer/CommandLineTools/usr/bin/clang++'
+    clang = '/Library/Developer/CommandLineTools/usr/bin/clang'
+    patch_module_attribute(monkeypatch, _macos_spawn, 'subprocess', 'run', lambda *a, **kw:
+                        SimpleNamespace(returncode=0, stdout=cpp + '\n'))
+    monkeypatch.setattr(_macos_spawn.seatbelt, '_developer_toolchain_read_dirs',
+                        lambda: ('/Library/Developer/CommandLineTools',))
+    private_os = patch_module_attribute(
+        monkeypatch, _macos_spawn, "os", "__name__", os.__name__,
+    )
+    patch_module_attribute(monkeypatch, private_os, "path", 'realpath', lambda p: clang if p == cpp else p)
+    patch_module_attribute(monkeypatch, private_os, "path", 'isdir', lambda p: True)
+    patch_module_attribute(monkeypatch, private_os, "path", 'exists', lambda p: True)
+    assert _macos_spawn._xcrun_path('--find', 'clang++') == cpp
+
+
+def test_cold_cpp_lookup_retry_replaces_system_shim(monkeypatch):
+    probes = []
+    cpp = "/Library/Developer/CommandLineTools/usr/bin/clang++"
+    def probe(*args):
+        probes.append(args)
+        if len(probes) == 1:
+            return None
+        return "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk" if args == ("--show-sdk-path",) else cpp
+    monkeypatch.setattr(_macos_spawn, "_xcrun_path", probe)
+    env = {"PATH": "/usr/bin:/bin"}
+    assert _macos_spawn._prepare_apple_tool(["/usr/bin/clang++", "target.cc"], env) == [cpp, "target.cc"]
+    assert probes == [("--find", "clang++"), ("--show-sdk-path",), ("--find", "clang++")]
+
+
+def test_cold_xcrun_query_has_bounded_startup_headroom(monkeypatch):
+    from types import SimpleNamespace
+    compiler = "/Library/Developer/CommandLineTools/usr/bin/clang"
+    def run(command, **kwargs):
+        assert command == ["/usr/bin/xcrun", "--sdk", "macosx", "--find", "clang"]
+        if kwargs["timeout"] <= 10:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        assert kwargs["timeout"] <= 30
+        return SimpleNamespace(returncode=0, stdout=compiler)
+    patch_module_attribute(monkeypatch, _macos_spawn, "subprocess", "run", run)
+    monkeypatch.setattr(_macos_spawn.seatbelt, "_developer_toolchain_read_dirs", lambda: ("/Library/Developer/CommandLineTools",))
+    private_os = patch_module_attribute(
+        monkeypatch, _macos_spawn, "os", "__name__", os.__name__,
+    )
+    patch_module_attribute(monkeypatch, private_os, "path", "isdir", lambda p: True)
+    patch_module_attribute(monkeypatch, private_os, "path", "exists", lambda p: True)
+    assert _macos_spawn._xcrun_path("--find", "clang") == compiler

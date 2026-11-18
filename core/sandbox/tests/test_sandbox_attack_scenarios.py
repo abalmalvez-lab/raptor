@@ -8,20 +8,31 @@ Run: python3 -m pytest core/sandbox/tests/test_sandbox_attack_scenarios.py -v
 """
 
 import os
+import re
 import shutil
+import signal
 import socket
 import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from core.sandbox import (
     check_landlock_available,
+    check_mount_available,
     check_net_available,
     run_untrusted,
     sandbox,
     state,
 )
+from core.sandbox.tests.capability import requires_landlock
+
+# Threat-model regression checks run real attacker-shaped children
+# under the REAL kernel's enforcement — real-kernel binding on both
+# platforms (see pytest.ini's native markers).
+pytestmark = [pytest.mark.linux_native, pytest.mark.darwin_native]
 
 
 def _compile(source: str, path: Path, extra_flags=()) -> bool:
@@ -30,18 +41,79 @@ def _compile(source: str, path: Path, extra_flags=()) -> bool:
     src.write_text(source)
     r = subprocess.run(
         ["gcc", str(src), "-o", str(path), "-O0", *extra_flags],
-        capture_output=True,
+        capture_output=True, check=False,
     )
     return r.returncode == 0 and path.exists()
 
 
+# Exit statuses that mean "the seccomp filter killed the probe with
+# SIGSYS before it could print": a negative signal code when the death
+# propagates as a signal, or 128+SIGSYS when a wrapper layer (unshare /
+# the pid-1 shim) re-encodes it as an exit status.
+_SIGSYS_STATUSES = (-signal.SIGSYS, 128 + signal.SIGSYS)
+
+
+def _assert_syscall_blocked(tc: unittest.TestCase, r, name: str,
+                            token: str = "r", blocked_rc: int = 0):
+    """Assert a syscall probe was actually denied — precisely.
+
+    The probes print ``<token>=<val>`` and encode the syscall outcome
+    in their exit status (``blocked_rc`` when the syscall failed, the
+    other value when it SUCCEEDED). The historical assertion pattern
+    (``"r=-1" in stdout or rc != 0``) was unfalsifiable: the probes
+    exit 1 exactly when the syscall succeeded, so *every* outcome —
+    including a live sandbox hole — satisfied ``rc != 0``.
+
+    Accepted outcomes, asserted exactly:
+      * probe ran: printed value is negative (syscall failed) AND the
+        exit status is the probe's own blocked encoding;
+      * probe never printed: only a SIGSYS kill by the filter counts —
+        any other silent exit (exec failure, wrapper error) FAILS.
+    """
+    out = r.stdout or ""
+    m = re.search(rf"{re.escape(token)}=(-?\d+)", out)
+    if m is not None:
+        val = int(m.group(1))
+        tc.assertLess(
+            val, 0,
+            f"{name}: syscall SUCCEEDED inside the sandbox "
+            f"({token}={val}, rc={r.returncode}) — the block has "
+            f"regressed; treat this as a live sandbox hole",
+        )
+        tc.assertEqual(
+            r.returncode, blocked_rc,
+            f"{name}: probe printed {token}={val} (blocked) but exited "
+            f"{r.returncode} instead of {blocked_rc} — probe/wrapper "
+            f"disagreement, investigate rather than trust the run",
+        )
+    else:
+        tc.assertIn(
+            r.returncode, _SIGSYS_STATUSES,
+            f"{name}: probe produced no '{token}=' output and exited "
+            f"{r.returncode} (stdout={out!r}, stderr="
+            f"{(r.stderr or '')[:200]!r}) — neither a completed probe "
+            f"nor a SIGSYS kill; the outcome proves nothing about the "
+            f"block",
+        )
+
+
+@requires_landlock
 class TestSyscallFilterBlocks(unittest.TestCase):
     """Claims: keyctl, bpf, userfaultfd, perf_event_open, io_uring_setup,
-    socket(AF_UNIX / AF_PACKET / AF_NETLINK), TIOCSTI are all blocked."""
+    socket(AF_PACKET / AF_NETLINK), TIOCSTI are all blocked.
+
+    AF_UNIX is layered: on the mount-ns path socket(AF_UNIX) is
+    deliberately ALLOWED (Python >= 3.14 multiprocessing needs it) and
+    the defense is that host pathname sockets are unreachable (fresh
+    tmpfs masks /run and /tmp; pivot_root leaves the host read-only,
+    and connect(2) on a read-only mount fails the MAY_WRITE check); on
+    the preexec-only fallback the socket() call itself is blocked. The
+    AF_UNIX test asserts the composite claim — a host-side listening
+    socket must be unreachable either way."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name) / "out"
@@ -57,18 +129,62 @@ class TestSyscallFilterBlocks(unittest.TestCase):
         )
         return r
 
-    def test_af_unix_socket_blocked(self):
-        r = self._run_c("""
+    def test_af_unix_host_pathname_socket_unreachable(self):
+        """The docker.sock escape shape: a listening host pathname
+        socket OUTSIDE the sandbox's target/output grants must be
+        unreachable. Two acceptable mechanisms, asserted precisely:
+        socket(AF_UNIX) itself EPERMs (preexec-only path), or the
+        socket is created but connect() to the host path fails
+        (mount-ns path: fresh tmpfs masks the host filesystem).
+        CONNECTED means a live escape — the probe exits 1 for it."""
+        # Host-side listener in a directory NOT granted to the sandbox.
+        host_dir = TemporaryDirectory()
+        self.addCleanup(host_dir.cleanup)
+        sock_path = os.path.join(host_dir.name, "host.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(sock_path)
+        listener.listen(1)
+        os.chmod(sock_path, 0o777)  # perms must not be the blocker
+
+        src = """
             #include <sys/socket.h>
+            #include <sys/un.h>
             #include <stdio.h>
-            int main(){int s=socket(AF_UNIX,SOCK_STREAM,0);
-              printf("fd=%d\\n",s);return s<0?0:1;}
-        """, "afunix")
-        # seccomp should return -EPERM → fd == -1 → our exit code 0 per the program
-        # but the filter may also kill with SIGSYS. Either is correct.
+            #include <string.h>
+            int main(int argc, char **argv){
+              int s=socket(AF_UNIX,SOCK_STREAM,0);
+              if(s<0){printf("fd=-1\\n");return 0;}
+              struct sockaddr_un a; memset(&a,0,sizeof a);
+              a.sun_family=AF_UNIX;
+              strncpy(a.sun_path,argv[1],sizeof a.sun_path-1);
+              int r=connect(s,(struct sockaddr*)&a,sizeof a);
+              if(r<0){printf("connect=-1\\n");return 0;}
+              printf("CONNECTED\\n");return 1;}
+        """
+        path = Path(self.tmp.name) / "afunix"
+        self.assertTrue(_compile(src, path), "failed to compile afunix")
+        r = run_untrusted(
+            [str(path), sock_path],
+            target=str(self.tmp.name), output=str(self.out),
+            capture_output=True, text=True, timeout=10,
+        )
+        out = r.stdout or ""
+        self.assertNotIn(
+            "CONNECTED", out,
+            f"sandboxed child connected to a host AF_UNIX pathname "
+            f"socket at {sock_path} — docker.sock-shape escape is LIVE "
+            f"(rc={r.returncode})",
+        )
+        self.assertEqual(
+            r.returncode, 0,
+            f"probe exited {r.returncode} without reporting an outcome "
+            f"(stdout={out!r}, stderr={(r.stderr or '')[:200]!r}) — "
+            f"the run proves nothing about the AF_UNIX defense",
+        )
         self.assertTrue(
-            "fd=-1" in (r.stdout or "") or r.returncode < 0 or r.returncode != 0,
-            f"AF_UNIX socket() should be blocked: rc={r.returncode} stdout={r.stdout}",
+            "fd=-1" in out or "connect=-1" in out,
+            f"probe produced no recognised outcome: {out!r}",
         )
 
     def test_socketpair_af_unix_allowed(self):
@@ -91,10 +207,7 @@ class TestSyscallFilterBlocks(unittest.TestCase):
             int main(){long r=syscall(SYS_keyctl,0,0,0,0,0);
               printf("r=%ld\\n",r);return r<0?0:1;}
         """, "keyctl")
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"keyctl should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "keyctl")
 
     def test_io_uring_setup_blocked(self):
         """Closes the io_uring-bypasses-Landlock gap on 5.13-6.2."""
@@ -105,10 +218,7 @@ class TestSyscallFilterBlocks(unittest.TestCase):
             int main(){long r=syscall(SYS_io_uring_setup,1,(void*)0);
               printf("r=%ld\\n",r);return r<0?0:1;}
         """, "iour")
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"io_uring_setup should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "io_uring_setup")
 
     def test_tiocsti_blocked(self):
         """TIOCSTI injection is the classic sandbox-escape via the parent tty."""
@@ -126,10 +236,13 @@ class TestSyscallFilterBlocks(unittest.TestCase):
         # + start_new_session), or TIOCSTI fails. Both are acceptable — both
         # prevent the attack.
         out = r.stdout or ""
-        self.assertTrue(
-            "notty" in out or "r=-1" in out or r.returncode != 0,
-            f"TIOCSTI should not succeed: {out}",
-        )
+        if "notty" in out:
+            # /dev/tty unavailable inside the sandbox (stdin=DEVNULL +
+            # start_new_session) — the attack is prevented upstream of
+            # the ioctl filter. Probe encodes this as exit 0.
+            self.assertEqual(r.returncode, 0)
+            return
+        _assert_syscall_blocked(self, r, "ioctl(TIOCSTI)")
 
     def test_bpf_blocked(self):
         """eBPF program loading is a kernel attack surface."""
@@ -140,10 +253,7 @@ class TestSyscallFilterBlocks(unittest.TestCase):
             int main(){long r=syscall(SYS_bpf,0,0,0);
               printf("r=%ld\\n",r);return r<0?0:1;}
         """, "bpf")
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"bpf syscall should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "bpf")
 
     def test_userfaultfd_blocked(self):
         """userspace page-fault handler — kernel-escalation primitive."""
@@ -154,10 +264,7 @@ class TestSyscallFilterBlocks(unittest.TestCase):
             int main(){long r=syscall(SYS_userfaultfd,0);
               printf("r=%ld\\n",r);return r<0?0:1;}
         """, "ufd")
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"userfaultfd should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "userfaultfd")
 
     def test_perf_event_open_blocked(self):
         """perf subsystem — historical kernel-exploit surface."""
@@ -168,10 +275,7 @@ class TestSyscallFilterBlocks(unittest.TestCase):
             int main(){long r=syscall(SYS_perf_event_open,0,0,0,0,0);
               printf("r=%ld\\n",r);return r<0?0:1;}
         """, "pe")
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"perf_event_open should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "perf_event_open")
 
     def test_process_vm_readv_blocked(self):
         """Cross-process memory read — credential-scraping primitive."""
@@ -187,10 +291,7 @@ class TestSyscallFilterBlocks(unittest.TestCase):
               long r=syscall(SYS_process_vm_readv,1,&iov,1,&iov,1,0);
               printf("r=%ld\\n",r);return r<0?0:1;}
         """, "pvmr")
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"process_vm_readv should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "process_vm_readv")
 
     def test_af_packet_socket_blocked(self):
         """AF_PACKET socket — raw-packet sniffing primitive."""
@@ -200,12 +301,10 @@ class TestSyscallFilterBlocks(unittest.TestCase):
             int main(){int s=socket(AF_PACKET,SOCK_RAW,0);
               printf("fd=%d\\n",s);return s<0?0:1;}
         """, "afpkt")
-        self.assertTrue(
-            "fd=-1" in (r.stdout or "") or r.returncode != 0,
-            f"AF_PACKET socket() should be blocked: {r.stdout}",
-        )
+        _assert_syscall_blocked(self, r, "socket(AF_PACKET)", token="fd")
 
 
+@requires_landlock
 class TestProfilePtraceBehavior(unittest.TestCase):
     """Claim: ptrace is blocked in 'full' profile, allowed in 'debug'.
 
@@ -242,11 +341,9 @@ class TestProfilePtraceBehavior(unittest.TestCase):
     def test_ptrace_blocked_in_full(self):
         r = self._run_probe("full")
         # Full profile: ptrace should be seccomp-blocked (returns -1 or
-        # SIGSYS-killed).
-        self.assertTrue(
-            "r=-1" in (r.stdout or "") or r.returncode != 0,
-            f"ptrace must be blocked in 'full': rc={r.returncode} out={r.stdout}",
-        )
+        # SIGSYS-killed). This probe encodes "blocked" as exit 1
+        # (it exits 0 when PTRACE_TRACEME succeeded).
+        _assert_syscall_blocked(self, r, "ptrace", blocked_rc=1)
 
     def test_ptrace_allowed_in_debug(self):
         r = self._run_probe("debug")
@@ -264,33 +361,42 @@ class TestAPIContract(unittest.TestCase):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
+    @requires_landlock
     def test_shell_true_rejected(self):
         """shell=True reinterprets argv into `sh -c argv[0] argv[1:]` which
         silently mangles our unshare command-line construction and is a
         shell-injection surface. Must be rejected early with TypeError."""
-        with self.assertRaises(TypeError) as cm:
-            with sandbox() as run:
-                run(["echo", "hello"], shell=True)
+        with self.assertRaises(TypeError) as cm, sandbox() as run:
+            run(["echo", "hello"], shell=True)
         self.assertIn("shell", str(cm.exception).lower())
 
     def test_pass_fds_socket_rejected(self):
-        """An inherited AF_UNIX socket FD can reach the docker daemon
-        socket. Defense: stat each pass_fds entry and refuse S_ISSOCK.
-        Pipe FDs (S_ISFIFO) remain allowed for legitimate stdin piping."""
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
-        # Create a socket FD — should be rejected
-        s1, s2 = socket.socketpair()
+        """An inherited AF_UNIX socket FD connected to a pathname
+        listener can reach the docker daemon socket. Defense: refuse
+        any pass_fds socket that has an addressable endpoint. (The
+        one admitted socket shape — an own anonymous socketpair half,
+        pipe-equivalent — is covered in test_pass_fds_socketpair.py;
+        pipe FDs remain allowed for legitimate stdin piping.)"""
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
+        # A client connected to a pathname AF_UNIX listener — the
+        # /var/run/docker.sock shape — must be rejected.
+        sock_path = os.path.join(self.tmp.name, "daemon.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            with self.assertRaises((TypeError, ValueError)):
-                with sandbox(
-                    target="/tmp", output=self.tmp.name,
-                ) as run:
-                    run(["true"], pass_fds=[s1.fileno()], timeout=5)
+            listener.bind(sock_path)
+            listener.listen(1)
+            client.connect(sock_path)
+            with self.assertRaises((TypeError, ValueError)), sandbox(
+                target=self.tmp.name, output=self.tmp.name,
+            ) as run:
+                run(["true"], pass_fds=[client.fileno()], timeout=5)
         finally:
-            s1.close()
-            s2.close()
+            client.close()
+            listener.close()
 
+    @requires_landlock
     def test_pass_fds_pipe_allowed(self):
         """Pipe FD (S_ISFIFO) must NOT trigger the socket-rejection path."""
         if not check_net_available():
@@ -298,7 +404,7 @@ class TestAPIContract(unittest.TestCase):
         rfd, wfd = os.pipe()
         try:
             with sandbox(
-                target="/tmp", output=self.tmp.name,
+                target=self.tmp.name, output=self.tmp.name,
             ) as run:
                 # Pass the read end — the child won't read it, we only
                 # care that pass_fds doesn't reject valid pipes.
@@ -353,21 +459,26 @@ class TestFakeHomeXDGRedirection(unittest.TestCase):
     """Claim: fake_home redirects not just HOME but every XDG_*_HOME."""
 
     def setUp(self):
-        if not check_net_available() or not check_landlock_available():
-            self.skipTest("Needs user-ns + Landlock")
+        if (not check_net_available() or not check_landlock_available()
+                or not check_mount_available()):
+            self.skipTest("Needs user-ns + Landlock + mount-ns")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
     def test_all_xdg_vars_redirected(self):
         """Confirm HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, XDG_DATA_HOME,
-        XDG_STATE_HOME all point inside {output}/.home/."""
+        XDG_STATE_HOME all point inside the fake home. setUp requires
+        the mount-ns lane, where the fake home lives in the per-sandbox
+        private /tmp (/tmp/.home): the ``<output>/.home`` intake is
+        copied there so the child's home never names the run
+        directory."""
         out = self.tmp.name
         r = run_untrusted(
             ["sh", "-c",
-             'for v in HOME XDG_CONFIG_HOME XDG_CACHE_HOME '
-             'XDG_DATA_HOME XDG_STATE_HOME; do '
-             'eval echo "$v=\\$$v"; done'],
-            target="/tmp", output=out,
+             ('for v in HOME XDG_CONFIG_HOME XDG_CACHE_HOME '
+              'XDG_DATA_HOME XDG_STATE_HOME; do '
+              'eval echo "$v=\\$$v"; done')],
+            target=out, output=out,
             capture_output=True, text=True, timeout=5,
         )
         self.assertEqual(r.returncode, 0)
@@ -377,8 +488,12 @@ class TestFakeHomeXDGRedirection(unittest.TestCase):
                     "XDG_DATA_HOME", "XDG_STATE_HOME"):
             self.assertIn(key, kv, f"{key} missing from env")
             self.assertTrue(
-                kv[key].startswith(os.path.join(out, ".home")),
-                f"{key}={kv[key]!r} — expected under {out}/.home/",
+                kv[key].startswith("/tmp/.home"),
+                f"{key}={kv[key]!r} — expected under /tmp/.home/",
+            )
+            self.assertNotIn(
+                out, kv[key],
+                f"{key}={kv[key]!r} — must not name the run directory",
             )
 
 
@@ -467,14 +582,15 @@ class TestProxyHostnameMatchRigor(unittest.TestCase):
         self.assertFalse(p.is_host_allowed("mueller.de"))
 
 
+@requires_landlock
 class TestOOMScoreAdjWrite(unittest.TestCase):
     """Adversarial gap: a child can write `/proc/self/oom_score_adj` to
     deprioritise itself (or prioritise) in the OOM killer. Under memory
     pressure this bumps other host processes ahead of the malicious child."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
@@ -492,9 +608,9 @@ class TestOOMScoreAdjWrite(unittest.TestCase):
         UNCHANGED. Assert that, rather than the specific mechanism.
         """
         r = run_untrusted(
-            ["sh", "-c", "echo -1000 > /proc/self/oom_score_adj 2>&1; "
-                         "cat /proc/self/oom_score_adj 2>&1"],
-            target="/tmp", output=self.tmp.name,
+            ["sh", "-c", ("echo -1000 > /proc/self/oom_score_adj 2>&1; "
+                          "cat /proc/self/oom_score_adj 2>&1")],
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=5,
         )
         out = (r.stdout or "") + (r.stderr or "")
@@ -506,6 +622,7 @@ class TestOOMScoreAdjWrite(unittest.TestCase):
                          f"oom_score_adj was actually lowered to -1000: {out!r}")
 
 
+@requires_landlock
 class TestNewMountAPIBlocked(unittest.TestCase):
     """Adversarial gap: the new mount API syscalls (kernel 5.2+,
     fsopen/fsmount/fspick/move_mount/mount_setattr) could let a child
@@ -513,8 +630,8 @@ class TestNewMountAPIBlocked(unittest.TestCase):
     bounded by user-ns rules; the new API may have different semantics."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
@@ -542,38 +659,34 @@ class TestNewMountAPIBlocked(unittest.TestCase):
 
     def test_fsopen_blocked(self):
         r = self._run_syscall_probe("SYS_fsopen", "fsopen")
-        self.assertTrue("r=-1" in (r.stdout or "") or r.returncode != 0,
-                        f"fsopen should be blocked: {r.stdout}")
+        _assert_syscall_blocked(self, r, "fsopen")
 
     def test_fsmount_blocked(self):
         r = self._run_syscall_probe("SYS_fsmount", "fsmount")
-        self.assertTrue("r=-1" in (r.stdout or "") or r.returncode != 0,
-                        f"fsmount should be blocked: {r.stdout}")
+        _assert_syscall_blocked(self, r, "fsmount")
 
     def test_fspick_blocked(self):
         r = self._run_syscall_probe("SYS_fspick", "fspick")
-        self.assertTrue("r=-1" in (r.stdout or "") or r.returncode != 0,
-                        f"fspick should be blocked: {r.stdout}")
+        _assert_syscall_blocked(self, r, "fspick")
 
     def test_move_mount_blocked(self):
         r = self._run_syscall_probe("SYS_move_mount", "move_mount")
-        self.assertTrue("r=-1" in (r.stdout or "") or r.returncode != 0,
-                        f"move_mount should be blocked: {r.stdout}")
+        _assert_syscall_blocked(self, r, "move_mount")
 
     def test_mount_setattr_blocked(self):
         r = self._run_syscall_probe("SYS_mount_setattr", "mount_setattr")
-        self.assertTrue("r=-1" in (r.stdout or "") or r.returncode != 0,
-                        f"mount_setattr should be blocked: {r.stdout}")
+        _assert_syscall_blocked(self, r, "mount_setattr")
 
 
+@requires_landlock
 class TestProcNetTCPLeak(unittest.TestCase):
     """Claim: under net-ns, the child's /proc/net/tcp shows only ns-local
     sockets (empty when block_network=True, proxy-only when use_egress_proxy).
     Gap check: confirm no host sockets leak through."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
@@ -599,7 +712,7 @@ class TestProcNetTCPLeak(unittest.TestCase):
     def test_net_ns_hides_host_tcp(self):
         r = run_untrusted(
             ["cat", "/proc/net/tcp"],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=5,
         )
         self.assertEqual(r.returncode, 0)
@@ -633,7 +746,7 @@ class TestSymlinkInReadablePaths(unittest.TestCase):
         from core.sandbox import run as sandbox_run
         r = sandbox_run(
             ["cat", str(symlink_dir / "secret.txt")],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             restrict_reads=True,
             readable_paths=[str(symlink_dir)],
             capture_output=True, text=True, timeout=5,
@@ -677,6 +790,7 @@ class TestSafeEnvAllowlistHygiene(unittest.TestCase):
                              f"{name} leaked into SAFE_ENV_ALLOWLIST")
 
 
+@requires_landlock
 class TestMapRootGetuid(unittest.TestCase):
     """Claim: `map_root=True` makes the child see itself as uid 0 INSIDE
     the user-ns. This is NOT real root on the host — it is capability
@@ -688,8 +802,8 @@ class TestMapRootGetuid(unittest.TestCase):
     so a switch to identity-mapping becomes a visible test change."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
@@ -751,26 +865,24 @@ class TestMapRootGetuid(unittest.TestCase):
                         f"(Landlock-only fallback); got: {r.stdout}")
 
 
+@requires_landlock
 class TestPidNamespaceDefenses(unittest.TestCase):
     """Claims: PID ns hides host PIDs (kill/ptrace/procfs cross-lookup)."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
     def test_self_runs_as_init_pid(self):
-        """Child should see itself as a low pid (1, 2, or 3) inside the
-        PID namespace. The exact value depends on layout:
-        - pid=1 if target is the direct pid-ns init
-        - pid=2 under the mount-ns path's intermediate fork
-        - pid=3 under the subprocess-path pid-1 shim
-          (libexec/raptor-pid1-shim with its double-fork layout)
+        """Child should see itself as a low pid (1, 2, or 3) inside
+        the PID namespace (pid=2 on the spawn backend: the in-ns init
+        waiter is pid-1 so the target keeps normal signal semantics).
         Any of these prove host pids are hidden."""
         r = run_untrusted(
             ["sh", "-c", "echo $$"],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=5,
         )
         self.assertEqual(r.returncode, 0)
@@ -780,9 +892,27 @@ class TestPidNamespaceDefenses(unittest.TestCase):
         """kill(host_pid) must return ESRCH — the host PID does not exist
         inside the PID namespace."""
         host_pid = os.getpid()
+        if host_pid < 300:
+            # A fresh pid namespace hands out 1, 2, 3, ... to the
+            # sandbox's own processes, so a SMALL host pid (a nested-
+            # namespace test runner: pytest under unshare -pf IS pid 1)
+            # can exist inside the child namespace as a DIFFERENT
+            # process -- kill -0 / procfs on it then probes the
+            # sandbox's own tree and cannot discriminate host
+            # visibility. 300 mirrors the lowest-pid gate used for
+            # kill safety fleet-wide: comfortably above the handful of
+            # pids a fresh namespace allocates during one sandbox run
+            # (false-pass direction), and far below the pids a real
+            # host session runs at, so the test still executes
+            # everywhere it is meaningful (false-skip direction).
+            self.skipTest(
+                f"test runner pid {host_pid} is small enough to "
+                "collide with the sandbox's fresh pid namespace -- "
+                "host-visibility probe would be vacuous"
+            )
         r = run_untrusted(
             ["sh", "-c", f"kill -0 {host_pid} 2>&1; echo rc=$?"],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=5,
         )
         out = r.stdout or ""
@@ -792,19 +922,20 @@ class TestPidNamespaceDefenses(unittest.TestCase):
         )
 
 
+@requires_landlock
 class TestForkBombBounded(unittest.TestCase):
     """Claim: RLIMIT_NPROC via prlimit-wrapper bounds fork bombs per sandbox."""
 
     def setUp(self):
-        if not check_net_available():
-            self.skipTest("User namespaces not available")
+        if not check_net_available() or not check_mount_available():
+            self.skipTest("User/mount namespaces not available")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
     def test_fork_bomb_capped(self):
         r = run_untrusted(
             ["sh", "-c", "i=0; while [ $i -lt 5000 ]; do sleep 30 & i=$((i+1)); done; echo $i"],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=10,
         )
         # Must not reach 5000 — should hit RLIMIT_NPROC first.
@@ -818,15 +949,16 @@ class TestRestrictReadsCredentialExfil(unittest.TestCase):
     restrict_reads blocks host-pid /proc/<pid>/environ."""
 
     def setUp(self):
-        if not check_net_available() or not check_landlock_available():
-            self.skipTest("Needs user-ns + Landlock")
+        if (not check_net_available() or not check_landlock_available()
+                or not check_mount_available()):
+            self.skipTest("Needs user-ns + Landlock + mount-ns")
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
     def test_fake_home_hides_ssh_creds(self):
         r = run_untrusted(
             ["sh", "-c", "cat ~/.ssh/id_rsa 2>&1 || echo NOACCESS"],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=5,
         )
         out = (r.stdout or "") + (r.stderr or "")
@@ -839,9 +971,27 @@ class TestRestrictReadsCredentialExfil(unittest.TestCase):
         """Cross-process /proc/<host_pid>/environ read must return ENOENT
         (host pid invisible under the new PID ns)."""
         host_pid = os.getpid()
+        if host_pid < 300:
+            # A fresh pid namespace hands out 1, 2, 3, ... to the
+            # sandbox's own processes, so a SMALL host pid (a nested-
+            # namespace test runner: pytest under unshare -pf IS pid 1)
+            # can exist inside the child namespace as a DIFFERENT
+            # process -- kill -0 / procfs on it then probes the
+            # sandbox's own tree and cannot discriminate host
+            # visibility. 300 mirrors the lowest-pid gate used for
+            # kill safety fleet-wide: comfortably above the handful of
+            # pids a fresh namespace allocates during one sandbox run
+            # (false-pass direction), and far below the pids a real
+            # host session runs at, so the test still executes
+            # everywhere it is meaningful (false-skip direction).
+            self.skipTest(
+                f"test runner pid {host_pid} is small enough to "
+                "collide with the sandbox's fresh pid namespace -- "
+                "host-visibility probe would be vacuous"
+            )
         r = run_untrusted(
             ["sh", "-c", f"cat /proc/{host_pid}/environ 2>&1 || echo BLOCKED"],
-            target="/tmp", output=self.tmp.name,
+            target=self.tmp.name, output=self.tmp.name,
             capture_output=True, text=True, timeout=5,
         )
         out = (r.stdout or "") + (r.stderr or "")
@@ -851,6 +1001,7 @@ class TestRestrictReadsCredentialExfil(unittest.TestCase):
         )
 
 
+@requires_landlock
 class TestParentSideTOCTOU(unittest.TestCase):
     """Claims: parent-side writes into {output} defeat child-planted symlinks
     and FIFOs via O_NOFOLLOW + fstat S_ISREG / lstat-first-makedirs."""
@@ -921,9 +1072,9 @@ class TestCLIPrecedence(unittest.TestCase):
         state._cli_sandbox_disabled = self._saved_disabled
 
     def test_unknown_profile_raises(self):
-        with self.assertRaises(ValueError) as cm:
-            with sandbox(profile="not-a-real-profile"):
-                pass
+        with self.assertRaises(ValueError) as cm, \
+                sandbox(profile="not-a-real-profile"):
+            pass
         self.assertIn("Unknown sandbox profile", str(cm.exception))
         self.assertIn("not-a-real-profile", str(cm.exception))
 
@@ -936,7 +1087,7 @@ class TestCLIPrecedence(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             r = run_untrusted(
                 ["sh", "-c", "ls /proc/self/net/route >/dev/null && echo HAS_NET"],
-                target="/tmp", output=tmp,
+                target=tmp, output=tmp,
                 capture_output=True, text=True, timeout=5,
             )
         # Under --sandbox none, network is open and /proc net routing info is available
@@ -944,6 +1095,7 @@ class TestCLIPrecedence(unittest.TestCase):
         self.assertIn("HAS_NET", r.stdout or "")
 
 
+@requires_landlock
 class TestProxyIsGlobalScreen(unittest.TestCase):
     """Claim: proxy rejects resolved IPs that are not globally routable
     (loopback, RFC1918, CGNAT 100.64/10, link-local, TEST-NET, etc.)."""
@@ -957,17 +1109,58 @@ class TestProxyIsGlobalScreen(unittest.TestCase):
     def test_loopback_resolved_ip_rejected(self):
         """'localhost' is allowlisted as a hostname but resolves to 127.0.0.1
         which fails the is_global check. Must yield denied_resolved_ip."""
-        with sandbox(
+        # Hermetic on mandatory-proxy hosts: with a live HTTPS_PROXY in
+        # the test env, the egress proxy autodetects an upstream and
+        # delegates DNS to it — the CONNECT takes the upstream path and
+        # the local is_global screen this test exercises never runs
+        # (event: upstream_failed instead of denied_resolved_ip). Scrub
+        # the proxy env and reset the proxy singleton so the direct
+        # path is taken; reset again on cleanup so later tests re-detect
+        # from the real env.
+        import os
+        from unittest.mock import patch as _patch
+
+        from core.sandbox.proxy import _reset_for_tests
+        _scrubbed = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in
+            ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+        }
+        _reset_for_tests()
+        self.addCleanup(_reset_for_tests)
+        with _patch.dict(os.environ, _scrubbed, clear=True), sandbox(
             use_egress_proxy=True, proxy_hosts=["localhost"],
             output=self.tmp.name, caller_label="is-global-test",
         ) as run:
-            # Any CONNECT through the proxy to localhost forces the is_global path
-            run(
-                ["curl", "-s", "-o", "/dev/null", "--max-time", "2",
-                 "https://localhost/"],
-                capture_output=True, text=True, timeout=8,
-            )
+            # Any CONNECT through the proxy to localhost forces the is_global path.
+            # Generous --max-time: the budget covers the whole sandbox
+            # bring-up (namespaces, forwarder, seccomp) before curl even
+            # sends CONNECT — a loaded host blew a 2s budget and the
+            # denial event never got a chance to exist (observed as an
+            # empty events list under a full parallel battery). The
+            # denial itself is immediate once the CONNECT arrives, and
+            # idempotent — so an empty events list (curl never got as
+            # far as CONNECT under load) earns retries inside the
+            # same sandbox rather than a flake.
+            for _attempt in range(3):
+                run(
+                    ["curl", "-s", "-o", "/dev/null", "--max-time", "15",
+                     "https://localhost/"],
+                    capture_output=True, text=True, timeout=45,
+                )
+                if run.events:
+                    break
         events = run.events  # cumulative per-sandbox view (see sandbox.md)
+        if not events:
+            # curl never reached CONNECT (a saturated host starved
+            # every attempt before the proxy saw traffic) — the
+            # is_global screen was not EXERCISED, which is not
+            # evidence it is broken. Skip loudly instead of failing
+            # on starvation.
+            self.skipTest(
+                "no proxy events after 3 attempts — CONNECT never "
+                "reached the proxy under host load; is_global screen "
+                "unexercised")
         results = [e.get("result") for e in events]
         self.assertIn("denied_resolved_ip", results,
                       f"Expected denied_resolved_ip; got {results}")

@@ -1,0 +1,630 @@
+"""Tests for the precondition mechanical verifier."""
+
+from __future__ import annotations
+
+import pytest
+
+from core.audit.precondition_check import (
+    CheckResult,
+    PreconditionVerdict,
+    verify_preconditions,
+    _extract_c_function,
+    _check_null_termination,
+    _check_bounds,
+    _check_sanitization,
+    _check_attacker_control,
+    _check_reaches_sink,
+)
+
+
+# ── Fixtures ────────────────────────────────────────────────────────
+
+REQPARSE_C = """\
+#include <string.h>
+#include <stdio.h>
+
+#define MAX_METHOD_LEN 16
+
+int is_valid_method(const char *method) {
+    if (strcmp(method, "GET") == 0) return 1;
+    if (strcmp(method, "POST") == 0) return 1;
+    return 0;
+}
+
+int parse_request(const char *raw, struct request *req) {
+    size_t method_len = strcspn(raw, " ");
+    if (method_len >= MAX_METHOD_LEN) return -1;
+    memcpy(req->method, raw, method_len);
+    req->method[method_len] = '\\0';
+    if (!is_valid_method(req->method)) return -1;
+
+    const char *path_start = raw + method_len + 1;
+    size_t path_len = strcspn(path_start, " ");
+    memcpy(req->path, path_start, path_len);
+    req->path[path_len] = '\\0';
+
+    return 0;
+}
+
+void handle_connection(int fd) {
+    char buf[4096];
+    int n = read(fd, buf, sizeof(buf));
+    struct request req;
+    parse_request(buf, &req);
+}
+"""
+
+
+@pytest.fixture
+def target_dir(tmp_path):
+    """Create a target directory with reqparse.c."""
+    (tmp_path / "reqparse.c").write_text(REQPARSE_C)
+    return tmp_path
+
+
+# ── Unit tests for check functions ──────────────────────────────────
+
+class TestCheckNullTermination:
+    """Bare call tokens (strncpy/strdup anywhere in the function) are weak
+    whole-function evidence and cap at 'inconclusive' under expect_absent,
+    matching _check_bounds/_check_sanitization. Only an explicit terminator
+    store — parameter-bound when a parameter is named — contradicts."""
+
+    def test_finds_explicit_null_termination(self):
+        source = "req->method[method_len] = '\\0';\nreq->path[path_len] = '\\0';"
+        result = _check_null_termination(source, "f.c", "fn", "", expect_absent=True)
+        assert result.verdict == "contradicted"
+
+    def test_no_null_termination(self):
+        source = "memcpy(buf, src, len);\nreturn buf;"
+        result = _check_null_termination(source, "f.c", "fn", "", expect_absent=True)
+        assert result.verdict == "supported"
+
+    def test_bare_strncpy_is_inconclusive(self):
+        source = "strncpy(dst, src, n);"
+        result = _check_null_termination(
+            source, "f.c", "fn", "", expect_absent=True,
+        )
+        assert result.verdict == "inconclusive"
+        assert "cannot confirm" in result.evidence
+
+    def test_bare_strdup_is_inconclusive(self):
+        source = "char *copy = strdup(input);"
+        result = _check_null_termination(
+            source, "f.c", "fn", "", expect_absent=True,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_bare_snprintf_is_inconclusive(self):
+        source = "snprintf(tmp, sizeof(tmp), \"%d\", x);"
+        result = _check_null_termination(
+            source, "f.c", "fn", "", expect_absent=True,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_token_with_parameter_named_is_inconclusive(self):
+        # strncpy present, parameter named but never explicitly
+        # terminated — the token alone must not contradict.
+        source = "strncpy(other, src, n);"
+        result = _check_null_termination(
+            source, "f.c", "fn", "buf", expect_absent=True,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_param_bound_store_contradicts(self):
+        source = "memcpy(buf, src, n);\nbuf[n] = '\\0';"
+        result = _check_null_termination(
+            source, "f.c", "fn", "buf", expect_absent=True,
+        )
+        assert result.verdict == "contradicted"
+        assert "buf" in result.evidence
+
+    def test_store_on_other_buffer_does_not_bind_parameter(self):
+        source = "scratch[i] = '\\0';"
+        result = _check_null_termination(
+            source, "f.c", "fn", "buf", expect_absent=True,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_unqualified_claim_store_contradicts(self):
+        # No parameter named: an explicit terminator store directly
+        # contradicts a generic "does not null-terminate" claim.
+        source = "out[len] = '\\0';"
+        result = _check_null_termination(
+            source, "f.c", "fn", "", expect_absent=True,
+        )
+        assert result.verdict == "contradicted"
+
+    def test_expect_present_and_found(self):
+        source = "buf[len] = '\\0';"
+        result = _check_null_termination(source, "f.c", "fn", "", expect_absent=False)
+        assert result.verdict == "supported"
+
+    def test_expect_present_token_still_supports(self):
+        source = "strncpy(dst, src, n);"
+        result = _check_null_termination(
+            source, "f.c", "fn", "", expect_absent=False,
+        )
+        assert result.verdict == "supported"
+
+    def test_expect_present_nothing_found_inconclusive(self):
+        source = "memcpy(buf, src, len);"
+        result = _check_null_termination(
+            source, "f.c", "fn", "", expect_absent=False,
+        )
+        assert result.verdict == "inconclusive"
+
+
+class TestCheckBounds:
+    def test_finds_length_check_inconclusive(self):
+        source = "if (method_len >= MAX_METHOD_LEN) return -1;"
+        result = _check_bounds(source, "f.c", "fn", "", expect_absent=True)
+        assert result.verdict == "inconclusive"
+
+    def test_no_bounds(self):
+        source = "char *p = src; return p;"
+        result = _check_bounds(source, "f.c", "fn", "", expect_absent=True)
+        assert result.verdict == "supported"
+
+
+class TestCheckSanitization:
+    def test_finds_validation_call_inconclusive(self):
+        source = "if (!is_valid_method(req->method)) return -1;"
+        result = _check_sanitization(source, "f.c", "fn", "", expect_absent=True)
+        assert result.verdict == "inconclusive"
+
+    def test_no_sanitization(self):
+        source = "int x = a + b;\nreturn x;"
+        result = _check_sanitization(source, "f.c", "fn", "", expect_absent=True)
+        assert result.verdict == "supported"
+
+
+class TestCheckAttackerControl:
+    def test_function_is_entry_point(self):
+        ctx = {"entry_points": ["handle_connection"], "call_edges": []}
+        result = _check_attacker_control(
+            "", "f.c", "handle_connection", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "supported"
+
+    def test_function_not_reachable(self):
+        # helper's caller IS recorded in the map, so the exhausted
+        # walk is real evidence — and none of it reaches an entry
+        # point.  This is the legitimate demoting case.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "orphan", "callee": "helper"},
+            {"caller": "main", "callee": "unrelated"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "contradicted"
+
+    def test_absent_from_map_is_inconclusive(self):
+        # The map is LLM-authored /understand output and routinely
+        # incomplete: when no call edge names the function at all, an
+        # empty upward walk is graph incompleteness, not
+        # unreachability — it must not mint the only demoting verdict.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "main", "callee": "other"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+        assert "no call edge naming helper" in result.evidence
+
+    def test_absent_from_map_earns_no_absence_receipt(self):
+        # Two-direction guard: the same non-evidence must not earn a
+        # supported unreachability receipt for the absence claim
+        # either — "no pattern found" is not a positive receipt.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "main", "callee": "other"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=True, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_empty_edge_list_is_inconclusive(self):
+        # Degenerate incompleteness: a map with entry points but no
+        # edges at all records nothing about anyone.
+        ctx = {"entry_points": ["main"], "call_edges": []}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_combined_form_edge_matches_bare_hypothesis(self):
+        # Edges keyed "file:func" while the hypothesis carries the
+        # bare name: the edge must still be seen — mixed key shapes
+        # made real reachability invisible and the empty walk read as
+        # a refutation.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "src/a.c:main", "callee": "src/a.c:helper"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "supported"
+
+    def test_mixed_key_shapes_walk_across_hops(self):
+        # Bare and combined forms alternating along the chain must
+        # still chain up to the entry point.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "main", "callee": "src/b.c:mid"},
+            {"caller": "src/b.c:mid", "callee": "helper"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "supported"
+
+    def test_no_context_map(self):
+        result = _check_attacker_control("", "f.c", "fn", "", True, None)
+        assert result.verdict == "inconclusive"
+
+    def test_malformed_precondition_records_degrade(self, tmp_path):
+        # LLM-written records: a non-dict entry or a string-shaped
+        # location must read as an inconclusive check, never abort
+        # the pass.
+        from core.audit.precondition_check import verify_preconditions
+        verdict = verify_preconditions(
+            [
+                "not-a-dict",
+                {"check_type": "caller_bounds_checks",
+                 "location": "src/a.c:fn",
+                 "assumption": "bounds checked"},
+            ],
+            tmp_path,
+        )
+        assert len(verdict.checks) == 2
+        assert all(c.verdict == "inconclusive" for c in verdict.checks)
+
+    def test_three_hop_reachable_is_supported(self):
+        # The old walk capped at 2 hops and returned "contradicted"
+        # for anything past the horizon — bounded negative evidence
+        # used as a refutation.  The full walk must find this path.
+        ctx = {
+            "entry_points": ["main"],
+            "call_edges": [
+                {"caller": "main", "callee": "dispatch"},
+                {"caller": "dispatch", "callee": "route"},
+                {"caller": "route", "callee": "helper"},
+            ],
+        }
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False,
+            context_map=ctx,
+        )
+        assert result.verdict == "supported"
+
+    def test_three_hop_reachable_contradicts_absence_claim(self):
+        ctx = {
+            "entry_points": ["main"],
+            "call_edges": [
+                {"caller": "main", "callee": "dispatch"},
+                {"caller": "dispatch", "callee": "route"},
+                {"caller": "route", "callee": "helper"},
+            ],
+        }
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=True,
+            context_map=ctx,
+        )
+        assert result.verdict == "contradicted"
+
+    def test_cyclic_edges_terminate(self):
+        ctx = {
+            "entry_points": ["main"],
+            "call_edges": [
+                {"caller": "a", "callee": "helper"},
+                {"caller": "b", "callee": "a"},
+                {"caller": "a", "callee": "b"},
+            ],
+        }
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False,
+            context_map=ctx,
+        )
+        assert result.verdict == "contradicted"
+
+    def test_truncated_walk_is_inconclusive(self, monkeypatch):
+        # Hitting the node cap is a horizon, not evidence — both claim
+        # directions must degrade to inconclusive.
+        import core.audit.precondition_check as pc
+        monkeypatch.setattr(pc, "_REACHABILITY_NODE_CAP", 2)
+        ctx = {
+            "entry_points": ["main"],
+            "call_edges": [
+                {"caller": f"f{i}", "callee": f"f{i + 1}"}
+                for i in range(6)
+            ] + [{"caller": "main", "callee": "f0"}],
+        }
+        for expect_absent in (False, True):
+            result = _check_attacker_control(
+                "", "f.c", "f6", "", expect_absent=expect_absent,
+                context_map=ctx,
+            )
+            assert result.verdict == "inconclusive", expect_absent
+            assert "truncated" in result.evidence
+
+    def test_no_entry_points_is_inconclusive(self):
+        ctx = {"entry_points": [], "call_edges": [
+            {"caller": "main", "callee": "helper"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+
+class TestCheckReachesSink:
+    def test_finds_strcpy(self):
+        source = "strcpy(dst, src);"
+        result = _check_reaches_sink(source, "f.c", "fn", "", expect_absent=False)
+        assert result.verdict == "supported"
+
+    def test_no_sinks_inconclusive(self):
+        source = "int x = 1;\nreturn x;"
+        result = _check_reaches_sink(source, "f.c", "fn", "", expect_absent=False)
+        assert result.verdict == "inconclusive"
+
+
+# ── Integration: verify_preconditions with real files ───────────────
+
+class TestVerifyPreconditions:
+    def test_contradicts_false_assumption(self, target_dir):
+        """The model claims parse_request does NOT null-terminate method.
+        The code clearly does (line: req->method[method_len] = '\\0').
+        The verifier should contradict this."""
+        preconditions = [{
+            "assumption": "parse_request does not null-terminate method",
+            "check_type": "caller_null_terminates",
+            "location": {"file": "reqparse.c", "function": "parse_request"},
+            "expect_absent": True,
+            "parameter": "method",
+        }]
+        verdict = verify_preconditions(preconditions, target_dir)
+        assert verdict.any_contradicted
+        assert "null-terminate" in verdict.contradiction_summary.lower()
+
+    def test_supports_true_assumption(self, target_dir):
+        """The model claims handle_connection does NOT sanitize input.
+        handle_connection just reads and passes buf — no sanitization.
+        The verifier should support this."""
+        preconditions = [{
+            "assumption": "handle_connection does not sanitize the raw input",
+            "check_type": "caller_sanitizes",
+            "location": {"file": "reqparse.c", "function": "handle_connection"},
+            "expect_absent": True,
+        }]
+        verdict = verify_preconditions(preconditions, target_dir)
+        assert not verdict.any_contradicted
+
+    def test_inconclusive_on_missing_file(self, target_dir):
+        preconditions = [{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {"file": "nonexistent.c", "function": "foo"},
+            "expect_absent": True,
+        }]
+        verdict = verify_preconditions(preconditions, target_dir)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+
+    def test_inconclusive_on_missing_function(self, target_dir):
+        preconditions = [{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {"file": "reqparse.c", "function": "nonexistent_fn"},
+            "expect_absent": True,
+        }]
+        verdict = verify_preconditions(preconditions, target_dir)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+
+    def test_traversal_path_is_inconclusive(self, tmp_path):
+        # location.file is LLM-authored: a ../ segment must not escape
+        # the analysed root (pinned across the contained-read helper
+        # migration).
+        target = tmp_path / "target"
+        target.mkdir()
+        (tmp_path / "outside.c").write_text(REQPARSE_C)
+        verdict = verify_preconditions([{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {
+                "file": "../outside.c", "function": "handle_request",
+            },
+            "expect_absent": True,
+        }], target)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+        assert "could not read" in verdict.checks[0].evidence
+
+    def test_absolute_path_is_inconclusive(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.c"
+        outside.write_text(REQPARSE_C)
+        verdict = verify_preconditions([{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {
+                "file": str(outside), "function": "handle_request",
+            },
+            "expect_absent": True,
+        }], target)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+
+    def test_nul_byte_path_is_inconclusive(self, target_dir):
+        # A NUL byte in the LLM-authored path must read as
+        # source-unavailable, not raise out of the verifier.
+        verdict = verify_preconditions([{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {
+                "file": "req\x00parse.c", "function": "handle_request",
+            },
+            "expect_absent": True,
+        }], target_dir)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+
+    def test_multiple_preconditions_one_contradicted(self, target_dir):
+        """If any precondition is contradicted, any_contradicted is True."""
+        preconditions = [
+            {
+                "assumption": "handle_connection does not sanitize",
+                "check_type": "caller_sanitizes",
+                "location": {"file": "reqparse.c", "function": "handle_connection"},
+                "expect_absent": True,
+            },
+            {
+                "assumption": "parse_request does not null-terminate",
+                "check_type": "caller_null_terminates",
+                "location": {"file": "reqparse.c", "function": "parse_request"},
+                "expect_absent": True,
+            },
+        ]
+        verdict = verify_preconditions(preconditions, target_dir)
+        assert verdict.any_contradicted
+        assert len(verdict.checks) == 2
+        contradicted = [c for c in verdict.checks if c.verdict == "contradicted"]
+        assert len(contradicted) == 1
+
+    def test_empty_preconditions(self, target_dir):
+        verdict = verify_preconditions([], target_dir)
+        assert not verdict.any_contradicted
+        assert len(verdict.checks) == 0
+
+
+# ── C function extraction ───────────────────────────────────────────
+
+class TestExtractCFunction:
+    def test_extracts_simple_function(self):
+        source = "int foo(int x) {\n    return x + 1;\n}\n"
+        result = _extract_c_function(source, "foo")
+        assert result is not None
+        assert "return x + 1" in result
+
+    def test_extracts_nested_braces(self):
+        source = "void bar() {\n    if (1) {\n        x();\n    }\n}\n"
+        result = _extract_c_function(source, "bar")
+        assert result is not None
+        assert result.endswith("}")
+
+    def test_nonexistent_function(self):
+        source = "void baz() { }"
+        result = _extract_c_function(source, "nonexistent")
+        assert result is None
+
+
+# ── PreconditionVerdict ─────────────────────────────────────────────
+
+class TestPreconditionVerdict:
+    def test_no_checks_is_not_contradicted(self):
+        v = PreconditionVerdict()
+        assert not v.any_contradicted
+        assert v.contradiction_summary == ""
+
+    def test_all_supported_is_not_contradicted(self):
+        v = PreconditionVerdict(checks=[
+            CheckResult("test", "assumption", "supported"),
+        ])
+        assert not v.any_contradicted
+
+    def test_one_contradicted(self):
+        v = PreconditionVerdict(checks=[
+            CheckResult("test", "assumption", "supported"),
+            CheckResult("null_check", "no null term", "contradicted", "found \\0"),
+        ])
+        assert v.any_contradicted
+        assert "null_check" in v.contradiction_summary
+
+
+class TestReachesSinkAbsenceTransitivity:
+    """expect_absent=True returned a 'supported' absence receipt for
+    wrapper functions whose HELPERS call the sink — the transitivity
+    its own docstring and the mirror branch refuse to conclude on."""
+
+    def _check(self, source):
+        from core.audit.precondition_check import _check_reaches_sink
+
+        return _check_reaches_sink(
+            source, "a.c", "log_input", "", True,
+        )
+
+    def test_wrapper_function_is_inconclusive(self):
+        r = self._check(
+            "void log_input(char *s) {\n"
+            "    copy_string(buf, s);\n"
+            "}\n",
+        )
+        assert r.verdict == "inconclusive"
+        assert "transitive" in r.evidence
+
+    def test_leaf_function_still_supported(self):
+        # Two-direction guard: a function with no calls at all cannot
+        # reach a sink transitively — the absence receipt stands.
+        r = self._check(
+            "int log_input(int a) {\n"
+            "    if (a > 0) { return a + 1; }\n"
+            "    return 0;\n"
+            "}\n",
+        )
+        assert r.verdict == "supported"
+        assert r.grade == "absence"
+
+    def test_direct_sink_still_inconclusive(self):
+        r = self._check(
+            "void log_input(char *s) { strcpy(buf, s); }\n",
+        )
+        assert r.verdict == "inconclusive"
+        assert "DOES reach" in r.evidence
+
+
+class TestTruncatedEdgeListDegrades:
+    """A capped call_edges list (call_edges_truncated marker from the
+    context-map callgraph enricher) is the same epistemic state as a
+    truncated walk: paths may exist past what the map records, so
+    no-path outcomes degrade to inconclusive, never contradicted."""
+
+    def test_truncated_edges_no_path_is_inconclusive(self):
+        ctx = {"entry_points": ["main"],
+               "call_edges": [
+                   {"caller": "orphan", "callee": "helper"},
+                   {"caller": "main", "callee": "unrelated"},
+               ],
+               "call_edges_truncated": True}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False,
+            context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_truncated_edges_cannot_support_unreachability(self):
+        ctx = {"entry_points": ["main"],
+               "call_edges": [
+                   {"caller": "orphan", "callee": "helper"},
+               ],
+               "call_edges_truncated": True}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=True,
+            context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_positive_reach_still_wins_over_truncation(self):
+        ctx = {"entry_points": ["main"],
+               "call_edges": [
+                   {"caller": "main", "callee": "helper"},
+               ],
+               "call_edges_truncated": True}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False,
+            context_map=ctx,
+        )
+        assert result.verdict == "supported"

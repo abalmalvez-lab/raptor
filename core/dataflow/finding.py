@@ -17,18 +17,25 @@ intermediate steps, strict JSON loading) are enforced.
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
+from typing import Any, TYPE_CHECKING
+
+from core.json import dumps_artifact, loads
+
+from core.dataflow._schema_checks import check_extra_fields, require_nonempty, unique_object_fields
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 SCHEMA_VERSION = 1
 
 
-_STEP_KEYS: FrozenSet[str] = frozenset(
+_STEP_KEYS: frozenset[str] = frozenset(
     {"file_path", "line", "column", "snippet", "label"}
 )
-_FINDING_KEYS: FrozenSet[str] = frozenset(
+_FINDING_KEYS: frozenset[str] = frozenset(
     {
         "schema_version",
         "finding_id",
@@ -43,15 +50,11 @@ _FINDING_KEYS: FrozenSet[str] = frozenset(
 )
 
 
-def _check_extra_fields(name: str, data: Mapping[str, Any], allowed: FrozenSet[str]) -> None:
-    extras = set(data.keys()) - allowed
-    if extras:
-        raise ValueError(f"unknown fields in {name} JSON: {sorted(extras)}")
-
-
-def _require_nonempty(label: str, value: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty string")
+# Strict from_dict checks — shared with the sibling value modules via
+# core.dataflow._schema_checks (local underscore names kept: they are
+# these modules' call-site and patch seams).
+_check_extra_fields = check_extra_fields
+_require_nonempty = require_nonempty
 
 
 @dataclass(frozen=True)
@@ -67,16 +70,22 @@ class Step:
     line: int
     column: int
     snippet: str
-    label: Optional[str] = None
+    label: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty("Step.file_path", self.file_path)
-        if self.line < 1:
-            raise ValueError(f"Step.line must be >= 1, got {self.line}")
-        if self.column < 0:
-            raise ValueError(f"Step.column must be >= 0, got {self.column}")
+        if not isinstance(self.snippet, str):
+            raise ValueError("Step.snippet must be a string")
+        if self.label is not None and not isinstance(self.label, str):
+            raise ValueError("Step.label must be a string or null")
+        if isinstance(self.line, bool) or not isinstance(self.line, int) or self.line < 1:
+            msg = f"Step.line must be an integer >= 1, got {self.line}"
+            raise ValueError(msg)
+        if isinstance(self.column, bool) or not isinstance(self.column, int) or self.column < 0:
+            msg = f"Step.column must be an integer >= 0, got {self.column}"
+            raise ValueError(msg)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "file_path": self.file_path,
             "line": self.line,
@@ -86,7 +95,7 @@ class Step:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "Step":
+    def from_dict(cls, data: Mapping[str, Any]) -> Step:
         _check_extra_fields("Step", data, _STEP_KEYS)
         return cls(
             file_path=data["file_path"],
@@ -118,7 +127,7 @@ class Finding:
     message: str
     source: Step
     sink: Step
-    intermediate_steps: Tuple[Step, ...] = ()
+    intermediate_steps: tuple[Step, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -126,12 +135,20 @@ class Finding:
         _require_nonempty("Finding.producer", self.producer)
         _require_nonempty("Finding.rule_id", self.rule_id)
         _require_nonempty("Finding.message", self.message)
+        for label, value in (("source", self.source), ("sink", self.sink)):
+            if not isinstance(value, Step):
+                raise TypeError(f"Finding.{label} must be a Step instance")
+        if isinstance(self.intermediate_steps, (str, bytes, Mapping)):
+            raise ValueError("Finding.intermediate_steps must be an iterable of Step instances")
+        if not isinstance(self.raw, Mapping):
+            raise ValueError("Finding.raw must be an object")
         if not isinstance(self.intermediate_steps, tuple):
             self.intermediate_steps = tuple(self.intermediate_steps)
         if not all(isinstance(s, Step) for s in self.intermediate_steps):
-            raise TypeError("Finding.intermediate_steps must contain Step instances")
+            msg = "Finding.intermediate_steps must contain Step instances"
+            raise TypeError(msg)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
             "finding_id": self.finding_id,
@@ -145,15 +162,21 @@ class Finding:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "Finding":
+    def from_dict(cls, data: Mapping[str, Any]) -> Finding:
         _check_extra_fields("Finding", data, _FINDING_KEYS)
         version = data["schema_version"]
-        if version != SCHEMA_VERSION:
-            raise ValueError(
+        if isinstance(version, bool) or not isinstance(version, int) or version != SCHEMA_VERSION:
+            msg = (
                 f"Finding schema_version {version!r} != expected "
                 f"{SCHEMA_VERSION!r}; corpus upgrade required"
             )
+            raise ValueError(msg)
         steps_raw: Iterable[Mapping[str, Any]] = data.get("intermediate_steps", [])
+        if isinstance(steps_raw, (str, bytes, Mapping)):
+            raise ValueError("Finding.intermediate_steps must be an iterable of step objects")
+        raw = data.get("raw", {})
+        if not isinstance(raw, Mapping):
+            raise ValueError("Finding.raw must be an object")
         return cls(
             finding_id=data["finding_id"],
             producer=data["producer"],
@@ -162,12 +185,15 @@ class Finding:
             source=Step.from_dict(data["source"]),
             sink=Step.from_dict(data["sink"]),
             intermediate_steps=tuple(Step.from_dict(s) for s in steps_raw),
-            raw=dict(data.get("raw", {})),
+            raw=dict(raw),
         )
 
-    def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), **kwargs)
+    def to_json(self, *, indent: int | None = None) -> str:
+        """Render as JSON. Explicit ``indent`` signature — see
+        ``core.dataflow.label.GroundTruth.to_json`` for the
+        rationale."""
+        return dumps_artifact(self.to_dict(), indent=indent)
 
     @classmethod
-    def from_json(cls, text: str) -> "Finding":
-        return cls.from_dict(json.loads(text))
+    def from_json(cls, text: str) -> Finding:
+        return cls.from_dict(loads(text, object_pairs_hook=unique_object_fields))

@@ -1,0 +1,635 @@
+"""Study-consumer repair: call-class-sized prep timeout, no
+retry-from-scratch, loud degradation, low-priority throttle slot."""
+
+from __future__ import annotations
+
+import subprocess
+import time
+import types
+from contextlib import contextmanager
+
+from core.audit.orchestrator import (
+    OrchestratorConfig,
+    OrchestratorResult,
+    StudyQueue,
+    StudyRequest,
+    _LockedOutcomes,
+    _study_consumer_loop,
+    _study_prep_timeout_s,
+)
+
+
+class TestStudyPrepTimeout:
+    def _mock_primary(self, monkeypatch, timeout):
+        mc = types.SimpleNamespace(timeout=timeout)
+        monkeypatch.setattr(
+            "core.llm.config._get_default_primary_model",
+            lambda prefer=None: mc,
+        )
+
+    def test_covers_primary_model_call_timeout(self, monkeypatch):
+        self._mock_primary(monkeypatch, 600)
+        assert _study_prep_timeout_s() == 900
+
+    def test_larger_model_timeout_raises_ceiling(self, monkeypatch):
+        self._mock_primary(monkeypatch, 1200)
+        assert _study_prep_timeout_s() == 1500
+
+    def test_tiny_model_timeout_floored(self, monkeypatch):
+        self._mock_primary(monkeypatch, 30)
+        assert _study_prep_timeout_s() == 120 + 300
+
+    def test_no_primary_model_uses_cc_default(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.llm.config._get_default_primary_model",
+            lambda prefer=None: None,
+        )
+        assert _study_prep_timeout_s() == 900
+
+    def test_config_probe_failure_tolerated(self, monkeypatch):
+        def _boom(prefer=None):
+            raise RuntimeError("config exploded")
+
+        monkeypatch.setattr(
+            "core.llm.config._get_default_primary_model", _boom,
+        )
+        assert _study_prep_timeout_s() == 900
+
+    def test_never_the_old_120s(self, monkeypatch):
+        self._mock_primary(monkeypatch, None)
+        assert _study_prep_timeout_s() > 120
+
+    @staticmethod
+    def _checklist(total_lines, *, per_fn=500):
+        items = []
+        line = 1
+        remaining = total_lines
+        while remaining > 0:
+            span = min(per_fn, remaining)
+            items.append(
+                {"name": f"f{line}", "line_start": line,
+                 "line_end": line + span - 1},
+            )
+            line += span
+            remaining -= span
+        return {"files": [{"path": "big.c", "items": items}]}
+
+    def test_cap_scales_with_target_size(self, monkeypatch):
+        # A size-blind 900s cap timed out on a large target and
+        # disabled domain models for the whole run. 100 KLoC at
+        # 3 s/KLoC buys 300 extra seconds.
+        self._mock_primary(monkeypatch, 600)
+        checklist = self._checklist(100_000)
+        assert _study_prep_timeout_s(checklist) == 900 + 300
+
+    def test_scaling_is_bounded(self, monkeypatch):
+        # A monorepo can't stretch the cap indefinitely.
+        self._mock_primary(monkeypatch, 600)
+        checklist = self._checklist(1_000_000)   # would be +3000s raw
+        assert _study_prep_timeout_s(checklist) == 900 + 900
+
+    def test_small_target_keeps_base_cap(self, monkeypatch):
+        self._mock_primary(monkeypatch, 600)
+        checklist = self._checklist(200)   # 0.2 KLoC → +0s
+        assert _study_prep_timeout_s(checklist) == 900
+
+    def test_unusable_checklist_falls_back(self, monkeypatch):
+        self._mock_primary(monkeypatch, 600)
+        assert _study_prep_timeout_s(None) == 900
+        assert _study_prep_timeout_s({}) == 900
+        assert _study_prep_timeout_s(
+            {"files": [{"items": [{"line_start": None, "line_end": "x"}]}]},
+        ) == 900
+
+
+def _capture_warnings(monkeypatch):
+    """Capture rendered logger.warning lines from the orchestrator."""
+    import core.audit.orchestrator as _orch
+
+    lines = []
+
+    def _sink(msg, *args, **kwargs):
+        try:
+            lines.append(str(msg) % args if args else str(msg))
+        except (TypeError, ValueError):
+            lines.append(str(msg))
+
+    monkeypatch.setattr(_orch.logger, "warning", _sink)
+    return lines
+
+
+def _queue_with_batches(n_items: int) -> StudyQueue:
+    q = StudyQueue()
+    for i in range(n_items):
+        q.enqueue(StudyRequest(
+            question=f"what is concept{i}?",
+            source_file="a.c",
+            source_function=f"fn{i}",
+        ))
+    q.signal_producer_done()
+    return q
+
+
+def _run_loop(config, queue, throttle=None):
+    shared = types.SimpleNamespace(domain_model=None)
+    _study_consumer_loop(
+        queue, config, shared, lambda ctx, cfg: None,
+        _LockedOutcomes(), OrchestratorResult(),
+        checklist={"files": []},
+        context_map=None,
+        evidence_index={},
+        sarif_cache=None,
+        entry_points=set(),
+        start_time=time.monotonic(),
+        on_progress=None,
+        throttle=throttle,
+    )
+
+
+class TestPrepFailureDisablesLoudly:
+    """Prep runs AT MOST once; failure disables the subsystem with one
+    operator-visible line and stops the consumer instead of retrying
+    the whole prep from scratch on every subsequent batch."""
+
+    def _config(self, tmp_path):
+        return OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            immediate_verify=False,
+        )
+
+    def test_timeout_disables_once_and_stops(self, monkeypatch, tmp_path):
+        import core.audit.orchestrator as _orch
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        # 20 items → 2 batches of 15/5: pre-fix the second batch
+        # would re-run prep from scratch.
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        assert len(calls) == 1, (
+            f"prep must run at most once, ran {len(calls)} times"
+        )
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1, (
+            f"expected exactly one loud disable line, got: {warnings}"
+        )
+        assert "timed out" in disabled[0]
+
+    def test_nonzero_exit_disables_once_and_stops(
+        self, monkeypatch, tmp_path,
+    ):
+        import core.audit.orchestrator as _orch
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=1, stderr="boom")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        assert len(calls) == 1
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "exit 1" in disabled[0]
+
+    def test_stderr_tail_terminal_scrubbed(self, monkeypatch, tmp_path):
+        # study-prep parses the hostile target: its stderr routinely
+        # quotes target-derived bytes (paths, source excerpts in parse
+        # errors) — the disable line must escape control sequences
+        # before they reach the operator's terminal.
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1,
+                stderr="parse error: \x1b]0;pwned\x07 in src/a.c",
+            )
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "\x1b" not in disabled[0]
+        assert "\x07" not in disabled[0]
+        assert "\\x1b" in disabled[0]
+
+    def test_stderr_excerpt_keeps_the_tail(self, monkeypatch, tmp_path):
+        # A Python child's diagnosis (the traceback's final frame +
+        # error line) sits at the END of stderr. A head slice keeps
+        # the boilerplate and drops the one line that names the
+        # failure — the disable line then shows 200 chars of
+        # traceback header while the actual error lives past the cut,
+        # and root-causing needs a live re-run.
+        import core.audit.orchestrator as _orch
+
+        tail_line = "TypeError: expected str, bytes or os.PathLike"
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1,
+                stderr=("Traceback (most recent call last):\n"
+                        + '  File "raptor-study-prep", in _multilang\n'
+                        * 20
+                        + tail_line),
+            )
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert tail_line in disabled[0]
+        # Elision authority travels OUT-OF-BAND, in the trusted
+        # prefix as a length count — an in-band marker is forgeable
+        # by the hostile stderr body it annotates.
+        assert "stderr tail (last 200 of " in disabled[0]
+
+    def test_short_stderr_unmarked_and_whole(self, monkeypatch, tmp_path):
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(returncode=1, stderr="boom")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "boom" in disabled[0]
+        assert "stderr tail (last" not in disabled[0]
+
+    def test_forged_elision_marker_carries_no_authority(
+        self, monkeypatch, tmp_path,
+    ):
+        # Hostile stderr (study-prep parses the target) can embed any
+        # marker text. The format's only elision signal is the
+        # trusted-prefix length count, so a forged in-band marker
+        # rides as inert quoted bytes: the count still names the TRUE
+        # total, and the genuine tail still ends the line.
+        import core.audit.orchestrator as _orch
+
+        forged = "x" * 300 + " stderr tail (last 200 of 5 chars): fake"
+        true_tail = "TypeError: the real diagnosis"
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1, stderr=forged + "\n" + true_tail,
+            )
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        total = len((forged + "\n" + true_tail).strip())
+        assert f"stderr tail (last 200 of {total} chars): " in disabled[0]
+        assert true_tail in disabled[0]
+
+    def test_disable_line_claims_only_the_real_loss(
+        self, monkeypatch, tmp_path,
+    ):
+        # Disabling the subsystem stops NEW learning; briefing-side
+        # concept injection reads domain-model.json from disk and
+        # keeps supplying already-extracted concepts. The disable
+        # line must not claim reviews run concept-blind — that
+        # over-claim steered operators to distrust verdicts that in
+        # fact carried the full model.
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(returncode=1, stderr="boom")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "without domain concepts" not in disabled[0]
+        assert "NEW concepts" in disabled[0]
+
+    def test_consumer_crash_announces_disable(
+        self, monkeypatch, tmp_path,
+    ):
+        # An exception escaping the consumer loop used to kill the
+        # daemon thread with only a threading-excepthook traceback —
+        # the run degraded SILENTLY, the exact failure the disable
+        # line exists to make loud. The wrapper must announce and
+        # still signal consumer-done (the drain path joins on it).
+        import core.audit.orchestrator as _orch
+
+        def boom(*args, **kwargs):
+            raise ValueError("wrapped \x1bhostile consumer crash")
+
+        monkeypatch.setattr(_orch, "_study_consumer_loop", boom)
+        warnings = _capture_warnings(monkeypatch)
+
+        queue = _queue_with_batches(1)
+        _orch._study_consumer(
+            queue, self._config(tmp_path),
+            types.SimpleNamespace(domain_model=None),
+            lambda ctx, cfg: None,
+            _LockedOutcomes(), OrchestratorResult(),
+            checklist={"files": []},
+            context_map=None,
+            evidence_index={},
+            sarif_cache=None,
+            entry_points=set(),
+            start_time=time.monotonic(),
+            on_progress=None,
+        )
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "study consumer crashed: ValueError" in disabled[0]
+        assert "\x1b" not in disabled[0]      # scrubbed
+        assert "\\x1b" in disabled[0]         # escaped, visible
+        assert queue._consumer_done            # finally still ran
+
+    def test_missing_study_list_disables_once(self, monkeypatch, tmp_path):
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "no study-list.json" in disabled[0]
+
+    def test_timeout_warning_surfaces_size_and_budget(
+        self, monkeypatch, tmp_path,
+    ):
+        # The size-scaled cap is used for the subprocess AND the
+        # disable warning states what the cap was sized for plus the
+        # remaining-vs-needed picture against the run's time budget.
+        import core.audit.orchestrator as _orch
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        monkeypatch.setattr(
+            "core.llm.config._get_default_primary_model",
+            lambda prefer=None: types.SimpleNamespace(timeout=600),
+        )
+        warnings = _capture_warnings(monkeypatch)
+
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path, max_seconds=3600,
+        )
+        checklist = {"files": [{"path": "big.c", "items": [
+            {"name": "f", "line_start": 1, "line_end": 100_000},
+        ]}]}
+        shared = types.SimpleNamespace(domain_model=None)
+        _study_consumer_loop(
+            _queue_with_batches(2), config, shared,
+            lambda ctx, cfg: None,
+            _LockedOutcomes(), OrchestratorResult(),
+            checklist=checklist,
+            context_map=None,
+            evidence_index={},
+            sarif_cache=None,
+            entry_points=set(),
+            start_time=time.monotonic(),
+            on_progress=None,
+        )
+
+        assert seen["timeout"] == 1200   # 900 base + 100 KLoC × 3 s
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "timed out after 1200s" in disabled[0]
+        assert "~100 KLoC" in disabled[0]
+        assert "needed >1200s" in disabled[0]
+        assert "left of the run's 3600s budget" in disabled[0]
+
+    def test_prep_uses_call_class_timeout(self, monkeypatch, tmp_path):
+        import core.audit.orchestrator as _orch
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        monkeypatch.setattr(
+            "core.llm.config._get_default_primary_model",
+            lambda prefer=None: types.SimpleNamespace(timeout=600),
+        )
+        _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(2))
+
+        assert seen["timeout"] == 900
+
+
+class _RecordingThrottle:
+    def __init__(self):
+        self.priorities = []
+
+    @contextmanager
+    def acquire_sync(self, *, low_priority=False):
+        self.priorities.append(low_priority)
+        yield
+
+
+class TestStudyRunUsesLowPriorityThrottle:
+    def test_run_study_acquires_low_priority_slot(
+        self, monkeypatch, tmp_path,
+    ):
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            # Prep "succeeds" and produces the study list.
+            (tmp_path / "study-list.json").write_text("[]")
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+
+        studied = []
+        import core.concepts.study as _study_mod
+        monkeypatch.setattr(
+            _study_mod, "run_study",
+            lambda *a, **kw: studied.append(1),
+        )
+
+        throttle = _RecordingThrottle()
+        # Stub client via the documented test seam (llm_budget_client
+        # short-circuits _run_llm_client): patching
+        # core.llm.client.LLMClient no longer intercepts construction
+        # — it goes through the transcript seam, whose module body
+        # subclasses whatever LLMClient is bound to at first import.
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            llm_budget_client=types.SimpleNamespace(
+                total_cost=0.0,
+                is_budget_exhausted=lambda: False,
+            ),
+        )
+        _run_loop(config, _queue_with_batches(2), throttle=throttle)
+
+        assert studied, "run_study was never reached"
+        assert throttle.priorities, "throttle slot never acquired"
+        assert all(p is True for p in throttle.priorities), (
+            "study batches must acquire the throttle slot at low "
+            f"priority; got {throttle.priorities}"
+        )
+
+
+class TestSkipPathsReleaseGate:
+    """Every consumer skip path must release the suppression gate for
+    the concepts it drops — a concept left pending with no future
+    batch holds the executor's suppression wait forever."""
+
+    def _config(self, tmp_path, out_dir="same"):
+        return OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path if out_dir == "same" else None,
+        )
+
+    def _loop(self, config, queue, domain_model=None):
+        shared = types.SimpleNamespace(domain_model=domain_model)
+        # These tests target batch skip/failure paths, not eager preparation.
+        # Resume at the supported prepared-state seam with an owned artifact.
+        study_list_path = None
+        if config.out_dir is not None:
+            study_list_path = config.out_dir / "study-list.json"
+            study_list_path.write_text("{}")
+        _study_consumer_loop(
+            queue, config, shared, lambda ctx, cfg: None,
+            _LockedOutcomes(), OrchestratorResult(),
+            checklist={"files": []},
+            context_map=None,
+            evidence_index={},
+            sarif_cache=None,
+            entry_points=set(),
+            start_time=time.monotonic(),
+            on_progress=None,
+            state={"study_list_built": True, "study_list_path": study_list_path},
+        )
+
+    @staticmethod
+    def _queue(*questions):
+        q = StudyQueue()
+        for question in questions:
+            q.enqueue(StudyRequest(
+                question=question,
+                source_file="a.c",
+                source_function="fn",
+                resolution="concept",
+            ))
+        q.signal_producer_done()
+        return q
+
+    def test_dedup_dropped_batch_releases_gate(self, tmp_path):
+        # Concept already in the domain model: dedup drops the whole
+        # batch — its pending entry must drain, not park forever.
+        q = self._queue("what is sk_buff?")
+        assert "sk_buff" in q.pending_concepts()
+        self._loop(
+            self._config(tmp_path), q,
+            domain_model={"concepts": [{"name": "sk_buff"}]},
+        )
+        assert q.pending_concepts() == frozenset()
+
+    def test_no_out_dir_releases_gate(self, tmp_path):
+        q = self._queue("what is foo_ctx?")
+        self._loop(self._config(tmp_path, out_dir=None), q)
+        assert q.pending_concepts() == frozenset()
+
+    def test_flush_failure_releases_gate(self, monkeypatch, tmp_path):
+        import core.concepts.audit_bridge as _bridge
+
+        def boom(*a, **kw):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(_bridge, "queue_reading_list_item", boom)
+        warnings = _capture_warnings(monkeypatch)
+        q = self._queue("what is foo_ctx?")
+        self._loop(self._config(tmp_path), q)
+        assert q.pending_concepts() == frozenset()
+        assert any("flush to reading-list failed" in m for m in warnings)
+
+    def test_study_run_failure_releases_gate(self, monkeypatch, tmp_path):
+        import core.audit.orchestrator as _orch
+
+        calls = []
+
+        def boom(config):
+            calls.append(config)
+            raise RuntimeError("transport down")
+
+        monkeypatch.setattr(_orch, "_run_llm_client", boom)
+        warnings = _capture_warnings(monkeypatch)
+        q = self._queue("what is foo_ctx?")
+        self._loop(self._config(tmp_path), q)
+        assert q.pending_concepts() == frozenset()
+        assert any("study-run failed" in m for m in warnings)
+        assert len(calls) == 1, "exercise the batch's study-run failure exactly once"
+
+
+class TestWithinBatchDuplicateKeepsHold:
+    """A dropped within-batch duplicate shares its concept with a
+    fresh sibling that is STILL being studied — marking it studied at
+    batch start would release the executor's suppression hold minutes
+    before the study result exists."""
+
+    @staticmethod
+    def _req(question):
+        return StudyRequest(
+            question=question, source_file="a.c",
+            source_function="fn", resolution="concept",
+        )
+
+    def test_duplicate_concept_stays_held_while_fresh_sibling_studies(self):
+        from core.audit.orchestrator import _mark_concepts_studied
+        q = StudyQueue()
+        q.enqueue(self._req("what is sk_buff layout?"))
+        q.enqueue(self._req("what is sk_buff lifetime?"))
+        assert "sk_buff" in q.pending_concepts()
+        fresh = [self._req("what is sk_buff layout?")]
+        dropped = [self._req("what is sk_buff lifetime?")]
+        _mark_concepts_studied(q, dropped, exclude=fresh)
+        # The fresh sibling still owns the concept: hold NOT released.
+        assert "sk_buff" in q.pending_concepts()
+        # When the fresh item's own path completes, the gate releases.
+        _mark_concepts_studied(q, fresh)
+        assert "sk_buff" not in q.pending_concepts()
+
+    def test_dropped_concept_without_fresh_sibling_still_releases(self):
+        from core.audit.orchestrator import _mark_concepts_studied
+        q = StudyQueue()
+        q.enqueue(self._req("what is netlink_sock?"))
+        assert "netlink_sock" in q.pending_concepts()
+        _mark_concepts_studied(
+            q, [self._req("what is netlink_sock?")],
+            exclude=[self._req("what is sk_buff layout?")],
+        )
+        assert "netlink_sock" not in q.pending_concepts()

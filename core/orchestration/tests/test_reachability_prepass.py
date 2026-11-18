@@ -157,3 +157,284 @@ def test_duration_recorded(tmp_path):
     })
     result = run_reachability_prepass(target, out_dir)
     assert result.duration_s >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Checklist writes go through the accessor (symlink-resolving, flocked)
+# ---------------------------------------------------------------------------
+
+
+def test_mark_unreachable_concurrent_writer_markers_survive(
+    tmp_path, monkeypatch,
+):
+    """Two writers through the accessor: the priority marker written
+    inside ``_mark_unreachable_low_priority``'s transform AND a
+    competing ``update_checklist`` write must both survive.
+
+    Pre-fix the function did a plain load+save; a write landing
+    between its read and its write was silently clobbered.
+    """
+    import threading
+    import core.atomic_fs.fs_lock as fs_lock
+
+    import core.orchestration.reachability_enrichment as re_mod
+    from core.inventory import update_checklist
+    from core.orchestration.agentic_passes import (
+        _mark_unreachable_low_priority,
+    )
+
+    out_dir = tmp_path / "agentic-out"
+    _write_checklist(out_dir, {
+        "src/a.py": [{"name": "dead", "kind": "function"}],
+    })
+
+    inside_transform = threading.Event()
+    release_transform = threading.Event()
+    contended = threading.Event()
+    real_try = fs_lock._try_flock_nb
+
+    def observe_contention(fd):
+        acquired = real_try(fd)
+        if not acquired:
+            contended.set()
+        return acquired
+
+    monkeypatch.setattr(fs_lock, "_try_flock_nb", observe_contention)
+
+    def fake_mark(checklist, target, *, inventory=None,
+                  allow_unreachable=False):
+        checklist["files"][0]["items"][0]["priority"] = "low"
+        inside_transform.set()
+        assert release_transform.wait(timeout=10), "transform was never released"
+        return 1
+
+    monkeypatch.setattr(
+        re_mod, "mark_unreachable_low_priority", fake_mark,
+    )
+
+    results = {}
+    errors = []
+
+    def run_mark():
+        try:
+            results["marked"] = _mark_unreachable_low_priority(out_dir, tmp_path)
+        except BaseException as error:
+            errors.append(error)
+
+    def add_marker(current):
+        current["competing_marker"] = True
+        return current
+
+    def run_competing():
+        try:
+            update_checklist(out_dir, add_marker)
+        except BaseException as error:
+            errors.append(error)
+
+    workers = [threading.Thread(target=run_mark), threading.Thread(target=run_competing)]
+    try:
+        workers[0].start()
+        assert inside_transform.wait(timeout=5), "marker transform never started"
+        workers[1].start()
+        # Release only after the other writer's REAL flock attempt failed.
+        # A missing accessor lock cannot pass by winning a scheduling race.
+        assert contended.wait(timeout=5), "competing writer never contended"
+        release_transform.set()
+        for worker in workers:
+            worker.join(timeout=10)
+            assert not worker.is_alive(), "checklist writer did not finish"
+        assert not errors, errors
+    finally:
+        release_transform.set()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=10)
+        assert not any(worker.is_alive() for worker in workers), "checklist writer leaked"
+
+    data = json.loads((out_dir / "checklist.json").read_text())
+    assert results["marked"] == 1
+    assert data["competing_marker"] is True
+    assert data["files"][0]["items"][0]["priority"] == "low"
+
+
+def test_mark_unreachable_preserves_project_symlink(tmp_path, monkeypatch):
+    """Project mode: checklist.json in the run dir is a symlink to the
+    project-level checklist. The write must go through the symlink,
+    not replace it with a regular file."""
+    import core.orchestration.reachability_enrichment as re_mod
+    from core.orchestration.agentic_passes import (
+        _mark_unreachable_low_priority,
+    )
+
+    # Real lifecycle shape (core/run/metadata.py): the run dir lives
+    # INSIDE the project dir, and the slot holds the one-level link
+    # ../checklist.json — the only symlink shape the checklist
+    # containment set admits.
+    project_checklist = tmp_path / "checklist.json"
+    project_checklist.write_text(json.dumps({
+        "files": [{"path": "src/a.py",
+                   "items": [{"name": "dead", "kind": "function"}]}],
+    }))
+
+    out_dir = tmp_path / "agentic-out"
+    out_dir.mkdir()
+    link = out_dir / "checklist.json"
+    link.symlink_to("../checklist.json")
+
+    def fake_mark(checklist, target, *, inventory=None,
+                  allow_unreachable=False):
+        checklist["files"][0]["items"][0]["priority"] = "low"
+        return 1
+
+    monkeypatch.setattr(
+        re_mod, "mark_unreachable_low_priority", fake_mark,
+    )
+
+    marked = _mark_unreachable_low_priority(out_dir, tmp_path)
+    assert marked == 1
+    assert link.is_symlink()
+    data = json.loads(project_checklist.read_text())
+    assert data["files"][0]["items"][0]["priority"] == "low"
+
+
+def test_mark_unreachable_no_write_when_nothing_marked(
+    tmp_path, monkeypatch,
+):
+    """A no-op transform must not rewrite the checklist."""
+    import core.orchestration.reachability_enrichment as re_mod
+    from core.orchestration.agentic_passes import (
+        _mark_unreachable_low_priority,
+    )
+
+    out_dir = tmp_path / "agentic-out"
+    path = _write_checklist(out_dir, {
+        "src/a.py": [{"name": "alive", "kind": "function"}],
+    })
+    before = path.read_text()
+    mtime_before = path.stat().st_mtime_ns
+
+    monkeypatch.setattr(
+        re_mod, "mark_unreachable_low_priority",
+        lambda checklist, target, *, inventory=None,
+        allow_unreachable=False: 0,
+    )
+
+    assert _mark_unreachable_low_priority(out_dir, tmp_path) == 0
+    assert path.read_text() == before
+    assert path.stat().st_mtime_ns == mtime_before
+
+
+# ---------------------------------------------------------------------------
+# Lock scope: heavy discovery stays outside the checklist flock
+# ---------------------------------------------------------------------------
+
+
+def test_heavy_discovery_runs_outside_checklist_flock(tmp_path, monkeypatch):
+    """Frida evidence discovery and the per-function reverse-closure
+    walk must run BEFORE update_checklist takes the cross-process
+    flock — the flock is the contention point for every checklist
+    writer in the run family, and those passes scale with target size
+    x run-dir count. Only cheap field application belongs under the
+    lock."""
+    import core.analysis.reachability as reach_mod
+    import core.inventory as inv_mod
+    import core.orchestration.frida_validation_bridge as fvb
+
+    target = _project(tmp_path, {
+        "src/vuln.py": (
+            "def dead(): pass\n"
+            "def alive(): pass\n"
+        ),
+        "src/main.py": (
+            "from src.vuln import alive\nalive()\n"
+        ),
+    })
+    out_dir = tmp_path / "agentic-out"
+    _write_checklist(out_dir, {
+        "src/vuln.py": [
+            {"name": "dead", "kind": "function", "line_start": 1},
+            {"name": "alive", "kind": "function", "line_start": 2},
+        ],
+    })
+
+    in_transform = {"active": False}
+    seen = {"evidence": [], "closure": []}
+
+    real_update = inv_mod.update_checklist
+
+    def tracking_update(output_dir, transform_fn):
+        def wrapped(current):
+            in_transform["active"] = True
+            try:
+                return transform_fn(current)
+            finally:
+                in_transform["active"] = False
+        return real_update(output_dir, wrapped)
+
+    def tracking_collect(*_a, **_k):
+        seen["evidence"].append(in_transform["active"])
+        return {}
+
+    real_closure = reach_mod.reverse_closure
+
+    def tracking_closure(*args, **kwargs):
+        seen["closure"].append(in_transform["active"])
+        return real_closure(*args, **kwargs)
+
+    monkeypatch.setattr(inv_mod, "update_checklist", tracking_update)
+    monkeypatch.setattr(fvb, "collect_runtime_evidence", tracking_collect)
+    monkeypatch.setattr(reach_mod, "reverse_closure", tracking_closure)
+
+    result = run_reachability_prepass(target, out_dir)
+    assert result.ran is True
+
+    assert seen["evidence"], "frida evidence discovery never ran"
+    assert seen["closure"], "reverse-closure walk never ran"
+    assert not any(seen["evidence"]), (
+        "frida evidence discovery ran under the checklist flock")
+    assert not any(seen["closure"]), (
+        "reverse-closure walk ran under the checklist flock")
+
+    # The lock-protected application still lands the enrichment.
+    saved = json.loads((out_dir / "checklist.json").read_text())
+    funcs = {f["name"]: f for f in saved["files"][0]["items"]}
+    assert funcs["alive"].get("caller_count_direct") is not None
+
+
+def test_precomputed_caller_context_matches_lazy_path(tmp_path):
+    """compute_caller_context + apply produces the same fields as the
+    lazy in-place computation (the pre-split behaviour)."""
+    import copy
+
+    from core.orchestration.reachability_enrichment import (
+        compute_caller_context,
+        enrich_with_caller_context,
+    )
+
+    target = _project(tmp_path, {
+        "src/vuln.py": (
+            "def helper(): pass\n"
+            "def alive(): helper()\n"
+        ),
+        "src/main.py": (
+            "from src.vuln import alive\nalive()\n"
+        ),
+    })
+    checklist = {
+        "files": [
+            {"path": "src/vuln.py", "items": [
+                {"name": "helper", "kind": "function", "line_start": 1},
+                {"name": "alive", "kind": "function", "line_start": 2},
+            ]},
+        ],
+    }
+    lazy = copy.deepcopy(checklist)
+    n_lazy = enrich_with_caller_context(lazy, target)
+
+    applied = copy.deepcopy(checklist)
+    computed = compute_caller_context(applied, target)
+    n_applied = enrich_with_caller_context(
+        applied, target, precomputed=computed)
+
+    assert n_lazy == n_applied
+    assert lazy == applied

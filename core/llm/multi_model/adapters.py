@@ -11,7 +11,8 @@ directly because Protocol + abc.ABC interaction is messy.
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Any, Dict, Hashable, List, Tuple
+from typing import Any
+from collections.abc import Hashable
 
 
 def _coerce_numeric(value: Any, default: float = 0.0) -> float:
@@ -25,6 +26,38 @@ def _coerce_numeric(value: Any, default: float = 0.0) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     return value
+
+
+def _first_wins_per_model(
+    per_model_results: dict[str, list[dict[str, Any]]],
+    key_fn: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """One vote per (item key, model): keep each model's FIRST record
+    for a key, drop the rest.
+
+    The panel-wide duplicate contract (panel_log, dawid_skene, replay,
+    calibrated_aggregation all settled on first-wins). The adapter
+    layer used to run two OTHER contracts at once — merge fed every
+    duplicate to select_primary (prefer-positive across a single
+    model's duplicates) while the agreement matrix kept the LAST
+    duplicate's verdict — so a duplicate-emitting task (retry glue,
+    merged shards) could ship a merged verdict disagreeing with the
+    matrix verdict recorded for the same model, and consensus grading
+    read a majority computed from different votes than the output
+    shows.
+    """
+    deduped: dict[str, list[dict[str, Any]]] = {}
+    for model_name, results in per_model_results.items():
+        seen: set = set()
+        kept: list[dict[str, Any]] = []
+        for r in results:
+            k = key_fn(r)
+            if k in seen:
+                continue
+            seen.add(k)
+            kept.append(r)
+        deduped[model_name] = kept
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -65,20 +98,20 @@ class BaseVerdictAdapter(ABC):
     # ----- consumer-required -----
 
     @abstractmethod
-    def item_id(self, item: Dict[str, Any]) -> str:
+    def item_id(self, item: dict[str, Any]) -> str:
         """Stable, non-empty id consistent across models."""
         ...
 
     @abstractmethod
-    def normalize_verdict(self, item: Dict[str, Any]) -> str:
+    def normalize_verdict(self, item: dict[str, Any]) -> str:
         """Return one of: 'positive', 'negative', 'inconclusive', 'unknown'."""
         ...
 
     # ----- consumer-overridable -----
 
     def select_primary(
-        self, model_results: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        self, model_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """Default policy: prefer-positive, then quality, then exploitability.
 
         Subclasses may override for domain-specific tiebreaking. Tie-breaks
@@ -90,9 +123,10 @@ class BaseVerdictAdapter(ABC):
         type elsewhere shouldn't crash the sort with a confusing error.
         """
         if not model_results:
-            raise ValueError("select_primary called with empty list")
+            msg = "select_primary called with empty list"
+            raise ValueError(msg)
 
-        def sort_key(r: Dict[str, Any]) -> Tuple:
+        def sort_key(r: dict[str, Any]) -> tuple:
             verdict = self.normalize_verdict(r)
             # prefer positive (True), then inconclusive (False), then negative
             verdict_rank = 0 if verdict == "positive" else (
@@ -106,8 +140,8 @@ class BaseVerdictAdapter(ABC):
         return dict(sorted(model_results, key=sort_key)[0])
 
     def extract_analysis_record(
-        self, result: Dict[str, Any], model_name: str,
-    ) -> Dict[str, Any]:
+        self, result: dict[str, Any], model_name: str,
+    ) -> dict[str, Any]:
         """Pick the per-model record stored under multi_model_analyses.
 
         Reasoning is truncated to REASONING_TRUNCATE chars to keep the
@@ -125,8 +159,8 @@ class BaseVerdictAdapter(ABC):
     # ----- substrate-facing -----
 
     def merge(
-        self, per_model_results: Dict[str, List[Dict[str, Any]]],
-    ) -> List[Dict[str, Any]]:
+        self, per_model_results: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
         """Fold per-model results into one item per id.
 
         Each merged item is a dict-copy of the primary chosen by
@@ -135,9 +169,15 @@ class BaseVerdictAdapter(ABC):
         multi_model_analyses key (not [], not None — absent). Consumers
         checking for multi-model context should use `if "multi_model_analyses"
         in item:` rather than `if item.get(...)`.
+
+        Duplicate ids within ONE model's list follow the panel-wide
+        first-wins contract (see _first_wins_per_model).
         """
-        by_id: Dict[str, List[Tuple[str, Dict[str, Any]]]] = defaultdict(list)
-        first_seen_order: List[str] = []
+        per_model_results = _first_wins_per_model(
+            per_model_results, self.item_id,
+        )
+        by_id: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+        first_seen_order: list[str] = []
         for model_name, results in per_model_results.items():
             for r in results:
                 rid = self.item_id(r)
@@ -145,11 +185,18 @@ class BaseVerdictAdapter(ABC):
                     first_seen_order.append(rid)
                 by_id[rid].append((model_name, r))
 
-        merged: List[Dict[str, Any]] = []
+        merged: list[dict[str, Any]] = []
         for rid in first_seen_order:
             entries = by_id[rid]
             results_only = [r for _, r in entries]
-            primary = self.select_primary(results_only)
+            # Copy HERE, not in select_primary: the default policy
+            # returns a dict-copy, but the method is consumer-
+            # overridable and an override returning the winning dict
+            # itself would let the annotation below mutate the raw
+            # per-model record (types.py promises per_model_raw stays
+            # raw). One copy at the single mutation site keeps every
+            # override honest.
+            primary = dict(self.select_primary(results_only))
             # Gate on DISTINCT model count, not contribution count. A single
             # model returning the same id twice shouldn't masquerade as a
             # multi-model analysis. Mirrors BaseSetAdapter.merge's logic.
@@ -165,9 +212,9 @@ class BaseVerdictAdapter(ABC):
 
     def correlate(
         self,
-        merged_items: List[Dict[str, Any]],
-        per_model_results: Dict[str, List[Dict[str, Any]]],
-    ) -> Dict[str, Any]:
+        merged_items: list[dict[str, Any]],
+        per_model_results: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
         """Compute agreement matrix and confidence signals.
 
         Returns:
@@ -177,15 +224,21 @@ class BaseVerdictAdapter(ABC):
             summary: counts (agreed, disputed, single_model, total, models)
         """
         models = sorted(per_model_results.keys())
-        # Build matrix: id → {model → verdict}
-        matrix: Dict[str, Dict[str, str]] = {}
+        # Build matrix: id → {model → verdict}. Same first-wins
+        # duplicate contract as merge() — the setdefault-then-assign
+        # walk used to keep the LAST duplicate's verdict while merge
+        # fed ALL duplicates to select_primary.
+        per_model_results = _first_wins_per_model(
+            per_model_results, self.item_id,
+        )
+        matrix: dict[str, dict[str, str]] = {}
         for model_name, results in per_model_results.items():
             for r in results:
                 rid = self.item_id(r)
                 matrix.setdefault(rid, {})[model_name] = self.normalize_verdict(r)
 
-        confidence: Dict[str, str] = {}
-        unique_insights: List[Dict[str, Any]] = []
+        confidence: dict[str, str] = {}
+        unique_insights: list[dict[str, Any]] = []
 
         for item in merged_items:
             rid = self.item_id(item)
@@ -208,19 +261,23 @@ class BaseVerdictAdapter(ABC):
                 # Strong disagreement — pos AND neg verdicts present.
                 confidence[rid] = "disputed"
                 analyses = item.get("multi_model_analyses", [])
-                pos_models = {a["model"] for a in analyses
+                # .get() throughout: a subclass overriding
+                # extract_analysis_record without "model"/"reasoning"
+                # keys must degrade to a skip, not KeyError the whole
+                # correlation.
+                pos_models = {a.get("model") for a in analyses
                               if a.get("verdict") == "positive"}
-                neg_models = {a["model"] for a in analyses
+                neg_models = {a.get("model") for a in analyses
                               if a.get("verdict") == "negative"}
+                pos_models.discard(None)
+                neg_models.discard(None)
                 minority = pos_models if len(pos_models) < len(neg_models) else neg_models
-                for analysis in analyses:
-                    if analysis.get("model") in minority and analysis.get("reasoning"):
-                        unique_insights.append({
+                unique_insights.extend({
                             "item_id": rid,
-                            "model": analysis["model"],
+                            "model": analysis.get("model"),
                             "verdict": analysis.get("verdict"),
-                            "reasoning": analysis["reasoning"],
-                        })
+                            "reasoning": analysis.get("reasoning"),
+                        } for analysis in analyses if analysis.get("model") in minority and analysis.get("reasoning"))
             elif uniq == {"positive"}:
                 confidence[rid] = "high"
             elif uniq == {"negative"}:
@@ -282,12 +339,12 @@ class BaseSetAdapter(ABC):
     # ----- consumer-required -----
 
     @abstractmethod
-    def item_id(self, item: Dict[str, Any]) -> str:
+    def item_id(self, item: dict[str, Any]) -> str:
         """Stable, non-empty id."""
         ...
 
     @abstractmethod
-    def item_key(self, item: Dict[str, Any]) -> Hashable:
+    def item_key(self, item: dict[str, Any]) -> Hashable:
         """Hashable dedup key. Items with equal keys are the same item.
 
         Implementations should normalize before key generation (e.g.,
@@ -298,8 +355,8 @@ class BaseSetAdapter(ABC):
     # ----- consumer-overridable -----
 
     def extract_set_record(
-        self, item: Dict[str, Any], model_name: str,
-    ) -> Dict[str, Any]:
+        self, item: dict[str, Any], model_name: str,
+    ) -> dict[str, Any]:
         """Per-model record stored under multi_model_finds.
 
         Default keeps the whole item with a model annotation. Override if
@@ -310,8 +367,8 @@ class BaseSetAdapter(ABC):
     # ----- substrate-facing -----
 
     def merge(
-        self, per_model_results: Dict[str, List[Dict[str, Any]]],
-    ) -> List[Dict[str, Any]]:
+        self, per_model_results: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
         """Union by item_key. Each merged item gets:
            - found_by_models: sorted list of distinct model names
            - multi_model_finds: per-model records (only when 2+ DISTINCT
@@ -319,10 +376,18 @@ class BaseSetAdapter(ABC):
            - all original non-key fields from the first model that found
              it (alphabetically-first model name wins on ties because the
              substrate sorts per_model_results upstream)
+
+        Duplicate keys within ONE model's list follow the panel-wide
+        first-wins contract (see _first_wins_per_model) — intra-model
+        duplicates neither qualify an item as multi-model nor add a
+        second per-model record to multi_model_finds.
         """
-        by_key: Dict[Hashable, Dict[str, Any]] = {}
-        first_seen_order: List[Hashable] = []
-        finds_by_key: Dict[Hashable, List[Dict[str, Any]]] = defaultdict(list)
+        per_model_results = _first_wins_per_model(
+            per_model_results, self.item_key,
+        )
+        by_key: dict[Hashable, dict[str, Any]] = {}
+        first_seen_order: list[Hashable] = []
+        finds_by_key: dict[Hashable, list[dict[str, Any]]] = defaultdict(list)
 
         for model_name, results in per_model_results.items():
             for item in results:
@@ -335,7 +400,7 @@ class BaseSetAdapter(ABC):
                     by_key[k]["found_by_models"].append(model_name)
                 finds_by_key[k].append(self.extract_set_record(item, model_name))
 
-        merged: List[Dict[str, Any]] = []
+        merged: list[dict[str, Any]] = []
         for k in first_seen_order:
             item = by_key[k]
             item["found_by_models"] = sorted(set(item["found_by_models"]))
@@ -350,27 +415,35 @@ class BaseSetAdapter(ABC):
 
     def correlate(
         self,
-        merged_items: List[Dict[str, Any]],
-        per_model_results: Dict[str, List[Dict[str, Any]]],
-    ) -> Dict[str, Any]:
+        merged_items: list[dict[str, Any]],
+        per_model_results: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
         """Compute recall signals: how many models found each item.
 
         Returns:
             recall_signals: {item_id: 'all_models'|'majority'|'minority'|'single_model'}
             presence_matrix: {item_id: [model_names]}
             summary: counts per recall bucket plus total and models
+
+        Denominator contract: EVERY key in ``per_model_results``
+        counts — an empty list means the model looked and found
+        nothing, a genuine observation for a set task. The substrate
+        dispatch strips FAILED members before calling (it is the one
+        layer that can tell failed from empty), so dead panel members
+        never deflate the recall buckets here. Direct callers own the
+        same responsibility.
         """
         n_models = len(per_model_results)
         models = sorted(per_model_results.keys())
 
-        recall: Dict[str, str] = {}
-        presence: Dict[str, List[str]] = {}
+        recall: dict[str, str] = {}
+        presence: dict[str, list[str]] = {}
 
         for item in merged_items:
             rid = self.item_id(item)
             # Dedupe: a single model returning the same item twice
             # shouldn't show up as two separate "finders" in the matrix.
-            unique_models = sorted(set(item.get("found_by_models", [])))
+            unique_models = sorted(set(item.get("found_by_models") or []))
             presence[rid] = unique_models
             n_found = len(unique_models)
 

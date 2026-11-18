@@ -1,0 +1,1526 @@
+"""Bounded compile-time constant folding for the Java value gate.
+
+Answers ONE question for the sanitizer-cut gate: does every reaching
+definition of the sink argument assign a compile-time constant? When
+it does, the value consumed at the sink cannot carry taint regardless
+of any sanitizer — the OWASP-Benchmark-style dead-branch ternary
+(``bar = (7 * 18) + num > 200 ? "constant" : tainted``) is the
+canonical shape: the condition folds over literal-only reaching
+definitions, the constant branch is selected, and the tainted branch
+is provably dead.
+
+Soundness posture (refusal-first, mirroring the Java CFG builder):
+
+* The expression grammar is a closed allowlist — integer / string /
+  boolean / char / null literals, parentheses, unary ``-`` / ``!``,
+  integer ``+ - * / %`` (division and modulo refuse a zero divisor
+  rather than guessing), string ``+`` concatenation, comparisons,
+  ``== !=`` (only where Java's runtime semantics are a VALUE
+  comparison — see :func:`_eq_semantics_are_value`; String and
+  possibly-boxed operands refuse), ``&& ||``, and the ternary
+  (folded only when its condition folds to a boolean). Casts,
+  method calls, field and array accesses, and every other node
+  type refuse.
+* Identifiers resolve through the caller-supplied reaching-defs
+  oracle: every reaching definition of the name at that point must
+  itself fold, and all of them must fold to the SAME value —
+  disagreeing constants refuse (the branch taken is unknown).
+* Java locals cannot be aliased (no address-of), so a local whose
+  every reaching definition folds is genuinely constant at the use;
+  array elements and fields CAN alias. Qualified stores (``obj.f =``,
+  ``a[i] =``) refuse structurally — not a ``name = expr`` shape —
+  and BARE-NAME field stores (``data = "x";`` with no local
+  ``data``, legal Java for a field of the enclosing class) refuse
+  by scope: the index only serves identifier-LHS definitions whose
+  name is a declared local/parameter of the enclosing method-like
+  scope, because a field's value can be rewritten by any
+  interleaved call the reaching-defs oracle cannot see.
+* Recursion is bounded (depth cap, visited set) — cyclic definitions
+  refuse.
+
+Integer semantics are Python's, not Java's: values whose magnitude
+exceeds 31-bit two's-complement range refuse rather than model
+wraparound (a folded comparison near overflow would otherwise be
+wrong in exactly the false-suppression direction).
+"""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+from core.analysis.threat_model_java import (
+    NON_SOURCE_JVM_CONSTANT_FIELDS,
+    NON_SOURCE_SYSTEM_READS,
+)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tree_sitter import Node
+
+
+
+_MAX_DEPTH = 8
+_INT_MIN = -(2 ** 31)
+_INT_MAX = 2 ** 31 - 1
+
+class _JavaChar(str):
+    """A folded UTF-16 character, distinct from a Java String value."""
+
+
+def _constant_conversion_is_identity(value: Any, target_type: bytes | None) -> bool:
+    """Declared boundaries must stay within the folder's value model."""
+    if target_type in (b"float", b"double", b"Character", b"java.lang.Character"):
+        # Floating-point and boxed-character conversions are not modelled.
+        return False
+    if target_type == b"char":
+        return isinstance(value, _JavaChar)
+    if isinstance(value, _JavaChar):
+        return target_type == b"var"
+    return True
+
+
+# Sentinel distinguishing "folds to None (null literal)" from "refuses".
+_REFUSE = object()
+
+
+class _TaintFree:
+    """Sentinel: provably attacker-uncontrolled, runtime value unknown
+    (JVM constant fields such as ``File.separator`` and JDK class
+    constants — NOT environment reads: the threat-model authority
+    classifies ``System.getenv``/``getProperty`` as taint sources, the
+    b44 stop-ship's root cause).
+    Never a usable VALUE — value consumers (switch pruning, weak-name
+    matching, danger checks) must never see it, so the fold boundary
+    converts it to REFUSE unless the caller opted in. Taint-freedom
+    consumers (:func:`definers_all_fold`) opt in: whichever runtime
+    value such an expression takes, it carries no caller taint."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<TAINT_FREE>"
+
+
+TAINT_FREE = _TaintFree()
+
+# System reads that may fold taint-free and the JVM constant fields —
+# BOTH derived from the shared threat-model authority so this table can
+# never contradict the postpass source-kind locator (the b44 stop-ship:
+# System.getenv was taint-free here and a taint source there, and
+# enforcement suppressed six real Juliet findings). Under the current
+# model the System-read set is EMPTY — getenv/getProperty are
+# environment taint sources; ``_fold_tf_system_read`` is kept for any
+# future authority-approved non-source read.
+_TF_SYSTEM_READS = NON_SOURCE_SYSTEM_READS
+_TF_FILE_FIELDS = NON_SOURCE_JVM_CONSTANT_FIELDS
+
+
+class _FoldExt:
+    """Bundled opt-in extensions threaded through the fold recursion:
+    the taint-free tier and the cross-file resolver. ``None`` retains
+    the pre-extension folder; indexed consumers also carry receiver scope."""
+
+    __slots__ = (
+        "allow_taint_free",
+        "ban_tf_system_reads",
+        "receiver_type",
+        "shadowed_receiver_names",
+        "receiver_is_value",
+        "union_hits",
+        "union_member_check",
+        "xfile",
+    )
+
+    def __init__(self, allow_taint_free: bool = False, xfile=None,
+                 receiver_type=None, ban_tf_system_reads: bool = False,
+                 shadowed_receiver_names: frozenset[str] = frozenset(),
+                 receiver_is_value=None) -> None:
+        self.allow_taint_free = allow_taint_free
+        self.xfile = xfile
+        self.shadowed_receiver_names = frozenset(shadowed_receiver_names)
+        self.receiver_is_value = receiver_is_value
+        # receiver_type(name, node) -> exact locally-created class, or None.
+        # Sound only when EVERY indexed definition of the local is a
+        # creation of that same class (see JavaConstIndex).
+        self.receiver_type = receiver_type
+        # b42: count of non-agreeing definer merges resolved by the
+        # taint-free union (audit attribution; empty when the tier is
+        # off or every merge agreed).
+        self.union_hits: list = []
+        # b42: when the postpass locator classified any of THIS
+        # finding's surviving source candidates as a system-read kind
+        # (environment/properties/file/console/database/socket), a
+        # system read cannot be taint-free FOR THIS FINDING — the read
+        # is the suspected source, and calling it attacker-free is
+        # exactly the circularity the all-candidates discipline
+        # forbids.  Measured live: 17 Juliet ground-truth-bad
+        # environment-source findings suppressed via the TF tier.
+        self.ban_tf_system_reads: bool = ban_tf_system_reads
+        # b42 x b40 composition: the union merges VALUE-CARRYING
+        # members too, and a compile-time constant can violate a
+        # value-based finding class on its own (the finite-value-set
+        # path's per-element danger discipline — a set containing a
+        # danger-bearing constant never suppresses).  The union holds
+        # itself to the same bar: concrete string members pass through
+        # this caller-supplied predicate (str list -> bool); None (no
+        # danger authority at this entry) refuses any union containing
+        # a concrete string member.
+        self.union_member_check = None
+
+
+def _tf_or_refuse(val: Any, ext) -> Any:
+    if val is TAINT_FREE and (ext is None or not ext.allow_taint_free):
+        return _REFUSE
+    return val
+
+
+def _parser():
+    from core.analysis.cfg_builder_java import _get_parser
+    return _get_parser()
+
+
+def _method_scope_types() -> frozenset[str]:
+    """Single-homed in the CFG builder (the scope oracle's owner) so
+    the index and the builder can never disagree on what counts as a
+    method-like scope."""
+    from core.analysis.cfg_builder_java import METHOD_SCOPE_TYPES
+    return METHOD_SCOPE_TYPES
+
+
+def _collect_local_scopes(
+    root: Node,
+) -> list[tuple[int, int, Any]]:
+    """Byte spans + positional local-scope oracles of every
+    method-like scope under ``root``. Shares the CFG builder's scope
+    oracle
+    (:func:`core.analysis.cfg_builder_java._declared_local_scopes`)
+    so the index and the builder can never disagree on what counts
+    as a local."""
+    from core.analysis.cfg_builder_java import _declared_local_scopes
+    out: list[tuple[int, int, Any]] = []
+    scope_types = _method_scope_types()
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type in scope_types:
+            out.append(
+                (n.start_byte, n.end_byte, _declared_local_scopes(n)),
+            )
+        stack.extend(c for c in n.children if c.is_named)
+    return out
+
+
+def _conversion_sensitive_names(root: Node) -> frozenset[str]:
+    """File-wide refusal mask; same-name ambiguity never grants a type."""
+    names: set[str] = set()
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if node.type in ("variable_declarator", "formal_parameter",
+                         "enhanced_for_statement", "resource"):
+            name = node.child_by_field_name("name")
+            declaration = node.parent if node.type == "variable_declarator" else node
+            target = declaration.child_by_field_name("type") if declaration is not None else None
+            if name is not None and target is not None \
+                    and target.text in (b"char", b"float", b"double",
+                                        b"Character", b"java.lang.Character"):
+                names.add(cast(bytes, name.text).decode())
+        pending.extend(node.named_children)
+    return frozenset(names)
+
+
+class JavaConstIndex:
+    """Per-file index of simple definitions: (line, name) → RHS node.
+
+    Only ``type name = expr;`` declarators and ``name = expr``
+    assignments within ``line_span`` are indexed — anything else
+    (array stores, field stores, compound assignments, ++/--) is
+    absent, so lookups on it refuse.
+
+    Scope discipline: a definition is indexed only when it sits
+    inside a method-like scope (method / constructor / initializer)
+    that declares the name as a local or parameter. A bare-name
+    store whose name is NOT a declared local resolves to a FIELD of
+    the enclosing class — the same ``name = expr`` syntax, but a
+    binding any interleaved call can rewrite, which the reaching-
+    defs oracle (call nodes define nothing) cannot see. Serving such
+    a definition let ``all_definers_constant`` prove "constant sink
+    argument" over a field a callee re-taints. Class-level field
+    declarators are likewise skipped (and poison the receiver-type
+    oracle for their name — a field's exact class is not stable
+    across calls).
+    """
+
+    def __init__(self, source_text: str,
+                 line_span: tuple[int, int],
+                 java_file_path: str | None = None,
+                 repo_root: str | None = None) -> None:
+        self._defs: dict[tuple[int, str], Any] = {}
+        # (lineno, name) keys that hold MORE THAN ONE write on the
+        # line (one-liner if/else arms, chained statements).  A
+        # line-keyed lookup cannot tell the reaching-defs oracle's
+        # per-definition nodes apart, so serving any single RHS would
+        # collapse distinct definers into one — measured as a live
+        # false suppression when a one-liner if/else discriminant
+        # folded to its first arm and pruned the tainted switch arm
+        # (b42 trap fixture).  Such keys refuse.
+        self._multi_write_lines: set[tuple[int, str]] = set()
+        # (lineno, name) keys where a definer kind the index does NOT
+        # record binds the name: enhanced-for headers, catch params,
+        # try-with-resources names, pattern bindings, formal/lambda
+        # parameters. The reaching-defs oracle emits these as definers
+        # (correctly), but a line-keyed lookup cannot tell them apart
+        # from a same-line indexed write — serving the indexed RHS for
+        # BOTH mints a constant proof over the unindexed (possibly
+        # tainted) binding. Such keys refuse, mirroring
+        # _multi_write_lines for the indexed-vs-indexed collision.
+        self._unindexed_definers: set[tuple[int, str]] = set()
+        self._compound_writers: set[str] = set()
+        # name -> exact created class, poisoned to None on any
+        # non-creation or differently-typed definition.
+        self._creation_types: dict[str, str | None] = {}
+        # (start_byte, end_byte, positional local-scope oracle) per
+        # method-like scope — the bare-name field-store gate.
+        self._scopes: list[tuple[int, int, Any]] = []
+        self.xfile = None
+        if java_file_path:
+            # repo_root may be absent: the resolver then serves only
+            # the JDK tier (no tree lookups), which needs no root.
+            try:
+                from core.analysis.java_xfile_const import (
+                    make_xfile_resolver,
+                )
+                self.xfile = make_xfile_resolver(java_file_path, repo_root)
+            except Exception:  # noqa: BLE001 — optional layer
+                self.xfile = None
+        self.ok = False
+        parser = _parser()
+        if parser is None:
+            return
+        try:
+            tree = parser.parse(source_text.encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        if tree.root_node.has_error:
+            return  # Incomplete definitions cannot establish a constant value.
+        self._scopes = _collect_local_scopes(tree.root_node)
+        conversion_sensitive = _conversion_sensitive_names(tree.root_node)
+        lo, hi = line_span
+        stack = [tree.root_node]
+        while stack:
+            n = stack.pop()
+            if n.start_point[0] + 1 > hi or n.end_point[0] + 1 < lo:
+                continue
+            if n.type == "variable_declarator":
+                name = n.child_by_field_name("name")
+                value = n.child_by_field_name("value")
+                if (name is not None and name.type == "identifier"
+                        and value is not None):
+                    nm = name.text.decode()
+                    if not self._is_scoped_local(n, nm):
+                        # Class-level field declarator (or a
+                        # declarator inside a scope shape the
+                        # collector doesn't model): never a local
+                        # definition — skip, and poison the
+                        # receiver-type oracle for the name.
+                        self._creation_types[nm] = None
+                        continue
+                    key = (n.start_point[0] + 1, nm)
+                    if key in self._defs:
+                        self._multi_write_lines.add(key)
+                    self._defs[key] = value
+                    self._note_creation(nm, value)
+            elif n.type == "assignment_expression":
+                left = n.child_by_field_name("left")
+                right = n.child_by_field_name("right")
+                op = n.child_by_field_name("operator")
+                if left is not None and left.type == "identifier":
+                    lname = left.text.decode()
+                    if op is not None and op.type != "=":
+                        # +=, -=, ... — a writer this index doesn't
+                        # model; every lookup of the name must refuse.
+                        self._compound_writers.add(lname)
+                    elif right is not None:
+                        if not self._is_scoped_local(n, lname):
+                            # Bare-name FIELD store (no declared
+                            # local of that name in the enclosing
+                            # method): same syntax as a local
+                            # rebinding, but any interleaved call
+                            # can rewrite the field — never index
+                            # (absence refuses the lookup), and
+                            # poison the receiver-type oracle.
+                            self._creation_types[lname] = None
+                            continue
+                        akey = (n.start_point[0] + 1, lname)
+                        if akey in self._defs:
+                            self._multi_write_lines.add(akey)
+                        self._defs[akey] = right
+                        self._note_creation(lname, right)
+            elif n.type == "update_expression":
+                # Parentheses preserve the updated scalar variable. Missing
+                # this writer can let its same-line initializer serve the
+                # update node's reaching definition as well.
+                operands = n.named_children
+                operand = _paren_unwrap(operands[0]) if len(operands) == 1 else None
+                if operand is not None and operand.type == "identifier":
+                    operand_text = operand.text
+                    if operand_text is None:
+                        raise AttributeError("'NoneType' object has no attribute 'decode'",
+                                             name="decode", obj=None)
+                    self._compound_writers.add(operand_text.decode())
+            elif n.type in ("enhanced_for_statement", "resource",
+                            "instanceof_expression", "formal_parameter",
+                            "spread_parameter"):
+                nm = n.child_by_field_name("name")
+                if nm is None and n.type == "spread_parameter":
+                    variable = next((c for c in n.named_children
+                                     if c.type == "variable_declarator"), None)
+                    nm = variable.child_by_field_name("name") if variable is not None else None
+                if nm is not None and nm.type == "identifier":
+                    self._note_unindexed_definer(n, nm)
+            elif n.type == "catch_formal_parameter":
+                idents = [c for c in n.children
+                          if c.type == "identifier"]
+                if idents:
+                    self._note_unindexed_definer(n, idents[-1])
+            elif n.type in ("type_pattern", "record_pattern_component"):
+                for c in n.children:
+                    if c.type == "identifier":
+                        self._note_unindexed_definer(n, c)
+            elif n.type == "lambda_expression":
+                params = n.child_by_field_name("parameters")
+                if params is not None and params.type == "identifier":
+                    self._note_unindexed_definer(n, params)
+            stack.extend(n.children)
+        # Later writes do not retain a declared target type. Known char /
+        # floating names therefore cannot borrow their RHS's value kind.
+        # File-wide name ambiguity only removes evidence; it grants none.
+        for key, rhs in tuple(self._defs.items()):
+            if key[1] in conversion_sensitive and rhs.parent is not None \
+                    and rhs.parent.type == "assignment_expression":
+                del self._defs[key]
+        self.ok = True
+
+    def _note_unindexed_definer(self, construct: Node, name_node: Node) -> None:
+        """Record every line the binding construct or its name node
+        starts on — reaching-defs definer nodes may carry either."""
+        nm = name_node.text.decode()  # type: ignore[union-attr]
+        self._unindexed_definers.add((construct.start_point[0] + 1, nm))
+        self._unindexed_definers.add((name_node.start_point[0] + 1, nm))
+        # An unknown binding cannot borrow a same-named creation in another scope.
+        self._creation_types[nm] = None
+
+    def _is_scoped_local(self, node: Node, name: str) -> bool:
+        """True when ``node`` sits inside a method-like scope where a
+        preceding in-scope declarator vouches for ``name`` AT THE
+        NODE's position. The INNERMOST containing scope decides — a
+        local class's methods are their own scopes, never windows
+        into the enclosing method. Positional vouching means a dead
+        block-scoped declarator elsewhere in the method (after the
+        store, in a disjoint block) serves nothing."""
+        innermost: tuple[int, int, Any] | None = None
+        for s, e, scopes in self._scopes:
+            if s <= node.start_byte and node.end_byte <= e:
+                if innermost is None or (e - s) < \
+                        (innermost[1] - innermost[0]):
+                    innermost = (s, e, scopes)
+        return innermost is not None and \
+            innermost[2].vouches(name, node.start_byte)
+
+    def _is_value_receiver(self, node: Node, name: str) -> bool:
+        # Reads can capture an outer local; stores still use the innermost oracle.
+        for start, end, scopes in self._scopes:
+            if start <= node.start_byte and node.end_byte <= end \
+                    and scopes.vouches(name, node.start_byte):
+                return True
+        return name in _member_value_names_at(node)
+
+    def receiver_type_at(self, name: str, node: Node) -> str | None:
+        # A member/capture must not borrow a same-named local's creation proof.
+        if not self._is_scoped_local(node, name):
+            return None
+        return self.receiver_type(name)
+
+    def _note_creation(self, name: str, value: Node) -> None:
+        """Track exact-creation-typed locals: usable as a method-call
+        receiver class only when EVERY definition creates the same
+        class. Any other definition shape poisons the name."""
+        cls = _exact_creation_class(value)
+        if name in self._creation_types:
+            if self._creation_types[name] != cls:
+                self._creation_types[name] = None
+        else:
+            self._creation_types[name] = cls
+
+    def receiver_type(self, name: str) -> str | None:
+        if name in self._compound_writers:
+            return None
+        return self._creation_types.get(name)
+
+    def rhs_at(self, lineno: int, name: str):
+        if name in self._compound_writers:
+            return None
+        if (lineno, name) in self._multi_write_lines:
+            # Two+ writes to the name on one line: a line-keyed lookup
+            # cannot disambiguate the oracle's definition nodes, and
+            # serving either RHS collapses distinct definers (the b42
+            # one-liner if/else trap).  Refuse.
+            return None
+        if (lineno, name) in self._unindexed_definers:
+            # A definer kind the index never records binds the name on
+            # this line (enhanced-for header, catch/formal param,
+            # resource, pattern binding): the oracle's definer for it
+            # would be served THIS indexed RHS — a constant proof over
+            # the unindexed binding.  Refuse (same one-liner
+            # co-location class as _multi_write_lines).
+            return None
+        return self._defs.get((lineno, name))
+
+
+def fold_expr(node, resolve_name, array_resolver=None,
+          config_resolver=None, conduit_resolver=None,
+          allow_taint_free: bool = False, xfile_resolver=None,
+          shadowed_receiver_names: frozenset[str] = frozenset()) -> Any:
+    """Fold a tree-sitter Java expression node to a constant.
+
+    ``resolve_name(name, depth)`` returns the name's constant value or
+    ``_REFUSE``. ``array_resolver(node, resolve_name, depth)`` — when
+    supplied (see :mod:`core.analysis.value_set_java`) — resolves an
+    ``array_access`` read; without it every array access refuses.
+    ``allow_taint_free`` opts into the :data:`TAINT_FREE` tier (the
+    result may then be TAINT_FREE instead of a value); off (default),
+    taint-free subexpressions refuse and behavior is unchanged.
+    ``xfile_resolver`` (see :mod:`core.analysis.java_xfile_const`)
+    resolves cross-file static-final fields and returns-literal
+    methods. ``shadowed_receiver_names`` names source-proven value bindings
+    that cannot act as class/package receiver heads in this expression.
+    Returns the folded value, TAINT_FREE (opt-in), or
+    ``_REFUSE``.
+    """
+    ext = None
+    if allow_taint_free or xfile_resolver is not None or shadowed_receiver_names:
+        ext = _FoldExt(allow_taint_free=allow_taint_free,
+                       xfile=xfile_resolver,
+                       shadowed_receiver_names=shadowed_receiver_names)
+    val = _fold(node, resolve_name, 0, array_resolver, config_resolver,
+                conduit_resolver, ext)
+    return _tf_or_refuse(val, ext)
+
+
+REFUSE = _REFUSE
+
+
+def _receiver_chain(node: Node) -> str | None:
+    """Dotted text of an identifier/field_access chain (``Utils`` /
+    ``org.owasp.benchmark.helpers.Utils``); None for anything else."""
+    if node is None:
+        return None
+    if node.type == "identifier":
+        return node.text.decode("utf-8", "replace")  # type: ignore[union-attr]
+    if node.type == "field_access":
+        obj = _receiver_chain(node.child_by_field_name("object"))  # type: ignore[arg-type]
+        fld = node.child_by_field_name("field")
+        if obj is not None and fld is not None \
+                and fld.type == "identifier":
+            return obj + "." + fld.text.decode("utf-8", "replace")  # type: ignore[union-attr]
+    if node.type == "scoped_identifier":
+        return node.text.decode("utf-8", "replace")  # type: ignore[union-attr]
+    return None
+
+
+def _tf_string_members_clear(ext, members) -> bool:
+    """b40 discipline for TAINT_FREE mints that have SEEN concrete
+    string members (concat algebra, pure-call concat, the
+    unknown-selector ternary): each member must clear the caller's
+    danger predicate, exactly like :func:`_tf_union` — a value-based
+    finding class is violated by the constant itself, however
+    attacker-free the selection around it. No predicate at this entry
+    means no danger authority: refuse, never assume. Non-string
+    members (TAINT_FREE sentinels, ints, bools) carry no charset and
+    pass through."""
+    strs = [m for m in members if isinstance(m, str)]
+    if not strs:
+        return True
+    if ext is None:
+        return False
+    chk = ext.union_member_check
+    return chk is not None and bool(chk(strs))
+
+
+def _member_value_names_at(node: Node) -> frozenset[str]:
+    """Ancestor-owned field/record names, excluding sibling/nested bodies."""
+    from core.analysis.cfg_node_tables import JAVA_TABLES
+
+    names: set[str] = set()
+    current = node.parent
+    while current is not None:
+        for member in current.named_children:
+            if member.type not in ("field_declaration", "constant_declaration"):
+                continue
+            for declaration in member.named_children:
+                if declaration.type == "variable_declarator":
+                    ident = declaration.child_by_field_name("name")
+                    if ident is not None:
+                        names.add(cast(bytes, ident.text).decode())
+        body = current.child_by_field_name("body")
+        parameters = current.child_by_field_name("parameters")
+        if body is not None and body.type in JAVA_TABLES.scope_barriers \
+                and parameters is not None:
+            # A record header's parameters also declare implicit fields.
+            for parameter in parameters.named_children:
+                ident = parameter.child_by_field_name("name")
+                if ident is not None:
+                    names.add(cast(bytes, ident.text).decode())
+        current = current.parent
+    return frozenset(names)
+
+
+def _exact_creation_class(node: Node) -> str | None:
+    """Named construction without an enclosing instance or anonymous body."""
+    if node.type != "object_creation_expression" or any(
+            child.type in ("class_body", ".") for child in node.children):
+        return None
+    ty = node.child_by_field_name("type")
+    if ty is None:
+        return None
+    cls = cast(bytes, ty.text).decode("utf-8", "replace").split("<", 1)[0]
+    return None if _type_receiver_is_shadowed(ty, cls) else cls
+
+
+def _type_receiver_is_shadowed(node, chain: str) -> bool:
+    from core.analysis.cfg_builder_java import _type_shadow_names_at
+
+    return chain.split(".", 1)[0] in _type_shadow_names_at(node)
+
+
+def _type_import_at(node: Node, name: str) -> str | None:
+    from core.analysis.cfg_builder_java import build_import_map
+
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    imports, _statics = build_import_map(root)
+    return imports.get(name)
+
+
+def _is_jvm_string_name(node: Node, ext) -> bool:
+    from core.analysis.cfg_builder_java import _type_shadow_names_at
+
+    if "String" in _type_shadow_names_at(node, include_top_level=True):
+        return False
+    imported = _type_import_at(node, "String")
+    if imported is not None:
+        return imported == "java.lang.String"
+    if ext is not None and ext.xfile is not None \
+            and ext.xfile.source_class_may_exist("String"):
+        return False
+    return True
+
+
+def _receiver_is_shadowed(node, ext) -> bool:
+    chain = _receiver_chain(node)
+    if chain is None:
+        return False
+    if _type_receiver_is_shadowed(node, chain):
+        return True
+    if ext is None:
+        return False
+    head = chain.split(".", 1)[0]
+    return (head in ext.shadowed_receiver_names
+            or (ext.receiver_is_value is not None and ext.receiver_is_value(node, head)))
+
+
+def _fold_field_access(node: Node, ext) -> Any:
+    """``File.separator``-class taint-free fields and cross-file
+    static-final resolution. Only fires under an extension context —
+    the default folder refuses every field access, unchanged."""
+    if ext is None:
+        return _REFUSE
+    obj = node.child_by_field_name("object")
+    fld = node.child_by_field_name("field")
+    if obj is None or fld is None or fld.type != "identifier":
+        return _REFUSE
+    field = fld.text.decode("utf-8", "replace")  # type: ignore[union-attr]
+    chain = _receiver_chain(obj)
+    if chain is None or _receiver_is_shadowed(obj, ext):
+        return _REFUSE
+    if ext.allow_taint_free and chain in ("File", "java.io.File") \
+            and field in _TF_FILE_FIELDS:
+        if chain == "java.io.File":
+            return TAINT_FREE
+        # Use this expression's compilation unit, including when folding
+        # a cross-file initializer whose imports differ from the caller's.
+        from core.analysis.cfg_builder_java import _type_shadow_names_at
+
+        imported = _type_import_at(obj, "File")
+        if imported == "java.io.File":
+            return TAINT_FREE
+        declared = "File" in _type_shadow_names_at(obj, include_top_level=True)
+        source_may_exist = (ext.xfile is not None
+                            and ext.xfile.source_class_may_exist("File"))
+        if imported is not None or declared or source_may_exist:
+            if ext.xfile is not None:
+                return ext.xfile.resolve_field(imported or chain, field, True)
+            return _REFUSE
+        # Preserve the unresolved/wildcard shortcut only after available
+        # source lookup has established a miss, rather than a refusal.
+        return TAINT_FREE
+    if ext.xfile is not None:
+        return ext.xfile.resolve_field(chain, field,
+                                       ext.allow_taint_free)
+    return _REFUSE
+
+
+def _fold_tf_system_read(node: Node, resolve_name, depth, array_resolver,
+                         config_resolver, conduit_resolver, ext) -> Any:
+    """``System.<read>("lit")`` → TAINT_FREE for authority-approved
+    NON-SOURCE reads only. Under the current threat model that set is
+    EMPTY (getenv/getProperty are environment taint sources — the b44
+    counterexample class; see core.analysis.threat_model_java), so
+    this producer refuses everything today; it stays wired for any
+    future read the authority approves. Literal (or folded-constant)
+    name required; the two-arg default must itself fold or be
+    taint-free."""
+    if ext is None or not ext.allow_taint_free:
+        return _REFUSE
+    if ext.ban_tf_system_reads:
+        # b42's per-finding circularity ban. With the authority's
+        # non-source set empty this branch is structurally
+        # never-firing (the name gate below refuses first) — kept as
+        # defense-in-depth with its tests as never-firing pins.
+        return _REFUSE
+    name_node = node.child_by_field_name("name")
+    obj = node.child_by_field_name("object")
+    if name_node is None or obj is None:
+        return _REFUSE
+    if name_node.text.decode() not in _TF_SYSTEM_READS:  # type: ignore[union-attr]
+        return _REFUSE
+    chain = _receiver_chain(obj)
+    if (chain is None or _receiver_is_shadowed(obj, ext)
+            or chain.rsplit(".", 1)[-1] != "System"):
+        return _REFUSE
+    args_node = node.child_by_field_name("arguments")
+    args = [c for c in (args_node.children if args_node else ())
+            if c.is_named]
+    if not args or len(args) > 2:
+        return _REFUSE
+    key = _fold(args[0], resolve_name, depth + 1, array_resolver,
+                config_resolver, conduit_resolver, ext)
+    if not isinstance(key, str):
+        return _REFUSE
+    if len(args) == 2:
+        dflt = _fold(args[1], resolve_name, depth + 1, array_resolver,
+                     config_resolver, conduit_resolver, ext)
+        if dflt is _REFUSE or dflt is None:
+            return _REFUSE
+    if name_node.text.decode() == "getProperty":  # type: ignore[union-attr]
+        # System properties are runtime-writable (System.setProperty
+        # from ANY code — including copying request data into one), so
+        # a property read is taint-free only under the cross-file
+        # resolver's tree-wide proof that this key is never written
+        # and no variable-key write exists. No resolver, no proof —
+        # refuse. getenv has no self-write API and needs no scan.
+        if ext.xfile is None or not ext.xfile.tf_property_key_ok(key):
+            return _REFUSE
+    return TAINT_FREE
+
+
+def _fold(node: Node, resolve_name, depth: int, array_resolver=None,
+          config_resolver=None, conduit_resolver=None, ext=None) -> Any:
+    if node is None or depth > _MAX_DEPTH:
+        return _REFUSE
+    t = node.type
+    if t == "parenthesized_expression":
+        inner = [c for c in node.children if c.is_named]
+        return _fold(inner[0], resolve_name, depth + 1, array_resolver,
+                 config_resolver, conduit_resolver, ext) \
+            if len(inner) == 1 else _REFUSE
+    if t == "field_access":
+        return _fold_field_access(node, ext)
+    if t == "cast_expression":
+        # Only the identity cast folds: ``(String) e`` where ``e``
+        # folds to a str is the same str (the OWASP-style collection
+        # round-trip's ubiquitous shape). Numeric casts can truncate
+        # or reinterpret, so every non-String target refuses — the
+        # wrong-value direction here selects wrong branches downstream.
+        ty = node.child_by_field_name("type")
+        val = node.child_by_field_name("value")
+        if ty is None or val is None:
+            return _REFUSE
+        ty_text = ty.text.decode().split("<", 1)[0].strip()  # type: ignore[union-attr]
+        if ty_text.split(".")[-1] != "String":
+            return _REFUSE
+        v = _fold(val, resolve_name, depth + 1, array_resolver,
+                  config_resolver, conduit_resolver, ext)
+        if v is TAINT_FREE:
+            return v
+        return v if isinstance(v, str) else _REFUSE
+    if t == "array_access" and array_resolver is not None:
+        return array_resolver(node, resolve_name, depth + 1)
+    if t == "decimal_integer_literal":
+        try:
+            v = int(node.text.decode())  # type: ignore[union-attr]
+        except ValueError:
+            return _REFUSE
+        return v if _INT_MIN <= v <= _INT_MAX else _REFUSE
+    if t == "string_literal":
+        # DECODED value, not raw text: the raw quote-inclusive form
+        # made "a" + "b" fold to a value that compared unequal to the
+        # folded "ab" — a wrong False in exactly the branch-selection
+        # position where it could pick the wrong ternary/switch arm.
+        # Escapes refuse rather than risk a mis-decode.
+        raw = node.text.decode()  # type: ignore[union-attr]
+        if len(raw) < 2 or "\\" in raw:
+            return _REFUSE
+        if raw.startswith('"""'):
+            # Java text block (tree-sitter types it string_literal
+            # too): ``"""x"""`` would slice to ``""x""`` — a wrong
+            # value that compares UNEQUAL where Java says EQUAL, and
+            # a wrong-unequal in branch-selection position prunes the
+            # TRUE arm (the false-suppression direction). Text-block
+            # semantics (incidental-whitespace stripping) are not
+            # modelled — refuse, the folder's standing posture.
+            return _REFUSE
+        return raw[1:-1]
+    if t in ("true", "false"):
+        return t == "true"
+    if t == "null_literal":
+        return None
+    if t == "character_literal":
+        # Preserve char identity through name/field resolution; addition
+        # of two characters must not use String concatenation. Escaped
+        # chars refuse.
+        raw = node.text.decode()  # type: ignore[union-attr]
+        if len(raw) != 3 or "\\" in raw:
+            return _REFUSE
+        return _JavaChar(raw[1:-1])
+    if t == "method_invocation":
+        # The taint-free System-read producer runs BEFORE the config
+        # resolver: System.getProperty/getenv is never a
+        # Properties-file read, and b22's hook claims every
+        # getProperty spelling with a refusal that must not shadow
+        # the (opt-in) taint-freedom conclusion. With the tier off
+        # this is a no-op and the config resolver's ordering is
+        # unchanged.
+        tf = _fold_tf_system_read(node, resolve_name, depth,
+                                  array_resolver, config_resolver,
+                                  conduit_resolver, ext)
+        if tf is TAINT_FREE:
+            return tf
+        if config_resolver is not None:
+            cfg = config_resolver(node, depth + 1)
+            if cfg is not None:
+                # a getProperty read: the resolver owns the verdict —
+                # a refusal must not fall through to the pure-call
+                # allowlist (it would refuse anyway, but the refusal
+                # accounting belongs to the config resolver).
+                return cfg
+        if conduit_resolver is not None:
+            def _refold(child, d):
+                return _fold(child, resolve_name, d, array_resolver,
+                             config_resolver, conduit_resolver, ext)
+            cv = conduit_resolver(node, _refold, depth + 1)
+            if cv is not None:
+                # a resolvable conduit call: the resolver owns the
+                # verdict (value or REFUSE); never fall through to the
+                # pure-call allowlist. Conduits refuse null constants
+                # at derivation, so None stays an unambiguous
+                # "not a conduit call" sentinel.
+                return cv
+        if ext is not None and ext.xfile is not None:
+            xf = _fold_xfile_call(node, ext)
+            if xf is not _REFUSE:
+                return xf
+        return _fold_pure_call(node, resolve_name, depth, array_resolver,
+                               config_resolver, conduit_resolver, ext)
+    if t == "identifier":
+        return resolve_name(node.text.decode(), depth + 1)  # type: ignore[union-attr]
+    if t == "unary_expression":
+        operand = node.child_by_field_name("operand")
+        op = node.child_by_field_name("operator")
+        val = _fold(operand, resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+        if val is _REFUSE or val is TAINT_FREE or op is None:
+            return _REFUSE
+        text = op.type
+        if text == "-" and isinstance(val, int) and not isinstance(val, bool):
+            v = -val
+            return v if _INT_MIN <= v <= _INT_MAX else _REFUSE
+        if text == "!" and isinstance(val, bool):
+            return not val
+        return _REFUSE
+    if t == "binary_expression":
+        left_node = node.child_by_field_name("left")
+        right_node = node.child_by_field_name("right")
+        left = _fold(left_node, resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+        if left is _REFUSE:
+            return _REFUSE
+        op_node = node.child_by_field_name("operator")
+        op = op_node.type if op_node is not None else ""  # type: ignore[assignment]
+        # Short-circuit forms fold on the left operand alone when it
+        # decides the result — mirrors Java evaluation order.
+        if op == "&&" and left is False:
+            return False
+        if op == "||" and left is True:
+            return True
+        right = _fold(node.child_by_field_name("right"), resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+        if right is _REFUSE:
+            return _REFUSE
+        if left is TAINT_FREE or right is TAINT_FREE:
+            # Taint-free algebra: string concatenation of
+            # constant/taint-free operands is taint-free (an attacker
+            # controls neither side); every other operator refuses —
+            # comparisons on an unknown value have no truth value.
+            # A concrete string operand is a MEMBER of the result and
+            # must clear the danger predicate (b40 composition).
+            if op == "+" and all(
+                    v is TAINT_FREE or isinstance(v, str)
+                    for v in (left, right)):
+                if not _tf_string_members_clear(ext, (left, right)):
+                    return _REFUSE
+                return TAINT_FREE
+            return _REFUSE
+        if op in ("==", "!=") and not _eq_semantics_are_value(
+                left_node, right_node, left, right):
+            return _REFUSE
+        if op == "+":
+            # Two char literals undergo numeric promotion, not String
+            # concatenation. Their Python str representation loses that
+            # distinction; numeric char arithmetic is not modelled here.
+            operands = (_paren_unwrap(left_node), _paren_unwrap(right_node))
+            if all(n is not None and n.type == "character_literal" for n in operands):
+                return _REFUSE
+        return _fold_binop(op, left, right)  # type: ignore[arg-type]
+    if t == "ternary_expression":
+        cond = _fold(node.child_by_field_name("condition"), resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+        if not isinstance(cond, bool):
+            if ext is not None and ext.allow_taint_free:
+                # Unknown selection over two attacker-free branches is
+                # attacker-free — taint-freedom, never a usable value.
+                # Each concrete string branch is a member of the
+                # result and must clear the danger predicate (b40).
+                cons = _fold(node.child_by_field_name("consequence"), resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+                alt = _fold(node.child_by_field_name("alternative"), resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+                if cons is not _REFUSE and alt is not _REFUSE:
+                    if not _tf_string_members_clear(ext, (cons, alt)):
+                        return _REFUSE
+                    return TAINT_FREE
+            return _REFUSE
+        branch = "consequence" if cond else "alternative"
+        value = _fold(node.child_by_field_name(branch), resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+        if _is_int(value) or isinstance(value, _JavaChar):
+            # Numeric conditional types depend on BOTH arms, even when
+            # the condition is constant. Refuse unmodelled promotion or
+            # narrowing rather than expose the selected RHS unchanged.
+            other = "alternative" if cond else "consequence"
+            other_value = _fold(node.child_by_field_name(other), resolve_name, depth + 1, array_resolver, config_resolver, conduit_resolver, ext)  # type: ignore[arg-type]
+            if type(other_value) is not type(value):
+                return _REFUSE
+        return value
+    return _REFUSE
+
+
+def _fold_xfile_call(node: Node, ext) -> Any:
+    """Cross-file returns-literal method calls: ``Cls.m(...)`` (static),
+    ``new Cls(...).m(...)`` (exact runtime class by construction), and
+    ``recv.m(...)`` where the extension context proves recv's every
+    definition creates the SAME class. Creation arguments are
+    irrelevant: the resolved body is a single ``return`` of an
+    expression that cannot reference parameters or instance state."""
+    obj = node.child_by_field_name("object")
+    name_node = node.child_by_field_name("name")
+    if obj is None or name_node is None:
+        return _REFUSE
+    args_node = node.child_by_field_name("arguments")
+    argc = len([c for c in (args_node.children if args_node else ())
+                if c.is_named])
+    method = name_node.text.decode("utf-8", "replace")  # type: ignore[union-attr]
+    cls: str | None = None
+    if obj.type == "object_creation_expression":
+        cls = _exact_creation_class(obj)
+    elif obj.type == "identifier":
+        recv = obj.text.decode("utf-8", "replace")  # type: ignore[union-attr]
+        typed = ext.receiver_type(recv, obj) if ext.receiver_type else None
+        if _receiver_is_shadowed(obj, ext) and typed is None:
+            return _REFUSE
+        cls = typed or recv
+    else:
+        if _receiver_is_shadowed(obj, ext):
+            return _REFUSE
+        cls = _receiver_chain(obj)
+    if not cls:
+        return _REFUSE
+    return ext.xfile.resolve_method(cls, method, argc,
+                                    ext.allow_taint_free)
+
+
+# String pure functions computed on folded-constant receivers. Each is
+# total on its checked domain, side-effect free, and locale-independent
+# as restricted below. Seed set <= 9 names.
+_PURE_STRING_METHODS = frozenset({
+    "charAt", "length", "substring", "toLowerCase", "toUpperCase",
+    "trim", "concat",
+})
+
+
+def _fold_pure_call(node: Node, resolve_name, depth: int,
+                    array_resolver=None,
+          config_resolver=None, conduit_resolver=None, ext=None) -> Any:
+    """Fold the pure-function allowlist on a receiver that itself
+    folds: ``charAt``/``length`` (the original pair), plus
+    ``substring``/``toLowerCase``/``toUpperCase``/``trim``/``concat``
+    (zero-arg case variants only — the Locale-taking overloads refuse)
+    and static ``String.valueOf`` on an already-folded value. A
+    TAINT_FREE receiver stays TAINT_FREE through the value-erasing
+    string ops (the attacker controls no part of the result); every
+    argument must still fold to a constant. Every other call refuses
+    as before."""
+    name_node = node.child_by_field_name("name")
+    obj = node.child_by_field_name("object")
+    if name_node is None or obj is None:
+        return _REFUSE
+    method = name_node.text.decode()  # type: ignore[union-attr]
+    args_node = node.child_by_field_name("arguments")
+    args = [c for c in (args_node.children if args_node else ())
+            if c.is_named]
+    # Folding consumers use unedited source-backed trees, whose text is bytes.
+    # Textless/edited trees are already unsupported at the name read above;
+    # this identity cast adds no fallback or change to that input contract.
+    if method == "valueOf" and obj.type == "identifier" \
+            and cast(bytes, obj.text).decode() == "String" and len(args) == 1 \
+            and not _receiver_is_shadowed(obj, ext) \
+            and _is_jvm_string_name(obj, ext):  # type: ignore[union-attr]
+        v = _fold(args[0], resolve_name, depth + 1, array_resolver,
+                  config_resolver, conduit_resolver, ext)
+        if v is TAINT_FREE:
+            return TAINT_FREE
+        if isinstance(v, (str, int, bool)) and v is not None:
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            return str(v)
+        return _REFUSE
+    if method not in _PURE_STRING_METHODS:
+        return _REFUSE
+    receiver = _fold(obj, resolve_name, depth + 1, array_resolver,
+                     config_resolver, conduit_resolver, ext)
+    folded_args: list[Any] = []
+    for a in args:
+        av = _fold(a, resolve_name, depth + 1, array_resolver,
+                   config_resolver, conduit_resolver, ext)
+        if av is _REFUSE:
+            return _REFUSE
+        folded_args.append(av)
+    if receiver is TAINT_FREE:
+        # Value-erasing ops on an attacker-free receiver: the result
+        # carries no caller taint whatever the runtime value. charAt/
+        # length yield derived scalars — equally attacker-free. A
+        # concrete string ARGUMENT to concat is a member of the
+        # result and must clear the danger predicate (b40).
+        if method == "concat" \
+                and not _tf_string_members_clear(ext, folded_args):
+            return _REFUSE
+        if any(a is TAINT_FREE for a in folded_args):
+            return TAINT_FREE if method == "concat" else _REFUSE
+        return TAINT_FREE
+    if not isinstance(receiver, str):
+        return _REFUSE
+    if any(a is TAINT_FREE for a in folded_args):
+        # Concrete RECEIVER (and any concrete args) are members of
+        # the concat result — same b40 bar.
+        if method == "concat" and not _tf_string_members_clear(
+                ext, [receiver, *folded_args]):
+            return _REFUSE
+        return TAINT_FREE if method == "concat" else _REFUSE
+    if method == "length":
+        if folded_args or not _utf16_faithful(receiver):
+            return _REFUSE
+        return len(receiver)
+    if method == "trim":
+        # Java trim strips <= U+0020 specifically; refuse non-ASCII
+        # receivers rather than model the difference from str.strip.
+        if folded_args or not receiver.isascii():
+            return _REFUSE
+        return receiver.strip("".join(chr(code) for code in range(0x21)))
+    if method in ("toLowerCase", "toUpperCase"):
+        # Zero-arg conversion uses the target's unknown default locale.
+        # Turkish/Azeri mappings affect ASCII I/i as well as non-ASCII.
+        if folded_args or not receiver.isascii():
+            return _REFUSE
+        sensitive = "I" if method == "toLowerCase" else "i"
+        if sensitive in receiver:
+            return _REFUSE
+        return (receiver.lower() if method == "toLowerCase"
+                else receiver.upper())
+    if method == "concat":
+        if len(folded_args) != 1 or not isinstance(folded_args[0], str):
+            return _REFUSE
+        return receiver + folded_args[0]
+    if method == "substring":
+        if len(folded_args) not in (1, 2):
+            return _REFUSE
+        if not all(_is_int(a) for a in folded_args):
+            return _REFUSE
+        if not _utf16_faithful(receiver):
+            return _REFUSE
+        lo = folded_args[0]
+        hi = folded_args[1] if len(folded_args) == 2 else len(receiver)
+        if not (0 <= lo <= hi <= len(receiver)):
+            return _REFUSE
+        return receiver[lo:hi]
+    if method == "charAt":
+        if len(folded_args) != 1:
+            return _REFUSE
+        idx = folded_args[0]
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            return _REFUSE
+        if not _utf16_faithful(receiver):
+            return _REFUSE
+        if not (0 <= idx < len(receiver)):
+            return _REFUSE
+        return _JavaChar(receiver[idx])
+    return _REFUSE
+
+
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _utf16_faithful(s: str) -> bool:
+    """True when every code point is BMP (<= U+FFFF): Python's
+    per-code-point ``len``/indexing then agrees exactly with Java's
+    UTF-16 code-unit ``length()``/``charAt()``/``substring()``. An
+    astral character occupies TWO Java code units but ONE Python code
+    point, so folding those methods on such a receiver yields wrong
+    VALUES in branch-selection position — the same wrong-branch hazard
+    the trim/case ops already refuse non-ASCII for."""
+    return all(ord(c) <= 0xFFFF for c in s)
+
+
+def _paren_unwrap(n: Node | None) -> Node | None:
+    while n is not None and n.type == "parenthesized_expression":
+        inner = [c for c in n.children if c.is_named]
+        if len(inner) != 1:
+            return n
+        n = inner[0]
+    return n
+
+
+# Expression shapes whose Java runtime type is a PRIMITIVE int (never
+# a boxed Integer): integer literals, arithmetic (binary/unary
+# numeric operators unbox their operands and yield primitives).
+_PRIMITIVE_INT_NODES = frozenset({
+    "decimal_integer_literal", "hex_integer_literal",
+    "octal_integer_literal", "binary_integer_literal",
+    "binary_expression", "unary_expression",
+})
+
+
+def _eq_semantics_are_value(left_node: Node | None, right_node: Node | None,
+                            left: Any, right: Any) -> bool:
+    """True when Java runtime ``==`` / ``!=`` on these operands is a
+    VALUE comparison, so folding by Python value is faithful.
+
+    Java ``==`` compares references for object operands. The folder's
+    values erase that distinction: ``_fold_pure_call`` yields Python
+    strs for ``substring``/``concat``/``toLowerCase``/… whose runtime
+    results are NEW (non-interned) String objects, so a by-value fold
+    of ``t == "a"`` returns True where the runtime is reference-false
+    — and a wrong truth value in branch-selection position prunes the
+    LIVE branch (the false-suppression direction the module docstring
+    forbids). Boxed ``Integer == Integer`` beyond the -128..127 cache
+    has the same hazard, and declared types are unknown here.
+
+    Value semantics are guaranteed only when at least one operand is
+    syntactically a PRIMITIVE-producing expression (the other side
+    then unboxes, JLS 15.21):
+
+    * ``null`` on either side — reference-vs-null matches the value
+      model (a folded non-null constant is never null);
+    * both booleans — folded booleans come from literals / logical
+      expressions (primitives), and autoboxing yields the canonical
+      cached ``Boolean`` objects, so even boxed-vs-boxed reference
+      comparison agrees with value comparison;
+    * a ``character_literal`` operand — the comparison is primitive
+      ``char`` (a String operand would not compile against a char);
+    * for int values, an integer-literal / arithmetic / unary operand.
+
+    Everything else refuses — notably ALL String comparisons without
+    a char-literal side (even literal-vs-literal: the interning
+    argument would be sound there, but carving it back in would make
+    the boundary depend on where every identifier's value came from;
+    the trade-off runs in the refusal direction and ``.equals`` is
+    the idiomatic spelling for value comparison anyway) and
+    identifier-vs-identifier ints (both sides could be boxed).
+    """
+    if left is None or right is None:
+        return True
+    if isinstance(left, bool) and isinstance(right, bool):
+        return True
+    ln = _paren_unwrap(left_node)
+    rn = _paren_unwrap(right_node)
+    if isinstance(left, str) or isinstance(right, str):
+        return (ln is not None and ln.type == "character_literal") or \
+            (rn is not None and rn.type == "character_literal")
+    if _is_int(left) and _is_int(right):
+        return (ln is not None and ln.type in _PRIMITIVE_INT_NODES) or \
+            (rn is not None and rn.type in _PRIMITIVE_INT_NODES)
+    return False
+
+
+def _fold_binop(op: str, left: Any, right: Any) -> Any:
+    if op == "+" and isinstance(left, str) and isinstance(right, str):
+        if isinstance(left, _JavaChar) and isinstance(right, _JavaChar):
+            return _REFUSE  # Numeric promotion, outside the modelled subset.
+        return left + right
+    if _is_int(left) and _is_int(right):
+        if op in ("+", "-", "*"):
+            v = {"+": left + right, "-": left - right, "*": left * right}[op]
+            return v if _INT_MIN <= v <= _INT_MAX else _REFUSE
+        if op in ("/", "%"):
+            if right == 0:
+                return _REFUSE
+            # Java integer division truncates toward zero.
+            q = abs(left) // abs(right)
+            if (left < 0) != (right < 0):
+                q = -q
+            if op == "/":
+                return q if _INT_MIN <= q <= _INT_MAX else _REFUSE
+            return left - q * right
+        if op in ("<", "<=", ">", ">="):
+            return {"<": left < right, "<=": left <= right,
+                    ">": left > right, ">=": left >= right}[op]
+    if op in ("==", "!="):
+        # By-value equality is faithful only where Java's runtime
+        # ``==`` is a value comparison — the caller (_fold) gates on
+        # _eq_semantics_are_value before reaching here (reference
+        # comparison of pure-call Strings / boxed Integers must
+        # refuse, never fold).
+        if type(left) is type(right) or (left is None or right is None):
+            return (left == right) if op == "==" else (left != right)
+        return _REFUSE
+    if op in ("&&", "||") and isinstance(left, bool) and isinstance(right, bool):
+        return (left and right) if op == "&&" else (left or right)
+    return _REFUSE
+
+
+def _index_ext(index: JavaConstIndex, allow_taint_free: bool):
+    """Carry exact-creation and positional value-binding evidence from the index.
+
+    Receiver scope remains active for value-only consumers too: a local named
+    String must not borrow the static String.valueOf special case.
+    """
+    return _FoldExt(allow_taint_free=allow_taint_free,
+                    xfile=index.xfile,
+                    receiver_type=index.receiver_type_at,
+                    receiver_is_value=index._is_value_receiver)
+
+
+def _make_point_resolver(rd, index: JavaConstIndex, array_resolver=None,
+                         config_resolver=None, conduit_resolver=None,
+                         ext=None):
+    """Name resolver over the reaching-defs oracle: every reaching
+    definition of the name at the program point must itself fold, and
+    all must fold to the same value (see module docstring; TAINT_FREE
+    values agree only with TAINT_FREE — an unknown attacker-free value
+    never equals a known constant). Shared by the constant-definers
+    gate and the switch-discriminant refinement.
+    """
+
+    def resolve_at(node, name: str, depth: int,
+                   visiting: set[tuple[int, str]]) -> Any:
+        if depth > _MAX_DEPTH:
+            return _REFUSE
+        try:
+            defs = rd.at(node, name)
+        except Exception:  # noqa: BLE001
+            return _REFUSE
+        if not defs:
+            return _REFUSE
+        values: list[Any] = []
+        for d in defs:
+            lineno = getattr(d, "lineno", 0)
+            key = (lineno, name)
+            if key in visiting:
+                return _REFUSE
+            rhs = index.rhs_at(lineno, name)
+            if rhs is None:
+                return _REFUSE
+            visiting.add(key)
+            val = _fold(
+                rhs,
+                lambda nm, dp, _d=d: resolve_at(_d, nm, dp, visiting),
+                depth,
+                array_resolver,
+                config_resolver,
+                conduit_resolver,
+                ext,
+            )
+            visiting.discard(key)
+            if val is _REFUSE:
+                return _REFUSE
+            # Neither widening a char RHS nor narrowing an integer RHS
+            # to char is modelled. A declaration must establish identity.
+            declarator = rhs.parent
+            declaration = (declarator.parent if declarator is not None
+                           and declarator.type == "variable_declarator" else None)
+            target_type = (declaration.child_by_field_name("type")
+                           if declaration is not None else None)
+            if not _constant_conversion_is_identity(
+                    val, target_type.text if target_type is not None else None):
+                return _REFUSE
+            values.append(val)
+        first = values[0]
+        for v in values[1:]:
+            if v is TAINT_FREE or first is TAINT_FREE:
+                if v is not first:
+                    return _tf_union(ext, values)
+                continue
+            if v is not first and v != first:
+                return _tf_union(ext, values)
+            if type(v) is not type(first):
+                return _tf_union(ext, values)
+        return first
+
+    return resolve_at
+
+
+def _tf_union(ext, values) -> Any:
+    """Merge verdict for non-agreeing definers that each folded.
+
+    Everything ``_fold`` produces is compile-time-known or proven
+    attacker-free by construction, so a disagreement between folded
+    values is still a union of attacker-free values — taint-free,
+    never a usable value.  Value consumers (tier off) keep the
+    historical refusal byte-for-byte; the union exists only for the
+    suppression question (b42).
+
+    Concrete STRING members additionally clear the caller's danger
+    predicate (``ext.union_member_check``) or the merge refuses — the
+    b40 composition: a value-based finding class is violated by the
+    constant itself, however attacker-free, and the finite-value-set
+    path already refuses such sets per element.  No predicate at this
+    entry means no danger authority: refuse, never assume.  Valueless
+    TAINT_FREE members ride the b37 tier precedent (no value to
+    check); ints and booleans cannot carry a danger charset.
+    """
+    if ext is None or not ext.allow_taint_free:
+        return _REFUSE
+    strs = [v for v in values if isinstance(v, str)]
+    if strs:
+        chk = ext.union_member_check
+        if chk is None or not chk(strs):
+            return _REFUSE
+    ext.union_hits.append(1)
+    return TAINT_FREE
+
+
+def fold_expr_at(rd, at_node, expr_node, index: JavaConstIndex,
+                 array_resolver=None,
+          config_resolver=None, conduit_resolver=None,
+          allow_taint_free: bool = False,
+          ban_tf_system_reads: bool = False,
+          union_member_check=None) -> Any:
+    """Fold an arbitrary expression at a program point: identifiers
+    resolve through the reaching-defs oracle at ``at_node`` with the
+    same all-defs-must-agree policy as the constant-definers gate.
+    Returns the folded value or :data:`REFUSE`; TAINT_FREE only when
+    ``allow_taint_free`` (value consumers keep the value-only
+    contract)."""
+    if not index.ok:
+        return _REFUSE
+    ext = _index_ext(index, allow_taint_free)
+    ext.ban_tf_system_reads = ban_tf_system_reads
+    ext.union_member_check = union_member_check
+    resolve_at = _make_point_resolver(rd, index, array_resolver,
+                                      config_resolver, conduit_resolver,
+                                      ext)
+    visiting: set[tuple[int, str]] = set()
+    val = _fold(
+        expr_node,
+        lambda nm, dp: resolve_at(at_node, nm, dp, visiting),
+        0,
+        array_resolver,
+        config_resolver,
+        conduit_resolver,
+        ext,
+    )
+    return _tf_or_refuse(val, ext if allow_taint_free else None)
+
+
+def definers_all_fold(
+    rd,
+    at_node,
+    name: str,
+    index: JavaConstIndex,
+    array_resolver=None,
+    config_resolver=None,
+    conduit_resolver=None,
+    ban_tf_system_reads: bool = False,
+    union_member_check=None,
+) -> bool:
+    """True when EVERY reaching definer of ``name`` at ``at_node``
+    folds to a compile-time constant — the values need NOT agree
+    (taint-freedom, not value identity; a variable that is provably
+    one of several constants carries no caller taint). Nested
+    identifier resolution keeps the strict all-defs-must-agree policy
+    of :func:`_make_point_resolver`, so relaxation applies only to the
+    named variable's own definer set, never inside arithmetic.
+
+    This is the taint-freedom consumer, so the :data:`TAINT_FREE` tier
+    is enabled here: a definer that resolves to a provably
+    attacker-uncontrolled value (system reads, cross-file static-final
+    config, their concats) counts as folding — its exact value is
+    irrelevant to the no-caller-taint conclusion this function
+    exists to draw. ``ban_tf_system_reads`` withdraws the tier's
+    bounded-system-read leg for findings whose own candidate source
+    is such a read (the b42 circularity ban — see
+    :func:`all_definers_constant`)."""
+    if not index.ok:
+        return False
+    ext = _index_ext(index, allow_taint_free=True)
+    ext.ban_tf_system_reads = ban_tf_system_reads
+    ext.union_member_check = union_member_check
+    resolve_at = _make_point_resolver(rd, index, array_resolver,
+                                      config_resolver, conduit_resolver,
+                                      ext)
+    try:
+        defs = rd.at(at_node, name)
+    except Exception:  # noqa: BLE001 — oracle failure reads as refuse
+        return False
+    if not defs:
+        return False
+    for d in defs:
+        rhs = index.rhs_at(getattr(d, "lineno", 0), name)
+        if rhs is None:
+            return False
+        val = _fold(
+            rhs,
+            lambda nm, dp, _d=d: resolve_at(_d, nm, dp, set()),
+            0,
+            array_resolver,
+            config_resolver,
+            conduit_resolver,
+            ext,
+        )
+        if val is _REFUSE:
+            return False
+    return True
+
+
+def definer_fold_values(
+    rd,
+    at_node,
+    name: str,
+    index: JavaConstIndex,
+    array_resolver=None,
+    config_resolver=None,
+    conduit_resolver=None,
+    max_definers: int = 8,
+) -> tuple[Any, ...] | None:
+    """The folded VALUE of every reaching definer of ``name`` at
+    ``at_node``, or None when any definer refuses. Values need not
+    agree — this is the finite-value-set consumer (b40): a variable
+    provably one of several compile-time constants carries no caller
+    taint, and the caller decides whether the SET itself is
+    acceptable (danger-model check per element).
+
+    Value-only by construction: the TAINT_FREE tier stays disabled —
+    a taint-free-but-unknown value has no member to run through a
+    danger model, so it must refuse here (the plain taint-freedom
+    conclusion without the set is :func:`definers_all_fold` /
+    :func:`all_definers_constant`'s job). Definer sets larger than
+    ``max_definers`` refuse (bounded recognizer).
+    """
+    if not index.ok:
+        return None
+    ext = _index_ext(index, allow_taint_free=False)
+    resolve_at = _make_point_resolver(rd, index, array_resolver,
+                                      config_resolver, conduit_resolver,
+                                      ext)
+    try:
+        defs = rd.at(at_node, name)
+    except Exception:  # noqa: BLE001 — oracle failure reads as refuse
+        return None
+    if not defs or len(defs) > max_definers:
+        return None
+    values = []
+    for d in defs:
+        rhs = index.rhs_at(getattr(d, "lineno", 0), name)
+        if rhs is None:
+            return None
+        val = _fold(
+            rhs,
+            lambda nm, dp, _d=d: resolve_at(_d, nm, dp, set()),
+            0,
+            array_resolver,
+            config_resolver,
+            conduit_resolver,
+            ext,
+        )
+        if val is _REFUSE or val is TAINT_FREE \
+                or not isinstance(val, (str, int)) \
+                or isinstance(val, bool):
+            return None
+        values.append(val)
+    return tuple(values)
+
+
+def all_definers_constant(
+    rd,
+    sink,
+    sink_arg: str,
+    index: JavaConstIndex,
+    array_resolver=None,
+    config_resolver=None,
+    conduit_resolver=None,
+    ban_tf_system_reads: bool = False,
+    union_member_check=None,
+) -> str | None:
+    """None when the constancy proof fails; a short reason string when
+    every reaching definition of ``sink_arg`` at ``sink`` folds to the
+    same compile-time constant (the reason names the value's type, not
+    the value — audit records shouldn't quote scanned content), or —
+    the b37 taint-free tier — when every definer is provably
+    attacker-uncontrolled (system reads / cross-file static-final
+    config and their concats) though the runtime value is unknown.
+    Suppression here is exactly the taint-freedom conclusion, so the
+    tier is sound for this consumer; the reason string distinguishes
+    the two proofs for the audit record.
+    """
+    if not index.ok:
+        return None
+
+    ext = _index_ext(index, allow_taint_free=True)
+    if ext is not None:
+        ext.ban_tf_system_reads = ban_tf_system_reads
+        ext.union_member_check = union_member_check
+    resolve_at = _make_point_resolver(rd, index, array_resolver,
+                                      config_resolver, conduit_resolver,
+                                      ext)
+    value = resolve_at(sink, sink_arg, 0, set())
+    if value is _REFUSE:
+        return None
+    if value is TAINT_FREE:
+        if ext.union_hits:
+            # b42: the definers disagreed on the value but every one
+            # folded — the branch selector is irrelevant to the
+            # attacker-control question.
+            return (
+                "every reaching definer of the sink argument folds to "
+                "an attacker-free value (non-agreeing taint-free union)"
+            )
+        return (
+            "every reaching definer of the sink argument is provably "
+            "attacker-uncontrolled (taint-free system/config reads)"
+        )
+    if isinstance(value, str) \
+            and not _tf_string_members_clear(ext, (value,)):
+        # b40: the agreed-value arm holds itself to the _tf_union bar
+        # — the same constant DISAGREEING across definers would refuse
+        # via the member check, so agreeing on it must not mint the
+        # suppression reason either. A danger-bearing compile-time
+        # constant violates a value-based finding class on its own.
+        return None
+    return (
+        f"every reaching definer of the sink argument folds to the "
+        f"same compile-time {'char' if isinstance(value, _JavaChar) else type(value).__name__} constant"
+    )

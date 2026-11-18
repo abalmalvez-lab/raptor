@@ -1,20 +1,29 @@
-"""Language detection by file extension."""
+"""Language detection by file extension (plus content refinement)."""
 
+import functools
+import os
+import re
+import stat
 from pathlib import Path
-from typing import Optional
+
+from core.source.streams import owned_fd
 
 LANGUAGE_MAP = {
     '.py': 'python',
     '.js': 'javascript',
     '.jsx': 'javascript',
+    '.mjs': 'javascript',
+    '.cjs': 'javascript',
     '.ts': 'typescript',
-    '.tsx': 'typescript',
+    '.tsx': 'tsx',
     '.c': 'c',
     '.h': 'c',
     '.cpp': 'cpp',
     '.cc': 'cpp',
     '.cxx': 'cpp',
     '.hpp': 'cpp',
+    '.hh': 'cpp',
+    '.hxx': 'cpp',
     '.java': 'java',
     '.go': 'go',
     '.rs': 'rust',
@@ -23,11 +32,342 @@ LANGUAGE_MAP = {
     '.cs': 'csharp',
     '.swift': 'swift',
     '.kt': 'kotlin',
+    '.kts': 'kotlin',
     '.scala': 'scala',
+    '.lua': 'lua',
+    # Regex-fallback languages (no tree-sitter grammar wired). Added so
+    # whole file classes stop contributing zero checklist items: a Perl
+    # CGI codebase, a shell-script installer, or a repo whose only
+    # injectable surface is a GitHub workflow previously produced an
+    # EMPTY inventory for those files.
+    '.pl': 'perl',
+    '.pm': 'perl',
+    '.sh': 'shell',
+    '.bash': 'shell',
+    '.m': 'objc',
+    '.mm': 'objc',
+    '.s': 'asm',      # suffix is lowercased, so .S (gas + cpp) folds here
+    '.asm': 'asm',
+    '.inc': 'inc',    # content-routed by refine_language (php/c/asm)
+    '.yml': 'yaml',   # GitHub workflow YAML — jobs/steps as reviewable units
+    '.yaml': 'yaml',
+}
+
+# Source-like extensions the inventory recognises but still cannot
+# parse. They are collected and RECORDED as exclusions (reason
+# ``unsupported_source_extension``) rather than silently invisible —
+# an operator can see the recall loss in ``excluded_files``.
+RECORD_ONLY_EXTENSIONS = frozenset({'.y', '.l', '.inl', '.sol'})
+
+# Script-per-file languages: file-scope statements ARE the program. A
+# classic PHP page/module executes its top level per request, so the
+# top-level span is the request handler — not glue between functions.
+# Consumers (gap selection, priority) treat interstitial checklist
+# items in these languages as reviewable code rather than extraction
+# residue. Deliberately a SEED (php only): Python/JS/TS module-scope
+# executable code is already extracted as named ``top_level`` items,
+# so their interstitial remainder really is import/definition residue,
+# and compiled/object languages have no executable file scope at all.
+# Grow this set only with the same evidence — an extractor that leaves
+# the language's executable file scope inside interstitial spans.
+SCRIPT_PER_FILE_LANGUAGES = frozenset({'php'})
+
+
+@functools.lru_cache(maxsize=64)
+def detect_language(filepath: str) -> str | None:
+    """Detect language from file extension."""
+    suffix = Path(filepath).suffix
+    # GNU convention: uppercase ``.C`` is C++ source (lowercase ``.c``
+    # is C). Checked case-sensitively BEFORE the lowercasing fold, or
+    # such files route to the C grammar and lose every class method.
+    if suffix == '.C':
+        return 'cpp'
+    return LANGUAGE_MAP.get(suffix.lower())
+
+
+# Interpreter basename → inventory language, for extensionless scripts
+# (launcher/dispatch surfaces like a repo's script dirs are routinely
+# extension-free; extension-only detection made every one of them
+# invisible to the inventory and every downstream scanner). Only
+# languages that already exist in LANGUAGE_MAP's value set are mapped —
+# a shebang must never introduce a language no extractor handles.
+_SHEBANG_INTERPRETERS = {
+    # OS-level interpreter basenames (baselined vocabulary — not project
+    # API names for DomainVocabulary/IRIS to learn). Version suffixes
+    # (python3, python3.12) are stripped before lookup.
+    'python': 'python',
+    'sh': 'shell', 'bash': 'shell', 'dash': 'shell', 'ksh': 'shell',
+    'zsh': 'shell',
+    'node': 'javascript', 'nodejs': 'javascript',
+    'perl': 'perl',
+    'ruby': 'ruby',
+}
+_SHEBANG_PROBE_BYTES = 160
+
+
+def _read_probe_head(filepath: str, nbytes: int) -> bytes | None:
+    """Bounded head read shared by the content probes.
+
+    O_NONBLOCK: a plain ``open()`` of a reader-less FIFO blocks
+    FOREVER, and these probes run on directory entries in the main
+    process — one stray pipe/device node in the target tree wedged
+    the whole inventory build. Non-blocking open + fstat lets us
+    reject anything that isn't a regular file before reading.
+    O_NOFOLLOW mirrors the walk's no-symlink policy.
+    """
+    try:
+        fd = os.open(filepath, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with owned_fd(fd, close_fd=os.close):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return os.read(fd, nbytes)
+        except OSError:
+            return None
+
+
+def _parse_shebang(head: bytes) -> str | None:
+    """Map a ``#!`` head to an inventory language, or None."""
+    if not head.startswith(b'#!'):
+        return None
+    line = head[2:].split(b'\n', 1)[0].decode('latin-1').strip()
+    tokens = line.split()
+    if not tokens:
+        return None
+    interp = Path(tokens[0]).name
+    # `#!/usr/bin/env python3` — the interpreter is env's first
+    # non-flag argument (`env -S python3` included).
+    if interp == 'env':
+        interp = next(
+            (Path(t).name for t in tokens[1:] if not t.startswith('-')),
+            '',
+        )
+    base = _SHEBANG_INTERPRETERS.get(interp.rstrip('0123456789.'))
+    if base is not None and base not in LANGUAGE_MAP.values():
+        return None
+    return base
+
+
+def detect_language_from_shebang(filepath: str) -> str | None:
+    """Detect language from a ``#!`` interpreter line.
+
+    Reads a bounded prefix; anything unreadable, non-``#!``, or naming
+    an interpreter outside the known set returns None (the file stays
+    uninventoried exactly as before). Version-suffixed interpreters
+    (``python3.12``) resolve by stripping trailing ``.``/digit runs.
+    """
+    head = _read_probe_head(filepath, _SHEBANG_PROBE_BYTES)
+    if head is None:
+        return None
+    return _parse_shebang(head)
+
+
+# PHP is probed by open tag rather than shebang: PHP ecosystems
+# routinely ship source under foreign extensions (plugin "module"
+# files and the like), and PHP source LEADS with its open tag. The
+# tag must be the head's first non-whitespace content (BOM tolerated)
+# — a tag anywhere deeper is a document QUOTING PHP (a fenced example
+# in a README mints real checklist items if routed), and a NUL in the
+# head is a binary (a polyglot image must not carry attacker bytes
+# into parser and review prompts as "source").
+_CONTENT_PROBE_BYTES = 1024
+_UTF8_BOM = b'\xef\xbb\xbf'
+
+
+def _php_leading_tag(text: str) -> bool:
+    """Shared leading-open-tag predicate for the walk probe (bytes,
+    via :func:`_php_leads`) and the ``.inc`` refine arm — one
+    definition so the two arms cannot drift back to anywhere-match.
+
+    Mirrors PHP's lexer: the ``<?php`` spelling is CASE-INSENSITIVE
+    (``<?PHP`` / ``<?Php`` are valid and occur in legacy plugin
+    ecosystems — the very file class the probe exists for) and must
+    be followed by whitespace or end-of-input (``<?phpinfo`` is not
+    an open tag). ``<?=`` needs no boundary.
+    """
+    stripped = text.lstrip()
+    if stripped.startswith('<?='):
+        return True
+    if stripped[:5].lower() != '<?php':
+        return False
+    rest = stripped[5:6]
+    return rest in ('', ' ', '\t', '\r', '\n')
+
+
+def _php_leads(head: bytes) -> bool:
+    if b'\x00' in head:
+        return False
+    if head.startswith(_UTF8_BOM):
+        head = head[len(_UTF8_BOM):]
+    # latin-1 is byte-lossless, and the tag grammar is pure ASCII.
+    return _php_leading_tag(head.decode('latin-1'))
+
+
+def detect_language_from_content(
+    filepath: str, *, allow_shebang: bool = True,
+) -> str | None:
+    """Detect language for a file whose extension says nothing.
+
+    Consulted when the extension is absent or unrecognised: a ``#!``
+    interpreter line first (same vocabulary as
+    :func:`detect_language_from_shebang`), then a leading PHP open
+    tag. Anything unreadable or unrecognisable returns None — the
+    file stays uninventoried exactly as before.
+
+    ``allow_shebang=False`` restricts the probe to the PHP open tag —
+    the inventory walk passes it for files that HAVE an (unrecognised)
+    extension: shebang routing is derived from extensionless
+    interpreter scripts, and probing shebangs on named documents
+    (``notes.txt`` opening with ``#!/bin/sh``) minted review units
+    from non-source.
+    """
+    head = _read_probe_head(filepath, _CONTENT_PROBE_BYTES)
+    if not head:
+        return None
+    if head.startswith(b'#!'):
+        return _parse_shebang(head) if allow_shebang else None
+    if _php_leads(head):
+        return 'php'
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def language_extensions(language: str) -> frozenset:
+    """Canonical extensions mapped to ``language`` in LANGUAGE_MAP —
+    lets the walk honour a caller's ``extensions`` narrowing for
+    content-probed files (a probe-admitted php/shell file is admitted
+    only when its language's extensions are in the allowed set)."""
+    return frozenset(
+        ext for ext, lang in LANGUAGE_MAP.items() if lang == language
+    )
+
+
+# ---------------------------------------------------------------------
+# Content-based refinement — extension alone misroutes two file classes:
+#   * ``.h`` headers: C by default, but a C++ header (classes, templates,
+#     namespaces) parsed with the C grammar loses every method.
+#   * ``.inc`` fragments: PHP includes, assembler includes, and C source
+#     fragments all share the extension.
+# ---------------------------------------------------------------------
+
+# C++-only constructs. tree-sitter-cpp parses plain C fine, so a false
+# positive (C header routed to cpp) is harmless; the miss direction
+# (C++ header parsed as C) is the recall bug this exists to fix.
+_CPP_HEADER_RE = re.compile(
+    # Horizontal-only indent in every ^ branch — the MULTILINE ^\s*
+    # idiom is quadratic on blank-line runs in scanned source.
+    r'(?m)'
+    r'^[^\S\n]*template\s*<'
+    r'|^[^\S\n]*namespace\s+[A-Za-z_{]'
+    r'|^[^\S\n]*class\s+[A-Za-z_]\w*'
+    r'|^[^\S\n]*(?:public|private|protected)\s*:'
+    r'|\bextern\s+"C\+\+"'
+    r'|\bstd::'
+    r'|\bvirtual\s+[A-Za-z_~]'
+    r'|\btypename\s+[A-Za-z_]'
+)
+
+_INC_ASM_RE = re.compile(
+    r'(?m)^[^\S\n]*(?:\.(?:text|data|globl|global|section|macro|equ)\b'
+    r'|%macro\b|%define\b|section\s+\.)'
+)
+_INC_C_RE = re.compile(
+    # Both branches horizontal-only: indent, and the signature
+    # token span [\w* \t] — a [\w*\s] span would cross newlines, and
+    # a line-broken signature must NOT route .inc content to C (a
+    # real C fragment virtually always carries an #include/#define
+    # or a same-line signature).
+    # The signature branch spells "indent, then a token span of >=2
+    # chars ending in a word char" deterministically: the indent span
+    # hands over at the first \w/*, and only the two-char minimum tail
+    # may still sit in blank space. The naive spelling
+    # [^\S\n]*[\w* \t]+\w+ makes three unbounded spans compete over
+    # the same space/tab run — quadratic on a planted horizontal run
+    # (seconds at 16K spaces even inside the sniff head).
+    r'(?m)^[^\S\n]*#\s*(?:include|define|ifn?def|pragma)\b'
+    r'|^[^\S\n]*(?:[\w*][\w* \t]*)?[\w* \t]\w\s*\([^;{)]*\)\s*\{'
+)
+
+
+def refine_language(language: str | None, filepath: str,
+                    content: str) -> str | None:
+    """Refine an extension-detected language using file content.
+
+    ``.h`` headers carrying C++ markers route to ``cpp`` so class
+    methods / templates parse; ``.inc`` fragments route to ``php`` /
+    ``asm`` / ``c`` by content. Everything else passes through
+    unchanged. Best-effort — unrecognisable content keeps the
+    extension verdict.
+    """
+    if not content:
+        return language
+    ext = Path(filepath).suffix.lower()
+    if language == 'c' and ext == '.h':
+        head = content[:64 * 1024]
+        if _CPP_HEADER_RE.search(head):
+            return 'cpp'
+        return language
+    if language == 'inc':
+        head = content[:16 * 1024]
+        # LEADING tag only, same predicate as the walk probe: a tag
+        # anywhere deeper is a document QUOTING PHP — a C fragment
+        # mentioning a PHP tag in a comment routed to the php grammar
+        # and lost every C function item.
+        if _php_leading_tag(head):
+            return 'php'
+        if _INC_ASM_RE.search(head):
+            return 'asm'
+        if _INC_C_RE.search(head):
+            return 'c'
+        return language
+    return language
+
+
+# Semgrep-canonical language id → operator-display name.
+# Used by every consumer that prints language IDs to a human
+# (``/scan`` pack-applicability lines, ``/prepare`` target
+# analysis, future report renderers). Pinned here so a future
+# language addition lands in one place rather than fanning out
+# to every renderer.
+LANG_DISPLAY = {
+    "c": "C",
+    "cpp": "C++",
+    "python": "Python",
+    "go": "Go",
+    "rust": "Rust",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+    "java": "Java",
+    "ruby": "Ruby",
+    "php": "PHP",
+    "kotlin": "Kotlin",
+    "swift": "Swift",
+    "scala": "Scala",
+    "csharp": "C#",
+    "solidity": "Solidity",
+    "bash": "Bash",
+    "yaml": "YAML",
+    "json": "JSON",
+    "html": "HTML",
+    "lua": "Lua",
+    "perl": "Perl",
+    "shell": "Shell",
+    "objc": "Objective-C",
+    "asm": "Assembly",
+    "inc": "Include fragment",
 }
 
 
-def detect_language(filepath: str) -> Optional[str]:
-    """Detect language from file extension."""
-    ext = Path(filepath).suffix.lower()
-    return LANGUAGE_MAP.get(ext)
+def display_lang(lang: str) -> str:
+    """Map a semgrep language id to its operator-display name.
+    Unknown id → pass through unchanged (caller renders the
+    raw id rather than guessing)."""
+    return LANG_DISPLAY.get(lang, lang)
+
+
+def display_langs(langs) -> str:
+    """Operator-readable joined list, e.g. ``["c", "cpp"]`` →
+    ``"C, C/C++"``."""
+    return ", ".join(display_lang(lang) for lang in langs)

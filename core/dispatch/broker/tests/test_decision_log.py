@@ -1,0 +1,207 @@
+"""Tests for decision logging."""
+
+from __future__ import annotations
+
+import json
+import threading
+
+import pytest
+
+from core.dispatch.broker.decision_log import DecisionLog, DecisionRecord
+from core.testing.threads import retiring_threads
+
+
+@pytest.fixture()
+def log_path(tmp_path):
+    return tmp_path / "decisions.jsonl"
+
+
+class TestDecisionRecord:
+    def test_defaults(self):
+        rec = DecisionRecord(
+            selected_model="claude-haiku-4-5",
+            reason="cheapest",
+        )
+        assert rec.hint_tier == "defer"
+        assert rec.success is True
+        assert rec.was_retry is False
+        assert rec.timestamp > 0
+
+    def test_full_record(self):
+        rec = DecisionRecord(
+            selected_model="claude-opus-4-6",
+            reason="scorecard top pick",
+            hint_tier="prefer",
+            hint_model="claude-opus-4-6",
+            decision_class="agentic:use-after-free",
+            prompt_tokens=4200,
+            alternatives=[
+                {"model": "claude-haiku-4-5", "reason_rejected": "lower score"},
+            ],
+            latency_ms=1234.5,
+            cost_usd=0.0042,
+            input_tokens=4200,
+            output_tokens=150,
+        )
+        assert rec.selected_model == "claude-opus-4-6"
+        assert len(rec.alternatives) == 1
+
+
+class TestDecisionLog:
+    def test_write_and_read(self, log_path):
+        log = DecisionLog(log_path)
+        rec = DecisionRecord(
+            selected_model="claude-haiku-4-5",
+            reason="test",
+        )
+        log.record(rec)
+        assert log.count == 1
+        assert log_path.exists()
+
+        records = log.read_all()
+        assert len(records) == 1
+        assert records[0].selected_model == "claude-haiku-4-5"
+
+    def test_stats(self, log_path):
+        log = DecisionLog(log_path)
+        log.record(DecisionRecord(
+            selected_model="haiku", reason="cheap", cost_usd=0.001,
+        ))
+        log.record(DecisionRecord(
+            selected_model="haiku", reason="cheap", cost_usd=0.002,
+        ))
+        log.record(DecisionRecord(
+            selected_model="opus", reason="deep", cost_usd=0.05,
+            success=False, error="timeout",
+        ))
+
+        s = log.stats()
+        assert s["total_decisions"] == 3
+        assert s["models_used"]["haiku"] == 2
+        assert s["models_used"]["opus"] == 1
+        assert s["failures"] == 1
+        assert abs(s["total_cost_usd"] - 0.053) < 1e-6
+
+    def test_jsonl_format(self, log_path):
+        log = DecisionLog(log_path)
+        log.record(DecisionRecord(
+            selected_model="haiku", reason="test",
+        ))
+        log.record(DecisionRecord(
+            selected_model="opus", reason="test2",
+        ))
+
+        lines = log_path.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 2
+        for line in lines:
+            parsed = json.loads(line)
+            assert "selected_model" in parsed
+
+    def test_concurrent_writes(self, log_path):
+        log = DecisionLog(log_path)
+        errors = []
+
+        def writer(model_name, n):
+            try:
+                for _ in range(n):
+                    log.record(DecisionRecord(
+                        selected_model=model_name, reason="concurrent",
+                    ))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=writer, args=(f"model-{i}", 50))
+            for i in range(4)
+        ]
+        with retiring_threads(threads, release=lambda: None, timeout=5):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert not errors
+        assert log.count == 200
+        records = log.read_all()
+        assert len(records) == 200
+
+    def test_read_all_skips_malformed_and_non_object_lines(self, log_path):
+        """read_all rides the shared hardened JSONL loader — same
+        best-effort policy as the previous inline parse: a malformed or
+        non-object line (foreign writer, truncated append) is skipped
+        without losing the well-formed records around it."""
+        log = DecisionLog(log_path)
+        log.record(DecisionRecord(selected_model="m1", reason="r1"))
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("{not json\n")
+            f.write('["array", "line"]\n')
+        log.record(DecisionRecord(selected_model="m2", reason="r2"))
+
+        records = log.read_all()
+        assert [r.selected_model for r in records] == ["m1", "m2"]
+
+    def test_read_empty(self, log_path):
+        log = DecisionLog(log_path)
+        assert log.read_all() == []
+
+    def test_read_nonexistent(self, tmp_path):
+        log = DecisionLog(tmp_path / "nope.jsonl")
+        assert log.read_all() == []
+
+    def test_zero_cost_counted(self, log_path):
+        log = DecisionLog(log_path)
+        log.record(DecisionRecord(
+            selected_model="haiku", reason="cached", cost_usd=0.0,
+        ))
+        log.record(DecisionRecord(
+            selected_model="haiku", reason="real", cost_usd=0.01,
+        ))
+        s = log.stats()
+        assert s["total_cost_usd"] == 0.01
+
+    def test_none_cost_not_counted(self, log_path):
+        log = DecisionLog(log_path)
+        log.record(DecisionRecord(
+            selected_model="haiku", reason="no cost data",
+        ))
+        s = log.stats()
+        assert s["total_cost_usd"] == 0.0
+
+
+class TestReadAllTolerance:
+    """read_all's docstring promises malformed lines are skipped —
+    pre-fix one unknown-key row (a newer writer's additive field, or
+    a planted line) raised TypeError out of the WHOLE read, and the
+    trail was read with no byte budget."""
+
+    def test_unknown_key_row_skipped_not_fatal(self, tmp_path):
+        path = tmp_path / "decisions.jsonl"
+        log = DecisionLog(path)
+        log.record(DecisionRecord(selected_model="m1", reason="a"))
+        with path.open("a") as fh:
+            fh.write(json.dumps({
+                "selected_model": "m2", "reason": "b",
+                "EXTRA_FUTURE_FIELD": 1,
+            }) + "\n")
+        log.record(DecisionRecord(selected_model="m3", reason="c"))
+        got = [r.selected_model for r in log.read_all()]
+        # The additive-field row still loads (unknown key filtered),
+        # neighbours untouched.
+        assert got == ["m1", "m2", "m3"]
+
+    def test_row_missing_required_fields_skipped(self, tmp_path):
+        path = tmp_path / "decisions.jsonl"
+        log = DecisionLog(path)
+        log.record(DecisionRecord(selected_model="m1", reason="a"))
+        with path.open("a") as fh:
+            fh.write(json.dumps({"reason": "no model"}) + "\n")
+        assert [r.selected_model for r in log.read_all()] == ["m1"]
+
+    def test_oversize_trail_reads_as_empty(self, tmp_path):
+        from core.dispatch.broker.decision_log import _MAX_TRAIL_BYTES
+        path = tmp_path / "decisions.jsonl"
+        row = json.dumps({"selected_model": "m", "reason": "r"}) + "\n"
+        with path.open("w") as fh:
+            for _ in range(_MAX_TRAIL_BYTES // len(row) + 2):
+                fh.write(row)
+        assert DecisionLog(path).read_all() == []

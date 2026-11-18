@@ -13,15 +13,17 @@ job rather than failing mid-campaign with a cryptic error.
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 from core.config import RaptorConfig
+from packages.fuzzing.env_hygiene import scrub_identity_env
+from core.run.scratch import scratch_dir
+from core.run.workdir import exec_workdir
 from packages.binary_analysis.radare2_understand import probe_capability as _probe_radare2_capability
 
 logger = logging.getLogger(__name__)
@@ -37,27 +39,33 @@ class CapabilityReport:
     is_linux: bool
 
     # Tools
-    afl_fuzz: Optional[str] = None
-    afl_cc: Optional[str] = None        # afl-clang-fast or afl-gcc
-    afl_cxx: Optional[str] = None
-    afl_showmap: Optional[str] = None
-    afl_cmin: Optional[str] = None
-    afl_tmin: Optional[str] = None
-    afl_cov: Optional[str] = None
+    afl_fuzz: str | None = None
+    afl_cc: str | None = None        # afl-clang-fast or afl-gcc
+    afl_cxx: str | None = None
+    afl_showmap: str | None = None
+    afl_cmin: str | None = None
+    afl_tmin: str | None = None
+    afl_cov: str | None = None
 
-    clang: Optional[str] = None
-    clang_xx: Optional[str] = None
-    gcc: Optional[str] = None
+    # Binary-only instrumentation support (uninstrumented targets):
+    # path to the QEMU tracer (-Q) / FRIDA tracer library (-O), or
+    # None when that mode is not built into this AFL++ install.
+    afl_qemu_trace: str | None = None
+    afl_frida_trace: str | None = None
 
-    lcov: Optional[str] = None
-    gcov: Optional[str] = None
-    llvm_cov: Optional[str] = None
+    clang: str | None = None
+    clang_xx: str | None = None
+    gcc: str | None = None
 
-    gdb: Optional[str] = None
-    rr: Optional[str] = None
+    lcov: str | None = None
+    gcov: str | None = None
+    llvm_cov: str | None = None
+
+    gdb: str | None = None
+    rr: str | None = None
 
     # Binary analysis
-    radare2: Optional[str] = None
+    radare2: str | None = None
     has_r2pipe: bool = False
     has_r2ghidra: bool = False
 
@@ -69,15 +77,15 @@ class CapabilityReport:
     has_thread_sanitizer: bool = False
 
     # Platform-specific issues
-    afl_shmem_ok: Optional[bool] = None    # macOS: True/False/None=untested
+    afl_shmem_ok: bool | None = None    # macOS: True/False/None=untested
     macos_afl_warning: str = ""
 
     # Versions (best effort)
     afl_version: str = ""
     clang_version: str = ""
 
-    issues: List[str] = field(default_factory=list)
-    recommendations: List[str] = field(default_factory=list)
+    issues: list[str] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
 
     def has_afl(self) -> bool:
         return self.afl_fuzz is not None and self.afl_shmem_ok is not False
@@ -88,7 +96,7 @@ class CapabilityReport:
     def has_any_fuzzer(self) -> bool:
         return self.has_afl() or self.has_clang_fuzzer()
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         d = dict(self.__dict__)
         d["has_afl"] = self.has_afl()
         d["has_clang_fuzzer"] = self.has_clang_fuzzer()
@@ -106,6 +114,9 @@ class CapabilityReport:
             + (f" -- {self.macos_afl_warning}" if self.macos_afl_warning else ""),
             f"  libFuzzer (clang):    {'yes' if self.has_clang_fuzzer() else 'no'}"
             + (f" ({self.clang_version})" if self.clang_version else ""),
+            "  AFL++ binary-only:    "
+            f"qemu={'yes' if self.afl_qemu_trace else 'no'} "
+            f"frida={'yes' if self.afl_frida_trace else 'no'}",
             "",
             "Sanitisers:",
             f"  AddressSanitizer:     {'yes' if self.has_address_sanitizer else 'no'}",
@@ -130,13 +141,11 @@ class CapabilityReport:
         if self.issues:
             lines.append("")
             lines.append("Issues:")
-            for issue in self.issues:
-                lines.append(f"  - {issue}")
+            lines.extend(f"  - {issue}" for issue in self.issues)
         if self.recommendations:
             lines.append("")
             lines.append("Recommendations:")
-            for rec in self.recommendations:
-                lines.append(f"  - {rec}")
+            lines.extend(f"  - {rec}" for rec in self.recommendations)
         return "\n".join(lines)
 
 
@@ -188,7 +197,11 @@ def probe() -> CapabilityReport:
     if is_macos:
         for hb in _homebrew_llvm_paths:
             if hb.endswith("clang") and Path(hb).exists():
-                # Only override if Apple clang doesn't have libFuzzer
+                # Only override when no clang was found or the PATH
+                # clang is Apple's /usr/bin/clang (which doesn't ship
+                # libFuzzer). Path match, not a capability probe — the
+                # actual libFuzzer probe runs further down against
+                # whichever clang wins here.
                 if not report.clang or "/usr/bin/clang" in (report.clang or ""):
                     report.clang = hb
                     break
@@ -212,9 +225,13 @@ def probe() -> CapabilityReport:
     report.has_r2pipe = bool(r2_cap.get("has_r2pipe"))
     report.has_r2ghidra = bool(r2_cap.get("has_r2ghidra"))
 
-    # AFL++ version probe
+    # AFL++ version probe + binary-only instrumentation support
     if report.afl_fuzz:
         report.afl_version = _probe_version(report.afl_fuzz, ["--help"])
+        report.afl_qemu_trace = find_afl_support_file(
+            "afl-qemu-trace", report.afl_fuzz)
+        report.afl_frida_trace = find_afl_support_file(
+            "afl-frida-trace.so", report.afl_fuzz)
 
     # Clang sanitiser support
     if report.clang:
@@ -258,7 +275,7 @@ def probe() -> CapabilityReport:
             )
 
     # MemorySanitizer is Linux/x86_64 only in practice
-    if report.has_memory_sanitizer and (is_macos or arch not in ("x86_64", "amd64")):
+    if report.has_memory_sanitizer and (not is_linux or arch not in ("x86_64", "amd64")):
         report.has_memory_sanitizer = False
         report.issues.append(
             "MemorySanitizer is supported only on Linux x86_64 in practice; "
@@ -293,19 +310,91 @@ def probe() -> CapabilityReport:
             "On Linux: 'sudo apt install rr' (Intel CPUs only)."
         )
 
-    logger.info(f"Capability probe: {report.summary().splitlines()[0]}")
+    logger.info("Capability probe: %s", report.summary().splitlines()[0])
     return report
 
 
-def _probe_version(binary: str, args: List[str]) -> str:
+# Conventional install locations for AFL++ helper artifacts. afl-fuzz
+# itself resolves helpers via $AFL_PATH, the directory containing its
+# own binary, and its compile-time helper dir; probing the same places
+# (plus PATH for executables) keeps the report honest about what a
+# campaign would actually find.
+_AFL_SUPPORT_DIRS = (
+    "/usr/local/lib/afl",
+    "/usr/lib/afl",
+    "/usr/local/share/afl",
+)
+
+
+def find_afl_support_file(name: str, afl_fuzz: str | None = None) -> str | None:
+    """Locate an AFL++ support artifact by name.
+
+    Used for the binary-only tracers (``afl-qemu-trace``,
+    ``afl-frida-trace.so``). Search order pairs the tracer with the
+    afl-fuzz that will run it — a tracer from a DIFFERENT install can
+    be shmem-protocol incompatible — so the *afl_fuzz*-adjacent dirs
+    come first, then ``$AFL_PATH``, then PATH (executables only), then
+    the conventional helper install dirs. Returns the path, or None
+    when this AFL++ install does not ship the artifact.
+    """
+    candidates: list[Path] = []
+    if afl_fuzz:
+        parent = Path(afl_fuzz).parent
+        candidates.append(parent)
+        # A symlinked afl-fuzz (source builds shimmed onto PATH) keeps
+        # its tracers next to the REAL binary; afl-fuzz itself finds
+        # them via its compile-time BIN_PATH, so probe there too.
+        try:
+            resolved_parent = Path(afl_fuzz).resolve().parent
+        except OSError:
+            resolved_parent = parent
+        if resolved_parent != parent:
+            candidates.append(resolved_parent)
+    afl_path = os.environ.get("AFL_PATH")
+    if afl_path:
+        candidates.append(Path(afl_path))
+    for directory in candidates:
+        candidate = directory / name
+        if candidate.is_file():
+            return str(candidate)
+    found = shutil.which(name)
+    if found:
+        found_path = Path(found)
+        # which() honours relative PATH entries and returns relative
+        # paths for them; the result feeds an AFL_PATH export that the
+        # campaign child resolves against ITS cwd (the output dir), so
+        # pin it to an absolute path here.
+        return str(found_path if found_path.is_absolute()
+                   else found_path.resolve())
+    for support_dir in _AFL_SUPPORT_DIRS:
+        candidate = Path(support_dir) / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _probe_executable(binary: str) -> str:
+    """Pin the caller-selected launcher before a neutral-cwd probe."""
+    return os.path.abspath(binary if os.sep in binary else (shutil.which(binary) or binary))
+
+
+def _probe_version(binary: str, args: list[str]) -> str:
     """Best-effort version extraction. Returns first non-empty version-looking line."""
     try:
-        result = subprocess.run(
-            [binary] + args,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        with scratch_dir("raptor-fuzz-probe-", dir=exec_workdir(), keepalive=True) as tmp:
+            env = scrub_identity_env(RaptorConfig.get_safe_env())
+            # Identity scrubbing uses HOME=/tmp for sandboxed targets. These
+            # trusted probes run on the host: never read shared-temp dotfiles.
+            env["HOME"] = str(tmp)
+            env["TMPDIR"] = str(tmp)
+            result = subprocess.run(
+                [_probe_executable(binary)] + args,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=os.sep,
+                env=env,
+            )
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         for line in output.splitlines():
             if any(c.isdigit() for c in line) and any(
@@ -324,8 +413,6 @@ def _probe_clang_sanitiser(clang: str, sanitizer: str) -> bool:
     test mimics what a real harness compilation looks like. For other
     sanitisers we compile a normal main() program.
     """
-    import tempfile
-
     if sanitizer == "fuzzer":
         # libFuzzer replaces main with its own driver. We must provide
         # LLVMFuzzerTestOneInput rather than main, otherwise the link
@@ -343,31 +430,35 @@ def _probe_clang_sanitiser(clang: str, sanitizer: str) -> bool:
         flag = f"-fsanitize={sanitizer}"
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".c", delete=False
-        ) as src:
-            src.write(test_src)
-            src_path = src.name
-        with tempfile.NamedTemporaryFile(suffix=".out", delete=False) as out:
-            out_path = out.name
+        # One self-deleting dir for the probe source, the probe output,
+        # AND the compiler's own scratch: clang derives its intermediate
+        # object names from the source basename and parks them in
+        # TMPDIR, so a timeout-killed compile stranded a
+        # raptor-fuzz-probe-*.o in the system temp dir on every probe.
+        # Pointing TMPDIR into the context-managed dir routes those
+        # intermediates through the same cleanup on success and failure.
+        with scratch_dir(
+            "raptor-fuzz-probe-", dir=exec_workdir(), keepalive=True,
+        ) as tmp:
+            src_path = os.path.join(tmp, "probe.c")
+            with open(src_path, "w") as src:
+                src.write(test_src)
+            out_path = os.path.join(tmp, "probe.out")
 
-        result = subprocess.run(
-            [clang, flag, src_path, "-o", out_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return result.returncode == 0
+            env = scrub_identity_env(RaptorConfig.get_safe_env())
+            env["TMPDIR"] = str(tmp)
+            env["HOME"] = str(tmp)
+            result = subprocess.run(
+                [_probe_executable(clang), flag, src_path, "-o", out_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=os.sep,
+                env=env,
+            )
+            return result.returncode == 0
     except Exception:
         return False
-    finally:
-        import os
-        for p in (locals().get("src_path"), locals().get("out_path")):
-            if p:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
 
 
 def _check_macos_afl_shmem(afl_fuzz: str) -> bool:
@@ -381,18 +472,22 @@ def _check_macos_afl_shmem(afl_fuzz: str) -> bool:
     if not Path(cat).exists():
         return True
     try:
-        with tempfile.TemporaryDirectory(prefix="raptor-afl-probe-") as tmp:
+        with scratch_dir(
+                "raptor-afl-probe-", dir=exec_workdir(), keepalive=True,
+        ) as tmp:
             tmp_path = Path(tmp)
             seeds = tmp_path / "in"
             out = tmp_path / "out"
             seeds.mkdir()
             (seeds / "seed").write_bytes(b"seed\n")
-            env = RaptorConfig.get_safe_env()
+            env = scrub_identity_env(RaptorConfig.get_safe_env())
+            env["HOME"] = str(tmp)
+            env["TMPDIR"] = str(tmp)
             env.setdefault("AFL_SKIP_CPUFREQ", "1")
             env.setdefault("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
             result = subprocess.run(
                 [
-                    afl_fuzz,
+                    _probe_executable(afl_fuzz),
                     "-i", str(seeds),
                     "-o", str(out),
                     "-V", "1",
@@ -403,20 +498,12 @@ def _check_macos_afl_shmem(afl_fuzz: str) -> bool:
                 capture_output=True,
                 text=True,
                 timeout=15,
+                cwd=os.sep,
                 env=env,
             )
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         lowered = output.lower()
-        if (
-            "shmget" in lowered
-            or "shmat" in lowered
-            or "shared memory" in lowered
-            or "afl-system-config" in lowered
-            or "cannot allocate memory" in lowered
-            or "operation not permitted" in lowered
-        ):
-            return False
-        return True
+        return not ("shmget" in lowered or "shmat" in lowered or "shared memory" in lowered or "afl-system-config" in lowered or "cannot allocate memory" in lowered or "operation not permitted" in lowered)
     except Exception:
         return True   # If we cannot tell, assume OK and let AFL fail loudly later
 
@@ -425,8 +512,8 @@ def select_fuzzer(
     report: CapabilityReport,
     target_kind: str = "binary",
     *,
-    prefer: Optional[str] = None,
-) -> Optional[str]:
+    prefer: str | None = None,
+) -> str | None:
     """Pick the right fuzzer for a target.
 
     target_kind:

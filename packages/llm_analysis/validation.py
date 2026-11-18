@@ -6,7 +6,9 @@ text contradicts the boolean verdict fields.
 
 import logging
 import re
-from typing import Dict
+import unicodedata
+
+from core.run.finding_status import read_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +46,15 @@ _SIGNAL_PATTERNS = {
 }
 
 
-def check_self_consistency(results_by_id: Dict[str, Dict]) -> int:
+def check_self_contradiction(results_by_id: dict[str, dict]) -> int:
     """Check for contradictions between LLM reasoning and verdict fields.
+
+    Naming note: previously ``check_self_consistency`` — renamed because
+    it collided with audit's ``run_self_consistency`` (Wang-et-al
+    a-priori N-sample majority vote in core/audit/multi_review.py).
+    This is a DIFFERENT QA mechanism: a-posteriori single-response
+    contradiction detection feeding targeted resampling (RetryTask).
+
 
     Two kinds of contradictions:
 
@@ -65,10 +74,29 @@ def check_self_consistency(results_by_id: Dict[str, Dict]) -> int:
     for fid, r in results_by_id.items():
         if "error" in r:
             continue
-        reasoning = (r.get("reasoning") or "")
-        is_tp = r.get("is_true_positive", True)
-        is_exp = r.get("is_exploitable", False)
-        ruling = (r.get("ruling") or "").lower()
+        reasoning = r.get("reasoning") or ""
+        if not isinstance(reasoning, str):
+            # LLM shape drift ("string" field returned as list/dict)
+            # must not crash the check — coerce for the regex pass.
+            reasoning = str(reasoning)
+        # Tri-state reads (read_verdict): a contradiction requires an
+        # ACTUAL claimed verdict on one side. Pre-fix the default-True
+        # read fabricated is_true_positive=True for a record missing
+        # the field entirely, so an abstained response whose ruling
+        # said "false_positive" was flagged self-contradictory — and
+        # burned a targeted-resample retry — over a contradiction the
+        # LLM never emitted.
+        is_tp = read_verdict(r, "is_true_positive") is True
+        is_exp = read_verdict(r, "is_exploitable") is True
+        # `ruling` travels through generate_structured's descriptive
+        # (non-enforced) schema, so fallback extraction can hand back
+        # a dict ({'status': 'false_positive'}) or other non-string
+        # shapes — the same drift journal_emit._panel_verdict defends
+        # against. `.lower()` on those aborts the whole retry stage.
+        ruling_raw = r.get("ruling")
+        if isinstance(ruling_raw, dict):
+            ruling_raw = ruling_raw.get("status")
+        ruling = str(ruling_raw or "").lower()
         fp_reason = r.get("false_positive_reason")
 
         contradictions = []
@@ -99,6 +127,11 @@ def check_self_consistency(results_by_id: Dict[str, Dict]) -> int:
         # Text contradictions — word-boundary matched (see module
         # docstring for the rationale on `\b`).
         if reasoning:
+            # NFKC-fold first: the signal patterns are ASCII with
+            # IGNORECASE, so fullwidth/compatibility spellings of the
+            # same phrases would otherwise sail past this self-QA
+            # heuristic (fewer targeted retries, not a gate bypass).
+            reasoning = unicodedata.normalize("NFKC", reasoning)
             if is_tp:
                 for signal, pat in _SIGNAL_PATTERNS["false_positive"]:
                     if pat.search(reasoning):
@@ -119,31 +152,30 @@ def check_self_consistency(results_by_id: Dict[str, Dict]) -> int:
             r["self_contradictory"] = True
             r["contradictions"] = contradictions
             flagged += 1
-            logger.warning(f"Self-contradiction in {fid}: {contradictions[0]}")
-        else:
-            # Pre-fix this branch was missing — once a finding had
-            # `self_contradictory=True` set, it persisted across
-            # re-runs of `_check_self_consistency` even when a
-            # successful retry resolved the contradiction. The
-            # downstream consensus / judge logic still saw the
-            # stale flag and treated the (now-clean) finding as
-            # uncertain.
-            #
-            # Real failure mode: RetryTask issues a fresh LLM call
-            # whose response IS internally consistent; the
-            # finding's previous self_contradictory=True from the
-            # original call leaks through unchanged. Operators
-            # see "self-contradictory" annotations on findings
-            # whose actual reasoning is fine.
-            #
-            # Clear the flag (and the contradictions list) when
-            # the current pass finds none. dict.pop with default
-            # so this is a no-op for findings that were never
-            # flagged.
-            if r.pop("self_contradictory", False):
-                r.pop("contradictions", None)
+            logger.warning("Self-contradiction in %s: %s", fid, contradictions[0])
+        # Pre-fix this branch was missing — once a finding had
+        # `self_contradictory=True` set, it persisted across
+        # re-runs of `_check_self_contradiction` even when a
+        # successful retry resolved the contradiction. The
+        # downstream consensus / judge logic still saw the
+        # stale flag and treated the (now-clean) finding as
+        # uncertain.
+        #
+        # Real failure mode: RetryTask issues a fresh LLM call
+        # whose response IS internally consistent; the
+        # finding's previous self_contradictory=True from the
+        # original call leaks through unchanged. Operators
+        # see "self-contradictory" annotations on findings
+        # whose actual reasoning is fine.
+        #
+        # Clear the flag (and the contradictions list) when
+        # the current pass finds none. dict.pop with default
+        # so this is a no-op for findings that were never
+        # flagged.
+        elif r.pop("self_contradictory", False):
+            r.pop("contradictions", None)
 
     if flagged:
-        logger.info(f"Self-consistency check: {flagged} finding(s) flagged as contradictory")
+        logger.info("Self-consistency check: %d finding(s) flagged as contradictory", flagged)
 
     return flagged

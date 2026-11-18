@@ -1,0 +1,525 @@
+"""Tests for core.analysis.taint_approx.
+
+The tree-walk tests use fake nodes and are hermetic (no tree-sitter
+needed); extraction tests require the real C grammar and skip when
+``tree_sitter_c`` is not installed.
+"""
+
+from __future__ import annotations
+
+import sys
+
+import pytest
+
+from core.analysis.taint_approx import (
+    CTaintApprox,
+    _find_function_declarator,
+    _find_identifier,
+    _resolve_callee,
+    _scan_calls,
+    _scan_opaque_assignments,
+    _walk_top_level,
+    bare_function_name,
+    compute_transitive_taint,
+    extract_taint_approx_c,
+    function_key,
+)
+
+
+class TestExtractTaintApproxC:
+    @pytest.fixture(autouse=True)
+    def _require_c_grammar(self):
+        pytest.importorskip("tree_sitter_c")
+    def test_direct_param_to_dangerous_sink(self):
+        code = """
+void parse_header(char *buf, int len) {
+    memcpy(dst, buf, len);
+}
+"""
+        results = extract_taint_approx_c(code)
+        assert "parse_header" in results
+        approx = results["parse_header"]
+        assert approx.params == ["buf", "len"]
+        assert approx.has_any_dangerous()
+        assert 0 in approx.dangerous_flows
+        assert 1 in approx.dangerous_flows
+
+    def test_no_dangerous_calls(self):
+        code = """
+int add(int a, int b) {
+    return a + b;
+}
+"""
+        results = extract_taint_approx_c(code)
+        assert "add" in results
+        approx = results["add"]
+        assert not approx.has_any_dangerous()
+        assert approx.direct_flows == {}
+
+    def test_direct_flow_non_dangerous(self):
+        code = """
+void wrapper(int x) {
+    helper(x);
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["wrapper"]
+        assert 0 in approx.direct_flows
+        assert approx.direct_flows[0] == [("helper", 0)]
+        assert not approx.has_any_dangerous()
+
+    def test_param_at_different_arg_positions(self):
+        code = """
+void copy(char *dst, const char *src, int n) {
+    memcpy(dst, src, n);
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["copy"]
+        assert 0 in approx.dangerous_flows
+        assert 1 in approx.dangerous_flows
+        assert 2 in approx.dangerous_flows
+
+    def test_opaque_flow_through_pointer(self):
+        code = """
+void process(char *buf, int len) {
+    char *p = buf;
+    memcpy(dst, p, len);
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["process"]
+        assert 1 in approx.dangerous_flows
+        assert 0 not in approx.dangerous_flows
+
+    def test_multiple_functions(self):
+        code = """
+void f1(int x) {
+    system(x);
+}
+
+void f2(int y) {
+    printf(y);
+}
+
+int f3(int z) {
+    return z;
+}
+"""
+        results = extract_taint_approx_c(code)
+        assert len(results) == 3
+        assert results["f1"].has_any_dangerous()
+        assert results["f2"].has_any_dangerous()
+        assert not results["f3"].has_any_dangerous()
+
+    def test_no_params(self):
+        code = """
+void init(void) {
+    setup();
+}
+"""
+        results = extract_taint_approx_c(code)
+        assert "init" in results
+        assert results["init"].params == []
+        assert not results["init"].has_any_dangerous()
+
+    def test_nested_calls(self):
+        code = """
+void handler(char *cmd) {
+    log(strlen(cmd));
+    system(cmd);
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["handler"]
+        assert approx.has_dangerous_param(0)
+        dangerous_callees = [c for c, _ in approx.dangerous_flows[0]]
+        assert "system" in dangerous_callees
+
+    def test_pointer_return_function(self):
+        code = """
+char *get_name(const char *input, int len) {
+    memcpy(buf, input, len);
+    return buf;
+}
+"""
+        results = extract_taint_approx_c(code)
+        assert "get_name" in results
+        approx = results["get_name"]
+        assert approx.has_any_dangerous()
+
+    def test_empty_source(self):
+        results = extract_taint_approx_c("")
+        assert results == {}
+
+    def test_non_identifier_argument_not_matched(self):
+        code = """
+void f(int x) {
+    memcpy(dst, &x, sizeof(x));
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["f"]
+        assert 0 not in approx.dangerous_flows or len(approx.dangerous_flows.get(0, [])) == 0
+
+    def test_field_access_callee(self):
+        code = """
+void handler(char *data) {
+    obj.process(data);
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["handler"]
+        assert 0 in approx.direct_flows
+        callee_names = [c for c, _ in approx.direct_flows[0]]
+        assert "obj.process" in callee_names
+
+
+DEEP = sys.getrecursionlimit() * 3
+
+
+class _FakeNode:
+    """Minimal stand-in for a tree-sitter node."""
+
+    def __init__(self, type_: str, children=None, text=b"", is_named=True):
+        self.type = type_
+        self.children = children or []
+        self.text = text
+        self.is_named = is_named
+
+
+def _deep_chain(depth: int, inner: _FakeNode, wrapper: str) -> _FakeNode:
+    node = inner
+    for _ in range(depth):
+        node = _FakeNode(wrapper, [node])
+    return node
+
+
+class TestIterativeWalks:
+    """The tree walks are iterative: a target file with deep nesting
+    must not abort the prep pass with RecursionError."""
+
+    def test_walk_top_level_survives_deep_nesting(self):
+        root = _deep_chain(DEEP, _FakeNode("identifier"), "compound_statement")
+        results: dict[str, CTaintApprox] = {}
+        _walk_top_level(root, results)          # must not raise
+        assert results == {}
+
+    def test_scan_calls_survives_deep_nesting(self):
+        root = _deep_chain(DEEP, _FakeNode("identifier"), "binary_expression")
+        approx = CTaintApprox(function="f", params=["p"])
+        _scan_calls(root, {"p"}, {"p": 0}, approx)   # must not raise
+        assert approx.direct_flows == {}
+
+    def test_scan_opaque_assignments_survives_deep_nesting(self):
+        root = _deep_chain(DEEP, _FakeNode("identifier"), "binary_expression")
+        approx = CTaintApprox(function="f", params=["p"])
+        _scan_opaque_assignments(root, {"p"}, approx)  # must not raise
+        assert not approx.has_opaque_flow
+
+    def test_find_identifier_survives_deep_nesting(self):
+        leaf = _FakeNode("identifier", text=b"needle")
+        root = _deep_chain(DEEP, leaf, "pointer_declarator")
+        assert _find_identifier(root) == "needle"
+
+    def test_find_function_declarator_survives_deep_nesting(self):
+        leaf = _FakeNode("function_declarator")
+        root = _deep_chain(DEEP, leaf, "pointer_declarator")
+        assert _find_function_declarator(root) is leaf
+
+    def test_resolve_callee_unwraps_deep_parens(self):
+        leaf = _FakeNode("identifier", text=b"fnptr")
+        root = _deep_chain(DEEP, leaf, "parenthesized_expression")
+        assert _resolve_callee(root) == ["fnptr"]
+
+    def test_walk_top_level_still_finds_functions(self):
+        # Pre-order behaviour pin: functions nested under translation
+        # unit children are analysed; the walk does not descend into a
+        # function_definition body.
+        decl = _FakeNode("function_declarator", [
+            _FakeNode("identifier", text=b"outer"),
+            _FakeNode("parameter_list"),
+        ])
+        fn = _FakeNode("function_definition", [decl])
+        root = _FakeNode("translation_unit", [fn])
+        results: dict[str, CTaintApprox] = {}
+        _walk_top_level(root, results)
+        assert list(results) == ["outer"]
+
+
+class TestEndToEndDeepFile:
+    def test_deeply_nested_c_file_does_not_abort(self):
+        pytest.importorskip("tree_sitter_c")
+        depth = 2000
+        body = "{\n" * depth + "}\n" * depth
+        code = (
+            "void deep(char *buf) " + body +
+            "\nvoid after(char *src, int n) { memcpy(dst, src, n); }\n"
+        )
+        results = extract_taint_approx_c(code)   # must not raise
+        # The later, well-formed function is still analysed.
+        assert "after" in results
+        assert results["after"].has_any_dangerous()
+
+    def test_normal_extraction_unchanged(self):
+        pytest.importorskip("tree_sitter_c")
+        code = (
+            "void parse(char *buf, int len) {\n"
+            "    memcpy(dst, buf, len);\n"
+            "}\n"
+        )
+        results = extract_taint_approx_c(code)
+        assert results["parse"].params == ["buf", "len"]
+        assert 0 in results["parse"].dangerous_flows
+
+
+class TestCTaintApprox:
+    def test_to_dict(self):
+        approx = CTaintApprox(
+            function="f",
+            params=["x", "y"],
+            direct_flows={0: [("g", 0)]},
+            dangerous_flows={0: [("system", 0)]},
+            has_opaque_flow=True,
+        )
+        d = approx.to_dict()
+        assert d["function"] == "f"
+        assert d["params"] == ["x", "y"]
+        assert d["has_opaque_flow"] is True
+        assert "0" in d["direct_flows"]
+        assert "0" in d["dangerous_flows"]
+
+    def test_has_dangerous_param(self):
+        approx = CTaintApprox(
+            function="f", params=["x"],
+            dangerous_flows={0: [("system", 0)]},
+        )
+        assert approx.has_dangerous_param(0)
+        assert not approx.has_dangerous_param(1)
+
+    def test_has_any_dangerous_empty(self):
+        approx = CTaintApprox(function="f", params=["x"])
+        assert not approx.has_any_dangerous()
+
+
+class TestParamIndexFidelity:
+    """Every parameter slot must be preserved — a dropped slot shifts
+    all later indices and mis-binds flows to the wrong parameter."""
+
+    @pytest.fixture(autouse=True)
+    def _require_c_grammar(self):
+        pytest.importorskip("tree_sitter_c")
+
+    def test_array_parameter_extracted(self):
+        code = """
+void f(char buf[64], int n) {
+    memcpy(dst, buf, n);
+}
+"""
+        approx = extract_taint_approx_c(code)["f"]
+        assert approx.params == ["buf", "n"]
+        assert approx.dangerous_flows[0] == [("memcpy", 1)]
+        assert approx.dangerous_flows[1] == [("memcpy", 2)]
+
+    def test_function_pointer_parameter_extracted(self):
+        code = """
+void f(void (*cb)(int), char *s) {
+    strcpy(dst, s);
+}
+"""
+        approx = extract_taint_approx_c(code)["f"]
+        assert approx.params == ["cb", "s"]
+        # s is index 1, not 0 — the fn-ptr slot must not vanish.
+        assert approx.dangerous_flows == {1: [("strcpy", 1)]}
+
+    def test_unnamed_parameter_holds_its_slot(self):
+        code = """
+void f(int, char *s) {
+    strcpy(dst, s);
+}
+"""
+        results = extract_taint_approx_c(code)
+        approx = results["f"]
+        assert len(approx.params) == 2
+        assert approx.params[1] == "s"
+        assert approx.dangerous_flows == {1: [("strcpy", 1)]}
+
+    def test_void_parameter_list_stays_empty(self):
+        code = """
+int g(void) { return 0; }
+"""
+        assert extract_taint_approx_c(code)["g"].params == []
+
+    def test_comment_between_arguments_does_not_shift_positions(self):
+        code = """
+void f(char *buf, int n) {
+    memcpy(dst, /* the source */ buf, n);
+}
+"""
+        approx = extract_taint_approx_c(code)["f"]
+        assert approx.dangerous_flows[0] == [("memcpy", 1)]
+        assert approx.dangerous_flows[1] == [("memcpy", 2)]
+
+
+class TestCppMethodExtraction:
+    """C++ class methods (field_identifier in-class, qualified_identifier
+    out-of-line) must produce summaries — accepting only plain
+    identifiers silently skipped every method."""
+
+    @pytest.fixture(autouse=True)
+    def _require_cpp_grammar(self):
+        pytest.importorskip("tree_sitter_cpp")
+
+    def test_out_of_line_method_definition(self):
+        from core.analysis.taint_approx import extract_taint_approx_cpp
+        code = """
+void Foo::bar(char *s, int n) { memcpy(dst, s, n); }
+"""
+        results = extract_taint_approx_cpp(code)
+        assert "bar" in results  # bare name, matching inventory keying
+        assert results["bar"].params == ["s", "n"]
+        assert results["bar"].dangerous_flows[0] == [("memcpy", 1)]
+
+    def test_in_class_method_definition(self):
+        from core.analysis.taint_approx import extract_taint_approx_cpp
+        code = """
+class C {
+public:
+    void m(char *s) { strcpy(dst, s); }
+};
+"""
+        results = extract_taint_approx_cpp(code)
+        assert "m" in results
+        assert results["m"].dangerous_flows == {0: [("strcpy", 1)]}
+
+    def test_free_function_still_extracted(self):
+        from core.analysis.taint_approx import extract_taint_approx_cpp
+        code = """
+void plain(char *s) { strcpy(dst, s); }
+"""
+        assert "plain" in extract_taint_approx_cpp(code)
+
+
+class TestTransitiveTaintJoinContract:
+    """compute_transitive_taint must join the loader's real key shape.
+
+    The producing side is exercised for real (core.audit.loaders builds
+    ``"rel:func"`` keys over an actual C tree) — hand-built bare-name
+    fixture keys are exactly the phantom shape that masked the inert
+    multi-hop lane.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_c_grammar(self):
+        pytest.importorskip("tree_sitter_c")
+
+    @staticmethod
+    def _tree(tmp_path):
+        (tmp_path / "a.c").write_text(
+            "void handle(char *input, int n) { copy_data(dst, input, n); }\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "b.c").write_text(
+            "void copy_data(char *dst, char *src, int n) "
+            "{ memcpy(dst, src, n); }\n",
+            encoding="utf-8",
+        )
+
+    def test_production_keys_produce_multi_hop_paths(self, tmp_path):
+        from core.audit.loaders import _build_taint_approx
+
+        self._tree(tmp_path)
+        per_function = _build_taint_approx(tmp_path)
+        assert sorted(per_function) == ["a.c:handle", "b.c:copy_data"]
+
+        from core.analysis.taint_approx import compute_transitive_taint
+
+        transitive = compute_transitive_taint(per_function)
+        # Result keys mirror the producer keys (the evidence index
+        # joins on them), and the multi-hop chain resolves the bare
+        # callee name against the prefixed entry.
+        assert "a.c:handle" in transitive
+        paths = transitive["a.c:handle"].param_sinks[0]
+        assert [p.hops for p in paths] == [
+            ["a.c:handle", "copy_data", "memcpy"],
+        ]
+        assert paths[0].sink_name == "memcpy"
+
+    def test_bare_keys_still_produce_multi_hop_paths(self, tmp_path):
+        # Control: the legacy bare-name vocabulary keeps working.
+        from core.audit.loaders import _build_taint_approx
+
+        self._tree(tmp_path)
+        per_function = {
+            bare_function_name(k): v
+            for k, v in _build_taint_approx(tmp_path).items()
+        }
+        transitive = compute_transitive_taint(per_function)
+        assert "handle" in transitive
+        assert transitive["handle"].param_sinks[0][0].hops == [
+            "handle", "copy_data", "memcpy",
+        ]
+
+    def test_ambiguous_bare_names_refused_for_hop_resolution(self):
+        # Two files defining copy_data: the chain must not extend
+        # through an arbitrary same-named function.
+        mid_a = CTaintApprox(
+            function="copy_data", params=["d", "s"],
+            direct_flows={1: [("memcpy", 1)]},
+            dangerous_flows={1: [("memcpy", 1)]},
+        )
+        mid_b = CTaintApprox(
+            function="copy_data", params=["d", "s"],
+            direct_flows={}, dangerous_flows={},
+        )
+        top = CTaintApprox(
+            function="handle", params=["input"],
+            direct_flows={0: [("copy_data", 1)]},
+            dangerous_flows={},
+        )
+        transitive = compute_transitive_taint({
+            "a.c:handle": top,
+            "b.c:copy_data": mid_a,
+            "c.c:copy_data": mid_b,
+        })
+        assert "a.c:handle" not in transitive
+
+    def test_path_volume_capped_both_directions(self):
+        from core.analysis.taint_approx import _MAX_PATHS_PER_PARAM
+
+        fan = _MAX_PATHS_PER_PARAM + 8
+        top = CTaintApprox(
+            function="hub", params=["x"],
+            direct_flows={0: [(f"mid{i}", 0) for i in range(fan)]},
+            dangerous_flows={},
+        )
+        mids = {
+            f"m{i}.c:mid{i}": CTaintApprox(
+                function=f"mid{i}", params=["y"],
+                direct_flows={0: [("memcpy", 0)]},
+                dangerous_flows={0: [("memcpy", 0)]},
+            )
+            for i in range(fan)
+        }
+        transitive = compute_transitive_taint({"h.c:hub": top, **mids})
+        capped = transitive["h.c:hub"].param_sinks[0]
+        assert len(capped) <= _MAX_PATHS_PER_PARAM
+
+        small = CTaintApprox(
+            function="hub", params=["x"],
+            direct_flows={0: [("mid0", 0), ("mid1", 0)]},
+            dangerous_flows={},
+        )
+        transitive = compute_transitive_taint({
+            "h.c:hub": small,
+            "m0.c:mid0": mids["m0.c:mid0"],
+            "m1.c:mid1": mids["m1.c:mid1"],
+        })
+        # Below the cap nothing is dropped.
+        assert len(transitive["h.c:hub"].param_sinks[0]) == 2
+
+    def test_function_key_round_trip(self):
+        key = function_key("src/net/parse.c", "handle")
+        assert key == "src/net/parse.c:handle"
+        assert bare_function_name(key) == "handle"
+        assert bare_function_name("handle") == "handle"

@@ -1,0 +1,365 @@
+"""Apply suppressions for known false-positive flow classes.
+
+CodeQL's heuristic taint-source list pins identifiers containing
+``secret``, ``credential``, ``api_key``, etc. regardless of the
+variable's *type*. A path variable named ``vendor_secret_key: Path``
+is therefore a "source" even though it points at a file on disk —
+the cryptographic material itself lives in the file's contents and
+never enters Python's argv. When such a path string flows through a
+``cmd`` list into a sandbox audit logger or per-run denial marker,
+``py/clear-text-logging-sensitive-data`` and
+``py/clear-text-storage-of-sensitive-information`` fire on every
+operator-visible logger downstream.
+
+The source-side defences (``paths-ignore: core/sandbox/tests/**``
+plus variable renames) handle the bulk of these. This script is the
+defence-in-depth for the residual flow class where the sink is in
+production code that genuinely needs the audit visibility. It runs
+between the multi-run SARIF merge step and the upload step in
+``.github/workflows/codeql.yml``.
+
+Mechanism: matched results are REMOVED from the SARIF before upload.
+GitHub does not act on the SARIF 2.1.0 ``suppressions`` property for
+open code-scanning alerts (verified empirically: repeated green
+uploads carrying stamped suppressions left the alerts open), so
+stamping is not a dismissal mechanism. Deleting the result instead
+closes the corresponding alert as no-longer-detected on the next
+upload. The reviewed justification for every removal lives in the
+tables below; adding a new entry requires its justification row and
+a paired regression test in test_sarif_known_fp_suppressions.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class KnownFP:
+    """One (rule, sink) pair that has been triaged as a false positive."""
+
+    rule_id: str
+    sink_file_prefixes: tuple[str, ...]
+    justification: str
+
+
+@dataclass(frozen=True)
+class SanitizerFP:
+    """A rule + sanitiser function: any flow passing through the sanitiser is FP."""
+
+    rule_id: str
+    sanitizer_file: str
+    sanitizer_function: str
+    justification: str
+
+
+# Each entry is reviewed and signed off by the security team. The
+# justification is what appears in the GitHub Code Scanning UI.
+#
+# When CodeQL surfaces a new flow that's actually a false positive,
+# the procedure is:
+#   1. Confirm the source is heuristically-named (variable name only)
+#      OR the sink is operator-visible by design;
+#   2. Document the reason in justification text below;
+#   3. Open a PR adding the entry — review checks the triage is sound.
+KNOWN_FP_RULES: tuple[KnownFP, ...] = (
+    KnownFP(
+        rule_id="py/insecure-protocol",
+        sink_file_prefixes=(
+            "packages/web/checks/cache.py",
+        ),
+        justification=(
+            "Request-smuggling probe socket: scanner semantics, not "
+            "client semantics. The raw probe exists to elicit a "
+            "parsing differential from whatever stack the TARGET "
+            "runs, legacy TLS included — there is no transport "
+            "privacy to protect and nothing of ours on the wire. The "
+            "floor is pinned explicitly (TLSVersion.TLSv1) with the "
+            "rationale in a code comment at the context construction. "
+            "Intended behavior."
+        ),
+    ),
+    KnownFP(
+        rule_id="py/clear-text-logging-sensitive-data",
+        sink_file_prefixes=(
+            "core/sandbox/context.py",
+            "core/sandbox/observe.py",
+        ),
+        justification=(
+            "Sandbox audit-log renderer (cmd_display). Source is a "
+            "heuristically-named path variable upstream "
+            "(e.g. vendor_secret_key: Path); the rendered string "
+            "interpolates a truncated cmd argv list for operator "
+            "visibility. Production callers do not pass real "
+            "credential material via argv — credentials live in "
+            "files referenced by path. Triaged FP."
+        ),
+    ),
+    KnownFP(
+        rule_id="py/clear-text-logging-sensitive-data",
+        sink_file_prefixes=(
+            "libexec/raptor-audit",
+        ),
+        justification=(
+            "Output at raptor-audit:174 is explicitly guarded by "
+            "core.security.redaction.redact_secrets() which strips "
+            "vendor credential patterns, auth headers, URL-embedded "
+            "secrets, and JWTs before sys.stdout.write(). CodeQL "
+            "does not model redact_secrets as a sanitiser barrier "
+            "and its codeFlows intermittently omit steps inside the "
+            "sanitiser function, preventing flow-based matching. "
+            "Source is a heuristically-named variable "
+            "(core/threat_model/__init__.py:732). Triaged FP."
+        ),
+    ),
+    # NOTE: no entries for the threat-model persistence flows
+    # (core/threat_model/__init__.py save_model, core/project/cli.py
+    # threat-model sync/export). Earlier entries triaged them as FPs
+    # on the claim that hardcoded_secrets summaries carry only finding
+    # labels — but the context-map hardcoded_secrets schema is
+    # unenforced and the producer can put the matched credential value
+    # into the very fields the summaries extract, so the flows were
+    # genuine. They are now redacted at the source
+    # (core/threat_model/__init__.py
+    # _sanitised_hardcoded_literal_entries) before any summary
+    # extraction, and the identifiers/lookups on those flows no longer
+    # match the query's sensitive-name heuristics; if a future
+    # query-pack version still derives the (now genuinely sanitized)
+    # flow, the correct lane is a SanitizerFP through
+    # core/security/redaction.py, not a file-prefix removal.
+    KnownFP(
+        rule_id="py/clear-text-storage-of-sensitive-information",
+        sink_file_prefixes=(
+            "core/sandbox/summary.py",
+            "core/sandbox/observe.py",
+        ),
+        justification=(
+            "Sandbox per-run denial / audit-degraded marker files "
+            "(record_denial, record_audit_degraded). Per-run JSON "
+            "state inside the sandbox's own output directory, "
+            "operator-visible by design. Source taint is a "
+            "heuristically-named path variable, not real secret "
+            "material. Triaged FP."
+        ),
+    ),
+    KnownFP(
+        rule_id="py/redos",
+        sink_file_prefixes=(
+            "packages/sca/tests/test_refresh_typosquat_lists.py",
+            "packages/sca/supply_chain/tests/test_name_grammar.py",
+        ),
+        justification=(
+            "Deliberately-superlinear regexes retained verbatim as "
+            "equivalence fixtures: these tests prove the production "
+            "linear-time Packagist grammar accepts exactly the same "
+            "language as the ambiguous legacy/published original, so "
+            "the vulnerable spelling must stay in the test text — "
+            "deleting it deletes the proof. The fixtures run only "
+            "against bounded, self-generated corpora (exhaustive "
+            "strings to length 6 plus structured strings with short "
+            "alnum runs), never attacker-controlled input, and each "
+            "site's comment forbids promoting the pattern into "
+            "production code. Intended fixture."
+        ),
+    ),
+    KnownFP(
+        rule_id="py/overly-large-range",
+        sink_file_prefixes=(
+            "core/annotations/storage.py",
+        ),
+        justification=(
+            "The flagged character range is a deliberate C0/C1 "
+            "control-character REJECT class in a write-time validator "
+            "(_CONTROL_CHARS_RE): matching text is refused with a "
+            "ValueError, never interpreted or rendered. Breadth is "
+            "the defence — over-rejecting is the safe direction for "
+            "terminal-control bytes in persisted annotations — and "
+            "the range's composition is documented in the comment at "
+            "the pattern. Intended behavior."
+        ),
+    ),
+)
+
+# Sanitiser-aware suppressions: any flow whose codeFlows pass through the
+# named function is false-positive because the sanitiser strips sensitive
+# material before the sink. Covers all current AND future call sites.
+SANITIZER_FP_RULES: tuple[SanitizerFP, ...] = (
+    SanitizerFP(
+        rule_id="py/clear-text-logging-sensitive-data",
+        sanitizer_file="core/security/redaction.py",
+        sanitizer_function="redact_secrets",
+        justification=(
+            "Output passes through core.security.redaction.redact_secrets() "
+            "which strips vendor credential patterns, auth headers, "
+            "URL-embedded secrets, and JWTs before the value reaches "
+            "the sink. CodeQL does not model redact_secrets as a "
+            "sanitiser barrier. Triaged FP."
+        ),
+    ),
+)
+
+
+def _validate_tables() -> None:
+    """Reject overly broad suppression entries at import time."""
+    for entry in KNOWN_FP_RULES:
+        for prefix in entry.sink_file_prefixes:
+            if "/" not in prefix:
+                msg = (
+                    f"KnownFP sink_file_prefix {prefix!r} is too broad — "
+                    f"must contain at least one '/' (e.g. 'core/sandbox/context.py')"
+                )
+                raise ValueError(msg)
+    for entry in SANITIZER_FP_RULES:
+        if "/" not in entry.sanitizer_file:
+            msg = (
+                f"SanitizerFP sanitizer_file {entry.sanitizer_file!r} is too broad — "
+                f"must contain at least one '/' (e.g. 'core/security/redaction.py')"
+            )
+            raise ValueError(msg)
+
+
+_validate_tables()
+
+
+def _result_sink_uri(result: dict) -> str | None:
+    """Return the sink file URI, or None if the result has no location."""
+    locations = result.get("locations") or []
+    if not locations:
+        return None
+    phys = locations[0].get("physicalLocation") or {}
+    artifact = phys.get("artifactLocation") or {}
+    uri = artifact.get("uri")
+    return uri if isinstance(uri, str) else None
+
+
+@lru_cache(maxsize=128)
+def _sanitizer_lines(file_name: str, func_name: str) -> tuple[int, int] | None:
+    """Resolve the reviewed function in the analyzed checkout without importing it."""
+    path = Path(__file__).resolve().parents[2] / file_name
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            return node.lineno, node.end_lineno
+    return None
+
+
+def _flow_passes_through(result: dict, file_name: str, func_name: str) -> bool:
+    """Require every reported flow to pass through the reviewed function.
+
+    Related locations are context, not proof of data flow. A step elsewhere
+    in the same module, or one sanitized path alongside an unsafe path,
+    must not remove the entire result from the upload.
+    """
+    bounds = _sanitizer_lines(file_name, func_name)
+    if bounds is None:
+        return False
+    flows = result.get("codeFlows") or []
+    if not flows:
+        return False
+    for cf in flows:
+        threads = cf.get("threadFlows") or []
+        if not threads:
+            return False
+        for tf in threads:
+            sanitized = False
+            for wrapper in tf.get("locations") or []:
+                loc = wrapper.get("location") or {}
+                line = (loc.get("physicalLocation") or {}).get("region", {}).get("startLine")
+                if (_loc_file_matches(loc, file_name) and type(line) is int
+                        and bounds[0] <= line <= bounds[1]):
+                    sanitized = True
+                    break
+            if not sanitized:
+                return False
+    return True
+
+
+def _loc_file_matches(loc: dict, file_substr: str) -> bool:
+    """Match the reviewed repository-relative file, not similarly named files."""
+    phys = loc.get("physicalLocation") or {}
+    artifact = phys.get("artifactLocation") or {}
+    uri = artifact.get("uri") or ""
+    return uri == file_substr
+
+
+def _matches_known_fp(result: dict) -> KnownFP | SanitizerFP | None:
+    """Return the matching KnownFP or SanitizerFP entry, or None."""
+    rule_id = result.get("ruleId")
+    if not isinstance(rule_id, str):
+        return None
+
+    # Check file-prefix-based suppressions.
+    uri = _result_sink_uri(result)
+    if uri is not None:
+        for entry in KNOWN_FP_RULES:
+            if entry.rule_id != rule_id:
+                continue
+            if uri in entry.sink_file_prefixes:
+                return entry
+
+    # Check sanitiser-based suppressions (code flow must pass through).
+    for entry in SANITIZER_FP_RULES:
+        if entry.rule_id != rule_id:
+            continue
+        if _flow_passes_through(result, entry.sanitizer_file, entry.sanitizer_function):
+            return entry
+
+    return None
+
+
+def apply_suppressions(sarif: dict) -> tuple[int, int]:
+    """Remove results matching a reviewed known-FP entry.
+
+    Returns ``(matched, removed)`` (always equal; both kept so the CI
+    log line stays diffable against historical runs). Removing the
+    result — rather than stamping a SARIF suppression, which GitHub
+    ignores — closes the open alert as no-longer-detected on upload.
+    """
+    matched = 0
+    for run in sarif.get("runs") or []:
+        results = run.get("results") or []
+        kept = []
+        for result in results:
+            if _matches_known_fp(result) is None:
+                kept.append(result)
+            else:
+                matched += 1
+        run["results"] = kept
+    return matched, matched
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print(
+            f"usage: {argv[0]} <sarif_path> "
+            "(modifies the file in place)",
+            file=sys.stderr,
+        )
+        return 2
+    sarif_path = Path(argv[1])
+    if not sarif_path.is_file():
+        print(f"ERROR: {sarif_path} is not a file", file=sys.stderr)
+        return 1
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    matched, newly = apply_suppressions(sarif)
+    sarif_path.write_text(
+        json.dumps(sarif, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        f"Known-FP triage: matched={matched} removed={newly} "
+        f"(rules: {len(KNOWN_FP_RULES)} file-prefix + "
+        f"{len(SANITIZER_FP_RULES)} sanitiser)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

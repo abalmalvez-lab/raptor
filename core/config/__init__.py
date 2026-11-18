@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 RAPTOR Centralized Configuration Module
 
@@ -8,13 +7,28 @@ including paths, timeouts, limits, and baseline settings.
 
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import ClassVar
+
+# Imported at module level DELIBERATELY (stdlib-only leaf module, no
+# cycle risk): get_safe_env() runs inside post-fork sandbox children
+# (_spawn.run_sandboxed's env=None default), where a lazy first-time
+# import would need filesystem reads the child's Landlock read
+# allowlist does not grant — the child died ModuleNotFoundError
+# whenever the parent process had not already imported the module.
+from core.security.credential_env import (
+    ANTHROPIC_FIRST_PARTY_AUTH_VARS,
+    CREDENTIAL_BEARING_ENV_VARS,
+    CREDENTIAL_GENERAL_BLOCKLIST_VARS,
+    is_credential_env_pattern_member,
+)
+from core.security.env_sanitisation import normalise_proxy_url, strip_env_vars, subprocess_tmpdir
+from core.security.rule_of_two import is_ci
 
 
-class classproperty:  # noqa: N801
+class classproperty:
     """Descriptor that works like @property but on the class itself."""
 
-    def __init__(self, func):
+    def __init__(self, func) -> None:
         self.fget = func
 
     def __get__(self, obj, cls):
@@ -45,27 +59,110 @@ class RaptorConfig:
     """
 
     def __init__(self) -> None:
-        raise TypeError(
+        msg = (
             "RaptorConfig is a class-level configuration namespace; "
             "do NOT instantiate. Access members as RaptorConfig.X (or "
             "patch via patch.object(RaptorConfig, ...) in tests)."
         )
+        raise TypeError(msg)
 
     # Version
-    VERSION = "3.0.0"
+    #
+    # ``VERSION`` is the baked release constant: it is stamped to the clean
+    # release number in the tag/archive at release time (see
+    # ``.github/workflows/release.yml``) and is what a release archive — which
+    # has no ``.git`` to derive from — reports.
+    #
+    # ``effective_version()`` is what the running tool should report/display.
+    # In a git checkout it derives the true position relative to the last
+    # release tag (e.g. ``3.0.0-1786-g7fcf38ea``) so a clone that is many
+    # commits past a release never masquerades as that clean release. It falls
+    # back to ``VERSION`` when there is no usable git checkout (archive,
+    # exported copy, git absent).
+    VERSION = "3.1.0"
+
+    @classmethod
+    def effective_version(cls) -> str:
+        """Runtime version: ``git describe`` in a checkout, else ``VERSION``."""
+        import subprocess
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[2]
+        if not (repo / ".git").exists():
+            return cls.VERSION
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo), "describe",
+                 "--tags", "--dirty=-local", "--always"],
+                capture_output=True, text=True, timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return cls.VERSION
+        desc = proc.stdout.strip()
+        if proc.returncode != 0 or not desc:
+            return cls.VERSION
+        return desc.lstrip("v")
 
     # Tool dependencies for startup checks
     # severity: "required" = feature unavailable, "degrades" = feature limited
     # group: tools in same group need at least one present
-    TOOL_DEPS = {
-        "afl++":    {"binary": "afl-fuzz",  "severity": "required", "affects": "/fuzz"},
-        "codeql":   {"binary": "codeql",    "group": "scanner",     "affects": "/codeql, /agentic"},
-        "gdb":      {"binary": "gdb",       "severity": "required", "affects": "/crash-analysis, /fuzz"},
-        "rr":       {"binary": "rr",        "severity": "degrades", "affects": "/crash-analysis"},
-        "semgrep":  {"binary": "semgrep",   "group": "scanner",     "affects": "/scan, /agentic"},
+    #
+    # Version-display convention (startup banner + doctor): a tool's
+    # version is shown IF AND ONLY IF RAPTOR gates behaviour on that
+    # version; presence-only otherwise. The version-gated set today:
+    #   * python  — 3.10+ floor (PEP 604 unions at import time)
+    #   * z3      — SMT feature coverage varies by release
+    #   * semgrep — rule semantics vary across releases; CI pins one
+    #   * joern   — MIN_JOERN_VERSION floor (packages/joern/prereqs.py)
+    #   * gcc     — -fanalyzer corroboration needs gcc >= 10
+    # Do NOT add versions for anything else — the probes cost startup
+    # time and the number carries no decision weight without a gate.
+    # Probe implementations live in core/startup/init.py
+    # (check_tools / _check_analyzer_capabilities); keep that module
+    # and this list in sync when a new version gate lands.
+    TOOL_DEPS: ClassVar[dict] = {
+        "afl++":        {"binary": "afl-fuzz",  "severity": "required", "affects": "/fuzz"},
+        "codeql":       {"binary": "codeql",    "group": "scanner",     "affects": "/codeql, /agentic"},
+        # Coccinelle (spatch) is required for source_intel's verdict-
+        # active axes (1-7). Without spatch, source_intel falls back
+        # to UNCERTAIN on most findings — informational-only axes
+        # (axis 1 alias scan, axis 6 build flags, axis 8 validation-
+        # after-overflow) still work via pure-Python paths.
+        # ``affects`` is operator-facing — names user commands ("/codeql,
+        # /agentic"), not internal subsystem axes. ``source_intel`` /
+        # ``verdict-active`` mean nothing to an operator reading /doctor.
+        "coccinelle":   {"binary": "spatch",    "severity": "degrades", "affects": "/codeql, /agentic (C/C++ semantic-patch verification)"},
+        "gdb":          {"binary": "gdb",       "severity": "required", "affects": "/crash-analysis, /fuzz"},
+        "joern":        {"binary": "joern",     "severity": "degrades", "affects": "/audit (inter-procedural taint analysis)"},
+        "rr":           {"binary": "rr",        "severity": "degrades", "affects": "/crash-analysis"},
+        "semgrep":      {"binary": "semgrep",   "group": "scanner",     "affects": "/scan, /agentic"},
+        # Dynamic analysis tools
+        "frida":        {"binary": "frida",       "severity": "degrades", "affects": "/frida, dynamic analysis, /fuzz harness probe"},
+        "frida-trace":  {"binary": "frida-trace", "severity": "degrades", "affects": "dynamic tracing"},
+        # Binary-oracle reachability and /audit's binary-evidence
+        # channel read ELF symbols/DWARF via binutils (readelf, nm,
+        # objdump, c++filt). readelf is the presence proxy — the
+        # suite ships as one package on every distro.
+        "binutils":     {"binary": "readelf",     "severity": "degrades", "affects": "/agentic, /codeql, /validate (binary-oracle reachability)"},
+        # r2 drives --binary-edges call-graph extraction
+        # (core/analysis/binary_oracle_edges.py) and /audit's binary
+        # corroboration (core/audit/capabilities.py).
+        "radare2":      {"binary": "r2",          "severity": "degrades", "affects": "/agentic, /codeql (--binary-edges), /audit (binary evidence)"},
+        # Perlasm generated-asm inventory (core/inventory/perlasm.py):
+        # without perl, detected generators become loud coverage gaps
+        # instead of enumerable generated kernels.
+        "perl":         {"binary": "perl",        "severity": "degrades", "affects": "/scan, /agentic, /audit (perlasm generated-asm inventory)"},
+        # SMT feasibility engine — a Python module, not a binary
+        # (checked via importlib.util.find_spec). Consumers guard the
+        # import and degrade: /audit path-feasibility, /codeql dataflow
+        # validation, and exploit_feasibility one-gadget checks fall
+        # back to LLM-only / unknown verdicts without it. ``pip`` names
+        # the PyPI distribution (module name differs).
+        "z3":           {"module": "z3", "pip": "z3-solver", "severity": "degrades", "affects": "/audit, /codeql, /exploit (SMT feasibility)"},
     }
 
-    TOOL_GROUPS = {
+    TOOL_GROUPS: ClassVar[dict] = {
         "scanner": {"min_required": 1, "affects": "/scan, /agentic"},
     }
 
@@ -76,9 +173,6 @@ class RaptorConfig:
     # added one directory level.
     REPO_ROOT = Path(__file__).resolve().parents[2]
     ENGINE_DIR = REPO_ROOT / "engine"
-    MCP_DIR = REPO_ROOT / "mcp"
-    AGENTS_DIR = MCP_DIR / "agents"
-    TOOLS_DIR = MCP_DIR / "tools"
     BASE_OUT_DIR = REPO_ROOT / "out"
     SEMGREP_RULES_DIR = ENGINE_DIR / "semgrep" / "rules"
     SEMGREP_REGISTRY_CACHE_DIR = SEMGREP_RULES_DIR / "registry-cache"
@@ -100,7 +194,7 @@ class RaptorConfig:
     # LocalFlowSource-based queries (covering CLI sources like sys.argv
     # that the stdlib RemoteFlowSource model excludes) are picked up
     # without operator configuration.
-    EXTRA_CODEQL_PACK_ROOTS: List[Path] = [
+    EXTRA_CODEQL_PACK_ROOTS: ClassVar[list[Path]] = [
         REPO_ROOT / "packages" / "llm_analysis" / "codeql_packs",
     ]
 
@@ -120,6 +214,84 @@ class RaptorConfig:
     # /exploit and /validate inherit through `tier1_check_finding`.
     IRIS_TIER1_ENABLED: bool = True
 
+    # Curated in-repo CodeQL query packs (CODEQL_QUERIES_DIR/<lang>/)
+    # kill-switch. When False, `QueryRunner.analyze_curated_packs`
+    # skips the curated pass entirely. Defaults to True so the
+    # hand-written queries run alongside the standard suites.
+    # Per-run CLI override: `/codeql --no-curated-queries`.
+    CODEQL_CURATED_ENABLED: bool = True
+
+    # Learned-models measurement pass on the /codeql agent: emit the
+    # project's tool-corroborated IRIS taint specs as a models-as-data
+    # extension pack and run the baseline-vs-augmented measurement over
+    # a small per-language query set. Augmented-only findings join the
+    # report as candidates (provenance=learned-model); suppression is
+    # measurement-only — nothing is dropped. Per-run CLI override:
+    # `/codeql --no-learned-models`.
+    CODEQL_LEARNED_MODELS_ENABLED: bool = True
+
+    # Mechanical Java source-wrapper summaries: same-tree helper
+    # methods whose return provably carries servlet-request data
+    # (core/analysis/java_source_summaries) are emitted as
+    # models-as-data sourceModel rows and threaded into the standard
+    # java suite via --additional-packs. Additive detection only.
+    CODEQL_SOURCE_SUMMARIES_ENABLED: bool = True
+
+    # Taint-pack models-as-data augmentation on the /codeql agent:
+    # the shipped taint seed packs (core/taint/data/packs) plus the
+    # project's operator-grade IRIS taint specs are emitted as
+    # models-as-data extension packs and staged into the STANDARD
+    # python/javascript suites via --additional-packs, and the run
+    # writes taint-mad-augmentation.json naming exactly which sink
+    # surfaces were augmented. Additive detection only — barrier rows
+    # never emit. Default off (zero cost when disabled); per-run CLI
+    # opt-in: the `--taint-crossfile` flag family
+    # (`--taint-crossfile-mad` on /codeql and /agentic).
+    CODEQL_TAINT_MAD_ENABLED: bool = False
+
+    # Record-only sanitizer-cut post-pass over scan SARIF findings
+    # (core/analysis/sanitizer_cut_postpass.py): value-bound gate
+    # verdicts are written to suppressions.jsonl as evidence
+    # (dropped: false) so the recall harness's warm scorer can measure
+    # the projected FP rate. Never mutates, demotes, or drops a
+    # finding. Per-run CLI override: `--no-sanitizer-cut-postpass`.
+    SANITIZER_CUT_POSTPASS_ENABLED: bool = True
+
+    # Sanitizer-cut ENFORCEMENT (corpus-earned 2026-08-19, operator-
+    # approved — see the attested sanitizer_dominated entry in
+    # core/analysis/reach_witness.py and
+    # measured enforcement evidence): full-proof suppress
+    # verdicts drop their findings from the combined SARIF, with
+    # dropped: true records in suppressions.jsonl. Per-tool SARIFs stay
+    # unfiltered (forensic record). Per-run CLI override:
+    # `--no-sanitizer-cut-enforce` (reverts to record-only evidence).
+    SANITIZER_CUT_ENFORCE_ENABLED: bool = True
+
+    # Config-resolved additive findings (scan stage, Java): selector
+    # calls (MessageDigest/Cipher/SecureRandom.getInstance) whose
+    # argument resolves through the strict properties-file resolver to
+    # a known-weak algorithm emit a NEW finding with
+    # provenance=config-resolved. Detection only — the stage never
+    # suppresses, and a resolution failure emits nothing. Per-run CLI
+    # override: `--no-config-resolved`.
+    CONFIG_RESOLVED_ENABLED: bool = True
+
+    # Threat models passed to `codeql database analyze` on the STANDARD
+    # suite pass (`--threat-model=<name>` per entry, additive to the
+    # always-on `default`/remote model). `local` enables the
+    # environment / commandargs / stdin / file / database source kinds
+    # on stock queries — the same source classes RAPTOR's in-repo IRIS
+    # packs model by hand (the IRIS pass stays: its verdicts feed the
+    # refute-downgrade path). Version-gated in the runner: CLIs older
+    # than CODEQL_THREAT_MODEL_MIN_VERSION never see the flag. The flag
+    # is a no-op for query packs / languages without threat-model
+    # support (CLI-documented behavior), so passing it is safe.
+    # Kill-switch: CODEQL_THREAT_MODELS_ENABLED = False.
+    # Per-run CLI overrides: `/codeql --threat-models <csv>` and
+    # `/codeql --no-threat-models`.
+    CODEQL_THREAT_MODELS_ENABLED: bool = True
+    CODEQL_THREAT_MODELS: ClassVar[tuple] = ("local",)
+
     # Timeout Configuration (seconds)
     DEFAULT_TIMEOUT = 1800          # 30 minutes
     SEMGREP_TIMEOUT = 900            # 15 minutes (scan over local rule dirs)
@@ -129,7 +301,6 @@ class RaptorConfig:
     CODEQL_ANALYZE_TIMEOUT = 2400    # 40 minutes (query execution)
     GIT_CLONE_TIMEOUT = 600          # 10 minutes
     LLM_TIMEOUT = 120                # 2 minutes per LLM call
-    SUBPROCESS_POLL_INTERVAL = 1     # 1 second
 
     # Resource Limits
     RESOURCE_READ_LIMIT = 5 * 1024 * 1024   # 5 MiB
@@ -154,12 +325,19 @@ class RaptorConfig:
         return cls._tuning().max_codeql_workers
 
     @classproperty
-    def CODEQL_RAM_MB(cls):
-        return cls._tuning().codeql_ram_mb
+    def CODEQL_ENABLED(cls):
+        """Persistent CodeQL toggle from ``tuning.json``.
+
+        When False, ``/agentic`` no longer injects ``--codeql`` by
+        default. CLI flags still override: ``--codeql`` forces ON,
+        ``--no-codeql`` forces OFF, regardless of this config.
+        """
+        return cls._tuning().codeql_enabled
 
     @classproperty
-    def CODEQL_THREADS(cls):
-        return cls._tuning().codeql_threads
+    def CODEQL_OFFLINE(cls):
+        """Operator opt-in: use local CodeQL assets without registry downloads."""
+        return os.environ.get('RAPTOR_CODEQL_OFFLINE', '').lower() in ('1', 'true', 'yes')
 
     # CodeQL DB cache: grace period before _evict_stale_canonical evicts
     # a canonical that has no metadata yet. The promote sequence has a
@@ -176,7 +354,7 @@ class RaptorConfig:
     CODEQL_DB_AUTO_CLEANUP = True    # Automatically cleanup old databases
 
     # Baseline Semgrep Packs (always included)
-    BASELINE_SEMGREP_PACKS: List[Tuple[str, str]] = [
+    BASELINE_SEMGREP_PACKS: ClassVar[list[tuple[str, str]]] = [
         ("semgrep_security_audit", "p/security-audit"),
         ("semgrep_owasp_top_10", "p/owasp-top-ten"),
         ("semgrep_secrets", "p/secrets"),
@@ -184,11 +362,11 @@ class RaptorConfig:
 
     # Mapping of policy groups to their corresponding semgrep registry packs
     # Format: {local_dir_name: (pack_name, pack_identifier)}
-    POLICY_GROUP_TO_SEMGREP_PACK: Dict[str, Tuple[str, str]] = {
+    POLICY_GROUP_TO_SEMGREP_PACK: ClassVar[dict[str, tuple[str, str]]] = {
         # Only packs that exist on semgrep.dev and are cached in registry-cache/
         # deserialisation, filesystem, logging: no registry pack exists, local rules only
         # crypto: p/crypto and category/crypto both 404 — local rules only
-        # ssrf: p/ssrf 404 and no local rules dir — no coverage until custom rules are added
+        # ssrf: p/ssrf 404; local coverage via POLICY_GROUP_RULE_FILES
         "secrets": ("semgrep_secrets", "p/secrets"),
         "injection": ("semgrep_injection", "p/command-injection"),
         "auth": ("semgrep_auth", "p/jwt"),
@@ -197,14 +375,97 @@ class RaptorConfig:
         "best-practices": ("semgrep_best_practices", "p/default"),
     }
 
+    # Policy groups whose in-repo rules live in a single file inside
+    # another group's directory rather than a directory of their own.
+    # Selecting the group scans exactly that file; the emitted rule ids
+    # are identical to a directory scan of the parent group (semgrep
+    # derives ids from the rule FILE's path), so `--policy-groups
+    # ssrf,sinks` dedups cleanly. No registry pack exists for these.
+    POLICY_GROUP_RULE_FILES: ClassVar[dict[str, Path]] = {
+        "ssrf": SEMGREP_RULES_DIR / "sinks" / "ssrf.yaml",
+    }
+
     # Default Policy Configuration
     DEFAULT_POLICY_VERSION = "v1"
     DEFAULT_POLICY_GROUPS = "all"
 
     # Environment Variables
     ENV_OUT_DIR = "RAPTOR_OUT_DIR"
-    ENV_JOB_ID = "RAPTOR_JOB_ID"
-    ENV_LLM_CMD = "RAPTOR_LLM_CMD"
+    # Operator override for target classification
+    # (auto|library|hybrid|application) consulted by
+    # core.inventory.library_detection.resolve_library_mode when the
+    # programmatic setting is "auto". The escape hatch for when
+    # auto-detection misclassifies a target (e.g. asserting 'hybrid' on a
+    # lib+CLI whose manifest only exposes the library side).
+    ENV_TARGET_KIND = "RAPTOR_TARGET_KIND"
+
+    # Operator-supplied debug binaries for the current target — triggers
+    # binary-oracle enrichment of the inventory (DWARF-joined per-function
+    # classification). Mutated by the ``--binary`` CLI flag (repeatable)
+    # at process start; read by ``build_inventory`` at the end of the
+    # build. Empty tuple = no enrichment.
+    #
+    # MULTIPLE binaries are the common case for ``--target-kind=hybrid``
+    # (a target that ships BOTH a library AND an application — npm
+    # package with main+bin, Python package with console_scripts,
+    # a C library that also ships a CLI). The classifier runs against
+    # each binary independently; the per-source-function results are
+    # combined with alive-in-any-wins semantics, so a function is only
+    # ``absent`` when EVERY declared binary lacks it. Picking the wrong
+    # single binary stops being a footgun.
+    #
+    # Follows the same in-process-ambient pattern as ``DEFAULT_TIMEOUT``
+    # — no env var (binary_oracle hasn't yet shown a need to cross
+    # subprocess boundaries; revisit if /validate or another helper grows
+    # one).
+    BINARY_ORACLE_PATHS: tuple[str, ...] = ()
+    # Subset of BINARY_ORACLE_PATHS whose absent verdicts must NOT earn
+    # suppression: env-built binaries whose build command was guessed
+    # (detector synthesis) rather than operator-set. Always re-assigned
+    # alongside BINARY_ORACLE_PATHS (never gate on truthiness).
+    BINARY_ORACLE_NO_SUPPRESS: tuple[str, ...] = ()
+    # Subset of BINARY_ORACLE_PATHS the OPERATOR declared (explicit
+    # ``--binary`` flags + the project binary store). Declared binaries
+    # are exempt from the enrichment's source-coverage floor — the
+    # declaration is the trust assertion the floor's drop warning names
+    # as its remedy. Always re-assigned alongside BINARY_ORACLE_PATHS.
+    BINARY_ORACLE_DECLARED: tuple[str, ...] = ()
+    # Identity pins for content-witnessed project-store binaries:
+    # path (as it appears in BINARY_ORACLE_PATHS) -> either
+    # ``(st_dev, st_ino, st_size, sha256_hex)`` — the fstat identity
+    # of the very fd the witness hash was verified on (O_NOFOLLOW
+    # open, fstat, hash that fd) — or ``None``, meaning the witness
+    # could not be verified fd-honestly (plant / content drift): the
+    # binary stays loaded for hint-tier enrichment but is DEMOTED out
+    # of absent-verdict suppression. The enrichment re-verifies each
+    # tuple pin around its own classify pass and demotes on mismatch,
+    # closing the window between the witness read and the oracle's
+    # by-name opens. Paths absent from the dict carry no pin (explicit
+    # --binary, auto-detect, env-build) and verify nothing. Always
+    # re-assigned alongside BINARY_ORACLE_PATHS (never gate on
+    # truthiness).
+    BINARY_ORACLE_IDENTITY_PINS: ClassVar[
+        dict[str, tuple[int, int, int, str] | None]] = {}
+
+    # Inc 2b Tier 1: when True, extract direct call edges from each
+    # binary in BINARY_ORACLE_PATHS (via r2) and annotate inventory
+    # items with binary-found callers. Affirmative reachability
+    # evidence — a function with binary-confirmed callers gets the
+    # ``binary_call_edge`` REACHABLE verdict via reach_witness.
+    # Opt-in because r2 ``aaa`` is slow (~10-30s per binary on
+    # typical sizes); operators turn it on when they care about
+    # source-graph false-deads on indirect / fn-pointer call sites.
+    BINARY_ORACLE_EDGES: bool = False
+
+    # Perlasm generated-asm inventory (core/inventory/perlasm.py):
+    # detect perlasm generators structurally, run them under the
+    # strict sandbox profile (fail-closed), and inventory the emitted
+    # assembly as ``asm-generated`` records. Default-on because the
+    # pass is zero-cost on repos without perlasm generators and
+    # fail-closed everywhere else (no strict sandbox => loud coverage
+    # gap, no execution). ``RAPTOR_NO_PERLASM=1`` is the env
+    # kill-switch for a single run.
+    PERLASM_INVENTORY: bool = True
 
     # LLM Provider Configuration.
     #
@@ -222,11 +483,13 @@ class RaptorConfig:
     # then imported the consumer module saw the wrong value with no
     # diagnostic.
     #
-    # Implement as a descriptor so both `RaptorConfig.OLLAMA_HOST`
-    # (class access; the existing call pattern across `core/llm/`)
-    # and `RaptorConfig().OLLAMA_HOST` (instance access; rare but
-    # supported) re-read the env var on every access. `__get__` is
-    # invoked for both class and instance reads.
+    # Implement as a descriptor so `RaptorConfig.OLLAMA_HOST` (class
+    # access; the existing call pattern across `core/llm/`) re-reads
+    # the env var on every access — a plain class attribute would
+    # freeze the value at import time. Instance access is impossible
+    # by design: RaptorConfig.__init__ raises TypeError (class-level
+    # namespace, never instantiated), so the descriptor only ever
+    # serves class reads.
     class _OllamaHostDescriptor:
         def __get__(self, obj, objtype=None):
             return os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -234,9 +497,9 @@ class RaptorConfig:
     OLLAMA_HOST = _OllamaHostDescriptor()
 
     # Proxy variables to strip for security
-    PROXY_ENV_VARS = [
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-        "http_proxy", "https_proxy", "no_proxy",
+    PROXY_ENV_VARS: ClassVar[list] = [
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "no_proxy", "all_proxy",
     ]
 
     # ----- Env allowlist (primary) and blocklist (belt + braces) -----
@@ -267,7 +530,12 @@ class RaptorConfig:
         # Home and session — many tools need HOME for ~/.config; stripping
         # breaks far too much. Redirect-via-malicious-HOME is a real but
         # accepted residual risk (see sandbox threat model).
-        "HOME", "SHELL", "PWD", "OLDPWD",
+        # OLDPWD is deliberately NOT kept: no tool consults the shell's
+        # previous working directory, and it leaks host filesystem
+        # layout (typically the orchestrator's repo path) into every
+        # child — including sandboxed ones whose whole point is not
+        # seeing the host layout.
+        "HOME", "SHELL", "PWD",
         # XDG base dirs — modern tools expect these. Same residual redirect
         # risk as HOME; accepted.
         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
@@ -291,8 +559,14 @@ class RaptorConfig:
         # were invoked from a trusted parent (bin/raptor, bin/cve-diff,
         # or Claude Code). Pure boolean flags; not shell-interpreted.
         # Must propagate through get_safe_env() because the sandbox
-        # spawns its own libexec scripts (raptor-pid1-shim,
-        # raptor-run-sandboxed) using this env.
+        # spawns its own libexec scripts (raptor-run-sandboxed)
+        # using this env. Untrusted TARGETS do not see them: the
+        # sandbox strips the whole TARGET_ENV_STRIP_SET from the
+        # target-bound env by default (core/sandbox/context.py's
+        # target-env staging). RAPTOR's own Claude Code
+        # skill dispatches opt out via keep_trust_markers=True (see
+        # run_untrusted_networked) — those children drive libexec/
+        # helpers on the operator-approved run and need the marker.
         "_RAPTOR_TRUSTED", "CLAUDECODE",
         # RAPTOR runtime config that downstream subprocesses must
         # honour for the operator's intent to take effect:
@@ -307,14 +581,246 @@ class RaptorConfig:
         # Both are validated by get_out_dir() (refuses system paths)
         # so an attacker setting them gains nothing beyond what they
         # already had with same-UID write access to ~/raptor-out.
-        "RAPTOR_OUT_DIR", "RAPTOR_DIR",
+        "RAPTOR_OUT_DIR", "RAPTOR_DIR", "RAPTOR_INSTALL_PROTECTED",
+        # Preserve the operator's first-use download opt-out through launchers
+        # and diagnostic subprocesses. This flag only disables installation.
+        "RAPTOR_CODEQL_AUTO_INSTALL",
+        "RAPTOR_SEMGREP_OFFLINE",
+        "RAPTOR_CODEQL_OFFLINE",
+        # Explicit operator tool selection; needed by imported offline CLIs
+        # that are cached outside PATH. Same operator-controlled axis as PATH.
+        "CODEQL_CLI",
+        "_RAPTOR_JOERN_TMP_BASE", "_RAPTOR_SERVICE_TMP_BASE",
+        #   RAPTOR_TARGET_KIND  operator's target-classification override
+        #                    (auto|library|hybrid|application). Must survive
+        #                    the subprocess boundary so an inventory rebuilt in
+        #                    a child honours the operator's intent. Only ever
+        #                    read as an enum (any other value → auto); no
+        #                    injection surface.
+        "RAPTOR_TARGET_KIND",
+        #   RAPTOR_SCORECARD_PATH  reliability-ledger path override
+        #                    (tests and operators point the per-model
+        #                    scorecard at a scratch/alternate file).
+        #                    Must survive the subprocess boundary:
+        #                    a child that flushes scorecard events
+        #                    would otherwise re-resolve the DEFAULT
+        #                    ledger under RAPTOR_DIR and silently
+        #                    discard the isolation/override — the
+        #                    same silent-loss class as RAPTOR_OUT_DIR.
+        #                    An attacker setting it gains nothing
+        #                    beyond same-UID file write access.
+        "RAPTOR_SCORECARD_PATH",
+        #   RAPTOR_LLM_TRANSCRIPT  LLM transcript record/replay seam
+        #                    (core/llm/transcript.py). Must survive the
+        #                    subprocess boundary: raptor.py spawns the
+        #                    analysis scripts through this env, and a
+        #                    stripped var means record mode silently
+        #                    produces a paid run with NO transcript
+        #                    while replay mode silently dispatches
+        #                    LIVE — the two failures the seam exists
+        #                    to prevent. Parse-validated in the child
+        #                    (a garbled value raises), record writes
+        #                    go through the O_NOFOLLOW append-JSONL
+        #                    writer, and replayed content is treated
+        #                    as untrusted — an attacker setting it
+        #                    gains nothing beyond same-UID file access
+        #                    (the RAPTOR_OUT_DIR argument). Stripped
+        #                    from target-bound envs below.
+        "RAPTOR_LLM_TRANSCRIPT",
+        # Session identity credential: the launcher-exported
+        # pid + token that lets deep children (skill dispatches, nested
+        # claude subagents, PID-namespace-blind helpers) resolve their
+        # owning session's project binding. Same contract as
+        # RAPTOR_OUT_DIR: validated on every read (digits, token
+        # compare_digest against the 0700 registry entry, identity
+        # stamp) — an attacker able to set them gains nothing beyond
+        # what same-UID write access to ~/.local/share/raptor already
+        # grants. Target-bound envs strip both via
+        # TARGET_ENV_STRIP_SET (sandboxed code never sees the
+        # credential; see core/sandbox/context.py).
+        "RAPTOR_SESSION_PID", "RAPTOR_SESSION_TOKEN", "_RAPTOR_SCRATCH_AUTH",
+        #   RAPTOR_REGISTRY_HOME  operator-registry relocation override
+        #                    (core.project.registry_home — projects
+        #                    registry, .active bookmark, sessions.d,
+        #                    all from one base). Must survive the
+        #                    subprocess boundary: RAPTOR's own
+        #                    scrub-spawned children re-resolve the
+        #                    registries through the seam, and a
+        #                    stripped var means the child resolves the
+        #                    DEFAULT home while the parent runs
+        #                    against the override — session binding,
+        #                    bookmark, and ledger locking silently
+        #                    split at every spawn boundary (the
+        #                    RAPTOR_OUT_DIR silent-loss class).
+        #                    Absolute-path-validated on every read;
+        #                    an attacker setting it gains nothing
+        #                    beyond same-UID write access to the dirs
+        #                    it redirects. Target-bound envs strip it
+        #                    below.
+        "RAPTOR_REGISTRY_HOME",
+        # Host-level consent for RAPTOR's reduced untrusted sandbox tier.
+        # RAPTOR-owned workers must inherit it so the decision made at the
+        # launcher boundary is not silently lost.  Target-bound envs strip it
+        # below, preventing scanned code from changing sandbox policy.
+        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED",
+        # Sanitizer-cut gate transport: the consuming commands
+        # (/agentic, /codeql, /validate) resolve --sanitizer-cut and
+        # export the result through these vars so scrub-spawned
+        # analysis workers reconstruct the SAME gate configuration
+        # (core.dataflow.sanitizer_cut_config._export_to_env /
+        # _resolve_from_env). Without them here the export died at
+        # this boundary and every safe-env worker silently ran
+        # mode=off — the opposite of the operator's flag, and the
+        # shadow-parity telemetry that gates lexical-fallback removal
+        # under-measured. Values are re-validated on read: the mode
+        # flags parse as booleans (anything non-truthy = off, the
+        # footgun-guarded resolver refuses the dangerous combination),
+        # the two paths are consumed only by RAPTOR's own telemetry
+        # writers — an attacker setting them gains nothing beyond
+        # same-UID file write access (the RAPTOR_OUT_DIR argument).
+        # Target-bound envs strip the family below.
+        "RAPTOR_SANITIZER_CUT", "RAPTOR_SANITIZER_CUT_NO_LEXICAL",
+        "RAPTOR_SANITIZER_CUT_PARITY_LOG", "RAPTOR_SANITIZER_CUT_AUDIT_DIR",
     })
+
+    # Variables that must NEVER reach code executed on behalf of a
+    # scanned TARGET (build scripts, test suites, fuzz targets, frida
+    # spawn-mode processes): trust markers a hostile child could
+    # replay against the libexec trust gate, and the session
+    # credential. Consumed by core/sandbox/context.py,
+    # libexec/raptor-seatbelt-shim (keep the shim's tuple in sync —
+    # the isolated `python3 -I` shim cannot import this module), and
+    # packages/fuzzing/env_hygiene.py; the strip regression harness is
+    # table-driven off this constant.
+    #
+    # Extend THIS constant; do not scatter per-caller strips.
+    TARGET_ENV_STRIP_SET = frozenset({
+        "CLAUDECODE", "_RAPTOR_TRUSTED",
+        "_RAPTOR_JOERN_TMP_BASE", "_RAPTOR_SERVICE_TMP_BASE",
+        "RAPTOR_SESSION_PID", "RAPTOR_SESSION_TOKEN", "_RAPTOR_SCRATCH_AUTH",
+        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED",
+        # Sandbox-disable consent nonce. Deliberately NOT in
+        # SAFE_ENV_ALLOWLIST (a pinning test holds that direction):
+        # propagation along RAPTOR's own worker spine is site-specific
+        # and explicit (core.sandbox.disable_consent), never ambient.
+        # Stripped here so code executed on behalf of a TARGET can
+        # never observe or replay a live consent against a child
+        # RAPTOR invocation.
+        "RAPTOR_NO_SANDBOX_NONCE",
+        # Framework-identity values: each one names RAPTOR (or its
+        # checkout / output layout) to any target that runs `env`,
+        # defeating the anti-fingerprint posture in one getenv. No
+        # sandboxed TARGET consumes them; RAPTOR's own children that
+        # do (libexec lifecycle helpers, nested skill dispatches) run
+        # on the keep-trust dispatch arm, which retains the full set
+        # by contract.
+        "RAPTOR_DIR", "RAPTOR_OUT_DIR", "RAPTOR_TARGET_KIND", "RAPTOR_INSTALL_PROTECTED",
+        "RAPTOR_CALLER_DIR",
+        "RAPTOR_SCORECARD_PATH",
+        # Operator-registry override: framework tell plus a host path
+        # that leaks the operator's registry layout. No target
+        # consumes it; RAPTOR's own children ride the keep-trust
+        # dispatch arm.
+        "RAPTOR_REGISTRY_HOME", "_RAPTOR_LAUNCH_METADATA",
+        # LLM transcript seam: framework tell plus a host path that
+        # leaks the run layout. No target consumes it; RAPTOR's own
+        # LLM-calling children ride the keep-trust dispatch arm.
+        "RAPTOR_LLM_TRANSCRIPT",
+        # Sanitizer-cut transport: framework tell plus two host paths
+        # (parity log, audit dir) that leak the run layout. No target
+        # consumes them.
+        "RAPTOR_SANITIZER_CUT", "RAPTOR_SANITIZER_CUT_NO_LEXICAL",
+        "RAPTOR_SANITIZER_CUT_PARITY_LOG", "RAPTOR_SANITIZER_CUT_AUDIT_DIR",
+    })
+
+    # Name prefixes that identify RAPTOR to EXECUTED target code even
+    # when no member of TARGET_ENV_STRIP_SET survives: several
+    # RAPTOR_* names legitimately ride the safe-env allowlist for
+    # RAPTOR's own scrub-spawned TOOL children (RAPTOR_EF_* budget
+    # knobs, the RAPTOR_CI stamp for the interactivity gate, transport
+    # kill switches) — but to a hostile binary every one of them is a
+    # one-getenv "you are inside RAPTOR" tell and an anti-analysis
+    # trigger. Paths that EXECUTE the analysed artifact (frida spawn;
+    # the sandbox's direct-exec target arm is the intended next
+    # adopter) must strip the whole family via
+    # strip_target_exec_markers(); tooling-facing paths keep the
+    # allowlist as-is. Prefix-based so future RAPTOR_* allowlist
+    # additions cannot silently re-open the fingerprint.
+    TARGET_EXEC_MARKER_ENV_PREFIXES = ("RAPTOR_", "_RAPTOR")
+
+    @staticmethod
+    def strip_target_exec_markers(env: dict) -> dict:
+        """Return *env* minus every RAPTOR-identifying name.
+
+        For spawn paths whose child IS the analysed target. Removes
+        TARGET_ENV_STRIP_SET plus every name matching
+        TARGET_EXEC_MARKER_ENV_PREFIXES. Never apply this to RAPTOR's
+        own tool children — they consume RAPTOR_EF_* / RAPTOR_CI by
+        contract (see the allowlist comments above).
+        """
+        strip = RaptorConfig.TARGET_ENV_STRIP_SET
+        prefixes = RaptorConfig.TARGET_EXEC_MARKER_ENV_PREFIXES
+        return {
+            k: v for k, v in env.items()
+            if k not in strip and not k.startswith(prefixes)
+        }
+
+    # CI markers ride the allowlist: RAPTOR's own interactivity gate
+    # (core.security.rule_of_two.is_interactive) runs inside children
+    # whose env this scrub produced — stripping every CI marker made
+    # the gate judge a pseudo-TTY CI runner as a human, silently
+    # opening the weakened-defenses consent path in CI. Pure boolean
+    # flags, no injection surface; one source of truth in
+    # rule_of_two so the lists cannot drift. (Deferred import: keeps
+    # the class body free of a module-level core.security dependency
+    # while still evaluating exactly once at class-definition time.)
+    from core.security.rule_of_two import ci_env_vars as _ci_env_vars  # type: ignore[misc]
+    SAFE_ENV_ALLOWLIST = SAFE_ENV_ALLOWLIST | frozenset(_ci_env_vars())
+    del _ci_env_vars
 
     # Name prefixes — any variable whose name starts with one of these is
     # kept, treated as a family allowlist. Keep the list minimal.
     SAFE_ENV_PREFIXES = (
         "LC_",          # locale sub-variables (LC_CTYPE, LC_COLLATE, etc.)
     )
+
+    # Exploit-feasibility knobs that may cross the scrub boundary:
+    # numeric budgets and shared-toggle booleans only — no injection
+    # surface, and the loader runs inside scrub-spawned children where
+    # dropping them silently discarded the operator's settings.
+    #
+    # Deliberately NOT a RAPTOR_EF_ prefix family: the rest of the
+    # namespace is exec-path class. RAPTOR_EF_{CHECKSEC,ROPGADGET,
+    # ONE_GADGET}_PATH name binaries the analysis EXECUTES,
+    # RAPTOR_EF_CONFIG names a JSON that can set those same paths, and
+    # RAPTOR_EF_CACHE_DIR redirects writes — the EDITOR/PAGER threat
+    # class this scrub exists to strip. Those work only in the
+    # operator's direct (unscrubbed) session environment.
+    SAFE_ENV_ALLOWLIST = SAFE_ENV_ALLOWLIST | frozenset({
+        "RAPTOR_EF_TIMEOUT_FAST", "RAPTOR_EF_TIMEOUT_NORMAL",
+        "RAPTOR_EF_TIMEOUT_MEDIUM", "RAPTOR_EF_TIMEOUT_SLOW",
+        "RAPTOR_EF_TIMEOUT_VERY_SLOW", "RAPTOR_EF_TIMEOUT_MAX",
+        "RAPTOR_EF_ENABLE_CACHING", "RAPTOR_EF_ROP_CACHE_SIZE",
+        "RAPTOR_EF_MAX_GADGETS", "RAPTOR_EF_VERIFY_FORMAT_N",
+        "RAPTOR_EF_VERBOSE",
+        # Pure-refusal transport kill switch (core.llm.cc_adapter):
+        # can only forbid billed claude spawns, never enable anything
+        # — safe for every child, and keeping it makes the
+        # whole-process-tree hermeticity guarantee hold through
+        # get_safe_env() children too.
+        "RAPTOR_CC_TRANSPORT_DISABLED",
+        # RE-database size-ceiling override (core.json.utils.
+        # RE_DATABASE_MAX_BYTES). Must cross the scrub boundary:
+        # scanners, validators, and libexec dispatches are
+        # scrub-spawned children, and stripping it here means a
+        # parent's raised ceiling writes a database its own child
+        # pipelines then refuse — the write-then-strand failure the
+        # ceiling unification removed, resurrected at every spawn
+        # boundary. Numeric knob with no injection surface: the value
+        # is strictly re-validated at consumption (positive integer
+        # or warn-and-default, never unlimited).
+        "RAPTOR_REDB_MAX_BYTES",
+    })
 
     # Environment variables that can be exploited for command injection or
     # runtime code injection when consumed by tools that auto-load config /
@@ -336,7 +842,7 @@ class RaptorConfig:
     #   3. Belt + braces inside get_safe_env() — if the allowlist is ever
     #      widened (e.g., a new `SSH_*` prefix) the overlay still strips
     #      the specific known-bad names.
-    DANGEROUS_ENV_VARS = [
+    DANGEROUS_ENV_VARS = frozenset([
         # Shell/tool-eval vectors
         "TERMINAL",        # Shell-evaluated by command lookup utilities
         "BROWSER",         # Shell-evaluated by open/xdg-open
@@ -355,16 +861,27 @@ class RaptorConfig:
         "LD_DEBUG",        # Loader debug output — info leak (maps, symbols)
         "LD_PROFILE",      # Loader profiling — writes profile data, side-channel
         "LD_SHOW_AUXV",    # Prints auxv including randomised addresses
+        # macOS dyld equivalents — no-ops on Linux, critical on macOS
+        "DYLD_INSERT_LIBRARIES",      # macOS equivalent of LD_PRELOAD
+        "DYLD_LIBRARY_PATH",          # macOS equivalent of LD_LIBRARY_PATH
+        "DYLD_FALLBACK_LIBRARY_PATH", # macOS fallback library resolution
+        "DYLD_FRAMEWORK_PATH",        # macOS framework injection
         # glibc data-module hijack (survives AT_SECURE on setuid binaries)
         "GCONV_PATH",      # iconv gconv-modules path — loads attacker .so on iconv use
+        "GLIBC_TUNABLES",  # parsed by ld.so at startup (CVE-2023-4911 surface)
         "LOCPATH",         # Locale data path — loads attacker locale modules
         "NLSPATH",         # Message catalog path — reads attacker-controlled data
         "HOSTALIASES",     # Static hostname→IP file — redirects DNS resolution
         "RES_OPTIONS",     # Resolver options — can influence DNS behaviour
         "LOCALDOMAIN",     # DNS search domain — name-resolution hijack
-        # malloc tuning — MALLOC_CHECK_ can make valgrind-style bugs crash,
-        # MALLOC_PERTURB_ can alter free()'d memory content, MALLOC_ARENA_MAX
-        # can destabilise threaded allocators. Not escapes, but unexpected.
+        # malloc tuning — MALLOC_CHECK_ can make valgrind-style bugs crash
+        # (and high values write to stderr → log injection),
+        # MALLOC_PERTURB_ can alter free()'d memory content (letting an
+        # attacker influence uninitialised-memory disclosure ABI),
+        # MALLOC_ARENA_MAX can destabilise threaded allocators. Not
+        # escapes, but unexpected. Sole entries — keep the allocator
+        # family together here (the jemalloc pair lives with the other
+        # allocator-config vars below).
         "MALLOC_CHECK_",
         "MALLOC_PERTURB_",
         "MALLOC_ARENA_MAX",
@@ -389,6 +906,9 @@ class RaptorConfig:
                                # any Java process (e.g. CodeQL) and load
                                # arbitrary code at JVM startup.
         "_JAVA_OPTIONS",       # Older variant of JAVA_TOOL_OPTIONS, same hazard.
+        "JDK_JAVA_OPTIONS",    # JDK 9+ variant: the java launcher prepends it
+                               # to every invocation — same -javaagent power
+                               # as JAVA_TOOL_OPTIONS via a third env name.
         "OPENSSL_CONF",        # OpenSSL reads this config file. .conf files
                                # can load ENGINEs (arbitrary .so files) via
                                # the `engines` section — arbitrary code exec
@@ -427,26 +947,11 @@ class RaptorConfig:
         "GIT_CONFIG",          # Used by `git config -f FILE` internally but
                                # also respected when set as env — same
                                # injection surface.
-        "GIT_SSH_COMMAND",     # Verified: git invokes this for every ssh-
-                               # based remote operation (clone/fetch/push
-                               # over ssh://). Direct arbitrary command exec.
-        "GIT_SSH",             # Older variant of GIT_SSH_COMMAND — same
-                               # exec path for git's ssh transport.
-        "SSH_ASKPASS",         # Verified: ssh runs this program to prompt
-                               # for passwords when no tty is attached.
-                               # Any sandboxed tool that invokes ssh (git-
-                               # over-ssh, rsync, scp, ansible) triggers it.
-                               # Direct arbitrary command exec.
         "PYTHONBREAKPOINT",    # Verified: redirects Python's breakpoint()
                                # builtin to an arbitrary import path. Runs
                                # when code calls breakpoint() — uncommon in
                                # production but real attack surface if any
                                # sandboxed Python tool does.
-        "KUBECONFIG",          # Kubernetes config file path. A malicious
-                               # kubeconfig's `users[].user.exec` directive
-                               # invokes an arbitrary command to obtain
-                               # credentials — any kubectl invocation with
-                               # a hijacked KUBECONFIG = arbitrary exec.
         # TLS trust / config redirection — weaken or subvert cryptographic
         # operations. Require MITM network position or traffic capture to
         # exploit, but zero legitimate use for the tools RAPTOR runs.
@@ -468,19 +973,13 @@ class RaptorConfig:
         "CLASSPATH",           # Java: adds attacker .jar to classpath →
                                # arbitrary class loaded at JVM startup via
                                # Class-Path manifest or explicit-main invocation.
-        "MAVEN_OPTS",          # Maven-invoked JVM flags. Same -javaagent
-                               # / -Djava.security.policy injection as
-                               # JAVA_TOOL_OPTIONS but via a different env var.
-        "GRADLE_OPTS",         # Same for gradle.
-        "CARGO_HOME",          # Rust: points cargo at an attacker config dir
-                               # (config.toml can set linker wrapper, build.rs
-                               # can execute arbitrary code).
-        "GEM_HOME",            # Ruby: search path for gems. A malicious gem
-                               # dir loaded on `require` runs at require time.
-        "GEM_PATH",            # Ruby: additional gem search paths.
-        "BUNDLE_GEMFILE",      # Bundler: pointer to Gemfile. Attacker Gemfile
-                               # + Gemfile.lock can run code via post-install
-                               # hooks.
+        # Build-tool names (MAVEN_OPTS, GRADLE_OPTS, CARGO_HOME,
+        # GEM_HOME, GEM_PATH, BUNDLE_GEMFILE and their per-ecosystem
+        # siblings) are NOT listed here: they live on the ecosystem
+        # surfaces in core/security/credential_env.py and join this
+        # list through the CREDENTIAL_GENERAL_BLOCKLIST_VARS union
+        # below — one home per member, derived from the tool's own
+        # documented env surface.
         "PHPRC",               # PHP: alternative php.ini. php.ini `extension=`
                                # loads arbitrary .so files at PHP startup.
         "PHP_INI_SCAN_DIR",    # PHP: additional ini scan dir — same vector.
@@ -493,36 +992,65 @@ class RaptorConfig:
         "EMACSLOADPATH",       # Emacs: additional load path. If any tool
                                # invokes emacs (--batch, etc.), .el files from
                                # the attacker dir auto-load.
-        "DOCKER_CONFIG",       # Docker CLI config dir. credsStore /
-                               # credHelpers entries invoke arbitrary binaries
-                               # named `docker-credential-<helper>` on login.
         "DOCKER_HOST",         # Docker daemon socket. An attacker URL lets
                                # a sandboxed child push images / run
                                # containers against a forged API.
+        # RAPTOR-internal sandbox marker — not code-exec, but a
+        # forged marker steers egress routing to a different loopback
+        # service if the pop-before-add gate in _macos_spawn is
+        # bypassed by a future code path.
+        "_RAPTOR_SEATBELT_EGRESS_PROXY",
         # TLS trust weakening. Not code-exec on their own but let an MITM
         # position actually intercept our traffic (e.g. if a child does
         # the TLS and the attacker planted a CA cert).
         "REQUESTS_CA_BUNDLE",  # Python `requests` trust anchor override.
         "CURL_CA_BUNDLE",      # curl trust anchor override.
+        "NIX_SSL_CERT_FILE",   # Nix/OCaml trust anchor override.
         "SSL_CERT_FILE",       # OpenSSL-based tools' trust anchor override.
         "SSL_CERT_DIR",        # OpenSSL-based tools' trust anchor dir.
-        # Allocator config — both glibc and jemalloc honour these env
-        # vars. They can enable allocator features (verbose stats,
-        # core dumps on detected corruption, profiling output paths)
-        # that an attacker can use to (a) leak memory contents into
-        # log files at predictable paths, (b) cause core dumps that
-        # may contain credentials, (c) redirect heap profile output
-        # to attacker-writable paths.
+        # Allocator config — jemalloc honours these env vars. They can
+        # enable allocator features (verbose stats, core dumps on
+        # detected corruption, profiling output paths) that an
+        # attacker can use to (a) leak memory contents into log files
+        # at predictable paths, (b) cause core dumps that may contain
+        # credentials, (c) redirect heap profile output to attacker-
+        # writable paths. The glibc MALLOC_* family is listed once,
+        # with the malloc-tuning group above.
         "MALLOC_CONF",         # jemalloc configuration string.
         "JE_MALLOC_CONF",      # alternate jemalloc env var (some builds).
-        "MALLOC_CHECK_",       # glibc heap consistency check; high values
-                               # write to stderr → log injection.
-        "MALLOC_PERTURB_",     # glibc fill-pattern; not security-critical
-                               # alone but lets an attacker influence
-                               # uninitialised-memory disclosure ABI.
         # Note: TERM is NOT stripped — it's read as a string (terminfo lookup),
         # not shell-evaluated. Stripping it breaks colour output in git/grep/etc.
-    ]
+        #
+        # Credential-family names (credential/config file pointers and
+        # exec-redirect vars like GIT_ASKPASS / KUBECONFIG /
+        # DOCKER_CONFIG / GIT_SSH_COMMAND / SSH_ASKPASS) are unioned in
+        # below from core/security/credential_env.py — the single home
+        # for that vocabulary. Only the general-blocklist subset joins:
+        # members a trusted lane legitimately carries into child envs
+        # (first-party CC auth, the Bedrock AWS passthrough) are
+        # documented exemptions there, because this list also feeds the
+        # sandbox strict_env re-filter of caller-supplied envs.
+        # Hostile-input filters (cc_trust settings scan, build-metadata
+        # env filtering) must union the FULL CREDENTIAL_ENV_FAMILY on
+        # top of this list.
+    ]) | CREDENTIAL_GENERAL_BLOCKLIST_VARS
+
+    @staticmethod
+    def is_dangerous_env_name(name: str) -> bool:
+        """True when *name* is general-blocklist material.
+
+        Exact ``DANGEROUS_ENV_VARS`` membership, plus the
+        credential-env NAME-PATTERN members
+        (``CARGO_TARGET_<triple>_RUNNER``-shaped names). Pattern
+        members cannot live in the exact-name set — the middle
+        segment varies — so every sweep that filters caller-supplied
+        env by ``DANGEROUS_ENV_VARS`` must apply this predicate
+        beside (or instead of) bare set membership, or a pattern
+        member rides through on its unenumerable spelling.
+        """
+        if name in RaptorConfig.DANGEROUS_ENV_VARS:
+            return True
+        return is_credential_env_pattern_member(name)
 
     # Git Configuration
     #
@@ -536,9 +1064,11 @@ class RaptorConfig:
     # the user's *default* config is read from $HOME, which we don't strip.
     # GIT_CONFIG_NOSYSTEM=1 belt-and-braces in case /dev/null isn't honoured
     # on the platform (e.g. some Windows builds).
-    GIT_ENV_VARS = {
+    GIT_ENV_VARS: ClassVar[dict] = {
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "true",
+        # Absolute so Git cannot resolve an operator-controlled executable
+        # through PATH inside a sandbox.
+        "GIT_ASKPASS": "/usr/bin/true",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -553,17 +1083,49 @@ class RaptorConfig:
     LOG_FORMAT_CONSOLE = "[%(levelname)s] %(message)s"
     LOG_FORMAT_FILE = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
+    @classproperty
+    def SEMGREP_OFFLINE(cls) -> bool:
+        """Require local Semgrep configurations without registry fallback."""
+        return os.environ.get("RAPTOR_SEMGREP_OFFLINE", "").lower() in {"1", "true", "yes"}
+
     @classmethod
     def get_semgrep_config(cls, pack_id: str) -> str:
-        """Return local cached path for a registry pack if available, else the registry ID.
-
-        Naming: p/secrets -> c.p.secrets.json (mirrors semgrep.dev /c/p/ URL path).
-        Falls back to the registry identifier so online scans still work.
-        """
+        """Resolve cached registry packs; refuse missing/invalid packs offline."""
+        if not pack_id.startswith(("p/", "category/")):
+            if cls.SEMGREP_OFFLINE and (pack_id == "auto" or "://" in pack_id
+                                          or not Path(pack_id).exists()):
+                raise ValueError(f"Offline Semgrep requires a local configuration: {pack_id!r}")
+            return pack_id
+        # Only flat pack names are valid cache keys.
+        import re
+        if not re.fullmatch(r"(?:p|category)/[a-z0-9][a-z0-9._-]*", pack_id):
+            raise ValueError(f"Invalid Semgrep registry pack: {pack_id!r}")
         cache_file = cls.SEMGREP_REGISTRY_CACHE_DIR / ("c." + pack_id.replace("/", ".") + ".json")
-        if cache_file.exists():
+        if cache_file.is_file():
+            if cls.SEMGREP_OFFLINE:
+                import json
+                from core.security.capped_read import read_capped
+                try:
+                    raw = read_capped(cache_file, 32 * 1024 * 1024, raise_on_refusal=True)
+                    data = json.loads(raw)
+                    if not isinstance(data, dict) or not isinstance(data.get("rules"), list) or not data["rules"]:
+                        raise ValueError("expected a nonempty rules list")
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"Offline Semgrep cache is invalid for {pack_id}: {exc}") from exc
             return str(cache_file)
+        if cls.SEMGREP_OFFLINE:
+            raise ValueError(
+                f"Offline Semgrep pack unavailable: {pack_id}. "
+                "Import a complete bundle with engine/semgrep/tools/cache-packs.py, then run check."
+            )
         return pack_id
+
+    @staticmethod
+    def get_codeql_db_dir() -> Path:
+        """Keep default database writes under output in protected sessions."""
+        if os.environ.get("RAPTOR_INSTALL_PROTECTED") == "1":
+            return RaptorConfig.get_out_dir() / "codeql_dbs"
+        return RaptorConfig.CODEQL_DB_DIR
 
     @staticmethod
     def get_out_dir() -> Path:
@@ -590,17 +1152,43 @@ class RaptorConfig:
         if not base:
             return RaptorConfig.BASE_OUT_DIR
         resolved = Path(base).resolve()
-        forbidden = ("/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys")
-        resolved_str = str(resolved)
-        for prefix in forbidden:
-            # Component-boundary match: equals or starts with `prefix/`.
-            if resolved_str == prefix or resolved_str.startswith(prefix + "/"):
-                raise ValueError(
-                    f"RAPTOR_OUT_DIR={resolved!r} resolves under system "
-                    f"path {prefix!r}. Refusing to create output there. "
-                    f"Set RAPTOR_OUT_DIR to a path under your home or a "
+        forbidden = (
+            "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc",
+            "/sys", "/lib", "/lib64", "/root", "/srv", "/opt", "/run",
+        )
+        # The filesystem root itself needs an explicit refusal: it is
+        # no prefix's child, so "/etc/.." (→ "/") sailed past the
+        # prefix rules and run scaffolding landed at / on root-run
+        # containers. /var and /tmp stay allowed — scratch output
+        # there is a legitimate operator choice.
+        for path_str in (os.path.normpath(base), str(resolved)):
+            if path_str == "/":
+                msg = (
+                    f"RAPTOR_OUT_DIR={base!r} resolves to the filesystem "
+                    f"root. Refusing to create output there. Set "
+                    f"RAPTOR_OUT_DIR to a path under your home or a "
                     f"dedicated work directory."
                 )
+                raise ValueError(msg)
+        # Check BOTH the lexically-normalised input and the symlink-
+        # resolved path. On macOS /etc, /var and /tmp are symlinks into
+        # /private, so a literal RAPTOR_OUT_DIR=/etc resolves to
+        # /private/etc and would slip past a resolved-only check — catch
+        # the operator-typed system path via os.path.normpath too. The
+        # resolved check still guards against a symlink that points into
+        # a (Linux-named) system directory.
+        candidates = (os.path.normpath(base), str(resolved))
+        for path_str in candidates:
+            for prefix in forbidden:
+                # Component-boundary match: equals or starts with `prefix/`.
+                if path_str == prefix or path_str.startswith(prefix + "/"):
+                    msg = (
+                        f"RAPTOR_OUT_DIR={base!r} resolves under system "
+                        f"path {prefix!r}. Refusing to create output there. "
+                        f"Set RAPTOR_OUT_DIR to a path under your home or a "
+                        f"dedicated work directory."
+                    )
+                    raise ValueError(msg)
         # Validate the parent exists. `mkdir(parents=True)` would
         # silently create a deep directory tree under what may be a
         # typo (`RAPTOR_OUT_DIR=/home/raptr/out` — note the missing
@@ -611,26 +1199,14 @@ class RaptorConfig:
         # pathed output tree that shows up as "where did my run go?"
         # an hour later.
         if not resolved.exists() and not resolved.parent.exists():
-            raise ValueError(
+            msg = (
                 f"RAPTOR_OUT_DIR={resolved!r} parent directory "
                 f"{str(resolved.parent)!r} does not exist. Refusing to "
                 f"create a deep tree under what may be a typo. Create "
                 f"the parent first or fix the path."
             )
+            raise ValueError(msg)
         return resolved
-
-    @staticmethod
-    def get_job_out_dir(job_id: str) -> Path:
-        """
-        Get the output directory for a specific job.
-
-        Args:
-            job_id: Unique job identifier
-
-        Returns:
-            Path: Job-specific output directory
-        """
-        return RaptorConfig.MCP_JOB_DIR / job_id
 
     @staticmethod
     def get_safe_env(
@@ -678,18 +1254,44 @@ class RaptorConfig:
         explicitly after calling get_safe_env(), or pass their own env=
         to subprocess.run() to bypass this filter entirely.
         """
-        from core.security.env_sanitisation import strip_env_vars
         allowlist = RaptorConfig.SAFE_ENV_ALLOWLIST
         prefixes = RaptorConfig.SAFE_ENV_PREFIXES
-        env = {}
-        for name, value in os.environ.items():
-            if name in allowlist or name.startswith(prefixes):
-                env[name] = value
+        env = {name: value for name, value in os.environ.items() if name in allowlist or name.startswith(prefixes)}
         # Belt + braces: strip anything dangerous that somehow made it
         # through (either allowlisted explicitly or matching a prefix).
-        if not preserve_proxy:
-            env = strip_env_vars(env, RaptorConfig.PROXY_ENV_VARS)
         env = strip_env_vars(env, RaptorConfig.DANGEROUS_ENV_VARS)
+        # Credential policy outranks safe prefixes (a registered key could
+        # otherwise look like a locale variable, e.g. LC_BROKER_API_KEY).
+        for name in RaptorConfig._metadata_credential_names():
+            env.pop(name, None)
+        # Every broker credential has one of these suffixes. Strip the whole
+        # secret-shaped family without loading or weakening the broker catalog.
+        for name in list(env):
+            if name.endswith(("_API_KEY", "_API_TOKEN")):
+                env.pop(name)
+        # Replace ambient TMPDIR with the launcher-owned session workspace.
+        # Do not initialize it here: this path also runs inside restricted,
+        # post-fork children where imports/mkdir and inherited locks are unsafe.
+        child_tmpdir = subprocess_tmpdir()
+        if child_tmpdir is not None:
+            env["TMPDIR"] = child_tmpdir
+        # Stamp the parent's CI verdict so the interactivity gate in
+        # children never depends on which vendor markers survived the
+        # scrub (allowlist churn must not be able to reopen the
+        # CI-with-pseudo-TTY bypass). RAPTOR_CI is itself a recognised
+        # marker in core.security.rule_of_two.
+        if is_ci():
+            env["RAPTOR_CI"] = "1"
+        if preserve_proxy:
+            for pv in RaptorConfig.PROXY_ENV_VARS:
+                val = os.environ.get(pv)
+                if val is not None:
+                    # URL-shaped values are normalised (trailing slash
+                    # breaks strict parsers like the JVM's HttpHost);
+                    # NO_PROXY is a host list and passes through.
+                    if not pv.upper().startswith("NO_"):
+                        val = normalise_proxy_url(val)
+                    env[pv] = val
         # F102: restore PYTHONUSERBASE AFTER the dangerous-var strip
         # for callers that opted in (e.g. semgrep scanner spawn).
         # Take the value verbatim from os.environ — do NOT invent
@@ -699,50 +1301,195 @@ class RaptorConfig:
             if _userbase is not None:
                 env["PYTHONUSERBASE"] = _userbase
         env["PYTHONUNBUFFERED"] = "1"
+        # Semgrep phones home on ANY invocation (version check against
+        # semgrep.dev, anonymous metrics) unless told not to — under
+        # the network-denied sandbox that is proxy-DENY noise plus up
+        # to ~90s of connect retries per invocation, and the argv
+        # flags (--disable-version-check, --metrics off) only cover
+        # subcommands that accept them (--version and --validate do
+        # not). The env pair covers every invocation shape.
+        env["SEMGREP_ENABLE_VERSION_CHECK"] = "0"
+        env["SEMGREP_SEND_METRICS"] = "off"
+        # Git config isolation for EVERY subprocess (inert for non-git
+        # tools). Without this, any internal or sandboxed git invocation
+        # reads the operator's ~/.gitconfig and /etc/gitconfig: a
+        # commit.gpgsign=true there routes `git commit` through
+        # gpg-agent/keyboxd (unix-socket IPC that network-denied
+        # sandboxes block — observed as non-deterministic "failed to
+        # write commit object"), log.showSignature invokes gpg on
+        # reads, core.fsmonitor spawns watchers, credential.helper
+        # fires on fetches. Applied AFTER the dangerous-var strip so
+        # OUR values win over any operator/caller-supplied override.
+        # Deliberate trade: operator gitconfig http.proxy /
+        # url.insteadOf / credential.helper no longer influence
+        # internal git — proxying flows through the env vars
+        # (preserve_proxy) instead. Sites that predate this chokepoint
+        # via get_git_env() are unaffected (same values).
+        env.update(RaptorConfig.GIT_ENV_VARS)
+        # RAPTOR_DIR is allowlisted above so children can derive tool
+        # paths — but the AMBIENT value may point at a different
+        # checkout (multi-checkout operators). Pin it to THIS tree so
+        # RAPTOR's own Python children never import another tree's
+        # modules (see pin_raptor_dir).
+        pin_raptor_dir(env)
         return env
 
     # LLM provider API-key env vars.  These are intentionally NOT in
     # SAFE_ENV_ALLOWLIST — untrusted-code subprocesses (CodeQL builds,
     # fuzz harnesses) must never see credentials.  get_llm_env() layers
     # them on top of get_safe_env() for our own LLM-calling scripts.
-    LLM_API_KEY_VARS = (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "GEMINI_API_KEY",
-        "MISTRAL_API_KEY",
-        # Below: providers RAPTOR doesn't call directly today, but
-        # whose keys legitimately need to flow through if the
-        # operator wires up a custom dispatcher / aggregator. Pre-fix
-        # the missing entries meant `get_llm_env()` stripped these
-        # for our analysis scripts even when they were the only
-        # configured provider.
-        "GOOGLE_API_KEY",       # alternate Gemini env name
-        "GROQ_API_KEY",         # aggregator + family stem (batch 067)
-        "TOGETHER_API_KEY",     # aggregator
-        "OPENROUTER_API_KEY",   # aggregator
-        "FIREWORKS_API_KEY",    # aggregator
-        "DEEPINFRA_API_KEY",    # aggregator
-        "PERPLEXITY_API_KEY",   # aggregator
-        "REPLICATE_API_TOKEN",  # aggregator (uses _TOKEN suffix)
-        "COHERE_API_KEY",       # cohere family (batch 067)
-        # AWS / GCP / Azure cloud providers when used as LLM gateways
-        # (Bedrock, Vertex AI, Azure OpenAI). Operators routing
-        # through these need credentials to flow through.
+    # Static-auth gateway keys come from the shared broker registry.
+    # Keep them available for env-direct SDK calls as well as dispatcher
+    # routes; untrusted-code subprocesses still never receive them.
+    @classproperty
+    def _LLM_AGGREGATOR_KEYS(cls):
+        # Ownership validation scans installed Python source. Metadata-only
+        # imports must not do that work; credential consumers still validate.
+        from core.llm.model_brokers import MODEL_BROKERS
+        return tuple(broker.api_key_env for broker in MODEL_BROKERS)
+
+    # Cloud gateway keys (Bedrock, Vertex AI, Azure OpenAI).
+    _LLM_CLOUD_KEYS = (
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
+        # Bedrock bearer — a selection signal AND a secret: children
+        # that resolve models locally starve on Bedrock entry
+        # resolution without it.
+        "AWS_BEARER_TOKEN_BEDROCK",
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
         "GOOGLE_APPLICATION_CREDENTIALS",  # GCP service account JSON path
     )
+
+    _LLM_NATIVE_KEYS = (
+        # First-party Claude/Anthropic auth — DERIVED from the
+        # canonical vocabulary, never hand-typed: the trio must reach
+        # LLM children as a unit. The strip twin
+        # (strip_llm_env_vars) already derives from
+        # CREDENTIAL_BEARING_ENV_VARS; this is the symmetric
+        # carry-side treatment, pinned both directions in
+        # tests/test_credential_env_consumption.py.
+        *ANTHROPIC_FIRST_PARTY_AUTH_VARS,
+        # Operator-configured extra request headers — rides gateway
+        # Authorization overrides, so it is credential posture, and
+        # the SDK reads it in the child.
+        "ANTHROPIC_CUSTOM_HEADERS",
+        # Direct providers
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",       # alternate Gemini env name
+        "OPENAI_API_KEY",
+        "MISTRAL_API_KEY",
+        "COHERE_API_KEY",
+    )
+
+    @classproperty
+    def LLM_API_KEY_VARS(cls):
+        return (*cls._LLM_NATIVE_KEYS, *cls._LLM_AGGREGATOR_KEYS, *cls._LLM_CLOUD_KEYS)
+
+    @staticmethod
+    def _metadata_credential_names():
+        # Preserve explicit namespace overrides, including nonstandard auth
+        # names, without evaluating the default catalog-backed descriptor.
+        if isinstance(RaptorConfig.__dict__["LLM_API_KEY_VARS"], classproperty):
+            return (*RaptorConfig._LLM_NATIVE_KEYS, *RaptorConfig._LLM_CLOUD_KEYS)
+        return RaptorConfig.LLM_API_KEY_VARS
+
+    # LLM transport/backend ROUTING env vars — selection flags and
+    # names, not secrets (credentials stay in LLM_API_KEY_VARS; the
+    # profile-based AWS chain reads the actual keys from the profile
+    # files that AWS_PROFILE / AWS_SHARED_CREDENTIALS_FILE merely
+    # name). Intentionally NOT in SAFE_ENV_ALLOWLIST: untrusted-code
+    # subprocesses have no business knowing the operator's LLM
+    # topology, and RAPTOR's own LLM children get them layered on by
+    # get_llm_env() / spawn_worker(). Without this family, every
+    # spawned LLM child lost the operator's backend selection:
+    # a minimal {"provider": "bedrock"} models.json entry could not
+    # backfill surface/model from the Claude Code install
+    # (_cc_bedrock_topology reads CLAUDE_CODE_USE_BEDROCK), the
+    # dispatcher's SigV4 chain lost its profile/region pins, and the
+    # claudecode fallback's `claude -p` child silently flipped from
+    # the operator's Bedrock backend to the direct API — where a
+    # Bedrock-shaped model id is a guaranteed HTTP 400.
+    LLM_ROUTING_ENV_VARS = (
+        # Claude Code backend selection — read by core.llm.config
+        # (_cc_bedrock_topology backfill), core.llm.cc_adapter
+        # (cc_subprocess_env AWS gate), core.llm.cc_proxy_hosts
+        # (egress profile), core.llm.cc_probe (cache signature), and
+        # by the `claude` CLI itself in grandchildren.
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        # Anthropic model mapping / endpoint — the CC-topology model
+        # backfill (gated on CLAUDE_CODE_USE_BEDROCK) and the `claude`
+        # CLI's own session-default resolution. The direct-API SDK
+        # path never reads ANTHROPIC_MODEL (verified: the only
+        # in-repo functional read is inside _cc_bedrock_topology,
+        # which returns early unless CLAUDE_CODE_USE_BEDROCK is set),
+        # so carrying it cannot re-route direct-API children.
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_BASE_URL",
+        # AWS signing-chain names — profile/region/config-file
+        # LOCATIONS, not credentials. Read by the dispatcher's SigV4
+        # auth chain, detection.bedrock_sigv4_intent, and egress
+        # host derivation. Needed: a child that cannot see them
+        # resolves a different (usually empty) signing chain than
+        # the parent that selected the provider.
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        # Nice-to-have (nonstandard installs only): honour custom
+        # shared-credentials/config locations so botocore's chain in
+        # the child matches the parent's.
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+    )
+
+    # RAPTOR's own LLM operator knobs, carried as prefix families
+    # (same pattern as cc_adapter's _CC_BACKEND_ENV_PREFIXES: new
+    # knobs in these namespaces keep working without call-site
+    # churn). RAPTOR_BEDROCK_* are the explicit Bedrock opt-in
+    # signals (MODEL / PROFILE / REGION / API) plus operational knobs
+    # (MAX_WORKERS / PREFLIGHT_CACHE); RAPTOR_CC_* are the claudecode
+    # transport knobs (MODEL / PIN_MODEL / EFFORT / FALLBACK_MODEL /
+    # BUDGET_USD / PROBE_CACHE). NOT RAPTOR_LLM_: the dispatcher
+    # route (RAPTOR_LLM_SOCKET + RAPTOR_LLM_TOKEN_FD) is per-child
+    # state that only spawn_worker may set — a blanket-inherited
+    # socket path without its token FD is a broken route.
+    LLM_ROUTING_ENV_PREFIXES = (
+        "RAPTOR_BEDROCK_",
+        "RAPTOR_CC_",
+    )
+
+    @staticmethod
+    def llm_routing_env() -> dict:
+        """The LLM routing family present in the real environment.
+
+        Names and selection flags only — no credentials (those are
+        ``LLM_API_KEY_VARS``, layered separately by ``get_llm_env``).
+        Overlay this onto a sanitised base env at every seam that
+        spawns one of RAPTOR's OWN LLM-calling children
+        (``get_llm_env`` does it automatically; ``spawn_worker``
+        applies it to its default baseline). Never overlay onto an
+        env destined for untrusted target code.
+        """
+        env = {}
+        for var in RaptorConfig.LLM_ROUTING_ENV_VARS:
+            val = os.environ.get(var)
+            if val:
+                env[var] = val
+        env.update({name: val for name, val in os.environ.items() if name.startswith(RaptorConfig.LLM_ROUTING_ENV_PREFIXES) and val})
+        return env
 
     @staticmethod
     def get_llm_env(
         *,
         include_python_user_base: bool = False,
     ) -> dict:
-        """Return get_safe_env() plus any LLM API keys present in the
-        real environment.
+        """Return get_safe_env() plus any LLM API keys and the LLM
+        transport-routing family present in the real environment.
 
         Use this for spawning RAPTOR's own analysis scripts that may call
         LLM providers.  Do NOT use for untrusted-code subprocesses.
@@ -758,27 +1505,96 @@ class RaptorConfig:
         ``python raptor.py <mode>`` invocations. Mirrors the existing
         ``include_python_user_base`` opt-in on ``get_safe_env`` —
         same default-False, opt-in pattern as ``preserve_proxy``.
+
+        Proxy vars are ALWAYS preserved here (``preserve_proxy=True``
+        on the underlying ``get_safe_env``). Rationale: this env is
+        exclusively for RAPTOR's own analysis scripts — trusted code
+        that hosts the sandbox egress proxy, spawns ``claude`` CLI
+        children, and makes provider SDK calls, all of which resolve
+        their upstream route from the process environment at runtime
+        (``core/sandbox/proxy.py`` autodetect,
+        ``egress.operator_proxy_env()``,
+        ``get_safe_env(preserve_proxy=True)``). Stripping the
+        operator's launch-time proxy here starves every one of those
+        mechanisms one level down and breaks all outbound HTTP on
+        mandatory-egress-proxy hosts. The hostile-repo threat that
+        motivates the default strip does not apply: these children
+        never execute target-repo code with this env.
         """
         env = RaptorConfig.get_safe_env(
+            preserve_proxy=True,
             include_python_user_base=include_python_user_base,
         )
         for var in RaptorConfig.LLM_API_KEY_VARS:
             val = os.environ.get(var)
             if val:
                 env[var] = val
+        # Transport/backend routing family (CLAUDE_CODE_USE_*,
+        # ANTHROPIC_MODEL, AWS profile/region names, RAPTOR_BEDROCK_*/
+        # RAPTOR_CC_* knobs). Applied AFTER get_safe_env so the
+        # documented LLM-env additions never depend on allowlist
+        # ordering; none of the names are in DANGEROUS_ENV_VARS, and
+        # RAPTOR_DIR pinning (inside get_safe_env) is untouched —
+        # the family shares no names with the pinned var.
+        env.update(RaptorConfig.llm_routing_env())
+        return env
+
+    @staticmethod
+    def strip_llm_env_vars(env: dict) -> dict:
+        """Remove LLM credentials, the transport-routing family, and
+        the dispatcher route pair from *env*; returns *env*.
+
+        For RAPTOR's own NON-LLM helper children that are spawned
+        from full-environ copies rather than ``get_safe_env()``
+        (the SMT/Z3 probe children: they must mirror the parent's
+        interpreter environment to unpickle and run RAPTOR verbs,
+        so they can't take the safe-env baseline — but they make no
+        LLM calls and have no business holding keys, backend
+        selection, or a broken half-route).
+        """
+        drop = set(RaptorConfig._metadata_credential_names())
+        # Resolve dynamic broker names only when one could be present. Unlike
+        # the untrusted safe-env baseline, these full-environ helpers may need
+        # application credentials such as NVD_API_KEY; never strip those merely
+        # because their names look secret-shaped.
+        if any(k not in drop and k.endswith(("_API_KEY", "_API_TOKEN")) for k in env):
+            drop.update(RaptorConfig.LLM_API_KEY_VARS)
+        drop.update(RaptorConfig.LLM_ROUTING_ENV_VARS)
+        # Credential-bearing family members not otherwise enumerated
+        # above (the canonical vocabulary owns the names — e.g.
+        # ANTHROPIC_AUTH_TOKEN and the CLAUDE_CODE_OAUTH_TOKEN
+        # setup-token credential, which full-environ copies would
+        # otherwise hand to children that never make LLM calls).
+        drop.update(CREDENTIAL_BEARING_ENV_VARS)
+        drop.update(("RAPTOR_LLM_SOCKET", "RAPTOR_LLM_TOKEN_FD"))
+        prefixes = RaptorConfig.LLM_ROUTING_ENV_PREFIXES
+        for name in [k for k in env
+                     if k in drop or k.startswith(prefixes)]:
+            del env[name]
+        # These children make no LLM calls by contract, but the prefix
+        # strip above also removed the pure-refusal transport kill
+        # switch. Force it ON rather than exempting it: a child that
+        # (buggily) constructed an LLM client would still see claude
+        # on PATH and CLAUDECODE — the switch is the layer that makes
+        # such a bug loud and spend-free instead of live.
+        env["RAPTOR_CC_TRANSPORT_DISABLED"] = "1"
         return env
 
     @staticmethod
     def get_git_env() -> dict:
-        """
-        Create environment for safe git operations.
+        """Environment for safe git operations — thin alias.
+
+        ``get_safe_env()`` already applies ``GIT_ENV_VARS`` for every
+        subprocess (git-config isolation is part of the baseline), so
+        this is deliberately a pure passthrough with no second overlay:
+        one source of truth, nothing to diverge. Kept as a named entry
+        point because call sites read better as "give me the git env"
+        and predate the chokepoint.
 
         Returns:
             dict: Environment configured for secure git operations
         """
-        env = RaptorConfig.get_safe_env()
-        env.update(RaptorConfig.GIT_ENV_VARS)
-        return env
+        return RaptorConfig.get_safe_env()
 
     @staticmethod
     def ensure_directories() -> None:
@@ -788,11 +1604,104 @@ class RaptorConfig:
             RaptorConfig.MCP_JOB_DIR,
             RaptorConfig.LOG_DIR,
             RaptorConfig.SCHEMAS_DIR,
-            RaptorConfig.CODEQL_DB_DIR,
+            RaptorConfig.get_codeql_db_dir(),
             RaptorConfig.CODEQL_SUITES_DIR,
         ]
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
+
+
+# Ambient RAPTOR_DIR values whose override has already been announced
+# (one line per distinct value per process, not one per spawn — a
+# single audit run spawns dozens of SMT/Z3 children).
+_RAPTOR_DIR_OVERRIDE_NOTICED: set = set()
+
+
+def pin_raptor_dir(env) -> dict:
+    """Hard-set ``RAPTOR_DIR`` in *env* to THIS tree's root; return *env*.
+
+    ``RAPTOR_DIR`` tells RAPTOR's own Python children which tree to
+    import ``core.*`` from (the mandated child bootstrap is
+    ``sys.path.insert(0, os.environ['RAPTOR_DIR'])``). The ambient
+    value is whatever the launching shell exported — operators running
+    multiple checkouts routinely have it pointing at a DIFFERENT tree,
+    and a child that inherits it silently imports the other tree's
+    modules (observed: every SMT probe of an audit run exited 1 with
+    ``TypeError: _run_smt_verb_inner() got an unexpected keyword
+    argument`` because the child imported a stale checkout's
+    ``core.audit.sweep``). Children of THIS process must import THIS
+    tree, so the value is SET — never ``setdefault``'d — with a
+    one-line notice the first time a differing ambient value is
+    replaced: running multiple checkouts is normal; silently importing
+    the wrong tree's modules is not.
+    """
+    import logging
+
+    own = str(RaptorConfig.REPO_ROOT)
+    ambient = env.get("RAPTOR_DIR")
+    if ambient and ambient != own and ambient not in _RAPTOR_DIR_OVERRIDE_NOTICED:
+        differs = True
+        try:
+            differs = Path(ambient).resolve() != RaptorConfig.REPO_ROOT
+        except OSError:
+            pass
+        if differs:
+            _RAPTOR_DIR_OVERRIDE_NOTICED.add(ambient)
+            logging.getLogger(__name__).info(
+                "RAPTOR_DIR override: ambient value %s points at a "
+                "different checkout — children of this process import "
+                "from %s",
+                ambient, own,
+            )
+    env["RAPTOR_DIR"] = own
+    return env
+
+
+def pin_raptor_dir_in_environ() -> None:
+    """Pin ``os.environ['RAPTOR_DIR']`` to this tree's root.
+
+    Launcher-side chokepoint (libexec preambles, e2e scripts): every
+    child that inherits ``os.environ`` afterwards — including the
+    ``python3 -c`` SMT/Z3 probe children — imports this tree.
+    """
+    pin_raptor_dir(os.environ)
+
+
+# Canonical boolean-toggle spellings. One parser for every operator
+# on/off env var so the accepted spellings don't drift per reader
+# (pre-fix: SAGE_FORCE_CPU treated "0" as enabling, RAPTOR_SAGE_AFL_PRIOR
+# ignored "off", CVE_DIFF_DISABLE_RULES ignored "true").
+_ENV_FLAG_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_ENV_FLAG_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """Parse the boolean environment toggle *name*.
+
+    Canonical spellings, case-insensitive, surrounding whitespace
+    ignored: truthy = ``1``/``true``/``yes``/``on``, falsy =
+    ``0``/``false``/``no``/``off``. Unset or empty returns *default*.
+    Any other value warns (so a typo like ``SAGE_FORCE_CPU=ture``
+    doesn't silently pick the default) and returns *default*.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in _ENV_FLAG_TRUTHY:
+        return True
+    if value in _ENV_FLAG_FALSY:
+        return False
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "%s=%r is not a recognised boolean toggle "
+        "(1/true/yes/on or 0/false/no/off); using default %s",
+        name, raw, default,
+    )
+    return default
 
 
 # Convenience aliases for backward compatibility

@@ -4,14 +4,15 @@ Translates vulnerability findings into ReportSpec for rendering.
 Used by both /validate and /agentic pipelines.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from core.security.prompt_output_sanitise import sanitise_code, sanitise_string
+
 from .formatting import get_display_status, title_case_type, truncate_path
-from .spec import ReportSpec, ReportSection
+from .spec import ReportSection, ReportSpec
 
 
-def build_findings_rows(findings: List[Dict[str, Any]], filename_only: bool = False) -> List[Tuple]:
+def build_findings_rows(findings: list[dict[str, Any]], filename_only: bool = False) -> list[tuple]:
     """Build table rows from findings. One shared implementation for all pipelines.
 
     Args:
@@ -54,11 +55,30 @@ FINDINGS_COLUMNS = ["#", "Type", "CWE", "File", "Status", "Severity", "CVSS"]
 _FILE_COLUMN_INDEX = FINDINGS_COLUMNS.index("File")
 
 
-def _markdown_rows(rows: List[Tuple]) -> List[Tuple]:
-    """Wrap file paths in backticks for markdown rendering."""
+def _markdown_rows(rows: list[tuple]) -> list[tuple]:
+    r"""Escape cells and wrap file paths in backticks for markdown
+    that this module emits DIRECTLY (``findings_summary``).
+
+    `build_findings_rows` output is shared with the console renderer
+    (which does its own `escape_nonprintable` pass and must not show
+    literal ``\|`` / ``<br>``), so the markdown-specific escaping
+    lives here — every cell goes through `_md_table_cell` so a
+    finding-derived value (vuln_type, cwe, file:line, status) cannot
+    split table columns or open an inline-code span. Matches the
+    per-finding detail table, which already escapes via
+    `_md_table_cell`.
+
+    NOT for rows destined for a :class:`ReportSpec`: the spec
+    renderer's ``_render_table`` defangs every cell itself (its
+    chokepoint contract), so pre-escaped rows came out
+    double-escaped — the wrapping backticks entity-escaped into
+    literal ``&#96;`` characters and the ``\|`` escape survived as a
+    visible stray backslash in every rendered report.
+    """
     return [
         tuple(
-            f"`{c}`" if j == _FILE_COLUMN_INDEX and c and c != "—" else c
+            f"`{_md_table_cell(c)}`" if j == _FILE_COLUMN_INDEX and c and c != "—"
+            else _md_table_cell(c)
             for j, c in enumerate(row)
         )
         for row in rows
@@ -67,7 +87,7 @@ def _markdown_rows(rows: List[Tuple]) -> List[Tuple]:
 _CVSS_NOTE = "CVSS scores reflect **inherent vulnerability impact** — not binary mitigations."
 
 
-def build_findings_summary(findings: List[Dict[str, Any]]) -> Dict[str, int]:
+def build_findings_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
     """Count findings by status category.
 
     Splits the ``Confirmed`` family into three sub-counts so the
@@ -97,8 +117,11 @@ def build_findings_summary(findings: List[Dict[str, Any]]) -> Dict[str, int]:
               "confirmed_unrestricted": 0,
               "confirmed_constrained": 0,
               "confirmed_blocked": 0,
+              "confirmed_unverified": 0,
+              "not_disproven": 0,
               "false_positive": 0,
-              "ruled_out": 0, "error": 0, "other": 0}
+              "ruled_out": 0, "ruled_out_unverified": 0,
+              "error": 0, "other": 0}
     for f in findings:
         status = get_display_status(f)
         if status == "Exploitable":
@@ -109,13 +132,29 @@ def build_findings_summary(findings: List[Dict[str, Any]]) -> Dict[str, int]:
         elif status == "Confirmed (Blocked)":
             counts["confirmed_blocked"] += 1
             counts["confirmed"] += 1
+        elif status == "Confirmed (Unverified)":
+            # NOT summed into the confirmed umbrella: unverified means
+            # exactly that — counting it as a verified confirmation is
+            # the inversion this bucket exists to prevent.
+            counts["confirmed_unverified"] += 1
         elif status.startswith("Confirmed"):
             counts["confirmed_unrestricted"] += 1
             counts["confirmed"] += 1
+        elif status == "Unconfirmed":
+            # not_disproven is a legitimate TERMINAL status, not an
+            # uncategorised leftover — the "other" bucket feeds a
+            # possible-pipeline-bug warning it must not trip.
+            counts["not_disproven"] += 1
         elif status == "False Positive":
             counts["false_positive"] += 1
         elif status == "Ruled Out":
             counts["ruled_out"] += 1
+        elif status == "Ruled Out (Unverified)":
+            # NOT summed into ruled_out: an unverified rule-out is a
+            # quarantined claim with no mechanical refutation behind
+            # it — counting it as a verified rule-out would grant it
+            # the suppression weight the quarantine exists to withhold.
+            counts["ruled_out_unverified"] += 1
         elif status.startswith("Error"):
             counts["error"] += 1
         else:
@@ -123,7 +162,7 @@ def build_findings_summary(findings: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
-def findings_summary_line(counts: Dict[str, int], vuln_count: Optional[int] = None) -> str:
+def findings_summary_line(counts: dict[str, int], vuln_count: int | None = None) -> str:
     """Build the one-line status summary from counts."""
     parts = []
     if counts["exploitable"]:
@@ -145,10 +184,16 @@ def findings_summary_line(counts: Dict[str, int], vuln_count: Optional[int] = No
         parts.append(f"{counts['confirmed_constrained']} Confirmed (Constrained)")
     if counts.get("confirmed_blocked"):
         parts.append(f"{counts['confirmed_blocked']} Confirmed (Blocked)")
+    if counts.get("confirmed_unverified"):
+        parts.append(f"{counts['confirmed_unverified']} Confirmed (Unverified)")
+    if counts.get("not_disproven"):
+        parts.append(f"{counts['not_disproven']} Not Disproven")
     if counts["false_positive"]:
         parts.append(f"{counts['false_positive']} False Positive")
     if counts["ruled_out"]:
         parts.append(f"{counts['ruled_out']} Ruled Out")
+    if counts.get("ruled_out_unverified"):
+        parts.append(f"{counts['ruled_out_unverified']} Ruled Out (Unverified)")
     if counts["error"]:
         parts.append(f"{counts['error']} Error")
     if counts.get("other"):
@@ -176,7 +221,7 @@ def findings_summary_line(counts: Dict[str, int], vuln_count: Optional[int] = No
 
 
 def _md_table_cell(s: str) -> str:
-    """Escape characters that break out of a markdown table cell.
+    r"""Escape characters that break out of a markdown table cell.
 
     Pre-fix only `|` was escaped, and only at one site
     (`build_finding_detail`'s code-line). Other cells interpolated
@@ -187,21 +232,51 @@ def _md_table_cell(s: str) -> str:
     re-parse the table as a list.
 
     Escapes:
-      * `|` → `\\|` (table column separator)
-      * `` ` `` → `\\` ` (inline-code fence)
+      * `|` → `\|` (table column separator)
+      * `` ` `` → `\` ` (inline-code fence)
       * Newlines → `<br>` (rows must be one line)
+      * Control/bidi bytes → `\xHH` escapes (`escape_nonprintable`):
+        table cells carry hostile-influenceable fields (file path,
+        function, vuln_type, code_line) and the report is catted to
+        terminals — `sanitise_code`'s own docstring names the exact
+        threat ("ANSI/BIDI/control-byte injection via terminal
+        emulators"); the prose fields go through `sanitise_string`
+        which already escapes, this hand-rolled cell lane must too.
+
+    Also strips autofetch markup (image/`<img>`/`<iframe>` tags,
+    `javascript:`/`data:` links) via the shared prompt-envelope
+    helper. The LLM-output sanitiser (`sanitise_string`) already
+    does this; without the same strip here, a finding-derived value
+    (file path, function name, scanner message) carrying `![](url)`
+    rendered as a live autofetch in the report — same exfil class,
+    different door. Parens/brackets are deliberately NOT escaped
+    (function cells legitimately contain them); the targeted strip
+    removes the markup family instead.
     """
     if s is None:
         return ""
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.prompt_envelope import _strip_autofetch_markup
     s = str(s)
+    s = _strip_autofetch_markup(s)
+    # Before the backslash-doubling below, so the `\xHH` escapes this
+    # pass emits render as single-backslash literals in the cell.
+    # ``\r\n``/``\r`` are normalised first so bare carriage returns
+    # keep their pre-existing ``<br>`` rendering instead of escaping.
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = escape_nonprintable(s, preserve_newlines=True)
     s = s.replace("\\", "\\\\")
     s = s.replace("|", "\\|")
-    s = s.replace("`", "\\`")
-    s = s.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
-    return s
+    # Backticks are REPLACED (U+02BC, same policy as the threat-model
+    # renderer), never backslash-escaped: many callers wrap cells in
+    # code spans, where backslash escapes are inert (CommonMark) — an
+    # escaped backtick still terminated the span and spilled the rest
+    # of a target-controlled cell into live markdown.
+    s = s.replace("`", "\u02bc")
+    return s.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
 
 
-def build_finding_detail(finding: Dict[str, Any], index: int) -> ReportSection:
+def build_finding_detail(finding: dict[str, Any], index: int) -> ReportSection:
     """Build a per-finding detail section."""
     fid = finding.get("id") or finding.get("finding_id") or f"FIND-{index:04d}"
     vtype = title_case_type(finding.get("vuln_type", "unknown"))
@@ -209,7 +284,16 @@ def build_finding_detail(finding: Dict[str, Any], index: int) -> ReportSection:
     fline = finding.get("line") if finding.get("line") is not None else finding.get("start_line")
     loc = f"{fpath}:{fline}" if fline is not None else fpath
 
-    title = f"{fid} — {vtype} in `{loc}`"
+    # Section titles render as one heading line — collapse and sanitise
+    # the finding-derived pieces (id, type, file:line) so a crafted value
+    # cannot inject extra heading lines or live markup. Same policy as
+    # core.project.report._md_heading. No backticks: these titles are
+    # rendered through the spec renderer's heading defang, which
+    # entity-escapes them into literal ``&#96;`` characters instead of
+    # a code span.
+    title = sanitise_string(
+        " ".join(f"{fid} — {vtype} in {loc}".split()), max_chars=300,
+    )
 
     lines = []
     lines.append("| Attribute | Value |")
@@ -218,12 +302,28 @@ def build_finding_detail(finding: Dict[str, Any], index: int) -> ReportSection:
 
     func = finding.get("function")
     if func:
-        lines.append(f"| Function | `{_md_table_cell(func)}` |")
+        # SCA findings stuff the dependency name into the ``function``
+        # slot (the finding shape is shared across tools, and SCA has
+        # no code function to attribute against). Labelling that as
+        # "Function" is operator-misleading — they see ``urllib3`` and
+        # assume there's a Python function literally called urllib3.
+        # Tool-aware label fixes the report without forcing every
+        # producer to reshape its output.
+        slot_label = "Dependency" if finding.get("tool") == "sca" else "Function"
+        lines.append(f"| {slot_label} | `{_md_table_cell(func)}` |")
+
+    # Imported findings carry their original foreign id (audit-style
+    # file:function:line, EXT-*) as source_id after normalisation to
+    # FIND-<n> — surface it so operators can trace the finding back
+    # to the producing pipeline.
+    source_id = finding.get("source_id")
+    if source_id:
+        lines.append(f"| Source ID | `{_md_table_cell(str(source_id))}` |")
 
     code = finding.get("proof", {}).get("vulnerable_code") if isinstance(finding.get("proof"), dict) else None
     code = code or finding.get("code") or ""
     if code:
-        code_line = code.strip().split("\n")[0][:100]
+        code_line = code.strip().split("\n")[0][:100]  # line-model: report display slice; a snippet \r is cosmetic
         lines.append(f"| Code | `{_md_table_cell(code_line)}` |")
 
     lines.append(f"| Final Status | {_md_table_cell(get_display_status(finding))} |")
@@ -241,13 +341,17 @@ def build_finding_detail(finding: Dict[str, Any], index: int) -> ReportSection:
         lines.append(f"| CVSS | {cvss_str} |")
 
     confidence = finding.get("confidence")
-    if confidence:
+    if confidence is not None:
         lines.append(f"| Confidence | {_md_table_cell(str(confidence).title())} |")
 
     lines.append("")
 
     # Reasoning / analysis (from agentic or validate)
-    reasoning = finding.get("reasoning") or finding.get("analysis")
+    reasoning = (
+        finding.get("reasoning")
+        or finding.get("candidate_reasoning")
+        or finding.get("analysis")
+    )
     if reasoning:
         lines.append(f"\n**Analysis:**\n{sanitise_string(str(reasoning).strip(), max_chars=3000)}")
 
@@ -264,13 +368,39 @@ def build_finding_detail(finding: Dict[str, Any], index: int) -> ReportSection:
     if patch_code:
         lines.append(f"\n**Patch:**\n```\n{sanitise_code(str(patch_code).strip())}\n```")
 
+    # Mechanical patch-gate annotations (packages/llm_analysis/patch_gate).
+    # Values come from the gate's closed vocabulary, but the dict shape is
+    # finding-supplied — sanitise like every other rendered field.
+    patch_gate = finding.get("patch_gate")
+    if patch_code and isinstance(patch_gate, dict):
+        gate_summary = ", ".join(
+            f"{key}: {patch_gate[key]}"
+            for key in ("format", "scope", "detector", "control", "compile")
+            if patch_gate.get(key)
+        )
+        if gate_summary:
+            if patch_gate.get("reliable") is False:
+                gate_summary += " (unreliable — see patch artifact)"
+            lines.append(
+                f"\n**Patch gate:** {sanitise_string(gate_summary, max_chars=400)}"
+            )
+
     # Key findings from feasibility
     feasibility = finding.get("feasibility", {})
     if isinstance(feasibility, dict):
         if feasibility.get("verdict"):
             lines.append(f"\n**Feasibility:** {sanitise_string(str(feasibility['verdict']), max_chars=200)}")
-        if feasibility.get("chain_breaks"):
-            breaks = [sanitise_string(str(b), max_chars=200) for b in feasibility['chain_breaks'][:3]]
+        # List-shaped only: feasibility records are finding-supplied
+        # JSON, and a dict here crashed the slice (KeyError on the
+        # slice object) while a string iterated per character into a
+        # junk render. Anything non-list is silently not a blocker
+        # list.
+        chain_breaks = feasibility.get("chain_breaks")
+        if isinstance(chain_breaks, list) and chain_breaks:
+            breaks = [
+                sanitise_string(str(b), max_chars=200)
+                for b in chain_breaks[:3]
+            ]
             lines.append(f"**Blockers:** {', '.join(breaks)}")
 
     # Dataflow
@@ -278,17 +408,30 @@ def build_finding_detail(finding: Dict[str, Any], index: int) -> ReportSection:
     if dataflow:
         lines.append(f"\n**Dataflow:** `{sanitise_string(str(dataflow), max_chars=500)}`")
 
-    return ReportSection(title=title, content="\n".join(lines))
+    from .document import Block
+    from .results import result_blocks
+    portable: list[Block] | None
+    portable = [Block("table", columns=["Attribute", "Value"], rows=[["Final Status", get_display_status(finding)]])]
+    ruling = finding.get("ruling")
+    if isinstance(ruling, dict) and ruling.get("reason"):
+        portable.append(Block("list", items=["Ruling: " + str(ruling["reason"])]))
+    try:
+        portable.extend(result_blocks(finding, title="Recorded finding evidence"))
+    except (ValueError, TypeError):
+        # The public legacy spec API predates strict JSON capture. Preserve its
+        # existing behavior for callers with nonportable Python-only fields.
+        portable = None
+    return ReportSection(title=title, content="\n".join(lines), blocks=portable, source_data=finding)
 
 
 def build_findings_spec(
-    findings: List[Dict[str, Any]],
+    findings: list[dict[str, Any]],
     title: str = "Security Report",
-    metadata: Dict[str, str] = None,
-    extra_summary: Dict[str, Any] = None,
-    warnings: List[str] = None,
-    extra_sections: List[ReportSection] = None,
-    output_files: List[str] = None,
+    metadata: dict[str, str] | None = None,
+    extra_summary: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+    extra_sections: list[ReportSection] | None = None,
+    output_files: list[str] | None = None,
     include_details: bool = True,
 ) -> ReportSpec:
     """Build a ReportSpec from findings data.
@@ -297,7 +440,11 @@ def build_findings_spec(
     (what columns, how to count, what note to show) lives here.
     Pipeline-specific data goes in metadata, extra_summary, extra_sections.
     """
-    rows = _markdown_rows(build_findings_rows(findings))
+    # RAW rows: the spec renderer defangs every table cell exactly
+    # once at its own chokepoint (escaping here double-escaped — see
+    # _markdown_rows). Cell markup like code spans cannot survive
+    # that defang, so none is added.
+    rows = build_findings_rows(findings)
     counts = build_findings_summary(findings)
 
     # Build summary metrics — extra_summary first (caller controls order),
@@ -340,7 +487,7 @@ def build_findings_spec(
     )
 
 
-def findings_summary(findings: List[Dict[str, Any]]) -> str:
+def findings_summary(findings: list[dict[str, Any]]) -> str:
     """Generate the 'Results at a Glance' text: table + status line.
 
     Takes data directly — no file I/O.
@@ -351,14 +498,13 @@ def findings_summary(findings: List[Dict[str, Any]]) -> str:
     try:
         from core.project.findings_utils import count_vulns
         vuln_count = count_vulns(findings)
-    except Exception:
+    except Exception:  # noqa: BLE001
         vuln_count = None
 
     lines = []
     lines.append("| " + " | ".join(FINDINGS_COLUMNS) + " |")
     lines.append("|" + "|".join("---" for _ in FINDINGS_COLUMNS) + "|")
-    for row in rows:
-        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    lines.extend("| " + " | ".join(str(c) for c in row) + " |" for row in rows)
     lines.append("")
     lines.append(findings_summary_line(counts, vuln_count))
 

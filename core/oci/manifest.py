@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,7 @@ class ImageManifest:
     so package state from later layers wins on path collisions.
     """
     config_digest: str
-    layers: List[LayerDescriptor]
+    layers: list[LayerDescriptor]
     media_type: str
 
 
@@ -90,9 +89,9 @@ class IndexEntry:
     digest: str
     size: int
     media_type: str
-    os: Optional[str]
-    architecture: Optional[str]
-    variant: Optional[str]              # e.g. "v8" for arm64v8
+    os: str | None
+    architecture: str | None
+    variant: str | None              # e.g. "v8" for arm64v8
 
 
 def is_image_index(media_type: str) -> bool:
@@ -115,21 +114,35 @@ def parse_image_manifest(parsed: dict) -> ImageManifest:
     config = parsed.get("config") or {}
     config_digest = config.get("digest") or ""
     if not config_digest:
-        raise ValueError(
-            "manifest missing config.digest — cannot identify image",
-        )
+        msg = "manifest missing config.digest — cannot identify image"
+        raise ValueError(msg)
     layers_raw = parsed.get("layers") or []
-    layers: List[LayerDescriptor] = []
+    layers: list[LayerDescriptor] = []
     for layer in layers_raw:
+        # Loud on malformation, like the config-digest check above: a
+        # silently dropped layer yields a partial package inventory
+        # indistinguishable from a clean one — the evasion class
+        # core.oci.blob refuses for media types. Sizes are coerced
+        # (the index parser's posture); a non-numeric size falls back
+        # to 0, which downstream budget logic treats as "unknown"
+        # (floor budget), never as license to skip the layer.
         if not isinstance(layer, dict):
-            continue
+            msg = f"manifest layer entry is not an object: {layer!r}"
+            raise ValueError(msg)
         digest = layer.get("digest")
-        size = layer.get("size")
         ltype = layer.get("mediaType") or ""
-        if not isinstance(digest, str) or not isinstance(size, int):
-            continue
+        if not isinstance(digest, str) or not digest:
+            msg = "manifest layer missing digest — cannot fetch layer"
+            raise ValueError(msg)
+        size = layer.get("size")
+        if isinstance(size, bool) or not isinstance(size, (int, float, str)):
+            size = 0
+        try:
+            size = int(size)
+        except (ValueError, TypeError, OverflowError):
+            size = 0
         layers.append(LayerDescriptor(
-            digest=digest, size=int(size), media_type=ltype,
+            digest=digest, size=size, media_type=ltype,
         ))
     return ImageManifest(
         config_digest=config_digest,
@@ -138,11 +151,11 @@ def parse_image_manifest(parsed: dict) -> ImageManifest:
     )
 
 
-def parse_image_index(parsed: dict) -> List[IndexEntry]:
+def parse_image_index(parsed: dict) -> list[IndexEntry]:
     """Convert a parsed image-index JSON into a list of
     :class:`IndexEntry`. Caller picks one and fetches that
     manifest separately."""
-    out: List[IndexEntry] = []
+    out: list[IndexEntry] = []
     for entry in parsed.get("manifests") or []:
         if not isinstance(entry, dict):
             continue
@@ -152,8 +165,12 @@ def parse_image_index(parsed: dict) -> List[IndexEntry]:
         platform = entry.get("platform") or {}
         if not isinstance(digest, str):
             continue
+        try:
+            size = int(size)
+        except (ValueError, TypeError, OverflowError):
+            size = 0
         out.append(IndexEntry(
-            digest=digest, size=int(size), media_type=ltype,
+            digest=digest, size=size, media_type=ltype,
             os=platform.get("os"),
             architecture=platform.get("architecture"),
             variant=platform.get("variant"),
@@ -162,12 +179,12 @@ def parse_image_index(parsed: dict) -> List[IndexEntry]:
 
 
 def select_platform(
-    entries: List[IndexEntry],
+    entries: list[IndexEntry],
     *,
     os: str = DEFAULT_PLATFORM_OS,
     architecture: str = DEFAULT_PLATFORM_ARCH,
-    variant: Optional[str] = None,
-) -> Optional[IndexEntry]:
+    variant: str | None = None,
+) -> IndexEntry | None:
     """Pick the entry matching ``(os, architecture[, variant])``.
 
     Behaviour:
@@ -202,14 +219,14 @@ def select_platform(
 
 
 __all__ = [
-    "DEFAULT_PLATFORM_OS",
     "DEFAULT_PLATFORM_ARCH",
-    "LayerDescriptor",
+    "DEFAULT_PLATFORM_OS",
     "ImageManifest",
     "IndexEntry",
+    "LayerDescriptor",
     "is_image_index",
     "is_image_manifest",
-    "parse_image_manifest",
     "parse_image_index",
+    "parse_image_manifest",
     "select_platform",
 ]

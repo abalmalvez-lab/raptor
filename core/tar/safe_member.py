@@ -1,4 +1,4 @@
-"""Tar member safety predicate.
+r"""Tar member safety predicate.
 
 Wraps :func:`tarfile.data_filter` (PEP 706 / Python 3.12+) into a
 boolean predicate consumers use as a skip-or-continue check.
@@ -23,6 +23,15 @@ The hardening rules (per PEP 706's ``data`` filter):
   * **uid/gid bits** — setuid / setgid / sticky bits stripped.
     A tarball can't usefully grant SUID 0 to its own files; the
     presence is suspicious.
+  * **Backslash separator** — Windows-shaped paths (``..\..\etc``)
+    rejected so an on-disk resolver that treats ``\`` as a
+    separator can't be fooled. Mirrors :mod:`core.zip.safe_member`.
+  * **NFKC-normalised traversal** — fullwidth/decomposed Unicode
+    forms (``．．``) that filesystems like HFS+ fold back to ASCII
+    on write are normalised before the traversal / absolute-path
+    checks run. Mirrors :mod:`core.zip.safe_member`.
+  * **Empty / whitespace-only names** — degenerate member names
+    are rejected; nothing legitimate produces them.
 
 In addition to the PEP 706 rules, this helper enforces a per-member
 size cap. PEP 706 doesn't address compression bombs (the size cap
@@ -42,6 +51,7 @@ from __future__ import annotations
 import logging
 import sys
 import tarfile
+import unicodedata
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -51,6 +61,14 @@ logger = logging.getLogger(__name__)
 # MB. 64 MB is generous for real data; anything bigger is either
 # a misuse of tar (use a different format) or a malicious bomb.
 DEFAULT_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+
+# Cap on tar-member ``name`` length. PAX-format tar permits names
+# up to 8 GiB via the ``LongLink`` extension; ``tarfile`` parses the
+# full name into a Python str during ``tf.__iter__`` BEFORE any of
+# the safety checks below fire. A 100MB attacker-supplied name
+# costs ~100 MB of RAM at iter-time, far below what the per-member
+# ``size`` cap would block. Real filenames are well under 4 KiB.
+DEFAULT_MAX_NAME_LENGTH = 4 * 1024
 
 # We need a fictional "destination" path for tarfile.data_filter to
 # resolve relative paths against. The path doesn't need to exist
@@ -66,10 +84,12 @@ class UnsafeMemberReason(str, Enum):
     SAFE = "safe"
     PATH_TRAVERSAL = "path_traversal"
     ABSOLUTE_PATH = "absolute_path"
+    BACKSLASH_PATH = "backslash_path"
     SPECIAL_FILE = "special_file"           # block/char dev, fifo, socket
     SYMLINK_UNSAFE = "symlink_unsafe"
     HARD_LINK = "hard_link"
     OVERSIZED = "oversized"
+    OVERSIZED_NAME = "oversized_name"
     UNRECOGNISED_TYPE = "unrecognised_type"
 
 
@@ -77,6 +97,7 @@ def is_safe_member(
     member: tarfile.TarInfo,
     *,
     max_size: int = DEFAULT_MAX_MEMBER_BYTES,
+    max_name_length: int = DEFAULT_MAX_NAME_LENGTH,
     allow_absolute_paths: bool = False,
 ) -> bool:
     """True if extracting ``member`` is safe under the hardening
@@ -84,6 +105,7 @@ def is_safe_member(
     callers that don't need the diagnostic detail."""
     return safe_member_reason(
         member, max_size=max_size,
+        max_name_length=max_name_length,
         allow_absolute_paths=allow_absolute_paths,
     ) == UnsafeMemberReason.SAFE
 
@@ -92,6 +114,7 @@ def safe_member_reason(
     member: tarfile.TarInfo,
     *,
     max_size: int = DEFAULT_MAX_MEMBER_BYTES,
+    max_name_length: int = DEFAULT_MAX_NAME_LENGTH,
     allow_absolute_paths: bool = False,
 ) -> UnsafeMemberReason:
     """Return the specific reason ``member`` is unsafe, or
@@ -109,7 +132,16 @@ def safe_member_reason(
     members for path-traversal, M for symlinks" counts at the
     consumer's report layer.
     """
-    # Size check first — cheap, and a 1 GB malicious entry should
+    # Name-length check first — a multi-MB tar member name (legal
+    # via PAX LongLink) has already been parsed into a Python str
+    # by tarfile.iter, but everything we do here downstream (path
+    # operations, regex matching, logging) compounds the cost on
+    # that string. Reject early so the bulk of the analysis runs
+    # on bounded names.
+    if len(member.name) > max_name_length:
+        return UnsafeMemberReason.OVERSIZED_NAME
+
+    # Size check next — cheap, and a 1 GB malicious entry should
     # be rejected before doing anything else with it.
     if member.size > max_size:
         return UnsafeMemberReason.OVERSIZED
@@ -124,10 +156,19 @@ def safe_member_reason(
 
     # Hard links can point inside or outside dest; PEP 706's filter
     # checks but we additionally treat any hard link as rejected
-    # because none of our consumers need them (we extract individual
-    # files, not full trees with internal cross-references).
+    # for direct extraction. Memory-only consumers can separately
+    # resolve references against verified regular entries; this filter
+    # never follows or creates links.
     if member.islnk():
         return UnsafeMemberReason.HARD_LINK
+
+    # Empty / whitespace-only names. Nothing legitimate produces
+    # them, and the split-based checks below treat them as vacuously
+    # safe — reject explicitly (fail-closed). Mirrors the zip guard's
+    # degenerate-name rejection (core.zip.safe_member).
+    name = member.name
+    if not name.strip():
+        return UnsafeMemberReason.UNRECOGNISED_TYPE
 
     # Absolute-path check before delegating to data_filter. PEP 706's
     # data_filter SILENTLY STRIPS a leading ``/`` rather than
@@ -142,6 +183,49 @@ def safe_member_reason(
             return UnsafeMemberReason.ABSOLUTE_PATH
         if member.issym() and member.linkname.startswith("/"):
             return UnsafeMemberReason.SYMLINK_UNSAFE
+
+    # Backslash check. Tar names use forward slash; any backslash is
+    # either a malformed producer or an intentional Windows path
+    # attack (``..\\..\\etc\\passwd``) on a host/filesystem whose
+    # resolver treats ``\\`` as a separator — data_filter's POSIX
+    # resolution would wave it through as a single odd-named segment.
+    # Reject explicitly, same predicate as core.zip.safe_member. Tar
+    # additionally carries symlink targets, so the link TARGET gets
+    # the same treatment (surfaced as the existing symlink reason).
+    if "\\" in name:
+        return UnsafeMemberReason.BACKSLASH_PATH
+    if member.issym() and "\\" in member.linkname:
+        return UnsafeMemberReason.SYMLINK_UNSAFE
+
+    # NFKC normalisation: HFS+ (macOS) and some case-insensitive
+    # filesystems map fullwidth/decomposed Unicode forms back to
+    # their ASCII equivalents during write. ``safe/．．/x``
+    # (FULLWIDTH FULL STOP) extracts as ``safe/../x`` on those
+    # filesystems → real path escape that the raw-name checks (and
+    # data_filter below) never see. Run the traversal / absolute
+    # checks on both the raw and the normalised form — same
+    # segment-equals-``..`` predicate as core.zip.safe_member; the
+    # original name is left intact for callers that want to surface
+    # the raw value. Symlink targets get the same treatment.
+    normalised = unicodedata.normalize("NFKC", name)
+    for to_check in {name, normalised}:
+        parts = [p for p in to_check.split("/") if p]
+        if ".." in parts:
+            return UnsafeMemberReason.PATH_TRAVERSAL
+        # Re-run the absolute-path check on the normalised form too.
+        # Some Unicode forms (FULLWIDTH SOLIDUS) resolve to a leading
+        # "/" only after NFKC.
+        if not allow_absolute_paths and to_check.startswith("/"):
+            return UnsafeMemberReason.ABSOLUTE_PATH
+    if member.issym():
+        linkname = member.linkname
+        for to_check in {linkname,
+                         unicodedata.normalize("NFKC", linkname)}:
+            link_parts = [p for p in to_check.split("/") if p]
+            if ".." in link_parts:
+                return UnsafeMemberReason.SYMLINK_UNSAFE
+            if not allow_absolute_paths and to_check.startswith("/"):
+                return UnsafeMemberReason.SYMLINK_UNSAFE
 
     # Use Python 3.12+ tarfile.data_filter for the canonical
     # path-traversal / symlink-target / abspath checks. Wrapped in
@@ -182,11 +266,15 @@ def safe_member_reason(
         # reject on legacy Python than ship a known gap.
         if member.name.startswith("/"):
             return UnsafeMemberReason.ABSOLUTE_PATH
-        if "../" in member.name or member.name.startswith("../"):
+        name_parts = [p for p in member.name.split("/") if p]
+        if ".." in name_parts:
             return UnsafeMemberReason.PATH_TRAVERSAL
         if member.issym():
             target = member.linkname
-            if target.startswith("/") or "../" in target:
+            if target.startswith("/"):
+                return UnsafeMemberReason.SYMLINK_UNSAFE
+            link_parts = [p for p in target.split("/") if p]
+            if ".." in link_parts:
                 return UnsafeMemberReason.SYMLINK_UNSAFE
 
     return UnsafeMemberReason.SAFE
@@ -194,6 +282,7 @@ def safe_member_reason(
 
 __all__ = [
     "DEFAULT_MAX_MEMBER_BYTES",
+    "DEFAULT_MAX_NAME_LENGTH",
     "UnsafeMemberReason",
     "is_safe_member",
     "safe_member_reason",

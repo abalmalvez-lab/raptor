@@ -16,14 +16,16 @@ contexts (markdown report, log streamer, etc.).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from core.security.log_sanitisation import sanitise_for_terminal
 
 
 def render_dataflow_validation_lines(
-    dv: Optional[Dict[str, Any]],
+    dv: dict[str, Any] | None,
     *,
     indent: str = "   ",
-) -> List[str]:
+) -> list[str]:
     """Render the IRIS dataflow validation summary as a list of lines.
 
     Args:
@@ -36,7 +38,7 @@ def render_dataflow_validation_lines(
 
     Returns:
         List of formatted strings ready to print. Empty list when
-        validation didn't run AND no skipped_reason was recorded
+        validation didn't run AND no errors or skipped_reason were recorded
         (caller should print nothing).
 
     Output shape (when populated):
@@ -58,17 +60,20 @@ def render_dataflow_validation_lines(
     n_validated = dv.get("n_validated", 0)
     n_cache_hits = dv.get("n_cache_hits", 0)
     skipped_reason = dv.get("skipped_reason", "")
+    n_errors = dv.get("n_errors", 0)
+    error_line = (f"{indent}Dataflow validation errors: {n_errors}"
+                  if type(n_errors) is int and n_errors > 0 else None)
 
     if not n_validated and not n_cache_hits:
-        # Validation didn't actually run on any finding. Surface the
-        # reason if one was recorded (operator can tell IRIS noticed
-        # but couldn't help — vs the silent "no findings to validate"
-        # case which is genuinely no signal).
-        if skipped_reason:
-            return [f"{indent}Dataflow validation skipped: {skipped_reason}"]
-        return []
+        # No validation result or cache hit was recorded. Keep an explicit
+        # skip reason and per-finding failure count visible; silence still
+        # represents the legacy case with neither results nor diagnostics.
+        notices = [f"{indent}Dataflow validation skipped: {skipped_reason}"] if skipped_reason else []
+        if error_line:
+            notices.append(error_line)
+        return [sanitise_for_terminal(line, max_len=4000) for line in notices]
 
-    out: List[str] = []
+    out: list[str] = []
 
     # Header line — matches the existing summary cadence
     # ("Exploits generated: N", "Patches generated: N", …).
@@ -85,7 +90,7 @@ def render_dataflow_validation_lines(
     n_tier1 = dv.get("n_tier1_prebuilt", 0)
     n_tier2 = dv.get("n_tier2_template", 0)
     n_tier3 = dv.get("n_tier3_retry", 0)
-    tier_parts: List[str] = []
+    tier_parts: list[str] = []
     if n_tier1:
         tier_parts.append(f"{n_tier1} Tier 1 (free)")
     if n_tier2:
@@ -102,7 +107,7 @@ def render_dataflow_validation_lines(
     n_smt_refuted = dv.get("n_tier4_smt_refuted", 0)
     n_smt_witness = dv.get("n_tier4_smt_witness", 0)
     n_smt_disagree = dv.get("n_tier4_smt_disagree", 0)
-    smt_parts: List[str] = []
+    smt_parts: list[str] = []
     if n_smt_refuted:
         smt_parts.append(f"{n_smt_refuted} refuted")
     if n_smt_witness:
@@ -161,9 +166,9 @@ def render_dataflow_validation_lines(
     n_hard = dv.get("n_applied_downgrades", 0)
     n_soft = dv.get("n_soft_downgrades", 0)
     if n_recommended:
-        outcome: List[str] = [f"{n_recommended} flagged"]
+        outcome: list[str] = [f"{n_recommended} flagged"]
         if n_hard or n_soft:
-            bits: List[str] = []
+            bits: list[str] = []
             if n_hard:
                 bits.append(f"{n_hard} hard")
             if n_soft:
@@ -171,4 +176,9 @@ def render_dataflow_validation_lines(
             outcome.append(f"applied: {', '.join(bits)}")
         out.append(f"{indent}  downgrades: {' · '.join(outcome)}")
 
-    return out
+    if error_line:
+        out.append(error_line)
+
+    # Both native callers print these lines directly. Escape only the view;
+    # captured telemetry remains unchanged for structured report consumers.
+    return [sanitise_for_terminal(line, max_len=4000) for line in out]

@@ -1,0 +1,1056 @@
+"""Emit learned taint vocabulary as a CodeQL data-extension pack.
+
+This is the PR2a emitter :mod:`core.dataflow.codeql_augmented_run`
+documents: it turns validated project vocabulary — IRIS taint specs
+(:class:`core.iris.specs.TaintSpec`) and sanitizer-evidence candidates
+(:class:`core.dataflow.sanitizer_evidence.CandidateValidator`) — into a
+models-as-data extension pack that ``codeql database analyze
+--additional-packs <pack>`` consumes, so the *stock* queries learn the
+target's own sources, sinks, summaries, and (for C/C++) barriers.
+
+Row shapes are pinned to the extensible predicates of the vendored
+stdlib packs this was verified against:
+
+* ``codeql/cpp-all`` (12.x) — 9-column ``sourceModel``/``sinkModel``/
+  ``barrierModel``, 10-column ``summaryModel``
+  (namespace, type, subtypes, name, signature, ext, access…, kind,
+  provenance).
+* ``codeql/python-all`` (7.x) — 3-column ``sourceModel``/``sinkModel``
+  (type, path, kind), 5-column ``summaryModel``
+  (type, path, input, output, kind).
+* ``codeql/javascript-all`` (2.10.x, vendored inside
+  ``codeql/javascript-queries``) — same (type, path) family as
+  python: 3-column ``sourceModel``/``sinkModel``, 5-column
+  ``summaryModel`` (``ApiGraphModelsExtensions.qll``; the trailing
+  ``madId`` column is CLI-assigned, never authored). The upstream
+  pack also declares ``barrierModel``/``barrierGuardModel``
+  extensible predicates, but this layout deliberately EXCLUDES them:
+  a barrier row suppresses findings, and the dynamic-language
+  barrier channel stays closed exactly like python's
+  (:mod:`core.taint.mad_matrix` pins the same rule a layer above).
+
+Languages whose stdlib row shapes have not been verified against a
+real pack are refused loudly rather than emitted speculatively — a
+malformed extension file fails the whole ``codeql database analyze``
+invocation. Adding a language is a data-only change to
+``_LANGUAGE_LAYOUTS`` once its shapes are confirmed.
+
+Trust properties:
+
+* **Provenance gate** — rows whose provenance is ``llm_prior`` /
+  ``llm_summarized`` (training memory, unverified summarization) or
+  missing are rejected, mirroring
+  :func:`core.audit.condition_smt.DomainVocabulary`'s policy. The
+  emitter reports every rejection with a reason; nothing is silently
+  dropped.
+* **Cell validation** — every learned name is validated against a
+  strict per-family grammar before it is written. YAML emission uses
+  ``json.dumps`` per row (JSON is a YAML subset), so no learned string
+  can escape its cell.
+* **Determinism** — rows are de-duplicated and sorted so packs diff
+  cleanly across runs.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from numbers import Number
+from pathlib import Path
+from collections.abc import Iterable, Mapping, Sequence
+
+import yaml
+
+from core.evidence import EvidenceTier, TIER_RANK
+
+SCHEMA_VERSION = 1
+
+# ── provenance gate ──────────────────────────────────────────────────
+
+#: Provenance values accepted into engine configuration. Everything
+#: else is rejected: ``llm_prior`` (training memory), ``llm_summarized``
+#: (unverified summarization), and unknown/missing values.
+ACCEPTED_PROVENANCE = frozenset({
+    "verbatim",          # study receipts: quoted from source
+    "mechanical",        # study receipts: tool-derived
+    "study",             # domain-model vocabulary
+    "iris_refined",      # IRIS spec that survived the refinement loop
+    "llm_extracted",     # LLM-extracted from source + identifier-validated
+    "operator",          # operator-declared
+    "annotation",        # human /annotate note
+    "framework_catalog", # curated catalog
+})
+
+REJECTED_PROVENANCE = frozenset({"llm_prior", "llm_summarized"})
+
+#: models-as-data provenance column value by RAPTOR provenance.
+#: Human-attested rows are "manual"; everything learned is
+#: "ai-generated" (upstream MaD vocabulary).
+_MAD_PROVENANCE = {
+    "operator": "manual",
+    "annotation": "manual",
+    "framework_catalog": "manual",
+}
+_MAD_PROVENANCE_DEFAULT = "ai-generated"
+
+# ── roles and layouts ────────────────────────────────────────────────
+
+ROLE_SOURCE = "source"
+ROLE_SINK = "sink"
+ROLE_SUMMARY = "summary"
+ROLE_BARRIER = "barrier"
+VALID_ROLES = frozenset({ROLE_SOURCE, ROLE_SINK, ROLE_SUMMARY, ROLE_BARRIER})
+
+#: role → extensible predicate name, per language. Only combinations
+#: verified against a vendored stdlib pack appear here.
+_LANGUAGE_LAYOUTS: Mapping[str, Mapping[str, str]] = {
+    "cpp": {
+        ROLE_SOURCE: "sourceModel",
+        ROLE_SINK: "sinkModel",
+        ROLE_SUMMARY: "summaryModel",
+        ROLE_BARRIER: "barrierModel",
+    },
+    "python": {
+        ROLE_SOURCE: "sourceModel",
+        ROLE_SINK: "sinkModel",
+        ROLE_SUMMARY: "summaryModel",
+        # python-all has no barrierModel extensible predicate; barrier
+        # rows are rejected with a directed reason (use QL barrier
+        # synthesis instead — core/dataflow/barrier_synth.py).
+    },
+    # java-all rows share the cpp 9/10-column family (package, type,
+    # subtypes, name, signature, ext, access, kind, provenance) —
+    # verified against codeql/java-all 9.0.4's ext/*.model.yml.
+    "java": {
+        ROLE_SOURCE: "sourceModel",
+        ROLE_SINK: "sinkModel",
+        ROLE_SUMMARY: "summaryModel",
+        ROLE_BARRIER: "barrierModel",
+    },
+    # javascript-all rows share the python (type, path) family —
+    # verified against codeql/javascript-all 2.10.1
+    # (ApiGraphModelsExtensions.qll + ext/*.model.yml). NO barrier
+    # role even though the upstream predicate exists: the
+    # dynamic-language barrier channel stays closed (suppression
+    # direction), matching python — the mad_matrix invariant pins
+    # this exclusion, and rows are refused here with a directed
+    # reason (use QL barrier synthesis instead).
+    "javascript": {
+        ROLE_SOURCE: "sourceModel",
+        ROLE_SINK: "sinkModel",
+        ROLE_SUMMARY: "summaryModel",
+    },
+}
+
+SUPPORTED_LANGUAGES = frozenset(_LANGUAGE_LAYOUTS)
+
+_STDLIB_PACK = {
+    "cpp": "codeql/cpp-all",
+    "python": "codeql/python-all",
+    "java": "codeql/java-all",
+    "javascript": "codeql/javascript-all",
+}
+
+# ── cell grammars ────────────────────────────────────────────────────
+
+# All grammars anchor with \Z, never $: in Python re, $ also matches
+# just BEFORE a trailing newline, so "name\n" would validate as
+# "name" while remaining a distinct string — two visually identical
+# cells that dedup, diff, and downstream joins treat as different.
+# \Z anchors at the absolute end only. For the same reason the
+# whitespace the cpp/signature/access grammars allow is [ \t], never
+# \s: \s includes \n, which would re-admit the invisible-byte twin
+# mid-cell (json.dumps contains it in the YAML, but dedup and joins
+# would still see two "identical" names).
+
+# C/C++ namespace: alnum plus :: < > , * & space ~ -. No quotes,
+# backslashes, or control characters can pass.
+_CPP_NAMESPACE_RE = re.compile(r"^[A-Za-z_~][\w:<>,*& \t~-]*\Z")
+_CPP_TYPE_RE = _CPP_NAMESPACE_RE
+# Function name: a plain (optionally destructor) identifier.
+_CPP_NAME_RE = re.compile(r"^~?[A-Za-z_]\w*\Z")
+# Java package (dotted identifiers; empty = default package), type
+# (identifier, nested via $ or .), name, and "(Type,Type)" signature
+# of erased simple types — the stdlib ext-file conventions.
+_JAVA_PACKAGE_RE = re.compile(r"^([A-Za-z_]\w*(\.[A-Za-z_]\w*)*)?\Z")
+_JAVA_TYPE_RE = re.compile(r"^[A-Za-z_]\w*([.$][A-Za-z_]\w*)*\Z")
+_JAVA_NAME_RE = re.compile(r"^[A-Za-z_]\w*\Z")
+_JAVA_SIGNATURE_RE = re.compile(r"^\([\w \t,.<>\[\]$]*\)\Z")
+# Python dotted type path; a leading ~ on a segment is the stdlib
+# "match by name suffix" convention (e.g. asyncpg.~Connection).
+_PY_TYPE_RE = re.compile(r"^~?[A-Za-z_]\w*(\.~?[A-Za-z_]\w*)*\Z")
+# Access-path component grammar shared by both families:
+#   Member[x], Argument[0], Argument[*1], Argument[0,query:],
+#   Parameter[0], ReturnValue, Subscript[0], Awaited, Element, Field[x]
+_ACCESS_PART_RE = re.compile(
+    r"^(ReturnValue|Awaited|Element|MapKey|MapValue"
+    r"|(Member|Argument|Parameter|Subscript|Field)\[[\w \t,.:*+-]*\])\Z"
+)
+_KIND_RE = re.compile(r"^[a-z][a-z0-9-]*\Z")
+_SIGNATURE_RE = re.compile(r"^[\w \t,:<>*&()\[\]~-]*\Z")
+
+# JavaScript type: `global`, or a lowercase NPM package (one
+# optional `@scope/` prefix) followed by dot-separated CAPITALIZED
+# qualified type names (`express.Request`); a leading ~ on a type
+# segment is the suffix-match convention shared with python
+# (`pkg.~Request`). Deliberately narrower than upstream's
+# parseTypeString: quoted dotted packages (`'pkg.name'.Type`),
+# `(package)` aliases, `file:` types, and uppercase package names
+# (npm forbids them — an unquoted dotted package would silently
+# misparse as package + type upstream) are never emitted, so the
+# grammar refuses them. No whitespace class at all — nothing this
+# emitter writes into a js type cell contains spaces, and \s would
+# re-admit the trailing-newline twin ([ \t] discipline, tightened to
+# empty here).
+_JS_TYPE_RE = re.compile(
+    r"^(@[a-z0-9][a-z0-9._-]*/)?"      # optional @scope/ (npm charset)
+    r"[a-z0-9_][a-z0-9_$-]*"           # package (lowercase npm charset)
+    r"(\.~?[A-Z][\w$-]*)*\Z"           # .Qualified.Type suffixes
+)
+# JavaScript access-path token grammar — the token universe verified
+# against codeql/javascript-all 2.10.1 (shared AccessPathSyntax
+# names + isExtraValidTokenNameInIdentifyingAccessPath), restricted
+# to what this emitter can produce plus upstream-valid headroom:
+#   no-argument: ReturnValue, Instance, Awaited, ArrayElement,
+#     Element, MapValue, AnyMember, NewCall, Call
+#   Member[name(,name)*]         — property names, no dots/spaces
+#   Argument[i]/Parameter[i]     — plain indices or i..j / i.. ranges
+#   WithArity[i] / WithArity[i..j]
+# Deliberately absent: Fuzzy, TypeVar, WithStringArgument,
+# GuardedRouteHandler, Decorated* and negative/N- indices — never
+# emitted, so never admitted. Ranges carry dots INSIDE brackets,
+# which is why js paths use the bracket-aware splitter below instead
+# of a bare split(".").
+_JS_INDEX = r"\d+(\.\.(\d+)?)?"
+_JS_ACCESS_PART_RE = re.compile(
+    r"^(ReturnValue|Instance|Awaited|ArrayElement|Element|MapValue"
+    r"|AnyMember|NewCall|Call"
+    r"|Member\[[\w$-]+(,[\w$-]+)*\]"
+    rf"|(Argument|Parameter)\[{_JS_INDEX}(,{_JS_INDEX})*\]"
+    rf"|WithArity\[{_JS_INDEX}\])\Z"
+)
+
+
+def _valid_access(path: str, *, allow_empty: bool = False) -> bool:
+    if not path:
+        return allow_empty
+    return all(_ACCESS_PART_RE.match(part) for part in path.split("."))
+
+
+def _split_js_access(path: str) -> list[str] | None:
+    """Split a js access path on dots OUTSIDE brackets.
+
+    ``Member[exec].Argument[0..]`` has a dot inside the range token;
+    a bare ``split(".")`` would shear it into invalid fragments (and
+    conversely let an invalid part hide across the shear). Returns
+    ``None`` on unbalanced brackets.
+    """
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    for ch in path:
+        if ch == "[":
+            depth += 1
+            cur.append(ch)
+        elif ch == "]":
+            depth -= 1
+            if depth < 0:
+                return None
+            cur.append(ch)
+        elif ch == "." and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if depth != 0:
+        return None
+    parts.append("".join(cur))
+    return parts
+
+
+def _valid_js_access(path: str, *, allow_empty: bool = False) -> bool:
+    if not path:
+        return allow_empty
+    parts = _split_js_access(path)
+    if parts is None:
+        return False
+    return all(_JS_ACCESS_PART_RE.match(part) for part in parts)
+
+
+def js_coordinate(dotted: str) -> tuple[str, str]:
+    """Split a dotted API name into the js-all ``(type, member path)``.
+
+    The mechanical boundary rule (pinned by tests):
+
+    * one segment → the global object: ``("global", "Member[eval]")``;
+    * a Capitalized first segment is a global class, not a package
+      (npm forbids uppercase package names): ``Buffer.from`` →
+      ``("global", "Member[Buffer].Member[from]")``;
+    * otherwise the first segment is the package; a Capitalized
+      NON-TERMINAL second segment joins the type (the
+      ``package.Type`` instance-property convention of the stock
+      models): ``express.Request.params`` → ``("express.Request",
+      "Member[params]")``;
+    * a TERMINAL Capitalized second segment is the class object
+      exported by the package, addressed as a member (the
+      constructor-call coordinate): ``vm.Script`` → ``("vm",
+      "Member[Script]")``;
+    * everything after the type boundary becomes ``Member[...]``
+      hops: ``fs.promises.readFile`` →
+      ``("fs", "Member[promises].Member[readFile]")``.
+
+    Static members of exported classes (``pkg.Class.static``) land on
+    the instance-typed form — outside this rule's scope; declare such
+    an API only when the instance reading is the intended one. The
+    returned member path may be empty (bare package names).
+    """
+    segments = dotted.split(".")
+    if len(segments) == 1 or segments[0][:1].isupper():
+        type_name, members = "global", segments
+    elif len(segments) >= 3 and segments[1][:1].isupper():
+        type_name, members = ".".join(segments[:2]), segments[2:]
+    else:
+        type_name, members = segments[0], segments[1:]
+    return type_name, ".".join(f"Member[{m}]" for m in members)
+
+
+# ── row model ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ModelRow:
+    """One learned model row, engine-family neutral.
+
+    cpp-family rows use ``namespace``/``type_name``/``name`` plus the
+    access fields; python-family rows use ``type_name`` (dotted path)
+    plus ``path`` (access path rooted at the type). ``model_kind`` is
+    the source/sink/summary kind column (``remote``,
+    ``sql-injection``, ``taint``, …); for barrier rows it names the
+    sink kind the barrier neutralizes.
+    """
+
+    role: str
+    provenance: str
+    confidence: float = 1.0
+    namespace: str = ""
+    type_name: str = ""
+    name: str = ""
+    path: str = ""
+    subtypes: bool = False
+    signature: str = ""
+    access_input: str = ""
+    access_output: str = ""
+    model_kind: str = ""
+
+    def summary(self) -> str:
+        coord = self.path or self.name or self.type_name
+        scope = self.type_name if self.path or self.name else self.namespace
+        where = f"{scope}.{coord}" if scope and coord != scope else coord
+        return f"{self.role}:{where or '<empty>'}:{self.model_kind}"
+
+
+@dataclass(frozen=True)
+class RejectedRow:
+    row: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExtensionPackResult:
+    """Outcome of one :func:`write_extension_pack` call."""
+
+    pack_dir: Path
+    model_file: Path
+    language: str
+    pack_name: str
+    counts: Mapping[str, int]          # extensible predicate → rows written
+    rejected: tuple[RejectedRow, ...]  # every input row not written, with reason
+
+    @property
+    def rows_written(self) -> int:
+        return sum(self.counts.values())
+
+    def to_dict(self) -> dict:
+        return {
+            "pack_dir": str(self.pack_dir),
+            "model_file": str(self.model_file),
+            "language": self.language,
+            "pack_name": self.pack_name,
+            "counts": dict(self.counts),
+            "rows_written": self.rows_written,
+            "rejected": [
+                {"row": r.row, "reason": r.reason} for r in self.rejected
+            ],
+        }
+
+
+# ── validation ───────────────────────────────────────────────────────
+
+
+def _gate_provenance(row: ModelRow) -> str | None:
+    if not row.provenance:
+        return "provenance missing"
+    if not isinstance(row.provenance, str):
+        return "provenance must be text"
+    if row.provenance in REJECTED_PROVENANCE:
+        return f"provenance {row.provenance!r} is not evidence-backed"
+    if row.provenance not in ACCEPTED_PROVENANCE:
+        return (
+            f"provenance {row.provenance!r} unknown; accepted: "
+            f"{sorted(ACCEPTED_PROVENANCE)}"
+        )
+    return None
+
+
+def _validate_common(row: ModelRow) -> str | None:
+    if not isinstance(row.role, str) or row.role not in VALID_ROLES:
+        return f"role {row.role!r} not in {sorted(VALID_ROLES)}"
+    if not isinstance(row.model_kind, str) or not _KIND_RE.match(row.model_kind):
+        return f"model_kind {row.model_kind!r} fails kind grammar"
+    if isinstance(row.confidence, bool) or not isinstance(row.confidence, Number):
+        return f"confidence {row.confidence!r} must be numeric"
+    try:
+        if not (0.0 <= row.confidence <= 1.0):
+            return f"confidence {row.confidence!r} outside [0, 1]"
+    except (TypeError, ValueError, ArithmeticError):
+        return f"confidence {row.confidence!r} is not an ordered real number"
+    return None
+
+
+def _validate_cpp(row: ModelRow) -> str | None:
+    if row.namespace and not _CPP_NAMESPACE_RE.match(row.namespace):
+        return f"namespace {row.namespace!r} fails cpp grammar"
+    if row.type_name and not _CPP_TYPE_RE.match(row.type_name):
+        return f"type {row.type_name!r} fails cpp grammar"
+    if not _CPP_NAME_RE.match(row.name or ""):
+        return f"name {row.name!r} fails cpp identifier grammar"
+    if row.signature and not _SIGNATURE_RE.match(row.signature):
+        return f"signature {row.signature!r} fails signature grammar"
+    if row.role in (ROLE_SOURCE, ROLE_BARRIER) and not _valid_access(row.access_output):
+        return f"output access {row.access_output!r} fails access grammar"
+    if row.role == ROLE_SINK and not _valid_access(row.access_input):
+        return f"input access {row.access_input!r} fails access grammar"
+    if row.role == ROLE_SUMMARY and not (
+        _valid_access(row.access_input) and _valid_access(row.access_output)
+    ):
+        return (
+            f"summary access {row.access_input!r}→{row.access_output!r} "
+            "fails access grammar"
+        )
+    return None
+
+
+def _validate_python(row: ModelRow) -> str | None:
+    if not _PY_TYPE_RE.match(row.type_name or ""):
+        return f"type {row.type_name!r} fails python dotted-path grammar"
+    if not _valid_access(row.path):
+        return f"path {row.path!r} fails access grammar"
+    if row.role == ROLE_SUMMARY and not (
+        _valid_access(row.access_input) and _valid_access(row.access_output)
+    ):
+        return (
+            f"summary access {row.access_input!r}→{row.access_output!r} "
+            "fails access grammar"
+        )
+    return None
+
+
+def _validate_javascript(row: ModelRow) -> str | None:
+    if not _JS_TYPE_RE.match(row.type_name or ""):
+        return f"type {row.type_name!r} fails javascript type grammar"
+    # Path is required, python-parity: a bare-type row would mark
+    # the module object itself, which no emitted role means.
+    if not _valid_js_access(row.path):
+        return f"path {row.path!r} fails javascript access grammar"
+    if row.role == ROLE_SUMMARY and not (
+        _valid_js_access(row.access_input) and _valid_js_access(row.access_output)
+    ):
+        return (
+            f"summary access {row.access_input!r}→{row.access_output!r} "
+            "fails javascript access grammar"
+        )
+    return None
+
+
+def _validate_java(row: ModelRow) -> str | None:
+    if not _JAVA_PACKAGE_RE.match(row.namespace or ""):
+        return f"package {row.namespace!r} fails java grammar"
+    if not _JAVA_TYPE_RE.match(row.type_name or ""):
+        return f"type {row.type_name!r} fails java grammar"
+    if not _JAVA_NAME_RE.match(row.name or ""):
+        return f"name {row.name!r} fails java identifier grammar"
+    if not _JAVA_SIGNATURE_RE.match(row.signature or "()"):
+        return f"signature {row.signature!r} fails java signature grammar"
+    if row.role in (ROLE_SOURCE, ROLE_BARRIER) and not _valid_access(row.access_output):
+        return f"output access {row.access_output!r} fails access grammar"
+    if row.role == ROLE_SINK and not _valid_access(row.access_input):
+        return f"input access {row.access_input!r} fails access grammar"
+    if row.role == ROLE_SUMMARY and not (
+        _valid_access(row.access_input) and _valid_access(row.access_output)
+    ):
+        return (
+            f"summary access {row.access_input!r}→{row.access_output!r} "
+            "fails access grammar"
+        )
+    return None
+
+
+def _validate(row: ModelRow, language: str) -> str | None:
+    reason = _gate_provenance(row) or _validate_common(row)
+    if reason:
+        return reason
+    if language in ("cpp", "java") and type(row.subtypes) is not bool:
+        return "subtypes must be a boolean"
+    layout = _LANGUAGE_LAYOUTS[language]
+    if row.role not in layout:
+        if language == "python" and row.role == ROLE_BARRIER:
+            return (
+                "codeql/python-all has no barrierModel extensible "
+                "predicate; use QL barrier synthesis "
+                "(core/dataflow/barrier_synth.py) for python sanitizers"
+            )
+        if language == "javascript" and row.role == ROLE_BARRIER:
+            return (
+                "the javascript layout excludes barrierModel even though "
+                "codeql/javascript-all declares it: a barrier row "
+                "suppresses findings, and the dynamic-language barrier "
+                "channel stays closed exactly like python's "
+                "(core.taint.mad_matrix pins the same rule)"
+            )
+        return f"role {row.role!r} unsupported for language {language!r}"
+    for index, cell in enumerate(_cells(row, language)):
+        if language in ("cpp", "java") and index == 2:
+            continue  # subtype boolean is checked separately
+        if not isinstance(cell, str):
+            return f"model cell {index} must be text"
+    if language == "cpp":
+        return _validate_cpp(row)
+    if language == "java":
+        return _validate_java(row)
+    if language == "javascript":
+        return _validate_javascript(row)
+    return _validate_python(row)
+
+
+# ── cell emission ────────────────────────────────────────────────────
+
+
+def _mad_provenance(row: ModelRow) -> str:
+    return _MAD_PROVENANCE.get(row.provenance, _MAD_PROVENANCE_DEFAULT)
+
+
+def _cells(row: ModelRow, language: str) -> list:
+    if language in ("cpp", "java"):
+        sig = row.signature
+        if language == "java" and not sig:
+            sig = "()"
+        base = [
+            row.namespace,
+            row.type_name,
+            row.subtypes,
+            row.name,
+            sig,
+            "",  # ext (subclass extension column) — unused
+        ]
+        prov = _mad_provenance(row)
+        if row.role == ROLE_SOURCE:
+            return base + [row.access_output, row.model_kind, prov]
+        if row.role == ROLE_SINK:
+            return base + [row.access_input, row.model_kind, prov]
+        if row.role == ROLE_BARRIER:
+            return base + [row.access_output, row.model_kind, prov]
+        return base + [row.access_input, row.access_output, row.model_kind, prov]
+    # (type, path) family — python and javascript share the shapes
+    if row.role == ROLE_SUMMARY:
+        return [
+            row.type_name, row.path,
+            row.access_input, row.access_output, row.model_kind,
+        ]
+    return [row.type_name, row.path, row.model_kind]
+
+
+# ── pack emission ────────────────────────────────────────────────────
+
+_DEFAULT_PACK_PREFIX = "raptor/learned-models"
+
+
+class _PackIdentityLoader(yaml.SafeLoader):
+    """Read manifest structure while refusing YAML alias graphs."""
+
+    def compose_node(self, parent, index):  # type: ignore[no-untyped-def]
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("pack identity aliases are unsupported")
+        return super().compose_node(parent, index)
+
+
+def _require_pack_destination_identity(pack_dir: Path, name: str, language: str) -> None:
+    """Reuse only empty directories or manifests naming the same logical pack."""
+    if pack_dir.is_symlink():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: linked destination")
+    if not pack_dir.exists():
+        return
+    if not pack_dir.is_dir():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: not a directory")
+    models = pack_dir / "models"
+    if models.is_symlink():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: linked models directory")
+    if models.exists() and not models.is_dir():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: models is not a directory")
+    model = models / f"{language}.model.yml"
+    if model.is_symlink():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: linked model file")
+    if model.exists() and not model.is_file():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: model is not a file")
+    manifest = pack_dir / "codeql-pack.yml"
+    if manifest.is_symlink():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: linked manifest")
+    if manifest.exists() and not manifest.is_file():
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: manifest is not a file")
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        if any(pack_dir.iterdir()):
+            raise ValueError(
+                f"cannot reuse pack destination {pack_dir}: populated without a manifest"
+            ) from exc
+        return
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(
+            f"cannot reuse pack destination {pack_dir}: manifest unreadable"
+        ) from exc
+    try:
+        document = yaml.compose(text, Loader=_PackIdentityLoader)
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise ValueError(
+            f"cannot reuse pack destination {pack_dir}: malformed manifest"
+        ) from exc
+    if not isinstance(document, yaml.nodes.MappingNode) or document.tag != "tag:yaml.org,2002:map":
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: unsupported manifest")
+    fields = {}
+    for key, value in document.value:
+        if (
+            not isinstance(key, yaml.nodes.ScalarNode)
+            or key.tag != "tag:yaml.org,2002:str"
+            or key.value in fields
+        ):
+            raise ValueError(
+                f"cannot reuse pack destination {pack_dir}: ambiguous manifest keys"
+            )
+        fields[key.value] = value
+    identity = fields.get("name")
+    if (
+        not isinstance(identity, yaml.nodes.ScalarNode)
+        or identity.tag != "tag:yaml.org,2002:str"
+        or re.fullmatch(r"[a-z][\w-]*/[a-z][\w-]*", identity.value) is None
+    ):
+        raise ValueError(f"cannot reuse pack destination {pack_dir}: unsupported manifest name")
+    if identity.value != name:
+        raise ValueError(
+            f"cannot reuse pack destination {pack_dir}: "
+            f"manifest names {identity.value!r}, requested {name!r}"
+        )
+
+
+def write_extension_pack(
+    rows: Iterable[ModelRow],
+    *,
+    language: str,
+    out_dir: Path,
+    pack_name: str | None = None,
+    pack_version: str = "0.0.0",
+) -> ExtensionPackResult:
+    """Write a CodeQL data-extension pack for *language* under *out_dir*.
+
+    Returns an :class:`ExtensionPackResult` whose ``pack_dir`` feeds
+    ``codeql database analyze --additional-packs`` (see
+    :func:`core.dataflow.codeql_augmented_run.analyze`). Every input
+    row that fails the provenance gate or a cell grammar lands in
+    ``rejected`` with a reason — check ``rows_written`` before running
+    an augmented analysis.
+
+    Existing populated destinations must have a readable mapping manifest
+    with a single text name identifying this same logical pack. Conflicting
+    or unsupported manifests are refused before model files are written;
+    genuinely new destinations and existing empty directories are allowed.
+    Named pack-directory, manifest, models-directory and model-file symlinks
+    and YAML aliases are not supported for reuse. Operator-selected output-root aliases remain
+    supported; this identity check does not provide filesystem confinement.
+
+    Raises :class:`ValueError` for unsupported languages (unverified
+    row shapes are never emitted speculatively) and for a
+    ``pack_name`` outside CodeQL's ``scope/name`` grammar.
+    """
+    if language not in SUPPORTED_LANGUAGES:
+        msg = (
+            f"language {language!r} unsupported; verified layouts exist "
+            f"for {sorted(SUPPORTED_LANGUAGES)}"
+        )
+        raise ValueError(msg)
+    name = pack_name or f"{_DEFAULT_PACK_PREFIX}-{language}"
+    if not re.match(r"^[a-z][\w-]*/[a-z][\w-]*\Z", name):
+        msg = f"pack_name {name!r} is not a valid scope/name"
+        raise ValueError(msg)
+    if not re.match(r"^\d+\.\d+\.\d+\Z", pack_version):
+        msg = f"pack_version {pack_version!r} is not semver"
+        raise ValueError(msg)
+
+    by_predicate: dict[str, set[tuple]] = {}
+    rejected: list[RejectedRow] = []
+    layout = _LANGUAGE_LAYOUTS[language]
+
+    for row in rows:
+        reason = _validate(row, language)
+        if reason:
+            rejected.append(RejectedRow(row=row.summary(), reason=reason))
+            continue
+        predicate = layout[row.role]
+        by_predicate.setdefault(predicate, set()).add(
+            tuple(_cells(row, language))
+        )
+
+    pack_dir = Path(out_dir) / name.replace("/", "-")
+    _require_pack_destination_identity(pack_dir, name, language)
+    models_dir = pack_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    stdlib_pack = _STDLIB_PACK[language]
+    lines = [
+        "# Generated by core.dataflow.extension_pack — do not hand-edit.",
+        "# Learned project vocabulary emitted as models-as-data rows;",
+        "# provenance-gated and cell-validated at emission time.",
+        "extensions:",
+    ]
+    for predicate in sorted(by_predicate):
+        lines.append("  - addsTo:")
+        lines.append(f"      pack: {stdlib_pack}")
+        lines.append(f"      extensible: {predicate}")
+        lines.append("    data:")
+        # json.dumps output is a valid YAML flow sequence; learned
+        # strings cannot escape their cell.
+        lines.extend(f"      - {json.dumps(list(cells))}" for cells in sorted(by_predicate[predicate]))
+    model_file = models_dir / f"{language}.model.yml"
+    model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    (pack_dir / "codeql-pack.yml").write_text(
+        "\n".join([
+            f"name: {name}",
+            f"version: {pack_version}",
+            "library: true",
+            "extensionTargets:",
+            f"  {stdlib_pack}: \"*\"",
+            "dataExtensions:",
+            "  - models/*.model.yml",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    return ExtensionPackResult(
+        pack_dir=pack_dir,
+        model_file=model_file,
+        language=language,
+        pack_name=name,
+        counts={p: len(r) for p, r in sorted(by_predicate.items())},
+        rejected=tuple(rejected),
+    )
+
+
+# ── converters ───────────────────────────────────────────────────────
+
+#: IRIS taint_class → MaD source kind (best-effort defaults; callers
+#: may override via the converter's kind maps).
+DEFAULT_SOURCE_KINDS: Mapping[str, str] = {
+    "remote": "remote",
+    "network": "remote",
+    "http": "remote",
+    "file": "file",
+    "filesystem": "file",
+    "environment": "environment",
+    "env": "environment",
+    "commandargs": "commandargs",
+    "argv": "commandargs",
+    "stdin": "stdin",
+    "database": "database",
+}
+DEFAULT_SOURCE_KIND_FALLBACK = "local"
+
+#: IRIS taint_class → MaD sink kind.
+DEFAULT_SINK_KINDS: Mapping[str, str] = {
+    "command_injection": "command-injection",
+    "os_command": "command-injection",
+    "sql_injection": "sql-injection",
+    "sql": "sql-injection",
+    "path_traversal": "path-injection",
+    "path_injection": "path-injection",
+    "code_injection": "code-injection",
+    "eval": "code-injection",
+    "ssrf": "request-forgery",
+    "request_forgery": "request-forgery",
+    "log_injection": "log-injection",
+    "url_redirect": "url-redirection",
+}
+
+#: CandidateValidator semantics_tag → the sink kind the barrier
+#: neutralizes (cpp barrierModel only).
+DEFAULT_BARRIER_KINDS: Mapping[str, str] = {
+    "sql_escape": "sql-injection",
+    "path_normalize": "path-injection",
+    "url_allowlist": "request-forgery",
+}
+
+#: Minimum evidence tier for spec-derived rows (inclusive).
+DEFAULT_MIN_TIER = EvidenceTier.XREF_BACKED
+
+
+@dataclass(frozen=True)
+class ConversionResult:
+    rows: tuple[ModelRow, ...]
+    rejected: tuple[RejectedRow, ...] = field(default_factory=tuple)
+
+
+def _split_cpp_function(qualified: str) -> tuple[str, str]:
+    """``ns::sub::fn`` → (``ns::sub``, ``fn``); bare name → ("", name)."""
+    if "::" in qualified:
+        ns, _, fn = qualified.rpartition("::")
+        return ns, fn
+    return "", qualified
+
+
+def _split_python_function(qualified: str) -> tuple[str, str]:
+    """``pkg.mod.fn`` → (``pkg.mod``, ``fn``); bare name → ("", name)."""
+    if "." in qualified:
+        mod, _, fn = qualified.rpartition(".")
+        return mod, fn
+    return "", qualified
+
+
+def rows_from_taint_specs(
+    specs: Sequence,
+    *,
+    language: str,
+    min_confidence: float = 0.6,
+    min_tier: EvidenceTier = DEFAULT_MIN_TIER,
+    source_kinds: Mapping[str, str] = DEFAULT_SOURCE_KINDS,
+    sink_kinds: Mapping[str, str] = DEFAULT_SINK_KINDS,
+    deref_cpp_args: bool = True,
+) -> ConversionResult:
+    """Convert IRIS :class:`~core.iris.specs.TaintSpec` records to rows.
+
+    Gates: ``evidence_tier`` at or above *min_tier* (specs below it
+    are LLM output that never earned corroboration) and ``confidence``
+    at or above *min_confidence*. Sanitiser specs become cpp barrier
+    rows; python sanitisers are rejected with a directed reason (no
+    barrierModel predicate upstream). Propagator specs become summary
+    rows. ``deref_cpp_args`` emits ``Argument[*N]`` (pointer content —
+    the common case for C string/buffer APIs) instead of
+    ``Argument[N]``.
+    """
+    rows: list[ModelRow] = []
+    rejected: list[RejectedRow] = []
+    min_rank = TIER_RANK[min_tier]
+
+    for spec in specs:
+        label = f"{spec.role}:{spec.function}"
+        if TIER_RANK.get(spec.evidence_tier, -1) < min_rank:
+            rejected.append(RejectedRow(
+                row=label,
+                reason=(
+                    f"evidence tier {spec.evidence_tier.value} below "
+                    f"{min_tier.value}"
+                ),
+            ))
+            continue
+        if spec.confidence < min_confidence:
+            rejected.append(RejectedRow(
+                row=label,
+                reason=f"confidence {spec.confidence} below {min_confidence}",
+            ))
+            continue
+
+        provenance = "iris_refined"
+        if language == "cpp":
+            ns, fn = _split_cpp_function(spec.function)
+            arg = (lambda i: f"Argument[*{i}]") if deref_cpp_args else (
+                lambda i: f"Argument[{i}]")
+            common = dict(namespace=ns, name=fn, provenance=provenance,
+                          confidence=spec.confidence)
+        elif language == "javascript":
+            js_type, js_members = js_coordinate(spec.function)
+            mod = js_type  # non-empty by construction; see js_coordinate
+            member = js_members
+            common = dict(type_name=js_type, provenance=provenance,
+                          confidence=spec.confidence)
+        else:
+            mod, fn = _split_python_function(spec.function)
+            member = f"Member[{fn}]" if mod else fn
+            common = dict(type_name=mod or fn, provenance=provenance,
+                          confidence=spec.confidence)
+
+        if spec.role == "source":
+            kind = DEFAULT_SOURCE_KIND_FALLBACK
+            for tc in spec.taint_classes:
+                if tc in source_kinds:
+                    kind = source_kinds[tc]
+                    break
+            if not spec.return_tainted:
+                rejected.append(RejectedRow(
+                    row=label,
+                    reason="source spec without return_tainted has no "
+                           "expressible output access",
+                ))
+                continue
+            if language == "cpp":
+                rows.append(ModelRow(role=ROLE_SOURCE, model_kind=kind,
+                                     access_output="ReturnValue", **common))
+            else:
+                rows.append(ModelRow(
+                    role=ROLE_SOURCE, model_kind=kind,
+                    path=f"{member}.ReturnValue" if mod else "ReturnValue",
+                    **common))
+        elif spec.role == "sink":
+            kind = None
+            for tc in spec.taint_classes:
+                if tc in sink_kinds:
+                    kind = sink_kinds[tc]
+                    break
+            if kind is None:
+                rejected.append(RejectedRow(
+                    row=label,
+                    reason=(
+                        f"no sink kind mapping for taint_classes "
+                        f"{spec.taint_classes!r}"
+                    ),
+                ))
+                continue
+            params = spec.params_affected or [0]
+            for i in params:
+                if language == "cpp":
+                    rows.append(ModelRow(role=ROLE_SINK, model_kind=kind,
+                                         access_input=arg(i), **common))
+                else:
+                    rows.append(ModelRow(
+                        role=ROLE_SINK, model_kind=kind,
+                        path=(f"{member}.Argument[{i}]" if mod
+                              else f"Argument[{i}]"),
+                        **common))
+        elif spec.role == "sanitiser":
+            if language != "cpp":
+                # python-all has no barrierModel predicate;
+                # javascript-all declares one but the layout excludes
+                # it — the dynamic-language barrier channel stays
+                # closed in the suppression direction either way.
+                rejected.append(RejectedRow(
+                    row=label,
+                    reason="sanitiser specs map to barrierModel, which "
+                           "only codeql/cpp-all provides here; use QL "
+                           "barrier synthesis for python, and the "
+                           "javascript barrier channel stays closed",
+                ))
+                continue
+            kind = None
+            for tc in spec.taint_classes:
+                if tc in sink_kinds:
+                    kind = sink_kinds[tc]
+                    break
+            if kind is None:
+                rejected.append(RejectedRow(
+                    row=label,
+                    reason=(
+                        f"no barrier kind mapping for taint_classes "
+                        f"{spec.taint_classes!r}"
+                    ),
+                ))
+                continue
+            out = "ReturnValue" if spec.return_tainted else arg(
+                (spec.params_affected or [0])[0])
+            rows.append(ModelRow(role=ROLE_BARRIER, model_kind=kind,
+                                 access_output=out, **common))
+        elif spec.role == "propagator":
+            params = spec.params_affected or [0]
+            if any(index != params[0] for index in params[1:]):
+                rejected.append(RejectedRow(
+                    row=label,
+                    reason="propagator has multiple distinct affected parameters; "
+                           "only single-input-to-return summaries are supported",
+                ))
+                continue
+            if language == "cpp":
+                rows.append(ModelRow(role=ROLE_SUMMARY, model_kind="taint",
+                                     access_input=arg(params[0]),
+                                     access_output="ReturnValue", **common))
+            elif not mod:
+                rejected.append(RejectedRow(
+                    row=label,
+                    reason="python propagator needs a module-qualified "
+                           "name (bare names have no type path)",
+                ))
+                continue
+            else:
+                rows.append(ModelRow(
+                    role=ROLE_SUMMARY, model_kind="taint",
+                    path=member,
+                    access_input=f"Argument[{params[0]}]",
+                    access_output="ReturnValue", **common))
+        else:
+            rejected.append(RejectedRow(row=label,
+                                        reason=f"role {spec.role!r} unknown"))
+    return ConversionResult(rows=tuple(rows), rejected=tuple(rejected))
+
+
+def rows_from_candidate_validators(
+    candidates: Sequence,
+    *,
+    language: str,
+    min_confidence: float = 0.6,
+    barrier_kinds: Mapping[str, str] = DEFAULT_BARRIER_KINDS,
+) -> ConversionResult:
+    """Convert :class:`CandidateValidator` sanitizer records to barrier
+    rows (cpp only — see :func:`rows_from_taint_specs` for the python
+    rationale). The validator's sanitized value is modelled as its
+    return value; semantics tags without a barrier-kind mapping
+    (``auth_check``, ``rate_limit``, ``other``…) are rejected because
+    they don't neutralize a dataflow sink kind.
+    """
+    rows: list[ModelRow] = []
+    rejected: list[RejectedRow] = []
+    for cand in candidates:
+        label = f"barrier:{cand.qualified_name}"
+        if cand.confidence < min_confidence:
+            rejected.append(RejectedRow(
+                row=label,
+                reason=f"confidence {cand.confidence} below {min_confidence}",
+            ))
+            continue
+        if language != "cpp":
+            rejected.append(RejectedRow(
+                row=label,
+                reason="barrierModel rows are cpp-only; use QL barrier "
+                       "synthesis for python",
+            ))
+            continue
+        kind = barrier_kinds.get(cand.semantics_tag)
+        if kind is None:
+            rejected.append(RejectedRow(
+                row=label,
+                reason=(
+                    f"semantics_tag {cand.semantics_tag!r} has no "
+                    "barrier-kind mapping"
+                ),
+            ))
+            continue
+        ns, fn = _split_cpp_function(cand.qualified_name)
+        provenance = {
+            "llm": "llm_extracted",
+            "annotation": "annotation",
+            "framework_catalog": "framework_catalog",
+        }.get(cand.extraction_provenance, cand.extraction_provenance)
+        rows.append(ModelRow(
+            role=ROLE_BARRIER,
+            namespace=ns,
+            name=fn,
+            access_output="ReturnValue",
+            model_kind=kind,
+            provenance=provenance,
+            confidence=cand.confidence,
+        ))
+    return ConversionResult(rows=tuple(rows), rejected=tuple(rejected))

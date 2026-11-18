@@ -1,0 +1,725 @@
+"""Tests for nosemgrep inline-suppression extraction and SARIF annotation."""
+
+import json
+import os
+import shutil
+import sys
+
+import pytest
+from pathlib import Path
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from core.audit.tests._live_transport import run_pinned_subprocess
+from packages.semgrep.nosemgrep import annotate_sarif, extract_nosemgrep
+
+
+# ── extract_nosemgrep ────────────────────────────────────────────────────────
+
+
+class TestExtractNosemgrep:
+    def test_inline_same_line(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep: python.eval-usage\n")
+        result = extract_nosemgrep(src, 1)
+        assert result is not None
+        assert result["suppressed"] is True
+        assert result["rule_ids"] == ["python.eval-usage"]
+        assert result["comment_line"] == 1
+
+    def test_comment_line_above(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("# nosemgrep: rule-id reason text\nx = eval(inp)\n")
+        result = extract_nosemgrep(src, 2)
+        assert result is not None
+        assert result["rule_ids"] == ["rule-id"]
+        assert result["justification"] == "reason text"
+        assert result["comment_line"] == 1
+
+    def test_blanket_suppression(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        result = extract_nosemgrep(src, 1)
+        assert result is not None
+        assert result["rule_ids"] == []
+        assert result["justification"] is None
+
+    def test_multiple_rule_ids(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep: rule-a,rule-b,rule-c\n")
+        result = extract_nosemgrep(src, 1)
+        assert result["rule_ids"] == ["rule-a", "rule-b", "rule-c"]
+
+    def test_c_style_comment(self, tmp_path):
+        src = tmp_path / "a.c"
+        src.write_text("strcpy(dst, src); // nosemgrep: cwe-120\n")
+        result = extract_nosemgrep(src, 1)
+        assert result is not None
+        assert result["rule_ids"] == ["cwe-120"]
+
+    def test_block_comment(self, tmp_path):
+        src = tmp_path / "a.c"
+        src.write_text("strcpy(dst, src); /* nosemgrep: cwe-120 */\n")
+        result = extract_nosemgrep(src, 1)
+        assert result is not None
+
+    def test_no_nosemgrep(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)\ny = 42\n")
+        assert extract_nosemgrep(src, 1) is None
+        assert extract_nosemgrep(src, 2) is None
+
+    def test_missing_file(self, tmp_path):
+        assert extract_nosemgrep(tmp_path / "missing.py", 1) is None
+
+    def test_line_out_of_range(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = 1\n")
+        assert extract_nosemgrep(src, 100) is None
+
+    def test_justification_with_colon_in_rule(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text(
+            "x = eval(inp)  # nosemgrep: python.lang.eval-usage safe constant\n"
+        )
+        result = extract_nosemgrep(src, 1)
+        assert result["rule_ids"] == ["python.lang.eval-usage"]
+        assert result["justification"] == "safe constant"
+
+    def test_preloaded_lines(self, tmp_path):
+        lines = ["x = eval(inp)  # nosemgrep: rule-id reason"]
+        result = extract_nosemgrep(tmp_path / "unused.py", 1, _lines=lines)
+        assert result is not None
+        assert result["rule_ids"] == ["rule-id"]
+
+
+# ── annotate_sarif ───────────────────────────────────────────────────────────
+
+
+def _make_sarif_data(results, tool_name=None):
+    run = {"results": results}
+    if tool_name:
+        run["tool"] = {"driver": {"name": tool_name}}
+    return {"runs": [run]}
+
+
+def _make_result(uri, line):
+    return {
+        "ruleId": "test.rule",
+        "message": {"text": "test"},
+        "level": "warning",
+        "locations": [{
+            "physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": {"startLine": line},
+            },
+        }],
+    }
+
+
+class TestAnnotateSarif:
+    def test_annotates_suppressed_result(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep: test.rule safe use\n")
+        result = _make_result("a.py", 1)
+        sarif = _make_sarif_data([result])
+
+        count = annotate_sarif(sarif, str(tmp_path))
+
+        assert count == 1
+        nosem = result["properties"]["nosemgrep"]
+        assert nosem["suppressed"] is True
+        assert nosem["rule_ids"] == ["test.rule"]
+        assert nosem["justification"] == "safe use"
+
+    def test_skips_unsuppressed_result(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)\n")
+        result = _make_result("a.py", 1)
+        sarif = _make_sarif_data([result])
+
+        count = annotate_sarif(sarif, str(tmp_path))
+
+        assert count == 0
+        assert "properties" not in result or "nosemgrep" not in result.get("properties", {})
+
+    def test_mixed_results(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\ny = eval(inp)\n")
+        r1 = _make_result("a.py", 1)
+        r2 = _make_result("a.py", 2)
+        sarif = _make_sarif_data([r1, r2])
+
+        count = annotate_sarif(sarif, str(tmp_path))
+
+        assert count == 1
+        assert "nosemgrep" in r1.get("properties", {})
+        assert "nosemgrep" not in r2.get("properties", {})
+
+    def test_missing_file_graceful(self, tmp_path):
+        result = _make_result("missing.py", 1)
+        sarif = _make_sarif_data([result])
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 0
+
+    def test_preserves_existing_properties(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        result = _make_result("a.py", 1)
+        result["properties"] = {"cwe": "CWE-94"}
+        sarif = _make_sarif_data([result])
+
+        annotate_sarif(sarif, str(tmp_path))
+
+        assert result["properties"]["cwe"] == "CWE-94"
+        assert result["properties"]["nosemgrep"]["suppressed"] is True
+
+    def test_file_uri_prefix(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        abs_path = str(src)
+        result = _make_result(f"file://{abs_path}", 1)
+        sarif = _make_sarif_data([result])
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 1
+
+    def test_skips_codeql_run(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        result = _make_result("a.py", 1)
+        sarif = _make_sarif_data([result], tool_name="CodeQL")
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 0
+        assert "nosemgrep" not in result.get("properties", {})
+
+    def test_skips_coccinelle_run(self, tmp_path):
+        src = tmp_path / "a.c"
+        src.write_text("strcpy(dst, src); // nosemgrep\n")
+        result = _make_result("a.c", 1)
+        sarif = _make_sarif_data([result], tool_name="coccinelle")
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 0
+
+    def test_annotates_semgrep_run(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        result = _make_result("a.py", 1)
+        sarif = _make_sarif_data([result], tool_name="Semgrep OSS")
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 1
+
+    def test_annotates_unnamed_tool_run(self, tmp_path):
+        """Runs without tool.driver.name (legacy SARIF) are assumed semgrep."""
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        result = _make_result("a.py", 1)
+        sarif = _make_sarif_data([result])  # no tool_name
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 1
+
+    def test_mixed_tool_runs(self, tmp_path):
+        """Only semgrep run annotated, CodeQL run skipped."""
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep\n")
+        r_sem = _make_result("a.py", 1)
+        r_cql = _make_result("a.py", 1)
+        sarif = {
+            "runs": [
+                {"tool": {"driver": {"name": "Semgrep OSS"}}, "results": [r_sem]},
+                {"tool": {"driver": {"name": "CodeQL"}}, "results": [r_cql]},
+            ]
+        }
+
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 1
+        assert "nosemgrep" in r_sem.get("properties", {})
+        assert "nosemgrep" not in r_cql.get("properties", {})
+
+
+class TestAnnotateSarifContainment:
+    """URIs derive from SARIF over an untrusted repo — reads must stay
+    under the repo root (out-of-tree files must never be quoted into
+    properties.nosemgrep.justification)."""
+
+    def _outside(self, tmp_path):
+        outside = tmp_path / "outside.py"
+        outside.write_text("x = 1  # nosemgrep: test.rule leaked-text\n")
+        root = tmp_path / "repo"
+        root.mkdir()
+        return outside, root
+
+    def test_file_uri_outside_root_refused(self, tmp_path):
+        outside, root = self._outside(tmp_path)
+        result = _make_result(f"file://{outside}", 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(root)) == 0
+        assert "properties" not in result
+
+    def test_absolute_uri_outside_root_refused(self, tmp_path):
+        outside, root = self._outside(tmp_path)
+        result = _make_result(str(outside), 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(root)) == 0
+        assert "properties" not in result
+
+    def test_traversal_uri_refused(self, tmp_path):
+        _outside, root = self._outside(tmp_path)
+        result = _make_result("../outside.py", 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(root)) == 0
+        assert "properties" not in result
+
+    def test_file_uri_inside_root_still_annotates(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep: test.rule ok\n")
+        result = _make_result(f"file://{src}", 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+
+
+# ── build_cmd flag ───────────────────────────────────────────────────────────
+
+
+class TestBuildCmdDisableNosemgrep:
+    def test_disable_nosemgrep_in_cmd(self):
+        from packages.semgrep.runner import build_cmd
+        cmd = build_cmd(Path("/src"), "p/security-audit")
+        assert "--disable-nosem" in cmd
+
+
+class TestAnnotateSarifMalformedShapes:
+    """One malformed result must never abort the whole SARIF merge.
+
+    Explicit ``null`` / wrong-typed nodes at any level read as absent;
+    well-formed sibling results still get annotated.
+    """
+
+    @staticmethod
+    def _suppressed_source(tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text(
+            "x = eval(inp)  # nosemgrep: test.rule safe use\n",
+        )
+        return src
+
+    def _assert_sibling_survives(self, tmp_path, bad_result):
+        self._suppressed_source(tmp_path)
+        good = _make_result("a.py", 1)
+        sarif = _make_sarif_data([bad_result, good])
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+        assert good["properties"]["nosemgrep"]["suppressed"] is True
+
+    def test_null_physical_location(self, tmp_path):
+        self._assert_sibling_survives(
+            tmp_path, {"locations": [{"physicalLocation": None}]},
+        )
+
+    def test_null_artifact_location_and_region(self, tmp_path):
+        self._assert_sibling_survives(tmp_path, {
+            "locations": [{"physicalLocation": {
+                "artifactLocation": None, "region": None,
+            }}],
+        })
+
+    def test_wrong_typed_uri_and_line(self, tmp_path):
+        self._assert_sibling_survives(tmp_path, {
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": 7},
+                "region": {"startLine": "12"},
+            }}],
+        })
+
+    def test_null_locations_and_results(self, tmp_path):
+        self._suppressed_source(tmp_path)
+        good = _make_result("a.py", 1)
+        sarif = {"runs": [
+            {"results": None},
+            {"results": [{"locations": None}, good]},
+        ]}
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+
+    def test_null_tool_and_driver(self, tmp_path):
+        self._suppressed_source(tmp_path)
+        good = _make_result("a.py", 1)
+        sarif = {"runs": [{"tool": None, "results": [good]}]}
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+        sarif2 = {"runs": [{"tool": {"driver": None},
+                            "results": [_make_result("a.py", 1)]}]}
+        assert annotate_sarif(sarif2, str(tmp_path)) == 1
+
+    def test_null_runs_returns_zero(self, tmp_path):
+        assert annotate_sarif({"runs": None}, str(tmp_path)) == 0
+
+    def test_non_dict_properties_skipped_not_clobbered(self, tmp_path):
+        self._suppressed_source(tmp_path)
+        bad = _make_result("a.py", 1)
+        bad["properties"] = "already-a-string"
+        good = _make_result("a.py", 1)
+        sarif = _make_sarif_data([bad, good])
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+        assert bad["properties"] == "already-a-string"
+
+
+class TestStandaloneReadIsCapped:
+    def test_extract_nosemgrep_routes_through_the_capped_reader(
+        self, tmp_path, monkeypatch,
+    ):
+        """The standalone path (no _lines) must use the same capped
+        read as annotate_sarif's _FileCache — it read files
+        unbounded."""
+        import packages.semgrep.nosemgrep as ns
+
+        f = tmp_path / "a.py"
+        f.write_text("x = 1  # nosemgrep: rule1\n")
+        calls = {"n": 0}
+        real = ns.read_text_capped
+
+        def counting(path, *a, **kw):
+            calls["n"] += 1
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(ns, "read_text_capped", counting)
+
+        def _no_unbounded(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("unbounded Path.read_text used")
+
+        monkeypatch.setattr(Path, "read_text", _no_unbounded)
+        got = extract_nosemgrep(f, 1)
+        assert got is not None and got["suppressed"] is True
+        assert calls["n"] == 1
+
+
+class TestLineModelDesync:
+    r"""Suppression lookups speak semgrep's \n line model.
+
+    Semgrep counts \n only; splitlines() also breaks on \f — legal
+    inside a string literal.  The shifted index read a standalone
+    nosemgrep comment TWO physical lines above the finding (which per
+    semgrep's spec suppresses nothing at the finding line: semgrep's
+    own nosem enforcement still reports it) and forged a
+    developer-suppressed annotation for downstream consumers.
+    """
+
+    TARGET = (
+        'S = "a\x0cb"\n'          # 1: form feed inside a string literal
+        "x = input()\n"           # 2
+        "# nosemgrep: x1-eval\n"  # 3: suppresses line 4 only
+        "y = 1\n"                 # 4
+        "z = eval(x)\n"           # 5: the finding (semgrep says line 5)
+    )
+
+    def test_string_literal_form_feed_cannot_forge_suppression(
+        self, tmp_path,
+    ):
+        src = tmp_path / "a.py"
+        src.write_bytes(self.TARGET.encode())
+        assert extract_nosemgrep(src, 5) is None
+
+    def test_the_comment_still_suppresses_its_own_next_line(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_bytes(self.TARGET.encode())
+        got = extract_nosemgrep(src, 4)
+        assert got is not None and got["suppressed"] is True
+        assert got["rule_ids"] == ["x1-eval"]
+        assert got["comment_line"] == 3
+
+    def test_annotate_sarif_cache_path_shares_the_model(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_bytes(self.TARGET.encode())
+        sarif = {
+            "runs": [{"results": [{
+                "ruleId": "x1-eval",
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": "a.py"},
+                    "region": {"startLine": 5},
+                }}],
+            }]}],
+        }
+        assert annotate_sarif(sarif, tmp_path) == 0
+        props = sarif["runs"][0]["results"][0].get("properties", {})
+        assert "nosemgrep" not in props
+
+    def test_bare_carriage_return_cannot_forge_suppression(self, tmp_path):
+        # Same forgery with the OTHER plantable byte: semgrep keeps a
+        # bare \r inside the line (it is not a line break), so the
+        # eval is its \n-line 4 — the read must not translate the \r
+        # into a break either.
+        src = tmp_path / "a.py"
+        src.write_bytes(
+            b's = "a\rb"\n# nosemgrep: x1-eval\ny = 1\nz = eval(x)\n')
+        assert extract_nosemgrep(src, 4) is None
+        got = extract_nosemgrep(src, 3)
+        assert got is not None and got["comment_line"] == 2
+
+
+class TestNosemgrepFindingSurvivesAnnotation:
+    """Evasion regression: a finding on a # nosemgrep-marked line must
+    survive annotate_sarif — the annotation records the suppression
+    attempt but never removes the finding (--disable-nosem means
+    semgrep already ignored the comment)."""
+
+    def test_finding_survives_with_annotation(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(input())  # nosemgrep: python.eval\n")
+        sarif = {
+            "runs": [{
+                "tool": {"driver": {"name": "Semgrep OSS"}},
+                "results": [{
+                    "ruleId": "python.eval",
+                    "locations": [{"physicalLocation": {
+                        "artifactLocation": {"uri": "a.py"},
+                        "region": {"startLine": 1},
+                    }}],
+                }],
+            }],
+        }
+        count = annotate_sarif(sarif, str(tmp_path))
+        assert count == 1
+        results = sarif["runs"][0]["results"]
+        assert len(results) == 1, "finding must not be removed"
+        props = results[0].get("properties", {})
+        assert props["nosemgrep"]["suppressed"] is True
+        assert "python.eval" in props["nosemgrep"]["rule_ids"]
+
+
+@pytest.mark.parametrize("selected,rule_id,applies", [
+    ("alpha", "pack.alpha", True),
+    ("group.alpha", "pack.group.alpha", True),
+    ("alpha", "pack.notalpha", False),
+    ("pha", "pack.alpha", False),
+    ("alpha", "pack.beta", False),
+    ("alpha", "", False),
+    ("alpha, beta", "pack.beta", True),
+    ("alpha,", "pack.alpha", True),
+    ("alpha,", "pack.beta", False),
+    ("alpha, beta,", "pack.beta", True),
+    ("alpha, beta ,", "pack.alpha", True),
+    ("alpha, ", "pack.alpha", True),
+    ("alpha, ", "pack.notalpha", False),
+])
+def test_annotation_respects_selected_rule(tmp_path, selected, rule_id, applies):
+    (tmp_path / "a.py").write_text(f"subject(value) # nosemgrep: {selected}\n")
+    result = _make_result("a.py", 1)
+    result["ruleId"] = rule_id
+    sarif = _make_sarif_data([result])
+    assert annotate_sarif(sarif, str(tmp_path)) == int(applies)
+    assert bool(result.get("properties", {}).get("nosemgrep")) is applies
+    assert sarif["runs"][0]["results"] == [result]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("semgrep") is None, reason="semgrep not installed")
+def test_native_rule_scoped_suppression_annotation(tmp_path):
+    config = tmp_path / "rules.json"
+    config.write_text(json.dumps({"rules": [{
+        "id": name, "languages": ["python"], "message": "owned suppression scope",
+        "severity": "WARNING", "pattern": "subject(...)",
+    } for name in ("group.alpha", "group.beta", "notalpha")]}))
+    source = tmp_path / "case.py"
+    source.write_text(
+        "subject(value) # nosemgrep: alpha\n"
+        "subject(value) # nosemgrep: group.alpha\n"
+        "subject(value) # nosemgrep: pha\n"
+        "subject(value) # nosemgrep: notalpha\n"
+        "subject(value) # nosemgrep: group\n"
+        "subject(value) # nosemgrep: group.alpha,group.beta\n"
+        "subject(value) # nosemgrep: group.alpha, group.beta\n"
+        "subject(value) # nosemgrep\n"
+        "# nosemgrep: group.alpha\n"
+        "subject(value) # nosemgrep: group.beta\n"
+        "subject(value) # nosem: group.alpha\n"
+        "subject(value) # NOSEMGREP: group.alpha\n"
+        "subject(value) # NoSeM: group.alpha\n"
+        "subject(value) # NOSEM\n"
+        "subject(value) # NoSeMgReP\n"
+        "subject(value) # nosemgrep: group.alpha,\n"
+        "subject(value) # nosemgrep: group.alpha, group.beta,\n"
+        "subject(value) # nosemgrep: group.alpha, group.beta ,\n"
+        "subject(value) # nosemgrep: group.alpha, \n"
+    )
+    command = ["semgrep", "scan", "--config", str(config), "--metrics", "off",
+               "--disable-version-check", "--jobs", "1"]
+    env = {**os.environ, "SEMGREP_SETTINGS_FILE": str(tmp_path / "settings.yml"),
+           "SEMGREP_LOG_FILE": str(tmp_path / "semgrep.log")}
+    native = run_pinned_subprocess(
+        [*command, "--json", str(source)], timeout=180,
+        context="native rule suppression", skip_signals=(9,), env=env,
+    )
+    assert native.returncode == 0, native.stderr
+    native_data = json.loads(native.stdout)
+    assert not native_data.get("errors"), native_data.get("errors")
+    assert {Path(path).name for path in native_data["paths"]["scanned"]} == {source.name}
+    raw = run_pinned_subprocess(
+        [*command, "--disable-nosem", "--sarif", str(source)], timeout=180,
+        context="suppression annotation comparison", skip_signals=(9,), env=env,
+    )
+    assert raw.returncode == 0, raw.stderr
+    sarif = json.loads(raw.stdout)
+    rows = [result for run in sarif["runs"] for result in run.get("results", [])]
+    all_findings = {(result["ruleId"], result["locations"][0]["physicalLocation"]["region"]["startLine"])
+                    for result in rows}
+    active = {(result["check_id"], result["start"]["line"])
+              for result in native_data["results"]}
+    assert len(rows) == len(all_findings) == 54
+    expected_suppressed = all_findings - active
+    assert expected_suppressed and active
+    assert annotate_sarif(sarif, str(tmp_path)) == len(expected_suppressed)
+    annotated = {(result["ruleId"], result["locations"][0]["physicalLocation"]["region"]["startLine"])
+                 for result in rows if result.get("properties", {}).get("nosemgrep", {}).get("suppressed") is True}
+    assert annotated == expected_suppressed
+    assert [result for run in sarif["runs"] for result in run["results"]] == rows
+    from core.sarif.parser import generate_scan_metrics
+
+    report = tmp_path / "annotated.sarif"
+    report.write_text(json.dumps(sarif))
+    metrics = generate_scan_metrics([str(report)])
+    assert metrics["total_findings"] == 54
+    assert metrics["nosemgrep_suppressed_count"] == len(expected_suppressed)
+    assert metrics["total_findings"] - metrics["nosemgrep_suppressed_count"] == len(active)
+
+
+@pytest.mark.parametrize("marker", ["nosem", "NOSEM", "NoSeM", "NOSEMGREP", "NoSeMgReP"])
+def test_native_marker_aliases_keep_rule_scope(tmp_path, marker):
+    (tmp_path / "a.py").write_text(f"subject(value) # {marker}: test.rule\n")
+    matching = _make_result("a.py", 1)
+    other = _make_result("a.py", 1)
+    other["ruleId"] = "other.rule"
+    sarif = _make_sarif_data([matching, other])
+    assert annotate_sarif(sarif, str(tmp_path)) == 1
+    assert matching["properties"]["nosemgrep"]["rule_ids"] == ["test.rule"]
+    assert "nosemgrep" not in other.get("properties", {})
+
+
+@pytest.mark.parametrize("marker", ["nosemgrepx", "nosem_not", "xNOSEM"])
+def test_marker_alias_requires_complete_keyword(tmp_path, marker):
+    source = tmp_path / "a.py"
+    source.write_text(f"subject(value) # {marker}: test.rule\n")
+    assert extract_nosemgrep(source, 1) is None
+
+
+@pytest.mark.parametrize("mode", ["standalone", "annotation"])
+@pytest.mark.parametrize("text,cap,line,applies", [
+    ("subject(value) # nosemgrep: other.rule\n", len("subject(value) # nosemgrep"), 1, False),
+    ("# nosemgrep: other.rule\nsubject(value)\n", len("# nosemgrep"), 2, False),
+    ("subject(value) # nosemgrep: test.rule\n" + "x" * 100,
+     len("subject(value) # nosemgrep: test.rule\n") + 5, 1, True),
+    ("# nosemgrep: test.rule\nsubject(value)\n", len("# nosemgrep: test.rule\n"), 2, True),
+    ("subject(value) # nosemgrep: test.rule", len("subject(value) # nosemgrep: test.rule"), 1, True),
+])
+def test_only_complete_capped_lines_establish_suppression(tmp_path, monkeypatch, mode, text, cap, line, applies):
+    from packages.semgrep import nosemgrep
+
+    source = tmp_path / "case.py"
+    source.write_text(text)
+    reader_name = "read_text_capped" if mode == "standalone" else "read_contained_text_capped"
+    read = getattr(nosemgrep, reader_name)
+
+    def bounded(*args, **kwargs):
+        return read(*args, max_chars=cap, **kwargs)
+
+    monkeypatch.setattr(nosemgrep, reader_name, bounded)
+    if mode == "standalone":
+        info = extract_nosemgrep(source, line, rule_id="test.rule")
+        assert bool(info) is applies
+    else:
+        result = _make_result("case.py", line)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(tmp_path)) == int(applies)
+        assert bool(result.get("properties", {}).get("nosemgrep")) is applies
+        assert sarif["runs"][0]["results"] == [result]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("semgrep") is None, reason="semgrep not installed")
+def test_native_capped_source_cannot_create_unscoped_suppression(tmp_path):
+    from core.sarif.parser import generate_scan_metrics
+    from core.source import read_text_capped
+    from core.source.contained import DEFAULT_MAX_SOURCE_CHARS
+    from packages.semgrep.runner import build_cmd
+
+    cap = DEFAULT_MAX_SOURCE_CHARS
+    marker = "# nosemgrep"
+    prefix = "#" + " " * (cap - len(marker) - 1) + marker
+    source = tmp_path / "case.py"
+    source.write_text(prefix + ": beta\nsubject(value)\n")
+    got = read_text_capped(source, newline="")
+    assert got == (prefix, True)
+    config = tmp_path / "rules.json"
+    config.write_text(json.dumps({"rules": [{
+        "id": name, "languages": ["python"], "message": "owned capped source",
+        "severity": "WARNING", "pattern": "subject(...)",
+    } for name in ("alpha", "beta")]}))
+    metadata = tmp_path / "native.json"
+    command = build_cmd(
+        source, str(config), json_output_path=metadata,
+        extra_args=["--max-target-bytes", str(cap * 2)], scope_isolation=False,
+    )
+    proc = run_pinned_subprocess(
+        command, timeout=120, context="capped suppression source", skip_signals=(9,),
+        env={**os.environ, "SEMGREP_SETTINGS_FILE": str(tmp_path / "settings.yml"),
+             "SEMGREP_LOG_FILE": str(tmp_path / "semgrep.log")},
+    )
+    # The production command uses --error: findings legitimately return 1.
+    assert proc.returncode in (0, 1), proc.stderr
+    native = json.loads(metadata.read_text())
+    assert not native.get("errors"), native.get("errors")
+    assert {Path(path).name for path in native["paths"]["scanned"]} == {source.name}
+    sarif = json.loads(proc.stdout)
+    rows = [result for run in sarif["runs"] for result in run.get("results", [])]
+    assert len(rows) == 2
+    assert {result["locations"][0]["physicalLocation"]["region"]["startLine"] for result in rows} == {2}
+    assert annotate_sarif(sarif, str(tmp_path)) == 0
+    assert all("nosemgrep" not in result.get("properties", {}) for result in rows)
+    report = tmp_path / "annotated.sarif"
+    report.write_text(json.dumps(sarif))
+    metrics = generate_scan_metrics([str(report)])
+    assert metrics["total_findings"] == 2
+    assert metrics["nosemgrep_suppressed_count"] == 0
+
+
+@pytest.mark.parametrize('indexed', [False, True])
+@pytest.mark.parametrize('directive_at_source', [False, True])
+def test_suppression_reads_the_run_owned_source(tmp_path, indexed, directive_at_source):
+    source_dir = tmp_path / 'src'
+    source_dir.mkdir()
+    directive = 'x = value  # nosemgrep: test.rule owned directive\n'
+    plain = 'x = value\n'
+    (tmp_path / 'owned.py').write_text(plain if directive_at_source else directive)
+    (source_dir / 'owned.py').write_text(directive if directive_at_source else plain)
+    result = _make_result('owned.py', 1)
+    artifact = result['locations'][0]['physicalLocation']['artifactLocation']
+    artifact['uriBaseId'] = 'SOURCE'
+    sarif = _make_sarif_data([result])
+    run = sarif['runs'][0]
+    run['originalUriBaseIds'] = {'SOURCE': {'uri': 'src/'}}
+    if indexed:
+        run['artifacts'] = [{'location': dict(artifact)}]
+        result['locations'][0]['physicalLocation']['artifactLocation'] = {'index': 0}
+
+    assert annotate_sarif(sarif, str(tmp_path)) == int(directive_at_source)
+    assert bool(result.get('properties', {}).get('nosemgrep')) is directive_at_source
+
+
+@pytest.mark.parametrize('reference,applies', [
+    ({'ruleIndex': 0}, True),
+    ({'ruleIndex': 1}, False),
+    ({'ruleIndex': True}, False),
+    ({'rule': {'index': 0}}, True),
+])
+def test_scoped_directive_uses_validated_rule_reference(tmp_path, reference, applies):
+    (tmp_path / 'owned.py').write_text('x = value  # nosemgrep: test.rule scoped\n')
+    result = _make_result('owned.py', 1)
+    del result['ruleId']
+    result.update(reference)
+    sarif = _make_sarif_data([result], 'semgrep')
+    sarif['runs'][0]['tool']['driver']['rules'] = [{'id': 'test.rule'}, {'id': 'other.rule'}]
+
+    assert annotate_sarif(sarif, str(tmp_path)) == int(applies)
+    assert bool(result.get('properties', {}).get('nosemgrep')) is applies

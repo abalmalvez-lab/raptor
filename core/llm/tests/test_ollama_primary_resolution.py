@@ -1,0 +1,274 @@
+"""Tests for Ollama models.json primary-selection eligibility.
+
+A configured local (Ollama) model must be able to become the default
+primary from ``~/.config/raptor/models.json``.  Before the Step 2c hook
+(``_config_ollama_primary``), the thinking-model scorer only knew cloud
+models and the env builder ignored the file, so a role-less Ollama entry
+could never be selected as primary — the run silently fell through to raw
+``/api/tags`` autodetect and picked whatever model the probe returned
+first.
+
+These tests pin ``RAPTOR_CONFIG`` at a temp file and stub the Ollama
+probe to return a DIFFERENT model list than the file, so a passing
+assertion proves the FILE drove selection, not autodetect.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+import shutil
+from types import ModuleType
+from core.testing.module_views import scoped_function_imports
+from core.testing.module_bindings import patch_module_attribute
+
+
+_local_imports = ModuleType("configuration_fixture_imports")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env(monkeypatch, tmp_path):
+    import core.llm.config as cfg
+    import core.llm.detection as det
+    from core.testing.llm_state import isolated_llm_resolution
+
+    with (
+        isolated_llm_resolution(cfg, det),
+        scoped_function_imports(cfg, ("_entry_auth_resolvable", "_build_claudecode_config"),
+                                {"shutil": shutil}, registries=("_PROVIDER_BUILDERS",)) as imports,
+    ):
+        try:
+            monkeypatch.setitem(globals(), "_local_imports", imports)
+            for var in (
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "MISTRAL_API_KEY",
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "AWS_PROFILE",
+                "RAPTOR_CONFIG",
+            ):
+                monkeypatch.delenv(var, raising=False)
+
+            empty = tmp_path / "models.json"
+            empty.write_text(json.dumps({"models": []}))
+            monkeypatch.setenv("RAPTOR_CONFIG", str(empty))
+
+            # Selection precedence is under test; inventory lookup is separate I/O.
+            monkeypatch.setattr(
+                "core.llm.model_resolution.resolve_anthropic",
+                lambda name, api_key: name,
+            )
+            # External LLM is "available" so _get_default_fallback_models and the
+            # availability gates don't bail; the thinking-model scorer stays live
+            # (we want to prove cloud still wins when present).
+            monkeypatch.setattr(
+                cfg, "detect_llm_availability",
+                lambda: det.LLMAvailability(external_llm=True, claude_code=False, llm_available=True),
+            )
+            # No live `claude` binary → claudecode never resolves as a competitor.
+            patch_module_attribute(monkeypatch, _local_imports, "shutil", "which", lambda _bin: None)
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+def _write_config(tmp_path, monkeypatch, models):
+    cfg_path = tmp_path / "models.json"
+    cfg_path.write_text(json.dumps({"models": models}))
+    monkeypatch.setenv("RAPTOR_CONFIG", str(cfg_path))
+    return cfg_path
+
+
+def _stub_autodetect(monkeypatch, names):
+    """Make the Ollama /api/tags probe return ``names`` — distinct from
+    the configured model so a match on the configured name proves the
+    file, not the probe, drove selection."""
+    import core.llm.config as cfg
+    monkeypatch.setattr(cfg, "_get_available_ollama_models", lambda: list(names))
+
+
+class TestOllamaConfigPrimary:
+    def test_roleless_ollama_entry_becomes_primary(self, tmp_path, monkeypatch):
+        """A role-less Ollama entry wins over whatever autodetect would
+        have returned, and its max_context/max_output are preserved."""
+        _write_config(tmp_path, monkeypatch, [
+            {
+                "provider": "ollama",
+                "model": "local-primary",
+                "max_context": 60000,
+                "max_output": 8192,
+            },
+        ])
+        # Autodetect would otherwise return a DIFFERENT model first.
+        _stub_autodetect(monkeypatch, ["local-big:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.provider == "ollama"
+        assert picked.model_name == "local-primary"
+        assert picked.max_context == 60000
+        assert picked.max_tokens == 8192
+
+    def test_first_roleless_ollama_entry_wins(self, tmp_path, monkeypatch):
+        """File order decides: the FIRST eligible Ollama entry is primary,
+        later eligible entries are not."""
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "ollama", "model": "local-primary"},
+            {"provider": "ollama", "model": "local-coder"},
+        ])
+        _stub_autodetect(monkeypatch, ["something-else:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.model_name == "local-primary"
+
+    def test_ollama_auxiliary_role_not_primary(self, tmp_path, monkeypatch):
+        """An Ollama entry with an auxiliary role (judge) is NOT selected
+        as primary — it falls through to autodetect."""
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "ollama", "model": "local-big", "role": "judge"},
+        ])
+        _stub_autodetect(monkeypatch, ["autodetected-model:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        # Step 2c skipped the judge entry; Step 3 autodetect ran instead.
+        assert picked is not None
+        assert picked.model_name == "autodetected-model:latest"
+
+    def test_ollama_analysis_role_is_primary(self, tmp_path, monkeypatch):
+        """An explicit analysis/code role is primary-eligible (matches the
+        Bedrock hook's eligibility set)."""
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "ollama", "model": "local-primary", "role": "analysis"},
+        ])
+        _stub_autodetect(monkeypatch, ["other:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.model_name == "local-primary"
+
+    def test_cloud_thinking_model_still_wins_over_ollama(self, tmp_path, monkeypatch):
+        """Step 2 (cloud thinking model) precedes Step 2c: a matching cloud
+        entry still beats a role-less Ollama entry."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "anthropic", "model": "claude-opus-4-6"},
+            {"provider": "ollama", "model": "local-primary"},
+        ])
+        _stub_autodetect(monkeypatch, ["local-primary:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.provider == "anthropic"
+
+    def test_ollama_entry_always_auth_resolvable(self, tmp_path, monkeypatch):
+        """Ollama needs no credential — auth-resolvable is unconditionally
+        True so the entry is eligible as both primary and fallback."""
+        from core.llm.config import _entry_auth_resolvable, ModelConfig
+        mc = ModelConfig(
+            provider="ollama", model_name="qwen3:latest", api_key=None,
+        )
+        assert _entry_auth_resolvable(mc) is True
+
+    def test_ollama_entry_zero_cost(self, tmp_path, monkeypatch):
+        """A config-file Ollama entry with an unknown model name gets
+        cost_per_1k_tokens=0.0, not the cloud fallback rate."""
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "ollama", "model": "local-custom"},
+        ])
+        _stub_autodetect(monkeypatch, ["other:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.cost_per_1k_tokens == 0.0
+
+    def test_offline_skips_ollama_primary(self, tmp_path, monkeypatch):
+        """offline=True skips Step 2c (Ollama is a network-probing provider),
+        matching how Steps 1/3 skip it."""
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "ollama", "model": "local-primary"},
+        ])
+        _stub_autodetect(monkeypatch, ["local-primary:latest"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model(offline=True)
+
+        # No cloud keys, Ollama skipped when offline → nothing resolves.
+        assert picked is None
+
+
+class TestClaudeCodeConfigPrimary:
+    """A declared claudecode entry beats autodetected Ollama; a
+    fallback-role entry stays a fallback."""
+
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        patch_module_attribute(
+            monkeypatch, _local_imports, "shutil", "which",
+            lambda b: "/usr/local/bin/claude" if b == "claude" else None,
+        )
+        import core.llm.config as cfg
+        monkeypatch.setattr(cfg, "_resolve_claudecode_model", lambda: "claude-test")
+
+    @pytest.mark.parametrize("role", [None, "analysis", "code"])
+    @pytest.mark.parametrize("provider", ["claudecode", "claudecode-resumable"])
+    def test_claudecode_entry_beats_autodetected_ollama(
+        self, tmp_path, monkeypatch, role, provider,
+    ):
+        entry = {"provider": provider}
+        if role:
+            entry["role"] = role
+        _write_config(tmp_path, monkeypatch, [entry])
+        _stub_autodetect(monkeypatch, ["qwen3:8b"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.provider == provider
+
+    def test_fallback_role_claudecode_does_not_become_primary(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "claudecode", "role": "fallback"},
+        ])
+        _stub_autodetect(monkeypatch, ["qwen3:8b"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model()
+
+        assert picked is not None
+        assert picked.provider == "ollama"
+        assert picked.model_name == "qwen3:8b"
+
+    def test_prefer_set_skips_claudecode_primary(
+        self, tmp_path, monkeypatch,
+    ):
+        """When the caller restricts providers via ``prefer``, a
+        claudecode config entry outside that set must not become
+        primary — the prefer guard applies to Step 2d the same way
+        it does to Steps 2b/2c."""
+        _write_config(tmp_path, monkeypatch, [
+            {"provider": "claudecode"},
+        ])
+        _stub_autodetect(monkeypatch, ["qwen3:8b"])
+
+        import core.llm.config as cfg
+        picked = cfg._get_default_primary_model(prefer=["anthropic"])
+
+        assert picked is None or picked.provider != "claudecode"

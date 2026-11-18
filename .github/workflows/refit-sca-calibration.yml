@@ -1,0 +1,267 @@
+name: Refit SCA risk-score multipliers
+
+# Auto-PR refit of the multiplier constants in
+# ``packages/sca/risk.py`` based on the calibration corpus's
+# project-sample findings.
+#
+# Pipeline (per run):
+#   1. Validate the corpus — read latest verdict.
+#   2. If verdict is needs_retune (or workflow_dispatch invoked),
+#      run packages/sca/scripts/refit-calibration --apply.
+#   3. If risk.py changed, commit + open auto-PR with diff +
+#      report.
+#
+# Cadence: monthly. Per-constant grid search reads project
+# samples and recomputes precision; cheap (no network), but
+# month-over-month tracking is appropriate for a slow-moving
+# threat-landscape corpus.
+#
+# Doesn't auto-merge — weight changes are operator-reviewed.
+
+on:
+  schedule:
+    # 5th of each month, 06:00 UTC. Spread across the month from
+    # the data-refresh workflows (1st = project samples; Tuesdays
+    # = ground-truth signals); refit runs after the corpus has had
+    # a chance to settle from those refreshes.
+    - cron: '0 6 5 * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force refit even if validation says validated_v1'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: refit-sca-calibration
+  cancel-in-progress: false
+
+jobs:
+  refit:
+    # Upstream maintenance only, including manual dispatch.
+    if: github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The validate/refit steps run repo code over the fetched
+          # calibration corpus with a contents:write token in scope; keep
+          # that token out of .git/config so those steps can't reach it
+          # (same hardening as refresh-sca-data.yml / sca-self-bump.yml).
+          # The push authenticates explicitly via the gh credential
+          # helper (see Commit + push).
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - name: Install minimal deps
+        # Pure-Python refit — no numpy / sklearn. Just whatever
+        # the SCA package itself needs to import (urllib3 etc.).
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          pip install 'urllib3==2.7.0,<3.0'
+
+      - name: Validate corpus
+        # Re-run validation to get the latest verdict. If it's
+        # validated_v1 AND the operator didn't pass --force, we
+        # skip the refit (no change needed). If needs_retune /
+        # unverified, proceed.
+        id: validate
+        env:
+          _RAPTOR_TRUSTED: '1'
+        # Metrics-only by design: the gate below reads the verdict
+        # from the committed weekly snapshot (same corpus state this
+        # run fetched, so the fresh metrics are identical), and this
+        # workflow must not write into the committed validation/ dir
+        # it doesn't commit.
+        run: |
+          set +e
+          packages/sca/scripts/raptor-sca-validate-corpus
+          # Re-read the committed report to extract the verdict for gating.
+          python <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json, os, re, sys
+          # Strictly date-shaped snapshots only — a stray
+          # late-sorting .json must not shadow the dated history
+          # (same shape the writer/pruner and risk.py apply).
+          dated = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
+          paths = sorted(
+              (p for p in
+               glob.glob('packages/sca/data/calibration/validation/*.json')
+               if dated.match(os.path.basename(p))),
+              reverse=True,
+          )
+          verdict = "unverified"
+          for p in paths:
+              try:
+                  data = json.loads(open(p).read())
+              except Exception:
+                  continue
+              if isinstance(data, dict) and isinstance(
+                      data.get("verdict"), str):
+                  verdict = data["verdict"]
+                  break
+          print(f"verdict={verdict}")
+          EOF
+
+      - name: Decide whether to refit
+        id: gate
+        # Pass GHA expressions via ``env:`` instead of interpolating
+        # directly into the shell script — defends against shell
+        # injection if either ``steps.validate.outputs.verdict`` or
+        # ``inputs.force`` ever carries shell metacharacters. Today
+        # both are operator-controlled via ``workflow_dispatch``,
+        # but the canonical pattern is to use ``env:`` always.
+        # See GitHub docs:
+        # https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+        env:
+          VERDICT: ${{ steps.validate.outputs.verdict }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          if [ "$FORCE" = "true" ]; then
+            echo "should_refit=true" >> "$GITHUB_OUTPUT"
+            echo "  → forcing refit (workflow_dispatch input)"
+          elif [ "$VERDICT" = "needs_retune" ] \
+              || [ "$VERDICT" = "unverified" ]; then
+            echo "should_refit=true" >> "$GITHUB_OUTPUT"
+            echo "  → verdict $VERDICT triggers refit"
+          else
+            echo "should_refit=false" >> "$GITHUB_OUTPUT"
+            echo "  → verdict $VERDICT; refit skipped"
+          fi
+
+      - name: Refit + apply
+        if: steps.gate.outputs.should_refit == 'true'
+        env:
+          _RAPTOR_TRUSTED: '1'
+        # ``--apply`` writes the proposed multiplier values back
+        # to packages/sca/risk.py if the improvement gate passes.
+        # Exit codes:
+        #   0  proposed + applied
+        #   1  rejected (no improvement)
+        #   2  insufficient_samples
+        #   3  error
+        # We don't fail the workflow on rejected/insufficient —
+        # the report still ships.
+        run: |
+          set +e
+          packages/sca/scripts/refit-calibration --apply --update-snapshot
+          rc=$?
+          echo "refit exit: $rc"
+          # Only exit 3 (genuine error) should fail the workflow.
+          if [ $rc -eq 3 ]; then
+            exit 1
+          fi
+
+      - name: Diff?
+        if: steps.gate.outputs.should_refit == 'true'
+        id: diff
+        run: |
+          if git diff --quiet -- \
+              packages/sca/risk.py \
+              packages/sca/data/calibration/refit/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit + push to refit branch
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          BRANCH="auto/sca-calibration-refit"
+          # persist-credentials:false (see Checkout) kept the token out of
+          # .git/config for the refit steps. Install gh CLI's credential
+          # helper, which reads the token from env at push time without
+          # ever embedding it in any URL stored in .git/config.
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add packages/sca/risk.py \
+                  packages/sca/data/calibration/refit/
+          git commit -m "chore(sca): refit risk-score multipliers
+
+          Auto-generated by .github/workflows/refit-sca-calibration.yml.
+          Per-constant grid search over packages/sca/risk.py multipliers
+          against the calibration corpus's project samples; ships only
+          if joint top-20 precision improvement clears 5 percentage
+          points. See packages/sca/data/calibration/refit/<date>.json
+          for per-constant deltas."
+          # Replay the refit commit onto current main before opening
+          # the PR — a branch cut from the dispatch-time checkout can
+          # be stale when auto-PR workflows run back-to-back, and a
+          # stale base turns any file overlap into a PR merge
+          # conflict. This workflow writes packages/sca/risk.py, a
+          # human-edited CODE file — the most conflict-prone write in
+          # the auto-PR family — so a genuine overlap must fail HERE,
+          # loudly, instead of opening a conflicted PR. Same block as
+          # the five sibling publish workflows.
+          git fetch origin main
+          git rebase origin/main
+          # --force-with-lease (not --force): refuses the push if the
+          # remote branch moved since our fetch — e.g. an operator amended
+          # the open auto-PR — rather than clobbering it. Fetch first to
+          # seed the lease baseline, but only when the branch already exists
+          # remotely: a bare fetch of a missing ref prints a misleading
+          # ``fatal: couldn't find remote ref`` on the first run (or after
+          # the prior auto-PR branch was merged + deleted). When the guard
+          # skips the fetch, the push simply creates the branch.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" || true   # tolerate a transient blip
+          fi
+          git push --force-with-lease origin "$BRANCH"
+
+      - name: Create or update PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          BRANCH="auto/sca-calibration-refit"
+          BODY=$(cat <<'EOF'
+          Auto-PR from `.github/workflows/refit-sca-calibration.yml`.
+
+          Per-constant grid search over `packages/sca/risk.py`'s multiplier constants. Each constant tested at ±10% of its current value against the calibration corpus's project samples; the variant maximising top-20 precision wins. Joint improvement gate: ≥5 percentage points or no ship.
+
+          Review checklist:
+          - [ ] `packages/sca/data/calibration/refit/<date>.json` shows the per-constant deltas + precision metrics
+          - [ ] Joint precision improvement clears 5%
+          - [ ] No constant moved more than 10% from its previous value (the workflow enforces, but spot-check the diff)
+          - [ ] Existing risk-scoring tests still pass post-refit
+
+          Sources: same calibration corpus (KEV / EPSS / EDB / MSF /
+          GitHub PoC + OSS project samples) the validate workflow
+          uses.
+          EOF
+          )
+          # --repo pins the running repo: without it gh defaults the base
+          # repo to the upstream parent on a fork, so a manual fork run would
+          # target (and fail against) the parent instead of the fork.
+          if ! gh pr view --repo "$GITHUB_REPOSITORY" "$BRANCH" >/dev/null 2>&1; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(sca): refit risk-score multipliers" \
+              --body "$BODY"
+          else
+            gh pr edit --repo "$GITHUB_REPOSITORY" "$BRANCH" --body "$BODY"
+          fi
+          # Labels best-effort (see sca-self-bump): a missing label must
+          # never block the PR. Create them once under Settings → Labels.
+          for lbl in automated sca; do
+            gh pr edit --repo "$GITHUB_REPOSITORY" "$BRANCH" --add-label "$lbl" 2>/dev/null \
+              || echo "label '$lbl' not in repo; skipping (create it under Settings → Labels to auto-apply)"
+          done

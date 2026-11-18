@@ -11,17 +11,27 @@
 name: RAPTOR CodeQL config
 
 paths-ignore:
-  # IRIS Tier 1 dataflow-validation fixtures (intentionally vulnerable
-  # Flask + sys.argv command-injection patterns; CodeQL flags them
-  # because they ARE vulnerable, by design).
-  - packages/llm_analysis/tests/fixtures/iris_e2e/**
-  # Generic test-fixture exclusion for any other deliberately-bad
-  # samples a future test adds.
-  - "**/tests/fixtures/**"
+  # Test code includes synthetic URLs, planted secrets, and deliberately
+  # vulnerable fixtures. Apply this consistently, including .github/tests,
+  # instead of adding per-suite exceptions after each fixture alert.
+  # Dedicated test/query jobs still exercise these files.
+  - "**/tests/**"
+  - "**/test/**"
   - "**/test_fixtures/**"
-  # Intentionally vulnerable testbeds used by /scan and /codeql self-tests
-  # (python_sql_injection.py, javascript_xss.js, smt_codeql_testbench.c).
-  - test/data/**
+  # sandbox helpers_test.c sets directory permissions then calls
+  # validate_exec_target — inherently TOCTOU by test design.
+  # The write_file_mode TOCTOU is fixed (fchmod on fd), but the
+  # chmod→validate pairs are the test exercising the security check.
+  - "core/sandbox/helpers/*_test*"
   # Git worktree mirrors — duplicates of in-tree source that would cause
   # double-counted alerts if scanned.
-  - .claude/worktrees/**
+  - ".claude/worktrees/**"
+  # The web scanner's raw-probe TLS shim disables certificate and
+  # hostname validation and floors the version at TLS 1.0 BY DESIGN —
+  # it builds attack traffic for authorized scan targets (self-signed
+  # staging included), not a client channel with anything to protect.
+  # CodeQL correctly flags that construction in client code; here the
+  # insecurity is the feature. The shim is quarantined to this one
+  # module (with a never-use-for-real-egress warning) precisely so the
+  # checks consuming it stay fully scanned.
+  - "packages/web/_probe_tls.py"

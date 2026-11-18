@@ -1,16 +1,22 @@
-"""Tests for Hypothesis, ValidationResult, ToolCapability, ToolEvidence."""
+"""Tests for Hypothesis, Location, FlowStep, ValidationResult,
+ToolCapability, ToolEvidence."""
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from packages.hypothesis_validation.adapters.base import (
     ToolCapability,
     ToolEvidence,
     ToolInvocation,
 )
-from packages.hypothesis_validation.hypothesis import Hypothesis
+from packages.hypothesis_validation.hypothesis import (
+    FlowStep,
+    Hypothesis,
+    Location,
+)
 from packages.hypothesis_validation.result import Evidence, ValidationResult
 
 
@@ -66,6 +72,54 @@ class TestHypothesis:
         assert h2.claim == h.claim
         assert h2.target == h.target
         assert h2.cwe == h.cwe
+
+
+class TestLocationLineCoercion:
+    """LLM-supplied JSON with a non-numeric ``line`` must degrade to
+    line=0, never raise from ``int()`` coercion."""
+
+    def test_non_numeric_string_becomes_zero(self):
+        assert Location.from_dict({"line": "not-a-number"}).line == 0
+
+    def test_numeric_string_parses(self):
+        assert Location.from_dict({"line": "42"}).line == 42
+
+    def test_none_becomes_zero(self):
+        assert Location.from_dict({"line": None}).line == 0
+
+    def test_truthy_non_numeric_type_becomes_zero(self):
+        assert Location.from_dict({"line": ["7"]}).line == 0
+
+    def test_int_passes_through(self):
+        assert Location.from_dict({"line": 7}).line == 7
+
+
+class TestFlowStepLineCoercion:
+    def test_non_numeric_string_becomes_zero(self):
+        assert FlowStep.from_dict({"line": "abc"}).line == 0
+
+    def test_numeric_string_parses(self):
+        assert FlowStep.from_dict({"line": "13"}).line == 13
+
+    def test_truthy_non_numeric_type_becomes_zero(self):
+        assert FlowStep.from_dict({"line": {"n": 3}}).line == 0
+
+
+class TestHypothesisFromDictLineCoercion:
+    def test_bad_lines_in_nested_fields_do_not_raise(self):
+        h = Hypothesis.from_dict({
+            "claim": "c",
+            "target": "/src",
+            "source": {"kind": "network", "line": "unknown"},
+            "sink": {"kind": "exec", "line": "12"},
+            "flow_steps": [
+                {"function": "f", "line": "??"},
+                {"function": "g", "line": 9},
+            ],
+        })
+        assert h.source.line == 0
+        assert h.sink.line == 12
+        assert [s.line for s in h.flow_steps] == [0, 9]
 
 
 class TestEvidence:
@@ -176,3 +230,29 @@ class TestToolInvocation:
         d = inv.to_dict()
         assert d["tool"] == "cocci"
         assert d["args"] == {"x": 1}
+
+
+class TestHypothesisPolarity:
+    def test_roundtrip(self):
+        h = Hypothesis(claim="c", target=Path("/src"),
+                       polarity="infeasibility")
+        assert Hypothesis.from_dict(h.to_dict()).polarity == "infeasibility"
+
+    def test_omitted_from_dict_when_unset(self):
+        # Additive field: unset polarity must not change the to_dict
+        # shape (hash_hypothesis stability for existing producers).
+        h = Hypothesis(claim="c", target=Path("/src"))
+        assert "polarity" not in h.to_dict()
+
+    def test_invalid_values_coerce_to_undeclared(self):
+        for bad in ("reachable", 3, ["reachability"], None, "  "):
+            h = Hypothesis.from_dict(
+                {"claim": "c", "target": "/src", "polarity": bad},
+            )
+            assert h.polarity == ""
+
+    def test_case_and_whitespace_normalised(self):
+        h = Hypothesis.from_dict(
+            {"claim": "c", "target": "/src", "polarity": " Reachability "},
+        )
+        assert h.polarity == "reachability"

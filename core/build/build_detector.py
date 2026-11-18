@@ -1,0 +1,2174 @@
+#!/usr/bin/env python3
+"""Build system detection and build command synthesis.
+
+Detects build systems (Make, CMake, Maven, Gradle, npm, Cargo, etc.)
+in a target directory and generates appropriate build commands.
+Consumers include CodeQL database creation and target-shape description.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+# _run_trusted: read-only tools (--version checks) — no namespace overhead.
+# Build-detection work compiles/executes untrusted content: each call site
+# passes target=output=<repo_path> so Landlock engages alongside seccomp +
+# namespace net block (full sandbox).
+from dataclasses import dataclass, field
+from pathlib import Path
+from shlex import quote
+from typing import Any, ClassVar
+
+from core.build.artifacts import cleanup_build_paths
+from core.logging import get_logger
+from core.sandbox import SandboxSetupError
+from core.sandbox import run as _sandbox_run
+from core.sandbox import run_trusted as _run_trusted
+from core.sandbox.context import untrusted_fresh_procfs_required
+
+logger = get_logger()
+
+# Cap on files collected by one recursive enumeration of the untrusted
+# repo. Too low silently drops real source files on big targets
+# (missing CodeQL coverage, missed -I dirs, missed build files); too
+# high lets a hostile file farm dominate the UNSANDBOXED detection
+# phase's wall time. 100k files is an order of magnitude above the
+# largest legitimate targets this pipeline scans while keeping the
+# worst-case walk bounded.
+_MAX_WALK_FILES = 100_000
+
+# Companion cap on DIRECTORIES traversed: the file cap alone does not
+# bound the walk — an empty-directory farm collects zero files while
+# stat()ing forever. Same trade-off shape as the file cap (too low
+# drops real deep trees; 200k dirs is far above legitimate targets).
+_MAX_WALK_DIRS = 200_000
+
+
+def _walk_files(
+    root: Path,
+    suffixes: tuple[str, ...] | None = None,
+    *,
+    max_files: int = _MAX_WALK_FILES,
+) -> list[Path]:
+    """Recursive file enumeration that never follows directory symlinks.
+
+    Detect/synthesise run in the UNSANDBOXED parent against scanned
+    repos, so a repo containing ``src -> /`` must never steer the walk
+    across the host filesystem (``detect_missing_config_headers``
+    would then read host files in the parent). ``Path.rglob``
+    recurses into directory symlinks only via 3.13's
+    ``recurse_symlinks=True`` opt-in (it's
+    ``glob.glob(recursive=True)`` that followed them by default);
+    ``os.walk(followlinks=False)`` bounds the walk to the real tree
+    explicitly on every supported interpreter. File symlinks are
+    still yielded (rglob parity); unreadable subtrees are skipped
+    (``os.walk`` default).
+
+    ``suffixes`` filters by case-sensitive ``str.endswith`` — the same
+    matches ``rglob(f"*{{suffix}}")`` produced for regular files. The
+    result is capped at ``max_files`` and the traversal itself at
+    ``_MAX_WALK_DIRS`` (the file cap bounds files COLLECTED, not
+    directories visited — an empty-dir farm walks free of it), each
+    with a warning, so a hostile file farm can't monopolise detection
+    either way.
+    """
+    out: list[Path] = []
+    dirs_seen = 0
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        dirs_seen += 1
+        if dirs_seen > _MAX_WALK_DIRS:
+            logger.warning(
+                "Directory enumeration under %s hit the %d-dir cap — "
+                "remaining subtrees are not considered for build "
+                "detection", root, _MAX_WALK_DIRS,
+            )
+            return out
+        for name in filenames:
+            if suffixes is not None and not name.endswith(suffixes):
+                continue
+            out.append(Path(dirpath) / name)
+            if len(out) >= max_files:
+                logger.warning(
+                    "File enumeration under %s hit the %d-file cap — "
+                    "remaining files are not considered for build "
+                    "detection", root, max_files,
+                )
+                return out
+    return out
+
+
+@dataclass
+class BuildSystem:
+    """Information about detected build system."""
+    type: str  # maven, gradle, npm, etc.
+    command: str  # Build command to use
+    working_dir: Path  # Directory to run command in
+    # Env vars we inject as-is. RAPTOR-CHOSEN CONSTANTS by contract:
+    # the static BUILD_SYSTEMS table is the only producer of non-empty
+    # content (never repo metadata — repo-derived env must go through
+    # the hostile-input gates instead). Consumers admit these through
+    # the codeql build-env gate by exact declared (name, value) pair —
+    # see declared_env_constants() — so a future producer that copies
+    # repo content in here still meets the gate.
+    env_vars: dict[str, str]
+    confidence: float  # 0.0 - 1.0
+    detected_files: list[str]  # Files that indicated this build system
+    cleanup_paths: list[Path] = field(default_factory=list)  # Temp files/dirs to remove after CodeQL
+    # Env var NAMES to auto-detect at build time. Each name must have
+    # a corresponding detector in core.build.toolchain.DETECTORS. The
+    # detected value (if non-None) is merged into the build
+    # subprocess's env alongside env_vars. See ~/design/env-handling.md.
+    env_detect: list[str] = field(default_factory=list)
+
+
+class BuildDetector:
+    """
+    Autonomous build system detection and command generation.
+
+    Detects build systems by analyzing build files and generates
+    appropriate commands for CodeQL database creation.
+    """
+
+    # Build system patterns per language
+    BUILD_SYSTEMS: ClassVar[dict] = {
+        "java": {
+            "maven": {
+                "files": ["pom.xml"],
+                "command": "mvn clean compile -DskipTests -Dmaven.test.skip=true",
+                "env_vars": {"MAVEN_OPTS": "-Xmx2048m"},
+                "env_detect": ["JAVA_HOME"],
+                "priority": 1,
+            },
+            "gradle": {
+                "files": ["build.gradle", "build.gradle.kts", "settings.gradle", "gradlew"],
+                "command": "./gradlew build -x test --no-daemon",
+                "command_fallback": "gradle build -x test --no-daemon",
+                "env_vars": {"GRADLE_OPTS": "-Xmx2048m"},
+                "env_detect": ["JAVA_HOME"],
+                "priority": 2,
+            },
+            "ant": {
+                "files": ["build.xml"],
+                "command": "ant compile",
+                "env_vars": {"ANT_OPTS": "-Xmx2048m"},
+                "env_detect": ["JAVA_HOME"],
+                "priority": 3,
+            },
+        },
+        "python": {
+            "poetry": {
+                "files": ["pyproject.toml", "poetry.lock"],
+                "command": "poetry install --no-root",
+                "env_vars": {},
+                "priority": 1,
+            },
+            "pip": {
+                "files": ["requirements.txt", "setup.py", "pyproject.toml"],
+                "command": "pip install -e . || pip install -r requirements.txt",
+                "env_vars": {},
+                "priority": 2,
+            },
+            "setuptools": {
+                "files": ["setup.py"],
+                "command": "python setup.py build",
+                "env_vars": {},
+                "priority": 3,
+            },
+        },
+        "javascript": {
+            "npm": {
+                "files": ["package.json", "package-lock.json"],
+                "command": "npm install && npm run build",
+                "command_fallback": "npm install",
+                "env_vars": {"NODE_ENV": "development"},
+                "priority": 1,
+            },
+            "yarn": {
+                "files": ["package.json", "yarn.lock"],
+                "command": "yarn install && yarn build",
+                "command_fallback": "yarn install",
+                "env_vars": {"NODE_ENV": "development"},
+                "priority": 2,
+            },
+            "pnpm": {
+                "files": ["package.json", "pnpm-lock.yaml"],
+                "command": "pnpm install && pnpm run build",
+                "command_fallback": "pnpm install",
+                "env_vars": {"NODE_ENV": "development"},
+                "priority": 3,
+            },
+        },
+        "typescript": {
+            "npm": {
+                "files": ["package.json", "tsconfig.json"],
+                "command": "npm install && npm run build",
+                "command_fallback": "npm install && tsc",
+                "env_vars": {"NODE_ENV": "development"},
+                "priority": 1,
+            },
+            "yarn": {
+                "files": ["package.json", "yarn.lock", "tsconfig.json"],
+                "command": "yarn install && yarn build",
+                "command_fallback": "yarn install && tsc",
+                "env_vars": {"NODE_ENV": "development"},
+                "priority": 2,
+            },
+        },
+        "go": {
+            "gomod": {
+                "files": ["go.mod"],
+                "command": "go build ./...",
+                "env_vars": {"CGO_ENABLED": "0"},
+                "env_detect": ["GOROOT"],
+                "priority": 1,
+            },
+        },
+        "cpp": {
+            # Priority ordering rationale (lower = picked first
+            # via ``min()``): source-of-truth build descriptions
+            # win over generated artefacts. An autotools project
+            # ships ``configure.ac`` AND a generated ``Makefile``
+            # AND a generated ``configure`` — picking "make"
+            # because Makefile is present would tell the operator
+            # to run ``make`` on a clean checkout, which fails
+            # because Makefile carries host-specific paths that
+            # ``./configure`` would have populated. The
+            # source-of-truth markers (CMakeLists.txt /
+            # configure.ac / meson.build) are HAND-AUTHORED;
+            # everything else can be regenerated from them.
+            # ``make`` is the fallback when ONLY a Makefile
+            # exists (no higher-level source) — that's a real
+            # case (hand-written Makefile projects) but rare;
+            # losing the false positive on autotools projects is
+            # a much bigger win.
+            "cmake": {
+                "files": ["CMakeLists.txt"],
+                "command": "cmake . && make",
+                "env_vars": {},
+                "priority": 1,
+            },
+            "autotools": {
+                "files": ["configure.ac", "configure.in", "Makefile.am"],
+                "command": "./configure && make",
+                "env_vars": {},
+                "priority": 2,
+            },
+            "meson": {
+                "files": ["meson.build"],
+                "command": "meson setup builddir && meson compile -C builddir",
+                "env_vars": {},
+                "priority": 3,
+            },
+            "make": {
+                # Last-resort: a hand-written Makefile with no
+                # higher-level source. Generated Makefiles (from
+                # autotools / cmake / meson) get classified by
+                # those entries above instead. Note we DON'T
+                # include ``configure`` here — its presence
+                # implies autotools regardless of which file is
+                # source vs generated.
+                "files": ["Makefile", "makefile"],
+                "command": "make",
+                "env_vars": {},
+                "priority": 4,
+            },
+        },
+        "csharp": {
+            "dotnet": {
+                "files": [".csproj", ".sln"],
+                "command": "dotnet build",
+                "env_vars": {},
+                "env_detect": ["DOTNET_ROOT"],
+                "priority": 1,
+            },
+            "msbuild": {
+                "files": [".csproj", ".sln"],
+                "command": "msbuild /t:Build",
+                "env_vars": {},
+                "env_detect": ["DOTNET_ROOT"],
+                "priority": 2,
+            },
+        },
+        "ruby": {
+            "bundler": {
+                "files": ["Gemfile", "Gemfile.lock"],
+                "command": "bundle install",
+                "env_vars": {},
+                "priority": 1,
+            },
+            "rake": {
+                "files": ["Rakefile"],
+                "command": "rake build",
+                "env_vars": {},
+                "priority": 2,
+            },
+        },
+    }
+    # C shares the cpp table by ALIAS (same dict object — one source
+    # of truth): cmake / autotools / meson / make describe C projects
+    # identically, and callers hint the real source language ("c").
+    # Without the key, detect_build_system warned "No build system
+    # detection for language: c" and bailed before any file scan —
+    # every pure-C target (e.g. GNU screen) fell through to the
+    # synthesised-compile fallback even when configure.ac was present.
+    BUILD_SYSTEMS["c"] = BUILD_SYSTEMS["cpp"]
+
+    def __init__(self, repo_path: Path) -> None:
+        """
+        Initialize build detector.
+
+        Args:
+            repo_path: Path to repository
+        """
+        self.repo_path = Path(repo_path)
+
+        if not self.repo_path.exists():
+            msg = f"Repository path does not exist: {repo_path}"
+            raise ValueError(msg)
+
+    def detect_build_system(self, language: str) -> BuildSystem | None:
+        """
+        Detect build system for given language.
+
+        Args:
+            language: Programming language
+
+        Returns:
+            BuildSystem object or None if no build system detected
+        """
+        logger.info("Detecting build system for %s in: %s", language, self.repo_path)
+
+        if language not in self.BUILD_SYSTEMS:
+            logger.warning("No build system detection for language: %s", language)
+            return None
+
+        # Get build systems for this language
+        build_systems = self.BUILD_SYSTEMS[language]
+
+        # Try each build system in priority order
+        detected = []
+        for build_type, config in build_systems.items():
+            result = self._check_build_system(language, build_type, config)
+            if result:
+                detected.append(result)
+
+        # Depth-1 fallback: some checkouts keep the whole build under
+        # one subdirectory (GNU screen's autotools live in src/; the
+        # repo root holds only COPYING + mktar.pl). Root-only scanning
+        # reported "no build system" for them. Scanned only when the
+        # root found NOTHING, shallowest-then-alphabetical, first
+        # subdirectory with any detection wins (deterministic, same
+        # rationale as the .csproj rglob sort). Symlinked and hidden
+        # dirs are skipped — a symlink can point out of the tree, and
+        # .git/.github never hold the build root.
+        if not detected:
+            try:
+                subdirs = sorted(
+                    (d for d in self.repo_path.iterdir()
+                     if d.is_dir() and not d.is_symlink()
+                     and not d.name.startswith(".")),
+                    key=lambda p: p.name,
+                )
+            except OSError:
+                subdirs = []
+            for sub in subdirs:
+                for build_type, config in build_systems.items():
+                    result = self._check_build_system(
+                        language, build_type, config, base=sub)
+                    if result:
+                        detected.append(result)
+                if detected:
+                    logger.info(
+                        "  Build system found in subdirectory: %s",
+                        sub.name)
+                    break
+
+        if not detected:
+            logger.warning("No build system detected for %s", language)
+            return None
+
+        # Return highest priority (lowest priority number)
+        best = min(detected, key=lambda x: self.BUILD_SYSTEMS[language][x.type]["priority"])
+        logger.info("✓ Detected %s build system for %s", best.type, language)
+        logger.info("  Command: %s", best.command)
+        return best
+
+    def _check_build_system(self, language: str, build_type: str, config: dict,
+                            base: Path | None = None) -> BuildSystem | None:
+        """
+        Check if a specific build system is present.
+
+        Args:
+            language: Programming language
+            build_type: Build system type
+            config: Build system configuration
+            base: Directory whose top level is scanned for the exact-name
+                marker files (defaults to the repo root; the depth-1
+                fallback in detect_build_system passes a subdirectory).
+                Extension-pattern markers (".csproj") keep their
+                repo-rooted recursive scan either way.
+
+        Returns:
+            BuildSystem object or None
+        """
+        detected_files = []
+        if base is None:
+            base = self.repo_path
+        working_dir = base
+
+        # Check for build files
+        for build_file in config["files"]:
+            # Check for exact match
+            if (base / build_file).exists():
+                detected_files.append(build_file)
+
+            # Check for extension match (e.g., *.csproj)
+            if build_file.startswith("."):
+                # Sort matches for determinism. `rglob` returns
+                # filesystem-iteration order (varies between
+                # machines and even between runs on the same
+                # machine after FS metadata reordering); without
+                # sorting `matches[0].parent` was non-
+                # deterministic — repos with multiple .csproj /
+                # .sln / .gradle files picked DIFFERENT
+                # working_dirs across runs, producing different
+                # CodeQL DBs and different SARIF outputs for the
+                # same source. Sort by path string to pin the
+                # selection to "shallowest-then-alphabetical"
+                # which matches operator intuition for "primary"
+                # build root.
+                matches = sorted(
+                    _walk_files(self.repo_path, (build_file,)),
+                    key=lambda p: (len(p.parts), str(p)),
+                )
+                if matches:
+                    detected_files.append(build_file)
+                    # Use the directory of the first match WITH
+                    # containment + executability checks. Pre-fix
+                    # `working_dir = matches[0].parent` used the
+                    # match blindly; the working dir handed to
+                    # codeql must RESOLVE inside the repo — a
+                    # symlinked path segment would otherwise make
+                    # the cd effectively land elsewhere (e.g.
+                    # /etc), a dir codeql can't build from and
+                    # whose surfacing leaks the operator's
+                    # filesystem layout into logs.
+                    # X_OK check refuses dirs we can't actually
+                    # browse into.
+                    candidate = matches[0].parent
+                    try:
+                        cand_resolved = candidate.resolve(strict=False)
+                        repo_resolved = self.repo_path.resolve(strict=False)
+                        cand_resolved.relative_to(repo_resolved)
+                        if os.access(candidate, os.X_OK):
+                            working_dir = candidate
+                        else:
+                            logger.debug(
+                                "Skipping working_dir %s — not browseable",
+                                candidate,
+                            )
+                    except (ValueError, OSError):
+                        logger.debug(
+                            "Skipping out-of-tree working_dir candidate %s",
+                            candidate,
+                        )
+
+        if not detected_files:
+            return None
+
+        # Calculate confidence based on number of indicators
+        confidence = min(0.5 + (len(detected_files) * 0.2), 1.0)
+
+        # Choose command (with fallback support)
+        command = config["command"]
+
+        # Special handling for cmake: distinguish "real cmake project
+        # root" (CMakeLists.txt has cmake_minimum_required + project())
+        # from "CMake subdir fragment" (e.g. ``lib/CMakeLists.txt`` in
+        # curl's source tree, meant to be included via
+        # ``add_subdirectory`` from the parent — running ``cmake .``
+        # from the subdir fails with "No cmake_minimum_required
+        # command is present").
+        #
+        # Without this check BuildDetector confidently returned
+        # ``cmake . && make`` for any directory containing a
+        # CMakeLists.txt, which silently broke CodeQL database
+        # creation on subdir targets — surfaced by /agentic on
+        # ``curl-8.11.0/lib`` (rc=1 from the synthesized build script,
+        # zero CodeQL findings, downstream LLM analysis ran without
+        # CodeQL context).
+        if build_type == "cmake":
+            cml = working_dir / "CMakeLists.txt"
+            if cml.is_file() and not self._is_cmake_project_root(cml):
+                logger.warning(
+                    "%s is a CMake subdirectory fragment (no "
+                    "cmake_minimum_required / project() declaration). "
+                    "Skipping cmake build — point CodeQL at the "
+                    "project root instead (typically the directory "
+                    "containing the top-level CMakeLists.txt with "
+                    "project()). Falling through to per-file "
+                    "synthesised compile, which may give partial "
+                    "coverage but won't recover configure-generated "
+                    "headers (e.g. config.h).",
+                    cml,
+                )
+                return None
+
+        # Special handling for autotools: a git checkout ships the
+        # hand-authored configure.ac / Makefile.am but usually NOT the
+        # generated ./configure (a release-tarball artifact), so
+        # "./configure && make" fails on the first command. autoreconf
+        # regenerates it with standard host tooling — preferred over
+        # running a repo-shipped autogen.sh by name.
+        if build_type == "autotools" and not (working_dir / "configure").is_file():
+            command = "autoreconf -fi && " + command
+            logger.debug(
+                "No generated ./configure in %s — prepending autoreconf",
+                working_dir,
+            )
+
+        # Special handling for gradle wrapper
+        if build_type == "gradle" and "./gradlew" in command:
+            gradlew = self.repo_path / "gradlew"
+            if not gradlew.exists() or not os.access(gradlew, os.X_OK):
+                # Fall back to system gradle
+                command = config.get("command_fallback", command)
+                logger.debug("Gradle wrapper not found, using system gradle")
+
+        # Special handling for npm/yarn/pnpm build scripts
+        if build_type in ["npm", "yarn", "pnpm"]:
+            # Check if build script exists in package.json
+            package_json = self.repo_path / "package.json"
+            if package_json.exists() and not self._has_build_script(package_json):
+                # Use fallback command (just install)
+                command = config.get("command_fallback", command)
+                logger.debug("No build script in package.json, using install only")
+
+        return BuildSystem(
+            type=build_type,
+            command=command,
+            working_dir=working_dir,
+            env_vars=config.get("env_vars", {}),
+            confidence=confidence,
+            detected_files=detected_files,
+            env_detect=config.get("env_detect", []),
+        )
+
+    @staticmethod
+    def _ancestor_include_refusal(
+        resolved: Path,
+        repo_resolved: Path,
+        bases: list,
+    ) -> str | None:
+        """Reason an ancestor-include candidate must be refused, or
+        ``None`` when it is grantable. ONE home for the predicate set,
+        applied at BOTH discovery and the pre-dry-run grant re-vet: the
+        re-vet exists because a symlink swapped between discovery and
+        grant must not widen the read sandbox, so a predicate the
+        re-vet lacks is a predicate the swap defeats (the shared-temp
+        block had drifted out of the re-vet — a discovery→grant swap
+        to ``/tmp/include``, creatable by ANY local user, passed for
+        targets extracted under /tmp).
+
+        ``bases`` is the containment set: the single walked ancestor
+        at discovery; the walked-ancestor parents at the grant site.
+        """
+        import tempfile
+        tmp_roots = {
+            "/tmp", "/var/tmp",
+            os.path.realpath(tempfile.gettempdir()),
+        }
+        s = str(resolved)
+        # System paths could never be the target's own include/ dir
+        # (path-boundary compare: /etcetera is not /etc).
+        for blocked in ("/etc", "/proc", "/sys", "/dev", "/boot"):
+            if s == blocked or s.startswith(blocked + os.sep):
+                return "system path"
+        # <shared-temp-root>/include is creatable by any local user.
+        if str(resolved.parent) in tmp_roots:
+            return "direct child of a shared temp root"
+        if resolved == Path(resolved.anchor):
+            return "filesystem root"
+        if repo_resolved.is_relative_to(resolved):
+            return "superset of the target"
+        if not any(resolved.is_relative_to(base) for base in bases):
+            return "outside the walked ancestor subtree"
+        return None
+
+    def _discover_ancestor_includes(self, max_depth: int = 3) -> list[str]:
+        """Find ``include/`` directories at ancestors of ``self.repo_path``.
+
+        Used by the synthesised-compile fallback to rescue subdir
+        targets where the public headers live in a sibling of the
+        compiled subdir. Example: repo_path ==
+        ``curl-8.11.0/lib`` — headers at ``curl-8.11.0/include/``.
+
+        Returns absolute paths (the includes are by construction
+        outside repo_path; relative paths would all start with
+        ``../`` and depend on the compiler's cwd at compile time).
+        Bounded depth so a deep target doesn't spend the entire
+        detection budget on filesystem stat() calls.
+
+        Safety: same X_OK + symlink-escape checks the cmake
+        detection path uses. An ``include/`` symlinked to /etc on
+        a malicious target would otherwise leak the operator's
+        filesystem layout into the compile script.
+        """
+        found: list[str] = []
+        try:
+            current = self.repo_path.resolve(strict=False)
+        except OSError:
+            return found
+        repo_resolved = current
+        # World-writable temp roots. <temp-root>/include is never a
+        # legitimate ancestor include dir: ANY local user could
+        # pre-create it and shadow system headers in every
+        # synthesised compile (a target extracted directly under
+        # /tmp would walk up to /tmp itself). An include/ inside an
+        # operator-owned subtree of the temp dir (/tmp/proj/include)
+        # stays eligible — only the shared roots are blocked.
+        import tempfile
+        tmp_roots = {
+            "/tmp", "/var/tmp",
+            os.path.realpath(tempfile.gettempdir()),
+        }
+        for _ in range(max_depth):
+            current = current.parent
+            if str(current) in tmp_roots:
+                continue
+            if not current.is_dir():
+                break
+            if not os.access(current, os.X_OK):
+                break
+            include_dir = current / "include"
+            try:
+                inc_resolved = include_dir.resolve(strict=False)
+            except OSError:
+                continue
+            if not (include_dir.is_dir() and os.access(include_dir, os.X_OK)):
+                continue
+            # Sanity-check the resolved path BEFORE the recursive
+            # header walk (a hostile resolution must not even be
+            # enumerated). The predicate set is shared with the
+            # pre-dry-run grant re-vet (`_ancestor_include_refusal`)
+            # so the two sites cannot drift: system paths, shared
+            # temp roots, filesystem root, repo supersets, and any
+            # resolution that leaves the ancestor subtree the
+            # candidate was found in — the rescue exists for IN-TREE
+            # sibling include dirs only; downstream a grant becomes
+            # both a compile `-I<dir>` and a dry-run sandbox readable
+            # grant on host content the operator never scoped in.
+            reason = self._ancestor_include_refusal(
+                inc_resolved, repo_resolved, [current])
+            if reason is not None:
+                logger.debug(
+                    "Skipping ancestor include candidate %s (%s)",
+                    include_dir, reason,
+                )
+                continue
+            if self._has_c_header(inc_resolved):
+                found.append(str(inc_resolved))
+        return found
+
+    @staticmethod
+    def _has_c_header(path: Path) -> bool:
+        """True if ``path`` contains at least one .h/.hpp/.hh file.
+
+        Walks until the FIRST hit (early exit, so a real include tree
+        answers after one directory) but the walk itself is bounded by
+        ``_MAX_WALK_DIRS`` — the early exit is no bound at all on a
+        header-free empty-dir farm. Suffix match is case-sensitive,
+        the same rule ``_walk_files`` applies when the missing-header
+        scan collects existing header NAMES: a case-insensitive match
+        here fed dirs whose headers the case-sensitive collection then
+        missed. Never follows directory symlinks (a hostile
+        ``include`` tree must not walk the host filesystem)."""
+        dirs_seen = 0
+        try:
+            for _dirpath, _dirnames, filenames in os.walk(
+                path, followlinks=False,
+            ):
+                dirs_seen += 1
+                if dirs_seen > _MAX_WALK_DIRS:
+                    logger.warning(
+                        "Header probe under %s hit the %d-dir cap — "
+                        "treating as header-free", path, _MAX_WALK_DIRS,
+                    )
+                    return False
+                for name in filenames:
+                    if name.endswith((".h", ".hpp", ".hh")):
+                        return True
+        except OSError:
+            return False
+        return False
+
+    def detect_missing_config_headers(self) -> list[tuple[str, Path]]:
+        """Detect referenced ``*config.h``-shaped headers that don't
+        exist on disk anywhere reachable.
+
+        Returns a list of (header_name, source_file_that_references_it)
+        tuples. Pure diagnostic — does NOT generate or auto-run
+        anything. Caller decides whether to log a WARNING + suggest
+        the operator pre-run ``./configure`` / ``cmake`` to materialise
+        the missing headers.
+
+        Heuristic: scan up to 200 .c/.cpp files at the top of
+        repo_path's sort order; grep for ``#include "<name>_config.h"``
+        or ``#include "config.h"``; cross-check whether each referenced
+        name exists anywhere under repo_path OR any ancestor we'd
+        consider for include discovery. Bounded scan + bounded
+        per-file read so an oversized target doesn't dominate
+        detection wall time.
+        """
+        import re
+        missing: list[tuple[str, Path]] = []
+        # Build the set of header names that DO exist on disk —
+        # repo_path + ancestor includes we'd consider.
+        existing_header_names = set()
+        for h in _walk_files(self.repo_path, (".h", ".hpp", ".hh")):
+            existing_header_names.add(h.name)
+        for parent_inc in self._discover_ancestor_includes(max_depth=3):
+            try:
+                for h in _walk_files(Path(parent_inc), (".h", ".hpp", ".hh")):
+                    existing_header_names.add(h.name)
+            except OSError:
+                continue
+
+        # Pattern: #include "something_config.h" OR #include "config.h".
+        # Case-SENSITIVE end to end: the existing-header name set is
+        # collected case-sensitively, so an IGNORECASE grep here
+        # reported "missing" for spellings the collection deliberately
+        # does not track (C itself is case-sensitive; the lowercase
+        # `#include` keyword and `*config.h` convention are the real
+        # shapes).
+        pattern = re.compile(
+            # Horizontal-only indent — the MULTILINE ^\s* idiom is
+            # quadratic on blank-line runs in scanned source.
+            r'^[^\S\n]*#\s*include\s*"([^"]*config(?:_[a-z0-9_]+)?\.h)"',
+            re.MULTILINE,
+        )
+        seen_missing = set()
+        sources: list[Path] = []
+        # Also scan local .h files — many projects use a gateway
+        # header (e.g. curl's ``curl_setup.h``) that does the
+        # ``#include "curl_config.h"`` so the .c files never
+        # reference the config header directly.
+        sources.extend(
+            _walk_files(self.repo_path, (".c", ".cc", ".cpp", ".cxx",
+                                         ".h", ".hpp")),
+        )
+        # Cap at 200 files to bound scan time on huge targets.
+        for src in sorted(sources, key=lambda p: (len(p.parts), str(p)))[:200]:
+            # Hardened head read: this scan runs in the UNSANDBOXED
+            # parent over untrusted directory entries, and _walk_files
+            # yields every file type — a raw open() on a writer-less
+            # FIFO named `a.c` blocks forever with nothing to kill it
+            # but the operator. read_text_capped opens O_NOFOLLOW +
+            # O_NONBLOCK and refuses non-regular files, degrading to
+            # skip — the same answer an unreadable file already got.
+            from core.source import read_text_capped
+            got = read_text_capped(src, 65536)
+            if got is None:
+                continue
+            text = got[0]
+            for m in pattern.finditer(text):
+                header = m.group(1)
+                if header in existing_header_names:
+                    continue
+                if header in seen_missing:
+                    continue
+                seen_missing.add(header)
+                missing.append((header, src))
+        return missing
+
+    @staticmethod
+    def _is_cmake_project_root(cmakelists: Path) -> bool:
+        """Return True if ``CMakeLists.txt`` declares itself a project
+        root (carries ``cmake_minimum_required`` or ``project()``).
+
+        Subdirectory CMakeLists fragments — e.g. ``curl-8.11.0/lib/CMakeLists.txt``,
+        meant to be included via ``add_subdirectory`` from a parent —
+        carry neither declaration and cannot be configured standalone:
+        ``cmake .`` from such a directory fails with "No
+        cmake_minimum_required command is present."
+
+        Detection: scan for either keyword at the start of any
+        non-comment line (case-insensitive — CMake commands are
+        not case-sensitive in the language). Leading whitespace
+        is tolerated so a ``project()`` inside an
+        ``if(BUILD_SOMETHING)`` block still counts. Bounded read
+        (first 64 KB) — real CMakeLists files rarely exceed this;
+        the cap protects against pathological inputs.
+        """
+        # Hardened head read (unsandboxed parent, untrusted entry): a
+        # FIFO or device node planted at a CMakeLists.txt path must
+        # degrade to "not a project root", never block the open.
+        from core.source import read_text_capped
+        got = read_text_capped(cmakelists, 65536)
+        if got is None:
+            return False
+        head = got[0]
+        for raw in head.splitlines():
+            line = raw.lstrip().lower()
+            if line.startswith(("cmake_minimum_required", "project(")):
+                return True
+        return False
+
+    # package.json manifests are small (npm publishes reject >~1 MiB
+    # manifests); 2 MiB is a generous ceiling for the size gate below.
+    _PACKAGE_JSON_MAX_BYTES: ClassVar[int] = 2 * 1024 * 1024
+
+    def _has_build_script(self, package_json: Path) -> bool:
+        """Check if package.json has a build script.
+
+        The manifest lives in the SCANNED (untrusted) repo and this
+        method runs in the unsandboxed parent, so the bytes are gated
+        BEFORE any parse — via the shared hardened reader
+        (``macro_config._read_bounded``: O_NOFOLLOW so a package.json
+        symlinked at /dev/zero is refused, O_NONBLOCK so a FIFO can't
+        block ``open`` forever, fstat regular-file + size gate before
+        any read, grew-past-cap re-check). This method used to carry
+        its own inline copy of that whole gate. Anything failing it
+        degrades to "no build script", same as a malformed manifest.
+        """
+        import json
+
+        from core.build.macro_config import _read_bounded
+        try:
+            raw = _read_bounded(package_json, self._PACKAGE_JSON_MAX_BYTES)
+        except (OSError, ValueError) as e:
+            logger.debug("Cannot read package.json: %s", e)
+            return False
+        try:
+            # Leading U+FEFF: the utf-8 BOM under the reader's
+            # errors="replace" decode (same contract the previous
+            # utf-8-sig decode provided).
+            data = json.loads(raw.lstrip("\ufeff"))
+            if not isinstance(data, dict):
+                return False
+            scripts = data.get("scripts", {})
+            return isinstance(scripts, dict) and "build" in scripts
+        except Exception as e:  # noqa: BLE001 — malformed manifest degrades to no-build-script
+            logger.debug("Error parsing package.json: %s", e)
+            return False
+
+    # Version probes run from the filesystem root — NEVER from inside
+    # the scanned repo. Build tools auto-load configuration relative
+    # to cwd (or an ancestor found by walking upward), even for bare
+    # version invocations:
+    #   * Maven's launcher discovers the project dir by walking up
+    #     from cwd and loads `.mvn/jvm.config` / `.mvn/maven.config` /
+    #     `.mvn/extensions.xml` from it — for `mvn --version` too. A
+    #     hostile repo shipping `.mvn/jvm.config` with
+    #     `-javaagent:<repo>/evil.jar` executes attacker code during
+    #     the probe, before any build is attempted.
+    #   * yarn classic honours `yarn-path` from a `.yarnrc` in cwd or
+    #     an ancestor and EXECUTES the named script for any
+    #     subcommand, `--version` included.
+    #   * dotnet consults `global.json`, bundler walks up looking for
+    #     a Gemfile — same discovery shape, lower impact.
+    # The probes only answer "is the tool installed"; they need no
+    # repo cwd at all. `os.sep` terminates every upward config walk
+    # at root-owned paths. Deliberately NOT a tempdir: /tmp is
+    # world-writable, so a walk up from a private mkdtemp would still
+    # honour a locally planted `/tmp/.mvn`. With argv a RAPTOR
+    # constant, env from get_safe_env(), and cwd neutralised, the
+    # probe has no attacker-controlled input — which is what the
+    # _run_trusted doctrine requires.
+    _PROBE_CWD: ClassVar[str] = os.sep
+
+    # Build type → tool-availability probe. Class-level (not a local)
+    # deliberately: the neutral-cwd regression test enumerates THIS
+    # map, so every probe — current and future — is covered by the
+    # cwd-never-inside-the-repo assertion. A probe added here cannot
+    # silently reopen the class the maven `.mvn/jvm.config` incident
+    # belonged to without failing that test.
+    # Every type BUILD_SYSTEMS can emit MUST have an entry here (a
+    # regression test enumerates both maps): validate_build_command
+    # returns False for unknown types, and the CodeQL caller downgrades
+    # an unvalidated detection to no-build mode — a missing entry
+    # silently discards a perfectly good detected command on EVERY run
+    # for that build system (autotools and meson shipped that way).
+    _VALIDATION_COMMANDS: ClassVar[dict[str, list[str]]] = {
+        "maven": ["mvn", "--version"],
+        "gradle": ["gradle", "--version"],
+        "ant": ["ant", "-version"],
+        "npm": ["npm", "--version"],
+        "yarn": ["yarn", "--version"],
+        "pnpm": ["pnpm", "--version"],
+        "pip": ["pip", "--version"],
+        "poetry": ["poetry", "--version"],
+        # `python setup.py build` — probe the interpreter the command
+        # names, not setuptools itself (import errors surface in the
+        # real build with a clear message).
+        "setuptools": ["python", "--version"],
+        "gomod": ["go", "version"],
+        "cmake": ["cmake", "--version"],
+        # `./configure && make`: configure is repo-shipped and never
+        # executed at validation time (same doctrine as the gradle
+        # wrapper special-case above — repo code doesn't run in the
+        # probe), so the system tool the command actually needs is
+        # make. autoconf is deliberately NOT probed: it generates
+        # configure but the detected command never invokes it.
+        "autotools": ["make", "--version"],
+        "meson": ["meson", "--version"],
+        "make": ["make", "--version"],
+        "dotnet": ["dotnet", "--version"],
+        "msbuild": ["msbuild", "-version"],
+        "bundler": ["bundle", "--version"],
+        "rake": ["rake", "--version"],
+    }
+
+    def validate_build_command(self, build_system: BuildSystem, timeout: int = 30) -> bool:
+        """
+        Validate that build command can be executed.
+
+        Does a quick check (e.g., mvn --version, gradle --version) to ensure
+        the build tool is available.
+
+        Args:
+            build_system: BuildSystem to validate
+            timeout: Timeout in seconds
+
+        Returns:
+            True if build command is likely to work
+        """
+        validation_cmd = self._VALIDATION_COMMANDS.get(build_system.type)
+
+        # Gradle wrapper: when detection kept the project's own ./gradlew
+        # as the build command, probing system `gradle` is wrong —
+        # wrapper-only projects (the common Gradle layout, no system
+        # gradle installed) would fail validation with "gradle not found
+        # in PATH" although the actual build command works. Do NOT
+        # execute the wrapper here: it is untrusted repo code and
+        # _run_trusted is reserved for system tools. Validate what the
+        # wrapper actually needs instead: the script itself (exists +
+        # executable) and a JVM on PATH.
+        if build_system.type == "gradle" and str(build_system.command).strip().startswith("./gradlew"):
+            wrapper_dir = (
+                Path(build_system.working_dir)
+                if build_system.working_dir else self.repo_path
+            )
+            gradlew = wrapper_dir / "gradlew"
+            if not gradlew.is_file() or not os.access(gradlew, os.X_OK):
+                logger.warning(
+                    "✗ gradle wrapper %s missing or not executable", gradlew,
+                )
+                return False
+            validation_cmd = ["java", "-version"]
+
+        if not validation_cmd:
+            # Unknown build-tool type. Pre-fix we returned True
+            # ("Assume it's OK if we can't validate") — but the
+            # next caller-side step is `--build-command "<bs.cmd>"`
+            # against `codeql database create`, which spawns the
+            # tool and fails opaquely if it isn't installed. The
+            # operator sees a CodeQL extraction error two minutes
+            # into a database build, not a clear "tool missing"
+            # warning at validation time.
+            #
+            # Returning False here is the honest answer: we have
+            # no evidence the build will succeed. The caller's
+            # validation-failed branch logs and skips this
+            # language with a useful message; the optimistic-True
+            # branch silently let unbuildable matrix entries
+            # through.
+            #
+            # Still log at debug so legitimately-unknown tool
+            # types (e.g. obscure JVM build systems we haven't
+            # added probes for yet) leave a breadcrumb when
+            # operators report unexpected validation failures.
+            logger.debug(
+                "No validation command for %s; treating as "
+                "unvalidated (returning False) — add a probe "
+                "command to validation_commands above to opt in.",
+                build_system.type,
+            )
+            return False
+
+        # Pre-flight working_dir exists + is a directory. The probe
+        # itself no longer runs there (see _PROBE_CWD), but the build
+        # command being validated does — a missing working_dir (e.g.
+        # detection picked a candidate whose parent was deleted
+        # between detection and validation, or a stale BuildSystem
+        # was serialised across runs) means the actual build will
+        # fail, so report it here with a warning that names the real
+        # issue rather than the misleading "build tool not found".
+        wd = Path(build_system.working_dir) if build_system.working_dir else None
+        if wd is not None and not wd.is_dir():
+            logger.warning(
+                "✗ %s validation skipped: working_dir %r doesn't exist",
+                build_system.type, str(wd),
+            )
+            return False
+
+        try:
+            result = _run_trusted(  # --version checks only
+                validation_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                # SECURITY: neutral cwd — never the scanned repo.
+                # With cwd inside the target, `mvn --version` loaded
+                # a repo-shipped `.mvn/jvm.config` (-javaagent = code
+                # execution) outside every sandbox tier. See the
+                # _PROBE_CWD rationale above.
+                cwd=self._PROBE_CWD,
+            )
+            success = result.returncode == 0
+            if success:
+                logger.debug("✓ Validated %s is available", build_system.type)
+            else:
+                logger.warning("✗ %s validation failed", build_system.type)
+            return success
+        except FileNotFoundError:
+            logger.warning(
+                "✗ %s not found in PATH (probe: %s)",
+                build_system.type, validation_cmd[0],
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            logger.warning("✗ %s validation timed out", build_system.type)
+            return False
+        except Exception as e:  # noqa: BLE001 — any probe failure means unvalidated
+            logger.warning("✗ Error validating %s: %s", build_system.type, e)
+            return False
+
+    # Languages that require compilation for CodeQL database creation.
+    COMPILED_LANGUAGES: ClassVar[set[str]] = {"cpp", "java", "csharp", "swift", "rust"}
+
+    # Validates individual compiler flag tokens.
+    # No $, backticks, semicolons, pipes, quotes, etc.
+    # Note: -I/ (root include) is technically allowed — file permissions are
+    # the protection. CodeQL's --source-root prevents system headers from
+    # being indexed as project code.
+    # Pre-fix this used `^...$`. Python regex `$` matches end-of-
+    # string OR just-before-a-trailing-newline, so a flag token
+    # `-DEVIL=$(rm -rf $HOME)\n` passed validation: the trailing
+    # `\n` was eaten by `$`. The safe-flag token then flowed into
+    # the build script as `-DEVIL=$(rm -rf $HOME)` (the newline
+    # got stripped) — and even more dangerously, in some
+    # contexts the embedded `\n` carried through to subprocess
+    # arg lists, where the next process's argv parser saw two
+    # arguments: the flag plus whatever followed the newline.
+    #
+    # Use `\A...\Z` for unambiguous string-boundary anchors:
+    # `\Z` doesn't accept the trailing newline, so the
+    # injection-shaped flag is correctly rejected.
+    #
+    # Space is in the character class: a flag reaches the compiler
+    # as ONE argv element via subprocess list args (no shell), so an
+    # embedded space is data, not a token separator. Auto-detected
+    # include dirs like "-Ithird party/inc" depend on this. Shell
+    # metacharacters ($, backticks, quotes, ;, |, newline …) remain
+    # rejected.
+    _SAFE_FLAG_TOKEN = re.compile(r'\A-?[A-Za-z0-9._/+= -]+\Z')
+
+    # Flags whose value arrives as a SEPARATE argv token. Only these
+    # get split (on the first space); everything else stays one argv
+    # token even when it contains spaces — whitespace-splitting every
+    # flag mangled spaced include paths ("-Ithird party/inc" became
+    # "-Ithird" plus a bogus positional "party/inc", both of which
+    # passed validation individually).
+    _PAIR_FLAG_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {"-include", "-sourcepath", "-cp", "-classpath"}
+    )
+
+    # Flag-NAME allowlist for synthesised builds. The metacharacter
+    # check alone let any flag name through — the CC prompt promises
+    # "-I/-D/-include/-std only", but a prompt-injected model reply
+    # could smuggle code-execution flags (-fplugin=, -B, -specs=,
+    # --wrapper) that are metacharacter-clean. Names here are every
+    # shape the heuristic detectors and the prompt contract emit.
+    # Unknown names are DROPPED AND LOGGED, not fatal: a build missing
+    # an exotic flag degrades visibly, and operators who genuinely
+    # need one have the trusted escape hatch — /project set
+    # build-command[.<lang>] supplies the whole build command and
+    # bypasses flag synthesis entirely.
+    _SAFE_FLAG_NAME = re.compile(
+        r'\A(?:'
+        r'-I.+|-D[A-Za-z_].*'           # include dirs / defines
+        r'|-include|-std=.+'            # forced header / language std
+        r'|-sourcepath|-cp|-classpath'  # javac shapes
+        r')\Z'
+    )
+
+    def _validate_flags(self, flags: list) -> list:
+        """Validate and normalise compiler flags.
+
+        Accepts single tokens ("-DFOO", "-Idir with spaces" — one
+        argv element, space is data) and known pair flags
+        ("-include header.h", or ["-sourcepath", "<dir>"] as two list
+        elements — emitted as their two argv tokens). Two gates, both
+        required: no shell/Make metacharacters (character level) AND a
+        known flag name (_SAFE_FLAG_NAME).
+
+        Pair flags validate ATOMICALLY: a rejected value drops its
+        name too, and a name with no value is dropped. Emitting the
+        bare name would make the compiler consume the NEXT argv
+        element (-d, a source file …) as its value — one rejected
+        repo path used to strand "-sourcepath", which then ate the
+        javac "-d" and silently broke the whole traced build. A bare
+        non-dash token is accepted ONLY in pair-value position:
+        standalone positionals would splice arbitrary extra argv
+        (an attacker-chosen source file) into every compile.
+        """
+        # Flatten to candidate argv tokens (pair strings split once).
+        tokens: list[str] = []
+        for flag in flags:
+            if not isinstance(flag, str) or not flag.strip():
+                continue
+            first, _sep, rest = flag.partition(" ")
+            if first in self._PAIR_FLAG_NAMES and rest.strip():
+                tokens.extend([first, rest.strip()])
+            else:
+                tokens.append(flag)
+
+        safe: list = []
+        i = 0
+        n = len(tokens)
+        while i < n:
+            tok = tokens[i]
+            if tok in self._PAIR_FLAG_NAMES:
+                value = tokens[i + 1] if i + 1 < n else None
+                if value is None or value.startswith("-"):
+                    # No value present — drop the name alone and keep
+                    # lexing from the next token (it is a flag, not a
+                    # value).
+                    logger.warning(
+                        "Dropped pair flag without a value: %s", tok)
+                    i += 1
+                    continue
+                if self._SAFE_FLAG_TOKEN.match(value):
+                    safe.extend([tok, value])
+                else:
+                    # Fail-closed by design: the charset excludes
+                    # shell/Make metacharacters (parens, quotes,
+                    # non-ASCII), which also drops LEGITIMATE values —
+                    # e.g. a repo-root -sourcepath under a checkout
+                    # path containing parentheses. Widening the class
+                    # would let those characters reach generated build
+                    # scripts; the trusted escape hatch is the whole
+                    # point of the hint below.
+                    logger.warning(
+                        "Rejected unsafe compiler flag pair: %s %s "
+                        "(operators needing it: /project set "
+                        "build-command)", tok, value)
+                i += 2
+                continue
+            if not tok.startswith("-"):
+                logger.warning(
+                    "Dropped unpaired positional token: %s", tok)
+                i += 1
+                continue
+            if not self._SAFE_FLAG_TOKEN.match(tok):
+                logger.warning("Rejected unsafe compiler flag: %s", tok)
+            elif not self._SAFE_FLAG_NAME.match(tok):
+                logger.warning(
+                    "Dropped compiler flag outside the synthesis "
+                    "allowlist: %s (operators needing it: "
+                    "/project set build-command)", tok,
+                )
+            else:
+                safe.append(tok)
+            i += 1
+        return safe
+
+    def synthesise_build_command(self, language: str) -> BuildSystem | None:
+        """Synthesise a build command for compiled languages without a build system.
+
+        Generates a Python build script that compiles each source file via
+        subprocess.run (no shell, no quoting issues). CodeQL traces the gcc
+        invocations through its preload tracer.
+
+        Flow: heuristic build → dry-run → if failures and CC available,
+        CC suggests flags → validated → dry-run again → use best result.
+
+        All temporary files (script + build dir) are created via mkstemp/mkdtemp
+        and tracked in BuildSystem.cleanup_paths for the caller to clean up.
+
+        Returns None for unsupported languages or no source files.
+        """
+        # Pre-fix:
+        #   if language not in self.COMPILED_LANGUAGES or language not in ("cpp", "java"):
+        #       return None
+        # COMPILED_LANGUAGES contains 5 entries (cpp, java,
+        # csharp, swift, rust), but the second `or` clause
+        # narrows the gate to ("cpp", "java"). With `or`, the
+        # condition is True (and we return None) whenever EITHER
+        # check trips — and the ("cpp", "java") tuple is strictly
+        # narrower than COMPILED_LANGUAGES, so the first check
+        # never independently rejects anything the second check
+        # accepts. The COMPILED_LANGUAGES test is dead.
+        #
+        # Worse, the dead check misleads readers: it suggests
+        # synthesise_build_command supports the full
+        # COMPILED_LANGUAGES set when in fact it gates on the
+        # narrow 2-language tuple. The synthesiser body assumes
+        # cpp/java only (compiler detection in
+        # _detect_build_params, .java vs .cpp source-file
+        # filtering); enabling csharp/swift/rust here would just
+        # produce empty source_files and return None one branch
+        # later — but the misleading first check made it look
+        # like the function had broader scope.
+        #
+        # Replace with the single, honest gate.
+        if language not in ("cpp", "java"):
+            return None
+
+        source_files, compiler, include_flags, define_flags = self._detect_build_params(language)
+        if not source_files:
+            return None
+
+        # Ancestor -I rescues point OUTSIDE repo_path by construction
+        # (in-repo include flags stay relative). The dry-run sandbox
+        # restricts reads to repo + system dirs, so the discovered
+        # ancestor include dirs must be carved out explicitly or the
+        # rescue self-defeats under the read sandbox. Absolute -I
+        # flags are exactly the _discover_ancestor_includes results —
+        # already ownership/system-path checked at discovery — but the
+        # grant is re-vetted here on the CURRENT resolution: a symlink
+        # swapped between discovery and grant must not widen the read
+        # sandbox. The grant only ever covers dirs inside the walked
+        # ancestor subtree (max_depth parents of the scan root) —
+        # roots, repo-supersets, and out-of-tree resolutions
+        # (`/usr`, a foreign `/home/...`) are all refused.
+        ancestor_read_dirs: list[str] = []
+        try:
+            repo_resolved = self.repo_path.resolve(strict=False)
+        except OSError:
+            repo_resolved = self.repo_path
+        # Filesystem roots never qualify as a base — for a shallow
+        # repo the third parent can be `/`, which would make the
+        # containment vacuous.
+        allowed_bases = [
+            p for p in list(repo_resolved.parents)[:3]
+            if p != Path(p.anchor)
+        ]
+        for flag in include_flags:
+            if not (isinstance(flag, str) and flag.startswith("-I")
+                    and os.path.isabs(flag[2:])):
+                continue
+            candidate = flag[2:]
+            try:
+                resolved = Path(candidate).resolve(strict=False)
+            except OSError:
+                continue
+            # Same predicate set as discovery (shared helper): a
+            # symlink swapped between discovery and grant must not
+            # smuggle in anything discovery would have refused —
+            # including a shared temp root's include dir, which for a
+            # /tmp-extracted target the parent-containment check
+            # alone admits (the walked-ancestor bases contain /tmp
+            # itself there).
+            reason = self._ancestor_include_refusal(
+                resolved, repo_resolved, allowed_bases)
+            if reason is not None:
+                logger.warning(
+                    "Refusing dry-run read grant for include dir %s — "
+                    "%s", candidate, reason,
+                )
+                continue
+            ancestor_read_dirs.append(candidate)
+
+        # Diagnostic — does NOT auto-run anything. If the target's
+        # .c files reference ``*_config.h``-shaped headers that
+        # don't exist on disk, surface a single WARNING listing
+        # them with the recommended manual fix. Configure/cmake
+        # auto-execution is intentionally out of scope (arbitrary
+        # code execution from untrusted source); the operator must
+        # opt in by running the build step themselves.
+        if language == "cpp":
+            try:
+                missing_cfg = self.detect_missing_config_headers()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("missing-config-header detection failed: %s", e)
+                missing_cfg = []
+            if missing_cfg:
+                names = sorted({h for h, _ in missing_cfg})
+                sample_src = missing_cfg[0][1]
+                logger.warning(
+                    "Synthesised compile: %d config-header(s) missing "
+                    "(%s) — referenced by e.g. %s. These are typically "
+                    "generated by ``./configure`` or ``cmake`` at the "
+                    "project root. Re-run after pre-building (NOT "
+                    "auto-executed — arbitrary code execution risk) to "
+                    "recover full CodeQL coverage. Synthesised build "
+                    "will continue with partial coverage.",
+                    len(names), ", ".join(names[:5]) + ("..." if len(names) > 5 else ""),
+                    sample_src,
+                )
+
+        # Create build dir and script once — reused across heuristic and CC.
+        # Hand-rolled (not scratch_dir, not reaper-listed): cleanup
+        # ownership transfers to the caller via cleanup_paths, and the
+        # dir lives under the scanned repo, not the system tmp — the
+        # tmp reaper only sweeps the system tmp root, so a SIGKILL
+        # residue here is operator-visible in the target tree instead.
+        import tempfile
+        cleanup: list[Path] = []
+        try:
+            build_dir = Path(tempfile.mkdtemp(prefix=".raptor_build_", dir=self.repo_path))
+            cleanup.append(build_dir)
+            fd, script_name = tempfile.mkstemp(
+                prefix=".raptor_build_", suffix=".py", dir=self.repo_path,
+            )
+            script_path = Path(script_name)
+            cleanup.insert(0, script_path)
+            # Record ownership before close: even a close failure must remove
+            # the script and directory. Never retry close on an uncertain fd.
+            os.close(fd)
+            build_cmd = f"{sys.executable} {quote(str(script_path))}"
+
+            # Write heuristic build script and dry-run
+            self._write_build_script(
+                script_path, build_dir,
+                source_files, compiler, include_flags, define_flags,
+            )
+            logger.info("Synthesised build script for %s: %s", language, script_path)
+            logger.info("  Source files: %d", len(source_files))
+
+            failures = self._dry_run(
+                script_path, language=language,
+                extra_readable=ancestor_read_dirs,
+            )
+            build_type = "synthesised"
+            confidence = 0.7
+
+            # `failures is None` → dry-run never ran (script crashed,
+            # sandbox-launch failed, timeout). We can't measure
+            # whether the heuristic flags work, so don't attempt a
+            # CC-suggest retry (the second dry-run would fail the same
+            # way and waste budget).
+            if failures is None:
+                logger.warning(
+                    "  Dry-run didn't execute — using heuristic flags without measurement",
+                )
+            elif failures:
+                heuristic_ok = len(source_files) - len(failures)
+                logger.info("  Dry-run: %d/%d compiled, %d failed", heuristic_ok, len(source_files), len(failures))
+
+                cc_flags = self._cc_suggest_flags(failures, language)
+                if cc_flags:
+                    self._write_build_script(
+                        script_path, build_dir, source_files, compiler,
+                        include_flags + cc_flags.get("includes", []),
+                        define_flags + cc_flags.get("defines", []),
+                    )
+                    cc_failures = self._dry_run(
+                        script_path, language=language,
+                        extra_readable=ancestor_read_dirs,
+                    )
+                    if cc_failures is None:
+                        logger.info("  CC retry didn't run — keeping heuristic")
+                        # The script on disk currently contains the UNMEASURED
+                        # CC flags — restore the heuristic script so the build
+                        # command matches what the log just promised.
+                        self._write_build_script(
+                            script_path, build_dir,
+                            source_files, compiler, include_flags, define_flags,
+                        )
+                    else:
+                        cc_ok = len(source_files) - len(cc_failures)
+                        if cc_ok > heuristic_ok:
+                            logger.info("  CC improved: %d → %d compiled", heuristic_ok, cc_ok)
+                            build_type = "synthesised-cc"
+                            # Keep the CC-flag script already on disk — it just
+                            # measured better. Pre-fix this branch fell through
+                            # to an unconditional heuristic rewrite, discarding
+                            # the improvement while build_type still claimed
+                            # "synthesised-cc".
+                        else:
+                            logger.info("  CC didn't improve, using heuristic")
+                            self._write_build_script(
+                                script_path, build_dir,
+                                source_files, compiler, include_flags, define_flags,
+                            )
+                        confidence = 0.5
+                else:
+                    confidence = 0.5
+            else:
+                logger.info("  Dry-run: all files compiled successfully")
+            # Ownership transfers only after constructing the result.
+            return BuildSystem(
+                type=build_type, command=build_cmd,
+                working_dir=self.repo_path, env_vars={},
+                confidence=confidence, detected_files=[],
+                cleanup_paths=cleanup,
+            )
+        except BaseException:
+            cleanup_build_paths(cleanup, preserve_error=True)
+            raise
+
+    def _detect_build_params(self, language: str):
+        """Detect source files, compiler, and include/define flags."""
+        source_files: list[Path] = []
+        if language == "cpp":
+            source_files.extend(
+                _walk_files(self.repo_path, (".c", ".cc", ".cpp", ".cxx")),
+            )
+            has_cpp = any(f.suffix in (".cpp", ".cc", ".cxx") for f in source_files)
+            compiler = "g++" if has_cpp else "gcc"
+
+            # Auto-detect -I flags from header locations
+            include_flags = set()
+            for h in _walk_files(self.repo_path, (".h", ".hpp", ".hh")):
+                try:
+                    include_flags.add(f"-I{h.parent.relative_to(self.repo_path)}")
+                except ValueError:
+                    pass
+            # Subdir-target rescue: walk UP from repo_path looking for
+            # sibling ``include/`` directories at ancestors. Real-world
+            # case: repo_path points at ``curl-8.11.0/lib`` and the
+            # public headers live at ``curl-8.11.0/include/curl/``;
+            # without this rescue, every ``#include <curl/curl.h>`` in
+            # the .c files fails to resolve and the synthesised
+            # compile produces a near-empty CodeQL database.
+            #
+            # Compile-context expansion only — these -I paths let the
+            # compiler find headers, but CodeQL DB still scopes to
+            # compilation events INSIDE the build target. No expansion
+            # of operator-stated scan scope.
+            for parent_inc in self._discover_ancestor_includes():
+                include_flags.add(f"-I{parent_inc}")
+            flag_list = sorted(include_flags)
+        elif language == "java":
+            source_files = _walk_files(self.repo_path, (".java",))
+            compiler = "javac"
+            flag_list = ["-sourcepath", str(self.repo_path)]
+        else:
+            return [], "", [], []
+
+        # Validate all auto-detected flags
+        flag_list = self._validate_flags(flag_list)
+        return source_files, compiler, flag_list, []
+
+    def _java_synthesised_classpath(self) -> list[str]:
+        """When we fall through to raw javac (no pom.xml/build.gradle/
+        build.xml), any external JARs the code depends on typically
+        live under `repo/lib/*.jar` by informal convention. Build a
+        classpath from that directory if it exists.
+
+        Returns an empty list on any of:
+         - no lib/ dir
+         - lib/ exists but has no .jar files
+         - repo_path doesn't resolve (shouldn't happen)
+
+        Rationale & edge cases in ~/design/env-handling.md (Q6).
+        Repo-scoped construction — does NOT inherit any host CLASSPATH.
+        """
+        lib_dir = self.repo_path / "lib"
+        if not lib_dir.is_dir():
+            return []
+        jars = sorted(str(p) for p in lib_dir.glob("*.jar"))
+        if jars:
+            logger.info(
+                "  Java synthesised build: %s jar(s) from lib/ added to classpath. If CodeQL semantics look wrong, inspect lib/ for stale/unused JARs.", len(jars)
+            )
+        return jars
+
+    def _write_build_script(self, script_path: Path, build_dir,
+                            source_files, compiler, include_flags, define_flags):
+        """Write a Python build script that compiles via subprocess.run.
+
+        Security model:
+        - No shell: compiler args are a Python list → subprocess.run uses execve
+          directly. Filenames with spaces, $, quotes, etc. are safe.
+        - Data via repr(): all interpolated values use {!r} which produces valid
+          Python literals. No code injection via crafted paths or flags.
+        - Flags validated: _validate_flags rejects shell/Make metacharacters
+          before any flag reaches the script.
+        - Path traversal check: realpath + startswith('..') prevents symlinks
+          from writing object files outside the build directory.
+        - File permissions: script is chmod 0o500 after write (read+execute
+          only) to prevent modification between generation and execution.
+        - Build isolation: output goes to a mkdtemp directory, not the source
+          tree. Cleanup paths are tracked explicitly on the BuildSystem.
+
+        Reuses the same script_path and build_dir across heuristic and CC
+        attempts — one directory, one script, one cleanup.
+        """
+        # SECURITY: validate all flags before they reach the generated script
+        include_flags = self._validate_flags(include_flags)
+        define_flags = self._validate_flags(define_flags)
+
+        files_list = [str(f) for f in source_files]
+        repo_root = str(self.repo_path)
+        is_java = compiler == "javac"
+
+        # Java-only: build classpath from repo/lib/*.jar if present.
+        # Repo-scoped; does NOT inherit any host CLASSPATH (see
+        # core.config.DANGEROUS_ENV_VARS for why CLASSPATH is stripped).
+        # Joined with `os.pathsep` inside the generated script so we
+        # don't need to know the host's separator at generation time.
+        java_classpath_jars: list[str] = (
+            self._java_synthesised_classpath() if is_java else []
+        )
+
+        script_path.chmod(0o700)  # Temporarily writable for rewrites (CC path)
+        # SECURITY: all data interpolated via {!r} (Python repr) — produces
+        # valid Python literals, not executable code.
+        script_path.write_text(f'''#!/usr/bin/env python3
+"""Synthesised by RAPTOR for CodeQL database creation.
+
+Compiles each source file individually via subprocess.run (no shell).
+CodeQL traces the compiler invocations through its preload tracer.
+Tolerates individual compilation failures.
+"""
+import os, subprocess, sys, threading
+
+# Strip dynamic-loader injection vars from the env we pass to each
+# compile subprocess. CodeQL's tracer wraps the build script with
+# its own preload library to capture compiler invocations; the
+# script itself shouldn't FORWARD a parent's LD_PRELOAD /
+# LD_LIBRARY_PATH / DYLD_* / PYTHONPATH (or other code-injection
+# vars) to gcc/javac, which would then attach attacker code at
+# every compile step. Build a one-shot scrubbed env here; reuse
+# across the per-file loop.
+_SCRUB_ENV_VARS = (
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "PYTHONPATH", "PYTHONSTARTUP",
+    "BASH_ENV", "ENV",
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
+)
+# Pre-fix the script scrubbed _SCRUB_ENV_VARS only from the env
+# passed to gcc/javac subprocesses (`_BUILD_ENV` below). The script
+# ITSELF (this python3 process) inherited the parent's full env —
+# so an attacker who could plant `LD_PRELOAD=/tmp/evil.so` in the
+# parent (a poisoned `.envrc` in the target repo, an operator's
+# config that set it for unrelated reasons) attached attacker code
+# to the python3 interpreter running the build script. The
+# subsequent `os.environ.items()` iteration would then capture the
+# tainted env even with the scrub above (because the script's own
+# state was already compromised). Defang at script entry by
+# popping the scrub vars from `os.environ` BEFORE building
+# `_BUILD_ENV`. The python3 interpreter's already-loaded preload
+# can't be unloaded mid-run, but removing the env var means any
+# subprocesses (including subprocess.run / Popen calls below)
+# don't re-inherit the preload chain.
+for _v in _SCRUB_ENV_VARS:
+    os.environ.pop(_v, None)
+_BUILD_ENV = {{k: v for k, v in os.environ.items() if k not in _SCRUB_ENV_VARS}}
+
+COMPILER = {compiler!r}
+FLAGS = {(include_flags + define_flags)!r}
+BUILD_DIR = {str(build_dir)!r}
+REPO_ROOT = os.path.realpath({repo_root!r})
+FILES = {files_list!r}
+IS_JAVA = {is_java!r}
+JAVA_CLASSPATH_JARS = {java_classpath_jars!r}
+
+# Java-only: compose classpath from repo-scoped jar list + build dir.
+# os.pathsep handles Linux vs Windows separators (Linux ":").
+JAVA_CP = os.pathsep.join(JAVA_CLASSPATH_JARS + [BUILD_DIR]) if IS_JAVA else None
+
+total = len(FILES)
+ok = 0
+fail = 0
+created_dirs = set()
+for i, src in enumerate(FILES):
+    if i > 0 and i % 50 == 0:
+        print(f"  Compiling... {{i}}/{{total}}", file=sys.stderr)
+
+    # SECURITY: resolve symlinks and reject paths that escape the repo root.
+    # Prevents writing object files outside the build directory via symlinks.
+    # Path-boundary compare: an in-repo file NAMED `..weird.c` is not
+    # an escape (rel must be `..` itself or start with `../`).
+    rel = os.path.relpath(os.path.realpath(src), REPO_ROOT)
+    if rel == '..' or rel.startswith('..' + os.sep):
+        fail += 1
+        continue
+
+    # SECURITY: subprocess.run with list args — no shell, no injection.
+    # Filenames are list elements passed directly to execve.
+    if IS_JAVA:
+        # SECURITY: -proc:none disables annotation processing. The
+        # classpath above includes repo-supplied lib/*.jar, and javac
+        # auto-discovers annotation processors on the classpath via
+        # ServiceLoader — without this flag a hostile jar's processor
+        # runs ATTACKER CODE inside every javac invocation. CodeQL
+        # only needs the compilation events, not processor output.
+        cmd = [COMPILER, "-proc:none"] + FLAGS + ["-d", BUILD_DIR]
+        if JAVA_CP:
+            cmd += ["-cp", JAVA_CP]
+        cmd += [src]
+    else:
+        obj = os.path.join(BUILD_DIR, rel + ".o")
+        obj_dir = os.path.dirname(obj)
+        if obj_dir not in created_dirs:
+            os.makedirs(obj_dir, exist_ok=True)
+            created_dirs.add(obj_dir)
+        cmd = [COMPILER, "-w"] + FLAGS + ["-c", src, "-o", obj]
+
+    # Per-compile stderr cap. Pre-fix `stderr=subprocess.PIPE`
+    # buffered the full stderr stream into the parent before
+    # returning — for C++ template-instantiation errors a
+    # SINGLE source file can produce tens of MB of stderr.
+    # Across hundreds of source files in a target, the script's
+    # RSS grew unbounded. Operators saw the build script
+    # OOM-killed mid-pass.
+    #
+    # Use Popen + bounded read(N) so each compile's stderr is
+    # capped at 256 KB — enough for a useful diagnostic
+    # excerpt, hard upper bound. Drain remaining bytes via
+    # the reader loop so the child can finish without SIGPIPE.
+    #
+    # The bounded read + drain run in a helper THREAD: read()
+    # blocks until N bytes or EOF, so doing it inline before
+    # wait(timeout) let a hung compiler that held stderr open
+    # (while writing little) pin the script at the read forever
+    # — the documented kill-after-timeout below never fired.
+    # With the reader threaded, wait(timeout) is always reached;
+    # on kill the reader sees EOF and exits.
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, env=_BUILD_ENV)
+    _STDERR_CAP = 256 * 1024
+    _cap = {{"data": b""}}
+    def _read_stderr(p=proc, out=_cap):
+        if p.stderr is None:
+            return
+        out["data"] = p.stderr.read(_STDERR_CAP)
+        # Drain any remainder so the child unblocks on its
+        # next stderr write rather than hanging on a full
+        # pipe buffer (PIPE_BUF is 64 KB on Linux; without
+        # the drain, a child writing > 256 KB sleeps in
+        # write(2) waiting for a reader).
+        while p.stderr.read(64 * 1024):
+            pass
+    _reader = threading.Thread(target=_read_stderr, daemon=True)
+    _reader.start()
+    # Per-file compile timeout. Pre-fix `proc.wait()` had no
+    # bound — a runaway compile (gcc on a pathological template
+    # instantiation, javac on infinite annotation processing,
+    # deliberately slow input from an untrusted target) hung
+    # the whole build script forever. CodeQL DB build then
+    # blocked indefinitely with no progress signal.
+    # 120s is comfortably above any legitimate single-file
+    # compile (the slowest C++ template compiles in real
+    # codebases run ~30s); a hung compile gets killed and
+    # counted as a failure so the rest of the pass continues.
+    # RAPTOR_COMPILE_TIMEOUT_S overrides for tests / unusual
+    # toolchains.
+    try:
+        _COMPILE_TIMEOUT_S = int(os.environ.get("RAPTOR_COMPILE_TIMEOUT_S", "120"))
+    except ValueError:
+        _COMPILE_TIMEOUT_S = 120
+    try:
+        proc.wait(timeout=_COMPILE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        fail += 1
+        sys.stderr.buffer.write(
+            f"\\n[compile timeout {{_COMPILE_TIMEOUT_S}}s on {{src!r}}]\\n".encode()
+        )
+        continue
+    _reader.join(timeout=5)
+    captured = _cap["data"]
+    if proc.returncode == 0:
+        ok += 1
+    else:
+        fail += 1
+        sys.stderr.buffer.write(captured)
+        if proc.stderr is not None and len(captured) >= _STDERR_CAP:
+            sys.stderr.buffer.write(
+                # Doubled braces escape in the OUTER template so the
+                # generated script gets a literal brace pair (runtime
+                # f-string reference to the script-local _STDERR_CAP),
+                # NOT an outer-scope substitution. Pre-fix the single
+                # braces let the OUTER f-string evaluate _STDERR_CAP
+                # at template-generation time, which raised NameError
+                # because _STDERR_CAP only exists in the GENERATED
+                # script scope. (Note: keep this comment free of
+                # triple-quotes — the outer template uses triple
+                # single-quotes.)
+                f"\\n[truncated to first {{_STDERR_CAP // 1024}} KB]\\n".encode()
+            )
+
+print(f"Compiled {{ok}}/{{total}} files ({{fail}} failed)")
+''')
+        # SECURITY: make read+execute only after writing — prevents modification
+        # between generation and CodeQL execution (TOCTOU mitigation).
+        script_path.chmod(0o500)
+        return script_path
+
+    def _dry_run(self, script_path, language: str | None = None,
+                 extra_readable: list[str] | None = None) -> list | None:
+        """Run the build script and return compilation failures.
+
+        Returns:
+          * ``list`` of failures (possibly empty) — script ran to
+            completion. `[]` means "ran successfully, no errors".
+          * ``None`` — script did NOT run at all (subprocess failed to
+            spawn, timeout, sandbox-launch error). Distinct from
+            "ran with zero failures" because the CC-flag-suggest path
+            (which kicks in `if failures:`) shouldn't fire when we
+            simply couldn't measure anything.
+
+        Pre-fix this returned `[]` for both cases. The caller's
+        `if failures:` then took the "no improvement needed" branch
+        when the script crashed at startup (interpreter mismatch,
+        sandbox eviction), silently degrading the synthesised-build
+        flow to "use heuristic flags" when the actual problem was
+        "we never compiled anything to know if the heuristic worked".
+
+        `language` is used to pick the env vars the build tool expects
+        — for Java synthesised builds we auto-detect JAVA_HOME and
+        inject it into the script's env. Without this, javac is found
+        via PATH but the JDK layout (tools.jar, rt.jar on older JDKs)
+        may not resolve. Scoped to this one subprocess — see
+        ~/design/env-handling.md.
+
+        ``extra_readable`` names additional read-allowed roots under
+        ``restrict_reads`` — the caller passes the discovered ancestor
+        include dirs, which point outside ``repo_path`` by
+        construction. Without the carve-out the sandboxed compiler
+        gets EACCES on every ancestor header while the real CodeQL
+        build (which runs read-wide) would succeed: the dry-run then
+        reports failures the CC flag-suggest retry can never fix,
+        burning a paid dispatch and downgrading confidence for the
+        exact case the ancestor rescue exists for.
+        """
+        # Build env: sanitised base + toolchain auto-detection for the
+        # language. For Java synthesised-build path, this is JAVA_HOME.
+        # For C/C++, nothing to detect (CC/CXX resolved via PATH).
+        from core.config import RaptorConfig
+        env = RaptorConfig.get_safe_env()
+        # Extra read-allowed roots under restrict_reads: user-local
+        # toolchain installs (sdkman/asdf JDKs) live outside the
+        # default system-dirs allowlist.
+        readable: list[str] = list(extra_readable or [])
+        if language == "java":
+            from core.build.toolchain import apply_toolchain_env
+            apply_toolchain_env(env, ["JAVA_HOME"])
+            java_home = env.get("JAVA_HOME")
+            if java_home:
+                readable.append(java_home)
+
+        try:
+            repo_path = str(self.repo_path)
+            from core.sandbox.python_paths import python_runtime_tool_paths
+            _tps = python_runtime_tool_paths()
+            fresh_procfs = untrusted_fresh_procfs_required()
+            result = _sandbox_run(
+                [sys.executable, str(script_path)],
+                block_network=True,
+                require_fresh_procfs=fresh_procfs,
+                omit_proc_reads=not fresh_procfs,
+                # The script compiles UNTRUSTED repo content, so it
+                # gets the read restriction the other build probes
+                # use: no $HOME credentials on Landlock-only hosts.
+                # Reads: system dirs + target (script + build dir
+                # live under repo_path) + toolchain roots.
+                restrict_reads=True,
+                target=repo_path, output=repo_path,
+                cwd=self.repo_path,
+                env=env,
+                readable_paths=readable or None,
+                tool_paths=_tps or None,
+                capture_output=True, text=True, timeout=300,
+            )
+            # Script crash (not compilation failure) — treat as
+            # "didn't actually run a build" via None sentinel, NOT
+            # `[]` ("ran with zero failures"). Pre-fix the empty
+            # list collapsed both cases and the CC-flag-suggest
+            # path silently skipped its retry attempt.
+            if result.returncode != 0 and "Traceback" in result.stderr:
+                # `[-2]` reaches the second-to-last line, but
+                # `result.stderr.split("\n")[-2]` raises IndexError
+                # if stderr has fewer than 2 lines (e.g. the script
+                # crashed before printing anything, or printed a
+                # single line without a trailing newline). Pre-fix
+                # the IndexError aborted the warning emission AND
+                # dropped through to the bare `except Exception`
+                # below, returning [] (now None) but with the
+                # operator-visible cause swallowed. Defensive
+                # slicing: take the last non-empty line, or the
+                # whole stderr if there's only one line.
+                stderr_lines = [line for line in (result.stderr or "").split("\n") if line.strip()]
+                tail = stderr_lines[-1] if stderr_lines else "(no stderr)"
+                logger.warning("Build script crashed: %s", tail)
+                return None
+            if result.returncode != 0 and not any(
+                marker in result.stderr
+                for marker in (": error:", ": fatal error:")
+            ):
+                # Nonzero exit with no Python traceback AND no compiler
+                # diagnostics: signal death (OOM-kill → returncode -9,
+                # empty stderr), interpreter mismatch, wrapper failure.
+                # Nothing was measured — falling through to the stderr
+                # parse would return [] and the caller would log
+                # "all files compiled successfully" with confidence 0.7,
+                # exactly the collapsed case the None sentinel exists to
+                # prevent.
+                logger.warning(
+                    "Build script exited %d without compiler diagnostics "
+                    "— treating as 'didn't run'",
+                    result.returncode,
+                )
+                return None
+        except SandboxSetupError:
+            raise  # sandbox isolation could not engage — fail loud, never mask as a benign result
+        except (subprocess.TimeoutExpired, Exception) as e:  # noqa: BLE001 — any spawn failure maps to the None sentinel
+            logger.warning("Build script never ran (%r) — treating as 'didn't run'", e)
+            return None
+
+        # Parse gcc/g++ errors from stderr
+        failures: list[dict[str, Any]] = []
+        for line in result.stderr.split("\n"):
+            if ": error:" in line or ": fatal error:" in line:
+                parts = line.split(":", 1)
+                src_file = parts[0].strip() if parts else "unknown"
+                error = parts[1].strip() if len(parts) > 1 else "unknown"
+                if not any(f["file"] == src_file for f in failures):
+                    failures.append({"file": src_file, "error": error})
+        return failures
+
+    def _cc_suggest_flags(self, failures: list, language: str) -> dict | None:
+        """Ask CC to suggest -I and -D flags to fix compilation failures.
+
+        Security model:
+        - CC has read-only access (--allowed-tools Read,Grep,Glob)
+        - CC outputs JSON data, not code — parsed by json.loads
+        - Every flag from CC goes through _validate_flags before use
+        - CC cannot modify the build script or execute commands
+        - Invalid/malicious flags are silently rejected
+        """
+        import shutil as _shutil
+        claude_bin = _shutil.which("claude")
+        if not claude_bin:
+            return None
+        # Path allowlist for the resolved claude binary. `which` walks
+        # PATH, which an untrusted target repo could influence —
+        # `direnv`-style `.envrc`, a `pyproject.toml` build hook, or
+        # a Makefile that calls into the build_detector flow can
+        # prepend a malicious dir to PATH. The resolved absolute
+        # path must come from a known install location so an injected
+        # `claude` shim in the target repo doesn't get executed under
+        # CC's allowlisted-tool model.
+        try:
+            real_claude = os.path.realpath(claude_bin)
+        except OSError:
+            return None
+        allowed_prefixes = (
+            "/usr/local/bin/",
+            "/usr/bin/",
+            "/opt/",
+            os.path.expanduser("~/.local/bin/"),
+            os.path.expanduser("~/.npm-global/bin/"),
+            "/snap/",
+            "/home/linuxbrew/.linuxbrew/bin/",
+            "/opt/homebrew/bin/",
+        )
+        if not any(real_claude.startswith(p) for p in allowed_prefixes):
+            logger.info(
+                "  Skipping CC flag inference — `claude` resolves to %r which is outside the install-location allowlist. If this is a legitimate location, add it to _cc_suggest_flags' `allowed_prefixes`.", real_claude
+            )
+            return None
+
+        failure_sample = "\n".join(
+            f"- {f['file']}: {f['error']}" for f in failures[:15]
+        )
+
+        from core.security.prompt_defense_profiles import CONSERVATIVE
+        from core.security.prompt_envelope import UntrustedBlock, build_prompt
+
+        compiler = "gcc" if language == "cpp" else "javac"
+        system = (
+            f"I have a {language} project with no build system. "
+            f"Compilation with {compiler} -w -c and auto-detected -I flags "
+            f"partially works, but {len(failures)} files fail.\n\n"
+            "Read the source files to understand what's needed. Then output "
+            "ONLY a JSON object with two arrays — no other text:\n\n"
+            '{"includes": ["-Ipath1", "-Ipath2"], '
+            '"defines": ["-DFOO", "-DBAR=1", "-include header.h"]}\n\n'
+            "Rules:\n"
+            "- Only suggest -I, -D, -include, and -std flags\n"
+            "- Do NOT invent #define values that aren't in the source\n"
+            "- Paths should be relative to the project root"
+        )
+        bundle = build_prompt(
+            system=system,
+            profile=CONSERVATIVE,
+            untrusted_blocks=(
+                UntrustedBlock(
+                    content=str(self.repo_path),
+                    kind="project_path",
+                    origin="build_detector",
+                ),
+                UntrustedBlock(
+                    content=failure_sample,
+                    kind="compiler_errors",
+                    origin="build_detector",
+                ),
+            ),
+        )
+        prompt = next(m.content for m in bundle.messages if m.role == "user")
+
+        from core.security.cc_trust import check_repo_claude_trust
+        if check_repo_claude_trust(str(self.repo_path)):
+            logger.info("  Skipping CC flag inference — target repo has dangerous "
+                        "Claude Code config (see earlier warning). "
+                        "Pass --trust-repo to override.")
+            return None
+
+        try:
+            logger.info("  Asking Claude Code for additional compiler flags...")
+            from core.llm.cc_adapter import (
+                CCDispatchConfig,
+                build_cc_command,
+                cc_subprocess_env,
+                strip_json_fences,
+                system_prompt_file_for,
+            )
+            config = CCDispatchConfig(
+                claude_bin=claude_bin,
+                tools="Read,Grep,Glob",
+                add_dirs=(str(self.repo_path),),
+                budget_usd="2.00",
+                timeout_s=180,
+                capture_json_envelope=False,
+            )
+            repo_path = str(self.repo_path)
+            # Route hostname allowlist through cc_proxy_hosts so this
+            # site picks up the same calibrate-aware policy as
+            # cc_dispatch's main entry point — operator override,
+            # calibrated SandboxProfile, then provider-aware fallback.
+            # Pre-migration this hardcoded ``api.anthropic.com``,
+            # which silently broke Bedrock / Vertex / Azure /
+            # custom-endpoint setups. The downstream client is
+            # ``claude`` either way, so the policy is identical.
+            from core.llm.cc_proxy_hosts import (
+                proxy_hosts_for_cc_dispatch,
+                readable_paths_for_cc_dispatch,
+            )
+            # env: backend overlay (CLAUDE_CODE_*/ANTHROPIC_*/AWS_*) so a
+            # Bedrock/Vertex-backed CLI child can authenticate; the
+            # sandbox's proxy env still overrides HTTPS_PROXY.
+            #
+            # System prompt (when the config carries one) rides a 0600
+            # tempfile + --system-prompt-file — never in the child's
+            # world-readable /proc/<pid>/cmdline (see
+            # build_cc_command's hygiene contract). Spawn AND wait
+            # stay inside the CM; the file path joins readable_paths
+            # because restrict_reads=True keeps TMPDIR outside the
+            # sandbox's read allowlist.
+            with system_prompt_file_for(config) as _sys_prompt_path:
+                readable_paths = readable_paths_for_cc_dispatch(claude_bin)
+                if _sys_prompt_path is not None:
+                    readable_paths = [*readable_paths, str(_sys_prompt_path)]
+                result = _sandbox_run(
+                    build_cc_command(
+                        config, system_prompt_file=_sys_prompt_path,
+                    ),
+                    target=repo_path, output=repo_path,
+                    # mint_aws_credentials: sandboxed child (see
+                    # cc_adapter._mint_child_aws_credentials) — an IAM-role
+                    # Bedrock host leaves it credential-starved otherwise.
+                    env=cc_subprocess_env(mint_aws_credentials=True),
+                    use_egress_proxy=True,
+                    # The CC child reads the UNTRUSTED repo (add_dirs +
+                    # Read/Grep/Glob) and its prompt embeds untrusted
+                    # compiler stderr — repo content can steer what the
+                    # child does, so this is repo-influenced egress and
+                    # must use the netns tier (00015 doctrine, same as
+                    # the sca agent's CC dispatches). On a netns-less
+                    # host the SandboxSetupError is swallowed by this
+                    # method's except handler and flag inference is
+                    # skipped rather than run through the weaker tier.
+                    require_proxy_netns=True,
+                    proxy_hosts=proxy_hosts_for_cc_dispatch(claude_bin),
+                    # Read confinement, same posture as the other CC
+                    # dispatch sites (skill_dispatch, the sub-agent
+                    # dispatcher): the child carries backend credentials
+                    # in env and reads hostile repo content + compiler
+                    # stderr, so on Landlock-only hosts restrict_reads is
+                    # what keeps prompt-steered Read/Grep/Glob away from
+                    # $HOME and /proc beyond the calibrated CLI floor.
+                    restrict_reads=True,
+                    readable_paths=readable_paths,
+                    caller_label="codeql-build-detect",
+                    input=prompt, capture_output=True, text=True, timeout=180,
+                )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+
+            # Cap JSON parse input. Pre-fix `result.stdout` could be
+            # arbitrarily large (CC model hallucinates and emits MB
+            # of "JSON"; CC subprocess could be tricked into echoing
+            # a large file via Read+output); json.loads would gladly
+            # consume the entire blob, allocating proportional
+            # memory + serialising it through the parser. The
+            # genuine response shape — `{"includes": [...],
+            # "defines": [...]}` with maybe 50 entries each at
+            # <100 chars — comfortably fits in 100KB. Anything
+            # larger is hallucination or attack.
+            _CC_JSON_MAX_BYTES = 100 * 1024
+            stdout = result.stdout.strip()
+            if len(stdout) > _CC_JSON_MAX_BYTES:
+                logger.warning(
+                    "CC suggest-flags output exceeded %d bytes (%d) — rejecting",
+                    _CC_JSON_MAX_BYTES, len(stdout),
+                )
+                return None
+            content = strip_json_fences(stdout)
+
+            import json
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                # Recover by scanning forward through `{` positions and
+                # picking the FIRST one whose tail JSON-parses cleanly.
+                # Pre-fix `idx = content.index("{")` always picked the
+                # first `{` — but LLM prose with embedded `{` glyphs
+                # ("the function takes { foo, bar } as params, here is
+                # the JSON: {valid}") parsed from the wrong position
+                # and silently dropped the real answer. Bound the
+                # scan at 16 attempts so a CC output full of literal
+                # `{` glyphs (a list of code samples) doesn't burn
+                # measurable wallclock retrying.
+                data = None
+                _attempts = 0
+                _start = 0
+                while _attempts < 16:
+                    idx = content.find("{", _start)
+                    if idx < 0:
+                        break
+                    try:
+                        data = json.loads(content[idx:])
+                        break
+                    except (ValueError, json.JSONDecodeError):
+                        _start = idx + 1
+                        _attempts += 1
+                if data is None:
+                    logger.debug(
+                        "CC output wasn't valid JSON after %d brace probes",
+                        _attempts,
+                    )
+                    return None
+
+            # Pre-fix `data.get("includes", [])` returned the
+            # default `[]` only when the key was MISSING. If the
+            # CC LLM emitted `{"includes": null, "defines": null}`
+            # (common when the model thought "no useful suggestion"
+            # and serialised null instead of an empty array), the
+            # `.get("includes", [])` returned None, and
+            # `_validate_flags(None)` crashed with `TypeError:
+            # 'NoneType' object is not iterable`. Coerce explicit
+            # null to [] in addition to the missing-key default.
+            #
+            # Real failure mode: a quiet json-from-CC failure
+            # turned into a Python traceback aborting the whole
+            # heuristic-build flow, where the right behaviour is
+            # to log "no flags suggested" and proceed with the
+            # base build.
+            includes = self._validate_flags(data.get("includes") or [])
+            defines = self._validate_flags(data.get("defines") or [])
+
+            if includes or defines:
+                logger.info("  CC suggested %d includes, %d defines", len(includes), len(defines))
+                return {"includes": includes, "defines": defines}
+
+        except subprocess.TimeoutExpired:
+            logger.info("  CC flag suggestion timed out (180s)")
+        except Exception as e:  # noqa: BLE001 — CC suggestion is best-effort enrichment
+            logger.debug("CC flag suggestion failed: %s", e)
+
+        return None
+
+    def generate_no_build_config(self, language: str) -> BuildSystem:
+        """
+        Generate a no-build configuration for languages that don't require compilation.
+
+        Args:
+            language: Programming language
+
+        Returns:
+            BuildSystem configured for no-build mode
+        """
+        logger.info("Using no-build mode for %s", language)
+
+        return BuildSystem(
+            type="no-build",
+            command="",  # Empty command for no-build
+            working_dir=self.repo_path,
+            env_vars={},
+            confidence=1.0,
+            detected_files=[],
+        )
+
+
+def main() -> None:
+    """CLI entry point for testing."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Detect build systems")
+    parser.add_argument("--repo", required=True, help="Repository path")
+    parser.add_argument("--language", required=True, help="Programming language")
+    parser.add_argument("--validate", action="store_true", help="Validate build command")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+
+    detector = BuildDetector(Path(args.repo))
+    build_system = detector.detect_build_system(args.language)
+
+    if not build_system:
+        print(f"No build system detected for {args.language}")
+        return
+
+    if args.validate:
+        valid = detector.validate_build_command(build_system)
+        if not valid:
+            print("WARNING: Build command validation failed")
+
+    # command / working_dir / env_vars derive from the scanned
+    # (hostile) repo's build files — escape before the terminal, and
+    # keep the JSON lane ASCII (C1 controls pass raw otherwise).
+    from core.security.log_sanitisation import sanitise_for_terminal as _sft
+    if args.json:
+        import json as _json
+        output = {
+            "type": build_system.type,
+            "command": build_system.command,
+            "working_dir": str(build_system.working_dir),
+            "env_vars": build_system.env_vars,
+            "confidence": build_system.confidence,
+        }
+        print(_json.dumps(output, indent=2, ensure_ascii=True, default=str))
+    else:
+        print(f"\n{'=' * 70}")
+        print(f"BUILD SYSTEM DETECTED: {build_system.type.upper()}")
+        print(f"{'=' * 70}")
+        print(f"Command: {_sft(str(build_system.command), max_len=300)}")
+        print(f"Working directory: {_sft(str(build_system.working_dir), max_len=300)}")
+        print(f"Confidence: {build_system.confidence:.2f}")
+        if build_system.env_vars:
+            print(f"Environment variables: {_sft(str(build_system.env_vars), max_len=300)}")
+
+
+def declared_env_constants() -> frozenset:
+    """Every (name, value) pair RAPTOR itself declares in a
+    BUILD_SYSTEMS ``env_vars`` row.
+
+    ``BuildSystem.env_vars`` carries RAPTOR-chosen constants (JVM heap
+    sizing and the like) — the static class table is the only
+    producer. The codeql build-env gate admits exactly these declared
+    pairs and refuses everything else as hostile input, so the
+    constants reach traced builds while a hypothetical future producer
+    that routes repo content into the field gains nothing: only the
+    literal benign pair RAPTOR would have set anyway can pass.
+    """
+    pairs = set()
+    for lang_configs in BuildDetector.BUILD_SYSTEMS.values():
+        for config in lang_configs.values():
+            for name, value in config.get("env_vars", {}).items():
+                pairs.add((name, value))
+    return frozenset(pairs)
+
+
+if __name__ == "__main__":
+    main()

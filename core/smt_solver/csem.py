@@ -2,8 +2,9 @@
 
 Width coercion, overflow predicates, and shift disambiguators used by
 domain encoders (``smt_onegadget``, ``smt_path_validator``) when they
-need to reason about real C arithmetic rather than abstract bitvector
-math.
+need explicit bitvector arithmetic models. Binding those models to C
+source types, promotions, definedness, and build assumptions is the
+encoder's responsibility.
 
 - **Overflow predicates** turn ``a + b`` into "does this wrap under
   {signed, unsigned} {add, sub, mul}" — the primitives that make
@@ -15,8 +16,16 @@ math.
   bitvec is arithmetic right shift; the logical form is ``z3.LShR``.
   Wrapping both by name stops encoders from silently picking the wrong
   one for a given signedness.
+- **Definedness predicates** — ``division_undefined`` and
+  ``shift_count_invalid`` and strict ``left_shift_undefined`` — expose
+  invalid arithmetic cases that Z3
+  otherwise assigns total bitvector results. They require explicit
+  promoted operand types; they do not infer source-language semantics.
 - **``cast``** combines the above to simulate a C-style conversion
   between integer types.
+
+Binary operands must be explicit bitvectors of matching width and context;
+construct literal values explicitly instead of relying on Z3 coercions.
 
 Usage::
 
@@ -26,7 +35,7 @@ Usage::
 
     s = new_solver()
     count = z3.BitVec("count", 32)
-    s.add(count < 0x40000000)                           # visible guard
+    s.add(z3.ULT(count, z3.BitVecVal(0x40000000, 32)))  # unsigned guard
     s.add(umul_overflows(count, z3.BitVecVal(16, 32)))  # mul wraps at 2^32
     if s.check() == z3.sat:
         print("Wraparound witness:", s.model()[count])
@@ -35,7 +44,7 @@ Usage::
     from core.smt_solver.csem import truncation_loses_bits
 
     value32 = z3.BitVec("value32", 32)
-    s.add(truncation_loses_bits(value32, to_width=8, to_signed=False))
+    s.add(truncation_loses_bits(value32, to_width=8, to_signed=False, from_signed=False))
     # SAT when a uint32→uint8 narrowing changes the value
 
     # Sign-preserving widening composed with arithmetic right shift
@@ -50,6 +59,7 @@ from __future__ import annotations
 from typing import Any
 
 from .availability import z3
+from ._validation import require_bool, require_bv, require_bv_pair, require_width
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +86,15 @@ def truncate(bv: Any, to_width: int) -> Any:
     ValueError pointing at THIS function with both widths in the
     message — the caller backtrace identifies the upstream bug.
     """
+    require_width(to_width, argument="to_width")
+    require_bv(bv)
     src_width = bv.size()
     if to_width <= 0 or to_width > src_width:
-        raise ValueError(
+        msg = (
             f"truncate: to_width={to_width} out of range for "
             f"{src_width}-bit operand (must be 1..{src_width})"
         )
+        raise ValueError(msg)
     return z3.Extract(to_width - 1, 0, bv)
 
 
@@ -94,12 +107,15 @@ def sign_extend(bv: Any, to_width: int) -> Any:
     a negative ext-width and a Z3 assertion failure from inside
     the C++ layer.
     """
+    require_width(to_width, argument="to_width")
+    require_bv(bv)
     src_width = bv.size()
     if to_width < src_width:
-        raise ValueError(
+        msg = (
             f"sign_extend: to_width={to_width} narrower than "
             f"source {src_width}-bit operand (use truncate() to narrow)"
         )
+        raise ValueError(msg)
     return z3.SignExt(to_width - src_width, bv)
 
 
@@ -111,36 +127,54 @@ def zero_extend(bv: Any, to_width: int) -> Any:
     bv.size()`` produced a negative ext-width and a Z3 assertion
     failure.
     """
+    require_width(to_width, argument="to_width")
+    require_bv(bv)
     src_width = bv.size()
     if to_width < src_width:
-        raise ValueError(
+        msg = (
             f"zero_extend: to_width={to_width} narrower than "
             f"source {src_width}-bit operand (use truncate() to narrow)"
         )
+        raise ValueError(msg)
     return z3.ZeroExt(to_width - src_width, bv)
 
 
-def truncation_loses_bits(bv: Any, to_width: int, to_signed: bool) -> Any:
-    """Predicate: does truncating ``bv`` to ``to_width`` lose information?
+def truncation_loses_bits(bv: Any, to_width: int, to_signed: bool, *, from_signed: bool) -> Any:
+    """Predicate: does this narrowing/reinterpretation change the integer value?
 
-    True exactly when the narrow value, re-extended to the original width
-    under the *narrow (destination) type's* signedness, differs from the
-    original — i.e. the C "value changes when assigned to a narrower type"
-    semantic.  ``to_signed`` names the narrow type's signedness to
-    parallel ``cast(..., from_signed=...)``.
+    Both source and destination signedness are required. The same source
+    bits can denote -1 or an unsigned maximum, with different narrowing
+    outcomes. Compare both values after extending to one bit wider than
+    the source: that frame distinguishes negative values from every
+    unsigned source value. A same-width signedness change is covered too.
 
-    Pre-fix this assumed ``to_width <= bv.size()`` (truncation must
-    narrow). When called with ``to_width > bv.size()`` (e.g. from a
-    miscalibrated overflow check that swapped the from/to widths),
-    the ``truncate(bv, to_width)`` call would have crashed inside Z3
-    with an opaque assertion error from C++. Now ``truncate``'s own
-    width guard fires first with a Python-readable ValueError that
-    pinpoints THIS predicate as the caller, so an incorrectly-flipped
-    width pair is debuggable from the traceback.
+    This models a specified bit-pattern conversion; it does not bind an
+    actual C cast or establish language/target-specific definedness.
     """
-    narrow = truncate(bv, to_width)
-    wide = sign_extend(narrow, bv.size()) if to_signed else zero_extend(narrow, bv.size())
-    return wide != bv
+    require_width(to_width, argument="to_width")
+    require_bv(bv)
+    if to_width > bv.size():
+        raise ValueError("truncation target cannot be wider than its source")
+    return conversion_changes_value(bv, to_width, to_signed, from_signed=from_signed)
+
+
+def conversion_changes_value(bv: Any, to_width: int, to_signed: bool, *, from_signed: bool) -> Any:
+    """Predicate for integer value change under a specified bit-pattern cast.
+
+    Covers narrowing, widening, and same-width reinterpretation. A common
+    comparison frame one bit wider than either type distinguishes every
+    unsigned value from all negative values. This is a conditional integer
+    conversion model, not evidence about a source cast or its definedness.
+    """
+    require_width(to_width, argument="to_width")
+    require_bool(from_signed, argument="from_signed")
+    require_bool(to_signed, argument="to_signed")
+    require_bv(bv)
+    converted = cast(bv, to_width, from_signed)
+    compare_width = max(bv.size(), to_width) + 1
+    source_value = sign_extend(bv, compare_width) if from_signed else zero_extend(bv, compare_width)
+    target_value = sign_extend(converted, compare_width) if to_signed else zero_extend(converted, compare_width)
+    return source_value != target_value
 
 
 # ---------------------------------------------------------------------------
@@ -148,25 +182,18 @@ def truncation_loses_bits(bv: Any, to_width: int, to_signed: bool) -> Any:
 # ---------------------------------------------------------------------------
 
 def uadd_overflows(a: Any, b: Any) -> Any:
-    """Unsigned addition wraps around (result < BOTH operands).
+    """Unsigned mathematical sum exceeds the representable maximum.
 
-    Pre-fix the docstring read `(result < either operand)`.
-    "Either" in English is ambiguous between "at least one of"
-    and "any one of"; the correct mathematical condition for
-    unsigned-add overflow is `result < a AND result < b`
-    (when wrap occurs the sum is smaller than EVERY input).
-    Reading the loose form as "at least one" gives a strictly
-    weaker condition that doesn't characterise overflow —
-    `a + b < a` alone is true when `b > UINT_MAX/2` even
-    without overflow on some bit widths. The Z3 implementation
-    (`Not(BVAddNoOverflow)`) is correct; only the docstring
-    wording was confusable.
+    Equivalently, the modular result is less than either input under
+    unsigned comparison: each individual comparison characterizes wrap.
     """
+    require_bv_pair(a, b)
     return z3.Not(z3.BVAddNoOverflow(a, b, signed=False))
 
 
 def sadd_overflows(a: Any, b: Any) -> Any:
     """Signed addition overflows in either direction (positive→wrap-to-negative or vice versa)."""
+    require_bv_pair(a, b)
     return z3.Or(
         z3.Not(z3.BVAddNoOverflow(a, b, signed=True)),
         z3.Not(z3.BVAddNoUnderflow(a, b)),
@@ -175,11 +202,13 @@ def sadd_overflows(a: Any, b: Any) -> Any:
 
 def usub_underflows(a: Any, b: Any) -> Any:
     """Unsigned subtraction wraps around (a < b)."""
+    require_bv_pair(a, b)
     return z3.Not(z3.BVSubNoUnderflow(a, b, signed=False))
 
 
 def ssub_overflows(a: Any, b: Any) -> Any:
     """Signed subtraction overflows in either direction."""
+    require_bv_pair(a, b)
     return z3.Or(
         z3.Not(z3.BVSubNoOverflow(a, b)),
         z3.Not(z3.BVSubNoUnderflow(a, b, signed=True)),
@@ -197,6 +226,7 @@ def umul_overflows(a: Any, b: Any) -> Any:
     side missing a check?). It isn't: there's no smaller-than-zero
     region to underflow into for unsigned arithmetic.
     """
+    require_bv_pair(a, b)
     return z3.Not(z3.BVMulNoOverflow(a, b, signed=False))
 
 
@@ -211,6 +241,7 @@ def smul_overflows(a: Any, b: Any) -> Any:
     See `umul_overflows` for why the unsigned variant has only
     one clause.
     """
+    require_bv_pair(a, b)
     return z3.Or(
         z3.Not(z3.BVMulNoOverflow(a, b, signed=True)),
         z3.Not(z3.BVMulNoUnderflow(a, b)),
@@ -228,11 +259,14 @@ def ashr(a: Any, b: Any) -> Any:
     helper exists so call sites read the intent rather than relying on
     the reader to remember the Python-operator-to-Z3-semantics mapping.
     """
+    require_bv_pair(a, b)
+    # Z3 shifts are total. C shift-count/definedness obligations are separate.
     return a >> b
 
 
 def lshr(a: Any, b: Any) -> Any:
     """Logical right shift — shifts in zeros (unsigned semantics)."""
+    require_bv_pair(a, b)
     return z3.LShR(a, b)
 
 
@@ -241,7 +275,7 @@ def lshr(a: Any, b: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def cast(bv: Any, to_width: int, from_signed: bool) -> Any:
-    """Simulate a C-style integer cast.
+    """Model a specified integer bit-pattern conversion.
 
     - Widening: sign-extends when the source is signed, zero-extends when
       unsigned (matching C's ``(int64_t)int32`` vs ``(uint64_t)uint32``
@@ -252,10 +286,96 @@ def cast(bv: Any, to_width: int, from_signed: bool) -> Any:
     The *destination* signedness doesn't change the bit pattern in C —
     callers interpret the result with the semantics they want (via
     signed/unsigned comparisons downstream), so it's not a parameter.
+    This does not establish a source conversion's language- or
+    implementation-defined behavior.
     """
+    require_width(to_width, argument="to_width")
+    require_bool(from_signed, argument="from_signed")
+    require_bv(bv)
     from_width = bv.size()
     if to_width > from_width:
         return sign_extend(bv, to_width) if from_signed else zero_extend(bv, to_width)
     if to_width < from_width:
         return truncate(bv, to_width)
     return bv
+
+
+# ---------------------------------------------------------------------------
+# Arithmetic definedness obligations
+# ---------------------------------------------------------------------------
+
+def division_undefined(a: Any, b: Any, *, signed: bool) -> Any:
+    """Invalid division/remainder for explicit, already-promoted integers.
+
+    Z3 division and remainder are total, including a zero divisor and the
+    signed minimum divided by minus one. C integer / and % are undefined
+    for both cases, even though the mathematical remainder in the latter
+    case would be zero. Unsigned division only excludes a zero divisor.
+
+    This predicate adds no constraints and performs no query. Assert it to
+    search for an invalid operation; assert its negation when modeling a
+    defined execution. Source types, promotions and reachability remain
+    separate obligations. Width-one vectors follow this integer model;
+    they do not establish C Boolean arithmetic semantics.
+    """
+    require_bool(signed, argument="signed")
+    require_bv_pair(a, b)
+    zero = z3.BitVecVal(0, b.size(), ctx=b.ctx)
+    invalid = b == zero
+    if signed:
+        minimum = z3.BitVecVal(1 << (a.size() - 1), a.size(), ctx=a.ctx)
+        minus_one = z3.BitVecVal(-1, b.size(), ctx=b.ctx)
+        invalid = z3.Or(invalid, z3.And(a == minimum, b == minus_one))
+    return invalid
+
+
+def shift_count_invalid(count: Any, value_width: int, *, signed: bool) -> Any:
+    """Count is negative or at least the promoted left operand's bit width.
+
+    The count may have a different width from the shifted value, as C's
+    integer promotions apply to the operands independently. ``signed`` is
+    the promoted count's signedness. A wider comparison frame prevents a
+    large value_width from wrapping into the count's narrower bitvector.
+
+    This covers counts for either shift direction. It does not establish
+    signed left-shift value definedness or choose the implementation's
+    behavior for right-shifting a negative signed value.
+    """
+    require_bool(signed, argument="signed")
+    require_width(value_width, argument="value_width")
+    require_bv(count, argument="count")
+    compare_width = max(count.size(), value_width.bit_length())
+    extended = zero_extend(count, compare_width)
+    limit = z3.BitVecVal(value_width, compare_width, ctx=count.ctx)
+    too_large = z3.UGE(extended, limit)
+    return z3.Or(count < z3.BitVecVal(0, count.size(), ctx=count.ctx), too_large) if signed else too_large
+
+
+def left_shift_undefined(value: Any, count: Any, *, value_signed: bool, count_signed: bool) -> Any:
+    """Strict C99/C11 left-shift fault predicate for already-promoted types.
+
+    The operands can have different widths because integer promotions are
+    independent for shifts. Invalid counts are always excluded. Unsigned
+    values otherwise shift modulo their range; signed values must be
+    nonnegative and their mathematical shifted value must fit signed range.
+
+    Some C++ language versions permit additional signed cases. For those
+    languages, proving this predicate impossible is a sufficient safety
+    condition; SAT alone must not be reported as a C++ undefined operation.
+    This does not infer source types, promotions, or language version.
+    """
+    require_bool(value_signed, argument="value_signed")
+    require_bool(count_signed, argument="count_signed")
+    require_bv(value, argument="value")
+    require_bv(count, argument="count")
+    if value.ctx != count.ctx:
+        raise ValueError("shift operands must share the same Z3 context")
+    invalid_count = shift_count_invalid(count, value.size(), signed=count_signed)
+    if not value_signed:
+        return invalid_count
+    # Resize only after building the count obligation in its original type.
+    # A wide invalid count must not wrap into an apparently valid narrow one.
+    shift = truncate(count, value.size()) if count.size() > value.size() else zero_extend(count, value.size())
+    maximum = z3.BitVecVal((1 << (value.size() - 1)) - 1, value.size(), ctx=value.ctx)
+    zero = z3.BitVecVal(0, value.size(), ctx=value.ctx)
+    return z3.Or(invalid_count, value < zero, z3.UGT(value, z3.LShR(maximum, shift)))

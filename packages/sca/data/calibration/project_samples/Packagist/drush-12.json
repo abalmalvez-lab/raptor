@@ -1,0 +1,3783 @@
+{
+  "_source": {
+    "fetched_at": "2026-11-01T13:00:13Z",
+    "git_ref": "12.5.0",
+    "license": "MIT (RAPTOR-generated fields only; upstream advisory data retains its own terms)",
+    "name": "RAPTOR SCA scan of drush-12",
+    "project_license": "MIT",
+    "provenance": "Scan output produced by RAPTOR's SCA pipeline against https://github.com/drush-ops/drush.git@12.5.0. Project source not redistributed.",
+    "url": "https://github.com/drush-ops/drush.git"
+  },
+  "findings": [
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55634",
+          "CVE-2024-55634",
+          "DRUPAL-CORE-2024-004"
+        ],
+        "id": "GHSA-7cwc-fjqm-8vh8"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "drupal/core-recommended",
+      "dep_version": "10.1.4",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00414,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core-recommended:10.1.4:GHSA-7cwc-fjqm-8vh8",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core-recommended@10.1.4",
+      "raptor_risk_estimate": 12.360821977482749,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.360821977482749
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-12393",
+          "CVE-2024-12393",
+          "DRUPAL-CORE-2024-003"
+        ],
+        "id": "GHSA-8mvq-8h2v-j9vf"
+      },
+      "cvss_score": 5.4,
+      "dep_name": "drupal/core-recommended",
+      "dep_version": "10.1.4",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00336,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core-recommended:10.1.4:GHSA-8mvq-8h2v-j9vf",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core-recommended@10.1.4",
+      "raptor_risk_estimate": 9.665829986075998,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.665829986075998
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55636",
+          "CVE-2024-55636",
+          "DRUPAL-CORE-2024-006"
+        ],
+        "id": "GHSA-938f-5r4f-h65v"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core-recommended",
+      "dep_version": "10.1.4",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.0093,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core-recommended:10.1.4:GHSA-938f-5r4f-h65v",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core-recommended@10.1.4",
+      "raptor_risk_estimate": 17.6502761698725,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 17.6502761698725
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55638",
+          "CVE-2024-55638",
+          "DRUPAL-CORE-2024-008"
+        ],
+        "id": "GHSA-gvf2-2f4g-jqf4"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core-recommended",
+      "dep_version": "10.1.4",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00983,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core-recommended:10.1.4:GHSA-gvf2-2f4g-jqf4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core-recommended@10.1.4",
+      "raptor_risk_estimate": 17.659964704929752,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 17.659964704929752
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-45440"
+        ],
+        "id": "GHSA-mg8j-w93w-xjgc"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "drupal/core-recommended",
+      "dep_version": "10.1.4",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.09269,
+      "exploit_evidence": {
+        "edb_ids": [
+          52266
+        ],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core-recommended:10.1.4:GHSA-mg8j-w93w-xjgc",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core-recommended@10.1.4",
+      "raptor_risk_estimate": 29.946541530637095,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 29.946541530637095
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55637",
+          "CVE-2024-55637",
+          "DRUPAL-CORE-2024-007"
+        ],
+        "id": "GHSA-w6rx-9g2x-mg5g"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core-recommended",
+      "dep_version": "10.1.4",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00826,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core-recommended:10.1.4:GHSA-w6rx-9g2x-mg5g",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core-recommended@10.1.4",
+      "raptor_risk_estimate": 17.6312647048545,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 17.6312647048545
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-13080",
+          "CVE-2025-13080",
+          "GHSA-83v7-c2cf-p9c2"
+        ],
+        "id": "DRUPAL-CORE-2025-005"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00347,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2025-005",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.513735003619148,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.513735003619148
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-13082",
+          "CVE-2025-13082",
+          "GHSA-h89p-5896-f4q8"
+        ],
+        "id": "DRUPAL-CORE-2025-007"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00243,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2025-007",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.50775997175635,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.50775997175635
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-13083",
+          "CVE-2025-13083",
+          "GHSA-mhpg-hpj5-73r2"
+        ],
+        "id": "DRUPAL-CORE-2025-008"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00278,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2025-008",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.5097707997871,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5097707997871
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-55803",
+          "CVE-2026-55803"
+        ],
+        "id": "DRUPAL-CORE-2026-005"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00353,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-005",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.51407971699585,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.51407971699585
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-55804",
+          "CVE-2026-55804"
+        ],
+        "id": "DRUPAL-CORE-2026-006"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00353,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-006",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.51407971699585,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.51407971699585
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-55806",
+          "CVE-2026-55806"
+        ],
+        "id": "DRUPAL-CORE-2026-007"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00339,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-007",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.513275385783549,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.513275385783549
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-55807",
+          "CVE-2026-55807"
+        ],
+        "id": "DRUPAL-CORE-2026-008"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00221,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-008",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.5064960227084505,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5064960227084505
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-55808",
+          "CVE-2026-55808"
+        ],
+        "id": "DRUPAL-CORE-2026-009"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00273,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-009",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.5094835386398495,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5094835386398495
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-15916"
+        ],
+        "id": "DRUPAL-CORE-2026-010"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00196,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-010",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.5050597169722,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5050597169722
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-55805"
+        ],
+        "id": "DRUPAL-CORE-2026-012"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00226,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-012",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.5067832838556985,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5067832838556985
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-108097"
+        ],
+        "id": "DRUPAL-CORE-2026-014"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00326,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-014",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.5125285068007,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5125285068007
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-108515"
+        ],
+        "id": "DRUPAL-CORE-2026-015"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00197,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:DRUPAL-CORE-2026-015",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 5.50511716920165,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.50511716920165
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-31674",
+          "CVE-2025-31674",
+          "DRUPAL-CORE-2025-003"
+        ],
+        "id": "GHSA-2qph-q8xw-gv7q"
+      },
+      "cvss_score": 4.5,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00595,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-2qph-q8xw-gv7q",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 6.218981051088093,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 6.218981051088093
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-3057",
+          "CVE-2025-3057",
+          "DRUPAL-CORE-2025-001"
+        ],
+        "id": "GHSA-39g6-x4x8-5jcm"
+      },
+      "cvss_score": 6.1,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00311,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-39g6-x4x8-5jcm",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 8.4052917531224,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 8.4052917531224
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-11942",
+          "CVE-2024-11942",
+          "DRUPAL-CORE-2024-002"
+        ],
+        "id": "GHSA-52jr-x6h6-xj6g"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00385,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-52jr-x6h6-xj6g",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 8.135979327798921,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 8.135979327798921
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [],
+        "id": "GHSA-6ccv-8fgf-cjpw"
+      },
+      "cvss_score": null,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-6ccv-8fgf-cjpw",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 8.3664105525,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 8.3664105525
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55634",
+          "CVE-2024-55634",
+          "DRUPAL-CORE-2024-004"
+        ],
+        "id": "GHSA-7cwc-fjqm-8vh8"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00414,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-7cwc-fjqm-8vh8",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 9.517832922661716,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.517832922661716
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-12393",
+          "CVE-2024-12393",
+          "DRUPAL-CORE-2024-003"
+        ],
+        "id": "GHSA-8mvq-8h2v-j9vf"
+      },
+      "cvss_score": 5.4,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00336,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-8mvq-8h2v-j9vf",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 7.442689089278519,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.442689089278519
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55636",
+          "CVE-2024-55636",
+          "DRUPAL-CORE-2024-006"
+        ],
+        "id": "GHSA-938f-5r4f-h65v"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.0093,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-938f-5r4f-h65v",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 13.590712650801827,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 13.590712650801827
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-6365",
+          "CVE-2026-6365",
+          "DRUPAL-CORE-2026-001"
+        ],
+        "id": "GHSA-f3cj-mjqm-fhvj"
+      },
+      "cvss_score": 6.1,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00219,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-f3cj-mjqm-fhvj",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 8.397231205330563,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 8.397231205330563
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-9082",
+          "CVE-2026-9082",
+          "DRUPAL-CORE-2026-004"
+        ],
+        "id": "GHSA-ghwc-95x2-682j"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.89381,
+      "exploit_evidence": {
+        "edb_ids": [
+          52608
+        ],
+        "github_poc_urls": [],
+        "kev_listed": true,
+        "msf_modules": [
+          "auxiliary_scanner/http/drupal_pgsql_entityquery_sqli"
+        ]
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-ghwc-95x2-682j",
+      "in_kev": true,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 50.326633988443525,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 50.326633988443525
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55638",
+          "CVE-2024-55638",
+          "DRUPAL-CORE-2024-008"
+        ],
+        "id": "GHSA-gvf2-2f4g-jqf4"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00983,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-gvf2-2f4g-jqf4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 13.59817282279591,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 13.59817282279591
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-31675",
+          "CVE-2025-31675",
+          "DRUPAL-CORE-2025-004"
+        ],
+        "id": "GHSA-m4wj-hhwj-47qp"
+      },
+      "cvss_score": 5.4,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00502,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-m4wj-hhwj-47qp",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 7.455564133898263,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.455564133898263
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-13081",
+          "CVE-2025-13081",
+          "DRUPAL-CORE-2025-006"
+        ],
+        "id": "GHSA-m6vv-vcj8-w8m7"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.0028,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-m6vv-vcj8-w8m7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 8.12708141376285,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 8.12708141376285
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-45440"
+        ],
+        "id": "GHSA-mg8j-w93w-xjgc"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.09269,
+      "exploit_evidence": {
+        "edb_ids": [
+          52266
+        ],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-mg8j-w93w-xjgc",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 23.05883697859057,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 23.05883697859057
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-55637",
+          "CVE-2024-55637",
+          "DRUPAL-CORE-2024-007"
+        ],
+        "id": "GHSA-w6rx-9g2x-mg5g"
+      },
+      "cvss_score": 9.8,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00826,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-w6rx-9g2x-mg5g",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 13.576073822737966,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 13.576073822737966
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2025-31673",
+          "CVE-2025-31673",
+          "DRUPAL-CORE-2025-002"
+        ],
+        "id": "GHSA-wpp8-fjgf-pwc7"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00317,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-wpp8-fjgf-pwc7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 7.303415153674735,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.303415153674735
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2026-6366",
+          "CVE-2026-6366",
+          "DRUPAL-CORE-2026-002"
+        ],
+        "id": "GHSA-xmjc-63pr-2mpg"
+      },
+      "cvss_score": 6.6,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00399,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-xmjc-63pr-2mpg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 9.102592157258403,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.102592157258403
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-drupal-2024-11941",
+          "CVE-2024-11941",
+          "DRUPAL-CORE-2024-001"
+        ],
+        "id": "GHSA-xq54-x54m-vcpx"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "drupal/core",
+      "dep_version": "10.1.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00476,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:drupal/core:10.1.4:GHSA-xq54-x54m-vcpx",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/drupal/core@10.1.4",
+      "raptor_risk_estimate": 10.352149389784122,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 10.352149389784122
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-67339"
+        ],
+        "id": "GHSA-94pj-82f3-465w"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00372,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-94pj-82f3-465w",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 9.4903921881765,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.4903921881765
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-55767"
+        ],
+        "id": "GHSA-cwxw-98qj-8qjx"
+      },
+      "cvss_score": 5.8,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00211,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-cwxw-98qj-8qjx",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 10.368293734545748,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 10.368293734545748
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-67353"
+        ],
+        "id": "GHSA-f283-ghqc-fg79"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00418,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-f283-ghqc-fg79",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 9.494939867897248,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.494939867897248
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-69245"
+        ],
+        "id": "GHSA-f7vp-7xgx-4w4r"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00199,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-f7vp-7xgx-4w4r",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 11.618184571036872,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.618184571036872
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59883"
+        ],
+        "id": "GHSA-g446-98w2-8p5w"
+      },
+      "cvss_score": 4.7,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00167,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-g446-98w2-8p5w",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 8.398035691849122,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 8.398035691849122
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-67354"
+        ],
+        "id": "GHSA-h95v-h523-3mw8"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00372,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-h95v-h523-3mw8",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 10.5647762094795,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 10.5647762094795
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-69246"
+        ],
+        "id": "GHSA-v5mv-p594-2x33"
+      },
+      "cvss_score": 7.2,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.0037,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-v5mv-p594-2x33",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 12.89233964781,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.89233964781
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-67355"
+        ],
+        "id": "GHSA-wm3w-8rrp-j577"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00366,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-wm3w-8rrp-j577",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 10.56411588190725,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 10.56411588190725
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-55568"
+        ],
+        "id": "GHSA-wpwq-4j6v-78m3"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "guzzlehttp/guzzle",
+      "dep_version": "7.7.1",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00148,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/guzzle:7.7.1:GHSA-wpwq-4j6v-78m3",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/guzzle@7.7.1",
+      "raptor_risk_estimate": 10.540123980115501,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 10.540123980115501
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48998"
+        ],
+        "id": "GHSA-34xg-wgjx-8xph"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "guzzlehttp/psr7",
+      "dep_version": "2.5.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00198,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/psr7:2.5.1:GHSA-34xg-wgjx-8xph",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/psr7@2.5.1",
+      "raptor_risk_estimate": 7.294356373396207,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.294356373396207
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59882"
+        ],
+        "id": "GHSA-c2w2-prh8-qm98"
+      },
+      "cvss_score": 4.2,
+      "dep_name": "guzzlehttp/psr7",
+      "dep_version": "2.5.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00317,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/psr7:2.5.1:GHSA-c2w2-prh8-qm98",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/psr7@2.5.1",
+      "raptor_risk_estimate": 5.787612008572433,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.787612008572433
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-49214"
+        ],
+        "id": "GHSA-hq7v-mx3g-29hw"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "guzzlehttp/psr7",
+      "dep_version": "2.5.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.0019,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/psr7:2.5.1:GHSA-hq7v-mx3g-29hw",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/psr7@2.5.1",
+      "raptor_risk_estimate": 7.293747379764037,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.293747379764037
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-55766"
+        ],
+        "id": "GHSA-vm85-hxw5-5432"
+      },
+      "cvss_score": 4.8,
+      "dep_name": "guzzlehttp/psr7",
+      "dep_version": "2.5.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00229,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:guzzlehttp/psr7:2.5.1:GHSA-vm85-hxw5-5432",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/guzzlehttp/psr7@2.5.1",
+      "raptor_risk_estimate": 6.6083467686528605,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 6.6083467686528605
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-24765"
+        ],
+        "id": "GHSA-vvj3-c3rp-c85p"
+      },
+      "cvss_score": 7.8,
+      "dep_name": "phpunit/phpunit",
+      "dep_version": "9.6.13",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00384,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:phpunit/phpunit:9.6.13:GHSA-vvj3-c3rp-c85p",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/phpunit/phpunit@9.6.13",
+      "raptor_risk_estimate": 9.926464759444919,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 9.926464759444919
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-25129"
+        ],
+        "id": "GHSA-4486-gxhx-5mg7"
+      },
+      "cvss_score": 6.7,
+      "dep_name": "psy/psysh",
+      "dep_version": "v0.11.21",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00322,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:psy/psysh:v0.11.21:GHSA-4486-gxhx-5mg7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/psy/psysh@v0.11.21",
+      "raptor_risk_estimate": 20.5799191351044,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 20.5799191351044
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-67434"
+        ],
+        "id": "GHSA-hmqg-cxww-wqhq"
+      },
+      "cvss_score": 7.3,
+      "dep_name": "squizlabs/php_codesniffer",
+      "dep_version": "3.7.2",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.01063,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:squizlabs/php_codesniffer:3.7.2:GHSA-hmqg-cxww-wqhq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/squizlabs/php_codesniffer@3.7.2",
+      "raptor_risk_estimate": 9.355856071801881,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 9.355856071801881
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-64500"
+        ],
+        "id": "GHSA-3rg7-wf37-54rm"
+      },
+      "cvss_score": 7.3,
+      "dep_name": "symfony/http-foundation",
+      "dep_version": "v6.3.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.01408,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/http-foundation:v6.3.4:GHSA-3rg7-wf37-54rm",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/http-foundation@v6.3.4",
+      "raptor_risk_estimate": 10.173812569794718,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 10.173812569794718
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-50345"
+        ],
+        "id": "GHSA-mrqx-rp3w-jpjp"
+      },
+      "cvss_score": 3.1,
+      "dep_name": "symfony/http-foundation",
+      "dep_version": "v6.3.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00587,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/http-foundation:v6.3.4:GHSA-mrqx-rp3w-jpjp",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/http-foundation@v6.3.4",
+      "raptor_risk_estimate": 4.28383074248254,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 4.28383074248254
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-108082"
+        ],
+        "id": "GHSA-r925-mgvr-h9cc"
+      },
+      "cvss_score": 8.7,
+      "dep_name": "symfony/http-foundation",
+      "dep_version": "v6.3.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.0048,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/http-foundation:v6.3.4:GHSA-r925-mgvr-h9cc",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/http-foundation@v6.3.4",
+      "raptor_risk_estimate": 12.008993126545798,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.008993126545798
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45067"
+        ],
+        "id": "GHSA-qpmx-3rfj-7rhv"
+      },
+      "cvss_score": 7.1,
+      "dep_name": "symfony/mime",
+      "dep_version": "v6.3.3",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00598,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/mime:v6.3.3:GHSA-qpmx-3rfj-7rhv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/mime@v6.3.3",
+      "raptor_risk_estimate": 9.8124760359497,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.8124760359497
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45070"
+        ],
+        "id": "GHSA-vqc8-7275-q272"
+      },
+      "cvss_score": 4.9,
+      "dep_name": "symfony/mime",
+      "dep_version": "v6.3.3",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.0039,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/mime:v6.3.3:GHSA-vqc8-7275-q272",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/mime@v6.3.3",
+      "raptor_risk_estimate": 6.757351675619739,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 6.757351675619739
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-46644"
+        ],
+        "id": "GHSA-2xf4-cg6j-vhgq"
+      },
+      "cvss_score": 2.7,
+      "dep_name": "symfony/polyfill-intl-idn",
+      "dep_version": "v1.27.0",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00538,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/polyfill-intl-idn:v1.27.0:GHSA-2xf4-cg6j-vhgq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/polyfill-intl-idn@v1.27.0",
+      "raptor_risk_estimate": 3.729178156124767,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 3.729178156124767
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-51736"
+        ],
+        "id": "GHSA-qq5c-677p-737q"
+      },
+      "cvss_score": 8.6,
+      "dep_name": "symfony/process",
+      "dep_version": "v6.3.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00428,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/process:v6.3.4:GHSA-qq5c-677p-737q",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/process@v6.3.4",
+      "raptor_risk_estimate": 11.86453556353989,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.86453556353989
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45065"
+        ],
+        "id": "GHSA-72xp-p242-47p9"
+      },
+      "cvss_score": null,
+      "dep_name": "symfony/routing",
+      "dep_version": "v6.3.3",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00348,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/routing:v6.3.3:GHSA-72xp-p242-47p9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/routing@v6.3.3",
+      "raptor_risk_estimate": 5.5137924558486,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 5.5137924558486
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48784"
+        ],
+        "id": "GHSA-h5x3-xfc9-m39h"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "symfony/routing",
+      "dep_version": "v6.3.3",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00348,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/routing:v6.3.3:GHSA-h5x3-xfc9-m39h",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/routing@v6.3.3",
+      "raptor_risk_estimate": 9.511291986338835,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.511291986338835
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-50343"
+        ],
+        "id": "GHSA-g3rh-rrhp-jhh9"
+      },
+      "cvss_score": 3.1,
+      "dep_name": "symfony/validator",
+      "dep_version": "v6.3.4",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00455,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/validator:v6.3.4:GHSA-g3rh-rrhp-jhh9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/validator@v6.3.4",
+      "raptor_risk_estimate": 4.277953379409807,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 4.277953379409807
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-109413"
+        ],
+        "id": "GHSA-2v3c-qxhr-7vpv"
+      },
+      "cvss_score": 8.7,
+      "dep_name": "symfony/yaml",
+      "dep_version": "v6.3.3",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00395,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/yaml:v6.3.3:GHSA-2v3c-qxhr-7vpv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/yaml@v6.3.3",
+      "raptor_risk_estimate": 15.58230083847562,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 15.58230083847562
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45304"
+        ],
+        "id": "GHSA-4qpc-3hr4-r2p4"
+      },
+      "cvss_score": 2.7,
+      "dep_name": "symfony/yaml",
+      "dep_version": "v6.3.3",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00684,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/yaml:v6.3.3:GHSA-4qpc-3hr4-r2p4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/yaml@v6.3.3",
+      "raptor_risk_estimate": 4.850441653684499,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 4.850441653684499
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45305"
+        ],
+        "id": "GHSA-9frc-8383-795m"
+      },
+      "cvss_score": 2.7,
+      "dep_name": "symfony/yaml",
+      "dep_version": "v6.3.3",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.00684,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/yaml:v6.3.3:GHSA-9frc-8383-795m",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/yaml@v6.3.3",
+      "raptor_risk_estimate": 4.850441653684499,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 4.850441653684499
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45133"
+        ],
+        "id": "GHSA-c2p3-7m5p-cv8x"
+      },
+      "cvss_score": 2.7,
+      "dep_name": "symfony/yaml",
+      "dep_version": "v6.3.3",
+      "direct": true,
+      "ecosystem": "Packagist",
+      "epss": 0.0063,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:symfony/yaml:v6.3.3:GHSA-c2p3-7m5p-cv8x",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/symfony/yaml@v6.3.3",
+      "raptor_risk_estimate": 4.84772199944625,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 4.84772199944625
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-47730"
+        ],
+        "id": "GHSA-2g2g-8p8h-fgwm"
+      },
+      "cvss_score": null,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00295,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-2g2g-8p8h-fgwm",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 3.916047379700669,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 3.916047379700669
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-46628"
+        ],
+        "id": "GHSA-4j38-f5cw-54h7"
+      },
+      "cvss_score": 1.3,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00295,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-4j38-f5cw-54h7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 11.257697735884879,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 11.257697735884879
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-49981"
+        ],
+        "id": "GHSA-529h-vh3j-85hq"
+      },
+      "cvss_score": 8.7,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00362,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-529h-vh3j-85hq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 8.523352522186144,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 8.523352522186144
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48806"
+        ],
+        "id": "GHSA-5v5v-ww74-355v"
+      },
+      "cvss_score": null,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00418,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-5v5v-ww74-355v",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 3.921069064205555,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 3.921069064205555
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-51754"
+        ],
+        "id": "GHSA-6377-hfv9-hqf6"
+      },
+      "cvss_score": 2.2,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00431,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-6377-hfv9-hqf6",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 2.1568798962415916,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 2.1568798962415916
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-45411"
+        ],
+        "id": "GHSA-6j75-5wfj-gh66"
+      },
+      "cvss_score": 8.5,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00849,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-6j75-5wfj-gh66",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 8.369663918314144,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 8.369663918314144
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-46638"
+        ],
+        "id": "GHSA-7fxw-r6jv-74c8"
+      },
+      "cvss_score": 5.8,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00473,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-7fxw-r6jv-74c8",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 5.688806072685573,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 5.688806072685573
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-46633"
+        ],
+        "id": "GHSA-7p85-w9px-jpjp"
+      },
+      "cvss_score": 9.3,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00688,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-7p85-w9px-jpjp",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 9.142114537269316,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 9.142114537269316
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48807"
+        ],
+        "id": "GHSA-8x9c-rmqh-456c"
+      },
+      "cvss_score": null,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00367,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-8x9c-rmqh-456c",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 3.918986902337675,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 3.918986902337675
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48808"
+        ],
+        "id": "GHSA-h8vq-8gpg-mhcg"
+      },
+      "cvss_score": null,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00407,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-h8vq-8gpg-mhcg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 3.9206199704693456,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 3.9206199704693456
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-51755"
+        ],
+        "id": "GHSA-jjxq-ff2g-95vh"
+      },
+      "cvss_score": 2.2,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00425,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-jjxq-ff2g-95vh",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 2.156745168120729,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 2.156745168120729
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48805"
+        ],
+        "id": "GHSA-p42q-9prx-q5wq"
+      },
+      "cvss_score": null,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00483,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-p42q-9prx-q5wq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 3.9237227999195197,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 3.9237227999195197
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-47732"
+        ],
+        "id": "GHSA-pr2w-4gpj-cpq4"
+      },
+      "cvss_score": null,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00402,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-pr2w-4gpj-cpq4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 3.9204158369528863,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 3.9204158369528863
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-46635"
+        ],
+        "id": "GHSA-vcc8-phrv-43wj"
+      },
+      "cvss_score": 2.1,
+      "dep_name": "twig/twig",
+      "dep_version": "v3.6.1",
+      "direct": false,
+      "ecosystem": "Packagist",
+      "epss": 0.00331,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Packagist:twig/twig:v3.6.1:GHSA-vcc8-phrv-43wj",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:composer/twig/twig@v3.6.1",
+      "raptor_risk_estimate": 2.056696499035066,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 2.056696499035066
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 1,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    }
+  ]
+}

@@ -1,0 +1,580 @@
+"""Tests for engine.coccinelle.vocab_renderer."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from engine.coccinelle.vocab_renderer import render
+
+
+@dataclass
+class FakeVocab:
+    allocators: frozenset = field(default_factory=frozenset)
+    deallocators: frozenset = field(default_factory=frozenset)
+    lock_acquires: frozenset = field(default_factory=frozenset)
+    lock_releases: frozenset = field(default_factory=frozenset)
+    refcount_gets: frozenset = field(default_factory=frozenset)
+    refcount_puts: frozenset = field(default_factory=frozenset)
+    callback_cancels: frozenset = field(default_factory=frozenset)
+
+
+class TestAlternationExtension:
+    def test_extends_deallocator_alternation(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({"rxrpc_free_skb"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert r"\|rxrpc_free_skb\)" in text
+        assert r"\(kfree\|kvfree" in text
+        Path(result).unlink()
+
+    def test_extends_allocator_alternation(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: allocators\n"
+            r"... when != E = \(\(kmalloc\|kzalloc\)(...)\|NULL\)" + "\n"
+        )
+        vocab = FakeVocab(allocators=frozenset({"my_alloc"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert r"\|my_alloc" in text
+        Path(result).unlink()
+
+    def test_no_change_when_bucket_empty(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        vocab = FakeVocab()
+        result = render(rule, vocab)
+        assert result is None
+
+    def test_no_change_without_markers(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(r"\(kfree\|kvfree\)(E);" + "\n")
+        vocab = FakeVocab(deallocators=frozenset({"extra"}))
+        result = render(rule, vocab)
+        assert result is None
+
+
+class TestIdentifierListExtension:
+    def test_extends_identifier_list(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: allocators\n"
+            "identifier unsafe_fn = {malloc, calloc, free};\n"
+        )
+        vocab = FakeVocab(allocators=frozenset({"pool_alloc"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "pool_alloc" in text
+        assert "malloc" in text
+        Path(result).unlink()
+
+
+class TestPythonSetExtension:
+    def test_extends_python_set(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            '// @vocab: deallocators\n'
+            '_safe = {"kfree", "kvfree", "vfree"}\n'
+        )
+        vocab = FakeVocab(deallocators=frozenset({"custom_free"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert '"custom_free"' in text
+        assert '"kfree"' in text
+        Path(result).unlink()
+
+    def test_extends_multi_line_python_set(self, tmp_path):
+        # The stock rules' report-script suppression sets span lines
+        # (use_after_free's ``_safe``); a line-bound splice left them
+        # seed-only with zero diagnostics — a dead splice slot on a
+        # verification rule.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            '// @vocab: deallocators\n'
+            '_safe = {"kfree", "kvfree",\n'
+            '         "pr_info", "printk",\n'
+            '         "WARN"}\n'
+            'if fn not in _safe:\n'
+            '    pass\n'
+        )
+        vocab = FakeVocab(deallocators=frozenset({"custom_free"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert '"custom_free"' in text
+        assert '"WARN", "custom_free"}' in text
+        # The literal's other lines and the consumer survive intact.
+        assert '"kfree", "kvfree",' in text
+        assert 'if fn not in _safe:' in text
+        Path(result).unlink()
+
+    def test_unterminated_set_passes_through_and_warns(
+        self, tmp_path, caplog,
+    ):
+        import logging as _logging
+
+        # No closing brace before the next marker: refuse the splice
+        # loudly rather than consuming the rest of the file.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            '// @vocab: deallocators\n'
+            '_safe = {"kfree",\n'
+            '// @vocab: allocators\n'
+            r'\(kmalloc\|kzalloc\)(sz)' + '\n'
+        )
+        vocab = FakeVocab(
+            deallocators=frozenset({"custom_free"}),
+            allocators=frozenset({"pool_alloc"}),
+        )
+        with caplog.at_level(
+            _logging.WARNING, logger="engine.coccinelle.vocab_renderer",
+        ):
+            result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        # The broken set is untouched; the later marker still splices.
+        assert '"custom_free"' not in text
+        assert r"\|pool_alloc" in text
+        assert any("produced no extension" in r.message
+                   for r in caplog.records)
+        Path(result).unlink()
+
+
+class TestDeadSpliceWitness:
+    """A marker with non-empty vocabulary that effects no textual
+    change is a dead splice slot — the renderer must say so (the
+    warning channel is the only witness; the render-validity oracle
+    promotes it to failure)."""
+
+    def test_no_op_marker_warns_and_render_stays_honest(
+        self, tmp_path, caplog,
+    ):
+        import logging as _logging
+
+        # A blank line between the marker and its construct detaches
+        # the splice: nothing is extended, and the rendered text would
+        # equal the source — render() must warn AND return None rather
+        # than positively claiming the marker took effect.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            "\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({"custom_free"}))
+        with caplog.at_level(
+            _logging.WARNING, logger="engine.coccinelle.vocab_renderer",
+        ):
+            result = render(rule, vocab)
+        assert result is None
+        dead = [r.message for r in caplog.records
+                if "produced no extension" in r.message]
+        assert dead and "deallocators" in dead[0]
+
+    def test_partial_no_op_still_warns(self, tmp_path, caplog):
+        import logging as _logging
+
+        # One live marker plus one dead one: the render is modified
+        # (live splice) but the dead slot must still be witnessed.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+            "// @vocab: allocators\n"
+            "\n"
+            r"\(kmalloc\|kzalloc\)(sz)" + "\n"
+        )
+        vocab = FakeVocab(
+            deallocators=frozenset({"custom_free"}),
+            allocators=frozenset({"pool_alloc"}),
+        )
+        with caplog.at_level(
+            _logging.WARNING, logger="engine.coccinelle.vocab_renderer",
+        ):
+            result = render(rule, vocab)
+        assert result is not None
+        assert r"\|custom_free" in result.read_text()
+        Path(result).unlink()
+        dead = [r.message for r in caplog.records
+                if "produced no extension" in r.message]
+        assert dead and "allocators" in dead[0]
+
+    def test_empty_bucket_does_not_warn(self, tmp_path, caplog):
+        import logging as _logging
+
+        # No names to splice means no dead slot — the seed-only render
+        # is the correct outcome, not a defect.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        with caplog.at_level(
+            _logging.WARNING, logger="engine.coccinelle.vocab_renderer",
+        ):
+            result = render(rule, FakeVocab())
+        assert result is None
+        assert not any("produced no extension" in r.message
+                       for r in caplog.records)
+
+
+class TestDisjunctionExtension:
+    def test_extends_disjunction_with_template(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: allocators\n"
+            "// @vocab-tmpl: ptr =@p_alloc %s(...)\n"
+            "(\n"
+            "  ptr =@p_alloc kmalloc(sz, flags)\n"
+            "|\n"
+            "  ptr =@p_alloc kzalloc(sz, flags)\n"
+            ")\n"
+        )
+        vocab = FakeVocab(allocators=frozenset({"zone_alloc"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "zone_alloc" in text
+        assert "ptr =@p_alloc zone_alloc(...)" in text
+        assert "kmalloc" in text
+        Path(result).unlink()
+
+    def test_star_template_lands_at_column_zero(self, tmp_path):
+        # Context-mode ``*`` annotations only match at column 0 — an
+        # indented star entry parses clean but silently never matches,
+        # so the whole learned lane would be dead.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: allocators\n"
+            "// @vocab-tmpl: * E@p = %s(...);\n"
+            "(\n"
+            "* E@p = malloc(...);\n"
+            "|\n"
+            "* E@p = calloc(...);\n"
+            ")\n"
+        )
+        vocab = FakeVocab(allocators=frozenset({"zone_alloc"}))
+        result = render(rule, vocab)
+        assert result is not None
+        lines = result.read_text().splitlines()
+        assert "* E@p = zone_alloc(...);" in lines
+        assert not any(
+            line.lstrip().startswith("*") and line != line.lstrip()
+            for line in lines
+        ), "star line was indented — it would silently never match"
+        Path(result).unlink()
+
+
+class TestWhenClauseExtension:
+    def test_extends_when_block(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            "  ... when != kfree(ptr)\n"
+            "      when != kvfree(ptr)\n"
+            "  return@p_ret E;\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({"my_free"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "when != my_free(...)" in text
+        assert "when != kfree(ptr)" in text
+        assert "when != kvfree(ptr)" in text
+        Path(result).unlink()
+
+
+class TestIdentifierGate:
+    """Vocabulary names are LLM study output over the untrusted repo
+    and get spliced into .cocci that spatch runs with
+    allow_scripting=True — anything beyond a plain identifier is
+    rejected, never spliced (U12-F260)."""
+
+    # The PoC payload: a hostile 'deallocator' name that would close
+    # the SmPL construct and open an attacker @script:python block.
+    HOSTILE = '};\n@script:python@\n@@\nimport os\nos.system("id")\n'
+
+    def test_hostile_name_never_spliced_into_alternation(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({self.HOSTILE}))
+        result = render(rule, vocab)
+        # Only the hostile name existed — nothing splice-worthy left.
+        assert result is None
+
+    def test_hostile_name_dropped_benign_kept(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        vocab = FakeVocab(
+            deallocators=frozenset({self.HOSTILE, "rxrpc_free_skb"}),
+        )
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "rxrpc_free_skb" in text
+        assert "@script" not in text
+        assert "os.system" not in text
+        Path(result).unlink()
+
+    def test_python_set_quote_breakout_rejected(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            '_safe = {"kfree", "vfree"}\n'
+        )
+        vocab = FakeVocab(
+            deallocators=frozenset({'ok_name", "memcpy'}),
+        )
+        result = render(rule, vocab)
+        assert result is None
+
+    @pytest.mark.parametrize("payload", [
+        "a(b)",           # parens (call syntax)
+        "a b",            # whitespace
+        "a\\|kfree",      # alternation injection
+        "a\nb",           # newline
+        "kfree\n",        # trailing newline ($-anchored .match accepts it)
+        'a"b',            # quote
+        "a@p",            # position-metavariable syntax
+        "",               # empty
+        "0abc",           # leading digit
+        "x" * 200,        # over-long
+    ])
+    def test_non_identifier_shapes_rejected(self, tmp_path, payload):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({payload}))
+        result = render(rule, vocab)
+        assert result is None, f"non-identifier {payload!r} was spliced"
+
+    def test_callback_cancels_bucket_now_mapped(self, tmp_path):
+        # U12-F265: _BUCKET_MAP lacked callback_cancels — the
+        # teardown_lifetime extension slots were silently dead.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: callback_cancels\n"
+            r"\(del_timer\|cancel_work\)(E);" + "\n"
+        )
+        vocab = FakeVocab(callback_cancels=frozenset({"my_cancel"}))
+        result = render(rule, vocab)
+        assert result is not None
+        assert r"\|my_cancel" in result.read_text()
+        Path(result).unlink()
+
+    def test_unknown_bucket_warns_and_splices_nothing(
+        self, tmp_path, caplog,
+    ):
+        import logging as _logging
+
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: callback_cancels_async\n"
+            r"\(del_timer\|cancel_work\)(E);" + "\n"
+        )
+        vocab = FakeVocab(callback_cancels=frozenset({"my_cancel"}))
+        with caplog.at_level(
+            _logging.WARNING, logger="engine.coccinelle.vocab_renderer",
+        ):
+            result = render(rule, vocab)
+        assert result is None
+        assert any("unknown @vocab bucket" in r.message
+                   for r in caplog.records)
+
+
+class TestNoneVocab:
+    def test_none_vocab_returns_none(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            r"\(kfree\|kvfree\)(E);" + "\n"
+        )
+        assert render(rule, None) is None
+
+
+class TestRealRules:
+    """Smoke-test rendering on the actual rule files."""
+
+    RULES_DIR = Path(__file__).parent.parent / "rules"
+    MARKED_RULES = [
+        "use_after_free.cocci",
+        "double_free.cocci",
+        "lock_imbalance.cocci",
+        "resource_leak_err.cocci",
+        "missing_null_check.cocci",
+        "signal_handler_unsafe.cocci",
+    ]
+
+    @pytest.mark.parametrize("rule_name", MARKED_RULES)
+    def test_renders_without_error(self, rule_name):
+        rule_path = self.RULES_DIR / rule_name
+        if not rule_path.exists():
+            pytest.skip(f"{rule_name} not found")
+        vocab = FakeVocab(
+            allocators=frozenset({"test_alloc"}),
+            deallocators=frozenset({"test_free"}),
+            lock_acquires=frozenset({"test_lock"}),
+            lock_releases=frozenset({"test_unlock"}),
+        )
+        result = render(rule_path, vocab)
+        assert result is not None, f"{rule_name} should produce output with vocab"
+        text = result.read_text()
+        assert "test_" in text
+        assert "// @vocab:" in text
+        Path(result).unlink()
+
+    @pytest.mark.parametrize("rule_name", MARKED_RULES)
+    def test_no_change_with_empty_vocab(self, rule_name):
+        rule_path = self.RULES_DIR / rule_name
+        if not rule_path.exists():
+            pytest.skip(f"{rule_name} not found")
+        vocab = FakeVocab()
+        result = render(rule_path, vocab)
+        assert result is None
+
+
+class TestAllMarkersProcessed:
+    """Every ``@vocab`` marker in a rule file must be processed.
+
+    The renderer used to stop marker scanning after the first
+    tmpl-disjunction or when-block splice (it consumed the whole rest
+    of the file), so a rule whose allocator trigger extended but whose
+    deallocator suppression did not minted findings on
+    project-vocabulary code — an actively harmful asymmetric splice.
+    """
+
+    def test_marker_after_tmpl_disjunction_is_processed(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: allocators\n"
+            "// @vocab-tmpl: ptr = %s(...);\n"
+            "(\n"
+            "  ptr = kmalloc(...);\n"
+            ")\n"
+            "// @vocab: deallocators\n"
+            "... when != kfree(ptr)\n"
+        )
+        vocab = FakeVocab(
+            allocators=frozenset({"xmalloc"}),
+            deallocators=frozenset({"xfree"}),
+        )
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "ptr = xmalloc(...);" in text
+        assert "when != xfree(...)" in text
+        Path(result).unlink()
+
+    def test_marker_after_when_block_is_processed(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: lock_releases\n"
+            "... when != mutex_unlock(&M)\n"
+            "// @vocab: lock_acquires\n"
+            r"\(mutex_lock\|mutex_trylock\)(&M);" + "\n"
+        )
+        vocab = FakeVocab(
+            lock_acquires=frozenset({"foo_lock"}),
+            lock_releases=frozenset({"foo_unlock"}),
+        )
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "when != foo_unlock(...)" in text
+        assert r"\|foo_lock\)" in text
+        Path(result).unlink()
+
+    def test_indented_marker_is_processed(self, tmp_path):
+        # Markers inside an indented construct (a when block nested in
+        # an if body) were invisible to the anchored marker regex.
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "if (...) {\n"
+            "  // @vocab: deallocators\n"
+            "  ... when != kfree(ptr)\n"
+            "  return E;\n"
+            "}\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({"xfree"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "when != xfree(...)" in text
+        assert "return E;" in text
+        Path(result).unlink()
+
+    def test_text_after_spliced_block_is_preserved_verbatim(self, tmp_path):
+        rule = tmp_path / "test.cocci"
+        rule.write_text(
+            "// @vocab: deallocators\n"
+            "... when != kfree(ptr)\n"
+            "    when != vfree(ptr)\n"
+            "trailing_pattern(ptr);\n"
+        )
+        vocab = FakeVocab(deallocators=frozenset({"xfree"}))
+        result = render(rule, vocab)
+        assert result is not None
+        text = result.read_text()
+        assert text.endswith("trailing_pattern(ptr);\n")
+        # Splice lands after the LAST existing when clause.
+        assert text.index("when != vfree") < text.index("when != xfree")
+        Path(result).unlink()
+
+
+class TestLockImbalanceMarkerSymmetry:
+    """The mutex leg's acquire alternation and release guard must
+    extend together — a learned acquire without its learned release in
+    the when-guard turns every balanced wrapper-locked function into
+    an imbalance verdict."""
+
+    RULES_DIR = Path(__file__).parent.parent / "rules"
+
+    def test_mutex_leg_extends_both_sides(self):
+        vocab = FakeVocab(
+            lock_acquires=frozenset({"foo_lock"}),
+            lock_releases=frozenset({"foo_unlock"}),
+        )
+        result = render(self.RULES_DIR / "lock_imbalance.cocci", vocab)
+        assert result is not None
+        text = result.read_text()
+        assert r"\|mutex_lock_killable\|foo_lock\)" in text
+        assert "when != foo_unlock(...)" in text
+        Path(result).unlink()
+
+    def test_resource_leak_extends_trigger_and_both_guards(self):
+        vocab = FakeVocab(
+            allocators=frozenset({"xmalloc"}),
+            deallocators=frozenset({"xfree"}),
+        )
+        result = render(self.RULES_DIR / "resource_leak_err.cocci", vocab)
+        assert result is not None
+        text = result.read_text()
+        assert "kvmalloc, xmalloc};" in text
+        assert "T ptr =@p_alloc alloc(...);" in text
+        # Outer liability guard AND inner error-path guard both extend.
+        assert text.count(r"\|xfree\)(ptr)") == 2
+        assert "kfree_sensitive, xfree};" in text
+        Path(result).unlink()

@@ -1,0 +1,244 @@
+"""NuGet (.NET) registry client.
+
+Fetches the ``api.nuget.org`` flat-container index for a package — the
+simplest endpoint that returns just a version list with no pagination:
+
+    https://api.nuget.org/v3-flatcontainer/<lowercase_id>/index.json
+
+Returns versions newest-first with pre-releases (any version containing
+``-``) filtered out.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from core.json import MISSING, JsonCache
+
+from ._negative_cache import log_fetch_failure, should_negative_cache
+from ._url import (
+    UnsafeUrlComponentError,
+    quote_segment,
+    registry_cache_key,
+)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.http import HttpClient
+
+logger = logging.getLogger(__name__)
+
+
+# defusedxml is required for safe ``.nuspec`` parsing. NuGet
+# responses come over HTTPS so the attacker model is registry-
+# compromise or MITM — lower risk than target-repo XML, but
+# defense-in-depth says use defusedxml. Refuse to parse without it.
+try:
+    from defusedxml.ElementTree import fromstring as _safe_xml_fromstring
+    _DEFUSEDXML_AVAILABLE = True
+except ImportError:                                  # pragma: no cover
+    _safe_xml_fromstring = None                      # type: ignore[assignment]
+    _DEFUSEDXML_AVAILABLE = False
+    logger.warning(
+        "sca.registries.nuget: 'defusedxml' not installed — NuGet "
+        "license / metadata fetches will be skipped. `uv pip install "
+        "defusedxml` to enable.",
+    )
+
+
+_CACHE_KEY_PREFIX = "nuget-versions"
+_DEFAULT_TTL = 24 * 3600
+
+
+class NugetClient:
+    """List versions from NuGet's flat-container."""
+
+    ecosystem = "NuGet"
+
+    def __init__(
+        self,
+        http: HttpClient,
+        cache: JsonCache | None = None,
+        *,
+        ttl_seconds: int = _DEFAULT_TTL,
+        offline: bool = False,
+    ) -> None:
+        self._http = http
+        self._cache = cache
+        self._ttl = ttl_seconds
+        self._offline = offline
+
+    def list_versions(self, name: str) -> list[str]:
+        # NuGet IDs are case-insensitive but the URL path requires
+        # lowercase.
+        canon = name.lower()
+        try:
+            encoded = quote_segment(canon)
+        except UnsafeUrlComponentError:
+            # Not an ID NuGet could ever serve — not-found path
+            # without touching the cache.
+            return []
+        cache_key = registry_cache_key(_CACHE_KEY_PREFIX, canon)
+        if self._cache is not None:
+            cached = self._cache.try_get(cache_key, ttl_seconds=self._ttl)
+            if cached is not MISSING:
+                return list(cached) if cached else []
+
+        if self._offline:
+            return []
+
+        try:
+            data = self._http.get_json(
+                f"https://api.nuget.org/v3-flatcontainer/{encoded}/index.json")
+        except Exception as e:                # noqa: BLE001
+            log_fetch_failure(logger, "sca.registries.nuget", name, e)
+            if self._cache is not None and should_negative_cache(e):
+                self._cache.put(cache_key, [], ttl_seconds=self._ttl)
+            return []
+
+        versions = _extract_versions(data)
+        if self._cache is not None:
+            self._cache.put(cache_key, versions, ttl_seconds=self._ttl)
+        return versions
+
+
+def _extract_versions(data: dict) -> list[str]:
+    """Pull versions from the NuGet flat-container response.
+
+    Shape:
+        {"versions": ["1.0.0", "1.1.0", "1.2.0-rc.1", ...]}
+    """
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("versions") or []
+    if not isinstance(raw, list):
+        return []
+    out = [v for v in raw if isinstance(v, str) and "-" not in v]
+    # Newest-first using semver-ish ordering.
+    out.sort(key=_semver_key, reverse=True)
+    return out
+
+
+def _semver_key(v: str):
+    """Best-effort semver tuple."""
+    parts = v.split(".")
+    out: list[tuple[int, int | str]] = []
+    for p in parts:
+        try:
+            out.append((0, int(p)))
+        except ValueError:
+            out.append((1, p))
+    return tuple(out)
+
+
+def _add_nuspec_methods():
+    """Attach ``get_metadata`` + ``get_nuspec`` to NugetClient."""
+
+    def get_metadata(self, name: str) -> dict | None:
+        versions = self.list_versions(name)
+        if not versions:
+            return None
+        return {
+            "releases": {v: [] for v in versions},
+            "info": {"version": versions[0]},
+        }
+
+    def get_nuspec(self, pkg: str, version: str) -> dict | None:
+        """Fetch + parse a .nuspec XML.
+
+        ``api.nuget.org/v3-flatcontainer/<id>/<ver>/<id>.nuspec``;
+        case-insensitive (caller normalises). Returns
+        ``{dependency_groups: [{targetFramework, dependencies}]}``."""
+        lower = pkg.lower()
+        try:
+            encoded = quote_segment(lower)
+            enc_version = quote_segment(version)
+        except UnsafeUrlComponentError:
+            return None
+        cache_key = registry_cache_key("nuget-nuspec", lower, version)
+        if self._cache is not None:
+            cached = self._cache.try_get(cache_key, ttl_seconds=self._ttl)
+            if cached is not MISSING:
+                return cached
+        if self._offline:
+            return None
+        url = (f"https://api.nuget.org/v3-flatcontainer/{encoded}/"
+                f"{enc_version}/{encoded}.nuspec")
+        try:
+            resp = self._http.request(
+                "GET", url, raise_on_status=False,
+            )
+        except Exception as e:                              # noqa: BLE001
+            logger.warning(
+                "sca.registries.nuget: nuspec fetch failed for "
+                "%s@%s: %s", pkg, version, e,
+            )
+            if self._cache is not None and should_negative_cache(e):
+                self._cache.put(cache_key, None, ttl_seconds=self._ttl)
+            return None
+        if resp.status_code != 200:
+            # raise_on_status=False means a 404 arrives as a response,
+            # not an exception — negative-cache the authoritative miss
+            # here too, or every detector re-fetches the same dead
+            # nuspec. Other statuses (5xx) stay uncached.
+            if (self._cache is not None
+                    and resp.status_code in (404, 410)):
+                self._cache.put(cache_key, None, ttl_seconds=self._ttl)
+            return None
+        if not _DEFUSEDXML_AVAILABLE:
+            # Environment-caused miss (local defusedxml absent) — never
+            # cache it as registry truth: after installing defusedxml
+            # the client kept serving "no nuspec" for up to a full TTL.
+            return None
+        try:
+            root = _safe_xml_fromstring(resp.content)
+        except Exception as e:                              # noqa: BLE001
+            logger.warning(
+                "sca.registries.nuget: nuspec parse failed for "
+                "%s@%s: %s", pkg, version, e,
+            )
+            if self._cache is not None:
+                self._cache.put(cache_key, None, ttl_seconds=self._ttl)
+            return None
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = root.tag.split("}", 1)[0] + "}"
+        meta = root.find(f"{ns}metadata")
+        if meta is None:
+            meta = root
+        deps_root = meta.find(f"{ns}dependencies") if meta is not None else None
+        groups: list[dict] = []
+        if deps_root is not None:
+            inner_groups = list(deps_root.findall(f"{ns}group"))
+            if inner_groups:
+                for g in inner_groups:
+                    tfm = g.get("targetFramework", "")
+                    deps = [
+                        {"id": d.get("id", ""),
+                         "version": d.get("version", "")}
+                        for d in g.findall(f"{ns}dependency")
+                    ]
+                    groups.append({
+                        "targetFramework": tfm,
+                        "dependencies": deps,
+                    })
+            else:
+                deps = [
+                    {"id": d.get("id", ""),
+                     "version": d.get("version", "")}
+                    for d in deps_root.findall(f"{ns}dependency")
+                ]
+                groups = [{"targetFramework": "", "dependencies": deps}]
+        result = {"dependency_groups": groups}
+        if self._cache is not None:
+            self._cache.put(cache_key, result, ttl_seconds=self._ttl)
+        return result
+
+    NugetClient.get_metadata = get_metadata
+    NugetClient.get_nuspec = get_nuspec
+
+
+_add_nuspec_methods()
+
+
+__all__ = ["NugetClient"]

@@ -1,0 +1,469 @@
+"""Curated table of known-safe library calls per sink class + language.
+
+The Tier 1B contract catalogue. Each entry describes a reviewed library
+profile for a named sink class. Consumers must establish its source
+requirements before granting authority; name recognition alone is insufficient.
+
+Adding entries is a soundness-critical operation — each ``soundness_note``
+documents WHY the call is safe (per library docs / known semantics) so
+reviewers can sanity-check the claim.  Keep the table small and well-
+justified; growth should be driven by concrete corpus cases.
+
+Immutable-return invariant: every transform entry's return value must
+be an IMMUTABLE value (str / str subclass; for C, a newly-allocated
+string the callee never retains, with caller-side buffer integrity
+established separately). The chain trackers and the
+sanitizer-cut value gate reason about NAME bindings only — they cannot
+see mutation through an alias.  A sanitizer returning a mutable
+container would let ``alias = clean_list; alias += [tainted]``
+re-taint the "sanitized" value while every name-level check still
+holds (the exclusivity condition would certify over the alias
+mutation). Conditional entries remain candidates until their output
+contracts are established; a recognised name does not establish this
+invariant. Reviewers must require immutable output or alias-aware tracking.
+
+Lookup contract:
+  ``find(library_call: str, sink_class: str, language: str)`` returns
+  the matching :class:`KnownSafeCall` entry or ``None``.  Matching is by
+  full dotted name and language, both case-sensitive.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+EXACT_STR_DEFAULT_CALL = "exact_builtin_str_default_call"
+DOMPURIFY_PROFILE = "dompurify_instance_config_and_immutable_output"
+SQL_ESCAPE_PROFILE = "sql_escape_driver_input_mode_and_literal_context"
+DEFAULT_POSITIONAL_CALL = "single_positional_default_call"
+PATH_JOIN_CONTAINMENT = "trusted_path_base_components_and_containment"
+HTML_TEXT_CONTENT_CONTEXT = "html_text_content_sink_context"
+HTML_ATTRIBUTE_POLICY = "html_quoted_attribute_sink_context_and_policy"
+HTML_OUTPUT_POLICY = "html_text_or_quoted_attribute_sink_context_and_policy"
+POSIX_SHELL_ARGUMENT_CONTEXT = "posix_shell_argument_sink_context"
+
+
+@dataclass(frozen=True)
+class KnownSafeCall:
+    """One curated entry — a soundness claim for a single library call.
+
+    ``library_call`` is the fully-qualified dotted name as it would appear
+    in the source (after any standard ``from X import Y`` flattening:
+    ``html.escape``, ``django.utils.html.escape``, etc).
+
+    ``input_arg_kind`` distinguishes:
+
+      * ``"transform"`` — the call's RETURN VALUE is the safe value
+        (e.g. ``html.escape(x)``).  The CHAIN must show the return
+        value (or a name assigned from it) reaching the sink; the
+        input variable itself is never constrained.
+      * ``"validate"`` — the call RAISES on bad input, so after it
+        returns the INPUT variable itself is constrained and stays the
+        chain start.  Raising is load-bearing: a validator that merely
+        returns a sentinel (``None``, ``False``) on bad input does NOT
+        constrain the input — control continues with the raw value
+        live — and MUST be classed ``"transform"`` instead (its safety
+        lives in the return value).  ``werkzeug.security.safe_join``
+        is the precedent: it returns ``None`` on traversal (only
+        Flask's ``flask.helpers.safe_join`` wrapper raises), so it is
+        a transform entry despite its validating flavour.
+
+    The chain-check consequences of the two kinds differ (input-start
+    vs binding-target-start) — reviewers must verify the raise/return
+    claim against the library's actual behaviour before picking a kind.
+    """
+    library_call: str
+    sink_class: str
+    languages: tuple[str, ...]
+    input_arg_kind: str            # "transform" | "validate"
+    soundness_note: str
+    # Supported primitive contract: one exact-str positional argument,
+    # using library defaults. Source annotations/isinstance do not suffice.
+    requires_exact_str: bool = False
+    required_source_contracts: frozenset[str] = frozenset()
+
+    def __post_init__(self):
+        if type(self.requires_exact_str) is not bool:
+            raise ValueError("requires_exact_str must be a boolean")
+        if (type(self.required_source_contracts) is not frozenset
+                or any(type(item) is not str or not item for item in self.required_source_contracts)):
+            raise ValueError("required_source_contracts must be a frozenset of nonempty strings")
+
+    @property
+    def source_contracts(self) -> frozenset[str]:
+        """Additional premises; name or value matching cannot establish them."""
+        if type(self.requires_exact_str) is not bool:
+            return frozenset({"invalid_catalog_contract"})
+        if (type(self.required_source_contracts) is not frozenset
+                or any(type(item) is not str or not item for item in self.required_source_contracts)):
+            return frozenset({"invalid_catalog_contract"})
+        primitive = frozenset({EXACT_STR_DEFAULT_CALL}) if self.requires_exact_str else frozenset()
+        return self.required_source_contracts | primitive
+
+
+_TABLE: tuple[KnownSafeCall, ...] = (
+    # ------------------------------------------------------------------
+    # pathtrav — path-traversal safe joiners / validators
+    # ------------------------------------------------------------------
+    KnownSafeCall(
+        library_call="werkzeug.security.safe_join",
+        sink_class="pathtrav",
+        languages=("python",),
+        # transform, NOT validate: werkzeug's safe_join returns None on
+        # traversal — it does not raise (raising NotFound is Flask's
+        # flask.helpers.safe_join WRAPPER).  With no raise the input
+        # variable is unconstrained after the call, so only the RETURN
+        # value may start the chain; the None return cannot traverse (a
+        # path sink consuming None fails with TypeError, not escape).
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({PATH_JOIN_CONTAINMENT}),
+        soundness_note=(
+            "Given a trusted base and supported component semantics, "
+            "werkzeug.security.safe_join (since werkzeug 0.5) returns "
+            "None if the joined path escapes the base directory or "
+            "contains traversal sequences.  Return value, when not None, "
+            "is lexically relative to the base directory. Filesystem containment "
+            "requires separate resolution and symlink premises."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="werkzeug.utils.secure_filename",
+        sink_class="pathtrav",
+        languages=("python",),
+        input_arg_kind="transform",
+        soundness_note=(
+            "werkzeug.utils.secure_filename strips path separators and "
+            "control chars; the return value contains only "
+            "[A-Za-z0-9._-] and never a path separator (verified vs "
+            "werkzeug source)."
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # xss — HTML-context escapers
+    # ------------------------------------------------------------------
+    KnownSafeCall(
+        library_call="html.escape",
+        sink_class="xss",
+        languages=("python",),
+        input_arg_kind="transform",
+        requires_exact_str=True,
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "For an exact builtin str input using library defaults, "
+            "stdlib html.escape converts &, <, >, and (with default "
+            "quote=True) \", ' to HTML entities.  Source-bound output context "
+            "and attribute policy remain separate requirements."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="django.utils.html.escape",
+        sink_class="xss",
+        languages=("python",),
+        input_arg_kind="transform",
+        requires_exact_str=True,
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "For an exact builtin str using defaults, "
+            "Django's escape wraps stdlib html.escape "
+            "+ marks result as SafeString.  Output context and attribute policy "
+            "remain separate requirements."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="markupsafe.escape",
+        sink_class="xss",
+        languages=("python",),
+        input_arg_kind="transform",
+        requires_exact_str=True,
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "For an exact builtin str using defaults, "
+            "markupsafe.escape escapes &, <, >, \", ' and returns Markup "
+            "(SafeString equivalent).  Output context and attribute policy "
+            "remain separate requirements."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="bleach.clean",
+        sink_class="xss",
+        languages=("python",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({DEFAULT_POSITIONAL_CALL, HTML_TEXT_CONTENT_CONTEXT}),
+        soundness_note=(
+            "bleach.clean sanitises HTML against an allowlist of tags "
+            "and attributes for HTML fragment content.  Output context "
+            "must be source-bound; custom "
+            "allowlists are caller's responsibility (we only claim "
+            "safety for the default call form, no args beyond the "
+            "input string)."
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # cmdi — shell-quoting / arg-list safe constructors
+    # ------------------------------------------------------------------
+    KnownSafeCall(
+        library_call="shlex.quote",
+        sink_class="cmdi",
+        languages=("python",),
+        input_arg_kind="transform",
+        requires_exact_str=True,
+        required_source_contracts=frozenset({POSIX_SHELL_ARGUMENT_CONTEXT}),
+        soundness_note=(
+            "For an exact builtin str using defaults, shlex.quote returns a shell-escaped string safe to "
+            "use as a complete argument token in a POSIX shell command "
+            "(single-quoted, with "
+            "embedded single quotes escaped).  Sound for shell=True "
+            "subprocess invocations ONLY — quoting does not neutralize "
+            "argument-position injection (CWE-88): a quoted value used "
+            "as one argv element still parses as an option "
+            "(quote('-rf') == '-rf'), so this entry belongs to the "
+            "cmdi (shell-string) sink class and must never be "
+            "catalogued for the argv-context class (cmdi_argv)."
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # JS / TS — mostly transforms via popular libraries
+    # ------------------------------------------------------------------
+    KnownSafeCall(
+        library_call="validator.escape",
+        sink_class="xss",
+        languages=("javascript", "typescript"),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "validator.js escape() replaces &, <, >, \", ', / with their "
+            "HTML entity equivalents.  Output context and attribute policy "
+            "remain separate requirements."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="DOMPurify.sanitize",
+        sink_class="xss",
+        languages=("javascript", "typescript"),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({DOMPURIFY_PROFILE}),
+        soundness_note=(
+            "DOMPurify.sanitize is the canonical XSS sanitiser for "
+            "user-supplied HTML; output is safe to assign to innerHTML.  "
+            "Requires a reviewed instance/configuration profile with immutable "
+            "output. Local default call syntax does not establish persistent "
+            "configuration, hooks or the return mode."
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # JS / TS — SQL escaping (reviewed mysql / mysql2 profiles)
+    # ------------------------------------------------------------------
+    KnownSafeCall(
+        library_call="connection.escape",
+        sink_class="sqli",
+        languages=("javascript", "typescript"),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({SQL_ESCAPE_PROFILE}),
+        soundness_note=(
+            "Under a reviewed mysql/mysql2 driver profile, primitive strings "
+            "are quoted for SQL literal placement when the connection SQL mode "
+            "supports backslash escaping. Other input domains can produce "
+            "different shapes; raw-SQL conversion hooks are not escaped string "
+            "inputs. Driver identity, input domain, SQL mode and literal context "
+            "require independent evidence. Identifier placement is unsupported."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="conn.escape",
+        sink_class="sqli",
+        languages=("javascript", "typescript"),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({SQL_ESCAPE_PROFILE}),
+        soundness_note=(
+            "Candidate spelling for the connection.escape profile. A variable "
+            "name does not establish driver identity or its escaping semantics; "
+            "the same driver, input, SQL-mode and literal-context requirements apply."
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # Java — escaping + parameterised queries
+    #
+    # Naming: the Java CFG builder (b13 leg) emits callable names
+    # FQN-RESOLVED against the file's explicit imports, so entries key
+    # on fully-qualified names. The chained ESAPI singleton idiom
+    # carries an explicit call marker (``…ESAPI.encoder().encodeFor…``)
+    # — only that exact static-chain shape matches; instance calls on
+    # an untyped variable never resolve (no type inference → no
+    # suppression through them).
+    #
+    # Class-assignment honesty: java.net.URLEncoder.encode is
+    # DELIBERATELY absent — it is a URL/form encoder, not an HTML or
+    # path sanitizer; classing it as either would be semantically
+    # dishonest (the adversarial corpus pins it as the wrong-class
+    # case). cmdi has NO Java entries: ESAPI's encodeForOS requires a
+    # caller-chosen Codec argument, so safety is not a property of the
+    # call name alone. sqli has NO Java entries: PreparedStatement
+    # parameterisation is a structural pattern, not a call-shaped
+    # transform. xss seed list is 6 names (≤9 vocab-guardrail seed
+    # rule); growth must come from learned vocabulary / corpus cases.
+    # ------------------------------------------------------------------
+    KnownSafeCall(
+        library_call="org.apache.commons.lang3.StringEscapeUtils.escapeHtml4",
+        sink_class="xss",
+        languages=("java",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "Apache Commons Lang escapeHtml4 escapes per HTML 4.0 spec; "
+            "output context and attribute policy remain separate requirements. "
+            "HTML attribute values must be quoted."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="org.owasp.encoder.Encode.forHtml",
+        sink_class="xss",
+        languages=("java",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "OWASP Java Encoder forHtml escapes for ALL HTML contexts "
+            "it documents as covered (element content and quoted "
+            "attributes): &, <, >, \", ' become entities. The project's "
+            "reference XSS encoder."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="org.owasp.encoder.Encode.forHtmlContent",
+        sink_class="xss",
+        languages=("java",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_TEXT_CONTENT_CONTEXT}),
+        soundness_note=(
+            "OWASP Java Encoder forHtmlContent escapes &, <, > for HTML "
+            "element-content context. Safe for text-node emission; the "
+            "catalog claim covers exactly that context."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="org.owasp.encoder.Encode.forHtmlAttribute",
+        sink_class="xss",
+        languages=("java",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_ATTRIBUTE_POLICY}),
+        soundness_note=(
+            "OWASP Java Encoder forHtmlAttribute escapes &, <, \", ' "
+            "(and more) for quoted-attribute context."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="org.owasp.esapi.ESAPI.encoder().encodeForHTML",
+        sink_class="xss",
+        languages=("java",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_TEXT_CONTENT_CONTEXT}),
+        soundness_note=(
+            "ESAPI DefaultEncoder.encodeForHTML entity-encodes for HTML "
+            "body context (canonical OWASP Benchmark safe form). The "
+            "key's explicit ()-marker means only the static "
+            "ESAPI.encoder() chain matches — an instance call on an "
+            "untyped variable never resolves to this entry."
+        ),
+    ),
+    KnownSafeCall(
+        library_call="org.springframework.web.util.HtmlUtils.htmlEscape",
+        sink_class="xss",
+        languages=("java",),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "Spring HtmlUtils.htmlEscape entity-encodes &, <, >, \", ' "
+            "per the HTML 4.0 character entity set. Output context and "
+            "attribute policy remain separate requirements."
+        ),
+    ),
+    # NB: org.apache.commons.io.FilenameUtils.getName is DELIBERATELY
+    # absent from pathtrav: getName("..") returns ".." (the text after
+    # the last separator of a separator-free input is the input), and
+    # joining that under a base directory escapes it by one level.
+    # A sound Java pathtrav transform needs dot-segment stripping;
+    # none of the common single-call APIs guarantee it.
+    # NB: Java PreparedStatement.setString is a structurally different
+    # pattern (a method call on a previously-allocated PreparedStatement
+    # object that's then executed).  Not a single-call transform —
+    # leaving for a future entry-kind that models multi-step
+    # parameterised-query patterns.
+
+    # ------------------------------------------------------------------
+    # C / C++ — Phase 11 entries
+    # ------------------------------------------------------------------
+    #
+    # Selection rule for C / C++: only "transform" sanitizers that
+    # return a newly-allocated value qualify. Destination-buffer
+    # writers (``mysql_real_escape_string(conn, dst, src, len)``,
+    # ``realpath(in, dst)``) are excluded because Phase 10's
+    # may_escape policy would downgrade them to candidate_only anyway
+    # — wiring them through the catalog would only generate audit
+    # noise. Such patterns will become value-bound under Phase 12-14's
+    # inter-procedural taint or a future alias-tracking refinement.
+    #
+    # The entries below are GLib library calls whose API docs specify
+    # newly allocated output. Caller-side alias integrity is still required.
+    # Adding entries from other libraries should follow the same
+    # bar: a documented "returns sanitized output" contract.
+    KnownSafeCall(
+        library_call="g_markup_escape_text",
+        sink_class="xss",
+        languages=("c", "cpp"),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({HTML_OUTPUT_POLICY}),
+        soundness_note=(
+            "GLib g_markup_escape_text (since GLib 2.0) escapes the XML "
+            "metacharacters &, <, >, \", ' to their entity references. "
+            "Returns a newly-allocated gchar* that is XML-safe and "
+            "(by extension) HTML-safe for text content."
+        ),
+    ),
+    # NB: g_uri_escape_string is DELIBERATELY absent from pathtrav:
+    # per RFC 3986 (and GLib's implementation) '.' is UNRESERVED and
+    # never percent-encoded, so the traversal sequence ".." passes
+    # through verbatim — joined under a base directory it escapes one
+    # level. The call does escape '/' (unless caller-allowed), but the
+    # pathtrav danger model includes '.' for exactly this dot-segment
+    # reason, so a separator-only claim cannot certify the sink class.
+    # Same precedent as the FilenameUtils.getName exclusion above: a
+    # sound pathtrav transform needs dot-segment stripping, which no
+    # percent-encoder provides.
+    KnownSafeCall(
+        library_call="g_shell_quote",
+        sink_class="cmdi",
+        languages=("c", "cpp"),
+        input_arg_kind="transform",
+        required_source_contracts=frozenset({POSIX_SHELL_ARGUMENT_CONTEXT}),
+        soundness_note=(
+            "GLib g_shell_quote (since GLib 2.0) returns a newly-allocated "
+            "string wrapped in single quotes with any embedded single "
+            "quotes properly escaped. The output is safe for inclusion "
+            "in a shell command line per POSIX sh(1) quoting rules."
+        ),
+    ),
+    # NOTE: sqlite3_mprintf is deliberately NOT in this catalog. Only its
+    # %q/%Q format specifiers escape; a generic %s does not, so keying
+    # suppression on the call name alone would falsely clear
+    # sqlite3_mprintf("... = %s", tainted) — the exact wrong-format-
+    # specifier FN this arc exists to prevent (review #1 on PR #794).
+    # Re-add only behind per-format-specifier discrimination.
+)
+
+
+def find(library_call: str, sink_class: str, language: str) -> KnownSafeCall | None:
+    """Look up a known-safe call entry.  Returns the matching entry or
+    None.  Exact match on ``library_call`` and ``sink_class``; language
+    must be in the entry's ``languages`` tuple."""
+    for entry in _TABLE:
+        if (entry.library_call == library_call
+                and entry.sink_class == sink_class
+                and language in entry.languages):
+            return entry
+    return None
+
+
+def all_entries() -> tuple[KnownSafeCall, ...]:
+    """Diagnostic accessor — returns the full table for testing /
+    audit-rendering."""
+    return _TABLE

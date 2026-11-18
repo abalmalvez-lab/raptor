@@ -1,0 +1,583 @@
+"""Cross-platform external ingress and fuzz-strategy tests."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
+
+from packages.binary_analysis.fuzz_suitability import assess_fuzz_suitability
+from packages.binary_analysis.ingress import recover_external_ingress
+from packages.binary_analysis.macho import AppBundleMetadata
+from packages.binary_analysis.manifest import BinaryManifest
+from packages.binary_analysis.topology import build_component_topology
+
+
+def _write_binary(path: Path, data: bytes) -> Path:
+    path.write_bytes(data)
+    path.chmod(0o755)
+    return path
+
+
+def _manifest(
+    path: Path,
+    *,
+    target_kind: str,
+    exports: Optional[list[str]] = None,
+    export_types: Optional[dict[str, str]] = None,
+    app_bundle: Optional[AppBundleMetadata] = None,
+    imports: Optional[list[str]] = None,
+) -> BinaryManifest:
+    return BinaryManifest(
+        schema_version=1,
+        binary_path=str(path),
+        binary_sha256="a" * 64,
+        size_bytes=path.stat().st_size,
+        executable=True,
+        target_kind=target_kind,
+        arch="x86",
+        bits=64,
+        binary_format=target_kind.split("-")[0] if "-" in target_kind else target_kind,
+        imports=list(imports or []),
+        exports=list(exports or []),
+        export_types=dict(export_types or {}),
+        app_bundle=app_bundle,
+    )
+
+
+def _pe_fixture() -> bytes:
+    data = bytearray(b"\x00" * 256)
+    data[:2] = b"MZ"
+    data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    data[0x80:0x84] = b"PE\x00\x00"
+    data[0x84:0x86] = (0x8664).to_bytes(2, "little")
+    return bytes(data)
+
+
+def test_macos_callback_ingress_drives_harness_extraction_not_whole_app_fuzz(tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "Demo", b"\xcf\xfa\xed\xfe" + b"\x00" * 128)
+    manifest = _manifest(
+        binary,
+        target_kind="macho",
+        app_bundle=AppBundleMetadata(
+            bundle_path=str(tmp_path / "Demo.app"),
+            info_plist_path=str(tmp_path / "Demo.app" / "Contents" / "Info.plist"),
+            url_schemes=["demo"],
+            identifier="com.example.demo",
+        ),
+    )
+    context = {
+        "framework_callback_candidates": [{
+            "class_name": "Demo.AppDelegate",
+            "method_name": "application:openURLs:",
+            "bound_function_id": "BFN-1000",
+            "bound_function_name": "method.Demo.AppDelegate.application:openURLs:",
+            "address": "0x1000",
+            "evidence_ids": ["EV-1"],
+        }],
+        "interesting_functions": [{
+            "id": "BFN-1000",
+            "name": "method.Demo.AppDelegate.application:openURLs:",
+            "address": "0x1000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+    topology = build_component_topology(manifest, ingress)
+    suitability = assess_fuzz_suitability(manifest, context, ingress, topology)
+
+    assert ingress[0]["kind"] == "url_handler"
+    assert ingress[0]["bound_function_id"] == "BFN-1000"
+    assert any(item["kind"] == "external_to_process" for item in topology["boundaries"])
+    assert suitability["strategy"] == "extract_harness_from_ingress"
+    assert suitability["direct_campaign_recommended"] is False
+
+
+def test_windows_dll_exports_bind_to_recovered_functions(tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(binary, target_kind="pe-dll", exports=["DecodePacket"])
+    context = {
+        "interesting_functions": [{
+            "id": "BFN-401000",
+            "name": "DecodePacket",
+            "address": "0x401000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+    topology = build_component_topology(manifest, ingress)
+    suitability = assess_fuzz_suitability(manifest, context, ingress, topology)
+
+    exported = next(item for item in ingress if item["kind"] == "exported_api")
+    assert exported["bound_function_id"] == "BFN-401000"
+    assert exported["boundary"] == "caller_to_library"
+    assert suitability["strategy"] == "extract_export_harness"
+
+
+def test_windows_and_linux_driver_symbols_are_treated_as_ioctl_boundaries(tmp_path: Path) -> None:
+    pe_binary = _write_binary(tmp_path / "demo.sys", _pe_fixture())
+    pe_manifest = _manifest(pe_binary, target_kind="pe-sys")
+    pe_context = {
+        "interesting_functions": [{
+            "id": "BFN-5000",
+            "name": "EvtIoDeviceControl",
+            "address": "0x5000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    pe_ingress, _ = recover_external_ingress(pe_manifest, pe_context)
+    pe_topology = build_component_topology(pe_manifest, pe_ingress)
+    pe_suitability = assess_fuzz_suitability(pe_manifest, pe_context, pe_ingress, pe_topology)
+    assert any(item["kind"] == "ioctl_dispatch" for item in pe_ingress)
+    assert pe_suitability["strategy"] == "snapshot_or_ioctl_harness"
+    assert pe_suitability["runtime_strategy"] == "kernel_harness_required"
+
+    ko_binary = _write_binary(tmp_path / "demo.ko", b"\x7fELF" + b"\x00" * 128)
+    ko_manifest = _manifest(ko_binary, target_kind="elf-kmod")
+    ko_context = {
+        "interesting_functions": [{
+            "id": "BFN-6000",
+            "name": "demo_unlocked_ioctl",
+            "address": "0x6000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ko_ingress, _ = recover_external_ingress(ko_manifest, ko_context)
+    ko_topology = build_component_topology(ko_manifest, ko_ingress)
+    ko_suitability = assess_fuzz_suitability(ko_manifest, ko_context, ko_ingress, ko_topology)
+    assert any(item["kind"] == "ioctl_dispatch" for item in ko_ingress)
+    assert ko_suitability["strategy"] == "snapshot_or_ioctl_harness"
+    assert ko_suitability["runtime_strategy"] == "kernel_harness_required"
+
+
+def test_libfuzzer_entry_is_the_only_direct_campaign_boundary(tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "harness", b"\x7fELF" + b"\x00" * 128)
+    manifest = _manifest(binary, target_kind="elf-linux")
+    context = {
+        "entry_points": [{
+            "id": "BEP-1000",
+            "name": "LLVMFuzzerTestOneInput",
+            "address": "0x1000",
+            "evidence_ids": ["EV-1"],
+        }],
+        "surface_details": [],
+        "sources": [],
+        "interesting_functions": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+    topology = build_component_topology(manifest, ingress)
+    suitability = assess_fuzz_suitability(manifest, context, ingress, topology)
+
+    assert suitability["strategy"] == "direct_harness"
+    assert suitability["direct_campaign_recommended"] is True
+    assert suitability["should_run_fuzz_plan"] is True
+
+
+def test_export_base_name_fallback_binds_and_keeps_first_match(tmp_path: Path) -> None:
+    """Exports not found by exact name bind through the base-name
+    index (sym.DecodePacket ~ DecodePacket). With several dotted names
+    sharing a base, the FIRST function in inventory order wins —
+    pinned so the index rewrite of the old linear scan can never
+    silently change which function an export binds to."""
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(binary, target_kind="pe-dll", exports=["DecodePacket"])
+    context = {
+        "interesting_functions": [
+            {
+                "id": "BFN-401000",
+                "name": "sym.DecodePacket",
+                "address": "0x401000",
+            },
+            {
+                "id": "BFN-402000",
+                "name": "dbg.DecodePacket",
+                "address": "0x402000",
+            },
+        ],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    exported = next(item for item in ingress if item["kind"] == "exported_api")
+    assert exported["bound_function_id"] == "BFN-401000"
+    assert exported["bound_function_name"] == "sym.DecodePacket"
+
+
+def test_exported_data_symbols_demoted_not_dropped(tmp_path: Path) -> None:
+    """Exported OBJECT/data symbols (e.g. a global length-limit
+    constant) are not callable APIs — they must never rank as
+    ``exported_api`` peers of real function exports. But the type byte
+    is attacker-controlled (a 2-byte st_info patch relabels a callable
+    export OBJECT while it stays dlopen/dlsym-callable), so they are
+    DEMOTED to a visible low-score ``exported_data`` candidate, never
+    silently dropped."""
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(
+        binary,
+        target_kind="pe-dll",
+        exports=["DecodePacket", "kMaxPacketLen"],
+        export_types={"DecodePacket": "FUNC", "kMaxPacketLen": "OBJ"},
+    )
+    context = {
+        "interesting_functions": [],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, records = recover_external_ingress(manifest, context)
+
+    exported = [item for item in ingress if item["kind"] == "exported_api"]
+    assert [item["name"] for item in exported] == ["DecodePacket"]
+    demoted = [item for item in ingress if item["kind"] == "exported_data"]
+    assert [item["name"] for item in demoted] == ["kMaxPacketLen"]
+    assert demoted[0]["details"]["symbol_type"] == "OBJ"
+    # Demoted below every function export: an attacker-flippable type
+    # byte must never move a candidate ABOVE an API export.
+    assert demoted[0]["score"] < min(item["score"] for item in exported)
+    data_records = [r for r in records if r.kind == "exported_data_symbol"]
+    assert len(data_records) == 1
+    assert data_records[0].data["names"] == ["kMaxPacketLen"]
+    assert data_records[0].data["count"] == 1
+    assert data_records[0].data["names_truncated"] is False
+
+
+def test_exported_data_demotion_applies_to_elf_exports(tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "libdemo.so", b"\x7fELF" + b"\x00" * 128)
+    manifest = _manifest(
+        binary,
+        target_kind="elf-linux",
+        exports=["demo_parse", "demo_version_string"],
+        export_types={"demo_parse": "FUNC", "demo_version_string": "OBJ"},
+    )
+    context = {
+        "interesting_functions": [],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, records = recover_external_ingress(manifest, context)
+
+    exported = [item for item in ingress if item["kind"] == "exported_api"]
+    assert [item["name"] for item in exported] == ["demo_parse"]
+    demoted = [item for item in ingress if item["kind"] == "exported_data"]
+    assert [item["name"] for item in demoted] == ["demo_version_string"]
+    assert any(r.kind == "exported_data_symbol" for r in records)
+
+
+def test_type_contradicted_export_stays_visible(tmp_path: Path) -> None:
+    """The type-contradiction case: an OBJ-typed export that r2's
+    aflj also lacks (aflj already skips OBJ-typed exports, so the
+    export loop is the last catch for a FUNC->OBJECT-patched callable)
+    must still surface as a visible candidate — with empty binding
+    fields, exactly like any other unbound export."""
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(
+        binary,
+        target_kind="pe-dll",
+        exports=["PatchedCallable"],
+        export_types={"PatchedCallable": "OBJECT"},
+    )
+    context = {
+        # aflj recovered nothing for this export.
+        "interesting_functions": [],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    demoted = next(item for item in ingress if item["kind"] == "exported_data")
+    assert demoted["name"] == "PatchedCallable"
+    assert demoted["bound_function_id"] == ""
+    assert demoted["evidence_ids"]  # candidate carries its own evidence
+
+
+def test_exports_with_unknown_type_stay_api_ingress(tmp_path: Path) -> None:
+    """Symbol-type coverage varies by format and r2 version: an export
+    with no recorded type must keep its exported_api candidacy
+    (fail-open) — only a positively identified data type excludes."""
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(
+        binary,
+        target_kind="pe-dll",
+        exports=["MysteryExport", "NoTypeInfo"],
+        export_types={"MysteryExport": "NOTYPE"},
+    )
+    context = {
+        "interesting_functions": [],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, records = recover_external_ingress(manifest, context)
+
+    exported = sorted(
+        item["name"] for item in ingress if item["kind"] == "exported_api"
+    )
+    assert exported == ["MysteryExport", "NoTypeInfo"]
+    assert not any(r.kind == "exported_data_symbol" for r in records)
+
+
+def test_manifest_export_types_roundtrip(tmp_path: Path) -> None:
+    """export_types must survive the to_dict/from_dict cycle — run-dir
+    reloads (report/investigate subcommands) would otherwise lose the
+    data/function distinction and re-rank data exports as APIs."""
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(
+        binary,
+        target_kind="pe-dll",
+        exports=["DecodePacket", "kMaxPacketLen"],
+        export_types={"DecodePacket": "FUNC", "kMaxPacketLen": "OBJ"},
+    )
+
+    reloaded = BinaryManifest.from_dict(manifest.to_dict())
+
+    assert reloaded.export_types == {
+        "DecodePacket": "FUNC",
+        "kMaxPacketLen": "OBJ",
+    }
+
+
+def test_unbound_export_still_surfaces(tmp_path: Path) -> None:
+    """An export with no matching function (exact or base) still
+    yields an ingress candidate with empty binding fields."""
+    binary = _write_binary(tmp_path / "codec.dll", _pe_fixture())
+    manifest = _manifest(binary, target_kind="pe-dll", exports=["NoSuchFn"])
+    context = {
+        "interesting_functions": [{
+            "id": "BFN-401000",
+            "name": "Other",
+            "address": "0x401000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    exported = next(item for item in ingress if item["kind"] == "exported_api")
+    assert exported["bound_function_id"] == ""
+
+
+# --- Win32 / darwin catalog arms -------------------------------------------
+
+
+def test_windows_service_entry_recovered(tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "svc.exe", _pe_fixture())
+    manifest = _manifest(binary, target_kind="pe-exe",
+                         exports=["ServiceMain"])
+    context = {
+        "interesting_functions": [{
+            "id": "BFN-401200",
+            "name": "ServiceMain",
+            "address": "0x401200",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    service = next(item for item in ingress
+                   if item["kind"] == "service_entry")
+    assert service["external_control"] == "service_control_manager"
+    assert service["boundary"] == "process_boundary"
+    assert service["bound_function_id"] == "BFN-401200"
+
+
+def test_service_entry_point_classified_from_entry_points(
+        tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "svc.exe", _pe_fixture())
+    manifest = _manifest(binary, target_kind="pe-exe")
+    context = {
+        "entry_points": [{
+            "id": "BFN-401200",
+            "name": "ServiceMain",
+            "address": "0x401200",
+        }],
+        "interesting_functions": [],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    service = next(item for item in ingress
+                   if item["kind"] == "service_entry")
+    assert service["external_control"] == "service_control_manager"
+
+
+def test_macho_xpc_listener_from_imports(tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "helper",
+                           b"\xcf\xfa\xed\xfe" + b"\x00" * 128)
+    manifest = _manifest(
+        binary, target_kind="macho",
+        imports=["xpc_connection_set_event_handler", "xpc_main",
+                 "printf"])
+    context: dict[str, Any] = {
+        "interesting_functions": [],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    listener = next(item for item in ingress
+                    if item["kind"] == "xpc_listener")
+    assert listener["boundary"] == "process_boundary"
+    assert listener["external_control"] == "peer_process"
+    assert listener["details"]["symbols"] == [
+        "xpc_connection_set_event_handler", "xpc_main"]
+    # Import-table facts are header-backed, but presence of the setup
+    # call is still only a candidate for "this binary listens".
+    assert listener["evidence_tier"] == "header_backed"
+    assert listener["confidence"] == "candidate"
+
+
+def test_macho_without_xpc_imports_has_no_listener(
+        tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "tool",
+                           b"\xcf\xfa\xed\xfe" + b"\x00" * 128)
+    manifest = _manifest(binary, target_kind="macho",
+                         imports=["printf", "read"])
+    ingress, _ = recover_external_ingress(
+        manifest, {"interesting_functions": [], "sources": []})
+    assert not [item for item in ingress
+                if item["kind"] == "xpc_listener"]
+
+
+def test_macho_iokit_external_method_from_functions(
+        tmp_path: Path) -> None:
+    binary = _write_binary(tmp_path / "driver.kext",
+                           b"\xcf\xfa\xed\xfe" + b"\x00" * 128)
+    manifest = _manifest(binary, target_kind="macho")
+    mangled = "__ZN12MyUserClient14externalMethodEjP25IOExternalMethodArguments"
+    context = {
+        "interesting_functions": [{
+            "id": "BFN-9000",
+            "name": mangled,
+            "address": "0x9000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    method = next(item for item in ingress
+                  if item["kind"] == "iokit_external_method")
+    assert method["boundary"] == "kernel_boundary"
+    assert method["external_control"] == "user_client_call"
+    assert method["bound_function_id"] == "BFN-9000"
+    # Substring-matched recovered names are a heuristic, candidate-
+    # confidence signal — never header-backed like the import arms.
+    assert method["evidence_tier"] == "heuristic"
+    assert method["confidence"] == "candidate"
+
+
+def test_macho_iokit_dispatch_under_cap_all_ranked(
+        tmp_path: Path) -> None:
+    """Below the flood cap every externalMethod match ranks and no
+    truncation record is emitted (the cap must not eat legitimate
+    multi-client drivers)."""
+    from packages.binary_analysis.ingress import (
+        _MACHO_IOKIT_DISPATCH_CAP,
+    )
+    binary = _write_binary(tmp_path / "driver.kext",
+                           b"\xcf\xfa\xed\xfe" + b"\x00" * 128)
+    manifest = _manifest(binary, target_kind="macho")
+    count = _MACHO_IOKIT_DISPATCH_CAP
+    context = {
+        "interesting_functions": [{
+            "id": f"BFN-{9000 + i}",
+            "name": f"__ZN8Client{i:02d}14externalMethodEj",
+            "address": hex(0x9000 + i),
+        } for i in range(count)],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, records = recover_external_ingress(manifest, context)
+
+    methods = [item for item in ingress
+               if item["kind"] == "iokit_external_method"]
+    assert len(methods) == count
+    assert not any(r.kind == "iokit_dispatch_truncated"
+                   for r in records)
+
+
+def test_macho_iokit_dispatch_flood_capped_with_audit_record(
+        tmp_path: Path) -> None:
+    """Above the cap: candidates bounded, and an aggregated evidence
+    record keeps the full match count plus the skipped names — a
+    crafted symbol table cannot silently drown the ranked queue OR
+    silently hide names from the audit trail."""
+    from packages.binary_analysis.ingress import (
+        _MACHO_IOKIT_DISPATCH_CAP,
+    )
+    binary = _write_binary(tmp_path / "driver.kext",
+                           b"\xcf\xfa\xed\xfe" + b"\x00" * 128)
+    manifest = _manifest(binary, target_kind="macho")
+    total = _MACHO_IOKIT_DISPATCH_CAP + 5
+    context = {
+        "interesting_functions": [{
+            "id": f"BFN-{9000 + i}",
+            "name": f"__ZN8Flood{i:03d}14externalMethodEj",
+            "address": hex(0x9000 + i),
+        } for i in range(total)],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, records = recover_external_ingress(manifest, context)
+
+    methods = [item for item in ingress
+               if item["kind"] == "iokit_external_method"]
+    assert len(methods) == _MACHO_IOKIT_DISPATCH_CAP
+    truncation = [r for r in records
+                  if r.kind == "iokit_dispatch_truncated"]
+    assert len(truncation) == 1
+    assert truncation[0].data["count"] == total
+    assert truncation[0].data["cap"] == _MACHO_IOKIT_DISPATCH_CAP
+    assert len(truncation[0].data["skipped_names"]) == 5
+    assert truncation[0].data["names_truncated"] is False
+
+
+def test_elf_ingress_unaffected_by_winmac_catalogs(
+        tmp_path: Path) -> None:
+    """No-ELF-regression pin: the Win32/darwin arms are kind-gated,
+    so an elf-linux manifest never grows their candidate kinds even
+    when name collisions exist."""
+    binary = _write_binary(tmp_path / "app", b"\x7fELF" + b"\x00" * 64)
+    manifest = _manifest(
+        binary, target_kind="elf-linux",
+        exports=["ServiceMain", "process_data"],
+        imports=["xpc_main", "RegQueryValueExW"])
+    context = {
+        "interesting_functions": [{
+            "id": "BFN-1",
+            "name": "MyClass_externalMethod_impl",
+            "address": "0x1000",
+        }],
+        "surface_details": [],
+        "sources": [],
+    }
+
+    ingress, _ = recover_external_ingress(manifest, context)
+
+    kinds = {item["kind"] for item in ingress}
+    assert "xpc_listener" not in kinds
+    assert "iokit_external_method" not in kinds
+    assert "service_entry" not in kinds
+    # The exports still surface through the pre-existing ELF arm.
+    assert "exported_api" in kinds

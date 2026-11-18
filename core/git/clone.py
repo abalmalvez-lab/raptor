@@ -10,7 +10,8 @@ Two entry points:
     not reachable from a depth-1 clone of HEAD, so progressive-fetch
     cascades use this.
 
-Both wrap their ``git`` subprocess in ``core.sandbox.run_untrusted``:
+Both wrap their ``git`` subprocess in ``core.sandbox.run_untrusted_networked``
+(network calls) and ``core.sandbox.run_untrusted`` (local-only calls):
 
   - the egress proxy pinned to the small set of hostnames the URL
     allowlist permits (github.com / gitlab.com plus the known
@@ -19,7 +20,7 @@ Both wrap their ``git`` subprocess in ``core.sandbox.run_untrusted``:
     the target / repo directory;
   - sanitised env (``RaptorConfig.get_git_env()`` — clears
     HTTP_PROXY / NO_PROXY etc., sets GIT_TERMINAL_PROMPT=0 and
-    GIT_ASKPASS=true so a malformed-credential prompt can't hang
+    GIT_ASKPASS=/usr/bin/true so a malformed-credential prompt can't hang
     the run);
   - bounded timeout (``RaptorConfig.GIT_CLONE_TIMEOUT``).
 
@@ -31,13 +32,29 @@ from __future__ import annotations
 
 import logging
 import re
-import tempfile
+import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from core.run.scratch import scratch_dir
 from core.config import RaptorConfig
 from core.git.validate import validate_repo_url
+from core.logging import log_security_event as _log_security_event
+from core.security.log_sanitisation import escape_nonprintable
+from core.security.redaction import redact_url_secrets_only
+
+# Backwards-compat re-export — historical callers + tests reference
+# ``core.git.clone._PROXY_HOSTS`` directly. Kept as the static-default
+# tuple (no operator override applied) so existing semantics hold;
+# new call sites should use ``_proxy_hosts_for_git()`` to pick up the
+# operator override config. (See the egress-allowlist commentary
+# further down for why these hosts and no others.)
+from ._proxy_hosts import _DEFAULT_GIT_HOSTS as _PROXY_HOSTS  # noqa: F401
+from ._proxy_hosts import proxy_hosts_for_git as _proxy_hosts_for_git
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # Git allows SHA abbreviations of 4+ chars; full SHA-1 is 40 hex.
 # We reject anything that doesn't match this shape so a tainted SHA
@@ -81,20 +98,30 @@ logger = logging.getLogger(__name__)
 # Without these, clones of LFS-using repos failed with `unable to
 # access 'https://raw.githubusercontent.com/...'` errors mid-checkout
 # — operator saw "git clone failed" with no signal that the proxy
-# allowlist was the missing piece. Add them so the egress proxy
-# accepts the redirected hosts.
-from ._proxy_hosts import proxy_hosts_for_git as _proxy_hosts_for_git
-# Backwards-compat re-export — historical callers + tests reference
-# ``core.git.clone._PROXY_HOSTS`` directly. Kept as the static-default
-# tuple (no operator override applied) so existing semantics hold;
-# new call sites should use ``_proxy_hosts_for_git()`` to pick up the
-# operator override config.
-from ._proxy_hosts import _DEFAULT_GIT_HOSTS as _PROXY_HOSTS  # noqa: F401
+# allowlist was the missing piece. The hosts live in ``._proxy_hosts``
+# (re-exported at the top of this module as ``_PROXY_HOSTS``) so the
+# egress proxy accepts the redirected hosts.
 
 
-def get_safe_git_env() -> Dict[str, str]:
+def get_safe_git_env(*, preserve_proxy: bool = False) -> dict[str, str]:
     """Sanitised env for git subprocess. Same shape as scanner.py used
-    pre-centralisation; promoted here so all callers share it."""
+    pre-centralisation; promoted here so all callers share it.
+
+    ``preserve_proxy=True`` keeps the operator's proxy vars
+    (HTTP_PROXY / HTTPS_PROXY / NO_PROXY) in the returned env — same
+    opt-in contract as ``RaptorConfig.get_safe_env``. Use ONLY for git
+    invocations that dial a remote OUTSIDE the sandbox egress proxy
+    (the dataflow walkers' targeted fetches): git honours proxy env,
+    and on mandatory-egress-proxy hosts a fetch has no route without
+    it. Everything else about the sanitisation (allowlist +
+    dangerous-var strip + the GIT_ENV_VARS prompt/askpass pins) is
+    identical. The sandbox-routed entry points in this module don't
+    need it — their egress goes through the in-process proxy.
+    """
+    if preserve_proxy:
+        env = RaptorConfig.get_safe_env(preserve_proxy=True)
+        env.update(RaptorConfig.GIT_ENV_VARS)
+        return env
     return RaptorConfig.get_git_env()
 
 
@@ -122,6 +149,58 @@ def get_safe_git_env() -> Dict[str, str]:
 #   - core.sshCommand=ssh: prevents per-repo SSH command override.
 #   - protocol.file.allow=user: refuses file:// URLs as remotes.
 #   - protocol.ext.allow=never: refuses ext:: protocol shells.
+#   - core.hooksPath=/dev/null: per-repo hooks directory pointer
+#     (git ≥2.9). Hostile .git/config setting
+#     ``core.hooksPath=.attacker-hooks`` fires arbitrary scripts on
+#     every git op against the clone; pointing it at /dev/null
+#     bypasses hook execution entirely.
+#   - credential.helper=: per-repo credential helper RCE
+#     (CVE-2017-1000117 family).
+#   - core.gitProxy=: per-repo proxy command RCE.
+#   - gpg.program=true (+ x509/ssh variants): `git log --format=%G?`
+#     and friends invoke the configured signature verifier once per
+#     signed commit walked, and the per-repo config can point it at
+#     any program. Pinned to `true` (no-op) so ordinary target-repo
+#     git ops never execute a repo-chosen verifier; the few callers
+#     that deliberately verify signatures re-enable it through the
+#     system binaries via `signature_probe_overrides()` below.
+#   - diff.external=: per-repo external diff command. git treats the
+#     empty value as a command to exec, so a `git diff` through these
+#     overrides FAILS LOUDLY unless the caller passes `--no-ext-diff`
+#     — deliberate: a diff invocation that forgot to disable external
+#     drivers fails closed instead of silently honouring a repo-named
+#     program. Per-driver `diff.<name>.command` entries share the
+#     arbitrary-name problem filters have (next paragraph); the
+#     explicit `--no-ext-diff` covers both.
+#
+# KNOWN LIMIT — clean/smudge filter drivers (`filter.<name>.clean` et
+# al.) cannot be blanket-neutralised here: the driver names are
+# repo-chosen, so there is no finite `-c` list that covers them. Any
+# git operation that (re)hashes worktree content — `git status`'s
+# index refresh, `git add`, checkout, and ALSO the racily-clean
+# re-verification inside worktree-side plumbing (`diff-index HEAD`,
+# `diff-files`, `ls-files -m`; the hostile repo ships its own index,
+# so every entry can be crafted racy) — runs them. Callers probing a
+# target repo must therefore stick to commands that never open
+# worktree files: `rev-parse`, `rev-list`, `log`, `ls-tree`,
+# `diff-index --cached` (index-vs-tree only), `ls-files` index dumps,
+# and the `ls-files --others` directory walk. For working-tree
+# dirtiness use core.git.dirty.probe_worktree_dirt — it compares
+# index stat data against os.lstat in Python instead of letting git
+# do the worktree side.
+#
+# KNOWN LIMIT — the same repo-chosen-key-name problem covers the
+# TRANSPORT class: `url.<base>.insteadOf` (rewrites any fetch URL),
+# `http.<url>.*` (URL-scoped proxy / sslVerify / sslCAInfo /
+# extraHeader — URL specificity beats a `-c http.<key>` pin), and
+# `credential.<url>.helper`. `http.proxy` is additionally
+# value-unpinnable: an empty value tells curl to DISABLE proxying,
+# which would sever the sandbox's env-based egress proxy. Network
+# operations therefore never trust a pre-existing repo's local
+# config — fetch_commit audits it against the keys it writes itself
+# (see ``_foreign_local_config_keys``) and refuses to fetch over
+# anything else; clone_repository and ls_remote have no pre-existing
+# local config in scope.
 #
 # Use `safe_git_command(*args)` below instead of building bare
 # `["git", ...]` lists when operating on a target repo.
@@ -131,8 +210,77 @@ _SAFE_GIT_OVERRIDES = (
     "-c", "core.pager=cat",
     "-c", "core.askPass=true",
     "-c", "core.sshCommand=ssh",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "credential.helper=",
+    "-c", "core.gitProxy=",
     "-c", "protocol.file.allow=user",
     "-c", "protocol.ext.allow=never",
+    "-c", "gpg.program=true",
+    "-c", "gpg.x509.program=true",
+    "-c", "gpg.ssh.program=true",
+    "-c", "diff.external=",
+    # Replace refs substitute arbitrary pre-planted objects behind a
+    # real OID at the object-read layer: with ``refs/replace/<sha>``
+    # present, ``git show``/``log``/``diff`` return the replacement
+    # content while ref resolution (and a fetched SHA's verification)
+    # still reports the requested OID. Git honours them by DEFAULT, so
+    # a hostile pre-existing ``.git`` can lie to every reader without
+    # touching config. Pinned off for every target-repo operation.
+    # (``info/grafts`` forges history similarly but has NO config key —
+    # fetch_commit refuses pre-existing repos that carry either; see
+    # ``_hostile_history_rewrite_reason``.)
+    "-c", "core.useReplaceRefs=false",
+)
+
+
+# STRICT variant for READ-ONLY operations on target repos (log,
+# rev-parse, rev-list, diff-index --cached, ls-files, ...). Read-only
+# ops never need a remote, so every transport can be refused wholesale:
+#
+#   - protocol.allow=never: one config kills file://, ext::, ssh://,
+#     git://, http(s):// in a single stroke. Stronger than the
+#     per-protocol pair in _SAFE_GIT_OVERRIDES — but note the
+#     precedence trap: git resolves `protocol.<name>.allow` BEFORE the
+#     `protocol.allow` catch-all, so the base tuple's
+#     `protocol.file.allow=user` would still permit the file protocol.
+#     The strict tuple therefore re-pins protocol.file.allow=never
+#     explicitly (protocol.ext.allow is already `never` in the base).
+#   - core.sshCommand=false: belt-and-braces on top of
+#     protocol.allow=never — even if a transport were somehow
+#     engaged, the SSH command is the no-op `false`, never a
+#     repo- or env-chosen binary. (The base tuple pins `ssh` because
+#     clone/fetch legitimately use SSH-capable transports.)
+#
+# These land AFTER _SAFE_GIT_OVERRIDES in the argv; git honours the
+# LAST `-c` occurrence for a key, so the strict pins win.
+#
+# Do NOT use the strict variant for the NETWORK argv in
+# clone_repository / fetch_commit / ls_remote — those genuinely need
+# the https transport; protocol.allow=never would break every one of
+# them. Their network argv use safe_git_command (per-protocol pins)
+# plus the sandbox egress proxy as the network control; fetch_commit's
+# LOCAL steps (init, remote add/set-url) never touch a transport and
+# do use the strict variant.
+#
+# The clean/smudge KNOWN LIMIT above applies unchanged to the strict
+# variant: filter drivers have repo-chosen names, so no finite `-c`
+# list neutralises them. protocol.allow=never does NOT protect
+# worktree-rehashing operations — strict callers must still stick to
+# commands that never open worktree files (`rev-parse`, `rev-list`,
+# `log`, `ls-tree`, `diff-index --cached`, `ls-files` index dumps /
+# `--others` walks; dirtiness goes through core.git.dirty).
+_STRICT_READONLY_EXTRA_OVERRIDES = (
+    "-c", "protocol.allow=never",
+    "-c", "protocol.file.allow=never",
+    "-c", "core.sshCommand=false",
+)
+
+# Full strict tuple — single source of truth for consumers that build
+# their own argv (core.audit.git_oracle) and for tests that pin the
+# hardening posture without duplicating literals.
+_SAFE_GIT_READONLY_OVERRIDES = (
+    *_SAFE_GIT_OVERRIDES,
+    *_STRICT_READONLY_EXTRA_OVERRIDES,
 )
 
 
@@ -159,6 +307,74 @@ def safe_git_command(*args: str) -> list:
     return ["git", *_SAFE_GIT_OVERRIDES, *args]
 
 
+def safe_git_readonly_command(*args: str) -> list:
+    """Return a git argv list with the STRICT read-only safety overrides.
+
+    Use for git commands that READ a target repository (cloned from an
+    untrusted source) and never need a remote: ``log``, ``rev-parse``,
+    ``rev-list``, ``diff-index --cached``, ``ls-files``, local
+    ``checkout`` / ``init`` / ``remote add`` steps, etc. On top of the
+    :func:`safe_git_command` posture this refuses every transport
+    (``protocol.allow=never``, with the per-protocol ``file`` pin
+    re-closed — see :data:`_STRICT_READONLY_EXTRA_OVERRIDES`) and pins
+    ``core.sshCommand=false``.
+
+    Do NOT use for network operations (the clone / fetch / ls-remote
+    argv inside :func:`clone_repository` / :func:`fetch_commit` /
+    :func:`ls_remote`) — those need the https transport and would fail
+    outright under ``protocol.allow=never``. They use
+    :func:`safe_git_command`; their network control is the sandbox
+    egress proxy, not this tuple.
+
+    ``--no-pager`` is included as belt-and-braces with the
+    ``core.pager=cat`` pin (it disables paging even for subcommands
+    that consult a different pager config key).
+
+    KNOWN LIMIT (same as :data:`_SAFE_GIT_OVERRIDES`): clean/smudge
+    filter drivers cannot be blanket-neutralised — stick to commands
+    that never open worktree files (racily-clean re-verification makes
+    even ``diff-index HEAD`` / ``ls-files -m`` re-hash content;
+    dirtiness goes through ``core.git.dirty``).
+
+    Example::
+
+        subprocess.run(
+            safe_git_readonly_command("-C", str(repo), "rev-parse", "HEAD"),
+            env=get_safe_git_env(), ...
+        )
+    """
+    return ["git", "--no-pager", *_SAFE_GIT_READONLY_OVERRIDES, *args]
+
+
+def signature_probe_overrides() -> list:
+    """Extra ``-c`` pairs for the few call sites that deliberately verify
+    commit signatures (``git log`` with ``%G?`` formats).
+
+    ``_SAFE_GIT_OVERRIDES`` pins every ``gpg.*.program`` to ``true`` so an
+    ordinary target-repo git op never executes a repo-configured verifier.
+    These pairs re-enable verification through the SYSTEM binaries
+    (resolved on PATH at call time) — later ``-c`` occurrences win, so
+    appending them after the safe overrides restores real verification
+    without ever honouring a program named by the target's own config::
+
+        cmd = safe_git_command(*signature_probe_overrides(), "log", ...)
+
+    A verifier that isn't installed keeps its neutral pin; the caller then
+    sees unverifiable signature statuses rather than an error, which is
+    the honest degradation (signature status "unknown", never fabricated).
+    """
+    pairs: list = []
+    for key, prog in (
+        ("gpg.program", "gpg"),
+        ("gpg.x509.program", "gpgsm"),
+        ("gpg.ssh.program", "ssh-keygen"),
+    ):
+        path = shutil.which(prog)
+        if path:
+            pairs += ["-c", f"{key}={path}"]
+    return pairs
+
+
 def _validate_writable_path(p: Path, *, role: str) -> None:
     """Refuse caller-supplied paths that would unsafely widen the
     sandbox's writable scope.
@@ -176,14 +392,20 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
         state — refuse and require the caller to be explicit);
       - filesystem root (``/``);
       - direct children of root (``/foo``, ``/etc``, …) where parent
-        is still ``/``.
+        is still ``/``;
+      - paths under system pseudo-fs prefixes (``/dev/``, ``/proc/``,
+        ``/sys/``, ``/run/``) and persistent system-state prefixes
+        (``/etc/``, ``/boot/``, ``/usr/``, ``/var/`` — excepting
+        children of ``/var/tmp/``) — see the denylist commentary
+        below.
     """
     if not p.is_absolute():
-        raise ValueError(
+        msg = (
             f"{role} must be an absolute path; got {str(p)!r}. Relative "
             f"paths are unsafe here — the sandbox writable scope "
             f"({role}.parent) would be cwd-dependent."
         )
+        raise ValueError(msg)
     # Pre-fix the validator only refused root and direct-children-of-
     # root. It silently accepted paths under sensitive system mounts:
     #
@@ -203,19 +425,60 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
     #                        sandbox writes here can collide with
     #                        systemd / docker / similar.
     #
+    # The same reasoning covers persistent SYSTEM STATE — the sandbox
+    # writable scope is ``p.parent``, so accepting a target under
+    # these hands a compromised git server write access to host
+    # configuration with the rest of the isolation engaged:
+    #
+    #   /etc/...           — target=/etc/clone makes /etc writable
+    #                        (cron.d, ld.so.conf.d, sudoers.d).
+    #   /boot/...          — kernels / bootloader config.
+    #   /usr/...           — system binaries and libraries.
+    #   /var/...           — spool/cron, log, lib service state —
+    #                        EXCEPT /var/tmp/<child>, the documented
+    #                        operator scratch location (a target
+    #                        directly AT /var/tmp still refuses:
+    #                        its parent — the writable scope — is
+    #                        /var itself).
+    #   /opt/...           — add-on package trees (root-owned per
+    #                        FHS); a workspace under /opt is
+    #                        conceivable but the documented scratch
+    #                        locations cover the legitimate cases, so
+    #                        the system-state reading wins.
+    #   /srv/...           — served content (web roots, ftp trees).
+    #   /root/...          — the superuser home: dotfiles, keys,
+    #                        cron-adjacent state.
+    #
     # Reject these prefixes outright. Operator-legitimate sandbox
     # work belongs under /tmp, /var/tmp, $HOME, or a dedicated
-    # workspace — not in system pseudo-fs locations.
-    _str = str(p)
-    _DENY_PREFIXES = ("/dev/", "/proc/", "/sys/", "/run/")
-    for prefix in _DENY_PREFIXES:
-        if _str.startswith(prefix) or _str == prefix.rstrip("/"):
-            raise ValueError(
-                f"{role}={str(p)!r} is under a system pseudo-fs prefix "
-                f"({prefix}); refusing to grant the sandbox write "
-                f"access. Use /tmp, /var/tmp, $HOME, or a dedicated "
-                f"workspace path instead."
-            )
+    # workspace — not in system pseudo-fs or system-state locations.
+    #
+    # Checked on BOTH the literal spelling and the resolved path: the
+    # literal-only check was defeated by ``..`` traversal
+    # (``/tmp/x/../../dev/shm/evil``) and by a symlink whose target
+    # lives under a denied prefix — the resolved form reveals both.
+    # The literal form stays checked too (macOS-symlink parity with
+    # the root checks below: a literal ``/run/...`` spelling is
+    # refused whatever it resolves to).
+    resolved = p.resolve()
+    _DENY_PREFIXES = (
+        "/dev/", "/proc/", "/sys/", "/run/",
+        "/etc/", "/boot/", "/usr/", "/var/",
+        "/opt/", "/srv/", "/root/",
+    )
+    _DENY_EXEMPT_PREFIXES = ("/var/tmp/",)
+    for candidate in (str(p), str(resolved)):
+        if any(candidate.startswith(ex) for ex in _DENY_EXEMPT_PREFIXES):
+            continue
+        for prefix in _DENY_PREFIXES:
+            if candidate.startswith(prefix) or candidate == prefix.rstrip("/"):
+                msg = (
+                    f"{role}={str(p)!r} is under a system pseudo-fs or "
+                    f"system-state prefix ({prefix}); refusing to grant "
+                    f"the sandbox write access. Use /tmp, /var/tmp, "
+                    f"$HOME, or a dedicated workspace path instead."
+                )
+                raise ValueError(msg)
     # Two checks against root, both required:
     #
     # 1. The RESOLVED form catches `/tmp/work -> /` symlink attacks
@@ -233,24 +496,187 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
     #
     # Either form being root → reject. Caught by core/sandbox/tests/
     # — first surfaced when the sandbox suite ran on macOS.
-    resolved = p.resolve()
-    for label, candidate in (("resolved", resolved), ("literal", p)):
-        if candidate.parent == candidate:
-            raise ValueError(
+    for label, candidate in (("resolved", resolved), ("literal", p)):  # type: ignore[assignment]
+        if candidate.parent == candidate:  # type: ignore[attr-defined]
+            msg = (
                 f"{role}={str(p)!r} {label}-form is the filesystem "
                 f"root; refusing to grant the sandbox write access "
                 f"to the entire filesystem"
             )
-        if candidate.parent == Path(candidate.anchor):
-            raise ValueError(
+            raise ValueError(msg)
+        if candidate.parent == Path(candidate.anchor):  # type: ignore[attr-defined]
+            msg = (
                 f"{role}={str(p)!r} {label}-form has filesystem root "
                 f"as its parent. Sandbox writable scope "
                 f"({role}.parent) would be the entire root filesystem."
             )
+            raise ValueError(msg)
+
+
+# fetch_commit OWNS the shape of the repos it fetches into: it creates
+# them via ``git init`` and configures exactly one remote. The local
+# config of a PRE-EXISTING ``repo_dir`` is therefore verifiable against
+# the keys those two steps write — anything else was planted by someone
+# other than us and gets the fetch refused.
+#
+# Why an allowlist and not more ``-c`` pins: an entire CLASS of
+# transport-altering config keys carries a repo-chosen component in the
+# key NAME, so no finite ``-c`` list can neutralise them (same shape as
+# the clean/smudge KNOWN LIMIT above):
+#
+#   - ``url.<base>.insteadOf`` rewrites ANY fetch URL — including to a
+#     different allowlisted host serving attacker content;
+#   - ``http.<url>.*`` scopes every http key (``proxy``, ``sslVerify``,
+#     ``sslCAInfo``, ``extraHeader``, …) by URL, and URL-scoped config
+#     is MORE SPECIFIC than a ``-c http.<key>`` pin, so it wins
+#     regardless of `-c`'s file-precedence;
+#   - ``credential.<url>.helper`` re-opens the credential-helper RCE
+#     behind a URL-scoped key;
+#   - ``remote.<name>.proxy`` / ``.vcs`` / ``.uploadpack`` alter
+#     transport per remote name.
+#
+# ``http.proxy`` itself is value-unpinnable too: git hands the value to
+# curl, and an EMPTY value disables proxying outright — including the
+# env-based egress proxy the sandbox injects — so `-c http.proxy=`
+# would break every sandboxed fetch instead of protecting it.
+#
+# The exec-vector keys (`core.fsmonitor`, hooks, editor, pager, gpg,
+# filter/diff drivers, …) stay pinned or refused via
+# ``_SAFE_GIT_OVERRIDES``; this audit closes the transport-CONFIG
+# class by refusing to run the NETWORK step over a config we didn't
+# write. Config is NOT the whole pre-existing-plant surface: replace
+# refs and grafts substitute planted objects behind a correctly-
+# verified fetch with a clean config, so the audit pairs with
+# ``_hostile_history_rewrite_reason`` (both run before the network
+# step) — neither alone closes the class.
+#
+# Trade-off, both directions: an allowlist FAILS LOUD if a future git
+# version's ``init`` writes a new default key (extend the set — the
+# error names the key); a denylist would instead FAIL OPEN on the next
+# transport key git grows, which is the direction this audit exists to
+# prevent.
+_FETCH_LOCAL_CONFIG_BENIGN = frozenset({
+    # `git init` defaults (platform-dependent members included).
+    "core.repositoryformatversion",
+    "core.filemode",
+    "core.bare",
+    "core.logallrefupdates",
+    "core.ignorecase",
+    "core.precomposeunicode",
+    "core.symlinks",
+})
+
+
+def _proc_error_detail(proc) -> str:
+    """stderr-or-stdout detail for git failure messages, neutralised at
+    the message-builder: git relays server-controlled ``remote:`` banner
+    lines verbatim into stderr, so ESC/C1 control bytes would otherwise
+    ride the RuntimeError into whichever consumer prints it (consumers
+    forward ``str(exc)`` onward). Escaping HERE means every present and
+    future consumer inherits the scrub; newlines are preserved for
+    multi-line git errors and the result is length-capped (a hostile
+    banner can be arbitrarily long)."""
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    detail = stderr or stdout or "unknown error"
+    return escape_nonprintable(detail, preserve_newlines=True)[:2000]
+
+
+def _foreign_local_config_keys(listing_nul: str) -> list:
+    """Keys in a ``git config --local -z --list`` dump that fetch_commit's
+    own init/remote-add steps would never write.
+
+    ``-z`` output is ``key\\n[value]\\0`` per entry — NUL framing means a
+    hostile VALUE containing newlines cannot forge or hide an entry
+    (line-wise parsing of the non-``-z`` form could be steered by a
+    value line that looks like a key). Keys are matched lowercased;
+    git already lowercases section and variable names, and the only
+    case-preserved part (subsection) is never load-bearing here.
+    """
+    foreign = set()
+    for entry in listing_nul.split("\0"):
+        if not entry:
+            continue
+        key = entry.split("\n", 1)[0].strip().lower()  # line-model: git -z config listing; key strip()-normalised
+        if not key or key in _FETCH_LOCAL_CONFIG_BENIGN:
+            continue
+        parts = key.split(".")
+        # remote.origin.url / remote.origin.fetch are fetch_commit's
+        # own ``remote add`` footprint (url is re-pinned via set-url
+        # before every fetch, so a pre-existing value cannot steer the
+        # remote). ORIGIN ONLY: fetch_commit never writes any other
+        # remote, and a planted foreign-remote ``ext::`` URL — inert
+        # for our explicit ``fetch origin <sha>`` — would lie in wait
+        # for any out-of-band ``git fetch --all`` in the same dir.
+        if (parts[0] == "remote" and parts[1:-1] == ["origin"]
+                and parts[-1] in ("url", "fetch")):
+            continue
+        foreign.add(key)
+    return sorted(foreign)
+
+
+def _hostile_history_rewrite_reason(repo_dir: Path, run) -> str | None:
+    """Refusal reason when a pre-existing ``repo_dir`` carries git
+    history-rewrite state fetch_commit never writes, else ``None``.
+
+    Two mechanisms substitute attacker content behind a correctly-
+    verified fetch WITHOUT any config key — so the config audit alone
+    cannot see them:
+
+      - ``refs/replace/<sha>`` (loose or packed): object substitution
+        at the read layer.  ``core.useReplaceRefs=false`` pins our own
+        commands, but the fetched repo outlives this function and any
+        consumer reading it without the pin gets the replacement.
+      - ``info/grafts``: parent-link rewriting (deprecated but still
+        honoured by default; NO config equivalent exists).
+
+    ``run`` is fetch_commit's local sandboxed runner — git plumbing
+    (not raw path checks) so packed replace refs and ``.git``-file
+    worktree pointers are covered.  Fail closed: an audit step that
+    cannot be read refuses like the unreadable-config arm.
+    """
+    refs = run(
+        safe_git_readonly_command(
+            "-C", str(repo_dir), "for-each-ref", "--count=1",
+            "refs/replace/",
+        ),
+    )
+    if refs.returncode != 0:
+        return (
+            "replace-ref audit unreadable — refusing to fetch over an "
+            f"unverifiable repository: {_proc_error_detail(refs)}"
+        )
+    if (refs.stdout or "").strip():
+        return (
+            "pre-existing repo_dir carries refs/replace/* — replace "
+            "refs substitute planted objects behind a correctly-"
+            "verified SHA for every reader"
+        )
+    grafts = run(
+        safe_git_readonly_command(
+            "-C", str(repo_dir), "rev-parse", "--git-path", "info/grafts",
+        ),
+    )
+    if grafts.returncode != 0:
+        return (
+            "grafts audit unreadable — refusing to fetch over an "
+            f"unverifiable repository: {_proc_error_detail(grafts)}"
+        )
+    grafts_path = Path((grafts.stdout or "").strip() or "info/grafts")
+    if not grafts_path.is_absolute():
+        grafts_path = repo_dir / grafts_path
+    if grafts_path.exists():
+        return (
+            "pre-existing repo_dir carries info/grafts — grafts "
+            "rewrite parent links for every reader and have no "
+            "config off-switch"
+        )
+    return None
 
 
 def clone_repository(
-    url: str, target: Path, depth: Optional[int] = 1,
+    url: str, target: Path, depth: int | None = 1,
+    mirror: bool = False,
 ) -> bool:
     """Shallow-clone ``url`` into ``target`` via the sandboxed runner.
 
@@ -260,49 +686,101 @@ def clone_repository(
             this as the only writable path.
         depth: shallow-clone depth (default 1). Pass ``None`` to clone
             full history.
+        mirror: pass ``--mirror`` (all refs, bare repository) — the
+            git-forensics shape: dangling / force-pushed history
+            needs refs a plain clone never fetches. Mutually
+            exclusive with ``depth``.
 
     Raises:
-        ValueError: URL fails the allowlist, or ``target`` fails the
+        ValueError: URL fails the allowlist, ``target`` fails the
             writable-path check (relative, filesystem root, or
-            direct child of root — see ``_validate_writable_path``).
+            direct child of root — see ``_validate_writable_path``),
+            or ``mirror`` is combined with a ``depth``.
         RuntimeError: ``git clone`` exited non-zero.
     """
+    if mirror and depth is not None:
+        msg = "mirror clones are full history; pass depth=None"
+        raise ValueError(msg)
     if not validate_repo_url(url):
-        raise ValueError(f"Invalid or untrusted repository URL: {url}")
+        # Security-event stream (restored from the pre-restructure
+        # core/git.py emitter, commit c1af3314): record the rejection
+        # in the audit trail. Observability only — the ValueError
+        # below is the behaviour; the emitter never raises. URL is
+        # redacted first: rejected URLs are exactly the ones that may
+        # carry userinfo credentials.
+        _log_security_event(
+            "invalid_repo_url",
+            "Rejected potentially unsafe repository URL: "
+            f"{redact_url_secrets_only(url)}",
+            operation="clone_repository",
+        )
+        msg = f"Invalid or untrusted repository URL: {url}"
+        raise ValueError(msg)
     _validate_writable_path(target, role="target")
 
-    cmd = ["git", "clone"]
-    if depth is not None:
+    # Per-invocation config pins (see _SAFE_GIT_OVERRIDES): the clone
+    # transport is https, which every pin is compatible with, and the
+    # pins also govern the post-transfer checkout of the untrusted tree.
+    cmd = safe_git_command("clone")
+    if mirror:
+        cmd.append("--mirror")
+    elif depth is not None:
         cmd.extend(["--depth", str(depth), "--no-tags"])
-    cmd.extend([url, str(target)])
+    # "--" before the URL, same as the ls-remote path: unexploitable
+    # today (validate_repo_url fullmatch-allowlists the shape) but the
+    # option/positional boundary must not silently re-open on any
+    # future allowlist widening.
+    cmd.extend(["--", url, str(target)])
 
-    logger.info("git clone: %s -> %s", url, target)
+    # Redact any embedded credentials in the URL before logging.
+    # ``validate_repo_url`` rejects userinfo upstream, but a future
+    # caller path (or an upstream validator bypass) shouldn't leak
+    # ``https://user:token@host/...`` into operator logs. Belt-and-
+    # braces — symmetric posture with the rest of the codebase.
+    logger.info("git clone: %s -> %s", redact_url_secrets_only(url), target)
     try:
-        from core.sandbox import run_untrusted
+        from core.sandbox import run_untrusted_networked
     except ImportError:
-        raise RuntimeError(
+        msg = (
             "core.sandbox unavailable - git clone refuses to run "
             "without sandbox isolation"
         )
+        raise RuntimeError(msg) from None
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    proc = run_untrusted(
+    proc = run_untrusted_networked(
         cmd,
         target=str(target.parent),
         output=str(target.parent),
         env=get_safe_git_env(),
-        use_egress_proxy=True,
         proxy_hosts=_proxy_hosts_for_git(),
+        fake_home=True,
         timeout=RaptorConfig.GIT_CLONE_TIMEOUT,
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        raise RuntimeError(
-            f"git clone failed: {stderr or stdout or 'unknown error'}"
+        msg = f"git clone failed: {_proc_error_detail(proc)}"
+        raise RuntimeError(msg)
+    # Host-side materialisation check. git's exit status reports what
+    # happened INSIDE the sandbox — under the mount-ns backend the
+    # child gets a private tmpfs /tmp, so if the destination isn't
+    # covered by the bind tree (e.g. ``target.parent`` is /tmp itself,
+    # which the per-ns tmpfs shadows and the bind step skips), git
+    # writes the clone into the tmpfs, exits 0, and the tree vanishes
+    # with the sandbox. Returning True there hands callers a phantom
+    # clone that only fails at their next (host-side) access, far from
+    # the cause. Verify on the HOST that the tree actually landed.
+    if not target.is_dir():
+        msg = (
+            f"git clone reported success but {target} does not exist "
+            f"on the host filesystem — the clone likely landed in the "
+            f"sandbox's private /tmp tmpfs because the destination's "
+            f"parent directory is not part of the sandbox bind tree. "
+            f"Use a destination at least one level below /tmp (so its "
+            f"parent is bind-mountable) or another writable workspace."
         )
+        raise RuntimeError(msg)
     return True
 
 
@@ -333,7 +811,13 @@ def fetch_commit(
         depth: shallow-fetch depth (default 5). The caller should
             cascade — start small, retry deeper on miss.
 
-    Returns ``True`` on success.
+    Returns ``True`` on success — the fetch completed AND
+    ``FETCH_HEAD^{commit}`` resolved to an OID matching the request
+    (exact equality for a full 40-hex SHA, prefix match for an
+    abbreviation). Returns ``False`` when the transport succeeded but
+    the fetched object does not match — an abbreviated SHA is
+    remote-resolved and could be ambiguous or attacker-chosen, so a
+    zero exit alone is not proof the wanted commit arrived.
 
     Raises:
         ValueError: URL fails the allowlist, ``repo_dir`` fails the
@@ -344,22 +828,31 @@ def fetch_commit(
             ``git fetch`` exited non-zero.
     """
     if not validate_repo_url(url):
-        raise ValueError(f"Invalid or untrusted repository URL: {url}")
+        # Same restored emitter as clone_repository — see the comment
+        # there. Redact before logging; never raises.
+        _log_security_event(
+            "invalid_repo_url",
+            "Rejected potentially unsafe repository URL: "
+            f"{redact_url_secrets_only(url)}",
+            operation="fetch_commit",
+        )
+        msg = f"Invalid or untrusted repository URL: {url}"
+        raise ValueError(msg)
     _validate_writable_path(repo_dir, role="repo_dir")
     if not _SHA_RE.fullmatch(sha):
         # Defend against ``sha = "--upload-pack=cmd"`` style flag
         # injection at the ``git fetch <repo> <refspec>`` position.
-        raise ValueError(
-            f"Invalid commit SHA shape (expected 4-40 hex chars): {sha!r}"
-        )
+        msg = f"Invalid commit SHA shape (expected 4-40 hex chars): {sha!r}"
+        raise ValueError(msg)
 
     try:
-        from core.sandbox import run_untrusted
+        from core.sandbox import run_untrusted, run_untrusted_networked
     except ImportError:
-        raise RuntimeError(
+        msg = (
             "core.sandbox unavailable - git fetch refuses to run "
             "without sandbox isolation"
         )
+        raise RuntimeError(msg) from None
 
     repo_dir.mkdir(parents=True, exist_ok=True)
     env = get_safe_git_env()
@@ -367,47 +860,88 @@ def fetch_commit(
     timeout = RaptorConfig.GIT_CLONE_TIMEOUT
 
     # ``output`` is the sandbox's writable allowlist. Use ``repo_dir.parent``
-    # to match ``clone_repository``: with ``fake_home=True`` (the
-    # ``run_untrusted`` default), the sandbox materialises ``{output}/.home/``
-    # for the child's HOME. Passing ``repo_dir`` directly would put that
-    # ``.home/`` *inside* the repo, polluting the caller's working tree.
-    # The parent directory is one level wider but matches clone semantics
-    # exactly — ``.home/`` ends up sibling to ``repo_dir``.
+    # to match ``clone_repository``: ``fake_home=True`` materialises
+    # ``{output}/.home/`` for the child's HOME. Passing ``repo_dir``
+    # directly would put ``.home/`` *inside* the repo, polluting the
+    # caller's working tree.
     sandbox_target = str(repo_dir.parent)
 
     def _run(cmd: list, *, network: bool):
-        # ``git init`` and ``git remote`` are local-only; the sandbox
-        # still runs them through ``run_untrusted`` for env hygiene.
-        # The egress proxy is only engaged for the fetch step — local
-        # ops have no need for it. NB: ``use_egress_proxy=True`` MUST be
-        # paired with ``proxy_hosts`` for the proxy to start; passing
-        # ``proxy_hosts`` alone is a no-op (the sandbox keeps
-        # ``block_network=True`` and the child has no network at all).
-        kwargs = dict(
-            target=sandbox_target,
-            output=sandbox_target,
-            env=env,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-        )
+        kwargs = {
+            "target": sandbox_target,
+            "output": sandbox_target,
+            "env": env,
+            "timeout": timeout,
+            "capture_output": True,
+            "text": True,
+        }
         if network:
-            kwargs["use_egress_proxy"] = True
-            kwargs["proxy_hosts"] = proxy_hosts
-        return run_untrusted(cmd, **kwargs)
+            return run_untrusted_networked(
+                cmd, proxy_hosts=proxy_hosts, fake_home=True, **kwargs)  # type: ignore[arg-type]
+        return run_untrusted(cmd, **kwargs)  # type: ignore[arg-type]
 
     is_repo = (repo_dir / ".git").exists()
+    if is_repo:
+        # PRE-EXISTING repo: its .git/config is untrusted, and the
+        # network step below honours transport-altering keys that no
+        # finite ``-c`` pin list can neutralise (URL-scoped
+        # ``url.<base>.insteadOf`` / ``http.<url>.*`` /
+        # ``credential.<url>.*``, per-remote proxy/vcs — see the
+        # closure commentary on ``_foreign_local_config_keys``).
+        # Refuse to fetch over a local config we didn't write — and
+        # over history-rewrite state (replace refs / grafts) that
+        # substitutes planted objects behind a correctly-verified
+        # fetch without touching config (see
+        # ``_hostile_history_rewrite_reason``).
+        listing = _run(
+            safe_git_readonly_command(
+                "-C", str(repo_dir), "config", "--local", "-z", "--list",
+            ),
+            network=False,
+        )
+        if listing.returncode != 0:
+            msg = (
+                "pre-existing repo_dir local config unreadable — "
+                "refusing to fetch over an unverifiable configuration: "
+                f"{_proc_error_detail(listing)}"
+            )
+            raise RuntimeError(msg)
+        foreign = _foreign_local_config_keys(listing.stdout or "")
+        if foreign:
+            shown = ", ".join(
+                escape_nonprintable(k)[:80] for k in foreign[:8]
+            )
+            msg = (
+                f"pre-existing repo_dir carries local git config keys "
+                f"fetch_commit never writes ({shown}) — a planted "
+                f"config can redirect or proxy the fetch "
+                f"(url.*.insteadOf, http.*), so the network step "
+                f"refuses to run over it. Re-create {str(repo_dir)!r} "
+                f"fresh (empty dir) to fetch."
+            )
+            raise RuntimeError(msg)
+        rewrite_reason = _hostile_history_rewrite_reason(
+            repo_dir, lambda cmd: _run(cmd, network=False),
+        )
+        if rewrite_reason is not None:
+            msg = (
+                f"{rewrite_reason} — the network step refuses to run "
+                f"over it. Re-create {str(repo_dir)!r} fresh (empty "
+                f"dir) to fetch."
+            )
+            raise RuntimeError(msg)
     if not is_repo:
         logger.info("git init: %s", repo_dir)
         proc = _run(
-            ["git", "-C", str(repo_dir), "init", "--quiet"],
+            # Local step, no transport — strict read-only pins apply
+            # (repo_dir may be a pre-existing clone whose .git/config
+            # is untrusted).
+            safe_git_readonly_command("-C", str(repo_dir), "init", "--quiet"),
             network=False,
         )
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"git init failed: "
-                f"{(proc.stderr or proc.stdout or 'unknown error').strip()}"
-            )
+            msg = f"git init failed: {_proc_error_detail(proc)}"
+            raise RuntimeError(msg)
 
     # ``remote add`` is idempotent-ish — if origin already exists we
     # rewrite the URL via ``set-url`` so the caller can reuse a
@@ -415,37 +949,87 @@ def fetch_commit(
     # we surface BOTH errors so the operator sees the real cause
     # (e.g. disk full) rather than only the set-url echo.
     add_proc = _run(
-        ["git", "-C", str(repo_dir), "remote", "add", "origin", url],
+        # Local step, no transport — strict read-only pins apply.
+        safe_git_readonly_command(
+            "-C", str(repo_dir), "remote", "add", "origin", url,
+        ),
         network=False,
     )
     if add_proc.returncode != 0:
         set_proc = _run(
-            ["git", "-C", str(repo_dir), "remote", "set-url", "origin", url],
+            safe_git_readonly_command(
+                "-C", str(repo_dir), "remote", "set-url", "origin", url,
+            ),
             network=False,
         )
         if set_proc.returncode != 0:
-            add_msg = (add_proc.stderr or add_proc.stdout or "").strip()
-            set_msg = (set_proc.stderr or set_proc.stdout or "").strip()
-            raise RuntimeError(
+            msg = (
                 f"git remote add/set-url failed: "
-                f"add={add_msg or 'unknown error'}; "
-                f"set-url={set_msg or 'unknown error'}"
+                f"add={_proc_error_detail(add_proc)}; "
+                f"set-url={_proc_error_detail(set_proc)}"
             )
+            raise RuntimeError(msg)
 
-    logger.info("git fetch (depth=%d): %s @ %s", depth, url, sha)
+    logger.info(
+        "git fetch (depth=%d): %s @ %s",
+        depth, redact_url_secrets_only(url), sha,
+    )
     proc = _run(
-        [
-            "git", "-C", str(repo_dir), "fetch",
+        # Network step — base pins only (the strict variant's
+        # protocol.allow=never would refuse the https transport).
+        safe_git_command(
+            "-C", str(repo_dir), "fetch",
             "--depth", str(depth), "--no-tags",
             "origin", sha,
-        ],
+        ),
         network=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git fetch failed: "
-            f"{(proc.stderr or proc.stdout or 'unknown error').strip()}"
+        msg = f"git fetch failed: {_proc_error_detail(proc)}"
+        raise RuntimeError(msg)
+
+    # Verify WHAT the remote actually sent. A zero exit only proves
+    # the transport succeeded — the remote controls the object behind
+    # any abbreviated name, and even for a full SHA a hostile or
+    # confused remote could satisfy the want differently. Resolve
+    # FETCH_HEAD to a commit OID (local plumbing — strict read-only
+    # pins) and require it to match the request: exact equality for a
+    # full 40-hex SHA, prefix match for an abbreviation. Anything
+    # else is a failed fetch, not a success.
+    verify = _run(
+        safe_git_readonly_command(
+            "-C", str(repo_dir), "rev-parse", "--verify",
+            "FETCH_HEAD^{commit}",
+        ),
+        network=False,
+    )
+    if verify.returncode != 0:
+        logger.warning(
+            "git fetch reported success but FETCH_HEAD does not "
+            "resolve to a commit: %s",
+            _proc_error_detail(verify),
         )
+        return False
+    resolved = (verify.stdout or "").strip().lower()
+    if not _LS_REMOTE_SHA_RE.fullmatch(resolved):
+        logger.warning(
+            "git fetch verification: unexpected rev-parse output %r",
+            resolved[:80],
+        )
+        return False
+    requested = sha.lower()
+    matches = (
+        resolved == requested
+        if len(requested) == 40
+        else resolved.startswith(requested)
+    )
+    if not matches:
+        logger.warning(
+            "git fetch verification: requested %s but FETCH_HEAD "
+            "resolved to %s — refusing the fetched object",
+            sha, resolved,
+        )
+        return False
     return True
 
 
@@ -454,11 +1038,13 @@ def ls_remote(
     *,
     proxy_hosts: Iterable[str],
     timeout: int = 20,
-) -> List[Tuple[str, str]]:
+    patterns: Iterable[str] | None = None,
+    bearer_token: str | None = None,
+) -> list[tuple[str, str]]:
     """Run ``git ls-remote --heads --tags`` against ``url``.
 
     Read-only operation that returns the refs the remote advertises.
-    Sandbox-routed via ``run_untrusted`` with the egress proxy pinned
+    Sandbox-routed via ``run_untrusted_networked`` with the egress proxy pinned
     to ``proxy_hosts``. Caller supplies the allowlist because consumers
     of this helper cover wider forge sets than the github/gitlab pair
     ``clone_repository`` accepts (cve_diff's agent uses it to probe
@@ -488,6 +1074,20 @@ def ls_remote(
         timeout: per-call wall-clock cap (seconds; default 20).
             Tighter than ``RaptorConfig.GIT_CLONE_TIMEOUT`` because
             ls-remote returns a ref-list, not whole repos.
+        patterns: optional ref patterns appended after an ``--``
+            end-of-options separator, so the remote only advertises
+            matching refs (``git ls-remote <url> <pattern>...``).
+            Each pattern must be non-empty and must not start with
+            ``-`` (would otherwise be parseable as a git option —
+            same argument-position defence as ``fetch_commit``'s
+            SHA shape check).
+        bearer_token: optional bearer credential for the forge
+            (private repos / rate-limit relief). Injected via the
+            ``GIT_CONFIG_COUNT``/``GIT_CONFIG_KEY_0``/
+            ``GIT_CONFIG_VALUE_0`` environment mechanism as an
+            ``http.extraheader`` — NEVER placed on argv (argv is
+            world-readable via /proc/<pid>/cmdline) and never
+            logged.
 
     Returns:
         ``[(sha, ref), ...]`` — e.g.
@@ -512,7 +1112,17 @@ def ls_remote(
     """
     proxy_host_list = list(proxy_hosts)
     if not proxy_host_list:
-        raise ValueError("ls_remote requires non-empty proxy_hosts")
+        msg = "ls_remote requires non-empty proxy_hosts"
+        raise ValueError(msg)
+
+    pattern_list = list(patterns) if patterns is not None else []
+    for pat in pattern_list:
+        if not pat or pat.startswith("-"):
+            msg = (
+                f"ls_remote: invalid ref pattern {pat!r} (empty or "
+                f"leading dash — could be parsed as a git option)"
+            )
+            raise ValueError(msg)
 
     # ``urlparse`` is more honest than a regex for the "is this a
     # safe URL shape" check — handles userinfo, fragments, ports
@@ -522,22 +1132,22 @@ def ls_remote(
     try:
         parsed = urlparse(url)
     except ValueError as e:
-        raise ValueError(f"ls_remote: malformed URL: {e}") from None
+        msg = f"ls_remote: malformed URL: {e}"
+        raise ValueError(msg) from None
 
     # ``https`` only — the in-process egress proxy is HTTPS-CONNECT
     # exclusively, so plain ``http://`` would pass this check but
     # fail at the proxy with a confusing transport error. Refuse
     # upfront for a clearer contract.
     if parsed.scheme != "https":
-        raise ValueError(
-            f"ls_remote requires https URL; got scheme={parsed.scheme!r}"
-        )
+        msg = f"ls_remote requires https URL; got scheme={parsed.scheme!r}"
+        raise ValueError(msg)
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError(
-            "ls_remote refuses URLs with userinfo (credentials in URL)"
-        )
+        msg = "ls_remote refuses URLs with userinfo (credentials in URL)"
+        raise ValueError(msg)
     if not parsed.hostname:
-        raise ValueError(f"ls_remote: URL has no hostname: {url!r}")
+        msg = f"ls_remote: URL has no hostname: {url!r}"
+        raise ValueError(msg)
 
     # IDNA round-trip on the hostname for canonicalisation. Pre-fix
     # `parsed.hostname.lower()` worked for ASCII hosts but missed
@@ -564,24 +1174,25 @@ def ls_remote(
     # before the subprocess fires.
     allowed_lower = {h.lower() for h in proxy_host_list}
     if host not in allowed_lower:
-        raise ValueError(
-            f"ls_remote: URL host {host!r} not in proxy_hosts allowlist"
-        )
+        msg = f"ls_remote: URL host {host!r} not in proxy_hosts allowlist"
+        raise ValueError(msg)
 
     try:
-        from core.sandbox import run_untrusted
+        from core.sandbox import run_untrusted_networked
     except ImportError:
-        raise RuntimeError(
+        msg = (
             "core.sandbox unavailable - git ls-remote refuses to run "
             "without sandbox isolation"
         )
+        raise RuntimeError(msg) from None
 
     # ``ls-remote`` doesn't write to the host filesystem, but
-    # ``run_untrusted`` requires a non-empty ``output`` so Landlock
-    # engages and ``fake_home`` has somewhere to materialise.
+    # ``run_untrusted_networked`` requires a non-empty ``output`` so
+    # Landlock engages and ``fake_home`` has somewhere to materialise.
     # An ephemeral temp dir gives the sandbox a writable scratch
     # area that's discarded as soon as we leave the with-block.
-    with tempfile.TemporaryDirectory(prefix="raptor-ls-remote-") as td:
+    with scratch_dir("raptor-ls-remote-") as scratch_path:
+        td = str(scratch_path)
         # Pre-fix the log line emitted the raw URL. Operators
         # passing tokens via URL userinfo (`https://oauth2:
         # token@github.com/owner/repo.git`) leaked the token to
@@ -600,13 +1211,33 @@ def ls_remote(
         logger.info("git ls-remote: %s (allowlist=%s)",
                      redact_secrets(url),
                      ",".join(sorted(allowed_lower)))
-        proc = run_untrusted(
-            ["git", "ls-remote", "--heads", "--tags", url],
+        # ``--`` ends option parsing so neither the URL nor any ref
+        # pattern can ever be interpreted as a git option.
+        cmd = safe_git_command(
+            "ls-remote", "--heads", "--tags", "--", url, *pattern_list,
+        )
+        env = get_safe_git_env()
+        if bearer_token:
+            # Credential rides the GIT_CONFIG_* env mechanism (git
+            # ≥2.31), NOT argv: /proc/<pid>/cmdline is readable by
+            # every same-uid process, env is not. Equivalent to
+            # ``-c http.extraheader=...`` in precedence terms except
+            # explicit ``-c`` options would win — safe_git_command
+            # sets no http.extraheader, so this value applies. The
+            # env dict is never logged.
+            env.update({
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraheader",
+                "GIT_CONFIG_VALUE_0":
+                    f"Authorization: bearer {bearer_token}",
+            })
+        proc = run_untrusted_networked(
+            cmd,
             target=td,
             output=td,
-            env=get_safe_git_env(),
-            use_egress_proxy=True,
+            env=env,
             proxy_hosts=proxy_host_list,
+            fake_home=True,
             timeout=timeout,
             capture_output=True,
             text=True,
@@ -621,13 +1252,10 @@ def ls_remote(
         )
 
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        raise RuntimeError(
-            f"git ls-remote failed: {stderr or stdout or 'unknown error'}"
-        )
+        msg = f"git ls-remote failed: {_proc_error_detail(proc)}"
+        raise RuntimeError(msg)
 
-    refs: List[Tuple[str, str]] = []
+    refs: list[tuple[str, str]] = []
     for line in (proc.stdout or "").splitlines():
         # Each line is: ``<40-hex sha>\t<ref>``.
         parts = line.split("\t", 1)
@@ -646,4 +1274,12 @@ def ls_remote(
     return refs
 
 
-__all__ = ["clone_repository", "fetch_commit", "get_safe_git_env", "ls_remote"]
+__all__ = [
+    "clone_repository",
+    "fetch_commit",
+    "get_safe_git_env",
+    "ls_remote",
+    "safe_git_command",
+    "safe_git_readonly_command",
+    "signature_probe_overrides",
+]

@@ -32,18 +32,20 @@ Out-of-scope shapes silently filter out (filter lives in
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
 
-from core.http import HttpClient
-from core.json import JsonCache
+from core.http import HttpClient, HttpError
 from core.oci.client import OciRegistryClient, RegistryError
 from core.oci.image_ref import parse_image_ref
 
-from ._version_filter import highest_stable
+from ._version_filter import highest_stable, highest_stable_with_variant
 from .github_releases import (
     NoStableVersionsFound,
     UpstreamLookupError,
 )
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.json import JsonCache
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +56,11 @@ def latest_tag(
     image_ref: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache] = None,
+    cache: JsonCache | None = None,
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
-    client: Optional[OciRegistryClient] = None,
+    client: OciRegistryClient | None = None,
     per_page: int = 100,
+    variant: str = "",
 ) -> str:
     """Return the highest stable-semver tag for the OCI image.
 
@@ -71,11 +74,18 @@ def latest_tag(
     credential-lookup overrides / token reuse across calls).
     Without one, a fresh client is constructed from ``http``.
 
+    ``variant`` — when non-empty, filter the tag list to
+    ``<semver>-<variant>`` shaped tags and return the highest.
+    Use to bump ``python:3.9-slim`` → ``python:3.12-slim`` (pass
+    ``variant="slim"``) while skipping the bare-semver and
+    other-variant entries in the registry. Pass the empty string
+    (default) for bare-semver-only behaviour.
+
     Raises:
 
     * :class:`NoStableVersionsFound` — no tag in the repo's tag
-      list matches the stable-semver shape (caller should fall
-      back to e.g. GitHub releases or skip the bump).
+      list matches the requested shape (caller should fall back
+      to e.g. GitHub releases or skip the bump).
     * :class:`UpstreamLookupError` — registry returned a non-200
       / shape-regression / network failure.
     """
@@ -83,10 +93,14 @@ def latest_tag(
         image_ref, http=http, cache=cache, ttl_seconds=ttl_seconds,
         client=client, per_page=per_page,
     )
-    winner = highest_stable(tags)
+    if variant:
+        winner = highest_stable_with_variant(tags, variant)
+    else:
+        winner = highest_stable(tags)
     if winner is None:
         raise NoStableVersionsFound(
             f"no stable-semver tags found for {image_ref}"
+            + (f" with variant {variant!r}" if variant else "")
         )
     return winner
 
@@ -95,11 +109,11 @@ def list_all_tags(
     image_ref: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache] = None,
+    cache: JsonCache | None = None,
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
-    client: Optional[OciRegistryClient] = None,
+    client: OciRegistryClient | None = None,
     per_page: int = 100,
-) -> List[str]:
+) -> list[str]:
     """Return the full tag list, unfiltered.
 
     Useful for diagnostic / future-detector use cases (e.g. "list
@@ -121,11 +135,11 @@ def _list_tags_cached(
     image_ref: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache],
+    cache: JsonCache | None,
     ttl_seconds: int,
-    client: Optional[OciRegistryClient],
+    client: OciRegistryClient | None,
     per_page: int,
-) -> List[str]:
+) -> list[str]:
     """Cached wrapper around ``OciRegistryClient.list_tags``.
 
     Cache key includes the parsed registry + repository (not the
@@ -133,8 +147,13 @@ def _list_tags_cached(
     regardless of what tag the caller asked about).
     """
     ref = parse_image_ref(image_ref)
+    from urllib.parse import quote as _quote
+    # Registry and repository each percent-encoded into one segment —
+    # the repository component is target-derived, and the cache layer
+    # requires keys that cannot alias each other.
     cache_key = (
-        f"upstream_latest:oci:{ref.registry}/{ref.repository}"
+        f"upstream_latest:oci:{_quote(ref.registry, safe='')}/"
+        f"{_quote(ref.repository, safe='')}"
         f":n={per_page}"
     )
     if cache is not None and ttl_seconds > 0:
@@ -144,10 +163,9 @@ def _list_tags_cached(
     registry_client = client or OciRegistryClient(http=http)
     try:
         tags = registry_client.list_tags(ref, per_page=per_page)
-    except RegistryError as exc:
-        raise UpstreamLookupError(
-            f"OCI tag list failed for {image_ref}: {exc}"
-        ) from exc
+    except (RegistryError, HttpError) as exc:
+        msg = f"OCI tag list failed for {image_ref}: {exc}"
+        raise UpstreamLookupError(msg) from exc
     if cache is not None and ttl_seconds > 0:
         cache.put(cache_key, tags, ttl_seconds=ttl_seconds)
     return tags

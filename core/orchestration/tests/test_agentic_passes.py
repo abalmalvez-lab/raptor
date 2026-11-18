@@ -6,6 +6,11 @@ routes by argv[0] program name — lifecycle helpers go through
 subprocess.run, claude calls through sandbox_run.
 """
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
+import pytest
 import contextlib
 import json
 import unittest
@@ -20,25 +25,84 @@ from core.orchestration.agentic_passes import (
     run_validate_postpass,
 )
 
-# Assume interactive for all tests except RuleOfTwoTests (which patches
-# is_interactive explicitly). Without this, every test that exercises the
-# full pass path fails in CI/pytest (no TTY).
+from core.testing.module_bindings import patch_module_attribute
+
+
+import shutil
+from types import ModuleType
+from core.testing.module_views import scoped_function_imports
+
+_discovery_imports = ModuleType("dispatch_discovery_imports")
+
+
+@pytest.fixture(autouse=True)
+def _owned_discovery_imports(monkeypatch):
+    from core.llm import cc_adapter
+
+    with scoped_function_imports(cc_adapter, ("resolve_claude_cli",), {"shutil": shutil}) as imports:
+        try:
+            monkeypatch.setitem(globals(), "_discovery_imports", imports)
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+
+@pytest.fixture(autouse=True)
+def _isolate_subprocess_run_patches(monkeypatch):
+    """Keep subprocess run mocks on consumer-owned module bindings."""
+    import core.orchestration.skill_dispatch as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "subprocess", "run", consumer_0.subprocess.run,
+    )
+
+
+# Dispatch here is mocked (run_untrusted_networked patched throughout)
+# — the pass wiring is under test, so the transport kill switch the
+# root conftest sets is cleared for this module.
+pytestmark = pytest.mark.usefixtures("cc_spawn_machinery_enabled")
+
+# proxy_hosts_for_cc_dispatch is provider-aware: on a host whose ambient
+# env selects Bedrock/Vertex/Foundry it returns that cloud's endpoints,
+# not the first-party defaults these tests assert. Pin the provider env
+# to first-party (empty string = unset for the truthiness checks) so the
+# tests are hermetic on any host.
+_FIRST_PARTY_PROVIDER_ENV = {
+    "CLAUDE_CODE_USE_BEDROCK": "",
+    "CLAUDE_CODE_USE_VERTEX": "",
+    "CLAUDE_CODE_USE_FOUNDRY": "",
+}
+
+# Force the Rule-of-Two agentic-pass gate open for all tests except
+# RuleOfTwoTests (which drives the gate's legs explicitly). The gate allows
+# the pass when a human terminal OR an effective sandbox is present; we mock
+# the human-terminal leg True so the full pass path runs under CI/pytest
+# (no controlling terminal, sandbox capability varies).
 _interactive_patch = None
 
 def setUpModule():
     global _interactive_patch
-    _interactive_patch = patch(
-        "core.security.rule_of_two.is_interactive", return_value=True,
-    )
-    _interactive_patch.start()
+    from core.testing.module_scope import module_fixture_setup, start_module_patch
+
+    with module_fixture_setup(globals(), ('_interactive_patch',)) as cleanup:
+        _interactive_patch = patch(
+            "core.security.rule_of_two._session_has_human_terminal",
+            return_value=True,
+        )
+        start_module_patch(cleanup, _interactive_patch)
 
 def tearDownModule():
-    _interactive_patch.stop()
+    globals()["_module_fixture_scope"].close()
 
 
 @contextlib.contextmanager
 def _patch_passes(dispatcher):
-    """Patch both subprocess.run and sandbox_run in agentic_passes.
+    """Patch both subprocess.run and sandbox_run in skill_dispatch.
+
+    The lifecycle helpers and the claude -p dispatch live in
+    core.orchestration.skill_dispatch (the shared runner agentic_passes
+    delegates to), so that's where the seams are.
 
     sandbox_run receives the claude -p calls (keyword-heavy signature);
     subprocess.run receives lifecycle/build_checklist calls. Both route
@@ -57,10 +121,12 @@ def _patch_passes(dispatcher):
         combined(cmd, *args, **kwargs)
         return result
 
-    with patch("core.orchestration.agentic_passes.subprocess.run",
+    with mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                side_effect=_subprocess_side_effect), \
-         patch("core.orchestration.agentic_passes.run_untrusted_networked",
-               side_effect=_sandbox_side_effect):
+         patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+               side_effect=_sandbox_side_effect), \
+         patch("core.llm.cc_probe.probe_cc_session_model",
+               return_value="fake-model"):
         yield combined
 
 
@@ -113,6 +179,14 @@ def _make_lifecycle_dispatcher(start_dir=None, claude_writes=None,
         return _ok(returncode=claude_returncode)
 
     return dispatcher
+
+
+# A healthy /validate child's terminal artifact. The dispatch's outcome
+# probe (missing_validation_report) requires it before the pass may
+# count as ran — the child's exit status alone is not an outcome.
+_VALIDATE_REPORT_WRITES = {
+    "validation-report.md": "# Exploitability Validation Report\n",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +318,7 @@ class UnderstandPrepassTests(unittest.TestCase):
 
     def test_skips_when_claude_not_on_path(self):
         with TemporaryDirectory() as tmp, \
-             patch("core.orchestration.agentic_passes.shutil.which", return_value=None):
+             patch("core.llm.cc_adapter.resolve_claude_cli", return_value=None):
             result = run_understand_prepass(
                 target=Path(tmp), agentic_out_dir=Path(tmp),
             )
@@ -350,10 +424,13 @@ class UnderstandPrepassTests(unittest.TestCase):
                 sandbox_calls.append(kwargs)
                 return dispatcher(cmd, *args, **kwargs)
 
-            with patch("core.orchestration.agentic_passes.subprocess.run",
+            with mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=dispatcher), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=_sandbox_capture):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=_sandbox_capture), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"), \
+                 patch.dict("os.environ", _FIRST_PARTY_PROVIDER_ENV):
                 run_understand_prepass(
                     target=tmp, agentic_out_dir=tmp,
                     claude_bin="/fake/claude",
@@ -379,8 +456,12 @@ class UnderstandPrepassTests(unittest.TestCase):
             paths = kw.get("readable_paths") or []
             self.assertTrue(any(p.endswith("/.claude") for p in paths),
                             f"missing ~/.claude in readable_paths: {paths!r}")
-            self.assertTrue(any("raptor" in p.lower() for p in paths),
-                            f"missing RAPTOR_DIR in readable_paths: {paths!r}")
+            # Assert the actual module-derived path, not a "raptor"
+            # substring — the repo dir is not always named raptor
+            # (worktrees, CI checkouts).
+            from core.orchestration.agentic_passes import _RAPTOR_DIR
+            self.assertIn(str(_RAPTOR_DIR), paths,
+                          f"missing RAPTOR_DIR in readable_paths: {paths!r}")
 
     def test_happy_path_enriches_agentic_checklist(self):
         # End-to-end: pre-pass writes context-map.json into the understand
@@ -545,7 +626,9 @@ class ValidatePostpassTests(unittest.TestCase):
                 {"finding_id": "FINDING-F3", "is_exploitable": False, "confidence": "low"},
             ])
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher) as mock_run:
                 result = run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
@@ -574,6 +657,26 @@ class ValidatePostpassTests(unittest.TestCase):
             self.assertNotIn("FINDING-F2", prompt)
             self.assertNotIn("FINDING-F3", prompt)
 
+    def test_zero_verdict_child_fails_the_postpass(self):
+        """A child that exits 0 WITHOUT writing validation-report.md
+        must yield ran=False with the no-verdicts reason. It used to
+        yield ran=True with report_path=None — the pass read as
+        completed while every selected finding stayed pending."""
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            report = self._make_report(tmp, [
+                {"finding_id": "FINDING-F1", "is_exploitable": True},
+            ])
+            validate_dir = tmp / "validate_run"
+            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            with _patch_passes(dispatcher):
+                result = run_validate_postpass(
+                    target=tmp, agentic_out_dir=tmp, analysis_report=report,
+                    claude_bin="/fake/claude",
+                )
+            self.assertFalse(result.ran)
+            self.assertIn("produced no verdicts", result.skipped_reason)
+
     def test_validate_dispatch_uses_sandbox_with_egress_proxy(self):
         with TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -588,10 +691,13 @@ class ValidatePostpassTests(unittest.TestCase):
                 sandbox_calls.append(kwargs)
                 return dispatcher(cmd, *args, **kwargs)
 
-            with patch("core.orchestration.agentic_passes.subprocess.run",
+            with mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=dispatcher), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=_sandbox_capture):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=_sandbox_capture), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"), \
+                 patch.dict("os.environ", _FIRST_PARTY_PROVIDER_ENV):
                 run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
                     claude_bin="/fake/claude",
@@ -618,8 +724,12 @@ class ValidatePostpassTests(unittest.TestCase):
             paths = kw.get("readable_paths") or []
             self.assertTrue(any(p.endswith("/.claude") for p in paths),
                             f"missing ~/.claude in readable_paths: {paths!r}")
-            self.assertTrue(any("raptor" in p.lower() for p in paths),
-                            f"missing RAPTOR_DIR in readable_paths: {paths!r}")
+            # Assert the actual module-derived path, not a "raptor"
+            # substring — the repo dir is not always named raptor
+            # (worktrees, CI checkouts).
+            from core.orchestration.agentic_passes import _RAPTOR_DIR
+            self.assertIn(str(_RAPTOR_DIR), paths,
+                          f"missing RAPTOR_DIR in readable_paths: {paths!r}")
 
     def test_skips_when_lifecycle_start_fails(self):
         with TemporaryDirectory() as tmp:
@@ -663,7 +773,7 @@ class BackstopTests(unittest.TestCase):
         with patch("core.orchestration.agentic_passes._run_understand_prepass_unsafe",
                    side_effect=RuntimeError("boom")):
             result = run_understand_prepass(
-                target=Path("/tmp/x"), agentic_out_dir=Path("/tmp/y"),
+                target=Path("scratch"), agentic_out_dir=Path("out"),
             )
         self.assertFalse(result.ran)
         self.assertIn("RuntimeError", result.skipped_reason)
@@ -673,8 +783,8 @@ class BackstopTests(unittest.TestCase):
         with patch("core.orchestration.agentic_passes._run_validate_postpass_unsafe",
                    side_effect=ValueError("kaboom")):
             result = run_validate_postpass(
-                target=Path("/tmp/x"), agentic_out_dir=Path("/tmp/y"),
-                analysis_report=Path("/tmp/y/r.json"),
+                target=Path("scratch"), agentic_out_dir=Path("out"),
+                analysis_report=Path("out/r.json"),
             )
         self.assertFalse(result.ran)
         self.assertIn("ValueError", result.skipped_reason)
@@ -785,7 +895,9 @@ class NaNScoreTests(unittest.TestCase):
             import json as _json
             report.write_text(_json.dumps({"results": findings}))
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher):
                 result = run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
@@ -917,7 +1029,9 @@ class SortKeyTypeSafetyTests(unittest.TestCase):
             report = tmp / "report.json"
             report.write_text(json.dumps({"results": findings}))
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher):
                 # Must not raise — backstop would catch it but the user would
                 # see "unexpected ValueError" instead of a clean post-pass.
@@ -976,12 +1090,14 @@ class AdversarialBugsTests(unittest.TestCase):
                 # claude -p: simulate the user Ctrl-C-ing the parent process.
                 raise KeyboardInterrupt()
 
-            with _patch_passes(dispatcher):
-                with self.assertRaises(KeyboardInterrupt):
-                    run_understand_prepass(
-                        target=tmp, agentic_out_dir=tmp,
-                        claude_bin="/fake/claude",
-                    )
+            with (
+                _patch_passes(dispatcher),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run_understand_prepass(
+                    target=tmp, agentic_out_dir=tmp,
+                    claude_bin="/fake/claude",
+                )
             # Lifecycle "fail" must have been invoked.
             fail_called = any(
                 Path(c[0]).name == "raptor-run-lifecycle" and "fail" in c
@@ -1019,13 +1135,13 @@ class AdversarialBugsTests(unittest.TestCase):
         # _complete_lifecycle ignores the subprocess returncode silently.
         # If the helper failed internally (e.g. couldn't write metadata),
         # we'd never know — the run dir stays in "running" state.
-        from core.orchestration.agentic_passes import _complete_lifecycle
-        with patch("core.orchestration.agentic_passes.subprocess.run",
+        from core.orchestration.skill_dispatch import complete_lifecycle
+        with mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                    return_value=_ok(returncode=1, stderr="permission denied")):
             with self.assertLogs(
-                "core.orchestration.agentic_passes", level="WARNING"
+                "core.orchestration.skill_dispatch", level="WARNING"
             ) as cm:
-                _complete_lifecycle(Path("/tmp/whatever"))
+                complete_lifecycle(Path("scratch"))
             self.assertTrue(
                 any("complete" in m.lower() and ("returned" in m.lower()
                                                   or "failed" in m.lower())
@@ -1041,23 +1157,23 @@ class LifecycleHelperResilienceTests(unittest.TestCase):
         # If raptor-run-lifecycle complete itself errors after the work
         # succeeded, we should still return a successful PrepassResult —
         # the analytical work is done, the housekeeping just didn't tick.
-        from core.orchestration.agentic_passes import _complete_lifecycle
-        with patch("core.orchestration.agentic_passes.subprocess.run",
+        from core.orchestration.skill_dispatch import complete_lifecycle
+        with mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                    side_effect=OSError("disk full")):
             # Should swallow the OSError, not raise.
-            _complete_lifecycle(Path("/tmp/whatever"))
+            complete_lifecycle(Path("scratch"))
 
     def test_fail_lifecycle_handles_none_gracefully(self):
         # _fail_lifecycle is called from error paths where the dir might
         # not have been created. None must be a no-op, not a crash.
-        from core.orchestration.agentic_passes import _fail_lifecycle
-        _fail_lifecycle(None, "anything")  # must not raise
+        from core.orchestration.skill_dispatch import fail_lifecycle
+        fail_lifecycle(None, "anything")  # must not raise
 
     def test_fail_lifecycle_swallows_subprocess_errors(self):
-        from core.orchestration.agentic_passes import _fail_lifecycle
-        with patch("core.orchestration.agentic_passes.subprocess.run",
+        from core.orchestration.skill_dispatch import fail_lifecycle
+        with mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                    side_effect=OSError("no such file")):
-            _fail_lifecycle(Path("/tmp/whatever"), "test")  # must not raise
+            fail_lifecycle(Path("scratch"), "test")  # must not raise
 
 
 class TimeoutTests(unittest.TestCase):
@@ -1238,6 +1354,25 @@ class FormatConverterTests(unittest.TestCase):
         self.assertEqual(out["findings"][0]["description"],
                          "tainted from req.body to db.execute")
 
+    def test_junk_verdict_shapes_never_export(self):
+        # Tri-state export rule: a non-bool shape is a non-verdict —
+        # it must not export under the canonical key, whether it
+        # arrives on the schema key or launders through the legacy
+        # "exploitable" alias.
+        from core.orchestration.agentic_passes import convert_agentic_to_validate
+        out = convert_agentic_to_validate(
+            [{"finding_id": "f1", "is_exploitable": "yes"},
+             {"finding_id": "f2", "exploitable": "yes"},
+             {"finding_id": "f3", "exploitable": True},
+             {"finding_id": "f4", "is_true_positive": 1}],
+            target_path="/repo")
+        by_id = {f["id"]: f for f in out["findings"]}
+        self.assertIsNot(by_id["f1"].get("is_exploitable"), True)
+        self.assertIsNot(by_id["f2"].get("is_exploitable"), True)
+        # A genuine legacy bool still normalises to the canonical key.
+        self.assertIs(by_id["f3"].get("is_exploitable"), True)
+        self.assertIsNot(by_id["f4"].get("is_true_positive"), True)
+
     def test_wraps_string_ruling_into_object(self):
         # /agentic emits ruling as a string verdict; /validate wants an object
         # {"status": ..., ...}. The converter must wrap, not pass through.
@@ -1324,7 +1459,8 @@ class FormatConverterTests(unittest.TestCase):
         # with our renamed fields landing in the right places.
         from core.orchestration.agentic_passes import convert_agentic_to_validate
         from packages.exploitability_validation.models import (
-            Finding, FindingsContainer,
+            Finding,
+            FindingsContainer,
         )
         out = convert_agentic_to_validate([{
             "finding_id": "vuln-1",
@@ -1353,79 +1489,120 @@ class FormatConverterTests(unittest.TestCase):
 class MockContractTests(unittest.TestCase):
     """Sanity-check that our subprocess.run mock path is the right one.
 
-    Tests do `patch("core.orchestration.agentic_passes.subprocess.run", ...)`.
+    Tests do `patch("core.orchestration.skill_dispatch.subprocess.run", ...)`.
     If a future refactor changes the import to `from subprocess import run`
     at module level, the patch path becomes wrong but tests still pass
     (mocking nothing) — silent test rot.
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_subprocess_run_patches(self):
+        """Inspect the unmodified import binding; this class never patches run."""
 
     def test_subprocess_module_is_imported_as_module_not_attr(self):
         # The patch target only works if subprocess is imported as a module
         # ("import subprocess") and used as subprocess.run, not as
         # ("from subprocess import run") which would need a different patch
         # path.
-        import core.orchestration.agentic_passes as ap
         import subprocess as sp
-        self.assertIs(ap.subprocess, sp,
-                      msg="agentic_passes must keep `import subprocess` so "
+
+        import core.orchestration.skill_dispatch as sd
+        self.assertIs(sd.subprocess, sp,
+                      msg="skill_dispatch must keep `import subprocess` so "
                           "tests' patch paths stay valid")
 
 
 class RuleOfTwoTests(unittest.TestCase):
-    """Agentic passes blocked in non-interactive mode (Rule of Two)."""
+    """Agentic-pass gate: allow when a human terminal OR an effective sandbox
+    is present; block only the no-human + no-sandbox quadrant.
 
-    def test_understand_blocked_in_ci(self):
-        with patch("core.security.rule_of_two.is_interactive", return_value=False):
+    Each test drives both legs explicitly via the gate's helper boundary, so
+    the outcome doesn't depend on the test host's process tree or sandbox
+    capability.
+    """
+
+    @staticmethod
+    def _legs(*, human: bool, sandbox: bool):
+        return (
+            patch("core.security.rule_of_two._session_has_human_terminal",
+                  return_value=human),
+            patch("core.security.rule_of_two._sandbox_will_contain",
+                  return_value=sandbox),
+        )
+
+    # --- block quadrant: neither human nor sandbox ---
+
+    def test_understand_blocked_when_neither(self):
+        h, s = self._legs(human=False, sandbox=False)
+        with h, s:
             result = run_understand_prepass(
-                target=Path("/tmp/fake-target"),
-                agentic_out_dir=Path("/tmp/fake-out"),
+                target=Path("scratch/target"),
+                agentic_out_dir=Path("scratch/out"),
                 claude_bin="/fake/claude",
             )
         self.assertFalse(result.ran)
-        self.assertIn("not allowed in non-interactive", result.skipped_reason)
+        self.assertIn("Rule of Two", result.skipped_reason)
 
-    def test_validate_blocked_in_ci(self):
+    def test_validate_blocked_when_neither(self):
         with TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             report = tmp / "report.json"
             report.write_text('{"results": []}')
-            with patch("core.security.rule_of_two.is_interactive", return_value=False):
+            h, s = self._legs(human=False, sandbox=False)
+            with h, s:
                 result = run_validate_postpass(
-                    target=Path("/tmp/fake-target"),
+                    target=Path("scratch/target"),
                     agentic_out_dir=tmp,
                     analysis_report=report,
                     claude_bin="/fake/claude",
                 )
         self.assertFalse(result.ran)
-        self.assertIn("not allowed in non-interactive", result.skipped_reason)
+        self.assertIn("Rule of Two", result.skipped_reason)
 
-    def test_understand_passes_gate_when_interactive(self):
-        with patch("core.security.rule_of_two.is_interactive", return_value=True), \
-             patch("core.orchestration.agentic_passes.shutil.which",
-                   return_value=None):
+    # --- allow quadrants: human present, OR sandbox effective ---
+
+    def test_understand_passes_gate_when_human(self):
+        h, s = self._legs(human=True, sandbox=False)
+        with h, s, mock_module_attribute(_discovery_imports, 'shutil', 'which', return_value=None
+        ):
             result = run_understand_prepass(
-                target=Path("/tmp/nonexistent-target"),
-                agentic_out_dir=Path("/tmp/nonexistent-out"),
+                target=Path("scratch/nonexistent-target"),
+                agentic_out_dir=Path("scratch/nonexistent-out"),
             )
-        # Gets past the Rule of Two gate, fails at next check
+        # Past the gate (no Rule-of-Two block), fails at the next check.
         self.assertFalse(result.ran)
-        self.assertNotIn("non-interactive", result.skipped_reason)
+        self.assertNotIn("Rule of Two", result.skipped_reason or "")
+        self.assertIn("claude not on PATH", result.skipped_reason)
 
-    def test_validate_passes_gate_when_interactive(self):
+    def test_understand_passes_gate_when_sandboxed_noninteractive(self):
+        # The new capability: CI/cron with containment runs the pass.
+        h, s = self._legs(human=False, sandbox=True)
+        with h, s, mock_module_attribute(_discovery_imports, 'shutil', 'which', return_value=None
+        ):
+            result = run_understand_prepass(
+                target=Path("scratch/nonexistent-target"),
+                agentic_out_dir=Path("scratch/nonexistent-out"),
+            )
+        self.assertFalse(result.ran)
+        self.assertNotIn("Rule of Two", result.skipped_reason or "")
+        self.assertIn("claude not on PATH", result.skipped_reason)
+
+    def test_validate_passes_gate_when_sandboxed_noninteractive(self):
         with TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             report = tmp / "report.json"
             report.write_text('{"results": []}')
-            with patch("core.security.rule_of_two.is_interactive", return_value=True), \
-                 patch("core.orchestration.agentic_passes.shutil.which",
-                       return_value=None):
+            h, s = self._legs(human=False, sandbox=True)
+            with h, s, mock_module_attribute(_discovery_imports, 'shutil', 'which',
+                return_value=None,
+            ):
                 result = run_validate_postpass(
-                    target=Path("/tmp/nonexistent-target"),
+                    target=Path("scratch/nonexistent-target"),
                     agentic_out_dir=tmp,
                     analysis_report=report,
                 )
         self.assertFalse(result.ran)
-        self.assertNotIn("non-interactive", result.skipped_reason)
+        self.assertNotIn("Rule of Two", result.skipped_reason or "")
 
 
 if __name__ == "__main__":

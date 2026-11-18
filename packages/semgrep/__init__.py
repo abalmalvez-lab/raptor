@@ -12,19 +12,30 @@ HOME redirect, registry-pack proxy hosts, and parallel orchestration belong to
 the caller (e.g. packages/static-analysis/scanner.py).
 """
 
-from .runner import build_cmd, is_available, run_rule, run_rules, version
-from .models import SemgrepFinding, SemgrepResult
+from .runner import (
+    build_cmd, is_available, run_rule, run_rules,
+    scope_isolation_available, version,
+)
+from .models import SemgrepFinding, SemgrepResult, convert_semgrep_json_to_sarif
+from .runtime import SnapRuntimeError, resolve_snap_runtime
 from .findings import to_findings
 from .coverage import to_coverage_record
+from .nosemgrep import annotate_sarif, extract_nosemgrep
 
 __all__ = [
+    "SnapRuntimeError",
+    "resolve_snap_runtime",
+    "convert_semgrep_json_to_sarif",
+    "SemgrepFinding",
+    "SemgrepResult",
+    "annotate_sarif",
     "build_cmd",
+    "extract_nosemgrep",
     "is_available",
     "run_rule",
     "run_rules",
-    "version",
-    "SemgrepFinding",
-    "SemgrepResult",
-    "to_findings",
+    "scope_isolation_available",
     "to_coverage_record",
+    "to_findings",
+    "version",
 ]

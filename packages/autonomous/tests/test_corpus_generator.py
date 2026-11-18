@@ -3,13 +3,22 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from packages.autonomous.corpus_generator import CorpusGenerator
 
 
+class _FakeStringsForSourceTests:
+    returncode = 0
+    stdout = "dummy\n"
+    stderr = ""
+
+
 class TestCorpusGenerator(unittest.TestCase):
 
-    def test_discovers_documented_command_grammar_and_generates_seeds(self):
+    @patch("packages.autonomous.corpus_generator._inspect_binary",
+           return_value=_FakeStringsForSourceTests())
+    def test_discovers_documented_command_grammar_and_generates_seeds(self, _inspect):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             binary = root / "target"
@@ -33,7 +42,9 @@ class TestCorpusGenerator(unittest.TestCase):
             self.assertTrue(any(data.startswith(b"HEAP:") for data in seed_data))
             self.assertTrue(any(data.startswith(b"JSON:") for data in seed_data))
 
-    def test_discovers_strcmp_command_tokens_from_source(self):
+    @patch("packages.autonomous.corpus_generator._inspect_binary",
+           return_value=_FakeStringsForSourceTests())
+    def test_discovers_strcmp_command_tokens_from_source(self, _inspect):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             binary = root / "target"
@@ -50,5 +61,136 @@ class TestCorpusGenerator(unittest.TestCase):
             self.assertIn("FMT", generator.detected_commands)
 
 
+class _FakeStrings:
+    """Stand-in for the sandboxed ``strings`` invocation."""
+
+    def __init__(self, stdout: str):
+        self.returncode = 0
+        self.stdout = stdout
+        self.stderr = ""
+
+
+# Strings chosen so dict-literal insertion order (STACK, HEAP, UAF,
+# JSON, ...) differs from sorted order (HEAP, JSON, STACK, UAF).
+_BINARY_STDOUT = "\n".join(
+    ["vuln_stack", "heap: input", "[uaf] handler", "parse_json here"]
+)
+
+
+class TestCommandsDetectedOrdering(unittest.TestCase):
+    """``analysis["commands_detected"]`` is emitted in sorted order on
+    BOTH the binary-only path and the source-context path, so the report
+    field's ordering does not depend on whether ``source_dir`` is set."""
+
+    @staticmethod
+    def _make_generator(root: Path, source_dir: Path | None = None) -> CorpusGenerator:
+        binary = root / "target"
+        binary.write_bytes(b"dummy")
+        return CorpusGenerator(binary, source_dir=source_dir)
+
+    def test_commands_detected_sorted_without_source_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            gen = self._make_generator(root)
+            with patch(
+                "packages.autonomous.corpus_generator._inspect_binary",
+                return_value=_FakeStrings(_BINARY_STDOUT),
+            ):
+                analysis = gen.analyze_binary()
+
+            commands = analysis["commands_detected"]
+            self.assertEqual(commands, sorted(commands))
+            self.assertEqual({"HEAP", "JSON", "STACK", "UAF"}, set(commands))
+
+    def test_commands_detected_ordering_independent_of_source_dir(self):
+        """Binary-only vs source-context path must agree on ordering."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            # Source contributes nothing new — set of commands is identical
+            # either way, so any ordering difference is purely path-dependent.
+            (source_dir / "README.md").write_text("no grammar here\n", encoding="utf-8")
+
+            with patch(
+                "packages.autonomous.corpus_generator._inspect_binary",
+                return_value=_FakeStrings(_BINARY_STDOUT),
+            ):
+                without_source = self._make_generator(root).analyze_binary()
+                with_source = self._make_generator(
+                    root, source_dir=source_dir
+                ).analyze_binary()
+
+            self.assertEqual(
+                without_source["commands_detected"],
+                with_source["commands_detected"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFormatDetectionBoundaries(unittest.TestCase):
+    """Format indicators with trailing-space semantics ('get ',
+    'post ') must only match WITHIN one extracted string, never
+    across the boundary between two joined strings."""
+
+    @staticmethod
+    def _analyze_with_strings(stdout: str) -> "CorpusGenerator":
+        class _StringsResult:
+            returncode = 0
+
+        result = _StringsResult()
+        result.stdout = stdout
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "target"
+            binary.write_bytes(b"dummy")
+            generator = CorpusGenerator(binary)
+            with patch(
+                "packages.autonomous.corpus_generator._inspect_binary",
+                return_value=result,
+            ):
+                generator.analyze_binary()
+        return generator
+
+    def test_no_cross_boundary_http_false_positive(self):
+        # 'target' + any following string must not synthesise 'get '.
+        generator = self._analyze_with_strings("target\nwidget\nforget\nother\n")
+        self.assertNotIn("http", generator.detected_formats)
+
+    def test_within_string_http_indicator_still_detected(self):
+        generator = self._analyze_with_strings("get /index.html\nother\n")
+        self.assertIn("http", generator.detected_formats)
+
+
+class TestSourceWalkBounded(unittest.TestCase):
+    def test_source_scan_stops_walk_at_cap(self):
+        """The candidate collection must stop the rglob at the 200th
+        match instead of materialising every matching path first
+        (walk/allocation cost only — the kept set is identical)."""
+        from pathlib import Path as _P
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = _P(tmpdir)
+            binary = root / "bin"
+            binary.write_bytes(b"dummy")
+            src = root / "src"
+            src.mkdir()
+            for i in range(250):
+                (src / f"f{i:03d}.txt").write_text("REPLY:data\n",
+                                                   encoding="utf-8")
+
+            consumed = {"n": 0}
+            real_rglob = _P.rglob
+
+            def counting_rglob(self, pattern):
+                for p in real_rglob(self, pattern):
+                    consumed["n"] += 1
+                    yield p
+
+            gen = CorpusGenerator(binary, source_dir=src)
+            with patch.object(_P, "rglob", counting_rglob):
+                gen._analyze_source_context()
+            assert consumed["n"] == 200

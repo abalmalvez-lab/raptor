@@ -10,6 +10,9 @@ Skip-silently semantics match the ``/scan`` cocci leg:
   * spatch absent → no facts (skipped)
   * target has no C/C++ source → no facts (skipped)
   * shipped prereqs rules dir missing → no facts (skipped)
+  * every prereq rule errored → no facts (skipped: an errored sweep
+    holds no absence evidence; ``rules_failed``, never an empty fact
+    base that reads as "scanned and found nothing")
 """
 
 from __future__ import annotations
@@ -17,19 +20,28 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 from .runner import is_available as spatch_available
 from .runner import run_rules as spatch_run_rules
 
-
 # Re-exported for callers that want to skip prereqs on pure-Python /
 # pure-JS targets without re-implementing the heuristic. Same set as
 # the /scan cocci leg's ``_repo_has_c_cpp_source``.
-_C_CPP_EXTS: Tuple[str, ...] = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh")
+_C_CPP_EXTS: tuple[str, ...] = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh")
+
+# Extensions the sweep's fact base NEVER covers: spatch parses C
+# translation units only (the runner's directory walk enumerates
+# ``*.c``/``*.h``, and spatch's C parser chokes on C++ constructs), so
+# a function defined in a ``.cpp``/``.cc`` file cannot appear in
+# ``defs`` no matter what — its absence is not evidence.
+# ``evaluate_finding`` skips findings on these files entirely rather
+# than minting ``function_exists=False`` for functions the sweep was
+# structurally blind to.
+_CPP_ONLY_EXTS: tuple[str, ...] = (".cc", ".cpp", ".cxx", ".hpp", ".hh")
 
 
-def _shipped_prereqs_rules_dir() -> Optional[Path]:
+def _shipped_prereqs_rules_dir() -> Path | None:
     """Resolve the in-tree shipped prereqs rules dir, or None if
     missing (minimal install / packaging strip)."""
     here = Path(__file__).resolve()
@@ -38,19 +50,32 @@ def _shipped_prereqs_rules_dir() -> Optional[Path]:
     return candidate if candidate.is_dir() else None
 
 
+# Pruned from the bounded source walk: VCS internals are never target
+# source, and .git alone routinely holds hundreds of loose object
+# files — enough to exhaust the file cap before any source dir is
+# reached (readdir order dependent).
+_VCS_DIR_NAMES: frozenset[str] = frozenset({".git", ".hg", ".svn"})
+
+
 def _has_c_cpp_source(repo_path: Path, max_files: int = 200) -> bool:
-    """Bounded heuristic: any C/C++ source under ``repo_path``?"""
+    """Bounded heuristic: any C/C++ source under ``repo_path``?
+
+    Walks with VCS directories pruned so their internals don't count
+    toward the cap — pre-fix ``rglob("*")`` enumerated ``.git/objects``
+    too, and any repo whose walk order fronted 200 non-source files
+    returned False even with C sources present.
+    """
     if not repo_path.is_dir():
         return False
     seen = 0
-    for entry in repo_path.rglob("*"):
-        if not entry.is_file():
-            continue
-        seen += 1
-        if entry.suffix.lower() in _C_CPP_EXTS:
-            return True
-        if seen >= max_files:
-            return False
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [d for d in dirnames if d not in _VCS_DIR_NAMES]
+        for fname in filenames:
+            seen += 1
+            if os.path.splitext(fname)[1].lower() in _C_CPP_EXTS:
+                return True
+            if seen >= max_files:
+                return False
     return False
 
 
@@ -66,9 +91,22 @@ class PrereqFacts:
     cocci only sees the syntactic form.
     """
 
-    defs: Dict[str, Set[Tuple[str, int]]] = field(default_factory=dict)
-    calls: Dict[str, Set[Tuple[str, int]]] = field(default_factory=dict)
-    skipped_reason: Optional[str] = None
+    defs: dict[str, set[tuple[str, int]]] = field(default_factory=dict)
+    calls: dict[str, set[tuple[str, int]]] = field(default_factory=dict)
+    skipped_reason: str | None = None
+    # False when any prereq rule errored (nonzero rc / parse errors on
+    # some files): the maps then hold PARTIAL evidence — positive
+    # entries stand, but a name's ABSENCE proves nothing. Negative
+    # consumers (``evaluate_finding``'s function_exists=False,
+    # source_intel's dead-code / gated-path axes) must abstain when
+    # this is False; asserting absence from an errored sweep is how
+    # engine failure used to read as a mechanical refutation.
+    complete: bool = True
+    # False when the sweep ran with ``--no-includes`` (always, today:
+    # gather_prereqs scans untrusted targets): header-defined
+    # static/inline functions never enter ``defs``, so absence of a
+    # name that would live in a header is not evidence either.
+    headers_parsed: bool = False
 
     @property
     def is_skipped(self) -> bool:
@@ -80,13 +118,13 @@ class PrereqFacts:
     def function_has_callers(self, name: str) -> bool:
         return name in self.calls and len(self.calls[name]) > 0
 
-    def callers_of(self, name: str) -> List[Tuple[str, int]]:
+    def callers_of(self, name: str) -> list[tuple[str, int]]:
         return sorted(self.calls.get(name, set()))
 
 
 def gather_prereqs(
     target: Path,
-    rules_dir: Optional[Path] = None,
+    rules_dir: Path | None = None,
     timeout_per_rule: int = 300,
 ) -> PrereqFacts:
     """Run shipped prereq rules against ``target`` and build facts.
@@ -102,7 +140,7 @@ def gather_prereqs(
     if not _has_c_cpp_source(target):
         return PrereqFacts(skipped_reason="no_c_cpp_source")
 
-    effective_rules_dir = rules_dir if rules_dir else _shipped_prereqs_rules_dir()
+    effective_rules_dir = rules_dir or _shipped_prereqs_rules_dir()
     if effective_rules_dir is None:
         return PrereqFacts(skipped_reason="rules_dir_missing")
 
@@ -111,9 +149,28 @@ def gather_prereqs(
         rules_dir=effective_rules_dir,
         timeout_per_rule=timeout_per_rule,
         no_includes=True,  # operator targets are untrusted
+        # In-repo shipped prereqs rules (code trust) — their
+        # @script:python reporting blocks are trusted.
+        allow_scripting=True,
     )
 
-    facts = PrereqFacts()
+    # Engine failure must never read as verified silence (the same
+    # rc-synthesis doctrine the runner applies one layer down): a
+    # sweep in which NO rule succeeded produced no absence evidence
+    # at all — treat it exactly like the other skip cases rather
+    # than returning an empty fact base that downstream negative
+    # checks would read as "scanned, nothing defined".
+    if not results or not any(r.ok for r in results):
+        return PrereqFacts(skipped_reason="rules_failed")
+
+    facts = PrereqFacts(
+        # Any errored rule leaves the maps partial: keep the positive
+        # evidence but mark the base incomplete so absence answers
+        # abstain (see PrereqFacts.complete).
+        complete=all(r.ok for r in results),
+        # no_includes=True above: headers are never parsed.
+        headers_parsed=False,
+    )
     for r in results:
         for m in r.matches:
             msg = (m.message or "").strip()
@@ -130,33 +187,45 @@ def gather_prereqs(
 
 
 def evaluate_finding(
-    finding: Dict[str, Any],
+    finding: dict[str, Any],
     facts: PrereqFacts,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Per-finding mechanical evaluation against the prereq facts.
 
     Returns a dict suitable for ``finding["cocci_prereqs"]``.
 
     Output shape:
       {
-        "applicable": bool,    # False when prereqs were skipped
-                               # OR finding's file isn't C/C++.
+        "applicable": bool,    # False when prereqs were skipped,
+                               # the finding carries no function
+                               # name or file, its file isn't C/C++, OR the
+                               # fact base is structurally blind to
+                               # the file (C++ TUs the C-only sweep
+                               # never parses).
         "checks": {
           "function_exists": bool | null,
           "function_has_callers": bool | null,
         },
-        "details": {           # only populated when checks ran
-          "function": str,
-          "callers_count": int,
+        "details": {           # only populated when checks ran;
+          "function": str,     # "abstained" names why a check
+          "callers_count": int,  # answered null instead of False
+          "abstained": str,      # (partial sweep / unparsed headers)
         },
         "skipped_reason": str | null,
       }
+
+    Condemn-toward-abstain: ``function_exists``/``function_has_callers``
+    answer ``False`` only when the fact base could actually have seen
+    the definition/callers (complete sweep; file class the walk
+    covers). A partial sweep or an uncovered file class answers
+    ``null`` — absence there is not evidence, and downstream
+    refutation consumers accept only a positive absence witness.
 
     Stage C reasoning consults this; Stage D may use it as evidence
     in attack-tree disposition. Status of the finding is NEVER
     overwritten here — these are facts, not verdicts.
     """
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "applicable": False,
         "checks": {
             "function_exists": None,
@@ -178,24 +247,59 @@ def evaluate_finding(
     if not func_name:
         out["skipped_reason"] = "finding_missing_function"
         return out
+    if not file_path:
+        out["skipped_reason"] = "finding_missing_file"
+        return out
+    ext = ""
     if file_path:
         ext = os.path.splitext(file_path)[1].lower()
         if ext and ext not in _C_CPP_EXTS:
             out["skipped_reason"] = "non_c_cpp_file"
             return out
+        if ext in _CPP_ONLY_EXTS:
+            # The sweep parses C translation units only — a function
+            # in a .cpp/.cc/.hpp file can never be in the fact base,
+            # so neither its absence nor its callers say anything.
+            out["skipped_reason"] = "ext_not_in_fact_base"
+            return out
 
     out["applicable"] = True
-    exists = facts.function_exists(func_name)
-    has_callers = facts.function_has_callers(func_name) if exists else None
+    out["details"]["function"] = func_name
 
-    out["checks"]["function_exists"] = exists
+    if facts.function_exists(func_name):
+        # Positive witness: stands even from a partial fact base.
+        out["checks"]["function_exists"] = True
+        out["details"]["callers_count"] = len(
+            facts.calls.get(func_name, set()),
+        )
+        if facts.function_has_callers(func_name):
+            out["checks"]["function_has_callers"] = True
+        elif facts.complete:
+            out["checks"]["function_has_callers"] = False
+        else:
+            # Partial sweep: the calls map may be missing exactly the
+            # caller that exists — "no callers" is not evidence.
+            out["checks"]["function_has_callers"] = None
+            out["details"]["abstained"] = "sweep_partial"
+        return out
+
+    # Name absent from defs. Absence is a POSITIVE witness only when
+    # the fact base could have seen the definition:
+    #   * the sweep must be complete (no rule errored), and
+    #   * the finding's file class must be one the walk parses —
+    #     header findings under --no-includes never enter defs.
+    if not ext:
+        out["checks"]["function_exists"] = None
+        out["details"]["abstained"] = "ext_not_in_fact_base"
+    elif ext == ".h" and not facts.headers_parsed:
+        out["checks"]["function_exists"] = None
+        out["details"]["abstained"] = "headers_not_parsed"
+    elif not facts.complete:
+        out["checks"]["function_exists"] = None
+        out["details"]["abstained"] = "sweep_partial"
+    else:
+        out["checks"]["function_exists"] = False
     # function_has_callers is only meaningful if the function exists.
     # When the function isn't defined locally (e.g. libc symbol), we
     # leave the caller check as null rather than asserting False.
-    out["checks"]["function_has_callers"] = has_callers
-
-    out["details"]["function"] = func_name
-    if exists:
-        out["details"]["callers_count"] = len(facts.calls.get(func_name, set()))
-
     return out

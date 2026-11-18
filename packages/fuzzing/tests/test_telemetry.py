@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -71,7 +72,7 @@ class TestFuzzingTelemetry(unittest.TestCase):
             tel = FuzzingTelemetry(out_dir=out_dir, fuzzer="afl++", target="/bin/test")
             tel.start()
             tel.update_stats(total_executions=100, paths_found=5, executions_per_second=200)
-            tel.record_crash("/tmp/crash-001", signal="SIGSEGV")
+            tel.record_crash("./crash-001", signal="SIGSEGV")
             tel.stop()
 
             self.assertTrue((out_dir / "fuzz-events.jsonl").exists())
@@ -90,6 +91,32 @@ class TestFuzzingTelemetry(unittest.TestCase):
             summary = json.loads((out_dir / "fuzz-summary.json").read_text())
             self.assertEqual(summary["fuzzer"], "afl++")
             self.assertEqual(summary["crashes"], 1)
+
+    def test_exec_stat_progression_persisted_but_throttled(self):
+        # The JSONL trail contract covers the executions progression;
+        # per-stderr-line callers (libFuzzer) must not flood it — one
+        # exec_stat per disk interval.
+        with tempfile.TemporaryDirectory() as tmp:
+            tel = FuzzingTelemetry(out_dir=Path(tmp))
+            tel.start()
+            for n in range(1, 6):
+                tel.update_stats(total_executions=n * 100)
+            # Simulate the interval elapsing.
+            tel._last_exec_stat_disk = 0.0
+            tel.update_stats(total_executions=999)
+            tel.stop()
+
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "fuzz-events.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            exec_stats = [e for e in events if e["kind"] == "exec_stat"]
+            # First call persisted, next four throttled, post-interval
+            # call persisted again.
+            self.assertEqual(len(exec_stats), 2)
+            self.assertEqual(exec_stats[0]["total_executions"], 100)
+            self.assertEqual(exec_stats[1]["total_executions"], 999)
 
     def test_first_path_event_emitted_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -132,25 +159,29 @@ class TestFuzzingTelemetry(unittest.TestCase):
 
     def test_thread_safe_snapshot(self):
         import threading
+        from core.testing.threads import retiring_threads
         with tempfile.TemporaryDirectory() as tmp:
             tel = FuzzingTelemetry(out_dir=Path(tmp))
             tel.start()
 
-            stop = threading.Event()
+            try:
+                stop = threading.Event()
 
-            def updater():
-                while not stop.is_set():
-                    tel.update_stats(total_executions=tel.stats.total_executions + 1)
-                    time.sleep(0.001)
+                def updater():
+                    while not stop.is_set():
+                        tel.update_stats(total_executions=tel.stats.total_executions + 1)
+                        time.sleep(0.001)
 
-            t = threading.Thread(target=updater, daemon=True)
-            t.start()
-            for _ in range(50):
-                snapshot = tel.snapshot()
-                self.assertIsInstance(snapshot["total_executions"], int)
-            stop.set()
-            t.join(timeout=2)
-            tel.stop()
+                t = threading.Thread(target=updater, daemon=True)
+                with retiring_threads((t,), release=stop.set, timeout=2):
+                    t.start()
+                    for _ in range(50):
+                        snapshot = tel.snapshot()
+                        self.assertIsInstance(snapshot["total_executions"], int)
+                    stop.set()
+                    t.join(timeout=2)
+            finally:
+                tel.stop()
 
     def test_on_event_callback_invoked(self):
         captured = []
@@ -161,12 +192,38 @@ class TestFuzzingTelemetry(unittest.TestCase):
                 on_event=lambda ev: captured.append(ev.kind),
             )
             tel.start()
-            tel.record_crash("/tmp/x")
+            tel.record_crash("./x")
             tel.stop()
 
         self.assertIn("campaign_start", captured)
         self.assertIn("crash", captured)
         self.assertIn("campaign_end", captured)
+
+
+class TestEventTrailHardening(unittest.TestCase):
+    """The events trail lives in a reused output dir a previous
+    campaign's hostile child had write on — planted symlinks/FIFOs at
+    the predictable name must refuse the open, never be followed or
+    block campaign start."""
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "mkfifo unavailable")
+    def test_start_refuses_planted_readerless_fifo_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            os.mkfifo(out_dir / "fuzz-events.jsonl")
+            tel = FuzzingTelemetry(out_dir=out_dir)
+            with self.assertRaises(OSError):
+                tel.start()
+
+    def test_start_refuses_planted_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            victim = out_dir / "victim"
+            (out_dir / "fuzz-events.jsonl").symlink_to(victim)
+            tel = FuzzingTelemetry(out_dir=out_dir)
+            with self.assertRaises(OSError):
+                tel.start()
+            self.assertFalse(victim.exists())
 
 
 if __name__ == "__main__":

@@ -60,20 +60,24 @@ def _try_parse_datetime(dt_str: str) -> datetime | None:
 
 
 def parse_datetime_lenient(dt_str: Any) -> datetime:
-    """Parse datetime with fallback to now.
+    """Parse a GH Archive timestamp, accepting the archive's several
+    formats.
 
-    Lenient parsing for GH Archive data where dates might be malformed.
-    Returns current UTC time if parsing fails.
+    Raises ValueError when the value is missing or unparseable: the
+    old fallback returned ``datetime.now()``, minting COLLECTION-time
+    timestamps onto forensic events from malformed rows — and the
+    fabricated time then also derived the wrong BigQuery table for
+    verification. A row whose timestamp cannot be read must fail the
+    row, never invent evidence.
     """
-    if dt_str is None:
-        return datetime.now(timezone.utc)
     if isinstance(dt_str, datetime):
         return dt_str
     if isinstance(dt_str, str):
         result = _try_parse_datetime(dt_str)
         if result:
             return result
-    return datetime.now(timezone.utc)
+    msg = f"unparseable GH Archive timestamp: {dt_str!r}"
+    raise ValueError(msg)
 
 
 def parse_datetime_strict(dt_str: str | datetime | None) -> datetime | None:
@@ -90,7 +94,8 @@ def parse_datetime_strict(dt_str: str | datetime | None) -> datetime | None:
     result = _try_parse_datetime(dt_str)
     if result:
         return result
-    raise ValueError(f"Unable to parse datetime: {dt_str}")
+    msg = f"Unable to parse datetime: {dt_str}"
+    raise ValueError(msg)
 
 
 def make_actor(login: str, actor_id: int | None = None) -> GitHubActor:
@@ -110,14 +115,17 @@ def make_repo_from_full_name(full_name: str) -> GitHubRepository:
         ValueError: If full_name is not in 'owner/repo' format or contains invalid values.
     """
     if not full_name or full_name in ("unknown/unknown", "/", "unknown"):
-        raise ValueError(f"Invalid repository full_name: '{full_name}' - must be 'owner/repo' format")
+        msg = f"Invalid repository full_name: '{full_name}' - must be 'owner/repo' format"
+        raise ValueError(msg)
 
     parts = full_name.split("/", 1)
     if len(parts) != 2:
-        raise ValueError(f"Invalid repository full_name: '{full_name}' - must be 'owner/repo' format")
+        msg = f"Invalid repository full_name: '{full_name}' - must be 'owner/repo' format"
+        raise ValueError(msg)
 
     owner, name = parts
     if not owner or not name or owner == "unknown" or name == "unknown":
-        raise ValueError(f"Invalid repository full_name: '{full_name}' - owner and name must be valid")
+        msg = f"Invalid repository full_name: '{full_name}' - owner and name must be valid"
+        raise ValueError(msg)
 
     return GitHubRepository(owner=owner, name=name, full_name=full_name)

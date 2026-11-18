@@ -1,0 +1,159 @@
+"""``uv.lock`` parser.
+
+uv (https://docs.astral.sh/uv/) is a fast Python package manager
+from astral-sh; ``uv.lock`` is its TOML lockfile (uv 0.4+, growing
+adoption fast).
+
+Schema (uv 0.4 / lockfile version 1):
+
+    version = 1
+    revision = 1
+    requires-python = ">=3.11"
+
+    [[package]]
+    name = "requests"
+    version = "2.31.0"
+    source = { registry = "https://pypi.org/simple" }
+    dependencies = [
+        { name = "charset-normalizer" },
+        { name = "idna" },
+        { name = "urllib3" },
+    ]
+    sdist = { ... }
+
+    [[package]]
+    name = "myproject"
+    version = "0.1.0"
+    source = { virtual = "." }       # the project itself
+    dependencies = [{ name = "requests" }]
+
+This parser:
+
+  * Walks the ``[[package]]`` array.
+  * Skips the project itself — entries with ``source = { virtual
+    = "..." }`` are the operator's project (Python virtual
+    package), not deps.
+  * Skips entries with ``source = { editable = "..." }`` or
+    ``source = { directory = "..." }`` — local-path overrides
+    that aren't registry-published.
+  * Emits ``ecosystem="PyPI"`` Dependency rows with
+    ``is_lockfile=True``, ``direct=False`` (uv.lock contains
+    the full resolved tree; direct/transitive isn't directly
+    queryable from the lockfile shape — operator-side
+    ``pyproject.toml`` is the source of truth for "direct").
+  * ``pin_style=PinStyle.EXACT`` since lockfile versions are
+    always pinned.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl
+from . import _safe_read, register
+
+try:
+    import tomllib                  # Python 3.11+
+except ImportError:                 # pragma: no cover
+    import tomli as tomllib         # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
+
+
+ECOSYSTEM = "PyPI"
+_PURL_TYPE = "pypi"
+
+
+@register(filenames=["uv.lock"])
+def parse(path: Path) -> list[Dependency]:
+    text = _safe_read.read_bounded(path, follow_symlinks=False)
+    if text is None:
+        # ``read_bounded`` already logged the underlying reason.
+        return []
+    try:
+        data = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
+        logger.warning(
+            "sca.parsers.uv_lock: TOML parse failed for %s: %s",
+            path, e,
+        )
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    packages = data.get("package")
+    if not isinstance(packages, list):
+        return []
+
+    out: list[Dependency] = []
+    for pkg in packages:
+        dep = _build_dep(pkg, declared_in=path)
+        if dep is not None:
+            out.append(dep)
+    return out
+
+
+def _build_dep(
+    pkg: Any, *, declared_in: Path,
+) -> Dependency | None:
+    if not isinstance(pkg, dict):
+        return None
+    name = pkg.get("name")
+    version = pkg.get("version")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(version, str) or not version.strip():
+        return None
+    # PEP 503 normalisation, same as every other PyPI parser. uv
+    # itself writes normalised names, but a non-canonical spelling
+    # (hand-edited lockfile, older tool output) would otherwise fail
+    # to join with the normalised manifest-side row from pyproject /
+    # requirements — the joined view would double-report instead of
+    # deferring to the manifest parser.
+    name = pep503_name(name.strip())
+    version = version.strip()
+
+    source = pkg.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
+
+    # Skip the project's own row (``virtual``) and local
+    # editables / directories / paths — these aren't
+    # registry-published deps. ``url`` sources stay IN: a direct
+    # sdist/wheel URL (``source = { url = "https://.../foo-1.2.tar.gz" }``)
+    # is a real third-party package with a concrete name + version —
+    # exactly what OSV matches on — so dropping it hid its advisories.
+    if any(k in source for k in ("virtual", "editable", "directory", "path")):
+        return None
+
+    # Git sources keep the version (some commit SHA or tag) but
+    # CVE matching against PyPI won't fire. Mark with PinStyle.GIT
+    # for transparency.
+    pin_style = (
+        PinStyle.GIT if "git" in source else PinStyle.EXACT
+    )
+
+    return Dependency(
+        ecosystem=ECOSYSTEM,
+        name=name,
+        version=version,
+        declared_in=declared_in,
+        scope="main",
+        is_lockfile=True,
+        pin_style=pin_style,
+        # uv.lock includes the full resolved tree; direct vs
+        # transitive distinction lives in the project's
+        # pyproject.toml. Mark all as not-direct so the joined
+        # view defers to the manifest-side parser when both are
+        # present.
+        direct=False,
+        purl=build_purl(_PURL_TYPE, name, version),
+        parser_confidence=Confidence(
+            "high",
+            reason="uv.lock pinned dependency",
+        ),
+    )

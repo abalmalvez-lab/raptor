@@ -1,0 +1,263 @@
+"""Unified per-finding status enum + helpers.
+
+Substrate for QoL #19. Replaces the null-field-detection pattern
+that downstream consumers (``raptor_agentic`` summary,
+``orchestrated_report.json`` readers, reporting renderers) used to
+decide ''was this finding analysed?'' / ''was it skipped?'' / ''does
+it need human review?'' / ''did the analysis crash?''. Each consumer
+re-implemented the detection from a different mix of fields
+(``is_true_positive is None``, ``self_contradictory``, ``error``,
+absent keys); each got it slightly wrong.
+
+A single ``status`` value on each finding dict is the source of
+truth. Helpers (``is_actionable``, ``needs_review``, ``is_skipped``)
+let consumers ask the question they actually care about without
+re-deriving the rules.
+
+## Status values
+
+* ``analysed`` — LLM processed the finding; verdict is trustworthy.
+  Headline ''Exploitable / FP'' counts come from this bucket.
+* ``analysis_inconsistent`` — LLM processed but reasoning /
+  verdict contradicted itself (``self_contradictory=True``)
+  post-Stage-F retry AND no judge resolved it. Counted as
+  ''Inconsistent (review needed)'' in operator output.
+* ``skipped_over_budget`` — cost or count cap hit before this
+  finding got dispatched.
+* ``skipped_duplicate`` — dedup against another finding kept this
+  out of the analysed set.
+* ``skipped_dead_code`` — binary-oracle filtered: function not in
+  the analysed binary.
+* ``skipped_filtered`` — operator ``--exclude-dir`` or filter rule
+  excluded this path.
+* ``skipped_tool_absent`` — tool that would have analysed this
+  finding wasn't available (e.g. codeql skipped because
+  ``autoreconf`` was missing).
+* ``error`` — analysis crashed; see ``error`` field on the finding
+  for detail.
+
+## Backwards compatibility
+
+``derive_status(finding)`` infers the status from existing fields
+(``is_true_positive``, ``self_contradictory``, ``error``,
+``contradiction_resolved_by_judge``) when a finding doesn't carry
+an explicit ``status`` key — so pre-existing emit paths continue
+to work without per-emit-site changes. New emit sites (orchestrator
+backfill, scan-time skip records) call ``set_status`` explicitly so
+consumers see the canonical value.
+
+``bucket_orchestration_results`` in ``core/orchestration/funnel.py``
+prefers the explicit status when present and falls back to the
+derive path otherwise. No flag day; consumers using the helpers
+work across the transition.
+"""
+
+from __future__ import annotations
+
+# String-valued for direct JSON serialisation. No Enum() — keeps
+# the dict shape grep-able and avoids the standard-library enum
+# import burden on every consumer.
+ANALYSED = "analysed"
+ANALYSIS_INCONSISTENT = "analysis_inconsistent"
+SKIPPED_OVER_BUDGET = "skipped_over_budget"
+SKIPPED_DUPLICATE = "skipped_duplicate"
+SKIPPED_DEAD_CODE = "skipped_dead_code"
+SKIPPED_FILTERED = "skipped_filtered"
+SKIPPED_TOOL_ABSENT = "skipped_tool_absent"
+SKIPPED = "skipped"   # generic skip when the reason wasn't recorded
+ERROR = "error"
+
+ALL_STATUSES = frozenset({
+    ANALYSED,
+    ANALYSIS_INCONSISTENT,
+    SKIPPED_OVER_BUDGET,
+    SKIPPED_DUPLICATE,
+    SKIPPED_DEAD_CODE,
+    SKIPPED_FILTERED,
+    SKIPPED_TOOL_ABSENT,
+    SKIPPED,
+    ERROR,
+})
+
+# All ``skipped_*`` values + the generic ``skipped`` — used by
+# ``is_skipped`` and skip-reason filters in reporting.
+_SKIPPED_STATUSES = frozenset({
+    SKIPPED_OVER_BUDGET,
+    SKIPPED_DUPLICATE,
+    SKIPPED_DEAD_CODE,
+    SKIPPED_FILTERED,
+    SKIPPED_TOOL_ABSENT,
+    SKIPPED,
+})
+
+
+#: Boolean verdict fields on analysis/finding records that carry
+#: tri-state semantics (True / False / abstained). Consumed by
+#: :func:`read_verdict` callers and by the idiom closure test that keeps
+#: raw truthiness/default reads of these keys out of the codebase.
+VERDICT_KEYS = ("is_true_positive", "is_exploitable")
+
+
+def read_verdict(record: dict | None, key: str) -> bool | None:
+    """Tri-state read of a boolean verdict field (``VERDICT_KEYS``).
+
+    Returns the stored value only when it is a genuine bool. A missing
+    key, an explicit ``None`` (response validation nulls a missing or
+    malformed verdict field — an abstention, not a verdict), a non-dict
+    record, or any non-bool shape all read as ``None``. Callers state
+    polarity explicitly::
+
+        read_verdict(r, "is_exploitable") is True    # confirmed
+        read_verdict(r, "is_exploitable") is False   # explicit negative
+        read_verdict(r, "is_exploitable") is None    # abstained / no verdict
+
+    Never apply truthiness, ``not``, or a bool ``.get`` default to
+    these fields directly: that idiom reads an abstention as a NEGATIVE
+    verdict and has repeatedly demoted findings whose analysis response
+    was merely malformed. ``test_verdict_tri_state_closure`` enforces
+    that new read sites route through this accessor.
+    """
+    if not isinstance(record, dict):
+        return None
+    value = record.get(key)
+    return value if isinstance(value, bool) else None
+
+
+def derive_status(finding: dict) -> str:
+    """Infer status from a finding's existing fields.
+
+    Used as the fallback when the finding doesn't carry an explicit
+    ``status`` key (backwards-compat for emit paths that pre-date
+    #19). Detection order:
+
+      1. ``error`` field present → ``error``
+      2. ``is_true_positive`` key absent → ``skipped`` (generic;
+         caller didn't record a specific skip reason)
+      3. a GENUINE ``is_exploitable`` verdict (either polarity) AND
+         ``self_contradictory=True`` (and not resolved by judge) →
+         ``analysis_inconsistent``. Verdict-POLARITY-agnostic by
+         definition: a self-contradictory NEGATIVE verdict is exactly
+         as untrustworthy as a positive one — gating on
+         ``is_exploitable=True`` let it derive a clean ``analysed``.
+         A junk/absent verdict stays out of the bucket (tri-state
+         accessor rule): the inconsistency bucket keys on a genuine
+         claim contradicting itself, not on junk.
+      4. Otherwise → ``analysed``
+
+    Known tension (deliberately unchanged): a PRESENT-but-null
+    ``is_true_positive`` derives ``analysed`` here, while the funnel
+    counts it ``unverdicted`` (gh #549) — reclassifying it as skipped
+    in this fallback would make ``is_skipped`` swallow unverdicted
+    findings out of the funnel and hide dispatch failures. Fixing the
+    ``analysed`` overstatement needs a dedicated enum value threaded
+    through the status consumers, not a fallback tweak.
+    """
+    if "error" in finding:
+        return ERROR
+    if "is_true_positive" not in finding:
+        return SKIPPED
+    if (read_verdict(finding, "is_exploitable") is not None
+            and finding.get("self_contradictory")
+            and not finding.get("contradiction_resolved_by_judge")):
+        return ANALYSIS_INCONSISTENT
+    return ANALYSED
+
+
+def set_status(finding: dict, status: str,
+               *, skip_reason: str | None = None) -> None:
+    """Stamp ``status`` (and optionally ``skip_reason``) on the
+    finding dict. Validates against ``ALL_STATUSES`` to catch
+    typos — an unknown status string would silently propagate
+    otherwise and break downstream filters that ``in``-check the
+    enum.
+
+    Raises ``ValueError`` on unknown status (deliberate — the
+    audit trail's value depends on the enum being closed)."""
+    if status not in ALL_STATUSES:
+        msg = (
+            f"finding_status.set_status: unknown status "
+            f"{status!r} (valid: {sorted(ALL_STATUSES)})"
+        )
+        raise ValueError(msg)
+    finding["status"] = status
+    if skip_reason is not None:
+        finding["skip_reason"] = skip_reason
+
+
+def get_status(finding: dict) -> str:
+    """Return the finding's status — prefer the explicit ``status``
+    field; fall back to ``derive_status`` for pre-#19 emit paths."""
+    explicit = finding.get("status")
+    if isinstance(explicit, str) and explicit in ALL_STATUSES:
+        return explicit
+    return derive_status(finding)
+
+
+def is_actionable(finding: dict) -> bool:
+    """True when the finding was successfully analysed and its
+    verdict is trustworthy. Headline ''Exploitable / FP'' counts
+    derive from this set."""
+    return get_status(finding) == ANALYSED
+
+
+def needs_review(finding: dict) -> bool:
+    """True when the LLM produced internally-contradictory
+    reasoning and no judge resolved it — operator-facing
+    ''Inconsistent (review needed)'' bucket."""
+    return get_status(finding) == ANALYSIS_INCONSISTENT
+
+
+def is_skipped(finding: dict) -> bool:
+    """True for any ``skipped_*`` status (regardless of reason).
+    Used by reporting to separate ''we looked at this'' from
+    ''we didn't get to this''."""
+    return get_status(finding) in _SKIPPED_STATUSES
+
+
+def is_errored(finding: dict) -> bool:
+    """True when the analysis attempt crashed. Distinct from
+    ``is_skipped`` because the operator may want to retry errored
+    findings (transient infra issues) vs investigate skipped
+    findings (budget / dedup / filter decisions)."""
+    return get_status(finding) == ERROR
+
+
+def is_terminal(finding: dict) -> bool:
+    """True for any final status (analysed / inconsistent /
+    skipped / errored). False only for the in-flight case where no
+    status has been derived yet.
+
+    Deliberately checks the EXPLICIT ``status`` field, not
+    ``get_status``: derive_status always lands in ALL_STATUSES, so
+    routing through get_status made this predicate unconditionally
+    True and the documented in-flight False case unreachable."""
+    explicit = finding.get("status")
+    return isinstance(explicit, str) and explicit in ALL_STATUSES
+
+
+__all__ = [
+    "ALL_STATUSES",
+    # status values
+    "ANALYSED",
+    "ANALYSIS_INCONSISTENT",
+    "ERROR",
+    "SKIPPED",
+    "SKIPPED_DEAD_CODE",
+    "SKIPPED_DUPLICATE",
+    "SKIPPED_FILTERED",
+    "SKIPPED_OVER_BUDGET",
+    "SKIPPED_TOOL_ABSENT",
+    # verdict fields
+    "VERDICT_KEYS",
+    "read_verdict",
+    # operations
+    "derive_status",
+    "get_status",
+    # predicates
+    "is_actionable",
+    "is_errored",
+    "is_skipped",
+    "is_terminal",
+    "needs_review",
+    "set_status",
+]

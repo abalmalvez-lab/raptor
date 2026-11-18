@@ -1,0 +1,172 @@
+"""One source-tree walk per ``(target, max_depth)``, memoised across
+the per-ecosystem reach scanners.
+
+Pre-fix each of the 8 reach scanners (``nodejs`` / ``python`` /
+``gomod`` / ``composer`` / ``gemfile`` / ``cargo`` / ``nuget`` /
+``maven``) did its own ``os.walk`` of the target tree. On a polyglot
+codebase (Grafana = TS + Go + Py + Java) that's seven redundant
+traversals before the function-level tier even starts; on a 50k-file
+repo each walk adds noticeable wallclock and stat() pressure.
+
+The unified walker emits every source file once, keyed by lowercased
+suffix. Each scanner consumes via :func:`iter_source_files` with its
+own ``extensions`` set and any ecosystem-specific extra directory
+exclusions (``bin``/``obj`` for .NET, ``var``/``cache`` for PHP).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from pathlib import Path
+
+from ..discovery import EXCLUDED_DIR_NAMES
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+logger = logging.getLogger(__name__)
+
+
+# Same default as the per-scanner walkers had before the refactor —
+# keeping the depth ceiling so any test fixture deeper than 12 levels
+# (rare) sees the same behaviour as before.
+DEFAULT_MAX_DEPTH = 12
+
+
+_CACHE_LOCK = threading.Lock()
+# Keyed on ``(resolved_target_str, max_depth)``. Cached as an
+# immutable tuple so a scanner can't poison the cache by mutating
+# the returned list. Memory: ~50 bytes per row × ~50k rows on
+# Grafana ≈ 2.5 MB — trivial. Bounded so a test sweep over many
+# distinct targets in one process can't grow unbounded.
+_CACHE: dict[tuple[str, int], tuple[tuple[Path, str], ...]] = {}
+_CACHE_MAX_TARGETS = 4
+
+
+def walk_source_files(
+    target: Path, *, max_depth: int = DEFAULT_MAX_DEPTH,
+) -> tuple[tuple[Path, str], ...]:
+    """Return every file under ``target`` that survives the canonical
+    SCA dir-exclusion list, as ``(path, suffix_lower)`` tuples.
+
+    Symlinks are not followed (parity with the per-scanner walks).
+    Depth is counted in ``Path.parts`` from the target root.
+    """
+    target = target.resolve()
+    key = (str(target), max_depth)
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+        if cached is not None:
+            return cached
+    if not target.is_dir():
+        # ``os.walk`` is lazy AND swallows scandir errors (default
+        # ``onerror=None``) — a nonexistent / unreadable target
+        # silently yields an EMPTY walk; the old try/except around
+        # the generator CONSTRUCTION could never fire. Refuse loudly
+        # and do NOT cache the miss, so a target that appears later
+        # isn't pinned empty for the process.
+        logger.debug(
+            "sca.reachability._walker: %s is not a directory; "
+            "empty walk (not cached)", target,
+        )
+        return ()
+    base_depth = len(target.parts)
+    out: list[tuple[Path, str]] = []
+    for dirpath, dirnames, filenames in os.walk(
+            str(target), followlinks=False):
+        depth = len(Path(dirpath).parts) - base_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        else:
+            # Sorted in-place so os.walk recurses in a stable order.
+            # Raw readdir order is filesystem-dependent — identical
+            # trees walked on different hosts produced differently
+            # ordered (and, once capped for display, differently
+            # truncated) reachability evidence lists, churning every
+            # corpus refresh diff.
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in EXCLUDED_DIR_NAMES
+            )
+        dp = Path(dirpath)
+        for fn in sorted(filenames):
+            dot = fn.rfind(".")
+            suffix = fn[dot:].lower() if dot > 0 else ""
+            out.append((dp / fn, suffix))
+    result = tuple(out)
+    with _CACHE_LOCK:
+        if len(_CACHE) >= _CACHE_MAX_TARGETS and key not in _CACHE:
+            oldest = next(iter(_CACHE))
+            _CACHE.pop(oldest, None)
+        _CACHE[key] = result
+    return result
+
+
+def reset_walk_cache() -> None:
+    """Drop the memoised walks. ``reachability.scan`` calls this at
+    entry: the cache exists so the per-ecosystem scanners within ONE
+    scan share a single traversal — it has no mtime axis, so letting
+    it outlive the scan serves stale file lists to long-lived
+    processes that scan the same target twice."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def iter_source_files(
+    target: Path,
+    extensions: set[str],
+    *,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    extra_excluded_dir_names: frozenset[str] = frozenset(),
+) -> Iterable[Path]:
+    """Yield files under ``target`` whose suffix is in ``extensions``.
+
+    ``extensions`` is a set of lowercased suffixes including the dot
+    (``{".py"}``, ``{".js", ".ts"}``). ``extra_excluded_dir_names`` is
+    a set of directory names beyond the canonical exclusion list —
+    apply the per-scanner extras here (``bin``/``obj`` for .NET,
+    ``var``/``cache`` for PHP, etc.) rather than in the shared walk
+    so unrelated scanners still see those subtrees.
+    """
+    target_resolved = target.resolve()
+    rows = walk_source_files(target_resolved, max_depth=max_depth)
+    if not extra_excluded_dir_names:
+        for path, suffix in rows:
+            if suffix in extensions:
+                yield path
+        return
+    extras = extra_excluded_dir_names
+    # Match dir-name exclusions only against path components BELOW
+    # the target root. Pre-fix the system tempdir component (e.g.
+    # ``/tmp/...``) collided with PHP's ``"cache"`` / Ruby's
+    # ``"tmp"`` extras and the scanner silently emitted nothing for
+    # files under a pytest ``tmp_path``.
+    for path, suffix in rows:
+        if suffix not in extensions:
+            continue
+        try:
+            rel = path.relative_to(target_resolved)
+        except ValueError:
+            # ``path`` not under target — shouldn't happen because
+            # ``walk_source_files`` walks from target; but be
+            # defensive rather than yield something we can't classify.
+            continue
+        if any(p in extras for p in rel.parts):
+            continue
+        yield path
+
+
+def _reset_cache_for_tests() -> None:
+    """Tests that share a ``tmp_path`` across reach scanners need the
+    cached walk evicted between cases; production never calls this."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+__all__ = [
+    "DEFAULT_MAX_DEPTH",
+    "iter_source_files",
+    "walk_source_files",
+]

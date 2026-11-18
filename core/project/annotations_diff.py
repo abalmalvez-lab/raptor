@@ -13,14 +13,14 @@ the verdict, not the file checksum.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from core.annotations import iter_all_annotations
 
 
-def _load_run(run_dir: Path) -> Dict[tuple, Dict[str, Any]]:
+def _load_run(run_dir: Path) -> dict[tuple, dict[str, Any]]:
     """Index a run's annotations by (file, function) → record dict."""
-    by_pair: Dict[tuple, Dict[str, Any]] = {}
+    by_pair: dict[tuple, dict[str, Any]] = {}
     ann_dir = run_dir / "annotations"
     if not ann_dir.exists():
         return by_pair
@@ -34,16 +34,14 @@ def _load_run(run_dir: Path) -> Dict[tuple, Dict[str, Any]]:
     return by_pair
 
 
-def _has_changed(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+def _has_changed(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Did the verdict-relevant content change between two records?"""
     if a["body"] != b["body"]:
         return True
-    if a["metadata"].get("status") != b["metadata"].get("status"):
-        return True
-    return False
+    return a["metadata"].get("status") != b["metadata"].get("status")
 
 
-def diff_annotations(run_dir_a: Path, run_dir_b: Path) -> Dict[str, Any]:
+def diff_annotations(run_dir_a: Path, run_dir_b: Path) -> dict[str, Any]:
     """Compare annotation trees between two run dirs.
 
     Returns a dict with four lists:
@@ -62,8 +60,8 @@ def diff_annotations(run_dir_a: Path, run_dir_b: Path) -> Dict[str, Any]:
     added = [b_index[k] for k in sorted(b_keys - a_keys)]
     removed = [a_index[k] for k in sorted(a_keys - b_keys)]
 
-    changed: List[Dict[str, Any]] = []
-    unchanged: List[Dict[str, Any]] = []
+    changed: list[dict[str, Any]] = []
+    unchanged: list[dict[str, Any]] = []
     for k in sorted(a_keys & b_keys):
         before = a_index[k]
         after = b_index[k]
@@ -82,9 +80,24 @@ def diff_annotations(run_dir_a: Path, run_dir_b: Path) -> Dict[str, Any]:
     }
 
 
-def format_diff(result: Dict[str, Any]) -> str:
-    """Render a diff result as text suitable for stdout."""
-    lines: List[str] = []
+def format_diff(result: dict[str, Any]) -> str:
+    """Render a diff result as text suitable for stdout.
+
+    file/function/status/source come from annotation records —
+    agent-written (and import-restorable) content — so every
+    interpolation is escaped at construction: the caller prints this
+    string verbatim to the operator terminal.
+    """
+    from core.security.log_sanitisation import sanitise_for_terminal as _sft
+
+    def _f(rec: dict[str, Any]) -> str:
+        return (f"{_sft(str(rec.get('file', '?')), max_len=200)}::"
+                f"{_sft(str(rec.get('function', '?')), max_len=120)}")
+
+    def _meta(rec: dict[str, Any], key: str) -> str:
+        return _sft(str(rec["metadata"].get(key, "—")), max_len=32)
+
+    lines: list[str] = []
     a, b = result["run_a"], result["run_b"]
     lines.append(f"Annotations diff: {a} → {b}")
     lines.append("")
@@ -99,33 +112,30 @@ def format_diff(result: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("Added:")
         for r in result["added"]:
-            status = r["metadata"].get("status", "—")
-            source = r["metadata"].get("source", "—")
             lines.append(
-                f"  + {r['file']}::{r['function']}  "
-                f"status={status}  source={source}"
+                f"  + {_f(r)}  "
+                f"status={_meta(r, 'status')}  source={_meta(r, 'source')}"
             )
     if result["removed"]:
         lines.append("")
         lines.append("Removed:")
         for r in result["removed"]:
-            status = r["metadata"].get("status", "—")
-            lines.append(f"  - {r['file']}::{r['function']}  status={status}")
+            lines.append(f"  - {_f(r)}  status={_meta(r, 'status')}")
     if result["changed"]:
         lines.append("")
         lines.append("Changed:")
         for ch in result["changed"]:
             before, after = ch["before"], ch["after"]
-            old_status = before["metadata"].get("status", "—")
-            new_status = after["metadata"].get("status", "—")
+            old_status = _meta(before, "status")
+            new_status = _meta(after, "status")
             if old_status != new_status:
                 lines.append(
-                    f"  ~ {after['file']}::{after['function']}  "
+                    f"  ~ {_f(after)}  "
                     f"status: {old_status} → {new_status}"
                 )
             else:
                 lines.append(
-                    f"  ~ {after['file']}::{after['function']}  "
+                    f"  ~ {_f(after)}  "
                     f"(body changed; status={new_status})"
                 )
     return "\n".join(lines) + "\n"

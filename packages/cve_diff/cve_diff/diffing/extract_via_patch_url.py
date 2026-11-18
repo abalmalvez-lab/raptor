@@ -37,12 +37,24 @@ from cve_diff.diffing import shape_dynamic
 from cve_diff.diffing.extract_via_gitlab_api import _gitlab_host_and_slug
 
 _TIMEOUT_S = 10
+
+# Git SHA shape: 7-40 lowercase hex chars. Mirrors the canonical
+# _SHA_RE in extract_via_gitlab_api; defined locally to avoid the
+# already-deep import chain.
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+# Per-line cap during unified-diff parsing. Patches with a single
+# multi-MB line (e.g. minified JS, generated source, or hostile
+# input) would otherwise materialise one giant Python string per
+# splitlines() iteration; truncating before the regex bounds peak
+# memory.
+_MAX_DIFF_LINE_BYTES = 64 * 1024
 _USER_AGENT = "cve-diff/0.1 (+https://github.com/cve-diff)"
 _MAX_BYTES = 5_000_000  # 5MB cap on patch body
 
 
 @functools.lru_cache(maxsize=1)
-def _client() -> "EgressClient":
+def _client() -> EgressClient:
     """Allowlisted egress client (curated forge hosts only).
 
     Pre-2026-05-04 this returned a bare UrllibClient with no host
@@ -68,8 +80,14 @@ def _patch_url_for(ref: RepoRef) -> str | None:
     unavailable.
     """
     url = (ref.repository_url or "").strip()
-    sha = (ref.fix_commit or "").strip()
+    sha = (ref.fix_commit or "").strip().lower()
     if not url or not sha:
+        return None
+    # SHA shape validation — refuse anything containing `?`, `#`,
+    # `&`, CRLF, or other URL-control characters. Without this gate,
+    # a poisoned advisory SHA like ``abc?token=`` smuggles query
+    # parameters into the constructed forge URL.
+    if not _SHA_RE.fullmatch(sha):
         return None
 
     # GitHub
@@ -104,12 +122,24 @@ def _patch_url_for(ref: RepoRef) -> str | None:
     #     and `savannah.gnu.org` both legitimate); reject all
     #     attacker-controlled variants.
     from core.url_patterns import is_kernel_org_url
-    from urllib.parse import urlsplit
+    from urllib.parse import urlsplit, urlunsplit
+
+    def _cgit_base(u: str) -> str:
+        # Drop any query/fragment BEFORE appending the cgit commit
+        # query. A stable-branch repository_url like
+        # ``.../linux.git/?h=linux-5.4.y`` would otherwise keep its
+        # query (and defeat the ``.git`` suffix strip, since the query
+        # follows ``.git``), producing a malformed double-`?` URL and
+        # silently losing the patch_url source.
+        try:
+            p = urlsplit(u)
+            u = urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+        except ValueError:
+            pass
+        return u.rstrip("/").removesuffix(".git")
+
     if is_kernel_org_url(url):
-        base = url.rstrip("/")
-        if base.endswith(".git"):
-            base = base[:-4]
-        return f"{base}/commit/?id={sha}&format=patch"
+        return f"{_cgit_base(url)}/commit/?id={sha}&format=patch"
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -120,16 +150,10 @@ def _patch_url_for(ref: RepoRef) -> str | None:
     # `/cgit/` as a path component is the cgit route convention,
     # but require it to be a true path component):
     if "/cgit/" in path:
-        base = url.rstrip("/")
-        if base.endswith(".git"):
-            base = base[:-4]
-        return f"{base}/commit/?id={sha}&format=patch"
+        return f"{_cgit_base(url)}/commit/?id={sha}&format=patch"
     if host in ("git.savannah.gnu.org", "savannah.gnu.org",
                 "git.savannah.nongnu.org", "savannah.nongnu.org"):
-        base = url.rstrip("/")
-        if base.endswith(".git"):
-            base = base[:-4]
-        return f"{base}/commit/?id={sha}&format=patch"
+        return f"{_cgit_base(url)}/commit/?id={sha}&format=patch"
 
     return None
 
@@ -175,7 +199,15 @@ def _parse_unified_diff(text: str) -> list[tuple[str, int]]:
     out: list[tuple[str, int]] = []
     current: str | None = None
     hunks = 0
+    # Stream line-by-line via splitlines(keepends=False) with an
+    # additional per-line length cap. ``text.splitlines()`` on a
+    # patch with a single multi-MB line allocates one giant string —
+    # same peak-memory shape as no cap at all. Truncate excessive
+    # lines before the regex match runs so neither ``_DIFF_GIT_RE``
+    # nor downstream string slicing sees the long-line case.
     for raw_line in text.splitlines():
+        if len(raw_line) > _MAX_DIFF_LINE_BYTES:
+            raw_line = raw_line[:_MAX_DIFF_LINE_BYTES]
         m = _DIFF_GIT_RE.match(raw_line)
         if m:
             if current is not None:
@@ -187,6 +219,19 @@ def _parse_unified_diff(text: str) -> list[tuple[str, int]]:
     if current is not None:
         out.append((current, hunks))
     return out
+
+
+def _diff_only(body: str) -> str:
+    """Return the diff portion of a format-patch email body.
+
+    Slices from the first line-anchored ``diff --git `` header. When no
+    such header exists the body is returned unchanged (the caller's
+    parse step then rejects it as unparseable).
+    """
+    idx = body.find("diff --git ")
+    while idx > 0 and body[idx - 1] != "\n":
+        idx = body.find("diff --git ", idx + 1)
+    return body[idx:] if idx >= 0 else body
 
 
 def extract_via_patch_url(cve_id: str, ref: RepoRef) -> DiffBundle | None:
@@ -217,6 +262,14 @@ def extract_via_patch_url(cve_id: str, ref: RepoRef) -> DiffBundle | None:
     if not body or not body.strip():
         return None
 
+    # Keep only the diff portion. A ``.patch`` response is a full
+    # format-patch email — mail headers + commit message + diffstat,
+    # THEN the unified diff. The clone/API bundles carry only diff
+    # bytes, and the agreement byte-delta comparison assumes comparable
+    # units: a small fix with a normal-sized commit message would
+    # otherwise systematically grade partial/disagree against an
+    # identical clone extraction.
+    body = _diff_only(body)
     parsed = _parse_unified_diff(body)
     if not parsed:
         return None
@@ -234,7 +287,7 @@ def extract_via_patch_url(cve_id: str, ref: RepoRef) -> DiffBundle | None:
 
     slug = extract_github_slug(ref.repository_url or "")
 
-    def _no_languages_fetch(_slug: str):
+    def _no_languages_fetch(_slug: str) -> None:
         # Best-effort: the patch URL path may be running against a forge
         # that doesn't expose a languages endpoint. shape_dynamic falls
         # back to its offline classifier.

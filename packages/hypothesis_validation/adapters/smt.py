@@ -3,7 +3,7 @@
 SMT is the right tool when the hypothesis is "this path is reachable
 under these constraints" or "these branch conditions are mutually
 exclusive". The LLM expresses constraints as line-separated text in
-the syntax that packages/codeql/smt_path_validator accepts:
+the syntax that core/smt_solver/path_feasibility accepts:
 
     size > 0
     offset + length <= buffer_size
@@ -14,33 +14,48 @@ The adapter feeds those into Z3 and reports satisfiability:
 
     sat       — there exist concrete inputs that satisfy all constraints.
                 For "is this path reachable" hypotheses → CONFIRMED, with
-                the model values surfaced as match details.
+                the model values surfaced as match details. Only reported
+                when EVERY condition parsed — sat over a subset proves
+                nothing about the full path, so partially-parsed sat is
+                surfaced as a tool failure naming the dropped conditions.
     unsat     — constraints are mutually exclusive, no input can satisfy
-                them. For "is this path reachable" hypotheses → REFUTED.
-                The unsat core names the conflicting constraints.
+                them. For "is this path reachable" hypotheses → REFUTED;
+                for "these constraints are mutually exclusive / the path
+                is infeasible" hypotheses → CONFIRMED. The evidence
+                carries empty_matches_conclusive; the verdict DIRECTION
+                is derived mechanically from the hypothesis's declared
+                ``polarity`` (undeclared polarity fails closed to
+                inconclusive rather than letting the evaluating LLM's
+                phrasing-aware claim pick the label — see
+                ``verdict.verdict_from``). Sound even when some
+                conditions were dropped as unparseable.
     unknown   — Z3 unavailable, all constraints unparseable, or solver
                 timed out. The runner converts to inconclusive.
 
-Different from the other adapters: there is no source code being scanned.
-The "matches" are Z3 model values (concrete input bytes that trigger the
-path). The `target` argument is informational only.
+Call heads do not establish callee contracts. Opaque-call SAT assignments
+are conditional models, not verified call executions; call-dependent UNSAT
+cores likewise cannot supply conclusive path evidence. Independent scalar
+contradictions remain usable. Name-based call summaries are disabled.
 
-Research basis: SAILOR (arXiv:2604.06506) used SMT to validate LLM-
-identified suspicious paths, achieving 379 vulnerabilities found vs 12
-for pure-agentic approaches.
+Different from the other adapters: there is no source code being scanned.
+The "matches" are values satisfying the supplied mathematical predicates;
+they do not establish source execution. The `target` argument is
+informational only.
+
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
 
-from packages.codeql.smt_path_validator import (
+from core.smt_solver.path_feasibility import (
     PathCondition,
     PathSMTResult,
     check_path_feasibility,
+    check_path_feasibility_dual,
 )
 
-from .base import ToolAdapter, ToolCapability, ToolEvidence
+from core.smt_solver.session import query_budget
 
+from .base import ToolAdapter, ToolCapability, ToolEvidence
 
 _SYNTAX_EXAMPLE = """\
 # Each non-empty line is a single path condition. Conditions must all
@@ -61,14 +76,14 @@ def _z3_available() -> bool:
     """Check whether Z3 is importable. Imported lazily to avoid forcing
     z3-solver as a hard dependency at import time."""
     try:
-        from core.smt_solver import z3_available  # type: ignore
+        from core.smt_solver import z3_available  # type: ignore[import-not-found]
         return z3_available()
-    except Exception:
+    except Exception:  # noqa: BLE001 — optional dependency probe; any failure means "not available"
         return False
 
 
 class SMTAdapter(ToolAdapter):
-    """Adapter wrapping packages/codeql/smt_path_validator for hypothesis validation.
+    """Adapter wrapping core/smt_solver/path_feasibility for hypothesis validation.
 
     Args:
         bv_profile: Optional BVProfile from core.smt_solver. Defaults to
@@ -77,7 +92,7 @@ class SMTAdapter(ToolAdapter):
             conditions.
     """
 
-    def __init__(self, bv_profile=None):
+    def __init__(self, bv_profile=None) -> None:
         self._bv_profile = bv_profile  # resolved lazily — see _profile()
 
     @property
@@ -101,7 +116,7 @@ class SMTAdapter(ToolAdapter):
                 "Source-code scanning — SMT does not look at code",
                 "String/regex patterns",
                 "Pointer chasing or memory aliasing",
-                "Anything not expressible in linear bit-vector arithmetic",
+                "Unsupported predicate syntax or unmodeled source-language semantics",
             ],
             syntax_example=_SYNTAX_EXAMPLE,
             languages=[],  # language-agnostic
@@ -113,22 +128,31 @@ class SMTAdapter(ToolAdapter):
         target: Path,
         *,
         timeout: int = 60,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
     ) -> ToolEvidence:
         """Check satisfiability of LLM-generated path conditions.
 
         The `target` and `env` arguments are accepted for protocol
         uniformity but ignored — SMT operates on the constraint text only.
-        `timeout` is also ignored at present (Z3 has its own internal
-        timeout via DEFAULT_TIMEOUT_MS in core.smt_solver).
+        `timeout` is a nonnegative integer in seconds. It shares a soft
+        query budget across both profiles and optional solver subqueries,
+        while retaining each factory solver's smaller per-query cap. It
+        is not a process wall-time limit.
         """
+        if type(timeout) is not int or timeout < 0:
+            return ToolEvidence(tool=self.name, rule=rule, success=False,
+                                error="timeout must be a nonnegative integer in seconds")
         if not self.is_available():
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False,
                 error="z3-solver is not installed",
             )
 
-        conditions = _parse_conditions(rule)
+        try:
+            conditions = _parse_conditions(rule)
+        except (ValueError, TypeError) as exc:
+            return ToolEvidence(tool=self.name, rule=rule, success=False,
+                                error=f"invalid SMT condition syntax: {exc}")
         if not conditions:
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False,
@@ -137,26 +161,88 @@ class SMTAdapter(ToolAdapter):
 
         try:
             profile = self._profile()
-            result: PathSMTResult = check_path_feasibility(
-                conditions, profile=profile,
+            # Signedness honesty: the default uint64 profile is a
+            # GUESS — under it the ubiquitous signed error check
+            # (``ret < 0``) encodes as ``ULT(ret, 0)``, unsat, so one
+            # signedness-mismatched guard would refute (and thereby
+            # confirm infeasibility for) a perfectly live path. When
+            # the operator did not pin a profile, an unsat verdict is
+            # honored only if BOTH signedness profiles agree
+            # (check_path_feasibility_dual); a caller-supplied
+            # bv_profile asserts known signedness and keeps the
+            # cheaper single-profile check.
+            check = (
+                check_path_feasibility if self._bv_profile is not None
+                else check_path_feasibility_dual
             )
-        except Exception as e:
+            with query_budget(timeout * 1000):
+                result: PathSMTResult = check(
+                    conditions, profile=profile, use_call_summaries=False,
+                )
+        except Exception as e:  # noqa: BLE001 — solver failure becomes tool-evidence error, never a crash
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False,
                 error=f"SMT solver error: {e}",
             )
 
-        if result.feasible is None:
+        if result.feasible is True and result.anon_var_map:
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False,
-                error=result.reasoning or "SMT verdict unknown",
+                error="unbound call results: a conditional model is not a verified call execution",
+            )
+
+        # A profile does not bind a callee's identity or return type. A
+        # conditional contradiction involving opaque call terms must not
+        # become conclusive evidence about the hypothesized path.
+        if (result.feasible is False and result.anon_var_map
+                and result.refutation_uses_call_terms is not False):
+            return ToolEvidence(
+                tool=self.name, rule=rule, success=False,
+                error="unbound call return types: encoded contradiction is conditional",
+            )
+
+        if result.smt_available is not True or type(result.feasible) is not bool:
+            reason = result.reasoning or "SMT verdict unknown"
+            dropped = list(result.unknown or [])
+            if dropped:
+                shown = ", ".join(repr(c) for c in dropped[:5])
+                more = f" (+{len(dropped) - 5} more)" if len(dropped) > 5 else ""
+                reason += f"; {len(dropped)} unparseable condition(s): {shown}{more}"
+            return ToolEvidence(
+                tool=self.name, rule=rule, success=False,
+                error=reason,
+            )
+
+        dropped = list(result.unknown or [])
+
+        if result.feasible and (dropped or result.unknown_reasons):
+            # sat over a strict subset of the conditions is NOT proof
+            # that the full path is feasible — adding back the dropped
+            # (unparseable) conditions can only shrink the solution
+            # space. Reporting the subset-sat as clean witness evidence
+            # would let a hypothesis be graded confirmed on a
+            # near-empty check, so surface it as a tool failure
+            # (mechanically inconclusive) naming what was dropped.
+            # The unsat side below stays sound under dropped
+            # conditions: unsat over a subset implies unsat overall.
+            shown = ", ".join(repr(c) for c in dropped[:5])
+            more = f" (+{len(dropped) - 5} more)" if len(dropped) > 5 else ""
+            return ToolEvidence(
+                tool=self.name, rule=rule, success=False,
+                error=(
+                    f"sat over a partial constraint set only — "
+                    f"{len(dropped)} of {len(conditions)} condition(s) "
+                    f"dropped as unparseable: {shown}{more}; rephrase "
+                    f"the dropped conditions in linear bit-vector form"
+                ),
             )
 
         # Build evidence. For sat (feasible=True), expose the witness as
         # "matches" — each model entry is a concrete input value. For unsat
-        # (feasible=False), there are no matches; success=True with empty
-        # matches means refuted.
-        matches: List[Dict] = []
+        # (feasible=False), there are no matches; the empty match list is
+        # itself the tool's definitive result (see
+        # empty_matches_conclusive below).
+        matches: list[dict] = []
         if result.feasible and result.model:
             for var, value in sorted(result.model.items()):
                 matches.append({
@@ -175,7 +261,20 @@ class SMTAdapter(ToolAdapter):
                 if matches else "sat — no model returned"
             )
         else:
-            summary = "unsat — constraints are mutually exclusive"
+            # Phrase both readings so the evaluating LLM can map the
+            # proof onto the hypothesis's phrasing: unsat REFUTES a
+            # reachability claim and CONFIRMS an infeasibility /
+            # mutual-exclusivity claim.
+            summary = (
+                "unsat — constraints are mutually exclusive (refutes a "
+                "reachability claim; confirms an infeasibility claim)"
+            )
+            if dropped:
+                summary += (
+                    f" — note: {len(dropped)} unparseable condition(s) "
+                    f"were excluded (sound: unsat over a subset implies "
+                    f"unsat over the whole set)"
+                )
 
         return ToolEvidence(
             tool=self.name,
@@ -183,6 +282,13 @@ class SMTAdapter(ToolAdapter):
             success=True,
             matches=matches,
             summary=summary,
+            # unsat is a definitive proof despite the empty match list.
+            # The flag tells the verdict ladder this emptiness is a
+            # tool result; the ladder then derives the verdict
+            # direction from the hypothesis's declared polarity
+            # (never from the LLM's post-hoc reading).
+            empty_matches_conclusive=not result.feasible,
+            predicate_verdict="sat" if result.feasible else "unsat",
         )
 
     def _profile(self):
@@ -195,7 +301,7 @@ class SMTAdapter(ToolAdapter):
         return BV_C_UINT64
 
 
-def _parse_conditions(rule: str) -> List[PathCondition]:
+def _parse_conditions(rule: str) -> list[PathCondition]:
     """Convert the LLM's line-separated constraint text into PathCondition objects.
 
     Format:
@@ -204,8 +310,8 @@ def _parse_conditions(rule: str) -> List[PathCondition]:
         ! text           — constraint that must NOT hold (negated)
         <blank>          — ignored
     """
-    conditions: List[PathCondition] = []
-    for idx, raw_line in enumerate(rule.splitlines()):
+    conditions: list[PathCondition] = []
+    for idx, raw_line in enumerate(str.splitlines(rule)):
         line = raw_line.strip()
         if not line:
             continue
@@ -216,7 +322,7 @@ def _parse_conditions(rule: str) -> List[PathCondition]:
             negated = True
             line = line[1:].strip()
             if not line:
-                continue
+                raise ValueError("negation requires a condition")
         conditions.append(PathCondition(
             text=line, step_index=idx, negated=negated,
         ))

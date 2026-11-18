@@ -1,0 +1,173 @@
+"""poetry.lock parser — Poetry's lockfile (TOML).
+
+Schema (Poetry 1.x):
+
+    [[package]]
+    name        = "django"
+    version     = "4.2.7"
+    optional    = false
+    python-versions = ">=3.8"
+    category    = "main"     # present in <1.5; absent in 1.5+
+
+    [package.source]
+    type       = "git" | "url" | "directory" | "file" | "legacy"
+    url        = "..."
+    reference  = "main"
+    resolved_reference = "<sha>"
+
+    [metadata]
+    lock-version = "2.0"
+
+Scope inference:
+- Poetry <1.5: ``category`` is "main" or "dev" — used directly.
+- Poetry >=1.5: ``category`` is gone; the lockfile no longer tracks
+  groups. We default to "main" with parser_confidence medium and let
+  the manifest+lockfile join restore the group later.
+
+Direct vs transitive cannot be derived from poetry.lock alone — every
+package is listed flat. We record ``direct=False`` and let the join
+pass flip rows that also appear in pyproject.toml.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from typing import Any, TYPE_CHECKING
+
+from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, lockfile_confidence
+from . import _safe_read, register
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_tomllib = None
+if sys.version_info >= (3, 11):
+    import tomllib as _tomllib            # type: ignore[no-redef,assignment]
+else:                                     # pragma: no cover — env-dependent
+    try:
+        import tomli as _tomllib          # type: ignore[no-redef]
+    except ImportError:
+        logger.warning(
+            "sca.parsers.poetry_lock: 'tomli' not installed (required on "
+            "Python <3.11) — poetry.lock files will be skipped."
+        )
+
+ECOSYSTEM = "PyPI"
+
+
+def parse(path: Path) -> list[Dependency]:
+    if _tomllib is None:
+        logger.warning(
+            "sca.parsers.poetry_lock: skipping %s — no TOML reader available",
+            path,
+        )
+        return []
+    text = _safe_read.read_bounded(path, follow_symlinks=False)
+    if text is None:
+        # ``read_bounded`` already logged the underlying reason.
+        return []
+
+    try:
+        data = _tomllib.loads(text)
+    except (_tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
+        logger.warning(
+            "sca.parsers.poetry_lock: TOML parse failed for %s: %s", path, e
+        )
+        return []
+
+    packages = data.get("package")
+    if not isinstance(packages, list):
+        return []
+
+    deps: list[Dependency] = []
+    for pkg in packages:
+        if not isinstance(pkg, dict):
+            continue
+        d = _build_dep(pkg, path)
+        if d is not None:
+            deps.append(d)
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+def _build_dep(pkg: dict[str, Any], path: Path) -> Dependency | None:
+    name = pkg.get("name")
+    version_text = pkg.get("version")
+    if not isinstance(name, str) or not name:
+        return None
+
+    source = pkg.get("source") if isinstance(pkg.get("source"), dict) else None
+    pin_style: PinStyle
+    version: str | None
+    confidence_reason: str
+
+    if source and source.get("type") == "git":
+        pin_style = PinStyle.GIT
+        # Prefer the resolved (post-fetch) commit if Poetry recorded it;
+        # fall back to the operator-supplied reference.
+        ref = source.get("resolved_reference") or source.get("reference")
+        version = ref if isinstance(ref, str) else (
+            version_text if isinstance(version_text, str) else None
+        )
+        confidence_reason = "poetry.lock git source"
+    elif source and source.get("type") in ("file", "directory", "url"):
+        pin_style = PinStyle.PATH
+        version = version_text if isinstance(version_text, str) else None
+        confidence_reason = f"poetry.lock {source.get('type')} source"
+    else:
+        version = version_text if isinstance(version_text, str) else None
+        pin_style = PinStyle.EXACT if version else PinStyle.WILDCARD
+        confidence_reason = "poetry.lock resolved entry"
+
+    scope = _infer_scope(pkg)
+
+    return Dependency(
+        ecosystem=ECOSYSTEM,
+        name=pep503_name(name),
+        version=version,
+        declared_in=path,
+        scope=scope,
+        is_lockfile=True,
+        pin_style=pin_style,
+        direct=False,
+        purl=build_purl("pypi", pep503_name(name), version),
+        parser_confidence=_confidence(pin_style, version, confidence_reason),
+    )
+
+
+def _infer_scope(pkg: dict[str, Any]) -> str:
+    """Map Poetry's category (when present) onto our scope buckets."""
+    cat = pkg.get("category")
+    if isinstance(cat, str):
+        if cat == "dev":
+            return "dev"
+        return "main"
+    # Poetry >=1.5 dropped the category field; without it, default to
+    # main with reduced confidence — see _confidence().
+    return "main"
+
+
+def _confidence(
+    pin_style: PinStyle,
+    version: str | None,
+    base_reason: str,
+) -> Confidence:
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason=base_reason,
+        path_reason=base_reason,
+        unversioned_reason="poetry.lock entry without version",
+        resolved_reason=base_reason,
+    )
+
+
+
+register(filenames=["poetry.lock"])(parse)

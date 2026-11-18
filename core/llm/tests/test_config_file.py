@@ -1,40 +1,94 @@
 """Tests for config file reading, model defaulting, and migration detection."""
 
+from core.testing.module_registry import mock_module_registry
+
 import json
 import os
-import pytest
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
-# packages/llm_analysis/tests/test_config_file.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
+import pytest
+
 
 from core.llm.config import (
-    _get_configured_models, _get_best_thinking_model,
-    _get_default_fallback_models, _model_config_from_entry,
+    _get_best_thinking_model,
+    _get_configured_models,
+    _get_default_fallback_models,
+    _model_config_from_entry,
 )
-from core.llm.model_data import PROVIDER_DEFAULT_MODELS, MODEL_COSTS, MODEL_LIMITS
+from core.llm.model_data import MODEL_COSTS, MODEL_LIMITS, PROVIDER_DEFAULT_MODELS
+
+
+from types import ModuleType
+from core.testing.module_bindings import mock_module_attribute
+
+_discovery_imports = ModuleType("discovery_fixture_imports")
 
 
 @pytest.fixture(autouse=True)
-def _restore_thinking_model_cache():
-    """Snapshot core.llm.config's module-level cache before each test and
-    restore after. Many tests in this file deliberately poke
-    `_thinking_model_checked` / `_cached_thinking_model` to force a
-    re-evaluation against tmp_path config; without restore, the module
-    is left in an inconsistent state and later tests in the suite (e.g.
-    packages/llm_analysis/tests/test_dispatch.py::test_multi_model_flags)
-    re-read the real environment and pick up unintended fallbacks.
-    """
+def _owned_discovery_imports(monkeypatch):
+    import core.llm.detection as owner
+    import importlib.metadata
+    from core.testing.module_views import scoped_function_imports
+
+    with scoped_function_imports(owner, ('_check_litellm_installed',), {'importlib.metadata': importlib.metadata}) as imports:
+        try:
+            monkeypatch.setitem(globals(), "_discovery_imports", imports)
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+
+@pytest.fixture(autouse=True)
+def _restore_llm_caches(monkeypatch):
+    """Own cold selection and detection caches instead of exposing caller entries."""
     import core.llm.config as cfg
-    saved_checked = getattr(cfg, "_thinking_model_checked", None)
-    saved_cached = getattr(cfg, "_cached_thinking_model", None)
-    try:
-        yield
-    finally:
-        cfg._thinking_model_checked = saved_checked
-        cfg._cached_thinking_model = saved_cached
+    import core.llm.detection as det
+    from core.testing.llm_state import isolated_llm_resolution
+
+    with isolated_llm_resolution(cfg, det):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch, tmp_path):
+    """Strip ambient provider env signals and pin the Anthropic model
+    resolver for every test in this file.
+
+    Two host-dependences this kills:
+
+    * ``_warn_unusable_keys`` iterates EVERY provider env key, and the
+      TestWarnUnusableKeys assertions read ``warning.call_args`` (the
+      LAST call) — an ambient key (e.g. MISTRAL_API_KEY with the
+      openai SDK patched unavailable) made the last warning a
+      different provider's and flipped both the warns and the
+      no-warning tests. Same scrub-family precedent as the dispatcher
+      conftest (core/llm/dispatcher/tests/conftest.py).
+    * ``_get_configured_models`` routes anthropic entries through
+      ``resolve_anthropic``, which lazily fetches the live
+      ``/v1/models`` inventory (5 s timeout) whenever an entry
+      carries an api_key — the config-reading fixtures here do. Pin
+      the resolver to identity so no unit test in this file can emit
+      a network call (or pay the timeout) from a keyed host.
+    """
+    # Default discovery and migrations must stay inside the test's own home.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("RAPTOR_CONFIG", raising=False)
+    monkeypatch.setattr("core.llm.detection._get_available_ollama_models", lambda: [])
+    monkeypatch.setattr("core.llm.config._get_available_ollama_models", lambda: [])
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+                "MISTRAL_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
+                "RAPTOR_LLM_SOCKET"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "core.llm.model_resolution.resolve_anthropic",
+        lambda name, api_key: name,
+    )
 
 
 class TestGetConfiguredModels:
@@ -275,6 +329,39 @@ class TestMigrationDetection:
         assert captured.out == ""
 
 
+class TestMigrationGuidanceAlwaysRuns:
+    """The guidance check runs whether or not litellm is installed.
+
+    ``detect_llm_availability`` must call ``_check_litellm_migration``
+    even when litellm is present, so a swallowed auto-migration
+    failure still surfaces the manual instructions."""
+
+    def _detect_with(self, monkeypatch, litellm_installed):
+        from core.llm import detection
+        calls = []
+        monkeypatch.setattr(
+            detection, "_check_litellm_installed",
+            lambda: litellm_installed,
+        )
+        monkeypatch.setattr(
+            detection, "_check_litellm_migration",
+            lambda: calls.append("migration-check"),
+        )
+        monkeypatch.setattr(detection, "_warn_unusable_keys", lambda: None)
+        monkeypatch.setattr(
+            detection, "_get_available_ollama_models", lambda: [],
+        )
+        monkeypatch.setattr(detection, "_cached_llm_availability", None)
+        detection.detect_llm_availability()
+        return calls
+
+    def test_migration_check_runs_when_litellm_found(self, monkeypatch):
+        assert self._detect_with(monkeypatch, True) == ["migration-check"]
+
+    def test_migration_check_still_runs_when_litellm_absent(self, monkeypatch):
+        assert self._detect_with(monkeypatch, False) == ["migration-check"]
+
+
 try:
     import yaml  # noqa: F401 — availability probe for the @skipif gate below
     HAS_PYYAML = True
@@ -409,7 +496,7 @@ model_list:
     def test_returns_false_without_pyyaml(self, tmp_path):
         from core.llm.detection import _try_auto_migrate
         old, new = self._make_litellm_config(tmp_path, "model_list: []")
-        with patch.dict(sys.modules, {"yaml": None}):
+        with mock_module_registry({"yaml": None}):
             result = _try_auto_migrate(old, new)
         assert result is False
         assert not new.exists()
@@ -436,6 +523,44 @@ model_list:
         data = json.loads(new.read_text())
         assert len(data["models"]) == 1
         assert data["models"][0]["model"] == "claude-opus-4-6"
+
+    def test_bedrock_entry_migrates(self, tmp_path):
+        # Bedrock is a first-class provider downstream — migration
+        # must carry its entries instead of dropping them.
+        from core.llm.detection import _try_auto_migrate
+        old, new = self._make_litellm_config(tmp_path, """
+model_list:
+  - model_name: bedrock-opus
+    litellm_params:
+      model: bedrock/anthropic.claude-opus-4-6
+  - model_name: claude
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+""")
+        result = _try_auto_migrate(old, new)
+        assert result is True
+        models = json.loads(new.read_text())["models"]
+        providers = {m["provider"] for m in models}
+        assert "bedrock" in providers
+        assert "anthropic" in providers
+        bedrock = next(m for m in models if m["provider"] == "bedrock")
+        assert bedrock["model"] == "anthropic.claude-opus-4-6"
+
+    def test_unsupported_provider_still_skipped(self, tmp_path):
+        from core.llm.detection import _try_auto_migrate
+        old, new = self._make_litellm_config(tmp_path, """
+model_list:
+  - model_name: vertex
+    litellm_params:
+      model: vertex_ai/gemini-pro
+  - model_name: claude
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+""")
+        result = _try_auto_migrate(old, new)
+        assert result is True
+        models = json.loads(new.read_text())["models"]
+        assert {m["provider"] for m in models} == {"anthropic"}
 
     def test_prints_needs_keys_warning(self, tmp_path, capsys):
         from core.llm.detection import _try_auto_migrate
@@ -471,7 +596,7 @@ class TestGenerateSampleConfig:
     def test_no_api_key_in_json_body(self):
         from core.llm.detection import generate_sample_config
         sample = generate_sample_config()
-        lines = [l for l in sample.splitlines() if not l.strip().startswith("//")]
+        lines = [line for line in sample.splitlines() if not line.strip().startswith("//")]
         data = json.loads("\n".join(lines))
         for model in data["models"]:
             assert "api_key" not in model
@@ -490,7 +615,7 @@ class TestCompromisedLitellmDetection:
     def test_182_8_causes_system_exit(self, mock_home, tmp_path):
         mock_home.return_value = tmp_path
         from core.llm.detection import _check_litellm_installed
-        with patch("importlib.metadata.version", return_value="1.82.8"):
+        with mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.82.8"):
             with pytest.raises(SystemExit) as exc_info:
                 _check_litellm_installed()
             assert "1.82.8" in str(exc_info.value)
@@ -500,7 +625,7 @@ class TestCompromisedLitellmDetection:
     def test_182_7_causes_system_exit(self, mock_home, tmp_path):
         mock_home.return_value = tmp_path
         from core.llm.detection import _check_litellm_installed
-        with patch("importlib.metadata.version", return_value="1.82.7"):
+        with mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.82.7"):
             with pytest.raises(SystemExit) as exc_info:
                 _check_litellm_installed()
             assert "1.82.7" in str(exc_info.value)
@@ -509,7 +634,7 @@ class TestCompromisedLitellmDetection:
     def test_safe_version_no_exit(self, mock_home, tmp_path, capsys):
         mock_home.return_value = tmp_path
         from core.llm.detection import _check_litellm_installed
-        with patch("importlib.metadata.version", return_value="1.55.0"):
+        with mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.55.0"):
             _check_litellm_installed()
         captured = capsys.readouterr()
         assert "malicious" not in captured.out
@@ -518,9 +643,9 @@ class TestCompromisedLitellmDetection:
     def test_182_8_shows_shell_removal(self, mock_home, tmp_path, capsys):
         mock_home.return_value = tmp_path
         from core.llm.detection import _check_litellm_installed
-        with patch("importlib.metadata.version", return_value="1.82.8"):
-            with pytest.raises(SystemExit):
-                _check_litellm_installed()
+        with mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.82.8"), \
+             pytest.raises(SystemExit):
+            _check_litellm_installed()
         captured = capsys.readouterr()
         assert "Do NOT use pip" in captured.out
         # Operator gets a guided two-step removal scoped to actual
@@ -536,9 +661,9 @@ class TestCompromisedLitellmDetection:
     def test_182_7_shows_pip_removal(self, mock_home, tmp_path, capsys):
         mock_home.return_value = tmp_path
         from core.llm.detection import _check_litellm_installed
-        with patch("importlib.metadata.version", return_value="1.82.7"):
-            with pytest.raises(SystemExit):
-                _check_litellm_installed()
+        with mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.82.7"), \
+             pytest.raises(SystemExit):
+            _check_litellm_installed()
         captured = capsys.readouterr()
         assert "pip uninstall litellm" in captured.out
 
@@ -561,7 +686,7 @@ model_list:
 
         from core.llm.detection import _check_litellm_installed
         with patch("core.llm.detection.Path.home", return_value=tmp_path), \
-             patch("importlib.metadata.version", return_value="1.55.0"):
+             mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.55.0"):
             _check_litellm_installed()
 
         assert new_config.exists()
@@ -579,7 +704,7 @@ model_list:
 
         from core.llm.detection import _check_litellm_installed
         with patch("core.llm.detection.Path.home", return_value=tmp_path), \
-             patch("importlib.metadata.version", return_value="1.55.0"):
+             mock_module_attribute(_discovery_imports, 'importlib.metadata', 'version', return_value="1.55.0"):
             _check_litellm_installed()
 
         assert json.loads(new_config.read_text()) == {"models": []}
@@ -648,7 +773,11 @@ class TestWarnUnusableKeys:
         with patch.dict(os.environ, {}, clear=False), \
              patch("core.llm.detection.OPENAI_SDK_AVAILABLE", False), \
              patch("core.llm.detection.logger") as mock_logger:
-            os.environ.pop("OPENAI_API_KEY", None)
+            # Clear every provider key _warn_unusable_keys inspects so the
+            # "no key present" precondition holds regardless of a dev's
+            # ambient env (patch.dict restores the full environ on exit).
+            for _k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+                os.environ.pop(_k, None)
             _warn_unusable_keys()
         mock_logger.warning.assert_not_called()
 
@@ -671,8 +800,10 @@ class TestFallbackModelsFromConfig:
                    if k not in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MISTRAL_API_KEY")}
             with patch.dict(os.environ, env, clear=True):
                 import core.llm.config as cfg
+                import core.llm.detection as det
                 cfg._thinking_model_checked = False
                 cfg._cached_thinking_model = None
+                det._cached_llm_availability = None
                 fallbacks = _get_default_fallback_models()
         names = [f.model_name for f in fallbacks]
         assert "gemini-2.5-flash" in names
@@ -696,8 +827,10 @@ class TestFallbackModelsFromConfig:
                          if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MISTRAL_API_KEY")}
             with patch.dict(os.environ, env_clean, clear=True):
                 import core.llm.config as cfg
+                import core.llm.detection as det
                 cfg._thinking_model_checked = False
                 cfg._cached_thinking_model = None
+                det._cached_llm_availability = None
                 fallbacks = _get_default_fallback_models()
         flash = [f for f in fallbacks if f.model_name == "gemini-2.5-flash"]
         assert len(flash) == 1
@@ -724,11 +857,175 @@ class TestFallbackModelsFromConfig:
                          if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MISTRAL_API_KEY")}
             with patch.dict(os.environ, env_clean, clear=True):
                 import core.llm.config as cfg
+                import core.llm.detection as det
                 cfg._thinking_model_checked = False
                 cfg._cached_thinking_model = None
+                det._cached_llm_availability = None
                 fallbacks = _get_default_fallback_models()
         names = [f.model_name for f in fallbacks]
-        assert "gemini-2.5-pro" in names
+        assert "gemini-2.5-flash" in names
+        assert "gemini-2.5-pro" not in names
+
+
+class TestDatedAliasThinkingSelection:
+    """Thinking-model selection must match dated configured ids against
+    the undated pattern table — a snapshot-pinned Sonnet falling
+    through to another (pricier or weaker) entry silently changes what
+    the run pays and gets."""
+
+    def _select(self, entries, tmp_path):
+        config = tmp_path / "models.json"
+        config.write_text(json.dumps(entries))
+        with patch.dict(os.environ, {"RAPTOR_CONFIG": str(config)}):
+            import core.llm.config as cfg
+            cfg._thinking_model_checked = False
+            cfg._cached_thinking_model = None
+            return _get_best_thinking_model()
+
+    def test_dated_id_matches_own_tier(self, tmp_path):
+        result = self._select([
+            {"provider": "anthropic", "model": "claude-sonnet-4-6-20260115",
+             "api_key": "sk-a"},
+            {"provider": "gemini", "model": "gemini-2.5-flash",
+             "api_key": "sk-g"},
+        ], tmp_path)
+        assert result is not None
+        # Sonnet tier (70) outranks Flash (55); the wire name keeps the
+        # operator's dated pin.
+        assert result.provider == "anthropic"
+        assert result.model_name == "claude-sonnet-4-6-20260115"
+
+    def test_unknown_stripped_id_still_falls_through(self, tmp_path):
+        # Two-direction guard: stripping must not invent matches — an
+        # id whose undated form is not in the pattern table keeps
+        # falling through to the next configured entry.
+        result = self._select([
+            {"provider": "anthropic", "model": "claude-sonnet-9-9-20990101",
+             "api_key": "sk-a"},
+            {"provider": "gemini", "model": "gemini-2.5-flash",
+             "api_key": "sk-g"},
+        ], tmp_path)
+        assert result is not None
+        assert result.model_name == "gemini-2.5-flash"
+
+    def test_dated_id_resolves_catalog_cost_and_limits(self, tmp_path):
+        result = self._select([
+            {"provider": "anthropic", "model": "claude-sonnet-4-6-20260115",
+             "api_key": "sk-a"},
+        ], tmp_path)
+        assert result is not None
+        limits = MODEL_LIMITS["claude-sonnet-4-6"]
+        costs = MODEL_COSTS["claude-sonnet-4-6"]
+        assert result.max_tokens == limits["max_output"]
+        assert result.max_context == limits["max_context"]
+        expected_cost = (costs["input"] + costs["output"]) / 2
+        assert result.cost_per_1k_tokens == pytest.approx(expected_cost)
+
+    def test_entry_api_base_wins_cold_start(self, tmp_path):
+        # The selection path's own docs promise an explicit api_base in
+        # the entry beats the provider endpoint table.
+        result = self._select([
+            {"provider": "openai", "model": "gpt-5.4", "api_key": "sk-o",
+             "api_base": "https://gw.example.test/v1"},
+        ], tmp_path)
+        assert result is not None
+        assert result.api_base == "https://gw.example.test/v1"
+
+
+class TestClaudecodeEntryCalibration:
+    """models.json claudecode entries must get the CLI transport's
+    calibrated defaults (600s / flagship-class limits), not the cloud-API
+    120s/8192 — the subprocess + --json-schema overhead killed heavy
+    structured calls after they had already billed."""
+
+    def test_bare_claudecode_entry_gets_cli_calibration(self, monkeypatch):
+        # Sentinel path — pin-model probe disabled so the resolver never
+        # reads a host cc-probe cache.
+        monkeypatch.setenv("RAPTOR_CC_PIN_MODEL", "0")
+        monkeypatch.delenv("RAPTOR_CC_MODEL", raising=False)
+        mc = _model_config_from_entry({"provider": "claudecode"})
+        assert mc.timeout == 600
+        flagship = MODEL_LIMITS.get(PROVIDER_DEFAULT_MODELS["anthropic"], {})
+        assert mc.max_tokens == flagship.get("max_output", 32000)
+        assert mc.max_context == flagship.get("max_context", 1000000)
+
+    def test_explicit_claudecode_fields_still_win(self, monkeypatch):
+        monkeypatch.setenv("RAPTOR_CC_PIN_MODEL", "0")
+        monkeypatch.delenv("RAPTOR_CC_MODEL", raising=False)
+        mc = _model_config_from_entry({
+            "provider": "claudecode", "timeout": 90,
+            "max_output": 4096, "max_context": 200000,
+        })
+        assert mc.timeout == 90
+        assert mc.max_tokens == 4096
+        assert mc.max_context == 200000
+
+    def test_cloud_entries_keep_generic_defaults(self):
+        # Two-direction guard: the CLI calibration must not leak onto
+        # cloud-API providers.
+        mc = _model_config_from_entry({
+            "provider": "gemini", "model": "some-unknown-model",
+            "api_key": "k",
+        })
+        assert mc.timeout == 120
+        assert mc.max_tokens == 8192
+
+
+class TestEntryApiBaseHonoured:
+    """An explicit api_base in a models.json entry must reach the
+    ModelConfig — otherwise the operator's key is sent to the public
+    endpoint instead of their gateway."""
+
+    def test_entry_api_base_wins(self):
+        mc = _model_config_from_entry({
+            "provider": "openai", "model": "gpt-5.2", "api_key": "k",
+            "api_base": "https://gw.example.test/v1",
+        })
+        assert mc.api_base == "https://gw.example.test/v1"
+
+    def test_default_endpoint_without_entry_api_base(self):
+        # Two-direction guard: no entry field -> provider endpoint table.
+        from core.llm.model_data import PROVIDER_ENDPOINTS
+        mc = _model_config_from_entry({
+            "provider": "openai", "model": "gpt-5.2", "api_key": "k",
+        })
+        assert mc.api_base == PROVIDER_ENDPOINTS["openai"]
+
+
+class TestFallbackPrimarySkipNormalized:
+    """The primary-skip in _get_default_fallback_models must compare the
+    NORMALIZED entry identity — the raw entry tuple misses provider
+    derivation / model backfill / Bedrock id normalization and re-adds
+    the primary as its own fallback."""
+
+    def test_derived_bedrock_primary_not_its_own_fallback(self, monkeypatch):
+        import core.llm.config as cfg
+        entries = [
+            # Provider-less Bedrock-shaped id: normalizes to
+            # ("bedrock", "anthropic.claude-opus-4-7") on the mantle
+            # surface — the raw tuple ("", "us.anthropic...") never
+            # matched the normalized primary key.
+            {"model": "us.anthropic.claude-opus-4-7"},
+            {"provider": "gemini", "model": "gemini-2.5-flash",
+             "api_key": "k", "role": "fallback"},
+        ]
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "tok")
+        monkeypatch.setattr(cfg, "_get_configured_models", lambda: entries)
+        monkeypatch.setattr(
+            cfg, "_get_default_primary_model",
+            lambda: _model_config_from_entry(entries[0]),
+        )
+        monkeypatch.setattr(cfg, "_get_available_ollama_models", lambda: [])
+        monkeypatch.setattr(
+            cfg, "detect_llm_availability",
+            lambda: type("A", (), {"external_llm": True})(),
+        )
+        fallbacks = cfg._get_default_fallback_models()
+        names = [f.model_name for f in fallbacks]
+        assert "anthropic.claude-opus-4-7" not in names
+        assert "us.anthropic.claude-opus-4-7" not in names
+        # Two-direction guard: the normalized skip must not swallow
+        # genuinely distinct entries.
         assert "gemini-2.5-flash" in names
 
 
@@ -752,3 +1049,154 @@ class TestModelDataConsistency:
         for model, limits in MODEL_LIMITS.items():
             assert "max_context" in limits, f"'{model}' missing 'max_context'"
             assert "max_output" in limits, f"'{model}' missing 'max_output'"
+
+
+class TestOperatorPrimaryOverride:
+    """The operator's ``--model`` directive must reach every downstream
+    consumer, not just the actor loop. Regression this guards against:
+    ``LLMConfig()`` no-arg constructions were silently falling through
+    to the models.json-configured "thinking model" (e.g. gemini-2.5-pro),
+    inflating per-iteration cost ~20× on tool-loop runs and breaking
+    the "if I pass --model, use that model" operator contract.
+    """
+
+    def test_override_short_circuits_thinking_model_path(self, tmp_path):
+        """When the override is set, ``_get_default_primary_model``
+        returns it unconditionally — even when a higher-scored
+        thinking model is configured."""
+        import core.llm.config as cfg
+        from core.llm.config import (
+            ModelConfig,
+            _get_default_primary_model,
+            set_operator_primary_override,
+        )
+
+        conf = tmp_path / "models.json"
+        conf.write_text(json.dumps({
+            "models": [
+                {"provider": "gemini", "model": "gemini-2.5-pro",
+                 "api_key": "test-key"},
+            ]
+        }))
+        with patch.dict(os.environ, {"RAPTOR_CONFIG": str(conf)}, clear=False):
+            cfg._thinking_model_checked = False
+            cfg._cached_thinking_model = None
+            picked = _get_default_primary_model()
+            assert picked is not None
+            assert picked.provider == "gemini"
+
+            override = ModelConfig(
+                provider="anthropic", model_name="claude-opus-4-7",
+                api_key="op-key", max_tokens=1000, max_context=200000,
+                temperature=0.7, cost_per_1k_tokens=0.015,
+            )
+            set_operator_primary_override(override)
+            picked2 = _get_default_primary_model()
+            assert picked2 is override
+            assert picked2.provider == "anthropic"
+            assert picked2.model_name == "claude-opus-4-7"
+
+    def test_override_beats_prefer_arg(self):
+        """``prefer=`` is a downstream consumer's hint. The operator's
+        explicit override beats it — otherwise a sub-consumer with a
+        specific provider preference could route the run through a
+        different model than what the operator asked for."""
+        from core.llm.config import (
+            ModelConfig,
+            _get_default_primary_model,
+            set_operator_primary_override,
+        )
+
+        override = ModelConfig(
+            provider="anthropic", model_name="claude-opus-4-7",
+            api_key="op-key", max_tokens=1000, max_context=200000,
+            temperature=0.7, cost_per_1k_tokens=0.015,
+        )
+        set_operator_primary_override(override)
+        picked = _get_default_primary_model(prefer=["openai", "gemini"])
+        assert picked is override
+
+    def test_llmconfig_no_arg_honours_override(self):
+        """The whole reason for the override — every anonymous
+        ``LLMConfig()`` construction picks up the operator's choice.
+        Without this, sub-consumers deep inside a run (mutator,
+        refuter, judge, brain-adjacent LLMs) would silently take the
+        thinking-model path."""
+        from core.llm.config import (
+            LLMConfig,
+            ModelConfig,
+            set_operator_primary_override,
+        )
+
+        override = ModelConfig(
+            provider="anthropic", model_name="claude-opus-4-7",
+            api_key="op-key", max_tokens=1000, max_context=200000,
+            temperature=0.7, cost_per_1k_tokens=0.015,
+        )
+        set_operator_primary_override(override)
+        cfg = LLMConfig()
+        assert cfg.primary_model is override
+
+    def test_override_none_restores_default_path(self, tmp_path):
+        """Clearing the override with ``None`` restores the pre-fix
+        resolution chain — no permanent state change."""
+        import core.llm.config as cfg
+        from core.llm.config import (
+            ModelConfig,
+            _get_default_primary_model,
+            set_operator_primary_override,
+        )
+
+        conf = tmp_path / "models.json"
+        conf.write_text(json.dumps({
+            "models": [
+                {"provider": "gemini", "model": "gemini-2.5-pro",
+                 "api_key": "test-key"},
+            ]
+        }))
+        set_operator_primary_override(ModelConfig(
+            provider="anthropic", model_name="claude-opus-4-7",
+            api_key="op-key", max_tokens=1000, max_context=200000,
+            temperature=0.7, cost_per_1k_tokens=0.015,
+        ))
+        set_operator_primary_override(None)
+        with patch.dict(os.environ, {"RAPTOR_CONFIG": str(conf)}, clear=False):
+            cfg._thinking_model_checked = False
+            cfg._cached_thinking_model = None
+            picked = _get_default_primary_model()
+            assert picked is not None
+            assert picked.provider == "gemini"
+
+
+class TestCacheDirAnchoredToRaptorDir:
+    """``LLMConfig.cache_dir`` must resolve against the RAPTOR install,
+    not the process cwd — a bare-shell invocation from a scanned repo
+    otherwise dropped ``out/llm_cache/`` into the target tree and
+    missed the real cache on every call."""
+
+    def test_anchored_under_raptor_dir_not_cwd(self, monkeypatch, tmp_path):
+        from core.llm.config import _default_cache_dir
+        raptor_dir = tmp_path / "raptor-install"
+        scanned_repo = tmp_path / "scanned-repo"
+        raptor_dir.mkdir()
+        scanned_repo.mkdir()
+        monkeypatch.setenv("RAPTOR_DIR", str(raptor_dir))
+        monkeypatch.chdir(scanned_repo)
+        resolved = _default_cache_dir().resolve()
+        assert resolved == (raptor_dir / "out" / "llm_cache").resolve()
+        assert not str(resolved).startswith(str(scanned_repo.resolve()))
+
+    def test_fallback_relative_when_raptor_dir_unset(self, monkeypatch):
+        """Other direction: hermetic environments without RAPTOR_DIR
+        keep the historical relative default rather than raising."""
+        from core.llm.config import _default_cache_dir
+        monkeypatch.delenv("RAPTOR_DIR", raising=False)
+        assert _default_cache_dir() == Path("out/llm_cache")
+
+    def test_llmconfig_default_uses_factory(self, monkeypatch, tmp_path):
+        from core.llm.config import LLMConfig
+        raptor_dir = tmp_path / "raptor-install"
+        raptor_dir.mkdir()
+        monkeypatch.setenv("RAPTOR_DIR", str(raptor_dir))
+        cfg = LLMConfig(primary_model=None)
+        assert cfg.cache_dir == raptor_dir / "out" / "llm_cache"

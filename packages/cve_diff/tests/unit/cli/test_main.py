@@ -10,26 +10,41 @@ flag.").
 """
 from __future__ import annotations
 
+import cve_diff.infra.disk_budget as _mock_consumer_shutil
+from core.testing.module_bindings import patch_module_attribute
+
+
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
 from cve_diff.agent.types import AgentOutput, AgentSurrender
 from cve_diff.cli.main import _budget_reason, app
+from cve_diff.core.exceptions import IdenticalCommitsError
 from cve_diff.core.models import CommitSha, PatchTuple
+from cve_diff.pipeline import Pipeline
 
 
 @pytest.mark.parametrize("text,expected", [
-    ("DiscoveryError: CVE-X: agent surrendered (budget_cost_usd): ...", "budget_cost_usd"),
-    ("DiscoveryError: CVE-X: agent surrendered (budget_iterations): foo", "budget_iterations"),
-    ("DiscoveryError: CVE-X: agent surrendered (budget_tokens): bar", "budget_tokens"),
-    ("DiscoveryError: CVE-X: agent surrendered (budget_s): elapsed", "budget_s"),
+    # The helper matches str(exc) of the caught DiscoveryError, which
+    # starts with the CVE id — DiscoveryError has no custom __str__, so
+    # there is never a class-name prefix.
+    ("CVE-2024-1234: agent surrendered (budget_cost_usd): iterations=30",
+     "budget_cost_usd"),
+    ("CVE-2024-1234: agent surrendered (budget_iterations): foo",
+     "budget_iterations"),
+    ("CVE-2024-1234: agent surrendered (budget_s): elapsed", "budget_s"),
     # Non-budget surrenders should not match — we don't extend on those.
-    ("DiscoveryError: CVE-X: agent surrendered (no_evidence): ...", None),
-    ("DiscoveryError: CVE-X: agent surrendered (UnsupportedSource): ...", None),
-    ("DiscoveryError: CVE-X: agent surrendered (llm_error): ...", None),
+    ("CVE-2024-1234: agent surrendered (no_evidence): ...", None),
+    ("CVE-2024-1234: agent surrendered (UnsupportedSource): ...", None),
+    ("CVE-2024-1234: agent surrendered (llm_error): ...", None),
+    # A quoted marker phrase deeper in unrelated error text must not
+    # trigger the budget-extension prompt.
+    ("AnalysisError: advisory quotes 'CVE-1999-0001: agent surrendered "
+     "(budget_cost_usd): x' verbatim", None),
     # Other error classes should not match either.
     ("AcquisitionError: clone failed", None),
     ("", None),
@@ -93,8 +108,14 @@ def test_run_pass_emits_all_six_artifacts(tmp_path, monkeypatch):
        <cve>.osv.json, <cve>.md, <cve>.flow.jsonl, <cve>.flow.md,
        <cve>.clone.patch, and (when API extraction ran) the API patch.
     """
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path / "user-state")
     origin, fix_sha = _make_origin(tmp_path)
     out = tmp_path / "out"
+    out.mkdir()
+    protected = tmp_path / "retained.txt"
+    protected.write_text("retained input")
+    (out / "CVE-2024-99001.md").symlink_to(protected)
 
     _patch_agent_loop(monkeypatch, AgentOutput(
         value=PatchTuple(
@@ -117,6 +138,8 @@ def test_run_pass_emits_all_six_artifacts(tmp_path, monkeypatch):
     # Core artifacts always emitted.
     assert (out / "CVE-2024-99001.osv.json").exists()
     assert (out / "CVE-2024-99001.md").exists()
+    assert not (out / "CVE-2024-99001.md").is_symlink()
+    assert protected.read_text() == "retained input"
     # Flow artifacts (shipped 2026-04-30).
     assert (out / "CVE-2024-99001.flow.jsonl").exists()
     assert (out / "CVE-2024-99001.flow.md").exists()
@@ -124,6 +147,48 @@ def test_run_pass_emits_all_six_artifacts(tmp_path, monkeypatch):
     assert (out / "CVE-2024-99001.clone.patch").exists()
     # API extraction skipped for file:// (non-GitHub) — no .github_api.patch.
     assert not list(out.glob("CVE-2024-99001.*api*.patch"))
+
+
+def test_failure_report_replaces_symlink_without_touching_input(tmp_path):
+    from cve_diff.cli.main import _write_failure_md
+    protected = tmp_path / "retained.txt"
+    protected.write_text("retained input")
+    report = tmp_path / "CVE-2024-99001.md"
+    report.symlink_to(protected)
+    _write_failure_md(tmp_path, "CVE-2024-99001", "no_evidence", "no public reference")
+    assert protected.read_text() == "retained input"
+    assert not report.is_symlink()
+    assert "no public reference" in report.read_text()
+
+
+@pytest.mark.parametrize(("limit_args", "expected_exit_code"), [
+    ([], 0),
+    (["--disk-limit", "80"], 8),
+])
+def test_run_distinguishes_default_policy_from_explicit_limit(
+    tmp_path, monkeypatch, limit_args, expected_exit_code,
+):
+    origin, fix_sha = _make_origin(tmp_path)
+    out = tmp_path / "out"
+    _patch_agent_loop(monkeypatch, AgentOutput(
+        value=PatchTuple(
+            repository_url=f"file://{origin}",
+            fix_commit=CommitSha(fix_sha),
+            introduced=None,
+        ),
+        rationale="stub",
+    ))
+    gib = 1024**3
+    patch_module_attribute(monkeypatch, _mock_consumer_shutil, 'shutil', 'disk_usage', lambda _path: SimpleNamespace(total=100 * gib, used=80 * gib, free=20 * gib))
+
+    result = CliRunner().invoke(app, [
+        "run", "CVE-2024-99008",
+        "--output-dir", str(out),
+        "--quiet",
+        *limit_args,
+    ])
+
+    assert result.exit_code == expected_exit_code, result.output
 
 
 def test_run_unsupported_exits_4(tmp_path, monkeypatch):
@@ -161,6 +226,73 @@ def test_run_no_evidence_exits_5(tmp_path, monkeypatch):
     assert result.exit_code == 5
     assert (out / "CVE-2024-99003.md").exists()
     assert (out / "CVE-2024-99003.flow.md").exists()
+
+
+# ---------- IdenticalCommitsError → exit 7, unified class label ----------
+# _write_failure_md and _flow_from_pipeline must receive one identical
+# error-class string ("IdenticalCommitsError"), like every sibling
+# handler — not a split "IdenticalCommits" / "IdenticalCommitsError".
+
+_IDENTICAL_CVE = "CVE-2024-99007"
+
+
+def _patch_pipeline_identical(monkeypatch) -> None:
+    """Pipeline.run raises IdenticalCommitsError after recording agent
+    telemetry, so the flow files carry tool calls and render the FAIL
+    outcome line with the error class."""
+
+    def stub_run(self, cve_id, work_dir):
+        self.agent.last_telemetry = {
+            "iterations": 2, "tokens": 100, "cost_usd": 0.01,
+            "elapsed_s": 0.1,
+            "tool_calls": ["osv_raw", "submit_result"],
+            "tool_calls_with_args": [
+                ("osv_raw", '{"cve_id": "%s"}' % cve_id),
+                ("submit_result", '{"outcome": "rescued"}'),
+            ],
+        }
+        raise IdenticalCommitsError(
+            f"{cve_id}: fix sha and parent resolved to the same commit"
+        )
+
+    monkeypatch.setattr(Pipeline, "run", stub_run)
+
+
+def _invoke_identical(tmp_path):
+    out = tmp_path / "out"
+    result = CliRunner().invoke(app, [
+        "run", _IDENTICAL_CVE,
+        "--output-dir", str(out),
+        "--disk-limit", "99.9",
+        "--quiet",
+    ])
+    return out, result
+
+
+def test_identical_commits_exits_7_with_unified_class_label(tmp_path, monkeypatch):
+    _patch_pipeline_identical(monkeypatch)
+    out, result = _invoke_identical(tmp_path)
+    assert result.exit_code == 7
+
+    failure_md = (out / f"{_IDENTICAL_CVE}.md").read_text(encoding="utf-8")
+    flow_md = (out / f"{_IDENTICAL_CVE}.flow.md").read_text(encoding="utf-8")
+
+    # Both artifacts retain the exact class, with their own presentation:
+    # typed failure metadata is plain text; the native flow uses a code span.
+    class_lines = [line for line in failure_md.splitlines() if line.startswith("**Class:** ")]
+    assert class_lines == ["**Class:** IdenticalCommitsError"]
+    assert "**✗ FAIL** · `IdenticalCommitsError`" in flow_md
+
+
+def test_identical_commits_outcome_is_humanized(tmp_path, monkeypatch):
+    """With the class label unified, _humanize_class maps it — the
+    Outcome header must not fall back to the raw 'Other (…)' form."""
+    _patch_pipeline_identical(monkeypatch)
+    out, result = _invoke_identical(tmp_path)
+    assert result.exit_code == 7
+    failure_md = (out / f"{_IDENTICAL_CVE}.md").read_text(encoding="utf-8")
+    assert "Other (" not in failure_md
+    assert "resolved to the same commit" in failure_md
 
 
 def test_run_writes_flow_md_with_pipeline_trace(tmp_path, monkeypatch):
@@ -250,3 +382,112 @@ def test_run_quiet_suppresses_flow_md_on_stdout(tmp_path, monkeypatch):
     assert "=== Artifacts ===" not in result.output
     # But flow.md still exists on disk.
     assert (out / "CVE-2024-99006.flow.md").exists()
+
+
+def test_echo_flow_md_escapes_hostile_body(tmp_path, capsys):
+    """The flow.md relay is a terminal sink: producers escape before
+    the file is written, but a producer regression (or hand-edited
+    flow.md) must not drive the operator's TTY — the relay escapes
+    too, keeping structural newlines."""
+    from cve_diff.cli.main import _echo_flow_md
+
+    (tmp_path / "CVE-2024-0003.flow.md").write_text(
+        "# trace\n\x1b]0;pwned\x07\x9b2J‮evil line\nsecond line\n",
+        encoding="utf-8",
+    )
+    _echo_flow_md(tmp_path, "CVE-2024-0003", quiet=False)
+    out = capsys.readouterr().out
+    assert "pipeline trace" in out
+    assert "# trace\n" in out  # newlines stay structural
+    assert "second line" in out
+    for raw in ("\x1b]", "\x07", "\x9b", "‮"):
+        assert raw not in out
+
+
+# ---------- typed-handler relays escape hostile exception text ----------
+# The typed except handlers relay str(exc) to the TTY; the exception
+# text carries the same content classes the progress_cb chokepoint
+# escapes (remote git stderr banners in AcquisitionError layer detail,
+# agent-authored rationale in DiscoveryError detail) — every lane must
+# apply the same sanitise_for_terminal idiom.
+
+_HOSTILE_EXC = "tag \x1b]0;pwned\x07 refs \x9b2J‮evil"
+
+
+def _patch_pipeline_raises(monkeypatch, exc) -> None:
+    def stub_run(self, cve_id, work_dir):
+        raise exc
+    monkeypatch.setattr(Pipeline, "run", stub_run)
+
+
+def test_identical_commits_relay_escapes_hostile_bytes(tmp_path, monkeypatch):
+    _patch_pipeline_raises(
+        monkeypatch, IdenticalCommitsError(f"CVE-2024-99010: {_HOSTILE_EXC}"))
+    result = CliRunner().invoke(app, [
+        "run", "CVE-2024-99010",
+        "--output-dir", str(tmp_path / "out"),
+        "--disk-limit", "99.9",
+        "--quiet",
+    ])
+    assert result.exit_code == 7
+    assert "identical commits:" in result.output
+    for raw in ("\x1b", "\x07", "\x9b"):
+        assert raw not in result.output
+    assert "pwned" in result.output  # escaped, content preserved
+
+
+def test_discovery_relay_escapes_hostile_bytes(tmp_path, monkeypatch):
+    from cve_diff.core.exceptions import DiscoveryError
+    _patch_pipeline_raises(
+        monkeypatch,
+        DiscoveryError(f"CVE-2024-99011: agent surrendered "
+                       f"(no_evidence): {_HOSTILE_EXC}"))
+    result = CliRunner().invoke(app, [
+        "run", "CVE-2024-99011",
+        "--output-dir", str(tmp_path / "out"),
+        "--disk-limit", "99.9",
+        "--quiet",
+    ])
+    assert result.exit_code == 5
+    assert "discovery failed:" in result.output
+    for raw in ("\x1b", "\x07", "\x9b"):
+        assert raw not in result.output
+
+
+def test_root_cause_success_line_escapes_hostile_vuln_type(
+        tmp_path, monkeypatch):
+    """vulnerability_type is unconstrained model-JSON text; the SUCCESS
+    line must apply the same chokepoint as the failure relays (cwe_id
+    is regex-normalised by the analyzer and stays as-is)."""
+    from cve_diff.analysis.analyzer import RootCause, RootCauseAnalyzer
+
+    origin, fix_sha = _make_origin(tmp_path)
+    out = tmp_path / "out"
+    _patch_agent_loop(monkeypatch, AgentOutput(
+        value=PatchTuple(
+            repository_url=f"file://{origin}",
+            fix_commit=CommitSha(fix_sha),
+            introduced=None,
+        ),
+        rationale="stub",
+    ))
+    monkeypatch.setattr(
+        RootCauseAnalyzer, "analyze",
+        lambda self, bundle: RootCause(
+            cwe_id="CWE-787",
+            vulnerability_type=f"overflow {_HOSTILE_EXC}",
+            summary="s", why_chain=(), affected_functions=(),
+            confidence=0.9, model_id="m",
+            input_tokens=1, output_tokens=1,
+        ))
+    result = CliRunner().invoke(app, [
+        "run", "CVE-2024-99012",
+        "--output-dir", str(out),
+        "--disk-limit", "99.9",
+        "--with-root-cause",
+        "--quiet",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "root cause: CWE-787" in result.output
+    for raw in ("\x1b", "\x07", "\x9b"):
+        assert raw not in result.output

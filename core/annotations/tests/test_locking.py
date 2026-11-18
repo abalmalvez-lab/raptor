@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -35,6 +34,7 @@ def _writer_proc(base_str: str, file: str, prefix: str, count: int):
         ))
 
 
+@pytest.mark.filterwarnings("ignore:This process.*fork:DeprecationWarning")
 class TestConcurrentWrites:
     """Two processes hammer the same file. With locking, all writes
     survive. Without it, ~half would be lost to the read-modify-write
@@ -58,8 +58,15 @@ class TestConcurrentWrites:
         p2.start()
         p1.join(timeout=30)
         p2.join(timeout=30)
-        assert p1.exitcode == 0, "writer 1 crashed"
-        assert p2.exitcode == 0, "writer 2 crashed"
+        # On a join timeout the child is still running: terminate it
+        # before asserting so a hang can't leak a live writer process
+        # into the rest of the pytest session.
+        for proc in (p1, p2):
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+        assert p1.exitcode == 0, "writer 1 crashed or hung"
+        assert p2.exitcode == 0, "writer 2 crashed or hung"
 
         from core.annotations import read_file_annotations
         annotations = read_file_annotations(base, "src/concur.py")
@@ -74,7 +81,7 @@ class TestConcurrentWrites:
         assert not missing, (
             f"{len(missing)} annotations lost to read-modify-write "
             f"race — locking didn't serialise. Missing: "
-            f"{sorted(list(missing))[:5]}..."
+            f"{sorted(missing)[:5]}..."
         )
 
 

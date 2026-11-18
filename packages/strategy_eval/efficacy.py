@@ -1,0 +1,210 @@
+"""Offline A/B efficacy eval for cwe_strategies.
+
+Question: does injecting a strategy's guidance actually improve the
+model's findings? For each labeled sample we run an otherwise-identical
+review prompt twice:
+
+  * control   — review instructions + the always-on ``general`` lens
+  * treatment — same + the target strategy's lens
+
+so the target lens is the ONLY variable (``general`` is present in both
+because it is always pinned in production). On a ``vulnerable`` sample,
+a VULNERABLE verdict is a hit; on a ``patched`` sample it is a false
+positive. Lift = treatment hit-rate − control hit-rate.
+
+This needs a live LLM and is nondeterministic, so it is an on-demand
+tool, never a CI gate. The LLM call is injected (``complete``) so the
+harness logic is unit-tested with a fake. Results are only as meaningful
+as the corpus: a synthetic seed measures whether the lens helps on the
+bug-class *shape*, not on real-world code.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from pathlib import Path
+from collections.abc import Callable
+
+import yaml
+
+from core.llm.cwe_strategies import load_all, render_strategies
+
+from .models import ABResult, EfficacySample
+
+# complete(system_prompt, user_prompt) -> model reply text
+Completer = Callable[[str, str], str]
+
+_REVIEW_INSTRUCTIONS = (
+    "You are a security code reviewer. Review the function in the user "
+    "message for security vulnerabilities. Reason briefly, then end your "
+    "reply with EXACTLY one line:\n"
+    "  VERDICT: VULNERABLE   (the function contains a security bug)\n"
+    "  VERDICT: SAFE         (it does not)\n"
+)
+
+# One verdict per LINE, and the LAST one wins. The instructions demand
+# the reply END with exactly one verdict line, and they themselves
+# contain both template lines — a whole-reply substring search for
+# "VERDICT: VULNERABLE" grades any reply that echoes or reasons about
+# the vulnerable option as VULNERABLE even when it concludes SAFE,
+# inflating flagged counts in both A/B arms.
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank runs in a model reply.
+_VERDICT_LINE_RE = re.compile(
+    r"^[^\S\n]*VERDICT:\s*(VULNERABLE|SAFE)\b", re.IGNORECASE | re.MULTILINE,
+)
+
+
+def grade(reply: str) -> bool:
+    """True iff the model's FINAL verdict line is VULNERABLE."""
+    verdicts = _VERDICT_LINE_RE.findall(reply or "")
+    if not verdicts:
+        return False
+    return verdicts[-1].upper() == "VULNERABLE"
+
+
+def _strategies_by_name() -> dict[str, object]:
+    return {s.name: s for s in load_all()}
+
+
+def build_prompts(sample: EfficacySample) -> tuple[str, str, str]:
+    """Return (control_system, treatment_system, user_prompt).
+
+    The two system prompts differ ONLY by the target lens, so any verdict
+    difference is attributable to it.
+    """
+    by_name = _strategies_by_name()
+    general = by_name.get("general")
+    lens = by_name.get(sample.strategy)
+    if lens is None:
+        msg = f"unknown strategy {sample.strategy!r} for sample {sample.id}"
+        raise KeyError(msg)
+
+    baseline = [general] if general is not None else []
+    control_system = _REVIEW_INSTRUCTIONS + "\n\n" + render_strategies(baseline)  # type: ignore[arg-type]
+    # If the target IS general, treatment == control (no delta).
+    treat_lenses = baseline if lens is general else baseline + [lens]
+    treatment_system = _REVIEW_INSTRUCTIONS + "\n\n" + render_strategies(treat_lenses)  # type: ignore[arg-type]
+    return control_system, treatment_system, sample.code
+
+
+def run_ab(sample: EfficacySample, complete: Completer, runs: int = 3) -> ABResult:
+    control_system, treatment_system, user = build_prompts(sample)
+    control_flagged = sum(
+        1 for _ in range(runs) if grade(complete(control_system, user))
+    )
+    treatment_flagged = sum(
+        1 for _ in range(runs) if grade(complete(treatment_system, user))
+    )
+    return ABResult(
+        sample_id=sample.id,
+        strategy=sample.strategy,
+        variant=sample.variant,
+        runs=runs,
+        control_flagged=control_flagged,
+        treatment_flagged=treatment_flagged,
+    )
+
+
+def run_efficacy_eval(
+    samples: list[EfficacySample], complete: Completer, runs: int = 3,
+) -> list[ABResult]:
+    return [run_ab(s, complete, runs) for s in samples]
+
+
+# ---------------------------------------------------------------------------
+# Corpus loading
+# ---------------------------------------------------------------------------
+
+
+def load_corpus(corpus_dir: Path) -> list[EfficacySample]:
+    """Load a labeled corpus: a ``manifest.yml`` listing samples, each with
+    ``id``, ``strategy``, ``file`` (relative path to the source), ``variant``
+    and optional ``synthetic``. Real samples drop in via the same format.
+    """
+    corpus_dir = Path(corpus_dir)
+    manifest = yaml.safe_load((corpus_dir / "manifest.yml").read_text("utf-8")) or {}
+    samples: list[EfficacySample] = []
+    for raw in manifest.get("samples", []):
+        code = (corpus_dir / raw["file"]).read_text(encoding="utf-8")
+        samples.append(
+            EfficacySample(
+                id=raw["id"],
+                strategy=raw["strategy"],
+                code=code,
+                variant=raw["variant"],
+                synthetic=bool(raw.get("synthetic", False)),
+            )
+        )
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
+def format_report(results: list[ABResult]) -> str:
+    # Aggregate per strategy × variant: total runs and flagged counts.
+    agg: dict[tuple, list[int]] = defaultdict(lambda: [0, 0, 0])  # runs, ctrl, treat
+    for r in results:
+        slot = agg[(r.strategy, r.variant)]
+        slot[0] += r.runs
+        slot[1] += r.control_flagged
+        slot[2] += r.treatment_flagged
+
+    lines = ["Efficacy eval (A/B: baseline vs baseline+lens) — live LLM", ""]
+    strategies = sorted({s for (s, _v) in agg})
+    for strat in strategies:
+        lines.append(f"{strat}:")
+        for variant in ("vulnerable", "patched"):
+            slot = agg.get((strat, variant))  # type: ignore[assignment]
+            if not slot:
+                continue
+            runs, ctrl, treat = slot
+            c_rate = ctrl / runs if runs else 0.0
+            t_rate = treat / runs if runs else 0.0
+            if variant == "vulnerable":
+                lines.append(
+                    f"  vulnerable  detection  control {c_rate*100:5.1f}%  "
+                    f"treatment {t_rate*100:5.1f}%  lift {(t_rate-c_rate)*100:+5.1f}%"
+                )
+            else:
+                lines.append(
+                    f"  patched     false-pos  control {c_rate*100:5.1f}%  "
+                    f"treatment {t_rate*100:5.1f}%  delta {(t_rate-c_rate)*100:+5.1f}%"
+                )
+            # Per-sample detail: the aggregate hides which sample
+            # produced (or destroyed) the lift — one mislabeled sample
+            # can skew the whole rate.
+            for r in results:
+                if (r.strategy, r.variant) != (strat, variant):
+                    continue
+                lines.append(
+                    f"    {r.sample_id}  ctrl {r.control_flagged}/{r.runs}"
+                    f"  treat {r.treatment_flagged}/{r.runs}"
+                )
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Default live completer (lazily wires the real LLM client)
+# ---------------------------------------------------------------------------
+
+
+def default_completer() -> Completer:
+    """Wire a Completer onto the real LLM client. Imported lazily so the
+    harness (and its tests) don't require the client unless a live run is
+    actually requested."""
+    from core.llm.client import LLMClient
+
+    client = LLMClient()
+
+    def _complete(system_prompt: str, user_prompt: str) -> str:
+        resp = client.generate(user_prompt, system_prompt=system_prompt)
+        text = getattr(resp, "content", None)
+        return text if text is not None else str(resp)
+
+    return _complete

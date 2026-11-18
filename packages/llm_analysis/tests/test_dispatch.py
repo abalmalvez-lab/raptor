@@ -1,23 +1,33 @@
 """Tests for the generic dispatch framework (dispatch.py + tasks.py)."""
 
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 # packages/llm_analysis/tests/test_dispatch.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from packages.llm_analysis.dispatch import (
     DispatchTask, DispatchResult, dispatch_task, _format_elapsed,
-    _classify_error,
+    _classify_error, _breaker_should_open, _BREAKER_PROVEN_THRESHOLD,
 )
 from packages.llm_analysis.tasks import (
     AggregationTask, AnalysisTask, ExploitTask, PatchTask, ConsensusTask,
     GroupAnalysisTask, JudgeTask, RetryTask,
 )
 from packages.llm_analysis.orchestrator import CostTracker
+
+
+@pytest.fixture(autouse=True)
+def _isolated_defense_telemetry(monkeypatch):
+    from core.testing.telemetry import pin_defense_telemetry
+
+    pin_defense_telemetry(monkeypatch)
 
 
 def _make_finding(finding_id, rule_id="sqli", file_path="db.py", start_line=42):
@@ -34,7 +44,7 @@ def _make_finding(finding_id, rule_id="sqli", file_path="db.py", start_line=42):
     }
 
 
-def _make_dispatch_result(exploitable=True, score=0.85):
+def _make_dispatch_result(exploitable=True, score=0.85, model="test-model"):
     return DispatchResult(
         result={
             "is_true_positive": True,
@@ -42,7 +52,7 @@ def _make_dispatch_result(exploitable=True, score=0.85):
             "exploitability_score": score,
             "reasoning": "test reasoning",
         },
-        cost=0.10, tokens=500, model="test-model", duration=5.0,
+        cost=0.10, tokens=500, model=model, duration=5.0,
     )
 
 
@@ -476,6 +486,90 @@ class TestDispatchTaskIntegration:
         summary = ct.get_summary()
         assert "test-model" in summary["cost_by_model"]
 
+    def test_progress_line_escapes_hostile_display(self, capsys):
+        # The progress line's display derives from the scanned
+        # (hostile) repo's file names and prints straight to the
+        # operator TTY — a raw ESC would allow ANSI/OSC injection
+        # (title changes, log-line forgery) mid-run.
+        hostile = _make_finding(
+            "f-001", file_path="src/\x1b]0;pwned\x07evil.py",
+        )
+
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            return _make_dispatch_result(exploitable=True, score=0.9)
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=[hostile],
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "evil.py" in out  # content survives, escaped
+
+    def test_progress_line_reports_abstention_not_verdict(self, capsys):
+        # A schema-nulled is_exploitable is an abstention. The
+        # progress line must say so — "not exploitable" would show
+        # the operator a definitive ruling nobody made.
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            return _make_dispatch_result(exploitable=None, score=None)
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-001")],
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "no verdict" in out
+        assert "not exploitable" not in out
+
+    def test_progress_line_explicit_false_still_definitive(self, capsys):
+        # Two-direction: an explicit False keeps its ruling.
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            return _make_dispatch_result(exploitable=False, score=0.0)
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-001")],
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "not exploitable" in out
+
+    def test_failure_line_escapes_llm_derived_error(self, capsys):
+        # External-LLM errors can embed response excerpts — the
+        # FAILED progress line must escape them (the CC path
+        # pre-escapes; this is the chokepoint for everything else).
+        findings = [_make_finding("f-001")]
+
+        def failing_fn(prompt, schema, system_prompt, temperature, model):
+            raise RuntimeError("response said \x1b[2J\x1b[H wipe")
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=failing_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "FAILED" in out
+        assert "\x1b" not in out
+
     def test_dispatch_handles_errors(self):
         """dispatch_task handles exceptions gracefully."""
         findings = [_make_finding("f-001")]
@@ -648,6 +742,272 @@ class TestDispatchTaskIntegration:
         assert len(dispatch_calls) == 2
 
 
+class TestCircuitBreakerEnforcement:
+    """A dead model's pre-submitted futures must not keep dispatching."""
+
+    def test_dead_model_futures_short_circuit(self):
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        model_a = MagicMock(model_name="model-a")
+        model_b = MagicMock(model_name="model-b")
+        findings = [_make_finding(f"f-{i:03d}") for i in range(12)]
+        a_calls = []
+
+        def _drained_a_failures() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return models.get("model-a", {}).get("schema_failed", 0)
+
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            if model is model_a:
+                n_prior = len(a_calls)
+                a_calls.append(1)
+                # Deterministic drain sync (replaces a sleep-won race
+                # with a fixed tolerance band, which a starved CI host
+                # could lose): block until the drain loop has recorded
+                # every PRIOR model-a failure into telemetry, so the
+                # dead-set is current before the next worker's
+                # dead-check can run. Bounded so a regression fails
+                # loudly instead of hanging the suite.
+                deadline = time.monotonic() + 10.0
+                while (_drained_a_failures() < n_prior
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
+                raise RuntimeError("model-a keeps exploding")
+            return _make_dispatch_result(
+                exploitable=False, score=0.1, model="model-b",
+            )
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=mock_fn,
+            role_resolution={"analysis_models": [model_a, model_b]},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,  # sequential: model-a items drain first
+        )
+        # Read BEFORE the reset: every real model-a dispatch failed
+        # and must have been recorded exactly once, and the
+        # short-circuited futures must have recorded nothing — a
+        # mismatch means the drain lost or misattributed a failure
+        # event.
+        drained_a = _drained_a_failures()
+        defense_telemetry.reset()
+
+        # Without enforcement every one of the 12 model-a futures
+        # called dispatch_fn (12 wasted API calls). With it, the
+        # breaker's contract is best-effort fast-stop
+        # (_ModelCircuitOpen: a future whose model "has since been
+        # declared dead" is short-circuited at execution time), so
+        # the real-dispatch count is scheduling-dependent, not exact.
+        # The worker thread pulls the next pre-submitted future the
+        # moment the previous one raises, while the DRAIN loop (main
+        # thread) is still recording that failure — with the mock's
+        # drain sync holding, the reachable outcomes are:
+        #   3 — the third failure's dead-add landed before item 4's
+        #       dead-check (worker descheduled between futures);
+        #   4 — the common interleaving: exactly one straggler whose
+        #       dead-check preceded the third failure's drain;
+        #   5 — item 5's dead-check slipped into the gap between the
+        #       third failure's telemetry record and its dead-add.
+        # Item 6 can never dispatch: its dead-check runs only after
+        # item 5's mock observed the FOURTH drained failure, which
+        # the drain records strictly after the third failure's
+        # dead-add. Asserting the common count exactly (== 4) was a
+        # load flake; the open-after-3 threshold itself is pinned
+        # deterministically by TestBreakerShouldOpen.
+        assert 3 <= len(a_calls) <= 5
+        assert drained_a == len(a_calls)
+
+        skipped = [r for r in results
+                   if r.get("error_type") == "circuit_breaker"]
+        assert len(skipped) == 12 - len(a_calls)
+        assert all(r["analysed_by"] == "model-a" for r in skipped)
+        assert all("circuit-broken" in r["error"] for r in skipped)
+
+        # Every model-a future is accounted for exactly once: the
+        # dispatched ones failed for real, the rest were skipped.
+        a_failed = [r for r in results
+                    if r.get("analysed_by") == "model-a"
+                    and r.get("error_type") != "circuit_breaker"
+                    and "error" in r]
+        assert len(a_failed) == len(a_calls)
+
+        # The healthy model still analysed every item.
+        b_ok = [r for r in results
+                if r.get("analysed_by") == "model-b" and "error" not in r]
+        assert len(b_ok) == 12
+
+    def test_proven_model_survives_transient_failure_burst(self):
+        """A model with prior successes must NOT be circuit-broken by 3
+        consecutive transient failures — the breaker requires a model
+        that has NEVER succeeded (completed == consec). Losing that
+        guard truncated single-model batches on any timeout burst."""
+        findings = [_make_finding(f"f-{i:03d}") for i in range(8)]
+        call_count = [0]
+
+        def burst_fn(prompt, schema, system_prompt, temperature, model):
+            call_count[0] += 1
+            # 2 successes, then a 3-failure transient burst, then recover.
+            if call_count[0] in (3, 4, 5):
+                raise RuntimeError("upstream timeout")
+            return _make_dispatch_result()
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=burst_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,  # sequential: makes the burst consecutive
+        )
+
+        # Every item dispatched — no abort-fill, no circuit_breaker skips.
+        assert call_count[0] == 8
+        assert len(results) == 8
+        assert not [r for r in results
+                    if r.get("error", "").startswith("aborted")]
+        assert not [r for r in results
+                    if r.get("error_type") == "circuit_breaker"]
+        successes = [r for r in results if "error" not in r]
+        assert len(successes) == 5
+
+    def test_all_dead_abort_reason_not_mislabelled_as_auth(self):
+        """Abort-fill records from the all-models-circuit-broken branch
+        used to say "aborted (auth failure)". Since the straggler sweep
+        resolves every future that actually RAN, abort-fill rows exist
+        only for futures cancelled before dispatch — so the straggler
+        holds the worker until the dispatching thread is provably
+        parked in the executor join, which is strictly AFTER
+        cancel_futures cancelled the queued remainder: exactly two
+        cancelled futures, every run."""
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        model = MagicMock(model_name="only-model")
+        findings = [_make_finding(f"f-{i:03d}") for i in range(6)]
+        calls = []
+        caller_ident = threading.get_ident()
+
+        def _drained() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return sum(s["schema_failed"] for s in models.values())
+
+        def _caller_parked_in_executor_join() -> bool:
+            # ThreadPoolExecutor.__exit__ -> shutdown(wait=True) ->
+            # Thread.join: only that path puts a "join" frame on the
+            # dispatching thread's stack (the in-loop abort shutdown
+            # passes wait=False and never joins), so this cannot
+            # trigger mid-cancellation.
+            frame = sys._current_frames().get(caller_ident)
+            while frame is not None:
+                if frame.f_code.co_name == "join":
+                    return True
+                frame = frame.f_back
+            return False
+
+        def failing_fn(prompt, schema, system_prompt, temperature, m):
+            calls.append(1)
+            n = len(calls)
+            # Deterministic drain sync (cf. the dead-futures test).
+            deadline = time.monotonic() + 10.0
+            while (_drained() < min(n - 1, 3)
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            if n == 4:
+                deadline = time.monotonic() + 10.0
+                while (not _caller_parked_in_executor_join()
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
+            raise RuntimeError("structured generation failed")
+
+        old_stderr = sys.stderr
+        sys.stderr = TestAbortStragglerSweep._DwellStderr(
+            old_stderr, calls)
+        try:
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=failing_fn,
+                role_resolution={"analysis_models": [model]},
+                prior_results={},
+                cost_tracker=CostTracker(0),
+                max_parallel=1,
+            )
+        finally:
+            sys.stderr = old_stderr
+        defense_telemetry.reset()
+
+        assert len(calls) == 4
+        assert len(results) == 6
+        assert all("error" in r for r in results)
+        aborted = [r for r in results if r["error"].startswith("aborted")]
+        assert len(aborted) == 2
+        for r in aborted:
+            assert "circuit-broken" in r["error"]
+            assert "auth" not in r["error"]
+
+    def test_auth_abort_reason_preserved(self):
+        """The auth-abort path still labels its abort-fill as auth."""
+        findings = [_make_finding(f"f-{i:03d}") for i in range(3)]
+
+        def auth_fail_fn(prompt, schema, system_prompt, temperature, m):
+            raise RuntimeError("Error 401 Unauthorized")
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=auth_fail_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+
+        aborted = [r for r in results if r.get("error", "").startswith("aborted")]
+        for r in aborted:
+            assert "auth failure" in r["error"]
+
+
+class TestBreakerShouldOpen:
+    """Deterministic pins for the breaker's open/stay-closed decision.
+
+    The integration tests above exercise the breaker through the
+    threaded dispatch path, where the number of real dispatches is
+    scheduling-dependent — these pin the threshold semantics exactly,
+    with no scheduler in the loop.
+    """
+
+    def test_never_succeeded_opens_at_three(self):
+        assert _breaker_should_open(consec=3, completed=3)
+
+    def test_two_consecutive_failures_stay_closed(self):
+        assert not _breaker_should_open(consec=2, completed=2)
+
+    def test_proven_model_rides_out_short_burst(self):
+        # Prior successes (completed > consec) suspend the fast path.
+        assert not _breaker_should_open(consec=3, completed=10)
+        assert not _breaker_should_open(
+            consec=_BREAKER_PROVEN_THRESHOLD - 1, completed=50,
+        )
+
+    def test_proven_model_opens_at_proven_threshold(self):
+        assert _breaker_should_open(
+            consec=_BREAKER_PROVEN_THRESHOLD, completed=50,
+        )
+
+    def test_proven_threshold_value_pinned(self):
+        # Regression pin for the constant itself — see its
+        # both-directions rationale before moving it in either
+        # direction.
+        assert not _breaker_should_open(consec=9, completed=50)
+        assert _breaker_should_open(consec=10, completed=50)
+
+
 class TestRetryTask:
     def test_selects_low_confidence(self):
         task = RetryTask()
@@ -662,7 +1022,7 @@ class TestRetryTask:
         assert selected[0]["finding_id"] == "f-001"
 
     def test_selects_boundaries(self):
-        """Half-open `[LOW, HIGH)` band — cluster 861.
+        """Half-open `[LOW, HIGH)` band.
 
         Pre-fix both the select band and the decisive check used
         the closed form `LOW <= score <= HIGH`, which made
@@ -870,6 +1230,42 @@ class TestJudgeTask:
         assert "SQL injection via user input" in prompt
         assert "is_exploitable=True" in prompt
 
+    def test_prompt_shows_earliest_snapshot_as_primary_verdict(self):
+        # A cross-family conservative override ran before the judge:
+        # the critique premise must be the analyst's OWN conclusion
+        # (the earliest snapshot), never the override — otherwise the
+        # judge critiques "is_exploitable=True" above reasoning that
+        # argues not-exploitable, and its "agreed" stamp mints
+        # corroboration for a verdict no analyst produced.
+        results_by_id = {
+            "f-001": {
+                "is_exploitable": True,  # cross-family override
+                "pre_crossfamily_is_exploitable": False,
+                "cross_family_disputed": True,
+                "ruling": "false_positive",
+                "reasoning": "sink is unreachable behind constant guard",
+            }
+        }
+        task = JudgeTask(results_by_id=results_by_id)
+        prompt = task.build_prompt(_make_finding("f-001"))
+        assert "is_exploitable=False" in prompt
+
+    def test_prompt_prefers_crossfamily_over_consensus_snapshot(self):
+        # Both stages snapshotted: the cross-family one is earlier in
+        # the pipeline and is the analyst's own verdict.
+        results_by_id = {
+            "f-001": {
+                "is_exploitable": True,
+                "pre_crossfamily_is_exploitable": False,
+                "pre_consensus_is_exploitable": True,
+                "ruling": "false_positive",
+                "reasoning": "r",
+            }
+        }
+        task = JudgeTask(results_by_id=results_by_id)
+        prompt = task.build_prompt(_make_finding("f-001"))
+        assert "is_exploitable=False" in prompt
+
 
 class TestAggregationTask:
     def test_gets_aggregate_models(self):
@@ -1035,8 +1431,12 @@ class TestConfigRoleValidation:
 
     def test_judge_with_analysis_ok(self):
         from core.llm.config import _validate_model_roles
-        analysis = MagicMock(); analysis.role = "analysis"; analysis.model_name = "gemini"
-        judge = MagicMock(); judge.role = "judge"; judge.model_name = "gpt-5"
+        analysis = MagicMock()
+        analysis.role = "analysis"
+        analysis.model_name = "gemini"
+        judge = MagicMock()
+        judge.role = "judge"
+        judge.model_name = "gpt-5"
         _validate_model_roles([analysis, judge])
 
     def test_aggregate_without_analysis_raises(self):
@@ -1049,40 +1449,81 @@ class TestConfigRoleValidation:
 
     def test_multiple_aggregate_models_raises(self):
         from core.llm.config import _validate_model_roles, ConfigError
-        analysis = MagicMock(); analysis.role = "analysis"; analysis.model_name = "gpt-5"
-        a1 = MagicMock(); a1.role = "aggregate"; a1.model_name = "claude-opus-4-6"
-        a2 = MagicMock(); a2.role = "aggregate"; a2.model_name = "gpt-5.4"
+        analysis = MagicMock()
+        analysis.role = "analysis"
+        analysis.model_name = "gpt-5"
+        a1 = MagicMock()
+        a1.role = "aggregate"
+        a1.model_name = "claude-opus-4-6"
+        a2 = MagicMock()
+        a2.role = "aggregate"
+        a2.model_name = "gpt-5.4"
         with pytest.raises(ConfigError, match="Multiple models with role 'aggregate'"):
             _validate_model_roles([analysis, a1, a2])
 
     def test_resolve_roles_includes_judge(self):
         from core.llm.config import resolve_model_roles
-        analysis = MagicMock(); analysis.role = "analysis"; analysis.model_name = "gemini"
-        judge = MagicMock(); judge.role = "judge"; judge.model_name = "gpt-5"
+        analysis = MagicMock()
+        analysis.role = "analysis"
+        analysis.model_name = "gemini"
+        judge = MagicMock()
+        judge.role = "judge"
+        judge.model_name = "gpt-5"
         result = resolve_model_roles(analysis, [judge])
         assert result["judge_models"] == [judge]
         assert result["analysis_model"] == analysis
 
     def test_resolve_roles_includes_aggregate(self):
         from core.llm.config import resolve_model_roles
-        analysis = MagicMock(); analysis.role = "analysis"; analysis.model_name = "gemini"
-        aggregate = MagicMock(); aggregate.role = "aggregate"; aggregate.model_name = "claude-opus-4-6"
+        analysis = MagicMock()
+        analysis.role = "analysis"
+        analysis.model_name = "gemini"
+        aggregate = MagicMock()
+        aggregate.role = "aggregate"
+        aggregate.model_name = "claude-opus-4-6"
         result = resolve_model_roles(analysis, [aggregate])
         assert result["aggregate_models"] == [aggregate]
 
     def test_multiple_analysis_models_allowed(self):
         from core.llm.config import _validate_model_roles
-        m1 = MagicMock(); m1.role = "analysis"; m1.model_name = "gemini"
-        m2 = MagicMock(); m2.role = "analysis"; m2.model_name = "gpt-5"
+        m1 = MagicMock()
+        m1.role = "analysis"
+        m1.model_name = "gemini"
+        m2 = MagicMock()
+        m2.role = "analysis"
+        m2.model_name = "gpt-5"
         _validate_model_roles([m1, m2])
 
     def test_resolve_roles_returns_analysis_models_list(self):
         from core.llm.config import resolve_model_roles
-        m1 = MagicMock(); m1.role = "analysis"; m1.model_name = "gemini"
-        m2 = MagicMock(); m2.role = "analysis"; m2.model_name = "gpt-5"
+        m1 = MagicMock()
+        m1.role = "analysis"
+        m1.model_name = "gemini"
+        m2 = MagicMock()
+        m2.role = "analysis"
+        m2.model_name = "gpt-5"
         result = resolve_model_roles(m1, [m2])
         assert len(result["analysis_models"]) == 2
         assert result["analysis_model"] == m1
+
+
+class _StubConfigWithDefaults:
+    """Stand-in for LLMConfig that injects config-derived defaults (a
+    cross-provider fallback + a role=consensus model) when constructed
+    WITHOUT an explicit fallback_models — i.e. what models.json would load.
+    Passing fallback_models=[] (the override path) yields no defaults."""
+
+    def __init__(self, primary_model=None, fallback_models=None, **kw):
+        from core.llm.config import ModelConfig
+        self.primary_model = primary_model
+        if fallback_models is None:
+            self.fallback_models = [
+                ModelConfig(provider="gemini", model_name="gemini-2.5-flash", role="fallback"),
+                ModelConfig(provider="anthropic", model_name="claude-haiku-4-5", role="consensus"),
+            ]
+        else:
+            self.fallback_models = list(fallback_models)
+        self.specialized_models = {}
 
 
 class TestBuildLLMConfigFromFlags:
@@ -1189,6 +1630,41 @@ class TestBuildLLMConfigFromFlags:
         consensus_models = [m for m in result.fallback_models if m.role == "consensus"]
         assert len(consensus_models) == 1
         assert consensus_models[0].model_name == "mistral-large-latest"
+
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "k"})
+    def test_explicit_model_suppresses_config_derived_defaults(self):
+        """An explicit --model is a general override: config-derived fallback
+        / role models (e.g. a cross-provider fallback or a role=consensus
+        entry from models.json) must NOT load when --model is set without the
+        matching role flag."""
+        from packages.llm_analysis.orchestrator import build_llm_config_from_flags
+        with patch("core.llm.config.LLMConfig", _StubConfigWithDefaults):
+            result = build_llm_config_from_flags(models=["gpt-5"], auto_detect=False)
+        assert result is not None
+        assert result.fallback_models == []  # nothing config-derived leaked
+        assert all(m.provider != "gemini" for m in result.fallback_models)
+        assert all(m.role != "consensus" for m in result.fallback_models)
+
+    def test_unrecognized_model_name_fails_loudly(self, capsys):
+        from packages.llm_analysis.orchestrator import build_llm_config_from_flags
+        result = build_llm_config_from_flags(models=["opus-4-8"], auto_detect=False)
+        assert result is None
+        assert "unrecognized model" in capsys.readouterr().err
+
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "k", "MISTRAL_API_KEY": "k2"})
+    def test_explicit_model_composes_with_role_flag_only(self):
+        """--model X --consensus Y → only Y as consensus; the config-derived
+        consensus + cross-provider fallback are still suppressed."""
+        from packages.llm_analysis.orchestrator import build_llm_config_from_flags
+        with patch("core.llm.config.LLMConfig", _StubConfigWithDefaults):
+            result = build_llm_config_from_flags(
+                models=["gpt-5"], consensus="mistral-large-latest", auto_detect=False,
+            )
+        assert result is not None
+        consensus_models = [m for m in result.fallback_models if m.role == "consensus"]
+        assert len(consensus_models) == 1
+        assert consensus_models[0].model_name == "mistral-large-latest"
+        assert all(m.provider != "gemini" for m in result.fallback_models)
 
 
 # -----------------------------------------------------------------------
@@ -1355,3 +1831,306 @@ class TestScaPatchPrompt:
         bundle = build_patch_prompt_bundle_from_finding(finding)
         user_msg = next(m.content for m in bundle.messages if m.role == "user")
         assert "sqli" in user_msg or "db.py" in user_msg
+
+
+class TestProvenModelBreakerThreshold:
+    """Both directions of _BREAKER_PROVEN_THRESHOLD: a proven model
+    riding out a sub-threshold burst keeps dispatching, while a proven
+    model failing permanently (mid-run credential expiry, provider
+    outage) still opens the breaker instead of burning one timeout per
+    remaining work item — pre-fix the never-succeeded requirement
+    (completed == consec) meant one early success disabled the breaker
+    for the whole run."""
+
+    def test_proven_model_sub_threshold_burst_survives(self):
+        findings = [_make_finding(f"f-{i:03d}") for i in range(15)]
+        call_count = [0]
+
+        def burst_fn(prompt, schema, system_prompt, temperature, model):
+            call_count[0] += 1
+            # 1 success, a 9-failure burst (threshold - 1), recover.
+            if 2 <= call_count[0] <= 10:
+                raise RuntimeError("upstream blip")
+            return _make_dispatch_result()
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=burst_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        assert call_count[0] == 15          # every item dispatched
+        assert not [r for r in results
+                    if r.get("error_type") == "circuit_breaker"
+                    or str(r.get("error", "")).startswith("aborted")]
+
+    def test_proven_model_permanent_failure_opens_breaker(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        findings = [_make_finding(f"f-{i:03d}") for i in range(30)]
+        calls = []
+        queue_cancelled = threading.Event()
+        abort_deadline = None
+
+        class CancellationExecutor(ThreadPoolExecutor):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+                if cancel_futures:
+                    # Publish only after the real executor has cancelled its
+                    # queue, so releasing the straggler cannot start more work.
+                    queue_cancelled.set()
+
+        def _drained_failures() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return sum(s["schema_failed"] for s in models.values())
+
+        def dead_after_one(prompt, schema, system_prompt, temperature,
+                           model):
+            nonlocal abort_deadline
+            n_prior_failures = max(0, len(calls) - 1)
+            calls.append(1)
+            if len(calls) == 1:
+                return _make_dispatch_result()
+            if n_prior_failures >= _BREAKER_PROVEN_THRESHOLD:
+                # This call may have passed the dead-model check before the
+                # drain published the breaker. Hold it until queue cancellation
+                # completes; telemetry alone precedes that publication.
+                if abort_deadline is None:
+                    abort_deadline = time.monotonic() + 5.0
+                queue_cancelled.wait(max(0.0, abort_deadline - time.monotonic()))
+            else:
+                deadline = time.monotonic() + 10.0
+                while (_drained_failures() < n_prior_failures
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
+            raise RuntimeError("credential expired mid-run")
+
+        with patch("packages.llm_analysis.dispatch.ThreadPoolExecutor", CancellationExecutor):
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=dead_after_one,
+                role_resolution={},
+                prior_results={},
+                cost_tracker=CostTracker(0),
+                max_parallel=1,
+            )
+        defense_telemetry.reset()
+
+        # One success, the proven threshold, and at most one in-flight
+        # straggler. The remaining items must be cancelled or short-circuited.
+        assert queue_cancelled.is_set(), "breaker did not cancel queued work"
+        assert 1 + _BREAKER_PROVEN_THRESHOLD <= len(calls) <= 2 + _BREAKER_PROVEN_THRESHOLD
+        assert len(results) == 30
+        broken = [r for r in results
+                  if r.get("error_type") == "circuit_breaker"
+                  or str(r.get("error", "")).startswith("aborted")]
+        assert len(broken) >= 30 - (2 + _BREAKER_PROVEN_THRESHOLD)
+
+    def test_success_resets_consecutive_failure_counter(self):
+        """The success branch's ``pm["consec"] = 0`` is what makes the
+        streak CONSECUTIVE rather than cumulative: a model alternating
+        failure/success accumulates 15 failures over 30 calls but never
+        two in a row, so the breaker must never open. Dropping the
+        reset would open the circuit at the proven threshold and
+        short-circuit the rest of the run for a mostly-healthy model.
+        The success direction is schedule-independent (a breaker that
+        never opens has no dead-check to race); the drain-sync below
+        exists so the mutated code reliably reaches the threshold
+        before the run completes."""
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        findings = [_make_finding(f"f-{i:03d}") for i in range(30)]
+        calls = []
+
+        def _drained_failures() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return sum(s["schema_failed"] for s in models.values())
+
+        def alternating(prompt, schema, system_prompt, temperature,
+                        model):
+            calls.append(1)
+            n = len(calls)
+            # Even-numbered calls fail; call 1 succeeds first so the
+            # model is proven (completed > consec forever after).
+            n_prior_failures = (n - 1) // 2
+            deadline = time.monotonic() + 10.0
+            while (_drained_failures() < n_prior_failures
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            if n % 2 == 0:
+                raise RuntimeError("intermittent blip")
+            return _make_dispatch_result()
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=alternating,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        defense_telemetry.reset()
+
+        assert len(calls) == 30             # every item dispatched
+        assert not [r for r in results
+                    if r.get("error_type") == "circuit_breaker"
+                    or str(r.get("error", "")).startswith("aborted")]
+
+
+class TestAbortStragglerSweep:
+    """All-models-dead abort with a real straggler in flight: the
+    worker's dead-check beat the dead-add, so a REAL API call was made
+    — and the executor context-exit (shutdown(wait=True)) joins the
+    worker, so by backfill time that future is done-but-undrained. Its
+    outcome must be swept: the failure's telemetry event recorded and
+    its row carrying the real error (a success carrying its real
+    result), never the backfill's "aborted (...)" mislabel."""
+
+    @staticmethod
+    def _drained_failures() -> int:
+        from core.security.prompt_telemetry import defense_telemetry
+        models = defense_telemetry.summary()[
+            "defense_telemetry"]["models"]
+        return sum(s["schema_failed"] for s in models.values())
+
+    class _DwellStderr:
+        """File-like stderr shim that pins the race deterministically:
+        the drain thread's breaker-open print runs AFTER the third
+        failure's telemetry record and BEFORE the dead-add, so dwelling
+        inside that write until the straggler (call 4) has entered
+        dispatch_fn guarantees exactly one real straggler. Bounded so a
+        regression fails loudly instead of hanging the suite."""
+
+        def __init__(self, inner, calls):
+            self._inner = inner
+            self._calls = calls
+
+        def write(self, text):
+            if "stopping dispatch" in text:
+                deadline = time.monotonic() + 10.0
+                while (len(self._calls) < 4
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
+            return self._inner.write(text)
+
+        def flush(self):
+            return self._inner.flush()
+
+    def _run_abort_scenario(self, straggler_outcome):
+        """Drive the only model dead in 3 failures with a 4th call in
+        flight; ``straggler_outcome(prompt)`` decides how call 4
+        completes. Returns (results, calls, drained_failure_count,
+        per-model telemetry summary captured before the reset)."""
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        model = MagicMock(model_name="only-model")
+        findings = [_make_finding(f"f-{i:03d}") for i in range(4)]
+        calls = []
+
+        def mock_fn(prompt, schema, system_prompt, temperature, m):
+            calls.append(1)
+            n = len(calls)
+            # Deterministic drain sync (cf. the dead-futures test):
+            # block until every PRIOR failure has been drained.
+            deadline = time.monotonic() + 10.0
+            while (self._drained_failures() < min(n - 1, 3)
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            if n == 4:
+                return straggler_outcome(prompt)
+            raise RuntimeError("model keeps exploding")
+
+        old_stderr = sys.stderr
+        sys.stderr = self._DwellStderr(old_stderr, calls)
+        try:
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=mock_fn,
+                role_resolution={"analysis_models": [model]},
+                prior_results={},
+                cost_tracker=CostTracker(0),
+                max_parallel=1,
+            )
+        finally:
+            sys.stderr = old_stderr
+
+        drained = self._drained_failures()
+        telemetry = defense_telemetry.summary()[
+            "defense_telemetry"]["models"].get("only-model", {})
+        defense_telemetry.reset()
+        # The dwell held the dead-add until call 4 had entered, and
+        # with 4 items there is no 5th future to race: exactly one
+        # real straggler, every run.
+        assert len(calls) == 4
+        assert len(results) == 4
+        return results, calls, drained, telemetry
+
+    def test_abort_straggler_failure_keeps_telemetry_and_real_row(self):
+        def _fail(prompt):
+            raise RuntimeError("straggler exploded for real")
+
+        results, calls, drained, _ = self._run_abort_scenario(_fail)
+
+        # Every REAL failure recorded exactly once — including the
+        # straggler's, which the drain loop's abort break never saw.
+        assert drained == 4
+        by_id = {r["finding_id"]: r for r in results}
+        straggler = by_id["f-003"]
+        assert straggler["error"] == "straggler exploded for real"
+        assert straggler["error_type"] == "error"
+        assert straggler["analysed_by"] == "only-model"
+
+    def test_abort_straggler_success_keeps_real_result(self):
+        results, calls, drained, _ = self._run_abort_scenario(
+            lambda prompt: _make_dispatch_result())
+
+        assert drained == 3                 # the three real failures
+        by_id = {r["finding_id"]: r for r in results}
+        straggler = by_id["f-003"]
+        # A completed success is a paid-for result: it must ride the
+        # results list, not be rewritten as an abort casualty.
+        assert "error" not in straggler
+        assert straggler["_quality"] == 1.0
+
+    def test_abort_straggler_success_runs_nonce_leak_check(self):
+        """A swept success must pass the same nonce-leak check as a
+        drained one: the leak flag feeds the defense summary and the
+        cross-family recheck's item selection, both of which still
+        consume it after an abort — and the recheck skips rows with an
+        ``error`` key, so BASE's "aborted" mislabel accidentally
+        quarantined a leaking straggler while an unchecked sweep would
+        promote it as a valid, unflagged analysis row."""
+        def _echo(prompt):
+            # Echoing the prompt reflects the envelope — and its nonce.
+            return DispatchResult(
+                result={
+                    "is_true_positive": True,
+                    "is_exploitable": True,
+                    "exploitability_score": 0.9,
+                    "reasoning": "r",
+                    "content": prompt,
+                },
+                cost=0.10, tokens=500, model="only-model", duration=5.0,
+            )
+
+        results, calls, drained, telemetry = self._run_abort_scenario(
+            _echo)
+
+        by_id = {r["finding_id"]: r for r in results}
+        straggler = by_id["f-003"]
+        assert "error" not in straggler
+        assert straggler.get("_nonce_leaked") is True
+        assert telemetry.get("nonce_leaks", 0) == 1
+        assert telemetry.get("schema_accepted", 0) == 1

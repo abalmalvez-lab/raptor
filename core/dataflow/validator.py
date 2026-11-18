@@ -14,9 +14,11 @@ they implement.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable, TYPE_CHECKING
 
-from core.dataflow.finding import Finding
+
+if TYPE_CHECKING:
+    from core.dataflow.finding import Finding
 
 
 class ValidatorVerdict(str, Enum):
@@ -45,9 +47,10 @@ class Validator(Protocol):
 class TrivialValidator:
     """The producer-only baseline: every finding is exploitable.
 
-    Recall is always 1.0 (never says not-exploitable, so never
-    misses a TP). Precision equals the corpus's TP share. Useful
-    as the floor every later validator must beat.
+    Recall is 1.0 when true-positive labels exist, otherwise undefined.
+    Precision equals the corpus's TP share for a non-empty corpus and
+    is undefined for an empty corpus. This baseline never predicts
+    not-exploitable or uncertain.
     """
 
     def validate(self, finding: Finding) -> ValidatorVerdict:

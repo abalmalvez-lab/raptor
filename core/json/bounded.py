@@ -1,0 +1,165 @@
+"""Bounded JSON entry points for attacker-influenced sources.
+
+``core.json.utils.load_json`` serves RAPTOR-owned artifacts, where
+the writer is trusted and the failure mode of interest is a corrupt
+or half-written file. The helpers here serve the OTHER input class:
+JSON another principal can inflate at will — tool output produced
+over a hostile target (SARIF, scanner ``--json`` payloads), files
+discovered inside a scanned repository, and network responses. For
+those, parsing before sizing is a memory-exhaustion primitive: a
+multi-gigabyte payload OOM-kills the scan before any content check
+runs.
+
+These helpers gate on size BEFORE the parse (and, for files, BEFORE
+the read) and fail closed with a distinct, size-mentioning
+:class:`JsonBudgetExceededError`. The error subclasses ``ValueError``
+so call sites with an existing ``except ValueError`` /
+``except json.JSONDecodeError`` malformed-input path degrade the same
+way for over-budget input without new plumbing — while callers that
+want to report the refusal distinctly can catch the subclass.
+
+Kept separate from ``core.json.utils`` so the security-bound surface
+stays small, explicit, and greppable.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import stat as _stat
+from pathlib import Path
+from typing import Any, BinaryIO
+
+from core.json.utils import JsonBudgetExceededError, _parse_finite_float, _reject_non_finite
+from core.source.streams import owned_fd, preserving_stream_error
+
+__all__ = [
+    "JsonBudgetExceededError",  # canonical home: core.json.utils
+    "load_json_bounded",
+    "load_json_stream_bounded",
+    "loads_bounded",
+]
+
+logger = logging.getLogger(__name__)
+
+
+def loads_bounded(data: str | bytes, *, max_bytes: int) -> Any:
+    """Parse in-memory JSON with a size gate BEFORE the parse.
+
+    For ``bytes`` the gate is exact; for ``str`` it counts characters
+    (a lower bound on the UTF-8 byte length — the string is already
+    materialised, so the gate's job is bounding parse cost, which
+    scales with length, not re-measuring memory).
+
+    Raises:
+        JsonBudgetExceededError: input longer than ``max_bytes``.
+        ValueError: malformed JSON, or a non-finite constant
+            (``NaN`` / ``Infinity`` — same default hardening as
+            ``core.json.utils.load_json``).
+    """
+    unit = "bytes" if isinstance(data, (bytes, bytearray)) else "characters"
+    size = len(data)
+    if size > max_bytes:
+        msg = (
+            f"JSON input is {size} {unit} — exceeds the "
+            f"{max_bytes}-byte budget; refusing to parse"
+        )
+        logger.warning("%s", msg)
+        raise JsonBudgetExceededError(msg)
+    return json.loads(data, parse_constant=_reject_non_finite, parse_float=_parse_finite_float)
+
+
+def _gate_regular_json(st: os.stat_result, label: str | Path, max_bytes: int) -> None:
+    if not _stat.S_ISREG(st.st_mode):
+        msg = (
+            f"refusing to read {label}: not a regular file "
+            f"(mode=0o{st.st_mode:o})"
+        )
+        logger.warning("%s", msg)
+        raise ValueError(msg)
+    if st.st_size > max_bytes:
+        msg = (
+            f"JSON file {label} is {st.st_size} bytes — exceeds the "
+            f"{max_bytes}-byte budget; refusing to read"
+        )
+        logger.warning("%s", msg)
+        raise JsonBudgetExceededError(msg)
+
+
+def _read_json_bytes(stream: BinaryIO, max_bytes: int) -> bytes:
+    return stream.read(max_bytes + 1)
+
+
+def _parse_file_json(raw: bytes, label: str | Path, max_bytes: int) -> Any:
+    if len(raw) > max_bytes:
+        msg = (
+            f"JSON file {label} grew past the {max_bytes}-byte budget "
+            f"during read; refusing to parse"
+        )
+        logger.warning("%s", msg)
+        raise JsonBudgetExceededError(msg)
+    return json.loads(
+        raw.decode("utf-8-sig", errors="replace"),
+        parse_constant=_reject_non_finite,
+        parse_float=_parse_finite_float,
+    )
+
+
+def load_json_stream_bounded(stream: BinaryIO, *, max_bytes: int) -> Any:
+    """Parse a borrowed regular binary stream without closing it.
+
+    The opened descriptor is checked for regular-file type and whole-file
+    size before any read. Reading starts at the stream's current position,
+    consumes at most ``max_bytes + 1`` bytes and uses the path reader's
+    UTF-8/BOM and finite-number rules. Every failure raises; ownership and
+    cleanup remain with the caller on both success and failure.
+
+    These checks bound input, not identity or freshness. A caller requiring
+    a stable file version must independently bind and recheck its descriptor.
+    """
+    label = "<open stream>"
+    _gate_regular_json(os.fstat(stream.fileno()), label, max_bytes)
+    raw = _read_json_bytes(stream, max_bytes)
+    return _parse_file_json(raw, label, max_bytes)
+
+
+def load_json_bounded(path: str | Path, *, max_bytes: int) -> Any:
+    """Load a JSON file with a ``stat()`` size gate BEFORE any read.
+
+    Strict contract (unlike ``load_json``'s warn-and-``None``): every
+    failure raises, so an unreadable or over-budget file can't be
+    confused with a parsed ``null``. The read itself is capped at
+    ``max_bytes + 1`` so a file that grows between stat and read is
+    still refused without buffering past the budget. Decoding is
+    ``utf-8-sig`` (BOM-tolerant, matching ``load_json``) with
+    ``errors="replace"`` so adversarial byte sequences surface as a
+    parse error, not a crash.
+
+    Raises:
+        OSError: missing / unreadable file.
+        JsonBudgetExceededError: file larger than ``max_bytes``.
+        ValueError: non-regular file (FIFO, socket, device — an
+            unbounded-read primitive), malformed JSON, or a
+            non-finite constant.
+    """
+    p = Path(path)
+    # Open FIRST, then fstat the OPEN fd — a stat-by-name followed by
+    # a separate open-by-name left a swap window where a regular file
+    # replaced by a FIFO between the two calls re-enabled the exact
+    # plantable-hang the S_ISREG gate refuses (the open on the FIFO
+    # blocks forever). O_NONBLOCK makes a FIFO/device open return
+    # immediately instead of blocking (it has no effect on regular-
+    # file reads), and the fstat then sees the true inode.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(str(p), flags)
+    with owned_fd(fd, close_fd=lambda descriptor: os.close(descriptor)):
+        st = os.fstat(fd)
+        _gate_regular_json(st, p, max_bytes)
+        with preserving_stream_error(os.fdopen(fd, "rb", closefd=False)) as fh:
+            raw = _read_json_bytes(fh, max_bytes)
+    return _parse_file_json(raw, p, max_bytes)

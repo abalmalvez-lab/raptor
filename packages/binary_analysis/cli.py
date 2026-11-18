@@ -1,0 +1,1438 @@
+"""Operator CLI for evidence-backed black-box binary work.
+
+This is the human-facing router behind ``/binary`` and ``raptor.py binary``.
+It keeps the substrate mechanical:
+
+- ``map`` reads bytes and radare2 output, and can ingest evidence
+  from EXISTING runtime / fuzz run directories (``--runtime-dir`` /
+  ``--fuzz-dir``) — it never executes the target itself.
+- ``runtime`` is an explicit Frida run.
+- ``harness`` turns one evidence-backed ingress into a harness plan.
+- ``fuzz`` is an explicit handoff to the existing fuzz workflow.
+- ``corpus`` profiles a directory of input samples with byte
+  statistics only — it never parses a sample semantically and never
+  executes anything.
+- ``graph`` / ``report`` / ``handoff`` are read-only views.
+- ``diagram`` is a derived view too, but writes ``diagrams.md`` into
+  the run dir by default (``--stdout`` prints instead; ``--force``
+  overwrites).
+
+The CLI does not silently execute an unknown target during ``map``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+# Path setup for direct script execution (`python3 raptor.py binary`
+# spawns this file; `libexec/raptor-binary` imports it with the path
+# already set). RAPTOR_DIR is the canonical project-root marker — hard
+# lookup per the CLAUDE.md path-safety rule: KeyError if unset, no
+# positional-walk fallback that silently imports a different checkout.
+if __name__ == "__main__":
+    sys.path.insert(0, os.environ["RAPTOR_DIR"])
+
+from core.atomic_fs import open_exclusive_artifact, open_hardened_append
+from core.hash import sha256_file
+from core.security.log_sanitisation import (
+    escape_nonprintable,
+    sanitise_for_terminal,
+)
+from core.config import RaptorConfig
+from core.json import load_json, save_json
+from core.project.registry_home import RegistryHomeError
+from core.run.metadata import complete_run, fail_run, start_run
+from core.run.output import TargetMismatchError, get_output_dir
+
+from packages.binary_analysis.corpus_profile import (
+    CorpusProfileOptions,
+    DEFAULT_MAX_BYTES_PER_SAMPLE,
+    DEFAULT_MAX_SAMPLES,
+    profile_corpus,
+)
+from packages.binary_analysis.investigation import write_investigation
+from packages.binary_analysis.harness import generate_binary_harness
+from packages.binary_analysis.manifest import BinaryManifest
+from packages.binary_analysis.pipeline import map_result_payload
+from packages.binary_analysis.pipeline import analyse_blackbox_binary, append_runtime_evidence_to_run
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+_COMMANDS = {
+    "investigate",
+    "map",
+    "runtime",
+    "trace-parser",
+    "harness",
+    "corpus",
+    "hunt",
+    "siblings",
+    "fuzz",
+    "graph",
+    "report",
+    "handoff",
+    "diagram",
+    "help",
+}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _normalise_argv(argv: Sequence[str]) -> list[str]:
+    args = list(argv)
+    if not args:
+        return ["help"]
+    if args[0] in {"-h", "--help"}:
+        return ["help"]
+    if args[0] not in _COMMANDS and not args[0].startswith("-"):
+        return ["investigate", *args]
+    return args
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        msg = "must be > 0"
+        raise argparse.ArgumentTypeError(msg)
+    return number
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="raptor-binary",
+        description="Evidence-backed black-box binary understanding and follow-on evidence collection.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("help", help="Show this help")
+
+    investigate_p = sub.add_parser("investigate", help="Run an autonomous evidence-first binary investigation")
+    _add_map_args(investigate_p)
+    investigate_p.add_argument("--runtime", action="store_true", help="Explicitly run a Frida evidence phase before the final map")
+    investigate_p.add_argument("--fuzz", action="store_true", help="Explicitly run a short fuzz phase before the final map")
+    investigate_p.add_argument("--active", action="store_true", help="Explicitly allow both runtime and fuzz phases")
+    investigate_p.add_argument("--runtime-duration", type=_positive_int, default=30, help="Seconds for --runtime/--active Frida phase")
+    investigate_p.add_argument("--fuzz-duration", type=_positive_int, default=60, help="Seconds for --fuzz/--active fuzz phase")
+
+    map_p = sub.add_parser("map", help="Build a static binary map and graph")
+    _add_map_args(map_p)
+
+    runtime_p = sub.add_parser("runtime", help="Collect explicit Frida input-callsite evidence")
+    runtime_p.add_argument("target", help="Binary, process name, bundle id or PID")
+    _add_trace_args(runtime_p, include_out=True)
+
+    trace_parser_p = sub.add_parser(
+        "trace-parser",
+        help="Run parser-focused Frida tracing and refresh an existing binary run",
+    )
+    trace_parser_p.add_argument("run_dir", help="Existing /binary investigate or map output directory")
+    _add_trace_args(trace_parser_p, include_out=False)
+
+    harness_p = sub.add_parser("harness", help="Plan or generate a candidate harness for one recovered ingress")
+    harness_p.add_argument("run_dir", help="Existing /binary investigate or map output directory")
+    harness_p.add_argument("--ingress", help="Ingress id to target; defaults to the highest-ranked ingress")
+    harness_p.add_argument(
+        "--llm-rank", action="store_true",
+        help="LLM re-rank of the ingress candidates before the default "
+             "selection cascade (ordering only; explicit --ingress wins)",
+    )
+    harness_p.add_argument("--abi", choices=["buffer-size", "cstring"], help="Operator-supplied ABI shape for exported APIs")
+    harness_p.add_argument("--device", help="Operator-supplied device path for ioctl harnesses")
+    harness_p.add_argument("--ioctl-code", help="Operator-supplied ioctl/control code, for example 0x222003")
+    harness_p.add_argument("--json", action="store_true", help="Emit compact JSON")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(harness_p)
+
+    corpus_p = sub.add_parser(
+        "corpus",
+        help="Profile a directory of input samples (byte statistics only; no parsing, no execution)",
+    )
+    corpus_p.add_argument("samples_dir", help="Directory of input samples harvested for the target")
+    corpus_p.add_argument("--family", help="Only profile samples whose relative path matches this glob")
+    corpus_p.add_argument(
+        "--max-samples", type=_positive_int, default=DEFAULT_MAX_SAMPLES,
+        help=f"Maximum samples to profile (default: {DEFAULT_MAX_SAMPLES})",
+    )
+    corpus_p.add_argument(
+        "--max-bytes-per-sample", type=_positive_int, default=DEFAULT_MAX_BYTES_PER_SAMPLE,
+        help=f"Per-sample read cap in bytes (default: {DEFAULT_MAX_BYTES_PER_SAMPLE})",
+    )
+    corpus_p.add_argument("--out", help="Explicit output directory")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(corpus_p)
+    hunt_p = sub.add_parser(
+        "hunt",
+        help="Operator-steered anchor-family and call-graph hunt over a mapped binary",
+    )
+    hunt_p.add_argument(
+        "target",
+        help="Existing binary run directory, or a binary (mapped first, like map)",
+    )
+    hunt_p.add_argument(
+        "--anchor", action="append", default=[], metavar="TEXT",
+        help="Anchor string to hunt (repeatable; substring match by default)",
+    )
+    hunt_p.add_argument(
+        "--anchor-re", action="store_true",
+        help="Treat --anchor values as regexes (size/complexity bounded)",
+    )
+    hunt_p.add_argument(
+        "--calls", metavar="FID_OR_NAME",
+        help="List callers of this function (fid or name)",
+    )
+    hunt_p.add_argument(
+        "--and-not-calls", metavar="FID_OR_NAME",
+        help="Subtract callers of this function from --calls (chokepoint residual)",
+    )
+    hunt_p.add_argument(
+        "--transitive", action="store_true",
+        help="Walk callers transitively (bounded depth) instead of direct only",
+    )
+    hunt_p.add_argument(
+        "--max-depth", type=_positive_int, default=None,
+        help="Transitive caller depth (clamped to the documented cap)",
+    )
+    hunt_p.add_argument("--json", action="store_true", help="Emit compact JSON")
+    add_report_arguments(hunt_p)
+
+    siblings_p = sub.add_parser(
+        "siblings",
+        help=("Sibling-consistency pass: peer clusters, per-member "
+              "check vectors, N-vs-K outlier flagging (review leads, "
+              "never findings)"),
+    )
+    siblings_p.add_argument(
+        "run_dir",
+        help="Existing /binary investigate or map output directory",
+    )
+    siblings_p.add_argument(
+        "--family", metavar="ID",
+        help="Analyse one hunt anchor family (BHUNTFAM-... id)",
+    )
+    siblings_p.add_argument(
+        "--auto", action="store_true",
+        help=("Full bounded peer-group formation (all layers) instead "
+              "of hunt-artifact families only"),
+    )
+    from packages.binary_analysis.siblings import MIN_CLUSTER_DEFAULT
+    siblings_p.add_argument(
+        "--min-cluster", type=_positive_int, default=MIN_CLUSTER_DEFAULT,
+        help=(f"Smallest cluster analysed (default: "
+              f"{MIN_CLUSTER_DEFAULT} — the smallest split where a "
+              f"majority exists)"),
+    )
+    siblings_p.add_argument("--json", action="store_true", help="Emit compact JSON")
+    add_report_arguments(siblings_p)
+
+    fuzz_p = sub.add_parser("fuzz", help="Hand off to RAPTOR's existing fuzz workflow")
+    fuzz_p.add_argument("target", help="Binary to fuzz")
+    fuzz_p.add_argument("fuzz_args", nargs=argparse.REMAINDER, help="Additional /fuzz arguments")
+
+    graph_p = sub.add_parser("graph", help="Query the binary graph")
+    graph_p.add_argument("run_dir", help="Binary map output directory")
+    graph_p.add_argument("--edges", action="store_true", help="List graph edges")
+    graph_p.add_argument("--evidence", action="store_true", help="List evidence records")
+    graph_p.add_argument("--kind", help="Filter graph edges by kind")
+    graph_p.add_argument("--tier", help="Filter evidence by tier")
+    graph_p.add_argument("--json", action="store_true", help="Emit JSON")
+    add_report_arguments(graph_p)
+
+    report_p = sub.add_parser("report", help="Print the investigation report, or the map report when no investigation exists")
+    report_p.add_argument("run_dir", help="Binary map output directory")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(report_p)
+
+    handoff_p = sub.add_parser("handoff", help="Print the validation handoff JSON")
+    handoff_p.add_argument("run_dir", help="Binary map output directory")
+    handoff_p.add_argument("--json", action="store_true", help="Emit compact JSON instead of pretty JSON")
+
+    diagram_p = sub.add_parser("diagram", help="Render diagrams from a binary map run")
+    diagram_p.add_argument("run_dir", help="Binary map output directory")
+    diagram_p.add_argument("--target", help="Display name to use in the diagram heading")
+    diagram_p.add_argument("--stdout", action="store_true", help="Print diagrams rather than writing diagrams.md")
+    diagram_p.add_argument("--force", action="store_true", help="Overwrite an existing diagrams.md")
+    add_report_arguments(diagram_p)
+
+    return parser
+
+
+def _add_map_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("target", help="Binary or compiled application executable")
+    parser.add_argument("--out", help="Explicit output directory")
+    parser.add_argument("--quick", action="store_true", help="Header/import intake only; skip deep radare2 analysis")
+    parser.add_argument("--slice-arch", help="Mach-O slice to deeply analyse, for example arm64 or x86_64")
+    parser.add_argument("--max-decompile", type=_positive_int, default=20, help="Maximum functions to decompile and persist")
+    parser.add_argument("--decompile-all", action="store_true", help="Persist pseudocode for every recovered function")
+    parser.add_argument("--no-string-anchors", action="store_true", help="Skip the bounded diagnostic-string anchor pass")
+    parser.add_argument("--runtime-dir", help="Existing /binary runtime or /frida run to ingest")
+    parser.add_argument("--fuzz-dir", help="Existing /binary fuzz or /fuzz run to ingest")
+    parser.add_argument("--constraint-file", help="JSON file containing explicit SMT path conditions")
+    parser.add_argument("--compare", help="Older compiled artefact to compare against")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(parser)
+
+
+def _add_trace_args(parser: argparse.ArgumentParser, *, include_out: bool) -> None:
+    parser.add_argument("--duration", type=_positive_int, default=30, help="Seconds to trace (default: 30)")
+    if include_out:
+        parser.add_argument("--out", help="Explicit Frida output directory")
+    parser.add_argument("--spawn", action="store_true", help="Force spawn-and-attach")
+    parser.add_argument("--unsafe-attach", action="store_true", help="Allow attach mode outside the sandbox")
+    parser.add_argument("--host", help="Remote frida-server host[:port]")
+    parser.add_argument("--usb", action="store_true", help="Use the first USB-connected device")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(parser)
+
+
+
+def _print_map_summary(payload: dict[str, Any], output_path: Path) -> None:
+    summary = payload["correlation"]["summary"]
+    print("Mode: map")
+    print("Models: none (mechanical binary substrate)")
+    print(f"Items: {len(payload['items'])}")
+    print("Summary: " + " | ".join(f"{key}={summary[key]}" for key in sorted(summary)))
+    print(f"Output: {output_path}")
+    print(f"Report: {output_path.parent / 'binary-analysis-report.md'}")
+    print(f"Handoff: {payload['artifacts']['binary_validation_handoff']}")
+    print(f"Graph: {payload['artifacts']['binary_graph']}")
+
+
+def _resolve_target_and_out(args: argparse.Namespace) -> tuple[Path, Path] | None:
+    target = Path(args.target).expanduser().resolve()
+    if not target.exists() or not target.is_file():
+        print(f"raptor-binary: target is not a file: {target}", file=sys.stderr)
+        return None
+    try:
+        out_dir = get_output_dir(
+            "understand",
+            target_name=target.stem,
+            explicit_out=args.out,
+            target_path=str(target),
+        )
+    except (TargetMismatchError, RegistryHomeError) as exc:
+        print(f"raptor-binary: {exc}", file=sys.stderr)
+        return None
+    return target, out_dir
+
+
+def _analyse_for_args(
+    args: argparse.Namespace,
+    target: Path,
+    out_dir: Path,
+    *,
+    runtime_dir: Path | None = None,
+    fuzz_dir: Path | None = None,
+) -> Any:
+    return analyse_blackbox_binary(
+        target,
+        out_dir=out_dir,
+        quick=bool(args.quick),
+        max_decompile=(1_000_000 if args.decompile_all else args.max_decompile),
+        slice_arch=args.slice_arch,
+        string_anchors=not getattr(args, "no_string_anchors", False),
+        runtime_dir=runtime_dir or (Path(args.runtime_dir).expanduser().resolve() if args.runtime_dir else None),
+        fuzz_dir=fuzz_dir or (Path(args.fuzz_dir).expanduser().resolve() if args.fuzz_dir else None),
+        constraint_file=Path(args.constraint_file).expanduser().resolve() if args.constraint_file else None,
+        compare_binary=Path(args.compare).expanduser().resolve() if args.compare else None,
+    )
+
+
+def _run_map(args: argparse.Namespace) -> int:
+    resolved = _resolve_target_and_out(args)
+    if resolved is None:
+        return 2
+    target, out_dir = resolved
+
+    from core.project.oplock import OpLockContention
+    from core.run.pin import ProjectArgvError
+    try:
+        start_run(out_dir, "understand", target=str(target))
+        _capture_map_lifecycle(args, out_dir)
+    except (OpLockContention, ProjectArgvError) as e:
+        print(f"raptor-binary: {e}", file=sys.stderr)
+        return 1
+    try:
+        result = _analyse_for_args(args, target, out_dir)
+        payload = map_result_payload(result, out_dir)
+        output_path = out_dir / "map-result.json"
+        save_json(output_path, payload)
+        complete_run(out_dir)
+    except KeyboardInterrupt:
+        fail_run(out_dir, "binary map interrupted")
+        raise
+    except Exception as exc:  # noqa: BLE001 - operator-facing clean failure
+        fail_run(out_dir, f"binary map failed: {type(exc).__name__}: {sanitise_for_terminal(str(exc), max_len=300)}")
+        print(f"raptor-binary: map failed: {type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return 1
+    _print_map_summary(payload, output_path)
+    _complete_map_report(args, payload, result, out_dir, 0)
+    return 0
+
+
+def _run_active_phase(
+    *,
+    kind: str,
+    cmd: list[str],
+    output_dir: Path,
+    trusted: bool = False,
+    llm: bool = False,
+) -> dict[str, Any]:
+    """``llm=True`` for children that make LLM calls (raptor_fuzzing's
+    crash analysis): they get ``get_llm_env()`` — API keys + the
+    transport-routing family — instead of the bare safe baseline that
+    starves their backend selection. Frida trace phases stay on the
+    safe env."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = output_dir / "stdout.log"
+    stderr_path = output_dir / "stderr.log"
+    try:
+        env = RaptorConfig.get_llm_env() if llm else RaptorConfig.get_safe_env()
+        if trusted:
+            env.setdefault("_RAPTOR_TRUSTED", "1")
+        # Stream the child's output straight into the log files:
+        # capture_output buffered an hour-long fuzz/frida child's full
+        # stdout+stderr in THIS process's memory before a single byte
+        # hit disk. Consumers only ever read the log files.
+        # Exclusive create (lstat-honest replace + O_EXCL|O_NOFOLLOW):
+        # the phase dir is reused run output previous phases' children
+        # had write on — a planted symlink/FIFO at the predictable log
+        # names must not be followed / block the open.
+        with os.fdopen(
+            open_exclusive_artifact(stdout_path, replace=True),
+            "w", encoding="utf-8",
+        ) as out_fh, os.fdopen(
+            open_exclusive_artifact(stderr_path, replace=True),
+            "w", encoding="utf-8",
+        ) as err_fh:
+            proc = subprocess.run(
+                cmd,
+                stdout=out_fh,
+                stderr=err_fh,
+                text=True,
+                env=env,
+                check=False,
+                timeout=3600,
+            )
+        return {
+            "kind": kind,
+            "status": "completed" if proc.returncode == 0 else "failed",
+            "returncode": proc.returncode,
+            "output_dir": str(output_dir),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "command": cmd,
+        }
+    except Exception as exc:  # noqa: BLE001 - report phase failure, keep static map useful
+        # Exception text echoes the child's argv and paths — target-
+        # influenced content (a hostile filename rides TimeoutExpired's
+        # message), so it goes through the same terminal-grade scrub
+        # as every other exc interpolation in this module. Append —
+        # the streamed partial output (e.g. up to a timeout kill) is
+        # diagnostic and must not be clobbered.
+        error_line = (
+            f"{type(exc).__name__}: "
+            f"{sanitise_for_terminal(str(exc), max_len=300)}"
+        )
+        # Hardened append (O_NOFOLLOW + FIFO refusal): the failure
+        # path can run before the exclusive create above (spawn
+        # refused), so the append must not trust the name either.
+        # The refusal itself must not escape this record-and-return
+        # containment: a hostile object occupying stderr.log (a
+        # planted directory -> EISDIR, a symlink/FIFO re-planted in
+        # the unlink->O_EXCL window of the creates above -> ELOOP/
+        # ENXIO) raises from the hardened append. Note it on OUR
+        # stderr and still return the failure record — losing the
+        # record would abort the whole run and lose the static map
+        # this handler exists to keep useful.
+        try:
+            with os.fdopen(
+                open_hardened_append(stderr_path), "a", encoding="utf-8",
+            ) as err_fh:
+                err_fh.write(error_line + "\n")
+        except OSError as log_exc:
+            print(
+                f"warning: phase '{kind}' failure log not written "
+                f"({type(log_exc).__name__}: "
+                f"{sanitise_for_terminal(str(log_exc), max_len=200)}); "
+                "recording the phase failure without it",
+                file=sys.stderr,
+            )
+        return {
+            "kind": kind,
+            "status": "failed",
+            "returncode": None,
+            "output_dir": str(output_dir),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "command": cmd,
+            "error": error_line,
+        }
+
+
+def _print_investigation_summary(investigation: dict[str, Any], out_dir: Path) -> None:
+    summary = investigation["summary"]
+    print("Mode: investigate")
+    print(f"Status: {investigation['status']}")
+    print(
+        "Summary: "
+        f"surfaces={summary['surface_candidates']} | "
+        f"flows={summary['candidate_flows']} | "
+        f"ingress={summary['ranked_ingress']} | "
+        f"parser_boundaries={summary.get('parser_boundary_candidates', 0)} | "
+        f"runtime_flows={summary['runtime_input_flows']} | "
+        f"fuzz_witnesses={summary['fuzz_witnesses']} | "
+        f"sibling_artifacts={summary['discovered_artifacts']}"
+    )
+    leads = investigation.get("ranked_surfaces") or []
+    ingress = investigation.get("ranked_ingress") or []
+    parser_boundaries = investigation.get("ranked_parser_boundaries") or []
+    # Names come from the analysed binary (symbols, imports, plist
+    # strings) — hostile bytes incl. raw ESC/OSC survive r2's iij, so
+    # every name is scrubbed+bounded before it reaches the terminal
+    # (_sft is the audit-recognised conventional alias).
+    _sft = sanitise_for_terminal
+    if ingress:
+        print("Top ingress:")
+        for item in ingress[:3]:
+            print(
+                f"  - {_sft(str(item['name']))} "
+                f"({_sft(str(item['kind']))}, boundary={_sft(str(item['boundary']))})"
+            )
+    if leads:
+        print("Top leads:")
+        for item in leads[:3]:
+            print(
+                f"  - {_sft(str(item['name']))} "
+                f"({_sft(str(item['category']))}, direct_callers={item['direct_callers']})"
+            )
+    if parser_boundaries:
+        print("Top parser boundaries:")
+        for item in parser_boundaries[:3]:
+            print(
+                f"  - {_sft(str(item['boundary_function_name']))} -> "
+                f"{_sft(str(item['parser_surface_name']))} "
+                f"(ingress={_sft(str(item['ingress_name']))}, depth={item['path']['depth']})"
+            )
+    actions = investigation.get("priority_queue") or []
+    if actions:
+        print("Next actions:")
+        for item in actions[:3]:
+            # Commands embed shlex.quote()d artifact paths from the
+            # hostile bundle — quoting preserves control bytes, so the
+            # command needs the same scrub as the names above.
+            print(f"  - {_sft(str(item['command']))}")
+    print(f"Output: {out_dir}")
+    print(f"Investigation report: {out_dir / 'binary-investigation-report.md'}")
+    print(f"Investigation JSON: {out_dir / 'binary-investigation.json'}")
+
+
+def _skipped_phase(kind: str, output_dir: Path, reason: str) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "status": "skipped",
+        "returncode": None,
+        "output_dir": str(output_dir),
+        "stdout": "",
+        "stderr": "",
+        "command": [],
+        "reason": reason,
+    }
+
+
+def _run_investigate(args: argparse.Namespace) -> int:
+    resolved = _resolve_target_and_out(args)
+    if resolved is None:
+        return 2
+    target, out_dir = resolved
+    if args.runtime_dir and (args.runtime or args.active):
+        print("raptor-binary: --runtime-dir cannot be combined with --runtime/--active", file=sys.stderr)
+        return 2
+    if args.fuzz_dir and (args.fuzz or args.active):
+        print("raptor-binary: --fuzz-dir cannot be combined with --fuzz/--active", file=sys.stderr)
+        return 2
+
+    from core.project.oplock import OpLockContention
+    from core.run.pin import ProjectArgvError
+    try:
+        start_run(out_dir, "understand", target=str(target))
+        _capture_map_lifecycle(args, out_dir)
+    except (OpLockContention, ProjectArgvError) as e:
+        print(f"raptor-binary: {e}", file=sys.stderr)
+        return 1
+    active_phases: list[dict[str, Any]] = []
+    try:
+        # Always map first. Agentic follow-on work needs a mechanical view of
+        # the artefact before it decides whether runtime or fuzzing is sensible.
+        resolved_runtime_dir: Path | None = None
+        resolved_fuzz_dir: Path | None = None
+        result = _analyse_for_args(args, target, out_dir)
+        if args.runtime or args.active:
+            runtime_dir = out_dir / "runtime"
+            suitability = result.context_map.get("fuzz_suitability") or {}
+            if suitability.get("runtime_strategy", "direct_process") == "direct_process":
+                active_phases.append(_run_active_phase(
+                    kind="runtime",
+                    output_dir=runtime_dir,
+                    trusted=True,
+                    cmd=[
+                        str(_repo_root() / "libexec" / "raptor-frida"),
+                        "--target",
+                        str(target),
+                        "--template",
+                        "binary-flow-trace",
+                        "--duration",
+                        str(args.runtime_duration),
+                        "--out",
+                        str(runtime_dir),
+                    ],
+                ))
+                if active_phases[-1]["status"] == "completed":
+                    resolved_runtime_dir = runtime_dir
+                    result = _analyse_for_args(args, target, out_dir, runtime_dir=resolved_runtime_dir)
+            else:
+                active_phases.append(_skipped_phase(
+                    "runtime",
+                    runtime_dir,
+                    str(
+                        suitability.get("runtime_reason")
+                        or "This artefact needs a harness before runtime tracing is meaningful."
+                    ),
+                ))
+        if args.fuzz or args.active:
+            fuzz_dir = out_dir / "fuzz"
+            suitability = result.context_map.get("fuzz_suitability") or {}
+            strategy = str(suitability.get("strategy") or "")
+            if strategy == "direct_harness":
+                active_phases.append(_run_active_phase(
+                    kind="fuzz",
+                    output_dir=fuzz_dir,
+                    trusted=True,
+                    llm=True,
+                    cmd=[
+                        sys.executable,
+                        str(_repo_root() / "raptor_fuzzing.py"),
+                        "--orchestrator",
+                        "--binary",
+                        str(target),
+                        "--duration",
+                        str(args.fuzz_duration),
+                        "--out",
+                        str(fuzz_dir),
+                    ],
+                ))
+                if active_phases[-1]["status"] == "completed":
+                    resolved_fuzz_dir = fuzz_dir
+                    result = _analyse_for_args(
+                        args, target, out_dir,
+                        runtime_dir=resolved_runtime_dir,
+                        fuzz_dir=resolved_fuzz_dir,
+                    )
+            elif suitability.get("should_run_fuzz_plan"):
+                active_phases.append(_run_active_phase(
+                    kind="fuzz_plan",
+                    output_dir=fuzz_dir,
+                    trusted=True,
+                    llm=True,
+                    cmd=[
+                        sys.executable,
+                        str(_repo_root() / "raptor_fuzzing.py"),
+                        "--orchestrator",
+                        "--binary",
+                        str(target),
+                        "--duration",
+                        str(args.fuzz_duration),
+                        "--plan-only",
+                        "--out",
+                        str(fuzz_dir),
+                    ],
+                ))
+            else:
+                active_phases.append(_skipped_phase(
+                    "fuzz",
+                    fuzz_dir,
+                    str(
+                        suitability.get("reason")
+                        or "No evidence-backed whole-target fuzzing boundary was recovered."
+                    ),
+                ))
+
+        payload = map_result_payload(result, out_dir)
+        payload["mode"] = "investigate"
+        payload["artifacts"]["binary_investigation"] = str(out_dir / "binary-investigation.json")
+        payload["artifacts"]["binary_investigation_report"] = str(out_dir / "binary-investigation-report.md")
+        save_json(out_dir / "map-result.json", payload)
+        investigation = write_investigation(result, out_dir, active_phases=active_phases)
+        complete_run(out_dir)
+    except KeyboardInterrupt:
+        fail_run(out_dir, "binary investigation interrupted")
+        raise
+    except Exception as exc:  # noqa: BLE001 - operator-facing clean failure
+        fail_run(out_dir, f"binary investigation failed: {type(exc).__name__}: {sanitise_for_terminal(str(exc), max_len=300)}")
+        print(f"raptor-binary: investigate failed: {type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return 1
+    _print_investigation_summary(investigation, out_dir)
+    _complete_map_report(args, payload, result, out_dir, 0, active_phases=active_phases)
+    return 0
+
+
+def _run_runtime(args: argparse.Namespace) -> int:
+    return subprocess.call(_frida_trace_command(
+        target=str(args.target),
+        duration=args.duration,
+        output_dir=Path(args.out).expanduser().resolve() if args.out else None,
+        spawn=args.spawn,
+        unsafe_attach=args.unsafe_attach,
+        host=args.host,
+        usb=args.usb,
+        report_args=_forward_report_args(args),
+    ), env=RaptorConfig.get_safe_env())
+
+
+def _forward_report_args(args):
+    options = getattr(args, "_report_options", None)
+    if options is None:
+        return []
+    if not options.enabled:
+        return ["--no-report"]
+    if not (args.report_format or args.report_output):
+        return []
+    forwarded = []
+    for format_name in options.formats:
+        forwarded.extend(["--report-format", format_name])
+    if options.output is not None:
+        # The Frida sandbox may change cwd; preserve the caller's selection.
+        forwarded.extend(["--report-output", str(options.output.expanduser().resolve())])
+    return forwarded
+
+
+def _frida_trace_command(
+    *,
+    target: str,
+    duration: int,
+    output_dir: Path | None,
+    spawn: bool,
+    unsafe_attach: bool,
+    host: str | None,
+    usb: bool,
+    report_args: list[str] | None = None,
+) -> list[str]:
+    cmd = [
+        str(_repo_root() / "libexec" / "raptor-frida"),
+        "--target",
+        target,
+        "--template",
+        "binary-flow-trace",
+        "--duration",
+        str(duration),
+    ]
+    if output_dir is not None:
+        cmd.extend(["--out", str(output_dir)])
+    if spawn:
+        cmd.append("--spawn")
+    if unsafe_attach:
+        cmd.append("--unsafe-attach")
+    if host:
+        cmd.extend(["--host", host])
+    if usb:
+        cmd.append("--usb")
+    if report_args:
+        cmd.extend(report_args)
+    return cmd
+
+
+def _load_run_manifest(run_dir: Path) -> BinaryManifest | None:
+    payload = load_json(run_dir / "binary-manifest.json")
+    if not isinstance(payload, dict):
+        print(f"raptor-binary: missing binary-manifest.json: {run_dir / 'binary-manifest.json'}", file=sys.stderr)
+        return None
+    manifest = BinaryManifest.from_dict(payload)
+    if not manifest.binary_path:
+        print(f"raptor-binary: invalid binary manifest in {run_dir}", file=sys.stderr)
+        return None
+    return manifest
+
+
+def _existing_active_phases(run_dir: Path) -> list[dict[str, Any]]:
+    payload = load_json(run_dir / "binary-investigation.json")
+    if not isinstance(payload, dict):
+        return []
+    phases = payload.get("active_phases")
+    if not isinstance(phases, list):
+        return []
+    return [dict(item) for item in phases if isinstance(item, dict)]
+
+
+def _run_trace_parser(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    if not run_dir.is_dir():
+        print(f"raptor-binary: run directory does not exist: {run_dir}", file=sys.stderr)
+        return 2
+    manifest = _load_run_manifest(run_dir)
+    if manifest is None:
+        return 2
+    binary = Path(manifest.binary_path).expanduser().resolve()
+    if not binary.is_file():
+        print(f"raptor-binary: mapped binary no longer exists: {binary}", file=sys.stderr)
+        return 2
+    # Verify content identity BEFORE the Frida phase spawns the binary:
+    # the file at the manifest path may have been swapped (rebuild, or a
+    # hostile replacement in a shared workspace) since the original map
+    # run, and the evidence-refresh gate inside
+    # append_runtime_evidence_to_run only runs after execution.
+    # Residual TOCTOU window, accepted: a swap between this hash and
+    # the spawn executes the replacement — sandboxed either way — and
+    # the post-execution re-hash keeps swapped-binary evidence out of
+    # the run artifacts, so containment and evidence integrity hold;
+    # only the (sandboxed) execution itself is time-dependent.
+    try:
+        current_sha = sha256_file(binary)
+    except OSError as exc:
+        print(f"raptor-binary: cannot hash mapped binary {binary}: {exc}", file=sys.stderr)
+        return 2
+    if manifest.binary_sha256 and current_sha != manifest.binary_sha256:
+        print(
+            f"raptor-binary: mapped binary has changed since the map run "
+            f"(sha256 {current_sha} != manifest {manifest.binary_sha256}); "
+            f"refusing to execute it — re-run the map on the current binary",
+            file=sys.stderr,
+        )
+        return 2
+
+    runtime_dir = run_dir / "parser-runtime"
+    phase = _run_active_phase(
+        kind="parser_trace",
+        output_dir=runtime_dir,
+        trusted=True,
+        cmd=_frida_trace_command(
+            target=str(binary),
+            duration=args.duration,
+            output_dir=runtime_dir,
+            spawn=args.spawn,
+            unsafe_attach=args.unsafe_attach,
+            host=args.host,
+            usb=args.usb,
+            report_args=_forward_report_args(args),
+        ),
+    )
+    if phase["status"] != "completed":
+        print(
+            f"raptor-binary: parser trace failed; see {phase['stderr']}",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = append_runtime_evidence_to_run(binary, out_dir=run_dir, runtime_dir=runtime_dir)
+    if result is None:
+        print(
+            "raptor-binary: parser trace completed but the existing run could not be refreshed",
+            file=sys.stderr,
+        )
+        return 1
+
+    payload = map_result_payload(result, run_dir)
+    prior_payload = load_json(run_dir / "map-result.json")
+    if isinstance(prior_payload, dict) and prior_payload.get("mode") == "investigate":
+        payload["mode"] = "investigate"
+    payload["artifacts"]["binary_investigation"] = str(run_dir / "binary-investigation.json")
+    payload["artifacts"]["binary_investigation_report"] = str(run_dir / "binary-investigation-report.md")
+    save_json(run_dir / "map-result.json", payload)
+    investigation = write_investigation(
+        result,
+        run_dir,
+        active_phases=[*_existing_active_phases(run_dir), phase],
+    )
+    print("Mode: trace-parser")
+    print(f"Status: {phase['status']}")
+    print(f"Runtime output: {runtime_dir}")
+    print(f"Runtime parser flows: {len(result.context_map.get('runtime_parser_flows', []))}")
+    print(f"Parser boundary candidates: {len(result.context_map.get('parser_boundary_candidates', []))}")
+    print(f"Investigation status: {investigation['status']}")
+    print(f"Report: {run_dir / 'binary-investigation-report.md'}")
+    print(f"Handoff: {run_dir / 'binary-validation-handoff.json'}")
+    return 0
+
+
+def _print_corpus_summary(profile: dict[str, Any]) -> None:
+    summary = profile["summary"]
+    artifacts = profile["artifacts"]
+    print("Mode: corpus")
+    print("Models: none (mechanical byte statistics)")
+    print(
+        f"Samples: {summary['samples_profiled']} profiled of "
+        f"{summary['samples_seen']} seen | families={summary['family_count']}"
+    )
+    # Family keys embed extension/name-template characters from
+    # attacker-chosen sample filenames — same terminal scrub as the
+    # investigation summaries.
+    _sft = sanitise_for_terminal
+    for family in profile["families"][:5]:
+        size_fields = len(family["size_field_candidates"])
+        print(
+            f"  - {_sft(str(family['id']), max_len=16)} "
+            f"{_sft(str(family['key']), max_len=80)}: "
+            f"{family['sample_count']} samples, "
+            f"endianness={family['endianness_vote']}, "
+            f"entropy={family['entropy']['classification']}, "
+            f"size_fields={size_fields}, "
+            f"tlv={family['tlv']['likelihood']}"
+        )
+    if summary["caps_hit"]:
+        print(f"Caps hit: {', '.join(summary['caps_hit'])}")
+    print(f"Seeds: {artifacts['seed_count']} in {artifacts['seed_dir']}")
+    if artifacts["fuzz_dict"]:
+        print(f"Dictionary: {artifacts['fuzz_dict']} ({artifacts['dict_entries']} tokens)")
+    print(f"Profile: {artifacts['profile_json']}")
+    print(f"Report: {artifacts['report']}")
+
+
+def _run_corpus(args: argparse.Namespace) -> int:
+    samples_dir = Path(args.samples_dir).expanduser().resolve()
+    if not samples_dir.is_dir():
+        print(f"raptor-binary: samples dir is not a directory: {samples_dir}", file=sys.stderr)
+        return 2
+    try:
+        out_dir = get_output_dir(
+            "understand",
+            target_name=samples_dir.name,
+            explicit_out=args.out,
+            target_path=str(samples_dir),
+        )
+    except (TargetMismatchError, RegistryHomeError) as exc:
+        print(f"raptor-binary: {exc}", file=sys.stderr)
+        return 2
+
+    from core.project.oplock import OpLockContention
+    from core.run.pin import ProjectArgvError
+    try:
+        start_run(out_dir, "understand", target=str(samples_dir))
+    except (OpLockContention, ProjectArgvError) as e:
+        print(f"raptor-binary: {e}", file=sys.stderr)
+        return 1
+    _capture_map_lifecycle(args, out_dir)
+    try:
+        profile = profile_corpus(CorpusProfileOptions(
+            samples_dir=samples_dir,
+            out_dir=out_dir,
+            family_glob=args.family,
+            max_samples=args.max_samples,
+            max_bytes_per_sample=args.max_bytes_per_sample,
+        ))
+        complete_run(out_dir)
+    except KeyboardInterrupt:
+        fail_run(out_dir, "corpus profiling interrupted")
+        raise
+    except Exception as exc:  # noqa: BLE001 - operator-facing clean failure
+        # Exception text can echo hostile sample paths — same
+        # terminal-grade scrub as the sibling subcommands.
+        fail_run(out_dir, f"corpus profiling failed: {type(exc).__name__}: "
+                          f"{sanitise_for_terminal(str(exc), max_len=300)}")
+        print(f"raptor-binary: corpus failed: {type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return 1
+    _print_corpus_summary(profile)
+    from .corpus_reporting import complete_corpus_report
+    complete_corpus_report(args, profile, samples_dir, out_dir)
+    return 0
+
+
+def _validate_hunt_flags(args: argparse.Namespace) -> str | None:
+    """Flag-surface validation for ``hunt``; returns an error string.
+
+    Runs BEFORE any lifecycle or analysis so a bad flag combination
+    (or an over-complex operator regex) refuses without side effects.
+    """
+    from packages.binary_analysis.hunt import HuntError, compile_anchor_matcher
+    if not args.anchor and not args.calls:
+        return "hunt needs --anchor and/or --calls"
+    if args.anchor_re and not args.anchor:
+        return "--anchor-re requires --anchor"
+    for flag, value in (
+        ("--and-not-calls", args.and_not_calls),
+        ("--transitive", args.transitive or None),
+        ("--max-depth", args.max_depth),
+    ):
+        if value is not None and not args.calls:
+            return f"{flag} requires --calls"
+    if args.max_depth is not None and not args.transitive:
+        # Silently-inert flags are a lie about what ran: direct-caller
+        # mode is depth 1 by definition, so a depth without
+        # --transitive must refuse rather than be ignored.
+        return "--max-depth requires --transitive"
+    if args.anchor:
+        try:
+            compile_anchor_matcher(list(args.anchor), regex=args.anchor_re)
+        except HuntError as exc:
+            return str(exc)
+    return None
+
+
+def _hunt_run_dir_for_binary(args: argparse.Namespace, target: Path) -> Path | None:
+    """Bare-binary mode: map first (full lifecycle parity with
+    ``map``), then hunt inside the fresh run dir."""
+    from core.project.oplock import OpLockContention
+    from core.run.pin import ProjectArgvError
+    try:
+        out_dir = get_output_dir(
+            "understand",
+            target_name=target.stem,
+            explicit_out=None,
+            target_path=str(target),
+        )
+    except (TargetMismatchError, RegistryHomeError) as exc:
+        print(f"raptor-binary: {exc}", file=sys.stderr)
+        return None
+    try:
+        start_run(out_dir, "understand", target=str(target))
+    except (OpLockContention, ProjectArgvError) as e:
+        print(f"raptor-binary: {e}", file=sys.stderr)
+        return None
+    _capture_map_lifecycle(args, out_dir)
+    # Same failure shape as map: an analyse crash must fail the run
+    # (not strand it permanently "running") and surface a scrubbed
+    # one-liner, never a raw traceback.
+    try:
+        result = analyse_blackbox_binary(target, out_dir=out_dir)
+        payload = map_result_payload(result, out_dir)
+        save_json(out_dir / "map-result.json", payload)
+    except KeyboardInterrupt:
+        fail_run(out_dir, "binary hunt interrupted")
+        raise
+    except Exception as exc:  # noqa: BLE001 - operator-facing clean failure
+        fail_run(out_dir, f"binary hunt failed: {type(exc).__name__}: {sanitise_for_terminal(str(exc), max_len=300)}")
+        print(f"raptor-binary: hunt map phase failed: {type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return None
+    return out_dir
+
+
+def _print_hunt_summary(results: list[dict[str, Any]]) -> None:
+    _sft = sanitise_for_terminal
+    for payload in results:
+        print(f"Mode: hunt ({_sft(str(payload.get('mode')))})")
+        if payload.get("mode") == "anchor":
+            families = payload.get("families") or []
+            print(f"Families: {len(families)}")
+            for family in families[:3]:
+                members = family.get("members") or []
+                names = ", ".join(
+                    _sft(str(m.get("name"))) for m in members[:4]
+                )
+                print(f"  - {_sft(str(family.get('id')))}: "
+                      f"{len(members)} member(s) — {names}")
+        else:
+            query = payload.get("query") or {}
+            print(f"Callers of {_sft(str(query.get('resolved_calls')))}: "
+                  f"{int(payload.get('caller_count') or 0)}")
+            residual = payload.get("residual")
+            if isinstance(residual, dict):
+                print(f"Chokepoint residual: {int(residual.get('count') or 0)} "
+                      f"(hypothesis tier — review queue, not findings)")
+        # Degradation and substrate-rejection notes reach the terminal,
+        # not just the JSON: a partial scan or a rejected re-database
+        # must be visible where the operator is looking.
+        for note in (payload.get("substrate_notes") or []):
+            print(f"  ⚠️ {_sft(str(note))}")
+        for line in payload.get("truncation_lines") or []:
+            print(f"  ⚠️ {_sft(str(line))}")
+        artifacts = payload.get("artifacts") or {}
+        print(f"Artifact: {artifacts.get('json')}")
+        print(f"Report: {artifacts.get('report')}")
+
+
+def _run_hunt(args: argparse.Namespace) -> int:
+    from packages.binary_analysis.hunt import (
+        HuntError,
+        run_anchor_hunt,
+        run_calls_hunt,
+    )
+    error = _validate_hunt_flags(args)
+    if error is not None:
+        print(f"raptor-binary: {error}", file=sys.stderr)
+        return 2
+    target = Path(args.target).expanduser().resolve()
+    lifecycle_dir: Path | None = None
+    if target.is_dir():
+        run_dir = target
+    elif target.is_file():
+        run_dir_or_none = _hunt_run_dir_for_binary(args, target)
+        if run_dir_or_none is None:
+            return 1
+        run_dir = run_dir_or_none
+        lifecycle_dir = run_dir
+    else:
+        print(f"raptor-binary: target is neither a run directory nor a file: {target}", file=sys.stderr)
+        return 2
+    results: list[dict[str, Any]] = []
+    try:
+        if args.anchor:
+            results.append(run_anchor_hunt(
+                run_dir, list(args.anchor), regex=args.anchor_re,
+            ))
+        if args.calls:
+            results.append(run_calls_hunt(
+                run_dir,
+                args.calls,
+                and_not_calls=args.and_not_calls,
+                transitive=args.transitive,
+                max_depth=args.max_depth,
+            ))
+        if lifecycle_dir is not None:
+            complete_run(lifecycle_dir)
+    except KeyboardInterrupt:
+        if lifecycle_dir is not None:
+            fail_run(lifecycle_dir, "binary hunt interrupted")
+        raise
+    except HuntError as exc:
+        # HuntError messages embed operator input pre-escaped, but the
+        # terminal scrub is the last line of defence either way.
+        if lifecycle_dir is not None:
+            fail_run(lifecycle_dir, f"binary hunt refused: {sanitise_for_terminal(str(exc), max_len=300)}")
+        print(f"raptor-binary: hunt refused: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - operator-facing clean failure
+        if lifecycle_dir is not None:
+            fail_run(lifecycle_dir, f"binary hunt failed: {type(exc).__name__}: {sanitise_for_terminal(str(exc), max_len=300)}")
+        print(f"raptor-binary: hunt failed: {type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return 1
+    if args.json:
+        # ensure_ascii: same terminal-JSON lane as the handoff print —
+        # payload strings are escaped at capture, but C1 controls in a
+        # hand-edited artifact must not reach the terminal raw.
+        for payload in results:
+            print(json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                             default=str))
+    else:
+        _print_hunt_summary(results)
+    from .hunt_reporting import complete_hunt_report
+    complete_hunt_report(args, results, run_dir)
+    return 0
+
+
+def _print_siblings_summary(payload: dict[str, Any]) -> None:
+    _sft = sanitise_for_terminal
+    print("Mode: siblings")
+    clusters = payload.get("clusters") or []
+    rows = payload.get("asymmetries") or []
+    print(f"Clusters analysed: {len(clusters)}")
+    print(f"Asymmetries: {len(rows)} "
+          f"(review leads with disproof recipes, not findings)")
+    for row in rows[:5]:
+        outliers = ", ".join(_sft(str(o)) for o in row.get("outliers") or [])
+        print(f"  - [{_sft(str(row.get('severity')))}] "
+              f"{_sft(str(row.get('property')))}: outlier {outliers} "
+              f"({_sft(str(row.get('evidence_tier')))})")
+    # The honesty lines ARE the result contract — they reach the
+    # terminal, not just the artifacts.
+    for note in payload.get("honesty") or []:
+        print(f"  ℹ️ {_sft(str(note))}")
+    for note in (payload.get("substrate_notes") or []):
+        print(f"  ⚠️ {_sft(str(note))}")
+    for note in payload.get("notes") or []:
+        print(f"  ⚠️ {_sft(str(note))}")
+    artifacts = payload.get("artifacts") or {}
+    print(f"Artifact: {artifacts.get('json')}")
+    print(f"Hypotheses: {artifacts.get('hypotheses')}")
+    print(f"Report: {artifacts.get('report')}")
+
+
+def _run_siblings(args: argparse.Namespace) -> int:
+    from packages.binary_analysis.hunt import HuntError
+    from packages.binary_analysis.siblings import run_siblings
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    if not run_dir.is_dir():
+        print(f"raptor-binary: not a run directory: {run_dir}",
+              file=sys.stderr)
+        return 2
+    try:
+        payload = run_siblings(
+            run_dir,
+            family=args.family,
+            auto=args.auto,
+            min_cluster=args.min_cluster,
+        )
+    except HuntError as exc:
+        print(f"raptor-binary: siblings refused: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}",
+              file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - operator-facing clean failure
+        print(f"raptor-binary: siblings failed: {type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc), max_len=300)}",
+              file=sys.stderr)
+        return 1
+    if args.json:
+        # ensure_ascii: same terminal-JSON lane as the handoff print —
+        # payload strings are escaped at capture, but C1 controls in a
+        # hand-edited artifact must not reach the terminal raw.
+        print(json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                         default=str))
+    else:
+        _print_siblings_summary(payload)
+    from .sibling_reporting import complete_sibling_report
+    complete_sibling_report(args, payload, run_dir)
+    return 0
+
+
+def _run_fuzz(args: argparse.Namespace) -> int:
+    target = Path(args.target).expanduser().resolve()
+    cmd = [
+        sys.executable,
+        str(_repo_root() / "raptor.py"),
+        "fuzz",
+        "--orchestrator",
+        "--binary",
+        str(target),
+        *args.fuzz_args,
+    ]
+    # get_llm_env: the re-entrant `raptor.py fuzz` builds ITS
+    # children's env from this process's environ — a safe-env hop
+    # here starves the grandchild's LLM crash analysis.
+    return subprocess.call(cmd, env=RaptorConfig.get_llm_env())
+
+
+def _run_harness(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    if not run_dir.is_dir():
+        print(f"raptor-binary: run directory does not exist: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        spec = generate_binary_harness(
+            run_dir,
+            ingress_id=args.ingress,
+            abi=args.abi,
+            device=args.device,
+            ioctl_code=args.ioctl_code,
+            llm_rank=getattr(args, "llm_rank", False),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"raptor-binary: harness failed: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        # ensure_ascii: JSON escapes C0 but passes C1 terminal
+        # controls raw when off — dumps_display is exactly that, and
+        # spec embeds boundary names recovered from the hostile
+        # binary verbatim. Still valid JSON, still one line.
+        print(json.dumps(spec, sort_keys=True, ensure_ascii=True,
+                         default=str))
+        from .harness_reporting import complete_harness_report
+        complete_harness_report(args, spec, run_dir)
+        return 0
+    # Ingress names come from the hostile binary's symbols/plist and
+    # spec['reason'] embeds recovered boundary names verbatim — same
+    # scrub as the investigation/map summaries.
+    print("Mode: harness")
+    print(f"Status: {sanitise_for_terminal(str(spec['status']), max_len=64)}")
+    print(f"Family: {sanitise_for_terminal(str(spec['family']), max_len=64)}")
+    print(f"Ingress: {sanitise_for_terminal(str(spec['ingress']['name']))} "
+          f"({sanitise_for_terminal(str(spec['ingress']['kind']), max_len=64)})")
+    print(f"Reason: {sanitise_for_terminal(str(spec['reason']))}")
+    print(f"Next step: {sanitise_for_terminal(str(spec['next_step']))}")
+    print(f"Spec: {spec['artifacts']['spec']}")
+    print(f"Report: {spec['artifacts']['report']}")
+    if spec.get("generated"):
+        # Spec artifacts are RAPTOR-written, but the file is re-read
+        # from disk here — scrub like the sibling spec fields above.
+        print(f"Source: {sanitise_for_terminal(str(spec['generated']['source']))}")
+        print(f"Build: {sanitise_for_terminal(str(spec['generated']['build_script']))}")
+    from .harness_reporting import complete_harness_report
+    complete_harness_report(args, spec, run_dir)
+    return 0
+
+
+def _run_graph(args: argparse.Namespace) -> int:
+    cmd = [
+        str(_repo_root() / "libexec" / "raptor-binary-graph-query"),
+        "--run-dir",
+        str(Path(args.run_dir).expanduser().resolve()),
+    ]
+    if args.edges:
+        cmd.append("--edges")
+    if args.evidence:
+        cmd.append("--evidence")
+    if args.kind:
+        cmd.extend(["--kind", args.kind])
+    if args.tier:
+        cmd.extend(["--tier", args.tier])
+    if args.json:
+        cmd.append("--json")
+    cmd.extend(_forward_report_args(args))
+    return subprocess.run(cmd, env=RaptorConfig.get_safe_env(), timeout=60).returncode
+
+
+def _print_file(run_dir: str, filename: str, *, json_output: bool = False) -> int:
+    path = Path(run_dir).expanduser().resolve() / filename
+    if not path.is_file():
+        print(f"raptor-binary: missing {filename}: {path}", file=sys.stderr)
+        return 1
+    if not json_output:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            print(f"raptor-binary: cannot read {escape_nonprintable(filename)} ({type(error).__name__})", file=sys.stderr)
+            return 1
+        # Report files embed binary-derived names; the writers scrub,
+        # but this print is the last line of defence for the terminal
+        # (control/bidi bytes in older or hand-edited artifacts).
+        print(
+            escape_nonprintable(
+                text, preserve_newlines=True,
+            ),
+            end="",
+        )
+        return 0
+    try:
+        # Run artifact written by this package's own pipeline.
+        payload = load_json(path, strict=True, max_bytes=64 * 1024 * 1024)
+    except ValueError as exc:
+        print(f"raptor-binary: invalid JSON in {path}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                     default=str))
+    return 0
+
+
+def _print_report(run_dir: str, *, report_options=None) -> int:
+    base = Path(run_dir).expanduser().resolve()
+    if report_options is not None:
+        from core.reporting.results import NativeResult, complete_native_result
+        sources = [base / name for name in (
+            "binary-investigation.json", "binary-manifest.json", "binary-context-map.json",
+            "binary-evidence.json", "binary-checklist.json", "binary-validation-handoff.json",
+        ) if (base / name).is_file()]
+        if not sources:
+            print("raptor-binary: no captured binary JSON available for export", file=sys.stderr)
+            return 1
+        try:
+            payload = {p.name: load_json(p, strict=True, max_bytes=32 * 1024 * 1024) for p in sources}
+            from .reporting import _redact_captured_json
+            try:
+                payload = _redact_captured_json(payload)
+            except (ValueError, TypeError, OSError) as error:
+                from core.reporting.service import capture_failure_summary
+                capture_failure_summary("binary", base.name, str(base), base, cause=error,
+                                        artifacts=[{"uri": str(p)} for p in sources], stream=sys.stdout)
+                return 1
+            result = complete_native_result(
+                NativeResult("binary", str(base), base.name, payload,
+                             artifacts=[{"uri": str(p)} for p in sources]),
+                base, stem="binary-report", options=report_options, stream=sys.stdout,
+            )
+            return 1 if result.errors else 0
+        except (ValueError, OSError) as exc:
+            print(f"raptor-binary: {sanitise_for_terminal(str(exc))}", file=sys.stderr)
+            return 1
+    investigation = base / "binary-investigation-report.md"
+    if investigation.is_file():
+        return _print_file(run_dir, investigation.name)
+    return _print_file(run_dir, "binary-analysis-report.md")
+
+
+def _run_diagram(args: argparse.Namespace) -> int:
+    cmd = [
+        str(_repo_root() / "libexec" / "raptor-render-diagrams"),
+        str(Path(args.run_dir).expanduser().resolve()),
+    ]
+    if args.target:
+        cmd.extend(["--target", args.target])
+    if args.stdout:
+        cmd.append("--stdout")
+    if args.force:
+        cmd.append("--force")
+    cmd.extend(_forward_report_args(args))
+    return subprocess.run(cmd, env=RaptorConfig.get_safe_env(), timeout=120).returncode
+
+
+def _capture_map_lifecycle(args, out_dir):
+    options = getattr(args, "_report_options", None)
+    if options is not None and options.enabled and (args.report_format or args.report_output):
+        from copy import deepcopy
+        from core.run.metadata import load_run_metadata
+        args._report_lifecycle_dir = out_dir
+        try:
+            metadata = load_run_metadata(out_dir) or {}
+            manifest = metadata.get("manifest") or {}
+            args._report_lifecycle_metadata = deepcopy({"command": metadata.get("command"),
+                "reporting_identity": metadata.get("reporting_identity"),
+                "manifest": {"target": manifest.get("target") if isinstance(manifest, dict) else None}})
+        except (OSError, ValueError, TypeError):
+            args._report_lifecycle_metadata = {}
+
+
+def _complete_map_report(args, payload, result, out_dir, status, *, active_phases=()):
+    options = getattr(args, "_report_options", None)
+    if options is not None and (not options.enabled or not (args.report_format or args.report_output)):
+        args._report_done = True
+        if out_dir is not None:
+            from core.reporting.service import unrefreshed_report_notice
+            notice = unrefreshed_report_notice(out_dir)
+            if notice:
+                print("Warning: " + notice, file=sys.stderr)
+        return
+    if options is not None and options.enabled and (args.report_format or args.report_output):
+        args._report_done = True
+        from .reporting import complete_map_report
+        complete_map_report(args, payload, result, out_dir, status, active_phases=active_phases)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(_normalise_argv(sys.argv[1:] if argv is None else argv))
+    if args.command == "help":
+        parser.print_help()
+        return 0
+    if args.command in {"runtime", "trace-parser", "corpus", "siblings", "hunt", "harness", "graph", "diagram"}:
+        from core.reporting.options import options_from_args
+        args._report_options = options_from_args(args, parser)
+    if args.command in {"investigate", "map"}:
+        from core.reporting.options import options_from_args
+        args._report_options = options_from_args(args, parser)
+        args._report_done = False
+        status = _run_investigate(args) if args.command == "investigate" else _run_map(args)
+        if not args._report_done:
+            _complete_map_report(args, None, None, Path(args.out) if args.out else None, status)
+        return status
+    if args.command == "runtime":
+        return _run_runtime(args)
+    if args.command == "trace-parser":
+        return _run_trace_parser(args)
+    if args.command == "harness":
+        return _run_harness(args)
+    if args.command == "corpus":
+        return _run_corpus(args)
+    if args.command == "hunt":
+        return _run_hunt(args)
+    if args.command == "siblings":
+        return _run_siblings(args)
+    if args.command == "fuzz":
+        return _run_fuzz(args)
+    if args.command == "graph":
+        return _run_graph(args)
+    if args.command == "report":
+        from core.reporting.options import options_from_args
+        options = options_from_args(args, parser)
+        if args.report_format or args.report_output or args.no_report:
+            return _print_report(args.run_dir, report_options=options)
+        return _print_report(args.run_dir)
+    if args.command == "handoff":
+        return _print_file(args.run_dir, "binary-validation-handoff.json", json_output=args.json)
+    if args.command == "diagram":
+        return _run_diagram(args)
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,33 +1,68 @@
 """The `sandbox()` context manager and the top-level run wrappers.
 
-This is the only module that talks to subprocess directly. It threads
-Landlock + seccomp + rlimits + namespace flags through to subprocess.run,
-handles per-call kwarg validation, and attaches structured sandbox_info
-to each result.
+This is the dispatch chokepoint for sandboxed TARGET execution: it
+threads Landlock + seccomp + rlimits + namespace flags through to the
+spawn backend / subprocess.run, handles per-call kwarg validation, and
+attaches structured sandbox_info to each result. (It is not the only
+module that calls subprocess at all — probes.py runs capability
+probes and _macos_spawn.py owns the darwin arm — but every sandboxed
+target dispatch routes through here.)
 """
 
+import errno
 import logging
+import re
 import os
+import resource
 import shutil
+import signal
 import stat
+import math
 import subprocess
 import sys
-from contextlib import contextmanager
+import weakref
+from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+import threading
+import time
+from contextlib import closing, contextmanager, suppress
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, TypeVar
+
+from core.security.log_sanitisation import sanitise_exception_message, sanitise_for_terminal
 
 from . import landlock as _landlock
 from . import probes as _probes
+# Module alias (not `from .errors import SandboxSetupError`): run()'s
+# closure contains function-local `from .errors import ...` statements,
+# which make the bare name function-local for the WHOLE scope — an
+# except clause naming it before those lines execute would hit
+# UnboundLocalError. The alias sidesteps the scoping trap.
+from . import errors as _errors
+from . import tiers as _tiers
+from ._env_quarantine import ENV_RESTORE_KEY as _ENV_RESTORE_KEY
+from ._fake_home import open_home as _open_fake_home
+from ._fake_home import prepare_home as _prepare_fake_home
+from ._pathpin import canonical_bind_path
 from . import seccomp as _seccomp
 from . import state
+from ._capture import BoundedCommunicator, decode_captured_result, limit_result
+
 # mount.py retained for its standalone tests; no longer imported from
 # context — mount-ns goes through core.sandbox._spawn / mount_ns.
 from .observe import (
     _CMD_DISPLAY_MAX_ARGS,
-    _check_blocked, _interpret_result,
+    _check_blocked,
+    _interpret_result,
 )
 from .preexec import _DEFAULT_LIMITS, _load_user_limits, _make_preexec_fn
-from .profiles import DEFAULT_PROFILE, PROFILES, _SANDBOX_KWARGS
+from .profiles import (
+    _SANDBOX_KWARGS,
+    DEFAULT_PROFILE,
+    PROFILES,
+    host_recon_threshold_for_profile,
+)
+
 
 # Attribute indirection so tests can patch these at the submodule level.
 # `patch.object(core.sandbox.landlock, "check_landlock_available", ...)`
@@ -46,7 +81,253 @@ def check_seccomp_available():
 def check_seatbelt_available():
     return _probes.check_seatbelt_available()
 
+
+def spawn_backend_available() -> bool:
+    """True when sandbox().run() will route through the Linux fork-based
+    spawn backend (core.sandbox._spawn.run_sandboxed) on this host.
+
+    The spawn backend is the only execution path that can deliver a live
+    child pid to an ``exec_pid_callback=`` caller before the sandboxed
+    target exits — the subprocess fallback paths (Landlock-only, unshare
+    CLI) and the macOS seatbelt path run the command to completion before
+    returning. Callers that need mid-run visibility of the child (e.g.
+    /proc/<pid>/maps sampling of an untrusted binary) must check this
+    predicate first and degrade to a "not sampled" result when it is
+    False, rather than running the target on a weaker or absent backend.
+
+    Mirrors the routing decision made inside sandbox().run(): Linux,
+    sandbox not disabled (per-CLI), a CLI profile (when set) that keeps
+    Landlock engaged, user-namespace capability, mount-namespace
+    capability, and the newuidmap/newgidmap helpers present.
+    """
+    if sys.platform == "darwin":
+        return False
+    if state._cli_sandbox_profile is not None:
+        _profile_cfg = PROFILES.get(state._cli_sandbox_profile)
+        if not _profile_cfg or not _profile_cfg.get("use_landlock"):
+            return False
+    elif state._cli_sandbox_disabled:
+        return False
+    if not (check_net_available() and check_mount_available()):
+        return False
+    from . import _spawn as _spawn_mod
+    return _spawn_mod.mount_ns_available()
+
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ExecutionObservation:
+    invocation: object = field(repr=False)
+    attempt: object = field(repr=False)
+    parent_input_digest: str
+    payload_bytes: int
+    filesystem_encoding: str
+    filesystem_errors: str
+    status_observation: tuple
+    wait_origin: str
+    exec_pid_delivered: bool
+    caller_kill_exemption_applied: bool
+
+    @property
+    def authenticated_build(self) -> bool:
+        return False
+
+    @property
+    def observed_child_context(self) -> bool:
+        return False
+
+
+class _ExecutionObservationReference:
+    def __init__(self, issuer):
+        self._issuer = issuer
+
+
+class _ExecutionObservationIssuer:
+    """One public call's private parent observations, never a build issuer.
+
+    No raw environment is retained in a result reference or public diagnostic.
+    Object identity binds the selected result; arbitrary trusted-parent Python
+    is outside this in-process ownership boundary.
+    """
+
+    def __init__(self):
+        from core.audit.prepared_execution_attempt import ExecutionInputOwner
+        self.inputs = ExecutionInputOwner(max_attempts=8, max_retained_bytes=32 * 1024 * 1024)
+        self._invocation = object()
+        self._results = {}
+        self._reference = None
+        self._result = None
+        self._view = None
+        self._available = True
+
+    def unavailable(self):
+        self._available = False
+
+    def record_native_result(self, result):
+        from core.audit.prepared_execution_attempt import ExecutionInputHandoff
+        handoff = getattr(result, "_execution_input_handoff", None)
+        try:
+            if (self._available and type(result) is subprocess.CompletedProcess
+                    and type(handoff) is ExecutionInputHandoff
+                    and len(self._results) < 8):
+                self._results[id(result)] = (weakref.ref(result), handoff.attempt)
+        finally:
+            # Do this before decode/refusal handling, including earlier retry
+            # results: ledger retirement cannot revoke an external snapshot.
+            if handoff is not None:
+                del result._execution_input_handoff
+
+    def bind_selected_result(self, result):
+        from core.audit.prepared_execution_inputs import InputsUnavailable
+        if not self._available:
+            return
+        registered = self._results.get(id(result))
+        if registered is None or registered[0]() is not result:
+            return
+        observation = getattr(result, "_setup_status_observation", None)
+        wait_origin = getattr(result, "_wait_origin", None)
+        delivered = getattr(result, "_exec_pid_delivered", None)
+        exempted = getattr(result, "_caller_kill_exemption_applied", None)
+        if (type(observation) is not tuple or len(observation) != 4
+                or observation[1] not in ("read-eof", "would-block", "read-error", "bound-reached")
+                or type(observation[2]) is not int or not 0 <= observation[2] <= 1279
+                or type(observation[3]) is not bool
+                or wait_origin not in ("capture-poll-waitpid", "capture-poll-echild",
+                                       "final-poll-waitpid", "final-blocking-waitpid",
+                                       "final-wait-echild", "not-observed")
+                or type(delivered) is not bool or type(exempted) is not bool):
+            return
+        parsed = observation[0]
+        if parsed is not None and (
+            type(parsed) is not tuple or len(parsed) != 2
+            or any(type(item) is not str for item in parsed)
+            or len(parsed[0]) != 1 or len(parsed[1]) > 1279
+        ):
+            return
+        try:
+            self.inputs.select_terminal(registered[1])
+            selected = self.inputs.read_selected(registered[1])
+        except InputsUnavailable:
+            return
+        snapshot = selected.inputs
+        view = _ExecutionObservation(
+            self._invocation, selected.attempt, snapshot.sha256,
+            snapshot.payload_bytes, snapshot.filesystem_encoding,
+            snapshot.filesystem_errors, observation, wait_origin, delivered, exempted,
+        )
+        reference = _ExecutionObservationReference(self)
+        self._view, self._result, self._reference = view, weakref.ref(result), reference
+        result._execution_observation = reference
+
+    def read(self, reference, result):
+        if (not self._available or reference is not self._reference or self._result is None
+                or self._result() is not result):
+            return None
+        return self._view
+
+    def close(self):
+        try:
+            self.inputs.close()
+        finally:
+            self._results.clear()
+
+
+def _read_execution_observation(result):
+    """Read only the exact selected result's privately issued parent view."""
+    reference = getattr(result, "_execution_observation", None)
+    if type(reference) is not _ExecutionObservationReference:
+        return None
+    if type(reference._issuer) is not _ExecutionObservationIssuer:
+        return None
+    return reference._issuer.read(reference, result)
+
+
+def _own_execution_observations(execute):
+    from functools import wraps
+    from ._retirement import retire_parent_resources
+
+    @wraps(execute)
+    def owned(cmd, **kwargs):
+        if "_execution_invocation" in kwargs:
+            raise TypeError("_execution_invocation is an internal sandbox argument")
+        # Observation is optional. Only its own ordinary failures are
+        # unavailable; execution, required budgets and cancellation stay loud.
+        try:
+            issuer = _ExecutionObservationIssuer()
+        except Exception:
+            issuer = None
+        failure = None
+        result = None
+
+        def retire_observation():
+            if issuer is not None:
+                try:
+                    issuer.close()
+                except Exception:
+                    issuer.unavailable()
+                    if result is not None:
+                        with suppress(Exception):
+                            del result._execution_observation
+
+        try:
+            result = execute(cmd, _execution_invocation=issuer, **kwargs)
+            if issuer is not None:
+                try:
+                    issuer.bind_selected_result(result)
+                except Exception:
+                    issuer.unavailable()
+                    with suppress(Exception):
+                        del result._execution_observation
+            return result
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            retire_parent_resources(retire_observation, primary_error=failure)
+
+    return owned
+
+
+def _first_external_caller() -> str:
+    """``file:line`` of the nearest stack frame outside core/sandbox.
+
+    The bare-run posture advisory fires once per process, so without
+    caller identity a legitimately-unconfined network-only invocation
+    is indistinguishable from an untrusted-bytes call that forgot its
+    confinement arguments. Frames belonging to the stdlib contextlib
+    machinery are skipped too — the advisory fires inside the
+    ``sandbox()`` generator, so the first frame outside this package
+    is ``contextlib.__enter__``/``enter_context``, which names the
+    plumbing instead of the caller that omitted target=/output=.
+    Best-effort: unattributable frames report a placeholder rather
+    than raising into the warning path.
+    """
+    try:
+        import contextlib as _contextlib
+        pkg_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+        ctx_file = os.path.abspath(
+            getattr(_contextlib, "__file__", "") or "")
+        frame = sys._getframe(1)
+        while frame is not None:
+            path = frame.f_code.co_filename
+            abspath = os.path.abspath(path)
+            if not abspath.startswith(pkg_dir) and abspath != ctx_file:
+                return f"{path}:{frame.f_lineno}"
+            frame = frame.f_back  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001 — attribution must never break the warning
+        pass
+    return "<unattributable>"
+
+# Framework-named temp paths (the launcher's per-session scratch
+# <base>/raptor-<uid>/session-<pid>-<rand>, harness session dirs,
+# any /tmp component naming the framework). Values matching it are
+# rewritten out of target-bound envs and skipped by the mount-ns
+# temp-dir re-creation — the NAME is the leak (framework, uid, host
+# pid), and re-creating it plants the same name inside the target's
+# private /tmp. Keep in sync with core/sandbox/mount_ns.py.
+_BRANDED_TMP_RE = re.compile(r"/[^/]*raptor[^/]*(/|$)", re.IGNORECASE)
 
 
 def _audit_degrade_reason(b_fallback_reason, b_fallback_instr,
@@ -65,15 +346,8 @@ def _audit_degrade_reason(b_fallback_reason, b_fallback_instr,
          Their reason is the most specific: it names the binary.
       2. ``check_mount_available()`` False — host kernel refuses
          unprivileged mount-ns (Ubuntu 24.04 default sysctl).
-      3. ``pass_fds=`` kwarg set — _spawn doesn't plumb inherited
-         fds; the call had to go subprocess+preexec.
-      4. ``input=`` kwarg set — same reason; piping stdin via
-         input= can't survive mount-ns fork+exec.
-      5. ``target`` and ``output`` both None — mount-ns has nothing
-         to bind-mount as the working area; the tracer has nowhere
-         to attach in the new namespace.
-      6. Catch-all — reachable only if a future change adds a new
-         spawn-eligibility gate without updating this helper.
+      3. ``target`` and ``output`` both None — no working area to bind.
+      4. Catch-all for future spawn-eligibility conditions.
 
     Each branch returns a short ``reason`` (what failed) and
     ``instructions`` (operator action to fix). Both flow into the
@@ -84,55 +358,797 @@ def _audit_degrade_reason(b_fallback_reason, b_fallback_instr,
         return (b_fallback_reason, b_fallback_instr)
     if sys.platform == "darwin":
         # macOS path. The only spawn-disabling host condition on
-        # darwin (after the pass_fds / input checks below) is
-        # sandbox-exec being missing or smoke-test-failing.
+        # darwin is sandbox-exec being missing or smoke-test-failing
+        # (pass_fds / input= are plumbed natively by the
+        # subprocess-backed macOS spawn and never disqualify there).
         if not check_seatbelt_available():
             return (
-                "macOS sandbox-exec is unavailable (smoke test "
-                "failed or /usr/bin/sandbox-exec missing)",
-                "verify `sandbox-exec -p '(version 1)(allow default)' "
+                ("macOS sandbox-exec is unavailable (smoke test "
+                "failed or /usr/bin/sandbox-exec missing)"),
+                ("verify `sandbox-exec -p '(version 1)(allow default)' "
                 "/usr/bin/true` succeeds on this host; reinstall "
-                "Command Line Tools if missing.",
+                "Command Line Tools if missing."),
             )
     elif not check_mount_available():
-        return (
-            "mount-ns blocked by host "
-            "(apparmor_restrict_unprivileged_userns=1)",
-            "set kernel.apparmor_restrict_unprivileged_userns=0 "
-            "(Ubuntu 24.04+) and install the uidmap package; or "
-            "rerun on a host where mount-ns is available.",
-        )
-    if kwargs.get("pass_fds"):
-        return (
-            "call uses pass_fds= which spawn doesn't plumb through",
-            "rework the caller to avoid pass_fds or accept that this "
-            "call won't audit",
-        )
-    if kwargs.get("input") is not None:
-        return (
-            "call uses input= which spawn doesn't plumb through",
-            "pipe via stdin= instead of input=, or accept that this "
-            "call won't audit",
-        )
+        # Pre-fix this branch hardcoded the AppArmor diagnostic — but
+        # ``check_mount_available()`` can fail for at least four
+        # distinct reasons (AppArmor sysctl, missing uidmap binaries,
+        # SELinux enforcing, outer seccomp / nested userns), each with
+        # its own remediation. Misattributing to AppArmor on a
+        # SELinux-using host sent operators chasing the wrong sysctl
+        # entirely. Route to ``mount_unavailable_reason()`` which
+        # re-probes the specific conditions in priority order and
+        # returns a routed ``(condition, fix)``.
+        from .probes import mount_unavailable_reason
+        return mount_unavailable_reason()
     if not (target or output):
         # Common case: callers that pass audit_run_dir= alone for
         # audit-signal routing but no target/output for filesystem
         # isolation (codeql analyze, helper subprocesses).
         return (
-            "call has no target= or output= — mount-ns has nothing "
-            "to bind-mount, so the tracer can't attach",
-            "pass target=<repo_path> and/or output=<run_dir> for "
+            ("call has no target= or output= — mount-ns has nothing "
+            "to bind-mount, so the tracer can't attach"),
+            ("pass target=<repo_path> and/or output=<run_dir> for "
             "full mount-ns isolation + audit, or accept that this "
-            "call runs at Landlock-only.",
+            "call runs at Landlock-only."),
         )
     # Reachable only if a future change adds a spawn-eligibility gate
     # without updating this helper. Better than lying with a specific
     # message; the docstring above tells the reader to update both.
     return (
         "spawn-path unavailable for this call (unknown reason)",
-        "inspect core/sandbox/context.py spawn_eligible determination "
-        "and update _audit_degrade_reason with the new branch.",
+        ("inspect core/sandbox/context.py spawn_eligible determination "
+        "and update _audit_degrade_reason with the new branch."),
     )
+
+
+# Serialises seq assignment across concurrent sandbox() exits in one
+# process: two writers counting the same file then appending would
+# mint duplicate sequence numbers and read as tampering at triage.
+_PROXY_PERSIST_LOCK = threading.Lock()
+
+
+def _sweep_marked_processes(token: str) -> list:
+    """SIGKILL every process whose environment carries this run's
+    marker (`_SBX_RUN_ID=<token>`).
+
+    Backstop teardown for the no-namespace path: the in-line subreaper
+    sweeper (preexec._reaper_split) catches orphans while it lives,
+    but a subprocess timeout kills the sweeper itself (Popen.pid) —
+    this parent-side pass then reaps the marked survivors. Two passes,
+    because a dying daemon can fork once more between scan and kill.
+    Only same-uid processes are readable in /proc, and the token is a
+    per-run random UUID, so a false-positive kill requires the exact
+    128-bit value in a foreign process env. Returns the pids killed.
+    """
+    # Only a complete environment entry proves this marker. Substrings in
+    # another variable/value, or a read truncated before NUL, do not.
+    needle = f"_SBX_RUN_ID={token}".encode() + b"\0"
+    boundary = b"\0" + needle
+    me = os.getpid()
+    killed: list = []
+    for _pass in range(2):
+        found = False
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return killed
+        for name in names:
+            if not name.isdigit() or int(name) == me:
+                continue
+            try:
+                with open(f"/proc/{name}/environ", "rb") as f:
+                    env_blob = f.read(1024 * 1024)
+            except OSError:
+                continue
+            if not (env_blob.startswith(needle) or boundary in env_blob):
+                continue
+            found = True
+            try:
+                os.kill(int(name), signal.SIGKILL)
+                killed.append(int(name))
+            except OSError:
+                continue
+        if not found:
+            break
+        time.sleep(0.05)
+    if killed:
+        logger.warning(
+            "Sandbox: teardown backstop killed %d marked survivor(s) "
+            "on the no-namespace path: %s", len(killed), killed,
+        )
+    return killed
+
+
+# Grace window for the teardown-first timeout below: how long the
+# sweeper gets to reap its subtree after the death-pipe EOF before the
+# parent falls back to SIGKILL. Sized above preexec._SWEEP_DEADLINE_S
+# so a healthy sweeper always finishes on its own.
+_TEARDOWN_SWEEP_GRACE_S = 3.0
+_TEARDOWN_KILL_GRACE_S = 5.0
+
+
+def _validate_output_redirections(kwargs: dict) -> None:
+    """Refuse invalid output sources before setup can reuse their fd numbers."""
+    if (kwargs.get("capture_output")
+            and (kwargs.get("stdout") is not None or kwargs.get("stderr") is not None)):
+        raise ValueError("stdout and stderr may not be used with capture_output")
+    for stream in ("stdout", "stderr"):
+        supplied = kwargs.get(stream)
+        if supplied is None:
+            continue
+        sentinels: tuple[int, ...] = (subprocess.PIPE, subprocess.DEVNULL)
+        if stream == "stderr":
+            sentinels += (subprocess.STDOUT,)
+        if isinstance(supplied, int) and supplied in sentinels:
+            continue
+        fd = supplied if isinstance(supplied, int) else supplied.fileno()
+        try:
+            os.fstat(fd)
+        except OSError as exc:
+            raise TypeError(
+                f"sandbox().run(): {stream}= fd={fd} is not a valid open "
+                f"file descriptor ({exc.__class__.__name__}: {exc})"
+            ) from exc
+
+
+def _run_teardown_first_timeout(
+    cmd: list, pk: dict, death_w_holder: list, start_new_session: bool,
+    *, max_capture_bytes: int | None = None, teardown_first: bool = True,
+) -> subprocess.CompletedProcess:
+    """subprocess.run equivalent whose failures tear down sweeper-first.
+
+    No-pid-namespace posture only (see the call site): the direct
+    child is the PR_SET_CHILD_SUBREAPER sweeper and the target is its
+    child. subprocess.run's own timeout handling SIGKILLs the direct
+    child — killing the sweeper before it can sweep, so a timed-out
+    hostile target's descendants survived into the (weaker,
+    marker-based) parent-side backstop. Here the deadline closes the
+    per-run death pipe FIRST: the sweeper sees EOF, SIGKILLs the
+    payload subtree (preexec._reaper_split), and exits on its own;
+    only if it fails to exit within the grace window does the parent
+    SIGKILL it. Cancellation and I/O/decode failures use the same ordering.
+    The subprocess.run contract is preserved: returns
+    CompletedProcess on normal exit, raises subprocess.TimeoutExpired
+    (with captured output) on deadline.
+
+    Remaining arms of this posture, DOCUMENTED as the degraded
+    envelope rather than fixed (the userns gate refuses namespace-less
+    hosts without an explicit operator opt-in):
+
+    * marker scrub — the parent-side backstop finds survivors via the
+      ``_SBX_RUN_ID`` environ marker; a descendant that re-execs
+      with a scrubbed environment is invisible to it. Inherent to
+      marker-based sweeps; the pid-namespace cascade is the real
+      containment and every namespace-capable host uses it.
+    * sweeper killability — on Landlock ABI < 6 there is no signal
+      scoping, so a hostile target can SIGKILL the same-UID sweeper
+      before spawning daemons (the marker backstop then applies, with
+      the scrub caveat above). Such runs are stamped
+      ``teardown_sweep_signal_unscoped`` in ``sandbox_info`` — see
+      the stamp block in run().
+    """
+    # Match subprocess.run's preparation without consuming the caller's
+    # dictionary or silently overriding explicit stream ownership.
+    pk = dict(pk)
+    timeout = pk.pop("timeout", None)
+    capture = pk.pop("capture_output", False)
+    check = pk.pop("check", False)
+    inp = pk.pop("input", None)
+    if capture:
+        if pk.get("stdout") is not None or pk.get("stderr") is not None:
+            raise ValueError("stdout and stderr may not be used with capture_output")
+        pk["stdout"] = pk["stderr"] = subprocess.PIPE
+    if inp is not None:
+        if pk.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        pk["stdin"] = subprocess.PIPE
+    bounded = (BoundedCommunicator(max(0, int(max_capture_bytes)))
+               if max_capture_bytes is not None else None)
+    proc = subprocess.Popen(cmd, start_new_session=start_new_session, **pk)
+    primary_failure: BaseException | None = None
+    try:
+        if bounded is not None:
+            bounded.attach(proc)
+        out, err = (bounded.communicate(input=inp, timeout=timeout) if bounded is not None
+                    else proc.communicate(input=inp, timeout=timeout))
+        result = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        if bounded is not None:
+            setattr(result, "_capture_limit_snapshot", (bounded.cap, out, err))
+        if check:
+            result.check_returncode()
+        _close_teardown_streams(proc)
+    except BaseException as failure:
+        primary_failure = failure
+        if bounded is not None:
+            try:
+                bounded.stop_input()
+            except BaseException as cleanup_error:
+                with suppress(BaseException):
+                    failure.add_note("sandbox input cleanup: " + type(cleanup_error).__name__)
+        _finish_teardown_first(proc, death_w_holder, failure, bounded=bounded,
+                               teardown_first=teardown_first)
+        raise
+    finally:
+        # Popen owns only PIPE streams; caller-supplied file objects are
+        # not proc.stdin/stdout/stderr and must remain open.
+        if primary_failure is not None:
+            _close_teardown_streams(proc, failure=primary_failure)
+    return result
+
+
+def _close_teardown_streams(proc, *, failure: BaseException | None = None) -> tuple:
+    """Attempt every close; preserve an active failure or raise the first one."""
+    pending = []
+    errors = []
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except BaseException as exc:
+            errors.append(exc)
+            if not stream.closed:
+                pending.append(stream)
+    if errors:
+        primary = failure if failure is not None else errors[0]
+        for cleanup_error in errors:
+            if cleanup_error is not primary:
+                with suppress(BaseException):
+                    primary.add_note("sandbox stream cleanup: " + type(cleanup_error).__name__)
+        if failure is None:
+            raise primary
+    return tuple(pending)
+
+
+def _timeout_snapshot(failure, proc, out=None, err=None) -> None:
+    """Keep the longest compatible cumulative snapshot, without duplication.
+
+    TimeoutExpired output is bytes even in text mode. A completed text
+    drain can add output only when its encoded prefix preserves the
+    already-captured bytes (newline translation must not rewrite evidence).
+    """
+    if not isinstance(failure, subprocess.TimeoutExpired):
+        return
+    for attr, candidate in (("output", out), ("stderr", err)):
+        current = getattr(failure, attr)
+        if isinstance(candidate, str) or isinstance(current, str):
+            stream = getattr(proc, "stdout" if attr == "output" else "stderr", None)
+            encoding = getattr(stream, "encoding", None) or proc.encoding or "utf-8"
+            errors = getattr(stream, "errors", None) or proc.errors or "strict"
+            if isinstance(candidate, str):
+                candidate = candidate.encode(encoding, errors)
+            if isinstance(current, str):
+                current = current.encode(encoding, errors)
+        if candidate is not None and (current is None or candidate.startswith(current)):
+            current = candidate
+        setattr(failure, attr, current)
+
+
+def _finish_teardown_first(proc, death_w_holder: list, failure: BaseException,
+                           *, bounded=None, teardown_first: bool = True) -> None:
+    """Signal the sweeper before escalation on every communication failure.
+
+    One deadline covers each grace/kill phase, including a fallback wait
+    when communicate cannot drain or decode. Never replace the primary
+    error. An unconfirmed process or unclosed stream remains attached to
+    that error as sandbox_process/sandbox_pipes for explicit retry.
+    """
+    issues = []
+    confirmed = False
+    death_close_pending = False
+    death_w = death_w_holder[0]
+    if death_w is not None:
+        # Consume the numeric slot before releasing the descriptor. An
+        # interruption after release must not leave run()'s finally
+        # retrying a number that another run may already have reused.
+        death_w_holder[0] = None
+        try:
+            from core.sandbox._spawn import close_death_w
+            close_death_w(death_w)
+        except BaseException as exc:
+            # Close may already have consumed the fd. Record uncertainty
+            # rather than blindly restoring and retrying its number.
+            death_close_pending = True
+            issues.append(type(exc).__name__ + " while closing death pipe")
+    phases = (((False, _TEARDOWN_SWEEP_GRACE_S), (True, _TEARDOWN_KILL_GRACE_S))
+              if teardown_first else ((True, _TEARDOWN_KILL_GRACE_S),))
+    for killing, budget in phases:
+        deadline = time.monotonic() + budget
+        if killing and proc.returncode is None:
+            if teardown_first:
+                with suppress(BaseException):
+                    logger.warning(
+                        "Sandbox: teardown-first sweep did not finish within "
+                        "its grace period; killing the owned sweeper")
+            try:
+                proc.kill()
+            except BaseException as exc:
+                issues.append(type(exc).__name__ + " while killing sweeper")
+        try:
+            out, err = (bounded.communicate(timeout=max(0, deadline - time.monotonic()))
+                        if bounded is not None else
+                        proc.communicate(timeout=max(0, deadline - time.monotonic())))
+            if bounded is not None:
+                out, err = bounded.outputs()
+            _timeout_snapshot(failure, proc, out, err)
+        except BaseException as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                try:
+                    _timeout_snapshot(failure, proc, exc.output, exc.stderr)
+                except BaseException as snapshot_error:
+                    issues.append(type(snapshot_error).__name__ + " while preserving output")
+            else:
+                issues.append(type(exc).__name__ + " while draining sweeper")
+        if bounded is not None:
+            try:
+                _timeout_snapshot(failure, proc, *bounded.outputs())
+            except BaseException as snapshot_error:
+                issues.append(type(snapshot_error).__name__ + " while preserving bounded output")
+        try:
+            proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException as exc:
+            issues.append(type(exc).__name__ + " while waiting for sweeper")
+        else:
+            confirmed = True
+            break
+    pending_pipes = _close_teardown_streams(proc, failure=failure)
+    def attach_metadata(name, value):
+        try:
+            setattr(failure, name, value)
+        except BaseException as metadata_error:
+            with suppress(BaseException):
+                issues.append(type(metadata_error).__name__ + " while attaching " + name)
+            return False
+        return True
+
+    attach_metadata("sandbox_cleanup_pending",
+                    death_close_pending or not confirmed or bool(pending_pipes))
+    if not confirmed and attach_metadata("sandbox_process", proc):
+        issues.append("sweeper exit unconfirmed; retry sandbox_process.wait()")
+    if pending_pipes and attach_metadata("sandbox_pipes", pending_pipes):
+        issues.append("owned pipes remain open; retry sandbox_pipes close")
+    for issue in issues:
+        with suppress(BaseException):
+            failure.add_note("sandbox cleanup: " + issue)
+
+
+def _apply_capture_ceiling(
+    result: subprocess.CompletedProcess, cap: int,
+) -> None:
+    """Apply the result-size bound and format loss once across executors.
+
+    Streaming owners bound retained bytes while draining. Other platform
+    executors still need this final clamp on their already-buffered output.
+    """
+    limit_result(result, cap)
+
+
+# Byte ceiling for recounting the (target-writable) event log. A
+# planted multi-GiB file must not serialize the parent's I/O under the
+# persist lock; past the cap the recount aborts with the overflow flag
+# set, which the sidecar carries as tamper evidence.
+_RECOUNT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _count_lines_bounded(path, max_bytes: int = _RECOUNT_MAX_BYTES):
+    """``(newline_count, overflowed)`` of the existing event log, same
+    open discipline as the writer (O_NOFOLLOW/O_NONBLOCK +
+    fstat-regular); ``(0, False)`` on any refusal — a refused file
+    also refuses the append below. ``overflowed`` is True when the
+    file exceeded *max_bytes* and the count stopped early."""
+    try:
+        fd = os.open(str(path),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC)
+    except OSError:
+        return 0, False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return 0, False
+        count = 0
+        seen = 0
+        while True:
+            chunk = os.read(fd, min(1 << 20, max_bytes - seen + 1))
+            if not chunk:
+                return count, False
+            seen += len(chunk)
+            count += chunk.count(b"\n")
+            if seen > max_bytes:
+                return count, True
+    except OSError:
+        return 0, False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# Per-path stream state for the proxy-events writer, guarded by
+# _PROXY_PERSIST_LOCK: the authoritative next sequence number and the
+# accumulated writer-side tamper flags. Parent memory is the
+# out-of-band anchor the target cannot touch — deriving seq purely by
+# recounting the target-writable file let a child truncate the suffix
+# (or delete the whole file) between batches and have the next batch
+# renumber contiguously over the erased history.
+_PROXY_STREAM_STATE: dict = {}
+
+# Cap on the count sidecar read-back (it is a ~200-byte JSON document;
+# anything larger is a planted object).
+_COUNT_SIDECAR_MAX_BYTES = 64 * 1024
+
+
+def _read_proxy_count_sidecar(output, run_binding):
+    """Load + verify the existing count sidecar.
+
+    Returns ``(count, flags, invalid)``: ``count`` is the verified
+    count (None when absent/unverifiable), ``flags`` the verified
+    writer flags, ``invalid`` True when a sidecar file EXISTS but does
+    not verify (tamper evidence in itself)."""
+    from . import proxy as _proxy_mod
+    from . import telemetry_mac as _tmac
+    from .evidence import _unique_evidence_object
+    path = os.path.join(output, _proxy_mod.PROXY_EVENTS_COUNT_FILENAME)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, set(), False
+    except OSError:
+        return None, set(), True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, set(), True
+        chunks = []
+        remaining = _COUNT_SIDECAR_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError:
+        return None, set(), True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if len(raw) > _COUNT_SIDECAR_MAX_BYTES:
+        return None, set(), True
+    import json as _json
+    try:
+        data = _json.loads(raw.decode("utf-8"),
+                           object_pairs_hook=_unique_evidence_object)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None, set(), True
+    if not isinstance(data, dict):
+        return None, set(), True
+    count = data.get("count")
+    flags = data.get("flags", [])
+    if (type(count) is not int or count < 0
+            or not isinstance(flags, list)
+            or not all(isinstance(flag, str) for flag in flags)):
+        return None, set(), True
+    token = data.get("mac")
+    fields = _tmac.proxy_events_count_fields(count, flags, run_binding)
+    if not _tmac.verify(fields, token):
+        return None, set(), True
+    return count, {str(f) for f in flags}, False
+
+
+def _write_proxy_count_sidecar(output, count, flags, run_binding):
+    """Atomically persist the MAC'd count sidecar (temp + rename).
+
+    Skipped when no token can be minted (no usable key): an unstamped
+    sidecar carries no authority, and its absence is the consistent
+    legacy shape. Never raises — sidecar persistence must not break
+    the caller."""
+    from . import proxy as _proxy_mod
+    from . import telemetry_mac as _tmac
+    # One snapshot feeds the parent mirror, MAC fields, and JSON payload.
+    flags = sorted(str(f) for f in flags)
+    # Parent-memory mirror FIRST (out of the target's reach and not
+    # dependent on a mintable token): the sidecar closes suffix/whole
+    # truncation of the EVENTS file, but a target that erases BOTH
+    # artifacts leaves nothing on disk — in-lifecycle triage then
+    # consults this record (summary.get_proxy_persist_state) instead
+    # of reading the run as telemetry-free. Strictly one-way: the
+    # record condemns shortened/erased streams, never excuses.
+    try:
+        from . import summary as _summary_pm
+        _summary_pm.record_proxy_persist_state(
+            Path(output), expected_count=int(count),
+            flags=flags)
+    except Exception as exc:  # noqa: BLE001 — accounting is best-effort
+        logger.debug(
+            "proxy persist accounting failed: %s: %s",
+            sanitise_for_terminal(type(exc).__name__, max_len=64),
+            sanitise_exception_message(exc),
+        )
+    path = os.path.join(output, _proxy_mod.PROXY_EVENTS_COUNT_FILENAME)
+    try:
+        token = _tmac.mint(_tmac.proxy_events_count_fields(
+            count, flags, run_binding))
+        if not token:
+            return
+        import json as _json
+        payload = _json.dumps({
+            "count": int(count),
+            "flags": flags,
+            "mac": token,
+        })
+        from core.atomic_fs import write_text_atomically
+        # Complete writes, unique temporary-file ownership, and fsync before
+        # replacement come from the same primitive as other audit artifacts.
+        write_text_atomically(
+            path, payload, tmp_prefix=".~proxy-count-", mode=0o600,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Sandbox: could not write %s: %s: %s",
+            sanitise_for_terminal(path),
+            sanitise_for_terminal(type(exc).__name__, max_len=64),
+            sanitise_exception_message(exc),
+        )
+
+
+def _persist_proxy_events(
+    events,
+    *,
+    output,
+    target=None,
+) -> None:
+    """Append proxy events to ``<output>/proxy-events.jsonl``.
+
+    Safe-open machinery (O_NOFOLLOW + O_NONBLOCK + ``fstat`` regular-
+    file check, plus the target-pollution skip) is shared between
+    two callers in this module:
+
+      * Per-spawn write inside ``_run()`` — fires after each
+        sandboxed subprocess completes, capturing that spawn's
+        proxy-event slice as soon as the spawn returns.
+      * Block-level write inside ``sandbox()`` ``__exit__`` —
+        captures events recorded against the block token (i.e.,
+        from non-subprocess HTTPClient calls inside the with-
+        block, such as ``agent.py`` running ``analyse()`` in-
+        process). Caller pre-dedups against per-spawn events so a
+        single ``proxy-events.jsonl`` doesn't carry duplicates of
+        what the per-spawn writes already persisted.
+
+    No-op when:
+      * ``events`` is empty (no payload to write).
+      * ``output`` is ``None`` (no persistence target configured).
+      * ``output`` resolves inside ``target`` (target-pollution
+        skip — some callers pass ``output=target`` for writable
+        Landlock surface; persisting the JSONL there would
+        pollute the scanned tree).
+
+    Non-fatal on every write failure. Observability is nice-to-
+    have, not a reason to break the caller — the write failure
+    surfaces in a warning and sticky persistence state so operators
+    investigating missing audit data can find the cause.
+    """
+    if not events or not output:
+        return
+
+    # Target-pollution skip: if the persistence target is inside
+    # the scanned tree, drop the write. See per-spawn site for
+    # the original rationale.
+    if target:
+        try:
+            _norm_out = os.path.realpath(output)
+            _norm_tgt = os.path.realpath(target)
+            if _norm_out == _norm_tgt or _norm_out.startswith(
+                _norm_tgt.rstrip(os.sep) + os.sep
+            ):
+                logger.debug(
+                    "Sandbox: output (%s) lies within target (%s); "
+                    "skipping proxy-events.jsonl persistence to "
+                    "avoid polluting the scanned tree (in-memory "
+                    "events unaffected)", sanitise_for_terminal(_norm_out),
+                    sanitise_for_terminal(_norm_tgt),
+                )
+                return
+        except OSError:
+            # ``realpath`` raised — likely a dangling component.
+            # Fall through to the write attempt rather than break
+            # the scan over an observability check.
+            pass
+
+    from . import proxy as _proxy_mod
+    from . import telemetry_mac as _tmac
+    _log_path = os.path.join(output, _proxy_mod.PROXY_EVENTS_FILENAME)
+    _run_binding = _tmac.run_binding(output)
+    _persist_lock = _PROXY_PERSIST_LOCK
+    with _persist_lock:
+        _state = _PROXY_STREAM_STATE.setdefault(
+            os.path.realpath(_log_path), {"next_seq": None, "flags": set()},
+        )
+        try:
+            # Opened with O_NOFOLLOW + O_NONBLOCK so a child-planted
+            # symlink (→ ~/.ssh/authorized_keys etc.) can't redirect
+            # the write outside the sandbox boundary, and a child-
+            # planted FIFO without a reader can't hang the parent.
+            # fstat S_ISREG below confirms we got a regular file and
+            # not, e.g., a TTY device the child pre-opened.
+            _log_fd = os.open(
+                _log_path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                0o600,
+            )
+        except OSError as _log_err:
+            logger.debug(
+                "Sandbox: could not open %s for proxy-event "
+                "persistence: %s", sanitise_for_terminal(_log_path),
+                sanitise_exception_message(_log_err),
+            )
+            # A planted symlink/FIFO at the events path used to suppress
+            # evidence with only this DEBUG line. Record it as a
+            # MAC-bound tamper flag in the count sidecar (whose atomic
+            # rename is not affected by the planted object) so triage
+            # fails toward suspicious instead of clean.
+            _state["flags"].add("persist_open_failure")
+            # Retain the full verified anchor even when no append is possible.
+            _side_count, _side_flags, _side_invalid = (
+                _read_proxy_count_sidecar(output, _run_binding))
+            _state["flags"] |= _side_flags
+            if _side_invalid:
+                _state["flags"].add("count_sidecar_invalid")
+            _count = max(_state["next_seq"] or 0, _side_count or 0)
+            _state["next_seq"] = _count
+            _write_proxy_count_sidecar(
+                output, _count, _state["flags"], _run_binding)
+            return
+        _fd_owned = True
+        _seq_start = None
+        _written = 0
+        try:
+            _log_st = os.fstat(_log_fd)
+            if not stat.S_ISREG(_log_st.st_mode):
+                logger.debug(
+                    "Sandbox: %s exists but is not a regular file "
+                    "(mode=0o%o); skipping proxy event persistence",
+                    sanitise_for_terminal(_log_path), _log_st.st_mode,
+                )
+                _fd_owned = False
+                os.close(_log_fd)
+                # Same tamper class as the open failure above.
+                _state["flags"].add("persist_open_failure")
+                # Retain the full verified anchor even when no append is possible.
+                _side_count, _side_flags, _side_invalid = (
+                    _read_proxy_count_sidecar(output, _run_binding))
+                _state["flags"] |= _side_flags
+                if _side_invalid:
+                    _state["flags"].add("count_sidecar_invalid")
+                _count = max(_state["next_seq"] or 0, _side_count or 0)
+                _state["next_seq"] = _count
+                _write_proxy_count_sidecar(
+                    output, _count, _state["flags"], _run_binding)
+                return
+            # Clear O_NONBLOCK for the actual append: only needed to
+            # stop a FIFO-open hang at the os.open() above; on a
+            # regular file it's harmless but pointless.
+            import fcntl as _fcntl
+            _flags = _fcntl.fcntl(_log_fd, _fcntl.F_GETFL)
+            _fcntl.fcntl(_log_fd, _fcntl.F_SETFL, _flags & ~os.O_NONBLOCK)
+            import json as _json
+
+            # Sequence base: the max of the (bounded) file recount, the
+            # verified count sidecar, and this process's own counter.
+            # Parent memory and the MAC'd sidecar are the out-of-band
+            # anchors: deriving seq from the recount alone let a child
+            # truncate the SUFFIX (or delete the whole file) between
+            # batches and have the next batch renumber contiguously over
+            # the erased history — fully verifying, history silently
+            # gone. When the recount comes up short the erased range
+            # stays un-renumbered (the verifier sees the gap) and the
+            # sidecar carries an explicit MAC-bound flag.
+            _recount, _overflowed = _count_lines_bounded(_log_path)
+            _side_count, _side_flags, _side_invalid = (
+                _read_proxy_count_sidecar(output, _run_binding))
+            _state["flags"] |= _side_flags
+            if _side_invalid:
+                _state["flags"].add("count_sidecar_invalid")
+            _anchored = (_side_count is not None
+                         or _state["next_seq"] is not None)
+            if _overflowed and not _anchored:
+                # A >cap events file with NO anchor (no parent memory, no
+                # verified sidecar): our writer would have left a sidecar,
+                # so this is a planted/foreign stream — tamper-flagged.
+                # ANCHORED runs never flag here: the seq base comes from
+                # the anchor, the aborted recount is merely unusable for
+                # writer-side truncation detection, and the read-side
+                # count check still catches erasures — an honest, very
+                # chatty (>cap) run stays clean.
+                _state["flags"].add("recount_overflow")
+            _seq_start = max(
+                _recount,
+                _side_count or 0,
+                _state["next_seq"] or 0,
+            )
+            if not _overflowed and _recount < _seq_start:
+                _state["flags"].add("stream_truncated")
+            with os.fdopen(_log_fd, "a", encoding="utf-8") as _f:
+                _fd_owned = False  # fdopen took ownership
+                for _i, e in enumerate(events):
+                    # Provenance stamp: triage verifies this token before
+                    # letting the event drive a verdict — the target can
+                    # append to this file mid-run (it holds Landlock write
+                    # on `output`), and an unstampable environment (no
+                    # usable key) degrades to the legacy unstamped shape
+                    # triage already accepts with a caveat. ``seq`` rides
+                    # inside the MAC so deleting stamped lines leaves a
+                    # detectable gap.
+                    stamped = {**e, "seq": _seq_start + _i}
+                    token = _tmac.mint(_tmac.proxy_event_fields(
+                        stamped, run=_run_binding))
+                    line = {**stamped, "mac": token} if token else e
+                    try:
+                        activity_token = _tmac.mint(_tmac.proxy_activity_fields(
+                            stamped, run=_run_binding))
+                    except (ValueError, TypeError, RecursionError):
+                        activity_token = None
+                    if activity_token:
+                        line = {**line, 'activity_mac': activity_token}
+                    _f.write(_json.dumps(line) + "\n")
+                    _written += 1
+                # The count sidecar is durable; its healthy count must never
+                # reach disk before the corresponding event records do.
+                _f.flush()
+                os.fsync(_f.fileno())
+            _state["next_seq"] = _seq_start + _written
+            # Ordering note (inherent two-file window): events append
+            # first, sidecar second. A crash between the two leaves
+            # survivors AHEAD of the sidecar count — the verifier fails
+            # that shape toward suspicious but names it as the
+            # interrupted-persist direction (distinct from truncation,
+            # where survivors fall BEHIND the count).
+            _write_proxy_count_sidecar(
+                output, _state["next_seq"], _state["flags"], _run_binding)
+        except BaseException as _persist_exc:
+            # os.fdopen takes ownership on success; on any pre-fdopen
+            # failure we still own the fd and must close.  Post-fdopen
+            # the `with` block already closed it — a second os.close
+            # would risk closing another thread's newly-opened fd.
+            if _fd_owned:
+                try:
+                    os.close(_log_fd)
+                except OSError:
+                    pass
+            if not isinstance(_persist_exc, Exception):
+                raise
+            logger.warning(
+                "Sandbox: could not write proxy events to %s: %s: %s",
+                sanitise_for_terminal(_log_path),
+                sanitise_for_terminal(type(_persist_exc).__name__, max_len=64),
+                sanitise_exception_message(_persist_exc),
+            )
+            # Preserve the failure and every acknowledged write across later
+            # batches. Recounting alone must not renumber over missing history.
+            _state["flags"].add("persist_write_failure")
+            try:
+                if _seq_start is None:
+                    _side_count, _side_flags, _side_invalid = (
+                        _read_proxy_count_sidecar(output, _run_binding))
+                    _state["flags"] |= _side_flags
+                    if _side_invalid:
+                        _state["flags"].add("count_sidecar_invalid")
+                    _count = max(_state["next_seq"] or 0, _side_count or 0)
+                else:
+                    _count = max(_state["next_seq"] or 0, _seq_start + _written)
+                _state["next_seq"] = _count
+                _write_proxy_count_sidecar(
+                    output, _count, _state["flags"], _run_binding)
+            except Exception as exc:  # secondary persistence must not break the caller
+                logger.warning(
+                    "Sandbox: could not persist proxy write-failure state: %s: %s",
+                    sanitise_for_terminal(type(exc).__name__, max_len=64),
+                    sanitise_exception_message(exc),
+                )
 
 
 def _cmd_visible_in_mount_tree(cmd, target, output, extra_paths) -> bool:
@@ -153,6 +1169,41 @@ def _cmd_visible_in_mount_tree(cmd, target, output, extra_paths) -> bool:
     regardless of which path we take.
     """
     from .mount_ns import _SYSTEM_RO_DIRS
+
+    def _visible(abs_path: str, canon) -> bool:
+        # ``canon`` canonicalises each GRANT before the prefix
+        # comparison. The literal leg passes os.path.abspath: binds
+        # land at the caller-SPELLED grant path (mount_ns
+        # canonical_bind_path never resolves symlinks), so a
+        # symlink-spelled grant is visible at its spelled name — its
+        # realpath spelling may not exist in the tree at all. The
+        # realpath leg passes os.path.realpath, matching what the
+        # spelled bind actually exposes.
+        # System bind-mount prefixes (must match
+        # mount_ns._SYSTEM_RO_DIRS). /tmp is the per-sandbox tmpfs —
+        # host /tmp content is NOT visible, so a binary at /tmp/X
+        # would be invisible inside the sandbox; we deliberately do
+        # NOT add /tmp to the visible list.
+        for sysdir in _SYSTEM_RO_DIRS:
+            prefix = f"/{sysdir}"
+            if abs_path == prefix or abs_path.startswith(prefix + "/"):
+                return True
+        # target / output bind-mounts (visible at original absolute
+        # path).
+        for d in (target, output):
+            if d:
+                d_abs = canon(d)
+                if abs_path == d_abs or abs_path.startswith(d_abs + "/"):
+                    return True
+        # Caller-supplied extras (readable_paths + tool_paths union).
+        for d in (extra_paths or []):
+            if not d:
+                continue
+            d_abs = canon(d)
+            if abs_path == d_abs or abs_path.startswith(d_abs + "/"):
+                return True
+        return False
+
     if not cmd:
         return True
     cmd0 = cmd[0]
@@ -164,72 +1215,667 @@ def _cmd_visible_in_mount_tree(cmd, target, output, extra_paths) -> bool:
         # Can't determine — let the call proceed; the subprocess will
         # fail with a clear ENOENT if the binary doesn't exist anywhere.
         return True
-    # Follow symlinks so we check the real binary path. A symlink at
-    # /usr/local/bin/X → /home/USER/bin/X resolves to the home path
-    # and would correctly fail the visibility check.
+    # BOTH ends of a symlink chain must be visible: the child execs
+    # the LITERAL argv path, so an invisible location pointing at a
+    # visible target (a venv's bin/python3 → /usr/bin/python3) fails
+    # exec just as surely as a visible location pointing at an
+    # invisible target (/usr/local/bin/X → /home/USER/bin/X).
+    # abspath normalises without following the final symlink.
+    literal = os.path.abspath(resolved)
+    if not _visible(literal, os.path.abspath):
+        return False
     abs_path = os.path.realpath(resolved)
-    # System bind-mount prefixes (must match mount_ns._SYSTEM_RO_DIRS).
-    # /tmp is the per-sandbox tmpfs — host /tmp content is NOT visible,
-    # so a binary at /tmp/X would be invisible inside the sandbox; we
-    # deliberately do NOT add /tmp to the visible list.
-    for sysdir in _SYSTEM_RO_DIRS:
-        prefix = f"/{sysdir}"
-        if abs_path == prefix or abs_path.startswith(prefix + "/"):
-            return True
-    # target / output bind-mounts (visible at original absolute path).
-    for d in (target, output):
-        if d:
-            d_abs = os.path.realpath(d)
-            if abs_path == d_abs or abs_path.startswith(d_abs + "/"):
-                return True
-    # Caller-supplied extras (readable_paths + tool_paths union).
-    for d in (extra_paths or []):
-        if not d:
+    return literal == abs_path or _visible(abs_path, os.path.realpath)
+
+
+_UNSET = object()
+
+# Containment tier each execution lane DELIVERS, keyed by the lane name
+# used at its dispatch site (core/sandbox/tiers.py holds the lattice).
+# The checked dispatch resolves its declared tier through this table so
+# (a) the declaration is auditable in one place, (b) the "future lane"
+# contract test can inject a below-floor lane and prove the assertion
+# catches it, and (c) a lane routed through the chokepoint cannot ship
+# without an explicit entry (KeyError fails closed) — while the AST
+# executor gate in the contract tests forbids spawning a process in
+# this module ANY other way, so the chokepoint cannot be routed
+# around by a new bare call site either. Per-call caps
+# (skip_pid_ns keeps host procfs on the mount lane; a Landlock-less
+# kernel reduces the plain-subprocess lane to rlimits+seccomp) are
+# applied at the call sites via the check's ``cap=``.
+#
+# The former "unshare-CLI subprocess" lane (NS_NOMOUNT via the
+# unshare/prlimit/pid1-shim chain, HOST procfs visible) is deleted:
+# every namespace-needing shape now routes through the modern spawn
+# backend, whose Landlock-absent mode delivers the redefined
+# NS_NOMOUNT tier (namespaces + FRESH procfs + seccomp) as a ``cap=``
+# on the mountless lane rather than as a separate registry entry.
+_LANE_TIERS: "dict[str, _tiers.ContainmentTier]" = {
+    "seatbelt spawn": _tiers.ContainmentTier.SEATBELT,
+    "mount-ns spawn": _tiers.ContainmentTier.MOUNT_NS,
+    "mountless namespace backend": _tiers.ContainmentTier.MOUNTLESS_NS,
+    "Landlock-only subprocess": _tiers.ContainmentTier.LANDLOCK_ONLY,
+}
+
+#: Per-file /etc grants substituted for the wholesale "/etc" read grant
+#: under ``omit_etc_reads=True``: what the dynamic loader and TLS stacks
+#: need to run a tool, and nothing that names the host or its users.
+#: Missing entries are skipped at grant time (Landlock rules bind to
+#: existing inodes).
+_ETC_MINIMAL_READS: tuple[str, ...] = (
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/alternatives",
+    # CA trust only — deliberately NOT the whole /etc/ssl, which would
+    # include /etc/ssl/private (DAC-protected, but no business being
+    # in the grant set at all).
+    "/etc/ssl/certs",
+    "/etc/ssl/openssl.cnf",
+    "/etc/ca-certificates",
+    "/etc/pki",
+    "/etc/crypto-policies",
+    "/etc/localtime",
+)
+
+#: The WSL Windows-drive automount root. WSL2 serves every Windows
+#: drive under here (drvfs/9p — /mnt/c and friends), so an ambient
+#: read grant below it hands the untrusted child the whole Windows
+#: filesystem as a readable exfil surface. Constant by the same
+#: decision as the launcher's PATH-scrub classifier: a non-default
+#: ``/etc/wsl.conf`` ``[automount] root`` falls outside the deny
+#: (documented residual — nothing else keys on the root).
+_WSL_AUTOMOUNT_ROOT = "/mnt"
+
+
+def _startup_wsl():
+    """``core.startup.wsl``, or None when unimportable.
+
+    Lazy by the module's cross-package import convention; a failure
+    reads as plain Linux — the detection contract every
+    core.startup.wsl consumer keeps (its own probes already fail
+    toward False)."""
+    try:
+        from core.startup import wsl as _wsl_mod
+        return _wsl_mod
+    except Exception:  # noqa: BLE001 — detection must never break a run
+        return None
+
+
+def _under(spelling: str, root: str) -> bool:
+    """Exact-or-descendant path containment on one spelling."""
+    return spelling == root or spelling.startswith(root + "/")
+
+
+def _anon_socketpair_problem(fd: int) -> str | None:
+    """Why this socket fd is NOT an own-socketpair half, or ``None``.
+
+    SECURITY-SENSITIVE: this predicate is the ONLY socket shape the
+    pass_fds gate admits, and it is deliberately capability-equivalent
+    to the stdio pipes the gate already allows — a private byte stream
+    to the trusted calling process, nothing else. Every check below is
+    load-bearing:
+
+    * ``AF_UNIX`` + ``SOCK_STREAM`` — no INET/DGRAM shapes; an
+      inherited INET socket is a network capability the seccomp
+      socket-family filter never sees.
+    * both endpoint addresses UNNAMED (empty) — a pathname or
+      abstract address on EITHER end means the fd reaches (or can be
+      reached by) something addressable in a shared namespace, e.g. a
+      connected ``/var/run/docker.sock`` client, which this gate
+      exists to refuse. ``getpeername`` must also succeed: an
+      unconnected socket is a listener-shaped capability, not a pipe.
+    * ``SO_PEERCRED`` peer pid == ``os.getpid()`` — the OTHER half is
+      held by the calling process itself, i.e. THIS process created
+      the pair via ``socketpair(2)``. A pair minted by a foreign
+      process and smuggled in over SCM_RIGHTS reports the foreign
+      pid and refuses. Platforms without ``SO_PEERCRED`` (non-Linux)
+      refuse — fail closed; the pathname transport is primary there.
+
+    The fd is inspected through a dup-wrapped ``socket.socket`` so
+    the caller's descriptor keeps its state (no ownership transfer).
+    Returns ``None`` when the fd qualifies, else the refusal reason.
+    """
+    import socket as _socket_mod
+    import struct as _struct
+
+    try:
+        dup_fd = os.dup(fd)
+    except OSError as e:
+        return f"fd not duplicable for inspection ({e})"
+    try:
+        sock = _socket_mod.socket(fileno=dup_fd)
+    except OSError as e:
+        os.close(dup_fd)
+        return f"not inspectable as a socket ({e})"
+    try:
+        if sock.family != _socket_mod.AF_UNIX:
+            return f"family {sock.family!r} is not AF_UNIX"
+        if sock.type != _socket_mod.SOCK_STREAM:
+            return f"type {sock.type!r} is not SOCK_STREAM"
+        try:
+            local = sock.getsockname()
+        except OSError as e:
+            return f"getsockname failed ({e})"
+        if local != "":
+            return "local endpoint is named (pathname/abstract), not an anonymous socketpair"
+        try:
+            peer = sock.getpeername()
+        except OSError as e:
+            return f"not a connected stream (getpeername: {e})"
+        if peer != "":
+            return "peer endpoint is named (pathname/abstract), not an anonymous socketpair"
+        so_peercred = getattr(_socket_mod, "SO_PEERCRED", None)
+        if so_peercred is None:
+            return "SO_PEERCRED unavailable on this platform"
+        try:
+            cred = sock.getsockopt(
+                _socket_mod.SOL_SOCKET, so_peercred,
+                _struct.calcsize("3i"),
+            )
+            peer_pid = _struct.unpack("3i", cred)[0]
+        except (OSError, _struct.error) as e:
+            return f"SO_PEERCRED unreadable ({e})"
+        if peer_pid != os.getpid():
+            return (f"peer pid {peer_pid} is not this process "
+                    f"({os.getpid()}) — pair not created here")
+        return None
+    finally:
+        sock.close()
+
+
+def _split_wsl_ambient_mnt_reads(
+    paths: list, exempt_roots: list,
+) -> "tuple[list, list]":
+    """``(kept, dropped)`` split for the WSL /mnt ambient-read deny.
+
+    A path is dropped when it lies at or below the Windows automount
+    root on EITHER spelling — its ``canonical_bind_path`` (the
+    lexical policy spelling: abspath + two-slash collapse, so
+    ``//mnt/c`` and ``/mnt/c/../c`` cannot walk around the deny) or
+    its ``os.path.realpath`` (the DESTINATION spelling: the bind
+    machinery inode-pins and mounts the RESOLVED source, so a symlink
+    whose destination is under /mnt would otherwise bind Windows
+    content at an off-/mnt spelling with no warning).
+
+    Exemption is destination-true and symmetric: a to-be-dropped
+    entry is kept only when its realpath lies at/below the realpath
+    of an *exempt_roots* entry (the run's target/output, the
+    operator's ``--sandbox-readable-path`` / ``--sandbox-tool-path``
+    CLI entries). Realpath BOTH sides so a symlink-spelled target
+    (``~/repo`` → ``/mnt/c/repo``) keeps its tree exempt; realpath
+    ONLY (never the entry's lexical spelling) so a symlink parked
+    inside an exempt tree cannot smuggle an out-of-tree /mnt
+    destination through its parent's exemption. Entries are returned
+    in their ORIGINAL spelling (downstream consumers normalise for
+    themselves); ``os.path.realpath`` never raises and normalises
+    nonexistent tails component-wise.
+    """
+    exempt_real = [os.path.realpath(r) for r in exempt_roots if r]
+    kept: list = []
+    dropped: list = []
+    for p in paths:
+        if not p:
+            kept.append(p)
             continue
-        d_abs = os.path.realpath(d)
-        if abs_path == d_abs or abs_path.startswith(d_abs + "/"):
-            return True
-    return False
+        spellings = {canonical_bind_path(p), os.path.realpath(p)}
+        under_mnt = any(_under(s, _WSL_AUTOMOUNT_ROOT)
+                        for s in spellings)
+        if not under_mnt:
+            kept.append(p)
+            continue
+        real = os.path.realpath(p)
+        exempted = any(_under(real, r) for r in exempt_real)
+        (kept if exempted else dropped).append(p)
+    return kept, dropped
+
+
+# Headroom added on top of the same-uid task-count snapshot when
+# deriving the no-namespace RLIMIT_NPROC ceiling (snapshot + budget +
+# headroom, `_derive_host_nproc_cap`). The snapshot is taken at
+# sandbox() setup; the kernel checks the ceiling at every later
+# fork/clone in the child tree, and on a busy multi-session host the
+# same uid's task count keeps moving between those two moments.
+# Trade-off, both directions: too small and ordinary thread-count
+# fluctuation (concurrent scanners, thread pools spinning up) eats the
+# margin before the child's first fork — the child strands at the
+# boundary with EAGAIN and the lane failure gets misread as a
+# capability loss; too large and the ceiling stops binding — the cap
+# exists to contain a fork bomb from untrusted code, and every unit of
+# headroom is one more process a bomb spawns before EAGAIN, so the
+# margin must stay a small fraction of the configured budget (default
+# 1024, preexec._DEFAULT_LIMITS) or the containment scale silently
+# doubles. 256 (a quarter of the default budget) absorbs transient
+# same-uid churn without materially widening the bomb allowance.
+_NPROC_CLAMP_HEADROOM = 256
+
+#: Substrings that identify a spawn child's setup-status detail as a
+#: fork/clone EAGAIN: the Python exception line a failed os.fork()
+#: leaves as the last traceback line, the mapped errno name, and the
+#: strerror text the exec 'X' arm embeds.
+_NPROC_EAGAIN_MARKERS = (
+    "BlockingIOError",
+    "EAGAIN",
+    "Resource temporarily unavailable",
+)
+
+
+def _count_same_uid_tasks() -> "int | None":
+    """Same-uid TASK (thread) count summed over numeric /proc entries.
+
+    RLIMIT_NPROC counts TASKS (threads), not processes — counting
+    tgids alone would set a ceiling BELOW the current usage on any
+    thread-heavy host and make every fork in the sandbox fail EAGAIN.
+    Numeric entries only: the magic links (self, thread-self) and
+    non-pid dirs stat to a uid too and would poison the count.
+    Returns None when /proc is unreadable.
+    """
+    try:
+        _uid = os.geteuid()
+        _count = 0
+        for _d in os.listdir("/proc"):
+            if not _d.isdigit():
+                continue
+            try:
+                if os.stat(f"/proc/{_d}").st_uid != _uid:
+                    continue
+                with open(f"/proc/{_d}/status", "rb") as _f:
+                    for _line in _f.read(4096).splitlines():
+                        if _line.startswith(b"Threads:"):
+                            _count += int(_line.split()[1])
+                            break
+                    else:
+                        _count += 1
+            except (OSError, ValueError, IndexError):
+                continue
+    except OSError:
+        return None  # /proc unreadable — caller skips the cap
+    return _count
+
+
+def _derive_host_nproc_cap(nproc_budget: int) -> "int | None":
+    """THE host-uid RLIMIT_NPROC ceiling formula: fresh same-uid task
+    snapshot + configured budget + `_NPROC_CLAMP_HEADROOM`.
+
+    Single derivation chokepoint on purpose: the EAGAIN pressure retry
+    in run() re-derives the ceiling mid-call with a fresh snapshot,
+    and routing every (re)computation through this function is what
+    keeps that recompute-only — the retry can never hand a child a
+    ceiling the formula itself wouldn't produce, so a hostile child
+    that provokes retries cannot ratchet its own fork allowance past
+    snapshot + budget + headroom. Returns None (no cap) when the
+    budget is unset or /proc is unreadable.
+    """
+    if nproc_budget <= 0:
+        return None
+    _count = _count_same_uid_tasks()
+    if _count is None:
+        return None  # /proc unreadable — skip the cap
+    return _count + nproc_budget + _NPROC_CLAMP_HEADROOM
+
+
+def _consumption_nproc_cap(
+        setup_cap: "int | None", nproc_budget: int) -> "int | None":
+    """NPROC ceiling for a no-namespace lane at DISPATCH time: a fresh
+    `_derive_host_nproc_cap` sample, falling back to the setup-time
+    cap when the fresh derivation fails.
+
+    The setup-time snapshot ages between sandbox() entry and the
+    moment a demoted call actually forks, and any mid-call resample
+    (e.g. one taken while an EAGAIN retry fires) is by construction
+    load-peak-biased — a fresh sample at consumption dominates both.
+    Two guards:
+    - ``setup_cap is None`` stays None: the lane had no cap configured
+      (no budget / no cap at setup) and consumption must not invent
+      one — behaviour there is unchanged.
+    - a failed fresh derivation (transiently unreadable /proc) keeps
+      the setup-time cap rather than returning None: shedding the
+      fork-bomb bound a context already holds would let untrusted
+      code run to the host's per-uid ceiling.
+    Both inputs come from `_derive_host_nproc_cap`, so the value can
+    never exceed that single formula.
+    """
+    if setup_cap is None:
+        return None
+    _fresh = _derive_host_nproc_cap(nproc_budget)
+    return _fresh if _fresh is not None else setup_cap
+
+
+def _nproc_eagain_shaped(detail: str) -> bool:
+    """True when a spawn child's setup-status detail line looks like a
+    fork/clone EAGAIN.
+
+    The detail is trusted setup-child text (last traceback line, exec
+    errno tag) but it can EMBED target-influenced substrings — bind
+    paths under the scanned tree ride the mount-failure tracebacks, so
+    a hostile repo can name a file after these markers. Shape-matching
+    alone must therefore never change behaviour: callers pair it with
+    ``_nproc_pressure_evidence()``, which measures OUR OWN rlimit and
+    /proc — evidence the target cannot forge.
+    """
+    return any(_m in detail for _m in _NPROC_EAGAIN_MARKERS)
+
+
+def _nproc_pressure_evidence() -> "str | None":
+    """Live evidence that THIS process tree runs at/near a finite
+    RLIMIT_NPROC ceiling: the honest attribution for a fork/clone
+    EAGAIN in the spawn chain (the spawn children fork under the
+    parent's inherited limit — the per-uid count racing an NPROC
+    clamp, not a kernel capability or LSM policy refusal).
+
+    Returns the evidence string (measured count vs soft limit) or
+    None when no finite limit binds / the count is comfortably below
+    it / /proc is unreadable. "Near" means within one
+    `_NPROC_CLAMP_HEADROOM` of the ceiling: the count that provoked
+    the child's EAGAIN has already moved by the time we re-measure,
+    and demanding exact exceedance would flap the attribution off on
+    exactly the fluctuating hosts it exists for.
+    """
+    try:
+        _soft, _ = resource.getrlimit(resource.RLIMIT_NPROC)
+    except (OSError, ValueError):
+        return None
+    if _soft == resource.RLIM_INFINITY or _soft <= 0:
+        return None
+    _count = _count_same_uid_tasks()
+    if _count is None:
+        return None
+    if _count < max(0, _soft - _NPROC_CLAMP_HEADROOM):
+        return None
+    return (f"same-uid task count {_count} vs RLIMIT_NPROC soft limit "
+            f"{_soft}")
+
+
+def _nproc_eagain_retry_decision(
+        setup_status: "tuple[str, str] | None",
+        already_retried: bool) -> "str | None":
+    """Decide whether ONE fresh-clamp spawn retry is warranted for a
+    failed spawn attempt; returns the pressure evidence when it is,
+    None otherwise.
+
+    Fires only when ALL of: (1) `already_retried` is False — the hard
+    once-bound. Without it, a failure that keeps presenting as EAGAIN
+    under sustained load would ratchet retries, and every retry forks
+    a fresh spawn chain — adding tasks under the very ceiling that is
+    already exhausted, a retry storm amplifying the outage it responds
+    to. (2) The child failed at a stage with fork/clone sites under
+    the inherited limit ('M'/'X'/'U' — mount setup, pre-exec forks,
+    namespace staging); the fail-closed categories (P tamper, C
+    contract, F fresh-procfs, L/S layer installs) have no fork race to
+    rescue and must keep their existing loud handling. (3) The detail
+    is EAGAIN-shaped AND (4) live pressure evidence corroborates it —
+    the shape alone can be spoofed by target-influenced path text (see
+    `_nproc_eagain_shaped`), so the self-measured evidence is the
+    load-bearing gate: absent pressure, behaviour is byte-identical to
+    the pre-retry code (no lane decision changes under non-race
+    conditions).
+    """
+    if already_retried:
+        return None
+    if setup_status is None or setup_status[0] not in ("M", "X", "U"):
+        return None
+    if not _nproc_eagain_shaped(setup_status[1]):
+        return None
+    return _nproc_pressure_evidence()
+
+
+def _require_degraded_udp_filter(seccomp_profile: str | None) -> None:
+    """Refuse a TCP-only Landlock fallback when seccomp cannot block UDP.
+
+    A profile without seccomp cannot supply the missing UDP layer.
+    Profile selection does not waive block_network; callers accepting
+    unrestricted fallback networking must use degraded_net_deny=False.
+    Explicitly disabled runs are handled before this gate.
+    """
+    if (not seccomp_profile or seccomp_profile == "none"
+            or not check_seccomp_available()):
+        from .errors import SandboxSetupError
+        raise SandboxSetupError(
+            "Sandbox: network namespace unavailable; Landlock only "
+            "restricts TCP, and the required seccomp UDP/DNS block "
+            "cannot engage \N{em dash} refusing network-blocked execution.",
+            "Enable network namespaces, or select a seccomp-enabled "
+            "profile with working libseccomp. "
+            "degraded_net_deny=False explicitly accepts open egress "
+            "on this fallback; a containment-floor waiver does not "
+            "waive the required UDP/DNS filter.",
+        )
+
+
+#: Run-root ``output=`` seam warning: fired once per (process,
+#: realpath). Loops that re-enter sandbox() with the same run dir
+#: (retry ladders, per-finding dispatch) must not turn one mis-wired
+#: call site into a warning flood.
+_run_root_output_warned: set[str] = set()
+
+#: In-sandbox fake-home location on the mount-ns lane. Lives inside
+#: the per-sandbox private /tmp tmpfs — no host path rides the name,
+#: and no bind mount ties it to the run directory (a bind's mountinfo
+#: root field re-leaks the bind SOURCE path, which is why the fake
+#: home is COPIED into the tmpfs rather than bound from
+#: ``<output>/.home``).
+_TMP_FAKE_HOME = "/tmp/.home"
+
+#: Fake-home intake budgets. The intake (``<output>/.home``) is
+#: writable by any EARLIER sandboxed child sharing the output dir, so
+#: the parent-side staging walk must be bounded. Both directions
+#: matter: legitimate pre-population is a handful of small dotfiles
+#: (gitconfig, tool rc files — hundreds of bytes each), so 256 subdirectories / 256 files /
+#: 8 MiB is an order of magnitude of headroom; raising the caps lets a
+#: hostile prior child make the parent buffer arbitrarily much of its
+#: run-dir plant into memory AND replay it into every subsequent
+#: sandbox's tmpfs budget. Exceeding a cap never fails the run — the
+#: child keeps the attributable ``<output>/.home`` (status quo ante)
+#: with a warning.
+_FAKE_HOME_INGEST_MAX_DIRS = 256
+_FAKE_HOME_INGEST_MAX_FILES = 256
+_FAKE_HOME_INGEST_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _bounded_fake_home_walk(home_fd):
+    """Walk pinned directories with bounded enumeration and descriptor ownership.
+
+    The root descriptor is borrowed. Child descriptors and scanners belong to
+    this generator, including when its consumer stops before traversal ends.
+    """
+    directories = files = 0
+    frames = [(".", home_fd, False, None)]
+    try:
+        while frames:
+            rel, fd, owned, children = frames[-1]
+            if children is None:
+                dirnames, filenames = [], []
+                entries = None
+                try:
+                    entries = os.scandir(fd)
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            directories += 1
+                            if directories > _FAKE_HOME_INGEST_MAX_DIRS:
+                                raise OSError(errno.E2BIG, "fake-home directory budget exceeded")
+                            dirnames.append(entry.name)
+                        else:
+                            files += 1
+                            if files > _FAKE_HOME_INGEST_MAX_FILES:
+                                raise OSError(errno.E2BIG, "fake-home file budget exceeded")
+                            filenames.append(entry.name)
+                except BaseException:
+                    if entries is not None:
+                        with suppress(OSError):
+                            entries.close()
+                    raise
+                else:
+                    entries.close()
+                frames[-1] = (rel, fd, owned, iter(dirnames))
+                yield rel, dirnames, filenames, fd
+            else:
+                name = next(children, None)
+                if name is None:
+                    frames.pop()
+                    if owned:
+                        os.close(fd)
+                else:
+                    child_rel = os.path.join(rel, name)
+                    child_fd = os.open(
+                        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=fd)
+                    try:
+                        frames.append((child_rel, child_fd, True, None))
+                    except BaseException:
+                        with suppress(OSError):
+                            os.close(child_fd)
+                        raise
+    finally:
+        while frames:
+            _, fd, owned, _ = frames.pop()
+            if owned:
+                with suppress(OSError):
+                    os.close(fd)
+
+
+def _stage_fake_home_intake(
+        fake_home_path: str) -> tuple[dict[str, bytes], list[str]] | None:
+    """Map the ``<output>/.home`` intake onto the private ``/tmp/.home``.
+
+    Returns ``(stage_files, stage_dirs)`` for the mount-ns staging
+    seam — file contents keyed by in-sandbox path, plus the directory
+    skeleton (empty XDG subdirs included). Returns ``None`` when the
+    intake cannot be staged faithfully: over the directory-count/file-count/byte
+    budgets, or any member is not a plain file/directory (a symlink,
+    FIFO, or device in the intake is a plant from an earlier child —
+    following it would read attacker-chosen host paths into the next
+    sandbox). The caller falls back to the attributable
+    ``<output>/.home`` — never a hard failure.
+    """
+    stage_files: dict[str, bytes] = {}
+    stage_dirs: list[str] = [_TMP_FAKE_HOME]
+    total = 0
+
+    home_fd = None
+    body_failed = False
+    home_close_failed = False
+    try:
+        home_fd = _open_fake_home(fake_home_path)
+        with closing(_bounded_fake_home_walk(home_fd)) as walk:
+            for rel, dirnames, filenames, dir_fd in walk:
+                rel = os.path.normpath(rel)
+                in_sbx_dir = (_TMP_FAKE_HOME if rel == "."
+                              else os.path.join(_TMP_FAKE_HOME, rel))
+                for name in dirnames:
+                    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(st.st_mode):
+                        return None
+                    stage_dirs.append(os.path.join(in_sbx_dir, name))
+                for name in filenames:
+                    if len(stage_files) >= _FAKE_HOME_INGEST_MAX_FILES:
+                        return None
+                    # O_NOFOLLOW + fstat: the lstat/open race is real in
+                    # a dir an earlier sandboxed child could write.
+                    read_failed = False
+                    fd = os.open(name,
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=dir_fd)
+                    try:
+                        st = os.fstat(fd)
+                        if not stat.S_ISREG(st.st_mode):
+                            return None
+                        budget = _FAKE_HOME_INGEST_MAX_BYTES - total
+                        if st.st_size > budget:
+                            return None
+                        data = b""
+                        while len(data) <= budget:
+                            chunk = os.read(fd, 65536)
+                            if not chunk:
+                                break
+                            data += chunk
+                        if len(data) > budget:
+                            # The file grew past its fstat size mid-read
+                            # (concurrent writer) — refuse rather than
+                            # stage a torn/oversize copy.
+                            return None
+                    except BaseException:
+                        read_failed = True
+                        raise
+                    finally:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            # Keep a read failure or cancellation authoritative.
+                            if not read_failed:
+                                raise
+                    total += len(data)
+                    stage_files[os.path.join(in_sbx_dir, name)] = data
+    except OSError:
+        return None
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        if home_fd is not None:
+            try:
+                os.close(home_fd)
+            except OSError:
+                # Intake I/O is best-effort, including root cleanup, but
+                # cleanup must never replace an active cancellation.
+                if not body_failed:
+                    home_close_failed = True
+    if home_close_failed:
+        return None
+    return stage_files, stage_dirs
 
 
 @contextmanager
-def sandbox(block_network: bool = False, target: str = None, output: str = None,
-            map_root: bool = False, limits: dict = None,
-            allowed_tcp_ports: list = None, profile: str = None,
+def sandbox(block_network=_UNSET, target: str | None = None, output: str | None = None,
+            map_root: bool = False, limits: dict | None = None,
+            allowed_tcp_ports: list | None = None, profile: str | None = None,
             disabled: bool = False,
-            use_egress_proxy: bool = False, proxy_hosts: list = None,
-            restrict_reads: bool = False, readable_paths: list = None,
-            caller_label: str = None,
-            fake_home: bool = False,
-            tool_paths: list = None,
+            use_egress_proxy: bool = False, proxy_hosts: list | None = None,
+            proxy_allowed_ports: list | None = None,
+            restrict_reads=_UNSET, readable_paths: list | None = None,
+            caller_label: str | None = None,
+            fake_home=_UNSET,
+            tool_paths: list | None = None,
             audit: bool = False, audit_verbose: bool = False,
-            audit_run_dir: Optional[str] = None,
+            audit_run_dir: str | None = None,
+            audit_required: bool = False,
             observe: bool = False,
-            writable_paths: Optional[list] = None,
+            writable_paths: list | None = None,
+            exclude_tmp_baseline: bool = False,
             sanitise_host_fingerprint: bool = False,
-            cpu_count: Optional[int] = None,
-            require_sanitisation: bool = False):
+            cpu_count: int | None = None,
+            require_sanitisation: bool = False,
+            etc_overlay: dict | None = None,
+            degraded_net_deny: bool = True,
+            loopback_unix_bridges: dict | None = None,
+            omit_proc_reads: bool = False,
+            omit_etc_reads: bool = False,
+            require_proxy_netns: bool = False,
+            rootfs: str | None = None,
+            output_run_root_ok: bool = False,
+            job_budget: dict | None = None):
     """Context manager for sandboxed subprocess execution.
 
     Each run() call inside the context runs the target command with the
-    isolation configured here. When `block_network=True` or mount
-    isolation is active, each run() launches its subprocess inside a
-    fresh user namespace via `unshare`; Landlock-only runs do NOT use
-    namespaces and execute in the calling process's namespace (Landlock
-    is applied in the child via preexec_fn). Resource rlimits always
-    apply.
+    isolation configured here. When `block_network=True`, mount
+    isolation, or a read restriction is active, each run() launches its
+    command through the fork-based spawn backend inside fresh user/pid/
+    ipc/cgroup(+net) namespaces (with the pivot_root bind tree when
+    target/output engage it, mountlessly otherwise); Landlock-only runs
+    do NOT use namespaces and execute in the calling process's
+    namespace (Landlock is applied in the child via preexec_fn).
+    Resource rlimits always apply.
 
     Args:
-        block_network: If True, block all network access via user namespace
-                      (`unshare --user --net`). Overridden by profile=
+        block_network: If True, block all network access via a fresh
+                      network namespace. Overridden by profile=
                       and by --sandbox/--no-sandbox CLI flags.
         target: Path to target repo. Engages Landlock. Under Landlock, the
                path is an engagement marker only (Landlock does not restrict
                reads); under mount-namespace mode, it is bind-mounted read-
-               only at /target inside the namespace.
+               only at its original absolute path inside the namespace.
         output: Path to output dir (always writable inside the sandbox).
                Engages Landlock and — when mount is active — bind-mounted
-               at /output.
+               writable at its original absolute path.
         map_root: Map current UID to root inside namespace (needed by some
                  builds that check `getuid() == 0`).
         limits: Resource limit overrides (memory_mb, max_file_mb, cpu_seconds).
@@ -245,7 +1891,9 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                           policy (but then allowed_tcp_ports is useless
                           because the namespace removes all interfaces;
                           mixing the two produces a warning).
-        profile: Named profile ('full', 'network-only', 'none'). Forces
+        profile: Named profile ('full', 'strict', 'target_run',
+                'debug', 'frida', 'network-only', 'none' — the
+                profiles.PROFILES table). Forces
                 block_network to the profile's value AND — when the profile
                 disables Landlock — nulls `target`, `output`, and
                 `allowed_tcp_ports` (with a WARNING log if any were set).
@@ -257,19 +1905,49 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                  string.
         use_egress_proxy: If True, route the child's outbound HTTPS
                  traffic through a local HTTPS-CONNECT proxy with a
-                 hostname allowlist. Closes the UDP/DNS exfil gap that
-                 `allowed_tcp_ports` leaves open: seccomp blocks
-                 AF_INET/AF_INET6 SOCK_DGRAM (so the child can't do DNS
-                 directly), and `allowed_tcp_ports` is auto-set to the
-                 proxy's ephemeral loopback port. The child env is
-                 extended with HTTPS_PROXY/http_proxy (both cases, for
-                 Node/curl/Python AND CodeQL's Java stack). Pair with
-                 `proxy_hosts=[...]` to declare the hostname allowlist.
-                 Implicitly sets block_network=False (network-ns block
-                 would make the proxy unreachable).
+                 hostname allowlist. Enforcement is tiered (strongest
+                 available wins): with netns capability the child runs
+                 in an EMPTY network namespace (loopback up) and
+                 reaches the proxy only via a unix-socket bridge —
+                 DNS/UDP exfil is impossible topologically and no
+                 seccomp UDP block is needed, so loopback-UDP tools
+                 (gradle) work. Without netns, Landlock pins TCP
+                 connect to the proxy port and seccomp blocks
+                 AF_INET/AF_INET6 SOCK_DGRAM to close the DNS/UDP
+                 exfil channel (gradle-class UDP-at-startup tools
+                 break there). The child env is extended with
+                 HTTPS_PROXY/http_proxy (both cases, for Node/curl/
+                 Python AND CodeQL's Java stack). Pair with
+                 `proxy_hosts=[...]` to declare the hostname
+                 allowlist.
+        proxy_allowed_ports: Destination-port allowlist for this
+                 context's proxy lane (gate 1b, always enforcing).
+                 None = any port (legacy behaviour). The networked
+                 untrusted helper passes [443] to make its docstring
+                 contract real — hostname authorisation alone would
+                 let the child CONNECT to any 1-65535 service on an
+                 allowlisted host.
         proxy_hosts: Hostname allowlist for the egress proxy. Union'd
                  with any existing allowlist if the proxy singleton is
                  already running. Required when use_egress_proxy=True.
+        loopback_unix_bridges: Mapping of {port: unix_socket_path}
+                 relayed inside the child's empty network namespace:
+                 the child connects to 127.0.0.1:<port> and the
+                 pre-Landlock relay forwards the bytes to the named
+                 unix socket on the host. Requires
+                 use_egress_proxy=True (ValueError) AND the netns
+                 egress tier (SandboxSetupError when only the
+                 Landlock/advisory tiers are available). When set, the
+                 staged proxy env carries NO_PROXY=127.0.0.1,localhost
+                 so bridged loopback traffic goes direct instead of
+                 dying at the CONNECT proxy's loopback rejection.
+        require_proxy_netns: Fail-closed switch for the egress tiers
+                 (Linux only; inert on macOS): when True and
+                 use_egress_proxy cannot engage the netns tier, raise
+                 SandboxSetupError instead of degrading to the
+                 port-scoped Landlock pin — which does not enforce the
+                 hostname allowlist. RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1
+                 is the operator override that accepts the weaker tier.
         restrict_reads: If True, flip Landlock's default "read everywhere"
                  to "read only in allowed paths". Defaults to a system-
                  dirs allowlist that covers what normal compiled binaries
@@ -281,6 +1959,33 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         readable_paths: Extra read-allowed paths (adds to the default
                  system-dirs list when restrict_reads=True). Ignored
                  when restrict_reads=False (reads are already wide).
+        tool_paths: Extra read-allowed directories for the TOOLCHAIN
+                 being run — unioned with readable_paths into the
+                 Landlock read allowlist and the mount-ns read-only
+                 bind set, so a tool installed outside the system dirs
+                 is visible and executable inside the sandbox. PATH
+                 entries under a declared dir also survive the child
+                 env's home-scrub (home-rooted PATH entries are
+                 otherwise dropped), so a $HOME-resident toolchain
+                 declared here resolves by name. A multi-dir toolchain
+                 needs EVERY dir it execs through declared — rustup's
+                 ~/.cargo/bin proxies re-exec ~/.rustup/toolchains/*,
+                 so both dirs belong in the list.
+                 Extended by the --sandbox-tool-path CLI flag. Callers
+                 spawning user-local toolchains under strict/
+                 restrict_reads need this (see
+                 python_runtime_tool_paths()).
+        writable_paths: Extra write-allowed paths (absolutized),
+                 layered on top of the canonical writable surface
+                 (output + the /tmp baseline). Use case: resolver
+                 scratch dirs (~/.cache/pip, ~/.npm, ~/.m2) that live
+                 outside the per-run output dir.
+        exclude_tmp_baseline: If True, drop /tmp (and /dev/shm) from
+                 the writable baseline so the child cannot write
+                 ANYWHERE under /tmp (exploit-engine wrapper-script
+                 defence). Only use when the sandboxed program is
+                 known not to need /tmp to start — a normal python3
+                 import writes pyc cache there.
         caller_label: Optional short identifier (e.g. "claude-sub-agent",
                  "codeql-pack-download") that propagates into proxy
                  event records. Used for per-caller filtering of
@@ -299,6 +2004,158 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                  should pre-populate `{output}/.home/` before invoking.
                  Requires `output=` to be set. Defaults to True on
                  `run_untrusted()`, False on direct `sandbox()` use.
+        audit: If True, engage the audit evidence channel for this
+                 context's run() calls: a spawn-tier syscall tracer
+                 records JSONL evidence under `<dir>/.audit` of the
+                 audit target dir (audit_run_dir or output). Per-call
+                 equivalent of the --audit CLI flag; silently no-ops
+                 when the sandbox is effectively disabled.
+        audit_verbose: Trace every syscall, not just those outside the
+                 enforcement allowlist. Only takes effect when audit
+                 mode is engaged; forced on by observe=True.
+        audit_run_dir: Directory the audit tiers write evidence into
+                 (they create only the `.audit/` subdir — the dir
+                 itself must already exist and be writable, else
+                 ValueError). Decouples "where audit JSONL goes" from
+                 Landlock's output= restriction: pass it alone for
+                 audit signal without a writable-path restriction.
+                 When unset, audit falls back to output; audit mode
+                 requires one of the two.
+        observe: Observe mode — implies audit and audit_verbose,
+                 writes to a separate observe JSONL, extends the trace
+                 set with the stat family, and stamps a per-run
+                 128-bit nonce into
+                 result.sandbox_info["observe_nonce"] for
+                 spoof-resistant parse_observe_log() parsing.
+        audit_required: (default False) Fail-closed switch for the audit
+                 evidence channel (precedent: `require_sanitisation`).
+                 When True and audit mode is engaged for a run() call but
+                 NO audit tier can attach (mount-ns/seatbelt spawn tracer
+                 AND the Landlock-only tracer both unavailable or failed),
+                 raise SandboxSetupError instead of degrading to an
+                 unaudited subprocess — the command does not execute.
+                 When False (default), degradation is permitted but is
+                 always recorded: the per-run
+                 ``sandbox-audit-degraded.json`` marker is written and
+                 ``result.sandbox_info["audit_engaged"]`` is False. Inert
+                 when audit mode is not engaged for the call.
+        degraded_net_deny: (default True) When `block_network=True` was
+                 requested but no namespace backend is available on this
+                 host (Landlock-only degradation — Ubuntu 24.04+ AppArmor
+                 userns default, SELinux, nested containers), fall back
+                 to Landlock's TCP-connect deny (ABI v4+): every outbound
+                 TCP connect fails with EACCES instead of silently running
+                 with full host network. Loopback connects are denied too
+                 (Landlock net rules are port-scoped, not address-scoped),
+                 which breaks daemon-IPC tools; known offenders are nudged
+                 to no-daemon mode via env (GRADLE_OPTS, NX_DAEMON). bind/
+                 listen are untouched; seccomp denies IPv4/IPv6 UDP
+                 socket creation, including DNS. This fallback refuses
+                 to run without a working seccomp filter. When the TCP deny
+                 cannot engage either (no Landlock ABI v4+ — which also
+                 leaves an allowed_tcp_ports allowlist unenforceable on
+                 this path), the context raises SandboxSetupError
+                 rather than running with the demanded block silently
+                 absent. On Linux with the default True, block_network=
+                 True therefore always yields a deny layer, an enforced
+                 port allowlist, or a refusal — never silently open
+                 egress; the explicit acceptance levers are False here
+                 (per call: a workload that genuinely needs loopback
+                 TCP / egress on a degraded host) and
+                 RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 (host-wide, converts
+                 the refusal to a loud warning). No effect when a
+                 namespace backend is available or on macOS (whose
+                 seatbelt lane has its own posture).
+        omit_proc_reads: (default False) Remove `/proc` from the
+                 default read allowlist computed under
+                 `restrict_reads=True`. Set by `run_untrusted()` /
+                 `run_untrusted_networked()` on hosts where the PID
+                 namespace cannot engage (no unprivileged userns) and
+                 the operator overrode the fail-closed refusal via
+                 RAPTOR_ALLOW_DEGRADED_UNTRUSTED: without a pid-ns, a
+                 compromised child in the HOST pid namespace can read
+                 `/proc/<pid>/environ` of any same-UID process — the
+                 credential-exfil channel the untrusted contract
+                 exists to close. Cost: tools that read `/proc/self/*`
+                 (ASAN, IFUNC dispatch, runtime CPU detection) fail
+                 with EACCES; extend `readable_paths=` for specific
+                 needs. Inert when `restrict_reads` is off (no read
+                 allowlist exists).
+        omit_etc_reads: (default False) Swap the wholesale `/etc` grant
+                 in the `restrict_reads=True` read allowlist for the
+                 minimal per-file set the loader and TLS stacks need
+                 (`_ETC_MINIMAL_READS`: ld.so cache/conf, alternatives,
+                 CA material, localtime). For callers whose payload has
+                 no business enumerating host identity files
+                 (`/etc/passwd`, `/etc/hosts`, `/etc/machine-id`, ...)
+                 this holds on the Landlock-only tier too, where no
+                 private mount view exists. Cost: anything else under
+                 /etc reads as EACCES — extend `readable_paths=` for
+                 specific needs. Inert when `restrict_reads` is off.
+        sanitise_host_fingerprint: If True, build a host-fingerprint
+                 persona once per context (synthetic cpuinfo etc.
+                 bind-mounted over the real files, plus UTS/identity
+                 and CPU-affinity changes) so the child sees a
+                 sanitised host identity. Requires Linux, the mount-ns
+                 backend, and at least one of target=/output=; when
+                 any is missing it degrades to a one-shot WARNING (the
+                 identity surfaces stay host-real) unless
+                 require_sanitisation=True.
+        cpu_count: CPU count the fingerprint persona claims (its
+                 cpuinfo), default 4; set_cpu_affinity clamps to the
+                 host's actual CPUs at apply time. Ignored with a
+                 warning when sanitise_host_fingerprint=False.
+        require_sanitisation: Fail-closed switch for the persona: when
+                 True and sanitisation cannot engage (unsupported
+                 platform, no mount-ns, no target/output), raise
+                 RuntimeError instead of logging the degradation
+                 warning. Also binds PER-RUN coverage: a per-overlay
+                 bind failure or missing target inside the mount-ns
+                 child aborts setup (instead of skip-and-continue),
+                 and a mount-ns setup/exec failure raises
+                 SandboxSetupError instead of degrading to the
+                 Landlock-only fallback (which cannot apply the
+                 persona at all).
+        etc_overlay: Dict mapping in-sandbox /etc paths (e.g.
+                 "/etc/sudoers") to host source files bind-mounted
+                 over them during mount-ns init (mount-ns backend
+                 only; non-str or missing-source entries are skipped
+                 with a warning). Keys are also appended to the read
+                 allowlist under restrict_reads=True.
+        rootfs: Directory holding an unpacked container-image filesystem
+                 (e.g. `docker create` + `docker export`). When set, the
+                 mount namespace pivots into THAT tree instead of the
+                 tmpfs-of-host-system-dirs — the command runs against
+                 the image's own /usr, /lib, /etc with per-namespace
+                 /dev, /proc, /sys, /tmp, /run on top, ns-local pids
+                 (an in-process PID-1 waiter reaps and mirrors exit
+                 status), and a subuid/subgid RANGE map so image
+                 entrypoints can chown/setuid to non-root uids.
+                 FAIL-CLOSED: rootfs requires the Linux mount-ns spawn
+                 backend — every degradation that other calls tolerate
+                 (Landlock-only fallback, seatbelt, profile 'none',
+                 native setup failures) raises SandboxSetupError
+                 instead, because "degraded" here means the command
+                 would run against the HOST filesystem while the caller
+                 believes it is containerised. The rootfs directory is
+                 the sacrificial writable upper layer: the environment
+                 writes into it host-side; treat it as consumed after
+                 the run. target/output binds, readable_paths,
+                 audit/observe, and network policy compose unchanged.
+        output_run_root_ok: Acknowledge that `output=` deliberately
+                 names a run-directory ROOT (a directory carrying
+                 `.raptor-run.json`). The run root is parent-attributed
+                 state the parent re-reads after the child exits —
+                 findings, manifests, the run's own recorded outcome —
+                 so granting a sandboxed child write access to it is a
+                 seam worth flagging. Default False: a run-root
+                 `output=` logs a once-per-(process,path) warning.
+                 Trusted-agent lanes whose contract IS "write this
+                 run's artifacts" pass True; hostile lanes should pass
+                 a work subdirectory instead
+                 (core.sandbox.work_dir.hostile_work_subdir).
+                 Detection only — never a refusal, and never consulted
+                 when the sandbox is effectively disabled.
 
     Landlock activation: engaged when any of `target`, `output`, or
     `allowed_tcp_ports` is set. Default filesystem policy is read-
@@ -307,11 +2164,41 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
 
     Profiles:
         full:         network blocked + Landlock + seccomp + rlimits (default)
-        debug:        full, but seccomp permits ptrace (for gdb/rr use cases
+        strict:       full + fail-closed backend checks + restrict_reads
+                      defaulted True (and fake_home when output= is set).
+                      Explicit restrict_reads=/fake_home= kwargs override
+                      the profile defaults. Callers spawning user-local
+                      toolchains (pip --user, pyenv, ~/venv) under strict
+                      must pass tool_paths=[...] (see
+                      python_runtime_tool_paths()).
+        debug:        full, but seccomp permits ptrace (for GDB/LLDB use cases
                       under /crash-analysis). All other seccomp blocks remain.
+        target_run:   full's layers with the network OPEN (block_network
+                      False) — for targets that must reach the network
+                      under otherwise-full confinement.
+        frida:        network open + Landlock + the frida seccomp profile
+                      (AF_UNIX allowed for frida-helper IPC; memfd exec
+                      carve-out). Consented instrumentation lane.
         network-only: network blocked + rlimits only (no Landlock, no seccomp)
         none:         rlimits only, no isolation
+
+    (Complete member list, kept in sync with profiles.PROFILES — the
+    operator-facing help in cli.py derives from the same table.)
     """
+    from .job_budget import Budget as _JobBudget
+    try:
+        _budget_spec = _JobBudget.parse(job_budget)
+    except (ValueError, TypeError) as exc:
+        raise _errors.SandboxSetupError('Invalid sandbox job budget') from exc
+    # Rootfs pre-flight: cheap shape errors raise here (caller bug,
+    # ValueError); "the backend can't honour rootfs on this host/config"
+    # raises SandboxSetupError at the use_mount decision below.
+    if rootfs is not None:
+        rootfs = os.path.abspath(rootfs)
+        if not os.path.isdir(rootfs):
+            msg = f"sandbox(rootfs=...): not a directory: {rootfs}"
+            raise ValueError(msg)
+
     # Initialize seccomp from the default profile. When the caller passes
     # a specific `profile=`, the value below is overridden; otherwise we
     # apply the default full-seccomp blocklist as a safety default. This
@@ -363,12 +2250,12 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # `sandbox(audit=True, disabled=True)` call would acquire the
     # ref-count without ever using audit, leaking the count if the
     # release path doesn't fire (which it does, but defensive).
-    _effectively_disabled = (
-        bool(disabled)
-        or bool(state._cli_sandbox_disabled)
-        or state._cli_sandbox_profile == "none"
-        or profile == "none"
-    )
+    if state._cli_sandbox_profile is not None:
+        _effectively_disabled = (state._cli_sandbox_profile == "none")
+    elif profile is not None:
+        _effectively_disabled = (profile == "none")
+    else:
+        _effectively_disabled = bool(disabled) or bool(state._cli_sandbox_disabled)
     # Observe mode is "audit + audit_verbose + write to a separate
     # JSONL file + extend the trace set with stat-family". Engaging
     # observe implies audit (TRACE action requires a tracer) and
@@ -410,60 +2297,152 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # is engaged with no output, spawn raises ValueError with a
     # clear "audit_mode=True requires audit_run_dir=" message.
 
+    # Resolve profile-implied defaults for the _UNSET kwargs BEFORE the
+    # fake-home setup below consumes fake_home (the authoritative
+    # profile-override block further down runs too late for it). The
+    # profile choice mirrors that block exactly: CLI wins, then
+    # disabled, then the caller's profile=. Reject unknown selected
+    # profiles before path staging can consume their configuration.
+    if (profile == "rr" and disabled
+            and state._cli_sandbox_profile is None
+            and not state._cli_sandbox_disabled):
+        raise _errors.SandboxSetupError(
+            "rr replay cannot waive containment through disabled=True; "
+            "sandbox opt-outs require an explicit operator profile choice")
+    if state._cli_sandbox_profile is not None:
+        _profile_for_defaults = state._cli_sandbox_profile
+    elif disabled or state._cli_sandbox_disabled:
+        _profile_for_defaults = "none"
+    else:
+        _profile_for_defaults = profile  # type: ignore[assignment]
+    if _profile_for_defaults is not None and _profile_for_defaults not in PROFILES:
+        raise ValueError(
+            f"Unknown sandbox profile {_profile_for_defaults!r}. "
+            f"Valid profiles: {sorted(PROFILES)}."
+        )
+    _profile_defaults: Mapping[str, object] = (
+        PROFILES.get(_profile_for_defaults)
+        if _profile_for_defaults else None
+    ) or {}
+    if _profile_for_defaults == "rr":
+        if (_profile_defaults.get("seccomp") != "rr"
+                or not all(_profile_defaults.get(key) is True
+                           for key in ("block_network", "use_landlock", "restrict_reads"))):
+            raise ValueError("rr profile must retain its complete namespace/seccomp contract")
+        # rr may open per-task perf counters only inside a private PID
+        # namespace. This is a profile requirement, not a waivable floor.
+        if use_egress_proxy or loopback_unix_bridges:
+            raise _errors.SandboxSetupError("rr does not permit host-network bridges or egress proxies")
+        if sys.platform != "linux" or not output or not check_seccomp_available():
+            raise _errors.SandboxSetupError(
+                "rr requires Linux, a writable output directory and functional seccomp")
+        if not (check_mount_available() and check_net_available()):
+            raise _errors.SandboxSetupError(
+                "rr requires private mount, PID and network namespaces; "
+                "a lower sandbox floor does not relax the rr counter policy")
+        block_network = True
+        restrict_reads = True
+        fake_home = True
+    if restrict_reads is _UNSET:
+        restrict_reads = bool(_profile_defaults.get("restrict_reads", False))
+    if fake_home is _UNSET:
+        # Profiles that imply restrict_reads imply the fake HOME too —
+        # the EACCES-vs-ENOENT pairing (git and friends hard-fail on an
+        # unreadable ~/.gitconfig but tolerate a missing one; verified
+        # 2026-08-15 in the Landlock-only battery). Only when output=
+        # is set: fake_home needs a writable location to materialise.
+        fake_home = bool(_profile_defaults.get("restrict_reads", False)
+                         and output)
+    if (_profile_defaults
+            and not _profile_defaults.get("use_landlock", True)
+            and fake_home):
+        # Landlock-off profiles (none / network-only) shed per-call
+        # Landlock policy wholesale. The authoritative profile block
+        # below nulls the FS/net policy kwargs, but fake_home is
+        # consumed by the materialisation immediately below, so its
+        # shed must happen here: without it, fake_home=True under
+        # `--sandbox none` materialised `.home` and staged HOME/XDG
+        # overrides for a run whose contract is "rlimits only, no
+        # isolation". Warning suppression mirrors the authoritative
+        # block's discard warning exactly: an explicit operator
+        # disable expects the shed (production callers pass
+        # fake_home=True unconditionally — a --sandbox none bisect
+        # session must not get one warning per call), a non-disabled
+        # Landlock-off profile gets told.
+        _defaults_effectively_disabled = (
+            state._cli_sandbox_profile == "none"
+            if state._cli_sandbox_profile is not None
+            else (disabled or state._cli_sandbox_disabled))
+        if not _defaults_effectively_disabled:
+            logger.warning(
+                "Sandbox: profile %r ignores fake_home=True — the "
+                "fake HOME is part of the per-call policy surface "
+                "this profile sheds (its isolation value rides "
+                "Landlock's read/write scoping).",
+                _profile_for_defaults)
+        fake_home = False
+
+    # Run-root output seam. `output=` naming a run-directory ROOT
+    # hands the sandboxed child write access to parent-attributed run
+    # state (.raptor-run.json, findings, manifests — everything the
+    # parent re-reads after the child exits). Hostile lanes should
+    # pass a work subdirectory (core.sandbox.work_dir.
+    # hostile_work_subdir); trusted-agent lanes whose contract IS
+    # "write this run's artifacts" acknowledge with
+    # output_run_root_ok=True. Warning-only (the grant itself is
+    # sometimes the contract), once per (process, realpath), and
+    # skipped when the sandbox is effectively disabled — a disabled
+    # run's child is a bare subprocess, there is no containment seam
+    # to flag.
+    if output and not output_run_root_ok and not _effectively_disabled:
+        from core.sandbox.work_dir import is_run_root as _is_run_root
+        if _is_run_root(output):
+            _rr_real = os.path.realpath(output)
+            if _rr_real not in _run_root_output_warned:
+                _run_root_output_warned.add(_rr_real)
+                # The path is caller-chosen but can embed
+                # target-derived segments (run dirs named after the
+                # analysed repo) — escape before it rides a warning
+                # onto the operator terminal.
+                from core.security.log_sanitisation import (
+                    escape_nonprintable,
+                )
+                logger.warning(
+                    "Sandbox: output= is a run-directory root (%s) — "
+                    "the sandboxed child can rewrite parent-attributed "
+                    "run state (.raptor-run.json, findings, "
+                    "manifests). Hostile call sites should pass a "
+                    "work subdirectory (core.sandbox.work_dir."
+                    "hostile_work_subdir); call sites that "
+                    "intentionally write run artifacts pass "
+                    "output_run_root_ok=True.",
+                    escape_nonprintable(str(output)))
+
     # Fake-HOME setup — create an empty home dir under `output` and
     # stage env overrides for the run() closure. Deferred to run-time
     # creation would add a race; we set up now so that Landlock's
     # writable_paths covers it. Requires output= so Landlock can write.
     fake_home_env: dict = {}
+    fake_home_path: str | None = None
     if fake_home:
         if not output:
-            raise ValueError(
+            msg = (
                 "fake_home=True requires output= so the fake home "
                 "directory is in a Landlock-writable location."
             )
+            raise ValueError(msg)
         fake_home_path = os.path.join(output, ".home")
-        # Symlink-TOCTOU defence. A sandboxed child has write access
-        # to `output`; in a callsite that reuses `output` across
-        # multiple sandbox() calls, an earlier child could have
-        # deleted `.home` (plus its XDG subdirs — all empty after
-        # initial creation) and replaced it with a symlink pointing
-        # at a user-writable location outside `output`. Without this
-        # check, the parent-side os.makedirs() below would follow the
-        # symlink and create `.config`, `.cache`, `.local/share`,
-        # `.local/state` inside the attacker-chosen directory (e.g.
-        # under `~/.ssh`, `~/Documents`, a backup root) — a bounded
-        # but real "write outside the sandbox" escape. We refuse to
-        # proceed if any of the paths we would materialise is already
-        # a symlink, forcing the caller to clean up `output` between
-        # runs or use a fresh dir.
-        _fake_home_paths = [
-            fake_home_path,
-            os.path.join(fake_home_path, ".config"),
-            os.path.join(fake_home_path, ".cache"),
-            os.path.join(fake_home_path, ".local"),
-            os.path.join(fake_home_path, ".local", "share"),
-            os.path.join(fake_home_path, ".local", "state"),
-        ]
-        for _p in _fake_home_paths:
-            try:
-                _st = os.lstat(_p)
-            except FileNotFoundError:
-                continue
-            # Anything that's not a regular directory is suspect: a
-            # prior sandboxed child could have replaced the expected
-            # dir with a symlink (→ parent mkdirs into attacker-chosen
-            # dir outside `output`), a FIFO (→ parent's chmod/stat
-            # hangs), a socket, or a device node. Refuse to proceed.
-            if not stat.S_ISDIR(_st.st_mode) or stat.S_ISLNK(_st.st_mode):
-                raise ValueError(
-                    f"fake_home refuses to materialise: {_p!r} exists "
-                    f"but is not a regular directory "
-                    f"(mode=0o{_st.st_mode:o}). A prior sandboxed "
-                    f"process may have replaced it to redirect "
-                    f"parent-side file operations or cause a hang. "
-                    f"Clean the output dir or use a fresh one."
-                )
-        os.makedirs(fake_home_path, mode=0o700, exist_ok=True)
+        # The output is writable by previous/sibling children. Pin every
+        # directory used for creation instead of checking with lstat and
+        # later resolving the same names again through os.makedirs.
+        try:
+            _prepare_fake_home(output)
+        except OSError as exc:
+            raise ValueError(
+                f"fake_home refuses to materialise: {fake_home_path!r} "
+                "or an XDG component is not a regular directory or cannot "
+                "be opened safely. Clean the output dir or use a fresh one."
+            ) from exc
         # Override HOME and the XDG base dirs so that tools which
         # resolve ~ or $XDG_CONFIG_HOME etc. land inside the fake
         # home. We deliberately DO NOT override XDG_RUNTIME_DIR —
@@ -475,80 +2454,410 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             "XDG_CACHE_HOME": os.path.join(fake_home_path, ".cache"),
             "XDG_DATA_HOME": os.path.join(fake_home_path, ".local", "share"),
             "XDG_STATE_HOME": os.path.join(fake_home_path, ".local", "state"),
+            # Identity follows the fake home: a child that gets a
+            # synthetic $HOME must not keep the operator's login name
+            # — USER/LOGNAME are pure host-identity leaks to a target
+            # that is being told it lives somewhere else. Tools that
+            # need "a" user name still get one.
+            "USER": "sandbox",
+            "LOGNAME": "sandbox",
         }
-        # Pre-create the XDG subdirs so tools that stat them first
-        # (rather than mkdir-on-write) behave correctly.
-        for xdg_dir in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME",
-                        "XDG_DATA_HOME", "XDG_STATE_HOME"):
-            try:
-                os.makedirs(fake_home_env[xdg_dir], mode=0o700, exist_ok=True)
-            except OSError:
-                pass
+
+    # The launcher's per-session temp dir names the framework AND the
+    # host (<base>/raptor-<uid>/session-<pid>-<rand>): a target that
+    # reads $TMPDIR learns all three in one getenv, and the mount-ns
+    # setup would even re-create that branded path inside the private
+    # tmpfs. Point the temp vars at a run-scoped neutral dir instead
+    # (mirrors the fake-home pattern; the output path is target-visible
+    # by definition). Any framework-named /tmp//var/tmp value is
+    # rewritten (an operator dir that happens to carry the name is
+    # rewritten too — the NAME is the leak regardless of who minted
+    # it); unbranded operator TMPDIRs pass through so nested test
+    # harnesses that share temp files with the child keep working.
+    # Gated on the disabled state (resolved above): the --sandbox none
+    # contract is "rlimits only", and a disabled run's child is a
+    # bare subprocess a bisecting operator compares against exactly
+    # that — the anti-fingerprint overlay is enforcement-lane
+    # polish and must not survive the disable as the run's one
+    # residual env mutation.
+    _temp_rebranding = (not _effectively_disabled and bool(target or output or rootfs)
+                       and (_profile_for_defaults is None
+                            or bool(_profile_defaults.get("use_landlock"))))
+    for _tv in ("TMPDIR", "TEMP", "TMP") if _temp_rebranding else ():
+        _tval = os.environ.get(_tv, "")
+        if (_tval.startswith(("/tmp/", "/var/tmp/"))
+                and _BRANDED_TMP_RE.search(_tval)):
+            # "/tmp" is the semantics the value would have had with no
+            # override at all: the mount-ns lane serves a private
+            # tmpfs there (where the unix-scope supervisor's pinned
+            # device set expects pathname sockets like the Python
+            # forkserver's to live), and the restricted Landlock-only
+            # posture re-steers the temp vars to its private scratch
+            # dir further down regardless.
+            fake_home_env[_tv] = "/tmp"
+    _use_proxy_netns = False
+    _proxy_tcp_lane_port = None
+    _proxy_unix_path: str | None = None
+    _proxy_lane_dir: str | None = None
+    _proxy_forwarder_port: int | None = None
+    if loopback_unix_bridges and not use_egress_proxy:
+        msg = (
+            "loopback_unix_bridges requires use_egress_proxy=True — "
+            "the bridge relay rides the netns egress tier."
+        )
+        raise ValueError(msg)
     if use_egress_proxy:
         if not proxy_hosts:
-            raise ValueError(
+            msg = (
                 "use_egress_proxy=True requires proxy_hosts=[...] "
                 "— an empty allowlist would block every connection."
             )
-        if block_network:
-            # Silently override — net-ns block and proxy are mutually
-            # exclusive (proxy listens on loopback, which the net-ns
-            # wouldn't include). Log so operators can see the config
-            # change.
-            logger.info(
-                "Sandbox: use_egress_proxy=True overrides block_network=True "
-                "(net-ns would hide the loopback proxy from the child)"
-            )
-            block_network = False
+            raise ValueError(msg)
 
         from . import proxy as _proxy_mod
         proxy_instance = _proxy_mod.get_proxy(proxy_hosts)
-        # Audit profile: ref-count engage allow-and-log on the
-        # hostname gate. Look ahead at state._cli_sandbox_profile
-        # because the per-call profile arg may not be set when the
-        # caller passed only --sandbox at the CLI. Acquire here;
-        # the matching release runs in the finally below so an
-        # exception during sandbox setup doesn't leave the count
-        # stuck above zero.
+
+        # Decide enforcement path, strongest first.
         #
-        # Set _engaging_audit ONLY after a successful acquire — if
-        # acquire raises, the finally would otherwise call release
-        # without a matching acquire (idempotent, but produces a
-        # spurious operator log).
-        # Audit-mode acquire is DEFERRED to just before yield (see
-        # below). If we acquired here, an exception in the ~700 LOC
-        # of sandbox setup between this point and the yield would
-        # leave the ref-count permanently incremented (the
-        # contextmanager's try/finally only fires after a yield).
-        # Decision recorded as `_will_engage_audit`; the actual
-        # acquire happens right before the yield.
-        _will_engage_audit = bool(audit_mode)
-        # Landlock TCP allowlist pins the child to the proxy port only.
-        # Caller-supplied allowed_tcp_ports is overridden (with a log if
-        # non-empty) — mixing with the proxy would let children bypass it.
-        if allowed_tcp_ports:
-            logger.info(
-                f"Sandbox: use_egress_proxy=True overrides "
-                f"allowed_tcp_ports={allowed_tcp_ports} with proxy port"
+        # Tier 1 — netns bridge (any Landlock ABI; needs the SPAWN
+        # backend): the child runs in an EMPTY netns (loopback
+        # brought up by the spawn layer) and reaches the proxy only
+        # through the forwarder that relays loopback TCP → unix
+        # socket. Containment is topological: no interfaces, no
+        # routes out, so DNS/UDP exfil is impossible WITHOUT the
+        # seccomp UDP block — which means JVM tools that open a
+        # loopback UDP socket before any build (gradle's
+        # FileLockContentionHandler / local-IP detection) work here.
+        # Previously this tier engaged only on ABI < 4 hosts; it is
+        # strictly stronger than the Landlock pin (port-scoped to ANY
+        # host) on every host, so it is the default whenever it can
+        # actually engage.
+        #
+        # "Can actually engage" means more than netns capability: the
+        # forwarder that bridges the empty netns to the proxy's unix
+        # socket is forked by _spawn.run_sandboxed, and that backend
+        # is only used when the mount-ns tier is live (use_mount —
+        # see the backend selection below and `spawn_eligible`). On a
+        # host with netns but WITHOUT the spawn backend (no uidmap
+        # helpers, LSM-restricted unprivileged userns → the CLI
+        # `unshare` fallback path), choosing this tier used to hand
+        # the child an empty netns with NO forwarder: the proxy was
+        # unreachable, every use_egress_proxy child silently lost all
+        # network, and the proxy's audit stream recorded nothing.
+        # Mirror use_mount's condition here so such hosts take Tier 2
+        # — the tier the design assigns to "no netns" hosts, and the
+        # tier they took before the netns default — keeping the
+        # chokepoint reachable and its event telemetry live.
+        #
+        # Tier 2 — Landlock TCP pin (ABI >= 4, no netns bridge):
+        # connect pinned to the proxy port + seccomp UDP block for
+        # DNS/UDP exfil. Known cost: gradle-class UDP-at-startup
+        # tools break ("Could not determine a usable local IP").
+        #
+        # Tier 3 — advisory (ABI < 4, no netns bridge): env vars only.
+        _proxy_abi = (
+            _get_landlock_abi() if check_landlock_available() else 0
+        )
+        _proxy_netns_capable = (
+            sys.platform != "darwin" and check_net_available()
+            # The forwarder rides the spawn backend: engaged only when
+            # the mount-ns tier will be used for this context (same
+            # condition as `use_mount` below).
+            and bool(target or output) and check_mount_available()
+            # An operator-disabled sandbox never reaches enforcement:
+            # its children run in the HOST netns against the proxy's
+            # main TCP listener, so binding a per-context unix lane
+            # here subscribed the run's event buffer to a lane the
+            # child never used — a forensic reader of a disabled-run
+            # bisect saw zero proxy events where egress happened.
+            # Disabled runs take the TCP-lane / run-global telemetry
+            # view instead (_effectively_disabled is the same
+            # construction-time resolution the audit-mode gate above
+            # uses; the run body re-resolves its own copy later).
+            and not _effectively_disabled
+        )
+        if _proxy_netns_capable:
+            _use_proxy_netns = True
+            from .proxy import lane_socket_path, make_lane_dir
+            # Per-instance PRIVATE lane directory, mode 0700 with a
+            # random per-context name. The lane socket used to live in
+            # the shared OUTPUT dir, where it was readdir-discoverable
+            # and connectable by every process that shares the rw
+            # bind: a sibling sandbox using the same output dir could
+            # connect to THIS context's lane and have its CONNECTs
+            # judged by THIS lane's allowlist and audit bit (cross-
+            # context confused deputy), and the sandboxed child itself
+            # could reach the lane directly through the rw bind. Only
+            # the parent-side forwarder needs the socket — it snapshots
+            # the HOST mount view before the child pivots — so the
+            # socket needs no presence inside the sandbox at all.
+            # make_lane_dir gives 0700 + a unique name AND a socket
+            # path guaranteed to fit sun_path regardless of how deep
+            # the ambient temp dir is; the SO_PEERCRED gate at the
+            # proxy lane (see proxy._handle_unix_client) is the
+            # enforcement backstop for same-uid processes that still
+            # reach the inode.
+            _proxy_lane_dir = make_lane_dir()
+            _proxy_unix_path = lane_socket_path(_proxy_lane_dir)
+            try:
+                proxy_instance.bind_unix(
+                    _proxy_unix_path,
+                    label=caller_label or "sandbox",
+                    # Scope this lane to THIS sandbox's hosts — the
+                    # proxy's global allowlist is a union across
+                    # concurrent runs (cross-run confused-deputy
+                    # defence; gate 1 checks both) — and to the
+                    # caller-declared destination ports (gate 1b).
+                    allowed_hosts=proxy_hosts,
+                    allowed_ports=proxy_allowed_ports,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Sandbox: proxy unix socket bind failed (%s); "
+                    "falling back to Landlock TCP pin%s", e,
+                    "" if _proxy_abi >= 4 else
+                    " — which is INERT on this kernel (Landlock ABI "
+                    f"{_proxy_abi} < 4): egress allowlist is advisory "
+                    "only",
+                )
+                _use_proxy_netns = False
+                _proxy_unix_path = None
+                if _proxy_lane_dir is not None:
+                    import shutil as _shutil
+                    _shutil.rmtree(_proxy_lane_dir, ignore_errors=True)
+                    _proxy_lane_dir = None
+        elif _proxy_abi < 4:
+            logger.warning(
+                "Sandbox: no netns bridge (netns capability or the "
+                "mount-ns spawn backend is unavailable) AND Landlock "
+                "ABI %d < 4 (no TCP allowlist) — egress proxy "
+                "allowlist is advisory only on this host.",
+                _proxy_abi,
             )
-        allowed_tcp_ports = [proxy_instance.port]
 
-        # UDP block — closes DNS/UDP exfil. Safe here because the proxy
-        # resolves hostnames on behalf of the child.
-        seccomp_block_udp = True
+        # 00015: fail closed when an untrusted-egress caller requires
+        # the netns tier but only the port-scoped Landlock tier is
+        # available. On a Linux net-yes/mount-no host the child would
+        # silently degrade to a Landlock port pin, where a direct
+        # connect() on the proxy port reaches ANY host (the hostname
+        # allowlist is bypassed). Refuse unless the operator explicitly
+        # accepts the weaker tier.
+        #
+        # Scoped to non-darwin: this is the Linux Landlock Tier-2 gap.
+        # macOS uses a different enforcement path (seatbelt SBPL, which
+        # can express address-scoped loopback egress) where _use_proxy_netns
+        # is always False, so an unscoped guard would wrongly refuse every
+        # macOS untrusted-egress caller. macOS egress scoping is out of
+        # this finding's scope and unchanged here.
+        # One parse, owned by _degraded_untrusted_waiver — the AXIS
+        # semantics (network waiver, not a tier floor) stay this
+        # site's; only the value grammar is shared.
+        _degraded_ok = _degraded_untrusted_waiver()
+        if (
+            sys.platform != 'darwin'
+            and use_egress_proxy
+            and require_proxy_netns
+            and not _use_proxy_netns
+            and not _degraded_ok
+        ):
+            from .errors import SandboxSetupError
+            msg = (
+                'use_egress_proxy with require_proxy_netns=True needs the '
+                'netns egress tier, but it is unavailable on this host '
+                '(mount-ns / user-ns capability missing). The port-scoped '
+                'Landlock fallback does not enforce the hostname allowlist '
+                '(a direct connect on the proxy port reaches any host). '
+                'Install uidmap / enable unprivileged user namespaces to '
+                'restore the netns tier, or set '
+                'RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 to accept the weaker tier.'
+            )
+            raise SandboxSetupError(msg)
 
-        # Child env needs HTTPS_PROXY etc. Both UPPERCASE (Node/curl/
-        # Python requests) AND lowercase (CodeQL's Java stack, git, wget
-        # on some distros). Setting both maximises compatibility.
-        proxy_url = f"http://127.0.0.1:{proxy_instance.port}"
+        if _use_proxy_netns:
+            # Netns enforcement: the child gets CLONE_NEWNET; the
+            # forwarder bridges TCP on loopback → Unix socket.
+            # Reuse the proxy's TCP port number for the forwarder
+            # inside the empty netns — no collision because the netns
+            # is fresh.
+            _proxy_forwarder_port = proxy_instance.port
+            if loopback_unix_bridges:
+                # Caller-declared bridge ports are baked into the
+                # child's env (base URLs) before this point, so THEY
+                # cannot move — shift the forwarder port instead on
+                # the (rare, ephemeral-port) collision. The netns is
+                # fresh; any free port number serves the forwarder.
+                while _proxy_forwarder_port in loopback_unix_bridges:
+                    _proxy_forwarder_port += 1
+            block_network = True
+            allowed_tcp_ports = None
+        else:
+            # TCP-only path (ABI >= 4 or fallback).
+            if block_network:
+                logger.debug(
+                    "Sandbox: use_egress_proxy=True overrides "
+                    "block_network=True (net-ns would hide the "
+                    "loopback proxy from the child)"
+                )
+                block_network = False
+            if allowed_tcp_ports:
+                logger.debug(
+                    "Sandbox: use_egress_proxy=True overrides "
+                    "allowed_tcp_ports=%s with proxy port",
+                    allowed_tcp_ports,
+                )
+            # Dedicated per-context lane: attribution for the audit
+            # decision, and the Landlock/SBPL pin keeps this context's
+            # children off the shared main listener entirely. On bind
+            # failure FAIL THE CONTEXT: the shared listener's gate 1
+            # enforces the process-global UNION of every registered
+            # context's hosts, so falling back there silently widens a
+            # lane-failed context from its own allowlist to whatever
+            # its concurrent siblings declared — and lane-bind failure
+            # is plausibly forceable (fd/port exhaustion by a sibling
+            # child). Mirrors the loopback_unix_bridges fail-closed
+            # shape below; the caller decides whether to retry.
+            try:
+                _proxy_tcp_lane_port = proxy_instance.bind_tcp_lane(
+                    label=caller_label or "sandbox",
+                    # Same lane-scoping as the unix-socket tier above.
+                    allowed_hosts=proxy_hosts,
+                    allowed_ports=proxy_allowed_ports,
+                )
+            except Exception as _lane_exc:  # noqa: BLE001 — any bind failure is fail-closed
+                from .errors import SandboxSetupError
+                msg = (
+                    "egress-proxy TCP lane bind failed for this "
+                    "context — refusing to fall back to the shared "
+                    "listener, whose connect gate enforces the union "
+                    "of ALL registered contexts' allowlists rather "
+                    "than this context's own. Free up local "
+                    "ports/file descriptors and retry."
+                )
+                raise SandboxSetupError(msg) from _lane_exc
+            allowed_tcp_ports = [_proxy_tcp_lane_port]
+            # Operator-visible engagement notice for tier 2, once per
+            # process (mirrors the tier-3 advisory warning above).
+            # Pre-fix this tier engaged with only DEBUG lines, yet it
+            # is a real weakening: Landlock's TCP rule is port-scoped,
+            # not (host, port)-scoped, so the pin admits a connect to
+            # ANY address that happens to listen on the pinned port —
+            # only traffic that actually goes through the proxy gets
+            # the hostname-allowlist gate. The ABI < 4 case is the
+            # tier-3 advisory warning above; this one covers the
+            # kernel that CAN pin (ABI >= 4) but only by port.
+            # An operator-disabled sandbox never engages the pin (or
+            # the seccomp UDP block the message reasons about), so
+            # the warning would describe enforcement that does not
+            # exist — and it must not burn the once-per-process latch
+            # for a later enforcing call. The disabled check sits
+            # BEFORE warn_once for exactly that reason.
+            if (_proxy_abi >= 4 and not _effectively_disabled
+                    and state.warn_once("_proxy_tier2_port_pin_warned")):
+                # The UDP-exfil closure on this tier IS the seccomp
+                # block — on a libseccomp-less host the filter never
+                # engages, and a message claiming the channel is
+                # closed would be actively misleading about an open
+                # DNS-exfil path. Word the message by what actually
+                # engages.
+                _udp_closed = _seccomp.check_seccomp_available()
+                logger.warning(
+                    "Sandbox: egress enforcement degraded to the "
+                    "Landlock TCP port pin (tier 2 — no netns bridge "
+                    "on this host). Landlock scopes TCP connect by "
+                    "PORT only, so the child can reach ANY address "
+                    "on port %d, not just the proxy — the hostname "
+                    "allowlist applies only to connections that ride "
+                    "the proxy. %s Enabling unprivileged user "
+                    "namespaces restores the stronger netns tier.",
+                    allowed_tcp_ports[0],
+                    ("DNS/UDP exfil stays closed by the seccomp UDP "
+                     "block." if _udp_closed else
+                     "DNS/UDP exfil is OPEN on this host: the seccomp "
+                     "UDP block cannot engage (libseccomp unavailable "
+                     "or non-functional)."),
+                )
+
+        _will_engage_audit = bool(audit_mode)
+
+        # UDP block only where containment needs it: on the netns tier
+        # the empty namespace already contains UDP topologically (no
+        # interfaces, no routes), and blocking UDP socket creation
+        # there would only re-break loopback-UDP tools (gradle). On
+        # the Landlock tier the block is what closes DNS/UDP exfil.
+        seccomp_block_udp = not _use_proxy_netns
+
+        # Caller-declared loopback bridges (LLM dispatcher for
+        # credential-proxy CLI children) exist only on the netns tier —
+        # the relay lives inside the child's fresh namespace. On the
+        # Landlock/advisory tiers there is no namespace to host it and
+        # binding on the HOST loopback would expose the bridged service
+        # to every local process. Fail closed with a clear error; the
+        # caller decides whether to fall back.
+        if loopback_unix_bridges and not _use_proxy_netns:
+            from .errors import SandboxSetupError
+            msg = (
+                "loopback_unix_bridges requires the netns egress tier "
+                "(netns capability or the mount-ns spawn backend is "
+                "unavailable on this host, or the proxy unix lane "
+                "failed to bind) — refusing to run the child without "
+                "its bridged loopback service."
+            )
+            raise SandboxSetupError(msg)
+        # Bridged children must reach their loopback service DIRECT —
+        # routing 127.0.0.1 through the CONNECT proxy would be denied
+        # (gate 2 rejects loopback targets by design). Everything
+        # non-loopback still routes through the chokepoint.
+        _no_proxy_value = (
+            "127.0.0.1,localhost" if loopback_unix_bridges else ""
+        )
+
+        _effective_proxy_port = (
+            _proxy_forwarder_port
+            if _use_proxy_netns
+            else (_proxy_tcp_lane_port or proxy_instance.port)
+        )
+        proxy_url = f"http://127.0.0.1:{_effective_proxy_port}"
         proxy_env_overrides = {
             "HTTPS_PROXY": proxy_url, "https_proxy": proxy_url,
             "HTTP_PROXY": proxy_url, "http_proxy": proxy_url,
-            # NO_PROXY = "" disables the user-env's NO_PROXY if any
-            # slipped through; an empty value means "no exclusions",
-            # i.e. route EVERYTHING through the proxy.
-            "NO_PROXY": "", "no_proxy": "",
+            "NO_PROXY": _no_proxy_value, "no_proxy": _no_proxy_value,
+            # JVM tools (Maven, Gradle, sbt — NOT CodeQL, which reads
+            # lowercase https_proxy itself) ignore proxy env entirely
+            # and need java.net sysprops. JAVA_TOOL_OPTIONS is picked
+            # up by every HotSpot JVM, including Gradle's daemon.
+            # Empty nonProxyHosts mirrors NO_PROXY="" — nothing
+            # bypasses the chokepoint (the JVM default would bypass
+            # localhost/127.*, and direct TCP is blocked anyway).
+            # The JVM prints "Picked up JAVA_TOOL_OPTIONS: ..." on
+            # stderr; harmless, and the value contains no secrets.
+            "JAVA_TOOL_OPTIONS": (
+                f"-Dhttp.proxyHost=127.0.0.1"
+                f" -Dhttp.proxyPort={_effective_proxy_port}"
+                f" -Dhttps.proxyHost=127.0.0.1"
+                f" -Dhttps.proxyPort={_effective_proxy_port}"
+                f" -Dhttp.nonProxyHosts="
+            ),
         }
+
+    # Operator allowlist extensions (--sandbox-readable-path /
+    # --sandbox-tool-path). Merged into the caller's kwargs here — once,
+    # before any consumption — so every backend sees them uniformly:
+    # the Linux Landlock preexec, the mount-ns extra read-only binds,
+    # and the macOS SBPL read rules all read these two variables.
+    # CLI-parsed values only (validated in cli.apply_cli_args); same
+    # prompt-injection contract as the profile override below. Note
+    # readable_paths still has effect only under restrict_reads=True —
+    # the existing warning covers the no-op case.
+    if state._cli_sandbox_readable_paths:
+        readable_paths = list(readable_paths or []) + [
+            p for p in state._cli_sandbox_readable_paths
+            if p not in (readable_paths or [])
+        ]
+    if state._cli_sandbox_tool_paths:
+        tool_paths = list(tool_paths or []) + [
+            p for p in state._cli_sandbox_tool_paths
+            if p not in (tool_paths or [])
+        ]
 
     # Apply profile overrides. CLI flag is authoritative — it wins over
     # caller-supplied `profile=` AND caller-supplied `disabled=True`, so a
@@ -566,12 +2875,14 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             profile = "none"
     if profile is not None:
         if profile not in PROFILES:
-            raise ValueError(
+            msg = (
                 f"Unknown sandbox profile {profile!r}. "
                 f"Valid profiles: {sorted(PROFILES)}."
             )
+            raise ValueError(msg)
         p = PROFILES[profile]
-        block_network = p["block_network"]
+        if block_network is _UNSET:
+            block_network = p["block_network"]
         seccomp_profile = p["seccomp"] or None
         if not p["use_landlock"]:
             # Profile forces Landlock off — warn if the caller handed us
@@ -579,18 +2890,78 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             # Truthy check — `target=""` and `allowed_tcp_ports=[]` are
             # treated as "not set" everywhere else in this module; using
             # `is not None` here would spuriously warn about empty values.
-            discarded = [name for name, val in (("target", target),
-                                                 ("output", output),
-                                                 ("allowed_tcp_ports", allowed_tcp_ports))
-                         if val]
+            # readable_paths is the one exception: an empty list is the
+            # MOST restrictive setting and engages Landlock (see the
+            # preexec engagement gate), so it is discard-worthy whenever
+            # it is not None.
+            discarded = [name for name, val in (
+                ("target", target),
+                ("output", output),
+                ("allowed_tcp_ports", allowed_tcp_ports),
+                ("writable_paths", writable_paths),
+                ("restrict_reads", restrict_reads),
+                # tool_paths is a read-grant loosener — inert without
+                # Landlock, but a caller that passed it deserves the
+                # same "this kwarg does nothing under this profile"
+                # attribution as the tightening kwargs.
+                ("tool_paths", tool_paths),
+            ) if val]
+            if readable_paths is not None:
+                discarded.append("readable_paths")
             if discarded and not effectively_disabled:
                 logger.warning(
-                    f"Sandbox: profile={profile!r} ignores {discarded} — "
-                    f"Landlock is disabled under this profile."
+                    "Sandbox: profile=%r ignores %s — Landlock is disabled under this profile.", profile, discarded
                 )
+            # Shed EVERY Landlock-engaging kwarg, not just the
+            # canonical target/output pair: a surviving
+            # writable_paths= / restrict_reads= / readable_paths=
+            # re-engaged Landlock further down with target and output
+            # already nulled — the operator's escape hatch delivered a
+            # write-nowhere-except-/tmp policy (output unwritable, the
+            # read allowlist missing the target) while the run stamped
+            # BARE. "none" must mean none: no Landlock policy, and a
+            # truthful stamp.
             target = None
             output = None
             allowed_tcp_ports = None
+            writable_paths = None
+            readable_paths = None
+            restrict_reads = False
+        if rootfs is not None and not p["use_landlock"]:
+            # Rootfs fail-closed gate #0: 'none' and 'network-only'
+            # are no-mount-ns-by-contract profiles. target/output are
+            # silently DISCARDED above (warned, nulled) because they
+            # are protection requests — dropping them weakens nothing
+            # the profile promised. rootfs is different: it is the
+            # EXECUTION SUBSTRATE ("run against this image tree"), and
+            # discarding it would run the command against the host
+            # filesystem while the caller believes it is containerised.
+            # Raise instead — whichever of the caller kwarg / CLI
+            # --sandbox flag chose this profile must be reconciled by
+            # the operator, not silently overridden in either direction.
+            from .errors import SandboxSetupError
+            msg = (
+                f"sandbox(rootfs=...) is incompatible with profile "
+                f"{profile!r} (no mount namespace under this profile) "
+                f"— refusing to run against the host filesystem."
+            )
+            raise SandboxSetupError(
+                msg,
+                "use profile 'full'/'strict'/'debug' (or drop the "
+                "--sandbox override) for image-rootfs runs.",
+            )
+    if block_network is _UNSET:
+        # Bare sandbox() (no profile=, no block_network=) follows the
+        # documented default profile: 'full' blocks network. Seccomp
+        # already seeds from DEFAULT_PROFILE above — letting network
+        # silently fall OPEN here contradicted the docstring's
+        # "full (default)" contract. Callers that genuinely want an
+        # open-network sandbox say block_network=False explicitly.
+        block_network = PROFILES[DEFAULT_PROFILE]["block_network"]
+    strict_required = profile in ("strict", "chromium")
+    if profile == "chromium" and not (target and output):
+        from .errors import SandboxSetupError
+        raise SandboxSetupError("Chromium profile requires explicit private target and output directories")
     # Explicitly disabled: no seccomp either (rlimits-only contract).
     if effectively_disabled:
         seccomp_profile = None
@@ -611,8 +2982,312 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         use_seatbelt = use_sandbox
     else:
         use_sandbox = not effectively_disabled and check_net_available()
-        use_mount = use_sandbox and bool(target or output) and check_mount_available()
+        use_mount = (use_sandbox and bool(target or output or rootfs)
+                     and check_mount_available())
         use_seatbelt = False
+
+    # Rootfs fail-closed gate #1 (context setup): rootfs is meaningless
+    # without the Linux mount-ns backend — every other execution path
+    # runs the command against the HOST filesystem, which for a caller
+    # that asked for an image rootfs is a silent contract violation, not
+    # a degradation. Covers: darwin/seatbelt, profile 'none'/disabled,
+    # missing userns/mount capability.
+    if rootfs is not None and not use_mount:
+        from .errors import SandboxSetupError
+        msg = (
+            "sandbox(rootfs=...) requires the Linux mount-namespace "
+            "backend, which cannot engage here (platform, profile "
+            "'none'/disabled, or missing unprivileged-userns/mount "
+            "capability) — refusing to run against the host filesystem."
+        )
+        raise SandboxSetupError(
+            msg,
+            "check `sysctl kernel.unprivileged_userns_clone` / AppArmor "
+            "userns restrictions, and do not combine rootfs= with "
+            "disabled=True or profile='none'.",
+        )
+
+    # Bare-run posture, named once per process: with NO target/output/
+    # rootfs there is nothing for the mount namespace or Landlock to
+    # anchor on, so the call gets network/rlimit/seccomp containment
+    # and UNRESTRICTED filesystem access. Legitimate for network-only
+    # tool invocations (pack downloads, wrapper probes); a caller
+    # expecting filesystem confinement must pass target= or output=.
+    #
+    # Profiles that discard target=/output= by contract ('none',
+    # 'network-only' — including every run_trusted() call, which routes
+    # here as profile='none' and REJECTS those kwargs outright) are
+    # excluded: the caller explicitly declined filesystem confinement,
+    # so there is no omission to advise on — and, the advisory being
+    # once per process, a trusted call would otherwise consume it and
+    # leave the first REAL bare-run caller unattributed.
+    profile_discards_fs: bool = (
+        profile is not None and not PROFILES[profile]["use_landlock"])
+    if (use_sandbox and not use_seatbelt
+            and not (target or output or rootfs)
+            and not profile_discards_fs
+            and state.warn_once("_bare_run_posture_warned")):
+        logger.warning(
+            "sandbox: run() without target=/output=/rootfs= applies "
+            "no filesystem confinement (network/seccomp/rlimits only). "
+            "Pass target= or output= if this call handles untrusted "
+            "bytes. First caller: %s (warned once per process — later "
+            "bare-run callers are not attributed).",
+            _first_external_caller(),
+        )
+
+    # Degraded-mode network fallback. block_network=True is normally
+    # enforced by the network namespace; when no namespace backend is
+    # available (use_sandbox False — AppArmor userns sysctl, SELinux,
+    # nested containers), the block previously evaporated to a one-shot
+    # warning and the child ran with full host network. Landlock ABI v4+
+    # can express "deny every TCP connect" with a handled-but-empty net
+    # ruleset: no TCP egress (EACCES). Pair it with seccomp's UDP deny
+    # so the host resolver cannot carry DNS queries outside the sandbox.
+    # bind/listen stay untouched (see the BIND_TCP design rationale).
+    # Deliberately NOT engaged when the caller supplied their own
+    # allowed_tcp_ports — that allowlist is already the network policy.
+    # Loopback caveat: Landlock net rules are port-scoped, so the deny
+    # hits self-loopback IPC too (gradle daemon et al.) — mitigated by
+    # the env nudge in run() and the degraded_net_deny=False opt-out.
+    _degraded_tcp_deny = False
+    if (not effectively_disabled
+            and degraded_net_deny
+            and block_network
+            and not use_sandbox):
+        # darwin reaches this block too (pre-fix it was scoped
+        # != "darwin", so a trusted block_network=True run on a
+        # seatbelt-less Mac silently kept FULL host network behind the
+        # once-per-process "Sandbox unavailable" warning — while
+        # run()'s docstring promised the refusal). There is no
+        # Landlock lane on darwin at all, so _ll_net_capable is
+        # structurally False there and the flow lands on the same
+        # fail-closed arm with the same two acceptance levers. This
+        # is deliberately a capability-axis refusal in context, not a
+        # tier: the floor lattice (tiers.py) orders CONTAINMENT
+        # backends, and its design notes keep per-axis enforceability
+        # (Landlock ABI, seccomp presence, network layers) as refusal
+        # conditions here, never tiers.
+        _ll_net_capable = (sys.platform != "darwin"
+                           and check_landlock_available()
+                           and _get_landlock_abi() >= 4)
+        if _ll_net_capable:
+            if strict_required:
+                # strict defers to its own aggregation gate — the UDP
+                # axis is covered by the seccomp-available check there.
+                seccomp_block_udp = (bool(seccomp_profile)
+                                     and seccomp_profile != "none"
+                                     and check_seccomp_available())
+            else:
+                _require_degraded_udp_filter(seccomp_profile)  # type: ignore[arg-type]
+                seccomp_block_udp = (bool(seccomp_profile)
+                                     and seccomp_profile != "none")
+        if _ll_net_capable and not allowed_tcp_ports:
+            _degraded_tcp_deny = True
+            if state.warn_once("_degraded_tcp_deny_warned"):
+                logger.warning(
+                    "Sandbox: block_network requested but no namespace "
+                    "backend is available — falling back to Landlock "
+                    "TCP-connect deny (all TCP connects fail with "
+                    "EACCES, including loopback; seccomp blocks UDP/DNS; "
+                    "bind/listen are unaffected). Daemon-IPC tools are nudged to "
+                    "no-daemon mode via env. Pass "
+                    "degraded_net_deny=False to opt out for workloads "
+                    "that need loopback TCP."
+                )
+        elif _ll_net_capable:
+            # allowed_tcp_ports supplied: the port allowlist IS the
+            # caller's network policy and Landlock (ABI v4+) enforces
+            # it on this backend-less path — the deny-all lane would
+            # break the allowlist. The block_network+allowed_tcp_ports
+            # combination itself gets the dead-combo warning below.
+            #
+            # NAMED CONTRACT — degraded_net_deny stays UNSET here, by
+            # design, and that includes proxied tier-2 runs (a
+            # use_egress_proxy call demoted off the netns tier, e.g.
+            # userns denied, arrives on this arm with the proxy lane
+            # port as its allowlist). The stamp means "the per-call
+            # Landlock TCP-connect DENY-ALL engaged because the
+            # namespace tier was unavailable"; on this arm no deny-all
+            # engages — the port allowlist is the live policy — so
+            # stamping it would be untruthful and would make the
+            # observe-layer loopback-deny diagnostics lie. Census at
+            # the time this contract was written: no consumer reads
+            # degraded_net_deny for a trust or verdict decision (the
+            # readers are the observe-layer diagnostic message, the
+            # posture docs, and tests); forensic readers of proxied
+            # tier-2 runs key on sandbox_info["proxy_enforcement"]
+            # (== "landlock_tcp" on this lane), which names the
+            # enforcement actually delivered. If a future consumer
+            # needs a trust decision from this arm, it must read
+            # proxy_enforcement — not infer from the absence of
+            # degraded_net_deny.
+            pass
+        elif not strict_required:
+            # Neither deny lane can engage: no namespace backend for
+            # the interface-level block, no Landlock v4+ for the
+            # degraded TCP-connect deny — and when allowed_tcp_ports
+            # was supplied, no enforcement for that allowlist either
+            # (Landlock TCP rules are an ABI v4+ feature). The caller
+            # demanded a network policy; running with unrestricted
+            # network after a one-shot warning made that policy
+            # evaporate exactly on the hosts that can least afford it
+            # (and only the FIRST such call even saw the warning).
+            # Fail closed, with two explicit acceptance levers:
+            #   * degraded_net_deny=False (per call, library callers)
+            #     skips this whole block — "this run may egress";
+            #   * RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 (host-wide, the
+            #     documented degraded-tier acceptance) converts the
+            #     refusal into a loud warning naming what is being
+            #     accepted.
+            # strict defers to its own gate below so that one abort
+            # names EVERY unmet strict requirement, this one included.
+            if sys.platform == "darwin":
+                from .probes import SEATBELT_FAIL_INSTRUCTIONS
+                _no_layer_reason = (
+                    "seatbelt (sandbox-exec) is unavailable on this "
+                    "host and macOS has no fallback network-deny layer"
+                )
+                _no_layer_fix = SEATBELT_FAIL_INSTRUCTIONS
+                _ports_clause = (
+                    " The supplied allowed_tcp_ports allowlist is "
+                    "equally unenforceable (the SBPL port rules need "
+                    "the seatbelt backend)." if allowed_tcp_ports
+                    else "")
+            else:
+                from .probes import ENGAGE_FAIL_INSTRUCTIONS
+                _no_layer_reason = (
+                    "no namespace backend is available on this host "
+                    "AND Landlock ABI v4+ is missing"
+                )
+                _no_layer_fix = ENGAGE_FAIL_INSTRUCTIONS
+                _ports_clause = (
+                    " The supplied allowed_tcp_ports allowlist is "
+                    "equally unenforceable (Landlock TCP rules need "
+                    "ABI v4+)." if allowed_tcp_ports else "")
+            # Shared parse (see _degraded_untrusted_waiver); the
+            # network-axis meaning stays this site's.
+            _degraded_ok = _degraded_untrusted_waiver()
+            if _degraded_ok:
+                if state.warn_once("_degraded_net_open_override_warned"):
+                    logger.warning(
+                        "Sandbox: block_network requested but %s — "
+                        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 accepts "
+                        "running with NETWORK UNRESTRICTED on this "
+                        "host%s.",
+                        _no_layer_reason,
+                        (" (the allowed_tcp_ports allowlist is "
+                         "unenforced too)" if allowed_tcp_ports else ""),
+                    )
+            else:
+                from .errors import SandboxSetupError
+                raise SandboxSetupError(
+                    "Sandbox: block_network=True was requested, but "
+                    + _no_layer_reason + " — no layer can enforce "
+                    "the requested network block." + _ports_clause,
+                    _no_layer_fix + " Alternatively: choose "
+                    "a profile without the network block when the "
+                    "workload genuinely needs egress (e.g. `--sandbox "
+                    "target_run`, which keeps filesystem confinement), "
+                    "pass degraded_net_deny=False (library callers) to "
+                    "accept an unrestricted-network run per call, or "
+                    "set RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 to accept "
+                    "the degraded tier host-wide.",
+                )
+
+    # strict is fail-closed: it refuses to run rather than degrade. The
+    # aborts raise SandboxSetupError (not RuntimeError) so (a) the
+    # message carries the host-specific remediation alongside the
+    # explicit-downgrade escape hatch, and (b) the BaseException
+    # propagation + SANDBOX_ENGAGE_EXIT_CODE subprocess convention
+    # apply — a strict abort inside a scanner child surfaces as
+    # "isolation could not engage", never as a silent "0 findings".
+    if strict_required:
+        from .errors import SandboxSetupError
+
+        def _strict_gate_refuse(
+                exc: "SandboxSetupError") -> "SandboxSetupError":
+            """Record strict's construction abort as a floor-class
+            refusal, then return it for raising. Floor-class in
+            substance: strict IS "floor = the intended tier" plus
+            the seccomp capability axis — the environment cannot
+            meet the containment the profile demands, and the
+            target never executes. The exception stays a plain
+            SandboxSetupError (record-then-raise, not a conversion):
+            the gate aggregates MIXED unmet requirements (tier
+            floors and the seccomp axis, possibly several at once),
+            so one typed floor/achievable field pair would overclaim
+            — the record carries honest labels computed from the
+            same probes the gate consulted instead."""
+            # Diagnostic capability labels cannot replace the constructed refusal.
+            with suppress(BaseException):
+                if sys.platform == "darwin":
+                    _floor_t = _tiers.ContainmentTier.SEATBELT
+                    _ach_t = _tiers.ContainmentTier.BARE
+                else:
+                    # strict demands the mount tier when it has a
+                    # target/output to bind, the namespace tier
+                    # otherwise; achievable follows the failed probes,
+                    # worst axis first (a missing filter voids every
+                    # tier's contract, exactly as in the seccomp axis
+                    # arms).
+                    _floor_t = (_tiers.ContainmentTier.MOUNT_NS
+                                if (target or output)
+                                else _tiers.ContainmentTier.NS_NOMOUNT)
+                    if (seccomp_profile
+                            and not _seccomp.check_seccomp_available()):
+                        _ach_t = _tiers.ContainmentTier.BARE
+                    elif not use_sandbox:
+                        _ach_t = (_tiers.ContainmentTier.LANDLOCK_ONLY
+                                  if check_landlock_available()
+                                  else _tiers.ContainmentTier.BARE)
+                    else:
+                        from ._spawn import (
+                            mount_ns_available as _sg_mount_avail,
+                        )
+                        if _sg_mount_avail():
+                            _ach_t = _tiers.ContainmentTier.MOUNTLESS_NS
+                        elif check_landlock_available():
+                            _ach_t = _tiers.ContainmentTier.LANDLOCK_ONLY
+                        else:
+                            _ach_t = _tiers.ContainmentTier.BARE
+                return _record_floor_refusal(
+                    audit_run_dir or output, exc,
+                    floor_label=_tiers.tier_label(_floor_t),
+                    achievable_label=_tiers.tier_label(_ach_t))
+            return exc
+
+        from .preflight import strict_backend_error
+        error = strict_backend_error(
+            use_sandbox=use_sandbox, use_mount=use_mount,
+            requires_mount=bool(target or output), seccomp_profile=seccomp_profile,
+        )
+        if error is not None:
+            try:
+                raise _strict_gate_refuse(error)
+            finally:
+                # A proxy lane may already exist before strict preflight.
+                # Refusal never reaches the later context-exit owner.
+                from ._retirement import retire_parent_resources
+
+                def _retire_refused_unix_lane() -> None:
+                    if proxy_instance is not None and _proxy_unix_path:
+                        proxy_instance.unbind_unix(_proxy_unix_path)
+
+                def _retire_refused_tcp_lane() -> None:
+                    if proxy_instance is not None and _proxy_tcp_lane_port is not None:
+                        proxy_instance.close_tcp_lane(_proxy_tcp_lane_port)
+
+                def _retire_refused_lane_dir() -> None:
+                    if _proxy_lane_dir is not None:
+                        import shutil as _shutil
+                        _shutil.rmtree(_proxy_lane_dir, ignore_errors=True)
+
+                retire_parent_resources(
+                    _retire_refused_unix_lane,
+                    _retire_refused_tcp_lane,
+                    _retire_refused_lane_dir,
+                )
 
     if effectively_disabled and not state._cli_sandbox_disabled:
         logger.info("Sandbox disabled for this call")
@@ -621,7 +3296,7 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             logger.warning(
                 "Sandbox unavailable — subprocesses run without namespace isolation"
             )
-    elif sys.platform != "darwin" and use_sandbox and not use_mount and (target or output):
+    elif sys.platform != "darwin" and use_sandbox and not use_mount and (target or output):  # noqa: SIM102
         # Linux Landlock-only mode: sandbox engaged but mount-ns
         # didn't (typically because unprivileged user namespaces are
         # disabled — Ubuntu 24.04+ ships with
@@ -632,14 +3307,25 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # is the load-bearing defence in this mode.  See
         # ``core/security/THREAT_MODEL.md`` (invariant I2-(a)).
         if state.warn_once("_sandbox_landlock_only_warned"):
+            # Pre-fix this warning hardcoded
+            # "kernel.apparmor_restrict_unprivileged_userns=1" as the
+            # likely cause. Operator on PR #777 hit this on a SELinux
+            # + rootless-podman host where the AppArmor sysctl doesn't
+            # exist — being told to flip a non-existent sysctl is
+            # active misdirection. Route through ``mount_unavailable_
+            # reason()`` (same helper the spawn-blockers branch uses)
+            # so AppArmor / uidmap / SELinux / nested-userns all get
+            # their own diagnostic instead of all collapsing to
+            # "AppArmor".
+            from .probes import mount_unavailable_reason
+            _condition, _ = mount_unavailable_reason()
             logger.warning(
-                "RAPTOR: sandbox running in Landlock-only mode — "
-                "mount namespace unavailable, likely "
-                "kernel.apparmor_restrict_unprivileged_userns=1. "
-                "Credential exfil is bounded only by Landlock; "
+                "sandbox: running in Landlock-only mode — "
+                "%s. Credential exfil is bounded only by Landlock; "
                 "callers that dispatch LLM-driven sub-agents on "
                 "hostile source should set restrict_reads=True. "
                 "See core/security/THREAT_MODEL.md (I2-(a)).",
+                _condition,
             )
 
     effective_limits = dict(_DEFAULT_LIMITS)
@@ -663,13 +3349,101 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # the canonical / extra distinction explicit.
     extra_writable_paths = list(writable_paths or [])
     writable_paths = None
+    _private_scratch_dir: str | None = None
+    # Per-CALL private scratch dirs minted when a mount-ns run is
+    # demoted to the Landlock-only path mid-call (see the demotion
+    # hardening in run()); cleaned up with the context.
+    try:
+        _outer_tmp_readonly = (sys.platform == "linux"
+                               and bool(os.statvfs("/tmp").f_flag & os.ST_RDONLY))
+    except OSError:
+        _outer_tmp_readonly = False
+    _demoted_scratch_dirs: list[str] = []
     if target or output or allowed_tcp_ports or extra_writable_paths:
-        writable_paths = ["/tmp"]
+        # ``/tmp`` is in the writable baseline so Python's pyc cache
+        # and the C compiler's intermediate files survive. Callers that
+        # specifically don't want a sandboxed child to be able to write
+        # ANYWHERE under /tmp (e.g. the exploit-engine substrate, where
+        # an LLM-emitted producer could otherwise rewrite the target
+        # wrapper script at ``/tmp/compile-and-run-target-*/target``)
+        # set ``exclude_tmp_baseline=True``. ONLY use this when you've
+        # verified the sandboxed program doesn't need /tmp to start —
+        # ``python3 -S`` exploits don't write pyc cache, but a normal
+        # ``python3`` import will.
+        import tempfile as _tempfile
+        # Private scratch dir for the RESTRICTED Landlock-only posture.
+        # In mount-ns mode /tmp and /dev/shm are per-sandbox tmpfs, so
+        # granting them wholesale is private by construction. Without
+        # the mount namespace they are the HOST-SHARED directories:
+        # granting all of /tmp made a target repo living under /tmp
+        # writable (scanned-tree self-modification despite a read-only
+        # profile), and granting host /dev/shm handed the child a
+        # cross-process plant/poison surface. When the caller asked for
+        # the restricted posture (restrict_reads — the strict/untrusted
+        # signal) on a host without mount-ns, swap the blanket grants
+        # for a fresh 0700 per-context scratch dir and steer tools to
+        # it via TMPDIR/TEMP/TMP (see the env staging in run()). Cost:
+        # tools that write literal /tmp paths (ignoring TMPDIR) and
+        # multiprocessing SemLock (needs /dev/shm) fail closed in this
+        # posture — acceptable for untrusted/strict work, and the
+        # mount-ns path keeps full /tmp semantics.
+        _use_private_scratch = (
+            sys.platform == "linux" and not use_seatbelt
+            and (restrict_reads or _outer_tmp_readonly) and not use_mount
+            and not effectively_disabled
+        )
+        if exclude_tmp_baseline:
+            writable_paths = []
+        elif _use_private_scratch:
+            _private_scratch_dir = _tempfile.mkdtemp(
+                prefix=".scr-")
+            # The reaper lists this prefix; a sandboxed campaign
+            # (uncapped fuzz durations) legitimately holds the dir
+            # mtime-quiet past the age floor while its TMPDIR still
+            # points here. The keepalive registration for the
+            # context's lifetime happens adjacent to the try/finally
+            # that unregisters it, NOT here — a setup failure in
+            # between must not orphan a registration that would pin
+            # the stray dir against reaping for the process lifetime.
+            writable_paths = [_private_scratch_dir]
+            if not restrict_reads:
+                # Preserve the normal caller's output/temp grants. Only the
+                # read-restricted posture revokes access to shared temp state.
+                writable_paths.append(_tempfile.gettempdir())
+                if os.path.isdir("/dev/shm"):
+                    writable_paths.append("/dev/shm")
+        else:
+            writable_paths = [_tempfile.gettempdir()]
+            # /dev/shm rides the scratch baseline for the same reason
+            # as /tmp: POSIX shared memory and named semaphores
+            # (sem_open/shm_open) are created there, and Python's
+            # multiprocessing primitives (SemLock behind Queue/Lock)
+            # fail with EPERM without it. In mount-ns mode this is the
+            # per-sandbox private tmpfs, not the host's shm.
+            if os.path.isdir("/dev/shm"):
+                writable_paths.append("/dev/shm")
+            # /dev/pts is deliberately NOT granted here: this list is
+            # shared by every lane, and only the mount-ns spawn lane
+            # serves a per-sandbox devpts — on the mountless retries
+            # and the subprocess fallbacks /dev/pts is the HOST's pty
+            # slaves (a write grant there hands sandboxed code the
+            # operator's terminal). run_sandboxed adds the grant
+            # itself, keyed on the lane actually building the mount
+            # tree.
+            # When TMPDIR points somewhere custom, ALSO keep /tmp in
+            # the baseline: tools fall back to it (gcc's "Cannot
+            # create temporary file in /tmp/" path), and in mount-ns
+            # mode the private tmpfs lives at /tmp regardless of what
+            # the host TMPDIR says. This is not a widening — with the
+            # default TMPDIR the baseline IS /tmp; a custom TMPDIR
+            # previously just broke that same posture.
+            if os.path.realpath(_tempfile.gettempdir()) != "/tmp":
+                writable_paths.append("/tmp")
         if output:
             # Absolutize: a relative path like "out/foo" fails Landlock
             # open in the mount-ns child after pivot_root (the new
             # rootfs has no `out/` directory) and triggers the
-            # "RAPTOR: Landlock writable path could not be opened"
+            # "sandbox: Landlock writable path could not be opened"
             # stderr line. The bind-mount fallback masks the failure
             # as a silent enforcement gap on writes to `output`.
             writable_paths.append(os.path.abspath(output))
@@ -687,14 +3461,39 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # sandbox regardless of what Landlock's allow-rule permits. Callers
     # mixing the two usually intend "block all network except 443" — that
     # intent requires `block_network=False` + allowed_tcp_ports=[443].
-    if block_network and allowed_tcp_ports and not effectively_disabled:
+    if block_network and allowed_tcp_ports and not effectively_disabled:  # noqa: SIM102
         if state.warn_once("_net_and_tcp_allowlist_warned"):
             logger.warning(
-                f"Sandbox: block_network=True makes allowed_tcp_ports="
-                f"{allowed_tcp_ports} unreachable — the namespace has no "
-                f"network interface for Landlock's TCP allow-rule to apply "
-                f"to. For a network allowlist, pass block_network=False."
+                "Sandbox: block_network=True makes allowed_tcp_ports=%s unreachable — the namespace has no network interface for Landlock's TCP allow-rule to apply to. For a network allowlist, pass block_network=False.", allowed_tcp_ports
             )
+
+    # Landlock's NET rules are the ONLY enforcement for
+    # allowed_tcp_ports on Linux: mount-ns isolates the filesystem,
+    # not TCP connect, and the netns backend is not engaged on
+    # allowlist runs (allowed_tcp_ports implies reachable network).
+    # The availability block below is rightly skipped when mount-ns
+    # engages — but that skip also swallowed the ABI-v4 warning, so a
+    # supplied port allowlist on an ABI < 4 kernel (5.13–6.6,
+    # including LTS) ran silently unenforced exactly when everything
+    # else looked healthy. Warn here for the mount-ns shape; the
+    # non-mount shape warns inside the block below as before.
+    # (block_network=True is excluded: that shape already gets the
+    # more accurate dead-combo warning above — the namespace leaves no
+    # interface for ANY allow-rule regardless of ABI.)
+    if (not effectively_disabled and not use_seatbelt and use_mount
+            and allowed_tcp_ports and not block_network
+            and (not check_landlock_available()
+                 or _get_landlock_abi() < 4)
+            and state.warn_once("_landlock_warned_abi_v4")):
+        logger.warning(
+            "Sandbox: allowed_tcp_ports=%s requires Landlock ABI v4 "
+            "(kernel 6.7+); current ABI is %s — the TCP allowlist is "
+            "NOT enforced (mount-ns isolates the filesystem, not TCP "
+            "connect). Pass block_network=True for a full network "
+            "block, or upgrade the kernel.",
+            allowed_tcp_ports,
+            _get_landlock_abi() if check_landlock_available() else 0,
+        )
 
     # Skip the entire Landlock-availability warning block on macOS:
     # seatbelt provides the equivalent enforcement (writable_paths,
@@ -703,15 +3502,117 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # "Landlock unavailable" warning even when seatbelt is fully
     # engaged — confusing and Linux-flavoured.
     if (not effectively_disabled and not use_mount and not use_seatbelt
-            and (target or output or allowed_tcp_ports)):
+            and (target or output or allowed_tcp_ports
+                 or restrict_reads or extra_writable_paths)):
+        # restrict_reads is part of the declared policy too: a
+        # read-restricted caller without target/output (possible under
+        # skip-mount / helper shapes) would otherwise silently lose
+        # its read restriction here instead of failing closed. So are
+        # caller-supplied writable_paths extras — a write-scoping
+        # request with nothing to enforce it used to slip past this
+        # predicate and run silently unconfined.
         if not check_landlock_available():
-            if state.warn_once("_landlock_warned_unavailable"):
-                logger.warning(
-                    "Sandbox: target/output/allowed_tcp_ports were set but "
+            # Acceptance lever, mirroring the degraded-net-deny arm
+            # above: RAPTOR_ALLOW_DEGRADED_UNTRUSTED is the documented
+            # host-wide acceptance of degraded containment tiers, and
+            # on a Landlock-less kernel it converts this refusal into
+            # a loud warning so the namespace lanes can still serve
+            # the workload — the modern spawn backend's ns-only tier
+            # (namespaces + fresh procfs + seccomp, floor-checked at
+            # dispatch) is what such a host has left, and refusing at
+            # construction made that tier unreachable for exactly the
+            # consented runs the waiver exists for. Filesystem-write /
+            # TCP-port / read-allowlist policy is genuinely unenforced
+            # under the acceptance, and the per-call floor comparison
+            # still refuses every unconsented untrusted call.
+            #
+            # The acceptance follows the full consent chain (per-run
+            # --sandbox-floor flag > project sandbox-floor setting >
+            # the legacy env var): a floor at or below ns-only IS the
+            # consent to run without the Landlock policy layer, from
+            # whichever surface set it — and an explicitly RAISED
+            # floor (flag/project mountless-ns or mount-ns) refuses
+            # here even when the env waiver is set, because the
+            # explicit surface wins in both directions. An explicit
+            # BARE ("none") consents to nothing on this arm.
+            _consent_floor, _consent_src = resolve_untrusted_floor()
+            _degraded_ll_ok = (
+                _tiers.ContainmentTier.LANDLOCK_ONLY
+                <= _consent_floor
+                <= _tiers.ContainmentTier.NS_NOMOUNT
+            )
+            if _degraded_ll_ok:
+                if _consent_src == _tiers.FLOOR_SOURCE_ENV:
+                    _ll_accept_surface = "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1"
+                elif _consent_src == _tiers.FLOOR_SOURCE_FLAG:
+                    _ll_accept_surface = (
+                        f"--sandbox-floor "
+                        f"{_tiers.tier_label(_consent_floor)}")
+                else:
+                    _ll_accept_surface = (
+                        f"the project sandbox-floor="
+                        f"{_tiers.tier_label(_consent_floor)} setting")
+                if state.warn_once("_degraded_landlock_override_warned"):
+                    logger.warning(
+                        "Sandbox: target/output/writable_paths/"
+                        "allowed_tcp_ports/restrict_reads were set "
+                        "but Landlock is unavailable on this kernel — "
+                        "%s accepts "
+                        "running WITHOUT filesystem-write/TCP/read "
+                        "policy enforcement; namespace containment "
+                        "(fresh procfs, pid/ipc/net isolation) still "
+                        "applies where a namespace lane engages, and "
+                        "the containment floor still gates every "
+                        "dispatch.",
+                        _ll_accept_surface,
+                    )
+            else:
+                from .errors import SandboxSetupError
+                msg = (
+                    "Sandbox: target/output/writable_paths/"
+                    "allowed_tcp_ports/restrict_reads were set but "
                     "Landlock is unavailable on this kernel — filesystem writes "
-                    "and TCP ports are NOT restricted. Consider --sandbox none "
-                    "to acknowledge, or upgrade to kernel 5.13+ for Landlock."
+                    "and TCP ports would NOT be restricted."
                 )
+                _ll_fix = (
+                    "Upgrade to kernel 5.13+ for Landlock, pass "
+                    "--sandbox network-only to keep namespace/network isolation "
+                    "without filesystem restriction, or --sandbox none to "
+                    "disable all isolation. To accept running without "
+                    "the Landlock policy layer, pass --sandbox-floor "
+                    "ns-only (this run), set sandbox-floor via "
+                    "/project set sandbox-floor ns-only (standing for "
+                    "the project), or set "
+                    "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 (host-wide)."
+                )
+                if _consent_src in (_tiers.FLOOR_SOURCE_FLAG,
+                                    _tiers.FLOOR_SOURCE_PROJECT):
+                    # Honesty rule: an explicitly pinned floor is not
+                    # relaxed by the env var or a lower-precedence
+                    # surface — say so instead of steering the
+                    # operator at overrides that would lose.
+                    _pin_surface = (
+                        "--sandbox-floor" if _consent_src
+                        == _tiers.FLOOR_SOURCE_FLAG
+                        else "the project sandbox-floor setting")
+                    if _consent_floor is _tiers.ContainmentTier.BARE:
+                        _ll_fix += (
+                            f" Note: {_pin_surface}=none is not a "
+                            f"consentable floor — untrusted work "
+                            f"never runs bare by consent; use "
+                            f"--sandbox none / --no-sandbox for the "
+                            f"operator-explicit sandbox-off."
+                        )
+                    else:
+                        _ll_fix += (
+                            f" Note: {_pin_surface} currently pins "
+                            f"the floor at "
+                            f"'{_tiers.tier_label(_consent_floor)}'"
+                            f", which the env var and lower-"
+                            f"precedence surfaces do not override — "
+                            f"change that surface itself to consent."
+                        )
+                raise SandboxSetupError(msg, _ll_fix)
         else:
             abi = _get_landlock_abi()
             # Each ABI level adds a restriction mask bit. Warn once per
@@ -719,25 +3620,15 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             # silent coverage gap visible to the operator.
             if allowed_tcp_ports and abi < 4 and state.warn_once("_landlock_warned_abi_v4"):
                 logger.warning(
-                    f"Sandbox: allowed_tcp_ports={allowed_tcp_ports} requires "
-                    f"Landlock ABI v4 (kernel 6.7+); current ABI is {abi} — "
-                    f"TCP allowlist is NOT enforced. Pass block_network=True "
-                    f"for full network block, or upgrade the kernel."
+                    "Sandbox: allowed_tcp_ports=%s requires Landlock ABI v4 (kernel 6.7+); current ABI is %s — TCP allowlist is NOT enforced. Pass block_network=True for full network block, or upgrade the kernel.", allowed_tcp_ports, abi
                 )
             if abi < 3 and state.warn_once("_landlock_warned_abi_v3"):
                 logger.warning(
-                    f"Sandbox: Landlock ABI v3 (kernel 6.2+) adds TRUNCATE "
-                    f"coverage; current ABI is {abi} — existing files outside "
-                    f"the writable paths can still be truncated via O_TRUNC "
-                    f"(though DAC may still block it)."
+                    "Sandbox: Landlock ABI v3 (kernel 6.2+) adds TRUNCATE coverage; current ABI is %s — existing files outside the writable paths can still be truncated via O_TRUNC (though DAC may still block it).", abi
                 )
             if abi < 2 and state.warn_once("_landlock_warned_abi_v2"):
                 logger.warning(
-                    f"Sandbox: Landlock ABI v2 (kernel 5.19+) adds REFER "
-                    f"coverage; current ABI is {abi} — cross-directory "
-                    f"rename/hardlink is NOT blocked. A process with write "
-                    f"access to /tmp can rename files across writable "
-                    f"boundaries. Upgrade the kernel to close this."
+                    "Sandbox: Landlock ABI v2 (kernel 5.19+) adds REFER coverage; current ABI is %s — cross-directory rename/hardlink is NOT blocked. A process with write access to /tmp can rename files across writable boundaries. Upgrade the kernel to close this.", abi
                 )
 
     # Compute the effective read-allowlist when restrict_reads is on.
@@ -771,32 +3662,106 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # reading /proc/self/maps (ASAN, IFUNC resolvers, runtime CPU
     # detection) break. Accepted residual: in Landlock-only mode (no
     # PID namespace), a compromised child can read /proc/<host_pid>/
-    # environ for same-UID host processes. Callsites that run code
-    # derived from untrusted input should use run_untrusted() which
-    # forces block_network=True → PID namespace → host PIDs invisible
-    # inside /proc.
-    effective_read_paths: Optional[list] = None
-    if restrict_reads:
-        effective_read_paths = [
+    # environ for same-UID host processes. run_untrusted() forces
+    # block_network=True → PID namespace → host PIDs invisible inside
+    # /proc — ON HOSTS WITH UNPRIVILEGED USERNS. On hosts without it
+    # the namespace tier never engages, so run_untrusted() FAILS
+    # CLOSED there instead of degrading (see
+    # _require_userns_or_optin; RAPTOR_ALLOW_DEGRADED_UNTRUSTED is
+    # the explicit operator override). Under that override the
+    # whole-of-/proc grant — and with it the same-UID environ
+    # channel — is withdrawn per call via omit_proc_reads; the
+    # per-call warning at the run_untrusted entry names the tool
+    # breakage this trades for.
+    def _restricted_read_allowlist() -> list[str]:
+        paths = [
             "/usr", "/lib", "/lib64", "/bin", "/sbin",
             "/etc", "/proc", "/sys",
         ]
-        # The pid-1 shim file ONLY (not the whole libexec/ dir).
-        # Without this, execvp of the shim fails with EACCES (rc=126)
-        # and every run_untrusted() call under restrict_reads=True
-        # errors out before the target even starts. Narrowing to the
-        # single file keeps the rest of libexec/ (other RAPTOR
-        # helpers that have no business being visible to a sandboxed
-        # target) out of the read allowlist. Landlock supports
-        # file-granularity rules via path_beneath with an O_PATH fd.
-        from pathlib import Path as _Path
-        _shim = _Path(__file__).resolve().parents[2] / "libexec" / "raptor-pid1-shim"
-        if _shim.is_file():
-            effective_read_paths.append(str(_shim))
+        if omit_proc_reads:
+            paths.remove("/proc")
+        if omit_etc_reads:
+            # Swap the wholesale /etc grant for the loader/TLS minimum.
+            # Host-identity files (/etc/passwd, /etc/hosts,
+            # /etc/machine-id, ...) stay denied — this matters most on
+            # the Landlock-only tier, where no private mount view
+            # narrows /etc for the child. Existing paths only:
+            # Landlock rules bind to inodes and the preexec treats a
+            # missing grant path as a setup failure.
+            paths.remove("/etc")
+            paths.extend(
+                p for p in _ETC_MINIMAL_READS if os.path.exists(p))
         if target:
-            effective_read_paths.append(target)
+            paths.append(target)
         if readable_paths:
-            effective_read_paths.extend(readable_paths)
+            paths.extend(readable_paths)
+        if etc_overlay:
+            for ns_path in etc_overlay:
+                if isinstance(ns_path, str) and ns_path not in paths:
+                    paths.append(ns_path)
+        return paths
+
+    effective_read_paths: list | None = None
+    if restrict_reads:
+        effective_read_paths = _restricted_read_allowlist()
+        # WSL /mnt default-deny (profile-assembly chokepoint). On a
+        # WSL host the automount family under /mnt IS the Windows
+        # filesystem; an AMBIENT entry there (a derived readable_paths
+        # value, a tool resolved through the Windows-interop PATH)
+        # would hand the restricted child the whole Windows drive as
+        # a readable exfil surface. Semantics, exactly:
+        #   * scope — restrict_reads=True on a detected-WSL host;
+        #     inert everywhere else (the composed list is untouched
+        #     off-WSL, and restrict_reads=False has no allowlist to
+        #     filter — its mount-ns tool binds are the trusted
+        #     posture, out of this deny's contract).
+        #   * denied — any composed read-allowlist or tool_paths
+        #     entry at/below /mnt on EITHER spelling: lexical
+        #     (canonical_bind_path) or destination (realpath — the
+        #     bind machinery mounts the resolved source, so a
+        #     symlink to /mnt is a /mnt grant). The static
+        #     system-dir defaults never name /mnt, so in practice
+        #     this catches readable_paths/tool_paths arrivals.
+        #   * exempt (explicit grants stay) — the run's target and
+        #     output trees (an operator whose TARGET lives on /mnt/c
+        #     analyses it exactly as before: the target grant, and
+        #     entries within it, are untouched; realpath both sides,
+        #     so a symlink-spelled target keeps its tree) and the
+        #     operator's --sandbox-readable-path /
+        #     --sandbox-tool-path CLI entries (already the
+        #     loudly-logged loosening surface — and the per-run
+        #     override this deny names).
+        # Both consumers of the composed grants inherit one filter
+        # result: the Landlock read allowlist below and the mount-ns
+        # extra_ro binds (built later from effective_read_paths +
+        # tool_paths) see the same post-deny lists.
+        _wsl = _startup_wsl()
+        if _wsl is not None and _wsl.is_wsl():
+            _mnt_exempt = [
+                *(p for p in (target, output) if p),
+                *(state._cli_sandbox_readable_paths or []),
+                *(state._cli_sandbox_tool_paths or []),
+            ]
+            effective_read_paths, _mnt_dropped = (
+                _split_wsl_ambient_mnt_reads(
+                    effective_read_paths, _mnt_exempt))
+            _kept_tools, _mnt_dropped_tools = (
+                _split_wsl_ambient_mnt_reads(
+                    list(tool_paths or []), _mnt_exempt))
+            if _mnt_dropped_tools:
+                tool_paths = _kept_tools
+            _mnt_dropped += _mnt_dropped_tools
+            if _mnt_dropped:
+                logger.warning(
+                    "Sandbox: WSL host — dropping ambient read "
+                    "grant(s) under %s from the restricted read "
+                    "allowlist: %s. The Windows filesystem is not "
+                    "ambiently readable to untrusted work; explicit "
+                    "grants stay (the run's target/output trees, and "
+                    "--sandbox-readable-path/--sandbox-tool-path for "
+                    "a per-run operator override). See docs/wsl.md.",
+                    _WSL_AUTOMOUNT_ROOT, _mnt_dropped,
+                )
     elif readable_paths:
         logger.warning(
             "Sandbox: readable_paths=%s ignored because restrict_reads=False "
@@ -804,11 +3769,93 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             readable_paths,
         )
 
-    preexec = _make_preexec_fn(effective_limits, writable_paths=writable_paths,
-                               allowed_tcp_ports=allowed_tcp_ports,
-                               seccomp_profile=seccomp_profile,
-                               seccomp_block_udp=seccomp_block_udp,
-                               readable_paths=effective_read_paths)
+    _preexec_readable = list(effective_read_paths or []) if effective_read_paths else None
+    if _preexec_readable is not None:
+        for _tp in (tool_paths or []):
+            if _tp and _tp not in _preexec_readable:
+                _preexec_readable.append(_tp)
+
+    # NPROC bound for the no-namespace path. The namespace paths count
+    # RLIMIT_NPROC against the ns-local uid (nobody = zero pre-existing
+    # processes) via the prlimit wrapper / grandchild setrlimit; the
+    # Landlock-only subprocess path shares the HOST uid, where a flat
+    # cap would count the operator's unrelated processes — so it
+    # historically applied NO process bound at all and a fork bomb ran
+    # to the host ceiling. Bound it relative to the current same-uid
+    # process count instead (`_derive_host_nproc_cap`): ceiling =
+    # count-at-setup + configured nproc budget + a bounded fluctuation
+    # headroom. Growth is capped at the same budget the namespace
+    # paths grant, without starving concurrent RAPTOR work. The
+    # snapshot is a SETUP-TIME value consumed at every later fork in
+    # the child tree — on a loaded host the same-uid count moves past
+    # it (the headroom absorbs ordinary churn, and the demoted-lane /
+    # audit-lane rebuilds resample at dispatch time through
+    # _consumption_nproc_cap, same formula).
+    _host_nproc_cap = None
+    # Teardown-sweep cell for the same no-namespace posture: the
+    # composed preexec forks a PR_SET_CHILD_SUBREAPER sweeper that
+    # SIGKILLs every surviving descendant (setsid daemons, SIGSTOP-
+    # parked children, delayed writers) when the payload exits or the
+    # per-run death pipe hits EOF. Namespace paths don't need it — the
+    # pid-ns cascade kill is stronger. See preexec._reaper_split.
+    #
+    # The death-pipe slot is a threading.local, NOT a plain cell key:
+    # the cell itself is shared by every run() inside this sandbox()
+    # context, and a plain key let CONCURRENT run() calls overwrite
+    # each other's fd between assignment and fork — run A's sweeper
+    # then watched run B's pipe (spurious cross-run SIGKILL on B's
+    # teardown, lost death watch for A). The fork inherits the calling
+    # thread's slot, so _reaper_split's post-fork read is per-run by
+    # construction (one run() per thread at a time).
+    # Minted for every Linux context that could dispatch on the plain
+    # subprocess lane. That used to exclude namespace-triggering
+    # shapes (their lane was the unshare-CLI chain, whose pid-ns
+    # cascade made the sweeper redundant); with that lane deleted, a
+    # namespace-shaped call whose spawn backend fails mid-setup
+    # demotes to the plain lane per call — the sweeper must exist for
+    # it. The cell is inert on runs that stay on the spawn lanes (the
+    # sweeper only forks inside the subprocess-lane preexec), and the
+    # teardown_sweep posture stamp below is scoped to runs that
+    # actually executed there.
+    _reaper_cell: dict | None = None
+    if (sys.platform == "linux" and not use_seatbelt
+            and not effectively_disabled):
+        _reaper_cell = {"death_local": threading.local()}
+        _nproc_budget = int(effective_limits.get("nproc", 0) or 0)
+        if _nproc_budget > 0:
+            _host_nproc_cap = _derive_host_nproc_cap(_nproc_budget)
+
+    _preexec_build_kwargs: dict[str, Any] = dict(
+        writable_paths=writable_paths,
+        allowed_tcp_ports=allowed_tcp_ports,
+        seccomp_profile=seccomp_profile,
+        seccomp_block_udp=seccomp_block_udp,
+        readable_paths=_preexec_readable,
+        deny_all_tcp_connect=_degraded_tcp_deny,
+        host_nproc_cap=_host_nproc_cap,
+        reaper_cell=_reaper_cell,
+        # Fileless-exec deny rides the restrict_reads posture (the
+        # untrusted / strict contract), mirroring Landlock's EXECUTE
+        # engagement in the same preexec: memfd_create + execveat
+        # AT_EMPTY_PATH are refused for exactly the children whose
+        # exec surface is scoped to the read allowlist. Trusted
+        # read-everywhere contexts build a byte-identical filter.
+        # (The frida profile keeps memfd_create — consented
+        # instrumentation; see _make_seccomp_preexec's carve-out.)
+        seccomp_deny_fd_exec=bool(restrict_reads),
+    )
+    # Plain-subprocess preexec with the namespace-creation deny rules
+    # (unshare/clone CLONE_NEW*, setns; clone3→ENOSYS). The fork
+    # backend's grandchild always installs these, and with the
+    # unshare-CLI lane deleted the plain subprocess lane is the ONLY
+    # lane that still execs through a preexec — its payload never
+    # legitimately unshares, so the deny rules apply blanket. (The
+    # legacy lane could not take them because its own `unshare`
+    # bootstrap ran under the filter — the documented residual that
+    # died with the lane.)
+    preexec_ns_blocked = _make_preexec_fn(
+        effective_limits, seccomp_block_ns_creation=True,
+        **_preexec_build_kwargs)
 
     # Host-fingerprint persona — opt-in. Built once per sandbox() context
     # and reused across every run() call inside it. Cleanup happens in
@@ -832,8 +3879,8 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     _persona = None
     _persona_tmpdir = None
     if sanitise_host_fingerprint:
-        from .fingerprint import build_persona, is_supported
         from ._spawn import mount_ns_available
+        from .fingerprint import build_persona, is_supported
         _fp_unsupported_reason = None
         if not is_supported():
             _fp_unsupported_reason = (
@@ -841,11 +3888,30 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                 "bind-mount + UTS-namespace primitives — run RAPTOR "
                 "in a Linux VM for untrusted-binary analysis)"
             )
+        elif not check_mount_available():
+            # Same gate run() uses to decide mount-ns engagement.
+            # Pre-fix this branch probed only mount_ns_available()
+            # (uidmap binaries), so a host whose kernel/LSM refuses
+            # unprivileged userns but has uidmap installed passed the
+            # gate, built the persona, and then mount-ns never engaged
+            # — sanitisation silently never applied. And the
+            # diagnostic hardcoded uidmap+AppArmor: route through
+            # mount_unavailable_reason() (the helper the strict and
+            # Landlock-only siblings already use) so SELinux / nested
+            # userns / missing-package hosts each get their own cause.
+            from .probes import mount_unavailable_reason
+            _fp_condition, _fp_fix = mount_unavailable_reason()
+            _fp_unsupported_reason = f"{_fp_condition}. {_fp_fix}"
         elif not mount_ns_available():
+            # check_mount_available() passed but the newuidmap/
+            # newgidmap execution probe failed (missing or broken
+            # install) — the spawn backend cannot run its uid-mapping
+            # step, so mount-ns (and with it the persona overlay)
+            # will not engage.
             _fp_unsupported_reason = (
-                "mount-ns unavailable (needs `uidmap` package + "
-                "kernel.apparmor_restrict_unprivileged_userns=0); "
-                "see startup banner for the exact sysctl"
+                "uidmap helpers unusable (newuidmap/newgidmap missing "
+                "or not executable) — install/repair the uidmap "
+                "package"
             )
         elif not (target or output):
             # mount-ns engagement requires at least one of target/output
@@ -868,12 +3934,26 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                 raise RuntimeError(msg + " (require_sanitisation=True)")
             logger.warning("Sandbox: %s; identity surfaces will be host-real.", msg)
         else:
+            import shutil as _shutil
             import tempfile as _tf
-            _persona_tmpdir = _tf.mkdtemp(prefix="raptor-persona-")
+            _persona_tmpdir = _tf.mkdtemp(prefix=".fp-")
             _effective_cpu_count = cpu_count if cpu_count is not None else 4
-            _persona = build_persona(
-                Path(_persona_tmpdir), cpu_count=_effective_cpu_count,
-            )
+            try:
+                # strict rides ON the persona: apply_overlay (in the
+                # mount-ns child) treats per-target failures as setup
+                # failures instead of skip-and-continue, so a
+                # fail-closed persona request cannot silently run
+                # with host-real identity files.
+                _persona = build_persona(
+                    Path(_persona_tmpdir), cpu_count=_effective_cpu_count,
+                    strict=bool(require_sanitisation),
+                )
+            except BaseException:
+                from ._retirement import retire_parent_resources
+                retire_parent_resources(
+                    lambda: _shutil.rmtree(_persona_tmpdir, ignore_errors=True),
+                )
+                raise
     elif cpu_count is not None:
         # cpu_count without the master switch is a caller mistake — the
         # CPU-mask change is part of the fingerprint persona, not an
@@ -882,13 +3962,46 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             "Sandbox: cpu_count=%d ignored because sanitise_host_fingerprint=False",
             cpu_count,
         )
+    if _persona is not None and os.environ.get(
+            "TERM", "").startswith(("screen", "tmux")):
+        # A screen/tmux-flavoured TERM says "interactive operator
+        # multiplexer" — contradicting the persona's headless-VM
+        # story in one getenv. Normalise to the boring default.
+        # Rides the fake_home_env overlay (same merge point).
+        fake_home_env["TERM"] = "xterm-256color"
+
 
     # Cumulative proxy-event list spanning every run() call in this
     # sandbox() context. Per-run slices live on each result.sandbox_info;
     # this is the unified view exposed as `run.events`.
     _sandbox_events: list = []
 
-    def run(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
+    def _own_input_spools(execute):
+        from contextlib import ExitStack
+        from functools import wraps
+        from ._retirement import retire_parent_resources
+
+        @wraps(execute)
+        def owned(cmd, **kwargs):
+            if '_input_spool_files' in kwargs:
+                raise TypeError('_input_spool_files is an internal sandbox argument')
+            files = ExitStack()
+            operation_failed = True
+            try:
+                result = execute(cmd, _input_spool_files=files, **kwargs)
+                operation_failed = False
+                return result
+            finally:
+                # Exceptions retain frames. File lifetime must end with this
+                # call, even while the caller keeps an execution traceback.
+                if operation_failed:
+                    retire_parent_resources(files.close)
+                else:
+                    files.close()
+        return owned
+
+    @_own_input_spools
+    def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         """Run a command inside the sandbox namespace defined by the enclosing
         `with sandbox(...)` block.
 
@@ -897,18 +4010,71 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         fixed by the enclosing context and CANNOT be overridden per-call —
         passing block_network=, target=, output=, profile=, etc. here raises
         TypeError. To change isolation, open a new `sandbox()` context.
+
+        PATH-divergence gate: when run() builds the child env itself
+        (no caller env=), a BARE command name that would resolve to a
+        different binary inside the sandbox than in the caller's
+        environment — the child-env scrub drops home-rooted PATH
+        entries, so a venv/rustup tool silently falls through to a
+        same-named system binary or to nothing — raises
+        SandboxSetupError naming both resolutions. Remedies, in
+        preference order: declare the toolchain via tool_paths= (run
+        the caller's binary inside the sandbox), invoke by absolute
+        path, or pass allow_path_divergence=True to state that the
+        child SHOULD resolve the name against its own PATH.
         """
         from core.config import RaptorConfig
+        _job_controller = kwargs.pop('_job_controller', None)
+        _execution_invocation = kwargs.pop('_execution_invocation', None)
+        _input_spool_files = kwargs.pop('_input_spool_files')
+
+        _validate_output_redirections(kwargs)
+
+        # Resolve the documented subprocess alias before selecting a native
+        # backend. Passing both forms with different truth values is ambiguous.
+        if kwargs.get("universal_newlines") is not None:
+            if (kwargs.get("text") is not None
+                    and bool(kwargs["text"]) != bool(kwargs["universal_newlines"])):
+                raise subprocess.SubprocessError(
+                    "Cannot disambiguate when both text and universal_newlines "
+                    "are supplied but different. Pass one or the other.")
+            kwargs["text"] = bool(kwargs["universal_newlines"])
+
+        if kwargs.get("encoding") == "locale":
+            import locale
+            kwargs["encoding"] = locale.getencoding()
 
         # Reject sandbox kwargs — they'd be silently ignored otherwise and
         # callers would wrongly assume per-call overrides took effect.
         misused = _SANDBOX_KWARGS & kwargs.keys()
         if misused:
-            raise TypeError(
+            msg_0 = (
                 f"sandbox().run() does not accept sandbox kwargs "
                 f"{sorted(misused)} — isolation is fixed by the enclosing "
                 f"sandbox() context. Open a new sandbox(...) block to change it."
             )
+            raise TypeError(msg_0)
+
+        # Native deadline comparisons cannot expire NaN, and subprocess
+        # waiters cannot represent infinite deadlines. None is unbounded.
+        _timeout = kwargs.get("timeout")
+        if _timeout is not None and not math.isfinite(_timeout):
+            raise ValueError("timeout must be finite or None")
+
+        # Per-call capture ceiling (bytes per captured stream), for
+        # callers that only ever consume bounded tails of hostile
+        # output (SandboxHandle.exec keeps kilobytes). Popped here so
+        # the subprocess-backed lanes never see an unknown kwarg. The
+        # fork spawn backend enforces it DURING the pipe drain — a
+        # true transient bound on the trusted parent's memory (rootfs
+        # runs are pinned to that backend by the rootfs fail-closed
+        # gates). Plain subprocess calls also drain through a bounded
+        # owner when this kwarg is present. Other platform lanes retain
+        # a result-size clamp at the dispatch chokepoint.
+        _max_capture_bytes = kwargs.pop("max_capture_bytes", None)
+        if _max_capture_bytes is not None:
+            # Refuse invalid limits before any executor can run the command.
+            _max_capture_bytes = max(0, int(_max_capture_bytes))
 
         # Audit-mode + missing output= handling. Two distinct cases:
         #
@@ -935,7 +4101,7 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         _has_audit_target = bool(output) or bool(audit_run_dir)
         if audit_mode and not _has_audit_target:
             if audit:  # case 1 — explicit per-call kwarg
-                raise ValueError(
+                msg_0 = (
                     "audit mode requires output= or audit_run_dir= so "
                     "the tracer has a directory to write "
                     "sandbox-summary.json into. Pass output=<dir> "
@@ -944,6 +4110,7 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                     "audit_run_dir=<dir> (audit-only, no Landlock "
                     "impact). run_untrusted() enforces output=."
                 )
+                raise ValueError(msg_0)
             # case 2 — CLI flag + internal helper without output.
             # Silently demote audit for this call only. The state
             # flag stays True for other sandbox calls in the process.
@@ -953,6 +4120,51 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                 "JSONL — audit demoted for this call only."
             )
             nonlocal_audit_mode = False
+
+        def _audit_target_dir_problem() -> str | None:
+            """Why the effective audit target dir is unusable, or None.
+
+            The audit tiers create ``<dir>/.audit`` inside the target
+            dir but never the dir itself (see evidence.ensure_audit_dir)
+            — the contract is "caller supplies an existing writable
+            directory" (lifecycle-created run dirs at every production
+            call site). A missing/unwritable dir is therefore a
+            caller-input error, categorically different from the
+            environmental degradations (no userns, no libseccomp, no
+            ptrace) the fallback ladder legitimately absorbs.
+            """
+            _d = audit_run_dir or output
+            if not (nonlocal_audit_mode and _d):
+                return None
+            if not os.path.isdir(_d):
+                return f"is not an existing directory: {_d!r}"
+            if not os.access(_d, os.W_OK | os.X_OK):
+                return f"is not writable: {_d!r}"
+            return None
+
+        # Fail-closed validation of the audit target BEFORE any spawn
+        # tier runs. Pre-fix, a typo'd audit_run_dir= surfaced as
+        # ENOENT deep inside the mount-ns spawn setup, was swallowed
+        # by the environmental-degradation excepts below, and the call
+        # cascaded mount-ns → Landlock-only → bare subprocess.run:
+        # the command executed with reduced containment and NO audit
+        # evidence, while the API call looked successful (fail-open
+        # on the evidence channel).
+        _audit_dir_problem = _audit_target_dir_problem()
+        if _audit_dir_problem:
+            _src = ("audit_run_dir" if audit_run_dir
+                    else "output (audit target fallback)")
+            msg_0 = (
+                f"audit mode is engaged but the audit target directory "
+                f"from {_src}= {_audit_dir_problem}. The sandbox creates "
+                f"only the .audit/ evidence subdirectory inside it, "
+                f"never the directory itself — create it before the "
+                f"call (production callers pass lifecycle-created run "
+                f"dirs). Refusing to run: silently continuing here "
+                f"previously disabled BOTH the mount-ns containment "
+                f"tier and the requested audit evidence."
+            )
+            raise ValueError(msg_0)
 
         # Always use safe env unless caller provided their own.
         # env=None is treated as "no env kwarg" — the subprocess
@@ -974,25 +4186,910 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # blocklist is belt-and-braces on the os.environ →
         # get_safe_env path (see core/config.py); the caller path
         # is "you know what you're doing".
-        strict_env = kwargs.pop("strict_env", False)
+        strict_env = kwargs.pop("strict_env", False) or seccomp_profile == "rr"
+        # allow_path_divergence: opt-out for the PATH-divergence gate
+        # below. Default False — a bare command that resolves to a
+        # DIFFERENT binary inside the sandbox than in the caller's
+        # environment (because the child-env home-scrub dropped the
+        # caller's venv/toolchain PATH entry) is refused with a named
+        # error instead of quietly execing the wrong binary. True is an
+        # explicit statement of intent: "the sandboxed child SHOULD
+        # resolve this name against its own (scrubbed) PATH even when
+        # that picks a different binary than my shell would".
+        allow_path_divergence = kwargs.pop("allow_path_divergence", False)
+        # ``strip_trust_markers``: opt-in from run_untrusted() /
+        # run_untrusted_networked(). CLAUDECODE / _RAPTOR_TRUSTED pass
+        # through get_safe_env(), but an untrusted TARGET holding them
+        # could invoke libexec scripts as a "trusted caller". Every
+        # lane execs the target directly (fork backend, seatbelt,
+        # Landlock-only subprocess — the shim-bearing unshare chain is
+        # deleted), so the env handed to the target has both markers
+        # removed. RAPTOR_DIR is stripped on the same contract: the
+        # libexec trust gate never accepted it, in-tree sandboxed
+        # children self-anchor via __file__, and to an untrusted
+        # target it is a pure "inside RAPTOR at <path>" tell.
+        # Dispatch children keep it alongside the markers
+        # (keep_trust_markers_for_dispatch).
+        # Popped for API compatibility; the strip is the default now
+        # (see the target-env staging below), so the flag's only
+        # remaining meaning is "do not warn about the subsumed kwarg".
+        kwargs.pop("strip_trust_markers", False)
+        # ``keep_trust_markers_for_dispatch``: the ONLY sanctioned way
+        # to keep CLAUDECODE/_RAPTOR_TRUSTED in a sandboxed target's
+        # env (RAPTOR's own Claude Code skill dispatches — see
+        # run_untrusted_networked(keep_trust_markers=True)). Travels
+        # as an explicit call kwarg and reaches the pid1 shim as an
+        # ARGV flag: the old in-band _RAPTOR_KEEP_TRUST_MARKERS env
+        # key meant ANY caller-supplied env dict carrying that key
+        # silently preserved the markers for untrusted code.
+        keep_trust_markers_for_dispatch = kwargs.pop(
+            "keep_trust_markers_for_dispatch", False)
+        # ``env_caller_filtered``: opt-in assertion from the caller
+        # that the env dict was constructed from a get_safe_env-
+        # equivalent base AND that any DANGEROUS_ENV_VARS present
+        # are INTENTIONAL caller overrides (not operator-secret
+        # leakage). Suppresses the operational-hygiene warning
+        # below. ``strict_env=True`` is still preferable when the
+        # caller's intent is "neutralise a few keys on top of a
+        # base I trust" — but callers that INTENTIONALLY inject
+        # DANGEROUS_ENV_VARS as primitives (e.g. LD_PRELOAD /
+        # LD_LIBRARY_PATH for a controlled scenario) would have
+        # those stripped by ``strict_env=True``.
+        # ``env_caller_filtered=True`` is the "I know what I'm
+        # doing AND I can't use strict_env" escape valve.
+        env_caller_filtered = kwargs.pop("env_caller_filtered", False)
+        _skip_pid_ns = kwargs.pop("skip_pid_ns", False)
+        _skip_mount_ns = kwargs.pop("skip_mount_ns", False)
+        # Kept separate from require_fresh_procfs: the operator's degraded
+        # untrusted opt-in relaxes the fresh-procfs requirement, but it must
+        # not erase the fact that the workload is untrusted. The waived
+        # containment floor and the mountless ABI predicate below still
+        # apply to every untrusted workload.
+        _untrusted_workload = kwargs.pop("_untrusted_workload", False)
+        # Untrusted-target contract knob (set by run_untrusted*): the
+        # grandchild's fresh-procfs mount stops being best-effort —
+        # a failure aborts the spawn (status byte 'F') instead of
+        # leaving the host-pid procfs bind visible to the target.
+        # Tri-state pop: None = the kwarg was never passed (trusted
+        # default); False = passed-but-zeroed — the caller derived the
+        # flag from untrusted_fresh_procfs_required() and the operator
+        # waiver is in force, so the call is untrusted-class work
+        # running at the waived floor rather than a trusted call.
+        # ``landlock_required`` is the BACKEND's floor-plumbing
+        # parameter, never a caller kwarg: the Landlock-absent
+        # tolerance mode is reachable ONLY via the resolved
+        # containment floor below. Refuse loudly instead of letting
+        # the name ride the loose **kwargs surface into (silent)
+        # nothing — a caller writing it believed it did something.
+        if "landlock_required" in kwargs:
+            msg_0 = (
+                "sandbox run() does not accept landlock_required= — "
+                "the Landlock-absent tolerance is derived from the "
+                "resolved containment floor, never from a caller "
+                "kwarg."
+            )
+            raise TypeError(msg_0)
+        _rfp_kwarg = kwargs.pop("require_fresh_procfs", None)
+        if _rfp_kwarg is not None:
+            # Normalise truthy/falsy literals (0/1, "" ...) at the
+            # boundary so the tri-state contract below sees exactly
+            # {None, True, False} — a literal 0 must resolve like
+            # False (present-but-zeroed), not like an absent kwarg.
+            _rfp_kwarg = bool(_rfp_kwarg)
+        if seccomp_profile == "rr":
+            if _skip_pid_ns or kwargs.get("inherit_netns"):
+                raise _errors.SandboxSetupError("rr requires private PID and network namespaces")
+            kwargs["start_new_session"] = True
+            _rfp_kwarg = True
+        _require_fresh_procfs = bool(_rfp_kwarg)
+
+        # ---- containment-floor contract, side 1: entry-time check ----
+        # The caller's requirement is stated ONCE as a floor
+        # (core/sandbox/tiers.py); the per-lane enforcement lives at
+        # the dispatch sites (_dispatch_floor_check below), so a new
+        # demotion lane cannot silently run below the floor. This
+        # entry check exists for fast, fully-remediated refusals on
+        # statically-knowable shapes — probes are probabilistic, so
+        # soundness comes from the dispatch assertion, not from here.
+        #
+        # The floor short-circuits at BARE for the operator's explicit
+        # sandbox-off surface (--sandbox none / --no-sandbox /
+        # disabled=True): that surface stays authoritative and is NOT
+        # second-guessed (a LIBRARY caller's profile='none' is not
+        # operator consent — it does not set effectively_disabled and
+        # does not lower the floor), at the documented cost that the
+        # explicit global disable also silences the per-call contract
+        # flag, exactly as it silences every other containment layer.
+        # Both directions are pinned by tests.
+        def _note_floor_refusal(
+                exc: "_errors.SandboxFloorError",
+        ) -> "_errors.SandboxFloorError":
+            """run()'s refusal chokepoint half of
+            :func:`_record_floor_refusal` (see its docstring for the
+            record's consumers and the active-run-dir fallback that
+            covers calls with no audit/output dir of their own).
+            Recording is skipped under the operator's explicit
+            disable: floor := BARE there, so no floor-contract
+            refusal can fire — the only raise that still routes here
+            is the require_fresh_procfs + skip_pid_ns caller-bug
+            contradiction, a coding error rather than environment
+            evidence."""
+            if effectively_disabled:
+                return exc
+            return _record_floor_refusal(audit_run_dir or output, exc)
+
+        _explicit_tier, _explicit_src = _explicit_untrusted_floor()
+        try:
+            _floor, _floor_source = _tiers.resolve_call_floor(
+                operator_disabled=effectively_disabled,
+                require_fresh_procfs=_rfp_kwarg,
+                untrusted_workload=_untrusted_workload,
+                # tiers.py reads no environment by design — hand it the
+                # env truth so the floor source is attributed honestly
+                # (a literal require_fresh_procfs=False without the
+                # waiver must not banner/warn in the waiver's name).
+                waiver_active=_degraded_untrusted_waiver(),
+                # Explicit consent surfaces (per-run flag > project
+                # setting), read from the argparse / run-start state
+                # slots — they apply to untrusted-class calls only and
+                # win over the env waiver in both directions.
+                explicit_floor=_explicit_tier,
+                explicit_source=_explicit_src,
+                # Host-scoped standing consent (WSL host-consent
+                # marker) — lowest precedence; only replaces the
+                # fail-closed default arms with ns-only.
+                host_floor=_host_consented_floor(),
+            )
+        except _errors.SandboxFloorError as _resolve_exc:
+            # The never-BARE-by-consent refusal ("--sandbox-floor
+            # none" / a bare project floor on untrusted-class work):
+            # record it into the run-dir evidence stream like every
+            # other floor refusal, then let it propagate.
+            raise _note_floor_refusal(_resolve_exc)
+
+        if seccomp_profile == "rr":
+            # Keep the counter exception out of every reduced lane, even
+            # when the operator has consented to a lower general floor.
+            if _floor < _tiers.ContainmentTier.MOUNT_NS:
+                _floor = _tiers.ContainmentTier.MOUNT_NS
+                _floor_source = _tiers.FLOOR_SOURCE_DEFAULT
+        if (_floor_source == _tiers.FLOOR_SOURCE_ENV
+                and sys.platform == "linux"
+                and state.warn_once("_floor_lowered_banner_warned")):
+            # Consent banner (once per process; the per-call warning
+            # in _dispatch_floor_check fires whenever the lowered
+            # floor actually bites).
+            logger.warning(
+                "sandbox: untrusted containment floor lowered to '%s' "
+                "(source: RAPTOR_ALLOW_DEGRADED_UNTRUSTED).",
+                _tiers.tier_label(_floor),
+            )
+        elif (_floor_source == _tiers.FLOOR_SOURCE_FLAG
+                and sys.platform == "linux"
+                and state.warn_once("_floor_flag_banner_warned")):
+            logger.warning(
+                "sandbox: untrusted containment floor set to '%s' "
+                "(source: --sandbox-floor).",
+                _tiers.tier_label(_floor),
+            )
+        elif (_floor_source == _tiers.FLOOR_SOURCE_PROJECT
+                and sys.platform == "linux"
+                and state.warn_once("_floor_project_banner_warned")):
+            logger.warning(
+                "sandbox: untrusted containment floor set to '%s' "
+                "(source: project setting sandbox-floor; per-run "
+                "--sandbox-floor overrides).",
+                _tiers.tier_label(_floor),
+            )
+        elif (_floor_source == _tiers.FLOOR_SOURCE_HOST
+                and sys.platform == "linux"
+                and state.warn_once("_floor_host_banner_warned")):
+            # Posture line for the host-scoped consent, once per
+            # process — the marker's grant date names WHICH ceremony
+            # this floor traces to (the startup banner prints the
+            # same posture through the check_env WSL section).
+            _granted = "date unavailable"
+            try:
+                from . import host_consent as _host_consent
+                _consent = _host_consent.applied_consent()
+                if _consent is not None:
+                    _granted = _consent.granted_at[:10]
+            except Exception:  # noqa: BLE001 — banner detail only
+                logger.debug("host-consent banner probe failed",
+                             exc_info=True)
+            logger.warning(
+                "sandbox: untrusted containment floor '%s' by host "
+                "consent, granted %s — Landlock unavailable on this "
+                "kernel. Revoke: bin/raptor wsl-consent revoke; a "
+                "per-run --sandbox-floor or the project "
+                "sandbox-floor setting overrides.",
+                _tiers.tier_label(_floor), _granted,
+            )
+        if (_floor_source in (_tiers.FLOOR_SOURCE_FLAG,
+                              _tiers.FLOOR_SOURCE_PROJECT)
+                and sys.platform == "linux"):
+            # Disagreement banner: an explicit surface won over a
+            # lower-precedence surface that named a DIFFERENT floor.
+            # Explicit-wins is the documented precedence; the banner
+            # makes the overridden surface visible (once per process),
+            # naming both surfaces and both values.
+            _overridden: list = []
+            if (_floor_source == _tiers.FLOOR_SOURCE_FLAG
+                    and state._project_sandbox_floor is not None
+                    and _tiers.label_tier(state._project_sandbox_floor)
+                    != _floor):
+                _overridden.append(
+                    f"project setting sandbox-floor="
+                    f"'{state._project_sandbox_floor}'")
+            if (_degraded_untrusted_waiver()
+                    and _tiers.waived_untrusted_floor() != _floor):
+                _overridden.append(
+                    "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 (frozen "
+                    "meaning: untrusted floor 'landlock')")
+            if _overridden and state.warn_once(
+                    "_floor_surface_disagreement_warned"):
+                _winner = ("--sandbox-floor"
+                           if _floor_source == _tiers.FLOOR_SOURCE_FLAG
+                           else "project setting sandbox-floor")
+                logger.warning(
+                    "sandbox: consent surfaces disagree on the "
+                    "untrusted containment floor — %s='%s' wins over "
+                    "%s (precedence: per-run flag > project setting "
+                    "> env var).",
+                    _winner, _tiers.tier_label(_floor),
+                    "; ".join(_overridden),
+                )
+        if _require_fresh_procfs and _skip_pid_ns:
+            # Contradictory by construction: skip_pid_ns keeps the
+            # host procfs on purpose (gdb lane), which is exactly the
+            # posture require_fresh_procfs refuses — a skip_pid_ns run
+            # can never satisfy a mount-tier floor. The untrusted
+            # entry points reject skip_pid_ns outright; a direct
+            # caller combining the two gets a loud error rather than
+            # a silently-neutralised contract.
+            msg = (
+                "sandbox run(): require_fresh_procfs=True cannot be "
+                "combined with skip_pid_ns=True — the skip keeps the "
+                "host-pid /proc visible, which is the exact posture "
+                "the requirement refuses."
+            )
+            raise _note_floor_refusal(_errors.SandboxFloorError(
+                msg, "",
+                # skip_pid_ns keeps the HOST procfs, which the
+                # redefined ns-only tier explicitly negates — the
+                # honest achievable claim is the policy-layer tier.
+                achievable=_tiers.ContainmentTier.LANDLOCK_ONLY,
+                floor=_floor,
+            ))
+
+        # ---- seccomp capability axis (a predicate, never a tier) ----
+        # Mirror of the untrusted entry gate's refuse-or-waive
+        # (_seccomp_axis_arm — one shared text): a direct contract-
+        # carrying run() — the payload-executor shape run(cmd, target,
+        # output, require_fresh_procfs=untrusted_fresh_procfs_
+        # required()) — previously reached the dispatch sites
+        # FILTERLESS on a libseccomp-less host, because the tier
+        # comparison alone cannot see the axis: every tier's contract
+        # INCLUDES the filter, so no lane's declared tier drops below
+        # the floor when only the filter is missing. Deliberately NOT
+        # folded into delivered-tier values: a BARE-collapse at the
+        # dispatch sites would refuse WAIVED hosts too (the entry
+        # gate's waiver accepts filterless), diverging from the
+        # entry-arm semantics this arm exists to mirror. The
+        # _ported_ns_tier BARE-collapse is the sanctioned asymmetry:
+        # it applies only inside the Landlock-absent tolerance mode,
+        # where the mountless lane's own NS_NOMOUNT declaration
+        # promises the filter and understating that one lane's
+        # delivery is safe — here the question is the CALL's
+        # contract, which the waiver may consent, so the axis stays
+        # a refuse-or-waive predicate. Floor BARE (trusted default /
+        # operator disable) keeps today's warn-once degradation.
+        if _floor > _tiers.ContainmentTier.BARE:
+            _seccomp_refusal = _seccomp_axis_arm(
+                # run_untrusted-marked calls already got this exact
+                # per-call warning from the entry gate — warn once
+                # per degraded call, not twice; the refusal branches
+                # below are unreachable for them (the entry gate
+                # raised first), so only the warning needs the dedup.
+                "sandbox run()", warn=not _untrusted_workload)
+            if _seccomp_refusal is not None:
+                raise _note_floor_refusal(_errors.SandboxFloorError(
+                    *_seccomp_refusal,
+                    # No tier's contract is deliverable without the
+                    # filter (LANDLOCK_ONLY is Landlock+seccomp+
+                    # rlimits), so the honest achievable claim is
+                    # BARE — it understates the Landlock/namespace
+                    # layers that still engage; caps may understate
+                    # delivered isolation, never overstate it.
+                    achievable=_tiers.ContainmentTier.BARE,
+                    floor=_floor,
+                ))
+        from ._spawn import mount_ns_available as _mount_ns_avail
+
+        # ---- Landlock-absent tolerance (the ported ns-only mode) ----
+        # On a kernel WITHOUT Landlock, the spawn backend may run
+        # without the Landlock layer WHEN the call's resolved floor
+        # admits the ns-only tier — floor resolution is the ONLY way
+        # to reach the mode (run()/sandbox() expose no kwarg for it;
+        # _spawn's landlock_required is set exclusively from this
+        # flag). With the mount tree engaged the lane keeps its
+        # MOUNT_NS declaration (the tree, not Landlock, is that
+        # tier's filesystem enforcement); without the tree the lane
+        # is capped to what the redefined NS_NOMOUNT tier honestly
+        # promises, computed by _ported_ns_tier below.
+        _landlock_tolerated = (
+            sys.platform == "linux"
+            and not effectively_disabled
+            and not check_landlock_available()
+            and _floor <= _tiers.ContainmentTier.NS_NOMOUNT
+        )
+
+        def _ported_ns_tier() -> "_tiers.ContainmentTier":
+            """Tier the spawn backend delivers WITHOUT the mount tree
+            and WITHOUT Landlock on this host + call shape.
+
+            NS_NOMOUNT promises namespaces + a FRESH pid-ns procfs +
+            seccomp; when any of those is unavailable up front the
+            lane must not claim the tier — it collapses to BARE
+            (understating the namespaces that may still engage is
+            safe; overstating never is). The entry-time probe verdict
+            here is advisory ordering; delivery stays fail-closed in
+            the child ('U'/'S'/'F' status bytes — the checked
+            dispatch passes require_fresh_procfs through whenever
+            this returns NS_NOMOUNT)."""
+            if not (seccomp_profile and check_seccomp_available()):
+                return _tiers.ContainmentTier.BARE
+            if _skip_pid_ns:
+                # Host procfs by caller declaration — the exact
+                # posture the tier negates.
+                return _tiers.ContainmentTier.BARE
+            from .probes import check_pidns_fresh_proc_available
+            if not check_pidns_fresh_proc_available():
+                return _tiers.ContainmentTier.BARE
+            return _tiers.ContainmentTier.NS_NOMOUNT
+
+        # Whether a mountless spawn in the tolerance mode must treat
+        # the fresh procfs mount as MANDATORY ('F' fail-closed): yes
+        # exactly when the lane declares NS_NOMOUNT — a tier that
+        # promises fresh procfs may not deliver the host view.
+        _ported_hard_fresh = (
+            _landlock_tolerated
+            and _ported_ns_tier() is _tiers.ContainmentTier.NS_NOMOUNT)
+
+        def _spawn_tier_cap(
+                without_mount: bool,
+        ) -> "_tiers.ContainmentTier | None":
+            """Per-call cap on the spawn lanes' declared tier.
+
+            * skip_pid_ns keeps the HOST procfs on both spawn lanes
+              (the fresh-proc remount rides the pid-ns grandchild
+              fork) — under the redefined NS_NOMOUNT (which promises
+              a FRESH procfs) the honest cap is the policy-layer tier
+              (LANDLOCK_ONLY), or BARE on a Landlock-less kernel.
+              Caps may understate delivered isolation; they must
+              never overstate it.
+            * The Landlock-absent tolerance caps a MOUNTLESS spawn to
+              what the ported ns-only tier honestly promises
+              (_ported_ns_tier). The mount lane keeps MOUNT_NS — the
+              bind tree, not Landlock, is that tier's filesystem
+              enforcement.
+            """
+            cap: "_tiers.ContainmentTier | None" = None
+            if _skip_pid_ns:
+                cap = (_tiers.ContainmentTier.LANDLOCK_ONLY
+                       if check_landlock_available()
+                       else _tiers.ContainmentTier.BARE)
+            if _landlock_tolerated and without_mount:
+                ported = _ported_ns_tier()
+                cap = ported if cap is None else min(cap, ported)
+            return cap
+
+        if _floor > _tiers.ContainmentTier.BARE:
+            # Highest tier this call can INTEND on this host + shape.
+            # Deliberately coarse — per-command demotions (B fallback,
+            # speculative cache, M/X status bytes, mid-setup spawn
+            # exceptions) are caught by the dispatch assertions.
+            if sys.platform == "darwin":
+                _intended = (_tiers.ContainmentTier.SEATBELT
+                             if use_sandbox
+                             else _tiers.ContainmentTier.BARE)
+            elif not use_sandbox:
+                # Environmental use_sandbox=False (userns probe
+                # refused: container default seccomp, the Ubuntu
+                # 24.04 AppArmor userns sysctl, missing uidmap
+                # tooling): the call lands on the plain-subprocess
+                # lane. Pre-fix, a contract-carrying call ran there
+                # with the HOST process table visible behind nothing
+                # louder than a once-per-process warning.
+                _intended = _tiers.ContainmentTier.LANDLOCK_ONLY
+            elif use_mount and _mount_ns_avail():
+                # The mount tiers need BOTH availability views to
+                # agree: `use_mount` (the capability probe) AND
+                # mount_ns_available() (the spawn-backend probe that
+                # actually routes the run) — they cache independently,
+                # and the subprocess fallback engages whenever the
+                # LATTER is false.
+                if _skip_mount_ns:
+                    _intended = (_ported_ns_tier() if _landlock_tolerated
+                                 else _tiers.ContainmentTier.MOUNTLESS_NS)
+                else:
+                    _intended = _tiers.ContainmentTier.MOUNT_NS
+            elif ((block_network or use_mount or restrict_reads)
+                  and _mount_ns_avail()):
+                # Namespace-needing shape without the mount tier
+                # (no target/output, or the mount capability probe
+                # refused): the modern spawn backend serves it
+                # mountlessly — MOUNTLESS_NS with Landlock, the
+                # ported ns-only tier without it.
+                _intended = (_ported_ns_tier() if _landlock_tolerated
+                             else _tiers.ContainmentTier.MOUNTLESS_NS)
+            elif block_network or use_mount or restrict_reads:
+                # uidmap helpers missing: no spawn backend at all —
+                # the plain subprocess lane is all this host offers.
+                _intended = _tiers.ContainmentTier.LANDLOCK_ONLY
+            else:
+                _intended = _tiers.ContainmentTier.LANDLOCK_ONLY
+            if _intended < _floor:
+                raise _note_floor_refusal(_entry_floor_refusal(
+                    _intended, _floor,
+                    environmental=not use_sandbox,
+                    skip_mount_ns=_skip_mount_ns,
+                    literal_contract=(_rfp_kwarg is True),
+                ))
+
+        def _floor_remedy(extra: str = "") -> str:
+            """Remedy sentence for a floor refusal: the situation-
+            specific fix first (when the demotion route carries one),
+            then the honesty-checked override sentence — it names the
+            RAPTOR_ALLOW_DEGRADED_UNTRUSTED escape when the env var
+            genuinely relaxes this call's floor, and says the override
+            will NOT relax it when the caller passed a literal
+            require_fresh_procfs=True (see _fresh_procfs_override_hint)."""
+            hint = _fresh_procfs_override_hint(
+                literal_contract=(_rfp_kwarg is True))
+            return f"{extra} {hint}".strip() if extra else hint
+
+        def _dispatch_floor_check(
+                lane: str, *,
+                executor: "Callable[[], subprocess.CompletedProcess]",
+                cap: "_tiers.ContainmentTier | None" = None,
+                cause: BaseException | None = None,
+                detail: str = "",
+                remedy: str = "",
+                setup_category: str | None = None,
+        ) -> subprocess.CompletedProcess:
+            """Containment-floor contract, side 2: the checked dispatch
+            CHOKEPOINT — the only way run() hands a command to an
+            executor.
+
+            The lane's declared tier resolves through the module-level
+            _LANE_TIERS registry (KeyError on an unregistered lane
+            fails closed), the hard pre-exec assertion runs, and only
+            then is ``executor`` invoked. Structural guarantee: the
+            AST gate in the contract tests forbids bare
+            process-spawning calls in this module outside this
+            chokepoint (and the named executor helpers it invokes), so
+            a future lane cannot ship an unchecked executor — the
+            check is not a convention beside the spawn, it IS the
+            spawn's entry point. ``cap`` lowers the declared tier for
+            per-call posture reductions (skip_pid_ns keeps the host
+            procfs on both spawn lanes; a Landlock-less kernel or the
+            operator disable reduces the plain-subprocess lane to
+            rlimits-only). ``cause`` chains the original backend
+            failure that demoted the call here.
+
+            When the floor holds only because the operator's waiver
+            lowered it (floor source "env") and the lane leaves the
+            host process table visible, the consented-degrade warning
+            fires on EVERY such call — each one runs attacker-derived
+            code under a reduced contract, and an operator watching a
+            long run must see every instance, not just the first.
+            """
+            # WSL1 refusal, at the same chokepoint the floor contract
+            # holds: WSL1 emulates Linux syscalls on the NT kernel —
+            # no namespaces, no Landlock, no seccomp — so there is no
+            # containment tier to deliver and nothing to degrade TO;
+            # every lane would run effectively bare behind a sandbox-
+            # shaped call. Refuse with the real remedy (WSL2) instead
+            # of the generic floor message. The operator-explicit
+            # disable stays authoritative (a disabled run asked for
+            # no sandbox — refusing it would only remove the escape
+            # this message names). Inert off-WSL1: two cached boolean
+            # probes, fail-toward-False.
+            if not effectively_disabled:
+                _wsl_m = _startup_wsl()
+                if _wsl_m is not None and _wsl_m.is_wsl1():
+                    raise _errors.SandboxSetupError(
+                        "sandboxed execution is unsupported on WSL1: "
+                        "WSL1 emulates Linux syscalls on the NT "
+                        "kernel — no namespaces, Landlock, or seccomp "
+                        "exist there, so no containment layer can "
+                        "engage and there is nothing to degrade to.",
+                        "Upgrade the distro to WSL2 (from Windows: "
+                        "`wsl --set-version <distro> 2`, then "
+                        "`wsl --shutdown`) — see docs/wsl.md. Running "
+                        "with NO sandbox at all remains the operator-"
+                        "explicit global disable (--sandbox none / "
+                        "--no-sandbox).",
+                    )
+            delivered = _LANE_TIERS[lane]
+            if cap is not None and cap < delivered:
+                delivered = cap
+            try:
+                _tiers.assert_floor(
+                    delivered, _floor, lane=lane, cause=cause,
+                    detail=detail,
+                    remedy=remedy or _floor_remedy(),
+                    setup_category=setup_category,
+                )
+            except _errors.SandboxFloorError as _floor_exc:
+                # Refusal chokepoint: record the run-dir evidence the
+                # verification seams' summary line counts, then let
+                # the typed refusal propagate unchanged.
+                _note_floor_refusal(_floor_exc)
+                raise
+            if (_landlock_tolerated
+                    and _floor_source not in _tiers.CONSENT_FLOOR_SOURCES
+                    and delivered <= _tiers.ContainmentTier.NS_NOMOUNT
+                    and (target or output or allowed_tcp_ports
+                         or restrict_reads or extra_writable_paths)
+                    and state.warn_once(
+                        "_tolerated_policy_unenforced_warned")):
+                # Trusted-floor tolerance bite: the call REQUESTED a
+                # filesystem/TCP policy, the kernel has no Landlock,
+                # and this lane has no mount tree — the policy is not
+                # enforced. The consented (env) case warns per call
+                # below; the trusted case must not be silent either
+                # (pre-port the spawn shapes aborted 'L' here).
+                logger.warning(
+                    "Sandbox: Landlock is unavailable on this kernel "
+                    "and this call runs on the %s lane without a "
+                    "mount tree — the requested filesystem/TCP "
+                    "policy (target/output/writable_paths/"
+                    "allowed_tcp_ports/restrict_reads) is NOT "
+                    "enforced for it. Upgrade to a kernel with "
+                    "Landlock (5.13+) to restore enforcement. "
+                    "(Warned once per process.)",
+                    lane,
+                )
+            if (_floor_source in _tiers.CONSENT_FLOOR_SOURCES
+                    and sys.platform == "linux"
+                    and delivered <= _tiers.ContainmentTier.NS_NOMOUNT
+                    and (_floor_source != _tiers.FLOOR_SOURCE_HOST
+                         or state.warn_once(
+                             "_floor_host_degrade_notice_warned"))):
+                # Consented-degrade warning, per call — except under
+                # the host-consent source, where it collapses to one
+                # notice per process: the marker's premise means
+                # EVERY untrusted call on the host runs at ns-only,
+                # so per-call repeats carry no new information (the
+                # flag/env/project sources keep per-call reporting —
+                # their floors bite selectively). The exposure
+                # named must match what the admitted lane actually
+                # leaves open: the redefined ns-only tier keeps a
+                # fresh pid-ns procfs (its exposure is the missing
+                # Landlock policy layer); everything below it leaves
+                # the HOST process table itself visible.
+                if delivered >= _tiers.ContainmentTier.NS_NOMOUNT:
+                    _waived_exposure = (
+                        "WITHOUT Landlock filesystem/TCP policy "
+                        "enforcement (namespace containment and a "
+                        "fresh procfs still apply)")
+                else:
+                    _waived_exposure = (
+                        "with the HOST process table visible to the "
+                        "untrusted target")
+                if _floor_source == _tiers.FLOOR_SOURCE_ENV:
+                    _consent_surface = ("RAPTOR_ALLOW_DEGRADED_"
+                                        "UNTRUSTED waives")
+                elif _floor_source == _tiers.FLOOR_SOURCE_FLAG:
+                    _consent_surface = (
+                        f"--sandbox-floor "
+                        f"{_tiers.tier_label(_floor)} lowers")
+                elif _floor_source == _tiers.FLOOR_SOURCE_HOST:
+                    _consent_surface = (
+                        f"the WSL host consent (bin/raptor "
+                        f"wsl-consent) sets "
+                        f"{_tiers.tier_label(_floor)} as")
+                else:
+                    _consent_surface = (
+                        f"the project sandbox-floor="
+                        f"{_tiers.tier_label(_floor)} setting lowers")
+                _once_suffix = (
+                    " (Landlock is unavailable on this kernel; "
+                    "Windows-interop surfaces — /usr/lib/wsl, "
+                    "binfmt_misc, the interop socket — remain "
+                    "reachable at this tier, see docs/wsl.md; "
+                    "shown once per process)"
+                    if _floor_source == _tiers.FLOOR_SOURCE_HOST
+                    else "")
+                logger.warning(
+                    "sandbox: %s the "
+                    "untrusted containment floor and %s — proceeding on "
+                    "the %s lane %s%s.",
+                    _consent_surface,
+                    detail or ("the mount-ns backend cannot engage for "
+                               "this call"),
+                    lane,
+                    _waived_exposure,
+                    _once_suffix,
+                )
+            if _job_controller is not None:
+                _job_controller.ensure_lane(
+                    lane, namespace_isolated=(delivered == _tiers.ContainmentTier.MOUNT_NS))
+                _job_controller.ensure_exports(
+                    [target, output, rootfs, *(writable_paths or []),
+                     *(readable_paths or []), *(tool_paths or [])],
+                    [0, 1, 2, *(kwargs.get('pass_fds') or []),
+                     *(kwargs.get(k) for k in ('stdin', 'stdout', 'stderr'))],
+                )
+            _executed = executor()
+            if _max_capture_bytes is not None:
+                # Result-size clamp for the lanes whose capture is not
+                # drained through the fork spawn backend's bounded
+                # loop (see the kwarg pop above). Idempotent on
+                # spawn-lane results — they are already within the cap.
+                _apply_capture_ceiling(_executed, _max_capture_bytes)
+            # Runtime dominance stamp: run()'s epilogue refuses any
+            # result that did not come through this chokepoint, so an
+            # executor added in ANOTHER module (out of the AST gate's
+            # sight) is caught at its first use instead of silently
+            # feeding results downstream.
+            _executed._floor_checked = True  # type: ignore[attr-defined]
+            return _executed
+        _inherit_netns = kwargs.pop("inherit_netns", False)
+        # inherit_netns drops CLONE_NEWNET / `--net` from every Linux
+        # lane, so a block_network run keeps the CALLER's network
+        # namespace — the sanctioned use (netns-coordinator paired
+        # isolation: the caller already sits in a shared ISOLATED
+        # netns the child must stay in to reach its peer), but for a
+        # caller in the HOST netns it silently neutralised the
+        # requested block: host interfaces and the host TCP table
+        # were reachable from a "network-blocked" run with no warning
+        # and no posture record. Network isolation is part of what a
+        # tier delivers for a block_network-bearing call, so the drop
+        # is now explicit: the untrusted contract refuses it (its
+        # network block may not be inherited away — run_untrusted*
+        # already reject the kwarg outright), every other caller gets
+        # a once-per-process warning naming the posture, and the
+        # per-run stamp below records it unconditionally.
+        _netns_inherited_drop = bool(
+            _inherit_netns and block_network
+            and sys.platform == "linux" and not effectively_disabled)
+        if _netns_inherited_drop:
+            if _floor >= _tiers.ContainmentTier.MOUNTLESS_NS:
+                raise _note_floor_refusal(_errors.SandboxFloorError(
+                    "sandbox run(): inherit_netns=True drops the "
+                    "network namespace from a block_network run — "
+                    "the untrusted contract's network block cannot "
+                    "be inherited away.",
+                    "run the untrusted call without inherit_netns=, "
+                    "or route coordinator-paired work through a "
+                    "trusted context.",
+                    achievable=_tiers.ContainmentTier.NS_NOMOUNT,
+                    floor=_floor,
+                ))
+            if state.warn_once("_inherit_netns_block_warned"):
+                logger.warning(
+                    "sandbox: inherit_netns=True keeps the caller's "
+                    "network namespace on a block_network run — the "
+                    "child shares whatever network the CALLER has "
+                    "(sanctioned for netns-coordinator paired runs, "
+                    "whose callers sit in a shared isolated netns; a "
+                    "host-netns caller just lost the requested "
+                    "block). Stamped per run as netns_inherited.",
+                )
+        _start_new_session = kwargs.pop("start_new_session", True)
+        # Deterministic child cwd. With no cwd= the two execution paths
+        # diverged: the mount-ns child lands in "/" (post-pivot_root
+        # chdir), while the Landlock-only subprocess child inherits the
+        # ORCHESTRATOR's cwd — leaking the host checkout path through
+        # getcwd() and pointing every relative-path write at the
+        # driver's directory instead of a sanctioned writable one.
+        # Default to the output dir (the canonical writable surface,
+        # bind-mounted on the spawn path) so both paths agree and
+        # relative writes land where the policy says writes go.
+        # Callers that pass cwd= keep full control, as before.
+        if (not effectively_disabled and output
+                and kwargs.get("cwd") is None):
+            kwargs["cwd"] = os.path.abspath(output)
+        # exec_pid_callback: live-pid observation hook, honoured only by
+        # the Linux fork-based spawn backend (see _spawn.run_sandboxed).
+        # Popped unconditionally so the subprocess fallback paths never
+        # forward an unknown kwarg to subprocess.run. Callers must gate
+        # on spawn_backend_available() — on the fallback paths the
+        # callback simply never fires.
+        _exec_pid_callback = kwargs.pop("exec_pid_callback", None)
         if kwargs.get("env") is None:
             kwargs.pop("env", None)  # drop any explicit None
             kwargs["env"] = RaptorConfig.get_safe_env()
+            if not effectively_disabled:
+                # Host-layout scrub for sandboxed children. get_safe_env()
+                # serves every subprocess in the codebase, so it keeps
+                # PWD and home-rooted PATH entries for plain tool spawns;
+                # a SANDBOXED child has no business learning the
+                # operator's home layout from either. PWD names the
+                # orchestrator's cwd (usually the RAPTOR checkout) and is
+                # recomputed by any shell; PATH entries under the
+                # operator's home (~/.local/bin, ~/bin) leak the home
+                # path while pointing at directories that are invisible
+                # (mount-ns) or read-restricted (Landlock) inside the
+                # sandbox anyway. Exception: entries under a DECLARED
+                # tool_paths dir stay — the caller explicitly named that
+                # toolchain dir, the same declaration already binds it
+                # read-only into the mount view and grants it in the
+                # Landlock read allowlist, and dropping it from PATH
+                # made the declared tool unresolvable (execvp ENOENT,
+                # exit 127) on hosts whose toolchains live under $HOME
+                # (rustup's ~/.cargo/bin being the canonical case).
+                # Caller-supplied env= dicts stay verbatim, as
+                # documented below.
+                _scrubbed = dict(kwargs["env"])
+                _scrubbed.pop("PWD", None)
+                _scrubbed.pop("OLDPWD", None)  # belt-and-braces (allowlist already drops it)
+                # Host-identity tells: the operator's login name and
+                # the machine hostname identify the analysis host to
+                # the sandboxed target. Tools that genuinely need a
+                # user name fall back to getpwuid(), which the env
+                # cannot fix (documented residual — the mount-ns
+                # map-root path presents ns-root there anyway).
+                _scrubbed.pop("USER", None)
+                _scrubbed.pop("LOGNAME", None)
+                _scrubbed.pop("HOSTNAME", None)
+                _home_prefix = os.path.expanduser("~")
+                _path_val = _scrubbed.get("PATH")
+                if _path_val:
+                    # Both spellings of each declared tool dir: the
+                    # literal (what a PATH entry usually matches) and
+                    # the resolved one (covers a symlinked declaration
+                    # meeting a resolved PATH entry, and vice versa).
+                    _declared_tool_dirs: list[str] = []
+                    for _tp in (tool_paths or []):
+                        if not _tp:
+                            continue
+                        for _cand in (os.path.normpath(_tp),
+                                      os.path.realpath(_tp)):
+                            if _cand not in _declared_tool_dirs:
+                                _declared_tool_dirs.append(_cand)
+
+                    def _under_declared_tool_dir(entry: str) -> bool:
+                        for _e in (os.path.normpath(entry),
+                                   os.path.realpath(entry)):
+                            for _d in _declared_tool_dirs:
+                                if _e == _d or _e.startswith(_d + os.sep):
+                                    return True
+                        return False
+
+                    _kept = [
+                        c for c in _path_val.split(os.pathsep)
+                        if c
+                        and (not (c.startswith("/home/")
+                                  or c == _home_prefix
+                                  or c.startswith(_home_prefix + os.sep))
+                             or _under_declared_tool_dir(c))
+                    ]
+                    # An empty PATH searches cwd; use exec's default search
+                    # when every inherited entry was removed instead.
+                    _scrubbed["PATH"] = os.pathsep.join(_kept) or os.defpath
+                    # PATH-divergence gate. The home-scrub above can
+                    # change what a BARE command name resolves to: the
+                    # caller's shell would run the venv/toolchain copy
+                    # (~/.venv/bin/pip, ~/.cargo/bin/cargo) while the
+                    # child's scrubbed PATH resolves a same-named
+                    # SYSTEM binary — or nothing. Execing a different
+                    # binary than the caller's environment names is
+                    # silent wrongness (results attributed to the
+                    # wrong tool version); refuse with the remedy
+                    # spelled out instead. Scope: bare names only
+                    # (path-carrying invocations never consult PATH),
+                    # only when the scrub actually changed PATH, and
+                    # only when the caller's PATH resolves the name at
+                    # all (otherwise the run fails not-found on its
+                    # own, unchanged). Caller-supplied env= is exempt
+                    # by construction — this branch only builds envs.
+                    # rootfs mode is exempt: cmd[0] resolves inside the
+                    # IMAGE filesystem, so a host-side which() over
+                    # either PATH names binaries the child will never
+                    # exec — host divergence is meaningless there and
+                    # refusing on it would reject valid image commands.
+                    _child_path_val = _scrubbed.get("PATH")
+                    if (not allow_path_divergence
+                            and rootfs is None
+                            and cmd and cmd[0]
+                            and os.sep not in cmd[0]
+                            and _child_path_val != _path_val):
+                        _caller_res = shutil.which(cmd[0], path=_path_val)
+                        _child_res = (
+                            shutil.which(cmd[0], path=_child_path_val)
+                            if _caller_res is not None else None)
+                        if _caller_res is not None and (
+                                _child_res is None
+                                or os.path.realpath(_child_res)
+                                != os.path.realpath(_caller_res)):
+                            from .errors import SandboxSetupError
+                            msg_0 = (
+                                f"sandbox run(): target {cmd[0]!r} "
+                                f"resolves to {_caller_res!r} in the "
+                                f"caller environment but "
+                                f"{_child_res!r} inside the sandbox "
+                                f"(the child-env scrub drops "
+                                f"home-rooted PATH entries) — "
+                                f"refusing to exec a different binary "
+                                f"than the caller's environment names."
+                            )
+                            raise SandboxSetupError(
+                                msg_0,
+                                "declare the toolchain dir via "
+                                "tool_paths=[...] so it stays visible "
+                                "and PATH-resolvable inside the "
+                                "sandbox, invoke the binary by "
+                                "absolute path, or pass "
+                                "allow_path_divergence=True if the "
+                                "sandboxed child is MEANT to resolve "
+                                "the name against its own PATH.",
+                            )
+                kwargs["env"] = _scrubbed
         else:
-            logger.info(
-                f"Sandbox: caller supplied custom env= for "
-                f"{' '.join(cmd[:_CMD_DISPLAY_MAX_ARGS]) or cmd!r} "
-                f"— get_safe_env() not applied; caller env passed through."
-            )
+            # Promote to WARNING — pre-fix this was INFO, which meant
+            # operators almost never noticed that a caller had passed
+            # custom env and the codebase-wide ``get_safe_env`` posture
+            # was being bypassed for that call. The bypass IS
+            # intentional (callers neutralise specific vars like
+            # ``GIT_CONFIG_GLOBAL=/dev/null``) but it should be visible
+            # in normal-verbosity logs so a stray ``env=`` argument
+            # doesn't quietly wave through ``EDITOR`` / ``PAGER`` /
+            # ``BROWSER`` from an attacker-influenced parent.
+            #
+            # Gate on ``not strict_env`` AND ``not env_caller_filtered``:
+            # either flag is a caller-side assertion that the warning
+            # is contradictory noise — the warning literally tells the
+            # caller to pass ``strict_env=True`` as the fix.
+            # ``env_caller_filtered`` covers the case (engine
+            # local_lowpriv_shell, semgrep config-merger, etc.) where
+            # the caller has built the env from get_safe_env()
+            # upstream AND deliberately added DANGEROUS_ENV_VARS as
+            # intentional primitives that ``strict_env=True`` would
+            # incorrectly strip.
+            if not strict_env and not env_caller_filtered:
+                logger.warning(
+                    "Sandbox: caller supplied custom env= for "
+                    "%s — get_safe_env() not applied; caller env "
+                    "passed through. Pass strict_env=True to strip "
+                    "DANGEROUS_ENV_VARS from the caller env, OR "
+                    "env_caller_filtered=True to acknowledge the "
+                    "caller has already filtered upstream.",
+                    " ".join(cmd[:_CMD_DISPLAY_MAX_ARGS]) or repr(cmd),
+                )
             if strict_env:
-                _dangerous = set(RaptorConfig.DANGEROUS_ENV_VARS)
-                _stripped = [k for k in kwargs["env"] if k in _dangerous]
+                # Preserve only RAPTOR's exact inert Git neutralisers. They
+                # are classified as dangerous because caller-controlled
+                # alternate paths can load config, but get_safe_env() resets
+                # them to /dev/null before this second-stage scrub. Removing
+                # those safe values makes git fall back to an unreadable real
+                # HOME and abort under Landlock instead of treating config as
+                # absent.
+                # is_dangerous_env_name = DANGEROUS_ENV_VARS plus the
+                # credential-env name patterns (CARGO_TARGET_<triple>_
+                # RUNNER-shaped members have no enumerable spelling).
+                _safe_git = RaptorConfig.GIT_ENV_VARS
+                _stripped = [
+                    k for k, v in kwargs["env"].items()
+                    if RaptorConfig.is_dangerous_env_name(k)
+                    and _safe_git.get(k) != v
+                ]
                 if _stripped:
-                    kwargs["env"] = {k: v for k, v in kwargs["env"].items()
-                                     if k not in _dangerous}
-                    logger.info(
-                        f"Sandbox: strict_env=True — stripped DANGEROUS_ENV_VARS "
-                        f"from caller env: {sorted(_stripped)}"
+                    kwargs["env"] = {
+                        k: v for k, v in kwargs["env"].items()
+                        if (not RaptorConfig.is_dangerous_env_name(k)
+                            or _safe_git.get(k) == v)
+                    }
+                    # Inherited temp roots are routinely replaced by private
+                    # scratch below; keep that per-child cleanup out of INFO.
+                    # Other stripped controls retain their existing visibility.
+                    _log_strip = (logger.debug if set(_stripped) <= {"TMPDIR", "TEMP", "TMP"}
+                                  else logger.info)
+                    _log_strip(
+                        "Sandbox: strict_env=True — stripped DANGEROUS_ENV_VARS from caller env: %s", sorted(_stripped)
                     )
 
         # Egress-proxy env injection — overlays AFTER get_safe_env() so
@@ -1012,6 +5109,176 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         if fake_home_env:
             kwargs["env"] = {**kwargs["env"], **fake_home_env}
 
+        # Private-scratch steering (restricted Landlock-only posture,
+        # see the writable-baseline construction): Landlock denies the
+        # host-shared /tmp, so TMPDIR must name the one scratch dir
+        # that IS writable or every tempfile-using tool fails at
+        # startup. Overlays caller env= too — the grant and the
+        # steering must not diverge.
+        if _private_scratch_dir:
+            kwargs["env"] = {
+                **kwargs["env"],
+                "TMPDIR": _private_scratch_dir,
+                "TEMP": _private_scratch_dir,
+                "TMP": _private_scratch_dir,
+            }
+
+        # Degraded-mode daemon nudge. The Landlock TCP-connect deny hits
+        # loopback too, and several build tools default to a client/
+        # daemon model over loopback TCP. Steer known offenders to their
+        # no-daemon mode through their own documented config — the same
+        # trusted-injection pattern as the JAVA_TOOL_OPTIONS proxy
+        # sysprops. Policy is unchanged: a tool that ignores the nudge
+        # (explicit --daemon, Bazel's client/server) still fails CLOSED,
+        # and _check_blocked names the opt-out.
+        if _degraded_tcp_deny:
+            kwargs["env"] = dict(kwargs["env"])
+            _daemon_off = "-Dorg.gradle.daemon=false"
+            _gopts = kwargs["env"].get("GRADLE_OPTS", "")
+            if _daemon_off not in _gopts:
+                kwargs["env"]["GRADLE_OPTS"] = (
+                    f"{_gopts} {_daemon_off}".strip()
+                )
+            kwargs["env"].setdefault("NX_DAEMON", "false")
+
+        # Target-bound env view — the ONE seam every direct-exec
+        # backend (fork, seatbelt, Landlock-only subprocess) hands to
+        # the child, and the named extension point for the sandbox
+        # re-anonymisation follow-up. The
+        # TARGET_ENV_STRIP_SET (trust markers + the session
+        # credential) is stripped by DEFAULT: the pre-fix strip was
+        # opt-in per caller, and its only setters were run_untrusted*
+        # — every other sandboxed spawn (CodeQL autobuild running
+        # repo-supplied build scripts, fuzz target execution) leaked
+        # CLAUDECODE/_RAPTOR_TRUSTED to target code on the primary
+        # fork backend. The keep-trust dispatch path (RAPTOR's own
+        # claude -p skill children, which drive libexec helpers and
+        # need both the markers and the session credential) is the
+        # ONLY exception, signalled by the sanctioned call kwarg.
+        # The legacy strip_trust_markers kwarg is still accepted —
+        # marker-stripping is now a subset of the default, and the
+        # flag additionally drops RAPTOR_DIR on untrusted-target
+        # paths — so existing callers keep working unchanged.
+        # The keep decision comes from the SANCTIONED call kwarg only.
+        # Pre-fix this probed the in-band _RAPTOR_KEEP_TRUST_MARKERS
+        # env key: a poisoned caller-supplied env dict carrying it
+        # delivered the full strip set (trust markers AND the session
+        # credential) to sandboxed target code on the direct-exec
+        # backends — while the kwarg the design sanctions never
+        # reached this seam at all, so RAPTOR's own fork-backend
+        # dispatches LOST their markers. The env key is still
+        # stripped from the child env below (defense in depth), but
+        # it no longer carries authority.
+        _keep_for_dispatch = keep_trust_markers_for_dispatch
+        if _keep_for_dispatch:
+            # Keep-trust keeps the trust markers and session
+            # credential ONLY. The sandbox-disable consent nonce is a
+            # different authority and strips here too: a dispatched
+            # child that can drive libexec helpers must still not
+            # inherit a live disable-consent it could replay on a
+            # composed RAPTOR invocation (same contract as the
+            # seatbelt shim's keep arm).
+            _env_for_target = {
+                k: v for k, v in kwargs["env"].items()
+                if k not in ("_RAPTOR_KEEP_TRUST_MARKERS",
+                             "RAPTOR_NO_SANDBOX_NONCE")
+            }
+        elif _untrusted_workload:
+            from core.config import RaptorConfig as _RC
+            # Untrusted-class work (run_untrusted*): the child IS (or
+            # runs) the analysed artifact, so beyond the strip set the
+            # WHOLE RAPTOR_*/_RAPTOR name family goes. Allowlist
+            # survivors like RAPTOR_EF_* / RAPTOR_CI serve RAPTOR's
+            # own tool children, but to a hostile binary every one of
+            # them is a one-getenv "you are inside RAPTOR" tell and an
+            # anti-analysis trigger — same contract as the frida spawn
+            # path. Prefix-based (strip_target_exec_markers) so future
+            # RAPTOR_* allowlist additions cannot silently re-open the
+            # fingerprint. The keep-trust dispatch arm above is
+            # untouched: dispatch children consume the markers by
+            # contract. (_RAPTOR_ENV_RESTORE rides the prefix family;
+            # the explicit filter below stays for the other arms.)
+            _env_for_target = {
+                k: v for k, v in
+                _RC.strip_target_exec_markers(kwargs["env"]).items()
+                if k != "_RAPTOR_KEEP_TRUST_MARKERS"
+            }
+        else:
+            from core.config import RaptorConfig as _RC
+            # RAPTOR_DIR (plus the other framework-identity values)
+            # now lives in TARGET_ENV_STRIP_SET itself: the libexec
+            # trust gate never accepted it, no sandboxed child
+            # legitimately derives paths from it (libexec scripts
+            # self-anchor via __file__; the netns coordinator exports
+            # its own), and to a target it is a pure "you are inside
+            # RAPTOR at <checkout path>" tell. The old opt-in
+            # strip_trust_markers add is therefore subsumed. Trusted
+            # tool spawns KEEP the allowlisted RAPTOR_* knobs
+            # (RAPTOR_EF_* budgets, the RAPTOR_CI stamp): their
+            # children consume them by contract — only the
+            # untrusted-workload arm above strips the whole family.
+            _env_for_target = {
+                k: v for k, v in kwargs["env"].items()
+                if k not in _RC.TARGET_ENV_STRIP_SET
+                and k != "_RAPTOR_KEEP_TRUST_MARKERS"
+            }
+        if _ENV_RESTORE_KEY in _env_for_target:
+            # RAPTOR-minted quarantine payload key (see
+            # _env_quarantine) — only ever set by run() itself on the
+            # launcher-bound view; a caller-supplied copy must not
+            # reach direct-exec children either.
+            _env_for_target = {
+                k: v for k, v in _env_for_target.items()
+                if k != _ENV_RESTORE_KEY
+            }
+
+        _mountless_call_writable: list[str] | None = None
+        _mountless_private_scratch: str | None = None
+
+        def _mountless_write_policy() -> tuple[list[str], dict]:
+            """Return write grants and env for a host-visible filesystem.
+
+            Construction assumes the mount backend has private tmpfs mounts at
+            /tmp and /dev/shm. If this call later uses a mountless lane under
+            read restriction, replace those host-shared grants with the same
+            private scratch policy used by the legacy demotion path.
+            """
+            nonlocal _env_for_target
+            nonlocal _mountless_call_writable
+            nonlocal _mountless_private_scratch
+
+            if _mountless_call_writable is not None:
+                return _mountless_call_writable, _env_for_target
+            if (not use_mount or rootfs is not None or not (target or output)
+                    or sys.platform != "linux" or effectively_disabled
+                    or not (restrict_reads or _outer_tmp_readonly) or exclude_tmp_baseline):
+                return list(writable_paths or []), _env_for_target
+
+            import tempfile as _tempfile_mountless
+            scratch = _tempfile_mountless.mkdtemp(prefix=".scr-")
+            _demoted_scratch_dirs.append(scratch)
+            from core.run.scratch import keepalive_register
+            keepalive_register(scratch)
+            shared = {
+                "/tmp", "/dev/shm",
+                os.path.realpath(_tempfile_mountless.gettempdir()),
+            }
+            _mountless_call_writable = [scratch] + [
+                path for path in (writable_paths or [])
+                if not restrict_reads
+                or (path not in shared and os.path.realpath(path) not in shared)
+            ]
+            _mountless_private_scratch = scratch
+            scratch_env = {"TMPDIR": scratch, "TEMP": scratch, "TMP": scratch}
+            kwargs["env"] = {**kwargs["env"], **scratch_env}
+            _env_for_target = {**_env_for_target, **scratch_env}
+            logger.debug(
+                "Sandbox: read-restricted mountless execution replaces "
+                "host-shared /tmp and /dev/shm grants with private scratch.",
+            )
+            return _mountless_call_writable, _env_for_target
+
+
         # Force FD close at fork. Python defaults close_fds=True on POSIX
         # but we reject explicit overrides — inheriting FDs from RAPTOR
         # into a sandboxed child is a capability leak (the child can read
@@ -1020,12 +5287,13 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # content, file handles for output) can use `pass_fds=[...]` which
         # is the documented subprocess.run escape hatch.
         if kwargs.get("close_fds") is False:
-            raise TypeError(
+            msg_0 = (
                 "sandbox().run() does not accept close_fds=False — "
                 "inheriting open FDs into the sandboxed child defeats the "
                 "isolation. Use `pass_fds=[fd, ...]` to pass specific FDs "
                 "through while still closing the rest."
             )
+            raise TypeError(msg_0)
         kwargs["close_fds"] = True
 
         # Reject shell=True. subprocess with shell=True reinterprets argv:
@@ -1037,12 +5305,13 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # if any part is attacker-influenced. Force callers to pass a
         # list of args.
         if kwargs.get("shell"):
-            raise TypeError(
+            msg_0 = (
                 "sandbox().run() does not accept shell=True — pass the "
                 "command as a list of args (e.g. [\"sh\", \"-c\", script]) "
                 "so argv construction stays deterministic and no implicit "
                 "shell expansion happens on attacker-influenced strings."
             )
+            raise TypeError(msg_0)
 
         # pass_fds audit + socket guard. Inherited sockets bypass the
         # seccomp socket() / socketpair() filter entirely — a caller
@@ -1051,70 +5320,393 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # host services. Reject socket FDs outright; allow regular
         # files, pipes, block devices, TTYs. Runtime cost: one fstat
         # per pass_fds entry.
-        if kwargs.get("pass_fds"):
+        if "pass_fds" in kwargs:
+            kwargs["pass_fds"] = tuple(kwargs["pass_fds"])
+        _pass_fds_declared = kwargs.pop("pass_fds_declared", False)
+        # stdin= carries a descriptor capability past every path-based
+        # layer exactly like a pass_fds entry: the spawn backends dup2
+        # it onto fd 0 unaudited, so a write-capable file fd, a dirfd
+        # (getdents/openat into unlisted trees) or a socket smuggled
+        # as stdin quietly bypassed the pass_fds gate below — whose
+        # own refusal text even recommended "pass stdin= directly".
+        # Audit it with the same policy (FIFO/tty/devnull exempt,
+        # pass_fds_declared parity, sockets always refused).
+        _stdin_kw = kwargs.get("stdin")
+        _stdin_audit_fd = None
+        if isinstance(_stdin_kw, int) and _stdin_kw >= 0:
+            _stdin_audit_fd = _stdin_kw
+        elif _stdin_kw is not None and hasattr(_stdin_kw, "fileno"):
+            try:
+                _stdin_audit_fd = _stdin_kw.fileno()
+            except (OSError, ValueError):
+                _stdin_audit_fd = None
+        if kwargs.get("pass_fds") or _stdin_audit_fd is not None:
+            import fcntl as _fcntl
             import stat as _stat
-            for fd in kwargs["pass_fds"]:
+
+            def _fd_policy_problem(fd: int) -> str | None:
+                """Why this fd grants an out-of-policy capability, or None.
+
+                An inherited fd is a kernel capability that bypasses
+                every path-based layer: Landlock attached its access
+                rights when the PARENT opened it (pre-restriction), and
+                the mount namespace never sees it. A $HOME file fd is
+                readable under restrict_reads; a dirfd allows getdents/
+                openat into unlisted trees; an anonymous fd (memfd,
+                deleted inode) can smuggle executable content. Compare
+                the fd's real target against the same policy the
+                sandbox enforces on paths.
+                """
+                mode = os.fstat(fd).st_mode
+                if _stat.S_ISFIFO(mode) or _stat.S_ISCHR(mode):
+                    # Pipes are the documented stdio-plumbing shape;
+                    # character devices (tty, /dev/null) grant nothing
+                    # a sandboxed child doesn't already have.
+                    return None
+                if not (_stat.S_ISREG(mode) or _stat.S_ISDIR(mode)):
+                    return "not a regular file, directory, pipe, or tty"
+                try:
+                    fd_target = os.readlink(f"/proc/self/fd/{fd}")
+                except OSError:
+                    fd_target = ""
+                    # No procfs (macOS): resolve via F_GETPATH, pinned
+                    # by dev/ino identity against the descriptor (the
+                    # _reopen_write_only pattern) so a rename between
+                    # the fcntl and the stat cannot smuggle a
+                    # different file past the policy compare. Without
+                    # this, EVERY regular-file/dir fd on darwin fell
+                    # through to the anonymous-inode refusal — a
+                    # false "unresolvable" diagnosis that made
+                    # pass_fds_declared=True the de-facto workaround
+                    # (weakening the audit this gate provides).
+                    # Unpinnable fds still refuse below (fail closed).
+                    _getpath = getattr(_fcntl, "F_GETPATH", None)
+                    if _getpath is not None:
+                        try:
+                            _raw = _fcntl.fcntl(fd, _getpath,
+                                                bytes(1024))
+                            _cand = _raw.split(b"\x00", 1)[0].decode(
+                                sys.getfilesystemencoding(),
+                                "surrogateescape")
+                            _st_path = os.lstat(_cand)
+                            _st_fd = os.fstat(fd)
+                            if ((_st_fd.st_dev, _st_fd.st_ino)
+                                    == (_st_path.st_dev,
+                                        _st_path.st_ino)):
+                                fd_target = _cand
+                        except OSError:
+                            pass
+                if not fd_target.startswith("/") or fd_target.endswith(
+                        " (deleted)"):
+                    return (f"anonymous or unlinked inode "
+                            f"({fd_target or 'unresolvable'})")
+                _writable = [os.path.abspath(w)
+                             for w in (writable_paths or [])]
+                _readable = [os.path.abspath(rp)
+                             for rp in (effective_read_paths or [])]
+                _readable.extend(os.path.abspath(base) for base in (target, output) if base)
+
+                def _under(path: str, bases: list) -> bool:
+                    return any(
+                        path == b or path.startswith(b.rstrip("/") + "/")
+                        for b in bases
+                    )
+
+                try:
+                    _acc = _fcntl.fcntl(fd, _fcntl.F_GETFL) & os.O_ACCMODE
+                except OSError:
+                    _acc = os.O_RDWR
+                _write_capable = (
+                    _stat.S_ISREG(mode) and _acc in (os.O_WRONLY, os.O_RDWR)
+                )
+                if _write_capable and not _under(fd_target, _writable):
+                    return (f"write-capable fd to {fd_target!r}, outside "
+                            f"the sandbox's writable paths")
+                if restrict_reads and not _under(
+                        fd_target, _readable + _writable):
+                    return (f"{'directory' if _stat.S_ISDIR(mode) else 'readable'} "
+                            f"fd to {fd_target!r}, outside the read "
+                            f"allowlist while restrict_reads is on")
+                return None
+
+            for fd in (kwargs.get("pass_fds") or ()):
                 try:
                     mode = os.fstat(fd).st_mode
                 except OSError as e:
-                    raise TypeError(
+                    msg_0 = (
                         f"sandbox().run(): pass_fds entry fd={fd} is not "
                         f"a valid open file descriptor ({e.__class__.__name__}: {e})"
-                    ) from e
+                    )
+                    raise TypeError(msg_0) from e
                 if _stat.S_ISSOCK(mode):
-                    raise TypeError(
+                    # SECURITY-SENSITIVE: sockets stay refused even
+                    # under pass_fds_declared — they bypass the seccomp
+                    # socket-family filter outright. ONE narrow shape
+                    # is admitted: a connected anonymous AF_UNIX
+                    # SOCK_STREAM socketpair half whose other half is
+                    # held by THIS process (_anon_socketpair_problem).
+                    # That shape is capability-equivalent to the stdio
+                    # pipes already allowed — a private byte stream to
+                    # the trusted parent — and lets sandboxed workers
+                    # (e.g. the Ghidra decompile server on hosts whose
+                    # seccomp lane denies socket(AF_UNIX)) serve over a
+                    # parent-created pair. Anything else — pathname or
+                    # abstract endpoints (docker.sock clients), INET
+                    # families, listeners, foreign-created pairs —
+                    # keeps the unconditional refusal below, which
+                    # pass_fds_declared cannot override.
+                    _sock_problem = _anon_socketpair_problem(fd)
+                    if _sock_problem is None:
+                        logger.info(
+                            "Sandbox: pass_fds entry fd=%d admitted as "
+                            "an own anonymous AF_UNIX stream socketpair "
+                            "half (pipe-equivalent capability).", fd,
+                        )
+                        continue
+                    msg_0 = (
                         f"sandbox().run(): pass_fds entry fd={fd} is a "
                         f"socket. Inherited sockets bypass the seccomp "
                         f"socket() family filter — a compromised child "
                         f"could connect to the socket's peer (e.g. "
-                        f"/var/run/docker.sock). Refusing. If you need "
-                        f"to pass a pipe for stdin content, use a pipe "
-                        f"fd (S_ISFIFO) or pass stdin= directly."
+                        f"/var/run/docker.sock). Refusing "
+                        f"({_sock_problem}); pass_fds_declared does not "
+                        f"override this. The only admissible socket "
+                        f"shape is a connected anonymous AF_UNIX "
+                        f"SOCK_STREAM socketpair half created by this "
+                        f"process. If you need to pass a pipe for "
+                        f"stdin content, use a pipe fd (S_ISFIFO) or "
+                        f"pass stdin= directly."
                     )
-            logger.info(
-                f"Sandbox: caller passed pass_fds={kwargs['pass_fds']} "
-                f"for {' '.join(cmd[:_CMD_DISPLAY_MAX_ARGS]) or cmd!r} — "
-                f"these FDs are inherited by the sandboxed child."
-            )
+                    raise TypeError(msg_0)
+                _problem = _fd_policy_problem(fd)
+                if _problem:
+                    if _pass_fds_declared:
+                        logger.warning(
+                            "Sandbox: pass_fds entry fd=%d grants an "
+                            "out-of-policy capability (%s) — allowed "
+                            "because the caller declared it with "
+                            "pass_fds_declared=True.", fd, _problem,
+                        )
+                    else:
+                        msg_0 = (
+                            f"sandbox().run(): pass_fds entry fd={fd} "
+                            f"grants an out-of-policy capability: "
+                            f"{_problem}. Inherited fds bypass Landlock "
+                            f"and the mount namespace (rights attached "
+                            f"at open time, before restrictions). Pass "
+                            f"pass_fds_declared=True to declare this "
+                            f"capability grant explicitly, or open the "
+                            f"file inside the sandbox's allowed paths."
+                        )
+                        raise TypeError(msg_0)
+            if kwargs.get("pass_fds"):
+                logger.info(
+                    "Sandbox: caller passed pass_fds=%s for %r — these FDs are inherited by the sandboxed child.", kwargs['pass_fds'], ' '.join(cmd[:_CMD_DISPLAY_MAX_ARGS]) or cmd
+                )
+            if _stdin_audit_fd is not None:
+                try:
+                    _stdin_mode = os.fstat(_stdin_audit_fd).st_mode
+                except OSError as e:
+                    raise TypeError(
+                        f"sandbox().run(): stdin= fd={_stdin_audit_fd} "
+                        f"is not a valid open file descriptor "
+                        f"({e.__class__.__name__}: {e})"
+                    ) from e
+                if _stat.S_ISSOCK(_stdin_mode):
+                    raise TypeError(
+                        f"sandbox().run(): stdin= fd={_stdin_audit_fd} "
+                        f"is a socket. Inherited sockets bypass the "
+                        f"seccomp socket() family filter — refusing "
+                        f"(same policy as pass_fds)."
+                    )
+                _stdin_problem = _fd_policy_problem(_stdin_audit_fd)
+                if _stdin_problem:
+                    if _pass_fds_declared:
+                        logger.warning(
+                            "Sandbox: stdin= fd=%d grants an "
+                            "out-of-policy capability (%s) — allowed "
+                            "because the caller declared it with "
+                            "pass_fds_declared=True.",
+                            _stdin_audit_fd, _stdin_problem,
+                        )
+                    else:
+                        raise TypeError(
+                            f"sandbox().run(): stdin= fd="
+                            f"{_stdin_audit_fd} grants an out-of-"
+                            f"policy capability: {_stdin_problem}. "
+                            f"The spawn backends dup2 caller stdin "
+                            f"onto fd 0, so it is a descriptor "
+                            f"capability exactly like a pass_fds "
+                            f"entry (fd 0 even survives pivot_root). "
+                            f"Use a pipe / input= for content, or "
+                            f"pass pass_fds_declared=True to declare "
+                            f"this grant explicitly."
+                        )
 
-        # Always set resource limits via preexec_fn
-        existing_preexec = kwargs.pop("preexec_fn", None)
-        if existing_preexec:
-            def combined():
-                existing_preexec()  # Caller's setup first (may open FDs)
-                preexec()           # Our limits + Landlock last (restricts from here on)
-            kwargs["preexec_fn"] = combined
-        else:
-            kwargs["preexec_fn"] = preexec
+        # Honor caller-supplied check= with subprocess.run semantics
+        # (raise CalledProcessError on nonzero exit). Popped here — the
+        # subprocess.run call sites below pass check=False explicitly
+        # (PLW1510), so a duplicate from **kwargs would raise TypeError
+        # — and applied at the single `return result` at the end.
+        # Silently dropping it left callers' CalledProcessError
+        # handlers dead while the docstring promised subprocess.run
+        # parity (the binary-oracle corpus drivers pass check=True and
+        # expect the raise to gate their build steps).
+        _check_requested = bool(kwargs.pop("check", False))
 
-        # Only use unshare when we need network / mount / PID isolation.
-        # Landlock filesystem isolation works without unshare, BUT in
-        # Landlock-only mode (no PID namespace) a compromised child
-        # running under the host pid-ns can read /proc/<host_pid>/environ
-        # for any same-UID host process — including the parent RAPTOR
-        # process's env, which is how ANTHROPIC_API_KEY / SSH credentials
-        # leak. Narrowing /proc in the read allowlist doesn't work
-        # (Landlock path_beneath binds to a specific inode, so
-        # subprocesses in the sandbox get their OWN /proc/<pid>/ inode
-        # denied, breaking ASAN/IFUNC/etc.). The fix is a PID namespace:
-        # the kernel enforces ns-level access to /proc/<pid>/ entries
-        # independently of the /proc mount, so host-ns pids are EACCES
-        # even though their dentries are visible through the shared
-        # /proc. Trigger an unshare whenever restrict_reads is on — PID
-        # ns + IPC ns + user ns, without network ns unless block_network
-        # is also set (the egress proxy needs the shared net ns to be
-        # reachable on loopback).
-        # `need_unshare` gates the Linux user-namespace bootstrap
-        # (`unshare` + `prlimit` + pid1 shim). On macOS, isolation
-        # comes from sandbox-exec / SBPL — there is no `unshare`
-        # binary to resolve, and the seatbelt path runs through
-        # _macos_spawn instead. Without the use_seatbelt veto, an
-        # ineligible-for-spawn macOS call (or even a fully eligible
-        # one, since the unshare_cmd is built unconditionally below)
-        # tries to resolve `unshare` and crashes the sandbox call.
+        # `need_unshare`: this call's policy wants NAMESPACE isolation
+        # (network block, mount tier, or a read restriction whose
+        # /proc-credential closure needs a pid-ns). The modern spawn
+        # backend is the only namespace lane — the legacy unshare-CLI
+        # chain is deleted — so the predicate now steers spawn
+        # eligibility (mountless mode when the mount tier isn't in
+        # play) and the per-call fallback rechecks, never a
+        # subprocess bootstrap.
         need_unshare = (use_sandbox
                         and not use_seatbelt
                         and (block_network or use_mount or restrict_reads))
+
+        # Always set resource limits via preexec_fn. Only the plain
+        # subprocess lane execs through it (the spawn backends run
+        # their own child-side chain), and its payload never
+        # legitimately unshares — so every subprocess-lane child gets
+        # the variant that additionally denies namespace creation
+        # (unshare/clone CLONE_NEW*, setns; clone3→ENOSYS). The
+        # legacy unshare-CLI lane was the one lane that could not
+        # take these rules (its bootstrap had to unshare under the
+        # filter); that documented residual died with the lane.
+        existing_preexec = kwargs.pop("preexec_fn", None)
+        if existing_preexec:
+            def combined() -> None:
+                existing_preexec()      # Caller's setup first (may open FDs)
+                preexec_ns_blocked()    # Our limits + Landlock last
+            kwargs["preexec_fn"] = combined
+        else:
+            kwargs["preexec_fn"] = preexec_ns_blocked
+
+        # Missing-tool resolution check, BEFORE any lane dispatch. A
+        # command that resolves NOWHERE — not on the caller's PATH, not
+        # on the child env's PATH, and (for absolute invocations) not
+        # on the filesystem — cannot exec on ANY non-rootfs lane: the
+        # mount view's bind sources, the private /tmp tmpfs (fresh and
+        # empty per call), and the host-visible lanes are all subsets
+        # of the host namespace, so an in-sandbox resolution can never
+        # succeed where the host's failed. Raise the subprocess-parity
+        # FileNotFoundError here, exactly what the plain-subprocess
+        # lane raises natively and what callers' tool-missing arms
+        # (`except FileNotFoundError: <tool> not installed`) have
+        # always been written against. Routing this shape into the
+        # spawn lane instead produced two doomed spawn attempts, a
+        # speculative-failure cache entry that steered every LATER
+        # call for the same name onto the mountless backend, and a
+        # category-'X' SandboxSetupError — a containment-flavoured
+        # refusal (BaseException, uncatchable by the tool-missing
+        # arms) for what is a plain missing binary, not a containment
+        # failure. Scope guards: rootfs runs resolve cmd[0] inside the
+        # IMAGE tree (host resolution is meaningless there — the
+        # existing rootfs gates own that shape); relative-with-
+        # separator invocations resolve against the CHILD cwd (which
+        # differs from the caller's) and are left to the lane; the
+        # operator-disabled path already gets this exact exception
+        # from subprocess.run itself.
+        if (not effectively_disabled and rootfs is None
+                and _cmd_resolves_nowhere(cmd,
+                                          kwargs["env"].get("PATH"),
+                                          cwd=kwargs.get("cwd"))):
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), cmd[0])
+
+        # Namespace isolation is wanted whenever network / mount / read
+        # policy is in play. Landlock filesystem isolation works
+        # without namespaces, BUT in Landlock-only mode (no PID
+        # namespace) a compromised child running under the host pid-ns
+        # can read /proc/<host_pid>/environ for any same-UID host
+        # process — including the parent RAPTOR process's env, which
+        # is how ANTHROPIC_API_KEY / SSH credentials leak. Narrowing
+        # /proc in the read allowlist doesn't work (Landlock
+        # path_beneath binds to a specific inode, so subprocesses in
+        # the sandbox get their OWN /proc/<pid>/ inode denied,
+        # breaking ASAN/IFUNC/etc.). The fix is a PID namespace: the
+        # kernel enforces ns-level access to /proc/<pid>/ entries
+        # independently of the /proc mount. Trigger the namespace lane
+        # whenever restrict_reads is on — PID ns + IPC ns + user ns,
+        # without network ns unless block_network is also set (the
+        # egress proxy needs the shared net ns to be reachable on
+        # loopback). All namespace shapes run through the fork-based
+        # spawn backend (mount tree when target/output engage it,
+        # mountless otherwise); on macOS isolation comes from
+        # sandbox-exec / SBPL via _macos_spawn (use_seatbelt vetoes
+        # need_unshare above).
+
+        # Representative engagement gate. The availability probes that
+        # set `use_sandbox` test a NARROWER op (`unshare --user
+        # --net`) than the spawn backend's os.unshare flag set
+        # (user+pid+ipc[+net][+cgroup]+mount). On rootless podman /
+        # distrobox (nested userns) the narrow probe can pass while
+        # the full flag-set fails: the child dies BEFORE exec and the
+        # call would surface as a late setup failure. Verify the full
+        # flag-set engages (cached per flag-set, probed via the
+        # unshare CLI as a stand-in for the same kernel capability)
+        # and fail LOUD if it doesn't — RAPTOR does not silently
+        # downgrade; the operator picks `--sandbox network-only`/
+        # `none`. The mount-ns layer is additionally gated by
+        # check_mount_available() upstream.
+        if need_unshare:
+            from .errors import SandboxSetupError
+            from .probes import (
+                ENGAGE_FAIL_INSTRUCTIONS,
+                check_unshare_engages,
+            )
+            _engage_flags = ["--user", "--pid", "--fork", "--ipc"]
+            # Same inherit_netns gate as the spawn backend's ns_flags:
+            # the probe must test the flag-set the run will use.
+            if block_network and not _inherit_netns:
+                _engage_flags.append("--net")
+            # CLONE_NEWCGROUP joins the spawn backend's flag set
+            # unconditionally; probe it when the CLI can express it —
+            # a kernel/policy that refuses CLONE_NEWCGROUP must not
+            # slip past the gate.
+            from .probes import unshare_supports_cgroup
+            if unshare_supports_cgroup():
+                _engage_flags.append("--cgroup")
+            _engages, _engage_reason = check_unshare_engages(_engage_flags)
+            if _engages is False:
+                # Definitive kernel refusal (rootless podman / nested userns).
+                msg_0 = (
+                    f"sandbox namespace setup failed "
+                    f"(unshare {' '.join(_engage_flags)}): {_engage_reason}"
+                )
+                _engage_exc = SandboxSetupError(
+                    msg_0,
+                    ENGAGE_FAIL_INSTRUCTIONS,
+                )
+                if _floor > _tiers.ContainmentTier.BARE:
+                    # Pre-spawn definitive namespace refusal on a
+                    # floored call: floor-class in substance (the
+                    # namespace tier the floor demands is
+                    # undeliverable; the target never executed) —
+                    # record-then-raise, type kept, mirroring the
+                    # userns entry arm's mapping: the policy layers
+                    # still engage when the kernel has them.
+                    _record_floor_refusal(
+                        audit_run_dir or output, _engage_exc,
+                        floor_label=_tiers.tier_label(_floor),
+                        achievable_label=_tiers.tier_label(
+                            _tiers.ContainmentTier.LANDLOCK_ONLY
+                            if check_landlock_available()
+                            else _tiers.ContainmentTier.BARE),
+                    )
+                raise _engage_exc
+            if _engages is None:  # noqa: SIM102
+                # Probe couldn't RUN (transient load) — NOT a verdict. Do
+                # NOT abort a possibly-working scan; proceed and let a real
+                # engagement failure surface at spawn (exec-status pipe).
+                if state.warn_once("_engage_probe_indeterminate_warned"):
+                    logger.warning(
+                        "Sandbox: engagement probe could not run (%s) — "
+                        "proceeding; a real namespace failure will still be "
+                        "caught at spawn.", _engage_reason,
+                    )
 
         # Log active sandbox layers for this command. Cache the Landlock
         # probe locally so we don't reacquire the cache lock 2-3× per run().
@@ -1130,14 +5722,16 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             layers.append("landlock")
         if allowed_tcp_ports and landlock_available:
             layers.append(f"tcp:{','.join(str(p) for p in allowed_tcp_ports)}")
+        elif _degraded_tcp_deny and landlock_available:
+            layers.append("tcp:deny-all")
         if seccomp_profile and check_seccomp_available():
             layers.append(f"seccomp:{seccomp_profile}")
-        # NPROC enforcement via prlimit wrapper, only meaningful when
-        # unshare creates a fresh user-ns (ns-UID nobody has 0 existing
-        # processes). Applied per-run() because need_unshare is per-call.
+        # NPROC enforcement (spawn grandchild setrlimit), only
+        # meaningful when the fresh user-ns makes the ns-UID's process
+        # count start at zero. Per-run() because need_unshare is
+        # per-call.
         nproc_limit = effective_limits.get("nproc", 0)
-        apply_nproc_wrapper = need_unshare and nproc_limit > 0
-        if apply_nproc_wrapper:
+        if need_unshare and nproc_limit > 0:
             layers.append(f"nproc:{nproc_limit}")
         layers.append("limits")
         # Sanitise cmd_display before it reaches any logger. cmd args
@@ -1151,81 +5745,7 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         cmd_display = escape_nonprintable(
             " ".join(cmd[:_CMD_DISPLAY_MAX_ARGS]) or "<empty cmd>"
         )
-        # Always log so operators can see the effective sandbox config for
-        # every subprocess — previously rlimits-only runs were silent,
-        # making it hard to verify in the field that the sandbox ran at all.
-        # Demoted to DEBUG when only rlimits apply, INFO when any
-        # isolation layer is active.
-        if layers == ["limits"]:
-            logger.debug(f"Sandbox (limits): {cmd_display}")
-        else:
-            logger.info(f"Sandbox ({'+'.join(layers)}): {cmd_display}")
-
-        if need_unshare:
-            # --pid --fork: new PID namespace hides host processes from
-            # kill()/ptrace (target PIDs don't exist in the child's ns).
-            # --fork is required because the child must be PID 1 in the
-            # new ns; the command itself runs as PID 1. (When use_mount
-            # is active we bypass this subprocess chain entirely and go
-            # through _spawn.run_sandboxed, which handles ns+pid setup
-            # via os.fork() + os.unshare directly.)
-            # --ipc: new SysV IPC namespace. Without this, a compromised
-            # sandboxed process shares the host's SysV shm/sem/msg-queue
-            # namespace with every other process on the machine — letting
-            # it DoS via IPC exhaustion or read same-UID apps' shm segments.
-            # Absolute paths for unshare and prlimit defeat PATH hijacking:
-            # a polluted PATH could otherwise shadow these with attacker
-            # binaries that run under our Landlock+seccomp but skip the
-            # actual unshare, leaving the child in the host's net/pid/ipc
-            # namespaces (= full outbound network).
-            from .probes import _resolve_sandbox_binary
-            unshare_cmd = [_resolve_sandbox_binary("unshare"),
-                           "--user", "--pid", "--fork", "--ipc"]
-            if block_network:
-                unshare_cmd.append("--net")
-            # prlimit wrapper: sits INSIDE the unshare chain so
-            # RLIMIT_NPROC counts against the ns-local UID (nobody =
-            # zero existing processes). prlimit is part of util-linux
-            # (same package as unshare), so always available when
-            # unshare is. Bounds fork bombs to `nproc` total per sandbox.
-            prlimit_wrapper = (
-                [_resolve_sandbox_binary("prlimit"),
-                 f"--nproc={nproc_limit}", "--"]
-                if apply_nproc_wrapper else []
-            )
-            # Mount-ns runs through _spawn.run_sandboxed below (fork +
-            # newuidmap + ctypes mount ops + pivot_root + Landlock +
-            # seccomp + pid-ns) — not through this subprocess chain.
-            # full_cmd here is only used when mount-ns ISN'T active:
-            # either use_mount=False, or _spawn raised at runtime and
-            # we dropped mount-ns for the fallback. Either way,
-            # Landlock-only is the right construction.
-            if map_root:
-                unshare_cmd.append("--map-root-user")
-            # pid-1 shim: unshare --fork makes the forked child pid-1
-            # of the new pid-ns and that child execs whatever argv
-            # comes next. If we put the user's cmd there directly,
-            # the target IS pid-1 — and Linux's pid-ns policy drops
-            # signals sent to pid-1 via raise() / kill(self,...)
-            # without an installed handler (man pid_namespaces).
-            # Nested-ns setups (Docker-in-CI, systemd-nspawn) can
-            # also drop synchronous-exception signals to pid-1 in
-            # some kernel/util-linux combinations, breaking crash
-            # observability. Interpose libexec/raptor-pid1-shim so
-            # the TARGET runs as pid-3 (via a double-fork for setsid
-            # permission) and only the shim is pid-1; the shim reaps,
-            # forwards signals, and mirrors the target's exit via
-            # the 128+sig convention (the same pid-1 filter prevents
-            # the shim re-raising the signal on itself, so we exit
-            # with 128+WTERMSIG — observe._interpret_result decodes
-            # both rc<0 and 128+sig to the same crashed=True state).
-            from pathlib import Path as _Path
-            shim_path = str(
-                _Path(__file__).resolve().parents[2] / "libexec" / "raptor-pid1-shim"
-            )
-            full_cmd = unshare_cmd + ["--"] + prlimit_wrapper + [shim_path] + cmd
-        else:
-            full_cmd = cmd
+        logger.debug("Sandbox (%s): %s", "+".join(layers), cmd_display)
 
         # Register this run with the proxy BEFORE the subprocess so every
         # tunnel event generated during the call is fanned into a per-run
@@ -1243,10 +5763,7 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # that happened during THAT subprocess. For a sandbox() block with
         # multiple run() calls, the accumulated view is exposed as
         # `run.events` (see below).
-        proxy_token = (
-            proxy_instance.register_sandbox(caller_label=caller_label)
-            if proxy_instance is not None else None
-        )
+        proxy_token = None
         # Mount-ns path: bypass subprocess+preexec entirely. _spawn
         # handles fork + newuidmap + mount + Landlock + seccomp + pid-ns
         # in the right order (mount ops MUST precede Landlock install on
@@ -1255,26 +5772,129 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # setup fails — adaptive so we still get Landlock-only when
         # mount-ns is unusable.
         used_spawn = False
-        # _spawn doesn't replicate every subprocess.run kwarg through its
-        # manual os.fork() path. The Landlock-only subprocess.run path
-        # handles them natively via Python's posix_spawn logic. Route
-        # callers that use one of these kwargs down the Landlock-only
-        # path rather than silently dropping them:
-        #   - `pass_fds`: inherited FDs into the child
-        #   - `input`: bytes/str piped to child's stdin (needs a writer
-        #     thread to avoid pipe-fill deadlock on large inputs)
-        # (`stdin=<fd>` IS plumbed through _spawn.run_sandboxed, so we
-        # only exclude `input=` here, not plain stdin=.)
-        # Either backend (Linux mount-ns or macOS seatbelt) routes through
-        # the spawn path; the same kwarg-compat gate applies to both
-        # (pass_fds / input= aren't plumbed through either backend's
-        # custom spawn implementation — Linux _spawn does its own
-        # os.fork() chain, macOS _macos_spawn wraps subprocess.run with
-        # sandbox-exec but still uses our preexec for rlimits, where
-        # input= would race against the writer-thread we don't have).
-        spawn_eligible = ((use_mount or use_seatbelt)
-                          and not kwargs.get("pass_fds")
-                          and kwargs.get("input") is None)
+        # Whether the per-call demotion recheck engaged the Landlock
+        # deny-all fallback for THIS call (assigned in the demoted
+        # dispatch arm; hoisted here so the epilogue's
+        # degraded_net_deny stamp can read it on every path).
+        _demoted_net_deny = False
+        # Reason string when the mount-ns spawn path was ATTEMPTED but
+        # fell back (exec failure retry, setup exception). Distinct
+        # from "never eligible": a caller that relied on mount-ns
+        # semantics (map_root pivot_root, per-ns /tmp, binds) can
+        # check result.sandbox_info["mount_ns_degraded"] instead of
+        # scraping stderr warnings.
+        _mount_ns_degraded = None
+        # The original backend failure when the demotion came via the
+        # mid-setup spawn EXCEPTION ladder (the environmental except arm
+        # below) or a synthesised carrier when it came via a status-byte
+        # / achievability rerouting, kept so the fallback lanes' floor
+        # checks can chain their refusal to the real failure. None on
+        # every other demotion route.
+        _spawn_ladder_err: BaseException | None = None
+        # Pre-spawn grant-identity pin state (mount-lane calls only —
+        # captured right before the first spawn dispatch, re-checked
+        # before any retry/demotion lane re-consumes the grants).
+        # _grant_pin_fds holds one O_PATH fd per pinned grant root for
+        # the rest of the call: an open fd keeps the pinned inode
+        # ALLOCATED, so a filesystem that recycles freed inode numbers
+        # (ext4 hands the freed number to the very next create; tmpfs
+        # allocates monotonically) can never mint a replacement that
+        # is stat-identical to the original — the re-check compares
+        # the path's re-stat against fstat() of the HELD descriptor,
+        # kernel truth for the validated object, instead of trusting
+        # two pathname stats to disagree. Closed in the proxy-token
+        # finally below (success, refusal raise, and ladder demotion
+        # all pass through it).
+        _grant_ids_before: "dict[str, tuple] | None" = None
+        _grant_pin_fds: list[int] = []
+        _audit_landlock_engaged = False
+        # Why audit could not engage for this call, for the degrade
+        # marker / audit_required raise at the no-audit bottleneck
+        # below. Set by the pre-flight ineligibility block and by the
+        # runtime failure sites (spawn exception, Landlock-only tracer
+        # exception); None while audit is still expected to engage.
+        _audit_no_engage_reason = None
+        _audit_no_engage_instr = ""
+        # Both native backends preserve audited pass_fds. Linux input=
+        # uses an unlinked, read-only spool mapped onto stdin, including
+        # calls which also pass additional descriptors. The Landlock-only
+        # audit backend also consumes stdin directly rather than input=.
+        if (sys.platform != "darwin"
+                and (use_mount or need_unshare or nonlocal_audit_mode)
+                and kwargs.get("input") is not None):
+            # subprocess.run's own contract, enforced here because the
+            # conversion below would otherwise silently prefer input=.
+            if kwargs.get("stdin") is not None:
+                raise ValueError(
+                    "stdin and input arguments may not both be used.")
+            import tempfile as _tf_mod
+            _in_payload = kwargs.pop("input")
+            if isinstance(_in_payload, str):
+                _enc = kwargs.get("encoding") or "utf-8"
+                if (kwargs.get("encoding") is None
+                        and (kwargs.get("text") or kwargs.get("errors") is not None)):
+                    import locale
+                    _enc = locale.getpreferredencoding(False)
+                _in_payload = _in_payload.encode(_enc, kwargs.get("errors") or "strict")
+            from ._retirement import retire_parent_resources
+            _stdin_spool = _tf_mod.TemporaryFile()
+            _spool_preparation_failed = True
+            try:
+                _stdin_spool.write(_in_payload)
+                _stdin_spool.flush()
+                # Re-open read-only before closing the unlinked writer. The
+                # child receives no capability to grow the host temp file.
+                _stdin_spool_ro = open(
+                    f"/proc/self/fd/{_stdin_spool.fileno()}", "rb")
+                try:
+                    _input_spool_files.callback(_stdin_spool_ro.close)
+                except BaseException:
+                    retire_parent_resources(_stdin_spool_ro.close)
+                    raise
+                _spool_preparation_failed = False
+            finally:
+                if _spool_preparation_failed:
+                    retire_parent_resources(_stdin_spool.close)
+                else:
+                    _stdin_spool.close()
+            # Integrity gate on the description the child will read:
+            # a short or empty spool silently turns a witness-driven
+            # run into "input never arrived" — the target exits clean
+            # and the caller records a wrong verdict instead of an
+            # error. Fail loud here instead.
+            _spool_size = os.fstat(_stdin_spool_ro.fileno()).st_size
+            _spool_expected_bytes = memoryview(_in_payload).nbytes
+            if _spool_size != _spool_expected_bytes:
+                from .errors import SandboxSetupError
+                msg_0 = (
+                    f"sandbox stdin spool integrity check failed: "
+                    f"wrote {_spool_expected_bytes} input= bytes but the "
+                    f"re-opened spool holds {_spool_size} — refusing "
+                    f"to run the target with truncated stdin."
+                )
+                raise SandboxSetupError(
+                    msg_0,
+                    "the tempdir filesystem dropped buffered writes "
+                    "on reopen; check TMPDIR (disk full, exotic "
+                    "filesystem) or pass stdin=<fd> directly.",
+                )
+            kwargs["stdin"] = _stdin_spool_ro
+            # The per-call owner closes this description after synchronous
+            # execution or refusal, independently of traceback/frame lifetime.
+        # need_unshare joins the eligibility predicate: with the
+        # unshare-CLI lane deleted, the fork-based spawn backend is
+        # the ONLY namespace lane, so every namespace-needing shape —
+        # including no-target/output block_network runs and
+        # restrict_reads on mount-incapable hosts — routes through it
+        # (mountlessly when the mount tier isn't in play).
+        spawn_eligible = bool(use_mount or use_seatbelt or need_unshare)
+        if rootfs is not None and not spawn_eligible:
+            from .errors import SandboxSetupError
+            raise SandboxSetupError(
+                "sandbox(rootfs=...).run() cannot engage the mount namespace; "
+                "refusing to run against the host filesystem.",
+                "restore the native mount namespace backend before using rootfs=.",
+            )
         # Track the audit-degraded reason so the audit-mode degraded
         # diagnostic block (further down) can attribute correctly.
         # B fallback and speculative-cache hit are NEW failure paths
@@ -1283,6 +5903,8 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # operators understand WHY audit didn't engage.
         _b_fallback_reason = None
         _b_fallback_instr = None
+        _prefer_mountless_spawn = False
+        _spawn_without_mount = _skip_mount_ns
         # Per-call check that cmd[0] is visible inside the mount-ns
         # bind tree. The bind tree is fixed: standard system dirs,
         # target/output, /tmp (per-sandbox tmpfs), and the union of
@@ -1295,24 +5917,30 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # macOS sandbox-exec doesn't change the filesystem view, so
         # this check + the speculative-C cache it feeds are skipped
         # on Darwin (use_mount is always False there).
-        if spawn_eligible and use_mount and cmd:
+        # Both per-command mountless selections below (B fallback and the
+        # speculative-C cache) reason about the host-mode bind tree;
+        # in rootfs mode cmd[0] resolves inside the IMAGE filesystem
+        # (its /bin/sh, its entrypoint script), so the host visibility
+        # check would demote perfectly valid commands — and demotion
+        # is forbidden for rootfs anyway (gate #2). Skip both.
+        if spawn_eligible and use_mount and cmd and rootfs is None:
             _all_extra = list(effective_read_paths or []) + list(tool_paths or [])
             _resolved = shutil.which(cmd[0]) or cmd[0]
             # B fallback: cmd[0] not in mount-ns bind tree → skip
             # mount-ns directly.
             if not _cmd_visible_in_mount_tree(cmd, target, output, _all_extra):
                 logger.debug(
-                    "Sandbox: Landlock-only for cmd[0]=%r "
+                    "Sandbox: mountless namespace backend for cmd[0]=%r "
                     "(resolved=%r, outside mount-ns bind tree). "
                     "Install under a system dir (/usr/local/bin) "
                     "or pass tool_paths=[<dir>] to engage mount-ns.",
                     cmd[0], _resolved,
                 )
-                spawn_eligible = False
+                _prefer_mountless_spawn = True
                 _b_fallback_reason = (
                     f"cmd[0]={cmd[0]!r} (resolved={_resolved!r}) is "
-                    f"outside the mount-ns bind tree — sandbox used "
-                    f"Landlock-only, tracer cannot attach")
+                    f"outside the mount-ns bind tree; sandbox used the "
+                    f"mountless namespace backend")
                 _b_fallback_instr = (
                     "install the tool under a system dir "
                     "(/usr/local/bin) or pass tool_paths=[<bin_dir>] "
@@ -1323,21 +5951,127 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             # attempt entirely — saves ~100-300ms per call.
             elif _resolved in state._speculative_failure_cache:
                 logger.debug(
-                    "Sandbox: Landlock-only for cmd[0]=%r — known "
+                    "Sandbox: mountless namespace backend for cmd[0]=%r; "
                     "speculative-failure cache hit (mount-ns "
                     "previously failed at exec for this binary)",
                     cmd[0],
                 )
-                spawn_eligible = False
+                _prefer_mountless_spawn = True
                 _b_fallback_reason = (
                     f"cmd[0]={cmd[0]!r} previously failed mount-ns at "
-                    f"exec — cached as known-Landlock-only; tracer "
-                    f"cannot attach for cached binaries")
+                    f"exec; cached for the mountless namespace backend")
                 _b_fallback_instr = (
                     "the binary's native exec deps are outside any "
                     "reasonable mount-ns bind set; audit can't engage "
                     "for this tool. Other tools in the same workflow "
                     "still audit normally.")
+
+        def _mountless_unachievable_reason() -> "str | None":
+            """Why the mountless namespace backend is not ACHIEVABLE
+            for this workload on this host, or None.
+
+            Landlock ABI is a host property identical at every tier —
+            a capability axis, never a tier — so a low ABI does not
+            move a lane in the lattice; it removes the mountless lane
+            from the achievable set for the workloads whose write
+            policy it breaks: without the TRUNCATE access right
+            (ABI 3, kernel 6.2), truncate(2)/open(O_TRUNC) outside the
+            write allowlist cannot be blocked on a host-visible
+            filesystem, so the mountless lane cannot honour an
+            untrusted or read-restricted call's write policy. A
+            demotion that would have retried mountlessly continues
+            down the ladder instead, where the floor comparison
+            decides admission: an unwaived untrusted call is refused
+            (its floor is the mount tier), a waived one proceeds on a
+            lane whose weaker contract the waiver documents (host-path
+            and host-procfs exposure) rather than on a lane with an
+            exposure the waiver never covered. Scoped to the automatic
+            demotion routes only — a caller-declared skip_mount_ns=True
+            lane choice is not second-guessed here.
+            """
+            if ((_untrusted_workload or restrict_reads)
+                    and check_landlock_available()
+                    and _get_landlock_abi() < 3):
+                return ("Landlock ABI is below 3 — truncate operations "
+                        "outside the write allowlist cannot be blocked "
+                        "on a host-visible filesystem")
+            return None
+
+        if _prefer_mountless_spawn:
+            _mountless_abi_block = _mountless_unachievable_reason()
+            if _mountless_abi_block:
+                # The mountless lane is out of the achievable set for
+                # this workload — continue down the demotion ladder
+                # (the fallback dispatch's floor check decides whether
+                # the demoted lane is admitted for this call).
+                _prefer_mountless_spawn = False
+                spawn_eligible = False
+                _why = (_b_fallback_reason
+                        or "command is outside the bind tree")
+                _mount_ns_degraded = (
+                    f"{_why}; mountless namespace backend not "
+                    f"achievable ({_mountless_abi_block})")
+                _spawn_ladder_err = _errors.SandboxSetupError(
+                    _mount_ns_degraded, setup_category="X")
+                if state.warn_once("_mountless_unachievable_warned"):
+                    # Loud like every other demotion route — see the
+                    # M/X reroute's rationale.
+                    logger.warning(
+                        "Sandbox: the mountless namespace backend is "
+                        "not achievable for this call (%s) — "
+                        "continuing down the demotion ladder; the "
+                        "containment floor decides admission, and the "
+                        "demoted lane enforces read/write policy with "
+                        "Landlock alone.",
+                        _mountless_abi_block,
+                    )
+        if _prefer_mountless_spawn:
+            if state.warn_once("_mountless_backend_warned"):
+                logger.warning(
+                    "Sandbox: bind-tree isolation unavailable for %r; using "
+                    "the mountless namespace backend. Host paths remain "
+                    "visible by name; Landlock enforces the requested read "
+                    "and write policy. Later cache hits log at debug level.",
+                    cmd[0],
+                )
+        # Persona fail-closed gate (pre-spawn arm): every route that
+        # abandons the mount-ns spawn path — the B fallback (cmd[0] outside the bind tree), a
+        # speculative-failure-cache hit, or a per-call
+        # skip_mount_ns=True — runs the command WITHOUT the
+        # fingerprint persona (it only rides run_sandboxed's mount-ns
+        # setup). A require_sanitisation caller must get a refusal,
+        # not a silent host-real run. Mirrors rootfs gate #2 above;
+        # the post-spawn M/X arm is gated separately below.
+        if (_persona is not None and require_sanitisation
+                and (not spawn_eligible or _skip_mount_ns
+                     or _prefer_mountless_spawn)):
+            from .errors import SandboxSetupError
+            _reason = (
+                _b_fallback_reason
+                or ("per-call skip_mount_ns=True bypasses the "
+                    "mount-ns backend" if _skip_mount_ns else
+                    "the native spawn backend is unavailable")
+            )
+            msg_0 = (
+                f"sandbox(require_sanitisation=True).run() cannot "
+                f"engage the mount-ns spawn backend for this call "
+                f"({_reason}) — refusing the reduced filesystem path, "
+                f"which cannot apply the fingerprint persona."
+            )
+            raise SandboxSetupError(
+                msg_0,
+                _b_fallback_instr
+                or "restore native mount support or drop skip_mount_ns= for this "
+                   "call, or drop require_sanitisation= to accept "
+                   "host-real identity surfaces on degrade.",
+            )
+        # NOTE: the former fresh-procfs pre-spawn gate lived here. Its
+        # shapes are now covered by the containment-floor contract:
+        # per-call skip_mount_ns= refuses at the entry-time check, the
+        # B-fallback / speculative-cache routes refuse at the mountless
+        # dispatch (with the route's own tool_paths= remedy), and the
+        # other fallback routes refuse before execution, all naming the
+        # override through the same honesty-checked hint.
         # Audit mode (b2/b3) requires the _spawn path because the
         # tracer needs to PTRACE_SEIZE a target the parent forked
         # itself. The Landlock-only fallback uses bare subprocess.run
@@ -1384,12 +6118,17 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                 _b_fallback_reason, _b_fallback_instr,
                 target, output, kwargs,
             )
+            _audit_no_engage_reason = degrade_reason
+            _audit_no_engage_instr = degrade_instr
             if state.warn_once("_audit_warned_no_spawn"):
                 logger.warning(
                     "Sandbox: --audit requested but %s; syscall + "
                     "filesystem audit (b2/b3) silently degrade to "
-                    "enforcement. Network audit (b1, if "
-                    "use_egress_proxy=True) is unaffected. Fix: %s",
+                    "enforcement. Network audit (b1): on the netns "
+                    "tier the fallback child has NO network path (its "
+                    "empty netns has no forwarder), so b1 records "
+                    "nothing for it; on the Landlock-TCP tier b1 is "
+                    "unaffected. Fix: %s",
                     degrade_reason, degrade_instr,
                 )
             # Per-call marker so operators inspecting an output dir can
@@ -1409,8 +6148,14 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
             # neither is set, the call's audit was already demoted
             # silently upstream — no marker needed.
             _marker_dir = audit_run_dir or output
-            if _marker_dir:
+            # Floor guard: a call whose containment floor sits above
+            # every fallback lane is about to REFUSE, not degrade —
+            # writing the audit-degraded marker for a run that never
+            # executes would make marker consumers count phantom
+            # degraded runs.
+            if _marker_dir and _floor <= _tiers.ContainmentTier.NS_NOMOUNT:
                 from pathlib import Path as _Path
+
                 from . import summary as _summary_mod
                 _summary_mod.record_audit_degraded(
                     _Path(_marker_dir),
@@ -1426,6 +6171,22 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # per-sandbox dict would grow unboundedly across a long
         # session with flaky sandboxes.
         try:
+            # Lane-scoped buffer (D3): subscribe to THIS context's
+            # transport so concurrent runs' events segregate. No lane
+            # (bind failure / advisory tier) degrades to the
+            # run-global view — over-capture, never dropped.
+            proxy_token = (
+                proxy_instance.register_sandbox(
+                    caller_label=caller_label,
+                    lane_key=(_proxy_unix_path if _use_proxy_netns
+                              else _proxy_tcp_lane_port),
+                    host_recon_threshold=host_recon_threshold_for_profile(
+                        profile or DEFAULT_PROFILE,
+                        _proxy_mod.DEFAULT_HOST_RECON_THRESHOLD,
+                    ),
+                )
+                if proxy_instance is not None else None
+            )
             if spawn_eligible and use_seatbelt:
                 # macOS sandbox-exec path. No fork/pivot_root chain; no
                 # mount-ns fallback ladder. sandbox-exec wraps a single
@@ -1438,28 +6199,61 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                     (audit_run_dir or output)
                     if nonlocal_audit_mode else None
                 )
-                result = _macos_mod.run_sandboxed(
+                _mac_readable = list(effective_read_paths or [])
+                for _tp in (tool_paths or []):
+                    if _tp and _tp not in _mac_readable:
+                        _mac_readable.append(_tp)
+                # Containment-floor contract, side 2: seatbelt is the
+                # platform's top tier — the check never refuses here,
+                # but every executor routes through the checked
+                # dispatch so the contract stays total.
+                result = _dispatch_floor_check(
+                    "seatbelt spawn",
+                    executor=lambda: _macos_mod.run_sandboxed(
                     cmd,
                     target=target, output=output,
                     block_network=block_network,
                     nproc_limit=nproc_limit,
                     limits=effective_limits,
                     writable_paths=writable_paths or [],
-                    readable_paths=effective_read_paths or [],
+                    readable_paths=_mac_readable,
                     allowed_tcp_ports=list(allowed_tcp_ports)
                         if allowed_tcp_ports else None,
                     # Linux-only kwargs accepted for signature parity
                     # with _spawn.run_sandboxed; ignored by SBPL backend.
-                    seccomp_profile=seccomp_profile,
+                    seccomp_profile=seccomp_profile,  # type: ignore[arg-type]
+                    # profile NAME so seatbelt can layer the
+                    # macos-strict extras (strict and full share
+                    # seccomp_profile="full").
+                    sandbox_profile=(profile if profile is not None
+                                     else DEFAULT_PROFILE),
                     seccomp_block_udp=seccomp_block_udp,
-                    env=kwargs.get("env"),
+                    env=_env_for_target,
                     cwd=kwargs.get("cwd"),
                     timeout=kwargs.get("timeout"),
                     capture_output=kwargs.get("capture_output", False),
                     text=kwargs.get("text", False),
+                    encoding=kwargs.get("encoding"),
+                    errors=kwargs.get("errors"),
                     stdin=kwargs.get("stdin"),
+                    # stdout=/stderr= forwarded like the Linux spawn
+                    # dispatch: pre-fix they were silently dropped
+                    # here, so every non-capturing run_untrusted() on
+                    # macOS handed the child the parent's original
+                    # O_RDWR pty slave on fd 1/2 — the exact keystroke
+                    # channel the write-only tty reopen exists to
+                    # revoke — while the reopened fds sat unused (and
+                    # seatbelt-lane callers lost their redirects).
+                    stdout=kwargs.get("stdout"),
+                    stderr=kwargs.get("stderr"),
+                    # Plumbed natively by the subprocess-backed macOS
+                    # spawn (see the spawn_eligible gate) — these two
+                    # kwargs must never silently cost the seatbelt.
+                    pass_fds=kwargs.get("pass_fds"),
+                    input=kwargs.get("input"),
                     audit_mode=nonlocal_audit_mode,
                     audit_run_dir=_audit_run_dir,
+                    audit_required=audit_required,
                     audit_verbose=audit_verbose_active and nonlocal_audit_mode,
                     observe_mode=observe and nonlocal_audit_mode,
                     observe_nonce=(nonlocal_observe_nonce
@@ -1467,17 +6261,136 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                                    else None),
                     restrict_reads=restrict_reads,
                     use_egress_proxy=use_egress_proxy,
-                    proxy_port=(proxy_instance.port
-                                if proxy_instance is not None else None),
+                    proxy_port=(
+                        (_proxy_tcp_lane_port or proxy_instance.port)
+                        if proxy_instance is not None else None),
                     fake_home=fake_home,
+                    exclude_tmp_baseline=exclude_tmp_baseline,
                     map_root=map_root,
-                    start_new_session=kwargs.get("start_new_session", True),
-                    strict_env=strict_env,
-                )
+                    start_new_session=_start_new_session,
+                    # Keep-trust decision, out-of-band (watcher-shim
+                    # argv): only this dispatch may mint it, keyed on
+                    # the sanctioned kwarg. Pre-fix the seatbelt dispatch never sent
+                    # it, so run_untrusted_networked(
+                    # keep_trust_markers=True) — RAPTOR's own claude -p
+                    # skill-dispatch lane — delivered children on macOS
+                    # that could not pass the libexec trust gates or
+                    # resolve their session binding.
+                    keep_trust_markers=keep_trust_markers_for_dispatch,
+                    # The public wrapper has already filtered the caller's
+                    # environment above, before adding RAPTOR-owned HOME,
+                    # proxy, and scratch overrides.  Reapplying strict_env in
+                    # the backend would remove those trusted overrides (most
+                    # importantly TMPDIR) and send grandchildren back to the
+                    # host /tmp.  Direct backend callers still retain the
+                    # backend's defence-in-depth filtering.
+                    strict_env=False,
+                ))
                 used_spawn = True
+                # Fail-loud parity with the Linux exec-status pipe. The macOS
+                # seatbelt shim reports via result._setup_status:
+                #   None     -> target reached inside the applied profile.
+                #   ("P", m) -> a granted path's identity pin (dev/ino)
+                #               stopped matching mid-run; the watcher shim
+                #               SIGKILLed the sandbox tree. Linux 'P'
+                #               parity: fail loud, never degrade, never
+                #               return the tainted result.
+                #   ("E", m) -> the in-sandbox readiness byte never arrived =>
+                #               sandbox-exec did not apply the profile. There
+                #               is no Landlock layer to degrade to on macOS, so
+                #               the only safe response is to fail loud rather
+                #               than silently run unsandboxed ("0 findings").
+                #   other    -> default-DENY, mirroring the Linux parent's
+                #               unknown-category arm: a category this parent
+                #               does not recognise means a setup/tamper step
+                #               reported something it cannot interpret, and
+                #               falling through as a genuine target result
+                #               is the same default-allow shape that let a
+                #               new demotion lane ship ungated on Linux.
+                _mac_status = getattr(result, "_setup_status", None)
+                if _mac_status is not None and _mac_status[0] == "E":
+                    from .errors import SandboxSetupError
+                    from .probes import SEATBELT_FAIL_INSTRUCTIONS
+                    msg_0 = f"sandbox seatbelt setup failed: {_mac_status[1]}"
+                    _e_exc = SandboxSetupError(
+                        msg_0,
+                        SEATBELT_FAIL_INSTRUCTIONS,
+                        setup_category=_mac_status[0],
+                    )
+                    if _floor > _tiers.ContainmentTier.BARE:
+                        # Delivery-time contract failure on the
+                        # seatbelt lane: floor-class in substance for
+                        # a floored (untrusted-class) call — the
+                        # entry-time seatbelt-absence refusal already
+                        # records, and a readiness failure at
+                        # delivery must not leave less evidence than
+                        # the probe-time one. Record-then-raise, type
+                        # kept (engagement error, as for the Linux
+                        # status bytes); trusted calls (floor BARE)
+                        # keep the plain fail-loud raise with no
+                        # record. There is no policy layer below
+                        # seatbelt on macOS, so achievable is BARE.
+                        _record_floor_refusal(
+                            audit_run_dir or output, _e_exc,
+                            floor_label=_tiers.tier_label(_floor),
+                            achievable_label=_tiers.tier_label(
+                                _tiers.ContainmentTier.BARE),
+                        )
+                    raise _e_exc
+                if _mac_status is not None and _mac_status[0] == "P":
+                    from .errors import SandboxSetupError
+                    msg_0 = (
+                        f"sandbox grant-path pin violated: "
+                        f"{_mac_status[1]}"
+                    )
+                    raise SandboxSetupError(
+                        msg_0,
+                        "a granted target/output/writable path changed "
+                        "identity mid-run (symlink or rename swap) and "
+                        "the sandbox was killed. Re-create the directory "
+                        "and re-run; never point grants at "
+                        "attacker-writable parents.",
+                        setup_category="P",
+                    )
+                if _mac_status is not None:
+                    from .errors import SandboxSetupError
+                    raise SandboxSetupError(
+                        f"sandbox seatbelt backend reported an "
+                        f"unrecognised setup-status category "
+                        f"{_mac_status[0]!r}: {_mac_status[1]}",
+                        "treating an unknown status as a genuine result "
+                        "would be a default-allow on the security "
+                        "boundary. Update RAPTOR so this parent and the "
+                        "seatbelt backend agree on the status "
+                        "vocabulary.",
+                        setup_category=_mac_status[0],
+                    )
             elif spawn_eligible:
+                _spawn_execution_committed = False
+
+                def _mark_spawn_execution_committed():
+                    nonlocal _spawn_execution_committed
+                    _spawn_execution_committed = True
+
                 try:
                     from . import _spawn as _spawn_mod
+                    if rootfs is not None and not _spawn_mod.mount_ns_available():
+                        # Rootfs fail-closed gate #3: use_mount passed at
+                        # context setup but the spawn backend's own probe
+                        # disagrees — the Landlock-only fallback below
+                        # would run against the host filesystem.
+                        from .errors import SandboxSetupError
+                        msg_0 = (
+                            "sandbox(rootfs=...): mount-ns spawn backend "
+                            "unavailable — refusing to run against the "
+                            "host filesystem."
+                        )
+                        raise SandboxSetupError(
+                            msg_0,
+                            "check unprivileged-userns support "
+                            "(kernel.unprivileged_userns_clone, AppArmor "
+                            "userns restrictions) and uidmap tooling.",
+                        )
                     if _spawn_mod.mount_ns_available():
                         # Union readable_paths + tool_paths into the
                         # single readable_paths list _spawn forwards as
@@ -1508,205 +6421,1584 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                             (audit_run_dir or output)
                             if nonlocal_audit_mode else None
                         )
-                        result = _spawn_mod.run_sandboxed(
-                            cmd,
-                            target=target, output=output,
-                            block_network=block_network,
-                            nproc_limit=nproc_limit,
-                            limits=effective_limits,
-                            writable_paths=writable_paths or [],
-                            readable_paths=_readable_with_tools,
-                            allowed_tcp_ports=list(allowed_tcp_ports)
+                        # skip_mount_ns: no bind-tree, host FS visible.
+                        # Landlock enforces the read allowlist directly —
+                        # effective_read_paths already enumerates the same
+                        # system-dirs floor the reduced filesystem path
+                        # uses (/usr, /lib, /etc, /proc, /sys, target,
+                        # tool_paths), so restrict_reads works without a
+                        # mount tree. Pre-fix this branch forced
+                        # restrict_reads=False, which silently stripped
+                        # read protection from skip_mount_ns callers that
+                        # asked for it (frida's wrapper passes both).
+                        # Without restrict_reads there is nothing to
+                        # enforce: pass None so tool_paths alone never
+                        # engages read restriction on a host-visible fs.
+                        _spawn_readable = (
+                            (_readable_with_tools if restrict_reads else None)
+                            if _skip_mount_ns
+                            else _readable_with_tools
+                        )
+                        _spawn_restrict_reads = restrict_reads
+                        # Unix-lane peer gate registration: hand the
+                        # spawn child's pid (root of the sandbox
+                        # process tree, including the proxy forwarder)
+                        # to the proxy so the lane's SO_PEERCRED gate
+                        # admits THIS run's tree and nothing else.
+                        # Deregistered in the finally below.
+                        _lane_peer_pids: list[int] = []
+
+                        def _register_lane_peer(pid: int) -> None:
+                            if _use_proxy_netns and _proxy_unix_path:
+                                if proxy_instance.add_lane_peer_root(  # type: ignore[union-attr]
+                                        _proxy_unix_path, pid):
+                                    _lane_peer_pids.append(pid)
+
+                        def _run_spawn_backend(
+                                *, skip_mount: bool,
+                        ) -> subprocess.CompletedProcess:
+                            nonlocal _spawn_execution_committed
+                            _spawn_execution_committed = False
+                            _call_writable = list(writable_paths or [])
+                            _call_env = _env_for_target
+                            if skip_mount:
+                                _call_writable, _call_env = (
+                                    _mountless_write_policy()
+                                )
+                            # Mount-ns lane: relocate the fake home
+                            # into the per-sandbox private /tmp. The
+                            # intake (`<output>/.home`, pre-populated
+                            # by the caller) is COPIED into the tmpfs
+                            # via the staging seam — never bind-
+                            # mounted (a bind's mountinfo root field
+                            # re-leaks the source path) — and HOME/
+                            # XDG_* re-point at /tmp/.home, so the
+                            # child's home stops naming the run
+                            # directory. Mountless lanes keep the
+                            # `<output>/.home` env staged at
+                            # construction: without a private /tmp,
+                            # "/tmp/.home" would be a host-shared,
+                            # attacker-plantable path. An unstageable
+                            # intake (budget breach or non-regular
+                            # member — see _stage_fake_home_intake)
+                            # also keeps the attributable home, with
+                            # a warning.
+                            _call_stage_files: dict[str, bytes] | None
+                            _call_stage_dirs: list[str] | None
+                            _call_stage_files = _call_stage_dirs = None
+                            if not skip_mount and fake_home_path is not None:
+                                _staged = _stage_fake_home_intake(
+                                    fake_home_path)
+                                if _staged is None:
+                                    from core.security.log_sanitisation import (  # noqa: E501
+                                        escape_nonprintable,
+                                    )
+                                    logger.warning(
+                                        "Sandbox: fake-home intake at "
+                                        "%s could not be staged into "
+                                        "the private /tmp (over "
+                                        "budget, unreadable, or a "
+                                        "non-regular member) — the "
+                                        "child keeps it as HOME.",
+                                        escape_nonprintable(
+                                            fake_home_path))
+                                else:
+                                    (_call_stage_files,
+                                     _call_stage_dirs) = _staged
+                                    _hp = fake_home_path
+                                    _call_env = {
+                                        k: (_TMP_FAKE_HOME
+                                            + v[len(_hp):]
+                                            if isinstance(v, str)
+                                            and (v == _hp
+                                                 or v.startswith(
+                                                     _hp + os.sep))
+                                            else v)
+                                        for k, v in _call_env.items()
+                                    }
+                            _explicit_codec = (kwargs.get("encoding") is not None
+                                               or kwargs.get("errors") is not None)
+                            _native_result = _spawn_mod.run_sandboxed(
+                                cmd,
+                                target=target, output=output,
+                                rootfs=rootfs,
+                                block_network=block_network,
+                                nproc_limit=nproc_limit,
+                                limits=effective_limits,
+                                writable_paths=_call_writable,
+                                readable_paths=_spawn_readable,
+                                allowed_tcp_ports=list(allowed_tcp_ports)
                                 if allowed_tcp_ports else None,
-                            seccomp_profile=seccomp_profile,
-                            seccomp_block_udp=seccomp_block_udp,
-                            env=kwargs.get("env"),
-                            cwd=kwargs.get("cwd"),
-                            timeout=kwargs.get("timeout"),
-                            capture_output=kwargs.get("capture_output", False),
-                            text=kwargs.get("text", False),
-                            stdin=kwargs.get("stdin"),
-                            audit_mode=nonlocal_audit_mode,
-                            audit_run_dir=_audit_run_dir,
-                            audit_verbose=audit_verbose_active and nonlocal_audit_mode,
-                            observe_mode=observe and nonlocal_audit_mode,
-                            observe_nonce=(nonlocal_observe_nonce
+                                seccomp_profile=seccomp_profile,  # type: ignore[arg-type]
+                                seccomp_block_udp=seccomp_block_udp,
+                                env=_call_env,
+                                cwd=kwargs.get("cwd"),
+                                timeout=kwargs.get("timeout"),
+                                capture_output=kwargs.get("capture_output", False),
+                                text=False if _explicit_codec else kwargs.get("text", False),
+                                stdin=kwargs.get("stdin"),
+                                stdout=kwargs.get("stdout"),
+                                stderr=kwargs.get("stderr"),
+                                pass_fds=kwargs.get("pass_fds", ()),
+                                max_capture_bytes=_max_capture_bytes,
+                                job_controller=_job_controller,
+                                _execution_input_owner=(None if _execution_invocation is None
+                                                        else _execution_invocation.inputs),
+                                audit_mode=nonlocal_audit_mode,
+                                audit_run_dir=_audit_run_dir,
+                                audit_required=audit_required,
+                                audit_verbose=audit_verbose_active and nonlocal_audit_mode,
+                                observe_mode=observe and nonlocal_audit_mode,
+                                observe_nonce=(nonlocal_observe_nonce
                                            if observe and nonlocal_audit_mode
                                            else None),
-                            restrict_reads=restrict_reads,
-                            strict_env=strict_env,
-                            persona=_persona,
-                            # Default True here even though subprocess.run
-                            # defaults to False — _spawn's historical
-                            # behaviour was unconditional os.setsid() and
-                            # that's the stronger posture for a mount-ns
-                            # child (no inherited controlling tty, so
-                            # /dev/tty → ENXIO, so no tty-read leak to
-                            # operator keystrokes). Callers who need an
-                            # inherited session (interactive gdb under
-                            # /crash-analysis per run_untrusted's
-                            # docstring) pass start_new_session=False
-                            # explicitly and that is honoured.
-                            start_new_session=kwargs.get("start_new_session", True),
-                        )
-                        used_spawn = True
-                        # Speculative-C retry: if tool_paths was supplied
-                        # and the call exited 126/127 with empty stderr,
-                        # the bind set was almost certainly insufficient
-                        # (typical Python tool: bin dir bound but stdlib
-                        # at sys.prefix/lib/pythonX.Y was not — Python
-                        # dies at `import encodings` before its stderr
-                        # handler initialises). 126/127 with NON-empty
-                        # stderr is a normal tool failure (semgrep
-                        # arg-parse error, etc.) — leave alone. Empty
-                        # stderr is the give-away that the process
-                        # never reached its error path.
-                        #
-                        # On detection: re-run via the Landlock-only
-                        # subprocess path (works without mount-ns
-                        # bind-tree visibility). This makes the
-                        # tool_paths contract speculative — caller
-                        # passes a best-guess bind set, we try it, if
-                        # it doesn't work we degrade silently to B's
-                        # fallback. Worst-case isolation matches the
-                        # B-only outcome.
-                        _stderr_text = result.stderr or b""
-                        if isinstance(_stderr_text, bytes):
-                            _stderr_text = _stderr_text.decode(
-                                "utf-8", errors="replace")
-                        # Strip ``RAPTOR:``-prefixed lines before the
-                        # emptiness test. Those are deliberate
-                        # post-fork diagnostics from the sandbox itself
-                        # (see core/sandbox/_fork_safe_warn.py) — e.g.
-                        # the benign ``mount_ns: target remount-ro
-                        # failed; relying on Landlock`` warning, which
-                        # fires on most Linux hosts and would
-                        # otherwise defeat this gate. The convention
-                        # is documented; no tool legitimately emits
-                        # the prefix, and an attacker who could spoof
-                        # it would only re-trigger this same fallback
-                        # — they can already do that today by exiting
-                        # 126 with empty stderr.
-                        _stderr_text = "\n".join(
-                            ln for ln in _stderr_text.splitlines()
-                            if not ln.lstrip().startswith("RAPTOR:")
-                        )
-                        if (tool_paths
-                                and result.returncode in (126, 127)
-                                and not _stderr_text.strip()):
-                            # Populate the per-cmd cache so future
-                            # calls for the same binary skip mount-ns
-                            # directly (saves the doubled subprocess
-                            # setup cost for every Semgrep rule etc).
-                            # First-time-per-binary fires INFO so
-                            # operators see what's happening; cache-
-                            # hits on subsequent calls are silent.
-                            #
-                            # Lock around the populate so two
-                            # concurrent first-failures for the same
-                            # binary don't double-log. Lock scope is
-                            # tight (dict insert + log-once decision)
-                            # — held for microseconds.
-                            _resolved_cmd0 = (shutil.which(cmd[0])
-                                              or cmd[0])
-                            with state._cache_lock:
-                                _first_seen = (
-                                    _resolved_cmd0
-                                    not in state._speculative_failure_cache
+                                restrict_reads=_spawn_restrict_reads,
+                                # _env_for_target/run_env is already filtered
+                                # by this wrapper.  It also contains trusted
+                                # sandbox-generated overrides such as the
+                                # private mountless TMPDIR; do not strip those
+                                # a second time in the lower backend.
+                                strict_env=False,
+                                persona=_persona,
+                                etc_overlay=etc_overlay,
+                                stage_files=_call_stage_files,
+                                stage_dirs=_call_stage_dirs,
+                                # Default True here even though subprocess.run
+                                # defaults to False — _spawn's historical
+                                # behaviour was unconditional os.setsid() and
+                                # that's the stronger posture for a mount-ns
+                                # child (no inherited controlling tty, so
+                                # /dev/tty → ENXIO, so no tty-read leak to
+                                # operator keystrokes). Callers who need an
+                                # inherited session (interactive gdb under
+                                # /crash-analysis per run_untrusted's
+                                # docstring) pass start_new_session=False
+                                # explicitly and that is honoured.
+                                start_new_session=_start_new_session,
+                                restore_signals=kwargs.get("restore_signals", True),
+                                inherit_netns=_inherit_netns,
+                                skip_pid_ns=_skip_pid_ns,
+                                skip_mount_ns=skip_mount,
+                                # The ported ns-only mode hard-requires
+                                # the fresh procfs mount ('F' fail-
+                                # closed) whenever its declared tier
+                                # claims it — the caller's contract
+                                # flag stays authoritative everywhere
+                                # else.
+                                require_fresh_procfs=(
+                                    _require_fresh_procfs
+                                    or (skip_mount and _ported_hard_fresh)),
+                                # Floor-resolved, never caller-chosen:
+                                # Landlock ABSENCE is tolerated only
+                                # when the resolved floor admits the
+                                # ns-only tier (see _landlock_tolerated).
+                                landlock_required=not _landlock_tolerated,
+                                proxy_unix_socket=_proxy_unix_path if _use_proxy_netns else None,
+                                proxy_forwarder_port=_proxy_forwarder_port if _use_proxy_netns else None,
+                                extra_unix_bridges=(
+                                    sorted(loopback_unix_bridges.items())
+                                    if (loopback_unix_bridges
+                                        and _use_proxy_netns)
+                                    else None
+                                ),
+                                exec_pid_callback=_exec_pid_callback,
+                                child_pid_callback=_register_lane_peer,
+                                execution_committed_callback=_mark_spawn_execution_committed,
+                            )
+                            if _execution_invocation is not None:
+                                try:
+                                    _execution_invocation.record_native_result(_native_result)
+                                except Exception:
+                                    _execution_invocation.unavailable()
+                                    with suppress(Exception):
+                                        delattr(_native_result, "_execution_input_handoff")
+                            if getattr(_native_result, "_setup_status", None) is not None:
+                                # A returned failure status keeps the existing
+                                # typed setup decision table authoritative.
+                                _spawn_execution_committed = False
+                            # Setup diagnostics must reach the decision table
+                            # before applying the target's requested codec.
+                            if (_explicit_codec
+                                    and getattr(_native_result, "_setup_status", None) is None):
+                                # Explicit codecs imply text mode in subprocess.
+                                # Keep raw bytes until the selected decoder runs;
+                                # the backend's legacy UTF-8 replacement would
+                                # otherwise lose bytes before errors= sees them.
+                                import locale
+                                _codec = kwargs.get("encoding") or locale.getpreferredencoding(False)
+                                _errors = kwargs.get("errors") or "strict"
+                                decode_captured_result(_native_result, _codec, _errors)
+                            return _native_result
+
+                        def _capture_grant_identities() -> dict[str, tuple]:
+                            """Snapshot every grant root's identity with
+                            a HELD O_PATH fd (appended to
+                            ``_grant_pin_fds``; released in the
+                            proxy-token finally).
+
+                            The fd does two jobs. It anchors the
+                            re-check: the path's later re-stat must
+                            match ``fstat()`` of this descriptor —
+                            kernel truth for the validated object, not
+                            a comparison of two forgeable pathname
+                            stats. And holding it keeps the pinned
+                            inode allocated, so inode-number recycling
+                            cannot make an unlink+recreate swap
+                            stat-identical to the original: a plain
+                            (st_dev, st_ino) snapshot was blind to
+                            exactly that swap on ext4, where the freed
+                            inode number goes to the very next create.
+
+                            A grant root that cannot be pinned (absent
+                            optional readable, vanished dir, or a
+                            symlink planted inside the realpath→walk
+                            window — ``open_pinned`` refuses mid-walk
+                            symlinks) records an explicit
+                            ``("unpinnable",)`` sentinel: still-absent
+                            at re-check time is clean (same as the old
+                            skip), while a path that BECOMES resolvable
+                            mid-call is a violation.
+                            """
+                            from . import _pathpin as _pathpin_mod
+                            identities: dict[str, tuple] = {}
+                            grant_paths = [
+                                target, output,
+                                *(writable_paths or []),
+                                *(_spawn_readable or []),
+                            ]
+                            for grant_path in grant_paths:
+                                if not grant_path:
+                                    continue
+                                absolute = os.path.abspath(grant_path)
+                                if absolute in identities:
+                                    continue
+                                try:
+                                    resolved = os.path.realpath(absolute)
+                                    pin_fd = _pathpin_mod.open_pinned(
+                                        resolved)
+                                except (OSError, ValueError):
+                                    identities[absolute] = ("unpinnable",)
+                                    continue
+                                _grant_pin_fds.append(pin_fd)
+                                pin_st = os.fstat(pin_fd)
+                                identities[absolute] = (
+                                    resolved, pin_st.st_dev,
+                                    pin_st.st_ino, pin_fd,
                                 )
-                                if _first_seen:
-                                    state._speculative_failure_cache[
-                                        _resolved_cmd0] = True
-                            if _first_seen:
-                                # ONE-TIME INFO per binary — concise.
-                                # The "why" detail (mount-ns failed
-                                # at exec, native-deps mismatch, etc.)
-                                # belongs in DEBUG, not in operator
-                                # output. Operator just needs to
-                                # know which binary and what isolation.
-                                logger.info(
-                                    "Sandbox: %r runs at Landlock-only "
-                                    "isolation.",
-                                    cmd[0],
-                                )
-                                # Companion DEBUG with the diagnostic
-                                # detail for operators investigating.
-                                logger.debug(
-                                    "Sandbox: %r mount-ns failed at "
-                                    "exec (rc=%d, no stderr — typical "
-                                    "of tools whose native deps live "
-                                    "outside the tool_paths bind set: "
-                                    "Python with sys.prefix/lib not "
-                                    "bound, semgrep with semgrep-core "
-                                    "outside install root, etc.). "
-                                    "Cached so subsequent calls to "
-                                    "this binary skip mount-ns "
-                                    "directly.",
-                                    cmd[0], result.returncode,
-                                )
+                            return identities
+
+                        def _grant_pin_mismatch_reason(
+                                pins: dict[str, tuple]) -> "str | None":
+                            """First grant root whose pinned identity no
+                            longer holds, as a reason string; None while
+                            every pin holds.
+
+                            Every arm is fail-closed for an
+                            attacker-observable swap: a vanished or
+                            unresolvable path, a changed realpath, a
+                            re-stat that differs from the HELD fd's
+                            fstat, a pinned inode whose link count
+                            dropped to zero (the unlink+recreate
+                            signature — refused even if a hostile
+                            filesystem reports the pinned numbers for
+                            the replacement path), and a
+                            previously-unpinnable path that now
+                            resolves.
+                            """
+                            for absolute, pin in pins.items():
+                                if pin[0] == "unpinnable":
+                                    try:
+                                        os.stat(os.path.realpath(absolute))
+                                    except OSError:
+                                        continue
+                                    return (
+                                        f"{absolute} was not resolvable "
+                                        f"at validation but resolves now")
+                                resolved, _dev, _ino, pin_fd = pin
+                                try:
+                                    resolved_now = os.path.realpath(
+                                        absolute)
+                                    st_now = os.stat(resolved_now)
+                                except OSError:
+                                    return f"{absolute} no longer resolves"
+                                if resolved_now != resolved:
+                                    return (
+                                        f"{absolute} re-resolves to "
+                                        f"{resolved_now!r} (validated "
+                                        f"{resolved!r})")
+                                st_fd = os.fstat(pin_fd)
+                                if ((st_now.st_dev, st_now.st_ino)
+                                        != (st_fd.st_dev, st_fd.st_ino)):
+                                    return (
+                                        f"{absolute} changed identity "
+                                        f"(dev/ino {st_now.st_dev}/"
+                                        f"{st_now.st_ino} != pinned "
+                                        f"{st_fd.st_dev}/{st_fd.st_ino})")
+                                if st_fd.st_nlink == 0:
+                                    return (
+                                        f"{absolute}: the validation-time "
+                                        f"inode was unlinked "
+                                        f"(recreate-in-place swap)")
+                            return None
+
+                        _spawn_without_mount = (
+                            _skip_mount_ns or _prefer_mountless_spawn
+                            or not use_mount)
+                        if (_prefer_mountless_spawn
+                                and _b_fallback_reason):
+                            _mount_ns_degraded = _b_fallback_reason
+                        # Containment-floor contract, side 2: the
+                        # spawn dispatch routes through the checked
+                        # chokepoint with its lane's declared tier.
+                        # The mountless lane is below the unwaived
+                        # untrusted floor — the B-fallback /
+                        # speculative-cache / per-call skip_mount_ns
+                        # routes refuse here with the route's own
+                        # remedy. Per-call caps (_spawn_tier_cap):
+                        # skip_pid_ns keeps the HOST procfs on both
+                        # spawn lanes, and the Landlock-absent
+                        # tolerance bounds a mountless spawn at the
+                        # ported ns-only tier.
+                        if _spawn_without_mount:
+                            if (_b_fallback_reason
+                                    and "previously failed mount-ns"
+                                    in _b_fallback_reason):
+                                # The speculative-cache route needs its
+                                # own remedy — the shared audit-oriented
+                                # text talks about tracer attachment,
+                                # which is not what this refusal is
+                                # about.
+                                _mountless_fix = (
+                                    "the binary previously failed to "
+                                    "exec inside the mount-ns view; "
+                                    "extend tool_paths=/readable_paths= "
+                                    "to cover its runtime dependencies "
+                                    "so the mount-ns lane can serve it.")
                             else:
-                                logger.debug(
-                                    "Sandbox: speculative-C cache "
-                                    "hit on cmd[0]=%r (rc=%d) — "
-                                    "Landlock-only fallback.",
-                                    cmd[0], result.returncode,
+                                _mountless_fix = _b_fallback_instr or ""
+                            _spawn_lane = "mountless namespace backend"
+                            if not use_mount:
+                                _no_mount_why = (
+                                    "no target/output engages the "
+                                    "mount tier for this call"
+                                    if not (target or output or rootfs)
+                                    else "the mount-namespace "
+                                         "capability is unavailable "
+                                         "on this host")
+                            else:
+                                _no_mount_why = ("per-call "
+                                                 "skip_mount_ns=True "
+                                                 "bypasses the "
+                                                 "mount-ns backend")
+                            _spawn_lane_kwargs: dict = {
+                                "detail": (_b_fallback_reason
+                                           or _no_mount_why),
+                                "remedy": _floor_remedy(_mountless_fix),
+                                "setup_category": (
+                                    "X" if _prefer_mountless_spawn
+                                    else None),
+                            }
+                        else:
+                            _spawn_lane = "mount-ns spawn"
+                            _spawn_lane_kwargs = {}
+                        _grant_ids_before = (
+                            _capture_grant_identities()
+                            if not _spawn_without_mount else None
+                        )
+                        try:
+                            result = _dispatch_floor_check(
+                                _spawn_lane,
+                                executor=lambda: _run_spawn_backend(
+                                    skip_mount=_spawn_without_mount,
+                                ),
+                                cap=_spawn_tier_cap(_spawn_without_mount),
+                                **_spawn_lane_kwargs,
+                            )
+                        finally:
+                            for _pp in _lane_peer_pids:
+                                proxy_instance.discard_lane_peer_root(  # type: ignore[union-attr]
+                                    _proxy_unix_path, _pp)  # type: ignore[arg-type]
+                        used_spawn = True
+                        # Authoritative setup-failure signal from the exec-
+                        # status pipe (core/sandbox/_spawn.py) — unspoofable
+                        # by the target, unambiguous vs exit codes/stderr:
+                        #   None  → the target execed; result is genuine.
+                        #   L/S/U → Landlock/seccomp/namespace-unshare failed
+                        #           to APPLY though its probe passed → a real
+                        #           "can't engage" → fail loud.
+                        #   P     → a bind source stopped resolving to its
+                        #           validation-time inode (tamper signal from
+                        #           the pinned mount setup) → fail loud; the
+                        #           M-degrade below would re-run without the
+                        #           bind tree, where the planted
+                        #           symlink resolves on the host filesystem
+                        #           and the refused steering would succeed.
+                        #   M/X   → mount-ns setup, or exec inside the
+                        #           sandbox, failed → retry with namespaces
+                        #           intact but without the bind tree.
+                        _setup_status = getattr(result, "_setup_status", None)
+                        # NPROC-pressure EAGAIN rescue: a spawn child
+                        # forks its setup chain (proxy forwarder,
+                        # pid-ns init split) under the PARENT's
+                        # inherited RLIMIT_NPROC, and on a loaded host
+                        # the same-uid task count races any finite
+                        # clamp on this process tree — the child dies
+                        # EAGAIN mid-setup and the failure reads like
+                        # a bind-tree / namespace capability loss.
+                        # When the failure is EAGAIN-shaped AND our
+                        # own measurement corroborates live pressure
+                        # (both gates — see the decision helper; the
+                        # shape alone is target-influenceable), retry
+                        # the SAME lane once. The spawn lanes don't
+                        # consume _host_nproc_cap (their children fork
+                        # under the parent's inherited limit), and the
+                        # no-namespace lanes re-derive their clamp at
+                        # dispatch time (_consumption_nproc_cap) — so
+                        # the retry deliberately persists NO snapshot:
+                        # a sample taken here would be load-peak-
+                        # biased for the rest of the context's life.
+                        # One retry per
+                        # run() CALL (not per context — repeated calls
+                        # under sustained pressure each get one, so
+                        # amplification is bounded at two spawn
+                        # attempts per operator-initiated call). The
+                        # bound is structural: this block is straight-
+                        # line code with no enclosing loop, and the
+                        # sequence pin test (mount-ns, retry, mountless
+                        # — exactly three dispatches) is the tripwire
+                        # against a loop refactor; the decision helper
+                        # additionally refuses any caller that reports
+                        # already_retried=True, because retry storms
+                        # under an exhausted per-uid ceiling amplify
+                        # the very pressure they respond to. Placed
+                        # BEFORE the category arms so a retry that
+                        # fails differently (P tamper, L/S layer
+                        # apply) still gets that category's
+                        # fail-closed handling on the adopted result.
+                        _nproc_pressure_cause = _nproc_eagain_retry_decision(
+                            _setup_status,
+                            already_retried=False,  # first attempt of
+                            # this call — the straight-line block never
+                            # re-consults the decision.
+                        )
+                        if _nproc_pressure_cause is not None:
+                            logger.info(
+                                "Sandbox: spawn child failed EAGAIN under "
+                                "per-uid process-count pressure (%s) — "
+                                "retrying the same lane once.",
+                                _nproc_pressure_cause,
+                            )
+                            try:
+                                result = _dispatch_floor_check(
+                                    _spawn_lane,
+                                    executor=lambda: _run_spawn_backend(
+                                        skip_mount=_spawn_without_mount,
+                                    ),
+                                    cap=_spawn_tier_cap(_spawn_without_mount),
+                                    **_spawn_lane_kwargs,
                                 )
-                            # Audit-mode signal lost: the retry routes
-                            # through subprocess+preexec which has no
-                            # tracer attachment. Write the marker so
-                            # operators see explicitly that audit
-                            # didn't fully engage for this call —
-                            # absent records would otherwise be
-                            # misread as "nothing to audit". Marker
-                            # location: audit_run_dir takes precedence
-                            # (canonical "where audit signal lands"),
-                            # fall back to output. Codeql analyze etc.
-                            # pass audit_run_dir without output — the
-                            # marker still fires there.
-                            _retry_marker_dir = audit_run_dir or output
-                            if nonlocal_audit_mode and _retry_marker_dir:
-                                from pathlib import Path as _Path
-                                from . import summary as _summary_mod
-                                _summary_mod.record_audit_degraded(
-                                    _Path(_retry_marker_dir),
-                                    reason=(
-                                        f"cmd[0]={cmd[0]!r} mount-ns "
-                                        f"failed at exec (rc="
-                                        f"{result.returncode}, no "
-                                        f"stderr) — speculative-C "
-                                        f"retry routed via Landlock-"
-                                        f"only; tracer didn't attach"),
-                                    instructions=(
-                                        "the binary's deps are outside "
-                                        "the tool_paths bind set; "
-                                        "audit can't engage. Other "
-                                        "tools in the workflow still "
-                                        "audit normally."),
+                            finally:
+                                # Peers register only when the proxy
+                                # lane exists (_register_lane_peer
+                                # gates on it): the truthiness guard
+                                # narrows the Optionals under that
+                                # invariant for the type-checker.
+                                if (_lane_peer_pids and proxy_instance
+                                        and _proxy_unix_path):
+                                    for _pp in _lane_peer_pids:
+                                        proxy_instance.discard_lane_peer_root(
+                                            _proxy_unix_path, _pp)
+                            _setup_status = getattr(
+                                result, "_setup_status", None)
+                            if _setup_status is None:
+                                # Rescued: the target execed on the
+                                # promised lane — no degrade, no
+                                # misattributed capability warning.
+                                logger.info(
+                                    "Sandbox: fresh-clamp retry succeeded "
+                                    "— the earlier failure was transient "
+                                    "NPROC pressure, not a capability or "
+                                    "policy refusal.")
+                                _nproc_pressure_cause = None
+                            elif not _nproc_eagain_shaped(_setup_status[1]):
+                                # The retry failed for a DIFFERENT
+                                # reason: the adopted terminal status
+                                # is not EAGAIN-shaped, so the FIRST
+                                # attempt's pressure verdict no longer
+                                # describes the failure the category
+                                # arms below are about to handle.
+                                # Clear it, or a genuine capability /
+                                # policy refusal surfacing only on the
+                                # retry would be reported as "NOT a
+                                # kernel capability or policy refusal"
+                                # (self-contradictory on L/S/U) and
+                                # would escape speculative-cache
+                                # memoisation on M/X.
+                                _nproc_pressure_cause = None
+                        if _setup_status is not None and _setup_status[0] == "P":
+                            from .errors import SandboxSetupError
+                            msg_0 = (
+                                f"sandbox bind-source pin violation: "
+                                f"{_setup_status[1]}"
+                            )
+                            raise SandboxSetupError(
+                                msg_0,
+                                "a target/output/readable bind source was "
+                                "replaced after this call validated it — "
+                                "treat this as concurrent tampering with "
+                                "the run's paths, not an environment "
+                                "problem. Stop whatever is rewriting the "
+                                "path (a sibling run sharing the output "
+                                "tree, or hostile code with write access "
+                                "to an ancestor directory) and re-run.",
+                                setup_category=_setup_status[0],
+                            )
+                        if _setup_status is not None and _setup_status[0] == "F":
+                            from .errors import SandboxSetupError
+                            msg_0 = (
+                                f"sandbox fresh-procfs mount failed for an "
+                                f"untrusted run: {_setup_status[1]}"
+                            )
+                            _f_exc = SandboxSetupError(
+                                msg_0,
+                                "the sandbox could not replace the host-pid "
+                                "procfs bind with a pid-namespace-local "
+                                "/proc, and untrusted targets are refused "
+                                "host-procfs visibility (it exposes the "
+                                "spawn chain's pre-strip environment). "
+                                "This mount is expected to succeed on any "
+                                "user-namespace-capable kernel — treat a "
+                                "persistent failure as an environment bug "
+                                "worth reporting. "
+                                + _fresh_procfs_override_hint(
+                                    literal_contract=(_rfp_kwarg is True)),
+                                setup_category=_setup_status[0],
+                            )
+                            if _floor > _tiers.ContainmentTier.BARE:
+                                # Delivery-time contract failure:
+                                # floor-class in substance (the target
+                                # never executed because the required
+                                # containment could not be delivered),
+                                # so it records like the entry-time
+                                # refusals. Record-then-raise, type
+                                # kept: the child-side status-byte
+                                # raises stay engagement errors by
+                                # design (child-side truth the floor
+                                # assertion cannot replace). The
+                                # delivered posture kept the policy
+                                # layers but exposed the host procfs
+                                # — below the ns-only tier's promise,
+                                # so the honest achievable label is
+                                # the policy-layer tier (probed: a
+                                # Landlock-less kernel understates
+                                # to none rather than overstate).
+                                _record_floor_refusal(
+                                    audit_run_dir or output, _f_exc,
+                                    floor_label=_tiers.tier_label(_floor),
+                                    achievable_label=_tiers.tier_label(
+                                        _tiers.ContainmentTier
+                                        .LANDLOCK_ONLY
+                                        if check_landlock_available()
+                                        else _tiers.ContainmentTier
+                                        .BARE),
                                 )
-                            used_spawn = False
-                            # Fall through to subprocess path below.
-                except (FileNotFoundError, RuntimeError, OSError) as _spawn_err:
+                            raise _f_exc
+                        if _setup_status is not None and _setup_status[0] == "C":
+                            # Fail-closed child setup abort: the spawn
+                            # child refused to continue (unusable
+                            # caller cwd= inside the pivoted root, a
+                            # caller-named readable path that failed
+                            # its read-only bind, a mandatory
+                            # hardening rlimit that could not apply)
+                            # and reported it on the exec-status pipe.
+                            # Pre-fix these sites os._exit'd with NO
+                            # status byte, so the parent read
+                            # EOF-no-byte as "the target execed" and
+                            # returned the aborted setup as a genuine
+                            # CompletedProcess whose rc (126/127)
+                            # collided with the shell not-found/not-
+                            # executable conventions — downstream
+                            # returncode oracles were fed fabricated
+                            # target results.
+                            from .errors import SandboxSetupError
+                            msg_0 = (
+                                f"sandbox child setup aborted "
+                                f"fail-closed: {_setup_status[1]}"
+                            )
+                            raise SandboxSetupError(
+                                msg_0,
+                                "the target never executed. Fix the "
+                                "named caller input (cwd=, "
+                                "readable_paths=) or host condition "
+                                "and retry — this category is "
+                                "fail-closed by contract and has no "
+                                "degrade path.",
+                                setup_category=_setup_status[0],
+                            )
+                        if _setup_status is not None and _setup_status[0] == "!":
+                            # Missing confirmation or a damaged status channel
+                            # cannot establish a genuine target result. Keep
+                            # the typed refusal without promising pre-exec death:
+                            # a read error can also follow a released target.
+                            from .errors import SandboxSetupError
+                            msg_0 = (
+                                f"sandbox target execution could not be confirmed "
+                                f"(rc={result.returncode}): "
+                                f"{_setup_status[1]}"
+                            )
+                            raise SandboxSetupError(
+                                msg_0,
+                                "do not assume the target never ran or that "
+                                "the returncode is a genuine target result. "
+                                "Check the status-channel error, OOM kills "
+                                "(dmesg), and external process sweepers before "
+                                "deciding whether retrying is safe.",
+                                setup_category=_setup_status[0],
+                            )
+                        if _setup_status is not None and _setup_status[0] in ("L", "S", "U"):
+                            from .errors import SandboxSetupError
+                            from .probes import (
+                                ENGAGE_FAIL_INSTRUCTIONS,
+                                LAYER_FAIL_INSTRUCTIONS,
+                            )
+                            _layer = {"L": "Landlock", "S": "seccomp",
+                                      "U": "namespace unshare"}.get(
+                                          _setup_status[0], _setup_status[0])
+                            # Namespace (U) failures need the same remedy as the
+                            # engagement gate — network-only also needs the
+                            # namespace, so only `none` avoids it. Landlock/
+                            # seccomp (L/S) ARE dropped by network-only, so it
+                            # is a real downgrade for those.
+                            _instr = (ENGAGE_FAIL_INSTRUCTIONS
+                                      if _setup_status[0] == "U"
+                                      else LAYER_FAIL_INSTRUCTIONS)
+                            msg_0 = (
+                                f"sandbox {_layer} setup failed in the spawn "
+                                f"child: {_setup_status[1]}"
+                            )
+                            if _nproc_pressure_cause is not None:
+                                # The EAGAIN rescue above already
+                                # retried once and the child still
+                                # died at this stage under measured
+                                # pressure — name the actual cause so
+                                # the operator chases host load, not a
+                                # kernel/LSM capability that is fine.
+                                msg_0 += (
+                                    f" — cause: per-uid process-count "
+                                    f"pressure against RLIMIT_NPROC "
+                                    f"({_nproc_pressure_cause}), not a "
+                                    f"kernel capability or policy "
+                                    f"refusal; one fresh-clamp retry "
+                                    f"also failed."
+                                )
+                            _lsu_exc = SandboxSetupError(
+                                msg_0,
+                                _instr,
+                                setup_category=_setup_status[0],
+                            )
+                            if _setup_status[0] == "U":
+                                # The status-byte shape of the
+                                # ladder's category-'U' contract: the
+                                # spawn child died at its unshare
+                                # stage after reporting on the
+                                # exec-status pipe. The EXCEPTION
+                                # shape of the same failure leaves
+                                # used_spawn False by construction
+                                # (the raise happens before the
+                                # assignment); the status shape must
+                                # reset it explicitly, or the
+                                # ladder's catch falls through with
+                                # the SETUP CHILD's CompletedProcess
+                                # as the target's result — fabricated
+                                # rc, no fallback run, and a floored
+                                # call bypassing the fallback
+                                # dispatch's floor refusal (which is
+                                # also where the refusal records,
+                                # with this exception chained as its
+                                # cause — no record here, or the one
+                                # refusal would count twice).
+                                used_spawn = False
+                            elif _floor > _tiers.ContainmentTier.BARE:
+                                # Terminal delivery-time layer-apply
+                                # failure ('L'/'S') on a floored
+                                # call: floor-class in substance (a
+                                # tier-contract layer could not be
+                                # delivered; the target never
+                                # executed) — same record-then-raise
+                                # as the F/E bytes, type kept.
+                                # Achievable follows the failed
+                                # layer, understating: 'S' voids
+                                # every tier's contract (the filter
+                                # is in all of them); 'L' leaves the
+                                # namespace tier's own promise when
+                                # the filter is deliverable, else
+                                # none.
+                                if _setup_status[0] == "S":
+                                    _lsu_ach = _tiers.ContainmentTier.BARE
+                                else:  # 'L'
+                                    _lsu_ach = (
+                                        _tiers.ContainmentTier.NS_NOMOUNT
+                                        if (seccomp_profile
+                                            and check_seccomp_available())
+                                        else _tiers.ContainmentTier.BARE)
+                                _record_floor_refusal(
+                                    audit_run_dir or output, _lsu_exc,
+                                    floor_label=_tiers.tier_label(_floor),
+                                    achievable_label=_tiers.tier_label(
+                                        _lsu_ach),
+                                )
+                            raise _lsu_exc
+                        # Retry without the bind tree on a mount-ns ('M') or
+                        # in-sandbox exec ('X') failure reported by the exec-
+                        # status pipe. 'X' is the common tool_paths case: the
+                        # bind set was insufficient (typical Python tool: bin
+                        # dir bound but stdlib at sys.prefix/lib was not), so
+                        # the target couldn't exec inside the mount-ns view.
+                        # Re-run through the namespace backend without
+                        # mount-ns bind-tree visibility. The
+                        # signal is authoritative and unspoofable (a tool can
+                        # no longer defeat OR forge this via stderr; the old
+                        # rc==126/127 + empty-stderr heuristic could be both).
+                        if _setup_status is not None and _setup_status[0] in ("M", "X"):
+                            # Rootfs fail-closed gate #4: an M/X status
+                            # for a rootfs run means the image pivot or
+                            # the exec inside the image failed. The
+                            # mountless retry below would re-run the
+                            # command against the HOST filesystem —
+                            # forbidden. Raise with the child's detail;
+                            # 'X' usually means cmd[0] doesn't exist in
+                            # the image (wrong entrypoint path) or its
+                            # interpreter/loader is missing there.
+                            if rootfs is not None:
+                                from .errors import SandboxSetupError
+                                msg_0 = (
+                                    f"sandbox(rootfs=...): mount-ns "
+                                    f"setup or exec inside the image "
+                                    f"rootfs failed: {_setup_status[1]} "
+                                    f"— refusing the mountless "
+                                    f"host-filesystem retry."
+                                )
+                                raise SandboxSetupError(
+                                    msg_0,
+                                    "verify the rootfs is a complete "
+                                    "unpacked image (loader + libs "
+                                    "present) and cmd[0] names a path "
+                                    "that exists INSIDE the image.",
+                                    setup_category=_setup_status[0],
+                                )
+                            # Persona fail-closed gate: the mountless
+                            # retry below runs WITHOUT the bind tree,
+                            # so the fingerprint persona (bind-mounts
+                            # + UTS) silently does not apply — the
+                            # exact half-state require_sanitisation
+                            # forbids. This is also where a strict
+                            # apply_overlay per-target failure lands
+                            # ('M' status from the spawn child).
+                            if _persona is not None and require_sanitisation:
+                                from .errors import SandboxSetupError
+                                msg_0 = (
+                                    f"sandbox(require_sanitisation="
+                                    f"True): mount-ns setup or exec "
+                                    f"failed ({_setup_status[0]}: "
+                                    f"{_setup_status[1]}) — refusing "
+                                    f"the mountless fallback, "
+                                    f"which cannot apply the "
+                                    f"fingerprint persona."
+                                )
+                                raise SandboxSetupError(
+                                    msg_0,
+                                    "fix the mount-ns failure (see "
+                                    "the child diagnostic above) or "
+                                    "drop require_sanitisation= to "
+                                    "accept host-real identity "
+                                    "surfaces on degrade.",
+                                    setup_category=_setup_status[0],
+                                )
+                            # Keep the namespace backend and retry without
+                            # the bind tree. This still enters a PID namespace,
+                            # mounts a fresh /proc, applies Landlock + seccomp,
+                            # and retains the isolated network/proxy lane. It
+                            # avoids the host-pid /proc exposure of the legacy
+                            # subprocess fallback on kernels/filesystems that
+                            # reject one of the bind mounts with EINVAL.
+                            _failed_setup_status = _setup_status
+                            # Synthesised carrier for the child's M/X
+                            # diagnostic (the status byte is in-band,
+                            # not an exception) — chained by the
+                            # checked dispatch below, or by the
+                            # fallback lanes when the mountless
+                            # backend is unachievable.
+                            _mx_cause = _errors.SandboxSetupError(
+                                f"sandbox mount-ns setup or exec "
+                                f"failed ({_setup_status[0]}: "
+                                f"{_setup_status[1]})",
+                                setup_category=_setup_status[0],
+                            )
+                            _mx_abi_block = (
+                                _mountless_unachievable_reason())
+                            if _mx_abi_block:
+                                # Mountless is out of the achievable
+                                # set for this workload (see
+                                # _mountless_unachievable_reason) —
+                                # continue down the demotion ladder;
+                                # the fallback dispatch's floor check
+                                # decides whether the demoted lane is
+                                # admitted for this call.
+                                _mount_ns_degraded = (
+                                    "bind-tree setup failed "
+                                    f"({_failed_setup_status[0]}: "
+                                    f"{_failed_setup_status[1]}); "
+                                    "mountless namespace backend not "
+                                    f"achievable ({_mx_abi_block})")
+                                _spawn_ladder_err = _mx_cause
+                                used_spawn = False
+                                if state.warn_once(
+                                        "_mountless_unachievable_warned"):
+                                    # The reroute must be as loud as
+                                    # every other demotion on this
+                                    # file: pre-fix shapes either
+                                    # refused with an explanatory
+                                    # message or warned — a silent
+                                    # stamp-only degrade of a
+                                    # read-restricted run to a
+                                    # host-visible lane is not
+                                    # acceptable.
+                                    logger.warning(
+                                        "Sandbox: the mountless "
+                                        "namespace backend is not "
+                                        "achievable for this call "
+                                        "(%s) — continuing down the "
+                                        "demotion ladder; the "
+                                        "containment floor decides "
+                                        "admission, and the demoted "
+                                        "lane enforces read/write "
+                                        "policy with Landlock alone.",
+                                        _mx_abi_block,
+                                    )
+                            else:
+                                # Refuse BEFORE the speculative-cache
+                                # write and the grant-pin re-check: a
+                                # refused run must not steer FUTURE
+                                # runs onto the mountless lane (the
+                                # cache is consulted by every later
+                                # call for the same binary, trusted
+                                # ones included). The checked dispatch
+                                # below re-asserts at the executor.
+                                _mx_declared = _LANE_TIERS[
+                                    "mountless namespace backend"]
+                                _mx_cap = _spawn_tier_cap(True)
+                                if (_mx_cap is not None
+                                        and _mx_cap < _mx_declared):
+                                    _mx_declared = _mx_cap
+                                try:
+                                    _tiers.assert_floor(
+                                        _mx_declared, _floor,
+                                        lane=("mountless namespace "
+                                              "backend"),
+                                        cause=_mx_cause,
+                                        detail=(f"{_setup_status[0]}: "
+                                                f"{_setup_status[1]}"),
+                                        remedy=_floor_remedy(
+                                            "fix the bind-tree/"
+                                            "tool-path failure."),
+                                        setup_category=_setup_status[0],
+                                    )
+                                except _errors.SandboxFloorError as \
+                                        _floor_exc:
+                                    _note_floor_refusal(_floor_exc)
+                                    raise
+                                _pin_reason = (
+                                    _grant_pin_mismatch_reason(
+                                        _grant_ids_before)
+                                    if _grant_ids_before is not None
+                                    else None)
+                                if _pin_reason is not None:
+                                    from .errors import SandboxSetupError
+                                    raise SandboxSetupError(
+                                        "sandbox grant-source pin violation "
+                                        f"during bind-tree fallback: "
+                                        f"{_pin_reason}",
+                                        "a target, output, writable, or readable "
+                                        "path changed while the first sandbox "
+                                        "backend was starting; refusing to grant "
+                                        "the replacement path to the retry.",
+                                        setup_category="P",
+                                    )
+                                if _nproc_pressure_cause is not None:
+                                    # Do NOT memoise a pressure-shaped
+                                    # failure: the cache asserts "this
+                                    # BINARY's bind tree is unusable"
+                                    # and steers every later call for
+                                    # it (trusted ones included) onto
+                                    # the mountless lane — evidence
+                                    # about the HOST's transient load
+                                    # must not buy that standing
+                                    # demotion. The next call probes
+                                    # mount-ns afresh, which is the
+                                    # pre-race behaviour once the load
+                                    # subsides.
+                                    logger.info(
+                                        "Sandbox: not memoising the "
+                                        "bind-tree failure for %r — it "
+                                        "failed under per-uid "
+                                        "process-count pressure (a "
+                                        "transient host condition), not "
+                                        "a property of this binary's "
+                                        "bind tree.",
+                                        cmd[0],
+                                    )
+                                else:
+                                    _resolved_cmd0 = (
+                                        shutil.which(cmd[0]) or cmd[0])
+                                    with state._cache_lock:
+                                        _first_seen = (
+                                            _resolved_cmd0 not in
+                                            state._speculative_failure_cache
+                                        )
+                                        if _first_seen:
+                                            state._speculative_failure_cache[
+                                                _resolved_cmd0] = True
+                                    if _first_seen:
+                                        # The fallback consumes the
+                                        # chained exception, so this
+                                        # line is the only record of
+                                        # WHY. Child-written reason:
+                                        # escape it.
+                                        from core.security.log_sanitisation import (  # noqa: E501
+                                            escape_nonprintable,
+                                        )
+                                        logger.info(
+                                            "Sandbox: %r bind tree is "
+                                            "unusable (%s: %s); future "
+                                            "runs will use the reduced "
+                                            "namespace backend.",
+                                            cmd[0],
+                                            _setup_status[0],
+                                            escape_nonprintable(
+                                                _setup_status[1]),
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "Sandbox: bind-tree failure "
+                                            "cache hit for cmd[0]=%r.",
+                                            cmd[0],
+                                        )
+                                result = _dispatch_floor_check(
+                                    "mountless namespace backend",
+                                    executor=lambda: _run_spawn_backend(
+                                        skip_mount=True),
+                                    cap=_spawn_tier_cap(True),
+                                    cause=_mx_cause,
+                                    detail=(f"{_setup_status[0]}: "
+                                            f"{_setup_status[1]}"),
+                                    remedy=_floor_remedy(
+                                        "fix the bind-tree/tool-path "
+                                        "failure."),
+                                    setup_category=_setup_status[0],
+                                )
+                                _retry_status = getattr(
+                                    result, "_setup_status", None)
+                                if _retry_status is not None:
+                                    from .errors import SandboxSetupError
+                                    raise SandboxSetupError(
+                                        "sandbox bind-tree fallback failed "
+                                        f"({_retry_status[0]}: "
+                                        f"{_retry_status[1]})",
+                                        "the reduced mount backend could not "
+                                        "engage Landlock, seccomp, namespaces, "
+                                        "fresh procfs, or execute the target; "
+                                        "the target was not run.",
+                                        setup_category=_retry_status[0],
+                                    )
+                                if _nproc_pressure_cause is not None:
+                                    # Honest degrade record: this was
+                                    # never a bind-tree capability
+                                    # problem — the spawn chain's
+                                    # forks lost a race against a
+                                    # finite RLIMIT_NPROC, twice
+                                    # (fresh-clamp retry included).
+                                    # Marker consumers and operators
+                                    # must see host pressure, not a
+                                    # kernel/policy refusal to chase.
+                                    _mount_ns_degraded = (
+                                        "bind-tree spawn failed under "
+                                        "per-uid process-count pressure "
+                                        "against RLIMIT_NPROC "
+                                        f"({_nproc_pressure_cause}; "
+                                        "child reported "
+                                        f"{_failed_setup_status[0]}: "
+                                        f"{_failed_setup_status[1]}); "
+                                        "one fresh-clamp retry also "
+                                        "failed; retried with Landlock "
+                                        "+ PID namespace + fresh procfs")
+                                else:
+                                    _mount_ns_degraded = (
+                                        "bind-tree setup failed "
+                                        f"({_failed_setup_status[0]}: "
+                                        f"{_failed_setup_status[1]}); "
+                                        "retried with "
+                                        "Landlock + PID namespace + "
+                                        "fresh procfs")
+                                _spawn_without_mount = True
+                                used_spawn = True
+                                if _nproc_pressure_cause is not None:
+                                    # Distinct warn-once key: the
+                                    # pressure cause and the genuine
+                                    # capability/policy cause each
+                                    # deserve their one loud surfacing
+                                    # per process — sharing the key
+                                    # would let whichever fires first
+                                    # swallow the other's diagnosis.
+                                    if state.warn_once(
+                                            "_nproc_pressure_degrade_warned"):
+                                        logger.warning(
+                                            "Sandbox: bind-tree spawn for "
+                                            "%r failed under per-uid "
+                                            "process-count pressure "
+                                            "against RLIMIT_NPROC (%s) — "
+                                            "NOT a kernel capability or "
+                                            "policy refusal. One "
+                                            "fresh-clamp retry also "
+                                            "failed; using Landlock + "
+                                            "PID namespace + fresh "
+                                            "procfs for this call.",
+                                            cmd[0],
+                                            _nproc_pressure_cause,
+                                        )
+                                elif state.warn_once(
+                                        "_mountless_backend_warned"):
+                                    logger.warning(
+                                        "Sandbox: bind-tree isolation "
+                                        "unavailable for %r; using Landlock "
+                                        "+ PID namespace + fresh procfs. "
+                                        "Later cache hits log at debug "
+                                        "level.",
+                                        cmd[0],
+                                    )
+                        elif _setup_status is not None:
+                            # Default-DENY unknown status categories.
+                            # The known letters are handled above; a
+                            # byte from a future writer that none of
+                            # those arms recognise means a setup step
+                            # failed in a way this parent does not
+                            # understand — treating it as a genuine
+                            # run (the old fall-through) is the same
+                            # default-allow shape that produced the
+                            # ungated-ladder bug. The child never
+                            # execed (a successful exec reaps the
+                            # CLOEXEC status fd and the parent reads
+                            # EOF), so fail loud.
+                            from .errors import SandboxSetupError
+                            raise SandboxSetupError(
+                                f"sandbox spawn child reported an "
+                                f"unrecognised setup-status category "
+                                f"{_setup_status[0]!r}: "
+                                f"{_setup_status[1]}",
+                                "the target never executed. This "
+                                "parent predates the status category "
+                                "— update RAPTOR so the parent and "
+                                "spawn backend agree on the status "
+                                "vocabulary.",
+                                setup_category=_setup_status[0],
+                            )
+                except (FileNotFoundError, RuntimeError, OSError,
+                        _errors.SandboxSetupError) as _spawn_err:
+                    if _spawn_execution_committed:
+                        raise
                     # _spawn raised mid-setup (uidmap uninstalled,
                     # kernel quirk, libc soname absent on minimal
-                    # containers, etc.). Fall back to
-                    # subprocess+preexec: the existing `full_cmd`
-                    # built above is already a Landlock-only
-                    # invocation (no --mount flags), so we don't
-                    # need to rebuild it — we just let the
-                    # `if not used_spawn` branch below run it. This
-                    # preserves --map-root-user if the caller
-                    # requested it (subprocess-level user-ns mapping
-                    # still works without mount-ns).
+                    # containers, etc.). Fall back to the plain
+                    # subprocess+preexec lane via the `if not
+                    # used_spawn` branch below — with the unshare-CLI
+                    # chain deleted there is no namespace fallback:
+                    # the per-call rechecks there (Landlock, network
+                    # block) and the floor dispatch decide whether the
+                    # demoted call may run at all.
                     # OSError covers ctypes.CDLL failures on exotic
                     # libc layouts (musl, minimal busybox images);
                     # FileNotFoundError is a subclass but we list
                     # it explicitly for documentation.
+                    #
+                    # SandboxSetupError from _spawn rides the ladder
+                    # ONLY for setup_category 'U' — the spawn child
+                    # dying at its unshare stage (userns refused at
+                    # runtime), the typed replacement for the bare
+                    # RuntimeError this environmental catch has always
+                    # degraded on. Every other category (P pin
+                    # violations, L/S hardening-layer failures, F
+                    # fresh-procfs contract) keeps its fail-loud
+                    # BaseException contract and is re-raised
+                    # untouched. Floor-contract invariant: the
+                    # SandboxFloorError raises inside this try (the
+                    # mount/mountless dispatch checks and the M/X
+                    # retry check) never carry category 'U' — their
+                    # categories come from status bytes or the
+                    # X-synthesised carriers — so a floor refusal can
+                    # never ride this ladder; and even a hypothetical
+                    # ladder-caught floor error would be re-refused at
+                    # the fallback dispatch (the floor is fixed for
+                    # the call and every fallback lane sits below any
+                    # floor that refused a spawn lane). The degrade below is loud (warning +
+                    # sandbox_info.mount_ns_degraded) and the strict /
+                    # persona / fresh-procfs (untrusted) / Landlock-
+                    # recheck gates in the `if not used_spawn` block
+                    # still decide whether the demoted call may
+                    # actually run.
+                    if (isinstance(_spawn_err, _errors.SandboxSetupError)
+                            and _spawn_err.setup_category != "U"):
+                        raise
+                    #
+                    # This except is for ENVIRONMENTAL failures only.
+                    # A caller-input error — the audit target dir
+                    # vanished after the entry validation above (the
+                    # tracer's ENOENT on <dir>/.audit lands here as a
+                    # FileNotFoundError) — must NOT ride the
+                    # degradation ladder: fail loudly instead of
+                    # silently trading away mount-ns containment AND
+                    # the requested audit evidence.
+                    #
+                    # Rootfs fail-closed gate #5: same principle for
+                    # rootfs runs — a spawn-setup failure must not
+                    # degrade to running the command on the host fs.
+                    if rootfs is not None:
+                        from .errors import SandboxSetupError
+                        msg_0 = (
+                            f"sandbox(rootfs=...): mount-ns spawn setup "
+                            f"failed ({_spawn_err.__class__.__name__}: "
+                            f"{_spawn_err}) — refusing the Landlock-only "
+                            f"host-filesystem fallback."
+                        )
+                        raise SandboxSetupError(
+                            msg_0,
+                            "fix the host (uidmap package, userns "
+                            "sysctl, /etc/subuid+/etc/subgid allotment) "
+                            "to restore the mount-ns tier.",
+                        ) from _spawn_err
+                    _vanished = _audit_target_dir_problem()
+                    if _vanished:
+                        from .errors import SandboxSetupError
+                        msg_0 = (
+                            f"sandbox mount-ns spawn failed "
+                            f"({_spawn_err}) and the audit target "
+                            f"directory {_vanished} — refusing the "
+                            f"Landlock-only fallback: the caller asked "
+                            f"for audit evidence and the target dir is "
+                            f"gone (caller-input error, not an "
+                            f"environmental degradation)."
+                        )
+                        raise SandboxSetupError(
+                            msg_0,
+                            "recreate the audit_run_dir/output "
+                            "directory (production callers pass "
+                            "lifecycle-created run dirs) and retry.",
+                        ) from _spawn_err
+                    if nonlocal_audit_mode:
+                        _audit_no_engage_reason = (
+                            f"mount-ns spawn path failed "
+                            f"({_spawn_err.__class__.__name__}: "
+                            f"{_spawn_err}) — audit falls back to the "
+                            f"Landlock-only tracer if available")
+                        _audit_no_engage_instr = (
+                            "see the sandbox log for the spawn "
+                            "failure; fix the host (uidmap package, "
+                            "userns sysctl) to restore the mount-ns "
+                            "audit tier.")
+                    _mount_ns_degraded = f"spawn setup failed: {_spawn_err}"
+                    # Keep the exception object itself: the except
+                    # binding is unset when this block exits, and the
+                    # fresh-procfs gate below needs it for `raise ...
+                    # from` chaining and its setup_category.
+                    _spawn_ladder_err = _spawn_err
                     logger.warning(
                         "Sandbox: mount-ns spawn path failed (%s); "
-                        "falling back to Landlock-only subprocess path.",
+                        "falling back to Landlock-only subprocess path."
+                        "%s",
                         _spawn_err,
+                        (" Caller passed map_root/target and relied on "
+                         "mount-ns semantics (pivot_root, per-ns /tmp, "
+                         "binds) — those are LOST for this call."
+                         if (map_root or target) else ""),
                     )
             if not used_spawn:
+                # Grant-identity re-check for the demotion ladder: the
+                # fallback lanes below re-consume the caller's grants
+                # on the HOST filesystem (no bind tree), so a grant
+                # root swapped while the spawn backend was failing —
+                # the status-byte 'U' reset, the mountless-unachievable
+                # reroute, and the mid-setup exception ladder all land
+                # here — must refuse exactly as the bind-tree (M/X)
+                # retry does, never be granted to the demoted lane.
+                # Ordering: for a run that is BOTH tampered and floored
+                # this tamper refusal outranks the fallback dispatch's
+                # floor refusal — both shapes refuse, and the tamper
+                # verdict is the more specific evidence. None when the
+                # mount lane was never attempted (nothing captured,
+                # nothing to re-check).
+                _ladder_pin_reason = (
+                    _grant_pin_mismatch_reason(_grant_ids_before)
+                    if _grant_ids_before is not None else None)
+                if _ladder_pin_reason is not None:
+                    from .errors import SandboxSetupError
+                    raise SandboxSetupError(
+                        "sandbox grant-source pin violation during "
+                        f"spawn-ladder demotion: {_ladder_pin_reason}",
+                        "a target, output, writable, or readable path "
+                        "changed while the spawn backend was failing; "
+                        "refusing to grant the replacement path to the "
+                        "demoted lane.",
+                        setup_category="P",
+                    )
+                # ---- Mount-ns demotion hardening -------------------
+                # Reaching here with use_mount True means THIS CALL was
+                # demoted from the mount-ns backend to the Landlock-only
+                # subprocess path (the B-fallback cmd-visibility check, the speculative-
+                # failure cache, an M/X setup status, or a mid-setup
+                # spawn error). Two contracts must survive that:
+                #
+                # 1. strict is fail-closed. The construction-time gate
+                #    runs before any per-call demotion exists — without
+                #    a per-call recheck, strict silently degraded here
+                #    (the rootfs gates #2/#4 are the model).
+                # 2. The construction-time writable grants were computed
+                #    for the mount backend, where /tmp and /dev/shm are
+                #    per-sandbox tmpfs. On the demoted path they are the
+                #    HOST-SHARED directories — exactly the grants the
+                #    private-scratch posture exists to withhold from
+                #    restricted (restrict_reads) runs. Recompute them
+                #    for this call.
+                _demoted_call_writable: list[str] | None = None
+                if (use_mount and rootfs is None
+                        and sys.platform == "linux"
+                        and not effectively_disabled):
+                    if strict_required:
+                        from .errors import SandboxSetupError
+                        _demote_why = (
+                            _mount_ns_degraded or _b_fallback_reason
+                            or "the native spawn backend is unavailable")
+                        raise SandboxSetupError(
+                            "sandbox profile 'strict': this call was "
+                            "demoted from the mount-ns backend to the "
+                            f"Landlock-only path ({_demote_why}) — "
+                            "strict does not degrade silently.",
+                            "make cmd[0] visible "
+                            "in the mount-ns bind tree (tool_paths=), "
+                            "or explicitly choose a profile that "
+                            "degrades gracefully (e.g. `--sandbox "
+                            "full`). RAPTOR will not silently "
+                            "downgrade for you.",
+                        )
+                    # Persona fail-closed gate (catch-all arm): the
+                    # Landlock-only path never applies the fingerprint
+                    # persona, so any demotion reaching here —
+                    # including mid-setup spawn errors and an
+                    # availability flap after the context-entry check
+                    # — is the host-real half-state
+                    # require_sanitisation forbids. The early gates
+                    # (pre-spawn kwarg/B-fallback/cache/skip_mount_ns,
+                    # post-spawn M/X) give more specific messages;
+                    # this one backstops every other route.
+                    if _persona is not None and require_sanitisation:
+                        from .errors import SandboxSetupError
+                        _demote_why = (
+                            _mount_ns_degraded or _b_fallback_reason
+                            or "mount-ns spawn was demoted for this "
+                               "call")
+                        raise SandboxSetupError(
+                            "sandbox(require_sanitisation=True): this "
+                            "call was demoted from the mount-ns "
+                            f"backend ({_demote_why}) — refusing the "
+                            "Landlock-only path, which cannot apply "
+                            "the fingerprint persona.",
+                            "fix the demotion cause, or drop "
+                            "require_sanitisation= to accept "
+                            "host-real identity surfaces on degrade.",
+                        )
+                    # NOTE: the former fresh-procfs catch-all gate
+                    # lived here. Every route into the fallback lanes
+                    # — the mid-setup spawn EXCEPTION ladder, the
+                    # kwarg demotions, and the achievability rerouting
+                    # — now passes the containment-floor dispatch
+                    # check immediately before its executor runs (see
+                    # _dispatch_floor_check at the run_landlock_audit
+                    # and subprocess dispatches below), with the
+                    # original backend failure chained so the real
+                    # cause stays diagnosable.
+                    # (The Landlock recheck that lived here moved
+                    # BELOW the fallback-lane floor assert — refusal
+                    # priority; see the comment at its new site.)
+                # (The private-scratch write-policy recompute and the
+                # per-call preexec rebuild moved BELOW the floor
+                # assert: a refused call must not mint scratch dirs
+                # or rebuild grants for a dispatch that never runs.)
+                # Containment-floor contract, side 2: shared demotion
+                # context for the fallback-lane dispatch checks below.
+                # _spawn_ladder_err carries the mid-setup backend
+                # exception (or the synthesised M/X / achievability
+                # carrier) so a refusing check chains the real cause;
+                # the detail names the route so both the refusal and
+                # the consented-degrade warning stay diagnosable.
+                if _spawn_ladder_err is not None:
+                    _fallback_floor_detail = (
+                        "demoted from the mount-ns backend "
+                        f"({_spawn_ladder_err.__class__.__name__}: "
+                        f"{_spawn_ladder_err})")
+                elif _mount_ns_degraded or _b_fallback_reason:
+                    _fallback_floor_detail = (
+                        "demoted from the mount-ns backend "
+                        f"({_mount_ns_degraded or _b_fallback_reason})")
+                elif (sys.platform == "linux" and not landlock_available
+                        and not effectively_disabled):
+                    # No demotion happened — the plain lane simply
+                    # cannot deliver its nominal tier on this kernel.
+                    # The remedy must name THAT, not a spawn failure
+                    # that never occurred.
+                    _fallback_floor_detail = (
+                        "the kernel has no Landlock, so this lane "
+                        "delivers rlimits/seccomp only")
+                else:
+                    _fallback_floor_detail = ""
+                if (sys.platform == "linux" and not landlock_available
+                        and not effectively_disabled
+                        and _spawn_ladder_err is None
+                        and not (_mount_ns_degraded
+                                 or _b_fallback_reason)):
+                    _fallback_floor_remedy = _floor_remedy(
+                        "upgrade to a kernel with Landlock (5.13+) so "
+                        "the floor can be met.")
+                else:
+                    _fallback_floor_remedy = _floor_remedy(
+                        "this lane exposes the host-pid /proc to the "
+                        "target; fix the demotion cause (see the sandbox "
+                        "log for the spawn failure; typical hosts need the "
+                        "uidmap package and the userns sysctl)."
+                        if sys.platform == "linux" else "")
+                # Declared tier of the plain-subprocess lane: rlimits
+                # only when the operator disabled the sandbox or the
+                # kernel has no Landlock to enforce with (dispatch
+                # tags must never overstate what a lane delivers).
+                _plain_lane_cap = (
+                    _tiers.ContainmentTier.BARE
+                    if (effectively_disabled or not landlock_available)
+                    else None)
+                # Refuse the fallback lane BEFORE any audit machinery
+                # runs: a refused call must not write audit-degraded
+                # markers or trade its floor refusal for an
+                # audit_required one. The checked dispatches below
+                # remain the hard per-executor guarantee; this early
+                # assert only fixes refusal PRIORITY. The plain
+                # subprocess lane is the ONLY fallback — the
+                # unshare-CLI namespace fallback is deleted; namespace
+                # shapes that cannot spawn land here and the floor
+                # decides admission.
+                _fallback_lane = "Landlock-only subprocess"
+                _fallback_delivered = _LANE_TIERS[_fallback_lane]
+                if (_plain_lane_cap is not None
+                        and _plain_lane_cap < _fallback_delivered):
+                    _fallback_delivered = _plain_lane_cap
+                try:
+                    _tiers.assert_floor(
+                        _fallback_delivered, _floor, lane=_fallback_lane,
+                        cause=_spawn_ladder_err,
+                        detail=_fallback_floor_detail,
+                        remedy=_fallback_floor_remedy,
+                    )
+                except _errors.SandboxFloorError as _floor_exc:
+                    _note_floor_refusal(_floor_exc)
+                    raise
+                # Landlock recheck (fail-closed). The construction-
+                # time "confinement requested but Landlock
+                # unavailable" refusal only runs when the mount
+                # backend was ruled out at setup (`not use_mount`).
+                # A call that CHOSE mount-ns and was then demoted
+                # here lands on the Landlock-only subprocess path,
+                # where the requested filesystem/TCP policy is
+                # enforced by Landlock ALONE — and _make_preexec_fn
+                # silently skips its Landlock arm when the kernel
+                # lacks it. Without this recheck the demoted call
+                # ran to completion with NO confinement at all
+                # (rc=0, host /tmp writable, target not read-only)
+                # while the caller had explicitly requested
+                # target/output/allowed_tcp_ports/restrict_reads.
+                # Mirrors the construction-time gate: same policy
+                # kwargs, same refusal, per-call. Sits AFTER the
+                # fallback-lane floor assert on purpose: when the
+                # resolved floor already rejects the fallback lane,
+                # the floor refusal is the authoritative one — it
+                # names the consent surface and carries the
+                # structured floor/achievable fields — whereas this
+                # refusal's "run on a kernel with Landlock" remedy
+                # is misleading for a call the floor would refuse on
+                # any kernel. Calls whose floor ADMITS the fallback
+                # lane still refuse here exactly as before.
+                if (use_mount and rootfs is None
+                        and sys.platform == "linux"
+                        and not effectively_disabled
+                        and (target or output or allowed_tcp_ports
+                             or restrict_reads)
+                        and not check_landlock_available()):
+                    from .errors import SandboxSetupError
+                    _demote_why = (
+                        _mount_ns_degraded or _b_fallback_reason
+                        or "the native spawn backend is unavailable")
+                    raise SandboxSetupError(
+                        "sandbox: this call was demoted from the "
+                        f"mount-ns backend ({_demote_why}) and "
+                        "Landlock is unavailable on this kernel — "
+                        "the Landlock-only path would enforce NONE "
+                        "of the requested target/output/"
+                        "allowed_tcp_ports/restrict_reads policy.",
+                        "fix the demotion cause so the mount "
+                        "namespace can enforce the policy, run on "
+                        "a kernel with Landlock (>= 5.13), or drop "
+                        "the confinement kwargs to explicitly "
+                        "accept an unconfined run. RAPTOR will not "
+                        "silently downgrade for you.",
+                    )
+                # Per-call network-block recheck. Construction
+                # resolved block_network to the NAMESPACE tier for
+                # this call (need_unshare), so the construction-time
+                # degraded-net-deny arm never evaluated — and this
+                # demoted call is about to execute on the plain lane
+                # with NO network namespace. (The deleted unshare-CLI
+                # fallback used to keep a netns for these demotions.)
+                # Mirror the construction arm per call, same
+                # precedence, same acceptance levers: Landlock ABI
+                # v4+ TCP-connect deny (loud), else the operator's
+                # degraded acceptance env (loud), else refuse.
+                # degraded_net_deny=False is the caller's per-call
+                # "this run may egress" opt-out, honoured exactly as
+                # at construction. allowed_tcp_ports is excluded from
+                # the deny-all lane for the same reason as at
+                # construction (the allowlist IS the network policy).
+                _demoted_net_deny = False
+                if (sys.platform == "linux" and not effectively_disabled
+                        and need_unshare and block_network
+                        and degraded_net_deny):
+                    if (landlock_available and _get_landlock_abi() >= 4
+                            and not allowed_tcp_ports):
+                        _require_degraded_udp_filter(seccomp_profile)  # type: ignore[arg-type]
+                        _demoted_net_deny = True
+                        if state.warn_once("_demoted_tcp_deny_warned"):
+                            logger.warning(
+                                "Sandbox: block_network requested but "
+                                "this call was demoted from the "
+                                "namespace backend — falling back to "
+                                "Landlock TCP-connect deny for this "
+                                "call (all TCP connects fail with "
+                                "EACCES, including loopback; "
+                                "seccomp blocks UDP/DNS; "
+                                "bind/listen are unaffected).",
+                            )
+                    # Network-axis waiver: deliberately the RAW env
+                    # var, not the floor consent chain — a tier floor
+                    # (--sandbox-floor / project setting) never
+                    # consents the network axis; accepting an
+                    # unrestricted-network run stays env-var-only.
+                    elif _degraded_untrusted_waiver():
+                        if state.warn_once(
+                                "_demoted_net_open_override_warned"):
+                            logger.warning(
+                                "Sandbox: block_network requested but "
+                                "this call was demoted from the "
+                                "namespace backend and Landlock ABI "
+                                "v4+ is missing — "
+                                "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 "
+                                "accepts running with NETWORK "
+                                "UNRESTRICTED for such calls.",
+                            )
+                    else:
+                        from .errors import SandboxSetupError
+                        from .probes import ENGAGE_FAIL_INSTRUCTIONS
+                        _demote_net_why = (_fallback_floor_detail
+                                           or "spawn backend unavailable")
+                        # Name the ACTUAL unmet condition: on an
+                        # ABI-v4+ host the deny-all lane was excluded
+                        # because allowed_tcp_ports is the policy —
+                        # claiming the ABI is missing there sent
+                        # operators chasing a Landlock upgrade they
+                        # already have.
+                        _no_deny_why = (
+                            "the Landlock deny-all fallback does not "
+                            "apply when allowed_tcp_ports is the "
+                            "network policy"
+                            if (landlock_available
+                                and _get_landlock_abi() >= 4
+                                and allowed_tcp_ports)
+                            else "Landlock ABI v4+ is missing")
+                        raise SandboxSetupError(
+                            "Sandbox: block_network=True was requested "
+                            "but this call was demoted from the "
+                            f"namespace backend ({_demote_net_why}) "
+                            f"and {_no_deny_why} — no "
+                            "layer can enforce the requested network "
+                            "block for this call.",
+                            ENGAGE_FAIL_INSTRUCTIONS + " Alternatively "
+                            "pass degraded_net_deny=False (library "
+                            "callers) to accept an unrestricted-network "
+                            "run per call, or set "
+                            "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 to "
+                            "accept the degraded tier host-wide.",
+                        )
+                # Private-scratch write-policy recompute for demoted
+                # restrict_reads calls (the construction grants
+                # assumed the mount backend's per-sandbox tmpfs), and
+                # the per-call preexec rebuild that carries it and/or
+                # the per-call TCP deny. The rebuild keeps the
+                # namespace-creation deny rules — the plain lane's
+                # payload never legitimately unshares.
+                if (use_mount and rootfs is None
+                        and sys.platform == "linux"
+                        and not effectively_disabled
+                        and restrict_reads and not exclude_tmp_baseline):
+                    _demoted_call_writable, _demoted_env = (
+                        _mountless_write_policy()
+                    )
+                    kwargs["env"] = dict(_demoted_env)
+                if (_demoted_call_writable is not None
+                        or _demoted_net_deny):
+                    _dem_preexec = _make_preexec_fn(
+                        effective_limits,
+                        writable_paths=(
+                            _demoted_call_writable
+                            if _demoted_call_writable is not None
+                            else writable_paths),
+                        allowed_tcp_ports=allowed_tcp_ports,
+                        seccomp_profile=seccomp_profile,  # type: ignore[arg-type]
+                        seccomp_block_udp=(seccomp_block_udp
+                                           or _demoted_net_deny),
+                        readable_paths=_preexec_readable,
+                        deny_all_tcp_connect=(_degraded_tcp_deny
+                                              or _demoted_net_deny),
+                        # Fresh-at-dispatch NPROC sample: the setup-
+                        # time snapshot has aged by the time a demoted
+                        # call forks (falls back to it if the resample
+                        # fails — never sheds the fork-bomb bound).
+                        host_nproc_cap=_consumption_nproc_cap(
+                            _host_nproc_cap,
+                            int(effective_limits.get("nproc", 0) or 0)),
+                        reaper_cell=_reaper_cell,
+                        seccomp_block_ns_creation=True,
+                        # The demotion rebuild must not shed the
+                        # fileless-exec deny the construction-time
+                        # preexec carried for this restrict_reads
+                        # posture (same restrict_reads key).
+                        seccomp_deny_fd_exec=bool(restrict_reads),
+                    )
+                    if existing_preexec:
+                        def _dem_combined(_ep=existing_preexec,
+                                          _np=_dem_preexec):
+                            _ep()
+                            _np()
+                        kwargs["preexec_fn"] = _dem_combined
+                    else:
+                        kwargs["preexec_fn"] = _dem_preexec
+                if _exec_pid_callback is not None:
+                    logger.debug(
+                        "Sandbox: exec_pid_callback supplied but this "
+                        "call is not routed through the spawn backend — "
+                        "the callback will not fire for %s",
+                        " ".join(cmd[:_CMD_DISPLAY_MAX_ARGS]) or repr(cmd),
+                    )
                 # Audit/observe in Landlock-only mode: the bare
                 # subprocess.run path has no tracer-fork machinery,
                 # so audit silently degraded pre-PR. _landlock_audit
@@ -1714,61 +8006,187 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                 # subprocess in parallel with the target child.
                 # Engaged only when the operator asked for audit
                 # AND we have the prerequisites (libseccomp + ptrace);
-                # any failure path falls back cleanly to the bare
+                # pre-execution setup failures can fall back to the bare
                 # subprocess.run below. mount-ns absent is acceptable
                 # — Landlock + seccomp + ptrace are sufficient for
                 # observe semantics; the THREAT_MODEL.md
                 # Landlock-only-mode warning still applies.
                 _audit_landlock_engaged = False
+                _audit_execution_committed = False
+
+                def _mark_audit_execution_committed():
+                    nonlocal _audit_execution_committed
+                    _audit_execution_committed = True
+
                 if nonlocal_audit_mode:
                     try:
+                        from . import _landlock_audit as _la
+                        from .landlock import (
+                            _make_landlock_preexec as _la_make_landlock,
+                        )
                         from .ptrace_probe import (
                             check_ptrace_available as _la_ptrace_check,
                         )
                         from .seccomp import (
-                            check_seccomp_available as _la_seccomp_check,
                             _make_seccomp_preexec as _la_make_seccomp,
                         )
-                        from .landlock import (
-                            _make_landlock_preexec as _la_make_landlock,
+                        from .seccomp import (
+                            check_seccomp_available as _la_seccomp_check,
                         )
-                        from . import _landlock_audit as _la
                         if (_la_seccomp_check()
                                 and _la_ptrace_check()):
                             # Build the rlimit-only preexec (no
                             # Landlock — we install it separately
                             # post-sync), the Landlock preexec, and
                             # the seccomp preexec with audit_mode=True.
+                            # host_nproc_cap rides along: the audit
+                            # lane runs the payload with no pid-ns,
+                            # so the RLIMIT_NPROC fork-bomb bound is
+                            # the only growth limit here exactly as
+                            # on the plain no-namespace lane —
+                            # omitting it ran audited targets at the
+                            # host's per-UID ceiling. reaper_cell is
+                            # deliberately None: teardown containment
+                            # on this lane is the tracer's
+                            # PTRACE_O_EXITKILL (see
+                            # run_landlock_audit), not the plain
+                            # lane's reaper-sweeper split.
                             _rlimit_only = _make_preexec_fn(
                                 effective_limits,
                                 writable_paths=None,
                                 readable_paths=None,
                                 allowed_tcp_ports=None,
+                                # Fresh-at-dispatch sample, setup-time
+                                # fallback — same rationale as the
+                                # demoted-lane rebuild above.
+                                host_nproc_cap=_consumption_nproc_cap(
+                                    _host_nproc_cap,
+                                    int(effective_limits.get(
+                                        "nproc", 0) or 0)),
+                                reaper_cell=None,
                             )
-                            _wp = list(writable_paths or [])
-                            if "/tmp" not in _wp:
+                            _wp = list(
+                                _demoted_call_writable
+                                if _demoted_call_writable is not None
+                                else (writable_paths or []))
+                            # Honour exclude_tmp_baseline: the caller
+                            # explicitly stripped the scratch dirs
+                            # (exploit-engine wrapper-script defence)
+                            # and the audit tracer must not silently
+                            # re-open them. The plain (non-audit)
+                            # preexec at the sandbox() baseline obeys
+                            # the same flag. Same for BOTH private-
+                            # scratch postures (construction-time and
+                            # per-call demoted): the whole point of
+                            # the scratch swap is to withhold the
+                            # host-shared /tmp, and the audit branch
+                            # must not silently re-open it. And only
+                            # when _wp is already non-empty: an
+                            # audit_run_dir-only call (the documented
+                            # "audit signal without a writable-path
+                            # restriction" shape — no target/output/
+                            # ports/writable_paths, so the plain lane
+                            # builds no policy at all) must not have
+                            # this branch invent a write-nowhere-
+                            # except-/tmp policy that breaks the
+                            # workload on exactly the userns-
+                            # restricted hosts this lane serves.
+                            if (_wp
+                                    and not exclude_tmp_baseline
+                                    and "/tmp" not in _wp
+                                    and _private_scratch_dir is None
+                                    and _demoted_call_writable is None):
                                 _wp.append("/tmp")
-                            _ll_preexec = _la_make_landlock(
-                                _wp,
-                                list(allowed_tcp_ports)
-                                    if allowed_tcp_ports else None,
-                                readable_paths=(
-                                    list(effective_read_paths)
-                                    if effective_read_paths else None
-                                ),
+                            _la_readable = (
+                                list(effective_read_paths)
+                                if effective_read_paths else None
                             )
+                            if _la_readable is not None:
+                                for _tp in (tool_paths or []):
+                                    if _tp and _tp not in _la_readable:
+                                        _la_readable.append(_tp)
+                            # Mirror the plain lane's engagement
+                            # predicate (preexec._make_preexec_fn):
+                            # no writable paths, no ports, no read
+                            # allowlist, no degraded/demoted net
+                            # deny -> no Landlock ruleset. The audit
+                            # tracer still engages — that is the
+                            # audit_run_dir contract.
+                            _la_engages = bool(
+                                _wp or allowed_tcp_ports
+                                or _la_readable is not None
+                                or _degraded_tcp_deny
+                                or _demoted_net_deny
+                                or (seccomp_block_udp
+                                    and _get_landlock_abi() >= 10))
+                            _ll_preexec = None
+                            if _la_engages:
+                                _ll_preexec = _la_make_landlock(
+                                    _wp,
+                                    list(allowed_tcp_ports)
+                                    if allowed_tcp_ports else None,
+                                        readable_paths=_la_readable,
+                                    # Degraded-host TCP deny must
+                                    # survive the audit branch: the
+                                    # plain preexec carries it, and
+                                    # dropping it here silently
+                                    # restored outbound network
+                                    # exactly when block_network had
+                                    # downgraded to Landlock-only.
+                                    # The PER-CALL demoted deny rides
+                                    # along for the same reason — the
+                                    # audit branch builds its own
+                                    # preexecs, so omitting it here
+                                    # let an audit-mode demoted
+                                    # block_network call connect
+                                    # freely while the demotion
+                                    # warning claimed EACCES.
+                                    deny_all_tcp_connect=(
+                                        _degraded_tcp_deny
+                                        or _demoted_net_deny),
+                                    deny_all_udp=(seccomp_block_udp
+                                                  or _demoted_net_deny),
+                                )
                             _sc_preexec = _la_make_seccomp(
-                                seccomp_profile,
-                                block_udp=seccomp_block_udp,
+                                seccomp_profile,  # type: ignore[arg-type]
+                                block_udp=(seccomp_block_udp
+                                           or _demoted_net_deny),
                                 audit_mode=True,
                                 observe_mode=bool(observe and nonlocal_audit_mode),
+                                # The audit fallback executes the BARE
+                                # target (the unshare-CLI bootstrap
+                                # that once forced the permissive
+                                # filter is deleted) — the payload
+                                # never legitimately unshares, so the
+                                # namespace-creation deny applies here
+                                # exactly as on the plain lane.
+                                block_ns_creation=True,
+                                # Same restrict_reads-keyed fileless-
+                                # exec deny as the plain preexec — the
+                                # audit branch builds its own seccomp
+                                # filter, and omitting the rules here
+                                # would hand an AUDITED untrusted
+                                # child the memfd-exec primitive the
+                                # enforcement run refuses.
+                                deny_fd_exec=bool(restrict_reads),
                             ) if seccomp_profile else None
                             _audit_run_dir_la = (
                                 audit_run_dir or output
                             )
+                            # Containment-floor contract, side 2: the
+                            # Landlock-only audit helper executes the
+                            # same cmd as the plain dispatches below
+                            # (tracer is observability, not
+                            # containment — same tier as its lane).
                             try:
-                                result = _la.run_landlock_audit(
-                                    full_cmd,
+                                result = _dispatch_floor_check(
+                                    "Landlock-only subprocess",
+                                    cap=_plain_lane_cap,
+                                    cause=_spawn_ladder_err,
+                                    detail=_fallback_floor_detail,
+                                    remedy=_fallback_floor_remedy,
+                                    executor=lambda: _la.run_landlock_audit(
+                                    cmd,
                                     audit_run_dir=str(_audit_run_dir_la),
                                     audit_verbose=audit_verbose_active,
                                     observe_mode=bool(observe and nonlocal_audit_mode),
@@ -1777,8 +8195,12 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                                         if observe and nonlocal_audit_mode
                                         else None
                                     ),
-                                    writable_paths=writable_paths or [],
-                                    readable_paths=effective_read_paths or [],
+                                    writable_paths=(
+                                        _demoted_call_writable
+                                        if _demoted_call_writable
+                                        is not None
+                                        else (writable_paths or [])),
+                                    readable_paths=_la_readable or effective_read_paths or [],
                                     allowed_tcp_ports=(
                                         list(allowed_tcp_ports)
                                         if allowed_tcp_ports else None
@@ -1788,53 +8210,694 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
                                     landlock_preexec=_ll_preexec,
                                     seccomp_preexec=_sc_preexec,
                                     rlimit_preexec=_rlimit_only,
-                                    env=kwargs.get("env"),
+                                    # cmd IS the target on this lane
+                                    # (no bootstrap hops — the
+                                    # unshare/prlimit/pid1-shim chain
+                                    # is deleted), so it gets the
+                                    # stripped target view directly.
+                                    env=_env_for_target,
                                     cwd=kwargs.get("cwd"),
                                     timeout=kwargs.get("timeout"),
                                     capture_output=kwargs.get(
                                         "capture_output", False),
                                     text=kwargs.get("text", False),
+                                    encoding=kwargs.get("encoding"),
+                                    errors=kwargs.get("errors"),
                                     stdin=kwargs.get("stdin"),
-                                    start_new_session=kwargs.get(
-                                        "start_new_session", True),
-                                )
+                                    pass_fds=kwargs.get("pass_fds") or (),
+                                    # Forwarded like the Linux spawn
+                                    # dispatch — dropping them here
+                                    # defeated run_untrusted's
+                                    # write-only tty reopen on the
+                                    # Landlock-only audit lane.
+                                    stdout=kwargs.get("stdout"),
+                                    stderr=kwargs.get("stderr"),
+                                    start_new_session=_start_new_session,
+                                    restore_signals=kwargs.get("restore_signals", True),
+                                    execution_committed_callback=_mark_audit_execution_committed,
+                                ))
                                 _audit_landlock_engaged = True
                             except (RuntimeError, OSError) as _la_err:
-                                # Tracer fork failed — fall through
-                                # to plain subprocess.run. Operator
-                                # gets the existing degrade marker.
+                                if _audit_execution_committed:
+                                    raise
+                                # Environmental tracer-fork failures
+                                # fall through to plain subprocess.run
+                                # (recorded at the no-audit bottleneck
+                                # below). A vanished audit target dir
+                                # is a caller-input error — the same
+                                # class the entry validation rejects —
+                                # and must not silently cost the
+                                # requested evidence channel.
+                                _vanished = _audit_target_dir_problem()
+                                if _vanished:
+                                    from .errors import SandboxSetupError
+                                    msg_0 = (
+                                        f"sandbox Landlock-only audit "
+                                        f"tracer failed ({_la_err}) and "
+                                        f"the audit target directory "
+                                        f"{_vanished} — refusing the "
+                                        f"non-audit fallback for a "
+                                        f"caller-input error."
+                                    )
+                                    raise SandboxSetupError(
+                                        msg_0,
+                                        "recreate the audit_run_dir/"
+                                        "output directory and retry.",
+                                    ) from _la_err
+                                _audit_no_engage_reason = (
+                                    f"Landlock-only audit tracer "
+                                    f"failed "
+                                    f"({_la_err.__class__.__name__}: "
+                                    f"{_la_err}) — no audit tier "
+                                    f"engaged for this call")
+                                _audit_no_engage_instr = (
+                                    "see the sandbox log for the "
+                                    "tracer failure; b2/b3 audit "
+                                    "signal is absent for this call.")
                                 logger.warning(
                                     "Sandbox: Landlock-only audit "
                                     "tracer failed (%s); falling back "
                                     "to non-audit subprocess.run",
                                     _la_err,
                                 )
+                        elif _audit_no_engage_reason is None:
+                            # Runtime-probe miss on the Landlock-only
+                            # tier (the eager pre-flight above only
+                            # probes when spawn was ineligible, so a
+                            # spawn-path runtime failure lands here
+                            # with no reason recorded yet).
+                            _audit_no_engage_reason = (
+                                "Landlock-only audit tracer "
+                                "unavailable (libseccomp/ptrace probe "
+                                "failed or no seccomp profile) — no "
+                                "audit tier engaged for this call")
+                            _audit_no_engage_instr = (
+                                "install libseccomp and permit "
+                                "PTRACE_SEIZE (Yama scope <= 1), or "
+                                "run without audit mode.")
                     except ImportError:
+                        if _audit_execution_committed:
+                            raise
                         # Sandbox helpers missing — let the bare
                         # path run.
-                        pass
+                        if _audit_no_engage_reason is None:
+                            _audit_no_engage_reason = (
+                                "sandbox audit helpers unavailable "
+                                "(ImportError) — no audit tier "
+                                "engaged for this call")
+                            _audit_no_engage_instr = (
+                                "reinstall RAPTOR's sandbox package; "
+                                "core.sandbox._landlock_audit failed "
+                                "to import.")
                 if not _audit_landlock_engaged:
-                    result = subprocess.run(full_cmd, **kwargs)
+                    if nonlocal_audit_mode:
+                        # No-audit bottleneck: EVERY audit-requested
+                        # call that is about to execute via bare
+                        # subprocess.run (no tracer of any tier)
+                        # passes through here — pre-flight
+                        # ineligibility, spawn runtime failure, M/X
+                        # retry, Landlock-only tracer failure and
+                        # ImportError alike. Two guarantees:
+                        #   1. the degradation is machine-readable
+                        #      (per-run marker, idempotent — the
+                        #      pre-flight sites keep their richer
+                        #      reason; plus sandbox_info
+                        #      ["audit_engaged"]=False stamped after
+                        #      the run), and
+                        #   2. audit_required=True refuses to execute
+                        #      the command at all (fail-closed on the
+                        #      evidence channel) instead of returning
+                        #      a successful-looking result with no
+                        #      observe record.
+                        _reason = (
+                            _audit_no_engage_reason
+                            or "no audit tier could engage for this "
+                               "call (unattributed degradation)")
+                        _marker_dir = audit_run_dir or output
+                        if _marker_dir:
+                            from pathlib import Path as _Path
+
+                            from . import summary as _summary_mod
+                            _summary_mod.record_audit_degraded(
+                                _Path(_marker_dir),
+                                reason=_reason,
+                                instructions=_audit_no_engage_instr,
+                            )
+                        if audit_required:
+                            from .errors import SandboxSetupError
+                            msg_0 = (
+                                f"audit was requested with "
+                                f"audit_required=True but no audit "
+                                f"tier could engage: {_reason}. "
+                                f"Refusing to run the command without "
+                                f"the requested audit evidence."
+                            )
+                            raise SandboxSetupError(
+                                msg_0,
+                                _audit_no_engage_instr
+                                or "fix the host's audit "
+                                   "prerequisites (userns/libseccomp/"
+                                   "ptrace) or drop audit_required= "
+                                   "to accept marker-recorded "
+                                   "degradation.",
+                            )
+                    # Containment-floor contract, side 2: the
+                    # plain-subprocess lane (Landlock + seccomp +
+                    # rlimits, host namespaces; rlimits only under
+                    # the operator disable or on a Landlock-less
+                    # kernel) — both executor shapes below route
+                    # through the checked dispatch.
+                    # No shim, no pid namespace on this path —
+                    # teardown containment comes from the preexec
+                    # sweeper (reaper cell) plus a parent-side
+                    # marked-process sweep. The env marker is a
+                    # per-run random token every descendant
+                    # inherits; after the run (normal return,
+                    # timeout, or exception) any /proc process
+                    # still carrying it is SIGKILLed — the
+                    # backstop for the paths that kill the sweeper
+                    # itself (subprocess timeout kills Popen.pid,
+                    # which IS the sweeper).
+                    _reap_token = None
+                    _death_r = _death_w = None
+                    _penv = _env_for_target
+                    if not effectively_disabled:
+                        import uuid as _uuid
+                        _reap_token = _uuid.uuid4().hex
+                        _penv = dict(_env_for_target)
+                        _penv["_SBX_RUN_ID"] = _reap_token
+                    if _reaper_cell is not None:
+                        # Registered creation (see _spawn's death-pipe
+                        # write-end registry): a mount-ns intermediate
+                        # forked while this run is in flight inherits
+                        # a copy of _death_w and must close it, or the
+                        # sweeper's EOF — the teardown signal for this
+                        # lane — stays pinned to that sibling spawn's
+                        # lifetime.
+                        from ._spawn import (
+                            open_death_pipe as _open_death_pipe,
+                        )
+                        _death_r, _death_w = _open_death_pipe()
+                        # Thread-local slot — see the cell's
+                        # construction comment for why this must
+                        # not be a plain shared key.
+                        _reaper_cell["death_local"].fd = _death_r
+                    _death_w_holder = [_death_w]
+                    try:
+                        # cmd IS the target (no bootstrap wrapper on
+                        # this lane), so it gets the marker-stripped
+                        # env view.
+                        _pk = dict(kwargs)
+                        _pk["env"] = _penv
+                        if (
+                            _reaper_cell is not None
+                            and _death_w is not None
+                        ) or _max_capture_bytes is not None:
+                            # Teardown-first failure cleanup: a plain
+                            # subprocess.run timeout SIGKILLs
+                            # Popen.pid, which on this path IS the
+                            # subreaper sweeper — the sweep dies
+                            # before it can run and containment
+                            # falls back to the (scrub-able)
+                            # marker backstop. Close the death
+                            # pipe FIRST so the sweeper reaps its
+                            # subtree and exits on its own; only
+                            # then kill. Apply this to cancellation and
+                            # communication errors even without a timeout.
+                            result = _dispatch_floor_check(
+                                "Landlock-only subprocess",
+                                cap=_plain_lane_cap,
+                                cause=_spawn_ladder_err,
+                                detail=_fallback_floor_detail,
+                                remedy=_fallback_floor_remedy,
+                                executor=lambda:
+                                    _run_teardown_first_timeout(
+                                        cmd, _pk,
+                                        _death_w_holder,
+                                        _start_new_session,
+                                        max_capture_bytes=_max_capture_bytes,
+                                        teardown_first=(_reaper_cell is not None
+                                                        and _death_w is not None),
+                                    ),
+                            )
+                        else:
+                            result = _dispatch_floor_check(
+                                "Landlock-only subprocess",
+                                cap=_plain_lane_cap,
+                                cause=_spawn_ladder_err,
+                                detail=_fallback_floor_detail,
+                                remedy=_fallback_floor_remedy,
+                                executor=lambda: subprocess.run(
+                                    cmd,
+                                    start_new_session=(
+                                        _start_new_session),
+                                    **_pk,
+                                    check=False,
+                                ),
+                            )
+                    except OSError as _ebadf:
+                        if (_ebadf.errno != errno.EBADF
+                                or getattr(_ebadf, "sandbox_cleanup_pending", False)):
+                            raise
+                        result = subprocess.CompletedProcess(
+                            cmd, returncode=-9,
+                        )
+                        # SYNTHETIC result: an infrastructure race
+                        # (a concurrently-closed fd inside the Popen
+                        # plumbing) — the target's real execution
+                        # state is UNKNOWN, and rc=-9 with no output
+                        # would otherwise read as a genuine SIGKILL
+                        # (mechanical crash evidence) to
+                        # observe._interpret_result and every crash
+                        # oracle. Stamp it so evidence consumers can
+                        # exclude the fabricated shape; the stamp is
+                        # transferred onto sandbox_info in the
+                        # epilogue (sandbox_info does not exist yet
+                        # here).
+                        result._synthetic_ebadf = True  # type: ignore[attr-defined]
+                        # Post-check executor death — see above.
+                        result._floor_checked = True  # type: ignore[attr-defined]
+                    finally:
+                        if _reaper_cell is not None:
+                            _reaper_cell["death_local"].fd = None
+                        from ._retirement import retire_parent_resources
+
+                        def _retire_plain_writer() -> None:
+                            death_w = _death_w_holder[0]
+                            # Consume before close: an interrupted release
+                            # must not leave a reusable numeric descriptor.
+                            _death_w_holder[0] = None
+                            if death_w is not None:
+                                from ._spawn import close_death_w
+                                close_death_w(death_w)
+
+                        def _retire_plain_reader() -> None:
+                            if _death_r is not None:
+                                try:
+                                    os.close(_death_r)
+                                except OSError:
+                                    pass
+
+                        def _retire_plain_marked() -> None:
+                            if _reap_token is not None:
+                                _sweep_marked_processes(_reap_token)
+
+                        retire_parent_resources(
+                            _retire_plain_writer,
+                            _retire_plain_reader,
+                            _retire_plain_marked,
+                        )
         finally:
-            events = (
-                proxy_instance.unregister_sandbox(proxy_token)
-                if proxy_token is not None else []
+            # Release the grant-identity pin fds on every exit path
+            # (success, refusal raise, ladder demotion): the pins only
+            # need to outlive the LAST possible re-check above, and a
+            # raise-path leak would accumulate one fd per pinned grant
+            # per refused call.
+            from ._retirement import retire_parent_resources
+
+            def _retire_grant_pins() -> None:
+                pins = iter(_grant_pin_fds)
+
+                def _close_next_pin() -> None:
+                    # Advance ownership before close; never retry a number
+                    # whose close may have completed before interruption.
+                    pin_fd = next(pins)
+                    try:
+                        os.close(pin_fd)
+                    except OSError:
+                        pass
+
+                try:
+                    retire_parent_resources(*(
+                        _close_next_pin for _ in _grant_pin_fds
+                    ))
+                finally:
+                    _grant_pin_fds.clear()
+
+            events: list = []
+
+            def _retire_proxy_registration() -> None:
+                nonlocal events
+                events = (
+                    proxy_instance.unregister_sandbox(proxy_token)  # type: ignore[union-attr]
+                    if proxy_token is not None else []
+                )
+
+            retire_parent_resources(
+                _retire_grant_pins, _retire_proxy_registration,
             )
         # Accumulate into the sandbox()-scoped cumulative view so callers
         # can inspect `run.events` for a unified stream across multiple
         # run() calls within one `with sandbox()` block.
         _sandbox_events.extend(events)
 
+        # Runtime dominance backstop for the chokepoint: every result
+        # consumed by run() must carry the checked-dispatch stamp. The
+        # AST gate covers executors added in THIS module; this covers
+        # a lane that spawns from another module entirely — post-exec
+        # (a lane the contract does not know about cannot be asserted
+        # pre-exec), so it converts a silent bypass into a loud
+        # failure at first use rather than preventing the first run.
+        # Deliberately NOT routed through the refusal-recording
+        # chokepoint: this is an internal-invariant violation (a code
+        # bug in a lane), not environment evidence — a floor_refusal
+        # record would count it as "environment cannot meet the
+        # floor" at the verification seams.
+        if not getattr(result, "_floor_checked", False):
+            raise _errors.SandboxFloorError(
+                "sandbox internal invariant violated: a result reached "
+                "run()'s epilogue without passing the checked-dispatch "
+                "chokepoint — an executor lane is bypassing the "
+                "containment-floor contract.",
+                "route the lane through _dispatch_floor_check(lane, "
+                "executor=...) so its declared tier is asserted "
+                "against the floor.",
+                achievable=_tiers.ContainmentTier.BARE,
+                floor=_floor,
+            )
         # Interpret process termination for observability
         _interpret_result(result, cmd_display)
+
+        # Synthetic-result stamp transfer (EBADF teardown race): the
+        # handler minted a CompletedProcess whose rc=-9 reflects no
+        # real signal — evidence consumers (crash oracles, observe
+        # readers) must be able to exclude it. sandbox_info is only
+        # attached by _interpret_result above, so the handler parks
+        # the stamp on the result object.
+        if getattr(result, "_synthetic_ebadf", False):
+            result.sandbox_info["synthetic_result"] = (  # type: ignore[attr-defined]
+                "ebadf-teardown-race")
 
         # Record whether mount-ns engaged on this run so per-run
         # forensic readers (sandbox-summary.json consumers) can tell
         # if the child had mount-ns isolation or fell back to
         # Landlock-only mode. See ``core/security/THREAT_MODEL.md``
         # I2-(a) for why this matters.
-        result.sandbox_info["mount_ns_active"] = bool(use_mount)
-        result.sandbox_info["restrict_reads"] = bool(restrict_reads)
+        # not `use_mount` alone: a per-call skip_mount_ns=True child has
+        # no bind tree even on a mount-capable host — reporting True
+        # would tell forensic readers the child had fs isolation it
+        # didn't have.
+        result.sandbox_info["mount_ns_active"] = bool(  # type: ignore[attr-defined]
+            used_spawn and use_mount
+            and not _spawn_without_mount
+        )
+        if (used_spawn
+                and _spawn_without_mount):
+            # Backend vocabulary: "landlock-pidns" when the Landlock
+            # policy layer engaged (the historical mountless posture),
+            # "pidns-nomount" when the floor-consented Landlock-absent
+            # mode ran without it (the ported ns-only lane).
+            result.sandbox_info["backend"] = (  # type: ignore[attr-defined]
+                "landlock-pidns" if landlock_available
+                else "pidns-nomount")
+            if _require_fresh_procfs or _ported_hard_fresh:
+                # Stamped when the fresh procfs mount was ENFORCED
+                # ('F' fail-closed): the caller's contract flag, or
+                # the ported ns-only lane's own tier promise.
+                result.sandbox_info["fresh_procfs"] = True  # type: ignore[attr-defined]
+        # Containment-tier posture: the tier this call actually
+        # DELIVERED, the floor in force, and where the floor came
+        # from. Always stamped — the canonical answer to "what
+        # contained this run" (mount_ns_active/backend stay for
+        # compatibility). Mirrors the dispatch tags exactly,
+        # including the per-call caps (_spawn_tier_cap): a skip_pid_ns
+        # run keeps the HOST procfs on both spawn lanes (the
+        # fresh-proc remount rides the pid-ns grandchild fork), so
+        # its posture is capped at the policy-layer tier — under the
+        # redefined ns-only tier (which PROMISES a fresh procfs),
+        # stamping ns-only would tell forensic readers the run had a
+        # procfs isolation it did not have. The Landlock-absent
+        # tolerance stamps a mountless run at the ported ns-only
+        # tier (or lower, per the same cap the dispatch asserted).
+        if effectively_disabled:
+            _delivered_tier = _tiers.ContainmentTier.BARE
+        elif used_spawn and use_seatbelt:
+            _delivered_tier = _tiers.ContainmentTier.SEATBELT
+        elif used_spawn and _skip_pid_ns and sys.platform == "linux":
+            _delivered_tier = (
+                _tiers.ContainmentTier.LANDLOCK_ONLY
+                if landlock_available
+                else _tiers.ContainmentTier.BARE)
+        elif used_spawn and not _spawn_without_mount:
+            _delivered_tier = _tiers.ContainmentTier.MOUNT_NS
+        elif used_spawn and _landlock_tolerated:
+            _delivered_tier = _ported_ns_tier()
+        elif used_spawn:
+            _delivered_tier = _tiers.ContainmentTier.MOUNTLESS_NS
+        elif sys.platform == "linux" and landlock_available:
+            _delivered_tier = _tiers.ContainmentTier.LANDLOCK_ONLY
+        else:
+            _delivered_tier = _tiers.ContainmentTier.BARE
+        _tier_info = result.sandbox_info  # type: ignore[attr-defined]
+        _tier_info["containment_tier"] = _tiers.tier_label(
+            _delivered_tier)
+        _tier_info["containment_floor"] = _tiers.tier_label(_floor)
+        _tier_info["floor_source"] = _floor_source
+        if state._cli_sandbox_disabled:
+            # Accepted CLI disable (--no-sandbox / --sandbox none):
+            # stamp its consent provenance so forensic readers
+            # (sandbox-summary, verified-outcomes) can attribute the
+            # bare run to a consent source. "unrecorded" marks state
+            # set outside the gate (direct test pokes); production
+            # disables always carry a source.
+            _tier_info["disable_consent"] = (
+                state._cli_sandbox_disable_consent or "unrecorded")
+        if _netns_inherited_drop:
+            # The requested network block was inherited away (see the
+            # inherit_netns gate at the kwarg pop) — forensic readers
+            # must see that this "network-blocked" run shared the
+            # caller's netns.
+            _tier_info["netns_inherited"] = True
+        # Fresh-procfs posture for pid-ns runs. When the host refuses
+        # the grandchild's procfs remount (static kernel policy —
+        # probed once, warned once per process by _spawn), stamp the
+        # per-run consequence so forensic readers see the degradation
+        # on every affected run, not only in the deduplicated log:
+        # /proc/<ns-pid> lookups ENOENT for ptrace-family tools inside
+        # the sandbox, and the host-pid procfs listing surface stays
+        # visible on runs that accept the degrade. NOT stamped on the
+        # require_fresh_procfs contract lane: a contract run that got
+        # this far PROVED its procfs was fresh (a grandchild mount
+        # failure aborts the run before any result exists), so a
+        # divergent probe verdict must not mislabel it degraded.
+        if (used_spawn and not _skip_pid_ns
+                and not (_require_fresh_procfs or _ported_hard_fresh)
+                and sys.platform == "linux"):
+            from .probes import check_pidns_fresh_proc_available
+            if not check_pidns_fresh_proc_available():
+                result.sandbox_info[  # type: ignore[attr-defined]
+                    "pidns_proc_mount_unavailable"] = True
+        # Telemetry-key posture (weakest-wins per run dir): without a
+        # mount namespace or a read allowlist the child can read the
+        # telemetry-MAC key and mint valid tokens — triage demotes
+        # token-verified telemetry for such runs. Recorded per call
+        # so multi-call runs take the weakest posture.
+        # Seatbelt audit runs stamp what is ENFORCED: audit mode drops
+        # the SBPL read deny for allow-with-report (observe, don't
+        # block), so restrict_reads was requested but NOT delivered —
+        # the honest value is False, and weakest-wins then does the
+        # right thing across the run. Linux keeps Landlock enforcing
+        # under its audit tier, so the requested value stays honest
+        # there.
+        _seatbelt_audit_observe_only = bool(
+            used_spawn and use_seatbelt and nonlocal_audit_mode
+            and restrict_reads)
+        # Landlock-less honesty (Linux): a requested read restriction
+        # is DELIVERED only by the mount tree (visibility — unbound
+        # paths do not exist in the pivoted view) or by Landlock's
+        # read allowlist. When the run executed without either — the
+        # ported ns-only lane, or a trusted demotion to the plain
+        # lane on a Landlock-less kernel — nothing enforced it, and
+        # stamping the REQUEST would both self-contradict the tier
+        # stamp and defeat the telemetry-key forgery demotion
+        # (mac_key_hidden would claim a key the child could read was
+        # hidden). Same honesty rule the seatbelt audit tier applies.
+        _reads_unenforced_no_landlock = bool(
+            sys.platform == "linux" and restrict_reads
+            and not effectively_disabled
+            and not landlock_available
+            and not result.sandbox_info["mount_ns_active"])  # type: ignore[attr-defined]
+        _reads_enforced = bool(
+            restrict_reads and not _seatbelt_audit_observe_only
+            and not _reads_unenforced_no_landlock)
+        _posture_dir = audit_run_dir or output
+        if _posture_dir and not effectively_disabled:
+            try:
+                from . import summary as _summary_posture
+                _summary_posture.record_run_posture(
+                    Path(_posture_dir),
+                    mount_ns_active=bool(
+                        result.sandbox_info["mount_ns_active"]),  # type: ignore[attr-defined]
+                    restrict_reads=_reads_enforced,
+                    mountless_backend=bool(
+                        used_spawn and _spawn_without_mount),
+                    containment_tier=_tiers.tier_label(_delivered_tier),
+                    containment_floor=_tiers.tier_label(_floor),
+                    block_network=bool(block_network),
+                    udp_block_engaged=bool(
+                        result.sandbox_info.get("udp_block_engaged",  # type: ignore[attr-defined]
+                                                False)),
+                )
+            except Exception:  # noqa: BLE001 — best-effort telemetry posture
+                logger.debug("run posture record failed",
+                             exc_info=True)
+        if _posture_dir and state._cli_sandbox_disabled:
+            # Disabled runs never reach record_run_posture above
+            # (nothing was enforced, so there is no posture to merge)
+            # — record the CLI disable itself in parent memory so the
+            # run's sandbox-summary carries the bare-run attribution
+            # (cli_sandbox_disabled + consent source) even with zero
+            # denial records. Keyed per run dir: a sweep of another
+            # run's leftovers must not inherit this process's state.
+            try:
+                from . import summary as _summary_disable
+                _summary_disable.record_cli_disable(
+                    Path(_posture_dir),
+                    state._cli_sandbox_disable_consent or "unrecorded")
+            except Exception:  # noqa: BLE001 — best-effort telemetry posture
+                logger.debug("cli-disable record failed",
+                             exc_info=True)
+        if _mount_ns_degraded:
+            result.sandbox_info["mount_ns_degraded"] = _mount_ns_degraded  # type: ignore[attr-defined]
+        # restrict_reads is enforced on every engaged path — mount-ns
+        # via the bind tree + Landlock, skip_mount_ns and Landlock-only
+        # via the Landlock read allowlist alone — EXCEPT the seatbelt
+        # audit tier, where the read wall is observe-only (see the
+        # posture note above): stamp the enforced truth plus an
+        # explicit marker so forensic readers can tell "no read wall"
+        # from "read wall demoted by audit mode".
+        result.sandbox_info["restrict_reads"] = _reads_enforced  # type: ignore[attr-defined]
+        if _seatbelt_audit_observe_only:
+            result.sandbox_info[  # type: ignore[attr-defined]
+                "read_enforcement"] = "observe-only"
+        elif _reads_unenforced_no_landlock:
+            # Requested but nothing could enforce it (Landlock-less
+            # kernel, no mount tree) — distinct marker so forensic
+            # readers can tell "no read wall requested" from
+            # "requested, unenforceable, consented".
+            result.sandbox_info[  # type: ignore[attr-defined]
+                "read_enforcement"] = "unenforced"
+        if _private_scratch_dir or _mountless_private_scratch:
+            # Restricted host-visible posture: the host-shared /tmp and
+            # /dev/shm grants were replaced by a 0700 TMPDIR-steered scratch
+            # directory, whether namespaces remain active or not.
+            result.sandbox_info["private_scratch"] = True  # type: ignore[attr-defined]
+        if (_reaper_cell is not None and not used_spawn
+                and not _audit_landlock_engaged):
+            # No-namespace posture: teardown containment came from the
+            # subreaper sweeper + marked-process backstop rather than
+            # a pid-namespace cascade. The audit-engaged exclusion
+            # keeps the stamp honest: run_landlock_audit spawns the
+            # payload with a reaper-less rlimit preexec (no
+            # _reaper_split, no sweeper, no marker backstop) —
+            # teardown containment there is the tracer's
+            # PTRACE_O_EXITKILL, so neither sweep stamp applies. The
+            # used_spawn exclusion is load-bearing since the reaper
+            # cell became unconditional: a spawn-lane run's teardown
+            # is the pid-ns cascade, and its preexec (where the
+            # sweeper forks) never runs.
+            _sweep_info = result.sandbox_info  # type: ignore[attr-defined]
+            _sweep_info["teardown_sweep"] = True
+            # Sweeper-killability gap (kernel limitation, stamped
+            # honestly like the Landlock metadata/TRUNCATE gaps
+            # below): the sweeper forks BEFORE Landlock restrict_self,
+            # so on scoping kernels (ABI >= 6, kernel 6.12) it sits
+            # outside the payload's Landlock domain and the payload
+            # cannot signal it. Without scoping (ABI < 6, or no
+            # Landlock ruleset engaged for the payload) a hostile
+            # same-UID payload can SIGKILL the sweeper before
+            # spawning daemons, leaving only the (env-scrub-able)
+            # marker backstop. landlock.py warns once per process at
+            # ruleset build time; this stamp gives forensic readers
+            # the per-run posture. ``signal_scoped`` is recorded by
+            # _make_preexec_fn next to the ruleset-engagement
+            # predicate so the stamp cannot drift from it.
+            if not _reaper_cell.get("signal_scoped"):
+                _sweep_info["teardown_sweep_signal_unscoped"] = True
+        # Landlock metadata gap (kernel limitation, stamped honestly):
+        # Landlock has no access right for metadata-only operations —
+        # chmod/chown/utimensat/setxattr on any same-UID file OUTSIDE
+        # the writable allowlist still succeed when Landlock is the
+        # only filesystem barrier. Under mount-ns the read-only binds
+        # close this (metadata writes fail EROFS); seccomp cannot
+        # close it (the target path lives behind a pointer argument
+        # classic BPF cannot dereference). Stamp the posture so
+        # forensic readers know metadata trust does not hold for this
+        # run. See docs/sandbox.md "Known limitations".
+        if (sys.platform == "linux"
+                and not result.sandbox_info["mount_ns_active"]  # type: ignore[attr-defined]
+                and writable_paths and check_landlock_available()):
+            result.sandbox_info["landlock_metadata_ops_unrestricted"] = True  # type: ignore[attr-defined]
+            # Landlock TRUNCATE gap (ABI < 3, kernel < 6.2, stamped
+            # honestly like the metadata gap above): the TRUNCATE
+            # access right doesn't exist before ABI 3, so truncate(2)
+            # / open(O_TRUNC) on same-UID files OUTSIDE the writable
+            # allowlist still succeeds when Landlock is the only
+            # filesystem barrier. Under mount-ns the read-only binds
+            # close this (EROFS). landlock.py warns once at ruleset
+            # build time; the stamp lets forensic readers see the
+            # posture per run.
+            if _get_landlock_abi() < 3:
+                result.sandbox_info["landlock_truncate_unrestricted"] = True  # type: ignore[attr-defined]
+        if _degraded_tcp_deny or _demoted_net_deny:
+            # Both arms of the deny-all fallback stamp: the
+            # construction-time degrade AND the per-call demotion
+            # recheck — pre-fix a demoted call's engaged deny read as
+            # None here while the prose mount_ns_degraded reason was
+            # the only honest signal.
+            result.sandbox_info["degraded_net_deny"] = True  # type: ignore[attr-defined]
+        if (_use_proxy_netns and not effectively_disabled
+                and used_spawn):
+            # Stamp the DELIVERED lane, not the construction-time
+            # tier decision: a per-call spawn demotion (runtime
+            # unshare refusal, setup-status fallback) runs the child
+            # on the plain host-netns lane with _use_proxy_netns
+            # still True — stamping "netns" there told forensic
+            # readers the child had topological containment it never
+            # had (an empty proxy-events list reads as "nothing
+            # tried to egress" instead of "the enforcing tier never
+            # ran"). Demoted calls fall through to the enforcement-
+            # honest labels below.
+            result.sandbox_info["proxy_enforcement"] = "netns"  # type: ignore[attr-defined]
+        elif use_egress_proxy:
+            # Stamp what actually ENFORCES the chokepoint for THIS
+            # run, not what was requested. Pre-fix every non-netns
+            # proxy run stamped "landlock_tcp" — including runs where
+            # NOTHING enforces it: an operator-disabled sandbox sheds
+            # the port pin, Landlock and seccomp wholesale (the
+            # 0002 truth-in-stamping class, proxy edition), and an
+            # ABI < 4 kernel has no TCP allowlist for the pin to ride
+            # (the tier-3 advisory posture its own setup warning
+            # already names). In both, the proxy env vars are still
+            # staged, so routing is at the child's discretion — the
+            # honest label is "advisory". macOS enforces the pin
+            # through seatbelt SBPL, not Landlock; label it as such.
+            if effectively_disabled or (
+                    not use_seatbelt and _proxy_abi < 4):
+                result.sandbox_info["proxy_enforcement"] = "advisory"  # type: ignore[attr-defined]
+            else:
+                result.sandbox_info["proxy_enforcement"] = (  # type: ignore[attr-defined]
+                    "seatbelt_tcp" if use_seatbelt else "landlock_tcp")
+                # Record the tier-2 weakening in the per-run evidence
+                # so forensic readers of sandbox_info see the reduced
+                # guarantee alongside the enforcement label, not only
+                # in process logs: the pin is port-scoped, so any
+                # address on the pinned port is reachable without the
+                # proxy's hostname gate.
+                _t2_tier, _t2_layer = (
+                    ("seatbelt_tcp", "seatbelt SBPL") if use_seatbelt
+                    else ("landlock_tcp", "Landlock"))
+                _t2_note = (
+                    f"egress tier: {_t2_tier} port pin — {_t2_layer} "
+                    "scopes TCP connect by port only; any address on "
+                    "the proxy port is reachable without the hostname "
+                    "allowlist"
+                )
+                _t2_existing = result.sandbox_info.get("evidence", "")  # type: ignore[attr-defined]
+                result.sandbox_info["evidence"] = (  # type: ignore[attr-defined]
+                    f"{_t2_existing} — {_t2_note}" if _t2_existing
+                    else _t2_note
+                )
         # Observe nonce — only present when sandbox(observe=True)
         # actually engaged audit mode at spawn time; absent under
         # plain audit and absent when observe was requested but
@@ -1859,14 +8922,39 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # Stamp the nonce in either case so the operator can pass
         # it to parse_observe_log() for spoof-resistant parsing.
         _audit_engaged_anywhere = (
-            spawn_eligible or _audit_landlock_engaged
+            used_spawn or _audit_landlock_engaged
         )
+        # Machine-readable evidence-channel record: when the caller
+        # asked for audit, say whether ANY audit tier engaged for
+        # this call. False pairs with the per-run
+        # sandbox-audit-degraded.json marker (which carries the why);
+        # consumers (triage provenance, run-metadata readers) get a
+        # per-call signal instead of parsing warnings out of stderr.
+        # Absent when audit was not requested/engaged for the call.
+        if nonlocal_audit_mode:
+            result.sandbox_info["audit_engaged"] = bool(  # type: ignore[attr-defined]
+                _audit_engaged_anywhere
+            )
         if (nonlocal_observe_nonce is not None
                 and nonlocal_audit_mode
                 and _audit_engaged_anywhere):
-            result.sandbox_info["observe_nonce"] = nonlocal_observe_nonce
+            result.sandbox_info["observe_nonce"] = nonlocal_observe_nonce  # type: ignore[attr-defined]
+            # Record HOW the nonce reached the tracer so
+            # parse_observe_log's backstop can refuse nonce-based
+            # trust if a future regression re-introduces a delivery
+            # channel the target could read on a namespace-less
+            # host. macOS: the nonce stays in parent-process state
+            # (seatbelt_audit.LogStreamer) and never touches disk;
+            # Linux spawn paths (mount-ns _spawn AND the Landlock-
+            # only _landlock_audit helper): anonymous fd — memfd
+            # passed as /proc/self/fd/N, no filesystem name.
+            result.sandbox_info["nonce_delivery"] = (  # type: ignore[attr-defined]
+                "in_process"
+                if (spawn_eligible and use_seatbelt)
+                else "anonymous_fd"
+            )
         else:
-            result.sandbox_info["observe_nonce"] = None
+            result.sandbox_info["observe_nonce"] = None  # type: ignore[attr-defined]
 
         # Attach proxy events (allow + deny + dns_fail + bytes) to
         # sandbox_info. Available to callers as
@@ -1876,120 +8964,29 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         # caller_label has already been stamped by the proxy at
         # unregister time (one copy, authoritative).
         if events:
-            result.sandbox_info["proxy_events"] = events
+            result.sandbox_info["proxy_events"] = events  # type: ignore[attr-defined]
             # Surface a concise summary in the top-level evidence for
             # quick-triage readers of sandbox_info.
             allowed = sum(1 for e in events if e["result"] == "allowed")
-            denied = sum(1 for e in events
-                         if e["result"] in ("denied_host", "denied_resolved_ip"))
+            from .proxy import _STATS_DENIED_RESULTS
+            denied = sum(1 for e in events if e["result"] in _STATS_DENIED_RESULTS)
             summary = (
                 f"egress: {allowed} allowed, {denied} denied "
                 f"({len(events)} total)"
             )
-            existing = result.sandbox_info.get("evidence", "")
-            result.sandbox_info["evidence"] = (
+            existing = result.sandbox_info.get("evidence", "")  # type: ignore[attr-defined]
+            result.sandbox_info["evidence"] = (  # type: ignore[attr-defined]
                 f"{existing} — {summary}" if existing else summary
             )
 
-            # Persist events to disk when an output dir is available.
-            # JSONL format (one JSON object per line) — append-friendly,
-            # streaming-friendly, trivially post-processable. Single
-            # append per sandbox() call, opened and closed to flush
-            # immediately (no open-file handle outliving this call).
-            # Non-fatal on write failure — observability is nice-to-
-            # have, not a reason to break the caller.
-            #
-            # Opened with O_NOFOLLOW + O_NONBLOCK and fstat-validated
-            # as a regular file to defeat two child-side TOCTOUs: a
-            # sandboxed child has write access to {output} and could
-            # pre-plant {output}/proxy-events.jsonl as either —
-            # (a) a symlink to ~/.bashrc / authorized_keys / daemon
-            #     log, in which case a following open would append
-            #     attacker-influenced JSON outside the sandbox
-            #     boundary (sandbox-escape write). O_NOFOLLOW blocks.
-            # (b) a FIFO with no reader, in which case open(O_WRONLY)
-            #     without O_NONBLOCK blocks the parent forever —
-            #     DoS against any RAPTOR caller that reuses `output`.
-            #     O_NONBLOCK + O_APPEND + fstat(S_ISREG) closes this.
-            #
-            # Invariant: never persist the JSONL into a path that lives
-            # under `target`. Some callers (e.g. packages/codeql/
-            # build_detector.py) intentionally pass output=target so
-            # Landlock engages on a writable repo for compile/build
-            # steps; writing proxy-events.jsonl there would pollute the
-            # user's scanned source tree. In-memory events on
-            # result.sandbox_info["proxy_events"] are unaffected.
-            _skip_target_pollution = False
-            try:
-                _norm_out = os.path.realpath(output) if output else None
-                _norm_tgt = os.path.realpath(target) if target else None
-                if _norm_out and _norm_tgt and (
-                    _norm_out == _norm_tgt
-                    or _norm_out.startswith(_norm_tgt + os.sep)
-                ):
-                    _skip_target_pollution = True
-                    logger.debug(
-                        f"Sandbox: output ({_norm_out}) lies within "
-                        f"target ({_norm_tgt}); skipping proxy-events."
-                        f"jsonl persistence to avoid polluting the "
-                        f"scanned tree (in-memory events unaffected)"
-                    )
-            except OSError:
-                # realpath() failed (e.g. dangling component, perm
-                # error). Fall back to the existing behaviour rather
-                # than break the scan over an observability check.
-                pass
-            if output and not _skip_target_pollution:
-                try:
-                    import json as _json
-                    _log_path = os.path.join(
-                        output, _proxy_mod.PROXY_EVENTS_FILENAME,
-                    )
-                    _log_fd = os.open(
-                        _log_path,
-                        os.O_WRONLY | os.O_APPEND | os.O_CREAT
-                        | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-                        0o600,
-                    )
-                    try:
-                        _log_st = os.fstat(_log_fd)
-                        if not stat.S_ISREG(_log_st.st_mode):
-                            # Child-planted FIFO / socket / device.
-                            # Close and skip; don't raise — proxy
-                            # event persistence is observability,
-                            # not a hard dependency.
-                            os.close(_log_fd)
-                            logger.debug(
-                                f"Sandbox: {_log_path} exists but is "
-                                f"not a regular file "
-                                f"(mode=0o{_log_st.st_mode:o}); "
-                                f"skipping proxy event persistence"
-                            )
-                        else:
-                            # Clear O_NONBLOCK for the actual append.
-                            # O_NONBLOCK was only needed to stop a
-                            # FIFO-open-hang; on a regular file it's
-                            # harmless but also pointless.
-                            import fcntl as _fcntl
-                            _flags = _fcntl.fcntl(_log_fd, _fcntl.F_GETFL)
-                            _fcntl.fcntl(_log_fd, _fcntl.F_SETFL,
-                                         _flags & ~os.O_NONBLOCK)
-                            with os.fdopen(_log_fd, "a", encoding="utf-8") as _f:
-                                for e in events:
-                                    _f.write(_json.dumps(e) + "\n")
-                    except BaseException:
-                        # os.fdopen would take ownership on success;
-                        # on any pre-fdopen failure we still own fd.
-                        try:
-                            os.close(_log_fd)
-                        except OSError:
-                            pass
-                        raise
-                except OSError as _log_err:
-                    logger.debug(
-                        f"Sandbox: could not persist proxy events to "
-                        f"{output}/proxy-events.jsonl: {_log_err}"
-                    )
+            # Per-spawn persistence: write this subprocess's events
+            # to ``<output>/proxy-events.jsonl`` immediately. The
+            # block-level write at ``sandbox()`` ``__exit__`` covers
+            # events from non-subprocess code inside the with-block
+            # (e.g. ``agent.py``'s in-process ``analyse()``); both
+            # writers share the same safe-open helper + the target-
+            # pollution skip so the file format stays unified.
+            _persist_proxy_events(events, output=output, target=target)
 
         # Check for sandbox enforcement. Each category is only reported when
         # its layer is actually engaged for this call — prevents false
@@ -2019,31 +9016,119 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
         #     clause (the default exception list is /private/tmp +
         #     output + writable_paths), so use_seatbelt itself is
         #     sufficient signal that fs writes are gated.
-        #   seccomp: macOS has no real equivalent; we treat the
-        #     SBPL hardening clauses (Tier 1.4, deny process-info etc.)
-        #     as a coarse stand-in when seccomp_profile is requested.
+        #   seccomp: Linux only. Seatbelt EPERM is not evidence of a
+        #     seccomp syscall denial and must not suggest Linux remedies.
         network_engaged = bool(
             (need_unshare and block_network)
             or (use_seatbelt and (block_network or use_egress_proxy))
+            or (_degraded_tcp_deny and landlock_available)
         )
         landlock_engaged = bool(
-            ((writable_paths or allowed_tcp_ports) and landlock_available)
+            ((writable_paths or allowed_tcp_ports or effective_read_paths)
+             and landlock_available)
             or use_seatbelt
         )
         seccomp_engaged = bool(
-            (seccomp_profile and check_seccomp_available())
-            or (use_seatbelt and seccomp_profile and seccomp_profile != "none")
+            sys.platform == "linux" and seccomp_profile
+            and seccomp_profile != "none" and check_seccomp_available()
         )
-        if stderr_text and (network_engaged or landlock_engaged or seccomp_engaged):
+        if ((stderr_text or events)
+                and (network_engaged or landlock_engaged or seccomp_engaged or use_egress_proxy)):
             _check_blocked(stderr_text, cmd_display, result.returncode,
-                          result.sandbox_info,
+                          result.sandbox_info,  # type: ignore[attr-defined]
                           network_engaged=network_engaged,
+                          proxy_events=events if use_egress_proxy else None,
                           landlock_engaged=landlock_engaged,
                           writable_paths=writable_paths,
                           seccomp_engaged=seccomp_engaged,
-                          seccomp_profile=seccomp_profile)
+                          seccomp_profile=seccomp_profile,  # type: ignore[arg-type]
+                          degraded_net_deny=_degraded_tcp_deny,
+                          # Linux: the SOCK_DGRAM block rides the
+                          # seccomp filter, so it is only live when
+                          # seccomp is. macOS: seatbelt's blanket
+                          # network deny covers UDP/loopback wholesale.
+                          udp_block_engaged=bool(
+                              ((seccomp_block_udp or _demoted_net_deny)
+                               and seccomp_engaged)
+                              or (use_seatbelt
+                                  and (block_network
+                                       or use_egress_proxy))))
 
+        # subprocess.run parity for check= — after interpretation and
+        # event accounting so a raising run still leaves run.events
+        # and the blocked-operation diagnostics populated.
+        if _check_requested and result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, getattr(result, "args", list(cmd)),
+                output=result.stdout, stderr=result.stderr,
+            )
         return result
+
+    # Each invocation owns its job, including retries of the namespace
+    # backend. Only this wrapper can supply the private controller channel.
+    from functools import wraps as _wraps
+    from .job_budget import Job as _Job
+    _execute_call = run
+
+    @_own_execution_observations
+    @_wraps(_execute_call)
+    def _budgeted_run(cmd, **kwargs):
+        if '_job_controller' in kwargs:
+            raise TypeError('_job_controller is an internal sandbox argument')
+        _execution_invocation = kwargs.pop('_execution_invocation')
+        from .summary import get_active_run_dir as _active_run_dir
+        _attributed_run_dir = _active_run_dir() or audit_run_dir or output
+        job = None
+        result = None
+        failure = None
+        try:
+            job = _Job(_budget_spec, namespace_backend=bool(
+                sys.platform == 'linux' and use_mount and not effectively_disabled),
+                run_dir=_attributed_run_dir)
+            result = _execute_call(cmd, _job_controller=job,
+                                   _execution_invocation=_execution_invocation, **kwargs)
+            return result
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            try:
+                if job is not None:
+                    job.close()
+            except BaseException as cleanup_error:
+                if failure is None:
+                    failure = cleanup_error
+                    raise
+                with suppress(BaseException):
+                    failure.add_note('job cleanup: ' + type(cleanup_error).__name__)
+            finally:
+                budget_record = (job.record if job is not None else
+                                 getattr(failure, 'job_budget', {}))
+                if result is not None:
+                    result.sandbox_info['job_budget'] = budget_record
+                if failure is not None:
+                    try:
+                        failure.job_budget = budget_record
+                    except Exception:
+                        with suppress(BaseException):
+                            failure.add_note('job budget receipt available in the run activity report')
+                # Retain parent-owned observations before run finalisation.
+                try:
+                    from . import activity as _activity
+                    _activity.record_execution(
+                        _attributed_run_dir,
+                        result=result, error=failure, job_budget=budget_record,
+                        observation_dir=audit_run_dir or output,
+                    )
+                except BaseException as activity_error:
+                    if failure is None:
+                        raise
+                    with suppress(BaseException):
+                        failure.add_note(
+                            'sandbox activity receipt: '
+                            + type(activity_error).__name__)
+
+    run = _budgeted_run
 
     # Expose the cumulative per-sandbox event view as an attribute on the
     # yielded run. Each inner run() call appends its per-call slice to this
@@ -2064,98 +9149,458 @@ def sandbox(block_network: bool = False, target: str = None, output: str = None,
     # only fires after the yield is reached. Acquiring immediately
     # before the yield ensures the matching release is guaranteed by
     # the finally below.
-    if use_egress_proxy and _will_engage_audit:
-        proxy_instance.acquire_audit_log_only()
-        _engaging_audit = True
+    # Block-level proxy-event token: captures events from
+    # non-subprocess HTTPClient calls inside ``with sandbox():``.
+    # The per-spawn token inside ``_run()`` already captures
+    # subprocess-attributed events; this block token fills the gap
+    # for callers like ``agent.py`` that wrap pure-Python work in
+    # the sandbox (no subprocess via ``run()``). Persistence at
+    # ``__exit__`` dedups against ``_sandbox_events`` so a single
+    # ``proxy-events.jsonl`` doesn't carry duplicates of events
+    # that the per-spawn writer already persisted. Only acquired
+    # when audit-mode IS engaging — same operator-intent gate as
+    # the audit ref-count acquire below. Registered BEFORE the
+    # audit acquire so the audit-acquire-to-yield gap stays
+    # minimal (pinned by ``test_acquire_happens_immediately_
+    # before_yield``); if ``register_sandbox`` raises, the audit
+    # acquire never runs so there's no ref-count leak.
+    _block_token: int | None = None
+    _audit_enable_attempted = False
     try:
+        if (use_egress_proxy and _will_engage_audit and output
+                and proxy_instance is not None):
+            # Same lane subscription as the per-spawn buffers (D3): the
+            # cm-block view collects THIS context's would-deny records,
+            # not a concurrent run's.
+            _block_token = proxy_instance.register_sandbox(
+                caller_label=(
+                    f"{caller_label}:cm-block" if caller_label
+                    else "sandbox:cm-block"
+                ),
+                lane_key=(_proxy_unix_path if _use_proxy_netns
+                          else _proxy_tcp_lane_port),
+                host_recon_threshold=host_recon_threshold_for_profile(
+                    profile or DEFAULT_PROFILE,
+                    _proxy_mod.DEFAULT_HOST_RECON_THRESHOLD,
+                ),
+            )
+        if _private_scratch_dir is not None:
+            # Registered here, adjacent to the try whose finally
+            # unregisters (only the guard-tested non-raising audit
+            # acquire sits between), so no setup-failure path can strand
+            # the registration. The dir is seconds old during setup, so
+            # late registration loses no reaper protection.
+            from core.run.scratch import keepalive_register
+            keepalive_register(_private_scratch_dir)
+        if _persona_tmpdir is not None:
+            # Same contract as the scratch above: the persona home is
+            # reaper-listed and mtime-quiet after build_persona writes it
+            # once, but a long-lived context making run() calls past the
+            # age floor still needs its source files — losing them would
+            # skip the overlay and leak host-real identity to the target.
+            from core.run.scratch import keepalive_register
+            keepalive_register(_persona_tmpdir)
+        if use_egress_proxy and _will_engage_audit:
+            # Scope the leniency to THIS context's lane. Concurrent
+            # sandboxes and in-process consumers (main listener) stay
+            # enforcing. set_lane_audit returning False means no lane
+            # exists (tcp lane bind failed) — fail CLOSED: the audit run
+            # proceeds with gate 1 enforcing and the operator is told the
+            # would-deny signal is incomplete.
+            _lane_key = (
+                _proxy_unix_path if _use_proxy_netns
+                else _proxy_tcp_lane_port
+            )
+            # An interrupted setter may already have enabled the lane.
+            _audit_enable_attempted = _lane_key is not None
+            if _lane_key is not None and proxy_instance.set_lane_audit(  # type: ignore[union-attr]
+                    _lane_key, True):
+                _engaging_audit = True
+            else:
+                logger.warning(
+                    "Sandbox: audit-log mode unavailable for this "
+                    "context (no proxy lane) — egress allowlist stays "
+                    "ENFORCING; would-deny events will appear as real "
+                    "denials."
+                )
         yield run
     finally:
-        if use_egress_proxy and _engaging_audit:
-            try:
-                proxy_instance.release_audit_log_only()
-            except Exception:
-                # WARNING-level (not debug): a failed release leaks
-                # the ref-count, which means every subsequent sandbox
-                # in this process will see inflated _audit_count
-                # and the proxy gate will be stuck in audit-log mode
-                # — non-audit sibling sandboxes get downgraded
-                # silently. Operator needs visibility into this so
-                # they can restart the process if accumulating leaks
-                # affect production. Stack trace via exc_info=True
-                # for diagnosis.
-                logger.warning(
-                    "audit ref-count release failed — proxy gate "
-                    "may stay in audit-log mode for remaining "
-                    "sandboxes in this process. Restart RAPTOR if "
-                    "this recurs.",
-                    exc_info=True,
+        from ._retirement import retire_parent_resources
+
+        def _retire_context_events() -> None:
+            # Drain + dedup + persist the block-token events before
+            # releasing the audit ref-count. Per-spawn events were
+            # fanned into BOTH the per-spawn token (already persisted
+            # by ``_run()``) AND the block token; dedup on
+            # ``(proxy_seq, t, host, port)`` so the JSONL doesn't carry
+            # duplicates. The proxy's per-event ``proxy_seq`` (distinct
+            # from the persisted stream ``seq``) keeps two
+            # GENUINELY DISTINCT events apart even when they tie on
+            # (t, host, port) — a bare timestamp key silently dropped
+            # such a second event from the persisted JSONL.
+            # ``_sandbox_events`` is the cumulative per-spawn view
+            # appended after each inner ``run()``.
+            if _block_token is not None and proxy_instance is not None:
+                try:
+                    _block_events = proxy_instance.unregister_sandbox(
+                        _block_token,
+                    )
+                except Exception:                       # noqa: BLE001
+                    _block_events = []
+                if _block_events:
+                    _seen = {
+                        (e.get("proxy_seq"), e.get("t"), e.get("host"),
+                         e.get("port"))
+                        for e in _sandbox_events
+                    }
+                    _block_only = [
+                        e for e in _block_events
+                        if (e.get("proxy_seq"), e.get("t"), e.get("host"),
+                            e.get("port"))
+                        not in _seen
+                    ]
+                    if _block_only:
+                        _persist_proxy_events(
+                            _block_only, output=output, target=target,
+                        )
+
+        def _retire_context_audit() -> None:
+            if use_egress_proxy and (_engaging_audit or _audit_enable_attempted):
+                # Clear the audit bit BEFORE unbind/close pops the lane
+                # from the registry: set_lane_audit resolves the key
+                # through the registry and returns False once the lane is
+                # popped, so a clear placed after unbind/close was a
+                # silent no-op — in-flight connections (handlers hold the
+                # lane object) kept log-and-allow leniency until they
+                # finished. Clearing first flips the shared lane object's
+                # bit while it is still resolvable, so in-flight handlers
+                # revert to enforcing immediately.
+                try:
+                    _lane_key = (
+                        _proxy_unix_path if _use_proxy_netns
+                        else _proxy_tcp_lane_port
+                    )
+                    if _lane_key is not None:
+                        proxy_instance.set_lane_audit(_lane_key, False)  # type: ignore[union-attr]
+                except Exception:
+                    # WARNING-level (not debug): a failed clear leaves
+                    # connections in flight on this context's lane in
+                    # audit-log mode until they finish — the operator
+                    # should see it, because a recurring failure here
+                    # means the teardown path is broken.
+                    logger.warning(
+                        "audit lane clear failed — in-flight connections "
+                        "on this context's lane may keep audit-log mode "
+                        "until they finish.",
+                        exc_info=True,
+                    )
+
+        def _retire_context_unix_lane() -> None:
+            if _use_proxy_netns and _proxy_unix_path and proxy_instance is not None:
+                try:
+                    proxy_instance.unbind_unix(_proxy_unix_path)
+                except Exception:
+                    logger.debug(
+                        "proxy unix socket cleanup failed", exc_info=True,
+                    )
+
+        def _retire_context_tcp_lane() -> None:
+            if _proxy_tcp_lane_port is not None and proxy_instance is not None:
+                try:
+                    proxy_instance.close_tcp_lane(_proxy_tcp_lane_port)
+                except Exception:
+                    logger.debug(
+                        "proxy tcp lane cleanup failed", exc_info=True,
+                    )
+
+        def _retire_context_lane_dir() -> None:
+            # Per-instance lane directory follows its socket.
+            if _proxy_lane_dir is not None:
+                import shutil as _shutil
+                try:
+                    _shutil.rmtree(_proxy_lane_dir, ignore_errors=True)
+                except Exception:
+                    logger.debug(
+                        "proxy lane dir cleanup failed for %s",
+                        _proxy_lane_dir, exc_info=True,
+                    )
+
+        def _retire_context_persona() -> None:
+            # Persona tmpdir lifecycle: created in build_persona above; the
+            # source files were bind-mounted into the sandbox children but
+            # bind sources can be unlinked after the bind is established —
+            # the kernel keeps the inode alive for the lifetime of the mount.
+            # Cleanup now is safe even mid-run (rare: with sandbox() used as
+            # a long-lived context wrapping many run() calls). For simplicity
+            # we only clean up at __exit__; the file count is small.
+            if _persona_tmpdir is not None:
+                import shutil as _shutil
+                from core.run.scratch import keepalive_unregister
+
+                def _remove_persona_dir() -> None:
+                    try:
+                        _shutil.rmtree(_persona_tmpdir, ignore_errors=True)
+                    except Exception:
+                        logger.debug(
+                            "persona tmpdir cleanup failed for %s",
+                            _persona_tmpdir, exc_info=True,
+                        )
+
+                retire_parent_resources(
+                    lambda: keepalive_unregister(_persona_tmpdir),
+                    _remove_persona_dir,
                 )
-        # Persona tmpdir lifecycle: created in build_persona above; the
-        # source files were bind-mounted into the sandbox children but
-        # bind sources can be unlinked after the bind is established —
-        # the kernel keeps the inode alive for the lifetime of the mount.
-        # Cleanup now is safe even mid-run (rare: with sandbox() used as
-        # a long-lived context wrapping many run() calls). For simplicity
-        # we only clean up at __exit__; the file count is small.
-        if _persona_tmpdir is not None:
-            import shutil as _shutil
-            try:
-                _shutil.rmtree(_persona_tmpdir, ignore_errors=True)
-            except Exception:
-                logger.debug(
-                    "persona tmpdir cleanup failed for %s",
-                    _persona_tmpdir, exc_info=True,
+
+        def _retire_context_scratch() -> None:
+            # Private scratch dir (restricted Landlock-only posture) —
+            # per-context, so it goes with the context.
+            if _private_scratch_dir is not None:
+                import shutil as _shutil
+                from core.run.scratch import keepalive_unregister
+
+                def _remove_private_scratch() -> None:
+                    try:
+                        _shutil.rmtree(_private_scratch_dir, ignore_errors=True)
+                    except Exception:
+                        logger.debug(
+                            "private scratch cleanup failed for %s",
+                            _private_scratch_dir, exc_info=True,
+                        )
+
+                retire_parent_resources(
+                    lambda: keepalive_unregister(_private_scratch_dir),
+                    _remove_private_scratch,
                 )
+
+        def _retire_context_demotions() -> None:
+            # Per-call scratch dirs minted by mount-ns demotions.
+            if _demoted_scratch_dirs:
+                import shutil as _shutil
+                from core.run.scratch import keepalive_unregister
+
+                def _retire_demoted_dir(_dsd: str) -> None:
+                    def _remove_demoted_dir() -> None:
+                        try:
+                            _shutil.rmtree(_dsd, ignore_errors=True)
+                        except Exception:
+                            logger.debug(
+                                "demoted scratch cleanup failed for %s",
+                                _dsd, exc_info=True,
+                            )
+
+                    retire_parent_resources(
+                        lambda: keepalive_unregister(_dsd),
+                        _remove_demoted_dir,
+                    )
+
+                retire_parent_resources(*(
+                    lambda _dsd=_dsd: _retire_demoted_dir(_dsd)
+                    for _dsd in _demoted_scratch_dirs
+                ))
+
+        retire_parent_resources(
+            _retire_context_events,
+            _retire_context_audit,
+            _retire_context_unix_lane,
+            _retire_context_tcp_lane,
+            _retire_context_lane_dir,
+            _retire_context_persona,
+            _retire_context_scratch,
+            _retire_context_demotions,
+        )
+
+
+def _cmd_resolves_nowhere(cmd: "list | None",
+                          env_path: "str | None", *, cwd=None) -> bool:
+    """True when ``cmd[0]`` resolves NOWHERE — not on the caller's
+    PATH, not on ``env_path`` (a child/caller-provided PATH value),
+    and (for absolute invocations) not on the filesystem. This is the
+    shape whose cross-lane contract is the subprocess-parity
+    FileNotFoundError (see the missing-tool check in the per-call run
+    body). Relative-with-separator commands resolve against the CHILD
+    cwd and are never classified here; an empty/absent command is left
+    to the lane's own validation. An absent child PATH uses the default
+    exec search, matching os.execvpe rather than inheriting caller PATH.
+    Relative and empty child PATH entries are searched from the child cwd.
+    An unusable cwd is left to the lane's own validation."""
+    if not (cmd and cmd[0]):
+        return False
+    _cmd0 = cmd[0]
+    if os.sep not in _cmd0:
+        if shutil.which(_cmd0):
+            return False
+        _child_path = os.defpath if env_path is None else env_path
+        _cwd = os.fsdecode(cwd) if cwd is not None else None
+        if _cwd is not None and (not _cwd or not os.path.isdir(_cwd)):
+            return False
+        _entries = _child_path.split(os.pathsep)
+        if any(not os.path.isabs(entry) for entry in _entries):
+            try:
+                if _cwd is None:
+                    _base = os.getcwd()
+                elif os.path.isabs(_cwd):
+                    _base = _cwd
+                else:
+                    _base = os.path.join(os.getcwd(), _cwd)
+            except OSError:
+                return False
+            # Do not normpath: symlink/.. traversal belongs to the filesystem.
+            _entries = [entry if os.path.isabs(entry) else os.path.join(_base, entry)
+                        for entry in _entries]
+        return shutil.which(_cmd0, path=os.pathsep.join(_entries)) is None
+    if os.path.isabs(_cmd0):
+        return not os.path.exists(_cmd0)
+    return False  # relative-with-sep: cwd-dependent
 
 
 # Convenience: standalone run function for one-off sandboxed commands
-def run(cmd: List[str], block_network: bool = False, target: str = None,
-        output: str = None, allowed_tcp_ports: list = None,
-        profile: str = None, disabled: bool = False, limits: dict = None,
+def run(cmd: list[str], block_network=_UNSET, target: str | None = None,
+        output: str | None = None, allowed_tcp_ports: list | None = None,
+        profile: str | None = None, disabled: bool = False, limits: dict | None = None,
         map_root: bool = False,
-        use_egress_proxy: bool = False, proxy_hosts: list = None,
-        restrict_reads: bool = False, readable_paths: list = None,
-        caller_label: str = None,
-        fake_home: bool = False,
-        tool_paths: list = None,
+        use_egress_proxy: bool = False, proxy_hosts: list | None = None,
+        proxy_allowed_ports: list | None = None,
+        require_proxy_netns: bool = False,
+        restrict_reads=_UNSET, readable_paths: list | None = None,
+        caller_label: str | None = None,
+        fake_home=_UNSET,
+        tool_paths: list | None = None,
         audit: bool = False, audit_verbose: bool = False,
-        audit_run_dir: Optional[str] = None,
+        audit_run_dir: str | None = None,
+        audit_required: bool = False,
         observe: bool = False,
-        writable_paths: Optional[list] = None,
+        writable_paths: list | None = None,
+        exclude_tmp_baseline: bool = False,
         sanitise_host_fingerprint: bool = False,
-        cpu_count: Optional[int] = None,
+        cpu_count: int | None = None,
         require_sanitisation: bool = False,
+        etc_overlay: dict | None = None,
+        degraded_net_deny: bool = True,
+        loopback_unix_bridges: dict | None = None,
+        omit_proc_reads: bool = False,
+        omit_etc_reads: bool = False,
+        rootfs: str | None = None,
+        output_run_root_ok: bool = False,
+        job_budget: dict | None = None,
         **kwargs) -> subprocess.CompletedProcess:
     """Run a single command in a sandbox. Convenience wrapper.
 
     Use this instead of subprocess.run() for any command that processes
-    untrusted content. Applies get_safe_env(), resource limits, and
-    namespace isolation automatically.
+    untrusted content — and prefer run_untrusted() when the COMMAND
+    ITSELF comes from or is influenced by the analysed target: it is
+    the fail-closed variant (refuses to execute whenever the sandbox
+    cannot engage). This wrapper degrades with a warning ONLY while
+    some layer can still enforce what the caller asked for; it too
+    refuses (SandboxSetupError) when nothing can — a mount-ns demotion
+    on a Landlock-less kernel with target/output/allowed_tcp_ports/
+    restrict_reads set, or block_network=True with no enforcing layer
+    left (Linux: neither the namespace backend nor Landlock ABI v4+;
+    macOS: seatbelt unavailable — there is no fallback network-deny
+    layer there at all).
+    Applies get_safe_env(), resource limits, and namespace isolation
+    automatically.
 
     Accepts the same sandbox-configuration kwargs as sandbox() — forwards
-    them into a one-shot context.
+    them into a one-shot context. An omitted block_network follows the
+    selected profile; an explicit boolean overrides that profile default.
     """
-    with sandbox(block_network=block_network, target=target, output=output,
-                 allowed_tcp_ports=allowed_tcp_ports, profile=profile,
-                 disabled=disabled, limits=limits, map_root=map_root,
-                 use_egress_proxy=use_egress_proxy,
-                 proxy_hosts=proxy_hosts,
-                 restrict_reads=restrict_reads,
-                 readable_paths=readable_paths,
-                 caller_label=caller_label,
-                 fake_home=fake_home,
-                 tool_paths=tool_paths,
-                 audit=audit, audit_verbose=audit_verbose,
-                 audit_run_dir=audit_run_dir,
-                 observe=observe,
-                 writable_paths=writable_paths,
-                 sanitise_host_fingerprint=sanitise_host_fingerprint,
-                 cpu_count=cpu_count,
-                 require_sanitisation=require_sanitisation) as _run:
+    _validate_output_redirections(kwargs)
+    from contextlib import ExitStack
+
+    from .errors import SandboxSetupError
+    with ExitStack() as _stack:
+        try:
+            _run = _stack.enter_context(sandbox(
+                block_network=block_network, target=target, output=output,
+                allowed_tcp_ports=allowed_tcp_ports, profile=profile,
+                disabled=disabled, limits=limits, map_root=map_root,
+                use_egress_proxy=use_egress_proxy,
+                proxy_hosts=proxy_hosts,
+                proxy_allowed_ports=proxy_allowed_ports,
+                require_proxy_netns=require_proxy_netns,
+                restrict_reads=restrict_reads,
+                readable_paths=readable_paths,
+                caller_label=caller_label,
+                fake_home=fake_home,
+                tool_paths=tool_paths,
+                audit=audit, audit_verbose=audit_verbose,
+                audit_run_dir=audit_run_dir,
+                audit_required=audit_required,
+                observe=observe,
+                writable_paths=writable_paths,
+                exclude_tmp_baseline=exclude_tmp_baseline,
+                sanitise_host_fingerprint=sanitise_host_fingerprint,
+                cpu_count=cpu_count,
+                require_sanitisation=require_sanitisation,
+                etc_overlay=etc_overlay,
+                degraded_net_deny=degraded_net_deny,
+                loopback_unix_bridges=loopback_unix_bridges,
+                omit_proc_reads=omit_proc_reads,
+                omit_etc_reads=omit_etc_reads,
+                rootfs=rootfs,
+                output_run_root_ok=output_run_root_ok,
+                job_budget=job_budget))
+        except SandboxSetupError as _construction_refusal:
+            # Refusal PRIORITY at the one-shot boundary. Context
+            # construction refuses on capability grounds (e.g.
+            # block_network with neither a namespace backend nor
+            # Landlock ABI v4+) without ever seeing the command or
+            # the call class — but run() knows both, and two per-call
+            # surfaces outrank a capability refusal, in the per-call
+            # body's own order (floor resolution first, missing-tool
+            # second, lane dispatch last):
+            #
+            #  * the consent-chain floor refusal (never-BARE:
+            #    "--sandbox-floor none" / a bare project floor on
+            #    untrusted-class work) is not remediable by ANY
+            #    environment change, so the capability refusal's
+            #    remedies (enable userns, `--sandbox none`, the
+            #    degraded-tier waiver) are misleading for it;
+            #  * a command that resolves NOWHERE cannot execute on
+            #    any lane of any host, so the missing-tool contract
+            #    (subprocess-parity FileNotFoundError, the callers'
+            #    `except FileNotFoundError: <tool> not installed`
+            #    arm) must keep working on degraded hosts too —
+            #    nothing runs either way, no enforcement is lost.
+            #
+            # Scoped to a REFUSING construction: on hosts where the
+            # context engages, nothing here changes — the per-call
+            # body keeps owning both checks.
+            if not disabled:
+                # operator_disabled=False is exact in this arm: the
+                # operator-disabled construction path never refuses
+                # (no enforcement gates run there).
+                _explicit_tier, _explicit_src = _explicit_untrusted_floor()
+                _rfp = kwargs.get("require_fresh_procfs")
+                try:
+                    _tiers.resolve_call_floor(
+                        operator_disabled=False,
+                        require_fresh_procfs=(
+                            bool(_rfp) if _rfp is not None else None),
+                        untrusted_workload=bool(
+                            kwargs.get("_untrusted_workload", False)),
+                        waiver_active=_degraded_untrusted_waiver(),
+                        explicit_floor=_explicit_tier,
+                        explicit_source=_explicit_src,
+                        host_floor=_host_consented_floor(),
+                    )
+                except _errors.SandboxFloorError as _floor_exc:
+                    raise _record_floor_refusal(
+                        audit_run_dir or output, _floor_exc,
+                    ) from _construction_refusal
+            _resolution_cwd = kwargs.get("cwd")
+            if _resolution_cwd is None and output:
+                _resolution_cwd = os.path.abspath(output)
+            if rootfs is None and _cmd_resolves_nowhere(
+                    cmd, (kwargs.get("env") or {}).get("PATH"), cwd=_resolution_cwd):
+                raise FileNotFoundError(
+                    errno.ENOENT, os.strerror(errno.ENOENT),
+                    cmd[0]) from _construction_refusal
+            raise
         return _run(cmd, **kwargs)
 
 
-def run_trusted(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
+def run_trusted(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a command whose input was chosen by RAPTOR itself (not the target).
 
     Example uses: readelf/nm/strings on a RAPTOR-picked binary path,
@@ -2173,18 +9618,907 @@ def run_trusted(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
     """
     misused = _SANDBOX_KWARGS & kwargs.keys()
     if misused:
-        raise TypeError(
+        msg = (
             f"run_trusted() does not accept sandbox kwargs {sorted(misused)} — "
             f"it always runs with profile='none'. Use run_untrusted(), run() "
             f"or sandbox() for isolated execution."
         )
+        raise TypeError(msg)
     return run(cmd, profile="none", **kwargs)
 
 
-def run_untrusted(cmd: List[str], *, target: str = None, output: str = None,
-                  limits: dict = None,
+# Recording preserves the refusal's concrete type: callers raise the
+# exact exception they passed in (SandboxFloorError from the typed
+# arms, plain SandboxSetupError from strict's record-then-raise).
+_FloorExcT = TypeVar("_FloorExcT", bound=_errors.SandboxSetupError)
+
+
+def _record_floor_refusal(
+        run_dir: "str | os.PathLike | None",
+        exc: _FloorExcT,
+        *,
+        floor_label: "str | None" = None,
+        achievable_label: "str | None" = None,
+) -> _FloorExcT:
+    """Record a containment-floor refusal into the run-dir evidence
+    stream (best-effort) and return ``exc`` for the caller to raise.
+
+    The verification seams (dark verification, exploit execution,
+    mitigation replay) map these refusals to the
+    ``unverifiable_environment`` status per finding; this is the
+    sandbox-side half — the refusal chokepoints write a typed record
+    so ``sandbox-summary.json`` carries the run-level count line even
+    when no denial was ever recorded. Serves run()'s in-run
+    chokepoint AND the pre-run() floor-class refusal arms (the
+    untrusted entry gate's userns/libseccomp/seatbelt arms, strict's
+    construction gate), which fire before any run() closure exists.
+
+    ``run_dir`` is the call's own attribution dir (``audit_run_dir``
+    or ``output``). When the call carries neither — a target-only
+    ``run_untrusted``, or an entry-gate refusal raised before the
+    dirs were even passed — fall back to the process's active run
+    dir (``summary.set_active_run_dir``, the run this refusal
+    happened inside), so the refusal still reaches that run's
+    evidence stream instead of silently skipping the record. With no
+    active run either, there is nowhere durable to attribute
+    evidence: the raise itself (BaseException semantics — cannot be
+    swallowed by ``except Exception``) is the signal, the same
+    documented limitation every run-dir evidence writer has.
+
+    ``floor_label``/``achievable_label`` override the labels read
+    from ``exc``'s typed fields — for record-then-raise sites whose
+    exception stays a plain :class:`SandboxSetupError` (strict's
+    construction gate, where the mixed tier-plus-seccomp-axis
+    requirements don't map onto one typed field pair).
+
+    Never raises on its own; a refusal must not be masked by
+    evidence I/O.
+    """
+    try:
+        from . import summary as _summary_refusal
+        if not run_dir:
+            run_dir = _summary_refusal.get_active_run_dir()
+        if not run_dir:
+            return exc
+        _summary_refusal.record_floor_refusal(
+            Path(run_dir),
+            floor=(floor_label
+                   or _tiers.tier_label(exc.floor)),  # type: ignore[attr-defined]
+            achievable=(achievable_label
+                        or _tiers.tier_label(exc.achievable)),  # type: ignore[attr-defined]
+            reason=str(exc),
+            remedies=exc.instructions or "",
+        )
+    except BaseException:  # evidence recording cannot replace the refusal
+        with suppress(BaseException):
+            logger.debug("floor-refusal record failed", exc_info=True)
+    return exc
+
+
+def _untrusted_refusal_floor() -> "_tiers.ContainmentTier":
+    """Floor field for an untrusted entry-gate refusal: the consent
+    chain's resolved floor, with a pinned ``none`` (BARE) mapped back
+    to the class default — never-BARE-by-consent keeps the default
+    contract in force for the refusal, and a record claiming floor
+    ``none`` would read as no violation at all."""
+    floor, _src = resolve_untrusted_floor()
+    if floor is _tiers.ContainmentTier.BARE:
+        return _tiers.untrusted_default_floor()
+    return floor
+
+
+def _seccomp_axis_arm(entry: str, *,
+                      warn: bool = True) -> "tuple[str, str] | None":
+    """Refuse-or-waive decision for the seccomp capability axis of the
+    untrusted-execution contract — ONE text, shared by the
+    run_untrusted entry gate (:func:`_require_userns_or_optin`) and
+    run()'s floor-resolution arm, so the two sites cannot drift.
+
+    libseccomp is part of the untrusted-execution contract on Linux,
+    not an optional layer: the AF_UNIX blocklist, the io_uring/
+    keyring/bpf escape-primitive blocks and the argument rules (dgram
+    socketpair, MSG_FASTOPEN) all live in the filter. The axis is a
+    capability PREDICATE, never a tier value (tiers.py doctrine):
+    every tier's delivery includes the filter (LANDLOCK_ONLY is
+    "Landlock+seccomp+rlimits"), so a tier floor never consents its
+    absence — accepting filterless from ``--sandbox-floor landlock``
+    would run BELOW the flag's documented meaning. Only the legacy
+    env var waives this axis, and ONLY while no explicit surface pins
+    a floor: an explicit surface names a tier whose contract includes
+    the filter, so it wins over the env waiver here exactly as it
+    does on the tier chain.
+
+    Returns ``None`` when the call may proceed: libseccomp is
+    available; the platform has no seccomp axis (darwin — the
+    seatbelt tier is the contract there); or the legacy waiver
+    accepts filterless, in which case the per-call warning fires
+    unless ``warn`` is False (run()'s arm passes False for
+    run_untrusted-marked calls, whose entry gate already emitted the
+    same per-call warning — one warning per degraded call, not two).
+    Otherwise returns ``(reason, instructions)`` for the caller to
+    raise in its own refusal type (the entry gate raises
+    SandboxSetupError as always; run()'s floor arm wraps it in
+    SandboxFloorError so the refusal records and maps at the
+    verification seam).
+    """
+    if sys.platform == "darwin":
+        return None
+    if _seccomp.check_seccomp_available():
+        return None
+    _floor_e, _src_e = _explicit_untrusted_floor()
+    if _floor_e is not None:
+        _surface_e = ("--sandbox-floor" if _src_e
+                      == _tiers.FLOOR_SOURCE_FLAG
+                      else "the project sandbox-floor setting")
+        if _floor_e is _tiers.ContainmentTier.BARE:
+            # The "none" edge: not a tier-includes-the-filter
+            # story — never-BARE-by-consent is the reason.
+            _pin_clause = (
+                f"{_surface_e}=none is not a consentable "
+                f"untrusted floor — untrusted work never runs "
+                f"bare by consent; use --sandbox none / "
+                f"--no-sandbox for the operator-explicit "
+                f"sandbox-off."
+            )
+        else:
+            _pin_clause = (
+                f"{_surface_e} pins the containment floor at "
+                f"'{_tiers.tier_label(_floor_e)}', a tier whose "
+                f"contract includes the filter — "
+                f"RAPTOR_ALLOW_DEGRADED_UNTRUSTED does not "
+                f"override an explicit surface."
+            )
+        return (
+            f"{entry}: libseccomp is unavailable or non-functional "
+            f"on this host — the untrusted-execution contract "
+            f"includes the seccomp syscall filter (socket-family "
+            f"blocklist, escape-primitive blocks, send-flag "
+            f"argument rules), which would silently not engage. "
+            f"{_pin_clause}",
+            "install libseccomp (libseccomp2 package); no "
+            "--sandbox-floor tier waives seccomp absence (every "
+            "tier includes the filter).",
+        )
+    if _degraded_untrusted_waiver():
+        if warn:
+            logger.warning(
+                "%s: libseccomp unavailable — running UNTRUSTED code "
+                "WITHOUT a seccomp filter (operator override "
+                "RAPTOR_ALLOW_DEGRADED_UNTRUSTED): socket-family, "
+                "escape-primitive and send-flag argument blocks are "
+                "all inactive for this call.", entry,
+            )
+        return None
+    return (
+        f"{entry}: libseccomp is unavailable or non-functional "
+        f"on this host — the untrusted-execution contract "
+        f"includes the seccomp syscall filter (socket-family "
+        f"blocklist, escape-primitive blocks, send-flag "
+        f"argument rules), which would silently not engage.",
+        "install libseccomp (libseccomp2 package), or set "
+        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 to explicitly "
+        "accept running untrusted code without a syscall "
+        "filter (no --sandbox-floor tier waives seccomp "
+        "absence — every tier includes the filter).",
+    )
+
+
+def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
+                             *, record_dir: "str | None" = None) -> bool:
+    """Fail closed when the untrusted-execution contract cannot hold.
+
+    ``record_dir`` — the caller's evidence-attribution dir
+    (``audit_run_dir or output``, threaded by run_untrusted*): every
+    refusal this gate raises is floor-class in substance (the
+    environment cannot meet the untrusted containment contract — the
+    target never executed), so each one records a ``floor_refusal``
+    into the run-dir evidence stream via
+    :func:`_record_floor_refusal` before propagating, exactly like
+    the refusals raised inside run(). Arm-by-arm typed mapping
+    (achievable understates, never overstates):
+
+    * darwin seatbelt arm — floor=the resolved untrusted floor
+      (SEATBELT), achievable=BARE (rlimits-only is all a
+      seatbelt-less mac delivers);
+    * libseccomp arm — floor=the resolved untrusted floor,
+      achievable=BARE (every tier's contract includes the filter, so
+      no tier is fully deliverable without it — the same mapping as
+      run()'s seccomp axis arm);
+    * userns arm — floor=the resolved untrusted floor,
+      achievable=LANDLOCK_ONLY when Landlock is available (the
+      policy layers still engage), else BARE.
+
+    The contract's credential-exfil defence is the PID/user namespace:
+    without it the child runs as caller_uid in the HOST namespaces,
+    where /proc/<host_pid>/environ of same-UID processes is readable
+    (restrict_reads grants /proc wholesale — see the rationale at the
+    effective_read_paths block). On hosts without unprivileged userns
+    the namespace tier silently never engaged, so "untrusted" ran with
+    the exact exposure the helper exists to prevent.
+
+    Default: refuse loudly. RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 is the
+    explicit operator acknowledgement that Landlock/seccomp-only
+    containment is acceptable on this host. macOS is exempt from the
+    NAMESPACE requirement because the seatbelt tier provides the
+    isolation contract there — but only when seatbelt actually
+    engages: a missing/smoke-failing sandbox-exec would otherwise let
+    the default (non-strict) profile degrade to a bare subprocess
+    with a warn_once, silently violating the fail-closed contract the
+    Linux arm enforces. The darwin arm therefore requires
+    check_seatbelt_available() or the same explicit operator
+    override.
+
+    Returns True when the override engaged degraded mode AND the read
+    allowlist is in force — callers then pass omit_proc_reads=True so
+    the whole-of-/proc grant (and with it the same-UID environ
+    credential channel) is withdrawn for that call. The override
+    warning fires on EVERY degraded call (deliberately not warn_once):
+    each such call runs ATTACKER-DERIVED code with a reduced contract,
+    and an operator watching a long run must see every instance, not
+    just the first. With restrict_reads=False there is no read
+    allowlist to withdraw /proc from, so the warning names the open
+    exposure instead and False is returned.
+    """
+    if sys.platform == "darwin":
+        if check_seatbelt_available():
+            return False
+        if _degraded_untrusted_waiver():
+            logger.warning(
+                "%s: sandbox-exec unavailable or failed its smoke "
+                "test — running UNTRUSTED code with rlimits-only "
+                "containment (operator override "
+                "RAPTOR_ALLOW_DEGRADED_UNTRUSTED).", entry,
+            )
+            return False
+        raise _record_floor_refusal(record_dir, _errors.SandboxFloorError(
+            f"{entry}: the seatbelt tier provides the untrusted-"
+            f"execution contract on macOS, but sandbox-exec is "
+            f"unavailable or failed its smoke test on this host — "
+            f"refusing to run attacker-derived code unconfined.",
+            "verify /usr/bin/sandbox-exec exists and can run a "
+            "minimal profile, or set RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 "
+            "to explicitly accept rlimits-only containment.",
+            achievable=_tiers.ContainmentTier.BARE,
+            floor=_untrusted_refusal_floor(),
+        ))
+    # libseccomp is part of the untrusted-execution contract on
+    # Linux, not an optional layer — see _seccomp_axis_arm (shared
+    # with run()'s floor-resolution arm so the direct payload-
+    # executor shape gets the same refuse-or-waive and the message
+    # texts cannot drift). strict fail-closes at profile resolution;
+    # the default full profile silently degraded to FILTERLESS with
+    # only a warning — the exact silent-downgrade shape the userns
+    # gate below exists to refuse. Same explicit operator override
+    # governs it.
+    _seccomp_refusal = _seccomp_axis_arm(entry)
+    if _seccomp_refusal is not None:
+        raise _record_floor_refusal(record_dir, _errors.SandboxFloorError(
+            *_seccomp_refusal,
+            # Same mapping as run()'s seccomp axis arm: no tier's
+            # contract is deliverable without the filter.
+            achievable=_tiers.ContainmentTier.BARE,
+            floor=_untrusted_refusal_floor(),
+        ))
+    if check_net_available():
+        return False
+    # Namespace loss on a userns-blocked host is acceptable only when
+    # the consent chain lowered the untrusted floor to EXACTLY the
+    # landlock tier (per-run flag > project setting > legacy env var).
+    # A floor above it (the default, or an explicitly RAISED
+    # flag/project floor — which wins over the env waiver in both
+    # directions) refuses; an explicit BARE ("none") consents to
+    # nothing and refuses too — untrusted work never runs bare by
+    # consent.
+    _floor, _floor_src = resolve_untrusted_floor()
+    if (_floor is _tiers.ContainmentTier.LANDLOCK_ONLY
+            and _floor_src in _tiers.CONSENT_FLOOR_SOURCES):
+        if _floor_src == _tiers.FLOOR_SOURCE_FLAG:
+            _consent_name = "operator consent --sandbox-floor landlock"
+        elif _floor_src == _tiers.FLOOR_SOURCE_PROJECT:
+            _consent_name = ("operator consent: project setting "
+                             "sandbox-floor=landlock")
+        else:
+            _consent_name = ("operator override "
+                             "RAPTOR_ALLOW_DEGRADED_UNTRUSTED")
+        if restrict_reads is not _UNSET and not restrict_reads:
+            logger.warning(
+                "%s: unprivileged user namespaces unavailable — running "
+                "UNTRUSTED code with Landlock/seccomp-only containment "
+                "(%s) "
+                "AND restrict_reads=False: same-UID /proc/<pid>/environ "
+                "credential reads are NOT blocked for this call.", entry,
+                _consent_name,
+            )
+            return False
+        logger.warning(
+            "%s: unprivileged user namespaces unavailable — running "
+            "UNTRUSTED code with Landlock/seccomp-only containment "
+            "(%s). "
+            "/proc is dropped from the read allowlist for this call "
+            "so same-UID /proc/<pid>/environ credential reads stay "
+            "blocked; tools that read /proc/self/* (ASAN, IFUNC "
+            "dispatch, runtime CPU detection) may fail with EACCES — "
+            "pass readable_paths= for specific needs, or fix the "
+            "host's userns restriction.", entry, _consent_name,
+        )
+        return True
+    msg = (
+        f"{entry}: this host cannot create unprivileged user "
+        f"namespaces, so the untrusted-execution contract (PID-ns "
+        f"hides host /proc; credential exfil blocked) cannot be met. "
+        f"Refusing to run untrusted code with degraded containment. "
+        f"Fix the host (e.g. the kernel/LSM userns restriction — see "
+        f"core/sandbox/helpers/) or explicitly accept "
+        f"Landlock/seccomp-only containment: --sandbox-floor landlock "
+        f"(this run), /project set sandbox-floor landlock (standing "
+        f"for the project), or RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 "
+        f"(host-wide)."
+    )
+    if _floor_src in (_tiers.FLOOR_SOURCE_FLAG,
+                      _tiers.FLOOR_SOURCE_PROJECT):
+        _surface = ("--sandbox-floor" if _floor_src
+                    == _tiers.FLOOR_SOURCE_FLAG
+                    else "the project sandbox-floor setting")
+        if _floor is _tiers.ContainmentTier.BARE:
+            msg += (
+                f" Note: {_surface}=none is not a consentable "
+                f"untrusted floor — untrusted work never runs bare "
+                f"by consent; use --sandbox none / --no-sandbox for "
+                f"the operator-explicit sandbox-off."
+            )
+        else:
+            msg += (
+                f" Note: {_surface} currently pins the floor at "
+                f"'{_tiers.tier_label(_floor)}', which the env var "
+                f"does not override."
+            )
+    raise _record_floor_refusal(record_dir, _errors.SandboxFloorError(
+        msg, "",
+        # The namespace tier is what this host lacks; the policy
+        # layers still engage when the kernel has them.
+        achievable=(_tiers.ContainmentTier.LANDLOCK_ONLY
+                    if check_landlock_available()
+                    else _tiers.ContainmentTier.BARE),
+        floor=_untrusted_refusal_floor(),
+    ))
+
+
+def _reopen_write_only(fd: int, flags: int) -> "int | None":
+    """Reopen *fd*'s file write-only, returning the new fd or None.
+
+    Linux's /proc/self/fd magic links honour the requested flags. BSD
+    /dev/fd opens are dup(2)s — flags are ignored and the descriptor
+    keeps its original access mode — so the result is VERIFIED
+    write-only; when it is not, fall back to a true reopen by real
+    path (F_GETPATH, macOS) pinned by device/inode identity against
+    the original descriptor. Returns None when no verified write-only
+    reopen exists (caller must fail closed, e.g. plug with /dev/null).
+    """
+    import fcntl as _fcntl
+    fd_link = (
+        f"/proc/self/fd/{fd}" if sys.platform != "darwin"
+        else f"/dev/fd/{fd}"
+    )
+    try:
+        wfd = os.open(fd_link, flags)
+    except OSError:
+        wfd = -1
+    if wfd >= 0:
+        try:
+            if _fcntl.fcntl(wfd, _fcntl.F_GETFL) & os.O_ACCMODE \
+                    == os.O_WRONLY:
+                return wfd
+        except OSError:
+            pass
+        except BaseException:
+            with suppress(BaseException):
+                os.close(wfd)
+            raise
+        os.close(wfd)
+    getpath = getattr(_fcntl, "F_GETPATH", None)
+    if getpath is None:
+        return None
+    try:
+        raw = _fcntl.fcntl(fd, getpath, bytes(1024))
+        path = raw.split(b"\x00", 1)[0].decode(
+            sys.getfilesystemencoding(), "surrogateescape")
+        cand = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st_old, st_new = os.fstat(fd), os.fstat(cand)
+        if (st_old.st_dev, st_old.st_ino) \
+                == (st_new.st_dev, st_new.st_ino):
+            return cand
+    except OSError:
+        pass
+    except BaseException:
+        with suppress(BaseException):
+            os.close(cand)
+        raise
+    os.close(cand)
+    return None
+
+
+def _retire_untrusted_stdio(fds: list[int], *, primary_error: BaseException | None) -> None:
+    """Attempt every owned reopen once while preserving dispatch failure."""
+    from ._retirement import retire_parent_resources
+
+    def close_one(fd: int) -> None:
+        with suppress(OSError):
+            os.close(fd)
+
+    retire_parent_resources(
+        *(lambda fd=fd: close_one(fd) for fd in fds),
+        primary_error=primary_error,
+    )
+
+
+def _untrusted_stdio_write_only(kwargs: dict, caller: str) -> "list[int]":
+    """fd 1/2 pass-through guard shared by EVERY ``run_untrusted*``
+    entry point — mutates *kwargs* in place, returns the reopened fds
+    the caller must close once the dispatched run returns.
+
+    The stdin/setsid defences plug fd 0 and /dev/tty, but when the
+    caller doesn't capture, the child inherits the operator's fd 1/2
+    with whatever access mode the PARENT opened them — and read rights
+    ride the descriptor past every path-based layer. Two readable
+    shapes exist:
+
+    * a PTY slave is opened O_RDWR, which setsid() does NOT revoke —
+      a target that read()s its OWN stdout/stderr taps the operator's
+      keystrokes;
+    * a non-tty O_RDWR descriptor (regular file opened rw, a socket,
+      an rw FIFO) hands the child read access to content the sandbox
+      policy never granted.
+
+    Hand the child a WRITE-ONLY reopen instead (output identical;
+    reads fail EBADF). ttys reopen via ttyname; other reopenable
+    objects (regular files, FIFOs) via the fd's /proc//dev magic link
+    with the original O_APPEND preserved. Sockets have no write-only
+    reopen — plug with DEVNULL and tell the operator to capture
+    instead (discarding output is strictly safer than granting a read
+    channel to the operator's socket peer). Write-only pass-throughs
+    (the normal shell-redirect shape) are untouched.
+
+    One shared function, not per-entry copies: the guard first landed
+    inline in ``run_untrusted`` only, and the networked sibling
+    shipped without it — an untrusted networked child could read the
+    operator's keystrokes off its own stdout while every other
+    defence held. Any future untrusted entry point calls this helper
+    (the entry-point sweep test enforces it mechanically).
+    """
+    _validate_output_redirections(kwargs)
+    wo_fds: list[int] = []
+    if kwargs.get("capture_output"):
+        return wo_fds
+    import fcntl as _fcntl
+    import stat as _stat
+    try:
+        for _name, _fd in (("stdout", 1), ("stderr", 2)):
+            if _name in kwargs:
+                continue
+            try:
+                _is_tty = os.isatty(_fd)
+                if not _is_tty:
+                    _mode = os.fstat(_fd).st_mode
+                    try:
+                        _acc = _fcntl.fcntl(
+                            _fd, _fcntl.F_GETFL) & os.O_ACCMODE
+                    except OSError:
+                        _acc = os.O_RDWR  # unknown → treat as readable
+                    if _acc == os.O_WRONLY:
+                        continue  # not readable — safe to inherit
+                    if _stat.S_ISSOCK(_mode):
+                        logger.warning(
+                            "%s: %s is a readable socket "
+                            "descriptor — plugging with /dev/null "
+                            "(no write-only reopen exists for "
+                            "sockets). Pass capture_output=True or "
+                            "an explicit %s= pipe to keep the "
+                            "output.", caller, _name, _name,
+                        )
+                        kwargs[_name] = subprocess.DEVNULL
+                        continue
+                    _flags = os.O_WRONLY | os.O_NOCTTY
+                    try:
+                        if _fcntl.fcntl(_fd, _fcntl.F_GETFL) \
+                                & os.O_APPEND:
+                            _flags |= os.O_APPEND
+                    except OSError:
+                        pass
+                    _wfd_opt = _reopen_write_only(_fd, _flags)
+                    if _wfd_opt is None:
+                        logger.warning(
+                            "%s: %s has no verified "
+                            "write-only reopen on this platform — "
+                            "plugging with /dev/null. Pass "
+                            "capture_output=True or an explicit "
+                            "%s= pipe to keep the output.",
+                            caller, _name, _name,
+                        )
+                        kwargs[_name] = subprocess.DEVNULL
+                        continue
+                    _wfd = _wfd_opt
+                    wo_fds.append(_wfd)
+                    if _stat.S_ISREG(_mode) and not (
+                            _flags & os.O_APPEND):
+                        # A fresh open starts at offset 0; carry the
+                        # inherited stream position so the child
+                        # appends after prior parent output instead
+                        # of clobbering it.
+                        try:
+                            os.lseek(_wfd,
+                                     os.lseek(_fd, 0, os.SEEK_CUR),
+                                     os.SEEK_SET)
+                        except OSError:
+                            pass
+                else:
+                    _wfd = os.open(os.ttyname(_fd),
+                                   os.O_WRONLY | os.O_NOCTTY)
+                    wo_fds.append(_wfd)
+            except OSError as _tty_exc:
+                # Fail CLOSED like the socket / no-reopen branches
+                # above: inheriting the descriptor here would hand the
+                # untrusted child the readable handle (an O_RDWR pty
+                # slave taps the operator's keystrokes) that this whole
+                # guard exists to revoke. Discarding output is strictly
+                # safer than granting the read channel.
+                logger.warning(
+                    "%s: could not reopen the %s "
+                    "descriptor write-only for the child (%s) — "
+                    "plugging with /dev/null (the inherited "
+                    "descriptor may be readable). Pass "
+                    "capture_output=True or an explicit %s= pipe to "
+                    "keep the output.",
+                    caller, _name, _tty_exc, _name,
+                )
+                kwargs[_name] = subprocess.DEVNULL
+                continue
+            kwargs[_name] = _wfd
+    except BaseException:
+        for owned_fd in wo_fds:
+            with suppress(BaseException):
+                os.close(owned_fd)
+        raise
+    return wo_fds
+
+
+def _fresh_procfs_override_hint(
+        literal_contract: "bool | None" = None) -> str:
+    """The override sentence for a fresh-procfs refusal, told honestly.
+
+    Every in-tree untrusted caller derives require_fresh_procfs from
+    :func:`untrusted_fresh_procfs_required`, so for them the consent
+    chain IS consulted (a lowered floor means the flag arrives False
+    and no refusal fires). The remedy sentence therefore reflects the
+    reader's ACTUAL situation:
+
+    * an explicit surface (per-run flag / project setting) pinned the
+      floor — say so, name the surface, and say the env var will NOT
+      relax it (explicit wins on disagreement);
+    * the chain is at the default and a lowered floor would relax the
+      refusal — name every override surface with the exact re-run
+      spelling;
+    * the chain is already lowered but the refusal still fired.
+      ``literal_contract`` carries the call's truth from the refusal
+      site: ``True`` = the call carried a literal
+      ``require_fresh_procfs=True`` — an explicit caller ask no
+      consent surface relaxes (telling that caller to consent again
+      would be a lie); ``False`` = the call honoured the lowered
+      floor and this host cannot deliver even the consented tier —
+      no consent surface admits a bare untrusted run; ``None`` =
+      unknown (out-of-run callers), told as the literal-ask case
+      (the only reachable shape for derived callers).
+    """
+    _floor, _source = resolve_untrusted_floor()
+    if _source == _tiers.FLOOR_SOURCE_FLAG:
+        if untrusted_fresh_procfs_required():
+            return (
+                f"--sandbox-floor {_tiers.tier_label(_floor)} pins the "
+                f"untrusted containment floor for this run "
+                f"(RAPTOR_ALLOW_DEGRADED_UNTRUSTED does not override "
+                f"it). To accept host-procfs-visible containment, "
+                f"re-run with --sandbox-floor landlock."
+            )
+        if literal_contract is False:
+            return (
+                f"--sandbox-floor {_tiers.tier_label(_floor)} already "
+                f"lowers the untrusted containment floor, but this "
+                f"host cannot deliver even that tier for this call — "
+                f"no consent surface admits a bare untrusted run; fix "
+                f"the host, or use the operator-explicit "
+                f"--sandbox none / --no-sandbox."
+            )
+        return (
+            f"--sandbox-floor {_tiers.tier_label(_floor)} already "
+            f"lowers the untrusted containment floor, but this call "
+            f"passed an explicit require_fresh_procfs=True, which no "
+            f"consent surface relaxes — drop the explicit flag (or "
+            f"derive it from untrusted_fresh_procfs_required()) to "
+            f"honour the consent."
+        )
+    if _source == _tiers.FLOOR_SOURCE_PROJECT:
+        if untrusted_fresh_procfs_required():
+            return (
+                f"the active project's sandbox-floor="
+                f"{_tiers.tier_label(_floor)} setting pins the "
+                f"untrusted containment floor "
+                f"(RAPTOR_ALLOW_DEGRADED_UNTRUSTED does not override "
+                f"it). To accept host-procfs-visible containment, "
+                f"re-run with --sandbox-floor landlock (per-run flag "
+                f"overrides the project setting) or change the "
+                f"standing consent via /project set sandbox-floor "
+                f"landlock."
+            )
+        if literal_contract is False:
+            return (
+                f"the active project's sandbox-floor="
+                f"{_tiers.tier_label(_floor)} setting already lowers "
+                f"the untrusted containment floor, but this host "
+                f"cannot deliver even that tier for this call — no "
+                f"consent surface admits a bare untrusted run; fix "
+                f"the host, or use the operator-explicit "
+                f"--sandbox none / --no-sandbox."
+            )
+        return (
+            f"the active project's sandbox-floor="
+            f"{_tiers.tier_label(_floor)} setting already lowers the "
+            f"untrusted containment floor, but this call passed an "
+            f"explicit require_fresh_procfs=True, which no consent "
+            f"surface relaxes — drop the explicit flag (or derive it "
+            f"from untrusted_fresh_procfs_required()) to honour the "
+            f"consent."
+        )
+    if not untrusted_fresh_procfs_required():
+        if literal_contract is False:
+            return (
+                "RAPTOR_ALLOW_DEGRADED_UNTRUSTED already lowers the "
+                "untrusted containment floor, but this host cannot "
+                "deliver even the waived tier for this call — no "
+                "consent surface admits a bare untrusted run; fix "
+                "the host, or use the operator-explicit "
+                "--sandbox none / --no-sandbox."
+            )
+        return (
+            "RAPTOR_ALLOW_DEGRADED_UNTRUSTED is already set, but this "
+            "call passed an explicit require_fresh_procfs=True, which "
+            "the override does not relax — drop the explicit flag (or "
+            "derive it from untrusted_fresh_procfs_required()) to "
+            "honour the override."
+        )
+    return (
+        "Alternatively re-run with --sandbox-floor landlock (this "
+        "run), persist the consent with /project set sandbox-floor "
+        "landlock (standing for the project), or set "
+        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 (host-wide) to "
+        "explicitly accept host-procfs-visible containment."
+    )
+
+
+def _fresh_procfs_env_refusal(
+    achievable: "_tiers.ContainmentTier | None" = None,
+    floor: "_tiers.ContainmentTier | None" = None,
+    literal_contract: "bool | None" = None,
+) -> "_errors.SandboxFloorError":
+    """Build the refusal for a fresh-procfs contract call on a host
+    where no isolation backend engaged for ENVIRONMENTAL reasons
+    (``use_sandbox`` computed False without an operator disable).
+
+    Split out of run() so the darwin remedy arm is unit-testable
+    off-platform. The remedy names the actual host condition (Linux:
+    :func:`mount_unavailable_reason`, the host diagnostic for the
+    userns-founded backends — legitimate here because the mount
+    probe is definitionally False whenever the net probe is; macOS:
+    the sandbox-exec binary / smoke test) and appends
+    :func:`_fresh_procfs_override_hint`, which tells the
+    literal-True vs derived-flag override story honestly.
+    """
+    if sys.platform == "darwin":
+        condition = ("the seatbelt backend (sandbox-exec) is "
+                     "unavailable or failed its smoke test")
+        exposure = ("the fallback would run the untrusted target "
+                    "with rlimits-only containment")
+        fix = ("verify /usr/bin/sandbox-exec exists and can run a "
+               "minimal profile.")
+        if achievable is None:
+            achievable = _tiers.ContainmentTier.BARE
+    else:
+        from .probes import mount_unavailable_reason
+        condition, fix = mount_unavailable_reason()
+        exposure = ("the fallback lanes leave the HOST process table "
+                    "visible to the untrusted target")
+        if achievable is None:
+            achievable = _tiers.ContainmentTier.LANDLOCK_ONLY
+    msg = (
+        "sandbox run(): the fresh-procfs contract cannot be met — no "
+        f"isolation backend engaged on this host ({condition}), and "
+        f"{exposure}."
+    )
+    return _errors.SandboxFloorError(
+        msg, fix + " " + _fresh_procfs_override_hint(
+            literal_contract=literal_contract),
+        achievable=achievable,
+        floor=(floor if floor is not None
+               else _tiers.untrusted_default_floor()))
+
+
+def _entry_floor_refusal(
+    intended: "_tiers.ContainmentTier",
+    floor: "_tiers.ContainmentTier",
+    *,
+    environmental: bool,
+    skip_mount_ns: bool,
+    literal_contract: "bool | None" = None,
+) -> "_errors.SandboxFloorError":
+    """Build the entry-time containment-floor refusal for the shape
+    at hand, preserving the message texts operators (and tests) know
+    from the per-lane gates this check subsumed.
+
+    Every entry refusal reachable in phase 2 belongs to the
+    fresh-procfs contract class (the waived floor is below every
+    intended tier), so the wording stays fresh-procfs-specific and
+    the remedy always routes through the honesty-checked
+    :func:`_fresh_procfs_override_hint`.
+    """
+    if environmental:
+        return _fresh_procfs_env_refusal(achievable=intended, floor=floor,
+                                         literal_contract=literal_contract)
+    if skip_mount_ns:
+        msg = (
+            "sandbox run(): the fresh-procfs contract cannot be met "
+            "for this call (per-call skip_mount_ns=True bypasses the "
+            "mount-ns backend) — the fallback lanes leave the "
+            "host-pid /proc visible to the untrusted target."
+        )
+        return _errors.SandboxFloorError(
+            msg, _fresh_procfs_override_hint(
+                literal_contract=literal_contract),
+            achievable=intended, floor=floor)
+    msg = (
+        "sandbox run(): the fresh-procfs contract cannot be "
+        "met — the mount-namespace backend is unavailable on "
+        "this host, and the fallback lanes leave the host-pid "
+        "/proc visible to the untrusted target."
+    )
+    return _errors.SandboxFloorError(
+        msg,
+        "install newuidmap/newgidmap (uidmap package) so the "
+        "mount-ns backend can engage. "
+        + _fresh_procfs_override_hint(literal_contract=literal_contract),
+        achievable=intended, floor=floor)
+
+
+def _degraded_untrusted_waiver() -> bool:
+    """Raw truth of the legacy ``RAPTOR_ALLOW_DEGRADED_UNTRUSTED`` env
+    var (same idiom as the userns entry gate). FROZEN meaning:
+    "untrusted floor := landlock" (Linux) — kept indefinitely as the
+    escape-hatch alias; all new consent semantics ship only on the
+    explicit surfaces (``--sandbox-floor`` / project ``sandbox-floor``),
+    which win over it on disagreement, with a banner naming both.
+    The network-axis waivers (degraded net-deny, proxy tier, the
+    darwin rlimits-only arm) consume the same PARSE through this
+    helper while keeping their own axis semantics — a tier floor
+    never consents the network axis; sharing the value grammar just
+    prevents the three inline copies drifting on what "set" means.
+    """
+    return os.environ.get(
+        "RAPTOR_ALLOW_DEGRADED_UNTRUSTED", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _explicit_untrusted_floor() -> (
+        "tuple[_tiers.ContainmentTier | None, str | None]"):
+    """The explicit consent surfaces' untrusted floor, flag first.
+
+    Reads only the two state slots the argparse / project run-start
+    plumbing populated (core.sandbox.cli setters) — never the
+    environment, never project files, never repo content.
+    """
+    label = state._cli_sandbox_floor
+    if label is not None:
+        return _tiers.label_tier(label), _tiers.FLOOR_SOURCE_FLAG
+    label = state._project_sandbox_floor
+    if label is not None:
+        return _tiers.label_tier(label), _tiers.FLOOR_SOURCE_PROJECT
+    return None, None
+
+
+def _host_consented_floor() -> "_tiers.ContainmentTier | None":
+    """The WSL host-consent marker's untrusted floor, or ``None``.
+
+    The LOWEST-precedence consent surface: consulted only after the
+    explicit surfaces and the env waiver decline, so the marker only
+    ever replaces the fail-closed default refusal — never a floor
+    another surface chose. The env waiver deliberately outranks it:
+    the waiver is a per-invocation operator action whose frozen
+    landlock mapping predates the marker, and a standing machine
+    marker must not change what an explicitly exported waiver has
+    always meant. All conditional-inertness rules (WSL kernel only,
+    Landlock-less only, kernel-family match, tamper fail-closed) live
+    in :mod:`core.sandbox.host_consent`; this wrapper adds the
+    platform gate and the never-raise guarantee floor resolution
+    requires. Off-WSL the cached detection short-circuits, so
+    non-WSL hosts pay no marker I/O.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        from . import host_consent
+        label = host_consent.host_consented_floor()
+        if label is None:
+            return None
+        return _tiers.label_tier(label)
+    except Exception:  # noqa: BLE001 — a consent probe must never break floor resolution
+        logger.debug("host-consent floor probe failed", exc_info=True)
+        return None
+
+
+def resolve_untrusted_floor() -> "tuple[_tiers.ContainmentTier, str]":
+    """Resolve the untrusted containment floor from the consent chain.
+
+    Precedence (highest wins), evaluated fresh on every call:
+
+        per-run ``--sandbox-floor`` flag  >  project ``sandbox-floor``
+        setting  >  legacy env var  >  host-consent marker  >  class
+        default (refuse below MOUNT_NS / SEATBELT)
+
+    The explicit surfaces win in BOTH directions — a flag/project
+    ``mount-ns`` refuses the degraded tiers even when the env waiver
+    is set, and a flag/project ``landlock`` lowers without the env
+    var. The host-consent marker (see
+    :mod:`core.sandbox.host_consent`) supplies exactly ``ns-only``,
+    and only where the chain would otherwise refuse at the default —
+    so a project-set HIGHER floor is never lowered by it, and the env
+    waiver's frozen landlock mapping is untouched where set. Returns
+    ``(tier, source)``; a flag value of ``none`` resolves to BARE
+    here and is refused for untrusted-class work at floor resolution
+    (tiers.resolve_call_floor's never-BARE-by-consent arm) — BARE
+    consents to nothing on any acceptance arm.
+    """
+    tier, source = _explicit_untrusted_floor()
+    if tier is not None and source is not None:
+        return tier, source
+    if _degraded_untrusted_waiver():
+        return _tiers.waived_untrusted_floor(), _tiers.FLOOR_SOURCE_ENV
+    host_tier = _host_consented_floor()
+    if host_tier is not None:
+        return host_tier, _tiers.FLOOR_SOURCE_HOST
+    return _tiers.untrusted_default_floor(), _tiers.FLOOR_SOURCE_DEFAULT
+
+
+def untrusted_fresh_procfs_required() -> bool:
+    """True while the resolved untrusted floor demands a fresh pid-ns
+    procfs — i.e. every tier the consent chain admits delivers one
+    (Linux: floor above the landlock tier; macOS: the unwaived
+    seatbelt contract).
+
+    Consent chain: per-run ``--sandbox-floor`` flag > project
+    ``sandbox-floor`` setting > the legacy
+    ``RAPTOR_ALLOW_DEGRADED_UNTRUSTED`` env var (frozen alias for
+    "untrusted floor := landlock") > the WSL host-consent marker
+    (ns-only — a floor that still demands the fresh procfs) > the
+    fail-closed class default.
+
+    The untrusted entry points consume this internally. Direct
+    ``run()`` callers that execute attacker-derived payloads (LLM
+    exploits, candidate PoCs, target binaries) pass it as
+    ``require_fresh_procfs=`` so their runs carry the same
+    fresh-procfs contract instead of silently accepting host-procfs
+    visibility.
+    """
+    floor, _source = resolve_untrusted_floor()
+    if sys.platform == "darwin":
+        return floor >= _tiers.ContainmentTier.SEATBELT
+    return floor >= _tiers.ContainmentTier.NS_NOMOUNT
+
+
+def run_untrusted(cmd: list[str], *, target: str | None = None, output: str | None = None,
+                  limits: dict | None = None,
+                  job_budget: dict | None = None,
                   restrict_reads: bool = True,
-                  readable_paths: list = None,
+                  readable_paths: list | None = None,
+                  writable_paths: list | None = None,
                   fake_home: bool = True,
                   **kwargs) -> subprocess.CompletedProcess:
     """Run a command whose input is attacker-derived or otherwise untrusted.
@@ -2227,32 +10561,119 @@ def run_untrusted(cmd: List[str], *, target: str = None, output: str = None,
     invoking target build scripts, or anything else where the command or
     its inputs trace back to untrusted material.
 
+    The trust markers (``CLAUDECODE`` / ``_RAPTOR_TRUSTED``) are
+    stripped from the child environment so a target-spawned process
+    cannot invoke RAPTOR's ``libexec/`` scripts as a "trusted caller"
+    — it hits their refusal path instead. ``RAPTOR_DIR`` is stripped
+    on the same contract: the libexec trust gate does not accept it
+    and an untrusted target has no legitimate use for the checkout
+    path.
+
     `**kwargs` forwards to run() — composable with audit/audit_verbose
     (audit-mode applies to the run_untrusted's full-strict profile),
-    profile= (override the default 'full' if absolutely needed),
-    caller_label=, env=, cwd=, etc. Forbidden via TypeError:
+    caller_label=, env=, cwd=, etc. `profile=` is accepted as a RATCHET
+    only: 'full' (the default) or 'strict' (fail-closed — aborts with
+    SandboxSetupError instead of degrading when an isolation layer is
+    unavailable; see PROFILES). Weaker profiles are rejected via
+    TypeError because they would relax the untrusted-execution contract
+    this helper exists to enforce. Also forbidden via TypeError:
     `block_network` and `allowed_tcp_ports` — run_untrusted's contract
-    is namespace-level network block, no TCP allowlist; callers
-    needing varied network policy use sandbox() directly.
+    is namespace-level network block, no TCP allowlist — and
+    `start_new_session` — setsid is part of the same contract (no
+    controlling tty, so /dev/tty cannot read the operator's
+    keystrokes); callers needing varied network/session policy use
+    sandbox() directly.
     """
+    from .job_budget import load_budget
+    try:
+        _configured_job = load_budget(job_budget)
+    except (OSError, ValueError, TypeError) as exc:
+        raise _errors.SandboxSetupError("Invalid untrusted job budget configuration") from exc
+    job_budget = _configured_job.as_dict() if _configured_job is not None else None
     # Truthy check — `target=""` and `output=""` must also be rejected,
     # otherwise the caller thinks they engaged Landlock but got no
     # isolation whatsoever (every downstream check is truthy-based).
     if not (target or output):
-        raise ValueError(
+        msg = (
             "run_untrusted() requires at least one non-empty of target= or "
             "output= so Landlock actually engages. Pass a read-only target "
             "dir and/or a writable output dir."
         )
-    # Guard against silent misuse — the contract fixes these.
-    for forbidden in ("block_network", "allowed_tcp_ports", "strict_env"):
-        if forbidden in kwargs:
-            raise TypeError(
-                f"run_untrusted() does not accept {forbidden}= — it always "
-                f"runs with block_network=True, no TCP allowlist, and "
-                f"strict_env=True env-stripping. Use sandbox() directly "
-                f"for varied network or env policy."
-            )
+        raise ValueError(msg)
+    # Fail closed on namespace-less hosts; under the explicit operator
+    # override the helper warns on EVERY call (attacker-derived code
+    # under a reduced contract) and returns True so the /proc read
+    # grant is withdrawn — keeping the same-UID environ credential
+    # channel closed. See _require_userns_or_optin.
+    _degraded_no_pidns = _require_userns_or_optin(
+        "run_untrusted", restrict_reads,
+        # Evidence attribution for the gate's floor-class refusals:
+        # same precedence as run()'s own refusal chokepoint.
+        record_dir=kwargs.get("audit_run_dir") or output,
+    )
+    # start_new_session is deliberately NOT accepted: the setsid
+    # detachment below is part of the untrusted-execution contract
+    # (without it /dev/tty resolves to the operator's controlling
+    # terminal and a sandboxed target polls their keystrokes), so a
+    # caller-supplied False would silently reopen that channel.
+    # Callers that genuinely need a controlling tty (interactive gdb
+    # under /crash-analysis) use sandbox() directly, per the setsid
+    # rationale comment below.
+    _UNTRUSTED_ALLOWED_KWARGS = frozenset({
+        "env", "cwd", "timeout", "capture_output", "text",
+        "encoding", "errors",
+        "stdin", "input", "pass_fds",
+        "caller_label",
+        "audit", "audit_verbose", "audit_run_dir", "audit_required",
+        "observe", "exclude_tmp_baseline",
+        "tool_paths",
+        "profile",
+        # PATH-divergence gate opt-out. Allowed through because it is
+        # a CORRECTNESS declaration, not an isolation control: the
+        # alternatively-resolved binary still runs under the full
+        # untrusted contract. Default False — an untrusted run whose
+        # bare command would resolve to a different binary inside the
+        # sandbox than in the caller's environment is refused with the
+        # named remedy (tool_paths= / absolute path) unless the caller
+        # states divergence is intended.
+        "allow_path_divergence",
+        # Anti-fingerprint persona: STRENGTHENS the untrusted
+        # contract (identity surfaces get masked), so it passes the
+        # ratchet the other rejections enforce. run_untrusted always
+        # has target|output, which guarantees the mount-ns backend
+        # the persona needs on any host where untrusted runs at all
+        # (the fresh-procfs contract refuses the rest).
+        "sanitise_host_fingerprint", "require_sanitisation",
+        "cpu_count",
+        # Run-root output acknowledgement: warning metadata for the
+        # sandbox() seam check, not an isolation control — the
+        # containment posture is identical either way.
+        "output_run_root_ok",
+    })
+    rejected = set(kwargs.keys()) - _UNTRUSTED_ALLOWED_KWARGS
+    if rejected:
+        msg = (
+            f"run_untrusted() does not accept {sorted(rejected)} — "
+            f"isolation policy (network, writable_paths, namespace "
+            f"controls) is fixed. Use sandbox() directly for varied "
+            f"policy."
+        )
+        raise TypeError(msg)
+    # profile= is a ratchet, not a free choice: only the default
+    # ('full') or the stronger fail-closed 'strict' may pass through.
+    # Anything weaker (none, network-only, debug, target_run, frida)
+    # would relax the very contract this helper exists to enforce.
+    # The --sandbox CLI flag remains authoritative over this value,
+    # as everywhere.
+    _profile = kwargs.get("profile")
+    if _profile is not None and _profile not in ("full", "strict"):
+        msg = (
+            f"run_untrusted() accepts only profile='strict' or 'full' "
+            f"(got {_profile!r}) — weaker profiles would relax the "
+            f"untrusted-execution contract. Use sandbox() directly "
+            f"for varied policy."
+        )
+        raise TypeError(msg)
     # Default stdin to DEVNULL for untrusted code. If the parent's stdin
     # is the operator's TTY (common for interactive RAPTOR use) and the
     # sandboxed target reads stdin, the target gets a live channel to
@@ -2275,28 +10696,68 @@ def run_untrusted(cmd: List[str], *, target: str = None, output: str = None,
     # a new session leader with no controlling tty, so /dev/tty returns
     # ENXIO. Callers who actually want a controlling tty (interactive
     # gdb under /crash-analysis) must use sandbox() directly and can
-    # pass start_new_session=False explicitly.
-    if "start_new_session" not in kwargs:
-        kwargs["start_new_session"] = True
-    return run(cmd, block_network=True, target=target, output=output,
-               limits=limits,
-               restrict_reads=restrict_reads,
-               readable_paths=readable_paths,
-               fake_home=fake_home,
-               strict_env=True,
-               **kwargs)
+    # pass start_new_session=False explicitly — this helper refuses
+    # the kwarg outright (allowlist above), so setsid is unconditional.
+    kwargs["start_new_session"] = True
+    # macOS has no private mount view: unless excluded, Seatbelt seeds
+    # host-shared /private/tmp into the write exceptions (and, under
+    # restrict_reads, the read allowlist), so same-UID cross-run temp
+    # artifacts are writable and a /tmp-resident target is mutable —
+    # the class the Linux private-scratch posture closes. Default the
+    # untrusted contract to the per-run scratch posture (the spawn
+    # layer steers TMPDIR into {output}/.tmp); callers may override
+    # explicitly.
+    if sys.platform == "darwin" and "exclude_tmp_baseline" not in kwargs:
+        kwargs["exclude_tmp_baseline"] = True
+    # fd 1/2 pass-through guard — shared with every other
+    # run_untrusted* entry point (see _untrusted_stdio_write_only for
+    # the full rationale: an inherited O_RDWR pty slave or rw
+    # descriptor hands the untrusted child read rights no path-based
+    # layer can revoke).
+    _wo_fds = _untrusted_stdio_write_only(kwargs, "run_untrusted")
+    # Waived-contract degradations warn per call at the dispatch site
+    # that actually delivers the reduced lane (the consented-degrade
+    # branch of run()'s containment-floor check).
+    _stdio_primary: BaseException | None = None
+    try:
+        return run(cmd, block_network=True, target=target, output=output,
+                   limits=limits, job_budget=job_budget,
+                   restrict_reads=restrict_reads,
+                   readable_paths=readable_paths,
+                   writable_paths=writable_paths,
+                   fake_home=fake_home,
+                   omit_proc_reads=_degraded_no_pidns,
+                   strict_env=True,
+                   strip_trust_markers=True,
+                   _untrusted_workload=True,
+                   # Untrusted contract: the fresh-procfs mount is
+                   # mandatory (host-procfs visibility exposes the
+                   # spawn chain's pre-strip environ image) unless the
+                   # operator explicitly accepted the degraded posture
+                   # (same truthiness idiom as the entry gate).
+                   require_fresh_procfs=untrusted_fresh_procfs_required(),
+                   **kwargs)
+    except BaseException as error:
+        _stdio_primary = error
+        raise
+    finally:
+        _retire_untrusted_stdio(_wo_fds, primary_error=_stdio_primary)
 
 
 def run_untrusted_networked(
-    cmd: List[str],
+    cmd: list[str],
     *,
-    target: str = None,
-    output: str = None,
+    target: str | None = None,
+    output: str | None = None,
     proxy_hosts: list,
-    limits: dict = None,
+    limits: dict | None = None,
+    job_budget: dict | None = None,
     restrict_reads: bool = True,
-    readable_paths: list = None,
+    readable_paths: list | None = None,
+    writable_paths: list | None = None,
     fake_home: bool = False,
+    keep_trust_markers: bool = False,
+    loopback_unix_bridges: dict | None = None,
     **kwargs,
 ) -> subprocess.CompletedProcess:
     """Variant of :func:`run_untrusted` that allows hostname-allowlisted
@@ -2323,50 +10784,164 @@ def run_untrusted_networked(
         proxy with hostname allowlist (the only network this child can
         reach is the listed hosts on port 443).
       * ``allowed_tcp_ports=[443]`` — only HTTPS to the proxy.
+      * ``proxy_allowed_ports=[443]`` — the proxy's own lane refuses
+        CONNECTs to any other destination port, making the
+        hosts-on-443 contract real at the enforcement point.
       * ``block_network=False`` — must be False so the proxy is
         reachable from inside the sandbox.
 
     Mirrors :func:`run_untrusted`'s stdin / start_new_session
-    defaults — DEVNULL stdin, setsid — for the same passive-sniffer +
-    controlling-tty reasons.
+    defaults — DEVNULL stdin, setsid — and its trust-marker hygiene
+    (``CLAUDECODE`` / ``_RAPTOR_TRUSTED`` stripped from the child
+    env) for the same reasons.
 
-    No callers in this PR. Provides the safe shape for future
-    cc_dispatch-style migrations to use; see THREAT_MODEL.md.
+    ``keep_trust_markers=True`` opts OUT of that strip for RAPTOR's
+    own Claude Code skill dispatches (``core.orchestration.
+    skill_dispatch``): the spawned CLI is RAPTOR's trusted binary
+    operating on the same operator-approved run — its whole job is to
+    drive ``libexec/`` helpers whose preamble refuses callers without
+    a marker — and the dispatch is already gated by cc-trust and the
+    rule-of-two before it reaches this helper. The markers only pass
+    through when the PARENT actually holds them (an untrusted parent
+    has nothing to propagate). NEVER set this for commands derived
+    from target-repo content; ``run_untrusted`` deliberately has no
+    such opt-out.
+
+    ``loopback_unix_bridges`` — mapping of ``{port: unix_socket_path}``
+    relayed INSIDE the child's empty network namespace: the child
+    reaches ``127.0.0.1:<port>`` and the pre-Landlock relay forwards
+    the bytes to the named Unix socket on the host (same mechanism as
+    the egress-proxy bridge). Used by credential-proxy CLI children to
+    reach the LLM dispatcher without holding provider credentials.
+    Netns-tier only: on hosts where the netns tier cannot engage the
+    sandbox raises ``SandboxSetupError`` rather than running the child
+    without its bridged service (fail closed). When set, the sandbox's
+    proxy env carries ``NO_PROXY=127.0.0.1,localhost`` so bridged
+    loopback traffic goes direct instead of dying at the CONNECT
+    proxy's loopback rejection.
+
+    Callers: Claude Code sub-agent dispatch (packages/llm_analysis/
+    cc_dispatch.py, core/orchestration/agentic_passes.py,
+    core/audit/validate.py), git network operations
+    (core/git/clone.py), the BigQuery query child
+    (libexec/raptor-bq-query → core/forensics/bq_query.py), and other
+    hostname-allowlisted egress consumers; see THREAT_MODEL.md.
     """
+    from .job_budget import load_budget
+    try:
+        _configured_job = load_budget(job_budget)
+    except (OSError, ValueError, TypeError) as exc:
+        raise _errors.SandboxSetupError("Invalid untrusted job budget configuration") from exc
+    job_budget = _configured_job.as_dict() if _configured_job is not None else None
     if not (target or output):
-        raise ValueError(
+        msg = (
             "run_untrusted_networked() requires at least one non-empty of "
             "target= or output= so Landlock actually engages."
         )
+        raise ValueError(msg)
     if not proxy_hosts:
-        raise ValueError(
+        msg = (
             "run_untrusted_networked() requires proxy_hosts=[...] — "
             "the egress allowlist is mandatory; callers wanting unrestricted "
             "network should use sandbox() directly."
         )
-    for forbidden in ("block_network", "allowed_tcp_ports", "use_egress_proxy", "strict_env"):
-        if forbidden in kwargs:
-            raise TypeError(
-                f"run_untrusted_networked() does not accept {forbidden}= — "
-                f"the network policy is fixed to egress-proxy-only on port "
-                f"443 and strict_env=True env-stripping is mandatory. Use "
-                f"sandbox() directly for varied network or env policy."
-            )
+        raise ValueError(msg)
+    # Same degraded-host handling as run_untrusted: fail closed, and
+    # under the operator override warn per call + withdraw the /proc
+    # read grant.
+    _degraded_no_pidns = _require_userns_or_optin(
+        "run_untrusted_networked", restrict_reads,
+        # Evidence attribution for the gate's floor-class refusals:
+        # same precedence as run()'s own refusal chokepoint.
+        record_dir=kwargs.get("audit_run_dir") or output,
+    )
+    # start_new_session refused for the same reason as run_untrusted:
+    # setsid detachment is contract, not preference (see the rationale
+    # there).
+    _NETWORKED_ALLOWED_KWARGS = frozenset({
+        "env", "cwd", "timeout", "capture_output", "text",
+        "encoding", "errors",
+        "stdin", "input", "pass_fds",
+        "caller_label",
+        "audit", "audit_verbose", "audit_run_dir", "audit_required",
+        "observe", "exclude_tmp_baseline",
+        "tool_paths",
+        # Run-root output acknowledgement: trusted-agent dispatches
+        # write the run's own artifacts by contract, so the seam
+        # warning's ack must be expressible on this helper.
+        "output_run_root_ok",
+    })
+    rejected = set(kwargs.keys()) - _NETWORKED_ALLOWED_KWARGS
+    if rejected:
+        msg = (
+            f"run_untrusted_networked() does not accept {sorted(rejected)} — "
+            f"network and isolation policy is fixed to egress-proxy-only. "
+            f"Use sandbox() directly for varied policy."
+        )
+        raise TypeError(msg)
     if "stdin" not in kwargs and "input" not in kwargs:
         kwargs["stdin"] = subprocess.DEVNULL
-    if "start_new_session" not in kwargs:
-        kwargs["start_new_session"] = True
-    return run(
-        cmd,
-        block_network=False,
-        target=target, output=output,
-        limits=limits,
-        restrict_reads=restrict_reads,
-        readable_paths=readable_paths,
-        fake_home=fake_home,
-        use_egress_proxy=True,
-        proxy_hosts=list(proxy_hosts),
-        allowed_tcp_ports=[443],
-        strict_env=True,
-        **kwargs,
-    )
+    kwargs["start_new_session"] = True
+    if keep_trust_markers:
+        # Tells run()'s target-env staging that this child is
+        # RAPTOR's own trusted dispatch — every lane execs the target
+        # directly, and the sanctioned kwarg is the only way the
+        # markers survive the default strip.
+        base_env = kwargs.get("env")
+        if base_env is None:
+            from core.config import RaptorConfig
+            base_env = RaptorConfig.get_safe_env()
+        kwargs["env"] = dict(base_env)
+        kwargs["keep_trust_markers_for_dispatch"] = True
+    # fd 1/2 pass-through guard — the same write-only reopen
+    # run_untrusted mints (see _untrusted_stdio_write_only): without
+    # it an uncaptured networked child inherits the operator's O_RDWR
+    # pty slave on fd 1/2 and can read keystrokes off its own stdout.
+    # (_NETWORKED_ALLOWED_KWARGS refuses stdout=/stderr=, so the
+    # helper's caller-supplied-slot skip never fires here.)
+    _wo_fds = _untrusted_stdio_write_only(
+        kwargs, "run_untrusted_networked")
+    # Waived-contract degradations warn per call at the dispatch site
+    # that actually delivers the reduced lane (the consented-degrade
+    # branch of run()'s containment-floor check).
+    _stdio_primary: BaseException | None = None
+    try:
+        return run(
+            cmd,
+            block_network=False,
+            target=target, output=output,
+            limits=limits, job_budget=job_budget,
+            restrict_reads=restrict_reads,
+            readable_paths=readable_paths,
+            writable_paths=writable_paths,
+            fake_home=fake_home,
+            use_egress_proxy=True,
+            require_proxy_netns=True,
+            proxy_hosts=list(proxy_hosts),
+            # The docstring contract is "the listed hosts on port 443".
+            # allowed_tcp_ports is consumed by the LOCAL pin (and replaced
+            # by the lane port on the TCP tier); the proxy-side lane port
+            # allowlist is what actually bounds the DESTINATION port of a
+            # CONNECT — without it any 1-65535 port on an allowlisted
+            # host was reachable.
+            allowed_tcp_ports=[443],
+            proxy_allowed_ports=[443],
+            omit_proc_reads=_degraded_no_pidns,
+            strict_env=True,
+            strip_trust_markers=not keep_trust_markers,
+            _untrusted_workload=True,
+            # Same untrusted contract as run_untrusted(): mandatory
+            # fresh-procfs mount unless the operator accepted the
+            # degraded posture. Applies to the keep-trust dispatch lane
+            # too — dispatch children are trusted, but the pid-ns/procfs
+            # posture is about what the SANDBOXED TREE can read, and the
+            # dispatch tree runs target-influenced tools.
+            require_fresh_procfs=untrusted_fresh_procfs_required(),
+            loopback_unix_bridges=loopback_unix_bridges,
+            **kwargs,
+        )
+    except BaseException as error:
+        _stdio_primary = error
+        raise
+    finally:
+        _retire_untrusted_stdio(_wo_fds, primary_error=_stdio_primary)

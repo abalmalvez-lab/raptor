@@ -50,7 +50,7 @@ from core.url_patterns import (
 
 DEFAULT_TIMEOUT_S = 10
 
-import re
+import re  # noqa: E402
 
 # `re.fullmatch` callers — `re.match` + `$` matches before final `\n`,
 # letting `"abc1234\n"` slip through and into `git fetch <sha>` argv.
@@ -58,7 +58,7 @@ _COMMIT_SHA_RE = re.compile(r"[a-f0-9]{7,40}", re.IGNORECASE | re.ASCII)
 _LINUX_UPSTREAM = f"https://github.com/{LINUX_UPSTREAM_SLUG}"
 
 
-def _build_default_client(timeout_s: int) -> OsvClient:
+def _build_default_client(_timeout_s: int) -> OsvClient:
     """Construct a stand-alone :class:`packages.osv.OsvClient` for the discoverer.
 
     OSVDiscoverer is used outside the agent loop (cascade / bench paths),
@@ -179,26 +179,9 @@ class OSVDiscoverer:
                 ]
                 for event in rng.events:
                     fixed = event.get("fixed")
-                    # `if not fixed` is falsy for empty string AND
-                    # for non-string types like 0/None/[], but a
-                    # TRUTHY non-string (e.g. an int sha that some
-                    # OSV emitters serialise wrong, a dict/list
-                    # from a malformed schema, or a hex BYTES blob
-                    # from a Python re-serialisation glitch) slips
-                    # through and lands as `CommitSha(fixed)` —
-                    # `CommitSha` is a `NewType(str)` so it just
-                    # casts without runtime check, but downstream
-                    # consumers that string-format / regex-match
-                    # the SHA hit TypeError on non-str. Tighten:
-                    # require fixed to be a non-empty str AND
-                    # match the SHA shape.
                     if not isinstance(fixed, str) or not fixed:
                         continue
                     if not _COMMIT_SHA_RE.fullmatch(fixed):
-                        # Some emitters put non-SHA "fixed"
-                        # markers (version strings like "1.2.3").
-                        # Skip — Pass 2 only consumes SHA-shaped
-                        # fix events.
                         continue
                     key = (repo, fixed)
                     if key in seen:
@@ -231,11 +214,18 @@ class OSVDiscoverer:
         and bare ``git@host:path`` SCP-style. We normalise every shape
         to ``https://<host>/<path>`` so downstream consumers (commit
         fetchers, slug extractors) only need to handle one form.
+
+        Returns ``""`` for inputs that produce a URL with a suspicious
+        shape (host contains ``@``, ``?``, ``#``, control bytes, or a
+        port; path contains query / fragment / null). A poisoned OSV
+        record with ``repo: "git@evil.com/cred-stealer:path?token="``
+        would otherwise normalise to a URL that downstream consumers
+        treat as a real forge — closing the SSRF / parameter-smuggling
+        gap.
         """
         if not url:
             return ""
-        if url.endswith(".git"):
-            url = url[:-4]
+        url = url.removesuffix(".git")
         if url.startswith("git://"):
             url = "https://" + url[len("git://"):]
         elif url.startswith("ssh://git@"):
@@ -250,4 +240,45 @@ class OSVDiscoverer:
             if ":" in rest:
                 host, path = rest.split(":", 1)
                 url = f"https://{host}/{path}"
+        # Validate the normalised URL shape. Reject if we can't parse
+        # it, if the URL carries control bytes, a fragment, userinfo,
+        # or an explicit port, or the host is missing / non-ASCII.
+        #
+        # Userinfo/port MUST be checked on ``netloc`` — ``hostname`` by
+        # definition never contains ``@`` or ``:`` (urlsplit strips
+        # userinfo and port before returning it), so a hostname-based
+        # check is dead code and shapes like
+        # ``https://github.com@evil.com/owner/repo`` sail through to
+        # confuse any substring-style github.com check downstream.
+        from urllib.parse import urlsplit
+        if any(ord(c) <= 0x1F or ord(c) == 0x7F for c in url):
+            return ""
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return ""
+        if parts.scheme not in ("https", "http"):
+            return ""
+        if "@" in (parts.netloc or ""):
+            return ""
+        try:
+            if parts.port is not None:
+                return ""
+        except ValueError:
+            # Non-numeric port specifier — malformed authority.
+            return ""
+        if parts.fragment:
+            return ""
+        if parts.query:
+            # The docstring's own worked example
+            # (``repo: "git@evil.com/cred-stealer:path?token="``) is the
+            # query-smuggling shape: a live query string would ride the
+            # "canonical" URL into ``PatchTuple.repository_url`` and
+            # every downstream consumer (clone argv included).
+            return ""
+        host = parts.hostname or ""
+        if not host:
+            return ""
+        if not all(0x21 <= ord(c) <= 0x7e for c in host):
+            return ""
         return url

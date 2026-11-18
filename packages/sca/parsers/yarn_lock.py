@@ -1,0 +1,377 @@
+"""yarn.lock parser — Yarn classic v1 and Berry v2+.
+
+Two on-disk shapes share one filename:
+
+- **Classic (v1)**: a custom indented format that's *not* valid YAML
+  (string values are bare-quoted with embedded special chars). The
+  ``# yarn lockfile v1`` banner is the only fingerprint we can rely on.
+  Each block starts with one or more comma-separated descriptors
+  (``"@types/node@^20.5.0", "@types/node@^20.10.0":``) followed by
+  indented ``key value`` properties; the resolved version sits under
+  ``version "X.Y.Z"``.
+
+- **Berry (v2+)**: the file *is* YAML and starts with a ``__metadata``
+  block. Top-level keys are full descriptors
+  (``"lodash@npm:^4.17.21"``); each maps to a record with ``version``,
+  ``resolution``, ``linkType`` and friends.
+
+Detection: if PyYAML is available and the file parses as YAML *with*
+a ``__metadata`` key, dispatch to the Berry path; otherwise treat it as
+classic. The classic path needs no extra dependencies.
+
+Direct vs transitive: yarn.lock alone doesn't flag direct deps; that
+information lives in ``package.json``. We record ``direct=False`` and
+let the manifest+lockfile join flip the bit.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, TYPE_CHECKING
+
+from core.source.lines import splitlines_prefix
+
+from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl, lockfile_confidence
+from . import _safe_read, register
+from ._npm_alias import looks_like_package_name as _looks_like_package_name
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+ECOSYSTEM = "npm"
+
+try:
+    import yaml as _yaml  # type: ignore[import-untyped]
+
+    from .._yaml_fast import safe_load as _safe_load
+    _HAS_YAML = True
+except ImportError:                       # pragma: no cover — env-dependent
+    _yaml = None                          # type: ignore[assignment]
+    _safe_load = None                     # type: ignore[assignment]
+    _HAS_YAML = False
+    logger.warning(
+        "sca.parsers.yarn_lock: 'PyYAML' not installed — Yarn Berry "
+        "lockfiles will be skipped (Yarn classic still works). "
+        "`uv pip install pyyaml` to enable."
+    )
+
+
+def parse(path: Path) -> list[Dependency]:
+    text = _safe_read.read_bounded(path, follow_symlinks=False)
+    if text is None:
+        # ``read_bounded`` already logged the underlying reason.
+        return []
+
+    if _looks_like_berry(text):
+        if not _HAS_YAML:
+            logger.warning(
+                "sca.parsers.yarn_lock: skipping Berry-format %s — "
+                "'PyYAML' not installed", path,
+            )
+            return []
+        return _parse_berry(text, path)
+    return _parse_classic(text, path)
+
+
+# ---------------------------------------------------------------------------
+# Format detection
+# ---------------------------------------------------------------------------
+
+def _looks_like_berry(text: str) -> bool:
+    """Berry lockfiles start with a ``__metadata`` block before the first
+    descriptor. Classic v1 files start with the ``# yarn lockfile v1`` banner.
+    """
+    head = "\n".join(splitlines_prefix(text, 30))
+    if "__metadata:" in head:
+        return True
+    if "# yarn lockfile v1" in head:
+        return False
+    # Ambiguous: try YAML; if it parses to a dict containing __metadata,
+    # call it Berry. Otherwise default to classic.
+    if _HAS_YAML:
+        try:
+            data = _safe_load(text)       # type: ignore[misc]
+            if isinstance(data, dict) and "__metadata" in data:
+                return True
+        except (_yaml.YAMLError, RecursionError, ValueError):  # type: ignore[union-attr]
+            # Best-effort sniff: malformed / pathologically nested
+            # YAML just means "not Berry". ValueError included:
+            # yaml.safe_load raises it on out-of-range date scalars
+            # (e.g. `a: 2023-99-99`) — escaping here reached the
+            # parser-dispatch catch-all and the whole lockfile read as
+            # zero dependencies ("clean"); the classic parser still
+            # extracts the deps.
+            pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Classic v1 parser (line-oriented)
+# ---------------------------------------------------------------------------
+
+def _parse_classic(text: str, path: Path) -> list[Dependency]:
+    deps: list[Dependency] = []
+    current_specs: list[str] = []
+    current_props: dict[str, str] = {}
+
+    def _flush() -> None:
+        if not current_specs:
+            return
+        d = _from_classic_block(current_specs, current_props, path)
+        if d is not None:
+            deps.append(d)
+
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            # Comment or blank → if we just finished a block, flush now.
+            if current_specs and not raw.strip():
+                _flush()
+                current_specs = []
+                current_props = {}
+            continue
+        if raw[0] not in (" ", "\t"):
+            # New block header.
+            _flush()
+            current_specs = _split_classic_specs(raw.rstrip(":").rstrip())
+            current_props = {}
+        else:
+            # Property line.
+            key, value = _parse_classic_prop(raw.strip())
+            if key is not None:
+                current_props[key] = value
+    _flush()
+    return deps
+
+
+_CLASSIC_SPEC_QUOTED = re.compile(r'"([^"]*)"')
+
+
+def _split_classic_specs(line: str) -> list[str]:
+    """Split a comma-separated spec header into individual descriptors.
+
+    Each spec may be quoted (when it contains commas/spaces/colons in the
+    range) or bare. We extract quoted runs first, then handle anything
+    left as bare comma-split tokens.
+    """
+    if '"' in line:
+        # All meaningful tokens are inside quotes when any quoting is used.
+        return _CLASSIC_SPEC_QUOTED.findall(line)
+    return [t.strip() for t in line.split(",") if t.strip()]
+
+
+_PROP_RE = re.compile(r'^([A-Za-z_][\w-]*)\s+(?:"([^"]*)"|([^\s].*))$')
+
+
+def _parse_classic_prop(line: str) -> tuple[str | None, str]:
+    """Parse one ``key value`` property line; ``value`` may be quoted."""
+    m = _PROP_RE.match(line)
+    if not m:
+        return None, ""
+    key = m.group(1)
+    value = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+    return key, value.strip()
+
+
+def _from_classic_block(
+    specs: list[str], props: dict[str, str], path: Path,
+) -> Dependency | None:
+    name, alias = _name_from_descriptor(specs[0]) if specs else (None, None)
+    if not name:
+        return None
+    if alias is None:
+        # A classic block can list several descriptors; the alias
+        # isn't always first ("lodash@^4, my-lodash@npm:lodash@^4:") —
+        # take the first descriptor that aliases THIS block's package.
+        for extra in specs[1:]:
+            n2, a2 = _name_from_descriptor(extra)
+            if n2 == name and a2:
+                alias = a2
+                break
+    version = props.get("version") or None
+    resolved = props.get("resolved", "")
+    pin_style = _pin_from_resolved(resolved, version)
+    return Dependency(
+        ecosystem=ECOSYSTEM,
+        name=name,
+        version=version,
+        declared_in=path,
+        scope="main",   # yarn.lock doesn't carry dev/peer info — joiner sets it
+        is_lockfile=True,
+        pin_style=pin_style,
+        direct=False,
+        purl=build_purl("npm", name, version),
+        parser_confidence=_confidence(pin_style, version),
+        alias_name=alias,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Berry parser (YAML)
+# ---------------------------------------------------------------------------
+
+def _parse_berry(text: str, path: Path) -> list[Dependency]:
+    try:
+        data = _safe_load(text)           # type: ignore[misc]
+    except (_yaml.YAMLError, RecursionError, ValueError) as e:  # type: ignore[union-attr]
+        # Same tuple as the _looks_like_berry sniff. ValueError:
+        # yaml.safe_load raises it on out-of-range date scalars.
+        # RecursionError: deep nesting the flow-depth pre-bound does
+        # not see (block-mapping nesting) blows the loader stack —
+        # report the parse failure instead of letting either escape
+        # to the dispatch catch-all as a silent zero-dep result.
+        logger.warning(
+            "sca.parsers.yarn_lock: Berry YAML parse failed for %s: %s",
+            path, e,
+        )
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    deps: list[Dependency] = []
+    for descriptor, entry in data.items():
+        if descriptor == "__metadata":
+            continue
+        if not isinstance(descriptor, str) or not isinstance(entry, dict):
+            continue
+        # Berry lets one record cover multiple comma-separated descriptors;
+        # any one of them resolves to the same version.
+        descriptors = [x.strip() for x in descriptor.split(",")]
+        name, alias = _name_from_descriptor(descriptors[0])
+        if not name:
+            continue
+        if alias is None:
+            # The alias descriptor may not come first
+            # ("lodash@npm:^4, my-lodash@npm:lodash@^4") — take the
+            # first descriptor that aliases THIS record's package.
+            for extra in descriptors[1:]:
+                n2, a2 = _name_from_descriptor(extra)
+                if n2 == name and a2:
+                    alias = a2
+                    break
+        v = entry.get("version")
+        version = v if isinstance(v, str) and v else None
+        resolution = entry.get("resolution")
+        pin_style = _pin_from_berry_resolution(resolution, version)
+
+        deps.append(Dependency(
+            ecosystem=ECOSYSTEM,
+            name=name,
+            version=version,
+            declared_in=path,
+            scope="main",
+            is_lockfile=True,
+            pin_style=pin_style,
+            direct=False,
+            purl=build_purl("npm", name, version),
+            parser_confidence=_confidence(pin_style, version),
+            alias_name=alias,
+        ))
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _name_from_descriptor(descriptor: str) -> tuple[str | None, str | None]:
+    """Extract ``(installed_name, alias_or_None)`` from a yarn descriptor.
+
+    Examples (input → installed name):
+      ``lodash@^4.17.21``                 → ``lodash``
+      ``"@types/node@^20.10.0"``          → ``@types/node``
+      ``lodash@npm:^4.17.21``             → ``lodash``        (Berry)
+      ``@scope/pkg@workspace:./pkgs/x``   → ``@scope/pkg``    (Berry)
+      ``myalias@npm:realpkg@^1.0``        → ``realpkg``       (alias)
+      ``myalias@npm:@scope/real@^1.0``    → ``@scope/real``   (alias)
+
+    Alias descriptors (``<alias>@npm:<real-pkg>@<range>``) resolve to
+    the REAL package: that's what yarn installs, so that's what OSV
+    must be queried for — recording the alias name hid the installed
+    package's advisories entirely. The alias spelling is returned as
+    the second element (``Dependency.alias_name``) so display and
+    fix-materialisation still see what the manifest declared.
+    """
+    s = descriptor.strip().strip('"')
+    if not s:
+        return None, None
+    name, spec = _split_name_spec(s)
+    if name is None:
+        return None, None
+    if spec is not None and spec.startswith("npm:"):
+        target = spec[len("npm:"):]
+        # ``npm:<range>`` (plain Berry protocol) vs ``npm:<pkg>[@range]``
+        # (alias) — a package name is never a range operator, and a
+        # bare digit-version only counts as a version when no explicit
+        # ``@<range>`` separator follows (digit-leading NAMES like
+        # ``7zip-bin`` are legal on npm).
+        real, real_spec = _split_name_spec(target)
+        if real and _looks_like_package_name(
+            real, has_spec=real_spec is not None,
+        ):
+            return real, (name if real != name else None)
+    return name, None
+
+
+def _split_name_spec(s: str) -> tuple[str | None, str | None]:
+    """Split ``name[@spec]`` where a scoped name keeps its leading
+    ``@``. Returns ``(name, spec_or_None)``; ``(None, None)`` for a
+    scope with no slash."""
+    if s.startswith("@"):
+        slash = s.find("/")
+        if slash == -1:
+            return None, None
+        sep = s.find("@", slash)
+        if sep == -1:
+            return s, None   # no version qualifier (rare)
+        return s[:sep], s[sep + 1:]
+    sep = s.find("@")
+    if sep == -1:
+        return s, None
+    return s[:sep], s[sep + 1:]
+
+
+def _pin_from_resolved(resolved: str, version: str | None) -> PinStyle:
+    """Classify pin style from a v1 ``resolved "..."`` URL."""
+    if resolved.startswith(("git+", "git:", "git@")):
+        return PinStyle.GIT
+    if resolved.startswith("file:"):
+        return PinStyle.PATH
+    if version:
+        return PinStyle.EXACT
+    return PinStyle.WILDCARD
+
+
+def _pin_from_berry_resolution(
+    resolution: Any, version: str | None,
+) -> PinStyle:
+    """Classify pin style from a Berry ``resolution: "..."`` field."""
+    if isinstance(resolution, str):
+        # Format: ``name@protocol:specifier`` — ``git`` / ``patch`` /
+        # ``workspace`` / ``portal`` are non-version sources.
+        if "@git+" in resolution or resolution.endswith("@git"):
+            return PinStyle.GIT
+        if "@workspace:" in resolution or "@portal:" in resolution:
+            return PinStyle.PATH
+        if "@file:" in resolution:
+            return PinStyle.PATH
+    if version:
+        return PinStyle.EXACT
+    return PinStyle.WILDCARD
+
+
+
+def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason="yarn.lock git source",
+        path_reason="yarn.lock workspace/file source",
+        unversioned_reason="yarn.lock entry without version",
+        resolved_reason="yarn.lock resolved entry",
+    )
+
+
+register(filenames=["yarn.lock"])(parse)

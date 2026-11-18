@@ -1,0 +1,1899 @@
+"""Tests for .github/scripts/test_scope.py — import-graph-based
+test tier dispatch."""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+with patch.object(sys, "path", sys.path.copy()):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+    from test_scope import (
+        FAST_TIER_IGNORES,
+        ROOT_HARNESS_FILES,
+        TIERS,
+        batch_matrix,
+        compute_tier_dispatch,
+        expand_conftest,
+        file_in_dir,
+        file_in_fast_tier,
+        file_matches_tier,
+        is_dependency_manifest,
+        is_test_file,
+    )
+
+
+class TestFeatureMatrixProducerDispatch:
+    PRODUCERS = [
+        "core/sandbox/scripts/feature-matrix/bin/probe.py",
+        "core/sandbox/scripts/feature-matrix/bin/report.py",
+        "core/sandbox/scripts/feature-matrix/profiles/make_profiles.py",
+    ]
+    DRIVER = Path("core/sandbox/tests/test_feature_matrix_selftest.py")
+    OTHER = Path("core/other/tests/test_other.py")
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        for path in self.PRODUCERS:
+            target = tmp_path / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("VALUE = 1\n")
+        for path in (self.DRIVER, self.OTHER):
+            target = tmp_path / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("def test_example(): pass\n")
+        script = tmp_path / "core/sandbox/scripts/feature-matrix/run-matrix.sh"
+        script.write_text("# inert fixture; never executed\n")
+        return tmp_path
+
+    @pytest.mark.parametrize("producer", PRODUCERS, ids=["probe", "report", "profiles"])
+    def test_producer_selects_existing_self_test(self, repo, producer):
+        result = compute_tier_dispatch([producer], repo)
+        assert result["sandbox"]["files"] == [self.DRIVER]
+        assert not result["python"]["run"]
+        assert result["_stats"]["changed"] == 1
+        assert result["_stats"]["dependents"] == 1
+
+    def test_preserves_graph_consumers_and_mixed_changes(self, repo):
+        (repo / self.OTHER).write_text(
+            "__import__('core.sandbox.scripts.feature-matrix.bin.probe')\n"
+        )
+        result = compute_tier_dispatch([self.PRODUCERS[0], str(self.OTHER)], repo)
+        assert result["sandbox"]["files"] == [self.DRIVER]
+        assert result["python"]["files"] == [self.OTHER]
+        # The importing test remains selected without being explicitly changed.
+        result = compute_tier_dispatch([self.PRODUCERS[0]], repo)
+        assert result["python"]["files"] == [self.OTHER]
+
+    def test_unrelated_change_does_not_select_self_test(self, repo):
+        result = compute_tier_dispatch([str(self.OTHER)], repo)
+        assert not result["sandbox"]["run"]
+        assert result["python"]["files"] == [self.OTHER]
+
+    def test_missing_driver_fails_toward_full_dispatch(self, repo):
+        (repo / self.DRIVER).unlink()
+        result = compute_tier_dispatch([self.PRODUCERS[0]], repo)
+        assert all(info["run"] for tier, info in result.items() if not tier.startswith("_"))
+        assert result["_stats"]["closure"] == result["_stats"]["total"]
+
+    @pytest.mark.parametrize("changed", [
+        "pyproject.toml", "conftest.py",
+        "core/sandbox/scripts/feature-matrix/run-matrix.sh",
+    ], ids=["manifest", "root-harness", "unmapped-shell"])
+    def test_existing_full_fallbacks_dominate(self, repo, changed):
+        result = compute_tier_dispatch([self.PRODUCERS[0], changed], repo)
+        assert all(info["run"] for tier, info in result.items() if not tier.startswith("_"))
+
+    def test_deleted_producer_still_forces_full_dispatch(self, repo):
+        (repo / self.PRODUCERS[0]).unlink()
+        result = compute_tier_dispatch([self.PRODUCERS[0]], repo)
+        assert all(info["run"] for tier, info in result.items() if not tier.startswith("_"))
+
+    def test_producer_selection_builds_only_one_graph(self, repo, monkeypatch):
+        import test_scope as scope
+
+        original = scope.build_graph
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(scope, "build_graph", counted)
+        result = compute_tier_dispatch(self.PRODUCERS, repo)
+        assert result["sandbox"]["files"] == [self.DRIVER]
+        assert len(calls) == 1
+
+
+class TestExpandConftest:
+    _ALL = [
+        Path("conftest.py"),
+        Path("core/llm/client.py"),
+        Path("core/sandbox/tests/conftest.py"),
+        Path("core/sandbox/tests/test_a.py"),
+        Path("core/sandbox/context.py"),
+    ]
+
+    def test_nested_conftest_expands_to_its_tree_only(self):
+        extra = expand_conftest(
+            {Path("core/sandbox/tests/conftest.py")}, self._ALL,
+        )
+        assert extra == {Path("core/sandbox/tests/test_a.py")}
+
+    def test_root_conftest_expands_to_whole_repo(self):
+        # The root's prefix would be "./", which matches no relative
+        # path — pre-fix the expansion returned nothing and a PR
+        # touching only the root conftest dispatched zero tiers.
+        extra = expand_conftest({Path("conftest.py")}, self._ALL)
+        assert extra == set(self._ALL) - {Path("conftest.py")}
+
+    def test_non_conftest_changes_expand_nothing(self):
+        assert expand_conftest({Path("core/llm/client.py")}, self._ALL) == set()
+
+
+class TestIsTestFile:
+    def test_test_prefix(self):
+        assert is_test_file(Path("core/llm/tests/test_client.py"))
+
+    def test_test_suffix(self):
+        assert is_test_file(Path("core/llm/client_test.py"))
+
+    @pytest.mark.parametrize("name", [
+        "helpers.py", "_resume_setup_ownership.py", "_foreign_import_workers.py",
+        "__init__.py", "conftest.py", "_test_private.py",
+    ])
+    def test_non_collectible_modules_in_tests_dir(self, name):
+        assert not is_test_file(Path("core/llm/tests") / name)
+
+    def test_not_test(self):
+        assert not is_test_file(Path("core/llm/client.py"))
+
+    def test_not_python(self):
+        assert not is_test_file(Path("core/llm/tests/data.json"))
+
+    def test_fixtures_excluded(self):
+        assert not is_test_file(Path("packages/llm_analysis/tests/fixtures/iris_e2e/src/app.py"))
+
+    def test_fixtures_deep_excluded(self):
+        assert not is_test_file(Path("core/dataflow/tests/fixtures/cvefix_cmdi_py/after/app.py"))
+
+
+class TestPrivateWorkerDrivers:
+    WORKER = Path("packages/ghidra/tests/worker_server_cases.py")
+    DRIVER = Path("packages/ghidra/tests/test_server.py")
+    RUNTIME = Path("packages/ghidra/server_worker.py")
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        sources = {
+            self.DRIVER: (
+                "from pathlib import Path\n"
+                "def short_sock_dir(): pass\n"
+                "def test_worker_cases_in_private_process():\n"
+                "    worker = Path(__file__).with_name('worker_server_cases.py')\n"
+            ),
+            self.WORKER: (
+                "from packages.ghidra.tests.test_server import short_sock_dir\n"
+                "from packages.ghidra import server_worker\n"
+                "def test_private_case(): assert server_worker.VALUE == 1\n"
+            ),
+            self.RUNTIME: "VALUE = 1\n",
+            **{Path(f"core/other/tests/test_other_{i}.py"):
+               f"def test_other_{i}(): pass\n" for i in range(4)},
+        }
+        for path, text in sources.items():
+            target = tmp_path / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        return tmp_path
+
+    @pytest.mark.parametrize("changed", [WORKER, DRIVER, RUNTIME],
+                             ids=["worker", "driver", "runtime"])
+    def test_changed_inputs_select_owner(self, repo, changed):
+        result = compute_tier_dispatch([str(changed)], repo)
+        assert result["python"]["files"] == [self.DRIVER]
+        assert result["python"]["matrix"] == [
+            {"batch": 1, "files": str(self.DRIVER)},
+        ]
+
+    def test_full_dispatch_executes_owner_once(self, repo):
+        result = compute_tier_dispatch(["pyproject.toml"], repo)
+        assert result["python"]["files"].count(self.DRIVER) == 1
+        assert self.WORKER not in result["python"]["files"]
+        assert set(result["python"]["files"]) == {self.DRIVER} | {
+            Path(f"core/other/tests/test_other_{i}.py") for i in range(4)
+        }
+        matrix_files = [p for batch in result["python"]["matrix"]
+                        for p in batch["files"].split()]
+        assert matrix_files.count(str(self.DRIVER)) == 1
+        assert str(self.WORKER) not in matrix_files
+
+    @pytest.mark.parametrize("changed", [WORKER, Path("pyproject.toml")],
+                             ids=["scoped", "full"])
+    def test_missing_owner_is_an_error(self, repo, changed):
+        (repo / self.DRIVER).unlink()
+        with pytest.raises(ValueError, match="private.*driver"):
+            compute_tier_dispatch([str(changed)], repo)
+
+    def test_unregistered_worker_name_is_not_directly_collected(self, repo):
+        other = Path("core/other/tests/worker_other_cases.py")
+        (repo / other).write_text("def test_other_case(): pass\n")
+        result = compute_tier_dispatch([str(other)], repo)
+        assert other not in result["python"]["files"]
+
+    def test_private_cases_remain_test_inputs(self):
+        assert is_test_file(self.WORKER)
+
+    def test_adding_owner_edges_preserves_borrowed_graph(self, repo):
+        import test_scope as scope
+
+        existing = Path("core/other/tests/test_other_0.py")
+        graph = {self.WORKER: {existing}}
+        result = scope.with_private_test_drivers(graph, repo)
+        assert graph == {self.WORKER: {existing}}
+        assert result[self.WORKER] == {existing, self.DRIVER}
+
+
+class TestHelperDriverDependencies:
+    def test_helper_imported_only_by_conftest_selects_owning_tests(self, tmp_path):
+        sources = {
+            "core/example/tests/helpers.py": "VALUE = 1\n",
+            "core/example/tests/conftest.py": "from core.example.tests import helpers\n",
+            "core/example/tests/test_driver.py": "def test_driver(): pass\n",
+            "core/example/tests/nested/other_test.py": "def test_nested(): pass\n",
+            "core/other/tests/test_unrelated.py": "def test_unrelated(): pass\n",
+        }
+        for name, source in sources.items():
+            target = tmp_path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source)
+        result = compute_tier_dispatch(["core/example/tests/helpers.py"], tmp_path)
+        assert result["python"]["files"] == [
+            Path("core/example/tests/nested/other_test.py"),
+            Path("core/example/tests/test_driver.py"),
+        ]
+        assert not _is_full_dispatch(result)
+
+    @pytest.mark.parametrize("changed", ["_worker.py", "_bridge.py", "helpers.py"])
+    def test_transitive_helpers_select_only_collectible_driver(self, tmp_path, changed):
+        root = Path("core/example/tests")
+        sources = {
+            "_worker.py": "raise RuntimeError('must never import helper')\n",
+            "_bridge.py": "from pathlib import Path\nWORKER = Path(__file__).with_name('_worker.py')\n",
+            "helpers.py": "from core.example.tests import _bridge\n",
+            "test_driver.py": "from core.example.tests import helpers\n",
+            "other_test.py": "def test_other(): pass\n",
+            "conftest.py": "# fixture graph input, not a pytest target\n",
+            "__init__.py": "",
+        }
+        for name, source in sources.items():
+            target = tmp_path / root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source)
+        result = compute_tier_dispatch([str(root / changed)], tmp_path)
+        assert result["python"]["files"] == [root / "test_driver.py"]
+        full = compute_tier_dispatch(["pyproject.toml"], tmp_path)
+        assert full["python"]["files"] == [root / "other_test.py", root / "test_driver.py"]
+
+
+class TestFileInDir:
+    def test_direct_child(self):
+        assert file_in_dir(Path("core/sandbox/tests/test_a.py"), "core/sandbox/tests")
+
+    def test_exact_match(self):
+        assert file_in_dir(Path("packages/sca"), "packages/sca")
+
+    def test_no_match(self):
+        assert not file_in_dir(Path("core/llm/tests/test_a.py"), "core/sandbox/tests")
+
+    def test_no_prefix_collision(self):
+        assert not file_in_dir(Path("core/sandbox_extra/test.py"), "core/sandbox")
+
+
+class TestFileMatchesTier:
+    def test_matches_test_dir(self):
+        tier = {"test_dirs": ["core/sandbox/tests"]}
+        assert file_matches_tier(Path("core/sandbox/tests/test_a.py"), tier)
+
+    def test_matches_test_file(self):
+        tier = {"test_files": ["core/security/tests/test_prompt_envelope_audit.py"]}
+        assert file_matches_tier(
+            Path("core/security/tests/test_prompt_envelope_audit.py"), tier
+        )
+
+    def test_no_match(self):
+        tier = {"test_dirs": ["core/sandbox/tests"]}
+        assert not file_matches_tier(Path("core/llm/tests/test_a.py"), tier)
+
+
+class TestFileInFastTier:
+    def test_fast_tier_test(self):
+        assert file_in_fast_tier(Path("core/llm/tests/test_client.py"))
+
+    def test_carved_out_test(self):
+        assert not file_in_fast_tier(Path("core/sandbox/tests/test_a.py"))
+
+    def test_sca_carved_out(self):
+        assert not file_in_fast_tier(Path("packages/sca/tests/test_a.py"))
+
+    def test_non_test_file(self):
+        assert not file_in_fast_tier(Path("core/llm/client.py"))
+
+
+class TestBatchMatrix:
+    def test_empty_returns_empty(self):
+        assert batch_matrix([]) == []
+
+    def test_single_file(self):
+        result = batch_matrix([Path("core/llm/tests/test_a.py")])
+        assert len(result) == 1
+        assert result[0]["batch"] == 1
+        assert result[0]["files"] == "core/llm/tests/test_a.py"
+
+    def test_under_threshold_single_batch(self):
+        files = [Path(f"core/tests/test_{i}.py") for i in range(25)]
+        result = batch_matrix(files)
+        assert len(result) == 1
+        assert len(result[0]["files"].split()) == 25
+
+    def test_over_threshold_splits(self):
+        files = [Path(f"core/tests/test_{i:03d}.py") for i in range(26)]
+        result = batch_matrix(files)
+        assert len(result) == 2
+        sizes = [len(b["files"].split()) for b in result]
+        assert sorted(sizes) == [13, 13]
+
+    def test_large_count_caps_at_max(self):
+        files = [Path(f"core/tests/test_{i:03d}.py") for i in range(200)]
+        result = batch_matrix(files)
+        assert len(result) == 8
+
+    def test_batches_are_balanced(self):
+        files = [Path(f"core/tests/test_{i:03d}.py") for i in range(50)]
+        result = batch_matrix(files)
+        sizes = [len(b["files"].split()) for b in result]
+        assert max(sizes) - min(sizes) <= 1
+
+    def test_files_are_sorted(self):
+        files = [Path("z.py"), Path("a.py"), Path("m.py")]
+        result = batch_matrix(files)
+        assert result[0]["files"] == "a.py m.py z.py"
+
+    def test_batch_numbers_sequential(self):
+        files = [Path(f"t_{i}.py") for i in range(60)]
+        result = batch_matrix(files)
+        assert [b["batch"] for b in result] == [1, 2, 3]
+
+    def test_custom_parameters(self):
+        files = [Path(f"t_{i}.py") for i in range(10)]
+        result = batch_matrix(files, max_batches=2, target_per_batch=3)
+        assert len(result) == 2
+
+
+class TestBatchMatrixDurationAware:
+    """RAPTOR_TEST_DURATIONS switches batch_matrix from count-based
+    round-robin to duration-aware LPT; every defect in the env/file
+    falls back to the count-based result EXACTLY (CI-critical path —
+    fail open to the status quo, never to a skewed or empty matrix)."""
+
+    # One heavy file among cheap ones: round-robin deals by name and
+    # lands the heavy file plus half the cheap ones on one batch.
+    _FILES = [Path(f"core/tests/test_{i:02d}.py") for i in range(8)]
+    _DURS = {"core/tests/test_00.py": 100.0,
+             **{f"core/tests/test_{i:02d}.py": 1.0 for i in range(1, 8)}}
+
+    @staticmethod
+    def _shard_seconds(matrix, durs, default=0.0):
+        return [
+            sum(durs.get(f, default) for f in entry["files"].split())
+            for entry in matrix
+        ]
+
+    def _with_map(self, monkeypatch, tmp_path, payload) -> None:
+        p = tmp_path / "durations.json"
+        p.write_text(payload if isinstance(payload, str)
+                     else json.dumps(payload), encoding="utf-8")
+        monkeypatch.setenv("RAPTOR_TEST_DURATIONS", str(p))
+
+    def test_lpt_beats_round_robin_on_skewed_set(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RAPTOR_TEST_DURATIONS", raising=False)
+        rr = batch_matrix(self._FILES, max_batches=2, target_per_batch=4)
+        self._with_map(monkeypatch, tmp_path, self._DURS)
+        lpt = batch_matrix(self._FILES, max_batches=2, target_per_batch=4)
+        rr_max = max(self._shard_seconds(rr, self._DURS))
+        lpt_max = max(self._shard_seconds(lpt, self._DURS))
+        assert lpt_max < rr_max
+        # Heavy file rides alone; the seven 1s files share the other
+        # batch — max shard 100s, the LPT optimum for this set.
+        assert lpt_max == 100.0
+        # Same file multiset, same output shape.
+        assert sorted(f for e in lpt for f in e["files"].split()) == \
+            sorted(str(f) for f in self._FILES)
+        assert [e["batch"] for e in lpt] == [1, 2]
+
+    def test_missing_files_get_median_default(self, monkeypatch, tmp_path):
+        # Two unmapped files must weigh the median (1.0s), not 0: at
+        # zero weight they would both pile onto the heavy batch.
+        durs = dict(self._DURS)
+        del durs["core/tests/test_06.py"], durs["core/tests/test_07.py"]
+        self._with_map(monkeypatch, tmp_path, durs)
+        lpt = batch_matrix(self._FILES, max_batches=2, target_per_batch=4)
+        heavy = next(e for e in lpt
+                     if "core/tests/test_00.py" in e["files"].split())
+        assert heavy["files"] == "core/tests/test_00.py"
+
+    @pytest.mark.parametrize("payload", [
+        "{not json",                      # malformed JSON
+        json.dumps(["a.py", 1.0]),        # wrong shape (not an object)
+        json.dumps({"a.py": "fast"}),     # non-numeric value
+        json.dumps({"a.py": -3.0}),       # negative value
+        json.dumps({"a.py": True}),       # bool masquerading as number
+        '{"a.py": NaN}',                  # non-finite value
+        pytest.param(json.dumps({"a.py": 10 ** 400}), id="oversized-integer"),
+        pytest.param(json.dumps({"a.py": -(10 ** 400)}), id="oversized-negative-integer"),
+        pytest.param(json.dumps({"a.py": 1e308, "b.py": 1e308}), id="overflowing-total"),
+    ])
+    def test_bad_map_falls_back_to_count_based(
+            self, monkeypatch, tmp_path, payload):
+        monkeypatch.delenv("RAPTOR_TEST_DURATIONS", raising=False)
+        baseline = batch_matrix(self._FILES, max_batches=3,
+                                target_per_batch=2)
+        self._with_map(monkeypatch, tmp_path, payload)
+        assert batch_matrix(self._FILES, max_batches=3,
+                            target_per_batch=2) == baseline
+
+    def test_unreadable_path_falls_back_to_count_based(
+            self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RAPTOR_TEST_DURATIONS", raising=False)
+        baseline = batch_matrix(self._FILES, max_batches=3,
+                                target_per_batch=2)
+        monkeypatch.setenv(
+            "RAPTOR_TEST_DURATIONS", str(tmp_path / "no_such.json"))
+        assert batch_matrix(self._FILES, max_batches=3,
+                            target_per_batch=2) == baseline
+
+    def test_fallback_is_logged_loudly(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv(
+            "RAPTOR_TEST_DURATIONS", str(tmp_path / "no_such.json"))
+        batch_matrix(self._FILES, max_batches=2, target_per_batch=4)
+        out = capsys.readouterr().out
+        assert "::warning::" in out and "falling back" in out
+
+    def test_all_zero_durations_leave_no_batch_empty(
+            self, monkeypatch, tmp_path):
+        # Regression pin for the LPT tie-break: with load-only heap
+        # keys every zero-duration file lands on batch 1 and later
+        # batches emit EMPTY files entries — pytest with no path args
+        # runs the whole repo. The (load, count, index) key must
+        # spread ties so every batch gets files.
+        self._with_map(
+            monkeypatch, tmp_path, {str(f): 0.0 for f in self._FILES})
+        lpt = batch_matrix(self._FILES, max_batches=4, target_per_batch=2)
+        assert len(lpt) == 4
+        assert all(e["files"] for e in lpt)
+
+
+class TestTierConsistency:
+    """Verify TIERS and FAST_TIER_IGNORES are consistent."""
+
+    def test_every_tier_with_test_dirs_is_in_fast_ignores(self):
+        for name, config in TIERS.items():
+            for d in config.get("test_dirs", []):
+                if d.startswith("core/") or d.startswith("packages/"):
+                    assert any(
+                        d == fi or d.startswith(fi + "/")
+                        for fi in FAST_TIER_IGNORES
+                    ), f"Tier {name}'s test dir {d} not in FAST_TIER_IGNORES"
+
+    def test_every_fast_ignore_has_a_tier(self):
+        all_tier_dirs = set()
+        for config in TIERS.values():
+            for d in config.get("test_dirs", []):
+                all_tier_dirs.add(d)
+        for fi in FAST_TIER_IGNORES:
+            if fi.endswith(".py"):
+                continue
+            has_tier = any(
+                fi == td or fi.startswith(td + "/") or td.startswith(fi + "/")
+                for td in all_tier_dirs
+            )
+            has_tests = any(Path(fi).rglob("test_*.py")) if Path(fi).is_dir() else False
+            if has_tests:
+                assert has_tier, (
+                    f"FAST_TIER_IGNORES entry {fi} has test files "
+                    f"but no tier handles it"
+                )
+
+
+class TestFastTierIgnoresLiveness:
+    def test_every_ignore_row_exists_on_disk(self):
+        """The oracle guarding FAST_TIER_IGNORES short-circuits
+        nonexistent rows (``is_dir()`` guard), so a carve-out for a
+        deleted package sat in the registry unnoticed — dead rows
+        read as coverage and hide the day the path is recreated with
+        a different layout. Every row must be a live directory or
+        test file."""
+        from test_scope import FAST_TIER_IGNORES
+
+        repo = Path(__file__).resolve().parents[2]
+        dead = sorted(
+            row for row in FAST_TIER_IGNORES
+            if not (repo / row).exists()
+        )
+        assert not dead, (
+            f"FAST_TIER_IGNORES row(s) for paths not on disk: {dead} "
+            "— delete the stale row(s)"
+        )
+
+
+class TestCiLintTriggerClosure:
+    """Registry closure: every repo file whose CONTENT a ci_lint test
+    pins must fire the ci_lint tier, or a breaking edit to it merges
+    green and reddens the next unrelated .github PR, misattributed."""
+
+    def test_read_targets_are_covered_by_extra_triggers(self):
+        # Mechanically enumerate the `_read("<path>")` targets across
+        # the .github test suites (the convention content-pinning
+        # tests use) and assert each is claimed by an extra_triggers
+        # entry. Tests that pin content through other idioms
+        # (directory scans like test_libexec_marker_coverage) cannot
+        # be enumerated this way — their roots are covered by
+        # explicit extra_triggers entries (libexec, bin).
+        import ast as ast_mod
+
+        github_dir = Path(__file__).resolve().parents[1]
+        pinned: set[str] = set()
+        for tf in [
+            *(github_dir / "tests").glob("*.py"),
+            *(github_dir / "scripts" / "tests").glob("*.py"),
+        ]:
+            tree = ast_mod.parse(tf.read_text(encoding="utf-8"))
+            for node in ast_mod.walk(tree):
+                if (
+                    isinstance(node, ast_mod.Call)
+                    and isinstance(node.func, ast_mod.Name)
+                    and node.func.id == "_read"
+                    and node.args
+                    and isinstance(node.args[0], ast_mod.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    pinned.add(node.args[0].value)
+
+        assert pinned, "no _read() pins found — enumeration broke"
+        triggers = TIERS["ci_lint"]["extra_triggers"]
+        from test_scope import is_dependency_manifest
+
+        uncovered = sorted(
+            p for p in pinned
+            # Dependency manifests need no trigger row: a change to
+            # them forces FULL dispatch (see is_dependency_manifest),
+            # which runs ci_lint along with every other tier.
+            if not is_dependency_manifest(p)
+            and not any(p == t or p.startswith(t + "/") for t in triggers)
+        )
+        assert not uncovered, (
+            f"ci_lint tests pin the content of {uncovered} but those "
+            "paths do not fire the tier — add them to "
+            "TIERS['ci_lint']['extra_triggers'] in test_scope.py"
+        )
+
+
+def _manifest_cache_key_gaps(
+    workflows_dir: Path, cache_helper: Path | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """(unclaimed root keys, directory-level manifest keys, root keys)
+    from the hashFiles() cache-key expressions in *workflows_dir*.
+
+    ``*.y*ml``: GHA accepts both workflow extensions. A key counts as
+    manifest-named when any path segment starts with ``requirements``
+    or is ``pyproject.toml`` or ``uv.lock`` — that is exactly the
+    vocabulary is_dependency_manifest claims, so a claimed name moving
+    into a directory cannot drop out of the checked set silently.
+    """
+    import re
+
+    args: set[str] = set()
+    for wf in sorted(workflows_dir.glob("*.y*ml")):
+        for call in re.findall(
+            r"hashFiles\(([^)]*)\)", wf.read_text(encoding="utf-8")
+        ):
+            args.update(re.findall(r"'([^']+)'", call))
+    if cache_helper is not None:
+        tree = ast.parse(cache_helper.read_text())
+        declarations = [node for node in tree.body if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == 'VENV_INPUTS'
+                                for target in node.targets)]
+        assert len(declarations) == 1, 'cache input declaration needs review'
+        inputs = ast.literal_eval(declarations[0].value)
+        assert inputs and all(isinstance(name, str) for name in inputs)
+        args.update(inputs)
+    # Bytecode source hashes are not dependency manifests.
+    root_level = sorted(a for a in args if "/" not in a and not a.endswith(('.py', '.pyi', '.ipynb')))
+    unclaimed = [
+        a for a in root_level
+        if not is_dependency_manifest(a.replace("*", "x"))
+    ]
+    moved = sorted(
+        a for a in args
+        if "/" in a and any(
+            seg.startswith("requirements")
+            or seg in {"pyproject.toml", "uv.lock", "uv.toml"}
+            for seg in Path(a).parts
+        )
+    )
+    return unclaimed, moved, root_level
+
+
+def _active(result: dict) -> list[str]:
+    return sorted(t for t, i in result.items()
+                  if not t.startswith("_") and i["run"])
+
+
+def _is_full_dispatch(result: dict) -> bool:
+    return all(i["run"] for t, i in result.items() if not t.startswith("_"))
+
+
+@pytest.fixture(scope="module")
+def mini_repo(tmp_path_factory) -> Path:
+    """Synthetic scan tree exercising every PR shape the dispatcher
+    must map: imported modules, package tests, tier-owned packages,
+    runtime data files with and without an owning package, and a
+    package with code but no test coverage."""
+    repo = tmp_path_factory.mktemp("mini_repo")
+    # Imported module + its test (fast tier).
+    (repo / "core/pkga").mkdir(parents=True)
+    (repo / "core/pkga/__init__.py").write_text("")
+    (repo / "core/pkga/mod.py").write_text("VALUE = 1\n")
+    (repo / "core/pkga/tests").mkdir()
+    (repo / "core/pkga/tests/fixtures").mkdir()
+    (repo / "core/pkga/tests/fixtures/sample.json").write_text("{}")
+    (repo / "core/pkga/tests/test_mod.py").write_text(
+        "from pathlib import Path\n\nimport core.pkga.mod\n\n"
+        'FIXTURES = Path(__file__).parent / "fixtures"\n\n'
+        "def test_value():\n"
+        "    assert core.pkga.mod.VALUE == 1\n"
+    )
+    # Runtime data owned by pkga (no test references the file itself).
+    (repo / "core/pkga/data").mkdir()
+    (repo / "core/pkga/data/rules.json").write_text("{}")
+    # Data directory with NO .py-bearing ancestor below the scan root.
+    (repo / "core/orphan").mkdir()
+    (repo / "core/orphan/blob.bin").write_text("x")
+    # Package with code but no tests and no importers.
+    (repo / "core/untested").mkdir()
+    (repo / "core/untested/helper.py").write_text("X = 1\n")
+    (repo / "core/untested/data").mkdir()
+    (repo / "core/untested/data/cfg.yml").write_text("a: 1\n")
+    # Tier-owned package (sca's test_dirs is the whole package).
+    (repo / "packages/sca/tests").mkdir(parents=True)
+    (repo / "packages/sca/__init__.py").write_text("")
+    (repo / "packages/sca/optimise.py").write_text("Y = 2\n")
+    (repo / "packages/sca/tests/test_shape.py").write_text(
+        "def test_shape():\n    assert True\n"
+    )
+    (repo / "packages/sca/data/popular").mkdir(parents=True)
+    (repo / "packages/sca/data/popular/pypi.json").write_text("[]")
+    # Repo-root entry module whose only dependent is a test that
+    # imports it by bare name (the raptor*.py shape). Deliberately
+    # NOT raptor-named: graph coverage derives from the root-level
+    # location, never from a name pattern or hand-list.
+    (repo / "entrymod.py").write_text("def main() -> int:\n    return 0\n")
+    (repo / "core/pkga/tests/test_entry.py").write_text(
+        "import entrymod\n\n"
+        "def test_main():\n"
+        "    assert entrymod.main() == 0\n"
+    )
+    return repo
+
+
+class TestIncompleteImportGraph:
+    @pytest.fixture
+    def repo(self, tmp_path):
+        sources = {
+            "core/example/model.py": "VALUE = 1\n",
+            "core/example/bridge.py": "import core.example.model\n",
+            "core/example/tests/test_model.py": "import core.example.bridge\n",
+            "core/other/tests/test_other.py": "def test_other(): pass\n",
+            "core/sandbox/tests/test_sandbox.py": "def test_sandbox(): pass\n",
+            ".github/tests/test_ci.py": "def test_ci(): pass\n",
+        }
+        for name, body in sources.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+        return tmp_path
+
+    @pytest.mark.parametrize("broken", [
+        "core/example/bridge.py", "core/example/tests/test_model.py",
+    ], ids=["intermediate", "consumer"])
+    def test_parse_failure_forces_complete_dispatch(self, repo, broken, capsys):
+        (repo / broken).write_text("def broken(:\n")
+        result = compute_tier_dispatch(["core/example/model.py"], repo)
+        assert _is_full_dispatch(result)
+        assert result["_scope"]["full"]
+        assert result["python"]["files"] == [
+            Path("core/example/tests/test_model.py"),
+            Path("core/other/tests/test_other.py"),
+        ]
+        assert result["sandbox"]["files"] == [Path("core/sandbox/tests/test_sandbox.py")]
+        assert result["ci_lint"]["files"] == [Path(".github/tests/test_ci.py")]
+        assert result["python"]["matrix"]
+        assert result["_stats"]["closure"] == result["_stats"]["total"]
+        assert "1 parse failures" in capsys.readouterr().out
+
+    def test_valid_graph_remains_scoped(self, repo):
+        result = compute_tier_dispatch(["core/example/model.py"], repo)
+        assert not _is_full_dispatch(result)
+        assert result["python"]["files"] == [Path("core/example/tests/test_model.py")]
+        assert not result["sandbox"]["run"]
+        assert not result["ci_lint"]["run"]
+
+    def test_non_graph_input_does_not_parse_broken_tree(self, repo, monkeypatch):
+        (repo / "core/example/bridge.py").write_text("def broken(:\n")
+
+        def unexpected_graph(*args, **kwargs):
+            pytest.fail("metadata-only input must not construct a graph")
+
+        monkeypatch.setattr("test_scope.build_graph", unexpected_graph)
+        result = compute_tier_dispatch(["docs/guide.md"], repo)
+        assert not _active(result)
+        assert not _is_full_dispatch(result)
+
+
+class TestDispatchFailsOpen:
+    """Simulation harness for the PR shapes that must never dispatch
+    zero tiers: deleted / renamed imported modules, data-only changes,
+    and workflow-harness-only changes. The dispatch decision fails
+    toward FULL dispatch on any file it cannot map — never toward
+    zero — while mappable shapes stay scoped."""
+
+    @pytest.mark.parametrize("planner,expected", [
+        ("pytest_workers.py", ["ci_lint", "exploit_feasibility", "sandbox"]),
+        ("macos_test_scope.py", ["ci_lint", "sandbox"]),
+        ("sca_test_matrix.py", ["ci_lint", "sca"]),
+    ], ids=["worker-planner", "macos-planner", "sca-planner"])
+    def test_worker_planner_edit_runs_its_consuming_tiers(self, tmp_path, monkeypatch, planner, expected):
+        targets = [
+            "core/sandbox/tests/test_one.py",
+            "packages/exploit_feasibility/tests/test_one.py",
+            ".github/tests/test_one.py",
+            "packages/sca/tests/test_one.py",
+        ]
+        for target in targets:
+            path = tmp_path / target
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("def test_one(): pass\n")
+        def unexpected_graph(*args, **kwargs):
+            pytest.fail("outside-graph planner must not parse the runtime graph")
+
+        monkeypatch.setattr("test_scope.build_graph", unexpected_graph)
+        result = compute_tier_dispatch(
+            [f".github/scripts/{planner}"], tmp_path,
+        )
+        assert _active(result) == expected
+        assert result["sandbox"]["files"] == ([Path(targets[0])] if "sandbox" in expected else [])
+        assert result["exploit_feasibility"]["files"] == ([Path(targets[1])] if "exploit_feasibility" in expected else [])
+        assert result["sca"]["files"] == ([Path(targets[3])] if "sca" in expected else [])
+
+    def test_plain_edit_stays_scoped(self, mini_repo):
+        # Control: an in-place edit of the same module dispatches its
+        # test without falling to full dispatch.
+        result = compute_tier_dispatch(["core/pkga/mod.py"], mini_repo)
+        assert result["python"]["run"]
+        assert Path("core/pkga/tests/test_mod.py") in result["python"]["files"]
+        assert not _is_full_dispatch(result)
+
+    def test_deleted_module_forces_full_dispatch(self, mini_repo):
+        # A deletion PR lists the removed path; the file is absent
+        # from the checkout, so the reverse graph has no key for it —
+        # its broken importers cannot be resolved.
+        result = compute_tier_dispatch(["core/pkga/gone.py"], mini_repo)
+        assert _is_full_dispatch(result), (
+            f"deleted module under-dispatched: only {_active(result)}"
+        )
+
+    def test_renamed_module_forces_full_dispatch(self, mini_repo):
+        # A rename arrives as [old_path, new_path]; the old path is
+        # absent from the checkout while importers still name it.
+        result = compute_tier_dispatch(
+            ["core/pkga/old_name.py", "core/pkga/mod.py"], mini_repo,
+        )
+        assert _is_full_dispatch(result), (
+            f"renamed module under-dispatched: only {_active(result)}"
+        )
+
+    def test_missing_py_outside_graph_stays_scoped(self, mini_repo):
+        # Both directions: a deleted .py the graph never covered
+        # (outside core//packages) proves nothing about lost import
+        # edges and must NOT torch scoping with a full dispatch.
+        result = compute_tier_dispatch(["docs/example.py"], mini_repo)
+        assert not _is_full_dispatch(result)
+        assert _active(result) == []
+
+    def test_data_only_in_tier_tree_runs_that_tier(self, mini_repo):
+        # sca's test_dirs is the whole package: a data-only PR (the
+        # weekly refresh auto-PR shape) must run the tier's tests —
+        # corrupted detector data merged with zero tests before.
+        result = compute_tier_dispatch(
+            ["packages/sca/data/popular/pypi.json"], mini_repo,
+        )
+        assert result["sca"]["run"]
+        assert Path("packages/sca/tests/test_shape.py") in result["sca"]["files"]
+        assert not _is_full_dispatch(result)
+
+    def test_data_only_owning_package_seeds_its_tests(self, mini_repo):
+        # A runtime resource with no tier claim routes through the
+        # package that owns it: core/pkga/data → core/pkga's modules →
+        # their tests via the import graph.
+        result = compute_tier_dispatch(
+            ["core/pkga/data/rules.json"], mini_repo,
+        )
+        assert result["python"]["run"]
+        assert Path("core/pkga/tests/test_mod.py") in result["python"]["files"]
+        assert not _is_full_dispatch(result)
+
+    def test_top_level_test_data_forces_full_dispatch(self, mini_repo):
+        # The top-level test/ tree is data with repo-relative
+        # consumers (sca-e2e corpora, scanner fixtures): the graph
+        # cannot claim it, so a corpus-only PR must fail toward FULL
+        # dispatch — it dispatched zero tiers before DATA_ROOTS
+        # joined the resource routing.
+        result = compute_tier_dispatch(
+            ["test/data/sca-e2e/labels.json"], mini_repo,
+        )
+        assert _is_full_dispatch(result), (
+            f"test/-data change under-dispatched: only {_active(result)}"
+        )
+
+    def test_test_data_python_fixture_forces_full_dispatch(self, mini_repo):
+        # .py files under test/ are fixture data too — no import-graph
+        # key, so seeding them proves nothing; they must route through
+        # the same fail-toward-full arm, not the silent .py lane.
+        result = compute_tier_dispatch(
+            ["test/data/python_sql_injection.py"], mini_repo,
+        )
+        assert _is_full_dispatch(result), (
+            f"test/-py fixture change under-dispatched: "
+            f"only {_active(result)}"
+        )
+
+    def test_fixture_data_routes_to_referencing_test(self, mini_repo):
+        # Fixture data maps to the tests that reference its directory
+        # (Path(__file__).parent / "fixtures" chain in the test file).
+        result = compute_tier_dispatch(
+            ["core/pkga/tests/fixtures/sample.json"], mini_repo,
+        )
+        assert result["python"]["run"]
+        assert Path("core/pkga/tests/test_mod.py") in result["python"]["files"]
+        assert not _is_full_dispatch(result)
+
+    @pytest.mark.parametrize("changed", [
+        # No .py-bearing ancestor below the scan root at all.
+        "core/orphan/blob.bin",
+        # Owning package exists but its closure reaches no test.
+        "core/untested/data/cfg.yml",
+    ])
+    def test_unmappable_data_forces_full_dispatch(self, mini_repo, changed):
+        result = compute_tier_dispatch([changed], mini_repo)
+        assert _is_full_dispatch(result), (
+            f"unmappable resource under-dispatched: only {_active(result)}"
+        )
+
+    def test_resource_outside_scan_roots_stays_inert(self, mini_repo):
+        # Both directions: docs and other out-of-tree files are not
+        # runtime inputs to any tier — they must not fall to full
+        # dispatch just because no mapping claims them.
+        result = compute_tier_dispatch(["docs/guide.md"], mini_repo)
+        assert _active(result) == []
+
+    @pytest.mark.parametrize("changed", [
+        "README.md", "docs/guide.md", ".github/workflows/lint.yml",
+        ".github/codeql/codeql-config.yml",
+    ])
+    def test_metadata_change_does_not_parse_python_tree(self, mini_repo, monkeypatch, changed):
+        def unexpected_graph(*args, **kwargs):
+            pytest.fail("metadata-only dispatch must not parse the Python tree")
+
+        monkeypatch.setattr("test_scope.build_graph", unexpected_graph)
+        result = compute_tier_dispatch([changed], mini_repo)
+        expected = ["ci_lint"] if changed == "README.md" or changed.startswith(".github/") else []
+        assert _active(result) == expected
+
+    def test_dangling_symlink_tree_still_dispatches(self, tmp_path):
+        # A dangling .py symlink anywhere under a scan root used to
+        # crash graph construction (FileNotFoundError), reddening the
+        # dispatch job for EVERY PR against that tree. An incomplete
+        # graph now fails toward full dispatch without crashing, even
+        # when the unreadable graph member was not directly changed.
+        (tmp_path / "core/pkgb").mkdir(parents=True)
+        (tmp_path / "core/pkgb/mod.py").write_text("V = 1\n")
+        (tmp_path / "core/pkgb/tests").mkdir()
+        (tmp_path / "core/pkgb/tests/test_mod.py").write_text(
+            "import core.pkgb.mod\n\ndef test_v():\n"
+            "    assert core.pkgb.mod.V == 1\n"
+        )
+        try:
+            (tmp_path / "core/pkgb/dangling.py").symlink_to(
+                tmp_path / "core/pkgb/no_such_target.py"
+            )
+        except OSError:
+            pytest.skip("platform cannot create symlinks")
+
+        # Unrelated edit: no crash, but the graph is incomplete.
+        result = compute_tier_dispatch(["core/pkgb/mod.py"], tmp_path)
+        assert Path("core/pkgb/tests/test_mod.py") in result["python"]["files"]
+        assert _is_full_dispatch(result)
+
+        # The symlink itself changed: cannot be mapped, full dispatch.
+        result = compute_tier_dispatch(["core/pkgb/dangling.py"], tmp_path)
+        assert _is_full_dispatch(result), (
+            f"changed dangling symlink under-dispatched: only {_active(result)}"
+        )
+
+    def test_root_module_edit_dispatches_importing_tests(self, mini_repo):
+        # A PR editing only a repo-root entry module must dispatch the
+        # tests that import it. Pre-fix the scan-root import filter
+        # erased those edges: the module sat in the graph as a node
+        # with zero reverse-dependents, the PR dispatched zero tiers,
+        # and tests-passed went green with the importing tests unrun.
+        result = compute_tier_dispatch(["entrymod.py"], mini_repo)
+        assert result["python"]["run"], "root-module edit dispatched zero tiers"
+        assert Path("core/pkga/tests/test_entry.py") in result["python"]["files"]
+        assert not _is_full_dispatch(result)
+
+    def test_root_module_deletion_forces_full_dispatch(self, mini_repo):
+        # Deleting a root entry module (absent from the checkout, so
+        # no graph key) must fail toward full dispatch — pre-fix only
+        # a hand-list of two names was covered and deleting any other
+        # root module stayed "outside graph → inert".
+        result = compute_tier_dispatch(["gone_root.py"], mini_repo)
+        assert _is_full_dispatch(result), (
+            f"deleted root module under-dispatched: only {_active(result)}"
+        )
+
+    def test_tier_workflow_only_change_forces_full_dispatch(self, mini_repo):
+        # tests.yml/_tier.yml ARE every tier's execution harness
+        # (pytest invocations, env guards, venv steps). GHA runs the
+        # modified workflow on the PR, but only the jobs that gate ON
+        # — pre-fix that was none, so a tier-command regression merged
+        # green and surfaced on the next real PR, misattributed.
+        result = compute_tier_dispatch(
+            [".github/workflows/tests.yml"], mini_repo,
+        )
+        assert _is_full_dispatch(result), (
+            f"workflow-only PR under-dispatched: only {_active(result)}"
+        )
+
+    @pytest.mark.parametrize("manifest", [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "pyproject.toml",
+        "uv.lock",
+        "uv.toml",
+    ])
+    def test_dependency_manifest_forces_full_dispatch(self, mini_repo, manifest):
+        # Every heavy tier installs from the root manifests (venv jobs
+        # key their caches on hashFiles('uv.lock')); pre-fix
+        # a manifest-only PR ran only the fast tier, so a pin bump
+        # that broke a carved-out tier merged green and reddened that
+        # tier's next unrelated run, misattributed.
+        result = compute_tier_dispatch([manifest], mini_repo)
+        assert _is_full_dispatch(result), (
+            f"{manifest}-only PR under-dispatched: only {_active(result)}"
+        )
+
+    def test_nested_manifest_stays_inert(self, mini_repo):
+        # Both directions: a requirements file inside a fixture tree
+        # is test data, not the CI install surface — it must not torch
+        # scoping with a full dispatch.
+        result = compute_tier_dispatch(
+            ["core/pkga/tests/fixtures/requirements.txt"], mini_repo,
+        )
+        assert not _is_full_dispatch(result)
+
+    def test_hashfiles_manifests_are_claimed(self):
+        # Oracle tying is_dependency_manifest to the CI install
+        # surface it mirrors: every ROOT-LEVEL file the workflows'
+        # hashFiles() cache keys reference must be claimed as a
+        # manifest, and no manifest-named key may sit in a directory
+        # (the pattern is root-only, so a cache key moved to e.g.
+        # requirements/base.txt — even while other keys stay at root —
+        # would silently dispatch only the fast tier again). Either
+        # direction of drift fails loud with the remedy named.
+        workflows = Path(__file__).resolve().parents[1] / "workflows"
+        unclaimed, moved, root_level = _manifest_cache_key_gaps(
+            workflows, cache_helper=workflows.parent / "scripts/ci_cache_key.py")
+        assert root_level, "hashFiles enumeration broke (no root-level keys)"
+        assert not unclaimed, (
+            f"workflow cache keys reference root manifest(s) "
+            f"{unclaimed} that is_dependency_manifest does not claim — "
+            "widen the pattern in test_scope.py"
+        )
+        assert not moved, (
+            f"workflow cache keys reference manifest(s) inside a "
+            f"directory {moved} — is_dependency_manifest is root-level "
+            "only, so these would dispatch nothing; widen the pattern "
+            "in test_scope.py together with the cache-key move"
+        )
+
+    def test_hashfiles_oracle_flags_drift_shapes(self, tmp_path):
+        # Failing-first fixtures for both drift directions, plus the
+        # .yaml workflow extension (GHA accepts both spellings).
+        (tmp_path / "new-name.yml").write_text(
+            "key: ${{ hashFiles('constraints.txt') }}\n"
+        )
+        unclaimed, moved, root_level = _manifest_cache_key_gaps(tmp_path)
+        assert unclaimed == ["constraints.txt"]
+
+        (tmp_path / "new-name.yml").unlink()
+        (tmp_path / "partial-move.yaml").write_text(
+            "key: ${{ hashFiles('requirements.txt', "
+            "'requirements/base.txt') }}\n"
+        )
+        unclaimed, moved, root_level = _manifest_cache_key_gaps(tmp_path)
+        assert unclaimed == []
+        assert moved == ["requirements/base.txt"]
+        assert root_level == ["requirements.txt"]
+
+    def test_scope_script_change_forces_full_dispatch(self, mini_repo):
+        # The dispatcher itself under-dispatching is the same failure
+        # shape: a scope-script bug gates every job off, so nothing
+        # validates the change beyond its unit tests.
+        result = compute_tier_dispatch(
+            [".github/scripts/test_scope.py"], mini_repo,
+        )
+        assert _is_full_dispatch(result)
+
+    def test_non_harness_workflow_stays_scoped(self, mini_repo):
+        # Both directions: other workflows (lint.yml etc.) are not the
+        # Python-tier harness — they fire ci_lint via extra_triggers,
+        # never a full dispatch.
+        result = compute_tier_dispatch(
+            [".github/workflows/lint.yml"], mini_repo,
+        )
+        assert not _is_full_dispatch(result)
+        assert _active(result) == ["ci_lint"]
+
+    def test_mixed_data_and_code_change(self, mini_repo):
+        # Mixed PR shape: tier-owned data + an imported module — both
+        # routes dispatch, still without a full fallback.
+        result = compute_tier_dispatch(
+            ["packages/sca/data/popular/pypi.json", "core/pkga/mod.py"],
+            mini_repo,
+        )
+        assert result["sca"]["run"]
+        assert result["python"]["run"]
+        assert not _is_full_dispatch(result)
+
+
+@pytest.mark.slow
+class TestOnRealRepo:
+    """Integration tests against the actual RAPTOR codebase."""
+
+    @pytest.fixture(scope="class")
+    @staticmethod
+    def repo():
+        repo = Path(__file__).resolve().parents[2]
+        if not (repo / "core").is_dir():
+            pytest.skip("not running from RAPTOR repo root")
+        return repo
+
+    @pytest.fixture(scope="class", autouse=True)
+    @staticmethod
+    def _shared_import_graph(repo, whole_repo_import_graph):
+        """Build the whole-repo import graph once for the class.
+
+        ``compute_tier_dispatch`` rebuilds the reverse import graph —
+        an AST parse of every Python file in the repo, tens of seconds
+        per call on a CI runner — on every invocation. The graph is a
+        pure function of the tree, and the tree does not change while
+        this class runs, so every test after the first re-derived the
+        same value. Reuse the graph's Python-file snapshot as well as
+        each distinct full-file discovery;
+        the closure walk, tier mapping and batching still run in every test.
+        Discovery results are copied so a caller cannot mutate the snapshot.
+        """
+        import test_scope as _ts
+        assert whole_repo_import_graph[4] == repo
+        references = whole_repo_import_graph[3]
+        cached = (whole_repo_import_graph[1], whole_repo_import_graph[2])
+        real_build_graph = _ts.build_graph
+        real_discover = _ts.discover_py_files
+        discovered = tuple(whole_repo_import_graph[0])
+        real_tier_files = _ts._discover_tier_files
+        real_fast_files = _ts._discover_fast_tier_files
+        tier_files = {}
+        fast_files = None
+
+        def _discover_cached(repo_arg, extra_roots=()):
+            if repo_arg == repo and not extra_roots:
+                return list(discovered)
+            return real_discover(repo_arg, extra_roots=extra_roots)
+
+        def _tier_files_cached(config, repo_arg):
+            if repo_arg != repo:
+                return real_tier_files(config, repo_arg)
+            key = (tuple(config.get("test_dirs", ())), tuple(config.get("test_files", ())))
+            if key not in tier_files:
+                tier_files[key] = tuple(real_tier_files(config, repo_arg))
+            return list(tier_files[key])
+
+        def _fast_files_cached(repo_arg):
+            nonlocal fast_files
+            if repo_arg != repo:
+                return real_fast_files(repo_arg)
+            if fast_files is None:
+                fast_files = tuple(real_fast_files(repo_arg))
+            return list(fast_files)
+
+        def _build_graph_cached(all_py, repo_arg, **kwargs):
+            if (repo_arg == repo and kwargs.get("on_parsed") is None
+                    and kwargs.get("on_divisions") is None):
+                for literal, paths in kwargs.get("literal_references", {}).items():
+                    paths.update(references.get(literal, ()))
+                return cached
+            return real_build_graph(all_py, repo_arg, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_ts, "build_graph", _build_graph_cached)
+            mp.setattr(_ts, "discover_py_files", _discover_cached)
+            mp.setattr(_ts, "_discover_tier_files", _tier_files_cached)
+            mp.setattr(_ts, "_discover_fast_tier_files", _fast_files_cached)
+            yield
+
+    @pytest.mark.parametrize("harness_file", sorted(ROOT_HARNESS_FILES))
+    def test_root_harness_change_dispatches_every_tier(
+            self, repo, harness_file):
+        """A PR touching only a harness file (root pytest config, the
+        tier workflows, or the scope scripts that drive dispatch)
+        reconfigures what every tier runs; pre-fix it dispatched ZERO
+        tiers and tests-passed went green with no tests run."""
+        result = compute_tier_dispatch([harness_file], repo)
+        inactive = [t for t, i in result.items()
+                    if not t.startswith("_") and not i["run"]]
+        assert inactive == [], (
+            f"{harness_file} left tiers undispatched: {inactive}")
+        assert result["python"]["files"], "fast tier got no files"
+
+    def test_every_root_entry_module_dispatches(self, repo):
+        """Closure oracle, derived from the tree — never a hand-list.
+
+        Every repo-root .py file must either be harness-grade (in
+        ROOT_HARNESS_FILES, forcing full dispatch — pinned by
+        test_root_harness_change_dispatches_every_tier) or acquire
+        reverse-dependents in the import graph so a PR editing it
+        dispatches the tiers that test it. A new root entry point
+        with neither fails here instead of silently dispatching zero
+        tiers until the cron reddens, misattributed."""
+        root_modules = sorted(
+            p.name for p in repo.glob("*.py") if p.is_file()
+        )
+        assert root_modules, "root-module enumeration broke"
+        undispatchable = []
+        for name in root_modules:
+            if name in ROOT_HARNESS_FILES:
+                continue
+            result = compute_tier_dispatch([name], repo)
+            if not any(i["run"] for t, i in result.items()
+                       if not t.startswith("_")):
+                undispatchable.append(name)
+        assert not undispatchable, (
+            f"root entry module(s) dispatch ZERO test tiers: "
+            f"{undispatchable} — no test imports them; add an importing "
+            "test or register them in ROOT_HARNESS_FILES"
+        )
+
+    def test_nested_conftest_still_scopes_to_its_tree(self, repo):
+        result = compute_tier_dispatch(
+            ["core/sandbox/tests/conftest.py"], repo,
+        )
+        assert result["sandbox"]["run"]
+        inactive = [t for t, i in result.items()
+                    if not t.startswith("_") and not i["run"]]
+        assert inactive, "nested conftest must not force full dispatch"
+
+    def test_leaf_change_scopes_tightly(self, repo):
+        result = compute_tier_dispatch(
+            ["packages/web/scanner.py"], repo
+        )
+        # redos_census dispatches on EVERY runtime-source change by
+        # design (its universe is the runtime tree; one test file,
+        # seconds) — it is not the fan-out this bound polices.
+        active = [t for t, i in result.items()
+                  if not t.startswith("_") and t != "redos_census"
+                  and i["run"]]
+        assert len(active) <= 3, f"leaf change activated too many tiers: {active}"
+        assert result["redos_census"]["run"], (
+            "runtime-source change must dispatch the redos census"
+        )
+
+    def test_no_dead_deps_gate_in_result(self, repo):
+        # deps-job gating lives in tests.yml (it ORs the venv tier
+        # outputs); a "_deps" entry computed here was never emitted
+        # (_emit_outputs skips underscore keys) and misled readers
+        # into thinking this script drove the deps job.
+        result = compute_tier_dispatch(
+            ["packages/web/scanner.py"], repo
+        )
+        assert "_deps" not in result
+
+    def test_sca_only_change(self, repo):
+        result = compute_tier_dispatch(
+            ["packages/sca/optimise.py"], repo
+        )
+        assert result["sca"]["run"]
+        assert len(result["sca"]["files"]) > 0
+        # raptor.py imports packages.sca.cli, so the entry-surface
+        # tests that import raptor are genuine dependents and their
+        # tiers legitimately dispatch (asserting zero non-sca tiers
+        # here used to pin the erased root-module edges). The dispatch
+        # must still stay scoped: no full fallback, and tiers with no
+        # graph path from sca stay off.
+        assert not _is_full_dispatch(result)
+        assert not result["sandbox"]["run"]
+        assert not result["sage"]["run"]
+
+    def test_ci_script_change_triggers_ci_lint(self, repo):
+        result = compute_tier_dispatch(
+            [".github/scripts/compute_filters.py"], repo
+        )
+        assert result["ci_lint"]["run"]
+
+    @pytest.mark.parametrize("changed", [
+        ".github/workflows/lint.yml",
+        "CLAUDE.md",
+        ".claude/commands/scan.md",
+        # test_ci_controls_docs pins README's self-check section and
+        # pyproject's exact ruff select list; a breaking edit to
+        # either merged green while only these tests would redden.
+        "README.md",
+        "pyproject.toml",
+        # test_libexec_marker_coverage / test_symlink_hop_bound pin
+        # the launcher-preamble templates byte-for-byte.
+        "libexec/raptor-agentic",
+        "bin/raptor",
+    ])
+    def test_asserted_content_change_triggers_ci_lint(self, repo, changed):
+        # .github/tests pins workflow content (test_ci_controls_docs)
+        # and CLAUDE.md / command-doc prose (test_lifecycle_doc_syntax);
+        # edits to those files must fire the tier that runs them.
+        result = compute_tier_dispatch([changed], repo)
+        assert result["ci_lint"]["run"], f"{changed} did not fire ci_lint"
+
+    def test_unrelated_root_file_does_not_trigger_ci_lint(self, repo):
+        # The extra_triggers are exact/prefix-scoped: a root-level file
+        # NO ci_lint test pins must not drag the whole tier in. (This
+        # used to pin README.md as non-firing — wrong direction: its
+        # content IS asserted by test_ci_controls_docs, so a README
+        # edit that broke the pin merged green. LICENSE is pinned by
+        # nothing this tier runs.)
+        result = compute_tier_dispatch(["LICENSE"], repo)
+        assert not result["ci_lint"]["run"]
+
+    def test_prompt_audit_trigger(self, repo):
+        result = compute_tier_dispatch(
+            ["packages/llm_analysis/agent.py"], repo
+        )
+        assert result["prompt_audit"]["run"]
+
+    def test_prompt_audit_trigger_files_match_registry(self, repo):
+        """The prompt_audit tier's trigger_files must mirror
+        _PROMPT_CONSTRUCTION_FILES from the audit module."""
+        sys.path.insert(0, str(repo))
+        try:
+            from core.security.prompt_envelope_audit import (
+                _PROMPT_CONSTRUCTION_FILES,
+            )
+        finally:
+            sys.path.pop(0)
+
+        tier_triggers = set(TIERS["prompt_audit"]["trigger_files"])
+        required = set(_PROMPT_CONSTRUCTION_FILES) | {
+            "core/security/prompt_envelope_audit.py",
+            "core/security/tests/test_prompt_envelope_audit.py",
+        }
+        missing = required - tier_triggers
+        assert not missing, (
+            f"prompt_audit trigger_files missing registered files: {missing}\n"
+            "Update TIERS['prompt_audit']['trigger_files'] in test_scope.py"
+        )
+
+    def test_no_changes_returns_all_skipped_or_empty(self, repo):
+        # LICENSE, not README.md: README now fires ci_lint (its content
+        # is pinned by test_ci_controls_docs).
+        result = compute_tier_dispatch(
+            ["LICENSE"], repo
+        )
+        active = [t for t, i in result.items()
+                  if not t.startswith("_") and i["run"]]
+        assert len(active) == 0
+
+    def test_python_tier_has_matrix(self, repo):
+        """The python tier always includes a matrix key."""
+        result = compute_tier_dispatch(
+            ["core/config/__init__.py"], repo
+        )
+        assert "matrix" in result["python"]
+        if result["python"]["run"]:
+            matrix = result["python"]["matrix"]
+            assert len(matrix) >= 1
+            assert all("batch" in entry and "files" in entry
+                       for entry in matrix)
+            assert json.dumps(matrix)
+
+    def test_python_matrix_empty_when_no_files(self, repo):
+        result = compute_tier_dispatch(
+            ["LICENSE"], repo
+        )
+        assert result["python"]["matrix"] == []
+
+    def test_category_tier_has_file_list(self, repo):
+        """Category tiers produce file lists, not whole directories."""
+        result = compute_tier_dispatch(
+            ["packages/sca/optimise.py"], repo
+        )
+        sca_files = result["sca"]["files"]
+        assert len(sca_files) > 0
+        assert all(is_test_file(f) for f in sca_files)
+
+
+# ---------------------------------------------------------------------------
+# Pytest-lane closure: no orphan test directories
+# ---------------------------------------------------------------------------
+
+# Tracked test files that deliberately run OUTSIDE the repo's CI pytest
+# lanes. Every entry needs a rationale; an entry whose files stop
+# existing goes stale loudly (asserted below) so the table cannot
+# accrete tombstones. Directory entries end with "/".
+LANE_EXEMPT: dict[str, str] = {
+    ".claude/skills/": (
+        "skill-kit suites (crash-analysis, oss-forensics evidence kit) "
+        "ship with their skills and are developer-run beside them; the "
+        "kits bind to skill-local deps (BigQuery clients, rr, gdb) and "
+        "no CI lane installs those. A recorded residue, not a claim of "
+        "coverage."
+    ),
+    ".devcontainer/test_devcontainer.py": (
+        "devcontainer smoke check, exercised when the container is "
+        "built — not a CI pytest suite."
+    ),
+    ".github/scripts/test_scope.py": (
+        "dispatch SCRIPT that happens to be test_-named; its suite is "
+        ".github/tests/test_test_scope.py (ci_lint lane)."
+    ),
+    ".github/scripts/test_impact.py": (
+        "dispatch SCRIPT that happens to be test_-named; its suite is "
+        ".github/tests/test_test_impact.py (ci_lint lane)."
+    ),
+    ".github/evals/": (
+        "replay-determinism eval lanes: run in their own dedicated "
+        "workflow (replay-determinism.yml, replay-determinism and "
+        "replay-eval-private jobs, each with a recorded skip budget) "
+        "rather than the tiered dispatch — the gate is path-filtered "
+        "with a daily full sweep, and the private-case lane's "
+        "skip-with-notice shape carries its own budget key."
+    ),
+}
+
+
+def _lane_exempt(rel: str) -> bool:
+    return any(
+        rel == e or (e.endswith("/") and rel.startswith(e))
+        for e in LANE_EXEMPT
+    )
+
+
+class TestPytestLaneClosure:
+    """Every git-tracked test file is claimed by a pytest lane.
+
+    The structural oracle for the orphan-directory class: engine/'s 44
+    test files (semgrep ReDoS gate, per-rule coccinelle suites — a
+    63-module tree) ran in NO CI lane — outside SCAN_ROOTS, every tier's test_dirs, and the fast
+    tier's core|packages bound — and rotted silently on every merge,
+    including force_full and nightly; the repo-root entry modules were
+    an earlier member of the same class. Per-member fixes leave the
+    next orphan directory silent; this test derives the universe from
+    the git tree, so a NEW test-bearing directory outside every lane
+    fails CI until a tier claims it (or it earns a documented
+    LANE_EXEMPT row).
+
+    A lane claims a file when the fast tier's own predicate accepts it
+    or a TIERS entry matches it — the exact functions dispatch runs,
+    so the oracle cannot drift from the dispatcher.
+    """
+
+    @staticmethod
+    def _tracked_test_files(repo: Path | None = None) -> list[str]:
+        import subprocess
+        if repo is None:
+            repo = Path(__file__).resolve().parents[2]
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo),
+                 "ls-files", "-z", "--", "*.py"],
+                capture_output=True, check=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pytest.skip("not a git checkout (or git unavailable)")
+        tracked = [
+            raw.decode("utf-8", errors="surrogateescape")
+            for raw in out.stdout.split(b"\0") if raw
+        ]
+        return [rel for rel in tracked if is_test_file(Path(rel))]
+
+    def test_every_tracked_test_file_is_claimed_by_a_lane(self):
+        orphans = [
+            rel for rel in self._tracked_test_files()
+            if not file_in_fast_tier(Path(rel))
+            and not any(
+                file_matches_tier(Path(rel), cfg)
+                for cfg in TIERS.values()
+            )
+            and not _lane_exempt(rel)
+        ]
+        assert not orphans, (
+            "test file(s) claimed by NO pytest lane — they run in no "
+            "CI tier and rot silently; add a tier (test_scope.TIERS), "
+            "widen the fast tier, or add a documented LANE_EXEMPT row: "
+            f"{orphans}"
+        )
+
+    def test_exempt_rows_are_live_and_reasoned(self):
+        tracked = self._tracked_test_files()
+        for entry, why in LANE_EXEMPT.items():
+            assert why.strip(), f"LANE_EXEMPT {entry}: empty rationale"
+            live = any(
+                rel == entry or (entry.endswith("/")
+                                 and rel.startswith(entry))
+                for rel in tracked
+            )
+            assert live, (
+                f"LANE_EXEMPT row {entry!r} matches no tracked test "
+                "file — remove the stale exemption"
+            )
+
+
+@pytest.mark.parametrize("changed", [
+    ".github/scripts/prepare_sbom.py",
+    ".github/sbom-provenance.json",
+])
+def test_sbom_preparation_inputs_dispatch_dependency_equipped_sca_tier(mini_repo, changed):
+    result = compute_tier_dispatch([changed], mini_repo)
+    assert result["sca"]["run"]
+    assert Path("packages/sca/tests/test_shape.py") in result["sca"]["files"]
+
+
+class TestEntryScriptDispatch:
+    def test_script_change_reaches_its_cli_tests_without_running_unrelated_tests(self, tmp_path):
+        tests = tmp_path / 'core/demo/tests'
+        tests.mkdir(parents=True)
+        (tests / 'test_cli.py').write_text('SCRIPT = ROOT / "libexec" / "raptor-demo"\n')
+        (tests / 'test_other.py').write_text('def test_other(): pass\n')
+        result = compute_tier_dispatch(['libexec/raptor-demo'], tmp_path)
+        assert result['python']['run']
+        assert result['python']['files'] == [Path('core/demo/tests/test_cli.py')]
+
+    def test_script_reference_in_source_reaches_importing_tests(self, tmp_path):
+        package = tmp_path / 'core/demo'
+        (package / 'tests').mkdir(parents=True)
+        (package / 'driver.py').write_text('SCRIPT = "bin/raptor-demo"\n')
+        (package / 'tests/test_driver.py').write_text('from core.demo import driver\n')
+        result = compute_tier_dispatch(['bin/raptor-demo'], tmp_path)
+        assert Path('core/demo/tests/test_driver.py') in result['python']['files']
+
+    def test_unknown_or_deleted_script_does_not_silently_skip_tests(self, tmp_path):
+        tests = tmp_path / 'core/demo/tests'
+        tests.mkdir(parents=True)
+        (tests / 'test_cli.py').write_text('def test_cli(): pass\n')
+        result = compute_tier_dispatch(['libexec/renamed-away'], tmp_path)
+        assert all(info['run'] for tier, info in result.items() if not tier.startswith('_'))
+
+
+def test_workflow_rebalance_preserves_selected_cases(tmp_path, monkeypatch):
+    """Execute the workflow's optional timing step: selected files stay exact."""
+    import textwrap
+
+    repo = Path(__file__).resolve().parents[2]
+    workflow = (repo / ".github/workflows/tests.yml").read_text()
+    block = workflow.split("      - id: balance\n", 1)[1].split("\n  deps:", 1)[0]
+    code = textwrap.dedent(block.split("<<'PYTHON'\n", 1)[1].split("          PYTHON", 1)[0])
+    durations = tmp_path / "durations.json"
+    durations.write_text(json.dumps({"a.py": 100, "b.py": 1, "c.py": 2}))
+    output = tmp_path / "outputs"
+    selected = tmp_path / "selected.json"
+    selected.write_text(json.dumps([
+        {"batch": 1, "files": "a.py b.py"}, {"batch": 2, "files": "c.py"},
+    ]))
+    monkeypatch.setenv("SELECTED_MATRIX_FILE", str(selected))
+    monkeypatch.setenv("RAPTOR_TEST_DURATIONS", str(durations))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    exec(compile(code, "workflow-balance", "exec"), {})
+    matrix = json.loads(output.read_text().split("=", 1)[1])
+    assert sorted(path for batch in matrix for path in batch["files"].split()) == [
+        "a.py", "b.py", "c.py",
+    ]
+
+
+class TestSharedFixtureInventory:
+
+    @pytest.mark.parametrize("shared_divisions", [False, True], ids=["tree", "divisions"])
+    @pytest.mark.parametrize("source,leaf", [
+        ("VALUE = {'row': call(Path(__file__).parent / 'fixtures' / 'nested')}\n", "nested"),
+        ("def factory(base=Path(__file__).parent / 'fixtures' / 'nested'):\n    return base\n", "nested"),
+        ("VALUE = [(Path(__file__).parent / 'fixtures' / 'nested') for borrowed in rows]\n", "nested"),
+        ("FIXTURE = Path(__file__).parent / 'fixtur\\x65s' / 'nested'\n", "nested"),
+        ("VALUE = call('fixtures', 123)\n", ""),
+    ], ids=["mapping-call", "function-default", "comprehension", "escaped-path", "leaf-fallback"])
+    def test_nested_path_syntax_and_fallback_keep_tree_read_only(
+        self, tmp_path, source, leaf, shared_divisions,
+    ):
+        from test_scope import _extract_fixture_dirs
+
+        test = tmp_path / "core/pkg/tests/test_shapes.py"
+        test.parent.mkdir(parents=True)
+        fixture = test.parent / "fixtures"
+        (fixture / "nested").mkdir(parents=True)
+        test.write_text(source)
+        tree = ast.parse(source)
+        before = ast.dump(tree, include_attributes=True)
+        divisions = [node for node in ast.walk(tree)
+                     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)]
+        kwargs = {"division_nodes": divisions} if shared_divisions else {"source_tree": tree}
+        result = _extract_fixture_dirs(test.relative_to(tmp_path), tmp_path,
+                                       source=source, **kwargs)
+        assert set(result) == {fixture / leaf}
+        assert ast.dump(tree, include_attributes=True) == before
+        assert test.read_text() == source
+
+    def test_all_consumers_and_nested_directories_are_retained(self, tmp_path):
+        from test_scope import build_data_file_map
+
+        tests = tmp_path / "core/pkg/tests"
+        fixtures = tests / "fixtures"
+        nested = fixtures / "nested"
+        nested.mkdir(parents=True)
+        (fixtures / "top.json").write_text("{}")
+        (nested / "child.json").write_text("{}")
+        (fixtures / "ignored.py").write_text("pass")
+        paths = []
+        for name, suffix in [("test_a", ""), ("test_b", ""),
+                             ("test_nested", ' / "nested"')]:
+            path = tests / f"{name}.py"
+            path.write_text('from pathlib import Path\n'
+                            'DATA = Path(__file__).parent / "fixtures"' + suffix)
+            paths.append(path.relative_to(tmp_path))
+        result = build_data_file_map(paths, tmp_path)
+        assert result == {
+            Path("core/pkg/tests/fixtures/top.json"): set(paths[:2]),
+            Path("core/pkg/tests/fixtures/nested/child.json"): set(paths),
+        }
+
+    def test_next_dispatch_sees_added_and_deleted_data(self, tmp_path):
+        from test_scope import build_data_file_map
+
+        tests = tmp_path / "core/pkg/tests"
+        fixtures = tests / "fixtures"
+        fixtures.mkdir(parents=True)
+        test = tests / "test_data.py"
+        test.write_text('from pathlib import Path\n'
+                        'DATA = Path(__file__).parent / "fixtures"')
+        relative_test = test.relative_to(tmp_path)
+        old = fixtures / "old.json"
+        old.write_text("{}")
+        assert build_data_file_map([relative_test], tmp_path) == {
+            old.relative_to(tmp_path): {relative_test},
+        }
+        old.unlink()
+        new = fixtures / "new.json"
+        new.write_text("{}")
+        assert build_data_file_map([relative_test], tmp_path) == {
+            new.relative_to(tmp_path): {relative_test},
+        }
+
+
+@pytest.mark.parametrize('changed,mode', [
+    ('conftest.py', 'full'),
+    ('pyproject.toml', 'full'),
+    ('core/pkga/removed.py', 'full'),
+    ('core/pkga/mod.py', 'scoped'),
+    ('.github/scripts/sca_test_matrix.py', 'scoped'),
+    (None, 'full'),
+], ids=['harness', 'dependencies', 'deleted-module', 'ordinary-edit', 'sca-planner', 'manual-full'])
+def test_cli_reports_actual_fallback_mode(mini_repo, tmp_path, monkeypatch, changed, mode):
+    import test_scope as dispatcher
+    changes = tmp_path / 'changed'
+    if changed is not None:
+        changes.write_text(changed + '\n')
+    output = tmp_path / 'outputs'
+    monkeypatch.setenv('GITHUB_OUTPUT', str(output))
+    matrix_file = tmp_path / 'matrix.json'
+    argv = ['test_scope', '--repo', str(mini_repo), '--python-matrix-out', str(matrix_file)]
+    if changed is not None:
+        argv.extend(['--changed-files', str(changes)])
+    monkeypatch.setattr(sys, 'argv', argv)
+    assert dispatcher.main() == 0
+    assert f'scope_mode={mode}\n' in output.read_text()
+    outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
+    assert json.loads(matrix_file.read_text()) == json.loads(outputs['python_matrix'])
+    assert outputs['python_matrix_file'] == str(matrix_file)
+
+
+def test_manifest_oracle_follows_runtime_key_inputs_and_ignores_bytecode(tmp_path):
+    workflow = tmp_path / 'cache.yml'
+    workflow.write_text("key: ${{ hashFiles('*.py', 'core/**/*.py') }}\n")
+    helper = tmp_path / 'key.py'
+    helper.write_text("VENV_INPUTS = ('pyproject.toml', 'uv.lock', 'uv.toml')\n")
+    assert _manifest_cache_key_gaps(tmp_path, cache_helper=helper) == ([], [], ['pyproject.toml', 'uv.lock', 'uv.toml'])
+    helper.write_text("VENV_INPUTS = ('pyproject.toml', 'uv.lock', 'requirements/base.txt')\n")
+    assert _manifest_cache_key_gaps(tmp_path, cache_helper=helper)[1] == ['requirements/base.txt']
+
+
+
+def test_optional_matrix_file_failure_preserves_dispatch_outputs(tmp_path, capsys):
+    import test_scope as dispatcher
+
+    files = [Path('core/tests/test_one.py')]
+    result = {'python': {'run': True, 'files': files, 'matrix': batch_matrix(files)}}
+    outputs = {'python_matrix_file': 'stale.json'}
+    dispatcher._emit_outputs(result, outputs.__setitem__,
+                             python_matrix_out=tmp_path / 'absent/matrix.json')
+    assert outputs['python'] == 'true'
+    assert outputs['python_matrix_file'] == ''
+    assert outputs['python_files'] == 'core/tests/test_one.py'
+    assert json.loads(outputs['python_matrix']) == result['python']['matrix']
+    assert '::warning::Cannot write optional Python matrix file:' in capsys.readouterr().out
+
+
+def test_large_matrix_rebalance_starts_without_large_environment_value(tmp_path):
+    import os
+    import subprocess
+    import textwrap
+
+    repo = Path(__file__).resolve().parents[2]
+    workflow = (repo / '.github/workflows/tests.yml').read_text()
+    block = workflow.split('      - id: balance\n', 1)[1].split('\n  deps:', 1)[0]
+    assert 'SELECTED_MATRIX:' not in block
+    assert 'continue-on-error: true' in block
+    assert 'python_matrix: ${{ steps.balance.outputs.python_matrix || steps.scope.outputs.python_matrix }}' in workflow
+    assert 'SELECTED_MATRIX_FILE: ${{ steps.scope.outputs.python_matrix_file }}' in block
+    assert "steps.scope.outputs.python_matrix_file != ''" in block
+    assert '--python-matrix-out "$RUNNER_TEMP/python-matrix.json"' in workflow
+    code = textwrap.dedent(block.split("<<'PYTHON'\n", 1)[1].split('          PYTHON', 1)[0])
+    files = [f'core/example/tests/test_case_{i:05d}.py' for i in range(5000)]
+    selected = tmp_path / 'selected.json'
+    selected.write_text(json.dumps([{'batch': 1, 'files': ' '.join(files)}]))
+    assert selected.stat().st_size > 131072
+    durations = tmp_path / 'durations.json'
+    durations.write_text(json.dumps({files[0]: 1.0}))
+    output = tmp_path / 'outputs'
+    env = dict(os.environ, SELECTED_MATRIX_FILE=str(selected),
+               RAPTOR_TEST_DURATIONS=str(durations), GITHUB_OUTPUT=str(output))
+    env.pop('SELECTED_MATRIX', None)
+    result = subprocess.run([sys.executable, '-c', code], cwd=repo, env=env,
+                            capture_output=True, text=True, timeout=30, check=True)
+    assert 'duration-aware LPT' in result.stdout
+    matrix = json.loads(output.read_text().split('=', 1)[1])
+    assert sorted(path for batch in matrix for path in batch['files'].split()) == files
+    assert all(batch['files'] for batch in matrix)
+
+
+def test_lane_closure_includes_literal_special_paths(tmp_path):
+    from core.testing.gitrepo import git_run, init_scratch_repo
+
+    repo = init_scratch_repo(tmp_path)
+    expected = {
+        f"unclaimed/tests/test_{name}.py"
+        for name in ("plain", "two words", "tab\tname", "line\nname",
+                     "naïve", 'quote"name', "back\\slash")
+    }
+    for rel in expected | {"core/module.py", "unclaimed/tests/data.json",
+                           "unclaimed/tests/fixtures/test_fixture.py"}:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    git_run(repo, "add", "--all")
+    assert set(TestPytestLaneClosure._tracked_test_files(repo)) == expected
+
+    class Probe(TestPytestLaneClosure):
+        __test__ = False
+
+        @staticmethod
+        def _tracked_test_files():
+            return TestPytestLaneClosure._tracked_test_files(repo)
+
+    with pytest.raises(AssertionError, match="claimed by NO pytest lane") as caught:
+        Probe().test_every_tracked_test_file_is_claimed_by_a_lane()
+    for rel in expected:
+        assert repr(rel) in str(caught.value)
+
+
+class TestOwnedResourceDispatchWork:
+    @pytest.mark.parametrize("changed,selected", [
+        (".github/tests/test_removed.py", True),
+        (".github/tests/test_surviving.py", True),
+        (".github/tests/fixtures/input.json", True),
+        (".github/tests/fixtures/test_example.py", True),
+        (".github/tests/conftest.py", True),
+        (".github/tests_neighbor/test_removed.py", False),
+        (".github/notes/input.json", False),
+    ], ids=["deleted", "existing", "fixture", "python-fixture", "conftest",
+            "sibling-prefix", "unowned-metadata"])
+    def test_outside_graph_directory_ownership_survives_deletions(
+        self, tmp_path, monkeypatch, changed, selected,
+    ):
+        survivor = Path(".github/tests/test_surviving.py")
+        target = tmp_path / survivor
+        target.parent.mkdir(parents=True)
+        target.write_text("def test_surviving(): pass\n")
+        if "/fixtures/" in changed:
+            fixture = tmp_path / changed
+            fixture.parent.mkdir()
+            fixture.write_text("{}\n" if fixture.suffix == ".json" else "VALUE = 1\n")
+
+        def unexpected_graph(*args, **kwargs):
+            pytest.fail("outside-graph test inputs must not parse runtime sources")
+
+        monkeypatch.setattr("test_scope.build_graph", unexpected_graph)
+        result = compute_tier_dispatch([changed], tmp_path)
+        assert result["ci_lint"]["run"] == selected
+        assert result["ci_lint"]["files"] == ([survivor] if selected else [])
+        assert not result["python"]["run"]
+
+    def test_ci_test_change_selects_owner_without_runtime_graph(self, tmp_path, monkeypatch, capsys):
+        changed = ".github/tests/test_dispatch.py"
+        target = tmp_path / changed
+        target.parent.mkdir(parents=True)
+        target.write_text("def test_dispatch(): pass\n")
+        runtime = tmp_path / "core/example.py"
+        runtime.parent.mkdir()
+        runtime.write_text("VALUE = 1\n")
+
+        def unexpected_graph(*args, **kwargs):
+            pytest.fail("outside-graph CI test must not parse the runtime graph")
+
+        monkeypatch.setattr("test_scope.build_graph", unexpected_graph)
+        result = compute_tier_dispatch([changed], tmp_path)
+        assert _active(result) == ["ci_lint"]
+        assert result["ci_lint"]["files"] == [Path(changed)]
+        assert result["_stats"]["changed"] == 1
+        assert "Building import graph" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("extra,calls,full", [
+        ("core/pkga/mod.py", 1, False),
+        ("entrymod.py", 1, False),
+        ("core/pkga/tests/fixtures/sample.json", 1, False),
+        ("core/orphan/blob.bin", 1, True),
+        ("libexec/unmapped-entry", 1, True),
+        ("packages/sca/data/popular/pypi.json", 0, False),
+        ("conftest.py", 0, True),
+        ("core/pkga/removed.py", 0, True),
+    ], ids=["runtime", "root-entry", "fixture", "unmapped-resource", "script",
+            "owned-data", "global-harness", "deleted-module"])
+    def test_outside_graph_input_keeps_mixed_work_and_fallbacks(
+        self, mini_repo, monkeypatch, extra, calls, full,
+    ):
+        import test_scope as scope
+
+        original = scope.build_graph
+        observed = []
+
+        def count_graph(*args, **kwargs):
+            observed.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(scope, "build_graph", count_graph)
+        result = compute_tier_dispatch([".github/scripts/pytest_workers.py", extra], mini_repo)
+        assert len(observed) == calls
+        assert _is_full_dispatch(result) == full
+        assert result["ci_lint"]["run"]
+        if not full and extra != "packages/sca/data/popular/pypi.json":
+            assert result["python"]["run"]
+        if extra == "packages/sca/data/popular/pypi.json":
+            assert Path("packages/sca/tests/test_shape.py") in result["sca"]["files"]
+
+    def test_script_and_resource_share_parsed_fixture_inventory(self, mini_repo, monkeypatch):
+        import test_scope as scoper
+
+        script = "libexec/fixture-reader"
+        entry = mini_repo / script
+        entry.parent.mkdir()
+        entry.write_text("#!/bin/sh\nexit 0\n")
+        test = mini_repo / "core/pkga/tests/test_mod.py"
+        test.write_text(test.read_text() + f"\nENTRY = {script!r}\n")
+        changed = [script, "core/pkga/tests/fixtures/sample.json"]
+        expected = compute_tier_dispatch(changed, mini_repo)
+        original = scoper._extract_fixture_dirs
+        parsed = []
+
+        def require_shared_tree(path, repo, *, source=None, division_nodes=None):
+            assert source is not None and division_nodes is not None, "fixture source walked after graph"
+            before = [ast.dump(node, include_attributes=True) for node in division_nodes]
+            result = original(path, repo, source=source, division_nodes=division_nodes)
+            assert [ast.dump(node, include_attributes=True) for node in division_nodes] == before
+            parsed.append(path)
+            return result
+
+        monkeypatch.setattr(scoper, "_extract_fixture_dirs", require_shared_tree)
+        actual = compute_tier_dispatch(changed, mini_repo)
+        assert actual == expected
+        assert not _is_full_dispatch(actual)
+        assert Path("core/pkga/tests/test_mod.py") in actual["python"]["files"]
+        assert len(parsed) == len(set(parsed))
+        assert set(parsed) == {path.relative_to(mini_repo) for path in mini_repo.rglob("*.py")
+                               if is_test_file(path.relative_to(mini_repo))}
+
+    @pytest.mark.parametrize("changed,expected", [
+        (["packages/sca/data/new.json"], ["sca"]),
+        (["engine/rules/deleted.cocci"], ["engine"]),
+        (["core/sandbox/tests/fixtures/input.bin"], ["sandbox"]),
+        (["packages/sca/data/new.json", "engine/rules/deleted.cocci",
+          "core/sandbox/tests/fixtures/input.bin", ".github/workflows/lint.yml"],
+         ["ci_lint", "engine", "sandbox", "sca"]),
+    ], ids=["sca-refresh", "deleted-engine-data", "sandbox-fixture", "mixed-tiers-metadata"])
+    def test_owned_data_needs_no_graph_or_fixture_census(
+        self, tmp_path, monkeypatch, changed, expected,
+    ):
+        tests = {
+            "sca": "packages/sca/tests/test_shape.py",
+            "engine": "engine/rules/tests/test_rule.py",
+            "sandbox": "core/sandbox/tests/test_contract.py",
+            "ci_lint": ".github/tests/test_workflow.py",
+        }
+        for name in tests.values():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("def test_contract(): pass\n")
+
+        def unexpected_work(*args, **kwargs):
+            pytest.fail("tier-owned data must not build a graph or fixture census")
+
+        monkeypatch.setattr("test_scope.build_graph", unexpected_work)
+        monkeypatch.setattr("test_scope.build_data_file_map", unexpected_work)
+        result = compute_tier_dispatch(changed, tmp_path)
+        assert _active(result) == sorted([*expected, "redos_census"])
+        for tier in expected:
+            assert result[tier]["files"] == [Path(tests[tier])]
+        assert result["python"]["files"] == []
+        assert result["_stats"]["closure"] == 0
+        assert not _is_full_dispatch(result)
+
+    @pytest.mark.parametrize("extra,full", [
+        ("core/pkga/mod.py", False),
+        ("core/pkga/data/rules.json", False),
+        ("core/pkga/tests/fixtures/sample.json", False),
+        ("core/orphan/blob.bin", True),
+        ("packages/sca_neighbor/data/input.json", True),
+        ("libexec/unmapped-entry", True),
+    ], ids=["code", "package-resource", "fixture", "unmapped-resource", "sibling-prefix", "script"])
+    def test_mixed_changes_keep_graph_and_conservative_fallback(
+        self, mini_repo, monkeypatch, extra, full,
+    ):
+        import test_scope as scoper
+
+        calls = []
+        original = scoper.build_graph
+
+        def record_graph(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(scoper, "build_graph", record_graph)
+        result = compute_tier_dispatch(
+            ["packages/sca/data/popular/pypi.json", extra], mini_repo,
+        )
+        assert len(calls) == 1
+        assert _is_full_dispatch(result) == full
+        assert result["sca"]["run"]
+        if not full:
+            assert _active(result) == ["python", "redos_census", "sca"]
+            assert Path("core/pkga/tests/test_mod.py") in result["python"]["files"]
+        if extra.startswith("libexec/"):
+            assert "literal_references" in calls[0]

@@ -5,30 +5,72 @@ the terminal banner. No logic, no checks, no side effects.
 """
 
 import random
+import re
+import textwrap
 from pathlib import Path
 
 _ASSETS = Path(__file__).resolve().parent / "assets"
 
+# The banner's version line carries a ``__VERSION__`` placeholder rather than a
+# hardcoded number, so the displayed version is always the live one injected
+# here — never a stale stamp. Matches the box layout the release uses.
+# The version token is one non-whitespace char then the box fill —
+# the naive ``\S+[^║]*`` overlapped two unbounded repeats on
+# non-whitespace chars (quadratic on a crafted logo line). The one
+# dropped corner is a version token itself containing the box glyph.
+_VERSION_LINE = re.compile(r"(║\s+Based on Claude Code - )\S[^║]*║")
 
-def read_logo() -> str:
-    """Read the ASCII logo from the raptor-offset file."""
+
+def read_logo(version: str = "") -> str:
+    """Read the ASCII logo, injecting ``version`` into the banner line.
+
+    ``version`` is the value to display (typically
+    ``RaptorConfig.effective_version()``); a leading ``v`` is added to match
+    the banner convention. The line is re-padded so the box border stays
+    aligned regardless of the version string's length. When ``version`` is
+    empty the asset is returned verbatim (placeholder left as-is)."""
     path = _ASSETS / "raptor-offset"
-    return path.read_text().rstrip() if path.exists() else ""
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8").rstrip()
+    if version:
+        label = "v" + version.lstrip("v")
+
+        def _stamp(m: "re.Match[str]") -> str:
+            content = m.group(1) + label
+            pad = max(1, 76 - len(content))
+            return content + " " * pad + "║"
+
+        text = _VERSION_LINE.sub(_stamp, text, count=1)
+    return text
 
 
 def read_random_quote() -> str:
     """Pick a random quote from the hackers-8ball file."""
     path = _ASSETS / "hackers-8ball"
     if path.exists():
-        lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         if lines:
-            return random.choice(lines)
+            # Decorative banner quote — non-cryptographic.
+            return random.choice(lines)  # nosemgrep: crypto.prng.random-module.python
     return '"Hack the planet!"'
 
 
-def format_banner(logo, quote, tool_results, tool_warnings, llm_lines,
-                  llm_warnings, env_parts, env_warnings, project_line=None,
-                  lang_line=None):
+def format_banner(
+    logo: str,
+    quote: str,
+    tool_results: list[tuple[str, bool]],
+    tool_warnings: list[str],
+    llm_lines: list[str],
+    llm_warnings: list[str],
+    env_parts: list[str],
+    env_warnings: list[str],
+    project_line: str | None = None,
+    lang_line: str | None = None,
+    tool_updates: set[str] | None = None,
+    *,
+    protection_notice: str | None = None,
+) -> str:
     """Format the startup banner from gathered data.
 
     Args:
@@ -42,18 +84,24 @@ def format_banner(logo, quote, tool_results, tool_warnings, llm_lines,
         env_warnings: List of warning strings from env checks.
         project_line: One-line project status, or None.
         lang_line: Pre-formatted language support line, or None.
+        tool_updates: Tool names that have a newer version on PyPI.
+        protection_notice: Verified installation status, or a verification warning.
 
     Returns:
         Formatted banner string.
     """
     lines = []
+    _updates = tool_updates or set()
 
     if logo:
         lines.append(logo)
         lines.append("")
 
-    # Tools
-    tool_parts = [f"{name} {'✓' if ok else '✗'}" for name, ok in tool_results]
+    # Tools — append * to version-gated tools with a newer release.
+    tool_parts = []
+    for name, ok in tool_results:
+        star = "*" if name.split()[0] in _updates else ""
+        tool_parts.append(f"{name}{star} {'✓' if ok else '✗'}")
     lines.append(f" tools: {'  '.join(tool_parts)}")
 
     # Env
@@ -77,13 +125,17 @@ def format_banner(logo, quote, tool_results, tool_warnings, llm_lines,
     )
     if ordered:
         lines.append(f"  warn: {ordered[0]}")
-        for w in ordered[1:]:
-            lines.append(f"        {w}")
+        lines.extend(f"        {w}" for w in ordered[1:])
         lines.append("")
 
     # Active project
     if project_line:
         lines.append(f"   {project_line}")
+        lines.append("")
+
+    if protection_notice:
+        lines.append(textwrap.fill(protection_notice, width=77,
+                                   initial_indent="  ", subsequent_indent="  "))
         lines.append("")
 
     lines.append("  For defensive security research, education, and authorized penetration testing.")

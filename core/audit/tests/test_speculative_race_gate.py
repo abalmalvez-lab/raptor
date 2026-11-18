@@ -1,0 +1,299 @@
+"""Tests for the speculative race demotion gate in core.audit.orchestrator."""
+
+from __future__ import annotations
+
+from core.audit.orchestrator import (
+    ReviewOutcome,
+    _apply_speculative_race_demotion,
+)
+
+
+def _outcome(status="finding", hypothesis="", body="", evidence_tool=""):
+    o = ReviewOutcome(
+        file="net/core/sock.c",
+        function="sock_copy",
+        status=status,
+        body=body,
+        hypothesis=hypothesis,
+    )
+    if evidence_tool:
+        o.evidence_tool = evidence_tool
+    return o
+
+
+class TestSpeculativeRaceDemotion:
+    """finding -> suspicious for evidence-free race hypotheses; a body
+    naming a protection mechanism never moves the verdict to clean
+    (the protection-phrase tests below pin suspicious, whatever the
+    phrase's polarity — a phrase match cannot tell an asserted
+    protection from an attributed or conceded one)."""
+
+    def test_non_race_hypothesis_unchanged(self):
+        o = _outcome(hypothesis="buffer overflow in memcpy")
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_race_finding_demoted_to_suspicious(self):
+        o = _outcome(
+            hypothesis="race condition between open and unlink",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_toctou_finding_demoted_to_suspicious(self):
+        o = _outcome(hypothesis="TOCTOU in file access path")
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_concurrent_finding_demoted(self):
+        o = _outcome(hypothesis="concurrent access to shared state")
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_race_with_tool_evidence_kept(self):
+        o = _outcome(
+            hypothesis="race condition in lock handling",
+            evidence_tool="semgrep:race-double-check",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_race_with_smt_evidence_kept(self):
+        o = _outcome(
+            hypothesis="data race on counter",
+            evidence_tool="smt:race-feasibility",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_race_with_joern_evidence_kept(self):
+        o = _outcome(
+            hypothesis="race condition in packet handler",
+            evidence_tool="joern:concurrent-access",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_suspicious_race_with_protection_stays_suspicious(self):
+        """A suspicious race whose body says the buffer is protected by a mutex
+        must stay suspicious. Protection prose is not a receipt, and turning it
+        into clean would hide real races on the model's word."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="race condition on shared buffer",
+            body="The buffer is protected by a mutex. The mutex_held "
+                 "ensures exclusive access during the copy operation.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_suspicious_race_with_rcu_lock_stays_suspicious(self):
+        """A body claiming traversal under rcu_read_lock must not move a
+        suspicious race to clean. The gate cannot verify the claim, so the
+        verdict has to stay open for review."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="data race on list traversal",
+            body="The list is traversed under rcu_read_lock protection.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_suspicious_race_with_spin_lock_stays_suspicious(self):
+        """A body claiming accesses are serialised by a spin lock must leave a
+        suspicious race suspicious. A phrase match cannot tell a true claim
+        from a mistaken or attributed one."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="concurrent modification",
+            body="All accesses to this field are serialised by spin_lock_bh.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_negated_protection_not_demoted(self):
+        """Protection prose of any polarity stays suspicious ('not protected
+        by' included; there is no negation window any more)."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="race condition on shared state",
+            body="The shared state is not protected by any lock. "
+                 "Concurrent access from multiple threads is possible.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_without_lock_not_demoted(self):
+        o = _outcome(
+            status="suspicious",
+            hypothesis="race condition in packet processing",
+            body="The counter is accessed without lock protection.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_missing_mutex_not_demoted(self):
+        o = _outcome(
+            status="suspicious",
+            hypothesis="toctou in file access",
+            body="The operation lacks mutex_held for the critical section.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_finding_race_no_protection_stays_suspicious(self):
+        """finding → suspicious (race), but no protection phrase → stays suspicious."""
+        o = _outcome(
+            hypothesis="race condition between threads",
+            body="Multiple threads access the same counter without synchronisation.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_clean_status_passes_through(self):
+        o = _outcome(
+            status="clean",
+            hypothesis="race condition",
+            body="protected by lock",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "clean"
+
+    def test_dormant_status_passes_through(self):
+        o = _outcome(
+            status="dormant",
+            hypothesis="race condition on dead path",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "dormant"
+
+    def test_init_only_protection_stays_suspicious(self):
+        """A body claiming the field is written only during init must not clear
+        a suspicious race. Init-only claims are unverified prose and once were
+        enough to mint a clean."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="data race on configuration",
+            body="This field is only written during init_only phase "
+                 "before any threads are spawned.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_single_threaded_protection_stays_suspicious(self):
+        """A body claiming single-threaded context must not clear a suspicious
+        race. Without this, a model assertion about threading would silently
+        drop a possible race from review."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="concurrent access to global",
+            body="The function runs in a single-threaded context during boot.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_prefilter_lock_evidence_kept(self):
+        o = _outcome(
+            hypothesis="race condition in locking",
+            evidence_tool="prefilter:lock-analysis",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_prefilter_race_evidence_kept(self):
+        o = _outcome(
+            hypothesis="data race on shared map",
+            evidence_tool="prefilter:race-detector",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_never_atomic_negation(self):
+        """Protection prose of any polarity stays suspicious (here a far
+        negation plus an asserted 'protected by')."""
+        o = _outcome(
+            status="suspicious",
+            hypothesis="race condition on counter",
+            body="The increment is not an atomic operation. "
+                 "However the field is protected by the socket lock.",
+        )
+        result = _apply_speculative_race_demotion(o)
+        # Prose naming a protection mechanism is not a receipt: the
+        # row stays suspicious whatever the phrase's polarity.
+        assert result.status == "suspicious"
+
+
+class TestRaceEvidenceAllowlist:
+    """Confirm-channel stamps and '+'-joined multi-stamps must count
+    as tool evidence; evidence-free race hypotheses still demote."""
+
+    def test_lock_region_confirmed_deadlock_survives(self):
+        o = _outcome(
+            hypothesis="deadlock when the callback re-enters ctx->lock",
+            evidence_tool="lock_region:callback_under_lock",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_non_concurrency_receipt_does_not_shield_race(self):
+        """A consistency receipt (return-check census) confirms a
+        non-concurrency property — it must not rescue a race
+        hypothesis it says nothing about. Same for fail_open."""
+        o = _outcome(
+            hypothesis="data race on shared refcount",
+            evidence_tool="consistency:return_check",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_fail_open_receipt_does_not_shield_race(self):
+        o = _outcome(
+            hypothesis="toctou window while the handler fails open",
+            evidence_tool="fail_open:handler_outcome",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_llm_claimed_never_rescues(self):
+        """LLM-provided evidence values are namespaced llm-claimed:*
+        before they reach evidence_tool; a claimed lock_region stamp
+        must not match the mechanical-channel allowlist."""
+        o = _outcome(
+            hypothesis="deadlock when the callback re-enters ctx->lock",
+            evidence_tool="llm-claimed:lock_region:callback_under_lock",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_multi_stamp_second_component_counts(self):
+        """'+'-joined stamps: a confirming component anywhere in the
+        join must keep the finding (startswith on the whole string
+        only saw the first component)."""
+        o = _outcome(
+            hypothesis="race condition in lock handling",
+            evidence_tool="precondition:x+smt:race-feasibility",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_critique_stamp_counts(self):
+        o = _outcome(
+            hypothesis="concurrent access to shared map",
+            evidence_tool="critique:prefilter:toctou-filesystem",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "finding"
+
+    def test_evidence_free_race_still_demotes(self):
+        o = _outcome(hypothesis="race condition between open and unlink")
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"
+
+    def test_unlisted_evidence_still_demotes(self):
+        """A stamp outside every confirm channel is not race evidence."""
+        o = _outcome(
+            hypothesis="race condition on the flag",
+            evidence_tool="mechanical:guard_sufficiency",
+        )
+        result = _apply_speculative_race_demotion(o)
+        assert result.status == "suspicious"

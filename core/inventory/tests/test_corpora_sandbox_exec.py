@@ -1,0 +1,287 @@
+"""Corpus drivers must execute fetched build systems inside the sandbox.
+
+The drivers clone pinned upstream refs and run the FETCHED build
+machinery (autogen/configure/make/cmake/ctest/cargo) plus the binaries
+it produces. Pre-fix they did so via bare ``subprocess.run`` with
+``env={**os.environ, ...}`` — attacker build scripts (supply-chain
+compromise of a pinned tag) would run with the operator's full
+environment, network, and filesystem. These tests pin the helper's
+sandbox policy and the drivers' adoption of it.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import core.sandbox as sandbox_mod
+from core.inventory.binary_oracle_corpora import _sandbox_exec
+from core.testing.module_views import scoped_function_imports
+
+REPO = Path(__file__).resolve().parents[3]
+CORPORA = REPO / "core" / "inventory" / "binary_oracle_corpora"
+
+_DRIVERS = (
+    "zlib.py", "libsodium.py", "snappy.py", "leveldb.py",
+    "regex_rust.py", "zstd_holdout.py", "synthetic.py",
+)
+
+
+class _Recorder:
+    def __init__(self, returncode=0):
+        self.calls = []
+        self.returncode = returncode
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append((list(cmd), kwargs))
+        return SimpleNamespace(returncode=self.returncode,
+                               stdout="out", stderr="err")
+
+
+class TestRunBuildStep:
+    def test_sandboxed_network_blocked_env_sanitised(
+            self, tmp_path, monkeypatch):
+        rec = _Recorder()
+        monkeypatch.setattr(sandbox_mod, "run", rec)
+        monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+        monkeypatch.setenv("PYTHONSTARTUP", "/tmp/evil.py")
+
+        _sandbox_exec.run_build_step(
+            ["./configure", "--static"], cwd=tmp_path, timeout=10,
+            extra_env={"CFLAGS": "-O0"},
+        )
+
+        cmd, kwargs = rec.calls[0]
+        assert cmd == ["./configure", "--static"]
+        assert kwargs["block_network"] is True
+        assert kwargs["target"] == str(tmp_path)
+        assert kwargs["output"] == str(tmp_path)
+        assert kwargs["env_caller_filtered"] is True
+        env = kwargs["env"]
+        assert "LD_PRELOAD" not in env
+        assert "PYTHONSTARTUP" not in env
+        assert env["CFLAGS"] == "-O0"
+
+    def test_network_optin_only_for_declared_fetch_steps(
+            self, tmp_path, monkeypatch):
+        rec = _Recorder()
+        monkeypatch.setattr(sandbox_mod, "run", rec)
+        _sandbox_exec.run_build_step(
+            ["cargo", "build"], cwd=tmp_path, timeout=10, network=True,
+        )
+        assert rec.calls[0][1]["block_network"] is False
+
+    @pytest.mark.parametrize("network", [False, True])
+    @pytest.mark.parametrize("kind", ["regular", "symlink", "missing"])
+    def test_resolver_overlay_is_file_scoped_and_fetch_only(
+            self, tmp_path, monkeypatch, network, kind):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        source = runtime / "resolver.conf"
+        resolver = tmp_path / "resolv.conf"
+        if kind != "missing":
+            source.write_text("nameserver 192.0.2.53\n", encoding="utf-8")
+            if kind == "symlink":
+                resolver.symlink_to(source)
+            else:
+                resolver.write_text(source.read_text(), encoding="utf-8")
+        monkeypatch.setattr(_sandbox_exec, "_RESOLVER_CONFIG", resolver)
+        rec = _Recorder()
+        with scoped_function_imports(
+            _sandbox_exec, ("run_build_step",), {"core.sandbox": sandbox_mod},
+        ) as imports:
+            getattr(imports, "core.sandbox").run = rec
+            _sandbox_exec.run_build_step(
+                ["cargo", "build"], cwd=tmp_path, timeout=10, network=network,
+            )
+        assert len(rec.calls) == 1
+        cmd, kwargs = rec.calls[0]
+        assert cmd == ["cargo", "build"]
+        assert kwargs["block_network"] is (not network)
+        assert kwargs["target"] == str(tmp_path)
+        assert kwargs["output"] == str(tmp_path)
+        if network and kind != "missing":
+            assert kwargs["etc_overlay"] == {str(resolver.resolve()): str(resolver.resolve())}
+        else:
+            assert "etc_overlay" not in kwargs
+
+    @pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+    def test_resolver_resolution_error_never_dispatches(self, tmp_path, monkeypatch, error_type):
+        resolver = tmp_path / "resolv.conf"
+        resolver.write_text("nameserver 192.0.2.53\n", encoding="utf-8")
+        resolved = []
+
+        class Unresolvable(type(tmp_path)):
+            def resolve(self, strict=False):
+                resolved.append(self)
+                raise error_type("owned resolver resolution failure")
+
+        monkeypatch.setattr(_sandbox_exec, "_RESOLVER_CONFIG", Unresolvable(resolver))
+        rec = _Recorder()
+        with scoped_function_imports(
+            _sandbox_exec, ("run_build_step",), {"core.sandbox": sandbox_mod},
+        ) as imports:
+            getattr(imports, "core.sandbox").run = rec
+            with pytest.raises(error_type, match="owned resolver resolution failure"):
+                _sandbox_exec.run_build_step(
+                    ["cargo", "build"], cwd=tmp_path, timeout=10, network=True,
+                )
+        assert resolved == [resolver]
+        assert rec.calls == []
+
+    def test_offline_build_never_probes_resolver(self, tmp_path, monkeypatch):
+        class Unprobed(type(tmp_path)):
+            def is_file(self):
+                pytest.fail("offline build probed resolver")
+
+            def resolve(self, strict=False):
+                pytest.fail("offline build resolved resolver")
+
+        monkeypatch.setattr(_sandbox_exec, "_RESOLVER_CONFIG", Unprobed(tmp_path / "resolv.conf"))
+        rec = _Recorder()
+        with scoped_function_imports(
+            _sandbox_exec, ("run_build_step",), {"core.sandbox": sandbox_mod},
+        ) as imports:
+            getattr(imports, "core.sandbox").run = rec
+            _sandbox_exec.run_build_step(["make"], cwd=tmp_path, timeout=10)
+        assert len(rec.calls) == 1
+        assert rec.calls[0][1]["block_network"] is True
+        assert "etc_overlay" not in rec.calls[0][1]
+
+    @pytest.mark.parametrize("kind", ["broken", "loop", "directory"])
+    @pytest.mark.parametrize("check", [False, True])
+    def test_unusable_resolver_preserves_build_failure(self, tmp_path, monkeypatch, kind, check):
+        resolver = tmp_path / "resolv.conf"
+        if kind == "broken":
+            resolver.symlink_to(tmp_path / "missing")
+        elif kind == "loop":
+            resolver.symlink_to(resolver)
+        else:
+            resolver.mkdir()
+        monkeypatch.setattr(_sandbox_exec, "_RESOLVER_CONFIG", resolver)
+        rec = _Recorder(returncode=7)
+        with scoped_function_imports(
+            _sandbox_exec, ("run_build_step",), {"core.sandbox": sandbox_mod},
+        ) as imports:
+            getattr(imports, "core.sandbox").run = rec
+            if check:
+                with pytest.raises(subprocess.CalledProcessError) as raised:
+                    _sandbox_exec.run_build_step(
+                        ["cargo", "fetch"], cwd=tmp_path, timeout=10, network=True,
+                    )
+                assert raised.value.returncode == 7
+                assert raised.value.output == "out"
+                assert raised.value.stderr == "err"
+            else:
+                result = _sandbox_exec.run_build_step(
+                    ["cargo", "fetch"], cwd=tmp_path, timeout=10, network=True, check=False,
+                )
+                assert result.returncode == 7
+        assert len(rec.calls) == 1
+        assert rec.calls[0][1]["block_network"] is False
+        assert "etc_overlay" not in rec.calls[0][1]
+        assert "restrict_reads" not in rec.calls[0][1]
+
+    def test_nonzero_exit_raises_calledprocesserror(
+            self, tmp_path, monkeypatch):
+        rec = _Recorder(returncode=2)
+        monkeypatch.setattr(sandbox_mod, "run", rec)
+        with pytest.raises(subprocess.CalledProcessError):
+            _sandbox_exec.run_build_step(
+                ["make"], cwd=tmp_path, timeout=10)
+
+    def test_writable_paths_forwarded(self, tmp_path, monkeypatch):
+        rec = _Recorder()
+        monkeypatch.setattr(sandbox_mod, "run", rec)
+        extra = tmp_path / "profraw"
+        _sandbox_exec.run_build_step(
+            ["ctest"], cwd=tmp_path, timeout=10, writable_paths=[extra],
+        )
+        assert rec.calls[0][1]["writable_paths"] == [str(extra)]
+
+    def test_scope_widens_sandbox_root_but_not_cwd(
+            self, tmp_path, monkeypatch):
+        """Out-of-tree builds pass the scratch parent as ``scope`` so
+        the sibling src/ tree is visible under mount-ns isolation; the
+        step still executes in its build dir."""
+        rec = _Recorder()
+        monkeypatch.setattr(sandbox_mod, "run", rec)
+        build = tmp_path / "build"
+        build.mkdir()
+        _sandbox_exec.run_build_step(
+            ["cmake", "../src"], cwd=build, scope=tmp_path, timeout=10,
+        )
+        kwargs = rec.calls[0][1]
+        assert kwargs["cwd"] == str(build)
+        assert kwargs["target"] == str(tmp_path)
+        assert kwargs["output"] == str(tmp_path)
+
+
+class TestRunTool:
+    def test_routes_through_run_trusted(self, tmp_path, monkeypatch):
+        rec = _Recorder()
+        monkeypatch.setattr(sandbox_mod, "run_trusted", rec)
+        out = _sandbox_exec.run_tool(
+            ["nm", "lib.a"], cwd=tmp_path, timeout=5, check=False)
+        cmd, kwargs = rec.calls[0]
+        assert cmd == ["nm", "lib.a"]
+        assert kwargs["cwd"] == str(tmp_path)
+        assert out.stdout == "out"
+
+    def test_input_text_forwarded(self, monkeypatch):
+        rec = _Recorder()
+        monkeypatch.setattr(sandbox_mod, "run_trusted", rec)
+        _sandbox_exec.run_tool(
+            ["c++filt"], timeout=5, check=False, input_text="_ZN3foo")
+        assert rec.calls[0][1]["input"] == "_ZN3foo"
+
+    def test_nonzero_exit_raises_when_checked(self, monkeypatch):
+        rec = _Recorder(returncode=1)
+        monkeypatch.setattr(sandbox_mod, "run_trusted", rec)
+        with pytest.raises(subprocess.CalledProcessError):
+            _sandbox_exec.run_tool(["gcov"], timeout=5)
+
+
+class TestDriverAdoption:
+    """Drift-guard: no driver may run a fetched build system or an
+    os.environ-inheriting subprocess outside the helper."""
+
+    def test_no_inherited_environ_in_subprocess_env(self):
+        for name in _DRIVERS:
+            text = (CORPORA / name).read_text(encoding="utf-8")
+            assert "{**os.environ" not in text, (
+                f"{name}: builds must use run_build_step's sanitised "
+                f"env, not the operator's os.environ")
+
+    def test_build_systems_not_invoked_via_bare_subprocess(self):
+        build_cmds = ('"make"', '"cmake"', '"ctest"', '"cargo"',
+                      '"./configure"', '"./autogen.sh"')
+        for name in _DRIVERS:
+            text = (CORPORA / name).read_text(encoding="utf-8")
+            for chunk in text.split("subprocess.run(")[1:]:
+                head = chunk[:200]
+                for cmd in build_cmds:
+                    assert cmd not in head, (
+                        f"{name}: {cmd} runs via bare subprocess.run — "
+                        f"route it through run_build_step")
+
+    def test_drivers_import_the_helper(self):
+        for name in _DRIVERS:
+            text = (CORPORA / name).read_text(encoding="utf-8")
+            assert "run_build_step" in text, (
+                f"{name}: no run_build_step usage found")
+
+
+def test_helper_env_base_is_get_safe_env(monkeypatch, tmp_path):
+    """The helper's base env must come from get_safe_env, not a copy of
+    the process env — belt-and-braces on top of the driver lint."""
+    rec = _Recorder()
+    monkeypatch.setattr(sandbox_mod, "run", rec)
+    monkeypatch.setenv("SOME_RANDOM_OPERATOR_VAR", "x")
+    _sandbox_exec.run_build_step(["make"], cwd=tmp_path, timeout=5)
+    env = rec.calls[0][1]["env"]
+    assert "SOME_RANDOM_OPERATOR_VAR" not in env
+    assert "PATH" in env  # compilers must still resolve

@@ -7,24 +7,27 @@ written in Semgrep YAML.
 """
 
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Dict, Optional
+from core.run.scratch import temporary_text
 
 from packages import semgrep as semgrep_pkg
 
 from .base import ToolAdapter, ToolCapability, ToolEvidence, make_sandbox_runner
 
-
+# The one worked example the LLM mirrors — it must be schema-valid
+# Semgrep YAML. Metavariable constraints go inside a `patterns:` block
+# as a `metavariable-regex` sibling of the match clause; there is no
+# `pattern-where` key in the rule schema (semgrep silently ignores
+# unknown keys, which would drop the constraint and over-match).
 _SYNTAX_EXAMPLE = """\
 rules:
   - id: hardcoded-secret
     message: Hardcoded credential assigned to $VAR
     severity: WARNING
     languages: [python, javascript]
-    pattern-either:
-      - pattern: $VAR = "..."
-      - pattern: $VAR = '...'
-    pattern-where:
+    patterns:
+      - pattern-either:
+          - pattern: $VAR = "..."
+          - pattern: $VAR = '...'
       - metavariable-regex:
           metavariable: $VAR
           regex: (?i)(password|secret|token|api[_-]?key)
@@ -41,7 +44,7 @@ class SemgrepAdapter(ToolAdapter):
             Set False for tests or trusted environments.
     """
 
-    def __init__(self, *, sandbox: bool = True):
+    def __init__(self, *, sandbox: bool = True) -> None:
         self._sandbox = sandbox
 
     @property
@@ -77,7 +80,7 @@ class SemgrepAdapter(ToolAdapter):
         target: Path,
         *,
         timeout: int = 300,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
     ) -> ToolEvidence:
         if not self.is_available():
             return ToolEvidence(
@@ -95,37 +98,28 @@ class SemgrepAdapter(ToolAdapter):
             from core.config import RaptorConfig
             env = RaptorConfig.get_safe_env()
 
-        rule_file: Optional[Path] = None
         try:
-            tmp = NamedTemporaryFile(
-                prefix="semgrep_hv_", suffix=".yaml",
-                mode="w", delete=False,
-            )
-            tmp.write(rule)
-            tmp.close()
-            rule_file = Path(tmp.name)
-
-            subprocess_runner = (
-                make_sandbox_runner(target=target) if self._sandbox else None
-            )
-            result = semgrep_pkg.run_rule(
-                target=target,
-                config=str(rule_file),
-                timeout=timeout,
-                env=env,
-                subprocess_runner=subprocess_runner,
-            )
+            with temporary_text(rule, prefix="semgrep_hv_", suffix=".yaml",
+                                strict_cleanup=False) as rule_file:
+                subprocess_runner = (
+                    make_sandbox_runner(target=target) if self._sandbox else None
+                )
+                result = semgrep_pkg.run_rule(
+                    target=target,
+                    config=str(rule_file),
+                    timeout=timeout,
+                    env=env,
+                    subprocess_runner=subprocess_runner,
+                    # sandbox=False on this adapter is the documented
+                    # trusted-input escape hatch; without this flag the
+                    # runner's own default sandbox would re-engage.
+                    unsandboxed=not self._sandbox,
+                )
         except OSError as e:
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False,
                 error=f"failed to invoke semgrep: {e}",
             )
-        finally:
-            if rule_file is not None:
-                try:
-                    rule_file.unlink()
-                except OSError:
-                    pass
 
         if not result.ok:
             return ToolEvidence(
@@ -141,10 +135,19 @@ class SemgrepAdapter(ToolAdapter):
         else:
             summary = "no findings"
 
+        coverage_error = ""
+        if result.files_failed or result.skipped_rules:
+            coverage_error = (
+                "incomplete Semgrep analysis: "
+                f"{len(result.files_failed)} file failure(s), "
+                f"{len(result.skipped_rules)} skipped rule(s)"
+            )
+
         return ToolEvidence(
             tool=self.name,
             rule=rule,
-            success=True,
+            success=not coverage_error,
             matches=matches,
             summary=summary,
+            error=coverage_error,
         )

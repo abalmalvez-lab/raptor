@@ -5,8 +5,7 @@ the existing dataflow validator's LLM prompts — *not* a verdict.
 The earlier draft of this design tried a ``verdict`` field with
 short-circuit behaviour; it was rejected because collapsing the
 suppression decision to a single LLM call is the worst class of
-failure for security tooling. See ``~/design/dataflow-sanitizer-bypass.md``
-for the rationale.
+failure for security tooling.
 
 Three records:
 
@@ -36,12 +35,25 @@ required strings, ``confidence`` in ``[0, 1]``, ``source_line >= 1``,
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Mapping, Tuple
+from typing import Any
+
+from core.json import dumps_artifact, loads
+
+from core.dataflow._schema_checks import check_extra_fields, require_nonempty, unique_object_fields
 
 
 SCHEMA_VERSION = 1
+
+
+def _coerce_float(v: Any) -> float:
+    if isinstance(v, bool):
+        raise ValueError("confidence must be numeric, not boolean")
+    try:
+        return float(v)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("confidence must be a number in [0, 1]") from exc
 
 
 SEMANTICS_SQL_ESCAPE = "sql_escape"
@@ -52,7 +64,7 @@ SEMANTICS_AUTH_CHECK = "auth_check"
 SEMANTICS_TYPE_COERCE = "type_coerce"
 SEMANTICS_RATE_LIMIT = "rate_limit"
 SEMANTICS_OTHER = "other"
-VALID_SEMANTICS_TAGS: FrozenSet[str] = frozenset(
+VALID_SEMANTICS_TAGS: frozenset[str] = frozenset(
     {
         SEMANTICS_SQL_ESCAPE,
         SEMANTICS_HTML_ESCAPE,
@@ -69,12 +81,12 @@ VALID_SEMANTICS_TAGS: FrozenSet[str] = frozenset(
 PROVENANCE_LLM = "llm"
 PROVENANCE_ANNOTATION = "annotation"
 PROVENANCE_FRAMEWORK_CATALOG = "framework_catalog"
-VALID_EXTRACTION_PROVENANCE: FrozenSet[str] = frozenset(
+VALID_EXTRACTION_PROVENANCE: frozenset[str] = frozenset(
     {PROVENANCE_LLM, PROVENANCE_ANNOTATION, PROVENANCE_FRAMEWORK_CATALOG}
 )
 
 
-_CANDIDATE_KEYS: FrozenSet[str] = frozenset(
+_CANDIDATE_KEYS: frozenset[str] = frozenset(
     {
         "name",
         "qualified_name",
@@ -86,7 +98,7 @@ _CANDIDATE_KEYS: FrozenSet[str] = frozenset(
         "extraction_provenance",
     }
 )
-_STEP_ANNOTATION_KEYS: FrozenSet[str] = frozenset(
+_STEP_ANNOTATION_KEYS: frozenset[str] = frozenset(
     {
         "step_index",
         "on_path_validators",
@@ -94,7 +106,7 @@ _STEP_ANNOTATION_KEYS: FrozenSet[str] = frozenset(
         "inlined_helpers",
     }
 )
-_EVIDENCE_KEYS: FrozenSet[str] = frozenset(
+_EVIDENCE_KEYS: frozenset[str] = frozenset(
     {
         "schema_version",
         "candidate_pool",
@@ -105,15 +117,11 @@ _EVIDENCE_KEYS: FrozenSet[str] = frozenset(
 )
 
 
-def _check_extra_fields(name: str, data: Mapping[str, Any], allowed: FrozenSet[str]) -> None:
-    extras = set(data.keys()) - allowed
-    if extras:
-        raise ValueError(f"unknown fields in {name} JSON: {sorted(extras)}")
-
-
-def _require_nonempty(label: str, value: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty string")
+# Strict from_dict checks — shared with the sibling value modules via
+# core.dataflow._schema_checks (local underscore names kept: they are
+# these modules' call-site and patch seams).
+_check_extra_fields = check_extra_fields
+_require_nonempty = require_nonempty
 
 
 @dataclass(frozen=True)
@@ -143,25 +151,25 @@ class CandidateValidator:
         _require_nonempty("CandidateValidator.semantics_text", self.semantics_text)
         _require_nonempty("CandidateValidator.source_file", self.source_file)
         if self.semantics_tag not in VALID_SEMANTICS_TAGS:
-            raise ValueError(
+            msg = (
                 f"semantics_tag {self.semantics_tag!r} not in "
                 f"{sorted(VALID_SEMANTICS_TAGS)!r}"
             )
+            raise ValueError(msg)
         if self.extraction_provenance not in VALID_EXTRACTION_PROVENANCE:
-            raise ValueError(
+            msg = (
                 f"extraction_provenance {self.extraction_provenance!r} not in "
                 f"{sorted(VALID_EXTRACTION_PROVENANCE)!r}"
             )
-        if not (0.0 <= self.confidence <= 1.0):
-            raise ValueError(
-                f"confidence must be in [0, 1], got {self.confidence!r}"
-            )
-        if self.source_line < 1:
-            raise ValueError(
-                f"source_line must be >= 1, got {self.source_line!r}"
-            )
+            raise ValueError(msg)
+        if isinstance(self.confidence, bool) or not (0.0 <= self.confidence <= 1.0):
+            msg = f"confidence must be in [0, 1], got {self.confidence!r}"
+            raise ValueError(msg)
+        if isinstance(self.source_line, bool) or not isinstance(self.source_line, int) or self.source_line < 1:
+            msg = f"source_line must be an integer >= 1, got {self.source_line!r}"
+            raise ValueError(msg)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "qualified_name": self.qualified_name,
@@ -174,16 +182,16 @@ class CandidateValidator:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "CandidateValidator":
+    def from_dict(cls, data: Mapping[str, Any]) -> CandidateValidator:
         _check_extra_fields("CandidateValidator", data, _CANDIDATE_KEYS)
         return cls(
             name=data["name"],
             qualified_name=data["qualified_name"],
             semantics_tag=data["semantics_tag"],
             semantics_text=data["semantics_text"],
-            confidence=float(data["confidence"]),
+            confidence=_coerce_float(data.get("confidence", 0)),
             source_file=data["source_file"],
-            source_line=int(data["source_line"]),
+            source_line=data.get("source_line", 0),
             extraction_provenance=data["extraction_provenance"],
         )
 
@@ -202,29 +210,29 @@ class StepAnnotation:
     """
 
     step_index: int
-    on_path_validators: Tuple[str, ...] = ()
-    variables_referenced: Tuple[str, ...] = ()
-    inlined_helpers: Tuple[str, ...] = ()
+    on_path_validators: tuple[str, ...] = ()
+    variables_referenced: tuple[str, ...] = ()
+    inlined_helpers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.step_index < 0:
-            raise ValueError(
-                f"step_index must be >= 0, got {self.step_index!r}"
-            )
+        if isinstance(self.step_index, bool) or not isinstance(self.step_index, int) or self.step_index < 0:
+            msg = f"step_index must be an integer >= 0, got {self.step_index!r}"
+            raise ValueError(msg)
         for label, value in (
             ("on_path_validators", self.on_path_validators),
             ("variables_referenced", self.variables_referenced),
             ("inlined_helpers", self.inlined_helpers),
         ):
+            if isinstance(value, (str, bytes, Mapping)):
+                raise ValueError(f"{type(self).__name__}.{label} must be an iterable of entries")
             if not isinstance(value, tuple):
                 object.__setattr__(self, label, tuple(value))
             for item in getattr(self, label):
                 if not isinstance(item, str) or not item.strip():
-                    raise ValueError(
-                        f"StepAnnotation.{label} entries must be non-empty strings"
-                    )
+                    msg = f"StepAnnotation.{label} entries must be non-empty strings"
+                    raise ValueError(msg)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "step_index": self.step_index,
             "on_path_validators": list(self.on_path_validators),
@@ -233,10 +241,13 @@ class StepAnnotation:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "StepAnnotation":
+    def from_dict(cls, data: Mapping[str, Any]) -> StepAnnotation:
         _check_extra_fields("StepAnnotation", data, _STEP_ANNOTATION_KEYS)
+        for field in ("on_path_validators", "variables_referenced", "inlined_helpers"):
+            if isinstance(data.get(field), (str, bytes, Mapping)):
+                raise ValueError(f"StepAnnotation.{field} must be an iterable of entries")
         return cls(
-            step_index=int(data["step_index"]),
+            step_index=data.get("step_index", 0),
             on_path_validators=tuple(data.get("on_path_validators", [])),
             variables_referenced=tuple(data.get("variables_referenced", [])),
             inlined_helpers=tuple(data.get("inlined_helpers", [])),
@@ -259,10 +270,10 @@ class SanitizerEvidence:
     couldn't parse or where the LLM call errored.
     """
 
-    candidate_pool: Tuple[CandidateValidator, ...] = ()
-    step_annotations: Tuple[StepAnnotation, ...] = ()
+    candidate_pool: tuple[CandidateValidator, ...] = ()
+    step_annotations: tuple[StepAnnotation, ...] = ()
     pool_completeness: str = "unknown"
-    extraction_failures: Tuple[str, ...] = ()
+    extraction_failures: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_nonempty("SanitizerEvidence.pool_completeness", self.pool_completeness)
@@ -270,22 +281,24 @@ class SanitizerEvidence:
             ("candidate_pool", self.candidate_pool, CandidateValidator),
             ("step_annotations", self.step_annotations, StepAnnotation),
         ):
+            if isinstance(value, (str, bytes, Mapping)):
+                raise ValueError(f"{type(self).__name__}.{label} must be an iterable of entries")
             if not isinstance(value, tuple):
                 object.__setattr__(self, label, tuple(value))
             for item in getattr(self, label):
                 if not isinstance(item, ty):
-                    raise TypeError(
-                        f"SanitizerEvidence.{label} must contain {ty.__name__} instances"
-                    )
+                    msg = f"SanitizerEvidence.{label} must contain {ty.__name__} instances"
+                    raise TypeError(msg)
+        if isinstance(self.extraction_failures, (str, bytes, Mapping)):
+            raise ValueError("SanitizerEvidence.extraction_failures must be an iterable of entries")
         if not isinstance(self.extraction_failures, tuple):
             object.__setattr__(self, "extraction_failures", tuple(self.extraction_failures))
         for f in self.extraction_failures:
             if not isinstance(f, str) or not f.strip():
-                raise ValueError(
-                    "SanitizerEvidence.extraction_failures entries must be non-empty strings"
-                )
+                msg = "SanitizerEvidence.extraction_failures entries must be non-empty strings"
+                raise ValueError(msg)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
             "candidate_pool": [c.to_dict() for c in self.candidate_pool],
@@ -295,14 +308,18 @@ class SanitizerEvidence:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "SanitizerEvidence":
+    def from_dict(cls, data: Mapping[str, Any]) -> SanitizerEvidence:
         _check_extra_fields("SanitizerEvidence", data, _EVIDENCE_KEYS)
         version = data["schema_version"]
-        if version != SCHEMA_VERSION:
-            raise ValueError(
+        if isinstance(version, bool) or not isinstance(version, int) or version != SCHEMA_VERSION:
+            msg = (
                 f"SanitizerEvidence schema_version {version!r} != expected "
                 f"{SCHEMA_VERSION!r}; consumer upgrade required"
             )
+            raise ValueError(msg)
+        for field in ("candidate_pool", "step_annotations", "extraction_failures"):
+            if isinstance(data.get(field), (str, bytes, Mapping)):
+                raise ValueError(f"SanitizerEvidence.{field} must be an iterable of entries")
         return cls(
             candidate_pool=tuple(
                 CandidateValidator.from_dict(c)
@@ -316,9 +333,12 @@ class SanitizerEvidence:
             extraction_failures=tuple(data.get("extraction_failures", [])),
         )
 
-    def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), **kwargs)
+    def to_json(self, *, indent: int | None = None) -> str:
+        """Render as JSON. Explicit ``indent`` signature — see
+        ``core.dataflow.label.GroundTruth.to_json`` for the
+        rationale."""
+        return dumps_artifact(self.to_dict(), indent=indent)
 
     @classmethod
-    def from_json(cls, text: str) -> "SanitizerEvidence":
-        return cls.from_dict(json.loads(text))
+    def from_json(cls, text: str) -> SanitizerEvidence:
+        return cls.from_dict(loads(text, object_pairs_hook=unique_object_fields))

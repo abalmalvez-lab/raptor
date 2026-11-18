@@ -22,12 +22,22 @@ checker is meaningfully independent.
 
 from __future__ import annotations
 
-from typing import Iterable, Literal, Optional
+from typing import Literal, TYPE_CHECKING
+
+from core.llm.model_brokers import MODEL_BROKERS
 
 
 Family = Literal[
     "anthropic", "openai", "google", "meta", "mistral",
-    "ollama", "cohere", "unknown",
+    "ollama", "cohere",
+    # Open-weight lineages. Distinct families so the cross-family
+    # independence guarantee (a checker from a different training
+    # lineage) actually holds on an all-open-weight roster — before
+    # these were added every such model resolved to "unknown" (bare
+    # name) or collapsed to "ollama" (provider-prefixed), silently
+    # defeating the control.
+    "qwen", "deepseek", "yi", "phi",
+    "unknown",
 ]
 
 
@@ -41,10 +51,10 @@ _PROVIDER_STEMS: tuple[tuple[str, Family], ...] = (
     ("mistralai", "mistral"),
     ("ollama", "ollama"),
     ("cohere", "cohere"),
-    # Aggregator hosts (Together, Groq, OpenRouter, Fireworks) re-host
+    # Aggregator hosts (for example, OpenRouter) re-host
     # models from underlying families. The provider stem alone doesn't
-    # tell us the family — `together/meta-llama/Llama-3-8B` is meta,
-    # `together/anthropic/claude-haiku-4-5` is anthropic. Strip the
+    # tell us the family — `openrouter/meta-llama/Llama-3-8B` is meta,
+    # `openrouter/anthropic/claude-haiku-4-5` is anthropic. Strip the
     # aggregator prefix and recurse on the remainder. Without this,
     # cross-family validation against an aggregator-hosted model
     # produced "unknown" and the safety check silently no-op'd.
@@ -53,27 +63,82 @@ _PROVIDER_STEMS: tuple[tuple[str, Family], ...] = (
 
 _MODEL_STEMS: tuple[tuple[str, Family], ...] = (
     ("claude", "anthropic"),
+    # ``gpt-oss`` is OpenAI's open-weight line — same vendor family as
+    # the hosted ``gpt-*`` API models (conservative: shared training
+    # lineage cannot be ruled out). Must be matched BEFORE the ``gpt``
+    # stem since the loop returns the first match and ``gpt-oss-20b``
+    # would otherwise resolve via the shorter ``gpt`` stem anyway.
+    ("gpt-oss", "openai"),
     ("gpt", "openai"),
     ("o1", "openai"),
     ("o3", "openai"),
     ("o4", "openai"),
     ("gemini", "google"),
+    ("gemma", "google"),   # Google's open-weight line — same vendor lineage
     ("llama", "meta"),
     ("mistral", "mistral"),
     ("mixtral", "mistral"),
     ("command", "cohere"),  # cohere's `command-r-plus`, `command-light`
+    # Open-weight lineages (served locally via Ollama/vLLM/etc.).
+    ("qwen", "qwen"),
+    ("deepseek", "deepseek"),
+    ("yi", "yi"),
+    ("phi", "phi"),
 )
 
 
 _AGGREGATOR_PREFIXES: tuple[str, ...] = (
-    "together/",
-    "groq/",
-    "openrouter/",
-    "fireworks/",
-    "deepinfra/",
-    "perplexity/",
-    "replicate/",
+    *(f"{broker.name}/" for broker in MODEL_BROKERS),
+    "bedrock/",  # custom transport; underlying lineage comes from the model id
 )
+
+
+# AWS Bedrock model identifiers use a different shape from the
+# `provider/model` form: a regional inference-profile prefix
+# (`us.` / `eu.` / `au.` / `apac.` / `global.`) followed by a
+# `<provider>.` segment then the model id, all dot-separated.
+# Family detection must strip the regional prefix and then map
+# the provider segment, otherwise `us.anthropic.claude-opus-4-7`
+# resolves to "unknown" and the cross-family checker (Attacker
+# Moves Second, arXiv 2510.09023) silently treats a Bedrock-Claude
+# producer and a direct-API-Claude checker as "different families"
+# — the exact failure mode the validator exists to prevent.
+#
+# Constants are imported from the single-source-of-truth module so
+# adding a new region or provider segment updates one place.
+from core.llm.bedrock_prefixes import (  # noqa: E402
+    BEDROCK_PROVIDER_SEGMENTS as _BEDROCK_PROVIDER_SEGMENTS,
+    BEDROCK_REGIONAL_PREFIXES as _BEDROCK_REGIONAL_PREFIXES,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+# Local mapping segment → Family (Family is a Literal local to this
+# module, can't live in the shared constants module without a
+# circular import).
+_BEDROCK_PROVIDER_PREFIXES: tuple[tuple[str, Family], ...] = (
+    ("anthropic.", "anthropic"),
+    ("meta.",      "meta"),
+    ("mistral.",   "mistral"),
+    ("cohere.",    "cohere"),
+)
+# Sanity: every segment listed in the shared module must have a
+# Family mapping here (or be intentionally Family-less, in which
+# case it's not in BEDROCK_PROVIDER_SEGMENTS).
+assert {p for p, _ in _BEDROCK_PROVIDER_PREFIXES} == set(
+    _BEDROCK_PROVIDER_SEGMENTS,
+), "Bedrock provider segments out of sync with Family mapping"
+
+
+def _strip_bedrock_regional_prefix(needle: str) -> str:
+    """Strip a single Bedrock regional prefix when present.
+    Operates on the LOWERED identifier; caller is responsible for
+    re-applying to the original-case string if needed."""
+    for prefix in _BEDROCK_REGIONAL_PREFIXES:
+        if needle.startswith(prefix):
+            return needle[len(prefix):]
+    return needle
 
 
 _FAMILY_TO_PROVIDER: dict[Family, str] = {
@@ -84,7 +149,24 @@ _FAMILY_TO_PROVIDER: dict[Family, str] = {
     "mistral": "mistral",
     "ollama": "ollama",
     "cohere": "cohere",
+    # Open-weight lineages are served locally; route them via Ollama.
+    "qwen": "ollama",
+    "deepseek": "ollama",
+    "yi": "ollama",
+    "phi": "ollama",
 }
+
+# Heads that :func:`bare_model_id` strips as a ``<provider>/`` prefix.
+# Union of the ROUTING provider strings and the family-detection
+# provider stems: ``family_of`` accepts ``google/gemini-…``,
+# ``meta-llama/Llama-…`` and ``mistralai/Mistral-…`` as
+# provider-qualified ids, so the bare-name peel must strip the same
+# heads — otherwise operator ``--model`` values in those spellings
+# never match their models.json entries.
+_BARE_STRIP_HEADS: frozenset[str] = (
+    frozenset(_FAMILY_TO_PROVIDER.values())
+    | frozenset(stem for stem, _ in _PROVIDER_STEMS)
+)
 
 
 def provider_for_family(family: Family) -> str:
@@ -93,8 +175,158 @@ def provider_for_family(family: Family) -> str:
 
 
 def provider_of(model_id: str) -> str:
-    """Shorthand: model identifier → provider string."""
+    """Model identifier → ROUTING provider string.
+
+    Distinct from :func:`family_of`: family is the model's training
+    lineage (what's the cross-family checker invariant), provider is
+    the routing target (which SDK/endpoint/dispatcher rule handles
+    this request).  The two diverge for Bedrock-routed Claude: family
+    is ``anthropic`` (so cross-family validation correctly refuses to
+    pair a Bedrock-Claude producer with a direct-API-Claude checker),
+    but the ROUTING provider is ``bedrock`` (so config-file lookups,
+    auth selection, and dispatcher routing pick the Bedrock path).
+
+    Order:
+      1. Bedrock-shaped IDs (``<region>.<provider>.<model>``) →
+         ``"bedrock"`` — every Bedrock prefix combination resolves
+         the same way regardless of underlying model family.
+      2. Otherwise fall back to :func:`family_of` → provider mapping,
+         preserving the existing direct-API behaviour.
+    """
+    needle = model_id.lower()
+    # Same iterated peel as family_of so chained shapes like
+    # ``openrouter/us.anthropic.claude-opus-4-7`` resolve to
+    # ``"bedrock"`` routing (the model is Bedrock-routed even when
+    # nominally aggregator-prefixed; the aggregator can't host a
+    # Bedrock-shaped id meaningfully).
+    for _ in range(5):
+        peeled = False
+        before_bedrock = needle
+        needle = _strip_bedrock_regional_prefix(needle)
+        if needle != before_bedrock:
+            peeled = True
+        for prefix, _family in _BEDROCK_PROVIDER_PREFIXES:
+            if needle.startswith(prefix):
+                return "bedrock"
+        for prefix in _AGGREGATOR_PREFIXES:
+            if needle.startswith(prefix):
+                needle = needle[len(prefix):]
+                peeled = True
+                break
+        if not peeled:
+            break
     return provider_for_family(family_of(model_id))
+
+
+def resolve_model_shorthand(
+    model_id: str, candidate_names: Iterable[str],
+) -> str | None:
+    """Resolve a bare tier-token shorthand to a configured model name.
+
+    An operator typing ``--model haiku`` gets back the full configured
+    name (``"claude-haiku-4-5-20251001"``) when exactly one configured
+    model has ``"haiku"`` as one of its hyphen-separated tokens.
+    Ambiguous input (two haiku variants configured) raises with the
+    candidate list so the operator can pick; missing input returns
+    ``None`` so the caller falls through to its usual failure path.
+
+    Match rule: shorthand equals one of the hyphen-separated tokens
+    of a configured model's :func:`bare_model_id` (case-insensitive).
+    ``"haiku"`` matches ``"claude-haiku-4-5-...`` but ``"pus"`` does
+    NOT match ``"claude-opus-4-7"`` — substring matches are too easy
+    to trigger accidentally on real names.
+
+    Only activated when the input:
+      * has NO ``/`` or ``.`` (provider-qualified / Bedrock IDs never
+        take this branch);
+      * is at least 3 characters (avoids ``"4"`` matching version
+        tokens);
+      * is not purely numeric (avoids ``"45"`` matching a version).
+
+    Callers dedupe ``candidate_names`` first when multiple entries
+    can refer to the same model (e.g. an alias + its dated snapshot);
+    this helper treats each name in the iterable as a distinct
+    candidate so it can raise a truthful ambiguity error.
+    """
+    # Guard: fail loud at the boundary rather than crashing deep inside
+    # ``"/" in <non-string>`` with a confusing TypeError. A misrouted
+    # ModelConfig arriving here always means the caller made a mistake.
+    # ``None`` is kept as a "missing input" sentinel per the docstring —
+    # the falsy short-circuit below returns None for that case.
+    if model_id is not None and not isinstance(model_id, str):
+        msg = (
+            f"resolve_model_shorthand: model_id must be str or None, got "
+            f"{type(model_id).__name__}"
+        )
+        raise TypeError(msg)
+    if not model_id or "/" in model_id or "." in model_id:
+        return None
+    if len(model_id) < 3 or model_id.isdigit():
+        return None
+    needle = model_id.lower()
+    matches: list[str] = []
+    for name in candidate_names:
+        if not name:
+            continue
+        bare = bare_model_id(name).lower()
+        tokens = bare.replace(".", "-").split("-")
+        if needle in tokens:
+            matches.append(name)
+    # Dedupe while preserving order — the caller may pass duplicate
+    # candidates when the same underlying model is referenced multiple
+    # times (primary + fallback + specialized).
+    seen: set[str] = set()
+    unique: list[str] = []
+    for m in matches:
+        if m not in seen:
+            seen.add(m)
+            unique.append(m)
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 1:
+        listed = ", ".join(sorted(unique))
+        msg = (
+            f"ambiguous model shorthand {model_id!r}: matches "
+            f"{listed}. Pass the full model name to disambiguate."
+        )
+        raise ValueError(msg)
+    return None
+
+
+def unknown_model_message(model_id: str) -> str:
+    """Operator-facing hint for a model id whose provider can't be resolved.
+
+    Used to fail loudly (instead of silently producing a keyless / provider-
+    less config) when an operator passes a prefix-less nickname like
+    ``opus-4-8`` rather than a recognizable id."""
+    return (
+        f"unrecognized model {model_id!r}: cannot determine its provider. "
+        f"Use a recognizable id (e.g. 'claude-opus-4-8', 'gpt-5', "
+        f"'gemini-2.5-pro') or an explicit 'provider/model' form "
+        f"(e.g. 'anthropic/claude-opus-4-8')."
+    )
+
+
+def routing_model_id(model_id: str) -> str:
+    """Return the identifier to put on the wire: aggregator/route
+    prefixes peeled, provider segments KEPT.
+
+    Distinct from :func:`bare_model_id`: Bedrock model ids require the
+    vendor-dotted form (``anthropic.claude-…``) — handing the SDK a
+    fully-bared name 403s. Use bare_model_id for MATCHING against
+    configured entries, routing_model_id for the outgoing model name.
+    """
+    needle = model_id
+    for _ in range(4):
+        peeled = False
+        for prefix in _AGGREGATOR_PREFIXES:
+            if needle.lower().startswith(prefix):
+                needle = needle[len(prefix):]
+                peeled = True
+                break
+        if not peeled:
+            break
+    return needle
 
 
 def bare_model_id(model_id: str) -> str:
@@ -107,7 +339,7 @@ def bare_model_id(model_id: str) -> str:
 
         bare_model_id("anthropic/claude-haiku-4-5")
             -> "claude-haiku-4-5"
-        bare_model_id("together/anthropic/claude-haiku-4-5")
+        bare_model_id("openrouter/anthropic/claude-haiku-4-5")
             -> "claude-haiku-4-5"
         bare_model_id("claude-haiku-4-5")
             -> "claude-haiku-4-5"
@@ -117,6 +349,21 @@ def bare_model_id(model_id: str) -> str:
     model under a separate ``provider`` key).
     """
     needle = model_id
+    # Bedrock regional prefix (``us.``/``eu.``/...) peel first, then
+    # the dot-separated Bedrock provider segment.  Mirrors
+    # :func:`family_of`'s peel order so the two helpers stay
+    # consistent on Bedrock identifiers.
+    lowered = needle.lower()
+    for prefix in _BEDROCK_REGIONAL_PREFIXES:
+        if lowered.startswith(prefix):
+            needle = needle[len(prefix):]
+            lowered = lowered[len(prefix):]
+            break
+    for prefix, _family in _BEDROCK_PROVIDER_PREFIXES:
+        if lowered.startswith(prefix):
+            needle = needle[len(prefix):]
+            lowered = lowered[len(prefix):]
+            break
     for _ in range(4):
         peeled = False
         for prefix in _AGGREGATOR_PREFIXES:
@@ -126,9 +373,15 @@ def bare_model_id(model_id: str) -> str:
                 break
         if not peeled:
             break
+        # An aggregator can front a Bedrock-shaped id
+        # (``bedrock/anthropic.claude-…``) — the regional/provider
+        # dot-peels above ran before this loop, so re-run them on the
+        # peeled remainder. Recursion mirrors family_of's peel-and-
+        # recurse and is bounded by the shrinking needle.
+        return bare_model_id(needle)
     if "/" in needle:
         head, rest = needle.split("/", 1)
-        if head.lower() in {v for v in _FAMILY_TO_PROVIDER.values()}:
+        if head.lower() in _BARE_STRIP_HEADS:
             needle = rest
     return needle
 
@@ -138,24 +391,41 @@ def family_of(model_id: str) -> Family:
 
     Matching is by prefix on the lowered identifier (so ``claude-opus-4-7``
     and ``anthropic/claude-haiku-4-5`` both resolve to ``"anthropic"``).
-    Provider routing prefixes (``provider/model``) are checked first so
-    that e.g. ``ollama/llama-3`` resolves to ``ollama`` not ``meta``.
 
-    Aggregator-host prefixes (``together/``, ``groq/``, ``openrouter/``,
-    etc.) are STRIPPED first before family resolution — they re-host
+    A provider routing prefix (``provider/model``) is PEELED and the
+    remainder re-resolved, so the *underlying model's* lineage wins over
+    the transport: ``ollama/qwen3`` → ``qwen``, ``ollama/deepseek-coder``
+    → ``deepseek``. Only when the remainder is itself unrecognised does
+    the provider's own family stand (``ollama/some-local-finetune`` →
+    ``ollama``). This is what lets an all-open-weight roster served
+    through one transport still be told apart by lineage — previously
+    every ``ollama/*`` collapsed to ``ollama`` and the cross-family
+    safety check silently no-op'd.
+
+    Aggregator-host prefixes (for example, ``openrouter/``) are STRIPPED first before family resolution — they re-host
     models from underlying families and must not be mistaken for a
     family of their own. Without this peel,
-    `together/anthropic/claude-haiku-4-5` resolved to "unknown" and
+    `openrouter/anthropic/claude-haiku-4-5` resolved to "unknown" and
     the cross-family safety check silently no-op'd.
 
     Unknown identifiers return ``"unknown"``.
     """
     needle = model_id.lower()
-    # Peel aggregator prefix(es). Some users chain (e.g.
-    # `openrouter/together/...`); peel iteratively up to a small bound
-    # to avoid pathological loops on adversarial inputs.
-    for _ in range(4):
+    # Iterate both peels (Bedrock regional + aggregator) so chained
+    # shapes like ``openrouter/us.anthropic.claude-opus-4-7`` resolve
+    # correctly.  Bedrock and aggregator prefixes use different
+    # separators (``.`` vs ``/``) and don't overlap in vocabulary,
+    # so a fixed-bound iteration converges in at most a handful of
+    # passes.  Bound at 5 to defend against pathological inputs.
+    for _ in range(5):
         peeled = False
+        before_bedrock = needle
+        needle = _strip_bedrock_regional_prefix(needle)
+        if needle != before_bedrock:
+            peeled = True
+        for prefix, family in _BEDROCK_PROVIDER_PREFIXES:
+            if needle.startswith(prefix):
+                return family
         for prefix in _AGGREGATOR_PREFIXES:
             if needle.startswith(prefix):
                 needle = needle[len(prefix):]
@@ -165,10 +435,32 @@ def family_of(model_id: str) -> Family:
             break
     for stem, family in _PROVIDER_STEMS:
         if needle.startswith(stem + "/"):
+            # Peel the provider prefix and resolve the UNDERLYING model.
+            # ``ollama/qwen3`` → ``qwen``; the transport family (``ollama``)
+            # only stands when the remainder is itself unrecognised. This
+            # keeps genuinely distinct lineages (Qwen vs DeepSeek vs Llama)
+            # cross-family even when all are served through one provider.
+            remainder_family = family_of(needle[len(stem) + 1:])
+            if remainder_family != "unknown":
+                return remainder_family
             return family
     for stem, family in _MODEL_STEMS:
-        if needle.startswith(stem + "-"):
+        # Match the stem when it stands alone, is followed by a separator
+        # (``llama-3.1``, ``gpt-4o``), OR — for stems of 3+ characters —
+        # is followed immediately by a version digit/dot (``qwen3``,
+        # ``qwen2.5``, ``phi4``).  Open model names frequently glue the
+        # version onto the family name with no separator, which the
+        # ``stem + "-"`` rule alone misses.  Short stems (``o1``, ``o3``,
+        # ``o4``) skip the digit rule: ``o100`` is not an OpenAI model,
+        # and the 2-char prefix sweeps too broadly.
+        if needle == stem:
             return family
+        if needle.startswith(stem):
+            nxt = needle[len(stem):len(stem) + 1]
+            if nxt in "-_.":
+                return family
+            if nxt.isdigit() and len(stem) >= 3:
+                return family
     return "unknown"
 
 
@@ -189,18 +481,42 @@ def same_family(a: str, b: str) -> bool:
 def select_cross_family_checker(
     producer_model_id: str,
     candidates: Iterable[str],
-) -> Optional[str]:
+) -> str | None:
     """Pick the first candidate that is from a different family than the producer.
 
     Returns ``None`` if no suitable candidate exists. ``"unknown"`` family
     candidates are skipped — they cannot be proven cross-family. The
+    same rule applies to the PRODUCER: an unrecognized producer id
+    (e.g. a rebadged or aggregator-aliased model) makes every
+    ``same_family`` comparison return False, which would hand back a
+    "cross-family" checker that may share the producer's lineage.
+    Unprovable is not cross-family, so an unknown producer returns
+    ``None`` — the caller skips the checker leg rather than trusting a
+    rebadged same-family model as an independent validator. The
     ordering of ``candidates`` is preserved so callers can pass a
     preference list (e.g. cheapest-first or fastest-first).
 
     Caller composes this with ``llm_response_schema.validate_response``:
     the chosen candidate becomes the model used inside the retry callback.
     """
+    import logging
+    _log = logging.getLogger("raptor.llm_family")
+    if family_of(producer_model_id) == "unknown":
+        _log.warning(
+            "cross-family validation skipped: producer model %r has an "
+            "unrecognised lineage, so no checker can be proven independent. "
+            "The 'Attacker Moves Second' control is INACTIVE for this call.",
+            producer_model_id,
+        )
+        return None
     for candidate in candidates:
         if not same_family(producer_model_id, candidate) and family_of(candidate) != "unknown":
             return candidate
+    _log.warning(
+        "cross-family validation skipped: no candidate from a different "
+        "lineage than %r was available (candidates all same-family or "
+        "unrecognised). The cross-family independence check is INACTIVE "
+        "for this call.",
+        producer_model_id,
+    )
     return None

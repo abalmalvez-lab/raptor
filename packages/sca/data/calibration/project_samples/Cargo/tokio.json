@@ -1,0 +1,1292 @@
+{
+  "_source": {
+    "fetched_at": "2026-10-29T21:47:03Z",
+    "git_ref": "tokio-1.35.0",
+    "license": "MIT (RAPTOR-generated fields only; upstream advisory data retains its own terms)",
+    "name": "RAPTOR SCA scan of tokio",
+    "project_license": "MIT",
+    "provenance": "Scan output produced by RAPTOR's SCA pipeline against https://github.com/tokio-rs/tokio.git@tokio-1.35.0. Project source not redistributed.",
+    "url": "https://github.com/tokio-rs/tokio.git"
+  },
+  "findings": [
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2020-35908",
+          "RUSTSEC-2020-0062"
+        ],
+        "id": "GHSA-5r9g-j7jj-hw6c"
+      },
+      "cvss_score": 5.5,
+      "dep_name": "futures-util",
+      "dep_version": "0.3.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.00341,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:futures-util:0.3.0:GHSA-5r9g-j7jj-hw6c",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/futures-util@0.3.0",
+      "raptor_risk_estimate": 5.978779502777737,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 5.978779502777737
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-27308",
+          "RUSTSEC-2024-0019"
+        ],
+        "id": "GHSA-r8w9-5wcg-vfj7"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "mio",
+      "dep_version": "0.8.9",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.00881,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:mio:0.8.9:GHSA-r8w9-5wcg-vfj7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/mio@0.8.9",
+      "raptor_risk_estimate": 16.73117699812411,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 16.73117699812411
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2026-0097"
+        ],
+        "id": "GHSA-cq8v-f236-94qc"
+      },
+      "cvss_score": null,
+      "dep_name": "rand",
+      "dep_version": "0.8.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:rand:0.8.0:GHSA-cq8v-f236-94qc",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/rand@0.8.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2026-0097"
+        ],
+        "id": "GHSA-cq8v-f236-94qc"
+      },
+      "cvss_score": null,
+      "dep_name": "rand",
+      "dep_version": "0.8.3",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:rand:0.8.3:GHSA-cq8v-f236-94qc",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/rand@0.8.3",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2026-0097"
+        ],
+        "id": "GHSA-cq8v-f236-94qc"
+      },
+      "cvss_score": null,
+      "dep_name": "rand",
+      "dep_version": "0.8",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:rand:0.8:GHSA-cq8v-f236-94qc",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/rand@0.8",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2021-38191",
+          "RUSTSEC-2021-0072"
+        ],
+        "id": "GHSA-2grh-hm3w-w7hv"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "tokio",
+      "dep_version": "1.0.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.00833,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.0.0:GHSA-2grh-hm3w-w7hv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.0.0",
+      "raptor_risk_estimate": 6.446481594486102,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.446481594486102
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2023-0005"
+        ],
+        "id": "GHSA-4q83-7cq4-p6wg"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.0.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.0.0:GHSA-4q83-7cq4-p6wg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.0.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2021-45710",
+          "RUSTSEC-2021-0124"
+        ],
+        "id": "GHSA-fg7r-2g4j-5cgr"
+      },
+      "cvss_score": 8.1,
+      "dep_name": "tokio",
+      "dep_version": "1.0.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.01239,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.0.0:GHSA-fg7r-2g4j-5cgr",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.0.0",
+      "raptor_risk_estimate": 8.887506345667871,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 8.887506345667871
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "GHSA-rr8g-9fpq-6wmg"
+        ],
+        "id": "RUSTSEC-2025-0023",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.0.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.0.0:RUSTSEC-2025-0023",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.0.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [],
+        "id": "RUSTSEC-2026-0386",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.0.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.0.0:RUSTSEC-2026-0386",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.0.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2023-0005"
+        ],
+        "id": "GHSA-4q83-7cq4-p6wg"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.15.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.15.0:GHSA-4q83-7cq4-p6wg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.15.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2023-22466",
+          "RUSTSEC-2023-0001"
+        ],
+        "id": "GHSA-7rrj-xr53-82p7"
+      },
+      "cvss_score": 5.4,
+      "dep_name": "tokio",
+      "dep_version": "1.15.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.0059,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.15.0:GHSA-7rrj-xr53-82p7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.15.0",
+      "raptor_risk_estimate": 5.885305515090022,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 5.885305515090022
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "GHSA-rr8g-9fpq-6wmg"
+        ],
+        "id": "RUSTSEC-2025-0023",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.15.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.15.0:RUSTSEC-2025-0023",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.15.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [],
+        "id": "RUSTSEC-2026-0386",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.15.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.15.0:RUSTSEC-2026-0386",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.15.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2021-38191",
+          "RUSTSEC-2021-0072"
+        ],
+        "id": "GHSA-2grh-hm3w-w7hv"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "tokio",
+      "dep_version": "1.2.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.00833,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.2.0:GHSA-2grh-hm3w-w7hv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.2.0",
+      "raptor_risk_estimate": 6.446481594486102,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.446481594486102
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2023-0005"
+        ],
+        "id": "GHSA-4q83-7cq4-p6wg"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.2.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.2.0:GHSA-4q83-7cq4-p6wg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.2.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2021-45710",
+          "RUSTSEC-2021-0124"
+        ],
+        "id": "GHSA-fg7r-2g4j-5cgr"
+      },
+      "cvss_score": 8.1,
+      "dep_name": "tokio",
+      "dep_version": "1.2.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.01239,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.2.0:GHSA-fg7r-2g4j-5cgr",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.2.0",
+      "raptor_risk_estimate": 8.887506345667871,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 8.887506345667871
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "GHSA-rr8g-9fpq-6wmg"
+        ],
+        "id": "RUSTSEC-2025-0023",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.2.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.2.0:RUSTSEC-2025-0023",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.2.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [],
+        "id": "RUSTSEC-2026-0386",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.2.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.2.0:RUSTSEC-2026-0386",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.2.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "GHSA-rr8g-9fpq-6wmg"
+        ],
+        "id": "RUSTSEC-2025-0023",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.28.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.28.0:RUSTSEC-2025-0023",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.28.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [],
+        "id": "RUSTSEC-2026-0386",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.28.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.28.0:RUSTSEC-2026-0386",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.28.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2021-38191",
+          "RUSTSEC-2021-0072"
+        ],
+        "id": "GHSA-2grh-hm3w-w7hv"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "tokio",
+      "dep_version": "1.5.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.00833,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.5.0:GHSA-2grh-hm3w-w7hv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.5.0",
+      "raptor_risk_estimate": 6.446481594486102,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.446481594486102
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "RUSTSEC-2023-0005"
+        ],
+        "id": "GHSA-4q83-7cq4-p6wg"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.5.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.5.0:GHSA-4q83-7cq4-p6wg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.5.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2021-45710",
+          "RUSTSEC-2021-0124"
+        ],
+        "id": "GHSA-fg7r-2g4j-5cgr"
+      },
+      "cvss_score": 8.1,
+      "dep_name": "tokio",
+      "dep_version": "1.5.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.01239,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.5.0:GHSA-fg7r-2g4j-5cgr",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.5.0",
+      "raptor_risk_estimate": 8.887506345667871,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 8.887506345667871
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "GHSA-rr8g-9fpq-6wmg"
+        ],
+        "id": "RUSTSEC-2025-0023",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.5.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.5.0:RUSTSEC-2025-0023",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.5.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [],
+        "id": "RUSTSEC-2026-0386",
+        "informational": "unsound"
+      },
+      "cvss_score": null,
+      "dep_name": "tokio",
+      "dep_version": "1.5.0",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": null,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tokio:1.5.0:RUSTSEC-2026-0386",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tokio@1.5.0",
+      "raptor_risk_estimate": 6.5982729041775,
+      "reachability": {
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95
+        },
+        "verdict": "not_function_reachable"
+      },
+      "risk_components": {
+        "final": 6.5982729041775
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-58160",
+          "GHSA-xwfj-jgwm-7wp5"
+        ],
+        "id": "RUSTSEC-2025-0055"
+      },
+      "cvss_score": null,
+      "dep_name": "tracing-subscriber",
+      "dep_version": "0.3.1",
+      "direct": true,
+      "ecosystem": "Cargo",
+      "epss": 0.00341,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Cargo:tracing-subscriber:0.3.1:RUSTSEC-2025-0055",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:cargo/tracing-subscriber@0.3.1",
+      "raptor_risk_estimate": 5.088214815652064,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "not_reachable"
+      },
+      "risk_components": {
+        "final": 5.088214815652064
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    }
+  ]
+}

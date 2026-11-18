@@ -1,0 +1,3001 @@
+"""Tests for core.audit.sweep — tool-grounded sweep execution."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import ClassVar
+
+import pytest
+
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+pytestmark = pytest.mark.usefixtures("owned_smt_subprocess")
+
+import core.audit.sweep as sweep_mod
+from core.audit.sweep import (
+    SarifCache,
+    SweepResult,
+    mechanical_check_to_semgrep,
+    run_codeql_sweep,
+    run_consistency_check,
+    run_smt_sweep,
+)
+
+
+
+@pytest.fixture(autouse=True)
+def _owned_negative_control_cache(monkeypatch):
+    """Keep control-result memo mutations separate from borrowed state."""
+    from core.audit import sweep
+    from core.testing.module_state import isolated_module_state
+
+    with isolated_module_state(sweep, {"_negative_control_cache": {}}):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+class TestSweepResult:
+    def test_to_log_entry(self):
+        result = SweepResult(
+            tool="semgrep",
+            file_path="src/handler.c",
+            function_name="parse_request",
+            outcome="confirmed",
+            matches=[{"line": 42}],
+            rule_id="injection-rule.yaml",
+        )
+        entry = result.to_log_entry()
+        assert entry["action"] == "sweep"
+        assert entry["key"] == "src/handler.c:parse_request"
+        assert entry["tool"] == "semgrep"
+        assert entry["outcome"] == "confirmed"
+        assert entry["match_count"] == 1
+        assert entry["rule_id"] == "injection-rule.yaml"
+
+    def test_refuted_no_matches(self):
+        result = SweepResult(
+            tool="coccinelle",
+            file_path="src/util.c",
+            function_name="helper",
+            outcome="refuted",
+        )
+        entry = result.to_log_entry()
+        assert entry["outcome"] == "refuted"
+        assert "match_count" not in entry
+
+    def test_error_with_errors(self):
+        result = SweepResult(
+            tool="semgrep",
+            file_path="src/missing.c",
+            function_name="gone",
+            outcome="error",
+            errors=["file not found"],
+        )
+        entry = result.to_log_entry()
+        assert entry["outcome"] == "error"
+        assert "file not found" in entry["errors"]
+
+
+class TestRunSemgrepSweep:
+    def test_missing_file(self, tmp_path: Path):
+        from core.audit.sweep import run_semgrep_sweep
+
+        result = run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="nonexistent.c",
+            function_name="foo",
+            rule_config="auto",
+        )
+        assert result.outcome == "error"
+        assert any("not found" in e for e in result.errors)
+
+    def test_file_exists_no_semgrep(self, tmp_path: Path, monkeypatch):
+        from core.audit.sweep import run_semgrep_sweep
+
+        (tmp_path / "test.c").write_text("int foo() { return 0; }\n")
+
+        monkeypatch.setattr(
+            "core.audit.sweep.run_semgrep_sweep.__module__",
+            "core.audit.sweep",
+        )
+
+        result = run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="test.c",
+            function_name="foo",
+            rule_config="auto",
+        )
+        # Either error (no semgrep) or refuted (no matches) — both valid
+        assert result.outcome in ("error", "refuted")
+
+
+class TestSemgrepErrorSemantics:
+    """Regression: tool failure (nonzero rc, crash, failed target parse)
+    classifies as 'error', never 'refuted' — a crashed scan says
+    nothing about the code and must not count against the hypothesis."""
+
+    def _sweep(self, tmp_path, monkeypatch, semgrep_result):
+        import packages.semgrep.runner as runner_mod
+        from core.audit.sweep import run_semgrep_sweep
+
+        (tmp_path / "test.c").write_text(
+            "int foo(char *p) { return p[0]; }\n",
+        )
+        monkeypatch.setattr(runner_mod, "is_available", lambda: True)
+        monkeypatch.setattr(
+            runner_mod, "run_rule", lambda *a, **kw: semgrep_result,
+        )
+        return run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="test.c",
+            function_name="foo",
+            rule_config="rule.yaml",
+        )
+
+    def test_bad_returncode_is_error_not_refuted(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The verifier PoC: completed semgrep proc rc=2, empty SARIF,
+        # errors=[] — used to classify as "refuted".
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=2,
+        ))
+        assert result.outcome == "error"
+        assert any("exited with code 2" in e for e in result.errors)
+
+    def test_runner_errors_are_error_before_match_logic(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=["Timeout after 120s"], returncode=-1,
+        ))
+        assert result.outcome == "error"
+        assert result.errors == ["Timeout after 120s"]
+
+    def test_target_in_files_failed_is_error(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # rc 0, no findings — but the one target file failed to parse:
+        # the file was never analysed, so "no findings" is not a
+        # refutation.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_failed=[str(tmp_path / "test.c")],
+        ))
+        assert result.outcome == "error"
+        assert any("files_failed" in e for e in result.errors)
+
+    def test_clean_scan_without_matches_still_refutes(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The genuine negative is preserved: rc 0, file analysed, no
+        # findings → refuted (the refutation lane must not weaken).
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_examined=[str(tmp_path / "test.c")],
+        ))
+        assert result.outcome == "refuted"
+
+
+class TestScannedWitnessGate:
+    """A zero-finding semgrep scan may only refute when the target
+    verifiably appears in the scanned-paths witness (files_examined /
+    paths.scanned). Semgrep can silently SKIP a target (paths.skipped
+    — surfaced in neither ``errors`` nor ``files_failed``): an
+    unwitnessed "no findings" analysed nothing and must not clear the
+    hypothesis — it degrades to 'inconclusive', never 'refuted'."""
+
+    def _sweep(self, tmp_path, monkeypatch, semgrep_result):
+        import packages.semgrep.runner as runner_mod
+        from core.audit.sweep import run_semgrep_sweep
+
+        (tmp_path / "test.c").write_text(
+            "int foo(char *p) { return p[0]; }\n",
+        )
+        monkeypatch.setattr(runner_mod, "is_available", lambda: True)
+        monkeypatch.setattr(
+            runner_mod, "run_rule", lambda *a, **kw: semgrep_result,
+        )
+        return run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="test.c",
+            function_name="foo",
+            rule_config="rule.yaml",
+        )
+
+    def test_target_absent_from_witness_is_inconclusive(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # rc 0, sidecar present — but the target is NOT in it: the
+        # scan silently skipped the file, so zero findings prove
+        # nothing about the code.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_examined=[str(tmp_path / "other.c")],
+        ))
+        assert result.outcome == "inconclusive"
+        assert "scanned-target witness" in (result.details or {})["reason"]
+
+    def test_absent_witness_sidecar_is_inconclusive(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The sidecar is best-effort (absent in injected-runner
+        # setups): its absence must degrade gracefully — inconclusive
+        # with a reason naming the missing witness, never refuted and
+        # never a crash.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+        ))
+        assert result.outcome == "inconclusive"
+        reason = (result.details or {})["reason"]
+        assert "scanned-target witness" in reason
+        assert "files_examined" in reason
+
+    def test_target_in_witness_still_refutes(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The genuine negative is preserved: the target appears in
+        # the scanned witness, so zero findings remain a refutation.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_examined=[str(tmp_path / "test.c")],
+        ))
+        assert result.outcome == "refuted"
+
+    def test_findings_confirm_without_witness(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The confirm lane is untouched: matches are their own
+        # evidence that the file was analysed.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[{"start": {"line": 1}}], errors=[], returncode=0,
+        ))
+        assert result.outcome == "confirmed"
+        assert len(result.matches) == 1
+
+
+class TestFilesFailedGate:
+    """A target the scan FAILED to parse analysed nothing — the sweep
+    must return 'error', never 'refuted', even when the file also
+    appears in the scanned witness (semgrep's PartialParsing warn
+    covers exactly the region a syntax error hides: the file lands in
+    paths.scanned AND errors[], and zero findings over the unparsed
+    region would read as a licensed refutation — planting a syntax
+    error next to a finding suppressed it)."""
+
+    def _sweep(self, tmp_path, monkeypatch, semgrep_result):
+        import packages.semgrep.runner as runner_mod
+        from core.audit.sweep import run_semgrep_sweep
+
+        (tmp_path / "test.c").write_text(
+            "int foo(char *p) { return p[0]; }\n",
+        )
+        monkeypatch.setattr(runner_mod, "is_available", lambda: True)
+        monkeypatch.setattr(
+            runner_mod, "run_rule", lambda *a, **kw: semgrep_result,
+        )
+        return run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="test.c",
+            function_name="foo",
+            rule_config="rule.yaml",
+        )
+
+    def test_dict_entry_is_error_not_refuted(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The standard runner emits {"path", "reason"} dicts
+        # (packages.semgrep.models parse_json_output) — a str() of
+        # the dict never matched the path, so the gate never fired.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_examined=[str(tmp_path / "test.c")],
+            files_failed=[{
+                "path": str(tmp_path / "test.c"),
+                "reason": "PartialParsing",
+            }],
+        ))
+        assert result.outcome == "error"
+        assert any("files_failed" in e for e in result.errors)
+
+    def test_string_entry_tolerated(self, tmp_path: Path, monkeypatch):
+        # Injected runners may emit bare path strings.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_examined=[str(tmp_path / "test.c")],
+            files_failed=[str(tmp_path / "test.c")],
+        ))
+        assert result.outcome == "error"
+
+    def test_unrelated_failed_file_keeps_refutation(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # A parse failure elsewhere in the invocation says nothing
+        # about THIS witnessed target.
+        from packages.semgrep.models import SemgrepResult
+
+        result = self._sweep(tmp_path, monkeypatch, SemgrepResult(
+            name="r", config="rule.yaml", target="test.c",
+            findings=[], errors=[], returncode=0,
+            files_examined=[str(tmp_path / "test.c")],
+            files_failed=[{
+                "path": str(tmp_path / "other.c"),
+                "reason": "PartialParsing",
+            }],
+        ))
+        assert result.outcome == "refuted"
+
+
+class TestJoernErrorSemantics:
+    """Joern leg of the same class: an errored taint query (timeout, server
+    crash, validation reject) returns no flows — that must classify as
+    'error', never 'refuted'."""
+
+    def _cpg(self, tmp_path):
+        from packages.joern.models import JoernCPG
+
+        cpg_path = tmp_path / "cpg.bin"
+        cpg_path.write_bytes(b"")
+        return JoernCPG(path=cpg_path, target=tmp_path)
+
+    def _sweep(self, tmp_path, monkeypatch, joern_result):
+        import packages.joern.runner as runner_mod
+        from core.audit.sweep import run_joern_sweep
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "a.c").write_text("int f() { return 0; }\n")
+        monkeypatch.setattr(
+            runner_mod, "run_taint_query_result",
+            lambda *a, **kw: joern_result,
+        )
+        return run_joern_sweep(
+            target_path=tmp_path,
+            file_path="src/a.c",
+            function_name="foo",
+            source_param="x",
+            sink_call="memcpy",
+            cpg=self._cpg(tmp_path),
+        )
+
+    def test_errored_query_is_error_not_refuted(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from packages.joern.models import JoernResult
+
+        result = self._sweep(tmp_path, monkeypatch, JoernResult(
+            query="q", flows=[], errors=["query timed out after 300s"],
+        ))
+        assert result.outcome == "error"
+        assert result.errors == ["query timed out after 300s"]
+
+    def test_no_flows_no_errors_still_refutes(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from packages.joern.models import JoernResult
+
+        result = self._sweep(tmp_path, monkeypatch, JoernResult(
+            query="q", flows=[], errors=[],
+        ))
+        assert result.outcome == "refuted"
+
+    def test_run_taint_query_result_surfaces_run_query_errors(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import packages.joern.runner as runner_mod
+        from packages.joern.models import JoernResult
+        from packages.joern.runner import run_taint_query_result
+
+        monkeypatch.setattr(
+            runner_mod, "run_query",
+            lambda *a, **kw: JoernResult(
+                query="q", flows=[], errors=["server process exited"],
+            ),
+        )
+        result = run_taint_query_result(
+            self._cpg(tmp_path), "foo", "memcpy",
+        )
+        assert result.errors == ["server process exited"]
+        assert result.flows == []
+
+
+class TestRunCoccinelleSweep:
+    def test_missing_file(self, tmp_path: Path):
+        from core.audit.sweep import run_coccinelle_sweep
+
+        result = run_coccinelle_sweep(
+            target_path=tmp_path,
+            file_path="nonexistent.c",
+            function_name="foo",
+            cocci_rule="rule.cocci",
+        )
+        assert result.outcome == "error"
+        assert any("not found" in e for e in result.errors)
+
+
+class TestPathContainment:
+    def test_path_traversal_blocked(self, tmp_path: Path):
+        from core.audit.sweep import run_semgrep_sweep
+
+        result = run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="../../etc/passwd",
+            function_name="foo",
+            rule_config="auto",
+        )
+        assert result.outcome == "error"
+        assert any("escapes" in e for e in result.errors)
+
+    def test_normal_path_allowed(self, tmp_path: Path):
+        from core.audit.sweep import run_semgrep_sweep
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "test.c").write_text("int foo() {}\n")
+
+        result = run_semgrep_sweep(
+            target_path=tmp_path,
+            file_path="src/test.c",
+            function_name="foo",
+            rule_config="auto",
+        )
+        # Not blocked by containment — may error on semgrep
+        assert result.outcome != "error" or \
+            not any("escapes" in e for e in result.errors)
+
+    def test_coccinelle_path_traversal_blocked(self, tmp_path: Path):
+        from core.audit.sweep import run_coccinelle_sweep
+
+        result = run_coccinelle_sweep(
+            target_path=tmp_path,
+            file_path="../../../etc/shadow",
+            function_name="foo",
+            cocci_rule="rule.cocci",
+        )
+        assert result.outcome == "error"
+        assert any("escapes" in e for e in result.errors)
+
+
+class TestRunSmtSweep:
+    def test_unknown_verb(self):
+        result = run_smt_sweep(
+            file_path="a.c",
+            function_name="foo",
+            verb="nonexistent-verb",
+            smt_args={},
+        )
+        assert result.outcome == "error"
+        assert result.tool == "smt"
+        assert any("unknown" in e.lower() for e in result.errors)
+
+    def test_every_mapped_shim_exists_on_disk(self):
+        raptor_dir = Path(sweep_mod.__file__).resolve().parents[2]
+        for verb, shim_name in sweep_mod._SMT_VERBS.items():
+            shim = raptor_dir / "libexec" / shim_name
+            assert shim.is_file(), f"{verb} maps to missing shim {shim}"
+
+    def test_direct_only_verb_routes_to_helpful_error(self):
+        for verb in sweep_mod._SMT_DIRECT_ONLY_VERBS:
+            result = run_smt_sweep(
+                file_path="a.c",
+                function_name="foo",
+                verb=verb,
+                smt_args={},
+            )
+            assert result.outcome == "error"
+            assert any("run_smt_verb_direct" in e for e in result.errors)
+
+    def test_every_verb_has_a_role(self):
+        all_verbs = set(sweep_mod._SMT_VERBS) | sweep_mod._SMT_DIRECT_ONLY_VERBS
+        missing = all_verbs - set(sweep_mod._SMT_VERB_ROLES)
+        assert not missing, f"verbs without a role entry: {sorted(missing)}"
+
+    def test_sanitiser_unavailable_fails_closed(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """When core.config (the env allowlist sanitiser) cannot be
+        imported, the shim must not be spawned at all — a pass-through
+        of os.environ minus a short blocklist is not a safe
+        environment."""
+        import sys as _sys
+
+        shim_dir = tmp_path / "libexec"
+        shim_dir.mkdir()
+        marker = tmp_path / "spawned"
+        shim = shim_dir / "raptor-smt-check-overflow"
+        shim.write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text('ran')\n"
+            "print('{\"result\": \"sat\"}')\n",
+        )
+        monkeypatch.setattr(sweep_mod, "_SMT_SHIM_DIR", shim_dir)
+        monkeypatch.setitem(_sys.modules, "core.config", None)
+
+        result = run_smt_sweep(
+            file_path="a.c",
+            function_name="foo",
+            verb="check-overflow",
+            smt_args={"var": "len", "type": "int32", "op": "len*4",
+                      "bound": "4294967295"},
+        )
+        assert result.outcome == "error"
+        assert any("unsanitised environment" in e for e in result.errors)
+        assert not marker.exists()
+
+    def test_valid_verb_runs(self):
+        result = run_smt_sweep(
+            file_path="a.c",
+            function_name="foo",
+            verb="check-overflow",
+            smt_args={"var": "len", "type": "int32", "op": "len*4",
+                       "bound": "4294967295"},
+        )
+        # Either succeeds (sat/unsat) or errors (z3 not installed)
+        assert result.tool == "smt"
+        assert result.rule_id == "smt:check-overflow:supplied-model"
+        assert result.outcome in ("confirmed", "refuted", "error", "inconclusive")
+
+    def test_sweep_result_log_entry(self):
+        result = run_smt_sweep(
+            file_path="a.c",
+            function_name="foo",
+            verb="check-overflow",
+            smt_args={},
+        )
+        entry = result.to_log_entry()
+        assert entry["tool"] == "smt"
+        assert entry["key"] == "a.c:foo"
+
+
+class TestRunCodeqlSweep:
+    def test_missing_query_file(self, tmp_path: Path):
+        result = run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="foo",
+            query_path="/nonexistent/query.ql",
+        )
+        assert result.outcome == "error"
+        assert result.tool == "codeql"
+        assert any("not found" in e for e in result.errors)
+
+    def test_no_database(self, tmp_path: Path):
+        query = tmp_path / "test.ql"
+        query.write_text("select 1")
+
+        result = run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="foo",
+            query_path=str(query),
+        )
+        assert result.outcome == "error"
+        assert result.tool == "codeql"
+
+    def test_planted_target_tree_db_is_not_discovered(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A codeql-db directory committed inside the scanned target
+        must never be auto-discovered: a repo-committed database has
+        untrusted provenance — a hostile tree can plant a crafted or
+        empty DB that steers sweep verdicts. No database_path means
+        an error outcome, never an in-target fallback."""
+        query = self._setup(tmp_path)  # creates tmp_path/codeql-db
+        calls: list = []
+        import core.dataflow.codeql_augmented_run as car
+
+        def fake(db_path, queries, output_path, **kw):
+            calls.append(db_path)
+            raise AssertionError(
+                "planted in-target DB must not be analysed"
+            )
+
+        monkeypatch.setattr(car, "analyze", fake)
+        result = run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="foo",
+            query_path=str(query),
+        )
+        assert result.outcome == "error"
+        assert any("database" in e.lower() for e in result.errors)
+        assert calls == []
+
+    @staticmethod
+    def _fake_analyze(results):
+        """Stand-in for codeql_augmented_run.analyze with its real
+        signature: (db_path, queries, output_path, *, ...) -> AnalysisResult.
+        Writes a minimal SARIF file exactly like the real function."""
+        import json
+        from types import SimpleNamespace
+
+        def fake(db_path, queries, output_path, *, extension_pack=None,
+                 codeql_bin="codeql", timeout_seconds=0, runner=None,
+                 extra_args=()):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps({"runs": [{"results": results}]}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                sarif_path=output_path,
+                queries=tuple(queries),
+                extension_pack=extension_pack,
+                elapsed_seconds=0.0,
+            )
+
+        return fake
+
+    @staticmethod
+    def _sarif_result(uri: str, line: int) -> dict:
+        return {
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": uri},
+                    "region": {"startLine": line},
+                }
+            }]
+        }
+
+    def _setup(self, tmp_path: Path, extracted: tuple[str, ...] = ("src/a.c",)):
+        import zipfile
+
+        db = tmp_path / "codeql-db"
+        db.mkdir()
+        # Source archive: a refutation-grade no-match needs the target
+        # extraction-witnessed; an unextracted file caps inconclusive.
+        with zipfile.ZipFile(db / "src.zip", "w") as zf:
+            for name in extracted:
+                zf.writestr(name, "int x;\n")
+        query = tmp_path / "test.ql"
+        query.write_text("select 1")
+        return query
+
+    @staticmethod
+    def _db(tmp_path: Path) -> str:
+        return str(tmp_path / "codeql-db")
+
+    def test_match_in_function_confirmed(self, tmp_path: Path, monkeypatch):
+        query = self._setup(tmp_path)
+        import core.dataflow.codeql_augmented_run as car
+        monkeypatch.setattr(
+            car, "analyze",
+            self._fake_analyze([self._sarif_result("src/a.c", 12)]),
+        )
+        result = run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="foo",
+            query_path=str(query),
+            database_path=self._db(tmp_path),
+            line_start=10,
+            line_end=20,
+        )
+        assert result.outcome == "confirmed"
+        assert len(result.matches) == 1
+
+    def test_match_outside_function_refuted(self, tmp_path: Path, monkeypatch):
+        query = self._setup(tmp_path)
+        import core.dataflow.codeql_augmented_run as car
+        monkeypatch.setattr(
+            car, "analyze",
+            self._fake_analyze([self._sarif_result("src/a.c", 99)]),
+        )
+        result = run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="foo",
+            query_path=str(query),
+            database_path=self._db(tmp_path),
+            line_start=10,
+            line_end=20,
+        )
+        assert result.outcome == "refuted"
+        assert result.matches == []
+
+    def test_oversize_sarif_rejected_gracefully(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ):
+        """A SARIF artifact past the 100 MiB cap must degrade to an
+        error SweepResult via the size-gate refusal — not by reading
+        the file and failing to parse it."""
+        import logging
+        import os
+        from types import SimpleNamespace
+
+        query = self._setup(tmp_path)
+        import core.dataflow.codeql_augmented_run as car
+
+        def fake_oversize(db_path, queries, output_path, **kw):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Sparse file: st_size past the cap without writing 100 MiB
+            # of data — load_sarif's stat gate rejects before any read.
+            with output_path.open("wb") as fh:
+                os.truncate(fh.fileno(), 100 * 1024 * 1024 + 1)
+            return SimpleNamespace(
+                sarif_path=output_path,
+                queries=tuple(queries),
+                extension_pack=None,
+                elapsed_seconds=0.0,
+            )
+
+        monkeypatch.setattr(car, "analyze", fake_oversize)
+        with caplog.at_level(logging.ERROR, logger="raptor"):
+            result = run_codeql_sweep(
+                target_path=tmp_path,
+                file_path="a.c",
+                function_name="foo",
+                query_path=str(query),
+                database_path=self._db(tmp_path),
+            )
+        assert result.outcome == "error"
+        assert result.tool == "codeql"
+        assert any(
+            "oversize" in e or "unreadable" in e for e in result.errors
+        )
+        # The refusal must come from the size gate (stat-based
+        # rejection), not from a whole-file read that failed to parse.
+        assert "too large" in caplog.text
+
+    def test_analyze_failure_reported(self, tmp_path: Path, monkeypatch):
+        query = self._setup(tmp_path)
+        import core.dataflow.codeql_augmented_run as car
+
+        def boom(db_path, queries, output_path, **kw):
+            raise car.CodeQLRunError("codeql analyze exited 2")
+
+        monkeypatch.setattr(car, "analyze", boom)
+        result = run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="foo",
+            query_path=str(query),
+            database_path=self._db(tmp_path),
+        )
+        assert result.outcome == "error"
+        assert any("exited 2" in e for e in result.errors)
+
+
+class TestCodeqlExtractionWitness:
+    """A refutation-grade no-match needs a POSITIVE extraction
+    witness: buildless C/C++ extraction is partial by design and a
+    traced build only covers what the build command compiled — an
+    unextracted file yields zero rows for EVERY query,
+    indistinguishable from clean. The same scanned-witness rule the
+    semgrep leg enforces via files_examined. Composition with the
+    membership PRE-gate (which skips provably-absent files before
+    the analyze): the post-arm closes that gate's declared fail-open
+    price — an unreadable archive still dispatches (confirmations
+    land), but its zero rows cap at inconclusive, never refuted."""
+
+    def _run(self, tmp_path: Path, extracted: tuple[str, ...]):
+        import zipfile
+
+        db = tmp_path / "codeql-db"
+        db.mkdir()
+        if extracted is not None:
+            with zipfile.ZipFile(db / "src.zip", "w") as zf:
+                for name in extracted:
+                    zf.writestr(name, "int x;\n")
+        query = tmp_path / "test.ql"
+        query.write_text("select 1")
+
+        class MemoStub:
+            """Whole-DB results in which the target file never
+            appears — the shape an unextracted file produces."""
+
+            def get_or_compute(self, key, fn):
+                other = {
+                    "locations": [{"physicalLocation": {
+                        "artifactLocation": {"uri": "src/other.c"},
+                        "region": {"startLine": 10},
+                    }}],
+                }
+                return [other], True
+
+        return run_codeql_sweep(
+            target_path=tmp_path,
+            file_path="src/target.c",
+            function_name="parse_input",
+            query_path=str(query),
+            database_path=str(db),
+            line_start=1,
+            line_end=50,
+            memo=MemoStub(),
+        )
+
+    def test_unextracted_file_skips_at_the_membership_gate(
+        self, tmp_path: Path,
+    ):
+        # Provably absent from src.zip: the membership PRE-gate skips
+        # before any analyze — the stronger semantics (no vacuous
+        # dispatch, channel leaves tools_dispatched entirely), and
+        # strictly never refuted. The post-arm is the backstop for
+        # the archive-less case below.
+        result = self._run(tmp_path, extracted=("src/other.c",))
+        assert result.outcome == "skipped"
+        assert result.outcome != "refuted"
+
+    def test_no_source_archive_caps_at_inconclusive(self, tmp_path: Path):
+        result = self._run(tmp_path, extracted=None)
+        assert result.outcome == "inconclusive"
+        assert any("no readable source archive" in e for e in result.errors)
+
+    def test_extracted_file_still_refutes(self, tmp_path: Path):
+        result = self._run(
+            tmp_path, extracted=("home/user/proj/src/target.c",),
+        )
+        assert result.outcome == "refuted"
+
+    def test_cluster_member_database_still_witnesses(
+        self, tmp_path: Path,
+    ):
+        # A cluster MEMBER directory (what the router hands out) is a
+        # full database with its own root src.zip — the shared
+        # membership primitive serves it like any other db path.
+        import zipfile
+
+        from core.audit.codeql_dbs import db_contains_source
+
+        member = tmp_path / "cluster" / "cpp"
+        member.mkdir(parents=True)
+        with zipfile.ZipFile(member / "src.zip", "w") as zf:
+            zf.writestr("proj/src/target.c", "int x;\n")
+        assert db_contains_source(member, "src/target.c") is True
+        assert db_contains_source(member, "src/absent.c") is False
+
+
+class TestConsistencyCheck:
+    def test_invalid_function_name_rejected(self, tmp_path: Path):
+        """Function names with injection characters are rejected."""
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="foo; rm -rf /",
+            cocci_rule="check.cocci",
+        )
+        assert result.outcome == "error"
+        assert "invalid function name" in result.errors[0]
+
+    def test_empty_function_name_rejected(self, tmp_path: Path):
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="",
+            cocci_rule="check.cocci",
+        )
+        assert result.outcome == "error"
+
+    def test_coccinelle_unavailable(self, monkeypatch, tmp_path: Path):
+        """When coccinelle package is not importable, returns error."""
+        import sys
+
+        monkeypatch.delitem(
+            sys.modules, "packages.coccinelle.runner", raising=False,
+        )
+        monkeypatch.setitem(
+            sys.modules, "packages.coccinelle.runner", None,
+        )
+
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="malloc",
+            cocci_rule="check_return.cocci",
+        )
+        assert result.outcome == "error"
+        assert result.tool == "coccinelle_consistency"
+
+    def test_no_findings_means_refuted(self, monkeypatch, tmp_path: Path):
+        """When coccinelle finds no inconsistencies, outcome is refuted."""
+        import sys
+        import types
+
+        class FakeResult:
+            matches: ClassVar[list] = []
+
+        def fake_run_rule(target, rule, *, defines=None, timeout=300,
+                          allow_scripting=False):
+            return FakeResult()
+
+        def fake_is_available():
+            return True
+
+        fake_mod = types.ModuleType("packages.coccinelle.runner")
+        fake_mod.run_rule = fake_run_rule
+        fake_mod.is_available = fake_is_available
+        monkeypatch.setitem(sys.modules, "packages.coccinelle.runner", fake_mod)
+
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="parse_input",
+            cocci_rule="check_return.cocci",
+        )
+        assert result.outcome == "refuted"
+        assert result.matches == []
+
+    def test_findings_means_confirmed(self, monkeypatch, tmp_path: Path):
+        """When coccinelle finds inconsistencies, outcome is confirmed."""
+        import sys
+        import types
+
+        class FakeResult:
+            matches: ClassVar[list] = [{"file": "src/a.c", "line": 10}]
+
+        def fake_run_rule(target, rule, *, defines=None, timeout=300,
+                          allow_scripting=False):
+            return FakeResult()
+
+        def fake_is_available():
+            return True
+
+        fake_mod = types.ModuleType("packages.coccinelle.runner")
+        fake_mod.run_rule = fake_run_rule
+        fake_mod.is_available = fake_is_available
+        monkeypatch.setitem(sys.modules, "packages.coccinelle.runner", fake_mod)
+
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="malloc",
+            cocci_rule="check_return.cocci",
+        )
+        assert result.outcome == "confirmed"
+        assert len(result.matches) == 1
+
+    def test_passes_function_name_as_define(self, monkeypatch, tmp_path: Path):
+        """Verifies function_name is passed as -D func=<name>."""
+        import sys
+        import types
+
+        captured_defines = {}
+
+        class FakeResult:
+            matches: ClassVar[list] = []
+
+        def fake_run_rule(target, rule, *, defines=None, timeout=300,
+                          allow_scripting=False):
+            captured_defines.update(defines or {})
+            return FakeResult()
+
+        def fake_is_available():
+            return True
+
+        fake_mod = types.ModuleType("packages.coccinelle.runner")
+        fake_mod.run_rule = fake_run_rule
+        fake_mod.is_available = fake_is_available
+        monkeypatch.setitem(sys.modules, "packages.coccinelle.runner", fake_mod)
+
+        run_consistency_check(
+            target_path=tmp_path,
+            function_name="process_buf",
+            cocci_rule="unchecked.cocci",
+        )
+        assert captured_defines.get("func") == "process_buf"
+
+
+class TestCoccinelleErrorSemantics:
+    """spatch failures and timeouts must record ``error``, never
+    ``refuted`` — a rule that never ran says nothing about the code
+    (same policy as the per-hypothesis semgrep path and cocci_flow)."""
+
+    @staticmethod
+    def _install_runner(monkeypatch, result):
+        import sys
+        import types
+
+        def fake_run_rule(*args, **kwargs):
+            return result
+
+        fake_mod = types.ModuleType("packages.coccinelle.runner")
+        fake_mod.run_rule = fake_run_rule
+        fake_mod.is_available = lambda: True
+        monkeypatch.setitem(
+            sys.modules, "packages.coccinelle.runner", fake_mod,
+        )
+
+    @staticmethod
+    def _spatch_result(**kwargs):
+        from packages.coccinelle.models import SpatchResult
+        return SpatchResult(rule="r", **kwargs)
+
+    def test_sweep_timeout_is_error_not_refuted(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from core.audit.sweep import run_coccinelle_sweep
+
+        (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+        self._install_runner(monkeypatch, self._spatch_result(
+            returncode=-1, errors=["spatch timed out after 120s"],
+        ))
+        result = run_coccinelle_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="f",
+            cocci_rule="check.cocci",
+        )
+        assert result.outcome == "error"
+        assert result.errors == ["spatch timed out after 120s"]
+
+    def test_sweep_nonzero_exit_without_errors_is_error(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from core.audit.sweep import run_coccinelle_sweep
+
+        (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+        self._install_runner(
+            monkeypatch, self._spatch_result(returncode=2),
+        )
+        result = run_coccinelle_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="f",
+            cocci_rule="check.cocci",
+        )
+        assert result.outcome == "error"
+        assert any("exited with code 2" in e for e in result.errors)
+
+    def test_sweep_clean_no_match_still_refuted(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from core.audit.sweep import run_coccinelle_sweep
+
+        (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+        self._install_runner(
+            monkeypatch, self._spatch_result(returncode=0),
+        )
+        result = run_coccinelle_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="f",
+            cocci_rule="check.cocci",
+        )
+        assert result.outcome == "refuted"
+
+    def test_consistency_timeout_is_error_not_refuted(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        self._install_runner(monkeypatch, self._spatch_result(
+            returncode=-1, errors=["spatch timed out after 300s"],
+        ))
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="parse_input",
+            cocci_rule="check_return.cocci",
+        )
+        assert result.outcome == "error"
+        assert result.errors == ["spatch timed out after 300s"]
+
+    def test_consistency_nonzero_exit_is_error(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        self._install_runner(
+            monkeypatch, self._spatch_result(returncode=127),
+        )
+        result = run_consistency_check(
+            target_path=tmp_path,
+            function_name="parse_input",
+            cocci_rule="check_return.cocci",
+        )
+        assert result.outcome == "error"
+        assert any("exited with code 127" in e for e in result.errors)
+
+
+class TestSarifCache:
+    def _write_sarif(self, scan_dir: Path, name: str, results: list):
+        import json
+        sarif = {
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {"driver": {"name": "test"}},
+                "results": results,
+            }],
+        }
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        (scan_dir / name).write_text(json.dumps(sarif))
+
+    def _make_result(self, uri: str, line: int, rule_id: str = "test-rule"):
+        return {
+            "ruleId": rule_id,
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": uri},
+                    "region": {"startLine": line},
+                },
+            }],
+        }
+
+    def test_empty_directory(self, tmp_path: Path):
+        cache = SarifCache.from_directory(tmp_path)
+        assert cache.lookup("handler.c") is None
+        assert cache.miss_count == 1
+
+    def test_loads_results_by_path(self, tmp_path: Path):
+        self._write_sarif(tmp_path / "scan", "combined.sarif", [
+            self._make_result("src/handler.c", 42),
+            self._make_result("src/handler.c", 99),
+            self._make_result("src/util.c", 10),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+        hits = cache.lookup("src/handler.c")
+        assert hits is not None
+        assert len(hits) == 2
+
+    def test_lookup_filters_by_line_range(self, tmp_path: Path):
+        self._write_sarif(tmp_path / "scan", "combined.sarif", [
+            self._make_result("src/handler.c", 42),
+            self._make_result("src/handler.c", 99),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+        hits = cache.lookup("src/handler.c", line_start=40, line_end=50)
+        assert len(hits) == 1
+        assert hits[0]["locations"][0]["physicalLocation"]["region"]["startLine"] == 42
+
+    def test_file_scanned_but_no_hits_returns_empty(self, tmp_path: Path):
+        self._write_sarif(tmp_path / "scan", "combined.sarif", [
+            self._make_result("src/handler.c", 42),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+        hits = cache.lookup("src/handler.c", line_start=200, line_end=300)
+        assert hits == []
+        assert cache.hit_count == 1
+
+    def test_lookup_returns_copies_not_live_cache_state(
+        self, tmp_path: Path,
+    ):
+        """lookup hands out deep copies: many hypotheses share one
+        ingested result set, so a consumer mutating its matches must
+        not corrupt every other hypothesis's view."""
+        self._write_sarif(tmp_path / "scan", "combined.sarif", [
+            self._make_result("src/handler.c", 42),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+
+        # Unranged branch: mutate the returned list and dict.
+        hits = cache.lookup("src/handler.c")
+        hits[0]["ruleId"] = "corrupted"
+        hits.append({"ruleId": "planted"})
+        again = cache.lookup("src/handler.c")
+        assert len(again) == 1
+        assert again[0]["ruleId"] == "test-rule"
+
+        # Ranged branch: shared dicts must be copies too.
+        ranged = cache.lookup("src/handler.c", line_start=40, line_end=50)
+        ranged[0]["locations"][0]["physicalLocation"]["region"][
+            "startLine"] = 9999
+        again = cache.lookup("src/handler.c", line_start=40, line_end=50)
+        assert len(again) == 1
+
+    def test_unknown_file_returns_none(self, tmp_path: Path):
+        self._write_sarif(tmp_path / "scan", "combined.sarif", [
+            self._make_result("src/handler.c", 42),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+        assert cache.lookup("unknown.c") is None
+        assert cache.miss_count == 1
+
+    def test_multiple_sarif_files_merged(self, tmp_path: Path):
+        self._write_sarif(tmp_path / "scan", "semgrep.sarif", [
+            self._make_result("src/handler.c", 42, "semgrep-rule"),
+        ])
+        self._write_sarif(tmp_path / "scan", "cocci.sarif", [
+            self._make_result("src/handler.c", 55, "cocci-rule"),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+        hits = cache.lookup("src/handler.c")
+        assert len(hits) == 2
+
+    def test_no_scan_directory(self, tmp_path: Path):
+        cache = SarifCache.from_directory(tmp_path)
+        assert cache.lookup("anything.c") is None
+
+    def test_empty_cache_is_falsy(self, tmp_path: Path):
+        cache = SarifCache.from_directory(tmp_path)
+        assert not cache
+        assert len(cache) == 0
+
+    def test_populated_cache_is_truthy(self, tmp_path: Path):
+        self._write_sarif(tmp_path / "scan", "combined.sarif", [
+            self._make_result("src/handler.c", 42),
+        ])
+        cache = SarifCache.from_directory(tmp_path)
+        assert cache
+        assert len(cache) == 1
+
+
+# ── Overflow-to-OOB operand extraction ──────────────────────────────
+
+
+class TestExtractOverflowToOobOperands:
+    def test_backtick_ids_preferred(self):
+        from core.audit.sweep import _extract_overflow_to_oob_operands
+        h = "The `total_records` value multiplied by `elem_size` overflows and `write_pos` indexes past the buffer"
+        count, elem, index = _extract_overflow_to_oob_operands(h, "")
+        assert count == "total_records"
+        assert elem == "elem_size"
+        assert index == "write_pos"
+
+    def test_stop_words_not_matched(self):
+        from core.audit.sweep import _extract_overflow_to_oob_operands
+        h = "The loop writes buf[write_pos] where write_pos derives from total_records and elem_size without an overflow check"
+        count, _elem, index = _extract_overflow_to_oob_operands(h, "")
+        assert count != "and"
+        assert index != "writes"
+        if count is not None:
+            assert count.lower() not in {"and", "the", "from", "writes"}
+        if index is not None:
+            assert index.lower() not in {"and", "the", "from", "writes"}
+
+    def test_compound_identifier_matched(self):
+        from core.audit.sweep import _extract_overflow_to_oob_operands
+        h = "num_entries multiplied by stride_size can overflow, index_val used as array offset"
+        count, elem, index = _extract_overflow_to_oob_operands(h, "")
+        assert count == "num_entries"
+        assert elem == "stride_size"
+        assert index == "index_val"
+
+    def test_fallback_to_source_for_count(self):
+        from core.audit.sweep import _extract_overflow_to_oob_operands
+        h = "the multiplication overflows and buf_offset indexes past the buffer"
+        src = "int nelem = get_count();"
+        count, _elem, _index = _extract_overflow_to_oob_operands(h, src)
+        assert count == "nelem"
+
+    def test_missing_elem_size_stays_unknown(self):
+        from core.audit.sweep import _extract_overflow_to_oob_operands
+        h = "num_items multiplied by something overflows, write_offset used as index"
+        _count, elem, _index = _extract_overflow_to_oob_operands(h, "")
+        assert elem is None
+
+
+# ── Joern sweep ─────────────────────────────────────────────────────
+
+
+class TestRunJoernSweep:
+    def test_path_traversal_blocked(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_sweep
+
+        result = run_joern_sweep(
+            target_path=tmp_path,
+            file_path="../../etc/passwd",
+            function_name="foo",
+            source_param="x",
+            sink_call="memcpy",
+        )
+        assert result.outcome == "error"
+        assert any("escapes" in e for e in result.errors)
+
+    def test_invalid_function_name(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_sweep
+
+        result = run_joern_sweep(
+            target_path=tmp_path,
+            file_path="src/a.c",
+            function_name="foo; rm -rf /",
+            source_param="x",
+            sink_call="memcpy",
+        )
+        assert result.outcome == "error"
+        assert "invalid function name" in result.errors[0]
+
+    def test_invalid_source_param(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_sweep
+
+        result = run_joern_sweep(
+            target_path=tmp_path,
+            file_path="src/a.c",
+            function_name="foo",
+            source_param='"); evil("',
+            sink_call="memcpy",
+        )
+        assert result.outcome == "error"
+        assert "invalid source_param" in result.errors[0]
+
+    def test_invalid_sink_call(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_sweep
+
+        result = run_joern_sweep(
+            target_path=tmp_path,
+            file_path="src/a.c",
+            function_name="foo",
+            source_param="x",
+            sink_call="a b c",
+        )
+        assert result.outcome == "error"
+        assert "invalid sink_call" in result.errors[0]
+
+    def test_no_cpg_errors(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_sweep
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "a.c").write_text("int f() {}")
+
+        result = run_joern_sweep(
+            target_path=tmp_path,
+            file_path="src/a.c",
+            function_name="foo",
+            source_param="x",
+            sink_call="memcpy",
+            cpg=None,
+        )
+        assert result.outcome == "error"
+        assert "no CPG" in result.errors[0]
+
+    def test_qualified_sink_accepted(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_sweep
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "a.c").write_text("int f() {}")
+
+        result = run_joern_sweep(
+            target_path=tmp_path,
+            file_path="src/a.c",
+            function_name="foo",
+            source_param="x",
+            sink_call="os.system",
+            cpg=None,
+        )
+        assert result.outcome == "error"
+        assert "no CPG" in result.errors[0]
+
+
+class TestRunJoernPreSweep:
+    def test_unavailable_returns_empty(self, monkeypatch, tmp_path: Path):
+        from core.audit.sweep import run_joern_pre_sweep
+
+        try:
+            from packages.joern import prereqs
+            monkeypatch.setattr(prereqs, "is_available", lambda: False)
+        except ImportError:
+            pass
+
+        result = run_joern_pre_sweep(tmp_path, {})
+        assert result == {}
+
+    def test_non_directory_returns_empty(self, tmp_path: Path):
+        from core.audit.sweep import run_joern_pre_sweep
+
+        f = tmp_path / "file.c"
+        f.write_text("int main() {}")
+        result = run_joern_pre_sweep(f, {})
+        assert result == {}
+
+    def test_build_pins_frontend_from_detected_language(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        """The local CPG build must pass the curated per-profile
+        joern-parse frontend for the detected dominant language."""
+        from core.audit.sweep import run_joern_pre_sweep
+
+        (tmp_path / "main.c").write_text("int main() { return 0; }")
+
+        from packages.joern import prereqs, runner
+        monkeypatch.setattr(prereqs, "is_available", lambda: True)
+
+        captured: dict = {}
+
+        def fake_build_cpg(target, **kwargs):
+            captured.update(kwargs)
+            from packages.joern.models import JoernCPG
+            return JoernCPG(
+                path=tmp_path / "nonexistent-cpg.bin", target=target,
+            )
+
+        monkeypatch.setattr(runner, "build_cpg", fake_build_cpg)
+
+        result = run_joern_pre_sweep(tmp_path, {})
+        assert result == {}  # fake CPG doesn't exist → empty
+        assert captured.get("languages") == {"c"}
+
+    def _run_with_query_result(self, monkeypatch, tmp_path, joern_result):
+        """Non-server pre-sweep with the taint query stubbed."""
+        from core.audit.sweep import run_joern_pre_sweep
+        from packages.joern import prereqs, runner
+        from packages.joern.models import JoernCPG
+
+        (tmp_path / "main.c").write_text("int main() { return 0; }")
+        cpg_path = tmp_path / "cpg.bin"
+        cpg_path.write_bytes(b"")
+
+        monkeypatch.setattr(prereqs, "is_available", lambda: True)
+        monkeypatch.setattr(
+            runner, "build_cpg",
+            lambda target, **kw: JoernCPG(path=cpg_path, target=target),
+        )
+        monkeypatch.setattr(
+            runner, "run_query", lambda *a, **kw: joern_result,
+        )
+        monkeypatch.setattr(runner, "cleanup_cpg", lambda cpg: None)
+
+        status: dict = {}
+        flows = run_joern_pre_sweep(tmp_path, {}, status_out=status)
+        return flows, status
+
+    def test_errored_query_is_not_completed(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        """An errored taint query returning zero flows must not mark
+        the sweep completed: 'no flows' from a degraded run means
+        'not swept', never 'not tainted' (and must stay uncacheable)."""
+        from packages.joern.models import JoernResult
+
+        flows, status = self._run_with_query_result(
+            monkeypatch, tmp_path, JoernResult(
+                query="q", flows=[],
+                errors=["query timed out after 300s"],
+            ),
+        )
+        assert flows == {}
+        assert status.get("completed") is False
+        assert status.get("errors")
+        assert status.get("errors_fatal") is True
+
+    def test_clean_query_is_completed(self, monkeypatch, tmp_path: Path):
+        """Guard for the other direction: a clean query with zero
+        flows is a genuinely empty (cacheable) sweep."""
+        from packages.joern.models import JoernResult
+
+        flows, status = self._run_with_query_result(
+            monkeypatch, tmp_path, JoernResult(
+                query="q", flows=[], errors=[],
+            ),
+        )
+        assert flows == {}
+        assert status.get("completed") is True
+        assert "errors_fatal" not in status
+
+
+class TestMechanicalCheckToSemgrep:
+    def test_unchecked_return_maps(self):
+        result = mechanical_check_to_semgrep("unchecked return value")
+        assert result is not None
+        assert "$FUNC" in result
+
+    def test_missing_null_check_maps(self):
+        result = mechanical_check_to_semgrep("missing null check on ptr")
+        assert result is not None
+        assert "null" in result.lower() or "$FUNC" in result
+
+    def test_missing_bounds_check_maps(self):
+        result = mechanical_check_to_semgrep("missing bounds check on index")
+        assert result is not None
+        assert "$BUF" in result or "$IDX" in result
+
+    def test_format_string_maps(self):
+        result = mechanical_check_to_semgrep("format string from user")
+        assert result is not None
+        assert "printf" in result
+
+    def test_unknown_check_returns_none(self):
+        result = mechanical_check_to_semgrep("completely unknown check")
+        assert result is None
+
+    def test_case_insensitive(self):
+        result = mechanical_check_to_semgrep("UNCHECKED RETURN value")
+        assert result is not None
+
+    def test_empty_string_returns_none(self):
+        result = mechanical_check_to_semgrep("")
+        assert result is None
+
+
+# ── _promote_clean_refuted ──────────────────────────────────────────────
+
+
+class TestPromoteCleanRefuted:
+
+
+    """Tests for _promote_clean_refuted — SMT-only promotion of clean
+    outcomes where the LLM generated then refuted an arithmetic hypothesis."""
+
+    def _outcome(self, file, function, status="clean", hypotheses=None, line=0):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file=file, function=function, status=status,
+            body="", hypothesis="", line=line,
+        )
+        o.hypotheses = hypotheses or []
+        o.review_result = {"hypotheses": hypotheses or []}
+        return o
+
+    def _result(self, outcomes):
+        from core.audit.orchestrator import OrchestratorResult
+        r = OrchestratorResult()
+        r.outcomes = list(outcomes)
+        r.clean = sum(1 for o in outcomes if o.status == "clean")
+        r.findings = sum(1 for o in outcomes if o.status == "finding")
+        r.suspicious = sum(1 for o in outcomes if o.status == "suspicious")
+        r.sweep_promoted = 0
+        return r
+
+    def _config(self, tmp_path, caller_gate=False):
+        # caller_gate defaults off here: this class's subject is the
+        # SMT-confirm promotion mechanics; the caller-side gate has
+        # its own suite (test_smt_caller_gate.py).
+        from core.audit.orchestrator import OrchestratorConfig
+        src = tmp_path / "src.c"
+        src.write_text("int f(int x) { return x + 1; }\n")
+        out = tmp_path / "out"
+        out.mkdir(exist_ok=True)
+        return OrchestratorConfig(
+            target_path=tmp_path, out_dir=out,
+            smt_promotion_caller_gate=caller_gate,
+        )
+
+    def test_skips_non_clean(self, tmp_path):
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", status="suspicious", hypotheses=[
+            {"mechanism": "integer overflow", "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_skips_no_refuted_hypotheses(self, tmp_path):
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": "null deref", "confidence": "confirmed"},
+        ])
+        result = self._result([outcome])
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "clean"
+
+    def test_skips_non_smt_hypotheses(self, tmp_path):
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": "TOCTOU race condition", "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "clean"
+
+    @pytest.mark.parametrize("verb,promotes", [("check-overflow", True), ("check-lock-discipline", False)])
+    def test_promotes_only_with_verification_receipt(self, tmp_path, monkeypatch, verb, promotes):
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": "integer overflow in size" if promotes else "lock not released on error",
+             "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_smt_verb",
+            lambda h: verb,
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: [f"smt:{verb}"],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "int f(int count) { return count; }",
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == ("finding" if promotes else "clean")
+        if promotes:
+            assert f"clean-refuted:smt:{verb}" in result.outcomes[0].evidence_tool
+        assert result.sweep_promoted == int(promotes)
+        assert result.clean == int(not promotes)
+        assert result.findings == int(promotes)
+
+    def test_no_promote_when_smt_refutes(self, tmp_path, monkeypatch):
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": "integer overflow in size calc", "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: [],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "int f(int x) { return x + 1; }",
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "clean"
+        assert result.sweep_promoted == 0
+
+    def test_blocked_by_guarded_sink(self, tmp_path, monkeypatch):
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": "resource leak on error", "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_smt_verb",
+            lambda h: "check-resource-leak",
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: ["smt:check-resource-leak"],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "void f() { p = kmalloc(16); }",
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._check_sink_guarded_cached",
+            lambda fn, js: "guarded",
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "clean"
+
+    def test_only_first_matching_hypothesis_checked(self, tmp_path, monkeypatch):
+        """If the first SMT-eligible refuted hypothesis confirms, stop."""
+        from core.audit.orchestrator import _promote_clean_refuted
+        calls = []
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": "integer overflow in size", "confidence": "refuted"},
+            {"mechanism": "integer overflow in offset", "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_smt_verb",
+            lambda h: "check-overflow",
+        )
+
+        def mock_chain(*a, **kw):
+            calls.append(kw.get("hypothesis", ""))
+            return ["smt:check-overflow"]
+
+        monkeypatch.setattr("core.audit.orchestrator._run_tool_chain", mock_chain)
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "int f(int count) { return count; }",
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "finding"
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("mechanism,verb,smt_lane_runs", [
+        # Verification-role vacuous verbs now REACH the tool chain —
+        # the vacuity policy lives in the sweep layer, which returns
+        # inconclusive (never confirmed) without guard premises, so
+        # the chain reports no confirmation and clean stands.
+        ("integer overflow in size calc", "check-overflow", True),
+        # Inferred bounds models are diagnostic even with guards. Their
+        # dedicated promotion lane is skipped; the cheap lane still runs.
+        ("buffer overflow in memcpy", "check-oob", False),
+        ("integer overflow leading to heap", "check-overflow-to-oob", False),
+    ])
+    def test_vacuous_verbs_cannot_promote(
+        self, tmp_path, monkeypatch, mechanism, verb, smt_lane_runs,
+    ):
+        """Guardless overflow/OOB SAT must not override LLM clean."""
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome("a.c", "f", hypotheses=[
+            {"mechanism": mechanism, "confidence": "refuted"},
+        ])
+        result = self._result([outcome])
+        calls = []
+
+        def chain(*a, **kw):
+            calls.append(kw.get("hypothesis", ""))
+            # Sweep-layer vacuity policy: SAT without premises comes
+            # back "inconclusive" → no confirmations from the chain.
+            return []
+
+        monkeypatch.setattr("core.audit.orchestrator._run_tool_chain", chain)
+        # Deterministic cheap-channel lane: one semgrep entry.
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_tool_chain",
+            lambda *a, **kw: [
+                {"type": "semgrep", "config": {"rule": "r.yaml"}},
+            ],
+        )
+        # Pin the SMT-verb source to the hypothesis-string mapping so
+        # the CWE-inference fallback can't supply a different verb.
+        monkeypatch.setattr(
+            "core.audit.cwe_dispatch.smt_verb_for_cwe", lambda c: None,
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "int f(int x) { return x + 1; }",
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "clean"
+        assert result.sweep_promoted == 0
+        # SMT lane (verification-role verbs only) plus the
+        # cheap-channel lane; the vacuity policy holds in both.
+        assert len(calls) == (2 if smt_lane_runs else 1)
+
+
+class TestRefutedHypothesisDispatch:
+    """Self-refuted hypotheses with concrete mechanisms still get
+    mechanical verification through cheap channels (bounded per
+    function), and a tool confirmation surfaces distinctly as a
+    clean → suspicious promotion with the tool receipt."""
+
+    def _outcome(self, hypotheses, line=0):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="a.c", function="f", status="clean",
+            body="prior body", hypothesis="", line=line,
+        )
+        o.hypotheses = hypotheses
+        o.review_result = {"hypotheses": hypotheses}
+        return o
+
+    def _result(self, outcomes):
+        from core.audit.orchestrator import OrchestratorResult
+        r = OrchestratorResult()
+        r.outcomes = list(outcomes)
+        r.clean = sum(1 for o in outcomes if o.status == "clean")
+        return r
+
+    def _config(self, tmp_path):
+        from core.audit.orchestrator import OrchestratorConfig
+        out = tmp_path / "out"
+        out.mkdir(exist_ok=True)
+        return OrchestratorConfig(target_path=tmp_path, out_dir=out)
+
+    def _no_smt(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_smt_verb",
+            lambda h: None,
+        )
+        # The CWE-inference fallback can also supply an SMT verb for
+        # mechanisms that keyword-map to a CWE — pin it off so these
+        # tests exercise the cheap-channel lane deterministically.
+        monkeypatch.setattr(
+            "core.audit.cwe_dispatch.smt_verb_for_cwe", lambda c: None,
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "int f(int x) { return x + 1; }",
+        )
+
+    def test_cheap_channel_confirmation_promotes_to_suspicious(
+        self, tmp_path, monkeypatch,
+    ):
+        """Refuted hypothesis + no SMT verb → cheap chain dispatch;
+        confirmation promotes clean → suspicious with the receipt."""
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome([{
+            "mechanism": "missing bounds check before memcpy(dst, src, len)",
+            "confidence": "refuted",
+            "counter": "",
+        }])
+        result = self._result([outcome])
+        self._no_smt(monkeypatch)
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_tool_chain",
+            lambda *a, **kw: [
+                {"type": "semgrep", "config": {"rule": "r.yaml"}},
+            ],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: ["semgrep:audit_sweep_x"],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._check_sink_guarded_cached",
+            lambda fn, js: "unguarded",
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        rescued = result.outcomes[0]
+        assert rescued.status == "suspicious"
+        assert rescued.evidence_tool == "semgrep:audit_sweep_x"
+        assert rescued.body.startswith("[refuted-hypothesis-confirmed")
+        assert rescued.review_result["refuted_hypothesis_confirmed"] is True
+        assert result.refuted_rescued == 1
+        assert result.clean == 0
+        assert result.suspicious == 1
+        assert result.tier_counters["refuted_sweep"].confirmed == 1
+
+    def test_high_confidence_refutation_skips_expensive_channels(
+        self, tmp_path, monkeypatch,
+    ):
+        """A substantive counter-argument demotes to cheap channels only:
+        Joern/CodeQL entries are stripped from the dispatched chain."""
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome([{
+            "mechanism": "tainted index reaches array write in parse_hdr()",
+            "confidence": "refuted",
+            "counter": (
+                "the caller validates idx against table_size on every "
+                "path before this function is reached"
+            ),
+        }])
+        result = self._result([outcome])
+        self._no_smt(monkeypatch)
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_tool_chain",
+            lambda *a, **kw: [
+                {"type": "semgrep", "config": {"rule": "r.yaml"}},
+                {"type": "joern", "config": {"sinks": ["memcpy"]}},
+                {"type": "codeql", "config": {"query": "q"}},
+                {"type": "coccinelle", "config": {"rule": "r.cocci"}},
+            ],
+        )
+        dispatched = []
+
+        def chain(chain_arg, **kw):
+            dispatched.extend(e["type"] for e in chain_arg)
+            return []
+
+        monkeypatch.setattr("core.audit.orchestrator._run_tool_chain", chain)
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert dispatched == ["semgrep", "coccinelle"]
+        assert result.outcomes[0].status == "clean"
+
+    def test_weak_refutation_keeps_full_chain(self, tmp_path, monkeypatch):
+        """No counter-argument → weak retraction → full chain allowed."""
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome([{
+            "mechanism": "tainted index reaches array write in parse_hdr()",
+            "confidence": "refuted",
+            "counter": "",
+        }])
+        result = self._result([outcome])
+        self._no_smt(monkeypatch)
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_tool_chain",
+            lambda *a, **kw: [
+                {"type": "semgrep", "config": {"rule": "r.yaml"}},
+                {"type": "joern", "config": {"sinks": ["memcpy"]}},
+                {"type": "codeql", "config": {"query": "q"}},
+            ],
+        )
+        dispatched = []
+
+        def chain(chain_arg, **kw):
+            dispatched.extend(e["type"] for e in chain_arg)
+            return []
+
+        monkeypatch.setattr("core.audit.orchestrator._run_tool_chain", chain)
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert dispatched == ["semgrep", "joern", "codeql"]
+
+    def test_dispatch_cap_and_specificity_ranking(self, tmp_path, monkeypatch):
+        """At most _MAX_REFUTED_DISPATCHES_PER_FN hypotheses dispatch,
+        picked by mechanism specificity (most concrete first)."""
+        from core.audit.orchestrator import (
+            _MAX_REFUTED_DISPATCHES_PER_FN,
+            _promote_clean_refuted,
+        )
+        hyps = [
+            {"mechanism": "bad", "confidence": "refuted", "counter": ""},
+            {"mechanism": "maybe wrong somewhere", "confidence": "refuted",
+             "counter": ""},
+            {"mechanism": (
+                "integer overflow in alloc_size = count * elem_size at "
+                "line 142 feeding kmalloc()"
+            ), "confidence": "refuted", "counter": ""},
+            {"mechanism": (
+                "use-after-free of ctx->buf when process_packet() frees "
+                "it on the error path (CWE-416)"
+            ), "confidence": "refuted", "counter": ""},
+            {"mechanism": (
+                "missing null_check() on ret of parse_config() before "
+                "deref at line 88"
+            ), "confidence": "refuted", "counter": ""},
+        ]
+        outcome = self._outcome(hyps)
+        result = self._result([outcome])
+        self._no_smt(monkeypatch)
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_tool_chain",
+            lambda *a, **kw: [
+                {"type": "semgrep", "config": {"rule": "r.yaml"}},
+            ],
+        )
+        seen = []
+
+        def chain(chain_arg, **kw):
+            seen.append(kw.get("hypothesis", ""))
+            return []
+
+        monkeypatch.setattr("core.audit.orchestrator._run_tool_chain", chain)
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert len(seen) == _MAX_REFUTED_DISPATCHES_PER_FN
+        # The two vague mechanisms lost the specificity ranking.
+        assert "bad" not in seen
+        assert "maybe wrong somewhere" not in seen
+
+    def test_detection_only_confirmation_does_not_promote(
+        self, tmp_path, monkeypatch,
+    ):
+        """Detection-role confirmations never override an LLM clean."""
+        from core.audit.orchestrator import _promote_clean_refuted
+        outcome = self._outcome([{
+            "mechanism": "overflow in size calc feeding memcpy at line 20",
+            "confidence": "refuted",
+            "counter": "",
+        }])
+        result = self._result([outcome])
+        self._no_smt(monkeypatch)
+        monkeypatch.setattr(
+            "core.audit.orchestrator._hypothesis_to_tool_chain",
+            lambda *a, **kw: [
+                {"type": "smt", "config": {"verb": "check-overflow-to-oob"}},
+            ],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: ["smt:check-overflow-to-oob"],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._is_detection_only",
+            lambda t: True,
+        )
+        _promote_clean_refuted(result, self._config(tmp_path))
+        assert result.outcomes[0].status == "clean"
+        assert result.refuted_rescued == 0
+
+
+class TestSweepValidateDetectionFilter:
+    """Detection-role tools must not stamp evidence in _sweep_validate."""
+
+    @pytest.mark.parametrize("rule_name", ["missing_bounds_check", "is_err_not_ptr_err", "snprintf_truncation_boundary", "strncpy_no_nul", "rcu_no_lock", "rcu_dereference_outside_rcu", "sensitive_data_leak", "dead_memset_free", "copy_user_size_mismatch", "uid_truncation", "shift_overflow", "division_by_zero", "popen_fclose", "use_after_fclose", "double_close", "use_after_close", "fdopendir_double_close", "double_free", "use_after_free", "realloc_losing_ptr", "resource_leak_err", "mmap_leak_err", "mmap_free", "free_nonbase_ptr_inc", "double_fclose", "malloc_strlen_strcpy", "sizeof_array_param", "sizeof_array_param_unsized", "double_sizeof", "pointer_scaling_double", "sizeof_container_of", "alloc_narrow_count", "shift_overflow_int", "shift_overflow_long", "shift_overflow_negative", "division_by_zero_param", "modulo_by_zero_param", "copy_from_user_sizeof_ptr", "integer_overflow_alloc", "negative_errno_unsigned_return", "packet_length_inverted_guard", "scatterlist_frag_undersize", 'missing_null_check', 'unchecked_return', 'snprintf_advance'])
+    def test_detection_only_tools_not_stamped(self, tmp_path, monkeypatch, rule_name):
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            ReviewOutcome,
+            _sweep_validate,
+        )
+        monkeypatch.setenv("RAPTOR_DIR", str(Path(__file__).resolve().parents[3]))
+        outcome = ReviewOutcome(
+            file="net/ipv4/esp4.c",
+            function="esp_output_head",
+            status="finding",
+            body="overflow in nfrags",
+            hypothesis="missing bounds check on nfrags counter",
+            line=450,
+        )
+        outcome.review_result = {"hypothesis": outcome.hypothesis}
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path / "out",
+        )
+        (tmp_path / "out").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: [f"coccinelle:{rule_name}"],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "void f() { buf[n]; }",
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator.run_prefilter",
+            lambda **kw: type("R", (), {"hits": []})(),
+        )
+
+        result = _sweep_validate(outcome, config)
+        assert f"coccinelle:{rule_name}" not in (result.evidence_tool or "")
+
+    def test_verification_tools_still_stamped(self, tmp_path, monkeypatch):
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            ReviewOutcome,
+            _sweep_validate,
+        )
+        outcome = ReviewOutcome(
+            file="net/ipv4/esp4.c",
+            function="esp_alloc_tmp",
+            status="finding",
+            body="overflow",
+            hypothesis="integer overflow in len calculation",
+            line=47,
+        )
+        outcome.review_result = {"hypothesis": outcome.hypothesis}
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path / "out",
+        )
+        (tmp_path / "out").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator._run_tool_chain",
+            lambda *a, **kw: ["smt:check-overflow"],
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._read_raw_source",
+            lambda *a, **kw: "int f(int x) { return x + y; }",
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator.run_prefilter",
+            lambda **kw: type("R", (), {"hits": []})(),
+        )
+
+        result = _sweep_validate(outcome, config)
+        assert "smt:check-overflow" in (result.evidence_tool or "")
+
+
+# ── Vacuity policy for unconstrained-arithmetic SMT verbs ───────────────
+
+
+def _z3_installed() -> bool:
+    try:
+        from core.smt_solver import z3_available
+        return z3_available()
+    except Exception:  # noqa: BLE001 — availability probe, never raise
+        return False
+
+
+needs_z3 = pytest.mark.skipif(not _z3_installed(), reason="z3 not installed")
+
+
+class TestComparisonPremiseExtraction:
+    def test_extracts_guard_mentioning_operand(self):
+        from core.audit.sweep import _extract_comparison_premises
+        src = "if (count < max_len) { total = count * size; }"
+        premises = _extract_comparison_premises(["count", "size"], src)
+        assert "count < max_len" in premises
+
+    def test_ignores_comparisons_of_other_identifiers(self):
+        from core.audit.sweep import _extract_comparison_premises
+        src = "if (other < limit) { total = count * size; }"
+        premises = _extract_comparison_premises(["count", "size"], src)
+        assert premises == []
+
+    def test_comments_and_strings_stripped(self):
+        from core.audit.sweep import _extract_comparison_premises
+        src = '// count < max\nchar *s = "count < max";\nreturn count;\n'
+        assert _extract_comparison_premises(["count"], src) == []
+
+    def test_shift_operators_not_comparisons(self):
+        from core.audit.sweep import _extract_comparison_premises
+        src = "x = count << 2; y = count >> 3;"
+        assert _extract_comparison_premises(["count"], src) == []
+
+    def test_deduplicates_and_caps(self):
+        from core.audit.sweep import _MAX_PREMISES, _extract_comparison_premises
+        lines = ["if (count < 10) {}"] * 3
+        lines += [f"if (count < {i}) {{}}" for i in range(20)]
+        premises = _extract_comparison_premises(["count"], "\n".join(lines))
+        assert premises.count("count < 10") == 1
+        assert len(premises) <= _MAX_PREMISES
+
+    def test_literal_operands_do_not_anchor(self):
+        from core.audit.sweep import _extract_comparison_premises
+        # "4" is a literal operand — it must not anchor extraction.
+        src = "if (x < 4) {}"
+        assert _extract_comparison_premises(["4"], src) == []
+
+
+class TestPremiseGate:
+    def test_no_premises_is_vacuous(self):
+        from core.audit.sweep import _premise_gate
+        reason = _premise_gate([], "uint32")
+        assert reason is not None
+        assert "no source-level guard premises" in reason
+
+    @needs_z3
+    def test_satisfiable_premises_pass(self):
+        from core.audit.sweep import _premise_gate
+        assert _premise_gate(["count < 100"], "uint32") is None
+
+    @needs_z3
+    def test_contradictory_premises_are_vacuous(self):
+        from core.audit.sweep import _premise_gate
+        reason = _premise_gate(["count > 10", "count < 5"], "uint32")
+        assert reason == "vacuous premises"
+
+    @needs_z3
+    def test_unencodable_premises_inconclusive(self):
+        from core.audit.sweep import _premise_gate
+        reason = _premise_gate(["p->len < q->cap"], "uint32")
+        assert reason is not None
+        assert "unencodable" in reason or "vacuous" in reason
+
+
+@pytest.mark.parametrize("runner", ["_run_smt_verb_inner", "_smt_verb_in_subprocess"])
+def test_missing_parser_refuses_source_derived_overflow(monkeypatch, runner):
+    from core.audit import condition_extraction
+
+    monkeypatch.setattr(condition_extraction, "_get_parser", lambda language: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unscoped source must not dispatch a solver")
+
+    monkeypatch.setattr(sweep_mod, "_run_smt_verb_on_source", forbidden)
+    monkeypatch.setattr("core.audit.subproc_json.run_json_child", forbidden)
+    result = getattr(sweep_mod, runner)(
+        file_path="a.c", function_name="f", verb="check-overflow",
+        source="unsigned f(unsigned a, unsigned b) { return a + b; }",
+        hypothesis="integer overflow in `a` + `b`", integer_abi="ilp32",
+    )
+    assert result.outcome == "inconclusive"
+    assert result.matches == []
+    assert result.details == {"source_scope_status": "unavailable"}
+
+
+@needs_z3
+class TestVacuousVerbPolicyDirect:
+    """SAT on check-overflow / check-oob / check-overflow-to-oob can
+    only mean something when source-level guard premises are encoded
+    as Z3 constraints.  Exercises ``_run_smt_verb_inner`` in-process."""
+
+    @pytest.fixture(autouse=True)
+    def _require_c_parser(self):
+        pytest.importorskip("tree_sitter", exc_type=ImportError)
+        pytest.importorskip("tree_sitter_c", exc_type=ImportError)
+
+    def _run(self, verb, source, hypothesis, file_path="a.c"):
+        from core.audit.sweep import _run_smt_verb_inner
+        return _run_smt_verb_inner(
+            file_path=file_path,
+            function_name="f",
+            verb=verb,
+            source=source,
+            hypothesis=hypothesis,
+            integer_abi="ilp32",
+        )
+
+    def test_overflow_guardless_source_is_inconclusive(self):
+        result = self._run(
+            "check-overflow",
+            "int f(int count, int size) { return count * size; }",
+            "integer overflow in `count` * `size`",
+        )
+        assert result.outcome == "inconclusive"
+        assert "no source-level guard premises" in (
+            (result.details or {}).get("summary", "")
+        )
+
+    def test_overflow_with_open_guard_confirms(self):
+        # Guard exists but doesn't bound the product: max_len is a
+        # free variable, so a wrap inside the guarded space exists.
+        result = self._run(
+            "check-overflow",
+            "int f(unsigned count, unsigned size, unsigned max_len) {\n"
+            "    if (count < max_len) { return count * size; }\n"
+            "    return 0;\n"
+            "}\n",
+            "integer overflow in `count` * `size`",
+        )
+        assert result.outcome == "confirmed"
+
+    def test_overflow_with_tight_guards_refutes(self):
+        # a <= 10 and b <= 10 → a + b <= 20, cannot wrap uint32.
+        result = self._run(
+            "check-overflow",
+            "int f(unsigned a, unsigned b) {\n"
+            "    if (a <= 10 && b <= 10) { return a + b; }\n"
+            "    return 0;\n"
+            "}\n",
+            "integer overflow in `a` + `b`",
+        )
+        assert result.outcome == "refuted"
+
+    def test_operator_from_hypothesis_is_honoured(self):
+        # Bounds 65536 × 65536 = 2^32 wraps under '*' but the sum
+        # 131072 cannot wrap under '+'.  A hardcoded '+' would refute;
+        # honouring the hypothesis's '*' confirms.
+        src = (
+            "int f(unsigned a, unsigned b) {\n"
+            "    if (a <= 65536 && b <= 65536) { return a * b; }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        mul = self._run("check-overflow", src, "integer overflow in `a` * `b`")
+        assert mul.outcome == "confirmed"
+        add_src = src.replace("a * b", "a + b")
+        add = self._run(
+            "check-overflow", add_src, "integer overflow in `a` + `b`",
+        )
+        assert add.outcome == "refuted"
+
+    def test_contradictory_premises_never_refute(self):
+        # Premises a > 10 AND a < 5 are jointly UNSAT — the full query
+        # would be UNSAT too, but that must read as "vacuous premises"
+        # (inconclusive), not as an authoritative refutation.
+        result = self._run(
+            "check-overflow",
+            "int f(unsigned a, unsigned b) {\n"
+            "    if (a > 10 && a < 5) { return a + b; }\n"
+            "    return 0;\n"
+            "}\n",
+            "integer overflow in `a` + `b`",
+        )
+        assert result.outcome == "inconclusive"
+        assert (result.details or {}).get("summary") == "vacuous premises"
+
+    def test_oob_guardless_source_is_inconclusive(self):
+        result = self._run(
+            "check-oob",
+            "int f(unsigned idx) { return arr[idx]; }",
+            "`idx` is used as an array index into buffer of size `buflen`",
+        )
+        assert result.outcome == "inconclusive"
+
+    def test_overflow_to_oob_guardless_is_inconclusive(self):
+        result = self._run(
+            "check-overflow-to-oob",
+            "void f(unsigned count, unsigned index) {\n"
+            "    p = malloc(count * 4);\n"
+            "    p[index] = 1;\n"
+            "}\n",
+            "overflow of `count` * `elem_size` leads to OOB at `index`",
+        )
+        assert result.outcome == "inconclusive"
+
+
+class TestRunSmtSweepVacuityPolicy:
+    """The shim (subprocess) path applies the same centralised policy:
+    sat on a vacuous verb without ``--guard`` args is inconclusive."""
+
+    def _patch_shim(self, monkeypatch, payload):
+        import core.audit.sweep as sweep_mod
+
+        class _Proc:
+            returncode = 0
+            stdout = payload
+            stderr = ""
+
+        patch_module_attribute(monkeypatch,
+            sweep_mod, 'subprocess', "run", lambda *a, **kw: _Proc(),
+        )
+
+    def test_sat_without_guards_is_inconclusive(self, monkeypatch):
+        self._patch_shim(monkeypatch, '{"result": "sat"}')
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f",
+            verb="check-overflow",
+            smt_args={"op": "*", "operand": ["count", "size"]},
+        )
+        assert result.outcome == "inconclusive"
+
+    def test_sat_with_guards_confirms(self, monkeypatch):
+        self._patch_shim(monkeypatch, '{"result": "sat"}')
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f",
+            verb="check-overflow",
+            smt_args={"op": "*", "operand": ["count", "size"],
+                      "guard": ["count < max_len"]},
+        )
+        assert result.outcome == "confirmed"
+
+    def test_unsat_remains_a_supplied_model_observation(self, monkeypatch):
+        self._patch_shim(monkeypatch, '{"result": "unsat"}')
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f",
+            verb="check-overflow",
+            smt_args={"op": "+", "operand": ["a", "b"]},
+        )
+        assert result.outcome == "inconclusive"
+        assert result.details["feasible"] is False
+
+    def test_non_vacuous_verb_sat_still_confirms(self, monkeypatch):
+        self._patch_shim(monkeypatch, '{"result": "sat"}')
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f",
+            verb="check-null-deref",
+            smt_args={"ptr": "p"},
+        )
+        assert result.outcome == "confirmed"
+
+
+class TestSemgrepPatternChainEntry:
+    """Chain entries from mechanical_check_to_semgrep carry
+    {"pattern": ...} with no rule file — the consumer must wrap the
+    pattern into a temp rule (and clean it up), not KeyError."""
+
+    def test_pattern_rule_file_shape(self, tmp_path):
+        from core.audit.orchestrator import _pattern_rule_file
+
+        pattern = mechanical_check_to_semgrep("unchecked return value")
+        path = _pattern_rule_file(pattern, "src/a.c")
+        try:
+            assert path is not None
+            import os
+            assert os.path.basename(path).startswith("audit_sweep_")
+            text = Path(path).read_text()
+            assert "pattern: |" in text
+            assert "$X = $FUNC(...)" in text
+            assert "languages: [c]" in text
+        finally:
+            if path:
+                Path(path).unlink(missing_ok=True)
+
+    def test_pattern_entry_dispatches_and_cleans_up(
+        self, tmp_path, monkeypatch,
+    ):
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _run_tool_chain,
+        )
+
+        seen = {}
+
+        def fake_sweep(**kw):
+            seen["rule_config"] = kw["rule_config"]
+            seen["existed_at_dispatch"] = Path(kw["rule_config"]).is_file()
+            return SweepResult(
+                tool="semgrep", file_path=kw["file_path"],
+                function_name=kw["function_name"], outcome="refuted",
+            )
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator.run_semgrep_sweep", fake_sweep,
+        )
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=None)
+        pattern = mechanical_check_to_semgrep("missing null check on ptr")
+        confirmed = _run_tool_chain(
+            [{"type": "semgrep", "config": {"pattern": pattern}}],
+            config=config,
+            file_path="a.c",
+            function_name="f",
+            source="int f(void) { return 0; }",
+            hypothesis="missing null check",
+        )
+        assert confirmed == []
+        assert seen.get("existed_at_dispatch") is True, (
+            "the wrapped rule file must exist when the sweep runs"
+        )
+        assert not Path(seen["rule_config"]).exists(), (
+            "the temp audit_sweep_ rule must be unlinked after dispatch"
+        )
+
+    def test_configless_entry_counts_as_channel_error(
+        self, tmp_path, monkeypatch,
+    ):
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _run_tool_chain,
+        )
+
+        def boom(**kw):
+            raise AssertionError("sweep must not run without a rule")
+
+        monkeypatch.setattr(
+            "core.audit.orchestrator.run_semgrep_sweep", boom,
+        )
+        errored: set = set()
+        confirmed = _run_tool_chain(
+            [{"type": "semgrep", "config": {}}],
+            config=OrchestratorConfig(target_path=tmp_path, out_dir=None),
+            file_path="a.c",
+            function_name="f",
+            source="",
+            hypothesis="h",
+            errored_types=errored,
+        )
+        assert confirmed == []
+        assert "semgrep" in errored
+
+
+class TestSmtShimInterface:
+    """run_smt_sweep must speak the shims' actual CLI/output contract:
+    conditions travel as POSITIONAL args (or a --stdin JSON array for
+    negated entries), and the verdict is the ``feasible`` key the
+    shims emit — parsed both directions against a stub shim."""
+
+    _STUB = r'''#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+if any(a == "--conditions" for a in args):
+    # Real shims have no such flag; argparse would exit 2.
+    sys.stderr.write("unrecognized arguments: --conditions\n")
+    sys.exit(2)
+conds = []
+it = iter(range(len(args)))
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--stdin":
+        conds.extend(
+            c["text"] if isinstance(c, dict) else c
+            for c in json.load(sys.stdin)
+        )
+        i += 1
+    elif a == "--profile":
+        i += 2
+    elif a == "--":
+        conds.extend(args[i + 1:])
+        break
+    elif a.startswith("--"):
+        i += 2
+    else:
+        conds.append(a)
+        i += 1
+if not conds:
+    print(json.dumps({"feasible": None, "reasoning": "no conditions"}))
+elif any("want-unsat" in c for c in conds):
+    print(json.dumps({"feasible": False, "unsatisfied": conds[:1]}))
+else:
+    print(json.dumps({"feasible": True, "model": {"x": 1}}))
+'''
+
+    def _install_stub(self, monkeypatch, tmp_path: Path):
+        from core.audit import sweep
+        shim = tmp_path / "raptor-smt-validate-path"
+        shim.write_text(self._STUB)
+        monkeypatch.setattr(sweep, "_SMT_SHIM_DIR", tmp_path)
+
+    def test_sat_confirms(self, monkeypatch, tmp_path: Path):
+        from core.audit.sweep import run_smt_sweep
+        self._install_stub(monkeypatch, tmp_path)
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f", verb="validate-path",
+            smt_args={"conditions": ["size > 0", "want-sat"]},
+        )
+        assert result.outcome == "confirmed"
+        assert result.matches and result.matches[0]["feasible"] is True
+
+    def test_unsat_remains_a_predicate_observation(self, monkeypatch, tmp_path: Path):
+        from core.audit.sweep import run_smt_sweep
+        self._install_stub(monkeypatch, tmp_path)
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f", verb="validate-path",
+            smt_args={"conditions": ["size > 0", "want-unsat"]},
+        )
+        assert result.outcome == "inconclusive"
+        assert result.details["feasible"] is False
+
+    def test_null_feasible_inconclusive(self, monkeypatch, tmp_path: Path):
+        from core.audit.sweep import run_smt_sweep
+        self._install_stub(monkeypatch, tmp_path)
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f", verb="validate-path",
+            smt_args={"conditions": []},
+        )
+        assert result.outcome == "inconclusive"
+
+    def test_negated_dict_conditions_go_via_stdin(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from core.audit.sweep import run_smt_sweep
+        self._install_stub(monkeypatch, tmp_path)
+        result = run_smt_sweep(
+            file_path="a.c", function_name="f", verb="validate-path",
+            smt_args={"conditions": [
+                {"text": "ptr == NULL", "negated": True},
+                "want-unsat",
+            ]},
+        )
+        assert result.outcome == "inconclusive"
+        assert result.details["feasible"] is False
+
+    def test_check_path_feasibility_both_directions(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        # The production caller (path_feasibility.check_path_feasibility)
+        # builds {"conditions": [...]} — end-to-end through the stub.
+        from core.audit.path_feasibility import (
+            PathCondition,
+            check_path_feasibility,
+        )
+        self._install_stub(monkeypatch, tmp_path)
+        sat = check_path_feasibility([PathCondition(text="want-sat")])
+        assert sat.feasible is True
+        unsat = check_path_feasibility([PathCondition(text="want-unsat")])
+        assert unsat.feasible is False
+
+
+class TestCoccinelleRangeFilter:
+    """A match in ANOTHER function of the same file must not confirm a
+    per-function hypothesis — the filter applies whenever line_start
+    is given, with a +50 window when line_end is unknown."""
+
+    @staticmethod
+    def _install_runner(monkeypatch, match_line: int):
+        import sys
+        import types
+
+        from packages.coccinelle.models import SpatchMatch, SpatchResult
+
+        result = SpatchResult(
+            rule="r",
+            matches=[SpatchMatch(file="a.c", line=match_line)],
+        )
+        fake_mod = types.ModuleType("packages.coccinelle.runner")
+        fake_mod.run_rule = lambda *a, **k: result
+        fake_mod.is_available = lambda: True
+        monkeypatch.setitem(
+            sys.modules, "packages.coccinelle.runner", fake_mod,
+        )
+
+    def _sweep(self, tmp_path: Path, **kwargs):
+        from core.audit.sweep import run_coccinelle_sweep
+
+        (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+        return run_coccinelle_sweep(
+            target_path=tmp_path,
+            file_path="a.c",
+            function_name="f",
+            cocci_rule="check.cocci",
+            **kwargs,
+        )
+
+    def test_distant_match_without_end_is_inconclusive(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        self._install_runner(monkeypatch, match_line=400)
+        result = self._sweep(tmp_path, line_start=10, line_end=None)
+        assert result.outcome == "inconclusive"
+        assert "end is unknown" in result.details["reason"]
+
+    def test_match_in_window_confirmed_start_only(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        self._install_runner(monkeypatch, match_line=30)
+        result = self._sweep(tmp_path, line_start=10, line_end=None)
+        assert result.outcome == "confirmed"
+
+    def test_real_bound_beats_window(self, monkeypatch, tmp_path: Path):
+        # line 30 is inside the +50 fallback window but OUTSIDE the
+        # real function span — the caller-provided bound wins.
+        self._install_runner(monkeypatch, match_line=30)
+        result = self._sweep(tmp_path, line_start=10, line_end=20)
+        assert result.outcome == "refuted"
+
+    def test_no_line_start_keeps_whole_file(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        self._install_runner(monkeypatch, match_line=400)
+        result = self._sweep(tmp_path, line_start=None, line_end=None)
+        assert result.outcome == "confirmed"
+
+
+class TestNegativeControlCache:
+    """Cache key carries the rule language; a failed control run is
+    never cached as matched=False (that permanently disarmed the
+    presence-detector cap for the keyword)."""
+
+    @staticmethod
+    def _install_runner(monkeypatch, results: list):
+        """Queue of results returned by successive run_rule calls."""
+        import sys
+        import types
+
+        calls = {"n": 0}
+
+        def fake_run_rule(*a, **k):
+            r = results[min(calls["n"], len(results) - 1)]
+            calls["n"] += 1
+            return r
+
+        fake_mod = types.ModuleType("packages.semgrep.runner")
+        fake_mod.run_rule = fake_run_rule
+        fake_mod.is_available = lambda: True
+        monkeypatch.setitem(
+            sys.modules, "packages.semgrep.runner", fake_mod,
+        )
+        return calls
+
+    @staticmethod
+    def _result(findings=(), errors=(), returncode=0, *,
+                files_examined=(), files_failed=(), skipped_rules=()):
+        import types
+
+        return types.SimpleNamespace(
+            findings=list(findings),
+            errors=list(errors),
+            returncode=returncode,
+            files_examined=list(files_examined),
+            files_failed=list(files_failed),
+            skipped_rules=list(skipped_rules),
+        )
+
+    def _clear_cache(self):
+        from core.audit import sweep
+        sweep._negative_control_cache.clear()
+
+    def test_failed_control_run_not_cached(self, monkeypatch):
+        from core.audit.sweep import _rule_matches_negative_control
+        self._clear_cache()
+        calls = self._install_runner(monkeypatch, [
+            self._result(errors=["invalid rule yaml"]),
+            self._result(findings=[{"line": 3}]),
+        ])
+        # Failure → False, but NOT cached...
+        assert not _rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        )
+        # ...so the next (healthy) run re-checks and arms the cap.
+        assert _rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        )
+        assert calls["n"] == 2
+        self._clear_cache()
+
+    def test_bad_returncode_not_cached(self, monkeypatch):
+        from core.audit.sweep import _rule_matches_negative_control
+        self._clear_cache()
+        self._install_runner(monkeypatch, [
+            self._result(returncode=2),
+            self._result(findings=[{"line": 3}]),
+        ])
+        assert not _rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        )
+        assert _rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        )
+        self._clear_cache()
+
+    @staticmethod
+    def _rule_file(tmp_path, lang):
+        rule = tmp_path / f"rule-{lang}.yaml"
+        rule.write_text(
+            "rules:\n  - id: hypothesis-check\n"
+            "    pattern-regex: printf\\(\n"
+            f"    languages: [{lang}]\n    severity: WARNING\n"
+            "    message: check\n",
+        )
+        return str(rule)
+
+    def test_language_in_cache_key(self, monkeypatch, tmp_path):
+        # A cpp-language rule's verdict against the .c fixture must not
+        # be served to a c-language rule (different languages: key
+        # separates them, so the second language re-runs the control).
+        # Real generated-shape rule files: the cpp leg re-languages a
+        # copy for the control run instead of scanning vacuously.
+        from core.audit.sweep import (
+            _rule_matches_negative_control, negative_control_fixture,
+        )
+        self._clear_cache()
+        fixture = negative_control_fixture("format string", "a.cpp")
+        assert fixture is not None
+        calls = self._install_runner(monkeypatch, [
+            self._result(files_examined=[str(fixture)]),  # witnessed cpp no-match
+            self._result(findings=[{"line": 3}]),  # c rule: matches
+        ])
+        cpp_rule = self._rule_file(tmp_path, "cpp")
+        c_rule = self._rule_file(tmp_path, "c")
+        assert not _rule_matches_negative_control(
+            cpp_rule, "format string", "a.cpp",
+        )
+        assert _rule_matches_negative_control(
+            c_rule, "format string", "a.c",
+        )
+        assert calls["n"] == 2
+        # Both verdicts now cached per-language: no further runs.
+        assert not _rule_matches_negative_control(
+            cpp_rule, "format string", "a.cpp",
+        )
+        assert _rule_matches_negative_control(
+            c_rule, "format string", "a.c",
+        )
+        assert calls["n"] == 2
+        self._clear_cache()
+
+    @pytest.mark.parametrize("coverage", ["missing", "other", "failed", "skipped"])
+    def test_unwitnessed_empty_control_not_cached(self, monkeypatch, coverage):
+        from core.audit import sweep
+        self._clear_cache()
+        fixture = sweep.negative_control_fixture("format string", "a.c")
+        assert fixture is not None
+        examined = [] if coverage == "missing" else [
+            str(fixture.with_name("other.c")) if coverage == "other" else str(fixture),
+        ]
+        calls = self._install_runner(monkeypatch, [
+            self._result(
+                files_examined=examined,
+                files_failed=[str(fixture)] if coverage == "failed" else [],
+                skipped_rules=["hypothesis-check"] if coverage == "skipped" else [],
+            ),
+            self._result(files_examined=[str(fixture)]),
+        ])
+        assert sweep._rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        ) is None
+        assert sweep._negative_control_cache == {}
+        assert sweep._rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        ) is False
+        assert sweep._rule_matches_negative_control(
+            "rule.yaml", "format string", "a.c",
+        ) is False
+        assert calls["n"] == 2
+        self._clear_cache()
+
+    def test_unrewritable_cpp_rule_skips_without_caching(
+        self, monkeypatch,
+    ):
+        # A cpp rule whose config cannot be re-languaged (missing
+        # file / stock pack) must SKIP the control — a vacuous scan
+        # must never cache matched=False for the keyword.
+        from core.audit import sweep
+        from core.audit.sweep import _rule_matches_negative_control
+        self._clear_cache()
+        calls = self._install_runner(monkeypatch, [
+            self._result(findings=[]),
+        ])
+        assert not _rule_matches_negative_control(
+            "rule.yaml", "format string", "a.cpp",
+        )
+        assert calls["n"] == 0  # never scanned vacuously
+        assert sweep._negative_control_cache == {}
+        self._clear_cache()
+
+
+class TestMechanicalPatternsAreRealSemgrep:
+    """The mechanical-check pattern table must contain no //-comment
+    lines (semgrep strips comments from patterns, silently degenerating
+    them into presence matchers) and must travel with its keyword so
+    the consumer arms the identifier-consistency / negative-control
+    caps."""
+
+    def test_no_comment_lines_in_patterns(self):
+        from core.audit.sweep import _MECHANICAL_CHECK_PATTERNS
+        for keyword, pattern in _MECHANICAL_CHECK_PATTERNS.items():
+            assert "//" not in pattern, keyword
+
+    def test_keyed_variant_returns_keyword(self):
+        from core.audit.sweep import mechanical_check_to_semgrep_keyed
+        keyed = mechanical_check_to_semgrep_keyed("missing null check on p")
+        assert keyed is not None
+        pattern, keyword = keyed
+        assert keyword == "missing null check"
+        assert "$FUNC" in pattern
+
+    def test_chain_entry_carries_keyword(self):
+        # The consumer passes hypothesis/negative-control caps only
+        # for keyword-bearing entries (orchestrator semgrep leg).
+        from core.audit.orchestrator import _hypothesis_to_tool_chain
+        chain = _hypothesis_to_tool_chain(
+            "missing bounds check lets idx run past the array",
+            "src/a.c",
+        )
+        semgrep_entries = [e for e in chain if e["type"] == "semgrep"]
+        assert semgrep_entries
+        cfg = semgrep_entries[0]["config"]
+        assert cfg.get("pattern") or cfg.get("rule")
+        if cfg.get("pattern"):
+            assert cfg.get("keyword") == "missing bounds check"
+
+
+class TestPremiseGateProfileLockstep:
+    """The premise-vacuity gate must model premises under exactly the
+    profile the verb's MAIN query uses. A gate profile looser than
+    the query's (e.g. the dual-signedness ``None``) would pass
+    premises that are contradictory under the query profile — the
+    main query then goes UNSAT and mints an authoritative "refuted"
+    (the masquerade the gate exists to block). A stricter/different
+    pin re-opens the same from the other side."""
+
+    def test_every_gate_profile_matches_the_following_query(self):
+        import ast as _ast
+
+        src = (
+            Path(__file__).resolve().parents[1] / "sweep.py"
+        ).read_text()
+        tree = _ast.parse(src)
+        events: list[tuple[int, str, str]] = []
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            fn = node.func
+            name = (
+                fn.id if isinstance(fn, _ast.Name)
+                else fn.attr if isinstance(fn, _ast.Attribute) else ""
+            )
+            if name == "_premise_gate" and len(node.args) >= 2:
+                arg = node.args[1]
+                if isinstance(arg, _ast.Constant):
+                    events.append((node.lineno, "gate", str(arg.value)))
+            elif name.startswith("check_"):
+                for kw in node.keywords:
+                    if kw.arg == "profile" and isinstance(
+                        kw.value, _ast.Constant,
+                    ):
+                        events.append(
+                            (node.lineno, "query", str(kw.value.value)),
+                        )
+        events.sort()
+        gates = [e for e in events if e[1] == "gate"]
+        assert gates, "sweep.py no longer premise-gates any SMT verb"
+        for lineno, _, gate_profile in gates:
+            following = [
+                e for e in events if e[0] > lineno
+            ]
+            nxt = following[0] if following else None
+            assert nxt is not None and nxt[1] == "query", (
+                f"_premise_gate at line {lineno} has no following "
+                f"profile-pinned query call"
+            )
+            assert nxt[2] == gate_profile, (
+                f"_premise_gate at line {lineno} vets premises under "
+                f"{gate_profile!r} but the main query at line {nxt[0]} "
+                f"models them under {nxt[2]!r} — cross-profile vacuous "
+                f"premises would reach the query and masquerade as "
+                f"refuted"
+            )
+
+
+class TestExtractPathConditionsOperatorRun:
+    def test_unterminated_quote_with_operator_run_is_fast(self):
+        """Hostile hypothesis text with an unterminated quote followed
+        by a long operator run: with the body spelled
+        [^`]*[<>=!]+[^`]* all three repeats overlap on the operator
+        chars and the engine tries every split of the run between
+        them — cubic in the hypothesis length. Spelling the body as
+        prefix-without-operators + one operator + greedy rest is
+        linear. Both-direction bound: fast AND real conditions still
+        extracted."""
+        from core.audit.sweep import _extract_path_conditions
+        from core.testing.wallclock import cpu_budget
+
+        for quote in ("`", '"'):
+            hostile = f"the check {quote}x " + "=" * (1 << 16) + " y"
+            with cpu_budget(1.0, what="operator-run condition extract"):
+                assert _extract_path_conditions(hostile, "") == []
+
+    def test_condition_forms_still_extracted(self):
+        from core.audit.sweep import _extract_path_conditions
+
+        assert _extract_path_conditions(
+            "fails when `len > cap` holds", "",
+        ) == ["len > cap"]
+        assert _extract_path_conditions(
+            'overflow if "n != 0" and "m <= k"', "",
+        ) == ["n != 0", "m <= k"]
+        assert _extract_path_conditions(
+            "wraps when size >= limit", "",
+        ) == ["size >= limit"]
+        # No operator inside the quotes: falls through, same as before.
+        assert _extract_path_conditions("call `foo` then x < y", "") \
+            == ["x < y"]
+
+
+def test_legacy_aliasing_sarif_is_neither_positive_nor_clean(tmp_path):
+    import json
+    from core.sarif.parser import parse_sarif_findings, load_sarif
+    raw = {"ruleId": "-Wstrict-aliasing", "message": {"text": "might break aliasing"},
+           "locations": [{"physicalLocation": {"artifactLocation": {"uri": "a.c"}, "region": {"startLine": 2}}}]}
+    directory = tmp_path / "scan"
+    directory.mkdir()
+    path = directory / "compiler.sarif"
+    path.write_text(json.dumps({"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "gcc"}},
+        "artifacts": [{"location": {"uri": "a.c"}}], "results": [raw]}]}))
+    cache = SarifCache.from_directory(tmp_path)
+    assert not cache.lookup("a.c")
+    assert "a.c" not in cache.scanned_files
+    assert parse_sarif_findings(path) == []
+    assert load_sarif(path)["runs"][0]["results"] == [raw]
+    assert cache.ingest("a.c", dict(raw, ruleId="independent-aliasing-proof")) == "a.c"
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_candidate_files_cannot_regain_clean_coverage(tmp_path, indexed):
+    import json
+    from core.audit.sweep import _ingest_sarif_file
+    from core.sarif.parser import parse_sarif_findings
+    cache = SarifCache()
+    result = {"locations": [{"physicalLocation": {"artifactLocation": {"uri": "a.c"}}}]}
+    result.update({"ruleIndex": 0} if indexed else {"ruleId": "compiler:-Wstrict-aliasing=1"})
+    run = {"tool": {"driver": {"name": "compiler", "rules": [{"id": "-Wstrict-aliasing"}]}},
+           "artifacts": [{"location": {"uri": "a.c"}}], "results": [result]}
+    path = tmp_path / "old.sarif"
+    path.write_text(json.dumps({"version": "2.1.0", "runs": [run]}))
+    assert _ingest_sarif_file(cache, path) == 0
+    assert parse_sarif_findings(path) == []
+    run["results"] = []
+    path.write_text(json.dumps({"version": "2.1.0", "runs": [run]}))
+    _ingest_sarif_file(cache, path)
+    assert "a.c" not in cache.scanned_files
+
+
+def test_direct_cache_ingest_rejects_conflicting_candidate_identity():
+    cache = SarifCache()
+    assert cache.ingest("a.c", {"ruleId": "other", "rule_id": "-Wstrict-aliasing"}) is None
+    assert not cache.lookup("a.c")
+
+
+@pytest.fixture(autouse=True)
+def _owned_codeql_pack_discovery():
+    """Sweep unit tests own pack metadata and never inspect installed tools."""
+    from contextlib import ExitStack
+
+    from core.audit import codeql_query_resolver as resolver, orchestrator
+    from core.testing.module_state import isolated_module_state
+
+    with pytest.MonkeyPatch.context() as patch, ExitStack() as state:
+        state.enter_context(isolated_module_state(
+            resolver, {"_PACK_INDEX_CACHE": {}, "_PACK_LOCKS": {}},
+            lock=resolver._CACHE_LOCK,
+        ))
+        state.enter_context(isolated_module_state(
+            orchestrator, {"_CODEQL_UNSUPPORTED_IDS_LOGGED": set()},
+            lock=orchestrator._CODEQL_UNSUPPORTED_IDS_LOCK,
+        ))
+        patch.setattr(resolver, "_pack_roots", lambda pack: [])
+        yield
+
+
+class TestCoccinelleConfirmOnlyHeaders:
+    @pytest.mark.parametrize("text,expected", [
+        ("// raptor: confirm-only\n@r@\n", True),
+        ("\ufeff// heading\n\n// raptor: confirm-only\n@r@\n", True),
+        ("// raptor: confirm-only-extra\n@r@\n", False),
+        ("// raptor:  confirm-only\n@r@\n", False),
+        ("@r@\n// raptor: confirm-only\n", False),
+        ('@script:python@\n@@\ntext = "// raptor: confirm-only"\n', False),
+        ("# other-language comment\n// raptor: confirm-only\n", False),
+    ])
+    def test_only_exact_leading_curated_headers_activate(self, tmp_path, monkeypatch, text, expected):
+        from core.audit import sweep
+
+        curated = tmp_path / "rules"
+        curated.mkdir()
+        rule = curated / "check.cocci"
+        rule.write_text(text)
+        monkeypatch.setattr(sweep, "_CURATED_COCCINELLE_RULES_DIR", curated)
+        monkeypatch.setattr(sweep, "_RULE_MARKER_CACHE", {})
+        assert sweep.is_confirm_only_coccinelle_rule(str(rule)) is expected
+
+    def test_dynamic_rules_cannot_opt_out_or_escape_through_symlinks(self, tmp_path, monkeypatch):
+        from core.audit import sweep
+
+        curated = tmp_path / "rules"
+        curated.mkdir()
+        dynamic = tmp_path / "hypothesis.cocci"
+        dynamic.write_text("// raptor: confirm-only\n@r@\n")
+        link = curated / "escape.cocci"
+        link.symlink_to(dynamic)
+        monkeypatch.setattr(sweep, "_CURATED_COCCINELLE_RULES_DIR", curated)
+        monkeypatch.setattr(sweep, "_RULE_MARKER_CACHE", {})
+        assert not sweep.is_confirm_only_coccinelle_rule(str(dynamic))
+        assert not sweep.is_confirm_only_coccinelle_rule(str(link))
+
+
+@pytest.mark.parametrize("curated", [False, True], ids=["untrusted-header", "curated-header"])
+def test_consistency_refutation_policy_uses_only_curated_headers(tmp_path, monkeypatch, curated):
+    from core.audit import sweep
+    from core.testing.module_views import scoped_function_imports
+    from packages.coccinelle import runner
+    from packages.coccinelle.models import SpatchResult
+
+    if curated:
+        rule = Path(__file__).resolve().parents[3] / "engine/coccinelle/rules/unchecked_return.cocci"
+    else:
+        rule = tmp_path / "dynamic.cocci"
+        rule.write_text("// raptor: confirm-only\n@r@\nidentifier virtual.func;\n@@\nfunc(...)\n")
+    (tmp_path / "calls.c").write_text("void do_io(void) {}\n")
+    calls = []
+
+    def execute(target, path, **options):
+        calls.append(options)
+        return SpatchResult(rule="unchecked_return")
+
+    with scoped_function_imports(
+        sweep, ("run_consistency_check",), {"packages.coccinelle.runner": runner},
+    ) as imports:
+        private_runner = getattr(imports, "packages.coccinelle.runner")
+        monkeypatch.setattr(private_runner, "is_available", lambda: True)
+        monkeypatch.setattr(private_runner, "run_rule", execute)
+        result = sweep.run_consistency_check(
+            target_path=tmp_path, function_name="do_io", cocci_rule=str(rule),
+            tree_languages=frozenset({"c"}),
+        )
+    assert result.outcome == ("inconclusive" if curated else "refuted")
+    assert bool((result.details or {}).get("confirm_only")) is curated
+    assert len(calls) == 1
+    assert calls[0]["defines"] == {"func": "do_io"}

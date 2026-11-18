@@ -33,19 +33,25 @@ Dockerfile uses this.
     ``apt-get install`` actually takes in real Dockerfiles.
     ``RUN bash -c "apt-get install -y foo"`` (subshell-quoted) is
     rare and intentionally out of scope.
-  * **Heredoc bodies.** ``RUN <<EOF`` is skipped — practically
-    never used for apt installs.
+  * **Heredoc bodies.** Skipped in both positions: an args-LEADING
+    ``RUN <<EOF`` skips the instruction, and a TRAILING heredoc
+    (``apt-get install -y curl <<EOF``) cuts extraction at the
+    marker so body lines never parse as install args. A command
+    chained AFTER a heredoc on the same RUN (``cmd <<EOF … && apt
+    install x``) is cut with it — conservative; practically unused
+    for apt installs.
   * **Globs / wildcards.** ``pkg*`` is returned verbatim as the
     name; the consumer (SCA tier) decides whether to resolve.
 """
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 from .parser import Instruction
+from .parser import _heredoc_tags as parser_heredoc_tags
 
 
 @dataclass(frozen=True)
@@ -66,15 +72,15 @@ class AptPackage:
     """
 
     name: str
-    version: Optional[str]
-    arch: Optional[str]
-    stage: Optional[str]
+    version: str | None
+    arch: str | None
+    stage: str | None
     line: int
 
 
 def extract_apt_packages(
-    instructions: List[Instruction],
-) -> List[AptPackage]:
+    instructions: list[Instruction],
+) -> list[AptPackage]:
     """Walk a parsed Dockerfile's instructions, return apt packages.
 
     Returns the deduplicated list of packages declared across every
@@ -83,7 +89,7 @@ def extract_apt_packages(
 
     Empty when no RUN instructions install via apt.
     """
-    out: List[AptPackage] = []
+    out: list[AptPackage] = []
     for inst in instructions:
         if inst.directive != "RUN":
             continue
@@ -91,12 +97,32 @@ def extract_apt_packages(
     return out
 
 
-def _extract_from_run(inst: Instruction) -> List[AptPackage]:
+def _extract_from_run(inst: Instruction) -> list[AptPackage]:
     if inst.args.lstrip().startswith("<<"):
         # Heredoc body — out of scope.
         return []
     flat = _flatten_run(inst.raw)
-    out: List[AptPackage] = []
+    # Trailing heredocs: ``RUN apt-get install -y curl <<EOF`` — the
+    # leading-marker guard above never fires, and flattening folded
+    # the BODY lines into the command, so body text parsed as install
+    # args (phantom package rows polluting the SBOM). Cut the
+    # flattened command at the first real heredoc marker (the
+    # quote-state token scan from the parser, not a bare `<<` sweep —
+    # `sed 's/<<X/y/'` must not truncate): everything from the marker
+    # on is body + terminator, never arguments.
+    tags = parser_heredoc_tags(inst.args)
+    if tags:
+        tag = tags[0][0]
+        marker = re.compile(
+            r"<<-?(?:" + "|".join(
+                (re.escape(tag), '"' + re.escape(tag) + '"',
+                 "'" + re.escape(tag) + "'"),
+            ) + r")(?=\s|$)"
+        )
+        m = marker.search(flat)
+        if m:
+            flat = flat[:m.start()]
+    out: list[AptPackage] = []
     for tokens in _split_commands(flat):
         out.extend(_packages_from_command(tokens, inst.line, inst.stage_name))
     return out
@@ -119,7 +145,7 @@ def _flatten_run(raw: str) -> str:
         # Drop the leading ``RUN`` directive on the first line.
         head = physical[0].split(None, 1)
         physical[0] = head[1] if len(head) > 1 else ""
-    chunks: List[str] = []
+    chunks: list[str] = []
     for ln in physical:
         s = ln.strip()
         if not s:
@@ -138,7 +164,7 @@ def _flatten_run(raw: str) -> str:
     return " ".join(chunks)
 
 
-def _inline_comment_start(s: str) -> Optional[int]:
+def _inline_comment_start(s: str) -> int | None:
     """Return the index where an inline shell comment starts in ``s``.
 
     Shell semantics: ``#`` starts a comment only at the beginning of
@@ -155,15 +181,17 @@ def _inline_comment_start(s: str) -> Optional[int]:
     return None
 
 
-def _split_commands(args: str) -> List[List[str]]:
+def _split_commands(args: str) -> list[list[str]]:
     """Split a shell command line into per-command token lists.
 
     Tokenisation goes through ``shlex.split`` (POSIX mode) so quoted
     arguments are unquoted (``"curl"`` -> ``curl``) and backslash
-    escapes are honoured. ``&&`` / ``||`` / ``;`` / ``|`` split
-    commands whether they're standalone (``a && b``) or fused
+    escapes are honoured. ``&&`` / ``||`` / ``;`` / ``|`` / ``&``
+    split commands whether they're standalone (``a && b``) or fused
     (``update;install``, ``yes|apt-get``) — the connectors are
-    pre-padded so shlex sees them as their own tokens.
+    pre-padded so shlex sees them as their own tokens. Backgrounding
+    ``&`` is a separator like ``;``: ``foo & apt-get install pkg``
+    starts a NEW command whose installs must not be missed.
 
     On unbalanced quotes (``shlex.ValueError``) we fall back to
     plain whitespace splitting so a broken Dockerfile doesn't
@@ -171,23 +199,26 @@ def _split_commands(args: str) -> List[List[str]]:
     """
     # Pre-process so connectors are always standalone tokens. Order
     # matters: pad ``&&`` / ``||`` first so the ``;`` / ``|`` pads
-    # don't turn ``&&`` into ``& &``. The final ``|  |`` reverse
-    # repairs ``||`` that the bare-``|`` pad would otherwise split.
+    # don't turn ``&&`` into ``& &``. The ``|  |`` / ``&  &`` reverse
+    # repairs restore ``||`` / ``&&`` that the bare-character pads
+    # split.
     padded = (
         args.replace("&&", " && ")
         .replace("||", " || ")
         .replace(";", " ; ")
         .replace("|", " | ")
         .replace("|  |", "||")
+        .replace("&", " & ")
+        .replace("&  &", "&&")
     )
     try:
         tokens = shlex.split(padded, comments=False, posix=True)
     except ValueError:
         tokens = padded.split()
-    out: List[List[str]] = []
-    current: List[str] = []
+    out: list[list[str]] = []
+    current: list[str] = []
     for tok in tokens:
-        if tok in ("&&", "||", ";", "|"):
+        if tok in ("&&", "||", ";", "|", "&"):
             if current:
                 out.append(current)
                 current = []
@@ -199,10 +230,10 @@ def _split_commands(args: str) -> List[List[str]]:
 
 
 def _packages_from_command(
-    tokens: List[str],
+    tokens: list[str],
     line: int,
-    stage: Optional[str],
-) -> List[AptPackage]:
+    stage: str | None,
+) -> list[AptPackage]:
     """For one shell command's token list, extract apt-installed
     packages. Returns empty unless the command is
     ``[(sudo|env=val) ...] (apt-get|apt) [flags] install [flags] pkg ...``.
@@ -210,16 +241,25 @@ def _packages_from_command(
     Subshell parens are unwrapped: tokens with a leading ``(`` or
     trailing ``)`` are stripped. ``( apt-get install -y pkg )`` and
     ``(apt-get install -y pkg)`` both parse the same as the bare
-    form.
+    form. Command-substitution spans are dropped FIRST — paren
+    stripping would otherwise launder a fragment like ``pkgs.txt)``
+    (from ``$(cat pkgs.txt)``) past ``_parse_pkg``'s ``)`` rejection
+    and into the inventory as a phantom package name.
     """
-    tokens = [_strip_subshell_paren(t) for t in tokens if t]
+    tokens = _drop_substitution_spans([t for t in tokens if t])
+    tokens = [_strip_subshell_paren(t) for t in tokens]
     tokens = [t for t in tokens if t]
     i = 0
-    # Skip ``KEY=VALUE`` env-var prefixes (e.g. DEBIAN_FRONTEND) and
+    # Skip ``KEY=VALUE`` env-var prefixes (e.g. DEBIAN_FRONTEND),
     # ``sudo`` prefixes (rare in Dockerfiles but real, e.g. on
-    # bases that demote root before subsequent layers).
+    # bases that demote root before subsequent layers), and BuildKit
+    # RUN flags (``--mount=type=cache``, ``--network``, ``--security``)
+    # — those belong to the RUN directive, land in the first command's
+    # token list, and previously hid its installs entirely.
     while i < len(tokens) and (
-        _is_env_prefix(tokens[i]) or tokens[i] == "sudo"
+        _is_env_prefix(tokens[i])
+        or tokens[i] == "sudo"
+        or tokens[i].startswith(("--mount", "--network", "--security"))
     ):
         i += 1
     if i >= len(tokens):
@@ -244,13 +284,22 @@ def _packages_from_command(
     if i >= len(tokens) or tokens[i] != "install":
         return []
     i += 1
-    out: List[AptPackage] = []
+    out: list[AptPackage] = []
     while i < len(tokens):
         tok = tokens[i]
         i += 1
         if tok.startswith("-"):
             # Install-time flags follow the same arg-bearing rule.
             if tok in _ARG_BEARING_FLAGS and i < len(tokens):
+                i += 1
+            continue
+        redir = _REDIRECTION_RE.match(tok)
+        if redir:
+            # Shell redirections are not packages. A BARE operator
+            # token ("2>", ">>") redirects into the NEXT token — skip
+            # that file target too; fused targets ("2>/dev/null") and
+            # fd-dups ("2>&1") complete within the token.
+            if redir.end() == len(tok) and i < len(tokens):
                 i += 1
             continue
         parsed = _parse_pkg(tok)
@@ -264,6 +313,10 @@ def _packages_from_command(
     return out
 
 
+# Shell redirection operator at token start: ``>``, ``>>``, ``<``,
+# ``<<``, with an optional leading fd number, plus ``&>`` / ``&>>``.
+_REDIRECTION_RE = re.compile(r"^(?:\d*(?:>>|>|<<|<)|&>>|&>)")
+
 _SHELL_PROGS = frozenset({"bash", "sh", "dash", "ash", "zsh"})
 # Flag values that mean "next token is the shell-command body".
 # ``-c`` is canonical; ``-lc`` / ``-Lc`` / ``-cl`` collapse a login
@@ -272,11 +325,11 @@ _SHELL_C_FLAGS = frozenset({"-c", "-lc", "-Lc", "-cl"})
 
 
 def _recurse_shell_c(
-    tokens: List[str],
+    tokens: list[str],
     start: int,
     line: int,
-    stage: Optional[str],
-) -> List[AptPackage]:
+    stage: str | None,
+) -> list[AptPackage]:
     """For a ``bash``/``sh`` invocation starting at ``start``, find
     ``-c <body>`` and recursively extract from the body string.
 
@@ -291,7 +344,7 @@ def _recurse_shell_c(
             if j >= len(tokens):
                 return []
             body = tokens[j]
-            out: List[AptPackage] = []
+            out: list[AptPackage] = []
             for sub in _split_commands(body):
                 out.extend(_packages_from_command(sub, line, stage))
             return out
@@ -301,6 +354,43 @@ def _recurse_shell_c(
         # Non-flag before any ``-c`` — script invocation, out of scope.
         return []
     return []
+
+
+def _drop_substitution_spans(tokens: list[str]) -> list[str]:
+    """Drop every token covered by a command substitution span.
+
+    ``shlex.split`` has no substitution awareness: ``$(cat pkgs.txt)``
+    arrives as ``["$(cat", "pkgs.txt)"]`` and ``$(cat a b)`` leaves the
+    MIDDLE fragments as bare clean-looking tokens. None of them are
+    package names — the substitution's output is unknowable statically
+    — so the whole span (``$(``/`` ` `` through its close, tracked
+    across tokens) is removed before any further token cleaning.
+    Tokens outside every span pass through untouched, so a real
+    package next to a substitution is still extracted. A plain ``)``
+    at depth 0 (subshell close) is NOT treated as a span end —
+    ``_strip_subshell_paren`` keeps handling that shape.
+    """
+    out: list[str] = []
+    depth = 0
+    in_backtick = False
+    for tok in tokens:
+        in_span = depth > 0 or in_backtick
+        i = 0
+        while i < len(tok):
+            c = tok[i]
+            if c == "`":
+                in_backtick = not in_backtick
+            elif c == "$" and tok.startswith("$(", i):
+                depth += 1
+                i += 2
+                continue
+            elif c == ")" and depth > 0:
+                depth -= 1
+            i += 1
+        if in_span or depth > 0 or in_backtick or "$(" in tok or "`" in tok:
+            continue
+        out.append(tok)
+    return out
 
 
 def _strip_subshell_paren(tok: str) -> str:
@@ -337,7 +427,7 @@ def _is_env_prefix(tok: str) -> bool:
     leading tokens, never inside the install argument list, so the
     syntactic ambiguity is resolved by position.
     """
-    if "=" not in tok or tok.startswith("-") or tok.startswith("="):
+    if "=" not in tok or tok.startswith(("-", "=")):
         return False
     name = tok.split("=", 1)[0]
     if not name or name[0].isdigit():
@@ -348,7 +438,7 @@ def _is_env_prefix(tok: str) -> bool:
 
 def _parse_pkg(
     token: str,
-) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+) -> tuple[str, str | None, str | None] | None:
     """Parse ``pkg``, ``pkg=ver``, ``pkg:arch``, or ``pkg:arch=ver``.
 
     Returns ``(name, version | None, arch | None)`` or ``None`` for
@@ -357,13 +447,13 @@ def _parse_pkg(
     or shell-substitution / quote-fragment tokens (``$(...``, ```...``,
     ``"..."``).
     """
-    if not token or token.startswith("=") or token.startswith(":"):
+    if not token or token.startswith(("=", ":")):
         return None
     # File paths to local .deb files: real apt syntax, but the file
     # name is the install target — not a package name an OSV
     # advisory would match against. Skip; consumers can scan the
     # file separately if they care.
-    if token.startswith("/") or token.startswith("./") or token.startswith("../"):
+    if token.startswith(("/", "./", "../")):
         return None
     # Shell command substitution / variable expansion produces
     # token fragments that aren't packages (``$(cat`` or ``)`` from
@@ -379,8 +469,8 @@ def _parse_pkg(
     # ``_split_commands`` — by the time we see the token here it
     # is already unquoted.
     name = token
-    version: Optional[str] = None
-    arch: Optional[str] = None
+    version: str | None = None
+    arch: str | None = None
     if "=" in name:
         name, version = name.split("=", 1)
         if not version:
@@ -404,9 +494,7 @@ def _is_clean_var_substitution(token: str) -> bool:
     if "`" in token or "$(" in token:
         return False
     # Count braces. ``${A}`` is fine; ``${A`` or ``A}`` is not.
-    if token.count("{") != token.count("}"):
-        return False
-    return True
+    return token.count("{") == token.count("}")
 
 
 __all__ = [

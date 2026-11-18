@@ -1,0 +1,60 @@
+{
+  "_source": {
+    "fetched_at": "2026-10-29T21:59:41Z",
+    "git_ref": "3.1.9",
+    "license": "MIT (RAPTOR-generated fields only; upstream advisory data retains its own terms)",
+    "name": "RAPTOR SCA scan of nodatime-3.1",
+    "project_license": "Apache-2.0",
+    "provenance": "Scan output produced by RAPTOR's SCA pipeline against https://github.com/nodatime/nodatime.git@3.1.9. Project source not redistributed.",
+    "url": "https://github.com/nodatime/nodatime.git"
+  },
+  "findings": [
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-44788"
+        ],
+        "id": "GHSA-6c8g-7p36-r338"
+      },
+      "cvss_score": 5.9,
+      "dep_name": "SharpCompress",
+      "dep_version": "0.29.0",
+      "direct": true,
+      "ecosystem": "NuGet",
+      "epss": 0.00313,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:NuGet:SharpCompress:0.29.0:GHSA-6c8g-7p36-r338",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:nuget/SharpCompress@0.29.0",
+      "raptor_risk_estimate": 20.57798867728469,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 20.57798867728469
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    }
+  ]
+}

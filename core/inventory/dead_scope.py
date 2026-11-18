@@ -1,0 +1,664 @@
+"""Detect lexically dead scopes — blocks guarded by an always-false
+condition or build gate, inside which function definitions never bind.
+
+A function defined inside ``if False:`` (Python), ``if (false) {…}``
+(JS/TS), or behind ``#[cfg(any())]`` (Rust) is never created: the
+guard's body never executes / compiles. The substrate's call-graph
+analysis can't see this — two dead-scope functions that call each
+other read as mutually CALLED, masking that the whole scope is dead.
+
+This module returns the *line ranges* of dead scopes. The inventory
+builder maps function ``line_start`` values into those ranges and tags
+the matching items ``lexical_dead=True``; the reachability prepass
+then demotes them regardless of in-scope call edges.
+
+Conservative bias (same as :mod:`core.inventory.module_load_abort`):
+only fire on unambiguously-constant guards, plus — for C/C++ — on
+file-scope ``static`` functions with no caller in their translation
+unit. ``if DEBUG:`` is NOT dead (DEBUG is a runtime name); ``if
+False:`` IS. ``#[cfg(test)]`` is NOT dead (it compiles under the test
+profile); ``#[cfg(any())]`` IS (an empty ``any()`` is the canonical
+always-false cfg). False negatives are cheap (miss a deferral); false
+positives are expensive (silence a real finding in live code).
+
+Per-language detection currently handled:
+
+  * Python: ``if <falsey-constant>:`` / ``while <falsey-constant>:``
+    — the BODY only (``else`` / ``elif`` branches stay live). Falsey
+    constants: ``False``, ``0``, ``0.0``, ``""``, ``None``.
+  * JavaScript / TypeScript: ``if (false) {…}`` / ``if (0) {…}`` at
+    any brace depth — the guarded block range.
+  * C / C++: ``static`` functions whose name occurs exactly once in
+    the translation unit (definition only, no callers) — provably
+    dead at file scope.
+  * Rust: ``if false {…}`` blocks, and ``#[cfg(any())]`` /
+    ``#[cfg(all(any()))]`` attributes — the following ``fn`` block.
+  * PHP: ``if (false) {…}`` / ``if (0)`` / ``if (null)`` blocks —
+    the guarded block range.
+  * Ruby: ``if false`` / ``if nil`` / ``unless true`` /
+    ``while false`` blocks, matched by indentation-anchored ``end``.
+
+Other languages return ``[]`` (no detector wired) — graceful
+degradation; the consumer treats absence as "no dead scope found",
+never as "everything is live".
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import re
+from core.source.strip import blank_c_noncode
+
+from bisect import bisect_right
+from collections import Counter
+
+logger = logging.getLogger(__name__)
+
+
+def _newline_offsets(source: str) -> list[int]:
+    """Offsets of every ``\\n`` in ``source``, computed once so
+    per-match line numbers are a bisect instead of an O(offset)
+    ``str.count`` — the count-per-match spelling made a crafted file
+    of thousands of tiny matches O(matches x file-size), hours of CPU
+    within the builder's 8 MiB per-file cap (and one stalled worker
+    evicts exactly that file from the inventory)."""
+    return [m.start() for m in re.finditer("\n", source)]
+
+
+def _line_at(offsets: list[int], pos: int) -> int:
+    """1-indexed line number of character ``pos``."""
+    return bisect_right(offsets, pos - 1) + 1
+
+# A dead scope is reported as an inclusive ``(start_line, end_line)``
+# 1-indexed range. A function whose ``line_start`` falls within any
+# returned range is lexically dead.
+DeadRange = tuple[int, int]
+
+
+def detect_dead_scopes(language: str, content: str) -> list[DeadRange]:
+    """Per-language dispatch. Returns inclusive 1-indexed line ranges
+    of lexically dead scopes, or ``[]`` when none found (or the
+    language has no detector wired).
+
+    Best-effort: any parse failure returns ``[]``; the caller treats
+    absence as "no dead scope".
+    """
+    if not content:
+        return []
+    try:
+        if language == "python":
+            return _detect_python(content)
+        if language in ("javascript", "typescript", "tsx"):
+            return _detect_javascript(language, content)
+        if language in ("c", "cpp"):
+            return _detect_c(content)
+        if language == "rust":
+            return _detect_rust(content)
+        if language == "php":
+            return _detect_php(content)
+        if language == "ruby":
+            return _detect_ruby(content)
+    except Exception:  # noqa: BLE001
+        return []
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+
+
+def _detect_python(content: str) -> list[DeadRange]:
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(content)
+    except SyntaxError:
+        return []
+    ranges: list[DeadRange] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.While)) and _py_test_is_false(
+            node.test
+        ):
+            # Only the guard's BODY is dead — orelse (else / elif)
+            # stays live and is walked separately by ast.walk, so a
+            # const-false elif nested in orelse is still caught on its
+            # own iteration.
+            body = node.body
+            if not body:
+                continue
+            start = body[0].lineno
+            end = max(_py_end_line(s) for s in body)
+            ranges.append((start, end))
+    return ranges
+
+
+def _py_test_is_false(test: ast.expr) -> bool:
+    """True iff the guard expression is an unambiguous falsey literal
+    (``False`` / ``0`` / ``0.0`` / ``""`` / ``None``). Runtime names
+    (``if DEBUG:``) and any non-literal expression are NOT dead."""
+    if not isinstance(test, ast.Constant):
+        return False
+    return not bool(test.value)
+
+
+def _py_end_line(stmt: ast.stmt) -> int:
+    return getattr(stmt, "end_lineno", None) or stmt.lineno
+
+
+# ---------------------------------------------------------------------------
+# JavaScript / TypeScript — brace-tracked ``if (false) {…}`` blocks.
+# Regex finds the guard header; manual brace matching finds the block
+# extent. Non-code text (comments, strings, templates, regex literals,
+# JSX text) is blanked by the tokenizer-grade shared substrate
+# (:func:`core.inventory.lexical_view.blank_noncode`) — hand-rolled
+# lexing repeatedly diverged from a real JS lexer on hostile shapes
+# (regex-vs-division guesses, comment openers consumed by fake regex
+# terminators), letting a hostile repo range live code as
+# lexical_dead, a hard-suppress witness. No grammar / parse errors →
+# bail on the whole file (no ranges — toward no suppression).
+# ---------------------------------------------------------------------------
+
+
+_JS_DEAD_IF = re.compile(r"\bif\s*\(\s*(?:false|0)\s*\)\s*\{")
+
+
+def _detect_javascript(language: str, content: str) -> list[DeadRange]:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode(language, content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; a
+        # partial view could range live code as dead (a hard-suppress
+        # witness). Bail on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
+    ranges: list[DeadRange] = []
+    # Native views need coordinates only after a complete range is found.
+    # Keep adapter preparation in its original order.
+    offsets = None if type(stripped) is str else _newline_offsets(stripped)
+    for m in _JS_DEAD_IF.finditer(stripped):
+        brace_pos = m.end() - 1
+        close = _match_brace(stripped, brace_pos)
+        if close is None:
+            continue
+        if offsets is None:
+            offsets = _newline_offsets(stripped)
+        ranges.append((_line_at(offsets, m.start()),
+                       _line_at(offsets, close)))
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# Rust — ``if false {…}`` blocks plus ``#[cfg(any())]`` attributes
+# (empty ``any()`` is the canonical always-false cfg) gating a fn.
+# Matched over the tokenizer-grade blanked view: comments (line, block
+# — nested included, doc), string literals (raw forms included) and
+# char literals are spaced out first, so ``if false {`` /
+# ``#[cfg(any())]`` in a comment or string can never range live code
+# dead. No grammar / parse errors → bail (no ranges).
+# ---------------------------------------------------------------------------
+
+
+_RUST_DEAD_IF = re.compile(r"\bif\s+false\s*\{")
+# ``#[cfg(any())]`` or ``#[cfg(all(any()))]`` — empty any() is false,
+# and all(false) is false. Whitespace-tolerant.
+_RUST_DEAD_CFG = re.compile(
+    r"#\s*\[\s*cfg\s*\(\s*(?:any\s*\(\s*\)|all\s*\(\s*any\s*\(\s*\)\s*\))\s*\)\s*\]"
+)
+# The IMMEDIATELY-following item, allowing chained attributes,
+# visibility and fn qualifiers between the cfg and the keyword. An
+# always-false cfg gates exactly the next item — so we only range it
+# when that item is a ``fn`` or ``mod`` (whose body is then dead). If
+# the cfg gates a non-fn/mod item (``struct`` / ``const`` / ``use`` /
+# ``impl`` / ``static``) we must NOT grab an unrelated ``fn`` later in
+# the file — that was a false positive flagging live code as dead.
+_RUST_ITEM_AFTER_CFG = re.compile(
+    r"\s*(?:#\s*\[[^\]]*\]\s*)*"                       # chained attrs
+    r"(?:pub\s*(?:\([^)]*\)\s*)?)?"                    # visibility
+    r"(?:(?:async|unsafe|const|extern(?:\s+\"[^\"]*\")?)\s+)*"  # qualifiers
+    r"(fn|mod)\b"
+)
+
+
+def _detect_rust(content: str) -> list[DeadRange]:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("rust", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; bail
+        # on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
+    ranges: list[DeadRange] = []
+    # Native views need coordinates only after a complete range is found.
+    # Keep adapter preparation in its original order.
+    offsets = None if type(stripped) is str else _newline_offsets(stripped)
+    # ``if false { … }`` blocks.
+    for m in _RUST_DEAD_IF.finditer(stripped):
+        brace_pos = m.end() - 1
+        close = _match_brace(stripped, brace_pos)
+        if close is None:
+            continue
+        if offsets is None:
+            offsets = _newline_offsets(stripped)
+        ranges.append((_line_at(offsets, m.start()),
+                       _line_at(offsets, close)))
+    # ``#[cfg(any())]`` gating the immediately-following fn / mod.
+    for m in _RUST_DEAD_CFG.finditer(stripped):
+        if type(stripped) is str:
+            # This pattern has no subject-start anchors or lookbehind: matching
+            # at the suffix offset is equivalent without copying that suffix.
+            item_start = m.end()
+            if not _RUST_ITEM_AFTER_CFG.match(stripped, item_start):
+                continue
+            brace_pos = stripped.find("{", item_start)
+            if brace_pos == -1:
+                continue
+            # Only a semicolon BEFORE the first brace refuses a bodyless
+            # item. Searching later text needlessly re-scans every suffix.
+            if stripped.find(";", item_start, brace_pos) != -1:
+                continue
+        else:
+            after = stripped[m.end():]
+            if not _RUST_ITEM_AFTER_CFG.match(after):
+                # cfg gates a non-fn/mod item — do not range (avoids the
+                # false positive of grabbing an unrelated later fn).
+                continue
+            # First ``{`` after the attribute is the gated item's body —
+            # nothing between the cfg and the body uses braces (attributes
+            # use ``[]``, visibility uses ``()``, generics use ``<>``).
+            # A bodyless item (e.g. ``mod dead_mod;``) has no ``{`` before
+            # its ``;`` — skip rather than latching onto the next item.
+            brace_rel = after.find("{")
+            semi_rel = after.find(";")
+            if brace_rel == -1:
+                continue
+            if semi_rel != -1 and semi_rel < brace_rel:
+                continue
+            brace_pos = m.end() + brace_rel
+        close = _match_brace(stripped, brace_pos)
+        if close is None:
+            continue
+        # Range spans from the attribute to the item's closing brace,
+        # so the fn/mod ``line_start`` is captured (and, for mod, every
+        # nested fn inside the dead module).
+        if offsets is None:
+            offsets = _newline_offsets(stripped)
+        ranges.append((_line_at(offsets, m.start()),
+                       _line_at(offsets, close)))
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# C / C++ — ``static`` functions with zero callers in the translation unit.
+#
+# A ``static`` function has file scope: it can only be called from
+# within its translation unit. If the function name (as a whole-word
+# match) appears exactly once in the file after stripping comments and
+# string/char literals, the definition is the only occurrence — no
+# code in the file calls it, so it is provably dead. The compiler
+# would emit ``-Wunused-function`` and optimise it away.
+#
+# Conservative: names appearing in macros, initialiser designators,
+# or sizeof expressions all count as occurrences, so we under-detect
+# rather than over-detect. ``__attribute__((constructor))`` /
+# ``destructor`` functions are skipped (called by the runtime, not by
+# source-level call sites).
+# ---------------------------------------------------------------------------
+
+
+_C_NOT_FUNC_NAMES = frozenset({
+    "if", "while", "for", "switch", "sizeof", "typeof", "alignof",
+    "return", "goto", "case", "do",
+    "void", "int", "char", "short", "long", "float", "double",
+    "unsigned", "signed", "bool", "_Bool",
+    "const", "volatile", "restrict", "_Atomic",
+    "struct", "enum", "union", "typedef",
+    "inline", "__inline", "__inline__", "__forceinline",
+    "__attribute__", "__extension__", "__typeof__",
+})
+
+
+
+
+# Scan-work budget for _detect_c. A crafted file of thousands of tiny
+# ``static`` definitions (or repeated never-closing headers) otherwise
+# makes every candidate re-scan toward EOF — O(candidates x file-size),
+# hours of CPU on a single 8 MiB input (the builder's per-file cap).
+# Legitimate code consumes roughly one file-length of scanning in total
+# (each body is walked once), so the factor leaves generous headroom;
+# on exhaustion we return the ranges found so far (under-detection is
+# the cheap, sound failure mode).
+_C_SCAN_BUDGET_FACTOR = 8
+# A parameter list longer than this is not a plausible function header —
+# same cap idea as the extractor's _MAX_C_LINE quadratic guard.
+_C_MAX_PARAM_SCAN = 16 * 1024
+
+
+def _detect_c(content: str) -> list[DeadRange]:
+    stripped = blank_c_noncode(content)
+    ranges: list[DeadRange] = []
+    offsets: list[int] | None = None
+    budget = _C_SCAN_BUDGET_FACTOR * len(stripped)
+    # Whole-word occurrence count for every identifier, computed once —
+    # a per-candidate re.findall over the full file is the other half of
+    # the O(candidates x file-size) blowup. Built lazily: most files have
+    # no static-function candidates at all.
+    counts: Counter[str] | None = None
+
+    for m in re.finditer(r"\bstatic\b", stripped):
+        if budget <= 0:
+            break
+        paren_pos = None
+        for j in range(m.end(), min(m.end() + 500, len(stripped))):
+            c = stripped[j]
+            if c == "(":
+                paren_pos = j
+                break
+            if c in ";{}":
+                break
+        if paren_pos is None:
+            continue
+
+        between = stripped[m.end():paren_pos]
+        name_match = re.search(r"\b(\w+)\s*$", between)
+        if not name_match:
+            continue
+        name = name_match.group(1)
+
+        if name in _C_NOT_FUNC_NAMES:
+            continue
+        if re.search(r"constructor|destructor", between):
+            continue
+
+        depth = 1
+        j = paren_pos + 1
+        param_limit = min(len(stripped), paren_pos + 1 + _C_MAX_PARAM_SCAN)
+        while j < param_limit and depth > 0:
+            if stripped[j] == "(":
+                depth += 1
+            elif stripped[j] == ")":
+                depth -= 1
+            j += 1
+        budget -= j - paren_pos
+        if depth != 0:
+            continue
+
+        brace_pos = None
+        for k in range(j, min(j + 200, len(stripped))):
+            if stripped[k] == "{":
+                brace_pos = k
+                break
+            if stripped[k] == ";":
+                break
+        if brace_pos is None:
+            continue
+
+        close = _match_brace(stripped, brace_pos)
+        # A failed match scanned to EOF; charge the worst case so a file
+        # of never-closing bodies cannot force repeated full-file scans.
+        budget -= (close if close is not None else len(stripped)) - brace_pos
+        if close is None:
+            continue
+
+        if re.search(r"\binline\b|__inline\b|__inline__\b|__forceinline\b",
+                     between):
+            continue
+
+        if counts is None:
+            counts = Counter(re.findall(r"\w+", stripped))
+        if counts[name] <= 1:
+            # Line numbers via the shared one-pass offsets — the
+            # per-range str.count spelling was the half of the
+            # O(candidates x file-size) class the _C_SCAN_BUDGET
+            # comment didn't cover (built lazily: most files never
+            # append a range).
+            if offsets is None:
+                offsets = _newline_offsets(stripped)
+            ranges.append((_line_at(offsets, m.start()),
+                           _line_at(offsets, close)))
+
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# Shared — brace matcher with string / char / line-comment skipping.
+# ---------------------------------------------------------------------------
+
+
+def _match_brace(source: str, open_pos: int) -> int | None:
+    """Given the index of an opening ``{``, return the index of the
+    matching ``}``. Skips string / template / char literals and line
+    comments so braces inside them don't unbalance the count. Returns
+    None on malformed input."""
+    if open_pos < 0 or open_pos >= len(source) or source[open_pos] != "{":
+        return None
+    depth = 1
+    i = open_pos + 1
+    n = len(source)
+    while i < n:
+        c = source[i]
+        if c in "\"'`":
+            # Rust lifetime / loop-label tokens (``'a``, ``'static``,
+            # ``'_``, ``'label:``) never close with a quote — treating
+            # one as a string opener swallows everything to the next
+            # ``'`` byte and desyncs the depth count over live code.
+            # The token grammar is ``'`` + XID_Start-or-``_``; only a
+            # single-char form closing immediately (``'x'`` — a char
+            # literal, its interior blanked by the substrate but the
+            # quotes kept) is a literal. isalpha() is Unicode-aware,
+            # matching rustc's XID_Start acceptance of non-ASCII
+            # lifetimes.
+            if c == "'" and i + 1 < n and (
+                    source[i + 1].isalpha() or source[i + 1] == "_"):
+                if i + 2 >= n or source[i + 2] != "'":
+                    i += 1
+                    continue
+            j = _skip_string(source, i)
+            if j is None:
+                return None
+            i = j
+            continue
+        if c == "/" and i + 1 < n and source[i + 1] == "/":
+            nl = source.find("\n", i)
+            if nl == -1:
+                return None
+            i = nl + 1
+            continue
+        if c == "/" and i + 1 < n and source[i + 1] == "*":
+            i += 2
+            bc_depth = 1
+            while i < n and bc_depth > 0:
+                if source[i] == "/" and i + 1 < n and source[i + 1] == "*":
+                    bc_depth += 1
+                    i += 2
+                elif source[i] == "*" and i + 1 < n and source[i + 1] == "/":
+                    bc_depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _skip_string(source: str, start: int) -> int | None:
+    """Advance past a string / template / char literal starting at
+    ``start``. Handles backslash escapes."""
+    quote = source[start]
+    i = start + 1
+    n = len(source)
+    while i < n:
+        c = source[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == quote:
+            return i + 1
+        i += 1
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PHP — ``if (false) {…}`` / ``if (0)`` / ``if (null)`` blocks. Same brace
+# shape as JS, so the JS block-matching is reused. Conservative: only
+# literal always-false constants (NOT ``if ($flag)`` — a runtime name).
+# Mutually-recursive functions inside the block otherwise read CALLED,
+# masking that the whole block is dead. Matched over the tokenizer-grade
+# blanked view: comments, strings, heredocs/nowdocs and the HTML text
+# outside the PHP tags are spaced out first, so string data can never
+# open a dead range over live code. No grammar / parse errors → bail.
+# ---------------------------------------------------------------------------
+
+
+_PHP_DEAD_IF = re.compile(r"\bif\s*\(\s*(?:false|0|null)\s*\)\s*\{")
+
+
+def _detect_php(content: str) -> list[DeadRange]:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("php", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; bail
+        # on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
+    ranges: list[DeadRange] = []
+    native_view = type(stripped) is str
+    line = 1
+    line_offset = 0
+    for m in _PHP_DEAD_IF.finditer(stripped):
+        close = _match_brace(stripped, m.end() - 1)
+        if close is None:
+            continue
+        if native_view:
+            # Starts advance even when nested closing positions move back.
+            # Count each gap once and the body locally; avoid a full-file
+            # newline table or repeated scans of the preceding prefix.
+            offset = m.start()
+            line += stripped.count("\n", line_offset, offset)
+            line_offset = offset
+            ranges.append((line, line + stripped.count("\n", offset, close)))
+        else:
+            ranges.append((stripped.count("\n", 0, m.start()) + 1,
+                           stripped.count("\n", 0, close) + 1))
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# Ruby — ``if false`` / ``if nil`` / ``unless true`` / ``while false`` blocks
+# (Ruby's only falsey constants are ``false`` and ``nil``). No braces, so the
+# matching ``end`` is found by INDENTATION anchoring: Ruby's universal
+# convention puts the closing ``end`` at the same column as the opening
+# keyword. The dead branch ends at an ``else``/``elsif`` (live) or the ``end``
+# at that column; if the scan dedents past the opener first (malformed /
+# unconventional), we BAIL and report nothing — a false positive here would
+# hard-suppress live code, so ambiguity must under-detect.
+#
+# Scanned over the tokenizer-grade blanked view: comments, strings,
+# heredoc bodies and the ``__END__`` section are spaced out first, so
+# an ``if false`` line inside a heredoc (idiomatic Ruby: SQL, usage
+# banners) can never open a dead range over live code. No grammar /
+# parse errors → bail (no ranges).
+# ---------------------------------------------------------------------------
+
+
+_RB_DEAD_IF = re.compile(
+    r"^(\s*)(?:if\s+(?:false|nil)|unless\s+true|while\s+false|until\s+true)"
+    r"\s*(?:then\b.*)?$")
+_RB_BRANCH_AT = re.compile(r"^(\s*)(?:else|elsif)\b")
+_RB_END_AT = re.compile(r"^(\s*)end\b")
+
+
+def _detect_ruby(content: str) -> list[DeadRange]:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("ruby", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; bail
+        # on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
+    lines = stripped.split("\n")  # line-model: byte-decoded view; pattern tails (\s*/.*) tolerate \r and captures are leading indent
+    ranges: list[DeadRange] = []
+    # Single pass with a stack of pending dead-if openers. Per-opener
+    # forward rescans made a balanced nested ladder O(openers x file)
+    # — minutes of CPU inside the builder's per-file cap, and one
+    # stalled worker evicts exactly that file from the inventory. The
+    # close / bail decisions depend only on (line, opener indent), so
+    # evaluating each line against the stack innermost-first takes the
+    # same decisions the independent scans took.
+    stack: list[tuple[int, str]] = []   # (opener line idx, opener indent)
+    for j, lj in enumerate(lines):
+        if lj.strip():
+            cur = lj[:len(lj) - len(lj.lstrip())]
+            be = _RB_BRANCH_AT.match(lj)
+            en = _RB_END_AT.match(lj)
+            while stack:
+                i, ind = stack[-1]
+                if (be and be.group(1) == ind) or (en and en.group(1) == ind):
+                    # dead branch body is lines i+1..j-1 (0-indexed) →
+                    # (i+2 .. j) 1-indexed.
+                    stack.pop()
+                    if i + 2 <= j:
+                        ranges.append((i + 2, j))
+                    # The same line may close / bail enclosing openers
+                    # too (their checks see the same (line, indent)).
+                    continue
+                if len(cur) <= len(ind) and cur != ind:
+                    # Dedented past the opener — or at/inside the
+                    # opener's column with a DIFFERENT whitespace mix
+                    # (space vs tab: same length, different bytes
+                    # evades both the byte-equal closer match above
+                    # and a length-only dedent check, letting the scan
+                    # latch onto a later end and range live defs
+                    # dead). Either way the indentation anchor is
+                    # broken — bail this opener (sound, under-detect)
+                    # and let enclosing openers judge the line.
+                    stack.pop()
+                    continue
+                break
+        m = _RB_DEAD_IF.match(lj)
+        if not m:
+            continue
+        # Self-contained one-liner (``if false then nil end``): the
+        # opener's own ``end`` sits on the same line, so scanning the
+        # FOLLOWING lines for an indentation-matched ``end`` would
+        # latch onto an unrelated later block and range live code
+        # (e.g. the next ``def``) as dead. The whole construct lives
+        # on one line — nothing below it is dead; skip (under-detect,
+        # sound). Checked on the comment-stripped line; an ``end``
+        # inside a string also skips — same cheap FN direction.
+        if re.search(r"\bend\b", lj[m.end(1):]):
+            continue
+        stack.append((j, m.group(1)))
+    # Openers still pending at EOF never found a closer — no range
+    # (exactly the independent scans' run-to-EOF outcome). Emission
+    # order above is innermost-first; the independent scans emitted
+    # opener-order (ascending start line) — restore it.
+    ranges.sort()
+    return ranges
+
+
+__all__ = ["DeadRange", "detect_dead_scopes"]

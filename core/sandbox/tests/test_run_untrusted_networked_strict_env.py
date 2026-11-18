@@ -9,9 +9,11 @@ cc_dispatch-style migrations that build env from semi-trusted sources.
 import pytest
 
 from core.sandbox import context as _ctx
+from core.sandbox.tests.capability import requires_userns
 
 
-def test_run_untrusted_networked_forwards_strict_env(monkeypatch):
+@requires_userns
+def test_run_untrusted_networked_forwards_strict_env(monkeypatch, tmp_path):
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -25,11 +27,15 @@ def test_run_untrusted_networked_forwards_strict_env(monkeypatch):
         return _Stub()
 
     monkeypatch.setattr(_ctx, "run", fake_run)
+    # The darwin arm of run_untrusted's entry gate smoke-tests the REAL
+    # host's sandbox-exec; pretend it holds so the forwarding under test
+    # is reached on every platform (including emulated-darwin runs).
+    monkeypatch.setattr(_ctx, "check_seatbelt_available", lambda: True)
 
     _ctx.run_untrusted_networked(
         ["echo", "ok"],
-        target="/tmp/raptor-target",
-        output="/tmp/raptor-output",
+        target=str(tmp_path / "target"),
+        output=str(tmp_path / "output"),
         proxy_hosts=["api.example.com"],
     )
 
@@ -50,7 +56,8 @@ def test_run_untrusted_networked_forwards_strict_env(monkeypatch):
     assert captured["kwargs"].get("proxy_hosts") == ["api.example.com"]
 
 
-def test_run_untrusted_rejects_caller_strict_env():
+@requires_userns
+def test_run_untrusted_rejects_caller_strict_env(tmp_path, monkeypatch):
     """Caller passing strict_env= must get the clean guard message, not
     a confusing "multiple values for keyword argument" TypeError.
 
@@ -59,22 +66,27 @@ def test_run_untrusted_rejects_caller_strict_env():
     misuse) or collide with the wire (TypeError that doesn't name the
     real problem). The forbidden-kwargs guard surfaces the misuse.
     """
+    # Entry-gate stub, same rationale as the forwarding test above.
+    monkeypatch.setattr(_ctx, "check_seatbelt_available", lambda: True)
     with pytest.raises(TypeError, match="strict_env"):
         _ctx.run_untrusted(
             ["echo", "ok"],
-            target="/tmp/raptor-target",
-            output="/tmp/raptor-output",
+            target=str(tmp_path / "target"),
+            output=str(tmp_path / "output"),
             strict_env=False,
         )
 
 
-def test_run_untrusted_networked_rejects_caller_strict_env():
+@requires_userns
+def test_run_untrusted_networked_rejects_caller_strict_env(tmp_path, monkeypatch):
     """Same defensive parity for the networked variant."""
+    # Entry-gate stub, same rationale as the forwarding test above.
+    monkeypatch.setattr(_ctx, "check_seatbelt_available", lambda: True)
     with pytest.raises(TypeError, match="strict_env"):
         _ctx.run_untrusted_networked(
             ["echo", "ok"],
-            target="/tmp/raptor-target",
-            output="/tmp/raptor-output",
+            target=str(tmp_path / "target"),
+            output=str(tmp_path / "output"),
             proxy_hosts=["api.example.com"],
             strict_env=False,
         )

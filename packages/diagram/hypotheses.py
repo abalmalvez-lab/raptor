@@ -3,17 +3,29 @@ Mermaid diagram generator for hypotheses.json (produced by /validate Stage B).
 
 Shows the evidence chain: finding → hypothesis → predictions → results.
 This is the diagram to look at when deciding whether something is exploitable
-enough to write a PoC for,it shows the concrete predictions and their
+enough to write a PoC for — it shows the concrete predictions and their
 outcomes, not just whether a node is "confirmed".
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from core.json import load_json
+
+from .caps import DEFAULT_CAP, cap_elements, truncation_marker_lines
+from .envelope import unwrap_list
 from .sanitize import sanitize as _sanitize, sanitize_id as _sid
+
+# Shared flow_trace rationale (see packages.diagram.caps): hypotheses
+# and their predictions come from LLM/run artifacts with no upstream
+# bound. Predictions are per-hypothesis leaf nodes — 50 keeps a
+# pathological fan-out readable while real hypotheses carry a handful.
+_MAX_HYPOTHESES = DEFAULT_CAP
+_MAX_PREDICTIONS_PER_HYP = 50
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 _STATUS_SYMBOL = {
@@ -58,6 +70,13 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
     if not hypotheses:
         return 'flowchart TD\n    EMPTY["No hypotheses"]'
 
+    # flow_trace's ingestion idiom: malformed elements drop, the rest
+    # still renders (the renderer's per-section try/except otherwise
+    # loses the WHOLE section to one junk element).
+    hypotheses = [h for h in hypotheses if isinstance(h, dict)]
+    hypotheses, dropped_hyps = cap_elements(hypotheses, _MAX_HYPOTHESES)
+    dropped_preds = 0
+
     # Group by finding
     by_finding: dict[str, list[dict]] = {}
     ungrouped: list[dict] = []
@@ -70,7 +89,11 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
 
     lines = ["flowchart TD"]
 
-    hyp_node_ids: dict[str, str] = {}  # hyp id → mermaid node id
+    # Keyed by the hypothesis OBJECT (via id()), not by its "id"
+    # field: an id-less hypothesis or two entries sharing one id would
+    # otherwise miss (or clobber) the styling lookup, rendering a
+    # confirmed hypothesis without its status colouring.
+    hyp_node_ids: dict[int, str] = {}  # id(hyp dict) → mermaid node id
     pred_node_ids: list[tuple[str, str, str]] = []  # (hyp_node_id, pred_node_id, pred_status)
 
     node_counter = [0]
@@ -80,26 +103,28 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
         return f"{prefix}{node_counter[0]}"
 
     def emit_hypothesis(hyp: dict, indent: str = "    ") -> str:
-        hid = hyp.get("id", f"H{node_counter[0]}")
         nid = next_id("HN")
-        hyp_node_ids[hid] = nid
+        hyp_node_ids[id(hyp)] = nid
         label = _hyp_label(hyp)
         status = _sanitize(hyp.get("status", "testing"))
-        if status == "confirmed":
-            lines.append(f'{indent}{nid}["{label}"]')
-        elif status == "disproven":
+        if status in {"confirmed", "disproven"}:
             lines.append(f'{indent}{nid}["{label}"]')
         else:
             lines.append(f'{indent}{nid}{{"{label}"}}')
 
-        # Predictions
-        for pred in hyp.get("predictions", []):
+        # Predictions — same drop-malformed idiom as the top-level list.
+        nonlocal dropped_preds
+        preds = hyp.get("predictions", [])
+        if not isinstance(preds, list):
+            preds = []
+        preds = [p for p in preds if isinstance(p, dict)]
+        preds, over = cap_elements(preds, _MAX_PREDICTIONS_PER_HYP)
+        dropped_preds += over
+        for pred in preds:
             pnid = next_id("PN")
             plabel = _prediction_label(pred)
             pstatus = _sanitize(pred.get("status", "testing"))
-            if pstatus == "confirmed":
-                lines.append(f'{indent}{pnid}["{plabel}"]')
-            elif pstatus == "disproven":
+            if pstatus in {"confirmed", "disproven"}:
                 lines.append(f'{indent}{pnid}["{plabel}"]')
             else:
                 lines.append(f'{indent}{pnid}(("{plabel}"))')
@@ -135,17 +160,16 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
     testing_nodes: list[str] = []
 
     for hyp in hypotheses:
-        hid = hyp.get("id", "")
-        nid = hyp_node_ids.get(hid)
-        if not nid:
+        node_id = hyp_node_ids.get(id(hyp))
+        if not node_id:
             continue
         status = _sanitize(hyp.get("status", "testing"))
         if status == "confirmed":
-            confirmed_nodes.append(nid)
+            confirmed_nodes.append(node_id)
         elif status == "disproven":
-            disproven_nodes.append(nid)
+            disproven_nodes.append(node_id)
         else:
-            testing_nodes.append(nid)
+            testing_nodes.append(node_id)
 
     lines.append("")
     lines.append("    classDef confirmed fill:#dcfce7,stroke:#16a34a,color:#14532d")
@@ -170,13 +194,18 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
     for cls, ids in pred_by_status.items():
         lines.append(f"    class {','.join(ids)} {cls}")
 
+    lines.extend(truncation_marker_lines(
+        "TRUNC", dropped_hyps, "hypotheses", _MAX_HYPOTHESES))
+    lines.extend(truncation_marker_lines(
+        "TRUNCPR", dropped_preds, "predictions",
+        _MAX_PREDICTIONS_PER_HYP))
+
     return "\n".join(lines)
 
 
 def generate_from_file(path: Path) -> str:
     data = load_json(path)
     if data is None:
-        raise ValueError(f"Failed to load {path}")
-    if isinstance(data, dict):
-        data = data.get("hypotheses", list(data.values())[0] if data else [])
-    return generate(data if isinstance(data, list) else [])
+        msg = f"Failed to load {path}"
+        raise ValueError(msg)
+    return generate(unwrap_list(data, keys=("hypotheses",)) or [])

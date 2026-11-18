@@ -3,23 +3,23 @@ would have been allowed under enforcement; `audit-verbose` logs them all.
 
 Mocked tests of the filter logic (allowlist matching, path resolution,
 write-intent detection, sockaddr decoding) plus an end-to-end test that
-runs both profiles against the same workload and verifies the record
-count differs in the expected direction.
+runs both profiles against explicit file operations and verifies permitted
+reads are filtered while out-of-policy write attempts remain visible.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import platform
-from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
-from core.sandbox import probes
-from core.sandbox import ptrace_probe
+from core.sandbox import audit_budget, probes, ptrace_probe
+from core.sandbox import evidence as evidence_mod
 from core.sandbox import tracer as tracer_mod
-from core.sandbox import audit_budget
-
+from core.sandbox.tests.capability import requires_landlock
 
 pytestmark = pytest.mark.skipif(
     not tracer_mod._is_supported_arch(),
@@ -43,9 +43,9 @@ class TestTracerCoversAllBlockedSyscalls:
 
     def test_x86_64_tracer_table_covers_seccomp_blocklist(self):
         from core.sandbox.seccomp import (
+            _AUDIT_EXTRA_TRACE_SYSCALLS,
             _SECCOMP_BLOCK_ALWAYS,
             _SECCOMP_BLOCK_UNLESS_DEBUG,
-            _AUDIT_EXTRA_TRACE_SYSCALLS,
         )
         from core.sandbox.tracer import _X86_64_SYSCALL_NAMES
 
@@ -62,21 +62,25 @@ class TestTracerCoversAllBlockedSyscalls:
         )
 
     def test_aarch64_tracer_table_covers_seccomp_blocklist(self):
-        # NOTE: aarch64 has no `open` syscall (only `openat`), so
-        # `open` is intentionally absent from _AARCH64_SYSCALL_NAMES.
-        # We exclude it from the expected set on aarch64.
+        # NOTE: aarch64 is an at-only ABI — the legacy non-at path
+        # syscalls (open, unlink, rename, link, symlink, mkdir,
+        # mknod, chmod, chown, lchown) do not exist there; libseccomp
+        # resolves them to -1 and the install loop skips them, so the
+        # tracer can never see them. Exclude them from the expected
+        # set on aarch64.
         from core.sandbox.seccomp import (
+            _AUDIT_EXTRA_TRACE_SYSCALLS,
             _SECCOMP_BLOCK_ALWAYS,
             _SECCOMP_BLOCK_UNLESS_DEBUG,
-            _AUDIT_EXTRA_TRACE_SYSCALLS,
         )
         from core.sandbox.tracer import _AARCH64_SYSCALL_NAMES
 
         expected = (set(_SECCOMP_BLOCK_ALWAYS)
                     | set(_SECCOMP_BLOCK_UNLESS_DEBUG)
                     | set(_AUDIT_EXTRA_TRACE_SYSCALLS))
-        # aarch64 doesn't have plain `open` — only `openat`.
-        expected.discard("open")
+        # Legacy non-at syscalls absent from the aarch64 ABI.
+        expected -= {"open", "unlink", "rename", "link", "symlink",
+                     "mkdir", "mknod", "chmod", "chown", "lchown"}
         known = set(_AARCH64_SYSCALL_NAMES.values())
         missing = expected - known
         assert missing == set(), (
@@ -104,6 +108,7 @@ class TestAuditSystemRoMatchesContext:
         # functions (which require ptrace/landlock context).
         import inspect
         import re
+
         from core.sandbox import _spawn, context
 
         spawn_src = inspect.getsource(_spawn.run_sandboxed)
@@ -117,12 +122,14 @@ class TestAuditSystemRoMatchesContext:
         assert spawn_m, "could not find _system_ro literal in _spawn"
         spawn_paths = re.findall(r'"([^"]+)"', spawn_m.group(1))
 
-        # Extract effective_read_paths default in context.
+        # Extract the restricted-read default from its helper in context.
         ctx_m = re.search(
-            r"effective_read_paths\s*=\s*\[\s*((?:\"[^\"]+\"[,\s]*)+)\]",
+            r"def _restricted_read_allowlist\(\).*?"
+            r"paths\s*=\s*\[\s*((?:\"[^\"]+\"[,\s]*)+)\]",
             ctx_src,
+            re.DOTALL,
         )
-        assert ctx_m, "could not find effective_read_paths in context"
+        assert ctx_m, "could not find restricted read allowlist in context"
         ctx_paths = re.findall(r'"([^"]+)"', ctx_m.group(1))
 
         assert set(spawn_paths) == set(ctx_paths), (
@@ -154,6 +161,7 @@ class TestTracerExitCodesAgreeAcrossDocs:
     def test_actual_returns_match_docstrings(self):
         import inspect
         import re
+
         from core.sandbox import tracer
 
         src = inspect.getsource(tracer)
@@ -263,8 +271,8 @@ class TestJsonlFilenameConstantAgrees:
     Pin both constants are byte-identical."""
 
     def test_tracer_and_summary_filename_constants_match(self):
-        from core.sandbox.tracer import _DENIALS_FILENAME
         from core.sandbox.summary import DENIALS_FILE
+        from core.sandbox.tracer import _DENIALS_FILENAME
         assert _DENIALS_FILENAME == DENIALS_FILE, (
             f"JSONL filename divergence: tracer writes "
             f"{_DENIALS_FILENAME!r}, summary reads {DENIALS_FILE!r}"
@@ -280,7 +288,7 @@ class TestProxyEventResultVocabulary:
     Drift class:
       - Proxy emits a NEW result string but the canonical set
         (_PROXY_EVENT_RESULTS) doesn't list it → test queries that
-        whitelist by canonical set silently miss the event.
+        allowlist by canonical set silently miss the event.
       - Proxy renames an existing result (e.g., `denied_host` to
         `host_denied`) → all consumer filters break silently.
 
@@ -291,6 +299,7 @@ class TestProxyEventResultVocabulary:
     def test_every_emitted_result_is_in_canonical_set(self):
         import inspect
         import re
+
         from core.sandbox import proxy
 
         src = inspect.getsource(proxy)
@@ -323,6 +332,7 @@ class TestProxyEventResultVocabulary:
         # emitting it or it's documentation-only — either way, drift.
         import inspect
         import re
+
         from core.sandbox import proxy
 
         src = inspect.getsource(proxy)
@@ -353,6 +363,7 @@ class TestSeccompIoctlCmdsMatchKernelUapi:
 
     def test_tiocsti_matches_kernel(self):
         import termios
+
         from core.sandbox import seccomp
         assert seccomp._TIOCSTI == termios.TIOCSTI, (
             f"_TIOCSTI={seccomp._TIOCSTI:#x} != termios.TIOCSTI="
@@ -362,11 +373,13 @@ class TestSeccompIoctlCmdsMatchKernelUapi:
 
     def test_tioccons_matches_kernel(self):
         import termios
+
         from core.sandbox import seccomp
         assert seccomp._TIOCCONS == termios.TIOCCONS
 
     def test_tiocsctty_matches_kernel(self):
         import termios
+
         from core.sandbox import seccomp
         # TIOCSCTTY may not be defined as _TIOCSCTTY in seccomp;
         # check the constant by-name via reflection.
@@ -381,6 +394,7 @@ class TestAtFdcwdValue:
 
     def test_at_fdcwd_matches_uapi_header(self):
         import re
+
         import pytest
         candidate_paths = [
             "/usr/include/fcntl.h",
@@ -425,6 +439,7 @@ class TestOpenFlagsMatchKernelUapi:
 
     def test_open_flags_match_os_module(self):
         import os
+
         from core.sandbox import tracer
         # Each constant must match os.O_*
         assert tracer._O_WRONLY == os.O_WRONLY, (
@@ -477,11 +492,11 @@ class TestArchSupportDivergence:
     contributor accidentally REMOVING aarch64 from mount_ns gets
     flagged."""
 
-    EXPECTED_TRACER_ARCHES = {"x86_64", "aarch64"}
+    EXPECTED_TRACER_ARCHES: ClassVar[set] = {"x86_64", "aarch64"}
 
     def test_tracer_arches_are_subset_of_mount_ns_arches(self):
-        from core.sandbox.tracer import _ARCH_INFO
         from core.sandbox.mount_ns import _PIVOT_ROOT_SYSCALL_NR
+        from core.sandbox.tracer import _ARCH_INFO
         tracer_arches = set(_ARCH_INFO.keys())
         mount_arches = set(_PIVOT_ROOT_SYSCALL_NR.keys())
         unsupported_in_mount = tracer_arches - mount_arches
@@ -524,22 +539,24 @@ class TestTracerArgvContract:
     def test_spawn_argv_matches_cli_main_parse(self):
         import inspect
         import re
-        from core.sandbox import _spawn, tracer
 
-        # Extract spawn's argv literal.
-        spawn_src = inspect.getsource(_spawn.run_sandboxed)
+        from core.sandbox import tracer
+        from core.sandbox._tracer_launch import prepare_tracer_launch
+
+        # Both spawn backends use the parent-side launch builder.
+        spawn_src = inspect.getsource(prepare_tracer_launch)
         argv_block = re.search(
-            r"tracer_argv\s*=\s*\[(.*?)\]",
+            r"argv\s*=\s*\[(.*?)\]",
             spawn_src, re.DOTALL,
         )
-        assert argv_block, "tracer_argv literal not found in _spawn"
+        assert argv_block, "argv literal not found in tracer launch builder"
         # Pull the variable names that follow `str(...)`.
         spawn_args = re.findall(
             r"str\((\w+)\)", argv_block.group(1),
         )
         # Plus the optional appended config_path.
-        if "tracer_argv.append" in spawn_src:
-            spawn_args.append("_audit_config_path")
+        if "argv.append" in spawn_src:
+            spawn_args.append("config_arg")
 
         # Extract _cli_main's positional parse.
         cli_src = inspect.getsource(tracer._cli_main)
@@ -585,7 +602,7 @@ class TestTracerArgvContract:
 
 class TestDenialTypeStringsAgreeAcrossModules:
     """Finding U: the denial_type string vocabulary
-    {"network", "write", "seccomp"} is duplicated across at least
+    {"network", "write", "seccomp", "udp"} is duplicated across at least
     five modules:
       - tracer.py:_NAME_TO_TYPE values + _denial_type fallback
       - proxy.py: hard-coded "network" in record_denial call
@@ -598,7 +615,7 @@ class TestDenialTypeStringsAgreeAcrossModules:
     aggregation breaks silently. Pin the canonical set here so
     drift is caught fast."""
 
-    CANONICAL_TYPES = {"network", "write", "seccomp"}
+    CANONICAL_TYPES: ClassVar[set] = {"network", "write", "seccomp", "udp"}
 
     def test_tracer_name_to_type_values_within_canonical(self):
         from core.sandbox.tracer import _NAME_TO_TYPE
@@ -655,7 +672,7 @@ class TestConftestSnapshotMatchesState:
     # Names that are deliberately excluded from snapshotting. Update
     # this set ONLY with a comment explaining why; consider whether
     # the exclusion is still right.
-    DOCUMENTED_EXCLUSIONS = {
+    DOCUMENTED_EXCLUSIONS: ClassVar[set] = {
         "_landlock_cache",  # forking probe; cache persists per-process
         # Snapshotted in conftest.py but via a separate dict-deep-copy
         # mechanism (saved_spec_cache = dict(mod._speculative_failure_cache))
@@ -664,13 +681,21 @@ class TestConftestSnapshotMatchesState:
         # from the regex check despite being properly snapshotted.
         # Added by PR #265 (mount-ns auto-fallback per-cmd cache).
         "_speculative_failure_cache",
+        # Same deep-copy mechanism (saved_engage_cache = dict(...)) — the
+        # per-flag-set engagement cache backing check_unshare_engages.
+        "_unshare_engage_cache",
     }
 
     def test_every_state_var_is_snapshotted_or_excluded(self):
         import re
+        from pathlib import Path
+
         from core.sandbox import state
-        # Pull the snapshot list literal from conftest source.
-        with open("core/sandbox/tests/conftest.py") as f:
+        # Pull the snapshot list literal from conftest source. Absolute,
+        # __file__-anchored so it survives a sibling suite leaving the
+        # process in a different cwd.
+        _conftest = Path(__file__).resolve().parent / "conftest.py"
+        with open(_conftest) as f:
             cf_src = f.read()
         snapshot_names = set(re.findall(
             r'"(_[a-z][a-z0-9_]*)"', cf_src,
@@ -808,8 +833,6 @@ class TestAuditExtrasHaveHandlers:
     act on them."""
 
     def test_every_audit_extra_has_a_handler(self):
-        from core.sandbox.seccomp import _AUDIT_EXTRA_TRACE_SYSCALLS
-        from core.sandbox.tracer import _path_arg_index
         import inspect
 
         # Per-syscall: must be either path-bearing (path_arg_index
@@ -817,6 +840,8 @@ class TestAuditExtrasHaveHandlers:
         # function. Today the only non-path one is connect, which
         # is decoded via decode_sockaddr — pin that explicit case.
         from core.sandbox import tracer
+        from core.sandbox.seccomp import _AUDIT_EXTRA_TRACE_SYSCALLS
+        from core.sandbox.tracer import _path_arg_index
         dispatch_src = inspect.getsource(tracer._handle_waitpid_event)
 
         unhandled = []
@@ -847,7 +872,7 @@ class TestAuditExtrasHaveHandlers:
         # Each audit-extra needs a sensible denial_type so summary
         # aggregation classifies it correctly (write/network/seccomp).
         from core.sandbox.seccomp import _AUDIT_EXTRA_TRACE_SYSCALLS
-        from core.sandbox.tracer import _denial_type, _NAME_TO_TYPE
+        from core.sandbox.tracer import _NAME_TO_TYPE, _denial_type
 
         valid_types = {"write", "network", "seccomp"}
         for syscall in _AUDIT_EXTRA_TRACE_SYSCALLS:
@@ -886,6 +911,7 @@ class TestAuditConfigSchemaAgree:
     def test_audit_config_keys_match(self):
         import inspect
         import re
+
         from core.sandbox import _spawn, tracer
 
         spawn_src = inspect.getsource(_spawn.run_sandboxed)
@@ -953,9 +979,10 @@ class TestAfInetConstantsAgree:
     def test_af_inet_matches_across_seccomp_and_tracer(self):
         # Read seccomp's literals via inspection (they're module-level
         # constants).
-        from core.sandbox import seccomp
-        from core.sandbox import tracer
-        import inspect, re
+        import inspect
+        import re
+
+        from core.sandbox import seccomp, tracer
 
         # tracer's _decode_sockaddr defines AF_INET/AF_INET6 as
         # function-local constants. Pull them via source.
@@ -985,6 +1012,7 @@ class TestAfInetConstantsAgree:
         # on Linux; pin against socket module which reads them from
         # the kernel headers at install time.
         import socket
+
         from core.sandbox import seccomp
         assert seccomp._AF_INET == socket.AF_INET
         assert seccomp._AF_INET6 == socket.AF_INET6
@@ -1018,11 +1046,18 @@ class TestPathInAllowlist:
         assert tracer_mod._path_in_allowlist(
             "/etc", ["", "/usr"]) is False
 
-    def test_multiple_prefixes(self):
-        allow = ["/usr", "/lib", "/tmp"]
-        assert tracer_mod._path_in_allowlist("/tmp/x", allow) is True
-        assert tracer_mod._path_in_allowlist("/lib/y", allow) is True
-        assert tracer_mod._path_in_allowlist("/home/z", allow) is False
+    def test_multiple_prefixes(self, tmp_path):
+        # Three distinct allowlist prefixes; assertions exercise hit
+        # in last entry, hit in middle entry, and miss (path outside
+        # any prefix). Per-test tmp_path so the prefixes stay hermetic.
+        a = str(tmp_path / "a")
+        b = str(tmp_path / "b")
+        c = str(tmp_path / "c")
+        allow = [a, b, c]
+        assert tracer_mod._path_in_allowlist(c + "/x", allow) is True
+        assert tracer_mod._path_in_allowlist(b + "/y", allow) is True
+        outside = str(tmp_path.parent / "elsewhere")
+        assert tracer_mod._path_in_allowlist(outside, allow) is False
 
 
 class TestIsWriteIntent:
@@ -1220,13 +1255,16 @@ class TestFilterDispatchSeccomp:
             "_recorded": recorded,
         }
 
-    def test_filtered_drops_path_in_allowlist(self):
+    def test_filtered_drops_path_in_allowlist(self, tmp_path):
         # /etc is in the read allowlist → openat /etc/hostname filtered.
+        # writable_paths/read_allowlist values are operational config
+        # (real sandbox uses these as conventional defaults); target=
+        # is opaque to the dispatch logic so use tmp_path.
         helpers = self._common_helpers(path_returned="/etc/hostname")
         audit_filter = {
             "verbose": False,
-            "writable_paths": ["/tmp"],
-            "read_allowlist": ["/etc", "/usr", "/tmp"],
+            "writable_paths": [str(tmp_path)],
+            "read_allowlist": ["/etc", "/usr", str(tmp_path)],
             "allowed_tcp_ports": [],
         }
         traced = {1000}
@@ -1234,7 +1272,7 @@ class TestFilterDispatchSeccomp:
         tracer_mod._handle_waitpid_event(
             1000, self._seccomp_event_status(),
             traced, 1000, self._make_arch_info(),
-            Path("/tmp"), budget,
+            tmp_path, budget,
             audit_filter=audit_filter,
             **{k: v for k, v in helpers.items() if not k.startswith("_")},
         )
@@ -1244,13 +1282,13 @@ class TestFilterDispatchSeccomp:
         assert helpers["_recorded"] == []
         assert budget.total_records == 0
 
-    def test_filtered_keeps_path_outside_allowlist(self):
+    def test_filtered_keeps_path_outside_allowlist(self, tmp_path):
         # /home/user/.ssh/id_rsa is NOT in the allowlist → recorded.
         helpers = self._common_helpers(path_returned="/home/user/.ssh/id_rsa")
         audit_filter = {
             "verbose": False,
-            "writable_paths": ["/tmp"],
-            "read_allowlist": ["/etc", "/usr", "/tmp"],
+            "writable_paths": [str(tmp_path)],
+            "read_allowlist": ["/etc", "/usr", str(tmp_path)],
             "allowed_tcp_ports": [],
         }
         traced = {1000}
@@ -1258,7 +1296,7 @@ class TestFilterDispatchSeccomp:
         tracer_mod._handle_waitpid_event(
             1000, self._seccomp_event_status(),
             traced, 1000, self._make_arch_info(),
-            Path("/tmp"), budget,
+            tmp_path, budget,
             audit_filter=audit_filter,
             **{k: v for k, v in helpers.items() if not k.startswith("_")},
         )
@@ -1266,14 +1304,14 @@ class TestFilterDispatchSeccomp:
         assert helpers["_recorded"][0]["path"] == "/home/user/.ssh/id_rsa"
         assert budget.total_records == 1
 
-    def test_verbose_keeps_everything(self):
+    def test_verbose_keeps_everything(self, tmp_path):
         # Same allowlisted path as test_filtered_drops_path_in_allowlist,
         # but verbose=True → record kept (verbose disables filter).
         helpers = self._common_helpers(path_returned="/etc/hostname")
         audit_filter = {
             "verbose": True,
-            "writable_paths": ["/tmp"],
-            "read_allowlist": ["/etc", "/usr", "/tmp"],
+            "writable_paths": [str(tmp_path)],
+            "read_allowlist": ["/etc", "/usr", str(tmp_path)],
             "allowed_tcp_ports": [],
         }
         traced = {1000}
@@ -1281,7 +1319,7 @@ class TestFilterDispatchSeccomp:
         tracer_mod._handle_waitpid_event(
             1000, self._seccomp_event_status(),
             traced, 1000, self._make_arch_info(),
-            Path("/tmp"), budget,
+            tmp_path, budget,
             audit_filter=audit_filter,
             **{k: v for k, v in helpers.items() if not k.startswith("_")},
         )
@@ -1293,7 +1331,7 @@ class TestFilterDispatchSeccomp:
         )
         assert budget.total_records == 1
 
-    def test_no_filter_keeps_everything(self):
+    def test_no_filter_keeps_everything(self, tmp_path):
         # audit_filter=None → no filtering (legacy/default behaviour).
         helpers = self._common_helpers(path_returned="/etc/hostname")
         traced = {1000}
@@ -1301,7 +1339,7 @@ class TestFilterDispatchSeccomp:
         tracer_mod._handle_waitpid_event(
             1000, self._seccomp_event_status(),
             traced, 1000, self._make_arch_info(),
-            Path("/tmp"), budget,
+            tmp_path, budget,
             audit_filter=None,
             **{k: v for k, v in helpers.items() if not k.startswith("_")},
         )
@@ -1310,14 +1348,19 @@ class TestFilterDispatchSeccomp:
         assert budget.total_records == 1
 
 
+@pytest.mark.linux_native
+@requires_landlock
 class TestEndToEndAuditVsAuditVerbose:
     """Real run: same workload under `audit` and `audit-verbose`,
-    verify record counts differ in the expected direction."""
+    verify allowed reads are dropped and out-of-policy writes retained."""
 
     @staticmethod
     def _prereqs_ok():
         if not probes.check_net_available():
             return False, "user namespaces unavailable"
+        from core.sandbox.seccomp import check_seccomp_available
+        if not check_seccomp_available():
+            return False, "seccomp unavailable"
         if not ptrace_probe.check_ptrace_available():
             return False, "ptrace unavailable"
         if not probes.check_mount_available():
@@ -1338,42 +1381,82 @@ class TestEndToEndAuditVsAuditVerbose:
         run_verbose = tmp_path / "verbose"
         run_verbose.mkdir()
 
-        # `python -c "pass"` opens many files in /usr/lib/... — all
-        # legitimate, all in the system allowlist. Filtered audit
-        # should produce 0 records; verbose should produce many.
-        cmd = ["/usr/bin/python3", "-c", "pass"]
+        # Generate known syscalls instead of depending on the host Python's
+        # startup/import behavior. Reads are permitted by the declared policy;
+        # the write is outside writable_paths and must survive filtering.
+        source = tmp_path / "source"
+        source.mkdir()
+        reads = [source / f"allowed-read-{index}" for index in range(8)]
+        for path in reads:
+            path.write_bytes(b"owned read")
+        write = source / "would-block-write"
+        program = """
+import errno, os, sys
+for path in sys.argv[1:-1]:
+    fd = os.open(path, os.O_RDONLY)
+    assert os.read(fd, 64) == b'owned read'
+    os.close(fd)
+try:
+    fd = os.open(sys.argv[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+except OSError as error:
+    # A read-only bind reports EROFS; Landlock reports EACCES/EPERM.
+    if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+        raise
+else:
+    os.write(fd, b'owned write')
+    os.close(fd)
+"""
+        cmd = ["/usr/bin/python3", "-I", "-S", "-c", program,
+               *(str(path) for path in reads), str(write)]
 
         def _run(rd, verbose):
             return run_sandboxed(
                 cmd,
-                target=str(tmp_path), output=str(tmp_path),
+                target=str(source), output=str(rd),
                 block_network=False, nproc_limit=0, limits={},
-                writable_paths=[str(tmp_path)], readable_paths=None,
+                # This low-level runner does not merge interpreter/library
+                # read grants like context.run(). Unrestricted reads are the
+                # policy being tested; only writes need a narrow allowlist.
+                writable_paths=[str(rd)], readable_paths=None,
+                restrict_reads=False,
                 allowed_tcp_ports=None,
                 seccomp_profile="full", seccomp_block_udp=False,
                 env=None, cwd=None, timeout=15,
-                audit_mode=True, audit_run_dir=str(rd),
+                audit_mode=True, audit_run_dir=str(rd), audit_required=True,
                 audit_verbose=verbose,
             )
 
         r1 = _run(run_filtered, verbose=False)
         r2 = _run(run_verbose, verbose=True)
-        assert r1.returncode == 0
-        assert r2.returncode == 0
+        assert r1.returncode == 0, f"filtered workload failed: setup={getattr(r1, '_setup_status', None)!r}; stderr={r1.stderr!r}"
+        assert r2.returncode == 0, f"verbose workload failed: setup={getattr(r2, '_setup_status', None)!r}; stderr={r2.stderr!r}"
 
-        # Filtered: 0 or near-zero records (python opens only system
-        # paths).
-        f_jsonl = run_filtered / tracer_mod._DENIALS_FILENAME
-        f_count = (sum(1 for _ in open(f_jsonl)) if f_jsonl.exists()
-                   else 0)
-        # Verbose: many records (Python startup is open-heavy).
-        v_jsonl = run_verbose / tracer_mod._DENIALS_FILENAME
-        assert v_jsonl.exists()
-        v_count = sum(1 for _ in open(v_jsonl))
+        def syscall_records(directory):
+            path = (directory / evidence_mod.AUDIT_SUBDIR
+                    / tracer_mod._DENIALS_FILENAME)
+            assert path.exists(), f"missing audit evidence: {path}"
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            syscalls = [record for record in records if "syscall" in record]
+            assert syscalls, f"audit contains no syscall events: {records!r}"
+            return syscalls
 
-        # Verbose should have at least 5x more records than filtered.
-        # (Real ratio is more like 30-100x; 5x is a lower bound.)
-        assert v_count >= max(5 * f_count, 5), (
-            f"audit-verbose should produce many more records than "
-            f"audit (filtered): filtered={f_count}, verbose={v_count}"
+        filtered = syscall_records(run_filtered)
+        verbose = syscall_records(run_verbose)
+        filtered_paths = {record.get("path") for record in filtered}
+        verbose_paths = {record.get("path") for record in verbose}
+        expected_reads = {str(path) for path in reads}
+        assert expected_reads <= verbose_paths, (
+            f"verbose audit lost explicit reads: {expected_reads - verbose_paths}; "
+            f"records={verbose!r}"
         )
+        assert expected_reads.isdisjoint(filtered_paths), (
+            f"filtered audit retained allowed reads: {expected_reads & filtered_paths}"
+        )
+        for records in (filtered, verbose):
+            assert any(record.get("path") == str(write)
+                       and record.get("syscall") in ("open", "openat", "openat2")
+                       for record in records), (
+                f"audit lost the out-of-policy write: {records!r}"
+            )
+        if write.exists():
+            assert write.read_bytes() == b"owned write"

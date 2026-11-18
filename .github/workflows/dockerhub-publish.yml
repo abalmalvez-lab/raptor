@@ -1,0 +1,501 @@
+name: Publish devcontainer image to Docker Hub
+
+# Builds + pushes the operator-facing devcontainer image
+# (.devcontainer/Dockerfile) to Docker Hub so users can `docker pull`
+# instead of building ~6GB locally. See gadievron/raptor#191.
+#
+# Tags pushed:
+#   :latest      — moving tag, updated on pushes to main that change
+#                  container inputs or the Python dependency lock.
+#   :<version>   — pushed only on tagged releases (vX.Y.Z -> X.Y.Z), via
+#                  the dispatch from release.yml (see below).
+#
+# Buildah squashes the cleaned filesystem, including inherited base layers.
+# Verify the flattened candidate before tagging or publishing it.
+#
+# VERSIONED-IMAGE COUPLING: release.yml commits the version stamp
+# AFTER the operator's tag push and force-moves the tag to the stamp
+# commit — pushed with the workflow GITHUB_TOKEN, and token-initiated
+# pushes never trigger workflows. Building :<version> from the
+# original tag-push event therefore ships the PRE-STAMP tree. (Today
+# that tree builds an identical image — the Dockerfile COPYs only
+# pyproject.toml/uv.lock, no stamp target — but the versioned image must
+# be built from the ref it claims to be, and any future COPY of
+# stamped files inherits correctness instead of silently shipping
+# the previous version.) So release.yml
+# dispatches THIS workflow with the tag name once the re-tag has
+# landed (workflow_dispatch IS deliverable by GITHUB_TOKEN — the
+# documented exception to the no-retrigger rule). The `tag`
+# input is validated before it reaches checkout's ref (release.yml's
+# own pre-checkout validation lesson).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      # Broad wake-up paths; the scope job compares actual COPY/build inputs.
+      - '.devcontainer/**'
+      - '.dockerignore'
+      - '.gitattributes'
+      - '**/.gitattributes'
+      - 'LICENSE'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/dockerhub-publish.yml'
+      - '.github/scripts/dockerhub_scope.py'
+      - '.github/scripts/with-ubuntu-apt.sh'
+      - '.github/scripts/prepare_sbom.py'
+      - '.github/scripts/check_playwright_source.py'
+      - '.github/scripts/check_node_release.py'
+      - '.github/scripts/write_sbom_checksums.py'
+      - '.github/scripts/check_uv_provenance.py'
+      - 'packages/sca/sbom_inventory/uv_provenance.py'
+      - '.github/actions/enable-userns/**'
+  schedule:
+    # Refresh mutable base images and apt packages, even without source changes.
+    - cron: '0 2 * * 3'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag to build :<version> from (must match
+          v<major>.<minor>.<patch>[-prerelease] and already point at
+          the stamped commit). Empty: build :latest from main.
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'latest' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    if: github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      build: ${{ steps.scope.outputs.build }}
+      fingerprint: ${{ steps.scope.outputs.fingerprint }}
+    steps:
+      - name: Validate publish target before checkout
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_TAG" ]]; then
+            [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] || exit 1
+          else
+            [[ "$REF" == 'refs/heads/main' ]] || { echo '::error::latest must be published from main'; exit 1; }
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare image inputs
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: python3 .github/scripts/dockerhub_scope.py
+
+  build-push:
+    needs: scope
+    if: needs.scope.outputs.build == 'true' && github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+      digest: ${{ steps.publish.outputs.digest }}
+      published_at: ${{ steps.publish.outputs.published_at }}
+    steps:
+      # Validate the dispatch input BEFORE checkout — an arbitrary
+      # ref string must never flow into checkout's `ref:` field
+      # (same pre-checkout gate as release.yml's).
+      - name: Validate dispatch tag input
+        if: github.event.inputs.tag != ''
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::tag must match v<major>.<minor>.<patch>[-prerelease], got '${INPUT_TAG}'" >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Tag dispatches build the STAMPED tag ref (see the
+          # versioned-image coupling note above); everything else
+          # builds the same immutable commit that the scope job fingerprinted.
+          ref: ${{ github.event.inputs.tag != '' && format('refs/tags/{0}', github.event.inputs.tag) || github.sha }}
+          persist-credentials: false
+
+      - name: Determine image tags
+        id: tags
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          image="danielcuthbert/raptor"
+          if [[ -n "${INPUT_TAG}" ]]; then
+            version="${INPUT_TAG#v}"
+            echo "tags=${image}:${version}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${image}:latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+
+      - name: Install image builder
+        run: |
+          set -euo pipefail
+          sudo bash .github/scripts/with-ubuntu-apt.sh packages buildah skopeo
+
+      - uses: ./.github/actions/enable-userns
+
+      - name: Build and verify cleaned image
+        env:
+          IMAGE_INPUTS: ${{ needs.scope.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          sudo buildah build --format docker --squash --label "io.raptor.ci.inputs=${IMAGE_INPUTS}" \
+            -f .devcontainer/Dockerfile -t localhost/raptor-publish:checked .
+          test "$(sudo buildah inspect --type image --format '{{len .OCIv1.RootFS.DiffIDs}}' localhost/raptor-publish:checked)" = 1
+          candidate_container=$(sudo buildah from localhost/raptor-publish:checked)
+          trap 'sudo buildah rm "$candidate_container"' EXIT
+          sudo buildah run --network none --cap-drop ALL --user 0 "$candidate_container" -- \
+            python3 /usr/local/libexec/prune-windows-helpers.py --check
+          sudo buildah run --network none "$candidate_container" -- bash -euc '
+            test "$(id -un)" = vscode
+            python3 -m venv /tmp/raptor-venv-check
+            /tmp/raptor-venv-check/bin/python -m pip --version
+            virtualenv --no-download /tmp/raptor-virtualenv-check
+            /tmp/raptor-virtualenv-check/bin/python -m pip --version
+            pipenv --version
+            pnpm --version
+            python3 /usr/local/libexec/use-system-node.py --check
+            python3 /usr/local/libexec/check-browser.py
+          '
+
+      - name: Verify confined Debian Chromium
+        run: |
+          set -euo pipefail
+          browser_image="raptor-browser-check:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo buildah push localhost/raptor-publish:checked "docker-daemon:${browser_image}"
+          trap 'docker image rm "$browser_image"' EXIT
+          # Exercise Docker's actual devcontainer runtime policy, as vscode.
+          docker run --rm --network none --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
+            --mount type=bind,source="$GITHUB_WORKSPACE",target=/workspaces/raptor,readonly \
+            --entrypoint python3 "$browser_image" \
+            -I -B /workspaces/raptor/.devcontainer/check-browser.py --confined /workspaces/raptor
+
+      - name: Export immutable image
+        id: export_image
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/container-sbom"
+          sudo buildah push --format v2s2 --compression-format gzip \
+            localhost/raptor-publish:checked "oci:${RUNNER_TEMP}/container-oci:verified"
+          sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/container-oci"
+          sudo chmod -R a+rX "${RUNNER_TEMP}/container-oci"
+          skopeo inspect --raw "oci:${RUNNER_TEMP}/container-oci:verified" > "${RUNNER_TEMP}/container-sbom/manifest.json"
+          echo "sha256:$(sha256sum "${RUNNER_TEMP}/container-sbom/manifest.json" | cut -d ' ' -f 1)" > "${RUNNER_TEMP}/container-sbom/image-digest.txt"
+
+      - name: Generate container inventories
+        id: inventory
+        continue-on-error: true
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+          SYFT_PARALLELISM: "4"
+          SYFT_FILE_METADATA_SELECTION: all
+          SYFT_FILE_METADATA_DIGESTS: sha256
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/container-sbom" "${RUNNER_TEMP}/syft-scratch"
+          python3 .github/scripts/install_sbom_tools.py --out "${RUNNER_TEMP}/sbom-tools"
+          TMPDIR="${RUNNER_TEMP}/syft-scratch" \
+          SYFT_CACHE_DIR="${RUNNER_TEMP}/syft-cache" \
+            "${RUNNER_TEMP}/sbom-tools/syft" scan "oci-dir:${RUNNER_TEMP}/container-oci" \
+              --scope squashed \
+              -o "syft-json=${RUNNER_TEMP}/container-sbom/syft.json" \
+              -o "cyclonedx-json@1.5=${RUNNER_TEMP}/container-sbom/raw.cdx.json" \
+              -o "spdx-json=${RUNNER_TEMP}/container-sbom/raw.spdx.json"
+
+      - name: Prepare audit output permissions
+        if: always() && steps.export_image.outcome == 'success'
+        run: |
+          set -euo pipefail
+          # The auditor runs as root with all capabilities dropped. Give it
+          # ownership rather than relying on CAP_DAC_OVERRIDE for the mount.
+          sudo chown -R 0:0 "${RUNNER_TEMP}/container-sbom"
+
+      - name: Collect and prepare container notice evidence
+        id: notice_evidence
+        if: steps.inventory.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          audit_container=$(sudo buildah from localhost/raptor-publish:checked)
+          trap 'sudo buildah rm "$audit_container"' EXIT
+          # Download source evidence separately; inventory verification stays offline.
+          if ! sudo buildah run --cap-drop ALL --user 0 \
+            --volume "${GITHUB_WORKSPACE}:/workspaces/raptor:ro" \
+            --volume "${RUNNER_TEMP}/container-sbom:/audit:rw" \
+            "$audit_container" -- python3 .github/scripts/prepare_sbom.py \
+              --syft /audit/syft.json --cyclonedx /audit/raw.cdx.json \
+              --spdx /audit/raw.spdx.json --out /audit/prepared \
+              --fetch-upstream-sources /audit/nvm-source-cache.json; then
+            echo "::warning::NVM source download unavailable; offline reporting will retain its provenance warning."
+          fi
+          if ! sudo buildah run --cap-drop ALL --user 0 \
+            --volume "${GITHUB_WORKSPACE}:/workspaces/raptor:ro" \
+            --volume "${RUNNER_TEMP}/container-sbom:/audit:rw" \
+            "$audit_container" -- bash -euc '
+              npm install --prefix /opt/raptor-sbom-sigstore --ignore-scripts \
+                --no-audit --no-fund @sigstore/cli@0.10.3 > /dev/null
+              python3 .github/scripts/check_playwright_source.py \
+                --syft /audit/syft.json --evidence /audit/playwright-sources \
+                --sigstore /opt/raptor-sbom-sigstore/node_modules/.bin/sigstore \
+                --download --out /audit/playwright-source-download.json
+            '; then
+            echo "::warning::Playwright source download unavailable; its provenance warning will remain."
+          fi
+          if ! sudo buildah run --cap-drop ALL --user 0 \
+            --volume "${GITHUB_WORKSPACE}:/workspaces/raptor:ro" \
+            --volume "${RUNNER_TEMP}/container-sbom:/audit:rw" \
+            "$audit_container" -- python3 .github/scripts/check_node_release.py \
+              --syft /audit/syft.json --evidence /audit/node-release \
+              --download --out /audit/node-release-download.json; then
+            echo "::warning::Node release download unavailable; its provenance warning will remain."
+          fi
+          sudo buildah run --network none --cap-drop ALL --user 0 \
+            --volume "${GITHUB_WORKSPACE}:/workspaces/raptor:ro" \
+            --volume "${RUNNER_TEMP}/container-sbom:/audit:rw" \
+            --volume "${RUNNER_TEMP}/container-oci:/image:ro" \
+            "$audit_container" -- bash -euc '
+              export PYTHONDONTWRITEBYTECODE=1
+              python3 .github/scripts/capture_container_evidence.py \
+                --syft /audit/syft.json --oci-layout /image --out /audit/capture
+              python3 .github/scripts/prepare_sbom.py \
+                --syft /audit/syft.json --cyclonedx /audit/raw.cdx.json \
+                --spdx /audit/raw.spdx.json --notice-evidence /audit/capture \
+                --owner-oci-layout /image --upstream-source-cache /audit/nvm-source-cache.json \
+                --playwright-source-evidence /audit/playwright-sources \
+                --node-release-evidence /audit/node-release \
+                --sigstore-verifier /opt/raptor-sbom-sigstore/node_modules/.bin/sigstore \
+                --out /audit/prepared
+            '
+
+      - name: Report container license and notice coverage
+        id: license_report
+        env:
+          AUDIT_OUTCOME: ${{ steps.notice_evidence.outcome }}
+        if: always() && steps.export_image.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          report_container=$(sudo buildah from localhost/raptor-publish:checked)
+          trap 'sudo buildah rm "$report_container"' EXIT
+          sudo buildah run --network none --cap-drop ALL --user 0 \
+            --volume "${GITHUB_WORKSPACE}:/workspaces/raptor:ro" \
+            --volume "${RUNNER_TEMP}/container-sbom:/audit:rw" \
+            "$report_container" -- env PYTHONDONTWRITEBYTECODE=1 \
+            python3 .github/scripts/report_sbom_licenses.py --audit-dir /audit \
+              --image-digest "$(cat "${RUNNER_TEMP}/container-sbom/image-digest.txt")" --emit-annotations --audit-status "$AUDIT_OUTCOME"
+
+      - name: Bind installed uv to its publisher image
+        id: uv_binding
+        if: steps.license_report.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          uv_container=$(sudo buildah from localhost/raptor-publish:checked)
+          trap 'sudo buildah rm "$uv_container"' EXIT
+          sudo buildah run --cap-drop ALL --user 0 \
+            --volume "${GITHUB_WORKSPACE}:/workspaces/raptor:ro" \
+            --volume "${RUNNER_TEMP}/container-sbom:/audit:rw" \
+            "$uv_container" -- env PYTHONDONTWRITEBYTECODE=1 \
+            python3 .github/scripts/check_uv_provenance.py \
+              --audit-dir /audit --out /audit/uv-provenance
+
+      - name: Make audit artifacts readable
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${RUNNER_TEMP}/container-sbom" ]]; then
+            sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/container-sbom"
+          fi
+
+      - name: Summarize container license coverage
+        env:
+          REPORT_OUTCOME: ${{ steps.license_report.outcome }}
+        if: always() && steps.export_image.outcome == 'success'
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP}/container-sbom/license-report.md"
+          if [[ "$REPORT_OUTCOME" == "success" && -s "$report" ]]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Container license audit unavailable; coverage is unknown. Inspect the partial container-sbom artifact."
+            echo "## Container licenses and notices" >> "$GITHUB_STEP_SUMMARY"
+            echo "Audit unavailable; coverage is unknown. Inspect the partial container-sbom artifact." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Verify and retain uv publisher attestation
+        id: uv_attestation
+        if: steps.uv_binding.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/container-sbom/uv-provenance"
+          # The collector fetched the public bundle by the exact index digest.
+          # Verify the retained bytes without exposing the job token.
+          gh attestation verify index.json --repo astral-sh/uv \
+            --signer-workflow astral-sh/uv/.github/workflows/build-docker.yml \
+            --deny-self-hosted-runners --bundle uv-publisher-attestation.jsonl --format json \
+            > signature-verification.json
+
+      - name: Report uv provenance status
+        if: always() && steps.export_image.outcome == 'success'
+        env:
+          UV_ATTESTATION_OUTCOME: ${{ steps.uv_attestation.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$UV_ATTESTATION_OUTCOME" == 'success' ]]; then
+            echo '### uv publisher provenance' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Installed uv bytes match a digest-checked layer member of an image authenticated against Astral’s build-docker.yml workflow.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The download includes the binary binding, original OCI documents, signed bundle and verifier result. Compiled dependency membership remains a separate check.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '::warning::uv publisher provenance unavailable; inspect uv-provenance in the container-sbom download.'
+            echo 'uv publisher provenance unavailable. No authenticated origin is established by this run.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Hash retained container evidence
+        id: evidence_checksums
+        if: always() && steps.export_image.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/write_sbom_checksums.py --audit-dir "${RUNNER_TEMP}/container-sbom"
+
+      - name: Attest container evidence checksums
+        id: evidence_attestation
+        if: always() && steps.evidence_checksums.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/container-sbom/evidence-checksums.sha256
+          push-to-registry: false
+
+      - name: Retain evidence signature bundle
+        id: retain_attestation
+        if: always() && steps.evidence_attestation.outcome == 'success'
+        continue-on-error: true
+        env:
+          BUNDLE_PATH: ${{ steps.evidence_attestation.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -s "$BUNDLE_PATH"
+          cp -- "$BUNDLE_PATH" "${RUNNER_TEMP}/container-sbom/evidence-attestation.jsonl"
+
+      - name: Report evidence authentication status
+        if: always() && steps.export_image.outcome == 'success'
+        env:
+          ATTESTATION_OUTCOME: ${{ steps.retain_attestation.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$ATTESTATION_OUTCOME" == 'success' ]]; then
+            echo 'Evidence checksums and signature bundle are included in the container-sbom download.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The signature authenticates the producing workflow; it does not certify coverage or upstream build provenance.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '::warning::Container evidence authentication unavailable; do not treat the download as authenticated.'
+            echo 'Evidence authentication unavailable. The download may contain partial or unsigned evidence.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Retain container SBOM and notice evidence
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: container-sbom
+          path: ${{ runner.temp }}/container-sbom/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Publish verified image
+        id: publish
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          IMAGE_INPUTS: ${{ needs.scope.outputs.fingerprint }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$INPUT_TAG" ]]; then
+            rc=0
+            python3 .github/scripts/dockerhub_scope.py --check-main || rc=$?
+            if [[ "$rc" -eq 1 ]]; then exit 0; fi
+            if [[ "$rc" -ne 0 ]]; then exit "$rc"; fi
+          fi
+          source="oci:${RUNNER_TEMP}/container-oci:verified"
+          exported_digest=$(cat "${RUNNER_TEMP}/container-sbom/image-digest.txt")
+          skopeo inspect --raw "$source" > "${RUNNER_TEMP}/manifest-to-push.json"
+          test "sha256:$(sha256sum "${RUNNER_TEMP}/manifest-to-push.json" | cut -d ' ' -f 1)" = "$exported_digest"
+          for tag in ${TAGS//,/ }; do
+            skopeo copy --preserve-digests --authfile "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+              "$source" "docker://${tag}"
+            skopeo inspect --raw --authfile "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+              "docker://${tag}" > "${RUNNER_TEMP}/published-manifest.json"
+            test "sha256:$(sha256sum "${RUNNER_TEMP}/published-manifest.json" | cut -d ' ' -f 1)" = "$exported_digest"
+          done
+          echo "digest=$exported_digest" >> "$GITHUB_OUTPUT"
+          echo "published_at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+  update-image-docs:
+    needs: [scope, build-push]
+    if: >-
+      github.repository == 'gadievron/raptor' &&
+      needs.build-push.outputs.published == 'true' &&
+      github.event.inputs.tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout current documentation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Pin instructions to the published image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_DIGEST: ${{ needs.build-push.outputs.digest }}
+          PUBLISHED_AT: ${{ needs.build-push.outputs.published_at }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          IMAGE_INPUTS: ${{ needs.scope.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          # Supply credentials only to this process tree, never the checkout config.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          export GIT_TERMINAL_PROMPT=0
+          python3 .github/scripts/update_published_image_docs.py --sync-main

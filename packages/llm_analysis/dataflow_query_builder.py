@@ -48,7 +48,6 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -78,17 +77,13 @@ _KIND_PATH_PROBLEM_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Match `@id <ns>/<rest>` — used for stable identification of which
-# discovered query handled a particular finding (audit trail).
-_ID_RE = re.compile(r"@id\s+([\w.\-/]+)")
-
 # Bound how much of each .ql file we read when checking metadata. Real
 # headers fit in ~1 KB; reading more wastes IO on large dataflow query
 # bodies. 4 KB gives slack for queries with long descriptions.
 _METADATA_READ_BYTES = 4096
 
 
-def _pack_roots() -> List[Path]:
+def _pack_roots() -> list[Path]:
     """Resolve all CodeQL pack roots in priority order.
 
     Returns extras (from RaptorConfig.EXTRA_CODEQL_PACK_ROOTS) first,
@@ -102,7 +97,7 @@ def _pack_roots() -> List[Path]:
     initialised. Tests can also monkeypatch _DEFAULT_PACK_ROOT
     directly to point at fixtures.
     """
-    extras: List[Path] = []
+    extras: list[Path] = []
     try:
         from core.config import RaptorConfig
         extras = list(RaptorConfig.EXTRA_CODEQL_PACK_ROOTS or [])
@@ -117,7 +112,7 @@ _RESOLVE_TIMEOUT_SECS = 30
 _QUERIES_PACK_NAME_RE = re.compile(r"^codeql/([A-Za-z0-9-]+)-queries$")
 
 
-def _resolved_pack_pointers() -> Dict[str, Path]:
+def _resolved_pack_pointers() -> dict[str, Path]:
     """Ask the `codeql` CLI for the canonical install paths of all
     published query packs. Returns {language: pack_path} for the
     `codeql/<lang>-queries` namespace; non-queries packs (libs,
@@ -140,10 +135,23 @@ def _resolved_pack_pointers() -> Dict[str, Path]:
     if not binary:
         return {}
     try:
+        # Import guarded separately from the subprocess call: core.config
+        # may not be fully initialised in test/script contexts (same
+        # rationale as _pack_roots), and an ImportError escaping here
+        # would crash Tier 1 discovery instead of degrading to the
+        # default-root walk this function's docstring promises.
+        from core.config import RaptorConfig
+        from core.sandbox.preexec import set_pdeathsig
+    except ImportError as e:
+        logger.debug("codeql resolve qlpacks skipped: %s", e)
+        return {}
+    try:
         proc = subprocess.run(
             [binary, "resolve", "qlpacks", "--format=json"],
             capture_output=True, text=True,
-            timeout=_RESOLVE_TIMEOUT_SECS,
+            timeout=_RESOLVE_TIMEOUT_SECS, check=False,
+            env=RaptorConfig.get_safe_env(),
+            preexec_fn=set_pdeathsig(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         logger.debug("codeql resolve qlpacks failed: %s", e)
@@ -160,7 +168,7 @@ def _resolved_pack_pointers() -> Dict[str, Path]:
         logger.debug("codeql resolve qlpacks JSON parse failed: %s", e)
         return {}
 
-    out: Dict[str, Path] = {}
+    out: dict[str, Path] = {}
     for pack_name, paths in (data or {}).items():
         m = _QUERIES_PACK_NAME_RE.match(pack_name)
         if not m or not paths:
@@ -176,7 +184,7 @@ def _resolved_pack_pointers() -> Dict[str, Path]:
     return out
 
 
-def _read_metadata(ql_path: Path) -> Optional[str]:
+def _read_metadata(ql_path: Path) -> str | None:
     """Return the first ~4KB of a .ql file as text, or None on read failure.
 
     Comment-block parsing is naive on purpose: we just look for tag
@@ -193,7 +201,7 @@ def _read_metadata(ql_path: Path) -> Optional[str]:
         return None
 
 
-def _extract_cwes(metadata: str) -> List[str]:
+def _extract_cwes(metadata: str) -> list[str]:
     """All CWE-NNN tags found in the metadata block (canonical form).
 
     CodeQL packs zero-pad to three digits (`cwe-022`); the canonical
@@ -210,12 +218,7 @@ def _is_path_problem(metadata: str) -> bool:
     return bool(_KIND_PATH_PROBLEM_RE.search(metadata))
 
 
-def _query_id(metadata: str) -> Optional[str]:
-    m = _ID_RE.search(metadata)
-    return m.group(1) if m else None
-
-
-def _language_from_pack_dir(pack_dir: Path) -> Optional[str]:
+def _language_from_pack_dir(pack_dir: Path) -> str | None:
     """Extract language tag from a `<lang>-queries` directory name.
 
     Examples: `python-queries` → "python", `cpp-queries` → "cpp".
@@ -229,7 +232,7 @@ def _language_from_pack_dir(pack_dir: Path) -> Optional[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def discover_prebuilt_queries() -> Dict[Tuple[str, str], Path]:
+def discover_prebuilt_queries() -> dict[tuple[str, str], Path]:
     """Walk installed CodeQL query packs to build the (lang, CWE) → path map.
 
     Scans `<pack_root>/<lang>-queries/<version>/Security/CWE-*/*.ql` and
@@ -249,7 +252,7 @@ def discover_prebuilt_queries() -> Dict[Tuple[str, str], Path]:
     default root so RAPTOR-shipped packs win on collisions. Within a
     single root, iteration is alphabetical for determinism.
     """
-    out: Dict[Tuple[str, str], Path] = {}
+    out: dict[tuple[str, str], Path] = {}
 
     # Build the priority-ordered list of (language, pack_dir) pairs:
     #   1. Extras roots (RaptorConfig.EXTRA_CODEQL_PACK_ROOTS) — RAPTOR-
@@ -261,7 +264,7 @@ def discover_prebuilt_queries() -> Dict[Tuple[str, str], Path]:
     #      `~/.codeql/packages/codeql/` install. May overlap with (2);
     #      `seen_dirs` dedupes by resolved absolute path.
     seen_dirs: set = set()
-    pack_dirs: List[Tuple[str, Path]] = []
+    pack_dirs: list[tuple[str, Path]] = []
 
     def _add_pack_dir(language: str, pack_dir: Path) -> None:
         try:
@@ -308,7 +311,7 @@ def discover_prebuilt_queries() -> Dict[Tuple[str, str], Path]:
     #                                                    checkout — handled
     #                                                    by rglob below)
     for language, pack_dir in pack_dirs:
-        search_dirs: List[Path] = []
+        search_dirs: list[Path] = []
         flat_security = pack_dir / "Security"
         if flat_security.is_dir():
             search_dirs.append(flat_security)
@@ -337,7 +340,7 @@ def discover_prebuilt_queries() -> Dict[Tuple[str, str], Path]:
     return out
 
 
-def discover_prebuilt_query(language: str, cwe: str) -> Optional[Path]:
+def discover_prebuilt_query(language: str, cwe: str) -> Path | None:
     """Look up a prebuilt path-problem query for (language, CWE).
 
     Both args are normalised before lookup. Returns the absolute .ql
@@ -358,7 +361,7 @@ def discover_prebuilt_query(language: str, cwe: str) -> Optional[Path]:
 #
 # These match the modern ConfigSig + TaintTracking::Global<> API found
 # in current python-all / java-all / cpp-all / javascript-all packs.
-_TAINT_TEMPLATES: Dict[str, str] = {
+_TAINT_TEMPLATES: dict[str, str] = {
     "python": """\
 /**
  * @name IRIS validation: {query_id}
@@ -436,9 +439,9 @@ import semmle.code.cpp.security.FlowSources as FS
 // "module DataFlow is ambiguous between: DataFlow::DataFlow,
 // DataFlow::DataFlow". Aliasing FlowSources scopes its DataFlow under
 // FS::DataFlow and leaves the new-style DataFlow as the unique top-level
-// `DataFlow`. Matches the canonical pattern in
-// /home/raptor/.local/codeql-queries/cpp/ql/src/Security/CWE/CWE-120/
-// UnboundedWrite.ql. LLM-generated source/sink bodies that need
+// `DataFlow`. Matches the canonical pattern in the CodeQL standard
+// packs (cpp/ql/src/Security/CWE/CWE-120/UnboundedWrite.ql, resolved
+// from the installed query packs). LLM-generated source/sink bodies that need
 // FlowSources types must use the FS:: prefix (e.g. `n instanceof
 // FS::FlowSource`) — see the prompt instructions in
 // _ask_llm_for_predicates.
@@ -521,13 +524,91 @@ def supported_languages_for_template() -> set:
     return set(_TAINT_TEMPLATES.keys())
 
 
+# Shared tail of every taint template. build_predicate_probe_query
+# splits on it to reuse each language's exact import/alias header, so
+# a predicate body that compiled inside the flow query compiles
+# identically inside the probe. Template drift is guarded by a unit
+# test asserting every template carries this tail exactly once; a
+# template without it makes the probe builder refuse (None) rather
+# than mis-assemble a query.
+_FLOW_QUERY_TAIL = """\
+module IrisFlow = TaintTracking::Global<IrisConfig>;
+import IrisFlow::PathGraph
+
+from IrisFlow::PathNode source, IrisFlow::PathNode sink
+where IrisFlow::flowPath(source, sink)
+select sink.getNode(), source, sink, "IRIS dataflow path"
+"""
+
+_PROBE_TAILS: dict[str, str] = {
+    "source": """\
+from DataFlow::Node n
+where IrisConfig::isSource(n)
+select n, "IRIS isSource probe"
+""",
+    "sink": """\
+from DataFlow::Node n
+where IrisConfig::isSink(n)
+select n, "IRIS isSink probe"
+""",
+}
+
+
+def build_predicate_probe_query(
+    *,
+    language: str,
+    source_predicate_body: str,
+    sink_predicate_body: str,
+    probe_role: str,
+    query_id: str = "raptor/iris/predicate-probe",
+) -> str | None:
+    """Assemble a standalone selector for ONE LLM-written predicate.
+
+    The Tier 2 vacuity control: before a zero-flow taint result is
+    trusted as refutation, each endpoint predicate is run on its own —
+    a predicate that selects zero nodes anywhere in the DB makes "no
+    flow" vacuously true, which is a property of the LLM's model, not
+    of the code. The probe keeps the taint template's full per-language
+    header (imports, aliases, the IrisConfig module with BOTH predicate
+    bodies) and swaps the flow query for a plain node selection over
+    ``probe_role`` (``"source"`` → ``isSource``, ``"sink"`` →
+    ``isSink``), downgrading ``@kind path-problem`` to ``@kind
+    problem`` for the two-column select.
+
+    Returns the full .ql text, or None when the language has no
+    template, either predicate body is empty / blank, ``probe_role``
+    is unknown, or the template lacks the shared flow tail (drift).
+    """
+    probe_tail = _PROBE_TAILS.get(probe_role)
+    if probe_tail is None:
+        return None
+    template = _TAINT_TEMPLATES.get(language.lower())
+    if template is None:
+        return None
+    if not source_predicate_body or not source_predicate_body.strip():
+        return None
+    if not sink_predicate_body or not sink_predicate_body.strip():
+        return None
+    header, sep, _ = template.partition(_FLOW_QUERY_TAIL)
+    if not sep:
+        return None
+    probe = (header + probe_tail).replace(
+        "@kind path-problem", "@kind problem", 1,
+    )
+    return probe.format(
+        source_predicate_body=source_predicate_body.strip(),
+        sink_predicate_body=sink_predicate_body.strip(),
+        query_id=query_id,
+    )
+
+
 def build_template_query(
     *,
     language: str,
     source_predicate_body: str,
     sink_predicate_body: str,
     query_id: str = "raptor/iris-validation",
-) -> Optional[str]:
+) -> str | None:
     """Assemble a Tier 2 query from the template + LLM-supplied predicates.
 
     Args:
@@ -539,7 +620,8 @@ def build_template_query(
         query_id: Stable identifier embedded in the query metadata.
 
     Returns:
-        Full .ql text, or None when the language has no template.
+        Full .ql text, or None when the language has no template or
+        when either predicate body is empty / blank.
     """
     template = _TAINT_TEMPLATES.get(language.lower())
     if template is None:
@@ -588,6 +670,10 @@ TEMPLATE_PREDICATE_SCHEMA = {
 # lose the CWE → prebuilt query mapping for these findings.
 #
 # Order matters: more specific patterns first. The first match wins.
+# Co-occurrence gaps are bounded ({0,200}): with an unbounded `.*`
+# gap a crafted rule id that repeats the head token re-scans the
+# rest of the id from every occurrence — quadratic. Real rule ids
+# are far shorter than the bound.
 _RULE_ID_TO_CWE: list = [
     # Command injection — variants seen in real rule sets:
     # "command-injection", "os-command-injection", "command_injection",
@@ -596,23 +682,28 @@ _RULE_ID_TO_CWE: list = [
     (re.compile(
         r"command[-_]?injection"
         r"|os[-_]?command"
-        r"|subprocess[-_.].*shell"
+        r"|subprocess[-_.].{0,200}shell"
         r"|shell[-_]?true"
         r"|command[-_]shell"
         r"|exec[-_]?shell",
         re.IGNORECASE,
     ), "CWE-78"),
+    # NoSQL injection — MUST precede the SQL entry: "nosql-injection"
+    # contains "sql-injection" as a substring, so with SQL first the
+    # first-match-wins loop would misroute NoSQL rule ids to CWE-89
+    # (and Tier 1 would then run the SQL-injection prebuilt query
+    # against a MongoDB-injection claim).
+    (re.compile(r"nosql[-_]?injection|\bnosqli\b|mongo[-_].{0,200}injection",
+                re.IGNORECASE), "CWE-943"),
     # SQL injection
     (re.compile(r"sql[-_]?injection|sqli\b", re.IGNORECASE), "CWE-89"),
-    # NoSQL injection
-    (re.compile(r"nosql[-_]?injection|mongo[-_].*injection", re.IGNORECASE), "CWE-943"),
     # Path traversal
     (re.compile(r"path[-_]?traversal|tainted[-_]?path|directory[-_]?traversal",
                 re.IGNORECASE), "CWE-22"),
     # XSS — DOM-based and reflected both map to CWE-79
     (re.compile(r"\bxss\b|cross[-_]?site[-_]?scripting", re.IGNORECASE), "CWE-79"),
     # Code injection / eval
-    (re.compile(r"code[-_]?injection|\beval\b.*injection", re.IGNORECASE), "CWE-94"),
+    (re.compile(r"code[-_]?injection|\beval\b.{0,200}injection", re.IGNORECASE), "CWE-94"),
     # XXE / XML external entity
     (re.compile(r"\bxxe\b|xml[-_]?external[-_]?entit", re.IGNORECASE), "CWE-611"),
     # SSRF
@@ -646,10 +737,29 @@ _RULE_ID_TO_CWE: list = [
     # Stack trace exposure
     (re.compile(r"stack[-_]?trace|exception[-_]?message[-_]?disclos",
                 re.IGNORECASE), "CWE-209"),
+    # Memory-corruption classes — native-code scanners (sanitizer rule
+    # names, CodeQL cpp packs) use these spellings. Mirrors the
+    # import-time inference vocabulary in core.sarif.import_normalizer
+    # so a finding resolves to the same CWE whichever pipeline leg
+    # infers it. Heap precedes the generic buffer entry so
+    # "heap-buffer-overflow" routes to CWE-122, not CWE-120.
+    (re.compile(r"heap[-_]?(?:buffer[-_]?)?over(?:flow|run)",
+                re.IGNORECASE), "CWE-122"),
+    (re.compile(r"buffer[-_]?over(?:flow|run)|stack[-_]?overflow",
+                re.IGNORECASE), "CWE-120"),
+    (re.compile(r"format[-_]?string", re.IGNORECASE), "CWE-134"),
+    (re.compile(r"integer[-_]?over(?:flow|wrap)", re.IGNORECASE), "CWE-190"),
+    (re.compile(r"double[-_]?free", re.IGNORECASE), "CWE-415"),
+    (re.compile(r"use[-_]?after[-_]?free|\buaf\b", re.IGNORECASE), "CWE-416"),
+    (re.compile(r"null[-_]?(?:pointer[-_]?)?deref", re.IGNORECASE), "CWE-476"),
+    (re.compile(r"out[-_]?of[-_]?bounds[-_]?write|oob[-_]?write",
+                re.IGNORECASE), "CWE-787"),
+    (re.compile(r"out[-_]?of[-_]?bounds[-_]?read|oob[-_]?read",
+                re.IGNORECASE), "CWE-125"),
 ]
 
 
-def infer_cwe_from_rule_id(rule_id: str) -> Optional[str]:
+def infer_cwe_from_rule_id(rule_id: str) -> str | None:
     """Infer a CWE tag from a Semgrep rule_id when the finding lacks one.
 
     Many Semgrep rules don't set the `cwe_id` field explicitly but have
@@ -672,10 +782,10 @@ def infer_cwe_from_rule_id(rule_id: str) -> Optional[str]:
 
 
 __all__ = [
+    "TEMPLATE_PREDICATE_SCHEMA",
+    "build_template_query",
     "discover_prebuilt_queries",
     "discover_prebuilt_query",
-    "build_template_query",
-    "supported_languages_for_template",
-    "TEMPLATE_PREDICATE_SCHEMA",
     "infer_cwe_from_rule_id",
+    "supported_languages_for_template",
 ]

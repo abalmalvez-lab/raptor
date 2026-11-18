@@ -1,0 +1,386 @@
+"""String-literal-aware comment stripping for source code.
+
+Single chokepoint for "strip comments without touching string
+literals."  The codebase had ~6 scattered implementations of this
+pattern (jsonc, source_intel, inventory extractors, SCA parsers,
+audit callsite consistency, staleness normalisation).  This module
+is the canonical one; new consumers should import from here.
+
+The language handlers track quoted literals while skipping comments.
+Comment markers inside strings are left untouched.  This is deliberately NOT
+a full lexer — it handles the common cases that matter for cosmetic-change
+detection and call-site analysis, not every edge case in the language
+spec.
+
+Known limitations:
+- Python: raw strings (r"...") and f-strings with nested braces are
+  handled correctly for quote tracking, but the ``#`` inside a
+  formatted expression (``f"{x:#04x}"``) is not stripped (safe
+  direction — treated as code, not comment).
+- C-family: raw string literals (R"delim(...)delim" in C++11) are
+  not handled; the opening ``"`` starts a string that never closes
+  properly.  Rare in practice and the failure mode is safe (under-
+  stripping, not over-stripping).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+__all__ = [
+    "C_FAMILY_SUFFIXES",
+    "blank_c_noncode",
+    "strip_c_comments",
+    "strip_comments",
+    "strip_python_comments",
+    "strip_shell_comments",
+]
+
+C_FAMILY_SUFFIXES = frozenset((
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx",
+    ".java", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs",
+    ".m", ".mm", ".kt", ".swift", ".cs", ".scala",
+))
+
+
+def strip_comments(text: str, filename: str) -> str:
+    """Strip comments from source text, respecting string literals.
+
+    Dispatches to the appropriate language handler based on file
+    extension.  Unknown extensions return the text unchanged (safe
+    direction — no stripping means no false-positive cosmetic
+    classification).
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in (".py", ".pyw"):
+        return strip_python_comments(text)
+    if suffix in C_FAMILY_SUFFIXES:
+        return strip_c_comments(text)
+    if suffix in (".sh", ".bash", ".zsh"):
+        return strip_shell_comments(text)
+    return text
+
+
+# -------------------------------------------------------------------
+# C-family: //, /* */, respecting " and ' string literals
+# -------------------------------------------------------------------
+
+def blank_c_noncode(content: str, *, allow_digit_separators: bool = False) -> str:
+    """Blank C comments and quoted literals, preserving offsets and newlines.
+
+    The default preserves the inventory scanner's behavior. Expanded C may
+    contain C23 digit separators, which are pp-number content, not quotes.
+    """
+    if (type(content) is str and '"' not in content and "'" not in content
+            and "/*" not in content and "//" not in content):
+        return content
+    out = list(content)
+    i = 0
+    n = len(out)
+    while i < n:
+        c = out[i]
+        if c == "/" and i + 1 < n:
+            if out[i + 1] == "/":
+                while i < n and out[i] != "\n":
+                    out[i] = " "
+                    i += 1
+                continue
+            if out[i + 1] == "*":
+                out[i] = " "
+                out[i + 1] = " "
+                i += 2
+                while i < n:
+                    if out[i] == "*" and i + 1 < n and out[i + 1] == "/":
+                        out[i] = " "
+                        out[i + 1] = " "
+                        i += 2
+                        break
+                    if out[i] != "\n":
+                        out[i] = " "
+                    i += 1
+                continue
+        if (allow_digit_separators and c in "0123456789"
+                and (i == 0 or not (content[i - 1].isalnum() or content[i - 1] in "_$"))):
+            # Consume a preprocessing number before quote handling. Prefixes
+            # such as u8'a' are identifiers followed by a character literal,
+            # so an embedded digit must not start this branch.
+            i += 1
+            while i < n:
+                value = out[i]
+                if value.isalnum() or value in "._":
+                    i += 1
+                elif value == "'" and i + 1 < n and (out[i + 1].isalnum() or out[i + 1] == "_"):
+                    i += 2
+                elif value in "+-" and out[i - 1] in "eEpP":
+                    i += 1
+                else:
+                    break
+            continue
+        if c in "\"'":
+            quote = c
+            out[i] = " "
+            i += 1
+            while i < n:
+                if out[i] == "\\" and i + 1 < n:
+                    out[i] = " "
+                    if out[i + 1] != "\n":
+                        out[i + 1] = " "
+                    i += 2
+                    continue
+                if out[i] == quote:
+                    out[i] = " "
+                    i += 1
+                    break
+                if out[i] != "\n":
+                    out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+
+_C_NONCODE_START_RE = re.compile(r"[\"']|/\*|//")
+
+
+def _strip_c_comment_spans(text: str, comment_replacement: str) -> str:
+    """Skip quoted literals and copy spans only around actual comments."""
+    out: list[str] = []
+    i = 0
+    copied = 0
+    # Replacement contents must not depend on a str subclass's truthiness.
+    has_replacement = str.__len__(comment_replacement) > 0
+    n = len(text)
+    has_escapes = None
+    while match := _C_NONCODE_START_RE.search(text, i):
+        start = match.start()
+        marker = match.group()
+        if marker in ("\"", "'"):
+            end = start + 1
+            # Probe once, only when quotes occur. Escaped text keeps its walk.
+            if has_escapes is None:
+                has_escapes = "\\" in text
+            if not has_escapes:
+                if end >= n:
+                    i = n
+                    continue
+                if text[end] == marker:
+                    i = end + 1
+                    continue
+                closing = text.find(marker, end)
+                i = n if closing < 0 else closing + 1
+                continue
+            while end < n:
+                character = text[end]
+                if character == "\\":
+                    end += 2
+                elif character == marker:
+                    end += 1
+                    break
+                else:
+                    end += 1
+            i = end
+            continue
+        if start > copied:
+            out.append(text[copied:start])
+        if has_replacement:
+            out.append(comment_replacement)
+        if marker == "/*":
+            end = text.find("*/", start + 2)
+            i = n if end < 0 else end + 2
+        else:
+            end = text.find("\n", start + 2)
+            i = n if end < 0 else end
+        copied = i
+    if copied == 0:
+        return text
+    if copied < n:
+        out.append(text[copied:])
+    return "".join(out)
+
+
+def strip_c_comments(text: str, *, comment_replacement: str = "") -> str:
+    """Strip C-family comments while preserving string/char literals.
+
+    Replace each comment with ``comment_replacement`` (empty by default).
+    A single space keeps surrounding preprocessing tokens separate.
+    """
+    if type(text) is str:
+        if "/*" not in text and "//" not in text:
+            return text
+        return _strip_c_comment_spans(text, comment_replacement)
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_block = False
+
+    while i < n:
+        c = text[i]
+
+        if in_block:
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                in_block = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if c == "/" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "/":
+                out.append(comment_replacement)
+                i += 2
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if nxt == "*":
+                out.append(comment_replacement)
+                in_block = True
+                i += 2
+                continue
+
+        if c in ('"', "'"):
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                qc = text[i]
+                out.append(qc)
+                if qc == "\\" and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if qc == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        out.append(c)
+        i += 1
+
+    return "".join(out)
+
+
+# -------------------------------------------------------------------
+# Python: # comments, respecting triple-quoted and regular strings
+# -------------------------------------------------------------------
+
+def strip_python_comments(text: str) -> str:
+    """Strip Python comments while preserving string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        c = text[i]
+
+        if c in ('"', "'"):
+            quote = c
+            if i + 2 < n and text[i + 1] == quote and text[i + 2] == quote:
+                triple = quote * 3
+                out.append(triple)
+                i += 3
+                while i < n:
+                    if text[i] == "\\" and i + 1 < n:
+                        out.append(text[i])
+                        out.append(text[i + 1])
+                        i += 2
+                        continue
+                    if (i + 2 < n
+                            and text[i] == quote
+                            and text[i + 1] == quote
+                            and text[i + 2] == quote):
+                        out.append(triple)
+                        i += 3
+                        break
+                    out.append(text[i])
+                    i += 1
+                continue
+            out.append(c)
+            i += 1
+            while i < n:
+                qc = text[i]
+                out.append(qc)
+                if qc == "\\" and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if qc == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        if c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+
+        out.append(c)
+        i += 1
+
+    return "".join(out)
+
+
+# -------------------------------------------------------------------
+# Shell: # comments, respecting ' and " string literals
+# -------------------------------------------------------------------
+
+def strip_shell_comments(text: str) -> str:
+    """Strip shell comments while preserving string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        c = text[i]
+
+        if c == "'":
+            out.append(c)
+            i += 1
+            while i < n and text[i] != "'":
+                out.append(text[i])
+                i += 1
+            if i < n:
+                out.append(text[i])
+                i += 1
+            continue
+
+        if c == '"':
+            out.append(c)
+            i += 1
+            while i < n:
+                qc = text[i]
+                out.append(qc)
+                if qc == "\\" and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if qc == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        if c == "#":
+            # "${#" is the parameter-length expansion ("${#arr[@]}",
+            # "${#var}"), not a comment — the "{" context check alone
+            # would truncate the rest of the line. A bare "{ #" (brace
+            # group followed by a real comment) has whitespace between,
+            # so the preceding char is not "{" and stripping still fires.
+            is_length_expansion = (
+                i >= 2 and text[i - 1] == "{" and text[i - 2] == "$"
+            )
+            if not is_length_expansion and (
+                i == 0 or text[i - 1] in (" ", "\t", "\n", ";", "(", "{")
+            ):
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+
+        out.append(c)
+        i += 1
+
+    return "".join(out)

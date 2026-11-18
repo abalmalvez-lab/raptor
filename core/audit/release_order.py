@@ -1,0 +1,1020 @@
+"""Release-order verification channel (CWE-354): data released before
+verification.
+
+Adjudicates hypotheses of the EFAIL shape — decrypted/parsed data is
+handed to the consumer (out BIO, socket, stream, callback) *before*
+the integrity/authenticity check completes (``cms_smime.c`` loops
+``BIO_write``-ing chunks and consults ``BIO_get_cipher_status`` only at
+end-of-stream). The property is temporal and contract-bound: every
+release site must be dominated by a condition consuming the integrity
+finalizer's result. One function with one release site can violate it,
+so this is a channel, not a consistency (peer-majority) comparator —
+composition with the in-flight consistency ordering dimension is
+evidentiary only: its ``PeerEvidence.to_dict()`` receipts slot into
+``corroboration[]`` unchanged (zero shared files).
+
+Legs:
+
+1. **Intra-function dominance (phase 1, LLM-free)** — CFG + dominator
+   tree (the ``lifecycle_collector`` path): a release site is safe
+   when a dominating condition mentions the finalizer's status binding
+   (or the finalizer call itself).
+2. **Joern cross-check (optional, when a server is up)** —
+   :func:`core.audit.joern_verify.run_guard_dominance_check` invoked
+   READ-ONLY with identifier = the status binding and sink = the
+   release callee. Agreement upgrades the receipt
+   (``engine: cfg+joern``); disagreement ⇒ ``engines-disagree``,
+   never a guess.
+3. **Cross-function release (phase 2)** — release in a callee returns
+   ``release-in-callee`` with the callee named.
+
+Honesty notes: a buffering-then-flush architecture is safe even when a
+*write* precedes the check if the write targets an internal buffer
+flushed post-check — the release-sink classifier therefore requires
+the destination to escape the function (out-param / stream handle /
+callback), and ``tmpout == out`` aliasing is resolved from assignment
+provenance; an unresolved alias ⇒ ``sink-alias-unresolved``. A
+plain-CBC pipeline without a MAC is not this channel's claim
+(``finalizer-unresolved``).
+
+Grade split: learned ``verify_release`` pairing (study
+``paired_operations``) or operator annotation ⇒ registry-grade
+``release_order:release-before-verify``; seed-exemplar-only match ⇒
+the ``-naming`` detection variant (aggregation-only). No LLM calls,
+no subprocesses.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from core.json import save_json
+from core.source.lines import slice_source_lines, split_lines
+
+logger = logging.getLogger(__name__)
+
+_RELEASE_LINES_IMPL = split_lines
+_RELEASE_TYPE_IMPL = type
+
+_RELEASE_DEST_ARG_RE = re.compile(r"[&*(]*\s*([A-Za-z_]\w*)")
+_RELEASE_HEADER_PARAM_RE = re.compile(r"[\w\*\s]\b([A-Za-z_]\w*)\s*[,)]")
+
+RULE_RELEASE_BEFORE_VERIFY = "release_order:release-before-verify"
+
+DETECTION_VARIANT_SUFFIX = "-naming"
+
+# CWE families the channel owns; it additionally joins the CWE-345
+# authenticity chain (fail_open keeps its membership — the family
+# gets both the role leg and the ordering leg).
+RELEASE_ORDER_CWES = frozenset({"CWE-354", "CWE-347"})
+_JOINED_CWES = frozenset({"CWE-345"})
+
+# Enumerated inconclusive reasons (each a distinct tested string).
+REASON_FINALIZER_UNRESOLVED = "finalizer-unresolved"
+REASON_RELEASE_IN_CALLEE = "release-in-callee"
+REASON_CFG_UNAVAILABLE = "cfg-unavailable"
+REASON_ENGINES_DISAGREE = "engines-disagree"
+REASON_SINK_ALIAS_UNRESOLVED = "sink-alias-unresolved"
+REASON_LANGUAGE_UNSUPPORTED = "language-unsupported"
+REASON_HYPOTHESIS_UNBINDABLE = "hypothesis-unbindable"
+
+INCONCLUSIVE_REASONS = frozenset({
+    REASON_FINALIZER_UNRESOLVED,
+    REASON_RELEASE_IN_CALLEE,
+    REASON_CFG_UNAVAILABLE,
+    REASON_ENGINES_DISAGREE,
+    REASON_SINK_ALIAS_UNRESOLVED,
+    REASON_LANGUAGE_UNSUPPORTED,
+    REASON_HYPOTHESIS_UNBINDABLE,
+})
+
+# SEED SETS — pattern illustrators only (SEED_SET_CAP discipline, the
+# callback_lifetime rule verbatim): growth goes to the study loop
+# (paired_operations kind "verify_release") or a pack, never here.
+_SEED_FINALIZER_NAMES = (
+    "EVP_DecryptFinal_ex", "EVP_CipherFinal_ex", "BIO_get_cipher_status",
+    "EVP_DigestVerifyFinal", "EVP_MAC_final", "HMAC_Final",
+    "crypto_aead_decrypt",
+)
+
+_SEED_RELEASE_NAMES = (
+    "BIO_write", "fwrite", "fputs", "write", "send", "sendto",
+    "SSL_write",
+)
+
+# Prepass caps (§2.6).
+MAX_PREPASS_CANDIDATES = 100
+PREPASS_BUDGET_S = 20.0
+MAX_PREPASS_FINDINGS = 50
+
+# Hypothesis shapes asserting release-before-verify ordering.
+# ``stem\w*.{0,N}`` gaps are respelled in canonical-split form
+# ``stem(?:.{0,N}|\w{1,64}.{N})``: the suffix run and the gap both
+# consume word characters, so the unbounded ambiguous spelling
+# re-splits against every stem repeat inside one long word —
+# quadratic on hostile text. Same language (gap alone, or word run
+# plus exactly-N gap); only a stem buried more than 64
+# word-characters before the gap stops matching.
+_RELEASE_ORDER_HYPOTHESIS_RE = re.compile(
+    r"(?:(?:releas|output|write|writ|deliver|emit|flush)"
+    r"(?:.{0,60}|\w{1,64}.{60})"
+    r"(?:before|prior\s+to|without).{0,40}"
+    r"(?:verif|authenticat|\btag\b|\bMAC\b|integrity|signature|"
+    r"cipher\s*status)"
+    r"|(?:verif|authenticat|integrity|cipher\s*status)"
+    r"(?:.{0,40}|\w{1,64}.{40})"
+    r"(?:only\s+)?(?:after|at\s+EOF|at\s+the\s+end|at\s+end)"
+    r"|\bEFAIL\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z_][\w.]*)\s*(?:\(\s*\))?`")
+_ASSIGN_FROM_CALL_RE = re.compile(r"=\s*[A-Za-z_]\w*\s*\(")
+
+
+def is_release_order_hypothesis(text: str) -> bool:
+    """True when the hypothesis asserts the release-before-verify
+    temporal ordering (EFAIL shape)."""
+    return bool(text) and bool(_RELEASE_ORDER_HYPOTHESIS_RE.search(text))
+
+
+def release_order_applicable(cwe: str) -> bool:
+    """True for the channel's own CWEs plus the CWE-345 authenticity
+    chain it joins additively."""
+    norm = (cwe or "").upper().strip()
+    if norm and not norm.startswith("CWE-"):
+        norm = f"CWE-{norm}"
+    return norm in RELEASE_ORDER_CWES or norm in _JOINED_CWES
+
+
+def is_detection_rule_id(rule_id: str) -> bool:
+    """True for the detection-grade rule-id variants (seed-only
+    pairing) — aggregation-eligible, never promote-alone."""
+    return rule_id.startswith("release_order:") and rule_id.endswith(
+        DETECTION_VARIANT_SUFFIX,
+    )
+
+
+def seed_budget_violations() -> list[str]:
+    """Vocabulary-policy lint: seed tuples stay within SEED_SET_CAP."""
+    from .fail_open_roles import SEED_SET_CAP
+    violations: list[str] = []
+    for name, seeds in (
+        ("_SEED_FINALIZER_NAMES", _SEED_FINALIZER_NAMES),
+        ("_SEED_RELEASE_NAMES", _SEED_RELEASE_NAMES),
+    ):
+        if len(seeds) > SEED_SET_CAP:
+            violations.append(
+                f"release_order.{name} has {len(seeds)} entries "
+                f"(cap {SEED_SET_CAP}) — teach the study loop instead",
+            )
+    return violations
+
+
+@dataclass
+class OrderEvidence:
+    """Aggregate channel verdict for one release-order hypothesis."""
+
+    outcome: str                 # confirmed | refuted | inconclusive
+    reason: str
+    rule_id: str = RULE_RELEASE_BEFORE_VERIFY
+    finalizer: dict[str, Any] | None = None
+    releases: list[dict[str, Any]] = field(default_factory=list)
+    reachability: dict[str, Any] | None = None
+    # Consistency §3.5 ordering PeerEvidence dicts and taint receipts
+    # slot in unchanged (the fail_open corroboration convention).
+    corroboration: list[Any] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "outcome": self.outcome,
+            "reason": self.reason,
+            "rule_id": self.rule_id,
+        }
+        if self.finalizer is not None:
+            d["finalizer"] = self.finalizer
+        if self.releases:
+            d["releases"] = self.releases
+        if self.reachability is not None:
+            d["reachability"] = self.reachability
+        if self.corroboration:
+            d["corroboration"] = [
+                c.to_dict() if hasattr(c, "to_dict") else c
+                for c in self.corroboration
+            ]
+        return d
+
+
+def _inconclusive(reason: str, detail: str = "") -> OrderEvidence:
+    return OrderEvidence(
+        outcome="inconclusive",
+        reason=f"{reason}: {detail}" if detail else reason,
+    )
+
+
+def _alias_unresolved_evidence(
+    unresolved_sites: list[dict[str, Any]],
+    fin_receipt: dict[str, Any],
+    file_path: str,
+    dominated_releases: list[dict[str, Any]] | None = None,
+) -> OrderEvidence:
+    """``sink-alias-unresolved`` inconclusive naming EVERY undecidable
+    write site. An unresolved alias is excluded from the dominance
+    test, so a refutation ("every release site is dominated") cannot
+    be claimed while one exists — undecidable evidence degrades to
+    inconclusive, never to refuted."""
+    first = unresolved_sites[0]
+    more = (
+        f" (+{len(unresolved_sites) - 1} more unresolved site(s))"
+        if len(unresolved_sites) > 1 else ""
+    )
+    return OrderEvidence(
+        outcome="inconclusive",
+        reason=(
+            f"{REASON_SINK_ALIAS_UNRESOLVED}: destination "
+            f"`{first['destination']}` of "
+            f"{first['callee']} at "
+            f"{file_path}:{first['line']} mixes "
+            "internal and escaping provenance — buffering vs "
+            f"release undecidable{more}"
+        ),
+        finalizer=fin_receipt,
+        releases=list(dominated_releases or []) + unresolved_sites,
+    )
+
+
+# ── vocabulary (seeds < learned) ────────────────────────────────────
+
+
+def learned_verify_release_pairs(
+    domain_model: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Finalizer/output pairs from study-learned ``paired_operations``
+    entries of kind ``verify_release`` (acquire = the call reporting
+    whether decryption/authentication succeeded, release = the call
+    handing data to the consumer). Channel-local parsing — the
+    ``learned_cleanup_pairs`` precedent; ``llm_prior`` excluded."""
+    pairs: list[dict[str, str]] = []
+    for entry in (domain_model or {}).get("paired_operations") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("kind") or "").lower() != "verify_release":
+            continue
+        if str(entry.get("provenance") or "") == "llm_prior":
+            continue
+        fin = str(entry.get("acquire") or "").split("(")[0].strip()
+        rel = str(entry.get("release") or "").split("(")[0].strip()
+        if not fin or not rel:
+            continue
+        pairs.append({
+            "finalizer": fin,
+            "release": rel,
+            "provenance": str(entry.get("provenance") or "domain_model"),
+        })
+    return pairs
+
+
+def _finalizer_vocabulary(
+    domain_model: dict[str, Any] | None,
+) -> dict[str, tuple[str, str]]:
+    vocab: dict[str, tuple[str, str]] = dict.fromkeys(_SEED_FINALIZER_NAMES, ("seed", "seed"))
+    for pair in learned_verify_release_pairs(domain_model):
+        vocab[pair["finalizer"]] = ("learned", pair["provenance"])
+    return vocab
+
+
+def _release_vocabulary(
+    domain_model: dict[str, Any] | None,
+) -> dict[str, tuple[str, str]]:
+    vocab: dict[str, tuple[str, str]] = dict.fromkeys(_SEED_RELEASE_NAMES, ("seed", "seed"))
+    for pair in learned_verify_release_pairs(domain_model):
+        vocab[pair["release"]] = ("learned", pair["provenance"])
+    return vocab
+
+
+_REGISTRY_VOCAB_SOURCES = frozenset({"learned", "annotation"})
+
+
+def _call_re(names: tuple[str, ...] | list[str]) -> re.Pattern:
+    alts = "|".join(
+        re.escape(n) for n in sorted(names, key=len, reverse=True)
+    )
+    return re.compile(r"\b(" + alts + r")\s*\(")
+
+
+# ── structural helpers ──────────────────────────────────────────────
+
+
+def _read_source(target_path: Path, file_path: str) -> str | None:
+    """Containment-checked, size-capped read of a hypothesis file path.
+
+    ``file_path`` arrives from review-outcome / checklist artifacts
+    (LLM-writable): a bare join lets an absolute value discard
+    ``target_path`` under ``/`` semantics and a ``..`` segment escape
+    the analysed root, pulling arbitrary host files into adjudication.
+    Escaping, unreadable, and pathological paths all read as None —
+    the caller's hypothesis-unbindable inconclusive, never a verdict.
+    """
+    from core.source import read_contained
+
+    return read_contained(target_path, file_path)
+
+
+def _function_segment(
+    source: str, function_name: str, language: str,
+) -> tuple[list[str], int]:
+    try:
+        from .fail_open_lang import c_function_span
+        span = c_function_span(source, function_name, language=language)
+    except ImportError:
+        span = None
+    if (_RELEASE_TYPE_IMPL(source) is str and str.__len__(source) >= 16 * 1024
+            and split_lines is _RELEASE_LINES_IMPL and _RELEASE_TYPE_IMPL(span) is tuple
+            and tuple.__len__(span) == 2
+            and _RELEASE_TYPE_IMPL(span[0]) is int and _RELEASE_TYPE_IMPL(span[1]) is int
+            and span[0] > 0 and span[1] >= span[0]):
+        return slice_source_lines(source, span[0], span[1]), span[0]
+    lines = split_lines(source)
+    if span:
+        return lines[span[0] - 1:span[1]], span[0]
+    return lines, 1
+
+
+# Destination argument position per release verb (1-based). fwrite's
+# destination stream is its 4th argument and fputs' its 2nd — the
+# first argument of both is the DATA buffer, and classifying that
+# buffer's provenance (``buf = malloc(len)`` → "internal") minted a
+# false buffered-then-flush refutation on genuine stdio releases.
+# Every other verb (BIO_write, write, send, learned verbs) writes to
+# its first argument.
+_DEST_ARG_POSITION = {"fwrite": 4, "fputs": 2}
+
+# Descriptor/stream constructors (POSIX seed set, <= 9 per the vocab
+# budget): a destination assigned from one of these is a live external
+# channel, never an internal buffered-then-flush buffer (contrast
+# BIO_new(BIO_s_mem())).
+_DESCRIPTOR_CONSTRUCTORS = frozenset({
+    "open", "openat", "creat", "fopen", "fdopen", "freopen",
+    "socket", "accept", "accept4",
+})
+
+
+def _dest_arg_base(code: str, callee: str) -> str:
+    """Base identifier of the callee's DESTINATION argument
+    (``BIO_write(out, buf, n)`` → ``out``;
+    ``fwrite(buf, 1, n, fp)`` → ``fp``)."""
+    m = re.search(rf"\b{re.escape(callee)}\s*\(", code)
+    if not m:
+        return ""
+    args = _call_args(code, m.end())
+    pos = _DEST_ARG_POSITION.get(callee, 1)
+    if len(args) < pos:
+        return ""
+    m2 = _RELEASE_DEST_ARG_RE.match(args[pos - 1].strip())
+    return m2.group(1) if m2 else ""
+
+
+def _call_args(code: str, open_paren_end: int) -> list[str]:
+    """Top-level comma-split arguments of the call whose opening
+    paren just closed at ``open_paren_end`` (best-effort, single
+    line — the site regexes match line-locally)."""
+    depth = 1
+    args: list[str] = []
+    start = open_paren_end
+    for i in range(open_paren_end, len(code)):
+        ch = code[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                if code[start:i].strip():
+                    args.append(code[start:i])
+                return args
+        elif ch == "," and depth == 1:
+            args.append(code[start:i])
+            start = i + 1
+    return args
+
+
+_DEST_TERNARY_RE = re.compile(r".+\?\s*([^\s:](?:[^:\n]*[^\s:])?)\s*:\s*(.+)")
+_DEST_BASE_RE = re.compile(r"[&*]*\s*([A-Za-z_]\w*)\s*$")
+_DEST_CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+
+
+def _classify_destination(
+    dest: str,
+    segment_lines: list[str],
+    params: tuple[str, ...],
+) -> str:
+    """``escaping`` (out-param / alias of a param), ``internal``
+    (assigned from a fresh call — buffered-then-flush shape), or
+    ``unresolved`` (mixed/conditional alias — the CMS ``tmpout``
+    shape when provenance cannot be pinned)."""
+    if not dest:
+        return "unresolved"
+    if dest in params:
+        return "escaping"
+    classes: set[str] = set()
+    assign_re = re.compile(rf"\b{re.escape(dest)}\s*=\s*([^;=][^;]*)")
+    for raw in segment_lines:
+        if type(raw) is str and "=" not in raw:
+            continue
+        code = raw.split("//", 1)[0]
+        m = assign_re.search(code)
+        if not m:
+            continue
+        rhs = m.group(1).strip()
+        # Ternary-arm split. The true-arm group is delimited by
+        # non-whitespace-non-colon on both ends: the naive trim
+        # spelling ``\s*(.+?)\s*:`` overlaps three unbounded repeats
+        # on whitespace, and an assignment line with a ``?`` followed
+        # by a long whitespace run and no ``:`` makes the engine try
+        # every split of the run — cubic in the line length. For
+        # syntactically valid ternaries the split and both captures
+        # are unchanged; only invalid shapes (whitespace-only or
+        # colon-leading true-arm) no longer match, and those arms
+        # classified as garbage either way.
+        cond = _DEST_TERNARY_RE.match(rhs)
+        arms = [cond.group(1), cond.group(2)] if cond else [rhs]
+        for arm in arms:
+            arm = arm.strip()
+            base = _DEST_BASE_RE.match(arm)
+            call = _DEST_CALL_RE.match(arm)
+            if base and base.group(1) in params:
+                classes.add("escaping")
+            elif call and call.group(1) in _DESCRIPTOR_CONSTRUCTORS:
+                # A freshly-opened descriptor/stream is NOT an
+                # internal buffer: data handed to it leaves the
+                # process immediately, so the buffered-then-flush
+                # refutation shape does not apply.
+                classes.add("escaping")
+            elif call:
+                classes.add("internal")
+            else:
+                classes.add("unknown")
+    if not classes:
+        # Never assigned in-function and not a parameter: a global /
+        # captured stream — treat as escaping (data leaves the
+        # function's control).
+        return "escaping"
+    if classes == {"escaping"}:
+        return "escaping"
+    if classes == {"internal"}:
+        return "internal"
+    return "unresolved"
+
+
+def _guards_at(
+    source: str,
+    function_name: str,
+    line: int,
+    file_path: str,
+    language: str,
+) -> list[str] | None:
+    """Dominating guard conditions via CFG + dominators; ``None`` =
+    CFG unavailable."""
+    try:
+        from core.analysis.cfg_builder_cpp import build_cpp_intraproc_cfg
+        from core.analysis.dominators import build_dom_tree
+        from core.analysis.lifecycle_collector import collect_guards_at_site
+    except ImportError:
+        return None
+    tail = function_name.rsplit(".", 1)[-1]
+    try:
+        cfg = build_cpp_intraproc_cfg(source, tail, language=language)
+        if cfg is None:
+            return None
+        dom = build_dom_tree(cfg)
+        guards = collect_guards_at_site(cfg, dom, line, file_path)
+    except Exception:
+        logger.debug("release_order: guard collection failed",
+                     exc_info=True)
+        return None
+    return [g.condition if g.polarity else f"!({g.condition})" for g in guards]
+
+
+def _entry_reachability(
+    context: Any,
+    inventory: dict[str, Any] | None,
+    file_path: str,
+    function_name: str,
+) -> dict[str, Any] | None:
+    try:
+        from .fail_open_verify import _entry_reachability as _fo_reach
+    except ImportError:
+        return None
+    try:
+        return _fo_reach(context, inventory, file_path, function_name)
+    except Exception:
+        logger.debug("release_order: reachability escalator failed",
+                     exc_info=True)
+        return None
+
+
+def _status_bindings(
+    segment_lines: list[str], span_start: int, finalizer: str,
+) -> tuple[list[str], int]:
+    """Identifiers bound to the finalizer's result plus the first
+    finalizer call line. The finalizer name itself is always a valid
+    binding (direct ``if (!EVP_DecryptFinal_ex(...))`` shapes)."""
+    bindings = [finalizer]
+    first_line = 0
+    call_re = re.compile(
+        rf"(?:\b([A-Za-z_]\w*)\s*=\s*)?\b{re.escape(finalizer)}\s*\(",
+    )
+    for idx, raw in enumerate(segment_lines):
+        if type(raw) is str and "(" not in raw:
+            continue
+        code = raw.split("//", 1)[0]
+        m = call_re.search(code)
+        if not m:
+            continue
+        if not first_line:
+            first_line = span_start + idx
+        binding = m.group(1)
+        if binding and binding not in bindings:
+            bindings.append(binding)
+    return bindings, first_line
+
+
+def _joern_cross_check(
+    joern_server: Any,
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    binding: str,
+    release_callee: str,
+    cfg_dominated: bool,
+) -> tuple[str, str]:
+    """Read-only guard-dominance cross-check. Returns
+    ``(engine, disagreement_detail)`` — engine ``cfg`` when the leg
+    could not run, ``cfg+joern`` on agreement, and a non-empty detail
+    on disagreement."""
+    if joern_server is None:
+        return "cfg", ""
+    try:
+        from . import joern_verify
+        res = joern_verify.run_guard_dominance_check(
+            target_path=Path(target_path),
+            file_path=file_path,
+            function_name=function_name,
+            identifier=binding,
+            sink_call=release_callee,
+            server=joern_server,
+        )
+    except Exception:
+        logger.debug("release_order: joern cross-check failed",
+                     exc_info=True)
+        return "cfg", ""
+    outcome = getattr(res, "outcome", "")
+    if outcome not in ("confirmed", "refuted"):
+        return "cfg", ""
+    joern_dominated = outcome == "refuted"
+    if joern_dominated == cfg_dominated:
+        return "cfg+joern", ""
+    return "cfg", (
+        f"CFG says dominated={cfg_dominated}, Joern says "
+        f"dominated={joern_dominated} for {release_callee} vs "
+        f"{binding}"
+    )
+
+
+# ── channel core ────────────────────────────────────────────────────
+
+
+def _adjudicate_function(
+    source: str,
+    file_path: str,
+    function_name: str,
+    language: str,
+    *,
+    target_path: Path | None = None,
+    hypothesis: str = "",
+    domain_model: dict[str, Any] | None = None,
+    context: Any = None,
+    inventory: dict[str, Any] | None = None,
+    joern_server: Any = None,
+) -> OrderEvidence:
+    segment_lines, span_start = _function_segment(
+        source, function_name, language,
+    )
+    segment = "\n".join(segment_lines)
+    # Lexical receipts are earned against the sanitized view only
+    # (comments and string literals blanked, newlines preserved) —
+    # the sibling checkers' doctrine.  Raw-text matching let a block
+    # comment mentioning BIO_write mint a release site (a confirmed
+    # release-before-verify) and let commented-out finalizers bind
+    # vocabulary; both directions are hostile-repo steerable.
+    from .source_view import sanitized_view
+    view_segment = sanitized_view(segment, file_path, language=language)
+    view_lines = view_segment.splitlines()
+
+    fin_vocab = _finalizer_vocabulary(domain_model)
+    fin_re = _call_re(list(fin_vocab))
+    fin_match = fin_re.search(view_segment)
+    if not fin_match:
+        return _inconclusive(
+            REASON_FINALIZER_UNRESOLVED,
+            f"no integrity finalizer vocabulary binds in "
+            f"{function_name} — an unauthenticated pipeline is not "
+            "this channel's claim",
+        )
+    finalizer = fin_match.group(1)
+    fin_source, fin_prov = fin_vocab[finalizer]
+    bindings, fin_line = _status_bindings(
+        view_lines, span_start, finalizer,
+    )
+
+    rel_vocab = _release_vocabulary(domain_model)
+    rel_re = _call_re(list(rel_vocab))
+
+    # Enumerate release sites with destination classification.
+    params: tuple[str, ...] = ()
+    try:
+        from core.analysis.cfg_builder_cpp import build_cpp_intraproc_cfg
+        cfg = build_cpp_intraproc_cfg(
+            source, function_name.rsplit(".", 1)[-1], language=language,
+        )
+        if cfg is not None:
+            params = cfg.params
+    except Exception:
+        cfg = None
+    if not params:
+        header = segment_lines[0] if segment_lines else ""
+        params = tuple(_RELEASE_HEADER_PARAM_RE.findall(header))
+
+    release_sites: list[dict[str, Any]] = []
+    internal_sites: list[dict[str, Any]] = []
+    unresolved_sites: list[dict[str, Any]] = []
+    for idx, code in enumerate(view_lines):
+        m = rel_re.search(code)
+        if not m:
+            continue
+        callee = m.group(1)
+        dest = _dest_arg_base(code, callee)
+        dest_class = _classify_destination(dest, view_lines, params)
+        site = {
+            "file": file_path,
+            "line": span_start + idx,
+            # The receipt shows the operator the ORIGINAL line; only
+            # the matching ran on the sanitized view.
+            "code": segment_lines[idx].strip()[:200],
+            "callee": callee,
+            "destination": dest,
+            "destination_class": dest_class,
+        }
+        if dest_class == "escaping":
+            release_sites.append(site)
+        elif dest_class == "unresolved":
+            unresolved_sites.append(site)
+        else:
+            internal_sites.append(site)
+
+    fin_receipt = {
+        "name": finalizer,
+        "file": file_path,
+        "line": fin_line,
+        "status_binding": ", ".join(b for b in bindings if b != finalizer)
+                          or finalizer,
+        "vocab_source": fin_source,
+        "provenance": fin_prov,
+    }
+
+    if not release_sites:
+        if unresolved_sites:
+            return _alias_unresolved_evidence(
+                unresolved_sites, fin_receipt, file_path,
+            )
+        if internal_sites:
+            # Buffered-then-flush architecture: every write targets an
+            # internal buffer (fresh-call provenance) — the safe CMS
+            # tmpout shape. Per-site provenance receipts.
+            return OrderEvidence(
+                outcome="refuted",
+                reason=(
+                    f"all {len(internal_sites)} write(s) in "
+                    f"{function_name} target an internal buffer "
+                    "(fresh-call provenance) — buffered-then-flush, "
+                    "nothing escapes before the check"
+                ),
+                finalizer=fin_receipt,
+                releases=internal_sites,
+            )
+        # Phase-2 seam: a hypothesis-named callee present in the
+        # function may wrap the write (BIO chains, wrapper writers).
+        for m in _BACKTICK_IDENT_RE.finditer(hypothesis or ""):
+            name = m.group(1).rstrip("(")
+            if name not in rel_vocab and re.search(
+                rf"\b{re.escape(name)}\s*\(", view_segment,
+            ):
+                return _inconclusive(
+                    REASON_RELEASE_IN_CALLEE,
+                    f"release happens in callee {name} — phase-2 "
+                    "callee expansion territory",
+                )
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"no release-classified call in {function_name}",
+        )
+
+    # Dominance test per release site.
+    releases: list[dict[str, Any]] = []
+    undominated: list[dict[str, Any]] = []
+    for site in release_sites:
+        guards = _guards_at(
+            source, function_name, site["line"], file_path, language,
+        )
+        if guards is None:
+            return _inconclusive(
+                REASON_CFG_UNAVAILABLE,
+                "CFG/dominators unavailable — dominance cannot be "
+                "established structurally",
+            )
+        dominator = None
+        for cond in guards:
+            if any(
+                re.search(rf"\b{re.escape(b)}\b", cond) for b in bindings
+            ):
+                dominator = cond[:200]
+                break
+        cfg_dominated = dominator is not None
+        engine, disagreement = _joern_cross_check(
+            joern_server, target_path or Path("."), file_path,
+            function_name,
+            str(fin_receipt["status_binding"]).split(",")[0].strip(),
+            site["callee"], cfg_dominated,
+        )
+        if disagreement:
+            return OrderEvidence(
+                outcome="inconclusive",
+                reason=f"{REASON_ENGINES_DISAGREE}: {disagreement}",
+                finalizer=fin_receipt,
+                releases=releases + [dict(site, engine="cfg")],
+            )
+        entry = dict(
+            site, dominated=cfg_dominated, dominator=dominator,
+            engine=engine,
+        )
+        releases.append(entry)
+        if not cfg_dominated:
+            undominated.append(entry)
+
+    if not undominated:
+        if unresolved_sites:
+            # A write whose alias provenance is undecidable was
+            # excluded from the dominance test above — "every release
+            # site is dominated" would be claimed over evidence that
+            # never covered it. The dominated receipts stay attached.
+            return _alias_unresolved_evidence(
+                unresolved_sites, fin_receipt, file_path,
+                dominated_releases=releases,
+            )
+        return OrderEvidence(
+            outcome="refuted",
+            reason=(
+                f"every release site ({len(releases)}) in "
+                f"{function_name} is dominated by a "
+                f"{finalizer}-status check (per-site dominator "
+                "receipts)"
+            ),
+            finalizer=fin_receipt,
+            releases=releases,
+        )
+
+    registry = fin_source in _REGISTRY_VOCAB_SOURCES
+    rule_id = (
+        RULE_RELEASE_BEFORE_VERIFY if registry
+        else RULE_RELEASE_BEFORE_VERIFY + DETECTION_VARIANT_SUFFIX
+    )
+    first = undominated[0]
+    result = OrderEvidence(
+        outcome="confirmed",
+        reason=(
+            f"{first['callee']} at {file_path}:{first['line']} "
+            f"releases `{first['destination']}` (escaping) with no "
+            f"dominating {finalizer}-status check — "
+            f"{len(undominated)}/{len(releases)} release site(s) "
+            f"undominated; verification completes only after release"
+        ),
+        rule_id=rule_id,
+        finalizer=fin_receipt,
+        releases=releases,
+    )
+    result.reachability = _entry_reachability(
+        context, inventory, file_path, function_name,
+    )
+    return result
+
+
+def run_release_order_check(
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    *,
+    inventory: dict[str, Any] | None = None,
+    context: Any = None,
+    domain_model: dict[str, Any] | None = None,
+    joern_server: Any = None,
+    budget_s: float | None = None,
+) -> OrderEvidence:
+    """Adjudicate one release-order hypothesis. See module docstring
+    for verdict semantics."""
+    del budget_s  # phase-2 callee-expansion parameter
+    # Binary checklist rows carry no repo source path; gate before the
+    # suffix-based language lookup can leak a meaningless ".0" reason.
+    from .fail_open_lang import is_binary_row
+    if is_binary_row(file_path):
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "binary checklist row — release-order reads repo source, "
+            "not decompiled output",
+        )
+    try:
+        from .fail_open_lang import language_for_path
+        language = language_for_path(file_path)
+    except ImportError:
+        language = None
+    if language not in ("c", "cpp"):
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            f"no phase-1 release-order analyzer for "
+            f"{language or Path(file_path).suffix or 'unknown'}",
+        )
+    source = _read_source(Path(target_path), file_path)
+    if source is None:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE, f"could not read {file_path}",
+        )
+    return _adjudicate_function(
+        source, file_path, function_name, language,
+        target_path=Path(target_path),
+        hypothesis=hypothesis,
+        domain_model=domain_model,
+        context=context,
+        inventory=inventory,
+        joern_server=joern_server,
+    )
+
+
+def run_release_order_prepass(
+    source_texts: dict[str, str],
+    *,
+    target_path: Path | None = None,
+    out_dir: Path | None = None,
+    inventory: dict[str, Any] | None = None,
+    context: Any = None,
+    domain_model: dict[str, Any] | None = None,
+    joern_server: Any = None,
+    budget_s: float = PREPASS_BUDGET_S,
+) -> dict[str, Any]:
+    """Standing pre-pass: candidate functions contain both a finalizer
+    name and a release-classified call (cheap string prefilter on the
+    source set), cap 100/run, budget 20 s (§2.6)."""
+    del target_path  # reserved for the phase-2 callee expansion
+    t0 = time.monotonic()
+    telemetry: dict[str, Any] = {
+        "channel": "release_order",
+        "confirmed": 0, "refuted": 0, "inconclusive": 0,
+        "candidates": 0, "budget_exceeded": False,
+        "inconclusive_reasons": {},
+    }
+    findings: list[dict[str, Any]] = []
+    leads: list[dict[str, Any]] = []
+    mechanical: list[dict[str, Any]] = []
+
+    fin_vocab = _finalizer_vocabulary(domain_model)
+    rel_vocab = _release_vocabulary(domain_model)
+    fin_re = _call_re(list(fin_vocab))
+    rel_re = _call_re(list(rel_vocab))
+
+    from .resource_bounds import _c_function_spans, _c_function_spans_from_lines
+
+    candidates: list[tuple[str, str]] = []
+    for fp, source in sorted(source_texts.items()):
+        if not fp.endswith((".c", ".h", ".cc", ".cpp", ".cxx", ".hpp")):
+            continue
+        if not (fin_re.search(source) and rel_re.search(source)):
+            continue
+        lines = split_lines(source)  # once per file, not per span
+        spans = (_c_function_spans_from_lines(lines) if type(source) is str
+                 else _c_function_spans(source))
+        for name, start, end in spans:
+            segment = "\n".join(lines[start - 1:end])
+            if fin_re.search(segment) and rel_re.search(segment):
+                candidates.append((fp, name))
+            if len(candidates) >= MAX_PREPASS_CANDIDATES:
+                break
+        if len(candidates) >= MAX_PREPASS_CANDIDATES:
+            break
+    telemetry["candidates"] = len(candidates)
+
+    for fp, name in candidates:
+        if time.monotonic() - t0 > budget_s:
+            telemetry["budget_exceeded"] = True
+            break
+        # Language from the file's extension, not a hardcoded "c":
+        # the suffix filter admits C++ files, and the C guard walk on
+        # a .cpp file fails into cfg-unavailable inconclusive.
+        try:
+            from .fail_open_lang import language_for_path
+            lang = language_for_path(fp) or "c"
+        except Exception:
+            lang = "c"
+        res = _adjudicate_function(
+            source_texts[fp], fp, name, lang,
+            domain_model=domain_model,
+            context=context,
+            inventory=inventory,
+            joern_server=joern_server,
+        )
+        telemetry[res.outcome] = telemetry.get(res.outcome, 0) + 1
+        if res.outcome == "inconclusive":
+            key = res.reason.split(":", 1)[0]
+            telemetry["inconclusive_reasons"][key] = (
+                telemetry["inconclusive_reasons"].get(key, 0) + 1
+            )
+            continue
+        if res.outcome != "confirmed":
+            continue
+        detection = is_detection_rule_id(res.rule_id)
+        status = (
+            "finding"
+            if not detection
+            and (res.reachability or {}).get("status") == "entry_reachable"
+            else "suspicious"
+        )
+        first = next(
+            (r for r in res.releases if not r.get("dominated")),
+            res.releases[0] if res.releases else {},
+        )
+        line = int(first.get("line") or 0)
+        if len(findings) < MAX_PREPASS_FINDINGS:
+            findings.append({
+                "file": fp,
+                "function": name,
+                "line": line,
+                "rule_id": res.rule_id,
+                "evidence_tool": res.rule_id,
+                "status": status,
+                "detection_grade": detection,
+                "cwe": "CWE-354",
+                "hypothesis": (
+                    f"{first.get('callee', 'the writer')} at "
+                    f"{fp}:{line} releases data before the "
+                    f"{(res.finalizer or {}).get('name', 'integrity')} "
+                    "check completes"
+                ),
+                "description": res.reason,
+                "receipts": res.to_dict(),
+            })
+        mechanical.append({
+            "file": fp,
+            "function": name,
+            "detector": "release_order",
+            "line": line,
+            "description": res.reason,
+            "callee": first.get("callee", ""),
+            "rule_id": res.rule_id,
+            "cwe": "CWE-354",
+        })
+        leads.append({
+            "channel": "release_order",
+            "file": fp,
+            "function": name,
+            "line": line,
+            "rule_id": res.rule_id,
+            "description": res.reason[:300],
+            "mechanism": (
+                f"{first.get('callee', 'a writer')} at {fp}:{line} "
+                "hands data to the consumer before the integrity "
+                "finalizer's status is consulted (release-before-"
+                "verify, CWE-354)"
+            ),
+        })
+
+    telemetry["wall_time_s"] = round(time.monotonic() - t0, 3)
+    if out_dir is not None and (findings or leads):
+        try:
+            # Atomic write (tempfile + rename via save_json): a torn
+            # write here surfaces as "release-order.json exists but
+            # fails to parse" at /review time.
+            save_json(
+                Path(out_dir) / "release-order.json",
+                {"findings": findings, "leads": leads,
+                 "telemetry": telemetry},
+            )
+        except Exception:
+            logger.debug("release-order.json write failed", exc_info=True)
+    return {
+        "findings": findings,
+        "leads": leads,
+        "mechanical": mechanical,
+        "telemetry": telemetry,
+    }

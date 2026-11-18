@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 
-from core.binary.fingerprint import CapabilityFingerprint
+from core.binary.fingerprint import (
+    FINGERPRINT_SCHEMA_VERSION,
+    CapabilityFingerprint,
+)
 from core.binary.fingerprint_store import (
     STORE_SCHEMA_VERSION,
     delete_fingerprint,
@@ -22,7 +25,7 @@ from core.binary.fingerprint_store import (
 def _fp(*, sha="abc", arch="x86", bits=64,
         buckets=None) -> CapabilityFingerprint:
     return CapabilityFingerprint(
-        schema_version=1,
+        schema_version=FINGERPRINT_SCHEMA_VERSION,
         binary_path="/test",
         binary_sha256=sha, arch=arch, bits=bits,
         binary_format="elf",
@@ -96,12 +99,19 @@ class TestAtomicWrite:
             data = json.load(f)
         assert data["ref"] == "ref"
 
-    def test_tmp_files_filtered_from_iter_refs(self, tmp_path):
-        """A leftover ``.tmp-*.json`` file (process killed
-        mid-write) doesn't pollute iter_refs."""
-        # Simulate the leftover
-        leftover = tmp_path / ".tmp-abc.json"
-        leftover.write_text('{"some": "data"}')
+    def test_stale_atomic_write_temps_filtered_from_iter_refs(
+            self, tmp_path):
+        """Leftover in-flight atomic-write temps (process killed
+        mid-write) don't pollute iter_refs. save_json's temps are
+        named ``.~savejson-<name>.json.<pid>.<tid>.<rand>.tmp`` and
+        atomic_fs's default prefix is ``.atomic-`` — BOTH end
+        ``.tmp``, so the ``.json`` suffix filter is what excludes
+        them (there is no separate prefix guard)."""
+        for stale in (
+            ".~savejson-x.json.3880225.140213.k9q2.tmp",
+            ".atomic-x.json.1234.5678.ab3f.tmp",
+        ):
+            (tmp_path / stale).write_text('{"some": "data"}')
         save_fingerprint(tmp_path, "real", _fp())
         refs = list(iter_refs(tmp_path))
         assert len(refs) == 1
@@ -165,6 +175,52 @@ class TestSchemaVersioning:
         with open(file_path, "w") as f:
             json.dump(data, f)
         assert load_fingerprint(tmp_path, "ref") is None
+
+    def test_mismatched_fingerprint_shape_load_returns_none(
+            self, tmp_path):
+        """Wrapper version OK, embedded fingerprint shape stale —
+        treat as no baseline. Regression for the silent-false-
+        positive-drift bug: a stored fingerprint with an old
+        FINGERPRINT_SCHEMA_VERSION must not be diffed against a
+        fresh one with a newer shape (new buckets would all show
+        as drift)."""
+        save_fingerprint(tmp_path, "ref", _fp())
+        file_path = next(tmp_path.glob("*.json"))
+        with open(file_path) as f:
+            data = json.load(f)
+        # Wrapper stays current; tamper only with embedded shape.
+        data["fingerprint"]["schema_version"] = \
+            FINGERPRINT_SCHEMA_VERSION - 1
+        with open(file_path, "w") as f:
+            json.dump(data, f)
+        assert load_fingerprint(tmp_path, "ref") is None
+
+    def test_iter_refs_skips_mismatched_fingerprint_shape(
+            self, tmp_path):
+        """Same regression as above, applied to iter_refs() —
+        stale-shape entries must be skipped by the enumeration
+        path too (drift detectors that scan the whole store
+        depend on this)."""
+        save_fingerprint(tmp_path, "good", _fp(sha="A"))
+        # Write a stale-shape entry directly (correct wrapper,
+        # stale embedded schema_version).
+        (tmp_path / "deadbeef.json").write_text(json.dumps({
+            "schema_version": STORE_SCHEMA_VERSION,
+            "ref": "stale-shape",
+            "fingerprint": {
+                "schema_version": FINGERPRINT_SCHEMA_VERSION - 1,
+                "binary_path": "/test",
+                "binary_sha256": "B",
+                "arch": "x86",
+                "bits": 64,
+                "binary_format": "elf",
+                "capability_buckets": {},
+            },
+        }))
+        refs = dict(iter_refs(tmp_path))
+        assert "good" in refs
+        assert "stale-shape" not in refs
+        assert len(refs) == 1
 
 
 # ---------------------------------------------------------------------------

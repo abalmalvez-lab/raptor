@@ -1,0 +1,679 @@
+"""Contract tests for core.env.verify — the plan engine over a handle.
+
+The cve_env suite pins the full check-executor behaviour through its
+tool surface; these pin the core engine directly: handle wiring, plan
+canonicalization, injector semantics, executor-table dispatch, hooks.
+"""
+
+from __future__ import annotations
+
+import re
+from contextlib import contextmanager, ExitStack
+from typing import Any
+
+from core.container.exec import ExecOutcome
+from core.env import verify as ev
+from core.env.handle import RuntimeHandle
+from core.sandbox.tests.socket_server import SocketServer
+
+_VERSION_RE = re.compile(r"--version|pip show|dpkg -l")
+
+
+class FakeHandle(RuntimeHandle):
+    tier = "docker"
+
+    def __init__(self, *, running: bool = True, logs: str = "",
+                 exec_outcomes: dict[str, ExecOutcome] | None = None,
+                 host_port: int = 8080) -> None:
+        self._running = running
+        self._logs = logs
+        self._exec = exec_outcomes or {}
+        self._host_port = host_port
+        self.torn_down = False
+
+    def endpoint(self):
+        return ("127.0.0.1", self._host_port) if self._host_port else None
+
+    def state(self) -> dict[str, Any]:
+        if self._running:
+            return {"Running": True, "Status": "running"}
+        return {"Running": False, "Status": "exited", "ExitCode": 1,
+                "OOMKilled": False}
+
+    def logs(self, tail: int = 500) -> str:
+        return self._logs
+
+    def exec(self, command: str, *, timeout_seconds: float = 30.0,
+             workdir: str = "") -> ExecOutcome:
+        return self._exec.get(command, ExecOutcome(
+            ok=True, container_id="cid", command=command, exit_code=0,
+            stdout="", stderr=""))
+
+    def teardown(self) -> None:
+        self.torn_down = True
+
+
+# ── status / logs / exec through the handle ───────────────────────────
+
+
+def test_status_pass_and_fail_shapes() -> None:
+    ok = ev.check_container_status(FakeHandle(running=True))
+    assert ok["passed"] and ok["details"]["status"] == "running"
+    bad = ev.check_container_status(FakeHandle(running=False,
+                                               logs="traceback ..."))
+    assert not bad["passed"]
+    assert bad["details"]["logs_tail"].startswith("traceback")
+    assert "hint" not in bad["details"]  # no hook → no hint key
+
+
+def test_status_hint_hook_attaches() -> None:
+    hooks = ev.VerifyHooks(status_hint=lambda state, logs: "look here")
+    bad = ev.check_container_status(FakeHandle(running=False), hooks=hooks)
+    assert bad["details"]["hint"] == "look here"
+
+
+def test_exec_check_matches_exit_and_stdout() -> None:
+    outcome = ExecOutcome(ok=True, container_id="c", command="app --version",
+                          exit_code=0, stdout="app 1.2.3", stderr="")
+    h = FakeHandle(exec_outcomes={"app --version": outcome})
+    r = ev.check_exec(h, command="app --version",
+                      expected_stdout_contains="1.2.3")
+    assert r["passed"]
+    assert r["details"]["expected_stdout_contains"] == "1.2.3"
+    r2 = ev.check_exec(h, command="app --version",
+                       expected_stdout_contains="9.9")
+    assert not r2["passed"]
+
+
+def test_log_check_regex_and_fetch_failure() -> None:
+    h = FakeHandle(logs="Server started on :8080\n")
+    assert ev.check_logs(h, expected_patterns=["Server start"])["passed"]
+    missing = ev.check_logs(h, expected_patterns=["nope"])
+    assert not missing["passed"]
+    fetchfail = ev.check_logs(FakeHandle(logs=""),
+                              expected_patterns=["x"])
+    assert not fetchfail["passed"]
+    assert "no logs available" in fetchfail["details"]["error"]
+
+
+# ── host-ip guard ─────────────────────────────────────────────────────
+
+
+def test_public_and_metadata_ips_refused() -> None:
+    assert ev.assert_local_host_ip("8.8.8.8") is not None
+    assert ev.assert_local_host_ip("169.254.169.254") is not None
+    assert ev.assert_local_host_ip("example.com") is not None
+    assert ev.assert_local_host_ip("127.0.0.1") is None
+    assert ev.assert_local_host_ip("10.1.2.3") is None
+    assert ev.assert_local_host_ip("::1") is None
+
+
+# ── plan utilities ────────────────────────────────────────────────────
+
+
+def test_canonicalize_prepends_status() -> None:
+    plan = [{"type": "http_check"}]
+    out = ev.canonicalize_plan(plan)
+    assert out[0] == {"type": "container_status"}
+    assert ev.canonicalize_plan(out) == out  # idempotent
+
+
+def test_alias_normalization_canonical_wins() -> None:
+    out = ev.normalize_kwargs({"timeout": 5, "timeout_seconds": 9},
+                              ev.HTTP_KEY_ALIASES)
+    assert out == {"timeout_seconds": 9}
+
+
+def test_version_injector_fills_only_gaps() -> None:
+    plan = [
+        {"type": "exec_check", "command": "app --version"},
+        {"type": "exec_check", "command": "app --version",
+         "expected_stdout_contains": "2.0.1"},
+        {"type": "exec_check", "command": "echo hi"},
+    ]
+    out, injected = ev.inject_version_assertion(plan, "1.2.3", _VERSION_RE)
+    assert injected == {0}
+    assert out[0]["expected_stdout_contains"] == "1.2.3"
+    assert out[1]["expected_stdout_contains"] == "2.0.1"
+    assert "expected_stdout_contains" not in out[2]
+    # No version digits in the literal → no injection.
+    _, none_injected = ev.inject_version_assertion(plan, "latest", _VERSION_RE)
+    assert none_injected == set()
+
+
+def test_smoke_injector_appends_only_when_needed() -> None:
+    plan = [{"type": "http_check", "path": "/"}]
+    out, injected = ev.inject_functional_smoke(plan)
+    assert len(out) == 3 and injected == {1, 2}
+    # Already smoke-satisfied (content_check) → untouched.
+    rich = [{"type": "http_check", "path": "/", "content_check": ["x"]}]
+    same, none = ev.inject_functional_smoke(rich)
+    assert same == rich and none == set()
+    # Non-HTTP plans never get HTTP probes injected.
+    db = [{"type": "exec_check", "command": "psql -c 'select 1'"}]
+    same2, none2 = ev.inject_functional_smoke(db)
+    assert same2 == db and none2 == set()
+
+
+# ── verify_plan engine ────────────────────────────────────────────────
+
+
+def test_verify_plan_short_circuits_on_fatal_failure() -> None:
+    h = FakeHandle(running=False)
+    out = ev.verify_plan(h, [{"type": "log_check",
+                              "expected_patterns": ["x"]}])
+    assert out["passed"] is False
+    assert out["reason"].startswith("container_status")
+    assert len(out["results"]) == 1  # log_check never ran
+
+
+def test_verify_plan_injected_smoke_grades_but_never_gates() -> None:
+    calls: list[str] = []
+
+    def http_exec(**kw: Any) -> dict[str, Any]:
+        calls.append(kw.get("path", "/"))
+        if kw.get("path", "/").startswith("/_phase32"):
+            return {"type": "http_check", "passed": False, "reason": "404≠200",
+                    "details": {}}
+        return {"type": "http_check", "passed": True,
+                "details": {"url": kw.get("path", "/")}}
+
+    h = FakeHandle()
+    executors = ev.default_executors(h)
+    executors["http_check"] = http_exec
+    out = ev.verify_plan(plan=[{"type": "container_status"},
+                               {"type": "http_check", "path": "/"}],
+                         handle=h, executors=executors)
+    assert out["passed"] is True  # failing injected probe didn't gate
+    smoke = [r for r in out["results"]
+             if r.get("injected_source") == "phase32_smoke"]
+    assert smoke, "smoke probes were not injected/tagged"
+
+
+def test_verify_plan_rejects_non_list_and_non_dict_steps() -> None:
+    h = FakeHandle()
+    assert not ev.verify_plan(h, "[]")["passed"]
+    out = ev.verify_plan(h, [{"type": "container_status"}, "nope"])
+    assert not out["passed"]
+    assert "must be a dict" in out["reason"]
+
+
+def test_verify_plan_quality_warning_hook() -> None:
+    hooks = ev.VerifyHooks(quality_warning=lambda results: "add version")
+    out = ev.verify_plan(FakeHandle(), [{"type": "container_status"}],
+                         hooks=hooks)
+    assert out["passed"] and out["verify_quality_warning"] == "add version"
+
+
+def test_verify_plan_executor_table_is_authoritative() -> None:
+    seen: list[str] = []
+
+    def spy_status() -> dict[str, Any]:
+        seen.append("status")
+        return {"type": "container_status", "passed": True, "details": {}}
+
+    out = ev.verify_plan(
+        plan=[{"type": "container_status"}],
+        executors={"container_status": spy_status},
+        endpoint=("127.0.0.1", 80),
+    )
+    assert out["passed"] and seen == ["status"]
+
+
+def test_verify_plan_requires_handle_or_executors() -> None:
+    try:
+        ev.verify_plan(plan=[])
+    except ValueError as exc:
+        assert "handle or an executor table" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError")
+
+
+# ── bounded HTTP exchange (the peer runs hostile target code) ─────────
+
+
+@contextmanager
+def _serve(handler_cls):
+    import socketserver
+    import threading
+
+    with socketserver.TCPServer(("127.0.0.1", 0), handler_cls) as srv:
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        try:
+            thread.start()
+            yield srv
+        finally:
+            if thread.ident is not None:
+                srv.shutdown()
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "HTTP server thread did not stop"
+
+
+def test_http_exchange_caps_oversize_body() -> None:
+    import http.server
+
+    class Big(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — stdlib handler contract
+            payload = b"x" * (256 * 1024)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *args):  # noqa: A003
+            pass
+
+    with _serve(Big) as srv:
+        status, content = ev._http_exchange(
+            host_ip="127.0.0.1", host_port=srv.server_address[1],
+            method="GET", path="/", timeout_seconds=5.0,
+            max_response_bytes=64 * 1024,
+        )
+    assert status == 200
+    assert len(content) == 64 * 1024  # capped, not the declared 256 KiB
+
+
+def test_http_exchange_deadline_stops_dripping_body() -> None:
+    import http.server
+    import threading
+    import time as _time
+
+    stop = threading.Event()
+
+    class Drip(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"  # no Content-Length: read-to-EOF body
+
+        def do_GET(self):  # noqa: N802 — stdlib handler contract
+            self.send_response(200)
+            self.end_headers()
+            try:
+                for _ in range(200):
+                    self.wfile.write(b"y" * 512)
+                    self.wfile.flush()
+                    if stop.wait(0.2):
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *args):  # noqa: A003
+            pass
+
+    start = _time.monotonic()
+    with _serve(Drip) as srv:
+        try:
+            status, content = ev._http_exchange(
+                host_ip="127.0.0.1", host_port=srv.server_address[1],
+                method="GET", path="/", timeout_seconds=1.0,
+            )
+        finally:
+            stop.set()
+    elapsed = _time.monotonic() - start
+    assert status == 200
+    # The drip feeds ~512 B per 0.2 s inside the socket-inactivity
+    # window; without the wall deadline this read would run ~40 s.
+    assert elapsed < 5.0
+    assert 0 < len(content) < 200 * 512
+
+
+def test_http_exchange_watchdog_stops_dripping_headers() -> None:
+    """The status/header phase blocks inside http.client with only the
+    inactivity timeout; a peer dripping header bytes (reviewer PoC:
+    one byte per 0.4 s sustains for hours) must be cut by the
+    whole-exchange watchdog, not survive it."""
+    import socket as _socket
+    import threading as _threading
+    import time as _time
+
+    with ExitStack() as resources:
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        resources.callback(srv.close)
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        stop = _threading.Event()
+
+        def _drip(conn) -> None:
+            try:
+                conn.sendall(b"HTTP/1.1 200 OK\r\n")
+                # Drip header bytes one at a time, each inside the
+                # inactivity window — never a blank line, never EOF.
+                for ch in (b"X-Drip: " + b"a" * 4096) * 4:
+                    if stop.is_set():
+                        break
+                    try:
+                        conn.sendall(bytes([ch]))
+                    except OSError:
+                        break
+                    if stop.wait(0.2):
+                        break
+            except OSError:
+                pass
+
+        server = resources.enter_context(SocketServer(srv, _drip))
+        resources.callback(stop.set)
+        start = _time.monotonic()
+        try:
+            try:
+                ev._http_exchange(
+                    host_ip="127.0.0.1", host_port=port,
+                    method="GET", path="/", timeout_seconds=1.0,
+                )
+            except TimeoutError as exc:
+                assert "watchdog" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("expected TimeoutError from header drip")
+        finally:
+            stop.set()
+            server.close()
+        # Watchdog fires at 2x timeout; without it this blocks ~55 min.
+        assert _time.monotonic() - start < 5.0
+# ── tcp_probe destination pinning (plans are untrusted) ───────────────
+
+
+def _tcp_spy(seen: list[dict[str, Any]]):
+    def spy(**kw: Any) -> dict[str, Any]:
+        seen.append(kw)
+        return {"type": "tcp_probe_check", "passed": True, "details": {}}
+    return spy
+
+
+def _pin_executors(seen: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "container_status": lambda: {
+            "type": "container_status", "passed": True, "details": {}},
+        "tcp_probe_check": _tcp_spy(seen),
+    }
+
+
+def test_tcp_probe_plan_host_ip_is_discarded() -> None:
+    seen: list[dict[str, Any]] = []
+    out = ev.verify_plan(
+        plan=[{"type": "tcp_probe_check", "host": "10.11.12.13",
+               "host_port": 8080, "send_text": "PING",
+               "expected_response_contains": "PONG"}],
+        executors=_pin_executors(seen),
+        endpoint=("127.0.0.1", 8080),
+    )
+    assert out["passed"], out
+    assert seen and seen[0]["host_ip"] == "127.0.0.1"  # pinned, not 10.x
+
+
+def test_tcp_probe_port_outside_allowlist_fails_closed() -> None:
+    seen: list[dict[str, Any]] = []
+    out = ev.verify_plan(
+        plan=[{"type": "tcp_probe_check", "host_port": 9999,
+               "send_text": "x", "expected_response_contains": "y"}],
+        executors=_pin_executors(seen),
+        endpoint=("127.0.0.1", 8080),
+    )
+    assert not out["passed"]
+    assert "not a published endpoint" in out["reason"]
+    assert seen == []  # probe never dispatched
+
+
+def test_tcp_probe_allowed_tcp_ports_extends_allowlist() -> None:
+    seen: list[dict[str, Any]] = []
+    out = ev.verify_plan(
+        plan=[{"type": "tcp_probe_check", "host_port": 6379,
+               "send_text": "PING", "expected_response_contains": "PONG"}],
+        executors=_pin_executors(seen),
+        endpoint=("127.0.0.1", 8080),
+        allowed_tcp_ports={6379},
+    )
+    assert out["passed"], out
+    assert seen and seen[0]["host_port"] == 6379
+
+
+# ── LLM-authored plan kwargs: failed check, never TypeError ────────────
+
+
+def test_unknown_kwargs_become_failed_check_not_typeerror() -> None:
+    def fixed_sig(*, command: str = "true") -> dict[str, Any]:
+        return {"type": "exec_check", "passed": True, "details": {}}
+
+    out = ev.verify_plan(
+        plan=[{"type": "exec_check", "bogus_key": 1}],
+        executors={
+            "container_status": lambda: {
+                "type": "container_status", "passed": True, "details": {}},
+            "exec_check": fixed_sig,
+        },
+        endpoint=("127.0.0.1", 8080),
+    )
+    assert not out["passed"]
+    assert "invalid step arguments" in out["reason"]
+
+
+def test_known_kwargs_still_dispatch() -> None:
+    seen: list[str] = []
+
+    def fixed_sig(*, command: str = "true") -> dict[str, Any]:
+        seen.append(command)
+        return {"type": "exec_check", "passed": True, "details": {}}
+
+    out = ev.verify_plan(
+        plan=[{"type": "exec_check", "command": "id"}],
+        executors={
+            "container_status": lambda: {
+                "type": "container_status", "passed": True, "details": {}},
+            "exec_check": fixed_sig,
+        },
+        endpoint=("127.0.0.1", 8080),
+    )
+    assert out["passed"] and seen == ["id"]
+
+
+# ── GET + form_encoded=false must not silently drop the payload ────────
+
+
+def test_get_without_form_encoding_fails_closed() -> None:
+    out = ev.check_http_request(
+        host_ip="127.0.0.1", host_port=8080, method="GET",
+        request_body="payload", form_encoded=False,
+        expected_response_contains="marker",
+    )
+    assert not out["passed"]
+    assert "cannot carry request_body" in out["reason"]
+
+
+def test_get_with_form_encoding_builds_query(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_exchange(**kw: Any) -> tuple[int, bytes]:
+        seen.update(kw)
+        return 200, b"marker"
+
+    monkeypatch.setattr(ev, "_http_exchange", fake_exchange)
+    out = ev.check_http_request(
+        host_ip="127.0.0.1", host_port=8080, method="GET",
+        request_body="payload", form_encoded=True, field_name="q",
+        expected_response_contains="marker",
+    )
+    assert out["passed"], out
+    assert "q=payload" in seen["path"]
+
+
+# ── expected_status coercion (quoted digits) ───────────────────────────
+
+
+def test_expected_status_digit_strings_coerced(monkeypatch) -> None:
+    monkeypatch.setattr(ev, "_http_exchange",
+                        lambda **kw: (200, b"hello"))
+    out = ev.check_http(host_ip="127.0.0.1", host_port=8080,
+                        expected_status=["200"])
+    assert out["passed"], out
+
+
+def test_expected_status_garbage_fails_with_reason(monkeypatch) -> None:
+    monkeypatch.setattr(ev, "_http_exchange",
+                        lambda **kw: (200, b"hello"))
+    out = ev.check_http(host_ip="127.0.0.1", host_port=8080,
+                        expected_status=["OK"])
+    assert not out["passed"]
+    assert "expected_status" in out["reason"]
+
+
+# ── metadata-IP spellings ──────────────────────────────────────────────
+
+
+def test_ipv4_mapped_metadata_spelling_refused() -> None:
+    for spelling in ("::ffff:169.254.169.254", "::FFFF:169.254.169.254",
+                     "fd00:0ec2:0000::0254"):
+        reason = ev.assert_local_host_ip(spelling)
+        assert reason is not None and "metadata" in reason, spelling
+
+
+def test_ordinary_private_addresses_still_allowed() -> None:
+    for spelling in ("10.0.0.5", "172.19.0.7", "::1", "127.0.0.1"):
+        assert ev.assert_local_host_ip(spelling) is None, spelling
+
+
+# ── ReDoS guard breadth ────────────────────────────────────────────────
+
+
+def test_quantified_alternation_and_nested_bounds_go_literal() -> None:
+    # Bomb-shaped patterns are matched LITERALLY: on a log that does
+    # not contain the literal text, the check fails fast instead of
+    # burning CPU in catastrophic backtracking.
+    h = FakeHandle(logs="x" * 2000 + "!")
+    for pattern in (r"(a|a)+$", r"(x{1,30}){1,30}y", r"(x+)+y"):
+        out = ev.check_logs(handle=h, expected_patterns=[pattern])
+        assert not out["passed"], pattern
+
+
+def test_plain_regex_and_unquantified_groups_still_match() -> None:
+    h = FakeHandle(logs="server ERROR started on port 8080")
+    out = ev.check_logs(
+        handle=h,
+        expected_patterns=[r"port \d+", r"(ERROR|FATAL)", "started"],
+    )
+    assert out["passed"], out
+
+
+# ── TCP response accumulation ──────────────────────────────────────────
+
+
+class _SegmentedSock:
+    """Fake socket returning one small segment per recv()."""
+
+    def __init__(self, segments: list[bytes]) -> None:
+        self._segments = list(segments)
+
+    def settimeout(self, _t: float) -> None:
+        pass
+
+    def recv(self, _n: int) -> bytes:
+        if not self._segments:
+            return b""
+        return self._segments.pop(0)
+
+
+class _SilentSock:
+    def settimeout(self, _t: float) -> None:
+        pass
+
+    def recv(self, _n: int) -> bytes:
+        raise TimeoutError("no data")
+
+
+def test_recv_response_accumulates_multi_segment_banner() -> None:
+    sock = _SegmentedSock([b"SSH-2.0-", b"OpenSSH_9.6", b"\r\n"])
+    out = ev._recv_response(sock, 4096, 5.0, b"OpenSSH")
+    assert b"SSH-2.0-OpenSSH" in out
+
+
+def test_recv_response_timeout_with_no_bytes_raises() -> None:
+    import pytest
+    with pytest.raises(TimeoutError):
+        ev._recv_response(_SilentSock(), 4096, 0.05, b"marker")
+
+
+def test_deep_executor_typeerror_labelled_executor_error() -> None:
+    # A TypeError from code that RAN is a bug, not a plan error —
+    # still fail-closed, but the label must not blame the plan.
+    def buggy(**kw: Any) -> dict[str, Any]:
+        return {"n": len(None)}  # type: ignore[arg-type]
+
+    out = ev.verify_plan(
+        plan=[{"type": "exec_check", "command": "id"}],
+        executors={
+            "container_status": lambda: {
+                "type": "container_status", "passed": True, "details": {}},
+            "exec_check": buggy,
+        },
+        endpoint=("127.0.0.1", 8080),
+    )
+    assert not out["passed"]
+    assert "executor error" in out["reason"]
+    assert "invalid step arguments" not in out["reason"]
+
+
+# ── hostile plan headers must fold into a failed check, never raise ────
+
+
+def test_crlf_header_value_is_failed_check_not_crash() -> None:
+    # http.client's putheader validation raises ValueError on CRLF in
+    # a header value; plans are untrusted (LLM-authored / on-disk
+    # replay), so this must degrade to failures-are-data — pre-fix the
+    # ValueError escaped verify_plan and provision() re-raised.
+    out = ev.check_http_request(
+        host_ip="127.0.0.1", host_port=1, method="POST",
+        request_body="x", expected_response_contains="marker",
+        headers={"X-Evil": "a\r\nInjected: b"},
+    )
+    assert not out["passed"]
+    assert "invalid request shape" in out["reason"]
+
+
+def test_illegal_header_name_is_failed_check_not_crash() -> None:
+    out = ev.check_http_request(
+        host_ip="127.0.0.1", host_port=1, method="POST",
+        request_body="x", expected_response_contains="marker",
+        headers={"Bad Name\r\n": "v"},
+    )
+    assert not out["passed"]
+    assert "invalid request shape" in out["reason"]
+
+
+def test_verify_plan_survives_hostile_header_step() -> None:
+    h = FakeHandle()
+    step = {
+        "type": "http_request_check", "method": "POST",
+        "request_body": "x", "expected_response_contains": "marker",
+        "headers": {"X-Evil": "a\r\nInjected: b"},
+    }
+    out = ev.verify_plan(h, [{"type": "container_status"}, step],
+                         endpoint=("127.0.0.1", 1))
+    assert out["passed"] is False  # failed check, no exception
+    reasons = " ".join(str(r.get("reason", "")) for r in out["results"])
+    assert "invalid request shape" in reasons
+
+
+class TestPlanLengthCap:
+    """Plans are untrusted (LLM-authored / on-disk specs) and each
+    step may legally wait 300 s — an uncapped N-step plan is a
+    300·N wall-clock sink in the trusted parent."""
+
+    def test_oversized_plan_refused_loudly(self):
+        from core.env.verify import _MAX_PLAN_STEPS, verify_plan
+        plan = [{"type": "stability_wait", "wait_seconds": 300}] * (
+            _MAX_PLAN_STEPS + 1)
+        result = verify_plan(executors={}, plan=plan)
+        assert result["passed"] is False
+        assert "refusing plans over" in result["reason"]
+        assert result["results"] == []  # nothing ran
+
+    def test_cap_boundary_plan_still_runs(self):
+        from core.env.verify import _MAX_PLAN_STEPS, verify_plan
+
+        def _ok(**_kw):
+            return {"type": "container_status", "passed": True,
+                    "reason": "", "details": {}}
+        execs = {"container_status": _ok}
+        plan = [{"type": "container_status"}] * _MAX_PLAN_STEPS
+        result = verify_plan(executors=execs, plan=plan)
+        assert result["passed"] is True

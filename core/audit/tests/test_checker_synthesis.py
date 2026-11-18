@@ -1,0 +1,897 @@
+"""Tests for core.audit.checker_synthesis — mid-loop checker amplification.
+
+Tests the delegation to ``packages.checker_synthesis`` via the
+``synthesize_and_sweep`` adapter, the ``_seed_from_outcome`` builder,
+and the ``SynthesisResult`` dataclass.
+"""
+
+from unittest.mock import patch
+
+import pytest
+
+from core.audit.checker_synthesis import (
+    SynthesisResult,
+    _build_llm_callable,
+    _is_prefilter_sourced,
+    _seed_from_outcome,
+    synthesize_and_sweep,
+)
+
+
+class TestSynthesisResult:
+    def test_basic(self):
+        r = SynthesisResult(
+            rule_id="synth-cwe-120-parse_header",
+            tool="semgrep",
+            content="rules:\n  - id: test",
+            cwe="CWE-120",
+            origin_file="parser.c",
+            origin_function="parse_header",
+            hits=[{"file": "other.c", "function": "process", "line": 42}],
+        )
+        assert r.rule_id == "synth-cwe-120-parse_header"
+        assert len(r.hits) == 1
+
+    def test_empty_hits(self):
+        r = SynthesisResult(
+            rule_id="r", tool="semgrep", content="c",
+            cwe="CWE-120", origin_file="a.c", origin_function="f",
+        )
+        assert r.hits == []
+
+
+# ---------------------------------------------------------------------------
+# _seed_from_outcome
+# ---------------------------------------------------------------------------
+
+
+class _StubOutcome:
+    """Minimal ReviewOutcome-shaped object for tests."""
+    def __init__(self, **kwargs):
+        self.file = kwargs.get("file", "src/auth.c")
+        self.function = kwargs.get("function", "check_pw")
+        self.line = kwargs.get("line", 42)
+        self.hypothesis = kwargs.get("hypothesis", "")
+        self.status = kwargs.get("status", "finding")
+        self.evidence_tool = kwargs.get("evidence_tool", "semgrep")
+        self.review_result = kwargs.get("review_result", {
+            "hypothesis": "missing bounds check on len",
+            "cwe_class": "CWE-120",
+            "source_snippet": "memcpy(dst, buf, len);",
+        })
+
+
+class _StubConfig:
+    def __init__(self, **kwargs):
+        self.target_path = kwargs.get("target_path", "/tmp/target")
+        self.out_dir = kwargs.get("out_dir", "/tmp/out")
+        self.codeql_db_path = kwargs.get("codeql_db_path", None)
+
+
+class TestSeedFromOutcome:
+    def test_builds_seed_from_outcome(self):
+        o = _StubOutcome()
+        seed = _seed_from_outcome(o)
+        assert seed is not None
+        assert seed.file == "src/auth.c"
+        assert seed.function == "check_pw"
+        assert seed.cwe == "CWE-120"
+        assert "bounds check" in seed.reasoning
+
+    def test_returns_none_without_hypothesis(self):
+        o = _StubOutcome(review_result={"cwe_class": "CWE-120"})
+        assert _seed_from_outcome(o) is None
+
+    def test_returns_none_without_cwe(self):
+        o = _StubOutcome(review_result={"hypothesis": "test"})
+        assert _seed_from_outcome(o) is None
+
+    def test_returns_none_without_file(self):
+        o = _StubOutcome(file="")
+        assert _seed_from_outcome(o) is None
+
+    def test_returns_none_without_function(self):
+        o = _StubOutcome(function="")
+        assert _seed_from_outcome(o) is None
+
+    def test_falls_back_to_outcome_hypothesis(self):
+        o = _StubOutcome(
+            hypothesis="fallback hypothesis",
+            review_result={"cwe_class": "CWE-89"},
+        )
+        seed = _seed_from_outcome(o)
+        assert seed is not None
+        assert seed.reasoning == "fallback hypothesis"
+
+    def test_uses_source_snippet(self):
+        o = _StubOutcome()
+        seed = _seed_from_outcome(o)
+        assert seed is not None
+        assert seed.snippet == "memcpy(dst, buf, len);"
+
+    def test_line_mapped_to_start_and_end(self):
+        o = _StubOutcome(line=99)
+        seed = _seed_from_outcome(o)
+        assert seed is not None
+        assert seed.line_start == 99
+        assert seed.line_end == 99
+
+
+# ---------------------------------------------------------------------------
+# _build_llm_callable
+# ---------------------------------------------------------------------------
+
+
+class _BareClient:
+    """LLM client without generate_structured."""
+
+
+class TestBuildLLMCallable:
+    @pytest.mark.slow
+    def test_returns_none_without_generate_structured(self):
+        with patch("core.llm.transcript.build_llm_client", return_value=_BareClient()):
+            assert _build_llm_callable(_StubConfig()) is None
+
+    def test_returns_callable_with_generate_structured(self):
+        class _FullClient:
+            total_cost = 0.0
+
+            def generate_structured(self, **kw):
+                return {"result": True}, {}
+
+        with patch("core.llm.transcript.build_llm_client", return_value=_FullClient()):
+            result = _build_llm_callable(_StubConfig())
+            assert result is not None
+            fn, _client = result
+            assert callable(fn)
+
+    def test_call_passes_synthesis_timeout(self):
+        """Synthesis is the heaviest structured call class — the
+        callable must pass its own per-call timeout so the claudecode
+        provider's 600s default doesn't kill it mid-generation."""
+        from core.audit.checker_synthesis import SYNTHESIS_TIMEOUT_S
+
+        class _CapturingClient:
+            total_cost = 0.0
+            captured = None
+
+            def generate_structured(self, **kw):
+                _CapturingClient.captured = kw
+                return {"result": True}, {}
+
+        with patch("core.llm.transcript.build_llm_client",
+                   return_value=_CapturingClient()):
+            fn, _client = _build_llm_callable(_StubConfig())
+            out = fn("prompt", {"type": "object"}, "system")
+            assert out == {"result": True}
+            assert (_CapturingClient.captured["timeout_s"]
+                    == SYNTHESIS_TIMEOUT_S)
+            assert SYNTHESIS_TIMEOUT_S > 600
+
+
+# ---------------------------------------------------------------------------
+# synthesize_and_sweep — delegation to packages.checker_synthesis
+# ---------------------------------------------------------------------------
+
+
+class TestSynthesizeAndSweepDelegation:
+    def test_cap_reached_returns_none(self):
+        o = _StubOutcome()
+        assert synthesize_and_sweep(
+            o, _StubConfig(), set(), synthesis_count=5, max_per_run=5,
+        ) is None
+
+    def test_no_hypothesis_returns_none(self):
+        o = _StubOutcome(review_result={})
+        assert synthesize_and_sweep(o, _StubConfig(), set()) is None
+
+    def test_no_target_path_returns_none(self):
+        o = _StubOutcome()
+        c = _StubConfig(target_path=None)
+
+        class _FakeClient:
+            total_cost = 0.0
+
+        with patch(
+            "core.audit.checker_synthesis._build_llm_callable",
+            return_value=(lambda p, s, sp: None, _FakeClient()),
+        ):
+            assert synthesize_and_sweep(o, c, set()) is None
+
+    def test_delegates_to_synthesise_with_refinement(self, tmp_path):
+        from packages.checker_synthesis import (
+            CheckerSynthesisResult,
+            Match,
+            SynthesisedRule,
+        )
+
+        captured = {}
+
+        def _fake_refinement(seed, *, repo_root, out_dir, llm, **kw):
+            captured["seed"] = seed
+            captured["repo_root"] = repo_root
+            return CheckerSynthesisResult(
+                seed=seed,
+                rule=SynthesisedRule(
+                    engine="semgrep", rule_id="synth.0", body="rules: ...",
+                ),
+                matches=[
+                    Match(file="src/other.c", line=10, snippet="bad()"),
+                    Match(file="src/auth.c", line=42, snippet="same"),
+                ],
+                positive_control=True,
+            )
+
+        def _fake_llm_callable(_config):
+            class _FakeClient:
+                total_cost = 0.0
+            return lambda p, s, sp: {"rule": "r"}, _FakeClient()
+
+        o = _StubOutcome()
+        c = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+
+        with patch(
+            "core.audit.checker_synthesis._build_llm_callable",
+            side_effect=_fake_llm_callable,
+        ), patch(
+            "packages.checker_synthesis.synthesise_with_refinement",
+            side_effect=_fake_refinement,
+        ):
+            result = synthesize_and_sweep(o, c, set())
+
+        assert result is not None
+        assert result.rule_id == "synth.0"
+        assert result.tool == "semgrep"
+        assert result.cwe == "CWE-120"
+        assert result.origin_file == "src/auth.c"
+        # Both matches are emitted; the seed's own function is excluded
+        # downstream by function identity, not here by line.
+        assert [h["file"] for h in result.hits] == ["src/other.c", "src/auth.c"]
+        assert all(h["origin_function"] == "check_pw" for h in result.hits)
+
+    def _sweep_with_matches(self, tmp_path, matches, seen=None):
+        from packages.checker_synthesis import (
+            CheckerSynthesisResult,
+            SynthesisedRule,
+        )
+
+        def _fake_refinement(seed, **kw):
+            return CheckerSynthesisResult(
+                seed=seed,
+                rule=SynthesisedRule(
+                    engine="semgrep", rule_id="synth.1", body="r",
+                ),
+                matches=list(matches),
+                positive_control=True,
+            )
+
+        def _fake_llm_callable(_config):
+            class _FakeClient:
+                total_cost = 0.0
+            return lambda p, s, sp: {"rule": "r"}, _FakeClient()
+
+        o = _StubOutcome()
+        c = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+
+        with patch(
+            "core.audit.checker_synthesis._build_llm_callable",
+            side_effect=_fake_llm_callable,
+        ), patch(
+            "packages.checker_synthesis.synthesise_with_refinement",
+            side_effect=_fake_refinement,
+        ):
+            return synthesize_and_sweep(o, c, seen if seen is not None else set())
+
+    def test_sites_survive_a_prior_run_key(self, tmp_path):
+        """A site is not suppressed by `<file>:<seed function>`.
+
+        The old key paired the *matched* file with the *seed's* function
+        name, which identifies nothing, and `seen_keys` spans prior runs
+        — so a real variant could be dropped by coincidence. Sites are
+        function-less; dedup belongs downstream once each is resolved.
+        """
+        from packages.checker_synthesis import Match
+
+        result = self._sweep_with_matches(
+            tmp_path,
+            [Match(file="src/already_seen.c", line=5)],
+            seen={"src/already_seen.c:check_pw"},
+        )
+        assert result is not None
+        assert [h["file"] for h in result.hits] == ["src/already_seen.c"]
+
+    def test_same_file_sibling_is_kept(self, tmp_path):
+        """A second vulnerable function in the seed's own file counts.
+
+        `m.file != file_path` used to discard every same-file match.
+        """
+        from packages.checker_synthesis import Match
+
+        result = self._sweep_with_matches(
+            tmp_path, [Match(file="src/auth.c", line=99)],
+        )
+        assert [(h["file"], h["line"]) for h in result.hits] == [
+            ("src/auth.c", 99),
+        ]
+
+    def test_origin_is_attached_to_every_hit(self, tmp_path):
+        """Downstream excludes the seed by function identity, so each hit
+        must say which finding it came from."""
+        from packages.checker_synthesis import Match
+
+        result = self._sweep_with_matches(
+            tmp_path,
+            [Match(file="src/auth.c", line=42),
+             Match(file="src/other.c", line=99)],
+        )
+        assert [(h["origin_file"], h["origin_function"]) for h in result.hits] == [
+            ("src/auth.c", "check_pw"), ("src/auth.c", "check_pw"),
+        ]
+
+    def test_synthesis_failure_returns_none(self, tmp_path):
+        from packages.checker_synthesis import CheckerSynthesisResult
+
+        def _fake_refinement(seed, **kw):
+            return CheckerSynthesisResult(seed=seed, rule=None)
+
+        def _fake_llm_callable(_config):
+            class _FakeClient:
+                total_cost = 0.0
+            return lambda p, s, sp: {"rule": "r"}, _FakeClient()
+
+        o = _StubOutcome()
+        c = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+
+        with patch(
+            "core.audit.checker_synthesis._build_llm_callable",
+            side_effect=_fake_llm_callable,
+        ), patch(
+            "packages.checker_synthesis.synthesise_with_refinement",
+            side_effect=_fake_refinement,
+        ):
+            assert synthesize_and_sweep(o, c, set()) is None
+
+    def test_exception_in_substrate_returns_none(self, tmp_path):
+        def _fake_llm_callable(_config):
+            class _FakeClient:
+                total_cost = 0.0
+            return lambda p, s, sp: {"rule": "r"}, _FakeClient()
+
+        o = _StubOutcome()
+        c = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+
+        with patch(
+            "core.audit.checker_synthesis._build_llm_callable",
+            side_effect=_fake_llm_callable,
+        ), patch(
+            "packages.checker_synthesis.synthesise_with_refinement",
+            side_effect=RuntimeError("substrate boom"),
+        ):
+            assert synthesize_and_sweep(o, c, set()) is None
+
+
+# ---------------------------------------------------------------------------
+# _sage_replay_rule — SAGE-recalled proven rules join sweeps (P33)
+# ---------------------------------------------------------------------------
+
+
+class _SageReplayRuleFixtures:
+    def _seed(self):
+        from packages.checker_synthesis import SeedBug
+
+        return SeedBug(
+            file="src/auth.c", function="check_pw",
+            line_start=42, line_end=42,
+            cwe="CWE-89", reasoning="sql injection",
+        )
+
+    def _meta(self, rule_path, body, **kw):
+        import hashlib
+
+        meta = {
+            "engine": "semgrep",
+            "cwe": "CWE-89",
+            "rule_id": "sqli-001",
+            "rule_body_hash": hashlib.sha256(
+                body.encode("utf-8")).hexdigest()[:16],
+            "rule_path": str(rule_path),
+            "tp_count": 9,
+            "fp_count": 1,
+            "total_matches": 10,
+            "dual_control": True,
+            "targets_tested": 4,
+            "verified": True,
+        }
+        meta.update(kw)
+        return meta
+
+
+class TestSageReplayRule(_SageReplayRuleFixtures):
+    def test_replays_verified_rule_with_sage_provenance(self, tmp_path):
+        from core.audit.checker_synthesis import _sage_replay_rule
+        from packages.checker_synthesis import Match
+
+        body = "rules:\n  - id: sqli-001\n"
+        rule_file = tmp_path / "sqli-001.yaml"
+        rule_file.write_text(body)
+
+        with patch(
+            "core.sage.recall_verified_proven_rules",
+            return_value=[self._meta(rule_file, body)],
+        ), patch(
+            "packages.checker_synthesis.synthesise._run_engine",
+            return_value=(
+                [Match(file="src/other.c", line=7, snippet="q()")], [],
+            ),
+        ):
+            replay = _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            )
+
+        assert replay is not None
+        cs_result, provenance = replay
+        assert provenance == "sage:sqli-001"
+        assert cs_result.rule.rule_id == "sqli-001"
+        assert cs_result.rule_tier == "library"
+        assert cs_result.dual_control is True
+        assert [m.file for m in cs_result.matches] == ["src/other.c"]
+
+    def test_body_hash_mismatch_skipped(self, tmp_path):
+        from core.audit.checker_synthesis import _sage_replay_rule
+
+        rule_file = tmp_path / "sqli-001.yaml"
+        rule_file.write_text("rules:\n  - id: TAMPERED\n")
+        meta = self._meta(rule_file, "rules:\n  - id: sqli-001\n")
+
+        with patch(
+            "core.sage.recall_verified_proven_rules", return_value=[meta],
+        ):
+            assert _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            ) is None
+
+    def test_missing_rule_file_skipped(self, tmp_path):
+        from core.audit.checker_synthesis import _sage_replay_rule
+
+        meta = self._meta(tmp_path / "gone.yaml", "body")
+        with patch(
+            "core.sage.recall_verified_proven_rules", return_value=[meta],
+        ):
+            assert _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            ) is None
+
+    def test_no_verified_rows_returns_none(self, tmp_path):
+        from core.audit.checker_synthesis import _sage_replay_rule
+
+        with patch(
+            "core.sage.recall_verified_proven_rules", return_value=[],
+        ):
+            assert _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            ) is None
+
+    def test_sweep_hits_carry_sage_provenance(self, tmp_path):
+        """synthesize_and_sweep stamps sage: provenance on hits when
+        the rule came from SAGE replay."""
+        from packages.checker_synthesis import (
+            CheckerSynthesisResult,
+            Match,
+            SynthesisedRule,
+        )
+
+        def _fake_llm_callable(_config):
+            class _FakeClient:
+                total_cost = 0.0
+
+            return lambda p, s, sp: {"rule": "r"}, _FakeClient()
+
+        def _fake_sage_replay(engine, cwe, seed, target_path):
+            cs = CheckerSynthesisResult(
+                seed=seed,
+                rule=SynthesisedRule(
+                    engine="semgrep", rule_id="sqli-001", body="r",
+                ),
+                matches=[Match(file="src/other.c", line=7, snippet="q()")],
+            )
+            cs.rule_tier = "library"
+            return cs, "sage:sqli-001"
+
+        class _NoReplayLib:
+            def find_replayable(self, cwe, engine):
+                return []
+
+        o = _StubOutcome()
+        c = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+
+        with patch(
+            "core.audit.checker_synthesis._build_llm_callable",
+            side_effect=_fake_llm_callable,
+        ), patch(
+            "packages.checker_synthesis.RuleLibrary",
+            return_value=_NoReplayLib(),
+        ), patch(
+            "core.audit.checker_synthesis._sage_replay_rule",
+            side_effect=_fake_sage_replay,
+        ):
+            result = synthesize_and_sweep(o, c, set())
+
+        assert result is not None
+        assert result.rule_id == "sqli-001"
+        assert all(h["provenance"] == "sage:sqli-001" for h in result.hits)
+
+
+class TestNoDefectHypothesisRefusal:
+    """Synthesis must refuse hypotheses the review itself classified as
+    refuted (the structural confidence field, never text matching)."""
+
+    def _outcome(self, *, hypotheses, hypothesis="helper is trivial"):
+        return _StubOutcome(
+            status="suspicious",
+            hypothesis=hypothesis,
+            review_result={
+                "hypothesis": hypothesis,
+                "cwe_class": "CWE-120",
+                "hypotheses": hypotheses,
+            },
+        )
+
+    def test_primary_entry_refuted_refuses(self):
+        from core.audit.checker_synthesis import (
+            _hypothesis_self_classified_refuted,
+        )
+        out = self._outcome(hypotheses=[
+            {"mechanism": "helper is trivial — no plausible defect",
+             "confidence": "refuted"},
+        ], hypothesis="helper is trivial — no plausible defect")
+        assert _hypothesis_self_classified_refuted(out, out.hypothesis)
+
+    def test_live_primary_entry_is_allowed(self):
+        from core.audit.checker_synthesis import (
+            _hypothesis_self_classified_refuted,
+        )
+        out = self._outcome(hypotheses=[
+            {"mechanism": "missing bounds check on len",
+             "confidence": "medium"},
+            {"mechanism": "some other idea", "confidence": "refuted"},
+        ], hypothesis="missing bounds check on len")
+        assert not _hypothesis_self_classified_refuted(out, out.hypothesis)
+
+    def test_all_refuted_array_refuses_unmatched_primary(self):
+        from core.audit.checker_synthesis import (
+            _hypothesis_self_classified_refuted,
+        )
+        out = self._outcome(hypotheses=[
+            {"mechanism": "idea one", "confidence": "refuted"},
+            {"mechanism": "idea two", "confidence": "refuted"},
+        ], hypothesis="an unmatched primary phrasing")
+        assert _hypothesis_self_classified_refuted(out, out.hypothesis)
+
+    def test_no_structured_hypotheses_is_not_refused(self):
+        from core.audit.checker_synthesis import (
+            _hypothesis_self_classified_refuted,
+        )
+        out = self._outcome(hypotheses=[], hypothesis="live idea")
+        assert not _hypothesis_self_classified_refuted(out, out.hypothesis)
+
+    def test_verification_rule_refuses_refuted_hypothesis(self, tmp_path):
+        from core.audit.checker_synthesis import synthesize_verification_rule
+
+        out = self._outcome(hypotheses=[
+            {"mechanism": "trivial one-line helper — no plausible defect "
+                          "mechanism", "confidence": "refuted"},
+        ], hypothesis="trivial one-line helper — no plausible defect "
+                      "mechanism")
+        cfg = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+        # Refusal happens before any LLM plumbing is touched.
+        assert synthesize_verification_rule(out, cfg) is None
+
+    def test_amplification_lane_refuses_refuted_seed(self, tmp_path):
+        from core.audit.checker_synthesis import synthesize_and_sweep
+
+        out = self._outcome(hypotheses=[
+            {"mechanism": "trivial helper — no plausible defect",
+             "confidence": "refuted"},
+        ], hypothesis="trivial helper — no plausible defect")
+        out.status = "finding"
+        cfg = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+        assert synthesize_and_sweep(out, cfg, set()) is None
+
+
+class TestRuleQuarantine:
+    """0%-precision synthesized rules are deactivated for the run."""
+
+    def _shared(self):
+        from core.audit.shared_state import SharedState
+        return SharedState()
+
+    def test_quarantines_after_three_all_fp_triages(self, caplog):
+        import logging
+
+        from core.audit.orchestrator import _note_rule_triage
+        shared = self._shared()
+        with caplog.at_level(logging.WARNING, logger="core.audit.orchestrator"):
+            for _ in range(3):
+                _note_rule_triage(shared, "rule-x", False)
+        assert "rule-x" in shared.quarantined_rules
+        assert any("rule quarantine" in r.getMessage() for r in caplog.records)
+
+    def test_one_true_positive_prevents_quarantine(self):
+        from core.audit.orchestrator import _note_rule_triage
+        shared = self._shared()
+        _note_rule_triage(shared, "rule-y", True)
+        for _ in range(10):
+            _note_rule_triage(shared, "rule-y", False)
+        assert "rule-y" not in shared.quarantined_rules
+
+    def test_below_min_evidence_not_quarantined(self):
+        from core.audit.orchestrator import _note_rule_triage
+        shared = self._shared()
+        _note_rule_triage(shared, "rule-z", False)
+        _note_rule_triage(shared, "rule-z", False)
+        assert "rule-z" not in shared.quarantined_rules
+
+    def test_replay_skips_quarantined_rule(self, tmp_path, monkeypatch):
+        # find_replayable returns a quarantined candidate; the replay
+        # path must not run it — synthesis falls through to the fresh
+        # lane instead of replaying the dead rule.
+        from core.audit import checker_synthesis as cs
+
+        out = _StubOutcome(status="finding")
+        cfg = _StubConfig(target_path=str(tmp_path), out_dir=str(tmp_path))
+
+        class _Entry:
+            rule_id = "quarantined-rule"
+
+        replayed: list[str] = []
+
+        class _FakeLib:
+            def find_replayable(self, cwe, engine):
+                return [_Entry()]
+
+            def rule_path(self, entry):
+                replayed.append(entry.rule_id)
+                raise AssertionError("quarantined rule was replayed")
+
+        class _FakeClient:
+            _call_cost_history: dict = {}
+
+        monkeypatch.setattr(
+            "packages.checker_synthesis.RuleLibrary", lambda: _FakeLib(),
+        )
+        monkeypatch.setattr(
+            cs, "_build_llm_callable",
+            lambda config: (lambda *a, **k: None, _FakeClient()),
+        )
+
+        def _no_rule(seed, **kwargs):
+            class _R:
+                rule = None
+                errors: list = []
+            return _R()
+
+        monkeypatch.setattr(
+            "packages.checker_synthesis.synthesise_with_refinement",
+            _no_rule,
+        )
+        result = cs.synthesize_and_sweep(
+            out, cfg, set(),
+            quarantined_rules={"quarantined-rule"},
+        )
+        assert result is None
+        assert replayed == []
+
+    def test_synthesis_hits_carry_rule_id_into_gaps(self):
+        from core.audit.orchestrator import _synthesis_hits_to_gaps
+
+        checklist = {"files": [{
+            "path": "src/a.c",
+            "items": [{"name": "f", "kind": "function",
+                       "line_start": 1, "line_end": 20}],
+        }]}
+        gaps = _synthesis_hits_to_gaps(
+            [{"file": "src/a.c", "line": 5, "function": "",
+              "origin_file": "src/b.c", "origin_function": "seed",
+              "rule_id": "rule-q"}],
+            checklist,
+        )
+        assert gaps and gaps[0]["synthesis_rule_id"] == "rule-q"
+
+
+class TestTriageRuleHitsErrorGuard:
+    """Error-status outcomes say nothing about a rule — they must
+    record neither TP nor FP (a transport brownout previously retired
+    healthy rules as all-false-positive)."""
+
+    def _shared(self):
+        from core.audit.shared_state import SharedState
+        return SharedState()
+
+    @staticmethod
+    def _library():
+        class _Entry:
+            rule_id = "lib-rule"
+
+        class _Lib:
+            def __init__(self):
+                self.matches = []
+
+            def all_entries(self):
+                return [_Entry()]
+
+            def record_match(self, rule_id, is_tp):
+                self.matches.append((rule_id, is_tp))
+
+        return _Lib()
+
+    @staticmethod
+    def _pf(rule_id="lib-rule"):
+        import types
+        hit = types.SimpleNamespace(rule_id=rule_id)
+        return types.SimpleNamespace(hits=[hit])
+
+    @staticmethod
+    def _outcome(status):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file="a.c", function="f", status=status, body="b",
+        )
+
+    def test_error_outcome_records_nothing(self):
+        from core.audit.orchestrator import _triage_rule_hits
+
+        shared = self._shared()
+        lib = self._library()
+        _triage_rule_hits(
+            shared, self._outcome("error"),
+            {"synthesis_rule_id": "synth-1"}, self._pf(), lib,
+        )
+        assert lib.matches == []
+        assert shared.rule_triage == {}
+
+    def test_clean_outcome_records_fp(self):
+        from core.audit.orchestrator import _triage_rule_hits
+
+        shared = self._shared()
+        lib = self._library()
+        _triage_rule_hits(
+            shared, self._outcome("clean"),
+            {"synthesis_rule_id": "synth-1"}, self._pf(), lib,
+        )
+        assert lib.matches == [("lib-rule", False)]
+        # [tp_count, total]: one all-FP triage recorded.
+        assert shared.rule_triage.get("synth-1") == [0, 1]
+
+    def test_finding_outcome_records_tp(self):
+        from core.audit.orchestrator import _triage_rule_hits
+
+        shared = self._shared()
+        lib = self._library()
+        _triage_rule_hits(
+            shared, self._outcome("finding"), {}, self._pf(), lib,
+        )
+        assert lib.matches == [("lib-rule", True)]
+
+
+class TestSageReplayRuleIdShape(_SageReplayRuleFixtures):
+    """Ingestion-time shape check: SAGE is an agent-writable store and
+    a recalled rule_id flows into library filenames — traversal or
+    separator characters mark a planted record, not a slugified id."""
+
+    def test_traversal_rule_id_rejected(self, tmp_path):
+        from core.audit.checker_synthesis import _sage_replay_rule
+        from packages.checker_synthesis import Match
+
+        body = "rules:\n  - id: x\n"
+        rule_file = tmp_path / "x.yaml"
+        rule_file.write_text(body)
+        meta = self._meta(rule_file, body, rule_id="../../evil")
+
+        with patch(
+            "core.sage.recall_verified_proven_rules",
+            return_value=[meta],
+        ), patch(
+            "packages.checker_synthesis.synthesise._run_engine",
+            return_value=(
+                [Match(file="src/other.c", line=7, snippet="q()")], [],
+            ),
+        ):
+            assert _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            ) is None
+
+    def test_separator_rule_id_rejected(self, tmp_path):
+        from core.audit.checker_synthesis import _sage_replay_rule
+
+        body = "rules:\n  - id: x\n"
+        rule_file = tmp_path / "x.yaml"
+        rule_file.write_text(body)
+        meta = self._meta(rule_file, body, rule_id="a/b")
+
+        with patch(
+            "core.sage.recall_verified_proven_rules",
+            return_value=[meta],
+        ):
+            assert _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            ) is None
+
+    def test_slugified_rule_id_still_replays(self, tmp_path):
+        # Two-direction guard: the mint-time slug alphabet passes
+        # unchanged (covered again by the inherited happy-path test).
+        from core.audit.checker_synthesis import _sage_replay_rule
+        from packages.checker_synthesis import Match
+
+        body = "rules:\n  - id: ok\n"
+        rule_file = tmp_path / "ok.yaml"
+        rule_file.write_text(body)
+        meta = self._meta(
+            rule_file, body, rule_id="src_auth.c.check_pw.CWE-89.1",
+        )
+
+        with patch(
+            "core.sage.recall_verified_proven_rules",
+            return_value=[meta],
+        ), patch(
+            "packages.checker_synthesis.synthesise._run_engine",
+            return_value=(
+                [Match(file="src/other.c", line=7, snippet="q()")], [],
+            ),
+        ):
+            replay = _sage_replay_rule(
+                "semgrep", "CWE-89", self._seed(), tmp_path,
+            )
+        assert replay is not None
+        assert replay[1] == "sage:src_auth.c.check_pw.CWE-89.1"
+
+
+# ---------------------------------------------------------------------------
+# _is_prefilter_sourced
+# ---------------------------------------------------------------------------
+
+
+class TestIsPrefilterSourced:
+    def test_prefilter_only(self):
+        assert _is_prefilter_sourced("prefilter:unbounded-strcpy") is True
+
+    def test_multiple_prefilter_parts(self):
+        assert _is_prefilter_sourced(
+            "prefilter:unbounded-strcpy+prefilter:format-string",
+        ) is True
+
+    def test_mixed_with_tool(self):
+        assert _is_prefilter_sourced(
+            "prefilter:unbounded-strcpy+joern:guard-dominance",
+        ) is False
+
+    def test_tool_only(self):
+        assert _is_prefilter_sourced("semgrep:rule-123") is False
+
+    def test_empty(self):
+        assert _is_prefilter_sourced("") is False
+
+    def test_prefilter_plus_validate(self):
+        assert _is_prefilter_sourced(
+            "prefilter:unbounded-strcpy+validate:confirmed-history",
+        ) is False
+
+
+class TestPrefilterSkipsSynthesis:
+    """synthesize_and_sweep returns None for prefilter-sourced findings."""
+
+    def test_skips_prefilter_sourced(self):
+        o = _StubOutcome(evidence_tool="prefilter:unbounded-strcpy")
+        result = synthesize_and_sweep(o, _StubConfig(), set())
+        assert result is None
+
+    def test_does_not_skip_tool_confirmed(self):
+        """joern-confirmed evidence must pass the prefilter gate and
+        reach _seed_from_outcome (the next gate after prefilter)."""
+        o = _StubOutcome(evidence_tool="joern:guard-dominance")
+        with patch(
+            "core.audit.checker_synthesis._seed_from_outcome",
+            return_value=None,
+        ) as mock_seed:
+            result = synthesize_and_sweep(o, _StubConfig(), set())
+        assert result is None
+        mock_seed.assert_called_once_with(o)

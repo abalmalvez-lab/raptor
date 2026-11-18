@@ -1,0 +1,400 @@
+"""Guard-bypass query (PR3).
+
+Answers: "does any CFG path from a source node to a sink node bypass
+all guards constraining the source variable?"
+
+Uses the existing PythonCFG/CPPCFG + DomTree, extended with
+ControlCondition from core/analysis/cfg_conditions.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+from .cfg_conditions import ConditionEdge, ControlCondition, extract_conditions_from_cfg, extract_references
+
+if TYPE_CHECKING:
+    from collections.abc import Hashable
+
+logger = logging.getLogger(__name__)
+
+_MAX_PATHS = 256
+_MAX_DEPTH = 50
+
+
+@dataclass(frozen=True)
+class Guard:
+    """A guard condition that constrains a variable."""
+
+    condition: ControlCondition
+    node_line: int
+
+    def to_dict(self):
+        return {
+            "condition": self.condition.to_dict(),
+            "node_line": self.node_line,
+        }
+
+
+@dataclass
+class GuardBypassResult:
+    """Result of a guard-bypass query."""
+
+    bypassable_paths: list[list[int]] = field(default_factory=list)
+    constraining_guards: list[Guard] = field(default_factory=list)
+    must_visit_guards: list[Guard] = field(default_factory=list)
+    smt_verdict: str | None = None
+    confidence: str = "structural"
+
+    def is_bypassed(self) -> bool:
+        return len(self.bypassable_paths) > 0
+
+    def to_dict(self):
+        return {
+            "bypassable_paths": self.bypassable_paths,
+            "constraining_guards": [g.to_dict() for g in self.constraining_guards],
+            "must_visit_guards": [g.to_dict() for g in self.must_visit_guards],
+            "smt_verdict": self.smt_verdict,
+            "confidence": self.confidence,
+        }
+
+
+GuardClassifier = Callable[[ControlCondition, str], bool]
+
+
+def _default_guard_classifier(condition: ControlCondition, variable: str) -> bool:
+    """Default: a condition constrains a variable if the variable
+    appears in the condition's references."""
+    return variable in condition.references
+
+
+def _find_node_at_line(cfg, line: int):
+    """Find the CFG node at or nearest to the given line."""
+    from .cfg_utils import find_node_at_line
+    return find_node_at_line(cfg, line)
+
+
+def _find_guards(
+    _cfg,
+    condition_edges: list[ConditionEdge],
+    source_var: str,
+    guard_classifier: GuardClassifier,
+) -> list[Guard]:
+    """Find all guards in the CFG that constrain the source variable."""
+    guards: list[Guard] = []
+    seen: set[tuple[str, int]] = set()
+
+    for edge in condition_edges:
+        if edge.condition is None:
+            continue
+        if guard_classifier(edge.condition, source_var):
+            key = (edge.condition.text, edge.src_line)
+            if key not in seen:
+                seen.add(key)
+                guards.append(Guard(
+                    condition=edge.condition,
+                    node_line=edge.src_line,
+                ))
+
+    return guards
+
+
+def _enumerate_paths(
+    cfg,
+    source_node,
+    sink_node,
+    max_paths: int = _MAX_PATHS,
+    max_depth: int = _MAX_DEPTH,
+) -> tuple[list[list[int]], bool]:
+    """Bounded DFS from source to sink. Returns (paths, complete).
+
+    complete is False if the path cap was hit (confidence degrades).
+    """
+    paths: list[list[int]] = []
+    complete = True
+
+    stack: list[tuple[object, list[int], set[int]]] = [
+        (source_node, [source_node.lineno], {id(source_node)}),
+    ]
+
+    while stack:
+        if len(paths) >= max_paths:
+            complete = False
+            break
+
+        node, path, visited = stack.pop()
+        if node is sink_node:
+            paths.append(list(path))
+            continue
+
+        if len(path) >= max_depth:
+            complete = False
+            continue
+
+        for succ in cfg.successors(node):
+            if id(succ) not in visited:
+                new_visited = visited | {id(succ)}
+                stack.append((succ, path + [succ.lineno], new_visited))
+
+    return paths, complete
+
+
+def _guard_on_path(
+    path_lines: list[int],
+    guard: Guard,
+) -> bool:
+    """Check if a guard's node line appears on the path."""
+    return guard.node_line in path_lines
+
+
+_MAX_NATIVE_QUERY_VISITS = 100_000
+
+
+class _NativeQueryIncomplete(RuntimeError):
+    pass
+
+
+def _query_native(cfg, source_node, sink_node, source_var, classifier) -> GuardBypassResult:
+    """Query selected node cuts, returning at most one bypass witness.
+
+    Reachability and dominance are relative to the supplied source node.
+    Serialized line paths are diagnostics, never branch identity authority.
+    """
+    from .dominators import AdjacencyGraph, build_dom_tree
+    from .lifecycle_collector import GuardEpochUnavailable, _require_stable_guard_epochs
+
+    remaining = _MAX_NATIVE_QUERY_VISITS
+    adjacency = {}
+    guards: list[Guard] = []
+
+    def successors(node):
+        if node not in adjacency:
+            adjacency[node] = list(cfg.successors(node))
+        return adjacency[node]
+
+    def walk(start, next_nodes, excluded=frozenset()):
+        nonlocal remaining
+        if start in excluded:
+            return {}
+        parents = {start: None}
+        pending = [start]
+        while pending:
+            remaining -= 1
+            if remaining < 0:
+                raise _NativeQueryIncomplete
+            node = pending.pop()
+            for successor in next_nodes(node):
+                if successor not in excluded and successor not in parents:
+                    parents[successor] = node
+                    pending.append(successor)
+        return parents
+
+    try:
+        reachable = walk(source_node, successors)
+        if sink_node not in reachable:
+            return GuardBypassResult()
+        reverse: dict[Hashable, list[Hashable]] = {}
+        for node, children in adjacency.items():
+            for child in children:
+                reverse.setdefault(child, []).append(node)
+        reaches_sink = walk(sink_node, lambda node: reverse.get(node, ()))
+        candidates = []
+        for fact in cfg.branch_guards:
+            if fact.branch not in reachable or fact.branch not in reaches_sink:
+                continue
+            condition = ControlCondition(
+                text=fact.condition, references=extract_references(fact.condition),
+                polarity=fact.polarity,
+            )
+            if classifier(condition, source_var) is True:
+                candidates.append(fact)
+                guards.append(Guard(condition=condition, node_line=fact.line))
+        if candidates:
+            _require_stable_guard_epochs(cfg, sink_node, candidates)
+        selected = frozenset(fact.branch for fact in candidates)
+        bypass = walk(source_node, successors, selected)
+        witnesses = []
+        if sink_node in bypass:
+            path = []
+            current = sink_node
+            while current is not None:
+                path.append(current.lineno)
+                current = bypass[current]
+            witnesses.append(list(reversed(path)))
+        dominators = build_dom_tree(AdjacencyGraph(source_node, adjacency)).dominators_of(sink_node)
+        must_visit = [guard for fact, guard in zip(candidates, guards) if fact.branch in dominators]
+        return GuardBypassResult(
+            bypassable_paths=witnesses, constraining_guards=guards,
+            must_visit_guards=must_visit,
+        )
+    except (GuardEpochUnavailable, _NativeQueryIncomplete):
+        return GuardBypassResult(constraining_guards=guards, confidence="incomplete")
+
+
+def query(
+    cfg,
+    source_var: str,
+    source_line: int,
+    sink_line: int,
+    guard_classifier: GuardClassifier | None = None,
+) -> GuardBypassResult:
+    """Query whether any path from source to sink bypasses guards
+    constraining source_var.
+
+    Args:
+        cfg: PythonCFG or CPPCFG instance.
+        source_var: variable name to track.
+        source_line: line number of source definition.
+        sink_line: line number of sink consumption.
+        guard_classifier: predicate deciding if a condition constrains
+            source_var. Defaults to reference-based check.
+
+    Returns:
+        GuardBypassResult with bypassable paths and guard inventory.
+    """
+    classifier = guard_classifier or _default_guard_classifier
+
+    source_node = _find_node_at_line(cfg, source_line)
+    sink_node = _find_node_at_line(cfg, sink_line)
+
+    if source_node is None or sink_node is None:
+        return GuardBypassResult(confidence="incomplete")
+    if getattr(cfg, "branch_guards", None) is not None:
+        return _query_native(cfg, source_node, sink_node, source_var, classifier)
+
+    condition_edges = extract_conditions_from_cfg(cfg)
+    guards = _find_guards(cfg, condition_edges, source_var, classifier)
+
+    if not guards:
+        paths, complete = _enumerate_paths(cfg, source_node, sink_node)
+        return GuardBypassResult(
+            bypassable_paths=paths,
+            constraining_guards=[],
+            must_visit_guards=[],
+            confidence="structural" if complete else "incomplete",
+        )
+
+    paths, complete = _enumerate_paths(cfg, source_node, sink_node)
+
+    if not paths:
+        return GuardBypassResult(
+            bypassable_paths=[],
+            constraining_guards=guards,
+            must_visit_guards=[],
+            confidence="structural" if complete else "incomplete",
+        )
+
+    bypassable: list[list[int]] = []
+    must_visit: set[int] = set(range(len(guards)))
+
+    for path in paths:
+        guards_on_path = set()
+        for i, guard in enumerate(guards):
+            if _guard_on_path(path, guard):
+                guards_on_path.add(i)
+
+        if not guards_on_path:
+            bypassable.append(path)
+
+        must_visit &= guards_on_path
+
+    must_visit_guards = [guards[i] for i in sorted(must_visit)]
+
+    return GuardBypassResult(
+        bypassable_paths=bypassable,
+        constraining_guards=guards,
+        must_visit_guards=must_visit_guards,
+        confidence="structural" if complete else "incomplete",
+    )
+
+
+def check_guard_coverage(
+    cfg,
+    read_line: int,
+    required_guard_text: str,
+    *,
+    required_polarity: bool = True,
+) -> bool:
+    """Check if a required guard dominates all paths to a read site.
+
+    Simplified query for lifecycle-precondition checks: does the
+    given guard condition appear on every path from entry to
+    read_line?
+
+    Returns True if the guard is on every path (no bypass).
+    """
+    if type(required_guard_text) is not str or not required_guard_text.strip() \
+            or type(required_polarity) is not bool:
+        return False
+    if getattr(cfg, "branch_guards", None) is not None:
+        from .dominators import build_dom_tree
+        from .lifecycle_collector import GuardEpochUnavailable, collect_guards_at_site
+
+        try:
+            guards = collect_guards_at_site(cfg, build_dom_tree(cfg), read_line, cfg.file_path)
+        except GuardEpochUnavailable:
+            return False
+        return any(
+            guard.polarity is required_polarity
+            and guard.condition.strip() == required_guard_text.strip()
+            for guard in guards
+        )
+    read_node = _find_node_at_line(cfg, read_line)
+    if read_node is None:
+        return False
+
+    entry_node = cfg.entry_node if hasattr(cfg, "entry_node") else cfg.entry
+    condition_edges = extract_conditions_from_cfg(cfg)
+
+    # Selected-polarity edges of matching guards, keyed src_line ->
+    # {dst_line}. Line MEMBERSHIP can never distinguish branches —
+    # the condition node's line lies on both branch paths by
+    # construction, so an else-branch read and a post-merge read both
+    # counted as "guard on every path". Coverage demands the path to
+    # TRAVERSE the guard's selected edge (consecutive line pair); a path
+    # arriving via the false edge answers "not covered", and the
+    # consumer keeps its missing-guard finding (refusal direction).
+    selected_edges: dict[int, set[int]] = {}
+    for edge in condition_edges:
+        if edge.condition is None or edge.condition.polarity is not required_polarity:
+            continue
+        if edge.condition.text.strip() == required_guard_text.strip():
+            selected_edges.setdefault(
+                edge.src_line, set()).add(edge.dst_line)
+
+    if not selected_edges:
+        return False
+
+    paths, complete = _enumerate_paths(cfg, entry_node, read_node)
+    if not paths:
+        # No enumerated paths is only vacuous coverage ("read site
+        # unreachable, nothing to guard") when the DFS actually
+        # completed. When the depth/path cap truncated enumeration,
+        # the absence of paths is an artifact of the bound, not a
+        # reachability fact — answer "not covered" so callers fall
+        # back to their weaker textual check instead of dropping
+        # findings as structurally covered. Mirrors query()'s
+        # confidence degradation to "incomplete" on truncation.
+        return complete
+
+    for path in paths:
+        traversed_selected_edge = any(
+            path[i] in selected_edges
+            and path[i + 1] in selected_edges[path[i]]
+            for i in range(len(path) - 1)
+        )
+        if not traversed_selected_edge:
+            return False
+
+    # Every ENUMERATED path carries the guard — but when the DFS was
+    # truncated (path cap or depth bound), unenumerated or deeper
+    # paths may bypass it. "Covered on every path" is a universal
+    # claim; an incomplete enumeration cannot support it, and the
+    # consumer (lifecycle_checker) DROPS a missing-guard finding on
+    # True. Answer "not covered" so it falls back to its weaker
+    # textual check. Mirrors query()'s confidence degradation and the
+    # truncated-with-zero-paths branch above.
+    return complete

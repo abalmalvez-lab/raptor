@@ -1,0 +1,366 @@
+"""Runtime regression oracle for candidate patches.
+
+Answers one question with dynamic evidence: given a proof-of-concept
+input that drives a vulnerable binary into a sink, does the patched
+build still reach that sink?  Two sink-watch sessions run with the
+same input — one against the unpatched binary, one against the
+patched build — and the verdict comes from comparing target-attributed
+sink evidence between them.
+
+Verdicts (``verdict`` in the report):
+
+* ``closed`` — the sink fired pre-patch and did not fire post-patch.
+  ``confidence`` is ``site`` when the pre-patch firing was
+  source-resolved to the finding's location, else ``function``.
+* ``still_fires`` — the sink fired in BOTH runs.  Compared at
+  function level only: a patch moves source lines, so matching the
+  post-patch run against the original finding's line is unsound.
+  Note a sink legitimately firing post-patch does NOT always mean the
+  patch failed (a patch may sanitise arguments rather than remove the
+  call) — this oracle detects call-removal and guard-style patches.
+* ``inconclusive`` — the sink never fired pre-patch (the PoC does
+  not demonstrate the vulnerable path), or the post-patch session
+  produced no events at all (broken session — absence of evidence
+  from a session that observed nothing is not evidence). Nothing can
+  be concluded about the patch.
+
+With several sinks, the runs are compared on ANY watched sink firing
+— per-sink counts are in the report when a finer reading matters.
+
+The target binaries run under the sandboxed frida dispatch
+(``libexec/raptor-frida`` → ``packages.frida.sandboxed``): frida
+profile, network deny in spawn mode, reads restricted, writes
+confined to the side run directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Sequence
+
+from core.json import load_jsonl
+from core.logging import configure_cli_logging, get_logger
+from core.security.log_sanitisation import sanitise_for_terminal as _sft
+
+log = get_logger("frida.patch_oracle")
+
+__all__ = ["verify_patch"]
+
+# Worst case per side: run duration + the runner's own bounded
+# stages (script-load 30s + flush 5s + detach 10s + kill 5s) +
+# sandbox setup + spawn slack.
+_SIDE_TIMEOUT_SLACK = 60.0
+
+_FINDING_ID = "patch-oracle"
+
+
+def _run_side(binary: Path, script_path: Path, side_dir: Path,
+              poc: Path | None, duration: float) -> None:
+    """Run one sink-watch session; raises RuntimeError on failure.
+
+    The session goes through ``libexec/raptor-frida`` — the same
+    sandboxed dispatch every other programmatic frida launch uses
+    (``active.observe_target`` / ``active.watch_sinks``): frida
+    profile, network deny for spawn mode, restricted reads, writes
+    confined to the side directory. The spawned target is a build of
+    the analysed (untrusted) project being driven into a suspected-
+    exploitable sink by a PoC — exactly the code that must not run
+    raw on the host ("built yourself" does not mean "audited
+    yourself").
+    """
+    # Same credential-stripped environment as every other frida
+    # launch (active._safe_env): even inside the sandbox the spawned
+    # target must not read operator credentials via getenv. _safe_env
+    # keeps RAPTOR_DIR/PYTHONPATH (wrapper + CLI imports) and the
+    # CLAUDECODE dispatch trust marker the wrapper checks.
+    from packages.frida.active import _safe_env
+    env = _safe_env()
+    libexec = Path(os.environ["RAPTOR_DIR"]) / "libexec" / "raptor-frida"
+    cmd = [
+        str(libexec),
+        "--target", str(binary.resolve()),
+        "--script", str(script_path.resolve()),
+        "--out", str(side_dir.resolve()),
+        "--duration", str(duration),
+        "--spawn",
+    ]
+    if poc is not None:
+        # PoC delivery: the CLI rebinds its own stdin from the file
+        # inside the sandbox (the wrapper grants the file's parent
+        # to the read set) — same shape as active.watch_sinks.
+        cmd.extend(["--stdin", str(Path(poc).resolve())])
+    # Capture to temp FILES, never an in-memory buffer: the spawned
+    # target inherits the CLI's stdio and can flood it without limit
+    # — only a bounded tail is ever needed for the failure message.
+    import tempfile
+    try:
+        with tempfile.TemporaryFile() as out_fh, \
+                tempfile.TemporaryFile() as err_fh:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=out_fh, stderr=err_fh,
+                timeout=duration + _SIDE_TIMEOUT_SLACK,
+                env=env,
+            )
+            if proc.returncode != 0:
+                raw_tail = b""
+                for fh in (err_fh, out_fh):
+                    size = fh.seek(0, os.SEEK_END)
+                    fh.seek(max(0, size - 4096))
+                    raw_tail = fh.read()
+                    if raw_tail.strip():
+                        break
+                # The captured streams carry hostile-target bytes (the
+                # spawned target inherits the frida CLI's stdio) —
+                # escape before the tail rides the exception onto the
+                # operator terminal. Escape FIRST, then slice: escape
+                # expansion of a control-char flood would otherwise
+                # eat the whole budget and truncate away the trailing
+                # (informative) part of the tail.
+                tail = _sft(
+                    raw_tail.decode(errors="replace").strip(),
+                    max_len=4 * 4096 + 64,
+                )[-400:]
+                msg = f"frida session against {binary} failed: {tail}"
+                raise RuntimeError(msg)
+    except subprocess.TimeoutExpired as e:
+        # An infrastructure hang must surface as an error, never leak
+        # out as a verdict-bearing exit code. The exception text quotes
+        # the (target-derived) command line — escape it.
+        msg = f"frida session against {binary} hung: {_sft(str(e))}"
+        raise RuntimeError(msg) from e
+
+
+def _judge_side(side_dir: Path, binary: Path, sinks: Sequence[str],
+                finding_location: tuple[str, int] | None) -> dict:
+    """Summarise one run: which sinks fired, site match if resolvable."""
+    from core.orchestration.frida_validation_bridge import (
+        annotate_attack_paths,
+        collect_runtime_evidence,
+    )
+
+    evidence = collect_runtime_evidence([side_dir],
+                                        target_path=str(binary))
+    # Bounded trail read: the events file is written under
+    # instrumentation of the target binary, so its size and line
+    # shape are target-influenced — count records through the
+    # budgeted JSONL loader instead of buffering arbitrary lines.
+    events_total = len(load_jsonl(
+        side_dir / "events.jsonl",
+        max_line_bytes=1024 * 1024,
+        max_total_bytes=256 * 1024 * 1024,
+    ))
+    paths = [{
+        "finding": _FINDING_ID,
+        "steps": [{"function": s} for s in sinks],
+    }]
+    locations = ({_FINDING_ID: finding_location}
+                 if finding_location is not None else None)
+    annotated = annotate_attack_paths(paths, evidence, locations)
+
+    fired: dict[str, dict] = {}
+    site_match = False
+    for step in annotated[0]["steps"]:
+        ev = step.get("runtime_evidence")
+        if not isinstance(ev, dict) or not ev.get("function_observed"):
+            continue
+        fired[step["function"]] = {
+            "call_count": ev.get("call_count", 0),
+            "callsite_match": ev.get("callsite_match"),
+        }
+        if ev.get("callsite_match") is True:
+            site_match = True
+    return {
+        "run_dir": str(side_dir),
+        "fired": fired,
+        "any_fired": bool(fired),
+        "site_match": site_match,
+        "events_total": events_total,
+    }
+
+
+def verify_patch(
+    before: Path,
+    after: Path,
+    sinks: Sequence[str],
+    out_dir: Path,
+    *,
+    poc: Path | None = None,
+    finding_location: tuple[str, int] | None = None,
+    duration: float = 10.0,
+) -> dict:
+    """Compare sink reachability between an unpatched and patched build.
+
+    ``before``/``after`` are the two binaries, ``sinks`` the watched
+    function names (the finding's sink, e.g. ``system``), ``poc`` an
+    optional input file fed to both runs on stdin, and
+    ``finding_location`` the original finding's ``(file, line)`` used
+    to qualify the pre-patch run at site level.
+
+    Writes ``patch-verify.json`` into ``out_dir`` and returns the same
+    report dict.  Raises ``ValueError`` on bad inputs and
+    ``RuntimeError`` when a frida session fails.
+    """
+    from .sink_watch import SinkSpec, render_sink_watch
+
+    for name, path in (("before", before), ("after", after)):
+        if not path.is_file():
+            msg = f"--{name} binary not found: {path}"
+            raise ValueError(msg)
+    if poc is not None and not poc.is_file():
+        msg = f"--poc file not found: {poc}"
+        raise ValueError(msg)
+    if not sinks:
+        msg = "at least one sink is required"
+        raise ValueError(msg)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    script_path = out_dir / "sink-watch.js"
+    script_path.write_text(
+        render_sink_watch([SinkSpec(fn=s) for s in sinks]),
+        encoding="utf-8")
+
+    sides: dict[str, dict] = {}
+    for side, binary in (("before", before), ("after", after)):
+        side_dir = out_dir / side
+        # A reused out dir must never let a previous invocation's
+        # events pass as this run's evidence (the runner APPENDS to
+        # events.jsonl): stale pre-patch sink events would judge a
+        # PoC that demonstrated nothing as a verified "closed".
+        if side_dir.exists():
+            shutil.rmtree(side_dir)
+        side_dir.mkdir()
+        log.info("patch-oracle: running %s side (%s)", side, binary)
+        _run_side(binary, script_path, side_dir, poc, duration)
+        sides[side] = _judge_side(side_dir, binary, sinks,
+                                  finding_location)
+
+    if not sides["before"]["any_fired"]:
+        verdict, confidence = "inconclusive", None
+        reason = ("sink did not fire pre-patch — the PoC does not "
+                  "demonstrate the vulnerable path, so the patch "
+                  "cannot be judged")
+    elif sides["after"]["events_total"] == 0:
+        # A healthy sink-watch session emits at least its attach
+        # summary. Zero events means the session observed nothing;
+        # silence from it is not evidence the sink stopped firing.
+        verdict, confidence = "inconclusive", None
+        reason = ("post-patch session produced no events at all — "
+                  "the session is broken, not the sink silent; "
+                  "nothing can be concluded")
+    elif sides["after"]["any_fired"]:
+        verdict, confidence = "still_fires", "function"
+        reason = ("sink still fires post-patch with the same input "
+                  "(function-level comparison; if the patch sanitises "
+                  "arguments rather than removing the call, confirm "
+                  "manually)")
+    else:
+        verdict = "closed"
+        confidence = "site" if sides["before"]["site_match"] else "function"
+        reason = ("sink fired pre-patch"
+                  + (" at the finding's source location"
+                     if confidence == "site" else "")
+                  + " and did not fire post-patch with the same input")
+
+    report = {
+        "verdict": verdict,
+        "confidence": confidence,
+        "reason": reason,
+        "sinks": list(sinks),
+        "poc": str(poc) if poc is not None else None,
+        "finding_location": (
+            f"{finding_location[0]}:{finding_location[1]}"
+            if finding_location is not None else None),
+        "before": sides["before"],
+        "after": sides["after"],
+    }
+    report_path = out_dir / "patch-verify.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n",
+                           encoding="utf-8")
+    return report
+
+
+def _parse_location(value: str) -> tuple[str, int]:
+    path, sep, line = value.rpartition(":")
+    if not sep or not path or not line.isdigit():
+        msg = f"expected file:line, got {value!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return path, int(line)
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Escaping-formatter chokepoint for this libexec dispatch target.
+    # The module-level get_logger() bootstrap already wires it in a
+    # fresh process; this keeps the guarantee independent of that
+    # import-time side effect (basicConfig no-ops when handlers
+    # already exist, so nothing is clobbered).
+    import logging as _logging
+    configure_cli_logging(_logging.WARNING)
+    parser = argparse.ArgumentParser(
+        prog="raptor frida-patch-verify",
+        description=("Verify a candidate patch dynamically: run the "
+                     "same PoC input against the unpatched and "
+                     "patched builds under a frida sink watch and "
+                     "compare sink reachability."),
+    )
+    parser.add_argument("--before", required=True, type=Path,
+                        help="Unpatched binary.")
+    parser.add_argument("--after", required=True, type=Path,
+                        help="Binary built from the patched source.")
+    parser.add_argument("--sink", action="append", required=True,
+                        dest="sinks", metavar="FN",
+                        help="Sink function to watch (repeatable), "
+                             "e.g. --sink system.")
+    parser.add_argument("--poc", type=Path,
+                        help="Input file fed to both runs on stdin.")
+    parser.add_argument("--location", type=_parse_location,
+                        metavar="FILE:LINE",
+                        help="Original finding location; qualifies the "
+                             "pre-patch run at site level.")
+    parser.add_argument("--duration", type=float, default=10.0,
+                        help="Seconds per side. Default 10.")
+    parser.add_argument("--out", required=True, type=Path,
+                        help="Output directory (report + both run "
+                             "dirs). The libexec wrapper injects one "
+                             "via the run lifecycle when omitted.")
+    args = parser.parse_args(argv)
+
+    if "RAPTOR_DIR" not in os.environ:
+        print("patch-verify: RAPTOR_DIR is not set (run via "
+              "libexec/raptor-frida-patch-verify)", file=sys.stderr)
+        return 2
+
+    try:
+        report = verify_patch(
+            args.before, args.after, args.sinks, args.out,
+            poc=args.poc, finding_location=args.location,
+            duration=args.duration)
+    except (ValueError, RuntimeError) as e:
+        # Belt-and-braces: the message may embed captured target
+        # output (escaped at construction above, but any other raise
+        # path lands here too).
+        print(f"patch-verify: {_sft(str(e), max_len=600)}", file=sys.stderr)
+        return 2
+
+    status = {"closed": "Closed", "still_fires": "Still Fires",
+              "inconclusive": "Inconclusive"}[report["verdict"]]
+    qualifier = (f" ({report['confidence']}-level)"
+                 if report["confidence"] else "")
+    print(f"patch-verify: {status}{qualifier} — "
+          f"{_sft(str(report['reason']), max_len=300)}")
+    print(f"patch-verify: report → {args.out / 'patch-verify.json'}")
+    # Verdict-bearing exit codes; 2 stays reserved for errors so an
+    # infrastructure failure can never read as a verdict.
+    return {"closed": 0, "still_fires": 1, "inconclusive": 3}[
+        report["verdict"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

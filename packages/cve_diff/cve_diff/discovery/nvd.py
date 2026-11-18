@@ -15,8 +15,7 @@ adds:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from packages.nvd import extract_patch_refs
 from packages.nvd.client import (
@@ -26,6 +25,9 @@ from packages.nvd.client import (
 )
 
 from cve_diff.core.models import CommitSha, DiscoveryResult, PatchTuple
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
@@ -71,8 +73,16 @@ class NvdDiscoverer:
         if not pairs:
             return None
 
-        vulns = payload.get("vulnerabilities") or []
-        raw = ((vulns[0] or {}).get("cve") or {}) if vulns else {}
+        vulns = payload.get("vulnerabilities")
+        if not isinstance(vulns, list):
+            vulns = []
+        # Guard the slot type: a non-dict first element (mangled proxy
+        # response / contract drift) must degrade to "no metadata", not
+        # raise AttributeError out of the discovery layer.
+        first = vulns[0] if vulns and isinstance(vulns[0], dict) else {}
+        raw = first.get("cve") or {}
+        if not isinstance(raw, dict):
+            raw = {}
 
         tuples: list[PatchTuple] = []
         for slug, sha in pairs:

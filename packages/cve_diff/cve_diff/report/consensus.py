@@ -78,13 +78,25 @@ class ConsensusReport:
         return sum(1 for m in self.methods if m.found)
 
     def matches_pipeline_pick(self, picked_slug: str, picked_sha: str) -> bool:
-        """Did the agent's submission match the consensus?"""
+        """Did the agent's submission match the consensus?
+
+        SHA comparison is a SYMMETRIC mutual-prefix check (both sides
+        ≥7 chars, compared over the first ``SHA_DISPLAY_LEN``): a
+        legitimate short-SHA pick against a full 40-char consensus (or
+        vice versa) is the same commit — an asymmetric one-way
+        ``startswith`` false-negatived exactly that case and printed a
+        spurious "differs from consensus" for correct picks.
+        """
         if not self.consensus_slug:
             return False
         ps = normalize_slug(picked_slug or "")
+        psha = (picked_sha or "").lower()
+        csha = (self.consensus_sha or "").lower()
         return (
             ps == self.consensus_slug
-            and (picked_sha or "").lower().startswith(self.consensus_sha[:SHA_DISPLAY_LEN].lower())
+            and len(psha) >= 7 and len(csha) >= 7
+            and (psha.startswith(csha[:SHA_DISPLAY_LEN])
+                 or csha.startswith(psha[:SHA_DISPLAY_LEN]))
         )
 
     def to_dict(self) -> dict:
@@ -130,22 +142,50 @@ def _osv_references(cve_id: str) -> MethodResult:
     payload = _fetch_osv_raw(cve_id)
     if payload is None:
         return MethodResult("OSV references", False, detail="OSV 404 / network failure")
-    for ref in payload.get("references") or []:
-        pair = _extract_pair_from_url((ref.get("url") or "").strip())
-        if pair:
-            slug, sha = pair
-            return MethodResult("OSV references", True, slug=slug, sha=sha,
-                                detail=ref.get("url", ""))
-    for aff in payload.get("affected") or []:
-        for rng in aff.get("ranges") or []:
-            if (rng.get("type") or "").upper() != "GIT":
+    refs = payload.get("references") or []
+    if isinstance(refs, list):
+        for ref in refs:
+            if not isinstance(ref, dict):
                 continue
-            slug = extract_github_slug(rng.get("repo") or "") or ""
-            for ev in rng.get("events") or []:
-                sha = (ev.get("fixed") or "").lower()
-                if slug and sha and sha != "0":
-                    return MethodResult("OSV references", True, slug=slug, sha=sha,
-                                        detail=f"affected.ranges (repo={slug})")
+            pair = _extract_pair_from_url(
+                (ref.get("url") or "").strip(),
+            )
+            if pair:
+                slug, sha = pair
+                return MethodResult(
+                    "OSV references", True, slug=slug, sha=sha,
+                    detail=ref.get("url", ""),
+                )
+    affected = payload.get("affected") or []
+    if isinstance(affected, list):
+        for aff in affected:
+            if not isinstance(aff, dict):
+                continue
+            ranges = aff.get("ranges") or []
+            if not isinstance(ranges, list):
+                continue
+            for rng in ranges:
+                if not isinstance(rng, dict):
+                    continue
+                if (rng.get("type") or "").upper() != "GIT":
+                    continue
+                slug = extract_github_slug(
+                    rng.get("repo") or "",
+                ) or ""
+                events = rng.get("events") or []
+                if not isinstance(events, list):
+                    continue
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    sha = (ev.get("fixed") or "").lower()
+                    if slug and sha and sha != "0":
+                        return MethodResult(
+                            "OSV references", True,
+                            slug=slug, sha=sha,
+                            detail=f"affected.ranges "
+                            f"(repo={slug})",
+                        )
     return MethodResult("OSV references", False, detail="no commit URLs in references / ranges")
 
 
@@ -236,7 +276,15 @@ def run_consensus(cve_id: str) -> ConsensusReport:
 
 
 def render_markdown(report: ConsensusReport) -> str:
-    """Format a `ConsensusReport` as a Markdown section."""
+    """Format a `ConsensusReport` as a Markdown section.
+
+    Escaped like its production twin (`markdown._render_consensus`):
+    slug/detail relay OSV/NVD-derived text, so the cells route through
+    md_inline — leaving this renderer raw was a divergence trap for
+    the next caller that imports it instead of the escaped twin.
+    """
+    from core.security.markdown_render import md_inline
+
     lines: list[str] = []
     lines.append("## Consensus from 2 methods")
     lines.append("")
@@ -245,16 +293,21 @@ def render_markdown(report: ConsensusReport) -> str:
     for m in report.methods:
         if m.found:
             lines.append(
-                f"| {m.name} | ✓ | {m.slug} / {m.sha[:SHA_DISPLAY_LEN]} | "
-                f"{(m.detail or '')[:80]} |"
+                f"| {md_inline(m.name)} | ✓ | "
+                f"{md_inline(m.slug)} / {md_inline(m.sha[:SHA_DISPLAY_LEN])} | "
+                f"{md_inline((m.detail or '')[:80])} |"
             )
         else:
-            lines.append(f"| {m.name} | — | — | {(m.detail or '')[:80]} |")
+            lines.append(
+                f"| {md_inline(m.name)} | — | — | "
+                f"{md_inline((m.detail or '')[:80])} |"
+            )
     lines.append("")
     if report.agreement_count >= 2:
         lines.append(
             f"**Both methods agree on "
-            f"`{report.consensus_slug}/{report.consensus_sha[:SHA_DISPLAY_LEN]}`.**"
+            f"`{md_inline(report.consensus_slug)}/"
+            f"{md_inline(report.consensus_sha[:SHA_DISPLAY_LEN])}`.**"
         )
     elif report.attempted_count == 0:
         lines.append("**No method found a fix-commit pointer for this CVE.**")

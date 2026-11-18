@@ -1,11 +1,11 @@
 """Tests for the libexec/raptor-agentic bash wrapper."""
 
 import os
-import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from core.testing.standalone_cli import run_standalone_cli
 
 # parents[3] climbs:
 #   [0] packages/autonomous/tests/  (this file's directory)
@@ -27,9 +27,9 @@ class RaptorAgenticWrapperTests(unittest.TestCase):
         # --help must be handled by raptor_agentic.py argparse, not by the
         # wrapper. We assert the resulting output mentions agentic-specific
         # flags including the new --understand and --validate.
-        proc = subprocess.run(
+        proc = run_standalone_cli(
             [str(WRAPPER), "--help"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(proc.returncode, 0,
                          msg=f"wrapper --help failed: {proc.stderr}")
@@ -40,10 +40,42 @@ class RaptorAgenticWrapperTests(unittest.TestCase):
     def test_wrapper_propagates_unknown_arg_failure(self):
         # An unknown flag should bubble up as a non-zero exit from argparse,
         # not be silently swallowed by the wrapper.
-        proc = subprocess.run(
-            [str(WRAPPER), "--definitely-not-a-flag"],
-            capture_output=True, text=True, timeout=15,
-        )
+        #
+        # Hermetic by construction: without an explicit --repo, the
+        # dispatcher back-fills the target from the host's ACTIVE
+        # PROJECT (or RAPTOR_CALLER_DIR) and runs its lifecycle
+        # pre-work — license detection, target-shape and build-system
+        # detection over the whole project tree — BEFORE the child's
+        # argparse ever sees the bogus flag. On a host with a large
+        # active project that pre-work alone blew the timeout and
+        # SIGKILLed a half-started real run into the operator's
+        # project directory. Pin --repo to an empty temp dir and
+        # RAPTOR_OUT_DIR to a temp out dir so the run touches nothing
+        # outside the test and reaches argparse immediately.
+        #
+        # HOME is redirected to the temp dir as well: even with an
+        # explicit --repo, the dispatcher resolves the host's active
+        # project (~/.raptor/projects/.active) and rejects a target
+        # outside the project's bounds ("target X is outside project
+        # Y") BEFORE argparse sees the bogus flag — so on an
+        # operator host with any active project this test failed
+        # while passing in CI. A fresh HOME means an empty projects
+        # tree (same isolation pattern as
+        # test_validate_checklist_handoff_e2e's autouse fixture).
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "empty-repo"
+            repo.mkdir()
+            out = Path(tmp) / "out"
+            out.mkdir()
+            env = dict(os.environ)
+            env["RAPTOR_OUT_DIR"] = str(out)
+            env["HOME"] = tmp
+            env.pop("RAPTOR_CALLER_DIR", None)
+            proc = run_standalone_cli(
+                [str(WRAPPER), "--repo", str(repo),
+                 "--definitely-not-a-flag"],
+                capture_output=True, text=True, timeout=60, env=env,
+            )
         self.assertNotEqual(proc.returncode, 0)
         # argparse writes errors to stderr.
         self.assertTrue(
@@ -63,9 +95,9 @@ class RaptorAgenticWrapperTests(unittest.TestCase):
             # Copy the wrapper but NOT raptor.py — the parent dir is empty.
             broken.write_text(WRAPPER.read_text())
             broken.chmod(0o755)
-            proc = subprocess.run(
+            proc = run_standalone_cli(
                 [str(broken), "--help"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("cannot find raptor.py", proc.stderr,
@@ -77,9 +109,9 @@ class RaptorAgenticWrapperTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             link = Path(tmp) / "raptor-agentic"
             link.symlink_to(WRAPPER)
-            proc = subprocess.run(
+            proc = run_standalone_cli(
                 [str(link), "--help"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(proc.returncode, 0,
                              msg=f"symlinked wrapper failed: {proc.stderr}")

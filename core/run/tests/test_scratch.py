@@ -1,0 +1,557 @@
+"""Tests for core.run.scratch — the shared scratch-dir context manager.
+
+Pins the consolidated behaviours of the hand-rolled mkdtemp sites this
+replaces: best-effort cleanup on both normal and exceptional exit, the
+``dir=`` run-output shape (parent created ``exist_ok``, no reaper
+registration), the ``TMPDIR`` export shape, the ``keep`` ownership-
+transfer escape hatch, and the reaper auto-registration for system-tmp
+prefixes (the coverage gap that let unlisted prefixes leak forever).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import time
+
+import pytest
+
+from core.run import tmp_reaper
+from core.run.scratch import scratch_dir
+
+
+from core.testing.module_bindings import patch_module_attribute
+
+import core.run.scratch as _tempfile_owner
+
+
+@pytest.fixture(autouse=True)
+def _owned_tempfile_namespace(monkeypatch):
+    """Share temporary-root faults only among this file's consumers."""
+    from core.testing.tempdirs import private_tempfile_module
+    import core.run.scratch as consumer_0
+    import core.run.tmp_reaper as consumer_1
+
+    private = private_tempfile_module(consumer_0.tempfile)
+    monkeypatch.setattr(consumer_0, "tempfile", private)
+    monkeypatch.setattr(consumer_1, "tempfile", private)
+    monkeypatch.setitem(globals(), "tempfile", private)
+
+
+_OLD = time.time() - 25 * 3600  # past the 24h default age floor
+
+
+@pytest.fixture
+def tmp_root(tmp_path, monkeypatch, _owned_tempfile_namespace):
+    monkeypatch.setattr(_tempfile_owner.tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.delenv("RAPTOR_TMP_REAP_MAX_AGE_H", raising=False)
+    return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _pin_sweep_roots(monkeypatch):
+    """Hermeticity: the sweep walks the real system tmp root and the
+    lane fallback base in addition to gettempdir() — the reap
+    assertions here must only ever see the private tmp_root."""
+    monkeypatch.setattr(tmp_reaper, "_SYSTEM_TMP_ROOTS", ())
+    monkeypatch.setattr(tmp_reaper, "_lane_fallback_bases", lambda: ())
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runtime_prefixes(monkeypatch):
+    monkeypatch.setattr(tmp_reaper, "_RUNTIME_DIR_PREFIXES", set())
+
+
+class TestBasicLifecycle:
+
+    def test_yields_existing_path_with_prefix(self, tmp_root):
+        with scratch_dir("raptor-scratch-test-") as p:
+            assert p.is_dir()
+            assert p.name.startswith("raptor-scratch-test-")
+            assert p.parent == tmp_root
+        assert not p.exists()
+
+    def test_cleanup_on_exception(self, tmp_root):
+        with pytest.raises(RuntimeError), \
+                scratch_dir("raptor-scratch-test-") as p:
+            (p / "litter.txt").write_text("x")
+            raise RuntimeError("boom")
+        assert not p.exists()
+
+    def test_cleanup_is_best_effort(self, tmp_root):
+        # A subdir made unreadable must not turn cleanup into a raise
+        # (the hand-rolled sites used ignore_errors / suppress(OSError)).
+        with scratch_dir("raptor-scratch-test-") as p:
+            sub = p / "sub"
+            sub.mkdir()
+            (sub / "f").write_text("x")
+            os.chmod(sub, 0o000)
+        # Reaching here IS the assertion: cleanup swallowed whatever the
+        # unreadable subdir did to it. What that was is venue-dependent:
+        # an unprivileged run cannot descend into the 000 dir, so the
+        # survivor needs its mode back for the fixture's own teardown,
+        # while a user-namespace root (CAP_DAC_OVERRIDE over its own
+        # files) removes it outright and leaves nothing to restore.
+        with contextlib.suppress(FileNotFoundError):
+            os.chmod(sub, 0o755)
+
+    def test_keep_transfers_ownership(self, tmp_root):
+        with scratch_dir("raptor-scratch-test-", keep=True) as p:
+            pass
+        assert p.is_dir()
+
+
+class TestRunOutputShape:
+
+    def test_dir_parent_created_exist_ok(self, tmp_path):
+        parent = tmp_path / "out" / "scratch"
+        with scratch_dir("git_oracle_", dir=parent) as p:
+            assert p.parent == parent
+            assert p.name.startswith("git_oracle_")
+        assert not p.exists()
+        assert parent.is_dir()  # parent survives; only the scratch goes
+
+    def test_dir_shape_not_reaper_registered(self, tmp_path):
+        with scratch_dir("compiler_sweep_", dir=tmp_path):
+            pass
+        assert "compiler_sweep_" not in tmp_reaper._RUNTIME_DIR_PREFIXES
+
+
+class TestTmpdirExport:
+
+    def test_env_gets_tmpdir(self, tmp_root):
+        env: dict[str, str] = {"PATH": "/usr/bin"}
+        with scratch_dir("raptor-scratch-test-", env=env) as p:
+            assert env["TMPDIR"] == str(p)
+        # Nothing restored on exit — the mapping is the caller's copy.
+        assert env["TMPDIR"] == str(p)
+
+
+class TestReaperRegistration:
+
+    def test_system_tmp_prefix_registered(self, tmp_root):
+        with scratch_dir("raptor-scratch-reg-"):
+            assert "raptor-scratch-reg-" in tmp_reaper._RUNTIME_DIR_PREFIXES
+
+    def test_registered_prefix_is_swept(self, tmp_root):
+        # A stale orphan with a runtime-registered prefix is reclaimed
+        # by the same process's next sweep — the coverage gap the
+        # hand-enumerated prefix tuple left open for unlisted prefixes.
+        with scratch_dir("raptor-scratch-reg-"):
+            pass
+        orphan = tmp_root / "raptor-scratch-reg-orphan1"
+        orphan.mkdir()
+        os.utime(orphan, (_OLD, _OLD))
+        reaped = tmp_reaper.reap_stale_tmp()
+        assert orphan in reaped
+        assert not orphan.exists()
+
+    def test_unregistered_prefix_not_swept(self, tmp_root):
+        stranger = tmp_root / "raptor-scratch-unreg-orphan1"
+        stranger.mkdir()
+        os.utime(stranger, (_OLD, _OLD))
+        assert tmp_reaper.reap_stale_tmp() == []
+        assert stranger.is_dir()
+
+
+class TestLiveSessionKeepalive:
+    """A LIVE session whose system-tmp scratch goes mtime-quiet past
+    the reaper's age floor (default 24 h) must not be false-reaped by
+    a concurrent process's sweep. The owning process keeps the dir's
+    mtime fresh: scratch_dir registers each system-tmp scratch with a
+    keepalive that a daemon thread ticks periodically. Tests drive
+    the tick directly (fake-clock style) instead of waiting."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_keepalive(self, monkeypatch):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(scratch_mod, "_keepalive_paths", set())
+
+    def test_quiet_live_scratch_survives_sweep(self, tmp_root):
+        from core.run import scratch as scratch_mod
+        with scratch_dir("raptor-keepalive-test-") as p:
+            # Simulate a session quiet past the age floor: nothing
+            # touched the dir's own mtime for >24h while the owning
+            # process (us) stayed alive.
+            os.utime(p, (_OLD, _OLD))
+            scratch_mod._keepalive_tick()  # what the thread does
+            assert tmp_reaper.reap_stale_tmp() == []
+            assert p.is_dir()
+
+    def test_without_tick_quiet_scratch_would_be_reaped(self, tmp_root):
+        # The exposure the keepalive closes, pinned as a control: same
+        # scenario minus the tick — the sweep takes the live dir.
+        with scratch_dir("raptor-keepalive-test-") as p:
+            os.utime(p, (_OLD, _OLD))
+            assert tmp_reaper.reap_stale_tmp() == [p]
+            assert not p.exists()
+
+    def test_tick_refreshes_mtime(self, tmp_root):
+        from core.run import scratch as scratch_mod
+        with scratch_dir("raptor-keepalive-test-") as p:
+            os.utime(p, (_OLD, _OLD))
+            scratch_mod._keepalive_tick()
+            assert time.time() - p.stat().st_mtime < 3600
+
+    def test_exit_unregisters(self, tmp_root):
+        from core.run import scratch as scratch_mod
+        with scratch_dir("raptor-keepalive-test-") as p:
+            assert str(p) in scratch_mod._keepalive_paths
+        assert str(p) not in scratch_mod._keepalive_paths
+        scratch_mod._keepalive_tick()  # tolerates the gone dir
+
+    def test_keep_unregisters_too(self, tmp_root):
+        # keep=True transfers ownership — the keepalive window is the
+        # context-manager window, so a kept dir ages out normally once
+        # its owner stops using it (same contract as --keep dirs).
+        from core.run import scratch as scratch_mod
+        with scratch_dir("raptor-keepalive-test-", keep=True) as p:
+            pass
+        assert str(p) not in scratch_mod._keepalive_paths
+        assert p.is_dir()
+
+    def test_dir_shape_not_registered(self, tmp_path):
+        # Run-output scratch is never reaper-swept, so it needs no
+        # keepalive either.
+        from core.run import scratch as scratch_mod
+        with scratch_dir("compiler_sweep_", dir=tmp_path) as p:
+            assert str(p) not in scratch_mod._keepalive_paths
+
+    def test_daemon_thread_started(self, tmp_root):
+        from core.run import scratch as scratch_mod
+        with scratch_dir("raptor-keepalive-test-"):
+            thread = scratch_mod._keepalive_thread
+            assert thread is not None
+            assert thread.daemon
+            assert thread.is_alive()
+
+    def test_tick_survives_vanished_path(self, tmp_root):
+        from core.run import scratch as scratch_mod
+        scratch_mod._keepalive_paths.add(str(tmp_root / "gone"))
+        scratch_mod._keepalive_tick()  # no raise is the assertion
+
+    def test_tick_never_follows_a_squatting_symlink(self, tmp_root):
+        # /tmp is world-writable: if the scratch vanished and someone
+        # squatted a symlink on its path, the tick must not refresh
+        # the target's mtime (that could keep an unrelated artifact
+        # alive past the reaper's floor).
+        import os as _os
+        if _os.utime not in _os.supports_follow_symlinks:
+            pytest.skip("platform cannot utime without following")
+        from core.run import scratch as scratch_mod
+        victim = tmp_root / "victim"
+        victim.mkdir()
+        os.utime(victim, (_OLD, _OLD))
+        link = tmp_root / "squatted"
+        link.symlink_to(victim)
+        scratch_mod._keepalive_paths.add(str(link))
+        scratch_mod._keepalive_tick()
+        assert victim.stat().st_mtime == pytest.approx(_OLD)
+
+
+class TestKeepalivePublicAPI:
+    """register/unregister are public: scratch owners whose dirs
+    outlive a lexical scope (teardown-method / returned-handle /
+    caller-finally ownership) hold a keepalive while the dir is live,
+    which is what makes reaper-listing their prefixes safe for
+    long-quiet-but-alive dirs."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_keepalive(self, monkeypatch):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(scratch_mod, "_keepalive_paths", set())
+
+    def test_register_then_tick_refreshes(self, tmp_path):
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register
+        d = tmp_path / "owned"
+        d.mkdir()
+        os.utime(d, (_OLD, _OLD))
+        keepalive_register(d)
+        scratch_mod._keepalive_tick()
+        assert time.time() - d.stat().st_mtime < 3600
+
+    def test_unregister_stops_refresh(self, tmp_path):
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register, keepalive_unregister
+        d = tmp_path / "owned"
+        d.mkdir()
+        keepalive_register(d)
+        keepalive_unregister(d)
+        os.utime(d, (_OLD, _OLD))
+        scratch_mod._keepalive_tick()
+        assert d.stat().st_mtime == pytest.approx(_OLD)
+
+    def test_unregister_is_idempotent(self, tmp_path):
+        from core.run.scratch import keepalive_unregister
+        keepalive_unregister(tmp_path / "never-registered")
+        keepalive_unregister(str(tmp_path / "never-registered"))
+
+    def test_str_and_path_are_equivalent(self, tmp_path):
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register, keepalive_unregister
+        d = tmp_path / "owned"
+        d.mkdir()
+        keepalive_register(str(d))
+        keepalive_unregister(d)
+        assert str(d) not in scratch_mod._keepalive_paths
+
+    def test_register_starts_ticker(self, tmp_path):
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register, keepalive_unregister
+        d = tmp_path / "owned"
+        d.mkdir()
+        keepalive_register(d)
+        try:
+            assert scratch_mod._keepalive_thread is not None
+            assert scratch_mod._keepalive_thread.daemon
+            assert scratch_mod._keepalive_thread.is_alive()
+        finally:
+            keepalive_unregister(d)
+
+    def test_ticker_start_failure_discards_registration(
+            self, tmp_path, monkeypatch):
+        """A path left registered with no ticker would be pinned by a
+        LATER register's ticker while its owner may be long dead —
+        the register must discard it and swallow the failure."""
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register
+
+        class _BoomThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread limit")
+
+        d = tmp_path / "owned"
+        d.mkdir()
+        monkeypatch.setattr(scratch_mod, "_keepalive_thread", None)
+        patch_module_attribute(monkeypatch, scratch_mod, "threading", "Thread", _BoomThread)
+        keepalive_register(d)  # must not raise
+        assert str(d) not in scratch_mod._keepalive_paths
+        assert scratch_mod._keepalive_thread is None
+
+    # Forking with the keepalive thread live is the scenario under
+    # test; Python >= 3.12 warns about exactly that.
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_fork_child_gets_fresh_lock_and_no_inherited_paths(
+            self, tmp_path):
+        """A child forked while the lock is held must not deadlock on
+        its first register, and must not keep refreshing the PARENT's
+        registrations (that would mask the parent's death from the
+        reaper)."""
+        import os as _os
+        if not hasattr(_os, "register_at_fork"):
+            pytest.skip("no register_at_fork on this platform")
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register, keepalive_unregister
+        parent_dir = tmp_path / "parent-owned"
+        parent_dir.mkdir()
+        keepalive_register(parent_dir)
+        try:
+            with scratch_mod._keepalive_lock:  # held across the fork
+                pid = _os.fork()
+            if pid == 0:  # child
+                code = 9
+                try:
+                    # A deadlocked register must kill the child, not
+                    # hang the suite's waitpid.
+                    import signal as _signal
+                    _signal.alarm(10)
+                    if not scratch_mod._keepalive_paths:
+                        keepalive_register(tmp_path)  # must not deadlock
+                        code = 0
+                finally:
+                    _os._exit(code)
+            _, status = _os.waitpid(pid, 0)
+            assert _os.waitstatus_to_exitcode(status) == 0
+            # Parent state survives the child's fork-reinit untouched.
+            assert str(parent_dir) in scratch_mod._keepalive_paths
+        finally:
+            keepalive_unregister(parent_dir)
+
+
+class TestInodeCeilingAdvisory:
+    """The soft inode ceiling on system-tmp lane creation: loud past
+    the threshold, silent below it, rate-limited, operator-tunable,
+    and never a refusal."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_advisory_state(self, monkeypatch):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(scratch_mod, "_last_inode_warning", 0.0)
+        monkeypatch.delenv("RAPTOR_TMP_INODE_SOFT_PCT", raising=False)
+
+    @staticmethod
+    def _statvfs(files: int, free: int):
+        import types
+        return lambda _path: types.SimpleNamespace(
+            f_files=files, f_ffree=free)
+
+    def _mint_lane(self, tmp_root):
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+
+    def test_below_ceiling_is_silent(self, tmp_root, monkeypatch, caplog):
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(1000, 500))
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" not in caplog.text
+
+    def test_past_ceiling_warns_loudly_once(
+        self, tmp_root, monkeypatch, caplog,
+    ):
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(1000, 50))  # 95%
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+            self._mint_lane(tmp_root)  # within the re-warn interval
+        assert caplog.text.count("inode usage") == 1
+        assert "95% inode usage" in caplog.text
+        # Advisory only: the lane itself was still created and cleaned.
+
+    def test_env_moves_the_ceiling(self, tmp_root, monkeypatch, caplog):
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(1000, 500))  # 50%
+        monkeypatch.setenv("RAPTOR_TMP_INODE_SOFT_PCT", "40")
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" in caplog.text
+
+    def test_env_zero_disables(self, tmp_root, monkeypatch, caplog):
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(1000, 0))  # 100%
+        monkeypatch.setenv("RAPTOR_TMP_INODE_SOFT_PCT", "0")
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" not in caplog.text
+
+    def test_non_numeric_env_keeps_default(
+        self, tmp_root, monkeypatch, caplog,
+    ):
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(1000, 20))  # 98%
+        monkeypatch.setenv("RAPTOR_TMP_INODE_SOFT_PCT", "lots")
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" in caplog.text
+
+    def test_no_inode_accounting_is_silent(
+        self, tmp_root, monkeypatch, caplog,
+    ):
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(0, 0))
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" not in caplog.text
+
+    def test_statvfs_failure_never_breaks_lane_creation(
+        self, tmp_root, monkeypatch,
+    ):
+        from core.run import scratch as scratch_mod
+
+        def _boom(_path):
+            raise OSError("statvfs exploded")
+
+        patch_module_attribute(monkeypatch, scratch_mod, 'os', "statvfs", _boom)
+        with scratch_dir("raptor-scratch-test-") as p:
+            assert p.is_dir()
+
+    def test_run_output_shape_not_probed(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        # dir=... scratch is operator-visible run output, not the
+        # session-tmp growth surface — no advisory there.
+        from core.run import scratch as scratch_mod
+        patch_module_attribute(monkeypatch,
+            scratch_mod, 'os', "statvfs", self._statvfs(1000, 0))
+        with caplog.at_level("WARNING"):
+            with scratch_dir("x-", dir=tmp_path / "out"):
+                pass
+        assert "inode usage" not in caplog.text
+
+
+class TestTempRootInteropAdvisory:
+    """System-tmp lane creation is a temp-root advisory chokepoint."""
+
+    pytestmark = pytest.mark.wsl
+
+    @pytest.fixture(autouse=True)
+    def _reset_latch(self, monkeypatch):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "_tmpdir_warned", False)
+
+    def test_system_tmp_shape_fires_advisory_once(
+        self, tmp_root, monkeypatch, capsys,
+    ):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", lambda path: True)
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+        err = capsys.readouterr().err
+        assert err.count("temp root (TMPDIR/RAPTOR_WORK_DIR)") == 1
+        assert "export TMPDIR=/tmp" in err
+
+    def test_silent_off_wsl(self, tmp_root, monkeypatch, capsys):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: False)
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+        assert "temp root" not in capsys.readouterr().err
+
+    def test_run_output_shape_not_a_chokepoint(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        # dir=... scratch does not live under the temp root, so it
+        # must not spend the once-per-process advisory.
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", lambda path: True)
+        with scratch_dir("x-", dir=tmp_path / "out"):
+            pass
+        assert "temp root" not in capsys.readouterr().err
+        assert wsl._tmpdir_warned is False
+
+
+@pytest.fixture(autouse=True)
+def _idle_fixture_cwds(monkeypatch):
+    # These tests own isolated directories; cwd discovery is a separate
+    # native integration concern. An unrelated lsof warning must not
+    # turn their dead-owner/age assertions into host-dependent results.
+    monkeypatch.setattr("core.run.tmp_reaper._live_cwds", lambda: set())
+
+
+@pytest.mark.parametrize("force_keepalive", [False, True])
+def test_explicit_parent_can_request_keepalive(tmp_path, force_keepalive):
+    import threading
+    from core.run import scratch as scratch_mod
+
+    with pytest.MonkeyPatch.context() as owner_patch:
+        stop = threading.Event()
+        paths = set()
+        owner_patch.setattr(scratch_mod, "_keepalive_paths", paths)
+        owner_patch.setattr(scratch_mod, "_keepalive_thread", None)
+        owner_patch.setattr(scratch_mod, "_keepalive_loop", lambda: stop.wait())
+        try:
+            with scratch_dir("raptor-ghidra-opt-in-", dir=tmp_path,
+                             keepalive=force_keepalive) as directory:
+                assert (str(directory) in paths) is force_keepalive
+            assert not directory.exists()
+            assert not paths
+        finally:
+            stop.set()
+            thread = scratch_mod._keepalive_thread
+            if thread is not None:
+                thread.join(timeout=5)
+                assert not thread.is_alive(), "owned explicit-parent ticker did not stop"

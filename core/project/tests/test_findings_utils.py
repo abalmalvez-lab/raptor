@@ -1,8 +1,42 @@
 """Tests for findings_utils — dedup keys, semantic grouping, bug counting."""
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from core.project.findings_utils import count_vulns, dedup_key, group_findings, group_key
+from core.project.findings_utils import (
+    count_vulns,
+    dedup_key,
+    finding_file,
+    group_findings,
+    group_key,
+    load_findings_from_dir,
+    load_sca_findings_from_dir,
+    merge_sca_findings,
+)
+
+
+def _sca_row(finding_id, name, *, severity="high", run_tag=""):
+    """A minimal SCA finding row in the canonical shape SCA writes."""
+    return {
+        "id": finding_id,
+        "finding_id": finding_id,
+        "vuln_type": "sca:supply_chain:slopsquat_suspect",
+        "tool": "sca",
+        "file": "package.json",
+        "function": name,
+        "line": 0,
+        "severity": severity,
+        "title": f"Slopsquat suspect: {name}{run_tag}",
+        "sca": {"kind": "slopsquat_suspect", "ecosystem": "npm", "name": name},
+    }
+
+
+def _write_sca_findings(run_dir: Path, rows):
+    sca_dir = run_dir / "sca"
+    sca_dir.mkdir(parents=True, exist_ok=True)
+    (sca_dir / "findings.json").write_text(json.dumps(rows), encoding="utf-8")
 
 
 class TestDedupKey(unittest.TestCase):
@@ -14,6 +48,35 @@ class TestDedupKey(unittest.TestCase):
     def test_missing_fields(self):
         self.assertEqual(dedup_key({}), ("", "", 0))
 
+    def test_orchestrated_file_path(self):
+        """Orchestrated /agentic results carry file_path, not file."""
+        f = {"file_path": "a.c", "function": "main", "line": 10}
+        self.assertEqual(dedup_key(f), ("a.c", "main", 10))
+
+    def test_scan_and_orchestrated_shapes_share_key(self):
+        scan = {"file": "src/a.c", "function": "main", "line": 10}
+        orch = {"file_path": "src/a.c", "function": "main", "line": 10}
+        self.assertEqual(dedup_key(scan), dedup_key(orch))
+
+    def test_relative_path_normalised(self):
+        a = {"file": "./src/a.c", "function": "main", "line": 10}
+        b = {"file_path": "src//a.c", "function": "main", "line": 10}
+        self.assertEqual(dedup_key(a), dedup_key(b))
+
+    def test_file_wins_over_file_path(self):
+        f = {"file": "a.c", "file_path": "b.c", "function": "fn", "line": 1}
+        self.assertEqual(dedup_key(f), ("a.c", "fn", 1))
+
+
+class TestFindingFile(unittest.TestCase):
+
+    def test_non_string_values_ignored(self):
+        self.assertEqual(finding_file({"file": ["a.c"]}), "")
+        self.assertEqual(finding_file({"file_path": 7}), "")
+
+    def test_empty(self):
+        self.assertEqual(finding_file({}), "")
+
 
 class TestGroupKey(unittest.TestCase):
 
@@ -24,6 +87,25 @@ class TestGroupKey(unittest.TestCase):
     def test_missing_vuln_type(self):
         f = {"file": "a.c", "function": "main", "line": 10}
         self.assertEqual(group_key(f), ("a.c", "main", ""))
+
+    def test_file_path_shape_keys_like_file(self):
+        """Orchestrated /agentic findings carry ``file_path``; both
+        serialised shapes must land in the same group — pre-fix every
+        agentic finding grouped under file ""."""
+        scan = {"file": "a.c", "function": "main", "vuln_type": "xss"}
+        agentic = {"file_path": "a.c", "function": "main",
+                   "vuln_type": "xss"}
+        self.assertEqual(group_key(scan), group_key(agentic))
+        self.assertEqual(group_key(agentic), ("a.c", "main", "xss"))
+
+    def test_file_path_findings_in_different_files_stay_separate(self):
+        findings = [
+            {"file_path": "a.c", "function": "main", "line": 5,
+             "vuln_type": "buffer_overflow"},
+            {"file_path": "b.c", "function": "main", "line": 5,
+             "vuln_type": "buffer_overflow"},
+        ]
+        self.assertEqual(count_vulns(findings), 2)
 
 
 class TestGroupFindings(unittest.TestCase):
@@ -102,5 +184,154 @@ class TestCountVulns(unittest.TestCase):
         self.assertEqual(count_vulns([]), 0)
 
 
+class TestLoadScaFindings(unittest.TestCase):
+
+    def test_reads_sca_subdir(self):
+        with TemporaryDirectory() as d:
+            run_dir = Path(d)
+            _write_sca_findings(run_dir, [_sca_row("SCA-1", "lodahs")])
+            out = load_sca_findings_from_dir(run_dir)
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0]["function"], "lodahs")
+
+    def test_absent_subdir_returns_empty(self):
+        with TemporaryDirectory() as d:
+            # No sca/ subdir at all.
+            self.assertEqual(load_sca_findings_from_dir(Path(d)), [])
+
+    def test_does_not_read_top_level_findings(self):
+        """The SCA loader must look ONLY in sca/, not the top-level
+        findings.json (that's load_findings_from_dir's job)."""
+        with TemporaryDirectory() as d:
+            run_dir = Path(d)
+            (run_dir / "findings.json").write_text(
+                json.dumps([{"id": "CODE-1", "file": "a.c"}]), encoding="utf-8")
+            self.assertEqual(load_sca_findings_from_dir(run_dir), [])
+
+
+class TestMergeScaFindings(unittest.TestCase):
+
+    def test_dedup_latest_run_wins(self):
+        with TemporaryDirectory() as d1, TemporaryDirectory() as d2:
+            r1, r2 = Path(d1), Path(d2)
+            _write_sca_findings(r1, [_sca_row("SCA-1", "lodahs", run_tag=" (run1)")])
+            _write_sca_findings(r2, [_sca_row("SCA-1", "lodahs", run_tag=" (run2)")])
+            # run_dirs ordered: later overrides earlier.
+            merged = merge_sca_findings([r1, r2])
+            self.assertEqual(len(merged), 1)
+            self.assertIn("(run2)", merged[0]["title"])
+
+    def test_distinct_ids_kept(self):
+        with TemporaryDirectory() as d1, TemporaryDirectory() as d2:
+            r1, r2 = Path(d1), Path(d2)
+            _write_sca_findings(r1, [_sca_row("SCA-1", "lodahs")])
+            _write_sca_findings(r2, [_sca_row("SCA-2", "expresss")])
+            merged = merge_sca_findings([r1, r2])
+            self.assertEqual(len(merged), 2)
+
+    def test_empty_when_no_sca(self):
+        with TemporaryDirectory() as d:
+            self.assertEqual(merge_sca_findings([Path(d)]), [])
+
+    def test_idless_distinct_findings_same_package_not_collapsed(self):
+        """Regression: two id-less findings on the SAME package but
+        different classes (slopsquat vs CVE) must NOT collide. Both have
+        file=package.json, function=lodash, line=0 — dedup_key would
+        merge them; group_key (vuln_type) keeps them distinct."""
+        with TemporaryDirectory() as d:
+            run_dir = Path(d)
+            slop = _sca_row("", "lodash")  # empty id → fallback path
+            slop.pop("id")
+            slop.pop("finding_id")
+            cve = dict(slop)
+            cve["vuln_type"] = "sca:vulnerable_dependency"
+            _write_sca_findings(run_dir, [slop, cve])
+            merged = merge_sca_findings([run_dir])
+            self.assertEqual(len(merged), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLoadFindingsOpenantFallback(unittest.TestCase):
+    """Standalone /openant runs write openant_findings.json and no
+    top-level findings.json; the loader falls back so project views
+    (findings / report / correlate / diff) see them."""
+
+    @staticmethod
+    def _openant_row(finding_id: str) -> dict:
+        return {
+            "id": finding_id,
+            "file": "src/app.py",
+            "function": "handler",
+            "line": 12,
+            "vuln_type": "sql_injection",
+            "severity": "high",
+            "tool": "openant",
+        }
+
+    def test_standalone_openant_findings_are_loaded(self):
+        with TemporaryDirectory() as td:
+            run_dir = Path(td)
+            rows = [self._openant_row("OA-1")]
+            (run_dir / "openant_findings.json").write_text(
+                json.dumps(rows), encoding="utf-8")
+            got = load_findings_from_dir(run_dir)
+            self.assertEqual([f["id"] for f in got], ["OA-1"])
+
+    def test_fallback_only_findings_json_wins_when_both_exist(self):
+        # /agentic runs write both, and findings.json already contains
+        # the merged OpenAnt rows — reading both would double-count.
+        with TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "findings.json").write_text(
+                json.dumps({"findings": [self._openant_row("MERGED-1")]}),
+                encoding="utf-8")
+            (run_dir / "openant_findings.json").write_text(
+                json.dumps([self._openant_row("OA-1")]), encoding="utf-8")
+            got = load_findings_from_dir(run_dir)
+            self.assertEqual([f["id"] for f in got], ["MERGED-1"])
+
+
+class TestHostileKeyComponents(unittest.TestCase):
+    """Finding rows are LLM-authored and import-restored: one row
+    with a dict/list in function/file/vuln_type/line made the dedup
+    tuple unhashable and TypeError'd every keyed consumer (/project
+    findings, report, merge, diff, correlate) — main() catches no
+    TypeError."""
+
+    def test_dedup_and_group_keys_are_hashable(self):
+        hostile = {"function": {"evil": 1}, "file": ["a"],
+                   "line": ["x"], "vuln_type": {"t": 2}}
+        {dedup_key(hostile): 1}
+        {group_key(hostile): 1}
+
+    def test_diff_and_merge_survive_hostile_row(self):
+        import json
+        from tempfile import TemporaryDirectory
+
+        from core.project.diff import diff_runs
+        from core.project.merge import merge_findings
+        with TemporaryDirectory() as td:
+            a = Path(td) / "run_a"
+            b = Path(td) / "run_b"
+            for d in (a, b):
+                d.mkdir()
+            (a / "findings.json").write_text(json.dumps({"findings": [
+                {"id": "f1", "file": "a.c", "function": {"evil": 1},
+                 "line": 1, "vuln_type": "x", "status": "confirmed"},
+            ]}))
+            (b / "findings.json").write_text(json.dumps({"findings": [
+                {"id": "f1", "file": "a.c", "function": "ok",
+                 "line": 2, "vuln_type": "x", "status": "confirmed"},
+            ]}))
+            result = diff_runs(a, b)
+            self.assertEqual(result["summary"]["findings_a"], 1)
+            merged = merge_findings([a, b])
+            self.assertEqual(len(merged), 2)
+
+    def test_normal_keys_unchanged(self):
+        f = {"file": "a.c", "function": "p", "line": 7, "vuln_type": "x"}
+        self.assertEqual(dedup_key(f), ("a.c", "p", 7))
+        self.assertEqual(group_key(f), ("a.c", "p", "x"))

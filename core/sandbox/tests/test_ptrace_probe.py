@@ -16,32 +16,36 @@ the kernel reports.
 
 import sys as _sys
 import pytest as _pytest
+
+
+from core.testing.module_state import isolated_module_state
 pytestmark = _pytest.mark.skipif(
     _sys.platform != "linux",
     reason="Linux-only sandbox internals (mount-ns / Landlock / seccomp / ptrace tracer / pid1 shim) — see core/sandbox/_macos_spawn.py for the macOS path",
 )
 
 
-import logging
-import os
+import logging  # noqa: E402
+import os  # noqa: E402
+import signal  # noqa: E402
 
-import pytest
+import pytest  # noqa: E402
 
-from core.sandbox import ptrace_probe
-from core.sandbox import state
+from core.sandbox import ptrace_probe  # noqa: E402
+from core.sandbox import state  # noqa: E402
+from core.testing.module_bindings import patch_module_attribute  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def reset_probe_cache():
-    """Each test starts with no cached probe result.
-
-    The autouse conftest fixture restores the cache at TEST END, but
-    we also need it cleared at TEST START — multiple probes within a
-    test should observe a consistent starting point.
-    """
-    state._ptrace_available_cache = None
-    state._ptrace_unavailable_warned = False
-    yield
+def reset_probe_cache(monkeypatch):
+    """Own both the cold probe result and its warning latch."""
+    with isolated_module_state(state, {
+        "_ptrace_available_cache": None, "_ptrace_unavailable_warned": False,
+    }, lock=state._cache_lock):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
 
 
 class TestProbeReturnsBoolean:
@@ -68,7 +72,7 @@ class TestProbeCache:
     def test_subsequent_calls_use_cache(self, monkeypatch):
         # First call populates the cache.
         first = ptrace_probe.check_ptrace_available()
-        # Counter-pattern detection (NOT exception-based): the H1
+        # Counter-pattern detection (NOT exception-based): the
         # try/except in check_ptrace_available catches Exception, so a
         # raised AssertionError would be silently swallowed and the
         # cache-broken case would fail with a less-informative
@@ -160,7 +164,7 @@ class TestProbeWarning:
 
 
 class TestEintrSafe:
-    """G1 regression: a transient signal during the probe must not be
+    """Regression guard: a transient signal during the probe must not be
     misinterpreted as 'ptrace unavailable'. The waitpid call retries on
     EINTR rather than failing through to the False-return path."""
 
@@ -176,7 +180,7 @@ class TestEintrSafe:
                 raise InterruptedError("simulated EINTR from unrelated signal")
             return sentinel_status
 
-        monkeypatch.setattr(os, "waitpid", fake_waitpid)
+        patch_module_attribute(monkeypatch, ptrace_probe, "os", "waitpid", fake_waitpid)
 
         result = ptrace_probe._waitpid_eintr_safe(12345, 0)
         assert result == sentinel_status
@@ -188,14 +192,14 @@ class TestEintrSafe:
         def fake_waitpid(pid, options):
             raise ChildProcessError("ECHILD: no child")
 
-        monkeypatch.setattr(os, "waitpid", fake_waitpid)
+        patch_module_attribute(monkeypatch, ptrace_probe, "os", "waitpid", fake_waitpid)
 
         with pytest.raises(ChildProcessError):
             ptrace_probe._waitpid_eintr_safe(12345, 0)
 
 
 class TestProbeNeverRaises:
-    """H1 regression: a future change that introduces an unexpected
+    """Regression guard: a future change that introduces an unexpected
     raise in _run_probe must not crash sandbox setup. The public API
     must always return a bool, even when the internals misbehave."""
 
@@ -238,6 +242,82 @@ class TestProbeNoZombies:
         assert after - before <= 1, (
             f"real probe leaked children: before={before}, after={after}"
         )
+
+
+_FAKE_PID = 424242
+_STOPPED = (signal.SIGSTOP << 8) | 0x7F  # WIFSTOPPED(SIGSTOP)
+
+
+class _FakePtrace:
+    """Stands in for libc.ptrace; accepts the restype/argtypes pokes."""
+
+    restype = None
+    argtypes = None
+
+    def __call__(self, request, pid, addr, data):
+        return 0
+
+
+class _FakeLibc:
+    ptrace = _FakePtrace()
+
+
+def _run_probe_with(monkeypatch, waitpid_impl):
+    reaped = []
+    monkeypatch.setattr(ptrace_probe, "_get_libc", lambda: _FakeLibc())
+    patch_module_attribute(monkeypatch, ptrace_probe, "os", "fork", lambda: _FAKE_PID)
+    monkeypatch.setattr(
+        ptrace_probe, "_waitpid_eintr_safe", waitpid_impl,
+    )
+    monkeypatch.setattr(
+        ptrace_probe, "_try_kill_and_reap",
+        lambda pid: reaped.append(pid),
+    )
+    result = ptrace_probe._run_probe()
+    return result, reaped
+
+
+class TestFinalWaitpidCleanup:
+    """The final-waitpid OSError exit path must run _try_kill_and_reap
+    like every other failure path, so a probe child is never leaked
+    unreaped."""
+
+    def test_final_waitpid_error_reaps_child(self, monkeypatch):
+        calls = []
+
+        def fake_waitpid(pid, options, *, deadline=None):
+            calls.append(options)
+            if len(calls) == 1:
+                return (pid, _STOPPED)   # child stopped as expected
+            raise OSError("simulated final-waitpid failure")
+
+        result, reaped = _run_probe_with(monkeypatch, fake_waitpid)
+        assert result is False
+        assert reaped == [_FAKE_PID], (
+            "final-waitpid failure must reap the resumed child"
+        )
+
+    def test_first_waitpid_error_still_reaps(self, monkeypatch):
+        # Guard for the sibling failure paths.
+        def fake_waitpid(pid, options, *, deadline=None):
+            raise OSError("simulated first-waitpid failure")
+
+        result, reaped = _run_probe_with(monkeypatch, fake_waitpid)
+        assert result is False
+        assert reaped == [_FAKE_PID]
+
+    def test_happy_path_no_reap(self, monkeypatch):
+        calls = []
+
+        def fake_waitpid(pid, options, *, deadline=None):
+            calls.append(options)
+            if len(calls) == 1:
+                return (pid, _STOPPED)
+            return (pid, 0)  # WIFEXITED, status 0
+
+        result, reaped = _run_probe_with(monkeypatch, fake_waitpid)
+        assert result is True
+        assert reaped == []
 
 
 def _count_children() -> int:

@@ -7,11 +7,16 @@ with branches shown as splits and sink nodes styled distinctly.
 
 from __future__ import annotations
 
-from core.json import load_json
-from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from .sanitize import sanitize as _sanitize, sanitize_id as _sid
+from core.json import load_json
+
+from .caps import cap_elements, truncation_marker_lines
+from .sanitize import sanitize as _sanitize
+from .sanitize import sanitize_id as _sid
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _step_label(step: dict[str, Any]) -> str:
@@ -92,7 +97,14 @@ def _step_node_id(step: dict[str, Any], fallback: int | str = "?") -> str:
 def generate(data: dict[str, Any]) -> str:
     trace_id = data.get("id", "TRACE")
     name = _sanitize(data.get("name", trace_id))
+    # Mirror the branches guard below: a non-list ``steps`` or a
+    # non-dict element raised AttributeError and degraded the WHOLE
+    # trace file to "Could not render"; malformed elements drop, the
+    # rest of the trace still renders.
     steps = data.get("steps", [])
+    if not isinstance(steps, list):
+        steps = []
+    steps = [s for s in steps if isinstance(s, dict)]
     # Cap step count. Pre-fix `steps` was used unbounded;
     # legitimate large traces (deep call chains in
     # generated code, recursive analyses) produced
@@ -105,20 +117,31 @@ def generate(data: dict[str, Any]) -> str:
     #     causing reports to silently truncate at the
     #     wrong place.
     # 200 steps is the largest size that renders cleanly in
-    # mainstream Mermaid setups. Cap with a clear annotation
-    # in the diagram so the operator knows WHY truncation
-    # happened.
+    # mainstream Mermaid setups (now the shared DEFAULT_CAP in
+    # packages.diagram.caps — this generator is the pattern's
+    # origin). Cap with a clear annotation in the diagram so the
+    # operator knows WHY truncation happened.
     _MAX_STEPS = 200
-    truncated_count = 0
-    if len(steps) > _MAX_STEPS:
-        truncated_count = len(steps) - _MAX_STEPS
-        steps = steps[:_MAX_STEPS]
+    steps, truncated_count = cap_elements(steps, _MAX_STEPS)
+    # Same render-size rationale as the step cap above: every branch
+    # adds a node, an edge, and an O(len(steps)) matching pass, so an
+    # unbounded branches array re-opens the exact oversize failure
+    # modes the step cap closes.
+    _MAX_BRANCHES = 200
     branches = data.get("branches", [])
+    if not isinstance(branches, list):
+        branches = []
+    # Same drop-malformed idiom as steps above: `branch.get` on a
+    # non-dict element lost the whole trace to "Could not render".
+    branches = [b for b in branches if isinstance(b, dict)]
+    branches, truncated_branches = cap_elements(branches, _MAX_BRANCHES)
     attacker_control = data.get("attacker_control") or {}
 
 
     if not steps:
-        return f"flowchart TD\n    EMPTY[\"No steps in {trace_id}\"]"
+        # trace_id comes raw from the trace JSON; sanitize before it lands
+        # inside the quoted Mermaid label.
+        return f"flowchart TD\n    EMPTY[\"No steps in {_sanitize(trace_id)}\"]"
 
     lines = ["flowchart TD"]
     lines.append(f'    TITLE["{name}"]')
@@ -161,8 +184,7 @@ def generate(data: dict[str, Any]) -> str:
 
     # Main chain edges
     lines.append("")
-    for i in range(len(node_ids) - 1):
-        lines.append(f"    {node_ids[i]} --> {node_ids[i+1]}")
+    lines.extend(f"    {node_ids[i]} --> {node_ids[i+1]}" for i in range(len(node_ids) - 1))
 
     # Branch annotations as separate note nodes
     if branches:
@@ -247,14 +269,10 @@ def generate(data: dict[str, Any]) -> str:
     if sanitize_ids:
         lines.append(f"    class {sanitize_ids} sanitize")
 
-    if truncated_count > 0:
-        lines.append("")
-        lines.append(
-            f'    TRUNC["⚠ Diagram truncated: '
-            f'{truncated_count} additional steps not shown '
-            f'(cap {_MAX_STEPS})"]'
-        )
-        lines.append("    style TRUNC fill:#fef9c3,stroke:#a16207")
+    lines.extend(truncation_marker_lines(
+        "TRUNC", truncated_count, "steps", _MAX_STEPS))
+    lines.extend(truncation_marker_lines(
+        "TRUNCBR", truncated_branches, "branches", _MAX_BRANCHES))
 
     return "\n".join(lines)
 
@@ -262,5 +280,6 @@ def generate(data: dict[str, Any]) -> str:
 def generate_from_file(path: Path) -> str:
     data = load_json(path)
     if data is None:
-        raise ValueError(f"Failed to load {path}")
+        msg = f"Failed to load {path}"
+        raise ValueError(msg)
     return generate(data)

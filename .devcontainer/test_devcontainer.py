@@ -85,9 +85,16 @@ def check_binary(name: str, version_flag: str = "--version") -> Tuple[bool, str,
     """Check if a binary exists and get its version."""
     path = shutil.which(name)
     if not path:
-        return False, f"Not found in PATH", None
+        return False, "Not found in PATH", None
 
     try:
+        if name == "codeql" and Path(path).resolve().name == "raptor-codeql-bootstrap":
+            result = subprocess.run([path, "--raptor-status"], capture_output=True,
+                                    text=True, timeout=10, check=True)
+            import json
+            state = json.loads(result.stdout)
+            if not state["installed"]:
+                return True, "First-use installer ready; CLI not downloaded yet", None
         result = subprocess.run(
             [name, version_flag],
             capture_output=True,
@@ -107,6 +114,10 @@ def check_binary(name: str, version_flag: str = "--version") -> Tuple[bool, str,
 def check_python_package(name: str, min_version: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """Check if a Python package is installed."""
     try:
+        # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
+        # Devcontainer test — verifies named packages are installed.
+        # ``name`` comes from the harness's hardcoded list, not
+        # external input.
         module = importlib.import_module(name.replace('-', '_'))
         version = getattr(module, '__version__', None)
         if version is None:
@@ -114,7 +125,7 @@ def check_python_package(name: str, min_version: Optional[str] = None) -> Tuple[
             try:
                 import pkg_resources
                 version = pkg_resources.get_distribution(name).version
-            except:
+            except Exception:
                 pass
 
         if version and min_version:
@@ -153,7 +164,7 @@ def check_library(name: str) -> Tuple[bool, str]:
             )
             if name in result.stdout:
                 return True, "Found via ldconfig"
-        except:
+        except Exception:
             pass
 
     # Try pkg-config
@@ -165,7 +176,7 @@ def check_library(name: str) -> Tuple[bool, str]:
         )
         if result.returncode == 0:
             return True, "Found via pkg-config"
-    except:
+    except Exception:
         pass
 
     # Try finding .so file
@@ -198,7 +209,7 @@ int main() { return 0; }
                     timeout=10
                 )
                 return result.returncode == 0, "Supported by gcc"
-            except:
+            except Exception:
                 return False, "Failed to test"
 
         elif feature == "--coverage":
@@ -210,7 +221,7 @@ int main() { return 0; }
                     timeout=10
                 )
                 return result.returncode == 0, "Supported by gcc"
-            except:
+            except Exception:
                 return False, "Failed to test"
 
         elif feature == "-fsanitize=address":
@@ -222,7 +233,7 @@ int main() { return 0; }
                     timeout=10
                 )
                 return result.returncode == 0, "Supported by gcc (ASAN)"
-            except:
+            except Exception:
                 return False, "Failed to test"
 
         elif feature == "c++17":
@@ -242,7 +253,7 @@ int main() {
                     timeout=10
                 )
                 return result.returncode == 0, "Supported by g++"
-            except:
+            except Exception:
                 return False, "Failed to test"
 
     return False, "Unknown feature"
@@ -260,7 +271,7 @@ def check_rr_kernel() -> Tuple[bool, str]:
                 return True, f"perf_event_paranoid={value} (OK)"
             else:
                 return False, f"perf_event_paranoid={value} (needs <=1, run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid)"
-    except:
+    except Exception:
         return False, "Cannot read /proc/sys/kernel/perf_event_paranoid"
 
 
@@ -313,6 +324,9 @@ def check_raptor_imports() -> List[TestResult]:
 
     for module_name, description in packages_to_test:
         try:
+            # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
+            # ``module_name`` is from the harness's hardcoded list
+            # of expected package names. Not external input.
             importlib.import_module(module_name)
             results.append(TestResult(
                 name=f"import {module_name}",
@@ -465,15 +479,18 @@ def run_all_tests(verbose: bool = False, skip_optional: bool = False) -> List[Te
             used_by=used_by
         ))
 
-    # Check rr kernel configuration
+    # Check rr kernel configuration. rr RECORDING is the opt-in
+    # --privileged profile (documented in devcontainer.json); the
+    # default container is unprivileged, where perf counters are
+    # unavailable and this check legitimately reports not-configured.
     passed, msg = check_rr_kernel()
     results.append(TestResult(
         name="rr kernel config",
         category=Category.DEBUGGER,
         passed=passed,
-        required=True,  # Required when using --privileged devcontainer
+        required=False,  # opt-in rr recording profile only
         message=msg,
-        used_by=["rr-debugger skill (requires --privileged devcontainer)"]
+        used_by=["rr-debugger skill (opt-in --privileged rr profile)"]
     ))
 
     # =========================================================================
@@ -557,7 +574,7 @@ def run_all_tests(verbose: bool = False, skip_optional: bool = False) -> List[Te
         ))
 
     # =========================================================================
-    # PYTHON CORE PACKAGES (from requirements.txt)
+    # PYTHON CORE PACKAGES (from pyproject.toml)
     # =========================================================================
 
     python_core_packages = [
@@ -579,7 +596,7 @@ def run_all_tests(verbose: bool = False, skip_optional: bool = False) -> List[Te
         ))
 
     # =========================================================================
-    # PYTHON DEV PACKAGES (from requirements-dev.txt)
+    # PYTHON DEV PACKAGES (from the default uv development group)
     # =========================================================================
 
     python_dev_packages = [
@@ -800,7 +817,7 @@ def print_results(results: List[TestResult], verbose: bool = False):
     if optional_failed > 0:
         print(f"    {color('Optional:', Colors.YELLOW)}      {optional_failed}")
 
-    print(f"\n  * = Required dependency")
+    print("\n  * = Required dependency")
 
     if required_failed > 0:
         print(color("\n  STATUS: FAILED - Required dependencies missing!", Colors.RED + Colors.BOLD))
@@ -839,11 +856,11 @@ Examples:
 
     args = parser.parse_args()
 
-    # Change to repo root if needed
-    if os.path.exists("packages") or os.path.exists(".claude"):
-        pass  # Already in repo root
-    elif os.path.exists("../packages"):
-        os.chdir("..")
+    # The checks below run relative to the repo root. Anchor to this
+    # script's own location (parents[1] = .devcontainer → repo root)
+    # rather than guessing from the caller's cwd, so the script works
+    # no matter where it's invoked from.
+    os.chdir(Path(__file__).resolve().parents[1])
 
     results = run_all_tests(verbose=args.verbose, skip_optional=args.skip_optional)
 

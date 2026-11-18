@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# raptor-sage-mcp — stdio MCP transport wrapper for the SAGE sidecar.
+#
+# Claude Code invokes this as the command in .mcp.json. It execs into
+# the boot-payload enforcement shim (libexec/raptor-sage-mcp-guard),
+# which spawns the SAGE container's `sage-gui mcp` process and pumps
+# stdio through it. The shim verifies the server-emitted instruction
+# surfaces (MCP initialize.instructions + the sage_inception message)
+# against the operator-authorized record in
+# .sage/boot-payload.authorized ON the real session — a compromised
+# server can no longer serve clean text to the setup-time capture
+# probe and injected directives to live sessions. Unauthorized
+# surfaces are stripped and replaced with a loud warning; the session
+# itself stays up.
+#
+# Not a user-facing script — invoked by Claude Code via .mcp.json only.
+# Claude Code sets CLAUDECODE=1 when spawning MCP server processes,
+# satisfying the trust-marker check below.
+
+set -euo pipefail
+
+# ─── trust-marker check (do not source; inline by design) ───
+if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
+    echo "$0: internal dispatch script." >&2
+    echo "  Run via 'bin/raptor' instead." >&2
+    echo "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass." >&2
+    exit 2
+fi
+# ─── end trust-marker check ─────────────────────────────────
+
+# Resolve RAPTOR_DIR via symlink chain (same pattern as raptor-sage-setup).
+SCRIPT="$0"
+_symhops=0
+while [ -L "$SCRIPT" ]; do
+    _symhops=$((_symhops + 1))
+    if [ "$_symhops" -gt 32 ]; then
+        echo "raptor-sage-mcp: symlink hop limit exceeded resolving $0" >&2
+        exit 3
+    fi
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
+    SCRIPT="$(readlink "$SCRIPT")"
+    [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
+done
+unset _symhops
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
+
+# Users who access docker via group membership (sg docker) rather than
+# direct socket permissions need the sg wrapper. Re-exec under sg if
+# docker is not directly accessible; the re-exec inherits the
+# environment (CLAUDECODE, SAGE_*) and stdin/stdout for MCP.
+# Guard: only re-exec when sg docker actually fixes the problem,
+# otherwise exit — without this, a genuinely-down docker daemon
+# causes an infinite exec loop.
+if ! docker info >/dev/null 2>&1; then
+    if command -v sg >/dev/null 2>&1 && sg docker -c "docker info" >/dev/null 2>&1; then
+        # sg -c takes a single shell string: printf %q quotes every
+        # element exec-safely (an install path carrying a quote or $
+        # breaks naive "\"$0\"" interpolation) and forwards any args
+        # verbatim so the re-exec matches the original invocation.
+        exec sg docker -c "$(printf '%q ' "$0" "$@")"
+    fi
+    echo "raptor-sage-mcp: Docker daemon is not running or not accessible." >&2
+    exit 3
+fi
+
+CHILD=(docker compose
+    -f "$RAPTOR_DIR/core/sage/docker-compose.yml"
+    exec -T
+    -e "SAGE_HOME=/root/.sage"
+    -e "SAGE_API_URL=http://localhost:8080"
+    -e "SAGE_PROVIDER=${SAGE_PROVIDER:-claude-code}"
+    -e "SAGE_PROJECT=${SAGE_PROJECT:-raptor}"
+    -e "SAGE_IDENTITY_PATH=${SAGE_IDENTITY_PATH:-/root/.sage/agents/raptor-claude-code/agent.key}"
+    sage
+    /usr/local/bin/sage-gui mcp)
+
+# Sanctioned capture bypass — raptor-sage-setup's capture_boot_payload
+# ONLY. The guard (correctly) strips both instruction surfaces when no
+# authorized stamp exists yet, so piping the very capture that CREATES
+# the stamp through enforcement deadlocks bootstrap: the guard's own
+# warning text gets recorded and every later session mismatches
+# forever.
+#
+# THREAT: the variable alone must never arm the bypass. Claude Code's
+# .mcp.json can carry an env map for the server process, and RAPTOR's
+# cc_trust scan exempts RAPTOR_DIR's own config — so an attacker who
+# can edit .mcp.json (or otherwise inject ambient env) could set
+# RAPTOR_SAGE_BOOT_CAPTURE and silently kill the guard for EVERY
+# session. The bypass therefore requires a capability only the setup
+# pipeline has: the variable must carry a fresh random token matching
+# the 0600 nonce file run_boot_probe writes immediately before the
+# probe and deletes right after. Env-only attackers cannot mint the
+# file; anything that can already write .sage/ owns the stamp anyway.
+if [ -n "${RAPTOR_SAGE_BOOT_CAPTURE:-}" ]; then
+    CAPTURE_NONCE_FILE="$RAPTOR_DIR/.sage/boot-capture.nonce"
+    if [ -f "$CAPTURE_NONCE_FILE" ] && [ ! -L "$CAPTURE_NONCE_FILE" ] \
+        && [ "$(cat "$CAPTURE_NONCE_FILE" 2>/dev/null)" = "$RAPTOR_SAGE_BOOT_CAPTURE" ]; then
+        exec "${CHILD[@]}"
+    fi
+    echo "raptor-sage-mcp: RAPTOR_SAGE_BOOT_CAPTURE is set but does not match a fresh capture nonce — ignoring the bypass; boot-payload enforcement stays on." >&2
+fi
+
+# -I: the guard enforces the operator-authorized boot-payload stamp,
+# and a session environment's interpreter-startup hook (PYTHONPATH
+# sitecustomize, user-site .pth/usercustomize) could otherwise
+# monkeypatch its comparison before enforcement begins. Isolated mode
+# at the call site means the hook never loads at all; the guard's own
+# in-file re-exec covers routes that bypass this wrapper.
+exec python3 -I "$RAPTOR_DIR/libexec/raptor-sage-mcp-guard" \
+    --authorized "$RAPTOR_DIR/.sage/boot-payload.authorized" \
+    -- \
+    "${CHILD[@]}"

@@ -67,6 +67,30 @@ def _build_project(tmp_path: Path):
 
 
 class TestPrintAnnotations(unittest.TestCase):
+    def test_run_dir_vanishing_mid_listing_does_not_crash(self):
+        """A run dir deleted between the annotations-dir probe and the
+        mtime stat (`/project clean` racing the listing) must not turn
+        the read-only listing into a FileNotFoundError traceback."""
+        import shutil
+
+        with TemporaryDirectory() as d:
+            project = _build_project(Path(d))
+            run_a = project.get_run_dirs()[0]
+
+            real_stat = Path.stat
+
+            def racing_stat(self, *args, **kwargs):
+                if self == run_a:
+                    # Simulate the clean pass winning the race.
+                    shutil.rmtree(run_a, ignore_errors=True)
+                return real_stat(self, *args, **kwargs)
+
+            with patch.object(Path, "stat", racing_stat), \
+                    patch("sys.stdout", new_callable=StringIO) as buf:
+                _print_annotations(project)
+            # The surviving run and project-level notes still list.
+            self.assertIn("logout", buf.getvalue())
+
     def test_lists_all_unique_pairs(self):
         with TemporaryDirectory() as d:
             project = _build_project(Path(d))
@@ -89,7 +113,7 @@ class TestPrintAnnotations(unittest.TestCase):
             output = buf.getvalue()
             # The login row should show source=human (project-level),
             # not source=llm (run-a).
-            login_line = [l for l in output.splitlines() if "login" in l][0]
+            login_line = [line for line in output.splitlines() if "login" in line][0]
             assert "human" in login_line
 
     def test_filter_by_status(self):
@@ -193,7 +217,8 @@ class TestPrintAnnotations(unittest.TestCase):
             assert "2 annotation(s)" in output
 
     def test_since_filter_excludes_old(self):
-        import os, time
+        import os
+        import time
         with TemporaryDirectory() as d:
             project = _build_project(Path(d))
             # Backdate the run-level annotation file by 30 days.

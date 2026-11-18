@@ -1,29 +1,19 @@
-"""Tests for SMT witness → /exploit PoC seed wiring.
+"""Conditional SMT model and summary wiring through validation and rendering.
 
-Tier 4 SMT (packages/llm_analysis/dataflow_validation.py) attaches a
-satisfying assignment to `analysis["smt_witness"]` when Z3 proves the
-LLM-emitted path conditions are jointly satisfiable. The /exploit
-prompt builder reads that field and surfaces it to the exploit-gen
-LLM as a starter PoC — concrete trigger values that are guaranteed
-to make the program take the dangerous code path, so the LLM doesn't
-have to derive them from first principles (the hardest part of
-integer-overflow / OOB / null-deref exploitation).
-
-These tests cover the wiring at both ends:
-  1. _tier4_smt_refine attaches a structured `smt_witness` field
-     when the SMT outcome is sat (witness branch).
-  2. build_exploit_prompt_bundle includes a dedicated `smt-witness`
-     UntrustedBlock when the field is present, omits when absent.
-  3. The block content is a parseable PoC seed (concrete values in
-     decimal AND hex).
+Models describe encoded constraints, not proven program reachability or input
+controllability. Tests preserve diagnostic values, call identities and summary
+metadata without promoting them into verified program inputs.
 """
 
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from packages.llm_analysis.prompts.exploit import (
     _format_smt_witness,
@@ -68,20 +58,14 @@ class TestFormatSmtWitness:
         })
         assert "x > 0" in out
 
-    def test_emphasises_solver_guarantee(self):
-        """The whole point of the witness is "Z3 has done this work
-        for you, don't redo it." The framing must be unambiguous."""
+    def test_keeps_the_solver_model_conditional(self):
         out = _format_smt_witness({
             "model": {"x": 1},
             "path_conditions": ["x > 0"],
         })
-        # Must convey that the values are solver-verified, not
-        # LLM-guessed. Look for any of: "guaranteed", "verified",
-        # "solver", "Z3" — at least one must appear.
-        assert any(w in out.lower() for w in ("guarantee", "verified", "solver", "z3")), (
-            f"witness block should make it clear values are solver-verified; "
-            f"got: {out[:200]}"
-        )
+        assert "SMT diagnostic model" in out
+        assert "not verified program inputs" in out
+        assert "does not establish source reachability" in out
 
     def test_non_int_value_renders_unchanged(self):
         """Defensive: if the model has a non-int (shouldn't happen
@@ -145,8 +129,8 @@ class TestFormatSmtWitness:
         assert "_anon_0 (= strlen(argv[1])) = 32" in out
         assert "_anon_1 = 7" in out
         # _anon_1 not decorated since it's not in the map
-        lines = [l for l in out.split("\n") if "_anon_1" in l]
-        assert all("(= " not in l for l in lines)
+        lines = [line for line in out.split("\n") if "_anon_1" in line]
+        assert all("(= " not in line for line in lines)
 
 
 # -- build_exploit_prompt_bundle integration -------------------------------
@@ -268,7 +252,7 @@ class TestTier4AttachesSmtWitness:
         assert analysis["smt_witness"]["path_conditions"] == ["x > 0"]
         assert analysis["smt_witness"]["path_profile"] == "uint32"
 
-    def test_refuted_branch_does_not_attach_witness(self):
+    def test_unsat_branch_does_not_attach_witness(self):
         """Unsat conditions ⇒ no witness; analysis must be untouched
         on this axis (don't leak stale data from a prior call)."""
         from packages.llm_analysis.dataflow_validation import _tier4_smt_refine
@@ -298,7 +282,7 @@ class TestTier4AttachesSmtWitness:
             }
             _, outcome = _tier4_smt_refine(inconclusive, finding, analysis)
 
-        assert outcome == "smt_refuted"
+        assert outcome == "smt_no_change"
         assert "smt_witness" not in analysis
 
     def test_no_check_branch_does_not_attach_witness(self):
@@ -359,7 +343,12 @@ class TestSmtPathValidatorAnonMap:
     when it bubbles up to /exploit."""
 
     def _check(self, condition_text):
-        from packages.codeql.smt_path_validator import (
+        # These three tests drive the REAL solver ("feasible is
+        # True") — without z3 the substrate degrades to
+        # feasible=None/smt_available=False, which would hard-fail
+        # rather than skip (z3 is a documented optional dep).
+        pytest.importorskip("z3")
+        from core.smt_solver.path_feasibility import (
             check_path_feasibility, PathCondition,
         )
         from core.smt_solver.config import BV_C_UINT64
@@ -387,3 +376,125 @@ class TestSmtPathValidatorAnonMap:
         assert len(r.anon_var_map) == 2
         assert r.anon_var_map["_anon_0"] == "strlen(input)"
         assert r.anon_var_map["_anon_1"] == "strlen(other)"
+
+
+# -- Conditional constraint summaries ------------------------------------
+
+class TestWpPredicateInWitness:
+    """Summary metadata survives transport without a source-proof claim."""
+
+    def test_predicate_renders_as_a_conditional_summary(self):
+        out = _format_smt_witness({
+            "model": {"count": 268435457},
+            "path_conditions": ["count > 0x10000000"],
+            "path_profile": "uint32",
+            "wp_predicate": "(bvugt count #x10000000)",
+            "wp_conjuncts": ["count > 0x10000000"],
+            "wp_complete": True,
+        })
+        assert "Reduced SMT constraint summary" in out
+        assert "(bvugt count #x10000000)" in out
+
+    def test_no_predicate_no_hard_constraint(self):
+        """Backwards-compatible: a witness without wp_predicate (older
+        substrate, or no z3) renders exactly as before — no constraint
+        block."""
+        out = _format_smt_witness({
+            "model": {"x": 1},
+            "path_conditions": ["x > 0"],
+        })
+        assert "HARD CONSTRAINT" not in out
+
+    def test_incomplete_predicate_carries_caveat(self):
+        out = _format_smt_witness({
+            "model": {"x": 1},
+            "wp_predicate": "(bvugt x #x00000000)",
+            "wp_conjuncts": ["x > 0"],
+            "wp_complete": False,
+        })
+        assert "Reduced SMT constraint summary" in out
+        assert "reduction completeness is unestablished" in out
+
+    def test_tier4_attaches_wp_fields(self):
+        """validate_path's wp_* fields flow through _tier4_smt_refine
+        onto analysis['smt_witness']."""
+        from packages.llm_analysis.dataflow_validation import _tier4_smt_refine
+        from packages.hypothesis_validation.result import ValidationResult
+
+        analysis = {"path_conditions": ["x > 5"], "path_profile": "uint32"}
+        finding = {"finding_id": "f1"}
+        confirmed = ValidationResult(verdict="confirmed", evidence=[], iterations=1)
+
+        with patch(
+            "packages.exploit_feasibility.smt_path.validate_path"
+        ) as mock_validate:
+            mock_validate.return_value = {
+                "feasible": True,
+                "smt_available": True,
+                "model": {"x": 6},
+                "reasoning": "satisfiable",
+                "satisfied": [],
+                "unsatisfied": [],
+                "unknown": [],
+                "unknown_reasons": [],
+                "wp_predicate": "(bvugt x #x00000005)",
+                "wp_conjuncts": ["x > 5"],
+                "wp_complete": True,
+            }
+            _, outcome = _tier4_smt_refine(confirmed, finding, analysis)
+
+        assert outcome == "smt_witness"
+        sw = analysis["smt_witness"]
+        assert sw["wp_predicate"] == "(bvugt x #x00000005)"
+        assert sw["wp_conjuncts"] == ["x > 5"]
+        assert sw["wp_complete"] is True
+
+    def test_predicate_reaches_exploit_prompt_end_to_end(self):
+        """The predicate surfaces in the assembled exploit prompt text."""
+        bundle = build_exploit_prompt_bundle(
+            rule_id="r1", file_path="/x.c", start_line=42, level="warning",
+            analysis={
+                "is_exploitable": True,
+                "smt_witness": {
+                    "model": {"count": 268435457},
+                    "wp_predicate": "(bvugt count #x10000000)",
+                    "wp_conjuncts": ["count > 0x10000000"],
+                    "wp_complete": True,
+                },
+            },
+        )
+        text = "\n".join(m.content for m in bundle.messages)
+        assert "(bvugt count #x10000000)" in text
+        assert "Reduced SMT constraint summary" in text
+
+
+class TestWitnessValueRendering:
+    """Signed profiles (int32/int64) yield negative witness ints and
+    fallback extraction can hand back bools — the hex rendering must
+    stay well-formed (the LLM copies these as layout constants)."""
+
+    def test_negative_value_renders_signed_hex(self):
+        text = _format_smt_witness({
+            "model": {"n": -31},
+            "path_conditions": ["n < 0"],
+            "path_profile": "int32",
+        })
+        assert "n = -31 (-0x1f)" in text
+        assert "0x-" not in text
+
+    def test_bool_value_rendered_bare(self):
+        text = _format_smt_witness({
+            "model": {"flag": True},
+            "path_conditions": [],
+            "path_profile": "int32",
+        })
+        assert "flag = True" in text
+        assert "(0x1)" not in text
+
+    def test_positive_value_unchanged(self):
+        text = _format_smt_witness({
+            "model": {"n": 32},
+            "path_conditions": [],
+            "path_profile": "uint64",
+        })
+        assert "n = 32 (0x20)" in text

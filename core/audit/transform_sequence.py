@@ -1,0 +1,1020 @@
+"""Detect transform-sequencing errors in sanitization pipelines.
+
+Finds functions that apply multiple transforms to the same data and
+checks whether the ordering is correct.  A sanitizer pipeline that
+runs steps in the wrong order can be bypassed — e.g. stripping
+invisible Unicode *after* a markdown-defanging regex allows a ZWS
+to defeat the regex.
+
+Two modes:
+
+1. **Catalog-matched** (mechanical): a static table of known ordering
+   constraints produces high-confidence violations with no LLM.
+2. **Candidate extraction**: multi-step transform sequences with
+   security-relevant names are surfaced for LLM review.
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import re
+from bisect import bisect_right
+from itertools import islice
+from dataclasses import dataclass, field
+from typing import Any, TYPE_CHECKING
+
+from .prompt_defence import sanitise_for_prompt
+from core.source.lines import split_lines
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TransformStep:
+    """One step in a transform chain."""
+
+    call_name: str
+    line: int
+    args_summary: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "call_name": self.call_name,
+            "line": self.line,
+            "args_summary": self.args_summary,
+        }
+
+
+@dataclass
+class TransformSequence:
+    """An ordered chain of transforms applied to the same data."""
+
+    file: str
+    function: str
+    variable: str
+    steps: list[TransformStep] = field(default_factory=list)
+
+    @property
+    def line_span(self) -> tuple[int, int]:
+        if not self.steps:
+            return (0, 0)
+        return (self.steps[0].line, self.steps[-1].line)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "file": self.file,
+            "function": self.function,
+            "variable": self.variable,
+            "steps": [s.to_dict() for s in self.steps],
+            "line_span": list(self.line_span),
+        }
+
+
+@dataclass
+class TransformOrderViolation:
+    """A detected ordering violation in a transform chain."""
+
+    file: str
+    function: str
+    line: int
+    sequence: list[str]
+    violation: str
+    fix: str
+    confidence: str
+    catalog_rule: str | None = None
+    siblings_correct: int = 0
+    sibling_locations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "file": self.file,
+            "function": self.function,
+            "line": self.line,
+            "sequence": self.sequence,
+            "violation": self.violation,
+            "fix": self.fix,
+            "confidence": self.confidence,
+            "catalog_rule": self.catalog_rule,
+        }
+        if self.siblings_correct:
+            d["siblings_correct"] = self.siblings_correct
+            d["sibling_locations"] = self.sibling_locations
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Ordering catalog
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _OrderingRule:
+    """A must-precede ordering constraint."""
+
+    name: str
+    must_precede_patterns: list[re.Pattern[str]]
+    must_follow_patterns: list[re.Pattern[str]]
+    reason: str
+    fix_template: str
+
+    def matches_precede(self, call_name: str) -> bool:
+        return any(p.search(call_name) for p in self.must_precede_patterns)
+
+    def matches_follow(self, call_name: str) -> bool:
+        return any(p.search(call_name) for p in self.must_follow_patterns)
+
+
+def _pat(*patterns: str) -> list[re.Pattern[str]]:
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
+
+
+_ENUMERATE_IMPL = enumerate
+_ANY_IMPL = any
+_ALL_IMPL = all
+_SET_IMPL = set
+_LEN_IMPL = len
+_PATTERN_TYPE = re.Pattern
+_RULE_TYPE = _OrderingRule
+_SEQUENCE_TYPE = TransformSequence
+_STEP_TYPE = TransformStep
+_VIOLATION_TYPE = TransformOrderViolation
+_PRECEDE_IMPL = _OrderingRule.matches_precede
+_FOLLOW_IMPL = _OrderingRule.matches_follow
+
+
+# Keyword-pair gaps in the ordering rules are bounded ({0,200}), same
+# convention as the double-encoding table below: an unbounded `.*` gap
+# makes every occurrence of the first keyword re-scan the rest of the
+# scanned name for the second — quadratic on hostile-shaped call names.
+# Real call names sit far inside the bound; a longer name stops
+# matching the rule instead of scanning without bound.
+ORDERING_RULES: list[_OrderingRule] = [
+    _OrderingRule(
+        name="unicode_before_regex",
+        must_precede_patterns=_pat(
+            r"unicode.{0,200}norm", r"nfkc|nfkd|nfc|nfd",
+            r"strip.{0,200}(?:invisible|zero.?width|control)",
+            r"remove.{0,200}(?:invisible|zero.?width|bidi|control)",
+        ),
+        must_follow_patterns=_pat(
+            r"re\.sub", r"re\.match", r"re\.search", r"re\.findall",
+            r"defang", r"neutrali[sz]e",
+            r"regex.{0,200}(?:replace|match|filter)",
+        ),
+        reason="Unicode normalization/stripping must precede regex matching — "
+               "invisible chars can defeat regex anchors and patterns",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="decode_before_path_check",
+        must_precede_patterns=_pat(
+            r"url.{0,200}decode", r"unquote", r"percent.{0,200}decode",
+            r"urllib.{0,200}unquote",
+        ),
+        must_follow_patterns=_pat(
+            r"path.{0,200}(?:check|valid|travers|saniti)",
+            r"(?:check|valid|saniti).{0,200}path",
+            r"os\.path\.(?:basename|normpath|realpath)",
+            r"is_safe_path", r"check_path",
+        ),
+        reason="URL-encoded traversal sequences (..%2F) bypass path checks "
+               "unless decoded first",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="entity_decode_before_xss_filter",
+        must_precede_patterns=_pat(
+            r"html.{0,200}(?:unescape|decode|entity)",
+            r"unescape.{0,200}html",
+            r"(?:decode|parse).{0,200}entit",
+        ),
+        must_follow_patterns=_pat(
+            r"(?:xss|html).{0,200}(?:filter|sanitiz|clean|strip|escape)",
+            r"(?:filter|sanitiz|clean|strip).{0,200}(?:xss|html|tag)",
+            r"bleach", r"html\.escape", r"markupsafe",
+        ),
+        reason="HTML-entity-encoded characters (&#60;) bypass XSS filters "
+               "unless decoded first",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="case_normalize_before_blocklist",
+        must_precede_patterns=_pat(
+            r"\.lower\b", r"\.upper\b", r"\.casefold\b",
+            r"case.{0,200}norm", r"to_?lower", r"to_?upper",
+        ),
+        must_follow_patterns=_pat(
+            r"block.?list", r"deny.?list", r"banned", r"forbidden",
+            r"disallow", r"reject.{0,200}(?:name|word|term)",
+        ),
+        reason="Mixed-case input bypasses case-sensitive blocklist checks",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="null_strip_before_extension_check",
+        must_precede_patterns=_pat(
+            r"(?:strip|remove|replace).{0,200}(?:null|\\x00|\x00|\\0)",
+            r"\.replace\(.{0,200}(?:null|\\x00|\\0)",
+        ),
+        must_follow_patterns=_pat(
+            r"(?:check|valid|allow).{0,200}(?:ext|suffix|file.?type)",
+            r"\.endswith\b", r"splitext\b", r"file.{0,200}extension",
+        ),
+        reason="Null bytes truncate filenames in some APIs, bypassing "
+               "extension checks",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="backslash_normalize_before_path_check",
+        must_precede_patterns=_pat(
+            r"\.replace\(.{0,200}(?:\\\\|backslash).{0,200}(?:/|slash)",
+            r"backslash.{0,200}norm", r"normalize.{0,200}(?:sep|slash|path)",
+        ),
+        must_follow_patterns=_pat(
+            r"path.{0,200}(?:check|valid|travers|saniti)",
+            r"\.startswith\(.{0,200}(?:/|\\\\)",
+        ),
+        reason="Backslash path separators bypass forward-slash-only "
+               "traversal checks",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="whitespace_strip_before_header_parse",
+        must_precede_patterns=_pat(
+            r"\.strip\b", r"\.lstrip\b",
+            r"strip.{0,200}(?:whitespace|space|ws)",
+        ),
+        must_follow_patterns=_pat(
+            r"(?:parse|split).{0,200}header",
+            r"header.{0,200}(?:parse|split|extract)",
+            r"content.?type.{0,200}parse",
+        ),
+        reason="Leading whitespace confuses header parsers and can cause "
+               "request smuggling",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="crlf_strip_before_header_inject",
+        must_precede_patterns=_pat(
+            r"(?:strip|remove|replace).{0,200}(?:crlf|\\r\\n|\\n|newline|cr|lf)",
+            r"\.replace\(.{0,200}(?:\\r|\\n)",
+        ),
+        must_follow_patterns=_pat(
+            r"(?:set|add|write).{0,200}header",
+            r"header.{0,200}(?:set|add|inject|write)",
+            r"response\.header",
+        ),
+        reason="CRLF characters in header values enable header injection",
+        fix_template="move {precede} before {follow}",
+    ),
+    _OrderingRule(
+        name="percent_decode_before_sql_filter",
+        must_precede_patterns=_pat(
+            r"url.{0,200}decode", r"unquote", r"percent.{0,200}decode",
+        ),
+        must_follow_patterns=_pat(
+            r"sql.{0,200}(?:filter|sanitiz|escape|param)",
+            r"(?:filter|sanitiz|escape).{0,200}sql",
+            r"quote.{0,200}(?:literal|string|ident)",
+        ),
+        reason="Percent-encoded quotes (%27) bypass SQL sanitization",
+        fix_template="move {precede} before {follow}",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Double-encoding detection
+# ---------------------------------------------------------------------------
+# Transform classes where applying the same decode/encode twice in a chain
+# indicates potential double-encoding bypass: an intermediate security check
+# saw the still-encoded form while the final consumer sees the decoded form.
+
+# Keyword-pair gaps are bounded ({0,200}): an unbounded `.*` gap
+# makes every occurrence of the first keyword re-scan the rest of the
+# scanned text for the second — quadratic on hostile-shaped text.
+# Real decode/encode spellings keep the pair within one identifier or
+# short phrase; beyond the bound the class simply does not attach.
+_DOUBLE_ENCODE_CLASSES: list[tuple[str, re.Pattern[str]]] = [
+    ("url_decode", re.compile(
+        r"url.{0,200}decode|unquote|percent.{0,200}decode|decodeURI|"
+        r"urllib.{0,200}unquote|url\.QueryUnescape|url\.PathUnescape",
+        re.IGNORECASE,
+    )),
+    ("html_decode", re.compile(
+        r"html.{0,200}(?:unescape|decode|entity)|unescape.{0,200}html|"
+        r"(?:decode|parse).{0,200}entit|html_entity_decode|he\.decode",
+        re.IGNORECASE,
+    )),
+    ("base64_decode", re.compile(
+        r"base64.{0,200}decode|b64decode|atob|Base64\.decode",
+        re.IGNORECASE,
+    )),
+    ("url_encode", re.compile(
+        r"url.{0,200}encode|urllib.{0,200}quote|percent.{0,200}encode|"
+        r"encodeURI|url\.QueryEscape|url\.PathEscape|"
+        r"(?:percent|url|uri|path).{0,200}quote|quote_plus",
+        re.IGNORECASE,
+    )),
+]
+
+
+def _matching_positions(names: list[str], pattern) -> list[int]:
+    """Reuse native name classifications; foreign matchers retain direct calls."""
+    if (type(pattern) is not _PATTERN_TYPE or all is not _ALL_IMPL
+            or set is not _SET_IMPL or len is not _LEN_IMPL or len(names) < 64
+            or not all(type(n) is str and len(n) <= 512 for n in islice(names, 64))
+            or len(set(islice(names, 64))) > 16):
+        return [i for i, name in enumerate(names) if pattern.search(name)]
+    matches: dict[str, bool] = {}
+    positions: list[int] = []
+    for i, name in enumerate(names):
+        if type(name) is str and len(name) <= 512:
+            matched: bool | re.Match[str] | None = matches.get(name)
+            if matched is None:
+                matched = pattern.search(name) is not None
+                if len(matches) < 256:
+                    matches[name] = matched
+        else:
+            matched = pattern.search(name)
+        if matched:
+            positions.append(i)
+    return positions
+
+
+def _check_duplicate_transforms(
+    seq: TransformSequence,
+) -> list[TransformOrderViolation]:
+    """Flag sequences where the same transform appears twice.
+
+    Two detection modes:
+    1. Encoding-class: double URL-decode, double base64-decode, etc.
+       (bypass risk when a security check sits between them).
+    2. Exact-name: same function called twice on the same variable
+       (likely copy-paste error or redundant processing).
+    """
+    violations: list[TransformOrderViolation] = []
+    step_names = [s.call_name for s in seq.steps]
+
+    encoding_flagged: set = set()
+
+    for class_name, pattern in _DOUBLE_ENCODE_CLASSES:
+        positions = (_matching_positions(step_names, pattern) if _LEN_IMPL(step_names) >= 64
+                     else [i for i, name in enumerate(step_names) if pattern.search(name)])
+        if len(positions) < 2:
+            continue
+
+        encoding_flagged.update(positions)
+        violations.append(TransformOrderViolation(
+            file=seq.file,
+            function=seq.function,
+            line=seq.steps[positions[0]].line,
+            sequence=step_names,
+            violation=(
+                f"double {class_name}: '{step_names[positions[0]]}' and "
+                f"'{step_names[positions[1]]}' in the same chain — "
+                f"if a security check runs between them, it sees the "
+                f"still-encoded form while the final consumer sees "
+                f"the decoded form"
+            ),
+            fix=(
+                f"verify no security-relevant check runs between "
+                f"'{step_names[positions[0]]}' and "
+                f"'{step_names[positions[1]]}'"
+            ),
+            confidence="medium",
+            catalog_rule="double_encoding",
+        ))
+
+    seen: dict[str, int] = {}
+    for i, name in enumerate(step_names):
+        if i in encoding_flagged:
+            continue
+        if name in seen and seen[name] not in encoding_flagged:
+            violations.append(TransformOrderViolation(
+                file=seq.file,
+                function=seq.function,
+                line=seq.steps[i].line,
+                sequence=step_names,
+                violation=(
+                    f"duplicate transform: '{name}' applied twice to "
+                    f"`{seq.variable}` (steps {seen[name] + 1} and {i + 1}) — "
+                    f"likely copy-paste error or redundant processing"
+                ),
+                fix=f"verify '{name}' is intentionally applied twice",
+                confidence="medium",
+                catalog_rule="duplicate_transform",
+            ))
+        seen[name] = i
+
+    return violations
+
+
+# Names that mark a transform as security-relevant.
+_SECURITY_TRANSFORM_RE = re.compile(
+    r"(?:sanitiz|strip|escape|encode|decode|filter|clean|normaliz|"
+    r"valid|defang|neutraliz|purif|bleach|quote|unquote|urlencode|"
+    r"urldecode|htmlescape|sqlescape|xss|crlf|inject|travers)",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# AST-based sequence extraction (Python)
+# ---------------------------------------------------------------------------
+
+def _first_arg_summary(node: ast.Call) -> str:
+    """Best-effort string summary of a call's first argument."""
+    if not node.args:
+        return ""
+    arg = node.args[0]
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        val = arg.value
+        if len(val) > 50:
+            val = val[:47] + "..."
+        return val
+    return ""
+
+
+class _SequenceExtractor(ast.NodeVisitor):
+    """Extract transform sequences from a single function body."""
+
+    def __init__(self, file: str, func_name: str, func_lineno: int) -> None:
+        self.file = file
+        self.func_name = func_name
+        self.func_lineno = func_lineno
+        self.sequences: list[TransformSequence] = []
+        self._reassign_chains: dict[str, list[TransformStep]] = {}
+        # Call nodes that are interior links of an already-emitted
+        # method chain: their steps are a strict sub-chain of the
+        # enclosing call's and must not be emitted separately (the
+        # tree-sitter extractor guards this with _is_chain_object).
+        self._chain_interior: set[ast.Call] = set()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if len(node.targets) != 1:
+            self.generic_visit(node)
+            return
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            self.generic_visit(node)
+            return
+
+        var_name = target.id
+        call_name, args_summary = self._call_name(node.value)
+        if call_name:
+            chain = self._reassign_chains.setdefault(var_name, [])
+            chain.append(TransformStep(
+                call_name=call_name,
+                line=node.lineno,
+                args_summary=args_summary,
+            ))
+        self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        if isinstance(node.value, ast.Call):
+            call = node.value
+            if isinstance(call.func, ast.Attribute):
+                obj = call.func.value
+                if isinstance(obj, ast.Name):
+                    var_name = obj.id
+                    method_name = call.func.attr
+                    chain = self._reassign_chains.setdefault(var_name, [])
+                    chain.append(TransformStep(
+                        call_name=f".{method_name}",
+                        line=node.lineno,
+                        args_summary=_first_arg_summary(call),
+                    ))
+        self.generic_visit(node)
+
+    def _call_name(self, node: ast.expr) -> tuple[str, str]:
+        """Extract the call name and first-arg summary from an expression."""
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                return node.func.id, _first_arg_summary(node)
+            if isinstance(node.func, ast.Attribute):
+                parts = self._dotted_name(node.func)
+                return parts, _first_arg_summary(node)
+            return "", ""
+        return "", ""
+
+    @staticmethod
+    def _dotted_name(node: ast.Attribute) -> str:
+        parts = [node.attr]
+        obj = node.value
+        while isinstance(obj, ast.Attribute):
+            parts.append(obj.attr)
+            obj = obj.value
+        if isinstance(obj, ast.Name):
+            parts.append(obj.id)
+        return ".".join(reversed(parts))
+
+    def _extract_method_chain(self, node: ast.expr) -> TransformSequence | None:
+        """Extract a method chain like x.strip().lower().replace(...)."""
+        steps: list[TransformStep] = []
+        var_name = ""
+        current = node
+
+        interior: list[ast.Call] = []
+        while isinstance(current, ast.Call):
+            if isinstance(current.func, ast.Attribute):
+                steps.append(TransformStep(
+                    call_name=f".{current.func.attr}",
+                    line=current.lineno,
+                    args_summary=_first_arg_summary(current),
+                ))
+                current = current.func.value
+                if isinstance(current, ast.Call):
+                    interior.append(current)
+            else:
+                break
+
+        if isinstance(current, ast.Name):
+            var_name = current.id
+
+        if len(steps) < 2:
+            return None
+        self._chain_interior.update(interior)
+
+        steps.reverse()
+        return TransformSequence(
+            file=self.file,
+            function=self.func_name,
+            variable=var_name,
+            steps=steps,
+        )
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Check for method chains — but never re-emit the prefixes of a
+        # chain already extracted from an enclosing call node.
+        if node not in self._chain_interior:
+            chain = self._extract_method_chain(node)
+            if chain:
+                self.sequences.append(chain)
+        self.generic_visit(node)
+
+    def finalize(self) -> list[TransformSequence]:
+        """Flush reassignment chains into sequences."""
+        for var_name, steps in self._reassign_chains.items():
+            if len(steps) >= 2:
+                self.sequences.append(TransformSequence(
+                    file=self.file,
+                    function=self.func_name,
+                    variable=var_name,
+                    steps=steps,
+                ))
+        return self.sequences
+
+
+def _extract_sequences_python(
+    file_path: str, source: str,
+) -> list[TransformSequence]:
+    """Extract transform sequences from Python source via AST."""
+    try:
+        tree = ast.parse(source, filename=file_path)
+    except SyntaxError:
+        return []
+
+    all_seqs: list[TransformSequence] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            extractor = _SequenceExtractor(file_path, node.name, node.lineno)
+            extractor.visit(node)
+            all_seqs.extend(extractor.finalize())
+
+    return all_seqs
+
+
+# ---------------------------------------------------------------------------
+# Regex-based sequence extraction (C/C++/Go/JS)
+# ---------------------------------------------------------------------------
+
+_C_EXTS = frozenset((".c", ".h", ".cc", ".cpp", ".cxx", ".go", ".js", ".ts"))
+
+# A function header needs a POSITIVE signal: at least one leading
+# type/keyword prefix, or a brace-terminated line (below). With every
+# prefix optional (the old shape) any bare call statement
+# (``log_msg(x);``) matched as a header and reset the accumulated
+# variable chains, leaving the fallback near-blind on real C. The
+# cost: headers with the return type on its own line (kernel style)
+# are no longer recognised, so a chain can be attributed to the
+# PREVIOUS function's name — sequence recall is preferred over label
+# precision in this tree-sitter-absent fallback.
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs (identical match set per line).
+# Bounded iteration counts on the keyword and type loops: the two
+# loops overlap on every word (keywords are \w+), so the unbounded
+# spelling let a qualifier-word line with no paren drive the engine
+# through every split of the run between them — worse than quadratic
+# on hostile lines. Bound trade-off, both directions: larger keeps
+# absurd headers matching but raises the per-line backtracking
+# ceiling; smaller is faster but a real header beyond the bound
+# stops matching. 16 words per loop sits far above real headers
+# while capping per-line work at a constant.
+_FUNC_HEADER_RE = re.compile(
+    r"^[^\S\n]*(?:(?:static|inline|void|int|char|unsigned|const|auto|"
+    r"func|function|export|async|public|private|protected|"
+    r"internal|override|virtual|abstract|final|synchronized|"
+    r"fn|def)\s+){1,16}"
+    r"(?:\([^)]*\)\s+)?"  # Go method receiver: func (s *Server) Handle(
+    r"(?:\w+\s+){0,16}"    # return type(s): int, *Item, []byte
+    r"(\w+)\s*\(",
+    re.MULTILINE,
+)
+
+# Brace-terminated header (``size_t copy_data(char *p) {``) for
+# return types outside the keyword list; the name must not be a
+# control-flow keyword (``if (...) {`` is not a header).
+_FUNC_HEADER_BRACE_RE = re.compile(
+    r"^\s*(?:[\w*\[\]&:<>,]+\s+)*(\w+)\s*\([^;{]*\)\s*\{\s*$",
+)
+
+_CONTROL_FLOW_NAMES = frozenset(
+    {"if", "for", "while", "switch", "catch", "do", "else", "return"}
+)
+
+# \b keeps the unanchored scan from restarting inside an identifier
+# run (quadratic); earliest-start matches and captures unchanged.
+# The dotted chain is bounded: a ".a"-unit storm makes every
+# component start re-walk the run when no call paren follows —
+# quadratic in the line (beyond 32 links the match binds the
+# last 32 components; real call chains sit far inside that).
+_CALL_RE = re.compile(
+    r"\b(\w+(?:\.\w+){0,32})\s*\(",
+)
+
+
+def _extract_sequences_c(
+    file_path: str, source: str,
+) -> list[TransformSequence]:
+    """Extract transform sequences in C/Go/JS/TS/Java via tree-sitter.
+
+    Falls back to regex when tree-sitter is unavailable.
+    """
+    try:
+        from .ts_extract import extract_call_chains
+    except ImportError:
+        return _extract_sequences_c_regex(file_path, source)
+
+    chains = extract_call_chains(file_path, source)
+    if chains is None:
+        return _extract_sequences_c_regex(file_path, source)
+
+    all_seqs: list[TransformSequence] = []
+    for chain in chains:
+        steps = [
+            TransformStep(
+                call_name=s.call_name,
+                line=s.line,
+                args_summary=s.first_arg,
+            )
+            for s in chain.steps
+        ]
+        if len(steps) >= 2:
+            all_seqs.append(TransformSequence(
+                file=chain.file,
+                function=chain.function,
+                variable=chain.variable,
+                steps=steps,
+            ))
+    return all_seqs
+
+
+def _extract_sequences_c_regex(
+    file_path: str, source: str,
+) -> list[TransformSequence]:
+    """Regex fallback for transform-sequence extraction."""
+    all_seqs: list[TransformSequence] = []
+    lines = split_lines(source)
+    current_func = "<module>"
+    var_chains: dict[str, list[TransformStep]] = {}
+
+    for lineno_0, line in enumerate(lines):
+        lineno = lineno_0 + 1
+        fm = _FUNC_HEADER_RE.match(line)
+        if not fm:
+            bm = _FUNC_HEADER_BRACE_RE.match(line)
+            if bm and bm.group(1) not in _CONTROL_FLOW_NAMES:
+                fm = bm
+        if fm:
+            for var, steps in var_chains.items():
+                if len(steps) >= 2:
+                    all_seqs.append(TransformSequence(
+                        file=file_path,
+                        function=current_func,
+                        variable=var,
+                        steps=steps,
+                    ))
+            var_chains = {}
+            current_func = fm.group(1)
+            continue
+
+        assign_m = re.match(
+            r"\s*(?:(?:const|let|var)\s+)?"  # JS declarations
+            r"(\w+)\s*(?::=|=)\s*"           # LHS and = or :=
+            r"(\w+(?:\.\w+)*)\s*\(",         # RHS call
+            line,
+        )
+        if assign_m:
+            var = assign_m.group(1)
+            call = assign_m.group(2)
+            rest = line[assign_m.end():]
+            chain = var_chains.setdefault(var, [])
+            first_arg = ""
+            str_m = re.search(r'"([^"]{1,50})"', rest)
+            if str_m:
+                first_arg = str_m.group(1)
+            chain.append(TransformStep(
+                call_name=call, line=lineno, args_summary=first_arg,
+            ))
+
+    for var, steps in var_chains.items():
+        if len(steps) >= 2:
+            all_seqs.append(TransformSequence(
+                file=file_path,
+                function=current_func,
+                variable=var,
+                steps=steps,
+            ))
+
+    return all_seqs
+
+
+# ---------------------------------------------------------------------------
+# Violation checking against catalog
+# ---------------------------------------------------------------------------
+
+def _check_sequence_against_catalog(
+    seq: TransformSequence,
+) -> list[TransformOrderViolation]:
+    """Check one sequence against all ordering rules."""
+    violations: list[TransformOrderViolation] = []
+    step_names = [s.call_name for s in seq.steps]
+
+    for rule in ORDERING_RULES:
+        # Find all positions where must_precede and must_follow match
+        precede_positions: list[int] = []
+        follow_positions: list[int] = []
+        native_positions = enumerate is _ENUMERATE_IMPL
+
+        for i, name in enumerate(step_names):
+            if rule.matches_precede(name):
+                precede_positions.append(i)
+            if rule.matches_follow(name):
+                follow_positions.append(i)
+
+        if not precede_positions or not follow_positions:
+            continue
+
+        # Violation: a must_follow step appears BEFORE a must_precede step
+        for fi in follow_positions:
+            eligible = (islice(precede_positions, bisect_right(precede_positions, fi), None)
+                        if native_positions and _LEN_IMPL(precede_positions) >= 8 else precede_positions)
+            violations.extend(TransformOrderViolation(
+                        file=seq.file,
+                        function=seq.function,
+                        line=seq.steps[fi].line,
+                        sequence=step_names,
+                        violation=(
+                            f"'{step_names[pi]}' must precede "
+                            f"'{step_names[fi]}': {rule.reason}"
+                        ),
+                        fix=rule.fix_template.format(
+                            precede=step_names[pi],
+                            follow=step_names[fi],
+                        ),
+                        confidence="high",
+                        catalog_rule=rule.name,
+                    ) for pi in eligible if fi < pi)
+
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def extract_transform_sequences(
+    source_text: dict[str, str],
+    *,
+    extra_security_names: frozenset | None = None,
+) -> list[TransformSequence]:
+    """Extract all multi-step transform sequences from source files.
+
+    Returns sequences with ≥2 steps where at least 2 steps have
+    security-relevant names.  Intended for LLM review injection.
+
+    *extra_security_names*: additional function names considered
+    security-relevant (e.g. from IRIS spec store).
+    """
+    extra = extra_security_names or frozenset()
+    all_seqs: list[TransformSequence] = []
+
+    for file_path, source in source_text.items():
+        if file_path.endswith(".py"):
+            seqs = _extract_sequences_python(file_path, source)
+        elif any(file_path.endswith(e) for e in _C_EXTS):
+            seqs = _extract_sequences_c(file_path, source)
+        else:
+            continue
+
+        for seq in seqs:
+            # Method-chain steps carry ".method"-shaped call names —
+            # match the extra (learned) names against the bare tail
+            # too, or the whole extra-names arm is dead for chains.
+            security_count = sum(
+                1 for s in seq.steps
+                if (_SECURITY_TRANSFORM_RE.search(s.call_name)
+                    or s.call_name in extra
+                    or s.call_name.rpartition(".")[2] in extra)
+            )
+            if security_count >= 2:
+                all_seqs.append(seq)
+
+    return all_seqs
+
+
+def detect_transform_order_violations(
+    source_text: dict[str, str],
+    *,
+    extra_security_names: frozenset | None = None,
+) -> list[TransformOrderViolation]:
+    """Detect ordering violations in transform sequences.
+
+    Runs all extraction heuristics and checks each sequence against
+    the ordering catalog.  Returns only catalog-matched violations
+    (high confidence, no LLM needed).
+
+    Each violation is annotated with how many sibling sequences use
+    the same transform pair in the *correct* order, plus their
+    locations.  This helps the LLM compare the anomaly against the
+    codebase norm.
+
+    *extra_security_names*: passed through for future sequence
+    filtering (currently ordering checks run on all sequences).
+    """
+    all_seqs: list[TransformSequence] = []
+    violations: list[TransformOrderViolation] = []
+
+    for file_path, source in source_text.items():
+        if file_path.endswith(".py"):
+            seqs = _extract_sequences_python(file_path, source)
+        elif any(file_path.endswith(e) for e in _C_EXTS):
+            seqs = _extract_sequences_c(file_path, source)
+        else:
+            continue
+        all_seqs.extend(seqs)
+
+    for seq in all_seqs:
+        violations.extend(_check_sequence_against_catalog(seq))
+        violations.extend(_check_duplicate_transforms(seq))
+
+    _annotate_sibling_counts(violations, all_seqs)
+
+    violations.sort(key=lambda v: (v.file, v.line))
+    return violations
+
+
+def _annotate_sibling_counts(
+    violations: list[TransformOrderViolation],
+    all_seqs: list[TransformSequence],
+) -> None:
+    """Annotate each violation with the count of sibling sequences
+    that apply the same rule's transforms in the correct order."""
+    if _native_sibling_inputs(violations, all_seqs):
+        rules: dict[str, _OrderingRule] = {}
+        for native_rule in ORDERING_RULES:
+            rules.setdefault(native_rule.name, native_rule)  # first matching catalog name wins
+        needed: dict[str, set[tuple[str, str]]] = {}
+        for v in violations:
+            if v.catalog_rule and v.catalog_rule in rules:
+                needed.setdefault(v.catalog_rule, set()).add((v.file, v.function))
+        indices: dict[str | None, tuple[
+            int, dict[tuple[str, str], int], list[tuple[str, str]],
+            dict[tuple[str, str], list[tuple[str, str]]],
+        ]] = {name: _correct_sibling_index(rules[name], all_seqs, groups)
+              for name, groups in needed.items()}
+        for v in violations:
+            index = indices.get(v.catalog_rule)
+            if index is None:
+                continue  # unknown catalog rows retain their existing annotations
+            total, counts, first, outside = index
+            group = (v.file, v.function)
+            v.siblings_correct = total - counts.get(group, 0)
+            v.sibling_locations = [f"{fp}:{fn}" for fp, fn in outside.get(group, first)]
+        return
+    for v in violations:
+        if not v.catalog_rule:
+            continue
+        rule: _OrderingRule | None = None
+        for r in ORDERING_RULES:
+            if r.name == v.catalog_rule:
+                rule = r
+                break
+        if rule is None:
+            continue
+
+        correct: list[str] = []
+        for seq in all_seqs:
+            if seq.file == v.file and seq.function == v.function:
+                continue
+            step_names = [s.call_name for s in seq.steps]
+            has_precede = any(rule.matches_precede(n) for n in step_names)
+            has_follow = any(rule.matches_follow(n) for n in step_names)
+            if not (has_precede and has_follow):
+                continue
+            precede_pos = [i for i, n in enumerate(step_names) if rule.matches_precede(n)]
+            follow_pos = [i for i, n in enumerate(step_names) if rule.matches_follow(n)]
+            if all(fp > pp for fp in follow_pos for pp in precede_pos):
+                correct.append(f"{seq.file}:{seq.function}")
+
+        v.siblings_correct = len(correct)
+        v.sibling_locations = correct[:5]
+
+
+def _native_sibling_inputs(violations, sequences) -> bool:
+    """Bound preparation, retaining direct behavior for adapters and overrides."""
+    return (
+        all is _ALL_IMPL and any is _ANY_IMPL and enumerate is _ENUMERATE_IMPL
+        and set is _SET_IMPL and len is _LEN_IMPL
+        and type(violations) is list and 2 <= len(violations) <= 4096
+        and type(sequences) is list and len(sequences) >= 8
+        and type(ORDERING_RULES) is list and len(ORDERING_RULES) <= 128
+        and _RULE_TYPE.matches_precede is _PRECEDE_IMPL and _RULE_TYPE.matches_follow is _FOLLOW_IMPL
+        and _VIOLATION_TYPE.__setattr__ is object.__setattr__
+        and all(type(v) is _VIOLATION_TYPE and type(v.file) is str and type(v.function) is str
+                and (type(v.catalog_rule) is str or v.catalog_rule is None) for v in violations)
+        and all(type(rule) is _RULE_TYPE and type(rule.name) is str
+                and 'matches_precede' not in vars(rule) and 'matches_follow' not in vars(rule)
+                and type(rule.must_precede_patterns) is list and type(rule.must_follow_patterns) is list
+                and all(type(p) is _PATTERN_TYPE for p in rule.must_precede_patterns)
+                and all(type(p) is _PATTERN_TYPE for p in rule.must_follow_patterns) for rule in ORDERING_RULES)
+        and all(type(seq) is _SEQUENCE_TYPE and type(seq.file) is str and type(seq.function) is str
+                and type(seq.steps) is list
+                and all(type(step) is _STEP_TYPE and type(step.call_name) is str for step in seq.steps)
+                for seq in sequences)
+    )
+
+
+def _correct_sibling_index(rule, sequences, needed):
+    """Count all correct rows, retaining only the first five exclusion prefixes.
+
+    An excluded group outside the global first five cannot change that prefix.
+    At most five groups need an alternative prefix; duplicate locations remain.
+    """
+    total = 0
+    counts: dict[tuple[str, str], int] = {}
+    first: list[tuple[str, str]] = []
+    outside: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for seq in sequences:
+        last_precede = -1
+        first_follow = None
+        for i, step in enumerate(seq.steps):
+            if rule.matches_precede(step.call_name):
+                last_precede = i
+            if first_follow is None and rule.matches_follow(step.call_name):
+                first_follow = i
+        if last_precede < 0 or first_follow is None or first_follow <= last_precede:
+            continue
+        group = (seq.file, seq.function)
+        total += 1
+        if group in needed:
+            counts[group] = counts.get(group, 0) + 1
+        for excluded, rows in outside.items():
+            if group != excluded and len(rows) < 5:
+                rows.append(group)
+        if len(first) < 5:
+            if group not in outside:
+                outside[group] = [row for row in first if row != group]
+            first.append(group)
+    return total, counts, first, outside
+
+
+def format_transform_sequences_for_prompt(
+    sequences: Sequence[TransformSequence],
+) -> str:
+    """Format extracted sequences for injection into an LLM review prompt."""
+    if not sequences:
+        return ""
+
+    parts = ["### Transform sequences (check ordering correctness)\n"]
+    for seq in sequences:
+        safe_file = sanitise_for_prompt(seq.file, content_type="path")
+        safe_func = sanitise_for_prompt(seq.function, content_type="name")
+        safe_var = sanitise_for_prompt(seq.variable, content_type="name")
+        steps_str = " → ".join(
+            f"`{sanitise_for_prompt(s.call_name, content_type='name')}`"
+            + (f" ({sanitise_for_prompt(s.args_summary, content_type='string')})" if s.args_summary else "")
+            for s in seq.steps
+        )
+        parts.append(
+            f"- **{safe_file}:{safe_func}** on `{safe_var}`: {steps_str}"
+        )
+    return "\n".join(parts)

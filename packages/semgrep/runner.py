@@ -1,12 +1,17 @@
 """Semgrep runner — invoke semgrep, parse results, return structured output.
 
-This module is intentionally minimal: build a command, run it via subprocess,
-parse SARIF and JSON output. Callers add their own concerns on top:
+This module is intentionally minimal: build a command, run it, parse SARIF
+and JSON output. Callers add their own concerns on top:
 
-  - Sandbox engagement (Landlock, mount-ns, network proxy) — see
-    packages/static-analysis/scanner.py:run() which wraps build_cmd() with
-    core.sandbox.run.
-  - HOME redirect into a per-run directory — also scanner concern.
+  - Sandbox POLICY. Execution is sandboxed BY DEFAULT: when no
+    ``subprocess_runner`` is injected, run_rule() wraps the invocation in
+    core.sandbox.run (Landlock scoped to the target, network blocked for
+    local rule paths) and REFUSES to run when the sandbox is unavailable.
+    Semgrep parses attacker-controlled source files, so parser bugs are a
+    code-execution surface. Callers with their own sandbox pass
+    ``subprocess_runner=`` (e.g. packages/static-analysis/scanner.py); the
+    explicit escape hatch for trusted input is ``unsandboxed=True``.
+  - HOME redirect into a per-run directory — scanner concern.
   - Output file layout (semgrep_<name>.sarif, .json, .stderr.log, .exit) —
     scanner persists; we hand back the raw strings.
   - Parallel orchestration across many configs — scanner uses
@@ -14,49 +19,331 @@ parse SARIF and JSON output. Callers add their own concerns on top:
     convenience run_rules() that runs sequentially.
 """
 
+import atexit
+from concurrent.futures import Future
+import logging
+import os
+import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
-from .models import SemgrepResult, parse_json_output, parse_sarif
+from core.atomic_fs import rmtree_hardened
+from core.run.scratch import keepalive_register, keepalive_unregister, write_temp_text
+from core.run.toolprobe import probe
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+from .models import (
+    _MAX_TOOL_OUTPUT_BYTES,
+    SemgrepResult,
+    parse_json_output,
+    parse_sarif,
+    convert_semgrep_json_to_sarif,
+)
+
+from .runtime import SnapRuntime, SnapRuntimeError, resolve_snap_runtime
+
+logger = logging.getLogger(__name__)
 
 _SEMGREP_BIN = "semgrep"
 _DEFAULT_TIMEOUT = 900
 _DEFAULT_RULE_TIMEOUT = 60
 
+# --x-ignore-semgrepignore-files shipped in the osemgrep Pro sync around
+# semgrep 1.95 (Nov 2024).  Older CLIs reject it as unknown (rc=2).
+# Version-gated: below-floor scans omit the flag and log a warning.
+_SCOPE_ISOLATION_MIN_VERSION = (1, 95, 0)
+_scope_upgrade_warned = False
+_SCOPE_WARNING_LOCK = threading.Lock()
 
-def is_available() -> bool:
-    """Check whether semgrep is on PATH."""
-    return shutil.which(_SEMGREP_BIN) is not None
+
+def _warn_scope_isolation_once(log, binary=None):
+    """Share one compatibility notice across scanner lanes and pack threads."""
+    global _scope_upgrade_warned
+    with _SCOPE_WARNING_LOCK:
+        if _scope_upgrade_warned:
+            return
+        _scope_upgrade_warned = True
+    floor = ".".join(str(p) for p in _SCOPE_ISOLATION_MIN_VERSION)
+    log.warning(
+        "semgrep scope isolation unavailable or unverified (requires %s or newer): "
+        "--x-ignore-semgrepignore-files unavailable "
+        "— .semgrepignore files in the scanned repo can hide findings "
+        "(upgrade: uv tool install --upgrade semgrep)",
+        floor,
+    )
+
+# RAPTOR-owned scan-scope baseline, passed as repeated ``--exclude``
+# args by build_cmd (gitignore-style patterns; trailing ``/`` = match
+# directories only — verified honoured on semgrep 1.172.0, skips
+# reported as ``cli_exclude_flags_match`` in paths.skipped).
+#
+# Why this exists: --x-ignore-semgrepignore-files (see build_cmd)
+# disables not only the target's .semgrepignore files but ALSO
+# semgrep's BUILT-IN default ignore set (which only applies when no
+# .semgrepignore exists). This list restores the useful part of that
+# default set from RAPTOR code, where a hostile target cannot edit it.
+#
+# Curation rule — dependency/build/artifact directories and generated
+# files ONLY: names that by ecosystem convention hold third-party or
+# machine-generated content nobody hand-edits. Deliberately ABSENT
+# (diverging from semgrep's built-in defaults, probed on 1.172.0:
+# .env/ .npm/ .tox/ .venv/ .yarn/ build/ dist/ node_modules/ test/
+# tests/ vendor/):
+#   - test/, tests/ — first-party code; skipping by NAME hands the
+#     target a steerable hiding channel (mkdir tests/ && hide the bug;
+#     demonstrated empirically on 1.172.0). Same reasoning keeps
+#     examples/, docs/, scripts/ etc. out of this list.
+#   - .env/ — the bare name collides with ``.env`` secret FILES;
+#     excluding the pattern would blind secrets rules.
+# Both-direction rationale: ADDING an entry re-opens a name-steerable
+# hiding spot (any first-party-plausible name is a hole a target can
+# mkdir its way into); REMOVING one buys back scan cost and finding
+# noise on third-party code RAPTOR does not report on anyway.
+# Operators extend per-run via extra_args --exclude / the scanner's
+# exclude-glob filter; entries here must clear the curation rule.
+SCOPE_EXCLUDE_BASELINE: tuple[str, ...] = (
+    # dependency trees / package-manager state
+    "node_modules/",
+    "bower_components/",
+    ".yarn/",
+    ".npm/",
+    "vendor/",
+    "third_party/",
+    "site-packages/",
+    ".venv/",
+    ".tox/",
+    # build artifacts
+    "build/",
+    "dist/",
+    # generated / minified assets
+    "*.min.js",
+    "*.min.css",
+    # lockfiles (machine-written dependency manifests)
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+)
 
 
-def version() -> Optional[str]:
-    """Return the semgrep version string, or None if unavailable."""
-    if not is_available():
+def is_available(semgrep_bin: str | None = None) -> bool:
+    """Check whether the selected Semgrep launcher can be resolved."""
+    return shutil.which(semgrep_bin or _SEMGREP_BIN) is not None
+
+
+def _version_probe(semgrep_bin: str | None = None):
+    from core.config import RaptorConfig
+    selected = shutil.which(semgrep_bin or _SEMGREP_BIN)
+    if selected is not None:
+        runtime = resolve_snap_runtime(selected)
+        if runtime is not None:
+            from core.run.toolprobe import ToolInfo
+            return ToolInfo(name=_SEMGREP_BIN, path=selected, returncode=0,
+                            stdout=runtime.version, stderr="")
+    if not RaptorConfig.SEMGREP_OFFLINE:
+        return probe(
+            semgrep_bin or _SEMGREP_BIN,
+            args=("--version", "--metrics", "off", "--disable-version-check"),
+            isolated_home=True,
+        )
+    from core.run.toolprobe import ToolInfo
+    binary = selected
+    if binary is None:
+        return None
+    runner = _default_sandbox_runner(Path.cwd(), "")
+    if runner is None:
+        return None
+    result = runner(
+        [str(Path(binary).absolute()), "--version", "--metrics", "off", "--disable-version-check"],
+        env=RaptorConfig.get_safe_env(), capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode:
+        return None
+    return ToolInfo(name=_SEMGREP_BIN, path=binary, returncode=result.returncode,
+                    stdout=result.stdout, stderr=result.stderr)
+
+
+def version(binary=None) -> str | None:
+    """Return the semgrep version string, or None if unavailable.
+
+    Verified Snap runtimes use their installed package metadata. Other
+    launchers delegate to core.run.toolprobe with a safe environment.
+    An explicit binary selects the same launcher as the scan rather than
+    querying an unrelated tool from PATH.
+    """
+    try:
+        info = _version_probe(binary) if binary is not None else _version_probe()
+    except SnapRuntimeError:
+        return None
+    return (info.first_line if info is not None and info.returncode == 0
+            and info.version_tuple() is not None else None)
+
+
+# Only the latest successful capability probe is retained. CLI scans and
+# scanner worker threads share it; diagnostics through version() stay fresh.
+_SCOPE_PROBE_LOCK = threading.Lock()
+_SCOPE_PROBE_CACHE: tuple[tuple[object, ...], tuple[int, ...]] | None = None
+_SCOPE_PROBE_PENDING: tuple[tuple[object, ...], Future[tuple[int, ...] | None]] | None = None
+
+
+def _reset_scope_probe_cache() -> None:
+    """Clear process state; also replace a possibly inherited locked mutex."""
+    global _SCOPE_PROBE_LOCK, _SCOPE_PROBE_CACHE, _SCOPE_PROBE_PENDING
+    _SCOPE_PROBE_LOCK = threading.Lock()
+    _SCOPE_PROBE_CACHE = None
+    _SCOPE_PROBE_PENDING = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_scope_probe_cache)
+
+
+def _scope_probe_key(semgrep_bin: str | None = None) -> tuple[object, ...] | None:
+    """Fingerprint the selected launcher and its dispatch/sandbox context."""
+    from core.config import RaptorConfig
+
+    binary = shutil.which(semgrep_bin or _SEMGREP_BIN)
+    if binary is None:
         return None
     try:
-        proc = subprocess.run(
-            [_SEMGREP_BIN, "--version"],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = (proc.stdout or proc.stderr or "").strip()
-        return out.splitlines()[0] if out else None
-    except (subprocess.TimeoutExpired, OSError):
+        path = Path(binary).absolute()
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        runtime = resolve_snap_runtime(str(path))
+        if runtime is not None:
+            return (str(path), str(resolved), *runtime.identity)
+        return (str(path), str(resolved), stat.st_dev, stat.st_ino,
+                stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                os.environ.get("PATH", ""), str(Path.cwd()),
+                RaptorConfig.SEMGREP_OFFLINE)
+    except (OSError, RuntimeError):
+        # Missing/unstatable launchers and symlink loops are never cached.
         return None
+
+
+def _probe_scope_version(
+    key: tuple[object, ...] | None, semgrep_bin: str | None = None,
+) -> tuple[int, ...] | None:
+    info = _version_probe() if semgrep_bin is None else _version_probe(semgrep_bin)
+    if info is None or info.returncode != 0:
+        return None
+    # Semgrep emits a bare release on either stream. Dependency warnings and
+    # prereleases are not evidence that a stable CLI capability is present.
+    releases = set()
+    for stream in (info.stdout, info.stderr):
+        if not isinstance(stream, str) or len(stream) >= 64 * 1024:
+            return None
+        for line in stream.splitlines():
+            match = re.fullmatch(r"v?([0-9]{1,6})\.([0-9]{1,6})(?:\.([0-9]{1,6}))?", line.strip())
+            if match:
+                releases.add(tuple(int(part or 0) for part in match.groups()))
+            elif re.match(r"v?[0-9]+\.[0-9]+", line.strip()):
+                return None
+    parsed = next(iter(releases)) if len(releases) == 1 else None
+    if key is None or parsed is None:
+        return parsed
+    try:
+        same_tool = str(Path(info.path).resolve(strict=True)) == key[1]
+    except (OSError, RuntimeError):
+        same_tool = False
+    return parsed if same_tool else None
+
+
+def _scope_version(semgrep_bin: str | None = None) -> tuple[int, ...] | None:
+    global _SCOPE_PROBE_CACHE, _SCOPE_PROBE_PENDING
+
+    def current_key():
+        return _scope_probe_key() if semgrep_bin is None else _scope_probe_key(semgrep_bin)
+
+    def probe_version(key):
+        return (_probe_scope_version(key) if semgrep_bin is None else
+                _probe_scope_version(key, semgrep_bin))
+
+    with _SCOPE_PROBE_LOCK:
+        key = current_key()
+        future: Future[tuple[int, ...] | None] | None = None
+        owner = False
+        if key is not None:
+            if _SCOPE_PROBE_CACHE is not None:
+                cached_key, cached_version = _SCOPE_PROBE_CACHE
+                if key == cached_key:
+                    return cached_version
+            if _SCOPE_PROBE_PENDING is not None and _SCOPE_PROBE_PENDING[0] == key:
+                future = _SCOPE_PROBE_PENDING[1]
+            else:
+                future = Future()
+                owner = True
+                # Advertise only the currently selected identity's flight.
+                # Existing waiters retain older futures; identity-checked
+                # cleanup cannot clear this newer coordination entry.
+                _SCOPE_PROBE_PENDING = (key, future)
+    if key is None:
+        return probe_version(None)
+    assert future is not None
+    if not owner:
+        parsed = future.result()
+        return parsed if key == current_key() else None
+
+    try:
+        parsed = probe_version(key)
+        with _SCOPE_PROBE_LOCK:
+            # Revalidate at publication, including changes during probing.
+            if key != current_key():
+                parsed = None
+            if parsed is not None:
+                _SCOPE_PROBE_CACHE = (key, parsed)
+            if _SCOPE_PROBE_PENDING is not None and _SCOPE_PROBE_PENDING[1] is future:
+                _SCOPE_PROBE_PENDING = None
+            future.set_result(parsed)
+        return parsed
+    except BaseException as exc:
+        # Current waiters share this failure; a later call starts a fresh
+        # attempt. Do not serialize repeated timeouts behind the same lock.
+        with _SCOPE_PROBE_LOCK:
+            if _SCOPE_PROBE_PENDING is not None and _SCOPE_PROBE_PENDING[1] is future:
+                _SCOPE_PROBE_PENDING = None
+            future.set_exception(exc)
+        raise
+
+
+def scope_isolation_available(semgrep_bin: str | None = None) -> bool:
+    """True when semgrep supports ``--x-ignore-semgrepignore-files``.
+
+    Below-floor versions let hostile targets steer scan scope via
+    ``.semgrepignore`` files.  Callers should log a warning and pass
+    ``scope_isolation=False`` to :func:`build_cmd`.
+    """
+    try:
+        vt = _scope_version() if semgrep_bin is None else _scope_version(semgrep_bin)
+    except SnapRuntimeError:
+        return False
+    return vt is not None and vt >= _SCOPE_ISOLATION_MIN_VERSION
 
 
 def build_cmd(
     target: Path,
     config: str,
     *,
-    json_output_path: Optional[Path] = None,
+    json_output_path: Path | None = None,
     rule_timeout: int = _DEFAULT_RULE_TIMEOUT,
-    semgrep_bin: Optional[str] = None,
-    extra_args: Optional[List[str]] = None,
-) -> List[str]:
+    semgrep_bin: str | None = None,
+    extra_args: list[str] | None = None,
+    extra_targets: "Sequence[Path]" = (),
+    scope_isolation: bool = True,
+    runtime: SnapRuntime | None = None,
+) -> list[str]:
     """Build the semgrep command argv.
 
     Pure: no subprocess invocation. Callers can wrap this with their own
@@ -71,27 +358,292 @@ def build_cmd(
         rule_timeout: Per-rule timeout in seconds.
         semgrep_bin: Override semgrep binary path. Defaults to PATH lookup.
         extra_args: Additional semgrep arguments to pass through.
+        extra_targets: Additional scan targets appended after ``target``.
+            Findings carry per-file artifact URIs, so callers can split
+            results back per target.
+        scope_isolation: Include ``--x-ignore-semgrepignore-files``.
+            Set to ``False`` on semgrep versions below
+            :data:`_SCOPE_ISOLATION_MIN_VERSION` — the flag is unknown
+            and would cause rc=2.
 
     Returns:
-        argv list ready for subprocess.run.
+        argv list ready for the caller's sandbox. Verified Snap runtimes
+        emit one JSON payload; callers retain it and use the reviewed JSON
+        conversion instead of requesting an unsupported dual-output sidecar.
     """
+    from core.config import RaptorConfig
+    if RaptorConfig.SEMGREP_OFFLINE:
+        config = RaptorConfig.get_semgrep_config(config)
     bin_path = semgrep_bin or shutil.which(_SEMGREP_BIN) or _SEMGREP_BIN
-    cmd: List[str] = [
-        bin_path,
+    if semgrep_bin is not None:
+        bin_path = shutil.which(semgrep_bin) or semgrep_bin
+    runtime = runtime or resolve_snap_runtime(bin_path)
+    cmd: list[str] = [
+        *((runtime.command_prefix) if runtime is not None else (bin_path,)),
         "scan",
         "--config", config,
-        "--quiet",
+        # --verbose, not --quiet (the two are mutually exclusive):
+        # only verbose populates ``paths.skipped`` in the --json
+        # output — the record of every path the scan did NOT examine
+        # and why — which run_rule surfaces as skipped_summary.
+        # --quiet also swallowed semgrep's own skipped-paths notice,
+        # so scope suppression was doubly invisible. Verbose chatter
+        # goes to stderr; stdout stays pure SARIF (verified on
+        # semgrep 1.172.0).
+        "--verbose",
         "--metrics", "off",
+        # Defaults ON upstream: fires an HTTP GET to semgrep.dev after
+        # every scan. Its 1-day cache lives under XDG_CACHE_HOME —
+        # RAPTOR's throwaway fake HOME — so every pack invocation
+        # re-pays the call (or a guaranteed-failing connect when the
+        # sandbox blocks network).
+        "--disable-version-check",
         "--error",
-        "--sarif",
+        "--json" if runtime is not None else "--sarif",
+        "--disable-nosem",
+        # Scan scope must be RAPTOR-owned, never target-owned. By
+        # default semgrep honours the SCANNED repo's ignore files —
+        # ``.semgrepignore`` (root and nested) and, inside a git
+        # repo, ``.gitignore`` — so a hostile target could ship one
+        # line of config and silently exempt its own subtrees from
+        # the scan (clean exit, empty findings). --disable-nosem
+        # above closes the inline suppression channel; these two
+        # close the file-level one. --no-git-ignore additionally
+        # stops semgrep shelling out to git inside the untrusted
+        # tree. Side effect (verified on 1.172.0): killing the
+        # .semgrepignore machinery also drops semgrep's BUILT-IN
+        # default ignore set (node_modules/, tests/, vendor/, ...),
+        # which only applies when no .semgrepignore file exists —
+        # the SCOPE_EXCLUDE_BASELINE --exclude args below restore
+        # the dependency/build/artifact part of it from RAPTOR code;
+        # tests/-type first-party names stay deliberately IN scope.
+        # RAPTOR-owned scope control (--exclude/--include via
+        # extra_args, the scanner's exclude-glob filter) is
+        # unaffected. --x-ignore-semgrepignore-files is documented
+        # [INTERNAL] upstream: if a future semgrep removes it, every
+        # scan fails LOUDLY (unknown option, rc=2 — surfaced as an
+        # engine error by run_rule and the scanner) rather than
+        # silently reverting to target-steered scope. Version-gated
+        # via scope_isolation (see _SCOPE_ISOLATION_MIN_VERSION):
+        # below-floor CLIs don't know the flag; callers log a warning.
+        "--no-git-ignore",
         "--timeout", str(rule_timeout),
     ]
-    if json_output_path is not None:
+    if RaptorConfig.SEMGREP_OFFLINE:
+        # Partial rule/config errors must fail the pack, even with findings.
+        cmd.append("--strict")
+    if scope_isolation:
+        cmd.insert(cmd.index("--no-git-ignore") + 1,
+                   "--x-ignore-semgrepignore-files")
+    for pattern in SCOPE_EXCLUDE_BASELINE:
+        cmd.extend(["--exclude", pattern])
+    if json_output_path is not None and runtime is None:
         cmd.extend(["--json-output", str(json_output_path)])
     if extra_args:
+        if runtime is not None and any(
+                arg in {"--json", "--sarif", "--json-output", "--output", "-o"}
+                or arg.startswith(("--json-output=", "--output=", "--sarif-output="))
+                for arg in extra_args):
+            raise SnapRuntimeError("Semgrep output format is managed by RAPTOR")
+        if RaptorConfig.SEMGREP_OFFLINE and any(
+            arg in {"--config", "-c", "--pro", "--pro-intrafile", "--pro-languages", "--no-strict"}
+            or arg.startswith(("--config=", "-c=", "--metrics", "--enable-version-check"))
+            for arg in extra_args
+        ):
+            raise ValueError("Offline Semgrep refuses acquisition/telemetry overrides in extra_args")
         cmd.extend(extra_args)
     cmd.append(str(target))
+    cmd.extend(str(t) for t in extra_targets)
     return cmd
+
+
+# One process-owned parent, with an isolated fake HOME per invocation.
+# A child must never share writable scratch with another invocation: it
+# could otherwise change that invocation's .home during parent-side setup.
+# Results are read/persisted before the invocation directory is reclaimed;
+# only the empty parent normally survives until process exit.
+_SCRATCH_LOCK = threading.Lock()
+_scratch_parent: str | None = None
+_scratch_owner_pid: int | None = None
+
+
+def _sandbox_scratch_parent() -> str:
+    global _scratch_parent, _scratch_owner_pid
+    pid = os.getpid()
+    with _SCRATCH_LOCK:
+        if _scratch_owner_pid is not None and _scratch_owner_pid != pid:
+            # Inherited state belongs to another process, never this child.
+            _scratch_parent = None
+            _scratch_owner_pid = None
+        if (_scratch_parent is not None
+                and (not os.path.isdir(_scratch_parent) or os.path.islink(_scratch_parent))):
+            keepalive_unregister(_scratch_parent)
+            _scratch_parent = None
+            _scratch_owner_pid = None
+        if _scratch_parent is None:
+            parent = tempfile.mkdtemp(prefix="semgrep-sbx-")
+            try:
+                keepalive_register(parent)
+            except BaseException:
+                try:
+                    keepalive_unregister(parent)
+                except BaseException:
+                    logger.warning("could not unregister failed semgrep scratch", exc_info=True)
+                rmtree_hardened(parent)
+                raise
+            _scratch_parent = parent
+            _scratch_owner_pid = pid
+        else:
+            # A previous failed cleanup may have unregistered this parent.
+            keepalive_register(_scratch_parent)
+        return _scratch_parent
+
+
+def _invocation_scratch_dir() -> str:
+    """Fresh per-invocation scratch under the process-owned parent."""
+    return tempfile.mkdtemp(prefix="inv-", dir=_sandbox_scratch_parent())
+
+
+def _reset_sandbox_scratch() -> None:
+    """Remove this process's scratch; retain failed cleanup for retry."""
+    global _scratch_parent, _scratch_owner_pid
+    with _SCRATCH_LOCK:
+        if _scratch_owner_pid is not None and _scratch_owner_pid != os.getpid():
+            return
+        if _scratch_parent is not None:
+            try:
+                keepalive_unregister(_scratch_parent)
+            finally:
+                if rmtree_hardened(_scratch_parent):
+                    _scratch_parent = None
+                    _scratch_owner_pid = None
+                else:
+                    logger.warning("semgrep scratch cleanup incomplete: %s", _scratch_parent)
+
+
+def _after_scratch_fork_child() -> None:
+    global _SCRATCH_LOCK, _scratch_parent, _scratch_owner_pid
+    _SCRATCH_LOCK = threading.Lock()
+    _scratch_parent = None
+    _scratch_owner_pid = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_scratch_fork_child)
+atexit.register(_reset_sandbox_scratch)
+
+
+def _default_sandbox_runner(target: Path, config: str, *, extra_targets=(), output_dir=None, target_root=None, runtime=None):
+    """subprocess.run-shaped wrapper over core.sandbox.run, or None.
+
+    Returns None when core.sandbox is unavailable on this host — the
+    caller REFUSES to run in that case (mirrors patch_gate's
+    no-sandbox-means-no-execution posture) rather than silently falling
+    back to an unsandboxed subprocess.
+
+    Registry configs (p/..., category/...) are fetched from semgrep.dev
+    at run time, so those get network — routed through the RAPTOR
+    egress proxy with the shared semgrep hostname allowlist
+    (``packages.semgrep._proxy_hosts``, the same posture the
+    static-analysis scanner and the codeql pack-download lane carry:
+    UDP blocked, hostname-allowlisted, resolved-IP-screened). This
+    module's own threat statement is that semgrep parses
+    attacker-controlled source, so the registry lane must not hand a
+    compromised parser fully open egress. Local rule paths run with
+    the network blocked entirely.
+    """
+    try:
+        from core.sandbox.context import run as sandbox_run
+    except ImportError:  # pragma: no cover - platform-dependent import
+        return None
+
+    from core.config import RaptorConfig
+    offline = RaptorConfig.SEMGREP_OFFLINE
+    needs_registry = not offline and str(config).startswith(("p/", "category/"))
+    if needs_registry:
+        from ._proxy_hosts import proxy_hosts_for_semgrep
+        net_kwargs: dict = {
+            "use_egress_proxy": True,
+            "proxy_hosts": proxy_hosts_for_semgrep(),
+        }
+    else:
+        net_kwargs = {"block_network": True}
+
+    def _runner(cmd, **kwargs):
+        if runtime is not None:
+            runtime.validate()
+            if tuple(cmd[:2]) != runtime.command_prefix:
+                raise SnapRuntimeError("Semgrep runtime does not match the selected command")
+        elif offline:
+            from core.sandbox.python_paths import python_runtime_tool_paths
+            selected = Path(shutil.which(cmd[0]) or cmd[0]).absolute()
+            binary = selected.resolve()
+            cmd = [str(selected), *cmd[1:]]
+            # Execution retains the launcher name (e.g. a Snap app alias),
+            # while grants retain the existing resolved runtime identity.
+            paths = [str(binary.parent), *python_runtime_tool_paths()]
+            if config and Path(config).exists():
+                paths.append(str(Path(config).resolve()))
+            kwargs.setdefault("tool_paths", paths)
+        # Fake HOME in a per-invocation scratch dir: semgrep
+        # unconditionally appends to ``~/.semgrep/semgrep.log`` (and
+        # reads/writes ``~/.semgrep/settings.yml``); the operator's
+        # real HOME is not sandbox-writable, so every scan died rc=1
+        # with "write outside allowed paths denied to
+        # ~/.semgrep/semgrep.log". fake_home requires output= (the
+        # Landlock-writable location the .home dir materialises
+        # under). Each invocation gets a fresh mkdtemp subdir of the
+        # process-shared parent (see the _sandbox_scratch_parent
+        # comment for why sharing one dir across concurrent
+        # invocations would reopen the fake-home symlink-TOCTOU
+        # window). An owned directory is reclaimed when this call exits;
+        # run_rule supplies its own directory until sidecar parsing ends.
+        from core.sandbox.python_paths import python_tool_paths
+        tool_paths = (list(runtime.tool_paths) if runtime is not None else
+                      (python_tool_paths(str(binary) if offline else cmd[0]) if cmd else []))
+        # Local rules are outside target/output in common run_rule calls.
+        # Declare the exact rule path; do not expose its parent directory.
+        if not needs_registry and Path(config).exists():
+            tool_paths.append(str(Path(config).absolute()))
+        options = {k: v for k, v in kwargs.items() if k != "shell"}
+        tool_paths.extend(options.pop("tool_paths", []) or [])
+        # A single-file scan needs an exact read-only bind, not its parent:
+        # scanning ~/file.py must not expose sibling credentials in HOME.
+        if target_root is not None:
+            # Keep the declared project scope even if its filesystem type
+            # changes after validation; never promote source paths to tools.
+            sandbox_target = str(target_root)
+        else:
+            sandbox_target = str(target) if target.is_dir() else None
+            if sandbox_target is None:
+                tool_paths.append(str(target.absolute()))
+            tool_paths.extend(str(Path(path).absolute()) for path in extra_targets)
+        owned_output = _invocation_scratch_dir() if output_dir is None else None
+        try:
+            return sandbox_run(
+                cmd,
+                target=sandbox_target,
+                caller_label="semgrep-runner",
+                env_caller_filtered=True,
+                output=output_dir if output_dir is not None else owned_output,
+                fake_home=True,
+                tool_paths=list(dict.fromkeys(tool_paths)),
+                **net_kwargs,
+                **options,
+            )
+        finally:
+            if owned_output is not None:
+                rmtree_hardened(owned_output)
+
+    return _runner
+
+
+_SANDBOX_REFUSAL = (
+    "core.sandbox unavailable — refusing to run semgrep on the target "
+    "outside a sandbox (semgrep parses untrusted source; parser bugs are "
+    "a code-execution surface). Pass unsandboxed=True for trusted input, "
+    "or inject subprocess_runner= with your own sandbox."
+)
 
 
 def run_rule(
@@ -101,11 +653,14 @@ def run_rule(
     name: str = "",
     timeout: int = _DEFAULT_TIMEOUT,
     rule_timeout: int = _DEFAULT_RULE_TIMEOUT,
-    env: Optional[Dict[str, str]] = None,
-    json_output_path: Optional[Path] = None,
-    semgrep_bin: Optional[str] = None,
-    extra_args: Optional[List[str]] = None,
+    env: dict[str, str] | None = None,
+    json_output_path: Path | None = None,
+    semgrep_bin: str | None = None,
+    extra_args: list[str] | None = None,
     subprocess_runner=None,
+    unsandboxed: bool = False,
+    extra_targets: "Sequence[Path]" = (),
+    target_root: Path | None = None,
 ) -> SemgrepResult:
     """Run semgrep with one config against a target.
 
@@ -117,90 +672,339 @@ def run_rule(
         rule_timeout: Per-rule timeout (semgrep --timeout).
         env: Subprocess environment. Defaults to current environment.
             Untrusted-target callers should pass RaptorConfig.get_safe_env().
-        json_output_path: Optional path for --json-output. If None, a
-            temporary file is used and removed after parsing.
+        json_output_path: Optional destination for current JSON metadata.
+            The tool writes a private sidecar, removed after parsing; with
+            an injected runner, that sidecar is a sibling of this destination.
+            The runner must permit writes in that parent directory. Current
+            nonempty metadata is published atomically to the destination.
         semgrep_bin: Override semgrep binary path.
         extra_args: Additional semgrep arguments.
-        subprocess_runner: Optional callable replacing subprocess.run. Must
-            accept the same kwargs (capture_output, text, timeout, env)
-            and return an object with returncode/stdout/stderr. Defaults
-            to subprocess.run. Used by callers that need to engage a
-            sandbox (e.g. core.sandbox.run) without reimplementing the
-            semgrep invocation logic.
+        subprocess_runner: Optional callable replacing the default
+            sandboxed runner. Must accept the same kwargs
+            (capture_output, text, timeout, env) and return an object
+            with returncode/stdout/stderr. Used by callers that engage
+            their own sandbox (e.g. core.sandbox.run) without
+            reimplementing the semgrep invocation logic. A verified installed
+            Snap runtime additionally requires the runner to expose
+            ``with_semgrep_runtime(runtime)`` returning a new compatible runner
+            with the same confinement policy and explicit runtime grants.
+        unsandboxed: Explicit opt-out from the default sandbox — run via
+            bare subprocess.run. For trusted input only. Ignored when
+            subprocess_runner is given. Without it, run_rule REFUSES to
+            execute when core.sandbox is unavailable.
+        extra_targets: Additional scan targets for the same invocation.
+            The result's findings cover ALL targets (each finding's
+            ``file`` names its origin) and the returncode follows the
+            combined scan — callers split per target themselves.
+        target_root: Optional caller-owned project directory containing every
+            explicit target. It bounds sandbox reads while argv still names only
+            those files. Outside targets are refused, not granted tool-path access.
 
     Returns:
         SemgrepResult with parsed findings, files_examined, files_failed,
         and raw SARIF/JSON for caller persistence.
     """
-    target = Path(target)
+    # Empty overrides retain build_cmd's default-launcher behaviour.
+    semgrep_bin = semgrep_bin or None
+    # The private bind tree need not carry the caller's working directory.
+    # Preserve file identity while making scan/rule arguments cwd-independent.
+    target = Path(target).absolute()
+    extra_targets = tuple(Path(path).absolute() for path in extra_targets)
+    # Registry identifiers keep their meaning even if a hostile working
+    # directory plants a colliding local p/<pack> or category/<name> path.
+    if not str(config).startswith(("p/", "category/")) and Path(config).exists():
+        config = str(Path(config).absolute())
     name = name or _config_to_name(config)
-
-    if not is_available():
-        return SemgrepResult(
-            name=name, config=config, target=str(target),
-            errors=["semgrep is not installed (semgrep binary not found on PATH)"],
-            returncode=-1,
-        )
-
-    cleanup_json = False
-    json_path = json_output_path
-    if json_path is None:
-        tmp = NamedTemporaryFile(prefix="semgrep_", suffix=".json", delete=False)
-        tmp.close()
-        json_path = Path(tmp.name)
-        cleanup_json = True
-
-    cmd = build_cmd(
-        target, config,
-        json_output_path=json_path,
-        rule_timeout=rule_timeout,
-        semgrep_bin=semgrep_bin,
-        extra_args=extra_args,
-    )
-
-    runner = subprocess_runner or subprocess.run
-
-    start = time.monotonic()
-    try:
-        proc = runner(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        if cleanup_json:
-            _safe_unlink(json_path)
-        return SemgrepResult(
-            name=name, config=config, target=str(target),
-            errors=[f"Timeout after {timeout}s"],
-            returncode=-1,
-            elapsed_ms=int((time.monotonic() - start) * 1000),
-        )
-    except OSError as e:
-        if cleanup_json:
-            _safe_unlink(json_path)
-        return SemgrepResult(
-            name=name, config=config, target=str(target),
-            errors=[str(e)],
-            returncode=-1,
-            elapsed_ms=int((time.monotonic() - start) * 1000),
-        )
-    elapsed = int((time.monotonic() - start) * 1000)
-
-    sarif_text = proc.stdout or ""
-    json_text = ""
-    if json_path.exists():
+    if target_root is not None:
         try:
-            json_text = json_path.read_text()
-        except OSError:
-            json_text = ""
-    if cleanup_json:
-        _safe_unlink(json_path)
+            target_root = Path(target_root).resolve(strict=True)
+            if not target_root.is_dir():
+                raise ValueError("target_root is not a directory")
+            for path in (target, *extra_targets):
+                path.resolve(strict=True).relative_to(target_root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return SemgrepResult(
+                name=name, config=config, target=str(target), returncode=-1,
+                errors=[f"Explicit Semgrep target escapes or cannot be resolved under target_root: {exc}"],
+            )
+    from core.config import RaptorConfig
+    if RaptorConfig.SEMGREP_OFFLINE:
+        try:
+            config = RaptorConfig.get_semgrep_config(config)
+        except ValueError as exc:
+            return SemgrepResult(name=name, config=config, target=str(target),
+                                 errors=[str(exc)], returncode=-1)
 
-    findings = parse_sarif(sarif_text)
+    available = is_available() if semgrep_bin is None else is_available(semgrep_bin)
+    if not available:
+        return SemgrepResult(
+            name=name, config=config, target=str(target),
+            errors=[("semgrep is not installed (semgrep binary not found on PATH)"
+                     if semgrep_bin is None else f"Selected Semgrep executable unavailable: {semgrep_bin}")],
+            returncode=-1,
+        )
+
+    if semgrep_bin is not None:
+        # Pin a relative PATH answer before any runner changes working directory.
+        semgrep_bin = str(Path(shutil.which(semgrep_bin) or semgrep_bin).absolute())
+    selected = shutil.which(semgrep_bin or _SEMGREP_BIN) or semgrep_bin or _SEMGREP_BIN
+    try:
+        runtime = resolve_snap_runtime(selected)
+    except SnapRuntimeError as exc:
+        return SemgrepResult(name=name, config=config, target=str(target),
+                             errors=[str(exc)], returncode=-1)
+    probe_binary = selected if runtime is not None or semgrep_bin is not None else None
+    scope_ok = (scope_isolation_available(probe_binary) if probe_binary is not None
+                else scope_isolation_available())
+    if not scope_ok:
+        if probe_binary is not None:
+            _warn_scope_isolation_once(logger, probe_binary)
+        else:
+            _warn_scope_isolation_once(logger)
+
+    # The scanner must write its sidecar inside the SAME output directory
+    # the sandbox grants. Host /tmp is not writable in a scoped invocation.
+    # Default sandbox output stays private; external destinations remain
+    # parent-owned. Injected runners retain their caller-owned output scope.
+    # Always use a fresh sidecar so an unchanged prior destination cannot
+    # supply coverage for the current invocation.
+    sandbox_output = (_invocation_scratch_dir()
+                      if subprocess_runner is None and not unsandboxed else None)
+    cleanup_json = False
+    json_path = None
+    # Protect sidecar setup too: allocating the invocation directory
+    # precedes sidecar allocation, whose setup can itself fail.
+    try:
+        if json_path is None:
+            json_path = write_temp_text(
+                "", prefix="semgrep_", suffix=".json",
+                dir=(sandbox_output if sandbox_output is not None else
+                     str(Path(json_output_path).parent) if json_output_path is not None else None),
+            )
+            cleanup_json = True
+
+        cmd = build_cmd(
+            target, config,
+            json_output_path=json_path,
+            rule_timeout=rule_timeout,
+            semgrep_bin=selected,
+            extra_args=extra_args,
+            extra_targets=extra_targets,
+            scope_isolation=scope_ok,
+            **({"runtime": runtime} if runtime is not None else {}),
+        )
+
+        if env is None:
+            # Registry configs (p/..., category/...) are fetched from
+            # semgrep.dev at run time — semgrep honours proxy env, so
+            # the operator's proxy must survive for those or every
+            # registry scan fails behind a mandatory egress proxy.
+            # Local rule paths keep the stricter default.
+            _needs_registry = str(config).startswith(("p/", "category/"))
+            env = RaptorConfig.get_safe_env(preserve_proxy=_needs_registry)
+
+        runner = subprocess_runner
+        if runtime is not None and runner is not None:
+            adapt = getattr(runner, "with_semgrep_runtime", None)
+            if not callable(adapt):
+                return SemgrepResult(
+                    name=name, config=config, target=str(target), returncode=-1,
+                    errors=["This Semgrep Snap requires a runtime-aware subprocess_runner "
+                            "with with_semgrep_runtime(runtime) support"],
+                )
+            runner = adapt(runtime)
+            if not callable(runner):
+                return SemgrepResult(
+                    name=name, config=config, target=str(target), returncode=-1,
+                    errors=["Semgrep runtime adapter did not return a callable runner"],
+                )
+        if runner is None:
+            if unsandboxed:
+                runner = subprocess.run
+            else:
+                # With a project root, source arguments remain inside that
+                # read-only scope. Do not promote target-derived file paths to
+                # tool_paths: a symlink swap must not grant outside reads.
+                runner = _default_sandbox_runner(
+                    target, config, extra_targets=extra_targets,
+                    output_dir=sandbox_output, target_root=target_root,
+                    **({"runtime": runtime} if runtime is not None else {}),
+                )
+                if runner is None:
+                    return SemgrepResult(
+                        name=name, config=config, target=str(target),
+                        errors=[_SANDBOX_REFUSAL],
+                        returncode=-1,
+                    )
+
+        start = time.monotonic()
+        try:
+            if runtime is not None:
+                runtime.validate()
+                env = runtime.child_environment(env)
+                if json_output_path is not None:
+                    Path(json_output_path).unlink(missing_ok=True)
+            proc = runner(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return SemgrepResult(
+                name=name, config=config, target=str(target),
+                errors=[f"Timeout after {timeout}s"],
+                returncode=-1,
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+            )
+        except (OSError, SnapRuntimeError) as e:
+            return SemgrepResult(
+                name=name, config=config, target=str(target),
+                errors=[str(e)],
+                returncode=-1,
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+            )
+        elapsed = int((time.monotonic() - start) * 1000)
+
+        # Budget gates on both tool outputs. Semgrep exits 0/1 on a
+        # successful scan regardless of output size, so an over-budget
+        # payload must surface as a scan ERROR — empty findings with
+        # empty errors at rc 0 would read as a verified-clean scan,
+        # handing a hostile repo a finding-suppression primitive
+        # (inflate the output past the cap and every real finding
+        # vanishes with the noise). The oversized text is also NOT
+        # retained on the result, so downstream serialisers never
+        # persist an attacker-sized payload.
+        budget_errors: list[str] = []
+        sarif_text = proc.stdout or ""
+        snap_json_text = ""
+        snap_output_valid = False
+        if runtime is not None:
+            try:
+                runtime.validate_output_version(
+                    proc.stdout or "", max_output_bytes=_MAX_TOOL_OUTPUT_BYTES)
+                sarif_text = convert_semgrep_json_to_sarif(
+                    proc.stdout or "", max_output_bytes=_MAX_TOOL_OUTPUT_BYTES)
+                snap_json_text = proc.stdout or ""
+                snap_output_valid = True
+            except ValueError as exc:
+                budget_errors.append(f"Semgrep JSON output is incomplete or invalid: {exc}")
+                raw = proc.stdout or ""
+                if len(raw) <= _MAX_TOOL_OUTPUT_BYTES and len(raw.encode("utf-8", errors="surrogatepass")) <= _MAX_TOOL_OUTPUT_BYTES:
+                    snap_json_text = raw
+                sarif_text = ""
+        # Measure BYTES, matching the budget's unit: len(str) counts
+        # characters, and UTF-8 encodes up to 4 bytes per char — a
+        # non-ASCII-heavy payload could weigh 4x the budget while
+        # passing a character-count gate. chars <= bytes always, so
+        # the cheap length check short-circuits the common case and
+        # the encode only runs on strings already under the budget
+        # in characters (bounded work).
+        sarif_bytes = (
+            len(sarif_text)
+            if len(sarif_text) > _MAX_TOOL_OUTPUT_BYTES
+            else len(sarif_text.encode("utf-8", errors="surrogatepass"))
+        )
+        if sarif_bytes > _MAX_TOOL_OUTPUT_BYTES:
+            msg = (
+                f"semgrep SARIF output is at least {sarif_bytes} bytes"
+                f" — exceeds the {_MAX_TOOL_OUTPUT_BYTES}-byte budget;"
+                " scan results unavailable (failed scan, not a clean"
+                " one)"
+            )
+            logger.warning("%s", msg)
+            budget_errors.append(msg)
+            sarif_text = ""
+        json_text = snap_json_text
+        metadata_errors_before = len(budget_errors)
+        if runtime is None and os.path.lexists(json_path):
+            from core.security.capped_read import read_capped_text
+            try:
+                # Open once with O_NOFOLLOW and enforce the cap during the
+                # read: a compromised scanner must not replace this sidecar
+                # with a symlink to a host file for the parent to follow.
+                json_text = read_capped_text(
+                    json_path, _MAX_TOOL_OUTPUT_BYTES,
+                    errors="strict", raise_on_refusal=True,
+                )
+            except (OSError, ValueError) as exc:
+                budget_errors.append(
+                    f"semgrep --json metadata unavailable within output budget "
+                    f"({_MAX_TOOL_OUTPUT_BYTES} bytes): {exc}"
+                )
+        if (not json_text and proc.returncode in (0, 1)
+                and len(budget_errors) == metadata_errors_before):
+            budget_errors.append(
+                "semgrep --json metadata missing or empty; scan coverage unavailable"
+            )
+        if (json_output_path is not None and json_text and
+                (runtime is None or snap_output_valid)):
+            from core.atomic_fs import write_text_atomically
+            try:
+                write_text_atomically(json_output_path, json_text)
+            except OSError as exc:
+                budget_errors.append(f"cannot save semgrep --json output: {exc}")
+    finally:
+        try:
+            if cleanup_json and json_path is not None:
+                _safe_unlink(json_path)
+        finally:
+            if sandbox_output is not None:
+                rmtree_hardened(sandbox_output)
+
+    sarif_errors: list[str] = []
+    findings = parse_sarif(sarif_text, errors=sarif_errors)
     parsed_json = parse_json_output(json_text)
+    if runtime is not None and not snap_output_valid:
+        # Keep the rejected native payload for diagnostics, never its coverage.
+        parsed_json.update(files_examined=[], files_failed=[], skipped_summary={},
+                           skipped_rules=[], semgrep_version="", _path_error_renderings=[])
+
+    # Engine failure must never read as verified silence: surface the
+    # budget refusals and the real errors array, and when semgrep
+    # exits outside {0, 1} (0 = no findings / clean, 1 = findings
+    # under --error) without a parseable errors payload (invalid rule
+    # YAML, internal crash on a hostile source file, signal kill — the
+    # tool never analysed the code, and semgrep sometimes emits empty
+    # SARIF before --json-output is written), synthesise an error from
+    # the returncode + stderr so every caller inherits the
+    # error-vs-refuted distinction instead of reading empty findings
+    # as a refutation.
+    errors: list[str] = budget_errors + list(parsed_json["errors"])
+    if proc.returncode not in (0, 1) and not errors:
+        stderr_tail = (proc.stderr or "").strip()[-500:]
+        errors.append(
+            f"semgrep exited with code {proc.returncode}"
+            + (f": {stderr_tail}" if stderr_tail else "")
+        )
+
+    errors.extend(sarif_errors)
+
+    # Semgrep lists both excluded paths and partially analysed files in
+    # paths.skipped. Recovered findings may coexist with parser errors;
+    # neither an empty result nor recovered findings prove full coverage.
+    # Counts only in
+    # the log line — the sample paths are target-derived and stay on
+    # the result; reason strings come from semgrep's own enum but are
+    # escaped anyway before the operator's log stream.
+    skipped_summary: dict = parsed_json.get("skipped_summary") or {}
+    if skipped_summary:
+        from core.security.log_sanitisation import escape_nonprintable
+        per_reason = ", ".join(
+            f"{escape_nonprintable(reason)}={info.get('count', 0)}"
+            for reason, info in skipped_summary.get("reasons", {}).items()
+        )
+        logger.info(
+            "semgrep '%s': %d path(s) excluded or not fully analysed — %s",
+            name, skipped_summary.get("total", 0), per_reason,
+        )
+
+    skipped_rules = parsed_json.get("skipped_rules", [])
+    if skipped_rules:
+        from core.security.log_sanitisation import escape_nonprintable
+        for reason in skipped_rules:
+            logger.warning("%s", escape_nonprintable(reason))
 
     return SemgrepResult(
         name=name,
@@ -209,27 +1013,31 @@ def run_rule(
         findings=findings,
         files_examined=parsed_json["files_examined"],
         files_failed=parsed_json["files_failed"],
+        _path_error_renderings=parsed_json.get("_path_error_renderings"),
+        skipped_summary=skipped_summary,
+        skipped_rules=skipped_rules,
         semgrep_version=parsed_json["semgrep_version"],
         returncode=proc.returncode,
         stderr=proc.stderr or "",
         sarif=sarif_text,
         json_output=json_text,
         elapsed_ms=elapsed,
-        errors=[],
+        errors=errors,
     )
 
 
 def run_rules(
     target: Path,
-    configs: List[Tuple[str, str]],
+    configs: list[tuple[str, str]],
     *,
     timeout: int = _DEFAULT_TIMEOUT,
     rule_timeout: int = _DEFAULT_RULE_TIMEOUT,
-    env: Optional[Dict[str, str]] = None,
-    semgrep_bin: Optional[str] = None,
-    extra_args: Optional[List[str]] = None,
+    env: dict[str, str] | None = None,
+    semgrep_bin: str | None = None,
+    extra_args: list[str] | None = None,
     subprocess_runner=None,
-) -> List[SemgrepResult]:
+    unsandboxed: bool = False,
+) -> list[SemgrepResult]:
     """Run multiple semgrep configurations sequentially.
 
     Args:
@@ -240,6 +1048,12 @@ def run_rules(
         env: Subprocess environment.
         semgrep_bin: Override semgrep binary path.
         extra_args: Additional semgrep arguments applied to every run.
+        subprocess_runner: Optional callable replacing the default
+            sandboxed runner; passed through unchanged to run_rule()
+            for every config (see run_rule for the required contract).
+        unsandboxed: Explicit opt-out from the default sandbox, passed
+            through unchanged to run_rule() for every config. Ignored
+            when subprocess_runner is given.
 
     Returns:
         One SemgrepResult per config, in input order.
@@ -249,7 +1063,9 @@ def run_rules(
     is sequential to keep the package free of policy decisions about
     concurrency, worker counts, and progress reporting.
     """
-    if not is_available():
+    if not configs:
+        return []
+    if semgrep_bin is None and not is_available():
         return [
             SemgrepResult(
                 name=name, config=config, target=str(target),
@@ -259,7 +1075,7 @@ def run_rules(
             for name, config in configs
         ]
 
-    results: List[SemgrepResult] = []
+    results: list[SemgrepResult] = []
     for name, config in configs:
         result = run_rule(
             target, config,
@@ -270,6 +1086,7 @@ def run_rules(
             semgrep_bin=semgrep_bin,
             extra_args=extra_args,
             subprocess_runner=subprocess_runner,
+            unsandboxed=unsandboxed,
         )
         results.append(result)
     return results
@@ -280,7 +1097,7 @@ def _config_to_name(config: str) -> str:
     if not config:
         return "semgrep"
     # Pack identifiers like "p/security-audit"
-    if config.startswith("p/") or config.startswith("category/"):
+    if config.startswith(("p/", "category/")):
         return config
     # Directory path — use the basename
     return Path(config).name or config

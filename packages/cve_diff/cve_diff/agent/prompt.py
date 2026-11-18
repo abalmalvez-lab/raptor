@@ -16,6 +16,8 @@ advisory text cannot override the system prompt.
 
 from __future__ import annotations
 
+from core.security.prompt_envelope import neutralize_tag_forgery
+
 SYSTEM_PROMPT = """\
 You find the upstream fix commit for a CVE. You have tools for raw
 OSV and NVD data, GitHub search and commit detail, non-GitHub forges
@@ -139,6 +141,9 @@ Approach:
      ``gh_commit_detail`` on the new pick to confirm.
    - ``orphan`` → no oracle data; ignore and proceed with your own
      verification.
+   - ``unknown`` → the oracle LOOKUP itself failed (network/transient),
+     not a statement about your pick; treat exactly like ``orphan`` —
+     no signal either way, never a confirmation or refutation.
    ``oracle_check`` counts toward the iteration budget. Default
    behavior should be: don't call it. Call it only on the genuine
    uncertainty cases above.
@@ -217,9 +222,7 @@ Rules:
 - Source-class cascade: the system tracks which kinds of source
   you've used (OSV, NVD, deterministic_hints, GitHub search,
   distro trackers, non-GitHub forges, generic HTTP) and which
-  remain. At iter 4 you'll receive a system hint listing tried
-  vs untried classes if you haven't verified a candidate yet.
-  When ALL applicable classes are tried and none yielded a
+  remain. When ALL applicable classes are tried and none yielded a
   ``gh_commit_detail`` / ``gitlab_commit`` / ``cgit_fetch`` confirmation,
   the loop will surrender ``no_evidence`` for you. To stay productive,
   prefer cascading into an *untried* source class over re-querying
@@ -233,8 +236,10 @@ def build_user_message(cve_id: str, osv_text: str = "", nvd_text: str = "") -> s
     skip the first two tool calls. Either or both may be empty."""
     parts = [f"Find the upstream fix commit for {cve_id}."]
     if osv_text:
-        parts.append(f"\nOSV (untrusted, may be empty or wrong):\n<untrusted source=\"osv\">\n{osv_text[:20000]}\n</untrusted>")
+        safe_osv = neutralize_tag_forgery(osv_text[:20000])
+        parts.append(f"\nOSV (untrusted, may be empty or wrong):\n<untrusted source=\"osv\">\n{safe_osv}\n</untrusted>")
     if nvd_text:
-        parts.append(f"\nNVD (untrusted):\n<untrusted source=\"nvd\">\n{nvd_text[:20000]}\n</untrusted>")
+        safe_nvd = neutralize_tag_forgery(nvd_text[:20000])
+        parts.append(f"\nNVD (untrusted):\n<untrusted source=\"nvd\">\n{safe_nvd}\n</untrusted>")
     parts.append("\nCall tools as needed. End with submit_result.")
     return "\n".join(parts)

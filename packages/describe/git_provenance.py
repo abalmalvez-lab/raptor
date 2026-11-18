@@ -1,0 +1,91 @@
+"""Git provenance for /describe — branch / commit / dirty /
+last-commit-date for the SCANNED TARGET.
+
+Distinct from ``core/run/provenance.py`` which snapshots the
+*framework*'s own checkout (the RAPTOR repo that produced a
+run). Here the target is attacker-controlled (we're describing
+an unknown codebase), so every git call goes through the
+shared ``_git`` helper with ``untrusted=True`` — that layers
+``safe_git_command``'s per-invocation overrides which
+neutralise hostile ``.git/config`` vectors
+(``core.fsmonitor`` / ``core.hooksPath`` / CVE-2024-32002
+family) — and the dirty flag comes from
+``core.git.dirty.probe_worktree_dirt``, which never lets git
+open a worktree file (clean-filter drivers have repo-chosen
+config names the overrides cannot blanket-disable).
+
+Best-effort throughout: a non-git target, a missing git
+binary, a timeout, or any individual command failure yields
+``None`` for the affected field rather than failing the
+inference. /describe's render shows a "Git: none detected"
+line in the all-None case, otherwise renders the fields it
+got.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from core.git.dirty import probe_worktree_dirt
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+@dataclass(frozen=True)
+class GitProvenance:
+    """Point-in-time git facts for the target tree. All
+    fields ``None`` when the target isn't a git checkout (or
+    git is unavailable, or every call timed out)."""
+    branch: str | None           # current branch name; None when detached HEAD
+    commit_short: str | None     # 7-12 char SHA
+    dirty: bool | None           # True/False, or None when the probe couldn't read
+    last_commit_date: str | None  # ISO 8601 (e.g. "2026-05-30T14:22:11+00:00")
+
+
+def detect_git_provenance(target_path: Path) -> GitProvenance:
+    """Snapshot the target's git state. Reuses
+    ``core.run.provenance._git`` with ``untrusted=True`` for
+    the hostile-.git/config defense.
+    """
+    try:
+        from core.run.provenance import _git
+    except Exception:  # noqa: BLE001
+        return GitProvenance(None, None, None, None)
+
+    # rev-parse --short = "is this a git checkout AND give me the SHA". A
+    # None result means "not a git tree" — short-circuit the rest.
+    sha = _git(target_path, "rev-parse", "--short", "HEAD", untrusted=True)
+    if sha is None:
+        return GitProvenance(None, None, None, None)
+
+    # symbolic-ref returns the branch name; detached HEAD returns None.
+    # "main" / "master" / "develop" etc.
+    branch = _git(
+        target_path, "symbolic-ref", "--short", "HEAD", untrusted=True,
+    )
+
+    # Dirtiness via core.git.dirty — `git status` (and even worktree
+    # plumbing like `diff-index HEAD`) re-hashes racily-clean entries
+    # through the repo's own clean-filter chain, i.e. command
+    # execution from a hostile .git. The probe compares index stat
+    # data against os.lstat instead and never lets git open a
+    # worktree file. True/False, or None when a channel failed.
+    dirty = probe_worktree_dirt(target_path).dirty
+
+    # %cI = strict ISO 8601 committer date. Parseable by every datetime
+    # library; readable by humans.
+    last_commit = _git(
+        target_path, "log", "-1", "--format=%cI", "HEAD", untrusted=True,
+    )
+
+    return GitProvenance(
+        branch=branch,
+        commit_short=sha,
+        dirty=dirty,
+        last_commit_date=last_commit,
+    )
+
+
+__all__ = ["GitProvenance", "detect_git_provenance"]

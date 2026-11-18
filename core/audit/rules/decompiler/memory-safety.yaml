@@ -1,0 +1,181 @@
+rules:
+  - id: decompiler-memcpy-variable-len
+    pattern: memcpy($DST, $SRC, $LEN)
+    message: "memcpy — verify length is bounded"
+    languages: [c]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-122"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-memmove-variable-len
+    pattern: memmove($DST, $SRC, $LEN)
+    message: "memmove — verify length is bounded"
+    languages: [c]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-122"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-checked-memcpy-size-mismatch
+    patterns:
+      - pattern: $FN($DST, $DST_SIZE, $SRC, $COUNT)
+      - metavariable-regex:
+          metavariable: $FN
+          regex: ".*memcpy.*|.*memmove.*"
+      - metavariable-comparison:
+          metavariable: $COUNT
+          comparison: "$COUNT > $DST_SIZE"
+    message: "checked memcpy wrapper: copy count exceeds destination size"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-122"
+      confidence: HIGH
+      source: decompiler
+
+  - id: decompiler-checked-memcpy-variable-len
+    patterns:
+      - pattern: $FN($DST, $DST_SIZE, $SRC, $COUNT)
+      - metavariable-regex:
+          metavariable: $FN
+          regex: ".*memcpy.*|.*memmove.*"
+    message: "checked memcpy wrapper — verify count <= dest_size"
+    languages: [c]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-122"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-free-then-use
+    pattern: |
+      free($PTR);
+      ...
+      $X = $PTR->$FIELD;
+    message: "potential use-after-free: field access on freed pointer"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-free-then-write-field
+    pattern: |
+      free($PTR);
+      ...
+      $PTR->$FIELD = $VAL;
+    message: "potential use-after-free: write to freed pointer field"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: MEDIUM
+      source: decompiler
+
+  - id: decompiler-free-then-deref-assign
+    pattern: |
+      free($PTR);
+      ...
+      $X = *$PTR;
+    message: "potential use-after-free via dereference"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-free-then-deref-write
+    pattern: |
+      free($PTR);
+      ...
+      *$PTR = $VAL;
+    message: "potential use-after-free: write through freed pointer"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: MEDIUM
+      source: decompiler
+
+  - id: decompiler-free-then-array-read
+    pattern: |
+      free($PTR);
+      ...
+      $X = $PTR[$IDX];
+    message: "potential use-after-free via array read"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-free-then-array-write
+    pattern: |
+      free($PTR);
+      ...
+      $PTR[$IDX] = $VAL;
+    message: "potential use-after-free via array write"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: MEDIUM
+      source: decompiler
+
+  - id: decompiler-free-then-memcpy
+    pattern: |
+      free($PTR);
+      ...
+      memcpy($PTR, $SRC, $LEN);
+    message: "potential use-after-free: memcpy into freed buffer"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-416"
+      confidence: MEDIUM
+      source: decompiler
+
+  - id: decompiler-free-then-func-call
+    pattern: |
+      free($PTR);
+      ...
+      $FN($PTR);
+    message: "freed pointer passed to function"
+    languages: [c]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-416"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-free-then-func-call-multi
+    pattern: |
+      free($PTR);
+      ...
+      $FN($PTR, $ARG);
+    message: "freed pointer passed to function"
+    languages: [c]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-416"
+      confidence: LOW
+      source: decompiler
+
+  - id: decompiler-double-free
+    pattern: |
+      free($PTR);
+      ...
+      free($PTR);
+    message: "potential double free"
+    languages: [c]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-415"
+      confidence: LOW
+      source: decompiler

@@ -1,0 +1,192 @@
+"""Label-scoped container/image cleanup.
+
+Every artifact the container substrate creates carries caller labels,
+so cleanup is exact-scope by construction: remove precisely the
+containers/images stamped ``<label>=<value>``, never a neighbour's.
+Best-effort throughout — a wedged daemon degrades to "0 removed", it
+never raises into a caller's teardown path.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from core.container.proc import RunOutcome, run_cli
+
+logger = logging.getLogger(__name__)
+
+
+def _discovery_complete(outcome: RunOutcome, kind: str) -> bool:
+    if outcome.truncated:
+        logger.warning("Refusing truncated %s cleanup listing", kind)
+        return False
+    return outcome.returncode == 0
+
+
+def _count_removed(requested: list[str], outcome: RunOutcome) -> int:
+    """Per-item success count for a batch removal.
+
+    ``docker rm -f`` / ``docker network rm`` echo each successfully
+    removed id on stdout and exit non-zero when ANY id failed —
+    rc-only accounting reported N-1 real removals as 0 whenever one
+    id was already gone.
+    """
+    if outcome.returncode == 0:
+        return len(requested)
+    removed = {line.strip() for line in (outcome.stdout or "").splitlines()}
+    return sum(1 for item in requested if item in removed)
+
+
+def remove_labeled_containers(label: str, value: str,
+                              timeout: float = 30.0) -> int:
+    """``docker rm -fv`` every container labeled ``label=value``.
+
+    Anonymous volumes are removed with their containers; named volumes stay.
+    Returns the count removed (0 when none matched or on any failure)."""
+    if not value:
+        return 0
+    list_result = run_cli(
+        ["docker", "ps", "-aq", "--filter", f"label={label}={value}"],
+        timeout=timeout,
+    )
+    if not _discovery_complete(list_result, "container"):
+        return 0
+    ids = list(dict.fromkeys(i.strip() for i in (list_result.stdout or "").splitlines()
+                             if i.strip()))
+    if not ids:
+        return 0
+    outcome = run_cli(["docker", "rm", "-f", "-v", *ids], timeout=timeout)
+    return _count_removed(ids, outcome)
+
+
+def remove_labeled_networks(label: str, value: str,
+                            timeout: float = 30.0) -> int:
+    """``docker network rm`` every network labeled ``label=value``.
+
+    Returns the count removed (0 when none matched or on any failure).
+    Call AFTER :func:`remove_labeled_containers` — a network with
+    attached containers refuses removal.
+    """
+    if not value:
+        return 0
+    list_result = run_cli(
+        ["docker", "network", "ls", "-q",
+         "--filter", f"label={label}={value}"],
+        timeout=timeout,
+    )
+    if not _discovery_complete(list_result, "network"):
+        return 0
+    ids = list(dict.fromkeys(i.strip() for i in (list_result.stdout or "").splitlines()
+                             if i.strip()))
+    if not ids:
+        return 0
+    outcome = run_cli(["docker", "network", "rm", *ids], timeout=timeout)
+    return _count_removed(ids, outcome)
+
+
+def prune_labeled_dangling(label: str, value: str,
+                           timeout: float = 60.0) -> bool:
+    """Prune DANGLING images carrying ``label=value``.
+
+    The legacy builder commits every Dockerfile step as an untagged
+    cache image; a failed or superseded build leaves those layers
+    behind even after the tagged image is removed (and
+    :func:`remove_labeled_images` deliberately skips ``<none>`` rows).
+    ``docker image prune`` with a label filter removes exactly the
+    caller's dangling residue — untagged only, so concurrent
+    neighbours' tagged images are never touched. Callers must put the
+    label on the FIRST Dockerfile instruction so every intermediate
+    inherits it.
+    """
+    if not value:
+        return False
+    result = run_cli(
+        ["docker", "image", "prune", "--force",
+         "--filter", f"label={label}={value}"],
+        timeout=timeout,
+    )
+    return result.returncode == 0
+
+
+def remove_labeled_images(
+    label: str,
+    value: str,
+    *,
+    tag_repo: str | None = None,
+    tag_value: str | None = None,
+    timeout: float = 30.0,
+) -> int:
+    """Remove IMAGES labeled ``label=value``; returns tags removed.
+
+    Removes by TAG (not ``-f`` by ID) so a multi-tag image deletes
+    cleanly as its last tag goes; ``<none>`` rows are skipped (left for
+    the dangling prune) and duplicates deduped. Call AFTER
+    :func:`remove_labeled_containers` so no live container holds the
+    image.
+
+    ``tag_repo``/``tag_value`` add a kill-path fallback sweep: a
+    SIGKILL'd builder can leave a tagged image WITHOUT the label (the
+    in-process labeling ran after the kill), so a second query lists
+    ``tag_repo``'s images and keeps those whose tag equals
+    ``tag_value`` or starts with ``tag_value + "-"`` — still scoped to
+    exactly the caller's unit, so concurrent neighbours are never
+    touched.
+    """
+    if not value:
+        return 0
+    tags: list[str] = []
+    label_result = run_cli(
+        [
+            "docker", "images",
+            "--filter", f"label={label}={value}",
+            "--format", "{{.Repository}}:{{.Tag}}",
+        ],
+        timeout=timeout,
+    )
+    if _discovery_complete(label_result, "labelled image"):
+        for t in (label_result.stdout or "").splitlines():
+            t = t.strip()
+            if t and "<none>" not in t:
+                tags.append(t)
+    if tag_repo and tag_value:
+        tag_result = run_cli(
+            ["docker", "images", tag_repo,
+             "--format", "{{.Repository}}:{{.Tag}}"],
+            timeout=timeout,
+        )
+        if _discovery_complete(tag_result, "tagged image"):
+            for t in (tag_result.stdout or "").splitlines():
+                t = t.strip()
+                if not t or "<none>" in t:
+                    continue
+                # Tag separator is the colon AFTER the last slash — a
+                # first-colon split read a port-bearing Repository
+                # ("localhost:5000/repo:tag") as tag "5000/repo:tag".
+                slash = t.rfind("/")
+                colon = t.rfind(":")
+                if colon <= slash:
+                    continue
+                tagpart = t[colon + 1:]
+                if tagpart == tag_value or tagpart.startswith(tag_value + "-"):
+                    tags.append(t)
+    tags = list(dict.fromkeys(tags))  # dedupe, preserve order
+    if not tags:
+        return 0
+    outcome = run_cli(["docker", "rmi", *tags], timeout=timeout)
+    if outcome.returncode == 0:
+        return len(tags)
+    # Partial success: ``docker rmi`` reports each removed tag as an
+    # ``Untagged: <tag>`` stdout line even when the batch exits
+    # non-zero because one tag was already gone.
+    untagged = {
+        line.split(": ", 1)[1].strip()
+        for line in (outcome.stdout or "").splitlines()
+        if line.startswith("Untagged: ")
+    }
+    return sum(1 for t in tags if t in untagged)
+
+
+def prune_dangling_images(timeout: float = 30.0) -> None:
+    """Prune dangling images only — safe against in-use images and
+    current tag-references."""
+    run_cli(["docker", "image", "prune", "-f"], timeout=timeout)

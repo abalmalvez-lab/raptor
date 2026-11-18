@@ -1,0 +1,5265 @@
+"""Constant-to-SMT bridge for guard sufficiency.
+
+Bridges the concrete_values extracted by condition_extraction (Layer 0/2)
+into Z3 SMT queries via the existing path_feasibility infrastructure.
+
+Answers: "Given this guard checks `len < MAX_SIZE` where MAX_SIZE=1024,
+and the sink is memcpy(dst, src, len) where dst is 256 bytes, is the
+guard sufficient to prevent overflow?"
+
+The key insight from the CPG paper: once you have CONCRETE values from
+constant resolution, you can PROVE guard insufficiency mechanically.
+A guard `if (n < 4096)` doesn't prevent overflow into a 256-byte buffer.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from itertools import islice
+from dataclasses import asdict, dataclass, field
+from typing import Any, TYPE_CHECKING
+from core.source.lines import iter_source_lines, split_lines as _NARROW_LINES_IMPL
+
+
+if TYPE_CHECKING:
+    from .condition_extraction import GuardCondition, SinkGuard
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_NARROW_TYPE_IMPL = type
+
+_SMT_AND_WORD_RE = re.compile(r"\band\b")
+_SMT_ELSE_WORD_RE = re.compile(r"\belse\b")
+_SMT_LOCK_CALL_RE = re.compile(r"\b(\w+_lock)\s*\(")
+_SMT_GO_DECL_RE = re.compile(r"\s*(?:package|func)\b")
+_SMT_PARAM_LIST_RE = re.compile(r"\([^)]{0,500}\)")
+_SMT_PARAM_SEPARATOR_RE = re.compile(r"[,)]")
+_SMT_INTEGER_MIN_RE = re.compile(r"MinInt|INT(?:\d+)?_MIN|L?LONG_MIN")
+_SMT_CALL_SHAPE_RE = re.compile(r"\b\w+\s*\(")
+_SMT_ASCII_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+# ---------------------------------------------------------------------------
+# Domain vocabulary — study-discovered operation pairs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DomainVocabulary:
+    """Project-specific API names extracted from domain-model.json.
+
+    Built from ``paired_operations`` entries discovered by study-prep's
+    Layer 1 transitive wrapper analysis.  Passed to mechanical checks so
+    they use project vocabulary instead of only hardcoded seed names.
+
+    ``lock_pairs`` preserves the exact acquire→release pairing (the
+    name sets alone force a lossy heuristic re-pairing downstream).
+    ``nullable_returns`` / ``auth_predicates`` / ``boundary_transfers``
+    are populated from the corresponding domain-model keys when the
+    study loop emits them, and by target-kind vocab packs
+    (:mod:`core.audit.vocab_packs`).
+    ``callback_registers`` / ``callback_cancels`` carry async-callback
+    registration / cancellation verbs (timer, workqueue, notifier
+    shapes) from ``paired_operations`` entries with a callback-family
+    ``kind`` — consumed by :mod:`core.audit.callback_lifetime`.
+
+    Vocabulary entries may be plain strings or dicts carrying a
+    ``provenance`` tier (study receipts convention: verbatim /
+    mechanical / llm_summarized / llm_prior). Entries whose provenance
+    is ``llm_prior`` (training memory, no on-disk evidence) are not
+    consumed.
+    """
+
+    allocators: frozenset = field(default_factory=frozenset)
+    deallocators: frozenset = field(default_factory=frozenset)
+    lock_acquires: frozenset = field(default_factory=frozenset)
+    lock_releases: frozenset = field(default_factory=frozenset)
+    lock_pairs: frozenset = field(default_factory=frozenset)
+    refcount_gets: frozenset = field(default_factory=frozenset)
+    refcount_puts: frozenset = field(default_factory=frozenset)
+    callback_registers: frozenset = field(default_factory=frozenset)
+    callback_cancels: frozenset = field(default_factory=frozenset)
+    security_fields: frozenset = field(default_factory=frozenset)
+    nullable_returns: frozenset = field(default_factory=frozenset)
+    auth_predicates: frozenset = field(default_factory=frozenset)
+    boundary_transfers: frozenset = field(default_factory=frozenset)
+
+    def merged(self, other: DomainVocabulary) -> DomainVocabulary:
+        """Union of two vocabularies (learned model + target pack)."""
+        return DomainVocabulary(
+            allocators=self.allocators | other.allocators,
+            deallocators=self.deallocators | other.deallocators,
+            lock_acquires=self.lock_acquires | other.lock_acquires,
+            lock_releases=self.lock_releases | other.lock_releases,
+            lock_pairs=self.lock_pairs | other.lock_pairs,
+            refcount_gets=self.refcount_gets | other.refcount_gets,
+            refcount_puts=self.refcount_puts | other.refcount_puts,
+            callback_registers=(
+                self.callback_registers | other.callback_registers
+            ),
+            callback_cancels=self.callback_cancels | other.callback_cancels,
+            security_fields=self.security_fields | other.security_fields,
+            nullable_returns=self.nullable_returns | other.nullable_returns,
+            auth_predicates=self.auth_predicates | other.auth_predicates,
+            boundary_transfers=(
+                self.boundary_transfers | other.boundary_transfers
+            ),
+        )
+
+    @classmethod
+    def from_domain_model(
+        cls, domain_model: dict[str, Any] | None,
+        target_path: str | Path | None = None,
+    ) -> DomainVocabulary:
+        """Build from a domain model, merged with any target-kind pack.
+
+        ``target_path`` gates the vocab packs: when the target looks
+        like a Linux kernel tree, the kernel pack supplies the kernel
+        API bulk that used to be hardcoded in the checkers. Without a
+        domain model AND without a matching pack this returns the empty
+        vocabulary (checkers fall back to their universal seeds).
+        """
+        vocab = cls._from_domain_model_only(domain_model)
+        if target_path is not None:
+            try:
+                from .vocab_packs import pack_for_target
+                pack = pack_for_target(target_path)
+            except Exception:
+                logger.debug("vocab pack load failed", exc_info=True)
+                pack = None
+            if pack is not None:
+                vocab = vocab.merged(pack)
+        return vocab
+
+    @classmethod
+    def _from_domain_model_only(
+        cls, domain_model: dict[str, Any] | None,
+    ) -> DomainVocabulary:
+        """Build the vocabulary from domain-model.json content.
+
+        Every name is gated through :func:`_vocab_name` — a strict
+        C-identifier grammar (mirroring api_pack_renderer._IDENT_RE).
+        Domain models are LLM study output over the UNTRUSTED scanned
+        repo, and vocabulary names get spliced into generated .cocci
+        rules that spatch executes with allow_scripting=True; a name
+        carrying SmPL/Python syntax is a code-injection payload
+        (U12-F260), so anything that is not a plain identifier is
+        rejected at construction, never spliced.
+        """
+        if not domain_model:
+            return cls()
+        pairs = domain_model.get("paired_operations", [])
+
+        alloc: set[str] = set()
+        dealloc: set[str] = set()
+        lock_acq: set[str] = set()
+        lock_rel: set[str] = set()
+        lock_pairs: set[tuple[str, str]] = set()
+        ref_get: set[str] = set()
+        ref_put: set[str] = set()
+        cb_reg: set[str] = set()
+        cb_cancel: set[str] = set()
+
+        # Pair-kind aliases per vocabulary class. The study prompt
+        # elicits the canonical kinds (alloc/lock/refcount/callback);
+        # the aliases cover in-session-written domain models.
+        _ALLOC_KINDS = ("alloc", "allocator")
+        _REFCOUNT_KINDS = ("refcount",)
+        _LOCK_KINDS = (
+            "spinlock", "mutex", "rwlock", "rcu", "lock", "semaphore",
+        )
+        _CALLBACK_KINDS = (
+            "callback", "register", "timer", "work", "workqueue",
+            "tasklet", "hrtimer", "notifier",
+        )
+        _KIND_MAP: dict[str, tuple[set[str], set[str]]] = {}
+        for kinds, buckets_for_kind in (
+            (_ALLOC_KINDS, (alloc, dealloc)),
+            (_REFCOUNT_KINDS, (ref_get, ref_put)),
+            (_LOCK_KINDS, (lock_acq, lock_rel)),
+            (_CALLBACK_KINDS, (cb_reg, cb_cancel)),
+        ):
+            for k in kinds:
+                _KIND_MAP[k] = buckets_for_kind
+
+        for pair in (pairs or []):
+            if not isinstance(pair, dict) or not _entry_actionable(pair):
+                continue
+            acquire = pair.get("acquire", "")
+            release = pair.get("release", "")
+            kind = pair.get("kind", "").lower()
+            if not acquire or not release:
+                continue
+
+            acq_name = _vocab_name(acquire)
+            rel_name = _vocab_name(release)
+            if acq_name is None or rel_name is None:
+                continue
+
+            buckets = _KIND_MAP.get(kind)
+            if buckets:
+                buckets[0].add(acq_name)
+                buckets[1].add(rel_name)
+                if buckets[0] is lock_acq:
+                    # Preserve the exact pairing the study discovered.
+                    lock_pairs.add((acq_name, rel_name))
+
+        sec_fields: set[str] = set()
+        for key in (
+            "security_fields", "security_attributes", "sensitive_fields",
+        ):
+            for entry in domain_model.get(key, []):
+                raw_name = _entry_name(entry)
+                vname = _vocab_name(raw_name) if raw_name else None
+                if vname:
+                    sec_fields.add(vname)
+
+        nullable: set[str] = set()
+        for entry in domain_model.get("nullable_returns", []):
+            raw_name = _entry_name(entry)
+            vname = _vocab_name(raw_name) if raw_name else None
+            if vname:
+                nullable.add(vname)
+
+        auth: set[tuple[str, str]] = set()
+        for entry in domain_model.get("auth_predicates", []):
+            if isinstance(entry, str):
+                vname = _vocab_name(entry)
+                if vname:
+                    auth.add((vname, "domain"))
+            elif (
+                isinstance(entry, dict) and entry.get("name")
+                and _entry_actionable(entry)
+            ):
+                vname = _vocab_name(str(entry["name"]))
+                kind_label = str(entry.get("kind", "domain"))
+                if vname and _VOCAB_IDENT_RE.match(kind_label):
+                    auth.add((vname, kind_label))
+
+        return cls(
+            allocators=frozenset(alloc),
+            deallocators=frozenset(dealloc),
+            lock_acquires=frozenset(lock_acq),
+            lock_releases=frozenset(lock_rel),
+            lock_pairs=frozenset(lock_pairs),
+            refcount_gets=frozenset(ref_get),
+            refcount_puts=frozenset(ref_put),
+            callback_registers=frozenset(cb_reg),
+            callback_cancels=frozenset(cb_cancel),
+            security_fields=frozenset(sec_fields),
+            nullable_returns=frozenset(nullable),
+            auth_predicates=frozenset(auth),
+        )
+
+    @property
+    def has_content(self) -> bool:
+        return bool(
+            self.allocators or self.deallocators
+            or self.lock_acquires or self.lock_releases
+            or self.lock_pairs
+            or self.refcount_gets or self.refcount_puts
+            or self.callback_registers or self.callback_cancels
+            or self.nullable_returns or self.auth_predicates
+            or self.boundary_transfers
+        )
+
+
+def _entry_actionable(entry: dict[str, Any]) -> bool:
+    """Study receipts tier gate for vocabulary dict entries.
+
+    ``llm_prior`` marks a claim backed only by training memory (see
+    ``core.concepts.receipts``) — never consumed as vocabulary. All
+    other tiers (and untiered legacy entries) pass: the mechanical
+    checkers verify the actual code, so vocabulary names only direct
+    attention.
+    """
+    return entry.get("provenance", "") != "llm_prior"
+
+
+def _entry_name(entry: Any) -> str:
+    """Name of a vocabulary entry — plain string or tier-carrying dict."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict) and entry.get("name"):
+        if not _entry_actionable(entry):
+            return ""
+        return str(entry["name"])
+    return ""
+
+
+# Strict identifier grammar for vocabulary names — mirrors
+# engine/coccinelle/api_pack_renderer._IDENT_RE. Vocabulary names are
+# LLM study output over the UNTRUSTED scanned repo and get spliced
+# into generated .cocci text that spatch executes with
+# allow_scripting=True (sweep renders shipped rules through
+# engine/coccinelle/vocab_renderer); anything beyond a plain C
+# identifier is a potential SmPL/Python injection payload (U12-F260:
+# a crafted deallocator name PoC'd an attacker @script:python block).
+_VOCAB_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def _vocab_name(raw: str) -> str | None:
+    """Normalise + validate one vocabulary name.
+
+    Strips a trailing ``(...)`` signature (study output convention),
+    then requires the strict identifier grammar. Returns None —
+    reject, never splice — for anything else.
+    """
+    name = str(raw).split("(")[0].strip()
+    if not name:
+        return None
+    if not _VOCAB_IDENT_RE.match(name):
+        logger.warning(
+            "domain-model vocabulary name rejected (not a plain "
+            "identifier): %r", str(raw)[:80],
+        )
+        return None
+    return name
+
+
+_EMPTY_VOCAB = DomainVocabulary()
+
+
+@dataclass
+class SmtSufficiencyResult:
+    """Result of SMT check on guard sufficiency."""
+
+    guard_text: str
+    feasible: bool | None = None  # True=guard insufficient, False=guard sufficient
+    reasoning: str = ""
+    concrete_values: dict[str, str] = field(default_factory=dict)
+    witness: dict[str, int] | None = None
+    error: str = ""
+
+    @property
+    def guard_sufficient(self) -> bool | None:
+        """True if the guard provably prevents the bug."""
+        if self.feasible is None:
+            return None
+        return not self.feasible  # infeasible overflow = sufficient guard
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "guard_text": self.guard_text,
+            "reasoning": self.reasoning,
+        }
+        if self.feasible is not None:
+            d["feasible"] = self.feasible
+            d["guard_sufficient"] = self.guard_sufficient
+        if self.concrete_values:
+            d["concrete_values"] = self.concrete_values
+        if self.witness:
+            d["witness"] = self.witness
+        if self.error:
+            d["error"] = self.error
+        return d
+
+
+@dataclass
+class PathFeasibilityResult:
+    """Feasibility of extracted integer constraints, not a source safety proof."""
+
+    feasible: bool | None = None
+    reasoning: str = ""
+    witness: dict[str, int] | None = None
+    guard_count: int = 0
+    oracle_scope: str = "integer-constraints"
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"reasoning": self.reasoning, "guard_count": self.guard_count,
+                             "oracle_scope": self.oracle_scope}
+        if self.feasible is not None:
+            d["feasible"] = self.feasible
+        if self.witness:
+            d["witness"] = self.witness
+        return d
+
+
+@dataclass
+class SignedMismatchResult:
+    """Result of checking signed/unsigned comparison mismatch."""
+
+    mismatch: bool = False
+    variable: str = ""
+    reasoning: str = ""
+    witness: dict[str, int] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"mismatch": self.mismatch, "reasoning": self.reasoning}
+        if self.variable:
+            d["variable"] = self.variable
+        if self.witness:
+            d["witness"] = self.witness
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Comparison extraction
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BoundsConstraint:
+    """A concrete bounds constraint extracted from a guard."""
+    variable: str
+    operator: str  # <, <=, >, >=, ==, !=
+    bound_value: int
+    source_text: str = ""
+
+
+def extract_bounds_constraints(
+    guard: GuardCondition,
+) -> list[BoundsConstraint]:
+    """Extract numeric bounds constraints from a guard condition.
+
+    Uses concrete_values for integer-atom constant resolution. Requires a
+    complete supported conjunction; returns [] for unsupported source text.
+    """
+    from .guard_integer_constraints import integer_conjunction
+
+    atoms = integer_conjunction(guard.text, guard.concrete_values)
+    return [BoundsConstraint(var, op, value, guard.text) for var, op, value in atoms] if atoms is not None else []
+
+
+# ---------------------------------------------------------------------------
+# Polarity-aware constraint builder
+# ---------------------------------------------------------------------------
+
+_NEGATE_OP = {"<": ">=", "<=": ">", ">": "<=", ">=": "<", "==": "!=", "!=": "=="}
+
+# Logical NOT that is not the first char of ``!=``.
+_LOGICAL_NOT_RE = re.compile(r"!(?!=)")
+
+# Python/word-form boolean operators (``or`` / ``not``) — same modeling
+# hazard as ``||`` / ``!`` in C-family guards.
+_WORD_BOOL_RE = re.compile(r"\b(?:or|not)\b")
+
+
+def _boolean_structure_tractable(text: str) -> bool:
+    """True when the guard text is a plain conjunction of comparisons.
+
+    The constraint extractor models a guard as the CONJUNCTION of every
+    comparison it can parse.  That model is only faithful when the
+    guard's boolean structure actually is a conjunction: disjunctions
+    (``n == 0 || n == 1``), logical negation (``!(len < max)``), and
+    ternaries select between alternatives that a flat conjunction
+    cannot represent — conjoining their atoms fabricates contradictions
+    (``n == 0 AND n == 1`` is UNSAT while the guard is trivially
+    satisfiable).  Per the safety contract, callers must treat
+    non-tractable guards as inconclusive — never as UNSAT proofs.
+    """
+    if "||" in text or "?" in text:
+        return False
+    if _LOGICAL_NOT_RE.search(text):
+        return False
+    return not _WORD_BOOL_RE.search(text)
+
+
+def _constraints_from_guard_text(
+    guard_text: str,
+) -> list[BoundsConstraint] | None:
+    """Conjunction atoms parsed from a raw guard text.
+
+    Returns None unless the entire guard is a supported conjunction of
+    identifier/literal comparisons. Arithmetic, partial numeric literals,
+    calls and unsupported Boolean structure never contribute fragments.
+    """
+    from .guard_integer_constraints import integer_conjunction
+
+    atoms = integer_conjunction(guard_text)
+    return [BoundsConstraint(var, op, value, guard_text) for var, op, value in atoms] if atoms is not None else None
+
+
+def constraints_for_guard(
+    guard: GuardCondition,
+    *,
+    respect_polarity: bool = True,
+) -> list[BoundsConstraint] | None:
+    """Extract constraints with polarity awareness.
+
+    When polarity is "excluded" (sink in the else-branch) or
+    "negated_guard" (early-return guard clause), the taken path
+    satisfies the NEGATED condition, so the guard is negated:
+    ``len < 1024`` becomes ``len >= 1024``.
+
+    Returns ``None`` when the constraints cannot faithfully represent
+    the guard:
+
+    * any guard operand or Boolean structure lies outside the complete
+      identifier/literal conjunction grammar, or
+    * polarity is "excluded"/"negated_guard" and more than one atom
+      was extracted —
+      by De Morgan ``NOT (A AND B)`` is ``NOT A OR NOT B``, a
+      disjunction; negating the atoms individually would instead
+      assert ``NOT A AND NOT B``, which is strictly stronger and
+      yields false "dead path" proofs.
+    """
+    if not _boolean_structure_tractable(guard.text):
+        return None
+    raw = extract_bounds_constraints(guard)
+    if not raw:
+        return None  # No complete supported conjunction, never a partial proof.
+    if not respect_polarity or guard.polarity not in (
+        "excluded", "negated_guard",
+    ):
+        return raw
+    if len(raw) > 1 or "&&" in guard.text or _SMT_AND_WORD_RE.search(guard.text):
+        # Negation of a conjunction is a disjunction — not
+        # representable as a constraint list.  This also covers the
+        # partially-extracted case (``flag && a < 10`` extracts one
+        # atom but negating it alone over-constrains).  Inconclusive.
+        return None
+    negated = []
+    for c in raw:
+        neg_op = _NEGATE_OP.get(c.operator)
+        if neg_op:
+            negated.append(BoundsConstraint(
+                variable=c.variable, operator=neg_op,
+                bound_value=c.bound_value, source_text=c.source_text,
+            ))
+    return negated
+
+
+# ---------------------------------------------------------------------------
+# Path feasibility — are all guards jointly satisfiable?
+# ---------------------------------------------------------------------------
+
+
+def check_path_feasibility(
+    guards: list[GuardCondition],
+) -> PathFeasibilityResult:
+    """Check whether the conjunction of guard conditions is satisfiable.
+
+    Results concern the extracted unbounded-integer constraint model.
+    They do not establish C widths, conversions, or source reachability.
+    Unmodeled guards prevent a SAT verdict for the complete conjunction;
+    a retained subset model is diagnostic only.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    all_constraints: list[BoundsConstraint] = []
+    unmodeled = 0
+    for g in guards:
+        cs = constraints_for_guard(g, respect_polarity=True)
+        if cs is None:
+            # The complete guard is outside the supported grammar or
+            # its polarity requires an unmodeled disjunction.
+            # Dropping its atoms keeps the remaining conjunction a
+            # weakening of the real path condition — an UNSAT on the
+            # rest is still a sound infeasibility proof — but the
+            # dropped guard itself never contributes atoms, so it can
+            # never manufacture a false contradiction.
+            unmodeled += 1
+            continue
+        all_constraints.extend(cs)
+
+    if not all_constraints:
+        reason = (
+            "guard expression outside supported conjunction model — inconclusive"
+            if unmodeled
+            else "no extractable constraints"
+        )
+        return PathFeasibilityResult(
+            feasible=None,
+            reasoning=reason,
+            guard_count=len(guards),
+        )
+
+    z3_result = _try_z3_path_feasibility(all_constraints)
+    if z3_result is not None:
+        result = PathFeasibilityResult(
+            feasible=z3_result[0],
+            reasoning=z3_result[1],
+            witness=z3_result[2],
+            guard_count=len(guards),
+        )
+    else:
+        result = _arithmetic_path_feasibility(all_constraints, len(guards))
+    if unmodeled and result.feasible is True:
+        result.feasible = None
+        result.reasoning = "encoded guard subset is satisfiable; unmodeled guards — inconclusive"
+    return result
+
+
+def _try_z3_path_feasibility(
+    constraints: list[BoundsConstraint],
+) -> tuple[bool | None, str, dict[str, int] | None] | None:
+    """Z3 path feasibility check. Returns None if Z3 unavailable."""
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("path_feasibility", {
+        "constraints": [asdict(c) for c in constraints],
+    })
+    return _verdict_tuple_from_child(out)
+
+
+def _arithmetic_path_feasibility(
+    constraints: list[BoundsConstraint],
+    guard_count: int,
+) -> PathFeasibilityResult:
+    """Exact independent integer intervals and finite exclusions, without Z3.
+
+    This has the same unbounded-integer model as the bridge's Z3 checker;
+    it does not establish C widths or conversion semantics.
+    """
+    per_var: dict[str, list[BoundsConstraint]] = {}
+    unmodeled = False
+    for c in constraints:
+        if not isinstance(c.variable, str) or not c.variable or type(c.bound_value) is not int:
+            unmodeled = True
+            continue
+        per_var.setdefault(c.variable, []).append(c)
+
+    witness = {}
+    for var, cs in per_var.items():
+        lower: int | None = None
+        upper: int | None = None
+        excluded = set()
+        for c in cs:
+            if c.operator in ("<", "<="):
+                ub = c.bound_value - 1 if c.operator == "<" else c.bound_value
+                if upper is None or ub < upper:
+                    upper = ub
+            elif c.operator in (">", ">="):
+                lb = c.bound_value + 1 if c.operator == ">" else c.bound_value
+                if lower is None or lb > lower:
+                    lower = lb
+            elif c.operator == "==":
+                lower = c.bound_value if lower is None else max(lower, c.bound_value)
+                upper = c.bound_value if upper is None else min(upper, c.bound_value)
+            elif c.operator == "!=":
+                excluded.add(c.bound_value)
+            else:
+                unmodeled = True
+        if lower is not None and upper is not None and lower > upper:
+            return PathFeasibilityResult(
+                feasible=False,
+                reasoning=f"integer-constraint model: {var} requires empty interval [{lower}, {upper}]",
+                guard_count=guard_count,
+            )
+        value = lower if lower is not None else upper if upper is not None else 0
+        direction = -1 if lower is None and upper is not None else 1
+        while value in excluded:
+            value += direction
+        if upper is not None and value > upper:
+            return PathFeasibilityResult(
+                feasible=False,
+                reasoning=f"integer-constraint model: every value for {var} in [{lower}, {upper}] is excluded",
+                guard_count=guard_count,
+            )
+        witness[var] = value
+
+    return PathFeasibilityResult(
+        feasible=None if unmodeled or not per_var else True,
+        reasoning="unsupported integer constraints — inconclusive" if unmodeled or not per_var else "integer-constraint model is feasible with a checked assignment",
+        witness=None if unmodeled or not per_var else witness,
+        guard_count=guard_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Signed/unsigned mismatch detection
+# ---------------------------------------------------------------------------
+
+
+# Unsigned C/kernel integer type names (beyond the ``unsigned`` keyword).
+_UNSIGNED_TYPE_NAMES = frozenset({
+    "size_t", "uintptr_t",
+    "u8", "u16", "u32", "u64",
+    "__u8", "__u16", "__u32", "__u64",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+})
+
+_SIGNED_TYPE_NAMES = frozenset({
+    "int", "long", "short", "char", "long long",
+    "ssize_t", "off_t", "loff_t", "ptrdiff_t",
+    "s8", "s16", "s32", "s64",
+    "__s8", "__s16", "__s32", "__s64",
+    "int8_t", "int16_t", "int32_t", "int64_t",
+})
+
+
+def declared_signedness(var_name: str, source: str) -> bool | None:
+    """Signedness of ``var_name``'s declared type in ``source``.
+
+    Returns True (unsigned), False (signed), or None when no
+    declaration is found — the caller must treat None as unknown, not
+    guess.
+    """
+    if not source or not var_name:
+        return None
+    type_re = re.compile(
+        r"\b((?:unsigned\s+)?(?:int|long(?:\s+long)?|short|char)"
+        r"|[su]?int(?:8|16|32|64)_t"
+        r"|__[su](?:8|16|32|64)"
+        r"|[su](?:8|16|32|64)"
+        r"|size_t|ssize_t|off_t|loff_t|uintptr_t|ptrdiff_t)"
+        # The star run gates its own trailing whitespace: the naive
+        # ``\s+\**\s*`` put two whitespace spans around it —
+        # quadratic on a type token followed by a whitespace run.
+        r"\s+(?:\*+\s*)?" + re.escape(var_name) + r"\b",
+    )
+    m = type_re.search(source)
+    if not m:
+        return None
+    type_str = m.group(1).strip()
+    if type_str.startswith("unsigned") or type_str in _UNSIGNED_TYPE_NAMES:
+        return True
+    if type_str in _SIGNED_TYPE_NAMES:
+        return False
+    return None
+
+
+def check_signed_mismatch(
+    guard: GuardCondition,
+    *,
+    var_is_unsigned: bool | None = None,
+    comparison_is_signed: bool | None = None,
+    bit_width: int = 32,
+    source: str = "",
+) -> SignedMismatchResult:
+    """Check an explicitly supplied signed-comparison/unsigned-use model.
+
+    An unsigned declaration does not establish signed comparison semantics:
+    a plain unsigned comparison with a small integer bound stays unsigned.
+    The caller must separately establish comparison_is_signed=True. Source
+    type lookup alone never grants that assumption. Cast/promotion binding
+    and source reachability are outside this legacy model.
+
+    Every polarity-adjusted guard atom participates in the query, and every
+    returned assignment is replayed against that complete conjunction.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    if comparison_is_signed is not True:
+        return SignedMismatchResult(reasoning="signed comparison semantics not established — no mismatch claim")
+    if var_is_unsigned is not None and type(var_is_unsigned) is not bool:
+        return SignedMismatchResult(reasoning="unsigned-use flag must be a boolean — no mismatch claim")
+    if var_is_unsigned is False:
+        return SignedMismatchResult(reasoning="variable is signed — no mismatch")
+    if type(bit_width) is not int or not 1 <= bit_width <= 64:
+        return SignedMismatchResult(reasoning="unsupported comparison width — no mismatch claim")
+    constraints = constraints_for_guard(guard)
+    limit = 1 << (bit_width - 1)
+    if not constraints or any(not -limit <= c.bound_value < limit for c in constraints):
+        return SignedMismatchResult(reasoning="complete guard model unavailable — no mismatch claim")
+
+    for c in constraints:
+        unsigned: bool | None = var_is_unsigned
+        if unsigned is None:
+            unsigned = declared_signedness(c.variable, source)
+        if unsigned is not True or c.operator not in ("<", "<=") or c.bound_value < 0:
+            continue
+        native = _try_z3_signed_mismatch(c.variable, c.operator, c.bound_value, bit_width, constraints)
+        if native is not None:
+            if type(native.mismatch) is not bool or (native.mismatch and native.variable != c.variable):
+                return SignedMismatchResult(reasoning="malformed comparison result — no mismatch claim")
+            if native.mismatch and not _mismatch_witness_valid(native.witness, c.variable, c.bound_value, bit_width, constraints):
+                return SignedMismatchResult(reasoning="comparison witness failed replay — no mismatch claim")
+            if native.mismatch:
+                return native
+            continue
+        # Independent exact-integer fallback for the same finite signed
+        # domain. Retain every guard atom rather than inventing -1.
+        variables = {atom.variable for atom in constraints}
+        domains = [BoundsConstraint(var, op, value) for var in variables
+                   for op, value in ((">=", -limit), ("<", limit))]
+        candidate = _arithmetic_path_feasibility(
+            constraints + domains + [BoundsConstraint(c.variable, "<", 0)], 1,
+        )
+        if candidate.feasible is True and _mismatch_witness_valid(
+            candidate.witness, c.variable, c.bound_value, bit_width, constraints,
+        ):
+            return SignedMismatchResult(
+                mismatch=True, variable=c.variable, witness=candidate.witness,
+                reasoning="explicit signed-comparison model admits a negative value with a larger unsigned interpretation",
+            )
+    return SignedMismatchResult(reasoning="no mismatch demonstrated in the supplied comparison model")
+
+
+def _mismatch_witness_valid(witness, variable, bound, bit_width, constraints):
+    """Replay finite signed values and every guard without native completion."""
+    import operator
+    comparisons = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
+                   ">=": operator.ge, "==": operator.eq, "!=": operator.ne}
+    limit = 1 << (bit_width - 1)
+    if not isinstance(witness, dict) or set(witness) != {c.variable for c in constraints} | {variable}:
+        return False
+    if any(type(value) is not int or not -limit <= value < limit for value in witness.values()):
+        return False
+    if witness[variable] >= 0 or witness[variable] % (1 << bit_width) <= bound:
+        return False
+    return all(c.operator in comparisons and comparisons[c.operator](witness[c.variable], c.bound_value)
+               for c in constraints)
+
+
+def _try_z3_signed_mismatch(
+    variable: str,
+    operator: str,
+    bound: int,
+    bit_width: int,
+    constraints: list[BoundsConstraint] | None = None,
+) -> SignedMismatchResult | None:
+    """Z3 check for signed/unsigned mismatch. Returns None if Z3 unavailable."""
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("signed_mismatch", {
+        "variable": variable,
+        "operator": operator,
+        "bound": bound,
+        "bit_width": bit_width,
+        "constraints": [asdict(c) for c in constraints] if constraints is not None else None,
+    })
+    return _result_from_child(SignedMismatchResult, out)
+
+
+# ---------------------------------------------------------------------------
+# Off-by-one detection
+# ---------------------------------------------------------------------------
+
+
+def check_off_by_one(
+    sink_guard: SinkGuard,
+    *,
+    buffer_size: int | None = None,
+    copies_null_terminator: bool = True,
+) -> list[SmtSufficiencyResult]:
+    """Detect off-by-one when guard allows exactly buffer_size but sink appends.
+
+    This is a potential strncat length-bound issue, not a source defect
+    proof: actual writes also depend on string lengths and destination
+    position. strncpy does not append a byte beyond its count. Candidate
+    length assignments must satisfy the complete supplied guard model.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    if type(buffer_size) is not int or buffer_size < 0 or copies_null_terminator is not True:
+        return []
+
+    null_term_sinks = frozenset({
+        "strncat",
+    })
+    api_base = sink_guard.sink_api.split(".")[-1] if "." in sink_guard.sink_api else sink_guard.sink_api
+    if api_base not in null_term_sinks:
+        return []
+
+    all_constraints = []
+    for reaching_guard in sink_guard.guards:
+        modeled = constraints_for_guard(reaching_guard)
+        if modeled is None:
+            return []
+        all_constraints.extend(modeled)
+
+    results: list[SmtSufficiencyResult] = []
+    for guard in sink_guard.guards:
+        if not guard.resolvable or not guard.concrete_values:
+            continue
+        constraints = constraints_for_guard(guard, respect_polarity=True)
+        if constraints is None:
+            # Unmodelable boolean structure — an atom pulled out of a
+            # disjunction may not actually gate the sink.
+            continue
+        for c in constraints:
+            if not ((c.operator == "<=" and c.bound_value == buffer_size)
+                    or (c.operator == "<" and c.bound_value == buffer_size + 1)):
+                continue
+            candidate = _arithmetic_path_feasibility(
+                all_constraints + [BoundsConstraint(c.variable, "==", buffer_size)], 1,
+            )
+            if candidate.feasible is not True:
+                continue
+            if c.operator == "<=" and c.bound_value == buffer_size:
+                results.append(SmtSufficiencyResult(
+                    guard_text=guard.text,
+                    feasible=True,
+                    reasoning=(
+                        f"potential off-by-one: guard model permits {c.variable}={c.bound_value} "
+                        f"but {api_base} writes up to {c.bound_value}+1 bytes "
+                        f"(null terminator) into {buffer_size}-byte buffer"
+                    ),
+                    concrete_values=guard.concrete_values,
+                    witness=candidate.witness,
+                ))
+            elif c.operator == "<" and c.bound_value == buffer_size + 1:
+                results.append(SmtSufficiencyResult(
+                    guard_text=guard.text,
+                    feasible=True,
+                    reasoning=(
+                        f"potential off-by-one: guard model permits {c.variable}={c.bound_value - 1} "
+                        f"but {api_base} writes up to {c.bound_value} bytes "
+                        f"(null terminator) into {buffer_size}-byte buffer"
+                    ),
+                    concrete_values=guard.concrete_values,
+                    witness=candidate.witness,
+                ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# SMT sufficiency check
+# ---------------------------------------------------------------------------
+
+
+def check_guard_sufficiency(
+    sink_guard: SinkGuard,
+    *,
+    buffer_size: int | None = None,
+    sink_context: dict[str, Any] | None = None,
+) -> list[SmtSufficiencyResult]:
+    """Check whether guard conditions are sufficient via SMT.
+
+    For each resolvable guard with concrete values, formulates a query:
+    "Can the constrained variable still violate the safety property?"
+
+    Args:
+        sink_guard: The guard set to check.
+        buffer_size: Known buffer size for overflow sinks (from allocation).
+        sink_context: Additional context (e.g., from annotations).
+
+    Returns:
+        List of SMT results, one per resolvable guard.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    results: list[SmtSufficiencyResult] = []
+
+    for guard in sink_guard.guards:
+        if not guard.resolvable or not guard.concrete_values:
+            continue
+
+        constraints = constraints_for_guard(guard, respect_polarity=True)
+        if constraints is None:
+            # Boolean structure (||/!/ternary or negated conjunction)
+            # the conjunctive model cannot represent.  A "sufficient"
+            # verdict computed from conjoined atoms would falsely
+            # assume every disjunct holds — honest verdict is
+            # inconclusive (no mechanical effect).
+            results.append(SmtSufficiencyResult(
+                guard_text=guard.text,
+                feasible=None,
+                reasoning=(
+                    "guard expression outside supported conjunction model "
+                    "— sufficiency inconclusive"
+                ),
+                concrete_values=guard.concrete_values,
+            ))
+            continue
+        if not constraints:
+            continue
+
+        result = _check_constraints_vs_safety(
+            constraints=constraints,
+            guard=guard,
+            buffer_size=buffer_size,
+            sink_api=sink_guard.sink_api,
+            sink_context=sink_context,
+        )
+        results.append(result)
+
+    return results
+
+
+def _check_constraints_vs_safety(
+    constraints: list[BoundsConstraint],
+    guard: GuardCondition,
+    buffer_size: int | None,
+    sink_api: str,
+    sink_context: dict[str, Any] | None,
+) -> SmtSufficiencyResult:
+    """Check if constraints are sufficient for the safety property.
+
+    For buffer overflow sinks: can the constrained length still exceed
+    the buffer size?
+    """
+    # Try Z3 first
+    z3_result = _try_z3_check(constraints, buffer_size, sink_api)
+    if z3_result is not None:
+        witness = z3_result[2] if len(z3_result) > 2 else None
+        return SmtSufficiencyResult(
+            guard_text=guard.text,
+            feasible=z3_result[0],
+            reasoning=z3_result[1],
+            concrete_values=guard.concrete_values,
+            witness=witness,
+        )
+
+    # Fallback: simple arithmetic reasoning
+    return _arithmetic_check(constraints, guard, buffer_size, sink_api)
+
+
+def _try_z3_check(
+    constraints: list[BoundsConstraint],
+    buffer_size: int | None,
+    sink_api: str,
+) -> tuple[bool | None, str, dict[str, int] | None] | None:
+    """Try Z3 SMT check. Returns None if Z3 unavailable.
+
+    Runs in a forked subprocess so Z3 assertion failures (segfaults in
+    the C++ core) don't kill the parent process.
+    """
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("guard_sufficiency", {
+        "constraints": [asdict(c) for c in constraints],
+        "buffer_size": buffer_size,
+        "sink_api": sink_api,
+    })
+    return _verdict_tuple_from_child(out)
+
+
+def _z3_importable() -> bool:
+    """True when the z3 package is installed (child would import it)."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("z3") is not None
+    except ImportError:
+        return False
+
+
+def _run_z3_child(tag: str, args: dict[str, Any], *, timeout: int = 10):
+    """Run one Z3 check in an isolated child over the JSON protocol.
+
+    One parameterised runner for every ``_try_z3_*`` wrapper — the
+    request is ``{"tag": ..., "args": {...}}``, dispatched child-side
+    by :func:`_z3_dispatch_json`. Returns the decoded JSON result or
+    ``None`` on any child failure (crash-isolation semantics unchanged
+    from the former pickle runners).
+    """
+    from .subproc_json import run_json_child
+    return run_json_child(
+        "core.audit.condition_smt:_z3_dispatch_json",
+        {"tag": tag, "args": args},
+        env=_z3_child_env(),
+        timeout=timeout,
+        label=f"z3:{tag}",
+    )
+
+
+def _result_from_child(cls, out):
+    """Rebuild a result dataclass from the child's JSON dict, or None."""
+    if not isinstance(out, dict):
+        return None
+    try:
+        return cls(**out)
+    except TypeError:
+        logger.debug(
+            "z3 child returned unexpected fields for %s", cls.__name__,
+        )
+        return None
+
+
+def _verdict_tuple_from_child(
+    out,
+) -> tuple[bool | None, str, dict[str, int] | None] | None:
+    """Rebuild a (verdict, reasoning, witness) tuple from child JSON.
+
+    ``verdict`` may be ``None`` — an inconclusive check (no sufficiency
+    model applies, insufficient variables) that must produce neither a
+    "guard sufficient" nor a "guard insufficient" claim.
+    """
+    if not isinstance(out, list) or len(out) != 3:
+        return None
+    verdict, reasoning, witness = out
+    if verdict is not None and not isinstance(verdict, bool):
+        return None
+    if not isinstance(reasoning, str):
+        return None
+    if witness is not None and not isinstance(witness, dict):
+        witness = None
+    return (verdict, reasoning, witness)
+
+
+def _z3_child_env() -> dict:
+    """Safe non-LLM environment for the SMT worker broker.
+
+    Retain a pinned RAPTOR_DIR for caller compatibility. The broker strips
+    framework markers and the worker resolves imports from its own file.
+    User-site dependencies are admitted explicitly after confinement.
+    """
+    from core.config import RaptorConfig, pin_raptor_dir
+    return RaptorConfig.strip_llm_env_vars(
+        pin_raptor_dir(RaptorConfig.get_safe_env()))
+
+
+_BUFFER_COPY_SINKS = frozenset({
+    "memcpy", "memmove", "strncpy", "strncat", "bcopy",
+    "copy_from_user", "copy_to_user", "wmemcpy",
+    "CopyMemory", "RtlCopyMemory",
+})
+
+
+def _z3_dispatch(
+    constraints: list[BoundsConstraint],
+    buffer_size: int | None,
+    sink_api: str,
+) -> tuple[bool | None, str, dict[str, int] | None] | None:
+    """Route to the appropriate Z3 check."""
+    alloc_sinks = {
+        "malloc", "calloc", "realloc", "kmalloc", "kzalloc",
+    }
+
+    api_base = sink_api.rsplit(".", maxsplit=1)[-1] if "." in sink_api else sink_api
+
+    if api_base in _BUFFER_COPY_SINKS and buffer_size is not None:
+        return _z3_overflow_check(constraints, buffer_size)
+    if api_base in alloc_sinks:
+        return _z3_alloc_overflow_check(constraints)
+
+    return _z3_consistency_check(constraints)
+
+
+_OVERFLOW_BV_WIDTH = 64
+
+
+def _signed_guard_bounds_fit(constraints: list[BoundsConstraint]) -> bool:
+    """Do not silently reduce mathematical guard bounds modulo 2**64."""
+    limit = 1 << (_OVERFLOW_BV_WIDTH - 1)
+    return bool(constraints) and all(
+        isinstance(c.variable, str) and bool(c.variable)
+        and c.operator in _NEGATE_OP
+        and type(c.bound_value) is int and -limit <= c.bound_value < limit
+        for c in constraints
+    )
+
+
+def _bv_signed(value: int, width: int = _OVERFLOW_BV_WIDTH) -> int:
+    """Signed interpretation of an unsigned bitvector model value."""
+    if value >= (1 << (width - 1)):
+        return value - (1 << width)
+    return value
+
+
+def _z3_overflow_check(
+    constraints: list[BoundsConstraint],
+    buffer_size: int,
+) -> tuple[bool | None, str, dict[str, int] | None]:
+    """Z3: Can length still overflow given the guard constraints?
+
+    Bitvector model with explicit signedness.  Guard atoms use SIGNED
+    comparisons — without declared-type evidence a C comparison like
+    ``len < 1024`` must be assumed signed, because assuming unsigned
+    silently rules out the negative-value case.  The overflow question
+    uses the UNSIGNED interpretation (the copy length parameter is
+    ``size_t``): a signed ``len = -1`` that passes ``len < 1024``
+    reaches ``memcpy`` as ``SIZE_MAX``.  The previous ``z3.Int`` model
+    had no wrap at all and declared such guards sufficient.
+    """
+    if not _signed_guard_bounds_fit(constraints):
+        return (None, "guard bounds do not fit the signed 64-bit model — inconclusive", None)
+    if type(buffer_size) is not int or not 0 <= buffer_size < (1 << _OVERFLOW_BV_WIDTH):
+        return (None, "buffer size does not fit the unsigned 64-bit model — inconclusive", None)
+
+    import z3
+
+    from core.smt_solver.session import check_solver, new_solver
+
+    solver = new_solver()
+
+    vars_map: dict[str, z3.BitVecRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.BitVec(c.variable, _OVERFLOW_BV_WIDTH)
+
+    # Guard constraints — z3py's overloaded comparisons on bitvectors
+    # are signed (BVSLT/BVSLE/...).
+    for c in constraints:
+        v = vars_map[c.variable]
+        bv_val = z3.BitVecVal(c.bound_value, _OVERFLOW_BV_WIDTH)
+        if c.operator == "<":
+            solver.add(v < bv_val)
+        elif c.operator == "<=":
+            solver.add(v <= bv_val)
+        elif c.operator == ">":
+            solver.add(v > bv_val)
+        elif c.operator == ">=":
+            solver.add(v >= bv_val)
+        elif c.operator == "==":
+            solver.add(v == bv_val)
+        elif c.operator == "!=":
+            solver.add(v != bv_val)
+
+    bv_buffer = z3.BitVecVal(buffer_size, _OVERFLOW_BV_WIDTH)
+
+    # Ask: can any constrained variable, as the sink's size_t argument,
+    # exceed buffer_size?
+    for name, v in vars_map.items():
+        solver.push()
+        solver.add(z3.UGT(v, bv_buffer))
+        result = check_solver(solver)
+        if result == z3.sat:
+            model = solver.model()
+            witness: dict[str, int] = {}
+            for wname, wv in vars_map.items():
+                wval = model[wv]
+                if wval is not None:
+                    try:
+                        witness[wname] = _bv_signed(wval.as_long())
+                    except AttributeError:
+                        pass
+            solver.pop()
+            shown = witness.get(name)
+            wrap_note = (
+                " (negative value wraps to a huge size_t)"
+                if shown is not None and shown < 0 else ""
+            )
+            return (
+                True,
+                (
+                    f"overflow possible: {name} can be {shown} with "
+                    f"unsigned interpretation > {buffer_size}{wrap_note}"
+                ),
+                witness or None,
+            )
+        if result == z3.unknown:
+            solver.pop()
+            return (None, "solver returned unknown — guard sufficiency inconclusive", None)
+        solver.pop()
+
+    return (
+        False,
+        (
+            f"guard sufficient: all constrained vars ≤ {buffer_size} "
+            f"(unsigned interpretation, signed guard atoms)"
+        ),
+        None,
+    )
+
+
+def _z3_alloc_overflow_check(
+    constraints: list[BoundsConstraint],
+) -> tuple[bool | None, str, dict[str, int] | None]:
+    """Z3: Can an allocation size integer-overflow given the constraints?
+
+    Guard atoms are encoded with SIGNED comparisons: source guards on
+    C integer variables must be assumed signed absent declared-type
+    evidence.  The previous unsigned encoding turned ``n > -1`` into
+    ``UGT(n, 0xFF..FF)`` — unsatisfiable — so every follow-on
+    multiplication query came back UNSAT and the check declared
+    "allocation size cannot overflow" from a mis-modeled guard.  The
+    wrap question itself stays on the unsigned (size_t) product.
+    """
+    if not _signed_guard_bounds_fit(constraints):
+        return (None, "guard bounds do not fit the signed 64-bit model — inconclusive", None)
+
+    import z3
+
+    from core.smt_solver.session import check_solver, new_solver
+
+    solver = new_solver()
+
+    vars_map: dict[str, z3.BitVecRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.BitVec(c.variable, 64)
+
+    # z3py's overloaded comparisons on bitvectors are signed.
+    for c in constraints:
+        v = vars_map[c.variable]
+        bv_val = z3.BitVecVal(c.bound_value, 64)
+        if c.operator == "<":
+            solver.add(v < bv_val)
+        elif c.operator == "<=":
+            solver.add(v <= bv_val)
+        elif c.operator == ">":
+            solver.add(v > bv_val)
+        elif c.operator == ">=":
+            solver.add(v >= bv_val)
+        elif c.operator == "==":
+            solver.add(v == bv_val)
+        elif c.operator == "!=":
+            solver.add(v != bv_val)
+
+    # Check: can multiplication of any two constrained vars wrap?
+    var_list = list(vars_map.items())
+    if len(var_list) >= 2:
+        for i in range(len(var_list)):
+            for j in range(i + 1, len(var_list)):
+                (_, a), (_, b) = var_list[i], var_list[j]
+                solver.push()
+                a_ext = z3.ZeroExt(64, a)
+                b_ext = z3.ZeroExt(64, b)
+                full_product = a_ext * b_ext
+                upper_bits = z3.Extract(127, 64, full_product)
+                solver.add(upper_bits != z3.BitVecVal(0, 64))
+
+                result = check_solver(solver)
+                if result == z3.sat:
+                    model = solver.model()
+                    witness = {}
+                    for wn, wv in vars_map.items():
+                        wval = model[wv]
+                        if wval is not None:
+                            try:
+                                witness[wn] = wval.as_long()
+                            except AttributeError:
+                                pass
+                    solver.pop()
+                    return (True, "integer overflow in allocation size is possible", witness or None)
+                solver.pop()
+                if result == z3.unknown:
+                    return (None, "solver returned unknown — allocation overflow inconclusive", None)
+        return (False, "allocation size cannot overflow given constraints", None)
+
+    # A single constrained variable gives the multiplication model
+    # nothing to check — that is the ABSENCE of an analysis, not a
+    # proof that the allocation size cannot overflow.  Returning False
+    # here used to stamp guard_sufficient=True vacuously.
+    return (
+        None,
+        (
+            "insufficient variables for multiplication overflow check "
+            "— inconclusive"
+        ),
+        None,
+    )
+
+
+def _z3_consistency_check(
+    constraints: list[BoundsConstraint],
+) -> tuple[bool | None, str, dict[str, int] | None]:
+    """Z3: Are the constraints internally consistent?
+
+    Consistency is NOT sufficiency: a satisfiable guard says nothing
+    about whether the guard prevents the bug class at this sink.  This
+    check therefore never produces a verdict — it exists only to keep
+    the dispatch total for sink classes without a sufficiency model.
+    Returning False here used to stamp guard_sufficient=True for every
+    non-memcpy/non-alloc sink with any resolvable guard.
+    """
+    import z3
+
+    from core.smt_solver.session import check_solver, new_solver
+
+    solver = new_solver()
+
+    vars_map: dict[str, z3.ArithRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.Int(c.variable)
+
+    for c in constraints:
+        v = vars_map[c.variable]
+        if c.operator == "<":
+            solver.add(v < c.bound_value)
+        elif c.operator == "<=":
+            solver.add(v <= c.bound_value)
+        elif c.operator == ">":
+            solver.add(v > c.bound_value)
+        elif c.operator == ">=":
+            solver.add(v >= c.bound_value)
+        elif c.operator == "==":
+            solver.add(v == c.bound_value)
+        elif c.operator == "!=":
+            solver.add(v != c.bound_value)
+
+    result = check_solver(solver)
+    if result not in (z3.sat, z3.unsat):
+        return (None, "solver returned unknown — consistency inconclusive", None)
+    if result == z3.unsat:
+        return (
+            None,
+            (
+                "constraints are contradictory — no sufficiency model "
+                "for this sink class; inconclusive"
+            ),
+            None,
+        )
+    return (
+        None,
+        (
+            "constraints are consistent — consistency is not a "
+            "sufficiency proof; inconclusive"
+        ),
+        None,
+    )
+
+
+def _z3_dispatch_json(request: dict) -> Any:
+    """Child-side dispatcher for the JSON protocol.
+
+    Rebuilds dataclass arguments from the plain dicts the parent sent,
+    routes to the in-process ``_z3_*_check`` implementations, and
+    flattens their results back to JSON-native shapes (lists / dicts /
+    primitives) — only the verdict fields cross the process boundary.
+    """
+    tag = request.get("tag")
+    args = request.get("args") or {}
+    if tag == "invariant_site_batch":
+        from .invariant_batch import run_request
+        return run_request(args)
+    if tag == "invariant_preservation":
+        from .invariant_worker import run_request
+        return run_request(args)
+    if tag == "overflow_disproof":
+        from .overflow_disproof import run_request
+        return run_request(args)
+    if tag == "literal_call":
+        from .literal_call import check_literal_calls
+        return check_literal_calls(**args)
+    if tag == "guard_sufficiency":
+        constraints = [BoundsConstraint(**c) for c in args["constraints"]]
+        result = _z3_dispatch(
+            constraints, args.get("buffer_size"), args.get("sink_api", ""),
+        )
+        return list(result) if result is not None else None
+    if tag == "path_feasibility":
+        constraints = [BoundsConstraint(**c) for c in args["constraints"]]
+        return list(_z3_path_feasibility_check(constraints))
+    if tag == "signed_mismatch":
+        return asdict(_z3_signed_mismatch_check(
+            args["variable"], args["operator"],
+            args["bound"], args["bit_width"],
+            [BoundsConstraint(**c) for c in args["constraints"]] if args.get("constraints") is not None else None,
+        ))
+    if tag == "auth_bypass":
+        return asdict(_z3_auth_bypass_check(
+            args["guard_text"], list(args.get("bypassed_checks") or []),
+        ))
+    if tag == "lock_discipline":
+        return asdict(_z3_lock_discipline_check(
+            args["guard_text"], args["lock_func"], args["ret_line"],
+        ))
+    if tag == "resource_leak":
+        return asdict(_z3_resource_leak_check(
+            args["guard_text"], args["var_name"], args["alloc_func"],
+            args["alloc_line"], args["ret_line"],
+        ))
+    if tag == "integer_narrowing":
+        return asdict(_z3_integer_narrowing_check(
+            args["var_name"], args["src_type"],
+            args["dest_type"], args["assign_line"],
+        ))
+    return None
+
+
+def _z3_path_feasibility_check(
+    constraints: list[BoundsConstraint],
+) -> tuple[bool | None, str, dict[str, int] | None]:
+    """Z3: Check if all constraints can be satisfied simultaneously.
+
+    Uses z3.Int (integer sort) rather than bitvectors because guards
+    extracted from tree-sitter are arithmetic comparisons, not
+    bit-width-bounded.  Uses core.smt_solver.session for solver
+    construction with timeout.
+    """
+    from core.smt_solver.availability import z3
+    from core.smt_solver.session import check_solver, new_solver
+
+    solver = new_solver()
+
+    vars_map: dict[str, z3.ArithRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.Int(c.variable)
+
+    for c in constraints:
+        v = vars_map[c.variable]
+        if c.operator == "<":
+            solver.add(v < c.bound_value)
+        elif c.operator == "<=":
+            solver.add(v <= c.bound_value)
+        elif c.operator == ">":
+            solver.add(v > c.bound_value)
+        elif c.operator == ">=":
+            solver.add(v >= c.bound_value)
+        elif c.operator == "==":
+            solver.add(v == c.bound_value)
+        elif c.operator == "!=":
+            solver.add(v != c.bound_value)
+
+    result = check_solver(solver)
+    if result == z3.unsat:
+        return (False, "path infeasible: guard conjunction is unsatisfiable", None)
+    if result == z3.sat:
+        model = solver.model()
+        witness = {}
+        for name, var in vars_map.items():
+            val = model[var]
+            if val is not None:
+                try:
+                    witness[name] = val.as_long()
+                except AttributeError:
+                    pass
+        return (True, "path feasible", witness or None)
+    return (None, "solver returned unknown — path feasibility inconclusive", None)
+
+
+def _z3_signed_mismatch_check(
+    variable: str,
+    operator: str,
+    bound: int,
+    bit_width: int,
+    constraints: list[BoundsConstraint] | None = None,
+) -> SignedMismatchResult:
+    """Solve the supplied signed-comparison model, never infer C conversions."""
+    from core.smt_solver.availability import z3
+    from core.smt_solver.session import check_solver, new_solver
+    from core.smt_solver.witness import format_vars
+
+    if (type(bit_width) is not int or not 1 <= bit_width <= 64
+            or operator not in {"<", "<="} or not isinstance(variable, str)
+            or not variable or type(bound) is not int or not 0 <= bound < (1 << (bit_width - 1))):
+        return SignedMismatchResult(reasoning="unsupported comparison model — inconclusive")
+    constraints = [BoundsConstraint(variable, operator, bound)] if constraints is None else list(constraints)
+    limit = 1 << (bit_width - 1)
+    if any(not isinstance(c.variable, str) or not c.variable or c.operator not in _NEGATE_OP
+           or type(c.bound_value) is not int or not -limit <= c.bound_value < limit for c in constraints):
+        return SignedMismatchResult(reasoning="unsupported guard model — inconclusive")
+    solver = new_solver()
+    variables = {name: z3.BitVec(name, bit_width) for name in {variable} | {c.variable for c in constraints}}
+    for c in constraints:
+        value, constant = variables[c.variable], z3.BitVecVal(c.bound_value, bit_width)
+        expressions = {"<": value < constant, "<=": value <= constant, ">": value > constant,
+                       ">=": value >= constant, "==": value == constant, "!=": value != constant}
+        solver.add(expressions[c.operator])
+    value = variables[variable]
+    # Assert the named comparison too: explicit constraints may omit it.
+    solver.add(value < bound if operator == "<" else value <= bound)
+    solver.add(value < 0, z3.UGT(value, z3.BitVecVal(bound, bit_width)))
+    result = check_solver(solver)
+    if result == z3.unknown:
+        return SignedMismatchResult(reasoning="solver returned unknown — comparison model inconclusive")
+    if result == z3.unsat:
+        return SignedMismatchResult(reasoning="supplied comparison model has no mismatch (Z3 UNSAT)")
+    try:
+        witness = format_vars(solver.model(), variables, signed=True, completion=True)
+    except Exception:
+        return SignedMismatchResult(reasoning="comparison model unavailable — no witness claim")
+    if not _mismatch_witness_valid(witness, variable, bound, bit_width, constraints):
+        return SignedMismatchResult(reasoning="comparison witness failed replay — no mismatch claim")
+    return SignedMismatchResult(
+        mismatch=True, variable=variable, witness=witness,
+        reasoning="explicit signed-comparison model admits a negative value with a larger unsigned interpretation",
+    )
+
+
+def _z3_auth_bypass_check(
+    guard_text: str,
+    bypassed_checks: list[str],
+) -> AuthBypassResult:
+    """Z3: Check if an early-return guard condition is satisfiable.
+
+    If SAT, the early return can be taken, bypassing the later auth
+    checks.  The guard condition is parsed for comparisons and encoded
+    as Z3 integer constraints.  A satisfying assignment is the witness
+    that demonstrates the bypass.
+    """
+    from core.smt_solver.availability import z3
+    from core.smt_solver.session import check_solver, new_solver
+
+    constraints = _constraints_from_guard_text(guard_text)
+
+    if constraints is None:
+        # Boolean structure (||/!/ternary) the conjunctive model cannot
+        # represent — a conjunction of the atoms would be a mis-model
+        # and its UNSAT a false "no bypass possible".  Conservatively
+        # treat the guard as satisfiable (same direction as the
+        # non-numeric case): the bypass is flagged for LLM review.
+        return AuthBypassResult(
+            bypass_found=True,
+            guard_text=guard_text,
+            bypassed_checks=bypassed_checks,
+            reasoning=(
+                f"early return guarded by '{guard_text.strip()}' bypasses "
+                f"auth checks {', '.join(bypassed_checks)} — guard boolean "
+                f"structure (||/!/ternary) not modeled, conservatively "
+                f"treated as feasible"
+            ),
+        )
+    if not constraints:
+        return AuthBypassResult(
+            bypass_found=True,
+            guard_text=guard_text,
+            bypassed_checks=bypassed_checks,
+            reasoning=(
+                f"early return guarded by '{guard_text.strip()}' bypasses "
+                f"auth checks {', '.join(bypassed_checks)} — guard has no "
+                f"numeric constraints (identity/state check, always feasible)"
+            ),
+        )
+
+    solver = new_solver()
+    vars_map: dict[str, z3.ArithRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.Int(c.variable)
+
+    for c in constraints:
+        v = vars_map[c.variable]
+        if c.operator == "<":
+            solver.add(v < c.bound_value)
+        elif c.operator == "<=":
+            solver.add(v <= c.bound_value)
+        elif c.operator == ">":
+            solver.add(v > c.bound_value)
+        elif c.operator == ">=":
+            solver.add(v >= c.bound_value)
+        elif c.operator == "==":
+            solver.add(v == c.bound_value)
+        elif c.operator == "!=":
+            solver.add(v != c.bound_value)
+
+    result = check_solver(solver)
+    if result == z3.sat:
+        model = solver.model()
+        witness: dict[str, Any] = {}
+        for name, var in vars_map.items():
+            val = model[var]
+            if val is not None:
+                try:
+                    witness[name] = val.as_long()
+                except AttributeError:
+                    pass
+        return AuthBypassResult(
+            bypass_found=True,
+            guard_text=guard_text,
+            bypassed_checks=bypassed_checks,
+            reasoning=(
+                f"Z3 SAT: guard '{guard_text.strip()}' is satisfiable — "
+                f"early return bypasses {', '.join(bypassed_checks)}"
+            ),
+            witness=witness or None,
+        )
+    if result == z3.unsat:
+        return AuthBypassResult(
+            bypass_found=False,
+            guard_text=guard_text,
+            reasoning=(
+                f"Z3 UNSAT: guard '{guard_text.strip()}' is infeasible — "
+                f"no bypass possible"
+            ),
+        )
+    return AuthBypassResult(
+        bypass_found=True,
+        guard_text=guard_text,
+        bypassed_checks=bypassed_checks,
+        reasoning="Z3 timeout — conservatively flag as potential bypass",
+    )
+
+
+def _arithmetic_check(
+    constraints: list[BoundsConstraint],
+    guard: GuardCondition,
+    buffer_size: int | None,
+    sink_api: str,
+) -> SmtSufficiencyResult:
+    """Exact fallback for the native copy check's signed-64 guard model.
+
+    Each constrained variable is considered independently as an unsigned
+    copy length, just as in _z3_overflow_check. This establishes neither
+    source argument identity nor C type/conversion semantics. Allocation
+    and unknown sink models remain inconclusive without Z3.
+    """
+    def result(feasible, reasoning, witness=None):
+        return SmtSufficiencyResult(
+            guard_text=guard.text, feasible=feasible, reasoning=reasoning,
+            concrete_values=guard.concrete_values, witness=witness,
+        )
+
+    if buffer_size is None:
+        return result(None, "no buffer size known for arithmetic check")
+    if sink_api.rsplit(".", 1)[-1] not in _BUFFER_COPY_SINKS:
+        return result(None, "no arithmetic sufficiency model for this sink")
+    if not _signed_guard_bounds_fit(constraints):
+        return result(None, "guard bounds do not fit the signed 64-bit model — inconclusive")
+    if type(buffer_size) is not int or not 0 <= buffer_size < (1 << _OVERFLOW_BV_WIDTH):
+        return result(None, "buffer size does not fit the unsigned 64-bit model — inconclusive")
+
+    modulus = 1 << _OVERFLOW_BV_WIDTH
+    variables = sorted({c.variable for c in constraints})
+    domains = [
+        BoundsConstraint(var, op, value)
+        for var in variables
+        for op, value in ((">=", -(modulus // 2)), ("<", modulus // 2))
+    ]
+    base = list(constraints) + domains
+    for var in variables:
+        # Negative signed values become value + 2**64 at the sink.
+        # Positive values retain their integer value. Query both ranges,
+        # always retaining every guard constraint on every variable.
+        for lower, upper in ((buffer_size - modulus, 0), (buffer_size, modulus // 2)):
+            candidate = _arithmetic_path_feasibility(
+                base + [BoundsConstraint(var, ">", lower), BoundsConstraint(var, "<", upper)],
+                1,
+            )
+            if candidate.feasible is True:
+                return result(True, f"unsigned copy-length model exceeds {buffer_size}", candidate.witness)
+            if candidate.feasible is None:
+                return result(None, "arithmetic copy-length model inconclusive")
+    return result(False, f"all constrained copy-length values fit {buffer_size} in the signed-64 guard model")
+
+
+# ---------------------------------------------------------------------------
+# Batch API
+# ---------------------------------------------------------------------------
+
+
+def check_all_sufficiency(
+    guards: list[SinkGuard],
+    *,
+    buffer_sizes: dict[int, int] | None = None,
+) -> list[list[SmtSufficiencyResult]]:
+    """Check sufficiency for all guards.
+
+    Args:
+        guards: List of SinkGuard instances.
+        buffer_sizes: Map of sink_line → known buffer size.
+
+    Returns:
+        List of results per guard (one inner list per SinkGuard).
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    if buffer_sizes is None:
+        buffer_sizes = {}
+
+    return [
+        check_guard_sufficiency(
+            sg,
+            buffer_size=buffer_sizes.get(sg.sink_line),
+        )
+        for sg in guards
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Auth bypass detection
+# ---------------------------------------------------------------------------
+
+# SEED SET — shape patterns (LSM prefix family, cred field access) plus
+# two canonical exemplars. The kernel predicate bulk (ns_capable,
+# inode_permission, ptrace_may_access, ...) lives in the linux_kernel
+# vocab pack; project predicates arrive via
+# DomainVocabulary.auth_predicates. Do not grow this list — teach the
+# study loop / pack instead.
+_AUTH_CHECK_PATTERNS = [
+    (re.compile(r"\b(capable)\s*\("), "capability"),
+    (re.compile(r"\b(security_\w+)\s*\("), "lsm"),
+    (re.compile(r"\b(uid_eq)\s*\("), "uid"),
+    (re.compile(r"\bcred->(uid|euid|suid|fsuid)\b"), "uid"),
+]
+
+
+def _auth_patterns(
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> list[tuple[re.Pattern, str]]:
+    """Seed auth patterns extended with vocab-supplied predicates."""
+    patterns = list(_AUTH_CHECK_PATTERNS)
+    if vocab.auth_predicates:
+        by_kind: dict[str, list[str]] = {}
+        for name, kind in sorted(vocab.auth_predicates):
+            by_kind.setdefault(kind, []).append(name)
+        for kind in sorted(by_kind):
+            alts = "|".join(
+                re.escape(n)
+                for n in sorted(by_kind[kind], key=len, reverse=True)
+            )
+            patterns.append((re.compile(rf"\b({alts})\s*\("), kind))
+    return patterns
+
+# Horizontal-only indent in the three return-line patterns — the
+# MULTILINE ^\s* idiom is quadratic on blank-line runs in scanned
+# source (identical match set per line for the per-line users).
+# The statement tail folds its trailing whitespace INTO the optional
+# group (``(?:;\s*)?$``, equivalent match set): the naive
+# ``\s*;?\s*$`` puts two unbounded whitespace spans around the
+# optional semicolon, and a return value followed by a long
+# whitespace run with no line end makes the engine try every split
+# of the run between them — quadratic on a single return token.
+_SUCCESS_RETURN_RE = re.compile(
+    r"^[^\S\n]*return\s+(0|nil|None|True|true|EXIT_SUCCESS)\s*(?:;\s*)?$",
+    re.MULTILINE,
+)
+
+_DENY_RETURN_RE = re.compile(
+    r"return\s+(-E[A-Z]+|-1|EPERM|EACCES|false|False)",
+)
+
+
+@dataclass
+class AuthBypassResult:
+    """Result of checking for auth check bypass via early return."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    bypass_found: bool = False
+    early_return_line: int = 0
+    guard_text: str = ""
+    bypassed_checks: list[str] = field(default_factory=list)
+    reasoning: str = ""
+    witness: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "bypass_found": self.bypass_found,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        if self.early_return_line:
+            d["early_return_line"] = self.early_return_line
+        if self.guard_text:
+            d["guard_text"] = self.guard_text
+        if self.bypassed_checks:
+            d["bypassed_checks"] = self.bypassed_checks
+        if self.witness:
+            d["witness"] = self.witness
+        return d
+
+
+def check_auth_bypass(
+    source: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> AuthBypassResult:
+    """Detect auth check bypass via early success return.
+
+    Scans for the pattern: a success return (return 0) guarded by a
+    weaker condition that appears BEFORE a stronger auth check
+    (capable(), uid_eq(), security_*()).  If the early return can be
+    taken without passing the later auth check, the later check is
+    bypassed.
+
+    Uses Z3 when available to verify guard feasibility; falls back to
+    structural ordering analysis.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+
+    auth_checks = _extract_auth_checks(lines, vocab)
+    if not auth_checks:
+        return AuthBypassResult(
+            applicable=False,
+            reasoning="no auth checks found in source",
+        )
+
+    success_returns = _extract_success_returns(lines)
+    if not success_returns:
+        return AuthBypassResult(
+            applicable=False,
+            reasoning="no success returns found",
+        )
+
+    last_auth_line = max(c[0] for c in auth_checks)
+
+    for ret_line in success_returns:
+        if ret_line >= last_auth_line:
+            continue
+
+        guard_text = _find_enclosing_guard(lines, ret_line)
+        if not guard_text:
+            continue
+
+        if _guard_is_auth_check(guard_text, auth_checks):
+            continue
+
+        bypassed = [
+            f"{atype}:{afunc}" for aline, atype, afunc in auth_checks
+            if aline > ret_line
+        ]
+        if not bypassed:
+            continue
+
+        # Cascading permission function: if the exact same auth call
+        # (same function AND arguments) appears both before and after
+        # the early return, this is an intentional early-out path.
+        bypassed_calls = {
+            call for aline, _, call in auth_checks if aline > ret_line
+        }
+        earlier_calls = {
+            call for aline, _, call in auth_checks if aline < ret_line
+        }
+        if bypassed_calls & earlier_calls:
+            continue
+
+        z3_result = _try_z3_auth_bypass(guard_text, bypassed)
+        if z3_result is not None:
+            if z3_result.bypass_found is False:
+                # This query refutes one candidate, not every later site.
+                continue
+            return z3_result
+
+        return AuthBypassResult(
+            bypass_found=True,
+            early_return_line=ret_line + 1,
+            guard_text=guard_text,
+            bypassed_checks=bypassed,
+            reasoning=(
+                f"success return at line {ret_line + 1} guarded by "
+                f"'{guard_text.strip()}' bypasses later auth checks: "
+                f"{', '.join(bypassed)}"
+            ),
+        )
+
+    return AuthBypassResult(reasoning="no bypass pattern detected")
+
+
+def _extract_auth_checks(
+    lines: list[str],
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> list[tuple[int, str, str]]:
+    """Extract (line_idx, check_type, call_text) for auth checks.
+
+    call_text includes function name and arguments so that e.g.
+    capable(CAP_SYS_ADMIN) and capable(CAP_NET_ADMIN) are distinct.
+    """
+    patterns = _auth_patterns(vocab)
+    results: list[tuple[int, str, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*")):
+            continue
+        for pattern, check_type in patterns:
+            m = pattern.search(line)
+            if m:
+                call_text = _extract_call_text(line, m.start())
+                results.append((i, check_type, call_text))
+                break
+    return results
+
+
+def _extract_call_text(line: str, start: int) -> str:
+    """Extract 'func(args)' starting at start position."""
+    depth = 0
+    for i in range(start, len(line)):
+        if line[i] == "(":
+            depth += 1
+        elif line[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return line[start:i + 1].strip()
+    return line[start:].strip()
+
+
+def _extract_success_returns(lines: list[str]) -> list[int]:
+    """Extract line indices of success returns."""
+    results: list[int] = []
+    for i, line in enumerate(lines):
+        if _SUCCESS_RETURN_RE.match(line):
+            results.append(i)
+    return results
+
+
+def _extract_if_condition(stripped: str) -> str:
+    """The parenthesised condition of an ``if (...)`` line."""
+    paren_start = stripped.index("(")
+    paren_depth = 0
+    cond = []
+    for ch in stripped[paren_start:]:
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+        cond.append(ch)
+        if paren_depth == 0:
+            break
+    return "".join(cond)
+
+
+def _only_blank_or_comment_between(
+    lines: list[str], start: int, end: int,
+) -> bool:
+    """True when every line strictly between start and end is blank or
+    a comment."""
+    for j in range(start + 1, end):
+        s = lines[j].strip()
+        if s and not s.startswith(("//", "/*", "*")):
+            return False
+    return True
+
+
+def _find_enclosing_guard(lines: list[str], ret_line: int) -> str:
+    """Walk backwards from ret_line to find the enclosing if-condition.
+
+    Brace depth decides enclosure: an ``if`` encloses the return only
+    when its opening brace is still unmatched at the return (depth goes
+    negative), or when it is braceless and the return is the very next
+    statement.  The previous version computed the depth and ignored it,
+    so a return AFTER a closed ``if (..) { .. }`` block inherited that
+    block's condition as its guard — the downstream Z3 feasibility
+    calls then reasoned about a condition that does not gate the
+    return at all.
+
+    An ``else`` boundary at depth 0 aborts the walk: the return lives
+    in the else branch, where the if-condition holds with INVERTED
+    polarity — returning it as-is would flip the feasibility question.
+    """
+    depth = 0
+    for i in range(ret_line - 1, max(ret_line - 15, -1), -1):
+        stripped = lines[i].strip()
+        opens = stripped.count("{")
+        closes = stripped.count("}")
+        new_depth = depth + closes - opens
+
+        if depth == 0 and _SMT_ELSE_WORD_RE.search(stripped):
+            return ""
+
+        if stripped.startswith("if") and "(" in stripped:
+            if opens:
+                if new_depth < 0:
+                    return _extract_if_condition(stripped)
+                # Balanced: the if-block closed above the return.
+            elif depth == 0 and _only_blank_or_comment_between(
+                lines, i, ret_line,
+            ):
+                # Braceless if directly guarding the return.
+                return _extract_if_condition(stripped)
+        elif new_depth < 0:
+            # Unmatched opener that is not an if (while/for/switch/
+            # function).  Continue at the next enclosing level.
+            new_depth = 0
+
+        depth = max(new_depth, 0)
+    return ""
+
+
+def _guard_is_auth_check(
+    guard_text: str, auth_checks: list[tuple[int, str, str]],
+) -> bool:
+    """Check if the guard itself is one of the auth checks."""
+    return any(func_name in guard_text for _, _, func_name in auth_checks)
+
+
+def _try_z3_auth_bypass(
+    guard_text: str,
+    bypassed_checks: list[str],
+) -> AuthBypassResult | None:
+    """Z3 feasibility check on the bypass guard. Returns None if Z3 unavailable."""
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("auth_bypass", {
+        "guard_text": guard_text,
+        "bypassed_checks": list(bypassed_checks),
+    })
+    return _result_from_child(AuthBypassResult, out)
+
+
+# ---------------------------------------------------------------------------
+# Lock discipline verification
+# ---------------------------------------------------------------------------
+
+# SEED SET — the three canonical kernel exemplars (kept because they
+# double as documentation of the pattern shape). The kernel lock-pair
+# bulk (down_read/up_read, lock_sock/release_sock, local_irq_*,
+# preempt_*, ...) lives in the linux_kernel vocab pack; project pairs
+# arrive via DomainVocabulary.lock_pairs (exact pairing) or the
+# lock_acquires/lock_releases name sets (heuristic pairing). The
+# suffix-based *_lock/*_unlock discovery below covers conventional
+# names mechanically. Do not grow this list — teach the study loop /
+# pack instead.
+_LOCK_PAIRS = [
+    (re.compile(r"\b(spin_lock(?:_irq(?:save)?|_bh)?)\s*\("), "spin_unlock"),
+    # raw_spinlock_t: `\b` never fires inside raw_spin_unlock (the
+    # underscore is a word char), so this needs its own pair — without
+    # it every raw_spin_lock_irqsave scope is invisible and fully
+    # locked kernel code reads as unprotected.
+    (
+        re.compile(r"\b(raw_spin_lock(?:_irq(?:save)?|_bh)?)\s*\("),
+        "raw_spin_unlock",
+    ),
+    (re.compile(r"\b(mutex_lock(?:_interruptible|_killable)?)\s*\("), "mutex_unlock"),
+    # rwlock_t: same word-boundary blindness as raw_spinlock — without
+    # these pairs a write_lock_irq(&tasklist_lock) scope is invisible
+    # and fully serialized kernel code reads as unprotected.
+    (
+        re.compile(r"\b(write_lock(?:_irq(?:save)?|_bh)?)\s*\("),
+        "write_unlock",
+    ),
+    (
+        re.compile(r"\b(read_lock(?:_irq(?:save)?|_bh)?)\s*\("),
+        "read_unlock",
+    ),
+    (re.compile(r"\b(rcu_read_lock)\s*\("), "rcu_read_unlock"),
+]
+
+_RETURN_RE = re.compile(r"^[^\S\n]*return\b", re.MULTILINE)
+
+_GOTO_RE = re.compile(r"\bgoto\s+(\w+)\s*;")
+
+_LABEL_RE = re.compile(r"^(\w+)\s*:", re.MULTILINE)
+
+
+@dataclass
+class LockDisciplineResult:
+    """Lexical lock-discipline observation, not a source-level proof."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    violation_found: bool = False
+    lock_type: str = ""
+    acquire_line: int = 0
+    return_line: int = 0
+    reasoning: str = ""
+    witness: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "violation_found": self.violation_found,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        if self.lock_type:
+            d["lock_type"] = self.lock_type
+        if self.acquire_line:
+            d["acquire_line"] = self.acquire_line
+        if self.return_line:
+            d["return_line"] = self.return_line
+        if self.witness:
+            d["witness"] = self.witness
+        return d
+
+
+def check_lock_discipline(
+    source: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> LockDisciplineResult:
+    """Detect lock acquire without matching release on a return path.
+
+    Scans for lock/unlock pairs and checks whether any return
+    statement falls between an acquire and its matching release.
+    Handles goto-based error paths by resolving labels. This is a lexical
+    lead: neither line order nor a satisfiable nearest guard establishes
+    lock ownership or complete control-flow coverage. Negative observations
+    likewise cannot refute a source-level defect claim.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    acquires = _extract_lock_acquires(lines, vocab)
+    if not acquires:
+        return LockDisciplineResult(
+            applicable=False,
+            reasoning="no lock acquires found",
+        )
+
+    returns = _extract_returns(lines)
+    goto_targets = _extract_goto_targets(lines)
+    labels = _extract_labels(lines)
+
+    for acq_line, lock_func, unlock_name, lock_obj in acquires:
+        unlock_lines = _find_unlocks(lines, unlock_name, lock_obj)
+        if not unlock_lines:
+            return LockDisciplineResult(
+                violation_found=True,
+                lock_type=lock_func,
+                acquire_line=acq_line + 1,
+                reasoning=(
+                    f"{lock_func} at line {acq_line + 1} has no matching "
+                    f"{unlock_name} in function"
+                ),
+            )
+
+        for ret_line in returns:
+            if ret_line <= acq_line:
+                continue
+
+            acq_indent = len(lines[acq_line]) - len(lines[acq_line].lstrip())
+            if any(
+                ul < ret_line and ul > acq_line
+                and (len(lines[ul]) - len(lines[ul].lstrip())) <= acq_indent
+                for ul in unlock_lines
+            ):
+                continue
+
+            # if (...) { unlock(); return; } — same-indent unlock
+            ret_indent = len(lines[ret_line]) - len(lines[ret_line].lstrip())
+            if any(
+                ul < ret_line and ul > acq_line
+                and (ret_line - ul) <= 3
+                and (len(lines[ul]) - len(lines[ul].lstrip())) == ret_indent
+                for ul in unlock_lines
+            ):
+                continue
+
+            ret_text = lines[ret_line].strip()
+            if _return_is_in_error_goto_block(
+                ret_line, lines, goto_targets, labels, unlock_name,
+            ):
+                continue
+
+            guard = _find_enclosing_guard(lines, ret_line)
+            bypassed_unlocks = [
+                f"line {ul + 1}" for ul in unlock_lines if ul > ret_line
+            ]
+
+            z3_result = _try_z3_lock_discipline(
+                guard, lock_func, ret_line + 1, bypassed_unlocks,
+            )
+            if z3_result is not None:
+                if z3_result.violation_found is False:
+                    # This query refutes one candidate, not every later site.
+                    continue
+                return z3_result
+
+            return LockDisciplineResult(
+                violation_found=True,
+                lock_type=lock_func,
+                acquire_line=acq_line + 1,
+                return_line=ret_line + 1,
+                reasoning=(
+                    f"return at line {ret_line + 1} ('{ret_text}') is "
+                    f"between {lock_func} (line {acq_line + 1}) and "
+                    f"{unlock_name} ({', '.join(bypassed_unlocks)}) — "
+                    f"lock held on exit"
+                ),
+            )
+
+    return LockDisciplineResult(reasoning="all lock/unlock pairs balanced on return paths")
+
+
+def _extract_lock_object(line: str, match_end: int) -> str:
+    """Extract the first argument to a lock/unlock call as a normalised key.
+
+    Returns the text between the opening '(' and the first ',' or ')',
+    stripped of '&' and whitespace.  When the argument cannot be parsed
+    (macros, nested calls), returns "" so callers fall back to
+    name-only matching.
+    """
+    rest = line[match_end:]
+    depth = 0
+    buf: list[str] = []
+    for ch in rest:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            break
+        else:
+            buf.append(ch)
+    raw = "".join(buf).strip().lstrip("&").strip()
+    if not raw or raw.startswith("("):
+        return ""
+    return raw
+
+
+def _extract_lock_acquires(
+    lines: list[str],
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> list[tuple[int, str, str, str]]:
+    """Extract (line_idx, lock_function, expected_unlock, lock_object).
+
+    ``lock_object`` is the normalised first argument (e.g. ``ep->lock``).
+    Empty string when the argument cannot be parsed.
+    """
+    pairs = list(_LOCK_PAIRS)
+    used = {m.pattern for m, _ in _LOCK_PAIRS}
+    # Exact pairs first (vocab packs, study-discovered paired_operations).
+    for acq, rel in sorted(vocab.lock_pairs):
+        pat_str = rf"\b({re.escape(acq)})\s*\("
+        if pat_str in used:
+            continue
+        pairs.append((re.compile(pat_str), rel))
+        used.add(pat_str)
+    # Name-set fallback: heuristically pair acquire/release names when
+    # only the flat sets are available.
+    if vocab.lock_acquires and vocab.lock_releases:
+        for acq in sorted(vocab.lock_acquires):
+            pat_str = rf"\b({re.escape(acq)})\s*\("
+            if pat_str in used:
+                continue
+            for rel in sorted(vocab.lock_releases):
+                if _paired_name_match(acq, rel):
+                    pairs.append((re.compile(pat_str), rel))
+                    used.add(pat_str)
+                    break
+    # Suffix-based discovery: scan for *_lock() / *_unlock() pairs
+    # not already covered by explicit pairs or vocab.
+    known_acq = {p.pattern for p, _ in pairs}
+    full_text = "\n".join(lines)
+    for m_lock in _SMT_LOCK_CALL_RE.finditer(full_text):
+        acq_name = m_lock.group(1)
+        pat_str = rf"\b({re.escape(acq_name)})\s*\("
+        if pat_str in known_acq:
+            continue
+        unlock_name = acq_name.replace("_lock", "_unlock", 1)
+        if re.search(rf"\b{re.escape(unlock_name)}\s*\(", full_text):
+            pairs.append((re.compile(pat_str), unlock_name))
+            known_acq.add(pat_str)
+
+    results: list[tuple[int, str, str, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*")):
+            continue
+        for pattern, unlock_name in pairs:
+            m = pattern.search(line)
+            if m:
+                lock_obj = _extract_lock_object(line, m.end())
+                results.append((i, m.group(1), unlock_name, lock_obj))
+                break
+    return results
+
+
+def _paired_name_match(acquire: str, release: str) -> bool:
+    """Heuristic: names share a root with lock/unlock or acquire/release."""
+    swaps = [
+        ("lock", "unlock"), ("acquire", "release"),
+        ("read_lock", "read_unlock"), ("write_lock", "write_unlock"),
+        ("down_", "up_"), ("get", "put"),
+    ]
+    a, r = acquire.lower(), release.lower()
+    for s_acq, s_rel in swaps:
+        if s_acq in a and r == a.replace(s_acq, s_rel, 1):
+            return True
+    return a.rsplit("_", 1)[0] == r.rsplit("_", 1)[0]
+
+
+def _find_unlocks(
+    lines: list[str],
+    unlock_name: str,
+    lock_object: str = "",
+) -> list[int]:
+    """Find line indices where unlock_name is called on lock_object."""
+    pat = re.compile(
+        rf"\b{re.escape(unlock_name)}(?:_irq(?:restore)?|_bh)?\s*\("
+    )
+    results: list[int] = []
+    for i, line in enumerate(lines):
+        m = pat.search(line)
+        if not m:
+            continue
+        if lock_object:
+            obj = _extract_lock_object(line, m.end())
+            if obj and obj != lock_object:
+                continue
+        results.append(i)
+    return results
+
+
+def _extract_returns(lines: list[str]) -> list[int]:
+    """Extract line indices of return statements."""
+    return [i for i, line in enumerate(lines) if _RETURN_RE.match(line)]
+
+
+def _extract_goto_targets(lines: list[str]) -> dict[int, str]:
+    """Map line_idx → goto target label."""
+    results: dict[int, str] = {}
+    for i, line in enumerate(lines):
+        m = _GOTO_RE.search(line)
+        if m:
+            results[i] = m.group(1)
+    return results
+
+
+def _extract_labels(lines: list[str]) -> dict[str, int]:
+    """Map label_name → line_idx."""
+    results: dict[str, int] = {}
+    for i, line in enumerate(lines):
+        m = _LABEL_RE.match(line)
+        if m and m.group(1) not in ("default", "case"):
+            results[m.group(1)] = i
+    return results
+
+
+def _return_is_in_error_goto_block(
+    ret_line: int,
+    lines: list[str],
+    _goto_targets: dict[int, str],
+    labels: dict[str, int],
+    unlock_name: str,
+) -> bool:
+    """Check if the return is in a goto-target block that unlocks."""
+    for label_line in labels.values():
+        if label_line > ret_line:
+            continue
+        if ret_line - label_line > 10:
+            continue
+        block = "\n".join(lines[label_line:ret_line + 1])
+        if unlock_name in block:
+            return True
+    return False
+
+
+def _try_z3_lock_discipline(
+    guard_text: str,
+    lock_func: str,
+    ret_line: int,
+    _bypassed_unlocks: list[str],
+) -> LockDisciplineResult | None:
+    """Z3 feasibility check on the guard of a lock-held return."""
+    if not guard_text:
+        return None
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("lock_discipline", {
+        "guard_text": guard_text,
+        "lock_func": lock_func,
+        "ret_line": ret_line,
+    })
+    return _result_from_child(LockDisciplineResult, out)
+
+
+def _z3_lock_discipline_check(
+    guard_text: str,
+    lock_func: str,
+    ret_line: int,
+) -> LockDisciplineResult:
+    """Z3: Check if a lock-held return guard is satisfiable."""
+    from core.smt_solver.availability import z3
+    from core.smt_solver.session import check_solver, new_solver
+
+    constraints = _constraints_from_guard_text(guard_text)
+
+    if constraints is None:
+        # ||/!/ternary structure — conjoining the atoms would risk a
+        # false "lock-held return path unreachable" UNSAT.  Same
+        # conservative direction as the non-numeric case: flag it.
+        return LockDisciplineResult(
+            violation_found=True,
+            lock_type=lock_func,
+            return_line=ret_line,
+            reasoning=(
+                f"return at line {ret_line} guarded by "
+                f"'{guard_text.strip()}' holds {lock_func} — guard "
+                f"boolean structure (||/!/ternary) not modeled, "
+                f"conservatively treated as feasible"
+            ),
+        )
+    if not constraints:
+        return LockDisciplineResult(
+            violation_found=True,
+            lock_type=lock_func,
+            return_line=ret_line,
+            reasoning=(
+                f"return at line {ret_line} guarded by '{guard_text.strip()}' "
+                f"holds {lock_func} — guard is non-numeric (always feasible)"
+            ),
+        )
+
+    solver = new_solver()
+    vars_map: dict[str, z3.ArithRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.Int(c.variable)
+
+    for c in constraints:
+        v = vars_map[c.variable]
+        if c.operator == "<":
+            solver.add(v < c.bound_value)
+        elif c.operator == "<=":
+            solver.add(v <= c.bound_value)
+        elif c.operator == ">":
+            solver.add(v > c.bound_value)
+        elif c.operator == ">=":
+            solver.add(v >= c.bound_value)
+        elif c.operator == "==":
+            solver.add(v == c.bound_value)
+        elif c.operator == "!=":
+            solver.add(v != c.bound_value)
+
+    result = check_solver(solver)
+    if result == z3.sat:
+        model = solver.model()
+        witness: dict[str, Any] = {}
+        for name, var in vars_map.items():
+            val = model[var]
+            if val is not None:
+                try:
+                    witness[name] = val.as_long()
+                except AttributeError:
+                    pass
+        return LockDisciplineResult(
+            violation_found=True,
+            lock_type=lock_func,
+            return_line=ret_line,
+            reasoning=(
+                f"Z3 SAT: return at line {ret_line} with {lock_func} held — "
+                f"guard '{guard_text.strip()}' is satisfiable"
+            ),
+            witness=witness or None,
+        )
+    if result == z3.unsat:
+        return LockDisciplineResult(
+            violation_found=False,
+            reasoning=(
+                f"Z3 UNSAT: guard '{guard_text.strip()}' is infeasible — "
+                f"lock-held return path unreachable"
+            ),
+        )
+    return LockDisciplineResult(
+        violation_found=True,
+        lock_type=lock_func,
+        return_line=ret_line,
+        reasoning="Z3 timeout — conservatively flag lock discipline issue",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Error path resource leak detection
+# ---------------------------------------------------------------------------
+
+# SEED SET — universal libc allocators, the two canonical kernel
+# exemplars, and the subsystem shape regex. The kernel allocator bulk
+# (kvmalloc, devm_kzalloc, alloc_skb, kstrdup, ...) lives in the
+# linux_kernel vocab pack; project allocators arrive via
+# DomainVocabulary.allocators / refcount_gets. Do not grow this list —
+# teach the study loop / pack instead.
+_ALLOC_PATTERNS = [
+    re.compile(r"\b(\w+)\s*=\s*(malloc|calloc|realloc)\s*\("),
+    re.compile(r"\b(\w+)\s*=\s*(kmalloc|kzalloc)\s*\("),
+    re.compile(r"\b(\w+)\s*=\s*(\w+_alloc_\w+)\s*\("),
+]
+
+# SEED SET — universal free plus the canonical kernel exemplar; the
+# kernel deallocator bulk lives in the linux_kernel vocab pack, and
+# project deallocators arrive via DomainVocabulary.deallocators /
+# refcount_puts (the *_free_* shape regex below stays).
+_FREE_NAMES = frozenset({
+    "free", "kfree",
+})
+
+# The name head is bounded: two unbounded word runs around
+# ``_free_`` re-split a long hostile identifier against each other
+# (quadratic); 256 chars of prefix sits far above real names.
+_FREE_RE = re.compile(r"\b(\w{1,256}_free_\w+)\s*\(")
+
+_ERROR_RETURN_RE = re.compile(
+    r"^[^\S\n]*return\s+(-\w+|NULL|ERR_PTR\s*\(|err|ret|rc|status)",
+    re.MULTILINE,
+)
+
+
+@dataclass
+class ResourceLeakResult:
+    """Result of checking error-path resource leak."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    leak_found: bool = False
+    alloc_var: str = ""
+    alloc_func: str = ""
+    alloc_line: int = 0
+    return_line: int = 0
+    reasoning: str = ""
+    witness: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "leak_found": self.leak_found,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        if self.alloc_var:
+            d["alloc_var"] = self.alloc_var
+        if self.alloc_func:
+            d["alloc_func"] = self.alloc_func
+        if self.alloc_line:
+            d["alloc_line"] = self.alloc_line
+        if self.return_line:
+            d["return_line"] = self.return_line
+        if self.witness:
+            d["witness"] = self.witness
+        return d
+
+
+def check_resource_leak(
+    source: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> ResourceLeakResult:
+    """Detect allocated resources not freed on error return paths."""
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    allocs = _extract_allocs(lines, vocab)
+    if not allocs:
+        return ResourceLeakResult(
+            applicable=False,
+            reasoning="no allocations found",
+        )
+
+    error_returns = _extract_error_returns(lines)
+    if not error_returns:
+        return ResourceLeakResult(
+            applicable=False,
+            reasoning="no error returns found",
+        )
+
+    goto_targets = _extract_goto_targets(lines)
+    labels = _extract_labels(lines)
+
+    for alloc_line, var_name, alloc_func in allocs:
+        for ret_line in error_returns:
+            if ret_line <= alloc_line:
+                continue
+
+            free_line = _var_freed_between(
+                lines, var_name, alloc_line, ret_line, vocab,
+            )
+            bypassed = False
+            if free_line >= 0:
+                if not _goto_bypasses_free(
+                    lines, goto_targets, labels,
+                    alloc_line, free_line, var_name, vocab,
+                ):
+                    continue
+                bypassed = True
+
+            if _return_gotos_to_free(
+                ret_line, lines, goto_targets, labels, var_name, vocab,
+            ):
+                continue
+
+            if not bypassed and _null_guarded_return(
+                lines, alloc_line, ret_line, var_name,
+            ):
+                continue
+
+            guard = _find_enclosing_guard(lines, ret_line)
+            z3_result = _try_z3_resource_leak(
+                guard, var_name, alloc_func, alloc_line + 1, ret_line + 1,
+            )
+            if z3_result is not None:
+                if z3_result.leak_found is False:
+                    # This query refutes one candidate, not every later site.
+                    continue
+                return z3_result
+
+            return ResourceLeakResult(
+                leak_found=True,
+                alloc_var=var_name,
+                alloc_func=alloc_func,
+                alloc_line=alloc_line + 1,
+                return_line=ret_line + 1,
+                reasoning=(
+                    f"'{var_name}' allocated by {alloc_func} at line "
+                    f"{alloc_line + 1} not freed before error return at "
+                    f"line {ret_line + 1}"
+                ),
+            )
+
+    return ResourceLeakResult(
+        reasoning="all allocations freed on error paths",
+    )
+
+
+def _extract_allocs(
+    lines: list[str],
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> list[tuple[int, str, str]]:
+    """Extract (line_idx, variable_name, alloc_function) tuples."""
+    patterns = list(_ALLOC_PATTERNS)
+    if vocab.allocators:
+        names = "|".join(re.escape(n) for n in sorted(vocab.allocators))
+        patterns.append(re.compile(rf"\b(\w+)\s*=\s*({names})\s*\("))
+    if vocab.refcount_gets:
+        names = "|".join(re.escape(n) for n in sorted(vocab.refcount_gets))
+        patterns.append(re.compile(rf"\b(\w+)\s*=\s*({names})\s*\("))
+
+    results: list[tuple[int, str, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*")):
+            continue
+        for pattern in patterns:
+            m = pattern.search(line)
+            if m:
+                results.append((i, m.group(1), m.group(2)))
+                break
+    return results
+
+
+def _extract_error_returns(lines: list[str]) -> list[int]:
+    """Extract line indices of error return statements."""
+    results: list[int] = []
+    for i, line in enumerate(lines):
+        if _ERROR_RETURN_RE.match(line):
+            results.append(i)
+    return results
+
+
+def _build_free_patterns(
+    var_name: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> tuple[re.Pattern, re.Pattern]:
+    """Build free-detection regexes, extended with study-discovered names."""
+    all_frees = _FREE_NAMES | vocab.deallocators | vocab.refcount_puts
+    free_pat = re.compile(
+        rf"\b({'|'.join(re.escape(f) for f in sorted(all_frees))})"
+        rf"\s*\(\s*{re.escape(var_name)}\b"
+    )
+    # Same bounded name head as _FREE_RE above.
+    subsystem_free_pat = re.compile(
+        rf"\b\w{{1,256}}_free_\w+\s*\(\s*{re.escape(var_name)}\b"
+    )
+    return free_pat, subsystem_free_pat
+
+
+def _var_freed_between(
+    lines: list[str], var_name: str, start: int, end: int,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> int:
+    """Return line index where var_name is freed, or -1 if not found."""
+    free_pat, subsystem_free_pat = _build_free_patterns(var_name, vocab)
+    for i in range(start + 1, min(end, len(lines))):
+        if free_pat.search(lines[i]) or subsystem_free_pat.search(lines[i]):
+            return i
+    return -1
+
+
+def _goto_bypasses_free(
+    lines: list[str],
+    goto_targets: dict[int, str],
+    labels: dict[str, int],
+    alloc_line: int,
+    free_line: int,
+    var_name: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> bool:
+    """Detect gotos between alloc and return that jump past the free.
+
+    Common kernel pattern: error_ci frees ci, error does not.
+    ``goto error`` after a successful alloc bypasses error_ci's free.
+    Only flags gotos that follow a successful-alloc guard (past the
+    IS_ERR / NULL check) so the first goto-on-alloc-failure is ignored.
+    """
+    err_guard_end = alloc_line
+    esc = re.escape(var_name)
+    for i in range(alloc_line + 1, min(free_line, len(lines))):
+        line = lines[i].strip()
+        if re.search(rf"if\s*\(\s*!{esc}\s*\)", line) or re.search(
+            rf"if\s*\(\s*(?:IS_ERR|!)\s*\(\s*{esc}\s*\)", line,
+        ) or re.search(
+            rf"if\s*\(\s*{esc}\s*==\s*NULL\s*\)", line,
+        ):
+            brace_depth = 0
+            for j in range(i, min(free_line, len(lines))):
+                brace_depth += lines[j].count("{") - lines[j].count("}")
+                if brace_depth <= 0:
+                    if j == i:
+                        # Braceless if: guard covers the next statement
+                        for nxt in range(j + 1, min(j + 4, len(lines))):
+                            nxt_s = lines[nxt].strip()
+                            if nxt_s and not nxt_s.startswith(("//", "/*")):
+                                err_guard_end = nxt
+                                break
+                        else:
+                            err_guard_end = j
+                    else:
+                        err_guard_end = j
+                    break
+            else:
+                err_guard_end = i + 3
+            break
+
+    free_pat, subsystem_free_pat = _build_free_patterns(var_name, vocab)
+    ownership_re = re.compile(rf"->\w+\s*=\s*{esc}\s*;")
+
+    for goto_line in range(err_guard_end + 1, free_line):
+        if goto_line not in goto_targets:
+            continue
+        target_label = goto_targets[goto_line]
+        target_line = labels.get(target_label)
+        if target_line is None or target_line <= free_line:
+            continue
+        block = "\n".join(lines[target_line:min(target_line + 10, len(lines))])
+        if free_pat.search(block) or subsystem_free_pat.search(block):
+            continue
+        # Ownership transfer: var stored into a struct field before this
+        # goto means cleanup happens via the enclosing struct (callbacks,
+        # completion handlers, embedded references).
+        if any(
+            ownership_re.search(lines[k])
+            for k in range(alloc_line + 1, goto_line)
+        ):
+            continue
+        return True
+    return False
+
+
+def _return_gotos_to_free(
+    ret_line: int,
+    lines: list[str],
+    goto_targets: dict[int, str],
+    labels: dict[str, int],
+    var_name: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> bool:
+    """Check if there's a goto before the return leading to a block that frees."""
+    all_frees = _FREE_NAMES | vocab.deallocators | vocab.refcount_puts
+    for goto_line in range(max(0, ret_line - 3), ret_line):
+        if goto_line in goto_targets:
+            label = goto_targets[goto_line]
+            label_line = labels.get(label)
+            if label_line is not None:
+                block = "\n".join(
+                    lines[label_line:min(label_line + 10, len(lines))]
+                )
+                if var_name in block and (
+                    any(f in block for f in all_frees)
+                    or _FREE_RE.search(block)
+                ):
+                    return True
+    return False
+
+
+def _null_guarded_return(
+    lines: list[str], alloc_line: int, ret_line: int, var_name: str,
+) -> bool:
+    """Check if the error return is guarded by a NULL check on the alloc var.
+
+    Pattern: if (!ptr) return -ENOMEM; — this is BEFORE any use,
+    so there's nothing to leak (the alloc failed).
+
+    Only returns True if ret_line is INSIDE the null-check block (within
+    3 lines of the check).  A return further away is after the alloc
+    succeeded and may leak.
+    """
+    null_pats = [
+        re.compile(rf"if\s*\(\s*!{re.escape(var_name)}\s*\)"),
+        re.compile(rf"if\s*\(\s*{re.escape(var_name)}\s*==\s*NULL\s*\)"),
+        re.compile(rf"if\s*\(\s*IS_ERR\s*\(\s*{re.escape(var_name)}\s*\)\s*\)"),
+    ]
+    for i in range(alloc_line + 1, min(ret_line + 1, len(lines))):
+        line = lines[i]
+        if any(p.search(line) for p in null_pats) and ret_line <= i + 3:
+            return True
+    return False
+
+
+def _try_z3_resource_leak(
+    guard_text: str,
+    var_name: str,
+    alloc_func: str,
+    alloc_line: int,
+    ret_line: int,
+) -> ResourceLeakResult | None:
+    """Z3 feasibility check on the guard of a leak-path return."""
+    if not guard_text:
+        return None
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("resource_leak", {
+        "guard_text": guard_text,
+        "var_name": var_name,
+        "alloc_func": alloc_func,
+        "alloc_line": alloc_line,
+        "ret_line": ret_line,
+    })
+    return _result_from_child(ResourceLeakResult, out)
+
+
+def _z3_resource_leak_check(
+    guard_text: str,
+    var_name: str,
+    alloc_func: str,
+    alloc_line: int,
+    ret_line: int,
+) -> ResourceLeakResult:
+    """Z3: Check if a leak-path guard is satisfiable."""
+    from core.smt_solver.availability import z3
+    from core.smt_solver.session import check_solver, new_solver
+
+    constraints = _constraints_from_guard_text(guard_text)
+
+    if constraints is None:
+        # ||/!/ternary structure — conjoining the atoms would risk a
+        # false "leak path unreachable" UNSAT.  Same conservative
+        # direction as the non-numeric case: flag it.
+        return ResourceLeakResult(
+            leak_found=True,
+            alloc_var=var_name,
+            alloc_func=alloc_func,
+            alloc_line=alloc_line,
+            return_line=ret_line,
+            reasoning=(
+                f"error return at line {ret_line} guarded by "
+                f"'{guard_text.strip()}' leaks '{var_name}' — guard "
+                f"boolean structure (||/!/ternary) not modeled, "
+                f"conservatively treated as feasible"
+            ),
+        )
+    if not constraints:
+        return ResourceLeakResult(
+            leak_found=True,
+            alloc_var=var_name,
+            alloc_func=alloc_func,
+            alloc_line=alloc_line,
+            return_line=ret_line,
+            reasoning=(
+                f"error return at line {ret_line} guarded by "
+                f"'{guard_text.strip()}' leaks '{var_name}' — "
+                f"guard is non-numeric (always feasible)"
+            ),
+        )
+
+    solver = new_solver()
+    vars_map: dict[str, z3.ArithRef] = {}
+    for c in constraints:
+        if c.variable not in vars_map:
+            vars_map[c.variable] = z3.Int(c.variable)
+
+    for c in constraints:
+        v = vars_map[c.variable]
+        if c.operator == "<":
+            solver.add(v < c.bound_value)
+        elif c.operator == "<=":
+            solver.add(v <= c.bound_value)
+        elif c.operator == ">":
+            solver.add(v > c.bound_value)
+        elif c.operator == ">=":
+            solver.add(v >= c.bound_value)
+        elif c.operator == "==":
+            solver.add(v == c.bound_value)
+        elif c.operator == "!=":
+            solver.add(v != c.bound_value)
+
+    result = check_solver(solver)
+    if result == z3.sat:
+        model = solver.model()
+        witness: dict[str, Any] = {}
+        for name, zvar in vars_map.items():
+            val = model[zvar]
+            if val is not None:
+                try:
+                    witness[name] = val.as_long()
+                except AttributeError:
+                    pass
+        return ResourceLeakResult(
+            leak_found=True,
+            alloc_var=var_name,
+            alloc_func=alloc_func,
+            alloc_line=alloc_line,
+            return_line=ret_line,
+            reasoning=(
+                f"Z3 SAT: error return at line {ret_line} leaks "
+                f"'{var_name}' — guard '{guard_text.strip()}' "
+                f"is satisfiable"
+            ),
+            witness=witness or None,
+        )
+    if result == z3.unsat:
+        return ResourceLeakResult(
+            leak_found=False,
+            reasoning=(
+                f"Z3 UNSAT: guard '{guard_text.strip()}' is infeasible — "
+                f"leak path unreachable"
+            ),
+        )
+    return ResourceLeakResult(
+        leak_found=True,
+        alloc_var=var_name,
+        alloc_func=alloc_func,
+        alloc_line=alloc_line,
+        return_line=ret_line,
+        reasoning="Z3 timeout — conservatively flag resource leak",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Null propagation detection
+# ---------------------------------------------------------------------------
+
+# Derived from the _NULLABLE_CALL_NAMES seed set below (kept as a
+# module-level compiled default for the no-vocab fast path).
+
+_NULL_CHECK_RE_TEMPLATE = r"(?:if\s*\(\s*!{var}\s*\)|if\s*\(\s*{var}\s*==\s*NULL\s*\)|if\s*\(\s*IS_ERR(?:_OR_NULL)?\s*\(\s*{var}\s*\)\s*\)|if\s*\(\s*unlikely\s*\(\s*!{var}\s*\)\s*\))"
+
+_DEREF_RE_TEMPLATE = r"(?:{var}\s*->|(?:\*\s*{var})\b)"
+
+
+@dataclass
+class NullPropagationResult:
+    """Result of checking null propagation."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    null_deref_found: bool = False
+    var_name: str = ""
+    source_func: str = ""
+    assign_line: int = 0
+    deref_line: int = 0
+    reasoning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "null_deref_found": self.null_deref_found,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        if self.var_name:
+            d["var_name"] = self.var_name
+        if self.source_func:
+            d["source_func"] = self.source_func
+        if self.assign_line:
+            d["assign_line"] = self.assign_line
+        if self.deref_line:
+            d["deref_line"] = self.deref_line
+        return d
+
+
+def check_null_propagation(
+    source: str, vocab: DomainVocabulary | None = None,
+) -> NullPropagationResult:
+    """Detect use of a possibly-NULL pointer without a null check."""
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    assigns = _extract_nullable_assigns(lines, vocab=vocab)
+    if not assigns:
+        return NullPropagationResult(
+            applicable=False,
+            reasoning="no nullable assignments found",
+        )
+
+    for assign_line, var_name, source_func in assigns:
+        null_check = _find_null_check(lines, var_name, assign_line)
+        first_deref = _find_first_deref(lines, var_name, assign_line)
+
+        if first_deref is None:
+            continue
+
+        if (
+            null_check is not None
+            and null_check < first_deref
+            and _null_check_exits(lines, null_check)
+        ):
+            continue
+
+        return NullPropagationResult(
+            null_deref_found=True,
+            var_name=var_name,
+            source_func=source_func,
+            assign_line=assign_line + 1,
+            deref_line=first_deref + 1,
+            reasoning=(
+                f"'{var_name}' from {source_func} (line {assign_line + 1}) "
+                f"dereferenced at line {first_deref + 1} without null check"
+            ),
+        )
+
+    return NullPropagationResult(
+        reasoning="all nullable pointers checked before use",
+    )
+
+
+# SEED SET — universal libc allocators plus the two canonical kernel
+# exemplars. The kernel bulk (kv*/devm_* allocators, driver-model
+# getters like dev_get_drvdata / platform_get_resource) lives in the
+# linux_kernel vocab pack; project names arrive via
+# DomainVocabulary.allocators and .nullable_returns. Do not grow this
+# list — teach the study loop / pack instead.
+_NULLABLE_CALL_NAMES = frozenset({
+    "malloc", "calloc", "realloc",
+    "kmalloc", "kzalloc",
+})
+
+
+def _build_nullable_re(extra: frozenset = frozenset()) -> re.Pattern:
+    names = _NULLABLE_CALL_NAMES | extra
+    alts = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    return re.compile(rf"\b(\w+)\s*=\s*({alts})\s*\(")
+
+
+_NULLABLE_CALLS = _build_nullable_re()
+
+
+_EXIT_RE = re.compile(
+    r"\b(return\b|goto\b|break\b|abort\s*\(|BUG\s*\(|panic\s*\()",
+)
+
+
+def _null_check_exits(lines: list[str], check_line: int) -> bool:
+    """Verify the null-check block contains an exit (return/goto/break)."""
+    for i in range(check_line, min(check_line + 4, len(lines))):
+        if _EXIT_RE.search(lines[i]):
+            return True
+    return False
+
+
+def _extract_nullable_assigns(
+    lines: list[str],
+    vocab: DomainVocabulary | None = None,
+) -> list[tuple[int, str, str]]:
+    """Extract (line_idx, var_name, source_function) from nullable calls."""
+    extra = (
+        (vocab.allocators | vocab.nullable_returns | vocab.refcount_gets)
+        if vocab is not None else frozenset()
+    )
+    nullable_re = _NULLABLE_CALLS if not extra else _build_nullable_re(extra)
+    results: list[tuple[int, str, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*")):
+            continue
+        m = nullable_re.search(line)
+        if m:
+            results.append((i, m.group(1), m.group(2)))
+    return results
+
+
+def _find_null_check(
+    lines: list[str], var_name: str, after_line: int,
+) -> int | None:
+    """Find first null check of var_name after after_line."""
+    pat = re.compile(
+        _NULL_CHECK_RE_TEMPLATE.format(var=re.escape(var_name))
+    )
+    for i in range(after_line + 1, len(lines)):
+        if pat.search(lines[i]):
+            return i
+    return None
+
+
+def _find_first_deref(
+    lines: list[str], var_name: str, after_line: int,
+) -> int | None:
+    """Find first dereference of var_name after after_line."""
+    pat = re.compile(
+        _DEREF_RE_TEMPLATE.format(var=re.escape(var_name))
+    )
+    for i in range(after_line + 1, len(lines)):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(("//", "/*")):
+            continue
+        if pat.search(lines[i]):
+            return i
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Integer narrowing/widening detection
+# ---------------------------------------------------------------------------
+
+_TYPE_WIDTHS: dict[str, int] = {
+    "char": 8, "signed char": 8, "unsigned char": 8,
+    "u8": 8, "s8": 8, "__u8": 8, "__s8": 8, "uint8_t": 8, "int8_t": 8,
+    "short": 16, "unsigned short": 16,
+    "u16": 16, "s16": 16, "__u16": 16, "__s16": 16, "uint16_t": 16, "int16_t": 16,
+    "int": 32, "unsigned int": 32, "unsigned": 32,
+    "u32": 32, "s32": 32, "__u32": 32, "__s32": 32, "uint32_t": 32, "int32_t": 32,
+    "long": 64, "unsigned long": 64, "long long": 64, "unsigned long long": 64,
+    "u64": 64, "s64": 64, "__u64": 64, "__s64": 64, "uint64_t": 64, "int64_t": 64,
+    "size_t": 64, "ssize_t": 64, "off_t": 64, "loff_t": 64,
+    "uintptr_t": 64, "ptrdiff_t": 64,
+}
+
+# C permits reordered builtin specifiers and an optional explicit int.
+# Four tokens cover unsigned long long int without unbounded word scanning.
+_NARROWING_BUILTIN_TYPE = (
+    r"(?:(?:signed|unsigned|char|short|int|long)\s+){0,3}"
+    r"(?:signed|unsigned|char|short|int|long)"
+)
+_NARROWING_ASSIGN_RE = re.compile(
+    r"(?:^|\s)"
+    r"(" + _NARROWING_BUILTIN_TYPE +
+    r"|u8|u16|u32|u64|s8|s16|s32|s64"
+    r"|__u8|__u16|__u32|__u64|__s8|__s16|__s32|__s64"
+    r"|uint8_t|uint16_t|uint32_t|uint64_t"
+    r"|int8_t|int16_t|int32_t|int64_t"
+    r"|size_t|ssize_t|off_t|loff_t)"
+    r"\s+(\w+)\s*="
+)
+
+_CAST_NARROWING_RE = re.compile(
+    r"\(\s*((?:unsigned\s+)?(?:char|short|int|long(?:\s+long)?)"
+    r"|u8|u16|u32|u64|s8|s16|s32|s64"
+    r"|__u8|__u16|__u32|__u64|__s8|__s16|__s32|__s64"
+    r"|uint8_t|uint16_t|uint32_t|uint64_t"
+    r"|int8_t|int16_t|int32_t|int64_t"
+    r"|size_t|ssize_t|off_t|loff_t)\s*\)"
+    r"\s*(\w+)"
+)
+
+@dataclass
+class IntegerNarrowingResult:
+    """Result of checking integer narrowing."""
+
+    narrowing_found: bool = False
+    source_type: str = ""
+    dest_type: str = ""
+    source_width: int = 0
+    dest_width: int = 0
+    assign_line: int = 0
+    reasoning: str = ""
+    witness: dict[str, Any] | None = None
+    # Native status is separate from a syntax-only narrowing candidate.
+    solver_status: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "narrowing_found": self.narrowing_found,
+            "reasoning": self.reasoning,
+        }
+        if self.source_type:
+            d["source_type"] = self.source_type
+        if self.dest_type:
+            d["dest_type"] = self.dest_type
+        if self.source_width:
+            d["source_width"] = self.source_width
+        if self.dest_width:
+            d["dest_width"] = self.dest_width
+        if self.assign_line:
+            d["assign_line"] = self.assign_line
+        if self.witness:
+            d["witness"] = self.witness
+        if self.solver_status is not None:
+            d["solver_status"] = self.solver_status
+        return d
+
+
+def check_integer_narrowing(
+    source: str, *, function_name: str | None = None, language: str | None = None,
+) -> IntegerNarrowingResult:
+    """Collect narrowing candidates, optionally for one named function.
+
+    Named probes require a unique parsed definition. An unresolved scope
+    supplies no observation and cannot refute a source-level claim.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    from core.source.lines import split_lines
+    from .source_view import sanitized_view
+    from .initializer import initializer_text
+    from .narrowing_guards import NarrowingGuardContext, integer_range
+
+    if language is None:
+        go_view = sanitized_view(source, language="go")
+        rows = (islice(iter_source_lines(go_view), 30)
+                if _NARROW_TYPE_IMPL(go_view) is str and split_lines is _NARROW_LINES_IMPL
+                else split_lines(go_view)[:30])
+        language = "go" if any(_SMT_GO_DECL_RE.match(line) for line in rows) else "c"
+    if language not in {"c", "cpp", "go"}:
+        return IntegerNarrowingResult(reasoning="unsupported narrowing source language")
+    source = sanitized_view(source, language=language)
+    if language == "go":
+        if function_name is not None:
+            from .probe_function_scope import go_function_scope
+            go_scope = go_function_scope(source, function_name)
+            if go_scope.status != "selected":
+                return IntegerNarrowingResult(reasoning=f"requested function scope {go_scope.status}")
+            source = go_scope.source_span(source)
+        return _check_integer_narrowing_go(split_lines(source))
+
+    lines = split_lines(source)
+    guards = NarrowingGuardContext(source, language=language)
+    scope = guards.function_scope(function_name) if function_name is not None else None
+    if scope is not None and scope.status != "selected":
+        return IntegerNarrowingResult(reasoning=f"requested function scope {scope.status}")
+    fallback_types = None
+
+    sites = guards.initializers()
+    if sites is None:
+        # A missing or failed parse retains the existing lexical diagnostic
+        # fallback, without borrowing parsed guards or verification authority.
+        sites = (
+            (m.group(1).strip(), m.group(2), i, m.end(), initializer_text(line[m.end():]))
+            for i, line in enumerate(lines)
+            if not line.lstrip().startswith(("//", "/*"))
+            for m in _NARROWING_ASSIGN_RE.finditer(line)
+        )
+    for dest_type, dest_var, i, column, rhs in sites:
+        if scope is not None and not guards.in_function(i, column, scope):
+            continue
+        dest_width = _type_to_width(dest_type)
+        if not dest_width:
+            continue
+
+        bindings = guards.visible_types(i, column)
+        if bindings is None:
+            # Preserve diagnostic leads when syntax is unavailable; this
+            # fallback never earns guard credit or verification authority.
+            if fallback_types is None:
+                fallback_types = {**_extract_param_types(source), **_extract_local_decls(lines)}
+            bindings = fallback_types
+        for src_var, src_type in bindings.items():
+            src_width = _type_to_width(src_type) if src_type else None
+            if not src_width:
+                continue
+            if src_var == dest_var:
+                continue
+            if src_width <= dest_width:
+                continue
+            if re.search(rf"\b{re.escape(src_var)}\b", rhs):
+                if guards.protects(
+                    src_var, i, column, integer_range(src_type, src_width),
+                    integer_range(dest_type, dest_width), src_type,
+                ):
+                    continue
+                # Grouping preserves a value use; calls and unevaluated
+                # operands need syntax-aware filtering. Reuse the guard
+                # context's bounded parse rather than stripping parentheses.
+                if not guards.may_use_value(src_var, i, column):
+                    continue
+
+                z3_result = _try_z3_integer_narrowing(
+                    src_var, src_type, dest_type,
+                    src_width, dest_width, i + 1,
+                )
+                if z3_result is not None:
+                    return z3_result
+
+                return IntegerNarrowingResult(
+                    narrowing_found=True,
+                    source_type=src_type,
+                    dest_type=dest_type,
+                    source_width=src_width,
+                    dest_width=dest_width,
+                    assign_line=i + 1,
+                    reasoning=(
+                        f"'{src_var}' ({src_type}, {src_width}-bit) "
+                        f"narrowed to '{dest_var}' ({dest_type}, "
+                        f"{dest_width}-bit) at line {i + 1} "
+                        f"without bounds check"
+                    ),
+                )
+
+    return IntegerNarrowingResult(
+        reasoning="no unchecked integer narrowing found",
+    )
+
+
+def _type_to_width(type_str: str) -> int | None:
+    """Map a C type string to its width in bits."""
+    normalized = " ".join(type_str.split())
+    width = _TYPE_WIDTHS.get(normalized)
+    if width is not None:
+        return width
+    if not set(normalized.split()) <= {"signed", "unsigned", "char", "short", "int", "long"}:
+        return None
+    from core.smt_solver.integer_types import integer_type
+
+    # Retain this diagnostic checker's existing LP64 assumptions; the formal
+    # source arithmetic model requires its own explicit target ABI.
+    kind = integer_type(normalized, "lp64")
+    return kind.width if kind is not None else None
+
+
+_GO_TYPE_WIDTHS: dict[str, int] = {
+    "byte": 8, "uint8": 8, "int8": 8,
+    "uint16": 16, "int16": 16,
+    "uint32": 32, "int32": 32, "rune": 32,
+    "uint64": 64, "int64": 64,
+    "int": 64, "uint": 64, "uintptr": 64,
+}
+
+# \b pins the assignee to a token start: an unpinned leading word
+# run re-scans every suffix of a long hostile word — quadratic.
+_GO_CAST_RE = re.compile(
+    r"\b(\w+)\s*(?::?=)\s*((?:u?int(?:8|16|32|64)?|byte|rune|uint|uintptr))\s*\(\s*(\w+)\s*\)"
+)
+
+# The optional second assignee gates its own trailing whitespace
+# ((?:,\s*\w+\s*)?): the naive ``\s*(?:,\s*\w+)?\s*`` put two
+# whitespace spans around it — quadratic on an assignment line
+# ending in a whitespace run.
+# \b pins the assignee to a token start (see _GO_CAST_RE).
+_GO_ATOI_RE = re.compile(
+    r"\b(\w+)\s*(?:,\s*\w+\s*)?(?::?=)\s*strconv\.(?:Atoi|ParseInt|ParseUint)\s*\("
+)
+
+# One branch per RHS shape (math token or bare word), each gating
+# its own trailing whitespace: the naive
+# ``\s*(?:math\.Max|math\.Min)?\w*\s*\{`` chained whitespace spans
+# around two optional atoms — quadratic on an if-line ending in a
+# whitespace run with no brace. Same match set.
+_GO_BOUNDS_CHECK_RE = re.compile(
+    r"if\s+\w+\s*[<>]=?\s*(?:(?:math\.Max|math\.Min)\w*\s*|\w+\s*)?\{"
+    r"|if\s+\w+\s*<\s*0\s*(?:\|\||&&)"
+    r"|if\s+\w+\s*>\s*math\.Max"
+)
+
+
+def _check_integer_narrowing_go(lines: list[str]) -> IntegerNarrowingResult:
+    """Go-specific integer narrowing via explicit type casts."""
+    wide_vars: dict[str, tuple[str, int]] = {}
+
+    for i, line in enumerate(lines):
+        am = _GO_ATOI_RE.search(line)
+        if am:
+            wide_vars[am.group(1)] = ("int", 64)
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            continue
+
+        cm = _GO_CAST_RE.search(line)
+        if not cm:
+            continue
+
+        dest_type = cm.group(2)
+        src_var = cm.group(3)
+
+        dest_width = _GO_TYPE_WIDTHS.get(dest_type)
+        if not dest_width:
+            continue
+
+        src_info = wide_vars.get(src_var)
+        if not src_info:
+            continue
+        src_type, src_width = src_info
+        if src_width <= dest_width:
+            continue
+
+        has_check = False
+        for j in range(max(0, i - 15), i):
+            # Bounded gap: the check operator sits on the same line
+            # as the variable; 500 chars sits far above real lines
+            # while an unbounded gap re-scans hostile long lines
+            # from every variable occurrence — quadratic.
+            if re.search(
+                rf"\b{re.escape(src_var)}\b.{{0,500}}[<>]=?\s*(?:math\.Max|0\b|\d{{4,}})",
+                lines[j],
+            ):
+                has_check = True
+                break
+            if _GO_BOUNDS_CHECK_RE.search(lines[j]) and re.search(
+                rf"\b{re.escape(src_var)}\b", lines[j],
+            ):
+                has_check = True
+                break
+        if has_check:
+            continue
+
+        return IntegerNarrowingResult(
+            narrowing_found=True,
+            source_type=src_type,
+            dest_type=dest_type,
+            source_width=src_width,
+            dest_width=dest_width,
+            assign_line=i + 1,
+            reasoning=(
+                f"'{src_var}' ({src_type}, {src_width}-bit) narrowed "
+                f"to {dest_type} ({dest_width}-bit) via explicit cast "
+                f"at line {i + 1} without bounds check"
+            ),
+        )
+
+    return IntegerNarrowingResult(
+        reasoning="no unchecked integer narrowing found",
+    )
+
+
+def _extract_param_types(source: str) -> dict[str, str]:
+    """Extract parameter name → type from function signature."""
+    results: dict[str, str] = {}
+    # The window matches the scanned 500-char signature slice; an
+    # unbounded interior re-scans from every '(' — quadratic.
+    sig_match = _SMT_PARAM_LIST_RE.search(source[:500])
+    if not sig_match:
+        return results
+    params_str = sig_match.group(0)[1:-1]
+    for param in params_str.split(","):
+        param = param.strip()
+        parts = param.rsplit(None, 1)
+        if len(parts) == 2:
+            type_str = parts[0].replace("*", "").strip()
+            name = parts[1].replace("*", "").strip()
+            if name and type_str:
+                results[name] = type_str
+    return results
+
+
+def _extract_local_decls(lines: list[str]) -> dict[str, str]:
+    """Extract local variable declarations with types."""
+    results: dict[str, str] = {}
+    for line in lines:
+        for m in _NARROWING_ASSIGN_RE.finditer(line):
+            results[m.group(2)] = m.group(1).strip()
+    return results
+
+
+# ------------------------------------------------------------------
+# Parsed-integer width contract
+# ------------------------------------------------------------------
+
+# Text-to-integer parse calls whose results are attacker-influenceable
+# whenever the parsed text is: Go strconv (stdlib) and the C libc
+# strto*/ato* family. Target-specific parse wrappers are NOT listed —
+# they arrive via the learned vocabulary, never hardcoded.
+_PARSED_INT_ASSIGN_RES: tuple[re.Pattern, ...] = (
+    # Same gated-assignee respelling as _GO_ATOI_RE above; \b pins
+    # the assignee to a token start (unpinned word runs re-scan
+    # every suffix of a long hostile word — quadratic).
+    re.compile(
+        r"\b(\w+)\s*(?:,\s*\w+\s*)?(?::?=)\s*"
+        r"strconv\.(?:Atoi|ParseInt|ParseUint)\s*\(",
+    ),
+    # The cast interior subsumes its leading whitespace
+    # ([\w\s*] includes whitespace): the naive ``\(\s*[\w\s*]+``
+    # overlapped two unbounded spans — quadratic on a cast-opening
+    # line ending in a whitespace run. Same language. \b pins the
+    # assignee to a token start.
+    re.compile(
+        r"\b(\w+)\s*=\s*(?:\([\w\s*]+\)\s*)?"
+        r"(?:strtou?ll?|strtou?l|atoi|atoll?|strtou?imax|strtoumax)"
+        r"\s*\(",
+    ),
+)
+
+# Ordering comparisons only: an equality test (``n == 0`` / ``n != 0``)
+# establishes no bound, so it does not discharge the width contract (a
+# directive value can pass ``n == 0`` and still overflow the consumer's
+# 32-bit storage).
+_PARSED_INT_COMPARE_TEMPLATE = (
+    r"\b{var}\b\s*[<>]=?|[<>]=?\s*\b{var}\b"
+)
+
+# Name run bounded — same boundary-fill rationale as the call
+# scans (separator fills keep \b live; unbounded runs re-scan per
+# planted head).
+_PARSED_INT_CALL_ARG_RE = re.compile(
+    r"\b([A-Za-z_][\w.]{0,128})\s*\(([^()]*)\)")
+
+# A direct text-to-integer parse call anywhere in a function body marks
+# that function as a parse WRAPPER: callers receive text-derived
+# integers from it without ever naming strconv/strto* themselves.
+_PARSE_CALL_BODY_RE = re.compile(
+    r"strconv\.(?:Atoi|ParseInt|ParseUint)\s*\(|"
+    r"\b(?:strtou?ll?|strtou?l|atoi|atoll?|strtou?imax|strtoumax)\s*\(",
+)
+
+_GO_FUNC_DEF_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?(\w+)\s*\(")
+# Bounded head window: the unbounded lazy head overlapped the star
+# run and the name on word/star chars — quadratic even at the
+# anchored match call. 256 chars sits far above real C heads.
+_C_FUNC_DEF_RE = re.compile(
+    r"^[A-Za-z_][\w\s*]{0,256}?\**(\w+)\s*\(",
+)
+_C_KEYWORD_STARTS = ("if", "for", "while", "switch", "return", "else")
+
+_PARSED_INT_SKIP_NAMES = frozenset({"_", "err", "ok"})
+
+# Bare numeric/string conversions: consumers only in the sense of
+# syntax. Inside a return statement they are the producer idiom.
+_CAST_CONSUMERS = frozenset({
+    "int", "int8", "int16", "int32", "int64",
+    "uint", "uint8", "uint16", "uint32", "uint64",
+    "uintptr", "byte", "rune", "float32", "float64", "string",
+})
+
+
+def derive_parse_wrappers(file_text: str) -> frozenset:
+    """Names of functions in *file_text* whose bodies contain a direct
+    text-to-integer parse call.
+
+    File-local and mechanical — the wrapper vocabulary is derived from
+    the analysed file itself, never from a hardcoded name list. Walks
+    each parse-call line back to the nearest enclosing function
+    definition (Go ``func`` at column 0, or a C-style definition at
+    column 0).
+    """
+    lines = file_text.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    wrappers: set[str] = set()
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*", "#", "*")):
+            continue
+        if not _PARSE_CALL_BODY_RE.search(line):
+            continue
+        for j in range(i, -1, -1):
+            m = _GO_FUNC_DEF_RE.match(lines[j])
+            if m:
+                wrappers.add(m.group(1))
+                break
+            if lines[j].startswith("}"):
+                break
+            if lines[j][:1].isalpha() and not lines[j].startswith(
+                _C_KEYWORD_STARTS,
+            ):
+                mc = _C_FUNC_DEF_RE.match(lines[j])
+                if mc:
+                    wrappers.add(mc.group(1))
+                    break
+    return frozenset(w for w in wrappers if w)
+
+
+_ASSIGN_LINE_RE = re.compile(
+    r"^\s*((?:\w+\s*,\s*)*\w+)\s*(?::?=|\+=|-=)\s*(.+)$",
+)
+
+
+def _propagate_parsed_aliases(
+    lines: list[str], parsed_vars: dict[str, int],
+) -> None:
+    """Extend *parsed_vars* through simple assignments (fixpoint).
+
+    ``line, col = n2, n`` / ``line = n`` / ``exp5 += exp`` — the alias
+    carries the text-derived value, so the contract follows it.
+    Positional multi-assigns map LHS[i] ← RHS[i]; anything more complex
+    taints every LHS name (detection role: over-approximate).
+    """
+    for _ in range(3):
+        changed = False
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith(("//", "/*", "#", "*")):
+                continue
+            m = _ASSIGN_LINE_RE.match(line)
+            if not m:
+                continue
+            lhs = [v.strip() for v in m.group(1).split(",")]
+            rhs = m.group(2)
+            rhs_parts = [p.strip() for p in rhs.split(",")]
+            if len(rhs_parts) == len(lhs) and len(lhs) > 1:
+                pairs = list(zip(lhs, rhs_parts))
+            else:
+                pairs = [(v, rhs) for v in lhs]
+            for var, expr in pairs:
+                if var in _PARSED_INT_SKIP_NAMES or var in parsed_vars:
+                    continue
+                if any(
+                    re.search(rf"\b{re.escape(p)}\b", expr)
+                    for p in parsed_vars
+                ):
+                    parsed_vars[var] = i
+                    changed = True
+        if not changed:
+            return
+
+
+def build_consumer_width_index(
+    checklist: dict[str, Any] | None,
+) -> dict[str, int]:
+    """Narrowest integer parameter width per function, from checklist
+    signatures (cross-file: the callee usually lives in another file).
+
+    Best-effort: functions without a parsable signature are absent.
+    """
+    index: dict[str, int] = {}
+    for fi in (checklist or {}).get("files", []):
+        for item in fi.get("items", fi.get("functions", [])) or []:
+            name = item.get("name") or ""
+            sig = item.get("signature") or ""
+            if not name or "(" not in sig:
+                continue
+            inner = sig[sig.find("(") + 1:sig.rfind(")")]
+            widths: list[int] = []
+            for tok in _SMT_PARAM_SEPARATOR_RE.split(inner):
+                for word in tok.split():
+                    w = _TYPE_WIDTHS.get(word.strip("*& ")) or \
+                        _GO_TYPE_WIDTHS.get(word.strip("*& "))
+                    if w:
+                        widths.append(w)
+            if widths:
+                short = name.rsplit(".", 1)[-1]
+                index[short] = min(widths)
+    return index
+
+
+def check_parsed_int_contract(
+    source: str,
+    *,
+    consumer_widths: dict[str, int] | None = None,
+    parse_wrappers: frozenset | None = None,
+) -> IntegerNarrowingResult:
+    """Parsed-integer width contract: a value parsed from text flows
+    into a consumer without ANY range check.
+
+    Text-derived integers are attacker-influenceable wherever the text
+    is; passing one to a callee, index, or arithmetic without a range
+    comparison delegates an int-width/semantic contract the local code
+    never established (the callee may store it in 32 bits, use it in
+    position arithmetic, or loop on it). Detection-role: the result is
+    injected as review evidence, never a verdict.
+
+    ``parse_wrappers`` extends the parse-site vocabulary with function
+    names derived from the analysed file itself (see
+    :func:`derive_parse_wrappers`): a call to a same-file wrapper whose
+    body parses text yields text-derived values too — the stdlib idiom
+    puts the ``strconv`` call one helper away from the consumer.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    parsed_vars: dict[str, int] = {}
+    wrapper_re = None
+    if parse_wrappers:
+        # Bounded assignee loop: the loop and the final name overlap
+        # on word chars, so the unbounded spelling cost every split
+        # of an assignee run with no '=' — quadratic. Sixteen
+        # assignees sits far above real code. \b pins the first
+        # assignee to a token start (an unpinned word run re-scans
+        # every suffix of a long hostile word).
+        wrapper_re = re.compile(
+            r"\b((?:\w+\s*,\s*){0,16}\w+)\s*(?::?=)\s*(?:\w+\.)?(?:"
+            + "|".join(re.escape(w) for w in sorted(parse_wrappers))
+            + r")\s*\(",
+        )
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*", "#", "*")):
+            continue
+        for rex in _PARSED_INT_ASSIGN_RES:
+            m = rex.search(line)
+            if m and m.group(1) not in ("_", "err"):
+                parsed_vars.setdefault(m.group(1), i)
+        if wrapper_re:
+            m = wrapper_re.search(line)
+            if m:
+                # A wrapper may return several values; which position
+                # carries the parsed int is unknown mechanically, so
+                # every named LHS is a candidate (detection role:
+                # over-approximate, the range-check pass prunes).
+                for var in m.group(1).split(","):
+                    var = var.strip()
+                    if var and var not in _PARSED_INT_SKIP_NAMES:
+                        parsed_vars.setdefault(var, i)
+
+    if not parsed_vars:
+        return IntegerNarrowingResult(
+            reasoning="no text-parsed integer variables found",
+        )
+
+    _propagate_parsed_aliases(lines, parsed_vars)
+
+    # Broken-abs idiom on a text-derived integer: ``if n < 0 { n = -n }``
+    # negation overflows at the width boundary (-MinInt == MinInt stays
+    # negative), so any subsequent upper-bound cap is bypassable. The
+    # range-check pass below must NOT clear this shape — the check the
+    # code performs is exactly the one the overflow defeats.
+    min_guard = _SMT_INTEGER_MIN_RE.search(source)
+    for var in parsed_vars:
+        neg_re = re.compile(
+            rf"\b{re.escape(var)}\s*=\s*-\s*{re.escape(var)}\b",
+        )
+        for j, line in enumerate(lines):
+            if line.lstrip().startswith(("//", "/*", "#", "*")):
+                continue
+            if neg_re.search(line) and not min_guard:
+                return IntegerNarrowingResult(
+                    narrowing_found=True,
+                    source_type="parsed-int",
+                    dest_type="negation",
+                    source_width=64,
+                    dest_width=64,
+                    assign_line=j + 1,
+                    reasoning=(
+                        f"'{var}' carries a text-parsed integer and is "
+                        f"negated onto itself at line {j + 1} "
+                        f"(absolute-value idiom) with no MinInt guard: "
+                        f"-MinInt overflows back to MinInt and stays "
+                        f"negative, so any later upper-bound cap on "
+                        f"'{var}' is bypassed at the width boundary"
+                    ),
+                )
+
+    for var, assign_idx in parsed_vars.items():
+        compare_re = re.compile(
+            _PARSED_INT_COMPARE_TEMPLATE.format(var=re.escape(var)),
+        )
+        range_checked = any(
+            compare_re.search(ln)
+            for ln in lines
+            if not ln.lstrip().startswith(("//", "#"))
+        )
+        if range_checked:
+            continue
+
+        for j in range(assign_idx + 1, len(lines)):
+            line = lines[j]
+            if line.lstrip().startswith(("//", "/*", "#", "*")):
+                continue
+            consumer = ""
+            for cm in _PARSED_INT_CALL_ARG_RE.finditer(line):
+                args = cm.group(2)
+                if re.search(rf"\b{re.escape(var)}\b", args):
+                    consumer = cm.group(1).rsplit(".", 1)[-1]
+                    break
+            # Producer idiom: a bare type conversion inside a return
+            # statement hands the parsed value to the CALLER — the
+            # width/semantic contract is the caller's to discharge, so
+            # flagging the helper itself only trains reviewers to
+            # dismiss the receipt where it matters.
+            if (
+                consumer in _CAST_CONSUMERS
+                and line.lstrip().startswith("return")
+            ):
+                continue
+            # Bounded, line-scoped subscript windows: real index
+            # expressions sit far below 64 chars, while unbounded
+            # interiors re-scan a hostile long line from every '['
+            # — worse than quadratic. The pre-variable window also
+            # excludes '[': with nested subscripts the innermost
+            # bracket still witnesses the indexed use, so the
+            # detected boolean is unchanged.
+            indexed = bool(
+                re.search(
+                    rf"\[[^][\n]{{0,64}}\b{re.escape(var)}\b[^\]\n]{{0,64}}\]",
+                    line,
+                ),
+            )
+            if not consumer and not indexed:
+                continue
+
+            width_note = ""
+            if consumer and consumer_widths:
+                w = consumer_widths.get(consumer)
+                if w and w < 64:
+                    width_note = (
+                        f" — and {consumer}()'s narrowest integer "
+                        f"parameter is {w}-bit"
+                    )
+            sink_desc = (
+                f"passed to {consumer}()" if consumer
+                else "used as an index"
+            )
+            return IntegerNarrowingResult(
+                narrowing_found=True,
+                source_type="parsed-int",
+                dest_type=consumer or "index",
+                source_width=64,
+                dest_width=(consumer_widths or {}).get(consumer, 0) or 0,
+                assign_line=j + 1,
+                reasoning=(
+                    f"'{var}' is parsed from text at line "
+                    f"{assign_idx + 1} and {sink_desc} at line {j + 1} "
+                    f"with NO range check anywhere in the function"
+                    f"{width_note}. Text-derived integers are "
+                    f"attacker-influenceable wherever the text is; the "
+                    f"consumer's width/semantic contract (32-bit "
+                    f"storage, position arithmetic, loop bounds) was "
+                    f"never established locally"
+                ),
+            )
+
+    return IntegerNarrowingResult(
+        reasoning="all text-parsed integers are range-checked or unconsumed",
+    )
+
+
+def _try_z3_integer_narrowing(
+    var_name: str,
+    src_type: str,
+    dest_type: str,
+    _src_width: int,
+    _dest_width: int,
+    assign_line: int,
+) -> IntegerNarrowingResult | None:
+    """Z3 check: can a value outside dest range reach the narrowing?"""
+    if not _z3_importable():
+        return None
+    out = _run_z3_child("integer_narrowing", {
+        "var_name": var_name,
+        "src_type": src_type,
+        "dest_type": dest_type,
+        "assign_line": assign_line,
+    })
+    result = _result_from_child(IntegerNarrowingResult, out)
+    # Unknown, unsupported and older statusless results cannot suppress
+    # the caller's independently extracted diagnostic candidate.
+    if result is None or result.solver_status not in {"sat", "unsat"}:
+        return None
+    if type(result.narrowing_found) is not bool or result.narrowing_found != (result.solver_status == "sat"):
+        return None
+    return result
+
+
+def _z3_integer_narrowing_check(
+    var_name: str,
+    src_type: str,
+    dest_type: str,
+    assign_line: int,
+) -> IntegerNarrowingResult:
+    """Query an unsigned width model, without a source-type or path proof."""
+    from core.smt_solver.availability import z3
+    from core.smt_solver.session import check_solver, new_solver, solver_reason_unknown
+
+    src_width = _type_to_width(src_type) if isinstance(src_type, str) else None
+    dest_width = _type_to_width(dest_type) if isinstance(dest_type, str) else None
+    if src_width is None or dest_width is None:
+        return IntegerNarrowingResult(
+            solver_status="unmodeled",
+            reasoning="unsupported type-width model — narrowing check inconclusive",
+        )
+
+    solver = new_solver()
+    v = z3.BitVec(var_name, src_width)
+
+    max_dest = (1 << dest_width) - 1
+    solver.add(z3.UGT(v, max_dest))
+
+    result = check_solver(solver)
+    if result == z3.sat:
+        model = solver.model()
+        witness_val = model[v]
+        w: dict[str, Any] = {}
+        if witness_val is not None:
+            try:
+                w[var_name] = witness_val.as_long()
+            except AttributeError:
+                pass
+        return IntegerNarrowingResult(
+            narrowing_found=True,
+            solver_status="sat",
+            source_type=src_type,
+            dest_type=dest_type,
+            source_width=src_width,
+            dest_width=dest_width,
+            assign_line=assign_line,
+            reasoning=(
+                f"Z3 SAT: unsigned width model for {src_type} ({src_width}-bit) "
+                f"→ {dest_type} ({dest_width}-bit) can discard high bits "
+                f"at line {assign_line}; witness values are unsigned bit patterns"
+            ),
+            witness=w or None,
+        )
+    if result != z3.unsat:
+        return IntegerNarrowingResult(
+            solver_status="unknown", source_type=src_type, dest_type=dest_type,
+            source_width=src_width, dest_width=dest_width, assign_line=assign_line,
+            reasoning="solver returned unknown — narrowing check inconclusive: " + solver_reason_unknown(solver),
+        )
+    return IntegerNarrowingResult(
+        narrowing_found=False,
+        solver_status="unsat",
+        reasoning="Z3 UNSAT: unsigned width model cannot discard high bits",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Early lock release (check-early-release)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EarlyReleaseResult:
+    """Result of checking for early lock release (use-after-unlock)."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    early_release_found: bool = False
+    lock_type: str = ""
+    acquire_line: int = 0
+    release_line: int = 0
+    use_line: int = 0
+    variable: str = ""
+    reasoning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "early_release_found": self.early_release_found,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        if self.lock_type:
+            d["lock_type"] = self.lock_type
+        if self.acquire_line:
+            d["acquire_line"] = self.acquire_line
+        if self.release_line:
+            d["release_line"] = self.release_line
+        if self.use_line:
+            d["use_line"] = self.use_line
+        if self.variable:
+            d["variable"] = self.variable
+        return d
+
+
+_GUARD_EXIT_RE = re.compile(
+    r"^\s*(?:return\b|goto\s+\w+\s*;)"
+)
+
+
+def _find_scope_unlock(
+    lines: list[str],
+    acquire_line: int,
+    unlock_re: re.Pattern[str],
+    search_limit: int = 80,
+) -> int | None:
+    """Find the scope-ending unlock, skipping guard-exit unlocks.
+
+    A guard-exit unlock is one that (a) is at a deeper brace depth than
+    the acquire AND (b) is immediately followed by ``return`` or ``goto``.
+    The function leaves the current path inside a conditional, so this
+    unlock is not the scope boundary for the happy path.
+
+    An unlock at the same brace depth as the acquire, or one not
+    followed by return/goto, is accepted as a scope boundary.
+
+    Returns the line index of the scope-ending unlock, or None.
+    """
+    acquire_depth = 0
+    for k in range(acquire_line + 1):
+        acquire_depth += lines[k].count("{") - lines[k].count("}")
+
+    end = min(len(lines), acquire_line + search_limit)
+    depth = acquire_depth
+
+    for j in range(acquire_line + 1, end):
+        depth += lines[j].count("{") - lines[j].count("}")
+
+        if not unlock_re.search(lines[j]):
+            continue
+
+        if depth > acquire_depth:
+            is_guard = False
+            for look in range(j + 1, min(len(lines), j + 3)):
+                stripped = lines[look].lstrip()
+                if not stripped or stripped.startswith(("//", "/*")):
+                    continue
+                if _GUARD_EXIT_RE.match(stripped):
+                    is_guard = True
+                break
+
+            if is_guard:
+                continue
+
+        return j
+
+    return None
+
+
+def check_early_release(
+    source: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> EarlyReleaseResult:
+    """Detect lock-read-unlock-use patterns (use-after-unlock race).
+
+    Finds cases where a value is read under a lock, the lock is released,
+    and the value is then used — creating a race window where another
+    thread can invalidate the value between release and use.
+
+    Supports both C (spin_lock/mutex/rcu) and Go (sync.Mutex/RWMutex).
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    is_go = any(
+        "func " in ln or "package " in ln or ".Lock()" in ln
+        for ln in lines[:30]
+    )
+
+    if is_go:
+        return _check_early_release_go(lines)
+    return _check_early_release_c(lines, vocab)
+
+
+# \b pins the assignee to a token start (an unpinned word run
+# re-scans every suffix of a long hostile word — quadratic); the
+# call-argument and subscript interiors are bounded — 500 chars
+# sits far above real expressions, while unbounded interiors
+# re-scan a hostile line from every planted opener.
+_GO_READ_RE = re.compile(
+    r"\b(\w+)\s*(?::=|=)\s*"
+    r"(?:\w+\.(\w+)(?:\s*\(.{0,500}\))?|\w+\[.{1,500}\])"
+)
+
+_GO_MULTI_RETURN_RE = re.compile(
+    r"\b(\w+)\s*,\s*\w+\s*(?::=|=)\s*\w+\.(\w+)\s*\("
+)
+
+
+def _check_early_release_go(lines: list[str]) -> EarlyReleaseResult:
+    """Go-specific early lock release detection."""
+    # \b pins the receiver to a token start (unpinned word runs
+    # re-scan every suffix of a long hostile word — quadratic).
+    lock_re = re.compile(r"\b(\w+)\.(RLock|Lock)\s*\(\s*\)")
+    unlock_re_tpl = r"{name}\.(?:RUnlock|Unlock)\s*\(\s*\)"
+    defer_re = re.compile(r"defer\s+(\w+)\.(RUnlock|Unlock)\s*\(\s*\)")
+
+    func_end = len(lines)
+    brace_depth = 0
+    in_func = False
+    for j, ln in enumerate(lines):
+        if "func " in ln and "{" in ln:
+            in_func = True
+            brace_depth = 0
+        if in_func:
+            brace_depth += ln.count("{") - ln.count("}")
+            if brace_depth <= 0 and j > 0:
+                func_end = j
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            continue
+
+        lm = lock_re.search(line)
+        if not lm:
+            continue
+
+        lock_name = lm.group(1)
+        lock_type = lm.group(2)
+        unlock_re = re.compile(unlock_re_tpl.format(name=re.escape(lock_name)))
+
+        has_defer = defer_re.search(line) or any(
+            defer_re.search(lines[j])
+            for j in range(max(0, i - 1), min(len(lines), i + 3))
+        )
+
+        unlock_line = _find_scope_unlock(lines, i, unlock_re, search_limit=50)
+
+        if has_defer and unlock_line is None:
+            unlock_line = func_end
+
+        if unlock_line is None:
+            continue
+
+        reads_under_lock: list[tuple[int, str]] = []
+        for j in range(i + 1, unlock_line):
+            for rx in (_GO_MULTI_RETURN_RE, _GO_READ_RE):
+                fm = rx.search(lines[j])
+                if fm:
+                    reads_under_lock.append((j, fm.group(1)))
+                    break
+
+        if not reads_under_lock:
+            continue
+
+        search_end = min(len(lines), unlock_line + 30)
+        for read_line, var_name in reads_under_lock:
+            var_use_re = re.compile(r"\b" + re.escape(var_name) + r"\b")
+            for k in range(unlock_line + 1, search_end):
+                if var_use_re.search(lines[k]):
+                    return EarlyReleaseResult(
+                        early_release_found=True,
+                        lock_type=f"{lock_name}.{lock_type}",
+                        acquire_line=i + 1,
+                        release_line=unlock_line + 1,
+                        use_line=k + 1,
+                        variable=var_name,
+                        reasoning=(
+                            f"'{var_name}' read at line {read_line + 1} under "
+                            f"{lock_name}.{lock_type} (line {i + 1}), lock "
+                            f"released at line {unlock_line + 1}, value used "
+                            f"at line {k + 1} — race window"
+                        ),
+                    )
+
+    return EarlyReleaseResult(
+        reasoning="no early lock release patterns found",
+    )
+
+
+def _check_early_release_c(
+    lines: list[str],
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> EarlyReleaseResult:
+    """C-specific early lock release detection (RCU/spinlock/mutex)."""
+    # \b pins each scan to a token start: an unpinned leading word
+    # run re-scans every suffix of a long hostile word — quadratic.
+    # Direct struct field read: var = ptr->field  /  var = obj.field
+    field_read_re = re.compile(
+        r"\b(\w+)\s*=\s*(?:(\w+)->(\w+)|(\w+)\.(\w+))"
+    )
+    # Macro-wrapped field read: var = MACRO(ptr->field) or MACRO(&ptr->field)
+    # Covers rcu_dereference*, READ_ONCE, smp_load_acquire, atomic*_read, etc.
+    # The scan is per line, so the argument interior excludes
+    # newlines, and both windows are bounded — a real macro read
+    # keeps '->' within tens of chars of the '(' — while unbounded
+    # interiors re-scan a hostile line from every planted opener,
+    # worse than quadratic. The pre-arrow window also excludes '='
+    # (an assignment inside the macro argument is not the
+    # field-read idiom), which keeps every scan attempt local.
+    macro_read_re = re.compile(
+        r"\b(\w+)\s*=\s*\w+\s*\([^)\n=]{0,256}->[^)\n]{0,64}\)"
+    )
+    # Function-call assignment: var = func(args)
+    func_assign_re = re.compile(r"\b(\w+)\s*=\s*\w+\s*\(")
+    # Output parameter: func(&var)
+    out_param_re = re.compile(r"\b\w+\s*\(\s*&(\w+)\s*[,)]")
+
+    acquires = _extract_lock_acquires(lines, vocab)
+    if not acquires:
+        # Release-only heuristic: if unlock calls exist but no acquires,
+        # the caller holds the lock. Treat function entry as implicit hold.
+        release_only: list[tuple[int, str, str]] = []
+        for _i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith(("//", "/*")):
+                continue
+            seed_unlocks = [u for _, u in _LOCK_PAIRS]
+            vocab_unlocks = sorted(
+                {r for _, r in vocab.lock_pairs} | vocab.lock_releases,
+            )
+            for unlock_name in seed_unlocks + vocab_unlocks:
+                unlock_pat = re.compile(
+                    r"\b" + re.escape(unlock_name)
+                    + r"(?:_irq(?:restore)?|_bh)?\s*\(",
+                )
+                if unlock_pat.search(line):
+                    release_only.append((0, "caller_held", unlock_name))
+                    break
+        if not release_only:
+            return EarlyReleaseResult(
+                applicable=False,
+                reasoning="no lock acquires found",
+            )
+        acquires = release_only  # type: ignore[assignment]
+
+    for acq_line, lock_func, unlock_name, *_ in acquires:
+        unlock_re = re.compile(
+            r"\b" + re.escape(unlock_name) + r"(?:_irq(?:restore)?|_bh)?\s*\("
+        )
+        unlock_line = _find_scope_unlock(lines, acq_line, unlock_re)
+
+        if unlock_line is None:
+            continue
+
+        reads_under_lock: list[tuple[int, str]] = []
+
+        for j in range(acq_line + 1, unlock_line):
+            stripped = lines[j].lstrip()
+            if stripped.startswith(("//", "/*")):
+                continue
+            fm = field_read_re.search(lines[j])
+            if fm:
+                var_name = fm.group(1)
+                reads_under_lock.append((j, var_name))
+                continue
+            fm = macro_read_re.search(lines[j])
+            if fm:
+                reads_under_lock.append((j, fm.group(1)))
+                continue
+            fm = func_assign_re.search(lines[j])
+            if fm:
+                reads_under_lock.append((j, fm.group(1)))
+                continue
+            fm = out_param_re.search(lines[j])
+            if fm:
+                reads_under_lock.append((j, fm.group(1)))
+
+        if not reads_under_lock:
+            continue
+
+        # Only flag when the variable is dereferenced as a pointer
+        # after unlock. Scalar copies (int, port, uid) used by
+        # value are safe — the copy is local.
+        for read_line, var_name in reads_under_lock:
+            var_deref_re = re.compile(
+                r"\b" + re.escape(var_name) + r"\s*->"
+                r"|&\s*" + re.escape(var_name) + r"\s*->"
+                r"|\*\s*" + re.escape(var_name) + r"\b"
+            )
+            for k in range(unlock_line + 1, min(len(lines), unlock_line + 30)):
+                stripped = lines[k].lstrip()
+                if stripped.startswith(("//", "/*")):
+                    continue
+                if var_deref_re.search(lines[k]):
+                    return EarlyReleaseResult(
+                        early_release_found=True,
+                        lock_type=lock_func,
+                        acquire_line=acq_line + 1,
+                        release_line=unlock_line + 1,
+                        use_line=k + 1,
+                        variable=var_name,
+                        reasoning=(
+                            f"'{var_name}' read at line {read_line + 1} "
+                            f"under {lock_func} (line {acq_line + 1}), "
+                            f"lock released at line {unlock_line + 1}, "
+                            f"pointer dereferenced at line {k + 1} — "
+                            f"race window"
+                        ),
+                    )
+
+        # Decision variables: scalars assigned from a function call
+        # under the lock, then used in a branch after unlock.
+        # \b pins the assignee to a token start (see field_read_re).
+        func_assigned_re = re.compile(r"\b(\w+)\s*=\s*\w+\s*\(")
+        for read_line, var_name in reads_under_lock:
+            assign_line_str = lines[read_line]
+            if not func_assigned_re.search(assign_line_str):
+                continue
+            branch_re = re.compile(
+                r"\bif\s*\(\s*!?" + re.escape(var_name) + r"\s*[)&|!=<>]"
+            )
+            for k in range(unlock_line + 1, min(len(lines), unlock_line + 20)):
+                stripped = lines[k].lstrip()
+                if stripped.startswith(("//", "/*")):
+                    continue
+                if branch_re.search(lines[k]):
+                    has_side_effect = False
+                    for eff in range(k + 1, min(len(lines), k + 5)):
+                        eff_s = lines[eff].strip()
+                        if _SMT_CALL_SHAPE_RE.search(eff_s) or "return" in eff_s:
+                            has_side_effect = True
+                            break
+                    if has_side_effect:
+                        return EarlyReleaseResult(
+                            early_release_found=True,
+                            lock_type=lock_func,
+                            acquire_line=acq_line + 1,
+                            release_line=unlock_line + 1,
+                            use_line=k + 1,
+                            variable=var_name,
+                            reasoning=(
+                                f"'{var_name}' computed at line "
+                                f"{read_line + 1} under {lock_func} "
+                                f"(line {acq_line + 1}), lock released "
+                                f"at line {unlock_line + 1}, stale "
+                                f"value gates branch at line {k + 1}"
+                            ),
+                        )
+
+    return EarlyReleaseResult(
+        reasoning="no early lock release patterns found",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lock-domain mismatch (check-lock-domain)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LockDomainResult:
+    """Result of checking for cross-lock-domain field access."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    mismatch_found: bool = False
+    field: str = ""
+    lock1: str = ""
+    lock1_line: int = 0
+    lock2: str = ""
+    lock2_line: int = 0
+    access1_line: int = 0
+    access2_line: int = 0
+    reasoning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "mismatch_found": self.mismatch_found,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        if self.field:
+            d["field"] = self.field
+        if self.lock1:
+            d["lock1"] = self.lock1
+            d["lock1_line"] = self.lock1_line
+        if self.lock2:
+            d["lock2"] = self.lock2
+            d["lock2_line"] = self.lock2_line
+        if self.access1_line:
+            d["access1_line"] = self.access1_line
+        if self.access2_line:
+            d["access2_line"] = self.access2_line
+        return d
+
+
+def check_lock_domain(
+    source: str,
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> LockDomainResult:
+    """Detect struct field accesses under different locks (TOCTOU).
+
+    Scans for struct field reads/writes (via -> or .) and tracks which
+    lock scope protects each access. When the same field is accessed
+    under two different lock names, flags a potential TOCTOU.
+
+    Supports C (spin_lock/mutex/rcu) and Go (sync.Mutex/RWMutex).
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+    is_go = any(
+        "func " in ln or "package " in ln or ".Lock()" in ln
+        for ln in lines[:30]
+    )
+
+    if is_go:
+        return _check_lock_domain_go(lines)
+    return _check_lock_domain_c(lines, vocab)
+
+
+def _check_lock_domain_go(lines: list[str]) -> LockDomainResult:
+    """Go-specific lock-domain mismatch detection."""
+    # \b pins receiver/field scans to token starts (unpinned word
+    # runs re-scan every suffix of a long hostile word — quadratic).
+    lock_re = re.compile(r"\b(\w+)\.(RLock|Lock)\s*\(\s*\)")
+    unlock_re_tpl = r"{name}\.(?:RUnlock|Unlock)\s*\(\s*\)"
+    field_re = re.compile(r"\b(\w+)\.(\w+)")
+
+    lock_scopes: list[tuple[int, int, str]] = []
+
+    i = 0
+    while i < len(lines):
+        lm = lock_re.search(lines[i])
+        if lm:
+            lock_name = lm.group(1)
+            lock_type = f"{lock_name}.{lm.group(2)}"
+            unlock_re = re.compile(
+                unlock_re_tpl.format(name=re.escape(lock_name))
+            )
+            for j in range(i + 1, min(len(lines), i + 80)):
+                if unlock_re.search(lines[j]):
+                    lock_scopes.append((i, j, lock_type))
+                    break
+        i += 1
+
+    if len(lock_scopes) < 2:
+        return LockDomainResult(
+            applicable=False,
+            reasoning="fewer than 2 lock scopes found",
+        )
+
+    field_accesses: dict[str, list[tuple[int, str]]] = {}
+    for scope_start, scope_end, lock_type in lock_scopes:
+        for j in range(scope_start + 1, scope_end):
+            for fm in field_re.finditer(lines[j]):
+                obj, fld = fm.group(1), fm.group(2)
+                if obj in ("sync", "fmt", "log", "os", "io"):
+                    continue
+                key = f"{obj}.{fld}"
+                field_accesses.setdefault(key, []).append((j, lock_type))
+
+    for field_key, accesses in field_accesses.items():
+        locks_seen: dict[str, int] = {}
+        for line_no, lock_type in accesses:
+            if lock_type not in locks_seen:
+                locks_seen[lock_type] = line_no
+        if len(locks_seen) >= 2:
+            items = list(locks_seen.items())
+            return LockDomainResult(
+                mismatch_found=True,
+                field=field_key,
+                lock1=items[0][0],
+                lock1_line=items[0][1] + 1,
+                lock2=items[1][0],
+                lock2_line=items[1][1] + 1,
+                access1_line=items[0][1] + 1,
+                access2_line=items[1][1] + 1,
+                reasoning=(
+                    f"'{field_key}' accessed under {items[0][0]} "
+                    f"(line {items[0][1] + 1}) and {items[1][0]} "
+                    f"(line {items[1][1] + 1}) — cross-lock-domain TOCTOU"
+                ),
+            )
+
+    return LockDomainResult(reasoning="no cross-lock-domain accesses found")
+
+
+# SEED SET — generic POSIX credential concepts. The kernel
+# task_struct/cred field bulk (cap_effective, dumpable, seccomp, ...)
+# lives in the linux_kernel vocab pack; project fields arrive via
+# DomainVocabulary.security_fields (domain-model security_fields /
+# security_attributes / sensitive_fields keys). Do not grow this list —
+# teach the study loop / pack instead.
+_SECURITY_FIELDS = frozenset({
+    "uid", "euid", "gid", "egid",
+})
+
+
+def _check_correlated_field_access(
+    lines: list[str],
+    lock_scopes: list[tuple[int, int, str, str]],
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> LockDomainResult | None:
+    """Detect security-relevant fields read under different locks.
+
+    Fires when two or more security-relevant fields are each accessed
+    under a different lock type — even when no single field appears
+    under two locks. The concern is atomicity: reading cred under
+    rcu_read_lock and mm under task_lock means the two reads are not
+    atomic with respect to setuid().
+    """
+    if not lock_scopes:
+        return None
+
+    sec_fields = _SECURITY_FIELDS | vocab.security_fields
+    if not sec_fields:
+        return None
+
+    # \b pins the base to a token start (unpinned word runs re-scan
+    # every suffix of a long hostile word — quadratic).
+    field_re = re.compile(r"\b(\w+)->(\w+)")
+    security_accesses: dict[str, list[tuple[int, str]]] = {}
+
+    for scope_start, scope_end, lock_func, _ in lock_scopes:
+        for j in range(scope_start + 1, scope_end):
+            stripped = lines[j].lstrip()
+            if stripped.startswith(("//", "/*")):
+                continue
+            for fm in field_re.finditer(lines[j]):
+                fld = fm.group(2)
+                if fld in sec_fields:
+                    security_accesses.setdefault(fld, []).append(
+                        (j, lock_func)
+                    )
+
+    if len(security_accesses) < 2:
+        return None
+
+    by_lock: dict[str, list[tuple[str, int]]] = {}
+    for fld, accesses in security_accesses.items():
+        for line_no, lock_func in accesses:
+            by_lock.setdefault(lock_func, []).append((fld, line_no))
+
+    if len(by_lock) < 2:
+        return None
+
+    lock_items = list(by_lock.items())
+    lock1, fields1 = lock_items[0]
+    lock2, fields2 = lock_items[1]
+    f1, l1 = fields1[0]
+    f2, l2 = fields2[0]
+
+    return LockDomainResult(
+        mismatch_found=True,
+        field=f"{f1} + {f2}",
+        lock1=lock1,
+        lock1_line=l1 + 1,
+        lock2=lock2,
+        lock2_line=l2 + 1,
+        access1_line=l1 + 1,
+        access2_line=l2 + 1,
+        reasoning=(
+            f"security-relevant fields '{f1}' and '{f2}' read "
+            f"under different locks ({lock1} and {lock2}) — "
+            f"TOCTOU: concurrent modification between reads"
+        ),
+    )
+
+
+def _check_lock_domain_c(
+    lines: list[str],
+    vocab: DomainVocabulary = _EMPTY_VOCAB,
+) -> LockDomainResult:
+    """C-specific lock-domain mismatch detection."""
+    field_re = re.compile(r"\b(\w+)->(\w+)")
+
+    acquires = _extract_lock_acquires(lines, vocab)
+
+    lock_scopes: list[tuple[int, int, str, str]] = []
+    for acq_line, lock_func, unlock_name, *_ in acquires:
+        unlock_re = re.compile(
+            r"\b" + re.escape(unlock_name) + r"(?:_irq(?:restore)?|_bh)?\s*\("
+        )
+        for j in range(acq_line + 1, min(len(lines), acq_line + 100)):
+            if unlock_re.search(lines[j]):
+                lock_scopes.append((acq_line, j, lock_func, unlock_name))
+                break
+
+    # Barrier-inside-lock: smp_load_acquire/READ_ONCE/atomic_read under
+    # a lock implies writers that bypass it (cross-function domain).
+    _barrier_re = re.compile(
+        r"\b(smp_load_acquire|atomic_read"
+        r"|atomic_long_read|smp_store_release)\s*\("
+    )
+    if not lock_scopes:
+        return LockDomainResult(
+            applicable=False,
+            reasoning="no lock scopes found",
+        )
+
+    if lock_scopes:
+        for scope_start, scope_end, lock_func, _ in lock_scopes:
+            for j in range(scope_start + 1, scope_end):
+                bm = _barrier_re.search(lines[j])
+                if not bm:
+                    continue
+                fm = field_re.search(lines[j])
+                if fm:
+                    fld = f"{fm.group(1)}->{fm.group(2)}"
+                    return LockDomainResult(
+                        mismatch_found=True,
+                        field=fld,
+                        lock1=lock_func,
+                        lock1_line=scope_start + 1,
+                        lock2=bm.group(1),
+                        lock2_line=j + 1,
+                        access1_line=scope_start + 1,
+                        access2_line=j + 1,
+                        reasoning=(
+                            f"'{fld}' read via {bm.group(1)} at "
+                            f"line {j + 1} inside {lock_func} scope — "
+                            f"barrier is redundant under exclusive lock, "
+                            f"implies cross-function unlocked writers"
+                        ),
+                    )
+
+    correlated = _check_correlated_field_access(lines, lock_scopes, vocab)
+    if correlated is not None:
+        return correlated
+
+    if len(lock_scopes) < 2:
+        return LockDomainResult(
+            reasoning="fewer than 2 complete lock scopes found",
+        )
+
+    field_accesses: dict[str, list[tuple[int, str]]] = {}
+    for scope_start, scope_end, lock_func, _ in lock_scopes:
+        for j in range(scope_start + 1, scope_end):
+            stripped = lines[j].lstrip()
+            if stripped.startswith(("//", "/*")):
+                continue
+            for fm in field_re.finditer(lines[j]):
+                key = f"{fm.group(1)}->{fm.group(2)}"
+                field_accesses.setdefault(key, []).append((j, lock_func))
+
+    for field_key, accesses in field_accesses.items():
+        locks_seen: dict[str, int] = {}
+        for line_no, lock_func in accesses:
+            if lock_func not in locks_seen:
+                locks_seen[lock_func] = line_no
+        if len(locks_seen) >= 2:
+            items = list(locks_seen.items())
+            a1_line = items[0][1]
+            a2_line = items[1][1]
+            # Nested locking: if both accesses fall within a single
+            # enclosing lock scope, the outer lock protects both.
+            if any(
+                s <= a1_line <= e and s <= a2_line <= e
+                for s, e, _, _ in lock_scopes
+            ):
+                continue
+            return LockDomainResult(
+                mismatch_found=True,
+                field=field_key,
+                lock1=items[0][0],
+                lock1_line=a1_line + 1,
+                lock2=items[1][0],
+                lock2_line=items[1][1] + 1,
+                access1_line=a1_line + 1,
+                access2_line=items[1][1] + 1,
+                reasoning=(
+                    f"'{field_key}' accessed under {items[0][0]} "
+                    f"(line {a1_line + 1}) and {items[1][0]} "
+                    f"(line {items[1][1] + 1}) — different locks "
+                    f"protect the same field"
+                ),
+            )
+
+    return LockDomainResult(reasoning="no cross-lock-domain accesses found")
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU (check-then-act) detector
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TocTouResult:
+    """Result of TOCTOU pattern detection."""
+
+    #: False when the detector's prerequisites were absent (no auth
+    #: checks / lock acquires / allocations / ... in the source) — the
+    #: model did not APPLY, which is not a refutation.  Consumers must
+    #: map inapplicable negatives to inconclusive, never to refuted.
+    applicable: bool = True
+    toctou_found: bool = False
+    check_call: str = ""
+    check_line: int = 0
+    use_call: str = ""
+    use_line: int = 0
+    variable: str = ""
+    reasoning: str = ""
+
+    def to_dict(self) -> dict:
+        d = {
+            "toctou_found": self.toctou_found,
+            "check_call": self.check_call,
+            "check_line": self.check_line,
+            "use_call": self.use_call,
+            "use_line": self.use_line,
+            "variable": self.variable,
+            "reasoning": self.reasoning,
+        }
+        if not self.applicable:
+            d["applicable"] = False
+        return d
+
+
+_TOCTOU_C_CHECKS = re.compile(
+    r"\b(access|stat|lstat|fstatat|faccessat"
+    r"|__xstat|__lxstat|__fxstatat"
+    r"|PathFileExistsA|GetFileAttributesA"
+    r")\s*\(",
+)
+
+_TOCTOU_C_USES = re.compile(
+    r"\b(open|fopen|creat|chmod|chown|lchown|fchmodat|fchownat"
+    r"|unlink|remove|rename|link|symlink|mkdir|rmdir"
+    r"|truncate|execve|execvp|execlp"
+    r"|CreateFileA|DeleteFileA|MoveFileA"
+    r")\s*\(",
+)
+
+_TOCTOU_C_DOUBLE_FETCH = re.compile(
+    r"\b(copy_from_user|get_user|__get_user"
+    r"|copy_from_iter|copyin)\s*\(",
+)
+
+_TOCTOU_GO_CHECKS = re.compile(
+    r"\b(os\.Stat|os\.Lstat|os\.IsExist|os\.IsNotExist"
+    r"|filepath\.Exists|os\.Access)\s*\(",
+)
+
+_TOCTOU_GO_USES = re.compile(
+    r"\b(os\.Open|os\.OpenFile|os\.Create|os\.Remove"
+    r"|os\.RemoveAll|os\.Rename|os\.Mkdir|os\.MkdirAll"
+    r"|os\.Chmod|os\.Chown|os\.Link|os\.Symlink"
+    r"|ioutil\.ReadFile|ioutil\.WriteFile)\s*\(",
+)
+
+# Bounded Path() argument windows: a real path expression sits far
+# below 500 chars, while an unbounded interior re-scans a hostile
+# line from every planted ``Path(`` — quadratic.
+_TOCTOU_PY_CHECKS = re.compile(
+    r"\b(os\.path\.exists|os\.path\.isfile|os\.path\.isdir"
+    r"|os\.access|os\.stat|os\.lstat|Path\([^)]{0,500}\)\.exists\(\)"
+    r"|Path\([^)]{0,500}\)\.is_file\(\)|Path\([^)]{0,500}\)\.is_dir\(\))"
+    r"\s*[\(.]?",
+)
+
+_TOCTOU_PY_USES = re.compile(
+    r"\b(open|os\.open|os\.remove|os\.unlink|os\.rename"
+    r"|os\.chmod|os\.chown|os\.mkdir|os\.makedirs"
+    r"|shutil\.rmtree|shutil\.move"
+    r"|Path\([^)]{0,500}\)\.open\(\)|Path\([^)]{0,500}\)\.unlink\(\))"
+    r"\s*\(",
+)
+
+
+def _extract_path_arg(line: str, call_match: re.Match) -> str:
+    """Extract the first argument (path variable) from a function call."""
+    rest = line[call_match.end() - 1:]
+    depth = 0
+    arg_start = -1
+    for i, ch in enumerate(rest):
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                arg_start = i + 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and arg_start >= 0:
+                return rest[arg_start:i].split(",")[0].strip().strip('"\'')
+        elif ch == "," and depth == 1 and arg_start >= 0:
+            return rest[arg_start:i].strip().strip('"\'')
+    return ""
+
+
+def _check_toctou_pairs(
+    lines: list,
+    check_re: re.Pattern,
+    use_re: re.Pattern,
+) -> TocTouResult:
+    """Scan for check-then-act pairs on the same path variable."""
+    checks: list[tuple[int, str, str]] = []
+    for i, line in enumerate(lines):
+        m = check_re.search(line)
+        if m:
+            path_arg = _extract_path_arg(line, m)
+            if path_arg:
+                checks.append((i, m.group(1), path_arg))
+
+    for i, line in enumerate(lines):
+        m = use_re.search(line)
+        if m:
+            use_arg = _extract_path_arg(line, m)
+            if not use_arg:
+                continue
+            for check_line, check_call, check_arg in checks:
+                if i <= check_line:
+                    continue
+                if check_arg == use_arg or (
+                    check_arg in use_arg or use_arg in check_arg
+                ):
+                    return TocTouResult(
+                        toctou_found=True,
+                        check_call=check_call,
+                        check_line=check_line + 1,
+                        use_call=m.group(1),
+                        use_line=i + 1,
+                        variable=check_arg,
+                        reasoning=(
+                            f"'{check_call}' checks '{check_arg}' at line "
+                            f"{check_line + 1}, then '{m.group(1)}' uses it "
+                            f"at line {i + 1} — filesystem state can change "
+                            f"between check and use"
+                        ),
+                    )
+
+    return TocTouResult(reasoning="no TOCTOU pattern found")
+
+
+def _extract_nth_arg(line: str, call_match: re.Match, n: int = 0) -> str:
+    """Extract the nth comma-separated argument from a function call."""
+    rest = line[call_match.end() - 1:]
+    depth = 0
+    arg_start = -1
+    args: list[str] = []
+    for i, ch in enumerate(rest):
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                arg_start = i + 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and arg_start >= 0:
+                args.append(rest[arg_start:i].strip())
+                break
+        elif ch == "," and depth == 1 and arg_start >= 0:
+            args.append(rest[arg_start:i].strip())
+            arg_start = i + 1
+    if n < len(args):
+        return args[n].strip().strip('"\'')
+    return ""
+
+
+def _check_toctou_double_fetch(lines: list) -> TocTouResult:
+    """Detect copy_from_user double-fetch: same user pointer copied twice."""
+    fetches: dict[str, list[tuple[int, str]]] = {}
+    for i, line in enumerate(lines):
+        m = _TOCTOU_C_DOUBLE_FETCH.search(line)
+        if m:
+            src_arg = _extract_nth_arg(line, m, n=1)
+            if src_arg:
+                fetches.setdefault(src_arg, []).append((i, m.group(1)))
+
+    for arg, locs in fetches.items():
+        if len(locs) >= 2:
+            return TocTouResult(
+                toctou_found=True,
+                check_call=locs[0][1],
+                check_line=locs[0][0] + 1,
+                use_call=locs[1][1],
+                use_line=locs[1][0] + 1,
+                variable=arg,
+                reasoning=(
+                    f"double fetch of user pointer '{arg}': first at line "
+                    f"{locs[0][0] + 1}, second at line {locs[1][0] + 1} — "
+                    f"user space can modify between fetches"
+                ),
+            )
+
+    return TocTouResult(reasoning="no double-fetch pattern found")
+
+
+def check_toctou(source: str) -> TocTouResult:
+    """Detect TOCTOU (check-then-act) filesystem races and double fetches."""
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+    if not source or not source.strip():
+        return TocTouResult(applicable=False, reasoning="empty source")
+
+    lines = source.splitlines()
+
+    has_go = any(kw in source for kw in ("func ", "package ", "import ("))
+    has_py = any(kw in source for kw in ("def ", "import os", "from pathlib"))
+
+    if has_go:
+        result = _check_toctou_pairs(lines, _TOCTOU_GO_CHECKS, _TOCTOU_GO_USES)
+        if result.toctou_found:
+            return result
+
+    if has_py:
+        result = _check_toctou_pairs(lines, _TOCTOU_PY_CHECKS, _TOCTOU_PY_USES)
+        if result.toctou_found:
+            return result
+
+    result = _check_toctou_pairs(lines, _TOCTOU_C_CHECKS, _TOCTOU_C_USES)
+    if result.toctou_found:
+        return result
+
+    result = _check_toctou_double_fetch(lines)
+    if result.toctou_found:
+        return result
+
+    return TocTouResult(reasoning="no TOCTOU pattern found")
+
+
+# ---------------------------------------------------------------------------
+# Race-protection verification (inverse of check_lock_domain)
+# ---------------------------------------------------------------------------
+
+_ATOMIC_ACCESSOR_RE = re.compile(
+    r"\b(?:atomic_read|atomic_set|atomic_inc|atomic_dec"
+    r"|atomic_add|atomic_sub|atomic_cmpxchg|atomic_xchg"
+    r"|atomic_long_read|atomic_long_set"
+    r"|smp_load_acquire|smp_store_release"
+    r"|READ_ONCE|WRITE_ONCE"
+    r"|xchg|cmpxchg"
+    r"|refcount_read|refcount_set|refcount_inc|refcount_dec"
+    r"|kref_get|kref_put)\s*\(",
+)
+
+_RCU_ACCESSOR_RE = re.compile(
+    r"\b(?:rcu_dereference|rcu_dereference_protected"
+    r"|rcu_dereference_check|rcu_dereference_raw"
+    r"|rcu_assign_pointer|RCU_INIT_POINTER)\s*\(",
+)
+
+_PER_CPU_RE = re.compile(
+    r"\b(?:per_cpu|this_cpu_ptr|this_cpu_read|this_cpu_write"
+    r"|__this_cpu_read|__this_cpu_write"
+    r"|per_cpu_ptr|raw_cpu_ptr)\s*\(",
+)
+
+
+@dataclass
+class RaceProtectionResult:
+    """Result of checking whether accesses are race-protected."""
+
+    protected: bool = False
+    total_accesses: int = 0
+    protected_accesses: int = 0
+    unprotected_accesses: int = 0
+    lock_scopes: int = 0
+    reasoning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "protected": self.protected,
+            "total_accesses": self.total_accesses,
+            "protected_accesses": self.protected_accesses,
+            "unprotected_accesses": self.unprotected_accesses,
+            "lock_scopes": self.lock_scopes,
+            "reasoning": self.reasoning,
+        }
+
+
+def check_race_protection(
+    source: str,
+    vocab: DomainVocabulary | None = None,
+) -> RaceProtectionResult:
+    """Check whether shared-state accesses are protected by synchronisation.
+
+    Scans for struct field dereferences (ptr->field) and checks whether
+    each access is inside a lock scope, uses an atomic/RCU accessor,
+    or is a per-CPU operation.  If ALL accesses are protected, returns
+    protected=True — the function has no unprotected shared-state
+    access and a race hypothesis can be mechanically refuted.
+
+    Only operates on C code.  Returns protected=False (inconclusive)
+    for non-C or when no field accesses are found.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+    if not source or not source.strip():
+        return RaceProtectionResult(reasoning="empty source")
+
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
+
+    # Non-C: bail
+    if any(kw in source for kw in ("func ", "package ", "import (")):
+        return RaceProtectionResult(reasoning="Go source, not applicable")
+    if any(kw in source for kw in ("def ", "import os", "class ")):
+        return RaceProtectionResult(reasoning="Python source, not applicable")
+
+    field_re = re.compile(r"\b(\w+)->(\w+)")
+
+    # Build lock scopes.  Each scope carries the lock OBJECT (first
+    # argument of the acquire) so that multi-access protection claims
+    # can require the SAME lock: holding a->lock here and b->lock
+    # there does not serialise accesses to one shared field.
+    if vocab is None:
+        vocab = _EMPTY_VOCAB
+    acquires = _extract_lock_acquires(lines, vocab)
+    lock_scopes: list[tuple[int, int]] = []
+    lock_scope_objects: list[tuple[int, int, str]] = []
+    for acq_line, lock_func, unlock_name, lock_obj in acquires:
+        if lock_func.startswith("rcu_read_lock"):
+            # Handled by the RCU accessor rule, not as a lock scope.
+            continue
+        unlock_re = re.compile(
+            r"\b" + re.escape(unlock_name) + r"(?:_irq(?:restore)?|_bh)?\s*\("
+        )
+        for j in range(acq_line + 1, min(len(lines), acq_line + 200)):
+            if unlock_re.search(lines[j]):
+                lock_scopes.append((acq_line, j))
+                lock_scope_objects.append((acq_line, j, lock_obj))
+                break
+
+    # rcu_read_lock..rcu_read_unlock scopes
+    rcu_scopes: list[tuple[int, int]] = []
+    rcu_lock_re = re.compile(r"\brcu_read_lock\s*\(\s*\)")
+    rcu_unlock_re = re.compile(r"\brcu_read_unlock\s*\(\s*\)")
+    for i, line in enumerate(lines):
+        if rcu_lock_re.search(line):
+            for j in range(i + 1, min(len(lines), i + 200)):
+                if rcu_unlock_re.search(lines[j]):
+                    rcu_scopes.append((i, j))
+                    break
+    # RCU read-side sections are NOT generic lock scopes: a plain
+    # p->field inside rcu_read_lock()..unlock() is only protected when
+    # p came from rcu_dereference (handled by the accessor rule below).
+
+    # preempt_disable / local_irq_save scopes (needed for per-CPU safety)
+    preempt_scopes: list[tuple[int, int]] = []
+    preempt_acq_re = re.compile(
+        r"\b(preempt_disable|local_irq_save|local_irq_disable"
+        r"|get_cpu|migrate_disable)\s*\(",
+    )
+    preempt_rel_re = re.compile(
+        r"\b(preempt_enable|local_irq_restore|local_irq_enable"
+        r"|put_cpu|migrate_enable)\s*\(",
+    )
+    for i, line in enumerate(lines):
+        if preempt_acq_re.search(line):
+            for j in range(i + 1, min(len(lines), i + 200)):
+                if preempt_rel_re.search(lines[j]):
+                    preempt_scopes.append((i, j))
+                    break
+    # Preempt-disable sections likewise only protect per-CPU accessors
+    # (SMP peers still run) — they are not generic lock scopes.
+
+    def _in_lock_scope(line_idx: int) -> bool:
+        return any(start <= line_idx <= end for start, end in lock_scopes)
+
+    def _covering_lock_objects(line_idx: int) -> set[str]:
+        """Lock objects of the mutex/spinlock scopes covering a line.
+
+        RCU / preempt scopes are excluded — they are separate
+        protection kinds handled by their own accessor rules.
+        """
+        return {
+            obj for start, end, obj in lock_scope_objects
+            if start <= line_idx <= end
+        }
+
+    def _in_rcu_scope(line_idx: int) -> bool:
+        return any(start <= line_idx <= end for start, end in rcu_scopes)
+
+    def _in_preempt_scope(line_idx: int) -> bool:
+        return any(start <= line_idx <= end for start, end in preempt_scopes)
+
+    def _call_arg_spans(line: str, call_re: re.Pattern) -> list[tuple[int, int]]:
+        """(start, end) spans of the argument lists of *call_re* calls
+        on *line* — used to bind accessor protection to the accessed
+        expression itself instead of to anything on the same line."""
+        spans: list[tuple[int, int]] = []
+        for m in call_re.finditer(line):
+            depth = 0
+            for k in range(m.end() - 1, len(line)):
+                if line[k] == "(":
+                    depth += 1
+                elif line[k] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        spans.append((m.end() - 1, k + 1))
+                        break
+            else:
+                spans.append((m.end() - 1, len(line)))
+        return spans
+
+    # Variables bound from rcu_dereference*() — only THEIR
+    # dereferences are RCU-protected inside an RCU read-side section.
+    rcu_deref_vars: set[str] = set()
+    # \b pins the assignee to a token start (unpinned word runs
+    # re-scan every suffix of a long hostile word — quadratic).
+    rcu_bind_re = re.compile(
+        r"\b(\w+)\s*=\s*rcu_dereference(?:_protected|_check|_raw)?\s*\(",
+    )
+    for line in lines:
+        m = rcu_bind_re.search(line)
+        if m:
+            rcu_deref_vars.add(m.group(1))
+
+    # Init dereferences of function parameters before any lock.
+    # Pattern: `type *var = param->field;` where param is a function arg.
+    # Only when locks exist — without locks there is no safe pre-lock zone.
+    init_lines: set[int] = set()
+    if lock_scopes:
+        param_names: set[str] = set()
+        sig_re = re.compile(r"\b\w+\s*\*\s*(\w+)")
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if "{" in stripped:
+                for m in sig_re.finditer(line):
+                    param_names.add(m.group(1))
+                break
+        first_lock_line = min(s for s, _ in lock_scopes)
+        init_deref_re = re.compile(
+            r"^\s+(?:struct\s+\w+\s+\*|[\w]+\s+\*?)\w+\s*=\s*(\w+)->\w+"
+        )
+        for i in range(min(first_lock_line, len(lines))):
+            m = init_deref_re.match(lines[i])
+            if m and m.group(1) in param_names:
+                init_lines.add(i)
+
+    total = 0
+    # (line_idx, base, field, protection kind) per access
+    access_records: list[tuple[int, str, str, str]] = []
+    # (base, field) -> covering-lock-object sets, one per lock-kind access
+    expr_lock_objs: dict[tuple[str, str], list[set[str]]] = {}
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "/*")):
+            continue
+        if stripped.startswith("*") and not stripped.startswith("*/"):
+            continue
+
+        accesses = list(field_re.finditer(line))
+        if not accesses:
+            continue
+
+        # Accessor protection binds to the accessed EXPRESSION, not to
+        # the line: atomic_read(&a->cnt) on a line that also touches
+        # b->data protects only a->cnt.
+        atomic_spans = _call_arg_spans(line, _ATOMIC_ACCESSOR_RE)
+        in_rcu = _in_rcu_scope(i)
+        rcu_spans = _call_arg_spans(line, _RCU_ACCESSOR_RE) if in_rcu else []
+        percpu_spans = (
+            _call_arg_spans(line, _PER_CPU_RE)
+            if _in_preempt_scope(i) else []
+        )
+
+        for fm in accesses:
+            total += 1
+            base, fieldname = fm.group(1), fm.group(2)
+            pos = fm.start()
+            kind = ""
+            if i in init_lines:
+                kind = "init"
+            elif any(s <= pos < e for s, e in atomic_spans):
+                kind = "atomic"
+            elif in_rcu and (
+                base in rcu_deref_vars
+                or any(s <= pos < e for s, e in rcu_spans)
+            ):
+                # RCU read-side sections only protect pointers obtained
+                # via rcu_dereference — a plain p->field inside
+                # rcu_read_lock()..unlock() is not thereby serialised.
+                kind = "rcu"
+            elif any(s <= pos < e for s, e in percpu_spans):
+                kind = "percpu"
+            elif _in_lock_scope(i):
+                kind = "lock"
+                expr_lock_objs.setdefault((base, fieldname), []).append(
+                    _covering_lock_objects(i),
+                )
+            access_records.append((i, base, fieldname, kind))
+
+    # Same-lock-object rule: when the SAME expression is accessed in
+    # multiple lock scopes, the protection claim needs one common,
+    # identifiable lock object across all of them.  Different (or
+    # unparseable) lock objects do not serialise the accesses.
+    inconsistent_exprs: set[tuple[str, str]] = set()
+    for expr, cover_sets in expr_lock_objs.items():
+        if len(cover_sets) < 2:
+            continue
+        named_sets = [{o for o in s if o} for s in cover_sets]
+        common = set.intersection(*named_sets) if named_sets else set()
+        if not common:
+            inconsistent_exprs.add(expr)
+
+    protected = 0
+    unprotected_lines: list[int] = []
+    for i, base, fieldname, kind in access_records:
+        if kind == "lock" and (base, fieldname) in inconsistent_exprs:
+            kind = ""
+        if kind:
+            protected += 1
+        else:
+            unprotected_lines.append(i + 1)
+
+    unprotected_count = total - protected
+
+    if total == 0:
+        return RaceProtectionResult(
+            lock_scopes=len(lock_scopes),
+            reasoning="no struct field dereferences found",
+        )
+
+    if unprotected_count == 0:
+        return RaceProtectionResult(
+            protected=True,
+            total_accesses=total,
+            protected_accesses=protected,
+            unprotected_accesses=0,
+            lock_scopes=len(lock_scopes),
+            reasoning=(
+                f"all {total} field accesses in this function are "
+                f"inside lock scopes or use atomic/RCU/per-CPU "
+                f"accessors (lexical heuristic: lock identity and "
+                f"accessor binding checked textually within this "
+                f"function only — cross-function access sites and "
+                f"aliasing are not analysed)"
+            ),
+        )
+
+    return RaceProtectionResult(
+        protected=False,
+        total_accesses=total,
+        protected_accesses=protected,
+        unprotected_accesses=unprotected_count,
+        lock_scopes=len(lock_scopes),
+        reasoning=(
+            f"{unprotected_count}/{total} field accesses at "
+            f"lines {unprotected_lines[:5]} are outside lock scopes "
+            f"and don't use atomic/RCU accessors"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis disproof
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HypothesisDisproofResult:
+    """Result of attempting to mechanically disprove a hypothesis."""
+
+    hypothesis_class: str = ""
+    disproved: bool | None = None
+    reasoning: str = ""
+    witness: dict[str, Any] | None = None
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "hypothesis_class": self.hypothesis_class,
+            "reasoning": self.reasoning,
+        }
+        if self.disproved is not None:
+            d["disproved"] = self.disproved
+        if self.witness:
+            d["witness"] = self.witness
+        if self.error:
+            d["error"] = self.error
+        return d
+
+
+def disprove_integer_overflow(
+    hypothesis: str,
+    source_context: str,
+    var_types: dict[str, str] | None = None,
+    *,
+    file_path: str = "",
+    function_name: str | None = None,
+    integer_abi=None,
+) -> HypothesisDisproofResult:
+    """Run the complete source-bound overflow disproof in a confined worker.
+
+    Source parsing, prefix definedness and every native solver query stay in the
+    worker. Invalid, missing or stale replies cannot authorize a disproof.
+    Isolation refusals retain the shared child runner's fail-closed policy.
+    """
+    from .safety_contract import assert_boost_only
+    assert_boost_only("condition_smt")
+    from .overflow_disproof import run_disproof
+    return run_disproof(hypothesis, source_context, var_types, file_path=file_path,
+                        function_name=function_name, integer_abi=integer_abi)

@@ -1,0 +1,196 @@
+"""Dockerfile ``FROM <image>:<tag>`` in-place rewriter.
+
+The bumper-orchestrator emits :class:`RewriteEdit` records with
+``locator`` set to ``"{registry}/{repository}"`` and the tag as
+``old_value``/``new_value``. This rewriter walks the Dockerfile,
+matches each ``FROM`` line against the locator, and rewrites the
+tag portion.
+
+Edge cases handled:
+
+* ``FROM <registry>/<repo>:<tag> AS <stage>`` — preserve the
+  ``AS <stage>`` suffix.
+* Variant tags (``3.12-bookworm``) — the bumper never emits
+  candidates for these; the rewriter doesn't expect to see them.
+  If the ``old_value`` doesn't match the file's tag exactly,
+  return ``value_mismatch``.
+* Digest-pinned FROM — the bumper skips these; rewriter not
+  invoked.
+* Short-form refs (``FROM python:3.12``) — must match by the
+  expanded locator (``docker.io/library/python``). The walker
+  parses to the canonical form; we accept both short and
+  expanded forms in the file.
+
+Same atomic-write + idempotent + value-mismatch semantics as
+``dockerfile_arg``."""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from . import RewriteEdit, RewriteResult, register, rewrite_file_with
+from typing import TYPE_CHECKING
+from ..file_shapes import is_dockerfile as _is_dockerfile
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+@register(predicate=_is_dockerfile, filenames=None)
+def rewrite_dockerfile_from(
+    path: Path, edits: list[RewriteEdit],
+) -> list[RewriteResult]:
+    """Apply FROM-image tag-bump edits to a Dockerfile in place.
+
+    The Dockerfile-ARG rewriter ALSO registers against Dockerfile
+    predicates. The dispatcher resolves a single rewriter per
+    path, so both rewriter functions actually need to be the
+    same physical function — OR this module needs to coordinate
+    with dockerfile_arg.
+
+    Implementation: this function delegates by examining each
+    edit. Primary discriminator is ``extra["kind"]`` set by the
+    bumper orchestrator from the candidate's ``kind`` field.
+    Fallback (no kind in extra): image-shaped locators (containing
+    ``/``) route to the FROM path, everything else to ARG. Mixed
+    batches get split + reassembled.
+    """
+    arg_edits: list[RewriteEdit] = []
+    from_edits: list[RewriteEdit] = []
+    inline_install_edits: list[RewriteEdit] = []
+    for edit in edits:
+        kind = (edit.extra or {}).get("kind")
+        if kind == "from_image":
+            from_edits.append(edit)
+        elif kind == "arg":
+            arg_edits.append(edit)
+        elif kind in {"inline_install_pip", "inline_install_npm"}:
+            inline_install_edits.append(edit)
+        # Back-compat shape heuristic for edits without an
+        # ``extra["kind"]``: image refs always contain ``/``,
+        # ARG names never do.
+        elif "/" in edit.locator:
+            from_edits.append(edit)
+        else:
+            arg_edits.append(edit)
+
+    results: list[RewriteResult] = []
+    if from_edits:
+        results.extend(_apply_from_edits(path, from_edits))
+    if arg_edits:
+        # Delegate ARG edits to the ARG rewriter so registration
+        # collisions don't cause one rewriter to clobber the other.
+        from .dockerfile_arg import rewrite_dockerfile_arg
+        results.extend(rewrite_dockerfile_arg(path, arg_edits))
+    if inline_install_edits:
+        from .dockerfile_inline_install import (
+            rewrite_dockerfile_inline_install, rewrite_dockerfile_npm_install,
+        )
+        pip_edits = [e for e in inline_install_edits if (e.extra or {}).get('kind') == 'inline_install_pip']
+        npm_edits = [e for e in inline_install_edits if (e.extra or {}).get('kind') == 'inline_install_npm']
+        if pip_edits:
+            results.extend(rewrite_dockerfile_inline_install(path, pip_edits))
+        if npm_edits:
+            results.extend(rewrite_dockerfile_npm_install(path, npm_edits))
+    return results
+
+
+def _apply_from_edits(
+    path: Path, edits: list[RewriteEdit],
+) -> list[RewriteResult]:
+    """Apply image-tag edits, atomic-writing the result.
+
+    Each edit's locator is ``"{registry}/{repository}"`` (e.g.
+    ``"docker.io/library/python"``). We match both the canonical
+    and short forms in the file (Docker accepts ``python:3.12``
+    as shorthand for ``docker.io/library/python:3.12``).
+    """
+    return rewrite_file_with(path, edits, _apply_one_from)
+
+
+def _apply_one_from(
+    text: str, edit: RewriteEdit,
+) -> tuple[str, RewriteResult]:
+    """Apply one image-tag edit. Matches both canonical and
+    short forms of the image ref."""
+    locator = edit.locator
+    # Build the candidate image-ref forms we'll match against.
+    # Canonical: registry/repo. Short forms: if registry is
+    # docker.io and repo starts with "library/", the bare repo
+    # name (e.g. "python") is also accepted; otherwise the
+    # short form is registry/repo verbatim. Parse the registry
+    # component explicitly via partition rather than startswith
+    # (this isn't a URL, but the lexical shape triggers
+    # incomplete-URL-sanitisation scanners).
+    forms = [locator]
+    registry, _, rest = locator.partition("/")
+    if registry == "docker.io" and rest:
+        namespace, _, image = rest.partition("/")
+        if namespace == "library" and image:
+            forms.append(image)
+            forms.append(f"library/{image}")
+            forms.append(f"docker.io/{image}")
+        else:
+            forms.append(rest)
+    image_alternates = "|".join(re.escape(f) for f in forms)
+    # Match: optional ``FROM`` + whitespace + image + ``:`` +
+    # captured tag + (optional ``@digest`` + optional ``AS
+    # <stage>`` + optional comment / EOL).
+    # Leading indent is HORIZONTAL-only ([^\S\n]) — the MULTILINE
+    # ``^\s*`` idiom is quadratic on blank-line runs (see the helm
+    # rewriter's fixed anchor; same sibling idiom).
+    pattern = re.compile(
+        rf"^([^\S\n]*FROM\s+(?:--platform=\S+\s+)?(?:{image_alternates}):)"
+        rf"(\S+?)"                  # tag (non-greedy)
+        rf"(\s|$|@|#)",              # boundary
+        re.MULTILINE,
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return text, RewriteResult(
+            edit=edit, applied=False, reason="not_found",
+        )
+    target_matches = [m for m in matches if m.group(2) == edit.old_value]
+    if not target_matches:
+        already_done = [m for m in matches if m.group(2) == edit.new_value]
+        if already_done:
+            return text, RewriteResult(
+                edit=edit, applied=False, reason="no_change",
+            )
+        current_tag = matches[0].group(2)
+        return text, RewriteResult(
+            edit=edit, applied=False,
+            reason=(
+                f"value_mismatch: file has {current_tag!r}, "
+                f"plan expected {edit.old_value!r}"
+            ),
+        )
+    new_text = text
+    for m in reversed(target_matches):
+        new_text = (
+            new_text[:m.start(2)]
+            + edit.new_value
+            + new_text[m.end(2):]
+        )
+    # Verdict parity with the shared driver and the sibling
+    # rewriters: when OTHER-valued occurrences of the same image
+    # remain, the apply is explicitly ``partial`` — a bare
+    # ``applied`` reported a clean rewrite over a mixed file.
+    stray_values = sorted(
+        {m.group(2) for m in matches}
+        - {edit.old_value, edit.new_value},
+    )
+    reason = "applied"
+    if stray_values:
+        reason = (
+            f"partial: {len(target_matches)} occurrence(s) bumped; "
+            f"other value(s) left in place: {stray_values!r}"
+        )
+    return new_text, RewriteResult(
+        edit=edit, applied=True, reason=reason,
+    )
+
+

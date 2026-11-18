@@ -59,7 +59,8 @@ VULN_TYPES = [
     "out_of_bounds_read", "out_of_bounds_write",
     "null_deref", "type_confusion", "memory_leak", "privilege_confusion",
     "race_condition", "uninitialized_memory",
-    "hardcoded_secret", "weak_crypto", "other",
+    "hardcoded_secret", "weak_crypto",
+    "information_disclosure", "open_redirect", "other",
 ]
 
 # Memory corruption vuln_types — Stage E feasibility analysis applies to these.
@@ -76,18 +77,19 @@ MEMORY_CORRUPTION_TYPES = frozenset({
 # canonical vuln_type. Pre-fix (and historically): the two lists
 # could drift apart silently. A vuln_type added to
 # MEMORY_CORRUPTION_TYPES but not VULN_TYPES would be silently
-# untracked by validators that whitelist against VULN_TYPES; a
+# untracked by validators that allowlist against VULN_TYPES; a
 # typo like "double_freee" would survive code review and only
 # manifest as a missed Stage-E-skipped finding months later.
 # Assert on import so any drift fails the test suite immediately.
 _VULN_TYPES_SET = frozenset(VULN_TYPES)
 _drift = MEMORY_CORRUPTION_TYPES - _VULN_TYPES_SET
 if _drift:
-    raise AssertionError(
+    msg = (
         f"MEMORY_CORRUPTION_TYPES drifted from VULN_TYPES: "
         f"{sorted(_drift)} not in VULN_TYPES. "
         f"Add to VULN_TYPES list or remove from MEMORY_CORRUPTION_TYPES."
     )
+    raise AssertionError(msg)
 
 def needs_feasibility_analysis(vuln_type: str) -> bool:
     """Check if a vuln_type requires Stage E binary feasibility analysis."""
@@ -124,6 +126,21 @@ VULN_TYPE_ALIASES = {
     "uaf": "use_after_free",
     "use_after_free_read": "use_after_free",
     "use_after_free_write": "use_after_free",
+    # Modern kernel UAF sub-classes — route into memory-corruption feasibility
+    # rather than falling through to "other" (which skips Stage E).
+    "kernel_stack_uaf": "use_after_free",
+    "cross_cache_uaf": "use_after_free",
+    "cross_cache": "use_after_free",
+    "timer_uaf": "use_after_free",
+    "uaf_via_pending_timer": "use_after_free",
+    # JIT/engine type-confusion sub-classes (V8 Maglev missing write barrier,
+    # SpiderMonkey inline-cache confusion) -> canonical type_confusion.
+    "jit_write_barrier": "type_confusion",
+    "missing_write_barrier": "type_confusion",
+    "write_barrier_missing": "type_confusion",
+    "ic_type_confusion": "type_confusion",
+    "inline_cache_type_confusion": "type_confusion",
+    "inline_cache_confusion": "type_confusion",
     # Double free
     "double-free": "double_free",
     # Format string
@@ -187,9 +204,14 @@ VULN_TYPE_ALIASES = {
     # Deserialization
     "insecure_deserialization": "deserialization",
     "unsafe_deserialization": "deserialization",
-    # Memory leak
-    "information_leak": "memory_leak",
-    "info_leak": "memory_leak",
+    # Information disclosure — NOT memory_leak: CWE-401 (missing
+    # release of memory) is a resource-lifetime bug; leaking data to
+    # an observer is CWE-200-family, and conflating them steered
+    # downstream CWE inference to the wrong family.
+    "information_leak": "information_disclosure",
+    "info_leak": "information_disclosure",
+    "information_exposure": "information_disclosure",
+    "sensitive_data_exposure": "information_disclosure",
     # Crypto
     "weak_cryptography": "weak_crypto",
     "insecure_crypto": "weak_crypto",
@@ -252,6 +274,29 @@ VALIDATE_RULING_VALUES = ["confirmed", "ruled_out", "exploitable"]
 # Confidence levels for LLM self-assessment.
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
+def is_dark_row(finding: dict) -> bool:
+    """True when a finding row carries the audit "dark" grade — no
+    mechanical tool had a channel to adjudicate it.
+
+    Three shapes, one meaning: findings-graded.json rows carry
+    ``status="dark"``; audit-emitted selection rows carry
+    ``audit_status="dark"`` (their ``status`` is the /validate entry
+    state); a re-import of an already-mapped container carries the
+    original grade as ``source_status="dark"``.
+
+    THE dark-eligibility predicate: dark rows are not validate-eligible
+    by default (the /validate import chokepoint routes them to the
+    witness backlog; ``--include-dark`` is the explicit operator
+    opt-in), and the /audit post-pass selection excludes them by the
+    same test. One definition so the two readers cannot drift.
+    """
+    return "dark" in (
+        finding.get("audit_status"),
+        finding.get("status"),
+        finding.get("source_status"),
+    )
+
+
 # False-positive reason categories — why a finding was ruled out.
 FP_REASONS = [
     "sanitized_input", "dead_code", "test_only",
@@ -290,8 +335,8 @@ CWE_TO_VULN_TYPE = {
     "CWE-190": "integer_overflow",
     "CWE-191": "integer_underflow", # Distinct from overflow — see batch 324
     "CWE-193": "buffer_overflow",   # Off-by-one error
-    "CWE-200": "other",             # Information disclosure
-    "CWE-209": "other",             # Sensitive info in error message
+    "CWE-200": "information_disclosure",
+    "CWE-209": "information_disclosure",  # Sensitive info in error message
     "CWE-269": "privilege_confusion", # Improper privilege management
     "CWE-285": "other",             # Improper authorization
     "CWE-287": "other",             # Improper authentication
@@ -320,7 +365,11 @@ CWE_TO_VULN_TYPE = {
     "CWE-494": "other",             # Download of code without integrity check
     "CWE-502": "deserialization",
     "CWE-552": "path_traversal",   # Files accessible to external parties
-    "CWE-601": "ssrf",              # URL redirect to untrusted site
+    # Open redirect, not SSRF: CWE-601 is the SERVER sending the
+    # CLIENT elsewhere; SSRF (CWE-918) is the server being made to
+    # fetch. The old label promoted every open-redirect finding into
+    # the SSRF lane (wrong severity model, wrong CWE-918 round-trip).
+    "CWE-601": "open_redirect",
     "CWE-611": "other",             # XXE
     "CWE-639": "other",             # Authorization bypass via user-controlled key
     "CWE-732": "other",             # Incorrect permission assignment
@@ -367,10 +416,15 @@ VULN_TYPE_TO_CWE = {
     "type_confusion": "CWE-843",
     "ssrf": "CWE-918",
     # Round-trip closure: every vuln_type that appears as a value
-    # in CWE_TO_VULN_TYPE above should also appear as a key here so
-    # callers can convert in BOTH directions. Pre-fix five
-    # categories were forward-only:
+    # in CWE_TO_VULN_TYPE above also appears as a key here so
+    # callers can convert in BOTH directions — with exactly ONE
+    # deliberate exception: "other" is the forward map's catch-all
+    # and has no representative CWE (any reverse pick would be
+    # wrong for most of its members). The closure test pins this.
+    # Pre-fix five categories were forward-only:
     "memory_leak": "CWE-401",
+    "information_disclosure": "CWE-200",
+    "open_redirect": "CWE-601",
     "hardcoded_secret": "CWE-798",
     "uninitialized_memory": "CWE-908",  # Use of uninitialized resource (more general than 457 init-only)
     "privilege_confusion": "CWE-269",

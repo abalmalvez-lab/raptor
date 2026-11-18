@@ -16,8 +16,9 @@ The ``bench`` command is registered here from
 """
 from __future__ import annotations
 
-import json
+from argparse import Namespace
 import re
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +26,10 @@ from typing import Annotated
 
 import typer
 
+from core.atomic_fs import write_text_atomically
+from core.json import save_json
+from core.reporting.options import options_from_args
+from core.security.log_sanitisation import sanitise_for_terminal
 from cve_diff import __version__
 from cve_diff.analysis.analyzer import RootCauseAnalysisError, RootCauseAnalyzer
 from cve_diff.cli.bench import bench as _bench_cmd
@@ -36,12 +41,56 @@ from cve_diff.core.exceptions import (
     UnsupportedSource,
 )
 from cve_diff.infra import api_status
+from cve_diff.infra.disk_budget import DiskBudgetExceeded
 from cve_diff.infra.github_client import warn_if_token_missing
 from cve_diff.llm.client import LLMCallFailed
-from cve_diff.pipeline import Pipeline, PipelineResult  # noqa: F401  (PipelineResult used in type hint)
+from cve_diff.pipeline import Pipeline, PipelineResult
 from cve_diff.report import markdown, osv_schema
+from cve_diff.security.exceptions import ValidationError
 from cve_diff.report.flow import write_flow_files, write_outcome_patches
 from cve_diff.security.validators import validate_cve_id
+
+
+def _install_termination_handlers() -> list[tuple[int, object]]:
+    """Convert SIGTERM/SIGINT into exception unwinding.
+
+    The clone workdir can reach ~2GB. Its cleanup only runs when the
+    interpreter unwinds normally (the ``finally`` in ``run``), but
+    SIGTERM's default action terminates the process with no unwinding
+    — a CI timeout or supervisor kill mid-clone leaked the whole temp
+    tree. Raising from the handler routes both signals through the
+    existing ``finally`` so ``TemporaryDirectory.cleanup()`` fires.
+
+    Returns ``(signum, previous_handler)`` pairs for
+    :func:`_restore_termination_handlers`. Installation is skipped
+    (empty entry) off the main thread, where ``signal.signal`` raises
+    ``ValueError``.
+    """
+    def _sig_to_exc(signum: int, _frame: object) -> None:
+        if signum == signal.SIGINT:
+            # Preserve conventional Ctrl-C semantics (typer/click
+            # translate KeyboardInterrupt into their Abort path).
+            raise KeyboardInterrupt
+        raise SystemExit(128 + signum)
+
+    restore: list[tuple[int, object]] = []
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            restore.append((signum, signal.signal(signum, _sig_to_exc)))
+        except ValueError:
+            pass
+    return restore
+
+
+def _restore_termination_handlers(
+    restore: list[tuple[int, object]],
+) -> None:
+    """Undo :func:`_install_termination_handlers`."""
+    for signum, previous in restore:
+        try:
+            signal.signal(signum, previous)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            pass
 
 
 def _echo_flow_md(output_dir: Path, cve_id: str, quiet: bool) -> None:
@@ -83,13 +132,23 @@ def _echo_flow_md(output_dir: Path, cve_id: str, quiet: bool) -> None:
             return
     else:
         try:
-            body = flow_md_path.read_text()
+            body = flow_md_path.read_text(encoding="utf-8")
         except OSError:
             return
+    # flow.md content is producer-escaped (telemetry escapes tool args
+    # and stage signals before they reach the file), but this relay is
+    # the terminal sink — escape here too so a producer regression (or
+    # a hand-edited flow.md) cannot drive the operator's TTY. Newlines
+    # are structural in the trace body and kept; the body is already
+    # display-capped above.
+    from core.security.log_sanitisation import (
+        escape_nonprintable,
+        sanitise_for_terminal,
+    )
     typer.echo("")
-    typer.echo(f"=== {cve_id} — pipeline trace ===")
+    typer.echo(f"=== {sanitise_for_terminal(str(cve_id), max_len=128)} — pipeline trace ===")
     typer.echo("")
-    typer.echo(body.rstrip())
+    typer.echo(escape_nonprintable(body.rstrip(), preserve_newlines=True))
     typer.echo("")
     typer.echo("=== Artifacts ===")
 
@@ -97,7 +156,7 @@ def _echo_flow_md(output_dir: Path, cve_id: str, quiet: bool) -> None:
 def _flow_from_pipeline(
     output_dir: Path, cve_id: str, pipeline: Pipeline,
     *, ok: bool, error_class: str | None,
-    pipeline_result: "PipelineResult | None" = None,
+    pipeline_result: PipelineResult | None = None,
 ) -> None:
     """Read agent telemetry off the pipeline and emit per-CVE flow files.
 
@@ -133,7 +192,20 @@ def _flow_from_pipeline(
             slug = None
         if slug is None:
             slug = (bundle.repo_ref.repository_url or "").lower()
+        # Discover provenance: the AgentResult is the only structured
+        # record of WHY the agent picked this (slug, sha) — verdict
+        # rationale plus loop cost. On PASS this is an AgentOutput.
+        ar = pipeline_result.agent_result
         stage_signals = {
+            "discover": {
+                "rationale": getattr(ar, "rationale", "") or "",
+                "tokens": getattr(ar, "tokens", 0),
+                "cost_usd": getattr(ar, "cost_usd", 0.0),
+                "elapsed_s": getattr(ar, "elapsed_s", 0.0),
+                "verified_candidates": len(
+                    getattr(ar, "verified_candidates", ()) or ()
+                ),
+            },
             "acquire": {"layer": layer},
             "resolve": {
                 "before": (bundle.commit_before or "?")[:12],
@@ -184,23 +256,25 @@ app = typer.Typer(
 )
 
 
-# Match the surrender-reason fragment produced by the agent layer:
-# `DiscoveryError: CVE-X: agent surrendered (REASON): ...`. Only the
-# budget_* family is eligible for interactive extension.
+# Match the surrender-reason fragment produced by the agent layer.
+# The caller matches against ``str(exc)`` of the caught DiscoveryError,
+# and DiscoveryError has no custom __str__, so the text starts with the
+# CVE id, NOT with a "DiscoveryError:" class-name prefix — pipeline
+# raises ``DiscoveryError(f"{cve_id}: agent surrendered ({reason}): …")``.
+# (An earlier class-name anchor made this regex unmatchable and the
+# whole interactive budget-extension flow dead code.)
 #
-# `\b` word boundary on the leading `agent` so we don't match
-# substrings of compound words (`maintainer-agent surrendered`).
-# Anchored to the canonical "DiscoveryError" prefix on the same
-# line so a CVE description that happens to quote the marker
-# phrase (security advisories sometimes quote tool output
-# verbatim, especially for CVEs about tool behaviour) doesn't
-# trigger a false-positive "offer budget extension" prompt.
-# `re.MULTILINE` so `^` matches a line start anywhere in the
-# (potentially multi-line) error text.
+# Anchored to the canonical start-of-string CVE-id prefix so a CVE
+# description that happens to QUOTE the marker phrase deeper in the
+# error text (security advisories sometimes quote tool output
+# verbatim) doesn't trigger a false-positive "offer budget extension"
+# prompt. The reason alternation lists exactly the budget reasons the
+# agent loop emits (``budget_s`` is the wall-clock cap; there is no
+# ``budget_tokens`` surrender reason).
 _BUDGET_REASON_RE = re.compile(
-    r"^DiscoveryError:.*?\bagent surrendered "
-    r"\((budget_cost_usd|budget_iterations|budget_tokens|budget_s)\)",
-    re.MULTILINE,
+    r"\ACVE-\d{4}-\d{4,}: agent surrendered "
+    r"\((budget_cost_usd|budget_iterations|budget_s)\)",
+    re.IGNORECASE,
 )
 
 
@@ -225,6 +299,17 @@ def _classify_discovery(error_text: str) -> str:
     return m.group(1) if m else "DiscoveryError"
 
 
+def _emit_report(options, output_dir: Path, cve_id: str, status: int, *, pipeline=None, **captured) -> None:
+    """Keep optional presentation separate from native command policy."""
+    try:
+        from cve_diff.report.completion import complete_cve_report
+        complete_cve_report(options, output_dir, cve_id, status,
+                            telemetry=getattr(getattr(pipeline, "agent", None), "last_telemetry", None),
+                            stage_status=getattr(pipeline, "_stage_status", None), **captured)
+    except Exception as exc:  # noqa: BLE001 — report failure must not mask analysis
+        typer.echo("Optional CVE-diff report failed (" + type(exc).__name__ + "); native result retained", err=True)
+
+
 def _write_failure_md(output_dir: Path, cve_id: str, error_class: str,
                       error_text: str) -> None:
     """Write a per-CVE markdown surfacing the agent's surrender rationale.
@@ -232,10 +317,14 @@ def _write_failure_md(output_dir: Path, cve_id: str, error_class: str,
     failures here are not allowed to break the CLI's exit-code path."""
     try:
         text = markdown.render_failure(cve_id, error_class, error_text)
-        (output_dir / f"{cve_id}.md").write_text(text)
+        write_text_atomically(output_dir / f"{cve_id}.md", text)
         typer.echo(f"wrote {output_dir / f'{cve_id}.md'}")
-    except Exception:  # noqa: BLE001 — never block the CLI on report-write
-        pass
+    except Exception as exc:  # noqa: BLE001 — never block the CLI on report-write
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "cve_diff CLI: failure-report write failed for %s: %s",
+            cve_id, exc, exc_info=True,
+        )
 
 
 def _version_callback(value: bool) -> None:
@@ -284,13 +373,23 @@ def run(
         ),
     ] = False,
     model_id: Annotated[
-        str,
-        typer.Option("--model", help="Model for root-cause analysis.", show_default=False),
-    ] = "claude-opus-4-7",
+        str | None,
+        typer.Option(
+            "--model",
+            help="Model for the discovery agent and root-cause analysis "
+                 "(default: RAPTOR's configured primary model).",
+            show_default=False,
+        ),
+    ] = None,
     disk_limit_pct: Annotated[
-        float,
-        typer.Option("--disk-limit", help="Max filesystem usage %.", show_default=False),
-    ] = 80.0,
+        float | None,
+        typer.Option(
+            "--disk-limit",
+            help="Hard maximum filesystem usage %. By default, abort at or "
+                 "above 80% only when less than 20 GiB remains free.",
+            show_default=False,
+        ),
+    ] = None,
     max_file_bytes: Annotated[
         int,
         typer.Option("--max-file", help="Per-file source cap in bytes.", show_default=False),
@@ -302,10 +401,27 @@ def run(
             help="Suppress progress and API-key banner.",
         ),
     ] = False,
+    report_format: Annotated[list[str] | None, typer.Option("--report-format", help="Portable companion format; repeat for multiple outputs.")] = None,
+    report_output: Annotated[Path | None, typer.Option("--report-output", help="Portable companion file or directory.")] = None,
+    no_report: Annotated[bool, typer.Option("--no-report", help="Disable portable companions; retain native CVE artifacts and terminal output.")] = False,
 ) -> None:
     """Discover, acquire, diff, and report the fix commit for a CVE."""
     warn_if_token_missing()
     cve_id = validate_cve_id(cve_id)
+    report_options = None
+    if report_format or report_output or no_report:
+        from cve_diff.report.completion import prepare_cve_report
+        try:
+            report_options = options_from_args(Namespace(report_format=report_format, report_output=report_output, no_report=no_report))
+            prepare_cve_report(report_options, output_dir, cve_id, input_root=work_dir)
+        except (ValueError, OSError, ValidationError) as exc:
+            typer.echo("Invalid report options: " + sanitise_for_terminal(str(exc), max_len=300), err=True)
+            raise typer.Exit(code=2) from exc
+    # Resolve the model at the entry point (operator pin > models.json
+    # > env autodetect > historical fallback) so the pipeline and
+    # analyzer stay config-free — see cve_diff.llm.auth.default_model_id.
+    from cve_diff.llm.auth import default_model_id
+    model_id = model_id or default_model_id()
     # Both the agent loop and the optional root-cause analyzer now go
     # direct to the Anthropic SDK (no LiteLLM proxy). The legacy
     # `require_alive()` proxy gate was removed 2026-05-01 along with
@@ -332,19 +448,39 @@ def run(
         work_dir.mkdir(parents=True, exist_ok=True)
         work = work_dir
 
+    # A SIGTERM (CI timeout, operator kill) must not leak the temp
+    # clone dir — convert it to unwinding so the finally below cleans
+    # up. Only needed when we own a TemporaryDirectory.
+    sig_restore = _install_termination_handlers() if tmp_ctx is not None else []
+
     if not quiet:
         api_status.print_to_stderr(api_status.render_startup_banner())
 
     progress_cb = None
     if not quiet:
         def progress_cb(stage: str, status: str, info: dict) -> None:
-            kv = " ".join(f"{k}={v}" for k, v in info.items())
+            # info values carry exception text (which embeds remote
+            # git stderr banners) and repo-derived slugs — escape the
+            # kv string; the typed-handler relays below apply the same
+            # chokepoint to the same content classes.
+            kv = sanitise_for_terminal(
+                " ".join(f"{k}={v}" for k, v in info.items()),
+                max_len=300,
+            )
             typer.echo(f"  · {stage:<16} {status:<8} {kv}", err=True)
 
     # Track the most-recent Pipeline so the except handlers can read
     # agent telemetry off it for `<cve>.flow.{jsonl,md}` emission. A
     # single-element list is the simplest closure-friendly mutable slot.
     pipeline_slot: list[Pipeline | None] = [None]
+
+    # Run-local LLM cost telemetry (llm-telemetry.jsonl next to the
+    # other artifacts) — same sink the libexec shim installs, so
+    # operator (bin/cve-diff) and agent (/cve-diff) runs record spend
+    # identically. Emits are no-ops without the sink.
+    from core.llm.telemetry import TELEMETRY_FILENAME, TelemetrySink, set_sink
+    telemetry_sink = TelemetrySink(output_dir / TELEMETRY_FILENAME)
+    set_sink(telemetry_sink)
 
     try:
         budget_multiplier = 1.0
@@ -356,7 +492,11 @@ def run(
                         max_file_bytes=max_file_bytes,
                         progress_callback=progress_cb,
                         agent_budget_multiplier=budget_multiplier,
+                        model_id=model_id,
+                        scorecard_enabled=True,
+                        sage_enabled=True,
                     )
+                    assert pipeline_slot[0] is not None
                     result = pipeline_slot[0].run(cve_id, work)
                     break
                 except DiscoveryError as exc:
@@ -380,8 +520,31 @@ def run(
                             )
                             continue
                     raise
+        except DiskBudgetExceeded as exc:
+            # Terminal by design: the pipeline re-raises this typed so
+            # no retry layer spends more while the disk stays over its
+            # limit. Own exit code — not an acquisition failure.
+            typer.echo("disk budget exceeded: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
+            typer.echo(
+                "hint: free space on the output filesystem or raise the "
+                "disk limit before re-running.",
+                err=True,
+            )
+            _write_failure_md(output_dir, cve_id, "DiskBudgetExceeded",
+                              f"DiskBudgetExceeded: {exc}")
+            if pipeline_slot[0] is not None:
+                _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
+                                    ok=False, error_class="DiskBudgetExceeded")
+            _echo_flow_md(output_dir, cve_id, quiet)
+            _emit_report(report_options, output_dir, cve_id, 8, pipeline=pipeline_slot[0],
+                         error_class="DiskBudgetExceeded", error_detail=str(exc), input_root=work)
+            raise typer.Exit(code=8) from exc
         except UnsupportedSource as exc:
-            typer.echo(f"unsupported source: {exc}", err=True)
+            typer.echo("unsupported source: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: this CVE points at a closed-source vendor; cve-diff only handles OSS.",
                 err=True,
@@ -392,9 +555,13 @@ def run(
                 _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
                                     ok=False, error_class="UnsupportedSource")
             _echo_flow_md(output_dir, cve_id, quiet)
+            _emit_report(report_options, output_dir, cve_id, 4, pipeline=pipeline_slot[0],
+                         error_class="UnsupportedSource", error_detail=str(exc), input_root=work)
             raise typer.Exit(code=4) from exc
         except DiscoveryError as exc:
-            typer.echo(f"discovery failed: {exc}", err=True)
+            typer.echo("discovery failed: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: verify the CVE id, check OSV at https://api.osv.dev/v1/vulns/"
                 f"{cve_id}, or set GITHUB_TOKEN if rate-limited.",
@@ -408,9 +575,13 @@ def run(
                                     ok=False,
                                     error_class=_classify_discovery(str(exc)))
             _echo_flow_md(output_dir, cve_id, quiet)
+            _emit_report(report_options, output_dir, cve_id, 5, pipeline=pipeline_slot[0],
+                         error_class=_classify_discovery(str(exc)), error_detail=str(exc), input_root=work)
             raise typer.Exit(code=5) from exc
         except AcquisitionError as exc:
-            typer.echo(f"acquisition failed: {exc}", err=True)
+            typer.echo("acquisition failed: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: check network / proxy; the discovered repo may have been renamed "
                 "or made private since the OSV record was published.",
@@ -422,23 +593,31 @@ def run(
                 _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
                                     ok=False, error_class="AcquisitionError")
             _echo_flow_md(output_dir, cve_id, quiet)
+            _emit_report(report_options, output_dir, cve_id, 6, pipeline=pipeline_slot[0],
+                         error_class="AcquisitionError", error_detail=str(exc), input_root=work)
             raise typer.Exit(code=6) from exc
         except IdenticalCommitsError as exc:
-            typer.echo(f"identical commits: {exc}", err=True)
+            typer.echo("identical commits: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: OSV record's fix sha and its parent resolved to the same commit; "
                 "the record likely names a tag rather than the fix commit.",
                 err=True,
             )
-            _write_failure_md(output_dir, cve_id, "IdenticalCommits",
+            _write_failure_md(output_dir, cve_id, "IdenticalCommitsError",
                               f"IdenticalCommitsError: {exc}")
             if pipeline_slot[0] is not None:
                 _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
                                     ok=False, error_class="IdenticalCommitsError")
             _echo_flow_md(output_dir, cve_id, quiet)
+            _emit_report(report_options, output_dir, cve_id, 7, pipeline=pipeline_slot[0],
+                         error_class="IdenticalCommitsError", error_detail=str(exc), input_root=work)
             raise typer.Exit(code=7) from exc
         except AnalysisError as exc:
-            typer.echo(f"analysis rejected: {exc}", err=True)
+            typer.echo("analysis rejected: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: the diff shape is notes_only — the agent picked a downstream "
                 "mirror rather than the upstream fix. Re-run with verbose tracing to "
@@ -451,26 +630,44 @@ def run(
                 _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
                                     ok=False, error_class="AnalysisError")
             _echo_flow_md(output_dir, cve_id, quiet)
+            _emit_report(report_options, output_dir, cve_id, 9, pipeline=pipeline_slot[0],
+                         error_class="AnalysisError", error_detail=str(exc), input_root=work)
             raise typer.Exit(code=9) from exc
 
         rc = None
         if with_root_cause:
             try:
                 rc = RootCauseAnalyzer(model_id=model_id).analyze(result.bundle)
+                # vulnerability_type is unconstrained model-JSON text
+                # (cwe_id is regex-normalised by the analyzer) — same
+                # chokepoint as the failure relays below.
                 typer.echo(
-                    f"root cause: {rc.cwe_id} ({rc.vulnerability_type}) "
+                    "root cause: "
+                    f"{rc.cwe_id} "
+                    f"({sanitise_for_terminal(str(rc.vulnerability_type), max_len=80)}) "
                     f"conf={rc.confidence:.2f} tokens={rc.input_tokens}+{rc.output_tokens}"
                 )
             except (RootCauseAnalysisError, LLMCallFailed) as exc:
-                typer.echo(f"root-cause analysis failed: {exc}", err=True)
+                typer.echo("root-cause analysis failed: "
+                           f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                           err=True)
+                _emit_report(report_options, output_dir, cve_id, 9, pipeline=pipeline_slot[0], bundle=result.bundle,
+                             root_cause_requested=True, root_cause_error=str(exc),
+                             error_class=type(exc).__name__, error_detail=str(exc), input_root=work)
                 raise typer.Exit(code=9) from exc
+
+        # Consensus-confirmed discovery → run-local verified outcome
+        # (surfaced by libexec/raptor-verified-outcomes). Best-effort.
+        from cve_diff.report.verified_outcomes import write_consensus_outcome
+        write_consensus_outcome(
+            output_dir, result.bundle,
+            cwe_id=getattr(rc, "cwe_id", None),
+        )
 
         osv_path = output_dir / f"{cve_id}.osv.json"
         md_path = output_dir / f"{cve_id}.md"
-        osv_path.write_text(
-            json.dumps(osv_schema.render(result.bundle, root_cause=rc), indent=2) + "\n"
-        )
-        md_path.write_text(markdown.render(result.bundle, root_cause=rc))
+        save_json(osv_path, osv_schema.render(result.bundle, root_cause=rc))
+        write_text_atomically(md_path, markdown.render(result.bundle, root_cause=rc))
         if pipeline_slot[0] is not None:
             _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
                                 ok=True, error_class="PASS",
@@ -512,7 +709,13 @@ def run(
                 typer.echo(f"wrote {extra_path}")
         if not quiet:
             api_status.print_to_stderr(api_status.render_rate_limit_summary())
+        _emit_report(report_options, output_dir, cve_id, 0, pipeline=pipeline_slot[0], bundle=result.bundle,
+                     root_cause=rc, root_cause_requested=with_root_cause, input_root=work)
     finally:
+        _restore_termination_handlers(sig_restore)
+        set_sink(None)
+        if telemetry_sink.total_records and not quiet:
+            typer.echo(telemetry_sink.summary_line(), err=True)
         if tmp_ctx is not None and not keep_workdir:
             tmp_ctx.cleanup()
 

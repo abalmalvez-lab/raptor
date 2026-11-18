@@ -1,0 +1,403 @@
+"""End-to-end regression test for the retry-failure log dedup.
+
+Pre-fix each upstream failure produced 4 operator-visible lines
+(dispatcher request.error INFO + provider 'X completion failed'
+ERROR + client 'Attempt N/M failed' WARNING + client 'Retrying'
+INFO). Post-fix ONE operator-visible WARNING per retry SEQUENCE
+survives — the terminal per-model line carrying the attempt count
+and last error; per-attempt failures and the rest demote to DEBUG
+(a 429 storm printed ~370 near-identical per-attempt WARNINGs).
+
+One carve-out: TIMEOUT-class attempt failures stay at WARNING
+(see ``TestTimeoutAttemptVisibility``) — each one already burned
+the full per-request read budget (600s on the bedrock/claudecode
+transports), so an upstream brownout otherwise looks like a
+silent multi-ten-minute stall. Unlike 429s they cannot storm —
+the read budget throttles them to a handful per hour per worker.
+
+These tests exercise the CLIENT path of the dedup — they patch
+the LLMClient's logger methods and count emissions per level
+after a forced provider failure. The dispatcher path is covered
+by ``test_log_quiet.py``; the provider path's demotion is
+verified by inspecting the source-level log calls (see
+``test_provider_completion_failed_uses_debug`` below).
+
+The RaptorLogger sets ``propagate=False`` (see
+``core/logging/__init__.py:RaptorLogger``), so ``caplog`` does
+not capture from it; ``monkeypatch.setattr`` on each level
+method is the working capture strategy.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from core.llm.client import LLMClient
+from core.llm.config import LLMConfig, ModelConfig
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+def _captured_logger(monkeypatch, module):
+    """Patch every log-level method on ``module.logger`` and return
+    a dict that collects per-level message strings as the test
+    runs. Restored automatically by monkeypatch on test teardown."""
+    captured: dict = {
+        "debug": [], "info": [], "warning": [], "error": [],
+    }
+    # Each level captured in its own list — bind the level into
+    # the closure via a default-arg trick (avoids the classic
+    # late-binding-loop bug).
+    for level in ("debug", "info", "warning", "error"):
+        def _make_sink(_level=level):
+            def _sink(msg, *args, **kwargs):
+                # Honour %-formatting the way logger.warning("x %s", y) would.
+                try:
+                    rendered = str(msg) % args if args else str(msg)
+                except (TypeError, ValueError):
+                    rendered = str(msg)
+                captured[_level].append(rendered)
+            return _sink
+        monkeypatch.setattr(module.logger, level, _make_sink())
+    return captured
+
+
+def _model(provider: str, name: str) -> ModelConfig:
+    return ModelConfig(
+        provider=provider, model_name=name, api_key="test-key",
+    )
+
+
+def _config(primary: ModelConfig, *, max_retries: int = 3) -> LLMConfig:
+    return LLMConfig(
+        primary_model=primary, fallback_models=[],
+        enable_caching=False, max_retries=max_retries,
+        enable_fallback=False,
+    )
+
+
+class TestClientRetryLogCluster:
+    """One operator-visible WARNING per retry sequence; no
+    'Retrying' INFO or other interstitial chatter."""
+
+    def test_three_attempts_emit_only_warnings(self, monkeypatch):
+        # Setup: single model, 3 retries, every attempt fails with
+        # a RETRYABLE error ("503" matches _is_retryable_error's
+        # pattern set; non-retryable errors break after attempt 1,
+        # and timeout-class errors are capped at one retry by the
+        # timeout retry policy — see test_timeout_retry_cap.py).
+        # Patch time.sleep to instant — the retry backoff would
+        # otherwise add 6+ seconds per test.
+        import core.llm.client as client_mod
+        patch_module_attribute(monkeypatch, client_mod, "time", "sleep", lambda _s: None)
+
+        primary = _model("anthropic", "primary")
+        config = _config(primary, max_retries=3)
+        client = LLMClient(config)
+
+        cap = _captured_logger(monkeypatch, client_mod)
+
+        with patch.object(client, "_get_provider") as mock_get:
+            prov = MagicMock()
+            prov.generate.side_effect = RuntimeError(
+                "simulated 503 from upstream",
+            )
+            mock_get.return_value = prov
+            with pytest.raises(Exception):  # noqa: B017 — wrapper re-raises the provider's own error
+                client.generate("test prompt")
+
+        # ONE operator-visible WARNING for the whole sequence: the
+        # terminal per-model line with the attempt count and last
+        # error. Per-attempt failures live at DEBUG. No fallback
+        # model, so no 'Falling back to:' line.
+        attempt_warnings = [
+            m for m in cap["warning"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert attempt_warnings == [], (
+            f"per-attempt failures should be DEBUG, got WARNINGs: "
+            f"{attempt_warnings}"
+        )
+        terminal = [m for m in cap["warning"] if "giving up after" in m]
+        assert len(terminal) == 1, (
+            f"expected one terminal warning, got: {cap['warning']}"
+        )
+        assert "3 failed attempt(s)" in terminal[0]
+        assert "simulated 503" in terminal[0]
+        attempt_debugs = [
+            m for m in cap["debug"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert len(attempt_debugs) == 3, (
+            f"expected 3 per-attempt DEBUG lines, got: {attempt_debugs}"
+        )
+
+        # CRITICAL: no 'Retrying ...' INFO. Pre-fix this fired
+        # twice (between attempts 1→2 and 2→3); post-fix it's DEBUG.
+        retrying_infos = [m for m in cap["info"] if "Retrying" in m]
+        assert retrying_infos == [], (
+            f"'Retrying ...' should now be DEBUG; got INFO: "
+            f"{retrying_infos}"
+        )
+
+        # The DEBUG counterpart of the demoted "Retrying
+        # <provider>/<model>" line should fire — confirms the
+        # demotion is a level change, not deletion. Use a
+        # specific match (mentions the attempt counter) so the
+        # pre-existing "Retrying in Ns..." backoff DEBUG line
+        # isn't counted.
+        retrying_attempt_debugs = [
+            m for m in cap["debug"]
+            if "Retrying" in m and "(attempt" in m
+        ]
+        assert len(retrying_attempt_debugs) == 2, (
+            f"expected 2 'Retrying ... (attempt N/3)' DEBUG lines "
+            f"between attempts, got: {retrying_attempt_debugs}"
+        )
+
+    def test_single_attempt_emits_one_warning_no_retrying(
+        self, monkeypatch,
+    ):
+        # max_retries=1 → one attempt, no 'Retrying' anywhere.
+        # A NON-timeout retryable error: timeout-class failures keep
+        # their per-attempt WARNING by design (brownout visibility —
+        # see TestTimeoutAttemptVisibility).
+        primary = _model("anthropic", "primary")
+        config = _config(primary, max_retries=1)
+        client = LLMClient(config)
+
+        import core.llm.client as client_mod
+        cap = _captured_logger(monkeypatch, client_mod)
+
+        with patch.object(client, "_get_provider") as mock_get:
+            prov = MagicMock()
+            prov.generate.side_effect = RuntimeError(
+                "simulated 503 from upstream",
+            )
+            mock_get.return_value = prov
+            with pytest.raises(Exception):  # noqa: B017 — wrapper re-raises the provider's own error
+                client.generate("test")
+
+        attempt_warnings = [
+            m for m in cap["warning"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert attempt_warnings == []
+        terminal = [m for m in cap["warning"] if "giving up after" in m]
+        assert len(terminal) == 1
+        assert "1 failed attempt(s)" in terminal[0]
+        # No 'Retrying' at any level (only one attempt).
+        assert not any(
+            "Retrying" in m
+            for level in cap.values()
+            for m in level
+        )
+
+
+class TestTimeoutAttemptVisibility:
+    """Timeout-class attempt failures are the dedup carve-out: they
+    log per-attempt at WARNING (with the wall-clock the attempt
+    burned) so an upstream brownout is operator-visible while the
+    review loop is re-buying 600s read budgets, instead of a silent
+    stall until the terminal line. Observed live: a 50-minute stall
+    during a bedrock brownout with only DEBUG lines emitted."""
+
+    def test_timeout_attempts_emit_per_attempt_warnings(
+        self, monkeypatch,
+    ):
+        import core.llm.client as client_mod
+        patch_module_attribute(monkeypatch, client_mod, "time", "sleep", lambda _s: None)
+
+        primary = _model("anthropic", "primary")
+        config = _config(primary, max_retries=3)
+        client = LLMClient(config)
+
+        cap = _captured_logger(monkeypatch, client_mod)
+
+        with patch.object(client, "_get_provider") as mock_get:
+            prov = MagicMock()
+            prov.generate.side_effect = RuntimeError(
+                "Request timed out waiting for upstream",
+            )
+            mock_get.return_value = prov
+            with pytest.raises(Exception):  # noqa: B017 — wrapper re-raises the provider's own error
+                client.generate("test prompt")
+
+        # Timeout retry cap = 1 → two attempts, each WARNING-visible,
+        # each carrying the wall-clock the attempt consumed.
+        attempt_warnings = [
+            m for m in cap["warning"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert len(attempt_warnings) == 2, (
+            f"timeout attempts must be WARNING-visible, got: "
+            f"{cap['warning']}"
+        )
+        assert all("after" in m and "s:" in m for m in attempt_warnings), (
+            f"per-attempt warnings must carry the burned wall-clock: "
+            f"{attempt_warnings}"
+        )
+        # Nothing lands at DEBUG for these attempts (level move, not
+        # duplication), and the terminal per-model line still fires.
+        attempt_debugs = [
+            m for m in cap["debug"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert attempt_debugs == []
+        terminal = [m for m in cap["warning"] if "giving up after" in m]
+        assert len(terminal) == 1
+
+    def test_non_timeout_attempts_stay_debug(self, monkeypatch):
+        """The carve-out is timeout-only — the 429/5xx storm dedup
+        must not regress."""
+        import core.llm.client as client_mod
+        patch_module_attribute(monkeypatch, client_mod, "time", "sleep", lambda _s: None)
+
+        primary = _model("anthropic", "primary")
+        config = _config(primary, max_retries=2)
+        client = LLMClient(config)
+
+        cap = _captured_logger(monkeypatch, client_mod)
+
+        with patch.object(client, "_get_provider") as mock_get:
+            prov = MagicMock()
+            prov.generate.side_effect = RuntimeError(
+                "simulated 503 from upstream",
+            )
+            mock_get.return_value = prov
+            with pytest.raises(Exception):  # noqa: B017 — wrapper re-raises the provider's own error
+                client.generate("test prompt")
+
+        attempt_warnings = [
+            m for m in cap["warning"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert attempt_warnings == []
+        attempt_debugs = [
+            m for m in cap["debug"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert len(attempt_debugs) == 2
+
+
+class TestStructuredTimeoutAttemptVisibility:
+    """``generate_structured`` is the twin loop the timeout carve-out
+    was written FOR — the review/audit calls that motivated it are
+    structured calls, and the observed 50-minute silent stall
+    reproduced verbatim on this path while only ``generate`` had the
+    WARNING selector. Same carve-out, same dedup for non-timeouts."""
+
+    SCHEMA = {"type": "object", "properties": {"x": {"type": "string"}}}
+
+    def _run(self, monkeypatch, error, *, max_retries: int = 3) -> dict:
+        import core.llm.client as client_mod
+        patch_module_attribute(monkeypatch, client_mod, "time", "sleep", lambda _s: None)
+        client = LLMClient(
+            _config(_model("anthropic", "primary"),
+                    max_retries=max_retries))
+        cap = _captured_logger(monkeypatch, client_mod)
+        with patch.object(client, "_get_provider") as mock_get:
+            prov = MagicMock()
+            prov.generate_structured.side_effect = error
+            prov.total_cost = 0.0
+            prov.total_tokens = 0
+            mock_get.return_value = prov
+            with pytest.raises(Exception):  # noqa: B017 — wrapper re-raises the provider's own error
+                client.generate_structured("test prompt", self.SCHEMA)
+        return cap
+
+    def test_timeout_attempts_emit_per_attempt_warnings(
+        self, monkeypatch,
+    ):
+        cap = self._run(
+            monkeypatch,
+            RuntimeError("Request timed out waiting for upstream"))
+        # Timeout retry cap = 1 → two attempts, each WARNING-visible,
+        # each carrying the wall-clock the attempt consumed.
+        attempt_warnings = [
+            m for m in cap["warning"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert len(attempt_warnings) == 2, (
+            f"structured timeout attempts must be WARNING-visible, "
+            f"got: {cap['warning']}"
+        )
+        assert all("after" in m and "s:" in m for m in attempt_warnings)
+        attempt_debugs = [
+            m for m in cap["debug"]
+            if "failed" in m and "ttempt" in m
+        ]
+        assert attempt_debugs == []
+
+    def test_non_timeout_attempts_stay_debug(self, monkeypatch):
+        cap = self._run(
+            monkeypatch,
+            RuntimeError("simulated 503 from upstream"),
+            max_retries=2)
+        attempt_warnings = [
+            m for m in cap["warning"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert attempt_warnings == []
+        attempt_debugs = [
+            m for m in cap["debug"]
+            if "Attempt" in m and "failed for" in m
+        ]
+        assert len(attempt_debugs) == 2
+
+
+class TestProviderCompletionFailedDemoted:
+    """Source-level verification: each provider's ``except``
+    block uses ``logger.debug`` (not ``logger.error``) for the
+    'X completion failed' line.
+
+    Source inspection rather than runtime — exercising the real
+    provider's except block would need an HTTP-level failure
+    against the dispatcher, which is integration-test territory.
+    A future refactor that flips one of these back to ERROR (or
+    deletes the log entirely) surfaces here at unit-test cost.
+    """
+
+    def test_openai_uses_debug_for_completion_failed(self):
+        self._assert_uses_debug_not_error("OpenAI completion failed")
+
+    def test_anthropic_uses_debug_for_completion_failed(self):
+        self._assert_uses_debug_not_error("Anthropic completion failed")
+
+    def test_gemini_uses_debug_for_completion_failed(self):
+        self._assert_uses_debug_not_error("Gemini completion failed")
+
+    def _assert_uses_debug_not_error(self, message_prefix: str):
+        from pathlib import Path
+        providers_src = (
+            Path(__file__).resolve().parents[1] / "providers.py"
+        ).read_text()
+        # Find the line containing the message; assert the
+        # preceding logger call on that or the previous line is
+        # `.debug(` not `.error(`. Cheap regex sufficient — full
+        # AST would over-engineer this guard.
+        lines = providers_src.splitlines()
+        for i, line in enumerate(lines):
+            if message_prefix in line:
+                # The logger call could be on this line or on the
+                # previous line (multi-line call). Look back up to
+                # 2 lines for the logger.X( token.
+                context = "\n".join(lines[max(0, i - 2): i + 1])
+                assert ".debug(" in context, (
+                    f"{message_prefix!r} should be logged at DEBUG "
+                    f"(LLMClient retry loop emits the WARNING); "
+                    f"found context:\n{context}"
+                )
+                assert ".error(" not in context, (
+                    f"{message_prefix!r} found at ERROR level — "
+                    f"would double up with the LLMClient WARNING. "
+                    f"Context:\n{context}"
+                )
+                return
+        pytest.fail(
+            f"could not find {message_prefix!r} in providers.py — "
+            f"the log line may have been moved or renamed; "
+            f"update the test"
+        )

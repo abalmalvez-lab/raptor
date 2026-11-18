@@ -10,36 +10,739 @@
 """
 import argparse
 import json
+import logging
 import os
+import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
-import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Any, TYPE_CHECKING, TypedDict, cast
 
-# Add parent directory to path for imports
-# packages/static-analysis/scanner.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[2]))
+if TYPE_CHECKING:
+    from core.coverage.record import SemgrepOutputSummary
+    from core.detectors.setup import AnalysisSetup
+    from packages.semgrep.runtime import SnapRuntime
 
-from core.json import save_json
+# Python path safety: the only permitted sys.path addition is the
+# launcher-pinned RAPTOR_DIR (hard lookup — a KeyError here means the
+# script was invoked outside the RAPTOR launcher / raptor.py /
+# conftest environment, and importing core.* from a __file__-derived
+# guess could silently pick up another checkout's modules).
+sys.path.insert(0, os.environ["RAPTOR_DIR"])
+
 from core.config import RaptorConfig
-from core.run.output import unique_run_suffix
-from core.run.safe_io import safe_run_mkdir
-from core.logging import get_logger
 from core.git import clone_repository
+from core.hash import sha256_bytes, sha256_fileobj, sha256_tree
+from core.json import load_json, loads, save_json
+from core.source import open_regular_gated, read_bytes_gated
+from core.logging import RaptorLogger, get_logger
+from core.run.output import unique_run_suffix
+from core.run.scratch import scratch_dir
+from core.run.parent_liveness import maybe_start_orphan_watchdog
+from core.run.safe_io import safe_run_mkdir
+from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError, set_pdeathsig
+
+# Parent-death preexec for detached child spawns, built once at import:
+# the factory primes the libc cache parent-side (find_library may shell
+# out to ldconfig), and the resulting closure is reusable across
+# spawns. Building it per-spawn would re-enter subprocess machinery
+# inside the spawn path itself.
+_PDEATHSIG_PREEXEC = set_pdeathsig()
+from core.sarif import emit as sarif_emit
+from core.sarif.parser import count_results
 from core.sarif.parser import generate_scan_metrics, merge_sarif, validate_sarif
-from core.hash import sha256_bytes, sha256_tree
 from packages import semgrep as semgrep_pkg
 
-logger = get_logger()
+logger = cast(RaptorLogger, get_logger())
+
+# Byte budgets: semgrep registry pack caches are capped at download
+# time (32 MiB socket cap in cache-packs) — 64 MiB leaves headroom;
+# per-pack tool JSON / SARIF outputs over a hostile target use the
+# SARIF budget class.
+_MAX_PACK_CACHE_BYTES = 64 * 1024 * 1024
+_MAX_TOOL_JSON_BYTES = 100 * 1024 * 1024
+
+
+def _sarif_result_uri(result: dict) -> str:
+    """Extract the file URI from a SARIF result, or empty string when
+    the structure is missing the expected nesting."""
+    locs = result.get("locations") or []
+    if not locs:
+        return ""
+    phys = locs[0].get("physicalLocation") or {}
+    return (phys.get("artifactLocation") or {}).get("uri") or ""
+
+
+def filter_sarif_by_exclude_globs(
+    sarif: dict, exclude_globs: list[str] | None, *, _copy_input: bool = True,
+) -> tuple[dict, int]:
+    """Return ``(filtered_sarif, dropped_count)`` — a copy of ``sarif``
+    with every result whose file URI matches any of ``exclude_globs``
+    removed from ``runs[*].results``. Order-preserving. No-op when
+    ``exclude_globs`` is None/empty.
+
+    Operator escape hatch for vendored / test / generated paths the
+    structural filters can't cover. Applied at the combined-SARIF
+    layer in /scan so the downstream metrics + /agentic consumption
+    see the filtered set; individual per-tool SARIFs stay unfiltered
+    as a forensic record of what each tool actually emitted.
+
+    Results without a usable URI (malformed location block) are kept
+    defensively — operator excludes shouldn't accidentally drop
+    findings whose metadata is broken. The internal ownership flag is used
+    only for the CLI's fresh merged document; public calls retain a copy.
+    """
+    if not exclude_globs:
+        return sarif, 0
+    import copy
+    import fnmatch as _fnmatch
+    out = copy.deepcopy(sarif) if _copy_input else sarif
+    dropped = 0
+    for run in out.get("runs", []):
+        kept: list = []
+        for r in run.get("results", []):
+            uri = _sarif_result_uri(r)
+            if uri and any(_fnmatch.fnmatch(uri, g) for g in exclude_globs):
+                dropped += 1
+                continue
+            kept.append(r)
+        run["results"] = kept
+    return out, dropped
+
+
+def _pack_tuple_for_id(pack_id: str) -> tuple[str, str]:
+    """Resolve a pack-id-suffix (``"security-audit"``,
+    ``"command-injection"``) to the full
+    ``(display_name, full_pack_id)`` tuple ``BASELINE_SEMGREP_PACKS``
+    uses. The display names aren't a clean derivation from the
+    pack-id (``command-injection`` → ``semgrep_injection``,
+    ``owasp-top-ten`` → ``semgrep_owasp_top_10`` — both reflect
+    historical naming conventions in
+    ``RaptorConfig.POLICY_GROUP_TO_SEMGREP_PACK``), so consult
+    those mappings first; fall back to a synthesised name for
+    unknown ids.
+
+    Used by ``_resolve_baseline_packs`` to convert the
+    target-type catalog's ``semgrep_packs.default`` (a list of
+    pack-id suffixes) to the tuple shape scanner internals expect.
+    """
+    full_id = f"p/{pack_id}"
+    # Baseline packs are listed by full tuple already.
+    for name, fid in RaptorConfig.BASELINE_SEMGREP_PACKS:
+        if fid == full_id:
+            return (name, fid)
+    # POLICY_GROUP_TO_SEMGREP_PACK values cover the rest of the
+    # canonical (name, pack-id) pairs.
+    for name, fid in RaptorConfig.POLICY_GROUP_TO_SEMGREP_PACK.values():
+        if fid == full_id:
+            return (name, fid)
+    # Unknown pack-id (catalog author added something we don't
+    # have a name convention for) — synthesise a safe name.
+    safe = pack_id.replace("-", "_").replace("/", "_")
+    return (f"semgrep_{safe}", full_id)
+
+
+# Registry packs dropped by the reachability probe this run.
+# Accumulated across dispatcher calls (parallel/sequential dispatch and
+# the expanded-semgrep stage all probe independently) so main() can
+# record the full loss in scan_metrics.json.
+_dropped_registry_packs: list[str] = []
+
+
+def _drop_unreachable_registry_packs(
+    configs: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Drop uncached registry packs when semgrep.dev is unreachable.
+
+    A 3-second TCP probe distinguishes "airgapped" from "slow link".
+    Cached packs (resolved to local paths by ``get_semgrep_config``)
+    and local rule directories pass through unchanged.
+
+    Dropping is loud: with an unpopulated local registry cache an
+    offline run loses EVERY baseline pack, which pre-fix read as a
+    clean-but-quiet scan. Each drop prints an operator banner and is
+    accumulated in ``_dropped_registry_packs`` for scan_metrics.json.
+    """
+    if RaptorConfig.SEMGREP_OFFLINE:
+        # Resolve every requested pack before probing or dropping coverage.
+        return [(name, RaptorConfig.get_semgrep_config(config))
+                for name, config in configs]
+    needs_network = [
+        (n, c) for n, c in configs
+        if c.startswith(("p/", "category/"))
+    ]
+    if not needs_network:
+        return configs
+    import os
+    import socket
+    from urllib.parse import urlsplit
+    # Probe the FIRST HOP semgrep will actually use. On
+    # mandatory-egress-proxy hosts a direct TCP connect to
+    # semgrep.dev:443 always fails even though semgrep (which honours
+    # proxy env) can fetch registry packs fine — pre-fix that
+    # misclassified every proxied host as airgapped and silently
+    # dropped all registry packs. When a proxy is configured for
+    # https (and semgrep.dev isn't no_proxy'd), reachability of the
+    # proxy itself is the meaningful signal.
+    probe_host, probe_port = "semgrep.dev", 443
+    proxy_url = (
+        os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY")
+    )
+    if proxy_url:
+        from core.http.urllib_backend import _host_in_no_proxy
+        raw_no = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+        no_proxy = tuple(e.strip() for e in raw_no.split(",") if e.strip())
+        if not _host_in_no_proxy("semgrep.dev", no_proxy):
+            parsed = urlsplit(
+                proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+            )
+            if parsed.hostname:
+                probe_host = parsed.hostname
+                probe_port = parsed.port or (
+                    443 if parsed.scheme == "https" else 80
+                )
+    try:
+        # create_connection iterates every getaddrinfo family — an
+        # AF_INET-only socket misclassified IPv6-only hosts/proxies
+        # as airgapped and dropped every registry pack.
+        sock = socket.create_connection(
+            (probe_host, probe_port), timeout=3,
+        )
+        sock.close()
+        return configs
+    except (TimeoutError, OSError):
+        dropped = [n for n, _ in needs_network]
+        logger.warning(
+            "semgrep.dev unreachable (3 s probe failed) — "
+            "dropping %d uncached registry pack(s): %s",
+            len(dropped), ", ".join(dropped),
+        )
+        for name in dropped:
+            if name not in _dropped_registry_packs:
+                _dropped_registry_packs.append(name)
+        print(
+            f"⚠️  semgrep: {len(dropped)} registry pack(s) dropped "
+            f"({', '.join(dropped)}) — semgrep.dev unreachable and no "
+            "local cache for them. Coverage is reduced for this run; "
+            "populate engine/semgrep/rules/registry-cache/ with "
+            "engine/semgrep/tools/cache-packs.py to scan offline.",
+            file=sys.stderr,
+        )
+        drop_set = {c for _, c in needs_network}
+        return [(n, c) for n, c in configs if c not in drop_set]
+
+
+def _resolve_baseline_packs(
+    repo_path: Path | None,
+) -> list[tuple[str, str]]:
+    """Resolve the baseline semgrep pack set for ``repo_path``.
+
+    When the target-type catalog matches and ships
+    ``semgrep_packs.default``, use the catalog's list — that's
+    the per-target-type tuning #7-7b ships. When no catalog match
+    (or the matched entry has no default packs, like the
+    ``generic`` fallback), use the hardcoded
+    ``RaptorConfig.BASELINE_SEMGREP_PACKS``.
+
+    Operator override via ``--policy-groups`` happens elsewhere
+    (in main's rules_dirs construction) and remains authoritative
+    — this resolver only governs the baseline (what runs when
+    the operator hasn't narrowed the rule set explicitly).
+    """
+    if repo_path is None:
+        return list(RaptorConfig.BASELINE_SEMGREP_PACKS)
+    try:
+        from core.run.target_types import load as load_target_type
+        entry = load_target_type(Path(repo_path))
+    except Exception:  # noqa: BLE001
+        # Catalog substrate is best-effort; never break the scan
+        # on a catalog load issue.
+        return list(RaptorConfig.BASELINE_SEMGREP_PACKS)
+    if entry is None or not entry.semgrep_packs_default:
+        return list(RaptorConfig.BASELINE_SEMGREP_PACKS)
+    return [_pack_tuple_for_id(pid) for pid in entry.semgrep_packs_default]
+
+
+# File-extension → semgrep-language mapping. Covers the common
+# cases; missing extensions silently produce no language hit
+# (operator sees an empty applicability count rather than a wrong
+# one). Lowercased keys; matches the lowercased extensions
+# catalog YAMLs ship.
+_EXT_TO_SEMGREP_LANG: dict[str, str] = {
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".hpp": "cpp", ".hh": "cpp",
+    ".py": "python",
+    ".go": "go",
+    ".rs": "rust",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+    ".ts": "typescript", ".tsx": "typescript",
+    ".java": "java",
+    ".rb": "ruby",
+    ".php": "php",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".cs": "csharp",
+    ".sol": "solidity",
+    ".sh": "bash", ".bash": "bash",
+    ".yaml": "yaml", ".yml": "yaml",
+    ".json": "json",
+    ".html": "html", ".htm": "html",
+    ".lua": "lua",
+}
+
+
+# Semgrep ships rules using BOTH names for the same language —
+# e.g. ``p/owasp-top-ten`` carries 67 rules at ``languages: [ts]``
+# AND 4 at ``languages: [typescript]``. A naïve extension →
+# canonical-name mapping misses the alias rules, undercounting
+# applicability. Expand the target set with the known aliases
+# before intersecting against each rule's ``languages`` field.
+# Symmetric: every key/value is rewritten the same direction
+# in both classes (operator's catalog might declare either form).
+_SEMGREP_LANG_ALIASES: dict[str, set] = {
+    "typescript": {"typescript", "ts"},
+    "ts": {"typescript", "ts"},
+    "kotlin": {"kotlin", "kt"},
+    "kt": {"kotlin", "kt"},
+    "javascript": {"javascript", "js"},
+    "js": {"javascript", "js"},
+    "csharp": {"csharp", "cs", "C#"},
+    "cs": {"csharp", "cs", "C#"},
+    "bash": {"bash", "sh"},
+    "sh": {"bash", "sh"},
+    "yaml": {"yaml", "yml"},
+}
+
+
+# Operator-facing display names live in
+# ``core.inventory.languages`` so /prepare and any future
+# renderer share the single source of truth. Re-exported with
+# underscore prefix here for back-compat with internal callers
+# (e.g. tests) that imported from this module.
+from core.inventory.languages import (  # noqa: E402, F401
+    LANG_DISPLAY as _LANG_DISPLAY,  # tests reference via _scanner._LANG_DISPLAY
+)
+from core.inventory.languages import (  # noqa: E402
+    display_lang as _display_lang,  # noqa: F401 — tests reference via _scanner._display_lang
+)
+from core.inventory.languages import (  # noqa: E402  (after the constants it displays)
+    display_langs as _display_langs,  # used by call sites below
+)
+from core.security.log_sanitisation import sanitise_for_terminal  # noqa: E402
+
+
+def _expand_language_aliases(langs: list[str]) -> set:
+    """Expand ``langs`` to include semgrep's alias names so the
+    intersection check below catches rules registered under
+    either form."""
+    out: set = set()
+    for lang in langs:
+        out.add(lang)
+        out.update(_SEMGREP_LANG_ALIASES.get(lang, set()))
+    return out
+
+
+def _target_semgrep_languages(repo_path: Path | None) -> list[str]:
+    """Best-effort set of semgrep language ids for ``repo_path``.
+
+    Sourced from the matched target-type catalog entry's
+    ``file_extensions`` — cheap (no tree walk) and accurate for
+    the common case. Returns ``[]`` when no catalog match,
+    extension list empty, or no extension maps to a known
+    semgrep language. Caller treats ``[]`` as ''don't show
+    applicability'' (better than guessing wrong).
+    """
+    if repo_path is None:
+        return []
+    try:
+        from core.run.target_types import load as _load_tt
+        entry = _load_tt(repo_path)
+    except Exception:  # noqa: BLE001
+        return []
+    if entry is None:
+        return []
+    langs: set = set()
+    for ext in entry.file_extensions:
+        lang = _EXT_TO_SEMGREP_LANG.get(ext.lower())
+        if lang:
+            langs.add(lang)
+    return sorted(langs)
+
+
+def _pack_rules_applicable_count(
+    pack_id: str, target_langs: list[str],
+) -> tuple[int, int] | None:
+    """Read the cached pack JSON for ``pack_id`` and return
+    ``(applicable_rule_count, total_rule_count)`` for rules
+    whose ``languages`` list intersects the alias-expanded
+    ``target_langs`` set.
+
+    None when the pack isn't cached locally — the operator's
+    semgrep invocation would fetch the pack from the registry
+    at scan time and we'd be measuring stale numbers. The
+    visibility line then omits this pack rather than printing
+    a misleading zero.
+    """
+    cache_file = RaptorConfig.SEMGREP_REGISTRY_CACHE_DIR / (
+        "c." + pack_id.replace("/", ".") + ".json"
+    )
+    if not cache_file.is_file():
+        return None
+    data = load_json(cache_file, max_bytes=_MAX_PACK_CACHE_BYTES)
+    if not isinstance(data, dict):
+        return None
+    rules = data.get("rules") or []
+    # Defensive: a future / corrupted cache file with ``rules`` as
+    # a non-list (e.g. dict, scalar) would crash the iteration
+    # below. Treat as no data — caller skips the pack.
+    if not isinstance(rules, list):
+        return None
+    target_set = _expand_language_aliases(target_langs)
+    applicable = 0
+    total = 0
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        total += 1
+        rule_langs = r.get("languages") or []
+        if not isinstance(rule_langs, list):
+            continue
+        if set(rule_langs) & target_set:
+            applicable += 1
+    return (applicable, total)
+
+
+def _pack_applicable_rule_ids(
+    pack_id: str, target_langs: list[str],
+) -> set | None:
+    """Return the SET of rule ids in ``pack_id`` whose
+    ``languages`` field intersects the alias-expanded
+    ``target_langs``. Used by ``_is_coverage_thin`` to dedupe
+    across packs that ship overlapping rules — e.g. ``p/default``
+    and ``p/security-audit`` share many entries; counting each
+    twice would inflate the threshold check.
+
+    None when the pack isn't cached locally (same contract as
+    ``_pack_rules_applicable_count``).
+    """
+    cache_file = RaptorConfig.SEMGREP_REGISTRY_CACHE_DIR / (
+        "c." + pack_id.replace("/", ".") + ".json"
+    )
+    if not cache_file.is_file():
+        return None
+    data = load_json(cache_file, max_bytes=_MAX_PACK_CACHE_BYTES)
+    if not isinstance(data, dict):
+        return None
+    rules = data.get("rules") or []
+    if not isinstance(rules, list):
+        return None
+    target_set = _expand_language_aliases(target_langs)
+    ids: set = set()
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        rule_langs = r.get("languages") or []
+        if not isinstance(rule_langs, list):
+            continue
+        if set(rule_langs) & target_set:
+            rule_id = r.get("id")
+            if isinstance(rule_id, str) and rule_id:
+                ids.add(rule_id)
+    return ids
+
+
+# Default threshold for unique applicable rules across baseline
+# packs. Calibration point: a C / userspace-daemon scan with the
+# c.userspace-daemon catalog nets ~9 unique applicable C rules; a
+# Python web-app scan with its catalog nets ~200+. 25 sits
+# comfortably between the two — picks up genuinely thin language
+# coverage without false-positive-ing on healthy coverage.
+# Operator-tunable via ``RAPTOR_SCAN_THIN_COVERAGE_THRESHOLD``
+# env var so future catalog entries with different rule densities
+# can be accommodated without a code change.
+_DEFAULT_THIN_COVERAGE_RULE_THRESHOLD = 25
+
+
+def _thin_coverage_threshold() -> int:
+    """Read the threshold from the env var, fall back to the
+    default. Malformed values (non-integer / negative) warn-once
+    and fall back to the default so a typo doesn't silently
+    disable the hint forever."""
+    import os
+    raw = os.environ.get("RAPTOR_SCAN_THIN_COVERAGE_THRESHOLD")
+    if not raw:
+        return _DEFAULT_THIN_COVERAGE_RULE_THRESHOLD
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "RAPTOR_SCAN_THIN_COVERAGE_THRESHOLD=%r is not an int; "
+            "using default %d",
+            raw, _DEFAULT_THIN_COVERAGE_RULE_THRESHOLD,
+        )
+        return _DEFAULT_THIN_COVERAGE_RULE_THRESHOLD
+    if value < 0:
+        logger.warning(
+            "RAPTOR_SCAN_THIN_COVERAGE_THRESHOLD=%d must be >= 0; "
+            "using default %d",
+            value, _DEFAULT_THIN_COVERAGE_RULE_THRESHOLD,
+        )
+        return _DEFAULT_THIN_COVERAGE_RULE_THRESHOLD
+    return value
+
+
+def _is_coverage_thin(
+    resolved_baseline: list[tuple[str, str]],
+    target_langs: list[str],
+) -> bool:
+    """True iff the count of UNIQUE applicable rule ids across
+    all baseline packs falls below the configured threshold
+    (``RAPTOR_SCAN_THIN_COVERAGE_THRESHOLD`` env var, default
+    25). Uncached packs are skipped — we don't know what they'd
+    contribute, so the hint doesn't fire on uncertainty.
+    Deduplication is essential because packs share rules
+    (``p/default`` and ``p/security-audit`` overlap heavily);
+    naively summing per-pack counts would inflate the figure
+    past the threshold for genuinely thin coverage."""
+    if not target_langs:
+        return False
+    unique_ids: set = set()
+    have_any_cached = False
+    for _, pack_id in resolved_baseline:
+        ids = _pack_applicable_rule_ids(pack_id, target_langs)
+        if ids is None:
+            continue
+        have_any_cached = True
+        unique_ids.update(ids)
+    return (
+        have_any_cached
+        and len(unique_ids) < _thin_coverage_threshold()
+    )
+
+
+def _llm_configured() -> bool:
+    """True when RAPTOR can dispatch an LLM call. Best-effort —
+    used to decide whether to suggest ``/agentic`` in the
+    thin-coverage hint (no point suggesting an LLM-driven path
+    when no LLM provider is available).
+
+    Defaults to True on any import / instantiation failure so a
+    transient config bug doesn't silently strip an option the
+    operator might be able to use."""
+    try:
+        from core.llm.config import LLMConfig
+        return LLMConfig().primary_model is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _format_thin_coverage_hint(
+    target_langs: list[str],
+    codeql_already_running: bool,
+    llm_configured: bool = True,
+) -> str:
+    """One-line operator-facing escalation hint when pack
+    applicability is thin. CodeQL clause omitted when the
+    operator already passed ``--codeql``; /agentic clause
+    omitted when no LLM is configured (suggesting it would be
+    hollow guidance).
+    """
+    lang_label = _display_langs(target_langs)
+    options: list[str] = []
+    if not codeql_already_running:
+        options.append("rerun with --codeql for richer queries")
+    if llm_configured:
+        options.append("use /agentic for LLM-driven hunting")
+    if not options:
+        # Pathological: both alternatives unavailable. Honest
+        # about it — operator at least knows the gap is real.
+        return f"  Coverage thin for {lang_label}."
+    return (
+        f"  Coverage thin for {lang_label} — "
+        f"{'; '.join(options)}."
+    )
+
+
+def _format_pack_applicability(
+    resolved_baseline: list[tuple[str, str]],
+    target_langs: list[str],
+) -> str | None:
+    """Render the operator-facing visibility line, or None when
+    no useful signal (no target langs, no cached pack data).
+
+    Example::
+
+        Pack rules applicable to c: security-audit 9/225, command-injection 0/30, owasp-top-ten 0/544
+
+    Pre-#16a the operator saw only ``6 rule-group(s)`` with no
+    way to know how many of the ~2k rules across those packs
+    actually target their language — masked the upstream
+    coverage gap that surfaced on the c.userspace-daemon scan.
+    """
+    if not target_langs:
+        return None
+    parts: list[str] = []
+    for _, pack_id in resolved_baseline:
+        counts = _pack_rules_applicable_count(pack_id, target_langs)
+        if counts is None:
+            continue
+        applicable, total = counts
+        # Strip the ``p/`` prefix for readability — the operator
+        # cares about the pack name, not the registry path
+        # convention.
+        short = pack_id.removeprefix("p/")
+        parts.append(f"{short} {applicable}/{total}")
+    if not parts:
+        return None
+    return (
+        f"Pack rules applicable to "
+        f"{_display_langs(target_langs)}: {', '.join(parts)}"
+    )
+
+
+def _resolve_rules_applied(
+    groups: list[str],
+    resolved_baseline: list[tuple[str, str]],
+    rules_dirs: list[str],
+) -> list[str]:
+    """Compute the ``rules_applied`` list stored on the semgrep
+    coverage record.
+
+    Captures every policy group whose registry pack actually ran,
+    so the coverage report's "policy group(s) not used" check
+    (``POLICY_GROUP_TO_SEMGREP_PACK.keys() - rules_applied``)
+    doesn't falsely flag groups whose pack was added via the
+    catalog, via a rule-dir-name match, or as a shared pack id
+    across multiple policy groups.
+
+    Pre-fix: ``rules_applied=['all']`` (literal) or local rule
+    directory names; both lacked the canonical policy-group keys,
+    so EVERY policy group showed as ''not used'' — the
+    operator-facing inconsistency the c.userspace-daemon scan
+    surfaced.
+
+    Honest semantic: pack-id-driven. A policy group is ''applied''
+    iff its registry pack id is in the set of pack ids semgrep
+    actually ran. That set is the union of:
+
+    * Catalog-resolved baseline packs (``resolved_baseline``).
+    * Pack ids that ``semgrep_scan_parallel`` adds because a
+      rule dir's name matched a key in ``POLICY_GROUP_TO_SEMGREP_PACK``
+      (see scanner.py:``Add corresponding standard pack if available``).
+
+    Operator-passed specific policy groups (``--policy-groups
+    auth,injection``) drive ``rules_dirs`` membership, which feeds
+    back through the same rule-dir → pack-id mapping — so the
+    set inclusion is automatic; no special branch needed.
+
+    Two correctness wins over the pre-fix design:
+
+    1. Shared pack ids — ``flows`` and ``best-practices`` both
+       map to ``p/default``; running ``flows/`` exercises both,
+       and both correctly land in ``applied`` here.
+    2. No-local-rule-dir groups — ``best-practices`` has no
+       local rule dir; ``--policy-groups all`` doesn't trigger
+       its registry pack via the rule-dir loop, so it's NOT in
+       ``applied`` unless something else added ``p/default``
+       (which ``flows/`` does in practice).
+
+    * ``groups`` — accepted for API symmetry / future extension;
+      currently unused (rule-dir membership is the actual signal).
+    * ``resolved_baseline`` — the catalog-resolved baseline pack
+      set (``[(display_name, pack_id), ...]``).
+    * ``rules_dirs`` — local rule directory paths the scanner
+      passed to semgrep_scan_parallel. Used to derive which
+      registry packs got auto-added via the rule-dir → pack-id
+      mapping, AND as the fallback identity when nothing else
+      populated the applied set.
+    """
+    # Compute the set of pack ids semgrep ACTUALLY ran — the
+    # union of catalog baseline + auto-added registry packs (via
+    # rule-dir name match).
+    ran_pack_ids: set = {pid for _, pid in resolved_baseline}
+    for rd in rules_dirs:
+        dir_name = Path(rd).name
+        mapping = RaptorConfig.POLICY_GROUP_TO_SEMGREP_PACK.get(dir_name)
+        if mapping is not None:
+            ran_pack_ids.add(mapping[1])
+
+    # Reverse-map every policy group whose pack id ran.
+    applied = {
+        group
+        for group, (_name, pack_id)
+        in RaptorConfig.POLICY_GROUP_TO_SEMGREP_PACK.items()
+        if pack_id in ran_pack_ids
+    }
+    if applied:
+        return sorted(applied)
+    # Fallback: no policy groups exercised → record rule-dir
+    # names so the coverage record still has SOME identity
+    # (preserves pre-fix shape for the genuinely-empty case).
+    _ = groups  # accepted for API symmetry; unused — see docstring.
+    # Single-file groups record by stem ("ssrf"), dirs by name.
+    return [
+        Path(r).stem if Path(r).is_file() else Path(r).name
+        for r in rules_dirs
+    ]
+
+
+def _sanitize_pack_name(name: str) -> str:
+    r"""Strict allowlist: alphanumeric + dash + underscore + dot.
+
+    ``name`` is the policy-pack name from
+    ``RaptorConfig.BASELINE_SEMGREP_PACKS`` /
+    ``POLICY_GROUP_TO_SEMGREP_PACK`` (operator can extend via
+    ``--policy-groups``), and the sanitised result becomes part of an
+    output FILE PATH. Any other shell / filesystem-special character
+    (``*``, ``?``, ``[``, ``]``, ``\``, space, NUL, newline, control
+    bytes) would otherwise flow straight into
+    ``out_dir / f"semgrep_{suffix}.sarif"``. Concrete failure: a
+    custom policy pack named with a space produced an output path with
+    embedded whitespace that subsequent ``find`` / ``glob`` calls
+    mishandled. Preserves the legacy ``/`` → ``_`` and ``:`` → ``_``
+    mapping (both in the disallowed set, so they get replaced anyway).
+    """
+    return re.sub(r'[^A-Za-z0-9._-]', '_', name)
+
+
+class _ScannerSandboxIOKwargs(TypedDict, total=False):
+    fake_home: bool
+    readable_paths: list[Path]
+
+
+class _ScannerSandboxEnvironmentKwargs(TypedDict, total=False):
+    strict_env: bool
+    env_caller_filtered: bool
+
+
+class _ScannerSandboxNetworkKwargs(TypedDict, total=False):
+    use_egress_proxy: bool
+    proxy_hosts: list[str]
+    caller_label: str
+    block_network: bool
+
+
+class _SemgrepRuntimeKwargs(TypedDict, total=False):
+    runtime: "SnapRuntime"
+
+
+class _ScanMetricKwargs(TypedDict, total=False):
+    on_source_report: Callable[[str, dict[str, Any] | None], None]
 
 
 def run(cmd, cwd=None, timeout=RaptorConfig.DEFAULT_TIMEOUT, env=None,
-        target=None, output=None, proxy_hosts=None, caller_label=None):
+        target=None, output=None, proxy_hosts=None, caller_label=None,
+        fake_home: bool=False, readable_paths=None, semgrep_runtime=None):
     """Execute a command in a network-isolated sandbox and return results.
 
     When `target` and `output` are supplied, Landlock is engaged — the
@@ -58,142 +761,125 @@ def run(cmd, cwd=None, timeout=RaptorConfig.DEFAULT_TIMEOUT, env=None,
         than block_network=True.
     """
     from core.sandbox import run as sandbox_run
-    net_kwargs = (
+    net_kwargs: _ScannerSandboxNetworkKwargs = (
         {"use_egress_proxy": True, "proxy_hosts": list(proxy_hosts),
          "caller_label": caller_label or "scanner"}
         if proxy_hosts else
         {"block_network": True}
     )
-    # tool_paths: speculative best-guess bind set so mount-ns isolation
-    # can engage. For Python tools we need (a) the script's bin dir
-    # and (b) the interpreter's stdlib dir at sys.prefix/lib/pythonX.Y.
-    #
-    # Outcome depends on the operator's install layout:
-    #
-    #   /usr/bin/semgrep (system install): cmd[0] already in mount
-    #     tree, helper returns []; mount-ns engages cleanly, full
-    #     isolation, silent.
-    #
-    #   ~/.local/bin/semgrep (pip --user) or /opt/homebrew/bin
-    #     (brew): helper returns [bin_dir, stdlib_dir]; mount-ns
-    #     tries with these. If semgrep then exec's native deps not
-    #     in the bind set (semgrep-core, etc.), context.py's
-    #     speculative-C retry catches the 126/empty-stderr and
-    #     falls back to Landlock-only. Workflow proceeds; debug-
-    #     level diagnostic only.
-    tool_paths = _compute_python_tool_paths(cmd)
-    p = sandbox_run(
+    # Declare the selected tool's runtime without granting a whole HOME-
+    # rooted venv. Resolve argv[0] too: both executable spelling and its
+    # dependencies must be visible in the bind tree. Unknown dependencies
+    # can still cause a mountless retry, subject to the unchanged floor.
+    if semgrep_runtime is not None:
+        semgrep_runtime.validate()
+        if tuple(cmd[:2]) != semgrep_runtime.command_prefix:
+            raise ValueError("Semgrep runtime does not match the selected command")
+        tool_paths = list(semgrep_runtime.tool_paths)
+        env = semgrep_runtime.child_environment(env or RaptorConfig.get_safe_env())
+    else:
+        _resolved0 = shutil.which(cmd[0]) or cmd[0]
+        _real0 = os.path.realpath(_resolved0)
+        if _real0 != cmd[0] and os.path.isfile(_real0):
+            cmd = [_real0, *cmd[1:]]
+        tool_paths = _compute_python_tool_paths(cmd)
+        from core.sandbox.python_paths import python_runtime_tool_paths
+        for p in python_runtime_tool_paths():
+            if p not in tool_paths:
+                tool_paths.append(p)
+    sandbox_kwargs: _ScannerSandboxIOKwargs = {}
+    if fake_home:
+        sandbox_kwargs["fake_home"] = True
+    if readable_paths:
+        sandbox_kwargs["readable_paths"] = list(readable_paths)
+        # readable_paths only reaches Landlock under restrict_reads;
+        # the channel that makes a path VISIBLE inside the mount-ns
+        # bind tree is tool_paths. The standard tree carries system
+        # dirs + target/output only — no /home — so local rule
+        # configs and --extra-config files were unreadable whenever
+        # mount-ns engaged, and the pack failed. Name them on both
+        # channels: bind now, read-allow if reads ever restrict.
+        for _rp in readable_paths:
+            if _rp not in tool_paths:
+                tool_paths.append(_rp)
+    # ``strict_env=True`` acknowledges that this caller deliberately
+    # supplies env= (a ``get_safe_env()``-derived dict with HOME / XDG
+    # overrides from the semgrep-specific path). Without it, the sandbox
+    # logs a one-line WARNING per invocation telling us to do exactly
+    # this. Operator on PR #777 surfaced the warning firing ~12× per
+    # scan run. The strip is a no-op for us (``get_safe_env`` already
+    # excludes DANGEROUS_ENV_VARS) but the flag is also the documented
+    # "I'm aware of the bypass" marker.
+    runtime_kwargs: _ScannerSandboxEnvironmentKwargs = (
+        {"env_caller_filtered": True} if semgrep_runtime is not None
+        else {"strict_env": True}
+    )
+    completed = sandbox_run(
         cmd,
         target=target,
         output=output,
         cwd=cwd,
         env=env or RaptorConfig.get_safe_env(),
+        **runtime_kwargs,
         text=True,
         capture_output=True,
         timeout=timeout,
         tool_paths=tool_paths or None,
+        **sandbox_kwargs,
         **net_kwargs,
     )
-    return p.returncode, p.stdout, p.stderr
+    return completed.returncode, completed.stdout, completed.stderr
 
 
 def _compute_python_tool_paths(cmd) -> list:
-    """Best-guess bind dirs for a Python-tool sandbox call.
+    """Declare the selected launcher and narrow Python runtime paths."""
+    from core.sandbox.python_paths import python_tool_paths
+    return python_tool_paths(cmd[0]) if cmd else []
 
-    Reads cmd[0]'s shebang to find the interpreter, then computes:
-      - script's bin dir (so cmd[0] resolves)
-      - interpreter's bin dir (often same dir)
-      - interpreter's stdlib dir, derived from interpreter path +
-        version (e.g. /home/USER/bin/python3.13 →
-        /home/USER/lib/python3.13)
 
-    All paths are absolute. Skips dirs that already lie under a
-    standard mount-ns bind prefix (/usr, /lib, etc.) — no point
-    asking for a bind that's already there.
+def _semgrep_jobs_per_worker(
+    n_configs: int,
+    max_workers: int,
+    cpu_count: int,
+) -> int:
+    """Per-process ``--jobs`` so concurrent packs share the host.
 
-    Returns [] when cmd is empty, the shebang can't be read, or
-    the layout doesn't match a recognisable Python install.
-    Speculative: a wrong guess is caught by context.py's
-    speculative-C retry (re-runs without tool_paths if the call
-    exits 126/127 with empty stderr).
+    Unpinned, each semgrep process defaults to every core; N parallel
+    packs would oversubscribe the machine N-fold (and semgrep's
+    rule interpreter is memory-hungry per job). Divide the cores by
+    the number of packs actually running at once, floor 1.
     """
-    import re
-    from pathlib import Path
-    if not cmd:
-        return []
-    cmd0 = cmd[0]
-    # Prefix-skip set — paths already in the mount-ns bind tree.
-    _SYS_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/etc/", "/bin/", "/sbin/")
-    def _interesting(p: str) -> bool:
-        return p and not any(p == s.rstrip("/") or p.startswith(s)
-                             for s in _SYS_PREFIXES)
-    paths = set()
-    # 1. Script's bin dir.
-    if Path(cmd0).is_absolute():
-        bin_dir = str(Path(cmd0).resolve().parent)
-        if _interesting(bin_dir):
-            paths.add(bin_dir)
-    # 2. Read shebang to find the interpreter.
-    #
-    # Pre-fix `f.readline()` was unbounded — `readline` reads
-    # until newline OR EOF. A file at `cmd0` with no newline
-    # (a binary, a corrupted script, an attacker-planted file
-    # at the resolved path) would read the WHOLE file into RSS
-    # before we noticed it wasn't a shebang. For multi-MB
-    # binaries that happen to live at `cmd[0]` (semgrep itself
-    # is a Python wrapper but some installs ship a compiled
-    # bin), the readline allocated the binary's full contents.
-    #
-    # Cap at 4 KB. POSIX shebangs are limited to 127 chars on
-    # Linux + 512 on most BSDs anyway; 4 KB is well above any
-    # legitimate shebang line.
-    _SHEBANG_READ_CAP = 4096
-    interp = None
-    try:
-        with open(cmd0, "rb") as f:
-            first_line = f.readline(_SHEBANG_READ_CAP).decode(
-                "utf-8", errors="ignore"
-            ).strip()
-        if first_line.startswith("#!"):
-            interp = first_line[2:].split()[0]
-    except (OSError, IndexError, UnicodeDecodeError):
-        pass
-    # 3. Interpreter's bin dir + stdlib dir.
-    # CRITICAL: use the UNRESOLVED interp path for stdlib computation,
-    # NOT Path.resolve(). Python's sys.prefix is computed from the path
-    # used to invoke the interpreter (i.e. sys.executable, which equals
-    # the unresolved shebang path). For an interpreter at
-    # /home/U/bin/python3.13 that's a symlink to /usr/bin/python3.13,
-    # Python sets sys.prefix=/home/U and looks for stdlib at
-    # /home/U/lib/python3.13. If we bind-mount the resolved location
-    # (/usr/lib/python3.13 — already in mount tree) Python won't find
-    # its stdlib because it's looking at sys.prefix-relative path.
-    # The bin dir IS still added via Path.resolve() (so symlink targets
-    # outside the mount tree get added too), but stdlib derivation
-    # MUST follow the unresolved path.
-    if interp and Path(interp).is_absolute() and Path(interp).is_file():
-        # Bin dir for the interpreter. Add both the resolved AND
-        # unresolved bin dirs so we cover the full symlink chain.
-        for p in {str(Path(interp).parent), str(Path(interp).resolve().parent)}:
-            if _interesting(p):
-                paths.add(p)
-        # Extract version from interpreter name. Try the SHEBANG name
-        # first (typically `python3.13` — version-stamped); fall back
-        # to the resolved name if the shebang name lacks a version.
-        candidate_names = [Path(interp).name, Path(interp).resolve().name]
-        ver = None
-        for name in candidate_names:
-            m = re.match(r"python(\d+\.\d+)", name)
-            if m:
-                ver = m.group(1)
-                break
-        if ver:
-            # Stdlib at sys.prefix/lib/pythonX.Y where sys.prefix is
-            # derived from the UNRESOLVED interp path (Python's view).
-            stdlib = Path(interp).parent.parent / "lib" / f"python{ver}"
-            if stdlib.is_dir() and _interesting(str(stdlib)):
-                paths.add(str(stdlib))
-    return sorted(paths)
+    active = max(1, min(max_workers, n_configs))
+    return max(1, cpu_count // active)
+
+
+def _semgrep_dropped_files(json_paths: list) -> dict:
+    """Compatibility wrapper for callers requesting only resource failures."""
+    from core.coverage.record import read_semgrep_outputs
+    return read_semgrep_outputs(json_paths, max_bytes=_MAX_TOOL_JSON_BYTES).dropped_files
+
+
+def _semgrep_skipped_paths(json_paths: list) -> dict:
+    """Compatibility wrapper for callers requesting only unique skip counts."""
+    from core.coverage.record import read_semgrep_outputs
+    return read_semgrep_outputs(json_paths, max_bytes=_MAX_TOOL_JSON_BYTES).skipped_paths
+
+
+def _semgrep_max_memory_mb(
+    n_configs: int,
+    max_workers: int,
+    total_ram_mb: int,
+) -> int:
+    """Per-pack ``--max-memory`` backstop (MiB).
+
+    Request 75% of estimated RAM divided by the active packs, with a
+    4 GiB minimum per pack. The floor can make the combined limits
+    exceed that RAM share. These requested tool limits do not guarantee
+    avoidance of host OOM or graceful termination; observed tool failures
+    still follow the normal failed-pack path.
+    """
+    active = max(1, min(max_workers, n_configs))
+    return max(4096, (total_ram_mb * 3 // 4) // active)
 
 
 def run_single_semgrep(
@@ -202,59 +888,93 @@ def run_single_semgrep(
     repo_path: Path,
     out_dir: Path,
     timeout: int,
-    progress_callback: Optional[Callable] = None
-) -> Tuple[str, bool]:
+    progress_callback: Callable | None = None,
+    extra_config_readable_paths: list[str] | None = None,
+    jobs: int | None = None,
+    max_memory_mb: int | None = None,
+) -> tuple[str, bool]:
     """
     Run a single Semgrep scan.
 
     Returns:
         Tuple of (sarif_path, success)
     """
-    def sanitize_name(name: str) -> str:
-        # Strict allowlist: alphanumeric + dash + underscore +
-        # dot. Pre-fix only `/` and `:` were replaced — but
-        # `name` is the policy-pack name from
-        # `RaptorConfig.BASELINE_SEMGREP_PACKS` /
-        # `POLICY_GROUP_TO_SEMGREP_PACK` (operator can extend
-        # via `--policy-groups`), and the sanitised result
-        # becomes part of an output FILE PATH. Any other shell
-        # / filesystem-special character (`*`, `?`, `[`, `]`,
-        # `\\`, space, NUL, newline, control bytes) flowed
-        # straight into `out_dir / f"semgrep_{suffix}.sarif"`.
-        # Concrete failure: a custom policy pack named with a
-        # space (e.g. `--policy-groups "my pack"`) produced
-        # `semgrep_my pack.sarif` — a path with embedded
-        # whitespace that subsequent `find` / `glob` calls
-        # mishandled (split on whitespace, missing the second
-        # half).
-        import re as _re
-        # Replace any non-allowed char with underscore. Preserve
-        # the legacy `/` → `_` and `:` → `_` mapping (those are
-        # both in the disallowed set, so they get replaced anyway).
-        return _re.sub(r'[^A-Za-z0-9._-]', '_', name)
-
-    suffix = sanitize_name(name)
+    if RaptorConfig.SEMGREP_OFFLINE:
+        config = RaptorConfig.get_semgrep_config(config)
+    suffix = _sanitize_pack_name(name)
     sarif = out_dir / f"semgrep_{suffix}.sarif"
     json_out = out_dir / f"semgrep_{suffix}.json"
     stderr_log = out_dir / f"semgrep_{suffix}.stderr.log"
     exit_file = out_dir / f"semgrep_{suffix}.exit"
+    # The CHILD's write grant is a dedicated subdir, never out_dir
+    # itself: in standalone /scan out_dir is the run ROOT, which holds
+    # parent-tier state — coverage-*.json records above all, which the
+    # coverage load chokepoint trusts at parent tier
+    # (core/coverage/record.py) — and semgrep parses hostile target
+    # files; a root-granted child could plant a top-level
+    # coverage-llm.json and mint review credit. The only child-written
+    # artifact is the --json-output metadata file: it is produced in
+    # the subdir and PROMOTED to its documented out_dir path by the
+    # parent after the run (every downstream reader keeps its path).
+    # sarif/stderr/exit are parent-written from the captured streams
+    # and stay at out_dir directly. Shared across parallel pack
+    # workers by design (same sharing as out_dir before); per-pack
+    # filenames keep them disjoint.
+    child_dir = out_dir / "semgrep-child"
+    child_dir.mkdir(parents=True, exist_ok=True)
+    json_out_child = child_dir / json_out.name
+    # A previous run's (or hostile sibling's) leftover at the child
+    # path must not be misattributed to this run.
+    json_out_child.unlink(missing_ok=True)
 
-    logger.debug(f"Starting Semgrep scan: {name}")
+    logger.debug("Starting Semgrep scan: %s", name)
 
     if progress_callback:
         progress_callback(f"Scanning with {name}")
 
     # Build the semgrep argv via packages/semgrep/. Sandbox engagement,
     # HOME redirect, and registry-pack proxy hosts remain scanner concerns
-    # below — packages/semgrep/ is pure invocation logic.
+    # below. Verified installed Snap runtimes also carry their explicitly
+    # scoped interpreter environment and one-payload JSON output contract.
     # Resolve binary explicitly to avoid broken-venv installations.
     semgrep_cmd = shutil.which("semgrep") or "/opt/homebrew/bin/semgrep"
+    try:
+        semgrep_runtime = semgrep_pkg.resolve_snap_runtime(semgrep_cmd)
+        scope_ok = semgrep_pkg.scope_isolation_available(semgrep_cmd)
+    except semgrep_pkg.SnapRuntimeError as exc:
+        json_out.unlink(missing_ok=True)
+        json_out.with_name(json_out.name + ".rejected").unlink(missing_ok=True)
+        logger.error("Semgrep runtime cannot be used safely: %s", exc)
+        sarif.write_text('{"runs": []}', encoding="utf-8")
+        stderr_log.write_text(str(exc), encoding="utf-8")
+        exit_file.write_text("-1", encoding="utf-8")
+        return str(sarif), False
+    if semgrep_runtime is not None:
+        # A failed new Snap invocation cannot leave prior coverage at this name.
+        json_out.unlink(missing_ok=True)
+        json_out.with_name(json_out.name + ".rejected").unlink(missing_ok=True)
+    if not scope_ok:
+        from packages.semgrep.runner import _warn_scope_isolation_once
+        if semgrep_runtime is not None:
+            _warn_scope_isolation_once(logger, semgrep_cmd)
+        else:
+            _warn_scope_isolation_once(logger)
+    runtime_options: _SemgrepRuntimeKwargs = (
+        {"runtime": semgrep_runtime} if semgrep_runtime is not None else {}
+    )
     cmd = semgrep_pkg.build_cmd(
         repo_path,
         config,
-        json_output_path=json_out,
+        json_output_path=json_out_child,
         rule_timeout=RaptorConfig.SEMGREP_RULE_TIMEOUT,
         semgrep_bin=semgrep_cmd,
+        extra_args=(
+            (["--jobs", str(jobs)] if jobs else [])
+            + (["--max-memory", str(max_memory_mb)] if max_memory_mb else [])
+            or None
+        ),
+        scope_isolation=scope_ok,
+        **runtime_options,
     )
 
     # Create clean environment without venv contamination or dangerous vars.
@@ -268,20 +988,32 @@ def run_single_semgrep(
         path_parts = [p for p in path_parts if 'venv' not in p.lower() and '/bin/pysemgrep' not in p]
         clean_env['PATH'] = ':'.join(path_parts)
 
-    # Redirect HOME into the run's out_dir so semgrep's two stateful
-    # files — semgrep.log (operational log) and settings.yml (metrics
-    # opt-in, empty after first write) — land inside the sandbox
-    # output rather than polluting the user's real ~/.semgrep.
-    # semgrep 1.79.0 does NOT persistently cache registry packs on
-    # disk — every invocation fetches the pack YAML from semgrep.dev
-    # regardless of HOME / cache dir — so the redirect costs us
-    # nothing (there's no cache to lose across scans). PR #196 ships
-    # pack YAMLs under engine/semgrep/rules/registry-cache/ and
-    # rewrites `p/security-audit` → local path BEFORE semgrep's
-    # registry client runs — post-#196 the fetch path is cold.
-    semgrep_home = out_dir / ".semgrep_home"
-    semgrep_home.mkdir(parents=True, exist_ok=True)
-    clean_env['HOME'] = str(semgrep_home)
+    # HOME + XDG basedirs are redirected via the sandbox layer's
+    # ``fake_home=True`` primitive (passed below to ``run()``). The
+    # sandbox itself owns the override semantics: it pre-creates
+    # ``HOME`` + all four ``XDG_*_HOME`` subdirs (CONFIG/DATA/CACHE/STATE)
+    # with mode 0o700 inside ``output``, refuses to materialise if any
+    # target path is a symlink (TOCTOU defence against a prior sandboxed
+    # child substituting a redirect target), and merges the override
+    # into the subprocess env with ``fake_home_env`` winning over any
+    # caller-supplied ``env=`` (see ``core/sandbox/context.py``).
+    #
+    # Without the XDG override, ``SAFE_ENV_ALLOWLIST`` preserves the
+    # operator's ``XDG_CONFIG_HOME`` and newer semgrep follows it to the
+    # real ``~/.config/semgrep`` — outside the Landlock writable policy.
+    # Under full sandbox the path is invisible inside the mount-ns;
+    # under the rootless-podman / distrobox Landlock-only path Landlock
+    # denies the write and semgrep crashes. ``fake_home=True`` is the
+    # profile-agnostic fix and means the policy lives in ONE place
+    # (sandbox context) instead of hand-rolled per-tool.
+    #
+    # semgrep 1.79.0 does NOT persistently cache registry packs on disk
+    # — every invocation fetches the pack YAML from semgrep.dev
+    # regardless of HOME / cache dir — so the redirect costs us nothing
+    # (there's no cache to lose across scans). PR #196 ships pack YAMLs
+    # under engine/semgrep/rules/registry-cache/ and rewrites
+    # ``p/security-audit`` → local path BEFORE semgrep's registry client
+    # runs — post-#196 the fetch path is cold.
 
     # Registry packs ("p/xxx", "category/xxx") fetch YAML from semgrep.dev
     # on every invocation — semgrep has no persistent on-disk cache. A slow
@@ -291,9 +1023,10 @@ def run_single_semgrep(
     # cost with a tighter ceiling so a stuck fetch drops that pack and the
     # remaining packs still run. Local rule directories keep the longer
     # timeout because they do real scan work without network.
-    is_registry_pack = config.startswith("p/") or config.startswith("category/")
+    is_registry_pack = config.startswith(("p/", "category/"))
     effective_timeout = min(timeout, RaptorConfig.SEMGREP_PACK_TIMEOUT) if is_registry_pack else timeout
 
+    sarif_written = False
     try:
         # Engage Landlock via target + output. Writes pinned to out_dir
         # and /tmp. Reads Landlock-default-wide (semgrep is a
@@ -301,33 +1034,116 @@ def run_single_semgrep(
         # Network: route via the egress proxy with the resolved
         # allowlist — UDP blocked, hostname-allowlisted,
         # resolved-IP-screened by the proxy's is_global check.
-        # Allowlist pulled from ._proxy_hosts (override → calibrate
-        # → static default) so operators on Semgrep self-hosted /
-        # corporate registry mirrors can override without source
-        # edits. See packages/static-analysis/_proxy_hosts.py.
-        #
+        # Allowlist pulled from packages/semgrep/_proxy_hosts.py
+        # (override → calibrate → static default) so operators on
+        # Semgrep self-hosted / corporate registry mirrors can
+        # override without source edits. The module lives with the
+        # semgrep package — the runner's registry lane shares the
+        # same allowlist — and is loaded by path here because
         # ``static-analysis`` is hyphenated → not importable as a
         # Python package; scanner.py runs as ``__main__`` via
-        # subprocess. Load the helper via importlib at call time
-        # to match the existing convention (see tests under
-        # packages/static-analysis/tests/ for the same pattern).
+        # subprocess.
         import importlib.util as _importlib_util
-        _ph_path = Path(__file__).parent / "_proxy_hosts.py"
+        _ph_path = (
+            Path(__file__).resolve().parents[1]
+            / "semgrep" / "_proxy_hosts.py"
+        )
         _ph_spec = _importlib_util.spec_from_file_location(
             "static_analysis_proxy_hosts", _ph_path,
         )
+        if _ph_spec is None or _ph_spec.loader is None:
+            raise ImportError("Semgrep proxy-host helper loader unavailable")
         _ph = _importlib_util.module_from_spec(_ph_spec)
         _ph_spec.loader.exec_module(_ph)
+        # ``fake_home=True``: sandbox layer materialises HOME + four
+        # XDG_*_HOME dirs inside ``output``, with symlink-TOCTOU defence,
+        # and merges its override into the subprocess env (winning over
+        # ``clean_env``'s ``HOME`` if anything else set it). Profile-
+        # agnostic — fires even under ``--sandbox none``.
+        #
+        # ``readable_paths``: the caller's ``--extra-config`` rule paths
+        # are passed here as well as in the semgrep argv. Today the
+        # scanner's Landlock policy is read-wide (``restrict_reads=False``
+        # — semgrep is a RAPTOR-chosen trusted tool) so this is a no-op,
+        # but future-proofs against a flip to read-restricted: an operator
+        # ``--extra-config /home/me/rules.yml`` would otherwise be denied
+        # at sandbox-read time.
+        # Local rule-directory packs reference a filesystem config
+        # (engine/semgrep/rules/<category>). Under mount-ns the child
+        # only sees the standard bind tree plus target/output — an
+        # install root under a masked path (/tmp checkouts, private
+        # prefixes) would leave the config unreadable and fail the
+        # pack. Naming it in readable_paths bind-mounts it explicitly
+        # instead of relying on where the install root happens to live.
+        _pack_readable = list(extra_config_readable_paths or [])
+        if (not is_registry_pack and Path(config).exists()
+                and str(config) not in _pack_readable):
+            _pack_readable.append(str(config))
         rc, so, se = run(
             cmd, timeout=effective_timeout, env=clean_env,
-            target=str(repo_path), output=str(out_dir),
-            proxy_hosts=_ph.proxy_hosts_for_semgrep(),
+            # The child's write grant is its work subdir, NOT out_dir
+            # (see child_dir above); the fake HOME lands inside it.
+            target=str(repo_path), output=str(child_dir),
+            proxy_hosts=(None if RaptorConfig.SEMGREP_OFFLINE or
+                         (semgrep_runtime is not None and not is_registry_pack)
+                         else _ph.proxy_hosts_for_semgrep()),
             caller_label="scanner-semgrep",
+            fake_home=True,
+            readable_paths=_pack_readable or None,
+            **({"semgrep_runtime": semgrep_runtime} if semgrep_runtime is not None else {}),
         )
 
+        if semgrep_runtime is not None:
+            # One native JSON payload supplies findings and coverage. This is
+            # parent-side conversion, never a second scan or fabricated sidecar.
+            from core.atomic_fs import write_text_atomically
+            raw_json = so or ""
+            if (len(raw_json) > _MAX_TOOL_JSON_BYTES or
+                    len(raw_json.encode("utf-8", errors="surrogatepass")) > _MAX_TOOL_JSON_BYTES):
+                raise ValueError("Semgrep JSON output exceeds the output budget")
+            try:
+                semgrep_runtime.validate_output_version(
+                    raw_json, max_output_bytes=_MAX_TOOL_JSON_BYTES)
+                so = semgrep_pkg.convert_semgrep_json_to_sarif(
+                    raw_json, max_output_bytes=_MAX_TOOL_JSON_BYTES)
+            except ValueError:
+                try:
+                    write_text_atomically(
+                        json_out.with_name(json_out.name + ".rejected"), raw_json)
+                except OSError:
+                    logger.warning("Could not retain rejected Semgrep JSON output")
+                raise
+            write_text_atomically(json_out, raw_json)
+            from packages.semgrep.models import parse_json_output
+            snap_metadata_errors = bool(parse_json_output(raw_json)["errors"])
+
+        # Promote the child-written JSON metadata to its documented
+        # out_dir path (parent-tier write). lstat-regular first: the
+        # child owns child_dir while it runs, and promoting a planted
+        # symlink would hand readers a child-chosen indirection (the
+        # budgeted readers refuse non-regular files, but the promoted
+        # name must not carry one in the first place). Absence is not
+        # an error — semgrep omits the file on some failure shapes;
+        # the empty-output handling below already covers those.
+        try:
+            import stat as _stat_mod
+            if semgrep_runtime is None and _stat_mod.S_ISREG(json_out_child.lstat().st_mode):
+                os.replace(json_out_child, json_out)
+            elif semgrep_runtime is None:
+                logger.warning(
+                    "semgrep '%s': child JSON output is not a regular "
+                    "file — not promoted", name)
+        except FileNotFoundError:
+            pass
+        except OSError as promote_exc:
+            logger.warning(
+                "semgrep '%s': JSON output promotion failed: %s",
+                name, promote_exc)
+
         # Validate output
-        if not so or not so.strip():
-            logger.warning(f"Semgrep scan '{name}' produced empty output")
+        output_missing = not so or not so.strip()
+        if output_missing:
+            logger.warning("Semgrep scan '%s' produced empty output", name)
             so = '{"runs": []}'
 
         # Explicit `encoding="utf-8"` on all three writes. Pre-fix
@@ -341,6 +1157,7 @@ def run_single_semgrep(
         # byte sequence in the semgrep stdout (shouldn't happen but
         # we don't want a single bad byte to crash the write).
         sarif.write_text(so, encoding="utf-8", errors="replace")
+        sarif_written = True
         stderr_log.write_text(se or "", encoding="utf-8", errors="replace")
         exit_file.write_text(str(rc), encoding="utf-8")
 
@@ -354,37 +1171,89 @@ def run_single_semgrep(
         # already strict enough to catch malformed semgrep output.
         is_valid = validate_sarif(sarif)
         if is_valid is False:
-            logger.warning(f"Semgrep scan '{name}' produced invalid SARIF")
+            logger.warning("Semgrep scan '%s' produced invalid SARIF", name)
         elif is_valid is None:
             logger.debug(
-                f"Semgrep scan '{name}': SARIF basic shape OK but full "
-                "schema validation skipped (jsonschema or schema file unavailable)"
+                "Semgrep scan '%s': SARIF basic shape OK but full "
+                "schema validation skipped (jsonschema or schema file unavailable)",
+                name
             )
 
-        success = rc in (0, 1) and is_valid is not False
-        logger.debug(f"Completed Semgrep scan: {name} (exit={rc}, valid={is_valid})")
+        success = (rc in (0, 1) and not output_missing and is_valid is not False
+                   and not (semgrep_runtime is not None and snap_metadata_errors))
+        logger.debug("Completed Semgrep scan: %s (exit=%s, valid=%s)", name, rc, is_valid)
 
         return str(sarif), success
 
-    except Exception as e:
-        logger.error(f"Semgrep scan '{name}' failed: {e}")
-        # Write empty SARIF on error. Same encoding posture as the
-        # success path above — explicit UTF-8 so the downstream
-        # parser sees a consistent byte shape regardless of host
-        # locale.
-        sarif.write_text('{"runs": []}', encoding="utf-8")
-        stderr_log.write_text(str(e), encoding="utf-8", errors="replace")
-        exit_file.write_text("-1", encoding="utf-8")
+    except SandboxSetupError:
+        # Sandbox isolation could not engage on this host. Do NOT mask it
+        # as an empty SARIF — that is the exact "0 findings in 0 files"
+        # silent-failure this exception exists to prevent. Propagate so
+        # the scan fails loud; the operator picks an explicit profile
+        # (`--sandbox network-only`). Every pack would hit the same host
+        # condition, so failing on the first is correct.
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.error("Semgrep scan '%s' failed: %s", name, e)
+        # Preserve output saved by this invocation if a later artifact write
+        # fails. An older report is not evidence from this invocation.
+        recovery_writes = [(stderr_log, str(e)), (exit_file, "-1")]
+        if not sarif_written:
+            recovery_writes.insert(0, (sarif, '{"runs": []}'))
+        for artifact, text in recovery_writes:
+            try:
+                artifact.write_text(text, encoding="utf-8", errors="replace")
+            except OSError:
+                logger.warning("Could not persist Semgrep failure artifact: %s", artifact.name)
         return str(sarif), False
+
+
+def _append_extra_configs(
+    configs: list[tuple[str, str]],
+    extra_configs: list[str] | None,
+) -> None:
+    """Append operator ``--extra-config`` entries to *configs* in place.
+
+    Single shared implementation for the parallel/sequential
+    dispatchers and the expanded stage, so the dedup discipline
+    cannot drift between copies:
+
+    Duplicate paths are dropped (main() pre-dedups by resolved value;
+    the defensive dedup here guards callers that don't go through
+    main()). Basename collisions across distinct paths get a
+    positional suffix so the per-pack SARIF filename
+    ``semgrep_extra_<name>.sarif`` is unique — without this, two
+    paths like ``/a/rules.yml`` + ``/b/rules.yml`` would both write
+    to ``semgrep_extra_rules.sarif`` and the silent-drop detector
+    would NOT fire (the file exists, just from the other pack's
+    worker).
+    """
+    seen_extra: set = set()
+    used_names: set = {n for n, _ in configs}
+    for extra in (extra_configs or []):
+        if extra in seen_extra:
+            logger.warning("--extra-config: duplicate path dropped: %s", extra)
+            continue
+        seen_extra.add(extra)
+        base = f"extra_{_sanitize_pack_name(Path(extra).name)}"
+        unique = base
+        i = 0
+        while unique in used_names:
+            i += 1
+            unique = f"{base}_{i}"
+        used_names.add(unique)
+        configs.append((unique, extra))
 
 
 def semgrep_scan_parallel(
     repo_path: Path,
-    rules_dirs: List[str],
+    rules_dirs: list[str],
     out_dir: Path,
     timeout: int = RaptorConfig.SEMGREP_TIMEOUT,
-    progress_callback: Optional[Callable] = None
-) -> List[str]:
+    progress_callback: Callable | None = None,
+    baseline_packs: list[tuple[str, str]] | None = None,
+    extra_configs: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
     """
     Run Semgrep scans in parallel for improved performance.
 
@@ -394,21 +1263,47 @@ def semgrep_scan_parallel(
         out_dir: Output directory for results
         timeout: Timeout per scan
         progress_callback: Optional callback for progress updates
+        baseline_packs: Override for the always-run baseline pack
+            set (``[(display_name, pack_id), ...]``). When None,
+            falls back to ``RaptorConfig.BASELINE_SEMGREP_PACKS`` —
+            preserves pre-#17 behaviour for callers that don't
+            consult the target-type catalog. Callers integrated
+            with the catalog (scanner.py main) resolve via
+            ``_resolve_baseline_packs`` and pass the result.
+        extra_configs: Operator-supplied custom rule sources
+            (``--extra-config``). Each value becomes its own peer
+            pack named ``extra_<basename>`` with its own SARIF;
+            duplicate paths are dropped with a warning and basename
+            collisions get a positional suffix. None/empty ⇒ no
+            extra packs.
 
     Returns:
-        List of SARIF file paths
+        (sarif_paths, failed_pack_names). Callers MUST surface the
+        failed list — silent-failure on parallel pack dispatch (a
+        submitted pack producing no SARIF on disk while
+        ``failed_scans`` records nothing) had no operator-visible
+        signal pre-fix: the survivor's SARIF was the only artifact
+        and the coverage record read like a complete run. Returning
+        the failed list from the dispatcher closes that gap; the
+        caller renders the summary line and writes it into the
+        coverage record.
     """
+    if baseline_packs is None:
+        baseline_packs = list(RaptorConfig.BASELINE_SEMGREP_PACKS)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Build config list with BOTH local rules AND standard packs for each category
-    configs: List[Tuple[str, str]] = []
+    configs: list[tuple[str, str]] = []
     added_packs = set()  # Track which standard packs we've added to avoid duplicates
 
     # Add local rules + corresponding standard packs for each specified category
     for rd in rules_dirs:
         rd_path = Path(rd)
         if rd_path.exists():
-            category_name = rd_path.name
+            # Files (single-file policy groups like ssrf) name the
+            # category by stem so the pack name is 'category_ssrf',
+            # not 'category_ssrf.yaml'.
+            category_name = rd_path.stem if rd_path.is_file() else rd_path.name
 
             # Add local rules for this category
             configs.append((f"category_{category_name}", str(rd_path)))
@@ -420,24 +1315,54 @@ def semgrep_scan_parallel(
                     resolved = RaptorConfig.get_semgrep_config(pack_id)
                     configs.append((pack_name, resolved))
                     added_packs.add(pack_id)
-                    logger.debug(f"Added standard pack for {category_name}: {resolved}")
+                    logger.debug("Added standard pack for %s: %s", category_name, resolved)
         else:
-            logger.warning(f"Rule directory not found: {rd_path}")
+            logger.warning("Rule directory not found: %s", rd_path)
 
-    # Add baseline packs (unless already added)
-    for pack_name, pack_identifier in RaptorConfig.BASELINE_SEMGREP_PACKS:
+    # Add baseline packs (unless already added). ``baseline_packs``
+    # was resolved by the caller (target-type catalog → tuned
+    # default per #7-7b; otherwise hardcoded BASELINE).
+    for pack_name, pack_identifier in baseline_packs:
         if pack_identifier not in added_packs:
             configs.append((pack_name, RaptorConfig.get_semgrep_config(pack_identifier)))
             added_packs.add(pack_identifier)
 
-    logger.info(f"Starting {len(configs)} Semgrep scans in parallel (max {RaptorConfig.MAX_SEMGREP_WORKERS} workers)")
-    logger.info(f"  - Local rule directories: {len([c for c in configs if c[0].startswith('category_')])}")
-    logger.info(f"  - Standard/baseline packs: {len([c for c in configs if not c[0].startswith('category_')])}")
+    # Operator-supplied custom rule sources via ``--extra-config``. Each
+    # value becomes a peer pack (its own SARIF, merged into combined
+    # results). Names are derived from the path so the operator can spot
+    # which extra-config produced which finding. Paths are deduped by
+    # resolved value — see _append_extra_configs for the dedup +
+    # basename-collision-rename rationale.
+    _append_extra_configs(configs, extra_configs)
+
+    configs = _drop_unreachable_registry_packs(configs)
+
+    logger.info(
+        "Starting %d Semgrep scans in parallel (max %s workers)",
+        len(configs),
+        RaptorConfig.MAX_SEMGREP_WORKERS
+    )
+    logger.info(
+        "  - Local rule directories: %d", len([c for c in configs if c[0].startswith('category_')])
+    )
+    logger.info(
+        "  - Standard/baseline packs: %d",
+        len([c for c in configs if not c[0].startswith('category_')])
+    )
 
     # Run scans in parallel
-    sarif_paths: List[str] = []
-    failed_scans: List[str] = []
+    sarif_paths: list[str] = []
+    failed_scans: list[str] = []
 
+    _jobs = _semgrep_jobs_per_worker(
+        len(configs), RaptorConfig.MAX_SEMGREP_WORKERS,
+        os.cpu_count() or 4,
+    )
+    from core.tuning import _detect_total_ram_mb
+    _max_mem = _semgrep_max_memory_mb(
+        len(configs), RaptorConfig.MAX_SEMGREP_WORKERS,
+        _detect_total_ram_mb(),
+    )
     with ThreadPoolExecutor(max_workers=RaptorConfig.MAX_SEMGREP_WORKERS) as executor:
         future_to_config = {
             executor.submit(
@@ -447,17 +1372,19 @@ def semgrep_scan_parallel(
                 repo_path,
                 out_dir,
                 timeout,
-                progress_callback
+                progress_callback,
+                extra_config_readable_paths=list(extra_configs or []),
+                jobs=_jobs,
+                max_memory_mb=_max_mem,
             ): (name, config)
             for name, config in configs
         }
 
-        completed = 0
         total = len(future_to_config)
 
-        for future in as_completed(future_to_config):
-            name, config = future_to_config[future]
-            completed += 1
+        for completed, future in enumerate(
+                as_completed(future_to_config), start=1):
+            name, _config = future_to_config[future]
 
             try:
                 sarif_path, success = future.result()
@@ -469,36 +1396,84 @@ def semgrep_scan_parallel(
                 if progress_callback:
                     progress_callback(f"Completed {completed}/{total} scans")
 
-            except Exception as exc:
-                logger.error(f"Semgrep scan '{name}' raised exception: {exc}")
+            except SandboxSetupError:
+                # Isolation could not engage — every pack hits the same
+                # host condition, so don't demote it to a per-pack failure
+                # (which would still emit a "scanned, found nothing" run).
+                # Propagate so the whole scan fails loud.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Semgrep scan '%s' raised exception: %s", name, exc)
                 failed_scans.append(name)
 
-    if failed_scans:
-        logger.warning(f"Failed scans: {', '.join(failed_scans)}")
+    # Detect the missing-SARIF case (worker returned success + a
+    # SARIF path, but no file actually exists on disk). Pre-fix,
+    # silently-dropped packs left no ``failed_scans`` entry —
+    # ``failure_count`` was 0, operators saw a clean run, the missing
+    # SARIFs went unnoticed. Check actual file presence (not the
+    # returned-path string) so any drop between worker-return and
+    # file-landing — filesystem error, sandbox teardown, race —
+    # registers as a failure.
+    submitted_names = {name for name, _ in configs}
+    silently_dropped = []
+    for name in submitted_names:
+        suffix = _sanitize_pack_name(name)
+        sarif_expected = out_dir / f"semgrep_{suffix}.sarif"
+        if not sarif_expected.is_file():  # noqa: SIM102
+            if name not in failed_scans:
+                silently_dropped.append(name)
+                failed_scans.append(name)
+    if silently_dropped:
+        logger.warning(
+            "Silently-dropped packs (submitted, no SARIF on disk): %s", ', '.join(silently_dropped)
+        )
 
-    logger.info(f"Completed {len(sarif_paths)} scans ({len(failed_scans)} failed)")
-    return sarif_paths
+    if failed_scans:
+        logger.warning("Failed scans: %s", ', '.join(failed_scans))
+
+    logger.info("Completed %d scans (%d failed)", len(sarif_paths), len(failed_scans))
+    return sarif_paths, failed_scans
 
 
 def semgrep_scan_sequential(
     repo_path: Path,
-    rules_dirs: List[str],
+    rules_dirs: list[str],
     out_dir: Path,
-    timeout: int = RaptorConfig.SEMGREP_TIMEOUT
-) -> List[str]:
-    """Sequential scanning fallback for debugging."""
+    timeout: int = RaptorConfig.SEMGREP_TIMEOUT,
+    baseline_packs: list[tuple[str, str]] | None = None,
+    extra_configs: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Sequential scanning fallback for debugging.
+
+    Returns ``(sarif_paths, failed_pack_names)`` — same contract as
+    ``semgrep_scan_parallel``. The sequential path is the
+    ``--sequential`` debug fallback; parallelism isn't the source of
+    the silent-drop class but the worker can still claim success
+    while no SARIF lands (filesystem error, sandbox teardown), so
+    the same cross-check + reporting apply.
+
+    ``baseline_packs``: same contract as the parallel sibling —
+    override for the always-run baseline pack set; None falls back
+    to ``RaptorConfig.BASELINE_SEMGREP_PACKS``.
+    """
+    if baseline_packs is None:
+        baseline_packs = list(RaptorConfig.BASELINE_SEMGREP_PACKS)
     out_dir.mkdir(parents=True, exist_ok=True)
-    sarif_paths: List[str] = []
+    sarif_paths: list[str] = []
+    failed_scans: list[str] = []
 
     # Build config list with BOTH local rules AND standard packs for each category
-    configs: List[Tuple[str, str]] = []
+    configs: list[tuple[str, str]] = []
     added_packs = set()  # Track which standard packs we've added to avoid duplicates
 
     # Add local rules + corresponding standard packs for each specified category
     for rd in rules_dirs:
         rd_path = Path(rd)
         if rd_path.exists():
-            category_name = rd_path.name
+            # Files (single-file policy groups like ssrf) name the
+            # category by stem so the pack name is 'category_ssrf',
+            # not 'category_ssrf.yaml'.
+            category_name = rd_path.stem if rd_path.is_file() else rd_path.name
 
             # Add local rules for this category
             configs.append((f"category_{category_name}", str(rd_path)))
@@ -511,26 +1486,129 @@ def semgrep_scan_sequential(
                     configs.append((pack_name, resolved))
                     added_packs.add(pack_id)
 
-    # Add baseline packs (unless already added)
-    for pack_name, pack_identifier in RaptorConfig.BASELINE_SEMGREP_PACKS:
+    # Add baseline packs (unless already added) — see parallel sibling
+    # for the catalog-aware resolution rationale.
+    for pack_name, pack_identifier in baseline_packs:
         if pack_identifier not in added_packs:
             configs.append((pack_name, RaptorConfig.get_semgrep_config(pack_identifier)))
             added_packs.add(pack_identifier)
 
-    for idx, (name, config) in enumerate(configs, 1):
-        logger.info(f"Running scan {idx}/{len(configs)}: {name}")
-        sarif_path, success = run_single_semgrep(name, config, repo_path, out_dir, timeout)
-        sarif_paths.append(sarif_path)
+    # Operator --extra-config — shared dedup + basename-collision
+    # rename (see _append_extra_configs).
+    _append_extra_configs(configs, extra_configs)
 
-    return sarif_paths
+    configs = _drop_unreachable_registry_packs(configs)
+
+    for idx, (name, config) in enumerate(configs, 1):
+        logger.info("Running scan %s/%d: %s", idx, len(configs), name)
+        try:
+            sarif_path, success = run_single_semgrep(
+                name, config, repo_path, out_dir, timeout,
+                extra_config_readable_paths=list(extra_configs or []),
+            )
+            sarif_paths.append(sarif_path)
+            if not success:
+                failed_scans.append(name)
+        except SandboxSetupError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — match parallel per-pack recovery
+            logger.error("Semgrep scan '%s' raised exception: %s", name, exc)
+            failed_scans.append(name)
+
+    # Detect silent drops the same way semgrep_scan_parallel does —
+    # worker may report success while no SARIF actually exists on
+    # disk. Cross-check submitted names against on-disk files.
+    submitted_names = {name for name, _ in configs}
+    silently_dropped = []
+    for name in submitted_names:
+        suffix = _sanitize_pack_name(name)
+        sarif_expected = out_dir / f"semgrep_{suffix}.sarif"
+        if not sarif_expected.is_file():  # noqa: SIM102
+            if name not in failed_scans:
+                silently_dropped.append(name)
+                failed_scans.append(name)
+    if silently_dropped:
+        logger.warning(
+            "Silently-dropped packs (submitted, no SARIF on disk): %s", ', '.join(silently_dropped)
+        )
+
+    return sarif_paths, failed_scans
+
+
+class _CodeQLStageTag(logging.Filter):
+    """Prefix log lines emitted from the concurrent CodeQL stage thread.
+
+    When the CodeQL stage overlaps the Semgrep stage their progress
+    lines interleave on the operator's console; the tag keeps the
+    stream legible without re-plumbing either stage's logging. The
+    prefix carries no format specifiers, so records with %-args still
+    format correctly.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if threading.current_thread().name.startswith("codeql-stage"):
+            record.msg = "[codeql] " + str(record.msg)
+        return True
+
+
+class _CodeQLStageHandle:
+    """Cross-thread kill switch for the concurrent CodeQL stage.
+
+    ``run_codeql`` runs on a NON-daemon executor worker whose inner
+    ``proc.communicate`` waits up to 3600s; concurrent.futures joins
+    that worker at interpreter shutdown. An abort raised out of the
+    semgrep stage (SandboxSetupError's fail-loud contract,
+    KeyboardInterrupt) therefore used to print "scan aborted" and then
+    block for up to an hour while the codeql agent kept burning
+    CPU/disk. The abort path calls :meth:`abort`, which SIGKILLs the
+    agent's whole process group so the worker's join returns promptly;
+    the register/abort race (abort lands before the spawn finishes) is
+    closed by killing at registration when already aborted.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._aborted = False
+
+    @property
+    def aborted(self) -> bool:
+        with self._lock:
+            return self._aborted
+
+    def register(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._proc = proc
+            if self._aborted:
+                self._kill_locked()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._proc = None
+
+    def abort(self) -> None:
+        with self._lock:
+            self._aborted = True
+            self._kill_locked()
+
+    def _kill_locked(self) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def run_codeql(
     repo_path: Path,
     out_dir: Path,
-    languages: Optional[List[str]] = None,
-    build_command: Optional[str] = None,
-) -> List[str]:
+    languages: list[str] | None = None,
+    build_command: str | None = None,
+    traced_build: bool = False,
+    stage_handle: _CodeQLStageHandle | None = None,
+) -> list[str]:
     """Delegate CodeQL analysis to packages/codeql/agent.py.
 
     Pre-unification this module shipped its own ~80-LOC WIP CodeQL
@@ -561,14 +1639,24 @@ def run_codeql(
             has those files or not" approach).
         build_command: Optional CodeQL build command override
             (e.g. for compiled languages with non-standard layouts).
+        traced_build: When True, forward ``--traced-build`` to the
+            agent (traced-build CodeQL extraction for compiled
+            languages). Default False adds no flag.
 
     Returns:
-        List of absolute SARIF paths the agent wrote. Empty on any
-        failure (logged); never raises.
+        Absolute paths of new or changed language SARIFs, plus a separate
+        execution diagnostic when the agent exits unsuccessfully. Unchanged
+        prior reports remain on disk but are excluded. Missing prerequisites
+        and timeouts return no reports. Diagnostic-write failures are logged
+        while recovered reports remain eligible. Raises ``SandboxSetupError``
+        when the sandbox could not engage (exit 3), and re-raises interrupts
+        and other non-``Exception`` aborts after killing the agent group.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    if shutil.which("codeql") is None:
-        logger.warning("codeql CLI not on PATH; skipping CodeQL stage")
+    from packages.codeql import is_available
+
+    if not is_available():
+        logger.warning("codeql CLI unavailable via CODEQL_CLI or PATH; skipping CodeQL stage")
         return []
 
     # repo root → packages/codeql/agent.py. scanner.py lives at
@@ -576,9 +1664,7 @@ def run_codeql(
     script_root = Path(__file__).resolve().parents[2]
     agent_script = script_root / "packages" / "codeql" / "agent.py"
     if not agent_script.exists():
-        logger.warning(
-            f"codeql agent script missing at {agent_script}; skipping CodeQL stage"
-        )
+        logger.warning("codeql agent script missing at %s; skipping CodeQL stage", agent_script)
         return []
 
     cmd = [
@@ -591,8 +1677,10 @@ def run_codeql(
         cmd.extend(["--languages", ",".join(languages)])
     if build_command:
         cmd.extend(["--build-command", build_command])
+    if traced_build:
+        cmd.append("--traced-build")
 
-    logger.info(f"Delegating CodeQL stage to {agent_script.name}")
+    logger.info("Delegating CodeQL stage to %s", agent_script.name)
     # subprocess.run + timeout SIGKILLs the immediate child only,
     # leaving the agent's codeql grandchildren as orphans holding
     # cache locks + gigabytes of memory until they finish. This
@@ -605,11 +1693,39 @@ def run_codeql(
     # this — their immediate child IS the namespace, and killing
     # the namespace kills everything inside.
     proc = None
+    if stage_handle is not None and stage_handle.aborted:
+        logger.warning("codeql stage aborted before agent spawn; skipping")
+        return []
+    def report_stamp(path):
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
     try:
+        previous_reports = {path: report_stamp(path) for path in out_dir.glob("codeql_*.sarif")}
+        agent_env = RaptorConfig.get_safe_env()
+        # Orphan opt-in for the agent itself (core.run.parent_liveness)
+        # — paired with start_new_session below by contract.
+        agent_env["RAPTOR_PARENT_WATCHDOG"] = str(os.getpid())
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True,
+            env=agent_env,
+            # Parent-death signaling: without it, a SIGKILLed scanner
+            # leaves the agent (and the codeql grandchildren holding
+            # cache locks + gigabytes) running forever. PDEATHSIG
+            # binds to the spawning THREAD — safe here because the
+            # codeql stage pool's worker outlives this proc by
+            # construction (shutdown joins the running task, and the
+            # abort path killpgs the agent before the pool shuts
+            # down), so the signal can only fire after the agent
+            # already exited, where it is a no-op.
+            preexec_fn=_PDEATHSIG_PREEXEC,
         )
+        if stage_handle is not None:
+            stage_handle.register(proc)
         try:
             stdout, stderr = proc.communicate(timeout=3600)
             returncode = proc.returncode
@@ -624,10 +1740,51 @@ def run_codeql(
                 pass
             logger.warning("codeql agent timed out after 3600s; skipping")
             return []
+        except BaseException:
+            # KeyboardInterrupt (or any other abort) while blocked in
+            # communicate: only TimeoutExpired killed the group, so a
+            # Ctrl-C on the sequential path orphaned the agent's whole
+            # process tree — codeql grandchildren kept burning
+            # CPU/memory and holding cache locks for up to an hour.
+            # Flatten the group like the timeout arm — including the
+            # reap: without the wait the direct child lingers as a
+            # zombie for as long as an interrupt-catching caller
+            # lives — then re-raise.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        finally:
+            if stage_handle is not None:
+                stage_handle.clear()
     except OSError as e:
-        logger.warning(f"failed to invoke codeql agent: {e}")
+        logger.warning("failed to invoke codeql agent: %s", e)
+        return []
+    if stage_handle is not None and stage_handle.aborted:
+        # Killed by the abort path: report the abort, not an agent rc.
+        logger.warning("codeql stage aborted; agent killed")
         return []
 
+    if returncode == SANDBOX_ENGAGE_EXIT_CODE:
+        # The codeql agent subprocess reported the sandbox could not engage.
+        # Propagate as a hard failure rather than silently returning [] — the
+        # /scan __main__ handler turns this into a fail-loud exit-3 abort.
+        msg = (
+            "the codeql agent subprocess reported the sandbox could not "
+            f"engage (exit {SANDBOX_ENGAGE_EXIT_CODE})"
+        )
+        raise SandboxSetupError(
+            msg,
+            "re-run with --sandbox network-only (or --sandbox none). "
+            "RAPTOR will not silently downgrade.",
+        )
+
+    diagnostic_reports = []
     if returncode != 0:
         # Surface the agent's stderr tail so the operator can see
         # WHY the run failed — language detection miscount, build
@@ -638,18 +1795,63 @@ def run_codeql(
         if len(stderr_tail) > 2000:
             stderr_tail = "..." + stderr_tail[-2000:]
         logger.warning(
-            f"codeql agent exited rc={returncode}. "
-            f"Last stderr: {stderr_tail or '<empty>'}"
+            "codeql agent exited rc=%s. Last stderr: %s", returncode, stderr_tail or '<empty>'
         )
+        document = _stage_findings_to_sarif([], tool_name="codeql", rule_prefix="codeql-stage")
+        diagnostic = _stage_diagnostic(
+            f"CodeQL agent exited with code {returncode}; recovered reports retained", failed=True,
+        )
+        diagnostic["exitCode"] = returncode
+        try:
+            diagnostic_reports = _write_stage_report(
+                out_dir / "codeql_stage_diagnostics.sarif", document, [diagnostic],
+            )
+        except (OSError, ValueError):
+            logger.warning("Could not persist CodeQL execution diagnostic; recovered reports retained")
         # Don't return early — the agent may have produced partial
-        # SARIFs (one language succeeded, another failed). Glob and
-        # return whatever's there.
+        # SARIFs (one language succeeded, another failed). Keep the
+        # recovered outputs that pass the freshness check below.
 
     # Glob for the agent's SARIF outputs. Naming matches the old
     # in-tree runner so downstream code (SARIF merge, coverage
     # records, _classify_artifact) needs no changes.
-    sarif_paths = sorted(str(p) for p in out_dir.glob("codeql_*.sarif"))
-    return sarif_paths
+    # Existing run directories may retain earlier language reports. Keep
+    # those files, but admit only reports observed as new or changed during
+    # this invocation, including partial outputs from a failed agent.
+    current_reports = []
+    for path in out_dir.glob("codeql_*.sarif"):
+        stamp = report_stamp(path)
+        if stamp is not None and stamp != previous_reports.get(path):
+            current_reports.append(str(path))
+    return sorted(set(current_reports + diagnostic_reports))
+
+
+def _join_codeql_stage(
+    future: "Future[list[str]]",
+    abort: Callable[[], None],
+) -> list[str]:
+    """Join the concurrent CodeQL stage with abort discipline.
+
+    Stage isolation: an ordinary stage failure (``Exception``) is
+    demoted to a warning — the semgrep results must survive a CodeQL
+    crash. Anything ELSE raised out of the blocking join —
+    KeyboardInterrupt above all, and the CodeQL DB build is usually
+    the run's critical path, so a Ctrl-C while watching the
+    ``[codeql]`` tail lands exactly here — must run the same abort
+    discipline as the guarded semgrep region: kill the agent's
+    process group so concurrent.futures' interpreter-shutdown join
+    can't wedge up to 1h on the non-daemon worker's communicate,
+    then re-raise.
+    """
+    try:
+        return future.result()
+    except Exception as e:  # noqa: BLE001 — stage isolation: semgrep results must survive
+        logger.error("CodeQL stage raised: %s", e)
+        print(f"⚠️  CodeQL stage failed: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
+        return []
+    except BaseException:
+        abort()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -663,25 +1865,104 @@ def run_codeql(
 _COCCI_C_EXTS: tuple = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh")
 
 
+# Pruned from the bounded probe walk — same discipline as the
+# /understand hunt dispatcher's ``repo_looks_c_cpp`` sibling: hidden
+# dirs (``.git`` alone routinely holds hundreds of loose object files,
+# enough to exhaust the cap before any source dir is reached, readdir
+# order dependent) plus vendored/build noise. Pruned entries never
+# consume the file budget. Trade-off (inherited from the sibling): a
+# repo whose ONLY C source hides under a pruned dir reads as non-C.
+_C_PROBE_SKIP_DIRS: frozenset[str] = frozenset({
+    "node_modules", "__pycache__", "venv", "env",
+    "build", "dist", "target",
+})
+
+
+def _c_cpp_source_probe(repo_path: Path,
+                        max_files_to_check: int = 200) -> tuple[bool, bool]:
+    """Bounded C/C++-presence probe: ``(found, budget_exhausted)``.
+
+    ``(True, _)`` — a C-family source file was seen.
+    ``(False, False)`` — the walk COMPLETED without one: an honest
+    negative, quiet skip is correct.
+    ``(False, True)`` — the budget ran out first: UNDECIDED, and a
+    stage that skips on it must say so loudly (fail-toward-visibility)
+    because a real C repo may sit past the horizon.
+    Directory enumeration errors raise OSError if no source was found,
+    instead of establishing a completed negative. A readable C-family
+    sibling still establishes presence; the skip helper reports unknowns.
+    """
+    if not repo_path.is_dir():
+        return False, False
+    enumeration_error = None
+
+    def record_walk_error(error):
+        nonlocal enumeration_error
+        if enumeration_error is None:
+            enumeration_error = error
+
+    seen = 0
+    for _dirpath, dirnames, filenames in os.walk(
+        repo_path, followlinks=False, onerror=record_walk_error,
+    ):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _C_PROBE_SKIP_DIRS and not d.startswith(".")
+        )
+        for fn in sorted(filenames):
+            if Path(fn).suffix.lower() in _COCCI_C_EXTS:
+                return True, False
+            seen += 1
+            if seen >= max_files_to_check:
+                return False, True
+    if enumeration_error is not None:
+        raise enumeration_error
+    return False, False
+
+
 def _repo_has_c_cpp_source(repo_path: Path,
                            max_files_to_check: int = 200) -> bool:
     """Quick heuristic: does the target have C/C++ source? Used by
     the auto-skip for non-C/C++ targets (cocci is C-family only)."""
-    if not repo_path.is_dir():
+    return _c_cpp_source_probe(repo_path, max_files_to_check)[0]
+
+
+def _skip_stage_without_c_cpp_source(stage: str, repo_path: Path) -> bool:
+    """Shared skip decision for the C-family-only stages (cocci,
+    compiler-scan, expanded-semgrep). True → the stage should skip.
+
+    An exhausted probe budget is reported on stderr as a gap record —
+    pre-fix all three stages degraded to ``logger.debug``, invisible at
+    default verbosity, and the run read as a clean semgrep-only scan.
+    """
+    try:
+        found, exhausted = _c_cpp_source_probe(repo_path)
+    except OSError as exc:
+        print(
+            f"⚠️  {stage}: C/C++ source enumeration failed — "
+            "stage skipped; coverage gap.", file=sys.stderr,
+        )
+        logger.warning("%s: C/C++ source enumeration failed: %s", stage, type(exc).__name__)
+        return True
+    if found:
         return False
-    seen = 0
-    for entry in repo_path.rglob("*"):
-        if not entry.is_file():
-            continue
-        seen += 1
-        if entry.suffix.lower() in _COCCI_C_EXTS:
-            return True
-        if seen >= max_files_to_check:
-            return False
-    return False
+    if exhausted:
+        print(
+            f"⚠️  {stage}: C/C++ probe budget exhausted before any "
+            f"C-family source was seen — stage skipped. If this target "
+            f"IS C/C++, its findings are being lost; coverage gap.",
+            file=sys.stderr,
+        )
+        logger.warning(
+            "%s: C/C++ presence undecided (probe budget exhausted); "
+            "stage skipped", stage,
+        )
+    else:
+        logger.debug("%s: target has no C/C++ source; skipping", stage)
+    return True
 
 
-def _shipped_cocci_rules_dir() -> Optional[Path]:
+def _shipped_cocci_rules_dir() -> Path | None:
     """Return the in-tree shipped-rules directory or None if it
     isn't present (minimal install / stripped tarball). The rules
     live at ``engine/coccinelle/rules/`` — distributed with RAPTOR,
@@ -697,9 +1978,11 @@ def _shipped_cocci_rules_dir() -> Optional[Path]:
 def run_cocci(
     repo_path: Path,
     out_dir: Path,
-    rules_dir: Optional[Path] = None,
+    rules_dir: Path | None = None,
     timeout: int = 300,
-) -> List[str]:
+    *,
+    on_coverage: Callable[[dict[str, Any]], None] | None = None,
+) -> list[str]:
     """Run Coccinelle's shipped rule set against ``repo_path`` and
     emit SARIF.
 
@@ -716,12 +1999,17 @@ def run_cocci(
     ``sarif_inputs = semgrep_sarifs + codeql_sarifs + cocci_sarifs``
     union works without special-cases.
 
+    ``on_coverage``, when supplied, receives this invocation's derived
+    coverage record before its best-effort disk write.
+
     Errors during individual rule runs are captured into the SARIF
     ``invocations[].toolExecutionNotifications`` so operators see
     them in the combined report rather than silently lost.
     """
     from packages.coccinelle.runner import (
         is_available as spatch_available,
+    )
+    from packages.coccinelle.runner import (
         run_rules as spatch_run_rules,
     )
     from packages.coccinelle.sarif import results_to_sarif
@@ -729,11 +2017,10 @@ def run_cocci(
     if not spatch_available():
         logger.debug("cocci: spatch not on PATH; skipping")
         return []
-    if not _repo_has_c_cpp_source(repo_path):
-        logger.debug("cocci: target has no C/C++ source; skipping")
+    if _skip_stage_without_c_cpp_source("cocci", repo_path):
         return []
 
-    effective_rules_dir = rules_dir if rules_dir else _shipped_cocci_rules_dir()
+    effective_rules_dir = rules_dir or _shipped_cocci_rules_dir()
     if effective_rules_dir is None:
         logger.debug(
             "cocci: shipped rules dir not found "
@@ -742,163 +2029,941 @@ def run_cocci(
         return []
 
     logger.info(
-        f"cocci: running {effective_rules_dir} against {repo_path} "
-        f"(timeout {timeout}s/rule)",
+        "cocci: running %s against %s (timeout %ss/rule)", effective_rules_dir, repo_path, timeout
     )
     results = spatch_run_rules(
         target=repo_path,
         rules_dir=effective_rules_dir,
         timeout_per_rule=timeout,
         no_includes=True,  # operator targets are untrusted
+        # In-repo shipped engine/coccinelle rules (code trust) — their
+        # @script:python reporting blocks are trusted.
+        allow_scripting=True,
     )
 
     sarif_doc = results_to_sarif(results, repo_path)
     sarif_path = out_dir / "cocci.sarif"
     save_json(sarif_path, sarif_doc)
 
+    # Coverage record — the SARIF translation drops files_examined, so build it
+    # from the spatch results (the true examined-set). Best-effort: a coverage
+    # write must never fail the scan. Previously cocci's examined-set was
+    # recorded nowhere, in any context.
+    try:
+        from core.coverage.record import build_from_cocci, write_record
+        from packages.coccinelle.runner import version as _spatch_version
+        cov = build_from_cocci(results, spatch_version=_spatch_version())
+        if cov:
+            if on_coverage is not None:
+                on_coverage(cov)
+            write_record(out_dir, cov, tool_name="coccinelle")
+    except Exception:
+        logger.debug("cocci: coverage record write failed", exc_info=True)
+
     n_results = sum(len(r.matches) for r in results)
     n_errors = sum(len(r.errors or []) for r in results)
     logger.info(
-        f"cocci: {n_results} matches across {len(results)} rules "
-        f"({n_errors} rule-level errors); SARIF at {sarif_path}",
+        "cocci: %s matches across %d rules (%s rule-level errors); SARIF at %s",
+        n_results,
+        len(results),
+        n_errors,
+        sarif_path
     )
     return [str(sarif_path)]
 
 
-def _sarif_has_findings(sarif_path: Path) -> bool:
-    """Return True iff the SARIF file contains at least one result.
+# ---------------------------------------------------------------------------
+# Compiler-analyzer scan (gcc -fanalyzer / clang --analyze) — opt-in
+# ---------------------------------------------------------------------------
 
-    Failures (missing file, unparseable JSON) return False — callers treat
-    "unknown" the same as "empty" because the goal is opportunistic cleanup.
+
+def _load_compiler_scan():
+    """Load the compiler_scan sibling module via importlib.
+
+    ``static-analysis`` is hyphenated → not importable as a Python
+    package; same call-time importlib convention as ``_proxy_hosts``.
+    Registered in ``sys.modules`` (dataclass processing resolves the
+    defining module there) and memoised across calls.
+    """
+    import importlib.util as _importlib_util
+    name = "static_analysis_compiler_scan"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path(__file__).parent / "compiler_scan.py"
+    spec = _importlib_util.spec_from_file_location(name, path)
+    mod = _importlib_util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_compiler_scan_stage(
+    repo_path: Path,
+    out_dir: Path,
+    max_tus: int | None = None,
+    setup: "AnalysisSetup | None" = None,
+    max_seconds: float | None = None,
+) -> list[str]:
+    """Run the compiler-analyzer scan channel and emit ``compiler.sarif``.
+
+    Same channel as core.audit.compiler_sweep, opposite direction: the
+    compiler's static analyzers run per-TU across the whole target and
+    their diagnostics become scan findings for the dedup/analysis
+    pipeline. Sandboxed, network-blocked, no build system — no repo
+    code executes (see packages/static-analysis/compiler_scan.py).
+
+    Auto-skipped (with a debug log) when the target has no C/C++
+    source. A refused run (sandbox unavailable, no analyzer toolchain)
+    is reported LOUDLY on stderr — never a silent empty result.
+
+    Returns the list of SARIF paths emitted — same shape as
+    ``run_codeql`` / ``run_cocci`` so the caller's ``sarif_inputs``
+    union works without special cases.
+    """
+    if _skip_stage_without_c_cpp_source("compiler-scan", repo_path):
+        return []
+
+    cs = _load_compiler_scan()
+    kwargs: dict[str, Any] = {} if max_tus is None else {"max_tus": max_tus}
+    if setup is not None:
+        kwargs["setup"] = setup
+    if max_seconds is not None:
+        kwargs["max_seconds"] = max_seconds
+    result = cs.scan_target(repo_path, out_dir=out_dir, **kwargs)
+
+    if not result.ok:
+        print(
+            f"⚠️  compiler-scan did not run: "
+            f"{sanitise_for_terminal(str(result.reason), max_len=300)}",
+            file=sys.stderr,
+        )
+        return []
+
+    sarif_path = out_dir / "compiler.sarif"
+    save_json(sarif_path, cs.to_sarif(result))
+    # Always replace the sidecar so a later clean scan cannot leave stale leads.
+    review_path = out_dir / "compiler-review-candidates.json"
+    save_json(review_path, cs.review_candidates_report(result))
+
+    summary = result.summary_line()
+    logger.info("%s; SARIF at %s; review candidates at %s", summary, sarif_path, review_path)
+    if (result.tus_skipped_cap or result.tus_failed or result.budget_exhausted or result.review_candidates
+            or result.suppressed_tus or result.unvetted_tus or result.detector_limitations):
+        # Cap skips, failed TUs and suppression-limited TUs must reach
+        # the operator without log-level spelunking — same posture as
+        # the failed-pack line.
+        print(f"⚠️  {summary}", file=sys.stderr)
+    return [str(sarif_path)]
+
+
+# ---------------------------------------------------------------------------
+# Expanded-view semgrep (fidelity-3 macro-hidden sink coverage) — opt-in
+# ---------------------------------------------------------------------------
+
+
+def _stage_diagnostic(message: str, *, failed: bool = False) -> dict:
+    """A failed invocation or explicit coverage limitation, never a finding."""
+    from core.security.log_sanitisation import escape_nonprintable
+    note = {
+        "level": "error" if failed else "warning",
+        "message": {"text": escape_nonprintable(message[:500])},
+    }
+    if not failed:
+        note["properties"] = {"coverage_limitation": "partial_analysis"}
+    return {"executionSuccessful": not failed, "toolExecutionNotifications": [note]}
+
+
+def _semgrep_stage_diagnostic(result, label: str) -> dict | None:
+    if result.errors or getattr(result, "returncode", 0) not in (0, 1):
+        reason = str(result.errors[0])[:200] if result.errors else f"exit code {result.returncode}"
+        return _stage_diagnostic(f"{label}: Semgrep execution failed ({reason}); recovered findings retained",
+                                 failed=True)
+    if (getattr(result, "files_failed", ()) or getattr(result, "skipped_rules", ())
+            or (getattr(result, "skipped_summary", None) or {}).get("total", 0)):
+        return _stage_diagnostic(f"{label}: files or rules were not fully analysed")
+    return None
+
+
+def _write_stage_report(path: Path, document: dict, diagnostics: list[dict]) -> list[str]:
+    if diagnostics:
+        document["runs"][0].setdefault("invocations", []).extend(diagnostics)
+    save_json(path, document)
+    return [str(path)]
+
+
+def run_python_sql_stage(
+    repo_path: Path, out_dir: Path, configs: list[str], semgrep_sarifs: list[str],
+) -> tuple[list[str], "SemgrepOutputSummary | None"]:
+    """Recover SQL leads only in files witnessed by the selected plain scan."""
+    from core.coverage.record import read_semgrep_outputs
+    from core.detectors.python_sql import (
+        RULE_ID, is_curated_sql_config, recover_python_sql,
+    )
+    from core.paths import confine
+
+    if not any(is_curated_sql_config(config) for config in configs):
+        return [], None
+    summary = read_semgrep_outputs(
+        [Path(path).with_suffix(".json") for path in semgrep_sarifs],
+        max_bytes=_MAX_TOOL_JSON_BYTES, location_rule_ids=frozenset({RULE_ID}),
+    )
+    diagnostics = []
+    if summary.input_errors:
+        diagnostics.append(_stage_diagnostic("Python SQL: original scan metadata is incomplete"))
+    if summary.location_rows_rejected:
+        diagnostics.append(_stage_diagnostic("Python SQL: raw match-location projection is incomplete"))
+    known = {(rule, path, line, column, line_end, column_end)
+             for rule, file, line, column, line_end, column_end in summary.result_locations
+             if (path := confine(repo_path, file)) is not None}
+    failed = {confine(repo_path, row["path"]) for row in summary.files_failed}
+    sources = []
+    for file in (summary.record or {}).get("files_examined", []):
+        path = confine(repo_path, file)
+        if path is None or path in failed or path.suffix.lower() not in {".py", ".pyw"}:
+            continue
+        sources.append(str(path.relative_to(repo_path.resolve())))
+    sources = list(dict.fromkeys(sources))
+    matches = []
+    if sources:
+        try:
+            recovery = recover_python_sql(repo_path, sources, out_dir=out_dir)
+        except Exception as exc:
+            diagnostics.append(_stage_diagnostic(f"Python SQL: recovery failed: {exc}", failed=True))
+        else:
+            matches = list(recovery.matches)
+            if recovery.status in {"partial", "error"}:
+                diagnostics.append(_stage_diagnostic(
+                    f"Python SQL: {recovery.reason or 'preparation incomplete'}",
+                    failed=recovery.status == "error",
+                ))
+            for file, reason in recovery.limitations:
+                diagnostics.append(_stage_diagnostic(f"Python SQL: {file}: {reason}"))
+    if not matches and not diagnostics:
+        return [], summary
+    results = []
+    for row in matches:
+        identity = (RULE_ID, confine(repo_path, row["file"]), row["line"], row["column"],
+                    row["line_end"], row["column_end"])
+        if identity in known:
+            continue
+        region = sarif_emit.source_region(
+            row["line"], column=row["column"], end_line=row["line_end"], end_column=row["column_end"],
+        )
+        results.append(sarif_emit.result(
+            RULE_ID, row["message"], [sarif_emit.location(row["file"], region)],
+            level=row["level"], properties={
+                "prepared_view": "python-builtin-int", "source_sha256": row["source_sha256"],
+            },
+        ))
+    document = sarif_emit.document([sarif_emit.run(
+        "semgrep-python-sql", [sarif_emit.minimal_rule(RULE_ID, properties={"cwe": "CWE-89"})], results,
+    )], schema_uri=sarif_emit.SCHEMA_URI_SCHEMASTORE)
+    return _write_stage_report(out_dir / "python-sql.sarif", document, diagnostics), summary
+
+
+def run_expanded_semgrep_stage(
+    repo_path: Path,
+    out_dir: Path,
+    rules_dirs: list[str],
+    baseline_packs: list[tuple[str, str]],
+    extra_configs: list[str] | None = None,
+    max_tus: int | None = None,
+    setup: "AnalysisSetup | None" = None,
+) -> list[str]:
+    """Re-run the loaded semgrep ruleset over fidelity-3 expanded views.
+
+    Pattern rules miss anything hidden behind macros (LIST_FOREACH
+    wrappers, lock macros, allocator wrappers). This stage expands
+    macro-heavy C/C++ TUs through the real preprocessor
+    (core.audit.preprocessor_view — sandboxed, no repo code executes),
+    runs the same rule configs the plain stage ran over the expanded
+    scratch tree, translates match lines back to ORIGINAL coordinates,
+    and emits ``expanded_semgrep.sarif`` under a distinct tool name
+    (``semgrep-expanded``) with an ``expanded_view`` marker on every
+    result. Matches mapping into system headers or other files are
+    dropped (noise by policy).
+
+    Bounded by preprocessor_view's per-run expansion budget; skipped
+    TUs are reported loudly. Best-effort per config — a failing pack
+    never kills the stage.
+
+    Returns the list of SARIF paths emitted (same shape as the other
+    stage runners).
+    """
+    if _skip_stage_without_c_cpp_source("expanded-semgrep", repo_path):
+        return []
+
+    from contextlib import nullcontext
+
+    from core.audit import expanded_semgrep as es
+    from core.detectors.semgrep import PreparedInput, run_semgrep_analysis
+    from packages.semgrep.runner import is_available as semgrep_available
+
+    if not semgrep_available():
+        print(
+            "⚠️  expanded-semgrep did not run: semgrep not installed",
+            file=sys.stderr,
+        )
+        return _write_stage_report(out_dir / "expanded_semgrep.sarif", es.findings_to_sarif([]),
+                                   [_stage_diagnostic("Semgrep not installed", failed=True)])
+
+    with scratch_dir("expanded_semgrep_", dir=out_dir, keepalive=True) as scratch:
+        kwargs: dict[str, Any] = {} if max_tus is None else {"max_tus": max_tus}
+        if setup is not None:
+            kwargs["setup"] = setup
+        corpus = es.build_expanded_corpus(
+            repo_path, scratch, out_dir=out_dir, **kwargs,
+        )
+        summary = corpus.summary_line()
+        logger.info(summary)
+        if corpus.skipped_budget:
+            print(f"⚠️  {summary}", file=sys.stderr)
+        diagnostics = []
+        if corpus.failed or corpus.skipped_budget:
+            diagnostics.append(_stage_diagnostic(
+                f"expanded-semgrep: {corpus.failed} TU(s) failed preparation; "
+                f"{corpus.skipped_budget} TU(s) skipped by the expansion budget",
+            ))
+        if corpus.expanded == 0:
+            if diagnostics:
+                return _write_stage_report(out_dir / "expanded_semgrep.sarif",
+                                           es.findings_to_sarif([]), diagnostics)
+            return []
+
+        # Same config set the plain stage ran: local rule dirs +
+        # baseline packs + operator --extra-config, minus unreachable
+        # registry packs.
+        configs: list[tuple[str, str]] = []
+        added_packs: set = set()
+        for rd in rules_dirs:
+            rd_path = Path(rd)
+            if rd_path.exists():
+                _cat = rd_path.stem if rd_path.is_file() else rd_path.name
+                configs.append((f"category_{_cat}", str(rd_path)))
+        for pack_name, pack_id in baseline_packs:
+            if pack_id not in added_packs:
+                configs.append(
+                    (pack_name, RaptorConfig.get_semgrep_config(pack_id)),
+                )
+                added_packs.add(pack_id)
+        # Shared dedup + basename-collision rename — pre-fix this was
+        # a bare extend, so duplicate CLI paths ran twice against the
+        # expanded corpus and colliding basenames shared a pack name.
+        _append_extra_configs(configs, extra_configs)
+        configs = _drop_unreachable_registry_packs(configs)
+
+        all_findings: list[dict] = []
+        seen: set = set()
+        total_dropped = 0
+        failed_packs = 0
+        for name, config in configs:
+            execution = run_semgrep_analysis(
+                detector=es.DETECTOR,
+                prepare=lambda: nullcontext(PreparedInput(
+                    corpus.root,
+                    lambda findings: es.translate_corpus_findings(corpus, findings),
+                )),
+                rule_config=config, name=name,
+                timeout=RaptorConfig.SEMGREP_PACK_TIMEOUT,
+                env_factory=lambda: RaptorConfig.get_safe_env(preserve_proxy=True),
+            )
+            state = execution.value
+            if execution.status in ("skipped", "error"):
+                if state.invocation_error is not None:
+                    logger.warning("expanded-semgrep: pack %s failed: %s", name, state.invocation_error)
+                else:
+                    logger.debug("expanded-semgrep: pack %s errors: %s", name, state.errors[:3])
+                failed_packs += 1
+                diagnostics.append(_stage_diagnostic(f"{name}: expanded Semgrep execution failed", failed=True))
+                continue
+            if execution.status == "partial":
+                logger.warning("expanded-semgrep: pack %s coverage is partial: %s", name, execution.reason)
+                diagnostics.append(_stage_diagnostic(f"{name}: expanded Semgrep analysis is partial",
+                                                     failed=bool(state.errors)))
+            translated, dropped = state.matches, state.dropped
+            total_dropped += dropped
+            for f in translated:
+                key = es.expanded_finding_key(f)
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_findings.append(f)
+
+        if configs and failed_packs == len(configs):
+            print(f"⚠️  expanded-semgrep stage FAILED: all {len(configs)} pack(s) failed; "
+                  "execution errors retained in SARIF", file=sys.stderr)
+        if not configs:
+            diagnostics.append(_stage_diagnostic("expanded-semgrep: no rule configurations available"))
+        if failed_packs:
+            print(
+                f"⚠️  expanded-semgrep: {failed_packs}/{len(configs)} "
+                f"pack(s) failed to run",
+                file=sys.stderr,
+            )
+
+        sarif_path = out_dir / "expanded_semgrep.sarif"
+        paths = _write_stage_report(sarif_path, es.findings_to_sarif(all_findings), diagnostics)
+        logger.info(
+            "expanded-semgrep: %d finding(s) at original coordinates "
+            "(%d expanded-region matches dropped as noise); SARIF at %s",
+            len(all_findings), total_dropped, sarif_path,
+        )
+        return paths
+
+
+# ---------------------------------------------------------------------------
+# Graduated synthesized rules (P7) — default-on, opt-out
+# ---------------------------------------------------------------------------
+
+_GRADUATED_TOOL_NAME = "raptor-graduated"
+
+
+def find_engine_rules_dir(out_dir: Path, repo_path: Path) -> Path | None:
+    """Locate the project's graduated semgrep rules directory.
+
+    Graduation (RuleLibrary.graduate / core.audit graduation) writes to
+    ``<project_dir>/engine-rules/semgrep/rules/*.yaml``. Candidate
+    resolution mirrors the run-directory layouts:
+
+      * /scan with a project: ``out_dir`` is the run dir → sibling
+        ``engine-rules`` under the project dir (``out_dir.parent``).
+      * /agentic: the scanner child writes to ``<run_dir>/scan`` →
+        two levels up.
+      * the active project's ``output_dir`` (authoritative when set).
+
+    SECURITY: only RAPTOR-graduated rules may load — a candidate that
+    resolves inside the scanned repo is rejected, so a hostile target
+    cannot plant YAML that runs as trusted scanner config.
+    """
+    repo_resolved = Path(repo_path).resolve()
+    candidates = []
+    out_resolved = Path(out_dir).resolve()
+    run_root: Path | None = None
+    try:
+        # THE PIN DECIDES FIRST — graduated rules run as trusted engine
+        # config, so candidate ORDER is a privilege decision. The
+        # pre-fix topology candidates came first: an --out run placed
+        # in a foreign project's dir loaded that project's rules ahead
+        # of the pinned project's, and for an /agentic child
+        # (out=<run>/scan) candidate 1 was <run>/engine-rules — INSIDE
+        # the sandbox write grant, plantable by any earlier hostile
+        # stage. Topology shapes remain only as the legacy fallback
+        # for pin-less dirs, and never from inside the governed run
+        # dir itself.
+        from core.audit.rules_dirs import standalone_read_candidates
+        from core.run.pin import pin_project_dir, resolve_run_pin
+        pin = resolve_run_pin(out_resolved)
+        run_root = pin.run_dir
+        proj_dir = pin_project_dir(out_resolved)
+        if proj_dir is not None:
+            candidates.append(proj_dir / "engine-rules")
+        candidates.extend(standalone_read_candidates(repo_resolved))
+        if not pin.authoritative:
+            candidates.append(out_resolved.parent / "engine-rules")
+            candidates.append(out_resolved.parent.parent / "engine-rules")
+    except Exception:
+        logger.debug(
+            "graduated-rules: pinned-project lookup failed", exc_info=True,
+        )
+        candidates.append(out_resolved.parent / "engine-rules")
+        candidates.append(out_resolved.parent.parent / "engine-rules")
+
+    for candidate in candidates:
+        rules_dir = candidate / "semgrep" / "rules"
+        try:
+            resolved = rules_dir.resolve()
+        except OSError:
+            continue
+        if run_root is not None and (
+                resolved == run_root or run_root in resolved.parents):
+            logger.warning(
+                "graduated-rules: refusing rules dir inside the run "
+                "dir (%s) — the run dir is the sandbox write grant",
+                resolved,
+            )
+            continue
+        if resolved == repo_resolved or repo_resolved in resolved.parents:
+            logger.warning(
+                "graduated-rules: refusing rules dir inside the scanned "
+                "repo (%s) — repo-supplied YAML never loads", resolved,
+            )
+            # Security-event stream (restored: the scanner emitted
+            # security events on suspicious-input rejection until the
+            # a2f0255b restructure; the clone-URL emitter moved to
+            # core/git, this is the scanner's own rejection path now).
+            # Observability only — the `continue` above/below is the
+            # behaviour; the emitter never raises.
+            logger.log_security_event(
+                "untrusted_rules_dir_rejected",
+                "graduated-rules candidate resolves inside the scanned "
+                "repo; repo-supplied YAML never loads as scanner config",
+                rules_dir=str(resolved),
+                repo=str(repo_resolved),
+            )
+            continue
+        if not rules_dir.is_dir():
+            continue
+        # Ownership gate (same predicate the pin walk applies to run
+        # markers): graduated rules load and execute as trusted
+        # scanner config, so a candidate dir another local user owns
+        # or can write — e.g. `--out /tmp/x` putting a planted
+        # `/tmp/engine-rules` on the topology candidates — never
+        # loads.
+        try:
+            from core.run.pin import _marker_trustworthy
+            if not (_marker_trustworthy(resolved)
+                    and _marker_trustworthy(resolved.parent)):
+                logger.warning(
+                    "graduated-rules: refusing rules dir %s — not "
+                    "owned by us, or writable by other users",
+                    resolved,
+                )
+                continue
+        except ImportError:
+            continue
+        try:
+            has_rules = any(path.match("*.yaml") for path in rules_dir.iterdir())
+        except OSError:
+            # Preserve the selected trusted directory so the stage reports
+            # its enumeration failure instead of treating it as empty.
+            return rules_dir
+        if has_rules:
+            return rules_dir
+    return None
+
+
+def run_graduated_rules_stage(
+    repo_path: Path,
+    out_dir: Path,
+    rules_dir: Path | None = None,
+) -> list[str]:
+    """Run the project's graduated synthesized rules as a scan stage.
+
+    Each graduated rule encodes a confirmed real-bug pattern
+    (precision-gated at graduation: >=2 TPs, >=3 matches, >=80%).
+    Runs every ``*.yaml`` under the engine-rules semgrep dir
+    individually (one bad rule never kills the stage), and emits
+    ``graduated.sarif`` under the distinct ``raptor-graduated`` tool
+    name with ``properties.provenance = "synthesized:<rule_id>"`` on
+    every result — so downstream analysis can key precision feedback
+    (``RuleLibrary.record_match``) back to the originating rule.
+
+    Auto-skips silently when no graduated rules exist. Returns the
+    list of SARIF paths emitted (same shape as the other stage
+    runners).
+    """
+    if rules_dir is None:
+        rules_dir = find_engine_rules_dir(out_dir, repo_path)
+    if rules_dir is None:
+        logger.debug("graduated-rules: no engine-rules dir found; skipping")
+        return []
+
+    # Containment check also for operator-supplied dirs: rules that
+    # live inside the scanned repo never load as scanner config.
+    try:
+        rules_resolved = Path(rules_dir).resolve()
+        repo_resolved = Path(repo_path).resolve()
+    except OSError:
+        return []
+    if rules_resolved == repo_resolved or repo_resolved in rules_resolved.parents:
+        print(
+            f"⚠️  graduated-rules: refusing rules dir inside the scanned "
+            f"repo: {rules_resolved}",
+            file=sys.stderr,
+        )
+        return []
+
+    try:
+        rule_files = sorted(path for path in Path(rules_dir).iterdir() if path.match("*.yaml"))
+    except OSError as exc:
+        return _write_stage_report(
+            Path(out_dir) / "graduated.sarif", _graduated_findings_to_sarif([]),
+            [_stage_diagnostic(
+                f"Graduated rule enumeration failed: {type(exc).__name__}", failed=True,
+            )],
+        )
+    if not rule_files:
+        return []
+
+    try:
+        from packages.semgrep.runner import is_available as semgrep_available
+        from packages.semgrep.runner import run_rule as semgrep_run_rule
+    except ImportError:
+        return _write_stage_report(Path(out_dir) / "graduated.sarif",
+                                   _graduated_findings_to_sarif([]),
+                                   [_stage_diagnostic("Semgrep runner unavailable", failed=True)])
+    if not semgrep_available():
+        print(
+            "⚠️  graduated-rules stage did not run: semgrep not installed",
+            file=sys.stderr,
+        )
+        return _write_stage_report(Path(out_dir) / "graduated.sarif",
+                                   _graduated_findings_to_sarif([]),
+                                   [_stage_diagnostic("Semgrep not installed", failed=True)])
+
+    all_findings: list[tuple[str, dict]] = []
+    diagnostics = []
+    failed = 0
+    for rule_file in rule_files:
+        rule_id = rule_file.stem
+        try:
+            res = semgrep_run_rule(
+                Path(repo_path), str(rule_file),
+                name=f"graduated_{rule_id}",
+                timeout=RaptorConfig.SEMGREP_PACK_TIMEOUT,
+                env=RaptorConfig.get_safe_env(preserve_proxy=True),
+            )
+        except Exception as exc:  # noqa: BLE001 — one rule must not kill the stage
+            logger.warning("graduated-rules: %s failed: %s", rule_id, exc)
+            failed += 1
+            diagnostics.append(_stage_diagnostic(f"{rule_id}: graduated Semgrep invocation failed", failed=True))
+            continue
+        diagnostic = _semgrep_stage_diagnostic(res, rule_id)
+        if res.errors:
+            logger.debug("graduated-rules: %s errors: %s", rule_id, res.errors[:3])
+        if diagnostic:
+            diagnostics.append(diagnostic)
+            if diagnostic["executionSuccessful"] is False:
+                failed += 1
+        all_findings.extend((rule_id, f.to_dict()) for f in res.findings)
+
+    if rule_files and failed == len(rule_files):
+        print(f"⚠️  graduated-rules stage FAILED: all {len(rule_files)} rule(s) failed; "
+              "execution errors retained in SARIF", file=sys.stderr)
+
+    sarif_path = Path(out_dir) / "graduated.sarif"
+    paths = _write_stage_report(sarif_path, _graduated_findings_to_sarif(all_findings), diagnostics)
+    logger.info(
+        "graduated-rules: %d rule(s) ran (%d failed), %d finding(s); "
+        "SARIF at %s",
+        len(rule_files), failed, len(all_findings), sarif_path,
+    )
+    if failed:
+        print(
+            f"⚠️  graduated-rules: {failed}/{len(rule_files)} graduated "
+            "rule(s) failed to run",
+            file=sys.stderr,
+        )
+    return paths
+
+
+def run_source_wrapper_stage(
+    repo_path: Path,
+    out_dir: Path,
+) -> tuple[list[str], list[str]]:
+    """Project mechanically-derived Java source-wrapper summaries into
+    additional taint-source rules and run them as a scan stage.
+
+    Sources are proofs from ``core.analysis.java_source_summaries``
+    (a helper method whose return provably carries servlet-request
+    data); sinks/sanitizers mirror the in-repo java rules. The
+    generated YAML lives under the run output directory — never in
+    the rules tree. Additive findings only, emitted as
+    ``source-wrappers.sarif`` under the ``raptor-source-wrappers``
+    tool name with rule ids prefixed ``source-wrapper:``. Auto-skips
+    silently when the tree yields no summaries or tree-sitter java
+    is unavailable.
+    """
+    summary_diagnostics: list[dict] = []
+
+    def failed_report(reason):
+        document = _stage_findings_to_sarif([], tool_name="raptor-source-wrappers",
+                                            rule_prefix="source-wrapper")
+        return _write_stage_report(Path(out_dir) / "source-wrappers.sarif", document,
+                                   [*summary_diagnostics, _stage_diagnostic(reason, failed=True)]), []
+
+    try:
+        from core.analysis.java_source_summaries import scan_tree
+        from packages.semgrep.source_wrapper_rules import generate_rules_yaml
+    except ImportError:
+        return [], []
+    try:
+        summaries, refusals, scanned = scan_tree(Path(repo_path))
+    except Exception as exc:  # noqa: BLE001 — stage must not kill the scan
+        logger.warning("source-wrappers: scan failed: %s", exc)
+        return failed_report("source-wrapper summary analysis failed")
+    # Unsupported method shapes are ordinary nonqualification; input caps
+    # and unreadable files instead mean the summary census was incomplete.
+    incomplete = {reason: refusals[reason] for reason in
+                  ("file_cap_hit", "source_cap_hit", "unreadable")
+                  if refusals.get(reason)}
+    if incomplete:
+        diagnostic = _stage_diagnostic("source-wrapper input analysis incomplete")
+        diagnostic["toolExecutionNotifications"][0]["properties"]["source_wrapper_refusals"] = incomplete
+        summary_diagnostics.append(diagnostic)
+    if not summaries and summary_diagnostics:
+        document = _stage_findings_to_sarif([], tool_name="raptor-source-wrappers",
+                                            rule_prefix="source-wrapper")
+        return _write_stage_report(Path(out_dir) / "source-wrappers.sarif", document,
+                                   summary_diagnostics), []
+    if not summaries:
+        logger.debug(
+            "source-wrappers: no qualifying wrappers "
+            "(%d files scanned)", scanned)
+        return [], []
+    yaml_text = generate_rules_yaml(summaries)
+    if not yaml_text:
+        return [], []
+    stage_dir = Path(out_dir) / "source-wrappers"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    rules_file = stage_dir / "rules.yaml"
+    rules_file.write_text(yaml_text, encoding="utf-8")
+
+    try:
+        from packages.semgrep.runner import is_available as semgrep_available
+        from packages.semgrep.runner import run_rule as semgrep_run_rule
+    except ImportError:
+        return failed_report("source-wrapper Semgrep runner unavailable")
+    if not semgrep_available():
+        print(
+            "⚠️  source-wrapper stage did not run: semgrep not installed",
+            file=sys.stderr,
+        )
+        return failed_report("source-wrapper Semgrep not installed")
+    try:
+        res = semgrep_run_rule(
+            Path(repo_path), str(rules_file),
+            name="source_wrappers",
+            timeout=RaptorConfig.SEMGREP_PACK_TIMEOUT,
+            env=RaptorConfig.get_safe_env(preserve_proxy=True),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("source-wrappers: run failed: %s", exc)
+        return failed_report("source-wrapper Semgrep invocation failed")
+    execution_diagnostic = _semgrep_stage_diagnostic(res, "source-wrapper")
+    if execution_diagnostic:
+        print("⚠️  source-wrapper stage incomplete; execution diagnostics retained in SARIF", file=sys.stderr)
+    findings = [("wrapper", f.to_dict()) for f in res.findings]
+    sarif_path = Path(out_dir) / "source-wrappers.sarif"
+    doc = _stage_findings_to_sarif(
+        findings,
+        tool_name="raptor-source-wrappers",
+        rule_prefix="source-wrapper",
+        # CWE rides the SARIF rule properties — the recall matcher
+        # never credits CWE-less findings (by doctrine), and the
+        # downstream CWE dispatch keys off it too.
+        cwe_by_suffix={
+            ".xss": "CWE-79",
+            ".trust-boundary": "CWE-501",
+            ".sqli": "CWE-89",
+            ".xpath": "CWE-643",
+        },
+    )
+    paths = _write_stage_report(sarif_path, doc,
+                                [*summary_diagnostics, *([execution_diagnostic] if execution_diagnostic else [])])
+    # The qualified wrapper names are run-scoped learned vocabulary:
+    # the sanitizer-cut post-pass's source locator only knows the
+    # direct servlet getters, so a finding whose taint enters via
+    # scr.getTheParameter(...) has no locatable source without them.
+    wrapper_names = sorted({s.name for s in summaries})
+    save_json(stage_dir / "wrappers.json", {
+        "wrapper_methods": wrapper_names,
+        "provenance": "mechanical-summary",
+    })
+    logger.info(
+        "source-wrappers: %d wrapper(s) projected, %d finding(s); "
+        "SARIF at %s (refusal top: %s)",
+        len(summaries), len(findings), sarif_path,
+        sorted(refusals.items(), key=lambda kv: -kv[1])[:3],
+    )
+    return paths, wrapper_names
+
+
+def _semgrep_source_region(finding: dict, *, repeat_end_line: bool = False) -> dict:
+    """Preserve direct-source spans without inventing an unknown start line."""
+    return sarif_emit.source_region(
+        finding.get("line") or finding.get("start_line"),
+        end_line=finding.get("line_end") or finding.get("end_line"),
+        column=finding.get("column"), end_column=finding.get("column_end"),
+        repeat_end_line=repeat_end_line,
+    )
+
+
+def _stage_findings_to_sarif(
+    findings: list[tuple[str, dict]],
+    *,
+    tool_name: str,
+    rule_prefix: str,
+    cwe_by_suffix: dict[str, str] | None = None,
+) -> dict:
+    """SARIF doc for a generated-rule stage; same shape discipline as
+    the graduated stage (distinct tool name, provenance in ruleId)."""
+    rule_index = sarif_emit.RuleIndex()
+    results: list[dict] = []
+    for rule_id, f in findings:
+        sarif_rule_id = (
+            f.get("rule_id") or f"{rule_prefix}:{rule_id}"
+        )
+        if not str(sarif_rule_id).startswith(rule_prefix):
+            sarif_rule_id = f"{rule_prefix}:{sarif_rule_id}"
+        if sarif_rule_id not in rule_index:
+            rule_props = None
+            for suffix, cwe in (cwe_by_suffix or {}).items():
+                if str(sarif_rule_id).endswith(suffix):
+                    rule_props = {"cwe": cwe}
+                    break
+            rule_index.add(sarif_emit.minimal_rule(
+                sarif_rule_id, properties=rule_props,
+            ))
+        results.append(sarif_emit.result(
+            sarif_rule_id,
+            f.get("message") or f"{rule_prefix} rule matched",
+            [sarif_emit.location(
+                f.get("file") or f.get("path") or "",
+                _semgrep_source_region(f, repeat_end_line=True),
+            )],
+            level=f.get("level") or "warning",
+            properties={"provenance": "mechanical-source-summary"},
+        ))
+    return sarif_emit.document(
+        [sarif_emit.run(
+            tool_name, rule_index.rules(), results,
+            information_uri="https://github.com/anthropics",
+        )],
+        schema_uri=sarif_emit.SCHEMA_URI_SCHEMASTORE,
+    )
+
+
+def _graduated_findings_to_sarif(
+    findings: list[tuple[str, dict]],
+) -> dict:
+    """SARIF 2.1.0 document for graduated-rule findings.
+
+    Distinct ``tool.driver.name`` keeps these a separate run in
+    combined.sarif. Provenance rides the ``ruleId`` itself
+    (``synthesized:<library_rule_id>``) because the downstream SARIF
+    parser (core/sarif/parser.py) keeps rule_id but drops result
+    properties — the precision-feedback loop keys
+    ``RuleLibrary.record_match`` off this prefix. The semgrep-internal
+    rule id (LLM-chosen kebab-case) is preserved in properties for
+    forensics.
+    """
+    rule_index = sarif_emit.RuleIndex()
+    results: list[dict] = []
+    for rule_id, f in findings:
+        sarif_rule_id = f"synthesized:{rule_id}"
+        rule_index.add(sarif_emit.minimal_rule(sarif_rule_id))
+        results.append(sarif_emit.result(
+            sarif_rule_id,
+            f.get("message") or f"graduated rule {rule_id} matched",
+            [sarif_emit.location(
+                f.get("file", ""), _semgrep_source_region(f),
+            )],
+            level=f.get("level") or "warning",
+            properties={
+                "provenance": sarif_rule_id,
+                "semgrep_rule_id": f.get("rule_id", ""),
+            },
+        ))
+    return sarif_emit.document(
+        [sarif_emit.run(
+            _GRADUATED_TOOL_NAME, rule_index.rules(), results,
+            information_uri="https://github.com/anthropics/raptor",
+        )],
+        schema_uri=sarif_emit.SCHEMA_URI_SCHEMATA,
+    )
+
+
+def _sarif_has_findings(sarif_path: Path) -> bool | None:
+    """True/False for readable report results; None when cleanup cannot know.
+
+    A malformed, missing, unsafe, or oversized report is not evidence of
+    zero findings. Refuse links and non-regular files on the opened fd.
     """
     try:
-        data = json.loads(sarif_path.read_text())
-    except Exception:
-        return False
-    for run_obj in data.get("runs", []) or []:
-        if run_obj.get("results"):
-            return True
-    return False
+        data = loads(read_bytes_gated(
+            sarif_path, _MAX_TOOL_JSON_BYTES, follow_symlinks=False,
+        ))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if (not isinstance(data, dict)
+            or data.get("version") not in ("2.1.0", "2.0.0")
+            or not isinstance(data.get("runs"), list)):
+        return None
+    found = False
+    for run in data["runs"]:
+        if not isinstance(run, dict):
+            return None
+        results = run.get("results", [])
+        if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
+            return None
+        found = found or bool(results)
+    return found
 
 
-def cleanup_per_pack_artifacts(out_dir: Path) -> int:
-    """Remove redundant per-pack semgrep files after combined.sarif is written.
+def _pack_exit_code(path: Path) -> int | None:
+    """Read the tiny exit marker with the same bounds for cleanup/provenance."""
+    try:
+        return int(read_bytes_gated(path, 64, follow_symlinks=False).strip())
+    except (OSError, ValueError):
+        return None
 
-    Per-pack files (semgrep_<suffix>.{exit,json,sarif,stderr.log}) are
-    intermediate: combined.sarif is the canonical post-merge artefact, and
-    scan_metrics.json captures the per-run accounting. Keep the minimum
-    needed for post-mortem of failed packs.
 
-    Cleanup rules (per pack):
-      - Always remove: .exit, .json, empty .stderr.log
-      - On exit==0: also remove .sarif
-      - On exit!=0: keep .exit, keep non-empty .stderr.log, keep .sarif if
-        it has findings; delete the .sarif if it is empty/zero-results
-        (still redundant — combined.sarif holds those results too)
+def cleanup_per_pack_artifacts(out_dir: Path, *, merged_inputs=None) -> int:
+    """Remove redundant Semgrep intermediates after a readable merge exists.
 
-    Strict glob (semgrep_*.{exit,json,sarif,stderr.log}) and os.unlink
-    only — never follow symlinks or recurse.
-
-    Returns the number of files removed.
+    When supplied, merged_inputs limits cleanup to reports from this merge.
+    Unknown reports or exit markers retain all their evidence. Successful
+    packs drop JSON/SARIF/exit; failed packs retain exit and SARIF findings.
+    Nonempty stderr always survives. Never recurse or follow symlinks.
     """
+    if _sarif_has_findings(out_dir / "combined.sarif") is None:
+        return 0
+    allowed = (None if merged_inputs is None else
+               {Path(path).absolute() for path in merged_inputs})
+    suffixes = set()
+    try:
+        for ext in (".exit", ".json", ".sarif", ".stderr.log"):
+            for path in out_dir.glob(f"semgrep_*{ext}"):
+                name = path.name[len("semgrep_"):-len(ext)]
+                if name:
+                    suffixes.add(name)
+    except OSError:
+        return 0
+
     removed = 0
-    # Group by suffix using a strict glob set.
-    suffixes: set = set()
-    for ext in (".exit", ".json", ".sarif", ".stderr.log"):
-        for p in out_dir.glob(f"semgrep_*{ext}"):
-            # glob does not follow symlinks for matching, but the resolved
-            # entry might still be one — defend with is_symlink check.
-            if p.is_symlink() or not p.is_file():
-                continue
-            name = p.name[len("semgrep_"):-len(ext)]
-            if name:
-                suffixes.add(name)
 
-    for suffix in suffixes:
-        exit_file = out_dir / f"semgrep_{suffix}.exit"
-        json_file = out_dir / f"semgrep_{suffix}.json"
-        sarif_file = out_dir / f"semgrep_{suffix}.sarif"
-        stderr_file = out_dir / f"semgrep_{suffix}.stderr.log"
-
-        # Read exit code BEFORE any deletion.
-        exit_code: Optional[int]
+    def remove(path, *, empty_only=False):
+        nonlocal removed
         try:
-            exit_code = int(exit_file.read_text().strip())
-        except Exception:
-            exit_code = None
-
-        success = exit_code == 0
-
-        # Always delete: .json (intermediate machine output)
-        for victim in (json_file,):
-            try:
-                if victim.is_file() and not victim.is_symlink():
-                    os.unlink(victim)
-                    removed += 1
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                logger.debug(f"cleanup: could not remove {victim}: {e}")
-
-        # Empty stderr — always delete
-        try:
-            if (stderr_file.is_file() and not stderr_file.is_symlink()
-                    and stderr_file.stat().st_size == 0):
-                os.unlink(stderr_file)
-                removed += 1
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                return False
+            if empty_only and info.st_size:
+                return True
+            path.unlink()
+            removed += 1
         except FileNotFoundError:
-            pass
-        except OSError as e:
-            logger.debug(f"cleanup: could not stat/remove {stderr_file}: {e}")
+            return True
+        except OSError as exc:
+            logger.debug("cleanup: could not remove %s: %s", path, exc)
+            return False
+        return True
 
-        if success:
-            # On success, .exit and .sarif are both redundant (combined.sarif
-            # is canonical and metrics record the success).
-            for victim in (exit_file, sarif_file):
-                try:
-                    if victim.is_file() and not victim.is_symlink():
-                        os.unlink(victim)
-                        removed += 1
-                except FileNotFoundError:
-                    pass
-                except OSError as e:
-                    logger.debug(f"cleanup: could not remove {victim}: {e}")
-        else:
-            # Failed pack: keep .exit. Keep .sarif only if it has findings;
-            # otherwise it is redundant noise (an empty {"runs":[]} stub).
-            if sarif_file.is_file() and not sarif_file.is_symlink():
-                if not _sarif_has_findings(sarif_file):
-                    try:
-                        os.unlink(sarif_file)
-                        removed += 1
-                    except OSError as e:
-                        logger.debug(
-                            f"cleanup: could not remove {sarif_file}: {e}"
-                        )
+    for suffix in sorted(suffixes):
+        exit_file = out_dir / f"semgrep_{suffix}.exit"
+        sarif_file = out_dir / f"semgrep_{suffix}.sarif"
+        if allowed is not None and sarif_file.absolute() not in allowed:
+            continue
+        has_findings = _sarif_has_findings(sarif_file)
+        exit_code = _pack_exit_code(exit_file)
+        if has_findings is None or exit_code is None:
+            continue
+        if not remove(out_dir / f"semgrep_{suffix}.json"):
+            continue
+        if not remove(out_dir / f"semgrep_{suffix}.stderr.log", empty_only=True):
+            continue
+        if exit_code in (0, 1):
+            # Keep the success marker until large intermediates are gone,
+            # otherwise a failed unlink makes future cleanup unknowable.
+            if remove(sarif_file):
+                remove(exit_file)
+        elif has_findings is False:
+            remove(sarif_file)
 
     if removed:
-        logger.info(
-            f"Cleaned up {removed} redundant per-pack scan files in {out_dir}"
-        )
+        logger.info("Cleaned up %s redundant per-pack scan files in %s", removed, out_dir)
     return removed
-
-
-def _count_sarif_results(sarif_data) -> int:
-    """Return the total number of results across runs in a parsed SARIF dict.
-
-    Tolerates malformed shapes — non-dict / non-list members count as zero
-    rather than raising. This is a provenance signal, not a validator.
-    """
-    if not isinstance(sarif_data, dict):
-        return 0
-    total = 0
-    for run_obj in sarif_data.get("runs", []) or []:
-        if not isinstance(run_obj, dict):
-            continue
-        results = run_obj.get("results") or []
-        if isinstance(results, list):
-            total += len(results)
-    return total
 
 
 def _pack_provenance_from_sarif(sarif_path: Path, out_dir: Path) -> dict:
@@ -910,7 +2975,11 @@ def _pack_provenance_from_sarif(sarif_path: Path, out_dir: Path) -> dict:
     Returns a dict with keys:
         tool, name, exit, findings, sarif_sha256, stderr_size_bytes
     Missing-file and parse failures degrade to safe defaults rather
-    than raising — provenance is best-effort.
+    than raising — provenance is best-effort. ``findings`` is null
+    (not 0) when the SARIF is missing, unparseable, or not a SARIF
+    document (no ``runs`` list — a 0-byte file parses to ``{}``): an
+    uncountable pack must stay distinguishable from a clean
+    zero-finding pack in the provenance record.
     """
     p = Path(sarif_path)
     stem = p.stem  # e.g. "semgrep_category_auth" or "codeql_cpp"
@@ -924,30 +2993,49 @@ def _pack_provenance_from_sarif(sarif_path: Path, out_dir: Path) -> dict:
         tool = "unknown"
         name = stem
 
-    # Hash + size + findings — read bytes once.
+    # Hash the exact bounded source bytes, then release them before parsing
+    # its decoded representation. Invalid JSON remains uncountable, not clean.
+    _SARIF_MAX_BYTES = 128 * 1024 * 1024
     try:
-        raw = p.read_bytes()
+        raw = read_bytes_gated(p, _SARIF_MAX_BYTES, follow_symlinks=False)
         sarif_sha256 = sha256_bytes(raw)
+        text = None
         try:
-            data = json.loads(raw.decode("utf-8", errors="replace"))
-        except Exception:
+            text = raw.decode("utf-8", errors="replace")
+            del raw
+            data = json.loads(text)
+        except Exception:  # noqa: BLE001
             data = None
-        findings = _count_sarif_results(data) if data is not None else 0
-    except OSError:
-        # Missing (FileNotFoundError) or unreadable (EACCES, EIO, …)
-        # — best-effort provenance, leave hash empty.
+        finally:
+            del text
+        if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
+            data = None
+        findings = count_results(data) if data is not None else None
+    except (OSError, ValueError):
+        # Missing, unsafe, over-budget or unreadable input is uncountable.
         sarif_sha256 = ""
-        findings = 0
+        findings = None
 
-    # Exit code: only semgrep packs write a .exit file. CodeQL only emits
-    # a SARIF on rc==0 (run_codeql appends only on success), so 0 is
-    # accurate when we can see the SARIF.
+    # Semgrep packs retain a .exit sidecar. Ordinary CodeQL language
+    # reports describe successful analyses; the separate stage diagnostic
+    # carries the unsuccessful agent invocation's exit code.
     if tool == "semgrep":
         exit_file = out_dir / f"{stem}.exit"
-        try:
-            exit_code = int(exit_file.read_text().strip())
-        except (OSError, ValueError):
-            exit_code = -1
+        parsed_exit = _pack_exit_code(exit_file)
+        exit_code = parsed_exit if parsed_exit is not None else -1
+    elif stem == "codeql_stage_diagnostics":
+        exit_code = -1
+        for run in data["runs"] if data is not None else []:
+            if not isinstance(run, dict):
+                continue
+            invocations = run.get("invocations")
+            if not isinstance(invocations, list):
+                continue
+            for invocation in invocations:
+                value = invocation.get("exitCode") if isinstance(invocation, dict) else None
+                if type(value) is int and value != 0:
+                    exit_code = value
+                    break
     else:
         exit_code = 0
 
@@ -981,9 +3069,9 @@ def _compose_verification_manifest(
 
     combined: dict = {"path": combined_sarif.name}
     try:
-        raw = combined_sarif.read_bytes()
-        combined["sha256"] = sha256_bytes(raw)
-        combined["size_bytes"] = len(raw)
+        with open_regular_gated(combined_sarif, follow_symlinks=False) as stream:
+            combined["sha256"] = sha256_fileobj(stream, chunk_size=64 * 1024)
+            combined["size_bytes"] = stream.tell()
     except FileNotFoundError:
         combined["sha256"] = ""
         combined["size_bytes"] = 0
@@ -995,7 +3083,60 @@ def _compose_verification_manifest(
     }
 
 
-def main():
+def _finalize_scan_artifacts(
+    sarif_inputs, merged: Path, out_dir: Path, *, merge_completed: bool,
+) -> None:
+    """Commit provenance before reclaiming this merge's redundant inputs."""
+    provenance_ok = False
+    try:
+        verification = _compose_verification_manifest(sarif_inputs, merged, out_dir)
+        provenance_ok = True
+    except Exception as exc:  # noqa: BLE001 — preserve originals on a hash failure
+        logger.debug("verification manifest compose failed (non-fatal): %s", exc)
+        verification = {
+            "schema_version": 1,
+            "combined_sarif": {"path": merged.name, "sha256": "", "size_bytes": 0},
+            "packs": [],
+        }
+    if not merge_completed:
+        # An older combined.sarif may survive a failed replacement. It is
+        # not the canonical report for THIS scan, even when it parses.
+        verification["combined_sarif"] = {
+            "path": merged.name, "sha256": "", "size_bytes": 0,
+        }
+    save_json(out_dir / "verification.json", verification)
+    if merge_completed and provenance_ok:
+        try:
+            cleanup_per_pack_artifacts(out_dir, merged_inputs=sarif_inputs)
+        except Exception as exc:  # noqa: BLE001 — reclaim remains best-effort
+            logger.debug("Per-pack cleanup failed (non-fatal): %s", exc)
+
+
+def _validate_policy_groups(
+    ap: argparse.ArgumentParser, policy_groups: str,
+) -> None:
+    """Hard-fail (argparse exit 2) on unknown or reserved policy
+    groups, naming the valid ones. ``all`` is always accepted."""
+    groups = [g.strip() for g in policy_groups.split(",") if g.strip()]
+    excluded = {"registry-cache"}
+    try:
+        valid = sorted(
+            p.name for p in RaptorConfig.SEMGREP_RULES_DIR.iterdir()
+            if p.is_dir() and p.name not in excluded
+        )
+    except OSError:
+        # Rules dir unreadable — the scan itself will surface that;
+        # don't turn every invocation into a usage error here.
+        return
+    bad = [g for g in groups if g != "all" and g not in valid]
+    if bad:
+        ap.error(
+            f"unknown policy group(s): {', '.join(sorted(set(bad)))}. "
+            f"Valid groups: all, {', '.join(valid)}"
+        )
+
+
+def main() -> None:
     ap = argparse.ArgumentParser(description="RAPTOR Automated Code Security Agent with parallel scanning")
     ap.add_argument("--repo", required=True, help="Path or Git URL")
     # Argparse accepts BOTH the hyphenated (`--policy-version`,
@@ -1041,6 +3182,101 @@ def main():
              "met; this flag is for the explicit-opt-out case in scripts.",
     )
     ap.add_argument(
+        "--compiler-scan", action="store_true",
+        dest="compiler_scan",
+        help="Run the compiler-analyzer scan channel: gcc -fanalyzer / "
+             "clang --analyze per C/C++ translation unit, diagnostics become "
+             "scan findings alongside Semgrep/CodeQL. Sandboxed, network "
+             "blocked, no build system — no repo code executes. Off by "
+             "default (operator opt-in).",
+    )
+    ap.add_argument(
+        "--no-compiler-scan", action="store_true",
+        dest="no_compiler_scan",
+        help="Explicitly disable the compiler-analyzer scan stage. Takes "
+             "precedence over --compiler-scan; script-friendly opt-out if "
+             "defaults change in future.",
+    )
+    from core.detectors.budget import DEFAULT_COMPILER_SCAN_SECONDS, positive_seconds
+    ap.add_argument(
+        "--compiler-scan-max-seconds", type=positive_seconds, default=None, metavar="SECONDS",
+        help=f"Shared compiler analysis budget (default {DEFAULT_COMPILER_SCAN_SECONDS:g}s). "
+             "Keeps completed findings and reports unfinished coverage. Discovery and cleanup add overhead.",
+    )
+    ap.add_argument(
+        "--compiler-scan-max-tus", type=int, default=None, metavar="N",
+        dest="compiler_scan_max_tus",
+        help="Cap the number of translation units the compiler-analyzer "
+             "scan compiles (default 2000). Skipped TUs are reported "
+             "loudly, never silently truncated.",
+    )
+    ap.add_argument(
+        "--expanded-semgrep", action="store_true",
+        dest="expanded_semgrep",
+        help="Re-run the loaded Semgrep ruleset over fidelity-3 "
+             "preprocessor-expanded views of macro-heavy C/C++ TUs, with "
+             "matches line-mapped back to original coordinates — catches "
+             "sinks hidden behind macros (LIST_FOREACH wrappers, allocator "
+             "macros). Budget-bounded; preprocessing is sandboxed and no "
+             "repo code executes. Off by default (operator opt-in).",
+    )
+    ap.add_argument(
+        "--no-sanitizer-cut-postpass", action="store_true",
+        dest="no_sanitizer_cut_postpass",
+        help="Disable the record-only sanitizer-cut post-pass. By "
+             "default eligible findings (CWE with catalog sanitizers, "
+             "supported language) are evaluated by the value-bound "
+             "gate and suppress/candidate verdicts are recorded to "
+             "suppressions.jsonl as evidence (dropped: false). The "
+             "post-pass never drops or demotes a finding in any mode; "
+             "this flag skips it entirely.",
+    )
+    ap.add_argument(
+        "--no-sanitizer-cut-enforce", action="store_true",
+        dest="no_sanitizer_cut_enforce",
+        help="Run the sanitizer-cut post-pass in record-only mode: "
+             "full-proof suppress verdicts are written as evidence "
+             "(dropped: false) but no finding is removed from the "
+             "combined SARIF. Default is enforcement (corpus-earned, "
+             "operator-approved 2026-08-19; per-tool SARIFs are never "
+             "filtered in any mode).",
+    )
+    ap.add_argument(
+        "--no-config-resolved", action="store_true",
+        dest="no_config_resolved",
+        help="Disable the config-resolved additive findings stage. By "
+             "default Java getInstance-family selector calls whose "
+             "argument resolves through the strict .properties-file "
+             "resolver to a known-weak algorithm emit an additional "
+             "finding (provenance=config-resolved). Detection only — "
+             "the stage never suppresses anything.",
+    )
+    ap.add_argument(
+        "--no-source-wrappers", action="store_true",
+        dest="no_source_wrappers",
+        help="Skip the source-wrapper projection stage (mechanically "
+             "derived Java taint-source rules for helper classes whose "
+             "methods return servlet-request data).",
+    )
+    ap.add_argument(
+        "--no-graduated-rules", action="store_true",
+        dest="no_graduated_rules",
+        help="Disable the graduated synthesized-rules stage. By default "
+             "every scan runs the active project's precision-gated "
+             "graduated rules (engine-rules/semgrep/rules/) as a "
+             "standard stage — each encodes a previously confirmed "
+             "real-bug pattern. Auto-skips silently when no graduated "
+             "rules exist; this flag is the explicit opt-out.",
+    )
+    ap.add_argument(
+        "--graduated-rules-dir", default=None, metavar="DIR",
+        dest="graduated_rules_dir",
+        help="Explicit graduated-rules directory (the semgrep/rules "
+             "subdir of an engine-rules tree). Overrides project-based "
+             "auto-resolution. Path-validated: a directory inside the "
+             "scanned repo is refused.",
+    )
+    ap.add_argument(
         "--languages",
         help="Comma-separated language list for CodeQL (e.g. cpp,java). "
              "Operator-friendly aliases (c, c++, js, ts, c#, kt, py) are "
@@ -1052,25 +3288,154 @@ def main():
         help="Override CodeQL's build command for compiled languages. "
              "Forwarded to packages/codeql/agent.py --build-command.",
     )
+    ap.add_argument(
+        "--traced-build", action="store_true",
+        help="Opt into traced-build C/C++ CodeQL extraction (executes the "
+             "repo's build system — asserts trust in the repo). Default is "
+             "buildless: no repo code runs during database creation. "
+             "Forwarded to packages/codeql/agent.py --traced-build.",
+    )
+    ap.add_argument(
+        "--no-traced-build", action="store_true",
+        help="Force buildless CodeQL extraction for this run, overriding "
+             "--traced-build. Per-run escape hatch.",
+    )
     ap.add_argument("--keep", action="store_true", help="Keep temp working directory")
-    ap.add_argument("--sequential", action="store_true", help="Disable parallel scanning (for debugging)")
+    ap.add_argument("--sequential", action="store_true", help="Fully serial run: semgrep packs one at a time AND stages in order (no semgrep/codeql overlap). Debugging knob.")
     ap.add_argument("--out", default=None, help="Output directory (from lifecycle). Overrides auto-generated path.")
+    ap.add_argument(
+        "--project", default=None, metavar="NAME",
+        help="Pin this run to the named project (precedence over the "
+             "session binding and the last-activated default). '-' = "
+             "explicitly projectless. Invalid values are a hard error, "
+             "never a fallback.",
+    )
+    ap.add_argument(
+        "--exclude-dir", action="append", default=None, metavar="GLOB",
+        dest="exclude_dir",
+        help=(
+            "Drop SARIF results whose file URI matches GLOB. Repeatable "
+            "(OR semantics). Applied post-merge to the combined.sarif + "
+            "scan_metrics; individual per-tool SARIFs stay unfiltered as "
+            "forensic record of what each tool actually emitted. Operator "
+            "escape hatch for vendored / test / generated paths. Example: "
+            "``--exclude-dir 'vendor/*' --exclude-dir '**/tests/*'``"
+        ),
+    )
+    ap.add_argument(
+        "--extra-config", action="append", default=None, metavar="PATH",
+        dest="extra_config",
+        help=(
+            "Additional semgrep rule source — a YAML rule file or a directory "
+            "of rules. Each value becomes a peer scan alongside the registry "
+            "packs (its own SARIF, merged into combined results). Repeatable. "
+            "Path must exist at parse time. RAPTOR never picks up ambient "
+            "``~/.semgrep/rules`` from the operator's HOME (sandbox stays "
+            "hermetic + reproducible across machines); this flag is the "
+            "explicit opt-in channel for custom rules. Example: "
+            "``--extra-config ./my-rules.yml --extra-config /etc/sec/policy/``"
+        ),
+    )
+
+    ap.add_argument(
+        "--show-suppressed", action="store_true",
+        dest="show_suppressed",
+        help="Include nosemgrep-suppressed findings in the output summary. "
+             "The SARIF always contains all findings regardless of this flag; "
+             "it only controls the presentation layer.",
+    )
 
     from core.sandbox import add_cli_args, apply_cli_args
     add_cli_args(ap)
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(ap)
     args = ap.parse_args()
+    report_options = options_from_args(args, ap)
     apply_cli_args(args, parser=ap)
 
+    # Also cover direct scanner/agentic workers that bypass raptor.py. Refuse
+    # before cloning, allocating scan output, tool probes or scanner children.
+    from core.sandbox.preflight import preflight_scan_cli
+    preflight_scan_cli(sys.argv[1:])
+
+    # Orphan containment: when the spawner opted this scanner in
+    # (raptor_agentic pairs the env var with start_new_session), a
+    # dead parent takes this whole process group down — pre-fix a
+    # SIGKILLed orchestrator left the scanner sleeping in its stage
+    # pool with blocked semgrep children forever. Armed before any
+    # scan work so the whole run is covered; direct operator
+    # invocations (no env var) are untouched.
+    maybe_start_orphan_watchdog("static-analysis-scanner")
+
+    if args.project is not None:
+        from core.run.pin import set_process_project
+        set_process_project(args.project)
+    if args.out:
+        # Child of a run: adopt the owning run's pin as the process
+        # override so every ambient consumer follows it. Runs even
+        # when --project was given — bootstrap then enforces the
+        # argv-vs-pin agreement (hard error on a split) and seals the
+        # freeze cache so this process stops re-reading the disk
+        # marker for its lifetime.
+        from core.run.pin import bootstrap_process_pin
+        bootstrap_process_pin(args.out)
+
+    # Project sandbox-floor consent: workers re-read the on-disk
+    # setting at their own run start (the run-pin bootstrap above
+    # resolves the owning project) — the per-run --sandbox-floor
+    # flag, forwarded on this worker's command line by the /agentic
+    # passthrough, wins in both directions at floor resolution.
+    from core.project.trust import apply_project_sandbox_floor
+    apply_project_sandbox_floor(args)
+
+    # Unknown policy groups are an argparse-level HARD error. Pre-fix
+    # they only logged a warning mid-scan — an operator copying a bad
+    # example (`--policy-groups injction`) got a scan that silently
+    # ran without the intended rules and never found out. Fail fast,
+    # before any clone / output-dir work, listing the valid groups.
+    _validate_policy_groups(ap, args.policy_groups)
+
+    # Explicit negative beats positive (per-run escape hatch; project
+    # trust-marker consumption lives in the /agentic and /codeql entry
+    # points which resolve markers before forwarding --traced-build).
+    if getattr(args, "no_traced_build", False):
+        args.traced_build = False
+
+    # Validate --extra-config paths upfront. Fail-loud on bad input so the
+    # operator finds out before a 30-minute scan has burnt its budget. The
+    # resolved absolute path replaces the operator-supplied string so the
+    # downstream semgrep invocation gets a stable, ambient-CWD-free
+    # reference. Dedup by resolved path — passing the same rule file twice
+    # (often a copy-paste mistake on the command line) silently doubled
+    # the pack count + double-counted findings in pre-dedup runs.
+    if args.extra_config:
+        _resolved_extra: list[str] = []
+        _seen: set = set()
+        for raw in args.extra_config:
+            p = Path(raw).expanduser()
+            if not p.exists():
+                ap.error(f"--extra-config: path does not exist: {raw}")
+            resolved = str(p.resolve())
+            if resolved in _seen:
+                logger.warning(
+                    "--extra-config: duplicate path on CLI dropped: %s",
+                    raw,
+                )
+                continue
+            _seen.add(resolved)
+            _resolved_extra.append(resolved)
+        args.extra_config = _resolved_extra
+
     start_time = time.time()
-    tmp = Path(tempfile.mkdtemp(prefix="raptor_auto_"))
     repo_path = None
+    with scratch_dir("raptor_auto_", keep=args.keep) as tmp:
+        if args.keep:
+            logger.info("Keeping scanner scratch at %s", tmp)
+        logger.info("Starting automated code security scan")
+        logger.info("Repository: %s", args.repo)
+        logger.info("Policy version: %s", args.policy_version)
+        logger.info("Policy groups: %s", args.policy_groups)
 
-    logger.info(f"Starting automated code security scan")
-    logger.info(f"Repository: {args.repo}")
-    logger.info(f"Policy version: {args.policy_version}")
-    logger.info(f"Policy groups: {args.policy_groups}")
-
-    try:
         # Acquire repository
         if args.repo.startswith(("http://", "https://", "git@")):
             repo_path = tmp / "repo"
@@ -1078,7 +3443,8 @@ def main():
         else:
             repo_path = Path(args.repo).resolve()
             if not repo_path.exists():
-                raise RuntimeError(f"repository path does not exist: {repo_path}")
+                msg = f"repository path does not exist: {repo_path}"
+                raise RuntimeError(msg)
 
         # Determine local rule directories
         groups = [g.strip() for g in args.policy_groups.split(",") if g.strip()]
@@ -1093,17 +3459,24 @@ def main():
             valid, unknown = [], []
             for g in groups:
                 p = rules_base / g
+                rule_file = RaptorConfig.POLICY_GROUP_RULE_FILES.get(g)
                 if g in _EXCLUDED_RULE_DIRS:
-                    logger.warning(f"Policy group '{g}' is reserved and cannot be used directly")
+                    logger.warning("Policy group '%s' is reserved and cannot be used directly", g)
                 elif p.is_dir():
                     valid.append(str(p))
+                elif rule_file is not None and rule_file.is_file():
+                    # Single-file group (e.g. ssrf → sinks/ssrf.yaml) —
+                    # the rules live inside another group's directory.
+                    valid.append(str(rule_file))
                 else:
                     unknown.append(g)
             if unknown:
-                logger.warning(f"Unknown policy groups (no rule directory found): {', '.join(unknown)}")
+                logger.warning(
+                    "Unknown policy groups (no rule directory found): %s", ', '.join(unknown)
+                )
             rules_dirs = valid
 
-        logger.info(f"Using {len(rules_dirs)} rule directories")
+        logger.info("Using %d rule directories", len(rules_dirs))
 
         # Output directory: use --out if provided (lifecycle), otherwise generate
         if args.out:
@@ -1142,21 +3515,193 @@ def main():
         }
         save_json(out_dir / "scan-manifest.json", manifest)
 
-        # Semgrep stage - Use parallel scanning by default
+        # Semgrep stage - Use parallel scanning by default. Resolve
+        # the baseline pack set via the target-type catalog (QoL
+        # #7-7b: per-target tuning) — catalog entry for the matched
+        # target type provides ``semgrep_packs.default``; falls back
+        # to the hardcoded RaptorConfig.BASELINE_SEMGREP_PACKS when
+        # no catalog match. Surface the resolved set + source so the
+        # operator sees WHY a particular pack list ran.
+        resolved_baseline = _resolve_baseline_packs(repo_path)
+        if list(resolved_baseline) != list(RaptorConfig.BASELINE_SEMGREP_PACKS):
+            try:
+                from core.run.target_types import load as _load_tt
+                _tt = _load_tt(repo_path)
+                _tt_name = _tt.name if _tt else "unknown"
+            except Exception:  # noqa: BLE001
+                _tt_name = "unknown"
+            _names = [n for n, _ in resolved_baseline]
+            logger.info("Semgrep baseline packs for target type '%s': %s", _tt_name, _names)
+        # Per-pack language applicability (QoL #16a). Tells the
+        # operator how many rules in each baseline pack actually
+        # match the target's language(s) — without this they read
+        # ``6 rule-group(s)`` and assume thousands of rules
+        # apply, when the upstream registry coverage for their
+        # language may be much thinner. Silent on no-target-lang
+        # or no-cached-pack-data (we won't fabricate a count).
+        _target_langs = _target_semgrep_languages(repo_path)
+        _applicability = _format_pack_applicability(
+            list(resolved_baseline), _target_langs,
+        )
+        if _applicability:
+            logger.info(_applicability)
+            # Escalation hint when applicability is thin —
+            # surface the alternative paths now so the operator
+            # doesn't think the framework's silent under-scan IS
+            # the verdict on the target. Omit when --codeql is
+            # already running (would suggest something happening).
+            if _is_coverage_thin(
+                list(resolved_baseline), _target_langs,
+            ):
+                _codeql_running = (
+                    args.codeql and not args.no_codeql
+                )
+                logger.info(_format_thin_coverage_hint(
+                    _target_langs, _codeql_running,
+                    llm_configured=_llm_configured(),
+                ))
         logger.info("Starting Semgrep scans...")
-        if args.sequential:
-            # Fallback to sequential for debugging
-            logger.warning("Sequential scanning enabled (slower)")
-            semgrep_sarifs = semgrep_scan_sequential(repo_path, rules_dirs, out_dir)
-        else:
-            semgrep_sarifs = semgrep_scan_parallel(repo_path, rules_dirs, out_dir)
+        # CodeQL stage overlap: the two heavyweight stages are
+        # independent SARIF producers, and the CodeQL DB build is
+        # usually the critical path — start it before the Semgrep
+        # packs so both run concurrently. --sequential keeps the
+        # fully serial order (debugging knob for both kinds of
+        # parallelism). Each stage's internal parallelism already
+        # shares the host (per-pack --jobs / per-build -j division);
+        # the transient 2:1 overlap is deliberate — the DB build's
+        # extractor phases are I/O-heavy while Semgrep is CPU-bound,
+        # and a hard split would idle cores for whichever stage
+        # finishes first.
+        run_codeql_stage = args.codeql and not args.no_codeql
+        _codeql_future = None
+        _codeql_pool = None
+        _codeql_t0 = 0.0
+        _stage_tag = _CodeQLStageTag()
+        if run_codeql_stage and not args.sequential:
+            _langs_arg = (
+                [x.strip() for x in args.languages.split(",") if x.strip()]
+                if args.languages else None  # None ⇒ agent auto-detects
+            )
+            print("⏱  Semgrep and CodeQL stages running concurrently "
+                  "(CodeQL lines tagged [codeql])", flush=True)
+            # Attach to the 'raptor' logger, not the root logger:
+            # get_logger() records are created on 'raptor' (which has
+            # propagate=False), and logger-level filters are only
+            # consulted on the logger a record is logged to — a
+            # root-logger filter never saw these records and the
+            # promised [codeql] tag was never applied.
+            logging.getLogger("raptor").addFilter(_stage_tag)
+            _codeql_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="codeql-stage")
+            _codeql_t0 = time.time()
+            _codeql_stage_handle = _CodeQLStageHandle()
+            _codeql_future = _codeql_pool.submit(
+                run_codeql, repo_path, out_dir,
+                languages=_langs_arg,
+                build_command=args.build_command,
+                traced_build=args.traced_build,
+                stage_handle=_codeql_stage_handle,
+            )
+
+        def _abort_codeql_stage() -> None:
+            # An exception between submit and join (semgrep's fail-loud
+            # SandboxSetupError, KeyboardInterrupt) used to propagate
+            # to sys.exit while concurrent.futures' shutdown hook
+            # JOINED the non-daemon worker — "scan aborted" then hung
+            # up to 1h on the agent's 3600s communicate. Kill the
+            # agent's process group so the join returns promptly.
+            if _codeql_pool is None:
+                return
+            _codeql_stage_handle.abort()
+            _codeql_pool.shutdown(wait=False, cancel_futures=True)
+            logging.getLogger("raptor").removeFilter(_stage_tag)
+
+        try:
+            if args.sequential:
+                # Fallback to sequential for debugging
+                logger.warning("Sequential scanning enabled (slower)")
+                semgrep_sarifs, semgrep_failed = semgrep_scan_sequential(
+                    repo_path, rules_dirs, out_dir,
+                    baseline_packs=resolved_baseline,
+                    extra_configs=args.extra_config,
+                )
+            else:
+                semgrep_sarifs, semgrep_failed = semgrep_scan_parallel(
+                    repo_path, rules_dirs, out_dir,
+                    baseline_packs=resolved_baseline,
+                    extra_configs=args.extra_config,
+                )
+        except BaseException:
+            _abort_codeql_stage()
+            raise
+
+        # Surface failed-pack count on stderr — at scan-level so the
+        # operator sees it without trawling the run's log file. The
+        # logger.warning inside semgrep_scan_parallel writes to the
+        # configured log handler (DEBUG/INFO level depending on -v);
+        # the stderr line below is unconditional and operator-facing.
+        if semgrep_failed:
+            print(
+                f"⚠️  semgrep: {len(semgrep_failed)} pack(s) failed or "
+                f"produced no SARIF: {', '.join(semgrep_failed)}",
+                file=sys.stderr,
+            )
+
+        # CI-gate signal — "every dispatched semgrep pack failed" means
+        # the scan produced no useful output. Pre-fix this exited 0
+        # regardless: an operator running ``raptor scan`` as a pre-merge
+        # gate on a broken sandbox would silently false-pass with "0
+        # findings". Detect at the dispatch boundary (sarif_paths has
+        # one entry per dispatched pack — success or fail; failed_scans
+        # is the failure subset). When the two lengths match and packs
+        # were attempted, surface as a distinct exit code at the final
+        # sys.exit below. The reserved SANDBOX_ENGAGE_EXIT_CODE stays
+        # for the actual sandbox-engagement-failure path (raised as
+        # SandboxSetupError); ``4`` is the all-packs-failed signal.
+        all_semgrep_failed = (
+            len(semgrep_sarifs) > 0
+            and len(semgrep_failed) == len(semgrep_sarifs)
+        )
+        if all_semgrep_failed:
+            print(
+                f"\nRAPTOR: scan produced no useful semgrep output — "
+                f"all {len(semgrep_sarifs)} dispatched pack(s) failed. "
+                f"Exiting 4 (CI-gate signal — distinct from "
+                f"sandbox-engagement-failure exit "
+                f"{SANDBOX_ENGAGE_EXIT_CODE}).",
+                file=sys.stderr,
+            )
 
         # CodeQL stage (optional). --no-codeql takes precedence —
         # script-friendly so a default-flip from "off" to "on" can
-        # be opted out of without code changes.
+        # be opted out of without code changes. When the stage was
+        # started concurrently above, join it here; the merge below
+        # needs its SARIFs either way.
         codeql_sarifs = []
-        run_codeql_stage = args.codeql and not args.no_codeql
-        if run_codeql_stage:
+        if _codeql_future is not None:
+            try:
+                # _join_codeql_stage keeps stage isolation (an
+                # ordinary CodeQL failure demotes to a warning) but
+                # runs the abort discipline on KeyboardInterrupt —
+                # the join is the run's single longest wait once
+                # semgrep finishes, so the most common operator
+                # Ctrl-C landed exactly here, skipped the guarded
+                # semgrep region above, and wedged interpreter
+                # shutdown on the worker's 3600s communicate.
+                codeql_sarifs = _join_codeql_stage(
+                    _codeql_future, _abort_codeql_stage,
+                )
+            finally:
+                # No-ops after an abort (idempotent shutdown; filter
+                # removal tolerates absence). Symmetric with the
+                # addFilter above (raptor logger).
+                assert _codeql_pool is not None
+                _codeql_pool.shutdown(wait=False)
+                logging.getLogger("raptor").removeFilter(_stage_tag)
+            print(f"⏱  CodeQL stage finished "
+                  f"({time.time() - _codeql_t0:.0f}s, "
+                  f"{len(codeql_sarifs)} SARIF file(s))", flush=True)
+        elif run_codeql_stage:
             languages = (
                 [s.strip() for s in args.languages.split(",") if s.strip()]
                 if args.languages else None  # None ⇒ agent auto-detects
@@ -1165,7 +3710,12 @@ def main():
                 repo_path, out_dir,
                 languages=languages,
                 build_command=args.build_command,
+                traced_build=args.traced_build,
             )
+
+        python_sql_sarifs, python_sql_summary = run_python_sql_stage(
+            repo_path, out_dir, [*rules_dirs, *(args.extra_config or [])], semgrep_sarifs,
+        )
 
         # Coccinelle stage. Default-on for C/C++ targets; auto-skips
         # silently when spatch is absent or the repo has no C/C++
@@ -1174,113 +3724,512 @@ def main():
         # the shipped rule set is small and AST-level matching is
         # fast — but the opt-out exists for unattended pipelines
         # where any extra signal is noise.
+        current_coverage_records: list[dict[str, Any]] = []
         cocci_sarifs = []
         if not args.no_cocci:
-            cocci_sarifs = run_cocci(repo_path, out_dir)
+            cocci_sarifs = run_cocci(repo_path, out_dir, on_coverage=current_coverage_records.append)
+
+        # Compiler-analyzer stage (opt-in). Same channel as /audit's
+        # compiler_sweep, opposite direction — per-TU gcc -fanalyzer /
+        # clang --analyze diagnostics become scan findings. --no wins
+        # over --on, mirroring the codeql flag pair.
+        from core.detectors.setup import AnalysisSetup, PreparedViews
+        analysis_setup = AnalysisSetup()
+        if args.compiler_scan and not args.no_compiler_scan and args.expanded_semgrep:
+            analysis_setup.preprocessed_views = PreparedViews()
+        compiler_sarifs = []
+        if args.compiler_scan and not args.no_compiler_scan:
+            compiler_sarifs = run_compiler_scan_stage(
+                repo_path, out_dir, max_tus=args.compiler_scan_max_tus,
+                setup=analysis_setup, max_seconds=args.compiler_scan_max_seconds,
+            )
+
+        # Expanded-view semgrep stage (opt-in). Re-runs the resolved
+        # ruleset over fidelity-3 expanded views of macro-heavy TUs;
+        # findings land at original coordinates with an expanded_view
+        # marker under the distinct semgrep-expanded tool name.
+        expanded_sarifs = []
+        if args.expanded_semgrep:
+            expanded_sarifs = run_expanded_semgrep_stage(
+                repo_path, out_dir, rules_dirs, list(resolved_baseline),
+                extra_configs=args.extra_config,
+                setup=analysis_setup,
+            )
+
+        # Graduated synthesized rules (default-on, opt-out). Every
+        # past confirmed bug pattern that graduated from the rule
+        # library re-fires as a standing zero-LLM-cost detector, with
+        # provenance synthesized:<id> per result. Auto-skips silently
+        # when the project has no graduated rules.
+        graduated_sarifs = []
+        if not args.no_graduated_rules:
+            graduated_sarifs = run_graduated_rules_stage(
+                repo_path, out_dir,
+                rules_dir=(
+                    Path(args.graduated_rules_dir)
+                    if args.graduated_rules_dir else None
+                ),
+            )
+
+        # Source-wrapper projection (default-on, opt-out): helper
+        # methods that provably return servlet-request data become
+        # additional taint sources for the in-repo java sink profiles.
+        source_wrapper_sarifs: list[str] = []
+        source_wrapper_names: list[str] = []
+        if not args.no_source_wrappers:
+            source_wrapper_sarifs, source_wrapper_names = (
+                run_source_wrapper_stage(repo_path, out_dir)
+            )
+
+        # Config-resolved additive findings (default-on, opt-out):
+        # weak algorithms selected via bundled .properties files are
+        # invisible to pattern detectors — the strict resolver proves
+        # the file value and emits provenance=config-resolved findings
+        # as a separate SARIF run. Detection only; never suppresses.
+        config_resolved_sarifs = []
+        config_resolved_stats = None
+        if (
+            RaptorConfig.CONFIG_RESOLVED_ENABLED
+            and not args.no_config_resolved
+        ):
+            try:
+                from core.analysis.config_resolved_findings import (
+                    run_config_resolved_stage,
+                )
+                _cr_sarif, config_resolved_stats = (
+                    run_config_resolved_stage(repo_path, out_dir)
+                )
+                if _cr_sarif is not None:
+                    config_resolved_sarifs = [_cr_sarif]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("config-resolved stage failed: %s", e)
+                config_resolved_stats = {"stage_error": 1}
 
         # Merge SARIFs if more than one
-        sarif_inputs = semgrep_sarifs + codeql_sarifs + cocci_sarifs
+        sarif_inputs = (
+            semgrep_sarifs + codeql_sarifs + cocci_sarifs
+            + compiler_sarifs + expanded_sarifs + graduated_sarifs
+            + config_resolved_sarifs + source_wrapper_sarifs + python_sql_sarifs
+        )
         merged = out_dir / "combined.sarif"
+        merge_completed = False
+        exclude_globs = args.exclude_dir
+        excluded_count = 0
         if sarif_inputs:
-            logger.info(f"Merging {len(sarif_inputs)} SARIF files...")
+            logger.info("Merging %d SARIF files...", len(sarif_inputs))
             try:
                 merged_data = merge_sarif([str(p) for p in sarif_inputs])
-                save_json(merged, merged_data)
-                logger.info(f"Merged SARIF created: {merged}")
-            except Exception as e:
-                logger.warning(f"SARIF merge failed, using individual files: {e}")
-                (out_dir / "sarif_merge.stderr.log").write_text(str(e))
+                # Operator --exclude-dir: post-merge filter so
+                # combined.sarif + downstream metrics see only the
+                # non-excluded set. Per-tool SARIFs stay unfiltered
+                # (forensic record of what each tool emitted).
+                merged_data, excluded_count = filter_sarif_by_exclude_globs(
+                    merged_data, exclude_globs, _copy_input=False,
+                )
+                if excluded_count:
+                    logger.info(
+                        "--exclude-dir dropped %s results from combined.sarif (%s)",
+                        excluded_count,
+                        exclude_globs
+                    )
+                # Annotate SARIF results whose source lines carry
+                # nosemgrep inline-suppression comments.  The annotation
+                # lives in result.properties.nosemgrep so any downstream
+                # consumer (/validate, external SARIF viewers) can see
+                # that a finding was developer-suppressed.
+                semgrep_pkg.annotate_sarif(
+                    merged_data, str(repo_path),
+                )
+                save_json(merged, merged_data, stream=True)
+                merge_completed = True
+                logger.info("Merged SARIF created: %s", merged)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("SARIF merge failed, using individual files: %s", e)
+                try:
+                    (out_dir / "sarif_merge.stderr.log").write_text(str(e), encoding="utf-8")
+                except OSError:
+                    logger.warning("Could not persist SARIF merge diagnostic; using individual files")
 
-        # Generate metrics
+        # Sanitizer-cut post-pass: value-bound gate verdicts land in
+        # suppressions.jsonl. Candidate verdicts are always evidence
+        # (dropped: false); full-proof suppress verdicts ENFORCE by
+        # default (corpus-earned, operator-approved 2026-08-19) — their
+        # findings are filtered from the combined SARIF below, while
+        # per-tool SARIFs stay unfiltered as the forensic record.
+        # Enforcement only runs when the combined SARIF exists (the
+        # per-tool fallback has no drop surface, so it stays
+        # record-only). Reads the filtered combined SARIF when it
+        # exists so --exclude-dir is honored. Failure degrades to a
+        # warning — the post-pass can never fail a scan.
+        sanitizer_cut_postpass_stats = None
+        if (
+            RaptorConfig.SANITIZER_CUT_POSTPASS_ENABLED
+            and not args.no_sanitizer_cut_postpass
+            and sarif_inputs
+        ):
+            try:
+                from core.analysis.sanitizer_cut_postpass import (
+                    filter_enforced_from_sarif,
+                    run_postpass,
+                )
+                merged_exists = merge_completed
+                postpass_inputs = (
+                    [merged] if merged_exists else [Path(path) for path in sarif_inputs]
+                )
+                enforce_on = (
+                    RaptorConfig.SANITIZER_CUT_ENFORCE_ENABLED
+                    and not args.no_sanitizer_cut_enforce
+                    and merged_exists
+                )
+                sanitizer_cut_postpass_stats = run_postpass(
+                    postpass_inputs, repo_path, out_dir,
+                    extra_source_patterns=source_wrapper_names,
+                    enforce=enforce_on,
+                )
+                enforced = (
+                    (sanitizer_cut_postpass_stats or {})
+                    .get("enforced_findings") or []
+                )
+                if enforce_on and enforced:
+                    removed = filter_enforced_from_sarif(merged, enforced)
+                    sanitizer_cut_postpass_stats["enforced_removed"] = removed
+                    if removed != len(enforced):
+                        logger.warning(
+                            "sanitizer-cut enforcement: %d verdicts enforced "
+                            "but %d results removed from the combined SARIF "
+                            "— identities that matched no result stayed "
+                            "recorded (dropped: true) without a drop; "
+                            "investigate before trusting this run's counts",
+                            len(enforced), removed,
+                        )
+                    else:
+                        logger.info(
+                            "sanitizer-cut enforcement: %d proven-safe "
+                            "finding(s) removed from the combined SARIF "
+                            "(per-tool SARIFs unfiltered; records in "
+                            "suppressions.jsonl)", removed,
+                        )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("sanitizer-cut post-pass failed: %s", e)
+
+        # Findings follow the committed combined report, including merge
+        # deduplication, exclusions and enforced suppression drops. Keep
+        # original artifact tables for fallback file counts: the merger can
+        # discard those tables, and canonical coverage records below may
+        # replace the fallback with the union of files actually examined.
         logger.info("Generating scan metrics...")
-        metrics = generate_scan_metrics(sarif_inputs)
-        save_json(out_dir / "scan_metrics.json", metrics)
+        codeql_coverage = None
+        codeql_report_paths = {Path(path) for path in codeql_sarifs}
+        if codeql_report_paths:
+            from core.coverage.record import CodeQLCoverageAccumulator
+            codeql_coverage = CodeQLCoverageAccumulator(repo_path)
 
-        logger.info(f"Scan complete: {metrics['total_findings']} findings in {metrics['total_files_scanned']} files")
+        def collect_codeql_coverage(path, data):
+            if codeql_coverage is not None and Path(path) in codeql_report_paths:
+                codeql_coverage.add_report(data)
+
+        metric_options: _ScanMetricKwargs = {"on_source_report": collect_codeql_coverage} if codeql_coverage is not None else {}
+        metric_paths = [str(path) for path in sarif_inputs]
+        if merge_completed:
+            metrics = generate_scan_metrics([str(merged)], file_count_paths=metric_paths, **metric_options)
+        else:
+            metrics = generate_scan_metrics(metric_paths, **metric_options)
+        # Record per-engine failure surfaces so downstream readers
+        # can distinguish a clean run from one where N packs silently
+        # dropped. Empty list is intentional (positive marker — "we
+        # tracked this, nothing failed") rather than absent-key
+        # (couldn't-be-bothered).
+        metrics["semgrep_failed_packs"] = semgrep_failed
+        # Registry packs the reachability probe dropped before dispatch
+        # (see _drop_unreachable_registry_packs) — distinct from
+        # semgrep_failed_packs, which records packs that DISPATCHED and
+        # then failed. Empty list means every requested pack ran.
+        metrics["dropped_registry_packs"] = sorted(_dropped_registry_packs)
+        # Count only annotations still present in the report selected for
+        # metrics: sanitizer enforcement may have removed annotated results.
+        nosemgrep_count = metrics["nosemgrep_suppressed_count"]
+        # Record-only post-pass stats (None when disabled or no SARIFs)
+        # — verdict counts, refusal reasons, budget skips. The verdicts
+        # themselves live in suppressions.jsonl.
+        metrics["sanitizer_cut_postpass"] = sanitizer_cut_postpass_stats
+        # Additive config-resolved stage stats (None when disabled) —
+        # files scanned, emissions, per-refusal resolver counts.
+        metrics["config_resolved"] = config_resolved_stats
+        if config_resolved_stats and config_resolved_stats.get("stage_error"):
+            metrics.setdefault("tool_execution_failures", {})["raptor-config-resolved"] = (
+                config_resolved_stats["stage_error"]
+            )
+        metrics["show_suppressed"] = getattr(args, "show_suppressed", False)
+        metrics["sarif_merge_failed"] = bool(sarif_inputs and not merge_completed)
+        metrics["codeql_no_output"] = bool(run_codeql_stage and not any(
+            Path(path).name != "codeql_stage_diagnostics.sarif" for path in codeql_sarifs
+        ))
+        metrics["semgrep_dropped_files"] = 0
+        metrics["analysis_gaps"] = {}
+        metrics["semgrep_metadata_errors"] = 0
+        metrics["semgrep_partial_files"] = 0
+        metrics["semgrep_skipped_rules"] = 0
 
         # Write coverage records and derive total_files_scanned from them
         try:
             from core.coverage.record import (
-                build_from_semgrep, build_from_codeql, write_record, load_records,
+                read_semgrep_outputs,
+                write_record,
             )
-            # Semgrep coverage — find JSON outputs alongside SARIFs
-            for sarif_path in semgrep_sarifs:
-                json_path = Path(sarif_path).with_suffix(".json")
-                if json_path.exists():
-                    record = build_from_semgrep(
-                        out_dir, json_path,
-                        rules_applied=groups if groups else [str(Path(r).name) for r in rules_dirs],
-                    )
-                    if record:
-                        write_record(out_dir, record, tool_name="semgrep")
-                        break  # one record covers all (paths.scanned is cumulative)
+            def persist_current_coverage(record, tool):
+                current_coverage_records.append(record)
+                try:
+                    write_record(out_dir, record, tool_name=tool)
+                except Exception:
+                    logger.debug("%s: coverage record write failed", tool, exc_info=True)
 
-            # CodeQL coverage — from SARIF artifacts
-            for sarif_path in codeql_sarifs:
-                record = build_from_codeql(Path(sarif_path))
+            # Semgrep coverage — find JSON outputs alongside SARIFs.
+            # See ``_resolve_rules_applied`` for why this isn't just
+            # ``groups`` or rule-dir names.
+            _rules_applied = _resolve_rules_applied(
+                groups, resolved_baseline, rules_dirs,
+            )
+            _all_semgrep_jsons = [
+                Path(sp).with_suffix(".json") for sp in semgrep_sarifs
+            ]
+            # Degradation visibility: a file dropped by rule timeouts /
+            # memory caps was NOT analysed even though the pack
+            # "succeeded" — silent coverage loss unless said out loud.
+            semgrep_summary = python_sql_summary or read_semgrep_outputs(
+                _all_semgrep_jsons, rules_applied=_rules_applied,
+            )
+            if semgrep_summary.record and _rules_applied:
+                semgrep_summary.record["rules_applied"] = _rules_applied
+            metrics["semgrep_skipped_rules"] = semgrep_summary.skipped_rules
+            if semgrep_summary.skipped_rules:
+                print(f"⚠️  semgrep: {semgrep_summary.skipped_rules} incompatible-rule notice(s); "
+                      "compatible rules continued, but coverage is incomplete", file=sys.stderr)
+            metrics["semgrep_metadata_errors"] = semgrep_summary.input_errors
+            if semgrep_summary.input_errors:
+                print(f"⚠️  semgrep: {semgrep_summary.input_errors} metadata output(s) unreadable or malformed; "
+                      "coverage is incomplete", file=sys.stderr)
+            _dropped = semgrep_summary.dropped_files
+            failed_files = {failure["path"] for failure in semgrep_summary.files_failed}
+            metrics["semgrep_partial_files"] = len(failed_files)
+            partial_only = failed_files - _dropped.keys()
+            if partial_only:
+                print(f"⚠️  semgrep: {len(partial_only)} file(s) have incomplete analysis or parser errors; "
+                      "details in the per-pack JSON metadata", file=sys.stderr)
+            if _dropped:
+                metrics["semgrep_dropped_files"] = len(_dropped)
+                # Dropped-file paths come from the semgrep error JSON
+                # over the (hostile) target tree — escape before the
+                # operator's stderr.
+                from core.security.log_sanitisation import (
+                    sanitise_for_terminal,
+                )
+                _preview = sanitise_for_terminal(
+                    ", ".join(list(_dropped)[:5]), max_len=400)
+                _more = len(_dropped) - min(5, len(_dropped))
+                print(
+                    f"⚠️  semgrep: {len(_dropped)} file(s) dropped by "
+                    f"rule timeouts/memory caps — NOT analysed: "
+                    f"{_preview}"
+                    + (f" (+{_more} more)" if _more else "")
+                    + ". Full list in coverage-record files_failed.",
+                    file=sys.stderr,
+                )
+            # Scope visibility: what the scan deliberately or
+            # incidentally never examined, said out loud once per run.
+            # Reason NAMES only on this line (bounded, escaped) —
+            # skipped paths are target-chosen strings and stay in the
+            # per-pack JSONs.
+            _skipped_by_reason = semgrep_summary.skipped_paths
+            if _skipped_by_reason:
+                from core.security.log_sanitisation import (
+                    sanitise_for_terminal,
+                )
+                _ordered = sorted(
+                    _skipped_by_reason.items(),
+                    key=lambda kv: (-kv[1], kv[0]),
+                )
+                _shown = sanitise_for_terminal(
+                    ", ".join(f"{r}={n}" for r, n in _ordered[:6]),
+                    max_len=400,
+                )
+                _rest = len(_ordered) - min(6, len(_ordered))
+                _n_skipped = sum(_skipped_by_reason.values())
+                print(
+                    f"semgrep: {_n_skipped} path(s) skipped, not "
+                    f"scanned — {_shown}"
+                    + (f" (+{_rest} more reason(s))" if _rest else "")
+                    + ". Paths in semgrep_<pack>.json paths.skipped.",
+                    file=sys.stderr,
+                )
+            if semgrep_summary.record:
+                persist_current_coverage(semgrep_summary.record, "semgrep")
+
+            # Reuse original reports decoded for metrics, covering every
+            # dispatched language without reopening the SARIF files.
+            if codeql_coverage is not None:
+                record = codeql_coverage.build_record()
                 if record:
-                    write_record(out_dir, record, tool_name="codeql")
-                    break  # one record per run
+                    persist_current_coverage(record, "codeql")
 
-            # Derive total_files_scanned from coverage records — these are
-            # the canonical source of what was examined (not SARIF artifacts,
-            # which Semgrep doesn't populate).
+            # Derive file totals only from this invocation's coverage facts.
+            # Reusing --out must not import old top-level or nested records.
+            from core.paths import to_repo_relative
             all_covered = set()
-            for rec in load_records(out_dir):
-                all_covered.update(rec.get("files_examined", []))
-            if all_covered:
+            has_file_coverage = False
+            for rec in current_coverage_records:
+                examined = rec.get("files_examined")
+                if not isinstance(examined, list):
+                    continue
+                has_file_coverage = True
+                for file in examined:
+                    if not isinstance(file, str):
+                        continue
+                    relative = to_repo_relative(file, repo_path, outside_root="relative")
+                    normal = to_repo_relative(relative, repo_path) if relative is not None else None
+                    if normal is not None:
+                        all_covered.add(file if normal == file else normal)
+            if has_file_coverage:
                 metrics["total_files_scanned"] = len(all_covered)
-                save_json(out_dir / "scan_metrics.json", metrics)
-        except Exception as e:
-            logger.debug(f"Coverage record write failed (non-fatal): {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Coverage record write failed (non-fatal): %s", e)
 
-        # Provenance manifest. MUST be composed BEFORE cleanup runs,
-        # because cleanup deletes most of the per-pack SARIFs we hash.
+        from core.reporting.scan_coverage import summarize_tool_coverage
+        metrics["tool_coverage"] = {
+            record["tool"]: summarize_tool_coverage(record)
+            for record in current_coverage_records
+        }
+
+        # Analysis gaps: files a parser abandoned during the scan's
+        # inventory/analysis passes (budget exceeded, stalled worker).
+        # Loud by contract — a crafted file that defeats a parser must
+        # be visible in the scan summary, never a silent skip.
         try:
-            verification = _compose_verification_manifest(
-                sarif_inputs, merged, out_dir,
+            from core.run.gaps import gap_summary
+            from core.sandbox.summary import get_active_run_dir
+            _gap_dir = get_active_run_dir() or out_dir
+            _gap_counts = gap_summary(_gap_dir)
+            if _gap_counts:
+                metrics["analysis_gaps"] = _gap_counts
+                _gap_desc = ", ".join(
+                    f"{n} {reason}"
+                    for reason, n in sorted(_gap_counts.items())
+                )
+                logger.warning(
+                    "Analysis gaps: %s record(s) — files NOT analysed "
+                    "(%s); see %s",
+                    sum(_gap_counts.values()), _gap_desc,
+                    _gap_dir / "analysis-gaps.jsonl",
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Analysis-gap summary failed (non-fatal): %s", e)
+
+        # Exit policy is independent of retained findings and coverage. Partial
+        # scans keep the existing exit policy but must not advertise success.
+        exit_code = 4 if all_semgrep_failed or (RaptorConfig.SEMGREP_OFFLINE and semgrep_failed) else 0
+        from core.reporting.scan_coverage import scan_execution_status
+        metrics["execution_status"] = "error" if exit_code else "ok"
+        metrics["execution_status"] = scan_execution_status(metrics)
+        save_json(out_dir / "scan_metrics.json", metrics)
+
+        if nosemgrep_count:
+            _active = metrics['total_findings'] - nosemgrep_count
+            logger.info(
+                "Scan finished (%s): %s findings + %s developer-suppressed in %s files",
+                metrics["execution_status"],
+                _active,
+                nosemgrep_count,
+                metrics['total_files_scanned']
             )
-        except Exception as e:
-            logger.debug(f"verification manifest compose failed (non-fatal): {e}")
-            verification = {
-                "schema_version": 1,
-                "combined_sarif": {"path": merged.name, "sha256": "", "size_bytes": 0},
-                "packs": [],
-            }
+        else:
+            logger.info(
+                "Scan finished (%s): %s findings in %s files",
+                metrics["execution_status"],
+                metrics['total_findings'],
+                metrics['total_files_scanned']
+            )
 
-        # Per-pack file cleanup. Runs AFTER combined.sarif and
-        # scan_metrics.json are finalised. The merged SARIF is canonical;
-        # per-pack semgrep_*.{exit,json,sarif,stderr.log} files are
-        # intermediate. Keep only what's useful for post-mortem of failed
-        # packs (exit code + non-empty stderr + sarif-with-findings).
-        try:
-            cleanup_per_pack_artifacts(out_dir)
-        except Exception as e:
-            logger.debug(f"Per-pack cleanup failed (non-fatal): {e}")
-
-        save_json(out_dir / "verification.json", verification)
+        # Persist provenance before deleting any intermediate. A failed
+        # merge must keep its per-tool fallback, even if an older combined
+        # report still exists at the output path.
+        _finalize_scan_artifacts(
+            sarif_inputs, merged, out_dir, merge_completed=merge_completed,
+        )
 
         duration = time.time() - start_time
-        logger.info(f"Total scan duration: {duration:.2f}s")
+        logger.info("Total scan duration: %.2fs", duration)
 
-        # Print coverage summary if checklist exists
+        # Tool-execution coverage block — replays current metrics counts
+        # without reopening historical per-tool records; renders an aligned
+        # summary (findings count, rule groups, silent-drop
+        # warnings) so the operator sees what RAN with what RESULT
+        # before the function-level coverage block below.
+        # Distinct from store_summary which answers ''what code did
+        # any tool examine?''; this one answers ''what did we look
+        # at it WITH?''.
         try:
-            from core.coverage.summary import compute_summary, format_summary
-            cov = compute_summary(out_dir)
+            from core.reporting.scan_coverage import render_scan_coverage
+            tool_cov = render_scan_coverage(out_dir)
+            if tool_cov:
+                print()
+                print(tool_cov)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Tool-coverage render failed (non-fatal): %s", e)
+
+        # This scan's file-level detail must use current facts as well. A
+        # prior checklist/store in reused --out is historical, not this scan.
+        try:
+            from core.coverage.store_summary import render_run_coverage
+            cov = render_run_coverage(out_dir, current_records=current_coverage_records,
+                                      repo_root=repo_path)
             if cov:
                 print()
-                print(format_summary(cov))
+                print(cov)
                 print()
-        except Exception:
-            pass
+        except (ImportError, FileNotFoundError) as exc:
+            # Narrowed: ImportError if the optional summary module
+            # isn't installed; FileNotFoundError if checklist hasn't
+            # been created yet. Other errors propagate so they
+            # surface instead of silently dropping the summary.
+            logger.debug("scanner: coverage summary unavailable: %s", exc)
 
+        # Capture finalized scanner evidence, independently of optional report
+        # formats. The operator's quick view does not depend on Claude prompts.
+        from core.reporting.adapters import context_from_sarif
+        from core.reporting.document import StageEnvelope
+        from core.reporting.service import complete_reporting
+        scan_stages = [StageEnvelope(
+            "semgrep", "failed" if all_semgrep_failed else ("partial" if semgrep_failed else ("completed" if semgrep_sarifs else "unknown")),
+            reason=f"{len(semgrep_failed)} failed pack(s)" if semgrep_failed else ("" if semgrep_sarifs else "No Semgrep artifact; execution is not attested"),
+        )]
+        if args.codeql and not args.no_codeql:
+            codeql_failed = bool((metrics.get("tool_execution_failures") or {}).get("codeql"))
+            scan_stages.append(StageEnvelope(
+                "codeql", "partial" if codeql_failed else ("completed" if codeql_sarifs else "unknown"),
+                reason=("Agent execution failed; recovered reports retained" if codeql_failed else
+                        ("No SARIF produced" if not codeql_sarifs else "")),
+            ))
+        report_context = context_from_sarif(
+            [merged] if merged.exists() else [Path(p) for p in sarif_inputs],
+            kind="scan", target=str(repo_path), run_id=out_dir.name, stages=scan_stages,
+        )
+        from core.reporting.adapters import apply_scan_metrics
+        apply_scan_metrics(report_context, metrics)
+        from core.reporting.lifecycle import apply_lifecycle
+        apply_lifecycle(report_context, out_dir, scope={"mode": "scanner-invocation", "target": str(repo_path)})
+        reporting = complete_reporting(report_context, out_dir, stem="scan-report", options=report_options,
+                                       stream=sys.stdout, show_suppressed=getattr(args, "show_suppressed", False))
         result = {
-            "status": "ok",
+            "status": metrics["execution_status"],
             "manifest": manifest,
             "metrics": metrics,
             "duration": duration,
+            "reporting": {"snapshot_id": reporting.summary.snapshot_id, "diagnostics": reporting.diagnostics},
         }
-        print(json.dumps(result, indent=2))
+        # ensure_ascii: JSON escapes C0 but passes C1 terminal
+        # controls raw when off — dumps_display is exactly that, and
+        # the manifest quotes target-derived paths. Still valid JSON
+        # for the parent process that parses this stdout.
+        print(json.dumps(result, indent=2, ensure_ascii=True, default=str))
         # Aggregate any tracer-emitted .sandbox-denials.jsonl into
         # sandbox-summary.json. The lifecycle hook lives in raptor.py
         # / raptor_agentic.py for top-level invocations — neither
@@ -1297,14 +4246,21 @@ def main():
         except Exception as _e:
             logger.debug("summarize_and_write at end of scanner.py: "
                          "%s", _e, exc_info=True)
-        sys.exit(0)
-    finally:
-        if not args.keep:
-            try:
-                shutil.rmtree(tmp)
-            except Exception:
-                pass
+        # ``all_semgrep_failed`` set above when every dispatched
+        # semgrep pack failed (CI-gate signal — exit 4 distinct from
+        # the sandbox-engagement-failure exit code which is reserved
+        # for the SandboxSetupError path at __main__).
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SandboxSetupError as e:
+        # Fail loud with the actionable message, not a traceback. The scan
+        # did NOT run — never let this look like a clean "0 findings".
+        print(
+            f"\nRAPTOR: scan aborted — sandbox isolation could not engage.\n{e}",
+            file=sys.stderr,
+        )
+        sys.exit(SANDBOX_ENGAGE_EXIT_CODE)

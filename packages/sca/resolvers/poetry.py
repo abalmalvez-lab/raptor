@@ -1,0 +1,125 @@
+"""Poetry resolver wrapper.
+
+Runs ``poetry lock --no-update`` to re-resolve the existing
+``pyproject.toml`` against the current set of compatible versions.
+Without ``--no-update`` Poetry would also bump non-target deps to
+their newest compatible release; we want a minimal validate that
+the proposed plan is internally consistent.
+
+Selection: matches any project whose ``pyproject.toml`` declares
+``[tool.poetry]``. A pyproject.toml with only PEP 621 ``[project]``
+metadata is left to ``PipResolver`` since it's not a Poetry project.
+"""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+from core.run.scratch import scratch_dir
+from pathlib import Path
+
+from . import ResolverResult, _check_tool, _run
+from ._proxy_hosts import _POETRY_ENV_KEYS
+from ._safe_io import copy_regular_file, read_regular_bytes, read_regular_text
+
+logger = logging.getLogger(__name__)
+
+
+class PoetryResolver:
+    """``poetry lock`` wrapper."""
+
+    ecosystem = "PyPI"
+    CACHE_ENV_KEYS = _POETRY_ENV_KEYS
+    CACHE_TOOLS = ("poetry",)
+    MANIFEST_FILES = ("pyproject.toml", "poetry.lock")
+    @property
+    def proxy_hosts(self) -> list:
+        """Egress-proxy hostname allowlist for poetry.
+        Override (`"poetry"` key) → calibrate (`poetry --version`,
+        cache-keyed on `POETRY_REPOSITORIES_PRIMARY_URL` /
+        `PIP_INDEX_URL`) → static default (`pypi.org` +
+        `files.pythonhosted.org`)."""
+        from ._proxy_hosts import proxy_hosts_for_poetry
+        return proxy_hosts_for_poetry()
+
+    def is_available(self) -> bool:
+        return _check_tool(["poetry", "--version"])
+
+    def matches(self, project_dir: Path) -> bool:
+        # The path lives in the scanned (hostile) directory — an
+        # lstat-gated, bounded read so a symlinked pyproject.toml
+        # can't steer the probe at operator files and a FIFO can't
+        # hang it.
+        text = read_regular_text(project_dir / "pyproject.toml")
+        if text is None:
+            return False
+        # Cheap text check — no need to TOML-parse just to detect a
+        # Poetry project. ``[tool.poetry]`` is unambiguous and
+        # case-sensitive in TOML.
+        return "[tool.poetry]" in text
+
+    def dry_run(
+        self, project_dir: Path, *, timeout: int = 120,
+    ) -> ResolverResult:
+        if not self.is_available():
+            return ResolverResult(
+                ecosystem=self.ecosystem,
+                success=False, available=False,
+                error="poetry not found in PATH",
+            )
+        if not (project_dir / "pyproject.toml").exists():
+            return ResolverResult(
+                ecosystem=self.ecosystem,
+                success=False, available=True,
+                error="no pyproject.toml in project",
+            )
+
+        # Copy manifest files into a writable tempdir — the sandbox
+        # only allows writes to the output dir and /tmp, not cwd.
+        # lstat-gated content copy: the sources sit in the scanned
+        # (hostile) directory, so symlinks are not followed and
+        # FIFOs are never opened (a follow-happy copy would leak
+        # operator files into the resolve, or hang on a FIFO).
+        with scratch_dir("raptor-sca-poetry-") as tmp:
+            tmp_path = Path(tmp)
+            for fname in ("pyproject.toml", "poetry.lock"):
+                copy_regular_file(project_dir / fname, tmp_path / fname)
+
+            try:
+                proc = _run(
+                    ["poetry", "lock", "--no-update", "--no-interaction"],
+                    cwd=tmp_path,
+                    timeout=timeout,
+                    proxy_hosts=self.proxy_hosts,
+                )
+            except subprocess.TimeoutExpired:
+                return ResolverResult(
+                    ecosystem=self.ecosystem,
+                    success=False, available=True,
+                    error=f"poetry lock timed out after {timeout}s",
+                )
+
+            raw = (proc.stdout + "\n" + proc.stderr).strip()
+            if proc.returncode != 0:
+                return ResolverResult(
+                    ecosystem=self.ecosystem,
+                    success=False, available=True,
+                    error=(proc.stderr.strip()
+                           or "poetry lock exited non-zero"),
+                    raw_output=raw,
+                )
+            lockfile = _read_if_exists(tmp_path / "poetry.lock")
+            return ResolverResult(
+                ecosystem=self.ecosystem,
+                success=lockfile is not None, available=True,
+                error=None if lockfile is not None else "resolver produced no readable regular lockfile within the byte budget",
+                proposed_lockfile=lockfile,
+                raw_output=raw,
+            )
+
+
+def _read_if_exists(p: Path) -> bytes | None:
+    return read_regular_bytes(p)
+
+
+__all__ = ["PoetryResolver"]

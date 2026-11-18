@@ -144,6 +144,64 @@ class TestHappyPath:
             )
         assert result == verdicts
 
+
+class TestTrajectoryWiring:
+    """Trace dispatch persists a trajectory under
+    ``$RAPTOR_TRAJECTORY_DIR/trajectories/trace-<model>/`` when the
+    env var is set — same opt-in shape as hunt_dispatch."""
+
+    def test_trajectory_written_when_env_var_set(
+        self, repo, fake_model_config, tmp_path, monkeypatch,
+    ):
+        from packages.code_understanding.dispatch.trace_dispatch import (
+            default_trace_dispatch,
+        )
+        from core.trajectories.auto import TRAJECTORY_DIR_ENV
+
+        monkeypatch.setenv(TRAJECTORY_DIR_ENV, str(tmp_path))
+        turns = [
+            FakeTurn(tool_calls=[("submit_verdicts", {"verdicts": []})]),
+        ]
+        with _patch_provider(turns):
+            default_trace_dispatch(
+                fake_model_config, _sample_traces(), str(repo),
+            )
+
+        traj_path = (
+            tmp_path / "trajectories"
+            / f"trace-{fake_model_config.model_name}"
+            / "trajectory.json"
+        )
+        assert traj_path.exists(), (
+            f"trajectory not at {traj_path}; "
+            f"tree was: {list(tmp_path.rglob('*'))}"
+        )
+        payload = json.loads(traj_path.read_text())
+        assert payload["run_id"] == f"trace-{fake_model_config.model_name}"
+        assert payload["model_name"] == fake_model_config.model_name
+        # finding_id / cwe are empty — trace isn't finding-driven.
+        assert payload["finding_id"] == ""
+        assert payload["cwe"] == ""
+
+    def test_unset_env_var_is_noop(
+        self, repo, fake_model_config, tmp_path, monkeypatch,
+    ):
+        from packages.code_understanding.dispatch.trace_dispatch import (
+            default_trace_dispatch,
+        )
+        from core.trajectories.auto import TRAJECTORY_DIR_ENV
+
+        monkeypatch.delenv(TRAJECTORY_DIR_ENV, raising=False)
+        monkeypatch.chdir(tmp_path)
+        turns = [
+            FakeTurn(tool_calls=[("submit_verdicts", {"verdicts": []})]),
+        ]
+        with _patch_provider(turns):
+            default_trace_dispatch(
+                fake_model_config, _sample_traces(), str(repo),
+            )
+        assert not (tmp_path / "trajectories").exists()
+
     def test_multi_turn_dispatch(self, repo, fake_model_config):
         """Model reads files first, then submits."""
         from packages.code_understanding.dispatch.trace_dispatch import (
@@ -332,6 +390,64 @@ class TestErrorPaths:
         ids = {v["trace_id"] for v in result}
         assert ids == {"EP-001", "EP-002"}
 
+    def test_phantom_trace_ids_filtered(self, repo, fake_model_config):
+        """A verdict for a trace_id not in the input batch is a
+        hallucination — it must not flow through as a phantom merged
+        item; verdicts for real input ids still pass."""
+        from packages.code_understanding.dispatch.trace_dispatch import (
+            default_trace_dispatch,
+        )
+
+        turns = [
+            FakeTurn(tool_calls=[("submit_verdicts", {
+                "verdicts": [
+                    {"trace_id": "EP-001", "verdict": "reachable"},
+                    {"trace_id": "EP-999", "verdict": "reachable"},  # phantom
+                    {"trace_id": "EP-002", "verdict": "uncertain"},
+                ],
+            })]),
+        ]
+
+        with _patch_provider(turns):
+            result = default_trace_dispatch(
+                fake_model_config, _sample_traces(), str(repo),
+            )
+        ids = {v["trace_id"] for v in result}
+        assert ids == {"EP-001", "EP-002"}
+
+    def test_omitted_trace_logged_as_unassessed(
+        self, repo, fake_model_config, caplog,
+    ):
+        """A trace the model skipped must leave a visible record —
+        silence would be indistinguishable from 'assessed clean'."""
+        import logging as _logging
+
+        from packages.code_understanding.dispatch.trace_dispatch import (
+            default_trace_dispatch,
+        )
+
+        turns = [
+            FakeTurn(tool_calls=[("submit_verdicts", {
+                "verdicts": [
+                    {"trace_id": "EP-001", "verdict": "reachable"},
+                    # EP-002 omitted
+                ],
+            })]),
+        ]
+
+        with _patch_provider(turns), caplog.at_level(
+            _logging.WARNING,
+            logger="packages.code_understanding.dispatch.trace_dispatch",
+        ):
+            result = default_trace_dispatch(
+                fake_model_config, _sample_traces(), str(repo),
+            )
+        assert {v["trace_id"] for v in result} == {"EP-001"}
+        assert any(
+            "EP-002" in r.getMessage() and "no verdict" in r.getMessage()
+            for r in caplog.records
+        )
+
     def test_provider_exception_caught(self, repo, fake_model_config):
         from packages.code_understanding.dispatch.trace_dispatch import (
             default_trace_dispatch,
@@ -455,9 +571,14 @@ class TestDirectCallerValidation:
             "trace_id": "EP-001",
             "entry": Path("/some/path"),  # not JSON-native
         }]
-        result = default_trace_dispatch(
-            fake_model_config, bad_traces, str(repo),
-        )
+        # Provider construction precedes serialization in the
+        # dispatch; stub it (like every other test here) so the
+        # assertion reaches the serialization guard on hosts without
+        # the full provider SDK stack installed.
+        with _patch_provider([]):
+            result = default_trace_dispatch(
+                fake_model_config, bad_traces, str(repo),
+            )
         assert len(result) == 1
         assert "error" in result[0]
         assert "serialize" in result[0]["error"]

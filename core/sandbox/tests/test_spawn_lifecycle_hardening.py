@@ -1,0 +1,280 @@
+"""Spawn lifecycle hardening: teardown, fd hygiene, helper resolution.
+
+- _kill_and_reap killpg'd whatever process group the child was in;
+  with the supported start_new_session=False shape that is RAPTOR's
+  OWN group — a timeout the target provoked SIGKILLed the
+  orchestrator (confused deputy).
+- A subprocess timeout SIGKILLs the setup child (the death-pipe
+  watcher) first; nothing then killed the pid-ns init, so the target
+  tree survived the timeout and kept executing. The grandchild now
+  ties its lifetime to the setup child via PR_SET_PDEATHSIG.
+- The grandchild fd sweep derived its ceiling from the ALREADY
+  LOWERED RLIMIT_NOFILE soft limit, so a pre-existing inheritable fd
+  numbered at/above it survived execvpe as an out-of-policy
+  capability.
+- newuidmap/newgidmap/getcap resolved via the inherited PATH in the
+  unsandboxed parent, contra the pinned-resolver doctrine.
+"""
+
+from contextlib import ExitStack
+import fcntl
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+from pathlib import Path
+
+import pytest
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux spawn backend",
+)
+
+
+def _mount_ns_usable() -> bool:
+    if not shutil.which("newuidmap") or not shutil.which("newgidmap"):
+        return False
+    sysctl = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+    return not (sysctl.exists() and sysctl.read_text().strip() == "1")
+
+
+_WT = str(Path(__file__).resolve().parents[3])
+
+
+class TestKillpgConfusedDeputyGuard(unittest.TestCase):
+    def test_kill_and_reap_never_signals_its_own_group(self):
+        """Driver process (own session) spawns a same-group child and
+        calls _kill_and_reap on it — pre-fix the killpg took out the
+        driver itself."""
+        driver = textwrap.dedent(f"""
+            import os, subprocess, sys
+            sys.path.insert(0, {_WT!r})
+            os.environ.setdefault("RAPTOR_DIR", {_WT!r})
+            from core.sandbox._spawn import _kill_and_reap
+            child = subprocess.Popen(["/bin/sleep", "300"],
+                                     start_new_session=False)
+            _kill_and_reap(child.pid)
+            print("DRIVER-SURVIVED")
+        """)
+        r = subprocess.run(
+            ["/usr/bin/python3", "-c", driver],
+            capture_output=True, text=True, timeout=60,
+            start_new_session=True,
+        )
+        self.assertIn("DRIVER-SURVIVED", r.stdout, (
+            f"_kill_and_reap SIGKILLed its own process group "
+            f"(confused deputy): rc={r.returncode} "
+            f"stderr={r.stderr[-300:]!r}"
+        ))
+        self.assertEqual(r.returncode, 0)
+
+
+@requires_landlock
+@requires_userns
+class TestTimeoutKillsTargetTree(unittest.TestCase):
+    def setUp(self):
+        if not _mount_ns_usable():
+            self.skipTest("mount-ns unusable here")
+        from core.sandbox._spawn import mount_ns_available
+        if not mount_ns_available():
+            self.skipTest("mount-ns not available on this host")
+
+    @pytest.mark.slow  # real 3s run timeout + two post-teardown observation
+    # windows (the quiet heartbeat IS the property) — ~7s by construction
+    def test_no_post_timeout_execution(self):
+        """A target that outlives the run timeout must be killed with
+        the sandbox teardown, not keep mutating output afterwards."""
+        from core.sandbox._spawn import run_sandboxed
+        out = tempfile.mkdtemp(prefix="raptor-pdsig-")
+        self.addCleanup(shutil.rmtree, out, True)
+        beat = os.path.join(out, "beat")
+        prog = textwrap.dedent(f"""
+            import os, time
+            # leave the captured process group — the surviving shape:
+            # killpg on the setup child's group no longer reaches us
+            try:
+                os.setsid()
+            except OSError:
+                pass
+            while True:
+                with open({beat!r}, "a") as f:
+                    f.write("b")
+                time.sleep(0.2)
+        """)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_sandboxed(
+                ["/usr/bin/python3", "-c", prog],
+                target=out, output=out,
+                block_network=True,
+                writable_paths=[out, "/tmp"],
+                nproc_limit=1024,
+                limits={"memory_mb": 0, "max_file_mb": 10240,
+                        "cpu_seconds": 300},
+                readable_paths=None, allowed_tcp_ports=None,
+                seccomp_profile="full", seccomp_block_udp=False,
+                env=None, cwd=None, timeout=3,
+                capture_output=True, text=True,
+            )
+        time.sleep(1.5)
+        self.assertTrue(os.path.isfile(beat), "target never wrote a heartbeat")
+        size_a = os.path.getsize(beat)
+        self.assertGreater(size_a, 0, "target heartbeat is empty")
+        time.sleep(2.5)
+        size_b = os.path.getsize(beat) if os.path.exists(beat) else 0
+        self.assertEqual(size_a, size_b, (
+            "target kept executing (heartbeat file still growing) "
+            "after the run timeout — the sandbox tree survived "
+            "teardown"
+        ))
+
+
+@requires_landlock
+@requires_userns
+class TestHighFdSweep(unittest.TestCase):
+    def setUp(self):
+        if not _mount_ns_usable():
+            self.skipTest("mount-ns unusable here")
+        from core.sandbox._spawn import mount_ns_available
+        if not mount_ns_available():
+            self.skipTest("mount-ns not available on this host")
+
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
+    def test_inheritable_fd_above_lowered_limit_is_closed(self):
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 5000  # above the sandbox's default 4096 NOFILE cap
+        if hard != resource.RLIM_INFINITY and hard <= want:
+            self.skipTest("hard NOFILE limit too low to stage the fd")
+        with ExitStack() as cleanup:
+            if soft != resource.RLIM_INFINITY and soft <= want:
+                cleanup.callback(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+                admitted = want + 64 if hard == resource.RLIM_INFINITY else min(want + 64, hard)
+                resource.setrlimit(resource.RLIMIT_NOFILE, (admitted, hard))
+            r_end, w_end = os.pipe()
+            cleanup.callback(os.close, r_end)
+            cleanup.callback(os.close, w_end)
+            # Allocate an unused slot rather than replacing a live fd at want.
+            want = fcntl.fcntl(r_end, fcntl.F_DUPFD, want)
+            cleanup.callback(os.close, want)
+            os.set_inheritable(want, True)
+            from core.sandbox._spawn import run_sandboxed
+            out = tempfile.mkdtemp(prefix="raptor-hifd-")
+            cleanup.callback(shutil.rmtree, out, True)
+            prog = textwrap.dedent(f"""
+                import os
+                try:
+                    os.fstat({want})
+                    print("FD-SURVIVED")
+                except OSError:
+                    print("FD-CLOSED")
+            """)
+            r = run_sandboxed(
+                ["/usr/bin/python3", "-c", prog],
+                target=out, output=out,
+                block_network=True,
+                writable_paths=[out, "/tmp"],
+                nproc_limit=1024,
+                limits={"memory_mb": 0, "max_file_mb": 10240,
+                        "cpu_seconds": 300},
+                readable_paths=None, allowed_tcp_ports=None,
+                seccomp_profile="full", seccomp_block_udp=False,
+                env=None, cwd=None, timeout=30,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("FD-CLOSED", r.stdout, (
+                f"inheritable fd {want} (above the lowered NOFILE "
+                f"soft limit) survived into the sandboxed child: "
+                f"{r.stdout!r}"
+            ))
+
+
+class TestPinnedHelperResolution(unittest.TestCase):
+    def test_trusted_resolver_ignores_inherited_path(self):
+        from core.sandbox.probes import _SAFE_BIN_DIRS, _find_sandbox_binary
+        with tempfile.TemporaryDirectory(prefix="raptor-path-") as d:
+            fake = os.path.join(d, "newuidmap")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake, os.stat(fake).st_mode | stat.S_IXUSR)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = d
+            try:
+                got = _find_sandbox_binary("newuidmap")
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertNotEqual(got, fake,
+                                "poisoned PATH entry was resolved")
+            if got is not None:
+                self.assertTrue(
+                    any(got.startswith(sd + "/")
+                        for sd in _SAFE_BIN_DIRS),
+                    f"resolved outside the pinned dirs: {got}")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@requires_landlock
+@requires_userns
+class TestTimeoutZeroMeansImmediateDeadline(unittest.TestCase):
+    """timeout=0 is "zero budget remaining", not "no deadline": the
+    falsy check (`if timeout`) built NO deadline and the run became
+    unbounded exactly when the caller asked for none at all. Both
+    directions: 0 must raise TimeoutExpired promptly; None must stay
+    deadline-free and let the child finish."""
+
+    def setUp(self):
+        if not _mount_ns_usable():
+            self.skipTest("mount-ns unusable here")
+        from core.sandbox._spawn import mount_ns_available
+        if not mount_ns_available():
+            self.skipTest("mount-ns not available on this host")
+
+    def _kwargs(self, out, timeout):
+        return {
+            "target": out, "output": out,
+            "block_network": True,
+            "writable_paths": [out, "/tmp"],
+            "nproc_limit": 1024,
+            "limits": {"memory_mb": 0, "max_file_mb": 10240,
+                       "cpu_seconds": 300},
+            "readable_paths": None, "allowed_tcp_ports": None,
+            "seccomp_profile": "full", "seccomp_block_udp": False,
+            "env": None, "cwd": None, "timeout": timeout,
+            "capture_output": True, "text": True,
+        }
+
+    def test_timeout_zero_raises_immediately(self):
+        from core.sandbox._spawn import run_sandboxed
+        out = tempfile.mkdtemp(prefix="raptor-t0-")
+        self.addCleanup(shutil.rmtree, out, True)
+        start = time.monotonic()
+        # The sleeper bounds the regression cost: pre-fix (no deadline)
+        # the call returns normally after 5s and assertRaises fails.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_sandboxed(["/bin/sleep", "5"],
+                          **self._kwargs(out, timeout=0))
+        self.assertLess(time.monotonic() - start, 5.0,
+                        "timeout=0 must not wait out the child")
+
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
+    def test_timeout_none_stays_unbounded(self):
+        from core.sandbox._spawn import run_sandboxed
+        out = tempfile.mkdtemp(prefix="raptor-tnone-")
+        self.addCleanup(shutil.rmtree, out, True)
+        r = run_sandboxed(["/bin/true"], **self._kwargs(out, timeout=None))
+        self.assertEqual(r.returncode, 0)

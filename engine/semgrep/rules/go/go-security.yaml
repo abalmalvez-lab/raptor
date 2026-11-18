@@ -1,0 +1,992 @@
+rules:
+  # ---------------------------------------------------------------------------
+  # Go — pattern: defer Close inside loop body — resource exhaustion
+  # ---------------------------------------------------------------------------
+  - id: raptor.go.defer-close-in-loop
+    message: >-
+      A deferred Close call appears inside a loop. Deferred calls run when the enclosing function returns and can accumulate. Review loop bounds, function lifetime and actual resource use; close per iteration or extract the loop body where necessary.
+    languages: [go]
+    severity: MEDIUM
+    patterns:
+      - pattern: defer $X.Close()
+      - pattern-inside: |
+          for ... {
+            ...
+          }
+    metadata:
+      cwe: ["CWE-401"]
+      tags: ["security", "go", "resource-leak"]
+
+  # ---------------------------------------------------------------------------
+  # Go — taint: web sources -> non-parameterised SQL query sinks
+  # ---------------------------------------------------------------------------
+  - id: raptor.go.sql-sprintf-query
+    message: >-
+      Untrusted data flows into a SQL query without parameterisation. Use
+      db.Query(sql, args...) with positional parameters instead of
+      fmt.Sprintf to build query strings.
+    languages: [go]
+    severity: CRITICAL
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.URL.Query().Get(...)
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.Header.Get(...)
+          - pattern: $REQ.PathValue(...)
+          # gin / echo — receiver-name anchored: a bare $CTX.Query(...)
+          # source also matches db.Query(...), which self-taints the
+          # Query sinks below (any hardcoded db.Query(fmt.Sprintf(..)))
+          # would flag itself with no attacker data involved).
+          - patterns:
+              - pattern-either:
+                  - pattern: $CTX.Query(...)
+                  - pattern: $CTX.Param(...)
+                  - pattern: $CTX.PostForm(...)
+                  - pattern: $CTX.QueryParam(...)
+                  - pattern: $CTX.FormValue(...)
+              - metavariable-regex:
+                  metavariable: $CTX
+                  regex: '(?i)^(c|ctx|context|ectx|gctx|cc)$'
+          # environment
+          - pattern: os.Getenv(...)
+          - pattern: os.Args[...]
+    pattern-sinks:
+      # Generic method names require SQL-shaped formatting. The formatted
+      # query is the sink, rather than the context or trailing bind values.
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.Query($QUERY, ...)
+              - pattern: $DB.Exec($QUERY, ...)
+              - pattern: $DB.QueryRow($QUERY, ...)
+              - pattern: $DB.QueryContext($CTX2, $QUERY, ...)
+              - pattern: $DB.QueryRowContext($CTX2, $QUERY, ...)
+              - pattern: $DB.ExecContext($CTX2, $QUERY, ...)
+          - metavariable-pattern:
+              metavariable: $QUERY
+              patterns:
+                - pattern: fmt.Sprintf($FMT, ...)
+                - metavariable-regex:
+                    metavariable: $FMT
+                    regex: '(?i)^["`]\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|MERGE|GRANT|REVOKE)\b.*'
+          - focus-metavariable: $QUERY
+      # These SQL-specific methods also accept bound values. Those values
+      # neither taint constant SQL text nor sanitise tainted SQL text.
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.QueryRow($Q, ...)
+              - pattern: $DB.QueryContext($CTX2, $Q, ...)
+              - pattern: $DB.QueryRowContext($CTX2, $Q, ...)
+              - pattern: $DB.ExecContext($CTX2, $Q, ...)
+          - focus-metavariable: $Q
+    metadata:
+      cwe: ["CWE-89"]
+      owasp_top_10: ["A3:2021-Injection"]
+      tags: ["security", "go", "sqli", "taint"]
+
+  # ---------------------------------------------------------------------------
+  # Go — pattern: insecure TLS configuration
+  # ---------------------------------------------------------------------------
+  - id: raptor.go.insecure-tls-skip-verify
+    message: >-
+      InsecureSkipVerify is enabled in a TLS configuration literal. Review the effective configuration, additional verification and connection use before assessing exposure. Keep certificate and hostname verification enabled for the intended peer.
+    languages: [go]
+    severity: CRITICAL
+    pattern: |
+      tls.Config{..., InsecureSkipVerify: true, ...}
+    metadata:
+      cwe: ["CWE-295"]
+      owasp_top_10: ["A7:2021-Identification and Authentication Failures"]
+      tags: ["security", "go", "tls"]
+
+  - id: raptor.go.insecure-tls-min-version
+    message: >-
+      TLS MinVersion requires review. Explicit legacy minimums can permit
+      deprecated protocols, while zero selects Go's version-dependent default.
+      Check the target Go version and configuration before treating zero as
+      a weak minimum; use an explicit supported minimum when policy requires it.
+    languages: [go]
+    severity: HIGH
+    # Explicit legacy constants and a zero/default configuration are distinct
+    # review cases. An omitted MinVersion also uses the default but is not
+    # matched by this struct-literal pattern. Neither zero nor omission alone
+    # establishes a downgrade; the target Go version/configuration matters.
+    pattern-either:
+      - pattern: |
+          tls.Config{..., MinVersion: tls.VersionSSL30, ...}
+      - pattern: |
+          tls.Config{..., MinVersion: tls.VersionTLS10, ...}
+      - pattern: |
+          tls.Config{..., MinVersion: tls.VersionTLS11, ...}
+      - pattern: |
+          tls.Config{..., MinVersion: 0, ...}
+    metadata:
+      cwe: ["CWE-295"]
+      tags: ["security", "go", "tls"]
+
+  # ---------------------------------------------------------------------------
+  # Go — taint: web sources -> filesystem path sinks
+  # ---------------------------------------------------------------------------
+  - id: raptor.go.filepath-traversal
+    message: >-
+      Potentially untrusted data reaches path construction or file I/O APIs. Review the actual operation and allowed roots before claiming traversal. filepath.Join does not enforce confinement; validate the effective path against the intended base directory.
+    languages: [go]
+    severity: CRITICAL
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.URL.Query().Get(...)
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.Header.Get(...)
+          - pattern: $REQ.PathValue(...)
+          # gin / echo — receiver-name anchored: a bare $CTX.Query(...)
+          # source also matches the .Query()/.Param() methods of stores,
+          # DB handles, and routers, tainting fully hardcoded data
+          # (self-taint; same fix as raptor.injection.sql.taint.go).
+          - patterns:
+              - pattern-either:
+                  - pattern: $CTX.Query(...)
+                  - pattern: $CTX.Param(...)
+                  - pattern: $CTX.PostForm(...)
+                  - pattern: $CTX.QueryParam(...)
+                  - pattern: $CTX.FormValue(...)
+              - metavariable-regex:
+                  metavariable: $CTX
+                  regex: '(?i)^(c|ctx|context|ectx|gctx|cc)$'
+          # environment
+          - pattern: os.Getenv(...)
+          - pattern: os.Args[...]
+    pattern-sinks:
+      - patterns:
+          - pattern: os.Open($PATH)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: os.ReadFile($PATH)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: os.OpenFile($PATH, $FLAGS, $PERM)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: ioutil.ReadFile($PATH)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: filepath.Join($BASE, $PATH)
+          - focus-metavariable: $PATH
+    # No filepath.Clean sanitizer: Clean("../..") returns "../.." and
+    # Clean("/srv/"+f) resolves the escape rather than preventing it —
+    # it normalises, it does not confine. filepath.Base does confine
+    # (strips every directory component, "../" included).
+    pattern-sanitizers:
+      - pattern: filepath.Base(...)
+        exact: true
+    metadata:
+      cwe: ["CWE-22"]
+      owasp_top_10: ["A1:2021-Broken Access Control"]
+      tags: ["security", "go", "path-traversal", "taint"]
+
+  # ---------------------------------------------------------------------------
+  # Go — pattern: strconv result cast to a narrower int without a range check
+  # ---------------------------------------------------------------------------
+  # Sanitizers require adjacent terminating guards or a bounded signed parse.
+  # Unresolved bounds and intervening statements remain conservative leads.
+  # Expanded patterns keep --validate and ordinary scanning consistent.
+  # Avoid YAML aliases here: the native validator does not resolve them.
+  - id: raptor.go.parsed-int-narrowing-cast
+    message: A strconv integer result reaches a narrow integer conversion. Check the destination bounds before conversion; values outside them wrap, and negative values wrap when converted to unsigned types.
+    languages:
+    - go
+    severity: MEDIUM
+    mode: taint
+    pattern-sources:
+    - pattern: strconv.Atoi(...)
+      exact: true
+    - pattern: strconv.ParseInt(...)
+      exact: true
+    pattern-sinks:
+    - patterns:
+      - pattern-either:
+        - pattern: uint8($V)
+        - pattern: uint16($V)
+        - pattern: uint32($V)
+        - pattern: int8($V)
+        - pattern: int16($V)
+        - pattern: int32($V)
+      - metavariable-regex:
+          metavariable: $V
+          regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+    pattern-sanitizers:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || $V > $MAX { return 0 }
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || uint64($V) > $MAX { return 0 }
+          - pattern-inside: if $MIN <= $V && $V <= $MAX { return $CAST($V) }
+          - pattern-inside: if $V >= $MIN && $V <= $MAX { return $CAST($V) }
+        - pattern: uint8($V)
+        - metavariable-comparison:
+            metavariable: $MIN
+            comparison: $MIN >= 0
+        - metavariable-comparison:
+            metavariable: $MAX
+            comparison: $MAX <= 255
+        - focus-metavariable: $V
+        - pattern-not-inside: if $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            uint64 := ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            var uint64 = ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(..., uint64 $T, ...) { ... }
+
+        - pattern-not-inside: |+
+            ...
+            var uint64 = ...
+            ...
+
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || $V > $MAX { return 0 }
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || uint64($V) > $MAX { return 0 }
+          - pattern-inside: if $MIN <= $V && $V <= $MAX { return $CAST($V) }
+          - pattern-inside: if $V >= $MIN && $V <= $MAX { return $CAST($V) }
+        - pattern: uint16($V)
+        - metavariable-comparison:
+            metavariable: $MIN
+            comparison: $MIN >= 0
+        - metavariable-comparison:
+            metavariable: $MAX
+            comparison: $MAX <= 65535
+        - focus-metavariable: $V
+        - pattern-not-inside: if $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            uint64 := ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            var uint64 = ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(..., uint64 $T, ...) { ... }
+
+        - pattern-not-inside: |+
+            ...
+            var uint64 = ...
+            ...
+
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || $V > $MAX { return 0 }
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || uint64($V) > $MAX { return 0 }
+          - pattern-inside: if $MIN <= $V && $V <= $MAX { return $CAST($V) }
+          - pattern-inside: if $V >= $MIN && $V <= $MAX { return $CAST($V) }
+        - pattern: uint32($V)
+        - metavariable-comparison:
+            metavariable: $MIN
+            comparison: $MIN >= 0
+        - metavariable-comparison:
+            metavariable: $MAX
+            comparison: $MAX <= 4294967295
+        - focus-metavariable: $V
+        - pattern-not-inside: if $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            uint64 := ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            var uint64 = ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(..., uint64 $T, ...) { ... }
+
+        - pattern-not-inside: |+
+            ...
+            var uint64 = ...
+            ...
+
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || $V > $MAX { return 0 }
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || uint64($V) > $MAX { return 0 }
+          - pattern-inside: if $MIN <= $V && $V <= $MAX { return $CAST($V) }
+          - pattern-inside: if $V >= $MIN && $V <= $MAX { return $CAST($V) }
+        - pattern: int8($V)
+        - metavariable-comparison:
+            metavariable: $MIN
+            comparison: $MIN >= -128
+        - metavariable-comparison:
+            metavariable: $MAX
+            comparison: $MAX <= 127
+        - focus-metavariable: $V
+        - pattern-not-inside: if $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            uint64 := ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            var uint64 = ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(..., uint64 $T, ...) { ... }
+
+        - pattern-not-inside: |+
+            ...
+            var uint64 = ...
+            ...
+
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || $V > $MAX { return 0 }
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || uint64($V) > $MAX { return 0 }
+          - pattern-inside: if $MIN <= $V && $V <= $MAX { return $CAST($V) }
+          - pattern-inside: if $V >= $MIN && $V <= $MAX { return $CAST($V) }
+        - pattern: int16($V)
+        - metavariable-comparison:
+            metavariable: $MIN
+            comparison: $MIN >= -32768
+        - metavariable-comparison:
+            metavariable: $MAX
+            comparison: $MAX <= 32767
+        - focus-metavariable: $V
+        - pattern-not-inside: if $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            uint64 := ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            var uint64 = ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(..., uint64 $T, ...) { ... }
+
+        - pattern-not-inside: |+
+            ...
+            var uint64 = ...
+            ...
+
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || $V > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                return $CAST($V)
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT := $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - patterns:
+            - pattern-inside: |
+                if $ERR != nil || $V < $MIN || uint64($V) > $MAX { return ... }
+                $OUT = $CAST($V)
+            - metavariable-regex:
+                metavariable: $OUT
+                regex: ^[\p{L}_][\p{L}\p{Nd}_]*$
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || $V > $MAX { return 0 }
+          - pattern-inside: |
+              $OUT := $CAST($V)
+              if $V < $MIN || uint64($V) > $MAX { return 0 }
+          - pattern-inside: if $MIN <= $V && $V <= $MAX { return $CAST($V) }
+          - pattern-inside: if $V >= $MIN && $V <= $MAX { return $CAST($V) }
+        - pattern: int32($V)
+        - metavariable-comparison:
+            metavariable: $MIN
+            comparison: $MIN >= -2147483648
+        - metavariable-comparison:
+            metavariable: $MAX
+            comparison: $MAX <= 2147483647
+        - focus-metavariable: $V
+        - pattern-not-inside: if $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || $V > $MAX { ... }
+        - pattern-not-inside: if $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: if $ERR != nil || $V < $MIN || uint64($V) > $MAX { ... }
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            uint64 := ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(...) {
+            ...
+            var uint64 = ...
+            ...
+            }
+
+        - pattern-not-inside: |+
+            func $F(..., uint64 $T, ...) { ... }
+
+        - pattern-not-inside: |+
+            ...
+            var uint64 = ...
+            ...
+
+      exact: true
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern-inside: |
+              $V, $ERR := strconv.ParseInt(..., ..., $BITS)
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR := strconv.ParseInt(..., ..., $BITS)
+              if $ERR != nil { return ... }
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR = strconv.ParseInt(..., ..., $BITS)
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR = strconv.ParseInt(..., ..., $BITS)
+              if $ERR != nil { return ... }
+              return $CAST($V)
+        - pattern: int8($V)
+        - metavariable-comparison:
+            metavariable: $BITS
+            comparison: $BITS > 0 and $BITS <= 8
+        - focus-metavariable: $V
+      - patterns:
+        - pattern-either:
+          - pattern-inside: |
+              $V, $ERR := strconv.ParseInt(..., ..., $BITS)
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR := strconv.ParseInt(..., ..., $BITS)
+              if $ERR != nil { return ... }
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR = strconv.ParseInt(..., ..., $BITS)
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR = strconv.ParseInt(..., ..., $BITS)
+              if $ERR != nil { return ... }
+              return $CAST($V)
+        - pattern: int16($V)
+        - metavariable-comparison:
+            metavariable: $BITS
+            comparison: $BITS > 0 and $BITS <= 16
+        - focus-metavariable: $V
+      - patterns:
+        - pattern-either:
+          - pattern-inside: |
+              $V, $ERR := strconv.ParseInt(..., ..., $BITS)
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR := strconv.ParseInt(..., ..., $BITS)
+              if $ERR != nil { return ... }
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR = strconv.ParseInt(..., ..., $BITS)
+              return $CAST($V)
+          - pattern-inside: |
+              $V, $ERR = strconv.ParseInt(..., ..., $BITS)
+              if $ERR != nil { return ... }
+              return $CAST($V)
+        - pattern: int32($V)
+        - metavariable-comparison:
+            metavariable: $BITS
+            comparison: $BITS > 0 and $BITS <= 32
+        - focus-metavariable: $V
+      exact: true
+    metadata:
+      cwe:
+      - CWE-190
+      - CWE-681
+      tags:
+      - security
+      - go
+      - integer
+      - truncation
+      - taint

@@ -1,0 +1,1181 @@
+"""Tests for ``packages.sca.transitive.expand_missing_transitives``.
+
+The orchestrator is a thin coordinator over (b) cascade resolver and
+(c) registry-metadata walk. The two underlying mechanisms have their
+own dedicated test suites; here we exercise the per-(ecosystem,
+project_dir) decision tree:
+
+  - sibling lockfile present → skip
+  - --no-resolve-transitive AND no fallback → skip
+  - cascade succeeds → emit cascade_resolver-tagged deps
+  - cascade fails AND fallback enabled → emit metadata_walk-tagged deps
+  - cascade fails AND fallback disabled → emit skip status
+
+Mocks: cascade resolver via ``get_resolver`` patch; metadata walker
+via direct ``walk_transitive`` patch. No real network or subprocess
+fires.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+
+from packages.sca.models import Confidence, Dependency, Manifest, PinStyle
+from packages.sca.resolvers import ResolverResult
+from core.testing.processes import run_in_process_group as _run_memory_process
+from packages.sca.transitive import (
+    _collapse_cargo_workspaces,
+    _is_cargo_workspace_root,
+    expand_missing_transitives,
+)
+
+
+def _manifest(eco: str, path: Path, *, is_lockfile: bool = False) -> Manifest:
+    return Manifest(path=path, ecosystem=eco, is_lockfile=is_lockfile)
+
+
+def _direct(eco: str, name: str, version: str, host: Path) -> Dependency:
+    return Dependency(
+        ecosystem=eco, name=name, version=version,
+        declared_in=host, scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT,
+        direct=True, purl=f"pkg:{eco.lower()}/{name}@{version}",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+
+
+def _transitive_dep(eco: str, name: str, version: str,
+                     host: Path, source_kind: str = "lockfile") -> Dependency:
+    return Dependency(
+        ecosystem=eco, name=name, version=version,
+        declared_in=host, scope="main", is_lockfile=False,
+        pin_style=PinStyle.EXACT, direct=False,
+        purl=f"pkg:{eco.lower()}/{name}@{version}",
+        parser_confidence=Confidence("high", reason="t"),
+        source_kind=source_kind,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Skip cases
+# ---------------------------------------------------------------------------
+
+def test_skips_when_sibling_lockfile_present(tmp_path):
+    """A manifest with a sibling lockfile already on disk → skip
+    transitive expansion; the lockfile parser handled it."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [
+        _manifest("PyPI", proj / "requirements.txt"),
+        _manifest("PyPI", proj / "Pipfile.lock", is_lockfile=True),
+    ]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+    deps, statuses = expand_missing_transitives(manifests, direct)
+    assert deps == []
+    assert len(statuses) == 1
+    assert statuses[0].method == "skipped_lockfile_present"
+    assert "Pipfile.lock" in (statuses[0].reason or "")
+
+
+def test_skips_when_resolver_disabled_and_no_fallback(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+    deps, statuses = expand_missing_transitives(
+        manifests, direct,
+        enable_resolver=False, enable_metadata_fallback=False,
+    )
+    assert deps == []
+    assert statuses[0].method == "skipped_resolver_disabled"
+
+
+# ---------------------------------------------------------------------------
+# Cascade resolver path (mode b)
+# ---------------------------------------------------------------------------
+
+def test_cascade_succeeds_emits_cascade_tagged_deps(tmp_path, monkeypatch):
+    """When cascade resolver succeeds, transitives are emitted with
+    source_kind="cascade_resolver" so operators can distinguish from
+    a checked-in lockfile."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "requirements.txt").write_text("a==1.0\n", encoding="utf-8")
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+
+    # Stub the resolver: pretend pip-compile produced a pinned reqs
+    # file containing both the direct dep AND a transitive.
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"a==1.0\nb==2.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.transitive.get_resolver"
+        if False else "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+
+    assert len(deps) == 1
+    assert deps[0].name == "b"
+    assert deps[0].version == "2.0"
+    assert deps[0].source_kind == "cascade_resolver"
+    assert deps[0].direct is False
+    assert statuses[0].method == "cascade_resolver"
+    assert statuses[0].deps_added == 1
+
+
+def test_cascade_resolver_unavailable_falls_through(tmp_path, monkeypatch):
+    """No toolchain → resolver returns is_available=False → cascade
+    falls through. With fallback off, status records the skip."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = False
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+    assert deps == []
+    assert statuses[0].method == "skipped_no_method_succeeded"
+
+
+def test_cascade_resolver_fails_falls_through(tmp_path, monkeypatch):
+    """Resolver runs but exits non-zero (registry refused / can't
+    satisfy). Fall through to skip status (no fallback)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=False, available=True,
+        error="ResolutionImpossible: a requires b<1, c requires b>=2",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+    assert deps == []
+    assert statuses[0].method == "skipped_no_method_succeeded"
+
+
+# ---------------------------------------------------------------------------
+# Metadata-walk fallback (mode c)
+# ---------------------------------------------------------------------------
+
+def test_fallback_to_metadata_walk_when_cascade_fails(tmp_path, monkeypatch):
+    """Cascade unavailable + fallback enabled → metadata walk fires,
+    deps emitted with source_kind=metadata_walk."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+
+    # Cascade unavailable.
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = False
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    # Stub the metadata walker.
+    from packages.sca.registry_metadata_walk import WalkResult
+    walked = [_transitive_dep("PyPI", "b", "2.0",
+                                proj / "requirements.txt",
+                                source_kind="metadata_walk")]
+    monkeypatch.setattr(
+        "packages.sca.registry_metadata_walk.walk_transitive",
+        lambda deps, **kw: WalkResult(
+            deps_added=walked, visits=1, cache_hits=0,
+            cache_misses=1, failures=0,
+        ),
+    )
+
+    deps, statuses = expand_missing_transitives(
+        manifests, direct,
+        http=MagicMock(),
+        enable_metadata_fallback=True,
+    )
+    assert len(deps) == 1
+    assert deps[0].source_kind == "metadata_walk"
+    assert statuses[0].method == "metadata_walk"
+    assert "approximate" in (statuses[0].reason or "").lower()
+
+
+def test_no_metadata_fallback_when_http_not_provided(tmp_path, monkeypatch):
+    """Even with --fallback-registry-metadata, walk needs http.
+    Without it, fall through to skip."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "a", "1.0", proj / "requirements.txt")]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = False
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(
+        manifests, direct,
+        http=None,                 # no http
+        enable_metadata_fallback=True,
+    )
+    assert deps == []
+    assert statuses[0].method == "skipped_no_method_succeeded"
+
+
+# ---------------------------------------------------------------------------
+# Dedup against direct deps
+# ---------------------------------------------------------------------------
+
+def test_dedup_against_direct_deps(tmp_path, monkeypatch):
+    """If cascade output includes a dep that's ALSO already declared
+    direct, don't re-emit it as a transitive — operator already saw
+    it via the manifest."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [
+        _direct("PyPI", "a", "1.0", proj / "requirements.txt"),
+        _direct("PyPI", "b", "2.0", proj / "requirements.txt"),
+    ]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    # Cascade output includes both direct deps + a new transitive.
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"a==1.0\nb==2.0\nc==3.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, _ = expand_missing_transitives(manifests, direct)
+    names = {d.name for d in deps}
+    assert names == {"c"}     # b stripped (already direct)
+
+
+# ---------------------------------------------------------------------------
+# Multi-ecosystem orchestration
+# ---------------------------------------------------------------------------
+
+def test_per_ecosystem_independent_decisions(tmp_path, monkeypatch):
+    """A project with PyPI + npm: PyPI cascade succeeds, npm has no
+    toolchain → falls back. Each ecosystem reports its own status."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [
+        _manifest("PyPI", proj / "requirements.txt"),
+        _manifest("npm", proj / "package.json"),
+    ]
+    direct = [
+        _direct("PyPI", "a", "1.0", proj / "requirements.txt"),
+        _direct("npm", "lodash", "4.17.21", proj / "package.json"),
+    ]
+
+    def fake_get_resolver(eco, project_dir=None):
+        r = MagicMock()
+        if eco == "PyPI":
+            r.is_available.return_value = True
+            r.dry_run.return_value = ResolverResult(
+                ecosystem="PyPI", success=True, available=True,
+                proposed_lockfile=b"a==1.0\npy_trans==1.0\n",
+            )
+        else:
+            r.is_available.return_value = False
+        return r
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+    by_eco = {s.ecosystem: s for s in statuses}
+    assert by_eco["PyPI"].method == "cascade_resolver"
+    assert by_eco["npm"].method == "skipped_no_method_succeeded"
+    # PEP 503: parser normalises "py_trans" → "py-trans".
+    assert any(d.name == "py-trans" for d in deps)
+    assert all(d.ecosystem != "npm" for d in deps)
+
+
+# ---------------------------------------------------------------------------
+# Batched cascade dispatch — shared venv, parallel manifests
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_batch_default_loops_dry_run():
+    """The free-function default for resolvers without
+    ``SUPPORTS_BATCH`` falls back to a sequential ``dry_run`` loop.
+    Defends the fallback so non-PipResolver consumers (npm, Maven,
+    Cargo, …) keep working without per-resolver opt-in."""
+    from packages.sca.resolvers import dry_run_batch
+
+    class _StubNoBatch:
+        def __init__(self):
+            self.calls: list = []
+
+        def dry_run(self, project_dir, *, timeout=120):
+            self.calls.append(project_dir)
+            return ResolverResult(
+                ecosystem="PyPI", success=True, available=True,
+                proposed_lockfile=b"x==1.0\n",
+            )
+
+    stub = _StubNoBatch()
+    out = dry_run_batch(stub, [Path("/p1"), Path("/p2"), Path("/p3")])
+    assert len(out) == 3
+    assert all(r.success for r in out)
+    assert stub.calls == [Path("/p1"), Path("/p2"), Path("/p3")]
+
+
+def test_dry_run_batch_uses_class_flag_not_attr_presence():
+    """Resolvers opt into batching via class-level
+    ``SUPPORTS_BATCH = True``. Mere attribute presence (e.g. a
+    MagicMock auto-attr) must NOT trigger the batch path —
+    ``list(MagicMock())`` returns an empty list, which would silently
+    zero out test results."""
+    from packages.sca.resolvers import dry_run_batch
+    from unittest.mock import MagicMock
+
+    fake = MagicMock()
+    fake.is_available.return_value = True
+    fake.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"x==1.0\n",
+    )
+    out = dry_run_batch(fake, [Path("/p1"), Path("/p2")])
+    assert len(out) == 2
+    assert all(r.success for r in out)
+    assert fake.dry_run.call_count == 2
+
+
+def test_dry_run_batch_uses_resolver_method_when_flag_set():
+    """When ``SUPPORTS_BATCH=True`` the free function delegates to
+    the resolver's ``dry_run_batch`` and returns its result verbatim
+    (no extra wrapping)."""
+    from packages.sca.resolvers import dry_run_batch
+
+    class _StubBatch:
+        SUPPORTS_BATCH = True
+
+        def __init__(self):
+            self.calls: list = []
+
+        def dry_run(self, *a, **kw):
+            raise AssertionError("dry_run shouldn't be called")
+
+        def dry_run_batch(self, project_dirs, *, common_root=None,
+                          timeout=120):
+            self.calls.append((tuple(project_dirs), common_root, timeout))
+            return [
+                ResolverResult(
+                    ecosystem="PyPI", success=True, available=True,
+                    proposed_lockfile=f"{p}==1.0\n".encode(),
+                ) for p in project_dirs
+            ]
+
+    stub = _StubBatch()
+    out = dry_run_batch(
+        stub, [Path("/a"), Path("/b")], common_root=Path("/"),
+    )
+    assert len(out) == 2
+    assert stub.calls == [((Path("/a"), Path("/b")), Path("/"), 120)]
+
+
+def test_dry_run_batch_falls_back_when_batch_raises():
+    """A buggy ``dry_run_batch`` must not abort the scan — the free
+    function catches and falls back to sequential ``dry_run``. The
+    operator sees a warning + complete results, never a crash."""
+    from packages.sca.resolvers import dry_run_batch
+
+    class _StubBuggyBatch:
+        SUPPORTS_BATCH = True
+
+        def __init__(self):
+            self.dry_run_calls = 0
+
+        def dry_run_batch(self, project_dirs, *, common_root=None,
+                          timeout=120):
+            raise RuntimeError("simulated batch crash")
+
+        def dry_run(self, project_dir, *, timeout=120):
+            self.dry_run_calls += 1
+            return ResolverResult(
+                ecosystem="PyPI", success=True, available=True,
+                proposed_lockfile=b"x==1.0\n",
+            )
+
+    stub = _StubBuggyBatch()
+    out = dry_run_batch(stub, [Path("/p1"), Path("/p2")])
+    assert len(out) == 2
+    assert all(r.success for r in out)
+    assert stub.dry_run_calls == 2
+
+
+# ---------------------------------------------------------------------------
+# _common_ancestor — sandbox cwd sizing
+# ---------------------------------------------------------------------------
+
+
+def test_common_ancestor_single_path_returns_self():
+    from packages.sca.transitive import _common_ancestor
+    assert _common_ancestor([Path("/a/b/c")]) == Path("/a/b/c")
+
+
+def test_common_ancestor_multiple_paths_finds_shared_prefix(tmp_path):
+    from packages.sca.transitive import _common_ancestor
+    (tmp_path / "a/x").mkdir(parents=True)
+    (tmp_path / "a/y/z").mkdir(parents=True)
+    common = _common_ancestor([tmp_path / "a/x", tmp_path / "a/y/z"])
+    assert common == (tmp_path / "a").resolve()
+
+
+def test_common_ancestor_disjoint_paths_refused():
+    """Disjoint inputs share only the filesystem root — returning
+    ``/`` sized the batch sandbox cwd filesystem-wide; ``None`` makes
+    the batch resolvers fall back to sequential per-dir sessions."""
+    from packages.sca.transitive import _common_ancestor
+    assert _common_ancestor([Path("/x/y"), Path("/p/q")]) is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-ecosystem parallel dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_cross_ecosystem_parallel_runs_concurrently(tmp_path, monkeypatch):
+    """Two ecosystems' batches dispatch on separate threads. Each
+    cascade sleeps briefly to simulate the sandbox subprocess; the
+    total wallclock is bounded by the slower one, not the sum.
+
+    Defends the cross-ecosystem parallelism — without threads each
+    ecosystem's batch would serialise behind the previous one."""
+    import threading
+    from packages.sca.transitive import _run_cascades_parallel
+
+    # Structural concurrency check: both ecosystem batches must be
+    # in flight at the same moment to release the barrier. A
+    # serialised implementation leaves the first batch waiting alone
+    # until the barrier times out — no wall-clock assertion, so
+    # scheduler jitter under a loaded test runner can't flake this.
+    barrier = threading.Barrier(2)
+
+    def fake_try(eco, work_items, cache=None):
+        try:
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError:
+            raise AssertionError(
+                "cascade batches serialised: second ecosystem batch "
+                "never started while the first was still running"
+            ) from None
+        return [(pd, host, [], None) for pd, host in work_items]
+
+    monkeypatch.setattr(
+        "packages.sca.transitive._try_cascade_batch", fake_try,
+    )
+
+    work = {
+        "PyPI": [(tmp_path / "a", tmp_path / "a/req.txt")],
+        "npm":  [(tmp_path / "b", tmp_path / "b/pkg.json")],
+    }
+    out = _run_cascades_parallel(work)
+    assert ("PyPI", tmp_path / "a") in out
+    assert ("npm", tmp_path / "b") in out
+
+
+def test_cross_ecosystem_one_crashes_others_proceed(tmp_path, monkeypatch):
+    """A crash in one ecosystem's batch shouldn't take down the
+    others. The crashed ecosystem gets per-item failure rows so
+    downstream can still emit a meaningful TransitiveStatus."""
+    from packages.sca.transitive import _run_cascades_parallel
+
+    def fake_try(eco, work_items, cache=None):
+        if eco == "PyPI":
+            raise RuntimeError("PyPI batch blew up")
+        return [(pd, host, [], None) for pd, host in work_items]
+
+    monkeypatch.setattr(
+        "packages.sca.transitive._try_cascade_batch", fake_try,
+    )
+
+    work = {
+        "PyPI": [(tmp_path / "a", tmp_path / "a/req.txt")],
+        "npm":  [(tmp_path / "b", tmp_path / "b/pkg.json")],
+    }
+    out = _run_cascades_parallel(work)
+    py = out[("PyPI", tmp_path / "a")]
+    assert py[0] is None
+    assert "blew up" in (py[1] or "")
+    npm = out[("npm", tmp_path / "b")]
+    assert npm[0] == []
+    assert npm[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Pre-resolution typosquat gate
+# ---------------------------------------------------------------------------
+
+
+def test_typosquat_dep_skips_cascade(tmp_path, monkeypatch):
+    """A direct dep flagged as a confident typosquat causes its
+    (ecosystem, project_dir) to skip the cascade resolver — we don't
+    want pip-compile / npm install fetching metadata for an
+    attacker-controlled name. Status row records the refusal."""
+    from packages.sca.supply_chain.typosquat import TyposquatFinding
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "requirements.txt").write_text("requessts==1.0\n")
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "requessts", "1.0", proj / "requirements.txt")]
+
+    # Stub the typosquat scanner to flag 'requessts' as a HIGH-
+    # confidence squat of 'requests'.
+    def fake_scan(deps):
+        return [
+            TyposquatFinding(
+                dependency=d,
+                nearest_popular="requests",
+                distance=1,
+                severity="medium",
+                confidence=Confidence("high",
+                                       reason="distance=1 from popular"),
+            )
+            for d in deps if d.name == "requessts"
+        ]
+    monkeypatch.setattr(
+        "packages.sca.supply_chain.typosquat.scan_deps", fake_scan,
+    )
+
+    # Stub the resolver too, so if cascade WERE invoked we'd notice
+    # (it would return a fake result instead of raising).
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"requessts==1.0\nrequests==1.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+
+    # Cascade was refused — no transitive deps emerged.
+    assert deps == []
+    assert len(statuses) == 1
+    s = statuses[0]
+    assert s.method == "skipped_typosquat_refused"
+    assert "requessts" in (s.reason or "")
+    # And the resolver was NEVER called — the gate fired upstream.
+    fake_resolver.dry_run.assert_not_called()
+
+
+def test_medium_confidence_typosquat_does_not_skip(tmp_path, monkeypatch):
+    """The gate only refuses on HIGH-confidence flags. Medium-confidence
+    ones still surface as findings but don't block cascade — the
+    operator may have a legitimate package with a similar name."""
+    from packages.sca.supply_chain.typosquat import TyposquatFinding
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "requirements.txt").write_text("requestz==1.0\n")
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "requestz", "1.0", proj / "requirements.txt")]
+
+    def fake_scan(deps):
+        return [
+            TyposquatFinding(
+                dependency=d, nearest_popular="requests",
+                distance=2, severity="medium",
+                confidence=Confidence("medium", reason="distance=2"),
+            )
+            for d in deps if d.name == "requestz"
+        ]
+    monkeypatch.setattr(
+        "packages.sca.supply_chain.typosquat.scan_deps", fake_scan,
+    )
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"requestz==1.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    _, statuses = expand_missing_transitives(manifests, direct)
+    # Medium confidence → cascade still runs (different status).
+    assert statuses[0].method != "skipped_typosquat_refused"
+
+
+# ---------------------------------------------------------------------------
+# Cargo workspace collapse
+# ---------------------------------------------------------------------------
+
+
+def test_is_cargo_workspace_root(tmp_path):
+    root = tmp_path / "Cargo.toml"
+    root.write_text("[workspace]\nmembers = ['a']\n")
+    assert _is_cargo_workspace_root(root) is True
+
+    member = tmp_path / "a" / "Cargo.toml"
+    member.parent.mkdir()
+    member.write_text("[package]\nname = 'a'\n")
+    assert _is_cargo_workspace_root(member) is False
+
+
+def test_is_cargo_workspace_root_missing_file(tmp_path):
+    assert _is_cargo_workspace_root(tmp_path / "nonexistent") is False
+
+
+def test_collapse_cargo_workspaces_drops_members(tmp_path):
+    """Workspace members with a lockfile at the root get collapsed."""
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "Cargo.toml").write_text("[workspace]\nmembers = ['a', 'b']\n")
+    (root / "Cargo.lock").write_text("# lock\n")
+    a_dir = root / "a"
+    a_dir.mkdir()
+    (a_dir / "Cargo.toml").write_text("[package]\nname = 'a'\n")
+    b_dir = root / "b"
+    b_dir.mkdir()
+    (b_dir / "Cargo.toml").write_text("[package]\nname = 'b'\n")
+
+    m_a = _manifest("Cargo", a_dir / "Cargo.toml")
+    m_b = _manifest("Cargo", b_dir / "Cargo.toml")
+    lockfile_dirs = {
+        ("Cargo", root): _manifest("Cargo", root / "Cargo.lock", is_lockfile=True),
+    }
+    by_eco_dir = {
+        ("Cargo", a_dir): [m_a],
+        ("Cargo", b_dir): [m_b],
+    }
+    result = _collapse_cargo_workspaces(by_eco_dir, lockfile_dirs)
+    assert ("Cargo", a_dir) not in result
+    assert ("Cargo", b_dir) not in result
+
+
+def test_collapse_cargo_workspaces_keeps_non_cargo(tmp_path):
+    """Non-Cargo entries pass through untouched."""
+    pip_dir = tmp_path / "py"
+    pip_dir.mkdir()
+    m = _manifest("PyPI", pip_dir / "requirements.txt")
+    by_eco_dir = {("PyPI", pip_dir): [m]}
+    result = _collapse_cargo_workspaces(by_eco_dir, {})
+    assert ("PyPI", pip_dir) in result
+
+
+def test_collapse_cargo_workspaces_keeps_standalone(tmp_path):
+    """A standalone Cargo project (no workspace parent) stays."""
+    proj = tmp_path / "standalone"
+    proj.mkdir()
+    (proj / "Cargo.toml").write_text("[package]\nname = 'solo'\n")
+    m = _manifest("Cargo", proj / "Cargo.toml")
+    result = _collapse_cargo_workspaces({("Cargo", proj): [m]}, {})
+    assert ("Cargo", proj) in result
+
+
+def test_include_only_manifest_still_dispatches_cascade(tmp_path, monkeypatch):
+    """A top-level requirements.txt containing only `-r reqs/base.txt`
+    carries deps whose declared_in is the INCLUDED file — the zero-
+    direct-deps filter must not drop it from cascade dispatch."""
+    proj = tmp_path / "proj"
+    (proj / "reqs").mkdir(parents=True)
+    top = proj / "requirements.txt"
+    base = proj / "reqs" / "base.txt"
+    top.write_text("-r reqs/base.txt\n", encoding="utf-8")
+    base.write_text("a==1.0\n", encoding="utf-8")
+
+    # find_manifests discovers only the conventional top-level name;
+    # the included file surfaces through the parser's include walk,
+    # so its deps carry declared_in=base.
+    manifests = [_manifest("PyPI", top)]
+    direct = [_direct("PyPI", "a", "1.0", base)]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"a==1.0\nb==2.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+
+    assert [d.name for d in deps] == ["b"]
+    assert statuses and statuses[0].method == "cascade_resolver"
+
+
+def test_nested_include_chain_dispatches_cascade(tmp_path, monkeypatch):
+    """-r chains nest: top -> mid -> base. The fixpoint walk must reach
+    the top-level manifest through the intermediate include file."""
+    proj = tmp_path / "proj"
+    (proj / "reqs").mkdir(parents=True)
+    top = proj / "requirements.txt"
+    mid = proj / "reqs" / "mid.txt"
+    base = proj / "reqs" / "base.txt"
+    top.write_text("-r reqs/mid.txt\n", encoding="utf-8")
+    mid.write_text("-r base.txt\n", encoding="utf-8")
+    base.write_text("a==1.0\n", encoding="utf-8")
+
+    manifests = [_manifest("PyPI", top), _manifest("PyPI", mid)]
+    direct = [_direct("PyPI", "a", "1.0", base)]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"a==1.0\nb==2.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+
+    # Two dispatch groups (proj/ and proj/reqs/) each resolve — the
+    # point is that NEITHER include-only manifest was filtered out.
+    assert {d.name for d in deps} == {"b"}
+    assert len(statuses) == 2
+    assert all(s.method == "cascade_resolver" for s in statuses)
+
+
+def test_zero_dep_yaml_manifest_still_filtered(tmp_path):
+    """The include augmentation must not resurrect the noise the filter
+    exists for: a speculatively-routed YAML with zero parsed deps stays
+    out of cascade dispatch."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    rules = proj / "rules.yaml"
+    rules.write_text("just: config\n", encoding="utf-8")
+
+    manifests = [_manifest("Kubernetes", rules)]
+    deps, statuses = expand_missing_transitives(manifests, [])
+
+    assert deps == []
+    assert statuses == []
+
+
+# ---------------------------------------------------------------------------
+# pip-compile `# via` parent map — canonical keys
+# ---------------------------------------------------------------------------
+
+
+def test_pip_compile_via_map_uses_canonical_keys():
+    """Dotted PyPI names (``zope.interface``) must land under the
+    same PEP 503 canonical key the consumer looks them up with —
+    otherwise the parent linkage is lost and the transitive-drop
+    detector skips the dep."""
+    from packages.sca.transitive import (
+        _extract_pip_compile_via, _parent_map_key,
+    )
+
+    blob = (
+        b"zope.interface==5.4.0\n"
+        b"    # via zope.event\n"
+        b"ruamel.yaml==0.18.6\n"
+        b"    # via\n"
+        b"    #   my_parent\n"
+        b"    #   other.parent\n"
+    )
+    parents = _extract_pip_compile_via(blob)
+    # Producer keys == consumer keys, for dotted and underscored names.
+    assert parents[_parent_map_key("PyPI", "zope.interface")] == [
+        "zope-event",
+    ]
+    assert parents[_parent_map_key("PyPI", "ruamel.yaml")] == [
+        "my-parent", "other-parent",
+    ]
+
+
+def test_via_parents_flow_through_to_cascade_deps(tmp_path, monkeypatch):
+    """End-to-end through the cascade path: a dotted transitive keeps
+    its ``source_extra['via']`` parents."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "zope-event", "4.5", proj / "requirements.txt")]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=(
+            b"zope-event==4.5\n"
+            b"zope.interface==5.4.0\n"
+            b"    # via zope.event\n"
+        ),
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, _ = expand_missing_transitives(manifests, direct)
+    trans = {d.name: d for d in deps}
+    assert "zope-interface" in trans
+    assert (trans["zope-interface"].source_extra or {}).get("via") == [
+        "zope-event",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Per-project-dir resolver routing (mixed-tool monorepos)
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_tool_dirs_each_get_their_matching_resolver(
+    tmp_path, monkeypatch,
+):
+    """A monorepo with a poetry dir and a pip dir under the same
+    ecosystem must route each dir through the resolver whose
+    ``matches()`` picked it — one resolver chosen from the first dir
+    would run the wrong tool against the other."""
+    poetry_dir = tmp_path / "svc-poetry"
+    pip_dir = tmp_path / "svc-pip"
+    poetry_dir.mkdir()
+    pip_dir.mkdir()
+    (poetry_dir / "pyproject.toml").write_text("[tool.poetry]\n")
+    (pip_dir / "requirements.txt").write_text("a==1.0\n")
+
+    manifests = [
+        _manifest("PyPI", poetry_dir / "pyproject.toml"),
+        _manifest("PyPI", pip_dir / "requirements.txt"),
+    ]
+    direct = [
+        _direct("PyPI", "a", "1.0", poetry_dir / "pyproject.toml"),
+        _direct("PyPI", "b", "2.0", pip_dir / "requirements.txt"),
+    ]
+
+    calls: dict[str, list] = {"poetry": [], "pip": []}
+
+    def _stub(tag: str) -> MagicMock:
+        r = MagicMock()
+        r.is_available.return_value = True
+
+        def _dry_run(pd, timeout=120):
+            calls[tag].append(pd)
+            return ResolverResult(
+                ecosystem="PyPI", success=True, available=True,
+                proposed_lockfile=b"t==9.9\n",
+            )
+        r.dry_run.side_effect = _dry_run
+        return r
+
+    poetry_stub = _stub("poetry")
+    pip_stub = _stub("pip")
+
+    def fake_get_resolver(eco, project_dir=None):
+        assert project_dir is not None, (
+            "resolver selection must be per project_dir"
+        )
+        if (project_dir / "pyproject.toml").exists():
+            return poetry_stub
+        return pip_stub
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+
+    assert calls["poetry"] == [poetry_dir]
+    assert calls["pip"] == [pip_dir]
+    # Both dirs resolved successfully via their own tool.
+    assert all(s.method == "cascade_resolver" for s in statuses)
+    assert {d.name for d in deps} == {"t"}
+
+
+def test_dedup_across_multiple_project_dirs_unchanged(
+    tmp_path, monkeypatch,
+):
+    """The direct-dep dedup key set is loop-invariant; hoisting it
+    must not change behaviour when several (eco, project_dir) groups
+    each emit overlapping transitives."""
+    d1 = tmp_path / "one"
+    d2 = tmp_path / "two"
+    d1.mkdir()
+    d2.mkdir()
+    manifests = [
+        _manifest("PyPI", d1 / "requirements.txt"),
+        _manifest("PyPI", d2 / "requirements.txt"),
+    ]
+    direct = [
+        _direct("PyPI", "a", "1.0", d1 / "requirements.txt"),
+        _direct("PyPI", "b", "2.0", d2 / "requirements.txt"),
+    ]
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        # Both groups produce the direct deps AND one new transitive.
+        proposed_lockfile=b"a==1.0\nb==2.0\nc==3.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+    # Direct deps stripped in every group; only the new transitive
+    # survives (once per project_dir, as before).
+    assert {d.name for d in deps} == {"c"}
+    assert all(s.method == "cascade_resolver" for s in statuses)
+
+
+class TestCanonicalNameSharedRule:
+    """The detector must join on the SAME canonical form as the rest
+    of the pipeline (packages/sca/naming.py) — its hand-rolled fold
+    diverged both ways."""
+
+    def test_pypi_dotted_name_folds_per_pep503(self):
+        from packages.sca.transitive_drop.detector import _canonical_name
+        # Pre-fix: "foo.bar" stayed "foo.bar" while the pipeline
+        # folded it to "foo-bar" — a dotted transitive dep evaded
+        # drop detection.
+        assert _canonical_name("PyPI", "Foo.Bar") == "foo-bar"
+        assert _canonical_name("PyPI", "foo_bar") == "foo-bar"
+
+    def test_case_sensitive_ecosystems_pass_through(self):
+        from packages.sca.transitive_drop.detector import _canonical_name
+        # Pre-fix: Cargo/Go names were lowercased here and nowhere
+        # else, minting false matches at this boundary only.
+        assert _canonical_name("Go", "github.com/Foo/Bar") == "github.com/Foo/Bar"
+        assert _canonical_name("Maven", "com.Example:Artifact") == "com.Example:Artifact"
+
+    def test_npm_lowercases(self):
+        from packages.sca.transitive_drop.detector import _canonical_name
+        assert _canonical_name("npm", "@Scope/Pkg") == "@scope/pkg"
+
+
+class TestParentMapProducerClosure:
+    """Every cascade parent-map producer must emit child keys AND
+    parent values already folded by ``_parent_map_key`` — the
+    transitive-drop detector joins ``source_extra["via"]`` back
+    through that rule, so a producer outside it silently loses the
+    parent linkage. The producer set is enumerated mechanically so
+    a new extractor cannot ship outside the closure."""
+
+    # Mixed-case samples: the fixpoint assertion below is vacuous on
+    # all-lowercase input, so every sample carries case.
+    _SAMPLES = {
+        "_extract_cargo_lock_parents": ("Cargo", (
+            b'[[package]]\n'
+            b'name = "Inflector"\n'
+            b'version = "0.11.4"\n'
+            b'dependencies = ["Regex-Syntax 0.6.0"]\n'
+            b'\n'
+            b'[[package]]\n'
+            b'name = "Regex-Syntax"\n'
+            b'version = "0.6.0"\n'
+        )),
+        "_extract_composer_lock_parents": ("Packagist", (
+            b'{"packages": [{"name": "Vendor/Package",'
+            b' "require": {"Child/Lib": "^1.0"}}]}'
+        )),
+        "_extract_gemfile_lock_parents": ("RubyGems", (
+            b"GEM\n"
+            b"  remote: https://rubygems.org/\n"
+            b"  specs:\n"
+            b"    RedCloth (4.3.4)\n"
+            b"      Nokogiri (= 1.16.0)\n"
+            b"    Nokogiri (1.16.0)\n"
+        )),
+        "_extract_npm_lock_parents": ("npm", (
+            b'{"packages": {"": {},'
+            b' "node_modules/ParentPkg":'
+            b' {"dependencies": {"ChildPkg": "^1.0"}}}}'
+        )),
+        # Extras-carrying shape included deliberately: an unstripped
+        # ``celery[redis]`` is its own pep503 fixpoint, so only the
+        # no-brackets assertion below can see it.
+        "_extract_pip_compile_via": ("PyPI", (
+            b"Zope.Interface==5.0\n"
+            b"    # via My_Parent\n"
+            b"Redis==4.5.0\n"
+            b"    # via Celery[redis]\n"
+        )),
+    }
+
+    def _producers(self):
+        import packages.sca.transitive as t
+        return {
+            name: fn for name, fn in vars(t).items()
+            if callable(fn)
+            and name.startswith("_extract_")
+            and (name.endswith("_parents") or name.endswith("_via"))
+        }
+
+    def test_every_producer_has_a_sample(self):
+        assert set(self._producers()) == set(self._SAMPLES)
+
+    def test_producers_emit_join_key_fixpoints(self):
+        from packages.sca.transitive import _parent_map_key
+        for name, fn in self._producers().items():
+            eco, blob = self._SAMPLES[name]
+            mapping = fn(blob)
+            assert mapping, f"{name}: sample produced no edges"
+            for child, parents in mapping.items():
+                assert child == _parent_map_key(eco, child), (
+                    f"{name}: child key {child!r} not join-key folded"
+                )
+                assert parents, f"{name}: {child!r} has no parents"
+                for p in parents:
+                    assert p == _parent_map_key(eco, p), (
+                        f"{name}: parent {p!r} not join-key folded"
+                    )
+                    # Requirement syntax (PEP 508 extras) is never
+                    # part of a package name in any covered
+                    # ecosystem — and brackets survive the pep503
+                    # fold, so the fixpoint assertion above is
+                    # blind to them.
+                    assert "[" not in p, (
+                        f"{name}: parent {p!r} carries requirement "
+                        "syntax (extras) — can never join a direct "
+                        "dep's key"
+                    )
+
+    def test_pip_compile_extras_and_marker_lines_join(self):
+        """The real pip-compile shapes the fixpoint sweep cannot
+        pin by construction: an extras-carrying pinned line and a
+        marker-carrying pinned line must still produce edges (the
+        old pkg_re skipped both lines entirely), and an
+        extras-carrying via parent must fold to the bare name."""
+        from packages.sca.transitive import _extract_pip_compile_via
+        mapping = _extract_pip_compile_via(
+            b"Celery[redis]==5.3.6\n"
+            b"    # via My_App\n"
+            b'Redis==4.5.0 ; python_version >= "3.9"\n'
+            b"    # via\n"
+            b"    #   Celery[redis]\n"
+            b"    #   kombu\n"
+        )
+        assert mapping["celery"] == ["my-app"]
+        assert mapping["redis"] == ["celery", "kombu"]
+
+
+def _run_requirements_memory_proof(tmp_path):
+    """Measure the include reader without consuming a borrowed tracing session."""
+    import subprocess
+    import sys
+
+    from core.testing.standalone_cli import standalone_cli_env
+
+    root = Path(__file__).resolve().parents[3]
+    script = """\
+import sys
+import tracemalloc
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from pytest import MonkeyPatch
+from core.testing.state_isolation import pin_user_state_dirs
+from packages.sca.tests.test_transitive import test_requirements_include_scan_refuses_oversized_file
+assert not tracemalloc.is_tracing()
+owned = Path(sys.argv[2])
+with MonkeyPatch.context() as patch:
+    pin_user_state_dirs(patch, owned / "memory-child-state")
+    test_requirements_include_scan_refuses_oversized_file(owned)
+print("requirements-memory-proof-ok")
+"""
+    with standalone_cli_env() as env:
+        result = _run_memory_process(
+            [sys.executable, "-I", "-c", script, str(root), str(tmp_path)],
+            timeout=30, env=env, cwd=root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "requirements-memory-proof-ok", result.stdout
+
+
+def test_requirements_include_scan_refuses_oversized_file(
+    tmp_path,
+) -> None:
+    """A planted multi-hundred-MB requirements file must be refused by
+    stat, not slurped — the include scan allocated ~2x the file size
+    before this read was bounded."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        _run_requirements_memory_proof(tmp_path)
+        return
+
+    from packages.sca.transitive import _requirements_include_targets
+
+    p = tmp_path / "requirements.txt"
+    with p.open("wb") as fh:
+        fh.truncate(60 * 1024 * 1024)       # sparse: cheap to create
+    try:
+        tracemalloc.start()
+        targets = _requirements_include_targets(p)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert targets == set()
+    assert peak < 10 * 1024 * 1024
+
+
+def test_cargo_workspace_probe_refuses_symlink(tmp_path) -> None:
+    """A committed ``Cargo.toml`` symlink must not be followed to a
+    host file."""
+    from packages.sca.transitive import _is_cargo_workspace_root
+
+    outside = tmp_path / "outside.toml"
+    outside.write_text("[workspace]\n", encoding="utf-8")
+    link = tmp_path / "Cargo.toml"
+    link.symlink_to(outside)
+    assert _is_cargo_workspace_root(link) is False
+
+
+def test_common_ancestor_refuses_rootless_batches() -> None:
+    """Manifests whose only shared prefix is the filesystem root must
+    NOT size the batch sandbox cwd to "/" (filesystem-wide reads for
+    the whole resolver session). ``None`` makes the batch resolvers
+    take their documented sequential per-dir fallback instead."""
+    from pathlib import Path as _P
+
+    from packages.sca.transitive import _common_ancestor
+
+    assert _common_ancestor([_P("/srv/app"), _P("/opt/other")]) is None
+    # A real shared prefix still batches.
+    assert _common_ancestor(
+        [_P("/srv/app/a"), _P("/srv/app/b")]) == _P("/srv/app")
+
+
+def test_common_ancestor_single_root_input_refused() -> None:
+    from pathlib import Path as _P
+
+    from packages.sca.transitive import _common_ancestor
+
+    assert _common_ancestor([_P("/")]) is None
+    assert _common_ancestor([_P("/srv/app")]) == _P("/srv/app")

@@ -5,7 +5,7 @@ Uses test-only fake adapters and reviewers; no real LLM calls.
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
@@ -14,16 +14,11 @@ from core.llm.multi_model import (
     run_multi_model,
 )
 
-
 # ---------------------------------------------------------------------------
 # Test fixtures: minimal fake handles, adapters, reviewers, gates
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class FakeModel:
-    """Satisfies ModelHandle protocol."""
-    model_name: str
+# FakeModel (ModelHandle stand-in) comes from core.testing.
+from core.testing import FakeModel
 
 
 class IdentityAdapter:
@@ -31,20 +26,20 @@ class IdentityAdapter:
     and dedupes by id (later models override earlier on conflict).
     Correlate returns count of contributing models per id."""
 
-    def item_id(self, item: Dict[str, Any]) -> str:
+    def item_id(self, item: dict[str, Any]) -> str:
         if not item.get("id"):
             raise ValueError(f"item missing id: {item}")
         return item["id"]
 
     def merge(self, per_model_results):
-        by_id: Dict[str, Dict] = {}
+        by_id: dict[str, dict] = {}
         for model_name, results in per_model_results.items():
             for r in results:
                 by_id[self.item_id(r)] = {**r, "from_model": model_name}
         return list(by_id.values())
 
     def correlate(self, merged_items, per_model_results):
-        per_id_count: Dict[str, int] = {}
+        per_id_count: dict[str, int] = {}
         for results in per_model_results.values():
             for r in results:
                 per_id_count[self.item_id(r)] = per_id_count.get(self.item_id(r), 0) + 1
@@ -414,6 +409,30 @@ class TestReviewers:
         assert by_id["high-1"].get("high_reviewed") is True
         assert "high_reviewed" not in by_id["low-1"]
         assert "high_reviewed" not in by_id["low-2"]
+
+    def test_reviewer_item_missing_id_is_dropped_not_fatal(self):
+        """A reviewer item whose id field is missing must be ignored,
+        not crash the run — adapters implement item_id as plain dict
+        access, and the docstring guarantees bad return shapes are
+        caught. The reviewer's valid items still apply."""
+        class MissingIdReviewer:
+            name = "missing_id"
+            cutoff_ratio = 1.0
+
+            def review(self, items):
+                return [
+                    {"severity": "oops-no-id"},          # item_id raises
+                    {"id": "x", "annotated_by": "ok"},   # still applies
+                ]
+
+        result = run_multi_model(
+            task=lambda m: [{"id": "x"}],
+            models=[FakeModel("m")],
+            adapter=IdentityAdapter(),
+            reviewers=[MissingIdReviewer()],
+        )
+        assert len(result.items) == 1
+        assert result.items[0]["annotated_by"] == "ok"
 
     def test_conditional_reviewer_no_applicable_items(self):
         # If no items match should_review, reviewer is a no-op
@@ -1047,3 +1066,263 @@ class TestEndToEnd:
         )
         assert result.items == [{"id": "single", "from_model": "only"}]
         assert result.failed_models == []
+
+
+class TestTimeoutUnblocksCaller:
+    def test_timeout_returns_without_joining_hung_worker(self):
+        """The timeout must actually unblock the caller — pre-fix the
+        failure was recorded but ThreadPoolExecutor.__exit__ then
+        re-joined the hung worker, blocking the caller for the very
+        hang the timeout had just recorded. The worker thread may
+        linger (documented); the caller returns now."""
+        import time
+
+        from core.llm.multi_model.dispatch import _dispatch_parallel
+
+        release = threading.Event()
+
+        def hung_task(model):
+            # Simulates a wedged provider call; released by the test
+            # teardown so the lingering worker doesn't stall pytest's
+            # interpreter-exit thread join.
+            release.wait(30)
+            return []
+
+        try:
+            start = time.monotonic()
+            per_model, failed = _dispatch_parallel(
+                hung_task, [FakeModel("wedged")], max_parallel=1,
+                timeout=0.5,
+            )
+            elapsed = time.monotonic() - start
+            assert elapsed < 10, (
+                f"caller stayed blocked {elapsed:.1f}s — executor "
+                "re-joined the hung worker"
+            )
+            assert failed == ["wedged"]
+            assert per_model == {"wedged": []}
+        finally:
+            release.set()
+
+
+class TestFuturesTimeoutClassCoverage:
+    """``as_completed`` raises ``concurrent.futures.TimeoutError``,
+    which is only an alias of the builtin ``TimeoutError`` from Python
+    3.11 — on the 3.10 floor a bare ``except TimeoutError`` misses it
+    and the panel crashes instead of isolating the straggler."""
+
+    def test_distinct_futures_timeout_class_is_caught(self, monkeypatch):
+        """Simulate the 3.10 situation on any interpreter: bind the
+        module's futures-timeout name to a class DISTINCT from the
+        builtin and prove the except clause still isolates it."""
+        import core.llm.multi_model.dispatch as dispatch_mod
+
+        class DistinctTimeout(Exception):
+            """py3.10 stand-in: not a builtin TimeoutError subclass."""
+
+        def raising_as_completed(futures, timeout=None):
+            # Deterministic: let the trivial task finish first so the
+            # harvest path (not thread-scheduling luck) decides the
+            # outcome. The class-coverage claim under test is only
+            # that the except clause CATCHES this class.
+            for f in list(futures):
+                f.result()
+            raise DistinctTimeout
+
+        monkeypatch.setattr(
+            dispatch_mod, "FuturesTimeoutError", DistinctTimeout)
+        monkeypatch.setattr(
+            dispatch_mod, "as_completed", raising_as_completed)
+
+        per_model, failed = dispatch_mod._dispatch_parallel(
+            lambda m: [], [FakeModel("m1")], max_parallel=1, timeout=0.1,
+        )
+        # Caught (no crash) — and the completed future is harvested
+        # as a healthy zero-result member, not marked failed.
+        assert failed == []
+        assert per_model == {"m1": []}
+
+    def test_real_futures_timeout_error_is_caught(self, monkeypatch):
+        from concurrent.futures import TimeoutError as CFTimeout
+
+        import core.llm.multi_model.dispatch as dispatch_mod
+
+        def raising_as_completed(futures, timeout=None):
+            # Deterministic — see the DistinctTimeout variant above.
+            for f in list(futures):
+                f.result()
+            raise CFTimeout
+
+        monkeypatch.setattr(
+            dispatch_mod, "as_completed", raising_as_completed)
+        per_model, failed = dispatch_mod._dispatch_parallel(
+            lambda m: [], [FakeModel("m1")], max_parallel=1, timeout=0.1,
+        )
+        assert failed == []
+        assert per_model == {"m1": []}
+
+
+class TestPanelTimeoutParameter:
+    """``run_multi_model`` exposes the panel wall-clock budget."""
+
+    @staticmethod
+    def _capture_dispatch(monkeypatch):
+        import core.llm.multi_model.dispatch as dispatch_mod
+        captured = {}
+
+        def fake_dispatch(task, models, max_parallel, timeout=600.0):
+            captured["timeout"] = timeout
+            return {m.model_name: [] for m in models}, []
+
+        monkeypatch.setattr(
+            dispatch_mod, "_dispatch_parallel", fake_dispatch)
+        return captured
+
+    def test_custom_timeout_plumbed_through(self, monkeypatch):
+        captured = self._capture_dispatch(monkeypatch)
+        run_multi_model(
+            task=lambda m: [],
+            models=[FakeModel("m1")],
+            adapter=IdentityAdapter(),
+            timeout=42.5,
+        )
+        assert captured["timeout"] == 42.5
+
+    def test_default_timeout_is_600(self, monkeypatch):
+        """Other direction: the documented default is unchanged for
+        callers that don't opt in."""
+        captured = self._capture_dispatch(monkeypatch)
+        run_multi_model(
+            task=lambda m: [],
+            models=[FakeModel("m1")],
+            adapter=IdentityAdapter(),
+        )
+        assert captured["timeout"] == 600.0
+
+
+class TestFailedModelsExcludedFromAdapterView:
+    """Failed panel members must not reach the adapter as empty-list
+    'contributors': BaseSetAdapter.correlate counts every key in its
+    denominator (an empty list from a LIVE model legitimately means
+    'looked, found nothing'), so a dead member silently demoted every
+    item one recall bucket — all_models was unreachable for the whole
+    run — and the summary named the corpse as a looker. Dispatch is
+    the one layer that knows failed from empty; it strips failed
+    members before the adapter sees the panel (per_model_raw and
+    failed_models still report them)."""
+
+    def _set_adapter(self):
+        from core.llm.multi_model.adapters import BaseSetAdapter
+
+        class SA(BaseSetAdapter):
+            def item_id(self, item):
+                return item["id"]
+
+            def item_key(self, item):
+                return item["id"]
+
+        return SA()
+
+    def test_recall_denominator_counts_live_models_only(self):
+        def task(model):
+            if model.model_name == "model-c":
+                raise RuntimeError("panel member down")
+            return [{"id": "v1"}]
+
+        result = run_multi_model(
+            task,
+            [FakeModel("model-a"), FakeModel("model-b"),
+             FakeModel("model-c")],
+            self._set_adapter(),
+        )
+        assert result.failed_models == ["model-c"]
+        # Found by EVERY live model → all_models, not majority.
+        assert result.correlation["recall_signals"]["v1"] == "all_models"
+        # The corpse is not listed as a looker...
+        assert result.correlation["summary"]["models"] == [
+            "model-a", "model-b",
+        ]
+        # ...but stays visible in the raw/failed reporting.
+        assert result.per_model_raw["model-c"] == []
+
+    def test_live_model_with_zero_finds_still_counts(self):
+        def task(model):
+            if model.model_name == "model-c":
+                return []  # looked, found nothing — a real observation
+            return [{"id": "v1"}]
+
+        result = run_multi_model(
+            task,
+            [FakeModel("model-a"), FakeModel("model-b"),
+             FakeModel("model-c")],
+            self._set_adapter(),
+        )
+        assert result.failed_models == []
+        assert result.correlation["recall_signals"]["v1"] == "majority"
+
+
+class TestTimeoutHarvestsCompletedFutures:
+    """The panel-timeout branch abandons HUNG workers by design — but a
+    future that COMPLETED between as_completed's last yield and the
+    expiry is a paid-for result. Discarding it and marking the model
+    failed both loses the result and mis-labels a healthy member
+    (failed_models consumers may alert). The except branch must
+    harvest done futures before marking the remainder failed."""
+
+    def test_completed_but_unyielded_future_harvested(self, monkeypatch):
+        import concurrent.futures as cf
+
+        from core.llm.multi_model import dispatch as dispatch_mod
+
+        def expired_after_completion(futures, timeout=None):
+            # Deterministic stand-in for the race window: every
+            # worker has finished, but the timeout fires before any
+            # future is yielded.
+            for f in list(futures):
+                f.result()
+            raise cf.TimeoutError(
+                "simulated: expiry between completion and yield",
+            )
+
+        monkeypatch.setattr(
+            dispatch_mod, "as_completed", expired_after_completion,
+        )
+
+        def task(model):
+            return [{"id": "v1", "note": "paid result"}]
+
+        per_model_raw, failed = dispatch_mod._dispatch_parallel(
+            task, [FakeModel("model-a")], 2, timeout=5,
+        )
+        assert per_model_raw == {
+            "model-a": [{"id": "v1", "note": "paid result"}],
+        }
+        assert failed == []
+
+    def test_genuinely_hung_worker_still_marked_failed(self, monkeypatch):
+        import concurrent.futures as cf
+
+        from core.llm.multi_model import dispatch as dispatch_mod
+
+        def instant_expiry(futures, timeout=None):
+            raise cf.TimeoutError("simulated: nothing completed")
+
+        monkeypatch.setattr(dispatch_mod, "as_completed", instant_expiry)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def task(model):
+            started.set()
+            release.wait(timeout=10)
+            return []
+
+        try:
+            per_model_raw, failed = dispatch_mod._dispatch_parallel(
+                task, [FakeModel("model-a")], 2, timeout=5,
+            )
+            assert started.wait(timeout=5)
+            assert per_model_raw == {"model-a": []}
+            assert failed == ["model-a"]
+        finally:
+            release.set()

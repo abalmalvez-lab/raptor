@@ -16,19 +16,16 @@ from unittest import mock
 import pytest
 
 from core.sandbox import context, state
+from core.testing.module_bindings import mock_module_attribute
+from core.sandbox.tests.capability import requires_userns
 
 
 @pytest.fixture
-def reset_caches():
-    """Make sure the platform / availability caches don't leak
-    between tests in this file."""
-    state._seatbelt_available_cache = None
-    state._mount_available_cache = None
-    state._mount_ns_available_cache = None
-    yield
-    state._seatbelt_available_cache = None
-    state._mount_available_cache = None
-    state._mount_ns_available_cache = None
+def reset_caches(monkeypatch):
+    """Pin fresh backend probes and restore the caller's cached answers."""
+    monkeypatch.setattr(state, "_seatbelt_available_cache", None)
+    monkeypatch.setattr(state, "_mount_available_cache", None)
+    monkeypatch.setattr(state, "_mount_ns_available_cache", None)
 
 
 def test_check_seatbelt_available_returns_false_on_linux(reset_caches):
@@ -58,6 +55,10 @@ def test_dispatch_picks_macos_backend_on_darwin(reset_caches):
     fake_macos_result.returncode = 0
     fake_macos_result.stderr = b""
     fake_macos_result.sandbox_info = {"backend": "macos-seatbelt"}
+    # The status-pipe contract is default-deny: an unset MagicMock
+    # attribute reads as a truthy unknown status and is (correctly)
+    # refused. Model a clean spawn explicitly.
+    fake_macos_result._setup_status = None
 
     with mock.patch.object(sys, "platform", "darwin"), \
          mock.patch.object(context, "check_seatbelt_available",
@@ -83,6 +84,8 @@ def test_dispatch_picks_macos_backend_on_darwin(reset_caches):
     )
 
 
+@requires_userns
+@pytest.mark.skipif(sys.platform != "linux", reason="runs real unshare")
 def test_dispatch_picks_linux_backend_on_linux(reset_caches):
     """Inverse: on Linux, the dispatch must use _spawn (or the
     Landlock-only subprocess fallback), NEVER _macos_spawn."""
@@ -93,6 +96,10 @@ def test_dispatch_picks_linux_backend_on_linux(reset_caches):
     fake_linux_result.returncode = 0
     fake_linux_result.stderr = b""
     fake_linux_result.sandbox_info = {"backend": "mount-ns"}
+    # The status-pipe contract is default-deny: an unset MagicMock
+    # attribute reads as a truthy unknown status and is (correctly)
+    # refused. Model a clean spawn explicitly.
+    fake_linux_result._setup_status = None
 
     with mock.patch.object(sys, "platform", "linux"), \
          mock.patch.object(context, "check_seatbelt_available",
@@ -110,10 +117,9 @@ def test_dispatch_picks_linux_backend_on_linux(reset_caches):
         with sandbox(target="/tmp", output="/tmp") as run:
             try:
                 run(["/usr/bin/true"], capture_output=True)
-            except Exception:
-                # The fake _spawn doesn't simulate the full chain
-                # perfectly; we only care about WHICH backend was
-                # invoked, not the result.
+            except Exception:  # noqa: BLE001, S110 — the fake _spawn
+                # doesn't simulate the full chain perfectly; we only
+                # care about WHICH backend was invoked, not the result.
                 pass
 
     assert not macos_run.called, (
@@ -133,14 +139,19 @@ def test_use_seatbelt_false_when_seatbelt_unavailable(reset_caches):
                             return_value=False):
         # Sandbox unavailable entirely → no backend; subprocess.run
         # path with rlimits only. Just verify no crash.
+        # block_network=False explicitly: the bare sandbox() default
+        # profile blocks network, and a network block with no
+        # enforcing layer now REFUSES on darwin too (see
+        # test_darwin_net_gate.py) — this test is about the backend
+        # dispatch, not the network gate.
         from core.sandbox.context import sandbox
-        with sandbox() as run:
-            with mock.patch("subprocess.run") as sub_run:
-                sub_run.return_value = mock.MagicMock(
-                    returncode=0, stderr=b"", stdout=b"",
-                    sandbox_info={},
-                )
-                run(["/usr/bin/true"])
+        with sandbox(block_network=False) as run, \
+                mock_module_attribute(context, "subprocess", "run") as sub_run:
+            sub_run.return_value = mock.MagicMock(
+                returncode=0, stderr=b"", stdout=b"",
+                sandbox_info={},
+            )
+            run(["/usr/bin/true"])
         assert sub_run.called
 
 
@@ -158,6 +169,10 @@ def test_use_seatbelt_does_not_depend_on_check_net_available(reset_caches):
     fake_macos_result.returncode = 0
     fake_macos_result.stderr = b""
     fake_macos_result.sandbox_info = {"backend": "macos-seatbelt"}
+    # The status-pipe contract is default-deny: an unset MagicMock
+    # attribute reads as a truthy unknown status and is (correctly)
+    # refused. Model a clean spawn explicitly.
+    fake_macos_result._setup_status = None
 
     from core.sandbox import _macos_spawn as macos_mod
     with mock.patch.object(sys, "platform", "darwin"), \
@@ -193,6 +208,10 @@ def test_macos_does_not_resolve_unshare(reset_caches):
     fake_macos_result.returncode = 0
     fake_macos_result.stderr = b""
     fake_macos_result.sandbox_info = {"backend": "macos-seatbelt"}
+    # The status-pipe contract is default-deny: an unset MagicMock
+    # attribute reads as a truthy unknown status and is (correctly)
+    # refused. Model a clean spawn explicitly.
+    fake_macos_result._setup_status = None
 
     with mock.patch.object(sys, "platform", "darwin"), \
          mock.patch.object(context, "check_seatbelt_available",
@@ -224,9 +243,39 @@ def test_audit_degrade_reason_macos_branch(reset_caches):
     with mock.patch.object(sys, "platform", "darwin"), \
          mock.patch.object(context, "check_seatbelt_available",
                             return_value=False):
-        reason, instr = context._audit_degrade_reason(
+        reason, _instr = context._audit_degrade_reason(
             None, None, None, None, {},
         )
         assert "sandbox-exec" in reason or "seatbelt" in reason.lower()
         # Must NOT mention apparmor (Linux-specific).
         assert "apparmor" not in reason.lower()
+
+
+def test_strict_profile_fails_closed_without_backend(reset_caches):
+    from core.sandbox.errors import SandboxSetupError
+    with mock.patch.object(sys, "platform", "linux"), \
+         mock.patch.object(context, "check_net_available", return_value=False):
+        from core.sandbox.context import sandbox
+        with pytest.raises(SandboxSetupError, match="strict") as exc_info, \
+             sandbox(profile="strict"):
+            pass
+        # The abort must carry actionable remediation, including the
+        # explicit-downgrade escape hatch — that is the point of the
+        # SandboxSetupError type over a bare RuntimeError.
+        assert exc_info.value.instructions
+        assert "--sandbox full" in exc_info.value.instructions
+
+
+def test_strict_profile_requires_mount_namespace_for_target_output(reset_caches):
+    from core.sandbox.errors import SandboxSetupError
+    with mock.patch.object(sys, "platform", "linux"), \
+         mock.patch.object(context, "check_net_available", return_value=True), \
+         mock.patch.object(context, "check_mount_available", return_value=False):
+        from core.sandbox.context import sandbox
+        with pytest.raises(SandboxSetupError, match="mount-namespace") as exc_info, \
+             sandbox(profile="strict", target="/tmp", output="/tmp"):
+            pass
+        # Instructions come from mount_unavailable_reason() — host-
+        # specific fix first, explicit-downgrade escape hatch appended.
+        assert exc_info.value.instructions
+        assert "--sandbox full" in exc_info.value.instructions

@@ -14,7 +14,9 @@ Summary outputs:
 
 from __future__ import annotations
 
+import html
 import json
+import re
 import shutil
 import signal
 import tempfile
@@ -26,22 +28,39 @@ from pathlib import Path
 
 import typer
 
+from core.atomic_fs import write_text_atomically
+from core.json import save_json
+from core.security.log_sanitisation import sanitise_for_terminal
+from cve_diff.agent.loop import AgentConfig
 from cve_diff.core.exceptions import CveDiffError
 from cve_diff.infra import api_status
 from cve_diff.infra.github_client import warn_if_token_missing
 from cve_diff.pipeline import Pipeline, PipelineResult
 from cve_diff.report import osv_schema
+from typing import NoReturn
 
 _PER_CVE_TIMEOUT_S = 300  # 5 min. Any upstream-slice clone finishes well under.
 _PACKAGE_DATA_DIR = Path(__file__).resolve().parents[2] / "data"  # packages/cve_diff/data/
+
+# Strict CVE id shape. Sample files are operator-supplied JSON, but the
+# id is interpolated into filenames and a tempdir prefix — a crafted
+# entry must not be able to smuggle path separators or `..` segments.
+_CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+
+def _valid_cve_id(raw: str) -> str | None:
+    """Uppercased id when *raw* is a well-formed CVE id, else None."""
+    candidate = raw.strip().upper()
+    return candidate if _CVE_ID_RE.match(candidate) else None
 
 
 class _PerCveTimeout(Exception):
     pass
 
 
-def _alarm_handler(_signum, _frame):
-    raise _PerCveTimeout(f"exceeded {_PER_CVE_TIMEOUT_S}s budget")
+def _alarm_handler(_signum, _frame) -> NoReturn:
+    msg = f"exceeded {_PER_CVE_TIMEOUT_S}s budget"
+    raise _PerCveTimeout(msg)
 
 
 @dataclass
@@ -56,7 +75,7 @@ class _CveResult:
     # Structured failure class — set at construction so the report
     # writer doesn't have to regex an unstructured error string.
     # "PASS" for ok=True; one of {"UnsupportedSource", "no_evidence",
-    # "budget_cost_usd", "budget_iterations", "budget_tokens",
+    # "budget_cost_usd", "budget_iterations", "budget_s",
     # "llm_error", "model_stopped_without_submit", "client_init_failed",
     # "PerCveTimeout", "AnalysisError", "DiscoveryError", "Other"} for
     # ok=False.
@@ -73,11 +92,10 @@ class _CveResult:
     # Action A's claims and analyzing walker patterns.
     agent_tool_calls_with_args: tuple[tuple[str, str], ...] = ()
     agent_model: str = ""
-    # Recovery telemetry: how many in-loop LLM retries fired (3-attempt
-    # backoff inside AgentLoop), whether the pipeline's meta-retry on
+    # Recovery telemetry: whether the pipeline's meta-retry on
     # budget+candidates ran, and whether the bench-layer retry pass
-    # re-ran this CVE after a transient failure.
-    llm_retries: int = 0
+    # re-ran this CVE after a transient failure. (There is no in-loop
+    # LLM retry layer in the tool-use engine — no counter for one.)
     meta_retry_attempted: bool = False
     # True when the pipeline's post-submit retry fired (stages 2-5
     # failed on the agent's first pick; agent re-run picked a new
@@ -98,6 +116,13 @@ class _CveResult:
     # "disagree" / "single_source") — see DiffBundle.extraction_agreement.
     consensus_agree: int | None = None
     extraction_agree: str = ""
+    # Per-CVE rate-limit / cache counter deltas captured INSIDE the
+    # worker (api_status counters are per-process module globals, so
+    # under -w>1 the parent never sees them otherwise). The parent
+    # absorbs these into its own api_status before rendering the
+    # end-of-run summaries. Keys may be JSON-round-tripped strings.
+    rate_limit_events: dict = field(default_factory=dict)
+    cache_events: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -108,9 +133,25 @@ class _BenchSummary:
     results: list[_CveResult] = field(default_factory=list)
 
 
-def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
+def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float | None = None,
              max_file_bytes: int = 128 * 1024) -> _CveResult:
-    """Worker entry point — runs pipeline + dumps OSV JSON for a single CVE.
+    """Worker entry point: :func:`_run_one_inner` plus per-CVE counter
+    deltas. api_status counters are per-process globals — a worker
+    serves many CVEs, so the result carries the DELTA for this CVE and
+    the parent absorbs it (absolute values would double-count)."""
+    before = api_status.counters_snapshot()
+    r = _run_one_inner(cve_id, output_dir, disk_limit_pct, max_file_bytes)
+    events_d, cache_d = api_status.counters_delta(
+        before, api_status.counters_snapshot()
+    )
+    r.rate_limit_events = events_d
+    r.cache_events = cache_d
+    return r
+
+
+def _run_one_inner(cve_id: str, output_dir: str, disk_limit_pct: float | None = None,
+                   max_file_bytes: int = 128 * 1024) -> _CveResult:
+    """Runs pipeline + dumps OSV JSON for a single CVE.
 
     Each worker installs a SIGALRM watchdog so a runaway clone (e.g. a
     multi-GB writeup archive that slipped past the metadata scorer) cannot
@@ -139,15 +180,16 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
     # Cost is near-zero because OSV / NVD / GitHub-commit fetches share
     # caches with the agent's tool calls.
     pipeline = Pipeline(disk_limit_pct=disk_limit_pct, max_file_bytes=max_file_bytes)
-    model_id = "claude-opus-4-7"  # AgentConfig default
+    # Read the default from the dataclass field (pipeline._effective_model
+    # pattern) — a duplicated literal drifted silently when the default
+    # model changed.
+    model_id = AgentConfig.__dataclass_fields__["model_id"].default
     try:
         with tempfile.TemporaryDirectory(prefix=f"bench-{cve_id}-") as tmp:
             try:
                 result = pipeline.run(cve_id, Path(tmp))
                 osv = osv_schema.render(result.bundle)
-                (out / f"{cve_id}.osv.json").write_text(
-                    json.dumps(osv, indent=2) + "\n"
-                )
+                save_json(out / f"{cve_id}.osv.json", osv)
                 consensus = result.bundle.consensus or {}
                 ext_agree = result.bundle.extraction_agreement or {}
                 r = _CveResult(
@@ -228,7 +270,7 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
                 signal.signal(signal.SIGALRM, prev_handler)
 
 
-def _agent_attrs(pipeline: "Pipeline", model_id: str) -> dict:
+def _agent_attrs(pipeline: Pipeline, model_id: str) -> dict:
     """Pull agent telemetry off the loop's last_telemetry + pipeline state."""
     tel = getattr(pipeline.agent, "last_telemetry", None) or {}
     return {
@@ -240,7 +282,6 @@ def _agent_attrs(pipeline: "Pipeline", model_id: str) -> dict:
             tuple(t) for t in tel.get("tool_calls_with_args", [])
         ),
         "agent_model": model_id,
-        "llm_retries": int(tel.get("llm_retries", 0)),
         "meta_retry_attempted": bool(getattr(pipeline, "_last_meta_retry_attempted", False)),
         "post_submit_retry_attempted": bool(getattr(pipeline, "_last_post_submit_retry_attempted", False)),
         "unverified_submits": int(tel.get("unverified_submits", 0)),
@@ -251,8 +292,12 @@ def _agent_attrs(pipeline: "Pipeline", model_id: str) -> dict:
 # Maps exception type or AgentSurrender reason → structured error_class
 # string. Order matters: the surrender-reason patterns are checked
 # before exception-type fallback.
+# ``budget_s`` is the loop's wall-clock cap reason; the loop emits no
+# ``budget_tokens`` reason, so listing it here would be dead — while
+# omitting budget_s made wall-clock surrenders fall through to the
+# generic DiscoveryError bucket and vanish from the budget rows.
 _SURRENDER_REASONS = (
-    "budget_cost_usd", "budget_iterations", "budget_tokens",
+    "budget_cost_usd", "budget_iterations", "budget_s",
     "llm_error", "no_evidence", "UnsupportedSource",
     "model_stopped_without_submit", "client_init_failed",
     "repeated_tool_call", "sha_not_found_in_repo",
@@ -270,14 +315,18 @@ def _write_failure_md(output_dir: Path, cve_id: str, error_class: str,
     try:
         from cve_diff.report.markdown import render_failure
         text = render_failure(cve_id, error_class, error_text)
-        (output_dir / f"{cve_id}.md").write_text(text)
-    except Exception:  # noqa: BLE001 — report write must not abort bench
-        pass
+        write_text_atomically(output_dir / f"{cve_id}.md", text)
+    except Exception as exc:  # noqa: BLE001 — report write must not abort bench
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "bench: failure-report write failed for %s: %s",
+            cve_id, exc, exc_info=True,
+        )
 
 
-def _write_flow(output_dir: Path, cve_id: str, result: "_CveResult",
-                pipeline: "Pipeline | None" = None,
-                pipeline_result: "PipelineResult | None" = None) -> None:
+def _write_flow(output_dir: Path, cve_id: str, result: _CveResult,
+                pipeline: Pipeline | None = None,
+                pipeline_result: PipelineResult | None = None) -> None:
     """Emit `<cve>.flow.jsonl` + `<cve>.flow.md` for one bench result.
 
     When ``pipeline`` is supplied, this delegates to
@@ -311,7 +360,7 @@ def _write_flow(output_dir: Path, cve_id: str, result: "_CveResult",
 _CORRECT_REFUSAL_CLASSES = frozenset({"UnsupportedSource", "no_evidence"})
 
 
-def _outcome_buckets(summary: "_BenchSummary") -> tuple[int, int, int]:
+def _outcome_buckets(summary: _BenchSummary) -> tuple[int, int, int]:
     """Return (pass, correct_refusal, pipeline_issue) counts.
 
     - pass: ``r.ok=True``
@@ -336,6 +385,8 @@ def _classify_error(error_text: str) -> str:
         # The DiscoveryError pattern is "agent surrendered (REASON):"
         if f"({reason})" in error_text:
             return reason
+    if error_text.startswith("DiskBudgetExceeded"):
+        return "DiskBudgetExceeded"
     if error_text.startswith("PerCveTimeout"):
         return "PerCveTimeout"
     if error_text.startswith("UnsupportedSource"):
@@ -354,7 +405,14 @@ def _echo_result(i: int, n: int, r: _CveResult) -> None:
         tag = "" if r.shape == "source" else f" [{r.shape}]"
         typer.echo(f"[{i}/{n}] PASS {r.cve_id}{tag} ({r.elapsed_s}s)")
     else:
-        typer.echo(f"[{i}/{n}] FAIL {r.cve_id} — {r.error}", err=True)
+        # r.error can relay agent/tool exception text (LLM- and
+        # repo-derived bytes) — escape + bound before the TTY.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        typer.echo(
+            f"[{i}/{n}] FAIL {r.cve_id} — "
+            f"{sanitise_for_terminal(str(r.error), max_len=512)}",
+            err=True,
+        )
 
 
 def _render_bench_markdown(summary: _BenchSummary) -> str:
@@ -399,8 +457,6 @@ def _render_bench_markdown(summary: _BenchSummary) -> str:
         outcome_lines.append(f"| {cls} | {c} | {100.0 * c / total:.1f}% |")
 
     # Recovery layers.
-    in_loop_retry_triggered = sum(1 for r in summary.results if r.llm_retries > 0)
-    in_loop_retry_recovered = sum(1 for r in summary.results if r.ok and r.llm_retries > 0)
     meta_retry_triggered = sum(1 for r in summary.results if r.meta_retry_attempted)
     meta_retry_recovered = sum(1 for r in summary.results if r.ok and r.meta_retry_attempted)
     bench_retry_triggered = sum(1 for r in summary.results if r.bench_retry_attempted)
@@ -421,9 +477,18 @@ def _render_bench_markdown(summary: _BenchSummary) -> str:
         for t, n in tool_calls_total.most_common()
     ]
 
-    # Failure cluster (excluding PASS).
+    # Failure cluster (excluding PASS). Error text relays agent/tool
+    # exception strings (LLM- and repo-derived bytes) into a table cell:
+    # md_inline flattens CR/LF (CommonMark treats a bare CR as a line
+    # ending too), escapes in-slot structure, and strips control bytes —
+    # pipe-and-newline-only escaping left CR and ANSI through.
+    def _error_cell(error: str | None) -> str:
+        from core.security.markdown_render import md_inline
+
+        return md_inline((error or "")[:200], max_chars=250)
+
     fail_lines = [
-        f"| {r.cve_id} | {r.error_class or 'Other'} | {(r.error or '')[:200].replace('|', '\\|').replace(chr(10), ' ')} |"
+        f"| {r.cve_id} | {r.error_class or 'Other'} | {_error_cell(r.error)} |"
         for r in summary.results
         if not r.ok
     ]
@@ -460,7 +525,7 @@ def _render_bench_markdown(summary: _BenchSummary) -> str:
             if v:
                 integrity_lines.append(f"| {k} | {v} |")
 
-    pass_n, refusal_n, issue_n = _outcome_buckets(summary)
+    _pass_n, refusal_n, issue_n = _outcome_buckets(summary)
 
     return (
         f"# Bench report — {summary.sample}\n\n"
@@ -483,23 +548,37 @@ def _render_bench_markdown(summary: _BenchSummary) -> str:
         f"| Outcome | Count | % |\n"
         f"|---|---:|---:|\n"
         + "\n".join(outcome_lines) + "\n\n"
-        f"## Diff integrity — sources + agreement\n\n"
+        "## Diff integrity — sources + agreement\n\n"
         + (("\n".join(integrity_lines) + "\n\n") if integrity_lines else
            "_(no PASSes to compare)_\n\n")
         + f"## Recovery layers — what saved CVEs\n\n"
         f"| Layer | Triggered | Recovered (PASS) |\n"
         f"|---|---:|---:|\n"
-        f"| In-loop LLM retry (3 attempts, 0/5/15s) | {in_loop_retry_triggered} | {in_loop_retry_recovered} |\n"
         f"| Meta-retry on budget+candidates | {meta_retry_triggered} | {meta_retry_recovered} |\n"
         f"| Bench-layer retry on transient errors | {bench_retry_triggered} | {bench_retry_recovered} |\n\n"
         f"## Tool usage (across {total} CVEs)\n\n"
         f"| Tool | Total calls | CVEs that used it |\n"
         f"|---|---:|---:|\n"
         + ("\n".join(tool_lines) if tool_lines else "_(no tool calls recorded)_") + "\n\n"
-        f"## Failure cluster\n\n"
+        "## Failure cluster\n\n"
         + ("| CVE | Class | Error (first 200 chars) |\n"
            "|---|---|---|\n" + "\n".join(fail_lines) + "\n"
            if fail_lines else "_(none — all PASS)_\n")
+    )
+
+
+def _esc(value: str) -> str:
+    """HTML-escape + control-byte-escape one tracker/advisory-influenced
+    string for the HTML report. ``html.escape(quote=True)`` alone still
+    lets raw ANSI escape sequences into the written file (harmless in a
+    browser, terminal-injection when the operator ``cat``s the report —
+    battery variant error-ansi); ``escape_nonprintable`` renders them
+    inert while keeping newlines readable."""
+    from core.security.log_sanitisation import escape_nonprintable
+
+    return html.escape(
+        escape_nonprintable(str(value), preserve_newlines=True),
+        quote=True,
     )
 
 
@@ -507,17 +586,28 @@ def _render_html(summary: _BenchSummary) -> str:
     pct = 100.0 * summary.passed / summary.total if summary.total else 0.0
     source_hits = sum(1 for r in summary.results if r.ok and r.shape == "source")
     non_source = summary.passed - source_hits
-    pass_n, refusal_n, issue_n = _outcome_buckets(summary)
+    _pass_n, refusal_n, issue_n = _outcome_buckets(summary)
 
     rows: list[str] = []
     for r in summary.results:
         status_cls = "pass" if r.ok else "fail"
         status_text = "PASS" if r.ok else "FAIL"
-        shape_cell = f'<span class="shape-{r.shape}">{r.shape}</span>' if r.shape else ""
+        # Escape EVERY tracker/advisory-influenced string before it
+        # reaches the document. ``r.error`` embeds exception text that
+        # carries the submitted repository_url (hostile OSV/NVD data
+        # passes on an http(s) prefix alone) and LLM surrender
+        # rationale derived from advisory text; ``shape`` also lands
+        # inside a class attribute — quote=True keeps a quoted
+        # attribute unescapable.
+        shape_esc = _esc(r.shape)
+        shape_cell = (
+            f'<span class="shape-{shape_esc}">{shape_esc}</span>'
+            if r.shape else ""
+        )
         detail = (
             f"{r.files_changed} files · {r.diff_bytes:,} B"
             if r.ok
-            else f'<span class="err">{r.error}</span>'
+            else f'<span class="err">{_esc(r.error)}</span>'
         )
         # Pointer consensus + extraction-agreement cells. Both empty
         # for FAIL rows (no bundle to integrity-check).
@@ -534,26 +624,30 @@ def _render_html(summary: _BenchSummary) -> str:
                 "agree": "agree", "partial": "partial",
                 "disagree": "err", "single_source": "partial",
             }.get(r.extraction_agree, "")
+            # Class comes from the fixed lookup table above; only the
+            # text is raw and needs escaping.
             extract_cell = (
-                f'<span class="{extract_cell_cls}">{r.extraction_agree}</span>'
+                f'<span class="{extract_cell_cls}">'
+                f'{_esc(r.extraction_agree)}</span>'
                 if r.extraction_agree else "—"
             )
         else:
             cons_cell = ""
             extract_cell = ""
         rows.append(
-            f'<tr class="{status_cls}"><td>{r.cve_id}</td>'
+            f'<tr class="{status_cls}"><td>{_esc(r.cve_id)}</td>'
             f'<td>{status_text}</td><td>{shape_cell}</td>'
             f'<td>{cons_cell}</td><td>{extract_cell}</td>'
             f'<td>{r.elapsed_s:.1f}s</td><td>{detail}</td></tr>'
         )
     table_rows = "\n".join(rows)
+    sample_esc = _esc(summary.sample)
 
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>cve-diff bench — {summary.sample}</title>
+<title>cve-diff bench — {sample_esc}</title>
 <style>
  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 2rem; }}
  h1 {{ margin-bottom: .2rem; }}
@@ -572,7 +666,7 @@ def _render_html(summary: _BenchSummary) -> str:
 <body>
 <h1>cve-diff bench</h1>
 <div class="meta">
-  sample: <code>{summary.sample}</code><br>
+  sample: <code>{sample_esc}</code><br>
   <strong>{summary.passed}/{summary.total} passed ({pct:.1f}%)</strong> —
   {source_hits} real source fixes,
   {non_source} packaging/notes-only,
@@ -609,10 +703,12 @@ def bench(
         "-w",
         help="Parallel workers (ProcessPoolExecutor). 1 = sequential.",
     ),
-    disk_limit_pct: float = typer.Option(
-        80.0,
+    disk_limit_pct: float | None = typer.Option(
+        None,
         "--disk-limit-pct",
-        help="Abort threshold (filesystem-used %). Pipeline raises if disk exceeds this at any stage entry.",
+        help="Hard maximum filesystem usage %. By default, abort at or above "
+             "80% only when less than 20 GiB remains free.",
+        show_default=False,
     ),
     max_file_bytes: int = typer.Option(
         128 * 1024,
@@ -647,11 +743,13 @@ def bench(
     # while bounding pathological input.
     _MAX_SAMPLE_BYTES = 50 * 1024 * 1024
     try:
-        with open(sample, "r", encoding="utf-8") as _sf:
+        with Path(sample).open(encoding="utf-8") as _sf:
             _sample_text = _sf.read(_MAX_SAMPLE_BYTES + 1)
     except OSError as e:
-        typer.echo(f"bench: cannot read sample {sample}: {e}", err=True)
-        raise typer.Exit(code=1)
+        typer.echo("bench: cannot read sample "
+                   f"{sanitise_for_terminal(str(sample), max_len=200)}: "
+                   f"{sanitise_for_terminal(str(e), max_len=300)}", err=True)
+        raise typer.Exit(code=1) from e
     if len(_sample_text) > _MAX_SAMPLE_BYTES:
         typer.echo(
             f"bench: sample {sample} exceeds {_MAX_SAMPLE_BYTES} bytes — "
@@ -659,7 +757,14 @@ def bench(
             err=True,
         )
         raise typer.Exit(code=1)
-    payload = json.loads(_sample_text)
+    try:
+        payload = json.loads(_sample_text)
+    except json.JSONDecodeError as exc:
+        typer.echo("bench: sample "
+                   f"{sanitise_for_terminal(str(sample), max_len=200)} is "
+                   f"not valid JSON: {sanitise_for_terminal(str(exc), max_len=300)}",
+                   err=True)
+        raise typer.Exit(code=1) from exc
     # Pre-fix `payload["cves"]` and `c["cve_id"]` raised KeyError
     # / TypeError on malformed sample files — the operator saw an
     # opaque traceback instead of a structured "sample is missing
@@ -681,7 +786,20 @@ def bench(
                 err=True,
             )
             continue
-        cves.append(c["cve_id"])
+        # The id flows into filenames ({cve_id}.osv.json, {cve_id}.md,
+        # the per-CVE tempdir prefix) — enforce the strict CVE shape
+        # so a crafted sample entry ("../evil", separators, control
+        # bytes) can never traverse out of the output directory.
+        cve_id = _valid_cve_id(c["cve_id"])
+        if cve_id is None:
+            rejected = repr(c["cve_id"])[:60]
+            typer.echo(
+                f"bench: sample {sample} has a malformed cve_id "
+                f"{rejected} — skipping (expected CVE-YYYY-NNNN...)",
+                err=True,
+            )
+            continue
+        cves.append(cve_id)
     if limit > 0:
         cves = cves[:limit]
 
@@ -693,29 +811,13 @@ def bench(
     summary_path = output_dir / "summary.json"
 
     def _flush() -> None:
-        # Atomic write. Pre-fix `summary_path.write_text(...)` was
-        # non-atomic — `_flush` is called after every CVE in a long
-        # bench run (a 100-CVE bench takes 30+ minutes), and the
-        # operator routinely reads `summary.json` mid-run to track
-        # progress. A reader catching the file mid-write got partial
-        # JSON and JSONDecode-crashed. Worse, a process kill
-        # mid-write left summary.json corrupted at end-of-run, with
-        # no easy recovery (the per-CVE results are scattered across
-        # `_run_one` outputs). Temp+rename keeps every observable
-        # state of summary.json complete.
-        import os as _os
-        tmp = summary_path.with_name(
-            f"{summary_path.name}.tmp.{_os.getpid()}"
-        )
-        try:
-            tmp.write_text(json.dumps(asdict(summary), indent=2) + "\n")
-            _os.replace(str(tmp), str(summary_path))
-        except BaseException:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        # Atomic write: ``_flush`` is called after every CVE in a
+        # long bench run (a 100-CVE bench takes 30+ minutes); the
+        # operator routinely reads ``summary.json`` mid-run to track
+        # progress. Torn reads got partial JSON and JSONDecode-
+        # crashed. save_json keeps every observable state of
+        # summary.json complete.
+        save_json(summary_path, asdict(summary))
 
     if workers <= 1:
         for i, cve_id in enumerate(cves, 1):
@@ -743,6 +845,12 @@ def bench(
                 # error class.
                 try:
                     r = fut.result()
+                    # Worker counters live in the worker process; merge
+                    # this CVE's delta so the parent's end-of-run
+                    # rate-limit / cache summaries stop rendering empty
+                    # under -w>1. (Sequential path needs no merge — the
+                    # counters accumulated in this process directly.)
+                    api_status.absorb(r.rate_limit_events, r.cache_events)
                 except BaseException as worker_exc:
                     cid = futures[fut]
                     r = _CveResult(
@@ -774,28 +882,20 @@ def bench(
     non_source = summary.passed - source_hits
     pass_n, refusal_n, issue_n = _outcome_buckets(summary)
     _flush()
-    # Atomic write via tmp+rename. Pre-fix `write_text` on the
-    # final filenames left a half-written summary visible to
-    # concurrent readers (the CI harness that polls
-    # `summary.json` to grab pass-rates the moment a bench
-    # finishes had a window where `json.load` failed mid-write
-    # with "Expecting value"). For .html and .md the consequence
-    # is an operator opening the file mid-bench and seeing
-    # truncated content.
-    #
-    # Same-directory tmp+rename so the rename is atomic on the
-    # same filesystem (cross-fs would fall back to copy+unlink).
-    def _atomic_write(path: Path, content: str) -> None:
-        tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-        try:
-            tmp.write_text(content)
-            tmp.replace(path)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-    import os
-    _atomic_write(output_dir / "summary.html", _render_html(summary))
-    _atomic_write(output_dir / "bench_report.md", _render_bench_markdown(summary))
+    # Atomic write: CI harness polls summary.html / bench_report.md
+    # for pass-rates the moment a bench finishes; torn reads leave
+    # operators seeing truncated JSON / markdown. Primitive keeps
+    # every observable state complete.
+    write_text_atomically(
+        output_dir / "summary.html",
+        _render_html(summary),
+        tmp_prefix=".bench-html-",
+    )
+    write_text_atomically(
+        output_dir / "bench_report.md",
+        _render_bench_markdown(summary),
+        tmp_prefix=".bench-md-",
+    )
     _persist_summary(output_dir / "summary.json", sample)
     typer.echo("")
     typer.echo(f"=== {summary.passed}/{summary.total} passed ({pct:.1f}%) ===")
@@ -845,7 +945,7 @@ def _persist_summary(summary_path: Path, sample: Path) -> None:
         shutil.copy2(summary_path, dest)
         typer.echo(f"persisted: {dest}")
     except Exception as exc:  # noqa: BLE001 — never fail the bench on a copy
-        typer.echo(f"(could not persist summary to data/runs/: {exc})", err=True)
+        typer.echo(f"(could not persist summary to data/runs/: {sanitise_for_terminal(str(exc), max_len=300)})", err=True)
 
 
 # Error classes the bench-layer retry pass re-runs. Anything else is a
@@ -854,15 +954,19 @@ def _persist_summary(summary_path: Path, sample: Path) -> None:
 # AcquisitionError covers "git clone died mid-fetch"; client_init_failed
 # covers a transient API auth flake (rate limit, DNS hiccup). Settled
 # outcomes (UnsupportedSource / no_evidence / budget_*) stay in.
+# DiskBudgetExceeded is deliberately NOT transient: a retry spends more
+# disk and more paid LLM turns while the host stays over its limit — the
+# pipeline re-raises it typed so it can never hide inside
+# AcquisitionError here.
 _TRANSIENT_CLASSES = frozenset({
     "llm_error", "PerCveTimeout", "AcquisitionError", "client_init_failed",
 })
 
 
 def _run_bench_retry_pass(
-    summary: "_BenchSummary",
+    summary: _BenchSummary,
     output_dir: str,
-    disk_limit_pct: float,
+    disk_limit_pct: float | None,
     max_file_bytes: int,
     n: int,
     flush_fn,

@@ -24,11 +24,12 @@ Behaviour:
 from __future__ import annotations
 
 from pathlib import PurePosixPath
-from typing import Any, Callable, Optional
+from typing import Any
+from collections.abc import Callable
 
 from cve_diff.diffing import shape as static_shape
 
-LanguagesFetcher = Callable[[str], Optional[dict[str, Any]]]
+LanguagesFetcher = Callable[[str], dict[str, Any] | None]
 
 _EXT_TO_LANGUAGE: dict[str, str] = {
     ".py": "python",
@@ -68,6 +69,25 @@ _EXT_TO_LANGUAGE: dict[str, str] = {
     ".ps1": "powershell",
 }
 
+# Intrinsically ambiguous extensions map to EVERY language they can
+# belong to: a header-only fix in a repo GitHub reports as {"C++"}
+# (no "C" entry in /languages) is still a source change, and forcing
+# it through the single-language map hard-failed genuine upstream
+# fixes as "packaging_only" / "likely downstream mirror".
+_EXT_TO_LANGUAGES_MULTI: dict[str, frozenset[str]] = {
+    ".h": frozenset({"c", "c++", "objective-c"}),
+    ".hh": frozenset({"c++", "c"}),
+    ".m": frozenset({"objective-c", "matlab"}),
+}
+
+
+def _langs_for_ext(ext: str) -> frozenset[str]:
+    multi = _EXT_TO_LANGUAGES_MULTI.get(ext)
+    if multi:
+        return multi
+    lang = _EXT_TO_LANGUAGE.get(ext)
+    return frozenset({lang}) if lang else frozenset()
+
 
 def classify(
     files: list[str],
@@ -87,15 +107,29 @@ def classify(
         return "source"
 
     if slug:
+        # nosemgrep: sinks.raptor.web.ssrf.dynamic-url
+        # ``fetch`` is a typed injected callable (parameter at
+        # line 75). The GitHub-API URL it builds is internal to
+        # the cve-diff package; ``slug`` is a vetted owner/repo
+        # form, not raw user input.
         payload = fetch(slug)
         if payload:
-            repo_langs = frozenset(str(k).lower() for k in payload.keys())
+            repo_langs = frozenset(str(k).lower() for k in payload)
+            any_mapped = False
             for path in files:
-                ext = _ext(path)
-                lang = _EXT_TO_LANGUAGE.get(ext)
-                if lang and lang in repo_langs:
-                    return "source"
-            return _non_source_breakdown(files)
+                langs = _langs_for_ext(_ext(path))
+                if langs:
+                    any_mapped = True
+                    if langs & repo_langs:
+                        return "source"
+            if any_mapped:
+                return _non_source_breakdown(files)
+            # No changed file's extension is even IN the (deliberately
+            # small, intrinsic) map — grammar / SQL / Fortran / template
+            # fixes are real source changes this table doesn't cover.
+            # The dynamic layer has no signal either way, so it must
+            # fall back to the static classifier rather than force a
+            # non-source verdict that hard-fails the run.
 
     return static_shape.classify(files)
 

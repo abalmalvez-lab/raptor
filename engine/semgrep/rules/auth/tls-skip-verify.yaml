@@ -1,11 +1,111 @@
 rules:
-  - id: raptor.tls.skip-verify
-    message: TLS verification disabled (insecure). Do not set verify=False or TrustAllHosts in production.
-    languages: [python, java, javascript]
+  # ---------------------------------------------------------------------------
+  # Python — TLS certificate verification disabled (CWE-295)
+  # Covers requests library methods that accept verify=False.
+  # ---------------------------------------------------------------------------
+  - id: raptor.tls.skip-verify.python
+    message: >-
+      TLS-verification bypass syntax appears in a request, client or connector configuration. Confirm the API, effective configuration and whether it is used for HTTPS traffic. Keep certificate verification enabled against the intended trust roots.
+    languages: [python]
     severity: HIGH
     pattern-either:
-      - pattern: requests.get(..., verify=False)
-      - pattern: HttpsURLConnection.setDefaultHostnameVerifier($X)
+      # requests — module-level helpers
+      - pattern: requests.get(..., verify=False, ...)
+      - pattern: requests.post(..., verify=False, ...)
+      - pattern: requests.put(..., verify=False, ...)
+      - pattern: requests.patch(..., verify=False, ...)
+      - pattern: requests.delete(..., verify=False, ...)
+      - pattern: requests.head(..., verify=False, ...)
+      - pattern: requests.options(..., verify=False, ...)
+      - pattern: requests.request(..., verify=False, ...)
+      # requests.Session — per-call verify=False and the session-wide
+      # attribute, anchored to a Session constructed in scope
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $S = requests.Session()
+                  ...
+              - pattern-inside: |
+                  $S = requests.session()
+                  ...
+              - pattern-inside: |
+                  with requests.Session() as $S:
+                      ...
+              - pattern-inside: |
+                  with requests.session() as $S:
+                      ...
+          - pattern-either:
+              - pattern: $S.get(..., verify=False, ...)
+              - pattern: $S.post(..., verify=False, ...)
+              - pattern: $S.put(..., verify=False, ...)
+              - pattern: $S.patch(..., verify=False, ...)
+              - pattern: $S.delete(..., verify=False, ...)
+              - pattern: $S.head(..., verify=False, ...)
+              - pattern: $S.options(..., verify=False, ...)
+              - pattern: $S.request(..., verify=False, ...)
+              - pattern: $S.verify = False
+      # httpx — module-level helpers and client constructors
+      - pattern: httpx.get(..., verify=False, ...)
+      - pattern: httpx.post(..., verify=False, ...)
+      - pattern: httpx.put(..., verify=False, ...)
+      - pattern: httpx.patch(..., verify=False, ...)
+      - pattern: httpx.delete(..., verify=False, ...)
+      - pattern: httpx.head(..., verify=False, ...)
+      - pattern: httpx.options(..., verify=False, ...)
+      - pattern: httpx.request(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)
+      - pattern: httpx.AsyncClient(..., verify=False, ...)
+      # aiohttp — ssl=False on the connector or per-request on a
+      # ClientSession constructed in scope
+      - pattern: aiohttp.TCPConnector(..., ssl=False, ...)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $S = aiohttp.ClientSession(...)
+                  ...
+              - pattern-inside: |
+                  async with aiohttp.ClientSession(...) as $S:
+                      ...
+          - pattern-either:
+              - pattern: $S.get(..., ssl=False, ...)
+              - pattern: $S.post(..., ssl=False, ...)
+              - pattern: $S.put(..., ssl=False, ...)
+              - pattern: $S.patch(..., ssl=False, ...)
+              - pattern: $S.delete(..., ssl=False, ...)
+              - pattern: $S.head(..., ssl=False, ...)
+              - pattern: $S.options(..., ssl=False, ...)
+              - pattern: $S.request(..., ssl=False, ...)
     metadata:
       cwe: ["CWE-295"]
       asvs: ["V14.1"]
+      tags: ["security", "tls", "misconfiguration"]
+
+  # ---------------------------------------------------------------------------
+  # Java — TLS hostname verification disabled (CWE-295)
+  # ---------------------------------------------------------------------------
+  - id: raptor.tls.skip-verify.java
+    message: >-
+      The default HTTPS hostname verifier is configured. Review the supplied verifier and where it is used; installing a verifier does not by itself establish that hostname checks are disabled. Reject mismatched hostnames or retain the default verifier.
+    languages: [java]
+    severity: HIGH
+    pattern: HttpsURLConnection.setDefaultHostnameVerifier($X)
+    metadata:
+      cwe: ["CWE-295"]
+      asvs: ["V14.1"]
+      tags: ["security", "tls", "misconfiguration"]
+
+  # ---------------------------------------------------------------------------
+  # JavaScript / TypeScript — TLS verification disabled (CWE-295)
+  # ---------------------------------------------------------------------------
+  - id: raptor.tls.skip-verify.javascript
+    message: >-
+      A TLS-verification bypass setting or matching Agent option appears in this code. Confirm the API and effective connection configuration before treating verification as disabled. Keep rejectUnauthorized enabled and avoid setting NODE_TLS_REJECT_UNAUTHORIZED to "0".
+    languages: [javascript, typescript]
+    severity: HIGH
+    pattern-either:
+      - pattern: 'process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"'
+      - pattern: 'new $MODULE.Agent({..., rejectUnauthorized: false, ...})'
+    metadata:
+      cwe: ["CWE-295"]
+      asvs: ["V14.1"]
+      tags: ["security", "tls", "misconfiguration"]

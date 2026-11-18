@@ -1,0 +1,164 @@
+"""YAML ``image:`` ref in-place rewriter.
+
+Handles three file shapes the bumper-orchestrator emits
+candidates for:
+
+* docker-compose files (``compose.yml`` / ``docker-compose.yml``)
+* Kubernetes manifests (any ``.yml`` / ``.yaml`` with k8s shape)
+* GitLab CI files (``.gitlab-ci.yml``)
+
+All three use the same ``image: <ref>`` line shape. One rewriter
+covers them via predicate-OR registration.
+
+The bumper-orchestrator emits :class:`RewriteEdit` records with
+``locator`` = ``"{registry}/{repository}"`` (the same convention
+``dockerfile_from`` uses for FROM lines). The line shape differs
+from Dockerfile's ``FROM`` but the semantics — match by locator,
+rewrite the tag, preserve quoting / comments / indentation — are
+the same."""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from . import RewriteEdit, RewriteResult, register, rewrite_file_with
+from typing import TYPE_CHECKING
+from ..file_shapes import is_compose_file as _is_compose_file
+from ..file_shapes import is_gitlab_ci_file as _is_gitlab_ci_file
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _is_k8s_manifest(path: Path) -> bool:
+    """Match k8s YAML manifests. Deliberately conservative —
+    rather than parsing every YAML to check for kind/apiVersion
+    (the parser does that), we register the same broad predicate
+    the parser uses (``.yml`` / ``.yaml`` with k8s-shaped path
+    segments). The actual line-shape match in
+    ``_apply_one_image`` is conservative enough that touching a
+    non-k8s YAML with no ``image:`` line is a silent no-op."""
+    if path.suffix.lower() not in (".yml", ".yaml"):
+        return False
+    # Avoid colliding with files the other rewriters own. GHA
+    # workflows under ``.github/workflows/`` route to ``gha_uses``.
+    parts = path.parts
+    for i in range(len(parts) - 2):
+        if parts[i] == ".github" and parts[i + 1] == "workflows":
+            return False
+    # Compose-shaped names also routed to this same rewriter
+    # (the predicate-OR registration), but ``_is_compose_file``
+    # is a subset of "yaml file" so we don't need a separate
+    # check here.
+    return True
+
+
+def _is_yaml_image_target(path: Path) -> bool:
+    """Combined predicate: any YAML file the rewriter might
+    edit. The actual rewrite is gated by line-shape matching, so
+    a YAML file with no ``image:`` line is a silent no-op."""
+    if _is_compose_file(path):
+        return True
+    if _is_gitlab_ci_file(path):
+        return True
+    return _is_k8s_manifest(path)
+
+
+@register(predicate=_is_yaml_image_target)
+def rewrite_yaml_image(
+    path: Path, edits: list[RewriteEdit],
+) -> list[RewriteResult]:
+    """Apply image-tag edits to YAML ``image:`` lines in place.
+
+    Each edit's locator is ``"{registry}/{repository}"``; we
+    match both canonical and short forms (Docker's
+    ``library/python`` ↔ ``python`` shorthand) the same way
+    ``dockerfile_from`` does."""
+    return rewrite_file_with(path, edits, _apply_one_image)
+
+
+def _apply_one_image(
+    text: str, edit: RewriteEdit,
+) -> tuple[str, RewriteResult]:
+    """Apply one ``image: <ref>:<tag>`` edit.
+
+    Locator forms accepted in the file:
+      * Canonical: ``image: docker.io/library/python:3.12``
+      * Short (docker.io implicit): ``image: python:3.12``
+      * Sub-namespace short: ``image: library/python:3.12``
+    """
+    locator = edit.locator
+    forms = [locator]
+    # Only docker.io has short forms (``image: python:3.12`` is implicitly
+    # ``docker.io/library/python:3.12``). Parse the registry component
+    # explicitly via split — avoids ``startswith`` host checks that look
+    # like incomplete URL sanitisation to scanners (this isn't a URL,
+    # but the lexical shape is the same).
+    registry, _, rest = locator.partition("/")
+    if registry == "docker.io" and rest:
+        namespace, _, image = rest.partition("/")
+        if namespace == "library" and image:
+            forms.append(image)
+            forms.append(f"library/{image}")
+            forms.append(f"docker.io/{image}")
+        else:
+            forms.append(rest)
+    image_alternates = "|".join(re.escape(f) for f in forms)
+    # YAML ``image:`` shape. Supports:
+    #   * Bare: ``    image: foo/bar:tag``
+    #   * Quoted: ``    image: "foo/bar:tag"``
+    #   * After list marker: ``    - image: foo/bar:tag``
+    # Leading indent is HORIZONTAL-only ([^\S\n]): under the
+    # MULTILINE ^ anchor a \s* matched at every line start inside a
+    # blank-line run and backtracked per character — quadratic on
+    # hostile YAML made of newlines (same class as the helm rewriter's
+    # fixed anchor; sibling of the same idiom).
+    pattern = re.compile(
+        rf"^([^\S\n]*(?:-\s+)?image:\s*[\"']?(?:{image_alternates}):)"
+        rf"([^\s\"'#]+)"                  # tag (non-greedy, stops at qt/ws/#)
+        rf"([\"'\s#]|$)",                  # boundary
+        re.MULTILINE,
+    )
+    # The same image can be pinned on several lines (two compose
+    # services on ``postgres:16.1``, repeated k8s containers).
+    # Verdicts are computed across ALL matching lines and every
+    # occurrence still at the old tag is rewritten — a first-match
+    # ``count=1`` substitution would bump one service and leave its
+    # twin on the vulnerable tag while the run reports applied.
+    tags = [m.group(2) for m in pattern.finditer(text)]
+    if not tags:
+        return text, RewriteResult(
+            edit=edit, applied=False, reason="not_found",
+        )
+    # Occurrences that actually need the bump: at the old tag and not
+    # already at the new one (a degenerate plan with old == new is
+    # idempotent, not applied).
+    needs_bump = [t for t in tags
+                  if t == edit.old_value and t != edit.new_value]
+    if not needs_bump:
+        if all(t == edit.new_value for t in tags):
+            return text, RewriteResult(
+                edit=edit, applied=False, reason="no_change",
+            )
+        stray = next(t for t in tags if t != edit.new_value)
+        return text, RewriteResult(
+            edit=edit, applied=False,
+            reason=(
+                f"value_mismatch: file has {stray!r}, "
+                f"plan expected {edit.old_value!r}"
+            ),
+        )
+
+    def _repl(m: re.Match) -> str:
+        if m.group(2) == edit.old_value:
+            return f"{m.group(1)}{edit.new_value}{m.group(3)}"
+        return m.group(0)
+    new_text = pattern.sub(_repl, text)
+    return new_text, RewriteResult(
+        edit=edit, applied=True, reason="applied",
+    )
+
+

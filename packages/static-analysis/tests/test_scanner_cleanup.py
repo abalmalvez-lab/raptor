@@ -19,7 +19,8 @@ _spec = importlib.util.spec_from_file_location(
     "static_analysis_scanner_cleanup", _SCANNER_PATH
 )
 _scanner_mod = importlib.util.module_from_spec(_spec)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 _spec.loader.exec_module(_scanner_mod)
 
 cleanup_per_pack_artifacts = _scanner_mod.cleanup_per_pack_artifacts
@@ -68,13 +69,13 @@ class TestSarifHasFindings:
         p.write_text(SARIF_WITH_FINDINGS)
         assert _sarif_has_findings(p) is True
 
-    def test_missing_file_returns_false(self, tmp_path):
-        assert _sarif_has_findings(tmp_path / "missing.sarif") is False
+    def test_missing_file_returns_unknown(self, tmp_path):
+        assert _sarif_has_findings(tmp_path / "missing.sarif") is None
 
-    def test_invalid_json_returns_false(self, tmp_path):
+    def test_invalid_json_returns_unknown(self, tmp_path):
         p = tmp_path / "x.sarif"
         p.write_text("not json {{{")
-        assert _sarif_has_findings(p) is False
+        assert _sarif_has_findings(p) is None
 
 
 # --------------------------------------------------------------------------
@@ -82,6 +83,10 @@ class TestSarifHasFindings:
 # --------------------------------------------------------------------------
 
 class TestCleanupPerPackArtifacts:
+
+    @pytest.fixture(autouse=True)
+    def committed_merge(self, tmp_path):
+        (tmp_path / "combined.sarif").write_text(EMPTY_SARIF)
 
     def test_successful_pack_with_empty_stderr_strips_everything(self, tmp_path):
         _make_pack(tmp_path, "category_auth", exit_code=0, stderr="")
@@ -109,7 +114,7 @@ class TestCleanupPerPackArtifacts:
     def test_failed_pack_with_empty_sarif_keeps_exit_and_stderr(self, tmp_path):
         _make_pack(
             tmp_path, "category_crypto",
-            exit_code=1, stderr="ERROR: rule parse failed\n",
+            exit_code=2, stderr="ERROR: rule parse failed\n",
             sarif=EMPTY_SARIF,
         )
         cleanup_per_pack_artifacts(tmp_path)
@@ -125,7 +130,7 @@ class TestCleanupPerPackArtifacts:
     def test_failed_pack_with_findings_keeps_sarif(self, tmp_path):
         _make_pack(
             tmp_path, "category_injection",
-            exit_code=1, stderr="ERROR: partial completion\n",
+            exit_code=2, stderr="ERROR: partial completion\n",
             sarif=SARIF_WITH_FINDINGS,
         )
         cleanup_per_pack_artifacts(tmp_path)
@@ -148,13 +153,14 @@ class TestCleanupPerPackArtifacts:
 
         cleanup_per_pack_artifacts(tmp_path)
 
-        assert not (tmp_path / f"semgrep_{suffix}.json").exists()
+        assert (tmp_path / f"semgrep_{suffix}.json").exists()
+        # An unknown exit preserves the pack's complete diagnostic set.
         # exit kept (failure treatment)
         assert (tmp_path / f"semgrep_{suffix}.exit").exists()
         # non-empty stderr kept
         assert (tmp_path / f"semgrep_{suffix}.stderr.log").exists()
-        # empty SARIF removed
-        assert not (tmp_path / f"semgrep_{suffix}.sarif").exists()
+        # Unknown exit means even the empty report remains evidence.
+        assert (tmp_path / f"semgrep_{suffix}.sarif").exists()
 
     def test_unrelated_files_left_alone(self, tmp_path):
         """Cleanup must only touch precisely-named per-pack files."""
@@ -173,6 +179,9 @@ class TestCleanupPerPackArtifacts:
         ]
         for name in keep:
             (tmp_path / name).write_text("x")
+
+        # Cleanup requires a readable canonical report.
+        (tmp_path / "combined.sarif").write_text(EMPTY_SARIF)
 
         # .semgrep_home/ subdirectory must be left intact.
         sh = tmp_path / ".semgrep_home"
@@ -204,7 +213,7 @@ class TestCleanupPerPackArtifacts:
         # Pack D: failed, sarif with findings → all diagnostics kept
         _make_pack(
             tmp_path, "p_default",
-            exit_code=1, stderr="partial\n", sarif=SARIF_WITH_FINDINGS,
+            exit_code=2, stderr="partial\n", sarif=SARIF_WITH_FINDINGS,
         )
 
         removed = cleanup_per_pack_artifacts(tmp_path)
@@ -237,7 +246,8 @@ class TestCleanupPerPackArtifacts:
         (tmp_path / "semgrep_category_partial.exit").write_text("0")
         # Should run without raising.
         cleanup_per_pack_artifacts(tmp_path)
-        assert not (tmp_path / "semgrep_category_partial.exit").exists()
+        # With no report, this marker is the only remaining evidence.
+        assert (tmp_path / "semgrep_category_partial.exit").exists()
 
     def test_does_not_follow_symlinks(self, tmp_path):
         # Set up a successful pack normally...

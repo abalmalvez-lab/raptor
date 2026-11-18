@@ -17,7 +17,8 @@ caller wants. This module centralises both:
     :func:`tarfile.data_filter` plus our own pre-checks (size cap,
     hard-link refusal, special-file refusal, optional absolute-path
     refusal). Returns :class:`UnsafeMemberReason` for diagnostic
-    logging.
+    logging. :func:`is_safe_member` is its boolean wrapper for
+    callers that don't need the diagnostic detail.
   * :func:`extract_files_from_tar` — generic tar walker that
     applies the safety filter, asks a consumer-supplied selector
     for the dict key (or ``None`` to skip), and returns
@@ -29,17 +30,27 @@ Limitations:
 
   * Requires Python 3.12+ for :func:`tarfile.data_filter`. Earlier
     versions get a stricter fallback that's slightly over-cautious.
-  * Doesn't cover compression-bomb attacks (a 1 KB tar that
-    extracts to 100 GB). The per-member size cap defends against
-    "one fake package-state file the size of the whole archive";
-    cumulative bombs need a wrapping budget the consumer enforces.
+  * Compression-bomb budgets ship here, with one opt-in: the
+    per-member size cap and the entry-count cap are on by default in
+    :func:`extract_files_from_tar` (raising
+    :class:`TarEntryCountExceeded`); the cumulative decompressed-size
+    budget is opt-in via its ``max_total_bytes`` argument (raising
+    :class:`TarTotalBytesExceeded`) because only the consumer knows a
+    sane aggregate bound for its archive class.
   * Decoding stays with the consumer — :func:`extract_files_from_tar`
     always returns bytes. Callers that want text decode themselves.
 """
 
-from .extract import extract_files_from_tar
+from .extract import (
+    TarEntryCountExceeded,
+    TarOpenError,
+    TarReadError,
+    TarTotalBytesExceeded,
+    extract_files_from_tar,
+)
 from .safe_member import (
     DEFAULT_MAX_MEMBER_BYTES,
+    DEFAULT_MAX_NAME_LENGTH,
     UnsafeMemberReason,
     is_safe_member,
     safe_member_reason,
@@ -47,6 +58,11 @@ from .safe_member import (
 
 __all__ = [
     "DEFAULT_MAX_MEMBER_BYTES",
+    "DEFAULT_MAX_NAME_LENGTH",
+    "TarEntryCountExceeded",
+    "TarOpenError",
+    "TarReadError",
+    "TarTotalBytesExceeded",
     "UnsafeMemberReason",
     "extract_files_from_tar",
     "is_safe_member",

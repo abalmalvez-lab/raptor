@@ -1,0 +1,392 @@
+"""Tests for axis-7 dead-code suppression (Phase 7).
+
+Composes with PR-4's ``packages.coccinelle.prereqs.gather_prereqs``
+to mark a finding NOT_EXPLOITABLE when its enclosing function is
+both `static` AND has zero callers / pointer-references in the
+target subtree.
+
+The static + pointer-ref guards are critical:
+  * `static` ensures file-local linkage (no calls in this TU →
+    genuinely dead).
+  * Pointer-reference scan covers kernel struct ops vtable
+    assignments (`.callback = func,`) and address-of uses that
+    PR-4's `funcname(args)` matcher misses.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from packages.coccinelle.runner import meets_min_version as _spatch_meets_min
+
+from core.dataflow.finding import Finding, Step
+from core.dataflow.validator import ValidatorVerdict
+from packages.source_intel.adapter import (
+    SourceIntelValidator,
+    _finding_in_dead_code,
+    _function_is_static,
+    _function_referenced_as_pointer,
+)
+
+
+@pytest.fixture
+def _live_tool_probe_state():
+    """Give this live probe fresh caches and restore the borrowed state."""
+    from core.testing.module_state import isolated_module_state
+    import packages.coccinelle.runner as consumer
+
+    with isolated_module_state(consumer, {
+        "_spatch_resolved": False,
+        "_resolved_spatch": None,
+    }):
+        yield
+
+
+@pytest.fixture
+def _live_tool_home(tmp_path, monkeypatch):
+    """Keep live prerequisite probes and their tests off operator state."""
+    root = tmp_path / "live-tool-state"
+    for key, leaf in {
+        "HOME": "home", "TMPDIR": "tmp", "XDG_CONFIG_HOME": "config",
+        "XDG_DATA_HOME": "data", "XDG_CACHE_HOME": "cache",
+    }.items():
+        directory = root / leaf
+        directory.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(key, str(directory))
+
+
+@pytest.fixture
+def _live_tool_prerequisite_0(_live_tool_home, _live_tool_probe_state):
+    """Check this live-tool prerequisite only after owned state is ready."""
+    if not _spatch_meets_min():
+        pytest.skip('spatch >= 1.3 required for prereqs E2E')
+
+
+
+
+def _finding(file_path: str, sink_line: int, rule_id: str) -> Finding:
+    return Finding(
+        finding_id="t",
+        producer="codeql",
+        rule_id=rule_id,
+        message="t",
+        source=Step(file_path=file_path, line=sink_line - 1, column=1,
+                    snippet="x", label="source"),
+        sink=Step(file_path=file_path, line=sink_line, column=1,
+                  snippet="x", label="sink"),
+        intermediate_steps=(),
+        raw={},
+    )
+
+
+# =====================================================================
+# _function_is_static — heuristic
+# =====================================================================
+
+
+def test_static_detected_simple(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "static int helper(int a) { return a; }\n"
+        "int public_fn(int a) { return a; }\n"
+    )
+    assert _function_is_static(str(f), "helper") is True
+    assert _function_is_static(str(f), "public_fn") is False
+
+
+def test_static_detected_multiline_signature(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "static int\n"
+        "long_signature(struct foo *f,\n"
+        "               int b)\n"
+        "{ return 0; }\n"
+    )
+    assert _function_is_static(str(f), "long_signature") is True
+
+
+def test_static_returns_false_on_missing_file():
+    assert _function_is_static("/no/such/file.c", "any") is False
+
+
+# =====================================================================
+# _function_referenced_as_pointer — vtable / callback / addr-of
+# =====================================================================
+
+
+def test_pointer_ref_struct_field_assignment(tmp_path):
+    f = tmp_path / "ops.c"
+    f.write_text(
+        "static int handler(int a) { return a; }\n"
+        "struct ops_t my_ops = {\n"
+        "    .handler = handler,\n"
+        "};\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "handler") is True
+
+
+def test_pointer_ref_address_of(tmp_path):
+    f = tmp_path / "use.c"
+    f.write_text(
+        "static int cb(int a) { return a; }\n"
+        "int register_cb(int (*)(int));\n"
+        "void boot(void) { register_cb(&cb); }\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "cb") is True
+
+
+def test_pointer_ref_passed_as_argument(tmp_path):
+    f = tmp_path / "use.c"
+    f.write_text(
+        "static int cb(int a) { return a; }\n"
+        "int register_cb(int (*)(int));\n"
+        "void boot(void) { register_cb(cb); }\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "cb") is True
+
+
+def test_pointer_ref_negative_only_call_present(tmp_path):
+    """If the only references are direct calls, the function is NOT
+    "referenced as a pointer" — return False so dead-code can fire."""
+    f = tmp_path / "use.c"
+    f.write_text(
+        "static int helper(int a) { return a; }\n"
+        "int main(void) { return helper(1); }\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "helper") is False
+
+
+def test_pointer_ref_found_in_hh_header(tmp_path):
+    """A callback reference living only in a ``.hh`` header must count.
+
+    The pointer scan is the final guard before dead-code suppression:
+    when ``.hh`` drifted out of the scan's extension set, a static
+    function referenced only there read as dead code — a wrong Not
+    Exploitable, the direction this axis promises not to err in.
+    """
+    (tmp_path / "def.c").write_text(
+        "static int handler(int a) { return a; }\n"
+    )
+    (tmp_path / "ops.hh").write_text(
+        "extern int handler(int);\n"
+        "struct ops_t my_ops = { .handler = handler, };\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "handler") is True
+
+
+def test_pointer_ref_extension_match_is_case_insensitive(tmp_path):
+    """Uppercase spellings (``.HH``) compare via ``suffix.lower()``,
+    matching the sibling walks in analyze.py and cache.py."""
+    (tmp_path / "def.c").write_text(
+        "static int handler(int a) { return a; }\n"
+    )
+    (tmp_path / "ops.HH").write_text(
+        "extern int handler(int);\n"
+        "struct ops_t my_ops = { .handler = handler, };\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "handler") is True
+
+
+def test_pointer_ref_searches_recursively(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (tmp_path / "def.c").write_text(
+        "static int handler(int a) { return a; }\n"
+    )
+    (sub / "ops.c").write_text(
+        "extern int handler(int);\n"
+        "struct ops_t my_ops = { .handler = handler, };\n"
+    )
+    assert _function_referenced_as_pointer(tmp_path, "handler") is True
+
+
+# =====================================================================
+# _finding_in_dead_code — full composition
+# =====================================================================
+
+
+@pytest.mark.usefixtures('_live_tool_prerequisite_0')
+def test_dead_code_fires_on_static_unreferenced(tmp_path):
+    """Static + zero callers + zero pointer-refs → dead-code."""
+    f = tmp_path / "dead.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "static int unsafe_helper(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+    assert _finding_in_dead_code(finding, tmp_path) is True
+
+
+@pytest.mark.usefixtures('_live_tool_prerequisite_0')
+def test_dead_code_skipped_for_non_static(tmp_path):
+    """Non-static function must not be flagged dead even with zero
+    callers in the target — caller may live in another TU."""
+    f = tmp_path / "live.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "int public_fn(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+    assert _finding_in_dead_code(finding, tmp_path) is False
+
+
+@pytest.mark.usefixtures('_live_tool_prerequisite_0')
+def test_dead_code_skipped_when_pointer_referenced(tmp_path):
+    """Static, no calls, BUT registered as a vtable callback — NOT
+    dead. This is the kernel struct ops shape (CVE-2017-7541)."""
+    f = tmp_path / "ops.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "static int handler(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+        "struct ops_t my_ops = { .handler = handler, };\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+    assert _finding_in_dead_code(finding, tmp_path) is False
+
+
+# =====================================================================
+# Verdict integration
+# =====================================================================
+
+
+@pytest.mark.usefixtures('_live_tool_prerequisite_0')
+@pytest.mark.slow  # genuine cost: full analyze()/spatch E2E through the sandbox exceeds the 10s default-tier budget; logic-level coverage stays default-tier
+def test_validator_verdict_dead_code_emits_not_exploitable(tmp_path):
+    """Adapter integration: dead-code → NOT_EXPLOITABLE wins over
+    other passes (it runs first)."""
+    f = tmp_path / "dead.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "static int unsafe_helper(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+    v = SourceIntelValidator(repo_root=tmp_path)
+    assert v.validate(finding) == ValidatorVerdict.NOT_EXPLOITABLE
+
+
+@pytest.mark.usefixtures('_live_tool_prerequisite_0')
+@pytest.mark.slow  # genuine cost: full analyze()/spatch E2E through the sandbox exceeds the 10s default-tier budget; logic-level coverage stays default-tier
+def test_validator_verdict_skips_dead_code_for_non_static(tmp_path):
+    """A non-static unsafe function with no observed calls in the
+    fixture — verdict must NOT be NOT_EXPLOITABLE.
+
+    Note: after axis-7 hazards shipped (deprecated functions
+    including strcpy), the unbounded-strcpy in this fixture
+    correctly fires axis-7 EXPLOITABLE. The original intent of
+    the test (dead-code doesn't fire on non-static) is still
+    enforced: any verdict OTHER than NOT_EXPLOITABLE confirms
+    dead-code is skipped. The use of `do_copy` instead of
+    `strcpy` would yield UNCERTAIN, but keeping `strcpy` is
+    more representative of real kernel code.
+    """
+    f = tmp_path / "live.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "int public_fn(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+    v = SourceIntelValidator(repo_root=tmp_path)
+    verdict = v.validate(finding)
+    assert verdict != ValidatorVerdict.NOT_EXPLOITABLE, (
+        f"dead-code MUST NOT fire on non-static fn; got {verdict}"
+    )
+
+
+def test_dead_code_requires_complete_sweep_unit(tmp_path, monkeypatch):
+    """A partially-errored sweep may be missing exactly the call site
+    that would disprove "zero callers" — the dead-code verdict must
+    abstain on an incomplete fact base. Control leg pins that the
+    same facts marked complete still fire."""
+    import packages.source_intel.adapter as adapter_mod
+    from packages.coccinelle.prereqs import PrereqFacts
+
+    f = tmp_path / "x.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "static int helper(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+
+    def _facts(complete: bool) -> PrereqFacts:
+        facts = PrereqFacts(complete=complete)
+        facts.defs["helper"] = {(str(f), 2)}
+        return facts
+
+    monkeypatch.setattr(
+        adapter_mod, "_gather_prereqs_cached", lambda t: _facts(False),
+    )
+    assert _finding_in_dead_code(finding, tmp_path) is False
+
+    monkeypatch.setattr(
+        adapter_mod, "_gather_prereqs_cached", lambda t: _facts(True),
+    )
+    assert _finding_in_dead_code(finding, tmp_path) is True
+
+
+def test_verdict_dead_code_branch_unit(tmp_path, monkeypatch):
+    """Default-tier twin of the spatch E2E verdict tests above: the
+    adapter's dead-code branch (dead → NOT_EXPLOITABLE, and it runs
+    before the exploitability axes) with the detection stubbed, so a
+    deleted branch fails every tier."""
+    import packages.source_intel.adapter as adapter_mod
+    from packages.source_intel.analyze import SourceIntelResult
+
+    analysis = SourceIntelResult()  # real empty result: axes stay quiet
+    monkeypatch.setattr(adapter_mod, "analyze", lambda target: analysis)
+
+    f = tmp_path / "x.c"
+    f.write_text(
+        "extern int strcpy(char *d, const char *s);\n"
+        "static int helper(const char *s) {\n"
+        "    char buf[16];\n"
+        "    strcpy(buf, s);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    finding = _finding(str(f), 4, "cpp/unbounded-write")
+
+    monkeypatch.setattr(
+        adapter_mod, "_finding_in_dead_code", lambda fi, root: True,
+    )
+    v = SourceIntelValidator(repo_root=tmp_path)
+    assert v.validate(finding) == ValidatorVerdict.NOT_EXPLOITABLE
+
+    # Not dead: the branch must not fire; whatever the axes decide,
+    # NOT_EXPLOITABLE must come from evidence, not from this stub.
+    monkeypatch.setattr(
+        adapter_mod, "_finding_in_dead_code", lambda fi, root: False,
+    )
+    for helper in (
+        "_abort_dominates_finding",
+        "_privileged_capability_dominates",
+    ):
+        if hasattr(adapter_mod, helper):
+            monkeypatch.setattr(
+                adapter_mod, helper, lambda fi, res, **kw: False,
+            )
+    v2 = SourceIntelValidator(repo_root=tmp_path)
+    assert v2.validate(finding) != ValidatorVerdict.NOT_EXPLOITABLE

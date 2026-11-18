@@ -1,0 +1,1309 @@
+"""Append-only corpus run-history store and reporting CLI.
+
+Usage:
+    python3 -m core.audit.corpus.history runs
+    python3 -m core.audit.corpus.history compare <runA> <runB>
+    python3 -m core.audit.corpus.history trend --label <function_id>
+    python3 -m core.audit.corpus.history stability
+    python3 -m core.audit.corpus.history import <results.json>...
+
+Every corpus run appends one RUN header record plus one LABEL record
+per scored label to a JSONL store (default
+``~/.local/share/raptor/corpus-history.jsonl``, overridable via
+``RAPTOR_CORPUS_HISTORY``).  ``compare`` is the report for measuring
+fix impact between two runs: per-label verdict flips grouped by flip
+type, attribution-cell changes, and cost deltas.  ``stability`` reports
+verdict variance across matching recorded pipeline, label, and configuration
+contexts.
+
+Reporting-only, by design: nothing in the audit/corpus pipeline reads
+this store to alter behavior.  The read side is exclusively this
+module's CLI.  The write side is a post-finalization hook in
+``run_corpus`` (after results.json lands) whose failure warns and
+never fails the run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import math
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TYPE_CHECKING, cast
+
+from core.json import load_json, loads
+from core.json.jsonl import append_jsonl
+from core.security.log_sanitisation import sanitise_for_terminal
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
+logger = logging.getLogger(__name__)
+
+HISTORY_ENV = "RAPTOR_CORPUS_HISTORY"
+
+# results.json files track corpus size — the checklist budget class.
+_MAX_RESULTS_BYTES = 256 * 1024 * 1024
+
+# Output filenames that identify the run only through their directory
+# (out/corpus-full-v3/results.json -> run id "corpus-full-v3").
+_GENERIC_STEMS = frozenset({"results", "corpus-results"})
+
+
+def store_path() -> Path:
+    """Resolve the history store path (env override > default)."""
+    override = os.environ.get(HISTORY_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return (
+        Path.home() / ".local" / "share" / "raptor"
+        / "corpus-history.jsonl"
+    )
+
+
+def _warn(msg: str) -> None:
+    print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Record construction
+# ---------------------------------------------------------------------------
+
+def pipeline_tree_sha() -> str:
+    """``git rev-parse HEAD^{tree}`` of the repo this runner executes from.
+
+    The pipeline-under-test is the checkout whose code is actually
+    running, so the root is resolved from this module's own location,
+    not the caller's cwd.  Returns ``""`` when the sha cannot be
+    resolved (not a git checkout, git missing) — recording must never
+    fail a run over provenance.
+    """
+    root = Path(__file__).resolve().parents[3]
+    try:
+        from core.config import RaptorConfig
+        from core.git import safe_git_readonly_command
+
+        result = subprocess.run(
+            safe_git_readonly_command(
+                "-C", str(root), "rev-parse", "HEAD^{tree}",
+            ),
+            capture_output=True, text=True, timeout=30,
+            env=RaptorConfig.get_safe_env(), check=False,
+        )
+        sha = result.stdout.strip()
+        if result.returncode == 0 and sha:
+            return sha
+    except Exception:  # noqa: BLE001 — provenance is best-effort
+        logger.debug("pipeline tree sha resolution failed", exc_info=True)
+    return ""
+
+
+def label_set_hash(labels: Iterable[Any]) -> str:
+    """SHA-256 over the sorted ``function_id:span_sha`` entries."""
+    entries = sorted(
+        f"{lb.function_id}:{getattr(lb.source, 'span_sha', '') or ''}"
+        for lb in labels
+    )
+    return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def _gate_outcomes(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Recompute calibration-gate outcomes for the run header.
+
+    Deterministic re-derivation from the same rows the summary scores;
+    failures degrade to ``passed: None`` rather than blocking the
+    write.
+    """
+    try:
+        from .corpus_metrics import check_gate, compute_metrics
+
+        aggregate, per_class, _ = compute_metrics(rows)
+        failures = check_gate(aggregate, per_class, rows)
+        return {"passed": not failures, "failures": failures}
+    except Exception:  # noqa: BLE001 — recording must not fail the run
+        logger.debug("gate recomputation failed", exc_info=True)
+        return {"passed": None, "failures": []}
+
+
+def run_id_for_output(output: Path) -> str:
+    """Derive a run id from the results path.
+
+    A generic filename (``results.json``) identifies the run through
+    its directory; anything else uses the file stem.
+    """
+    resolved = output.resolve()
+    if resolved.stem in _GENERIC_STEMS and resolved.parent.name:
+        return resolved.parent.name
+    return resolved.stem
+
+
+def _timestamp_for_run(run_tag: str | None, output: Path) -> str:
+    """ISO-8601 UTC timestamp from the run's own artifacts.
+
+    Prefers the runner's run tag (the epoch it stamped at run start);
+    falls back to the results file's mtime.  No fresh clock reads.
+    """
+    if run_tag:
+        try:
+            return datetime.fromtimestamp(
+                int(run_tag), tz=timezone.utc,
+            ).isoformat()
+        except (ValueError, OverflowError, OSError):
+            pass
+    try:
+        return datetime.fromtimestamp(
+            output.stat().st_mtime, tz=timezone.utc,
+        ).isoformat()
+    except OSError:
+        return ""
+
+
+def _recorded_total_spend(record: dict[str, Any]) -> int | float | None:
+    """Read a usable saved total, without inferring it from label costs."""
+    value = record.get("total_spend_usd")
+    try:
+        if type(value) in (int, float):
+            numeric = cast(int | float, value)
+            return numeric if math.isfinite(numeric) and numeric >= 0 else None
+        return None
+    except OverflowError:
+        return None
+
+
+def build_run_record(
+    results: list[dict[str, Any]],
+    meta: dict[str, Any],
+    *,
+    run_id: str,
+    timestamp: str,
+    tree_sha: str,
+    config: dict[str, Any],
+    labels_hash: str,
+    imported: bool = False,
+    profile: str = "deployed",
+    selection: Any = "full",
+    label_kind: str = "real",
+) -> dict[str, Any]:
+    """Build the RUN header record for one corpus run.
+
+    ``label_kind`` partitions the store: ``real`` runs measure
+    detection on real-world labels; ``synthetic_mutant`` runs are
+    mutation-operator regression floors (see
+    ``core.audit.corpus.mutation``).  The two must never mix in one
+    report — ``compare`` refuses across kinds, ``stability`` groups
+    include the kind, and the post-run delta reports only consider
+    prior runs of the same kind.  Records written before the field
+    existed are read as ``real`` (see :func:`run_label_kind`).
+
+    ``profile`` records which knowledge profile produced the run
+    (``cold`` = raw first-time-user capability, ``deployed`` = all
+    accumulated-knowledge channels on). Records written before the
+    field existed are read as ``deployed`` (see :func:`run_profile`).
+
+    ``selection`` distinguishes a full-corpus run (``"full"``) from a
+    selective refire (a dict like ``{"class": ..., "labels": [...]}``
+    mirroring the --class/--label filters), so history readers never
+    misread a 3-label refire as a full-run regression. The label-set
+    hash already reflects the subset; this field records the
+    operator's intent. Absent on pre-selection records.
+
+    ``label_files_sha256`` (read from meta) is the content hash of
+    the label overlay the run loaded — the runner stamps it into
+    results meta, so both fresh recordings and back-imports of a
+    meta-carrying results.json tie the row to its exact overlay.
+    Empty on records whose results predate the field.
+    """
+    reviewed = [r for r in results if not r.get("skipped")]
+    return {
+        "record": "run",
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "pipeline_tree_sha": tree_sha,
+        "profile": profile or "deployed",
+        "label_kind": label_kind or "real",
+        "selection": selection if selection is not None else "full",
+        "config": dict(config),
+        "label_set_hash": labels_hash,
+        "label_files_sha256": meta.get("label_files_sha256", ""),
+        "gates": _gate_outcomes(results),
+        "totals": {
+            "labels": len(results),
+            "reviewed": len(reviewed),
+            "matched": sum(1 for r in reviewed if r.get("match")),
+            "errors": sum(
+                1 for r in results if r.get("actual") == "error"
+            ),
+            "skipped": len(results) - len(reviewed),
+            "wall_s": meta.get("wall_s", 0.0),
+            "llm_s": meta.get("llm_s", 0.0),
+        },
+        "cost_usd": meta.get(
+            "cost_usd",
+            round(sum(r.get("cost_usd", 0.0) for r in results), 4),
+        ),
+        "total_spend_usd": _recorded_total_spend(meta),
+        "imported": imported,
+    }
+
+
+def describe_selection(run_rec: dict[str, Any]) -> str:
+    """Human-readable selection: 'full', 'class=x', 'N label(s)'.
+
+    Pre-selection records return '' (unknown — full runs and refires
+    were recorded identically before the field existed).
+    """
+    sel = run_rec.get("selection")
+    if sel is None:
+        return ""
+    if sel == "full":
+        return "full"
+    parts = []
+    if isinstance(sel, dict):
+        if sel.get("class"):
+            parts.append(f"class={sel['class']}")
+        if sel.get("labels"):
+            parts.append(f"{len(sel['labels'])} label(s)")
+    return "refire: " + ", ".join(parts) if parts else "refire"
+
+
+def run_profile(run_rec: dict[str, Any]) -> str:
+    """The run header's profile, tolerant of pre-profile records.
+
+    Every run recorded before the profile field existed ran with all
+    accumulated-knowledge channels on — today's ``deployed``.
+    """
+    return run_rec.get("profile") or "deployed"
+
+
+def run_label_kind(run_rec: dict[str, Any]) -> str:
+    """The run header's label kind, tolerant of pre-kind records.
+
+    Every run recorded before the field existed measured real-world
+    labels (synthetic mutants postdate it) — ``real``.
+    """
+    return run_rec.get("label_kind") or "real"
+
+
+def build_label_records(
+    results: list[dict[str, Any]],
+    *,
+    run_id: str,
+    span_shas: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build one LABEL record per result row.
+
+    Tolerates older result shapes: every field beyond ``function_id``
+    is optional and defaults (v2 rows lack ``error_reason``, probe
+    rows lack ``skipped``, pre-attribution rows lack the attribution
+    fields).
+    """
+    span_shas = span_shas or {}
+    records = []
+    for row in results:
+        fid = row.get("function_id", "")
+        if not fid:
+            _warn(f"history: result row without function_id skipped "
+                  f"(run {run_id})")
+            continue
+        records.append({
+            "record": "label",
+            "run_id": run_id,
+            "function_id": fid,
+            "span_sha": span_shas.get(fid, ""),
+            "label_kind": row.get("label_kind") or "real",
+            "bug_class": row.get("bug_class", ""),
+            "expected": row.get("expected", ""),
+            "actual": row.get("actual", ""),
+            "match": bool(row.get("match", False)),
+            "skipped": bool(row.get("skipped", False)),
+            "attribution": row.get("attribution", ""),
+            "observed_mechanisms": list(
+                row.get("observed_mechanisms", []) or [],
+            ),
+            "error_reason": row.get("error_reason", ""),
+            "model": row.get("model", ""),
+            "cost_usd": row.get("cost_usd", 0.0),
+            "duration_s": row.get("duration_s", 0.0),
+        })
+    return records
+
+
+def append_records(path: Path, records: list[dict[str, Any]]) -> None:
+    """Append records to the JSONL store (append-only, one per line).
+
+    Routed through ``core.json.jsonl.append_jsonl`` so concurrent
+    writers stay line-atomic: the store is machine-wide
+    (``~/.local/share/raptor/corpus-history.jsonl``) and parallel
+    corpus runs finish whenever they finish — a buffered text-mode
+    append flushes in interleavable chunks, and one torn RUN header
+    silently drops that run from every report (the reader skips
+    malformed lines by contract). O_APPEND + single-write appends
+    also pick up the trail hardening (symlink/FIFO refusal).
+    Raises ``OSError`` like ``append_jsonl``; both callers tolerate
+    it (``record_run`` is a warn-and-return-False wrapper, the CLI
+    ``import`` command fails loudly).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for rec in records:
+        append_jsonl(path, rec, sort_keys=True)
+
+
+def record_run(
+    results: list[dict[str, Any]],
+    meta: dict[str, Any],
+    *,
+    output_path: Path,
+    run_tag: str | None = None,
+    labels: list[Any] | None = None,
+    config: dict[str, Any] | None = None,
+    store: Path | None = None,
+    profile: str = "deployed",
+    selection: Any = "full",
+    label_kind: str = "real",
+) -> bool:
+    """Append one run to the history store.  Never raises.
+
+    The run_corpus writer hook: called once results.json is finalized
+    (normal and gate-fail exits alike).  Any failure warns on stderr
+    and returns False — history is reporting-only and must never fail
+    the run that produced the data.
+    """
+    try:
+        path = Path(store) if store is not None else store_path()
+        output = Path(output_path)
+        run_id = run_id_for_output(output)
+        run_rec = build_run_record(
+            results, meta,
+            run_id=run_id,
+            timestamp=_timestamp_for_run(run_tag, output),
+            tree_sha=pipeline_tree_sha(),
+            config=config or {},
+            labels_hash=label_set_hash(labels) if labels else "",
+            profile=profile,
+            selection=selection,
+            label_kind=label_kind,
+        )
+        span_shas = {
+            lb.function_id: getattr(lb.source, "span_sha", "") or ""
+            for lb in (labels or [])
+        }
+        label_recs = build_label_records(
+            results, run_id=run_id, span_shas=span_shas,
+        )
+        append_records(path, [run_rec] + label_recs)
+        print(f"Run history appended to {path} (run {run_id})",
+              flush=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 — history must never fail the run
+        logger.debug("history recording failed", exc_info=True)
+        _warn(f"corpus run history not recorded: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Store reading
+# ---------------------------------------------------------------------------
+
+def iter_records(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield store records, skipping malformed lines with a warning.
+
+    A corrupt line (interrupted append, manual edit) must not kill
+    reads over the rest of an append-only store.
+    """
+    try:
+        # errors="replace": the decode happens in the loop header,
+        # OUTSIDE any per-line try — one invalid-UTF-8 line (torn
+        # append, manual edit) raised UnicodeDecodeError and killed
+        # the whole generator, losing every record after it. Replaced
+        # bytes make that line fail JSON parse and skip like any other
+        # malformed line.
+        f = Path(path).open(encoding="utf-8", errors="replace")  # raw-open: corpus history ledger owned by this harness (eval lane)
+    except OSError:
+        return
+    with f:
+        for lineno, raw in enumerate(f, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = loads(raw)
+            except ValueError:
+                _warn(f"{path}:{lineno}: malformed history line skipped")
+                continue
+            if (
+                not isinstance(rec, dict)
+                or rec.get("record") not in ("run", "label")
+            ):
+                _warn(f"{path}:{lineno}: unrecognized history record "
+                      f"skipped")
+                continue
+            yield rec
+
+
+def load_store(
+    path: Path,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Load (run_headers, label_records_by_run_id) in append order."""
+    runs: list[dict[str, Any]] = []
+    labels: dict[str, list[dict[str, Any]]] = {}
+    for rec in iter_records(path):
+        if rec["record"] == "run":
+            runs.append(rec)
+        else:
+            labels.setdefault(rec.get("run_id", ""), []).append(rec)
+    return runs, labels
+
+
+def resolve_run(
+    runs: list[dict[str, Any]],
+    token: str,
+) -> dict[str, Any]:
+    """Resolve a run id (or unique substring) to its latest header.
+
+    Raises ``ValueError`` listing candidates on ambiguity, or when
+    nothing matches.
+    """
+    exact = [r for r in runs if r.get("run_id") == token]
+    if exact:
+        return exact[-1]
+    matches = [r for r in runs if token in r.get("run_id", "")]
+    ids = sorted({r.get("run_id", "") for r in matches})
+    if len(ids) == 1:
+        return [r for r in matches if r.get("run_id") == ids[0]][-1]
+    if not ids:
+        known = ", ".join(
+            sorted({r.get("run_id", "") for r in runs}),
+        ) or "none recorded"
+        msg = f"no run matches {token!r} (runs: {known})"
+        raise ValueError(msg)
+    msg = f"run token {token!r} is ambiguous: {', '.join(ids)}"
+    raise ValueError(msg)
+
+
+def _latest_labels(
+    run: dict[str, Any],
+    labels_by_run: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Latest label record per function_id for one run."""
+    out: dict[str, dict[str, Any]] = {}
+    for rec in labels_by_run.get(run.get("run_id", ""), []):
+        out[rec["function_id"]] = rec
+    return out
+
+
+# ---------------------------------------------------------------------------
+# compare
+# ---------------------------------------------------------------------------
+
+def classify_flip(a: dict[str, Any], b: dict[str, Any]) -> str:
+    """Classify a verdict flip between two records of the same label.
+
+    ``errored``: the label now errors.  ``recovered``: it errored
+    before and now matches (``regressed`` if it errored before and
+    still mismatches).  ``improved`` / ``regressed``: the match flag
+    flipped.  ``lateral``: verdict changed, match unchanged.
+    """
+    if b.get("actual") == "error":
+        return "errored"
+    if a.get("actual") == "error":
+        return "recovered" if b.get("match") else "regressed"
+    a_match = bool(a.get("match"))
+    b_match = bool(b.get("match"))
+    if b_match and not a_match:
+        return "improved"
+    if a_match and not b_match:
+        return "regressed"
+    return "lateral"
+
+
+def compare_runs(
+    run_a: dict[str, Any],
+    run_b: dict[str, Any],
+    labels_a: dict[str, dict[str, Any]],
+    labels_b: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Compute the fix-impact diff between two runs.
+
+    Refuses cross-kind comparison (``ValueError``): a synthetic-
+    mutant run's flips are mutation-operator regression movements and
+    must never render in the same report as real-label movements —
+    the refusal is structural (here, not just in the CLI) so every
+    programmatic consumer inherits it.
+    """
+    kind_a, kind_b = run_label_kind(run_a), run_label_kind(run_b)
+    if kind_a != kind_b:
+        msg = (
+            f"cannot compare across label kinds: "
+            f"{run_a.get('run_id')} is {kind_a}, "
+            f"{run_b.get('run_id')} is {kind_b} (synthetic-mutant "
+            f"floors never mix with real-label results)"
+        )
+        raise ValueError(msg)
+    common = sorted(set(labels_a) & set(labels_b))
+    flips: dict[str, list[dict[str, Any]]] = {}
+    attribution_changes: list[dict[str, Any]] = []
+    expectation_changes: list[dict[str, Any]] = []
+    for fid in common:
+        a, b = labels_a[fid], labels_b[fid]
+        if ("expected" in a, a.get("expected")) != ("expected" in b, b.get("expected")):
+            expectation_changes.append({
+                "function_id": fid,
+                "from_recorded": "expected" in a, "from": a.get("expected"),
+                "to_recorded": "expected" in b, "to": b.get("expected"),
+            })
+        if a.get("actual") != b.get("actual"):
+            flips.setdefault(classify_flip(a, b), []).append({
+                "function_id": fid,
+                "expected": b.get("expected", a.get("expected", "")),
+                "from": a.get("actual", ""),
+                "from_skipped": bool(a.get("skipped")),
+                "to": b.get("actual", ""),
+                "to_skipped": bool(b.get("skipped")),
+                "error_reason": b.get("error_reason", ""),
+            })
+        if a.get("attribution", "") != b.get("attribution", ""):
+            attribution_changes.append({
+                "function_id": fid,
+                "from": a.get("attribution", ""),
+                "to": b.get("attribution", ""),
+                "observed": b.get("observed_mechanisms", []),
+            })
+
+    def _matched(recs: dict[str, dict[str, Any]]) -> tuple[int, int]:
+        """(matched, reviewed) over non-skipped records — the same
+        convention as the run header and the runner summary."""
+        reviewed = [r for r in recs.values() if not r.get("skipped")]
+        return sum(1 for r in reviewed if r.get("match")), len(reviewed)
+
+    cost_a = float(run_a.get("cost_usd") or 0.0)
+    cost_b = float(run_b.get("cost_usd") or 0.0)
+    total_spend_a = _recorded_total_spend(run_a)
+    total_spend_b = _recorded_total_spend(run_b)
+    matched_a, reviewed_a = _matched(labels_a)
+    matched_b, reviewed_b = _matched(labels_b)
+    common_matched_a, common_reviewed_a = _matched({fid: labels_a[fid] for fid in common})
+    common_matched_b, common_reviewed_b = _matched({fid: labels_b[fid] for fid in common})
+    config_a = run_a.get("config") or {}
+    config_b = run_b.get("config") or {}
+    configuration_changes = []
+    for field in sorted(config_a.keys() | config_b.keys()):
+        if (field in config_a, config_a.get(field)) != (field in config_b, config_b.get(field)):
+            configuration_changes.append({
+                "field": field,
+                "from_recorded": field in config_a, "from": config_a.get(field),
+                "to_recorded": field in config_b, "to": config_b.get(field),
+            })
+    return {
+        "run_a": run_a,
+        "run_b": run_b,
+        "common": len(common),
+        "only_in_a": sorted(set(labels_a) - set(labels_b)),
+        "only_in_b": sorted(set(labels_b) - set(labels_a)),
+        "matched_a": matched_a,
+        "reviewed_a": reviewed_a,
+        "matched_b": matched_b,
+        "reviewed_b": reviewed_b,
+        "common_label_matches": {
+            "matched_a": common_matched_a, "reviewed_a": common_reviewed_a,
+            "matched_b": common_matched_b, "reviewed_b": common_reviewed_b,
+        },
+        "flips": flips,
+        "attribution_changes": attribution_changes,
+        "cost_a": cost_a,
+        "cost_b": cost_b,
+        "cost_delta": cost_b - cost_a,
+        "total_spend_a": total_spend_a,
+        "total_spend_b": total_spend_b,
+        "total_spend_delta": (total_spend_b - total_spend_a
+                              if total_spend_a is not None and total_spend_b is not None else None),
+        "configuration_changes": configuration_changes,
+        "expectation_changes": expectation_changes,
+    }
+
+
+# Fixed report order: improvements first, then the bad news.
+_FLIP_ORDER = ("improved", "recovered", "lateral", "regressed", "errored")
+
+
+def format_compare(diff: dict[str, Any]) -> str:
+    """Format the compare report."""
+    a, b = diff["run_a"], diff["run_b"]
+    lines = []
+    lines.append(
+        f"Compare {a.get('run_id')} ({a.get('timestamp') or '?'}) -> "
+        f"{b.get('run_id')} ({b.get('timestamp') or '?'})"
+    )
+    if run_label_kind(a) == "synthetic_mutant":
+        lines.append(
+            "  Label kind: synthetic_mutant — flips are mutation-"
+            "operator regression movements, not real-bug detection "
+            "changes"
+        )
+    for run, tag in ((a, "run a"), (b, "run b")):
+        desc = describe_selection(run)
+        if desc and desc != "full":
+            lines.append(
+                f"  NOTE: {tag} ({run.get('run_id')}) is a selective "
+                f"refire ({desc}) — flips reflect the refired subset, "
+                f"not a full-run regression"
+            )
+    prof_a, prof_b = run_profile(a), run_profile(b)
+    if (prof_a, prof_b) != ("deployed", "deployed"):
+        note = (
+            " — PROFILES DIFFER (cold measures raw first-run "
+            "capability; deployed folds accumulated knowledge)"
+            if prof_a != prof_b else ""
+        )
+        lines.append(f"  Profiles: {prof_a} -> {prof_b}{note}")
+    configuration_changes = diff.get("configuration_changes", [])
+    if configuration_changes:
+        lines.append("  NOTE: recorded configuration differs; verdict changes alone do not isolate fix impact.")
+        for change in configuration_changes:
+            before = repr(change["from"]) if change["from_recorded"] else "(unrecorded)"
+            after = repr(change["to"]) if change["to_recorded"] else "(unrecorded)"
+            lines.append(sanitise_for_terminal(f"    {change['field']}: {before} -> {after}"))
+    expectation_changes = diff.get("expectation_changes", [])
+    if expectation_changes:
+        lines.append("  NOTE: recorded label expectations differ; match deltas may reflect label revisions.")
+        for change in expectation_changes:
+            before = repr(change["from"]) if change["from_recorded"] else "(unrecorded)"
+            after = repr(change["to"]) if change["to_recorded"] else "(unrecorded)"
+            lines.append(sanitise_for_terminal(f"    {change['function_id']}: expected {before} -> {after}"))
+    lines.append(
+        f"  Labels: {diff['common']} common"
+        + (f", {len(diff['only_in_a'])} only in {a.get('run_id')}"
+           if diff["only_in_a"] else "")
+        + (f", {len(diff['only_in_b'])} only in {b.get('run_id')}"
+           if diff["only_in_b"] else "")
+    )
+    shared = diff.get("common_label_matches")
+    if shared is not None:
+        shared_delta = shared["matched_b"] - shared["matched_a"]
+        lines.append(
+            f"  Matched on shared labels (reviewed): {shared['matched_a']}/{shared['reviewed_a']}"
+            f" -> {shared['matched_b']}/{shared['reviewed_b']} ({shared_delta:+d})"
+        )
+        if not diff["common"]:
+            lines.append("  NOTE: no shared labels; whole-run totals do not measure a common set.")
+        elif shared["reviewed_a"] != shared["reviewed_b"]:
+            lines.append("  NOTE: shared labels have different non-skipped counts.")
+    delta = diff["matched_b"] - diff["matched_a"]
+    lines.append(
+        f"  Matched in whole runs (reviewed): {diff['matched_a']}/{diff['reviewed_a']}"
+        f" -> {diff['matched_b']}/{diff['reviewed_b']} ({delta:+d})"
+    )
+    lines.append(
+        f"  Label-attributed cost: ${diff['cost_a']:.4f} -> ${diff['cost_b']:.4f} "
+        f"({diff['cost_delta']:+.4f})"
+    )
+    total_a, total_b, total_delta = (diff.get(key) for key in ("total_spend_a", "total_spend_b", "total_spend_delta"))
+    before_total = f"${total_a:.4f}" if total_a is not None else "unknown"
+    after_total = f"${total_b:.4f}" if total_b is not None else "unknown"
+    delta_total = f"${total_delta:+.4f}" if total_delta is not None else "unknown"
+    lines.append(f"  Recorded total spend: {before_total} -> {after_total} (delta {delta_total})")
+    for run, tag in ((a, "  Gates"), (b, "      ->")):
+        gates = run.get("gates") or {}
+        passed = gates.get("passed")
+        verdict = (
+            "unknown" if passed is None
+            else "pass" if passed
+            else f"fail ({len(gates.get('failures', []))})"
+        )
+        lines.append(f"{tag} [{run.get('run_id')}]: {verdict}")
+
+    flips = diff["flips"]
+    total_flips = sum(len(v) for v in flips.values())
+    if not total_flips:
+        lines.append("\nNo verdict flips.")
+    else:
+        lines.append(f"\nVerdict flips ({total_flips}):")
+        for kind in _FLIP_ORDER:
+            group = flips.get(kind)
+            if not group:
+                continue
+            lines.append(f"  {kind} ({len(group)}):")
+            for flip in group:
+                from_tag = " (skipped)" if flip["from_skipped"] else ""
+                to_tag = " (skipped)" if flip["to_skipped"] else ""
+                lines.append(
+                    f"    {flip['function_id']}: {flip['from']}"
+                    f"{from_tag} -> {flip['to']}{to_tag} "
+                    f"[expected={flip['expected']}]"
+                )
+                if flip["error_reason"]:
+                    lines.append(
+                        f"      reason: {flip['error_reason']}"
+                    )
+
+    changes = diff["attribution_changes"]
+    if changes:
+        lines.append(f"\nAttribution changes ({len(changes)}):")
+        for ch in changes:
+            observed = ", ".join(ch["observed"]) or "none"
+            lines.append(
+                f"  {ch['function_id']}: {ch['from'] or '(unset)'} -> "
+                f"{ch['to'] or '(unset)'} [observed: {observed}]"
+            )
+    else:
+        lines.append("\nNo attribution changes.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# runs / trend / stability
+# ---------------------------------------------------------------------------
+
+def format_runs(runs: list[dict[str, Any]]) -> str:
+    """Format the run-header listing."""
+    if not runs:
+        return "No runs recorded."
+    lines = [
+        f"{'Run':<28} {'Timestamp':<26} {'Tree':<12} {'Profile':<9} "
+        f"{'Mode':<10} "
+        f"{'Labels':>6} {'Match':>6} {'Label $':>9} {'Total $':>9} {'Gates':<9} "
+        f"{'Imported':<9} Kind",
+        "-" * 138,
+    ]
+    for r in runs:
+        totals = r.get("totals") or {}
+        gates = r.get("gates") or {}
+        passed = gates.get("passed")
+        gate_str = (
+            "unknown" if passed is None
+            else "pass" if passed
+            else f"fail({len(gates.get('failures', []))})"
+        )
+        config = r.get("config") or {}
+        total_spend = _recorded_total_spend(r)
+        total_text = f"${total_spend:.4f}" if total_spend is not None else "unknown"
+        lines.append(
+            f"{r.get('run_id', '')[:27]:<28} "
+            f"{(r.get('timestamp') or '')[:25]:<26} "
+            f"{(r.get('pipeline_tree_sha') or '')[:12]:<12} "
+            f"{run_profile(r)[:9]:<9} "
+            f"{config.get('mode') or ''!s:<10} "
+            f"{totals.get('labels', 0):>6} "
+            f"{totals.get('matched', 0):>6} "
+            f"${float(r.get('cost_usd') or 0.0):>8.4f} "
+            f"{total_text:>9} "
+            f"{gate_str:<9} "
+            f"{'yes' if r.get('imported') else 'no':<9} "
+            f"{run_label_kind(r)}"
+        )
+    return "\n".join(lines)
+
+
+def format_trend(
+    function_id: str,
+    runs: list[dict[str, Any]],
+    labels_by_run: dict[str, list[dict[str, Any]]],
+) -> str:
+    """Format one label's history across all recorded runs.
+
+    Partitioned by label kind: the same function_id can be labelled
+    as a real defect in one overlay and as a synthetic mutant in
+    another, and a mutant row rendering inline with real rows would
+    read as a real-detection trend.  Rows are grouped per kind with
+    an explicit section marker — never interleaved.
+    """
+    rows = []
+    for run in runs:
+        rec = _latest_labels(run, labels_by_run).get(function_id)
+        if rec is None:
+            continue
+        rows.append((run, rec))
+    if not rows:
+        return f"No history for label {function_id!r}."
+    by_kind: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for run, rec in rows:
+        kind = rec.get("label_kind") or run_label_kind(run)
+        by_kind.setdefault(kind, []).append((run, rec))
+    lines = [f"History for {function_id}:"]
+    multi = len(by_kind) > 1
+    for kind in sorted(by_kind):
+        if multi or kind != "real":
+            note = (
+                " (partitioned — mutant rows never trend against "
+                "real rows)" if multi else ""
+            )
+            lines.append(f"  Label kind: {kind}{note}")
+        lines.extend((
+            f"  {'Run':<28} {'Timestamp':<26} {'Expected':<10} "
+            f"{'Actual':<12} {'Match':<6} {'Attribution':<14} "
+            f"{'Cost':>9}",
+            "  " + "-" * 110,
+        ))
+        for run, rec in by_kind[kind]:
+            lines.append(
+                f"  {run.get('run_id', '')[:27]:<28} "
+                f"{(run.get('timestamp') or '')[:25]:<26} "
+                f"{rec.get('expected', ''):<10} "
+                f"{rec.get('actual', ''):<12} "
+                f"{'yes' if rec.get('match') else 'NO':<6} "
+                f"{rec.get('attribution', '') or '-':<14} "
+                f"${float(rec.get('cost_usd') or 0.0):>8.4f}"
+            )
+            if rec.get("error_reason"):
+                lines.append(f"      reason: {rec['error_reason']}")
+    return "\n".join(lines)
+
+
+def stability_groups(
+    runs: list[dict[str, Any]],
+    labels_by_run: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Group by recorded tree, kind, profile, config, and label fingerprints.
+
+    Runs without a recorded tree sha (imports) cannot assert
+    same-tree and are excluded.  Within each group of two or more
+    runs, report labels with different verdicts. Missing label fingerprints
+    form separate legacy groups whose incomplete provenance is reported.
+    Recorded hashes are not revalidated. Label kind remains structural:
+    mutant and real-label runs never share a group. Reused IDs contribute
+    only their latest header; their merged label history is disclosed.
+    """
+    grouped: dict[
+        tuple[str, str, str, str, str, str], list[dict[str, Any]],
+    ] = {}
+    latest_runs: dict[str, dict[str, Any]] = {}
+    reused_run_ids = set()
+    for run in reversed(runs):
+        run_id = run.get("run_id", "")
+        if run_id in latest_runs:
+            reused_run_ids.add(run_id)
+        else:
+            latest_runs[run_id] = run
+    for run in reversed(list(latest_runs.values())):
+        tree = run.get("pipeline_tree_sha") or ""
+        if not tree:
+            continue
+        label_set = run.get("label_set_hash")
+        label_files = run.get("label_files_sha256")
+        key = (
+            tree,
+            run_label_kind(run),
+            run_profile(run),
+            json.dumps(run.get("config") or {}, sort_keys=True),
+            label_set if isinstance(label_set, str) else "",
+            label_files if isinstance(label_files, str) else "",
+        )
+        grouped.setdefault(key, []).append(run)
+
+    out = []
+    for (tree, kind, profile, config_json, label_set, label_files), group in sorted(
+        grouped.items(),
+    ):
+        if len(group) < 2:
+            continue
+        verdicts: dict[str, dict[str, str]] = {}
+        for run in group:
+            for fid, rec in _latest_labels(run, labels_by_run).items():
+                verdicts.setdefault(fid, {})[run.get("run_id", "")] = (
+                    rec.get("actual", "")
+                )
+        unstable = {
+            fid: by_run for fid, by_run in verdicts.items()
+            if len(by_run) >= 2 and len(set(by_run.values())) > 1
+        }
+        comparable = sum(
+            1 for by_run in verdicts.values() if len(by_run) >= 2
+        )
+        out.append({
+            "tree_sha": tree,
+            "label_kind": kind,
+            "profile": profile,
+            "config": json.loads(config_json),
+            "label_set_hash": label_set,
+            "label_files_sha256": label_files,
+            "label_provenance_recorded": bool(label_set and label_files),
+            "run_ids": [r.get("run_id", "") for r in group],
+            "reused_run_ids": [r.get("run_id", "") for r in group if r.get("run_id", "") in reused_run_ids],
+            "comparable_labels": comparable,
+            "unstable": unstable,
+        })
+    return out
+
+
+def format_stability(groups: list[dict[str, Any]]) -> str:
+    """Format variance and recorded input-provenance coverage."""
+    if not groups:
+        return (
+            "No comparable run groups (need two or more distinct recorded run IDs "
+            "with matching recorded tree, label provenance, profile, kind, and configuration)."
+        )
+    lines = []
+    for g in groups:
+        config = ", ".join(
+            f"{k}={v}" for k, v in sorted(g["config"].items())
+            if v is not None
+        )
+        kind_tag = (
+            f" kind {g['label_kind']}"
+            if g.get("label_kind", "real") != "real" else ""
+        )
+        lines.append(
+            f"Tree {g['tree_sha'][:12]}{kind_tag} "
+            f"profile {g.get('profile', 'deployed')} "
+            f"config [{config}] — runs: {', '.join(g['run_ids'])}"
+        )
+        label_set = (g.get("label_set_hash") or "")[:12] or "unrecorded"
+        label_files = (g.get("label_files_sha256") or "")[:12] or "unrecorded"
+        lines.append(sanitise_for_terminal(f"  Recorded labels: set={label_set} definitions={label_files}"))
+        if not g.get("label_provenance_recorded", False):
+            lines.append("  NOTE: label provenance is incomplete; variance does not establish identical label inputs.")
+        if g.get("reused_run_ids"):
+            lines.append("  NOTE: reused run IDs use their latest header and merged label history.")
+        n_unstable = len(g["unstable"])
+        lines.append(
+            f"  Verdict variance: {n_unstable}/"
+            f"{g['comparable_labels']} comparable label(s) unstable"
+        )
+        for fid in sorted(g["unstable"]):
+            by_run = g["unstable"][fid]
+            detail = ", ".join(
+                f"{rid}={verdict}"
+                for rid, verdict in sorted(by_run.items())
+            )
+            lines.append(f"    {fid}: {detail}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# refire deltas
+# ---------------------------------------------------------------------------
+
+def refire_deltas(
+    store: Path,
+    function_ids: list[str],
+    *,
+    current_run_id: str,
+) -> list[str]:
+    """Per-label verdict deltas vs each label's latest PRIOR record.
+
+    Post-run operator reporting for the selective-refire loop (fix a
+    detector -> refire one label -> read the flip): for every refired
+    label, find its most recent record from a run recorded BEFORE the
+    current one and phrase the change. Read-only use of the history
+    store, consistent with the reporting-only rule — it reports to
+    the operator after results are final and never feeds the
+    pipeline. Returns [] when the store or the current run is absent.
+    """
+    try:
+        runs, labels_by_run = load_store(store)
+    except OSError:
+        return []
+    order = [r.get("run_id", "") for r in runs]
+    if current_run_id not in order:
+        return []
+    # Last occurrence: a reused --output path re-records under the
+    # same id; the newest header is the refire. (Reusing a path also
+    # merges the two runs' label records — distinct --output paths
+    # per refire keep deltas exact; see the corpus README.)
+    cur_idx = max(
+        i for i, rid in enumerate(order) if rid == current_run_id
+    )
+    current = runs[cur_idx]
+    cur_labels = _latest_labels(current, labels_by_run)
+    prior_runs = [
+        r for r in runs[:cur_idx]
+        if r.get("run_id") != current_run_id
+        # Same-kind priors only: a mutant refire delta against a real
+        # run's record (or vice versa) would phrase a cross-kind flip
+        # as a fix impact.
+        and run_label_kind(r) == run_label_kind(current)
+    ]
+
+    lines: list[str] = []
+    for fid in function_ids:
+        now = cur_labels.get(fid)
+        if now is None:
+            continue
+        prev = None
+        for run in reversed(prior_runs):
+            rec = _latest_labels(run, labels_by_run).get(fid)
+            if rec is not None:
+                prev = (run, rec)
+                break
+        expected = now.get("expected", "")
+        match_tag = "matches" if now.get("match") else "mismatched"
+        if prev is None:
+            lines.append(
+                f"{fid}: {now.get('actual', '')} "
+                f"(expected {expected}, {match_tag}) — no prior history"
+            )
+            continue
+        prev_run, prev_rec = prev
+        if prev_rec.get("actual") == now.get("actual"):
+            lines.append(
+                f"{fid}: {now.get('actual', '')} — unchanged since "
+                f"{prev_run.get('run_id', '?')} (still {match_tag})"
+            )
+        else:
+            flip = classify_flip(prev_rec, now)
+            lines.append(
+                f"{fid}: {prev_rec.get('actual', '')} -> "
+                f"{now.get('actual', '')} (expected {expected}) — "
+                f"{flip.upper()}, now {match_tag} "
+                f"[vs {prev_run.get('run_id', '?')}]"
+            )
+    return lines
+
+
+def full_run_delta(store: Path, current_run_id: str) -> str | None:
+    """Delta vs an overlapping prior run, preferring recorded context.
+
+    Full-run counterpart to :func:`refire_deltas`: a 220-label run
+    used to print nothing but "history appended" even when the store
+    held a complete prior run — the flip report existed in the data
+    and was never shown.  Read-only, reporting-only, best-effort:
+    returns None when the store, the current run, a prior run, or any
+    common label is absent across all same-kind priors. Prefer the latest
+    overlapping run with matching recorded profile and configuration;
+    otherwise use the latest overlapping run with context warnings.
+    """
+    try:
+        runs, labels_by_run = load_store(store)
+    except OSError:
+        return None
+    order = [r.get("run_id", "") for r in runs]
+    if current_run_id not in order:
+        return None
+    # Last occurrence, same convention as refire_deltas: a reused
+    # --output path re-records under the same id.
+    cur_idx = max(
+        i for i, rid in enumerate(order) if rid == current_run_id
+    )
+    current = runs[cur_idx]
+    prior_runs = [
+        r for r in runs[:cur_idx]
+        if r.get("run_id") != current_run_id
+        # Same-kind priors only — compare_runs refuses cross-kind
+        # anyway; filtering here finds the latest COMPARABLE run
+        # instead of failing on an interleaved other-kind run.
+        and run_label_kind(r) == run_label_kind(current)
+    ]
+    if not prior_runs:
+        return None
+    labels_b = _latest_labels(current, labels_by_run)
+    fallback = None
+    selected = None
+    seen_run_ids = set()
+    for candidate in reversed(prior_runs):
+        candidate_id = candidate.get("run_id", "")
+        if candidate_id in seen_run_ids:
+            continue
+        seen_run_ids.add(candidate_id)
+        candidate_labels = _latest_labels(candidate, labels_by_run)
+        if not (candidate_labels.keys() & labels_b.keys()):
+            continue
+        if fallback is None:
+            fallback = (candidate, candidate_labels)
+        if (run_profile(candidate) == run_profile(current)
+                and (candidate.get("config") or {}) == (current.get("config") or {})):
+            selected = (candidate, candidate_labels)
+            break
+    if fallback is None:
+        return None
+    if selected is None:
+        selected = fallback
+        note = "Automatic baseline: no matching recorded context; using latest overlapping run.\n"
+    elif selected[0] is not fallback[0]:
+        note = "Automatic baseline: preferred matching recorded profile and configuration.\n"
+    else:
+        note = ""
+    prior, labels_a = selected
+    diff = compare_runs(prior, current, labels_a, labels_b)
+    return note + format_compare(diff)
+
+
+# ---------------------------------------------------------------------------
+# import
+# ---------------------------------------------------------------------------
+
+def import_results(results_path: Path, store: Path) -> str:
+    """Back-import a results.json into the store.  Returns the run id.
+
+    Tolerates the older result shapes: a bare list (no meta wrapper),
+    meta without triage/prefilter, rows without error_reason or
+    attribution fields.  The run header is synthesized from whatever
+    meta exists plus the file's mtime; ``imported: true`` marks it,
+    and the pipeline tree sha and label-set hash are left empty (they
+    were not recorded at run time and cannot be reconstructed).
+    """
+    raw = load_json(results_path, strict=True, max_bytes=_MAX_RESULTS_BYTES)
+    if raw is None:
+        # Strict load_json still soft-returns None for a missing file.
+        raise FileNotFoundError(results_path)
+    if isinstance(raw, dict) and "results" in raw:
+        meta = raw.get("meta") or {}
+        rows = raw["results"]
+    elif isinstance(raw, list):
+        meta = {}
+        rows = raw
+    else:
+        msg = (
+            f"{results_path}: not a corpus results file "
+            f"(expected a list or a {{meta, results}} wrapper)"
+        )
+        raise ValueError(msg)
+    if not isinstance(rows, list):
+        msg = f"{results_path}: results is not a list"
+        raise ValueError(msg)
+
+    # Kind integrity: rows carrying an explicit label_kind must agree
+    # with the file's meta (a re-wrapped or hand-edited artifact must
+    # carry the kind verbatim, and a mismatch is refused — never
+    # silently defaulted).  Kind-less rows inherit the meta kind so a
+    # synthetic file's rows are never recorded as real.
+    meta_kind = meta.get("label_kind") or "real"
+    for row in rows:
+        row_kind = row.get("label_kind")
+        if row_kind and row_kind != meta_kind:
+            msg = (
+                f"{results_path}: row {row.get('function_id', '?')!r} "
+                f"has label_kind={row_kind!r} but meta says "
+                f"{meta_kind!r} — refusing a mixed-kind import"
+            )
+            raise ValueError(msg)
+        row["label_kind"] = meta_kind
+
+    modes = sorted({r.get("mode", "") for r in rows if r.get("mode")})
+    config = {
+        "mode": "+".join(modes) if modes else None,
+        "triage": meta.get("triage"),
+        "prefilter": meta.get("prefilter"),
+        "model": meta.get("model", ""),
+        "scope": None,
+        "splice": meta.get("spliced_from"),
+    }
+    # Preserve recorded provenance without inventing current defaults for
+    # older artifacts. Presence matters: null ABI and a no-expiry TTL are
+    # explicit values, not missing configuration.
+    for key in ("model_resolved", "llm_cache", "llm_cache_policy", "integer_abi"):
+        if key in meta:
+            config[key] = meta[key]
+    run_id = run_id_for_output(results_path)
+    run_rec = build_run_record(
+        rows, meta,
+        run_id=run_id,
+        timestamp=_timestamp_for_run(None, results_path),
+        tree_sha="",
+        config=config,
+        labels_hash="",
+        imported=True,
+        profile=meta.get("profile") or "deployed",
+        label_kind=meta.get("label_kind") or "real",
+    )
+    label_recs = build_label_records(rows, run_id=run_id)
+    append_records(store, [run_rec] + label_recs)
+    return run_id
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python3 -m core.audit.corpus.history",
+        description=(
+            "Corpus run-history reporting (reporting-only: the "
+            "audit/corpus pipeline never reads this store)"
+        ),
+    )
+    parser.add_argument(
+        "--store", type=Path, default=None,
+        help=f"History store path (default: {HISTORY_ENV} env var, "
+             f"then ~/.local/share/raptor/corpus-history.jsonl)",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("runs", help="List recorded run headers")
+
+    p_cmp = sub.add_parser(
+        "compare",
+        help="Per-label verdict flips, attribution changes, and cost "
+             "deltas between two runs (fix-impact report)",
+    )
+    p_cmp.add_argument("run_a", help="Run id (or unique substring)")
+    p_cmp.add_argument("run_b", help="Run id (or unique substring)")
+
+    p_trend = sub.add_parser(
+        "trend", help="One label's verdict history across runs",
+    )
+    p_trend.add_argument(
+        "--label", required=True, dest="function_id",
+        help="function_id of the label",
+    )
+
+    sub.add_parser(
+        "stability",
+        help="Verdict variance across distinct run IDs grouped by recorded pipeline, labels, and configuration",
+    )
+
+    p_imp = sub.add_parser(
+        "import", help="Back-import results.json files into the store",
+    )
+    p_imp.add_argument(
+        "results", nargs="+", type=Path,
+        help="results.json path(s) from prior corpus runs",
+    )
+
+    args = parser.parse_args(argv)
+    store = args.store if args.store is not None else store_path()
+
+    if args.cmd == "import":
+        rc = 0
+        for path in args.results:
+            try:
+                run_id = import_results(path, store)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                _warn(f"import failed for {path}: {exc}")
+                rc = 1
+                continue
+            print(f"Imported {path} as run {run_id} into {store}")
+        return rc
+
+    runs, labels_by_run = load_store(store)
+
+    if args.cmd == "runs":
+        print(format_runs(runs))
+        return 0
+
+    if args.cmd == "compare":
+        try:
+            run_a = resolve_run(runs, args.run_a)
+            run_b = resolve_run(runs, args.run_b)
+            diff = compare_runs(
+                run_a, run_b,
+                _latest_labels(run_a, labels_by_run),
+                _latest_labels(run_b, labels_by_run),
+            )
+        except ValueError as exc:
+            # Unresolvable/ambiguous run tokens, or a cross-kind
+            # compare (mutant floors never mix with real results).
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(format_compare(diff))
+        return 0
+
+    if args.cmd == "trend":
+        report = format_trend(args.function_id, runs, labels_by_run)
+        print(report)
+        return 0 if not report.startswith("No history") else 1
+
+    if args.cmd == "stability":
+        print(format_stability(stability_groups(runs, labels_by_run)))
+        return 0
+
+    return 1  # pragma: no cover — argparse enforces the choices
+
+
+if __name__ == "__main__":
+    sys.exit(main())

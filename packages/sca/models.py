@@ -1,0 +1,653 @@
+"""Data model for the /sca pipeline.
+
+Every signal in the pipeline carries a Confidence; every finding has a single
+canonical schema; risk is surfaced both as per-signal components
+(``risk_components``) and as a composite score
+(``VulnFinding.raptor_risk_estimate``, computed in :mod:`.risk`).
+
+All dataclasses are JSON-serialisable via dataclasses.asdict; the report and
+findings.json layers handle that wrapping.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Literal, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Confidence — cross-cutting uncertainty type
+# ---------------------------------------------------------------------------
+
+ConfidenceLevel = Literal["low", "medium", "high"]
+
+# Standard categorical → numeric mapping. Used wherever a level is given
+# without an explicit numeric override.
+_CONFIDENCE_NUMERIC = {"low": 0.30, "medium": 0.70, "high": 0.95}
+
+
+@dataclass(frozen=True)
+class Confidence:
+    """Cross-cutting confidence/uncertainty for any signal in the pipeline.
+
+    Carries:
+      - level: human-readable bucket
+      - numeric: 0.0-1.0 for the (future) risk-score formula
+      - reason: max-200-char human-readable justification
+
+    The standard level→numeric mapping (low=0.30, medium=0.70, high=0.95) is
+    applied when numeric is not explicitly provided. Pass an explicit numeric
+    when a signal is genuinely continuous (e.g., wrapping EPSS directly).
+    """
+
+    level: ConfidenceLevel
+    reason: str = ""
+    numeric: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.numeric is None:
+            object.__setattr__(self, "numeric", _CONFIDENCE_NUMERIC[self.level])
+        if len(self.reason) > 200:
+            object.__setattr__(self, "reason", self.reason[:197] + "...")
+
+
+# ---------------------------------------------------------------------------
+# Pin style — how tightly a manifest declares a version
+# ---------------------------------------------------------------------------
+
+class PinStyle(str, Enum):
+    EXACT = "exact"          # ==1.2.3
+    CARET = "caret"          # ^1.2.3 (npm: compatible-with)
+    TILDE = "tilde"          # ~1.2.3 (npm: approximately)
+    RANGE = "range"          # >=1.2.0,<2.0.0
+    WILDCARD = "wildcard"    # *
+    GIT = "git"              # git+https://... or git ref
+    PATH = "path"            # local path
+    UNKNOWN = "unknown"      # parser couldn't classify
+
+
+# OCI tags that float to a moving target — pulling them twice can
+# yield different images, so they classify as WILDCARD, not EXACT.
+FLOATING_TAGS = frozenset({
+    "latest", "stable", "edge", "nightly", "dev",
+    "beta", "alpha", "rc", "canary",
+    "main", "master",
+})
+
+
+def classify_pin_style(version: str | None) -> PinStyle:
+    """Classify an OCI image tag's pin style.
+
+    ``sha256:`` digests are EXACT; missing tags and well-known
+    floating tags are WILDCARD; every other tag is treated as EXACT.
+    Shared by the container-manifest parsers (compose, kubernetes,
+    gitlab-ci). The gomod parser keeps its own Go-specific variant
+    (pseudo-versions, path replacements).
+    """
+    if not version:
+        return PinStyle.WILDCARD
+    if version.startswith("sha256:"):
+        return PinStyle.EXACT
+    if version.lower() in FLOATING_TAGS:
+        return PinStyle.WILDCARD
+    return PinStyle.EXACT
+
+
+# ---------------------------------------------------------------------------
+# Dependency — one row per dep (direct or transitive)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Dependency:
+    """A single dep observed in a manifest or lockfile."""
+
+    ecosystem: str               # "Maven", "PyPI", "npm", "Cargo", "Go",
+                                 # "RubyGems", "NuGet", "Packagist"
+    name: str                    # canonical (purl-ready), case-normalised.
+                                 # ALWAYS the real (installed) package: an
+                                 # npm alias (``<alias>@npm:<real>@<range>``)
+                                 # records the alias TARGET here so advisory
+                                 # lookups, purls, and cross-run identity
+                                 # key on what actually ships — recording
+                                 # the alias spelling hid the installed
+                                 # package's advisories. The manifest's
+                                 # literal spelling lives in ``alias_name``.
+    version: str | None       # None = unpinned manifest entry
+    declared_in: Path            # which manifest/lockfile observed it
+    scope: str                   # "main" | "dev" | "test" | "peer" |
+                                 # "optional" | "build"
+    is_lockfile: bool            # True if from a lockfile (resolved version)
+    pin_style: PinStyle
+    direct: bool                 # True if declared, False if transitive
+    purl: str                    # pkg:maven/group/artifact@version
+    parser_confidence: Confidence  # exact (POM XML) | heuristic (Gradle DSL)
+    declared_license: str | None = None  # single declaration/expression;
+                                        # multiple entries use license_declarations
+    commented_out: bool = False    # True when extracted from a commented
+                                    # line (e.g. `# z3-solver==4.16.0.0`); the
+                                    # findings layer downgrades severity to
+                                    # info and the rewriter preserves the `#`
+    source_kind: str = "manifest"   # "manifest" / "lockfile" / "dockerfile"
+                                    # / "devcontainer" / "shell_script" /
+                                    # "gha_workflow" / "cascade_resolver"
+                                    # / "metadata_walk" / "review" /
+                                    # "dockerfile_from" / "override" — feeds
+                                    # the report's "where did this come
+                                    # from" column. ``cascade_resolver`` is
+                                    # a transitive dep generated by an
+                                    # in-sandbox cascade run; ``metadata_walk``
+                                    # is a transitive dep approximated by
+                                    # registry-metadata recursion (less
+                                    # accurate); ``review`` is operator-
+                                    # supplied to ``raptor-sca check``.
+    source_extra: dict[str, Any] | None = None
+                                    # Per-source diagnostic context.
+                                    # Examples:
+                                    #   ``dockerfile_from`` rows carry
+                                    #     ``{"image": "<ref>", "digest":
+                                    #     "<sha256:...>", "stage_name":
+                                    #     "builder" | None}`` so the
+                                    #     report can group by base image
+                                    #     and surface which build stage a
+                                    #     finding came from.
+                                    # Renderers that don't consume the
+                                    # field treat it as a black box.
+    workspace_root: Path | None = None  # set when this dep was
+                                            # parsed from a npm / Yarn /
+                                            # pnpm workspace member; the
+                                            # path of the monorepo root
+                                            # (where the parent
+                                            # ``package.json`` with the
+                                            # ``workspaces`` field lives,
+                                            # or where ``pnpm-workspace.yaml``
+                                            # lives). Hygiene checks
+                                            # group multi-workspace
+                                            # findings under one logical
+                                            # project; cross-workspace
+                                            # divergent-version findings
+                                            # use this as the cluster
+                                            # key.
+
+    alias_name: str | None = None        # manifest-declared alias
+                                            # spelling when the dep was
+                                            # installed via an npm alias
+                                            # (``"my-lodash": "npm:lodash@
+                                            # ^4.17.21"`` → name="lodash",
+                                            # alias_name="my-lodash").
+                                            # Display and fix-
+                                            # materialisation consult this
+                                            # so reports show what the
+                                            # manifest literally declares
+                                            # and rewrites land under the
+                                            # alias key; everything else
+                                            # (OSV, purl, dedup, diff)
+                                            # keys on ``name``. ``None``
+                                            # for non-aliased deps.
+    inline_comment: str | None = None    # trailing ``# note`` text
+                                            # from the raw line, preserved
+                                            # for round-trip rewriting
+    version_floor: str | None = None     # tightest lower bound
+                                            # (``>=`` / ``>``) from the
+                                            # original specifier — the
+                                            # downgrade floor harden
+                                            # honours when remediating
+                                            # below the current pin.
+    version_ceiling: str | None = None   # tightest upper bound
+                                            # (``<`` / ``<=``) — the
+                                            # upgrade ceiling.
+
+    transitive_depth: int | None = None  # graph-derived depth, when known
+    license_declarations: tuple[str, ...] = ()  # separate upstream declarations;
+                                                # no inferred AND/OR relationship
+
+    def __post_init__(self) -> None:
+        # Provenance correction: lockfile-parsed rows that don't set an
+        # explicit source_kind would otherwise carry the "manifest"
+        # default and misreport their origin in findings.json / SBOM.
+        # Explicit non-default source_kinds are always preserved.
+        if self.is_lockfile and self.source_kind == "manifest":
+            self.source_kind = "lockfile"
+
+    def key(self) -> str:
+        """Stable identity for dedup / cross-reference."""
+        return f"{self.ecosystem}:{self.name}@{self.version or '*'}"
+
+
+# ---------------------------------------------------------------------------
+# Advisory — OSV / GHSA record matched to a dep
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AffectedRange:
+    """One range entry from OSV's affected[].ranges[]."""
+
+    type: Literal["SEMVER", "ECOSYSTEM", "GIT"]
+    events: list[dict[str, str]]  # [{"introduced": "0"}, {"fixed": "2.17.1"}]
+    repo: str | None = None    # for type=GIT
+
+
+@dataclass
+class CVSSScore:
+    """Standard CVSS3.1 score + vector."""
+
+    score: float                 # 0.0-10.0
+    vector: str                  # "CVSS:3.1/AV:N/AC:L/..."
+    severity: Literal["none", "low", "medium", "high", "critical"]
+
+
+@dataclass
+class Advisory:
+    """A single OSV / GHSA / PYSEC advisory."""
+
+    osv_id: str                  # "GHSA-jfh8-c2jp-5v3q" or "PYSEC-2024-..."
+    aliases: list[str]           # ["CVE-2021-44228", ...]
+    summary: str                 # one-line summary
+    details: str                 # full markdown details — registry-
+                                 # supplied, NOT length-bounded at
+                                 # parse (packages/osv/parser applies
+                                 # no cap); renderers sanitise/trim
+    affected: list[AffectedRange]
+    severity: CVSSScore | None
+    fixed_versions: list[str]    # extracted from affected.ranges.events.fixed
+    references: list[str]        # URLs
+    published: datetime | None = None
+    modified: datetime | None = None
+    ecosystem_specific: dict[str, Any] | None = None
+    # ecosystem_specific.imports[].symbols populated for Go advisories;
+    # used by Go function-level reachability.
+    # RUSTSEC ``informational`` tag (and similar non-security markers
+    # on other ecos). Values seen in the wild: ``"unsound"``,
+    # ``"unmaintained"``, ``"notice"``. When set, the advisory is NOT
+    # a security vulnerability — it's a soundness / quality concern
+    # the upstream curators wanted to surface. Consumers (calibration
+    # validate / refit; future: scan-time severity gating) skip these
+    # from exploitation ground-truth so they don't inflate the
+    # signal set. ``None`` for advisories that are real
+    # vulnerabilities (vast majority).
+    informational: str | None = None
+    # Weakness classes from the record's ``database_specific.cwe_ids``
+    # (GHSA populates these; other ecos usually don't). Normalised
+    # "CWE-NNN" strings. Consumed by the audit-side advisory bridge to
+    # derive per-component CWE-family priors.
+    cwe_ids: list[str] = field(default_factory=list)
+    # Severity label derived from a non-CVSS source (GHSA's
+    # ``database_specific.severity``) when the record's only CVSS entry
+    # is a v4 vector that couldn't be scored numerically (the optional
+    # ``cvss`` package is absent or the vector is malformed). Carries no
+    # fabricated numeric score — ``severity`` stays None. The findings
+    # layer consults this before its blanket medium degrade. Values:
+    # "none" / "low" / "medium" / "high" / "critical".
+    severity_fallback: str | None = None
+
+
+# Distro-namespaced CVE-primary ids: Debian / Ubuntu / Alpine secdb
+# OSV records ship ``<DISTRO>-CVE-<year>-<number>`` as the PRIMARY id
+# with an EMPTY alias list — the CVE is embedded in the id, never
+# aliased. Anchored both ends: exactly one uppercase prefix token,
+# then a spec-shaped CVE tail (4-digit year, ≥4-digit number), and
+# nothing after it — ``DEBIAN-CVE-2026-1234-1`` or a multi-segment
+# prefix does NOT match. Prefix-stripping grants no authority the
+# alias list doesn't already grant: any advisory can list arbitrary
+# CVE aliases, so a hostile ``EVIL-CVE-…`` primary can only point at
+# a real CVE's public enrichment the same way a planted alias could.
+# ASCII digits only (``\d`` would admit Unicode digits) and ``\Z``
+# (``$`` tolerates a trailing newline) — the id must be exactly the
+# canonical shape, byte for byte.
+_DISTRO_CVE_PRIMARY_RE = re.compile(r"^[A-Z]+-(CVE-[0-9]{4}-[0-9]{4,})\Z")
+
+
+def canonical_cve_id(candidate: object) -> str | None:
+    """Normalise one advisory id to its canonical CVE id, or ``None``
+    when the id carries no CVE.
+
+    Uppercases first (the KEV / EPSS / SSVC enrichment maps are keyed
+    uppercase), passes ``CVE-*`` ids through, and resolves the
+    distro-namespaced ``<DISTRO>-CVE-*`` primary-id family to its
+    embedded CVE. The distro id itself stays untouched on the advisory
+    (``osv_id`` is the provenance record); only the JOIN key is
+    canonicalised.
+    """
+    if not isinstance(candidate, str):
+        return None
+    # ``.strip()`` before the fold: a whitespace-padded feed spelling
+    # was otherwise admitted verbatim (trailing ws — failing every
+    # uppercase-keyed join) or dropped entirely (leading ws).
+    candidate = candidate.strip().upper()
+    if candidate.startswith("CVE-"):
+        return candidate
+    m = _DISTRO_CVE_PRIMARY_RE.match(candidate)
+    if m:
+        return m.group(1)
+    return None
+
+
+def cve_ids(advisory: Advisory) -> list[str]:
+    """All CVE-shaped ids for ``advisory`` — primary ``osv_id`` first,
+    then aliases, first-seen order, deduplicated.
+
+    OSV serves records whose PRIMARY id carries the CVE with no
+    self-alias — either the CVE itself (kernel-CNA records) or a
+    distro-namespaced ``<DISTRO>-CVE-*`` id (Debian / Ubuntu / Alpine
+    secdb — exactly the rows image-source scans inject). A consumer
+    that keys KEV / EPSS / SSVC enrichment off the alias list alone
+    silently loses those signals for CVE-primary advisories, so every
+    CVE-list consumer routes through here, and every id resolves
+    through :func:`canonical_cve_id` so the distro family joins too.
+
+    Ids are normalised to UPPERCASE: the EPSS / SSVC enrichment maps
+    are keyed uppercase, so a lowercase feed spelling appended raw
+    would be admitted here yet silently lose its join downstream
+    (epss/ssvc null while the case-folding KEV join says listed).
+    Dedup is case-insensitive for the same reason.
+    """
+    out: list[str] = []
+    for cand in (advisory.osv_id, *(advisory.aliases or [])):
+        canonical = canonical_cve_id(cand)
+        if canonical is not None and canonical not in out:
+            out.append(canonical)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Reachability — module-level (default) + Go function-level
+# ---------------------------------------------------------------------------
+
+ReachabilityVerdict = Literal[
+    "not_evaluated",   # parser doesn't support this ecosystem's import detection
+    "not_reachable",   # dep is in tree but no import found in non-test source
+    "imported",        # at least one import found in non-test source
+    "not_function_reachable",  # imported, but the OSV-listed affected function(s)
+                       # aren't called by the project (function-level resolver
+                       # — currently PyPI when OSV ships affected_functions)
+    "called_in_dead_code",     # vulnerable function called from project source,
+                       # but EVERY call site lives in a project function with
+                       # no callers (1-hop empty AND reverse closure empty).
+                       # The vulnerable code path isn't exercised at runtime
+                       # under normal use. Confidence is ``medium`` not
+                       # ``high`` — a no-caller host might still be an entry
+                       # point we can't see (CLI main, HTTP handler registered
+                       # via decorator, pytest fixture, ``__main__`` module,
+                       # packaging entry-point). Operators viewing medium
+                       # confidence can override.
+    "likely_called",   # vulnerable function/symbol confirmed at a call site
+                       # in a project function that IS reachable — the call
+                       # sits on a live execution path. (Go function-level
+                       # when OSV ships symbols; PyPI function-level via
+                       # core.analysis.reachability)
+]
+
+
+@dataclass
+class Reachability:
+    verdict: ReachabilityVerdict
+    confidence: Confidence
+    evidence: list[str] = field(default_factory=list)  # file:line refs
+
+
+# Operator-facing display labels for each verdict. Title-cased for the
+# rendered tables (the schema enum stays snake_case for the JSON/CLI
+# contract). Single source of truth — renderers + reports import from
+# here so a new verdict only needs one update.
+REACHABILITY_LABELS: dict[str, str] = {
+    "likely_called": "Likely called",
+    "imported": "Imported",
+    "called_in_dead_code": "Called in dead code",
+    "not_reachable": "Not reachable",
+    "not_function_reachable": "Not function reachable",
+    "not_evaluated": "Not evaluated",
+}
+
+# Display order for breakdown tables: reachable-tier first, then
+# uncertain, then not-reachable. Matches the triage-by-impact ordering
+# operators want at a glance. New verdicts not in this tuple sort to
+# the end (renderers handle the leftover set).
+REACHABILITY_ORDER: tuple[str, ...] = (
+    "likely_called",
+    "imported",
+    "called_in_dead_code",
+    "not_reachable",
+    "not_function_reachable",
+    "not_evaluated",
+)
+
+
+# ---------------------------------------------------------------------------
+# Findings — every finding flows into the shared findings.json schema
+# ---------------------------------------------------------------------------
+
+Severity = Literal["info", "low", "medium", "high", "critical"]
+
+
+@dataclass
+class VulnFinding:
+    """sca:vulnerable_dependency — a known CVE/GHSA matches a dep."""
+
+    finding_id: str              # stable, deterministic; used in cross-refs
+    dependency: Dependency
+    advisories: list[Advisory]
+    in_kev: bool                 # CISA known-exploited
+    epss: float | None        # FIRST.org probability, 0.0-1.0
+    fixed_version: str | None # smallest fix
+    reachability: Reachability
+    version_match_confidence: Confidence
+    cvss_score: float | None  # max across advisories
+    cvss_vector: str | None
+    severity: Severity
+    exposure_factor: float       # 0.0-1.0; call-site density
+    transitive_depth: int        # 0 = direct, N = N levels deep
+    # Composite risk estimate (0..100) per the formula in
+    # ``packages/sca/risk.py``. Calibration is unverified — see that
+    # module for the status. ``risk_components`` carries the per-
+    # multiplier breakdown so operators can read off "why is this
+    # score what it is" without re-deriving it.
+    raptor_risk_estimate: float | None = None
+    risk_components: dict[str, Any] | None = None
+    # Exploit-existence evidence from the calibration corpus.
+    # Augments ``in_kev`` with concrete references operators can
+    # follow up on (Exploit-DB entry IDs, Metasploit module paths).
+    # None when the corpus hasn't been loaded; an empty
+    # ExploitEvidence (all-fields-empty) when loaded but no
+    # signals matched any of this finding's CVE aliases.
+    exploit_evidence: ExploitEvidence | None = None
+    # CISA Vulnrichment SSVC `Exploitation` decision — one of
+    # ``"active"`` / ``"poc"`` / ``"none"`` / ``None``. Closes the
+    # cold-start eco gap where KEV / EPSS / EDB / MSF / PoC return
+    # nothing for ~95% of Cargo / NuGet / Packagist findings;
+    # Vulnrichment scores ~60% of those CVEs. ``active`` is a
+    # KEV-equivalent signal (broader coverage than CISA KEV
+    # itself); ``poc`` is an ExploitEvidence-equivalent signal.
+    # ``None`` means either CISA hasn't enriched the CVE yet, or
+    # the Vulnrichment lookup wasn't wired into this run.
+    ssvc_exploitation: str | None = None
+    # SSVC ``Automatable`` decision — one of ``"yes"`` /
+    # ``"no"`` / ``None``. Indicates whether the steps of an
+    # attack can be reliably automated (think: wormable
+    # potential, mass-scanning feasibility). Independent of
+    # ``Exploitation``: a CVE can be poc + automatable=yes
+    # (high-fanout exploitation likely) OR active + automatable
+    # =no (skilled-actor-only). The risk formula applies a small
+    # bonus multiplier on top of the SSVC tier when both
+    # Exploitation>=poc AND Automatable=yes hold.
+    ssvc_automatable: str | None = None
+    related_findings: list[str] = field(default_factory=list)
+    suppressed: bool = False
+    suppression_reason: str | None = None
+
+    # Query identity when a binary inventory package is matched through its
+    # source package or a more precise release. Fixed versions use this stream.
+    advisory_package: dict[str, str | None] | None = None
+
+
+@dataclass(frozen=True)
+class ExploitEvidence:
+    """Per-CVE exploit-existence signals derived from the
+    calibration corpus.
+
+    All three sources are independent: a CVE can be in KEV without
+    a public PoC, or have a public PoC without a Metasploit module,
+    etc. Operators triaging vulns benefit from seeing all three.
+    """
+    kev_listed: bool = False
+    edb_ids: list[int] = field(default_factory=list)
+    msf_modules: list[str] = field(default_factory=list)
+    github_poc_urls: list[str] = field(default_factory=list)
+
+    @property
+    def has_any(self) -> bool:
+        """True iff at least one signal fired."""
+        return (
+            self.kev_listed
+            or bool(self.edb_ids)
+            or bool(self.msf_modules)
+            or bool(self.github_poc_urls)
+        )
+
+
+HygieneKind = Literal[
+    "lockfile_missing",
+    "lockfile_drift",
+    "unpinned_dependency",
+    "loose_pin",
+    "cross_manifest_inconsistency",
+    "platform_compat",
+    "yanked_version",
+]
+
+
+@dataclass
+class HygieneFinding:
+    """Security-relevant integrity issues only.
+
+    Pure dev-quality (duplicate_versions, git_dependency, path_dependency,
+    dead_dependency) is recorded as SBOM metadata, not findings.
+    """
+
+    finding_id: str
+    kind: HygieneKind
+    dependency: Dependency
+    detail: str
+    severity: Severity
+    confidence: Confidence
+    related_findings: list[str] = field(default_factory=list)
+    suppressed: bool = False
+    suppression_reason: str | None = None
+
+
+LicenseKind = Literal[
+    "license_denied",       # dep's SPDX matches policy.deny
+    "license_warned",       # dep's SPDX matches policy.warn
+    "license_unknown",      # registry didn't return a license, can't enforce
+    "license_incompatible", # multi-license expr with no acceptable choice
+]
+
+
+@dataclass
+class LicenseFinding:
+    """Per-dep license-policy finding — the legal/compliance dimension.
+
+    Distinct from HygieneFinding (security integrity) and
+    SupplyChainFinding (registry-level supply-chain attacks); a
+    deny-listed license isn't a security issue, it's a compliance
+    issue, and operators triage these on a different axis.
+    """
+    finding_id: str
+    kind: LicenseKind
+    dependency: Dependency
+    spdx: str | None              # the license string we evaluated; None on unknown
+    detail: str
+    severity: Severity
+    confidence: Confidence
+    suppressed: bool = False
+    suppression_reason: str | None = None
+
+
+SupplyChainKind = Literal[
+    "typosquat_candidate",
+    "typosquat_domain",
+    "recent_publish",
+    "version_publish",
+    "maintainer_change",
+    "maintainer_account_change",
+    "low_bus_factor",
+    "install_hook_suspicious",
+    "binary_in_tests",
+    "binary_in_package",
+    "large_obfuscated_artefact",
+    "disguised_filename",
+    "known_exfil_destination",
+    "python_pth_file",
+    "python_import_time_execution",
+    "git_tag_drift",
+    "gha_action_ref_drift",
+    "gha_action_sunset",
+    "gha_action_outdated",
+    "gha_secret_flow",
+    "version_diff_anomaly",
+    "sentinel_match",
+    "platform_compat_regression",
+    "platform_compat_improvement",
+    "transitive_now_optional",
+    "binary_capability_delta",
+    "image_capability_drift",
+    "orphan_commit_dep",
+    "payload_size_spike",
+    "workflow_unsigned_commit",
+    "branch_protection_missing_signed_commits",
+    "slopsquat_suspect",
+    "commit_provenance_drift",
+    "missing_wheels",
+]
+
+
+@dataclass
+class SupplyChainFinding:
+    """Supply-chain heuristic — mechanical or LLM-assisted."""
+
+    finding_id: str
+    kind: SupplyChainKind
+    dependency: Dependency
+    detail: str
+    evidence: dict[str, Any]     # raw signals (sanitised before display)
+    severity: Severity
+    confidence: Confidence
+    related_findings: list[str] = field(default_factory=list)
+    suppressed: bool = False
+    suppression_reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Triage — LLM ranking output
+# ---------------------------------------------------------------------------
+
+PriorityBucket = Literal["fix_today", "this_sprint", "this_quarter", "accept"]
+
+
+@dataclass
+class TriageItem:
+    finding_id: str              # must match an emitted finding's ID
+    rank: int                    # 1..N
+    priority_bucket: PriorityBucket
+    one_line_rationale: str      # max 200 chars
+    confidence: Confidence
+
+
+# ---------------------------------------------------------------------------
+# Manifest — discovery output
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Manifest:
+    """A discovered manifest or lockfile to be parsed."""
+
+    path: Path                   # absolute path
+    ecosystem: str               # which parser handles it
+    is_lockfile: bool
+    workspace_root: Path | None = None
+    # Set when this manifest is a workspace member; used to qualify
+    # cross_manifest_inconsistency (deps differing across manifests
+    # within a workspace are intentional, not a finding).

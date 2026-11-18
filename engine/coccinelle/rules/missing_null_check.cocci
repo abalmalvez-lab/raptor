@@ -4,6 +4,8 @@
 // Two rules: assign_alloc for `E = malloc(...)` (re-assignment),
 // decl_alloc for `T E = malloc(...)` (declaration-init). The * context
 // markers are required by spatch for context-mode matching.
+// @role: detection
+// raptor: confirm-only
 
 @assign_alloc@
 expression E;
@@ -11,6 +13,8 @@ position p;
 identifier fld;
 @@
 
+// @vocab: allocators
+// @vocab-tmpl: * E@p = %s(...);
 (
 * E@p = malloc(...);
 |
@@ -40,6 +44,8 @@ identifier fld;
 type T;
 @@
 
+// @vocab: allocators
+// @vocab-tmpl:   T E@p = %s(...);
 (
   T E@p = malloc(...);
 |
@@ -69,7 +75,7 @@ E << assign_alloc.E;
 
 import json, sys
 for _p in p:
-    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "missing_null_check", "message": "Allocation result %s used without NULL check" % E}
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "missing_null_check", "message": "Candidate: allocation destination %s later dereferenced without a recognised NULL-check pattern; review value replacement, non-null contracts and branch validation" % E}
     sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
 
 @script:python@
@@ -79,5 +85,5 @@ E << decl_alloc.E;
 
 import json, sys
 for _p in p:
-    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "missing_null_check", "message": "Allocation result %s used without NULL check" % E}
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "missing_null_check", "message": "Candidate: allocation destination %s later dereferenced without a recognised NULL-check pattern; review value replacement, non-null contracts and branch validation" % E}
     sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")

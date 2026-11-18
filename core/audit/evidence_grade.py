@@ -1,0 +1,1568 @@
+"""Evidence grading for /audit findings.
+
+Each piece of evidence injected into the review context carries a source
+tag and confidence level. Source tags distinguish mechanical extraction
+(verifiable, deterministic) from LLM inference (probabilistic). Confidence
+levels gate injection priority — HIGH evidence is never shed from the
+prompt, LOW evidence is shed first under budget pressure.
+
+Grading happens at two levels:
+1. Per-evidence-item: each signal (taint flow, Joern result, spec
+   deviation) gets a source tag and confidence.
+2. Per-finding: a finding's overall confidence is the strongest
+   evidence in its chain.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import enum
+import functools
+import importlib
+from dataclasses import dataclass
+from typing import Any
+
+from .smt_evidence import LEGACY_GUARD_MODEL_NAMESPACES
+
+
+class EvidenceSource(str, enum.Enum):
+    """Where a piece of evidence came from."""
+
+    TREE_SITTER = "mechanical:tree_sitter"
+    TAINT_APPROX = "mechanical:taint_approx"
+    CALL_GRAPH = "mechanical:call_graph"
+    JOERN = "mechanical:joern"
+    SEMGREP = "mechanical:semgrep"
+    CODEQL = "mechanical:codeql"
+    COCCINELLE = "mechanical:coccinelle"
+    SMT = "mechanical:smt"
+    BINARY_ORACLE = "mechanical:binary_oracle"
+    TYPESTATE = "mechanical:typestate"
+    NEGATIVE_SPACE = "mechanical:negative_space"
+    PREFILTER = "mechanical:prefilter"
+    LLM_INFERRED = "llm:inferred"
+    LLM_SPEC = "llm:spec"
+    LLM_CORROBORATED = "llm:corroborated"
+    DYNAMIC_SANITIZER = "dynamic:sanitizer"
+    DYNAMIC_FRIDA = "dynamic:frida"
+    DYNAMIC_CRASH = "dynamic:crash"
+    DARK_VERIFY = "mechanical:dark_verify"
+    DIFFERENTIAL = "mechanical:differential"
+    SANWIT = "mechanical:sanwit"
+    GADGET_ORACLE = "mechanical:gadget_oracle"
+    COMPILATION = "mechanical:compilation"
+    COMPILER_ANALYZER = "mechanical:compiler_analyzer"
+    PRECONDITION = "mechanical:precondition"
+    DISASM = "mechanical:disasm"
+
+
+class Confidence(str, enum.Enum):
+    """Confidence level for evidence injection priority."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+_SOURCE_CONFIDENCE: dict[EvidenceSource, Confidence] = {
+    EvidenceSource.TREE_SITTER: Confidence.HIGH,
+    EvidenceSource.TAINT_APPROX: Confidence.HIGH,
+    EvidenceSource.CALL_GRAPH: Confidence.HIGH,
+    EvidenceSource.JOERN: Confidence.HIGH,
+    EvidenceSource.SEMGREP: Confidence.HIGH,
+    EvidenceSource.CODEQL: Confidence.HIGH,
+    EvidenceSource.COCCINELLE: Confidence.HIGH,
+    EvidenceSource.SMT: Confidence.HIGH,
+    EvidenceSource.BINARY_ORACLE: Confidence.HIGH,
+    EvidenceSource.TYPESTATE: Confidence.MEDIUM,
+    EvidenceSource.NEGATIVE_SPACE: Confidence.MEDIUM,
+    EvidenceSource.PREFILTER: Confidence.MEDIUM,
+    EvidenceSource.LLM_INFERRED: Confidence.LOW,
+    EvidenceSource.LLM_SPEC: Confidence.LOW,
+    EvidenceSource.LLM_CORROBORATED: Confidence.MEDIUM,
+    EvidenceSource.DYNAMIC_SANITIZER: Confidence.HIGH,
+    EvidenceSource.DYNAMIC_FRIDA: Confidence.HIGH,
+    EvidenceSource.DYNAMIC_CRASH: Confidence.MEDIUM,
+    EvidenceSource.DARK_VERIFY: Confidence.HIGH,
+    # Differential family execution: sandboxed member runs compared
+    # under an explicit contract — executed evidence, same grade as a
+    # dark witness.
+    EvidenceSource.DIFFERENTIAL: Confidence.HIGH,
+    # Sanitizer-sufficiency witness receipts are executed evidence,
+    # but detection-grade by the channel's discipline (they speak to
+    # the defense, not the attack path): MEDIUM, never HIGH.
+    EvidenceSource.SANWIT: Confidence.MEDIUM,
+    EvidenceSource.COMPILATION: Confidence.MEDIUM,
+    EvidenceSource.COMPILER_ANALYZER: Confidence.HIGH,
+    # Precondition checks are regex + context-map reachability — real
+    # mechanical evidence, but weaker than an engine match: MEDIUM,
+    # never HIGH, so precondition-promoted findings grade tool-backed
+    # rather than confirmed.
+    EvidenceSource.PRECONDITION: Confidence.MEDIUM,
+    # Disasm cross-check receipts are corroboration-only by contract
+    # (the channel never promotes): LOW keeps the chain entry from
+    # lifting the exported confidence of the verdict it rode in on.
+    EvidenceSource.DISASM: Confidence.LOW,
+}
+
+VALID_EVIDENCE_TOOLS: frozenset = frozenset({
+    "semgrep", "coccinelle", "codeql", "joern",
+    "compiler",
+    "compilation", "dynamic:sanitizer", "dynamic:crash", "frida:runtime",
+    "dark_verify:sanitizer-violation",
+    # Differential family execution: the deviant accepted an input
+    # every executed conforming peer rejected (directional divergence
+    # under an acceptance contract), or a dual-controlled metamorphic
+    # relation was violated on the executed target. Both are executed
+    # witness receipts; the pass mints no refuting stamp — family
+    # agreement on a handful of vectors is only a failure to promote.
+    "differential:confirmed", "differential:relation-violation",
+    # core/symbolic (angr): a solver-derived concrete input, replayed
+    # in a sandbox. A replayed crash is execution evidence; a bare
+    # solve is a solver proof of reachability/PC-control within the
+    # modeled constraints.
+    "symbolic",
+})
+
+# NOTE: "triage" is deliberately NOT a tool namespace. The triage
+# stamps ("triage:batch" from the glance batcher, "triage:classifier"
+# from the skip classifier) record which LLM/mechanical shortcut
+# produced the verdict — they are provenance, not verification. A
+# 500-token batch glance blessed as tool evidence used to short-circuit
+# refutation gates, the G2 finding gate, and the promotion alarm.
+_TOOL_NAMESPACES = frozenset(VALID_EVIDENCE_TOOLS | {
+    # Qualified SMT receipts retain their channel classification.
+    "smt",
+    "prefilter", "critique", "sweep", "sarif_cache",
+    "dynamic", "frida", "dark_verify", "differential", "precondition",
+    "fail_open", "consistency", "ptr_lifecycle", "lock_region",
+    "resource_bounds", "release_order", "protocol_state",
+    # Sanitizer-sufficiency witness (core.audit.sanwit): every stamp
+    # it mints is detection-grade by the channel's own classifier
+    # below — the namespace is registered so its receipts are
+    # recognized pipeline stamps (aggregation-eligible), never
+    # promoted alone.
+    "sanwit",
+    # PHP gadget-chain oracle (core.analysis.gadget_oracle): same
+    # discipline as sanwit — every stamp is detection-grade by the
+    # channel's own classifier (a found chain adjudicates gadget
+    # existence, not the request-to-unserialize taint path), so its
+    # receipts aggregate but never promote alone.
+    "gadget_oracle",
+    # Legacy condition-model namespaces remain aggregation-eligible;
+    # their exact registry spellings below are diagnostic even with a model.
+    "dead_path_smt", "insufficient_guard_smt", "signed_mismatch_smt",
+    # Live producer namespaces the firewall was missing — each stamp
+    # is set exclusively by pipeline code (never reachable from raw
+    # model output, which sanitize_llm_evidence_tool namespaces under
+    # llm-claimed:). Rejecting them force-demoted genuine
+    # confirmations at the journal chokepoint and fired the CRITICAL
+    # injection alarm on legitimate runs:
+    #   lifecycle           — bare "lifecycle" (orchestrator
+    #                         _proactive_validate, lifecycle
+    #                         precondition check)
+    #   api_boundary        — "api_boundary:caller-contract"
+    #                         (api_boundary.RULE_ID)
+    #   integer_truncation  — "integer_truncation:<rule_id>"
+    #   proto_length        — "proto_length:<rule_id>"
+    #   struct_field        — "struct_field:<rule_id>"
+    #                         (orchestrator _run_tool_chain binary-
+    #                         context checker legs)
+    #   validate            — "validate:observed_runtime" /
+    #                         "validate:replayed_crash"
+    #                         (validate_bridge) and
+    #                         "validate:confirmed-history"
+    #                         (findings_export history receipt)
+    "lifecycle", "api_boundary", "integer_truncation",
+    "proto_length", "struct_field", "validate",
+})
+
+
+# Channel namespaces whose modules own the detection-grade rule-id
+# classification (each exports ``is_detection_rule_id``). The channel
+# is the single authority for which of its stamps "may not promote
+# alone" — consulting it here keeps this firewall from drifting when a
+# channel adds a variant (the fail_open/ptr_lifecycle/lock_region
+# ``-naming`` stamps passed as full tool evidence for exactly that
+# reason).
+_DETECTION_CLASSIFIER_MODULES: dict[str, str] = {
+    # Stock emitted variants inherit their owner role; export and promotion
+    # must agree even when the report ID differs from the rule filename.
+    "coccinelle": "core.analysis.coccinelle_metadata",
+    "compiler": "core.detectors.compiler_families",
+    "consistency": "core.audit.peer_evidence",
+    "fail_open": "core.audit.fail_open_verify",
+    "lock_region": "core.audit.lock_region",
+    "ptr_lifecycle": "core.audit.ptr_lifecycle",
+    "release_order": "core.audit.release_order",
+    "resource_bounds": "core.audit.resource_bounds",
+    "protocol_state": "core.audit.protocol_state",
+    # Sanitizer-sufficiency witness: EVERY sanwit stamp is
+    # detection-grade (an executed breakout adjudicates the
+    # defense-insufficiency premise, not the attack path), so the
+    # channel classifier answers True for the whole namespace.
+    "sanwit": "core.audit.sanwit",
+    # PHP gadget-chain oracle: EVERY stamp is detection-grade (a
+    # chain exhibit corroborates the gadget-existence premise; the
+    # absence stamps ride only inconclusive/refuted outcomes — the
+    # earned refutation's authority is a confidence clamp at export,
+    # never confirming tool evidence), so the channel classifier
+    # answers True for the whole namespace.
+    "gadget_oracle": "core.analysis.gadget_oracle",
+    # Bare joern reachability (joern:live / joern:pre_sweep) is
+    # guard-blind and detection-role at the promotion sites — grading
+    # it as sustain-capable tool evidence here let the same receipt
+    # hold an LLM-authored claim against demotion. joern:flow /
+    # joern:guard-dominance / joern:taint:* keep verification role.
+    "joern": "core.audit.joern_verify",
+    # SMT verbs the channel's own role table (sweep._SMT_VERB_ROLES)
+    # demotes to detection: hypothesis-shaped local checks whose
+    # receipts confirm lexical feasibility, not vulnerability.  On the
+    # instrumented 185-finding corpus these stamps backed 88 exported
+    # tool_backed findings with 0 survivors through /validate.
+    "smt": "core.audit.sweep",
+    # Symbolic (angr) channel: bare reachability (symbolic-reach) is
+    # detection-role — some stdin reaching an address is guard-blind
+    # evidence; PC-hijack solves and replayed crashes keep
+    # verification role. Classifier lives with the channel in
+    # core.audit.sweep.
+    "symbolic": "core.audit.sweep",
+}
+
+
+@functools.cache
+def _channel_detection_classifier(namespace: str):
+    """The channel's own ``is_detection_rule_id``, or None when the
+    channel module is unavailable (fall back to the string heuristics
+    below)."""
+    mod_name = _DETECTION_CLASSIFIER_MODULES.get(namespace)
+    if not mod_name:
+        return None
+    try:
+        mod = importlib.import_module(mod_name)
+    except ImportError:
+        return None
+    return getattr(mod, "is_detection_rule_id", None)
+
+
+# ── Single spelling registry ─────────────────────────────────────────
+# ONE module-level admission table for namespaces whose
+# verification-grade spellings are enumerated PER SPELLING. For a
+# namespace registered here the bare root grants nothing: a spelling
+# listed with the "verification" role is a full receipt, a spelling
+# listed with the "detection" role corroborates and aggregates but
+# never convicts alone, and an UNLISTED spelling is not
+# verification-grade (fail-closed) while remaining non-poisonous —
+# the composite policy in :func:`is_tool_evidence` ignores it
+# alongside known receipts, so the alarm channel stays quiet on
+# legitimate runs. A new tool lane earns each spelling here
+# explicitly; namespace membership alone never buys admission (no
+# prefix trust — registry entries override the ``_TOOL_NAMESPACES``
+# root check for their namespace).
+#
+# Spelling lookups see WHITESPACE-STRIPPED parts: both composite
+# parsers (``is_tool_evidence`` / ``is_verification_evidence`` —
+# pipeline's ``_is_verification_evidence`` delegates here) strip each
+# ``+``-part before any registry consult, pre-existing join hygiene
+# for producer-side ``" + "`` joins. The mapping below therefore
+# matches stripped spellings exactly; a padded key would be a dead
+# entry.
+_ROLE_VERIFICATION = "verification"
+_ROLE_DETECTION = "detection"
+_EXACT_SPELLING_REGISTRY: dict[str, dict[str, str]] = {
+    # Complete arithmetic assignments still do not establish source
+    # argument identity, C conversions, or reachability. A witness suffix
+    # cannot grant these legacy condition models verification authority.
+    **{name: {name: _ROLE_DETECTION, f"{name}:witness": _ROLE_DETECTION}
+       for name in LEGACY_GUARD_MODEL_NAMESPACES},
+    # Prediction matches are observations, not independent defect oracles.
+    "dark_verify": {
+        "dark_verify:sanitizer-violation": _ROLE_VERIFICATION,
+        "dark_verify:confirmed": _ROLE_DETECTION,
+        "dark_verify:refuted": _ROLE_DETECTION,
+    },
+    # CodeQL dataflow-validation verdicts whose query text is
+    # LLM-AUTHORED (``dataflow_validation.method == "codeql-iris-llm"``
+    # — Tier 2 template predicates, Tier 3 compile-retry, the legacy
+    # free-form fallback). CodeQL executing the query is mechanical;
+    # the PREMISES are model text, so the receipt is detection-role:
+    # it corroborates and steers review, but neither alone nor combined
+    # with other detection namespaces does it satisfy verification grade
+    # — it cannot break merge ties, hold a claim against demotion, or
+    # earn a cross-run skip. Kept OUT of the ``codeql`` namespace:
+    # that namespace has an open-ended mechanical-premise producer
+    # (``codeql:<query-stem>`` pack-query stamps) which enumeration
+    # would fail-close, and the split keeps the honest provenance
+    # visible in the spelling itself.
+    "codeql-llm": {
+        "codeql-llm:dataflow": _ROLE_DETECTION,
+    },
+    # Differential family execution receipts. Both spellings are
+    # executed-witness receipts and keep full verification grade: the
+    # deviant accepted an input every executed conforming peer
+    # rejected (directional divergence under an acceptance contract),
+    # or a dual-controlled metamorphic relation was violated on the
+    # executed target. The producing lane mints EXACTLY these two —
+    # a pass mints no stamp at all (family agreement on a handful of
+    # vectors is only a failure to promote, never a refuting
+    # receipt). Registry ownership replaces namespace-root admission
+    # for this family: the bare root and any other ``differential:*``
+    # spelling are not verification-grade (fail-closed), even where
+    # the namespace root is separately listed in
+    # ``_TOOL_NAMESPACES`` — a plausible-looking novel variant
+    # (``differential:agreement``, ``differential:observed``) must
+    # earn its own row here.
+    "differential": {
+        "differential:confirmed": _ROLE_VERIFICATION,
+        "differential:relation-violation": _ROLE_VERIFICATION,
+    },
+}
+
+
+def registry_owns(part: str) -> bool:
+    """True when *part*'s namespace admits by enumerated spelling only."""
+    ns = part.split(":", 1)[0] if ":" in part else part
+    return ns in _EXACT_SPELLING_REGISTRY
+
+
+def registered_spelling_role(part: str) -> str | None:
+    """Role of *part* under the exact-spelling registry.
+
+    ``"verification"`` / ``"detection"`` for listed spellings; None
+    when the namespace is not registry-owned OR the exact spelling is
+    unlisted (an unlisted spelling under an owned namespace carries
+    NO role: it fails closed out of verification grade and out of the
+    aggregation floor, and is ignored by the composite policy).
+
+    One caller (the orchestrator's ``_is_detection_only``) consults
+    this with the UNSTRIPPED part while the composite parsers strip
+    first. Where the two disagree, a whitespace-padded spelling misses
+    the mapping here and returns None, which that gate treats as
+    detection-only — the disagreement direction is deny-at-the-
+    stricter-gate, never a grant.
+    """
+    ns = part.split(":", 1)[0] if ":" in part else part
+    return _EXACT_SPELLING_REGISTRY.get(ns, {}).get(part)
+
+
+# Verification-role spellings each classifier-owned channel mints,
+# mirrored here for hosts where the channel module itself cannot be
+# imported. When the channel authority is unavailable the string
+# heuristics in ``_is_detection_variant`` still recognise the KNOWN
+# detection variants, but an UNKNOWN variant cannot be graded — it
+# used to fall through to namespace-prefix admission and grade as
+# full verification evidence. Admission now fails closed to the
+# spellings below (plus the bare-namespace ``VALID_EVIDENCE_TOOLS``
+# entries): unknown variants are ignored (non-poisonous), never
+# admitted. Sources per namespace: sweep._SMT_VERB_ROLES
+# verification rows (bare + ``:witness``; the ``:witness`` suffix
+# keeps its receipt except on diagnostic-only verbs and encoding checks,
+# mirroring sweep.is_detection_rule_id) plus the orchestrator's
+# ``smt:disproof:sat`` stamp; joern_verify's endpoint-bound stamps;
+# sweep's symbolic role split; each census channel's registry-grade
+# rule-id constants. sanwit / gadget_oracle enumerate nothing — the
+# whole namespace is detection-grade by the channels' own
+# classifiers.
+_SMT_FALLBACK_VERIFICATION_VERBS = (
+    "check-overflow", "check-array-bounds",
+)
+# The array-access producer mints only its bare, source-bound receipt.
+_SMT_FALLBACK_WITNESS_VERBS = (
+    "check-overflow",
+)
+_CLASSIFIER_FALLBACK_VERIFICATION: dict[str, frozenset[str]] = {
+    "joern": frozenset({"joern:flow", "joern:guard-dominance"}),
+    "smt": frozenset(
+        {f"smt:{v}" for v in _SMT_FALLBACK_VERIFICATION_VERBS}
+        | {f"smt:{v}:witness" for v in _SMT_FALLBACK_WITNESS_VERBS}
+        | {"smt:disproof:sat", "smt:check-overflow:literal-call"},
+    ),
+    "symbolic": frozenset({
+        "symbolic:symbolic-pc-hijack", "symbolic:symbolic-reach-crash",
+    }),
+    "consistency": frozenset({
+        "consistency:return-check", "consistency:flag-mode",
+        "consistency:cleanup", "consistency:argument-shape",
+        "consistency:sanitize-sink", "consistency:clone-drift",
+    }),
+    "fail_open": frozenset({
+        "fail_open:handler-outcome", "fail_open:ignored-return",
+        "fail_open:tristate", "fail_open:return-domain",
+        "fail_open:recover-continue", "fail_open:unawaited",
+    }),
+    "ptr_lifecycle": frozenset({"ptr_lifecycle:stale-alias"}),
+    "lock_region": frozenset({"lock_region:callback-under-lock"}),
+    "resource_bounds": frozenset({
+        "resource_bounds:unbounded-accumulation",
+    }),
+    "release_order": frozenset({
+        "release_order:release-before-verify",
+    }),
+    "protocol_state": frozenset({
+        "protocol_state:invariant-violated",
+    }),
+    "sanwit": frozenset(),
+    "gadget_oracle": frozenset(),
+}
+
+# Pipeline-minted dynamic-tail receipt families that keep
+# verification role in the classifier-unavailable fallback. Each
+# entry is an explicitly registered multi-segment family whose tail
+# is pipeline-derived (never model text — sanitize_llm_evidence_tool
+# namespaces raw model strings before they can reach this check).
+# Bounded families for existing lanes, not namespace prefix trust.
+_CLASSIFIER_FALLBACK_VERIFICATION_FAMILIES: dict[str, tuple[str, ...]] = {
+    # sweep.py mints ``joern:taint:<function>-><sink>``; the joern
+    # channel classifies the whole family verification-role.
+    "joern": ("joern:taint:",),
+}
+
+
+def _is_detection_variant(part: str) -> bool:
+    """Detection-role channel stamps (``consistency:*-majority``,
+    ``fail_open:*-naming``, ``ptr_lifecycle:*-naming``, ...).
+
+    A majority statistic / uncorroborated-vocabulary premise
+    corroborates; it does not convict (the ``git_history``
+    epistemology). Such a stamp may ride along in a ``+``-joined
+    aggregation receipt, but alone it is NOT tool evidence — a
+    ``finding`` carrying only a detection variant trips the promotion
+    alarm.
+    """
+    namespace = part.split(":", 1)[0] if ":" in part else part
+    if namespace in _EXACT_SPELLING_REGISTRY:
+        # Exact-spelling registry namespaces never reach the channel
+        # classifiers or the string heuristics: listed spellings carry
+        # their enumerated role; unlisted spellings carry NO role here
+        # (and fail closed out of verification grade in
+        # _is_single_tool_evidence).
+        return registered_spelling_role(part) == _ROLE_DETECTION
+    classify = _channel_detection_classifier(namespace)
+    if classify is not None:
+        try:
+            return bool(classify(part))
+        except Exception:  # noqa: BLE001 — fall back to string heuristics
+            pass
+    # String-heuristic fallback for hosts where a channel module is
+    # unavailable — mirrors each channel's DETECTION_VARIANT_SUFFIX
+    # contract.
+    if part in ("joern:live", "joern:pre_sweep", "joern:flow-encoding", "joern:xf:caller_constraint", "joern:xf:taint_to_arithmetic"):
+        return True
+    if part.startswith("consistency:") and part.split(":", 2)[1].removesuffix("-majority") in {"guard-presence", "guard-predicate"}:
+        return True
+    if part.startswith("sanwit:"):
+        # The whole sanwit namespace is detection-grade (mirrors
+        # core.audit.sanwit.is_detection_rule_id).
+        return True
+    if part.startswith("gadget_oracle:"):
+        # The whole gadget-oracle namespace is detection-grade
+        # (mirrors core.analysis.gadget_oracle.is_detection_rule_id;
+        # the refutation stamp answering True is harmless — it rides
+        # only refuted outcomes, never backs a finding).
+        return True
+    if part.startswith("consistency:") and part.endswith("-majority"):
+        return True
+    if part.startswith((
+        "fail_open:", "ptr_lifecycle:", "lock_region:",
+        "resource_bounds:", "release_order:",
+    )) and part.endswith("-naming"):
+        return True
+    # protocol_state: the -unreceipted invariant variant plus the two
+    # PERMANENTLY detection-grade lead rule-ids (CWE-563-adjacent /
+    # proxy-quality — design §4.3).
+    if part.startswith("protocol_state:"):
+        return part.endswith("-unreceipted") or part in (
+            "protocol_state:dead-state-field",
+            "protocol_state:unvalidated-peer-write",
+        )
+    # smt: mirrors sweep._SMT_VERB_ROLES detection entries (":witness"
+    # keeps its receipt — a concrete solver model discriminates).
+    # Source patterns, width-only narrowing, predicate feasibility and encoding checks
+    # stay detection even with a model: they do not verify their premises
+    # against source semantics (mirrors sweep.is_detection_rule_id).
+    if part.startswith("smt:"):
+        verb = part.split(":", 2)[1]
+        from .smt_evidence import is_diagnostic_smt_rule
+        if verb == "check-encoding-residual" or is_diagnostic_smt_rule(part):
+            return True
+        if part.endswith(":witness"):
+            return False
+        return verb in (
+            "invariant-preservation", "check-overflow-to-oob",
+            "check-negative-bypass", "check-auth-bypass",
+            "check-resource-leak", "check-null-propagation",
+            "check-early-release", "check-lock-domain", "check-toctou",
+        )
+    # symbolic (angr) channel: bare reachability is detection-role —
+    # some stdin reaching an address is guard-blind evidence; PC-hijack
+    # solves and replayed crashes keep verification role (mirrors
+    # sweep.is_detection_rule_id's symbolic split).
+    if part.startswith(("symbolic:", "symbolic-")):
+        tail = part.split(":", 1)[1] if ":" in part else part
+        return tail == "symbolic-reach"
+    return False
+
+
+# Namespaces whose PRESENCE in a stamp disqualifies the whole thing,
+# even next to a real receipt in a "+"-composite (unlike unknown
+# producer namespaces, which are merely ignored):
+#   triage      — records which LLM/mechanical shortcut produced the
+#                 verdict (see the _TOOL_NAMESPACES note): the verdict
+#                 behind it is an LLM guess, and no pipeline join ever
+#                 legitimately mixes it with a receipt.
+#   git_history — corroboration-only oracle kind (core.audit.
+#                 git_oracle: "corroborates, never a verdict"); its
+#                 module pins that no stamp carrying it may satisfy
+#                 this classifier.
+_POISON_NAMESPACES = frozenset({"triage", "git_history"})
+
+# Provenance wrappers: prefixes that record HOW a tool receipt was
+# earned, wrapped around the receipt itself.  ``clean-refuted:smt`` is
+# _promote_clean_refuted's stamp for "the LLM refuted its own
+# hypothesis and SMT then confirmed it" — the inner stamp is the
+# evidence; the prefix is history.  Unwrapping keeps the promotion
+# alarm honest: before this, every clean-refuted promotion (a
+# policy-sanctioned, tool-confirmed lane) fired the
+# promotion_without_tool_evidence CRITICAL because the wrapper
+# namespace was unknown here, drowning the alarm channel that is
+# supposed to be EMPTY on legitimate runs.
+_PROVENANCE_WRAPPERS = ("clean-refuted:",)
+
+
+def _is_single_tool_evidence(part: str) -> bool:
+    """Check one atomic stamp (no ``+`` separator)."""
+    # The legacy bare SMT stamp also covered unbound predicate models.
+    # Verification requires a qualified receipt identifying the check.
+    if not part or part in {"none", "smt"}:
+        return False
+    for wrapper in _PROVENANCE_WRAPPERS:
+        if part.startswith(wrapper):
+            # The wrapper records provenance; the wrapped stamp is the
+            # receipt and must qualify on its own merits (a wrapped
+            # detection-role variant still may not convict).
+            return _is_single_tool_evidence(part[len(wrapper):])
+    if registry_owns(part):
+        # Exact-spelling registry namespace: only the enumerated
+        # verification spellings qualify — the bare root and unlisted
+        # variants fail closed (ignored by the composite policy,
+        # never poisonous).
+        return registered_spelling_role(part) == _ROLE_VERIFICATION
+    if _is_detection_variant(part):
+        return False
+    root = part.split(":", maxsplit=1)[0] if ":" in part else part
+    if root in _DETECTION_CLASSIFIER_MODULES and \
+            _channel_detection_classifier(root) is None:
+        # Channel authority unavailable: the string heuristics in
+        # _is_detection_variant recognise the KNOWN detection
+        # variants, but an UNKNOWN variant cannot be graded — fail
+        # closed to the enumerated verification spellings instead of
+        # admitting the whole namespace by prefix. Non-poisonous: an
+        # unadmitted part is simply not evidence; is_tool_evidence
+        # ignores it next to known receipts.
+        if part in VALID_EVIDENCE_TOOLS:
+            return True
+        if part in _CLASSIFIER_FALLBACK_VERIFICATION.get(
+                root, frozenset()):
+            return True
+        return any(
+            part.startswith(family)
+            for family in
+            _CLASSIFIER_FALLBACK_VERIFICATION_FAMILIES.get(root, ())
+        )
+    return root in _TOOL_NAMESPACES or part in _TOOL_NAMESPACES
+
+
+def is_tool_evidence(stamp: str) -> bool:
+    """Return True if *stamp* was set by an actual tool run, not an LLM claim.
+
+    Matches canonical stamps (``"dynamic:sanitizer"``, ``"semgrep"``, etc.),
+    namespaced composites (``"semgrep:rule-123"``, ``"critique:prefilter:id"``),
+    and ``+``-joined multi-tool stamps (``"semgrep+joern"``).
+
+    Composite policy (each ``+``-part judged on its own merits):
+
+    * Model-authored parts poison the WHOLE stamp: ``llm-claimed:``
+      prefixes (``sanitize_llm_evidence_tool`` prefixes only the full
+      raw model string, so ``llm-claimed:foo+semgrep`` means the
+      MODEL wrote ``foo+semgrep`` — the "semgrep" part is part of the
+      claim, not a receipt), the ``_LLM_ONLY_EVIDENCE`` vocabulary
+      ("llm", "manual", ...), miscased spellings of known tool names
+      ("Semgrep" — pipeline stamps are always lowercase), empty parts
+      (malformed join), and the ``_POISON_NAMESPACES`` (``triage:*``
+      LLM-shortcut provenance, ``git_history`` corroboration).
+    * A part in a known tool namespace qualifies; the stamp is tool
+      evidence when at least one part qualifies.
+    * Remaining unknown parts are ignored rather than rejecting the
+      whole stamp: such parts can only be minted by pipeline
+      ``_stamp_evidence`` calls (a producer namespace this table
+      hasn't learned yet), and vetoing the KNOWN receipts next to
+      them force-demoted genuine confirmations at the journal
+      chokepoint and fired the CRITICAL injection alarm on
+      legitimate runs.
+    * Detection-role variants (``consistency:*-majority``,
+      ``smt:check-toctou``, ...) never qualify alone — a statistical
+      prior corroborates, it does not convict. Combining detection-role
+      namespaces never grants verification authority.
+    """
+    if not stamp or stamp == "none":
+        return False
+    parts = stamp.split("+") if "+" in stamp else [stamp]
+    qualifying = 0
+    for p in parts:
+        p = p.strip()
+        if not p:
+            # "semgrep+" / "++": pipeline joins never emit empty
+            # parts — malformed stamp, not evidence.
+            return False
+        low = p.lower()
+        if low.startswith(LLM_CLAIM_PREFIX) or low in _LLM_ONLY_EVIDENCE:
+            return False
+        if (low.split(":", 1)[0] if ":" in low else low) in _POISON_NAMESPACES:
+            return False
+        if _is_single_tool_evidence(p):
+            qualifying += 1
+        elif p != low and _is_single_tool_evidence(low):
+            # Miscased spelling of a known receipt ("Semgrep",
+            # "CodeQL:rule") — pipeline stamps are lowercase by
+            # construction, so this is model-authored text.
+            return False
+    return qualifying > 0
+
+
+_LLM_ONLY_EVIDENCE = frozenset({
+    "manual", "manual code review", "manual review", "code review",
+    "llm", "llm review", "none", "n/a", "",
+})
+
+LLM_CLAIM_PREFIX = "llm-claimed:"
+
+
+def sanitize_llm_evidence_tool(raw: str) -> str:
+    """Normalise an evidence_tool value that came from the LLM.
+
+    Values meaning "no tool" collapse to empty string.  Everything else
+    is namespaced under ``llm-claimed:`` so it cannot satisfy
+    :func:`is_tool_evidence`.  A real receipt overwrites it later via
+    ``_stamp_evidence`` once a tool has actually run.
+    """
+    value = (raw or "").strip()
+    if not value or value.lower() in _LLM_ONLY_EVIDENCE:
+        return ""
+    if value.startswith(LLM_CLAIM_PREFIX):
+        return value
+    return f"{LLM_CLAIM_PREFIX}{value}"
+
+
+#: Every machine marker a consumer tests in body text — with
+#: ``startswith`` OR ``in`` (anywhere). Enumerated by
+#: ``core/audit/tests/_marker_sites.py``; the closure test
+#: (``core/audit/tests/test_model_body_markers.py``) re-enumerates the
+#: tree's check sites on every run and fails when a body consumer reads
+#: a marker missing here.
+MACHINE_BODY_MARKERS: tuple[str, ...] = (
+    "[anti_self_refutation:",
+    "[caller-contract:",
+    "[consistency:",
+    "[counter-hypothesis escalation:",
+    "[entry-unreachability:",
+    "[gadget-absence:",
+    "[gate violation:",
+    "[guarded-sink:",
+    "[hypothesis-consistency:",
+    "[mechanical]",
+    "[precondition-verified via ",
+    "[rationale-consistency demotion:",
+    "[reused:",
+    "[sarif-clean gate]",
+    "[secondary-dispatch:",
+    "[secondary-hypothesis-confirmed via ",
+    "[self-contradiction:",
+    "[sink-unreachability:",
+    "[smt-disproof:",
+    "[smt-infeasible:",
+    # Exact saved Tier 4 migration diagnostic, not a general SMT prefix.
+    "[smt] inconclusive → refuted: unsat path conditions",
+    "[suspicious-demotion:",
+    "[suspicious-resolution:",
+    "[sweep promoted via ",
+    "[sweep-promotion:",
+    "[tool-confirmed]",
+    "[tool-refuted]",
+)
+
+#: What a known marker becomes inside model-authored text: the bracket
+#: stays readable, but no consumer matches ``[llm-claimed:<marker>``.
+LLM_MARKER_LEAD = "[llm-claimed:"
+
+#: Lead put in front of model-authored body text that still starts
+#: with ``[`` (an UNKNOWN / future bracketed marker at position 0).
+#: Same rule as ``llm-claimed:`` for evidence_tool: a model can name a
+#: marker, never mint one.
+LLM_BODY_PREFIX = "[llm-claimed] "
+
+
+#: ``review_result`` keys only PIPELINE code may set — machine flags,
+#: receipts, provenance and stage records written into the model's
+#: review dict after it is parsed. A model (or target text it echoed)
+#: emitting one of these keys would mint the machine signal
+#: (``counter_escalated: true`` -> counter-escalation floor resolves a
+#: model suspicious to clean; ``all_refuted_demotion: true`` -> a deepen
+#: bare clean dominates; ``file`` / ``function`` / ``model`` /
+#: ``cost_usd`` would override the multi-pass panel's identity and
+#: accounting, which ``_outcome_to_panel_result`` merges the review dict
+#: over). The review_fn and edge-review parse boundaries drop them from
+#: model output (:func:`drop_pipeline_owned`); batch glance rejects any
+#: element outside its closed schema, and the chain detector and refuter
+#: copy explicit fields only, so no such key reaches an outcome there.
+#: Classified by
+#: ``core/audit/tests/_review_keys.py``; the closure test fails when
+#: pipeline code reads or writes a key that is in neither set.
+PIPELINE_OWNED_REVIEW_KEYS: frozenset[str] = frozenset({
+    "adversarial_needs_evidence", "adversarial_review",
+    "aggregated_promotion", "all_refuted_demotion",
+    "all_refuted_demotion_withheld", "all_refuted_grounding",
+    "backlog_drain", "bug_a", "bug_b", "calibrated_downgrade",
+    "caller_evidence", "chain", "claim_review_delivery",
+    "caller_context_delivery", "claim_material_deferred",
+    "language_reference_delivery", "source_study_delivery", "binary_initial_type_delivery", "review_input_scope",
+    "binary_review_binding", "binary_publication_scope",
+    "integer_abi_context", "_binary_integer_abi_owner", "binary_subject_context", "binary_caller_context", "binary_callee_assessment_context",
+    "conditional_request_delivery", "external_context_delivery", "publication_failure", "review_recovery", "synthesis_review_context",
+    "confidence", "consistency_receipts", "context_reduced",
+    "cost_usd", "cross_entry_receipt", "cross_entry_rendered",
+    "duration_s", "file", "function", "merge_decision",
+    "model", "multi_model_analyses", "prior_evidence_tools",
+    "counter_escalated", "cwe_class", "cwe_inferred", "cwe_placeholder",
+    "deepen_stranded", "deepen_unadjudicated", "demotion_referee",
+    "evidence_chain", "file_dampening", "from_composition",
+    "g2_invariant_bypass",
+    "g2_invariant_bypass_tiers", "gadget_absence",
+    "ondemand_synth_blocked", "ondemand_synth_hypothesis", "ondemand_synth_receipt",
+    "precondition_verification", "premise_blocked_confirms", "primitive",
+    "promotion_gate_demoted", "prompt_budget_event",
+    "rationale_consistency_demotion", "rationale_consistency_mismatch",
+    "reused", "reused_from_run", "review_claims",
+    "rationale_consistency_note", "refuted_hypothesis_confirmed",
+    "secondary_confirmations", "secondary_hypothesis_confirmed",
+    "security_impact", "smt_caller_gate", "study_receipts",
+    "ihv_all_refuted", "ihv_gate_blocked",
+    "ihv_hypotheses_confirmed", "ihv_hypotheses_total",
+    "ihv_refuted", "ihv_tools", "immediate_verified",
+    "synthesis_refused", "tool_evidence", "tools_confirmed",
+    "uncorrelated_tool_hits",
+    "weakness_a", "weakness_b", "weakness_chain",
+})
+
+#: ``review_result`` keys the MODEL authors (review JSON schema fields,
+#: plus legacy / other-mode review fields pipeline code still reads as
+#: model claims). Pipeline stages may also rewrite some of them
+#: (status, body, hypothesis, cwe, evidence_tool) — that is not
+#: authority, the model may set them too.
+MODEL_AUTHORED_REVIEW_KEYS: frozenset[str] = frozenset({
+    "anchor", "body", "bug_class", "callees", "callers",
+    "chain_exhausted", "claim", "claim_withdrawals",
+    "constraints", "counter_direction", "counter_hypothesis", "cwe",
+    "dataflow_sink", "dataflow_source",
+    "dangerous_callees", "edge_verdicts", "entry_point",
+    "evasion_mechanism", "evidence_tool", "hypotheses", "hypothesis",
+    "impact", "inferred_spec", "intent_trace", "mechanism",
+    "language_reference_requests", "caller_context_requests", "conditional_verification_requests",
+    "observations", "preconditions", "reading_list", "relies_on",
+    "sanitizer_callees", "source_snippet", "spec_deviation", "status",
+    "tool_query_suggestion", "typestate_violation", "verdict_rationale",
+    "vuln_type",
+})
+
+
+def drop_pipeline_owned(result: Any) -> Any:
+    """A copy of a parsed model dict without pipeline-owned keys.
+
+    The field twin of the marker defang: a model can never set a
+    machine flag by emitting its key. Non-dicts pass through.
+    """
+    if not isinstance(result, dict):
+        return result
+    return {k: v for k, v in result.items()
+            if k not in PIPELINE_OWNED_REVIEW_KEYS}
+
+
+def defang_model_text(text: Any) -> str:
+    """Rewrite every registered machine marker in model-authored text.
+
+    Every occurrence, anywhere, of a :data:`MACHINE_BODY_MARKERS` entry
+    becomes ``[llm-claimed:<marker>`` — neither a ``startswith`` nor an
+    ``in`` consumer can match it, wherever the text is later spliced
+    (a body, a marker's reason, an observation). ``None`` becomes
+    ``""`` and a non-string value its ``str()`` form. Idempotent.
+    """
+    if text is None:
+        return ""
+    value = text if isinstance(text, str) else str(text)
+    for marker in MACHINE_BODY_MARKERS:
+        if marker in value:
+            value = value.replace(marker, LLM_MARKER_LEAD + marker[1:])
+    return value
+
+
+def defang_model_fields(obj: Any) -> Any:
+    """Taint at source: :func:`defang_model_text` over EVERY string in a
+    parsed model / agent / annotation response — nested dicts (values;
+    keys are schema), lists and tuples included — applied once at the
+    parse boundary, so every later interpolation of any field is safe
+    by construction. Non-string scalars pass through unchanged.
+    """
+    if isinstance(obj, str):
+        return defang_model_text(obj)
+    if isinstance(obj, dict):
+        return {k: defang_model_fields(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [defang_model_fields(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(defang_model_fields(v) for v in obj)
+    return obj
+
+
+def defang_model_body(text: Any) -> str:
+    """Neutralise machine markers in model-authored BODY text.
+
+    :func:`defang_model_text`, plus: a body that still opens with ``[``
+    (a marker the registry does not know yet), after leading
+    whitespace, gains :data:`LLM_BODY_PREFIX`. Idempotent — safe on
+    text already defanged at its parse boundary (no double prefix).
+    """
+    value = defang_model_text(text)
+    head = value.lstrip()
+    if head.startswith("[") and not head.startswith(
+            (LLM_BODY_PREFIX, LLM_MARKER_LEAD)):
+        value = f"{LLM_BODY_PREFIX}{value}"
+    return value
+
+
+_PREFILTER_PREFIX = "prefilter:"
+# The surviving outcome's provenance leads in the merge tie-break: a
+# stamp whose FIRST part is one of these is never verification.
+_NON_MECHANICAL_LEAD = (_PREFILTER_PREFIX, LLM_CLAIM_PREFIX)
+
+
+def is_verification_evidence(ev: str) -> bool:
+    """True when evidence is strong enough to break a merge tie.
+
+    The single verification-grade admission authority: the merge
+    tie-break (``core.audit.pipeline._is_verification_evidence``
+    delegates here) and the orchestrator's demotion-gate wrapper both
+    consume this predicate.
+
+    Fail-closed allowlist: a stamp counts only when at least one
+    ``+``-part is a receipt this module recognises
+    (:func:`is_tool_evidence` — registered producer namespaces,
+    poison/miscasing/LLM-vocabulary rejection) AND the part is not
+    detection-role (the exact-spelling registry, the channel
+    classifiers, and the orchestrator's ``_is_detection_only`` role
+    tables). A stamp in a namespace no producer table names is NOT
+    verification, whatever it looks like — provenance-only stamps
+    (``journal:recall:*``, ``sage:recall:*``,
+    ``reachability:dead_code``, ``mechanical:guard_sufficiency``,
+    ``sarif:no_alerts``, ``inventory:*``) record how a verdict was
+    reached, and each one's own doctrine says it must not break a
+    merge tie.
+
+    Exact-spelling registry namespaces admit per enumerated spelling
+    only: a listed verification spelling qualifies, a listed detection
+    spelling counts toward the aggregation floor, and an unlisted
+    spelling earns nothing (fail-closed, non-poisonous).
+
+    Composite parse: the surviving outcome's provenance leads, so a stamp
+    whose FIRST part is non-mechanical (``llm-claimed:``,
+    ``prefilter:``) is never verification. Scanning later parts stops
+    at the first ``llm-claimed:`` part: ``sanitize_llm_evidence_tool``
+    namespaces the model's whole raw string, so everything after that
+    marker is the claim's own text (``llm-claimed:smt+joern`` is one
+    model answer, not a receipt trailing a claim) — while a genuine
+    receipt BEFORE the marker
+    (``smt:check-integer-narrowing+llm-claimed:smt``, the
+    evidence-combine shape) keeps its verification status.
+
+    Detection-role receipts remain observations regardless of how many
+    namespaces they span. At least one verification receipt is required.
+    """
+    return next(iter_verification_receipts(ev), None) is not None
+
+
+def iter_verification_receipts(ev: str):
+    """Yield admitted parts without crossing model-claim provenance markers.
+
+    Outcome-specific policies may further restrict these receipts. Splitting
+    a composite directly must not turn model-owned suffix text into proof.
+    """
+    if not ev or ev.startswith(_NON_MECHANICAL_LEAD):
+        return
+    for part in ev.split("+"):
+        part = part.strip()
+        if not part:
+            continue
+        low = part.lower()
+        if low.startswith(LLM_CLAIM_PREFIX):
+            break
+        if low.startswith(_PREFILTER_PREFIX):
+            continue
+        if registry_owns(part):
+            # Exact-spelling registry namespaces: the enumerated role
+            # decides; an unlisted spelling is fail-closed — neither
+            # verification nor recognized diagnostic evidence, ignored.
+            role = registered_spelling_role(part)
+            if role == _ROLE_VERIFICATION:
+                yield part
+            continue
+        # Import guard only: evidence_grade↔orchestrator is a
+        # potential import cycle; _is_detection_only itself is a pure
+        # string check (stock-rule role tables). Unknown namespaces
+        # come back False and must still pass receipt admission below.
+        detection = False
+        with contextlib.suppress(ImportError):
+            from core.audit.orchestrator import _is_detection_only
+            detection = _is_detection_only(part)
+        if detection:
+            continue
+        if is_tool_evidence(part):
+            yield part
+
+
+_RECEIPT_MAP: dict[str, tuple] = {
+    "dynamic:sanitizer": (
+        EvidenceSource.DYNAMIC_SANITIZER,
+        "confirmed by dynamic sanitizer (signal-anchored report)",
+    ),
+    "dynamic:crash": (
+        EvidenceSource.DYNAMIC_CRASH,
+        "harness died by a real signal (waitstatus-provenance crash)",
+    ),
+    "dynamic:exception": (
+        EvidenceSource.DYNAMIC_CRASH,
+        (
+            "harness observed an exception/nonzero exit — "
+            "exception-grade hint, not a confirmed crash"
+        ),
+    ),
+    "frida": (EvidenceSource.DYNAMIC_FRIDA, "confirmed by Frida runtime observation"),
+    "joern": (EvidenceSource.JOERN, "confirmed by Joern CPG analysis"),
+    "joern:guard-dominance": (
+        EvidenceSource.JOERN,
+        (
+            "no check on the named identifier dominates the sink "
+            "(Joern CPG dominator analysis)"
+        ),
+    ),
+    "joern:flow": (
+        EvidenceSource.JOERN,
+        "source-to-sink dataflow confirmed by Joern reachableByFlows",
+    ),
+    "semgrep": (EvidenceSource.SEMGREP, "confirmed by Semgrep pattern match"),
+    "codeql": (EvidenceSource.CODEQL, "confirmed by CodeQL analysis"),
+    "coccinelle": (EvidenceSource.COCCINELLE, "confirmed by Coccinelle"),
+    "smt": (EvidenceSource.SMT, "path feasibility confirmed by SMT solver"),
+    "smt:check-overflow:literal-call": (
+        EvidenceSource.SMT,
+        "complete literal caller tuple violates typed source arithmetic, conditional on wrapper entry",
+    ),
+    "dark_verify:sanitizer-violation": (EvidenceSource.DARK_VERIFY, "sanitizer violation observed in target call"),
+    "dark_verify:confirmed": (EvidenceSource.DARK_VERIFY, "legacy witness prediction matched"),
+    "dark_verify:refuted": (EvidenceSource.DARK_VERIFY, "refuted by executed dark witness"),
+    "dark_verify": (EvidenceSource.DARK_VERIFY, "dark verification witness"),
+    "differential:confirmed": (
+        EvidenceSource.DIFFERENTIAL,
+        (
+            "confirmed by differential family execution: the deviant "
+            "accepted an input every executed conforming peer rejected"
+        ),
+    ),
+    "differential:relation-violation": (
+        EvidenceSource.DIFFERENTIAL,
+        (
+            "confirmed by executed metamorphic witness: a "
+            "dual-controlled relation's equivalence pair diverged on "
+            "the target"
+        ),
+    ),
+    "differential": (
+        EvidenceSource.DIFFERENTIAL,
+        "differential execution witness",
+    ),
+    # Sanitizer-sufficiency witness. Stamps are three-segment
+    # (``sanwit:insufficient:<context>``) and the lookup consults the
+    # exact part then the bare NAMESPACE — so the bare row below is
+    # the one that renders (two-segment rows would be dead keys).
+    "sanwit": (
+        EvidenceSource.SANWIT,
+        (
+            "sanitizer-sufficiency witness: the extracted chain was "
+            "executed against the sink context's breakout corpus "
+            "(rule id carries the verdict and context; receipts are "
+            "corpus- and context-scoped)"
+        ),
+    ),
+    # PHP gadget-chain oracle. Stamps are two-segment
+    # (``gadget_oracle:chain`` / ``:chain-conditional`` /
+    # ``:no-gadgets``) and every one is detection-grade; the bare
+    # namespace row renders for all of them.
+    "gadget_oracle": (
+        EvidenceSource.GADGET_ORACLE,
+        (
+            "gadget-chain oracle: static magic-method enumeration "
+            "with property-to-sink flow over the whole PHP tree "
+            "(chain exhibits and census-qualified absence are both "
+            "hint/boost evidence — verify against source)"
+        ),
+    ),
+    "compilation": (EvidenceSource.COMPILATION, "confirmed by compilation and execution"),
+    "compiler": (EvidenceSource.COMPILER_ANALYZER, "confirmed by compiler static-analyzer diagnostic"),
+    "critique": (EvidenceSource.PREFILTER, "confirmed by critique prefilter"),
+    # Fail-open channel receipts (per rule-id; the bare namespace
+    # covers the -naming detection variants).
+    "fail_open:handler-outcome": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a permissive error handler swallows failures of a "
+            "security-role call (role + handler + fallibility receipts)"
+        ),
+    ),
+    "fail_open:ignored-return": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "the return value of a security-role call is neither "
+            "assigned nor compared at the flagged site"
+        ),
+    ),
+    "fail_open:tristate": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "the error value of a tri-state security API is accepted "
+            "by the comparison shape"
+        ),
+    ),
+    "fail_open:return-domain": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a security-role call's result is compared against "
+            "exactly -1 while its derived return domain provably "
+            "contains another negative error value"
+        ),
+    ),
+    "fail_open:recover-continue": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a recover()-style handler swallows a security panic and "
+            "control continues"
+        ),
+    ),
+    "fail_open:unawaited": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a security-role async call's rejection is unobserved "
+            "(unawaited / empty catch)"
+        ),
+    ),
+    "fail_open": (
+        EvidenceSource.TREE_SITTER,
+        "fail-open shape confirmed by the handler-outcome channel",
+    ),
+    # Resource-bounds channel receipts (the bare namespace covers the
+    # -naming detection variants riding in aggregation composites).
+    "resource_bounds:unbounded-accumulation": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "an accumulation site has no dominating bound witness in "
+            "the function or its searched callers (guard walk + "
+            "constant-resolution receipts; the searched scope is "
+            "named in the receipt)"
+        ),
+    ),
+    "resource_bounds": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "unbounded-accumulation shape confirmed by the "
+            "bound-witness comparator"
+        ),
+    ),
+    # Release-order channel receipts (the bare namespace covers the
+    # -naming detection variants riding in aggregation composites).
+    "release_order:release-before-verify": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a release site handing data to an escaping destination "
+            "is not dominated by the integrity finalizer's status "
+            "check (per-site dominator receipts; cfg+joern when the "
+            "engines agree)"
+        ),
+    ),
+    "release_order": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "release-before-verify ordering confirmed by the "
+            "dominance comparator"
+        ),
+    ),
+    # Protocol-state channel receipts (the bare namespace covers the
+    # -unreceipted variant and the detection-grade lead rule-ids
+    # riding in aggregation composites).
+    "protocol_state:invariant-violated": (
+        EvidenceSource.SMT,
+        (
+            "a study-receipted protocol invariant is violable at a "
+            "peer-writable census write site (per-site inductive SMT "
+            "receipts with dominating guards encoded)"
+        ),
+    ),
+    "protocol_state": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "protocol-state shape receipted by the field census "
+            "(dead-state / unvalidated-peer-write legs)"
+        ),
+    ),
+    # Consistency channel receipts (per dimension; the bare namespace
+    # covers the -majority detection variants riding in aggregation
+    # composites). Every premise is a deterministic fact: the usage
+    # classification is AST, the contract is the target's own header
+    # attribute or a receipted learned contract, the majority is
+    # reproducible arithmetic.
+    "consistency:return-check": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a return-contract-bearing callee's result is discarded at "
+            "the flagged site while the checking siblings exhibit the "
+            "convention (census + contract witness receipts)"
+        ),
+    ),
+    "consistency:flag-mode": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a security-relevant flag/mode argument deviates from the "
+            "constant the sibling call sites agree on"
+        ),
+    ),
+    "consistency:cleanup": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "an error path omits the learned release call its sibling "
+            "paths perform on the same acquisition"
+        ),
+    ),
+    "consistency:argument-shape": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a sizeof-over-pointer argument contradicts the declared "
+            "type and the buffer-sizing convention of the sibling "
+            "call sites (declared-type witness receipts)"
+        ),
+    ),
+    "consistency:sanitize-sink": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "an operator-annotated sink's call site lacks the "
+            "dominating sanitizer its sibling sites apply (annotation "
+            "convention witness + sanitizing-exhibit receipts)"
+        ),
+    ),
+    "consistency:guard-presence": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a site lacks the bounds/null guard its peers apply; "
+            "predicate feasibility is diagnostic and does not "
+            "establish a source safety violation"
+        ),
+    ),
+    "consistency:clone-drift": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a near-clone of a past-security-fix region lacks the "
+            "guard the fix added (fix-commit contract witness + "
+            "token-containment receipts)"
+        ),
+    ),
+    "consistency:guard-predicate": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a guard predicate deviates from its peers' (off-by-one "
+            "operator, missing null arm, signedness mix); predicate "
+            "models corroborate the deviation without proving the "
+            "source bug"
+        ),
+    ),
+    "consistency": (
+        EvidenceSource.TREE_SITTER,
+        "peer-majority consistency evidence (PeerEvidence receipts)",
+    ),
+    # ptr_lifecycle channel receipts (leg B; the bare namespace covers
+    # the -naming detection variants riding in aggregation
+    # composites). Leg A (field-parity) emits under the consistency
+    # namespace by construction and needs no row here.
+    "ptr_lifecycle:stale-alias": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a lifecycle event released the aliased owner with the "
+            "alias live and read afterwards (alias edge + event + "
+            "invalidation search + post-event read receipts)"
+        ),
+    ),
+    "ptr_lifecycle": (
+        EvidenceSource.TREE_SITTER,
+        "stale-alias shape confirmed by the ptr_lifecycle census",
+    ),
+    # lock_region channel receipts (the bare namespace covers the
+    # -naming detection variants).
+    "lock_region:callback-under-lock": (
+        EvidenceSource.TREE_SITTER,
+        (
+            "a callback-shaped invocation sits between a paired lock "
+            "acquire and its release (region + invocation + setter "
+            "receipts)"
+        ),
+    ),
+    "lock_region": (
+        EvidenceSource.TREE_SITTER,
+        "callback-under-lock shape confirmed by the lock_region "
+        "channel",
+    ),
+    "sarif_cache": (EvidenceSource.SEMGREP, "matched prior SARIF result"),
+    "precondition": (
+        EvidenceSource.PRECONDITION,
+        (
+            "LLM-stated preconditions mechanically verified in the "
+            "vulnerability-supporting direction"
+        ),
+    ),
+}
+
+_CONFIDENCE_PRIORITY: dict[Confidence, int] = {
+    Confidence.HIGH: 0,
+    Confidence.MEDIUM: 1,
+    Confidence.LOW: 2,
+}
+
+
+@dataclass
+class GradedEvidence:
+    """A single piece of evidence with source attribution and confidence."""
+
+    source: EvidenceSource
+    confidence: Confidence
+    description: str
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "source": self.source.value,
+            "confidence": self.confidence.value,
+            "description": self.description,
+        }
+        if self.detail:
+            d["detail"] = self.detail
+        return d
+
+    @property
+    def priority(self) -> int:
+        return _CONFIDENCE_PRIORITY.get(self.confidence, 2)
+
+
+def default_confidence(source: EvidenceSource) -> Confidence:
+    """Return the default confidence for an evidence source."""
+    return _SOURCE_CONFIDENCE.get(source, Confidence.LOW)
+
+
+def grade_evidence(
+    source: EvidenceSource,
+    description: str,
+    *,
+    detail: str | None = None,
+    confidence_override: Confidence | None = None,
+) -> GradedEvidence:
+    """Create a graded evidence item."""
+    conf = confidence_override or default_confidence(source)
+    return GradedEvidence(
+        source=source,
+        confidence=conf,
+        description=description,
+        detail=detail,
+    )
+
+
+def finding_confidence(chain: list[GradedEvidence]) -> Confidence:
+    """Compute overall confidence for a finding from its evidence chain.
+
+    The finding's confidence is the highest confidence in the chain.
+    If the chain has both mechanical and LLM evidence pointing at the
+    same issue, the LLM evidence upgrades to MEDIUM (corroborated).
+    """
+    if not chain:
+        return Confidence.LOW
+
+    has_mechanical = any(
+        e.source.value.startswith("mechanical:")
+        or e.source.value.startswith("dynamic:")
+        for e in chain
+    )
+    has_llm = any(
+        e.source.value.startswith("llm:")
+        for e in chain
+    )
+
+    best = Confidence.LOW
+    for e in chain:
+        conf = e.confidence
+        if has_mechanical and has_llm and conf == Confidence.LOW:
+            conf = Confidence.MEDIUM
+        if _CONFIDENCE_PRIORITY[conf] < _CONFIDENCE_PRIORITY[best]:
+            best = conf
+    return best
+
+
+def grade_evidence_record(record: Any) -> list[GradedEvidence]:
+    """Convert an EvidenceRecord into a list of GradedEvidence items.
+
+    Maps each populated field of the existing EvidenceRecord to graded
+    evidence with appropriate source tags.
+    """
+    items: list[GradedEvidence] = []
+
+    if getattr(record, "taint_approx", None) is not None:
+        approx = record.taint_approx
+        df = approx.get("dangerous_flows", {}) if isinstance(approx, dict) else getattr(approx, "dangerous_flows", {})
+        if df:
+            items.append(grade_evidence(
+                EvidenceSource.TAINT_APPROX,
+                f"{len(df)} tainted parameter flows",
+            ))
+
+    if getattr(record, "taint_summary", None) is not None:
+        items.append(grade_evidence(
+            EvidenceSource.TAINT_APPROX,
+            "CFG path-sensitive taint flow",
+        ))
+
+    flows = getattr(record, "joern_flows", [])
+    if flows:
+        items.append(grade_evidence(
+            EvidenceSource.JOERN,
+            f"{len(flows)} Joern CPG flows",
+        ))
+
+    imported = getattr(record, "imported_joern_flows", [])
+    if imported:
+        items.append(grade_evidence(
+            EvidenceSource.JOERN,
+            f"{len(imported)} imported Joern flows",
+        ))
+
+    unguarded = getattr(record, "joern_unguarded_sinks", [])
+    if unguarded:
+        items.append(grade_evidence(
+            EvidenceSource.JOERN,
+            f"{len(unguarded)} unguarded sinks",
+        ))
+
+    codeql = getattr(record, "codeql_alerts", [])
+    if codeql:
+        items.append(grade_evidence(
+            EvidenceSource.CODEQL,
+            f"{len(codeql)} CodeQL alerts",
+        ))
+
+    semgrep = getattr(record, "semgrep_hits", [])
+    if semgrep:
+        items.append(grade_evidence(
+            EvidenceSource.SEMGREP,
+            f"{len(semgrep)} Semgrep matches",
+        ))
+
+    if getattr(record, "negative_space", None):
+        ns = record.negative_space
+        items.append(grade_evidence(
+            EvidenceSource.NEGATIVE_SPACE,
+            f"{len(ns)} convention deviations from sibling functions",
+        ))
+
+    if getattr(record, "sink_unreachable", False):
+        items.append(grade_evidence(
+            EvidenceSource.CALL_GRAPH,
+            "sink unreachable from entry points",
+        ))
+
+    if getattr(record, "binary_sink_edges", None):
+        items.append(grade_evidence(
+            EvidenceSource.BINARY_ORACLE,
+            f"{len(record.binary_sink_edges)} binary call edges to sinks",
+        ))
+
+    sink_args = getattr(record, "joern_sink_args", [])
+    if sink_args:
+        items.append(grade_evidence(
+            EvidenceSource.JOERN,
+            f"{len(sink_args)} sink argument flows",
+        ))
+
+    if getattr(record, "context_map_sink", None) is not None:
+        # context-map.json sink_details are raw LLM output from
+        # /understand over the untrusted repo — grading them
+        # CALL_GRAPH/HIGH promoted a hostile-repo-steerable claim to
+        # mechanical evidence (THREAT_MODEL I2(b)). LLM tier: LOW
+        # alone; MEDIUM (corroborated) only when a deterministic tool
+        # produced sink evidence for the SAME function in this record.
+        corroborated = bool(
+            flows or imported or unguarded or sink_args
+            or codeql or semgrep
+            or getattr(record, "binary_sink_edges", None)
+            or getattr(record, "taint_approx", None) is not None
+            or getattr(record, "taint_summary", None) is not None
+        )
+        items.append(grade_evidence(
+            EvidenceSource.LLM_CORROBORATED if corroborated
+            else EvidenceSource.LLM_INFERRED,
+            "context-map sink match (LLM-derived, /understand --map)",
+        ))
+
+    if getattr(record, "transitive_taint", None) is not None:
+        items.append(grade_evidence(
+            EvidenceSource.TAINT_APPROX,
+            "transitive taint propagation",
+        ))
+
+    if getattr(record, "prefilter", None) is not None:
+        items.append(grade_evidence(
+            EvidenceSource.PREFILTER,
+            "prefilter match",
+        ))
+
+    app_sinks = getattr(record, "app_sink_targets", [])
+    if app_sinks:
+        items.append(grade_evidence(
+            EvidenceSource.CALL_GRAPH,
+            f"{len(app_sinks)} application sink targets",
+        ))
+
+    sanitizers = getattr(record, "sanitizer_calls", [])
+    if sanitizers:
+        items.append(grade_evidence(
+            EvidenceSource.TAINT_APPROX,
+            f"{len(sanitizers)} sanitizer calls",
+        ))
+
+    if getattr(record, "binary_surface_category", None):
+        items.append(grade_evidence(
+            EvidenceSource.BINARY_ORACLE,
+            f"surface category: {record.binary_surface_category}",
+        ))
+
+    if getattr(record, "binary_parser_boundary", False):
+        items.append(grade_evidence(
+            EvidenceSource.BINARY_ORACLE,
+            "parser boundary function",
+        ))
+
+    layer0 = getattr(record, "binary_layer0_findings", [])
+    if layer0:
+        items.append(grade_evidence(
+            EvidenceSource.BINARY_ORACLE,
+            f"{len(layer0)} layer-0 binary findings",
+        ))
+
+    return items
+
+
+def _typestate_type_name(violation: Any) -> str:
+    """``type_name`` of a pipeline typestate violation (object or
+    journaled dict form), stripped; empty when absent."""
+    if isinstance(violation, dict):
+        return str(violation.get("type_name") or "").strip()
+    return str(getattr(violation, "type_name", "") or "").strip()
+
+
+def grade_review_result(
+    review_result: dict[str, Any] | None,
+    evidence_tool: str = "",
+    typestate_context: list[Any] | None = None,
+) -> list[GradedEvidence]:
+    """Extract graded evidence from an LLM review result.
+
+    ``typestate_context`` is the pipeline's own record of the
+    typestate violations it injected into the review prompt for this
+    function (``ctx["typestate_violations"]``) — the corroboration
+    gate for the model's ``typestate_violation`` claim below.
+    """
+    items: list[GradedEvidence] = []
+
+    rr = review_result or {}
+
+    hypothesis = rr.get("hypothesis", "")
+    if hypothesis:
+        items.append(grade_evidence(
+            EvidenceSource.LLM_INFERRED,
+            hypothesis[:200],
+        ))
+
+    spec_dev = rr.get("spec_deviation")
+    if spec_dev and spec_dev.get("deviation"):
+        items.append(grade_evidence(
+            EvidenceSource.LLM_SPEC,
+            f"spec deviation: {spec_dev['deviation'][:150]}",
+        ))
+
+    ts_viol = rr.get("typestate_violation")
+    if ts_viol and ts_viol.get("confirmed"):
+        # ``typestate_violation`` is parsed model JSON — a claim, not
+        # the mechanical typestate checker's output. Grading it
+        # ``mechanical:typestate`` at HIGH let a fabricated
+        # ``{"confirmed": true}`` mint mechanical-tier evidence the
+        # export firewall trusts (same class as the context-map-sink
+        # demotion in ``grade_evidence_record``). LLM tier: LOW alone;
+        # MEDIUM (corroborated) only when the pipeline actually
+        # injected typestate context for this function and the claimed
+        # type matches an injected violation's type (a claim naming a
+        # type the checker never flagged is uncorroborated).
+        claimed_type = str(ts_viol.get("type_name") or "").strip()
+        context_types = {
+            t for t in (
+                _typestate_type_name(v) for v in (typestate_context or [])
+            ) if t
+        }
+        corroborated = bool(typestate_context) and (
+            not claimed_type or claimed_type in context_types
+        )
+        items.append(grade_evidence(
+            EvidenceSource.LLM_CORROBORATED if corroborated
+            else EvidenceSource.LLM_INFERRED,
+            f"{ts_viol.get('violation_kind', 'violation')} on "
+            f"{ts_viol.get('type_name', '?')} (LLM-confirmed typestate)",
+        ))
+
+    if evidence_tool and is_tool_evidence(evidence_tool):
+        parts = evidence_tool.split("+") if "+" in evidence_tool else [evidence_tool]
+        seen: set = set()
+        for part in parts:
+            part = part.strip()
+            # A valid composite does not grant verification authority
+            # to its detection-only or unrecognized components.
+            if not is_tool_evidence(part):
+                continue
+            namespace = part.split(":")[0] if ":" in part else part
+            entry = _RECEIPT_MAP.get(part) or _RECEIPT_MAP.get(namespace)
+            if entry and entry[0] not in seen:
+                seen.add(entry[0])
+                source, description = entry
+                items.append(grade_evidence(source, description))
+
+    return items
+
+
+def format_evidence_chain(chain: list[GradedEvidence]) -> str:
+    """Render an evidence chain as human-readable text."""
+    if not chain:
+        return ""
+
+    lines = ["### Evidence chain"]
+    for e in sorted(chain, key=lambda x: x.priority):
+        tag = e.source.value.split(":")[-1]
+        conf = e.confidence.value.upper()
+        lines.append(f"- [{conf}] ({tag}) {e.description}")
+        if e.detail:
+            lines.append(f"  {e.detail}")
+    return "\n".join(lines)

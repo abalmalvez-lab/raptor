@@ -1,0 +1,425 @@
+"""Tests for project-sample collection — clone, scan, sanitise.
+
+Network-dependent operations (git clone + run_sca) are mocked so
+the tests run offline and deterministically. The collector's
+sanitisation + error-handling logic is what matters for unit
+tests; live clone-and-scan runs through the sample-refresh CLI
+(``packages/sca/scripts/raptor-sca-collect-samples``, driven by the
+``refresh-sca-project-samples.yml`` workflow), never from this
+suite.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import List
+from unittest.mock import patch
+
+import pytest
+
+
+from packages.sca.calibration.project_samples import (
+    PROJECT_SAMPLES,
+    CollectResult,
+    ProjectSample,
+    _sanitise_findings,
+    collect_project_samples,
+)
+
+
+def _fake_findings(sample_root: Path):
+    """Build the canonical fake-findings list rooted under the
+    caller's hermetic sample dir. The vulnerable-dependency entry
+    must have its ``file`` under ``sample_root`` so the path-strip
+    tests can verify the prefix is removed."""
+    return [
+        {
+            "vuln_type": "sca:vulnerable_dependency",
+            "finding_id": "sca:vulnerable_dependency:PyPI:django:CVE-X",
+            "severity": "high",
+            "file": str(sample_root / "django" / "setup.py"),
+            "sca": {
+                "ecosystem": "PyPI",
+                "name": "django",
+                "version": "4.2.0",
+                "purl": "pkg:pypi/django@4.2.0",
+                "advisory": {"osv_id": "GHSA-x"},
+                "in_kev": False,
+                "epss": 0.05,
+                "cvss_score": 7.5,
+                "reachability": {"verdict": "imported"},
+                "raptor_risk_estimate": 0.65,
+                "risk_components": {"calibration_status": "unverified"},
+                "direct": False,
+                "exposure_factor": 0.25,
+                "transitive_depth": 2,
+                # ``reason`` free text can embed clone paths — the
+                # sanitiser must scrub it (path-strip test checks).
+                "parser_confidence": {
+                    "level": "medium", "numeric": 0.7,
+                    "reason": f"heuristic parse of {sample_root}/setup.py",
+                },
+                "version_match_confidence": {
+                    "level": "low", "numeric": 0.3,
+                    "reason": "range match",
+                },
+            },
+        },
+        {
+            "vuln_type": "sca:hygiene:loose_pin",   # filtered out
+            "finding_id": "sca:hygiene:loose_pin:django",
+            "severity": "low",
+            "sca": {"ecosystem": "PyPI", "name": "django"},
+        },
+        {
+            "vuln_type": "sca:license:warned",      # filtered out
+            "finding_id": "sca:license:warned:PyPI:django",
+            "severity": "medium",
+            "sca": {"ecosystem": "PyPI", "name": "django",
+                     "spdx": "GPL-3.0"},
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# _sanitise_findings — schema + path stripping
+# ---------------------------------------------------------------------------
+
+
+def test_sanitise_keeps_only_vuln_findings(tmp_path):
+    sample_root = tmp_path / "sample"
+    out = _sanitise_findings(_fake_findings(sample_root), sample_root)
+    assert len(out) == 1
+    assert out[0]["finding_id"] == "sca:vulnerable_dependency:PyPI:django:CVE-X"
+
+
+def test_sanitise_strips_tempdir_paths(tmp_path):
+    """The output must NOT contain any file path under the
+    discarded clone dir — second runs would have different
+    tempdir suffixes and we don't want path leakage."""
+    sample_root = tmp_path / "sample"
+    out = _sanitise_findings(_fake_findings(sample_root), sample_root)
+    serialised = json.dumps(out)
+    assert str(sample_root) not in serialised
+    assert "setup.py" not in serialised
+
+
+def test_sanitise_preserves_validation_relevant_fields(tmp_path):
+    sample_root = tmp_path / "sample"
+    out = _sanitise_findings(_fake_findings(sample_root), sample_root)
+    f = out[0]
+    # Fields needed for validation: score, severity, kev/epss
+    # signals, advisory id.
+    assert f["raptor_risk_estimate"] == 0.65
+    assert f["severity"] == "high"
+    assert f["in_kev"] is False
+    assert f["epss"] == 0.05
+    assert f["cvss_score"] == 7.5
+    assert f["dep_name"] == "django"
+    assert f["dep_version"] == "4.2.0"
+    assert f["purl"] == "pkg:pypi/django@4.2.0"
+    assert f["advisory"] == {"osv_id": "GHSA-x"}
+
+
+def test_sanitise_archives_risk_model_inputs(tmp_path):
+    """The archive must carry the inputs the refitter rebuilds
+    scores from — direct flag, exposure, transitive depth, and the
+    parser / version-match confidence numerics. Confidence blocks
+    are scrubbed to level + numeric (free-text ``reason`` can embed
+    clone paths and the risk formula never reads it)."""
+    sample_root = tmp_path / "sample"
+    out = _sanitise_findings(_fake_findings(sample_root), sample_root)
+    f = out[0]
+    assert f["direct"] is False
+    assert f["exposure_factor"] == 0.25
+    assert f["transitive_depth"] == 2
+    assert f["parser_confidence"] == {"level": "medium", "numeric": 0.7}
+    assert f["version_match_confidence"] == {"level": "low", "numeric": 0.3}
+    assert "reason" not in json.dumps(
+        [f["parser_confidence"], f["version_match_confidence"]],
+    )
+
+
+def test_sanitise_empty_input(tmp_path):
+    assert _sanitise_findings([], tmp_path) == []
+
+
+def test_sanitise_skips_malformed_entries(tmp_path):
+    bad = [None, "string", 42, {"vuln_type": "sca:vulnerable_dependency"}]
+    out = _sanitise_findings(bad, tmp_path)
+    # The dict-without-sca survives but with mostly None fields.
+    assert len(out) == 1
+
+
+def test_sanitise_orders_deterministically(tmp_path):
+    """Output is in a stable, total order independent of input order, so a
+    corpus refresh only diffs on real changes (not reordering churn)."""
+    def _vuln(fid: str, name: str):
+        return {
+            "vuln_type": "sca:vulnerable_dependency",
+            "finding_id": fid,
+            "severity": "high",
+            "sca": {"ecosystem": "npm", "name": name, "version": "1.0.0",
+                    "purl": f"pkg:npm/{name}@1.0.0"},
+        }
+
+    scrambled = [
+        _vuln("sca:vd:npm:z:CVE-2", "z"),
+        _vuln("sca:vd:npm:a:CVE-1", "a"),
+        _vuln("sca:vd:npm:m:CVE-3", "m"),
+    ]
+    ids = [f["finding_id"] for f in _sanitise_findings(scrambled, tmp_path)]
+    assert ids == sorted(ids)
+    # Reversed input → identical output (the churn this prevents).
+    rev = [f["finding_id"]
+           for f in _sanitise_findings(list(reversed(scrambled)), tmp_path)]
+    assert rev == ids
+
+
+# ---------------------------------------------------------------------------
+# collect_project_samples — orchestrator + license filter
+# ---------------------------------------------------------------------------
+
+
+def test_only_licenses_filter(tmp_path: Path):
+    """Operators concerned about license-touch can restrict
+    collection to specific SPDX IDs."""
+    samples = [
+        ProjectSample(name="x", ecosystem="PyPI",
+                       repo_url="https://x/", git_ref="v1",
+                       license_spdx="GPL-3.0"),
+        ProjectSample(name="y", ecosystem="PyPI",
+                       repo_url="https://y/", git_ref="v1",
+                       license_spdx="MIT"),
+    ]
+    # Mock _collect_one so no network. Just record which samples
+    # got through the filter.
+    called_with: List[ProjectSample] = []
+    with patch(
+        "packages.sca.calibration.project_samples._collect_one"
+    ) as mock_collect:
+        mock_collect.side_effect = lambda s, *args, **kw: (
+            called_with.append(s),
+            CollectResult(
+                project=s.name, ecosystem=s.ecosystem,
+                written=True, error=None, finding_count=0,
+            ),
+        )[1]
+        collect_project_samples(
+            out_dir=tmp_path, samples=samples,
+            only_licenses=["MIT"],
+        )
+    assert [s.name for s in called_with] == ["y"]
+
+
+def test_one_sample_failing_doesnt_abort_others(tmp_path: Path):
+    """A failure on one project doesn't stop the rest."""
+    samples = [
+        ProjectSample(name="ok", ecosystem="PyPI",
+                       repo_url="https://ok/", git_ref="v1",
+                       license_spdx="MIT"),
+        ProjectSample(name="bad", ecosystem="PyPI",
+                       repo_url="https://bad/", git_ref="v1",
+                       license_spdx="MIT"),
+    ]
+    def _fake(s, *args, **kw):
+        if s.name == "bad":
+            raise RuntimeError("simulated clone failure")
+        return CollectResult(
+            project=s.name, ecosystem=s.ecosystem,
+            written=True, error=None, finding_count=2,
+        )
+    with patch(
+        "packages.sca.calibration.project_samples._collect_one",
+        side_effect=_fake,
+    ):
+        results = collect_project_samples(
+            out_dir=tmp_path, samples=samples,
+        )
+    by_name = {r.project: r for r in results}
+    assert by_name["ok"].written is True
+    assert by_name["bad"].error is not None
+    assert "simulated clone failure" in by_name["bad"].error
+
+
+@pytest.mark.filterwarnings("ignore:.*multi-threaded.*fork:DeprecationWarning")
+def test_parallel_collects_all_samples_input_order(tmp_path: Path):
+    """jobs>1 runs projects across a process pool and returns one result
+    per sample in INPUT order (not completion order), with per-project
+    failures isolated. Uses the ``fork`` start method so the patched
+    ``_collect_one`` is inherited by the worker processes."""
+    samples = [
+        ProjectSample(name=f"p{i}", ecosystem="PyPI",
+                       repo_url=f"https://p{i}/", git_ref="v1",
+                       license_spdx="MIT")
+        for i in range(5)
+    ]
+
+    def _fake(s, *args, **kw):
+        # Emit to stdout so the worker's fd-level capture is exercised.
+        print(f"scanning {s.name}")
+        if s.name == "p3":
+            raise RuntimeError("boom p3")
+        return CollectResult(
+            project=s.name, ecosystem=s.ecosystem,
+            written=True, error=None, finding_count=len(s.name),
+        )
+
+    with patch(
+        "packages.sca.calibration.project_samples._collect_one",
+        side_effect=_fake,
+    ):
+        results = collect_project_samples(
+            out_dir=tmp_path, samples=samples,
+            jobs=3, prewarm=False, _mp_start_method="fork",
+        )
+
+    assert [r.project for r in results] == [f"p{i}" for i in range(5)]
+    by = {r.project: r for r in results}
+    assert by["p0"].written is True
+    assert by["p3"].error is not None and "boom p3" in by["p3"].error
+    # The four non-failing projects all produced a result.
+    assert sum(1 for r in results if r.written) == 4
+
+
+def test_prewarm_global_feeds_is_best_effort(monkeypatch):
+    """The KEV pre-warm must never raise — a fetch/import failure just
+    leaves workers to load the catalog themselves."""
+    from packages.sca.calibration import project_samples as ps
+
+    def _boom():
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("core.http.default_client", _boom)
+    # Should swallow the error, not propagate.
+    ps._prewarm_global_feeds()
+
+
+def test_default_samples_all_have_licenses():
+    """The curated list ships with declared licenses — sanity-
+    check the data file."""
+    for s in PROJECT_SAMPLES:
+        assert s.license_spdx, f"{s.name} missing license"
+        assert s.repo_url.startswith("https://"), s.name
+        assert s.git_ref, f"{s.name} missing git_ref pin"
+
+
+def test_default_samples_only_permissive_or_dual():
+    """Bootstrap policy: don't pull in copyleft-only projects.
+    Tightens the collection's license footprint to OSI-permissive
+    or dual-licensed (e.g. ``MIT OR Apache-2.0``)."""
+    permissive = {"MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC"}
+    for s in PROJECT_SAMPLES:
+        # Either single-permissive or dual-licensed with at least
+        # one permissive choice.
+        choices = {c.strip() for c in s.license_spdx.replace(
+            " AND ", " OR ").split(" OR ")}
+        assert choices & permissive, (
+            f"{s.name} license {s.license_spdx!r} has no permissive "
+            f"choice; expand the policy or remove from PROJECT_SAMPLES"
+        )
+
+
+# ---------------------------------------------------------------------------
+# fetched_at-masked write skipping
+# ---------------------------------------------------------------------------
+
+def test_same_modulo_fetched_at() -> None:
+    from packages.sca.calibration.project_samples import (
+        _same_modulo_fetched_at,
+    )
+    old = {
+        "_source": {"fetched_at": "2026-01-01T00:00:00Z", "url": "x"},
+        "findings": [{"finding_id": "a"}],
+    }
+    new_ts_only = {
+        "_source": {"fetched_at": "2026-02-02T00:00:00Z", "url": "x"},
+        "findings": [{"finding_id": "a"}],
+    }
+    new_data = {
+        "_source": {"fetched_at": "2026-02-02T00:00:00Z", "url": "x"},
+        "findings": [{"finding_id": "b"}],
+    }
+    assert _same_modulo_fetched_at(old, new_ts_only)
+    assert not _same_modulo_fetched_at(old, new_data)
+    assert not _same_modulo_fetched_at(None, new_ts_only)
+    assert not _same_modulo_fetched_at([], new_ts_only)
+
+
+def test_sanitise_advisory_preserves_join_keys_and_drops_unused_prose(tmp_path):
+    from copy import deepcopy
+    from packages.sca.calibration.validate import _extract_cve_ids
+    findings = _fake_findings(tmp_path)
+    advisory = {
+        "id": "GHSA-test", "osv_id": "CVE-2024-1234", "aliases": ["CVE-2024-1234"],
+        "cves": ["CVE-2024-1234"], "cve_id": "CVE-2024-1234", "informational": False,
+        "summary": "unused advisory prose", "details": "unused full description",
+        "references": ["https://example.org/advisory"], "fixed_versions": ["2.0"],
+        "published": "2024-01-01", "future_description": "must also be omitted",
+    }
+    findings[0]["sca"]["advisory"] = advisory
+    original = deepcopy(findings)
+    result = _sanitise_findings(findings, tmp_path)[0]["advisory"]
+    assert result == {key: advisory[key] for key in
+                      ("id", "osv_id", "aliases", "cves", "cve_id", "informational")}
+    assert _extract_cve_ids(result) == _extract_cve_ids(advisory)
+    assert findings == original
+    advisory["informational"] = "unmaintained"
+    result = _sanitise_findings(findings, tmp_path)[0]["advisory"]
+    assert result["informational"] == "unmaintained"
+    assert _extract_cve_ids(result) == []
+
+
+@pytest.mark.parametrize("advisory", [None, "malformed", []])
+def test_sanitise_advisory_handles_missing_or_invalid_blocks(tmp_path, advisory):
+    findings = _fake_findings(tmp_path)
+    findings[0]["sca"]["advisory"] = advisory
+    assert _sanitise_findings(findings, tmp_path)[0]["advisory"] is None
+
+
+@pytest.mark.parametrize("verdict", ["imported", "not_reachable", "not_evaluated"])
+def test_sanitise_diagnostics_preserves_rescoring(tmp_path, verdict):
+    from packages.sca.calibration.refit import _rescore_finding
+    findings = _fake_findings(tmp_path)
+    sca = findings[0]["sca"]
+    sca["risk_components"] = {"final": 0.65, "cvss_base": 75.0, "diagnostic": "discard"}
+    sca["reachability"] = {
+        "verdict": verdict,
+        "confidence": {"level": "low", "numeric": 0.3, "reason": "discard"},
+        "evidence": [str(tmp_path / "discarded-source.py")],
+    }
+    sca["exploit_evidence"] = {
+        "kev_listed": False, "edb_ids": [123], "msf_modules": [],
+        "github_poc_urls": [], "has_any": True,
+    }
+    projected = _sanitise_findings(findings, tmp_path)[0]
+    full = {**projected, **{key: sca[key] for key in
+                           ("risk_components", "reachability", "exploit_evidence")}}
+    assert projected["risk_components"] == {"final": 0.65}
+    assert projected["reachability"] == {"verdict": verdict,
+        "confidence": {"level": "low", "numeric": 0.3}}
+    assert "has_any" not in projected["exploit_evidence"]
+    for overrides in [None, {"_REACH_NOT_EVALUATED_MULTIPLIER": 0.4,
+                             "_REACH_NOT_REACHABLE_MAX_REDUCTION": 0.2}]:
+        assert _rescore_finding(projected, overrides) == _rescore_finding(full, overrides)
+
+
+@pytest.mark.parametrize("raw", [None, [], "invalid", {}, {"confidence": None},
+                               {"confidence": "invalid"}, {"confidence": {}}])
+def test_sanitise_reachability_preserves_missing_and_invalid_semantics(tmp_path, raw):
+    from packages.sca.calibration.refit import _rescore_finding
+    findings = _fake_findings(tmp_path)
+    findings[0]["sca"]["reachability"] = raw
+    projected = _sanitise_findings(findings, tmp_path)[0]
+    full = {**projected, "reachability": raw}
+    assert _rescore_finding(projected, None) == _rescore_finding(full, None)
+
+
+def test_committed_project_samples_are_all_readable_by_calibration():
+    from packages.sca.calibration.validate import _load_project_samples
+    samples_dir = Path(__file__).resolve().parents[2] / "data/calibration/project_samples"
+    files = sorted(samples_dir.rglob("*.json"))
+    assert files, "calibration sample coverage check must not be vacuous"
+    loaded = _load_project_samples(samples_dir)
+    assert len(loaded) == len(files), "calibration silently skipped an invalid or oversized sample"

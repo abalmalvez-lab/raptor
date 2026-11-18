@@ -17,13 +17,16 @@ the hypothesis. IRIS achieved 2x CodeQL's recall (55 vs 27 CVEs) using
 this pattern.
 """
 
-import json
 import logging
 import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Optional, Set
+
+from core.sarif.parser import _coerce_line, get_run_execution_diagnostics, load_sarif
+from core.source.lines import splitlines_prefix
+from core.config import RaptorConfig
+from packages.codeql.tunables import CodeQLTunables
 
 from .base import ToolAdapter, ToolCapability, ToolEvidence, make_sandbox_runner
 
@@ -33,10 +36,24 @@ logger = logging.getLogger(__name__)
 # Process-scoped cache of pack dirs we've already attempted to install.
 # Pack-install is idempotent and fast on subsequent calls (just reads the
 # lockfile), but skipping the subprocess entirely is cheaper.
-_INSTALLED_PACK_DIRS: Set[Path] = set()
+_INSTALLED_PACK_DIRS: set[Path] = set()
 
 
-def _find_pack_dir(query_path: Path) -> Optional[Path]:
+def _codeql_user_state_paths() -> list[str]:
+    """Read-allowlist entries for codeql's per-user state.
+
+    The default sandbox runner restricts reads to system dirs + target +
+    output + /tmp, which would hide codeql's pack cache and compile
+    cache (``~/.codeql``) and its user config (``~/.config/codeql``) —
+    every stdlib-importing query would then fail to compile. These are
+    read-only grants; writes stay confined to the database dir + /tmp.
+    """
+    home = Path.home()
+    candidates = (home / ".codeql", home / ".config" / "codeql")
+    return [str(p) for p in candidates if p.exists()]
+
+
+def _find_pack_dir(query_path: Path) -> Path | None:
     """Walk up from a .ql file looking for the containing pack's qlpack.yml.
 
     Bounds the walk to a few levels — pack layouts are
@@ -53,32 +70,36 @@ def _ensure_pack_installed(
     query_path: Path,
     codeql_bin: str,
     runner,
-    env: Dict[str, str],
+    env: dict[str, str],
 ) -> None:
     """Run `codeql pack install` on the query's containing pack if needed.
 
     Skipped when:
       - The query lives outside any qlpack.yml-owning directory
       - The pack already has a `codeql-pack.lock.yml` (already installed)
-      - We've already attempted install for this pack in this process
+      - We've already SUCCESSFULLY installed this pack in this process
 
     Failures are logged but do not raise — the subsequent
     `codeql database analyze` call surfaces a clearer error if the
-    install was actually required.
+    install was actually required. Failed attempts are NOT cached:
+    a transient failure (e.g. network blocked for this run) must not
+    suppress the retry once the environment is fixed.
     """
+    if RaptorConfig.CODEQL_OFFLINE:
+        return
     pack_dir = _find_pack_dir(Path(query_path))
     if pack_dir is None:
         return
     if pack_dir in _INSTALLED_PACK_DIRS:
         return
-    _INSTALLED_PACK_DIRS.add(pack_dir)
 
     if (pack_dir / "codeql-pack.lock.yml").is_file():
         # Already installed — pack-install would be a no-op.
+        _INSTALLED_PACK_DIRS.add(pack_dir)
         return
 
     try:
-        runner(
+        proc = runner(
             [codeql_bin, "pack", "install", str(pack_dir)],
             capture_output=True, text=True,
             timeout=180, env=env,
@@ -88,6 +109,15 @@ def _ensure_pack_installed(
             "codeql pack install on %s failed: %s — analyze may fail with a clearer error",
             pack_dir, e,
         )
+        return
+    if getattr(proc, "returncode", 1) != 0:
+        logger.warning(
+            "codeql pack install on %s exited %s — leaving it uncached so"
+            " a later call can retry; analyze may fail with a clearer error",
+            pack_dir, getattr(proc, "returncode", None),
+        )
+        return
+    _INSTALLED_PACK_DIRS.add(pack_dir)
 
 
 _SYNTAX_EXAMPLE = """\
@@ -134,11 +164,11 @@ class CodeQLAdapter(ToolAdapter):
 
     def __init__(
         self,
-        database_path: Optional[Path] = None,
-        codeql_bin: Optional[str] = None,
+        database_path: Path | None = None,
+        codeql_bin: str | None = None,
         *,
         sandbox: bool = True,
-    ):
+    ) -> None:
         self._database_path = Path(database_path) if database_path else None
         self._codeql_bin = codeql_bin or shutil.which("codeql")
         self._sandbox = sandbox
@@ -157,9 +187,7 @@ class CodeQLAdapter(ToolAdapter):
             return False
         if not self._database_path:
             return False
-        if not self._database_path.exists():
-            return False
-        return True
+        return self._database_path.exists()
 
     def describe(self) -> ToolCapability:
         return ToolCapability(
@@ -187,7 +215,7 @@ class CodeQLAdapter(ToolAdapter):
         target: Path,
         *,
         timeout: int = 300,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
     ) -> ToolEvidence:
         """Invoke an existing pack-resident .ql file directly.
 
@@ -228,7 +256,12 @@ class CodeQLAdapter(ToolAdapter):
 
         if env is None:
             from core.config import RaptorConfig
-            env = RaptorConfig.get_safe_env()
+            # preserve_proxy: the lazy `codeql pack install` (which
+            # runs unsandboxed — see below) fetches dep packs from the
+            # registry; CodeQL's Java stack honours the lowercase
+            # https_proxy env var. The sandboxed analyze itself never
+            # needs the network.
+            env = RaptorConfig.get_safe_env(preserve_proxy=True)
 
         # `output=` grants write access to the database directory.
         # CodeQL writes to `<db>/<lang>/default/cache/` (the IMB
@@ -242,10 +275,17 @@ class CodeQLAdapter(ToolAdapter):
         # …/cache/.lock (eventual cause: FileNotFoundException
         # …/cache/.lock)" on a database that demonstrably exists
         # on disk with a writable cache subdir.
+        # fake_home=False: codeql resolves its pack + compile caches
+        # under the real $HOME; an empty fake HOME would make every
+        # stdlib-importing query fail to compile. restrict_reads keeps
+        # the rest of the home directory unreadable, with the codeql
+        # state dirs explicitly re-granted read-only.
         runner = (
             make_sandbox_runner(
                 target=self._database_path,
                 output=self._database_path,
+                fake_home=False,
+                readable_paths=_codeql_user_state_paths(),
             )
             if self._sandbox else subprocess.run
         )
@@ -257,10 +297,24 @@ class CodeQLAdapter(ToolAdapter):
         # absolute query path. Standard installed packs (under
         # ~/.codeql/packages/codeql/) always have lockfiles already,
         # so this is a no-op for them.
-        _ensure_pack_installed(query_path, self._codeql_bin, runner, env)
+        # The install step runs UNSANDBOXED (plain subprocess): it only
+        # processes the RAPTOR-shipped pack manifest — never the target
+        # code or an LLM-generated rule — and it must reach the pack
+        # registry (via the preserved proxy env) to build the lockfile,
+        # which the sandbox's network block would deny. The analyze
+        # call below stays sandboxed.
+        _ensure_pack_installed(query_path, self._codeql_bin, subprocess.run, env)
 
         try:
-            with TemporaryDirectory(prefix="codeql_prebuilt_") as tmp:
+            # Scratch (SARIF output, temp pack) lives INSIDE the
+            # database dir: the sandbox's only host-visible writable
+            # surface is `output` (the db) — the mount-ns backend
+            # gives the child a PRIVATE /tmp, so a workspace under
+            # the host /tmp would leave the SARIF invisible to the
+            # parent (and the temp pack's lockfile unwritable).
+            with TemporaryDirectory(
+                prefix="codeql_prebuilt_", dir=str(self._database_path),
+            ) as tmp:
                 sarif_path = Path(tmp) / "result.sarif"
                 cmd = [
                     self._codeql_bin,
@@ -271,6 +325,7 @@ class CodeQLAdapter(ToolAdapter):
                     f"--output={sarif_path}",
                     "--no-rerun",
                 ]
+                CodeQLTunables.from_tuning().append_to(cmd, include_disk_cache=False)
                 try:
                     proc = runner(
                         cmd, capture_output=True, text=True,
@@ -301,6 +356,15 @@ class CodeQLAdapter(ToolAdapter):
                 error=f"workspace setup failed: {e}",
             )
 
+        if matches is None:
+            # Parse failure is a tool failure, never a default-refuted
+            # "no matches" — the runner grades success=False as
+            # inconclusive.
+            return ToolEvidence(
+                tool=self.name, rule=rule_label, success=False,
+                error="SARIF output unreadable (parse failure)",
+            )
+
         n = len(matches)
         files = sorted({m["file"] for m in matches if m.get("file")})
         if n:
@@ -316,13 +380,245 @@ class CodeQLAdapter(ToolAdapter):
             summary=summary,
         )
 
+    def run_prebuilt_queries_batch(
+        self,
+        query_paths: list[Path],
+        *,
+        timeout: int = 600,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, ToolEvidence]:
+        """Run multiple prebuilt queries in a single JVM invocation.
+
+        Returns a dict keyed by str(query_path) → ToolEvidence.
+        Saves ~4-6s of JVM+DB overhead per additional query beyond the first.
+        """
+        if not query_paths:
+            return {}
+
+        unique_paths = list(dict.fromkeys(str(p) for p in query_paths))
+
+        # Same three precondition diagnostics as run() / run_prebuilt_query
+        # so batch failures are equally actionable.
+        if not self._codeql_bin:
+            err = "codeql CLI is not installed"
+        elif not self._database_path:
+            err = "no CodeQL database configured (set_database() first)"
+        elif not self._database_path.exists():
+            err = f"CodeQL database not found: {self._database_path}"
+        else:
+            err = ""
+        if err:
+            return {
+                qp: ToolEvidence(tool=self.name, rule=qp, success=False, error=err)
+                for qp in unique_paths
+            }
+
+        if env is None:
+            from core.config import RaptorConfig
+            # preserve_proxy: the lazy `codeql pack install` (which
+            # runs unsandboxed — see below) fetches dep packs from the
+            # registry; CodeQL's Java stack honours the lowercase
+            # https_proxy env var. The sandboxed analyze itself never
+            # needs the network.
+            env = RaptorConfig.get_safe_env(preserve_proxy=True)
+
+        # Same sandbox shape as run_prebuilt_query — see the comment
+        # there for the output= (IMB cache write) and fake_home=False
+        # (real-HOME pack cache) rationale.
+        runner = (
+            make_sandbox_runner(
+                target=self._database_path,  # type: ignore[arg-type]
+                output=self._database_path,
+                fake_home=False,
+                readable_paths=_codeql_user_state_paths(),
+            )
+            if self._sandbox else subprocess.run
+        )
+
+        # Unsandboxed install for the same reason as run_prebuilt_query:
+        # RAPTOR-shipped manifests only, and the lockfile fetch needs
+        # the network the sandbox denies. Analyze stays sandboxed.
+        for qp in unique_paths:
+            _ensure_pack_installed(Path(qp), self._codeql_bin or "", subprocess.run, env)
+
+        try:
+            # Scratch (SARIF output, temp pack) lives INSIDE the
+            # database dir: the sandbox's only host-visible writable
+            # surface is `output` (the db) — the mount-ns backend
+            # gives the child a PRIVATE /tmp, so a workspace under
+            # the host /tmp would leave the SARIF invisible to the
+            # parent (and the temp pack's lockfile unwritable).
+            with TemporaryDirectory(
+                prefix="codeql_batch_", dir=str(self._database_path),
+            ) as tmp:
+                sarif_path = Path(tmp) / "result.sarif"
+                cmd = [
+                    self._codeql_bin or "codeql",
+                    "database", "analyze",
+                    str(self._database_path),
+                    *unique_paths,
+                    "--format=sarif-latest",
+                    f"--output={sarif_path}",
+                    "--no-rerun",
+                ]
+                CodeQLTunables.from_tuning().append_to(cmd, include_disk_cache=False)
+                try:
+                    proc = runner(
+                        cmd, capture_output=True, text=True,
+                        timeout=timeout, env=env,
+                    )
+                except subprocess.TimeoutExpired:
+                    return {
+                        qp: ToolEvidence(
+                            tool=self.name, rule=qp, success=False,
+                            error=f"codeql batch timeout after {timeout}s",
+                        )
+                        for qp in unique_paths
+                    }
+                except OSError as e:
+                    return {
+                        qp: ToolEvidence(
+                            tool=self.name, rule=qp, success=False,
+                            error=f"failed to invoke codeql: {e}",
+                        )
+                        for qp in unique_paths
+                    }
+
+                if proc.returncode != 0 or not sarif_path.exists():
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    return {
+                        qp: ToolEvidence(
+                            tool=self.name, rule=qp, success=False,
+                            error=err[:500] or f"codeql returned {proc.returncode}",
+                        )
+                        for qp in unique_paths
+                    }
+
+                all_matches = _parse_sarif(sarif_path)
+        except OSError as e:
+            return {
+                qp: ToolEvidence(
+                    tool=self.name, rule=qp, success=False,
+                    error=f"workspace setup failed: {e}",
+                )
+                for qp in unique_paths
+            }
+
+        if all_matches is None:
+            # Parse failure is a tool failure for every query in the
+            # batch, never a default-refuted "no matches".
+            return {
+                qp: ToolEvidence(
+                    tool=self.name, rule=qp, success=False,
+                    error="SARIF output unreadable (parse failure)",
+                )
+                for qp in unique_paths
+            }
+
+        # Build a lookup from SARIF ruleId back to the originating
+        # query path.  CodeQL sets ruleId to the query's @id metadata.
+        # Register by both the full @id (extracted from the .ql source)
+        # and the bare stem as a fallback.  A stem shared by two queries
+        # cannot attribute anything — crediting all its matches to
+        # whichever query registered first would misattribute the other
+        # query's results — so colliding stems are dropped from the
+        # lookup and their results flow into the unattributed handling
+        # below. Full @id collisions are equally ambiguous, including a
+        # collision between a declared @id and another query's stem.
+        # A known ambiguous full identifier must not retry by suffix.
+        rule_to_qp: dict[str, str] = {}
+        ambiguous_rule_ids: set[str] = set()
+
+        def register_rule_id(rule_id: str, query_path: str) -> None:
+            if rule_id in rule_to_qp and rule_to_qp[rule_id] != query_path:
+                ambiguous_rule_ids.add(rule_id)
+            else:
+                rule_to_qp.setdefault(rule_id, query_path)
+
+        for qp in unique_paths:
+            register_rule_id(Path(qp).stem, qp)
+            try:
+                # Bounded header scan for @id — the metadata comment
+                # normally sits in the first few hundred bytes; 64 KiB
+                # tolerates long licence/doc headers while still
+                # capping the read on a pathological file. f.read(n)
+                # actually bounds the READ — a post-hoc slice would
+                # materialise the whole file first.
+                with Path(qp).open(encoding="utf-8", errors="replace") as fh:
+                    ql_header = fh.read(65536)
+                for line in ql_header.split("\n"):  # line-model: RAPTOR-side query files; lines strip()-normalised
+                    stripped = line.strip().lstrip("*").strip()
+                    if stripped.startswith("@id "):
+                        at_id = stripped[4:].strip()
+                        if at_id:
+                            register_rule_id(at_id, qp)
+                        break
+            except OSError:
+                pass
+        for rule_id in ambiguous_rule_ids:
+            rule_to_qp.pop(rule_id, None)
+
+        matches_by_qp: dict[str, list[dict]] = {qp: [] for qp in unique_paths}
+        unattributed: list[dict] = []
+        for m in all_matches:
+            rid = m.get("rule", "")
+            target = rule_to_qp.get(rid)
+            if target is None and rid not in ambiguous_rule_ids and "/" in rid:
+                # ruleId may be qualified like "py/sql-injection"
+                target = rule_to_qp.get(rid.rsplit("/", 1)[-1])
+            if target is not None:
+                matches_by_qp[target].append(m)
+            else:
+                unattributed.append(m)
+
+        unattributed_error = ""
+        if unattributed:
+            unknown_rids = sorted({str(m.get("rule", "")) for m in unattributed})
+            unattributed_error = (
+                f"{len(unattributed)} batch result(s) could not be "
+                f"attributed to a query (ruleIds: {unknown_rids[:5]})"
+            )
+
+        results: dict[str, ToolEvidence] = {}
+        for qp in unique_paths:
+            qp_matches = matches_by_qp[qp]
+            if not qp_matches and unattributed:
+                # Any unattributed result could belong to this query, so
+                # a clean "no matches" (which downstream may grade as a
+                # refutation) is not supportable — report a tool failure
+                # instead. Queries with positively attributed matches
+                # keep their evidence.
+                results[qp] = ToolEvidence(
+                    tool=self.name, rule=qp, success=False,
+                    error=(
+                        f"{unattributed_error}; cannot distinguish "
+                        "'no matches' from misattribution for this query"
+                    ),
+                )
+                continue
+            n = len(qp_matches)
+            files = sorted({m["file"] for m in qp_matches if m.get("file")})
+            if n:
+                summary = f"{n} match{'es' if n != 1 else ''} in {len(files)} file{'s' if len(files) != 1 else ''}"
+            else:
+                summary = "no matches"
+            results[qp] = ToolEvidence(
+                tool=self.name,
+                rule=qp,
+                success=True,
+                matches=qp_matches,
+                summary=summary,
+            )
+
+        return results
+
     def run(
         self,
         rule: str,
         target: Path,
         *,
         timeout: int = 300,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
     ) -> ToolEvidence:
         """Run an LLM-generated .ql query against the configured database.
 
@@ -357,8 +653,12 @@ class CodeQLAdapter(ToolAdapter):
             )
 
         if env is None:
-            from core.config import RaptorConfig
-            env = RaptorConfig.get_safe_env()
+            # preserve_proxy: the `codeql pack install` step (which
+            # runs unsandboxed — see below) fetches dep packs from the
+            # registry; CodeQL's Java stack honours the lowercase
+            # https_proxy env var. The sandboxed analyze itself never
+            # needs the network.
+            env = RaptorConfig.get_safe_env(preserve_proxy=True)
 
         # codeql wants the .ql in a query pack alongside a qlpack.yml.
         # Generate both in a temp dir, then `codeql pack install` so that
@@ -368,22 +668,35 @@ class CodeQLAdapter(ToolAdapter):
         # use anything beyond the bare `import python` core fail to
         # compile.
         try:
-            with TemporaryDirectory(prefix="codeql_hv_") as tmp:
+            # Scratch (SARIF output, temp pack) lives INSIDE the
+            # database dir: the sandbox's only host-visible writable
+            # surface is `output` (the db) — the mount-ns backend
+            # gives the child a PRIVATE /tmp, so a workspace under
+            # the host /tmp would leave the SARIF invisible to the
+            # parent (and the temp pack's lockfile unwritable).
+            with TemporaryDirectory(
+                prefix="codeql_hv_", dir=str(self._database_path),
+            ) as tmp:
                 pack_dir = Path(tmp) / "hv-pack"
                 pack_dir.mkdir(parents=True, exist_ok=True)
                 query_file = pack_dir / "query.ql"
                 qlpack = pack_dir / "qlpack.yml"
 
-                query_file.write_text(rule)
-                qlpack.write_text(_qlpack_yaml(rule))
+                query_file.write_text(rule, encoding="utf-8")
+                qlpack.write_text(_qlpack_yaml(rule), encoding="utf-8")
 
                 # See note in run_prebuilt_query — `output=` is
                 # required so codeql can write to its IMB cache
-                # under `<db>/<lang>/default/cache/`.
+                # under `<db>/<lang>/default/cache/`, and
+                # fake_home=False keeps the real-HOME pack cache
+                # resolvable (restrict_reads still hides the rest
+                # of the home directory).
                 runner = (
                     make_sandbox_runner(
                         target=self._database_path,
                         output=self._database_path,
+                        fake_home=False,
+                        readable_paths=_codeql_user_state_paths(),
                     )
                     if self._sandbox else subprocess.run
                 )
@@ -392,17 +705,29 @@ class CodeQLAdapter(ToolAdapter):
                 # standard library packs the query may import).
                 # Cached after first run so subsequent invocations are
                 # fast. Failure here doesn't abort — the query may not
-                # need any external imports.
-                try:
-                    runner(
-                        [self._codeql_bin, "pack", "install", str(pack_dir)],
-                        capture_output=True, text=True,
-                        timeout=120, env=env,
-                    )
-                except Exception:
-                    # Pack install is best-effort. If the query has no
-                    # external imports it will still compile.
-                    pass
+                # need any external imports: exec/timeout failures are
+                # tolerated but logged, matching _ensure_pack_installed
+                # (the analyze step below fails loudly if the
+                # environment is truly broken).
+                # UNSANDBOXED (plain subprocess): the install reads the
+                # RAPTOR-generated qlpack.yml only — never the target
+                # code, and the LLM query is not evaluated — and it
+                # needs the registry (proxy env preserved above) to
+                # build the lockfile, which the sandbox's network block
+                # would deny. Only the analyze below, which executes
+                # the LLM query, runs sandboxed.
+                if not RaptorConfig.CODEQL_OFFLINE:
+                    try:
+                        subprocess.run(
+                            [self._codeql_bin, "pack", "install", str(pack_dir)],
+                            capture_output=True, text=True,
+                            timeout=120, env=env,
+                        )
+                    except (OSError, subprocess.SubprocessError) as e:
+                        logger.warning(
+                            "codeql pack install on %s failed: %s — analyze may fail with a clearer error",
+                            pack_dir, e,
+                        )
 
                 sarif_path = Path(tmp) / "result.sarif"
                 cmd = [
@@ -414,6 +739,7 @@ class CodeQLAdapter(ToolAdapter):
                     f"--output={sarif_path}",
                     "--no-rerun",
                 ]
+                CodeQLTunables.from_tuning().append_to(cmd, include_disk_cache=False)
                 try:
                     proc = runner(
                         cmd, capture_output=True, text=True,
@@ -444,6 +770,15 @@ class CodeQLAdapter(ToolAdapter):
                 error=f"workspace setup failed: {e}",
             )
 
+        if matches is None:
+            # Parse failure is a tool failure, never a default-refuted
+            # "no matches" — the runner grades success=False as
+            # inconclusive.
+            return ToolEvidence(
+                tool=self.name, rule=rule, success=False,
+                error="SARIF output unreadable (parse failure)",
+            )
+
         n = len(matches)
         files = sorted({m["file"] for m in matches if m.get("file")})
         if n:
@@ -468,10 +803,13 @@ def _qlpack_yaml(rule: str) -> str:
     matching dependencies are `codeql/<lang>-all`.
     """
     lang = "cpp"  # default for /audit's primary use case
-    for line in rule.splitlines()[:20]:
+    for line in splitlines_prefix(rule, 20):
         s = line.strip()
         if s.startswith("import "):
-            head = s.split()[1].split(".")[0].lower()
+            tokens = s.split()
+            if len(tokens) < 2:
+                continue
+            head = tokens[1].split(".")[0].lower()
             if head in {"cpp", "java", "python", "javascript", "go", "csharp", "ruby", "swift"}:
                 lang = head
                 break
@@ -479,34 +817,68 @@ def _qlpack_yaml(rule: str) -> str:
     return (
         "name: raptor/hv-pack\n"
         "version: 0.0.0\n"
-        f"library: false\n"
+        "library: false\n"
         "dependencies:\n"
         f"  codeql/{lang}-all: \"*\"\n"
     )
 
 
-def _parse_sarif(sarif_path: Path) -> List[Dict]:
-    """Extract matches from a CodeQL SARIF file."""
+def _parse_sarif(sarif_path: Path) -> list[dict] | None:
+    """Extract matches from a CodeQL SARIF file.
+
+    Returns ``None`` on read/parse/extraction failure or explicit run
+    incompleteness so the caller can report a tool failure — an empty list strictly means "the file
+    parsed and contained no results". Collapsing failures into ``[]``
+    made an unreadable SARIF indistinguishable from a genuine
+    no-matches run, which downstream graded as a refuted hypothesis.
+    The extraction loop is inside the guard too (adapters must not
+    raise; hostile SARIF can put non-numeric values where startLine
+    belongs).
+    """
+    # Bounded canonical loader (100 MiB stat gate before the read):
+    # the SARIF is CodeQL output over the analysed target, which can
+    # inflate it through paths and snippets. None-on-failure keeps
+    # the tool-failure contract distinct from genuine no-matches.
+    data = load_sarif(sarif_path)
+    if data is None:
+        logger.warning("codeql SARIF parse failed: %s", sarif_path)
+        return None
     try:
-        data = json.loads(sarif_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
-    matches: List[Dict] = []
-    for run in data.get("runs", []) or []:
-        for result in run.get("results", []) or []:
-            msg = result.get("message", {})
-            text = msg.get("text", "") if isinstance(msg, dict) else str(msg)
-            file = ""
-            line = 0
-            locs = result.get("locations", []) or []
-            if locs and isinstance(locs[0], dict):
-                phys = locs[0].get("physicalLocation", {})
-                file = (phys.get("artifactLocation", {}) or {}).get("uri", "")
-                line = int((phys.get("region", {}) or {}).get("startLine", 0))
-            matches.append({
-                "file": file,
-                "line": line,
-                "rule": result.get("ruleId", ""),
-                "message": text,
-            })
+        matches: list[dict] = []
+        runs = data.get("runs")
+        if not isinstance(runs, list):
+            raise ValueError("SARIF runs must be a list")
+        for run in runs:
+            if any(get_run_execution_diagnostics(run).values()):
+                raise ValueError("SARIF run reports incomplete or malformed execution")
+            results = run.get("results", [])
+            if not isinstance(results, list):
+                raise ValueError("SARIF results must be a list when present")
+            for result in results:
+                rule_id = result.get("ruleId", "")
+                if not isinstance(rule_id, str):
+                    raise ValueError("SARIF ruleId must be a string when present")
+                msg = result.get("message", {})
+                text = msg.get("text", "") if isinstance(msg, dict) else str(msg)
+                file = ""
+                line = 0
+                locs = result.get("locations", []) or []
+                if locs and isinstance(locs[0], dict):
+                    phys = locs[0].get("physicalLocation", {})
+                    file = (phys.get("artifactLocation", {}) or {}).get("uri", "")
+                    parsed_line = _coerce_line((phys.get("region", {}) or {}).get("startLine", 0))
+                    if parsed_line is None:
+                        raise ValueError("SARIF startLine must be an integer when present")
+                    line = parsed_line
+                if not isinstance(file, str):
+                    raise ValueError("SARIF artifact URI must be a string when present")
+                matches.append({
+                    "file": file,
+                    "line": line,
+                    "rule": rule_id,
+                    "message": text,
+                })
+    except Exception:  # noqa: BLE001 — adapter MUST-NOT-raise contract
+        logger.warning("codeql SARIF parse failed: %s", sarif_path)
+        return None
     return matches

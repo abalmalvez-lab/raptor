@@ -183,6 +183,115 @@ def test_rule_skips_untrustedblock_constructor(tmp_path):
     assert vs == []
 
 
+def test_rule_catches_messagepart_fstring(tmp_path):
+    """``MessagePart`` is a zero-sanitisation dataclass whose content
+    ships to the model verbatim — it is NOT an envelope-constructor
+    exemption, so f-string interpolation into its ``content`` fires."""
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import MessagePart\n"
+        "def f(finding):\n"
+        "    return MessagePart(role='user', content=f'{finding.message}')\n"
+    )
+    vs = audit_file(src)
+    assert any(v.attr == "message" for v in vs)
+
+
+def test_rule_catches_taintedstring_trusted_label(tmp_path):
+    """``TaintedString(value=f'{...}', trust='trusted')`` routes attacker
+    text through the light trusted-rendering path — it must fire."""
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import TaintedString\n"
+        "def f(finding):\n"
+        "    return TaintedString(value=f'{finding.message}', trust='trusted')\n"
+    )
+    vs = audit_file(src)
+    assert any(v.attr == "message" for v in vs)
+
+
+def test_rule_skips_taintedstring_untrusted_label(tmp_path):
+    """Only a literal ``trust='untrusted'`` exempts a TaintedString."""
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import TaintedString\n"
+        "def f(finding):\n"
+        "    return TaintedString(value=f'{finding.message}', trust='untrusted')\n"
+    )
+    assert audit_file(src) == []
+
+
+def test_rule_catches_taintedstring_nonliteral_trust(tmp_path):
+    """A trust label the AST can't prove is treated conservatively —
+    it fires and needs an explicit allowlist entry."""
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import TaintedString\n"
+        "def f(finding, label):\n"
+        "    return TaintedString(value=f'{finding.message}', trust=label)\n"
+    )
+    vs = audit_file(src)
+    assert any(v.attr == "message" for v in vs)
+
+
+def test_rule_catches_taintedstring_missing_trust(tmp_path):
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import TaintedString\n"
+        "def f(finding):\n"
+        "    return TaintedString(value=f'{finding.message}')\n"
+    )
+    vs = audit_file(src)
+    assert any(v.attr == "message" for v in vs)
+
+
+def test_rule_checks_taintedstring_positional_trust(tmp_path):
+    """The trust label may be passed positionally — both dataclass
+    fields are positional-or-keyword."""
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import TaintedString\n"
+        "def ok(finding):\n"
+        "    return TaintedString(f'{finding.message}', 'untrusted')\n"
+        "def bad(finding):\n"
+        "    return TaintedString(f'{finding.message}', 'trusted')\n"
+    )
+    vs = audit_file(src)
+    assert [v.func_name for v in vs] == ["bad"]
+
+
+def test_rule_checks_taintedstring_trust_on_percent_format(tmp_path):
+    """The trust-label check also applies on the ``.format()`` /
+    %-format paths, where the interpolation inside the constructor
+    kwarg is reached via the enclosing-constructor walk."""
+    from core.security.prompt_envelope_audit import audit_file
+
+    src = tmp_path / "fake_prompt_builder.py"
+    src.write_text(
+        "from core.security.prompt_envelope import TaintedString\n"
+        "def bad(finding):\n"
+        "    return TaintedString(value='x: %s' % finding.message,\n"
+        "                         trust='trusted')\n"
+        "def ok(finding):\n"
+        "    return TaintedString(value='x: %s' % finding.message,\n"
+        "                         trust='untrusted')\n"
+    )
+    vs = audit_file(src)
+    assert [v.func_name for v in vs] == ["bad"]
+
+
 def test_rule_skips_explicit_sanitisation(tmp_path):
     """Wrapping in ``neutralize_tag_forgery`` /
     ``_sanitize_for_prompt`` removes the violation."""
@@ -213,6 +322,33 @@ def test_rule_catches_lambda_fstring(tmp_path):
     assert len(vs) == 1
     assert vs[0].func_name == "A.<lambda>"
     assert vs[0].attr == "message"
+
+
+def test_rule_catches_method_call_wrapper(tmp_path):
+    """A bare method-call wrapper must NOT exempt the attribute —
+    pre-fix ``f"{finding.message.strip()}"`` returned no violation
+    (any ``.strip()``/``.upper()`` fully bypassed the lint, and the
+    sanitiser allowlist was dead code)."""
+    from core.security.prompt_envelope_audit import audit_file
+    src = tmp_path / "t.py"
+    src.write_text(
+        "def f(finding):\n"
+        "    return f'Analyse: {finding.message.strip()}'\n"
+    )
+    vs = audit_file(src)
+    assert any(v.attr == "message" for v in vs)
+
+
+def test_rule_skips_sanitised_then_method_call(tmp_path):
+    """Direction check: a KNOWN sanitiser terminates the walk, so
+    ``neutralize_tag_forgery(x.message).strip()`` stays exempt."""
+    from core.security.prompt_envelope_audit import audit_file
+    src = tmp_path / "t.py"
+    src.write_text(
+        "def f(finding):\n"
+        "    return f'{neutralize_tag_forgery(finding.message).strip()}'\n"
+    )
+    assert audit_file(src) == []
 
 
 def test_rule_catches_walrus_attr(tmp_path):
@@ -268,7 +404,8 @@ def test_update_allowlist_is_atomic_on_failure(tmp_path):
     """If the rewrite raises mid-way, no half-written file should
     remain on disk and the original audit module must be intact.
     Simulates failure by patching `render_allowlist` to throw."""
-    import shutil, inspect
+    import shutil
+    import inspect
     from unittest.mock import patch
     from core.security import prompt_envelope_audit as mod
     from core.security.prompt_envelope_audit import _update_allowlist_in_source
@@ -436,3 +573,56 @@ def test_render_allowlist_carries_existing_notes_and_emits_todo(tmp_path):
     out = render_allowlist([known, new], allowlist=allow)
     assert "markdown for disk, not LLM prompt" in out
     assert "TODO: audit_note required" in out
+
+
+class TestDictReadIdioms:
+    """RAPTOR findings are predominantly dicts: the dominant repo
+    idiom (finding["message"], finding.get("message")) and positional
+    .format() args evaded the lint entirely — a registered
+    dict-consuming builder passed the CI closure arm vacuously."""
+
+    @staticmethod
+    def _audit_snippet(tmp_path, body):
+        from core.security.prompt_envelope_audit import audit_file
+        src = tmp_path / "snippet.py"
+        src.write_text(body)
+        return audit_file(src)
+
+    def test_dict_subscript_read_flagged(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path, 'prompt = f"analyse: {finding[\'message\']}"\n')
+        assert [v.attr for v in vs] == ["message"]
+
+    def test_dict_get_read_flagged(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path, 'prompt = f"analyse: {finding.get(\'message\')}"\n')
+        assert [v.attr for v in vs] == ["message"]
+
+    def test_getattr_read_flagged(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path,
+            'prompt = f"analyse: {getattr(finding, \'message\')}"\n')
+        assert [v.attr for v in vs] == ["message"]
+
+    def test_format_positional_args_flagged(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path,
+            'prompt = "{} {}".format(finding.message, finding.snippet)\n')
+        assert sorted(v.attr for v in vs) == ["message", "snippet"]
+
+    def test_subscript_get_of_benign_key_not_flagged(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path,
+            'prompt = f"{finding[\'severity_rank\']} {finding.get(\'id\')}"\n')
+        assert vs == []
+
+    def test_sanitised_dict_read_not_flagged(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path,
+            'prompt = f"{neutralize_tag_forgery(finding[\'message\'])}"\n')
+        assert vs == []
+
+    def test_nonconstant_subscript_keeps_receiver_walk(self, tmp_path):
+        vs = self._audit_snippet(
+            tmp_path, 'prompt = f"{items[0].message}"\n')
+        assert [v.attr for v in vs] == ["message"]

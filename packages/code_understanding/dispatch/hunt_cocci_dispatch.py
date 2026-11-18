@@ -40,13 +40,17 @@ otherwise falls through to the default LLM dispatch.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-import re
-import tempfile
+import os
+import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
 from core.llm.config import ModelConfig
+from core.run.scratch import scratch_dir
+from core.source.streams import preserving_stream_error
 from core.llm.providers import create_provider
 from packages.coccinelle.models import SpatchResult
 from packages.coccinelle.runner import is_available as spatch_is_available
@@ -73,19 +77,33 @@ _C_FILE_EXTS: tuple[str, ...] = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh
 
 def repo_looks_c_cpp(repo_path: str, max_files_to_check: int = 200) -> bool:
     """Heuristic check that the repo has C/C++ source. Bounded scan
-    so giant repos don't pay a rglob walk to discover the obvious."""
+    so giant repos don't pay a full walk to discover the obvious.
+
+    Noise dirs (.git and other hidden dirs, node_modules, build
+    output) are pruned and never consume the file budget — a real C
+    repo whose walk order surfaces thousands of .git objects or
+    vendored JS first must not exhaust the cap before reaching its
+    first ``.c`` file and get refused as "no C/C++ source".
+    """
     p = Path(repo_path)
     if not p.is_dir():
         return False
+    skip_dirs = {
+        "node_modules", "__pycache__", "venv", "env",
+        "build", "dist", "target",
+    }
     seen = 0
-    for entry in p.rglob("*"):
-        if not entry.is_file():
-            continue
-        seen += 1
-        if entry.suffix.lower() in _C_FILE_EXTS:
-            return True
-        if seen >= max_files_to_check:
-            return False
+    for dirpath, dirnames, filenames in os.walk(p, followlinks=False):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in skip_dirs and not d.startswith(".")
+        )
+        for fn in sorted(filenames):
+            if Path(fn).suffix.lower() in _C_FILE_EXTS:
+                return True
+            seen += 1
+            if seen >= max_files_to_check:
+                return False
     return False
 
 
@@ -146,19 +164,35 @@ Example (for "find all strcpy calls"):
 """
 
 
-_RULE_FENCE_RE = re.compile(
-    r"```cocci\s*\n(.*?)```",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
 def _strip_fences(text: str) -> str:
     """Pull the rule text out of ```cocci ... ``` fences. If the model
-    returned plain text without fences, take the whole thing."""
-    m = _RULE_FENCE_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
+    returned plain text without fences, take the whole thing.
+
+    Find-based walk, match-identical to the lazy-DOTALL fence regex
+    it replaces (case-insensitive opener, whitespace run ending in a
+    newline, body up to the first later triple-backtick): the regex
+    re-scanned to end-of-text from every planted opener when the
+    closer was withheld — quadratic on model-produced text."""
+    lowered = text.lower()
+    pos = 0
+    while True:
+        opener = lowered.find("```cocci", pos)
+        if opener == -1:
+            return text.strip()
+        run_start = opener + len("```cocci")
+        run_end = run_start
+        while run_end < len(text) and text[run_end].isspace():
+            run_end += 1
+        newline = text.rfind("\n", run_start, run_end)
+        if newline == -1:
+            # No newline after the marker: not a fence opener.
+            pos = opener + 1
+            continue
+        close = text.find("```", newline + 1)
+        if close == -1:
+            # No closer anywhere later: no opener can match either.
+            return text.strip()
+        return text[newline + 1:close].strip()
 
 
 def translate_pattern_to_cocci_rule(
@@ -166,7 +200,7 @@ def translate_pattern_to_cocci_rule(
     *,
     model: ModelConfig,
     max_cost_usd: float = DEFAULT_RULE_GEN_MAX_COST_USD,
-) -> "Optional[str]":
+) -> str | None:
     """Single-turn LLM call: pattern → cocci rule text. Returns None
     when the model declared the pattern UNTRANSLATABLE (caller falls
     back to LLM-grep hunt or surfaces the reason)."""
@@ -180,11 +214,36 @@ def translate_pattern_to_cocci_rule(
         f"Translate this pattern into a Coccinelle .cocci rule:\n\n"
         f"{pattern}\n"
     )
+    # max_cost_usd enforcement for a one-shot call: the output side is
+    # bounded by max_tokens below; the input side is the pattern text,
+    # gated here by a size ceiling derived from the budget (≈4 chars
+    # per token at a conservative $10/Mtok input price) so a
+    # pathological pattern cannot bill unbounded input tokens against
+    # a knob that would otherwise be dead.
+    max_input_tokens = max(1_000, int(max_cost_usd / 10e-6))
+    if len(user_message) // 4 > max_input_tokens:
+        logger.warning(
+            "cocci_hunt: pattern (%d chars) exceeds the rule-gen "
+            "budget ($%.2f) input ceiling — skipping cocci translation",
+            len(user_message), max_cost_usd,
+        )
+        return None
     response = provider.generate(
         prompt=user_message,
         system_prompt=_RULE_GEN_SYSTEM,
         max_tokens=600,
     )
+    try:
+        actual_cost = float(getattr(response, "cost", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        actual_cost = 0.0  # provider gave no numeric cost — skip check
+    if actual_cost > max_cost_usd:
+        logger.warning(
+            "cocci_hunt: rule-gen call cost $%.4f exceeded its "
+            "$%.4f budget (single-shot call — spend is post-hoc "
+            "observable only)",
+            actual_cost, max_cost_usd,
+        )
     text = (getattr(response, "content", "") or "").strip()
     if not text:
         return None
@@ -208,13 +267,13 @@ def translate_pattern_to_cocci_rule(
 def _spatch_matches_to_variants(
     result: SpatchResult,
     repo_path: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Translate ``SpatchResult.matches`` into the variant-dict shape
     that ``VariantAdapter`` expects: file (relative to repo), line,
     function (best-effort empty unless the rule emitted it), snippet
     (the rule's emitted message), confidence."""
     repo = Path(repo_path).resolve()
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for m in result.matches:
         # Normalize file paths to repo-relative when we can. The
         # VariantAdapter's dedup key includes the file path; an
@@ -242,6 +301,78 @@ def _spatch_matches_to_variants(
 
 
 # ---------------------------------------------------------------------
+# Sandbox runner
+# ---------------------------------------------------------------------
+
+
+def _make_locked_sandbox_runner(
+    target: Path,
+    scratch_output: Path,
+    *,
+    caller_label: str = "understand-hunt-cocci",
+) -> Callable:
+    """Build a subprocess.run-shaped callable around ``core.sandbox.run``
+    with reads locked down and a fake $HOME.
+
+    ``restrict_reads=True`` limits reads to the system dirs, ``target``,
+    ``scratch_output``, and /tmp (where the rule file and spatch's
+    TMPDIR scratch live) — the real $HOME is unreadable. ``fake_home=True``
+    points HOME/XDG_*_HOME at an empty directory under ``scratch_output``
+    so a hostile rule finds no dotfiles to read even by path guess. A
+    spatch installed outside the system dirs (e.g. via opam under $HOME)
+    stays loadable through ``tool_paths``.
+
+    Fail-closed when ``core.sandbox`` is unimportable: raises
+    ``SandboxUnavailableError`` unless the operator explicitly opted
+    into ``RAPTOR_ALLOW_UNSANDBOXED_TOOLS=1`` (loud warning + security
+    event), in which case plain ``subprocess.run`` is returned.
+    """
+    try:
+        # Bind the module, not the function: the import failure is
+        # detected here (fail-closed BEFORE any tempfiles exist), while
+        # ``run`` itself is resolved per call so test seams can patch
+        # ``core.sandbox.run``.
+        from core import sandbox as core_sandbox  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001 — any import failure means no isolation
+        from core.run.sandbox_policy import require_sandbox_or_optout
+        require_sandbox_or_optout(f"{caller_label} (locked sandbox runner)", exc)
+
+        def _unsandboxed_runner(cmd, **kwargs):
+            # The opt-out waives the sandbox, never environment
+            # hygiene: spatch parses hostile target source and
+            # executes an LLM-emitted rule, and bare subprocess.run
+            # handed it the operator's FULL environment (tokens,
+            # GIT_* overrides). Same fix shape as the joern opt-out
+            # lane.
+            try:
+                from core.config import RaptorConfig
+                kwargs.setdefault("env", RaptorConfig.get_safe_env())
+            except ImportError:
+                pass
+            return subprocess.run(cmd, **kwargs)
+
+        return _unsandboxed_runner
+
+    def _runner(cmd, **kwargs):
+        sandbox_kwargs: dict[str, Any] = {
+            "block_network": True,
+            "target": str(target),
+            "output": str(scratch_output),
+            "restrict_reads": True,
+            "fake_home": True,
+            "caller_label": caller_label,
+            "env_caller_filtered": True,
+        }
+        exe = cmd[0] if cmd else ""
+        if exe and Path(exe).is_absolute():
+            sandbox_kwargs["tool_paths"] = [str(Path(exe).parent)]
+        sandbox_kwargs.update({k: v for k, v in kwargs.items() if k != "shell"})
+        return core_sandbox.run(cmd, **sandbox_kwargs)
+
+    return _runner
+
+
+# ---------------------------------------------------------------------
 # Dispatch entry point
 # ---------------------------------------------------------------------
 
@@ -253,9 +384,9 @@ def cocci_hunt_dispatch(
     *,
     rule_timeout_s: int = DEFAULT_RULE_TIMEOUT_S,
     rule_gen_max_cost_usd: float = DEFAULT_RULE_GEN_MAX_COST_USD,
-    spatch_runner: Optional[Callable] = None,
+    spatch_runner: Callable | None = None,
     sandbox: bool = True,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """``HuntDispatchFn`` implementation backed by Coccinelle.
 
     Same call shape as ``default_hunt_dispatch`` so the substrate's
@@ -264,18 +395,22 @@ def cocci_hunt_dispatch(
     key — substrate convention for ``failed_models`` capture.
 
     ``sandbox`` (default True) runs spatch through ``core.sandbox.run``
-    via ``make_sandbox_runner``. Critical: cocci rules CAN embed
-    ``script:python`` blocks that execute as part of the spatch
+    via ``_make_locked_sandbox_runner``. Critical: cocci rules CAN
+    embed ``script:python`` blocks that execute as part of the spatch
     process. The dispatch's rule text is LLM-emitted, and the LLM's
     pattern input is operator-influenced — combined, that's
-    arbitrary-code-exec inside the process invoking spatch. The
-    sandbox locks reads to ``target``, blocks network, and uses a
-    fake $HOME so even a compromised rule can't exfiltrate. Tests
-    pass ``sandbox=False`` for speed; production callers should
-    take the default. Falls back to plain ``subprocess.run`` on
-    hosts where the sandbox isn't available (non-Linux/macOS,
-    minimal containers) — degrade-not-fail. ``spatch_runner``
-    overrides everything (lets tests inject a fully-stubbed runner).
+    arbitrary-code-exec inside the process invoking spatch (the
+    coccinelle runner refuses script blocks by default; the sandbox is
+    the second layer). The sandbox locks reads to ``target`` (plus
+    system dirs and /tmp, where the rule file lives), blocks network,
+    and uses a fake $HOME so even a compromised rule can't exfiltrate.
+    Fail-closed: when ``core.sandbox`` is unavailable the dispatch
+    returns an error variant instead of degrading to an unlocked run —
+    hosts that accept unisolated execution opt in explicitly via
+    ``RAPTOR_ALLOW_UNSANDBOXED_TOOLS=1``. Tests pass ``sandbox=False``
+    for speed; production callers should take the default.
+    ``spatch_runner`` overrides everything (lets tests inject a
+    fully-stubbed runner).
     """
     if not isinstance(pattern, str) or not pattern.strip():
         return [{"error": "pattern must be a non-empty string"}]
@@ -320,65 +455,85 @@ def cocci_hunt_dispatch(
             "tool (CodeQL / IRIS) for taint-shaped patterns"
         )}]
 
-    # Step 2: write the rule to a temp file and hand it to spatch.
-    # The runner's harness auto-injection writes the harnessed
-    # text to its own tempfile when needed (fixed by the
-    # runner-fix PR).
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".cocci", delete=False,
-    ) as fh:
-        fh.write(rule_text)
-        rule_path = Path(fh.name)
-
     # Sandbox spatch by default — see docstring. Caller's explicit
-    # ``spatch_runner=`` wins (used by tests to inject mocks).
+    # ``spatch_runner=`` wins (used by tests to inject mocks). Built
+    # before the rule tempfile so failure here has nothing to clean up.
     effective_runner = spatch_runner
-    if effective_runner is None and sandbox:
+    with preserving_stream_error(contextlib.ExitStack()) as _scratch_stack:
+        if effective_runner is None and sandbox:
+            try:
+                # Writable scratch for the sandbox: hosts the fake $HOME
+                # (fake_home requires an output dir) and bounds Landlock's
+                # writable scope. Removed when the stack closes in the
+                # finally below; the raptor-cocci-hunt- prefix is listed in
+                # the tmp reaper's static tuple, so a SIGKILLed hunt
+                # strands nothing past the age floor.
+                scratch_output = _scratch_stack.enter_context(
+                    scratch_dir("raptor-cocci-hunt-"))
+                effective_runner = _make_locked_sandbox_runner(
+                    Path(repo_path), scratch_output,
+                )
+            except Exception as exc:  # noqa: BLE001 - fail closed, surface as error variant
+                return [{"error": (
+                    f"sandbox unavailable for spatch — refusing to run the "
+                    f"LLM-emitted rule unisolated: {type(exc).__name__}: {exc}"
+                )}]
+
+        # Step 2: write the rule to a temp file and hand it to spatch.
+        # The runner's harness auto-injection writes the harnessed
+        # text to its own tempfile when needed (fixed by the
+        # runner-fix PR).
+
+        from core.run.scratch import write_temp_text
+
+        rule_path = None
         try:
-            from packages.hypothesis_validation.adapters.base import (
-                make_sandbox_runner,
-            )
-            effective_runner = make_sandbox_runner(
+            rule_path = write_temp_text(rule_text, prefix="tmp", suffix=".cocci")
+            result: SpatchResult = spatch_run_rule(
                 target=Path(repo_path),
-                caller_label="understand-hunt-cocci",
+                rule=rule_path,
+                timeout=rule_timeout_s,
+                no_includes=True,  # operator targets are untrusted
+                subprocess_runner=effective_runner,
             )
-        except ImportError:
-            # hypothesis_validation isn't a hard dependency of
-            # /understand. If it's missing, fall back to unsandboxed
-            # plain subprocess.run via the runner's default. Log so
-            # operators can audit.
-            logger.warning(
-                "cocci_hunt: make_sandbox_runner unavailable; "
-                "spatch will run unsandboxed",
-            )
+        except Exception as exc:  # noqa: BLE001 - spatch wrapper failure
+            return [{"error": (
+                f"spatch invocation failed: {type(exc).__name__}: {exc}"
+            )}]
+        finally:
+            try:
+                if rule_path is not None:
+                    rule_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    try:
-        result: SpatchResult = spatch_run_rule(
-            target=Path(repo_path),
-            rule=rule_path,
-            timeout=rule_timeout_s,
-            no_includes=True,  # operator targets are untrusted
-            subprocess_runner=effective_runner,
-        )
-    except Exception as exc:  # noqa: BLE001 - spatch wrapper failure
-        return [{"error": (
-            f"spatch invocation failed: {type(exc).__name__}: {exc}"
-        )}]
-    finally:
-        try:
-            rule_path.unlink()
-        except OSError:
-            pass
-
-    if not result.ok and not result.matches:
-        # Nothing matched AND spatch reported errors — surface the
-        # error so the operator can refine the pattern. (Empty
-        # matches with rc=0 is a legitimate "no variants found"
-        # answer — return [] in that case.)
+    if not result.ok:
         err = "; ".join(result.errors)[:500] if result.errors else (
             f"spatch returncode {result.returncode}"
         )
-        return [{"error": f"cocci rule did not execute cleanly: {err}"}]
+        if not result.matches:
+            # Nothing matched AND spatch reported errors — surface the
+            # error so the operator can refine the pattern. (Empty
+            # matches with rc=0 is a legitimate "no variants found"
+            # answer — return [] in that case.)
+            return [{"error": f"cocci rule did not execute cleanly: {err}"}]
+        # Partial yield: the run errored (a file failed to parse, a
+        # per-file timeout hit, ...) but still produced matches.
+        # Swallowing the errors made the incomplete match set read as
+        # a complete answer — stamp each variant with a degradation
+        # note instead (extra keys ride variant dicts by contract; an
+        # appended error ENTRY would be stripped by the substrate's
+        # error filter and surface nowhere).
+        logger.warning(
+            "cocci hunt: rule did not execute cleanly; %d match(es) "
+            "may be a partial set: %s", len(result.matches), err,
+        )
+        variants = _spatch_matches_to_variants(result, repo_path)
+        for v in variants:
+            v["degradation"] = (
+                f"cocci rule did not execute cleanly: {err}; "
+                f"match set may be partial"
+            )
+        return variants
 
     return _spatch_matches_to_variants(result, repo_path)

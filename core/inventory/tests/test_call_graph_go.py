@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from core.testing.reachability_state import isolated_reachability_caches
+
 import pytest
 
 from core.inventory.call_graph import (
@@ -10,6 +12,17 @@ from core.inventory.call_graph import (
     INDIRECTION_WILDCARD_IMPORT,
     extract_call_graph_go,
 )
+
+
+@pytest.fixture(autouse=True)
+def _owned_reachability_caches(monkeypatch):
+    """Own inventory indexes while retaining warm caller state."""
+    with isolated_reachability_caches():
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
 
 
 pytest.importorskip("tree_sitter_go")
@@ -133,7 +146,7 @@ def test_resolver_matches_versioned_import_call():
     name ``github.com/foo/bar/v2.SomeFunc``. Without this
     heuristic, the call would resolve to nothing (``bar`` not in
     imports map → unresolved)."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_go(
         'package x\n'
@@ -153,7 +166,7 @@ def test_resolver_matches_versioned_import_call():
 def test_resolver_matches_hyphenated_import_call():
     """End-to-end: call to ``barutils.X()`` in a file importing
     ``github.com/foo/bar-utils`` resolves to ``bar-utils.X``."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_go(
         'package x\n'
@@ -367,7 +380,7 @@ def test_resolver_called_against_go_data():
     and returns CALLED for matching qualified names. Note: Go OSV
     symbols use the FULL module path (``net/http.HandlerFunc``)
     so the resolver matches against that."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_go(
         'package x\n'
@@ -387,7 +400,7 @@ def test_resolver_called_against_go_data():
 def test_resolver_uncertain_on_dot_import_with_tail_match():
     """File with dot import AND a bare-name call matching the
     target tail → UNCERTAIN."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_go(
         'package x\n'
@@ -408,7 +421,7 @@ def test_resolver_uncertain_on_dot_import_with_tail_match():
 
 
 def test_resolver_not_called_when_function_unused():
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_go(
         'package x\n'
@@ -442,3 +455,162 @@ def test_package_main_captured():
         'func main() {}\n'
     )
     assert g.package_name == "main"
+
+
+# ---------------------------------------------------------------------------
+# argument_identifiers extraction — load-bearing for downstream
+# function-as-argument registration detection (net/http, gin, echo).
+# Tests pin: bare identifiers captured, non-identifiers (strings,
+# composite literals, selectors, function literals) skipped, ordering
+# preserved.
+# ---------------------------------------------------------------------------
+
+
+def test_go_argument_identifiers_http_handlefunc():
+    g = extract_call_graph_go(
+        'package main\n'
+        'import "net/http"\n'
+        'func main() {\n'
+        '\thttp.HandleFunc("/x", handler)\n'
+        '}\n'
+    )
+    call = next(c for c in g.calls if c.chain[-1] == "HandleFunc")
+    assert call.argument_identifiers == ["handler"]
+
+
+def test_go_argument_identifiers_gin_get():
+    g = extract_call_graph_go(
+        'package main\n'
+        'func setup(r *gin.Engine) {\n'
+        '\tr.GET("/users", listUsers)\n'
+        '\tr.POST("/users", createUser)\n'
+        '}\n'
+    )
+    get_call = next(c for c in g.calls if c.chain[-1] == "GET")
+    post_call = next(c for c in g.calls if c.chain[-1] == "POST")
+    assert get_call.argument_identifiers == ["listUsers"]
+    assert post_call.argument_identifiers == ["createUser"]
+
+
+def test_go_argument_identifiers_multiple_with_middleware():
+    g = extract_call_graph_go(
+        'package main\n'
+        'func setup(r *gin.Engine) {\n'
+        '\tr.GET("/admin", authMW, adminPanel)\n'
+        '}\n'
+    )
+    call = next(c for c in g.calls if c.chain[-1] == "GET")
+    assert call.argument_identifiers == ["authMW", "adminPanel"]
+
+
+def test_go_argument_identifiers_skip_string_and_composite():
+    g = extract_call_graph_go(
+        'package main\n'
+        'func main() {\n'
+        '\thttp.HandleFunc("/x", handler)\n'
+        '}\n'
+    )
+    call = next(c for c in g.calls if c.chain[-1] == "HandleFunc")
+    # String literal "/x" filtered, only handler kept.
+    assert call.argument_identifiers == ["handler"]
+
+
+def test_go_argument_identifiers_skip_function_literal():
+    g = extract_call_graph_go(
+        'package main\n'
+        'func main() {\n'
+        '\thttp.HandleFunc("/x", func(w http.ResponseWriter, r *http.Request) {})\n'
+        '}\n'
+    )
+    call = next(c for c in g.calls if c.chain[-1] == "HandleFunc")
+    # Inline `func() {}` not an identifier — skipped.
+    assert call.argument_identifiers == []
+
+
+def test_go_argument_identifiers_skip_selector():
+    g = extract_call_graph_go(
+        'package main\n'
+        'func main() {\n'
+        '\thttp.HandleFunc("/x", svc.Handle)\n'
+        '}\n'
+    )
+    call = next(c for c in g.calls if c.chain[-1] == "HandleFunc")
+    # `svc.Handle` is a selector_expression, not a bare identifier.
+    assert call.argument_identifiers == []
+
+
+def test_go_argument_identifiers_empty_no_args():
+    g = extract_call_graph_go(
+        'package main\n'
+        'func main() {\n'
+        '\tinit()\n'
+        '}\n'
+    )
+    call = next(c for c in g.calls if c.chain == ["init"])
+    assert call.argument_identifiers == []
+
+
+def test_go_argument_identifiers_round_trips_via_dict():
+    """Schema round-trip: argument_identifiers survives
+    to_dict/from_dict serialisation."""
+    g = extract_call_graph_go(
+        'package main\n'
+        'func main() {\n'
+        '\thttp.HandleFunc("/x", handler)\n'
+        '}\n'
+    )
+    d = g.to_dict()
+    g2 = FileCallGraph.from_dict(d)
+    call = next(c for c in g2.calls if c.chain[-1] == "HandleFunc")
+    assert call.argument_identifiers == ["handler"]
+
+
+def test_go_prefixed_repo_binds_declared_package_name():
+    """go-<name> repos declare their package WITHOUT the prefix
+    (go-multierror → package multierror); without that alias every
+    direct call into such a package failed to resolve."""
+    g = extract_call_graph_go(
+        'package main\n'
+        'import "github.com/hashicorp/go-multierror"\n'
+        'func f(e error) { multierror.Append(e, nil) }\n'
+    )
+    assert g.imports.get("multierror") == "github.com/hashicorp/go-multierror"
+    # The literal and collapsed forms coexist with it.
+    assert "go-multierror" in g.imports
+    assert "gomultierror" in g.imports
+
+
+def test_go_prefixed_versioned_module_binds_stripped_form():
+    g = extract_call_graph_go(
+        'package main\n'
+        'import "github.com/foo/go-bar-utils/v2"\n'
+        'func f() { barutils.Do() }\n'
+    )
+    assert g.imports.get("barutils") == "github.com/foo/go-bar-utils/v2"
+
+
+def test_dot_versioned_module_binds_pre_dot_segment():
+    """gopkg.in-style dot-versioned paths (``gopkg.in/yaml.v2``)
+    declare the pre-version package name — call sites read
+    ``yaml.Unmarshal``, so the bare import must bind ``yaml``
+    alongside the literal segment."""
+    g = extract_call_graph_go(
+        'package x\nimport "gopkg.in/yaml.v2"\n'
+        'func f(b []byte) { var v any; yaml.Unmarshal(b, &v) }\n'
+    )
+    assert g.imports.get("yaml") == "gopkg.in/yaml.v2"
+    assert g.imports.get("yaml.v2") == "gopkg.in/yaml.v2"
+
+
+def test_dot_versioned_binding_names_include_hyphen_aliases():
+    """The dot-version alias composes with the hyphen conventions
+    (``gopkg.in/src-d/go-git.v4`` → ``go-git`` → ``git`` /
+    ``gogit``), pure-function level so the rule is pinned without
+    the grammar wheel."""
+    from core.inventory.call_graph import _go_bare_binding_names
+    names = _go_bare_binding_names("gopkg.in/yaml.v2")
+    assert "yaml" in names
+    names = _go_bare_binding_names("gopkg.in/src-d/go-git.v4")
+    assert {"go-git", "git", "gogit"} <= set(names)
+    # The literal segment stays first — first-import-wins contract.
+    assert _go_bare_binding_names("gopkg.in/yaml.v2")[0] == "yaml.v2"

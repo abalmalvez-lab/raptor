@@ -8,12 +8,21 @@ the mechanics (threading, progress, cost, errors).
 import json
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import Any
 
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import ModelDefenseProfile, system_with_priming
+from core.run.finding_status import read_verdict
 
+from .correlation import tally_verdict_votes
 from .dispatch import DispatchTask
+
+# Canonical SCA-dispatch predicates live in finding_kinds (shared with
+# the prompt builders so the copies can't drift). The local underscore
+# names remain this module's documented seam — tests and in-module
+# call sites import them from here.
+from .finding_kinds import is_sca_finding as _is_sca_finding
+from .finding_kinds import is_sca_vuln_finding as _is_sca_vuln_finding
 from .prompts import (
     ANALYSIS_SYSTEM_PROMPT,
     ANALYSIS_TASK_INSTRUCTIONS,
@@ -34,7 +43,8 @@ def _user_message_from_bundle(bundle) -> str:
     for m in bundle.messages:
         if m.role == "user":
             return m.content
-    raise AssertionError("bundle has no user message")
+    msg = "bundle has no user message"
+    raise AssertionError(msg)
 
 
 def _analysis_system_text(profile: ModelDefenseProfile = CONSERVATIVE) -> str:
@@ -64,8 +74,19 @@ class AnalysisTask(DispatchTask):
     name = "analysis"
     model_role = "analysis"
 
-    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE):
+    def __init__(
+        self,
+        profile: ModelDefenseProfile = CONSERVATIVE,
+        *,
+        allow_unreachable: bool = False,
+    ) -> None:
         self.profile = profile
+        # Operator's --allow-unreachable; threaded into the prompt
+        # builder so the system message switches from "engagement
+        # required" to "informational only" Stage C text. The
+        # substrate-side enricher skip is independent — that runs
+        # in the reachability pre-pass before AnalysisTask exists.
+        self.allow_unreachable = bool(allow_unreachable)
         self._tls = threading.local()
 
     def get_models(self, role_resolution):
@@ -76,7 +97,16 @@ class AnalysisTask(DispatchTask):
         return [model] if model else []
 
     def build_prompt(self, finding):
-        bundle = build_analysis_prompt_bundle_from_finding(finding, profile=self.profile)
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
+        )
+        si_blocks = evidence_blocks_for_finding(finding)
+        budget = getattr(self._tls_budget, "tokens", 0) if hasattr(self, "_tls_budget") else 0
+        bundle = build_analysis_prompt_bundle_from_finding(
+            finding, profile=self.profile, extra_blocks=tuple(si_blocks),
+            allow_unreachable=self.allow_unreachable,
+            budget_tokens=budget,
+        )
         self._tls.nonce = bundle.nonce
         return _user_message_from_bundle(bundle)
 
@@ -92,6 +122,9 @@ class AnalysisTask(DispatchTask):
     def get_system_prompt(self):
         return _analysis_system_text(self.profile)
 
+    def budget_tokens_for_model(self, model) -> int:
+        return _budget_for_task(self, model)
+
     def process_result(self, item, result):
         out = super().process_result(item, result)
         from packages.cvss import score_finding
@@ -99,17 +132,55 @@ class AnalysisTask(DispatchTask):
         return out
 
 
+def _budget_for_task(task, model) -> int:
+    from core.llm.prompt_budget import context_budget_for_model
+
+    name = getattr(model, "model_name", None) if model else None
+    sys_text = task.get_system_prompt() or ""
+    sys_tokens = len(sys_text) // 4
+    return context_budget_for_model(name or "fallback", sys_tokens)
+
+
+
+
+def _sca_exploit_priority(f: dict) -> float:
+    """Score an SCA finding for exploit-target ranking (higher = better target)."""
+    sca = f.get("sca", {})
+    score = 0.0
+    if sca.get("in_kev"):
+        score += 50.0
+    epss = sca.get("epss")
+    if epss is not None:
+        try:
+            score += float(epss) * 30.0
+        except (ValueError, TypeError):
+            pass
+    reach = sca.get("reachability", "not_evaluated")
+    if reach == "likely_called":
+        score += 20.0
+    elif reach == "imported":
+        score += 10.0
+    cvss = sca.get("cvss_score")
+    if cvss is not None:
+        try:
+            score += float(cvss)
+        except (ValueError, TypeError):
+            pass
+    return score
+
+
+
 class ExploitTask(DispatchTask):
     """Exploit PoC generation for exploitable findings."""
 
     name = "exploit"
-    model_role = "code"
+    model_role = "exploit"
     temperature = 0.8
     budget_cutoff = 0.85
 
     _SCA_REACHABILITY_FOR_EXPLOIT = ("likely_called", "imported")
 
-    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE):
+    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE) -> None:
         self.profile = profile
         self._tls = threading.local()
 
@@ -120,22 +191,49 @@ class ExploitTask(DispatchTask):
             prior = prior_results.get(fid, {})
             if prior.get("exploit_code"):
                 continue
-            if prior.get("is_exploitable"):
+            if read_verdict(prior, "is_exploitable") is True:
                 selected.append(f)
                 continue
-            # SCA findings: select if reachable or KEV-listed
-            if f.get("rule_id", "").startswith("sca:vulnerable_dependency"):
+            # SCA findings: select if reachable or KEV-listed.
+            # ``_is_sca_vuln_finding`` is the narrower predicate —
+            # only ``sca:vulnerable_dependency`` matches; hygiene /
+            # license / supply-chain SCA findings are SCA-shaped
+            # but not exploit-PoC targets.
+            if _is_sca_vuln_finding(f):
                 sca = f.get("sca", {})
                 reachability = sca.get("reachability", "")
                 in_kev = sca.get("in_kev", False)
-                if reachability in self._SCA_REACHABILITY_FOR_EXPLOIT:
+                if reachability in self._SCA_REACHABILITY_FOR_EXPLOIT or (in_kev and reachability != "not_reachable"):
                     selected.append(f)
-                elif in_kev and reachability != "not_reachable":
-                    selected.append(f)
+        # Highest-priority SCA findings first so a budget-cutoff
+        # truncation upstream catches the most-actionable rows.
+        # Code-shaped findings keep priority 0 (the score helper
+        # only adds for SCA fields), so they sort below SCA hits
+        # — acceptable: code findings already came in with
+        # ``is_exploitable=True`` from prior_results, meaning
+        # they've been pre-validated and don't need re-ranking
+        # here.
+        selected.sort(
+            key=lambda f: _sca_exploit_priority(f) if _is_sca_finding(f) else 0,
+            reverse=True,
+        )
         return selected
 
     def build_prompt(self, finding):
-        bundle = build_exploit_prompt_bundle_from_finding(finding, profile=self.profile)
+        # Phase D: inject source_intel structural evidence for
+        # memory-corruption findings so the exploit generator sees the
+        # same structural context the analysis step saw (allocations,
+        # hazards, sanitizer-shaped sites). Returns () for irrelevant
+        # rule_ids — no LLM-cost overhead on non-target findings.
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
+        )
+        si_blocks = evidence_blocks_for_finding(finding)
+        budget = getattr(self._tls_budget, "tokens", 0) if hasattr(self, "_tls_budget") else 0
+        bundle = build_exploit_prompt_bundle_from_finding(
+            finding, profile=self.profile, extra_blocks=tuple(si_blocks),
+            budget_tokens=budget,
+        )
         self._tls.nonce = bundle.nonce
         return _user_message_from_bundle(bundle)
 
@@ -148,7 +246,10 @@ class ExploitTask(DispatchTask):
     def get_system_prompt(self):
         return _exploit_system_text(self.profile)
 
-    def get_schema(self, finding):
+    def budget_tokens_for_model(self, model) -> int:
+        return _budget_for_task(self, model)
+
+    def get_schema(self, finding) -> None:
         return None
 
     def finalize(self, results, prior_results):
@@ -166,33 +267,72 @@ class PatchTask(DispatchTask):
     """Secure patch generation for exploitable findings."""
 
     name = "patch"
-    model_role = "code"
+    model_role = "exploit"
     temperature = 0.3
     budget_cutoff = 0.85
 
-    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE):
+    def __init__(
+        self,
+        profile: ModelDefenseProfile = CONSERVATIVE,
+        checkers_dir: Any | None = None,
+    ) -> None:
         self.profile = profile
         self._tls = threading.local()
+        # Optional run-dir ``checkers/`` path so the gate can replay
+        # synthesized checkers; None degrades to registry-cache-only
+        # detector resolution.
+        self.checkers_dir = checkers_dir
+        # Populated by select_items; finalize's patch gate needs the
+        # full finding dicts, which its result records don't carry.
+        self._findings_by_id: dict[str, Any] = {}
+        # Finding ids whose stored ``patch_gate`` was produced by THIS
+        # task's gate run. The merge step consults this side-channel
+        # (not the result dict, which is LLM-derived and forgeable) to
+        # decide whether a record's gate annotations are trustworthy
+        # or the patch still needs gating (inline CC-schema patches).
+        self.gated_ids: set[str] = set()
 
     def select_items(self, findings, prior_results):
+        # Index the full finding dicts for finalize's patch gate —
+        # finalize only receives result records, which lack the
+        # file/line/repo context the gate anchors on. select_items
+        # always runs before dispatch (dispatch.py dispatch_task), so
+        # the index is in place by finalize time.
+        self._findings_by_id = {
+            f.get("finding_id", ""): f for f in findings
+        }
         selected = []
         for f in findings:
             fid = f.get("finding_id", "")
             prior = prior_results.get(fid, {})
             if prior.get("patch_code"):
                 continue
-            if prior.get("is_exploitable"):
+            if read_verdict(prior, "is_exploitable") is True:
                 selected.append(f)
                 continue
-            # SCA findings with a known fix version get a manifest patch
-            if f.get("rule_id", "").startswith("sca:vulnerable_dependency"):
+            # SCA findings with a known fix version get a manifest patch.
+            # Narrower than ``_is_sca_finding`` because hygiene /
+            # license / supply-chain findings aren't patch-targets
+            # even though they're SCA-shaped.
+            if _is_sca_vuln_finding(f):
                 sca = f.get("sca", {})
                 if sca.get("fixed_version"):
                     selected.append(f)
         return selected
 
     def build_prompt(self, finding):
-        bundle = build_patch_prompt_bundle_from_finding(finding, profile=self.profile)
+        # Phase D: inject source_intel structural evidence so the
+        # patch generator sees the structural context (allocations,
+        # hazards, sanitizer-shaped sites) when crafting a fix.
+        # Returns () for irrelevant rule_ids — no LLM-cost overhead
+        # on non-target findings.
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
+        )
+        si_blocks = evidence_blocks_for_finding(finding)
+        bundle = build_patch_prompt_bundle_from_finding(
+            finding, profile=self.profile, extra_blocks=si_blocks,
+        )
         self._tls.nonce = bundle.nonce
         return _user_message_from_bundle(bundle)
 
@@ -205,7 +345,7 @@ class PatchTask(DispatchTask):
     def get_system_prompt(self):
         return _patch_system_text(self.profile)
 
-    def get_schema(self, finding):
+    def get_schema(self, finding) -> None:
         return None
 
     def finalize(self, results, prior_results):
@@ -216,7 +356,102 @@ class PatchTask(DispatchTask):
                 if content:
                     prior_results[fid]["patch_code"] = content
                     prior_results[fid]["has_patch"] = True
+                    # Mechanical patch gate — same annotate-only
+                    # posture as agent.generate_patch: a gate crash
+                    # degrades to a warning and the patch is kept.
+                    gate = self._gate_patch(fid, content)
+                    if gate is not None:
+                        prior_results[fid]["patch_gate"] = gate
+                        r["patch_gate"] = gate
+                        self.gated_ids.add(fid)
         return results
+
+    def _gate_patch(self, fid: str, content: str) -> dict | None:
+        """Run the mechanical patch gate over one accepted patch.
+
+        Returns the ``GateResult.to_dict()`` annotations, or None when
+        the gate itself failed (never blocks the save). Findings in
+        this flow carry ``repo_path`` (stamped by the orchestrator
+        before dispatch); flows that genuinely lack file or span
+        context get honest ``skipped`` annotations from the gate
+        rather than a guessed scope anchor.
+        """
+        finding = self._findings_by_id.get(fid) or {}
+        try:
+            from pathlib import Path
+
+            from packages.llm_analysis.patch_gate import run_patch_gate
+
+            repo_path = finding.get("repo_path") or ""
+            file_path = finding.get("file_path") or ""
+            try:
+                start_line = int(finding.get("start_line") or 0)
+            except (TypeError, ValueError):
+                start_line = 0
+            try:
+                end_line = int(finding.get("end_line") or start_line)
+            except (TypeError, ValueError):
+                end_line = start_line
+            if not repo_path:
+                # No repo anchor at all — only the format check is
+                # meaningful; run_patch_gate handles the empty
+                # file_path case the same way.
+                file_path = ""
+                repo_path = "."
+            checkers_dir = (
+                Path(self.checkers_dir) if self.checkers_dir else None
+            )
+            gate = run_patch_gate(
+                content,
+                repo_path=Path(repo_path),
+                file_path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+                rule_id=finding.get("rule_id") or "",
+                tool=finding.get("tool") or "",
+                checkers_dir=checkers_dir,
+            )
+            logger.info(
+                "   · Patch gate (%s): format=%s scope=%s detector=%s "
+                "control=%s",
+                fid, gate.format, gate.scope, gate.detector, gate.control,
+            )
+            return gate.to_dict()
+        except Exception as e:  # noqa: BLE001 — gate is annotate-only
+            logger.warning("   · Patch gate skipped for %s: %s", fid, e)
+            return None
+
+
+# Override-stage snapshots of the primary analyst's own
+# ``is_exploitable`` conclusion, EARLIEST first. Two pipeline stages
+# mutate the field in place — the cross-family conservative override
+# (CrossFamilyCheckTask.finalize) and the consensus majority
+# (ConsensusTask.finalize) — and each snapshots the pre-override value
+# once, idempotently, before writing. Any consumer that renders or
+# tallies "the primary's vote" must read the earliest snapshot
+# present: reading the raw field one stage downstream re-creates the
+# structurally-impossible-critique defect (a judge shown an override
+# as the analyst's own conclusion, minting "agreed" corroboration for
+# a verdict no analyst produced) one hop later.
+_PRIMARY_SNAPSHOT_KEYS: tuple[str, ...] = (
+    "pre_crossfamily_is_exploitable",
+    "pre_consensus_is_exploitable",
+)
+
+
+def primary_verdict_snapshot(primary: dict) -> bool | None:
+    """The primary analyst's own tri-state ``is_exploitable`` verdict.
+
+    Earliest override-stage snapshot when one exists, else the
+    current field through ``read_verdict`` (tri-state: only a genuine
+    bool is a vote). Snapshot values are RAPTOR-written tri-states;
+    a non-bool snapshot reads as abstention, same as ``read_verdict``.
+    """
+    for key in _PRIMARY_SNAPSHOT_KEYS:
+        if key in primary:
+            value = primary[key]
+            return value if isinstance(value, bool) else None
+    return read_verdict(primary, "is_exploitable")
 
 
 class ConsensusTask(DispatchTask):
@@ -226,7 +461,7 @@ class ConsensusTask(DispatchTask):
     model_role = "consensus"
     budget_cutoff = 0.70
 
-    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE):
+    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE) -> None:
         self.profile = profile
         self._tls = threading.local()
 
@@ -261,7 +496,15 @@ class ConsensusTask(DispatchTask):
         return selected
 
     def build_prompt(self, finding):
-        bundle = build_analysis_prompt_bundle_from_finding(finding, profile=self.profile)
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
+        )
+        si_blocks = evidence_blocks_for_finding(finding)
+        budget = getattr(self._tls_budget, "tokens", 0) if hasattr(self, "_tls_budget") else 0
+        bundle = build_analysis_prompt_bundle_from_finding(
+            finding, profile=self.profile, extra_blocks=tuple(si_blocks),
+            budget_tokens=budget,
+        )
         self._tls.nonce = bundle.nonce
         return _user_message_from_bundle(bundle)
 
@@ -277,6 +520,9 @@ class ConsensusTask(DispatchTask):
     def get_system_prompt(self):
         return _analysis_system_text(self.profile)
 
+    def budget_tokens_for_model(self, model) -> int:
+        return _budget_for_task(self, model)
+
     def finalize(self, results, prior_results):
         """Apply verdict rules across analysis + consensus results.
 
@@ -284,7 +530,7 @@ class ConsensusTask(DispatchTask):
         - 1 consensus model: flag disagreement but preserve primary verdict
         - 2+ consensus models: majority across primary + all consensus
         """
-        consensus_by_finding: Dict[str, List[Dict]] = {}
+        consensus_by_finding: dict[str, list[dict]] = {}
         for r in results:
             fid = r.get("finding_id")
             if fid and "error" not in r:
@@ -296,12 +542,61 @@ class ConsensusTask(DispatchTask):
                 if not consensus_analyses:
                     continue
 
-                primary_exploitable = primary.get("is_exploitable", False)
-                verdicts = [primary_exploitable]
-                for ca in consensus_analyses:
-                    verdicts.append(ca.get("is_exploitable", False))
+                # Tri-state read of the analyst's OWN verdict: the
+                # earliest override-stage snapshot when the
+                # cross-family conservative override already mutated
+                # the raw field (reading the raw field tallied the
+                # CHECKER's opinion as "the primary's vote" and froze
+                # it into the pre-consensus audit snapshot), else
+                # read_verdict — an abstained primary is recorded as
+                # None, not fabricated into an explicit False.
+                primary_exploitable = primary_verdict_snapshot(primary)
+                # Shared abstention-aware tally (see correlation.py):
+                # missing/null is_exploitable — an errored / refused /
+                # schema-failed model — is an abstention, never a
+                # "not exploitable" vote. Pre-fix `.get(..., False)`
+                # let two malformed consensus responses out-vote a
+                # clean primary "exploitable" verdict 2-1.
+                panel = tally_verdict_votes(
+                    ca.get("is_exploitable") for ca in consensus_analyses
+                )
+                # The primary's tally feed is the PARSED tri-state
+                # value, matching the stamp decision below: feeding
+                # the raw field let a junk shape ("true") cast a
+                # coerced, DECISIVE vote on rows the stamp then
+                # certified as the panel's own verdict — and made
+                # this surface diverge from JudgeTask, whose
+                # abstained-primary branch never lets the primary
+                # influence the outcome.
+                tally = tally_verdict_votes(
+                    [primary_exploitable]
+                    + [ca.get("is_exploitable") for ca in consensus_analyses]
+                )
 
-                disputed = not all(v == verdicts[0] for v in verdicts)
+                disputed = tally.disputed
+                # The primary cast NO vote (missing/null
+                # is_exploitable — errored / refused / schema-nulled,
+                # or a junk shape, which is a non-verdict either way).
+                # Snapshot BEFORE the verdict override below so the
+                # stamp decision reads the analyst's actual state.
+                primary_abstained = primary_exploitable is None
+
+                if panel.voted == 0:
+                    # The whole consensus panel abstained — no second
+                    # opinion exists. Mark the stage outcome
+                    # explicitly and leave the primary verdict
+                    # untouched: "agreed" here would let errored
+                    # consensus responses mint corroboration
+                    # (dataflow_validation reads consensus=="agreed"
+                    # as agreement evidence).
+                    primary["consensus"] = "no-verdict"
+                    primary["consensus_analyses"] = [
+                        {"model": ca.get("analysed_by", "?"),
+                         "is_exploitable": ca.get("is_exploitable"),
+                         "reasoning": ca.get("reasoning", "")}
+                        for ca in consensus_analyses
+                    ]
+                    continue
 
                 n_consensus = len(consensus_analyses)
                 if n_consensus == 1:
@@ -320,11 +615,38 @@ class ConsensusTask(DispatchTask):
                     # verdict and flags `cross_family_disputed`")
                     # so consensus and cross-family handle
                     # disputes the same way.
-                    final = any(verdicts)  # True if any voter says exploitable
+                    final = tally.any_exploitable()
                 else:
-                    final = sum(1 for v in verdicts if v) > len(verdicts) / 2
+                    majority = tally.majority()
+                    # Tied vote (possible once abstainers are
+                    # excluded, or with an even voter count): no
+                    # majority exists — apply the same conservative-
+                    # max rule as the 1-vote dispute above, so a
+                    # tie is surfaced as exploitable-for-review
+                    # rather than silently resolved against the
+                    # finding.
+                    final = (tally.any_exploitable() if majority is None
+                             else majority)
 
-                primary["consensus"] = "disputed" if disputed else "agreed"
+                if primary_abstained:
+                    # A one-sided pair: the primary never voted, so
+                    # there is nothing to "agree" with — that stamp
+                    # would mint corroboration downstream
+                    # (reconcile_dataflow_validation reads
+                    # consensus=="agreed" as "two strong signals
+                    # support the original verdict" and takes the
+                    # SOFT downgrade path; the operator summary
+                    # counts it as agreement). The panel's verdict
+                    # stands on its own authority instead — same
+                    # stamp semantics as JudgeTask.finalize's
+                    # primary_abstained branch below.
+                    primary["consensus"] = (
+                        "disputed" if panel.disputed else "panel-verdict"
+                    )
+                else:
+                    primary["consensus"] = (
+                        "disputed" if disputed else "agreed"
+                    )
                 # Capture pre-consensus verdict before overriding,
                 # so JudgeTask (which runs AFTER consensus) can show
                 # the judge what the primary analyst actually
@@ -368,7 +690,7 @@ class JudgeTask(DispatchTask):
         "If you disagree, explain what was missed or incorrect."
     )
 
-    def __init__(self, results_by_id=None, profile: ModelDefenseProfile = CONSERVATIVE):
+    def __init__(self, results_by_id=None, profile: ModelDefenseProfile = CONSERVATIVE) -> None:
         self.results_by_id = results_by_id or {}
         self.profile = profile
         self._tls = threading.local()
@@ -383,7 +705,13 @@ class JudgeTask(DispatchTask):
             r = prior_results.get(fid, {"error": True})
             if "error" in r:
                 continue
-            if not r.get("is_true_positive", True):
+            # Only an EXPLICIT False skips the judge. Response
+            # validation nulls a missing/malformed is_true_positive
+            # (an abstention, not a verdict); a truthiness check read
+            # that None as "false positive" and silently dropped from
+            # the judge panel exactly the malformed-response findings
+            # that most need a second opinion.
+            if read_verdict(r, "is_true_positive") is False:
                 continue
             if r.get("cross_family_agreed"):
                 continue
@@ -392,23 +720,32 @@ class JudgeTask(DispatchTask):
 
     def build_prompt(self, finding):
         from core.security.prompt_envelope import UntrustedBlock
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
+        )
 
         fid = finding.get("finding_id")
         primary = self.results_by_id.get(fid, {})
         primary_reasoning = (primary.get("reasoning") or "")[:2000]
-        # Use pre-consensus verdict if ConsensusTask ran first
-        # and stored it. Pre-fix `primary.get("is_exploitable")`
-        # showed the post-consensus value to the judge, making it
-        # structurally impossible for the judge to critique the
-        # primary analyst's ORIGINAL conclusion on any finding
-        # consensus had touched.
-        primary_verdict = primary.get(
-            "pre_consensus_is_exploitable",
-            primary.get("is_exploitable", "unknown"),
+        # The EARLIEST override-stage snapshot (cross-family, then
+        # consensus), else the raw field. Pre-fix
+        # `primary.get("is_exploitable")` showed the post-consensus
+        # value to the judge, making it structurally impossible for
+        # the judge to critique the primary analyst's ORIGINAL
+        # conclusion on any finding consensus had touched — and the
+        # pre-consensus-only read recreated the same defect one stage
+        # earlier for cross-family-overridden findings.
+        primary_verdict: bool | None | str = primary_verdict_snapshot(
+            primary,
         )
+        if primary_verdict is None:
+            # Abstained primary (schema-nulled verdict or a None
+            # pre-consensus snapshot): show the judge "unknown", not
+            # a Python None the model could misread as a verdict.
+            primary_verdict = "unknown"
         primary_ruling = primary.get("ruling", "unknown")
 
-        extra_blocks = (
+        extra_blocks: tuple[UntrustedBlock, ...] = (
             UntrustedBlock(
                 content=(
                     f"Primary verdict: is_exploitable={primary_verdict}, "
@@ -417,10 +754,14 @@ class JudgeTask(DispatchTask):
                 kind="primary-analysis-reasoning",
                 origin=f"judge:{fid}",
             ),
-        )
+        ) + evidence_blocks_for_finding(finding)
 
+        budget = getattr(self._tls_budget, "tokens", 0) if hasattr(self, "_tls_budget") else 0
         bundle = build_analysis_prompt_bundle_from_finding(
-            finding, profile=self.profile, extra_blocks=extra_blocks,
+            finding,
+            profile=self.profile,
+            extra_blocks=tuple(extra_blocks),
+            budget_tokens=budget,
         )
         self._tls.nonce = bundle.nonce
         return _user_message_from_bundle(bundle)
@@ -437,9 +778,13 @@ class JudgeTask(DispatchTask):
     def get_system_prompt(self):
         return _analysis_system_text(self.profile) + self._JUDGE_ADDENDUM
 
+    def budget_tokens_for_model(self, model) -> int:
+        return _budget_for_task(self, model)
+
     def finalize(self, results, prior_results):
-        """Apply judge verdicts: preserve primary (single), majority (multi)."""
-        judge_by_finding: Dict[str, List[Dict]] = {}
+        """Apply judge verdicts: preserve primary (single), majority
+        (multi); when the primary abstained, the panel verdict stands."""
+        judge_by_finding: dict[str, list[dict]] = {}
         for r in results:
             fid = r.get("finding_id")
             if fid and "error" not in r:
@@ -451,27 +796,109 @@ class JudgeTask(DispatchTask):
                 if not judge_analyses:
                     continue
 
-                primary_exploitable = primary.get("is_exploitable", False)
-                verdicts = [primary_exploitable]
-                for ja in judge_analyses:
-                    verdicts.append(ja.get("is_exploitable", False))
+                # Tri-state read of the analyst's OWN verdict — same
+                # earliest-snapshot rule as the consensus stage above
+                # (the raw field here carries the consensus/cross-
+                # family override; feeding it as "the primary's vote"
+                # double-counts the earlier panel's opinion in this
+                # tally and mislabels agreed/disputed) — and the same
+                # no-fabrication rule (junk is not a vote).
+                primary_exploitable = primary_verdict_snapshot(primary)
+                # Shared abstention-aware tally (see correlation.py):
+                # missing/null is_exploitable is an abstention, never
+                # a "not exploitable" vote — pre-fix a schema-failed
+                # judge response counted as a negative majority vote
+                # and could flip a real exploitable verdict.
+                panel = tally_verdict_votes(
+                    ja.get("is_exploitable") for ja in judge_analyses
+                )
+                # Same parsed-primary tally feed as the consensus
+                # stage: the primary's vote is the tri-state value
+                # the abstention snapshot below reads, never the raw
+                # field (a junk shape is not a vote).
+                tally = tally_verdict_votes(
+                    [primary_exploitable]
+                    + [ja.get("is_exploitable") for ja in judge_analyses]
+                )
 
-                disputed = not all(v == verdicts[0] for v in verdicts)
+                disputed = tally.disputed
 
+                if panel.voted == 0:
+                    # Every judge abstained — no review verdict
+                    # exists. Record the stage outcome explicitly,
+                    # preserve the primary verdict, and skip the
+                    # contradiction tie-break below (it requires an
+                    # actual judge vote; "agreed" from zero votes
+                    # would mint corroboration).
+                    primary["judge"] = "no-verdict"
+                    primary["judge_analyses"] = [
+                        {"model": ja.get("analysed_by", "?"),
+                         "resolved_model": ja.get("resolved_model"),
+                         "is_exploitable": ja.get("is_exploitable"),
+                         "reasoning": ja.get("reasoning", "")}
+                        for ja in judge_analyses
+                    ]
+                    continue
+
+                primary_abstained = primary_exploitable is None
                 n_judges = len(judge_analyses)
-                if n_judges == 1:
+                if primary_abstained:
+                    # The primary cast NO vote (missing/null
+                    # is_exploitable — errored / refused / schema-
+                    # nulled). select_items admits these findings
+                    # precisely because they need a real review, so
+                    # the panel's verdict stands regardless of panel
+                    # size; "preserve primary" here would throw that
+                    # review away and keep the non-verdict. And
+                    # "agreed" would mint corroboration from a
+                    # one-sided pair — the primary never voted, so
+                    # there is nothing to agree with. A tied panel
+                    # yields None: the abstention survives honestly.
+                    final = panel.majority()
+                    primary["judge"] = (
+                        "disputed" if panel.disputed else "panel-verdict"
+                    )
+                elif n_judges == 1:
                     final = primary_exploitable
+                    primary["judge"] = "disputed" if disputed else "agreed"
                 else:
-                    final = sum(1 for v in verdicts if v) > len(verdicts) / 2
+                    majority = tally.majority()
+                    # No majority (a tie once abstainers are
+                    # excluded): preserve the primary verdict — the
+                    # judge stage overrides only on a strict
+                    # majority, mirroring its own 1-judge
+                    # preserve-primary rule.
+                    final = (primary_exploitable if majority is None
+                             else majority)
+                    primary["judge"] = "disputed" if disputed else "agreed"
 
-                primary["judge"] = "disputed" if disputed else "agreed"
                 primary["is_exploitable"] = final
                 primary["judge_analyses"] = [
                     {"model": ja.get("analysed_by", "?"),
+                     # Carry the resolved snapshot through so judge scorecard
+                     # outcomes record model_version (else it's always None).
+                     "resolved_model": ja.get("resolved_model"),
                      "is_exploitable": ja.get("is_exploitable"),
                      "reasoning": ja.get("reasoning", "")}
                     for ja in judge_analyses
                 ]
+
+                # Contradiction resolution (QoL #11-11d): when the
+                # primary came back self_contradictory after Stage F
+                # retry, the judge stage HAS now seen the finding
+                # and produced a verdict — that verdict IS the
+                # tie-break. Clear the self_contradictory flag so
+                # the headline's ''Inconsistent (review needed)''
+                # count drops; preserve the original ``contradictions``
+                # list + a new ``contradiction_resolved_by_judge``
+                # marker so the audit trail survives for operators
+                # who want to inspect HOW it was resolved. `final`
+                # is None only for an abstained primary over a tied
+                # panel — no verdict was produced, so nothing exists
+                # to tie-break with.
+                if final is not None and primary.get("self_contradictory"):
+                    primary["contradiction_resolved_by_judge"] = True
+                    primary["self_contradictory"] = False
 
         return results
 
@@ -483,6 +910,21 @@ class AggregationTask(DispatchTask):
     model_role = "aggregate"
     temperature = 0.2
     budget_cutoff = 0.95
+
+    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE,
+                 findings: list[dict[str, Any]] | None = None) -> None:
+        self.profile = profile
+        # Original findings indexed by id so build_prompt can pull
+        # SI evidence per memory-corruption finding — gives the
+        # aggregator structural ground truth alongside the
+        # per-model verdicts, useful for breaking ties on disputed
+        # findings. Optional: when not provided, aggregator runs
+        # exactly as before (verdict-only synthesis).
+        self.findings_by_id = {
+            f.get("finding_id"): f for f in (findings or [])
+            if f.get("finding_id")
+        }
+        self._tls = threading.local()
 
     # Threshold value lifted from the producer so any future
     # recalibration touches one place. Kept at module load time —
@@ -509,10 +951,6 @@ class AggregationTask(DispatchTask):
         "farthest from the rest of the panel."
     )
 
-    def __init__(self, profile: ModelDefenseProfile = CONSERVATIVE):
-        self.profile = profile
-        self._tls = threading.local()
-
     def get_models(self, role_resolution):
         return role_resolution.get("aggregate_models", [])
 
@@ -523,12 +961,33 @@ class AggregationTask(DispatchTask):
         from core.security.prompt_envelope import (
             TaintedString,
             UntrustedBlock,
+        )
+        from core.security.prompt_envelope import (
             build_prompt as _build_prompt,
+        )
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
         )
 
         content = json.dumps(payload, indent=2, sort_keys=True)
         findings = payload.get("findings", [])
         models = payload.get("models", [])
+
+        # SI evidence per memory-corruption finding in the payload —
+        # helps the aggregator break ties on findings where models
+        # disagree by surfacing structural ground truth (hazards,
+        # allocations, sanitizer-shaped sites). Bounded contribution
+        # per finding (max 12 lines × ~50 chars), and the
+        # rule_id-prefix gate inside evidence_blocks_for_finding
+        # naturally filters out non-MC findings. Findings_by_id
+        # lookup is empty when AggregationTask was constructed
+        # without findings — falls back to verdict-only synthesis.
+        si_blocks: tuple[UntrustedBlock, ...] = ()
+        for finding_summary in findings:
+            fid = finding_summary.get("finding_id")
+            original = self.findings_by_id.get(fid) if fid else None
+            if original is not None:
+                si_blocks = si_blocks + evidence_blocks_for_finding(original)
 
         bundle = _build_prompt(
             system=AggregationTask._SYSTEM_TEXT,
@@ -537,7 +996,7 @@ class AggregationTask(DispatchTask):
                 content=content,
                 kind="multi-model-analysis-results",
                 origin="aggregate:orchestrator",
-            ),),
+            ),) + si_blocks,
             slots={
                 "finding_count": TaintedString(value=str(len(findings)), trust="trusted"),
                 "model_count": TaintedString(value=str(len(models)), trust="trusted"),
@@ -555,10 +1014,10 @@ class AggregationTask(DispatchTask):
     def get_system_prompt(self):
         return system_with_priming(AggregationTask._SYSTEM_TEXT, self.profile)
 
-    def get_item_id(self, item):
+    def get_item_id(self, item) -> str:
         return "aggregate"
 
-    def get_item_display(self, item):
+    def get_item_display(self, item) -> str:
         return "multi-model synthesis"
 
     def get_schema(self, item):
@@ -627,9 +1086,18 @@ class GroupAnalysisTask(DispatchTask):
     model_role = "analysis"
     temperature = 0.3
 
-    def __init__(self, results_by_id: Optional[Dict[str, Dict]] = None,
-                 profile: ModelDefenseProfile = CONSERVATIVE):
+    def __init__(self, results_by_id: dict[str, dict] | None = None,
+                 findings: list[dict[str, Any]] | None = None,
+                 profile: ModelDefenseProfile = CONSERVATIVE) -> None:
         self.results_by_id = results_by_id or {}
+        # Index original findings by finding_id so build_prompt can
+        # call evidence_blocks_for_finding per group member without
+        # rebuilding finding shape from analysis results (which lose
+        # repo_path + metadata.name).
+        self.findings_by_id = {
+            f.get("finding_id"): f for f in (findings or [])
+            if f.get("finding_id")
+        }
         self.profile = profile
         self._tls = threading.local()
 
@@ -638,9 +1106,14 @@ class GroupAnalysisTask(DispatchTask):
 
     def build_prompt(self, group):
         from core.security.prompt_envelope import (
-            UntrustedBlock,
             TaintedString,
+            UntrustedBlock,
+        )
+        from core.security.prompt_envelope import (
             build_prompt as _build_prompt,
+        )
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
         )
 
         finding_ids = group.get("finding_ids", [])
@@ -648,12 +1121,23 @@ class GroupAnalysisTask(DispatchTask):
         criterion_value = group.get("criterion_value", "?")
 
         summaries = []
+        si_blocks: tuple[UntrustedBlock, ...] = ()
         for fid in finding_ids:
             r = self.results_by_id.get(fid, {})
-            exploitable = r.get("is_exploitable", "unknown")
+            _v = read_verdict(r, "is_exploitable")
+            exploitable = "unknown" if _v is None else _v
             score = r.get("exploitability_score", "?")
             reasoning = (r.get("reasoning") or "")[:300]
             summaries.append(f"- {fid}: exploitable={exploitable}, score={score}\n  {reasoning}")
+
+            # SI evidence per group member — strong signal for
+            # "shared root cause" analysis when multiple group
+            # members carry the same hazard pattern. Returns () for
+            # non-memory-corruption findings, so non-MC groups
+            # naturally surface no SI noise.
+            original = self.findings_by_id.get(fid)
+            if original is not None:
+                si_blocks = si_blocks + evidence_blocks_for_finding(original)
 
         findings_text = "\n".join(summaries) if summaries else "(no prior results)"
 
@@ -664,7 +1148,7 @@ class GroupAnalysisTask(DispatchTask):
                 content=findings_text,
                 kind="prior-finding-summaries",
                 origin=f"group:{criterion}={criterion_value}",
-            ),),
+            ),) + si_blocks,
             slots={
                 "criterion": TaintedString(value=str(criterion), trust="untrusted"),
                 "criterion_value": TaintedString(value=str(criterion_value), trust="untrusted"),
@@ -702,17 +1186,17 @@ class GroupAnalysisTask(DispatchTask):
     def get_item_id(self, group):
         return group.get("group_id", "unknown")
 
-    def get_item_display(self, group):
-        return f"{group.get('criterion', '?')}={group.get('criterion_value', '?')[:30]}"
+    def get_item_display(self, group) -> str:
+        return f"{group.get('criterion', '?')}={(group.get('criterion_value') or '?')[:30]}"
 
-    def get_schema(self, group):
+    def get_schema(self, group) -> None:
         return None
 
 
 class RetryTask(AnalysisTask):
-    """Stage F: self-consistency check + retry contradictions and low confidence.
+    """Stage F: self-contradiction check + retry contradictions and low confidence.
 
-    Runs _check_self_consistency to flag contradictions, then selects findings
+    Runs _check_self_contradiction to flag contradictions, then selects findings
     that are self-contradictory OR have ambiguous scores (0.3-0.7).
 
     For contradictions: provides feedback context ("you said X but marked Y").
@@ -723,15 +1207,16 @@ class RetryTask(AnalysisTask):
     LOW = 0.3
     HIGH = 0.7
 
-    def __init__(self, results_by_id: Optional[Dict[str, Dict]] = None,
-                 profile: ModelDefenseProfile = CONSERVATIVE):
-        super().__init__(profile=profile)
+    def __init__(self, results_by_id: dict[str, dict] | None = None,
+                 profile: ModelDefenseProfile = CONSERVATIVE,
+                 *, allow_unreachable: bool = False) -> None:
+        super().__init__(profile=profile, allow_unreachable=allow_unreachable)
         self.results_by_id = results_by_id or {}
 
     def select_items(self, findings, prior_results):
-        # Run self-consistency check to flag contradictions
-        from packages.llm_analysis.orchestrator import _check_self_consistency
-        _check_self_consistency(prior_results)
+        # Run self-contradiction check to flag contradictions
+        from packages.llm_analysis.orchestrator import _check_self_contradiction
+        _check_self_contradiction(prior_results)
 
         selected = []
         for f in findings:
@@ -766,6 +1251,9 @@ class RetryTask(AnalysisTask):
 
     def build_prompt(self, finding):
         from core.security.prompt_envelope import UntrustedBlock
+        from packages.llm_analysis.source_intel_inject import (
+            evidence_blocks_for_finding,
+        )
 
         fid = finding.get("finding_id")
         r = self.results_by_id.get(fid, {})
@@ -787,8 +1275,19 @@ class RetryTask(AnalysisTask):
                 ),
             )
 
+        # SI evidence applies to retries of the same finding just as
+        # it did in the original analysis — the structural facts
+        # (allocations, hazards, sanitizer-shaped sites) don't change
+        # between attempts, and the retry LLM benefits from the same
+        # context the primary saw.
+        extra_blocks = extra_blocks + evidence_blocks_for_finding(finding)
+
+        budget = getattr(self._tls_budget, "tokens", 0) if hasattr(self, "_tls_budget") else 0
         bundle = build_analysis_prompt_bundle_from_finding(
-            finding, profile=self.profile, extra_blocks=extra_blocks,
+            finding, profile=self.profile,
+            extra_blocks=tuple(extra_blocks),
+            allow_unreachable=self.allow_unreachable,
+            budget_tokens=budget,
         )
         self._tls.nonce = bundle.nonce
         return _user_message_from_bundle(bundle)
@@ -833,7 +1332,7 @@ class RetryTask(AnalysisTask):
                 # telemetry), `_quality` (response validation),
                 # `cross_family_check` (CrossFamilyCheckTask
                 # verdict + checker_model + trigger),
-                # `contradictions` (self-consistency check
+                # `contradictions` (self-contradiction check
                 # output). Downstream consumers (judge,
                 # consensus, reporting) lost the audit trail
                 # for any finding that hit the retry loop.
@@ -855,6 +1354,19 @@ class RetryTask(AnalysisTask):
                             merged[k] = v
                         elif k.startswith("_"):
                             merged[k] = v  # pipeline state — prior wins.
+                # Re-adjudicate self-contradiction against the FRESH
+                # response. The graft above copies the prior record's
+                # self_contradictory / contradictions for audit
+                # continuity, but the flag must describe the merged
+                # result: a retry that came back internally consistent
+                # and decisive would otherwise stay flagged forever
+                # (inflating the "Inconsistent (review needed)"
+                # bucket), while a retry that is STILL contradictory
+                # gets its contradiction list refreshed.
+                from packages.llm_analysis.validation import (
+                    check_self_contradiction,
+                )
+                check_self_contradiction({fid: merged})
                 prior_results[fid] = merged
             # setdefault before sub-key mutation. Pre-fix
             # `prior_results[fid]["retried"] = True` raised
@@ -890,8 +1402,9 @@ class CrossFamilyCheckTask(AnalysisTask):
     QUALITY_THRESHOLD = 0.7
 
     def __init__(self, checker_model, results_by_id=None,
-                 profile: ModelDefenseProfile = CONSERVATIVE):
-        super().__init__(profile=profile)
+                 profile: ModelDefenseProfile = CONSERVATIVE,
+                 *, allow_unreachable: bool = False) -> None:
+        super().__init__(profile=profile, allow_unreachable=allow_unreachable)
         self.checker_model = checker_model
         self.results_by_id = results_by_id or {}
 
@@ -912,7 +1425,7 @@ class CrossFamilyCheckTask(AnalysisTask):
         return selected
 
     def finalize(self, results, prior_results):
-        from core.security.llm_family import same_family
+        from core.security.llm_family import family_of, same_family
 
         for r in results:
             fid = r.get("finding_id")
@@ -939,12 +1452,64 @@ class CrossFamilyCheckTask(AnalysisTask):
                 }
                 continue
 
-            primary_exploitable = primary.get("is_exploitable", False)
-            checker_exploitable = r.get("is_exploitable", False)
+            # The guard above is VOID when either family is unknown:
+            # same_family returns False for any comparison involving
+            # "unknown", so two rebadged same-lineage ids sail past it
+            # and adjudicate. Unprovable is not cross-family
+            # (llm_family doctrine) — the resolver already refuses
+            # unknown producers, this is the belt for direct task
+            # construction. Record the check, don't adjudicate.
+            if (family_of(primary_model) == "unknown"
+                    or family_of(actual_model) == "unknown"):
+                unproven = ("primary" if family_of(primary_model)
+                            == "unknown" else "checker")
+                prior_results[fid]["cross_family_check"] = {
+                    "checker_model": actual_model,
+                    "intended_model": self.checker_model.model_name,
+                    "trigger": trigger,
+                    "verdict": (
+                        "skipped — cross-family not provable "
+                        f"({unproven} model family unknown)"
+                    ),
+                }
+                continue
+
+            # Tri-state reads (shared counting rule — see
+            # correlation.py's tally contract): only a genuine bool is
+            # a vote. A nulled ``is_exploitable`` (errored / refused /
+            # schema-failed response) is NOT a vote, and neither is a
+            # junk shape ("yes", 1) that bypassed response validation.
+            # Pre-fix the raw `.get` comparison let identical junk on
+            # both sides mint ``cross_family_agreed`` (suppressing
+            # BOTH review panels — consensus and judge skip agreed
+            # findings), let junk-vs-bool manufacture a "dispute"
+            # (flipping a clean not-exploitable primary to exploitable
+            # via the conservative override), and read ``1 == True``
+            # as cross-shape agreement. Record the check but don't
+            # adjudicate — same shape as the same-family fallback
+            # skip above.
+            primary_exploitable = read_verdict(primary, "is_exploitable")
+            checker_exploitable = read_verdict(r, "is_exploitable")
+            if primary_exploitable is None or checker_exploitable is None:
+                absent = ("checker" if checker_exploitable is None
+                          else "primary")
+                prior_results[fid]["cross_family_check"] = {
+                    "checker_model": actual_model,
+                    "checker_exploitable": checker_exploitable,
+                    "checker_ruling": r.get("ruling"),
+                    "trigger": trigger,
+                    "verdict": f"skipped — {absent} returned no verdict",
+                }
+                continue
 
             check_record = {
                 "checker_model": actual_model,
                 "checker_exploitable": checker_exploitable,
+                # The analyst's own vote, on the record in BOTH arms:
+                # pre-fix the record stored only the checker's side,
+                # so after the conservative override the primary's
+                # original conclusion survived nowhere.
+                "primary_exploitable": primary_exploitable,
                 "checker_ruling": r.get("ruling"),
                 "trigger": trigger,
             }
@@ -982,6 +1547,17 @@ class CrossFamilyCheckTask(AnalysisTask):
                 check_record["reasoning_distance"] = distance
 
             if primary_exploitable != checker_exploitable:
+                # Snapshot the analyst's own verdict BEFORE the
+                # conservative override, idempotently — same shape as
+                # the pre-consensus snapshot one stage downstream.
+                # Consumers (ConsensusTask tally + stamp, JudgeTask's
+                # critique prompt) prefer the earliest snapshot via
+                # primary_verdict_snapshot; without it they read the
+                # override as the analyst's own conclusion.
+                if "pre_crossfamily_is_exploitable" not in prior_results[fid]:
+                    prior_results[fid]["pre_crossfamily_is_exploitable"] = (
+                        primary_exploitable
+                    )
                 prior_results[fid]["is_exploitable"] = True
                 prior_results[fid]["cross_family_disputed"] = True
                 check_record["verdict"] = "disputed — conservative override"

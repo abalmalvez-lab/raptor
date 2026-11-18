@@ -1,4 +1,4 @@
-"""Test for the narrow `except` clause in raptor_agentic._replay_fuzz_crashes.
+"""Tests for raptor_agentic crash replay and subprocess handling.
 
 Per PR #488 review (grokjc): the replay loop must catch only
 (OSError, subprocess.SubprocessError, ValueError) — anything else
@@ -8,16 +8,38 @@ turning into "reproduced=False" replay entries.
 Drives _replay_fuzz_crashes against a temp dir with a stubbed
 sandbox.run that raises various exception types, asserting which
 get swallowed vs which propagate.
+
+Also pins:
+- _replay_fuzz_crashes runs each replay under the full
+  credential-isolation sandbox — restrict_reads=True and fake_home=True
+  as the docstring promises — so attacker-derived crash inputs can't
+  read ~/.ssh, ~/.aws, models.json etc. and leak them into the captured
+  *.stdout.log / *.stderr.log files.
+- run_command_streaming's generic exception handler returns
+  (-1, "", str(e)) when subprocess.Popen itself raises, instead of
+  dying on the unbound ``process`` name.
 """
 
 from __future__ import annotations
 
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_subprocess_launch_patches(monkeypatch):
+    """Keep launch mocks on consumer-owned subprocess module bindings."""
+    import raptor_agentic as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "subprocess", "Popen", consumer_0.subprocess.Popen,
+    )
 
 
 # parents[3] climbs:
@@ -25,17 +47,14 @@ from unittest.mock import patch
 #   [1] packages/fuzzing/
 #   [2] packages/
 #   [3] <repo root>
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
-
-class TestReplayExceptNarrowing(unittest.TestCase):
-    """The except clause in _replay_fuzz_crashes only catches the
-    documented narrow tuple. Other exceptions propagate."""
+class _ReplayCase(unittest.TestCase):
+    """Shared fixture: a fake ELF target (plus asan sibling) and one
+    crash input, so _replay_fuzz_crashes actually reaches its sandbox
+    call site."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="replay-except-test-")
+        self.tmp = tempfile.mkdtemp(prefix="replay-test-")
         self.addCleanup(lambda: __import__("shutil").rmtree(
             self.tmp, ignore_errors=True,
         ))
@@ -52,6 +71,11 @@ class TestReplayExceptNarrowing(unittest.TestCase):
         self.crash_file = Path(self.tmp) / "crash-input"
         self.crash_file.write_bytes(b"\x41" * 16)
         self.out_dir = Path(self.tmp) / "out"
+
+
+class TestReplayExceptNarrowing(_ReplayCase):
+    """The except clause in _replay_fuzz_crashes only catches the
+    documented narrow tuple. Other exceptions propagate."""
 
     def _run_with_sandbox_raising(self, exc):
         """Invoke _replay_fuzz_crashes with sandbox.run patched to
@@ -74,14 +98,14 @@ class TestReplayExceptNarrowing(unittest.TestCase):
         result = self._run_with_sandbox_raising(
             OSError("simulated FS failure"),
         )
-        entries = result.get(str(self.crash_file), [])
+        entries = result.get(self.crash_file.name, [])
         self.assertTrue(any(e.get("error") for e in entries),
                         f"OSError should be caught + logged: {entries}")
 
     def test_subprocess_called_process_error_is_caught(self):
         exc = subprocess.CalledProcessError(returncode=1, cmd="x")
         result = self._run_with_sandbox_raising(exc)
-        entries = result.get(str(self.crash_file), [])
+        entries = result.get(self.crash_file.name, [])
         self.assertTrue(any(e.get("error") for e in entries),
                         f"CalledProcessError should be caught: {entries}")
 
@@ -89,7 +113,7 @@ class TestReplayExceptNarrowing(unittest.TestCase):
         result = self._run_with_sandbox_raising(
             ValueError("simulated bad arg"),
         )
-        entries = result.get(str(self.crash_file), [])
+        entries = result.get(self.crash_file.name, [])
         self.assertTrue(any(e.get("error") for e in entries),
                         f"ValueError should be caught: {entries}")
 
@@ -117,6 +141,212 @@ class TestReplayExceptNarrowing(unittest.TestCase):
         STOP, not 'record this as a failed replay and continue'."""
         with self.assertRaises(KeyboardInterrupt):
             self._run_with_sandbox_raising(KeyboardInterrupt())
+
+
+class _FakeCompleted:
+    """Minimal stand-in for subprocess.CompletedProcess (bytes streams).
+
+    returncode -11 = death by SIGSEGV: real crash evidence, so the
+    replay contract marks it reproduced (a plain nonzero exit no
+    longer counts — usage errors and leak reports are not crashes).
+    """
+
+    def __init__(self):
+        self.stdout = b"replay stdout"
+        self.stderr = b"replay stderr"
+        self.returncode = -11
+
+
+class TestReplaySandboxIsolation(_ReplayCase):
+    """_replay_fuzz_crashes engages restrict_reads + fake_home."""
+
+    def _replay_and_capture_kwargs(self):
+        from raptor_agentic import _replay_fuzz_crashes
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return _FakeCompleted()
+
+        # The lazy `from core.sandbox import run` inside the function
+        # resolves at call time — patch the source-module attribute.
+        with patch("core.sandbox.run", side_effect=_fake_run):
+            result = _replay_fuzz_crashes(
+                binary_path=self.binary,
+                crash_files=[self.crash_file],
+                out_dir=self.out_dir,
+            )
+        return result, calls
+
+    def test_restrict_reads_engaged(self):
+        _, calls = self._replay_and_capture_kwargs()
+        self.assertTrue(calls, "sandbox run was never invoked")
+        for _cmd, kwargs in calls:
+            self.assertIs(kwargs.get("restrict_reads"), True,
+                          f"restrict_reads missing/false: {kwargs}")
+
+    def test_fake_home_engaged(self):
+        _, calls = self._replay_and_capture_kwargs()
+        self.assertTrue(calls, "sandbox run was never invoked")
+        for _cmd, kwargs in calls:
+            self.assertIs(kwargs.get("fake_home"), True,
+                          f"fake_home missing/false: {kwargs}")
+
+    def test_network_blocked_and_output_set(self):
+        """fake_home requires output=; block_network stays engaged."""
+        _, calls = self._replay_and_capture_kwargs()
+        self.assertTrue(calls, "sandbox run was never invoked")
+        for _cmd, kwargs in calls:
+            self.assertIs(kwargs.get("block_network"), True)
+            self.assertTrue(kwargs.get("output"),
+                            "output= must be set so fake_home can "
+                            "materialise inside a writable dir")
+
+    def test_replay_entries_still_recorded(self):
+        """The isolation kwargs must not change the replay contract:
+        stdout/stderr logs written, reproduced flag derived from crash
+        evidence (the fixture exits -11 = SIGSEGV, a reproduction)."""
+        result, _ = self._replay_and_capture_kwargs()
+        entries = result.get(self.crash_file.name, [])
+        self.assertTrue(entries, "no replay entries recorded")
+        for entry in entries:
+            self.assertTrue(entry.get("reproduced"), entry)
+            self.assertTrue(Path(entry["stdout"]).exists())
+            self.assertTrue(Path(entry["stderr"]).exists())
+
+    def test_result_keyed_by_crash_basename(self):
+        """The replay contract keys entries by crash-file BASENAME
+        (stable across run-dir moves/adoption and symlinked tmp
+        components), never the replay-time absolute path — consumers
+        (fuzz_evidence, the crash-context join) join on the basename."""
+        result, _ = self._replay_and_capture_kwargs()
+        self.assertIn(self.crash_file.name, result)
+        self.assertNotIn(str(self.crash_file), result)
+
+    def test_missing_crash_file_keyed_by_basename_too(self):
+        """The not-a-file early-out records under the SAME basename
+        key — a mixed absolute-path/basename summary would detach the
+        entry from every basename-joining consumer."""
+        from raptor_agentic import _replay_fuzz_crashes
+        ghost = Path(self.tmp) / "crash-ghost"
+        with patch("core.sandbox.run", side_effect=AssertionError(
+                "sandbox must not run for a missing crash file")):
+            result = _replay_fuzz_crashes(
+                binary_path=self.binary,
+                crash_files=[ghost],
+                out_dir=self.out_dir,
+            )
+        self.assertIn(ghost.name, result)
+        self.assertNotIn(str(ghost), result)
+        self.assertEqual(result[ghost.name], [])
+
+    def test_exit_one_reproduced_only_with_sanitizer_report(self):
+        """Two-direction pin for the plain-nonzero exit: exit 1 with
+        benign stderr (usage error, leak-at-exit) is NOT a
+        reproduction; the same exit WITH a sanitizer report is."""
+        from raptor_agentic import _replay_fuzz_crashes
+
+        for stderr, expected in (
+            (b"usage: target <file>", False),
+            (b"==7==ERROR: AddressSanitizer: heap-buffer-overflow", True),
+        ):
+            fake = _FakeCompleted()
+            fake.returncode = 1
+            fake.stderr = stderr
+            with patch("core.sandbox.run", return_value=fake):
+                result = _replay_fuzz_crashes(
+                    binary_path=self.binary,
+                    crash_files=[self.crash_file],
+                    out_dir=self.out_dir,
+                )
+            entries = result.get(self.crash_file.name, [])
+            self.assertTrue(entries, "no replay entries recorded")
+            for entry in entries:
+                self.assertIs(
+                    bool(entry.get("reproduced")), expected,
+                    (stderr, entry),
+                )
+
+
+class TestReplayTimeoutStillIsolated(_ReplayCase):
+    """TimeoutExpired replays keep partial logs (regression guard for
+    the fix touching the sandbox call site)."""
+
+    def test_timeout_records_reproduced_entry(self):
+        from raptor_agentic import _replay_fuzz_crashes
+        # A hang only reproduces a hang: use a timeout-class input so
+        # the timed-out replay legitimately counts as reproduced.
+        timeout_input = Path(self.tmp) / "timeout-input"
+        timeout_input.write_bytes(b"\x41" * 16)
+        exc = subprocess.TimeoutExpired(cmd="x", timeout=15,
+                                        output=b"partial", stderr=b"")
+        with patch("core.sandbox.run", side_effect=exc):
+            result = _replay_fuzz_crashes(
+                binary_path=self.binary,
+                crash_files=[timeout_input],
+                out_dir=self.out_dir,
+            )
+        entries = result.get(timeout_input.name, [])
+        self.assertTrue(entries)
+        self.assertEqual(entries[0]["returncode"], "timeout")
+        self.assertTrue(entries[0]["reproduced"])
+
+    def test_timeout_on_crash_input_is_not_reproduction(self):
+        from raptor_agentic import _replay_fuzz_crashes
+        exc = subprocess.TimeoutExpired(cmd="x", timeout=15,
+                                        output=b"partial", stderr=b"")
+        with patch("core.sandbox.run", side_effect=exc):
+            result = _replay_fuzz_crashes(
+                binary_path=self.binary,
+                crash_files=[self.crash_file],
+                out_dir=self.out_dir,
+            )
+        entries = result.get(self.crash_file.name, [])
+        self.assertTrue(entries)
+        self.assertEqual(entries[0]["returncode"], "timeout")
+        # crash-class input that merely hangs: partial logs kept, but
+        # no dynamic-confirmation claim rides into /validate.
+        self.assertFalse(entries[0]["reproduced"])
+
+
+class TestRunCommandStreamingPopenFailure(unittest.TestCase):
+    """run_command_streaming returns gracefully when Popen raises."""
+
+    def test_popen_oserror_returns_minus_one(self):
+        from raptor_agentic import run_command_streaming
+        env_patch = patch.dict("os.environ", {}, clear=False)
+        with env_patch:
+            import os as _os
+            _os.environ.pop("RAPTOR_LLM_SOCKET", None)
+            with patch(
+                "raptor_agentic.subprocess.Popen",
+                side_effect=OSError("simulated exec failure"),
+            ):
+                rc, stdout, stderr = run_command_streaming(
+                    ["definitely-not-a-real-binary"],
+                    "test spawn",
+                    timeout=5,
+                )
+        self.assertEqual(rc, -1)
+        self.assertEqual(stdout, "")
+        self.assertIn("simulated exec failure", stderr)
+
+    def test_popen_filenotfound_returns_minus_one(self):
+        from raptor_agentic import run_command_streaming
+        env_patch = patch.dict("os.environ", {}, clear=False)
+        with env_patch:
+            import os as _os
+            _os.environ.pop("RAPTOR_LLM_SOCKET", None)
+            with patch(
+                "raptor_agentic.subprocess.Popen",
+                side_effect=FileNotFoundError("no such file"),
+            ):
+                rc, stdout, stderr = run_command_streaming(
+                    ["missing"], "test spawn", timeout=5,
+                )
+        self.assertEqual(rc, -1)
+        self.assertEqual(stdout, "")
+        self.assertIn("no such file", stderr)
 
 
 if __name__ == "__main__":

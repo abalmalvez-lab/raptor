@@ -1,0 +1,229 @@
+# Python CLI
+
+[Documentation index](README.md)
+
+`raptor.py` is the direct entry point for CI pipelines, scripting, and
+non-interactive use. For interactive analysis via Claude Code, launch with
+`bin/raptor` instead.
+
+**Related documentation:**
+[commands](commands.md) |
+[README](README.md) |
+[dependencies](dependencies.md)
+
+
+**On this page:**
+
+- [Usage](#usage)
+- [Modes](#modes)
+- [Sandbox Flags](#sandbox-flags)
+- [Examples](#examples)
+- [Environment Variables](#environment-variables)
+- [Exit Codes](#exit-codes)
+- [Output](#output)
+- [Running fully standalone (no Claude Code)](#running-fully-standalone-no-claude-code)
+
+## Usage
+
+Run these commands in a terminal from the RAPTOR checkout, with its Python
+dependencies installed. Slash commands belong in a RAPTOR session; see the
+[command reference](commands.md) for that interface.
+
+```sh
+python3 raptor.py <mode> [flags]
+```
+
+Run `python3 raptor.py --help` for the mode list, or
+`python3 raptor.py <mode> --help` for mode-specific flags.
+
+
+## Modes
+
+| Mode | Purpose |
+|------|---------|
+| `scan` | Static analysis with Semgrep |
+| `sca` | Software Composition Analysis (dependencies, advisories, SBOM) |
+| `binary` | Black-box binary investigation and evidence collection |
+| `fuzz` | Binary fuzzing with AFL++ |
+| `web` | Web application security testing |
+| `agentic` | Full autonomous workflow (Semgrep + LLM analysis; CodeQL when `--codeql` is passed) |
+| `codeql` | CodeQL-only deep analysis |
+| `analyze` | LLM-powered analysis of existing SARIF files |
+| `describe` | Pre-flight inspection: target type, tool readiness, cost estimate |
+| `doctor` | Status report for local setup (no Claude needed) |
+| `frida` | Dynamic instrumentation via Frida (alpha) |
+| `openant` | OpenAnt semantic source analysis with an LLM |
+
+
+## Sandbox Flags
+
+These sandbox flags exist on the `scan`, `fuzz`, `agentic`, and `codeql`
+modes — the modes that register `core.sandbox.add_cli_args`. The other
+modes do not accept them and reject them with an
+`unrecognized arguments` error. Pass them **after** the mode name:
+
+```
+--sandbox {debug,frida,full,network-only,none,strict,target_run}
+                                           Force a sandbox profile (default: full)
+--no-sandbox                               Alias for --sandbox none (consent-gated: interactive TTY or minted nonce)
+--audit                                    Log what enforcement would have blocked
+--audit-verbose                            With --audit, log every traced syscall
+--audit-budget N                           With --audit, override the record cap (default 10000)
+--sandbox-floor {mount-ns,mountless-ns,ns-only,landlock,none}
+                                           Per-run consent for the untrusted containment
+                                           floor (lower to accept a degraded host, raise to
+                                           pin the full contract; 'none' is never a
+                                           consentable untrusted floor)
+--sandbox-readable-path PATH               Extend the sandbox read allowlist (repeatable)
+--sandbox-tool-path DIR                    Make an operator-installed tool dir visible
+                                           inside the sandbox (repeatable; read-only)
+```
+
+The unified launcher accepts `--trust-repo` and `--no-trust-repo` before
+dispatch. Their effect depends on the mode; acceptance does not grant every
+mode a trust override. See each mode’s trust-policy guidance.
+`--version` is top-level only —
+`python3 raptor.py --version`, before any mode name.
+
+
+## Examples
+
+```bash
+# Full autonomous workflow
+python3 raptor.py agentic --repo /path/to/code
+
+# Static analysis only
+python3 raptor.py scan --repo /path/to/code --policy-groups secrets,injection
+
+# Agentic with pre-mapping and post-validation
+python3 raptor.py agentic --repo /path/to/code --understand --validate
+
+# Binary fuzzing (1 hour, 4 parallel instances)
+python3 raptor.py fuzz --binary /path/to/binary --duration 3600 --parallel 4
+
+# Export starter corpus then fuzz with it
+python3 raptor.py fuzz --export-seed-corpus /tmp/seeds
+python3 raptor.py fuzz --binary /path/to/binary --corpus /tmp/seeds
+
+# Web scanning
+python3 raptor.py web --url https://example.com
+
+# CodeQL analysis
+python3 raptor.py codeql --repo /path/to/code --languages java
+
+# Analyse existing SARIF
+python3 raptor.py analyze --repo /path/to/code --sarif findings.sarif --max-findings 10
+
+# Black-box binary investigation
+python3 raptor.py binary investigate /path/to/binary
+
+# SCA dependency scan
+python3 raptor.py sca --repo /path/to/code
+
+# Pre-flight target description
+python3 raptor.py describe --target /path/to/code
+
+# Check local tool setup
+python3 raptor.py doctor
+
+# Dynamic instrumentation
+python3 raptor.py frida --target /path/to/binary --template api-trace
+
+# CI pipeline (no exploits; exit code 0 = completed, not "no findings")
+python3 raptor.py agentic \
+  --repo . \
+  --policy-groups secrets,injection \
+  --max-findings 5 \
+  --no-exploits
+```
+
+
+## Environment Variables
+
+The common exports for direct CLI use. Full registry:
+[Environment Variables](environment.md).
+
+```bash
+# LLM provider (at least one recommended for analysis modes)
+export ANTHROPIC_API_KEY="sk-ant-..."   # Recommended
+export OPENAI_API_KEY="sk-..."          # Alternative
+export GEMINI_API_KEY="..."             # Google Gemini
+export MISTRAL_API_KEY="..."            # Mistral
+
+# AWS Bedrock (SigV4 auth)
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="eu-west-1"
+
+# AWS Bedrock (bearer token auth)
+export AWS_BEARER_TOKEN_BEDROCK="..."
+
+# Optional overrides
+export RAPTOR_OUT_DIR="/custom/output/path"
+export RAPTOR_CALLER_DIR="/original/cwd"
+```
+
+
+
+## Exit Codes
+
+The launcher preserves the child command's exit code. Code **0** normally
+means successful completion, not an absence of findings. Codes depend on the
+mode: **1** can mean a command failure or an SCA threshold violation; **2**
+can mean invalid arguments or a launcher-internal failure; **3** denotes a
+sandbox-engagement failure; static analysis uses **4** when every dispatched
+Semgrep pack fails. Code **130** signals SIGINT (Ctrl-C).
+
+Consult the mode's reference when interpreting a nonzero code.
+
+To gate CI on finding severity, use SCA's threshold flags:
+
+```bash
+python3 raptor.py sca --repo . --fail-on-severity high --fail-on-kev
+```
+
+For other modes, parse the output files (`findings.json`, SARIF) rather than
+relying on the exit code.
+
+
+## Output
+
+All results are written to `out/` (or this session's project directory). The
+structure varies by mode; see [architecture](architecture.md) for details.
+
+
+## Running fully standalone (no Claude Code)
+
+`bin/raptor` -- the interactive shell with the banner and slash commands, i.e. the
+conversational layer -- execs straight into the Claude Code CLI and always needs its own
+login. The actual mechanics underneath it don't: `python3 raptor.py <mode>` is a plain
+Python CLI with no Claude Code dependency at all.
+
+```bash
+# No `claude` process involved at any point
+python3 raptor.py doctor                        # status check -- explicitly "no claude needed"
+python3 raptor.py agentic --repo /path/to/code   # scan -> dedup -> analysis
+python3 raptor.py scan --repo /path/to/code
+```
+
+`libexec/raptor-*` scripts (including `raptor-project-manager` -- `raptor.py` has no
+`project` mode, project management lives there exclusively) are also plain Python, but
+they refuse to run unless `CLAUDECODE` is set (true automatically inside a Claude Code
+session) or `_RAPTOR_TRUSTED=1` is set explicitly -- a guard against being invoked
+outside the launcher's environment sanitisation. Set it once for standalone use:
+
+```bash
+export _RAPTOR_TRUSTED=1
+
+libexec/raptor-project-manager create myapp --target /path/to/code
+libexec/raptor-project-manager use myapp
+python3 raptor.py agentic --repo /path/to/code   # picks up the active project automatically
+libexec/raptor-project-manager status
+libexec/raptor-project-manager findings
+```
+
+Point `models.json` / `OLLAMA_HOST` at a local Ollama instance (see [local model
+setup](llm.md#ollama-offline--airgapped)) and this whole path never talks to Anthropic
+-- useful for airgapped boxes or local-only hardware. You lose the conversational
+slash-command layer (the interactive chat); the scan/analysis/exploit pipeline itself is
+unaffected.

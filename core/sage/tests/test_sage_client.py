@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from core.testing.logging_state import owned_log_handler
+
 
 class TestSageClientHealthCheck(unittest.TestCase):
     """Test sync health check."""
@@ -68,19 +70,22 @@ class TestSageClientHealthCheck(unittest.TestCase):
 
 
 class TestSageClientNoSDK(unittest.TestCase):
-    """Test graceful degradation when the SDK isn't importable."""
+    """Test graceful degradation when SAGE is disabled."""
 
     def test_embed_no_client(self):
         from core.sage.client import SageClient
-        self.assertIsNone(SageClient().embed("test"))
+        from core.sage.config import SageConfig
+        self.assertIsNone(SageClient(SageConfig(enabled=False)).embed("test"))
 
     def test_query_no_client(self):
         from core.sage.client import SageClient
-        self.assertEqual(SageClient().query("test", "domain"), [])
+        from core.sage.config import SageConfig
+        self.assertEqual(SageClient(SageConfig(enabled=False)).query("test", "domain"), [])
 
     def test_propose_no_client(self):
         from core.sage.client import SageClient
-        self.assertFalse(SageClient().propose("test content"))
+        from core.sage.config import SageConfig
+        self.assertFalse(SageClient(SageConfig(enabled=False)).propose("test content"))
 
 
 def _install_mock_sdk(client_mod):
@@ -93,8 +98,15 @@ def _install_mock_sdk(client_mod):
     client_mod._SAGE_SDK_AVAILABLE = True
     client_mod._SyncSageClient = mock_cls
     client_mod._AgentIdentity = mock_identity_cls
+    # Mirror the SAGE MemoryType enum: fact | observation |
+    # inference | task (docs/reference/python-sdk.md). client.propose's
+    # allowlist references all four members directly, so the mock must
+    # expose them all or the allowlist build raises AttributeError.
     client_mod._MemoryType = SimpleNamespace(
-        observation="observation", fact="fact", inference="inference"
+        observation="observation",
+        fact="fact",
+        inference="inference",
+        task="task",
     )
     return mock_cls, mock_instance
 
@@ -120,7 +132,8 @@ def _restore_sdk(client_mod, snapshot):
 class TestSageClientWithMock(unittest.TestCase):
     """Test async methods with mocked sync SDK."""
 
-    def test_query_returns_results(self):
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_query_returns_results(self, _mock_direct):
         import core.sage.client as client_mod
 
         snapshot = _snapshot_sdk(client_mod)
@@ -148,7 +161,8 @@ class TestSageClientWithMock(unittest.TestCase):
         finally:
             _restore_sdk(client_mod, snapshot)
 
-    def test_query_back_to_back_uses_cached_sdk_client(self):
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_query_back_to_back_uses_cached_sdk_client(self, _mock_direct):
         """Regression: two queries in the same process must both succeed.
 
         The original async-based wrapper silently failed on the second
@@ -178,7 +192,60 @@ class TestSageClientWithMock(unittest.TestCase):
         finally:
             _restore_sdk(client_mod, snapshot)
 
-    def test_propose_auto_embeds(self):
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_list_memories_forwards_domain(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+            from core.sage.client import SageClient
+            from core.sage.config import SageConfig
+
+            sc = SageClient(SageConfig(enabled=True))
+            mock_instance.list_memories.return_value = "page"
+            self.assertEqual(
+                sc.list_memories(limit=5, offset=10, domain="d"), "page")
+            mock_instance.list_memories.assert_called_once_with(
+                limit=5, offset=10, domain="d")
+            # No domain -> the kwarg is omitted entirely.
+            mock_instance.list_memories.reset_mock()
+            sc.list_memories(limit=5, offset=10)
+            mock_instance.list_memories.assert_called_once_with(
+                limit=5, offset=10)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_list_memories_domain_falls_back_on_legacy_sdk(
+            self, _mock_direct):
+        # An SDK that predates server-side domain filtering raises
+        # TypeError on the kwarg; the wrapper retries unfiltered so
+        # the caller's client-side filter still sees every row.
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+            from core.sage.client import SageClient
+            from core.sage.config import SageConfig
+
+            sc = SageClient(SageConfig(enabled=True))
+            calls = []
+
+            def legacy(limit=200, offset=0):
+                calls.append((limit, offset))
+                return "page"
+
+            mock_instance.list_memories = legacy
+            self.assertEqual(
+                sc.list_memories(limit=5, offset=0, domain="d"), "page")
+            self.assertEqual(calls, [(5, 0)])
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_propose_auto_embeds(self, _mock_direct):
         import core.sage.client as client_mod
 
         snapshot = _snapshot_sdk(client_mod)
@@ -194,6 +261,188 @@ class TestSageClientWithMock(unittest.TestCase):
             self.assertTrue(sc.propose("hello", domain_tag="raptor-findings"))
             mock_instance.embed.assert_called_once_with("hello")
             mock_instance.propose.assert_called_once()
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+
+class TestResolveMemoryType(unittest.TestCase):
+    """The shared memory-type allowlist (used by SageClient.propose and
+    the seeding scripts): dict membership, never getattr on the enum."""
+
+    _ENUM = SimpleNamespace(
+        fact="fact", observation="observation",
+        inference="inference", task="task",
+    )
+
+    def _resolve(self, name):
+        from core.sage.client import resolve_memory_type
+        return resolve_memory_type(name, self._ENUM)
+
+    def test_canonical_names_map(self):
+        self.assertEqual(self._resolve("fact"), "fact")
+        self.assertEqual(self._resolve("task"), "task")
+
+    def test_legacy_aliases_fold(self):
+        self.assertEqual(self._resolve("hypothesis"), "inference")
+        self.assertEqual(self._resolve("lesson"), "observation")
+
+    def test_dunder_name_never_resolves_via_attribute(self):
+        # getattr(enum, "__class__") would hand back the class object;
+        # the allowlist must fall back to observation instead.
+        with self.assertLogs("raptor", level="WARNING"):
+            self.assertEqual(self._resolve("__class__"), "observation")
+
+    def test_typo_warns_and_falls_back(self):
+        with self.assertLogs("raptor", level="WARNING") as cm:
+            self.assertEqual(self._resolve("observatoin"), "observation")
+        self.assertIn("unknown memory_type", " ".join(cm.output))
+
+
+class TestQueryCacheBoundAndRace(unittest.TestCase):
+    """The per-instance query cache is FIFO-bounded (256, insertion
+    order — not LRU), and its eviction tolerates the concurrent-pop
+    race hook consumers can hit from ThreadPoolExecutor workers."""
+
+    def _client_with_mock(self, client_mod):
+        _, mock_instance = _install_mock_sdk(client_mod)
+        from core.sage.config import SageConfig
+        from core.sage.client import SageClient
+
+        sc = SageClient(SageConfig(enabled=True))
+        mock_instance.embed.return_value = [0.1]
+        mock_instance.query.return_value = SimpleNamespace(results=[])
+        return sc
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_cache_is_fifo_bounded_at_256(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            sc = self._client_with_mock(client_mod)
+            for i in range(257):
+                sc.query(f"q{i}")
+            self.assertEqual(len(sc._query_cache), 256)
+            keys = {k[0] for k in sc._query_cache}
+            self.assertNotIn("q0", keys)      # first inserted evicted
+            self.assertIn("q256", keys)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_lost_eviction_race_does_not_escape_query(self, _mock_direct):
+        # Simulate the loser of a concurrent eviction: the key picked
+        # by next(iter(...)) was already popped by another thread, so
+        # pop raises KeyError. That must be absorbed like
+        # StopIteration — pre-fix it escaped query() and the caller's
+        # broad except silently dropped the recall.
+        import core.sage.client as client_mod
+
+        class _RacingDict(dict):
+            raced = False
+
+            def pop(self, key, *default):
+                if not self.raced:
+                    self.raced = True
+                    raise KeyError(key)
+                return super().pop(key, *default)
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            sc = self._client_with_mock(client_mod)
+            racing = _RacingDict(
+                {(f"q{i}", "general", 5, None): () for i in range(256)}
+            )
+            sc._query_cache = racing
+            self.assertEqual(sc.query("fresh"), [])   # must not raise
+            self.assertTrue(racing.raced)
+            self.assertIn(("fresh", "general", 5, None), racing)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+
+class TestSageClientTagsAndMinConfidence(unittest.TestCase):
+    """SAGE 11.9.2 features: tags on propose, min_confidence on query."""
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_propose_passes_tags_when_provided(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+
+            from core.sage.config import SageConfig
+            from core.sage.client import SageClient
+
+            sc = SageClient(SageConfig(enabled=True))
+            mock_instance.embed.return_value = [0.1, 0.2]
+
+            sc.propose("hello", tags=["scan", "finding", "xss"])
+            kwargs = mock_instance.propose.call_args.kwargs
+            self.assertEqual(kwargs["tags"], ["scan", "finding", "xss"])
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_propose_omits_tags_when_none(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+
+            from core.sage.config import SageConfig
+            from core.sage.client import SageClient
+
+            sc = SageClient(SageConfig(enabled=True))
+            mock_instance.embed.return_value = [0.1, 0.2]
+
+            sc.propose("hello")
+            kwargs = mock_instance.propose.call_args.kwargs
+            self.assertNotIn("tags", kwargs)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_query_passes_min_confidence_when_provided(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+
+            from core.sage.config import SageConfig
+            from core.sage.client import SageClient
+
+            sc = SageClient(SageConfig(enabled=True))
+            mock_instance.embed.return_value = [0.1]
+            mock_instance.query.return_value = SimpleNamespace(results=[])
+
+            sc.query("test", min_confidence=0.5)
+            kwargs = mock_instance.query.call_args.kwargs
+            self.assertEqual(kwargs["min_confidence"], 0.5)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_query_omits_min_confidence_when_none(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+
+            from core.sage.config import SageConfig
+            from core.sage.client import SageClient
+
+            sc = SageClient(SageConfig(enabled=True))
+            mock_instance.embed.return_value = [0.1]
+            mock_instance.query.return_value = SimpleNamespace(results=[])
+
+            sc.query("test")
+            kwargs = mock_instance.query.call_args.kwargs
+            self.assertNotIn("min_confidence", kwargs)
         finally:
             _restore_sdk(client_mod, snapshot)
 
@@ -300,5 +549,196 @@ class TestSageClientEgressProxyRegistration(unittest.TestCase):
                 mock_get.assert_not_called()
 
 
+class TestSageClientWithFakeSdk(unittest.TestCase):
+    """Coverage without mock objects: deterministic fake SDK."""
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_propose_and_query_with_fake_sdk(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            class _FakeIdentity:
+                @staticmethod
+                def default():
+                    return object()
+
+            class _FakeRecord:
+                def __init__(self, content, confidence_score, domain_tag):
+                    self.content = content
+                    self.confidence_score = confidence_score
+                    self.domain_tag = domain_tag
+
+            class _FakeClient:
+                def __init__(self, **_kwargs):
+                    self.last_proposed = None
+
+                def embed(self, text):
+                    # Deterministic pseudo-embedding for testability.
+                    return [float(len(text) % 7), 0.5, 1.0]
+
+                def propose(self, **kwargs):
+                    self.last_proposed = kwargs
+
+                def query(self, embedding, domain_tag, top_k, **kwargs):
+                    content = f"embedded={embedding[0]} domain={domain_tag} top_k={top_k}"
+                    return SimpleNamespace(
+                        results=[_FakeRecord(content, 0.88, domain_tag)]
+                    )
+
+            client_mod._SAGE_SDK_AVAILABLE = True
+            client_mod._SyncSageClient = _FakeClient
+            client_mod._AgentIdentity = _FakeIdentity
+            client_mod._MemoryType = SimpleNamespace(
+                observation="observation", fact="fact", inference="inference",
+                task="task",
+            )
+
+            from core.sage.config import SageConfig
+            from core.sage.client import SageClient
+
+            sc = SageClient(SageConfig(enabled=True))
+            self.assertTrue(
+                sc.propose("seed content", memory_type="observation", domain_tag="raptor-findings")
+            )
+            rows = sc.query("seed content", "raptor-findings", top_k=2)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["domain"], "raptor-findings")
+            self.assertGreater(rows[0]["confidence"], 0.8)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+
+class TestHardenIdentityKeyPerms(unittest.TestCase):
+    """The SDK writes the agent key umask-wide; RAPTOR clamps it."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = __import__("pathlib").Path(self.tmp.name) / "ids"
+        self.dir.mkdir(mode=0o755)
+        self.key = self.dir / "agent.key"
+        self.key.write_bytes(b"\x00" * 32)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _mode(path):
+        import os
+        import stat
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_wide_key_clamped_with_warning(self):
+        import os
+        os.chmod(self.key, 0o664)
+        from core.sage.client import harden_identity_key_perms
+        with self.assertLogs("raptor", level="WARNING") as logs:
+            harden_identity_key_perms(self.key)
+        self.assertEqual(self._mode(self.key), 0o600)
+        self.assertEqual(self._mode(self.dir), 0o700)
+        self.assertTrue(any("clamping" in line for line in logs.output))
+
+    def test_tight_key_untouched_no_warning(self):
+        import logging
+        import os
+        os.chmod(self.key, 0o600)
+        os.chmod(self.dir, 0o700)
+        from core.sage.client import harden_identity_key_perms
+        records = []
+        logger = logging.getLogger("raptor")
+        handler = logging.Handler()
+        handler.emit = records.append
+        with owned_log_handler(logger, handler):
+            harden_identity_key_perms(self.key)
+        self.assertEqual(self._mode(self.key), 0o600)
+        self.assertFalse(
+            [r for r in records if r.levelno >= logging.WARNING],
+        )
+
+    def test_missing_key_is_noop(self):
+        from core.sage.client import harden_identity_key_perms
+        harden_identity_key_perms(self.dir / "absent.key")  # must not raise
+
+    def test_symlink_key_refused(self):
+        import os
+        target = self.dir / "target"
+        target.write_bytes(b"\x00" * 32)
+        os.chmod(target, 0o644)
+        link = self.dir / "link.key"
+        link.symlink_to(target)
+        from core.sage.client import harden_identity_key_perms
+        with self.assertLogs("raptor", level="WARNING") as logs:
+            harden_identity_key_perms(link)
+        # The symlink target's permissions must not be touched.
+        self.assertEqual(self._mode(target), 0o644)
+        self.assertTrue(
+            any("not a regular file" in line for line in logs.output),
+        )
+
+    def test_default_path_resolves_env_var(self):
+        import os
+        os.chmod(self.key, 0o664)
+        from core.sage.client import harden_identity_key_perms
+        with patch.dict(
+            os.environ, {"SAGE_IDENTITY_PATH": str(self.key)},
+        ):
+            harden_identity_key_perms(None)
+        self.assertEqual(self._mode(self.key), 0o600)
+
+    def test_home_parent_never_clamped(self):
+        import os
+        from pathlib import Path
+        key = Path(self.tmp.name) / "home" / "stray.key"
+        key.parent.mkdir(mode=0o755)
+        key.write_bytes(b"\x00" * 32)
+        os.chmod(key, 0o664)
+        from core.sage.client import harden_identity_key_perms
+        with patch("core.sage.client.Path.home",
+                   return_value=key.parent):
+            harden_identity_key_perms(key)
+        self.assertEqual(self._mode(key), 0o600)
+        # $HOME itself keeps its mode.
+        self.assertEqual(self._mode(key.parent), 0o755)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInstallScriptsClampIdentityKey(unittest.TestCase):
+    """The install-time scripts provision the identity BEFORE any
+    clamped call site runs — the exact mechanism that produced the
+    observed group-readable key. Pin the wiring: both scripts clamp
+    the umask across creation and harden afterwards."""
+
+    _SCRIPTS = (
+        "core/sage/scripts/register_agents.py",
+        "core/sage/scripts/seed_sage_knowledge.py",
+    )
+
+    def _source(self, rel):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[3]
+        return (root / rel).read_text(encoding="utf-8")
+
+    def test_umask_clamped_across_identity_creation(self):
+        for rel in self._SCRIPTS:
+            src = self._source(rel)
+            umask_at = src.index("umask(0o077)")
+            create_at = src.index("AgentIdentity.default()")
+            self.assertLess(
+                umask_at, create_at,
+                f"{rel}: umask clamp must precede identity creation",
+            )
+
+    def test_harden_called_after_creation(self):
+        for rel in self._SCRIPTS:
+            src = self._source(rel)
+            create_at = src.index("AgentIdentity.default()")
+            harden_at = src.index("harden_identity_key_perms()")
+            self.assertGreater(
+                harden_at, create_at,
+                f"{rel}: harden must follow identity creation",
+            )

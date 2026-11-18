@@ -1,0 +1,261 @@
+"""Contract tests for ``packages/sca/reachability/_shared``.
+
+These test the FUNCTIONS' contracts (what callers rely on), not the
+consolidation itself — the per-ecosystem modules re-export the
+helpers under their historical private names.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+from packages.sca.reachability._shared import (
+    UNRESOLVED_ENTRY,
+    extract_function_names,
+    format_evidence,
+    extract_qualified_symbols,
+)
+
+
+def _adv(es=None, ds=None):
+    return SimpleNamespace(ecosystem_specific=es, database_specific=ds)
+
+
+class TestExtractQualifiedSymbols:
+    def test_imports_symbols_qualified_with_path(self):
+        # Rust-style '::' in the import path is normalised to '.' —
+        # the resolver splits qualified names on '.' only, so a
+        # verbatim '::' segment could never match any call chain.
+        adv = _adv(es={"imports": [{"path": "foo::bar", "symbols": ["baz", "qux"]}]})
+        assert extract_qualified_symbols(adv, "dep") == [
+            "foo.bar.baz", "foo.bar.qux",
+        ]
+
+    def test_rust_and_ruby_separators_normalised(self):
+        adv = _adv(
+            es={"imports": [{"path": "smallvec",
+                             "symbols": ["SmallVec::insert_many"]}]},
+            ds={"affected_symbols": ["ActionDispatch::Routing::Mapper#draw"]},
+        )
+        # Namespace-head mode (crates/NuGet): the already-qualified
+        # flat symbol is emitted verbatim-normalised PLUS the
+        # dep-prefixed variant; the resolver binds whichever spelling
+        # the project imports.
+        assert extract_qualified_symbols(adv, "smallvec") == [
+            "smallvec.SmallVec.insert_many",
+            "ActionDispatch.Routing.Mapper.draw",
+            "smallvec.ActionDispatch.Routing.Mapper.draw",
+        ]
+        # Non-head mode (gems/composer): the gem name never heads a
+        # module chain — only the bindable spelling is emitted.
+        # (The old unconditional prefix minted
+        # "actionpack.ActionDispatch..." — unbindable, and every
+        # such name paired as NOT_CALLED toward a false
+        # high-confidence suppression.)
+        assert extract_qualified_symbols(
+            adv, "actionpack", dep_is_namespace_head=False,
+        ) == [
+            "smallvec.SmallVec.insert_many",
+            "ActionDispatch.Routing.Mapper.draw",
+        ]
+
+    def test_slash_bearing_dep_never_prefixes(self):
+        adv = _adv(ds={"affected_symbols": [
+            "Symfony\\Component\\HttpFoundation\\Request::create",
+            "bare_function",
+        ]})
+        # Even in head mode the slash-bearing composer name fails the
+        # namespace shape: qualified symbols are emitted unprefixed;
+        # the bare symbol has no bindable spelling and becomes an
+        # unresolved marker — counted (it blocks the downgrade) but
+        # never queried.
+        assert extract_qualified_symbols(
+            adv, "symfony/http-foundation",
+        ) == [
+            "Symfony.Component.HttpFoundation.Request.create",
+            UNRESOLVED_ENTRY,
+        ]
+
+    def test_no_double_prefix_when_symbol_carries_dep_head(self):
+        adv = _adv(ds={"affected_symbols": [
+            "Newtonsoft.Json.JsonConvert.DeserializeObject",
+        ]})
+        assert extract_qualified_symbols(adv, "Newtonsoft.Json") == [
+            "Newtonsoft.Json.JsonConvert.DeserializeObject",
+        ]
+
+    def test_bare_symbol_under_head_shaped_dep_still_qualifies(self):
+        # The PyPI shape: distribution name == module name.
+        adv = _adv(ds={"affected_functions": ["extract_zipped_paths"]})
+        assert extract_qualified_symbols(adv, "requests") == [
+            "requests.extract_zipped_paths",
+        ]
+
+    def test_empty_symbol_in_flat_lists_skipped(self):
+        # An empty affected_symbols entry must not emit a dangling
+        # "dep." qualified name.
+        adv = _adv(es={"affected_symbols": ["", "real"]})
+        assert extract_qualified_symbols(adv, "dep") == ["dep.real"]
+
+    def test_missing_import_path_uses_flat_policy(self):
+        # No path on the import record: same bindability policy as
+        # the flat lists (never an unconditional dep prefix; the
+        # unbindable bare symbol is counted via the marker).
+        adv = _adv(es={"imports": [{"symbols": ["Mod::run", "bare"]}]})
+        assert extract_qualified_symbols(
+            adv, "vendor/pkg", dep_is_namespace_head=False,
+        ) == ["Mod.run", UNRESOLVED_ENTRY]
+
+    def test_import_path_falls_back_to_dep_name(self):
+        adv = _adv(es={"imports": [{"symbols": ["run"]}]})
+        assert extract_qualified_symbols(adv, "mygem") == ["mygem.run"]
+
+    def test_flat_lists_qualified_with_dep_name(self):
+        adv = _adv(
+            es={"affected_symbols": ["a"]},
+            ds={"affected_functions": ["b"]},
+        )
+        assert extract_qualified_symbols(adv, "dep") == ["dep.a", "dep.b"]
+
+    def test_both_sources_consulted_in_order(self):
+        adv = _adv(
+            es={"imports": [{"path": "p", "symbols": ["one"]}]},
+            ds={"imports": [{"path": "q", "symbols": ["two"]}]},
+        )
+        assert extract_qualified_symbols(adv, "dep") == ["p.one", "q.two"]
+
+    def test_non_dict_sources_skipped(self):
+        adv = _adv(es=["not-a-dict"], ds="also-not")
+        assert extract_qualified_symbols(adv, "dep") == []
+
+    def test_missing_attrs_default_empty(self):
+        assert extract_qualified_symbols(object(), "dep") == []
+
+    def test_non_string_symbols_skipped(self):
+        adv = _adv(es={
+            "imports": [{"path": "p", "symbols": ["ok", 3, None, ""]}],
+            "affected_symbols": ["fine", 7],
+        })
+        assert extract_qualified_symbols(adv, "dep") == ["p.ok", "dep.fine"]
+
+    def test_empty_dep_name_disables_flat_lists_only(self):
+        adv = _adv(es={
+            "imports": [{"path": "p", "symbols": ["s"]}],
+            "affected_symbols": ["t"],
+        })
+        # imports[] still qualify via explicit path; flat lists need
+        # a dep_name to qualify with.
+        assert extract_qualified_symbols(adv, "") == ["p.s"]
+
+    def test_rustsec_affects_functions_shape(self):
+        # The RustSec convention — the dominant Rust advisory
+        # producer. Live OSV export shape (RUSTSEC-2021-0003):
+        # ecosystem_specific = {"affected_functions": null,
+        #   "affects": {"functions": ["smallvec::SmallVec::
+        #   insert_many"], "arch": [], "os": []}}.
+        # Fully-qualified crate paths normalise to dotted form.
+        adv = _adv(es={
+            "affected_functions": None,
+            "affects": {
+                "functions": ["smallvec::SmallVec::insert_many"],
+                "arch": [], "os": [],
+            },
+        })
+        assert extract_qualified_symbols(adv, "smallvec") == [
+            "smallvec.SmallVec.insert_many",
+        ]
+
+    def test_rustsec_affects_junk_tolerated(self):
+        adv = _adv(es={"affects": {
+            "functions": ["ok::f", 3, None, ""],
+        }})
+        assert extract_qualified_symbols(adv, "ok") == ["ok.f"]
+        assert extract_qualified_symbols(
+            _adv(es={"affects": "not-a-dict"}), "ok",
+        ) == []
+        assert extract_qualified_symbols(
+            _adv(es={"affects": {"functions": "not-a-list"}}), "ok",
+        ) == []
+
+    def test_non_string_path_marks_symbols_unresolved(self):
+        # Junk path: never dep-qualify junk, but the string symbol
+        # still names an advisory function the tier can't evaluate —
+        # it must be counted, not silently dropped.
+        adv = _adv(es={"imports": [{"path": 42, "symbols": ["s"]}]})
+        assert extract_qualified_symbols(adv, "dep") == [UNRESOLVED_ENTRY]
+
+
+class TestExtractFunctionNames:
+    def test_imports_symbols_unqualified(self):
+        adv = _adv(es={"imports": [{"path": "ignored", "symbols": ["f", "g"]}]})
+        assert extract_function_names(adv) == ["f", "g"]
+
+    def test_flat_lists_from_both_sources(self):
+        adv = _adv(
+            es={"affected_symbols": ["a"]},
+            ds={"affected_functions": ["b"]},
+        )
+        assert extract_function_names(adv) == ["a", "b"]
+
+    def test_flat_list_key_order_dominates_source_order(self):
+        # affected_symbols from BOTH sources come before any
+        # affected_functions (key-major iteration).
+        adv = _adv(
+            es={"affected_functions": ["f2"], "affected_symbols": ["s1"]},
+            ds={"affected_symbols": ["s2"]},
+        )
+        assert extract_function_names(adv) == ["s1", "s2", "f2"]
+
+    def test_non_string_entries_skipped(self):
+        adv = _adv(es={
+            "imports": [{"symbols": ["ok", 1, None]}],
+            "affected_symbols": ["fine", {}],
+        })
+        assert extract_function_names(adv) == ["ok", "fine"]
+
+    def test_missing_attrs_default_empty(self):
+        assert extract_function_names(object()) == []
+
+    def test_non_dict_sources_skipped(self):
+        adv = _adv(es="nope", ds=["nah"])
+        assert extract_function_names(adv) == []
+
+    def test_duplicates_preserved_for_caller_dedup(self):
+        adv = _adv(
+            es={"affected_symbols": ["x"]},
+            ds={"affected_symbols": ["x"]},
+        )
+        assert extract_function_names(adv) == ["x", "x"]
+
+
+class TestFormatEvidence:
+    def test_relative_under_target_and_absolute_outside(self):
+        target = Path("/repo")
+        hits = [
+            (Path("/repo/src/a.py"), 3, False),
+            (Path("/elsewhere/b.py"), 9, False),
+        ]
+        assert format_evidence(hits, target=target) == [
+            "src/a.py:3", "/elsewhere/b.py:9",
+        ]
+
+    def test_none_target_keeps_paths_verbatim(self):
+        hits = [(Path("/x/y.go"), 12, True)]
+        assert format_evidence(hits, target=None) == ["/x/y.go:12"]
+
+    def test_cap_with_overflow_marker(self):
+        hits = [(Path(f"/t/f{i}.rb"), i, False) for i in range(7)]
+        out = format_evidence(hits, target=Path("/t"), cap=5)
+        assert len(out) == 6
+        assert out[-1] == "... (+2 more)"
+
+    def test_exactly_cap_no_marker(self):
+        hits = [(Path(f"/t/f{i}.cs"), i, False) for i in range(5)]
+        out = format_evidence(hits, target=Path("/t"))
+        assert len(out) == 5
+
+    def test_target_itself_not_relativised(self):
+        # ``target in f.parents`` is False for the target itself.
+        hits = [(Path("/t"), 1, False)]
+        assert format_evidence(hits, target=Path("/t")) == ["/t:1"]

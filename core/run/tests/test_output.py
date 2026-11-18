@@ -1,14 +1,39 @@
 """Tests for output directory resolution."""
 
+from pkgutil import resolve_name as _mock_owner
+
+
 import os
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from core.run.output import get_output_dir, TargetMismatchError, unique_run_suffix
+from core.run.output import (
+    get_output_dir,
+    resolve_default_target,
+    TargetMismatchError,
+    unique_run_suffix,
+)
 
 # Mock that disables project resolution — for testing standalone (no project) mode.
+
+from core.testing.module_bindings import patch_module_attribute
+import pytest
+
+import core.run.output as _clock_consumer
+from core.testing.module_bindings import mock_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_os_fault_patches(monkeypatch):
+    """Keep process and path simulations on the module under test."""
+    import core.run.output as consumer
+
+    patch_module_attribute(monkeypatch, consumer, "os", "getpid", consumer.os.getpid)
+
+
 _NO_SYMLINK = patch("core.run.output._resolve_active_project", return_value=None)
 
 
@@ -40,10 +65,8 @@ class TestGetOutputDir(unittest.TestCase):
         result = get_output_dir("scan", target_name="")
         self.assertTrue(result.name.startswith("scan_"))
         parts = result.name.split("_")
-        # scan_<date>_<time>_pid<N>_<ns-tail> — at least 5 parts now
-        # (4-digit monotonic-ns tail added in batch 143 for in-process
-        # collision avoidance). The pid marker is no longer the LAST
-        # part; assert it appears in the suffix segment instead.
+        # scan_<date>_<time>_pid<N>_<sequence>: the PID and sequence
+        # occupy separate suffix components.
         self.assertGreaterEqual(len(parts), 5)
         pid_parts = [p for p in parts if p.startswith("pid")]
         self.assertEqual(len(pid_parts), 1, f"expected one pid marker in {parts!r}")
@@ -58,104 +81,180 @@ class TestGetOutputDir(unittest.TestCase):
             with patch("core.run.output._resolve_active_project",
                        return_value=(d, "test", "")):
                 # Pin the timestamp string so both calls see the same second
-                with patch("time.strftime", return_value="20260427-120000"):
+                with mock_module_attribute(_clock_consumer, 'time', 'strftime', return_value='20260427-120000'):
                     # Simulate sibling process via patched os.getpid
-                    with patch("os.getpid", return_value=11111):
+                    with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=11111):
                         a = get_output_dir("scan")
-                    with patch("os.getpid", return_value=22222):
+                    with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=22222):
                         b = get_output_dir("scan")
                     self.assertNotEqual(a, b,
                         "same-second invocations from different processes "
                         "must produce distinct dir names")
 
 
-def _mock_project(d, name="myapp", target="/tmp/vulns"):
-    """Create a mock for _resolve_active_project that returns test values."""
-    return patch("core.run.output._resolve_active_project",
-                 return_value=(d, name, target))
+@contextmanager
+def _mock_project(d, name="myapp", target=None):
+    """Patch ``_resolve_active_project`` to return synthetic (output_dir,
+    name, target) values for the test.
+
+    ``target`` defaults to ``<d>/vulns`` so every per-test scratch dir
+    gets a hermetic project-target path under it. Yields the resolved
+    target string so the test body can build matching subdirs / sibling
+    "other" paths against the same scratch root — no hardcoded /tmp
+    literals leak into the assertions."""
+    if target is None:
+        target = str(Path(d) / "vulns")
+    with patch("core.run.output._resolve_active_project",
+               return_value=(d, name, target)):
+        yield target
 
 
 class TestTargetMismatch(unittest.TestCase):
 
     def test_matching_target_ok(self):
         with TemporaryDirectory() as d:
-            with _mock_project(d):
-                get_output_dir("scan", target_path="/tmp/vulns")
+            with _mock_project(d) as target:
+                get_output_dir("scan", target_path=target)
 
     def test_subdirectory_target_ok(self):
         with TemporaryDirectory() as d:
-            with _mock_project(d):
-                get_output_dir("scan", target_path="/tmp/vulns/src/parser")
+            with _mock_project(d) as target:
+                subdir = str(Path(target) / "src" / "parser")
+                get_output_dir("scan", target_path=subdir)
 
     def test_different_target_raises(self):
         with TemporaryDirectory() as d:
             with _mock_project(d):
+                other = str(Path(d) / "other")
                 with self.assertRaises(TargetMismatchError) as ctx:
-                    get_output_dir("scan", target_path="/tmp/other")
+                    get_output_dir("scan", target_path=other)
                 self.assertIn("outside project", str(ctx.exception))
                 self.assertIn("/project create", str(ctx.exception))
-                self.assertIn("/project use none", str(ctx.exception))
+                # Remediation reflects the session model: create
+                # activates for THIS session; --project pins a single
+                # run; /project none is the session-only clear.
+                self.assertIn("--project", str(ctx.exception))
+                self.assertIn("/project none", str(ctx.exception))
+
+    def test_url_target_skips_check(self):
+        """/web targets are URLs, not paths — never a mismatch."""
+        with TemporaryDirectory() as d:
+            with _mock_project(d):
+                get_output_dir("web", target_path="https://example.com")
+                get_output_dir("web", target_path="http://10.0.0.1:8080/x")
+
+    def test_fuzz_out_of_tree_binary_warns_not_raises(self):
+        """Fuzz binaries routinely live outside the source tree."""
+        with TemporaryDirectory() as d:
+            with _mock_project(d):
+                other = str(Path(d) / "build" / "app")
+                with self.assertLogs("core.run.output", level="WARNING") as cm:
+                    get_output_dir("fuzz", target_path=other)
+                self.assertTrue(
+                    any("outside project" in m for m in cm.output))
+
+    def test_mismatch_message_escapes_hostile_path_fields(self):
+        """Project name/target can be adopt-inferred from
+        child-writable run metadata or import-restored, and every
+        catcher bare-prints str(e) to stderr — so all three
+        interpolated fields (target, name, project target) must arrive
+        escaped, including inside the /project create remedy line."""
+        from core.run.output import _check_target_mismatch
+        hostile = "\x1b]0;pwned\x07\x1b[2J"
+        with self.assertRaises(TargetMismatchError) as ctx:
+            _check_target_mismatch(
+                f"/does/not/exist{hostile}",
+                f"proj{hostile}name",
+                f"/srv/other{hostile}",
+            )
+        msg = str(ctx.exception)
+        self.assertIn("outside project", msg)
+        self.assertNotIn("\x1b", msg)
+        self.assertNotIn("\x07", msg)
+        self.assertIn("pwned", msg)  # content survives, escaped
+
+    def test_url_mismatch_message_is_length_bounded(self):
+        """The URL branch already escaped control bytes via !r, but
+        left length unbounded — a hostile project target could flood
+        the terminal. Both sides must be bounded with the elision
+        marker."""
+        from core.run.output import _check_target_mismatch
+        flood = "https://example.com/" + "A" * 10000
+        with self.assertRaises(TargetMismatchError) as ctx:
+            _check_target_mismatch(
+                flood, "p", "https://example.com/repo")
+        msg = str(ctx.exception)
+        self.assertLess(len(msg), 1000)
+        self.assertIn("...[+", msg)  # elision marker, not silent loss
+
+    def test_fuzz_in_tree_binary_ok_silently(self):
+        with TemporaryDirectory() as d:
+            with _mock_project(d) as target:
+                binary = str(Path(target) / "build" / "app")
+                get_output_dir("fuzz", target_path=binary)
 
     def test_no_project_target_skips_check(self):
         with TemporaryDirectory() as d:
             with _mock_project(d, target=""):
-                get_output_dir("scan", target_path="/tmp/anything")
+                anywhere = str(Path(d) / "anywhere")
+                get_output_dir("scan", target_path=anywhere)
 
     def test_caller_dir_mismatch_raises(self):
         """RAPTOR_CALLER_DIR is used for mismatch check when no explicit target."""
         with TemporaryDirectory() as d:
-            env = {"RAPTOR_CALLER_DIR": "/tmp/other"}
-            with patch.dict(os.environ, env):
-                with _mock_project(d):
+            with _mock_project(d):
+                other = str(Path(d) / "other")
+                env = {"RAPTOR_CALLER_DIR": other}
+                with patch.dict(os.environ, env):
                     with self.assertRaises(TargetMismatchError):
                         get_output_dir("scan")
 
     def test_caller_dir_matches(self):
         """RAPTOR_CALLER_DIR matching project target is fine."""
         with TemporaryDirectory() as d:
-            env = {"RAPTOR_CALLER_DIR": "/tmp/vulns"}
-            with patch.dict(os.environ, env):
-                with _mock_project(d):
+            with _mock_project(d) as target:
+                env = {"RAPTOR_CALLER_DIR": target}
+                with patch.dict(os.environ, env):
                     get_output_dir("scan")
 
     def test_explicit_out_skips_check(self):
         with TemporaryDirectory() as d:
             with _mock_project(d):
-                result = get_output_dir("scan", explicit_out="/tmp/manual",
-                                        target_path="/tmp/other")
-                self.assertEqual(result, Path("/tmp/manual").resolve())
+                manual = str(Path(d) / "manual")
+                other = str(Path(d) / "other")
+                result = get_output_dir("scan", explicit_out=manual,
+                                        target_path=other)
+                self.assertEqual(result, Path(manual).resolve())
 
 
 class TestUniqueRunSuffix(unittest.TestCase):
     """The collision-prevention primitive used by every standalone-mode
     output-dir computation across RAPTOR."""
 
-    # The 4-digit monotonic-ns tail (added in batch 143) makes
-    # exact-string assertions impractical without also patching
-    # time.monotonic_ns. Use prefix + shape assertions instead so
-    # the tests survive future tail-format adjustments.
+    # Sequence values belong to the process. Check prefixes and minimum
+    # numeric width rather than assuming a particular allocation number.
     def test_underscore_separator(self):
-        with patch("time.strftime", return_value="20260427_120000"):
-            with patch("os.getpid", return_value=12345):
+        with mock_module_attribute(_clock_consumer, 'time', 'strftime', return_value='20260427_120000'):
+            with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=12345):
                 suffix = unique_run_suffix("_")
                 self.assertTrue(suffix.startswith("20260427_120000_pid12345_"))
                 tail = suffix.rsplit("_", 1)[-1]
-                self.assertEqual(len(tail), 4)
+                self.assertGreaterEqual(len(tail), 4)
                 self.assertTrue(tail.isdigit())
 
     def test_hyphen_separator(self):
-        with patch("time.strftime", return_value="20260427-120000"):
-            with patch("os.getpid", return_value=12345):
+        with mock_module_attribute(_clock_consumer, 'time', 'strftime', return_value='20260427-120000'):
+            with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=12345):
                 suffix = unique_run_suffix("-")
                 self.assertTrue(suffix.startswith("20260427-120000-pid12345-"))
                 tail = suffix.rsplit("-", 1)[-1]
-                self.assertEqual(len(tail), 4)
+                self.assertGreaterEqual(len(tail), 4)
                 self.assertTrue(tail.isdigit())
 
     def test_default_separator_is_underscore(self):
         # Standalone mode is the more common shape, so default to '_'.
-        with patch("time.strftime", return_value="20260427_120000"):
-            with patch("os.getpid", return_value=12345):
+        with mock_module_attribute(_clock_consumer, 'time', 'strftime', return_value='20260427_120000'):
+            with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=12345):
                 suffix = unique_run_suffix()
                 self.assertTrue(suffix.startswith("20260427_120000_pid12345_"))
 
@@ -167,8 +266,8 @@ class TestUniqueRunSuffix(unittest.TestCase):
         def capture(fmt):
             captured["fmt"] = fmt
             return "20260427-120000"
-        with patch("time.strftime", side_effect=capture):
-            with patch("os.getpid", return_value=99):
+        with mock_module_attribute(_clock_consumer, 'time', 'strftime', side_effect=capture):
+            with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=99):
                 unique_run_suffix("-")
         self.assertEqual(captured["fmt"], "%Y%m%d-%H%M%S")
 
@@ -186,13 +285,193 @@ class TestUniqueRunSuffix(unittest.TestCase):
         # The fundamental property: two concurrent processes get different
         # PIDs and therefore different suffixes even at the same wall-clock
         # second.
-        with patch("time.strftime", return_value="20260427_120000"):
-            with patch("os.getpid", return_value=11111):
+        with mock_module_attribute(_clock_consumer, 'time', 'strftime', return_value='20260427_120000'):
+            with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=11111):
                 a = unique_run_suffix("_")
-            with patch("os.getpid", return_value=22222):
+            with mock_module_attribute(_mock_owner('core.run.output'), 'os', 'getpid', return_value=22222):
                 b = unique_run_suffix("_")
             self.assertNotEqual(a, b)
 
 
+class TestResolveDefaultTarget(unittest.TestCase):
+    """CLAUDE.md DEFAULT TARGET DIRECTORY resolution chain — active
+    project → ``RAPTOR_CALLER_DIR`` → None."""
+
+    def test_active_project_target_wins(self):
+        # The project target must be a real, populated dir — the
+        # volatile-target sanity gate refuses nonexistent/empty
+        # defaults (see test_volatile_default_target.py); this test
+        # is about precedence over RAPTOR_CALLER_DIR.
+        with TemporaryDirectory() as d:
+            target = Path(d) / "proj"
+            target.mkdir()
+            (target / "main.c").write_text("int main(void){}\n")
+            with _mock_project(d, target=str(target)):
+                with patch.dict(os.environ,
+                                {"RAPTOR_CALLER_DIR": "/path/from/env"}):
+                    self.assertEqual(resolve_default_target(),
+                                     str(target))
+
+    def test_falls_back_to_caller_dir_when_no_project(self):
+        # A real, populated dir — the caller-dir layer now passes
+        # through the same volatile-target gate as the project layer,
+        # so a fictional path would be refused ("does not exist").
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / "main.c").write_text("int main(void){}\n")
+            with _NO_SYMLINK:
+                with patch.dict(os.environ, {"RAPTOR_CALLER_DIR": tmp}):
+                    self.assertEqual(resolve_default_target(), tmp)
+
+    def test_returns_none_when_neither_signal_present(self):
+        with _NO_SYMLINK:
+            env = {k: v for k, v in os.environ.items()
+                   if k != "RAPTOR_CALLER_DIR"}
+            with patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(resolve_default_target())
+
+    def test_empty_caller_dir_returns_none(self):
+        # Empty-string env var is "not set" in CLAUDE.md's semantics.
+        with _NO_SYMLINK:
+            with patch.dict(os.environ, {"RAPTOR_CALLER_DIR": ""}):
+                self.assertIsNone(resolve_default_target())
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUrlTargetCaseInsensitiveHost(unittest.TestCase):
+    """URL scheme/host comparison is case-insensitive (DNS is) — a
+    https://Example.com run against project https://example.com
+    spuriously refused; a genuinely different host must still raise."""
+
+    def test_case_only_host_difference_accepted(self):
+        from core.run.output import _check_target_mismatch
+        _check_target_mismatch(
+            "https://Example.com/repo", "p", "https://example.com/repo")
+
+    def test_different_host_still_refused(self):
+        from core.run.output import TargetMismatchError, _check_target_mismatch
+        with self.assertRaises(TargetMismatchError):
+            _check_target_mismatch(
+                "https://evil.example/repo", "p",
+                "https://example.com/repo")
+
+    def test_path_stays_case_sensitive(self):
+        from core.run.output import TargetMismatchError, _check_target_mismatch
+        with self.assertRaises(TargetMismatchError):
+            _check_target_mismatch(
+                "https://example.com/Repo", "p",
+                "https://example.com/repo")
+
+
+class TestTargetMatchesProjectPredicate(unittest.TestCase):
+    """target_matches_project must answer exactly what the gate
+    enforces — the dispatcher's pin vet trusts it, and a predicate
+    that drifts (a naive resolved-prefix ``startswith``, symlink or
+    URL-normalisation divergence) silently demotes healthy pins or
+    threads doomed ones. Every case asserts the predicate against the
+    gate itself AND against the expected verdict, over exactly the
+    boundary shapes a prefix-string reimplementation gets wrong."""
+
+    @staticmethod
+    def _gate(target: str, project_target: str, command: str = "") -> bool:
+        from core.run.output import _check_target_mismatch
+        try:
+            _check_target_mismatch(target, "projx", project_target,
+                                   command=command)
+        except TargetMismatchError:
+            return False
+        return True
+
+    def _both(self, target: str, project_target: str,
+              command: str = "") -> bool:
+        from core.run.output import target_matches_project
+        verdict = target_matches_project(target, "projx", project_target,
+                                         command=command)
+        self.assertEqual(verdict,
+                         self._gate(target, project_target, command),
+                         "predicate diverged from the gate for "
+                         f"{target!r} vs {project_target!r}")
+        return verdict
+
+    def test_sibling_prefix_name_is_outside(self):
+        # /a/bc is NOT inside /a/b — component-wise containment, not
+        # string prefix. The shape a resolved-prefix startswith
+        # reimplementation gets wrong.
+        with TemporaryDirectory() as d:
+            proj = Path(d) / "target"
+            evil = Path(d) / "target-evil"
+            proj.mkdir()
+            evil.mkdir()
+            self.assertFalse(self._both(str(evil), str(proj)))
+
+    def test_exact_equality_is_inside(self):
+        with TemporaryDirectory() as d:
+            self.assertTrue(self._both(d, d))
+
+    def test_subdirectory_is_inside(self):
+        with TemporaryDirectory() as d:
+            sub = Path(d) / "src" / "parser"
+            self.assertTrue(self._both(str(sub), d))
+
+    def test_symlinked_target_resolves_into_project(self):
+        # The target rides in through a symlink whose destination is
+        # inside the project — both sides resolve, so it matches.
+        with TemporaryDirectory() as d:
+            proj = Path(d) / "proj"
+            (proj / "src").mkdir(parents=True)
+            link = Path(d) / "shortcut"
+            link.symlink_to(proj / "src")
+            self.assertTrue(self._both(str(link), str(proj)))
+
+    def test_symlink_escape_is_outside(self):
+        # A path lexically under the project dir that symlinks OUT of
+        # it must not match — resolution happens before containment.
+        with TemporaryDirectory() as d:
+            proj = Path(d) / "proj"
+            outside = Path(d) / "outside"
+            proj.mkdir()
+            outside.mkdir()
+            escape = proj / "vendored"
+            escape.symlink_to(outside)
+            self.assertFalse(self._both(str(escape), str(proj)))
+
+    def test_relative_target_resolves_against_cwd(self):
+        with TemporaryDirectory() as d:
+            proj = Path(d) / "proj"
+            (proj / "child").mkdir(parents=True)
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(proj)
+                self.assertTrue(self._both("child", str(proj)))
+                self.assertFalse(
+                    self._both(os.path.join("..", "elsewhere"),
+                               str(proj)))
+            finally:
+                os.chdir(old_cwd)
+
+    def test_url_pair_match_is_host_case_insensitive(self):
+        # URL pairs never touch the filesystem: resolving
+        # "HTTPS://Example.COM" against the cwd (what a Path-based
+        # reimplementation would do) is meaningless.
+        self.assertTrue(self._both("HTTPS://Example.COM/repo",
+                                   "https://example.com/repo"))
+
+    def test_url_pair_mismatch_is_outside(self):
+        self.assertFalse(self._both("https://evil.example/repo",
+                                    "https://example.com/repo"))
+
+    def test_url_target_with_path_project_skips_the_check(self):
+        with TemporaryDirectory() as d:
+            self.assertTrue(self._both("https://example.com/app", d))
+
+    def test_fuzz_out_of_tree_is_warn_only(self):
+        # The gate's documented fuzz shape: out-of-tree binaries warn
+        # and proceed — the predicate must answer True, not demote.
+        with TemporaryDirectory() as d:
+            proj = Path(d) / "proj"
+            binary = Path(d) / "build" / "app"
+            proj.mkdir()
+            self.assertTrue(self._both(str(binary), str(proj),
+                                       command="fuzz"))

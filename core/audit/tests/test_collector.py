@@ -1,0 +1,1242 @@
+"""Tests for core.audit.collector.Collector."""
+
+from __future__ import annotations
+
+import pytest
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from core.audit.collector import Collector
+
+
+
+@pytest.fixture(autouse=True)
+def _owned_domain_slice_memos(monkeypatch):
+    """Keep record/fold model memoization separate from borrowed state."""
+    from collections import OrderedDict
+    from functools import lru_cache
+    from core.concepts import audit_bridge
+    from core.testing.module_state import isolated_module_state
+
+    original = audit_bridge._load_cached
+    private = lru_cache(**original.cache_parameters())(original.__wrapped__)
+    with isolated_module_state(
+        audit_bridge,
+        {"_load_cached": private, "_slice_memos": OrderedDict()},
+        lock=audit_bridge._slice_memo_lock,
+    ):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+@dataclass
+class _FakeOutcome:
+    file: str = "src/auth.py"
+    function: str = "check_pw"
+    status: str = "finding"
+    body: str = "SQL injection in query"
+    model: str = "test-model"
+    cost_usd: float = 0.01
+    duration_s: float = 1.5
+    hypothesis: str = ""
+    hypotheses: list[str] = field(default_factory=list)
+    # A legitimate finding carries a tool receipt — the journal-write
+    # promotion gate demotes an evidence-less finding to suspicious
+    # (that path is exercised in test_promotion_alarm.py).
+    evidence_tool: str = "semgrep:sql-injection"
+    review_result: dict[str, Any] | None = None
+    weaknesses: list[dict[str, Any]] | None = None
+
+
+def _make_gap(file: str = "src/auth.py", name: str = "check_pw") -> dict[str, Any]:
+    return {"file": file, "name": name, "line_start": 10, "line_end": 30}
+
+
+def _write_checklist(out_dir: Path, files: list[dict]) -> None:
+    cl = {"files": files}
+    (out_dir / "checklist.json").write_text(json.dumps(cl), encoding="utf-8")
+
+
+class TestCollectorSubmitAndFlush:
+    def test_journal_written_immediately_not_on_flush(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(function="check_pw"), _make_gap(name="check_pw"))
+        c.submit(_FakeOutcome(function="login"), _make_gap(name="login"))
+
+        entries = load_entries(tmp_path)
+        assert len(entries) == 2
+        assert entries[0].function == "check_pw"
+        assert entries[1].function == "login"
+
+        c.flush()
+        entries_after = load_entries(tmp_path)
+        assert len(entries_after) == 2
+
+    def test_batches_audit_log_single_write(self, tmp_path: Path) -> None:
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(function="a"), _make_gap(name="a"))
+        c.submit(_FakeOutcome(function="b"), _make_gap(name="b"))
+
+        log_path = tmp_path / ".audit-log.jsonl"
+        assert not log_path.exists()
+
+        c.flush()
+
+        lines = log_path.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 2
+        assert json.loads(lines[0])["key"] == "src/auth.py:a:10"
+        assert json.loads(lines[1])["key"] == "src/auth.py:b:10"
+
+    def test_flush_is_idempotent(self, tmp_path: Path) -> None:
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(), _make_gap())
+        c.flush()
+        c.flush()
+        lines = (tmp_path / ".audit-log.jsonl").read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 1
+
+    def test_error_status_not_marked_checked(self, tmp_path: Path) -> None:
+        _write_checklist(tmp_path, [
+            {"path": "src/auth.py", "items": [{"name": "check_pw"}]},
+        ])
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(status="error"), _make_gap())
+        c.flush()
+
+        cl = json.loads((tmp_path / "checklist.json").read_text(encoding="utf-8"))
+        assert "checked_by" not in cl["files"][0]["items"][0]
+
+    def test_no_checklist_file_no_crash(self, tmp_path: Path) -> None:
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(), _make_gap())
+        c.flush()
+
+    def test_audit_log_entry_fields(self, tmp_path: Path) -> None:
+        outcome = _FakeOutcome(
+            hypothesis="tainted input",
+            evidence_tool="joern",
+        )
+        outcome.review_result = {"preconditions": ["auth required"]}
+        gap = _make_gap()
+        gap["strategies"] = ["sql_injection"]
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(outcome, gap)
+        c.flush()
+
+        entry = json.loads(
+            (tmp_path / ".audit-log.jsonl").read_text(encoding="utf-8").strip(),
+        )
+        assert entry["hypothesis"] == "tainted input"
+        assert entry["evidence_tool"] == "joern"
+        assert entry["preconditions"] == ["auth required"]
+        assert entry["strategies"] == ["sql_injection"]
+
+    def test_checklist_not_mutated_by_collector(self, tmp_path: Path) -> None:
+        """Post-migration: Collector doesn't stamp ``checked_by`` on
+        the checklist. Journal is authoritative for LLM review
+        existence; checklist is a pure inventory snapshot. Any
+        pre-existing ``checked_by`` (from a prior tool run, e.g.
+        ``scan``) is preserved untouched — but no fresh
+        ``audit`` entry is added by the review path."""
+        _write_checklist(tmp_path, [
+            {"path": "src/auth.py", "items": [
+                {"name": "check_pw", "checked_by": ["scan"]},
+            ]},
+        ])
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(), _make_gap())
+        c.flush()
+
+        cl = json.loads((tmp_path / "checklist.json").read_text(encoding="utf-8"))
+        by = cl["files"][0]["items"][0].get("checked_by", [])
+        assert "scan" in by
+        assert "audit" not in by
+
+    def test_multiple_submits_produce_multiple_journal_entries(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(model="model-a"), _make_gap())
+        c.submit(_FakeOutcome(model="model-b"), _make_gap())
+        c.flush()
+
+        entries = load_entries(tmp_path)
+        assert len(entries) == 2
+        assert entries[0].model == "model-a"
+        assert entries[1].model == "model-b"
+
+
+class TestCollectorJournalDualWrite:
+    """Verify each submit lands in the journal (the sole review store)."""
+
+    def test_append_journal_without_checked_by(self, tmp_path: Path) -> None:
+        """checked_by is vestigial — callers may omit it entirely."""
+        from core.audit.collector import append_journal_for_outcome
+        from core.coverage.journal import load_entries
+        append_journal_for_outcome(
+            out_dir=tmp_path,
+            target_path=tmp_path,
+            run_id="r1",
+            outcome=_FakeOutcome(),
+            gap=_make_gap(),
+        )
+        entries = load_entries(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].model == "test-model"
+
+    def test_reading_list_null_question_never_persists_null(
+        self, tmp_path: Path,
+    ) -> None:
+        # The journal declares reading_list_items: list[str]. LLM
+        # rows carry present-but-null / non-str questions, and a
+        # .get default never fires on a present null — the str(item)
+        # fallback must catch those leaves instead of persisting
+        # JSON null into the typed field.
+        from core.audit.collector import append_journal_for_outcome
+        from core.coverage.journal import load_entries
+        append_journal_for_outcome(
+            out_dir=tmp_path,
+            target_path=tmp_path,
+            run_id="r1",
+            outcome=_FakeOutcome(review_result={"reading_list": [
+                {"question": None},
+                {"question": 42},
+                {"question": "real question?"},
+                "stray-non-dict",
+            ]}),
+            gap=_make_gap(),
+        )
+        (entry,) = load_entries(tmp_path)
+        assert "real question?" in entry.reading_list_items
+        assert all(
+            isinstance(q, str) and q
+            for q in entry.reading_list_items
+        )
+        assert len(entry.reading_list_items) == 3
+
+    def test_submit_creates_journal_entry(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path, run_id="test-run")
+        c.submit(_FakeOutcome(), _make_gap())
+        entries = load_entries(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].file == "src/auth.py"
+        assert entries[0].function == "check_pw"
+        assert entries[0].verdict == "finding"
+        assert entries[0].run_id == "test-run"
+        assert entries[0].model == "test-model"
+
+    def test_journal_entries_match_submits(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path, run_id="r1")
+        c.submit(_FakeOutcome(function="fn_a"), _make_gap(name="fn_a"))
+        c.submit(_FakeOutcome(function="fn_b", status="clean"),
+                 _make_gap(name="fn_b"))
+        entries = load_entries(tmp_path)
+        assert len(entries) == 2
+        assert entries[0].function == "fn_a"
+        assert entries[0].verdict == "finding"
+        assert entries[1].function == "fn_b"
+        assert entries[1].verdict == "clean"
+
+    def test_journal_captures_strategies(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        gap = _make_gap()
+        gap["strategies"] = ["aliasing", "input_handling"]
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(), gap)
+        entries = load_entries(tmp_path)
+        assert entries[0].strategies == ["aliasing", "input_handling"]
+
+    def test_journal_captures_hypotheses(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        outcome = _FakeOutcome(
+            hypotheses=[{"claim": "overflow", "status": "disproven"}],
+        )
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(outcome, _make_gap())
+        entries = load_entries(tmp_path)
+        assert entries[0].hypotheses == [{"claim": "overflow", "status": "disproven"}]
+
+    def test_journal_captures_domain_model_hash(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        dm = {"concepts": [{"id": "test"}]}
+        (tmp_path / "domain-model.json").write_text(
+            json.dumps(dm), encoding="utf-8",
+        )
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(), _make_gap())
+        entries = load_entries(tmp_path)
+        assert entries[0].domain_model_hash is not None
+        assert len(entries[0].domain_model_hash) == 8
+
+    def test_invalidate_domain_model_cache(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(function="fn1"), _make_gap(name="fn1"))
+        hash1 = load_entries(tmp_path)[0].domain_model_hash
+
+        dm = {"concepts": [{"id": "new_concept"}]}
+        (tmp_path / "domain-model.json").write_text(
+            json.dumps(dm), encoding="utf-8",
+        )
+        c.invalidate_domain_model_cache()
+        c.submit(_FakeOutcome(function="fn2"), _make_gap(name="fn2"))
+        entries = load_entries(tmp_path)
+        hash2 = entries[1].domain_model_hash
+        assert hash2 is not None
+        assert hash1 != hash2
+
+    def test_error_status_still_journaled(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(status="error"), _make_gap())
+        entries = load_entries(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].verdict == "error"
+
+
+class TestEvidenceToolsSeparation:
+    """Regression: journal evidence_tools must carry only the CONFIRMING
+    receipt — never the tools_dispatched union. A dispatched-but-
+    silent tool reading as a confirming receipt made false positives
+    permanently undemotable via feedback's referee and corrupted
+    per-channel survival/attribution telemetry."""
+
+    def _submit(self, tmp_path, outcome):
+        from core.coverage.journal import load_entries
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(outcome, _make_gap())
+        entries = load_entries(tmp_path)
+        assert len(entries) == 1
+        return entries[0]
+
+    def test_dispatched_but_silent_tools_are_not_evidence(self, tmp_path):
+        # The verifier PoC: semgrep dispatched, found nothing
+        # (confirmed=set(), ran={'semgrep'}) — the journal row used to
+        # show evidence_tools=['semgrep'] while outcome.evidence_tool
+        # was empty.
+        outcome = _FakeOutcome(
+            status="suspicious", evidence_tool="",
+        )
+        outcome.tools_dispatched = {"semgrep", "joern"}
+        entry = self._submit(tmp_path, outcome)
+        assert entry.evidence_tools == []
+        assert entry.tools_dispatched == ["joern", "semgrep"]
+
+    def test_confirming_receipt_is_evidence(self, tmp_path):
+        outcome = _FakeOutcome(
+            status="finding", evidence_tool="smt:check-overflow",
+        )
+        outcome.tools_dispatched = {"smt", "semgrep"}
+        entry = self._submit(tmp_path, outcome)
+        assert entry.evidence_tools == ["smt:check-overflow"]
+        assert entry.tools_dispatched == ["semgrep", "smt"]
+
+    def test_referee_does_not_grade_dispatched_as_tool_evidence(
+        self, tmp_path,
+    ):
+        # The verdict-affecting consumer from the PoC: feedback's
+        # _prior_has_tool_evidence must come back False for a
+        # dispatched-but-silent journal entry, so an LLM-only
+        # /validate 'disproven' ruling can demote the claim.
+        from core.audit.feedback import _prior_has_tool_evidence
+
+        outcome = _FakeOutcome(status="suspicious", evidence_tool="")
+        outcome.tools_dispatched = {"semgrep"}
+        entry = self._submit(tmp_path, outcome)
+        assert _prior_has_tool_evidence(entry) is False
+
+    def test_round_trip_preserves_tools_dispatched(self, tmp_path):
+        from core.coverage.journal import _entry_from_dict
+
+        outcome = _FakeOutcome(status="suspicious", evidence_tool="")
+        outcome.tools_dispatched = {"coccinelle"}
+        entry = self._submit(tmp_path, outcome)
+        raw = entry.to_dict()
+        assert raw["tools_dispatched"] == ["coccinelle"]
+        assert "evidence_tools" not in raw or raw["evidence_tools"] == []
+        rebuilt = _entry_from_dict(raw)
+        assert rebuilt.tools_dispatched == ["coccinelle"]
+
+
+class TestCollectorSageHypothesis:
+    """Test SAGE hypothesis store wiring in Collector.submit()."""
+
+    def test_stores_verdict_when_hash_present(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        calls: list = []
+
+        def capture(**kwargs):
+            calls.append(kwargs)
+            return True
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        outcome = _FakeOutcome(
+            status="clean", hypothesis="unchecked return",
+            evidence_tool="semgrep:ret-check",
+        )
+        gap = _make_gap()
+        gap["_sage_source_hash"] = "abc123"
+
+        with patch("core.sage.hooks.store_audit_hypothesis_verdict", side_effect=capture):
+            c.submit(outcome, gap)
+
+        assert len(calls) == 1
+        assert calls[0]["file_path"] == "src/auth.py"
+        assert calls[0]["function"] == "check_pw"
+        assert calls[0]["hypothesis"] == "unchecked return"
+        assert calls[0]["status"] == "clean"
+        assert calls[0]["source_hash"] == "abc123"
+
+    def test_skips_without_source_hash(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        outcome = _FakeOutcome(status="clean", hypothesis="test")
+        gap = _make_gap()
+
+        with patch("core.sage.hooks.store_audit_hypothesis_verdict") as mock:
+            c.submit(outcome, gap)
+            mock.assert_not_called()
+
+    def test_skips_error_status(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        outcome = _FakeOutcome(status="error", hypothesis="test")
+        gap = _make_gap()
+        gap["_sage_source_hash"] = "h1"
+
+        with patch("core.sage.hooks.store_audit_hypothesis_verdict") as mock:
+            c.submit(outcome, gap)
+            mock.assert_not_called()
+
+    def test_skips_empty_hypothesis(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        outcome = _FakeOutcome(status="clean", hypothesis="")
+        gap = _make_gap()
+        gap["_sage_source_hash"] = "h1"
+
+        with patch("core.sage.hooks.store_audit_hypothesis_verdict") as mock:
+            c.submit(outcome, gap)
+            mock.assert_not_called()
+
+    def test_sage_error_does_not_break_submit(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        outcome = _FakeOutcome(status="clean", hypothesis="test hyp")
+        gap = _make_gap()
+        gap["_sage_source_hash"] = "h1"
+
+        with patch("core.sage.hooks.store_audit_hypothesis_verdict", side_effect=RuntimeError("boom")):
+            c.submit(outcome, gap)
+
+        assert len(c._log_entries) == 1
+
+
+class TestCorrectiveStrategyInheritance:
+    """Strategies-less corrective writes (deepen / post-loop re-review
+    commit paths pass synthetic gaps without the field) inherit the
+    strategy set the run's own journal already recorded for the site,
+    so the corrective row keeps the review's briefing instead of
+    shadowing it with ``strategies: []`` (which made cross-run verdict
+    reuse refuse the function as strategy_changed forever)."""
+
+    def _write(self, out_dir: Path, gap: dict, **outcome_over) -> None:
+        from core.audit.collector import append_journal_for_outcome
+        outcome = _FakeOutcome(**outcome_over)
+        append_journal_for_outcome(
+            out_dir=out_dir, target_path=out_dir, run_id="run-1",
+            outcome=outcome, gap=gap,
+        )
+
+    def test_corrective_write_inherits_site_strategies(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.coverage.journal import load_entries
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30,
+             "strategies": ["general", "input_handling"]},
+            status="suspicious",
+        )
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        entries = load_entries(tmp_path)
+        assert entries[-1].verdict == "clean"
+        assert entries[-1].strategies == ["general", "input_handling"]
+
+    def test_no_prior_row_keeps_empty_record(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        self._write(tmp_path, {"line_start": 10}, status="clean")
+        assert load_entries(tmp_path)[-1].strategies == []
+
+    def test_other_site_never_donates(self, tmp_path: Path) -> None:
+        # Same-named sibling at a different span must not donate its
+        # briefing to this site's corrective row.
+        from core.coverage.journal import load_entries
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        self._write(tmp_path, {"line_start": 99}, status="clean")
+        assert load_entries(tmp_path)[-1].strategies == []
+
+    def test_agentic_producer_never_inherits(self, tmp_path: Path) -> None:
+        from core.audit.collector import append_journal_for_outcome
+        from core.coverage.journal import load_entries
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        append_journal_for_outcome(
+            out_dir=tmp_path, target_path=tmp_path, run_id="run-1",
+            outcome=_FakeOutcome(status="clean"),
+            gap={"line_start": 10}, producer="agentic",
+        )
+        assert load_entries(tmp_path)[-1].strategies == []
+
+    def test_later_segment_row_found_after_snapshot(
+        self, tmp_path: Path,
+    ) -> None:
+        # The per-run snapshot is built at the first strategies-less
+        # write; a site journaled only AFTER that must still resolve
+        # (miss-triggered refresh when the journal grew).
+        from core.coverage.journal import load_entries
+        self._write(tmp_path, {"line_start": 10}, status="clean")
+        self._write(
+            tmp_path,
+            {"line_start": 50, "line_end": 70, "strategies": ["memory"]},
+            status="suspicious", function="login",
+        )
+        self._write(tmp_path, {"line_start": 50}, status="clean",
+                    function="login")
+        assert load_entries(tmp_path)[-1].strategies == ["memory"]
+
+    def test_mechanical_echo_never_donates(self, tmp_path: Path) -> None:
+        # A post-loop mechanical echo row's ``post-loop-mechanical``
+        # tag is a row-kind marker, not a review briefing — inheriting
+        # it turns the corrective row itself into a mechanical echo
+        # for every is_mechanical_echo consumer (dropped from reviewed
+        # counts, refused by cross-run reuse as strategy_changed).
+        from core.coverage.journal import is_mechanical_echo, load_entries
+        self._write(
+            tmp_path,
+            {"line_start": 0, "strategies": ["post-loop-mechanical"]},
+            status="suspicious", body="[mechanical] pattern hit",
+        )
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        entry = load_entries(tmp_path)[-1]
+        assert entry.strategies == []
+        assert not is_mechanical_echo(entry)
+
+
+class TestStrategySnapshotDegrade:
+    """A failed journal parse must degrade loudly and uniformly (no
+    donations, explicit ``None`` marker) — a silently returned partial
+    snapshot passes off the rows it happened to reach as the run's
+    strategy state, and the failure retries once the journal grows."""
+
+    _LOGGER = "core.audit.collector"
+
+    def _write(self, out_dir: Path, gap: dict, **outcome_over) -> None:
+        from core.audit.collector import append_journal_for_outcome
+        outcome = _FakeOutcome(**outcome_over)
+        append_journal_for_outcome(
+            out_dir=out_dir, target_path=out_dir, run_id="run-1",
+            outcome=outcome, gap=gap,
+        )
+
+    def test_parse_failure_returns_none_and_warns(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        from core.audit.collector import _build_strategy_snapshot
+        import core.audit.journal as journal_mod
+
+        def _boom(*a, **kw):
+            raise OSError("journal unreadable")
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _boom)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            snapshot = _build_strategy_snapshot(tmp_path)
+        assert snapshot is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+        assert len(warnings) == 1
+        assert str(tmp_path) in warnings[0].getMessage()
+
+    def test_empty_journal_is_empty_dict_not_none(
+        self, tmp_path: Path,
+    ) -> None:
+        # {} = parsed fine, nothing eligible — distinct from the
+        # degraded None marker.
+        from core.audit.collector import _build_strategy_snapshot
+        assert _build_strategy_snapshot(tmp_path) == {}
+
+    def test_degraded_snapshot_never_donates_then_recovers(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # Corrective write during the outage journals [] (the
+        # pre-existing no-donation fallback); once the journal has
+        # grown and the parse works again, inheritance resumes.
+        from core.coverage.journal import load_entries
+        import core.audit.journal as journal_mod
+
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        real_load_entries = journal_mod.load_entries_checked
+
+        def _boom(*a, **kw):
+            raise OSError("journal unreadable")
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _boom)
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        assert load_entries(tmp_path)[-1].strategies == []
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", real_load_entries)
+        # The corrective row above grew the journal, so the next
+        # strategies-less write re-parses and inherits again.
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective again")
+        assert load_entries(tmp_path)[-1].strategies == ["auth"]
+
+    def test_healthy_inheritance_unchanged(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        assert load_entries(tmp_path)[-1].strategies == ["auth"]
+
+    def test_mid_loop_failure_degrades_uniformly(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # A failure part-way through the eligibility walk must not
+        # pass off the rows reached so far as the run's strategy
+        # state — the degrade is uniform (None), never a partial map.
+        import core.coverage.journal_mac as journal_mac
+
+        from core.audit.collector import _build_strategy_snapshot
+
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        self._write(
+            tmp_path,
+            {"line_start": 50, "line_end": 70, "strategies": ["memory"]},
+            status="suspicious", function="login",
+        )
+        real = journal_mac.entry_provenance
+        calls = {"n": 0}
+
+        def _flaky(entry: Any, *a: Any, **kw: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("mac key unreadable")
+            return real(entry, *a, **kw)
+
+        monkeypatch.setattr(journal_mac, "entry_provenance", _flaky)
+        assert _build_strategy_snapshot(tmp_path) is None
+        assert calls["n"] >= 2
+
+    def test_incomplete_journal_load_degrades(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        # An over-budget journal loads as a bounded PARTIAL list
+        # WITHOUT raising — it must take the same uniform degrade as
+        # a parse failure, and the corrective row then donates [].
+        import core.audit.journal as journal_mod
+
+        from core.audit.collector import _build_strategy_snapshot
+        from core.coverage.journal import JournalLoad, load_entries
+
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        real = journal_mod.load_entries_checked
+
+        def _partial(out_dir: Path, **kw: Any) -> JournalLoad:
+            loaded = real(out_dir, **kw)
+            return JournalLoad(
+                entries=loaded.entries, complete=False,
+                reason="retained budget exceeded",
+            )
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _partial)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            assert _build_strategy_snapshot(tmp_path) is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+        assert len(warnings) == 1
+        assert "retained budget exceeded" in warnings[0].getMessage()
+
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        assert load_entries(tmp_path)[-1].strategies == []
+
+    def test_exception_warning_escaped_and_bounded(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        # A hostile exception message (control bytes + flooding
+        # length) must land escaped and truncated in the WARNING;
+        # the traceback is DEBUG-only.
+        import core.audit.journal as journal_mod
+
+        from core.audit.collector import _build_strategy_snapshot
+
+        hostile = "\x1b]0;pwn\x07" + "A" * 100_000
+
+        def _boom(*a: Any, **kw: Any) -> None:
+            raise OSError(hostile)
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _boom)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            assert _build_strategy_snapshot(tmp_path) is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "\x1b" not in msg
+        assert "\\x1b" in msg
+        assert "chars]" in msg  # explicit elision marker
+        assert len(msg) < 1000  # bounded, not the 100 KB flood
+
+
+class TestFlushDurability:
+    """flush() is re-usable (post-loop passes submit AFTER the first
+    flush), retains entries on write failure, and appends through the
+    hardened JSONL writer (no symlink-follow)."""
+
+    def test_flush_reusable_across_post_loop_submits(
+        self, tmp_path: Path,
+    ) -> None:
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(function="main_loop"), _make_gap(name="main_loop"))
+        c.flush()
+        # Post-loop pass (dark verify / IRIS telemetry) submits more —
+        # a one-shot latch used to silently discard this.
+        c.submit(_FakeOutcome(function="post_loop"), _make_gap(name="post_loop"))
+        c.flush()
+        lines = (tmp_path / ".audit-log.jsonl").read_text(
+            encoding="utf-8",
+        ).strip().split("\n")
+        keys = [json.loads(ln)["key"] for ln in lines]
+        assert keys == [
+            "src/auth.py:main_loop:10", "src/auth.py:post_loop:10",
+        ]
+
+    def test_failed_write_retains_entries(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import core.json.jsonl as jsonl
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        c.submit(_FakeOutcome(function="kept"), _make_gap(name="kept"))
+
+        real = jsonl._append_jsonl_bytes
+        state = {"fail": True}
+
+        def flaky(*args, **kwargs):
+            if state["fail"]:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(jsonl, "_append_jsonl_bytes", flaky)
+        c.flush()  # must not raise, must not mark flushed
+        assert not (tmp_path / ".audit-log.jsonl").exists()
+
+        state["fail"] = False
+        c.flush()
+        lines = (tmp_path / ".audit-log.jsonl").read_text(
+            encoding="utf-8",
+        ).strip().split("\n")
+        assert len(lines) == 1
+        assert json.loads(lines[0])["key"] == "src/auth.py:kept:10"
+
+    def test_symlinked_audit_log_refused(self, tmp_path: Path) -> None:
+        # A symlink planted at the trail path in the target-writable
+        # run dir must be refused (O_NOFOLLOW), never followed.
+        out = tmp_path / "out"
+        out.mkdir()
+        victim = tmp_path / "victim.txt"
+        victim.write_text("host file\n")
+        (out / ".audit-log.jsonl").symlink_to(victim)
+
+        c = Collector(out_dir=out, target_path=tmp_path)
+        c.submit(_FakeOutcome(function="x"), _make_gap(name="x"))
+        c.flush()  # swallows the OSError, retains the entry
+        assert victim.read_text() == "host file\n"
+        assert c._log_entries  # retained for a later flush
+
+
+class TestSubmitVerificationTier:
+    def test_submit_computes_verification_tier(self, tmp_path: Path) -> None:
+        # Collector.submit must derive the tier like _commit_outcome:
+        # dispatch without negative receipts remains speculative.
+        from core.audit.orchestrator import ReviewOutcome
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path)
+        clean = ReviewOutcome(
+            file="src/a.c", function="ok", status="clean",
+            body="fine", tools_dispatched={"semgrep"},
+        )
+        c.submit(clean, _make_gap(name="ok"))
+        assert clean.verification_tier == "speculative"
+
+        spec = ReviewOutcome(
+            file="src/a.c", function="guess", status="clean", body="fine",
+        )
+        c.submit(spec, _make_gap(name="guess"))
+        assert spec.verification_tier == "speculative"
+
+        c.flush()
+        lines = (tmp_path / ".audit-log.jsonl").read_text(
+            encoding="utf-8",
+        ).strip().split("\n")
+        tiers = {
+            json.loads(ln)["key"]: json.loads(ln)["verification_tier"]
+            for ln in lines
+        }
+        assert tiers["src/a.c:ok:10"] == "speculative"
+        assert tiers["src/a.c:guess:10"] == "speculative"
+
+
+class TestReusedVerdictChokepoint:
+    """The journal-write promotion gate must not decay reused
+    findings: a cross-run import re-asserts the origin run's already-
+    gated verdict at the LLM_ONLY tier cap (verdict_reuse doctrine),
+    it is not a fresh promotion."""
+
+    def test_reused_finding_not_demoted_no_alarm(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.audit.orchestrator import ReviewOutcome
+        from core.audit.promotion_alarm import load_alarms
+
+        o = ReviewOutcome(
+            file="src/a.c", function="fn", status="finding",
+            body="[reused]", evidence_tool="journal:recall:run-1",
+        )
+        o.reused = True
+        o.reused_from_run = "run-1"
+
+        c = Collector(out_dir=tmp_path, target_path=tmp_path, run_id="run-2")
+        c.submit(o, _make_gap(name="fn"))
+        assert o.status == "finding"
+        assert load_alarms(tmp_path) == []
+        # ...and the tier cap still applies: no live receipt, LLM_ONLY.
+        assert o.verification_tier == "llm_only"
+
+    def test_fresh_evidence_less_finding_still_demoted(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.audit.orchestrator import ReviewOutcome
+        from core.audit.promotion_alarm import load_alarms
+
+        o = ReviewOutcome(
+            file="src/a.c", function="fn", status="finding",
+            body="claim", evidence_tool="",
+        )
+        c = Collector(out_dir=tmp_path, target_path=tmp_path, run_id="run-2")
+        c.submit(o, _make_gap(name="fn"))
+        assert o.status == "suspicious"
+        alarms = load_alarms(tmp_path)
+        assert len(alarms) == 1
+        assert alarms[0]["blocked"] is True
+
+
+class TestFlushExceptionTotal:
+    def test_flush_never_raises_on_unexpected_error(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # "Never raises" must be exception-total: flush runs from
+        # end-of-run paths and the SIGTERM hook.
+        collector = Collector(out_dir=tmp_path, target_path=tmp_path)
+
+        def boom() -> None:
+            raise RuntimeError("row-shape surprise")
+
+        monkeypatch.setattr(collector, "_flush_audit_log", boom)
+        collector.flush()  # must not raise
+
+
+class TestDomainSliceStamp:
+    """Journal rows carry the per-function domain-slice fingerprint."""
+
+    _SOURCE = (
+        "int check_pw(const char *pw) {\n"
+        "    return strcmp(pw, stored) == 0;\n"
+        "}\n"
+    )
+
+    def _setup(self, tmp_path: Path, *, with_model: bool = True):
+        import json as _json
+
+        from core.concepts.audit_bridge import _load_cached
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "auth.c").write_text(self._SOURCE, encoding="utf-8")
+        run = tmp_path / "run1"
+        run.mkdir()
+        if with_model:
+            (run / "domain-model.json").write_text(
+                _json.dumps({
+                    "concepts": [{
+                        "id": "pw_compare_rules",
+                        "description": (
+                            "check_pw must compare in constant time"
+                        ),
+                    }],
+                    "invariants": [],
+                    "contracts": [],
+                }),
+                encoding="utf-8",
+            )
+        _load_cached.cache_clear()
+        return run, target
+
+    @staticmethod
+    def _gap() -> dict[str, Any]:
+        return {
+            "file": "auth.c", "name": "check_pw",
+            "line_start": 1, "line_end": 3,
+        }
+
+    def _append(self, run: Path, target: Path, gap=None) -> None:
+        from core.audit.collector import append_journal_for_outcome
+        append_journal_for_outcome(
+            out_dir=run,
+            target_path=target,
+            run_id="run1",
+            outcome=_FakeOutcome(file="auth.c", function="check_pw"),
+            gap=gap or self._gap(),
+        )
+
+    def test_stamp_matches_the_fold_recompute(self, tmp_path: Path) -> None:
+        from core.audit.context import domain_slice_hash_for
+        from core.coverage.journal import load_entries
+        run, target = self._setup(tmp_path)
+        self._append(run, target)
+        [entry] = load_entries(run)
+        assert entry.domain_slice_hash is not None
+        # Record-time stamp and reuse-time recompute are the SAME
+        # code path — they must agree on unchanged input.
+        assert entry.domain_slice_hash == domain_slice_hash_for(
+            run, target, "auth.c", "check_pw", 1, 3)
+
+    def test_no_model_no_stamp(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        run, target = self._setup(tmp_path, with_model=False)
+        self._append(run, target)
+        [entry] = load_entries(run)
+        assert entry.domain_slice_hash is None
+
+    def test_edge_rows_not_stamped(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        run, target = self._setup(tmp_path)
+        gap = dict(self._gap(), edge_callee="auth.c:stored_cmp")
+        self._append(run, target, gap=gap)
+        [entry] = load_entries(run)
+        assert entry.domain_slice_hash is None
+
+    def test_renderer_failure_stamps_nothing(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import core.audit.context as context_mod
+        from core.coverage.journal import load_entries
+
+        def _boom(*a, **kw):
+            raise RuntimeError("renderer failure")
+
+        monkeypatch.setattr(context_mod, "domain_slice_hash_for", _boom)
+        run, target = self._setup(tmp_path)
+        self._append(run, target)
+        # The row still lands — a slice-stamp failure must never cost
+        # the review record — just without the stamp.
+        [entry] = load_entries(run)
+        assert entry.verdict
+        assert entry.domain_slice_hash is None
+
+
+class TestExtractWeaknesses:
+    """Tests for extract_weaknesses (weakness tier extraction)."""
+
+    def test_cross_function_with_guard_type(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 buffer overflow in parse_input",
+            "confidence": "refuted",
+            "counter": "the caller validate_input() checks buffer length",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+            "assumed_property": "input length <= 256",
+        }]
+        ws = extract_weaknesses(hyps, function="parse_input", file="src/parse.c")
+        assert len(ws) == 1
+        w = ws[0]
+        assert w["guard_type"] == "bounds"
+        assert w["property"] == "input length <= 256"
+        assert w["assumed_by"] == "src/parse.c:parse_input"
+        assert "validate_input" in w["guarded_by"]
+        assert w["source"] == "structured_pass"
+        assert w["confidence"] == "medium"  # "refuted" → default
+
+    def test_confidence_propagated(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "high",
+            "counter": "caller validate_input() checks",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+            "assumed_property": "len <= 256",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws[0]["confidence"] == "high"
+
+    def test_local_scope_no_weakness(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 overflow",
+            "confidence": "refuted",
+            "counter": "length is checked at line 42",
+            "counter_scope": "local",
+            "guard_type": "bounds",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws == []
+
+    def test_missing_guard_type_no_weakness(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 overflow",
+            "confidence": "refuted",
+            "counter": "caller caps the buffer",
+            "counter_scope": "cross_function",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws == []
+
+    def test_missing_counter_scope_no_weakness(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 overflow",
+            "confidence": "refuted",
+            "counter": "caller caps the buffer",
+            "guard_type": "bounds",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws == []
+
+    def test_cwe_carried_from_hypothesis(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-476 null dereference",
+            "confidence": "refuted",
+            "counter": "caller guarantees non-NULL",
+            "counter_scope": "cross_function",
+            "guard_type": "null_safety",
+            "assumed_property": "pointer is non-NULL",
+        }]
+        ws = extract_weaknesses(hyps, cwe="CWE-476")
+        assert len(ws) == 1
+        assert ws[0]["cwe_class"] == "CWE-476"
+
+    def test_invalid_guard_type_rejected(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "refuted",
+            "counter": "caller caps it",
+            "counter_scope": "cross_function",
+            "guard_type": "magic",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert ws == []
+
+    def test_all_guard_types_accepted(self):
+        from core.audit.collector import extract_weaknesses
+
+        for gt in ("bounds", "null_safety", "validation", "sanitisation",
+                    "lifetime", "ordering", "concurrency", "other"):
+            hyps = [{
+                "mechanism": "test",
+                "confidence": "refuted",
+                "counter": "caller provides",
+                "counter_scope": "cross_function",
+                "guard_type": gt,
+            }]
+            ws = extract_weaknesses(hyps, function="f")
+            assert len(ws) == 1, f"guard_type={gt} rejected"
+            assert ws[0]["guard_type"] == gt
+
+    def test_mechanism_used_when_no_assumed_property(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 stack buffer overflow via strcpy",
+            "confidence": "refuted",
+            "counter": "caller provides safe input",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert len(ws) == 1
+        assert ws[0]["property"] == "CWE-120 stack buffer overflow via strcpy"
+
+    def test_empty_guard_type_rejected(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "refuted",
+            "counter": "caller caps it",
+            "counter_scope": "cross_function",
+            "guard_type": "",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert ws == []
+
+    def test_empty_guarded_by_when_no_function_names(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "refuted",
+            "counter": "the input is safe",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+            "assumed_property": "length bounded",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert len(ws) == 1
+        assert ws[0]["guarded_by"] == []
+
+    def test_hypothesis_cwe_overrides_fallback(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "null dereference",
+            "confidence": "refuted",
+            "counter": "caller guarantees non-NULL",
+            "counter_scope": "cross_function",
+            "guard_type": "null_safety",
+            "cwe": "CWE-476",
+        }]
+        ws = extract_weaknesses(hyps, cwe="CWE-120")
+        assert len(ws) == 1
+        assert ws[0]["cwe_class"] == "CWE-476"
+
+
+def test_journal_append_returns_the_entry_that_landed(tmp_path):
+    from core.audit.backlog_drain import _RowOutcome
+    from core.audit.collector import append_journal_for_outcome
+    from core.coverage.journal import ReviewJournalEntry, load_entries
+
+    (tmp_path / "a.c").write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    outcome = _RowOutcome(file="a.c", function="f", status="suspicious", line=1,
+                          hypothesis="owned concern", review_result={})
+    appended = append_journal_for_outcome(out_dir=tmp_path, target_path=tmp_path,
+        run_id="owned-run", outcome=outcome, gap={"line_start": 1, "line_end": 1})
+    assert isinstance(appended, ReviewJournalEntry)
+    assert (appended.file, appended.function, appended.run_id) == ("a.c", "f", "owned-run")
+    assert appended.source_hash
+    actual = load_entries(tmp_path)[0]
+    assert (actual.file, actual.function, actual.ts, actual.source_hash) == (
+        appended.file, appended.function, appended.ts, appended.source_hash)
+
+
+def test_failed_journal_append_returns_no_acknowledgement(tmp_path, monkeypatch):
+    from core.audit import collector
+    from core.audit.backlog_drain import _RowOutcome
+
+    (tmp_path / "a.c").write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    outcome = _RowOutcome(file="a.c", function="f", status="suspicious", line=1,
+                          hypothesis="owned concern", review_result={})
+    seen = []
+
+    def failed_append(directory, entry):
+        seen.append((directory, entry.function))
+        raise OSError("owned append failure")
+
+    monkeypatch.setattr(collector, "append_entry", failed_append)
+    result = collector.append_journal_for_outcome(out_dir=tmp_path, target_path=tmp_path,
+        run_id="owned-run", outcome=outcome, gap={"line_start": 1, "line_end": 1})
+    assert seen == [(tmp_path, "f")]
+    assert result is None and not (tmp_path / "review-journal.jsonl").exists()
+
+
+@pytest.mark.parametrize("failure", ["scope_mismatch", "hash_unavailable", "recording", "untyped_scope"])
+def test_bound_journal_refusal_cannot_produce_an_acknowledgement(tmp_path, monkeypatch, failure):
+    from dataclasses import replace
+    from core.audit import check_trace, collector, record
+    from core.audit.backlog_drain import _RowOutcome
+    from core.audit.refutation_source import capture_source_identity
+    from core.audit.verification_results import VerificationScope
+
+    path = tmp_path / "a.c"
+    path.write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    scope = VerificationScope("a.c", "f", 1, "owned concern", capture_source_identity(tmp_path, "a.c"))
+    outcome = _RowOutcome(file="a.c", function="f", status="suspicious", line=1,
+                          hypothesis="owned concern", review_result={})
+    seen = []
+
+    def no_hash(*args, **kwargs):
+        seen.append("hash")
+        return None
+
+    def failed_record(*args, **kwargs):
+        seen.append("record")
+        raise OSError("owned recording failure")
+
+    if failure == "scope_mismatch":
+        scope = replace(scope, function="g")
+    elif failure == "hash_unavailable":
+        monkeypatch.setattr(record, "_compute_hash", no_hash)
+    elif failure == "recording":
+        path.write_text("int f(void) { return 1; }\n", encoding="utf-8")
+        monkeypatch.setattr(check_trace, "record_source_invalidation", failed_record)
+    else:
+        scope = {"file": "a.c"}  # model-shaped data is not a pipeline scope
+    result = collector.append_journal_for_outcome(out_dir=tmp_path, target_path=tmp_path,
+        run_id="owned-run", outcome=outcome, gap={"line_start": 1, "line_end": 1}, verification_scope=scope)
+    assert result is None and not (tmp_path / "review-journal.jsonl").exists()
+    assert seen == ({"hash_unavailable": ["hash"], "recording": ["record"]}.get(failure, []))

@@ -1,0 +1,281 @@
+"""Journal body must agree with the stored verdict.
+
+Observed field failure: a journal record carried verdict=suspicious
+while its body ended "Verdict: clean" — the counter-hypothesis
+escalation flipped the status after the prose was generated and never
+annotated the text, leaving the operator to guess which to trust.
+Status flips and withheld model refutations stamp a gate marker at
+the top of the body. Also covers the loud-once fix-history skip on
+non-git targets. Hermetic — LLM stubbed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from core.audit.llm_review import make_review_fn
+from core.audit.orchestrator import OrchestratorConfig
+
+
+class _StubResponse:
+    def __init__(self, result):
+        self.result = result
+        self.cost = 0.1
+        self.model = "stub"
+        self.input_tokens = 1
+        self.output_tokens = 1
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+
+
+class _StubClient:
+    def __init__(self, result):
+        self._result = result
+
+    def supports_prompt_caching_for(self):
+        return False
+
+    def generate_structured(self, prompt, schema, **kwargs):
+        return _StubResponse(dict(self._result))
+
+
+def _review(result_dict, ctx_extra=None):
+    client = _StubClient(result_dict)
+    review_fn = make_review_fn(client)
+    ctx = {
+        "file": "a.c", "function": "f", "source": "int f(void){}",
+        "line_start": 1, "line_end": 1,
+    }
+    if ctx_extra:
+        ctx.update(ctx_extra)
+    config = OrchestratorConfig(target_path=Path("."), out_dir=None)
+    return review_fn(ctx, config)
+
+
+COMPELLING_COUNTER = (
+    "an attacker-controlled length reaching memcpy can overflow the "
+    "stack buffer when the caller passes tainted input"
+)
+
+
+class TestBodyAnnotatedOnStatusFlips:
+    def test_counter_escalation_stamps_body(self):
+        outcome = _review({
+            "status": "clean",
+            "body": "All flows are bounds-checked. Verdict: clean.",
+            "counter_hypothesis": COMPELLING_COUNTER,
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.body.startswith(
+            "[counter-hypothesis escalation:",
+        ), (
+            "a body arguing clean under a suspicious verdict must "
+            "carry the gate marker"
+        )
+        # The original prose is preserved below the marker.
+        assert "Verdict: clean." in outcome.body
+
+    def test_model_refutation_stamps_withheld_adjudication(self):
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Possible overflow at line 10.",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted",
+                 "counter": "n is clamped to sizeof(buf) on line 8, "
+                            "inside this function",
+                 "counter_scope": "local"},
+                {"mechanism": "underflow via m", "confidence": "refuted",
+                 "counter": "m is unsigned and checked > 0 before the "
+                            "subtraction on line 12",
+                 "counter_scope": "local"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.body.startswith("[withheld all-refuted demotion:")
+        assert outcome.review_result["all_refuted_demotion_withheld"] == "explicit-withdrawal-required"
+        assert "all_refuted_grounding" not in outcome.review_result
+
+    def test_rationale_consistency_check_flips_nothing(self):
+        # The rationale-consistency check never changes a verdict: a finding whose
+        # rationale reads clean stays a finding with its body as
+        # written (nothing to reconcile); the check only leaves a
+        # review_result note.
+        """A finding whose rationale reads clean must stay a finding with its
+        body exactly as written, carrying only a review_result note. If the
+        check flipped the status, body and verdict would disagree again, which
+        is the field failure this file guards against."""
+        body = (
+            "The function is safe because every index is clamped "
+            "before use."
+        )
+        outcome = _review({
+            "status": "finding", "body": body,
+            "hypothesis": "index overflow",
+        })
+        assert outcome.status == "finding"
+        assert outcome.body == body
+        assert "rationale_consistency_note" in outcome.review_result
+
+    def test_unflipped_verdicts_keep_bare_body(self):
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Possible overflow at line 10.",
+            "hypothesis": "overflow via n",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "medium"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.body == "Possible overflow at line 10."
+
+
+class TestAllRefutedGrounding:
+    """Model refutations remain unverified pending admitted adjudication.
+
+    A refutation with no counter, a cross_function counter, or a
+    contract-delegating counter is an unverified claim — the verdict
+    stays suspicious (with a visible withhold marker) so verification
+    adjudicates it instead of the model erasing its own suspicion by
+    assertion. A deepen pass also requires admitted adjudication or
+    explicit source-bound withdrawal, rather than a provenance label.
+    """
+
+    def test_missing_counter_withholds_demotion(self):
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Possible overflow at line 10.",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.body.startswith("[withheld all-refuted demotion:")
+        assert outcome.review_result[
+            "all_refuted_demotion_withheld"] == "ungrounded"
+        assert "all_refuted_demotion" not in outcome.review_result
+        # The original prose is preserved below the marker.
+        assert "Possible overflow at line 10." in outcome.body
+
+    def test_cross_function_counter_withholds_demotion(self):
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Possible overflow at line 10.",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted",
+                 "counter": "the parse_header caller clamps n before "
+                            "every call site",
+                 "counter_scope": "cross_function"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.review_result[
+            "all_refuted_demotion_withheld"] == "ungrounded"
+
+    def test_contract_delegation_counter_withholds_demotion(self):
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Possible overflow at line 10.",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted",
+                 "counter": "the caller must ensure n <= sizeof(buf) "
+                            "per the function's contract",
+                 "counter_scope": "local"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.review_result[
+            "all_refuted_demotion_withheld"] == "ungrounded"
+
+    def test_one_ungrounded_among_grounded_withholds(self):
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Two candidate defects.",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted",
+                 "counter": "n is clamped to sizeof(buf) on line 8",
+                 "counter_scope": "local"},
+                {"mechanism": "underflow via m", "confidence": "refuted"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert "1 of 2" in outcome.body
+
+    def test_counter_escalated_all_refuted_keeps_floor(self):
+        # Machine-raised suspicious (model said clean, compelling
+        # counter escalated it): the same response's refutation record
+        # may not un-raise it without a verification-grade receipt —
+        # even when every refutation is grounded.
+        outcome = _review({
+            "status": "clean",
+            "body": "All flows are bounds-checked. Verdict: clean.",
+            "counter_hypothesis": COMPELLING_COUNTER,
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted",
+                 "counter": "n is clamped to sizeof(buf) on line 8",
+                 "counter_scope": "local"},
+            ],
+        })
+        assert outcome.status == "suspicious"
+        assert outcome.review_result[
+            "all_refuted_demotion_withheld"] == "counter-escalation-floor"
+        # The escalation marker stays FIRST (journal-rebuild provenance
+        # reads the body prefix); the withhold marker splices second.
+        assert outcome.body.startswith("[counter-hypothesis escalation:")
+        head, _, tail = outcome.body.partition("\n\n")
+        assert tail.startswith("[withheld all-refuted demotion:")
+
+    def test_deepen_model_refutation_withholds_adjudication(self):
+        # A deepen context does not admit a negative fact or withdrawal.
+        outcome = _review({
+            "status": "suspicious",
+            "body": "Possible overflow at line 10.",
+            "hypotheses": [
+                {"mechanism": "overflow via n", "confidence": "refuted"},
+            ],
+        }, ctx_extra={"deepen": True})
+        assert outcome.status == "suspicious"
+        assert outcome.body.startswith("[withheld all-refuted demotion:")
+        assert outcome.review_result["all_refuted_demotion_withheld"] == "ungrounded"
+        assert "all_refuted_grounding" not in outcome.review_result
+
+
+class TestFixHistorySkipIsLoud:
+    def test_non_git_target_logs_one_notice(self, tmp_path, monkeypatch):
+        import core.audit.fix_history as _fh
+
+        infos: list[str] = []
+
+        def _info(msg, *args, **kwargs):
+            infos.append(str(msg) % args if args else str(msg))
+
+        monkeypatch.setattr(_fh.logger, "info", _info)
+        monkeypatch.setattr(
+            "core.audit.git_oracle._is_git_repo", lambda p: False,
+        )
+
+        fixes = _fh.mine_security_fixes(tmp_path)
+        assert fixes == []
+        notices = [m for m in infos if "not a git repository" in m]
+        assert len(notices) == 1, (
+            "fix-history must announce (once) why it mined nothing"
+        )
+
+
+class TestSiblingSarifNoOpIsLoud:
+    def test_zero_import_announces_itself(self):
+        # The orchestrator's prep block logs a visible line for BOTH
+        # outcomes of the sibling-SARIF import; the zero path used to
+        # vanish silently. Source-level pin: the else-branch exists
+        # right next to the import call.
+        import inspect
+
+        import core.audit.orchestrator as _orch
+
+        src = inspect.getsource(_orch)
+        anchor = src.find("import_sibling_sarif(\n            sarif_cache")
+        assert anchor != -1
+        window = src[anchor:anchor + 1200]
+        assert "nothing imported" in window, (
+            "the sibling-SARIF no-op must log loudly instead of "
+            "returning silently"
+        )

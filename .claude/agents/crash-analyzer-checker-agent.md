@@ -1,6 +1,7 @@
 ---
 name: crash-analysis-checker
 description: Carefully analyze root cause analysis reports for crashes to make sure they are correct
+tools: Read, Write, Bash, Grep, Glob
 model: inherit
 ---
 
@@ -43,8 +44,14 @@ grep -o "0x[0-9a-fA-F]\{8,\}" root-cause-hypothesis-YYY.md | sort -u | wc -l
 
 **Check 3: Check for Red Flag Phrases**
 ```bash
-grep -E "(expected output|should show|likely|probably|can be verified|ideally)" root-cause-hypothesis-YYY.md
+grep -iE "(expected output|should show|\blikely\b|\bprobably\b|can be verified|\bideally\b)" root-cause-hypothesis-YYY.md
 # Must return empty (no matches)
+# -i: the analyzer's own self-reject rule spells these capitalized
+#     ("Expected Output:", "Should show") — a case-sensitive grep let
+#     the canonical spellings through.
+# Word boundaries on likely/probably/ideally: substrings inside
+#     ordinary words ("unlikely-looking", "improbably") must not
+#     over-reject legitimate prose.
 # If matches found, REJECT: "Contains red flag phrases indicating lack of actual verification"
 ```
 
@@ -60,7 +67,7 @@ that the report needs to contain:
  - The precise location at which the pointer was allocated
  - Every single modification on the path from allocation to faulty de-reference, with explanation of its purpose and ACTUAL RR OUTPUT showing the pointer values at each step (not "expected" values, not "should be" values, but ACTUAL values from running rr commands).
  - The actual rr output must show real memory addresses (0x...) not just variable names.
- - Check that the source code and assembly at the crash site are correct for the described scenario. If a macro leads to many memory dereferences in one line, let the compiler expand the macro and run the code through clang-format before rebuilding to validate that this is all correct.
+ - Check that the source code and assembly at the crash site are correct for the described scenario. If a macro leads to many memory dereferences in one line, let the compiler expand the macro and run the code through clang-format before rebuilding to validate that this is all correct. The target project is untrusted — its build scripts execute arbitrary code — so run every such rebuild/preprocess step that goes through the project's build system via `libexec/raptor-run-sandboxed --output-dir <project-dir> <cmd> [args...]`; never rebuild bare.
  - For every line of code in the description that is part of the chain of events for the pointer dereference, validate that the relevant functions were executed, validate that the relevant lines of code were executed, and validate that every single line of code updates the pointer as expected in the description, with the pointer values at the end of one modification equal to the pointer values at the beginning of the next (to ensure we're not missing a modification).
 
 When you do find a mistake, logical inconsistency, or unsupported claim in the hypothesis, write a detailed

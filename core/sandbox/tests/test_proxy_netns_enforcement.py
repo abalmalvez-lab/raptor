@@ -1,0 +1,920 @@
+"""Tests for proxy enforcement via network namespace + unix socket bridge.
+
+Validates that when Landlock's TCP allowlist is unavailable (ABI < 4),
+the sandbox falls back to putting the child in an empty network
+namespace and relaying through a TCP→Unix forwarder.
+"""
+import os
+import socket
+import subprocess
+import sys
+import time
+from contextlib import ExitStack
+from pathlib import Path
+from unittest import mock
+
+import pytest
+from core.sandbox.tests.capability import requires_landlock
+from core.sandbox.tests.socket_server import SocketServer
+
+
+from core.testing.module_bindings import mock_module_attribute
+from core.testing.processes import reap_on_exit
+
+
+RAPTOR_DIR = Path(__file__).resolve().parents[3]
+# Hard-SET (never setdefault): the code under test derives paths from
+# RAPTOR_DIR; an ambient value for another checkout must not win.
+if __name__ == "__main__":
+    os.environ["RAPTOR_DIR"] = str(RAPTOR_DIR)
+    if str(RAPTOR_DIR) not in sys.path:
+        sys.path.insert(0, str(RAPTOR_DIR))
+
+
+@pytest.fixture(autouse=True)
+def _owned_install_dir(monkeypatch):
+    monkeypatch.setenv("RAPTOR_DIR", str(RAPTOR_DIR))
+
+
+
+# ---------------------------------------------------------------------------
+# proxy.py: bind_unix / unbind_unix
+# ---------------------------------------------------------------------------
+
+class TestProxyUnixSocket:
+    """EgressProxy.bind_unix / unbind_unix lifecycle."""
+
+    @pytest.fixture(autouse=True)
+    def _proxy(self, short_sock_dir):
+        from core.sandbox.proxy import EgressProxy
+
+        # The stub keeps CONNECT tests local; its sockets and threads must
+        # also be retired if later fixture setup fails before yield.
+        with ExitStack() as cleanup:
+            self._upstream = cleanup.enter_context(
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+            )
+            self._upstream.bind(("127.0.0.1", 0))
+            self._upstream.listen(8)
+            upstream_port = self._upstream.getsockname()[1]
+
+            def _serve_upstream(conn):
+                try:
+                    conn.settimeout(5)
+                    data = b""
+                    while b"\r\n\r\n" not in data:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        data += chunk
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+            self._upstream_server = cleanup.enter_context(
+                SocketServer(self._upstream, _serve_upstream),
+            )
+            self.proxy = EgressProxy(
+                ["example.com"],
+                upstream_proxy=f"http://127.0.0.1:{upstream_port}",
+            )
+            cleanup.callback(self.proxy.stop, drain_timeout=0)
+            self.sock_path = str(short_sock_dir / "p.sock")
+            yield
+
+    def test_bind_creates_socket_file(self):
+        self.proxy.bind_unix(self.sock_path)
+        assert os.path.exists(self.sock_path)
+        st = os.stat(self.sock_path)
+        import stat
+        assert stat.S_ISSOCK(st.st_mode)
+
+    def test_unbind_removes_socket_file(self):
+        self.proxy.bind_unix(self.sock_path)
+        assert os.path.exists(self.sock_path)
+        self.proxy.unbind_unix(self.sock_path)
+        assert not os.path.exists(self.sock_path)
+
+    def test_unbind_idempotent(self):
+        self.proxy.bind_unix(self.sock_path)
+        self.proxy.unbind_unix(self.sock_path)
+        self.proxy.unbind_unix(self.sock_path)  # no error
+
+    def test_connect_via_unix_socket(self):
+        """CONNECT through the unix socket and get a response."""
+        self.proxy.bind_unix(self.sock_path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(self.sock_path)
+            s.sendall(
+                b"CONNECT example.com:443 HTTP/1.1\r\n"
+                b"Host: example.com:443\r\n\r\n"
+            )
+            resp = s.recv(4096)
+            # Deterministic via the loopback upstream stub: the tunnel
+            # establishes and the unix-socket path is proven
+            # end-to-end without touching the real network.
+            assert resp.startswith(b"HTTP/1.1 200"), resp
+        finally:
+            s.close()
+
+    def test_denied_host_via_unix_socket(self):
+        """Non-allowlisted host is denied through unix socket too."""
+        self.proxy.bind_unix(self.sock_path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(self.sock_path)
+            s.sendall(
+                b"CONNECT evil.example:443 HTTP/1.1\r\n"
+                b"Host: evil.example:443\r\n\r\n"
+            )
+            resp = s.recv(4096)
+            assert b"403" in resp
+        finally:
+            s.close()
+
+    def test_stop_cleans_up_unix_servers(self):
+        self.proxy.bind_unix(self.sock_path)
+        self.proxy.stop(drain_timeout=0)
+        assert not os.path.exists(self.sock_path)
+
+    def test_peer_check_allows_unix(self):
+        """Unix socket connections have no peer IP — must not be
+        rejected by the loopback-only check."""
+        self.proxy.bind_unix(self.sock_path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(self.sock_path)
+            s.sendall(
+                b"CONNECT example.com:443 HTTP/1.1\r\n"
+                b"Host: example.com:443\r\n\r\n"
+            )
+            resp = s.recv(4096)
+            # NOT rejected with "non-loopback peer"
+            assert b"non-loopback" not in resp.lower()
+            assert resp.startswith(b"HTTP/1.1 ")
+        finally:
+            s.close()
+
+
+@pytest.mark.parametrize("fail_setup", [False, True])
+def test_proxy_fixture_closes_upstream_on_every_exit(monkeypatch, short_sock_dir, fail_setup):
+    from core.sandbox import proxy as proxy_mod
+
+    owner = TestProxyUnixSocket()
+    stopped = []
+
+    class ProbeProxy:
+        def __init__(self, *args, **kwargs):
+            if fail_setup:
+                raise RuntimeError("fixture setup failed")
+
+        def stop(self, *, drain_timeout):
+            # Stop the proxy before tearing down the backend it may still use.
+            assert owner._upstream.fileno() != -1
+            assert owner._upstream_server._accept_thread.is_alive()
+            stopped.append(drain_timeout)
+
+    monkeypatch.setattr(proxy_mod, "EgressProxy", ProbeProxy)
+    fixture = TestProxyUnixSocket._proxy.__wrapped__(owner, short_sock_dir)
+    try:
+        if fail_setup:
+            with pytest.raises(RuntimeError, match="fixture setup failed"):
+                next(fixture)
+        else:
+            next(fixture)
+            fixture.close()
+    finally:
+        fixture.close()
+
+    assert stopped == ([] if fail_setup else [0])
+    assert owner._upstream.fileno() == -1
+    assert not owner._upstream_server._accept_thread.is_alive()
+    assert not owner._upstream_server._clients
+
+
+# ---------------------------------------------------------------------------
+# _proxy_bridge.py: bring_up_loopback + _run_forwarder
+# ---------------------------------------------------------------------------
+
+def _free_loopback_port() -> int:
+    """Ephemeral free port on 127.0.0.1.
+
+    The forwarder tests used FIXED ports (19876/19877): a concurrent
+    session running the same suite collides outright, and even a
+    solo back-to-back rerun used to fail on the TIME_WAIT remnant
+    before _run_forwarder gained SO_REUSEADDR. A kernel-assigned
+    port sidesteps both.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _connect_with_retry(port: int, deadline_s: float = 5.0) -> socket.socket:
+    """Connect to a just-spawned forwarder, retrying while it binds.
+
+    A fixed pre-connect sleep is not hermetic: under full-suite load
+    the spawned forwarder can take longer than the sleep to import and
+    bind, and the parent's connect() then fails with ECONNREFUSED.
+    Retry until the deadline instead.
+    """
+    end = time.monotonic() + deadline_s
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        try:
+            s.connect(("127.0.0.1", port))
+            return s
+        except OSError:
+            s.close()
+            if time.monotonic() >= end:
+                raise
+            time.sleep(0.05)
+
+
+def _spawn_forwarder(port, sock_path, death_r):
+    """Run ``_run_forwarder`` in a FRESH single-threaded interpreter.
+
+    These tests used to ``os.fork()`` the forwarder, but the test
+    process is legitimately multi-threaded by the time they run under
+    a full-suite order: the egress-proxy singleton's daemon thread
+    (``raptor-egress-proxy``), started by any earlier sandbox test,
+    lives for the whole process, and two of the tests below start
+    their own echo threads before launching the forwarder. Forking
+    there draws Python's multi-threaded-fork DeprecationWarning on
+    every run. The forwarder only needs importable module code plus
+    one inherited fd, so a subprocess (fork+exec into a fresh,
+    single-threaded interpreter) preserves the semantics without the
+    fork hazard. ``pass_fds`` keeps ``death_r``'s descriptor number
+    intact in the child; the caller still closes its own copy.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(RAPTOR_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+    code = (
+        "import sys\n"
+        "from core.sandbox._proxy_bridge import _run_forwarder\n"
+        "_run_forwarder(int(sys.argv[1]), sys.argv[2], int(sys.argv[3]))\n"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", code, str(port), sock_path, str(death_r)],
+        pass_fds=(death_r,), env=env,
+    )
+
+
+class TestProxyBridge:
+    """TCP-to-Unix forwarder integration."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        # Short tmpdir for AF_UNIX path limit on macOS (104 bytes).
+        candidate = str(tmp_path / "r.sock")
+        if len(candidate) > 100:
+            import tempfile
+            self.tmp = Path(tempfile.mkdtemp(prefix="rpt_", dir="/tmp")).resolve()
+            self._short_dir = self.tmp
+        else:
+            self.tmp = tmp_path
+            self._short_dir = None
+        yield
+        if self._short_dir:
+            import shutil
+            shutil.rmtree(str(self._short_dir), ignore_errors=True)
+
+    # os.unshare is Linux-only — real-kernel netns binding.
+    @pytest.mark.linux_native
+    def test_bring_up_loopback_in_netns(self):
+        """bring_up_loopback works inside a fresh netns (requires
+        CAP_NET_ADMIN in a user-ns)."""
+        script = (
+            "import os, socket, struct\n"
+            "os.unshare(0x40000000 | 0x10000000)\n"  # NEWUSER | NEWNET
+            "from core.sandbox._proxy_bridge import _bring_up_loopback\n"
+            "_bring_up_loopback()\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.bind(('127.0.0.1', 0))\n"
+            "print('OK', s.getsockname())\n"
+            "s.close()\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={"PYTHONPATH": str(RAPTOR_DIR), "PATH": os.environ["PATH"]},
+        )
+        if result.returncode != 0 and "PermissionError" in result.stderr:
+            pytest.skip(
+                "SIOCSIFFLAGS denied — kernel or seccomp blocks "
+                "CAP_NET_ADMIN inside user namespaces"
+            )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+
+    def test_forwarder_relays_data(self):
+        """_run_forwarder bridges TCP ↔ Unix socket."""
+        with ExitStack() as cleanup:
+            sock_path = str(self.tmp / "relay.sock")
+            port = _free_loopback_port()
+            echo_srv = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+            echo_srv.bind(sock_path)
+            echo_srv.listen(1)
+
+            def echo(conn):
+                data = conn.recv(4096)
+                if data:
+                    conn.sendall(data)
+
+            server = SocketServer(echo_srv, echo)
+            cleanup.callback(server.close)
+            death_r, death_w = os.pipe()
+            read_cleanup = ExitStack()
+            read_cleanup.callback(os.close, death_r)
+            cleanup.callback(read_cleanup.close)
+            write_cleanup = ExitStack()
+            write_cleanup.callback(os.close, death_w)
+            cleanup.callback(write_cleanup.close)
+            fwd = _spawn_forwarder(port, sock_path, death_r)
+            cleanup.enter_context(reap_on_exit(fwd))
+            read_cleanup.close()
+            # Connect via TCP → forwarder → unix → echo server → back.
+            # Retries while the spawned forwarder starts up and binds — a
+            # fixed sleep is not hermetic under full-suite load.
+            s = cleanup.enter_context(_connect_with_retry(port))
+            s.sendall(b"hello-bridge")
+            s.settimeout(5.0)
+            got = s.recv(4096)
+            s.close()
+
+            assert got == b"hello-bridge"
+            write_cleanup.close()
+            fwd.wait(timeout=10)
+
+    def test_forwarder_concurrent_connections_with_churn(self):
+        """Multiple simultaneous relays with interleaved teardown must
+        not cross-contaminate. Regression cover for the readable-
+        snapshot restructure: a relay fd closed earlier in a select
+        iteration must be skipped (not read/closed again), and accepts
+        are deferred until after the snapshot is processed so a fresh
+        connection can't alias a just-closed fd number."""
+        with ExitStack() as cleanup:
+            sock_path = str(self.tmp / "churn.sock")
+            echo_srv = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+            echo_srv.bind(sock_path)
+            echo_srv.listen(64)
+
+            def echo(conn):
+                try:
+                    while data := conn.recv(4096):
+                        conn.sendall(data)
+                except OSError:
+                    # The native churn deliberately resets some peers.
+                    pass
+
+            server = SocketServer(echo_srv, echo)
+            cleanup.callback(server.close)
+            port = _free_loopback_port()
+            death_r, death_w = os.pipe()
+            read_cleanup = ExitStack()
+            read_cleanup.callback(os.close, death_r)
+            cleanup.callback(read_cleanup.close)
+            write_cleanup = ExitStack()
+            write_cleanup.callback(os.close, death_w)
+            cleanup.callback(write_cleanup.close)
+            fwd = _spawn_forwarder(port, sock_path, death_r)
+            cleanup.enter_context(reap_on_exit(fwd))
+            read_cleanup.close()
+            # Rapid rounds of: open several connections, exchange a
+            # unique payload on each, abruptly close some while others
+            # are mid-flight, verify the survivors' payloads are
+            # intact (no bytes from a torn-down relay leak in).
+            for round_no in range(10):
+                socks = []
+                for i in range(6):
+                    s = cleanup.enter_context(_connect_with_retry(port))
+                    s.settimeout(5.0)
+                    socks.append(s)
+                # Abruptly close half BEFORE any traffic — their
+                # teardown lands in the same select snapshots as the
+                # survivors' data + new accepts.
+                for s in socks[::2]:
+                    s.close()
+                survivors = socks[1::2]
+                for i, s in enumerate(survivors):
+                    payload = f"r{round_no}-c{i}".encode() * 50
+                    s.sendall(payload)
+                    got = b""
+                    while len(got) < len(payload):
+                        chunk = s.recv(4096)
+                        assert chunk, (
+                            f"round {round_no} conn {i}: relay died "
+                            f"mid-payload (got {len(got)} bytes)"
+                        )
+                        got += chunk
+                    assert got == payload, (
+                        f"round {round_no} conn {i}: payload corrupted"
+                    )
+                for s in survivors:
+                    s.close()
+            write_cleanup.close()
+            fwd.wait(timeout=10)
+
+    def test_forwarder_exits_on_death_pipe(self):
+        """Forwarder exits when death pipe write end is closed."""
+        with ExitStack() as cleanup:
+            sock_path = str(self.tmp / "noop.sock")
+            # The forwarder need not reach this listener before the EOF.
+            noop_srv = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+            noop_srv.bind(sock_path)
+            noop_srv.listen(1)
+            death_r, death_w = os.pipe()
+            read_cleanup = ExitStack()
+            read_cleanup.callback(os.close, death_r)
+            cleanup.callback(read_cleanup.close)
+            write_cleanup = ExitStack()
+            write_cleanup.callback(os.close, death_w)
+            cleanup.callback(write_cleanup.close)
+            fwd = _spawn_forwarder(_free_loopback_port(), sock_path, death_r)
+            cleanup.enter_context(reap_on_exit(fwd))
+            read_cleanup.close()
+            write_cleanup.close()
+            assert fwd.wait(timeout=10) == 0
+
+
+# ---------------------------------------------------------------------------
+# context.py: proxy_netns fallback path
+# ---------------------------------------------------------------------------
+
+def _spawn_backend_live() -> bool:
+    """Production gates for the netns bridge tier (Tier 1): the
+    forwarder rides the fork spawn backend, which needs REAL userns +
+    mount-ns capability — the same probes context.py consults. Late
+    attribute lookup (``probes.check_...``) so a harness that patches
+    the probe module is honoured."""
+    if sys.platform != "linux":
+        return False
+    from core.sandbox import probes
+    return probes.check_net_available() and probes.check_mount_available()
+
+
+class TestProxyNetnsContextWiring:
+    """Verify context.py routes between the egress tiers on the
+    production gates: netns bridge (Tier 1) needs the SPAWN backend
+    (net capability AND the mount probe), any Landlock ABI; without
+    the backend the context takes the Landlock TCP pin (ABI >= 4,
+    stamped ``landlock_tcp``) / advisory (ABI < 4, stamped
+    ``advisory`` — the pin has no kernel TCP allowlist to ride, so
+    only the env vars steer traffic). An operator-disabled sandbox
+    sheds every enforcement layer, so it stamps ``advisory`` too,
+    whatever the host could have delivered.
+
+    The probe inputs are pinned by mock so each test asserts the TIER
+    DECISION for one explicit host shape; tests whose decision lands
+    on the netns tier additionally gate on the REAL probes because
+    they spawn a live child through that tier.
+
+    The PLATFORM the wiring consults is pinned the same way —
+    ``sys.platform`` branches before any probe is read, and macOS
+    truthfully stamps ``seatbelt_tcp`` for every non-netns proxy run,
+    so an unpinned simulation encodes one platform's answer against
+    whatever host runs it. Because the child is real, each pinned
+    direction also carries the native marker for the kernel it needs:
+    linux tiers spawn through Landlock/netns, the darwin tier through
+    seatbelt."""
+
+    @pytest.fixture(autouse=True)
+    def _tmpdir(self, tmp_path):
+        self.out = str(tmp_path / "out")
+        os.makedirs(self.out, exist_ok=True)
+
+    @pytest.fixture
+    def _fresh_tier2_latch(self):
+        """Give the test an unfired tier-2 warn-once latch.
+
+        The warning is once-per-PROCESS; under shuffled full-suite
+        order any earlier egress-proxy sandbox that lands on the
+        Landlock tier — including tests OUTSIDE this directory, which
+        this dir's ``_sandbox_state_guard`` conftest cannot restore —
+        consumes the once and the assertions below see zero WARNING
+        records. Resetting up front makes each tier-2 test own its
+        latch state; the conftest guard still restores the pre-test
+        value afterwards, so process-global semantics are preserved
+        for everything else."""
+        from core.sandbox import state
+        state.reset_warn_once("_proxy_tier2_port_pin_warned")
+
+    def _enforcement_with(self, *, abi: int, net: bool, mount: bool,
+                          platform: str) -> "str | None":
+        """Run a trivial child with the probe surface pinned; return
+        the proxy_enforcement the context chose.
+
+        ``platform`` pins the platform the wiring consults (the same
+        seam ``_enter_egress`` pins): the tier selection branches on
+        ``sys.platform`` BEFORE it reads any probe, so an unpinned
+        simulation asserts one platform's tier names against whatever
+        host runs the suite — on a real mac the truthful stamp for
+        every non-netns proxy run is ``seatbelt_tcp``, not the linux
+        tier names. The pin makes each test's platform assumption
+        explicit; it does NOT make the test host-independent, because
+        the child is REAL: the linux direction spawns through the
+        selected linux tier (Landlock/netns — ``linux_native``), and
+        the darwin direction needs the real seatbelt backend (a
+        mocked-available seatbelt fails closed at spawn on any other
+        kernel — ``darwin_native``)."""
+        import core.sandbox.context as ctx
+        from core.sandbox import sandbox
+
+        with mock_module_attribute(
+            ctx, 'sys', "platform", platform,
+        ), mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=abi,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available",
+            return_value=net,
+        ), mock.patch(
+            "core.sandbox.context.check_mount_available",
+            return_value=mount,
+        ), sandbox(
+            target=self.out,
+            output=self.out,
+            use_egress_proxy=True,
+            proxy_hosts=["example.com"],
+        ) as run:
+            result = run(
+                ["echo", "proxy-tier-test"],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0
+            return result.sandbox_info.get("proxy_enforcement")
+
+    @pytest.mark.skipif(
+        not _spawn_backend_live(),
+        reason="netns tier spawns a live child through the fork "
+               "backend (needs real userns + mount-ns capability)",
+    )
+    @requires_landlock
+    def test_netns_path_selected_on_low_abi(self):
+        """ABI < 4 with the spawn backend live → netns enforcement."""
+        assert self._enforcement_with(
+            abi=3, net=True, mount=True, platform="linux",
+        ) == "netns"
+
+    @pytest.mark.skipif(
+        not _spawn_backend_live(),
+        reason="netns tier spawns a live child through the fork "
+               "backend (needs real userns + mount-ns capability)",
+    )
+    @requires_landlock
+    def test_netns_tier_wins_on_high_abi(self):
+        """netns is the strongest tier and wins on ANY ABI when the
+        spawn backend is live — the Landlock pin is port-scoped to
+        any host and needs the seccomp UDP block, so ABI >= 4 no
+        longer routes to landlock_tcp on backend-capable hosts."""
+        assert self._enforcement_with(
+            abi=4, net=True, mount=True, platform="linux",
+        ) == "netns"
+
+    @pytest.mark.linux_native
+    def test_landlock_tcp_when_mount_probe_fails_on_high_abi(self):
+        """netns capability alone is NOT enough: without the mount-ns
+        spawn backend there is no forwarder, so the context must take
+        the Landlock TCP pin tier (the netns tier would hand the child
+        an empty namespace with no route to the proxy)."""
+        assert (self._enforcement_with(
+            abi=4, net=True, mount=False, platform="linux",
+        ) == "landlock_tcp")
+
+    @pytest.mark.linux_native
+    def test_advisory_tier_when_mount_probe_fails_on_low_abi(self):
+        """Same mount-gate routing on ABI < 4 — but stamped for what
+        it IS: Landlock has no TCP allowlist before ABI 4, so nothing
+        enforces the pin and the honest label is ``advisory``
+        (env-vars only), not the enforcing tier's name."""
+        assert (self._enforcement_with(
+            abi=3, net=True, mount=False, platform="linux",
+        ) == "advisory")
+
+    @pytest.mark.darwin_native
+    def test_seatbelt_tcp_stamped_on_darwin(self):
+        """Darwin direction of the same wiring: on macOS every
+        non-netns proxy run enforces the port pin through seatbelt
+        SBPL, and the stamp says so truthfully — ``seatbelt_tcp``,
+        never a linux tier name, even on the exact probe shape the
+        linux direction maps to ``landlock_tcp`` (the netns bridge is
+        a linux tier; its capability probe is platform-gated off on
+        darwin before any probe is read). Real seatbelt backend
+        required: the child spawns through sandbox-exec."""
+        assert (self._enforcement_with(
+            abi=4, net=True, mount=False, platform="darwin",
+        ) == "seatbelt_tcp")
+
+    def _enter_egress(self, *, platform, net, mount, require, env=None, monkeypatch=None):
+        """Enter sandbox() with the probe/platform surface pinned and exit
+        WITHOUT running a child — exercises the 00015 setup-time guard,
+        which fires (or not) at __enter__ before any child executes."""
+        import core.sandbox.context as ctx
+        from core.sandbox import sandbox
+        if env and monkeypatch:
+            monkeypatch.setenv("RAPTOR_ALLOW_DEGRADED_UNTRUSTED", env)
+        with mock_module_attribute(ctx, 'sys', "platform", platform), mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=4,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available", return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available", return_value=net,
+        ), mock.patch(
+            "core.sandbox.context.check_mount_available", return_value=mount,
+        ):
+            with sandbox(
+                target=self.out, output=self.out, use_egress_proxy=True,
+                proxy_hosts=["example.com"], require_proxy_netns=require,
+            ):
+                pass
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_require_proxy_netns_fails_closed_on_linux_degraded(self):
+        """00015: on a Linux net-yes/mount-no host, an untrusted-egress
+        caller requiring the netns tier is REFUSED (not silently port-pinned)."""
+        from core.sandbox.errors import SandboxSetupError
+        with pytest.raises(SandboxSetupError, match="netns egress tier"):
+            self._enter_egress(platform="linux", net=True, mount=False, require=True)
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_require_proxy_netns_override_bypasses_guard_on_linux(self, monkeypatch):
+        """The operator override lets the degraded tier through explicitly
+        (the setup-time guard does not fire)."""
+        # No SandboxSetupError('netns egress tier') should be raised.
+        self._enter_egress(platform="linux", net=True, mount=False, require=True,
+                           env="1", monkeypatch=monkeypatch)
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_require_proxy_netns_falsey_override_keeps_guard(self, monkeypatch):
+        """A falsey override value (0/false/off) must NOT bypass the guard —
+        the guard uses strict truthiness, matching _require_userns_or_optin."""
+        from core.sandbox.errors import SandboxSetupError
+        for val in ("0", "false", "off", "no", ""):
+            with pytest.raises(SandboxSetupError, match="netns egress tier"):
+                self._enter_egress(platform="linux", net=True, mount=False,
+                                   require=True, env=val, monkeypatch=monkeypatch)
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_require_proxy_netns_not_enforced_on_darwin(self):
+        """Regression (macOS blocker): macOS uses seatbelt (a different
+        enforcement path) where _use_proxy_netns is always False; the guard
+        must NOT fire there, or every macOS untrusted-egress caller breaks."""
+        # net/mount irrelevant on darwin; the guard is scoped out entirely.
+        self._enter_egress(platform="darwin", net=True, mount=False, require=True)
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_require_proxy_netns_flag_off_does_not_fire_on_linux(self):
+        """Without the flag (trusted egress callers), the guard never fires."""
+        self._enter_egress(platform="linux", net=True, mount=False, require=False)
+
+    @pytest.mark.linux_native
+    def test_tcp_path_when_netns_unavailable(self):
+        """Without netns capability, ABI >= 4 falls back to the
+        Landlock TCP pin tier — the pre-generalisation posture.
+        Platform pinned like ``_enforcement_with``: the tier under
+        test is the linux fallback ladder."""
+        import core.sandbox.context as ctx
+        from core.sandbox import sandbox
+
+        abi = 4
+        with mock_module_attribute(
+            ctx, 'sys', "platform", "linux",
+        ), mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=abi,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available",
+            return_value=False,
+        ), sandbox(
+            target=self.out,
+            output=self.out,
+            use_egress_proxy=True,
+            proxy_hosts=["example.com"],
+        ) as run:
+            result = run(
+                ["echo", "proxy-tcp-test"],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0
+            assert result.sandbox_info.get("proxy_enforcement") == "landlock_tcp"
+
+    @pytest.mark.linux_native
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_tier2_port_pin_warns_and_records_evidence(self, caplog):
+        """Tier-2 engagement (Landlock TCP port pin) must be
+        operator-visible — a WARNING naming the weaker port-scoped
+        guarantee (pre-fix it was DEBUG-silent) — and the reduced
+        guarantee must land in the per-run sandbox_info evidence.
+        Platform pinned like ``_enforcement_with``: the asserted
+        stamp and evidence text are the LINUX tier's (macOS records
+        the seatbelt SBPL equivalents)."""
+        import logging
+
+        import core.sandbox.context as ctx
+        from core.sandbox import sandbox
+
+        abi = 4
+        with mock_module_attribute(
+            ctx, 'sys', "platform", "linux",
+        ), mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=abi,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available",
+            return_value=False,
+        ), caplog.at_level(logging.WARNING, logger="core.sandbox.context"):
+            with sandbox(
+                target=self.out,
+                output=self.out,
+                use_egress_proxy=True,
+                proxy_hosts=["example.com"],
+            ) as run:
+                result = run(
+                    ["echo", "tier2-warn-test"],
+                    capture_output=True, text=True, timeout=15,
+                )
+        assert result.returncode == 0
+        assert result.sandbox_info.get("proxy_enforcement") == "landlock_tcp"
+        tier2_warnings = [
+            r for r in caplog.records
+            if "Landlock TCP port pin" in r.getMessage()
+            and "ANY address" in r.getMessage()
+        ]
+        assert tier2_warnings, (
+            "tier-2 engagement must emit an operator-visible WARNING "
+            "naming the any-address-on-port weakening")
+        evidence = result.sandbox_info.get("evidence", "")
+        assert "landlock_tcp port pin" in evidence
+        assert "any address on the proxy port" in evidence
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_disabled_sandbox_stamps_advisory_not_landlock_tcp(
+            self, caplog):
+        """disabled=True + use_egress_proxy=True: NO port pin, NO
+        Landlock, NO seccomp engage — the run must not stamp
+        ``proxy_enforcement="landlock_tcp"`` (the truth-in-stamping
+        class: the stamp described enforcement that did not exist),
+        must not print the tier-2 "DNS/UDP exfil stays closed"
+        warning (the seccomp block never installs on a disabled run),
+        and must not burn the once-per-process warning latch a later
+        ENFORCING call still needs."""
+        import logging
+
+        from core.sandbox import sandbox, state
+
+        with mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=4,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available",
+            return_value=False,
+        ), caplog.at_level(logging.WARNING, logger="core.sandbox.context"):
+            with sandbox(
+                target=self.out,
+                output=self.out,
+                disabled=True,
+                use_egress_proxy=True,
+                proxy_hosts=["example.com"],
+            ) as run:
+                result = run(
+                    ["echo", "disabled-proxy-test"],
+                    capture_output=True, text=True, timeout=15,
+                )
+        assert result.returncode == 0
+        assert result.sandbox_info.get("proxy_enforcement") == "advisory"
+        tier2_warnings = [
+            r for r in caplog.records
+            if "Landlock TCP port pin" in r.getMessage()
+        ]
+        assert not tier2_warnings, (
+            "a disabled run must not describe enforcement it sheds")
+        assert state._proxy_tier2_port_pin_warned is False, (
+            "disabled run burned the tier-2 warn-once latch")
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_tier2_warning_is_once_per_process(self, caplog):
+        """Two tier-2 contexts → exactly one WARNING (warn_once)."""
+        import logging
+
+        from core.sandbox import sandbox
+
+        with mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=4,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available",
+            return_value=False,
+        ), caplog.at_level(logging.WARNING, logger="core.sandbox.context"):
+            for _ in range(2):
+                with sandbox(
+                    target=self.out,
+                    output=self.out,
+                    use_egress_proxy=True,
+                    proxy_hosts=["example.com"],
+                ):
+                    pass
+        tier2_warnings = [
+            r for r in caplog.records
+            if "Landlock TCP port pin" in r.getMessage()
+        ]
+        assert len(tier2_warnings) == 1
+
+    def _tier2_warning_text(self, caplog, *, seccomp_ok: bool) -> str:
+        import logging
+
+        from core.sandbox import sandbox
+        with mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=4,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.context.check_net_available",
+            return_value=False,
+        ), mock.patch(
+            "core.sandbox.context._seccomp.check_seccomp_available",
+            return_value=seccomp_ok,
+        ), caplog.at_level(logging.WARNING, logger="core.sandbox.context"):
+            with sandbox(
+                target=self.out,
+                output=self.out,
+                use_egress_proxy=True,
+                proxy_hosts=["example.com"],
+            ):
+                pass
+        msgs = [r.getMessage() for r in caplog.records
+                if "Landlock TCP port pin" in r.getMessage()]
+        assert msgs, "tier-2 warning did not fire"
+        return msgs[0]
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_tier2_warning_names_open_udp_when_seccomp_absent(
+            self, caplog):
+        """The UDP-exfil closure on tier 2 IS the seccomp block. On a
+        libseccomp-less host the old message claimed the channel was
+        closed by a filter that never engaged — an actively misleading
+        reassurance over an open DNS-exfil path."""
+        msg = self._tier2_warning_text(caplog, seccomp_ok=False)
+        assert "DNS/UDP exfil is OPEN" in msg
+        assert "stays closed" not in msg
+
+    @pytest.mark.usefixtures("_fresh_tier2_latch")
+    def test_tier2_warning_names_closed_udp_when_seccomp_present(
+            self, caplog):
+        # Prime the real cache first: seccomp_ok=True only pins the
+        # probe's ANSWER; the run's filter builder still dereferences
+        # state._libseccomp_cache, which stays None unless the real
+        # probe ran and succeeded.
+        from core.sandbox import seccomp as seccomp_mod
+        if not seccomp_mod.check_seccomp_available():
+            pytest.skip("libseccomp not functional on this host")
+        msg = self._tier2_warning_text(caplog, seccomp_ok=True)
+        assert "DNS/UDP exfil stays closed by the seccomp UDP block" in msg
+        assert "is OPEN" not in msg
+
+    @requires_landlock
+    def test_fallback_on_unix_bind_failure(self):
+        """If bind_unix fails, falls back to TCP-only without crash.
+        On this ABI 3 host shape the fallback pin is INERT (the
+        bind-failure warning says so itself), so the truthful stamp
+        is ``advisory`` — not the enforcing tier's label."""
+        from core.sandbox import sandbox
+
+        def _fail_bind(*a, **kw):
+            raise OSError("mock bind failure")
+
+        with mock.patch(
+            "core.sandbox.context._get_landlock_abi", return_value=3,
+        ), mock.patch(
+            "core.sandbox.context.check_landlock_available",
+            return_value=True,
+        ), mock.patch(
+            "core.sandbox.proxy.EgressProxy.bind_unix",
+            side_effect=_fail_bind,
+        ), sandbox(
+            target=self.out,
+            output=self.out,
+            use_egress_proxy=True,
+            proxy_hosts=["example.com"],
+        ) as run:
+            result = run(
+                ["echo", "fallback-test"],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0
+            assert result.sandbox_info.get("proxy_enforcement") == "advisory"

@@ -356,6 +356,57 @@ def test_cache_miss_on_model_family_change():
     assert len(calls) == 2
 
 
+def test_errored_parse_is_not_cached_and_reextracts():
+    """A malformed response must not poison the cache: cache hits
+    return an empty error list, so caching an errored parse would
+    permanently record a transient failure as 'no validators in this
+    file'. The next call re-extracts and surfaces errors again."""
+    responses = iter([
+        "{ not json",                                    # transient garbage
+        json.dumps({"validators": [_valid_validator_dict()]}),
+    ])
+    calls: List[PromptBundle] = []
+
+    def _flaky(bundle: PromptBundle) -> Optional[str]:
+        calls.append(bundle)
+        return next(responses)
+
+    cache: dict = {}
+    content = "pass\n" * 30
+
+    first_c, first_e = extract_from_content(
+        file_path="x.py", content=content, extractor=_flaky, cache=cache,
+    )
+    assert first_c == () and first_e  # errored, nothing cached
+    assert cache == {}
+
+    second_c, second_e = extract_from_content(
+        file_path="x.py", content=content, extractor=_flaky, cache=cache,
+    )
+    assert len(calls) == 2            # re-extracted, not served from cache
+    assert len(second_c) == 1 and second_e == []
+
+
+def test_error_free_parse_is_cached():
+    """Counter-direction: an error-free result still populates the
+    cache and the second call is a hit."""
+    extractor, calls = _recording_extractor(
+        {"validators": [_valid_validator_dict()]},
+    )
+    cache: dict = {}
+    content = "pass\n" * 30
+
+    extract_from_content(
+        file_path="x.py", content=content, extractor=extractor, cache=cache,
+    )
+    assert len(cache) == 1
+    candidates, errors = extract_from_content(
+        file_path="x.py", content=content, extractor=extractor, cache=cache,
+    )
+    assert len(calls) == 1
+    assert len(candidates) == 1 and errors == []
+
+
 def test_no_cache_means_no_caching():
     extractor, calls = _recording_extractor({"validators": []})
     extract_from_content(file_path="x.py", content="pass\n" * 5, extractor=extractor)
@@ -471,3 +522,59 @@ def test_adversarial_huge_validator_count_still_processes_each():
     )
     assert len(candidates) == 50
     assert errors == []
+
+
+def test_extract_from_files_traversal_refused(tmp_path):
+    """Containment goes through the shared confine() chokepoint —
+    traversal-shaped relative paths are recorded as errors, never
+    read."""
+    from core.dataflow.llm_extractor import extract_from_files
+    (tmp_path / "ok.py").write_text("def escape_x(s):\n    return s\n")
+    candidates, errors = extract_from_files(
+        file_paths=["../outside.py"],
+        repo_root=tmp_path,
+        extractor=lambda **kw: (),
+    )
+    assert candidates == ()
+    assert errors and "escapes repo root" in errors[0]
+
+
+def test_extract_from_files_containment_uses_shared_chokepoint(
+        tmp_path, monkeypatch):
+    """Wiring pin: containment must route through core.paths.confine
+    (a future confine hardening has to reach this site)."""
+    import core.dataflow.llm_extractor as le
+    seen: dict = {}
+
+    def fake_confine(base, candidate):
+        seen["args"] = (base, candidate)
+        return None
+
+    monkeypatch.setattr(le, "confine", fake_confine)
+    candidates, errors = le.extract_from_files(
+        file_paths=["a.py"], repo_root=tmp_path,
+        extractor=lambda **kw: (),
+    )
+    assert seen["args"] == (tmp_path, "a.py")
+    assert errors and "escapes repo root" in errors[0]
+
+
+def test_extract_from_files_read_is_capped(tmp_path, monkeypatch):
+    """The anchored read enforces the shared character budget —
+    a planted huge repo file truncates instead of buffering whole
+    into the extraction prompt path."""
+    import core.dataflow.llm_extractor as le
+    monkeypatch.setattr(le, "DEFAULT_MAX_SOURCE_CHARS", 128)
+    (tmp_path / "big.py").write_text(
+        "pad = 0\n" * 1000 + "TAIL_SENTINEL = 1\n")
+    seen: dict = {}
+
+    def extractor(bundle):
+        seen["prompt"] = "\n".join(
+            m.content for m in bundle.messages)
+        return None
+
+    le.extract_from_files(
+        file_paths=["big.py"], repo_root=tmp_path, extractor=extractor,
+    )
+    assert "TAIL_SENTINEL" not in seen["prompt"]

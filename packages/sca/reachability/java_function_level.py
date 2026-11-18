@@ -1,0 +1,303 @@
+"""Java (Maven) function-level reachability tier.
+
+Sibling of the PyPI / npm / Go tiers, covering Maven coordinates
+now that the Java call-graph extractor in
+``core.inventory.call_graph`` emits the same ``FileCallGraph`` shape
+the resolver consumes.
+
+Maven is unique among the function-level tiers in that there is
+*no* module-level Maven scanner — Maven deps come into ``scan()``
+with verdict ``not_evaluated``. So this tier is gated on both
+``imported`` (in case a future module-level scanner is added) AND
+``not_evaluated`` (current state). When OSV ships per-symbol info
+the tier promotes to ``likely_called`` or downgrades to
+``not_function_reachable``; otherwise the verdict is preserved.
+
+## Verdict transitions
+
+  * Any affected method CALLED → ``likely_called``.
+  * EVERY advisory-listed method evaluated and NOT_CALLED, none
+    UNCERTAIN → ``not_function_reachable``.
+  * Any UNCERTAIN, mixed, or unevaluable entry → leave at the
+    existing verdict.
+
+## Qualified-name shape
+
+Java OSV records (when symbol info is present at all) follow the
+same Go-style convention:
+
+  * ``ecosystem_specific.imports[].path`` is the Java package, e.g.
+    ``com.fasterxml.jackson.databind``.
+  * ``ecosystem_specific.imports[].symbols`` is a list of
+    ``Class.method`` or ``Class$Inner.method`` strings.
+
+We emit the qualified name ``<path>.<symbol>`` = ``com.fasterxml
+.jackson.databind.ObjectMapper.readValue``. The Java extractor's
+import map binds short names like ``ObjectMapper`` to their full
+package + class path, so the chain ``["ObjectMapper", "readValue"]``
+generated from a project-source call resolves to the OSV qualified
+name.
+
+## Limitation
+
+Instance-method dispatch where the variable name doesn't match the
+type (``ObjectMapper mapper = new ObjectMapper(); mapper
+.readValue(...)``) won't bind through the static import map and so
+won't resolve to the OSV symbol. Static and class-level calls
+(``ObjectMapper.SOME_METHOD()``, ``Class.staticMethod()``) work
+correctly. Same family of limitation as Go interface dispatch and
+Python method-on-instance.
+
+The flat fallback shapes (``affected_functions`` /
+``affected_symbols`` without a path) cannot be QUERIED for Java —
+unlike Go where the dep name equals the import path, Maven dep names
+(``groupId:artifactId``) are not Java packages, so the dep name
+alone can't form a valid qualified name. They still COUNT: each such
+entry is recorded as unresolved and blocks the
+``not_function_reachable`` downgrade (the advisory named a function
+this tier could not evaluate), while the ``likely_called`` upgrade
+from the path-qualified entries is unaffected.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+from collections.abc import Iterable
+
+from ..models import Confidence, Dependency, Reachability
+from ._shared import _NAMESPACE_HEAD_RE, UNRESOLVED_ENTRY
+
+logger = logging.getLogger(__name__)
+
+
+def build_maven_symbol_map(
+    osv_results: Iterable[Any] | None,
+) -> dict[str, list[str]]:
+    """Extract per-dep qualified-name targets from Maven OSV results.
+
+    Returns ``{dep_key: [qualified_name, ...]}``. Each qualified
+    name is ``<advisory_import_path>.<symbol>`` — Java OSV records
+    pair each symbol with the affected Java package
+    (``imports[].path``).
+
+    Empty when no Maven advisories carry symbol info.
+    """
+    if not osv_results:
+        return {}
+    out: dict[str, list[str]] = {}
+    for r in osv_results:
+        if not hasattr(r, "advisories"):
+            continue
+        dep_key = getattr(r, "dep_key", None)
+        if not dep_key or not dep_key.startswith("Maven:"):
+            continue
+        qualified: list[str] = []
+        for adv in r.advisories:
+            qualified.extend(_extract_qualified(adv))
+        if qualified:
+            out.setdefault(dep_key, []).extend(qualified)
+    return {k: list(dict.fromkeys(v)) for k, v in out.items()}
+
+
+def _extract_qualified(advisory: Any) -> list[str]:
+    """Pull ``<package>.<symbol>`` qualified names out of an Advisory.
+
+    Reads ``ecosystem_specific.imports[].path`` and
+    ``ecosystem_specific.imports[].symbols``, plus the same shape
+    under ``database_specific``. Entries without a usable path — and
+    the flat ``affected_symbols`` / ``affected_functions`` shapes —
+    have no queryable spelling (the Maven dep name is
+    ``groupId:artifactId``, not a Java package, so we can't
+    synthesise one) and are emitted as ``UNRESOLVED_ENTRY`` markers:
+    never queried, but counted, so the refine pass abstains from the
+    downgrade instead of suppressing on the queryable remainder.
+    """
+    out: list[str] = []
+    es = getattr(advisory, "ecosystem_specific", None) or {}
+    ds = getattr(advisory, "database_specific", None) or {}
+    for source in (es, ds):
+        if not isinstance(source, dict):
+            continue
+        for imp in source.get("imports") or []:
+            if not isinstance(imp, dict):
+                continue
+            raw_symbols = imp.get("symbols") or []
+            if not isinstance(raw_symbols, list):
+                # Junk-shaped container (a bare string iterates
+                # char-by-char into garbage queries): one counted
+                # marker instead.
+                out.append(UNRESOLVED_ENTRY)
+                continue
+            symbols = [
+                s for s in raw_symbols
+                if isinstance(s, str) and s
+            ]
+            path = imp.get("path")
+            if (not isinstance(path, str) or not path
+                    or not _NAMESPACE_HEAD_RE.fullmatch(path)):
+                # No path, junk path, or a path that is not a Java
+                # package spelling (a ``groupId:artifactId``
+                # coordinate, a slashed filesystem path, ...): a
+                # composed ``<path>.<symbol>`` would be a well-formed
+                # garbage query pairing NOT_CALLED — the same silent
+                # suppression the marker exists to block.
+                out.extend(UNRESOLVED_ENTRY for _ in symbols)
+                continue
+            out.extend(f"{path}.{s}" for s in symbols)
+        for key in ("affected_symbols", "affected_functions"):
+            v = source.get(key)
+            if isinstance(v, list):
+                out.extend(
+                    UNRESOLVED_ENTRY
+                    for s in v if isinstance(s, str) and s
+                )
+    return out
+
+
+def refine_maven_verdicts(
+    deps: list[Dependency],
+    out: dict[str, Reachability],
+    *,
+    target: Path,
+    maven_symbol_map: dict[str, list[str]],
+    inventory: dict[str, Any] | None = None,
+) -> None:
+    """For Maven deps in ``maven_symbol_map`` whose current verdict
+    is ``imported`` or ``not_evaluated``, run the function-level
+    resolver and update ``out`` in-place.
+
+    Maven has no module-level scanner so the typical starting
+    verdict is ``not_evaluated``. We accept either gate so the tier
+    works today AND continues to work if a module-level Maven
+    scanner is added later.
+    """
+    candidates: list[Dependency] = []
+    for d in deps:
+        if d.ecosystem != "Maven":
+            continue
+        current = out.get(d.key())
+        if current is None:
+            continue
+        if current.verdict not in ("imported", "not_evaluated"):
+            continue
+        symbols = maven_symbol_map.get(d.key())
+        if not symbols:
+            continue
+        if not any("." in s for s in symbols):
+            # Only unresolved markers — nothing queryable, so the
+            # tier can neither upgrade nor honestly downgrade; skip
+            # before paying for an inventory build.
+            continue
+        candidates.append(d)
+
+    if not candidates:
+        return
+
+    if inventory is None:
+        try:
+            from core.inventory.builder import build_inventory
+            from core.run.scratch import scratch_dir
+            with scratch_dir("raptor-sca-reachability-") as td:
+                inventory = build_inventory(str(target), str(td))
+        except Exception:                           # noqa: BLE001
+            logger.warning(
+                "sca.reachability.java_function_level: inventory "
+                "build failed; skipping function-level tier",
+                exc_info=True,
+            )
+            return
+
+    from core.analysis.reachability import (
+        Verdict,
+        function_called,
+    )
+
+    for d in candidates:
+        qualified_names = maven_symbol_map[d.key()]
+        paired = []
+        for qualified in qualified_names:
+            if not qualified or "." not in qualified:
+                continue
+            try:
+                paired.append((qualified, function_called(inventory, qualified)))
+            except ValueError:
+                continue
+
+        if not paired:
+            continue
+
+        verdicts = {r.verdict for _, r in paired}
+        covered = len(paired) == len(qualified_names)
+        if Verdict.CALLED in verdicts:
+            evidence_lines: list[str] = []
+            called_qns: list[str] = []
+            for qn, r in paired:
+                if r.verdict == Verdict.CALLED:
+                    called_qns.append(qn)
+                    evidence_lines.extend(
+                        f"{path}:{line}" for path, line in r.evidence
+                    )
+            from ._host_reachability import classify_called_or_dead
+            affected = ", ".join(sorted(set(called_qns)))
+            out[d.key()] = classify_called_or_dead(
+                inventory, evidence_lines,
+                likely_called_reason=(
+                    "OSV-listed affected symbol called from "
+                    f"project Java source: {affected}"
+                ),
+                affected_summary=affected,
+            )
+        elif Verdict.UNCERTAIN in verdicts or not covered:
+            # ``not covered``: some advisory entry never paired —
+            # an UNRESOLVED_ENTRY marker (flat / path-less shapes)
+            # or a resolver refusal. The advisory named a function
+            # this tier could not evaluate, so "all listed symbols
+            # unreached" would overstate the evidence → abstain.
+            continue
+        else:
+            # Confidence tracks how much evidence backs the
+            # downgrade. An ``imported``-gated dep had positive
+            # import-level evidence; a ``not_evaluated`` base means
+            # there is NO import evidence at all (no module-level
+            # Maven scanner) and instance-method dispatch — the
+            # dominant Java call shape — is invisible to the static
+            # import map (see Limitation above), so claiming a
+            # high-confidence downgrade would overstate what the
+            # resolver actually saw.
+            base_verdict = out[d.key()].verdict
+            if base_verdict == "not_evaluated":
+                confidence = Confidence(
+                    "medium",
+                    reason=(
+                        f"the {len(paired)} OSV-listed affected "
+                        f"symbol(s) are not called from non-test "
+                        f"Java source via static/class-level "
+                        f"dispatch; capped at medium — no "
+                        f"import-level evidence exists for this dep "
+                        f"and instance-method dispatch is invisible "
+                        f"to the static import map"
+                    ),
+                )
+            else:
+                confidence = Confidence(
+                    "high",
+                    reason=(
+                        f"Maven dep declared but the "
+                        f"{len(paired)} OSV-listed "
+                        f"affected symbol(s) are not called from "
+                        f"non-test Java source"
+                    ),
+                )
+            out[d.key()] = Reachability(
+                verdict="not_function_reachable",
+                confidence=confidence,
+                evidence=[],
+            )
+
+
+__all__ = [
+    "build_maven_symbol_map",
+    "refine_maven_verdicts",
+]

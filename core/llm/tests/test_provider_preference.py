@@ -12,7 +12,6 @@ contract.
 
 from __future__ import annotations
 
-
 import pytest
 
 from core.llm.config import (
@@ -20,6 +19,26 @@ from core.llm.config import (
     ModelConfig,
     _get_default_primary_model,
 )
+
+
+from types import ModuleType
+from core.testing.module_bindings import patch_module_attribute
+
+_discovery_imports = ModuleType("discovery_fixture_imports")
+
+
+@pytest.fixture(autouse=True)
+def _owned_discovery_imports(monkeypatch):
+    import core.llm.config as owner
+    import core.llm.detection as detection
+    from core.testing.llm_state import scoped_claudecode_discovery
+
+    with scoped_claudecode_discovery(owner, detection) as imports:
+        try:
+            monkeypatch.setitem(globals(), "_discovery_imports", imports)
+            yield
+        finally:
+            monkeypatch.undo()
 
 
 # ---------------------------------------------------------------------------
@@ -30,9 +49,27 @@ from core.llm.config import (
 @pytest.fixture
 def clean_env(monkeypatch):
     """Strip every LLM-related env var so each test starts from an
-    empty environment. Tests opt in to specific keys via setenv."""
+    empty environment. Tests opt in to specific keys via setenv.
+
+    Beyond the four classic provider keys, strip the Bedrock-era
+    family: ``_build_bedrock_config`` returns a config from
+    ``AWS_BEARER_TOKEN_BEDROCK`` alone (and ``bedrock`` sits in
+    ``_DEFAULT_PROVIDER_ORDER``), so an ambient bearer token on a
+    Bedrock-configured host flipped the nothing-available and
+    claudecode-fallthrough assertions. Same scrub family as the
+    dispatcher conftest (core/llm/dispatcher/tests/conftest.py),
+    plus the dispatcher-route socket and the claudecode model pin.
+    """
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
-                "MISTRAL_API_KEY"):
+                "MISTRAL_API_KEY",
+                # Bedrock family (dispatcher-conftest precedent)
+                "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK",
+                "AWS_ENDPOINT_URL_BEDROCK", "CLAUDE_CODE_USE_BEDROCK",
+                # Dispatcher route + claudecode model resolution pins
+                "RAPTOR_LLM_SOCKET", "RAPTOR_CC_MODEL",
+                "RAPTOR_CC_PIN_MODEL"):
         monkeypatch.delenv(var, raising=False)
     yield monkeypatch
 
@@ -52,7 +89,7 @@ def no_thinking_model(monkeypatch):
 def no_claudecode(monkeypatch):
     """Pretend ``claude`` isn't on PATH so the ultimate fallback
     is None rather than ClaudeCodeLLMProvider."""
-    monkeypatch.setattr("shutil.which", lambda _bin: None)
+    patch_module_attribute(monkeypatch, _discovery_imports, 'shutil', 'which', lambda _bin: None)
 
 
 @pytest.fixture
@@ -60,7 +97,7 @@ def no_ollama(monkeypatch):
     """Pretend Ollama isn't running."""
     monkeypatch.setattr(
         "core.llm.config._get_available_ollama_models",
-        lambda: [],
+        list,
     )
 
 
@@ -120,7 +157,7 @@ def test_claudecode_fallthrough_when_no_external_llm(
     """The keyless case: no API keys, no Ollama, but ``claude`` on
     PATH. The resolver falls through to ClaudeCodeLLMProvider so
     tool-using consumers can still operate."""
-    monkeypatch.setattr("shutil.which", lambda b: "/usr/bin/claude" if b == "claude" else None)
+    patch_module_attribute(monkeypatch, _discovery_imports, 'shutil', 'which', lambda b: "/usr/bin/claude" if b == "claude" else None)
     config = _get_default_primary_model()
     assert config is not None
     assert config.provider == "claudecode"
@@ -133,7 +170,7 @@ def test_claudecode_only_used_as_last_resort(
     """When *any* API key is set, the resolver picks the API path
     over Claude Code — CC is slower (subprocess + JSON-protocol
     synthesis for tool-use) so it's the absolute last resort."""
-    monkeypatch.setattr("shutil.which", lambda b: "/usr/bin/claude" if b == "claude" else None)
+    patch_module_attribute(monkeypatch, _discovery_imports, 'shutil', 'which', lambda b: "/usr/bin/claude" if b == "claude" else None)
     clean_env.setenv("MISTRAL_API_KEY", "test-key")
     config = _get_default_primary_model()
     assert config.provider == "mistral"        # not "claudecode"
@@ -240,7 +277,7 @@ def test_prefer_falls_through_to_claudecode(
     """Keyless preference: cve-diff says ``prefer="anthropic"``,
     operator has nothing set up, ``claude`` is on PATH → CC subprocess.
     The complete fallback chain ends here."""
-    monkeypatch.setattr("shutil.which", lambda b: "/usr/bin/claude" if b == "claude" else None)
+    patch_module_attribute(monkeypatch, _discovery_imports, 'shutil', 'which', lambda b: "/usr/bin/claude" if b == "claude" else None)
     config = _get_default_primary_model(prefer="anthropic")
     assert config.provider == "claudecode"
 
@@ -360,7 +397,7 @@ def test_llmclient_primary_provider_raises_without_primary_model() -> None:
     cfg.retry_delay_remote = 5.0
     cfg.enable_caching = False
     from pathlib import Path
-    cfg.cache_dir = Path("/tmp")
+    cfg.cache_dir = Path(".")
     cfg.enable_cost_tracking = False
     cfg.max_cost_per_scan = 10.0
     cfg.scorecard_enabled = False  # avoid latent class-default pollution if a future code path consults scorecard
@@ -368,8 +405,10 @@ def test_llmclient_primary_provider_raises_without_primary_model() -> None:
     client.config = cfg
     client.providers = {}
     import threading
-    client._key_locks = {}
+    from collections import OrderedDict
+    client._key_locks = OrderedDict()
     client._key_locks_guard = threading.Lock()
+    client._key_locks_cap = 4096
 
     with pytest.raises(RuntimeError, match="primary_model"):
         _ = client.primary_provider

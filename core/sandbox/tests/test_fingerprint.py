@@ -19,6 +19,7 @@ import pytest
 
 from core.sandbox.fingerprint import (
     HOST_CPU_COUNT,
+    _host_cpu_count,
     _HOSTNAME,
     _DOMAINNAME,
     _MACHINE_ID,
@@ -37,7 +38,7 @@ def test_host_cpu_count_sentinel_resolves_to_host(tmp_path):
     """build_persona(cpu_count=HOST_CPU_COUNT) must resolve to the
     host's actual schedulable CPU count via os.sched_getaffinity(0).
     Persona.cpu_count is the resolved int, not the sentinel."""
-    expected = len(os.sched_getaffinity(0))
+    expected = _host_cpu_count()
     persona = build_persona(tmp_path, cpu_count=HOST_CPU_COUNT)
     assert persona.cpu_count == expected, (
         f"sentinel resolved to {persona.cpu_count}, expected {expected}"
@@ -48,7 +49,7 @@ def test_host_cpu_count_sentinel_yields_n_cpuinfo_blocks(tmp_path):
     """With the sentinel, /proc/cpuinfo claims as many processors as
     the host has available — preserves capability surface for callers
     that need real parallelism (codeql, parallel builds)."""
-    expected = len(os.sched_getaffinity(0))
+    expected = _host_cpu_count()
     build_persona(tmp_path, cpu_count=HOST_CPU_COUNT)
     content = (tmp_path / "cpuinfo").read_text()
     indices = [
@@ -144,15 +145,19 @@ def test_build_persona_rejects_negative_cpu_count(tmp_path):
 
 def test_build_persona_creates_all_expected_targets(tmp_path):
     persona = build_persona(tmp_path, cpu_count=4)
+    from core.sandbox.fingerprint import _DMI_STORY
     expected = {
         "/proc/cpuinfo", "/proc/version", "/proc/cmdline", "/proc/stat",
-        "/proc/uptime", "/proc/loadavg",
+        "/proc/uptime", "/proc/loadavg", "/proc/meminfo",
+        "/proc/interrupts", "/proc/softirqs", "/proc/schedstat",
+        "/proc/sys/kernel/random/boot_id",
         "/etc/os-release", "/etc/machine-id", "/etc/hostname",
-        "/sys/class/dmi/id/sys_vendor",
-        "/sys/class/dmi/id/product_name",
+        "/etc/passwd", "/etc/group",
         "/sys/devices/system/cpu/online",
         "/sys/devices/system/cpu/possible",
-    }
+        "/sys/devices/system/node/node0/cpulist",
+        "/sys/devices/system/node/node0/cpumap",
+    } | {f"/sys/class/dmi/id/{name}" for name in _DMI_STORY}
     assert set(persona.files) == expected
 
 
@@ -231,7 +236,7 @@ def test_cpuinfo_flags_preserved_from_host(tmp_path):
     persona = build_persona(tmp_path, cpu_count=1)
     content = Path(persona.files["/proc/cpuinfo"]).read_text()
     fake_flags_line = next(
-        l for l in content.splitlines() if l.startswith("flags")
+        line for line in content.splitlines() if line.startswith("flags")
     )
     _, _, fake_flags = fake_flags_line.partition(":")
     assert fake_flags.strip() == host_flags
@@ -284,13 +289,13 @@ def test_cpuinfo_microcode_is_plausible_revision(tmp_path):
     which is rare on production systems)."""
     persona = build_persona(tmp_path, cpu_count=1)
     content = Path(persona.files["/proc/cpuinfo"]).read_text()
-    micro_lines = [l for l in content.splitlines() if "microcode" in l]
+    micro_lines = [line for line in content.splitlines() if "microcode" in line]
     assert micro_lines, "no microcode line in cpuinfo"
     # All microcode values present, none all-zero, all valid hex.
-    for l in micro_lines:
-        value = l.partition(":")[2].strip()
-        assert value.startswith("0x"), l
-        assert int(value, 16) > 0, f"microcode is zero/empty: {l!r}"
+    for line in micro_lines:
+        value = line.partition(":")[2].strip()
+        assert value.startswith("0x"), line
+        assert int(value, 16) > 0, f"microcode is zero/empty: {line!r}"
 
 
 def test_cpuinfo_bogomips_is_not_round_hundred(tmp_path):
@@ -298,14 +303,14 @@ def test_cpuinfo_bogomips_is_not_round_hundred(tmp_path):
     Real CPUs report values like 4799.95 / 4399.99 / etc."""
     persona = build_persona(tmp_path, cpu_count=1)
     content = Path(persona.files["/proc/cpuinfo"]).read_text()
-    bogo_lines = [l for l in content.splitlines() if l.startswith("bogomips")]
+    bogo_lines = [line for line in content.splitlines() if line.startswith("bogomips")]
     assert bogo_lines
-    for l in bogo_lines:
-        value = float(l.partition(":")[2].strip())
+    for line in bogo_lines:
+        value = float(line.partition(":")[2].strip())
         # Must be slightly off from a round hundred. 4800.00 → fail,
         # 4399.99 → pass.
         assert int(value * 100) % 100 != 0, (
-            f"bogomips is too round: {l!r}"
+            f"bogomips is too round: {line!r}"
         )
 
 
@@ -314,7 +319,7 @@ def test_cpuinfo_bugs_line_is_empty(tmp_path):
     Must be empty value."""
     persona = build_persona(tmp_path, cpu_count=1)
     content = Path(persona.files["/proc/cpuinfo"]).read_text()
-    bugs_lines = [l for l in content.splitlines() if l.startswith("bugs")]
+    bugs_lines = [line for line in content.splitlines() if line.startswith("bugs")]
     assert bugs_lines
     for line in bugs_lines:
         _, _, value = line.partition(":")
@@ -393,12 +398,82 @@ def test_cpu_possible_matches_online(tmp_path):
 def test_proc_stat_has_aggregate_plus_n_per_cpu_lines(tmp_path):
     persona = build_persona(tmp_path, cpu_count=4)
     stat = Path(persona.files["/proc/stat"]).read_text()
-    cpu_lines = [l for l in stat.splitlines() if l.startswith("cpu")]
+    cpu_lines = [line for line in stat.splitlines() if line.startswith("cpu")]
     # Expected: 1 aggregate "cpu " + 4 per-cpu lines "cpu0".."cpu3"
     assert len(cpu_lines) == 5
     assert cpu_lines[0].startswith("cpu ")
     for i in range(4):
-        assert any(l.startswith(f"cpu{i} ") for l in cpu_lines)
+        assert any(line.startswith(f"cpu{i} ") for line in cpu_lines)
+
+
+def test_proc_stat_jiffies_consistent_with_fake_uptime(tmp_path):
+    """The cpu jiffies must corroborate the fabricated uptime — the
+    old hardcoded values summed to ~11.5s of CPU time while
+    /proc/uptime claimed days, an instant cross-check tell. Idle
+    jiffies must equal the /proc/uptime idle figure at USER_HZ, and
+    the total must be within a plausible band of uptime*HZ*cpus."""
+    from core.sandbox.fingerprint import _USER_HZ
+
+    cpu_count = 2
+    persona = build_persona(tmp_path, cpu_count=cpu_count)
+    uptime_line = Path(persona.files["/proc/uptime"]).read_text()
+    uptime_s = float(uptime_line.split()[0])
+    uptime_idle_s = float(uptime_line.split()[1])
+
+    stat = Path(persona.files["/proc/stat"]).read_text()
+    agg = next(line for line in stat.splitlines()
+               if line.startswith("cpu "))
+    fields = [int(x) for x in agg.split()[1:]]
+    user, nice, system, idle = fields[0], fields[1], fields[2], fields[3]
+
+    # Idle jiffies == /proc/uptime idle seconds at USER_HZ (exact by
+    # construction — both derive from the same value).
+    assert idle == int(uptime_idle_s) * _USER_HZ
+    # Total CPU time within a plausible band of wall-clock capacity.
+    total = user + nice + system + idle
+    capacity = uptime_s * _USER_HZ * cpu_count
+    assert 0.9 * capacity <= total <= 1.05 * capacity, (
+        f"total jiffies {total} vs capacity {capacity}"
+    )
+    # Non-trivial busy time (a zero-work box is its own tell).
+    assert user > 0 and system > 0
+
+
+def test_proc_stat_per_cpu_lines_split_the_aggregate(tmp_path):
+    """Per-cpu jiffies must be ~aggregate/cpu_count, not hardcoded."""
+    cpu_count = 4
+    persona = build_persona(tmp_path, cpu_count=cpu_count)
+    stat = Path(persona.files["/proc/stat"]).read_text()
+    agg_idle = int(next(line for line in stat.splitlines()
+                        if line.startswith("cpu ")).split()[4])
+    for i in range(cpu_count):
+        line = next(ln for ln in stat.splitlines()
+                    if ln.startswith(f"cpu{i} "))
+        assert int(line.split()[4]) == agg_idle // cpu_count
+
+
+def test_proc_stat_intr_ctxt_corroborate_interrupts_file(tmp_path):
+    """intr/ctxt must agree with the persona's OWN /proc/interrupts:
+    "intr 0 / ctxt 0" on a box claiming days of uptime contradicted
+    the LOC timer row one read-pair away — the cross-checking-
+    detector class the module's other derivations exist to survive."""
+    cpu_count = 2
+    persona = build_persona(tmp_path, cpu_count=cpu_count)
+    stat = Path(persona.files["/proc/stat"]).read_text()
+    intr = int(next(line for line in stat.splitlines()
+                    if line.startswith("intr ")).split()[1])
+    ctxt = int(next(line for line in stat.splitlines()
+                    if line.startswith("ctxt ")).split()[1])
+    interrupts = Path(persona.files["/proc/interrupts"]).read_text()
+    loc_row = next(line for line in interrupts.splitlines()
+                   if line.startswith("LOC:"))
+    loc_total = sum(int(x) for x in loc_row.split()[1:1 + cpu_count])
+    assert intr > 0 and ctxt > 0
+    # intr covers at least the summed timer interrupts; ctxt runs a
+    # small multiple of intr on a low-load box.
+    assert intr >= loc_total
+    assert intr <= loc_total * 4
+    assert ctxt > intr
 
 
 def test_proc_stat_includes_required_kernel_fields(tmp_path):

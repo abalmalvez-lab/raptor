@@ -4,24 +4,32 @@ Exports a project output directory as a zip archive and imports
 zip archives back, with path traversal and symlink validation.
 """
 
-import shutil
+from contextlib import ExitStack
+import fnmatch
+import os
+import stat
+import time
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from core.hash import sha256_file
+from core.json import load_json, save_json
 from core.logging import get_logger
-from core.zip import DEFAULT_MAX_ENTRIES, peek_total_entries
+from core.project.registry_home import refuse_registry_overlap
+from core.run.scratch import scratch_dir
+from core.source.gated import open_regular_gated
+from core.source.streams import preserving_stream_error
+from core.zip import DEFAULT_MAX_ENTRIES, bomb_shaped_reason, peek_eocd
 
 logger = get_logger()
 
 
-def _check_zip_entries(infolist) -> List[str]:
+def _check_zip_entries(infolist) -> list[str]:
     """Check zip entries for path traversal, absolute paths, and symlinks.
 
     Returns a list of warning strings. Empty means safe.
     """
-    warnings: List[str] = []
+    warnings: list[str] = []
     for info in infolist:
         name = info.filename
         # Pre-fix the absolute-path + traversal checks tested
@@ -74,6 +82,16 @@ def _check_zip_entries(infolist) -> List[str]:
 # exhaustion via infolist materialisation.
 _MAX_ENTRIES = DEFAULT_MAX_ENTRIES
 
+# Cap on the embedded ``.project.json`` metadata entry. It carries a
+# handful of short fields (name, target, description, notes, created)
+# — a few KB at most in practice. Import buffers and parses it
+# wholesale in the trusted parent BEFORE the streaming per-entry size
+# checks of the extraction loop apply, so it needs its own bound; the
+# aggregate 10 GiB declared-size fast-reject is far too coarse to
+# protect a single-entry read.
+_MAX_PROJECT_META_BYTES = 1024 * 1024
+_MAX_PROJECT_ARCHIVE_BYTES = 10 * 1024 * 1024 * 1024
+
 
 class _ZipBombShapeError(Exception):
     """Raised when an open zipfile exceeds ``_MAX_ENTRIES``.
@@ -86,26 +104,34 @@ class _ZipBombShapeError(Exception):
 
 
 def _enforce_zip_entry_cap(zip_path: Path) -> None:
-    """Raise ``_ZipBombShapeError`` if the EOCD pre-flight reports
-    over-cap.
+    """Raise ``_ZipBombShapeError`` if the EOCD pre-flight reports a
+    bomb shape.
 
-    Delegates to :func:`core.zip.peek_total_entries` (the substrate
-    primitive lifted from PR #514). A ``None`` return means "couldn't
-    parse the EOCD" — we let the caller proceed to ``ZipFile()``,
-    which will either succeed for a small valid archive or raise
-    ``BadZipFile``. Only a definitively-over-cap parse triggers the
-    early reject.
+    Delegates to :func:`core.zip.peek_eocd` +
+    :func:`core.zip.bomb_shaped_reason` (the substrate primitives
+    lifted from PR #514): the declared entry count is capped AND
+    cross-checked against the declared central-directory size — a
+    forged EOCD with a small count in front of a huge real central
+    directory would otherwise pass a count-only gate, and
+    ``ZipFile()`` then materialises the whole CD anyway (it parses
+    until the cd-size buffer is exhausted, ignoring the count). A
+    ``None`` peek means "couldn't parse the EOCD" — we let the caller
+    proceed to ``ZipFile()``, which will either succeed for a small
+    valid archive or raise ``BadZipFile``. Only a definitively
+    bomb-shaped parse triggers the early reject.
     """
-    count = peek_total_entries(zip_path)
-    if count is not None and count > _MAX_ENTRIES:
+    summary = peek_eocd(zip_path)
+    if summary is None:
+        return
+    reason = bomb_shaped_reason(summary, max_entries=_MAX_ENTRIES)
+    if reason is not None:
         raise _ZipBombShapeError(
-            f"zip declares {count} entries in EOCD — refusing as "
-            f"zip-bomb shape (legitimate RAPTOR project exports have "
+            f"{reason} (legitimate RAPTOR project exports have "
             f"<< 1000 entries)"
         )
 
 
-def _collect_bounded_infolist(zf: zipfile.ZipFile) -> List[zipfile.ZipInfo]:
+def _collect_bounded_infolist(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     """Materialise ``zf.infolist()`` with the ``_MAX_ENTRIES`` cap enforced.
 
     The EOCD pre-flight at ``_enforce_zip_entry_cap`` rejects archives
@@ -124,19 +150,20 @@ def _collect_bounded_infolist(zf: zipfile.ZipFile) -> List[zipfile.ZipInfo]:
     Raises ``_ZipBombShapeError`` on over-cap; callers translate
     per their error model.
     """
-    entries: List[zipfile.ZipInfo] = []
+    entries: list[zipfile.ZipInfo] = []
     for i, info in enumerate(zf.infolist()):
         if i >= _MAX_ENTRIES:
-            raise _ZipBombShapeError(
+            msg = (
                 f"zip has more than {_MAX_ENTRIES} entries — "
                 f"refusing as zip-bomb shape (legitimate "
                 f"RAPTOR project exports have << 1000 entries)"
             )
+            raise _ZipBombShapeError(msg)
         entries.append(info)
     return entries
 
 
-def validate_zip_contents(zip_path: Path) -> Tuple[bool, List[str]]:
+def validate_zip_contents(zip_path: Path) -> tuple[bool, list[str]]:
     """Check a zip file for path traversal, absolute paths, and symlinks.
 
     Args:
@@ -158,7 +185,7 @@ def validate_zip_contents(zip_path: Path) -> Tuple[bool, List[str]]:
         return False, [str(e)]
 
     try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
+        with preserving_stream_error(zipfile.ZipFile(zip_path, "r")) as zf:
             try:
                 entries = _collect_bounded_infolist(zf)
             except _ZipBombShapeError as e:
@@ -194,68 +221,585 @@ def _is_transient_artefact(path: Path) -> bool:
     name = path.name
     if name.endswith(".lock"):
         return True
-    if name.startswith(".annotation-") and name.endswith(".tmp"):
-        return True
-    return False
+    return bool(name.startswith(".annotation-") and name.endswith(".tmp"))
 
 
 def export_project(project_output_dir: Path, dest_path: Path,
-                   project_json_path: Path = None,
-                   force: bool = False) -> Dict[str, str]:
+                   project_json_path: Path | None = None,
+                   force: bool = False) -> dict[str, str]:
     """Zip a project output directory, skipping symlinks.
 
     Args:
         project_output_dir: The project's output directory to archive.
         dest_path: Destination path for the zip file.
         project_json_path: Optional project metadata JSON to include in the zip.
+        force: Overwrite dest_path if it already exists.
 
     Returns:
         Dict with 'path' (zip file path) and 'sha256' (hex digest).
 
     Raises:
         FileNotFoundError: If the source directory doesn't exist.
+        FileExistsError: If dest_path exists and force is False.
     """
     project_output_dir = Path(project_output_dir)
     dest_path = Path(dest_path)
 
     if not project_output_dir.is_dir():
-        raise FileNotFoundError(f"Directory not found: {project_output_dir}")
+        msg = f"Directory not found: {project_output_dir}"
+        raise FileNotFoundError(msg)
 
     # Ensure dest has .zip extension
     if dest_path.suffix != ".zip":
         dest_path = dest_path.with_suffix(".zip")
 
-    if dest_path.exists() and not force:
-        raise FileExistsError(f"File already exists: {dest_path} (use --force to overwrite)")
+    if os.path.lexists(dest_path) and not force:
+        msg = f"File already exists: {dest_path} (use --force to overwrite)"
+        raise FileExistsError(msg)
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build zip manually to skip symlinks (shutil.make_archive follows them)
-    # plus per-process / transient artefacts that shouldn't ship in a
-    # portable archive (POSIX advisory lock files, tempfile leftovers).
-    with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item in project_output_dir.rglob("*"):
-            if item.is_symlink():
-                logger.debug(f"Skipping symlink in export: {item}")
-                continue
-            if item.is_file():
-                if _is_transient_artefact(item):
-                    logger.debug(f"Skipping transient artefact: {item}")
+    # A failed archive must not truncate a previous export or leave a
+    # partial zip at the advertised destination. Keep staging on the same
+    # filesystem so publication needs no second copy of the archive.
+    destination = dest_path.parent.resolve() / dest_path.name
+    with scratch_dir(".export-", dir=dest_path.parent, keepalive=True) as staging_dir:
+        staged_path = staging_dir / "archive.zip"
+        _write_project_zip(project_output_dir, staged_path, project_json_path,
+                           destination)
+        sha256 = sha256_file(staged_path)
+        if force:
+            try:
+                previous = dest_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISREG(previous.st_mode):
+                    staged_path.chmod(stat.S_IMODE(previous.st_mode))
+            os.replace(staged_path, dest_path)
+        else:
+            # O_EXCL semantics at publication, including a name that
+            # appeared while the archive was being built.
+            os.link(staged_path, dest_path)
+    logger.info("Exported project to %s (sha256: %s)", dest_path, sha256)
+    return {"path": str(dest_path), "sha256": sha256}
+
+
+def _write_zip_regular(zf: zipfile.ZipFile, path: Path, arcname: str,
+                       remaining: int) -> int:
+    """Stream one opened regular inode, enforcing the importer's byte limit."""
+    with preserving_stream_error(open_regular_gated(path, follow_symlinks=False)) as source:
+        info = os.fstat(source.fileno())
+        if info.st_size > remaining:
+            raise ValueError('Project export exceeds the importable archive byte limit')
+        try:
+            stamp = time.localtime(info.st_mtime)[:6]
+        except (OverflowError, OSError, ValueError):
+            stamp = (1970, 1, 1, 0, 0, 0) if info.st_mtime < 0 else (9999, 1, 1, 0, 0, 0)
+        if stamp[0] < 1980:
+            stamp = (1980, 1, 1, 0, 0, 0)
+        elif stamp[0] > 2107:
+            stamp = (2107, 12, 31, 23, 59, 58)
+        entry = zipfile.ZipInfo(arcname, date_time=stamp)
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        entry.external_attr = info.st_mode << 16
+        entry.file_size = info.st_size
+        written = 0
+        with preserving_stream_error(zf.open(entry, 'w', force_zip64=True)) as destination:
+            while True:
+                chunk = source.read(min(1024 * 1024, remaining - written + 1))
+                if not chunk:
+                    break
+                if written + len(chunk) > remaining:
+                    raise ValueError('Project export exceeds the importable archive byte limit')
+                destination.write(chunk)
+                written += len(chunk)
+        return written
+
+
+def _write_project_zip(project_output_dir: Path, staged_path: Path,
+                       project_json_path: Path | None,
+                       destination: Path) -> None:
+    """Build the archive, excluding its own output and private staging."""
+    with preserving_stream_error(zipfile.ZipFile(staged_path, "w", zipfile.ZIP_DEFLATED)) as zf:
+        written = entries = 0
+        source_versions: dict[Path, tuple[int, ...]] = {}
+
+        def source_version(path):
+            info = path.lstat()
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                    info.st_mtime_ns, info.st_ctime_ns)
+
+        def add(path, arcname, limit=None):
+            nonlocal written, entries
+            if entries >= _MAX_ENTRIES:
+                raise ValueError('Project export exceeds the importable archive entry limit')
+            remaining = _MAX_PROJECT_ARCHIVE_BYTES - written
+            if limit is not None:
+                remaining = min(remaining, limit)
+            source_versions.setdefault(path, source_version(path))
+            written += _write_zip_regular(zf, path, arcname, remaining)
+            entries += 1
+
+        def failed_walk(error):
+            raise error  # A successful archive must not silently omit an unreadable subtree.
+
+        for dirpath, dirnames, filenames in os.walk(
+                project_output_dir, followlinks=False, onerror=failed_walk):
+            # Do not pack current or crash-left export staging into a
+            # later archive when the destination sits inside the source.
+            dirnames[:] = [
+                d for d in dirnames
+                if not Path(dirpath, d).is_symlink()
+                and not d.startswith(".export-")
+            ]
+            # The OpenAnt scanner's staged config view (any depth) can
+            # carry operator-authored LLM provider api_keys merged from
+            # ~/.config/openant/config.json. The scanner scrubs it the
+            # moment its subprocess exits; this exclusion is
+            # defense-in-depth for a stage a crashed run left behind —
+            # zip transport strips the 0600 that protects it on disk.
+            dirnames[:] = [d for d in dirnames if d != "openant-xdg"]
+            if Path(dirpath) == project_output_dir:
+                # Ghidra attach/import caches never ship: the cached
+                # re-database.json is the trust-bearing artifact
+                # context injection and `raptor-ghidra decompile`
+                # read FIRST, and an unsigned archive restoring it
+                # byte-identical would hand the archive author the
+                # "derived" database (attacker-chosen decompilation,
+                # addresses that anchor sync comments). Same stance
+                # as binaries/trust markers: machine-local, derived,
+                # recomputable by re-attach — not archive content.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d != "ghidra-attach"
+                    and not (d.startswith("ghidra-")
+                             and Path(dirpath, d,
+                                      "re-database.json").is_file())
+                ]
+            for fname in filenames:
+                item = Path(dirpath, fname)
+                if item.parent.resolve() / item.name == destination:
                     continue
+                info = item.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    logger.debug("Skipping non-regular entry in export: %s", item)
+                    continue
+                if _is_transient_artefact(item):
+                    logger.debug("Skipping transient artefact: %s", item)
+                    continue
+                if (Path(dirpath) == project_output_dir
+                        and fname == "ghidra-attach"):
+                    # Reserved cache-dir name shipped as a FILE would
+                    # block every attach on the restored project
+                    # (cache mkdir fails on the name collision).
+                    logger.debug("Skipping reserved-name file: %s", item)
+                    continue
+                if project_json_path is not None and item == project_output_dir / '.project.json':
+                    continue  # The explicit registry metadata is the single authoritative member.
                 arcname = f"{project_output_dir.name}/{item.relative_to(project_output_dir)}"
-                zf.write(item, arcname)
+                limit = _MAX_PROJECT_META_BYTES if item == project_output_dir / '.project.json' else None
+                add(item, arcname, limit)
         # Include project metadata if provided
         if project_json_path and project_json_path.exists():
-            zf.write(project_json_path, f"{project_output_dir.name}/.project.json")
+            if project_json_path.stat().st_size > _MAX_PROJECT_META_BYTES:
+                raise ValueError('Project metadata exceeds the importable metadata byte limit')
+            add(project_json_path, f"{project_output_dir.name}/.project.json", _MAX_PROJECT_META_BYTES)
+        # A SQLite checkpoint can change an already-copied DB while its WAL
+        # is still waiting to be copied. Successful per-file reads alone do
+        # not establish a consistent archive. Refuse source changes before
+        # publishing staging, keeping databases opaque and the old export safe.
+        for path, version in source_versions.items():
+            message = f"Project source changed during export: {str(path)!r}"
+            try:
+                current = source_version(path)
+            except OSError as error:
+                raise ValueError(message) from error
+            if current != version:
+                raise ValueError(message)
 
-    sha256 = sha256_file(dest_path)
-    logger.info(f"Exported project to {dest_path} (sha256: {sha256})")
-    return {"path": str(dest_path), "sha256": sha256}
+
+
+def _guard_import_output_dir(output_base: Path, project_name: str) -> Path:
+    """Resolve the import extraction root and prove it is a strict
+    child of ``output_base``.
+
+    ``project_name`` has already passed ``ProjectManager.
+    _validate_name`` (no separators, never ``.``/``..``), so this
+    can only trip on future drift — but the rmtree call sites below
+    (mid-extract cleanup, ``--force`` replacement) and the
+    registered ``output_dir`` (later consumed by ``/project delete
+    --purge``) are exactly the places a regression would turn into
+    cross-project data destruction, so the invariant is
+    enforced here rather than assumed.
+    """
+    output_dir = Path(output_base) / project_name
+    base_resolved = Path(output_base).resolve(strict=False)
+    dir_resolved = output_dir.resolve(strict=False)
+    if dir_resolved == base_resolved or base_resolved not in dir_resolved.parents:
+        msg = (
+            f"Refusing import: output dir {output_dir} is not a "
+            f"strict child of the output base {output_base}"
+        )
+        raise ValueError(msg)
+    return output_dir
+
+
+def _demote_imported_annotations(output_dir: Path) -> None:
+    """Stamp ``provenance=imported`` onto EVERY restored annotation,
+    regardless of what stamp the archive shipped.
+
+    The archive is unsigned and its bytes are attacker-authored at
+    will: a hostile export can ship ``source=human`` notes pre-stamped
+    ``provenance=interactive-tty`` + ``tty=stdin`` — bytes
+    indistinguishable from a real operator's CLI write — to mass-mark
+    vulnerable functions clean with operator authority after import.
+    The stamp is caller-asserted text; nothing binds it to an actual
+    TTY, and the zip channel severs whatever provenance the note ever
+    had. So the import stamps the channel every note came through:
+    ``provenance=imported`` classifies as hint tier and never earns
+    human grade (see :mod:`core.annotations.provenance` — the
+    ``provenance`` tag wins over any retained ``tty`` key, and every
+    elevated-weight reader gates on :func:`is_human_grade`).
+
+    The note's text and other metadata (status, source, tty, custom
+    keys) are preserved for display; a pre-existing ``provenance``
+    claim is kept visible under ``provenance-claimed`` (a display-only
+    key no reader trusts).
+
+    Fail-closed per note: a restored section the write path refuses
+    to re-serialise (values that would corrupt the on-disk format)
+    is REMOVED rather than left carrying its archive-supplied stamp.
+    """
+    from core.annotations.models import Annotation
+    from core.annotations.provenance import IMPORTED as _IMPORTED
+    from core.annotations.provenance import PROVENANCE_KEY as _PROV_KEY
+    from core.annotations.storage import (
+        iter_all_annotations,
+        remove_annotation,
+        write_annotation,
+    )
+
+    for ann_base in sorted(Path(output_dir).rglob("annotations")):
+        if not ann_base.is_dir() or ann_base.is_symlink():
+            continue
+        for ann in list(iter_all_annotations(ann_base)):
+            if ann.metadata.get(_PROV_KEY) == _IMPORTED:
+                # Already demoted (idempotent re-run, or the archive
+                # self-stamped the demoted tag — nothing to launder).
+                continue
+            meta = dict(ann.metadata)
+            claimed = meta.get(_PROV_KEY)
+            if claimed:
+                # Keep the archive's claim visible for operator
+                # display under a key no reader grades on.
+                meta.setdefault("provenance-claimed", claimed)
+            meta[_PROV_KEY] = _IMPORTED
+            try:
+                write_annotation(
+                    ann_base,
+                    Annotation(file=ann.file, function=ann.function,
+                               body=ann.body, metadata=meta),
+                )
+            except ValueError:
+                logger.warning(
+                    "import: dropping restored annotation %s:%s — "
+                    "cannot re-serialise it with the imported "
+                    "provenance stamp",
+                    ann.file, ann.function,
+                )
+                try:
+                    remove_annotation(ann_base, ann.file, ann.function)
+                except (ValueError, OSError):
+                    logger.warning(
+                        "import: could not remove unstampable "
+                        "annotation %s:%s", ann.file, ann.function,
+                    )
+
+
+# Findings files (relative to a run dir) whose provenance refs get
+# namespaced on import: exactly the files the lifecycle stamper
+# writes canonical refs into — ONE constant, consumed from its owner,
+# so a stamp-path addition cannot leave imported refs of that file
+# un-namespaced (the pre-shared-constant mirror drifted exactly that
+# way when the openant lane landed without the ride-along).
+from core.run.findings import _STAMP_PATHS as _IMPORTED_REF_REWRITE_PATHS
+
+# Prefix stamped onto every imported provenance ref's run_id. An
+# imported archive cannot own ANY run id on this install: a
+# pre-seeded ref claiming a local run id (including the very run id
+# the restored dir will register under) would otherwise suppress
+# canonical stamping (core/run/findings.py skips findings that
+# already carry a ref for the current run_id) and read as
+# locally-verified work in reports/correlation.
+_IMPORTED_REF_PREFIX = "imported:"
+
+def _namespace_imported_provenance_refs(run_dir: Path) -> None:
+    """Prefix every provenance ref's ``run_id`` in *run_dir*'s
+    findings files with ``imported:`` (idempotent).
+
+    Oversized files are skipped (with a warning) rather than parsed
+    wholesale at import time — consumers' loaders refuse files over
+    the same bound (:data:`core.project.findings_utils.
+    MAX_FINDINGS_JSON_BYTES`), so an unrewritten oversized file never
+    feeds a merge fold either.
+    """
+    from core.project.findings_utils import MAX_FINDINGS_JSON_BYTES
+
+    for rel in _IMPORTED_REF_REWRITE_PATHS:
+        path = run_dir / rel
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_FINDINGS_JSON_BYTES:
+            logger.warning(
+                "import: %s is %d bytes — too large to rewrite "
+                "provenance refs; loaders refuse it at the same bound",
+                path, size,
+            )
+            continue
+        data = load_json(path)
+        if isinstance(data, list):
+            findings = data
+        elif isinstance(data, dict):
+            findings = data.get("findings") or data.get("results") or []
+        else:
+            continue
+        changed = False
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            for ref in finding.get("provenance_refs") or ():
+                if not isinstance(ref, dict):
+                    continue
+                run_id = ref.get("run_id")
+                if (isinstance(run_id, str) and run_id
+                        and not run_id.startswith(_IMPORTED_REF_PREFIX)):
+                    ref["run_id"] = _IMPORTED_REF_PREFIX + run_id
+                    changed = True
+        if changed:
+            save_json(path, data)
+
+
+def _mark_imported_runs(output_dir: Path, archive_sha256: str) -> None:
+    """Stamp the persisted imported marker onto the restored project
+    root and every restored run directory, and namespace each run's
+    provenance refs.
+
+    The marker (:data:`core.project.findings_utils.
+    IMPORTED_RUN_MARKER_FILE`) is what merge folds consult to keep
+    attacker-selected statuses from an unsigned archive from
+    dominating locally-produced ones. Run-dir candidates mirror
+    ``Project._list_run_dirs``'s enumeration (top-level dirs, no
+    dot/underscore prefix, none of ``GENERATED_PROJECT_DIRS``).
+    """
+    from datetime import datetime, timezone
+
+    from core.project.findings_utils import IMPORTED_RUN_MARKER_FILE
+
+    payload = {
+        "imported": True,
+        "imported_at": datetime.now(timezone.utc).isoformat(),
+        "archive_sha256": archive_sha256,
+    }
+    root = Path(output_dir)
+    save_json(root / IMPORTED_RUN_MARKER_FILE, payload)
+    from core.project.project import GENERATED_PROJECT_DIRS
+    for child in root.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if (child.name.startswith((".", "_"))
+                or child.name in GENERATED_PROJECT_DIRS):
+            continue
+        save_json(child / IMPORTED_RUN_MARKER_FILE, payload)
+        _neutralise_imported_liveness(child)
+        _namespace_imported_provenance_refs(child)
+
+
+def _neutralise_imported_liveness(run_dir: Path) -> None:
+    """Rewrite a restored ``status=running`` run marker to
+    ``interrupted`` and strip its session/tool identity stamps.
+
+    A restored ``.raptor-run.json`` claiming ``running`` describes a
+    session on the EXPORTING machine at export time (or a forged claim
+    from an unsigned archive) — never a process this machine's
+    lifecycle owns. Left verbatim, its foreign session stamp reads as
+    unverifiable-alive forever: every future ``start_run`` in the
+    project hits the contention gate, clean/merge/delete refuse, and
+    the abandon sweep (correctly fail-open on foreign stamps) never
+    clears it. ``interrupted`` is honest — the run did not complete
+    inside THIS project — and non-terminal state is exactly what an
+    unsigned archive must not mint. Best-effort: an unreadable or
+    oversized marker is left for the size-gated consumers to refuse.
+    """
+    from core.run.metadata import RUN_METADATA_FILE, STATUS_RUNNING, _load_meta
+    marker = run_dir / RUN_METADATA_FILE
+    if not marker.is_file():
+        return
+    try:
+        meta = _load_meta(marker)
+    except OSError:
+        return
+    if not isinstance(meta, dict) or meta.get("status") != STATUS_RUNNING:
+        return
+    meta["status"] = "interrupted"
+    meta["import_liveness_neutralised"] = True
+    for stamp in ("session_pid", "tool_pid", "tool_pid_start",
+                  "session_start", "session_boot_id", "session_pidns",
+                  "session_machine_id", "session_id"):
+        meta.pop(stamp, None)
+    save_json(marker, meta)
+    logger.info(
+        "import: neutralised restored running marker in %s "
+        "(status=running -> interrupted; session stamps stripped)",
+        run_dir.name,
+    )
+
+
+# --- Privileged-artifact quarantine ---------------------------------
+#
+# Restored archives are unsigned; every artifact in them is
+# attacker-authored at will. Annotations get a provenance demotion
+# (readers already grade the imported tag), but the other
+# trust-bearing artifact families have NO import-marker mechanism in
+# their consumers — restoring them at their canonical paths would let
+# a forged archive mark code reviewed/clean (coverage store, review
+# journals), veto feedback, seed prompts with "mechanically-verified"
+# exemplars (verified outcomes, labeled attempts), or smuggle
+# taint-spec roles and witness manifests as locally-earned evidence.
+#
+# The seam that requires no consumer edits: move them out of the
+# canonical locations into an `_imported-quarantine/` namespace
+# (underscore-prefixed — run-dir enumeration skips it) preserving the
+# original relative layout for operator inspection. Consumers look up
+# these artifacts at fixed canonical paths (project-root
+# coverage.json / review-journal-index.json / iris-specs, per-run
+# review-journal.jsonl / verified-outcomes.jsonl /
+# iris-taint-specs-refined.json, `witnesses/` store roots discovered
+# per run dir), so a quarantined artifact is simply never consulted.
+_QUARANTINE_DIR_NAME = "_imported-quarantine"
+
+_PRIVILEGED_FILE_NAMES = frozenset({
+    "coverage.json",                  # durable coverage store
+    "coverage-progress.jsonl",        # store trend sidecar
+    "review-journal.jsonl",           # per-run review journal
+    "review-journal-index.json",      # project journal index
+    "verified-outcomes.jsonl",        # oracle-verified outcome sidecar
+    "validation-outcomes.json",       # graph outcome replay input
+    # Canonical analysis memory is derived, not locally earned evidence
+    # when restored from an unsigned archive. Keep SQLite opaque, including
+    # recovery sidecars that must not attach to a newly created local store.
+    "raptor.graph.sqlite",
+    "raptor.graph.sqlite-wal",
+    "raptor.graph.sqlite-shm",
+    "raptor.graph.sqlite-journal",
+    "iris-taint-specs-refined.json",  # per-run IRIS refined specs
+    # Cached Ghidra database: the FIRST candidate context injection,
+    # status, sync address anchoring, and decompile read. Export
+    # never ships the attach/legacy cache slots (run-dir copies of
+    # the artifact do ship), but a crafted archive can carry one at
+    # the attach slot or the stem-keyed legacy slot — restored in
+    # place it hands the archive author the "derived" database.
+    # Derived + recomputable by re-attach, so quarantining costs
+    # nothing.
+    "re-database.json",
+    # Validation checklist: run-level copies are what
+    # _promote_checklist elects "newest" and copies to the project
+    # level (merging checked_by credit) — a forged archive would
+    # mint reviewed/verified checklist state the next start_run
+    # promotes into authority. Same false-suppression direction as
+    # the coverage records.
+    "checklist.json",
+})
+
+# Glob-shaped privileged families. Per-run coverage records are
+# per-tool files (``coverage-semgrep.json`` / ``coverage-read.json``
+# / legacy ``coverage-record.json``) discovered by consumers via a
+# ``coverage-*.json`` glob (core/coverage/record.py) — a fixed-name
+# set can never cover a producer-named family, which is exactly how
+# the records escaped the first quarantine cut while the project-root
+# store (``coverage.json``) was caught: a forged record minted
+# examined-coverage that shrank the gap-audit residual and passed
+# ``/project coverage --fail-under``.
+_PRIVILEGED_FILE_GLOBS = (
+    "coverage-*.json",
+)
+
+_PRIVILEGED_DIR_NAMES = frozenset({
+    "witnesses",          # WitnessStore roots (manifests + blobs)
+    "iris-specs",         # project IRIS spec store
+    "labeled_attempts",   # project exemplar pool
+    "ghidra-attach",      # attach cache slots (see re-database.json)
+})
+
+
+def _quarantine_dest(qroot: Path, rel: Path) -> Path:
+    """Destination for one quarantined artifact, uniquified if the
+    archive itself shipped a colliding quarantine entry."""
+    dest = qroot / rel
+    if not dest.exists():
+        return dest
+    n = 1
+    while True:
+        candidate = dest.with_name(f"{dest.name}.imported-{n}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _quarantine_imported_privileged_artifacts(output_dir: Path) -> list[str]:
+    """Move trust-bearing artifacts out of their canonical paths into
+    ``_imported-quarantine/`` (layout-preserving). Returns the moved
+    relative paths. Idempotent: an existing quarantine dir (re-import
+    of a re-exported project) is left untouched, never re-nested."""
+    root = Path(output_dir)
+    qroot = root / _QUARANTINE_DIR_NAME
+    moved: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dp = Path(dirpath)
+        if dp == root and _QUARANTINE_DIR_NAME in dirnames:
+            dirnames.remove(_QUARANTINE_DIR_NAME)
+        for name in list(dirnames):
+            if name in _PRIVILEGED_DIR_NAMES:
+                src = dp / name
+                rel = src.relative_to(root)
+                dest = _quarantine_dest(qroot, rel)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(dest)
+                dirnames.remove(name)
+                moved.append(str(rel))
+        for name in filenames:
+            # A FILE carrying a privileged DIR name is quarantined
+            # too: a crafted archive shipping a plain file named
+            # `ghidra-attach` restores in place and bricks every
+            # later attach (cache mkdir hits the name collision) —
+            # the export-side skip does not bind an archive author.
+            if (name in _PRIVILEGED_FILE_NAMES
+                    or name in _PRIVILEGED_DIR_NAMES
+                    or any(fnmatch.fnmatch(name, pat)
+                           for pat in _PRIVILEGED_FILE_GLOBS)):
+                src = dp / name
+                rel = src.relative_to(root)
+                dest = _quarantine_dest(qroot, rel)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(dest)
+                moved.append(str(rel))
+    if moved:
+        logger.info(
+            "import: quarantined %d privileged artifact(s) under %s "
+            "(unsigned archive — coverage/journal/witness/IRIS/outcome "
+            "artifacts are not restored as locally-earned trust): %s",
+            len(moved), _QUARANTINE_DIR_NAME, ", ".join(sorted(moved)),
+        )
+    return moved
 
 
 def import_project(zip_path: Path, projects_dir: Path,
                    force: bool = False,
-                   output_base: Path = None) -> Dict[str, str]:
+                   output_base: Path | None = None) -> dict[str, str]:
     """Import a zipped project.
 
     Validates the zip, extracts output data to output_base/<name>/,
@@ -269,29 +813,46 @@ def import_project(zip_path: Path, projects_dir: Path,
         output_base: Base directory for output data (default: out/projects/).
 
     Returns:
-        Dict with 'name', 'output_dir', and optionally 'orphaned_output'.
+        Dict with 'name' and 'output_dir'; optional 'orphaned_output',
+        'retained_backup' and 'retained_registry_backup' name retained data.
 
     Raises:
         ValueError: If zip is unsafe, not a RAPTOR archive, or project
             exists and force is False.
         FileNotFoundError: If zip file doesn't exist.
     """
+    with ExitStack() as cleanup:
+        return _import_project(zip_path, projects_dir, force, output_base, cleanup)
+
+
+def _import_project(zip_path: Path, projects_dir: Path, force: bool,
+                    output_base: Path | None, cleanup: ExitStack) -> dict[str, str]:
+    """Import with staging owned until publication or any failure."""
     import json
 
     zip_path = Path(zip_path)
     projects_dir = Path(projects_dir)
     if output_base is None:
-        output_base = Path("out/projects")
+        # Parity with ProjectManager.create(): the cwd-relative
+        # Path("out/projects") minted RELATIVE output_dirs — the
+        # restored project landed wherever the process's cwd was
+        # (not under RAPTOR_OUT_DIR), and JVM-facing paths derived
+        # from the registration later resolved against the
+        # sandbox's private scratch cwd instead of the project.
+        from core.project.project import DEFAULT_OUTPUT_BASE
+        output_base = DEFAULT_OUTPUT_BASE
 
     if not zip_path.exists():
-        raise FileNotFoundError(f"Zip file not found: {zip_path}")
+        msg = f"Zip file not found: {zip_path}"
+        raise FileNotFoundError(msg)
 
     # EOCD pre-flight: reject over-cap archives BEFORE the ZipFile
     # constructor reads the entire central directory into memory.
     try:
         _enforce_zip_entry_cap(zip_path)
     except _ZipBombShapeError as e:
-        raise ValueError(f"Unsafe zip file rejected: {e}") from e
+        msg = f"Unsafe zip file rejected: {e}"
+        raise ValueError(msg) from e
 
     # Single zip open: validate, inspect, and extract
     has_common_root = False
@@ -299,7 +860,7 @@ def import_project(zip_path: Path, projects_dir: Path,
     embedded_meta = None
 
     try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
+        with preserving_stream_error(zipfile.ZipFile(zip_path, "r")) as zf:
             # --- Security validation ---
             # Use the same entry-count cap that `validate_zip_contents`
             # applies (F029: pre-fix `import_project` re-implemented the
@@ -309,17 +870,18 @@ def import_project(zip_path: Path, projects_dir: Path,
             try:
                 bounded_entries = _collect_bounded_infolist(zf)
             except _ZipBombShapeError as e:
-                raise ValueError(f"Unsafe zip file rejected: {e}") from e
+                msg = f"Unsafe zip file rejected: {e}"
+                raise ValueError(msg) from e
             warnings = _check_zip_entries(bounded_entries)
             if warnings:
-                raise ValueError(
-                    f"Unsafe zip file rejected: {'; '.join(warnings)}"
-                )
+                msg = f"Unsafe zip file rejected: {'; '.join(warnings)}"
+                raise ValueError(msg)
 
             # --- Determine structure and check for project metadata ---
             names = zf.namelist()
             if not names:
-                raise ValueError("Empty zip file")
+                msg = "Empty zip file"
+                raise ValueError(msg)
 
             first_part = names[0].split("/")[0]
             has_subdirs = "/" in names[0]
@@ -329,31 +891,61 @@ def import_project(zip_path: Path, projects_dir: Path,
             # Require .project.json — reject non-RAPTOR archives early
             meta_path = f"{first_part}/.project.json" if has_common_root else ".project.json"
             if meta_path not in names:
-                raise ValueError(
+                msg = (
                     "Not a RAPTOR project archive (missing .project.json). "
                     "Use `raptor project export` to create importable archives."
                 )
+                raise ValueError(msg)
 
             # --- Fast-reject on declared size ---
             # Reuse the already-bounded infolist from the cap check
             # above (F029: avoids a second full infolist materialisation).
             declared_size = sum(info.file_size for info in bounded_entries)
-            max_size = 10 * 1024 * 1024 * 1024  # 10GB
+            max_size = _MAX_PROJECT_ARCHIVE_BYTES
             if declared_size > max_size:
-                raise ValueError(
+                msg = (
                     f"Zip declared size ({declared_size / 1024 / 1024:.0f}MB) exceeds "
                     f"limit ({max_size / 1024 / 1024:.0f}MB)"
                 )
+                raise ValueError(msg)
 
             # --- Read project metadata ---
             if has_common_root:
                 project_name = first_part
+            # Per-entry byte cap BEFORE buffering/parsing the metadata
+            # in the trusted parent: check the declared size, then
+            # bound the actual decompressed read too (the declared
+            # size is attacker-controlled and can undersell a huge
+            # stored stream).
+            meta_info = next(
+                info for info in bounded_entries
+                if info.filename == meta_path
+            )
+            if meta_info.file_size > _MAX_PROJECT_META_BYTES:
+                raise ValueError(
+                    f"Project metadata entry {meta_path!r} declares "
+                    f"{meta_info.file_size} bytes — exceeds the "
+                    f"{_MAX_PROJECT_META_BYTES}-byte metadata cap"
+                )
+            with preserving_stream_error(zf.open(meta_path)) as meta_fh:  # raw-open: ZIP metadata read capped at _MAX_PROJECT_META_BYTES + 1 below
+                raw_meta = meta_fh.read(_MAX_PROJECT_META_BYTES + 1)
+            if len(raw_meta) > _MAX_PROJECT_META_BYTES:
+                raise ValueError(
+                    f"Project metadata entry {meta_path!r} exceeds the "
+                    f"{_MAX_PROJECT_META_BYTES}-byte metadata cap "
+                    f"(declared size was smaller — corrupted or "
+                    f"malicious zip)"
+                )
             try:
-                embedded_meta = json.loads(zf.read(meta_path))
+                embedded_meta = json.loads(raw_meta)
+                if not isinstance(embedded_meta, dict):
+                    msg = "Corrupt .project.json in archive"
+                    raise ValueError(msg)
                 if embedded_meta.get("name"):
                     project_name = embedded_meta["name"]
             except (json.JSONDecodeError, KeyError):
-                raise ValueError("Corrupt .project.json in archive")
+                msg = "Corrupt .project.json in archive"
+                raise ValueError(msg) from None
 
             # --- Validate name before any filesystem work ---
             from .project import ProjectManager
@@ -361,27 +953,71 @@ def import_project(zip_path: Path, projects_dir: Path,
             try:
                 mgr._validate_name(project_name)
             except ValueError as e:
-                raise ValueError(f"Cannot import: {e}")
+                msg = f"Cannot import: {e}"
+                raise ValueError(msg) from e
 
             existing = mgr.load(project_name)
             if existing and not force:
-                raise ValueError(
-                    f"Project '{project_name}' already exists. Use --force to overwrite."
-                )
+                msg = f"Project '{project_name}' already exists. Use --force to overwrite."
+                raise ValueError(msg)
 
             # --- Prepare output directory ---
-            # Use the zip's root directory name for extraction path (not the
-            # embedded project name) — extraction preserves the zip structure.
-            output_dir = output_base / (first_part if has_common_root else project_name)
-            orphaned_output = None
-            if existing and force:
-                old_output_path = Path(existing.output_dir).resolve()
-                if output_dir.exists():
-                    shutil.rmtree(output_dir)
-                mgr.delete(project_name, purge=False)
-                if old_output_path != output_dir.resolve() and old_output_path.exists():
-                    orphaned_output = str(old_output_path)
-                logger.info(f"Removed existing project '{project_name}' (force=True)")
+            # Anchor extraction at output_base/<VALIDATED project
+            # name>, stripping the archive's root-dir prefix. The
+            # pre-fix code anchored at the zip's own root dir name
+            # (`output_base / first_part`) with `first_part` never
+            # validated — a hostile archive named its root after a
+            # VICTIM project ("victimproj/") to overwrite that
+            # project's findings/coverage while registering under an
+            # innocuous embedded name, or used a "./"-rooted layout
+            # (passes _check_zip_entries: pathlib drops ".") to make
+            # output_dir == output_base, arming every later rmtree
+            # (mid-extract cleanup, --force replace, /project delete
+            # --purge) to destroy EVERY project's output.
+            # `project_name` passed _validate_name above (no "/",
+            # never "." / ".."), so output_dir is always a strict
+            # child of output_base; _guard_import_output_dir keeps
+            # that invariant explicit against future drift.
+            output_dir = _guard_import_output_dir(
+                output_base, project_name,
+            )
+            refuse_registry_overlap(output_dir, extra_projects_dir=projects_dir)
+            # Refuse a same-name destination dir that exists but is
+            # NOT a registered project (an orphan from a deleted
+            # project, an operator's unrelated dir, debris). Pre-fix
+            # the collision check consulted only the registry, so
+            # import silently MERGED into the orphan
+            # (mkdir exist_ok=True) and any late failure rmtree'd it —
+            # destroying data import never created. --force is the
+            # explicit operator override: it replaces the dir
+            # wholesale (never merges), same as it replaces a
+            # registered project's tree.
+            if output_dir.exists() and not existing and not force:
+                raise ValueError(
+                    f"Refusing import: output dir {output_dir} already "
+                    f"exists but no project '{project_name}' is "
+                    f"registered. Move the directory aside, or pass "
+                    f"--force to replace it."
+                )
+
+            # --- Stage the extraction ---
+            # Extract into a fresh private staging dir and atomically
+            # move it into place only after extraction AND the
+            # trust-demotion passes succeed. Pre-fix the loop wrote
+            # straight into output_dir and the failure cleanup
+            # rmtree'd the FINAL path — with --force the old project
+            # tree was even deleted before a single byte extracted,
+            # so a failed import destroyed the previous data with no
+            # rollback. Failure cleanup now only ever removes the
+            # staging dir import itself created.
+            workspace = cleanup.enter_context(scratch_dir(
+                prefix=f".import-{project_name}-", dir=output_base, keepalive=True,
+            ))
+            staging_dir = workspace / "project"
+            staging_dir.mkdir()
+            # Keep the workspace private; widen only the publishable child
+            # to the conventional project output-directory mode.
+            os.chmod(staging_dir, 0o755)
 
             # --- Extract output data ---
             #
@@ -400,99 +1036,130 @@ def import_project(zip_path: Path, projects_dir: Path,
             # the running cumulative bytes BEFORE writing each
             # chunk to the destination. The per-chunk write
             # short-circuits as soon as the cap is exceeded.
-            output_dir.mkdir(parents=True, exist_ok=True)
-            max_size = 10 * 1024 * 1024 * 1024  # 10GB
+            max_size = _MAX_PROJECT_ARCHIVE_BYTES
             chunk = 1024 * 1024  # 1 MiB
             bytes_extracted = 0
-            try:
-                # Reuse the bounded infolist captured during validation
-                # (F029): the cap check has already proven the count is
-                # ≤ _MAX_ENTRIES, no need to materialise again.
-                for info in bounded_entries:
-                    if info.filename.endswith("/.project.json") or info.filename == ".project.json":
+            # Reuse the bounded infolist captured during validation
+            # (F029): the cap check has already proven the count is
+            # ≤ _MAX_ENTRIES, no need to materialise again.
+            for info in bounded_entries:
+                if info.filename == meta_path:
+                    continue
+                if info.is_dir():
+                    continue
+                # Strip the archive's common root component so
+                # every entry lands under output_dir regardless
+                # of what the (attacker-chosen) root dir was
+                # called. `partition` rather than `split`: a
+                # bare root entry ("myproj") yields an empty
+                # remainder, which we skip.
+                if has_common_root:
+                    arcrel = info.filename.partition("/")[2]
+                    if not arcrel:
                         continue
-                    if info.is_dir():
-                        continue
-                    # Refuse if the per-entry declared size alone
-                    # would exceed remaining budget — saves opening
-                    # a stream we'd immediately cancel.
-                    if bytes_extracted + info.file_size > max_size:
-                        raise ValueError(
-                            f"Entry {info.filename!r} ({info.file_size / 1024 / 1024:.0f}MB) "
-                            f"would exceed limit ({max_size / 1024 / 1024:.0f}MB)"
-                        )
-                    extract_dest = Path(output_base if has_common_root else output_dir)
-                    target_path = extract_dest / info.filename
-                    # Resolve and re-check containment.
-                    # `_check_zip_entries` already vetted the
-                    # filenames upstream, but Python's traversal-
-                    # protection in zipfile is version-dependent
-                    # (3.6 had bugs around symlink-shaped entries,
-                    # 3.11 added stricter checks but still misses
-                    # NTFS-style alternate-data-stream filenames
-                    # and Windows drive-letter prefixes on POSIX).
-                    # Pre-fix this comment claimed "defence in
-                    # depth" but performed NO re-check — the
-                    # comment was a lie. Add the actual containment
-                    # check so any traversal that slipped past
-                    # _check_zip_entries (future regression, novel
-                    # filename shape, or a Python-version
-                    # behavioural difference) is caught here.
-                    extract_dest_resolved = extract_dest.resolve(strict=False)
-                    target_resolved = target_path.resolve(strict=False)
-                    try:
-                        target_resolved.relative_to(extract_dest_resolved)
-                    except ValueError:
-                        raise ValueError(
-                            f"Refusing to extract {info.filename!r}: "
-                            f"resolved target {target_resolved} escapes "
-                            f"destination {extract_dest_resolved}"
-                        )
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    actual_size = 0
-                    with zf.open(info, "r") as src, open(target_path, "wb") as dst:
-                        while True:
-                            buf = src.read(chunk)
-                            if not buf:
-                                break
-                            actual_size += len(buf)
-                            bytes_extracted += len(buf)
-                            if bytes_extracted > max_size:
-                                raise ValueError(
-                                    f"Extracted size ({bytes_extracted / 1024 / 1024:.0f}MB) "
-                                    f"exceeds limit ({max_size / 1024 / 1024:.0f}MB) "
-                                    f"during {info.filename!r}"
-                                )
-                            dst.write(buf)
-                    if actual_size != info.file_size:
-                        raise ValueError(
-                            f"Size mismatch for {info.filename}: "
-                            f"header says {info.file_size}, got {actual_size} "
-                            f"(corrupted or malicious zip)"
-                        )
-            except Exception:
-                # Clean up partial extraction
-                if output_dir.exists():
-                    shutil.rmtree(output_dir)
-                raise
+                else:
+                    arcrel = info.filename
+                # Refuse if the per-entry declared size alone
+                # would exceed remaining budget — saves opening
+                # a stream we'd immediately cancel.
+                if bytes_extracted + info.file_size > max_size:
+                    msg = (
+                        f"Entry {info.filename!r} ({info.file_size / 1024 / 1024:.0f}MB) "
+                        f"would exceed limit ({max_size / 1024 / 1024:.0f}MB)"
+                    )
+                    raise ValueError(msg)
+                extract_dest = staging_dir
+                target_path = extract_dest / arcrel
+                # Resolve and re-check containment.
+                # `_check_zip_entries` already vetted the
+                # filenames upstream, but Python's traversal-
+                # protection in zipfile is version-dependent
+                # (3.6 had bugs around symlink-shaped entries,
+                # 3.11 added stricter checks but still misses
+                # NTFS-style alternate-data-stream filenames
+                # and Windows drive-letter prefixes on POSIX).
+                # Pre-fix this comment claimed "defence in
+                # depth" but performed NO re-check — the
+                # comment was a lie. Add the actual containment
+                # check so any traversal that slipped past
+                # _check_zip_entries (future regression, novel
+                # filename shape, or a Python-version
+                # behavioural difference) is caught here.
+                extract_dest_resolved = extract_dest.resolve(strict=False)
+                target_resolved = target_path.resolve(strict=False)
+                try:
+                    target_resolved.relative_to(extract_dest_resolved)
+                except ValueError:
+                    msg = (
+                        f"Refusing to extract {info.filename!r}: "
+                        f"resolved target {target_resolved} escapes "
+                        f"destination {extract_dest_resolved}"
+                    )
+                    raise ValueError(msg) from None
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                actual_size = 0
+                with preserving_stream_error(zf.open(info, "r")) as src, preserving_stream_error(open(target_path, "wb")) as dst:
+                    while True:
+                        buf = src.read(chunk)
+                        if not buf:
+                            break
+                        actual_size += len(buf)
+                        bytes_extracted += len(buf)
+                        if bytes_extracted > max_size:
+                            msg = (
+                                f"Extracted size ({bytes_extracted / 1024 / 1024:.0f}MB) "
+                                f"exceeds limit ({max_size / 1024 / 1024:.0f}MB) "
+                                f"during {info.filename!r}"
+                            )
+                            raise ValueError(msg)
+                        dst.write(buf)
+                if actual_size != info.file_size:
+                    msg = (
+                        f"Size mismatch for {info.filename}: "
+                        f"header says {info.file_size}, got {actual_size} "
+                        f"(corrupted or malicious zip)"
+                    )
+                    raise ValueError(msg)
 
     except zipfile.BadZipFile:
-        raise ValueError("Invalid zip file")
+        msg = "Invalid zip file"
+        raise ValueError(msg) from None
 
-    # Register the project
-    target = embedded_meta.get("target", "(imported)") if embedded_meta else "(imported)"
-    description = embedded_meta.get("description", "") if embedded_meta else ""
-    notes = embedded_meta.get("notes", "") if embedded_meta else ""
-    created = embedded_meta.get("created") if embedded_meta else None
+    # Demote ALL restored annotations to hint tier BEFORE the project
+    # registers (readers must never see archive-supplied stamps as
+    # anything but imported). A failure here fails the import closed:
+    # remove the staged tree rather than register a project carrying
+    # notes that would read as operator authority.
+    try:
+        _demote_imported_annotations(staging_dir)
+    except Exception as e:
+        msg = f"Import failed while stamping restored annotations: {e}"
+        raise ValueError(msg) from e
 
-    mgr.create(project_name, target, description=description,
-               output_dir=str(output_dir), resolve_target=False,
-               created=created)
-    if notes:
-        mgr.update_notes(project_name, notes)
+    # Stamp the persisted imported marker onto the restored root and
+    # every restored run dir, and namespace their provenance refs —
+    # merge/report consumers must always be able to tell imported
+    # runs from locally-produced ones. Fails the import closed like
+    # the annotation pass above.
+    try:
+        _mark_imported_runs(staging_dir, sha256_file(zip_path))
+    except Exception as e:
+        raise ValueError(
+            f"Import failed while marking imported runs: {e}"
+        ) from e
 
-    logger.info(f"Imported project '{project_name}' to {output_dir}")
-    result = {"name": project_name, "output_dir": str(output_dir)}
-    if orphaned_output:
-        result["orphaned_output"] = orphaned_output
-    return result
+    # Quarantine trust-bearing artifacts (coverage store, review
+    # journals, witness stores, IRIS specs, verified outcomes,
+    # exemplar pools) out of their canonical paths — consumers must
+    # never treat archive-supplied copies as locally-earned trust.
+    # Fails the import closed like the passes above.
+    try:
+        _quarantine_imported_privileged_artifacts(staging_dir)
+    except Exception as e:
+        raise ValueError(
+            f"Import failed while quarantining privileged artifacts: {e}"
+        ) from e
+
+    from .import_transaction import publish_import
+    return publish_import(mgr, project_name, embedded_meta or {},
+                          staging_dir, output_dir, force)

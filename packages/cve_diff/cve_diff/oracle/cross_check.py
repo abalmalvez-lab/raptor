@@ -1,4 +1,4 @@
-"""Oracle cross-check CLI.
+r"""Oracle cross-check CLI.
 
 Reads a `cve-diff bench` ``summary.json`` and, for each CVE:
 - If PASS: parse the matching ``<cve_id>.osv.json`` in the same
@@ -14,8 +14,8 @@ Writes:
   examples per verdict
 
 Usage:
-    .venv/bin/python -m cve_diff.oracle.cross_check \\
-        --summary /tmp/bench200/summary.json \\
+    .venv/bin/python -m cve_diff.oracle.cross_check \
+        --summary /tmp/bench200/summary.json \
         --output-dir /tmp/bench200/oracle/
 """
 
@@ -30,7 +30,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from core.atomic_fs import write_bytes_atomically
 from core.http.urllib_backend import UrllibClient
+from core.json import load_json_bounded
+from core.url_patterns import GITHUB_COMMIT_URL_RE, normalize_slug
 from packages.nvd import NvdClient
 from packages.nvd.verify import verify as _nvd_verify
 from packages.osv import OsvClient
@@ -47,17 +50,20 @@ def _osv_client() -> OsvClient:
 def _nvd_client() -> NvdClient:
     return NvdClient()
 
-_GH_COMMIT_URL = re.compile(
-    r"https?://github\.com/([^/]+/[^/#?\s.]+)/commit/([a-f0-9]{7,40})",
-    re.IGNORECASE,
-)
+# Shared commit-URL pattern from core.url_patterns: its repo segment
+# keeps dots. A dot-excluding local copy failed to match dotted repo
+# names ("socketio/engine.io") at all, so the oracle verified a wrong
+# or missing slug and misgraded correct picks.
+_GH_COMMIT_URL = GITHUB_COMMIT_URL_RE
 
 
 def _load_pick_from_osv_file(summary_dir: Path, cve_id: str) -> tuple[str, str]:
     """Return (slug, sha) from the per-CVE OSV JSON, or ('', '')."""
     path = summary_dir / f"{cve_id}.osv.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # /cve-diff run artifact; ValueError also covers the
+        # byte-budget refusal.
+        data = load_json_bounded(path, max_bytes=64 * 1024 * 1024)
     except (OSError, ValueError):
         return "", ""
     # Pre-fix `for ref in data.get("references") or []` then
@@ -76,13 +82,20 @@ def _load_pick_from_osv_file(summary_dir: Path, cve_id: str) -> tuple[str, str]:
         url = (ref.get("url") or "")
         m = _GH_COMMIT_URL.search(url)
         if m:
-            slug = m.group(1)
-            if slug.endswith(".git"):
-                slug = slug[:-4]
-            return slug, m.group(2)
+            return normalize_slug(m.group(1)), m.group(2)
     # Fallback: the repo field + the first fixed event.
-    for aff in data.get("affected") or []:
-        for rng in aff.get("ranges") or []:
+    affected = data.get("affected") or []
+    if not isinstance(affected, list):
+        return "", ""
+    for aff in affected:
+        if not isinstance(aff, dict):
+            continue
+        ranges = aff.get("ranges") or []
+        if not isinstance(ranges, list):
+            continue
+        for rng in ranges:
+            if not isinstance(rng, dict):
+                continue
             repo = rng.get("repo") or ""
             # Cap the slug capture at GitHub's own per-segment limit
             # (39 chars for owner per docs, 100 chars for repo). Pre-fix
@@ -93,16 +106,22 @@ def _load_pick_from_osv_file(summary_dir: Path, cve_id: str) -> tuple[str, str]:
             # while bounding pathological input. The leading anchor
             # `https?://github.com/` already filters most garbage; this
             # is defence-in-depth.
+            # Repo segment keeps dots (same dotted-name class as the
+            # commit-URL pattern above): a dot-excluding class captured
+            # "socketio/engine" for "socketio/engine.io".
             m = re.match(
-                r"https?://github\.com/([^/]{1,256}/[^/#?\s.]{1,256})",
+                r"https?://github\.com/([^/#?\s]{1,256}/[^/#?\s]{1,256})",
                 repo,
             )
             slug = ""
             if m:
-                slug = m.group(1)
-                if slug.endswith(".git"):
-                    slug = slug[:-4]
-            for ev in rng.get("events") or []:
+                slug = normalize_slug(m.group(1))
+            events = rng.get("events") or []
+            if not isinstance(events, list):
+                continue
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
                 sha = ev.get("fixed") or ""
                 if slug and sha:
                     return slug, sha
@@ -110,13 +129,18 @@ def _load_pick_from_osv_file(summary_dir: Path, cve_id: str) -> tuple[str, str]:
 
 
 def _verify_one(cve_id: str, picked_slug: str, picked_sha: str) -> OracleVerdict:
-    """Ask OSV; if ORPHAN, fall back to NVD."""
+    """Ask OSV; if ORPHAN or UNKNOWN (lookup failed), fall back to NVD."""
     v = _osv_verify(cve_id, picked_slug, picked_sha, client=_osv_client())
-    if v.verdict != Verdict.ORPHAN:
+    if v.verdict not in (Verdict.ORPHAN, Verdict.UNKNOWN):
         return v
     nv = _nvd_verify(cve_id, picked_slug, picked_sha, client=_nvd_client())
     if nv.verdict != Verdict.ORPHAN:
         return nv
+    if v.verdict == Verdict.UNKNOWN:
+        # The OSV lookup failed outright — NVD's orphan doesn't make
+        # the combined answer definitive, so surface the degraded
+        # oracle coverage instead of a don't-penalize ORPHAN.
+        return v
     # Both orphans — return the first with combined note.
     return OracleVerdict(
         cve_id=cve_id, picked_slug=picked_slug, picked_sha=picked_sha,
@@ -152,7 +176,12 @@ def main() -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    try:
+        summary = load_json_bounded(summary_path, max_bytes=64 * 1024 * 1024)
+    except (ValueError, OSError) as exc:
+        print(f"cross-check: cannot read {summary_path}: {exc}",
+              file=sys.stderr)
+        sys.exit(1)
     results = summary.get("results") or []
     if args.limit > 0:
         results = results[: args.limit]
@@ -180,8 +209,20 @@ def main() -> int:
     # Per-iteration `fh.flush()` is intentional checkpoint behaviour
     # — operator can `tail -f oracle_verdicts.jsonl.tmp` to watch
     # progress in real time on large runs (1000+ CVEs take 30+ min).
+    # Exclusive create at the (deliberately predictable — the tail -f
+    # contract above) tmp name: a symlink left at it would make this
+    # writer stream verdicts to an attacker-chosen path. The
+    # missing_ok unlink removes a planted symlink ITSELF; O_EXCL |
+    # O_NOFOLLOW fails loud if anything reappears in the window.
     tmp_path = jsonl_path.with_suffix(jsonl_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as fh:
+    tmp_path.unlink(missing_ok=True)
+    tmp_fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o644,
+    )
+    with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
         for i, r in enumerate(results, 1):
             cve_id = r.get("cve_id", "UNKNOWN")
             status = _classify_bench_status(r)
@@ -229,7 +270,13 @@ def main() -> int:
     # JSONL written with NO oracle_summary.md, blamed an oracle
     # bug rather than the upstream feed encoding issue.
     md = _render_markdown(summary_path.name, results, verdicts_by_status)
-    (out_dir / "oracle_summary.md").write_text(md, encoding="utf-8", errors="replace")
+    # Atomic write (planted-symlink defence at the predictable report
+    # name — same threat as the verdicts stream above); bytes variant
+    # keeps the errors="replace" encoding contract.
+    write_bytes_atomically(
+        out_dir / "oracle_summary.md",
+        md.encode("utf-8", errors="replace"),
+    )
 
     # Headline to stderr
     pass_results = verdicts_by_status.get("PASS", [])
@@ -238,10 +285,11 @@ def main() -> int:
     mirror = sum(1 for v in pass_results if v.verdict == Verdict.MIRROR_DIFFERENT_SLUG)
     disp = sum(1 for v in pass_results if v.verdict == Verdict.DISPUTE)
     orph = sum(1 for v in pass_results if v.verdict == Verdict.ORPHAN)
+    unk = sum(1 for v in pass_results if v.verdict == Verdict.UNKNOWN)
     hall = sum(1 for v in pass_results if v.verdict == Verdict.LIKELY_HALLUCINATION)
     print(
         f"\nPASS breakdown: exact={ver} range={rng} mirror={mirror} "
-        f"dispute={disp} orphan={orph} hallucination={hall}",
+        f"dispute={disp} orphan={orph} unknown={unk} hallucination={hall}",
         file=sys.stderr,
     )
     return 0
@@ -272,13 +320,10 @@ def _render_markdown(summary_name: str, results: list[dict],
             examples = by_v[verdict]
             lines.append(f"### {verdict.value} ({len(examples)})")
             # Show up to 5 examples.
-            for ex in examples[:5]:
-                lines.append(
-                    f"- **{ex.cve_id}** (src={ex.source}): "
+            lines.extend(f"- **{ex.cve_id}** (src={ex.source}): "
                     f"picked=`{ex.picked_slug}@{ex.picked_sha[:12] if ex.picked_sha else ''}`, "
                     f"expected={list(ex.expected_slugs)[:3]} / {[s[:12] for s in ex.expected_shas[:3]]}"
-                    + (f". {ex.notes}" if ex.notes else "")
-                )
+                    + (f". {ex.notes}" if ex.notes else "") for ex in examples[:5])
             if len(examples) > 5:
                 lines.append(f"- … and {len(examples) - 5} more")
     return "\n".join(lines) + "\n"

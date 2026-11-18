@@ -1,0 +1,4425 @@
+"""Tests for /audit review pipeline features.
+
+Covers: wrapper prefilter, verification tiers, confidence propagation,
+spec inference (assertions + preconditions), convergence dispatch,
+concurrency hypothesis mapping, learning loop.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+# Owned source/LLM fixtures; native worker tests verify OS containment.
+pytestmark = pytest.mark.usefixtures("owned_smt_subprocess")
+
+# ── Feature 1: Wrapper auto-clean ─────────────────────────────────
+
+class TestWrapperAutoClean:
+
+    def test_trivial_c_wrapper_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+int setkey(struct crypto_aead *aead, const u8 *key, unsigned int keylen) {
+    return crypto_aead_setkey(aead, key, keylen);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="wrapper.c",
+            function_name="setkey",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+        assert result.skip_reason
+
+    def test_wrapper_with_cast_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+int process(void *data, int len) {
+    return handle_data((char *)data, len);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="cast.c",
+            function_name="process",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_wrapper_with_array_indexing_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+int get_val(int *arr, int idx) {
+    return arr[idx];
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="index.c",
+            function_name="get_val",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_wrapper_with_assertion_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+void cleanup(struct obj *o) {
+    BUG_ON(!o);
+    kfree(o);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="assert.c",
+            function_name="cleanup",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_multistatement_not_wrapper(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+int do_work(int x) {
+    int result = compute(x);
+    log_result(result);
+    return result;
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="multi.c",
+            function_name="do_work",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_wrapper_python_delegate(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+def get_config(key):
+    return lookup_config(key)
+"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="wrap.py",
+            function_name="get_config",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+        assert "trivial wrapper" in result.skip_reason
+
+    def test_crypto_wrapper_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+void hash_input(char *buf, int len) {
+    sha256(buf, len, out);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="crypto.c",
+            function_name="hash_input",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_dangerous_api_wrapper_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+void copy_data(char *dst, char *src, int len) {
+    return memcpy(dst, src, len);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="copy.c",
+            function_name="copy_data",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_guard_then_delegate_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+int check_range(int n) {
+    if (n > MAX) return -1;
+    return process(n);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="guard.c",
+            function_name="check_range",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_variable_pointer_offset_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+int probe(struct device *dev, int reg) {
+    return read_register(dev->mmio + reg);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="probe.c",
+            function_name="probe",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def test_kernel_malloc_wrapper_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+void *alloc_obj(size_t n) {
+    return kmalloc(n, GFP_KERNEL);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="alloc.c",
+            function_name="alloc_obj",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+
+    def _py_wrapper(self, body: str):
+        from core.audit.prefilter import run_prefilter
+        return run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="wrap.py",
+            function_name="f",
+            source=f"def f(arg):\n    return {body}\n",
+            line_start=1,
+        )
+
+    def test_shell_true_wrapper_keeps_its_hit_and_review(self):
+        # A one-line delegate to subprocess.run(cmd, shell=True) fires
+        # an error-grade hit on its own line; the wrapper skip must
+        # not resolve the function mechanically clean over it.
+        result = self._py_wrapper("subprocess.run(arg, shell=True)")
+        assert any(
+            h.rule_id == "subprocess-shell-true" for h in result.hits
+        )
+        assert not result.skip_llm
+
+    def test_pickle_loads_wrapper_not_skipped(self):
+        result = self._py_wrapper("pickle.loads(arg)")
+        assert any(h.rule_id == "pickle-untrusted" for h in result.hits)
+        assert not result.skip_llm
+
+    def test_yaml_load_wrapper_not_skipped(self):
+        result = self._py_wrapper("yaml.load(arg)")
+        assert any(h.rule_id == "yaml-unsafe-load" for h in result.hits)
+        assert not result.skip_llm
+
+    def test_dotted_dangerous_delegate_not_skipped(self):
+        # No hit fires for shell-less subprocess.run, so this pins the
+        # DOTTED callee match: the bare-word capture compared "run"
+        # against the dotted _DANGEROUS_PY_APIS entries and never
+        # excluded it.
+        result = self._py_wrapper("subprocess.run(arg)")
+        assert not result.hits
+        assert not result.skip_llm
+
+    def test_bare_imported_dangerous_tail_not_skipped(self):
+        # `from pickle import loads` — the bare tail of a dotted
+        # dangerous entry must exclude too.
+        result = self._py_wrapper("loads(arg)")
+        assert not result.skip_llm
+
+    def test_getattr_literal_dangerous_delegate_not_skipped(self):
+        # Reflection indirection: the captured callee is `getattr`,
+        # which the dangerous-callee exclusion never matched — the
+        # literal attribute name must resolve to subprocess.run and
+        # refuse the skip.
+        result = self._py_wrapper(
+            'getattr(subprocess, "run")(arg, shell=True)'
+        )
+        assert not result.skip_llm
+
+    def test_getattr_dynamic_name_not_skipped(self):
+        # A dynamic attribute name is unresolvable mechanically: the
+        # delegate's real target is unknown, so it must never be
+        # journalled mechanically clean.
+        result = self._py_wrapper("getattr(subprocess, arg)(arg)")
+        assert not result.skip_llm
+
+    def test_getattr_default_arg_form_not_skipped(self):
+        # The three-argument getattr stays unresolved (conservative):
+        # no skip.
+        result = self._py_wrapper('getattr(subprocess, "run", None)(arg)')
+        assert not result.skip_llm
+
+    def test_getattr_literal_benign_target_still_skips(self):
+        # Both directions: a literal-name getattr RESOLVES and
+        # re-enters the exclusion checks — a benign resolved target
+        # keeps the trivial-wrapper skip.
+        result = self._py_wrapper('getattr(math, "sqrt")(arg)')
+        assert result.skip_llm
+        assert "math.sqrt" in result.skip_reason
+
+    def test_import_module_delegate_not_skipped(self):
+        result = self._py_wrapper("importlib.import_module(arg)")
+        assert not result.skip_llm
+
+    def test_dunder_import_delegate_not_skipped(self):
+        result = self._py_wrapper('__import__("os")')
+        assert not result.skip_llm
+
+    def test_attrgetter_literal_dangerous_not_skipped(self):
+        # The wider indirection family: the captured callee is the
+        # helper, so the literal name must resolve into the
+        # exclusion checks.
+        result = self._py_wrapper('operator.attrgetter("run")(sp)(arg)')
+        assert not result.skip_llm
+
+    def test_methodcaller_literal_dangerous_not_skipped(self):
+        result = self._py_wrapper('operator.methodcaller("run", arg)(sp)')
+        assert not result.skip_llm
+
+    def test_partial_reference_dangerous_not_skipped(self):
+        # partial's wrapped callable is a REFERENCE, not a call — the
+        # first-argument identifier is the resolvable name.
+        result = self._py_wrapper("functools.partial(sp.run)(arg)")
+        assert not result.skip_llm
+
+    def test_partial_of_getattr_not_skipped(self):
+        # Nested indirection resolves to another indirection helper —
+        # refuse, never chase.
+        result = self._py_wrapper('partial(getattr, sp, "run")(arg)')
+        assert not result.skip_llm
+
+    def test_vars_subscript_dangerous_not_skipped(self):
+        result = self._py_wrapper('vars(sp)["run"](arg)')
+        assert not result.skip_llm
+
+    def test_globals_subscript_dangerous_not_skipped(self):
+        result = self._py_wrapper('globals()["system"](arg)')
+        assert not result.skip_llm
+
+    def test_vars_dynamic_name_not_skipped(self):
+        result = self._py_wrapper("vars(sp)[arg](arg)")
+        assert not result.skip_llm
+
+    def test_unknown_factory_result_call_not_skipped(self):
+        # A factory outside the family whose RESULT is called: the
+        # executed target is unknown — never mechanically clean.
+        result = self._py_wrapper("make_fn()(arg)")
+        assert not result.skip_llm
+
+    def test_attrgetter_literal_benign_still_skips(self):
+        # Both directions: family shapes with a resolvable benign
+        # literal keep the skip.
+        result = self._py_wrapper('operator.attrgetter("total")(box)')
+        assert result.skip_llm
+
+    def test_two_line_method_value_not_skipped(self):
+        # The local name captures as the callee while the real target
+        # sits surface-spelled on the assignment line — resolve the
+        # one-hop alias before the exclusion checks.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = subprocess.run\n    return f2(a)\n",
+            "python", None,
+        )
+        assert not is_wrapper
+
+    def test_two_line_method_value_benign_still_skips(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = helper\n    return f2(a)\n",
+            "python", None,
+        )
+        assert is_wrapper
+
+    def test_c_dlsym_literal_dangerous_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            'void *f(void *h) {\n    return dlsym(h, "system");\n}\n',
+            "c", None,
+        )
+        assert not is_wrapper
+
+    def test_other_language_callee_sets_excluded(self):
+        # The wrapper exclusion must not be narrower than
+        # _is_trivially_clean's per-language dangerous-callee sets
+        # (body-only shape: the signature line usually saves these by
+        # accident, which is no contract).
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "\treturn exec.Command(c)\n", "go", None,
+        )
+        assert not is_wrapper
+
+    def test_dunder_call_dangerous_not_skipped(self):
+        # Object-protocol executor: `sink.__call__(...)` executes the
+        # base object with no helper at all — the captured callee's
+        # tail is `__call__`, which matched neither the dotted
+        # dangerous entries nor their bare tails, so the delegate
+        # journalled mechanically clean.
+        for body in (
+            "os.system.__call__(arg)",
+            "subprocess.run.__call__(arg)",
+            "pickle.loads.__call__(arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_dunder_call_chain_not_skipped(self):
+        # Stacked executor segments still resolve to the base object.
+        result = self._py_wrapper("os.system.__call__.__call__(arg)")
+        assert not result.skip_llm
+
+    def test_wrapped_dunder_chain_not_skipped(self):
+        # `.__wrapped__` / `.__func__` unwrap chains execute the
+        # underlying callable too.
+        for body in (
+            "subprocess.run.__wrapped__(arg)",
+            "sp.run.__func__(sp, arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_dunder_call_alias_not_skipped(self):
+        # The executor chain on a LOCAL alias: strip before the alias
+        # walk so `f2.__call__` resolves as `f2` -> os.system.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = os.system\n    return f2.__call__(a)\n",
+            "python", None,
+        )
+        assert not is_wrapper
+
+    def test_object_protocol_dunder_refused(self):
+        # Any other dunder segment routes through the object protocol
+        # — the executed target is not the spelled name, so the
+        # delegate is unresolvable and never mechanically clean.
+        for body in (
+            "obj.__class__(arg)",
+            "obj.__self__.helper(arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_mid_chain_dangerous_attribute_not_skipped(self):
+        # The dangerous target buried mid-chain behind a non-dunder
+        # attribute: every segment joins the tail exclusion.
+        result = self._py_wrapper("subprocess.run.retry(arg)")
+        assert not result.skip_llm
+
+    def test_dunder_call_benign_still_skips(self):
+        # Both directions: the executor chain resolves and re-enters
+        # the exclusion checks — a benign base object keeps the skip.
+        result = self._py_wrapper("helper.compute.__call__(arg)")
+        assert result.skip_llm
+        assert "helper.compute" in result.skip_reason
+
+    def test_sink_callable_argument_not_skipped(self):
+        # The sink escapes as a VALUE: passed as a callable-reference
+        # argument, it never appears in call position, so the
+        # captured-callee exclusion cannot see it. The executor is
+        # deliberately not enumerated — any call taking a sink-name
+        # reference refuses the skip.
+        for body in (
+            "pool.submit(os.system, arg)",
+            "asyncio.to_thread(os.system, arg)",
+            "map(os.system, arg)",
+            "filter(os.system, arg)",
+            "itertools.starmap(os.system, arg)",
+            "apply(os.system, arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_sink_bare_reference_argument_not_skipped(self):
+        # `from os import system` — the escaping reference is the
+        # bare name, matched against the bare tails exactly like the
+        # bare-callee case.
+        result = self._py_wrapper("pool.submit(system, arg)")
+        assert not result.skip_llm
+
+    def test_sink_reference_executor_dunder_not_skipped(self):
+        # The reference can carry the executor-dunder chain too.
+        result = self._py_wrapper("pool.submit(os.system.__call__, arg)")
+        assert not result.skip_llm
+
+    def test_sink_reference_alias_not_skipped(self):
+        # The argument spells a LOCAL alias; the sink sits on the
+        # assignment line outside any argument list — one-hop alias
+        # resolution mirrors the callee walk.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = os.system\n    return pool.submit(f2, a)\n",
+            "python", None,
+        )
+        assert not is_wrapper
+
+    def test_sink_reference_keyword_argument_not_skipped(self):
+        result = self._py_wrapper("pool.submit(fn=os.system)")
+        assert not result.skip_llm
+
+    def test_c_sink_function_pointer_argument_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "int f(char *cmd) {\n    return dispatch(system, cmd);\n}\n",
+            "c", None,
+        )
+        assert not is_wrapper
+
+    def test_benign_reference_argument_still_skips(self):
+        # Both directions: benign callable references keep the skip.
+        result = self._py_wrapper("dispatch(helper.compute, arg)")
+        assert result.skip_llm
+
+    def test_reference_scan_ignores_strings_and_comments(self):
+        # Prose naming a sink in a string or trailing comment must
+        # not flip a benign wrapper — strings/comments are cut from
+        # the reference view only.
+        for body in (
+            "helper.process(arg, mode='run the system fast')",
+            "helper.process(arg)  # runs the query via os.system",
+        ):
+            result = self._py_wrapper(body)
+            assert result.skip_llm, body
+
+    def test_reference_scan_is_argument_position_only(self):
+        # A tail-colliding name OUTSIDE any argument list (a plain
+        # data read) keeps the skip: the position gate is what holds
+        # the legitimate-corpus flip rate at ~0.
+        result = self._py_wrapper("helper.process(arg) == request.param")
+        assert result.skip_llm
+
+    # ── Whole-value escape analysis (Python AST leg) ──────────────
+    # A sink value escaping through ANY binding/argument/return shape
+    # must refuse the skip; the benign twins pin the other direction.
+
+    def _py_fn(self, source: str):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(source, "python", None)
+        return is_wrapper
+
+    def test_two_hop_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    f1 = os.system\n    f2 = f1\n"
+            "    return f2(cmd)\n"
+        )
+
+    def test_tuple_unpack_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g, h = os.system, len\n    return g(cmd)\n"
+        )
+
+    def test_chained_assign_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g = h = os.system\n    return g(cmd)\n"
+        )
+
+    def test_annotated_assign_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g: object = os.system\n    return g(cmd)\n"
+        )
+
+    def test_conditional_rhs_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, x):\n    g = os.system if x else print\n"
+            "    return g(cmd)\n"
+        )
+
+    def test_spaced_dots_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g = os . system\n    return g(cmd)\n"
+        )
+
+    def test_default_parameter_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, g=os.system):\n    return g(cmd)\n"
+        )
+
+    def test_kwonly_default_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, *, g=os.system):\n    return g(cmd)\n"
+        )
+
+    def test_two_hop_value_escape_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    f1 = os.system\n    f2 = f1\n"
+            "    return pool.submit(f2, cmd)\n"
+        )
+
+    def test_tuple_unpack_value_escape_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g, h = os.system, len\n"
+            "    return pool.submit(g, cmd)\n"
+        )
+
+    def test_return_position_sink_escape_not_skipped(self):
+        # The sink escapes as the RETURN VALUE while the single call
+        # is benign — no binding, no argument position.
+        assert not self._py_fn(
+            "def f(x):\n    log(x)\n    return os.system\n"
+        )
+
+    def test_yield_position_sink_escape_not_skipped(self):
+        assert not self._py_fn(
+            "def f(x):\n    log(x)\n    yield os.system\n"
+        )
+
+    def test_comprehension_value_escape_not_skipped(self):
+        # A sink spelled in a comprehension's element/key/value
+        # position escapes by value exactly like a display element.
+        for body in (
+            "def f(c, y):\n    log(c)\n"
+            "    return (subprocess.run for _ in y)\n",
+            "def f(c, y):\n    log(c)\n"
+            "    return {k: os.system for k in y}\n",
+            "def f(c, y):\n    log(c)\n"
+            "    return [os.system for _ in y]\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_comprehension_loop_var_tail_collision_still_skips(self):
+        # The other direction: a comprehension-scoped loop variable
+        # that merely tail-collides with a sink name is the
+        # construct's own binder, not a body value — the wrapper
+        # stays trivially skippable.
+        assert self._py_fn(
+            "def f(tool_call_log):\n"
+            "    return any(call in TOOLS for call in tool_call_log)\n"
+        )
+
+    def test_subscripted_display_value_escape_not_skipped(self):
+        # Subscripting a display still yields a body-spelled element.
+        for body in (
+            "def f(c):\n    log(c)\n    return {1: os.system}[1]\n",
+            "def f(c):\n    log(c)\n    return [os.system][0]\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_opaque_value_view_carries_spelled_refs(self):
+        # The conservative arm itself must carry body-spelled
+        # references out of opaque expressions — pinned at the
+        # value-view level so the refusal never depends on an
+        # unrelated downstream text heuristic.
+        import ast as ast_mod
+
+        from core.audit.prefilter import _py_value_refs
+        for expr in (
+            "[os.system for _ in y]",
+            "(subprocess.run for _ in y)",
+            "{k: os.system for k in y}",
+            "[os.system][0]",
+            "{1: os.system}[1]",
+        ):
+            refs, resolved = _py_value_refs(
+                ast_mod.parse(expr, mode="eval").body,
+            )
+            assert not resolved, expr
+            assert refs & {"os.system", "subprocess.run"}, expr
+
+    def test_bare_decorator_reference_judged(self):
+        # A bare decorator executes the referenced callable at
+        # definition time; a benign decorator keeps the skip.
+        assert not self._py_fn(
+            "@os.system\ndef f(c):\n    return log(c)\n"
+        )
+        assert self._py_fn(
+            "@functools.lru_cache\ndef f(c):\n    return helper(c)\n"
+        )
+
+    def test_walrus_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    return (g := os.system)(cmd)\n"
+        )
+
+    def test_container_display_sink_not_skipped(self):
+        for body in (
+            "def f(cmd):\n    fns = [os.system]\n    return apply(fns, cmd)\n",
+            "def f(cmd):\n    d = {'k': os.system}\n    return apply(d, cmd)\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_lambda_carried_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g = lambda: os.system\n    return apply(g, cmd)\n"
+        )
+
+    def test_import_alias_sink_not_skipped(self):
+        for body in (
+            "def f(cmd):\n    import os as o\n    return o.system(cmd)\n",
+            "def f(cmd):\n    from os import system as s\n    return s(cmd)\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_augassign_carried_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, g):\n    g += [os.system]\n    return apply(g, cmd)\n"
+        )
+
+    def test_subscript_store_sink_not_skipped(self):
+        # Store into a container: no local name is bound, but the
+        # stored value carries the sink out of the wrapper.
+        assert not self._py_fn(
+            "def f(cmd, d):\n    d['k'] = os.system\n    return helper(cmd)\n"
+        )
+
+    def test_unresolvable_bound_callee_not_skipped(self):
+        # The delegate's value comes from a container the body never
+        # spells — an unresolvable delegate is never mechanically
+        # clean.
+        assert not self._py_fn(
+            "def f(cmd):\n    g = TABLE[0]\n    return g(cmd)\n"
+        )
+
+    def test_global_rebindable_callee_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    global g\n    return g(cmd)\n"
+        )
+
+    def test_unparseable_python_source_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd:\n    return helper(cmd)\n"
+        )
+
+    def test_star_import_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    from os import *\n    return helper(cmd)\n"
+        )
+
+    def test_literal_default_parameter_stays_caller_data(self):
+        # A pure-literal default leaves the parameter as plain caller
+        # data: forwarding it (even under a tail-colliding name) or
+        # calling through it keeps the skip.
+        for body in (
+            "def f(x, out=None):\n    return out.append(x)\n",
+            "def f(x, timeout=30):\n    return helper(x, timeout)\n",
+            "def f(self, *, write=True):\n"
+            "    return self._lock(write=write)\n",
+        ):
+            assert self._py_fn(body), body
+
+    def test_parameter_forward_under_sink_tail_name_skips(self):
+        # A BARE parameter reference is caller data even under a
+        # tail-colliding name — the local binding shadows any module
+        # of the same spelling.
+        assert self._py_fn(
+            "def f(request):\n    return helper(request)\n"
+        )
+
+    def test_attribute_chain_on_parameter_still_judged(self):
+        # The attribute segments name the API reached through the
+        # caller's object — only the parameter ROOT is exempt.
+        assert not self._py_fn(
+            "def f(sp, arg):\n    return pool.submit(sp.run, arg)\n"
+        )
+
+    def test_rebound_parameter_loses_caller_data_exemption(self):
+        assert not self._py_fn(
+            "def f(system, c):\n    system = os.system\n"
+            "    return dispatch(system, c)\n"
+        )
+
+    def test_reference_default_parameter_still_resolves(self):
+        # Both directions: a reference-carrying default joins the
+        # parameter's value domain — sink defaults refuse, benign
+        # ones resolve and skip.
+        assert not self._py_fn(
+            "def f(cmd, g=os.system):\n    return g(cmd)\n"
+        )
+        assert self._py_fn(
+            "def f(a, g=math.sqrt):\n    return g(a)\n"
+        )
+
+    def test_lambda_param_does_not_exempt_outer_name(self):
+        # A lambda parameter shadows only inside the lambda — outside
+        # it the same spelling is the module/import, so it must never
+        # join the caller-data exemption (the bare sink call below
+        # would be journalled mechanically clean).
+        assert not self._py_fn(
+            "def f(c):\n    g = lambda system: 0\n    return system(c)\n"
+        )
+
+    def test_nested_def_param_does_not_exempt_outer_name(self):
+        assert not self._py_fn(
+            "def f(c):\n    def g(system):\n        pass\n"
+            "    return system(c)\n"
+        )
+
+    def test_lambda_param_project_sink_not_laundered(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        skip, _ = _is_trivial_wrapper(
+            "def f(c):\n    g = lambda utilmod: 0\n"
+            "    return utilmod.launch(c)\n",
+            "python", None,
+            project_sinks=frozenset({"utilmod.launch"}),
+        )
+        assert not skip
+
+    def test_project_sink_root_survives_param_collision(self):
+        # The operator's dotted sink declaration names the module —
+        # a parameter sharing that root keeps the reference judged
+        # (dotted project sinks derive no bare-tail set, so the root
+        # is their only surface).
+        from core.audit.prefilter import _is_trivial_wrapper
+        skip, _ = _is_trivial_wrapper(
+            "def f(c, utilmod=None):\n    return utilmod.launch(c)\n",
+            "python", None,
+            project_sinks=frozenset({"utilmod.launch"}),
+        )
+        assert not skip
+
+    def test_lambda_with_benign_params_keeps_skip(self):
+        # The other direction: lambda parameters colliding with
+        # nothing keep the wrapper trivially skippable.
+        assert self._py_fn(
+            "def f(x):\n    g = lambda k: k\n    return helper(x, g)\n"
+        )
+
+    def test_relative_import_delegate_still_skips(self):
+        # A relative import spells its delegate fully — the wrapper
+        # stays trivially skippable; only the ref parts are judged.
+        for body in (
+            "def f(cfg, line):\n"
+            "    from .cfg_utils import find_node\n"
+            "    return find_node(cfg, line)\n",
+            "def f(x):\n    from . import helpers\n"
+            "    return helpers.compute(x)\n",
+        ):
+            assert self._py_fn(body), body
+
+    def test_relative_import_sink_tail_not_skipped(self):
+        assert not self._py_fn(
+            "def f(c):\n    from .proc_utils import run\n"
+            "    return run(c)\n"
+        )
+
+    def test_benign_alias_chain_still_skips(self):
+        # Both directions: benign values flowing through the same
+        # shapes keep the skip.
+        for body in (
+            "def f(a):\n    g = math.sqrt\n    return g(a)\n",
+            "def f(a, g=math.sqrt):\n    return g(a)\n",
+            "def f(a, x):\n    g = math.sqrt if x else math.floor\n"
+            "    return g(a)\n",
+            "def f(x):\n    limit = 30\n    return helper(x, limit)\n",
+        ):
+            assert self._py_fn(body), body
+
+    # ── Whole-value escape analysis (C/C++ text-grammar leg) ──────
+
+    def _c_fn(self, source: str, lang: str = "c"):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(source, lang, None)
+        return is_wrapper
+
+    def test_c_typedef_fn_pointer_alias_not_skipped(self):
+        # A leading type token defeated the anchored alias regex; the
+        # declaration grammar must see through the declarator.
+        assert not self._c_fn(
+            "sighandler_t f(char *c) {\n"
+            "    sighandler_t fp = system;\n    return fp(c);\n}\n"
+        )
+
+    def test_cpp_auto_alias_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n    auto fp = system;\n"
+            "    return fp(c);\n}\n",
+            "cpp",
+        )
+
+    def test_c_fn_pointer_declarator_alias_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            "    int (*fp)(const char *) = system;\n"
+            "    return fp(c);\n}\n"
+        )
+
+    def test_c_brace_initializer_sink_not_skipped(self):
+        # Refusal here comes from the body-view truncation at the
+        # initializer's `}` and the tail gates — the statement
+        # splitter consumes brace groups before value classification,
+        # so no value-level judgment of brace elements is claimed
+        # (both directions pinned: aggregate and C++ brace
+        # declarator).
+        for body in (
+            "int f(char *c) {\n    handler_t t[] = {system};\n"
+            "    return helper(c);\n}\n",
+            "void f(char *c) {\n    fn_t fp{system};\n"
+            "    fp(c);\n}\n",
+        ):
+            assert not self._c_fn(body), body
+
+    def test_c_ternary_sink_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c, int x) {\n"
+            "    fn_t fp = x ? system : safe_fn;\n"
+            "    return fp(c);\n}\n"
+        )
+
+    def test_c_chained_assign_sink_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n    fn_t g = h = system;\n"
+            "    return g(c);\n}\n"
+        )
+
+    def test_c_compound_assign_sink_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n    a |= (uintptr_t)system;\n"
+            "    return helper(c);\n}\n"
+        )
+
+    def test_c_member_and_array_store_sink_not_skipped(self):
+        for body in (
+            "void f(struct ops *o, char *c) {\n"
+            "    o->exec_fn = system;\n    helper(c);\n}\n",
+            "void f(fn_t *t, char *c) {\n"
+            "    t[0] = system;\n    helper(c);\n}\n",
+        ):
+            assert not self._c_fn(body), body
+
+    def test_c_return_position_cast_sink_not_skipped(self):
+        assert not self._c_fn(
+            "void *f(char *c) {\n    log_it(c);\n"
+            "    return (void *)system;\n}\n"
+        )
+
+    def test_c_subscript_bound_callee_not_skipped(self):
+        # The delegate's value comes out of a container — an
+        # unresolvable delegate is never mechanically clean.
+        assert not self._c_fn(
+            "int f(char *c) {\n    fn_t fp = handlers[0];\n"
+            "    return fp(c);\n}\n"
+        )
+
+    def test_c_pointer_store_line_not_treated_as_comment(self):
+        # A leading `*` is a block-comment continuation only inside
+        # an open `/* ... */`; a pointer store must stay in the
+        # judged view.
+        assert not self._c_fn(
+            "void f(fn_t *slot, char *c) {\n"
+            "    *slot = system;\n    helper(c);\n}\n"
+        )
+
+    def test_c_block_comment_continuation_still_dropped(self):
+        # Both directions: prose continuation lines (even ones
+        # spelling sinks) stay out of the judged view.
+        assert self._c_fn(
+            "/* setkey wrapper\n * forwards; system = crypto layer\n"
+            " */\nint setkey(struct aead *a, const u8 *k) {\n"
+            "    return aead_setkey(a, k);\n}\n"
+        )
+
+    def test_c_code_after_inline_block_comment_judged(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            "    /* nothing */ dispatch(system, c);\n    return 0;\n}\n"
+        )
+
+    def test_c_string_spelling_comment_opener_does_not_swallow(self):
+        # `/*` inside a C string literal is data — treating it as an
+        # opener dropped every following line from the judged view,
+        # hiding a live sink call behind a glob pattern.
+        assert not self._c_fn(
+            'int glob_run(const char *d) {\n'
+            '    log_msg("scan /* pattern");\n'
+            '    return system(d);\n}\n'
+        )
+
+    def test_c_line_comment_opener_does_not_swallow(self):
+        # A `/*` after `//` is line-comment prose, not an opener —
+        # the phantom state swallowed the sink line below.
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            "    return log(c); // note /*\n"
+            "    system(c);\n}\n"
+        )
+
+    def test_c_string_comment_closer_does_not_end_state(self):
+        # The mirror direction: `*/` inside a string while no comment
+        # is open is data; the sink call stays judged either way.
+        assert not self._c_fn(
+            'int f(char *c) {\n'
+            '    log_msg("end */ marker");\n'
+            '    return system(c);\n}\n'
+        )
+
+    def test_c_quotes_inside_open_comment_are_prose(self):
+        # Inside an open block comment there are no strings — the
+        # first `*/` closes even when quoted, so following code stays
+        # in the judged view (over-inclusion at worst, never a
+        # swallow).
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            '    /* doc " */ dispatch(system, c);\n'
+            "    return 0;\n}\n"
+        )
+
+    def test_python_block_comment_string_does_not_hide_code(self):
+        # `/*` in a Python string is data, not a comment opener — a
+        # sink call between `"/*"` and `"*/"` strings must stay
+        # visible to the call gate / AST judgment.
+        assert not self._py_fn(
+            'def f(c):\n    s = "/*"\n    os.system(c)\n'
+            '    t = "*/"\n    return s + t\n'
+        )
+
+    def test_c_benign_declarations_still_skip(self):
+        for body in (
+            "int f(int x) {\n    int limit = 30;\n"
+            "    return check_limit(x, limit);\n}\n",
+            "int f(int x, int y) {\n"
+            "    fn_t g = y ? do_a : do_b;\n    return g(x);\n}\n",
+        ):
+            assert self._c_fn(body), body
+
+    def test_cpp_benign_auto_alias_still_skips(self):
+        assert self._c_fn(
+            "int f(int x) {\n    auto g = my_helper;\n"
+            "    return g(x);\n}\n",
+            "cpp",
+        )
+
+    # ── Whole-value escape analysis (remaining language legs) ─────
+    # Body-only shapes: with a signature line present these languages
+    # never reach the skip (the signature's own `name(` counts as a
+    # call), so the binding grammar is exercised on bodies.
+
+    def test_go_declaration_alias_sink_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        for body in (
+            "g := exec.Command\nreturn g(c)\n",
+            "g := exec.Command\nh := g\nreturn dispatch(h, c)\n",
+        ):
+            is_wrapper, _ = _is_trivial_wrapper(body, "go", None)
+            assert not is_wrapper, body
+
+    def test_js_const_alias_sink_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        for body in (
+            "const g = eval;\nreturn g(c);\n",
+            "let a = eval;\nlet b = a;\nreturn b(c);\n",
+        ):
+            is_wrapper, _ = _is_trivial_wrapper(body, "javascript", None)
+            assert not is_wrapper, body
+
+    def test_lua_local_alias_sink_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "local g = os.execute\nreturn g(c)\n", "lua", None,
+        )
+        assert not is_wrapper
+
+    def test_perl_coderef_value_escape_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "my $g = \\&system;\nreturn dispatch($g, $x);\n",
+            "perl", None,
+        )
+        assert not is_wrapper
+
+    def test_php_string_callable_binding_not_skipped(self):
+        # `$g = 'system'; $g($c)` — the delegate's value is a string
+        # the noise strip cut, so the bound callee resolves to
+        # nothing nameable: never mechanically clean.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "$g = 'system';\nreturn $g($c);\n", "php", None,
+        )
+        assert not is_wrapper
+
+    def test_other_language_benign_aliases_still_skip(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        for body, lg in (
+            ("g := compute\nreturn g(x)\n", "go"),
+            ("const g = myHelper;\nreturn g(x);\n", "javascript"),
+            ("local g = fmt_helper\nreturn g(x)\n", "lua"),
+        ):
+            is_wrapper, _ = _is_trivial_wrapper(body, lg, None)
+            assert is_wrapper, (body, lg)
+
+    def test_callgraph_resolved_dangerous_callee_not_skipped(self):
+        # The extraction pipeline resolved the delegate to a dangerous
+        # callee the body text does not spell (macro indirection) —
+        # the call-graph veto must refuse the skip.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "int f(int x) {\n    return DO_OP(x);\n}\n",
+            "c", [{"name": "system"}],
+        )
+        assert not is_wrapper
+
+    def test_callgraph_resolved_project_sink_callee_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(x):\n    return do_op(x)\n",
+            "python", [{"name": "render_query"}],
+            project_sinks=frozenset({"render_query"}),
+        )
+        assert not is_wrapper
+
+    def test_callgraph_benign_callee_still_skips(self):
+        # Exact-name match only: a benign resolved callee (even one
+        # sharing no name with the body spelling) keeps the skip.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(x):\n    return do_op(x)\n",
+            "python", [{"name": "compute_value"}],
+        )
+        assert is_wrapper
+
+
+class TestBinderConstructClosure:
+    """Mechanical closure over the installed Python grammar: every
+    ast node type that introduces or receives a name binding must be
+    either handled by the wrapper escape collector or covered by its
+    conservative runtime default (refuse the skip). The enumeration
+    is derived from the ast module itself, so a new grammar release
+    adding a binder construct fails here until it is classified —
+    while the runtime default already refuses it."""
+
+    def test_installed_binder_grammar_totally_classified(self):
+        import ast as ast_mod
+
+        from core.audit.prefilter import (
+            _PY_BINDER_FIELDS,
+            _PY_HANDLED_BINDERS,
+        )
+        binder_classes = {
+            obj for obj in vars(ast_mod).values()
+            if isinstance(obj, type)
+            and issubclass(obj, ast_mod.AST)
+            and set(getattr(obj, "_fields", ())) & _PY_BINDER_FIELDS
+        }
+        assert binder_classes, "binder-field enumeration went empty"
+        # Constructs deliberately left to the conservative runtime
+        # default: match patterns and type-parameter declarations
+        # refuse the skip instead of modelling their bindings.
+        conservatively_refused = {
+            getattr(ast_mod, name)
+            for name in (
+                "MatchAs", "MatchStar", "MatchMapping",
+                "TypeAlias", "TypeVar", "ParamSpec", "TypeVarTuple",
+            )
+            if hasattr(ast_mod, name)
+        }
+        unclassified = (
+            binder_classes
+            - set(_PY_HANDLED_BINDERS)
+            - conservatively_refused
+        )
+        assert not unclassified, (
+            "new binder constructs need classification in the "
+            f"wrapper escape collector: {sorted(c.__name__ for c in unclassified)}"
+        )
+
+    def test_unhandled_binder_construct_refuses_analysis(self):
+        # A match capture pattern binds through a construct the
+        # collector does not model — the conservative default must
+        # refuse the analysis (and therefore the skip).
+        from core.audit.prefilter import (
+            _is_trivial_wrapper,
+            _py_wrapper_escape,
+        )
+        src = (
+            "def f(c, x):\n"
+            "    match x:\n"
+            "        case g:\n"
+            "            return helper(c)\n"
+        )
+        assert _py_wrapper_escape(src) is None
+        assert not _is_trivial_wrapper(src, "python", None)[0]
+
+    def test_store_sweep_refuses_unaccounted_name(self, monkeypatch):
+        # Belt-and-braces behind the binder-field check: a
+        # Store-context Name the collector did not bind or account
+        # for refuses the analysis. Exercised by planting a synthetic
+        # binder whose holder type carries no binder-shaped field.
+        import ast as ast_mod
+
+        from core.audit.prefilter import _py_wrapper_escape
+        src = "def f(c):\n    return helper(c)\n"
+        tree = ast_mod.parse(src)
+
+        def planted_parse(_source: str) -> ast_mod.Module:
+            # graft a bare Store name under an expression statement
+            planted = ast_mod.Name(id="ghost", ctx=ast_mod.Store())
+            tree.body[0].body.insert(0, ast_mod.Expr(value=planted))
+            return tree
+
+        monkeypatch.setattr(ast_mod, "parse", planted_parse)
+        assert _py_wrapper_escape(src) is None
+
+
+
+#: Adversarial shape battery rows: (case id, language, source,
+#: expected skip verdict, project sinks, resolved callees).
+#: Historical escape shapes re-spelled independently of the pinned
+#: member tests, benign controls, and hostile candidates across
+#: every language leg.
+_ADVERSARIAL_CASES: list[tuple] = [
+    (
+        'H01-tuple-unpack', 'python',
+        'def f(c):\n    a, b = os.system, 1\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H02-chained', 'python',
+        'def f(c):\n    a = b = os.system\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H03-annotated', 'python',
+        'def f(c):\n    a: object = subprocess.run\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H04-conditional-rhs', 'python',
+        'def f(c, z):\n    a = os.system if z else print\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H05-spaced-attr', 'python',
+        'def f(c):\n    a = os . system\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H06-default-arg', 'python',
+        'def f(c, run=subprocess.run):\n    return run(c)\n',
+        False, None, None,
+    ),
+    (
+        'H07-kwonly-default', 'python',
+        'def f(c, *, run=os.system):\n    return run(c)\n',
+        False, None, None,
+    ),
+    (
+        'H08-two-hop', 'python',
+        'def f(c):\n    a = os.system\n    b = a\n    return b(c)\n',
+        False, None, None,
+    ),
+    (
+        'H09-return-value-escape', 'python',
+        'def f(c):\n    log(c)\n    return os.system\n',
+        False, None, None,
+    ),
+    (
+        'H10-yield-escape', 'python',
+        'def f(c):\n    log(c)\n    yield subprocess.run\n',
+        False, None, None,
+    ),
+    (
+        'H11-walrus', 'python',
+        'def f(c):\n    return (a := os.system)(c)\n',
+        False, None, None,
+    ),
+    (
+        'H12-arg-value-escape', 'python',
+        'def f(c):\n    return pool.submit(os.system, c)\n',
+        False, None, None,
+    ),
+    (
+        'H13-container-store', 'python',
+        "def f(c, d):\n    d['k'] = os.system\n    return log(c)\n",
+        False, None, None,
+    ),
+    (
+        'H14-attr-store', 'python',
+        'def f(self, c):\n    self.h = os.system\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'H15-augassign', 'python',
+        'def f(c, acc):\n    acc += [os.system]\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'H16-import-alias', 'python',
+        'def f(c):\n    import os as o\n    return o.system(c)\n',
+        False, None, None,
+    ),
+    (
+        'H17-from-import', 'python',
+        'def f(c):\n    from os import system as s\n    return s(c)\n',
+        False, None, None,
+    ),
+    (
+        'H18-star-import', 'python',
+        'def f(c):\n    from os import *\n    return system(c)\n',
+        False, None, None,
+    ),
+    (
+        'H19-lambda-carry', 'python',
+        'def f(c):\n    g = lambda: os.system\n    return g(c)\n',
+        False, None, None,
+    ),
+    (
+        'H20-subscript-store', 'python',
+        'def f(c, tbl):\n    tbl[0] = subprocess.run\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'HC1-typedef-fnptr', 'c',
+        'void w(char *c) {\n    sighandler_t fp = system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC2-auto', 'cpp',
+        'void w(char *c) {\n    auto fp = system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC3-fnptr-declarator', 'c',
+        'void w(char *c) {\n    int (*fp)(const char*) = system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC4-brace-init', 'cpp',
+        'void w(char *c) {\n    fn_t fp{system};\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC5-ternary', 'c',
+        'void w(char *c, int z) {\n    fn_t fp = z ? system : puts;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC6-chained', 'c',
+        'void w(char *c) {\n    a = b = system;\n    a(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC7-ptr-store', 'c',
+        'void w(char *c, fn_t *slot) {\n    *slot = system;\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC8-return-cast', 'c',
+        'void *w(char *c) {\n    log(c);\n    return (void *)system;\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC9-member-store', 'c',
+        'void w(struct ops *o, char *c) {\n    o->run = system;\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC10-compound', 'c',
+        'void w(char *c) {\n    fp += system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HG1-go-decl', 'go',
+        'func w(c string) {\n    h := system\n    h(c)\n}\n',
+        False, None, None,
+    ),
+    (
+        'HG2-go-two-hop', 'go',
+        'func w(c string) {\n    h := system\n    g := h\n    g(c)\n}\n',
+        False, None, None,
+    ),
+    (
+        'HJ1-js-const', 'js',
+        'function w(c) {\n    const h = eval;\n    return h(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HJ2-js-arrow-carry', 'js',
+        'function w(c) {\n    const h = () => eval;\n    return h(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HR1-getattr', 'python',
+        "def f(c):\n    return getattr(os, 'system')(c)\n",
+        False, None, None,
+    ),
+    (
+        'HR2-partial', 'python',
+        'def f(c):\n    return partial(sp.run)(c)\n',
+        False, None, None,
+    ),
+    (
+        'HR3-dunder-call', 'python',
+        'def f(c):\n    return os.system.__call__(c)\n',
+        False, None, None,
+    ),
+    (
+        'HR4-vars', 'python',
+        "def f(c):\n    return vars(os)['system'](c)\n",
+        False, None, None,
+    ),
+    (
+        'HR5-factory-result', 'python',
+        'def f(c):\n    return make()(c)\n',
+        False, None, None,
+    ),
+    (
+        'HR6-dlsym', 'c',
+        'void w(char *c) {\n    fn = dlsym(h, "system");\n}\n',
+        False, None, None,
+    ),
+    (
+        'B01-benign-delegate', 'python',
+        'def f(x):\n    return helper.compute(x)\n',
+        True, None, None,
+    ),
+    (
+        'B02-math-alias', 'python',
+        'def f(x):\n    s = math.sqrt\n    return s(x)\n',
+        True, None, None,
+    ),
+    (
+        'B03-bare-param-forward', 'python',
+        'def f(g, x):\n    return g(x)\n',
+        True, None, None,
+    ),
+    (
+        'B04-c-benign', 'c',
+        'int w(int x) {\n    return helper(x);\n}\n',
+        True, None, None,
+    ),
+    (
+        'B05-literal-default', 'python',
+        'def f(x, out=None):\n    return helper(x, out)\n',
+        True, None, None,
+    ),
+    (
+        # Caller-data exemption: a param-rooted method call carries
+        # no sink identity of its own.
+        'B06-param-method', 'python',
+        'def f(request):\n    return request.get_host()\n',
+        True, None, None,
+    ),
+    (
+        'G01-nonlocal-cell', 'python',
+        'def f(c):\n    h = None\n    def s():\n        nonlocal h\n        h = os.system\n    return h(c)\n',
+        False, None, None,
+    ),
+    (
+        'G02-closure-return', 'python',
+        'def f(c):\n    def g():\n        return os.system\n    return g()(c)\n',
+        False, None, None,
+    ),
+    (
+        'G03-lambda-closure-smuggle', 'python',
+        'def f(c):\n    g = lambda: os.system\n    return apply_(g, c)\n',
+        False, None, None,
+    ),
+    (
+        'G04-class-attr-store', 'python',
+        'def f(c):\n    class C:\n        run = os.system\n    return C.run(c)\n',
+        False, None, None,
+    ),
+    (
+        'G05-class-attr-two-step', 'python',
+        'def f(c, C):\n    C.run = os.system\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G06-comp-elt-leak', 'python',
+        'def f(c, y):\n    log(c)\n    return [os.system for _ in y]\n',
+        False, None, None,
+    ),
+    (
+        'G07-comp-iter', 'python',
+        'def f(c):\n    return [g for g in [os.system]]\n',
+        False, None, None,
+    ),
+    (
+        'G08-genexp-elt', 'python',
+        'def f(c, y):\n    log(c)\n    return (subprocess.run for _ in y)\n',
+        False, None, None,
+    ),
+    (
+        'G09-dictcomp-value', 'python',
+        'def f(c, y):\n    log(c)\n    return {k: os.system for k in y}\n',
+        False, None, None,
+    ),
+    (
+        'G10-subscript-display', 'python',
+        'def f(c):\n    log(c)\n    return [os.system][0]\n',
+        False, None, None,
+    ),
+    (
+        'G11-dict-subscript-display', 'python',
+        'def f(c):\n    log(c)\n    return {1: os.system}[1]\n',
+        False, None, None,
+    ),
+    (
+        'G12-slice-display', 'python',
+        'def f(c):\n    log(c)\n    return (os.system, print)[:1]\n',
+        False, None, None,
+    ),
+    (
+        'G13-bare-decorator', 'python',
+        '@os.system\ndef f(c):\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G14-decorator-call', 'python',
+        '@wraps(os.system)\ndef f(c):\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G15-reduce', 'python',
+        'def f(c, fns):\n    return reduce(chain_, [os.system], c)\n',
+        False, None, None,
+    ),
+    (
+        'G16-partialmethod', 'python',
+        'def f(c):\n    run = partialmethod(os.system)\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G17-dict-dispatch', 'python',
+        "def f(c):\n    d = {'a': os.system}\n    return d['a'](c)\n",
+        False, None, None,
+    ),
+    (
+        'G18-inline-dict-dispatch', 'python',
+        "def f(c):\n    return {'a': os.system}['a'](c)\n",
+        False, None, None,
+    ),
+    (
+        'G19-eval-callee', 'python',
+        "def f(c):\n    return eval('os.system')(c)\n",
+        False, None, None,
+    ),
+    (
+        'G20-exec-bind', 'python',
+        "def f(c):\n    exec('h = os.system')\n    return h(c)\n",
+        False, None, None,
+    ),
+    (
+        'G21-eval-bind', 'python',
+        "def f(c):\n    h = eval('os.sys' + 'tem')\n    return h(c)\n",
+        False, None, None,
+    ),
+    (
+        'G22-sysmodules', 'python',
+        "def f(c, evil):\n    sys.modules['os'] = evil\n    return log(c)\n",
+        False, None, None,
+    ),
+    (
+        'G23-lambda-param-shadow-bare', 'python',
+        'def f(c):\n    g = lambda system: 0\n    return system(c)\n',
+        False, None, None,
+    ),
+    (
+        'G24-lambda-param-shadow-proj', 'python',
+        'def f(c):\n    g = lambda utilmod: 0\n    return utilmod.launch(c)\n',
+        False, frozenset({'utilmod.launch'}), None,
+    ),
+    (
+        'G25-own-param-shadow-proj', 'python',
+        'def f(c, utilmod=None):\n    return utilmod.launch(c)\n',
+        False, frozenset({'utilmod.launch'}), None,
+    ),
+    (
+        'G26-nesteddef-param-shadow', 'python',
+        'def f(c):\n    def g(system): pass\n    return system(c)\n',
+        False, None, None,
+    ),
+    (
+        'G27-global-store', 'python',
+        'def f(c):\n    global h\n    h = os.system\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G28-callees-veto', 'c',
+        'void w(char *c) {\n    DOIT(c);\n}\n',
+        False, None, [{'name': 'system'}],
+    ),
+    (
+        'G29-callees-benign', 'c',
+        'void w(char *c) {\n    DOIT(c);\n}\n',
+        True, None, [{'name': 'project_helper'}],
+    ),
+    (
+        'G30-callees-proj-sink', 'c',
+        'void w(char *c) {\n    DOIT(c);\n}\n',
+        False, frozenset({'proj_sink'}), [{'name': 'proj_sink'}],
+    ),
+    (
+        'G31-rust-lifetime-swallow', 'rust',
+        "fn w(c: &str) {\n    let x: &'a str = y; let h = system; let z: &'b str = q;\n    h(c);\n}\n",
+        False, None, None,
+    ),
+    (
+        'G32-cpp-digit-sep', 'cpp',
+        "void w(char *c) {\n    int x = 1'000; fp = system; int y = 5'6;\n    fp(c);\n}\n",
+        False, None, None,
+    ),
+    (
+        # Known residual, pinned: `#`-leading lines are dropped from
+        # the C line view, so a same-body macro hiding the sink call
+        # skips as a benign delegate. The call-graph callee veto
+        # compensates when the extraction pipeline resolves the macro
+        # (the callees row below); lexer-grade preprocessor handling
+        # is out of this analysis' scope.
+        'G33-c-macro-hidden', 'c',
+        '#define FWD(x) system(x)\nvoid w(char *c) {\n    FWD(c);\n}\n',
+        True, None, None,
+    ),
+    (
+        'G33b-c-macro-hidden-callees-veto', 'c',
+        '#define FWD(x) system(x)\nvoid w(char *c) {\n    FWD(c);\n}\n',
+        False, None, [{'name': 'system'}],
+    ),
+    (
+        'G34-go-closure-capture', 'go',
+        'func w(c string) {\n    h := func() { system(c) }\n    h()\n}\n',
+        False, None, None,
+    ),
+    (
+        'G35-js-template-swallow', 'js',
+        'function w(c) {\n    const h = system;\n    return sh(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G36-c-block-comment-ptr', 'c',
+        'void w(fn_t *s, char *c) {\n    /* doc\n     * more doc\n     */\n    *s = system;\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G37-c-fake-block-close', 'c',
+        'void w(fn_t *s, char *c) {\n    *s = system; /* set\n     * handler */\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G38-c-string-quote-swallow', 'c',
+        'void w(char *c) {\n    p = "a; q = \\"b"; fp = system; r = "c";\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G39-unresolved-delegate', 'python',
+        "def f(c, d):\n    h = d['k']\n    return h(c)\n",
+        False, None, None,
+    ),
+    (
+        'G40-cycle', 'python',
+        'def f(c):\n    a = b\n    b = a\n    return a(c)\n',
+        False, None, None,
+    ),
+]
+
+
+class TestWrapperAdversarialShapes:
+    """Each battery row pins today's verdict (skip or review) so a
+    grammar change that re-opens an escape shape — or starts
+    refusing a pinned benign control — fails loudly with its case
+    id."""
+
+    @pytest.mark.parametrize(
+        ("cid", "lang", "src", "expect_skip", "sinks", "callees"),
+        _ADVERSARIAL_CASES,
+        ids=[c[0] for c in _ADVERSARIAL_CASES],
+    )
+    def test_adversarial_shape(
+        self,
+        cid: str,
+        lang: str,
+        src: str,
+        expect_skip: bool,
+        sinks: frozenset | None,
+        callees: list[dict[str, Any]] | None,
+    ) -> None:
+        from core.audit.prefilter import _is_trivial_wrapper
+        skip, _reason = _is_trivial_wrapper(
+            src, lang, callees, project_sinks=sinks,
+        )
+        assert skip == expect_skip, cid
+
+
+# ── Multi-language prefilter patterns ─────────────────────────────
+
+class TestMultiLanguagePrefilter:
+
+    def test_php_eval_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function process($input) {
+    $result = eval($input);
+    return $result;
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="handler.php",
+            function_name="process",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "php-eval-variable" for h in result.hits)
+
+    def test_php_accessor_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function getName() {
+    return $this->name;
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="model.php",
+            function_name="getName",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+
+    def test_java_runtime_exec_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+public void runCommand(String cmd) {
+    Process p = Runtime.getRuntime().exec(cmd);
+    p.waitFor();
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="Runner.java",
+            function_name="runCommand",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "java-runtime-exec" for h in result.hits)
+
+    def test_java_accessor_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+public int getId() {
+    return this.id;
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="Entity.java",
+            function_name="getId",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+
+    def test_js_eval_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function compute(expr) {
+    return eval(expr);
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="calc.js",
+            function_name="compute",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "js-eval" for h in result.hits)
+
+    def test_ts_dom_xss_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function render(html: string): void {
+    document.getElementById('out').innerHTML = html;
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="render.ts",
+            function_name="render",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "js-xss-dom" for h in result.hits)
+
+    def test_lua_loadstring_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function run_code(code)
+    local fn = loadstring(code)
+    return fn()
+end"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="sandbox.lua",
+            function_name="run_code",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "lua-loadstring" for h in result.hits)
+
+    def test_perl_system_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+sub run_cmd {
+    my ($cmd) = @_;
+    system("$cmd");
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="util.pl",
+            function_name="run_cmd",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "perl-command-exec" for h in result.hits)
+
+    def test_perl_accessor_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+sub name {
+    return $self->{name};
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="Obj.pm",
+            function_name="name",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+
+    def test_js_accessor_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+getCount() {
+    return this.count;
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="counter.js",
+            function_name="getCount",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+
+    def test_lua_accessor_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function get_value(self)
+    return self.value
+end"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="obj.lua",
+            function_name="get_value",
+            source=source,
+            line_start=1,
+        )
+        assert result.skip_llm
+
+    def test_php_unserialize_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+function load_data($raw) {
+    $data = unserialize($raw);
+    return $data['key'];
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="loader.php",
+            function_name="load_data",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "php-unserialize" for h in result.hits)
+
+    def test_java_deserialization_detected(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+public Object deserialize(InputStream in) throws Exception {
+    ObjectInputStream ois = new ObjectInputStream(in);
+    return ois.readObject();
+}"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="Deserialize.java",
+            function_name="deserialize",
+            source=source,
+            line_start=1,
+        )
+        assert not result.skip_llm
+        assert any(h.rule_id == "java-deserialization" for h in result.hits)
+
+
+# ── Feature 2: Verification tiers ─────────────────────────────────
+
+class TestVerificationTiers:
+
+    def test_enum_values(self):
+        from core.audit.pipeline import VerificationTier
+        assert VerificationTier.CONFIRMED.value == "confirmed"
+        assert VerificationTier.TOOL_BACKED.value == "tool_backed"
+        assert VerificationTier.LLM_ONLY.value == "llm_only"
+        assert VerificationTier.SPECULATIVE.value == "speculative"
+
+    def test_severity_caps(self):
+        from core.audit.pipeline import VerificationTier
+        assert VerificationTier.CONFIRMED.max_severity == "critical"
+        assert VerificationTier.TOOL_BACKED.max_severity == "high"
+        assert VerificationTier.LLM_ONLY.max_severity == "medium"
+        assert VerificationTier.SPECULATIVE.max_severity == "low"
+
+    def test_tier_tool_backed(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="overflow", evidence_tool="semgrep:overflow",
+            tools_dispatched={"semgrep"},
+        )
+        assert o.compute_tier() == "tool_backed"
+
+    def test_tier_no_evidence(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="suspicious",
+            body="maybe", evidence_tool="",
+        )
+        assert o.compute_tier() == "speculative"
+
+    def test_tier_clean_is_speculative(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="clean",
+            body="safe", evidence_tool="semgrep:check",
+        )
+        assert o.compute_tier() == "speculative"
+
+    def test_tier_llm_only(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="vuln", evidence_tool="llm_analysis",
+            tools_dispatched={"semgrep"},
+        )
+        assert o.compute_tier() == "llm_only"
+
+
+# ── Feature 3: Confidence propagation ─────────────────────────────
+
+@dataclass
+class _MockOutcome:
+    file: str
+    function: str
+    status: str
+    verification_tier: str = "speculative"
+    hypotheses: list[dict[str, Any]] | None = None
+
+
+class TestConfidencePropagation:
+
+    def test_all_callers_clean_do_not_prove_the_input_contract(self):
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "if the caller passes invalid length",
+                 "confidence": "medium", "counter": "trusts its caller"},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "b.c", "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller1",
+                            "callee_file": "b.c", "callee": "target"},
+                           {"caller_file": "a.c", "caller": "caller2",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert demotions == []
+
+    def test_demotion_log_entry_carries_source_functions(self):
+        """The audit-log record must carry the full evidentiary basis
+        for the verdict flip, not just the (truncated) prose reason."""
+        from core.audit.orchestrator import _demotion_log_entry
+        from core.audit.propagation import ConfidenceDemotion
+
+        d = ConfidenceDemotion(
+            file="b.c",
+            function="target",
+            reason="all 7 callers verified clean: c1, c2, c3, c4, c5",
+            source_functions=["c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        )
+        entry = _demotion_log_entry(d)
+        assert entry["action"] == "sweep_promotion"
+        assert entry["key"] == "b.c:target:0"
+        assert entry["evidence_tool"] == "confidence_propagation"
+        assert entry["hypothesis"] == d.reason
+        assert entry["source_functions"] == [
+            "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+        ]
+
+    def test_one_caller_not_clean_keeps(self):
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "suspicious"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "caller could provide null",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "b.c", "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller1",
+                            "callee_file": "b.c", "callee": "target"},
+                           {"caller_file": "a.c", "caller": "caller2",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+    def test_no_propagation_from_llm_only(self):
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "llm_only"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "caller passes tainted data",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller1",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+    def test_no_transitive_demotion(self):
+        """Neither an initial contract guess nor its descendants may become clean."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "root", "clean", "confirmed"),
+            _MockOutcome("a.c", "root2", "clean", "tool_backed"),
+            _MockOutcome("a.c", "fn0", "suspicious", hypotheses=[
+                {"mechanism": "caller provides bad data",
+                 "confidence": "medium", "counter": ""},
+            ]),
+            _MockOutcome("a.c", "fn1", "suspicious", hypotheses=[
+                {"mechanism": "caller provides bad data",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "a.c:root": [{"caller_file": "a.c", "caller": "root",
+                          "callee_file": "a.c", "callee": "fn0"}],
+            "a.c:root2": [{"caller_file": "a.c", "caller": "root2",
+                           "callee_file": "a.c", "callee": "fn0"}],
+            "a.c:fn0": [{"caller_file": "a.c", "caller": "root",
+                         "callee_file": "a.c", "callee": "fn0"},
+                        {"caller_file": "a.c", "caller": "root2",
+                         "callee_file": "a.c", "callee": "fn0"},
+                        {"caller_file": "a.c", "caller": "fn0",
+                         "callee_file": "a.c", "callee": "fn1"}],
+            "a.c:fn1": [{"caller_file": "a.c", "caller": "fn0",
+                         "callee_file": "a.c", "callee": "fn1"}],
+        }
+        demotions = propagate_confidence(
+            outcomes, edge_index, max_iterations=5, min_callers=1,
+        )
+        assert demotions == []
+
+    def test_vacuous_callee_not_demoted(self):
+        """Callee not in edge index must not cause vacuous demotion."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "func", "suspicious", hypotheses=[
+                {"mechanism": "callee malloc returns NULL",
+                 "confidence": "medium",
+                 "counter": "malloc could fail"},
+            ]),
+        ]
+        edge_index = {
+            "a.c:func": [{"caller_file": "a.c", "caller": "func",
+                          "callee_file": "libc.so", "callee": "free"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+    def test_no_hypotheses_no_demotion(self):
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[]),
+        ]
+        edge_index = {
+            "a.c:caller": [{"caller_file": "a.c", "caller": "caller",
+                            "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+    def test_same_name_other_file_callers_not_matched(self):
+        """Callers of a same-named function in a DIFFERENT file must not
+        stand in for the flagged function's callers.
+
+        C statics make duplicate function names routine; a bare-name
+        match on a file-qualified edge collects the wrong function's
+        callers, and an all-clean wrong-caller set silently demotes a
+        suspicious outcome to clean.
+        """
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "if the caller passes invalid length",
+                 "confidence": "medium", "counter": "trusts its caller"},
+            ]),
+        ]
+        # Both edges carry a callee_file that names OTHER.c — a
+        # different function that merely shares the name "target".
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "other.c", "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee_file": "other.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert demotions == []
+
+    def test_fileless_edge_still_matches_bare_name(self):
+        """File-less edges cannot establish a contract either."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "if the caller passes invalid length",
+                 "confidence": "medium", "counter": "trusts its caller"},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert demotions == []
+
+
+# ── Feature 4: Coccinelle concurrency rules ───────────────────────
+
+class TestConcurrencyHypothesisMapping:
+
+    def test_lock_scope_routes(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_cocci_check
+        result = hypothesis_to_cocci_check("lock scope gap after spinlock release")
+        assert result is not None
+        assert "lock_scope_gap" in result
+
+    def test_deadlock_routes(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_cocci_check
+        result = hypothesis_to_cocci_check("ABBA deadlock between mutex A and B")
+        assert result is not None
+        assert "lock_order_violation" in result
+
+    def test_memory_barrier_routes(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_cocci_check
+        result = hypothesis_to_cocci_check("missing memory barrier smp_wmb")
+        assert result is not None
+        assert "missing_memory_barrier" in result
+
+    def test_atomic_race_routes(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_cocci_check
+        result = hypothesis_to_cocci_check("atomic_read race condition in refcount")
+        assert result is not None
+        assert "atomic_check_then_act" in result
+
+    def test_cwe_362_covered_when_coccinelle_ran(self):
+        from core.audit.tool_coverage import is_class_covered
+        assert is_class_covered(
+            "CWE-362", "race condition", "",
+            {"coccinelle": True},
+            ran_tools={"coccinelle"},
+        )
+
+    def test_cwe_362_not_covered_when_coccinelle_never_ran(self):
+        """Installed-but-never-dispatched is NOT coverage."""
+        from core.audit.tool_coverage import is_class_covered
+        assert not is_class_covered(
+            "CWE-362", "race condition", "",
+            {"coccinelle": True},
+        )
+
+    def test_cwe_667_covered_when_coccinelle_ran(self):
+        from core.audit.tool_coverage import is_class_covered
+        assert is_class_covered(
+            "CWE-667", "improper locking", "",
+            {"coccinelle": True},
+            ran_tools={"coccinelle"},
+        )
+
+    def test_toctou_routes_to_double_fetch_first(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_cocci_check
+        result = hypothesis_to_cocci_check(
+            "TOCTOU vulnerability via double copy_from_user"
+        )
+        assert result is not None
+        assert "double_fetch" in result
+
+    def test_generic_toctou_routes_to_new_rule(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_cocci_check
+        result = hypothesis_to_cocci_check(
+            "time-of-check time-of-use in permission check"
+        )
+        assert result is not None
+        assert "toctou" in result
+
+
+# ── Feature 5: Spec inference ─────────────────────────────────────
+
+class TestAssertionExtraction:
+
+    def test_bug_on_extracts_invariant(self):
+        from core.audit.spec_inference import infer_spec_mechanical
+        gap = {
+            "name": "remove_waiter",
+            "file": "kernel/lock.c",
+            "source": "void remove_waiter(struct waiter *w) {\n"
+                       "    BUG_ON(!list_empty(&w->list));\n"
+                       "    kfree(w);\n"
+                       "}\n",
+            "line_start": 10,
+        }
+        spec = infer_spec_mechanical(gap)
+        assert any("list_empty" in inv for inv in spec.invariants)
+        assert any(s.signal == "assertion_macro" for s in spec.sources)
+
+    def test_lockdep_extracts_precondition(self):
+        from core.audit.spec_inference import infer_spec_mechanical
+        gap = {
+            "name": "do_op",
+            "file": "core/ops.c",
+            "source": "void do_op(struct obj *o) {\n"
+                       "    lockdep_assert_held(&o->lock);\n"
+                       "    o->state++;\n"
+                       "}\n",
+            "line_start": 1,
+        }
+        spec = infer_spec_mechanical(gap)
+        assert any("lock" in p and "held" in p for p in spec.preconditions)
+
+    def test_assert_extracts_precondition(self):
+        from core.audit.spec_inference import infer_spec_mechanical
+        gap = {
+            "name": "divide",
+            "file": "math.c",
+            "source": "int divide(int a, int b) {\n"
+                       "    assert(b != 0);\n"
+                       "    return a / b;\n"
+                       "}\n",
+            "line_start": 1,
+        }
+        spec = infer_spec_mechanical(gap)
+        assert any("b != 0" in p for p in spec.preconditions)
+
+
+class TestPreconditionVerification:
+
+    def test_universally_satisfied(self):
+        from core.audit.spec_inference import (
+            InferredSpec,
+            verify_preconditions_at_call_sites,
+        )
+        spec = InferredSpec(
+            function="process",
+            file="f.c",
+            preconditions=["ptr != NULL"],
+        )
+        callers = [
+            {"file": "a.c", "name": "caller1",
+             "source": "if (ptr == NULL) return; process(ptr);"},
+            {"file": "a.c", "name": "caller2",
+             "source": "if (!ptr) return -1; process(ptr);"},
+        ]
+        results = verify_preconditions_at_call_sites(spec, callers)
+        assert len(results) == 1
+        assert results[0].is_universally_satisfied
+        assert results[0].verified_sites == 2
+
+    def test_not_universal_when_one_violates(self):
+        from core.audit.spec_inference import (
+            InferredSpec,
+            verify_preconditions_at_call_sites,
+        )
+        spec = InferredSpec(
+            function="process",
+            file="f.c",
+            preconditions=["ptr != NULL"],
+        )
+        callers = [
+            {"file": "a.c", "name": "caller1",
+             "source": "if (ptr == NULL) return; process(ptr);"},
+            {"file": "a.c", "name": "caller2",
+             "source": "process(ptr);"},
+        ]
+        results = verify_preconditions_at_call_sites(spec, callers)
+        assert len(results) == 1
+        assert not results[0].is_universally_satisfied
+
+    def test_format_verification_observation_grade(self):
+        # The scan is lexical, position-insensitive and
+        # name-collision-prone: the rendering must report the
+        # observation, never claim a violation hypothesis is refuted.
+        from core.audit.spec_inference import (
+            PreconditionVerification,
+            format_precondition_verification,
+        )
+        v = PreconditionVerification(
+            precondition="ptr != NULL",
+            total_call_sites=3,
+            verified_sites=3,
+            unknown_sites=0,
+            is_universally_satisfied=True,
+        )
+        text = format_precondition_verification([v])
+        assert "all 3 caller(s) contain a matching check" in text
+        assert "refuted" not in text
+        assert "SATISFIED" not in text  # no ALL_CAPS status values
+
+    def test_format_verification_partial_split(self):
+        from core.audit.spec_inference import (
+            PreconditionVerification,
+            format_precondition_verification,
+        )
+        v = PreconditionVerification(
+            precondition="len <= BUF_SIZE",
+            total_call_sites=5,
+            verified_sites=2,
+            unknown_sites=3,
+            is_universally_satisfied=False,
+        )
+        text = format_precondition_verification([v])
+        assert "2/5 caller(s) contain a matching check" in text
+        assert "3 with none observed" in text
+        assert "refuted" not in text
+
+    def test_same_named_collision_does_not_mint_refuted_wording(self):
+        # A caller whose ONLY matching text is an unrelated
+        # same-named check (a different `ptr`, checked nowhere near
+        # the call) still counts as an observation — the rendering
+        # must not escalate it to refute-grade steering.
+        from core.audit.spec_inference import (
+            InferredSpec,
+            format_precondition_verification,
+            verify_preconditions_at_call_sites,
+        )
+        spec = InferredSpec(
+            function="process",
+            file="f.c",
+            preconditions=["ptr != NULL"],
+        )
+        callers = [
+            {"file": "a.c", "name": "collide",
+             "source": ("void collide(void) {\n"
+                        "  char *ptr = other();\n"
+                        "  if (!ptr) return;\n"
+                        "  free(ptr);\n"
+                        "  process(global_ptr);\n"
+                        "}\n")},
+        ]
+        results = verify_preconditions_at_call_sites(spec, callers)
+        text = format_precondition_verification(results)
+        assert "refuted" not in text
+        assert "lexical observation" in text
+
+
+# ── Feature 6: Convergence loop ───────────────────────────────────
+
+class TestConvergenceDispatch:
+
+    def test_dispatch_smt_suggestion(self):
+        from core.audit.refinement import dispatch_suggestion
+
+        @dataclass
+        class MockOutcome:
+            file: str = "f.c"
+            function: str = "fn"
+            status: str = "suspicious"
+            hypothesis: str = "integer overflow in allocation"
+
+        @dataclass
+        class MockConfig:
+            target_path: Path = Path("/tmp")
+
+        results = dispatch_suggestion(
+            "run SMT check-overflow on the malloc size",
+            MockOutcome(),
+            {"file": "f.c", "function": "fn", "source": "int x = malloc(n * sizeof(int));"},
+            MockConfig(),
+        )
+        # May or may not produce results depending on tool availability;
+        # the important thing is it doesn't crash
+        assert isinstance(results, list)
+
+    def test_empty_suggestion_returns_empty(self):
+        from core.audit.refinement import dispatch_suggestion
+        results = dispatch_suggestion("", None, {}, None)
+        assert results == []
+
+
+# ── Fix 5c-1: Minimum-caller gate ───────────────────────────────
+
+class TestMinimumCallerGate:
+
+    def test_single_caller_not_enough(self):
+        """With min_callers=2 (default), a single clean caller does not demote."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "caller passes invalid length",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller1",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+    def test_min_callers_one_does_not_authorize_demotion(self):
+        """Caller counts do not prove that arguments satisfy a contract."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "caller passes invalid length",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller1",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index, min_callers=1)
+        assert demotions == []
+
+
+# ── Fix 5c-2: Callee-direction propagation ──────────────────────
+
+class TestCalleeDirectionPropagation:
+
+    def test_callee_clean_does_not_prove_return_values(self):
+        """A clean tier does not prove that a callee cannot return an error."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("lib.c", "helper", "clean", "tool_backed"),
+            _MockOutcome("main.c", "process", "suspicious", hypotheses=[
+                {"mechanism": "helper() could return negative value",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "main.c:process": [{"caller_file": "main.c", "caller": "process",
+                                "callee_file": "lib.c", "callee": "helper"}],
+            "lib.c:helper": [{"caller_file": "main.c", "caller": "process",
+                              "callee_file": "lib.c", "callee": "helper"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert demotions == []
+
+    def test_callee_not_clean_keeps(self):
+        """When a hypothesis names a callee that is suspicious, no demotion."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("lib.c", "helper", "suspicious"),
+            _MockOutcome("main.c", "process", "suspicious", hypotheses=[
+                {"mechanism": "helper() could return negative value",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "main.c:process": [{"caller_file": "main.c", "caller": "process",
+                                "callee_file": "lib.c", "callee": "helper"}],
+            "lib.c:helper": [{"caller_file": "main.c", "caller": "process",
+                              "callee_file": "lib.c", "callee": "helper"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+
+# ── Fix 5c-3: Finding immune to propagation ─────────────────────
+
+class TestFindingImmunity:
+
+    def test_finding_not_demoted_by_propagation(self):
+        """Propagation only targets suspicious outcomes, never findings."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "finding", hypotheses=[
+                {"mechanism": "caller passes invalid length",
+                 "confidence": "medium", "counter": ""},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "b.c", "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee_file": "b.c", "callee": "target"}],
+            "b.c:target": [{"caller_file": "a.c", "caller": "caller1",
+                            "callee_file": "b.c", "callee": "target"},
+                           {"caller_file": "a.c", "caller": "caller2",
+                            "callee_file": "b.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 0
+
+
+# ── Fix 5c-4: CONFIRMED tier ────────────────────────────────────
+
+class TestConfirmedTier:
+
+    def test_dark_verify_confirmed(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="overflow", evidence_tool="dark_verify:sanitizer-violation",
+            tools_dispatched={"smt"},
+        )
+        assert o.compute_tier() == "confirmed"
+
+    def test_dynamic_crash(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="crash", evidence_tool="dynamic:crash",
+        )
+        assert o.compute_tier() == "confirmed"
+
+    def test_frida_runtime(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="runtime", evidence_tool="frida:runtime",
+        )
+        assert o.compute_tier() == "confirmed"
+
+    def test_smt_still_tool_backed(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="overflow", evidence_tool="smt:check-overflow",
+            tools_dispatched={"smt"},
+        )
+        assert o.compute_tier() == "tool_backed"
+
+    def test_guard_model_witness_is_diagnostic(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="overflow", evidence_tool="insufficient_guard_smt:witness",
+            tools_dispatched={"smt"},
+        )
+        assert o.compute_tier() == "llm_only"
+
+    def test_guard_model_witness_does_not_upgrade_independent_evidence(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="overflow",
+            evidence_tool="semgrep:rule1+signed_mismatch_smt:witness",
+            tools_dispatched={"smt", "semgrep"},
+        )
+        assert o.compute_tier() == "tool_backed"
+
+    def test_smt_no_witness_not_confirmed(self):
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="dead path", evidence_tool="dead_path_smt",
+            tools_dispatched={"dead_path_smt"},
+        )
+        assert o.compute_tier() == "llm_only"
+
+    def test_llm_claimed_witness_never_confirmed(self):
+        # The is_tool_evidence firewall must run BEFORE the :witness
+        # suffix check: a sanitized model claim ending in ":witness"
+        # used to export verification_tier=confirmed from pure model
+        # text (hostile-repo steerable).
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="overflow",
+            evidence_tool="llm-claimed:smt:check-overflow:witness",
+            tools_dispatched={"smt"},
+        )
+        assert o.compute_tier() == "llm_only"
+
+    def test_llm_claimed_runtime_stamp_never_confirmed(self):
+        # Same firewall ordering for the _CONFIRMED_EVIDENCE stamps: a
+        # model claiming "foo+dynamic:crash" gets one llm-claimed
+        # prefix on the full string, and the trailing part must not
+        # satisfy the confirmed-evidence membership check.
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="crash", evidence_tool="llm-claimed:foo+dynamic:crash",
+            tools_dispatched={"dynamic"},
+        )
+        assert o.compute_tier() == "llm_only"
+
+    def test_real_witness_still_confirmed_after_firewall(self):
+        # Two-direction pin for the firewall reorder: genuine solver
+        # witness stamps keep the confirmed tier.
+        from core.audit.orchestrator import ReviewOutcome
+        for stamp in (
+            "smt:check-overflow:witness",
+            "clean-refuted:smt:check-overflow:witness",
+        ):
+            o = ReviewOutcome(
+                file="f.c", function="fn", status="finding",
+                body="overflow", evidence_tool=stamp,
+                tools_dispatched={"smt"},
+            )
+            assert o.compute_tier() == "confirmed", stamp
+
+    def test_detection_role_stamp_does_not_grade_tool_backed(self):
+        # Incident regression (openssh instrumented corpus): 136/137
+        # tool_backed findings were disproven; the dominant stamps
+        # were detection-role smt:check-* variants that graded
+        # tool_backed purely because "smt" was in tools_dispatched.
+        # A stamp the evidence firewall rejects must not export
+        # tool_backed through the dispatched-name path.
+        from core.audit.orchestrator import ReviewOutcome
+        o = ReviewOutcome(
+            file="f.c", function="fn", status="finding",
+            body="toctou", evidence_tool="smt:check-toctou",
+            tools_dispatched={"smt"},
+        )
+        assert o.compute_tier() == "llm_only"
+
+
+# ── Fix 5c-5: Contract-delegation co-occurrence ─────────────────
+
+class TestContractDelegationCooccurrence:
+
+    def test_caller_specific_phrase_blocks(self):
+        from core.audit.llm_review import _counter_hypothesis_is_compelling
+        counter = (
+            "This is a buffer overflow but the caller's responsibility "
+            "is to validate the length before calling this function."
+        )
+        assert not _counter_hypothesis_is_compelling(counter)
+
+    def test_subject_agnostic_without_caller_ref_is_compelling(self):
+        """'fails to validate' without caller reference should NOT suppress."""
+        from core.audit.llm_review import _counter_hypothesis_is_compelling
+        counter = (
+            "The function fails to validate the buffer length, leading "
+            "to a heap overflow when processing untrusted input data."
+        )
+        assert _counter_hypothesis_is_compelling(counter)
+
+    def test_subject_agnostic_with_caller_ref_blocks(self):
+        """'fails to validate' with 'caller' should suppress (delegation)."""
+        from core.audit.llm_review import _counter_hypothesis_is_compelling
+        counter = (
+            "If the caller fails to validate the buffer length, this "
+            "could lead to an overflow, but that is the caller's bug."
+        )
+        assert not _counter_hypothesis_is_compelling(counter)
+
+
+# ── Fix 5c-6: IRIS sink wrapper rejection ────────────────────────
+
+class TestIrisSinkWrapperRejection:
+
+    def test_wrapper_to_iris_sink_not_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+def send_query(q):
+    return execute_sql(q)
+"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="db.py",
+            function_name="send_query",
+            source=source,
+            line_start=1,
+            project_sinks=frozenset({"execute_sql"}),
+        )
+        assert not result.skip_llm
+
+    def test_wrapper_to_non_sink_still_skipped(self):
+        from core.audit.prefilter import run_prefilter
+        source = """\
+def get_name(obj):
+    return fetch_name(obj)
+"""
+        result = run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="util.py",
+            function_name="get_name",
+            source=source,
+            line_start=1,
+            project_sinks=frozenset({"execute_sql"}),
+        )
+        assert result.skip_llm
+
+
+# ── Learning loop ────────────────────────────────────────────────
+
+class TestLearningLoop:
+
+    def test_extract_fp_patterns_caller_contract(self):
+        from core.audit.learning import extract_fp_patterns
+        results = [
+            {"correct": False, "expected": "clean", "actual": "suspicious",
+             "hypothesis": "caller passes null", "hypotheses": [
+                 {"mechanism": "caller passes invalid length", "counter": ""}]},
+            {"correct": False, "expected": "clean", "actual": "suspicious",
+             "hypothesis": "upstream caller provides bad data", "hypotheses": []},
+            {"correct": False, "expected": "clean", "actual": "suspicious",
+             "hypothesis": "the caller could invoke with null", "hypotheses": []},
+            {"correct": True, "expected": "clean", "actual": "clean",
+             "hypothesis": "", "hypotheses": []},
+        ]
+        patterns = extract_fp_patterns(results, min_count=2)
+        assert len(patterns) >= 1
+        assert patterns[0]["category"] == "caller_contract"
+        assert patterns[0]["count"] >= 2
+
+    def test_no_patterns_when_all_correct(self):
+        from core.audit.learning import extract_fp_patterns
+        results = [
+            {"correct": True, "expected": "clean", "actual": "clean",
+             "hypothesis": "", "hypotheses": []},
+        ]
+        assert extract_fp_patterns(results) == []
+
+    def test_save_and_load_corrections(self, tmp_path):
+        from core.audit.learning import load_corrections, save_corrections
+        patterns = [
+            {"category": "caller_contract", "count": 5,
+             "correction": "Do not flag caller contract issues.",
+             "examples": ["a.c:func1", "b.c:func2"]},
+        ]
+        save_corrections(patterns, tmp_path, store_to_sage=False)
+        corrections = load_corrections(tmp_path)
+        assert len(corrections) == 1
+        assert "caller contract" in corrections[0]
+
+    def test_corpus_fallback_anchored_to_raptor_dir(self, tmp_path, monkeypatch):
+        """The out/audit-corpus-* fallback must not depend on process CWD."""
+        import json as _json
+
+        from core.audit.learning import load_corrections
+
+        repo_root = tmp_path / "repo"
+        corpus = repo_root / "out" / "audit-corpus-20260101"
+        corpus.mkdir(parents=True)
+        (corpus / "prompt-corrections.json").write_text(_json.dumps({
+            "corrections": [{"rule": "Check bounds before memcpy."}],
+        }))
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        monkeypatch.setenv("RAPTOR_DIR", str(repo_root))
+
+        corrections = load_corrections()
+        assert corrections == ["Check bounds before memcpy."]
+
+    def test_format_corrections_for_prompt(self):
+        from core.audit.learning import format_corrections_for_prompt
+        corrections = [
+            "Do not flag caller contract issues.",
+            "Check lock scope before hypothesising races.",
+        ]
+        text = format_corrections_for_prompt(corrections)
+        assert "LEARNED CORRECTIONS" in text
+        assert "1." in text
+        assert "2." in text
+
+    def test_empty_corrections_no_output(self):
+        from core.audit.learning import format_corrections_for_prompt
+        assert format_corrections_for_prompt([]) == ""
+
+
+# ── Ensemble merge ──────────────────────────────────────────────
+
+    # ── SMT clean-refuted precision ─────────────────────────────────
+
+class TestSmtCleanRefutedPrecision:
+
+    def test_bare_overflow_no_longer_maps_to_verb(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("stack overflow in recursion") is None
+        assert hypothesis_to_smt_verb("the buffer could overflow") is None
+
+    def test_integer_overflow_still_maps(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("integer overflow in count * size") == "check-overflow"
+        assert hypothesis_to_smt_verb("arithmetic overflow wraps uint32") == "check-overflow"
+
+    def test_buffer_overflow_maps_to_oob(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("buffer overflow via memcpy") == "check-oob"
+
+    def test_source_has_arithmetic_positive(self):
+        from core.audit.orchestrator import _source_has_arithmetic
+        assert _source_has_arithmetic("size = count * elem_size;")
+        assert _source_has_arithmetic("offset = base + len;")
+        assert _source_has_arithmetic("result = a - b;")
+
+    def test_source_has_arithmetic_negative(self):
+        from core.audit.orchestrator import _source_has_arithmetic
+        assert not _source_has_arithmetic("return get_value(ctx);")
+        assert not _source_has_arithmetic("if (ptr == NULL) return;")
+
+    def test_arithmetic_in_comments_ignored(self):
+        from core.audit.orchestrator import _source_has_arithmetic
+        assert not _source_has_arithmetic('// size = count * elem_size\nreturn 0;')
+        assert not _source_has_arithmetic('/* a + b */\nreturn ptr;')
+
+
+# ── Language gate (Intervention A) ─────────────────────────────
+
+class TestLanguageGate:
+
+    def test_overflow_safe_languages_gated(self):
+        from core.audit.sweep import _lang_has_overflow_safety
+        assert _lang_has_overflow_safety("pkg/oci/spec_opts.go")
+        assert _lang_has_overflow_safety("flask_appbuilder/manager.py")
+        assert _lang_has_overflow_safety("src/main.rs")
+        assert _lang_has_overflow_safety("com/example/App.java")
+
+    def test_c_not_gated(self):
+        from core.audit.sweep import _lang_has_overflow_safety
+        assert not _lang_has_overflow_safety("fs/proc/base.c")
+        assert not _lang_has_overflow_safety("net/ipv4/esp4.c")
+        assert not _lang_has_overflow_safety("include/net/esp.h")
+
+
+# ── Self-contradiction demotion (Intervention C) ────────────────
+
+class TestSelfContradictionDemotion:
+
+    def _make_outcome(self, status, hypotheses, evidence=""):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file="test.c", function="func",
+            status=status, body="test body",
+            hypotheses=hypotheses, evidence_tool=evidence,
+        )
+
+    def test_all_refuted_suspicious_requires_explicit_withdrawal(self):
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted",
+             "counter": "the length is clamped to sizeof(buf) on the "
+                        "line above the copy",
+             "counter_scope": "local"},
+            {"mechanism": "oob", "confidence": "refuted",
+             "counter": "the index is bounds-checked against len "
+                        "inside this function",
+             "counter_scope": "local"},
+        ])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0] is outcome
+        assert outcome.status == "suspicious"
+        assert result.suspicious == 1
+        assert result.clean == 0
+        assert outcome.review_result["all_refuted_demotion_withheld"] == "explicit-withdrawal-required"
+
+    def test_ungrounded_all_refuted_not_demoted(self):
+        # Refutations with no counter (or a non-local / delegated one)
+        # are unverified claims — the post-loop net must not erase the
+        # suspicion the in-review gate deliberately kept alive.
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted"},
+            {"mechanism": "oob", "confidence": "refuted"},
+        ])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+        assert result.suspicious == 1
+
+    def test_cross_function_counter_not_demoted(self):
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted",
+             "counter": "every caller clamps the length first",
+             "counter_scope": "cross_function"},
+        ])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_withheld_marker_not_demoted(self):
+        # The review path already adjudicated withholding — the net
+        # respects its decision even when the hypotheses look grounded.
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            ReviewOutcome,
+            _demote_self_contradictions,
+        )
+        outcome = ReviewOutcome(
+            file="test.c", function="func",
+            status="suspicious", body="test body",
+            hypotheses=[
+                {"mechanism": "overflow", "confidence": "refuted",
+                 "counter": "the length is clamped on the line above",
+                 "counter_scope": "local"},
+            ],
+            evidence_tool="",
+            review_result={
+                "all_refuted_demotion_withheld": "counter-escalation-floor",
+            },
+        )
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_counter_escalated_not_demoted(self):
+        # Machine-raised suspicious: only a verification-grade receipt
+        # un-raises it, never the model's own refutation record. The
+        # body prefix is the provenance surviving journal rebuilds.
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            ReviewOutcome,
+            _demote_self_contradictions,
+        )
+        outcome = ReviewOutcome(
+            file="test.c", function="func",
+            status="suspicious",
+            body=(
+                "[counter-hypothesis escalation: the review rationale "
+                "below concludes clean, but a compelling "
+                "counter-hypothesis kept this verdict suspicious — "
+                "overflow via tainted n]\n\nlooks clean"
+            ),
+            hypotheses=[
+                {"mechanism": "overflow", "confidence": "refuted",
+                 "counter": "the length is clamped on the line above",
+                 "counter_scope": "local"},
+            ],
+            evidence_tool="",
+        )
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_mixed_confidence_not_demoted(self):
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted"},
+            {"mechanism": "oob", "confidence": "medium"},
+        ])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_evidence_backed_not_demoted(self):
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted"},
+        ], evidence="smt:check-overflow")
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_no_hypotheses_not_demoted(self):
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+
+# ── Format-string Go gate (Intervention D) ──────────────────────
+
+class TestFormatStringGoGate:
+
+    def test_format_string_skipped_for_go(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_semgrep_rule
+        result = hypothesis_to_semgrep_rule(
+            "format string injection via user input", "pkg/fmt/format.go",
+        )
+        assert result is None
+
+    def test_format_string_kept_for_c(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_semgrep_rule
+        result = hypothesis_to_semgrep_rule(
+            "format string injection via user input", "src/logger.c",
+        )
+        assert result is not None
+        Path(result).unlink()
+
+
+# ── Auth bypass SMT check (check-auth-bypass) ──────────────────
+
+class TestAuthBypass:
+
+    def test_early_return_before_auth_check(self):
+        # ptrace_has_cap is pack-tier vocabulary (kernel targets get it
+        # via the linux_kernel vocab pack; seeds alone no longer carry it).
+        from core.audit.condition_smt import check_auth_bypass
+        from core.audit.vocab_packs import load_pack
+        source = (
+            "int func(struct task *task) {\n"
+            "    if (same_thread_group(task, current))\n"
+            "        return 0;\n"
+            "    if (!ptrace_has_cap(cred, tcred, mode))\n"
+            "        return -EPERM;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_auth_bypass(source, load_pack("linux_kernel"))
+        assert result.bypass_found
+        assert "ptrace_has_cap" in str(result.bypassed_checks)
+
+    def test_no_bypass_when_auth_before_return(self):
+        from core.audit.condition_smt import check_auth_bypass
+        source = (
+            "int func(struct task *task) {\n"
+            "    if (!capable(CAP_SYS_ADMIN))\n"
+            "        return -EPERM;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_auth_bypass(source)
+        assert not result.bypass_found
+
+    def test_no_auth_checks_returns_clean(self):
+        from core.audit.condition_smt import check_auth_bypass
+        source = (
+            "int func(int x) {\n"
+            "    if (x > 0)\n"
+            "        return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        result = check_auth_bypass(source)
+        assert not result.bypass_found
+        assert "no auth checks" in result.reasoning
+
+    def test_guard_is_auth_check_not_flagged(self):
+        from core.audit.condition_smt import check_auth_bypass
+        source = (
+            "int func(void) {\n"
+            "    if (capable(CAP_SYS_ADMIN))\n"
+            "        return 0;\n"
+            "    if (!ns_capable(ns, CAP_NET_RAW))\n"
+            "        return -EPERM;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_auth_bypass(source)
+        assert not result.bypass_found
+
+    def test_hypothesis_maps_to_auth_bypass_verb(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("permission bypass via early return") == "check-auth-bypass"
+        assert hypothesis_to_smt_verb("capability bypass in ptrace") == "check-auth-bypass"
+        assert hypothesis_to_smt_verb("privilege escalation via uid check") == "check-auth-bypass"
+
+    def test_result_to_dict(self):
+        from core.audit.condition_smt import AuthBypassResult
+        r = AuthBypassResult(
+            bypass_found=True,
+            early_return_line=3,
+            guard_text="(same_thread_group(task, current))",
+            bypassed_checks=["capability:ptrace_has_cap"],
+            reasoning="early return bypasses auth",
+        )
+        d = r.to_dict()
+        assert d["bypass_found"] is True
+        assert d["early_return_line"] == 3
+        assert "ptrace_has_cap" in d["bypassed_checks"][0]
+
+    def test_cascading_permission_not_flagged(self):
+        from core.audit.condition_smt import check_auth_bypass
+        source = (
+            "static bool has_pid_permissions(struct proc_fs_info *fs_info,\n"
+            "    struct task_struct *task, enum proc_hidepid hide_pid_min)\n"
+            "{\n"
+            "    if (fs_info->hide_pid == HIDEPID_NOT_PTRACEABLE)\n"
+            "        return ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);\n"
+            "    if (fs_info->hide_pid < hide_pid_min)\n"
+            "        return true;\n"
+            "    if (in_group_p(fs_info->pid_gid))\n"
+            "        return true;\n"
+            "    return ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);\n"
+            "}\n"
+        )
+        result = check_auth_bypass(source)
+        assert not result.bypass_found
+
+
+class TestLockDiscipline:
+    """Tests for the lock discipline SMT check."""
+
+    def test_return_between_lock_unlock(self):
+        from core.audit.condition_smt import check_lock_discipline
+        source = (
+            "int foo(struct bar *b) {\n"
+            "    spin_lock(&b->lock);\n"
+            "    if (b->err)\n"
+            "        return -EINVAL;\n"
+            "    b->count++;\n"
+            "    spin_unlock(&b->lock);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_lock_discipline(source)
+        assert result.violation_found
+        assert "spin_lock" in result.lock_type
+        assert result.return_line > 0
+
+    def test_balanced_lock_unlock(self):
+        from core.audit.condition_smt import check_lock_discipline
+        source = (
+            "int foo(struct bar *b) {\n"
+            "    spin_lock(&b->lock);\n"
+            "    b->count++;\n"
+            "    spin_unlock(&b->lock);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_lock_discipline(source)
+        assert not result.violation_found
+
+    def test_no_lock_acquires(self):
+        from core.audit.condition_smt import check_lock_discipline
+        source = "int foo(void) { return 0; }\n"
+        result = check_lock_discipline(source)
+        assert not result.violation_found
+        assert "no lock acquires" in result.reasoning
+
+    def test_missing_unlock_entirely(self):
+        from core.audit.condition_smt import check_lock_discipline
+        source = (
+            "void foo(struct bar *b) {\n"
+            "    mutex_lock(&b->mtx);\n"
+            "    b->val = 42;\n"
+            "}\n"
+        )
+        result = check_lock_discipline(source)
+        assert result.violation_found
+        assert "no matching" in result.reasoning
+
+    def test_goto_error_path_with_unlock(self):
+        from core.audit.condition_smt import check_lock_discipline
+        source = (
+            "int foo(struct bar *b) {\n"
+            "    spin_lock(&b->lock);\n"
+            "    if (b->err)\n"
+            "        goto out;\n"
+            "    b->count++;\n"
+            "out:\n"
+            "    spin_unlock(&b->lock);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_lock_discipline(source)
+        assert not result.violation_found
+
+    def test_mutex_lock_interruptible(self):
+        from core.audit.condition_smt import check_lock_discipline
+        source = (
+            "int foo(struct bar *b) {\n"
+            "    mutex_lock_interruptible(&b->mtx);\n"
+            "    if (b->err)\n"
+            "        return -EINTR;\n"
+            "    mutex_unlock(&b->mtx);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_lock_discipline(source)
+        assert result.violation_found
+
+    def test_result_to_dict(self):
+        from core.audit.condition_smt import LockDisciplineResult
+        r = LockDisciplineResult(
+            violation_found=True,
+            lock_type="spin_lock",
+            acquire_line=5,
+            return_line=8,
+            reasoning="lock held on return",
+        )
+        d = r.to_dict()
+        assert d["violation_found"] is True
+        assert d["lock_type"] == "spin_lock"
+        assert d["acquire_line"] == 5
+        assert d["return_line"] == 8
+
+    def test_hypothesis_maps_to_lock_discipline_verb(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("lock imbalance in error path") == "check-lock-discipline"
+        assert hypothesis_to_smt_verb("missing unlock before return") == "check-lock-discipline"
+        assert hypothesis_to_smt_verb("spinlock held on error return") == "check-lock-discipline"
+        assert hypothesis_to_smt_verb("deadlock from recursive locking") == "check-lock-discipline"
+
+
+class TestResourceLeak:
+    """Tests for the error-path resource leak SMT check."""
+
+    def test_leak_on_error_return(self):
+        from core.audit.condition_smt import check_resource_leak
+        source = (
+            "int foo(struct device *dev) {\n"
+            "    char *buf = kmalloc(256, GFP_KERNEL);\n"
+            "    int ret = do_thing(buf);\n"
+            "    if (ret < 0)\n"
+            "        return ret;\n"
+            "    kfree(buf);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_resource_leak(source)
+        assert result.leak_found
+        assert result.alloc_var == "buf"
+        assert result.alloc_func == "kmalloc"
+
+    def test_no_leak_when_freed(self):
+        from core.audit.condition_smt import check_resource_leak
+        source = (
+            "int foo(struct device *dev) {\n"
+            "    char *buf = kmalloc(256, GFP_KERNEL);\n"
+            "    int ret = do_thing(buf);\n"
+            "    if (ret < 0) {\n"
+            "        kfree(buf);\n"
+            "        return ret;\n"
+            "    }\n"
+            "    kfree(buf);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_resource_leak(source)
+        assert not result.leak_found
+
+    def test_no_allocs(self):
+        from core.audit.condition_smt import check_resource_leak
+        source = "int foo(void) { return 0; }\n"
+        result = check_resource_leak(source)
+        assert not result.leak_found
+        assert "no allocations" in result.reasoning
+
+    def test_null_check_not_a_leak(self):
+        from core.audit.condition_smt import check_resource_leak
+        source = (
+            "int foo(void) {\n"
+            "    char *p = kzalloc(64, GFP_KERNEL);\n"
+            "    if (!p)\n"
+            "        return -ENOMEM;\n"
+            "    kfree(p);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_resource_leak(source)
+        assert not result.leak_found
+
+    def test_goto_cleanup_not_a_leak(self):
+        from core.audit.condition_smt import check_resource_leak
+        source = (
+            "int foo(void) {\n"
+            "    char *buf = kmalloc(128, GFP_KERNEL);\n"
+            "    if (do_thing())\n"
+            "        goto err;\n"
+            "    kfree(buf);\n"
+            "    return 0;\n"
+            "err:\n"
+            "    kfree(buf);\n"
+            "    return -EIO;\n"
+            "}\n"
+        )
+        result = check_resource_leak(source)
+        assert not result.leak_found
+
+    def test_result_to_dict(self):
+        from core.audit.condition_smt import ResourceLeakResult
+        r = ResourceLeakResult(
+            leak_found=True,
+            alloc_var="buf",
+            alloc_func="kmalloc",
+            alloc_line=3,
+            return_line=7,
+            reasoning="leak on error path",
+        )
+        d = r.to_dict()
+        assert d["leak_found"] is True
+        assert d["alloc_var"] == "buf"
+        assert d["alloc_func"] == "kmalloc"
+
+    def test_hypothesis_maps_to_resource_leak_verb(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("resource leak in error path") == "check-resource-leak"
+        assert hypothesis_to_smt_verb("memory leak when init fails") == "check-resource-leak"
+        assert hypothesis_to_smt_verb("allocated but not freed on error") == "check-resource-leak"
+
+
+class TestNullPropagation:
+    """Tests for the null propagation detection check."""
+
+    def test_deref_without_null_check(self):
+        from core.audit.condition_smt import check_null_propagation
+        source = (
+            "int foo(struct device *dev) {\n"
+            "    char *buf = kmalloc(256, GFP_KERNEL);\n"
+            "    buf->field = 42;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_null_propagation(source)
+        assert result.null_deref_found
+        assert result.var_name == "buf"
+        assert result.source_func == "kmalloc"
+
+    def test_null_check_before_deref(self):
+        from core.audit.condition_smt import check_null_propagation
+        source = (
+            "int foo(struct device *dev) {\n"
+            "    char *buf = kmalloc(256, GFP_KERNEL);\n"
+            "    if (!buf)\n"
+            "        return -ENOMEM;\n"
+            "    buf->field = 42;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_null_propagation(source)
+        assert not result.null_deref_found
+
+    def test_is_err_check(self):
+        from core.audit.condition_smt import check_null_propagation
+        source = (
+            "int foo(void) {\n"
+            "    struct clk *clk = devm_kzalloc(dev, sizeof(*clk), GFP_KERNEL);\n"
+            "    if (IS_ERR(clk))\n"
+            "        return PTR_ERR(clk);\n"
+            "    clk->rate = 1000;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_null_propagation(source)
+        assert not result.null_deref_found
+
+    def test_no_nullable_assigns(self):
+        from core.audit.condition_smt import check_null_propagation
+        source = "int foo(void) { return 0; }\n"
+        result = check_null_propagation(source)
+        assert not result.null_deref_found
+        assert "no nullable" in result.reasoning
+
+    def test_no_deref(self):
+        from core.audit.condition_smt import check_null_propagation
+        source = (
+            "int foo(void) {\n"
+            "    char *buf = kzalloc(64, GFP_KERNEL);\n"
+            "    kfree(buf);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        result = check_null_propagation(source)
+        assert not result.null_deref_found
+
+    def test_result_to_dict(self):
+        from core.audit.condition_smt import NullPropagationResult
+        r = NullPropagationResult(
+            null_deref_found=True,
+            var_name="ptr",
+            source_func="kmalloc",
+            assign_line=3,
+            deref_line=5,
+            reasoning="deref without check",
+        )
+        d = r.to_dict()
+        assert d["null_deref_found"] is True
+        assert d["var_name"] == "ptr"
+        assert d["deref_line"] == 5
+
+    def test_hypothesis_maps_to_null_propagation_verb(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("null pointer dereference") == "check-null-propagation"
+        assert hypothesis_to_smt_verb("missing null check after alloc") == "check-null-propagation"
+        assert hypothesis_to_smt_verb("unchecked null from kmalloc") == "check-null-propagation"
+
+
+class TestIntegerNarrowing:
+    """Tests for the integer narrowing detection check."""
+
+    def test_size_t_to_int_narrowing(self):
+        from core.audit.condition_smt import check_integer_narrowing
+        source = (
+            "void foo(size_t len) {\n"
+            "    int local_len = len;\n"
+            "    do_thing(local_len);\n"
+            "}\n"
+        )
+        result = check_integer_narrowing(source)
+        assert result.narrowing_found
+        assert result.source_type == "size_t"
+        assert result.dest_type == "int"
+        assert result.source_width == 64
+        assert result.dest_width == 32
+
+    def test_same_width_no_narrowing(self):
+        from core.audit.condition_smt import check_integer_narrowing
+        source = (
+            "void foo(unsigned int len) {\n"
+            "    int local_len = len;\n"
+            "    do_thing(local_len);\n"
+            "}\n"
+        )
+        result = check_integer_narrowing(source)
+        assert not result.narrowing_found
+
+    def test_bounds_check_prevents_flag(self):
+        from core.audit.condition_smt import check_integer_narrowing
+        source = (
+            "void foo(size_t len) {\n"
+            "    if (len > INT_MAX)\n"
+            "        return;\n"
+            "    int local_len = len;\n"
+            "    do_thing(local_len);\n"
+            "}\n"
+        )
+        result = check_integer_narrowing(source)
+        assert not result.narrowing_found
+
+    def test_no_narrowing_assignments(self):
+        from core.audit.condition_smt import check_integer_narrowing
+        source = "int foo(void) { return 0; }\n"
+        result = check_integer_narrowing(source)
+        assert not result.narrowing_found
+
+    def test_result_to_dict(self):
+        from core.audit.condition_smt import IntegerNarrowingResult
+        r = IntegerNarrowingResult(
+            narrowing_found=True,
+            source_type="size_t",
+            dest_type="u16",
+            source_width=64,
+            dest_width=16,
+            assign_line=5,
+            reasoning="narrowing without check",
+        )
+        d = r.to_dict()
+        assert d["narrowing_found"] is True
+        assert d["source_type"] == "size_t"
+        assert d["dest_width"] == 16
+
+    def test_hypothesis_maps_to_integer_narrowing_verb(self):
+        from core.audit.hypothesis_mapping import hypothesis_to_smt_verb
+        assert hypothesis_to_smt_verb("integer narrowing in copy path") == "check-integer-narrowing"
+        assert hypothesis_to_smt_verb("truncation of user-supplied length") == "check-integer-narrowing"
+        assert hypothesis_to_smt_verb("size_t to int conversion") == "check-integer-narrowing"
+
+
+# ── Deepen parallelisation ──────────────────────────────────────────
+
+class TestDeepenParallel:
+
+    @staticmethod
+    def _make_outcome(file, func, status, body="body", hypothesis="hyp"):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file=file,
+            function=func,
+            status=status,
+            body=body,
+            hypothesis=hypothesis,
+            review_result={"body": body},
+        )
+
+    @staticmethod
+    def _make_checklist(*entries):
+        from collections import defaultdict
+        by_file = defaultdict(list)
+        for file, func in entries:
+            by_file[file].append({
+                "name": func,
+                "line_start": 1,
+                "line_end": 100,
+            })
+        files = [
+            {"path": f, "functions": funcs}
+            for f, funcs in by_file.items()
+        ]
+        return {"files": files}
+
+    def test_serial_and_parallel_produce_same_results(self, monkeypatch, tmp_path):
+        import copy
+        import time
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _deepen_suspicious,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "foo", "suspicious"),
+            self._make_outcome("b.c", "bar", "suspicious"),
+            self._make_outcome("c.c", "baz", "suspicious"),
+        ]
+        checklist = self._make_checklist(
+            ("a.c", "foo"), ("b.c", "bar"), ("c.c", "baz"),
+        )
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+            deepen_suspicious=True,
+            enable_session_context=False,
+            blind_first_pass=False,
+        )
+
+        def _fake_build_context(cfg, gap, *a, **kw):
+            return {"file": gap["file"], "function": gap["name"]}
+
+        monkeypatch.setattr(_orch, "_build_context", _fake_build_context)
+
+        call_count = 0
+        def mock_review(ctx, cfg):
+            nonlocal call_count
+            call_count += 1
+            return self._make_outcome(
+                ctx["file"], ctx["function"], "finding", body="found it",
+            )
+
+        result_serial = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes),
+            suspicious=3,
+        )
+        _deepen_suspicious(
+            result_serial, config, mock_review, checklist,
+            None, None, [], None, set(), time.time(), None,
+            max_workers=1,
+        )
+
+        serial_count = call_count
+        call_count = 0
+
+        result_parallel = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes),
+            suspicious=3,
+        )
+        _deepen_suspicious(
+            result_parallel, config, mock_review, checklist,
+            None, None, [], None, set(), time.time(), None,
+            max_workers=4,
+        )
+
+        assert serial_count == call_count == 3
+        assert result_serial.findings == result_parallel.findings
+
+    def test_parallel_deepen_no_targets(self, tmp_path):
+        import time
+
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _deepen_suspicious,
+        )
+
+        result = OrchestratorResult(
+            outcomes=[self._make_outcome("a.c", "foo", "clean")],
+            clean=1,
+        )
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            deepen_suspicious=True,
+        )
+        out = _deepen_suspicious(
+            result, config, lambda c, cfg: None,
+            {"files": []}, None, None, [], None, set(),
+            time.time(), None, max_workers=4,
+        )
+        assert out.clean == 1
+
+    def test_parallel_deepen_handles_review_failure(self, monkeypatch, tmp_path):
+        import time
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _deepen_suspicious,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "foo", "suspicious"),
+            self._make_outcome("b.c", "bar", "suspicious"),
+        ]
+        checklist = self._make_checklist(("a.c", "foo"), ("b.c", "bar"))
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+            deepen_suspicious=True,
+            enable_session_context=False,
+            blind_first_pass=False,
+        )
+
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {"file": gap["file"], "function": gap["name"]},
+        )
+
+        def mock_review(ctx, cfg):
+            if ctx["function"] == "foo":
+                raise RuntimeError("LLM failed")
+            from core.audit.orchestrator import ReviewOutcome
+            return ReviewOutcome(
+                file="b.c", function="bar", status="finding",
+                body="ok", hypothesis="null pointer dereference in bar",
+                evidence_tool="semgrep:cwe-476",
+                review_result={"body": "ok"},
+            )
+
+        result = OrchestratorResult(outcomes=list(outcomes), suspicious=2)
+        out = _deepen_suspicious(
+            result, config, mock_review, checklist,
+            None, None, [], None, set(), time.time(), None,
+            max_workers=4,
+        )
+        assert out.findings == 1
+
+
+class TestDisagreementParallel:
+
+    @staticmethod
+    def _make_outcome(file, func, status, body="body"):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file=file, function=func, status=status, body=body,
+            review_result={"body": body},
+        )
+
+    def test_serial_and_parallel_same_results(self, monkeypatch, tmp_path):
+        import copy
+        import time
+        from types import SimpleNamespace
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _re_review_disagreements,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "foo", "clean"),
+            self._make_outcome("b.c", "bar", "clean"),
+        ]
+        checklist = {
+            "files": [
+                {"file": "a.c", "items": [{"name": "foo", "line_start": 1, "line_end": 50}]},
+                {"file": "b.c", "items": [{"name": "bar", "line_start": 1, "line_end": 50}]},
+            ],
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {"file": gap["file"], "function": gap["name"]},
+        )
+
+        disagreements = [
+            SimpleNamespace(
+                file="a.c", function="foo",
+                resolution="mechanical wins",
+                mechanical_claim=SimpleNamespace(reachable=True, has_flow=True),
+            ),
+            SimpleNamespace(
+                file="b.c", function="bar",
+                resolution="mechanical wins",
+                mechanical_claim=SimpleNamespace(reachable=True, has_flow=False),
+            ),
+        ]
+
+        call_count = 0
+        def mock_review(ctx, cfg):
+            nonlocal call_count
+            call_count += 1
+            return self._make_outcome(ctx["file"], ctx["function"], "suspicious")
+
+        result_serial = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2,
+        )
+        _re_review_disagreements(
+            disagreements, result_serial, config, mock_review,
+            checklist, None, None, time.time(), None,
+            max_workers=1,
+        )
+        serial_count = call_count
+
+        call_count = 0
+        result_parallel = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2,
+        )
+        _re_review_disagreements(
+            disagreements, result_parallel, config, mock_review,
+            checklist, None, None, time.time(), None,
+            max_workers=4,
+        )
+
+        assert serial_count == call_count == 2
+        assert result_serial.suspicious == result_parallel.suspicious == 2
+
+    def test_handles_review_failure(self, monkeypatch, tmp_path):
+        import time
+        from types import SimpleNamespace
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _re_review_disagreements,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "foo", "clean"),
+            self._make_outcome("b.c", "bar", "clean"),
+        ]
+        checklist = {
+            "files": [
+                {"file": "a.c", "items": [{"name": "foo"}]},
+                {"file": "b.c", "items": [{"name": "bar"}]},
+            ],
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {"file": gap["file"], "function": gap["name"]},
+        )
+        disagreements = [
+            SimpleNamespace(
+                file="a.c", function="foo",
+                resolution="wins",
+                mechanical_claim=SimpleNamespace(reachable=True, has_flow=True),
+            ),
+            SimpleNamespace(
+                file="b.c", function="bar",
+                resolution="wins",
+                mechanical_claim=SimpleNamespace(reachable=True, has_flow=True),
+            ),
+        ]
+
+        def mock_review(ctx, cfg):
+            if ctx["function"] == "foo":
+                raise RuntimeError("boom")
+            return self._make_outcome("b.c", "bar", "suspicious")
+
+        result = OrchestratorResult(outcomes=list(outcomes), clean=2)
+        out = _re_review_disagreements(
+            disagreements, result, config, mock_review,
+            checklist, None, None, time.time(), None,
+            max_workers=4,
+        )
+        assert out.suspicious == 1
+        assert out.clean == 1
+
+
+class TestIterativeReReviewParallel:
+
+    @staticmethod
+    def _make_outcome(file, func, status, body="body"):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file=file, function=func, status=status, body=body,
+            review_result={"body": body},
+        )
+
+    def test_parallel_iteration_same_results(self, monkeypatch, tmp_path):
+        import copy
+        import time
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _iterative_re_review,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "caller1", "clean"),
+            self._make_outcome("a.c", "caller2", "clean"),
+            self._make_outcome("b.c", "callee", "finding"),
+        ]
+
+        checklist = {
+            "items": [
+                {"file": "a.c", "functions": [
+                    {"name": "caller1", "line_start": 1, "line_end": 50},
+                    {"name": "caller2", "line_start": 51, "line_end": 100},
+                ]},
+                {"file": "b.c", "functions": [
+                    {"name": "callee", "line_start": 1, "line_end": 50},
+                ]},
+            ],
+        }
+        context_map = {
+            "call_graph": {
+                "a.c:caller1": ["b.c:callee"],
+                "a.c:caller2": ["b.c:callee"],
+            },
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+            propagate_constraints=True,
+            enable_session_context=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {"file": gap["file"], "function": gap["name"]},
+        )
+        monkeypatch.setattr(
+            _orch, "_commit_outcome", lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            _orch, "save_constraints", lambda *a, **kw: None,
+        )
+
+        call_count = 0
+        def mock_review(ctx, cfg):
+            nonlocal call_count
+            call_count += 1
+            return self._make_outcome(ctx["file"], ctx["function"], "clean")
+
+        result_serial = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2, findings=1,
+        )
+        _iterative_re_review(
+            result_serial, config, mock_review, checklist,
+            context_map, None, set(), [], None, None,
+            time.time(), None, max_workers=1,
+        )
+        serial_count = call_count
+
+        call_count = 0
+        result_parallel = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2, findings=1,
+        )
+        _iterative_re_review(
+            result_parallel, config, mock_review, checklist,
+            context_map, None, set(), [], None, None,
+            time.time(), None, max_workers=4,
+        )
+
+        assert serial_count == call_count
+        assert result_serial.clean == result_parallel.clean
+
+
+class TestStudyReReviewParallel:
+
+    @staticmethod
+    def _make_outcome(file, func, status, body="body"):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file=file, function=func, status=status, body=body,
+            review_result={"body": body},
+        )
+
+    def test_serial_and_parallel_same_results(self, monkeypatch, tmp_path):
+        import copy
+        import time
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _re_review_study_enriched,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "foo", "clean"),
+            self._make_outcome("b.c", "bar", "clean"),
+        ]
+        checklist = {
+            "files": [
+                {"path": "a.c", "functions": [{"name": "foo", "line_start": 1, "line_end": 50}]},
+                {"path": "b.c", "functions": [{"name": "bar", "line_start": 1, "line_end": 50}]},
+            ],
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+            enable_session_context=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {"file": gap["file"], "function": gap["name"]},
+        )
+        monkeypatch.setattr(
+            _orch, "_commit_outcome", lambda *a, **kw: None,
+        )
+
+        reading_list = {"a.c:foo", "b.c:bar"}
+
+        call_count = 0
+        def mock_review(ctx, cfg):
+            nonlocal call_count
+            call_count += 1
+            return self._make_outcome(ctx["file"], ctx["function"], "suspicious")
+
+        result_serial = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2,
+        )
+        _re_review_study_enriched(
+            result_serial, config, mock_review, checklist, None, {},
+            None, set(), reading_list, time.time(), None,
+            max_workers=1,
+        )
+        serial_count = call_count
+
+        call_count = 0
+        result_parallel = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2,
+        )
+        _re_review_study_enriched(
+            result_parallel, config, mock_review, checklist, None, {},
+            None, set(), reading_list, time.time(), None,
+            max_workers=4,
+        )
+
+        assert serial_count == call_count == 2
+        assert result_serial.suspicious == result_parallel.suspicious
+
+    def test_duplicate_gap_entries_do_not_crash(self, monkeypatch, tmp_path):
+        """Duplicate reading-list entries resolve to the same prior
+        outcome; the second replace used to raise ValueError from
+        outcomes.index() once the first iteration had swapped the prior
+        out of the list. Candidates are now deduped and the replace is
+        guarded (same shape as _re_review_joern_enriched)."""
+        import copy
+        import time
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _re_review_study_enriched,
+        )
+
+        outcomes = [
+            self._make_outcome("a.c", "foo", "clean"),
+            self._make_outcome("b.c", "bar", "clean"),
+        ]
+        checklist = {
+            "files": [
+                {"path": "a.c", "functions": [{"name": "foo", "line_start": 1, "line_end": 50}]},
+                {"path": "b.c", "functions": [{"name": "bar", "line_start": 1, "line_end": 50}]},
+            ],
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            sweep_validate_findings=False,
+            enable_session_context=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {"file": gap["file"], "function": gap["name"]},
+        )
+        monkeypatch.setattr(
+            _orch, "_commit_outcome", lambda *a, **kw: None,
+        )
+
+        call_count = 0
+        def mock_review(ctx, cfg):
+            nonlocal call_count
+            call_count += 1
+            return self._make_outcome(ctx["file"], ctx["function"], "suspicious")
+
+        # A list (not a set) so the duplicate entries actually reach
+        # the candidate loop — the signature says set, but nothing
+        # enforces it and the dedupe must hold either way.
+        reading_list = ["a.c:foo", "a.c:foo", "b.c:bar"]
+
+        result = OrchestratorResult(
+            outcomes=copy.deepcopy(outcomes), clean=2,
+        )
+        _re_review_study_enriched(
+            result, config, mock_review, checklist, None, {},
+            None, set(), reading_list, time.time(), None,
+            max_workers=1,
+        )
+
+        # Each function reviewed exactly once; no duplicate outcomes.
+        assert call_count == 2
+        assert len(result.outcomes) == 2
+        statuses = {(o.file, o.function): o.status for o in result.outcomes}
+        assert statuses[("a.c", "foo")] == "suspicious"
+        assert statuses[("b.c", "bar")] == "suspicious"
+
+
+# ── Pre-loop SMT screen ──────────────────────────────────────────────
+
+
+class TestPreLoopSmtScreen:
+
+    def _make_config(self, tmp_path):
+        @dataclass
+        class _Cfg:
+            target_path: Path = tmp_path
+            sweep_validate_findings: bool = True
+        return _Cfg()
+
+    def test_auth_bypass_injects_evidence_and_keeps_in_workqueue(self, tmp_path):
+        from core.audit.orchestrator import OrchestratorResult, _pre_loop_smt_screen
+
+        src = tmp_path / "auth.c"
+        src.write_text("""\
+int check_access(struct task *t) {
+    if (same_thread_group(t, current))
+        return 0;
+    if (!ptrace_has_cap(cred, tcred, mode))
+        return -EPERM;
+    return 0;
+}
+""")
+        # ptrace_has_cap comes from the linux_kernel vocab pack; mark
+        # the target as a kernel tree so the screen's vocab loads it.
+        (tmp_path / "Kconfig").write_text("config FOO\n")
+        workqueue = [
+            {"file": "auth.c", "name": "check_access", "line_start": 1, "line_end": 7},
+        ]
+        result = OrchestratorResult()
+        config = self._make_config(tmp_path)
+
+        kept = _pre_loop_smt_screen(workqueue, config, result)
+        assert len(kept) == 1
+        assert result.findings == 0
+        assert "_smt_pre_evidence" in kept[0]
+
+    def test_clean_function_stays_in_workqueue(self, tmp_path):
+        from core.audit.orchestrator import OrchestratorResult, _pre_loop_smt_screen
+
+        src = tmp_path / "clean.c"
+        src.write_text("""\
+int add(int a, int b) {
+    return a + b;
+}
+""")
+        workqueue = [
+            {"file": "clean.c", "name": "add", "line_start": 1, "line_end": 3},
+        ]
+        result = OrchestratorResult()
+        config = self._make_config(tmp_path)
+
+        kept = _pre_loop_smt_screen(workqueue, config, result)
+        assert len(kept) == 1
+        assert result.findings == 0
+        assert len(result.outcomes) == 0
+
+    def test_dead_path_boosts_but_never_resolves_dormant(
+        self, tmp_path, monkeypatch,
+    ):
+        """Safety contract: condition_smt is not in SUPPRESS_SOURCES.
+
+        A dead-path UNSAT from the conjunctive guard model may inject
+        evidence, but the function must STAY in the workqueue — it
+        used to be committed dormant without LLM review.
+        """
+        from core.audit import condition_extraction as ce
+        from core.audit.condition_extraction import GuardCondition, SinkGuard
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _pre_loop_smt_screen,
+        )
+
+        src = tmp_path / "dead.c"
+        src.write_text("""\
+int f(int n, char *srcb) {
+    char buf[16];
+    if (n < 5) {
+        if (n > 10) {
+            memcpy(buf, srcb, n);
+        }
+    }
+    return 0;
+}
+""")
+
+        def _fake_extract(source, filepath, *a, **kw):
+            return [SinkGuard(
+                sink_file=filepath, sink_line=5, sink_function="f",
+                sink_api="memcpy",
+                guards=[
+                    GuardCondition(
+                        text="n < 5", category="bounds",
+                        polarity="required", line=3,
+                    ),
+                    GuardCondition(
+                        text="n > 10", category="bounds",
+                        polarity="required", line=4,
+                    ),
+                ],
+            )]
+
+        monkeypatch.setattr(ce, "extract_sink_guards", _fake_extract)
+
+        workqueue = [
+            {"file": "dead.c", "name": "f", "line_start": 1, "line_end": 9},
+        ]
+        result = OrchestratorResult()
+        config = self._make_config(tmp_path)
+
+        kept = _pre_loop_smt_screen(workqueue, config, result)
+        assert len(kept) == 1
+        assert kept[0]["_smt_pre_evidence"] == "smt:dead-path"
+        assert result.dormant == 0
+        assert len(result.outcomes) == 0
+
+    def test_disjunctive_guard_is_not_dead_path(self, tmp_path, monkeypatch):
+        """A `n == 0 || n == 1` guard is trivially reachable — the old
+        flat-conjunction model proved it UNSAT and resolved the
+        function dormant.  It must stay unscreened."""
+        from core.audit import condition_extraction as ce
+        from core.audit.condition_extraction import GuardCondition, SinkGuard
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _pre_loop_smt_screen,
+        )
+
+        src = tmp_path / "disj.c"
+        src.write_text("""\
+int g(int n, char *srcb) {
+    char buf[16];
+    if (n == 0 || n == 1) {
+        memcpy(buf, srcb, n);
+    }
+    return 0;
+}
+""")
+
+        def _fake_extract(source, filepath, *a, **kw):
+            return [SinkGuard(
+                sink_file=filepath, sink_line=4, sink_function="g",
+                sink_api="memcpy",
+                guards=[GuardCondition(
+                    text="n == 0 || n == 1", category="bounds",
+                    polarity="required", line=3,
+                )],
+            )]
+
+        monkeypatch.setattr(ce, "extract_sink_guards", _fake_extract)
+
+        workqueue = [
+            {"file": "disj.c", "name": "g", "line_start": 1, "line_end": 7},
+        ]
+        result = OrchestratorResult()
+        config = self._make_config(tmp_path)
+
+        kept = _pre_loop_smt_screen(workqueue, config, result)
+        assert len(kept) == 1
+        assert kept[0].get("_smt_pre_evidence") != "smt:dead-path"
+        assert result.dormant == 0
+        assert len(result.outcomes) == 0
+
+    def test_non_c_file_skips_c_only_checks(self, tmp_path):
+        from core.audit.orchestrator import OrchestratorResult, _pre_loop_smt_screen
+
+        src = tmp_path / "app.py"
+        src.write_text("""\
+def greet(name):
+    return f"hello {name}"
+""")
+        workqueue = [
+            {"file": "app.py", "name": "greet", "line_start": 1, "line_end": 2},
+        ]
+        result = OrchestratorResult()
+        config = self._make_config(tmp_path)
+
+        kept = _pre_loop_smt_screen(workqueue, config, result)
+        assert len(kept) == 1
+        assert result.findings == 0
+
+    def test_mixed_workqueue_partial_screen(self, tmp_path):
+        from core.audit.orchestrator import OrchestratorResult, _pre_loop_smt_screen
+
+        buggy = tmp_path / "leak.c"
+        buggy.write_text("""\
+int process(int fd) {
+    void *buf = malloc(1024);
+    if (fd < 0)
+        return -1;
+    free(buf);
+    return 0;
+}
+""")
+        clean = tmp_path / "ok.c"
+        clean.write_text("""\
+int add(int a, int b) {
+    return a + b;
+}
+""")
+        workqueue = [
+            {"file": "leak.c", "name": "process", "line_start": 1, "line_end": 7},
+            {"file": "ok.c", "name": "add", "line_start": 1, "line_end": 3},
+        ]
+        result = OrchestratorResult()
+        config = self._make_config(tmp_path)
+
+        kept = _pre_loop_smt_screen(workqueue, config, result)
+        assert len(kept) == 2
+        assert kept[0]["name"] == "process"
+        assert "_smt_pre_evidence" in kept[0]
+        assert kept[1]["name"] == "add"
+        assert result.findings == 0
+
+
+class TestDisagreementReReviewTallies:
+    """Status-changing disagreement re-reviews replace the outcome
+    IN PLACE (no double-append), and every re-review call books its
+    spend — verdict changed or not."""
+
+    @staticmethod
+    def _outcome(file, fn, status, cost=0.0):
+        from core.audit.orchestrator import ReviewOutcome
+        return ReviewOutcome(
+            file=file, function=fn, status=status,
+            body="test", cost_usd=cost,
+        )
+
+    def _run(self, monkeypatch, tmp_path, new_status):
+        import time
+        from types import SimpleNamespace
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _re_review_disagreements,
+        )
+
+        result = OrchestratorResult(
+            outcomes=[self._outcome("a.c", "foo", "clean")], clean=1,
+        )
+        checklist = {
+            "files": [{
+                "file": "a.c",
+                "items": [{"name": "foo", "line_start": 1, "line_end": 50}],
+            }],
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            sweep_validate_findings=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {
+                "file": gap["file"], "function": gap["name"],
+            },
+        )
+        disagreements = [SimpleNamespace(
+            file="a.c", function="foo", resolution="mechanical wins",
+            mechanical_claim=SimpleNamespace(reachable=True, has_flow=True),
+        )]
+        _re_review_disagreements(
+            disagreements, result, config,
+            lambda ctx, cfg: self._outcome(
+                ctx["file"], ctx["function"], new_status, cost=0.25,
+            ),
+            checklist, None, None, time.time(), None,
+            max_workers=1,
+        )
+        return result
+
+    def test_status_change_does_not_double_append(
+        self, monkeypatch, tmp_path,
+    ):
+        result = self._run(monkeypatch, tmp_path, "suspicious")
+        assert len(result.outcomes) == 1, (
+            "in-place replacement must not append a second copy"
+        )
+        assert result.outcomes[0].status == "suspicious"
+        assert result.suspicious == 1
+        assert result.clean == 0
+
+    def test_changed_verdict_cost_booked(self, monkeypatch, tmp_path):
+        result = self._run(monkeypatch, tmp_path, "suspicious")
+        phase = result.cost_tracker.phases.get("re_review")
+        assert phase is not None
+        assert phase.cost_usd == 0.25
+
+    def test_unchanged_verdict_cost_booked(self, monkeypatch, tmp_path):
+        # The call cost money even though the verdict stood.
+        result = self._run(monkeypatch, tmp_path, "clean")
+        assert len(result.outcomes) == 1
+        phase = result.cost_tracker.phases.get("re_review")
+        assert phase is not None
+        assert phase.cost_usd == 0.25
+
+
+class TestIterativeReReviewKeepsPriorOnFailure:
+    """A failed propagation re-review call must keep the prior valid
+    verdict — never replace it with an error outcome."""
+
+    def _run(self, monkeypatch, tmp_path, review_fn):
+        import time
+
+        import core.audit.orchestrator as _orch
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            ReviewOutcome,
+            _iterative_re_review,
+        )
+
+        finding = ReviewOutcome(
+            file="callee.c", function="worker", status="finding",
+            body="bug", hypothesis="overflow",
+        )
+        caller_clean = ReviewOutcome(
+            file="caller.c", function="dispatch", status="clean",
+            body="fine",
+        )
+        result = OrchestratorResult(
+            outcomes=[finding, caller_clean], findings=1, clean=1,
+        )
+        checklist = {
+            "files": [{
+                "path": "caller.c",
+                "items": [{
+                    "name": "dispatch", "line_start": 1, "line_end": 50,
+                }],
+            }],
+        }
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            propagate_constraints=True,
+            sweep_validate_findings=False,
+        )
+        monkeypatch.setattr(
+            _orch, "_build_context",
+            lambda cfg, gap, *a, **kw: {
+                "file": gap["file"], "function": gap["name"],
+            },
+        )
+        monkeypatch.setattr(
+            _orch, "_find_re_review_targets",
+            lambda findings, cfg, cl, cm, reviewed: [{
+                "gap": {
+                    "file": "caller.c", "name": "dispatch",
+                    "line_start": 1, "line_end": 50,
+                },
+                "callee_findings": [findings[0]] if findings else [],
+            }],
+        )
+        return _iterative_re_review(
+            result, config, review_fn, checklist, None, None,
+            set(), [], None, None, time.time(), None,
+        )
+
+    def test_failure_keeps_prior_clean(self, monkeypatch, tmp_path):
+        def boom(ctx, cfg):
+            raise RuntimeError("transport reset")
+
+        result = self._run(monkeypatch, tmp_path, boom)
+        caller = [o for o in result.outcomes if o.function == "dispatch"]
+        assert caller and caller[0].status == "clean", (
+            "failed re-review must not mint an error outcome over a "
+            "valid clean verdict"
+        )
+        assert result.errors == 0
+
+    def test_success_still_replaces(self, monkeypatch, tmp_path):
+        from core.audit.orchestrator import ReviewOutcome
+
+        calls = []
+
+        def ok(ctx, cfg):
+            calls.append(ctx)
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="suspicious", body="callee taints arg",
+            )
+
+        result = self._run(monkeypatch, tmp_path, ok)
+        assert calls, "re-review must have been dispatched"
+        caller = [o for o in result.outcomes if o.function == "dispatch"]
+        assert caller and caller[0].status == "suspicious"

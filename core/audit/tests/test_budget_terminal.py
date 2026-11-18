@@ -1,0 +1,718 @@
+"""Budget exhaustion is TERMINAL for the /audit review loop.
+
+Covers the observed field failure: the LLM client's cap was exhausted
+mid-run (spend from timed-out attempts lives only in the client's
+ledger), but the loop kept running — full block-level prep per
+remaining function, a doomed LLM call, an "error" journal verdict,
+repeat. These tests pin the fixed behaviour:
+
+* a budget-exceeded error from review_fn stops the loop immediately;
+* budget-killed functions are NOT journaled — they stay gap-eligible;
+* per-function prep is not paid after exhaustion;
+* the post-loop passes (deepen dispatch via _check_budget, error
+  retry) stop dispatching too;
+* error-verdict journal entries never suppress future gaps.
+
+Hermetic: no network, no real LLM calls — review_fn is stubbed and the
+budget client is a fake.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from core.audit.gaps import compute_gaps
+from core.audit.orchestrator import (
+    OrchestratorConfig,
+    OrchestratorResult,
+    ReviewOutcome,
+    _check_budget,
+    _retry_error_outcomes,
+    run_orchestrator,
+)
+from core.audit.tests.reuse_foundation_fixtures import current_foundation_fields
+from core.coverage.journal import (
+    ReviewJournalEntry,
+    append_entry,
+    load_entries,
+    now_iso,
+)
+from core.llm.client import (
+    LLMBudgetExceededError,
+    is_budget_exceeded_error,
+)
+
+
+from core.testing.module_views import scoped_function_imports
+from core.testing.module_bindings import patch_module_attribute
+
+
+
+class _FakeBudgetClient:
+    """Stands in for LLMClient — only the budget probe is consulted."""
+
+    def __init__(self, exhausted: bool = False) -> None:
+        self.exhausted = exhausted
+
+    def is_budget_exhausted(self, estimated_cost: float = 0.1) -> bool:
+        return self.exhausted
+
+
+def _make_fn_body(name: str, start: int) -> str:
+    lines = [f"int {name}(char *input, int len) {{"]
+    lines += [f"  int v{i} = len + {i};" for i in range(20)]
+    lines += ["  char buf[64];", "  memcpy(buf, input, len);",
+              "  return buf[0];", "}"]
+    return "\n".join(lines)
+
+
+def _setup_target(tmp_path: Path, n_functions: int = 3):
+    """Target with *n_functions* non-trivial functions (no batching)."""
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    names = [f"handler_{i}" for i in range(n_functions)]
+    src_lines: list[str] = []
+    items = []
+    line = 1
+    for name in names:
+        body = _make_fn_body(name, line)
+        n = body.count("\n") + 1
+        items.append(
+            {"name": name, "line_start": line, "line_end": line + n - 1},
+        )
+        src_lines.append(body)
+        line += n
+    (target / "src" / "big.c").write_text("\n".join(src_lines) + "\n")
+
+    out = tmp_path / "out"
+    out.mkdir()
+    checklist = {"target_path": str(target),
+                 "files": [{"path": "src/big.c", "items": items}]}
+    (out / "checklist.json").write_text(json.dumps(checklist))
+    return target, out, names
+
+
+def _config(target: Path, out: Path, **kw) -> OrchestratorConfig:
+    defaults: dict = {
+        "target_path": target,
+        "out_dir": out,
+        "resume": False,
+        "max_workers": 1,
+        "batch_sloc_threshold": 0,  # force the executor path, no batching
+        "prefilter": False,         # every function reaches review_fn
+        "validate": False,
+        # Review-budget behavior is under test, not post-loop discovery
+        # through an ambient model client after a partial completion.
+        "open_discovery": False,
+        # Budget rails are under test, not the Joern channel: on a
+        # joern-equipped host run_orchestrator otherwise starts a REAL
+        # server (JVM spawn + CPG build + pre-sweep + stop, ~9s on the
+        # C fixtures here — the same incidental-substrate cost class as
+        # the mechanical-detector seam the batched test already stubs).
+        # The production knob keeps the whole lifecycle off; the Joern
+        # channel has its own wiring tests.
+        "joern_overrides": {"enabled": False},
+    }
+    defaults.update(kw)
+    return OrchestratorConfig(**defaults)
+
+
+def _journal_functions(out: Path) -> set[str]:
+    return {e.function for e in load_entries(out)}
+
+
+class TestBudgetExceededError:
+    def test_typed_and_string_detection(self):
+        assert is_budget_exceeded_error(LLMBudgetExceededError("nope"))
+        assert is_budget_exceeded_error(
+            RuntimeError("LLM budget exceeded: $6.25 spent > $6.00 limit"),
+        )
+        assert not is_budget_exceeded_error(RuntimeError("api timeout"))
+        assert not is_budget_exceeded_error(ValueError("budget exceeded"))
+
+    def test_subclasses_runtime_error(self):
+        # Legacy string-matching handlers catch RuntimeError — the typed
+        # class must stay inside that net.
+        assert issubclass(LLMBudgetExceededError, RuntimeError)
+
+
+@pytest.mark.slow
+class TestBudgetStopsReviewLoop:
+    @pytest.fixture(autouse=True)
+    def _no_unrelated_detector_battery(self, monkeypatch):
+        # These cases exercise budget rails, per-function preparation and
+        # real journal/gap handling. Detector behavior has its own suites.
+        import core.audit.orchestrator as orch
+
+        monkeypatch.setattr(
+            orch, "_run_mechanical_detectors", lambda *a, **k: ({}, set()),
+        )
+
+    def test_loop_stops_and_unreviewed_stay_gaps(self, tmp_path: Path):
+        target, out, names = _setup_target(tmp_path, n_functions=3)
+
+        calls = []
+
+        def review_fn(ctx, config):
+            calls.append(ctx["function"])
+            if len(calls) >= 2:
+                raise LLMBudgetExceededError(
+                    "LLM budget exceeded: $6.25 spent > $6.00 limit",
+                )
+            from core.audit.context import format_context_for_prompt
+
+            delivered = []
+            format_context_for_prompt(ctx, knowledge_delivery_sink=delivered.append)
+            assert len(delivered) == 1
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="clean", body="ok", cost_usd=0.5,
+                review_result=delivered[0],
+            )
+
+        result = run_orchestrator(_config(target, out), review_fn)
+
+        # Loop stopped at the budget error: one success, no error
+        # verdicts, and the budget-killed function was not retried.
+        assert result.reviewed == 1
+        assert result.errors == 0
+        assert result.terminated_by == "llm_budget_exceeded"
+        assert len(calls) == 2
+
+        # Only the successful review reached the journal — the killed
+        # and never-attempted functions were NOT journaled.
+        journaled = _journal_functions(out)
+        assert len(journaled) == 1
+
+        # Gap recomputation still surfaces the two unreviewed functions.
+        checklist = json.loads((out / "checklist.json").read_text())
+        gaps = compute_gaps(checklist, [], out_dir=out)
+        gap_names = {g["name"] for g in gaps}
+        assert gap_names == set(names) - journaled
+        assert len(gap_names) == 2
+
+    def test_prep_not_run_when_exhausted_from_start(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        target, out, names = _setup_target(tmp_path, n_functions=2)
+
+        prep_calls = []
+        import core.audit.orchestrator as orch
+        real_prep = orch._try_block_level_context
+
+        def spy_prep(*a, **kw):
+            prep_calls.append(a)
+            return real_prep(*a, **kw)
+
+        monkeypatch.setattr(orch, "_try_block_level_context", spy_prep)
+
+        review_calls = []
+
+        def review_fn(ctx, config):
+            review_calls.append(ctx["function"])
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="clean", body="ok",
+            )
+
+        cfg = _config(
+            target, out, llm_budget_client=_FakeBudgetClient(exhausted=True),
+        )
+        result = run_orchestrator(cfg, review_fn)
+
+        assert review_calls == []
+        assert prep_calls == []
+        assert result.terminated_by == "llm_budget_exceeded"
+        assert _journal_functions(out) == set()
+        checklist = json.loads((out / "checklist.json").read_text())
+        gaps = compute_gaps(checklist, [], out_dir=out)
+        assert {g["name"] for g in gaps} == set(names)
+
+    def test_prep_not_run_after_midrun_exhaustion(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Once the client ledger crosses the cap, later functions must
+        not pay block-level prep (the observed ~40min post-exhaustion
+        waste)."""
+        target, out, _names = _setup_target(tmp_path, n_functions=3)
+
+        client = _FakeBudgetClient(exhausted=False)
+        prep_calls = []
+        import core.audit.orchestrator as orch
+
+        monkeypatch.setattr(
+            orch, "_try_block_level_context",
+            lambda *a, **kw: prep_calls.append(a),
+        )
+
+        review_calls = []
+
+        def review_fn(ctx, config):
+            review_calls.append(ctx["function"])
+            client.exhausted = True  # spend lands on the client ledger
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="clean", body="ok", cost_usd=6.0,
+            )
+
+        cfg = _config(target, out, llm_budget_client=client)
+        result = run_orchestrator(cfg, review_fn)
+
+        assert len(review_calls) == 1
+        assert len(prep_calls) == 1  # only the pre-exhaustion function
+        assert result.reviewed == 1
+        assert result.terminated_by == "llm_budget_exceeded"
+
+
+class TestCheckBudgetConsultsClient:
+    def test_client_ledger_trips_gate(self, tmp_path: Path):
+        """result.total_cost_usd can sit far below the cap while the
+        client ledger (which includes failed/timed-out attempts) is
+        exhausted — the gate must trip on the client ledger too. This
+        is what stops the deepen phase from dispatching post-exhaustion
+        (its dispatch loops poll _check_budget per item)."""
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            max_cost_usd=6.0,
+            llm_budget_client=_FakeBudgetClient(exhausted=True),
+        )
+        result = OrchestratorResult()
+        result.total_cost_usd = 3.75  # successful outcomes only
+        assert _check_budget(config, 0.0, result) is True
+        assert result.terminated_by == "llm_budget_exceeded"
+
+    @pytest.mark.parametrize("skip_max_seconds", [False, True])
+    @pytest.mark.parametrize("has_client", [False, True])
+    def test_recorded_client_budget_stop_stays_terminal(
+        self, tmp_path: Path, skip_max_seconds: bool, has_client: bool,
+    ):
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            llm_budget_client=_FakeBudgetClient(exhausted=False) if has_client else None,
+        )
+        result = OrchestratorResult()
+        result.terminated_by = "llm_budget_exceeded"
+        assert _check_budget(
+            config, 0.0, result, skip_max_seconds=skip_max_seconds,
+        ) is True
+        assert result.terminated_by == "llm_budget_exceeded"
+
+    def test_not_exhausted_gate_stays_open(self, tmp_path: Path):
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+            max_cost_usd=6.0,
+            llm_budget_client=_FakeBudgetClient(exhausted=False),
+        )
+        result = OrchestratorResult()
+        result.total_cost_usd = 3.75
+        assert _check_budget(config, 0.0, result) is False
+        assert result.terminated_by == "complete"
+
+
+class TestErrorRetryStopsOnBudget:
+    def test_retry_pass_stops_after_first_budget_error(self, tmp_path: Path):
+        target, out, names = _setup_target(tmp_path, n_functions=3)
+        checklist = json.loads((out / "checklist.json").read_text())
+
+        config = _config(target, out)
+        result = OrchestratorResult()
+        for name in names:
+            outcome = ReviewOutcome(
+                file="src/big.c", function=name,
+                status="error", body="api blip",
+                error_class="api_error",  # recoverable → retried
+            )
+            result.outcomes.append(outcome)
+            result.errors += 1
+
+        calls = []
+
+        def review_fn(ctx, config):
+            calls.append(ctx["function"])
+            raise LLMBudgetExceededError(
+                "LLM budget exceeded: $6.25 spent > $6.00 limit",
+            )
+
+        result = _retry_error_outcomes(
+            result, config, review_fn, checklist,
+            None, None, 0.0, None,
+        )
+
+        # ONE attempt, then the pass stops — not one per error outcome.
+        assert len(calls) == 1
+        assert result.terminated_by == "llm_budget_exceeded"
+
+
+class TestErrorVerdictsStayGapEligible:
+    def _entry(self, function: str, verdict: str,
+               item: dict) -> ReviewJournalEntry:
+        # Journal writers record the reviewed checklist item's REAL
+        # span — the fold's per-site credits are span-bound, so a
+        # hashless verified row suppresses exactly the recorded site
+        # (a row claiming a span no checklist item occupies earns
+        # nothing; see test_hashless_row_at_unknown_site below).
+        return ReviewJournalEntry(
+            ts=now_iso(), run_id="run1", file="src/big.c",
+            function=function, verdict=verdict, source_hash="",
+            line_start=item["line_start"], line_end=item["line_end"],
+        )
+
+    def test_journal_error_verdict_still_a_gap(self, tmp_path: Path):
+        _target, out, names = _setup_target(tmp_path, n_functions=2)
+        checklist = json.loads((out / "checklist.json").read_text())
+        items = checklist["files"][0]["items"]
+
+        from dataclasses import replace
+
+        checklist["target_path"] = str(_target)
+        append_entry(out, self._entry(names[0], "error", items[0]))
+        # The clean peer is a current review; the error row remains retryable.
+        clean = replace(self._entry(names[1], "clean", items[1]),
+                        **current_foundation_fields(_target, "src/big.c",
+                            items[1]["line_start"], items[1]["line_end"]))
+        append_entry(out, clean)
+
+        gaps = compute_gaps(checklist, [], out_dir=out)
+        gap_names = {g["name"] for g in gaps}
+        assert names[0] in gap_names   # error → retry next run
+        assert names[1] not in gap_names
+
+    def test_hashless_row_at_unknown_site_stays_a_gap(self, tmp_path: Path):
+        """A verified journal row with NO source hash suppresses only
+        the site it recorded. When the recorded span matches no
+        checklist item, the function re-reviews (over-review, the
+        safe direction) — a wildcard credit here would let a reviewed
+        1-line prototype suppress its unreviewed same-named body, the
+        documented missed-vulnerability failure the span-bound
+        credits exist to prevent."""
+        _target, out, names = _setup_target(tmp_path, n_functions=2)
+        checklist = json.loads((out / "checklist.json").read_text())
+
+        append_entry(out, self._entry(
+            names[1], "clean", {"line_start": 999, "line_end": 1010}))
+
+        gaps = compute_gaps(checklist, [], out_dir=out)
+        assert names[1] in {g["name"] for g in gaps}
+
+    def test_coverage_import_skips_error_verdicts(self, tmp_path: Path):
+        """The run-completion journal→coverage-store projection must not
+        mark budget/API-error verdicts as reviewed — that would
+        misrepresent coverage for anything derived from the store."""
+        from core.coverage.importer import import_journal
+        from core.coverage.journal import merge_into_index
+        from core.coverage.store import CoverageStore
+
+        _target, out, names = _setup_target(tmp_path, n_functions=2)
+        checklist = json.loads((out / "checklist.json").read_text())
+        items = checklist["files"][0]["items"]
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        append_entry(out, self._entry(names[0], "error", items[0]))
+        append_entry(out, self._entry(names[1], "clean", items[1]))
+        merge_into_index(project_dir, out)
+
+        store = CoverageStore(tmp_path / "coverage.json")
+        marks = import_journal(store, project_dir, checklist)
+        assert marks == 1  # the clean entry only
+
+
+class _FlippableBudgetClient:
+    """Fake client whose exhaustion flips after N is_budget_exhausted
+    consultations-worth of reviews — flipped externally by the test's
+    review_fn once the first batch has been paid for."""
+
+    def __init__(self) -> None:
+        self.exhausted = False
+
+    def is_budget_exhausted(self, estimated_cost: float = 0.1) -> bool:
+        return self.exhausted
+
+
+def _setup_trivial_target(tmp_path: Path, n_files: int, fns_per_file: int):
+    """Target of trivial (batchable) functions spread across files."""
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    files = []
+    names = []
+    for f in range(n_files):
+        items = []
+        src_lines: list[str] = []
+        line = 1
+        for i in range(fns_per_file):
+            name = f"tiny_{f}_{i}"
+            names.append(name)
+            body = f"int {name}(int x) {{\n  return x + {i};\n}}"
+            n = body.count("\n") + 1
+            items.append(
+                {"name": name, "line_start": line, "line_end": line + n - 1},
+            )
+            src_lines.append(body)
+            line += n
+        rel = f"src/f{f}.c"
+        (target / rel).write_text("\n".join(src_lines) + "\n")
+        files.append({"path": rel, "items": items})
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "checklist.json").write_text(json.dumps({"files": files}))
+    return target, out, names
+
+
+class TestBatchedPassBudgetTerminal:
+    """Incident regression: the batched (trivial-function) pass
+    submitted EVERY batch to its thread pool up front and checked the
+    rails only in the result-consumption loop. On exhaustion the loop
+    broke — but queued batches were never cancelled, the pool join
+    executed the entire pre-submitted backlog (observed live: many
+    hours of post-exhaustion reviews), and the outcomes the
+    workers completed after the break were never tallied, freezing
+    result.total_cost_usd and blinding the cost-cap rail itself."""
+
+    def test_queued_batches_not_dispatched_after_exhaustion(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        target, out, names = _setup_trivial_target(
+            tmp_path, n_files=6, fns_per_file=4,
+        )
+        # Under test: batch dispatch vs the budget rails. The
+        # sandboxed mechanical-detector prep is incidental here and
+        # dominates wallclock (~40s of real detector runs on the
+        # fixture); the seam has its own wiring tests.
+        import core.audit.orchestrator as orch
+        monkeypatch.setattr(
+            orch, "_run_mechanical_detectors",
+            # Full variadic signature + the real (dict, set) return
+            # contract: a wrong-shaped stub dies inside the phase's
+            # blanket except and "works" by swallowed crash instead of
+            # by stubbing.
+            lambda *args, **kwargs: ({}, set()),
+        )
+        client = _FlippableBudgetClient()
+        calls: list[str] = []
+
+        def review_fn(ctx, config):
+            calls.append(ctx["function"])
+            if len(calls) >= 4:
+                # First batch paid for — the cap is now exhausted.
+                client.exhausted = True
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="clean", body="ok", cost_usd=0.5,
+            )
+
+        cfg = _config(
+            target, out,
+            batch_sloc_threshold=15,
+            llm_budget_client=client,
+        )
+        result = run_orchestrator(cfg, review_fn)
+
+        # The first batch (4 functions in one file) was reviewed; the
+        # five queued batches were cancelled or worker-gated — never
+        # dispatched. Pre-fix every one of the 24 functions was
+        # reviewed after exhaustion.
+        assert len(calls) <= 8, (
+            f"{len(calls)} reviews dispatched — queued batches ran "
+            f"after budget exhaustion"
+        )
+        # Every dispatched review's outcome is tallied — pre-fix the
+        # consumption loop broke and completed outcomes vanished from
+        # the result (journal had them; the ledger froze).
+        assert result.reviewed == len(calls)
+        assert result.total_cost_usd == pytest.approx(0.5 * len(calls))
+        assert result.terminated_by == "llm_budget_exceeded"
+        # Journal agrees with the tally.
+        assert len(_journal_functions(out)) == len(calls)
+
+    def test_exhaustion_with_queued_batches_terminates(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Deadlock regression: exhaustion firing while batches are
+        still QUEUED must terminate the pass, not hang it.
+
+        ``pool.shutdown(cancel_futures=True)`` cancels queued batches
+        by draining the pool's work queue — so no worker ever pops
+        them, and nothing ever notifies a completion waiter for them
+        (see ``TestQueueDrainCancellation`` for the primitive pin).
+        Pre-fix the harvest loop iterated ``as_completed`` over ALL
+        submitted futures and therefore blocked forever on the
+        drain-cancelled ones: a capped run whose cost rail fired with
+        batches still queued hung its batched pass indefinitely.
+
+        The sibling test above cannot reach this shape: its rail-
+        refused batches complete instantly, so the single worker has
+        drained the whole queue before the consumer's shutdown runs
+        and nothing is left to cancel. Here the worker is held INSIDE
+        its pre-batch rail check (post-exhaustion only) until the
+        queue drain has actually happened, guaranteeing batches are
+        still pending when ``cancel_futures=True`` fires:
+
+        1. the only worker reviews batch 1; its last review flips the
+           client ledger to exhausted;
+        2. the worker picks up batch 2 — its rail check now blocks on
+           ``queue_drained``;
+        3. the consumer tallies batch 1, sees exhaustion, and calls
+           ``shutdown(cancel_futures=True)``: batches 3..6 are
+           cancelled while pending, then the instrumented pool sets
+           ``queue_drained``;
+        4. the worker wakes, rail-refuses batch 2, and exits — the
+           consumer must now terminate with four cancelled futures
+           that will never complete.
+        """
+        import core.audit.orchestrator as orch
+        with scoped_function_imports(orch, ('_run_audit_body',), {"concurrent.futures": concurrent.futures}) as imports:
+            target, out, _names = _setup_trivial_target(
+                tmp_path, n_files=6, fns_per_file=4,
+            )
+            from core.audit import capabilities
+
+            # The eight-second watchdog bounds cancellation/harvest, not
+            # unrelated host-tool discovery or background model study.
+            monkeypatch.setattr(
+                capabilities, "probe_capabilities",
+                lambda *a, **kw: capabilities.AuditCapabilities(),
+            )
+            monkeypatch.setattr(orch, "_study_consumer", lambda *a, **kw: None)
+            monkeypatch.setattr(
+                orch, "_run_mechanical_detectors",
+                lambda *args, **kwargs: ({}, set()),
+            )
+
+            client = _FlippableBudgetClient()
+            queue_drained = threading.Event()
+
+            real_check = orch._check_budget
+
+            def gated_check(config, start_time, result):
+                # Hold post-exhaustion WORKER rail checks until the
+                # consumer's cancel_futures drain has run. The consumer's
+                # own checks (main run thread) pass straight through.
+                if (
+                    client.exhausted
+                    and threading.current_thread().name.startswith(
+                        "ThreadPoolExecutor",
+                    )
+                ):
+                    queue_drained.wait(timeout=15)
+                return real_check(config, start_time, result)
+
+            monkeypatch.setattr(orch, "_check_budget", gated_check)
+
+            class _SignalOnCancelDrain(ThreadPoolExecutor):
+                """Signals AFTER shutdown's queue drain cancelled the
+                pending futures — the only point that is causally ordered
+                after the cancellations the regression needs in place."""
+
+                def shutdown(self, wait=True, *, cancel_futures=False):
+                    super().shutdown(wait=wait, cancel_futures=cancel_futures)
+                    if cancel_futures:
+                        queue_drained.set()
+
+            # The batched pass imports ThreadPoolExecutor from
+            # concurrent.futures at call time; the private import view
+            # keeps this executor override on the audit body.
+            patch_module_attribute(monkeypatch, imports, "concurrent.futures", "ThreadPoolExecutor", _SignalOnCancelDrain,
+            )
+
+            calls: list[str] = []
+
+            def review_fn(ctx, config):
+                calls.append(ctx["function"])
+                if len(calls) >= 4:
+                    # First batch paid for — the cap is now exhausted.
+                    client.exhausted = True
+                return ReviewOutcome(
+                    file=ctx["file"], function=ctx["function"],
+                    status="clean", body="ok", cost_usd=0.5,
+                )
+
+            cfg = _config(
+                target, out,
+                batch_sloc_threshold=15,
+                llm_budget_client=client,
+                # The Joern lifecycle is incidental to this seam and
+                # dominates wallclock on joern-equipped hosts; the
+                # watchdog below needs the healthy run to be fast.
+                joern_overrides={"enabled": False},
+                iris=False,
+                sage_recall=False,
+                immediate_verify=False,
+                sweep_validate_findings=False,
+                max_refinements=0,
+            )
+
+            box: list = []
+            runner = threading.Thread(
+                target=lambda: box.append(run_orchestrator(cfg, review_fn)),
+                daemon=True,
+                name="audit-under-test",
+            )
+            runner.start()
+            runner.join(timeout=8.0)
+            if runner.is_alive():
+                queue_drained.set()  # unwedge the held worker before failing
+                runner.join(timeout=1.0)
+                pytest.fail(
+                    "batched pass hung after budget exhaustion with queued "
+                    "batches — the harvest loop never terminated on the "
+                    "drain-cancelled futures",
+                )
+
+            result = box[0]
+            # Batch 1 reviewed; batch 2 worker-gated; batches 3..6
+            # cancelled while pending — never dispatched.
+            assert len(calls) == 4, (
+                f"{len(calls)} reviews dispatched — queued batches ran "
+                f"after budget exhaustion"
+            )
+            # Every dispatched review's outcome is tallied, including any
+            # that complete during the shutdown itself.
+            assert result.reviewed == len(calls)
+            assert result.total_cost_usd == pytest.approx(0.5 * len(calls))
+            assert result.terminated_by == "llm_budget_exceeded"
+            assert len(_journal_functions(out)) == len(calls)
+
+
+class TestQueueDrainCancellation:
+    """Pins the stdlib contract the batched pass's harvest loop is
+    built around: ``shutdown(cancel_futures=True)`` cancels queued
+    futures by DRAINING the work queue, so no worker ever calls
+    ``set_running_or_notify_cancel`` on them and no completion waiter
+    is ever notified. Both ``as_completed`` and ``wait`` treat such a
+    future as still pending forever — the harvest loop must drop
+    futures via ``.cancelled()`` instead of waiting on them."""
+
+    def test_drain_cancelled_future_never_notifies_waiters(self):
+        gate = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            running = None
+            try:
+                running = pool.submit(gate.wait, 10)  # occupies the worker
+                queued = pool.submit(lambda: None)    # sits in the queue
+                pool.shutdown(wait=False, cancel_futures=True)
+
+                # The drain cancelled it — visible to .cancelled() ...
+                assert queued.cancelled()
+
+                # ... but as_completed never yields it,
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    next(concurrent.futures.as_completed([queued], timeout=0.2))
+
+                # and wait() still classifies it as not_done.
+                done, not_done = concurrent.futures.wait(
+                    {queued}, timeout=0.2,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                assert done == set()
+                assert not_done == {queued}
+            finally:
+                gate.set()
+                if running is not None:
+                    assert running.result(timeout=5) is True

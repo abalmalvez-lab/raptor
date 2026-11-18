@@ -1,12 +1,27 @@
 """Tests for _tighten_config_perms() — auto-chmod of ~/.config/raptor/models.json."""
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
 import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
 from core.startup.init import _tighten_config_perms
+
+
+from core.testing.module_bindings import patch_module_attribute
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_os_fault_patches(monkeypatch):
+    """Keep process and path simulations on the module under test."""
+    import core.startup.init as consumer
+
+    patch_module_attribute(monkeypatch, consumer, "os", "getuid", consumer.os.getuid)
 
 
 class TestTightenConfigPerms(unittest.TestCase):
@@ -57,7 +72,7 @@ class TestTightenConfigPerms(unittest.TestCase):
         with TemporaryDirectory() as d:
             p = self._make_file(Path(d), 0o664)
             fake_uid = p.stat().st_uid + 1
-            with patch("os.getuid", return_value=fake_uid):
+            with mock_module_attribute(_mock_owner('core.startup.init'), 'os', 'getuid', return_value=fake_uid):
                 notice = _tighten_config_perms(p)
             self.assertIsNotNone(notice)
             self.assertTrue(notice.startswith("\u26a0"))
@@ -84,7 +99,19 @@ class TestTightenConfigPerms(unittest.TestCase):
         # + fchmod to close the swap-symlink-mid-call race.
         with TemporaryDirectory() as d:
             p = self._make_file(Path(d), 0o644)
-            with patch("os.fchmod", side_effect=PermissionError("denied")):
+            with mock_module_attribute(_mock_owner('core.startup.init'), 'os', 'fchmod', side_effect=PermissionError("denied")):
                 notice = _tighten_config_perms(p)
             self.assertTrue(notice.startswith("\u26a0"))
             self.assertIn("chmod failed", notice)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks mkfifo")
+    def test_fifo_warns_without_opening(self):
+        # A FIFO with no writer blocks any O_RDONLY open forever \u2014
+        # the guard must refuse before reaching the open.
+        with TemporaryDirectory() as d:
+            p = Path(d) / "models.json"
+            os.mkfifo(p, 0o644)
+            notice = _tighten_config_perms(p)
+            self.assertIsNotNone(notice)
+            self.assertTrue(notice.startswith("\u26a0"))
+            self.assertIn("not a regular file", notice)

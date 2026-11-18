@@ -1,0 +1,636 @@
+"""Expanded-view (fidelity-3) semgrep for macro-hidden sink coverage.
+
+Pattern rules match the source AS WRITTEN — anything hidden behind a
+macro (``LIST_FOREACH`` wrappers, lock macros, allocator wrappers) is
+invisible to them.  This module runs semgrep against the fidelity-3
+preprocessor-expanded view built by
+:mod:`core.audit.preprocessor_view` and translates match line numbers
+back through the linemarker line map to ORIGINAL file coordinates.
+
+Two consumers:
+
+* :func:`core.audit.sweep.run_semgrep_sweep` — second pass when the
+  plain pass produced no in-range match and the function's source
+  shows macro invocations (cheap textual gate).  A confirmed match is
+  evidence-stamped distinctly (``semgrep:<rule>:expanded``) so
+  downstream review can see it came from the expanded view.
+* the ``--expanded-semgrep`` /scan stage — re-runs the loaded ruleset
+  over expanded views of macro-heavy TUs, emitting findings with
+  original-coordinate locations and an ``expanded_view`` marker.
+
+Noise policy: ONLY matches whose expanded line maps back to a line
+inside the file being examined are kept.  System-header expansion has
+``None`` map entries and other-file (header) expansion maps elsewhere
+— both are dropped with a debug log, never surfaced as findings.
+
+Failure policy: preprocess failure (missing generated headers, exotic
+dialects) is a degraded result with a reason — never an exception that
+kills the caller and never a fabricated view.
+
+Bounds: expansion reuses preprocessor_view's per-run budget convention
+(``_AUGMENT_FILE_CAP`` preprocessor runs); views are cached per file so
+repeated hypotheses against the same TU pay the preprocessor once.
+The semgrep invocation reuses ``packages.semgrep.runner.run_rule`` —
+the same path :mod:`core.audit.sweep` uses.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+from core.atomic_fs import write_bytes_atomically
+from core.detectors.setup import AnalysisSetup
+from core.detectors.semgrep import define_semgrep_detector
+from core.sarif import emit
+from core.run.scratch import temporary_text
+from core.source import read_text_capped
+
+from ._util import safe_join
+from .preprocessor_view import (
+    _AUGMENT_FILE_CAP,
+    _CXX_SUFFIXES,
+    _macro_flags,
+    _macro_candidate,
+    ExpandedView,
+    expand_translation_unit,
+)
+
+logger = logging.getLogger(__name__)
+
+DETECTOR = define_semgrep_detector("expanded-semgrep", "2")
+
+# C-family suffixes eligible for expansion. Headers included for the
+# audit-side second pass (a .h preprocesses fine as a lone TU); the
+# scan-side corpus walks proper TUs only (headers are covered through
+# the TUs that include them).
+_C_FAMILY_SUFFIXES = frozenset({".c", ".h"}) | _CXX_SUFFIXES
+_TU_SUFFIXES = frozenset({".c"}) | (_CXX_SUFFIXES - {".hh", ".hpp", ".hxx"})
+
+_SEMGREP_TIMEOUT_S = 120
+
+# Cheap textual gate: an ALL_CAPS function-like macro invocation.
+# preprocessor_view's prefilter (``_MACRO_INVOCATION_RE``) anchors to
+# column 0 because it hunts DEFINE_HANDLER-style definition
+# generators; here the interesting shapes are also *inside* function
+# bodies (``LIST_FOREACH(...)``, ``SPIN_LOCK(...)``), so the same
+# heuristic is relaxed to a word boundary anywhere on the line.
+_MACRO_USE_RE = re.compile(r"\b[A-Z_][A-Z0-9_]{2,}\s*\(")
+
+
+def is_c_family(file_path: str) -> bool:
+    """Is *file_path* a C/C++ source or header (expandable)?"""
+    return Path(file_path).suffix in _C_FAMILY_SUFFIXES
+
+
+def has_macro_invocation(text: str) -> bool:
+    """Does *text* contain a function-like ALL_CAPS macro invocation?"""
+    return _macro_candidate(text, _MACRO_USE_RE)
+
+
+# ---------------------------------------------------------------------------
+# Per-run expansion budget (preprocessor_view's cap convention) + view cache
+# ---------------------------------------------------------------------------
+
+
+class ExpansionBudget:
+    """Bounded, cached access to fidelity-3 views.
+
+    At most *max_expansions* preprocessor runs are charged; views are
+    cached per target, file and normalized macro flags so re-examining
+    the same preprocessing configuration is free.
+    Failed views are cached too — a TU that will not preprocess should
+    not be retried on every hypothesis.  Thread-safe (the orchestrator
+    sweeps concurrently).
+    """
+
+    def __init__(self, max_expansions: int = _AUGMENT_FILE_CAP) -> None:
+        self.max_expansions = max_expansions
+        self.used = 0
+        self._views: dict[tuple[str, str, tuple[str, ...]], ExpandedView] = {}
+        self._lock = threading.Lock()
+
+    def view_for(
+        self,
+        target_path: Path,
+        file_path: str,
+        *,
+        macro_config: Any = None,
+        out_dir: Path | None = None,
+    ) -> ExpandedView | None:
+        """Cached fidelity-3 view, or None when the budget is spent.
+
+        Cached entries (ok or degraded) never re-charge the budget.
+        """
+        target_path = Path(target_path).absolute()
+        flags = tuple(_macro_flags(macro_config))
+        key = (str(target_path), file_path, flags)
+        with self._lock:
+            if key in self._views:
+                view = self._views[key]
+                return replace(view, errors=list(view.errors))
+            if self.used >= self.max_expansions:
+                return None
+            self.used += 1
+        view = expand_translation_unit(
+            target_path=Path(target_path),
+            file_path=file_path,
+            macro_config=flags,
+            out_dir=out_dir,
+        )
+        with self._lock:
+            self._views[key] = replace(view, errors=list(view.errors))
+        return view
+
+
+# Process-level budget for the audit-side second pass: one orchestrator
+# run is one process, so this bounds the pass exactly the way
+# preprocessor_view's checklist augmentation bounds itself.
+_PROCESS_BUDGET = ExpansionBudget()
+
+
+def _reset_process_budget(max_expansions: int = _AUGMENT_FILE_CAP) -> None:
+    """Test hook: replace the process budget."""
+    global _PROCESS_BUDGET
+    _PROCESS_BUDGET = ExpansionBudget(max_expansions)
+
+
+# ---------------------------------------------------------------------------
+# Audit-side: one (target, file, rule) expanded pass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExpandedRuleResult:
+    """Result of running one semgrep rule against one expanded TU.
+
+    ``matches`` carry ORIGINAL coordinates (``line`` in *file_path*);
+    ``dropped_out_of_file`` counts matches whose origin was a system
+    header / another file (noise, excluded by policy).  ``ok=False``
+    with *reason* is the graceful degradation shape — preprocess
+    failure, budget exhaustion, semgrep failure — never an exception.
+    """
+
+    ok: bool
+    file_path: str
+    rule_config: str = ""
+    matches: list[dict[str, Any]] = field(default_factory=list)
+    dropped_out_of_file: int = 0
+    reason: str = ""
+
+
+def run_expanded_semgrep_rule(
+    *,
+    target_path: Path,
+    file_path: str,
+    rule_config: str,
+    line_start: int = 0,
+    line_end: int = 0,
+    macro_config: Any = None,
+    out_dir: Path | None = None,
+    budget: ExpansionBudget | None = None,
+    timeout: int = _SEMGREP_TIMEOUT_S,
+) -> ExpandedRuleResult:
+    """Run *rule_config* against the fidelity-3 view of *file_path*.
+
+    Produces the expanded view via preprocessor_view (budgeted,
+    cached), writes it to a scratch file with the original suffix
+    (semgrep language detection), runs semgrep on it via the same
+    ``packages.semgrep.runner.run_rule`` path the sweep engine uses,
+    then translates match lines back through the line map.  Only
+    matches mapping to lines inside *file_path* (and inside
+    ``[line_start, line_end]`` when given) are kept.
+    """
+
+    from core.detectors.semgrep import (
+        PreparedInput,
+        PreparationUnavailable,
+        run_semgrep_analysis,
+    )
+
+    @contextmanager
+    def prepare():
+        if not is_c_family(file_path):
+            raise PreparationUnavailable(f"not a C/C++ file: {file_path}")
+        if safe_join(Path(target_path), file_path) is None:
+            raise PreparationUnavailable(f"path escapes target: {file_path}")
+        expansion_budget = budget if budget is not None else _PROCESS_BUDGET
+        view = expansion_budget.view_for(
+            Path(target_path), file_path, macro_config=macro_config, out_dir=out_dir,
+        )
+        if view is None:
+            raise PreparationUnavailable(
+                f"expansion budget exhausted ({expansion_budget.max_expansions} preprocessor runs)",
+            )
+        if not view.ok:
+            raise PreparationUnavailable(
+                "no fidelity-3 view: " + "; ".join(str(e) for e in view.errors),
+            )
+        try:
+            from packages.semgrep.runner import is_available
+        except ImportError as exc:
+            raise PreparationUnavailable(f"semgrep runner unavailable: {exc}") from exc
+        if not is_available():
+            raise PreparationUnavailable("semgrep not installed")
+
+        with temporary_text(
+            view.text, prefix="expanded_", suffix=Path(file_path).suffix or ".c",
+            errors="replace", strict_cleanup=False,
+        ) as scratch:
+            yield PreparedInput(
+                scratch,
+                lambda findings: _translate_file_findings(
+                    view, file_path, findings, line_start=line_start, line_end=line_end,
+                ),
+            )
+
+    execution = run_semgrep_analysis(
+        detector=DETECTOR, prepare=prepare, rule_config=rule_config, timeout=timeout,
+    )
+    state = execution.value
+    if execution.status in ("skipped", "error"):
+        reason = execution.reason
+        if state.invocation_error is not None:
+            reason = f"semgrep on expanded view failed: {state.invocation_error}"
+        elif state.errors:
+            reason = "semgrep errors on expanded view: " + "; ".join(state.errors[:3])
+        logger.debug("expanded_semgrep degraded for %s: %s", file_path, reason)
+        return ExpandedRuleResult(
+            ok=False, file_path=file_path, rule_config=rule_config, reason=reason,
+        )
+    if execution.status == "partial":
+        logger.warning("expanded_semgrep coverage is partial for %s: %s", file_path, execution.reason)
+    return ExpandedRuleResult(
+        ok=True, file_path=file_path, rule_config=rule_config,
+        matches=state.matches, dropped_out_of_file=state.dropped,
+    )
+
+
+def _translate_finding(
+    view: ExpandedView,
+    original_rel: str,
+    finding: Any,
+    *,
+    line_start: int = 0,
+    line_end: int = 0,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Map one match; range exclusions are not counted as attribution noise."""
+    expanded_line = getattr(finding, "line", 0) or 0
+    origin = view.origin_of(expanded_line)
+    if origin is None or origin[0] != original_rel:
+        logger.debug(
+            "expanded-semgrep: dropping match at expanded line %d of %s "
+            "(origin %s — outside the target file)",
+            expanded_line, original_rel, origin[0] if origin else "<unattributable>",
+        )
+        return None, True
+    if (line_start and origin[1] < line_start) or (line_end and origin[1] > line_end):
+        return None, False
+    mapped = {
+        "file": original_rel,
+        "line": origin[1],
+        "expanded_line": expanded_line,
+        "rule_id": getattr(finding, "rule_id", "") or "",
+        "message": getattr(finding, "message", "") or "",
+        "expanded_view": True,
+    }
+    from core.sarif.parser import _coerce_line
+    for source, target in (("column", "expanded_column"), ("line_end", "expanded_line_end"),
+                           ("column_end", "expanded_column_end")):
+        value = _coerce_line(getattr(finding, source, None))
+        if value is not None and value > 0:
+            mapped[target] = value
+    return mapped, False
+
+
+def expanded_location_key(finding: dict[str, Any]) -> tuple[int, ...]:
+    """Identity in the expanded view, never coordinates in the original file."""
+    from core.sarif.parser import _coerce_line
+    return tuple(max(_coerce_line(finding.get(key)) or 0, 0) for key in (
+        "expanded_line", "expanded_column", "expanded_line_end", "expanded_column_end",
+    ))
+
+
+def expanded_finding_key(finding: dict[str, Any]) -> tuple[Any, ...]:
+    """Deduplicate repeated reports, retaining distinct expanded occurrences."""
+    return (finding["rule_id"], finding["file"], finding["line"], expanded_location_key(finding))
+
+
+def _translate_file_findings(
+    view: ExpandedView,
+    file_path: str,
+    findings: list[Any],
+    *,
+    line_start: int,
+    line_end: int,
+) -> tuple[list[dict[str, Any]], int]:
+    matches: list[dict[str, Any]] = []
+    dropped = 0
+    for finding in findings:
+        mapped, noise = _translate_finding(
+            view, file_path.replace(os.sep, "/"), finding,
+            line_start=line_start, line_end=line_end,
+        )
+        dropped += noise
+        if mapped is not None:
+            matches.append(mapped)
+    return matches, dropped
+
+
+# ---------------------------------------------------------------------------
+# Scan-side: expanded corpus of macro-heavy TUs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExpandedTu:
+    """One TU's expanded copy in the scan corpus.
+
+    Expanded copies deliberately preserve the original relative layout
+    inside the scratch root, so ``original_rel`` doubles as the
+    corpus-relative path.
+    """
+
+    original_rel: str
+    view: ExpandedView
+
+
+@dataclass
+class ExpandedCorpus:
+    """Scratch directory of expanded views for the /scan stage."""
+
+    root: Path
+    tus: dict[str, ExpandedTu] = field(default_factory=dict)  # original_rel →
+    candidates_total: int = 0   # macro-heavy TUs discovered
+    expanded: int = 0
+    skipped_budget: int = 0
+    failed: int = 0
+
+    def summary_line(self) -> str:
+        parts = [
+            (
+                f"expanded-semgrep: {self.expanded}/{self.candidates_total} "
+                f"macro-heavy TU(s) expanded"
+            )
+        ]
+        if self.failed:
+            parts.append(f"{self.failed} failed preparation")
+        if self.skipped_budget:
+            parts.append(
+                f"⚠️  {self.skipped_budget} TU(s) SKIPPED by the expansion "
+                f"budget — no silent coverage claim for them"
+            )
+        return "; ".join(parts)
+
+
+def _iter_candidate_tus(target_path: Path) -> list[str]:
+    """Sorted repo-relative C/C++ TU paths, inventory exclusions applied."""
+    from core.inventory.exclusions import DEFAULT_EXCLUDES, should_exclude
+
+    target_path = Path(target_path)
+    tus: list[str] = []
+    for root, subdirs, files in os.walk(target_path, followlinks=False):
+        subdirs[:] = sorted(d for d in subdirs if not d.startswith("."))
+        for name in sorted(files):
+            if Path(name).suffix not in _TU_SUFFIXES:
+                continue
+            rel = os.path.relpath(os.path.join(root, name), target_path)
+            if should_exclude(rel, DEFAULT_EXCLUDES):
+                continue
+            tus.append(rel.replace(os.sep, "/"))
+    return sorted(tus)
+
+
+def build_expanded_corpus(
+    target_path: Path,
+    scratch_root: Path,
+    *,
+    max_tus: int = _AUGMENT_FILE_CAP,
+    macro_config: Any = None,
+    out_dir: Path | None = None,
+    setup: AnalysisSetup | None = None,
+) -> ExpandedCorpus:
+    """Expand macro-heavy TUs into *scratch_root* for a corpus scan.
+
+    Walks the target's C/C++ TUs (inventory exclusion rules reused),
+    keeps files passing the macro-invocation gate, and expands up to
+    *max_tus* of them (preprocessor_view's per-run budget convention).
+    Expanded copies preserve the relative layout and suffix so semgrep
+    language detection and result paths stay predictable.  Best-effort
+    per file; preprocess failures are counted, never raised.
+    """
+    setup = setup if setup is not None else AnalysisSetup()
+    target_path = Path(target_path)
+    scratch_root = Path(scratch_root)
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    # Process-private scratch contract: the expanded copies land at
+    # target-derived relative paths, so a pre-populated or symlinked
+    # scratch root could alias those writes onto foreign files. The
+    # caller owns creating a FRESH dir (mkdtemp under the run dir);
+    # refuse anything else loudly instead of writing into it.
+    if scratch_root.is_symlink():
+        msg = f"expanded-corpus scratch root is a symlink: {scratch_root}"
+        raise ValueError(msg)
+    if any(scratch_root.iterdir()):
+        msg = (
+            f"expanded-corpus scratch root {scratch_root} is not empty "
+            "— pass a fresh process-private directory"
+        )
+        raise ValueError(msg)
+    corpus = ExpandedCorpus(root=scratch_root)
+
+    flags = tuple(_macro_flags(macro_config))
+    budget = max_tus
+    for rel in _iter_candidate_tus(target_path):
+        resolved = safe_join(target_path, rel)
+        if resolved is None:
+            corpus.failed += 1
+            logger.debug("expanded corpus: %s could not be confined to the target", rel)
+            continue
+        # Capped like every migrated core/audit sibling: the
+        # candidate gate buffered whole files, so a planted
+        # multi-hundred-MB "source" cost its full size in peak
+        # memory before being screened. An oversized file is not a
+        # sensible expansion candidate — skip it.
+        got = read_text_capped(resolved, errors="replace")
+        if got is None or got[1]:
+            corpus.failed += 1
+            logger.debug("expanded corpus: %s could not be read within the source budget", rel)
+            continue
+        raw, _ = got
+        if not has_macro_invocation(raw):
+            continue
+        corpus.candidates_total += 1
+        if budget <= 0:
+            corpus.skipped_budget += 1
+            continue
+        budget -= 1
+        view = expand_translation_unit(
+            target_path=target_path,
+            file_path=rel,
+            macro_config=flags,
+            out_dir=out_dir,
+            include_dirs_memo=setup.include_dirs_memo, setup=setup,
+        )
+        if not view.ok:
+            corpus.failed += 1
+            logger.debug(
+                "expanded corpus: %s failed to preprocess: %s",
+                rel, "; ".join(str(e) for e in view.errors),
+            )
+            continue
+        dest = scratch_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Atomic write: belt-and-braces under the fresh-scratch
+            # contract above — os.replace never follows a symlink
+            # planted mid-loop by a concurrent writer. Bytes variant
+            # keeps the old write_text errors="replace" behaviour.
+            write_bytes_atomically(
+                dest, view.text.encode("utf-8", errors="replace"),
+            )
+        except OSError as exc:
+            corpus.failed += 1
+            logger.debug("expanded corpus: could not write %s: %s", dest, exc)
+            continue
+        corpus.expanded += 1
+        corpus.tus[rel] = ExpandedTu(original_rel=rel, view=view)
+
+    if corpus.skipped_budget:
+        logger.warning(
+            "expanded-semgrep: expansion budget reached — %d of %d "
+            "macro-heavy TU(s) expanded; %d SKIPPED",
+            corpus.expanded, corpus.candidates_total, corpus.skipped_budget,
+        )
+    return corpus
+
+
+def _rel_in_corpus(root: Path, finding_file: str) -> str | None:
+    """Corpus-relative path for a semgrep finding location, or None.
+
+    Semgrep spells result paths differently across versions and
+    invocation shapes (absolute, relative to the scanned dir, relative
+    to the cwd) — resolve all three against the corpus root.
+    """
+    if not finding_file:
+        return None
+    try:
+        root_real = os.path.realpath(root)
+    except OSError:
+        return None
+    p = Path(finding_file)
+    candidates = [p] if p.is_absolute() else [root / p, Path.cwd() / p]
+    for cand in candidates:
+        try:
+            real = os.path.realpath(cand)
+        except OSError:
+            continue
+        if real.startswith(root_real + os.sep) and os.path.isfile(real):
+            return os.path.relpath(real, root_real).replace(os.sep, "/")
+    return None
+
+
+def translate_corpus_findings(
+    corpus: ExpandedCorpus,
+    findings: list[Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Translate corpus-scan findings back to original coordinates.
+
+    Returns ``(translated, dropped)``.  Kept findings are dicts with
+    ``file`` (original repo-relative path), ``line`` (original line),
+    ``expanded_line``, ``rule_id``, ``message`` and the
+    ``expanded_view`` marker.  Matches in unattributable regions
+    (system headers) or mapping into a different file than the TU that
+    pulled them in are dropped with a debug log. Exact repeated expanded
+    occurrences collapse; distinct matches sharing an original line survive.
+    """
+    translated: list[dict[str, Any]] = []
+    dropped = 0
+    seen: set[tuple[Any, ...]] = set()
+    # The prepared corpus is immutable during this call. Bound both entries
+    # and key length; no filesystem result is reused by a later translation.
+    paths: dict[str, str | None] = {}
+    for finding in findings:
+        f_file = getattr(finding, "file", "") or ""
+        if not isinstance(f_file, str):
+            dropped += 1
+            continue
+        if f_file in paths:
+            rel = paths[f_file]
+        else:
+            rel = _rel_in_corpus(corpus.root, f_file)
+            if len(paths) < 256 and len(f_file) <= 4096:
+                paths[f_file] = rel
+        tu = corpus.tus.get(rel) if rel else None
+        if tu is None:
+            dropped += 1
+            logger.debug(
+                "expanded-semgrep: dropping match in %r (not a corpus TU)",
+                f_file,
+            )
+            continue
+        mapped, noise = _translate_finding(tu.view, tu.original_rel, finding)
+        dropped += noise
+        if mapped is None:
+            continue
+        key = expanded_finding_key(mapped)
+        if key not in seen:
+            seen.add(key)
+            translated.append(mapped)
+    return translated, dropped
+
+
+# ---------------------------------------------------------------------------
+# SARIF for the /scan stage
+# ---------------------------------------------------------------------------
+
+_SARIF_SCHEMA_URI = emit.SCHEMA_URI_COMMITTEE
+_TOOL_NAME = "semgrep-expanded"
+
+
+def findings_to_sarif(findings: list[dict[str, Any]]) -> dict[str, Any]:
+    """SARIF 2.1.0 document for translated expanded-view findings.
+
+    Distinct ``tool.driver.name`` (``semgrep-expanded``) keeps these
+    results a separate run in combined.sarif — downstream review sees
+    the marker instead of silently mixing expanded-view hits into the
+    plain semgrep run.  Every result carries
+    ``properties.expanded_view: true`` and original coordinates.
+    """
+    rule_index = emit.RuleIndex()
+    results: list[dict[str, Any]] = []
+    for f in findings:
+        rule_id = f.get("rule_id") or "(unnamed)"
+        rule_index.add(emit.minimal_rule(rule_id))
+        point = expanded_location_key(f)
+        properties = {"expanded_view": True, "expanded_line": point[0]}
+        for key, value in zip(("expanded_column", "expanded_line_end", "expanded_column_end"), point[1:]):
+            if value:
+                properties[key] = value
+        result = emit.result(
+            rule_id,
+            f.get("message") or f"{rule_id} matched "
+            "(fidelity-3 expanded view)",
+            [emit.location(f.get("file", ""),
+                           {"startLine": f.get("line", 0)})],
+            properties=properties,
+        )
+        if point[0]:
+            result["partialFingerprints"] = {
+                "raptor/expandedLocation/v1": ":".join(str(value) for value in point),
+            }
+        results.append(result)
+    return emit.document(
+        [emit.run(
+            _TOOL_NAME, rule_index.rules(), results,
+            full_name="Semgrep over fidelity-3 preprocessor-"
+                      "expanded views (macro-hidden sinks)",
+        )],
+        schema_uri=_SARIF_SCHEMA_URI,
+    )

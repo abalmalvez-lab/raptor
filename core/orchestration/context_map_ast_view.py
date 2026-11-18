@@ -65,16 +65,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 def enrich_with_ast_view(
-    context_map: Dict[str, Any],
+    context_map: dict[str, Any],
     target_path: Path,
     *,
-    inventory: Optional[Dict[str, Any]] = None,
+    inventory: dict[str, Any] | None = None,
 ) -> int:
     """Walk ``context_map``'s ``entry_points`` and ``sinks`` lists
     and attach an ``ast_view`` field to each entry whose
@@ -90,7 +90,7 @@ def enrich_with_ast_view(
     if not isinstance(context_map, dict):
         return 0
 
-    sections: List[List[Any]] = []
+    sections: list[list[Any]] = []
     for key in ("entry_points", "sinks"):
         sec = context_map.get(key)
         if isinstance(sec, list) and sec:
@@ -101,9 +101,9 @@ def enrich_with_ast_view(
     if inventory is None:
         try:
             from core.inventory.builder import build_inventory
-            import tempfile
-            with tempfile.TemporaryDirectory() as td:
-                inventory = build_inventory(str(target_path), td)
+            from core.run.scratch import scratch_dir
+            with scratch_dir("raptor-orchestration-inventory-") as td:
+                inventory = build_inventory(str(target_path), str(td))
         except Exception as e:                              # noqa: BLE001
             logger.debug(
                 "context_map_ast_view: inventory build failed (%s); "
@@ -113,7 +113,7 @@ def enrich_with_ast_view(
 
     try:
         from core.ast import view
-        from core.inventory.reachability import enclosing_function
+        from core.analysis.reachability import enclosing_function
     except ImportError:
         return 0
 
@@ -165,9 +165,7 @@ def enrich_with_ast_view(
             try:
                 fv = view(abs_path, host.name, at_line=line)
             except Exception:                              # noqa: BLE001
-                # core.ast.view is documented as returning None on
-                # error, but defensively swallow exceptions too —
-                # one bad entry must not block the rest.
+                logger.debug("ast view failed for %s:%s", abs_path, line, exc_info=True)
                 continue
             if fv is None:
                 continue

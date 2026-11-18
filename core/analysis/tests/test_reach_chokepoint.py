@@ -1,0 +1,276 @@
+"""Tests for the shared reachability-chokepoint helper.
+
+The chokepoint helper is the single source of truth for "should this
+finding be suppressed?" — both /agentic and /codeql consult it. The
+adversarial review (P0-C-1, P0-C-2) flagged silent-drop risks from
+copy-paste-reductionism in the prior /agentic implementation:
+absolute paths, file:// URIs, and language-incorrect module strings.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from core.analysis.reach_chokepoint import (
+    check_suppress,
+    normalise_path,
+    path_to_module,
+)
+
+
+# ---------------------------------------------------------------------------
+# normalise_path
+# ---------------------------------------------------------------------------
+
+def test_normalise_path_strips_file_uri_prefix(tmp_path: Path) -> None:
+    rel = normalise_path(f"file://{tmp_path}/src/util.c", tmp_path)
+    assert rel == "src/util.c"
+
+
+def test_normalise_path_makes_absolute_relative_to_repo(
+    tmp_path: Path,
+) -> None:
+    rel = normalise_path(str(tmp_path / "lib" / "x.c"), tmp_path)
+    assert rel == "lib/x.c"
+
+
+def test_normalise_path_rejects_absolute_outside_repo(
+    tmp_path: Path,
+) -> None:
+    """Absolute path that's not under repo_root → None. Suppression
+    must NOT fire on files outside the analysed tree."""
+    other = tmp_path.parent
+    rel = normalise_path(str(other / "elsewhere" / "x.c"), tmp_path)
+    assert rel is None
+
+
+def test_normalise_path_strips_leading_dot_slash(tmp_path: Path) -> None:
+    rel = normalise_path("./src/x.c", tmp_path)
+    assert rel == "src/x.c"
+
+
+def test_normalise_path_preserves_relative(tmp_path: Path) -> None:
+    rel = normalise_path("src/util.c", tmp_path)
+    assert rel == "src/util.c"
+
+
+def test_normalise_path_empty_returns_none(tmp_path: Path) -> None:
+    assert normalise_path("", tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# path_to_module
+# ---------------------------------------------------------------------------
+
+def test_path_to_module_python() -> None:
+    assert path_to_module("packages/foo/bar.py") == "packages.foo.bar"
+
+
+def test_path_to_module_c() -> None:
+    """Adversarial review P0-C-2: for non-Python languages, the prior
+    /agentic hook passed the LITERAL path string as ``module`` because
+    its derivation was python-only. The shared helper strips the
+    extension uniformly across languages."""
+    assert path_to_module("src/util.c") == "src.util"
+    assert path_to_module("src/lib.cc") == "src.lib"
+    assert path_to_module("src/lib.cpp") == "src.lib"
+
+
+def test_path_to_module_rust() -> None:
+    assert path_to_module("src/main.rs") == "src.main"
+
+
+def test_path_to_module_no_extension_returns_none() -> None:
+    """A path with no extension (Makefile, README) can't yield a
+    sensible module — return None rather than fabricate one."""
+    assert path_to_module("Makefile") is None
+    assert path_to_module("") is None
+
+
+# ---------------------------------------------------------------------------
+# check_suppress — integration of override + path/module + verdict
+# ---------------------------------------------------------------------------
+
+def _checklist_with_absent_function(
+    file_path: str, name: str, line: int = 1,
+) -> dict:
+    """A classifier observation without source/build correspondence."""
+    return {"files": [{
+        "path": file_path, "language": "c",
+        "items": [{
+            "name": name, "kind": "function", "line_start": line,
+            "metadata": {"binary_oracle": {
+                "classification": "absent",
+                "binaries": [{"tier": "full", "path": "/b"}],
+            }},
+        }],
+    }]}
+
+
+def _checklist_with_lexically_dead_function(file_path: str, name: str, line: int = 1) -> dict:
+    # Consumer fixture for the existing structural predicate; no execution claim.
+    return {"files": [{"path": file_path, "language": "c", "items": [{
+        "name": name, "kind": "function", "line_start": line, "lexical_dead": True,
+    }]}]}
+
+
+def test_check_suppress_withholds_unproven_absent_full_tier(tmp_path: Path) -> None:
+    checklist = _checklist_with_absent_function("src/util.c", "helper", 5)
+    decision = check_suppress(
+        checklist=checklist,
+        file_path="src/util.c",
+        function_name="helper",
+        line=5,
+        repo_root=tmp_path,
+    )
+    assert decision is None
+
+
+def test_check_suppress_respects_manual_override(tmp_path: Path) -> None:
+    checklist = _checklist_with_lexically_dead_function("src/util.c", "helper", 5)
+    decision = check_suppress(
+        checklist=checklist,
+        file_path="src/util.c",
+        function_name="helper",
+        line=5,
+        repo_root=tmp_path,
+        manual_override=True,
+    )
+    assert decision is None
+
+
+def test_check_suppress_respects_allow_unreachable(
+    tmp_path: Path,
+) -> None:
+    checklist = _checklist_with_lexically_dead_function("src/util.c", "helper", 5)
+    decision = check_suppress(
+        checklist=checklist,
+        file_path="src/util.c",
+        function_name="helper",
+        line=5,
+        repo_root=tmp_path,
+        allow_unreachable=True,
+    )
+    assert decision is None
+
+
+def test_check_suppress_handles_absolute_finding_path(
+    tmp_path: Path,
+) -> None:
+    """Adversarial review P0-C-1: SARIF emitters often produce
+    absolute paths; the chokepoint MUST normalise via the shared
+    helper, not pass the absolute path verbatim to the inventory
+    lookup (which would miss every time)."""
+    checklist = _checklist_with_lexically_dead_function("src/util.c", "helper", 5)
+    decision = check_suppress(
+        checklist=checklist,
+        file_path=str(tmp_path / "src" / "util.c"),  # ABSOLUTE
+        function_name="helper",
+        line=5,
+        repo_root=tmp_path,
+    )
+    assert decision is not None
+    assert decision[0] == "lexical_dead"
+
+
+def test_check_suppress_handles_file_uri_finding_path(
+    tmp_path: Path,
+) -> None:
+    checklist = _checklist_with_lexically_dead_function("src/util.c", "helper", 5)
+    decision = check_suppress(
+        checklist=checklist,
+        file_path=f"file://{tmp_path}/src/util.c",
+        function_name="helper",
+        line=5,
+        repo_root=tmp_path,
+    )
+    assert decision is not None
+
+
+def test_check_suppress_string_false_manual_override_is_not_truthy(
+    tmp_path: Path,
+) -> None:
+    """``"false"`` (string) must be coerced to bool-False rather than
+    treated as truthy (Python ``bool("false")`` is True). Otherwise an
+    emitter writing ``"manual_override": "false"`` would accidentally
+    bypass the chokepoint."""
+    checklist = _checklist_with_lexically_dead_function("src/util.c", "helper", 5)
+    decision = check_suppress(
+        checklist=checklist,
+        file_path="src/util.c",
+        function_name="helper",
+        line=5,
+        repo_root=tmp_path,
+        manual_override="false",
+    )
+    # "false" → False → suppression fires
+    assert decision is not None
+
+
+def test_coerce_manual_override_shared_convention() -> None:
+    """One coercion for every consumer (reachability suppression, the
+    SAGE prior-verdict skip): string-False shapes are False, anything
+    affirmatively truthy is True."""
+    from core.analysis.reach_chokepoint import coerce_manual_override
+
+    for falsy in (None, False, 0, "", "false", "FALSE", " 0 ", "no",
+                  "off"):
+        assert coerce_manual_override(falsy) is False, falsy
+    for truthy in (True, 1, "true", "yes", "1", "on", "anything"):
+        assert coerce_manual_override(truthy) is True, truthy
+
+
+def test_sage_fp_skip_honours_manual_override() -> None:
+    """Wiring pin: the /agentic SAGE prior-verdict skip gates on the
+    per-finding manual_override via the shared coercion — previously
+    only the run-wide env kill switch applied."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[3]
+    src = (root / "packages" / "llm_analysis" / "agent.py").read_text(
+        encoding="utf-8")
+    recall_at = src.index("recall_prior_finding_verdict(")
+    gate_at = src.index(
+        "coerce_manual_override(\n"
+        "                            finding.get(\"manual_override\"))")
+    assert gate_at < recall_at, (
+        "the manual_override gate must run before the SAGE recall"
+    )
+
+
+def test_record_suppression_swallows_unserialisable_extra(tmp_path):
+    # The best-effort contract must be structural: a producer
+    # smuggling a non-serialisable value through ``extra`` raises
+    # TypeError/ValueError inside the JSON writer — that must be
+    # logged and swallowed, never propagate into the caller's
+    # pipeline.
+    from core.analysis.reach_chokepoint import record_suppression
+    record_suppression(
+        tmp_path, finding={"finding_id": "f1"},
+        verdict="binary_oracle_absent", reason="r",
+        extra={"bad": object()},
+    )
+    # No record written, no exception raised.
+    p = tmp_path / "suppressions.jsonl"
+    assert not p.exists() or "f1" not in p.read_text()
+
+
+def test_non_numeric_line_does_not_raise(tmp_path):
+    """check_suppress(line="N/A") raised ValueError out of the
+    chokepoint into the /agentic + /codeql consumer loops — the one
+    raw coercion on an otherwise shape-tolerated path. A non-numeric
+    line reads as line 0 ("no line")."""
+    from core.analysis.reach_chokepoint import check_suppress
+    checklist = {"files": [{"path": "pkg/mod.py", "items": [
+        {"name": "f", "line_start": 1, "kind": "function"},
+    ], "call_graph": {"calls": [], "imports": {}}}]}
+    for odd_line in ("N/A", "", None, [], {}):
+        result = check_suppress(
+            checklist=checklist,
+            file_path="pkg/mod.py",
+            function_name="f",
+            line=odd_line,
+            repo_root=str(tmp_path),
+        )
+        # Verdict content is classifier-dependent; the contract under
+        # test is only "never raises on a hostile/odd line shape".
+        assert result is None or isinstance(result, tuple)

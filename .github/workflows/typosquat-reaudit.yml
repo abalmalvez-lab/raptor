@@ -1,0 +1,110 @@
+name: Typosquat reviewed-legit re-audit
+
+# Step 3 of the typosquat-denylist curation loop (design/typosquat-denylist-
+# curation.md): monthly MECHANICAL re-audit of the auto-/hand-filed
+# reviewed-legit list. Auto-filed 'legit' names are suppressed from the
+# candidate queue forever, so this re-checks each one's CURRENT registry state
+# and flags any contradiction — removed, now deprecated, or now carrying a
+# confirmed-malicious (MAL-) OSV advisory (the litellm/node-ipc "trusted name
+# turned bad" class). All ground-truth signal, NO LLM (CI has none), so it runs
+# here and opens an issue. The deeper LLM re-examination is operator-side
+# (`raptor-sca triage`).
+
+on:
+  schedule:
+    # 07:00 UTC on the 1st of each month.
+    - cron: '0 7 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write          # to open / comment the re-audit issue
+
+concurrency:
+  group: typosquat-reaudit
+  cancel-in-progress: false
+
+env:
+  VENV_PATH: .venv
+
+jobs:
+  reaudit:
+    # Upstream maintenance only, including manual dispatch.
+    if: github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        # Hash-pinned per design/sca.md §1045 (re-run raptor-sca fix
+        # --cve-only --hash-pin after a minor bump).
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - name: Restore or rebuild runtime venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-runtime
+          uv-export-extra-args: --no-dev
+          save-on-rebuild: 'true'
+
+      - name: Expose runtime interpreter to subsequent steps
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
+              output.write(str(Path(os.environ["VENV_PATH"]).resolve() / "bin") + "\n")
+          PYTHON
+
+      - name: Re-audit reviewed-legit (mechanical, no LLM)
+        # Writes a markdown report to RUNNER_TEMP (never the repo); empty when
+        # nothing is flagged. Routes through the SCA egress-controlled client
+        # (registries + api.osv.dev are on SCA_ALLOWED_HOSTS).
+        run: |
+          set -euo pipefail
+          python -m packages.sca.supply_chain.typosquat_audit --reaudit \
+            --out "$RUNNER_TEMP/reaudit.md"
+
+      - name: Open / update issue when entries are flagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # gh is first-party + pre-installed. Find an open re-audit issue and
+        # comment on it (avoids a monthly pile-up); else open one. Dedup is by
+        # TITLE (a stable title) — no bespoke label, so this stays on the
+        # standardised SCA bot-label scheme (#681): the only labels applied are
+        # the canonical ``automated`` + ``sca`` pair (as refit-sca-calibration
+        # does). Labels are best-effort — a missing label must never fail the
+        # run (see sca-self-bump / refresh-sca-data).
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/reaudit.md"
+          if [ ! -s "$REPORT" ]; then
+            echo "No reviewed-legit entries flagged this month."
+            exit 0
+          fi
+          TITLE="chore(sca): typosquat reviewed-legit re-audit flags"
+          existing=$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty" \
+            2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$REPORT"
+            echo "Updated re-audit issue #$existing"
+          else
+            num=$(gh issue create --title "$TITLE" --body-file "$REPORT")
+            echo "Opened re-audit issue $num"
+            # Standardised SCA bot labels only (best-effort).
+            for lbl in automated sca; do
+              gh issue edit "$num" --add-label "$lbl" 2>/dev/null \
+                || echo "label '$lbl' not in repo; skipping"
+            done
+          fi

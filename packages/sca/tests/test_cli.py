@@ -1,0 +1,195 @@
+"""Tests for ``packages.sca.cli`` — exit codes, output paths, flag plumbing."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import pytest
+
+from core.testing.logging_state import isolated_cli_logging
+from packages.sca import cli, pipeline
+
+
+@pytest.fixture
+def offline_target(tmp_path: Path) -> Path:
+    """Empty repo with one trivial manifest — runs without network."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package.json").write_text('{"dependencies": {"x": "*"}}',
+                                       encoding="utf-8")
+    return repo
+
+
+@isolated_cli_logging()
+def test_main_returns_2_when_target_missing(tmp_path: Path) -> None:
+    rc = cli.main([str(tmp_path / "nope")])
+    assert rc == 2
+
+
+@isolated_cli_logging()
+def test_main_returns_2_when_target_not_a_directory(tmp_path: Path) -> None:
+    f = tmp_path / "file"
+    f.write_text("x")
+    rc = cli.main([str(f)])
+    assert rc == 2
+
+
+@isolated_cli_logging()
+def test_main_writes_findings_and_report(
+    offline_target: Path, tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    rc = cli.main([str(offline_target), "--out", str(out), "--offline"])
+    assert rc == 0
+    assert (out / "findings.json").exists()
+    assert (out / "report.md").exists()
+    rows = json.loads((out / "findings.json").read_text())
+    assert isinstance(rows, list)
+
+
+@isolated_cli_logging()
+def test_main_default_out_dir_is_timestamped(
+    offline_target: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    """Without --out the run lands under ./out/sca-<ts>/."""
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main([str(offline_target), "--offline"])
+    assert rc == 0
+    out_root = tmp_path / "out"
+    assert out_root.exists()
+    runs = list(out_root.iterdir())
+    assert len(runs) == 1
+    assert runs[0].name.startswith("sca-")
+    assert (runs[0] / "findings.json").exists()
+
+
+@isolated_cli_logging()
+def test_main_runtime_error_returns_3(
+    offline_target: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    """If the pipeline raises, the CLI returns 3 rather than crashing."""
+    def boom(**_):
+        raise RuntimeError("synthetic pipeline failure")
+    monkeypatch.setattr(pipeline, "run_sca", boom)
+    monkeypatch.setattr(cli, "run_sca", boom)
+    rc = cli.main([str(offline_target), "--out", str(tmp_path / "out"),
+                   "--offline"])
+    assert rc == 3
+
+
+@isolated_cli_logging()
+def test_flags_propagate_to_run_sca(
+    offline_target: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    captured: Dict[str, Any] = {}
+
+    def fake_run_sca(*, target, output_dir, options):
+        captured["target"] = target
+        captured["options"] = options
+        # Return a minimal RunResult-shaped object for _print_summary.
+        from packages.sca.pipeline import RunResult
+        return RunResult(
+            target=target, output_dir=output_dir,
+            findings_path=output_dir / "findings.json",
+            report_path=output_dir / "report.md",
+            sbom_path=output_dir / "sbom.cdx.json",
+            sarif_path=output_dir / "findings.sarif",
+            deps_analysed=0, vuln_findings=0, hygiene_findings=0,
+            supply_chain_findings=0, suppressed_findings=0,
+            in_kev=0, cache_hits=0, cache_misses=0,
+        )
+
+    monkeypatch.setattr(cli, "run_sca", fake_run_sca)
+    rc = cli.main([
+        str(offline_target),
+        "--out", str(tmp_path / "out"),
+        "--offline", "--no-cache",
+        "--no-kev", "--no-epss",
+        "--cache-root", str(tmp_path / "cache"),
+    ])
+    assert rc == 0
+    options = captured["options"]
+    assert options.offline is True
+    assert options.no_cache is True
+    assert options.enable_kev is False
+    assert options.enable_epss is False
+    assert options.cache_root == tmp_path / "cache"
+
+
+@isolated_cli_logging()
+def test_verbose_flag_lowers_log_level(
+    offline_target: Path, tmp_path: Path,
+) -> None:
+    """``-v`` and ``-vv`` switch logging level; just verify CLI still
+    succeeds end-to-end."""
+    rc = cli.main([str(offline_target), "--out", str(tmp_path / "out"),
+                   "--offline", "-vv"])
+    assert rc == 0
+
+
+def test_transitive_skip_line_escapes_resolver_stderr_bytes() -> None:
+    """The skip-reason headline quotes resolver stderr, which echoes
+    hostile-manifest bytes — control characters must be escaped
+    before the default-scan summary line reaches the terminal."""
+    from types import SimpleNamespace
+
+    from packages.sca.transitive import TransitiveStatus
+
+    status = TransitiveStatus(
+        manifest=Path("requirements.txt"),
+        ecosystem="PyPI",
+        method="skipped_no_method_succeeded",
+        reason="pip failed: \x1b[2Jboom \x9bhidden",
+    )
+    result = SimpleNamespace(
+        transitive_statuses=[status], transitive_added=0,
+    )
+    line = cli._format_transitive_line(result)
+    assert line is not None
+    assert "\x1b" not in line
+    assert "\x9b" not in line
+    assert "pip failed" in line
+
+
+# ---------------------------------------------------------------------------
+# fix positional translation — value-flag set derived from update.py
+# ---------------------------------------------------------------------------
+
+
+def test_positional_translation_survives_exclude_orderings() -> None:
+    """--exclude takes a value; a hand-typed value-flag set drifted and
+    mistranslated it. ``fix --exclude GLOB /repo`` must keep the glob
+    as the flag's value and translate the bare path."""
+    from packages.sca.cli import _positional_to_target_flag
+
+    assert _positional_to_target_flag(
+        ["--exclude", "**/tests/**", "/repo"],
+    ) == ["--exclude", "**/tests/**", "--target", "/repo"]
+
+
+def test_positional_translation_never_swallows_a_flag_value() -> None:
+    """``--findings f.json --exclude g``: g is --exclude's VALUE, not a
+    droppable positional — swallowing it left a dangling --exclude."""
+    from packages.sca.cli import _positional_to_target_flag
+
+    assert _positional_to_target_flag(
+        ["--findings", "f.json", "--exclude", "g"],
+    ) == ["--findings", "f.json", "--exclude", "g"]
+
+
+def test_value_flag_set_is_derived_from_the_update_parser() -> None:
+    """Closure: the translation's value-flag universe comes from
+    update.py's own parser (every option that consumes a value), so a
+    new flag can never silently reintroduce the drift."""
+    from packages.sca.update import value_flags
+
+    flags = value_flags()
+    assert "--exclude" in flags
+    assert "--format" in flags
+    assert "--findings" in flags
+    # store_true flags consume nothing and must NOT be here — marking
+    # one as value-taking would swallow the operand after it.
+    assert "--apply" not in flags
+    assert "--allow-major" not in flags

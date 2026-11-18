@@ -13,20 +13,47 @@ developer manually flips the sysctl.
 
 from __future__ import annotations
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
 import sys as _sys
 import pytest as _pytest
+
+import pytest
+from core.testing.module_bindings import patch_module_attribute
+
+
+from core.testing.module_state import isolated_module_state
+
+
+@pytest.fixture(autouse=True)
+def _isolate_subprocess_launch_patches(monkeypatch):
+    """Keep launch mocks on consumer-owned subprocess module bindings."""
+    import core.sandbox._spawn as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "subprocess", "run", consumer_0.subprocess.run,
+    )
+
+
 pytestmark = _pytest.mark.skipif(
     _sys.platform != "linux",
     reason="Linux-only sandbox internals (mount-ns / Landlock / seccomp / ptrace tracer / pid1 shim) — see core/sandbox/_macos_spawn.py for the macOS path",
 )
 
 
-import os
-import shutil
-import sys
-import tempfile
-import unittest
-from pathlib import Path
+import os  # noqa: E402
+import shutil  # noqa: E402
+import sys  # noqa: E402
+import tempfile  # noqa: E402
+import unittest  # noqa: E402
+from pathlib import Path  # noqa: E402
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 
 def _mount_ns_usable() -> bool:
@@ -42,9 +69,16 @@ def _mount_ns_usable() -> bool:
 class TestMountNSAvailableProbe(unittest.TestCase):
     """mount_ns_available() — correctness of the runtime probe."""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _owned_probe_cache(self, monkeypatch):
         from core.sandbox import state
-        state._mount_ns_available_cache = None
+        with isolated_module_state(state, {'_mount_ns_available_cache': None, '_newuidmap_path_cache': None, '_newgidmap_path_cache': None}, lock=state._cache_lock):
+            try:
+                yield
+            finally:
+                monkeypatch.undo()
+
+
 
     def test_returns_bool(self):
         from core.sandbox._spawn import mount_ns_available
@@ -99,9 +133,16 @@ class TestRunSandboxedSmokeTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_basic_execvp(self):
         """Fork+newuidmap+mount+Landlock+seccomp+exec chain runs. The
-        child sees itself as PID 1 (pid-ns) and uid 0 (user-ns-mapped)."""
+        child sees itself as PID 2 (pid-ns — the in-ns init waiter is
+        PID 1, so the TARGET keeps normal kill(2) signal semantics;
+        a PID-1 target had abort()/raise() identities distorted by
+        the kernel's pid-1 filter) and uid 0 (user-ns-mapped)."""
         from core.sandbox._spawn import run_sandboxed
         r = run_sandboxed(
             ["sh", "-c", "echo pid=$$; id -u"],
@@ -118,10 +159,15 @@ class TestRunSandboxedSmokeTest(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, f"stderr: {r.stderr!r}")
-        # PID 1 inside the pid-ns, uid 0 inside the user-ns.
-        self.assertIn("pid=1", r.stdout)
+        # PID 2 inside the pid-ns (PID 1 is the init waiter), uid 0
+        # inside the user-ns.
+        self.assertIn("pid=2", r.stdout)
         self.assertIn("0", r.stdout.splitlines()[-1])
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_target_visible_at_original_path(self):
         """Caller's target dir is bind-mounted at its original absolute
         path inside the sandbox, so argv referring to the host path
@@ -145,6 +191,10 @@ class TestRunSandboxedSmokeTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"stderr: {r.stderr!r}")
         self.assertIn("MARKER-CONTENT", r.stdout)
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_output_writable_inside_sandbox(self):
         """A file created in output by the child survives the sandbox."""
         from core.sandbox._spawn import run_sandboxed
@@ -167,15 +217,27 @@ class TestRunSandboxedSmokeTest(unittest.TestCase):
                         "file created by sandboxed child should persist "
                         "because output is bind-mounted writable")
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_tmp_is_fresh_per_sandbox(self):
         """Per-sandbox tmpfs /tmp — content the caller placed in host
         /tmp is NOT visible inside the sandbox (except the bind-mounted
         target/output path). This is the main isolation win over
         Landlock-only mode."""
         from core.sandbox._spawn import run_sandboxed
-        canary = f"/tmp/.raptor-canary-{os.getpid()}"
-        Path(canary).write_text("SHOULD-NOT-BE-VISIBLE\n")
-        try:
+        # The canary must live in the HOST /tmp root: this test proves the
+        # per-sandbox tmpfs shadows /tmp *itself*, so a nested tmp_path
+        # wouldn't exercise the mount. NamedTemporaryFile gives a
+        # collision-free name and cleans up even when an assert fails —
+        # no hand-rolled os.getpid() name or try/finally unlink.
+        with tempfile.NamedTemporaryFile(
+            dir="/tmp", prefix=".raptor-canary-", mode="w",
+        ) as cf:
+            cf.write("SHOULD-NOT-BE-VISIBLE\n")
+            cf.flush()
+            canary = cf.name
             r = run_sandboxed(
                 ["sh", "-c", f"cat {canary} 2>&1 || echo GONE"],
                 target=self.tmp.name, output=self.tmp.name,
@@ -193,9 +255,88 @@ class TestRunSandboxedSmokeTest(unittest.TestCase):
             self.assertIn("GONE", r.stdout,
                           "/tmp canary leaked into sandboxed view — "
                           "per-sandbox tmpfs isolation broken")
-        finally:
-            os.unlink(canary)
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
+    def test_readable_file_under_target_bind_no_eexist(self):
+        """A readable_paths FILE living under the target bind must not
+        abort the spawn. The step-8 target bind already populates the
+        mount point inside the namespace, so the extra_ro_paths stub
+        creation (O_CREAT|O_EXCL) hit EEXIST and the child exited 126 —
+        observed as flaky sandboxed runs whenever the scanned tree
+        names its own helper files in readable_paths. Duplicated entry
+        exercises the same-path-twice variant of the flake."""
+        from core.sandbox._spawn import run_sandboxed
+        helper = Path(self.tmp.name) / "libexec" / "helper.sh"
+        helper.parent.mkdir()
+        helper.write_text("HELPER-CONTENT\n")
+        out = tempfile.TemporaryDirectory()
+        self.addCleanup(out.cleanup)
+        r = run_sandboxed(
+            ["cat", str(helper)],
+            target=self.tmp.name, output=out.name,
+            block_network=True,
+            nproc_limit=1024,
+            limits={"memory_mb": 0, "max_file_mb": 10240, "cpu_seconds": 300},
+            writable_paths=[out.name, "/tmp"],
+            # One file under the target bind, one duplicate, and the
+            # parent dir under the same bind — every shape that used
+            # to hit the O_EXCL stub open.
+            readable_paths=[str(helper), str(helper), str(helper.parent)],
+            allowed_tcp_ports=None,
+            seccomp_profile=None, seccomp_block_udp=False,
+            env=None, cwd=None, timeout=15,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(
+            r.returncode, 0,
+            f"spawn aborted (rc={r.returncode}) — extra_ro_paths stub "
+            f"creation must tolerate paths already served by the "
+            f"target bind; stderr: {r.stderr!r}",
+        )
+        self.assertIn("HELPER-CONTENT", r.stdout)
+
+    @requires_userns
+    def test_tmp_resident_target_is_read_only(self):
+        """A target under /tmp must NOT be writable through its bind.
+
+        Host /tmp is typically mounted nosuid,nodev; the read-only
+        remount used to drop those locked flags, the kernel refused it
+        with EPERM in the user namespace, and the fallback "relying on
+        Landlock" was no backstop for /tmp-resident targets (the
+        Landlock writable baseline covers /tmp — the per-sandbox-tmpfs
+        rationale). Net effect: scanned-tree self-modification through
+        a supposedly read-only bind. The remount now repeats the
+        source mount's flags; the write must fail with EROFS."""
+        from core.sandbox._spawn import run_sandboxed
+        tgt = tempfile.TemporaryDirectory(prefix="raptor-rotgt-", dir="/tmp")
+        self.addCleanup(tgt.cleanup)
+        atk = Path(tgt.name) / "ATK-marker"
+        r = run_sandboxed(
+            ["sh", "-c", f"echo pwn > {atk} && echo WROTE"],
+            target=tgt.name, output=self.tmp.name,
+            block_network=True,
+            nproc_limit=1024,
+            limits={"memory_mb": 0, "max_file_mb": 10240, "cpu_seconds": 300},
+            writable_paths=[self.tmp.name, "/tmp"],
+            readable_paths=None,
+            allowed_tcp_ports=None,
+            seccomp_profile=None, seccomp_block_udp=False,
+            env=None, cwd=None, timeout=15,
+            capture_output=True, text=True,
+        )
+        self.assertNotIn("WROTE", r.stdout or "",
+                         "write into the read-only target bind succeeded")
+        self.assertFalse(atk.exists(),
+                         "host file materialised through the read-only "
+                         "target bind — locked-flag remount regressed")
+
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_stub_dir_cleaned_up_after_run(self):
         """The parent-created tempfile.mkdtemp stub must be removed
         after the child exits. Without cleanup, /tmp accumulates
@@ -255,6 +396,385 @@ class TestRunSandboxedSmokeTest(unittest.TestCase):
             os.path.exists(our_stub),
             f"this test's mkdtemp stub leaked: {our_stub}"
         )
+
+
+@requires_landlock
+@requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+@requires_mount
+class TestEtcOverlayMissingHostTarget(unittest.TestCase):
+    """etc_overlay when the target path doesn't exist on the host.
+
+    Baron Samedit (CVE-2021-3156) needs /etc/pam.d/sudoedit overlay'd into
+    the sandbox, but that file doesn't exist on the host.  On kernel ≥5.12
+    the bind mount of /etc is MNT_LOCKED (can't remount RW), and the
+    namespace uid can't create files on the host FS anyway (EACCES).
+
+    The fix mounts a tmpfs on {root}/etc, shallow-copies host /etc into it,
+    and pre-creates mount-point stubs for missing targets.  This test
+    exercises that path end-to-end: the child reads the overlaid content
+    through a path that doesn't exist on the host.
+    """
+
+    # Inner timeout for the sandboxed command. A healthy tmpfs+copy
+    # run completes in well under a second; 8s keeps generous headroom
+    # on a loaded runner while staying inside the 10s default-tier
+    # slow-test guard, so a wedge fails THIS test with the phase trace
+    # below instead of also tripping the tier guard at 15+s.
+    _SANDBOX_TIMEOUT = 8
+
+    def setUp(self):
+        if not _mount_ns_usable():
+            self.skipTest(
+                "mount-ns unusable here (needs uidmap package + "
+                "kernel.apparmor_restrict_unprivileged_userns=0)"
+            )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # Per-phase watchdog trace: the overlay setup path has wedged
+        # on a CI runner whose /etc we cannot inspect or reproduce
+        # (every enumerated pathological-entry shape passes locally).
+        # The sandbox child appends a marker per setup phase (and per
+        # copied /etc entry) to this host-side file; on a timeout the
+        # failure message carries the trace so the CI log itself
+        # names the phase/entry that wedged.
+        self.phase_trace = os.path.join(self.tmp.name, "phase-trace.log")
+        os.environ["RAPTOR_SANDBOX_PHASE_TRACE"] = self.phase_trace
+        self.addCleanup(
+            os.environ.pop, "RAPTOR_SANDBOX_PHASE_TRACE", None)
+
+    def _run_overlay_cmd(self, cmd, etc_overlay):
+        """run_sandboxed with the shared config; on a setup wedge
+        (TimeoutExpired) fail with the phase trace inlined."""
+        import subprocess
+
+        from core.sandbox._spawn import run_sandboxed
+        try:
+            r = run_sandboxed(
+                cmd,
+                target=self.tmp.name, output=self.tmp.name,
+                block_network=True,
+                nproc_limit=1024,
+                limits={"memory_mb": 0, "max_file_mb": 10240,
+                        "cpu_seconds": 300},
+                writable_paths=[self.tmp.name, "/tmp"],
+                readable_paths=None,
+                allowed_tcp_ports=None,
+                seccomp_profile=None, seccomp_block_udp=False,
+                env=None, cwd=None, timeout=self._SANDBOX_TIMEOUT,
+                capture_output=True, text=True,
+                etc_overlay=etc_overlay,
+            )
+            # The trace is only useful on the wedge it exists to
+            # diagnose — prove on every green run that it actually
+            # records the overlay phases, so it can't silently rot.
+            trace = Path(self.phase_trace).read_text()
+            self.assertIn("etc copy: done", trace)
+            self.assertIn("pivot_root: start", trace)
+            return r
+        except subprocess.TimeoutExpired:
+            trace = "<no phase trace written>"
+            try:
+                trace = Path(self.phase_trace).read_text()
+            except OSError:
+                pass
+            self.fail(
+                f"sandbox setup wedged ({self._SANDBOX_TIMEOUT}s "
+                f"timeout). Phase trace (LAST line = the phase or "
+                f"/etc entry that never completed; a trace ending at "
+                f"the pivot_root marker means the wedge is "
+                f"post-pivot):\n{trace}"
+            )
+
+    def test_overlay_file_visible_at_missing_host_path(self):
+        """A file overlay'd to a path that doesn't exist on the host
+        is readable inside the sandbox with the correct content."""
+        # Pick a target path that definitely doesn't exist on the host.
+        overlay_target = "/etc/raptor_test_overlay_missing.conf"
+        assert not os.path.exists(overlay_target), (
+            f"test assumption violated: {overlay_target} exists on host"
+        )
+
+        # Create the overlay source file in our temp dir.
+        overlay_source = os.path.join(self.tmp.name, "overlay.conf")
+        sentinel = "RAPTOR-OVERLAY-SENTINEL-42"
+        with open(overlay_source, "w") as f:
+            f.write(sentinel + "\n")
+
+        r = self._run_overlay_cmd(
+            ["cat", overlay_target],
+            {overlay_target: overlay_source},
+        )
+        self.assertEqual(r.returncode, 0,
+                         f"cat failed inside sandbox; stderr: {r.stderr!r}")
+        self.assertIn(sentinel, r.stdout,
+                      "overlay content not visible at the missing-host path")
+
+    def test_host_etc_files_still_visible_with_tmpfs_overlay(self):
+        """When tmpfs+copy is used for /etc, pre-existing host files
+        (e.g. /etc/hostname) remain visible inside the sandbox."""
+        overlay_target = "/etc/raptor_test_overlay_missing2.conf"
+        assert not os.path.exists(overlay_target)
+
+        overlay_source = os.path.join(self.tmp.name, "overlay2.conf")
+        with open(overlay_source, "w") as f:
+            f.write("OVERLAY2\n")
+
+        # Read /etc/hostname — a file that exists on any Linux host.
+        r = self._run_overlay_cmd(
+            ["sh", "-c",
+             f"cat /etc/hostname && cat {overlay_target}"],
+            {overlay_target: overlay_source},
+        )
+        self.assertEqual(r.returncode, 0,
+                         f"sandbox cmd failed; stderr: {r.stderr!r}")
+        # Host /etc/hostname content should be present (shallow-copied).
+        host_hostname = open("/etc/hostname").read().strip()
+        self.assertIn(host_hostname, r.stdout,
+                      "host /etc/hostname not preserved after tmpfs+copy")
+        # Overlay content should also be present.
+        self.assertIn("OVERLAY2", r.stdout,
+                      "overlay file not visible alongside host /etc")
+
+
+@requires_landlock
+@requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+@requires_mount
+class TestEtcOverlayKeyValidation(unittest.TestCase):
+    """etc_overlay keys are concatenated onto the staging root; a
+    non-normalized key (\"..\") must never drive pre-pivot file
+    creation OUTSIDE the staging root on the host."""
+
+    def setUp(self):
+        if not _mount_ns_usable():
+            self.skipTest(
+                "mount-ns unusable here (needs uidmap package + "
+                "kernel.apparmor_restrict_unprivileged_userns=0)"
+            )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_dotdot_key_cannot_escape_staging_root(self):
+        from core.sandbox._spawn import run_sandboxed
+
+        src = os.path.join(self.tmp.name, "src.conf")
+        with open(src, "w") as f:
+            f.write("payload\n")
+        escape_name = "raptor-test-overlay-escape-marker"
+        escape_path = os.path.join(tempfile.gettempdir(), escape_name)
+        if os.path.exists(escape_path):
+            os.unlink(escape_path)
+        self.addCleanup(
+            lambda: os.path.exists(escape_path)
+            and os.unlink(escape_path))
+
+        r = run_sandboxed(
+            ["true"],
+            target=self.tmp.name, output=self.tmp.name,
+            block_network=True,
+            nproc_limit=1024,
+            limits={"memory_mb": 0, "max_file_mb": 10240,
+                    "cpu_seconds": 300},
+            writable_paths=[self.tmp.name, "/tmp"],
+            readable_paths=None, allowed_tcp_ports=None,
+            seccomp_profile=None, seccomp_block_udp=False,
+            env=None, cwd=None, timeout=15,
+            capture_output=True, text=True,
+            etc_overlay={f"/../{escape_name}": src},
+        )
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertFalse(os.path.exists(escape_path), (
+            f"etc_overlay '..' key escaped the staging root and "
+            f"created {escape_path} on the host"
+        ))
+        self.assertIn("normalized absolute path", r.stderr,
+                      "expected the loud key-validation skip")
+
+
+class TestGidmapAllowProbe(unittest.TestCase):
+    """_gidmap_allow_available() — detection of the raptor-gidmap-allow helper."""
+
+    @pytest.fixture(autouse=True)
+    def _owned_probe_cache(self, monkeypatch):
+        from core.sandbox import state
+        with isolated_module_state(state, {'_gidmap_allow_cache': None, '_gidmap_allow_warned_missing': False}, lock=state._cache_lock):
+            try:
+                yield
+            finally:
+                monkeypatch.undo()
+
+
+
+
+    def test_returns_none_when_binary_missing(self):
+        """When the helper binary doesn't exist, returns None."""
+        from unittest.mock import patch
+        from core.sandbox._spawn import _gidmap_allow_available
+        with patch("core.sandbox._spawn.GIDMAP_ALLOW_PATH") as mock_path:
+            mock_path.is_file.return_value = False
+            self.assertIsNone(_gidmap_allow_available())
+
+    def test_returns_none_when_no_cap_setgid(self):
+        """Binary exists but getcap doesn't show cap_setgid → None."""
+        from unittest.mock import patch, MagicMock
+        from core.sandbox._spawn import _gidmap_allow_available
+        mock_run = MagicMock(return_value=MagicMock(stdout="", returncode=0))
+        with patch("core.sandbox._spawn.GIDMAP_ALLOW_PATH") as mock_path:
+            mock_path.is_file.return_value = True
+            with (
+                patch("core.sandbox._spawn._find_sandbox_binary",
+                      return_value="/usr/sbin/getcap"),
+                mock_module_attribute(_mock_owner('core.sandbox._spawn'), 'subprocess', 'run', mock_run),
+            ):
+                self.assertIsNone(_gidmap_allow_available())
+
+    def test_returns_path_when_cap_present(self):
+        """Binary exists and getcap confirms cap_setgid → returns path."""
+        from unittest.mock import patch, MagicMock
+        from core.sandbox._spawn import _gidmap_allow_available
+        mock_run = MagicMock(return_value=MagicMock(
+            stdout="/path/to/raptor-gidmap-allow cap_setgid=ep",
+            returncode=0,
+        ))
+        with patch("core.sandbox._spawn.GIDMAP_ALLOW_PATH") as mock_path:
+            mock_path.is_file.return_value = True
+            mock_path.__str__ = lambda _: "/path/to/raptor-gidmap-allow"
+            with (
+                patch("core.sandbox._spawn._find_sandbox_binary",
+                      return_value="/usr/sbin/getcap"),
+                mock_module_attribute(_mock_owner('core.sandbox._spawn'), 'subprocess', 'run', mock_run),
+            ):
+                result = _gidmap_allow_available()
+                self.assertEqual(result, "/path/to/raptor-gidmap-allow")
+
+    def test_cached_after_first_probe(self):
+        """Second call returns the cached value without re-probing."""
+        from unittest.mock import patch
+        from core.sandbox import state
+        from core.sandbox._spawn import _gidmap_allow_available
+        with patch("core.sandbox._spawn.GIDMAP_ALLOW_PATH") as mock_path:
+            mock_path.is_file.return_value = False
+            _gidmap_allow_available()
+        # Cache should be set to False (not None).
+        self.assertFalse(state._gidmap_allow_cache)
+        # Second call should still return None — cache is already decided.
+        self.assertIsNone(_gidmap_allow_available())
+
+
+class TestDeathPipeOrphanTeardown(unittest.TestCase):
+    """Death-pipe mechanism: intermediate child exits 137 when the
+    parent's write end closes (simulating orchestrator SIGKILL/OOM).
+
+    Tests the core select-loop mechanism without needing mount-ns;
+    the loop logic is architecture-independent.
+    """
+
+    def test_death_pipe_eof_exits_child(self):
+        """Fork a child that watches death_r while waiting on a
+        long-running grandchild. Close death_w → child must SIGKILL
+        the grandchild and exit 137."""
+        import signal as _signal
+        import time
+        import warnings
+        death_r, death_w = os.pipe()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=DeprecationWarning,
+                message=r".*fork.*may lead to deadlocks.*",
+            )
+            pid = os.fork()
+        if pid == 0:
+            os.close(death_w)
+            grand = os.fork()
+            if grand == 0:
+                os.close(death_r)
+                time.sleep(300)
+                os._exit(0)
+            import select as _sel
+            while True:
+                try:
+                    p, _st = os.waitpid(grand, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if p != 0:
+                    break
+                try:
+                    ready, _, _ = _sel.select([death_r], [], [], 0.05)
+                except (OSError, ValueError):
+                    time.sleep(0.05)
+                    continue
+                if ready:
+                    try:
+                        os.kill(grand, _signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(grand, 0)
+                    except ChildProcessError:
+                        pass
+                    os._exit(137)
+            os._exit(0)
+
+        os.close(death_r)
+        import time
+        time.sleep(0.3)
+        os.close(death_w)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 137)
+
+    def test_normal_exit_no_death_pipe(self):
+        """When the grandchild exits normally, the intermediate child
+        mirrors the exit code and death_r stays open (no false trigger)."""
+        import warnings
+        death_r, death_w = os.pipe()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=DeprecationWarning,
+                message=r".*fork.*may lead to deadlocks.*",
+            )
+            pid = os.fork()
+        if pid == 0:
+            os.close(death_w)
+            grand = os.fork()
+            if grand == 0:
+                os.close(death_r)
+                os._exit(42)
+            import select as _sel
+            import time
+            st = 9
+            while True:
+                try:
+                    p, st = os.waitpid(grand, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if p != 0:
+                    break
+                try:
+                    ready, _, _ = _sel.select([death_r], [], [], 0.05)
+                except (OSError, ValueError):
+                    time.sleep(0.05)
+                    continue
+                if ready:
+                    try:
+                        os.kill(grand, 9)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(grand, 0)
+                    except ChildProcessError:
+                        pass
+                    os._exit(137)
+            if os.WIFEXITED(st):
+                os._exit(os.WEXITSTATUS(st))
+            os._exit(255)
+
+        os.close(death_r)
+        _, status = os.waitpid(pid, 0)
+        os.close(death_w)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 42)
 
 
 if __name__ == "__main__":

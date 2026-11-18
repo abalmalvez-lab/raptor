@@ -38,13 +38,17 @@ def _hostname_in(hosts: list[str], target: str) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _reset_calibrate_memo():
-    """Per-process memo isolation. Autouse so cross-test pollution
-    can't leak a calibrated profile into a static-fallback test.
-    Mirrors the cc_proxy_hosts test layout."""
-    mod._reset_calibrate_cache_for_tests()
-    yield
-    mod._reset_calibrate_cache_for_tests()
+def _reset_calibrate_memo(tmp_path, monkeypatch):
+    """Own the override path and calibration memo without clearing caller state."""
+    from core.sandbox import calibrated_hosts
+    from core.testing.module_state import isolated_module_state
+
+    monkeypatch.setattr(mod, "_OVERRIDE_CONFIG_PATH",
+                        tmp_path / "proxy-hosts.json")
+    with isolated_module_state(
+        calibrated_hosts, {"_CACHE": {}}, lock=calibrated_hosts._CACHE_LOCK,
+    ):
+        yield
 
 
 @pytest.fixture
@@ -225,23 +229,55 @@ class TestOverrideConfig:
         monkeypatch.setattr(mod, "_OVERRIDE_CONFIG_PATH", config_path)
         assert proxy_hosts_for_codeql() == ["a.example", "b.example"]
 
-    def test_empty_override_falls_back(
+    def test_empty_override_is_operator_deny_all(
         self, isolated_env, monkeypatch, tmp_path, no_calibrate,
     ):
         config_path = tmp_path / "codeql-proxy-hosts.json"
         config_path.write_text(json.dumps({"proxy_hosts": []}))
         monkeypatch.setattr(mod, "_OVERRIDE_CONFIG_PATH", config_path)
-        # Empty override is a misconfig — fall through rather than
-        # allowlisting nothing (which would deny every pack
-        # download). Same shape as cc_proxy_hosts.
+        # {"proxy_hosts": []} is an explicit operator deny-all;
+        # collapsing it to None silently re-granted the default GHCR
+        # hosts the operator just denied. Same semantics AND encoding
+        # as the cc sibling: deny-all is loopback-only (the sandbox
+        # rejects an empty allowlist; the proxy refuses loopback
+        # targets), so every remote host stays denied while the run
+        # fails at the proxy with a per-host log instead of an
+        # opaque sandbox setup error.
         hosts = proxy_hosts_for_codeql()
-        assert _hostname_in(hosts, "ghcr.io")
+        assert hosts == ["127.0.0.1", "localhost"]
+        assert not _hostname_in(hosts, "ghcr.io")
+
+    def test_all_entries_invalid_override_is_still_deny_all(
+        self, isolated_env, monkeypatch, tmp_path, no_calibrate,
+    ):
+        # A configured list whose entries all sanitise away is still a
+        # CONFIGURED (deny-all) list, not an unconfigured fall-through.
+        config_path = tmp_path / "codeql-proxy-hosts.json"
+        config_path.write_text(json.dumps({"proxy_hosts": [7, "", None]}))
+        monkeypatch.setattr(mod, "_OVERRIDE_CONFIG_PATH", config_path)
+        hosts = proxy_hosts_for_codeql()
+        assert hosts == ["127.0.0.1", "localhost"]
+        assert not _hostname_in(hosts, "ghcr.io")
 
     def test_malformed_override_falls_back(
         self, isolated_env, monkeypatch, tmp_path, no_calibrate,
     ):
         config_path = tmp_path / "codeql-proxy-hosts.json"
         config_path.write_text("not valid json{{")
+        monkeypatch.setattr(mod, "_OVERRIDE_CONFIG_PATH", config_path)
+        hosts = proxy_hosts_for_codeql()
+        assert _hostname_in(hosts, "ghcr.io")
+
+    def test_undecodable_override_falls_back(
+        self, isolated_env, monkeypatch, tmp_path, no_calibrate,
+    ):
+        """Garbage bytes at the override path (an operator pointing
+        it at a binary file) must degrade to the static default like
+        every other malformed shape — pre-fix the UnicodeDecodeError
+        escaped and took down every pack-download policy
+        resolution."""
+        config_path = tmp_path / "codeql-proxy-hosts.json"
+        config_path.write_bytes(b"\xff\xfe\x00garbage\x9c")
         monkeypatch.setattr(mod, "_OVERRIDE_CONFIG_PATH", config_path)
         hosts = proxy_hosts_for_codeql()
         assert _hostname_in(hosts, "ghcr.io")

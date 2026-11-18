@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Fuzzing Memory - Learning and Knowledge Persistence
 
@@ -6,15 +5,20 @@ This module enables RAPTOR to learn from past fuzzing campaigns and
 improve over time through persistent knowledge storage.
 """
 
+import fcntl
+import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, TYPE_CHECKING
 
 from core.json import load_json, save_json
-
 from core.logging import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = get_logger()
 
@@ -42,17 +46,26 @@ class FuzzingKnowledge:
     last_updated: float = field(default_factory=time.time)
 
     # Context
-    binary_hash: Optional[str] = None  # Which binary did we learn this from?
-    campaign_id: Optional[str] = None  # Which fuzzing campaign?
+    binary_hash: str | None = None  # Which binary did we learn this from?
+    campaign_id: str | None = None  # Which fuzzing campaign?
 
-    def update_success(self):
+    def _coerce_confidence(self) -> None:
+        """Shared-file entries may carry a non-numeric confidence
+        (other processes' writes / hand edits) — reset to the neutral
+        default instead of raising into the caller."""
+        if not isinstance(self.confidence, (int, float)):
+            self.confidence = 0.5
+
+    def update_success(self) -> None:
         """Record a successful application of this knowledge."""
+        self._coerce_confidence()
         self.success_count += 1
         self.confidence = min(1.0, self.confidence + 0.1)
         self.last_updated = time.time()
 
-    def update_failure(self):
+    def update_failure(self) -> None:
         """Record a failed application of this knowledge."""
+        self._coerce_confidence()
         self.failure_count += 1
         self.confidence = max(0.0, self.confidence - 0.05)
         self.last_updated = time.time()
@@ -80,7 +93,7 @@ class FuzzingMemory:
     - Share knowledge between fuzzing sessions
     """
 
-    def __init__(self, memory_file: Optional[Path] = None):
+    def __init__(self, memory_file: Path | None = None) -> None:
         """
         Initialise fuzzing memory.
         Right now we use json and ideally we should be using sqlite or similar for scalability.
@@ -95,80 +108,209 @@ class FuzzingMemory:
         self.memory_file.parent.mkdir(parents=True, exist_ok=True)
 
         # In-memory knowledge store
-        self.knowledge: Dict[str, FuzzingKnowledge] = {}
+        self.knowledge: dict[str, FuzzingKnowledge] = {}
 
         # Campaign history
-        self.campaigns: List[Dict] = []
+        self.campaigns: list[dict] = []
+
+        # Batched save: avoid writing to disk on every remember() call
+        self._dirty_count: int = 0
+        self._save_batch_size: int = 50
+        self._last_save_time: float = 0.0
+        self._save_interval: float = 30.0  # seconds
+
+        # Keys deliberately removed this session (prune) — the
+        # merge-on-save must not resurrect them from disk.
+        self._removed_keys: set[str] = set()
 
         # Load existing memory
         self.load()
 
-        logger.info(f"Fuzzing memory initialised: {len(self.knowledge)} knowledge entries loaded")
+        # Debug: constructor detail — fires once per process and every
+        # RAPTOR subprocess constructs one, so at INFO it was among the
+        # top repeated lines in the audit trail.
+        logger.debug("Fuzzing memory initialised: %d knowledge entries loaded", len(self.knowledge))
 
-    def load(self):
+    def load(self) -> None:
         """Load memory from persistent storage."""
         if not self.memory_file.exists():
-            logger.info(f"No existing memory file at {self.memory_file}")
+            logger.debug("No existing memory file at %s", self.memory_file)
             return
 
         try:
             data = load_json(self.memory_file)
-            if data is None:
-                logger.warning(f"Failed to parse memory file: {self.memory_file}")
+            if not isinstance(data, dict):
+                logger.warning("Failed to parse memory file: %s", self.memory_file)
                 return
 
             # Load knowledge entries
             for key, k_dict in data.get("knowledge", {}).items():
-                self.knowledge[key] = FuzzingKnowledge(
-                    knowledge_type=k_dict["knowledge_type"],
-                    key=k_dict["key"],
-                    value=k_dict["value"],
-                    confidence=k_dict.get("confidence", 0.5),
-                    success_count=k_dict.get("success_count", 0),
-                    failure_count=k_dict.get("failure_count", 0),
-                    last_updated=k_dict.get("last_updated", time.time()),
-                    binary_hash=k_dict.get("binary_hash"),
-                    campaign_id=k_dict.get("campaign_id"),
-                )
+                self.knowledge[key] = self._knowledge_from_dict(k_dict)
 
             # Load campaign history
             self.campaigns = data.get("campaigns", [])
 
-            logger.info(f"Loaded {len(self.knowledge)} knowledge entries, {len(self.campaigns)} past campaigns")
+            logger.debug("Loaded %d knowledge entries, %d past campaigns", len(self.knowledge), len(self.campaigns))
 
-        except Exception as e:
-            logger.error(f"Failed to load memory: {e}")
+        except Exception as e:  # noqa: BLE001 — memory is additive; never crash the campaign
+            logger.error("Failed to load memory: %s", e)
 
-    def save(self):
-        """Save memory to persistent storage."""
+    @staticmethod
+    def _knowledge_from_dict(k_dict: dict) -> FuzzingKnowledge:
+        """Rehydrate one serialised knowledge entry."""
+        return FuzzingKnowledge(
+            knowledge_type=k_dict["knowledge_type"],
+            key=k_dict["key"],
+            value=k_dict["value"],
+            confidence=k_dict.get("confidence", 0.5),
+            success_count=k_dict.get("success_count", 0),
+            failure_count=k_dict.get("failure_count", 0),
+            last_updated=k_dict.get("last_updated", time.time()),
+            binary_hash=k_dict.get("binary_hash"),
+            campaign_id=k_dict.get("campaign_id"),
+        )
+
+    #: Lock-acquisition deadline. Trade-off, both directions: longer
+    #: waits ride out big concurrent merges but let ONE wedged holder
+    #: (crashed mid-save under a debugger, D-state on a dead network
+    #: mount) stall every campaign's periodic flush behind it; shorter
+    #: waits shed load fast but can skip knowledge saves under mere
+    #: contention. Saves are additive best-effort (a timed-out save
+    #: logs and retries on the next flush), so 30s errs toward
+    #: liveness.
+    _LOCK_TIMEOUT_S: float = 30.0
+
+    @contextmanager
+    def _locked(self) -> "Iterator[None]":
+        """Exclusive advisory lock over the shared memory file.
+
+        The store is shared across processes (default:
+        ``~/.raptor/fuzzing_memory.json``) and every save is a full
+        read-merge-write; without the lock two concurrent campaigns
+        interleave their RMW cycles and the last writer silently
+        discards the other's learned knowledge. flock on a sibling
+        ``.lock`` file (never the data file itself — save_json
+        replaces it by rename, which would drop the lock identity).
+
+        Acquisition is non-blocking with a deadline: a wedged holder
+        must not stall the caller forever (saves are best-effort by
+        contract — ``save()`` catches and logs the timeout).
+        """
+        lock_path = self.memory_file.with_name(self.memory_file.name + ".lock")
+        with open(lock_path, "w", encoding="utf-8") as fh:
+            deadline = time.monotonic() + self._LOCK_TIMEOUT_S
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"memory lock {lock_path} not acquired "
+                            f"within {self._LOCK_TIMEOUT_S:.0f}s — "
+                            f"another campaign may be wedged holding it"
+                        ) from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _merge_from_disk(self) -> None:
+        """Fold concurrent writers' state into memory before saving.
+
+        Newest-entry-wins per knowledge key (``last_updated``), except
+        keys this session deliberately removed (prune). Campaigns are
+        a union: disk order first, then our unsaved records.
+        """
+        if not self.memory_file.exists():
+            return
+        data = load_json(self.memory_file)
+        if not isinstance(data, dict):
+            return
+        knowledge = data.get("knowledge")
+        if isinstance(knowledge, dict):
+            for key, k_dict in knowledge.items():
+                if key in self._removed_keys:
+                    continue
+                if not isinstance(k_dict, dict):
+                    continue
+                try:
+                    entry = self._knowledge_from_dict(k_dict)
+                except (KeyError, TypeError):
+                    continue
+                ours = self.knowledge.get(key)
+                if ours is None or entry.last_updated > ours.last_updated:
+                    self.knowledge[key] = entry
+        disk_campaigns = data.get("campaigns")
+        if isinstance(disk_campaigns, list):
+            # Canonical-JSON keys instead of `c not in merged`: the
+            # membership test was an O(n²) dict-equality scan over a
+            # store that only ever grows.
+            merged = list(disk_campaigns)
+            seen_keys = {self._campaign_key(c) for c in merged}
+            for c in self.campaigns:
+                key = self._campaign_key(c)
+                if key not in seen_keys:
+                    merged.append(c)
+                    seen_keys.add(key)
+            self.campaigns = merged
+
+    @staticmethod
+    def _campaign_key(campaign: Any) -> str:
+        """Hashable identity for a campaign record (JSON-plain data;
+        sort_keys makes key order irrelevant, matching dict ==)."""
         try:
-            data = {
-                "knowledge": {
-                    key: {
-                        "knowledge_type": k.knowledge_type,
-                        "key": k.key,
-                        "value": k.value,
-                        "confidence": k.confidence,
-                        "success_count": k.success_count,
-                        "failure_count": k.failure_count,
-                        "last_updated": k.last_updated,
-                        "binary_hash": k.binary_hash,
-                        "campaign_id": k.campaign_id,
-                    }
-                    for key, k in self.knowledge.items()
-                },
-                "campaigns": self.campaigns,
-                "last_saved": time.time(),
-            }
+            return json.dumps(campaign, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return repr(campaign)
 
-            save_json(self.memory_file, data)
+    def flush(self) -> None:
+        """Flush any pending dirty state to disk."""
+        if self._dirty_count > 0:
+            self.save()
+            self._dirty_count = 0
+            self._last_save_time = time.time()
 
-            logger.debug(f"Memory saved to {self.memory_file}")
+    def save(self) -> None:
+        """Save memory to persistent storage.
 
-        except Exception as e:
-            logger.error(f"Failed to save memory: {e}")
+        Lock → merge-from-disk → atomic write: concurrent campaigns
+        each keep the union of learned state instead of last-writer-
+        wins dropping whichever process saved first.
+        """
+        try:
+            with self._locked():
+                self._save_locked()
+            self._removed_keys.clear()
+        except Exception as e:  # noqa: BLE001 — memory is additive; never crash the campaign
+            logger.error("Failed to save memory: %s", e)
 
-    def remember(self, knowledge: FuzzingKnowledge):
+    def _save_locked(self) -> None:
+        """Merge + serialise + write. Caller holds the file lock."""
+        self._merge_from_disk()
+        data = {
+            "knowledge": {
+                key: {
+                    "knowledge_type": k.knowledge_type,
+                    "key": k.key,
+                    "value": k.value,
+                    "confidence": k.confidence,
+                    "success_count": k.success_count,
+                    "failure_count": k.failure_count,
+                    "last_updated": k.last_updated,
+                    "binary_hash": k.binary_hash,
+                    "campaign_id": k.campaign_id,
+                }
+                for key, k in self.knowledge.items()
+            },
+            "campaigns": self.campaigns,
+            "last_saved": time.time(),
+        }
+        save_json(self.memory_file, data)
+        logger.debug("Memory saved to %s", self.memory_file)
+
+    def remember(self, knowledge: FuzzingKnowledge) -> None:
         """
         Store a piece of knowledge.
 
@@ -182,15 +324,24 @@ class FuzzingMemory:
             existing = self.knowledge[key]
             existing.value = knowledge.value
             existing.last_updated = time.time()
-            logger.debug(f"Updated knowledge: {key}")
+            logger.debug("Updated knowledge: %s", key)
         else:
             # Store new knowledge
             self.knowledge[key] = knowledge
-            logger.info(f"Learned new knowledge: {key}")
+            logger.info("Learned new knowledge: %s", key)
 
-        self.save()
+        self._dirty_count += 1
+        now = time.time()
+        elapsed = now - self._last_save_time
+        if (
+            self._dirty_count >= self._save_batch_size
+            or elapsed >= self._save_interval
+        ):
+            self.save()
+            self._dirty_count = 0
+            self._last_save_time = now
 
-    def recall(self, knowledge_type: str, key: str) -> Optional[FuzzingKnowledge]:
+    def recall(self, knowledge_type: str, key: str) -> FuzzingKnowledge | None:
         """
         Retrieve a piece of knowledge.
 
@@ -205,7 +356,7 @@ class FuzzingMemory:
         return self.knowledge.get(lookup_key)
 
     def find_similar(self, knowledge_type: str,
-                     min_confidence: float = 0.5) -> List[FuzzingKnowledge]:
+                     min_confidence: float = 0.5) -> list[FuzzingKnowledge]:
         """
         Find all knowledge of a certain type with sufficient confidence.
 
@@ -216,19 +367,23 @@ class FuzzingMemory:
         Returns:
             List of matching knowledge entries
         """
-        results = []
-        for k in self.knowledge.values():
-            if k.knowledge_type == knowledge_type and k.confidence >= min_confidence:
-                results.append(k)
+        results = [k for k in self.knowledge.values() if k.knowledge_type == knowledge_type and k.confidence >= min_confidence]
 
         # Sort by confidence (highest first)
         results.sort(key=lambda x: x.confidence, reverse=True)
         return results
 
     def record_strategy_success(self, strategy_name: str, binary_hash: str,
-                                crashes_found: int, exploitable_crashes: int):
+                                crashes_found: int, exploitable_crashes: int) -> None:
         """
         Record that a fuzzing strategy was successful.
+
+        The stored ``value`` dict is a snapshot of the most recent run —
+        each call overwrites the previous crash counts rather than
+        accumulating them. Cumulative history lives in the entry's
+        success/failure counters (``update_success`` / ``update_failure``),
+        unlike ``record_crash_pattern`` which accumulates counts inside
+        ``value`` itself.
 
         Args:
             strategy_name: Name of the strategy
@@ -265,12 +420,16 @@ class FuzzingMemory:
         }
 
         self.remember(knowledge)
-        logger.info(f"Recorded strategy result: {strategy_name} - {crashes_found} crashes")
+        logger.info("Recorded strategy result: %s - %s crashes", strategy_name, crashes_found)
 
     def record_crash_pattern(self, signal: str, function: str,
-                            binary_hash: str, exploitable: bool):
+                            binary_hash: str, exploitable: bool) -> None:
         """
         Record a crash pattern for learning.
+
+        Unlike ``record_strategy_success`` (latest-run snapshot), the
+        stored ``value`` dict accumulates: each call increments
+        ``total_count`` and, when exploitable, ``exploitable_count``.
 
         Args:
             signal: Crash signal (e.g., "SIGSEGV")
@@ -294,8 +453,22 @@ class FuzzingMemory:
                 binary_hash=binary_hash,
             )
 
-        # Update counts
+        # Update counts. The recalled value may be another process's
+        # write to the shared file (schema drift, hand edits): a
+        # non-dict value or non-int counter raised KeyError/TypeError
+        # out of here into the crash-analysis path. Malformed learning
+        # state resets — the store is additive best-effort.
         value = knowledge.value
+        if not isinstance(value, dict):
+            value = {
+                "signal": signal,
+                "function": function,
+                "exploitable_count": 0,
+                "total_count": 0,
+            }
+        for counter in ("total_count", "exploitable_count"):
+            if not isinstance(value.get(counter), int):
+                value[counter] = 0
         value["total_count"] += 1
         if exploitable:
             value["exploitable_count"] += 1
@@ -307,7 +480,7 @@ class FuzzingMemory:
         self.remember(knowledge)
 
     def record_exploit_technique(self, technique: str, crash_type: str,
-                                binary_characteristics: Dict, success: bool):
+                                binary_characteristics: dict, success: bool) -> None:
         """
         Record whether an exploit technique worked.
 
@@ -337,9 +510,9 @@ class FuzzingMemory:
             knowledge.update_failure()
 
         self.remember(knowledge)
-        logger.info(f"Recorded exploit technique: {technique} - {'success' if success else 'failure'}")
+        logger.info("Recorded exploit technique: %s - %s", technique, 'success' if success else 'failure')
 
-    def get_best_strategy(self, binary_hash: str) -> Optional[str]:
+    def get_best_strategy(self, binary_hash: str) -> str | None:
         """
         Get the best fuzzing strategy for a binary based on past experience.
 
@@ -362,8 +535,10 @@ class FuzzingMemory:
         strategies.sort(key=lambda k: (k.confidence, k.success_rate()), reverse=True)
 
         best = strategies[0]
-        logger.info(f"Best strategy for binary: {best.value['name']} "
-                   f"(confidence: {best.confidence:.2f}, success rate: {best.success_rate():.2f})")
+        logger.info(
+            "Best strategy for binary: %s (confidence: %.2f, success rate: %.2f)",
+            best.value['name'], best.confidence, best.success_rate(),
+        )
 
         return best.value["name"]
 
@@ -384,24 +559,41 @@ class FuzzingMemory:
         if knowledge is None:
             # No past data - use signal-based heuristic
             signal_probs = {
-                "SIGSEGV": 0.7,  # Memory corruption - often exploitable
-                "SIGABRT": 0.5,  # Heap issues - sometimes exploitable
-                "SIGILL": 0.4,   # Illegal instruction - less often exploitable
-                "SIGFPE": 0.2,   # Arithmetic - rarely exploitable
+                "SIGSEGV": 0.7, 11: 0.7,
+                "SIGABRT": 0.5, 6: 0.5,
+                "SIGILL": 0.4, 4: 0.4,
+                "SIGFPE": 0.2, 8: 0.2,
             }
-            return signal_probs.get(signal, 0.3)
+            # Callers may pass signal as a string-encoded int ("11")
+            # which misses the int key (11).  Normalise first.
+            lookup_key: Any = signal
+            try:
+                lookup_key = int(signal)
+            except (TypeError, ValueError):
+                pass
+            return signal_probs.get(lookup_key, 0.3)
 
-        # Use historical data
+        # Use historical data. Same shared-file shape hazard as
+        # record_crash_pattern: malformed entries read as no-data
+        # instead of raising into the crash-analysis path.
         value = knowledge.value
-        if value["total_count"] == 0:
+        if not isinstance(value, dict):
+            return 0.3
+        total = value.get("total_count")
+        exploitable = value.get("exploitable_count")
+        if (not isinstance(total, int) or not isinstance(exploitable, int)
+                or total <= 0):
             return 0.3
 
-        exploitable_rate = value["exploitable_count"] / value["total_count"]
+        exploitable_rate = exploitable / total
 
         # Combine with confidence
-        return exploitable_rate * knowledge.confidence
+        confidence = (knowledge.confidence
+                      if isinstance(knowledge.confidence, (int, float))
+                      else 0.5)
+        return exploitable_rate * confidence
 
-    def record_campaign(self, campaign_data: Dict):
+    def record_campaign(self, campaign_data: dict) -> None:
         """
         Record a complete fuzzing campaign for future reference.
 
@@ -409,14 +601,20 @@ class FuzzingMemory:
             campaign_data: Dictionary with campaign information
         """
         campaign_data["timestamp"] = time.time()
-        campaign_data["date"] = datetime.now().isoformat()
+        campaign_data["date"] = datetime.now(timezone.utc).isoformat()
 
         self.campaigns.append(campaign_data)
+        # save() serialises the entire knowledge dict too, so any pending
+        # dirty entries are persisted here — reset the batch counters like
+        # flush() does, or the next remember()/flush() rewrites the same
+        # data redundantly.
         self.save()
+        self._dirty_count = 0
+        self._last_save_time = time.time()
 
-        logger.info(f"Recorded campaign: {campaign_data.get('binary_name', 'unknown')}")
+        logger.info("Recorded campaign: %s", campaign_data.get('binary_name', 'unknown'))
 
-    def get_statistics(self) -> Dict:
+    def get_statistics(self) -> dict:
         """Get memory statistics."""
         stats = {
             "total_knowledge": len(self.knowledge),
@@ -428,9 +626,9 @@ class FuzzingMemory:
         # Count by type
         for k in self.knowledge.values():
             k_type = k.knowledge_type
-            if k_type not in stats["knowledge_by_type"]:
-                stats["knowledge_by_type"][k_type] = 0
-            stats["knowledge_by_type"][k_type] += 1
+            if k_type not in stats["knowledge_by_type"]:  # type: ignore[operator]
+                stats["knowledge_by_type"][k_type] = 0  # type: ignore[index]
+            stats["knowledge_by_type"][k_type] += 1  # type: ignore[index]
 
         # Average confidence
         if self.knowledge:
@@ -440,7 +638,7 @@ class FuzzingMemory:
 
         return stats
 
-    def prune_low_confidence(self, threshold: float = 0.2):
+    def prune_low_confidence(self, threshold: float = 0.2) -> None:
         """
         Remove knowledge with very low confidence.
 
@@ -449,12 +647,19 @@ class FuzzingMemory:
         """
         before_count = len(self.knowledge)
 
-        self.knowledge = {
+        kept = {
             key: k for key, k in self.knowledge.items()
             if k.confidence >= threshold
         }
+        # Tombstone the removed keys so the merge-on-save doesn't
+        # immediately resurrect them from the shared file.
+        self._removed_keys.update(set(self.knowledge) - set(kept))
+        self.knowledge = kept
 
         pruned = before_count - len(self.knowledge)
         if pruned > 0:
-            logger.info(f"Pruned {pruned} low-confidence knowledge entries")
+            logger.info("Pruned %s low-confidence knowledge entries", pruned)
+            # Full-state save — reset the batch counters (see record_campaign).
             self.save()
+            self._dirty_count = 0
+            self._last_save_time = time.time()

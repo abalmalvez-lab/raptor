@@ -1,0 +1,831 @@
+name: Nightly (slow + integration)
+
+# The `slow` and `integration` markers are deselected by default in
+# pytest.ini (`addopts = -m "not integration and not slow"`), so most
+# of these tests run NOWHERE in the per-PR / per-push test matrix and
+# this workflow is their only CI execution. One carve-out: the
+# core/sandbox + packages/exploit_feasibility slow/integration subset
+# ALSO runs in tests.yml on gated PRs — the sandbox job carries the
+# combined tier, the exploit-feasibility job a package-scoped mirror
+# for PRs that fire only its own filter (a sandbox regression once sat
+# in this nightly-only window for days) — this workflow remains the
+# full-repo, unfiltered pass over both markers.
+#
+#   * slow        — perf baselines + sandbox-setup-heavy resolver tests
+#                   (deterministic; a failure is a real regression).
+#   * integration — live-network contract tests against OSV / NVD /
+#                    GitHub (may flake on external outages; failures
+#                    red-fail the run so they are investigated).
+#
+# The corpus-scale binary-oracle precision drivers carry their own
+# `corpus` marker and run in weekly_corpus.yml, NOT here — they
+# re-derive measurement numbers rather than pin regressions, and at
+# minutes-per-driver they were the bulk of this job's wallclock. The
+# synthetic driver stays `slow` as the nightly harness smoke.
+#
+# Deliberately a standalone workflow, NOT a job in tests.yml: it must
+# never ride tests.yml's `merge_group` force_full path — the merge queue
+# must not block on a live-API hiccup or a multi-minute perf baseline.
+
+on:
+  schedule:
+    # 07:00 UTC — on the days tests.yml's full-suite cron also fires
+    # (Mon/Thu 06:00) this stays an hour clear of it; every other day
+    # it runs alone.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Focused suites skip the full batch; cpp runs all C/C++ query regressions
+        type: choice
+        default: full
+        options:
+          - full
+          - crashes
+          - semgrep
+          - java
+          - cpp
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.suite || 'full' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.14'
+  VENV_PATH: .venv
+
+jobs:
+  intentional-crashes:
+    if: github.event_name != 'workflow_dispatch' || inputs.suite == 'full' || inputs.suite == 'crashes'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable unprivileged user namespaces
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/enable-userns
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-grammars
+          uv-export-extra-args: --extra grammars
+          save-on-rebuild: 'true'
+      - name: Run contained expected-crash tests
+        env:
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          python -m pytest -v --tb=short -ra \
+            core/testing/tests/test_expected_crash.py \
+            core/symbolic/tests/test_availability_probe_isolation.py::test_probe_survives_import_that_aborts_the_process \
+            core/symbolic/tests/test_isolate.py::test_child_crash_reported_as_crash_not_budget_kill \
+            --junitxml="$RUNNER_TEMP/intentional-crashes.xml"
+      - name: Require contained crash coverage
+        run: |
+          python - "$RUNNER_TEMP/intentional-crashes.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse(sys.argv[1]).iter("testcase"))
+          assert len(cases) >= 13, "contained crash tests were not collected"
+          assert not any(c.find("skipped") is not None for c in cases), "contained crash coverage skipped"
+          PY
+      - name: Verify sandbox signal contracts on Linux
+        if: runner.os == 'Linux'
+        env:
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          python -m pytest -m "" -v --tb=short -ra \
+            core/sandbox/tests/test_e2e_sandbox.py::TestE2ECrashObservability::test_segfault_detected \
+            core/sandbox/tests/test_e2e_sandbox.py::TestE2ECrashObservability::test_sigabrt_detected \
+            core/sandbox/tests/test_sandbox.py::TestSandboxObservability::test_crash_detected \
+            core/audit/tests/test_dark_verify.py::TestRealExecutionRust::test_confirms_panic_as_crash \
+            packages/llm_analysis/tests/test_exploit_verify_execute.py::test_null_deref_to_exit_signal \
+            packages/llm_analysis/tests/test_exploit_verify_execute.py::test_no_sanitizer_default_unchanged \
+            core/audit/tests/test_dynamic_sweep_forgery.py::TestGenuineUbsanStillSanitizerGrade::test_ubsan_overflow_classifies_sanitizer \
+            --junitxml="$RUNNER_TEMP/sandbox-signal-contracts.xml"
+          python - "$RUNNER_TEMP/sandbox-signal-contracts.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse(sys.argv[1]).iter("testcase"))
+          assert len(cases) >= 7, "sandbox signal contracts were not collected"
+          assert not any(c.find("skipped") is not None for c in cases), "sandbox signal coverage skipped"
+          PY
+      - name: Verify macOS toolchain runtime access
+        if: runner.os == 'macOS'
+        env:
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          python -m pytest -m "" -v --tb=short \
+            core/sandbox/tests/test_macos_spawn.py::test_project_python_starts_with_restricted_home_metadata \
+            core/sandbox/tests/test_macos_spawn.py::test_apple_compiler_can_load_sdk_under_read_restrictions \
+            --junitxml="$RUNNER_TEMP/macos-toolchain.xml"
+      - name: Upload native-crash test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: intentional-crashes-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/intentional-crashes.xml
+            ${{ runner.temp }}/macos-toolchain.xml
+            ${{ runner.temp }}/sandbox-signal-contracts.xml
+          if-no-files-found: ignore
+
+  slow-integration:
+    if: github.event_name != 'workflow_dispatch' || inputs.suite == 'full'
+    # Playwright 1.60.0 has no Ubuntu 26 dependency/browser support.
+    # Keep the native browser lane on its supported LTS image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable unprivileged user namespaces
+        # Ubuntu 24.04 runners block unprivileged user namespaces via
+        # AppArmor by default; the sandbox's mount-ns backend needs them
+        # (plus newuidmap/newgidmap from uidmap). Without this, the
+        # untrusted-run fresh-procfs contract correctly refuses the
+        # host-procfs-visible fallback and every untrusted-target test
+        # fails at setup.
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
+            .github/scripts/semgrep-cli.txt
+
+      # Grammar and web extras supply the parsers and Playwright needed
+      # by the real slow/integration cases. Keep this venv separate from
+      # the grammar-only profiles used by other lanes.
+      # The selected extras remain pinned by pyproject.toml and uv.lock.
+      - name: Restore or rebuild venv (with grammars and web)
+        id: native_venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-grammars-web
+          uv-export-extra-args: --extra grammars --extra web
+          save-on-rebuild: 'true'
+
+      - name: Install Chromium for native browser tests
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo bash .github/scripts/with-ubuntu-apt.sh playwright \
+            "$GITHUB_WORKSPACE/$VENV_PATH/bin/python"
+          source "$VENV_PATH/bin/activate"
+          python -m playwright install --only-shell chromium
+
+      - name: Install semgrep
+        # semgrep is deliberately NOT a pyproject.toml dep (optional
+        # tool, same as radare2/LLVM below), but the audit-pipeline
+        # slow tests exercise real sweeps: G2's receipt gate demands
+        # an EXECUTED confirmed sweep, so without the binary those
+        # tests can only skip. Installed here so the nightly keeps
+        # covering the sweep → record → report → feedback chain.
+        run: uv tool install --python "$(command -v python3)" "$(cat .github/scripts/semgrep-cli.txt)"
+
+      # The toolchain .debs are cached so the warm path installs from
+      # local files instead of round-tripping apt.llvm.org every night
+      # (the install step's most outage-prone leg). The key carries no
+      # package-version component: refresh weekly and on host-image/ABI
+      # changes so old transaction closures do not downgrade a newer runner.
+      - name: Restore apt toolchain cache (radare2 + LLVM 21 .debs)
+        id: apt-debs
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ steps.native_venv.outputs.platform-key }}-llvm21-radare2-${{ steps.native_venv.outputs.week }}-${{ hashFiles('.github/scripts/apt_history_window.py') }}-v3
+
+      - name: Install binary-analysis toolchain (radare2 + LLVM 21)
+        # continue-on-error so a transient apt/LLVM mirror outage doesn't
+        # abort the whole nightly before the (toolchain-independent) test
+        # families run; the "Refuse a toolchain-less..." step below still
+        # reddens the RUN afterwards so the outage can't silently convert
+        # the r2/llvm families into permanent skips (same rationale as
+        # weekly_corpus.yml's all-skipped guard).
+        id: toolchain
+        continue-on-error: true
+        env:
+          DEBS_DIR: ${{ runner.temp }}/apt-debs
+          APT_CACHE_USABLE: ${{ steps.apt-debs.outcome == 'success' && steps.apt-debs.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          capture_rc=0
+          if [[ "$APT_CACHE_USABLE" == true ]] && ls "$DEBS_DIR"/*.deb >/dev/null 2>&1; then
+            # Warm path: install straight from the cached .debs — no
+            # network. dpkg resolves inter-deb ordering itself; a
+            # dependency that left the runner image since the cache
+            # was cut is mopped up from the network by ``apt-get -f``,
+            # and the refuse step below still guards the end state.
+            sudo dpkg -i "$DEBS_DIR"/*.deb \
+              || sudo apt-get install -f -y --no-install-recommends
+          else
+            # A failed restore can leave partial files; never bank those.
+            mkdir -p "$DEBS_DIR"
+            rm -f "$DEBS_DIR"/*.deb
+            history_snapshot="$RUNNER_TEMP/toolchain-apt-before.json"
+            history_window="$RUNNER_TEMP/toolchain-apt-window.log"
+            history_ready=0
+            # A cache observation failure must not prevent the original installs.
+            if python3 .github/scripts/apt_history_window.py snapshot \
+              /var/log/apt/history.log "$history_snapshot"; then
+              history_ready=1
+            fi
+            sudo bash .github/scripts/with-ubuntu-apt.sh packages radare2
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 21
+            sudo apt-get install -y --no-install-recommends llvm-21 clang-21
+            # Capture errors must not hide tools already installed above.
+            # Run with errexit inside the subshell, retain its status outside,
+            # then publish PATH before reporting failure (and refusing save).
+            set +e
+            (
+              set -euo pipefail
+              # Keep Install rows from the verified cold-toolchain window.
+              # Earlier browser provisioning has its own mandatory installer.
+              # Retain the existing package extraction and download semantics.
+              sudo mkdir -p "$DEBS_DIR"
+              if [[ "$history_ready" != 1 ]]; then
+                echo '::warning::No verified APT history boundary; refusing cache capture'
+                exit 1
+              fi
+              python3 .github/scripts/apt_history_window.py extract \
+                /var/log/apt/history.log "$history_snapshot" "$history_window"
+              # Entries in the log line look like ``name:arch (version,
+              # automatic)`` — match on the ``name:arch (`` shape so the
+              # comma inside the parens can't leak stray tokens.
+              pkgs=$(sed -n 's/^Install: //p' "$history_window" \
+                       | grep -oE '[A-Za-z0-9][A-Za-z0-9.+-]*:[a-z0-9-]+ \(' \
+                       | sed 's/:.*//' | sort -u)
+              [ -n "$pkgs" ]
+              sudo apt-get install -y --reinstall --download-only \
+                -o Dir::Cache::archives="$DEBS_DIR" $pkgs
+              sudo find "$DEBS_DIR" -mindepth 1 ! -name '*.deb' -depth -delete
+              sudo chown -R "$(id -u):$(id -g)" "$DEBS_DIR"
+            )
+            capture_rc=$?
+            set -e
+          fi
+          sudo update-alternatives --install /usr/bin/clang clang \
+            /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ \
+            /usr/bin/clang++-21 100
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
+          r2 -v || true
+          clang --version || true
+          /usr/lib/llvm-21/bin/llvm-cov --version || true
+          /usr/lib/llvm-21/bin/llvm-profdata --version || true
+          exit "$capture_rc"
+
+      # Explicit save (not actions/cache's implicit post-job save) so a
+      # partial download from a failed cold path can never be cached:
+      # only a fully successful install step banks its .debs.
+      - name: Save apt toolchain cache
+        # continue-on-error: a transient tar/cache-service failure must
+        # not abort the nightly before tests run — the next cold run
+        # rebuilds and retries the save.
+        continue-on-error: true
+        if: steps.apt-debs.outputs.cache-hit != 'true' && steps.toolchain.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ steps.native_venv.outputs.platform-key }}-llvm21-radare2-${{ steps.native_venv.outputs.week }}-${{ hashFiles('.github/scripts/apt_history_window.py') }}-v3
+
+      # RAPTOR_MAX_SESSION_SECONDS: tier wallclock tripwire (root
+      # conftest). Nightly #193 measured 1829s for the expanded slow tier.
+      # Allow 45 minutes for tests, with 15 additional minutes in the job
+      # timeout for setup and report uploads. Keep the tripwire enabled so
+      # further growth remains visible before the job is forcibly cancelled.
+      - name: Run slow tests
+        id: slow_tests
+        env:
+          RAPTOR_RANDOMISE_TESTS: ${{ github.run_id }}
+          RAPTOR_MAX_SESSION_SECONDS: '2700'
+        run: |
+          source $VENV_PATH/bin/activate
+          # .github test dirs included for their slow-marked
+          # whole-repo import-graph classes (excluded from ci-lint's
+          # bounded PR job by the default addopts marker filter).
+          # The Semgrep engine directory is owned by semgrep-regressions;
+          # core/package Semgrep consumers continue to run in this job.
+          # Keep shared module fixtures on one worker and retain seeded
+          # module ordering. Use two workers on the existing runner;
+          # no extra toolchain installs. Mixed slow/integration cases belong
+          # to the integration phase so they execute once per nightly.
+          python -m pytest -n 2 --dist loadfile --no-loadscope-reorder -m "slow and not integration" core packages engine .github/tests .github/scripts/tests \
+            --ignore=engine/semgrep/tests \
+            --deselect=packages/semgrep/tests/test_runner.py::TestSandboxMetadataIntegration --ignore=packages/codeql/tests/test_pack_dependency_resolution.py -q --durations=25 \
+            --junitxml="$RUNNER_TEMP/slow.xml"
+
+      # Full-collection lane, so --full: a count below the recorded
+      # one is stale headroom worth a warning, not a filtered subset.
+      - name: Check slow-lane skip count against its recorded budget
+        if: ${{ !cancelled() && (steps.slow_tests.outcome == 'success' || steps.slow_tests.outcome == 'failure') }}
+        run: |
+          python3 .github/scripts/check_skip_budget.py \
+            --lane nightly-slow --full \
+            --junit-xml "$RUNNER_TEMP/slow.xml"
+
+      - name: Run integration tests (retry failed cases once)
+        id: integration_tests
+        # Preserve integration coverage after a slow-test or skip-budget
+        # failure. Require the slow step to have run so setup failures
+        # do not launch tests in an unprepared environment.
+        if: ${{ !cancelled() && (steps.slow_tests.outcome == 'success' || steps.slow_tests.outcome == 'failure') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          source $VENV_PATH/bin/activate
+          # Keep the same roots as the slow phase: mixed-marker cases in
+          # the CI checker suites must retain an integration owner too.
+          guard_attempt="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          export RAPTOR_PYTEST_GUARD_ATTEMPT="$guard_attempt"
+          export RAPTOR_PYTEST_GUARD_REPORT="$RUNNER_TEMP/integration-guards-1.json"
+          rm -f -- "$RAPTOR_PYTEST_GUARD_REPORT"
+          rc=0
+          python -m pytest -o "cache_dir=$RUNNER_TEMP/integration-pytest-cache" --cache-clear -m integration core packages engine .github/tests .github/scripts/tests \
+            --ignore=engine/semgrep/tests \
+            --deselect=packages/semgrep/tests/test_runner.py::TestSandboxMetadataIntegration --ignore=packages/codeql/tests/test_pack_dependency_resolution.py --durations=25 \
+            --tb=short --junitxml="$RUNNER_TEMP/integration-attempt-1.xml" \
+            || rc=$?
+          # Keep a full report even when retry is inappropriate or fails.
+          if [ -f "$RUNNER_TEMP/integration-attempt-1.xml" ]; then
+            cp "$RUNNER_TEMP/integration-attempt-1.xml" "$RUNNER_TEMP/integration.xml"
+          fi
+          if ! python3 .github/scripts/pytest_retry_reports.py guards "$RUNNER_TEMP/integration-guards-1.json" "$guard_attempt"; then
+            if [ "$rc" -eq 0 ]; then rc=1; fi
+            exit "$rc"
+          fi
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          # Collection/internal/usage errors and session-level failures do
+          # not become another complete test run.
+          if [ "$rc" -ne 1 ] || ! python3 .github/scripts/pytest_retry_reports.py eligible "$RUNNER_TEMP/integration-attempt-1.xml" "$RUNNER_TEMP/integration-pytest-cache" --guard-report "$RUNNER_TEMP/integration-guards-1.json" --attempt "$guard_attempt"; then
+            exit "$rc"
+          fi
+          echo ""
+          echo "::warning::Integration tests failed (exit $rc) — retrying only failed cases in 60s"
+          echo ""
+          sleep 60
+          export RAPTOR_PYTEST_GUARD_REPORT="$RUNNER_TEMP/integration-guards-2.json"
+          export RAPTOR_PYTEST_GUARD_ATTEMPT="${guard_attempt}-retry"
+          rm -f -- "$RAPTOR_PYTEST_GUARD_REPORT"
+          retry_rc=0
+          python -m pytest -o "cache_dir=$RUNNER_TEMP/integration-pytest-cache" --lf --last-failed-no-failures=none -m integration core packages engine .github/tests .github/scripts/tests \
+            --ignore=engine/semgrep/tests \
+            --deselect=packages/semgrep/tests/test_runner.py::TestSandboxMetadataIntegration --ignore=packages/codeql/tests/test_pack_dependency_resolution.py --durations=25 \
+            --tb=short --junitxml="$RUNNER_TEMP/integration-attempt-2.xml" \
+            || retry_rc=$?
+          python3 .github/scripts/pytest_retry_reports.py merge \
+            "$RUNNER_TEMP/integration-attempt-1.xml" "$RUNNER_TEMP/integration-attempt-2.xml" \
+            "$RUNNER_TEMP/integration.xml"
+          exit "$retry_rc"
+
+      # The effective report retains first-pass successes/skips and replaces
+      # only failed cases. Both raw attempts remain available as artifacts.
+      - name: Check integration skip count against its recorded budget
+        if: ${{ !cancelled() && (steps.integration_tests.outcome == 'success' || steps.integration_tests.outcome == 'failure') }}
+        run: |
+          python3 .github/scripts/check_skip_budget.py \
+            --lane nightly-integration --full \
+            --junit-xml "$RUNNER_TEMP/integration.xml"
+
+      # Backstop for the continue-on-error toolchain install above: the
+      # r2 / llvm-cov test families skip-with-reason when their binaries
+      # are absent, so a persistently broken install would read as a
+      # green nightly with those families never executing. Verify the
+      # tools actually landed and fail the run with a named reason if
+      # not. Runs AFTER the test steps (and even when they failed) so
+      # the toolchain-independent signal is still collected either way.
+      # Trade-off both ways: checking earlier would save the ~30 min of
+      # tests on a broken mirror day but would also discard the healthy
+      # families' signal; checking here keeps the signal and still
+      # refuses the silent-skip rot.
+      - name: Refuse a toolchain-less binary-analysis nightly
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          missing=""
+          command -v r2 >/dev/null 2>&1 || missing="$missing radare2"
+          /usr/lib/llvm-21/bin/llvm-cov --version >/dev/null 2>&1 \
+            || missing="$missing llvm-21"
+          if [ -n "$missing" ]; then
+            echo "::error::binary-analysis toolchain missing:${missing} —" \
+              "the r2/llvm test families above can only skip, so this" \
+              "nightly produced no binary-analysis signal. Check the" \
+              "toolchain install step's log."
+            exit 1
+          fi
+          echo "Toolchain present: r2 + llvm-21."
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: nightly-slow-integration-results
+          path: |
+            ${{ runner.temp }}/slow.xml
+            ${{ runner.temp }}/integration-attempt-*.xml
+            ${{ runner.temp }}/integration-guards-*.json
+            ${{ runner.temp }}/integration.xml
+          retention-days: 14
+          if-no-files-found: ignore
+
+  java-query-regressions:
+    name: Java query regressions
+    if: github.event_name != 'workflow_dispatch' || inputs.suite == 'full' || inputs.suite == 'java'
+    # Separate tool-backed regression: no optional-tool skip and no added
+    # time or memory contention in the existing slow/integration job.
+    runs-on: ubuntu-latest
+    # Measured native-suite and production-check components total about
+    # 20 minutes at 4 GiB; leave room for setup and hosted-runner variance.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961  # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Read pinned CodeQL cache identity
+        id: codeql_identity
+        run: python3 .github/scripts/ci_cache_key.py --kind codeql
+
+      - name: Restore CodeQL CLI
+        id: codeql_cli
+        continue-on-error: true  # Cache availability must not gate execution.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/java-log-codeql
+          key: ${{ steps.codeql_identity.outputs.key }}
+
+      - name: Install CodeQL CLI
+        env:
+          CODEQL_VERSION: ${{ steps.codeql_identity.outputs.version }}
+          CODEQL_SHA256: ${{ steps.codeql_identity.outputs.sha256 }}
+        if: steps.codeql_cli.outcome != 'success' || steps.codeql_cli.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            "https://github.com/github/codeql-cli-binaries/releases/download/v${CODEQL_VERSION}/codeql-linux64.zip" \
+            --output "$RUNNER_TEMP/codeql-linux64.zip"
+          printf '%s  %s\n' \
+            "$CODEQL_SHA256" \
+            "$RUNNER_TEMP/codeql-linux64.zip" | sha256sum --check
+          rm -rf "$RUNNER_TEMP/java-log-codeql"
+          mkdir -p "$RUNNER_TEMP/java-log-codeql"
+          unzip -q -o "$RUNNER_TEMP/codeql-linux64.zip" -d "$RUNNER_TEMP/java-log-codeql"
+
+      - name: Save CodeQL CLI
+        if: steps.codeql_cli.outcome != 'success' || steps.codeql_cli.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/java-log-codeql
+          key: ${{ steps.codeql_identity.outputs.key }}
+
+      - name: Checkout matching CodeQL Java libraries
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: github/codeql
+          # Immutable checkout pin; kept in sync with codeql-cli.json by tests.
+          ref: 28b6aa8616a393ebb45186e3ba4df004a0f3ef4e
+          path: .codeql-java-libraries
+          sparse-checkout: |
+            java/ql/lib
+            shared
+          persist-credentials: false
+
+      - name: Run Java query regressions
+        run: |
+          set -euo pipefail
+          cli="$RUNNER_TEMP/java-log-codeql/codeql/codeql"
+          "$cli" version
+          mkdir -p "$RUNNER_TEMP/java-query-tests"
+          cp -R engine/codeql/queries "$RUNNER_TEMP/java-query-tests/queries"
+          cp -R engine/codeql/tests/java "$RUNNER_TEMP/java-query-tests/tests"
+          "$cli" test run --threads=2 --ram=4096 --format=json \
+            --search-path="$GITHUB_WORKSPACE/.codeql-java-libraries" \
+            --additional-packs="$RUNNER_TEMP/java-query-tests/queries/java:$RUNNER_TEMP/java-query-tests/tests" \
+            "$RUNNER_TEMP/java-query-tests/tests/log-injection" \
+            "$RUNNER_TEMP/java-query-tests/tests/deserialization" \
+            "$RUNNER_TEMP/java-query-tests/tests/xxe" \
+            > "$RUNNER_TEMP/java-query-tests/results.json"
+
+      - name: Compile production Java log and deserialization queries
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/java-log-codeql/codeql/codeql" query compile --threads=2 --ram=4096 \
+            --search-path="$GITHUB_WORKSPACE/.codeql-java-libraries" \
+            --additional-packs="$RUNNER_TEMP/java-query-tests/queries/java" \
+            "$RUNNER_TEMP/java-query-tests/queries/java/LogInjection.ql" \
+            "$RUNNER_TEMP/java-query-tests/queries/java/InsecureDeserialization.ql" \
+            2>&1 | tee "$RUNNER_TEMP/java-query-tests/production-compile.log"
+
+      # The native XXE suite executes the shared production logic. Check
+      # the thin reporting wrapper without repeating its costly optimizer run.
+      - name: Check production Java XXE query
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/java-log-codeql/codeql/codeql" query compile --check-only --threads=2 --ram=4096 \
+            --search-path="$GITHUB_WORKSPACE/.codeql-java-libraries" \
+            --additional-packs="$RUNNER_TEMP/java-query-tests/queries/java" \
+            "$RUNNER_TEMP/java-query-tests/queries/java/XXEDocumentBuilder.ql" \
+            2>&1 | tee "$RUNNER_TEMP/java-query-tests/xxe-production-check.log"
+
+      - name: Upload Java query test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: focused-codeql-java-regression-results
+          path: |
+            ${{ runner.temp }}/java-query-tests/results.json
+            ${{ runner.temp }}/java-query-tests/tests/log-injection/*.actual
+            ${{ runner.temp }}/java-query-tests/tests/log-injection/*.expected
+            ${{ runner.temp }}/java-query-tests/tests/deserialization/*.actual
+            ${{ runner.temp }}/java-query-tests/tests/deserialization/*.expected
+            ${{ runner.temp }}/java-query-tests/tests/xxe/*.actual
+            ${{ runner.temp }}/java-query-tests/tests/xxe/*.expected
+            ${{ runner.temp }}/java-query-tests/production-compile.log
+            ${{ runner.temp }}/java-query-tests/xxe-production-check.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  cpp-query-regressions:
+    name: C/C++ query regressions
+    if: github.event_name != 'workflow_dispatch' || inputs.suite == 'full' || inputs.suite == 'cpp'
+    # Independent of the Java and slow/integration jobs. Reuse the pinned
+    # CLI cache; keep C/C++ libraries and native tests in this job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned CodeQL cache identity
+        id: codeql_identity
+        run: python3 .github/scripts/ci_cache_key.py --kind codeql
+
+      - name: Restore CodeQL CLI
+        id: codeql_cli
+        continue-on-error: true  # Cache availability must not gate execution.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/java-log-codeql
+          key: ${{ steps.codeql_identity.outputs.key }}
+
+      - name: Install CodeQL CLI
+        env:
+          CODEQL_VERSION: ${{ steps.codeql_identity.outputs.version }}
+          CODEQL_SHA256: ${{ steps.codeql_identity.outputs.sha256 }}
+        if: steps.codeql_cli.outcome != 'success' || steps.codeql_cli.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            "https://github.com/github/codeql-cli-binaries/releases/download/v${CODEQL_VERSION}/codeql-linux64.zip" \
+            --output "$RUNNER_TEMP/codeql-linux64.zip"
+          printf '%s  %s\n' \
+            "$CODEQL_SHA256" \
+            "$RUNNER_TEMP/codeql-linux64.zip" | sha256sum --check
+          rm -rf "$RUNNER_TEMP/java-log-codeql"
+          mkdir -p "$RUNNER_TEMP/java-log-codeql"
+          unzip -q -o "$RUNNER_TEMP/codeql-linux64.zip" -d "$RUNNER_TEMP/java-log-codeql"
+
+      - name: Save CodeQL CLI
+        if: steps.codeql_cli.outcome != 'success' || steps.codeql_cli.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/java-log-codeql
+          key: ${{ steps.codeql_identity.outputs.key }}
+
+      - name: Checkout matching CodeQL C/C++ libraries
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: github/codeql
+          # Immutable checkout pin; kept in sync with codeql-cli.json by tests.
+          ref: 28b6aa8616a393ebb45186e3ba4df004a0f3ef4e
+          path: .codeql-cpp-libraries
+          sparse-checkout: |
+            cpp/ql/lib
+            shared
+          persist-credentials: false
+
+      - name: Set up Python for sandbox dependency regressions
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore or rebuild the project venv
+        uses: ./.github/actions/setup-venv
+        with:
+          save-on-rebuild: 'true'
+
+      - name: Verify sandboxed custom-pack dependency discovery
+        env:
+          CODEQL_CLI: ${{ runner.temp }}/java-log-codeql/codeql/codeql
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          "$CODEQL_CLI" version
+          python -m pytest packages/codeql/tests/test_pack_dependency_resolution.py -m integration -q \
+            --junitxml="$RUNNER_TEMP/codeql-dependencies.xml"
+          python - "$RUNNER_TEMP/codeql-dependencies.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse(sys.argv[1]).getroot().iter("testcase"))
+          if not cases or any(case.find("skipped") is not None for case in cases):
+              sys.exit("CodeQL dependency regressions must execute without skips")
+          print(f"Verified {len(cases)} sandbox dependency regressions")
+          PY
+
+      - name: Compile fixtures with system headers
+        run: |
+          set -euo pipefail
+          gcc --version
+          g++ --version
+          mkdir -p "$RUNNER_TEMP/cpp-query-tests"
+          # Without __CODEQL_TEST__, the fixtures use system headers.
+          gcc -c engine/codeql/tests/cpp/truncation/TruncationCases.c \
+            -o "$RUNNER_TEMP/cpp-query-tests/c.o"
+          g++ -c engine/codeql/tests/cpp/truncation/TruncationCases.cpp \
+            -o "$RUNNER_TEMP/cpp-query-tests/cpp.o"
+          gcc -c engine/codeql/tests/cpp/truncation/ImplicitAllocation.c \
+            -o "$RUNNER_TEMP/cpp-query-tests/implicit-c.o"
+          g++ -c engine/codeql/tests/cpp/truncation/ImplicitAllocation.cpp \
+            -o "$RUNNER_TEMP/cpp-query-tests/implicit-cpp.o"
+          # The bare discarded-move negative deliberately ignores nodiscard.
+          g++ -std=c++17 -Wno-unused-result -c engine/codeql/tests/cpp/use-after-move/MoveCases.cpp \
+            -o "$RUNNER_TEMP/cpp-query-tests/move.o"
+          g++ -std=c++17 -c engine/codeql/tests/cpp/iterator-invalidation/IteratorCases.cpp \
+            -o "$RUNNER_TEMP/cpp-query-tests/iterator.o"
+          g++ -std=c++17 -c engine/codeql/tests/cpp/format-string/FormatCases.cpp \
+            -o "$RUNNER_TEMP/cpp-query-tests/format.o"
+
+      - name: Run C/C++ query regressions
+        run: |
+          set -euo pipefail
+          cli="$RUNNER_TEMP/java-log-codeql/codeql/codeql"
+          "$cli" version
+          cp -R engine/codeql/queries/cpp "$RUNNER_TEMP/cpp-query-tests/queries"
+          cp -R engine/codeql/tests/cpp "$RUNNER_TEMP/cpp-query-tests/tests"
+          "$cli" test run --threads=2 --ram=4096 --format=json \
+            --search-path="$GITHUB_WORKSPACE/.codeql-cpp-libraries" \
+            --additional-packs="$RUNNER_TEMP/cpp-query-tests/queries:$RUNNER_TEMP/cpp-query-tests/tests" \
+            "$RUNNER_TEMP/cpp-query-tests/tests/truncation" \
+            "$RUNNER_TEMP/cpp-query-tests/tests/use-after-move" \
+            "$RUNNER_TEMP/cpp-query-tests/tests/iterator-invalidation" \
+            "$RUNNER_TEMP/cpp-query-tests/tests/format-string" \
+            > "$RUNNER_TEMP/cpp-query-tests/results.json"
+
+      - name: Check production C/C++ query wrappers
+        run: |
+          set -euo pipefail
+          # The native test executes the shared production flow. Avoid
+          # repeating optimization just for the thin reporting wrapper.
+          "$RUNNER_TEMP/java-log-codeql/codeql/codeql" query compile --check-only --threads=2 --ram=4096 \
+            --search-path="$GITHUB_WORKSPACE/.codeql-cpp-libraries" \
+            --additional-packs="$RUNNER_TEMP/cpp-query-tests/queries" \
+            "$RUNNER_TEMP/cpp-query-tests/queries/IntegerTruncationInCast.ql" \
+            "$RUNNER_TEMP/cpp-query-tests/queries/ImplicitNarrowingAllocation.ql" \
+            "$RUNNER_TEMP/cpp-query-tests/queries/UseAfterMove.ql" \
+            "$RUNNER_TEMP/cpp-query-tests/queries/IteratorInvalidation.ql" \
+            "$RUNNER_TEMP/cpp-query-tests/queries/FormatStringFromUntrusted.ql" \
+            2>&1 | tee "$RUNNER_TEMP/cpp-query-tests/production-check.log"
+
+      - name: Upload C/C++ query test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: focused-codeql-cpp-regression-results
+          path: |
+            ${{ runner.temp }}/codeql-dependencies.xml
+            ${{ runner.temp }}/cpp-query-tests/results.json
+            ${{ runner.temp }}/cpp-query-tests/tests/truncation/*.actual
+            ${{ runner.temp }}/cpp-query-tests/tests/truncation/*.expected
+            ${{ runner.temp }}/cpp-query-tests/tests/use-after-move/*.actual
+            ${{ runner.temp }}/cpp-query-tests/tests/use-after-move/*.expected
+            ${{ runner.temp }}/cpp-query-tests/tests/iterator-invalidation/*.actual
+            ${{ runner.temp }}/cpp-query-tests/tests/iterator-invalidation/*.expected
+            ${{ runner.temp }}/cpp-query-tests/tests/format-string/*.actual
+            ${{ runner.temp }}/cpp-query-tests/tests/format-string/*.expected
+            ${{ runner.temp }}/cpp-query-tests/production-check.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  semgrep-regressions:
+    if: github.event_name != 'workflow_dispatch' || inputs.suite == 'full' || inputs.suite == 'semgrep'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
+            .github/scripts/semgrep-cli.txt
+
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-scan-regressions
+          save-on-rebuild: 'true'
+
+      - name: Install Semgrep
+        run: |
+          uv tool install --python "$(command -v python3)" "$(cat .github/scripts/semgrep-cli.txt)"
+          semgrep --version
+
+      - name: Run Semgrep engine regressions
+        env:
+          RAPTOR_RANDOMISE_TESTS: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          # Own the engine's nightly cases. Directory discovery keeps newly
+          # marked tests covered; the broad slow/integration steps exclude it.
+          python -m pytest engine/semgrep/tests \
+            packages/semgrep/tests/test_runner.py::TestSandboxMetadataIntegration \
+            -m 'slow or integration' -q \
+            --basetemp="$RUNNER_TEMP/semgrep-tests" \
+            --junitxml="$RUNNER_TEMP/scan-regressions.xml"
+          python - "$RUNNER_TEMP/scan-regressions.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse(sys.argv[1]).getroot().iter("testcase"))
+          if not cases:
+              sys.exit("No Semgrep regression tests executed")
+          skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
+          if skipped:
+              sys.exit(f"Semgrep regression tests skipped: {skipped}")
+          print(f"Verified {len(cases)} Semgrep regressions executed without skips")
+          PY
+
+      - name: Upload Semgrep test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: focused-semgrep-regression-results
+          path: |
+            ${{ runner.temp }}/scan-regressions.xml
+            ${{ runner.temp }}/semgrep-tests/**/sandbox-diagnostics.json
+            ${{ runner.temp }}/semgrep-tests/**/sandbox-stderr.txt
+            ${{ runner.temp }}/semgrep-tests/**/sandbox-replay-stderr.txt
+            ${{ runner.temp }}/semgrep-tests/**/sandbox-observe.jsonl
+          retention-days: 14
+          if-no-files-found: ignore

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Goal-Directed Planning - High-Level Objective Achievement
+Goal-Directed Planning - Goal Parsing and Crash Re-ranking
 
-This module enables RAPTOR to work towards user-specified goals:
-- "Find heap overflow vulnerabilities"
-- "Target parser code"
-- "Achieve remote code execution"
-- "Test authentication bypass"
+Parses user-specified goals ("find heap overflow vulnerabilities",
+"target parser code", "achieve remote code execution") into
+structured Goal objects, and re-ranks crashes by goal alignment.
+Goals steer prioritisation only — the fuzz loop's duration and stop
+conditions are the operator's timer, not goal state.
 """
 
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from core.logging import get_logger
 
@@ -33,7 +33,7 @@ class Goal:
     """A high-level goal to achieve."""
     goal_type: GoalType
     description: str  # Human-readable description
-    target_value: Optional[str] = None  # Target value (e.g., "heap_overflow")
+    target_value: str | None = None  # Target value (e.g., "heap_overflow")
 
     # Progress tracking
     progress: float = 0.0  # 0.0 to 1.0
@@ -41,42 +41,47 @@ class Goal:
     start_time: float = field(default_factory=time.time)
 
     # Strategy adjustments for this goal
-    strategy_hints: Dict[str, Any] = field(default_factory=dict)
+    strategy_hints: dict[str, Any] = field(default_factory=dict)
 
 
 class GoalPlanner:
-    """
-    Plans actions to achieve high-level goals.
+    """Parses operator goals and re-ranks crashes against them.
 
-    Transforms abstract goals like "find heap overflow" into concrete
-    fuzzing strategies and analysis priorities.
+    Historic goal-progress methods (adapt_fuzzing_strategy /
+    update_goal_progress / should_continue_towards_goal) were removed:
+    they had no production caller, and should_continue_towards_goal
+    looped forever on FIND_VULNERABILITY_TYPE goals — no code path
+    ever set ``achieved`` for that goal type. Any future stop-
+    condition wiring must close that loop (verify the crash type
+    actually matches) before consulting goal state.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize goal planner."""
-        self.current_goal: Optional[Goal] = None
-        self.goal_history: List[Goal] = []
+        self.current_goal: Goal | None = None
+        self.goal_history: list[Goal] = []
         logger.info("Goal-directed planner initialized")
 
-    def set_goal(self, goal: Goal):
+    def set_goal(self, goal: Goal) -> None:
         """
         Set a new goal to work towards.
 
         Args:
             goal: Goal to achieve
         """
-        if self.current_goal and not self.current_goal.achieved:
-            logger.info(f"Replacing current goal: {self.current_goal.description}")
+        if self.current_goal:
+            if not self.current_goal.achieved:
+                logger.info("Replacing current goal: %s", self.current_goal.description)
             self.goal_history.append(self.current_goal)
 
         self.current_goal = goal
         logger.info("=" * 70)
         logger.info("NEW GOAL SET")
         logger.info("=" * 70)
-        logger.info(f"Goal: {goal.description}")
-        logger.info(f"Type: {goal.goal_type.value}")
+        logger.info("Goal: %s", goal.description)
+        logger.info("Type: %s", goal.goal_type.value)
         if goal.target_value:
-            logger.info(f"Target: {goal.target_value}")
+            logger.info("Target: %s", goal.target_value)
 
     def create_goal_from_user_input(self, user_goal: str) -> Goal:
         """
@@ -93,7 +98,7 @@ class GoalPlanner:
         # Detect goal type from user input
         if any(vuln in user_goal_lower for vuln in [
             "heap overflow", "stack overflow", "use-after-free",
-            "buffer overflow", "null pointer"
+            "buffer overflow", "null pointer", "uaf"
         ]):
             # Extract vulnerability type
             if "heap overflow" in user_goal_lower:
@@ -118,7 +123,7 @@ class GoalPlanner:
                 }
             )
 
-        elif any(code_area in user_goal_lower for code_area in [
+        if any(code_area in user_goal_lower for code_area in [
             "parser", "network", "authentication", "crypto"
         ]):
             # Target specific code area
@@ -143,7 +148,7 @@ class GoalPlanner:
                 }
             )
 
-        elif any(exploit in user_goal_lower for exploit in [
+        if any(exploit in user_goal_lower for exploit in [
             "rce", "code execution", "shell", "exploit"
         ]):
             return Goal(
@@ -156,7 +161,7 @@ class GoalPlanner:
                 }
             )
 
-        elif "coverage" in user_goal_lower or "explore" in user_goal_lower:
+        if "coverage" in user_goal_lower or "explore" in user_goal_lower:
             return Goal(
                 goal_type=GoalType.MAXIMIZE_COVERAGE,
                 description=user_goal,
@@ -166,58 +171,16 @@ class GoalPlanner:
                 }
             )
 
-        else:
-            # Default: find any crash
-            return Goal(
-                goal_type=GoalType.FIND_ANY_CRASH,
-                description=user_goal,
-                strategy_hints={
-                    "fast_mode": True,
-                }
-            )
+        # Default: find any crash
+        return Goal(
+            goal_type=GoalType.FIND_ANY_CRASH,
+            description=user_goal,
+            strategy_hints={
+                "fast_mode": True,
+            }
+        )
 
-    def adapt_fuzzing_strategy(self, base_strategy: Dict) -> Dict:
-        """
-        Adapt fuzzing strategy based on current goal.
-
-        Args:
-            base_strategy: Base fuzzing strategy
-
-        Returns:
-            Goal-adapted strategy
-        """
-        if not self.current_goal:
-            return base_strategy
-
-        adapted = base_strategy.copy()
-        hints = self.current_goal.strategy_hints
-
-        # Apply strategy hints
-        if hints.get("focus_on_memory"):
-            logger.info("Goal: Focusing on memory operations")
-            adapted["extra_flags"] = adapted.get("extra_flags", []) + ["-m", "none"]
-
-        if hints.get("enable_asan"):
-            logger.info("Goal: Recommending ASAN for memory bugs")
-            # This is a hint to the user, can't force it
-
-        if hints.get("mutation_strategy") == "aggressive":
-            logger.info("Goal: Using aggressive mutations")
-            adapted["extra_flags"] = adapted.get("extra_flags", []) + ["-L", "0"]
-
-        if hints.get("mutation_strategy") == "diverse":
-            logger.info("Goal: Using diverse mutations")
-            adapted["extra_flags"] = adapted.get("extra_flags", []) + ["-D"]
-
-        if hints.get("parallel_instances"):
-            from core.tuning import get_tuning
-            ceiling = get_tuning().max_fuzz_parallel
-            adapted["parallel"] = min(hints["parallel_instances"], ceiling)
-            logger.info(f"Goal: Using {adapted['parallel']} parallel instances")
-
-        return adapted
-
-    def prioritize_crashes_for_goal(self, crashes: List) -> List:
+    def prioritize_crashes_for_goal(self, crashes: list) -> list:
         """
         Prioritize crashes based on current goal.
 
@@ -245,14 +208,14 @@ class GoalPlanner:
                 crash_type = getattr(crash, 'crash_type', 'unknown')
                 if goal.target_value and goal.target_value in crash_type:
                     goal_bonus = 100.0  # Huge bonus for exact match
-                    logger.info(f"✨ Crash {crash.crash_id} matches goal: {goal.target_value}")
+                    logger.info("✨ Crash %s matches goal: %s", crash.crash_id, goal.target_value)
 
             elif goal.goal_type == GoalType.TARGET_CODE_AREA:
                 # Check if crash is in target code area
                 function_name = getattr(crash, 'function_name', '')
                 if goal.target_value and goal.target_value in function_name.lower():
                     goal_bonus = 50.0
-                    logger.info(f"✨ Crash {crash.crash_id} in target area: {goal.target_value}")
+                    logger.info("✨ Crash %s in target area: %s", crash.crash_id, goal.target_value)
 
             elif goal.goal_type == GoalType.ACHIEVE_EXPLOIT_TYPE:
                 # Prioritize highly exploitable crashes
@@ -267,70 +230,14 @@ class GoalPlanner:
 
         return [c for c, s in scored_crashes]
 
-    def update_goal_progress(self, fuzzing_state):
+    def get_summary(self) -> dict:
+        """Get summary of goals and progress.
+
+        ``progress`` / ``achieved`` are static defaults today: no
+        production path advances them (the progress updater was
+        removed as dead code). The keys stay for report-shape
+        compatibility.
         """
-        Update progress towards current goal.
-
-        Args:
-            fuzzing_state: Current fuzzing state
-        """
-        if not self.current_goal:
-            return
-
-        goal = self.current_goal
-
-        if goal.goal_type == GoalType.FIND_ANY_CRASH:
-            if fuzzing_state.total_crashes > 0:
-                goal.progress = 1.0
-                goal.achieved = True
-                logger.info(f"✓ GOAL ACHIEVED: {goal.description}")
-
-        elif goal.goal_type == GoalType.MAXIMIZE_COVERAGE:
-            # Progress based on coverage growth rate
-            if fuzzing_state.total_coverage > 0:
-                # Normalize progress (arbitrary scale)
-                goal.progress = min(1.0, fuzzing_state.total_coverage / 10000.0)
-
-        elif goal.goal_type == GoalType.FIND_VULNERABILITY_TYPE:
-            # Check if we found the target vulnerability
-            if fuzzing_state.total_crashes > 0:
-                # Would need to check crash types
-                goal.progress = 0.5  # Partial progress for finding any crash
-
-        # Log progress
-        if goal.progress > 0:
-            logger.info(f"Goal progress: {goal.progress * 100:.1f}%")
-
-    def should_continue_towards_goal(self, fuzzing_state) -> bool:
-        """
-        Decide if we should continue fuzzing to achieve goal.
-
-        Args:
-            fuzzing_state: Current fuzzing state
-
-        Returns:
-            True if should continue
-        """
-        if not self.current_goal:
-            return True  # No goal, use default logic
-
-        goal = self.current_goal
-
-        # If goal achieved, we can stop
-        if goal.achieved:
-            logger.info(f"Goal achieved: {goal.description}")
-            return False
-
-        # If goal is to find specific vulnerability, keep going until found
-        if goal.goal_type == GoalType.FIND_VULNERABILITY_TYPE:
-            # Keep going if we haven't found it yet
-            return not goal.achieved
-
-        # Default: continue
-        return True
-
-    def get_summary(self) -> Dict:
-        """Get summary of goals and progress."""
         return {
             "current_goal": {
                 "description": self.current_goal.description,
@@ -339,5 +246,7 @@ class GoalPlanner:
                 "achieved": self.current_goal.achieved,
             } if self.current_goal else None,
             "total_goals_attempted": len(self.goal_history) + (1 if self.current_goal else 0),
-            "goals_achieved": sum(1 for g in self.goal_history if g.achieved),
+            "goals_achieved": sum(1 for g in self.goal_history if g.achieved) + (
+                1 if self.current_goal and self.current_goal.achieved else 0
+            ),
         }

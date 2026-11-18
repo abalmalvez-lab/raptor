@@ -1,0 +1,458 @@
+"""Offline panel-log replay harness — Phase 2d of the calibrated-aggregation arc.
+
+This is the **validation mechanism for the Phase 4 gate-flip
+decision**, not a research side-project: it is how we measure, on real
+historical data, whether the Dawid–Skene posterior would change verdicts
+enough to justify landing the deferred posterior-weighted scorecard
+update (Phase 4). Given one or more historical
+``orchestrated_report.json`` files, the harness:
+
+1. Loads every per-finding panel via :mod:`core.llm.multi_model.panel_log`.
+2. Recovers the *recorded* per-finding verdict — the
+   ``is_exploitable`` boolean the legacy majority-vote / primary-
+   selection pipeline produced.
+3. Re-aggregates the same panels with Dawid–Skene per decision class.
+4. Compares: how often does the calibrated posterior flip the verdict?
+   In which direction? What does per-model inferred reliability look
+   like on this corpus?
+
+The harness does *not* mutate the input files and does not touch any
+scorecard. It is read-only and side-effect-free except for stdout
+output and the optional ``--out`` files (the rendered report —
+markdown unless ``--json`` — plus a ``.json`` sibling).
+
+Why it ships as a CLI now even though phase 3 already attaches
+calibrated verdicts inline at orchestration time:
+
+* The replay can run across **many** historical runs at once, so
+  the per-model reliability EM has much more data to converge on
+  than any single orchestration sees.
+* Operators with a corpus of historical scans (a research dataset,
+  a CI run history, a project's accumulated reports) can quantify
+  how often the new estimator would have produced a different
+  triage outcome — useful for understanding the impact of Phase 3
+  before it has accumulated its own bucket history.
+* It cleanly separates "the pipeline runs once per scan" from
+  "the question we want to answer is corpus-wide" — those have
+  different output shapes.
+
+The flip-rate is the headline number: how often does ``posterior >
+0.5`` disagree with the recorded ``is_exploitable``? A high flip
+rate on a known-good corpus suggests either calibration mismatch
+or that the historical pipeline was systematically miscalibrated
+in ways D–S can recover.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from collections.abc import Sequence
+from typing import TypedDict
+
+from core.atomic_fs import write_text_atomically
+from core.json import dumps_artifact, load_json
+from core.llm.multi_model.dawid_skene import (
+    DawidSkeneResult,
+    estimate_partitioned,
+)
+from core.llm.multi_model.panel_log import (
+    DEFAULT_DECISION_CLASS_PREFIX,
+    discover_reports,
+    load_from_paths,
+)
+from core.llm.scorecard.priors import (
+    BetaPrior,
+    uniform_prior,
+)
+from core.run.finding_status import read_verdict
+
+
+# Flip = D–S posterior > 0.5 disagrees with recorded is_exploitable.
+# Direction tags so downstream readers know which way the verdict moved.
+FLIP_TO_EXPLOITABLE = "to_exploitable"
+FLIP_TO_NOT_EXPLOITABLE = "to_not_exploitable"
+NO_FLIP = "no_flip"
+# The recorded pipeline never concluded on this finding (verdict
+# missing / nulled) — there is nothing to flip FROM. Bucketed
+# separately: counting these as NO_FLIP silently deflated flip_rate.
+NO_RECORDED_VERDICT = "no_recorded_verdict"
+
+
+# ---------------------------------------------------------------------------
+# Output shapes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FindingComparison:
+    """Per-finding before/after the calibrated estimator."""
+    finding_id: str
+    decision_class: str
+    recorded_is_exploitable: bool | None   # the original verdict
+    posterior_true_positive: float
+    credible_interval_lo: float
+    credible_interval_hi: float
+    n_models: int
+    flip: str  # FLIP_TO_EXPLOITABLE | FLIP_TO_NOT_EXPLOITABLE | NO_FLIP
+
+
+class ModelReliabilityRow(TypedDict):
+    model: str
+    alpha: float
+    beta: float
+
+
+@dataclass(frozen=True)
+class ClassSummary:
+    """Per-decision-class roll-up."""
+    decision_class: str
+    n_findings: int
+    n_flips_to_exploitable: int
+    n_flips_to_not_exploitable: int
+    converged: bool
+    iterations: int
+    model_reliabilities: list[ModelReliabilityRow] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReplayReport:
+    sources: list[str]
+    total_panels: int
+    total_findings_with_panel: int
+    distinct_models: list[str]
+    distinct_decision_classes: list[str]
+    findings: list[FindingComparison]
+    class_summaries: list[ClassSummary]
+    # Aggregate metrics — the headline numbers an operator scans first.
+    # Flip rates are computed over findings WITH a recorded verdict
+    # (the comparable set) — abstained findings are counted separately
+    # below, never as silent NO_FLIPs deflating the headline number.
+    flip_rate: float
+    flip_to_exploitable_rate: float
+    flip_to_not_exploitable_rate: float
+    posterior_distribution: dict[str, float]  # bin -> count
+    # Findings whose recorded pipeline never concluded (verdict
+    # missing / nulled). Additive field — JSON consumers tolerate
+    # extra keys.
+    n_no_recorded_verdict: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Loader: pair PanelRecords with their recorded verdict
+# ---------------------------------------------------------------------------
+
+
+def _recorded_verdict_index(
+    report_paths: Sequence[Path],
+) -> dict[str, bool | None]:
+    """Read each report and extract ``{finding_id: is_exploitable}``.
+
+    The replay needs this to compute flip rates. Stored separately
+    from PanelRecord so the panel_log loader stays narrow (its job
+    is per-model verdicts; the *aggregate* recorded verdict is a
+    different artefact).
+    """
+    out: dict[str, bool | None] = {}
+    for path in report_paths:
+        if not path.is_file():
+            continue
+        # Mirror panel_log's tolerance — bad files surfaced via
+        # the loader's own error path; here we just skip (None fails
+        # the dict gate) so a corrupt file in a big corpus doesn't
+        # abort the replay.
+        payload = load_json(path, max_bytes=64 * 1024 * 1024)
+        if not isinstance(payload, dict):
+            continue
+        results = payload.get("results")
+        if not isinstance(results, list):
+            continue
+        for finding in results:
+            if not isinstance(finding, dict):
+                continue
+            fid = finding.get("finding_id")
+            if not isinstance(fid, str):
+                continue
+            if fid in out:
+                # Same finding in multiple reports: FIRST record in
+                # path order wins — the same rule the estimator
+                # applies to duplicate (finding, model) panels
+                # (dawid_skene.estimate). Pre-fix this index kept the
+                # LAST file's verdict while the EM kept the first
+                # file's panels, so flips were computed against a
+                # different run than the one that fed the posterior.
+                continue
+            out[fid] = read_verdict(finding, "is_exploitable")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Comparator
+# ---------------------------------------------------------------------------
+
+
+def _flip_tag(recorded: bool | None, posterior: float) -> str:
+    if recorded is None:
+        return NO_RECORDED_VERDICT  # nothing to flip from
+    posterior_says_exploitable = posterior > 0.5
+    if recorded == posterior_says_exploitable:
+        return NO_FLIP
+    return FLIP_TO_EXPLOITABLE if posterior_says_exploitable else FLIP_TO_NOT_EXPLOITABLE
+
+
+# Posterior bin boundaries: tight near the centre because the
+# interesting research question is "how often does D-S land in the
+# uncertain band?" — fewer wide bins at the extremes.
+_POSTERIOR_BINS = [
+    (0.0, 0.05, "0.00-0.05"),
+    (0.05, 0.20, "0.05-0.20"),
+    (0.20, 0.40, "0.20-0.40"),
+    (0.40, 0.60, "0.40-0.60"),
+    (0.60, 0.80, "0.60-0.80"),
+    (0.80, 0.95, "0.80-0.95"),
+    (0.95, 1.0 + 1e-9, "0.95-1.00"),
+]
+
+
+def _bin_posteriors(posteriors: Sequence[float]) -> dict[str, float]:
+    counts: Counter = Counter()
+    for p in posteriors:
+        for lo, hi, label in _POSTERIOR_BINS:
+            if lo <= p < hi:
+                counts[label] += 1
+                break
+    # Always emit every bin so the rendered histogram has stable rows.
+    return {label: float(counts.get(label, 0)) for _, _, label in _POSTERIOR_BINS}
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def replay(
+    report_paths: Sequence[Path],
+    *,
+    prior: BetaPrior | None = None,
+    decision_class_prefix: str = DEFAULT_DECISION_CLASS_PREFIX,
+) -> ReplayReport:
+    """Re-aggregate panel records from historical reports and compare
+    against the recorded verdicts.
+
+    :param report_paths: List of ``orchestrated_report.json`` paths.
+        Use :func:`core.llm.multi_model.panel_log.discover_reports` to
+        find them under a root directory.
+    :param prior: Beta prior for the per-class incidence rate.
+        Defaults to :func:`uniform_prior` (Phase 1b's "no audit-
+        derived rate" stance).
+    """
+    prior = prior or uniform_prior()
+    panel_records = load_from_paths(
+        report_paths, decision_class_prefix=decision_class_prefix,
+    )
+    recorded_index = _recorded_verdict_index(report_paths)
+
+    if not panel_records:
+        return ReplayReport(
+            sources=[str(p) for p in report_paths],
+            total_panels=0,
+            total_findings_with_panel=0,
+            distinct_models=[],
+            distinct_decision_classes=[],
+            findings=[],
+            class_summaries=[],
+            flip_rate=0.0,
+            flip_to_exploitable_rate=0.0,
+            flip_to_not_exploitable_rate=0.0,
+            posterior_distribution=_bin_posteriors([]),
+        )
+
+    # Run D–S per decision class.
+    ds_results: list[DawidSkeneResult] = estimate_partitioned(
+        panel_records, priors={}, default_prior=prior,
+    )
+
+    findings: list[FindingComparison] = []
+    class_summaries: list[ClassSummary] = []
+    for ds_result in ds_results:
+        n_to_pos = 0
+        n_to_neg = 0
+        for fp in ds_result.findings:
+            recorded = recorded_index.get(fp.finding_id)
+            tag = _flip_tag(recorded, fp.posterior)
+            if tag == FLIP_TO_EXPLOITABLE:
+                n_to_pos += 1
+            elif tag == FLIP_TO_NOT_EXPLOITABLE:
+                n_to_neg += 1
+            findings.append(FindingComparison(
+                finding_id=fp.finding_id,
+                decision_class=fp.decision_class,
+                recorded_is_exploitable=recorded,
+                posterior_true_positive=fp.posterior,
+                credible_interval_lo=fp.credible_interval[0],
+                credible_interval_hi=fp.credible_interval[1],
+                n_models=fp.n_models,
+                flip=tag,
+            ))
+        class_summaries.append(ClassSummary(
+            decision_class=ds_result.decision_class,
+            n_findings=len(ds_result.findings),
+            n_flips_to_exploitable=n_to_pos,
+            n_flips_to_not_exploitable=n_to_neg,
+            converged=ds_result.converged,
+            iterations=ds_result.iterations,
+            model_reliabilities=[
+                ModelReliabilityRow(model=r.model, alpha=r.alpha, beta=r.beta)
+                for r in ds_result.model_reliabilities
+            ],
+        ))
+
+    total_findings = len(findings)
+    n_no_recorded = sum(
+        1 for f in findings if f.flip == NO_RECORDED_VERDICT
+    )
+    # Comparable set: findings with a recorded verdict to flip from.
+    n_comparable = total_findings - n_no_recorded
+    n_flips_pos = sum(1 for f in findings if f.flip == FLIP_TO_EXPLOITABLE)
+    n_flips_neg = sum(1 for f in findings if f.flip == FLIP_TO_NOT_EXPLOITABLE)
+    n_flips = n_flips_pos + n_flips_neg
+
+    distinct_models = sorted({r.model for r in panel_records})
+    distinct_classes = sorted({r.decision_class for r in panel_records})
+
+    return ReplayReport(
+        sources=[str(p) for p in report_paths],
+        total_panels=len(panel_records),
+        total_findings_with_panel=total_findings,
+        distinct_models=distinct_models,
+        distinct_decision_classes=distinct_classes,
+        findings=findings,
+        class_summaries=class_summaries,
+        flip_rate=(n_flips / n_comparable) if n_comparable else 0.0,
+        flip_to_exploitable_rate=(n_flips_pos / n_comparable) if n_comparable else 0.0,
+        flip_to_not_exploitable_rate=(n_flips_neg / n_comparable) if n_comparable else 0.0,
+        posterior_distribution=_bin_posteriors([f.posterior_true_positive for f in findings]),
+        n_no_recorded_verdict=n_no_recorded,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def render_markdown(report: ReplayReport) -> str:
+    from core.reporting.renderers import render_document
+    from .replay_document import build_document
+    return render_document(build_document(report), "markdown").content.decode("utf-8")
+
+
+def render_json(report: ReplayReport) -> str:
+    # The rendering is persisted to the replay output file AND written
+    # to the operator terminal by main() — the terminal half makes
+    # ensure_ascii load-bearing: without it, C1 controls (single-byte
+    # CSI/OSC) in orchestrated_report-derived strings pass through
+    # raw. ASCII output stays a valid JSON document for the parsing
+    # consumers (jq, downstream tooling) either way.
+    return dumps_artifact(asdict(report), sort_keys=True, ensure_ascii=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="panel-replay",
+        description=(
+            "Re-aggregate panel records from historical "
+            "orchestrated_report.json files with Dawid–Skene and "
+            "compare against the recorded verdicts. Research "
+            "instrument; read-only."
+        ),
+    )
+    parser.add_argument(
+        "paths", nargs="*", type=Path,
+        help=(
+            "Specific orchestrated_report.json files. If omitted, "
+            "pass --root to scan a directory for them."
+        ),
+    )
+    parser.add_argument(
+        "--root", type=Path, default=None,
+        help=(
+            "Root directory to scan recursively for "
+            "orchestrated_report.json files."
+        ),
+    )
+    parser.add_argument(
+        "--decision-class-prefix", default=DEFAULT_DECISION_CLASS_PREFIX,
+        help=(
+            "Decision-class key prefix. Default matches the "
+            "agentic / scorecard convention "
+            "('agentic:<rule_id>')."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON instead of markdown.",
+    )
+    parser.add_argument(
+        "--out", type=Path, default=None,
+        help=(
+            "Optional output file. If set, the rendered report is "
+            "written there *and* a structured copy is written "
+            "next to it with a .json suffix."
+        ),
+    )
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(parser)
+    args = parser.parse_args(argv)
+    report_options = options_from_args(args, parser) if args.report_format or args.report_output or args.no_report else None
+
+    paths: list[Path] = list(args.paths)
+    if args.root:
+        paths.extend(discover_reports(args.root))
+    if not paths:
+        sys.stderr.write(
+            "panel-replay: no paths supplied (pass orchestrated_report.json "
+            "paths positionally, or --root <dir> to discover)\n"
+        )
+        return 2
+
+    from .replay_completion import prepare
+    try:
+        prepare(report_options, paths, args.out)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    report = replay(
+        paths, decision_class_prefix=args.decision_class_prefix,
+    )
+    rendered = render_json(report) if args.json else render_markdown(report)
+    sys.stdout.write(rendered)
+    if not rendered.endswith("\n"):
+        sys.stdout.write("\n")
+
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomically(args.out, rendered)
+        json_out = args.out.with_suffix(args.out.suffix + ".json")
+        write_text_atomically(json_out, render_json(report))
+
+    try:
+        from .replay_completion import complete
+        complete(report, report_options, args.out)
+    except Exception as exc:  # noqa: BLE001 — optional presentation cannot change the completed replay
+        print("Optional replay report unavailable (" + type(exc).__name__ + "); native replay retained", file=sys.stderr)
+
+    # Exit 0 on any completed replay — informational, no pass/fail
+    # semantics.  (Usage errors return 2 above, before replaying.)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

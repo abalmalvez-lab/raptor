@@ -36,13 +36,20 @@ Limitations (also noted in :doc:`README`):
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import re
 import sqlite3
 import struct
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+from core.run.scratch import scratch_dir
+
+from .distro import release_ecosystem
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +65,29 @@ class InstalledPackage:
     ecosystem: str
     name: str
     version: str
-    source_layer_digest: Optional[str] = None
+
+
+class PackageDbLimitExceeded(Exception):
+    """Raised when a single package-state file yields more records
+    than :data:`MAX_PACKAGE_RECORDS`. The input files are size-capped
+    upstream (64 MiB/member), but minimal stanzas amplify bytes into
+    Python objects at a high constant factor — a hostile registry
+    image could otherwise drive a multi-GB heap spike. Real package
+    databases top out in the low tens of thousands of records."""
+
+
+# Per-file record ceiling for the parsers below. Debian's full
+# archive is ~70k packages; a single installed-state file above this
+# is hostile or corrupt, never real.
+MAX_PACKAGE_RECORDS = 300_000
+
+
+def _check_record_cap(records: list, source: str) -> None:
+    if len(records) >= MAX_PACKAGE_RECORDS:
+        raise PackageDbLimitExceeded(
+            f"{source} exceeds {MAX_PACKAGE_RECORDS} package records "
+            f"(bomb-shape); refusing"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +95,7 @@ class InstalledPackage:
 # ---------------------------------------------------------------------------
 
 
-def parse_dpkg_status(content: bytes) -> List[InstalledPackage]:
+def parse_dpkg_status(content: bytes) -> list[InstalledPackage]:
     """Parse ``var/lib/dpkg/status``.
 
     The format is RFC 822-ish: stanzas separated by blank lines,
@@ -80,7 +109,8 @@ def parse_dpkg_status(content: bytes) -> List[InstalledPackage]:
     Half-removed / unpacked / config-files-only states aren't
     real installs from a CVE-matching perspective.
     """
-    out: List[InstalledPackage] = []
+    out: list[InstalledPackage] = []
+    seen: set[tuple[str, str]] = set()
     text = content.decode("utf-8", errors="replace")
     for stanza in _split_rfc822_stanzas(text):
         fields = _parse_rfc822_stanza(stanza)
@@ -91,16 +121,37 @@ def parse_dpkg_status(content: bytes) -> List[InstalledPackage]:
             continue
         if not _dpkg_status_is_installed(status):
             continue
+        # OSV's Debian / Ubuntu feeds key advisories by SOURCE
+        # package name (DEBIAN-CVE-* for ``openssl``; nothing under
+        # the ``libssl1.1`` binary split). ``Source:`` may carry a
+        # version qualifier (``Source: openssl (1.1.0l-1)``) — use
+        # that source version rather than a binary rebuild suffix.
+        # Binary-only stanzas (no Source field) ARE their own
+        # source. Deduplicate per (source, version): one source
+        # builds many binaries and one advisory row is enough.
+        source = (fields.get("Source") or "").strip()
+        if source:
+            match = re.fullmatch(r"([a-z0-9][a-z0-9+.-]*)(?: \(([^()\s]+)\))?", source)
+            if not match:
+                raise ValueError("invalid dpkg Source field")
+            name, source_version = match[1], match[2] or version.strip()
+        else:
+            name, source_version = package.strip(), version.strip()
+        key = (name, source_version)
+        if key in seen:
+            continue
+        seen.add(key)
+        _check_record_cap(out, "dpkg status")
         out.append(InstalledPackage(
-            ecosystem="Debian", name=package.strip(),
-            version=version.strip(),
+            ecosystem="Debian", name=name,
+            version=source_version,
         ))
     return out
 
 
 def _split_rfc822_stanzas(text: str) -> Iterator[str]:
     """Split on blank lines. Tolerates Windows line endings."""
-    cur: List[str] = []
+    cur: list[str] = []
     for line in text.splitlines():
         if not line.strip():
             if cur:
@@ -116,25 +167,32 @@ def _parse_rfc822_stanza(stanza: str) -> dict:
     """Parse one RFC822-ish stanza into a {field: value} dict.
     Multi-line values (continuation lines indented by whitespace)
     get joined with the leading whitespace stripped per dpkg
-    convention."""
-    out: dict = {}
-    current_key: Optional[str] = None
+    convention.
+
+    Values accumulate as line lists and are joined once at the end.
+    The previous per-continuation-line ``out[key] = out.get(key, "")
+    + ...`` rebuilt a dict-held string on every line (the dict
+    reference keeps the refcount above 1, so CPython's in-place
+    concat fast path never applies) — O(n²) CPU on
+    attacker-controlled input: a 64 MiB member made entirely of
+    continuation lines burned hours in this loop.
+    """
+    parts: dict[str, list[str]] = {}
+    current_key: str | None = None
     for line in stanza.splitlines():
         if not line:
             continue
         if line[0].isspace():
             # Continuation of previous field's value.
             if current_key is not None:
-                out[current_key] = (
-                    out.get(current_key, "") + "\n" + line.strip()
-                )
+                parts[current_key].append(line.strip())
             continue
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
         current_key = key.strip()
-        out[current_key] = value.strip()
-    return out
+        parts[current_key] = [value.strip()]
+    return {key: "\n".join(lines) for key, lines in parts.items()}
 
 
 def _dpkg_status_is_installed(status: str) -> bool:
@@ -152,7 +210,7 @@ def _dpkg_status_is_installed(status: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def parse_apk_installed(content: bytes) -> List[InstalledPackage]:
+def parse_apk_installed(content: bytes) -> list[InstalledPackage]:
     """Parse ``lib/apk/db/installed``.
 
     Format: stanzas separated by blank lines. Each line is
@@ -165,19 +223,32 @@ def parse_apk_installed(content: bytes) -> List[InstalledPackage]:
     this file (uninstalled packages have their stanzas removed),
     so every parsed stanza is a real install.
     """
-    out: List[InstalledPackage] = []
+    out: list[InstalledPackage] = []
+    seen: set[tuple[str, str]] = set()
     text = content.decode("utf-8", errors="replace")
     for stanza in _split_rfc822_stanzas(text):
-        package: Optional[str] = None
-        version: Optional[str] = None
+        package: str | None = None
+        version: str | None = None
+        origin: str | None = None
         for line in stanza.splitlines():
             if line.startswith("P:"):
                 package = line[2:].strip()
             elif line.startswith("V:"):
                 version = line[2:].strip()
+            elif line.startswith("o:"):
+                # Origin (source) package — Alpine's secdb (and
+                # OSV's ALPINE-CVE mirror) key advisories by it,
+                # not by the subpackage split.
+                origin = line[2:].strip()
         if package and version:
+            name = origin or package
+            key = (name, version)
+            if key in seen:
+                continue
+            seen.add(key)
+            _check_record_cap(out, "apk installed db")
             out.append(InstalledPackage(
-                ecosystem="Alpine", name=package, version=version,
+                ecosystem="Alpine", name=name, version=version,
             ))
     return out
 
@@ -195,9 +266,36 @@ _RPMTAG_RELEASE = 1002
 _RPMTAG_EPOCH = 1003
 
 _RPMTAG_TYPE_STRING = 6
+_RPMTAG_TYPE_INT32 = 4
 
 
-def parse_rpm_sqlite(content: bytes) -> List[InstalledPackage]:
+@contextlib.contextmanager
+def _rpm_connection(content: bytes):
+    """Own the SQLite connection and every file its parser may leave behind."""
+    with scratch_dir("raptor-rpm-") as workspace:
+        path = workspace / "rpmdb.sqlite"
+        path.write_bytes(content)
+        # URI-escape the complete path: TMPDIR may legally contain '?' or '#'.
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        failed = False
+        try:
+            yield conn
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                conn.close()
+            except BaseException:
+                if not failed:
+                    raise
+                try:
+                    logger.warning("RPM database close failed for %s", path, exc_info=True)
+                except BaseException:
+                    pass  # Preserve the active operation error if its diagnostic fails.
+
+
+def parse_rpm_sqlite(content: bytes) -> list[InstalledPackage]:
     """Parse ``var/lib/rpm/rpmdb.sqlite``.
 
     The DB has a ``Packages`` table whose ``blob`` column holds
@@ -217,45 +315,62 @@ def parse_rpm_sqlite(content: bytes) -> List[InstalledPackage]:
     copy of the bytes — sqlite3 wants a path, not bytes. The
     tempfile is auto-cleaned on context exit.
     """
-    out: List[InstalledPackage] = []
-
-    with tempfile.NamedTemporaryFile(
-        prefix="raptor-rpm-", suffix=".sqlite", delete=False,
-    ) as fp:
-        fp.write(content)
-        tmp_path = Path(fp.name)
-    try:
-        # ``mode=ro`` URI open guards against any accidental writes.
-        conn = sqlite3.connect(
-            f"file:{tmp_path}?mode=ro", uri=True,
-        )
+    out: list[InstalledPackage] = []
+    with _rpm_connection(content) as conn:
+        # The database bytes come from an image layer, so the engine
+        # runs in its least-trusting configuration: no extension
+        # loading, no SQL from the schema itself (a view named
+        # ``Packages`` would otherwise execute its author's
+        # expressions when selected), cell-size validation against
+        # corrupt pages, and a heap ceiling so a crafted DB can't
+        # balloon the host process.
+        with contextlib.suppress(AttributeError):
+            conn.enable_load_extension(False)
+        cur = conn.cursor()
         try:
-            cur = conn.cursor()
-            try:
-                cur.execute("SELECT blob FROM Packages")
-            except sqlite3.OperationalError as e:
+            cur.execute("PRAGMA trusted_schema=OFF")
+            cur.execute("PRAGMA cell_size_check=ON")
+            cur.execute("PRAGMA hard_heap_limit=268435456")  # 256 MB
+            row = cur.execute(
+                "SELECT type, sql FROM sqlite_master "
+                "WHERE name = 'Packages'",
+            ).fetchone()
+            if row is None:
                 logger.debug(
-                    "core.oci.sbom: rpmdb.sqlite missing Packages "
-                    "table (%s); skipping", e,
+                    "core.oci.sbom: rpmdb.sqlite has no Packages "
+                    "object; skipping",
                 )
                 return out
-            for (blob,) in cur:
-                if not isinstance(blob, (bytes, bytearray)):
-                    continue
-                pkg = _parse_rpm_header(bytes(blob))
-                if pkg is not None:
-                    out.append(pkg)
-        finally:
-            conn.close()
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+            obj_type, obj_sql = row[0], row[1] or ""
+            if obj_type != "table" or re.match(
+                r"\s*CREATE\s+VIRTUAL\s+TABLE", obj_sql, re.IGNORECASE,
+            ):
+                # Only a plain table is acceptable — views and
+                # virtual tables evaluate schema-author SQL/module
+                # code on SELECT.
+                logger.debug(
+                    "core.oci.sbom: Packages is %s, not a plain "
+                    "table; skipping", obj_type,
+                )
+                return out
+            cur.execute("SELECT blob FROM Packages")
+        except sqlite3.Error as e:
+            logger.debug(
+                "core.oci.sbom: rpmdb.sqlite unreadable (%s); "
+                "skipping", e,
+            )
+            return out
+        for (blob,) in cur:
+            if not isinstance(blob, (bytes, bytearray)):
+                continue
+            pkg = _parse_rpm_header(bytes(blob))
+            if pkg is not None:
+                _check_record_cap(out, "rpmdb.sqlite")
+                out.append(pkg)
     return out
 
 
-def _parse_rpm_header(blob: bytes) -> Optional[InstalledPackage]:
+def _parse_rpm_header(blob: bytes) -> InstalledPackage | None:
     """Parse one RPM header blob → InstalledPackage.
 
     Tolerant: malformed / truncated headers return None rather
@@ -299,19 +414,21 @@ def _parse_rpm_header(blob: bytes) -> Optional[InstalledPackage]:
             value = _read_rpm_string(blob, data_start + off, data_end)
             if value is not None:
                 fields[tag] = value
-        elif tag == _RPMTAG_EPOCH:
-            # Epoch is INT32 (type 4); keep it as bytes for now,
-            # we'll only use it if both name+version are found.
-            pass
+        elif tag == _RPMTAG_EPOCH and typ == _RPMTAG_TYPE_INT32:
+            epoch_off = data_start + off
+            if epoch_off + 4 <= len(blob):
+                fields[_RPMTAG_EPOCH] = struct.unpack(
+                    ">i", blob[epoch_off:epoch_off + 4],
+                )[0]
 
     name = fields.get(_RPMTAG_NAME)
     version = fields.get(_RPMTAG_VERSION)
     release = fields.get(_RPMTAG_RELEASE)
     if not name or not version:
         return None
-    full_version = (
-        f"{version}-{release}" if release else version
-    )
+    epoch = fields.get(_RPMTAG_EPOCH)
+    ver_str = f"{version}-{release}" if release else version
+    full_version = f"{epoch}:{ver_str}" if epoch else ver_str
     # OSV's "Red Hat" ecosystem covers RHEL / Rocky / Alma / older
     # CentOS. SUSE / openSUSE use a separate ecosystem; we'd need
     # ``/etc/os-release`` parsing to distinguish. For now,
@@ -323,7 +440,7 @@ def _parse_rpm_header(blob: bytes) -> Optional[InstalledPackage]:
     )
 
 
-def _read_rpm_string(blob: bytes, offset: int, data_end: int) -> Optional[str]:
+def _read_rpm_string(blob: bytes, offset: int, data_end: int) -> str | None:
     """RPM strings are NUL-terminated. Read from ``offset`` until
     NUL or end of data section; decode as UTF-8 (with permissive
     error handling for non-ASCII package descriptions)."""
@@ -350,10 +467,93 @@ LAYER_FILE_PATHS = {
     "var/lib/rpm/rpmdb.sqlite": parse_rpm_sqlite,
 }
 
+# Distro-identity files. Not package databases — they resolve WHICH
+# OSV ecosystem the package rows belong to: dpkg serves both Debian
+# and Ubuntu (disjoint advisory feeds with incompatible version
+# streams — an Ubuntu ``…ubuntu2.1~18.04.23`` version held against a
+# Debian fixed-range is meaningless), and Alpine's OSV index is
+# sharded per release (``Alpine:v3.16``; the unsuffixed ecosystem
+# returns nothing). ``etc/os-release`` is the standard location;
+# ``usr/lib/os-release`` is the documented fallback.
+OS_RELEASE_PATHS = ("etc/os-release", "usr/lib/os-release")
+
+# Every layer path worth extracting — package DBs plus distro
+# identity. Consumers drive :func:`extract_files_from_layer` with
+# this set.
+WANTED_LAYER_PATHS = tuple(LAYER_FILE_PATHS) + OS_RELEASE_PATHS
+
+
+def parse_os_release(content: bytes) -> dict[str, str]:
+    """Parse the ``KEY=value`` lines of an os-release file.
+
+    Values may be double- or single-quoted. Unknown / malformed
+    lines are skipped — the file is target-controlled, so this
+    parser extracts and never trusts.
+    """
+    out: dict[str, str] = {}
+    for line in content.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key.isidentifier():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value[:200]
+    return out
+
+
+def _resolve_distro_ecosystem(
+    pkg: InstalledPackage, os_release: dict[str, str],
+) -> str:
+    """Map a package row's parser-assigned ecosystem to the OSV
+    ecosystem the image's distro actually publishes under."""
+    distro_id = (os_release.get("ID") or "").lower()
+    if pkg.ecosystem == "Debian":
+        family = {"debian": "Debian", "ubuntu": "Ubuntu"}.get(distro_id)
+        if family:
+            release = os_release.get("VERSION_ID") or os_release.get("VERSION_CODENAME") or ""
+            return release_ecosystem(family, release) or family
+        # ID_LIKE is not evidence of the parent's package release/origin.
+        # Retain inventory, but leave release unknown for advisory consumers.
+        return "Debian"
+    if pkg.ecosystem == "Alpine":
+        version_id = os_release.get("VERSION_ID") or ""
+        parts = version_id.split(".")
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            return f"Alpine:v{parts[0]}.{parts[1]}"
+        # Release unknown (edge images carry a snapshot VERSION_ID)
+        # — keep the bare ecosystem; the query returns nothing
+        # rather than wrong-release matches.
+        return "Alpine"
+    return pkg.ecosystem
+
+
+@dataclass(frozen=True)
+class LayerPackagesResult:
+    """Outcome of :func:`packages_from_layer_files`.
+
+    ``failures`` maps package-db path → error summary for every
+    known package-state file that was PRESENT but could not be
+    parsed (rejected, corrupt, over the record cap). A non-empty
+    mapping means the package inventory is PARTIAL — pre-fix these
+    failures were logged at debug level and the result was
+    indistinguishable from "this image has no such database".
+    """
+    packages: list[InstalledPackage]
+    failures: dict[str, str]
+
+    @property
+    def complete(self) -> bool:
+        return not self.failures
+
 
 def packages_from_layer_files(
     layer_files: dict,
-) -> List[InstalledPackage]:
+) -> LayerPackagesResult:
     """Dispatch each known path through its parser. Used by the
     consumer pipeline as the post-:func:`extract_files_from_layer`
     step.
@@ -361,25 +561,54 @@ def packages_from_layer_files(
     Multi-layer images: each layer's call to this helper returns
     its own package set; the caller overlays later-layer packages
     onto earlier-layer ones (later wins on name collision — that's
-    Docker's overlay semantics for state files)."""
-    out: List[InstalledPackage] = []
+    Docker's overlay semantics for state files).
+
+    Parser failures are surfaced in the result's ``failures``
+    mapping (and logged at WARNING) so callers can distinguish an
+    absent database from a rejected or unparseable one.
+    """
+    os_release: dict[str, str] = {}
+    for path in OS_RELEASE_PATHS:
+        if path in layer_files:
+            os_release = parse_os_release(layer_files[path])
+            break
+
+    out: list[InstalledPackage] = []
+    failures: dict[str, str] = {}
     for path, parser in LAYER_FILE_PATHS.items():
         if path in layer_files:
             try:
-                out.extend(parser(layer_files[path]))
+                parsed = parser(layer_files[path])
             except Exception as e:                  # noqa: BLE001
-                logger.debug(
-                    "core.oci.sbom: parser for %s failed: %s",
-                    path, e,
+                failures[path] = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    "core.oci.sbom: parser for %s failed (package "
+                    "inventory will be partial): %s", path, e,
                 )
-    return out
+                continue
+            for pkg in parsed:
+                eco = _resolve_distro_ecosystem(pkg, os_release)
+                out.append(
+                    pkg if eco == pkg.ecosystem
+                    else InstalledPackage(
+                        ecosystem=eco, name=pkg.name,
+                        version=pkg.version,
+                    )
+                )
+    return LayerPackagesResult(packages=out, failures=failures)
 
 
 __all__ = [
-    "InstalledPackage",
     "LAYER_FILE_PATHS",
-    "parse_dpkg_status",
-    "parse_apk_installed",
-    "parse_rpm_sqlite",
+    "MAX_PACKAGE_RECORDS",
+    "OS_RELEASE_PATHS",
+    "WANTED_LAYER_PATHS",
+    "InstalledPackage",
+    "LayerPackagesResult",
+    "PackageDbLimitExceeded",
     "packages_from_layer_files",
+    "parse_apk_installed",
+    "parse_dpkg_status",
+    "parse_os_release",
+    "parse_rpm_sqlite",
 ]

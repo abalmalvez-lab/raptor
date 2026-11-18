@@ -1,43 +1,108 @@
 """Tests for Coccinelle runner."""
 
+from pkgutil import resolve_name as _mock_owner
+
+
+
 import json
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from packages.coccinelle import runner as runner_mod
+from packages.coccinelle.models import SpatchMatch
 from packages.coccinelle.runner import (
-    run_rule,
-    run_rules,
-    is_available,
-    version,
-    _parse_results,
-    _parse_errors,
-    _inject_harness,
+    BATCH_CHUNK_FILES,
+    MIN_SPATCH_VERSION,
+    RESULT_PREFIX,
     _collect_files_examined,
     _dedup_matches,
-    RESULT_PREFIX,
+    _inject_harness,
+    _parse_errors,
+    _parse_results,
+    contains_script_block,
+    demux_result_by_file,
+    derive_batch_timeout_s,
+    derive_batch_workers,
+    is_available,
+    meets_min_version,
+    run_rule,
+    run_rules,
+    run_rules_batched,
+    version,
+    version_tuple,
 )
-from packages.coccinelle.models import SpatchMatch
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+from core.testing.module_bindings import mock_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probe_patch_targets(monkeypatch):
+    """Keep probe mocks local, including delegated discovery and execution."""
+    import packages.coccinelle.runner as consumer
+
+    patch_module_attribute(
+        monkeypatch, consumer, "subprocess", "run", consumer.subprocess.run,
+    )
+    patch_module_attribute(
+        monkeypatch, consumer, "shutil", "which", consumer.shutil.which,
+    )
+
+    import core.run.toolprobe as delegate
+
+    patch_module_attribute(
+        monkeypatch, delegate, "subprocess", "run",
+        lambda *args, **kwargs: consumer.subprocess.run(*args, **kwargs),
+    )
+    patch_module_attribute(
+        monkeypatch, delegate, "shutil", "which",
+        lambda *args, **kwargs: consumer.shutil.which(*args, **kwargs),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_spatch_resolution(monkeypatch):
+    from core.testing.module_state import isolated_module_state
+
+    with isolated_module_state(runner_mod, {"_spatch_resolved": False, "_resolved_spatch": None}):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
+
+def _nonced_prefix_from_cmd(cmd) -> str:
+    """Extract the per-invocation ``COCCIRESULT-<nonce>:`` marker the
+    runner substituted into the sp-file — emitting with it simulates
+    an authentic script-block emission from the executed rule."""
+    sp_idx = cmd.index("--sp-file")
+    text = Path(cmd[sp_idx + 1]).read_text(encoding="utf-8")
+    m = re.search(r"COCCIRESULT-[0-9a-f]{32}:", text)
+    assert m, "sp-file carries no nonced COCCIRESULT marker"
+    return m.group(0)
 
 
 class TestAvailability:
     def test_is_available_found(self):
-        with patch("shutil.which", return_value="/usr/bin/spatch"):
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value="/usr/bin/spatch"):
             assert is_available()
 
     def test_is_available_missing(self):
-        with patch("shutil.which", return_value=None):
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value=None):
             assert not is_available()
 
     def test_version_returns_string(self):
-        with patch("shutil.which", return_value="/usr/bin/spatch"), \
-             patch("subprocess.run") as mock_run:
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value="/usr/bin/spatch"), \
+             mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'subprocess', 'run') as mock_run:
             mock_run.return_value = MagicMock(
                 stdout="spatch version 1.3 compiled with OCaml\n",
                 returncode=0,
@@ -47,17 +112,55 @@ class TestAvailability:
             assert "1.3" in v
 
     def test_version_unavailable(self):
-        with patch("shutil.which", return_value=None):
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value=None):
             assert version() is None
+
+    def test_version_tuple_parses_major_minor(self):
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value="/usr/bin/spatch"), \
+             mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="spatch version 1.3 compiled with OCaml version 5.4.0\n",
+                returncode=0,
+            )
+            assert version_tuple() == (1, 3)
+
+    def test_version_tuple_handles_three_component(self):
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value="/usr/bin/spatch"), \
+             mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="spatch version 1.1.1 compiled with OCaml version 4.14.1\n",
+                returncode=0,
+            )
+            # Only major.minor is significant for the floor check.
+            assert version_tuple() == (1, 1)
+
+    def test_version_tuple_none_when_unavailable(self):
+        with mock_module_attribute(_mock_owner('packages.coccinelle.runner'), 'shutil', 'which', return_value=None):
+            assert version_tuple() is None
+
+    def test_meets_min_version_true_at_floor(self):
+        with patch("packages.coccinelle.runner.version_tuple",
+                   return_value=MIN_SPATCH_VERSION):
+            assert meets_min_version() is True
+
+    def test_meets_min_version_false_below_floor(self):
+        with patch("packages.coccinelle.runner.version_tuple",
+                   return_value=(1, 1)):
+            assert meets_min_version() is False
+
+    def test_meets_min_version_false_when_unknown(self):
+        with patch("packages.coccinelle.runner.version_tuple",
+                   return_value=None):
+            assert meets_min_version() is False
 
 
 class TestParseResults:
     def test_parse_single_result(self):
-        data = {"file": "/tmp/a.c", "line": 10, "col": 5}
+        data = {"file": "./a.c", "line": 10, "col": 5}
         output = f"{RESULT_PREFIX}{json.dumps(data)}\n"
         matches = _parse_results(output, "test_rule")
         assert len(matches) == 1
-        assert matches[0].file == "/tmp/a.c"
+        assert matches[0].file == "./a.c"
         assert matches[0].line == 10
         assert matches[0].rule == "test_rule"
 
@@ -72,7 +175,7 @@ class TestParseResults:
 
     def test_parse_ignores_non_result_lines(self):
         output = "init_defs_builtins: /usr/lib/coccinelle/standard.h\n"
-        output += "HANDLING: /tmp/test.c\n"
+        output += "HANDLING: ./test.c\n"
         output += f'{RESULT_PREFIX}{{"file":"a.c","line":1}}\n'
         matches = _parse_results(output, "r")
         assert len(matches) == 1
@@ -91,7 +194,7 @@ class TestParseErrors:
     def test_ignores_info_lines(self):
         stderr = (
             "init_defs_builtins: /usr/lib/coccinelle/standard.h\n"
-            "HANDLING: /tmp/test.c\n"
+            "HANDLING: ./test.c\n"
         )
         assert _parse_errors(stderr) == []
 
@@ -284,16 +387,21 @@ class TestRunRule:
         target = tmp_path / "test.c"
         target.write_text("void f() { void *p = malloc(10); }\n")
 
-        mock_proc = MagicMock()
-        mock_proc.stdout = ""
-        mock_proc.stderr = (
-            'COCCIRESULT:{"file":"test.c","line":1}\n'
-        )
-        mock_proc.returncode = 0
+        def mock_run(cmd, **kwargs):
+            # Emit with the invocation's nonced marker, as the
+            # rewritten script block would.
+            prefix = _nonced_prefix_from_cmd(cmd)
+            proc = MagicMock()
+            proc.stdout = ""
+            proc.stderr = f'{prefix}{{"file":"test.c","line":1}}\n'
+            proc.returncode = 0
+            return proc
 
         with patch("packages.coccinelle.runner.is_available", return_value=True), \
-             patch("subprocess.run", return_value=mock_proc):
-            result = run_rule(target, rule, env=dict(os.environ))
+             patch("packages.coccinelle.runner._sandboxed_run", side_effect=mock_run):
+            # Rule carries its own @script:python — trusted-caller flag.
+            result = run_rule(target, rule, env=dict(os.environ),
+                              allow_scripting=True)
 
         assert result.rule == "test"
         assert result.match_count == 1
@@ -307,7 +415,8 @@ class TestRunRule:
         target.write_text("void f() {}\n")
 
         with patch("packages.coccinelle.runner.is_available", return_value=True), \
-             patch("subprocess.run", side_effect=sp.TimeoutExpired("spatch", 5)):
+             patch("packages.coccinelle.runner._sandboxed_run",
+                   side_effect=sp.TimeoutExpired("spatch", 5)):
             result = run_rule(target, rule, timeout=5, env=dict(os.environ))
 
         assert not result.ok
@@ -349,7 +458,8 @@ class TestHarnessTempfilePath:
 
         with patch(
             "packages.coccinelle.runner.is_available", return_value=True,
-        ), patch("subprocess.run", side_effect=_capture):
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=_capture):
             run_rule(target, rule, env=dict(os.environ))
 
         cmd = captured["cmd"]
@@ -366,7 +476,7 @@ class TestHarnessTempfilePath:
             "tempfile should be cleaned up by the time subprocess.run "
             "returns to the caller (we're inside the patched runner, "
             "which captured the path; runner's finally cleans up)"
-        ) or True  # noqa
+        )
         # Fed via input= would be a regression — passing a path to
         # an existing file means input= must NOT be set.
         assert captured["input"] is None, (
@@ -375,11 +485,13 @@ class TestHarnessTempfilePath:
             f"via the tempfile path"
         )
 
-    def test_pre_injected_rule_bypasses_tempfile(self, tmp_path):
-        """If the operator's rule already has ``script:python``
-        (e.g. the hypothesis_validation adapter's pattern), the
-        runner skips harness injection and uses the original
-        rule path directly — no tempfile, no path rewrite."""
+    def test_pre_injected_rule_routes_via_nonced_tempfile(self, tmp_path):
+        """A rule that already has ``script:python`` skips harness
+        injection but still routes via a tempfile: its emit sites are
+        rewritten to the per-invocation ``COCCIRESULT-<nonce>:`` marker
+        (U14-F2 — a plain marker would be forgeable by hostile source
+        re-emitted in spatch's diff output). The original rule file is
+        never modified."""
         rule = tmp_path / "self_emitting.cocci"
         rule.write_text(textwrap.dedent("""\
             @r@
@@ -401,21 +513,36 @@ class TestHarnessTempfilePath:
 
         def _capture(cmd, **kwargs):
             captured["cmd"] = list(cmd)
+            sp_idx = cmd.index("--sp-file")
+            captured["text"] = Path(cmd[sp_idx + 1]).read_text(
+                encoding="utf-8",
+            )
             return MagicMock(stdout="", stderr="", returncode=0)
 
         with patch(
             "packages.coccinelle.runner.is_available", return_value=True,
-        ), patch("subprocess.run", side_effect=_capture):
-            run_rule(target, rule, env=dict(os.environ))
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=_capture):
+            # Rule carries its own @script:python — trusted-caller flag.
+            run_rule(target, rule, env=dict(os.environ),
+                     allow_scripting=True)
 
         cmd = captured["cmd"]
         sp_idx = cmd.index("--sp-file")
         sp_path = Path(cmd[sp_idx + 1])
-        # No harness injection → pass-through to the original rule.
-        assert sp_path == rule, (
-            f"runner unnecessarily wrote a harnessed tempfile when "
-            f"the rule already has script:python; got path={sp_path}"
+        assert sp_path != rule, (
+            "runner executed the original rule file — its plain "
+            "COCCIRESULT: emissions would be rejected by the nonced "
+            "parser (or forgeable if accepted)"
         )
+        text = captured["text"]
+        # No harness injection (rule already scripted) …
+        assert text.count("@script:python@") == 1
+        # … but the emit site was rewritten to the nonced marker.
+        assert re.search(r"COCCIRESULT-[0-9a-f]{32}:", text)
+        assert RESULT_PREFIX not in text
+        # Original rule file untouched.
+        assert "COCCIRESULT-" not in rule.read_text(encoding="utf-8")
 
     def test_tempfile_cleaned_up_after_success(self, tmp_path):
         """Tempfile should be removed when spatch succeeds."""
@@ -437,7 +564,8 @@ class TestHarnessTempfilePath:
 
         with patch(
             "packages.coccinelle.runner.is_available", return_value=True,
-        ), patch("subprocess.run", side_effect=_capture):
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=_capture):
             run_rule(target, rule, env=dict(os.environ))
 
         # Post-call: tempfile gone.
@@ -471,7 +599,8 @@ class TestHarnessTempfilePath:
 
         with patch(
             "packages.coccinelle.runner.is_available", return_value=True,
-        ), patch("subprocess.run", side_effect=_capture_then_timeout):
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=_capture_then_timeout):
             result = run_rule(target, rule, timeout=5,
                               env=dict(os.environ))
 
@@ -502,7 +631,8 @@ class TestHarnessTempfilePath:
 
         with patch(
             "packages.coccinelle.runner.is_available", return_value=True,
-        ), patch("subprocess.run", side_effect=_capture_then_oserror):
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=_capture_then_oserror):
             result = run_rule(target, rule, env=dict(os.environ))
 
         assert not result.ok
@@ -541,12 +671,325 @@ class TestRunRules:
         mock_proc.returncode = 0
 
         with patch("packages.coccinelle.runner.is_available", return_value=True), \
-             patch("subprocess.run", return_value=mock_proc):
+             patch("packages.coccinelle.runner._sandboxed_run",
+                   return_value=mock_proc):
             results = run_rules(target, rules_dir, env=dict(os.environ))
 
         assert len(results) == 2
         assert results[0].rule == "a"
         assert results[1].rule == "b"
+
+    def test_on_rule_progress_callback_fires_per_rule_in_order(
+        self, tmp_path,
+    ):
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        for name in ["a.cocci", "b.cocci", "c.cocci"]:
+            (rules_dir / name).write_text(
+                "@r@\nposition p;\n@@\nmalloc@p(...)\n",
+            )
+        target = tmp_path / "test.c"
+        target.write_text("void f() {}\n")
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = ""
+        mock_proc.stderr = ""
+        mock_proc.returncode = 0
+
+        seen = []
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True), \
+             patch("packages.coccinelle.runner._sandboxed_run",
+                   return_value=mock_proc):
+            results = run_rules(
+                target, rules_dir, env=dict(os.environ),
+                on_rule=lambda i, n, name: seen.append((i, n, name)),
+            )
+
+        assert len(results) == 3
+        assert seen == [(0, 3, "a"), (1, 3, "b"), (2, 3, "c")]
+
+    def test_on_rule_callback_failure_never_costs_the_scan(self, tmp_path):
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "a.cocci").write_text(
+            "@r@\nposition p;\n@@\nmalloc@p(...)\n",
+        )
+        target = tmp_path / "test.c"
+        target.write_text("void f() {}\n")
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = ""
+        mock_proc.stderr = ""
+        mock_proc.returncode = 0
+
+        def boom(*_a):
+            raise RuntimeError("progress stream gone")
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True), \
+             patch("packages.coccinelle.runner._sandboxed_run",
+                   return_value=mock_proc):
+            results = run_rules(
+                target, rules_dir, env=dict(os.environ), on_rule=boom,
+            )
+
+        assert len(results) == 1
+
+
+class TestRunRulesBatched:
+    def test_empty_list(self):
+        assert run_rules_batched(Path("/tmp"), []) == {}
+
+    def test_batched_alias_rule_ids_demux_to_owning_stem(self, tmp_path):
+        """Rules whose scripting emits ids that differ from the file
+        stem (12 shipped rules: va_arg_mismatch -> va_arg_promoted_type*,
+        double_close -> double_fclose, ...) must have their matches
+        attributed to the owning file, not silently dropped (U12-F210).
+        """
+        r1 = tmp_path / "va_arg_mismatch.cocci"
+        r1.write_text(
+            "@r@\nposition p;\n@@\nva_arg@p(...)\n\n"
+            "@script:python@\np << r.p;\n@@\n"
+            'import json, sys\n'
+            'msg = {"rule":  "va_arg_promoted_type", "file": "t.c", "line": 1}\n'
+            'sys.stderr.write("COCCIRESULT:" + json.dumps(msg))\n'
+        )
+        r2 = tmp_path / "double_close.cocci"
+        r2.write_text(
+            "@s@\nposition p;\n@@\nclose@p(...)\n\n"
+            "@script:python@\np << s.p;\n@@\n"
+            'import json, sys\n'
+            'msg = {"rule": "double_fclose", "file": "t.c", "line": 2}\n'
+            'sys.stderr.write("COCCIRESULT:" + json.dumps(msg))\n'
+        )
+        target = tmp_path / "t.c"
+        target.write_text("void f() {}\n")
+
+        alias_line = json.dumps(
+            {"file": "t.c", "line": 1, "rule": "va_arg_promoted_type"},
+        )
+        alias_line2 = json.dumps(
+            {"file": "t.c", "line": 2, "rule": "double_fclose"},
+        )
+
+
+        def mock_run(cmd, **kwargs):
+            prefix = _nonced_prefix_from_cmd(cmd)
+            proc = MagicMock()
+            proc.stdout = ""
+            proc.stderr = (
+                f"{prefix}{alias_line}\n"
+                f"{prefix}{alias_line2}\n"
+            )
+            proc.returncode = 0
+            return proc
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=mock_run):
+            results = run_rules_batched(
+                target, [r1, r2], env=dict(os.environ),
+                allow_scripting=True,
+            )
+
+        assert len(results["va_arg_mismatch"].matches) == 1
+        assert results["va_arg_mismatch"].matches[0].rule == \
+            "va_arg_promoted_type"
+        assert len(results["double_close"].matches) == 1
+        # Unknown IDs are covered by the inert retry test; ordinary aliases
+        # retain their batch routing without triggering individual retries.
+
+    def test_shipped_alias_rules_all_extractable(self):
+        """Every shipped script-bearing rule's emitted ids are visible
+        to the demux alias scan — a new emission shape that the scan
+        misses would silently drop that rule's batched output."""
+        from packages.coccinelle.runner import _emitted_rule_ids
+
+        rules_dir = (
+            Path(__file__).resolve().parents[3]
+            / "engine" / "coccinelle" / "rules"
+        )
+        if not rules_dir.is_dir():
+            pytest.skip("engine rules dir not present")
+        missing = []
+        for rule in sorted(rules_dir.glob("*.cocci")):
+            text = rule.read_text(encoding="utf-8")
+            if "script:python" not in text:
+                continue
+            if not _emitted_rule_ids(text):
+                missing.append(rule.stem)
+        assert missing == [], (
+            f"script-bearing rules with no demux-extractable rule id: "
+            f"{missing}"
+        )
+
+    def test_single_rule_delegates(self, tmp_path):
+        rule = tmp_path / "a.cocci"
+        rule.write_text("@r@\nposition p;\n@@\nmalloc@p(...)\n")
+        target = tmp_path / "test.c"
+        target.write_text("void f() {}\n")
+        mock_proc = MagicMock()
+        mock_proc.stdout = ""
+        mock_proc.stderr = ""
+        mock_proc.returncode = 0
+        with patch(
+            "packages.coccinelle.runner.is_available",
+            return_value=True,
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 return_value=mock_proc):
+            results = run_rules_batched(
+                target, [rule], env=dict(os.environ),
+            )
+        assert "a" in results
+        assert results["a"].rule == "a"
+
+    def test_batched_demultiplexes(self, tmp_path):
+        # Batch callers run self-scripting rules (the shipped rule set)
+        # with allow_scripting=True; the runner rewrites their emit
+        # sites to the per-invocation nonced marker.
+        r1 = tmp_path / "rule_x.cocci"
+        r1.write_text(
+            "@r@\nposition p;\n@@\nmalloc@p(...)\n\n"
+            "@script:python@\np << r.p;\n@@\n"
+            'import sys\nsys.stderr.write("COCCIRESULT:x")\n'
+        )
+        r2 = tmp_path / "rule_y.cocci"
+        r2.write_text(
+            "@s@\nposition p;\n@@\nfree@p(...)\n\n"
+            "@script:python@\np << s.p;\n@@\n"
+            'import sys\nsys.stderr.write("COCCIRESULT:y")\n'
+        )
+        target = tmp_path / "test.c"
+        target.write_text("void f() { malloc(1); free(0); }\n")
+        line1 = json.dumps({
+            "file": "test.c", "line": 1, "col": 1,
+            "line_end": 1, "col_end": 10,
+            "rule": "rule_x", "message": "hit x",
+        })
+        line2 = json.dumps({
+            "file": "test.c", "line": 1, "col": 20,
+            "line_end": 1, "col_end": 30,
+            "rule": "rule_y", "message": "hit y",
+        })
+        def mock_run(cmd, **kwargs):
+            prefix = _nonced_prefix_from_cmd(cmd)
+            proc = MagicMock()
+            proc.stdout = ""
+            proc.stderr = f"{prefix}{line1}\n{prefix}{line2}\n"
+            proc.returncode = 0
+            return proc
+
+        with patch(
+            "packages.coccinelle.runner.is_available",
+            return_value=True,
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=mock_run):
+            results = run_rules_batched(
+                target, [r1, r2], env=dict(os.environ),
+                allow_scripting=True,
+            )
+        assert set(results.keys()) == {"rule_x", "rule_y"}
+        assert len(results["rule_x"].matches) == 1
+        assert len(results["rule_y"].matches) == 1
+        assert results["rule_x"].matches[0].message == "hit x"
+
+    def test_not_installed(self, tmp_path):
+        r1 = tmp_path / "a.cocci"
+        r1.write_text("@@\n@@\nmalloc(...);\n")
+        r2 = tmp_path / "b.cocci"
+        r2.write_text("@@\n@@\nfree(...);\n")
+        with patch(
+            "packages.coccinelle.runner.is_available",
+            return_value=False,
+        ):
+            results = run_rules_batched(
+                tmp_path, [r1, r2],
+            )
+        assert len(results) == 2
+        for r in results.values():
+            assert not r.ok
+            assert "not installed" in r.errors[0].lower()
+
+    def test_batched_results_match_run_rule_contract(self, tmp_path):
+        """Batch results must honour the single-rule SpatchResult
+        contract: files_examined populated (coverage read zero from the
+        batch path pre-fix) and per-result errors lists that are NOT
+        the same aliased object (mutating one silently edited all)."""
+        r1 = tmp_path / "rule_x.cocci"
+        r1.write_text("@r@\nposition p;\n@@\nmalloc@p(...)\n")
+        r2 = tmp_path / "rule_y.cocci"
+        r2.write_text("@s@\nposition p;\n@@\nfree@p(...)\n")
+        target_dir = tmp_path / "src"
+        target_dir.mkdir()
+        (target_dir / "test.c").write_text("void f() {}\n")
+        (target_dir / "test.h").write_text("void f(void);\n")
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = ""
+        mock_proc.stderr = "warning: something odd\n"
+        mock_proc.returncode = 0
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 return_value=mock_proc):
+            results = run_rules_batched(
+                target_dir, [r1, r2], env=dict(os.environ),
+            )
+
+        rx, ry = results["rule_x"], results["rule_y"]
+        expected = sorted([
+            str(target_dir / "test.c"), str(target_dir / "test.h"),
+        ])
+        assert rx.files_examined == expected
+        assert ry.files_examined == expected
+        assert rx.errors is not ry.errors
+        rx.errors.append("consumer mutation")
+        assert "consumer mutation" not in ry.errors
+
+
+class TestRunRulesTreeWalkOnce:
+    def test_run_rules_walks_target_once(self, tmp_path):
+        """The C/H enumeration is loop-invariant: N rules must not
+        trigger N full tree walks."""
+        from packages.coccinelle import runner as runner_mod
+
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        for name in ("a", "b", "c"):
+            (rules_dir / f"{name}.cocci").write_text(
+                "@r@\nposition p;\n@@\nmalloc@p(...)\n"
+            )
+        target_dir = tmp_path / "src"
+        target_dir.mkdir()
+        (target_dir / "one.c").write_text("void f() {}\n")
+
+        calls = []
+        real_walk = runner_mod._walk_c_h
+
+        def counting_walk(target):
+            calls.append(target)
+            return real_walk(target)
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = ""
+        mock_proc.stderr = ""
+        mock_proc.returncode = 0
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ), patch("packages.coccinelle.runner._walk_c_h",
+                 side_effect=counting_walk), patch(
+            "packages.coccinelle.runner._sandboxed_run",
+            return_value=mock_proc,
+        ):
+            results = run_rules(target_dir, rules_dir, env=dict(os.environ))
+
+        assert len(results) == 3
+        assert len(calls) == 1
+        # The shared walk still lands in every result.
+        for r in results:
+            assert r.files_examined == [str(target_dir / "one.c")]
 
 
 @pytest.mark.skipif(
@@ -590,7 +1033,8 @@ class TestRunRuleIntegration:
                 sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\\n")
         """))
 
-        result = run_rule(target, rule)
+        # Rule carries its own @script:python — trusted-caller flag.
+        result = run_rule(target, rule, allow_scripting=True)
         assert result.ok or result.returncode == 0
         assert result.match_count == 2
 
@@ -615,7 +1059,7 @@ class TestRunRuleIntegration:
                 sys.stderr.write("COCCIRESULT:" + json.dumps({"file": _p.file, "line": int(_p.line)}) + "\\n")
         """))
 
-        result = run_rule(target, rule)
+        result = run_rule(target, rule, allow_scripting=True)
         assert result.match_count == 0
 
     def test_files_examined_includes_clean_file(self, tmp_path):
@@ -639,9 +1083,12 @@ class TestRunRuleIntegration:
                 sys.stderr.write("COCCIRESULT:" + json.dumps({"file": _p.file, "line": int(_p.line)}) + "\\n")
         """))
 
-        result = run_rule(target, rule)
+        result = run_rule(target, rule, allow_scripting=True)
         assert result.match_count == 0
         assert str(target) in result.files_examined
+
+
+_SHIPPED_ENGINE_DIR = Path(__file__).resolve().parents[3] / "engine"
 
 
 @pytest.mark.skipif(
@@ -663,7 +1110,8 @@ class TestShippedRulesIntegration:
                 *p = 42;
             }
         """))
-        result = run_rule(target, self.RULES_DIR / "missing_null_check.cocci")
+        result = run_rule(target, self.RULES_DIR / "missing_null_check.cocci",
+                          allow_scripting=True)
         assert result.returncode == 0
         assert result.match_count >= 1
 
@@ -677,7 +1125,8 @@ class TestShippedRulesIntegration:
                 *p = 42;
             }
         """))
-        result = run_rule(target, self.RULES_DIR / "missing_null_check.cocci")
+        result = run_rule(target, self.RULES_DIR / "missing_null_check.cocci",
+                          allow_scripting=True)
         assert result.returncode == 0
         assert result.match_count == 0
 
@@ -697,7 +1146,8 @@ class TestShippedRulesIntegration:
                 return 0;
             }
         """))
-        result = run_rule(target, self.RULES_DIR / "lock_imbalance.cocci")
+        result = run_rule(target, self.RULES_DIR / "lock_imbalance.cocci",
+                          allow_scripting=True)
         assert result.returncode == 0
         assert result.match_count >= 1
 
@@ -719,7 +1169,8 @@ class TestShippedRulesIntegration:
                 return 0;
             }
         """))
-        result = run_rule(target, self.RULES_DIR / "lock_imbalance.cocci")
+        result = run_rule(target, self.RULES_DIR / "lock_imbalance.cocci",
+                          allow_scripting=True)
         assert result.returncode == 0
         assert result.match_count == 0
 
@@ -740,7 +1191,8 @@ class TestShippedRulesIntegration:
                 return 0;
             }
         """))
-        result = run_rule(target, self.RULES_DIR / "lock_imbalance.cocci")
+        result = run_rule(target, self.RULES_DIR / "lock_imbalance.cocci",
+                          allow_scripting=True)
         assert result.returncode == 0
         assert result.match_count >= 1
 
@@ -763,6 +1215,7 @@ class TestShippedRulesIntegration:
             target,
             self.RULES_DIR / "unchecked_return.cocci",
             defines={"func": "do_io"},
+            allow_scripting=True,
         )
         assert result.returncode == 0
         assert result.match_count >= 1
@@ -783,6 +1236,2611 @@ class TestShippedRulesIntegration:
             target,
             self.RULES_DIR / "unchecked_return.cocci",
             defines={"func": "do_io"},
+            allow_scripting=True,
         )
         assert result.returncode == 0
         assert result.match_count == 0
+
+    def test_atomic_check_then_act_catches_race(self, tmp_path):
+        target = tmp_path / "test.c"
+        target.write_text(textwrap.dedent("""\
+            void bug_read_kfree(struct obj *o) {
+                if (atomic_read(&o->refcnt) == 0) {
+                    kfree(o);
+                }
+            }
+            void bug_read_destroy(struct obj *o) {
+                if (atomic_read(&o->refcnt) == 1)
+                    obj_destroy(o);
+            }
+            void ok_dec_test_kfree(struct obj *o) {
+                if (atomic_dec_and_test(&o->refcnt)) {
+                    kfree(o);
+                }
+            }
+        """))
+        result = run_rule(
+            target,
+            self.RULES_DIR / "atomic_check_then_act.cocci",
+            allow_scripting=True,
+        )
+        assert result.returncode == 0
+        # Only the two atomic_read shapes are races. The
+        # dec_and_test-guarded free is the canonical atomic refcount
+        # put and must not be counted.
+        assert result.match_count == 2
+
+    def test_atomic_check_then_act_clean(self, tmp_path):
+        target = tmp_path / "test.c"
+        target.write_text(textwrap.dedent("""\
+            void ok_under_lock(struct obj *o) {
+                spin_lock(&g_lock);
+                if (atomic_read(&o->refcnt) == 0) {
+                    kfree(o);
+                }
+                spin_unlock(&g_lock);
+            }
+            void ok_lock_between(struct obj *o) {
+                if (atomic_read(&o->refcnt) == 0) {
+                    mutex_lock(&o->lock);
+                    kfree(o);
+                    mutex_unlock(&o->lock);
+                }
+            }
+            void ok_atomic_between(struct obj *o) {
+                if (atomic_read(&o->refcnt) == 1) {
+                    atomic_set(&o->refcnt, 0);
+                    kfree(o);
+                }
+            }
+            void ok_other_object(struct obj *o, struct obj *q) {
+                if (atomic_read(&o->refcnt) == 0) {
+                    kfree(q);
+                }
+            }
+        """))
+        result = run_rule(
+            target,
+            self.RULES_DIR / "atomic_check_then_act.cocci",
+            allow_scripting=True,
+        )
+        assert result.returncode == 0
+        assert result.match_count == 0
+
+    @pytest.mark.parametrize(
+        "cocci_file",
+        sorted(_SHIPPED_ENGINE_DIR.rglob("*.cocci")) or [None],
+        ids=lambda path: path.relative_to(_SHIPPED_ENGINE_DIR).as_posix()
+        if path is not None else "no-shipped-rules",
+    )
+    def test_all_shipped_cocci_parse(self, cocci_file):
+        """Every shipped .cocci must pass `spatch --parse-cocci`.
+
+        A rule that trips the SmPL parser contributes nothing on its
+        own, and — worse — the /scan batch path concatenates every
+        non-parametric rule into ONE spatch input, so a single broken
+        rule aborts the parse of the whole batch and silently disables
+        every batched rule (observed with atomic_check_then_act).
+
+        Parametric rules (declaring `identifier virtual.<name>`) only
+        bind when -D <name>=... is supplied, so the sweep feeds each
+        one dummy defines for exactly the virtual names it declares.
+        """
+        import re
+        import subprocess
+
+        assert cocci_file is not None, f"no .cocci files under {_SHIPPED_ENGINE_DIR}"
+
+        spatch = runner_mod._spatch_path()
+        # Catches every declared virtual metavariable, including the
+        # comma-list form `identifier virtual.lock, virtual.unlock;`.
+        # Over-matching (e.g. a comment) is harmless: spatch accepts
+        # -D names that no rule declares.
+        virtual_re = re.compile(r"virtual\.(\w+)")
+        cmd = [spatch, "--parse-cocci", str(cocci_file)]
+        names = set(virtual_re.findall(cocci_file.read_text(encoding="utf-8")))
+        for name in sorted(names):
+            cmd.extend(["-D", f"{name}=raptor_parse_probe"])
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            check=False,
+        )
+        tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+        assert proc.returncode == 0, (
+            f"unparseable .cocci rule {cocci_file}: {' | '.join(tail)}"
+        )
+
+
+class TestSpatchScratchTmpdir:
+    """spatch materialises per-file working copies (cocci-output-*,
+    cocci_small_output-*) in TMPDIR and only removes them on clean
+    exit — a timeout kill stranded ~200 of them per interrupted sweep.
+    The runner gives every invocation a private scratch TMPDIR and
+    removes it unconditionally."""
+
+    def _run_and_capture_env(
+        self, tmp_path: Path, *, boom: bool = False,
+    ) -> dict:
+        import subprocess as _sp
+        rule = tmp_path / "r.cocci"
+        rule.write_text(
+            "@r@\nexpression e1, e2;\nposition p;\n@@\nstrcpy@p(e1, e2)\n"
+        )
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+        captured: dict = {}
+
+        def _fake(cmd, **kwargs):
+            captured["env"] = kwargs.get("env") or {}
+            # Simulate spatch stranding a working copy in TMPDIR.
+            scratch = captured["env"].get("TMPDIR")
+            if scratch:
+                (Path(scratch) / "cocci-output-1-abc-x.c").write_text("x")
+            if boom:
+                raise _sp.TimeoutExpired(cmd, 1)
+            return MagicMock(stdout="", stderr="", returncode=0)
+
+        # Stub at run_rule's documented test seam (subprocess_runner=)
+        # rather than patching the global subprocess.run: the default
+        # runner is core.sandbox.run, whose internal exec primitive is
+        # an implementation detail — on the no-namespace posture its
+        # timeout path execs via a Popen-based teardown-first wrapper,
+        # which a subprocess.run patch never intercepts (the REAL
+        # spatch then runs, and the env this helper captures is
+        # whatever sandbox-internal probe called subprocess.run last —
+        # no scratch TMPDIR). The scratch-dir contract under test
+        # lives in run_rule itself, above the runner seam.
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            run_rule(
+                target, rule, env=dict(os.environ),
+                subprocess_runner=_fake,
+            )
+        return captured
+
+    def test_private_tmpdir_passed_and_removed(self, tmp_path):
+        captured = self._run_and_capture_env(tmp_path)
+        scratch = captured["env"].get("TMPDIR", "")
+        assert "raptor-cocci-tmp-" in scratch, (
+            "spatch not given a private scratch TMPDIR"
+        )
+        assert not Path(scratch).exists(), (
+            "scratch dir (with spatch's stranded working copy) survived"
+        )
+
+    def test_scratch_removed_even_on_timeout(self, tmp_path):
+        captured = self._run_and_capture_env(tmp_path, boom=True)
+        scratch = captured["env"].get("TMPDIR", "")
+        assert scratch and not Path(scratch).exists(), (
+            "timeout path leaked the scratch dir"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scripting gate — allow_scripting=False (default) refuses rules that
+# declare SmPL scripting blocks BEFORE any spatch invocation.
+# ---------------------------------------------------------------------------
+
+
+HOSTILE_SCRIPTED_RULE = textwrap.dedent("""\
+    @r@
+    position p;
+    @@
+    malloc@p(...)
+
+    @script:python@
+    p << r.p;
+    @@
+    import os
+    os.system("touch /tmp/pwned")
+""")
+
+PLAIN_RULE = "@r@\nposition p;\n@@\nmalloc@p(...)\n"
+
+
+def _mock_proc():
+    return MagicMock(stdout="", stderr="", returncode=0)
+
+
+class TestEvidenceNonce:
+    """COCCIRESULT forgery defence (U14-F2): only lines carrying the
+    per-invocation nonce parse as matches; a repo-planted plain (or
+    wrong-nonce) marker is rejected and logged as an attack signal."""
+
+    _SCRIPTED_RULE = textwrap.dedent("""\
+        @r@
+        position p;
+        @@
+        malloc@p(...)
+
+        @script:python@
+        p << r.p;
+        @@
+
+        import json, sys
+        for _p in p:
+            sys.stderr.write("COCCIRESULT:" + json.dumps({"file": _p.file, "line": int(_p.line)}) + "\\n")
+    """)
+
+    def test_forged_plain_marker_rejected_and_flagged(self, tmp_path):
+        rule = tmp_path / "r.cocci"
+        rule.write_text(self._SCRIPTED_RULE)
+        target = tmp_path / "t.c"
+        target.write_text("void f() { malloc(1); }\n")
+
+        forged_plain = 'COCCIRESULT:{"file":"src/auth.c","line":42,"rule":"forged"}'
+        forged_guess = (
+            "COCCIRESULT-" + "0" * 32
+            + ':{"file":"src/auth.c","line":43,"rule":"forged"}'
+        )
+
+        def mock_run(cmd, **kwargs):
+            prefix = _nonced_prefix_from_cmd(cmd)
+            proc = MagicMock()
+            # spatch diff output re-emits hostile source lines on
+            # stdout; the authentic script emission lands on stderr.
+            proc.stdout = f" {forged_plain}\n{forged_guess}\n"
+            proc.stderr = f'{prefix}{{"file":"t.c","line":1}}\n'
+            proc.returncode = 0
+            return proc
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=mock_run):
+            result = run_rule(target, rule, env=dict(os.environ),
+                              allow_scripting=True)
+
+        assert [(m.file, m.line) for m in result.matches] == [("t.c", 1)]
+        assert all(m.rule != "forged" for m in result.matches)
+        assert result.forged_markers == 2
+
+    def test_nonce_unique_per_invocation(self, tmp_path):
+        rule = tmp_path / "r.cocci"
+        rule.write_text(self._SCRIPTED_RULE)
+        target = tmp_path / "t.c"
+        target.write_text("void f() {}\n")
+        seen = []
+
+        def mock_run(cmd, **kwargs):
+            seen.append(_nonced_prefix_from_cmd(cmd))
+            return MagicMock(stdout="", stderr="", returncode=0)
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ), patch("packages.coccinelle.runner._sandboxed_run",
+                 side_effect=mock_run):
+            run_rule(target, rule, env=dict(os.environ),
+                     allow_scripting=True)
+            run_rule(target, rule, env=dict(os.environ),
+                     allow_scripting=True)
+
+        assert len(seen) == 2 and seen[0] != seen[1]
+
+    def test_parse_results_legacy_plain_prefix_without_nonce(self):
+        # Direct-callers (unit tests, raw-output post-processing) keep
+        # the plain-prefix parse when no nonce is supplied.
+        out = 'COCCIRESULT:{"file":"a.c","line":3}\n'
+        assert len(_parse_results(out, "r")) == 1
+        # With a nonce, the same plain line is NOT a match.
+        assert _parse_results(out, "r", nonce="ab" * 16) == []
+
+    @pytest.mark.skipif(
+        not is_available(), reason="coccinelle not installed",
+    )
+    def test_live_if0_planted_marker_rejected(self, tmp_path):
+        """U14-F2 PoC regression against real spatch: a COCCIRESULT
+        line planted in an #if 0 block adjacent to matchable code is
+        re-emitted by the context-mode diff, but must never parse as
+        a match — and must be flagged as an attack signal."""
+        rule = tmp_path / "double_free.cocci"
+        rule.write_text(textwrap.dedent("""\
+            @df@
+            expression E;
+            position p;
+            @@
+            free(E);
+            * free@p(E);
+
+            @script:python@
+            p << df.p;
+            @@
+            import json, sys
+            for _pu in p:
+                _m = {"file": _pu.file, "line": int(_pu.line),
+                      "col": int(_pu.column),
+                      "rule": "double_free", "message": "double free"}
+                sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\\n")
+        """))
+        target = tmp_path / "victim.c"
+        target.write_text(
+            "void victim(char *p) {\n"
+            "    free(p);\n"
+            "    free(p);\n"
+            "#if 0\n"
+            'COCCIRESULT:{"file":"src/auth.c","line":42,"col":1,'
+            '"rule":"forged_rule","message":"forged"}\n'
+            "#endif\n"
+            "}\n"
+        )
+        result = run_rule(target, rule, allow_scripting=True, timeout=120)
+        assert all(m.rule != "forged_rule" for m in result.matches), (
+            "repo-planted COCCIRESULT line parsed as a verified match"
+        )
+        assert all("auth.c" not in m.file for m in result.matches)
+        # The authentic double-free match still parses.
+        assert any(m.rule == "double_free" and m.line == 3
+                   for m in result.matches)
+        # And the forgery attempt was surfaced as an attack signal.
+        assert result.forged_markers >= 1
+
+
+class TestScriptingGate:
+    """LLM-synthesised (untrusted) rules must never smuggle a
+    @script:/@initialize:/@finalize: block into spatch. The refusal is
+    a structured error result, not an exception, and it fires before
+    tempfile write / runner invocation. RAPTOR's own injected harness
+    is added after the gate and is exempt by construction."""
+
+    def test_default_refuses_scripted_rule_runner_not_invoked(
+        self, tmp_path,
+    ):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(HOSTILE_SCRIPTED_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock()
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(target, rule, subprocess_runner=spy)
+
+        assert not result.ok
+        assert result.returncode == -1
+        assert "scripting block" in result.errors[0]
+        spy.assert_not_called()
+
+    @pytest.mark.parametrize("header", [
+        "@script:python@",
+        "@script:ocaml@",
+        "@initialize:python@",
+        "@finalize:python@",
+        "@ script:python @",  # header whitespace tolerated by spatch
+    ])
+    def test_all_scripting_headers_refused(self, tmp_path, header):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(f"{PLAIN_RULE}\n{header}\n@@\nprint(1)\n")
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock()
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(target, rule, subprocess_runner=spy)
+
+        assert not result.ok
+        assert "scripting block" in result.errors[0]
+        spy.assert_not_called()
+
+    def test_comment_mentioning_script_does_not_trip_gate(self, tmp_path):
+        """The matcher anchors on rule-header syntax; a comment that
+        merely mentions "@script:" must not refuse the rule."""
+        rule = tmp_path / "commented.cocci"
+        rule.write_text(
+            "// do NOT add @script: blocks here — see runner docs\n"
+            + PLAIN_RULE
+        )
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock(return_value=_mock_proc())
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(target, rule, subprocess_runner=spy)
+
+        assert spy.called
+        assert result.returncode == 0
+
+    def test_allow_scripting_true_passes_rule_through_unmodified(
+        self, tmp_path,
+    ):
+        """Shipped-rule path: with allow_scripting=True the scripted
+        rule still executes, and the text handed to spatch is the
+        original rule file, byte-for-byte."""
+        rule = tmp_path / "shipped.cocci"
+        rule.write_text(HOSTILE_SCRIPTED_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            sp_idx = cmd.index("--sp-file")
+            captured["path"] = Path(cmd[sp_idx + 1])
+            captured["text"] = captured["path"].read_text(encoding="utf-8")
+            return _mock_proc()
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(
+                target, rule,
+                subprocess_runner=_capture,
+                allow_scripting=True,
+            )
+
+        assert result.returncode == 0
+        # The rule is materialised into the invocation scratch dir (the
+        # sandbox's writable surface) — the substance of the contract
+        # is the TEXT handed to spatch, byte-for-byte the original.
+        assert captured["path"] != rule
+        assert captured["text"] == HOSTILE_SCRIPTED_RULE
+
+    def test_plain_rule_still_gets_harness_and_runs(self, tmp_path):
+        """The gate must not break RAPTOR's own harness injection:
+        a plain SmPL rule is wrapped with the @script:python
+        COCCIRESULT harness and executed."""
+        rule = tmp_path / "plain.cocci"
+        rule.write_text(PLAIN_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            sp_idx = cmd.index("--sp-file")
+            captured["text"] = Path(cmd[sp_idx + 1]).read_text(
+                encoding="utf-8",
+            )
+            return _mock_proc()
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(target, rule, subprocess_runner=_capture)
+
+        assert result.returncode == 0
+        assert "@script:python@" in captured["text"]
+        # The injected harness emits the per-invocation nonced marker,
+        # never the plain (forgeable) prefix.
+        assert re.search(r"COCCIRESULT-[0-9a-f]{32}:", captured["text"])
+        assert RESULT_PREFIX not in captured["text"]
+
+    def test_contains_script_block_predicate(self):
+        assert contains_script_block(HOSTILE_SCRIPTED_RULE)
+        assert contains_script_block("@initialize:python@\n@@\nx=1\n")
+        assert contains_script_block("@finalize:ocaml@\n@@\n")
+        assert not contains_script_block(PLAIN_RULE)
+        assert not contains_script_block(
+            "// commented @script:python mention\n" + PLAIN_RULE
+        )
+
+
+class TestScriptingGateBatched:
+    def test_scripted_rule_refused_plain_rule_still_batched(
+        self, tmp_path,
+    ):
+        hostile = tmp_path / "hostile.cocci"
+        hostile.write_text(HOSTILE_SCRIPTED_RULE)
+        plain = tmp_path / "plain.cocci"
+        plain.write_text(PLAIN_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            sp_idx = cmd.index("--sp-file")
+            captured["text"] = Path(cmd[sp_idx + 1]).read_text(
+                encoding="utf-8",
+            )
+            captured["calls"] = captured.get("calls", 0) + 1
+            return _mock_proc()
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            results = run_rules_batched(
+                target, [hostile, plain, tmp_path / "plain2.cocci"],
+                subprocess_runner=_capture,
+            )
+
+        # plain2 doesn't exist → dropped by the existence filter;
+        # hostile refused; plain batched alone... but a 2-element
+        # surviving list still takes the batch path only when >1 rule
+        # remains AFTER the existence filter. Here [hostile, plain]
+        # survive, so the batch path runs with hostile refused.
+        assert "hostile" in results
+        assert not results["hostile"].ok
+        assert "scripting block" in results["hostile"].errors[0]
+        # The hostile payload never reached the batch file.
+        assert "os.system" not in captured["text"]
+        assert "malloc@p" in captured["text"]
+        assert captured["calls"] == 1
+        assert results["plain"].returncode == 0
+
+    def test_all_scripted_rules_refused_runner_not_invoked(self, tmp_path):
+        r1 = tmp_path / "h1.cocci"
+        r1.write_text(HOSTILE_SCRIPTED_RULE)
+        r2 = tmp_path / "h2.cocci"
+        r2.write_text(PLAIN_RULE + "\n@initialize:python@\n@@\nx=1\n")
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock()
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            results = run_rules_batched(
+                target, [r1, r2], subprocess_runner=spy,
+            )
+
+        assert set(results) == {"h1", "h2"}
+        for r in results.values():
+            assert not r.ok
+            assert "scripting block" in r.errors[0]
+        spy.assert_not_called()
+
+    def test_single_rule_delegation_forwards_gate(self, tmp_path):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(HOSTILE_SCRIPTED_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock()
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            results = run_rules_batched(
+                target, [rule], subprocess_runner=spy,
+            )
+
+        assert not results["hostile"].ok
+        assert "scripting block" in results["hostile"].errors[0]
+        spy.assert_not_called()
+
+    def test_allow_scripting_true_keeps_scripted_rule_in_batch(
+        self, tmp_path,
+    ):
+        r1 = tmp_path / "shipped.cocci"
+        r1.write_text(HOSTILE_SCRIPTED_RULE)
+        r2 = tmp_path / "plain.cocci"
+        r2.write_text(PLAIN_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            sp_idx = cmd.index("--sp-file")
+            captured["text"] = Path(cmd[sp_idx + 1]).read_text(
+                encoding="utf-8",
+            )
+            return _mock_proc()
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            results = run_rules_batched(
+                target, [r1, r2],
+                subprocess_runner=_capture,
+                allow_scripting=True,
+            )
+
+        assert "@script:python@" in captured["text"]
+        assert results["shipped"].returncode == 0
+        assert results["plain"].returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Default runner — sandboxed, network blocked.
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultRunnerSandboxed:
+    """When no subprocess_runner is passed, the runner routes spatch
+    through core.sandbox (network blocked) rather than bare
+    subprocess.run. Explicit subprocess_runner always wins."""
+
+    def test_run_rule_default_routes_through_sandboxed_run(
+        self, tmp_path, monkeypatch,
+    ):
+        rule = tmp_path / "plain.cocci"
+        rule.write_text(PLAIN_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock(return_value=_mock_proc())
+        monkeypatch.setattr(runner_mod, "_sandboxed_run", spy)
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(target, rule, env=dict(os.environ))
+
+        assert spy.called
+        assert result.returncode == 0
+
+    def test_run_rules_batched_default_routes_through_sandboxed_run(
+        self, tmp_path, monkeypatch,
+    ):
+        r1 = tmp_path / "a.cocci"
+        r1.write_text(PLAIN_RULE)
+        r2 = tmp_path / "b.cocci"
+        r2.write_text("@s@\nposition p;\n@@\nfree@p(...)\n")
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        spy = MagicMock(return_value=_mock_proc())
+        monkeypatch.setattr(runner_mod, "_sandboxed_run", spy)
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            run_rules_batched(target, [r1, r2], env=dict(os.environ))
+
+        assert spy.called
+
+    def test_sandboxed_run_blocks_network(self, monkeypatch):
+        """_sandboxed_run wires core.sandbox.run with
+        block_network=True; subprocess-style kwargs pass through."""
+        import core.sandbox as sandbox_pkg
+
+        captured = {}
+
+        def fake_sandbox_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = kwargs
+            return _mock_proc()
+
+        monkeypatch.setattr(sandbox_pkg, "run", fake_sandbox_run)
+        proc = runner_mod._sandboxed_run(
+            ["spatch", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+
+        assert proc.returncode == 0
+        assert captured["cmd"] == ["spatch", "--version"]
+        assert captured["kwargs"]["block_network"] is True
+        assert captured["kwargs"]["caller_label"] == "coccinelle-runner"
+        assert captured["kwargs"]["capture_output"] is True
+        assert captured["kwargs"]["timeout"] == 5
+
+    def test_explicit_subprocess_runner_wins(self, tmp_path, monkeypatch):
+        rule = tmp_path / "plain.cocci"
+        rule.write_text(PLAIN_RULE)
+        target = tmp_path / "x.c"
+        target.write_text("void f() {}\n")
+
+        def _boom(cmd, **kwargs):
+            raise AssertionError(
+                "default sandbox runner used despite explicit "
+                "subprocess_runner"
+            )
+
+        monkeypatch.setattr(runner_mod, "_sandboxed_run", _boom)
+        stub = MagicMock(return_value=_mock_proc())
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            result = run_rule(target, rule, subprocess_runner=stub)
+
+        assert stub.called
+        assert result.returncode == 0
+
+class TestSpatchPathRealpath:
+    """_spatch_path caches the REAL path: a symlink shim on PATH
+    otherwise fails the sandbox's mount-ns visibility check and
+    silently downgrades rule runs to Landlock-only."""
+
+    def test_resolves_symlink(self, tmp_path, monkeypatch):
+        from packages.coccinelle import runner as runner_mod
+        real = tmp_path / "coccinelle" / "bin" / "spatch"
+        real.parent.mkdir(parents=True)
+        real.write_text("#!/bin/sh\n")
+        link = tmp_path / "shim" / "spatch"
+        link.parent.mkdir()
+        link.symlink_to(real)
+        patch_module_attribute(monkeypatch, runner_mod, "shutil", "which", lambda _name: str(link))
+        monkeypatch.setattr(runner_mod, "_spatch_resolved", False)
+        monkeypatch.setattr(runner_mod, "_resolved_spatch", None)
+        assert runner_mod._spatch_path() == str(real.resolve())
+        # Cache invalidation hygiene for later tests.
+        monkeypatch.setattr(runner_mod, "_spatch_resolved", False)
+        monkeypatch.setattr(runner_mod, "_resolved_spatch", None)
+
+
+class TestNonzeroExitVisibility:
+    """Engine failure must never read as verified silence: a nonzero
+    spatch exit with unrecognised (or empty) stderr previously yielded
+    errors=[] and a full files_examined — coverage / refutation
+    consumers read the crashed sweep as examined-clean."""
+
+    def _run(self, tmp_path, *, returncode, stderr="", stdout=""):
+        rule = tmp_path / "test.cocci"
+        rule.write_text("@r@\nposition p;\n@@\nmalloc@p(...)\n")
+        target = tmp_path / "test.c"
+        target.write_text("void f() { void *p = malloc(10); }\n")
+
+        def mock_run(cmd, **kwargs):
+            proc = MagicMock()
+            proc.stdout = stdout
+            proc.stderr = stderr
+            proc.returncode = returncode
+            return proc
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True), \
+             patch("packages.coccinelle.runner._sandboxed_run",
+                   side_effect=mock_run):
+            return run_rule(target, rule, env=dict(os.environ))
+
+    def test_nonzero_rc_with_quiet_stderr_synthesizes_error(self, tmp_path):
+        result = self._run(tmp_path, returncode=-11)
+        assert result.errors == ["spatch exited with code -11"]
+        assert result.ok is False
+
+    def test_nonzero_rc_stderr_tail_included(self, tmp_path):
+        result = self._run(
+            tmp_path, returncode=1, stderr="No rules apply.",
+        )
+        assert result.errors == [
+            "spatch exited with code 1: No rules apply.",
+        ]
+
+    def test_nonzero_rc_does_not_claim_files_examined(self, tmp_path):
+        # A crashed sweep verified nothing — the whole-tree
+        # files_examined claim must not survive a nonzero exit.
+        result = self._run(tmp_path, returncode=-9)
+        assert result.files_examined == []
+
+    def test_nonzero_rc_with_recognized_error_not_duplicated(self, tmp_path):
+        result = self._run(
+            tmp_path, returncode=2,
+            stderr="parse error: line 3 of the semantic patch",
+        )
+        assert len(result.errors) == 1
+        assert "parse error" in result.errors[0]
+        assert result.files_examined == []
+
+    def test_zero_rc_keeps_full_files_examined(self, tmp_path):
+        # Two-direction: a clean exit keeps the whole-tree claim.
+        result = self._run(tmp_path, returncode=0)
+        assert result.errors == []
+        assert result.files_examined  # the target file is listed
+        assert result.ok is True
+
+
+class TestDefaultRunnerConfinement:
+    """The default (core.sandbox) runner engages filesystem
+    confinement — ``target=`` the scanned tree, ``output=`` the
+    invocation's scratch dir — instead of the bare-run posture
+    (no target/output: network/seccomp/rlimits only, plus a
+    once-per-process warning attributed to this module)."""
+
+    def _record_sandbox_run(self, monkeypatch):
+        calls: list[tuple[list, dict]] = []
+
+        def _record(cmd, **kwargs):
+            calls.append((list(cmd), kwargs))
+            return _mock_proc()
+
+        import core.sandbox
+        monkeypatch.setattr(core.sandbox, "run", _record)
+        return calls
+
+    def test_run_rule_confines_target_output_and_scratch(
+        self, tmp_path, monkeypatch,
+    ):
+        calls = self._record_sandbox_run(monkeypatch)
+        rule = tmp_path / "r.cocci"
+        rule.write_text(PLAIN_RULE)
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "x.c").write_text("void f() {}\n")
+        inc = tmp_path / "inc"
+        inc.mkdir()
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            run_rule(target, rule, include_dirs=[inc])
+
+        assert calls, "default runner never reached core.sandbox.run"
+        cmd, kwargs = calls[0]
+        assert kwargs["target"] == str(target)
+        assert kwargs["cwd"] == str(target)
+        assert kwargs["block_network"] is True
+        assert kwargs["env_caller_filtered"] is True
+        # The rule file is materialised inside the sandbox's writable
+        # output= surface — the only path both sides of the mount view
+        # share for it.
+        scratch = kwargs["output"]
+        assert scratch
+        sp_file = cmd[cmd.index("--sp-file") + 1]
+        assert sp_file.startswith(scratch + os.sep)
+        # Include dirs ride tool_paths so the mount view binds them.
+        assert str(inc) in (kwargs.get("tool_paths") or [])
+
+    def test_run_rules_batched_confines_target_and_output(
+        self, tmp_path, monkeypatch,
+    ):
+        calls = self._record_sandbox_run(monkeypatch)
+        rules = []
+        for name in ("a", "b"):
+            r = tmp_path / f"{name}.cocci"
+            r.write_text(PLAIN_RULE.replace("@r@", f"@{name}@"))
+            rules.append(r)
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "x.c").write_text("void f() {}\n")
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            run_rules_batched(target, rules, allow_scripting=True)
+
+        assert calls, "default runner never reached core.sandbox.run"
+        cmd, kwargs = calls[0]
+        assert kwargs["target"] == str(target)
+        assert kwargs["block_network"] is True
+        scratch = kwargs["output"]
+        sp_file = cmd[cmd.index("--sp-file") + 1]
+        assert sp_file.startswith(scratch + os.sep)
+
+    def test_custom_subprocess_runner_keeps_subprocess_signature(
+        self, tmp_path,
+    ):
+        seen = {}
+
+        def _stub(cmd, **kwargs):
+            seen.update(kwargs)
+            return _mock_proc()
+
+        rule = tmp_path / "r.cocci"
+        rule.write_text(PLAIN_RULE)
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "x.c").write_text("void f() {}\n")
+
+        with patch(
+            "packages.coccinelle.runner.is_available", return_value=True,
+        ):
+            run_rule(target, rule, subprocess_runner=_stub)
+
+        assert "target" not in seen
+        assert "output" not in seen
+
+
+class TestBatchNonzeroExitVisibility:
+    """The batch path must apply the same rc-synthesis as run_rule: a
+    quiet spatch crash previously yielded every per-rule SpatchResult
+    with errors=[] and the whole C/H tree in files_examined —
+    verified silence for a sweep that analysed nothing."""
+
+    def _run_batch(self, tmp_path, *, returncode, stderr="", stdout=""):
+        r1 = tmp_path / "rule_x.cocci"
+        r1.write_text("@r@\nposition p;\n@@\nmalloc@p(...)\n")
+        target = tmp_path / "test.c"
+        target.write_text("void f() { void *p = malloc(10); }\n")
+
+        def mock_run(cmd, **kwargs):
+            proc = MagicMock()
+            proc.stdout = stdout
+            proc.stderr = stderr
+            proc.returncode = returncode
+            return proc
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True), \
+             patch("packages.coccinelle.runner._sandboxed_run",
+                   side_effect=mock_run):
+            return run_rules_batched(
+                target, [r1], env=dict(os.environ),
+            )
+
+    def test_quiet_crash_synthesizes_error_per_rule(self, tmp_path):
+        out = self._run_batch(tmp_path, returncode=-11)
+        result = out["rule_x"]
+        assert result.errors == ["spatch exited with code -11"]
+        assert result.ok is False
+
+    def test_quiet_crash_does_not_claim_files_examined(self, tmp_path):
+        out = self._run_batch(tmp_path, returncode=-9)
+        assert out["rule_x"].files_examined == []
+
+    def test_clean_exit_keeps_full_files_examined(self, tmp_path):
+        out = self._run_batch(tmp_path, returncode=0)
+        assert any(f.endswith("test.c")
+                   for f in out["rule_x"].files_examined)
+
+
+class TestUndecodableRuleFiles:
+    """A non-UTF-8 (or unreadable) rule file must degrade to a
+    structured SpatchResult like every other failure shape in this
+    runner — pre-fix it raised UnicodeDecodeError out of run_rule /
+    run_rules / run_rules_batched, aborting the whole multi-rule
+    sweep and losing every already-computed result."""
+
+    LATIN1_RULE = (
+        b"// commentaire op\xe9rateur (latin-1, not UTF-8)\n"
+        b"@r@\nposition p;\n@@\nreturn@p 0;\n"
+    )
+
+    def _bad_rule(self, tmp_path):
+        bad = tmp_path / "bad.cocci"
+        bad.write_bytes(self.LATIN1_RULE)
+        return bad
+
+    def test_run_rule_returns_structured_error(self, tmp_path):
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        with patch.object(runner_mod, "is_available", return_value=True):
+            result = run_rule(target, self._bad_rule(tmp_path))
+        assert result.returncode == -1
+        assert result.ok is False
+        assert any("unreadable" in e for e in result.errors)
+
+    @pytest.mark.skipif(not is_available(), reason="spatch not installed")
+    def test_run_rules_keeps_good_rules_results(self, tmp_path):
+        """The good rule's result survives a sweep containing an
+        undecodable sibling."""
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f(void) { return 0; }\n")
+        rules = tmp_path / "rules"
+        rules.mkdir()
+        (rules / "aa_good.cocci").write_text(
+            "@r@\nposition p;\n@@\nreturn@p 0;\n", encoding="utf-8",
+        )
+        self._bad_rule(rules)
+        results = run_rules(target, rules, no_includes=True)
+        by_rule = {r.rule: r for r in results}
+        assert "bad" in by_rule and by_rule["bad"].returncode == -1
+        assert any("unreadable" in e for e in by_rule["bad"].errors)
+        assert "aa_good" in by_rule
+        assert by_rule["aa_good"].returncode == 0
+
+    @pytest.mark.skipif(not is_available(), reason="spatch not installed")
+    def test_run_rules_batched_isolates_bad_rule(self, tmp_path):
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        good = tmp_path / "good.cocci"
+        good.write_text(
+            "@good@\n@@\n- return 0;\n+ return 1;\n", encoding="utf-8",
+        )
+        out = run_rules_batched(
+            target, [good, self._bad_rule(tmp_path)],
+        )
+        assert out["bad"].returncode == -1
+        assert any("unreadable" in e for e in out["bad"].errors)
+        assert out["good"].returncode == 0
+
+    def test_run_rule_oserror_is_structured(self, tmp_path):
+        """Unreadable-by-permissions is the same degradation class."""
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        bad = self._bad_rule(tmp_path)
+        with patch.object(runner_mod, "is_available", return_value=True), \
+             patch.object(runner_mod, "read_text_gated",
+                          side_effect=OSError("EIO mid-read")):
+            result = run_rule(target, bad)
+        assert result.returncode == -1
+        assert any("unreadable" in e for e in result.errors)
+
+
+class TestBatchedRuleCap:
+    """The 1 MiB rule-size OOM defence covers BOTH read paths: the
+    ≥2-rule batched loop used to read, concatenate, and run an
+    uncapped rule whenever it had a sibling."""
+
+    def _rules(self, tmp_path):
+        good = tmp_path / "good.cocci"
+        good.write_text(
+            "@good@\n@@\n- return 0;\n+ return 1;\n", encoding="utf-8",
+        )
+        big = tmp_path / "big.cocci"
+        big.write_text(
+            "// " + "x" * (runner_mod._RULE_MAX_BYTES + 100) + "\n",
+            encoding="utf-8",
+        )
+        return good, big
+
+    @pytest.mark.skipif(not is_available(), reason="spatch not installed")
+    def test_batched_refuses_oversized_rule_others_run(self, tmp_path):
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        good, big = self._rules(tmp_path)
+        out = run_rules_batched(target, [good, big])
+        assert out["big"].returncode == -1
+        assert any("cap" in e for e in out["big"].errors)
+        assert out["good"].returncode == 0
+
+    def test_batched_cap_refusal_without_spawn(self, tmp_path):
+        """Both rules oversized → nothing reaches spatch at all."""
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        _, big = self._rules(tmp_path)
+        big2 = tmp_path / "big2.cocci"
+        big2.write_text(
+            "// " + "y" * (runner_mod._RULE_MAX_BYTES + 100) + "\n",
+            encoding="utf-8",
+        )
+        spawned = []
+
+        def fake_runner(cmd, **kwargs):  # pragma: no cover - must not run
+            spawned.append(cmd)
+            return MagicMock(stdout="", stderr="", returncode=0)
+
+        out = run_rules_batched(
+            target, [big, big2],
+            subprocess_runner=fake_runner,
+        )
+        assert not spawned
+        assert all(r.returncode == -1 for r in out.values())
+
+
+class TestBatchedApiParity:
+    """run_rules_batched carries run_rule's include_dirs /
+    no_includes / defines semantics — pre-fix all three were
+    silently dropped, so rules needing them diverged between the
+    batched and per-rule lanes."""
+
+    def _two_rules(self, tmp_path):
+        a = tmp_path / "a.cocci"
+        a.write_text("@a@\n@@\n- return 0;\n+ return 1;\n",
+                     encoding="utf-8")
+        b = tmp_path / "b.cocci"
+        b.write_text("@b@\n@@\n- return 2;\n+ return 3;\n",
+                     encoding="utf-8")
+        return [a, b]
+
+    def test_flags_reach_the_batched_command(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f(void) { return 0; }\n")
+        inc = tmp_path / "hdrs"
+        inc.mkdir()
+        captured = {}
+
+        def fake_runner(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return MagicMock(stdout="", stderr="", returncode=0)
+
+        with patch.object(runner_mod, "is_available", return_value=True):
+            run_rules_batched(
+                target, self._two_rules(tmp_path),
+                include_dirs=[inc],
+                no_includes=True,
+                defines={"KERNEL": "1"},
+                subprocess_runner=fake_runner,
+            )
+        cmd = captured["cmd"]
+        assert "--no-includes" in cmd
+        assert "-I" in cmd and str(inc) in cmd
+        assert "-D" in cmd and "KERNEL=1" in cmd
+
+    def test_single_rule_fallback_forwards_flags(self, tmp_path):
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        rule = self._two_rules(tmp_path)[0]
+        captured = {}
+
+        def fake_runner(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return MagicMock(stdout="", stderr="", returncode=0)
+
+        with patch.object(runner_mod, "is_available", return_value=True):
+            run_rules_batched(
+                target, [rule],
+                no_includes=True,
+                defines={"X": "2"},
+                subprocess_runner=fake_runner,
+            )
+        assert "--no-includes" in captured["cmd"]
+        assert "X=2" in captured["cmd"]
+
+
+class TestTimeoutElapsedMs:
+    """Timeout results carry the wall time actually spent — the
+    default 0 misread the SLOWEST invocations as instantaneous."""
+
+    def _ticker(self):
+        state = {"t": 1000.0}
+
+        def _mono():
+            state["t"] += 0.25
+            return state["t"]
+
+        return _mono
+
+    def test_run_rule_timeout_carries_elapsed(self, tmp_path):
+        import subprocess as sp
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        rule = tmp_path / "r.cocci"
+        rule.write_text("@r@\n@@\n- return 0;\n+ return 1;\n",
+                        encoding="utf-8")
+
+        def fake_runner(cmd, **kwargs):
+            raise sp.TimeoutExpired(cmd, 1)
+
+        with patch.object(runner_mod, "is_available", return_value=True), \
+             mock_module_attribute(runner_mod, 'time', "monotonic",
+                          side_effect=self._ticker()):
+            result = run_rule(
+                target, rule, timeout=1, subprocess_runner=fake_runner,
+            )
+        assert result.returncode == -1
+        assert result.elapsed_ms > 0
+
+    def test_batched_timeout_carries_elapsed(self, tmp_path):
+        import subprocess as sp
+        target = tmp_path / "a.c"
+        target.write_text("int f(void) { return 0; }\n")
+        rules = []
+        for name in ("a", "b"):
+            r = tmp_path / f"{name}.cocci"
+            r.write_text(f"@{name}@\n@@\n- return 0;\n+ return 1;\n",
+                         encoding="utf-8")
+            rules.append(r)
+
+        def fake_runner(cmd, **kwargs):
+            raise sp.TimeoutExpired(cmd, 1)
+
+        with patch.object(runner_mod, "is_available", return_value=True), \
+             mock_module_attribute(runner_mod, 'time', "monotonic",
+                          side_effect=self._ticker()):
+            out = run_rules_batched(
+                target, rules, timeout=1, subprocess_runner=fake_runner,
+            )
+        assert all(r.elapsed_ms > 0 for r in out.values())
+
+
+class TestFilesExaminedNoIncludes:
+    """files_examined claims verified silence for every listed file —
+    under --no-includes spatch never opens a header, so *.h must not
+    be claimed (the probe shape: a never-included header was
+    reported examined)."""
+
+    def test_collect_excludes_headers_under_no_includes(self, tmp_path):
+        (tmp_path / "a.c").write_text("")
+        (tmp_path / "never_included.h").write_text("")
+        result = _collect_files_examined(tmp_path, set(), no_includes=True)
+        assert any(f.endswith("a.c") for f in result)
+        assert not any(f.endswith(".h") for f in result)
+
+    def test_collect_keeps_headers_with_includes(self, tmp_path):
+        # Two-direction pin: includes enabled keeps the approximate
+        # header coverage claim.
+        (tmp_path / "a.c").write_text("")
+        (tmp_path / "u.h").write_text("")
+        result = _collect_files_examined(tmp_path, set(), no_includes=False)
+        assert any(f.endswith("u.h") for f in result)
+
+    def test_match_files_survive_the_filter(self, tmp_path):
+        (tmp_path / "a.c").write_text("")
+        result = _collect_files_examined(
+            tmp_path, {"evidence.h"}, no_includes=True,
+        )
+        assert "evidence.h" in result
+
+    @pytest.mark.skipif(not is_available(), reason="spatch not installed")
+    def test_run_rule_no_includes_omits_header(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f(void) { return 0; }\n")
+        (target / "never_included.h").write_text("#define X 1\n")
+        rule = tmp_path / "r.cocci"
+        rule.write_text("@r@\nposition p;\n@@\n- return@p 0;\n+ return 1;\n",
+                        encoding="utf-8")
+        result = run_rule(target, rule, no_includes=True)
+        assert result.returncode == 0
+        assert not any(
+            f.endswith("never_included.h") for f in result.files_examined
+        )
+        assert any(f.endswith("a.c") for f in result.files_examined)
+class TestScriptingGateLexicalSpellings:
+    """contains_script_block must judge rule text the way spatch's
+    LEXER does, not the way the raw bytes read.
+
+    Every spelling in EXECUTED_SPELLINGS ran its script payload on
+    spatch 1.3 (python + ocaml scripting enabled), verified with a
+    runtime-computed marker so an error-output echo of the source can
+    never masquerade as execution, and with a clean (0) exit. A gate
+    that misses any of them admits code execution inside spatch on
+    the untrusted (allow_scripting=False) paths.
+
+    CONSERVATIVE_SPELLINGS do not execute on spatch 1.3 (most do not
+    even parse) but declare scripting in shapes other Coccinelle
+    grammars accept — the script-constraint form is real syntax on
+    newer versions — or that a laxer parser could lex; the gate
+    refuses them too, because on untrusted paths a wider matcher only
+    ever refuses more.
+    """
+
+    EXECUTED_SPELLINGS = {
+        "comment_in_header_python":
+            '@/*c*/script:python@\n@@\nprint("x")\n',
+        "comment_in_header_ocaml":
+            '@/*c*/script:ocaml@\n@@\nprint_string "x"\n',
+        "multiline_comment_spanning_header":
+            '@/*x\ny*/script:python@\n@@\nprint("x")\n',
+        "line_comment_then_keyword_next_line":
+            '@//c\nscript:python@\n@@\nprint("x")\n',
+        "newline_between_at_and_keyword":
+            '@\nscript:python@\n@@\nprint("x")\n',
+        "carriage_return_after_at":
+            '@\rscript:python@\n@@\nprint("x")\n',
+        "formfeed_after_at":
+            '@\x0cscript:python@\n@@\nprint("x")\n',
+        "tab_after_at":
+            '@\tscript:python@\n@@\nprint("x")\n',
+        "comment_between_keyword_and_colon":
+            '@script/*c*/:python@\n@@\nprint("x")\n',
+        "comment_after_colon":
+            '@script:/*c*/python@\n@@\nprint("x")\n',
+        "spaces_around_colon":
+            '@ script : python@\n@@\nprint("x")\n',
+        "comment_header_after_prior_rule":
+            '@r1@ expression E; @@ foo(E)\n'
+            '@/*x*/script:python@\n@@\nprint("x")\n',
+        "crlf_line_comment_header":
+            '@//c\r\nscript:python@\r\n@@\r\nprint("x")\r\n',
+        # Over-cap multi-char constant: spatch lexes it as ONE token,
+        # so a scanner that demoted the quote to a stray character
+        # let the embedded /* open a phantom comment truncating the
+        # live header below out of the gate's view.
+        "long_char_literal_phantom_comment_python":
+            "@a@ expression E; @@\nfoo(E, 'aaaaaaaaaaaaa/*aa');\n"
+            '@script:python@\n@@\nprint("x")\n',
+        "long_char_literal_phantom_comment_space_colon":
+            "@a@ expression E; @@\nfoo(E, 'aaaaaaaaaaaaa/*aa');\n"
+            '@script : python@\n@@\nprint("x")\n',
+        "long_char_literal_phantom_comment_ocaml":
+            "@a@ expression E; @@\nfoo(E, 'aaaaaaaaaaaaa/*aa');\n"
+            '@script:ocaml@\n@@\nprint_string "x"\n',
+        "minimal_over_cap_literal_phantom_comment":
+            "@a@ expression E; @@\nfoo(E, 'aaaaaaaaab/*');\n"
+            '@script:python@\n@@\nprint("x")\n',
+        # spatch lexes a char constant ACROSS newlines: no same-line
+        # close, but a later quote pairs it — everything between is
+        # ONE token for spatch while a live-view scan would hand the
+        # embedded /* to the comment stripper, truncating the header.
+        "multiline_char_literal_phantom_comment":
+            "@a@ expression E; position p; @@\n"
+            "foo@p(E, 'aa/*aa\nbb');\n"
+            '@script : python@\n@@\nprint("x")\n',
+        "multiline_char_literal_close_alone_on_next_line":
+            "@a@ expression E; position p; @@\n"
+            "foo@p(E, 'aa/*aa\n');\n"
+            '@script : python@\n@@\nprint("x")\n',
+        # Executed-but-visible ride-alongs: the CR / escaped-newline
+        # literals keep the header visible today; pinned so a future
+        # scanner change cannot silently admit them.
+        "cr_inside_char_literal":
+            "@a@ expression E; position p; @@\n"
+            "foo@p(E, 'aa/*a\rb');\n"
+            '@script:python@\n@@\nprint("x")\n',
+        "escaped_newline_inside_char_literal":
+            "@a@ expression E; position p; @@\n"
+            "foo@p(E, 'aa/*aa\\\nbb');\n"
+            '@script:python@\n@@\nprint("x")\n',
+        # spatch lexes a STRING literal across a raw newline and
+        # across a backslash continuation the same way: the
+        # continuation line is string content for spatch but would be
+        # live text for a view that stops at the newline — its /*
+        # would truncate the header below.
+        "multiline_string_phantom_comment":
+            '@a@ expression E; position p; @@\n'
+            'foo@p(E, "ab\n/*x");\n'
+            '@script : python@\n@@\nprint("x")\n',
+        "backslash_continued_string_phantom_comment":
+            '@a@ expression E; position p; @@\n'
+            'foo@p(E, "ab\\\n/*x");\n'
+            '@script : python@\n@@\nprint("x")\n',
+        "backslash_continued_string_phantom_plain_colon":
+            '@a@ expression E; position p; @@\n'
+            'foo@p(E, "ab\\\n/*x");\n'
+            '@script:python@\n@@\nprint("x")\n',
+        # Executed-but-visible ride-along: spatch honours //-comments
+        # on a #-directive line; the header on the next line runs and
+        # stays visible in the view.
+        "hash_line_comment_then_header":
+            '@x@ expression E; @@\nfoo(E);\n#define B // "\n'
+            '@script:python@\n@@\nprint("x")\n',
+    }
+
+    CONSERVATIVE_SPELLINGS = {
+        "comment_in_header_initialize":
+            '@/*c*/initialize:python@\n@@\nimport os\n',
+        "comment_in_header_finalize":
+            '@/*c*/finalize:python@\n@@\nimport os\n',
+        "depends_clause":
+            '@/*c*/script:python depends on r@\n@@\nprint("x")\n',
+        "uppercase_header":
+            '@SCRIPT:Python@\n@@\nprint("x")\n',
+        "header_midline_after_tokens":
+            '@r1@ expression E; @@ foo(E) @script:python@ @@ print("x")\n',
+        "script_constraint_no_header":
+            '@r@\nidentifier i : script:python { evil(i) };\n'
+            '@@\n- i(...);\n',
+        "script_constraint_on_inherited_metavar":
+            '@r@\nidentifier i;\n@@\n- i(...);\n'
+            '@t@\nidentifier r.i : script:python { evil(i) };\n'
+            '@@\n- i(...);\n',
+        "stray_quote_before_header":
+            "@r1@ expression E; @@\nfoo(E); ' @script:python@\n"
+            '@@\nprint("x")\n',
+        "unterminated_string_then_header_next_line":
+            '@r1@ expression E; @@\nfoo(E); "abc\n'
+            '@script:python@\n@@\nprint("x")\n',
+    }
+
+    @pytest.mark.parametrize(
+        "rule_text",
+        list(EXECUTED_SPELLINGS.values()),
+        ids=list(EXECUTED_SPELLINGS),
+    )
+    def test_executed_spellings_trip_the_gate(self, rule_text):
+        assert contains_script_block(rule_text)
+
+    @pytest.mark.parametrize(
+        "rule_text",
+        list(CONSERVATIVE_SPELLINGS.values()),
+        ids=list(CONSERVATIVE_SPELLINGS),
+    )
+    def test_conservative_spellings_trip_the_gate(self, rule_text):
+        assert contains_script_block(rule_text)
+
+    # ---- string/char-literal awareness: the stripper must neither
+    # ---- open comments inside literals (false-negative direction)
+    # ---- nor let literals swallow keywords (false-negative direction).
+
+    def test_block_comment_opener_inside_string_does_not_swallow_header(self):
+        # A string-unaware comment stripper would open /* here and
+        # swallow the real header below to EOF.
+        rule = (
+            '@r1@ expression E; @@\nfoo("a/*b");\n'
+            '@script:python@\n@@\nprint("x")\n'
+        )
+        assert contains_script_block(rule)
+
+    def test_line_comment_inside_string_does_not_swallow_sameline_header(self):
+        rule = (
+            '@r1@ expression E; @@\nfoo(E); "a//b" @script:python@\n'
+            '@@\nprint("x")\n'
+        )
+        assert contains_script_block(rule)
+
+    def test_comment_opener_inside_char_literal_does_not_swallow_header(self):
+        rule = (
+            "@r1@ expression E; @@\nfoo('/*');\n"
+            '@script:python@\n@@\nprint("x")\n'
+        )
+        assert contains_script_block(rule)
+
+    def test_over_cap_char_literal_is_refused_as_ambiguous(self):
+        # A '...' pair closing beyond the cap is a multi-char constant
+        # spatch lexes as one token — the scan refuses to classify it
+        # rather than demote the quote (whose contents would then
+        # reach the comment scanner: the phantom-comment bypass).
+        rule = "@x@ expression E; @@\nfoo(E, 'aaaaaaaaaaaaa/*aa');\n"
+        assert contains_script_block(rule)
+
+    def test_small_char_literals_stay_clean(self):
+        rule = "@x@ expression E; @@\nfoo(E, 'a', '\\x41', '\\n');\n"
+        assert not contains_script_block(rule)
+
+    def test_stray_quote_with_any_later_quote_is_refused(self):
+        # spatch can pair the quote ACROSS newlines with any later
+        # quote — the span between is one token for spatch, live text
+        # for a naive view, so it must refuse as ambiguous even with
+        # no scripting keyword anywhere.
+        rule = "@x@ expression E; @@\nfoo(E); ' \nbar(E, 'a');\n"
+        assert contains_script_block(rule)
+
+    def test_stray_quote_as_last_quote_stays_clean(self):
+        # Nothing left to pair with — probed inert on raw spatch
+        # (consumes to EOF looking for the close, executes nothing),
+        # and the view keeps everything after it live, so nothing
+        # can hide behind it.
+        rule = "@x@ expression E; @@\nfoo(E); ' \nbar(E);\n"
+        assert not contains_script_block(rule)
+
+    def test_unclosed_dquote_with_any_later_dquote_is_refused(self):
+        # Same pair-across-newlines hazard as the char constant:
+        # spatch lexes a string literal across a raw newline or a
+        # backslash continuation to a later close quote.
+        rule = '@x@ expression E; @@\nfoo(E, "ab\nbar(E, "x");\n'
+        assert contains_script_block(rule)
+        cont = '@x@ expression E; @@\nfoo(E, "ab\\\nbar(E, "x");\n'
+        assert contains_script_block(cont)
+
+    def test_stray_dquote_as_last_dquote_stays_clean(self):
+        # Probed inert on raw spatch (consumes to EOF hunting the
+        # close, executes nothing — even with an independently
+        # executable tail behind it).
+        rule = '@x@ expression E; @@\nfoo(E); "\nbar(E);\n'
+        assert not contains_script_block(rule)
+
+    def test_char_literal_cannot_blank_a_scripting_keyword(self):
+        # The shortest scripting spelling ("script:ocaml") is longer
+        # than the char-literal cap, so quoting it does not hide it.
+        from packages.coccinelle.runner import _CHAR_LITERAL_CAP
+        assert _CHAR_LITERAL_CAP < len("script:ocaml")
+        rule = (
+            "@r@\nidentifier i : 'script:ocaml' { evil(i) };\n"
+            "@@\n- i(...);\n"
+        )
+        assert contains_script_block(rule)
+
+    # ---- negatives: mentions that are NOT lexed as scripting must
+    # ---- keep passing (the gate stays adoption-compatible with the
+    # ---- shipped syntax example and comment-bearing LLM rules).
+
+    def test_comment_mention_not_flagged(self):
+        rule = (
+            "// this rule deliberately avoids @script:python blocks\n"
+            "@x@\nexpression E;\n@@\n* foo(E);\n"
+        )
+        assert not contains_script_block(rule)
+
+    def test_marker_inside_string_literal_not_flagged(self):
+        # Probed: spatch does not lex a header out of a string
+        # literal (the rule never executes), so no refusal either.
+        rule = '@x@\nexpression E;\n@@\nfoo("@script:python@");\n'
+        assert not contains_script_block(rule)
+
+    def test_word_suffix_not_flagged(self):
+        rule = "@x@\nexpression E;\n@@\npostscript: foo(E);\n"
+        assert not contains_script_block(rule)
+
+    def test_pure_smpl_not_flagged(self):
+        rule = (
+            "@unchecked@\nexpression E;\nposition p;\n@@\n"
+            "* E@p = malloc(...);\n... when != E == NULL\n* E->fld\n"
+        )
+        assert not contains_script_block(rule)
+
+
+class TestResultMarkerGate:
+    """An untrusted rule carrying its own COCCIRESULT emit site must be
+    refused before the nonce rewrite: the rewrite noncifies EVERY
+    marker in the text it executes, so a rule-supplied emit site would
+    be minted into evidence the parser accepts (forged SpatchMatch
+    rows chosen by the rule author)."""
+
+    MARKER_RULE = (
+        "// mentions COCCIRESULT: in prose only\n"
+        "@x@\nexpression E;\n@@\n* foo(E);\n"
+    )
+
+    def test_run_rule_refuses_marker_rule_before_invocation(self, tmp_path):
+        rule = tmp_path / "marker.cocci"
+        rule.write_text(self.MARKER_RULE)
+        target = tmp_path / "t.c"
+        target.write_text("int main(void){return 0;}\n")
+        calls = []
+
+        def record_runner(cmd, **kwargs):
+            calls.append(cmd)
+            proc = MagicMock()
+            proc.stdout, proc.stderr, proc.returncode = "", "", 0
+            return proc
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(target, rule, env=dict(os.environ),
+                              subprocess_runner=record_runner)
+        assert calls == []          # spatch never invoked
+        assert result.returncode == -1
+        assert result.matches == []
+        assert any("COCCIRESULT" in e for e in result.errors)
+
+    def test_trusted_caller_flag_still_admits_marker_rules(self, tmp_path):
+        rule = tmp_path / "marker.cocci"
+        rule.write_text(self.MARKER_RULE)
+        target = tmp_path / "t.c"
+        target.write_text("int main(void){return 0;}\n")
+
+        def ok_runner(cmd, **kwargs):
+            proc = MagicMock()
+            proc.stdout, proc.stderr, proc.returncode = "", "", 0
+            return proc
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(target, rule, env=dict(os.environ),
+                              subprocess_runner=ok_runner,
+                              allow_scripting=True)
+        assert result.returncode == 0
+        assert not result.errors
+
+    def test_batched_refuses_marker_rule_and_runs_the_rest(self, tmp_path):
+        marker = tmp_path / "marker.cocci"
+        marker.write_text(self.MARKER_RULE)
+        clean = tmp_path / "clean.cocci"
+        clean.write_text("@y@\nexpression E;\n@@\n* bar(E);\n")
+        target = tmp_path / "t.c"
+        target.write_text("int main(void){return 0;}\n")
+
+        def ok_runner(cmd, **kwargs):
+            sp_idx = cmd.index("--sp-file")
+            batch_text = Path(cmd[sp_idx + 1]).read_text(encoding="utf-8")
+            assert RESULT_PREFIX not in batch_text
+            assert "COCCIRESULT" not in self._strip_nonced(batch_text)
+            proc = MagicMock()
+            proc.stdout, proc.stderr, proc.returncode = "", "", 0
+            return proc
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            out = run_rules_batched(
+                target, [marker, clean], env=dict(os.environ),
+                subprocess_runner=ok_runner,
+            )
+        assert any("COCCIRESULT" in e for e in out["marker"].errors)
+        assert out["marker"].returncode == -1
+        assert out["clean"].returncode == 0
+
+    @staticmethod
+    def _strip_nonced(text: str) -> str:
+        return re.sub(r"COCCIRESULT-[0-9a-f]{32}:", "", text)
+
+
+class TestScriptingForgeryChainClosed:
+    """Full-chain regression: a hostile rule combining a comment-in-
+    header scripting block with its own COCCIRESULT emit site must be
+    refused on the default (allow_scripting=False) path — previously
+    the gate missed the spelling, the nonce rewrite noncified the
+    HOSTILE emit site, and the parser returned attacker-chosen
+    SpatchMatch rows as mechanical evidence."""
+
+    HOSTILE_RULE = (
+        "@/*c*/script:python@\n@@\n"
+        "print('COCCIRESULT:{\"file\": \"src/auth.c\", \"line\": 1337, "
+        "\"rule\": \"forged-by-attacker\", "
+        "\"message\": \"attacker-chosen evidence\"}')\n"
+    )
+
+    def test_hostile_rule_refused_never_executed(self, tmp_path):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(self.HOSTILE_RULE)
+        target = tmp_path / "t.c"
+        target.write_text("int main(void){return 0;}\n")
+        calls = []
+
+        def spatch_sim(cmd, **kwargs):
+            # Simulates spatch EXECUTING the hostile script: emit the
+            # forged row with the invocation's nonced marker, exactly
+            # as the rewritten hostile emit site would.
+            calls.append(cmd)
+            prefix = _nonced_prefix_from_cmd(cmd)
+            proc = MagicMock()
+            proc.stdout = (
+                prefix + '{"file": "src/auth.c", "line": 1337, '
+                '"rule": "forged-by-attacker", '
+                '"message": "attacker-chosen evidence"}\n'
+            )
+            proc.stderr = ""
+            proc.returncode = 0
+            return proc
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(target, rule, env=dict(os.environ),
+                              subprocess_runner=spatch_sim)
+
+        assert calls == []          # refused before spatch invocation
+        assert result.matches == []  # no forged evidence accepted
+        assert result.returncode == -1
+        assert result.errors and "scripting block" in result.errors[0]
+
+    @pytest.mark.skipif(
+        not is_available(), reason="spatch not installed",
+    )
+    def test_hostile_rule_refused_on_real_spatch_path(self, tmp_path):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(self.HOSTILE_RULE)
+        target = tmp_path / "t.c"
+        target.write_text("int main(void){return 0;}\n")
+        result = run_rule(target, rule)  # default allow_scripting=False
+        assert result.matches == []
+        assert result.returncode == -1
+        assert result.errors and "scripting block" in result.errors[0]
+
+    @pytest.mark.skipif(
+        not is_available(), reason="spatch not installed",
+    )
+    def test_constraint_form_refused_on_real_spatch_path(self, tmp_path):
+        rule = tmp_path / "constraint.cocci"
+        rule.write_text(
+            "@r@\nidentifier i : script:python "
+            "{ print('COCCIRESULT:{}') };\n@@\n- i(...);\n"
+        )
+        target = tmp_path / "t.c"
+        target.write_text("int main(void){return 0;}\n")
+        result = run_rule(target, rule)
+        assert result.matches == []
+        assert result.returncode == -1
+        assert result.errors and "scripting block" in result.errors[0]
+
+
+class TestNonceTheftForgeryChainClosed:
+    """The marker gate alone cannot survive an execution bypass: the
+    nonced harness is materialised into the SAME sp-file as the rule,
+    so an executing payload can read its own rule file (path via
+    /proc/self/cmdline) and mint a forged row with a VALID nonce —
+    no literal COCCIRESULT text in the rule, so only the scripting
+    gate stands between the rule and accepted forged evidence. This
+    pins the phantom-comment + space-colon spelling that once slipped
+    that gate, end to end."""
+
+    STEAL = (
+        "import re\n"
+        "raw = open('/proc/self/cmdline','rb').read().split(b'\\x00')\n"
+        "sp = raw[raw.index(b'--sp-file')+1].decode()\n"
+        "txt = open(sp).read()\n"
+        "mm = re.search('COCCIRESULT-[0-9a-f]{32}:', txt)\n"
+        "print(mm.group(0) + '{\"file\": \"src/auth.c\", \"line\": 1337, "
+        "\"rule\": \"forged-by-attacker\", "
+        "\"message\": \"attacker-chosen evidence\"}')\n"
+    )
+    HOSTILE_RULE = (
+        "@a@ expression E; position p; @@\n"
+        "foo@p(E, 'aaaaaaaaaaaaa/*aa');\n"
+        "@script : python@\n@@\n"
+    ) + STEAL
+    # Same chain through the multi-line-literal phantom (the close
+    # quote sits on the NEXT line; spatch lexes the constant across
+    # the newline, so no comment exists for it).
+    HOSTILE_RULE_MULTILINE = (
+        "@a@ expression E; position p; @@\n"
+        "foo@p(E, 'aa/*aa\nbb');\n"
+        "@script : python@\n@@\n"
+    ) + STEAL
+    # And through the string-literal twin (backslash continuation;
+    # spatch lexes the string across it, so the /* on the
+    # continuation line is string content for spatch).
+    HOSTILE_RULE_STRING = (
+        '@a@ expression E; position p; @@\n'
+        'foo@p(E, "ab\\\n/*x");\n'
+        "@script : python@\n@@\n"
+    ) + STEAL
+
+    def test_rules_carry_no_literal_marker(self):
+        # The theft variants deliberately defeat the marker gate; the
+        # scripting gate must therefore refuse them on its own.
+        for rule in (self.HOSTILE_RULE, self.HOSTILE_RULE_MULTILINE,
+                     self.HOSTILE_RULE_STRING):
+            assert RESULT_PREFIX not in rule
+            assert contains_script_block(rule)
+
+    def _record_runner(self, calls):
+        def record_runner(cmd, **kwargs):
+            # Snapshot the sp-file content at invocation time — the
+            # scratch dir is gone once the runner returns.
+            sp = Path(cmd[cmd.index("--sp-file") + 1])
+            calls.append((cmd, sp.read_text(encoding="utf-8")))
+            proc = MagicMock()
+            proc.stdout, proc.stderr, proc.returncode = "", "", 0
+            return proc
+        return record_runner
+
+    @pytest.mark.parametrize("rule_text", [
+        HOSTILE_RULE, HOSTILE_RULE_MULTILINE, HOSTILE_RULE_STRING,
+    ], ids=["over_cap_literal", "multiline_literal", "string_literal"])
+    def test_refused_before_spatch_invocation(self, tmp_path, rule_text):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(rule_text)
+        target = tmp_path / "t.c"
+        target.write_text('int main(void){foo("z", 0); return 0;}\n')
+        calls = []
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(target, rule, env=dict(os.environ),
+                              subprocess_runner=self._record_runner(calls))
+        assert calls == []
+        assert result.returncode == -1
+        assert result.matches == []
+        assert result.errors and "scripting block" in result.errors[0]
+
+    @pytest.mark.parametrize("rule_text", [
+        HOSTILE_RULE, HOSTILE_RULE_MULTILINE, HOSTILE_RULE_STRING,
+    ], ids=["over_cap_literal", "multiline_literal", "string_literal"])
+    def test_batched_path_refuses_too(self, tmp_path, rule_text):
+        hostile = tmp_path / "hostile.cocci"
+        hostile.write_text(rule_text)
+        clean = tmp_path / "clean.cocci"
+        clean.write_text("@y@\nexpression E;\n@@\n* bar(E);\n")
+        target = tmp_path / "t.c"
+        target.write_text('int main(void){foo("z", 0); return 0;}\n')
+        calls = []
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            out = run_rules_batched(
+                target, [hostile, clean], env=dict(os.environ),
+                subprocess_runner=self._record_runner(calls),
+            )
+        assert out["hostile"].returncode == -1
+        assert out["hostile"].matches == []
+        assert any("scripting block" in e for e in out["hostile"].errors)
+        assert out["clean"].returncode == 0
+        # The one spatch invocation is the clean rule's batch — the
+        # hostile text never reaches an sp-file.
+        for _cmd, sp_text in calls:
+            assert "/proc/self/cmdline" not in sp_text
+
+    @pytest.mark.skipif(
+        not is_available(), reason="spatch not installed",
+    )
+    def test_refused_on_real_spatch_path(self, tmp_path):
+        rule = tmp_path / "hostile.cocci"
+        rule.write_text(self.HOSTILE_RULE)
+        target = tmp_path / "t.c"
+        target.write_text('int main(void){foo("z", 0); return 0;}\n')
+        result = run_rule(target, rule)  # allow_scripting defaults False
+        assert result.returncode == -1
+        assert result.matches == []
+        assert not any(
+            m.file == "src/auth.c" and m.line == 1337
+            for m in result.matches
+        )
+
+
+class TestFileSetBatching:
+    """Explicit multi-file batches: one spatch invocation carries the
+    file list on argv, quiet coverage follows argv membership only
+    after reported parse/output errors are ruled out, and an empty
+    batch never falls through to a whole-tree --dir scan.
+    """
+
+    def _tree(self, tmp_path):
+        rule = tmp_path / "r.cocci"
+        rule.write_text(PLAIN_RULE)
+        root = tmp_path / "src"
+        root.mkdir()
+        files = []
+        for name in ("a.c", "b.c", "c.c"):
+            f = root / name
+            f.write_text("void f() { malloc(4); }\n")
+            files.append(f)
+        return rule, root, files
+
+    def test_cmd_carries_file_list_not_dir(self, tmp_path):
+        rule, root, files = self._tree(tmp_path)
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = kwargs.get("cwd")
+            return _mock_proc()
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, file_set=files, subprocess_runner=_capture,
+            )
+
+        cmd = captured["cmd"]
+        for f in files:
+            assert str(f) in cmd
+        assert "--dir" not in cmd
+        # The directory target rides only as cwd (include resolution),
+        # never as a positional scan argument.
+        assert str(root) == captured["cwd"]
+        assert cmd.count(str(root)) == 0
+        assert result.returncode == 0
+
+    def test_files_examined_is_exactly_argv_on_success(self, tmp_path):
+        rule, root, files = self._tree(tmp_path)
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, file_set=files,
+                subprocess_runner=lambda cmd, **kw: _mock_proc(),
+            )
+        # Match-free run: attribution still covers every argv file —
+        # NOT the (empty) match set, and NOT a tree walk.
+        assert result.files_examined == sorted(str(f) for f in files)
+
+    def test_failed_batch_claims_no_verified_silence(self, tmp_path):
+        rule, root, files = self._tree(tmp_path)
+
+        def _boom(cmd, **kwargs):
+            return MagicMock(stdout="", stderr="Fatal error: oom",
+                             returncode=2)
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, file_set=files, subprocess_runner=_boom,
+            )
+        assert result.returncode == 2
+        assert result.errors
+        # Dead spatch verified nothing beyond actual matches (none).
+        assert result.files_examined == []
+
+    def test_empty_file_set_is_noop_never_whole_tree(self, tmp_path):
+        rule, root, _files = self._tree(tmp_path)
+        spy = MagicMock()
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, file_set=[], subprocess_runner=spy,
+            )
+        spy.assert_not_called()
+        assert result.ok
+        assert result.matches == []
+        assert result.files_examined == []
+
+    def test_file_target_with_file_set_refused(self, tmp_path):
+        rule, root, files = self._tree(tmp_path)
+        spy = MagicMock()
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                files[0], rule, file_set=files, subprocess_runner=spy,
+            )
+        spy.assert_not_called()
+        assert result.returncode == -1
+        assert any("directory target" in e for e in result.errors)
+
+    def test_directory_entry_in_file_set_refused(self, tmp_path):
+        # spatch RECURSES into a directory argv entry (rc 0): its
+        # inner matches demux to keys that are not file_set members
+        # (silently dropped) while the directory itself would read
+        # verified-silent — so a non-regular-file entry is refused
+        # before any spawn, like the file-target/empty-set caller bugs.
+        rule, root, files = self._tree(tmp_path)
+        sub = root / "sub"
+        sub.mkdir()
+        (sub / "hidden_hit.c").write_text("void g() { malloc(8); }\n")
+        spy = MagicMock()
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, file_set=[files[0], sub],
+                subprocess_runner=spy,
+            )
+        spy.assert_not_called()
+        assert result.returncode == -1
+        assert any("regular file" in e for e in result.errors)
+        assert str(sub) in result.errors[0]
+        # A refused batch verifies nothing.
+        assert result.files_examined == []
+
+    def test_missing_entry_in_file_set_refused(self, tmp_path):
+        rule, root, files = self._tree(tmp_path)
+        spy = MagicMock()
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, file_set=[files[0], root / "gone.c"],
+                subprocess_runner=spy,
+            )
+        spy.assert_not_called()
+        assert result.returncode == -1
+        assert any("regular file" in e for e in result.errors)
+        assert result.files_examined == []
+
+
+class TestJobsLane:
+    """--jobs is the opt-in --dir parallel lane. It MUST ride with
+    --tmp-dir into the writable scratch (parmap's per-worker redirect
+    files land in cwd by default — the read-only mount view under the
+    sandbox — and spatch then exits 2 despite full output), and it is
+    inert outside --dir mode, so the runner refuses to pretend
+    otherwise."""
+
+    def _setup(self, tmp_path):
+        rule = tmp_path / "r.cocci"
+        rule.write_text(PLAIN_RULE)
+        root = tmp_path / "src"
+        root.mkdir()
+        (root / "a.c").write_text("void f() { malloc(4); }\n")
+        return rule, root
+
+    def test_dir_jobs_adds_jobs_and_scratch_tmp_dir(self, tmp_path):
+        rule, root = self._setup(tmp_path)
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            i = cmd.index("--tmp-dir")
+            captured["tmp_dir"] = cmd[i + 1]
+            captured["tmp_dir_exists"] = os.path.isdir(cmd[i + 1])
+            return _mock_proc()
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True):
+            result = run_rule(
+                root, rule, jobs=8, subprocess_runner=_capture,
+            )
+
+        cmd = captured["cmd"]
+        assert "--dir" in cmd
+        assert cmd[cmd.index("--jobs") + 1] == "8"
+        # tmp-dir lives in the per-invocation scratch (writable inside
+        # the sandbox), never under the target tree, and it exists
+        # before spatch starts.
+        assert captured["tmp_dir_exists"]
+        assert not captured["tmp_dir"].startswith(str(root))
+        assert Path(captured["tmp_dir"]).name == "parmap"
+        assert result.returncode == 0
+
+    def test_jobs_with_file_set_ignored_with_warning(
+        self, tmp_path, caplog,
+    ):
+        rule, root = self._setup(tmp_path)
+        files = [root / "a.c"]
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _mock_proc()
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True), \
+                caplog.at_level("WARNING", logger="packages.coccinelle.runner"):
+            run_rule(
+                root, rule, file_set=files, jobs=8,
+                subprocess_runner=_capture,
+            )
+        # Direction 1: the flag never reaches spatch (parmap is inert
+        # on explicit file lists — a lie about applied concurrency).
+        assert "--jobs" not in captured["cmd"]
+        assert "--tmp-dir" not in captured["cmd"]
+        assert any("--jobs ignored" in r.message for r in caplog.records)
+
+    def test_jobs_on_single_file_target_ignored(self, tmp_path, caplog):
+        rule, root = self._setup(tmp_path)
+        target = root / "a.c"
+        captured = {}
+
+        def _capture(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _mock_proc()
+
+        with patch("packages.coccinelle.runner.is_available",
+                   return_value=True), \
+                caplog.at_level("WARNING", logger="packages.coccinelle.runner"):
+            run_rule(target, rule, jobs=8, subprocess_runner=_capture)
+        assert "--jobs" not in captured["cmd"]
+        assert any("--jobs ignored" in r.message for r in caplog.records)
+
+    def test_jobs_default_and_one_add_nothing(self, tmp_path):
+        rule, root = self._setup(tmp_path)
+        for jobs in (0, 1):
+            captured = {}
+
+            def _capture(cmd, **kwargs):
+                captured["cmd"] = list(cmd)
+                return _mock_proc()
+
+            with patch("packages.coccinelle.runner.is_available",
+                       return_value=True):
+                run_rule(root, rule, jobs=jobs, subprocess_runner=_capture)
+            # Direction 2: the serial default stays byte-identical —
+            # no --jobs/--tmp-dir churn on the common path.
+            assert "--jobs" not in captured["cmd"]
+            assert "--tmp-dir" not in captured["cmd"]
+
+
+class TestDerivedBatchCaps:
+    """Two-direction pins for the batching caps. Each bound encodes a
+    failure mode; moving a bound requires re-arguing the OTHER
+    direction, not just the one that motivated the change."""
+
+    def test_workers_floor_keeps_parallel_win(self):
+        # Too low and batching degenerates to the single-lane sweep
+        # (the >13 h/rule floor on 63k-file trees). Even a 1-cpu box
+        # keeps 2 lanes: spatch is I/O-blocked often enough to overlap.
+        assert derive_batch_workers(1) >= 2
+        assert derive_batch_workers(4) >= 2
+
+    def test_workers_ceiling_bounds_contention(self):
+        # Too high and the pool fights the orchestrator's LLM workers
+        # and the sandbox supervisors for memory/kernel resources —
+        # measured speedup plateaued by 16 lanes.
+        assert derive_batch_workers(128) <= 16
+        assert derive_batch_workers(1024) <= 16
+
+    def test_workers_scale_with_cpu_between_bounds(self):
+        assert derive_batch_workers(16) == 4
+        assert derive_batch_workers(32) == 8
+        assert derive_batch_workers(64) == 16
+
+    def test_chunk_floor_amortises_invocation_overhead(self):
+        # Below ~8 files/invocation the sandboxed fork+startup cost
+        # (~120-150 ms) dominates again and the batching win is gone.
+        assert BATCH_CHUNK_FILES >= 8
+
+    def test_chunk_ceiling_bounds_blast_radius(self):
+        # One failed/timed-out batch discards every member's work; a
+        # larger K also stretches the batch timeout further.
+        assert BATCH_CHUNK_FILES <= 64
+
+    def test_timeout_single_file_unchanged(self):
+        assert derive_batch_timeout_s(120, 1) == 120
+        assert derive_batch_timeout_s(120, 0) == 120
+
+    def test_timeout_grows_with_batch_size(self):
+        # Direction 1: no per-file headroom would let an ordinary
+        # batch trip the single-file budget purely by being a batch.
+        assert derive_batch_timeout_s(120, 2) > 120
+        assert (derive_batch_timeout_s(120, 10)
+                >= derive_batch_timeout_s(120, 5))
+
+    def test_timeout_capped_at_four_x_base(self):
+        # Direction 2: uncapped linear-in-K would stall a worker lane
+        # for K single-file timeouts on one pathological batch.
+        assert derive_batch_timeout_s(120, 1000) == 480
+        assert derive_batch_timeout_s(60, 1000) == 240
+
+
+class TestDemuxResultByFile:
+    """Per-file demultiplexing of a batch result: matches attribute by
+    argv-echoed position file; silence attributes by argv membership;
+    a failed batch can never read as refuted for any member."""
+
+    def _batch(self, root, files, **overrides):
+        from packages.coccinelle.models import SpatchResult
+        kw = dict(
+            rule="r", rule_path="/rules/r.cocci",
+            matches=[], files_examined=[str(f) for f in files],
+            errors=[], elapsed_ms=100, returncode=0, forged_markers=0,
+        )
+        kw.update(overrides)
+        return SpatchResult(**kw)
+
+    def test_matches_attribute_per_file(self, tmp_path):
+        root = tmp_path / "src"
+        (root / "sub").mkdir(parents=True)
+        fa = root / "a.c"
+        fb = root / "sub" / "b.c"
+        fa.write_text("x")
+        fb.write_text("x")
+        result = self._batch(root, [fa, fb], matches=[
+            SpatchMatch(file=str(fa), line=3, rule="r"),
+            SpatchMatch(file=str(fb), line=7, rule="r"),
+            SpatchMatch(file=str(fb), line=9, rule="r"),
+        ])
+        out = demux_result_by_file(result, [fa, fb], root)
+        assert set(out) == {"a.c", "sub/b.c"}
+        assert [m.line for m in out["a.c"].matches] == [3]
+        assert [m.line for m in out["sub/b.c"].matches] == [7, 9]
+        assert out["a.c"].files_examined == ["a.c"]
+        assert out["a.c"].returncode == 0
+
+    @pytest.mark.parametrize("unassigned", ["other.c", "sub/a.c", "./a.c"])
+    def test_unassigned_match_invalidates_batch_silence(self, tmp_path, unassigned):
+        root = tmp_path / "src"
+        root.mkdir()
+        fa, fb = root / "a.c", root / "b.c"
+        result = self._batch(root, [fa, fb], matches=[
+            SpatchMatch(file=str(fa), line=3, rule="r"),
+            SpatchMatch(file=unassigned, line=7, rule="r"),
+        ])
+        out = demux_result_by_file(result, [fa, fb], root)
+        assert [m.line for m in out["a.c"].matches] == [3]
+        for per in out.values():
+            assert not per.ok
+            assert per.files_examined == []
+            assert any("input file set" in error for error in per.errors)
+        assert result.ok  # Demultiplexing does not mutate its input.
+
+    def test_repeated_hits_resolve_each_spelling_once_per_batch(self, tmp_path, monkeypatch):
+        root = tmp_path / "src"
+        root.mkdir()
+        source = root / "a.c"
+        source.write_text("x")
+        alias = root / "alias.c"
+        alias.symlink_to(source)
+        original_resolve = Path.resolve
+        calls = []
+
+        def resolve(path, *args, **kwargs):
+            calls.append(str(path))
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        result = self._batch(root, [source], matches=[
+            SpatchMatch(file=str(path), line=line, rule="r")
+            for line in range(1, 501) for path in (source, alias)
+        ])
+        for _ in range(2):
+            calls.clear()
+            out = demux_result_by_file(result, [source], root)
+            assert calls.count(str(source)) == calls.count(str(alias)) == 1
+            assert out["a.c"].ok
+            assert out["a.c"].files_examined == ["a.c"]
+            assert [match.line for match in out["a.c"].matches] == [
+                line for line in range(1, 501) for _ in range(2)
+            ]
+
+    def test_resolution_failure_is_reused_without_inventing_attribution(self, tmp_path, monkeypatch):
+        source = tmp_path / "a.c"
+        original_resolve = Path.resolve
+        calls = []
+
+        def resolve(path, *args, **kwargs):
+            if path == source:
+                calls.append(path)
+                raise OSError("unavailable")
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        result = self._batch(tmp_path, [source], matches=[
+            SpatchMatch(file=str(source), line=line, rule="r") for line in range(1, 11)
+        ])
+        out = demux_result_by_file(result, [source], tmp_path)
+        assert calls == [source]
+        assert out[str(source)].ok
+        assert len(out[str(source)].matches) == 10
+
+    def test_match_free_file_is_verified_silent(self, tmp_path):
+        root = tmp_path / "src"
+        root.mkdir()
+        fa = root / "a.c"
+        fb = root / "b.c"
+        fa.write_text("x")
+        fb.write_text("x")
+        result = self._batch(root, [fa, fb], matches=[
+            SpatchMatch(file=str(fa), line=1, rule="r"),
+        ])
+        out = demux_result_by_file(result, [fa, fb], root)
+        # b.c produced nothing — its silence is still verified,
+        # carried by argv membership, never by the match set.
+        assert out["b.c"].matches == []
+        assert out["b.c"].files_examined == ["b.c"]
+        assert out["b.c"].ok
+
+    def test_failed_batch_propagates_error_to_every_member(
+        self, tmp_path,
+    ):
+        root = tmp_path / "src"
+        root.mkdir()
+        fa = root / "a.c"
+        fb = root / "b.c"
+        fa.write_text("x")
+        fb.write_text("x")
+        result = self._batch(
+            root, [fa, fb],
+            errors=["spatch exited with code 2: Fatal error"],
+            returncode=2, files_examined=[],
+        )
+        out = demux_result_by_file(result, [fa, fb], root)
+        for rel in ("a.c", "b.c"):
+            assert not out[rel].ok
+            assert out[rel].errors
+            # No member of a crashed batch may claim examined-clean.
+            assert out[rel].files_examined == []
+
+    def test_rc_zero_with_errors_still_counts_as_failed(self, tmp_path):
+        # Mirrors SpatchResult.ok: parser-detected errors on a zero
+        # exit are still engine failure, never verified silence.
+        root = tmp_path / "src"
+        root.mkdir()
+        fa = root / "a.c"
+        fa.write_text("x")
+        result = self._batch(
+            root, [fa], errors=["Fatal error: exception"], returncode=0,
+        )
+        out = demux_result_by_file(result, [fa], root)
+        assert out["a.c"].files_examined == []
+        assert not out["a.c"].ok
+
+    def test_forged_markers_count_propagates(self, tmp_path):
+        root = tmp_path / "src"
+        root.mkdir()
+        fa = root / "a.c"
+        fa.write_text("x")
+        result = self._batch(root, [fa], forged_markers=3)
+        out = demux_result_by_file(result, [fa], root)
+        assert out["a.c"].forged_markers == 3
+
+    def test_file_outside_root_keeps_argv_spelling(self, tmp_path):
+        root = tmp_path / "src"
+        root.mkdir()
+        outside = tmp_path / "elsewhere" / "z.c"
+        outside.parent.mkdir()
+        outside.write_text("x")
+        result = self._batch(root, [outside])
+        out = demux_result_by_file(result, [outside], root)
+        assert str(outside) in out
+        assert out[str(outside)].files_examined == [str(outside)]
+
+
+class TestPerRuleVersions:
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_incompatible_rule_does_not_block_legacy_rule(self, tmp_path, batched):
+        from packages.coccinelle.runner import run_rules, run_rules_batched
+
+        source = tmp_path / "source.c"
+        source.write_text("void f(void) { legacy_call(); }\n")
+        rules = tmp_path / "rules"
+        rules.mkdir()
+        future = rules / "future.cocci"
+        future.write_text("// raptor-min-version: 1.3.0\n@r@\n@@\nfuture_call()\n")
+        legacy = rules / "legacy.cocci"
+        legacy.write_text("@r@\nposition p;\n@@\nlegacy_call@p()\n")
+        executed = []
+
+        def fake_run(cmd, **kwargs):
+            text = Path(cmd[cmd.index("--sp-file") + 1]).read_text()
+            executed.append(text)
+            assert "future_call" not in text
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("packages.coccinelle.runner.is_available", return_value=True), \
+             patch("packages.coccinelle.runner.version", return_value="1.1.1"):
+            if batched:
+                results = run_rules_batched(source, [future, legacy], subprocess_runner=fake_run)
+            else:
+                results = {r.rule: r for r in run_rules(source, rules, subprocess_runner=fake_run)}
+        assert results["legacy"].ok
+        assert not results["future"].ok
+        assert "requires tool >= 1.3.0" in results["future"].errors[0]
+        assert len(executed) == 1
+
+    def test_single_unknown_version_does_not_execute_declared_rule(self, tmp_path):
+        from packages.coccinelle.runner import run_rule
+
+        rule = tmp_path / "requires.cocci"
+        rule.write_text("// raptor-min-version: 1.3.0\n@r@\n@@\nfoo()\n")
+        execute = MagicMock(side_effect=AssertionError("must not execute"))
+        with patch("packages.coccinelle.runner.is_available", return_value=True), \
+             patch("packages.coccinelle.runner.version", return_value=None):
+            result = run_rule(tmp_path, rule, subprocess_runner=execute)
+        assert "installed version unknown" in result.errors[0]
+        execute.assert_not_called()
+
+
+class TestVersionMatchesExecutedBinary:
+    @pytest.mark.parametrize("remove_pinned", [False, True])
+    def test_path_change_cannot_upgrade_pinned_tools_reported_version(self, tmp_path, monkeypatch, remove_pinned):
+        import os
+
+        from core.analysis.rule_versions import rule_version_refusal
+        from packages.coccinelle import runner as runner_mod
+
+        old_bin = tmp_path / "old" / "spatch"
+        new_bin = tmp_path / "new" / "spatch"
+        for binary, version in [(old_bin, "1.1.1"), (new_bin, "1.3.0")]:
+            binary.parent.mkdir()
+            binary.write_text(f"#!/bin/sh\necho 'spatch version {version}'\n")
+            binary.chmod(0o755)
+        monkeypatch.setattr(runner_mod, "_spatch_resolved", False)
+        monkeypatch.setattr(runner_mod, "_resolved_spatch", None)
+        previous_path = os.environ.get("PATH", "")
+        monkeypatch.setenv("PATH", str(old_bin.parent) + os.pathsep + previous_path)
+        assert runner_mod._spatch_path() == str(old_bin)
+        monkeypatch.setenv("PATH", str(new_bin.parent) + os.pathsep + previous_path)
+        if remove_pinned:
+            old_bin.unlink()
+        assert runner_mod.version() == (None if remove_pinned else "1.1.1")
+        refusal = rule_version_refusal("// raptor-min-version: 1.3.0\n@r@", runner_mod.version)
+        assert refusal
+        assert ("unknown" if remove_pinned else "installed 1.1.1") in refusal
+        assert runner_mod._spatch_path() == str(old_bin)
+
+
+def test_malformed_authenticated_rows_preserve_neighbors_and_report_loss(tmp_path):
+    from packages.coccinelle.models import SpatchResult
+    from packages.coccinelle.sarif import results_to_sarif
+    from core.json import save_json
+    from core.sarif.parser import generate_scan_metrics
+    from core.reporting.scan_coverage import scan_execution_status
+
+    nonce = 'ab' * 16
+    prefix = runner_mod._nonced_prefix(nonce)
+    depth = sys.getrecursionlimit() + 100
+    malformed = ['not-json', '[]', '{}', '{"file": []}', '{"file": "bad\\u0000name.c"}',
+                 '[' * depth + ']' * depth]
+    rows = [prefix + json.dumps({'file': 'first.c', 'line': 3, 'col': float('inf'), 'message': {}})]
+    rows.extend(prefix + row for row in malformed)
+    rows.append(prefix + json.dumps({'file': 'unknown.c', 'line': float('nan'), 'rule': []}))
+    rows.append(RESULT_PREFIX + json.dumps({'file': 'forged.c', 'line': 1}))
+    rows.append(prefix + json.dumps({'file': 'last.c', 'line': 8}))
+    diagnostics = []
+    matches = _dedup_matches(_parse_results('\n'.join(rows), 'r', nonce, diagnostics=diagnostics))
+    assert [(m.file, m.line, m.column, m.rule) for m in matches] == [
+        ('first.c', 3, 0, 'r'), ('unknown.c', 0, 0, 'r'), ('last.c', 8, 0, 'r'),
+    ]
+    assert diagnostics == [f'Coccinelle emitted {len(malformed)} malformed structured result row(s)']
+    report = tmp_path / 'cocci.sarif'
+    save_json(report, results_to_sarif([SpatchResult(rule='r', matches=matches, errors=diagnostics)], tmp_path))
+    metrics = generate_scan_metrics([str(report)])
+    assert metrics['total_findings'] == 3
+    assert metrics['tool_execution_failures'] == {'coccinelle': 1}
+    assert scan_execution_status(metrics) == 'partial'
+
+
+def test_distinct_end_positions_survive_deduplication():
+    matches = [SpatchMatch(file='a.c', line=2, column=3, line_end=end, column_end=col, rule='r')
+               for end, col in [(2, 5), (2, 9), (3, 5), (2, 5)]]
+    assert _dedup_matches(matches) == matches[:3]
+
+
+@pytest.mark.parametrize('damage', ['malformed-row', 'engine-error', 'timeout'])
+def test_incomplete_rule_run_cannot_claim_examined_silence(tmp_path, damage):
+    import subprocess
+    target = tmp_path / 'target'
+    target.mkdir()
+    source = target / 'hit.c'
+    source.write_text('void f() {}')
+    (target / 'unseen.c').write_text('void g() {}')
+    rule = tmp_path / 'r.cocci'
+    rule.write_text(PLAIN_RULE)
+    def execute(cmd, **kwargs):
+        prefix = _nonced_prefix_from_cmd(cmd)
+        hit = prefix + json.dumps({'file': str(source), 'line': 1, 'col': float('inf')}) + '\n'
+        output = hit + prefix + '{}\n' if damage != 'engine-error' else hit
+        if damage == 'timeout':
+            raise subprocess.TimeoutExpired(cmd, 1, output=output)
+        result = _mock_proc()
+        result.stdout = output
+        result.stderr = 'semantic error: partial analysis' if damage == 'engine-error' else ''
+        return result
+    with patch('packages.coccinelle.runner.is_available', return_value=True):
+        result = run_rule(target, rule, subprocess_runner=execute)
+    assert not result.ok
+    assert len(result.matches) == 1
+    assert result.matches[0].line == 1 and result.matches[0].column == 0
+    assert result.files_examined == ([] if damage == 'timeout' else [str(source)])
+    if damage != 'engine-error':
+        assert any('malformed structured result' in error for error in result.errors)
+
+
+def test_source_inventory_walks_once_and_excludes_source_shaped_directories(tmp_path, monkeypatch):
+    target = tmp_path / 'source'
+    target.mkdir()
+    expected = set()
+    for name in ('a.c', 'a.h', '.c', '.h', '.hidden.c'):
+        path = target / name
+        path.write_text('/* source */\n')
+        expected.add(str(path))
+    (target / 'directory.c').mkdir()
+    child = target / 'directory.c' / 'child.c'
+    child.write_text('/* source */\n')
+    expected.add(str(child))
+    (target / 'ignored.cpp').write_text('/* not part of the C inventory */\n')
+    original = Path.rglob
+    walks = []
+
+    def counted(root, pattern, *args, **kwargs):
+        if root == target:
+            walks.append(root)
+        return original(root, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'rglob', counted)
+    assert runner_mod._walk_c_h(target) == expected
+    assert len(walks) == 1
+    assert set(_collect_files_examined(target, set(), tree_files=expected)) == expected
+    assert set(_collect_files_examined(target, set(), tree_files=expected, no_includes=True)) == {
+        path for path in expected if not path.endswith('.h')}
+
+
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='FIFO requires POSIX')
+def test_source_inventory_does_not_claim_fifo_as_examined_file(tmp_path):
+    source = tmp_path / 'real.c'
+    source.write_text('void f(void) {}\n')
+    os.mkfifo(tmp_path / 'pipe.c')
+    os.mkfifo(tmp_path / 'pipe.h')
+    assert runner_mod._walk_c_h(tmp_path) == {str(source)}
+    assert _collect_files_examined(tmp_path, set()) == [str(source)]
+
+
+def test_source_inventory_metadata_failure_preserves_other_files(tmp_path, monkeypatch):
+    good = tmp_path / 'good.c'
+    unavailable = tmp_path / 'unavailable.h'
+    good.write_text('void f(void) {}\n')
+    unavailable.write_text('/* header */\n')
+    original = Path.is_file
+
+    def inspect(path, *args, **kwargs):
+        if path == unavailable:
+            raise PermissionError('metadata unavailable')
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'is_file', inspect)
+    assert runner_mod._walk_c_h(tmp_path) == {str(good)}
+
+
+@pytest.mark.parametrize('stream', ['stdout', 'stderr'])
+def test_forged_marker_notice_counts_all_rows_and_bounds_inert_sample(tmp_path, monkeypatch, stream):
+    nonce = 'ab' * 16
+    prefix = runner_mod._nonced_prefix(nonce)
+    sample = 'COCCIRESULT:\x1b[2J' + 'x' * 500
+    output = sample + '\n' + ('COCCIRESULT:other\n' * 1_000) + prefix + '{}\n'
+    streams = {'stdout': '', 'stderr': ''}
+    streams[stream] = output
+    notices = []
+    monkeypatch.setattr(runner_mod.logger, 'warning', lambda *args: notices.append(args))
+    count = runner_mod._warn_forged_markers(**streams, nonce=nonce, rule_name='r', target=tmp_path)
+    assert count == 1_001
+    assert len(notices) == 1
+    rendered_sample = notices[0][-1]
+    assert len(rendered_sample) == 200
+    assert '\x1b' not in rendered_sample and '\\x1b' in rendered_sample
+
+
+def test_forged_marker_notice_accepts_single_pass_streams(tmp_path, monkeypatch):
+    def markers(output, nonce):
+        yield from ('COCCIRESULT:' + value for value in output)
+    monkeypatch.setattr(runner_mod, '_forged_marker_lines', markers)
+    notices = []
+    monkeypatch.setattr(runner_mod.logger, 'warning', lambda *args: notices.append(args))
+    count = runner_mod._warn_forged_markers('ab', 'cd', nonce='n', rule_name='r', target=tmp_path)
+    assert count == 4
+    assert notices[-1][-1] == 'COCCIRESULT:a'
+
+
+@pytest.mark.parametrize("mode", ["single-file", "file-set", "rule-batch"])
+def test_parse_diagnostics_prevent_zero_exit_false_coverage(tmp_path, mode):
+    root = tmp_path / "sources"
+    root.mkdir()
+    valid = root / "valid.c"
+    broken = root / "broken.c"
+    valid.write_text("void valid(void *p) { free(p); }\n")
+    broken.write_text("void broken( { free(p); }\n")
+    rules = []
+    for name in ("observe_a", "observe_b"):
+        rule = tmp_path / (name + ".cocci")
+        rule.write_text(
+            f"@{name}@\nposition p;\n@@\nfree@p(...)\n\n"
+            f"@script:python@\np << {name}.p;\n@@\n"
+            "import json, sys\n"
+            f'msg = {{"rule": "{name}", "file": "valid.c", "line": 1}}\n'
+            'sys.stderr.write("COCCIRESULT:" + json.dumps(msg) + "\\n")\n'
+        )
+        rules.append(rule)
+    calls = []
+    def engine(cmd, **kwargs):
+        calls.append(list(cmd))
+        # Model the independently observed engine diagnostic switches.
+        visible = "--parse-error-msg" in cmd and "--very-quiet" not in cmd
+        stderr = "parse error\n" if visible else ""
+        if mode == "file-set":
+            prefix = _nonced_prefix_from_cmd(cmd)
+            stderr += prefix + json.dumps({"file": str(valid), "line": 1}) + "\n"
+        return MagicMock(returncode=0, stdout="", stderr=stderr)
+    with patch("packages.coccinelle.runner.is_available", return_value=True):
+        if mode == "rule-batch":
+            results = run_rules_batched(root, rules, allow_scripting=True,
+                subprocess_runner=engine, env=dict(os.environ))
+            assert set(results) == {rule.stem for rule in rules}
+            assert all(not result.ok and result.files_examined == []
+                       for result in results.values())
+            assert len(calls) == 3  # Batch plus the existing per-rule recovery.
+        else:
+            result = run_rule(broken if mode == "single-file" else root, rules[0],
+                file_set=[valid, broken] if mode == "file-set" else None,
+                allow_scripting=True, subprocess_runner=engine, env=dict(os.environ))
+            assert not result.ok and "parse error" in result.errors
+            assert str(broken) not in result.files_examined
+            if mode == "file-set":
+                assert len(result.matches) == 1  # Keep the authentic partial hit.
+                members = demux_result_by_file(result, [valid, broken], root)
+                assert all(member.files_examined == [] for member in members.values())
+                assert members["valid.c"].matches
+        assert all("--quiet" in cmd and "--parse-error-msg" in cmd
+                   and "--very-quiet" not in cmd for cmd in calls)
+
+
+@pytest.mark.parametrize('deny_listing', [True, False])
+def test_rule_discovery_refusal_is_not_empty_directory(tmp_path, monkeypatch, deny_listing):
+    rules = tmp_path / 'owned-rules'
+    rules.mkdir()
+    if deny_listing:
+        (rules / 'owned.cocci').write_text('// inert; never executed\n')
+    original = os.scandir
+    denied = []
+
+    def scoped_scandir(path):
+        if deny_listing and os.path.normpath(os.fspath(path)) == str(rules):
+            denied.append(str(path))
+            raise PermissionError('owned rule enumeration refusal')
+        return original(path)
+
+    def unexpected_probe():
+        pytest.fail('rule discovery control must not reach tool availability')
+
+    monkeypatch.setattr(os, 'scandir', scoped_scandir)
+    monkeypatch.setattr(runner_mod, 'is_available', unexpected_probe)
+    results = run_rules(tmp_path, rules)
+    if deny_listing:
+        assert denied
+        assert len(results) == 1
+        assert results[0].returncode == -1
+        assert results[0].files_examined == []
+        assert 'enumerat' in results[0].errors[0].lower()
+    else:
+        assert results == []
+
+
+def test_rule_discovery_preserves_glob_names_and_order(tmp_path, monkeypatch):
+    from packages.coccinelle.models import SpatchResult
+
+    rules = tmp_path / 'owned-rules'
+    rules.mkdir()
+    for name in ('z.cocci', '.cocci', 'a.cocci', 'upper.COCCI', 'skip.txt'):
+        (rules / name).write_text('// inert; never executed\n')
+    (rules / 'directory.cocci').mkdir()
+    expected = sorted(rules.glob('*.cocci'))
+    target = tmp_path / 'owned.c'
+    target.write_text('/* inert */\n')
+    seen = []
+
+    def fake_rule(_target, rule, **kwargs):
+        seen.append(rule)
+        return SpatchResult(rule=rule.stem, rule_path=str(rule))
+
+    monkeypatch.setattr(runner_mod, 'is_available', lambda: True)
+    monkeypatch.setattr(runner_mod, '_rule_version_probe', lambda: None)
+    monkeypatch.setattr(runner_mod, 'run_rule', fake_rule)
+    results = run_rules(target, rules)
+    assert seen == expected
+    assert [r.rule_path for r in results] == [str(p) for p in expected]
+
+
+@pytest.mark.parametrize('count', [0, 1, 2])
+def test_batched_missing_requested_rules_are_refusals(tmp_path, monkeypatch, count):
+    rules = [tmp_path / f'owned-missing-{index}.cocci' for index in range(count)]
+    monkeypatch.setattr(runner_mod, 'is_available', lambda: True)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('missing-rule control must not probe versions or execute spatch')
+
+    monkeypatch.setattr(runner_mod, 'version', forbidden)
+    monkeypatch.setattr(runner_mod, '_sandboxed_run', forbidden)
+    results = runner_mod.run_rules_batched(tmp_path, rules, _installed_version=forbidden)
+    assert set(results) == {p.stem for p in rules}
+    for result in results.values():
+        assert result.returncode == -1
+        assert result.errors
+        assert result.files_examined == []
+        assert result.matches == []
+
+
+def test_all_excluded_rules_skip_tool_and_target_work(tmp_path, monkeypatch):
+    rules = tmp_path / 'owned-rules'
+    rules.mkdir()
+    (rules / 'owned.cocci').write_text('// inert; never executed\n')
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('excluded sweep must not probe, walk, notify or execute')
+
+    for name in ('is_available', '_walk_c_h', '_rule_version_probe', 'run_rule'):
+        monkeypatch.setattr(runner_mod, name, forbidden)
+    assert run_rules(tmp_path, rules, exclude_rules=frozenset({'owned'}), on_rule=forbidden) == []
+
+
+def test_mixed_exclusion_preserves_progress_indices(tmp_path, monkeypatch):
+    from packages.coccinelle.models import SpatchResult
+
+    rules = tmp_path / 'owned-rules'
+    rules.mkdir()
+    for name in ('a_skip', 'b_kept'):
+        (rules / f'{name}.cocci').write_text('// inert; never executed\n')
+    target = tmp_path / 'owned.c'
+    target.write_text('/* inert */\n')
+    progress = []
+    seen = []
+
+    def fake_rule(_target, rule, **kwargs):
+        seen.append(rule.stem)
+        return SpatchResult(rule=rule.stem)
+
+    monkeypatch.setattr(runner_mod, 'is_available', lambda: True)
+    monkeypatch.setattr(runner_mod, '_rule_version_probe', lambda: lambda: None)
+    monkeypatch.setattr(runner_mod, 'run_rule', fake_rule)
+    results = run_rules(target, rules, exclude_rules=frozenset({'a_skip'}),
+                        on_rule=lambda *args: progress.append(args))
+    assert seen == ['b_kept']
+    assert [r.rule for r in results] == ['b_kept']
+    assert progress == [(1, 2, 'b_kept')]

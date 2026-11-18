@@ -1,0 +1,795 @@
+"""``raptor-sca upgrade`` — forward-looking upgrade-impact analysis.
+
+Use case: an operator is considering ``lodash 4.17.4 → 4.17.21`` and
+wants the cost/benefit before committing. We re-run the same OSV/KEV/
+EPSS lookups on both versions and emit a delta report.
+
+Two modes:
+
+    raptor-sca upgrade <eco> <name> <from> <to>
+        Pairwise comparison: advisories resolved by the upgrade vs new
+        advisories introduced.
+
+    raptor-sca upgrade <eco> <name> <from> --candidate v1 --candidate v2 ...
+        Multi-target table: rows are advisories on ``from``; columns
+        are each candidate; cells indicate whether the candidate
+        resolves that advisory. Useful for picking the smallest
+        upgrade that resolves the open set.
+
+Output: markdown to stdout (or ``--out``). Exit code:
+
+    0  — pairwise: no new advisories introduced — either at least one
+         advisory resolved, or a no-op where both versions carry the
+         same advisory set; or candidates: at least one candidate
+         resolves all.
+    1  — non-trivial trade-off: some advisories regressed, or no
+         candidate fully resolves the open set.
+    2  — invalid arguments, or verdict unavailable: the OSV lookup
+         degraded (network, cache or advisory-record failure) and the report
+         carries a "verdict unavailable" section — never a wrong
+         exit 0/1 minted from missing data.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from io import StringIO
+from pathlib import Path
+
+from core.cve import EpssClient, KevClient
+from core.atomic_fs import write_text_atomically
+from core.json import JsonCache
+from core.security.log_sanitisation import escape_nonprintable
+from core.security.prompt_output_sanitise import sanitise_string
+
+from . import sca_cache_root, default_client
+from ._md import neutralize_inline
+from .findings import build_vuln_findings, severity_rank
+from .models import (
+    Advisory,
+    Confidence,
+    Dependency,
+    PinStyle,
+    VulnFinding,
+)
+from .osv import OsvClient
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.http import HttpClient
+    from collections.abc import Sequence
+
+logger = logging.getLogger(__name__)
+
+
+def main(
+    argv: Sequence[str],
+    *,
+    http: HttpClient | None = None,
+    cache: JsonCache | None = None,
+) -> int:
+    from .cli import _configure_logging
+
+    args = _parse_args(argv)
+    _configure_logging(args.verbose)
+
+    # Validate the positional ecosystem (case-sensitive on OSV's side).
+    # Modal mode (--add/--remove/--from-file) parses ecosystems out of the
+    # spec entries instead, so the positional may be empty.
+    if args.ecosystem and not (args.add or args.remove or args.from_file):
+        from .ecosystems import canonicalise, known_list
+        canonical_eco = canonicalise(args.ecosystem)
+        if canonical_eco is None:
+            print(
+                f"raptor-sca upgrade: unknown ecosystem {args.ecosystem!r}; "
+                f"expected one of {known_list()}",
+                file=sys.stderr,
+            )
+            return 2
+        args.ecosystem = canonical_eco
+
+    if cache is None:
+        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else sca_cache_root())
+    if http is None:
+        http = default_client(offline=args.offline)
+
+    ttl_query = 0 if args.no_cache else 24 * 3600
+    osv = OsvClient(http, cache, offline=args.offline,
+                    query_ttl=ttl_query, vuln_ttl=ttl_query)
+    kev = (KevClient(http, cache, offline=args.offline, ttl_seconds=ttl_query)
+           if not args.no_kev else None)
+    epss = (EpssClient(http, cache, offline=args.offline, ttl_seconds=ttl_query)
+            if not args.no_epss else None)
+    capture = None
+    if args._report_options.enabled and args._report_options.output is not None:
+        from .whatif_reporting import UpgradeCapture
+        capture = UpgradeCapture()
+
+    if args.add or args.remove or args.from_file:
+        report, exit_code = _modal_report(
+            adds=args.add or [],
+            removes=args.remove or [],
+            from_file=args.from_file,
+            findings_path=args.findings,
+            osv=osv,
+            capture=capture,
+        )
+    elif args.candidate:
+        report, exit_code = _candidates_report(
+            args.ecosystem, args.name, args.from_version, args.candidate,
+            osv, kev, epss,
+            capture=capture,
+        )
+    else:
+        report, exit_code = _pairwise_report(
+            args.ecosystem, args.name, args.from_version, args.to_version,
+            osv, kev, epss,
+            capture=capture,
+        )
+
+    if args.explain and not (args.add or args.remove or args.from_file):
+        explain_section = _explain_upgrade(
+            args.ecosystem, args.name,
+            args.from_version, args.to_version or (args.candidate[0] if args.candidate else ""),
+            target=Path(args.target) if args.target else None,
+        )
+        if explain_section:
+            report += explain_section
+            if capture is not None:
+                capture.record("impact explanation", {"recorded domain text": explain_section})
+
+    if osv.degraded:
+        # A transient OSV failure must never read as "no known
+        # advisories" with exit 0 — a network outage would wave a
+        # vulnerable upgrade through any CI gate built on this
+        # command. Refuse to conclude instead.
+        sample = ", ".join(
+            neutralize_inline(k, limit=60)
+            for k in osv.failed_dep_keys[:5]
+        )
+        report += (
+            "\n## OSV lookups degraded — verdict unavailable\n\n"
+            f"{osv.failed_lookups} advisory lookup(s) were unavailable"
+            + (f" (e.g. {sample})" if sample else "")
+            + "; the advisory counts above may be incomplete. "
+            "Re-run with available advisory data (online or cached).\n"
+        )
+        exit_code = 2
+
+    if args.out:
+        out = Path(args.out).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic — a crash mid-write must not leave a truncated report.
+        write_text_atomically(out, report)
+    sys.stdout.write(report)
+    sys.stdout.flush()
+    if capture is not None:
+        from .whatif_reporting import complete_upgrade_report
+        complete_upgrade_report(args, capture, exit_code=exit_code, osv=osv)
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="raptor-sca upgrade",
+        description="Forward-looking upgrade-impact analysis.",
+    )
+    p.add_argument("ecosystem", nargs="?",
+                   help="(positional mode) ecosystem of the dep")
+    p.add_argument("name", nargs="?",
+                   help="(positional mode) dep name")
+    p.add_argument("from_version", metavar="from-version", nargs="?",
+                   help="(positional mode) currently-installed version")
+    p.add_argument("to_version", metavar="to-version", nargs="?",
+                   help="(positional mode) proposed upgrade target "
+                        "(omit when using --candidate)")
+    p.add_argument(
+        "--add", metavar="ECO:NAME@VERSION", action="append", default=None,
+        help="propose adding a new dep; report advisories the new dep "
+             "would introduce. Repeatable.",
+    )
+    p.add_argument(
+        "--remove", metavar="ECO:NAME", action="append", default=None,
+        help="propose removing a dep; report advisories the project "
+             "would no longer be exposed to. Needs --findings to know "
+             "which advisories currently apply; without it the report "
+             "shows nothing clearing.",
+    )
+    p.add_argument(
+        "--from", metavar="CHANGES.JSON", dest="from_file",
+        help="bulk shape: a JSON file with a list of "
+             "``{op: add|remove|upgrade, ecosystem, name, version?}`` "
+             "entries; each is dispatched as if its ``op`` were the "
+             "corresponding flag.",
+    )
+    p.add_argument(
+        "--findings", metavar="PATH",
+        help="path to an existing findings.json (for --remove to know "
+             "which advisories currently apply)",
+    )
+    p.add_argument(
+        "--candidate", action="append", default=None,
+        help="alternative upgrade target; repeat for multiple candidates",
+    )
+    p.add_argument(
+        "--candidates",
+        help="comma-separated alias: ``--candidates 1.0,1.1,latest`` is "
+             "equivalent to ``--candidate 1.0 --candidate 1.1 "
+             "--candidate latest``",
+    )
+    p.add_argument("--out", help="markdown output path")
+    p.add_argument(
+        "--explain", action="store_true",
+        help="LLM upgrade impact analysis: grep call sites in --target, "
+             "classify as safe / minor_migration / major_migration",
+    )
+    p.add_argument(
+        "--target", metavar="PATH",
+        help="project root for --explain call-site grep (required with --explain)",
+    )
+    p.add_argument("--offline", action="store_true")
+    p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--no-kev", action="store_true")
+    p.add_argument("--no-epss", action="store_true")
+    p.add_argument("--cache-root")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(p)
+    args = p.parse_args(argv)
+    args._report_options = options_from_args(args, p)
+    if args.report_format and args.report_output is None:
+        p.error("--report-format requires --report-output for this command")
+    # Expand ``--candidates A,B,C`` into the existing ``--candidate`` list.
+    if args.candidates:
+        extras = [c.strip() for c in args.candidates.split(",") if c.strip()]
+        args.candidate = (args.candidate or []) + extras
+    # --explain greps call sites under --target; without an explicit
+    # target the analysis would silently run against an arbitrary cwd.
+    if args.explain and not args.target:
+        p.error("--target is required with --explain")
+    # Determine whether we're in modal (--add/--remove/--from) or
+    # positional mode. Modal mode skips the positional-required check.
+    modal = bool(args.add or args.remove or args.from_file)
+    if not modal:
+        if not args.ecosystem or not args.name or not args.from_version:
+            p.error("positional <ecosystem> <name> <from-version> required "
+                     "(or use --add / --remove / --from)")
+        if args.candidate is None and not args.to_version:
+            p.error("either <to-version> or --candidate / --candidates "
+                     "is required")
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Pairwise comparison
+# ---------------------------------------------------------------------------
+
+def _modal_report(
+    *,
+    adds: list[str],
+    removes: list[str],
+    from_file: str | None,
+    findings_path: str | None,
+    osv: OsvClient,
+    capture=None,
+) -> tuple[str, int]:
+    """Run the ``--add`` / ``--remove`` / ``--from`` shape.
+
+    For each add, queries OSV for the proposed version and reports
+    advisories the new dep would introduce. For each remove, scans an
+    existing findings.json for advisories tied to the dep and reports
+    what would clear. ``--from`` is a JSON file with a list of
+    ``{op, ecosystem, name, version?}`` entries dispatched into the
+    same handlers.
+    """
+    from core.json import load_json_bounded
+    spec_adds: list[tuple[str, str, str]] = []     # (eco, name, version)
+    spec_removes: list[tuple[str, str]] = []        # (eco, name)
+    for raw in adds:
+        parsed = _parse_modal_spec(raw, expect_version=True)
+        if parsed:
+            spec_adds.append(parsed)               # type: ignore[arg-type]
+    for raw in removes:
+        parsed = _parse_modal_spec(raw, expect_version=False)
+        if parsed:
+            spec_removes.append(parsed[:2])        # type: ignore[index]
+
+    if from_file:
+        try:
+            # Operator-supplied spec file; ValueError also covers the
+            # byte-budget refusal.
+            entries = load_json_bounded(
+                Path(from_file), max_bytes=64 * 1024 * 1024,
+            )
+        except (OSError, ValueError) as e:
+            if capture is not None:
+                capture.record("refusal", {"reason": str(e), "source": from_file})
+            return f"raptor-sca upgrade --from: cannot read {from_file}: {e}\n", 2
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                op = entry.get("op")
+                eco = entry.get("ecosystem")
+                name = entry.get("name")
+                version = entry.get("version")
+                if not (eco and name):
+                    continue
+                if op in ("add", "upgrade") and version:
+                    spec_adds.append((eco, name, version))
+                elif op == "remove":
+                    spec_removes.append((eco, name))
+
+    lines: list[str] = ["# raptor-sca upgrade — proposed change set", ""]
+
+    has_introduced = False
+    if spec_adds:
+        lines.append("## Adds")
+        lines.append("")
+        for eco, name, ver in spec_adds:
+            advs = _query_one(osv, eco, name, ver)
+            if capture is not None:
+                from .findings import _advisory_summary
+                capture.record("add", {"ecosystem": eco, "name": name, "version": ver,
+                                       "advisory count": len(advs),
+                                       "advisories": [_advisory_summary(a) for a in advs[:100]] if capture.has_capacity else []})
+            if advs:
+                has_introduced = True
+                # osv_id is remote registry content headed for
+                # markdown/stdout — same neutralisation as report.py.
+                ids = ", ".join(
+                    neutralize_inline(a.osv_id, limit=60) for a in advs)
+                lines.append(
+                    f"- ⚠ **{eco}:{name}@{ver}** would introduce "
+                    f"{len(advs)} advisor{'y' if len(advs) == 1 else 'ies'}: "
+                    f"{ids}"
+                )
+            else:
+                lines.append(
+                    f"- ✓ {eco}:{name}@{ver} — no known advisories"
+                )
+        lines.append("")
+
+    if spec_removes:
+        lines.append("## Removes")
+        lines.append("")
+        cleared = _findings_clearing(findings_path, spec_removes)
+        for eco, name in spec_removes:
+            advs = cleared.get((eco, name), [])
+            if capture is not None:
+                capture.record("remove", {"ecosystem": eco, "name": name,
+                                          "recorded clearing advisories": len(advs), "advisories": advs[:100],
+                                          "baseline supplied": bool(findings_path)})
+            if advs:
+                lines.append(
+                    f"- removing **{eco}:{name}** would clear "
+                    f"{len(advs)} finding(s): "
+                    f"{', '.join(neutralize_inline(a, limit=60) for a in advs)}"
+                )
+            else:
+                lines.append(
+                    f"- removing {eco}:{name} clears no current findings "
+                    f"(either no advisories on it, or no findings.json given)"
+                )
+        lines.append("")
+
+    if not spec_adds and not spec_removes:
+        lines.append("(no add/remove specs supplied)")
+        lines.append("")
+
+    return "\n".join(lines) + "\n", (1 if has_introduced else 0)
+
+
+def _parse_modal_spec(raw: str, *, expect_version: bool):
+    """Parse ``ECO:NAME@VERSION`` (when expect_version) or ``ECO:NAME``.
+
+    Returns ``(eco, name, version)`` (version may be empty string when
+    not expected/provided), or ``None`` if the spec is malformed.
+    """
+    if ":" not in raw:
+        return None
+    eco, rest = raw.split(":", 1)
+    eco = eco.strip()
+    if not eco:
+        return None
+    if expect_version:
+        if "@" not in rest:
+            return None
+        name, version = rest.rsplit("@", 1)
+        if not (name and version):
+            return None
+        return eco, name.strip(), version.strip()
+    return eco, rest.strip(), ""
+
+
+def _query_one(osv: OsvClient, eco: str, name: str, version: str):
+    from .models import Confidence, Dependency, PinStyle
+    dep = Dependency(
+        ecosystem=eco, name=name, version=version,
+        declared_in=Path("/<whatif>"),
+        scope="main", is_lockfile=False,
+        pin_style=PinStyle.EXACT, direct=True,
+        purl=f"pkg:{eco.lower()}/{name}@{version}",
+        parser_confidence=Confidence("high", reason="whatif"),
+    )
+    results = osv.query_batch([dep])
+    return results[0].advisories if results else []
+
+
+def _findings_clearing(
+    findings_path: str | None, removes,
+) -> dict:
+    """Map ``(eco, name) → [advisory_id, ...]`` for every advisory that
+    would clear if the dep were removed (i.e., it's the only dep in
+    findings.json mentioning that advisory)."""
+    from core.json import load_json_bounded
+    if not findings_path:
+        return {}
+    try:
+        # Operator-supplied findings file; ValueError also covers the
+        # byte-budget refusal.
+        rows = load_json_bounded(Path(findings_path), max_bytes=64 * 1024 * 1024)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(rows, list):
+        # A dict silently iterates its keys; a scalar crashes the
+        # arm. Hand-edited / foreign findings documents read as "no
+        # advisory map".
+        return {}
+    remove_set = {r[:2] for r in removes}
+    adv_to_deps: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sca = row.get("sca") or {}
+        eco = sca.get("ecosystem")
+        name = sca.get("name")
+        adv = (sca.get("advisory") or {}).get("id")
+        if not (eco and name and adv):
+            continue
+        adv_to_deps.setdefault(adv, set()).add((eco, name))
+    out: dict = {}
+    for adv, dep_keys in adv_to_deps.items():
+        removed_keys = dep_keys & remove_set
+        surviving_keys = dep_keys - remove_set
+        if removed_keys and not surviving_keys:
+            for key in removed_keys:
+                out.setdefault(key, []).append(adv)
+    return out
+
+
+def _pairwise_report(
+    ecosystem: str, name: str, from_version: str, to_version: str,
+    osv: OsvClient,
+    kev: KevClient | None,
+    epss: EpssClient | None,
+    *, capture=None,
+) -> tuple[str, int]:
+    # Validate the version pair against the ecosystem comparator
+    # before any network. Pre-fix: unparseable versions silently
+    # produced "0 resolved, 0 regressed" with exit 0 — an operator
+    # typo in a CI pipeline meant the gate falsely reported "safe
+    # upgrade" on an upgrade that never even compared.
+    from .versions import VersionError
+    from .versions import compare as _vcompare
+    try:
+        _vcompare(ecosystem, from_version, to_version)
+    except VersionError as exc:
+        if capture is not None:
+            capture.record("refusal", {"reason": str(exc)})
+        return (
+            (f"# raptor-sca upgrade — {ecosystem}:{name} "
+             f"{from_version} → {to_version}\n\n"
+             f"**Error:** unparseable version pair: {exc}\n"),
+            2,
+        )
+    deps = [_synthesise(ecosystem, name, from_version),
+            _synthesise(ecosystem, name, to_version)]
+    osv_results = osv.query_batch(deps)
+    findings = build_vuln_findings(deps, osv_results, kev=kev, epss=epss)
+
+    by_version: dict[str, list[VulnFinding]] = {from_version: [], to_version: []}
+    for f in findings:
+        by_version.setdefault(f.dependency.version or "", []).append(f)
+
+    from_ids = {_canonical_id(f) for f in by_version[from_version]}
+    to_ids = {_canonical_id(f) for f in by_version[to_version]}
+    resolved_ids = from_ids - to_ids
+    regressed_ids = to_ids - from_ids
+
+    resolved = [f for f in by_version[from_version]
+                if _canonical_id(f) in resolved_ids]
+    regressed = [f for f in by_version[to_version]
+                 if _canonical_id(f) in regressed_ids]
+    if capture is not None:
+        capture.findings("from", from_version, by_version[from_version])
+        capture.findings("to", to_version, by_version[to_version])
+        capture.record("comparison", {"resolved": len(resolved), "regressed": len(regressed),
+                                      "resolved advisory ids": sorted(resolved_ids)[:100],
+                                      "regressed advisory ids": sorted(regressed_ids)[:100]})
+
+    buf = StringIO()
+    buf.write(f"# raptor-sca upgrade — {ecosystem}:{name} "
+              f"{from_version} → {to_version}\n\n")
+    buf.write(f"- {from_version}: **{len(by_version[from_version])}** advisor"
+              f"{'y' if len(by_version[from_version]) == 1 else 'ies'}\n")
+    buf.write(f"- {to_version}: **{len(by_version[to_version])}** advisor"
+              f"{'y' if len(by_version[to_version]) == 1 else 'ies'}\n")
+    buf.write(f"- Resolved: **{len(resolved)}**, "
+              f"Regressed: **{len(regressed)}**\n\n")
+
+    if resolved:
+        buf.write("## Advisories resolved by the upgrade\n\n")
+        for f in _ranked(resolved):
+            buf.write(_advisory_line(f))
+        buf.write("\n")
+
+    if regressed:
+        buf.write("## Advisories newly applicable on the target\n\n")
+        for f in _ranked(regressed):
+            buf.write(_advisory_line(f))
+        buf.write("\n")
+
+    if not resolved and not regressed:
+        buf.write("Both versions carry the same advisory set; the "
+                  "upgrade resolves nothing and introduces nothing.\n\n")
+
+    exit_code = 0 if (resolved and not regressed) else 1
+    if not resolved and not regressed:
+        exit_code = 0
+    return buf.getvalue(), exit_code
+
+
+# ---------------------------------------------------------------------------
+# Multi-candidate comparison
+# ---------------------------------------------------------------------------
+
+def _candidates_report(
+    ecosystem: str, name: str, from_version: str, candidates: list[str],
+    osv: OsvClient,
+    kev: KevClient | None,
+    epss: EpssClient | None,
+    *, capture=None,
+) -> tuple[str, int]:
+    from .versions import VersionError
+    from .versions import compare as _vcompare
+    for cand in candidates:
+        try:
+            _vcompare(ecosystem, from_version, cand)
+        except VersionError as exc:
+            if capture is not None:
+                capture.record("refusal", {"reason": str(exc), "version": cand})
+            return (
+                (f"# raptor-sca upgrade — {ecosystem}:{name} "
+                 f"from {from_version}\n\n"
+                 f"**Error:** unparseable candidate version "
+                 f"{cand!r}: {exc}\n"),
+                2,
+            )
+    versions = [from_version] + list(candidates)
+    deps = [_synthesise(ecosystem, name, v) for v in versions]
+    osv_results = osv.query_batch(deps)
+    findings = build_vuln_findings(deps, osv_results, kev=kev, epss=epss)
+
+    by_version: dict[str, list[VulnFinding]] = {v: [] for v in versions}
+    for f in findings:
+        by_version.setdefault(f.dependency.version or "", []).append(f)
+    if capture is not None:
+        for version in versions:
+            capture.findings("candidate" if version != from_version else "from", version, by_version.get(version, []))
+
+    base_findings = by_version.get(from_version, [])
+    base_ids = {_canonical_id(f): f for f in base_findings}
+    if not base_ids:
+        # Nothing to compare against — still useful to emit each
+        # candidate's own advisory count so the operator can compare.
+        buf = StringIO()
+        buf.write(f"# raptor-sca upgrade — {ecosystem}:{name} from {from_version}\n\n")
+        buf.write("No advisories on the current version. Candidate "
+                  "comparisons:\n\n")
+        for cand in candidates:
+            n = len(by_version.get(cand, []))
+            buf.write(f"- {cand}: {n} advisor{'y' if n == 1 else 'ies'}\n")
+        return buf.getvalue(), 0
+
+    # Mark each base advisory: resolved by which candidate(s)?
+    resolution_table: dict[str, dict[str, bool]] = {}
+    for adv_id, base_finding in base_ids.items():
+        resolution_table[adv_id] = {}
+        for cand in candidates:
+            cand_ids = {_canonical_id(f) for f in by_version.get(cand, [])}
+            resolution_table[adv_id][cand] = adv_id not in cand_ids
+
+    buf = StringIO()
+    buf.write(f"# raptor-sca upgrade — {ecosystem}:{name} from {from_version}\n\n")
+    buf.write(f"Comparing **{len(candidates)}** candidate "
+              f"{'version' if len(candidates) == 1 else 'versions'} against "
+              f"**{len(base_ids)}** open advisor"
+              f"{'y' if len(base_ids) == 1 else 'ies'}.\n\n")
+
+    # Header row.
+    buf.write("| Advisory | Severity |")
+    for cand in candidates:
+        buf.write(f" {cand} |")
+    buf.write("\n")
+    buf.write("|---|---|")
+    buf.write("|".join(["---"] * len(candidates)))
+    buf.write("|\n")
+    for adv_id, base_finding in sorted(
+        base_ids.items(),
+        key=lambda kv: -severity_rank(kv[1].severity),
+    ):
+        buf.write(
+            f"| {neutralize_inline(adv_id, limit=60)} "
+            f"| {base_finding.severity.title()} |")
+        for cand in candidates:
+            mark = "✓" if resolution_table[adv_id][cand] else "—"
+            buf.write(f" {mark} |")
+        buf.write("\n")
+    buf.write("\n")
+
+    # Summary row: count per candidate.
+    coverage: dict[str, int] = {
+        cand: sum(1 for adv in resolution_table.values() if adv[cand])
+        for cand in candidates
+    }
+    buf.write("**Coverage:** ")
+    parts = [f"{cand} resolves {coverage[cand]}/{len(base_ids)}"
+             for cand in candidates]
+    buf.write("; ".join(parts))
+    buf.write("\n\n")
+
+    # Recommendation: smallest candidate that resolves the full set.
+    full_clear = [cand for cand in candidates
+                  if coverage[cand] == len(base_ids)]
+    if capture is not None:
+        capture.record("candidate comparison", {"open advisories": len(base_ids),
+                                                "candidate count": len(candidates),
+                                                "resolved counts": {cand: coverage[cand] for cand in candidates[:100]},
+                                                "recommended candidate": full_clear[0] if full_clear else None})
+    if full_clear:
+        buf.write(f"## Recommendation\n\nUpgrade to **{full_clear[0]}** "
+                  "— resolves every open advisory.\n")
+        return buf.getvalue(), 0
+    buf.write("## Recommendation\n\nNo candidate resolves the full open "
+              "set. Combine upgrades with mitigations or pick the "
+              "highest-coverage candidate as a stepping stone.\n")
+    return buf.getvalue(), 1
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _synthesise(ecosystem: str, name: str, version: str) -> Dependency:
+    return Dependency(
+        ecosystem=ecosystem,
+        name=name,
+        version=version,
+        declared_in=Path(f"<raptor-sca upgrade: {ecosystem}:{name}@{version}>"),
+        scope="main",
+        is_lockfile=False,
+        pin_style=PinStyle.EXACT,
+        direct=True,
+        purl=f"pkg:{ecosystem.lower()}/{name}@{version}",
+        parser_confidence=Confidence(
+            "high", reason="operator-supplied whatif target",
+        ),
+    )
+
+
+def _canonical_id(f: VulnFinding) -> str:
+    """Identity for cross-version comparison.
+
+    Two findings refer to the same underlying CVE when their primary
+    advisories share a CVE alias. Falling back to ``osv_id`` covers
+    advisories without a CVE assigned.
+    """
+    if not f.advisories:
+        return f.dependency.name or ""
+    advisory: Advisory = f.advisories[0]
+    for alias in advisory.aliases:
+        if isinstance(alias, str) and alias.upper().startswith("CVE-"):
+            return alias.upper()
+    return advisory.osv_id
+
+
+def _ranked(findings: list[VulnFinding]) -> list[VulnFinding]:
+    return sorted(
+        findings,
+        key=lambda f: (
+            -severity_rank(f.severity),
+            not f.in_kev,
+            -(f.epss or 0.0),
+            f.advisories[0].osv_id if f.advisories else "",
+        ),
+    )
+
+
+def _advisory_line(f: VulnFinding) -> str:
+    if not f.advisories:
+        return f"- {f.dependency.name or '?'}\n"
+    primary = f.advisories[0]
+    tags: list[str] = [f.severity.title()]
+    if f.in_kev:
+        tags.append("**KEV**")
+    if f.cvss_score is not None:
+        tags.append(f"CVSS {f.cvss_score:.1f}")
+    if f.epss is not None:
+        tags.append(f"EPSS {f.epss:.2f}")
+    # OSV-sourced fields (id / aliases / summary) are untrusted
+    # registry content headed for stdout — same escaping treatment
+    # as report.py.
+    aliases = ", ".join(
+        escape_nonprintable(a) for a in primary.aliases[:2]
+    ) if primary.aliases else ""
+    summary = sanitise_string(primary.summary) if primary.summary else ""
+    return (f"- [{' / '.join(tags)}] "
+            f"**{escape_nonprintable(primary.osv_id)}**"
+            + (f" ({aliases})" if aliases else "")
+            + (f" — {summary}" if summary else "")
+            + "\n")
+
+
+def _explain_upgrade(
+    ecosystem: str,
+    name: str,
+    from_version: str,
+    to_version: str,
+    *,
+    target: Path | None = None,
+) -> str:
+    """Run LLM upgrade-impact analysis and return a markdown section."""
+    if not to_version:
+        return ""
+
+    from .llm import get_llm_client
+    from .llm.upgrade_impact_review import assess_upgrade_impact
+
+    client = get_llm_client()
+    if client is None:
+        return "\n## Upgrade impact (LLM)\n\nNo LLM available — skipping.\n"
+
+    dep = _synthesise(ecosystem, name, from_version)
+    if target is None:
+        target = Path.cwd()
+
+    verdict = assess_upgrade_impact(client, dep, to_version, target)
+    if verdict is None:
+        return "\n## Upgrade impact (LLM)\n\nLLM analysis failed.\n"
+
+    lines: list[str] = [
+        "",
+        "## Upgrade impact (LLM)",
+        "",
+        f"**Verdict:** {verdict.verdict.replace('_', ' ')}",
+        f"**Confidence:** {verdict.confidence}",
+    ]
+    if verdict.summary:
+        # LLM output over hostile-influenceable inputs (changelogs,
+        # call sites) — defang before it reaches markdown/stdout.
+        lines.append(f"\n{sanitise_string(verdict.summary)}")
+
+    if verdict.breaking_changes:
+        lines.append("")
+        lines.append("### Breaking changes")
+        lines.append("")
+        for bc in verdict.breaking_changes:
+            lines.append(
+                f"- **{neutralize_inline(bc.site, limit=120)}**: "
+                f"{neutralize_inline(bc.what_breaks)}")
+            if bc.suggested_fix:
+                lines.append(
+                    f"  - Fix: {neutralize_inline(bc.suggested_fix)}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+__all__ = ["main"]

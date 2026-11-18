@@ -1,0 +1,1481 @@
+"""Tests for packages.joern.server."""
+
+from __future__ import annotations
+
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
+import base64
+import gc
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from packages.joern.server import (
+    _LEASE_MISMATCH,
+    _LEASE_VAL,
+    _LEASE_CONFLICT_ERROR,
+    JoernServer,
+    _find_free_port,
+    _repl_bridge_path,
+    _server_auth_supported,
+)
+from packages.joern.tunables import JoernTunables
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_subprocess_launch_patches(monkeypatch):
+    """Keep launch mocks on consumer-owned subprocess module bindings."""
+    import packages.joern.server as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "subprocess", "Popen", consumer_0.subprocess.Popen,
+    )
+    patch_module_attribute(
+        monkeypatch, consumer_0, "subprocess", "run", consumer_0.subprocess.run,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _heap_ledger_in_tmp(tmp_path: Path,
+                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """In-file twin of the suite conftest's _isolated_heap_ledger:
+    release archives strip conftest.py (export-ignore), and a start()
+    with an explicit heap_mb then reserves against — rewrites and
+    evicts rows in — the operator's real
+    ~/.local/share/raptor/joern-heap-ledger.json, the live host-wide
+    heap arbitration state. The pin must travel with the file."""
+    from packages.joern import heap_ledger
+    monkeypatch.setattr(
+        heap_ledger, "_LEDGER_PATH", tmp_path / "heap-ledger.json",
+    )
+    monkeypatch.setattr(heap_ledger, "_host_budget_mb", lambda: 1 << 24)
+
+
+class TestFindFreePort:
+    def test_returns_nonzero_port(self):
+        port = _find_free_port()
+        assert isinstance(port, int)
+        assert port > 0
+
+
+class TestReplBridgePath:
+    @patch("packages.joern.server._joern_path", return_value=None)
+    def test_returns_none_when_joern_missing(self, _):
+        assert _repl_bridge_path() is None
+
+    @patch("packages.joern.server._joern_path")
+    def test_finds_bridge_next_to_joern(self, mock_joern, tmp_path):
+        joern_bin = tmp_path / "joern"
+        joern_bin.write_text("#!/bin/bash\n", encoding="utf-8")
+        bridge = tmp_path / "repl-bridge"
+        bridge.write_text("#!/bin/bash\n", encoding="utf-8")
+        mock_joern.return_value = str(joern_bin)
+        result = _repl_bridge_path()
+        assert result == str(bridge)
+
+
+class TestJoernServerInit:
+    def test_default_values(self):
+        srv = JoernServer()
+        assert srv._heap_mb is None
+        assert srv._proc is None
+        assert srv._port is None
+        assert srv._cpg_loaded is False
+
+    def test_custom_heap(self):
+        srv = JoernServer(heap_mb=2048)
+        assert srv._heap_mb == 2048
+
+    def test_from_tunables(self):
+        t = JoernTunables(heap_mb=1024, cpg_timeout_s=60, query_timeout_s=60)
+        srv = JoernServer.from_tunables(t)
+        assert srv._heap_mb == 1024
+        assert srv._query_timeout_s == 60
+
+    def test_from_tunables_none_heap(self):
+        t = JoernTunables(heap_mb=None)
+        srv = JoernServer.from_tunables(t)
+        assert srv._heap_mb is None
+
+    def test_from_tunables_default(self):
+        srv = JoernServer.from_tunables()
+        assert srv._heap_mb is None
+        assert srv._query_timeout_s == 300
+
+
+class TestTeardownWithoutInit:
+    """``__del__`` → ``stop()`` must be safe on instances whose
+    ``__init__`` never ran (or never reached the ``_proc``
+    assignment): pre-fix, garbage-collecting such an instance raised
+    ``AttributeError: 'JoernServer' object has no attribute '_proc'``
+    as a PytestUnraisableExceptionWarning at teardown."""
+
+    def test_del_is_noop_on_bare_new_instance(self):
+        srv = JoernServer.__new__(JoernServer)
+        srv.__del__()  # must not raise
+
+    def test_failed_init_leaves_no_unraisable_on_del(self):
+        # A bad-signature TypeError fires before __init__'s body runs,
+        # so the collected instance has no instance attributes at all.
+        # CPython drops the half-built object at the raise; capture the
+        # unraisable hook so the __del__ outcome is asserted, not just
+        # warned about.
+        seen: list[object] = []
+        prev_hook = sys.unraisablehook
+        sys.unraisablehook = seen.append
+        try:
+            with pytest.raises(TypeError):
+                JoernServer(nonexistent_kwarg=1)
+            # Argument binding drops this acyclic, uninitialised instance.
+            gc.collect(0)
+        finally:
+            sys.unraisablehook = prev_hook
+        assert not seen, f"unraisable during teardown: {seen}"
+
+
+class TestJoernServerProperties:
+    def test_port_none_before_start(self):
+        srv = JoernServer()
+        assert srv.port is None
+
+    def test_pid_none_before_start(self):
+        srv = JoernServer()
+        assert srv.pid is None
+
+
+class TestJoernServerIsAlive:
+    def test_not_alive_before_start(self):
+        srv = JoernServer()
+        assert srv.is_alive() is False
+
+
+class TestJoernServerQuery:
+    def test_query_without_cpg(self):
+        srv = JoernServer()
+        srv._cpg_loaded = False
+        result = srv.query("cpg.method.l")
+        assert result.errors
+        assert "no CPG loaded" in result.errors[0]
+
+    def test_query_validation_blocks_dangerous(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        result = srv.query('java.io.File("/etc/passwd")')
+        assert result.errors
+        assert "blocked" in result.errors[0]
+
+    def test_query_fails_fast_when_server_process_dead(self):
+        """If the server process has exited, query() returns an error
+        immediately rather than blocking on a stale HTTP connection."""
+        from unittest.mock import MagicMock
+
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # process exited
+        # A real (but inert, beyond pid_max) pid: the handle is GC'd
+        # after the test and __del__ → stop() → group verification
+        # would otherwise walk a MagicMock pgid into the kill ladder.
+        mock_proc.pid = 2_000_000_000
+        srv._proc = mock_proc
+
+        result = srv.query("cpg.method.l")
+        assert result.errors
+        assert "server process exited" in result.errors[0]
+
+
+class TestJoernServerQueryScript:
+    def test_script_not_found(self, tmp_path):
+        srv = JoernServer()
+        result = srv.query_script(tmp_path / "nonexistent.sc")
+        assert result.errors
+        assert "not found" in result.errors[0]
+
+
+class TestJoernServerImportCpg:
+    def test_cpg_file_not_found(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        ok = srv.import_cpg(tmp_path / "nonexistent.bin")
+        assert ok is False
+
+    def _cpg_file(self, tmp_path):
+        p = tmp_path / "cpg.bin"
+        p.write_bytes(b"stub")
+        return p
+
+    def test_success_requires_verified_cpg_binding(self, tmp_path):
+        # Incident regression: after a stuck-query restart the REPL
+        # answered importCpg affirmatively in a fraction of a second
+        # while `cpg` never bound — every later taint query failed to
+        # compile with "Not found: cpg" for the rest of the run, with
+        # nothing but per-query warnings. importCpg success must be
+        # backed by a binding probe.
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        responses = [
+            {"success": True, "stdout": "workspace..."},   # importCpg
+            {"success": True,
+             "stdout": "-- [E006] Not Found Error: Not found: cpg"},
+        ]
+        with patch.object(JoernServer, "_post_sync",
+                          side_effect=responses):
+            ok = srv.import_cpg(self._cpg_file(tmp_path))
+        assert ok is False
+        assert srv._cpg_loaded is False
+
+    def test_probe_transport_failure_fails_import(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        responses = [{"success": True, "stdout": "ok"}, None]
+        with patch.object(JoernServer, "_post_sync",
+                          side_effect=responses):
+            ok = srv.import_cpg(self._cpg_file(tmp_path))
+        assert ok is False
+
+    def test_missing_success_key_is_failure(self, tmp_path):
+        # Pre-fix `resp.get("success", True)` counted a malformed
+        # response as success.
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        with patch.object(JoernServer, "_post_sync",
+                          return_value={"stdout": "??"}):
+            ok = srv.import_cpg(self._cpg_file(tmp_path))
+        assert ok is False
+
+    def test_verified_import_succeeds(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        responses = [
+            {"success": True, "stdout": "workspace..."},   # importCpg
+            {"success": True, "stdout": 'val res0: String = "42"'},
+            {"success": True, "stdout": "warmup"},          # dataflow warmup
+            {"success": True, "stdout": "warmup"},
+        ]
+        with patch.object(JoernServer, "_post_sync",
+                          side_effect=responses):
+            ok = srv.import_cpg(self._cpg_file(tmp_path))
+        assert ok is True
+        assert srv._cpg_loaded is True
+
+
+class TestJoernServerImportCode:
+    """import_code mirrors import_cpg's hardening: strict success
+    check, cpg-binding probe, and import-source bookkeeping so a
+    stuck-query restart() can re-import instead of coming back
+    CPG-less while ensure_alive reports healthy."""
+
+    def test_target_not_directory(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        f = tmp_path / "file.c"
+        f.write_text("int main(){}", encoding="utf-8")
+        ok = srv.import_code(f)
+        assert ok is False
+
+    def test_missing_success_key_is_failure(self, tmp_path):
+        # Pre-fix `resp.get("success", True)` counted a malformed
+        # response as success and set _cpg_loaded — every later query
+        # then failed "Not found: cpg" with only per-query warnings.
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        with patch.object(JoernServer, "_post_sync",
+                          return_value={"stdout": "??"}):
+            ok = srv.import_code(tmp_path)
+        assert ok is False
+        assert srv._cpg_loaded is False
+
+    def test_success_requires_verified_cpg_binding(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        responses = [
+            {"success": True, "stdout": "workspace..."},   # importCode
+            {"success": True,
+             "stdout": "-- [E006] Not Found Error: Not found: cpg"},
+        ]
+        with patch.object(JoernServer, "_post_sync",
+                          side_effect=responses):
+            ok = srv.import_code(tmp_path)
+        assert ok is False
+        assert srv._cpg_loaded is False
+
+    def test_verified_import_succeeds_and_records_source(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        responses = [
+            {"success": True, "stdout": "workspace..."},   # importCode
+            {"success": True, "stdout": 'val res0: String = "42"'},
+        ]
+        with patch.object(JoernServer, "_post_sync",
+                          side_effect=responses):
+            ok = srv.import_code(tmp_path, timeout=123)
+        assert ok is True
+        assert srv._cpg_loaded is True
+        # restart() re-imports from whichever source is recorded.
+        assert srv._code_path == tmp_path.resolve()
+        assert srv._cpg_path is None
+        assert srv._last_import_timeout == 123
+
+    def test_restart_reimports_code_source(self, tmp_path):
+        srv = JoernServer()
+        srv._code_path = tmp_path
+        srv._last_import_timeout = 77
+        calls = []
+        with patch.object(JoernServer, "stop"), \
+                patch.object(JoernServer, "start"), \
+                patch.object(
+                    JoernServer, "import_code",
+                    side_effect=lambda p, timeout: calls.append(
+                        (p, timeout)) or True,
+                ):
+            assert srv.restart() is True
+        assert calls == [(tmp_path, 77)]
+
+    def test_restart_fails_when_code_source_vanished(self, tmp_path):
+        # Same fabricated-healthy wedge as the vanished-CPG case: the
+        # restart must report failure, not come back CPG-less.
+        srv = JoernServer()
+        srv._code_path = tmp_path / "gone"
+        with patch.object(JoernServer, "stop"), \
+                patch.object(JoernServer, "start"):
+            assert srv.restart() is False
+
+
+class TestJoernServerCloseWorkspace:
+    @patch.object(JoernServer, "_post_sync", return_value={"success": True})
+    def test_close_workspace_resets_flag(self, mock_post):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv.close_workspace()
+        assert srv._cpg_loaded is False
+        mock_post.assert_called_once()
+
+
+class TestJoernServerRunTaintQuery:
+    def test_rejects_invalid_source(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        flows = srv.run_taint_query("not valid!", "memcpy")
+        assert flows == []
+
+    def test_rejects_invalid_sink(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        flows = srv.run_taint_query("parse_header", "not valid!")
+        assert flows == []
+
+
+class TestRunTaintQueriesBatchErrorsOut:
+    """The batch API honours run_taint_query's errors_out contract."""
+
+    def _server(self, result):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv.query = lambda q, **kw: result  # instance seam
+        return srv
+
+    def test_errors_forwarded_to_errors_out(self):
+        from packages.joern.models import JoernResult
+
+        srv = self._server(
+            JoernResult(query="q", errors=["timeout (async poll)"]),
+        )
+        errors_out: list[str] = []
+        flows = srv.run_taint_queries_batch(
+            [("src_fn", "sink_fn")], errors_out=errors_out,
+        )
+        assert flows == []
+        assert errors_out == ["timeout (async poll)"]
+
+    def test_clean_batch_leaves_errors_out_empty(self):
+        from packages.joern.models import JoernResult, TaintFlow
+
+        flow = TaintFlow(
+            source_method="src_fn", source_param="p0",
+            sink_call="sink_fn", sink_arg_idx=0,
+        )
+        srv = self._server(
+            JoernResult(query="q", flows=[flow], raw_output="ok"),
+        )
+        errors_out: list[str] = []
+        flows = srv.run_taint_queries_batch(
+            [("src_fn", "sink_fn")], errors_out=errors_out,
+        )
+        assert len(flows) == 1
+        assert errors_out == []
+
+
+class TestJoernServerContextManager:
+    @patch.object(JoernServer, "start")
+    @patch.object(JoernServer, "stop")
+    def test_context_manager(self, mock_stop, mock_start):
+        with JoernServer():
+            mock_start.assert_called_once()
+        assert mock_stop.call_count >= 1
+
+
+class TestJoernServerStopIdempotent:
+    def test_stop_before_start(self):
+        srv = JoernServer()
+        srv.stop()  # should not raise
+        assert srv._proc is None
+
+
+class TestJoernServerRunTieredSweep:
+    def test_script_not_found(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "packages.joern.server.Path",
+            lambda *a, **kw: tmp_path / "nonexistent",
+        )
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        result = srv.run_tiered_sweep()
+        assert result.errors
+        assert "not found" in result.errors[0]
+
+    def test_substitutes_lang_profile_sinks(self, tmp_path):
+        from packages.joern.lang_config import C_CPP, PYTHON
+        script_path = (
+            __import__("pathlib").Path(__file__).resolve().parent.parent
+            / "queries" / "tiered_taint.sc"
+        )
+        content = script_path.read_text(encoding="utf-8")
+
+        for profile in (PYTHON, C_CPP):
+            for sink in profile.sinks[:3]:
+                assert sink in " ".join(profile.sinks)
+
+            sink_items = ", ".join(f'"{s}"' for s in profile.sinks)
+            expected = f"List({sink_items})"
+            substituted = content.replace("__DANGEROUS_SINKS__", expected)
+            assert "__DANGEROUS_SINKS__" not in substituted
+            assert expected in substituted
+
+    def test_substitutes_depth_and_args(self):
+        from packages.joern.lang_config import C_CPP
+        script_path = (
+            __import__("pathlib").Path(__file__).resolve().parent.parent
+            / "queries" / "tiered_taint.sc"
+        )
+        content = script_path.read_text(encoding="utf-8")
+        sink_items = ", ".join(f'"{s}"' for s in C_CPP.sinks)
+        content = content.replace("__DANGEROUS_SINKS__", f"List({sink_items})")
+        content = content.replace("__EFFECTIVE_DEPTH__", str(C_CPP.max_call_depth))
+        content = content.replace("__MAX_ARGS__", str(C_CPP.max_args_to_allow))
+        content = content.replace("__MAX_OUTPUT_ARGS__", str(C_CPP.max_output_args_expansion))
+
+        assert "__EFFECTIVE_DEPTH__" not in content
+        assert "__MAX_ARGS__" not in content
+        assert "__MAX_OUTPUT_ARGS__" not in content
+        assert "val effectiveDepth = 4" in content
+        assert "maxArgsToAllow = 200" in content
+        assert "maxOutputArgsExpansion = 200" in content
+
+    def test_without_cpg(self):
+        srv = JoernServer()
+        srv._cpg_loaded = False
+        result = srv.run_tiered_sweep()
+        assert result.errors
+        assert "no CPG loaded" in result.errors[0]
+
+
+class TestJoernServerZGCFlags:
+    @staticmethod
+    def _safe_stop(srv):
+        # The mocked Popen carries a fake pid — stop() must never reach the
+        # real os.killpg, or it signals whatever live process group owns
+        # that pgid (this killed operator screen sessions).
+        with mock_module_attribute(_mock_owner('packages.joern.server'), 'os', 'killpg',
+                   side_effect=ProcessLookupError):
+            srv.stop()
+
+    @staticmethod
+    def _start_and_capture(srv):
+        from unittest.mock import MagicMock
+
+        captured_cmd = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            mock_proc = MagicMock()
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
+            mock_proc.poll.return_value = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.wait = MagicMock()
+            return mock_proc
+
+        with (
+            patch("packages.joern.server._server_auth_supported",
+                  return_value=True),
+            # Pin the TCP fallback tier: these tests assert the direct
+            # joern argv; the netns-wrapped shape has its own tests in
+            # test_server_uds.py (and the real probe must not run
+            # under a mocked subprocess).
+            patch("packages.joern.server._netns_isolation_available",
+                  return_value=False),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'os', 'killpg',
+                  side_effect=ProcessLookupError),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'Popen',
+                  side_effect=fake_popen),
+            patch.object(srv, "_wait_for_ready", return_value=True),
+            patch.object(srv, "_warmup_imports"),
+        ):
+            srv.start()
+        return captured_cmd
+
+    def test_start_cmd_includes_zgc_jdk21(self):
+        """JDK 21-23: ZGC selected, G1 disabled, ZGenerational passed."""
+        srv = JoernServer(heap_mb=8192)
+        with patch("packages.joern.prereqs._java_version", return_value=21):
+            captured_cmd = self._start_and_capture(srv)
+
+        assert "-J-XX:-UseG1GC" in captured_cmd
+        assert "-J-XX:+UseZGC" in captured_cmd
+        assert "-J-XX:+ZGenerational" in captured_cmd
+        assert "-J-XX:+UseStringDeduplication" in captured_cmd
+        assert "-J-Djava.util.concurrent.ForkJoinPool.common.parallelism=6" in captured_cmd
+        assert "-J-Xms8192m" not in captured_cmd  # ceiling only, no Xms pin
+        assert "-J-Xmx8192m" in captured_cmd
+
+        self._safe_stop(srv)
+
+    def test_spawn_env_confines_jvm_tmpdir_to_workspace(self):
+        """JVM scratch must land in the disposable workspace, not /tmp."""
+        import os
+        from unittest.mock import MagicMock
+
+        captured_env = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured_env.update(kwargs.get("env") or {})
+            mock_proc = MagicMock()
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
+            mock_proc.poll.return_value = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.wait = MagicMock()
+            return mock_proc
+
+        srv = JoernServer()
+        with (
+            patch("packages.joern.prereqs._java_version", return_value=21),
+            patch("packages.joern.server._server_auth_supported",
+                  return_value=True),
+            patch("packages.joern.server._netns_isolation_available",
+                  return_value=False),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'os', 'killpg',
+                  side_effect=ProcessLookupError),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'Popen',
+                  side_effect=fake_popen),
+            patch.object(srv, "_wait_for_ready", return_value=True),
+            patch.object(srv, "_warmup_imports"),
+        ):
+            srv.start()
+            jvm_tmp = os.path.join(srv._workdir, "jvm-tmp")
+            assert captured_env.get("_JAVA_OPTIONS") == (
+                f"-Djava.io.tmpdir={jvm_tmp}"
+            )
+            assert os.path.isdir(jvm_tmp)
+        self._safe_stop(srv)
+
+    def test_start_cmd_omits_zgenerational_jdk24_plus(self):
+        """JDK >= 24 removed ZGenerational — must not be passed."""
+        srv = JoernServer()
+        with patch("packages.joern.prereqs._java_version", return_value=25):
+            captured_cmd = self._start_and_capture(srv)
+
+        assert "-J-XX:+UseZGC" in captured_cmd
+        assert "-J-XX:+ZGenerational" not in captured_cmd
+
+        self._safe_stop(srv)
+
+    def test_boot_retries_without_gc_flags_when_jvm_dies(self):
+        """First boot dies (e.g. GC flag conflict) → retry with defaults."""
+        from unittest.mock import MagicMock
+
+        srv = JoernServer()
+        launches = []
+
+        def fake_popen(cmd, **kwargs):
+            launches.append(list(cmd))
+            mock_proc = MagicMock()
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
+            # First launch: dead process; second: alive.
+            mock_proc.poll.return_value = 1 if len(launches) == 1 else None
+            mock_proc.stderr = MagicMock()
+            mock_proc.wait = MagicMock()
+            return mock_proc
+
+        ready_results = iter([False, True])
+
+        with (
+            patch("packages.joern.prereqs._java_version", return_value=25),
+            patch("packages.joern.server._server_auth_supported",
+                  return_value=True),
+            # Pin the TCP fallback tier: these tests assert the direct
+            # joern argv; the netns-wrapped shape has its own tests in
+            # test_server_uds.py (and the real probe must not run
+            # under a mocked subprocess).
+            patch("packages.joern.server._netns_isolation_available",
+                  return_value=False),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'os', 'killpg',
+                  side_effect=ProcessLookupError),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'Popen',
+                  side_effect=fake_popen),
+            patch.object(srv, "_wait_for_ready",
+                         side_effect=lambda: next(ready_results)),
+            patch.object(srv, "_warmup_imports"),
+        ):
+            srv.start()
+
+        assert len(launches) == 2
+        assert any(a.startswith("-J-XX:") for a in launches[0])
+        assert not any(a.startswith("-J-XX:") for a in launches[1])
+
+        self._safe_stop(srv)
+
+
+class TestQueryCancellable:
+    def test_cancel_before_result(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        call_count = 0
+
+        def fake_post_async(query_str):
+            return "test-uuid-123"
+
+        def fake_get_result(uuid):
+            return None
+
+        def cancel_immediately():
+            nonlocal call_count
+            call_count += 1
+            return call_count >= 1
+
+        with patch.object(srv, "_post_async", side_effect=fake_post_async), \
+             patch.object(srv, "_get_result", side_effect=fake_get_result):
+            result = srv.query_cancellable(
+                "cpg.method.l",
+                cancel_check=cancel_immediately,
+                poll_interval=0.01,
+            )
+        assert result.errors
+        assert "cancelled" in result.errors[0]
+
+    def test_result_returned_when_ready(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        def fake_post_async(query_str):
+            return "test-uuid-456"
+
+        def fake_get_result(uuid):
+            return {"stdout": "", "stderr": "", "success": True}
+
+        with patch.object(srv, "_post_async", side_effect=fake_post_async), \
+             patch.object(srv, "_get_result", side_effect=fake_get_result):
+            result = srv.query_cancellable("cpg.method.l", poll_interval=0.01)
+        assert not result.errors
+        assert result.ok
+
+    def test_falls_back_to_sync_when_async_unavailable(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        def fake_post_async(query_str):
+            return None
+
+        sync_resp = {"stdout": "", "stderr": "", "success": True}
+
+        with patch.object(srv, "_post_async", side_effect=fake_post_async), \
+             patch.object(srv, "_post_sync", return_value=sync_resp):
+            result = srv.query_cancellable("cpg.method.l")
+        assert result.ok
+
+    def test_no_cpg_returns_error(self):
+        srv = JoernServer()
+        srv._cpg_loaded = False
+        result = srv.query_cancellable("cpg.method.l")
+        assert result.errors
+        assert "no CPG loaded" in result.errors[0]
+
+    def test_timeout_returns_error(self):
+        srv = JoernServer(query_timeout_s=1)
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        with patch.object(srv, "_post_async", return_value="uuid-789"), \
+             patch.object(srv, "_get_result", return_value=None), \
+             patch.object(srv, "restart", return_value=False):
+            result = srv.query_cancellable(
+                "cpg.method.l", timeout=1, poll_interval=0.1,
+            )
+        assert result.errors
+        assert "timeout" in result.errors[0]
+
+    def test_post_async_returns_none_without_base_url(self):
+        srv = JoernServer()
+        srv._base_url = None
+        assert srv._post_async("1+1") is None
+
+    def test_get_result_returns_none_without_base_url(self):
+        srv = JoernServer()
+        srv._base_url = None
+        assert srv._get_result("some-uuid") is None
+
+
+class TestRestart:
+    def test_restart_after_query_timeout(self):
+        """When query() gets a timeout, it restarts the server so
+        subsequent queries don't queue behind the stuck one."""
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        with patch.object(srv, "_post_sync", return_value=None), \
+             patch.object(srv, "restart", return_value=True) as mock_restart:
+            srv._last_post_error = "query timed out after 300s"
+            result = srv.query("cpg.method.l")
+        assert result.errors
+        mock_restart.assert_called_once()
+
+    def test_no_restart_on_non_timeout_error(self):
+        """Non-timeout errors should not trigger a restart."""
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        with patch.object(srv, "_post_sync", return_value=None), \
+             patch.object(srv, "restart") as mock_restart:
+            srv._last_post_error = "connection failed: refused"
+            result = srv.query("cpg.method.l")
+        assert result.errors
+        mock_restart.assert_not_called()
+
+    def test_restart_preserves_cpg_path(self, tmp_path):
+        """restart() should reload the CPG from the stored path."""
+        cpg_file = tmp_path / "cpg.bin"
+        cpg_file.write_bytes(b"")
+
+        srv = JoernServer()
+        srv._cpg_path = cpg_file
+
+        with patch.object(srv, "stop"), \
+             patch.object(srv, "start"), \
+             patch.object(srv, "import_cpg", return_value=True) as mock_import:
+            result = srv.restart()
+        assert result is True
+        # No import ran before the restart, so no remembered timeout —
+        # import_cpg resolves its own tunables-backed default.
+        mock_import.assert_called_once_with(cpg_file, timeout=None)
+
+    def test_restart_reimport_inherits_import_timeout(self, tmp_path):
+        """A mid-run restart re-imports with the timeout the original
+        import resolved, not a per-call default."""
+        cpg_file = tmp_path / "cpg.bin"
+        cpg_file.write_bytes(b"")
+
+        srv = JoernServer()
+        srv._cpg_path = cpg_file
+        srv._last_import_timeout = 900
+
+        with patch.object(srv, "stop"), \
+             patch.object(srv, "start"), \
+             patch.object(srv, "import_cpg", return_value=True) as mock_import:
+            result = srv.restart()
+        assert result is True
+        mock_import.assert_called_once_with(cpg_file, timeout=900)
+
+
+class TestRunTaintExistsQuery:
+    def test_exists_true(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        resp = {"stdout": "JOERN_EXISTS:true\n", "stderr": "", "success": True}
+        with patch.object(srv, "_post_sync", return_value=resp):
+            assert srv.run_taint_exists_query("foo", "bar") is True
+
+    def test_exists_false(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        resp = {"stdout": "JOERN_EXISTS:false\n", "stderr": "", "success": True}
+        with patch.object(srv, "_post_sync", return_value=resp):
+            assert srv.run_taint_exists_query("foo", "bar") is False
+
+    def test_invalid_source_returns_false(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        assert srv.run_taint_exists_query("foo;bar", "baz") is False
+
+
+class TestRunSummaryBatch:
+    def test_empty_methods_returns_empty(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        assert srv.run_summary_batch([]) == {}
+
+    def test_no_cpg_returns_empty(self):
+        srv = JoernServer()
+        srv._cpg_loaded = False
+        assert srv.run_summary_batch(["foo"]) == {}
+
+    def test_invalid_method_returns_empty(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        assert srv.run_summary_batch(["not valid!"]) == {}
+
+    def test_parses_summary_output(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        raw = (
+            'METHOD_SUMMARY:{"method":"foo","found":true,"taints":["buf"],'
+            '"pre":["assert(buf != NULL)"],"ret":["int"]}\n'
+        )
+        resp = {"stdout": raw, "stderr": "", "success": True}
+        with patch.object(srv, "_post_sync", return_value=resp):
+            result = srv.run_summary_batch(["foo"])
+        assert "foo" in result
+        assert result["foo"].taint_rules == ["buf"]
+        assert result["foo"].preconditions == ["assert(buf != NULL)"]
+        assert result["foo"].returns == ["int"]
+
+    def test_uses_cancellable_when_cancel_check_provided(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://127.0.0.1:9999"
+
+        raw = (
+            'METHOD_SUMMARY:{"method":"bar","found":true,"taints":[],'
+            '"pre":[],"ret":["void"]}\n'
+        )
+
+        def fake_post_async(query_str):
+            return "uuid-summary"
+
+        def fake_get_result(uuid):
+            return {"stdout": raw, "stderr": "", "success": True}
+
+        with patch.object(srv, "_post_async", side_effect=fake_post_async), \
+             patch.object(srv, "_get_result", side_effect=fake_get_result):
+            result = srv.run_summary_batch(
+                ["bar"], cancel_check=lambda: False, timeout=30,
+            )
+        assert "bar" in result
+        assert result["bar"].returns == ["void"]
+
+
+class TestWarmupDataflow:
+    @patch.object(JoernServer, "_post_sync", return_value={"stdout": "List()", "success": True})
+    def test_warmup_fires_reachable_by(self, mock_post):
+        srv = JoernServer()
+        srv._warmup_dataflow()
+        assert mock_post.called
+        query = mock_post.call_args[0][0]
+        assert "reachableBy" in query
+        assert "__RAPTOR_WARMUP_NONEXISTENT__" in query
+        assert "dataflowengineoss" in query
+
+
+class TestJoernServerIsolatedWorkspace:
+    """The server boots in a fresh temp cwd, never the caller's.
+
+    Joern loads every project in $CWD/workspace/ at startup; a corrupt
+    entry left by a killed run (overlays but no project.json) wedged
+    the REPL bridge before it bound the port — every subsequent boot
+    on the machine failed with "failed to start within 120s".
+    """
+
+    def test_start_uses_fresh_temp_cwd(self):
+        import os as _os
+        from unittest.mock import MagicMock, patch
+
+        srv = JoernServer()
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured.update(kwargs)
+            mock_proc = MagicMock()
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
+            mock_proc.poll.return_value = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.wait = MagicMock()
+            return mock_proc
+
+        with (
+            patch("packages.joern.prereqs._java_version", return_value=25),
+            patch("packages.joern.server._server_auth_supported",
+                  return_value=True),
+            # Pin the TCP fallback tier: these tests assert the direct
+            # joern argv; the netns-wrapped shape has its own tests in
+            # test_server_uds.py (and the real probe must not run
+            # under a mocked subprocess).
+            patch("packages.joern.server._netns_isolation_available",
+                  return_value=False),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'Popen',
+                  side_effect=fake_popen),
+            patch.object(srv, "_wait_for_ready", return_value=True),
+            patch.object(srv, "_warmup_imports"),
+        ):
+            srv.start()
+
+        workdir = captured.get("cwd")
+        assert workdir, "server must not inherit the caller's cwd"
+        assert workdir != _os.getcwd()
+        assert _os.path.isdir(workdir)
+        assert _os.path.basename(workdir).startswith("raptor-joern-ws-")
+
+        with mock_module_attribute(_mock_owner('packages.joern.server'), 'os', 'killpg',
+                   side_effect=ProcessLookupError):
+            srv.stop()
+        assert not _os.path.isdir(workdir), "stop() must clean the workdir"
+
+
+class TestServerAuthSupportProbe:
+    """--server-auth-* capability probe on the launcher's --help output."""
+
+    def _probe(self, binary, *, stdout=None, error=None):
+        from packages.joern import server as server_mod
+        server_mod._AUTH_SUPPORT_CACHE.pop(binary, None)
+        proc = MagicMock()
+        proc.stdout = stdout or ""
+        proc.stderr = ""
+        kwargs = (
+            {"side_effect": error} if error else {"return_value": proc}
+        )
+        try:
+            with mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'run', **kwargs):
+                return _server_auth_supported(binary)
+        finally:
+            server_mod._AUTH_SUPPORT_CACHE.pop(binary, None)
+
+    def test_detects_auth_flags_in_help(self):
+        stdout = (
+            "REST server mode\n  --server\n"
+            "  --server-auth-username <value>\n"
+            "  --server-auth-password <value>\n"
+        )
+        assert self._probe("/fake/joern-with-auth", stdout=stdout) is True
+
+    def test_missing_auth_flags(self):
+        stdout = "REST server mode\n  --server\n  --server-port <value>\n"
+        assert self._probe("/fake/joern-without-auth", stdout=stdout) is False
+
+    def test_probe_failure_fails_closed(self):
+        assert self._probe("/fake/joern-broken", error=OSError("boom")) is False
+
+
+    def test_probe_uses_selected_jdk_without_homebrew_wrapper(self, tmp_path, monkeypatch):
+        from packages.joern import server, prereqs
+        from packages.joern.tests.test_prereqs import _mac_jdk
+        home, java = _mac_jdk(tmp_path)
+        monkeypatch.setattr(prereqs, "_java_path", lambda: str(java))
+        binary = str(tmp_path / "repl-bridge")
+        monkeypatch.setattr(server, "_AUTH_SUPPORT_CACHE", {})
+        def launch(command, **kwargs):
+            assert command == [binary, "--help"]
+            assert kwargs["env"]["JAVACMD"] == str(java)
+            assert kwargs["env"]["JAVA_HOME"] == str(home)
+            return subprocess.CompletedProcess(command, 0, "--server-auth-username", "")
+        patch_module_attribute(monkeypatch, server, 'subprocess', "run", launch)
+        assert server._server_auth_supported(binary)
+
+
+class TestJoernServerAuth:
+    """Every boot generates a random Basic-auth credential; every
+    client request carries the matching Authorization header."""
+
+    @staticmethod
+    def _start_and_capture(srv):
+        captured_cmd = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            mock_proc = MagicMock()
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
+            mock_proc.poll.return_value = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.wait = MagicMock()
+            return mock_proc
+
+        with (
+            patch("packages.joern.prereqs._java_version", return_value=25),
+            patch("packages.joern.server._server_auth_supported",
+                  return_value=True),
+            # Pin the TCP fallback tier: these tests assert the direct
+            # joern argv; the netns-wrapped shape has its own tests in
+            # test_server_uds.py (and the real probe must not run
+            # under a mocked subprocess).
+            patch("packages.joern.server._netns_isolation_available",
+                  return_value=False),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'Popen',
+                  side_effect=fake_popen),
+            patch.object(srv, "_wait_for_ready", return_value=True),
+            patch.object(srv, "_warmup_imports"),
+        ):
+            srv.start()
+        return captured_cmd
+
+    @staticmethod
+    def _safe_stop(srv):
+        with mock_module_attribute(_mock_owner('packages.joern.server'), 'os', 'killpg',
+                   side_effect=ProcessLookupError):
+            srv.stop()
+
+    @staticmethod
+    def _expected_header(srv):
+        token = base64.b64encode(
+            f"{srv._auth_user}:{srv._auth_password}".encode()
+        ).decode("ascii")
+        return f"Basic {token}"
+
+    def test_start_argv_contains_auth_flags_with_credential(self):
+        srv = JoernServer()
+        cmd = self._start_and_capture(srv)
+
+        assert "--server-auth-username" in cmd
+        assert "--server-auth-password" in cmd
+        user = cmd[cmd.index("--server-auth-username") + 1]
+        password = cmd[cmd.index("--server-auth-password") + 1]
+        assert user
+        assert len(password) >= 32
+        assert srv._auth_user == user
+        assert srv._auth_password == password
+
+        self._safe_stop(srv)
+
+    def test_credential_rotates_per_boot(self):
+        srv = JoernServer()
+        cmd1 = self._start_and_capture(srv)
+        pw1 = cmd1[cmd1.index("--server-auth-password") + 1]
+        self._safe_stop(srv)
+        assert srv._auth_password is None  # cleared on stop
+
+        cmd2 = self._start_and_capture(srv)
+        pw2 = cmd2[cmd2.index("--server-auth-password") + 1]
+        self._safe_stop(srv)
+        assert pw1 != pw2
+
+    def test_auth_unsupported_refuses_unauthenticated_server(self):
+        srv = JoernServer()
+        with (
+            patch("packages.joern.server._server_auth_supported",
+                  return_value=False),
+            mock_module_attribute(_mock_owner('packages.joern.server'), 'subprocess', 'Popen',
+                  side_effect=AssertionError("must not spawn a server")),
+            pytest.raises(RuntimeError, match="server-auth"),
+        ):
+            srv.start()
+        assert srv._proc is None
+        assert srv.port is None
+
+    def _authed_server(self):
+        srv = JoernServer()
+        srv._auth_user = "raptor"
+        srv._auth_password = "secret-token"
+        srv._base_url = "http://127.0.0.1:9999"
+        return srv
+
+    def test_post_urllib_sends_authorization_header(self):
+        srv = self._authed_server()
+        opener = MagicMock()
+        resp = opener.open.return_value.__enter__.return_value
+        resp.read.return_value = b'{"success": true}'
+        with patch("packages.joern.server._NO_PROXY_OPENER", opener):
+            data = srv._post_urllib(
+                f"{srv._base_url}/query-sync", {"query": "1+1"}, 5,
+            )
+        assert data == {"success": True}
+        req = opener.open.call_args[0][0]
+        assert req.get_header("Authorization") == self._expected_header(srv)
+
+    def test_post_httpx_sends_authorization_header(self):
+        srv = self._authed_server()
+        stub_httpx = MagicMock()
+        client = stub_httpx.Client.return_value
+        stream_resp = client.stream.return_value.__enter__.return_value
+        stream_resp.iter_bytes.return_value = iter([b'{"success": true}'])
+        with patch("packages.joern.server._httpx", stub_httpx):
+            data = srv._post_sync("1+1", timeout=5)
+        assert data == {"success": True}
+        headers = client.stream.call_args.kwargs["headers"]
+        assert headers["Authorization"] == self._expected_header(srv)
+
+    def test_post_async_sends_authorization_header(self):
+        srv = self._authed_server()
+        opener = MagicMock()
+        resp = opener.open.return_value.__enter__.return_value
+        resp.read.return_value = b'{"uuid": "u-1"}'
+        with (
+            patch("packages.joern.server._NO_PROXY_OPENER", opener),
+            patch("packages.joern.server._httpx", None),
+        ):
+            uuid = srv._post_async("1+1")
+        assert uuid == "u-1"
+        req = opener.open.call_args[0][0]
+        assert req.get_header("Authorization") == self._expected_header(srv)
+
+    def test_get_result_sends_authorization_header(self):
+        srv = self._authed_server()
+        opener = MagicMock()
+        resp = opener.open.return_value.__enter__.return_value
+        resp.read.return_value = b'{"success": true, "stdout": ""}'
+        with (
+            patch("packages.joern.server._NO_PROXY_OPENER", opener),
+            patch("packages.joern.server._httpx", None),
+        ):
+            data = srv._get_result("u-1")
+        assert data is not None
+        req = opener.open.call_args[0][0]
+        assert req.get_header("Authorization") == self._expected_header(srv)
+
+    def test_no_credential_means_no_header(self):
+        srv = JoernServer()
+        assert srv._auth_headers() == {}
+
+
+class TestHasScalaError:
+    """Error detection must scan the full stdout — the REPL echoes the
+    submitted script first, so long batch scripts push compiler
+    diagnostics past any fixed prefix window."""
+
+    def test_error_marker_beyond_2000_bytes_detected(self):
+        from packages.joern.server import _has_scala_error
+        echoed_script = "val step = cpg.call.name(\"memcpy\").l\n" * 200
+        stdout = echoed_script + "-- [E006] Not Found Error: value cpgx"
+        assert len(echoed_script) > 2000
+        assert _has_scala_error(stdout)
+
+    def test_clean_output_not_flagged(self):
+        from packages.joern.server import _has_scala_error
+        stdout = 'res0: List[String] = List("a")\n' * 200
+        assert not _has_scala_error(stdout)
+
+    def test_empty_output_not_flagged(self):
+        from packages.joern.server import _has_scala_error
+        assert not _has_scala_error("")
+
+    def test_ansi_wrapped_marker_detected(self):
+        from packages.joern.server import _has_scala_error
+        # Diagnostics start their own line; detection is line-anchored.
+        stdout = ("x" * 3000) + "\n\x1b[31m-- [E007]\x1b[0m mismatch"
+        assert _has_scala_error(stdout)
+
+    def test_record_payload_error_string_not_flagged(self):
+        # A successful query whose returned code snippets contain the
+        # target repo's own "error:" strings must not read as failed.
+        from packages.joern.server import _has_scala_error
+        stdout = (
+            'JOERN_CALLER:{"caller":"log_fail","file":"a.c","line":9,'
+            '"code":"fprintf(stderr, \\"error: %s\\", msg)"}\n'
+            'JOERN_UNGUARDED:{"sink":"system","line":3,'
+            '"code":"system(cmd); // Error: unchecked"}\n'
+            'METHOD_SUMMARY:{"method":"m","found":true,'
+            '"pre":["check_error: state"]}\n'
+            "JOERN_CALLERS_DONE"
+        )
+        assert not _has_scala_error(stdout)
+
+    def test_scala2_diagnostic_line_detected(self):
+        from packages.joern.server import _has_scala_error
+        assert _has_scala_error(
+            "query.sc:3: error: not found: value cpgx"
+        )
+
+    def test_bare_error_line_detected(self):
+        from packages.joern.server import _has_scala_error
+        assert _has_scala_error("error: illegal start of definition")
+
+    def test_midline_error_string_not_flagged(self):
+        # Free-floating "error:" inside otherwise healthy output is
+        # content, not a compiler verdict.
+        from packages.joern.server import _has_scala_error
+        assert not _has_scala_error(
+            'res1: String = "handler for error: timeout"'
+        )
+
+
+class TestTieredSweepSinkEscaping:
+    def test_profile_sinks_escaped_into_the_list_literal(self):
+        from types import SimpleNamespace
+
+        from packages.joern.models import JoernResult
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        captured: dict = {}
+        profile = SimpleNamespace(
+            sinks=('bad"sink',), max_call_depth=2,
+            max_args_to_allow=8, max_output_args_expansion=4,
+        )
+        with patch.object(
+            srv, "_submit_query",
+            side_effect=lambda content, **kw: captured.update(
+                content=content) or JoernResult(query="q"),
+        ):
+            srv.run_tiered_sweep(lang_profile=profile)
+        assert '"bad\\"sink"' in captured["content"]
+        assert 'bad"sink' not in captured["content"].replace(
+            'bad\\"sink', "")
+
+
+class TestTaintExistsErrorsChannel:
+    def test_degraded_query_reports_errors(self):
+        from packages.joern.models import JoernResult
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        errors: list = []
+        with patch.object(
+            srv, "query",
+            return_value=JoernResult(query="q", errors=["query failed: x"]),
+        ):
+            assert srv.run_taint_exists_query(
+                "src_fn", "sink_fn", errors_out=errors) is False
+        assert errors == ["query failed: x"]
+
+    def test_true_flow_stays_true_with_channel(self):
+        from packages.joern.models import JoernResult
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        errors: list = []
+        with patch.object(
+            srv, "query",
+            return_value=JoernResult(query="q",
+                                     raw_output="JOERN_EXISTS:true"),
+        ):
+            assert srv.run_taint_exists_query(
+                "src_fn", "sink_fn", errors_out=errors) is True
+        assert errors == []
+
+
+class TestGraphIdentityLease:
+    """Shared-server graph-swap defence: every import declares a
+    per-import lease val in the same compilation unit, every query
+    prepends a require on this handle's nonce, and a detected swap
+    pays one bounded re-import instead of returning evidence about a
+    sibling session's graph."""
+
+    def _cpg_file(self, tmp_path):
+        p = tmp_path / "cpg.bin"
+        p.write_bytes(b"stub")
+        return p
+
+    def _recording_post(self, responses):
+        posted = []
+
+        def fake(self_srv, query_str, *, timeout=30):
+            posted.append(query_str)
+            return responses.pop(0)
+
+        return posted, fake
+
+    # import_cpg consumes exactly three posts: the import+lease
+    # compilation unit, the cpg-binding probe, and the dataflow
+    # warmup (the second warmup in TestJoernServerImportCpg's
+    # fixtures belongs to start()'s _warmup_imports, never reached
+    # through import_cpg).
+    _IMPORT_OK = [
+        {"success": True, "stdout": "workspace..."},   # import unit
+        {"success": True, "stdout": 'val res0: String = "42"'},
+        {"success": True, "stdout": "warmup"},
+    ]
+
+    def test_import_declares_lease_in_import_unit(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK))
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+        assert 'importCpg("' in posted[0]
+        assert f'val {_LEASE_VAL} = "' in posted[0]
+        assert srv._graph_lease is not None
+        # The nonce the handle remembers is the one the unit declared.
+        assert f'val {_LEASE_VAL} = "{srv._graph_lease}"' in posted[0]
+
+    def test_query_prepends_guard_and_keeps_original_query(self):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        srv._cpg_loaded = True
+        srv._graph_lease = "aa" * 16
+        posted, fake = self._recording_post(
+            [{"success": True, "stdout": "val res0: Int = 1"}])
+        with patch.object(JoernServer, "_post_sync", fake):
+            result = srv.query("cpg.method.name.l")
+        assert posted[0].startswith(
+            f'require({_LEASE_VAL} == "{"aa" * 16}", "{_LEASE_MISMATCH}")\n')
+        assert posted[0].endswith("cpg.method.name.l")
+        assert result.query == "cpg.method.name.l"
+        assert not result.errors
+
+    def test_query_without_lease_runs_unguarded(self):
+        # Pre-lease compatibility (direction two): a handle that never
+        # imported (or a lifecycle-reused server loaded by an old
+        # RAPTOR) posts the query verbatim, exactly as before.
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        srv._cpg_loaded = True
+        posted, fake = self._recording_post(
+            [{"success": True, "stdout": "val res0: Int = 1"}])
+        with patch.object(JoernServer, "_post_sync", fake):
+            srv.query("cpg.method.name.l")
+        assert posted[0] == "cpg.method.name.l"
+
+    def test_swap_classifier_matches_thrown_forms_only(self):
+        thrown = ("java.lang.IllegalArgumentException: requirement "
+                  f"failed: {_LEASE_MISMATCH}")
+        assert JoernServer._lease_swapped(thrown, "") is True
+        assert JoernServer._lease_swapped("", thrown) is True
+        # A sibling running a pre-lease RAPTOR imported without
+        # declaring the val at all.
+        assert JoernServer._lease_swapped(
+            f"-- [E006] Not Found Error: Not found: {_LEASE_VAL}", "",
+        ) is True
+        # An ordinary compile error can ECHO the guard line; the bare
+        # marker must not classify as a swap or every such error pays
+        # a re-import.
+        echo = (f'require({_LEASE_VAL} == "ab", "{_LEASE_MISMATCH}")\n'
+                "-- [E006] Not Found Error: Not found: cpgg")
+        assert JoernServer._lease_swapped(echo, "") is False
+        assert JoernServer._lease_swapped("val res0: Int = 1", "") is False
+
+    def test_swap_classifier_ignores_record_line_payloads(self):
+        # Record/sentinel lines carry the SCANNED repo's own text: a
+        # target file containing the thrown-form string verbatim must
+        # not classify every query on it as a swap (each false swap
+        # costs a full re-import, and the cap then kills the tier).
+        payload = (
+            "JOERN_FLOW:src/evil.c:12:parse|"
+            "log(\"requirement failed: "
+            f"{_LEASE_MISMATCH}\")"
+        )
+        assert JoernServer._lease_swapped(payload, "") is False
+        assert JoernServer._lease_swapped(
+            f"METHOD_SUMMARY:handler|Not found: {_LEASE_VAL}", "",
+        ) is False
+        # ...while a genuine thrown form alongside record output
+        # still classifies.
+        mixed = (
+            "JOERN_FLOW:src/ok.c:3:f|snippet\n"
+            "java.lang.IllegalArgumentException: requirement "
+            f"failed: {_LEASE_MISMATCH}"
+        )
+        assert JoernServer._lease_swapped(mixed, "") is True
+
+    def test_swap_recovers_reimports_and_retries_once(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK) + [
+            # attempt 0: sibling swapped the graph — guard fired
+            {"success": False,
+             "stderr": ("java.lang.IllegalArgumentException: "
+                        f"requirement failed: {_LEASE_MISMATCH}")},
+        ] + list(self._IMPORT_OK) + [
+            # attempt 1 under the fresh lease
+            {"success": True, "stdout": "val res0: Int = 7"},
+        ])
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+            first_lease = srv._graph_lease
+            result = srv.query("cpg.method.name.l")
+        assert not result.errors
+        assert srv._lease_reimports == 1
+        assert srv._graph_lease != first_lease
+        # The retry was guarded with the NEW nonce.
+        assert posted[-1].startswith(
+            f'require({_LEASE_VAL} == "{srv._graph_lease}"')
+
+    def test_reimport_cap_degrades_loudly_then_fails_fast(self, tmp_path):
+        from packages.joern.server import _LEASE_REIMPORT_CAP
+
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK) + [
+            {"success": False,
+             "stderr": ("java.lang.IllegalArgumentException: "
+                        f"requirement failed: {_LEASE_MISMATCH}")},
+        ])
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+            srv._lease_reimports = _LEASE_REIMPORT_CAP  # cap consumed
+            result = srv.query("cpg.method.name.l")
+            n_posted = len(posted)
+            # Degraded: later queries fail fast without posting.
+            result2 = srv.query("cpg.method.name.l")
+        assert result.errors == [_LEASE_CONFLICT_ERROR]
+        assert srv._lease_exhausted is True
+        assert result2.errors == [_LEASE_CONFLICT_ERROR]
+        assert len(posted) == n_posted
+
+    def test_ordinary_failure_does_not_reimport(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK) + [
+            {"success": False, "stderr": "value foo is not a member"},
+        ])
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+            result = srv.query("cpg.method.foo.l")
+        assert result.errors
+        assert srv._lease_reimports == 0
+
+    def test_close_workspace_clears_lease(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._graph_lease = "bb" * 16
+        with patch.object(JoernServer, "_post_sync",
+                          return_value={"success": True}):
+            srv.close_workspace()
+        assert srv._graph_lease is None
+
+
+class TestImportRetryAfterServerReplacement:
+    """A sibling session's restart replaces the shared JVM while THIS
+    handle's import is in flight: the import's post dies mid-flight
+    (dead old JVM / new credential on the replacement). The failed
+    import must leave the handle cleanly retryable — no fabricated
+    loaded state, no stale lease — so the caller's ordinary retry
+    against the replacement server succeeds with a fresh lease."""
+
+    def test_failed_import_leaves_handle_cleanly_retryable(
+            self, tmp_path):
+        p = tmp_path / "cpg.bin"
+        p.write_bytes(b"stub")
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+
+        responses = [
+            None,  # import unit: transport died under the replacement
+            {"success": True, "stdout": "workspace..."},   # retry unit
+            {"success": True, "stdout": 'val res0: String = "42"'},
+            {"success": True, "stdout": "warmup"},
+        ]
+
+        def fake(self_srv, query_str, *, timeout=30):
+            return responses.pop(0)
+
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(p) is False
+            assert srv._cpg_loaded is False
+            assert srv._graph_lease is None
+            epoch = srv._cpg_load_epoch
+
+            assert srv.import_cpg(p) is True
+        assert srv._cpg_loaded is True
+        assert srv._graph_lease is not None
+        assert srv._cpg_load_epoch == epoch + 1

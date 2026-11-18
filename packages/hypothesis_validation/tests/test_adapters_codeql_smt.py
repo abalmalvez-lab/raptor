@@ -6,14 +6,36 @@ is a thin wrapper over packages/codeql/smt_path_validator and exercising
 the real path catches integration issues mocks would mask.
 """
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
 import json
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_probe_patches(monkeypatch):
+    """Keep host discovery and process mocks on consumer-owned bindings."""
+    import packages.hypothesis_validation.adapters.codeql as consumer
+
+    patch_module_attribute(
+        monkeypatch, consumer, "shutil", "which", consumer.shutil.which,
+    )
+    patch_module_attribute(
+        monkeypatch, consumer, "subprocess", "run", consumer.subprocess.run,
+    )
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from packages.hypothesis_validation.adapters import (
     CodeQLAdapter,
@@ -43,31 +65,31 @@ class TestCodeQLAdapterBasics:
         assert "dataflow" in text.lower() or "data flow" in text.lower()
 
     def test_unavailable_when_no_database(self):
-        with patch("shutil.which", return_value="/usr/bin/codeql"):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value="/usr/bin/codeql"):
             a = CodeQLAdapter()
             assert not a.is_available()
 
     def test_unavailable_when_no_binary(self, tmp_path):
         db = tmp_path / "db"
         db.mkdir()
-        with patch("shutil.which", return_value=None):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value=None):
             a = CodeQLAdapter(database_path=db)
             assert not a.is_available()
 
     def test_unavailable_when_database_missing(self, tmp_path):
-        with patch("shutil.which", return_value="/usr/bin/codeql"):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value="/usr/bin/codeql"):
             a = CodeQLAdapter(database_path=tmp_path / "nonexistent")
             assert not a.is_available()
 
     def test_available_when_db_and_binary_present(self, tmp_path):
         db = tmp_path / "db"
         db.mkdir()
-        with patch("shutil.which", return_value="/usr/bin/codeql"):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value="/usr/bin/codeql"):
             a = CodeQLAdapter(database_path=db)
             assert a.is_available()
 
     def test_set_database_updates_availability(self, tmp_path):
-        with patch("shutil.which", return_value="/usr/bin/codeql"):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value="/usr/bin/codeql"):
             a = CodeQLAdapter()
             assert not a.is_available()
             db = tmp_path / "db"
@@ -89,7 +111,7 @@ class TestCodeQLAdapterRun:
     def test_run_no_binary(self, tmp_path):
         db = tmp_path / "db"
         db.mkdir()
-        with patch("shutil.which", return_value=None):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value=None):
             a = CodeQLAdapter(database_path=db, sandbox=False)
         ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert not ev.success
@@ -141,13 +163,30 @@ class TestCodeQLAdapterRun:
                     Path(arg.split("=", 1)[1]).write_text(sarif)
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run', side_effect=fake_run):
             ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert ev.success
         assert len(ev.matches) == 1
         assert ev.matches[0]["file"] == "src/a.c"
         assert ev.matches[0]["line"] == 42
         assert "1 match" in ev.summary
+
+    def test_run_corrupt_sarif_is_tool_failure(self, tmp_path):
+        """A written-but-unreadable SARIF is success=False, never a
+        default-refuted zero-match success."""
+        a, db = self._adapter(tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            for arg in cmd:
+                if arg.startswith("--output="):
+                    Path(arg.split("=", 1)[1]).write_text("{corrupt")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run', side_effect=fake_run):
+            ev = a.run("import cpp\nselect 1\n", tmp_path)
+        assert not ev.success
+        assert "unreadable" in ev.error
+        assert ev.matches == []
 
     def test_run_subprocess_no_matches(self, tmp_path):
         a, db = self._adapter(tmp_path)
@@ -160,7 +199,7 @@ class TestCodeQLAdapterRun:
                     )
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run', side_effect=fake_run):
             ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert ev.success
         assert ev.matches == []
@@ -168,7 +207,7 @@ class TestCodeQLAdapterRun:
 
     def test_run_subprocess_error(self, tmp_path):
         a, db = self._adapter(tmp_path)
-        with patch("subprocess.run", return_value=MagicMock(
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run', return_value=MagicMock(
             returncode=1, stdout="", stderr="syntax error in query",
         )):
             ev = a.run("not valid ql", tmp_path)
@@ -177,7 +216,7 @@ class TestCodeQLAdapterRun:
 
     def test_run_subprocess_timeout(self, tmp_path):
         a, db = self._adapter(tmp_path)
-        with patch("subprocess.run",
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
                    side_effect=__import__("subprocess").TimeoutExpired("codeql", 60)):
             ev = a.run("import cpp\nselect 1\n", tmp_path, timeout=60)
         assert not ev.success
@@ -185,7 +224,7 @@ class TestCodeQLAdapterRun:
 
     def test_run_subprocess_oserror(self, tmp_path):
         a, db = self._adapter(tmp_path)
-        with patch("subprocess.run", side_effect=OSError("boom")):
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run', side_effect=OSError("boom")):
             ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert not ev.success
         assert "boom" in ev.error
@@ -193,11 +232,86 @@ class TestCodeQLAdapterRun:
     def test_run_no_sarif_produced(self, tmp_path):
         a, db = self._adapter(tmp_path)
         # subprocess returns 0 but no SARIF written
-        with patch("subprocess.run", return_value=MagicMock(
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run', return_value=MagicMock(
             returncode=0, stdout="", stderr="",
         )):
             ev = a.run("import cpp\nselect 1\n", tmp_path)
         assert not ev.success
+
+
+class TestCodeQLBatchPreconditionMessages:
+    """run_prebuilt_queries_batch emits the same three distinct
+    precondition messages as run() / run_prebuilt_query instead of one
+    generic "codeql/database unavailable" string."""
+
+    def test_no_cli_message_matches_siblings(self, tmp_path):
+        db = tmp_path / "db"
+        db.mkdir()
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'shutil', 'which', return_value=None):
+            a = CodeQLAdapter(database_path=db)
+        results = a.run_prebuilt_queries_batch([Path("/pack/q.ql")])
+        assert set(results) == {"/pack/q.ql"}
+        ev = results["/pack/q.ql"]
+        assert not ev.success
+        assert ev.error == "codeql CLI is not installed"
+
+    def test_no_database_configured_message_matches_siblings(self):
+        a = CodeQLAdapter(codeql_bin="/usr/bin/codeql")
+        results = a.run_prebuilt_queries_batch([Path("/pack/q.ql")])
+        ev = results["/pack/q.ql"]
+        assert not ev.success
+        assert ev.error == "no CodeQL database configured (set_database() first)"
+
+    def test_database_missing_message_matches_siblings(self, tmp_path):
+        missing = tmp_path / "nonexistent-db"
+        a = CodeQLAdapter(database_path=missing, codeql_bin="/usr/bin/codeql")
+        results = a.run_prebuilt_queries_batch([Path("/pack/q.ql")])
+        ev = results["/pack/q.ql"]
+        assert not ev.success
+        assert ev.error == f"CodeQL database not found: {missing}"
+
+    def test_generic_message_no_longer_used(self, tmp_path):
+        a = CodeQLAdapter(
+            database_path=tmp_path / "nope", codeql_bin="/usr/bin/codeql",
+        )
+        results = a.run_prebuilt_queries_batch([Path("/pack/q.ql")])
+        assert "codeql/database unavailable" not in results["/pack/q.ql"].error
+
+    def test_empty_batch_returns_empty_dict(self, tmp_path):
+        a = CodeQLAdapter(
+            database_path=tmp_path / "nope", codeql_bin="/usr/bin/codeql",
+        )
+        assert a.run_prebuilt_queries_batch([]) == {}
+
+
+class TestRunInlinePackInstallLogging:
+    def test_pack_install_failure_logs_warning(self, tmp_path, caplog):
+        """A failing inline `codeql pack install` in run() must emit a
+        warning (matching the _ensure_pack_installed contract) instead
+        of silently swallowing the exception."""
+        db = tmp_path / "db"
+        db.mkdir()
+        a = CodeQLAdapter(
+            database_path=db,
+            codeql_bin=str(tmp_path / "no-such-codeql"),
+            sandbox=False,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="packages.hypothesis_validation.adapters.codeql",
+        ):
+            ev = a.run(
+                "import cpp\nfrom Function f select f",
+                target=db,
+                env={"PATH": "/usr/bin"},
+            )
+        # The analyze step still fails loudly on its own.
+        assert not ev.success
+        assert "failed to invoke codeql" in ev.error
+        # And the install failure is now observable in the log.
+        assert any(
+            "codeql pack install" in rec.getMessage() for rec in caplog.records
+        )
 
 
 class TestQlPackYaml:
@@ -224,13 +338,35 @@ class TestParseSarif:
         p.write_text(json.dumps({"runs": []}))
         assert _parse_sarif(p) == []
 
-    def test_missing_file(self, tmp_path):
-        assert _parse_sarif(tmp_path / "nonexistent") == []
+    def test_missing_file_is_parse_failure(self, tmp_path):
+        # None (tool failure), never [] — an unreadable SARIF must not
+        # grade as a refuted "no matches".
+        assert _parse_sarif(tmp_path / "nonexistent") is None
 
-    def test_invalid_json(self, tmp_path):
+    def test_invalid_json_is_parse_failure(self, tmp_path):
         p = tmp_path / "x.sarif"
         p.write_text("not json")
-        assert _parse_sarif(p) == []
+        assert _parse_sarif(p) is None
+
+    def test_hostile_start_line_is_parse_failure(self, tmp_path):
+        # Extraction is inside the MUST-NOT-raise guard: a non-numeric
+        # startLine reports a parse failure instead of raising.
+        p = tmp_path / "x.sarif"
+        p.write_text(json.dumps({
+            "runs": [{
+                "results": [{
+                    "ruleId": "r1",
+                    "message": {"text": "msg"},
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": "a.c"},
+                            "region": {"startLine": "NaN-ish"},
+                        },
+                    }],
+                }],
+            }],
+        }))
+        assert _parse_sarif(p) is None
 
     def test_basic_parse(self, tmp_path):
         p = tmp_path / "x.sarif"
@@ -288,9 +424,9 @@ class TestParseConditions:
         assert c[0].text == "size == 0"
         assert not c[1].negated
 
-    def test_negation_with_no_text_skipped(self):
-        c = _parse_conditions("!\n!  \n")
-        assert c == []
+    def test_negation_with_no_text_is_rejected(self):
+        with pytest.raises(ValueError, match="negation requires a condition"):
+            _parse_conditions("!\n!  \n")
 
     def test_step_indices_preserved(self):
         c = _parse_conditions("size > 0\nlen < 1024\n")
@@ -338,15 +474,38 @@ class TestSMTAdapterIntegration:
         ev = a.run("# just a comment\n", tmp_path)
         assert not ev.success
 
-    def test_mixed_valid_and_invalid(self, tmp_path):
+    def test_mixed_valid_and_invalid_is_tool_failure(self, tmp_path):
         a = SMTAdapter()
-        # The first condition is fine; the second has unsupported syntax —
-        # smt_path_validator buckets that as "unknown" but the first still
-        # solves. The adapter should still report sat.
+        # The first condition is fine; the second has unsupported syntax
+        # and gets dropped to "unknown". sat over the surviving subset is
+        # NOT proof the full path is feasible, so the adapter must report
+        # a tool failure naming the dropped condition rather than clean
+        # confirming evidence over a near-empty check.
         ev = a.run("size > 0\nptr->field == 1\n", tmp_path)
-        # At minimum: doesn't crash. May return sat (unparseable conditions
-        # are dropped to unknown) or unknown depending on solver behaviour.
-        assert ev.success or "unknown" in (ev.error or "").lower()
+        assert not ev.success
+        assert "unparseable" in ev.error
+        assert "ptr->field" in ev.error
+
+    def test_fully_parsed_sat_still_confirms(self, tmp_path):
+        # Companion direction: when EVERY condition parses, sat evidence
+        # stays clean witness evidence — the partial-set failure above
+        # must not swallow legitimate results.
+        a = SMTAdapter()
+        ev = a.run("size > 0\nsize < 1024\n", tmp_path)
+        assert ev.success
+        assert "sat" in ev.summary
+        assert ev.matches
+
+    def test_unsat_with_dropped_conditions_stays_sound(self, tmp_path):
+        # unsat over a subset implies unsat over the whole set, so a
+        # dropped condition must not degrade an unsat result to failure —
+        # only annotate it.
+        a = SMTAdapter()
+        ev = a.run("x == 0\nx != 0\nptr->field == 1\n", tmp_path)
+        assert ev.success
+        assert "unsat" in ev.summary
+        assert "excluded" in ev.summary
+        assert ev.matches == []
 
 
 class TestSMTAdapterUnavailable:
@@ -364,3 +523,360 @@ class TestSMTAdapterUnavailable:
         with patch.object(a, "is_available", return_value=True):
             ev = a.run("", tmp_path)
         assert not ev.success
+
+
+class TestParseSarifBudget:
+    def test_oversize_sarif_is_parse_failure(self, tmp_path: Path) -> None:
+        """A SARIF over the bounded loader's cap is a tool failure
+        (None), never an empty refutation. Sparse truncate: the stat
+        gate fires before any read."""
+        import os
+
+        p = tmp_path / "x.sarif"
+        p.write_text(json.dumps({"runs": []}))
+        os.truncate(p, 100 * 1024 * 1024 + 1)
+        assert _parse_sarif(p) is None
+
+
+class TestPrebuiltSarifParseFailure:
+    """run_prebuilt_query / run_prebuilt_queries_batch must convert a
+    SARIF parse failure into failure evidence exactly like run() does —
+    _parse_sarif returns None on unreadable output and the adapters
+    MUST NOT raise (len(None) / iterating None are TypeErrors)."""
+
+    def _adapter(self, tmp_path: Path) -> tuple[CodeQLAdapter, Path]:
+        db = tmp_path / "db"
+        db.mkdir()
+        a = CodeQLAdapter(
+            database_path=db, codeql_bin="/usr/bin/codeql", sandbox=False,
+        )
+        return a, db
+
+    def _query(self, tmp_path: Path, name: str = "q.ql",
+               qid: str | None = None) -> Path:
+        q = tmp_path / name
+        q.parent.mkdir(parents=True, exist_ok=True)
+        header = f"/**\n * @id {qid}\n */\n" if qid else ""
+        q.write_text(header + "import cpp\nselect 1\n")
+        return q
+
+    @staticmethod
+    def _fake_run_writing(text: str):
+        def fake_run(cmd, **kwargs):
+            for arg in cmd:
+                if arg.startswith("--output="):
+                    Path(arg.split("=", 1)[1]).write_text(text)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    def test_prebuilt_corrupt_sarif_is_tool_failure(self, tmp_path):
+        a, db = self._adapter(tmp_path)
+        q = self._query(tmp_path)
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
+                   side_effect=self._fake_run_writing("{corrupt")):
+            ev = a.run_prebuilt_query(q, tmp_path)
+        assert not ev.success
+        assert "unreadable" in ev.error
+        assert ev.matches == []
+
+    def test_prebuilt_valid_sarif_still_succeeds(self, tmp_path):
+        a, db = self._adapter(tmp_path)
+        q = self._query(tmp_path)
+        sarif = json.dumps({"runs": [{"results": []}]})
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
+                   side_effect=self._fake_run_writing(sarif)):
+            ev = a.run_prebuilt_query(q, tmp_path)
+        assert ev.success
+        assert "no matches" in ev.summary
+
+    def test_batch_corrupt_sarif_is_tool_failure_for_every_query(self, tmp_path):
+        a, db = self._adapter(tmp_path)
+        q1 = self._query(tmp_path, "a/q1.ql")
+        q2 = self._query(tmp_path, "b/q2.ql")
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
+                   side_effect=self._fake_run_writing("{corrupt")):
+            results = a.run_prebuilt_queries_batch([q1, q2])
+        assert set(results) == {str(q1), str(q2)}
+        for ev in results.values():
+            assert not ev.success
+            assert "unreadable" in ev.error
+
+
+class TestBatchAttribution:
+    """Batch SARIF results map back to their originating query via
+    @id / filename stem. Results that map to no known query must not
+    vanish silently (the owning query would read as a clean refutable
+    "no matches"), and a stem shared by two queries must not credit
+    everything to whichever registered first."""
+
+    def _adapter(self, tmp_path: Path) -> CodeQLAdapter:
+        db = tmp_path / "db"
+        db.mkdir(exist_ok=True)
+        return CodeQLAdapter(
+            database_path=db, codeql_bin="/usr/bin/codeql", sandbox=False,
+        )
+
+    def _query(self, tmp_path: Path, rel: str, qid: str | None = None) -> Path:
+        q = tmp_path / rel
+        q.parent.mkdir(parents=True, exist_ok=True)
+        header = f"/**\n * @id {qid}\n */\n" if qid else ""
+        q.write_text(header + "import cpp\nselect 1\n")
+        return q
+
+    @staticmethod
+    def _sarif_with(rule_ids: list[str]) -> str:
+        return json.dumps({
+            "runs": [{
+                "results": [
+                    {
+                        "ruleId": rid,
+                        "message": {"text": f"hit for {rid}"},
+                        "locations": [{
+                            "physicalLocation": {
+                                "artifactLocation": {"uri": "src/a.c"},
+                                "region": {"startLine": 1},
+                            },
+                        }],
+                    }
+                    for rid in rule_ids
+                ],
+            }],
+        })
+
+    @staticmethod
+    def _fake_run_writing(text: str):
+        def fake_run(cmd, **kwargs):
+            for arg in cmd:
+                if arg.startswith("--output="):
+                    Path(arg.split("=", 1)[1]).write_text(text)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    def test_unattributed_results_degrade_zero_match_queries(self, tmp_path):
+        a = self._adapter(tmp_path)
+        q1 = self._query(tmp_path, "a/first.ql", qid="raptor/first")
+        q2 = self._query(tmp_path, "b/second.ql", qid="raptor/second")
+        sarif = self._sarif_with(["raptor/first", "vendor/unknown-rule"])
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
+                   side_effect=self._fake_run_writing(sarif)):
+            results = a.run_prebuilt_queries_batch([q1, q2])
+        # The attributable match reaches its query.
+        assert results[str(q1)].success
+        assert len(results[str(q1)].matches) == 1
+        # The zero-match query cannot claim a clean "no matches" while
+        # an unattributed result exists — any of them could be its own.
+        assert not results[str(q2)].success
+        assert "could not be attributed" in results[str(q2)].error
+
+    def test_fully_attributed_batch_keeps_clean_no_matches(self, tmp_path):
+        # Direction guard: with every result attributed, a query with
+        # zero matches keeps its refutation-capable clean result.
+        a = self._adapter(tmp_path)
+        q1 = self._query(tmp_path, "a/first.ql", qid="raptor/first")
+        q2 = self._query(tmp_path, "b/second.ql", qid="raptor/second")
+        sarif = self._sarif_with(["raptor/first"])
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
+                   side_effect=self._fake_run_writing(sarif)):
+            results = a.run_prebuilt_queries_batch([q1, q2])
+        assert results[str(q1)].success
+        assert len(results[str(q1)].matches) == 1
+        assert results[str(q2)].success
+        assert results[str(q2)].matches == []
+        assert "no matches" in results[str(q2)].summary
+
+    def test_stem_collision_not_credited_to_first_query(self, tmp_path):
+        # Two queries share the stem "q" and declare no @id; a result
+        # with ruleId "q" is genuinely ambiguous. Crediting it to the
+        # first-registered query would fabricate its evidence AND hand
+        # the second a false refutation — both must degrade instead.
+        a = self._adapter(tmp_path)
+        q1 = self._query(tmp_path, "a/q.ql")
+        q2 = self._query(tmp_path, "b/q.ql")
+        sarif = self._sarif_with(["q"])
+        with mock_module_attribute(_mock_owner('packages.hypothesis_validation.adapters.codeql'), 'subprocess', 'run',
+                   side_effect=self._fake_run_writing(sarif)):
+            results = a.run_prebuilt_queries_batch([q1, q2])
+        assert results[str(q1)].matches == []
+        assert not results[str(q1)].success
+        assert not results[str(q2)].success
+
+
+class TestEnsurePackInstalledCaching:
+    """A failed `codeql pack install` must not be cached as installed —
+    the cache would suppress the retry that could succeed once the
+    operator fixes the environment."""
+
+    def _pack(self, tmp_path: Path) -> tuple[Path, Path]:
+        pack = tmp_path / "pack"
+        pack.mkdir()
+        (pack / "qlpack.yml").write_text("name: raptor/test-pack\n")
+        q = pack / "q.ql"
+        q.write_text("import cpp\nselect 1\n")
+        return pack, q
+
+    def test_failed_install_is_retried(self, tmp_path):
+        from packages.hypothesis_validation.adapters.codeql import (
+            _INSTALLED_PACK_DIRS,
+            _ensure_pack_installed,
+        )
+        pack, q = self._pack(tmp_path)
+        calls: list[list] = []
+
+        def failing_runner(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=1, stdout="", stderr="registry unreachable")
+
+        try:
+            _ensure_pack_installed(q, "codeql", failing_runner, {})
+            assert len(calls) == 1
+            # Second call retries instead of hitting a poisoned cache.
+            _ensure_pack_installed(q, "codeql", failing_runner, {})
+            assert len(calls) == 2
+        finally:
+            _INSTALLED_PACK_DIRS.discard(pack.resolve())
+            _INSTALLED_PACK_DIRS.discard(pack)
+
+    def test_successful_install_is_cached(self, tmp_path):
+        from packages.hypothesis_validation.adapters.codeql import (
+            _INSTALLED_PACK_DIRS,
+            _ensure_pack_installed,
+        )
+        pack, q = self._pack(tmp_path)
+        calls: list[list] = []
+
+        def ok_runner(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        try:
+            _ensure_pack_installed(q, "codeql", ok_runner, {})
+            _ensure_pack_installed(q, "codeql", ok_runner, {})
+            assert len(calls) == 1
+        finally:
+            _INSTALLED_PACK_DIRS.discard(pack.resolve())
+            _INSTALLED_PACK_DIRS.discard(pack)
+
+
+@pytest.mark.skipif(
+    not SMTAdapter().is_available(),
+    reason="z3-solver not installed",
+)
+class TestSMTUnsatConclusiveFlag:
+    """unsat is a definitive proof despite the empty match list — the
+    evidence must carry empty_matches_conclusive so the verdict ladder
+    can honour a confirmed reading of an infeasibility-phrased
+    hypothesis, while sat evidence must NOT carry the flag."""
+
+    def test_unsat_sets_flag(self, tmp_path):
+        a = SMTAdapter()
+        ev = a.run("x == 0\nx != 0\n", tmp_path)
+        assert ev.success
+        assert ev.matches == []
+        assert ev.empty_matches_conclusive is True
+
+    def test_sat_does_not_set_flag(self, tmp_path):
+        a = SMTAdapter()
+        ev = a.run("size > 0\nsize < 1024\n", tmp_path)
+        assert ev.success
+        assert ev.empty_matches_conclusive is False
+
+    def test_unsat_summary_names_both_readings(self, tmp_path):
+        # The evaluating LLM maps the proof onto the hypothesis's
+        # phrasing from the summary text.
+        a = SMTAdapter()
+        ev = a.run("x == 0\nx != 0\n", tmp_path)
+        assert "refutes" in ev.summary
+        assert "confirms" in ev.summary
+
+
+class TestSMTAdapterDualSignedness:
+    """The default (unpinned) profile is a signedness GUESS — an unsat
+    verdict must be honored only when BOTH signedness profiles agree,
+    or the ubiquitous C signed error check (``ret < 0``) refutes any
+    hypothesis that carries it."""
+
+    def test_default_profile_routes_through_dual(self, tmp_path,
+                                                 monkeypatch):
+        import packages.hypothesis_validation.adapters.smt as smt_mod
+        calls: list[str] = []
+
+        def _fake(conditions, profile=None, *, use_call_summaries):
+            assert use_call_summaries is False
+            calls.append("dual")
+            from core.smt_solver.path_feasibility import PathSMTResult
+            return PathSMTResult(True, [], [], [], {}, True, "sat")
+
+        monkeypatch.setattr(smt_mod, "check_path_feasibility_dual", _fake)
+        monkeypatch.setattr(
+            smt_mod.SMTAdapter, "is_available", lambda self: True)
+        ev = SMTAdapter().run("size > 0\n", tmp_path)
+        assert ev.success
+        assert calls == ["dual"]
+
+    def test_pinned_profile_keeps_single_check(self, tmp_path,
+                                               monkeypatch):
+        import packages.hypothesis_validation.adapters.smt as smt_mod
+        calls: list[str] = []
+
+        def _fake(conditions, profile=None, *, use_call_summaries):
+            assert use_call_summaries is False
+            calls.append("single")
+            from core.smt_solver.path_feasibility import PathSMTResult
+            return PathSMTResult(True, [], [], [], {}, True, "sat")
+
+        monkeypatch.setattr(smt_mod, "check_path_feasibility", _fake)
+        monkeypatch.setattr(
+            smt_mod.SMTAdapter, "is_available", lambda self: True)
+        ev = SMTAdapter(bv_profile=object()).run("size > 0\n", tmp_path)
+        assert ev.success
+        assert calls == ["single"]
+
+    @pytest.mark.skipif(
+        not SMTAdapter().is_available(),
+        reason="z3-solver not installed",
+    )
+    def test_signed_error_check_not_refuted_by_default(self, tmp_path):
+        # Fails pre-adoption: single-profile uint64 encoded
+        # ``ret < 0`` as ULT(ret, 0) — unsat — confirming a false
+        # infeasibility.
+        ev = SMTAdapter().run("ret < 0\n", tmp_path)
+        assert ev.success
+        assert "sat" in ev.summary and "unsat" not in ev.summary
+
+    @pytest.mark.skipif(
+        not SMTAdapter().is_available(),
+        reason="z3-solver not installed",
+    )
+    def test_pinned_unsigned_profile_still_authoritative(self, tmp_path):
+        # Two-direction companion: an operator who PINS unsigned has
+        # asserted the signedness — the single-profile unsat stands.
+        from core.smt_solver import BV_C_UINT64
+        ev = SMTAdapter(bv_profile=BV_C_UINT64).run("ret < 0\n", tmp_path)
+        assert ev.success
+        assert "unsat" in ev.summary
+
+
+@pytest.mark.parametrize("dropped", [[], ["ptr->field == 1"], [f"invalid_{i}" for i in range(7)]])
+def test_indeterminate_smt_preserves_reason_and_bounds_dropped_conditions(tmp_path, monkeypatch, dropped):
+    import packages.hypothesis_validation.adapters.smt as module
+    from core.smt_solver.path_feasibility import PathSMTResult
+
+    result = PathSMTResult(
+        feasible=None, satisfied=[], unsatisfied=[], unknown=dropped,
+        model={}, smt_available=True, reasoning="query remains indeterminate",
+    )
+    monkeypatch.setattr(module, "_z3_available", lambda: True)
+    monkeypatch.setattr(module, "check_path_feasibility_dual", lambda *a, **kw: result)
+    evidence = SMTAdapter().run("size > 0", tmp_path)
+    assert not evidence.success
+    assert not evidence.matches
+    assert not evidence.empty_matches_conclusive
+    assert evidence.error.startswith(result.reasoning)
+    if not dropped:
+        assert evidence.error == result.reasoning
+    else:
+        assert "unparseable" in evidence.error
+        assert all(repr(condition) in evidence.error for condition in dropped[:5])
+        if len(dropped) > 5:
+            assert "(+2 more)" in evidence.error
+            assert "invalid_5" not in evidence.error

@@ -9,12 +9,6 @@ from core.schema_constants import AGENTIC_RULING_VALUES, CONFIDENCE_LEVELS, SEVE
 
 # Schema for vulnerability analysis — used with generate_structured()
 ANALYSIS_SCHEMA = {
-    "is_true_positive": "boolean",
-    "is_exploitable": "boolean",
-    "exploitability_score": "float (0.0-1.0)",
-    "confidence": f"string ({'/'.join(CONFIDENCE_LEVELS)})",
-    "severity_assessment": f"string ({'/'.join(SEVERITY_LEVELS)})",
-    "ruling": f"string ({'/'.join(AGENTIC_RULING_VALUES)})",
     "reasoning": "string",
     "attack_scenario": "string",
     "prerequisites": "list of strings",
@@ -41,6 +35,19 @@ ANALYSIS_SCHEMA = {
         "dangerous path. Each entry is a single predicate the parser "
         "accepts: e.g. 'count > 0x10000000', 'alloc_size == count * 16', "
         "'index >= buffer_size', 'ptr == NULL'. "
+        "Emit GUARDS ONLY — Boolean predicates that gate execution. Do "
+        "NOT emit program statements (assignments, increment/decrement, "
+        "function calls without a comparison); the parser routes those to "
+        "ASSIGNMENT_SHAPED rejection. "
+        "SSA-rename across mutations: the Z3 encoder treats every "
+        "appearance of an identifier as the same value, so a path that "
+        "mutates `input` between two `strlen(input)` guards must be "
+        "emitted with renamed identifiers — e.g. "
+        "['strlen(input_pre) > 100', 'strlen(input_post) < 50'] when "
+        "realloc(input,...) ran between them. Identical-text calls "
+        "across conditions in this list share a variable in the solver "
+        "(textual identity = shared value), so use distinct names "
+        "whenever the value differs. "
         "REQUIRED for memory-corruption CWEs (their analysis is not "
         "complete without it): CWE-119/120/121/122 (buffer overflow — "
         "supply the size-vs-bound predicate), CWE-125/787 (out-of-bounds "
@@ -60,6 +67,12 @@ ANALYSIS_SCHEMA = {
         "wraparound), 'int32' / 'int64' (signed integer paths). REQUIRED "
         "when path_conditions is non-empty; null otherwise."
     ),
+    "is_true_positive": "boolean",
+    "is_exploitable": "boolean",
+    "exploitability_score": "float (0.0-1.0)",
+    "confidence": f"string ({'/'.join(CONFIDENCE_LEVELS)})",
+    "severity_assessment": f"string ({'/'.join(SEVERITY_LEVELS)})",
+    "ruling": f"string ({'/'.join(AGENTIC_RULING_VALUES)})",
 }
 
 # Additional fields when dataflow is available
@@ -75,23 +88,23 @@ DATAFLOW_SCHEMA_FIELDS = {
 # Schema for deep dataflow validation — used by agent.py's validate_dataflow
 DATAFLOW_VALIDATION_SCHEMA = {
     "source_type": "string - type of source (user_input/config/hardcoded/etc)",
-    "source_attacker_controlled": "boolean - can attacker control this source?",
     "source_reasoning": "string - explain why source is or isn't attacker-controlled",
+    "source_attacker_controlled": "boolean - can attacker control this source?",
     "sanitizers_found": "integer - number of sanitizers in the path",
-    "sanitizers_effective": "boolean - do sanitizers prevent exploitation?",
     "sanitizer_details": "list of dicts with keys: name, purpose, bypass_possible, bypass_method",
-    "path_reachable": "boolean - can this code path be reached by attacker?",
+    "sanitizers_effective": "boolean - do sanitizers prevent exploitation?",
     "reachability_barriers": "list of strings - what blocks reaching this path?",
-    "is_exploitable": "boolean - FINAL VERDICT: is this truly exploitable?",
-    "exploitability_confidence": "float (0.0-1.0) - how confident in this assessment?",
+    "path_reachable": "boolean - can this code path be reached by attacker?",
     "exploitability_reasoning": "string - detailed explanation of verdict",
-    "attack_complexity": "string - low/medium/high - difficulty of exploitation",
+    "attack_complexity": {"type": "string", "enum": ["low", "medium", "high"], "description": "difficulty of exploitation"},
     "attack_prerequisites": "list of strings - what attacker needs to succeed",
     "attack_payload_concept": "string - describe what payload would work, or empty if not exploitable",
     "impact_if_exploited": "string - what attacker can achieve",
     "cvss_estimate": "float (0.0-10.0) - severity score",
-    "false_positive": "boolean - is this a false positive?",
     "false_positive_reason": "string - why it's false positive, or empty",
+    "false_positive": "boolean - is this a false positive?",
+    "exploitability_confidence": "float (0.0-1.0) - how confident in this assessment?",
+    "is_exploitable": "boolean - FINAL VERDICT: is this truly exploitable?",
     # SMT path-feasibility hooks — see DATAFLOW_SCHEMA_FIELDS for the
     # full description. Same semantics; carried in the deep-validation
     # output too so the Tier 4 gate sees them whichever LLM call
@@ -103,8 +116,17 @@ DATAFLOW_VALIDATION_SCHEMA = {
         "vs-bound predicate), CWE-476 (null deref — supply 'ptr == NULL'), "
         "CWE-191 (underflow). For ANY OTHER CWE, the correct value is null. "
         "Examples: 'count > 0x10000000', 'alloc_size == count * 16', "
-        "'idx >= buffer_size', 'ptr == NULL'. Z3 uses these to refute "
-        "infeasible findings and to seed /exploit PoCs from witness models."
+        "'idx >= buffer_size', 'ptr == NULL'. "
+        "Emit GUARDS ONLY (Boolean predicates that gate execution); do NOT "
+        "emit program statements / assignments. SSA-rename across mutations: "
+        "if a variable is reassigned between two guards in the path, rename "
+        "later occurrences so the solver doesn't merge pre-mutation and "
+        "post-mutation values into one variable. Z3 treats identical-text "
+        "call subterms (e.g. strlen(s)) as shared across conditions in this "
+        "list, so use distinct names (input_pre / input_post, etc.) whenever "
+        "the value actually differs. "
+        "Z3 uses these to refute infeasible findings and to seed /exploit "
+        "PoCs from witness models."
     ),
     "path_profile": (
         "string or null - bitvector profile: 'uint64' (default — sizes/"
@@ -120,16 +142,6 @@ FINDING_RESULT_SCHEMA = {
     "type": "object",
     "properties": {
         "finding_id": {"type": "string"},
-        "is_true_positive": {"type": "boolean"},
-        "is_exploitable": {"type": "boolean"},
-        "exploitability_score": {
-            "type": "number",
-            "minimum": 0,
-            "maximum": 1,
-        },
-        "confidence": {"type": ["string", "null"], "enum": [*CONFIDENCE_LEVELS, None]},
-        "severity_assessment": {"type": "string"},
-        "ruling": {"type": ["string", "null"]},
         "reasoning": {"type": "string"},
         "attack_scenario": {"type": ["string", "null"]},
         "exploit_code": {"type": ["string", "null"]},
@@ -143,7 +155,22 @@ FINDING_RESULT_SCHEMA = {
         "false_positive_reason": {"type": ["string", "null"]},
         "tool": {"type": ["string", "null"]},
         "rule_id": {"type": ["string", "null"]},
+        "severity_assessment": {"type": "string"},
+        "exploitability_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+        "confidence": {"type": ["string", "null"], "enum": [*CONFIDENCE_LEVELS, None]},
+        # Constrain ruling to the documented enum. Structured-output
+        # providers (Gemini / Anthropic tool-use) honour the enum,
+        # so this forces the LLM to map its thinking to the canonical
+        # vocabulary instead of inventing near-synonyms. ``None``
+        # preserved for the case where the LLM declines to rule.
+        "ruling": {"type": ["string", "null"], "enum": [*AGENTIC_RULING_VALUES, None]},
+        "is_true_positive": {"type": "boolean"},
+        "is_exploitable": {"type": "boolean"},
     },
-    "required": ["finding_id", "is_true_positive", "is_exploitable", "reasoning"],
+    "required": ["finding_id", "reasoning", "is_true_positive", "is_exploitable"],
     "additionalProperties": False,
 }

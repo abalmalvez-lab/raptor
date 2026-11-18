@@ -15,14 +15,29 @@ from pathlib import Path
 import pytest
 
 # .claude/skills/oss-forensics/github-evidence-kit/tests/test_store.py -> .claude/skills/oss-forensics/github-evidence-kit
-sys.path.insert(0, str(Path(__file__).parents[1]))
+from contextlib import nullcontext as _path_nullcontext
+from unittest.mock import patch as _path_patch
+import pytest as _path_pytest
 
-from src import EvidenceStore, EvidenceSource, load_evidence_from_json
+with (_path_patch.object(sys, "path", sys.path.copy())
+      if __name__ != "__main__" else _path_nullcontext()):
+    sys.path.insert(0, str(Path(__file__).parents[1]))
+
+    from src import EvidenceStore, EvidenceSource, load_evidence_from_json
 
 
-# =============================================================================
-# STORE BASIC OPERATIONS
-# =============================================================================
+    # =============================================================================
+    # STORE BASIC OPERATIONS
+    # =============================================================================
+
+
+
+
+@_path_pytest.fixture(autouse=True)
+def _scoped_helper_import_path(monkeypatch):
+    """Keep lazy helper imports available without modifying borrowed path lists."""
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    sys.path.insert(0, str(Path(__file__).parents[1]))
 
 
 class TestEvidenceStoreBasics:
@@ -313,3 +328,101 @@ class TestEvidenceStoreMerge:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestCollisionLoudness:
+    """A same-id add with DIFFERENT content is a keying collision —
+    replacement silently destroys a timeline event, so it must be
+    logged; identical re-ingest stays silent (idempotent)."""
+
+    def _event(self, what: str):
+        from datetime import datetime, timezone
+
+        from src.schema.common import (
+            EvidenceSource,
+            GitHubActor,
+            GitHubRepository,
+            VerificationInfo,
+        )
+        from src.schema.events import Event
+        return Event(
+            evidence_id="EVD-COLLIDE",
+            when=datetime(2024, 1, 15, 10, 30, tzinfo=timezone.utc),
+            who=GitHubActor(login="someone"),
+            what=what,
+            repository=GitHubRepository(owner="o", name="r",
+                                        full_name="o/r"),
+            verification=VerificationInfo(
+                source=EvidenceSource.GHARCHIVE,
+                bigquery_table="githubarchive.day.20240115"),
+        )
+
+    def test_differing_collision_logs_warning(self, caplog):
+        from src.store import EvidenceStore
+        store = EvidenceStore()
+        store.add(self._event("first event"))
+        with caplog.at_level("WARNING", logger="src.store"):
+            store.add(self._event("second, different event"))
+        assert any("collision" in r.message for r in caplog.records)
+
+    def test_identical_reingest_is_silent(self, caplog):
+        from src.store import EvidenceStore
+        store = EvidenceStore()
+        store.add(self._event("same event"))
+        with caplog.at_level("WARNING", logger="src.store"):
+            store.add(self._event("same event"))
+        assert not caplog.records
+        assert len(store) == 1
+
+
+# =============================================================================
+# CORROBORATION GAPS
+# =============================================================================
+
+
+class TestCorroborationGaps:
+    """EvidenceStore.corroboration_gaps() surfaces single-sourced commits."""
+
+    @staticmethod
+    def _commit(eid, sha, source):
+        from src.schema.observations import CommitObservation, CommitAuthor
+        from src.schema.common import VerificationInfo
+        now = datetime.now(timezone.utc)
+        author = CommitAuthor(name="T", email="t@t.com", date=now)
+        return CommitObservation(
+            evidence_id=eid,
+            observed_when=now,
+            observed_by=source,
+            observed_what="commit",
+            verification=VerificationInfo(source=source),
+            sha=sha,
+            message="m",
+            author=author,
+            committer=author,
+        )
+
+    def test_dual_sourced_commit_has_no_gap(self):
+        store = EvidenceStore([
+            self._commit("commit-aaa", "a" * 40, EvidenceSource.GITHUB),
+            self._commit("commit-git-aaa", "a" * 40, EvidenceSource.GIT),
+        ])
+        assert store.corroboration_gaps() == []
+
+    def test_single_sourced_commit_is_a_gap(self):
+        store = EvidenceStore([
+            self._commit("commit-bbb", "b" * 40, EvidenceSource.GITHUB),
+        ])
+        gaps = store.corroboration_gaps()
+        assert len(gaps) == 1
+        assert gaps[0]["sha"] == "b" * 40
+        assert gaps[0]["sources"] == ["github"]
+
+    def test_mixed_store(self):
+        store = EvidenceStore([
+            self._commit("commit-aaa", "a" * 40, EvidenceSource.GITHUB),
+            self._commit("commit-git-aaa", "a" * 40, EvidenceSource.GIT),
+            self._commit("commit-bbb", "b" * 40, EvidenceSource.GITHUB),
+        ])
+        gaps = store.corroboration_gaps()
+        assert len(gaps) == 1
+        assert gaps[0]["sha"] == "b" * 40

@@ -1,0 +1,191 @@
+"""Joern CPG integration — inter-procedural dataflow analysis.
+
+Public API:
+    from packages.joern import build_cpg, run_query, run_taint_query
+    from packages.joern import JoernCPG, TaintFlow, FlowStep, JoernResult
+
+    cpg = build_cpg(Path("/src"))
+    flows = run_taint_query(cpg, "parse_header", "memcpy")
+    cleanup_cpg(cpg)
+
+Cross-tool session:
+    from packages.joern import joern_session
+
+    with joern_session(target_path, cache_dir=project_dir) as srv:
+        # srv is a JoernServer with CPG loaded, or None if unavailable
+        ...
+"""
+
+import contextlib
+import logging
+from pathlib import Path
+from collections.abc import Iterator
+
+from .models import FlowStep, JoernCPG, JoernMethodSummary, JoernResult, TaintFlow
+from .prereqs import check_prereqs, is_available, version
+from .runner import build_cpg, build_cpg_cached, cleanup_cpg, run_query, run_taint_query
+from .client import GraphClient as JoernServer
+from .tunables import JoernTunables
+
+_logger = logging.getLogger(__name__)
+
+__all__ = [
+    "FlowStep",
+    "JoernCPG",
+    "JoernMethodSummary",
+    "JoernResult",
+    "JoernServer",
+    "TaintFlow",
+    "build_cpg",
+    "check_prereqs",
+    "cleanup_cpg",
+    "is_available",
+    "joern_session",
+    "run_query",
+    "run_taint_query",
+    "version",
+]
+
+
+def _release_session_resources(srv, cpg, cache_dir, reach_token, *, preserve_error=False):
+    """Attempt every teardown without replacing a session's original error."""
+    actions = []
+    if reach_token is not None:
+        def reset_reach():
+            try:
+                from core.analysis.reach_audit import reset_joern_server
+            except ImportError:
+                return
+            reset_joern_server(reach_token)
+        actions.append(reset_reach)
+    actions.append(srv.stop)
+    if cpg is not None and (cache_dir is None or cpg.owned_dir is not None):
+        actions.append(lambda: cleanup_cpg(cpg))
+    first_error = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            _logger.warning("Joern session teardown failed", exc_info=True)
+            if first_error is None:
+                first_error = exc
+    if first_error is not None and not preserve_error:
+        raise first_error
+
+
+@contextlib.contextmanager
+def joern_session(
+    target_path: Path,
+    *,
+    cache_dir: Path | None = None,
+    tunables: JoernTunables | None = None,
+    register_reach_audit: bool = True,
+    exclude_dirs: tuple[str, ...] = (),
+    scope_exclude_dirs: tuple[str, ...] = (),
+) -> Iterator[JoernServer | None]:
+    """Context manager for a cross-tool Joern session.
+
+    ``exclude_dirs``: freshness-neutral run-artifact exclusions (a
+    run's output dir inside the target). ``scope_exclude_dirs``: the
+    caller's scope COMPLEMENT — semantic coverage exclusions that key
+    the CPG cache slot (see
+    :func:`packages.joern.runner.build_cpg_cached`).
+
+    Boots a Joern server, builds/loads the CPG, imports it into
+    the server, and optionally registers the server with
+    ``core.analysis.reach_audit`` so ``classify_reachability``
+    can resolve indirect callers.
+
+    Yields the server (or None if Joern is unavailable). Always
+    cleans up on exit.
+
+    Usage::
+
+        with joern_session(target, cache_dir=project_dir) as srv:
+            if srv:
+                result = srv.query("cpg.method.l")
+    """
+    if not is_available():
+        yield None
+        return
+
+    if tunables is None:
+        tunables = JoernTunables.from_tuning()
+
+    srv = JoernServer.from_tunables(tunables)
+    try:
+        srv.start()
+    except Exception:
+        _logger.debug("Joern server failed to start", exc_info=True)
+        yield None
+        return
+
+    cpg = None
+    reach_token = None
+    failed = False
+    try:
+        # Pin the joern-parse frontend from the curated per-language
+        # profiles rather than trusting parse-side auto-detection.
+        from .lang_config import parse_languages_for
+        parse_langs = parse_languages_for(str(target_path))
+        # heap_mb reaches BOTH JVMs: the query server above
+        # (from_tunables) and the joern-parse frontend here — on large
+        # targets the parse JVM is exactly where the operator's
+        # joern_heap_mb matters; omitting it left big builds
+        # GC-thrashing at the JVM default while the setting silently
+        # applied only to the server.
+        # A derived ("auto") CPG timeout resolves HERE, where the
+        # target is known — from_tuning only holds the unknown-scope
+        # fallback.
+        from .tunables import resolve_cpg_timeout_s
+        combined_excludes = tuple(exclude_dirs) + tuple(scope_exclude_dirs)
+        build_timeout = resolve_cpg_timeout_s(
+            tunables, target_path, exclude_dirs=combined_excludes,
+        )
+        if cache_dir is not None:
+            cpg = build_cpg_cached(
+                target_path, cache_dir,
+                languages=parse_langs,
+                timeout=build_timeout,
+                heap_mb=tunables.heap_mb,
+                heap_is_derived=tunables.heap_is_derived,
+                exclude_dirs=exclude_dirs,
+                scope_exclude_dirs=scope_exclude_dirs,
+            )
+        else:
+            cpg = build_cpg(
+                target_path,
+                languages=parse_langs,
+                timeout=build_timeout,
+                heap_mb=tunables.heap_mb,
+                heap_is_derived=tunables.heap_is_derived,
+                # No cache slot to key on the uncached path — scope
+                # exclusions still shape the graph (analysis parity).
+                exclude_dirs=combined_excludes,
+            )
+        if not cpg.exists() or getattr(cpg, "build_failed", False):
+            yield None
+            return
+        if cpg.exists():
+            from .client import GraphClient
+            if isinstance(srv, GraphClient):
+                if cpg.build_failed or not srv.bind_graph(cpg, timeout=tunables.import_timeout_s):
+                    yield None
+                    return
+            elif not srv.import_cpg(cpg.path, timeout=tunables.import_timeout_s):
+                yield None
+                return
+
+        if register_reach_audit:
+            try:
+                from core.analysis.reach_audit import set_joern_server
+                reach_token = set_joern_server(srv)
+            except ImportError:
+                pass
+
+        yield srv
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        _release_session_resources(srv, cpg, cache_dir, reach_token, preserve_error=failed)

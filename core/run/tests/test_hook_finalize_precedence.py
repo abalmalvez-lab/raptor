@@ -1,0 +1,479 @@
+"""Stamping precedence between heuristic finalisers and a run's own.
+
+The lifecycle hook's Stop path judges a run it did not start: it infers
+"the tool call ended" from the recorded worker credential reading dead,
+then finalizes. When that inference is wrong — the run is mid-flight —
+its stamp used to be indistinguishable from a real verdict, so the
+terminal guard in ``_update_status`` refused the owner's genuine
+``fail_run``/``complete_run`` and the heuristic verdict stood forever
+(observed as a failed scan permanently reading Completed).
+
+These tests pin the adjudicated precedence rule:
+
+* real vs real           — first writer wins (the terminal guard);
+* heuristic vs real      — the REAL verdict wins regardless of order;
+* heuristic vs heuristic — first writer wins (the no-op clause).
+
+``TestForcedDeadWorkerWindow`` forces the misjudged-liveness window
+deterministically with real machinery: a subprocess whose recorded
+worker parent is made to die after ``start_run`` records it, so the
+hook's REAL liveness check (no patching) reads the worker dead while
+the run is, by construction, still in flight.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from core.json import load_json, save_json
+from core.run.metadata import (
+    RUN_METADATA_FILE,
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    complete_run,
+    fail_run,
+    cancel_run,
+    worker_liveness_for_meta,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[3]  # core/run/tests/ → raptor/
+HOOK_SCRIPT = REPO_ROOT / "libexec" / "raptor-lifecycle-hook"
+
+# Import the hook module despite its hyphenated filename and missing .py ext.
+_loader = importlib.machinery.SourceFileLoader(
+    "lifecycle_hook_precedence", str(HOOK_SCRIPT))
+_spec = importlib.util.spec_from_loader(
+    "lifecycle_hook_precedence", _loader, origin=str(HOOK_SCRIPT))
+_hook_mod = importlib.util.module_from_spec(_spec)
+_hook_mod.__file__ = str(HOOK_SCRIPT)
+_spec.loader.exec_module(_hook_mod)
+
+FAILURE_MARKER = _hook_mod.FAILURE_MARKER
+SESSION_PID = 99999
+
+#: An aged start timestamp: past the Stop path's freshness floor, so
+#: the hook's judgement is gated only by worker liveness.
+_AGED_TS = "2026-05-03T12:00:00+00:00"
+
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path):
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    with pytest.MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, tmp_path)
+        data_home = tmp_path / "data"
+        data_home.mkdir(exist_ok=True)
+        patch.setenv("XDG_DATA_HOME", str(data_home))
+        patch.delenv("_RAPTOR_SCRATCH_AUTH", raising=False)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(_user_state_in_tmp):
+    """Undo body patches before restoring the file-owned registry pins."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
+def _make_running_run(parent: Path, name: str, command: str = "scan",
+                      session_pid: int = SESSION_PID,
+                      tool_pid: int = 11111,
+                      timestamp: str = _AGED_TS) -> Path:
+    d = parent / name
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "version": 1,
+        "command": command,
+        "timestamp": timestamp,
+        "status": STATUS_RUNNING,
+        "extra": {},
+        "session_pid": session_pid,
+        "tool_pid": tool_pid,
+    }
+    save_json(d / RUN_METADATA_FILE, meta)
+    return d
+
+
+def _meta(d: Path) -> dict:
+    return load_json(d / RUN_METADATA_FILE)
+
+
+def _status(d: Path) -> str:
+    return _meta(d).get("status")
+
+
+def _extra(d: Path) -> dict:
+    return _meta(d).get("extra") or {}
+
+
+def _run_stop_hook(tmp: Path) -> None:
+    """Fire the hook's Stop path against *tmp* as the repo root.
+
+    Only session identity is patched — worker liveness is the REAL
+    check, so a test reaching a finalization proves the recorded
+    credential genuinely read dead.
+    """
+    with patch.object(_hook_mod, "REPO_ROOT", tmp), \
+         patch("core.run.metadata._get_session_pid",
+               return_value=SESSION_PID):
+        with patch.object(sys, "argv", ["hook", "stop"]):
+            _hook_mod.main()
+
+
+# Subprocess B: performs a REAL start_run, recording its parent (A) as
+# the worker credential (tool_pid + tool_pid_start).
+_STARTER_CHILD = """\
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from unittest.mock import patch
+from core.run.metadata import start_run
+# The fixture exercises the parent fallback, never the host's ancestors.
+with patch("core.project.sessions._walk_session_pid", return_value=None):
+    start_run(Path(sys.argv[2]), "scan")
+"""
+
+# Subprocess A: spawns B, waits for B's start_run to finish, then
+# exits — so the credential B recorded (A) dies AFTER it was recorded
+# while the run itself is still in flight. (A parent that dies BEFORE
+# start_run never becomes the credential: the worker stamp's pid<=1
+# clause records the calling process itself instead.)
+_TRANSIENT_PARENT = """\
+import subprocess
+import sys
+subprocess.run(
+    [sys.executable, "-c", %r, sys.argv[1], sys.argv[2]],
+    check=True, timeout=120,
+)
+""" % _STARTER_CHILD
+
+
+class TestForcedDeadWorkerWindow(unittest.TestCase):
+    """Deterministically force the Stop path's dead-worker window
+    and pin the precedence outcome in both orderings.
+
+    Stop only acts when a failure marker is present; without one, the
+    run is UNKNOWN (dead worker could be OOM/kill) and stays running
+    for SessionEnd or the next start_run sweep. With a marker, Stop
+    stamps ``failed`` with ``hook_finalize`` — a heuristic that the
+    owner's real finaliser can override via the recovery clause.
+    """
+
+    def _start_run_with_dead_worker(self, tmp: Path) -> Path:
+        """REAL ``start_run`` whose recorded worker credential is dead
+        by the time this returns."""
+        from core.testing.processes import reap_on_exit
+        from core.testing.standalone_cli import standalone_cli_env
+
+        run = tmp / "out" / "scan-001"
+        env = dict(os.environ, CLAUDECODE="1", RAPTOR_CALLER_DIR=str(tmp))
+        env.pop("RAPTOR_LAUNCH_TARGET", None)
+        # Parent and child retain the file fixture's data directory after
+        # the child's standalone HOME and launch context have gone away.
+        with standalone_cli_env(env=env, data_home=os.environ["XDG_DATA_HOME"]) as child_env:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _TRANSIENT_PARENT,
+                 str(REPO_ROOT), str(run)],
+                env=child_env, cwd=str(tmp), process_group=0,
+            )
+            with reap_on_exit(proc, process_group=True):
+                proc.wait(timeout=120)
+                self.assertEqual(proc.returncode, 0)
+
+        meta = _meta(run)
+        # The window is REAL: the recorded worker (the transient
+        # parent) is dead, and the unpatched liveness check says so.
+        self.assertEqual(meta.get("status"), STATUS_RUNNING)
+        self.assertEqual(meta.get("tool_pid"), proc.pid)
+        alive, _detail = worker_liveness_for_meta(meta)
+        self.assertFalse(alive)
+
+        # Re-key the run to the test's session identity and age it
+        # past the freshness floor — the floor is a separate defence
+        # pinned in TestStopFreshnessFloor; here the window itself is
+        # under test.
+        meta["session_pid"] = SESSION_PID
+        meta["timestamp"] = _AGED_TS
+        save_json(run / RUN_METADATA_FILE, meta)
+        return run
+
+    def test_stop_skips_without_marker(self):
+        # No failure marker → Stop leaves the run in RUNNING.
+        # The owner's real fail_run then works on STATUS_RUNNING
+        # directly — no precedence issue.
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = self._start_run_with_dead_worker(tmp)
+
+            _run_stop_hook(tmp)
+            self.assertEqual(_status(run), STATUS_RUNNING)
+
+            fail_run(run, "exit code 3")
+            self.assertEqual(_status(run), STATUS_FAILED)
+            extra = _extra(run)
+            self.assertEqual(extra.get("error"), "exit code 3")
+            self.assertNotIn("hook_finalize", extra)
+
+    def test_hook_stamps_failed_with_marker_owner_complete_supersedes(self):
+        # With a failure marker: Stop stamps failed (hook_finalize),
+        # but the run was actually live and completes — the recovery
+        # clause lets the real complete_run supersede.
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = self._start_run_with_dead_worker(tmp)
+            (run / FAILURE_MARKER).write_text("")
+
+            _run_stop_hook(tmp)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            self.assertIs(_extra(run).get("hook_finalize"), True)
+
+            complete_run(run)
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            self.assertNotIn("hook_finalize", _extra(run))
+
+    def test_owner_fail_first_hook_noops(self):
+        # Reverse ordering: the real verdict landed first; the hook
+        # must leave it alone entirely.
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = self._start_run_with_dead_worker(tmp)
+
+            fail_run(run, "exit code 3")
+            self.assertEqual(_status(run), STATUS_FAILED)
+
+            _run_stop_hook(tmp)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            extra = _extra(run)
+            self.assertEqual(extra.get("error"), "exit code 3")
+            self.assertNotIn("hook_finalize", extra)
+
+    def test_hook_fails_with_marker_owner_fail_supersedes(self):
+        # With a failure marker: Stop stamps failed (hook_finalize),
+        # then the owner's real fail_run supersedes with a different
+        # error — the recovery clause lets the real verdict win.
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = self._start_run_with_dead_worker(tmp)
+            (run / FAILURE_MARKER).write_text("")
+
+            _run_stop_hook(tmp)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            self.assertIs(_extra(run).get("hook_finalize"), True)
+
+            fail_run(run, "exit code 3")
+            self.assertEqual(_status(run), STATUS_FAILED)
+            extra = _extra(run)
+            self.assertEqual(extra.get("error"), "exit code 3")
+            self.assertNotIn("hook_finalize", extra)
+
+
+class TestPrecedenceMatrix(unittest.TestCase):
+    """The adjudicated precedence rule, pinned in both directions for
+    each pairing (heuristic writes use the same call shapes the hook
+    and the abandon sweeps use)."""
+
+    def _running(self, tmp: str) -> Path:
+        return _make_running_run(Path(tmp) / "out", "scan-001")
+
+    # heuristic vs real: real wins regardless of order -----------------
+
+    def test_heuristic_complete_then_real_fail(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            complete_run(run, extra={"hook_finalize": True})
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            fail_run(run, "exit code 1")
+            self.assertEqual(_status(run), STATUS_FAILED)
+            extra = _extra(run)
+            self.assertEqual(extra.get("error"), "exit code 1")
+            self.assertNotIn("hook_finalize", extra)
+
+    def test_real_fail_then_heuristic_complete(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            fail_run(run, "exit code 1")
+            complete_run(run, extra={"hook_finalize": True})
+            self.assertEqual(_status(run), STATUS_FAILED)
+            extra = _extra(run)
+            self.assertEqual(extra.get("error"), "exit code 1")
+            self.assertNotIn("hook_finalize", extra)
+
+    def test_heuristic_fail_then_real_complete(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            fail_run(run, "tool exited with error",
+                     extra={"hook_finalize": True})
+            self.assertEqual(_status(run), STATUS_FAILED)
+            complete_run(run)
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            extra = _extra(run)
+            self.assertNotIn("hook_finalize", extra)
+            # The heuristic's error must not contaminate the real
+            # outcome.
+            self.assertNotIn("error", extra)
+
+    def test_real_complete_then_heuristic_fail(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            complete_run(run)
+            fail_run(run, "tool exited with error",
+                     extra={"hook_finalize": True})
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            self.assertNotIn("hook_finalize", _extra(run))
+
+    def test_heuristic_fail_then_real_fail_consumes_marker(self):
+        # Same-status refail lane: the real failure supersedes the
+        # heuristic one — marker consumed, error refreshed — so a later
+        # stray complete_run cannot launder the genuine failure.
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            fail_run(run, "tool exited with error",
+                     extra={"hook_finalize": True})
+            fail_run(run, "exit code 3")
+            self.assertEqual(_status(run), STATUS_FAILED)
+            extra = _extra(run)
+            self.assertEqual(extra.get("error"), "exit code 3")
+            self.assertNotIn("hook_finalize", extra)
+            complete_run(run)
+            self.assertEqual(_status(run), STATUS_FAILED)
+
+    def test_real_cancel_overrides_heuristic_complete(self):
+        # The rule covers every real finaliser, not just fail_run.
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            complete_run(run, extra={"hook_finalize": True})
+            cancel_run(run)
+            self.assertEqual(_status(run), STATUS_CANCELLED)
+            self.assertNotIn("hook_finalize", _extra(run))
+
+    # real vs real: first writer wins (unchanged) ----------------------
+
+    def test_real_complete_then_real_fail(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            complete_run(run)
+            fail_run(run, "late failure")
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+
+    def test_real_fail_then_real_complete(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            fail_run(run, "exit code 1")
+            complete_run(run)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            self.assertEqual(_extra(run).get("error"), "exit code 1")
+
+    # heuristic vs heuristic: first writer wins ------------------------
+
+    def test_heuristic_complete_then_sweep_fail(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            complete_run(run, extra={"hook_finalize": True})
+            fail_run(run, "session ended without explicit completion",
+                     extra={"abandon_sweep": True})
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            extra = _extra(run)
+            # The loser's marker/error must not be merged in.
+            self.assertNotIn("abandon_sweep", extra)
+            self.assertNotIn("error", extra)
+
+    def test_sweep_fail_then_heuristic_complete(self):
+        with TemporaryDirectory() as tmp:
+            run = self._running(tmp)
+            fail_run(run, "session ended without explicit completion",
+                     extra={"abandon_sweep": True})
+            complete_run(run, extra={"hook_finalize": True})
+            self.assertEqual(_status(run), STATUS_FAILED)
+            self.assertIs(_extra(run).get("abandon_sweep"), True)
+
+
+class TestStopFreshnessFloor(unittest.TestCase):
+    """The Stop path does not judge a run younger than the abandon
+    freshness floor — the misjudged-liveness inference is at its
+    weakest right after start, when the run's own finaliser is
+    typically milliseconds away."""
+
+    def _stop(self, tmp: str) -> None:
+        with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
+             patch("core.run.metadata._get_session_pid",
+                   return_value=SESSION_PID), \
+             patch("core.run.metadata._pid_alive", return_value=False):
+            with patch.object(sys, "argv", ["hook", "stop"]):
+                _hook_mod.main()
+
+    def test_young_run_is_left_alone(self):
+        with TemporaryDirectory() as tmp:
+            now = datetime.now(timezone.utc).isoformat()
+            run = _make_running_run(Path(tmp) / "out", "scan-001",
+                                    tool_pid=1, timestamp=now)
+            self._stop(tmp)
+            self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_aged_run_without_marker_stays_running(self):
+        with TemporaryDirectory() as tmp:
+            run = _make_running_run(Path(tmp) / "out", "scan-001",
+                                    tool_pid=1)
+            self._stop(tmp)
+            self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_aged_run_is_finalized_with_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = _make_running_run(Path(tmp) / "out", "scan-001",
+                                    tool_pid=1)
+            (run / FAILURE_MARKER).write_text("")
+            self._stop(tmp)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            self.assertIs(_extra(run).get("hook_finalize"), True)
+
+    def test_unparseable_timestamp_with_marker_is_finalized(self):
+        # Fail direction: a corrupt/missing/future stamp is NOT young —
+        # the hook passes the freshness gate. With a failure marker,
+        # Stop finalizes; without one, SessionEnd or start_run sweep
+        # catches the run.
+        for ts in ("not-a-timestamp", None,
+                   (datetime.now(timezone.utc)
+                    + timedelta(hours=1)).isoformat()):
+            with TemporaryDirectory() as tmp:
+                run = _make_running_run(Path(tmp) / "out", "scan-001",
+                                        tool_pid=1)
+                (run / FAILURE_MARKER).write_text("")
+                meta = _meta(run)
+                if ts is None:
+                    meta.pop("timestamp", None)
+                else:
+                    meta["timestamp"] = ts
+                save_json(run / RUN_METADATA_FILE, meta)
+                self._stop(tmp)
+                self.assertEqual(
+                    _status(run), STATUS_FAILED,
+                    f"timestamp {ts!r} was not finalized despite marker")
+
+    def test_too_young_to_judge_boundaries(self):
+        fn = _hook_mod._too_young_to_judge
+        now = datetime.now(timezone.utc)
+        self.assertTrue(fn({"timestamp": now.isoformat()}))
+        self.assertFalse(
+            fn({"timestamp": (now - timedelta(minutes=5)).isoformat()}))
+        self.assertFalse(
+            fn({"timestamp": (now + timedelta(minutes=5)).isoformat()}))
+        self.assertFalse(fn({"timestamp": "garbage"}))
+        self.assertFalse(fn({"timestamp": 12345}))
+        self.assertFalse(fn({}))
+
+
+if __name__ == "__main__":
+    unittest.main()

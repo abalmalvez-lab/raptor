@@ -19,22 +19,23 @@ from unittest.mock import patch
 
 import pytest
 
-try:
+if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-except IndexError:                                      # pragma: no cover
-    pass
 
-from core.security.codeql_trust import _scan_cached, set_trust_override
+from core.security.codeql_trust import set_trust_override
 from packages.codeql.database_manager import DatabaseManager
 
 
 @pytest.fixture(autouse=True)
-def _clear_trust_state():
-    _scan_cached.cache_clear()
-    set_trust_override(False)
-    yield
-    _scan_cached.cache_clear()
-    set_trust_override(False)
+def _clear_trust_state(monkeypatch):
+    from core.security import codeql_trust as trust
+    from core.testing.module_state import isolated_module_state
+
+    with isolated_module_state(trust, {"_trust_override_set": False}):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
 
 
 def _unsafe_target(tmp_path: Path) -> Path:
@@ -73,11 +74,12 @@ def test_unsafe_target_refused_without_trust_repo(tmp_path):
     assert result.database_path is None
     # The error string steers the operator at the right escape hatch.
     assert any("--trust-repo" in e for e in result.errors)
+    assert any("failed the CodeQL trust check" in e for e in result.errors)
     # And the codeql CLI specifically wasn't invoked — metadata-related
     # subprocess calls (e.g. git rev-parse for repo-hash) happen later
     # in the flow, after the trust gate fires.
     assert "codeql" not in " ".join(result.errors).lower() or \
-        "unsafe CodeQL pack" in " ".join(result.errors)
+        "failed the CodeQL trust check" in " ".join(result.errors)
 
 
 def test_unsafe_target_proceeds_with_trust_override(tmp_path):
@@ -98,9 +100,24 @@ def test_unsafe_target_proceeds_with_trust_override(tmp_path):
         result = dm.create_database(target, "python")
 
     # Trust gate didn't refuse — the cached-DB short-circuit returned
-    # success; the unsafe-pack-config error must NOT be in errors.
-    assert not any("unsafe CodeQL pack config" in e for e in result.errors)
+    # success; the trust-check refusal error must NOT be in errors.
+    assert not any("failed the CodeQL trust check" in e for e in result.errors)
     assert result.success is True
+
+
+def test_unexaminable_target_refused_with_lane_covering_message(tmp_path):
+    """The refusal string must cover BOTH gate lanes: a target the
+    checker cannot stat refuses with the same operator steering as a
+    dangerous-config block (the stdout diagnostic carries the lane
+    detail)."""
+    dm = _dm(tmp_path)
+
+    result = dm.create_database(tmp_path / "does-not-exist", "python")
+
+    assert result.success is False
+    assert any("failed the CodeQL trust check" in e for e in result.errors)
+    assert any("could not be examined" in e for e in result.errors)
+    assert any("--trust-repo" in e for e in result.errors)
 
 
 def test_safe_target_does_not_short_circuit_at_trust_gate(tmp_path):

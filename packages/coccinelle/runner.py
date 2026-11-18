@@ -6,25 +6,430 @@ rules to emit structured COCCIRESULT lines on stdout that we parse here.
 For rules that already contain their own Python scripting (human-authored
 static rules), we parse their output directly. For rules without scripting,
 we wrap them with a reporting harness.
+
+Trust posture: rules with their own scripting blocks execute code inside
+spatch, so they only run when the caller passes ``allow_scripting=True``
+(reserved for in-repo, code-trust rules). Untrusted / LLM-synthesised
+rules keep the default False and are refused with a structured error;
+they rely on the injected harness instead. The default subprocess runner
+routes spatch through core.sandbox with network blocked.
 """
 
+import functools
 import json
+import fnmatch
+import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable, Iterable, Iterator
+from itertools import chain, groupby
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any
 
+from core.analysis.coccinelle_metadata import (
+    RULE_MAX_BYTES as _RULE_MAX_BYTES,
+    emitted_rule_ids as _emitted_rule_ids,
+)
+from core.analysis.rule_versions import VersionProbeCache, rule_version_refusal, version_tuple as _release_version
 from core.config import RaptorConfig
+from core.run.scratch import scratch_dir
+from core.run.toolprobe import probe
+from core.security.log_sanitisation import escape_nonprintable
+from core.source import ReadBudgetExceededError, read_text_gated
+from core.source.lines import iter_splitlines
 
 from .models import SpatchMatch, SpatchResult
+
+logger = logging.getLogger(__name__)
 
 RESULT_PREFIX = "COCCIRESULT:"
 _SPATCH_BIN = "spatch"
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _make_nonce() -> str:
+    """Per-invocation evidence nonce for the COCCIRESULT marker.
+
+    spatch's transform/context diff output re-emits UNMODIFIED source
+    lines from the scanned file, and hostile source can therefore plant
+    a literal ``COCCIRESULT:{...}`` line that reaches our stdout parse
+    (U14-F2: attacker-chosen file/line/rule minted as a verified
+    SpatchMatch, PoC'd through an ``#if 0`` block). Every invocation
+    now rewrites the rule's emit sites to ``COCCIRESULT-<nonce>:`` and
+    the parser accepts ONLY that marker. The nonce is generated after
+    the scanned repo was authored, so no repo content can carry it;
+    a bare or wrong-nonce marker line is rejected and logged as an
+    attack signal.
+    """
+    return secrets.token_hex(16)
+
+
+def _nonced_prefix(nonce: str) -> str:
+    return f"COCCIRESULT-{nonce}:"
+
+# Position-metavariable names that we refuse to inject into the
+# @script:python@ harness — they'd shadow Python builtins / keywords
+# or our own scratch identifiers (``_p``, ``_m``), confusing the
+# embedded interpreter or enabling unexpected behaviour from a
+# hostile .cocci rule. The dunder-prefix check above this set
+# catches ``__import__`` / ``__builtins__`` etc. without enumeration.
+_COCCI_POS_VAR_DENY = frozenset({
+    # Python keywords
+    "True", "False", "None", "if", "else", "elif", "for", "while",
+    "import", "from", "as", "def", "class", "return", "yield",
+    "lambda", "try", "except", "finally", "raise", "with", "pass",
+    "break", "continue", "global", "nonlocal", "assert", "in", "is",
+    "not", "and", "or",
+    # Harness-scope locals
+    "json", "sys", "_p", "_m",
+    # Common shadow-the-builtin foot-guns
+    "int", "str", "bytes", "open", "type", "list", "dict", "set",
+    "tuple", "object", "print", "id", "input", "exec", "eval",
+    "compile", "globals", "locals", "vars", "getattr", "setattr",
+    "hasattr", "delattr",
+})
+
+# SmPL scripting constructs. `@script:python@`, `@script:ocaml@`,
+# `@initialize:python@`, and `@finalize:python@` blocks execute code
+# inside the spatch process, and the script *constraint* form
+# (`identifier i : script:python { ... }`, no `@`-header at all) does
+# the same on the newer Coccinelle grammars that accept it. An
+# LLM-synthesised or otherwise untrusted rule carrying any of them is
+# a code-execution vector, not a pattern.
+#
+# The gate judges the rule the way spatch's LEXER does, not the way
+# the raw bytes read. spatch skips /*...*/ and //-to-EOL comments
+# anywhere — including inside a rule header (`@/*c*/script:python@`
+# runs its script payload on spatch 1.3; python and ocaml both
+# probed), spanning lines, between the keyword and the colon
+# (`@script/*c*/:python@`), and after it — and accepts any
+# whitespace (newline, CR, FF, tab) between `@` and the keyword and
+# spaces around the `:`. The matcher therefore runs over
+# _lexical_scan() — comments replaced by whitespace, string/char-
+# literal contents blanked — and matches the bare keyword+colon.
+#
+# The matcher is deliberately WIDER than the probed executable set:
+# no line anchoring and no `@` requirement, so it also refuses the
+# script-constraint form (`identifier i : script:python { ... }`,
+# accepted by newer Coccinelle grammars, no `@`-header at all),
+# mid-line headers, and keywords a laxer parser might lex out of
+# positions spatch 1.3 rejects. On the untrusted paths every
+# widening only refuses more.
+#
+# Fail direction: every raw-text/lexer divergence is tuned to refuse
+# MORE, never less — a wrongly refused untrusted rule costs one LLM
+# retry; a wrongly admitted rule is code execution inside spatch plus
+# COCCIRESULT evidence forgery. A comment merely *mentioning*
+# "@script:python" still does not trip the gate (comments are
+# stripped first — inert for spatch too), and neither does the
+# marker inside a SAME-LINE string literal (blanked; probed: spatch
+# agrees on the same-line close and never runs a header out of one).
+# Strings and char constants WITHOUT a same-line close are a
+# different matter — spatch lexes those across newlines — and refuse
+# as ambiguous instead (see _lexical_scan). RAPTOR's own reporting
+# harness is appended by _inject_harness AFTER the gate and is
+# exempt by construction.
+_SCRIPT_BLOCK_RE = re.compile(
+    r"\b(?:script|initialize|finalize)\s*:",
+    re.IGNORECASE,
+)
+
+# Lifecycle blocks export interpreter state across script rules. Separate
+# rule files must not acquire a shared initialization/finalization scope.
+_LIFECYCLE_BLOCK_RE = re.compile(r"\b(?:initialize|finalize)\s*:", re.IGNORECASE)
+
+# Longest span a single quote may open as a char literal in
+# _lexical_scan before the gate refuses to classify it. Real C/SmPL
+# char literals are tiny ('x', '\n', '\x41'). A quote pair LONGER
+# than the cap on one line is a multi-char constant — spatch lexes it
+# as ONE token, so demoting the quote to a stray character would let
+# the literal's CONTENT reach the comment scanner (an embedded /*
+# would open a phantom comment and truncate a live script header out
+# of the gate's view). Ambiguous over-cap literals are therefore
+# REFUSED outright on untrusted paths (refuse-more; costs one LLM
+# retry), never demoted.
+_CHAR_LITERAL_CAP = 11  # MUST stay < len("script:ocaml") — pinned by test
+
+
+def _lexical_scan_uncached(
+    text: str, char_literal_cap: int,
+) -> tuple[str, bool]:
+    """Normalise SmPL rule text the way spatch's lexer sees it.
+
+    Returns ``(view, ambiguous)``. ``view`` is the text with comments
+    (``/*...*/`` and ``//`` to end-of-line) turned into whitespace
+    and string/char-literal CONTENTS blanked (the quotes stay);
+    length-preserving except for stripped comments. ``ambiguous`` is
+    True when the text contains quoting the scanner refuses to
+    classify — spatch can lex a quoted span WIDER than this view in
+    three shapes, and each would hand live-looking text (embedded
+    ``/*`` comment openers included) to the comment stripper,
+    opening a phantom comment that truncates a following script
+    header out of the gate's sight while spatch sees no comment at
+    all:
+
+    - a ``'`` pair closing on the same line but only BEYOND
+      ``_CHAR_LITERAL_CAP`` (a multi-char constant, one token for
+      spatch);
+    - a ``'`` with no same-line close when ANY later ``'`` exists
+      (spatch lexes a char constant ACROSS newlines to it);
+    - a ``"`` with no same-line close — raw newline OR backslash
+      continuation — when any later ``"`` exists (spatch lexes a
+      string literal across both).
+
+    All three refuse. The only demoted quotes are truly unpairable
+    ones (last quote of their kind in the text): probed inert on
+    spatch 1.3 — it consumes to EOF hunting the close and executes
+    nothing, even when the swallowed tail is independently
+    executable.
+
+    Divergences from the real lexer are deliberately refuse-more:
+
+    - an unterminated ``/*`` truncates the rest (probed: spatch
+      lexes nothing after it either, so nothing hidden there can
+      execute);
+    - a same-line-closed quote pair is blanked — for ``'`` the cap
+      keeps any hidden span shorter than the shortest executable
+      scripting spelling, and for ``"`` spatch agrees on the
+      same-line close (escape handling probed) and never runs a
+      header out of a same-line string.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    ambiguous = False
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            out.append(" ")
+            if end == -1:
+                break
+            i = end + 2
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i + 2)
+            out.append(" ")
+            if nl == -1:
+                break
+            i = nl  # keep the newline itself
+            continue
+        if c == '"':
+            end = -1
+            j = i + 1
+            while j < n:
+                ch = text[j]
+                if ch == "\\":
+                    if j + 1 < n and text[j + 1] == "\n":
+                        # Backslash continuation: no same-line close.
+                        break
+                    j += 2
+                    continue
+                if ch == '"':
+                    end = j
+                    break
+                if ch == "\n":
+                    break
+                j += 1
+            if end == -1:
+                # No same-line close — whether the scan stopped at a
+                # raw newline or a backslash continuation. spatch
+                # lexes a string literal ACROSS both to a later close
+                # quote (probed: rules with either shape parse and
+                # run), so everything between is one token for spatch
+                # while it would stay LIVE in this view — an embedded
+                # /* on the continuation line would open a phantom
+                # comment and truncate a following script header out
+                # of the gate's sight. Refuse whenever any later
+                # quote exists to pair with; only a quote with
+                # nothing left to pair against is a plain character
+                # (probed inert: spatch consumes to EOF hunting the
+                # close and executes nothing, even when the swallowed
+                # tail is independently executable).
+                if text.find('"', i + 1) != -1:
+                    ambiguous = True
+                out.append(c)
+                i += 1
+                continue
+            out.append('"')
+            out.append(" " * (end - i - 1))
+            out.append('"')
+            i = end + 1
+            continue
+        if c == "'":
+            end = -1
+            j = i + 1
+            while j < n:
+                ch = text[j]
+                if ch == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if ch == "'":
+                    end = j
+                    break
+                if ch == "\n":
+                    break
+                j += 1
+            if end == -1:
+                # No same-line close. spatch lexes a char constant
+                # ACROSS newlines to a later close quote — everything
+                # between is one token for spatch while it stays LIVE
+                # in this view, so an embedded /* would open a
+                # phantom comment and truncate a following script
+                # header out of the gate's sight. Refuse whenever any
+                # later quote exists to pair with; only a quote with
+                # nothing left to pair against is a plain character
+                # (probed inert: spatch consumes to EOF and executes
+                # nothing).
+                if text.find("'", i + 1) != -1:
+                    ambiguous = True
+                out.append(c)
+                i += 1
+                continue
+            if end - i > char_literal_cap:
+                # Over-cap multi-char constant: refuse to classify
+                # (see _CHAR_LITERAL_CAP). Emit the quote as a plain
+                # character so the view stays inspectable.
+                ambiguous = True
+                out.append(c)
+                i += 1
+                continue
+            out.append("'")
+            out.append(" " * (end - i - 1))
+            out.append("'")
+            i = end + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), ambiguous
+
+
+# Keep at most 32 small rule bodies/views. Cache text, never a filename or
+# stat identity: callers still reread rules and enforce their size/version
+# gates, so edits, refusals and per-invocation nonces remain fresh.
+_cached_lexical_scan = functools.lru_cache(maxsize=32)(_lexical_scan_uncached)
+
+
+def _lexical_scan(text: str) -> tuple[str, bool]:
+    """Reuse immutable lexical results for identical, bounded rule text."""
+    if type(text) is str and len(text) <= 64 * 1024:
+        return _cached_lexical_scan(text, _CHAR_LITERAL_CAP)
+    # Do not retain large inputs or impose hashing on str subclasses.
+    return _lexical_scan_uncached(text, _CHAR_LITERAL_CAP)
+
+# Structured-refusal messages shared by run_rule / run_rules_batched.
+_SCRIPT_BLOCK_REFUSAL = (
+    "Rule contains a scripting block (@script:/@initialize:/@finalize: "
+    "header or script:-constraint), or quoting too ambiguous to prove "
+    "the absence of one (a multi-char character constant), and "
+    "allow_scripting=False — refused before spatch invocation. "
+    "Scripting blocks execute code inside spatch; pass "
+    "allow_scripting=True only for in-repo, code-trust rules."
+)
+
+_RESULT_MARKER_REFUSAL = (
+    "Rule contains the COCCIRESULT result-marker text and "
+    "allow_scripting=False — refused before spatch invocation. The "
+    "runner nonce-rewrites every marker in the rule it executes, so a "
+    "rule-supplied emit site would be minted into accepted match "
+    "evidence (forgery). RAPTOR injects its own reporting harness; "
+    "remove the marker text, or pass allow_scripting=True only for "
+    "in-repo, code-trust rules."
+)
+
+
+def contains_script_block(rule_text: str) -> bool:
+    """True when ``rule_text`` declares an SmPL scripting construct
+    (``@script:`` / ``@initialize:`` / ``@finalize:`` rule header, or
+    the ``script:``-constraint form on a metavariable declaration) —
+    or when its quoting is lexically AMBIGUOUS (an over-cap
+    multi-char char constant) so the scan cannot prove the absence
+    of one (see ``_lexical_scan``); both refuse on untrusted paths.
+
+    Shared gate: the runner refuses such rules unless the caller
+    passes ``allow_scripting=True``, and checker synthesis uses the
+    same predicate to reject LLM-emitted rules before they are
+    persisted to disk. Matches over the lexical view so comment /
+    whitespace spellings the real parser accepts cannot slip past a
+    raw-text scan (see ``_SCRIPT_BLOCK_RE``).
+    """
+    view, ambiguous = _lexical_scan(rule_text)
+    return ambiguous or bool(_SCRIPT_BLOCK_RE.search(view))
+
+
+def _sandboxed_run(cmd, **kwargs):
+    """Default subprocess runner: spatch inside core.sandbox with
+    network blocked.
+
+    Mirrors packages/codeql/query_runner.py: the rule text may carry
+    embedded scripting (trusted in-repo rules, or the harness we
+    inject), so the process gets no network and the standard sandbox
+    filesystem posture. ``tool_paths`` exposes the spatch install dir
+    so mount-ns mode keeps the binary visible when it is not under
+    /usr/bin — caller-supplied ``tool_paths`` extras (include dirs
+    that must stay visible inside the mount view) are merged in.
+    The invocation sites pass ``target=``/``output=`` so filesystem
+    confinement actually engages; without them run() is a bare-run
+    (network/seccomp/rlimits only) and warns accordingly. Sandbox
+    layers degrade internally when unavailable; a SandboxSetupError
+    propagates — fail loud, never mask as a benign result. Callers
+    that pass an explicit ``subprocess_runner`` bypass this entirely
+    (tests use stubs; adapters bring their own sandbox wrapper).
+    """
+    from core.sandbox import run as sandbox_run
+
+    sp = _spatch_path()
+    tool_paths = [str(Path(sp).resolve().parent)] if sp else []
+    for extra in kwargs.pop("tool_paths", None) or []:
+        if str(extra) not in tool_paths:
+            tool_paths.append(str(extra))
+    # env_caller_filtered: every caller in this module derives its env
+    # from get_safe_env() (plus the private scratch TMPDIR), so the
+    # sandbox's "unfiltered caller env" warning does not apply — and
+    # would otherwise fire once per spatch invocation.
+    kwargs.setdefault("env_caller_filtered", True)
+    return sandbox_run(
+        cmd,
+        block_network=True,
+        tool_paths=tool_paths or None,
+        caller_label="coccinelle-runner",
+        **kwargs,
+    )
+
+
+def _confined_default_runner(
+    subprocess_runner: Callable[..., Any] | None,
+    spatch_cwd: Path | None,
+    scratch: Path,
+    include_dirs: list[Path] | None = None,
+) -> Callable[..., Any]:
+    """Resolve the runner for one spatch invocation.
+
+    A caller-supplied ``subprocess_runner`` is returned untouched — it
+    owns its own isolation posture and its signature carries only the
+    subprocess-shaped kwargs. The default runner is bound to this
+    invocation's confinement surfaces so ``core.sandbox.run`` engages
+    filesystem confinement instead of the bare-run posture (network/
+    seccomp/rlimits only, plus its once-per-process warning):
+    ``target=`` the scanned tree (read-only in the mount view),
+    ``output=`` the invocation's scratch dir (rule file + spatch temp
+    copies, the one writable surface), and any ``-I`` include dirs as
+    read-only tool paths so the mount view keeps them visible.
+    """
+    if subprocess_runner is not None:
+        return subprocess_runner
+    return functools.partial(
+        _sandboxed_run,
+        target=str(spatch_cwd) if spatch_cwd is not None else None,
+        output=str(scratch),
+        tool_paths=[str(d) for d in include_dirs or []],
+    )
+
 
 # Resolve `spatch` ONCE per process via shutil.which and cache the
 # absolute path. Pre-fix every subprocess call passed the bare
@@ -40,23 +445,23 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 #     mid-run, an upstream tool that mutates os.environ) could
 #     swap out spatch. Cache locks in the resolved path discovered
 #     at first probe.
-_resolved_spatch: Optional[str] = None
+# The cached path is the REAL path (os.path.realpath of the which()
+# result): package managers and opam installs commonly place a symlink
+# on PATH while the actual binary (and its sibling data files) live in
+# the install prefix. The mount-ns visibility check realpaths cmd[0]
+# and the bind tree carries the RESOLVED tool dir, so exec'ing the
+# un-realpath'd symlink either fails ENOENT inside the namespace or
+# silently drops the run to the Landlock-only fallback tier
+# (selftest-05 scanner precedent: exec tools via their real path).
+_resolved_spatch: str | None = None
 _spatch_resolved: bool = False  # True once we've cached (None or path).
-def _spatch_path() -> Optional[str]:
+def _spatch_path() -> str | None:
     global _resolved_spatch, _spatch_resolved
     if not _spatch_resolved:
-        _resolved_spatch = shutil.which(_SPATCH_BIN)
+        _found = shutil.which(_SPATCH_BIN)
+        _resolved_spatch = os.path.realpath(_found) if _found else None
         _spatch_resolved = True
     return _resolved_spatch
-
-
-def reset_spatch_path_cache() -> None:
-    """Clear the cached spatch path. Call between tests that patch
-    `shutil.which` so the next probe re-resolves PATH.
-    """
-    global _resolved_spatch, _spatch_resolved
-    _resolved_spatch = None
-    _spatch_resolved = False
 
 
 def is_available() -> bool:
@@ -68,33 +473,85 @@ def is_available() -> bool:
     return shutil.which(_SPATCH_BIN) is not None
 
 
-def version() -> Optional[str]:
-    """Return the spatch version string, or None if unavailable."""
-    if not is_available():
+# Minimum spatch version RAPTOR's shipped rule-set is authored against.
+# Several attribute rules (engine/coccinelle/source_intel/attrs/*) match a
+# *prefix* GCC attribute on a function declaration —
+# ``__attribute__((deprecated)) T f(...);`` — which spatch only learned to
+# parse at 1.3. On 1.1.1 (the apt build on Ubuntu 22.04/24.04 and Debian
+# bookworm) those rules raise a SmPL parse error and emit nothing; the
+# runner degrades per-rule (the run continues) but the rule is dead. The
+# rule-integrity parse test gates on this so it skips — rather than
+# false-fails — on a host whose spatch predates the floor.
+MIN_SPATCH_VERSION = (1, 3)
+_MAX_VERSION_TEXT_CHARS = 64 * 1024
+
+
+def version() -> str | None:
+    """Probe the pinned executable freshly; accept only stable spatch banners."""
+    binary = _spatch_path()
+    if binary is None:
         return None
-    try:
-        proc = subprocess.run(
-            [_spatch_path() or _SPATCH_BIN, "--version"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in proc.stdout.splitlines():
-            if line.startswith("spatch version"):
-                return line.split("spatch version", 1)[1].strip()
-        return proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else None
-    except (subprocess.TimeoutExpired, OSError):
+    info = probe(binary)
+    if info is None or info.returncode != 0:
         return None
+    versions: dict[tuple[int, int, int], str] = {}
+    for stream in (info.stdout, info.stderr):
+        if not isinstance(stream, str):
+            continue
+        # A retained prefix cannot exclude a conflicting banner in the
+        # discarded tail. Refuse the shared probe's retention ceiling.
+        if len(stream) >= _MAX_VERSION_TEXT_CHARS:
+            return None
+        for line in stream.splitlines():
+            line = line.strip()
+            if line.startswith("spatch version "):
+                value = line.removeprefix("spatch version ").strip()
+                parsed = _release_version(value)
+                if parsed is None:
+                    return None
+                versions.setdefault(parsed, value)
+    # Conflicting banners cannot safely establish a rule's compatibility.
+    return next(iter(versions.values())) if len(versions) == 1 else None
+
+
+def version_tuple() -> tuple | None:
+    """Stable major.minor for the informational floor; unknown stays unknown."""
+    parsed = _release_version(version())
+    return parsed[:2] if parsed is not None else None
+
+
+def _rule_version_probe() -> Callable[[], str | None]:
+    """One positive cache entry for one rule sweep, tied to its pinned binary."""
+    cache = VersionProbeCache()
+
+    def installed() -> str | None:
+        return cache.get(version, _spatch_path)
+
+    return installed
+
+
+def meets_min_version() -> bool:
+    """True iff an installed spatch is at least ``MIN_SPATCH_VERSION``.
+    False when spatch is absent or its version can't be determined."""
+    vt = version_tuple()
+    return vt is not None and vt >= MIN_SPATCH_VERSION
 
 
 def run_rule(
     target: Path,
     rule: Path,
     *,
-    include_dirs: Optional[List[Path]] = None,
+    include_dirs: list[Path] | None = None,
     no_includes: bool = False,
     timeout: int = 300,
-    env: Optional[Dict[str, str]] = None,
-    defines: Optional[Dict[str, str]] = None,
+    env: dict[str, str] | None = None,
+    defines: dict[str, str] | None = None,
     subprocess_runner=None,
+    allow_scripting: bool = False,
+    tree_files: set[str] | None = None,
+    file_set: list[Path] | None = None,
+    jobs: int = 0,
+    _installed_version: Callable[[], str | None] | None = None,
 ) -> SpatchResult:
     """Run a single Coccinelle rule against a target.
 
@@ -106,18 +563,64 @@ def run_rule(
         timeout: Per-rule timeout in seconds.
         env: Subprocess environment (use get_safe_env() for untrusted targets).
         defines: Virtual identifier bindings passed as -D key=value.
-        subprocess_runner: Optional callable replacing subprocess.run. Must
-            accept the same kwargs (capture_output, text, timeout, env,
-            input) and return an object with returncode/stdout/stderr.
-            Defaults to subprocess.run. Used by callers that need to
-            engage a sandbox (e.g. core.sandbox.run) without reimplementing
-            the spatch invocation logic.
+        subprocess_runner: Optional callable replacing the default sandboxed
+            runner. Must accept the same kwargs (capture_output, text,
+            timeout, env, input) and return an object with
+            returncode/stdout/stderr. Defaults to ``_sandboxed_run``
+            (core.sandbox with network blocked). Callers that need a
+            different isolation posture pass their own wrapper; tests
+            pass stubs.
+        allow_scripting: When False (default), a rule declaring an SmPL
+            scripting construct (``@script:`` / ``@initialize:`` /
+            ``@finalize:`` header, or a ``script:``-constraint) is
+            refused with a structured error before any tempfile write or
+            spatch invocation — those constructs execute code inside
+            spatch. A rule carrying its own ``COCCIRESULT`` marker text
+            is refused the same way: the nonce rewrite would otherwise
+            mint the rule's emit site into accepted match evidence.
+            Pass True only for in-repo, code-trust rules
+            (engine/coccinelle shipped rules, cocci_flow templates).
+            RAPTOR's own injected reporting harness is added after these
+            gates and is exempt by construction.
+        tree_files: Pre-enumerated C/H file walk of a directory target
+            (see ``_collect_files_examined``). Multi-rule callers pass
+            the same set for every rule so the loop-invariant tree walk
+            happens once per run instead of once per rule.
+        file_set: Explicit list of source files handed to ONE spatch
+            invocation (one fork, one sandbox) instead of the target
+            path. ``target`` must then be the directory that spatch
+            should resolve relative ``#include`` paths from — it
+            becomes the subprocess cwd, exactly as in ``--dir`` mode —
+            and entries are made absolute relative to the caller's
+            current directory before invocation. Match attribution
+            uses that argv spelling. Reported input parse errors
+            make coverage incomplete even when spatch exits zero;
+            partial matches remain available. With no reported parse
+            or output errors, quiet members are attributed from argv,
+            not the match set. This is not an independent complete-parse
+            witness. Split the combined result per
+            file with :func:`demux_result_by_file`. An empty list is a
+            no-op success (never a whole-tree ``--dir`` fallback).
+        jobs: When > 1 and scanning in ``--dir`` mode, pass
+            ``--jobs N`` so spatch parallelises internally (parmap).
+            Requires ``--tmp-dir`` pointed into the writable scratch:
+            parmap writes per-worker stdout/stderr redirect files into
+            its tmp dir (default: cwd), and under the default sandbox
+            the target tree is a read-only mount view — the workers
+            survive, but the parent's redirect-file read fails and
+            spatch exits 2 despite complete match output. The runner
+            wires the tmp dir automatically. Ignored (with a warning)
+            when ``file_set`` is given or the target is a single file:
+            spatch's parmap only engages in ``--dir`` mode — an
+            explicit file list runs serially regardless of ``--jobs``
+            (measured on spatch 1.3), so silently accepting the flag
+            there would misreport the concurrency actually applied.
 
     Returns:
         SpatchResult with matches parsed from COCCIRESULT lines.
     """
-    rule = Path(rule)
-    target = Path(target)
+    rule = Path(rule).resolve()
+    target = Path(target).absolute()
     rule_name = rule.stem
 
     if not is_available():
@@ -134,91 +637,250 @@ def run_rule(
             returncode=-1,
         )
 
-    rule_text = rule.read_text()
-    needs_harness = RESULT_PREFIX not in rule_text and "script:python" not in rule_text
+    # The shared reader checks regularity and the byte cap on the opened
+    # descriptor, then bounds the read even if the file grows afterward.
+    try:
+        rule_text = read_text_gated(rule, _RULE_MAX_BYTES, encoding="utf-8")
+    except ReadBudgetExceededError:
+        return SpatchResult(
+            rule=rule_name, rule_path=str(rule),
+            errors=[f"Rule file exceeds {_RULE_MAX_BYTES}-byte cap"],
+            returncode=-1,
+        )
+    except (OSError, ValueError) as e:
+        return SpatchResult(
+            rule=rule_name, rule_path=str(rule),
+            errors=[f"Rule file unreadable (must be UTF-8 text): {e}"],
+            returncode=-1,
+        )
 
-    # If the rule needs harness injection, the modified text has to
-    # reach spatch via a real file path. Pre-fix this routed via
-    # ``--sp-file -`` (stdin), but spatch 1.3 (the build on every
-    # host we ship to) doesn't accept ``-`` / ``--sp-file=-`` /
-    # ``--sp-file /dev/stdin`` — each errors with either
-    # ``Sys_error("-: No such file or directory")`` or "unexpected
-    # code before the first rule". The only reliable invocation is
-    # a real path. Write the harnessed text to a tempfile and pass
-    # its path; cleanup in ``finally`` covers timeout / error paths.
-    harnessed_rule_path: Optional[Path] = None
-    if needs_harness:
-        injected = _inject_harness(rule_text, rule_name)
-        if injected != rule_text:
-            # Tempfile in the system tempdir — works under the
-            # default sandbox allowlist (``/tmp`` is reachable).
-            # delete=False so we control cleanup; without it the
-            # NamedTemporaryFile context manager would unlink on
-            # exit before spatch could read it through the
-            # subprocess_runner.
-            fd, tmp_name = tempfile.mkstemp(suffix=".cocci", prefix="raptor-cocci-")
+    refusal = rule_version_refusal(rule_text, _installed_version or version)
+    if refusal:
+        return SpatchResult(
+            rule=rule_name, rule_path=str(rule), errors=[refusal], returncode=-1,
+        )
+
+    # Scripting gate — refuse before any tempfile write or spatch
+    # invocation. See contains_script_block / allow_scripting docs.
+    if not allow_scripting and contains_script_block(rule_text):
+        return SpatchResult(
+            rule=rule_name, rule_path=str(rule),
+            errors=[_SCRIPT_BLOCK_REFUSAL],
+            returncode=-1,
+        )
+
+    # Marker gate — an untrusted rule must never carry its own
+    # COCCIRESULT emit site: the nonce rewrite below rewrites EVERY
+    # marker in the text it executes, so a rule-supplied emit site
+    # would be noncified into evidence the parser accepts (forged
+    # matches minted as mechanical verdict) — the rule-side twin of
+    # the hostile-source forgery the per-invocation nonce closes (see
+    # _make_nonce). Refuse instead of noncifying; the injected harness
+    # is appended AFTER this gate and is exempt by construction.
+    if not allow_scripting and RESULT_PREFIX in rule_text:
+        return SpatchResult(
+            rule=rule_name, rule_path=str(rule),
+            errors=[_RESULT_MARKER_REFUSAL],
+            returncode=-1,
+        )
+
+    if file_set is not None:
+        # Member inputs are relative to the caller, before the child cwd changes.
+        file_set = [Path(entry).absolute() for entry in file_set]
+        if not target.is_dir():
+            # The target is the include-resolution root (subprocess
+            # cwd) in batch mode; a file target here is a caller bug
+            # that would silently resolve headers from the wrong
+            # directory — refuse rather than guess.
+            return SpatchResult(
+                rule=rule_name, rule_path=str(rule),
+                errors=[
+                    "file_set requires a directory target (the "
+                    f"include-resolution root); got: {target}",
+                ],
+                returncode=-1,
+            )
+        if not file_set:
+            # Empty batch is a no-op success. Falling through to the
+            # positional-target branch would rescan the WHOLE tree in
+            # --dir mode — a silent blast-radius surprise for a
+            # caller that filtered its chunk down to nothing.
+            return SpatchResult(
+                rule=rule_name, rule_path=str(rule),
+                returncode=0,
+            )
+        for entry in file_set:
+            # Every entry must be a regular file: a DIRECTORY entry
+            # makes spatch recurse (rc 0) — matches inside it demux
+            # to keys that are not file_set members (dropped) while
+            # the entry itself reads verified-silent, and a missing
+            # entry's rc-255 whole-batch failure is a worse receipt
+            # than a structured refusal naming the bad entry. Same
+            # attribution-corruption rationale as the file-target and
+            # empty-set refusals above.
             try:
-                with os.fdopen(fd, "w") as fh:
-                    fh.write(injected)
-                harnessed_rule_path = Path(tmp_name)
+                entry_is_file = Path(entry).is_file()
             except OSError:
-                # If we can't write, fall back to the un-harnessed
-                # rule path. The caller still gets spatch results,
-                # just without our structured COCCIRESULT lines —
-                # which is the same UX as a multi-rule file
-                # (handled below in _inject_harness's existing
-                # "return rule_text unchanged" path).
-                try:
-                    Path(tmp_name).unlink()
-                except OSError:
-                    pass
-                harnessed_rule_path = None
+                entry_is_file = False
+            if not entry_is_file:
+                return SpatchResult(
+                    rule=rule_name, rule_path=str(rule),
+                    errors=[
+                        "file_set entries must be regular files; "
+                        f"not a regular file: {entry}",
+                    ],
+                    returncode=-1,
+                )
 
-    sp_file_path = harnessed_rule_path if harnessed_rule_path else rule
-    cmd = [_spatch_path() or _SPATCH_BIN, "--sp-file", str(sp_file_path)]
+    if jobs and jobs > 1 and (file_set is not None or target.is_file()):
+        # parmap only engages in --dir mode: an explicit file list (or
+        # a single positional file) runs serially no matter what
+        # --jobs says (measured on spatch 1.3 — a 100-file list with
+        # --jobs 16 ran at single-lane speed). Passing the flag anyway
+        # would make the caller believe N-way concurrency was applied.
+        logger.warning(
+            "coccinelle: --jobs ignored (spatch parallelises only in "
+            "--dir mode; explicit file lists run serially)"
+        )
+        jobs = 0
 
-    if target.is_dir():
-        cmd.extend(["--dir", str(target)])
-    else:
-        cmd.append(str(target))
+    # Documentation and C string patterns mentioning Python scripts do not
+    # provide reporting code; inspect the same lexer view as the script gate.
+    needs_harness = (RESULT_PREFIX not in rule_text
+                     and "script:python" not in _lexical_scan(rule_text)[0])
 
-    if no_includes:
-        cmd.append("--no-includes")
-    if include_dirs:
-        for d in include_dirs:
-            cmd.extend(["-I", str(d)])
-
-    cmd.append("--very-quiet")
-
-    if defines:
-        for k, v in defines.items():
-            cmd.extend(["-D", f"{k}={v}"])
+    # Per-invocation evidence nonce (see _make_nonce): every emit site
+    # — the rule's own scripting blocks and our injected harness — is
+    # rewritten from ``COCCIRESULT:`` to ``COCCIRESULT-<nonce>:``; the
+    # parser accepts only the nonced marker.
+    nonce = _make_nonce()
+    exec_text = rule_text
+    reporting_unavailable = False
+    if needs_harness:
+        exec_text = _inject_harness(rule_text, rule_name)
+        reporting_unavailable = exec_text == rule_text
+    exec_text = exec_text.replace(RESULT_PREFIX, _nonced_prefix(nonce))
 
     run_env = dict(env) if env is not None else RaptorConfig.get_safe_env()
-    runner = subprocess_runner or subprocess.run
+    # Private scratch for spatch's own temp files. spatch materialises
+    # per-file working copies (cocci-output-*, cocci_small_output-*)
+    # in the temp dir and only removes them on clean exit — a timeout
+    # kill or spatch crash strands them (observed: ~200 files from one
+    # interrupted sweep). It honours TMPDIR, so scratch_dir points each
+    # invocation at its own dir (TMPDIR exported into run_env) and
+    # removes it on exit — including whatever a killed spatch left.
+    # The scratch dir doubles as the default runner's sandbox
+    # ``output=``, the one writable surface the mount-ns view
+    # bind-mounts — everything spatch must read or write outside the
+    # target tree has to live in it. Accepted residual: the bind
+    # serves the scratch at its ORIGINAL absolute path, so its
+    # framework-named leaf (and, under the launcher, its branded
+    # session ancestors) become visible inside the child's mount view
+    # even though the env scrub keeps the name out of the child env —
+    # a fingerprint tell to a compromised spatch, not a containment
+    # loss. spatch input is operator-trusted rules, and a neutral bind
+    # location would need new mount plumbing.
+    with scratch_dir("raptor-cocci-tmp-", env=run_env) as spatch_scratch:
+        # The (possibly harnessed / nonce-substituted) rule text has
+        # to reach spatch via a real file path. ``--sp-file -``
+        # (stdin) does not work on spatch 1.3 (the build on every
+        # host we ship to) — each spelling errors with either
+        # ``Sys_error("-: No such file or directory")`` or
+        # "unexpected code before the first rule". Always materialise
+        # into the scratch dir: the ORIGINAL rule path (in-repo rules
+        # dir) is not part of the sandbox's mount view, so handing it
+        # to a confined spatch would fail file-not-found.
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                suffix=".cocci", prefix="raptor-cocci-",
+                dir=str(spatch_scratch))
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(exec_text)
+        except OSError as e:
+            # Fail closed: running the ORIGINAL file would emit
+            # plain (un-nonced) markers that the parser must reject,
+            # so the run could only ever report false silence.
+            # Pre-nonce this fell back to the un-harnessed rule; now
+            # an unwritable scratch is a structured error instead.
+            return SpatchResult(
+                rule=rule_name, rule_path=str(rule),
+                errors=[
+                    "failed to materialise nonce-marked rule file: "
+                    f"{e}",
+                ],
+                returncode=-1,
+            )
+        sp_file_path = Path(tmp_name)
+        cmd = [_spatch_path() or _SPATCH_BIN, "--sp-file", str(sp_file_path)]
 
-    start = time.monotonic()
-    # `cwd=target.parent if file else target if dir`. spatch
-    # resolves #include paths relative to its CWD when paths
-    # are not absolute. Pre-fix the runner inherited the
-    # parent process's CWD (typically the RAPTOR repo root,
-    # not the target's directory), so:
-    #   * Headers in the target's own tree found via relative
-    #     #include were missed (spatch couldn't resolve
-    #     `#include "foo.h"` because it looked in
-    #     RAPTOR-root not target-root).
-    #   * SmPL `<+...+>` patterns spanning multiple translation
-    #     units silently failed to match across includes.
-    # Setting cwd= to the target's directory fixes both — the
-    # path semantics now match what spatch expects when invoked
-    # by hand from the target repo.
-    if target.is_file():
-        spatch_cwd = target.parent
-    elif target.is_dir():
-        spatch_cwd = target
-    else:
-        spatch_cwd = None
-    try:
+        if file_set:
+            # Explicit multi-file batch: one spatch invocation, one
+            # sandbox, per-file match attribution via the position
+            # metavariable's file field (spatch echoes the argv
+            # spelling). cwd stays on the directory target below, so
+            # relative-#include resolution matches --dir mode.
+            cmd.extend(str(f) for f in file_set)
+        elif target.is_dir():
+            cmd.extend(["--dir", str(target)])
+        else:
+            cmd.append(str(target))
+
+        if jobs and jobs > 1:
+            # Only reachable in --dir mode (file-list / single-file
+            # jobs was zeroed above). --tmp-dir MUST live in the
+            # writable scratch: parmap writes per-worker stdout/stderr
+            # redirect files into its tmp dir, and the default is the
+            # CWD — the read-only target mount view under the sandbox.
+            # Without it the workers run fine but the parent's
+            # redirect-file read fails and spatch exits 2 despite
+            # complete match output.
+            parmap_tmp = spatch_scratch / "parmap"
+            try:
+                parmap_tmp.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return SpatchResult(
+                    rule=rule_name, rule_path=str(rule),
+                    errors=[f"failed to create parmap tmp dir: {e}"],
+                    returncode=-1,
+                )
+            cmd.extend(["--jobs", str(jobs), "--tmp-dir", str(parmap_tmp)])
+
+        if no_includes:
+            cmd.append("--no-includes")
+        if include_dirs:
+            for d in include_dirs:
+                cmd.extend(["-I", str(d)])
+
+        # Very-quiet can suppress C parse failures even on a zero exit.
+        cmd.extend(["--quiet", "--parse-error-msg"])
+
+        if defines:
+            for k, v in defines.items():
+                cmd.extend(["-D", f"{k}={v}"])
+
+        start = time.monotonic()
+        # `cwd=target.parent if file else target if dir`. spatch
+        # resolves #include paths relative to its CWD when paths
+        # are not absolute. Pre-fix the runner inherited the
+        # parent process's CWD (typically the RAPTOR repo root,
+        # not the target's directory), so:
+        #   * Headers in the target's own tree found via relative
+        #     #include were missed (spatch couldn't resolve
+        #     `#include "foo.h"` because it looked in
+        #     RAPTOR-root not target-root).
+        #   * SmPL `<+...+>` patterns spanning multiple translation
+        #     units silently failed to match across includes.
+        # Setting cwd= to the target's directory fixes both — the
+        # path semantics now match what spatch expects when invoked
+        # by hand from the target repo.
+        if target.is_file():
+            spatch_cwd = target.parent
+        elif target.is_dir():
+            spatch_cwd = target
+        else:
+            spatch_cwd = None
+        runner = _confined_default_runner(
+            subprocess_runner, spatch_cwd, spatch_scratch, include_dirs)
         try:
             proc = runner(
                 cmd,
@@ -242,15 +904,24 @@ def run_rule(
             partial_stderr = exc.stderr if isinstance(exc.stderr, str) else (
                 exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
             )
+            errors = [f"Timeout after {timeout}s (partial output captured)"]
             partial_matches = _dedup_matches(
-                _parse_results(partial_stdout, rule_name)
-                + _parse_results(partial_stderr, rule_name)
+                _parse_results(partial_stdout, rule_name, nonce=nonce, diagnostics=errors)
+                + _parse_results(partial_stderr, rule_name, nonce=nonce, diagnostics=errors)
             )
             return SpatchResult(
                 rule=rule_name, rule_path=str(rule),
                 matches=partial_matches,
-                errors=[f"Timeout after {timeout}s (partial output captured)"],
+                errors=errors,
+                # Wall time actually spent before the kill — leaving
+                # the default 0 misread the SLOWEST invocations as
+                # instantaneous in timing reports.
+                elapsed_ms=int((time.monotonic() - start) * 1000),
                 returncode=-1,
+                forged_markers=_warn_forged_markers(
+                    partial_stdout, partial_stderr,
+                    nonce=nonce, rule_name=rule_name, target=target,
+                ),
             )
         except OSError as e:
             return SpatchResult(
@@ -260,12 +931,51 @@ def run_rule(
             )
         elapsed = int((time.monotonic() - start) * 1000)
 
-        matches = _dedup_matches(
-            _parse_results(proc.stdout, rule_name) + _parse_results(proc.stderr, rule_name)
-        )
         errors = _parse_errors(proc.stderr)
+        matches = _dedup_matches(
+            _parse_results(proc.stdout, rule_name, nonce=nonce, diagnostics=errors)
+            + _parse_results(proc.stderr, rule_name, nonce=nonce, diagnostics=errors)
+        )
 
-        files_examined = _collect_files_examined(target, {m.file for m in matches})
+        # Engine failure must never read as verified silence: a
+        # nonzero exit whose stderr matches none of the known
+        # error patterns (segfault, OCaml fatal-error variants,
+        # sandbox kill, a parametric rule's "No rules apply")
+        # previously yielded errors=[] and a full files_examined —
+        # coverage and refutation consumers then read the crashed
+        # sweep as examined-clean. Mirror the semgrep runner:
+        # synthesise an error from the returncode + stderr tail so
+        # every caller inherits the error-vs-refuted distinction.
+        if proc.returncode != 0 and not errors:
+            stderr_tail = (proc.stderr or "").strip()[-500:]
+            errors.append(
+                f"spatch exited with code {proc.returncode}"
+                + (f": {stderr_tail}" if stderr_tail else "")
+            )
+
+        if reporting_unavailable:
+            errors.append("Structured Coccinelle result reporting unavailable for this rule")
+
+        # Reported parse failures or output loss can leave a zero-exit
+        # run incomplete. Withhold quiet coverage and keep authentic
+        # partial matches, as on the timeout path.
+        if proc.returncode == 0 and not errors:
+            if file_set:
+                # Attribute quiet members from argv only after the
+                # reported parse/output error checks above. A match
+                # set alone cannot witness a complete parse.
+                files_examined = sorted(str(f) for f in file_set)
+            else:
+                try:
+                    files_examined = _collect_files_examined(
+                        target, {m.file for m in matches}, tree_files=tree_files,
+                        no_includes=no_includes,
+                    )
+                except OSError as exc:
+                    errors.append(_source_inventory_error(exc))
+                    files_examined = sorted({m.file for m in matches})
+        else:
+            files_examined = sorted({m.file for m in matches})
 
         return SpatchResult(
             rule=rule_name,
@@ -275,40 +985,57 @@ def run_rule(
             errors=errors,
             elapsed_ms=elapsed,
             returncode=proc.returncode,
+            forged_markers=_warn_forged_markers(
+                proc.stdout, proc.stderr,
+                nonce=nonce, rule_name=rule_name, target=target,
+            ),
         )
-    finally:
-        # Clean up the harnessed-rule tempfile. Covers timeout
-        # (early return), OSError (early return), and normal-exit
-        # paths uniformly. Best-effort; an already-unlinked file
-        # or permission flake doesn't affect the result.
-        if harnessed_rule_path is not None:
-            try:
-                harnessed_rule_path.unlink()
-            except OSError:
-                pass
 
 
 def run_rules(
     target: Path,
     rules_dir: Path,
     *,
-    include_dirs: Optional[List[Path]] = None,
+    include_dirs: list[Path] | None = None,
     no_includes: bool = False,
     timeout_per_rule: int = 300,
-    env: Optional[Dict[str, str]] = None,
-    defines: Optional[Dict[str, str]] = None,
+    env: dict[str, str] | None = None,
+    defines: dict[str, str] | None = None,
     subprocess_runner=None,
-) -> List[SpatchResult]:
+    allow_scripting: bool = False,
+    on_rule=None,
+    exclude_rules: frozenset[str] = frozenset(),
+) -> list[SpatchResult]:
     """Run all .cocci rules in a directory against a target.
 
-    Returns one SpatchResult per rule, in filename order.
+    ``allow_scripting`` is forwarded to run_rule — pass True only for
+    in-repo, code-trust rule directories.
+
+    ``on_rule`` is an optional progress callback invoked BEFORE each
+    rule runs as ``on_rule(index, total, rule_stem)`` (0-based index,
+    total rules in this directory). A single spatch invocation can run
+    for minutes on large C targets; the callback lets callers emit
+    operator-facing progress instead of going silent for the whole
+    directory. Callback failures are swallowed — progress must never
+    cost a scan.
+
+    ``exclude_rules`` omits explicitly unconfigured rule stems.
+    Returns one SpatchResult per executed rule, in filename order.
     """
     rules_dir = Path(rules_dir)
     if not rules_dir.is_dir():
         return []
 
-    rule_paths = sorted(rules_dir.glob("*.cocci"))
-    if not rule_paths:
+    try:
+        rule_paths = sorted(
+            path for path in rules_dir.iterdir() if fnmatch.fnmatch(path.name, "*.cocci")
+        )
+    except OSError as exc:
+        return [SpatchResult(
+            rule="coccinelle", rule_path=str(rules_dir), returncode=-1,
+            errors=[f"Coccinelle rules directory could not be enumerated: {type(exc).__name__}"],
+        )]
+    if not any(path.stem not in exclude_rules for path in rule_paths):
         return []
 
     if not is_available():
@@ -320,8 +1047,30 @@ def run_rules(
             )
         ]
 
+    # The C/H tree walk is loop-invariant (the target doesn't change
+    # between rules) — enumerate once here instead of once per rule:
+    # N rules previously meant 2N full recursive globs of the target.
+    target = Path(target).absolute()
+    try:
+        tree_files = _walk_c_h(target) if target.is_dir() else None
+    except OSError as exc:
+        return [SpatchResult(
+            rule=path.stem, rule_path=str(path), returncode=-1,
+            errors=[_source_inventory_error(exc)],
+        ) for path in rule_paths if path.stem not in exclude_rules]
+
     results = []
-    for rule_path in rule_paths:
+    installed_version = _rule_version_probe()
+    for idx, rule_path in enumerate(rule_paths):
+        if rule_path.stem in exclude_rules:
+            continue
+        if on_rule is not None:
+            try:
+                on_rule(idx, len(rule_paths), rule_path.stem)
+            except Exception:  # noqa: BLE001 — progress must never cost a scan
+                logger.debug(
+                    "on_rule progress callback failed", exc_info=True,
+                )
         result = run_rule(
             target, rule_path,
             include_dirs=include_dirs,
@@ -330,47 +1079,525 @@ def run_rules(
             env=env,
             defines=defines,
             subprocess_runner=subprocess_runner,
+            allow_scripting=allow_scripting,
+            tree_files=tree_files,
+            _installed_version=installed_version,
         )
         results.append(result)
 
     return results
 
 
-def _dedup_matches(matches: List[SpatchMatch]) -> List[SpatchMatch]:
-    """Remove duplicate matches (same file+line+col+rule), preserving order."""
+def run_rules_batched(
+    target: Path,
+    rules: list[Path],
+    *,
+    include_dirs: list[Path] | None = None,
+    no_includes: bool = False,
+    timeout: int = 300,
+    env: dict[str, str] | None = None,
+    defines: dict[str, str] | None = None,
+    subprocess_runner=None,
+    allow_scripting: bool = False,
+    tree_files: set[str] | None = None,
+    _installed_version: Callable[[], str | None] | None = None,
+) -> dict[str, SpatchResult]:
+    """Run multiple .cocci rules in a single spatch invocation.
+
+    Concatenates rule files into one temp file so spatch parses the C
+    AST once.  Results are demultiplexed by the ``rule`` field in each
+    COCCIRESULT line. Plain rules needing an injected reporter run individually
+    through run_rule, which attempts harness injection and reports unavailable
+    structured output. Callers running scripted rules must pass
+    ``allow_scripting=True``. With the default False, any rule declaring
+    a scripting block gets a structured refusal result (no execution);
+    the remaining rules still run.
+
+    ``include_dirs`` / ``no_includes`` / ``defines`` carry run_rule's
+    semantics (extra ``-I`` dirs, ``--no-includes`` for untrusted
+    targets, ``-D`` virtual bindings) — the batched path used to
+    silently drop all three, so rules that needed them diverged
+    between the batched and per-rule lanes.
+
+    ``tree_files`` optionally supplies the same C/H inventory accepted by
+    run_rule. Otherwise a directory inventory is created when needed and
+    shared through batch splitting and individual retries within this call.
+    It is never reused by a later call or mutated by coverage filtering.
+
+    Returns a dict keyed by rule stem name → SpatchResult.
+    Falls back to per-rule run_rule when only one rule is given or
+    accepted rules have colliding result IDs (including file-stem
+    aliases). Individual execution preserves attribution in that case.
+    Rules with lifecycle scripts (initialize/finalize), or ambiguous
+    lexical structure, execute individually to isolate their interpreter
+    state. The remaining rules can still batch. A failed/timed-out batch
+    retries its accepted rules individually with the original timeout/options;
+    incomplete batch matches never stand in for those per-rule results.
+    """
+    target = Path(target).absolute()
+    # Keep every explicitly requested path: missing rules need a refusal,
+    # not silent removal from the batch's result set.
+    rules = [Path(r).resolve() for r in rules]
+    if not rules:
+        return {}
+    installed_version = _installed_version or _rule_version_probe()
+    if len(rules) == 1:
+        result = run_rule(
+            target, rules[0],
+            include_dirs=include_dirs,
+            no_includes=no_includes,
+            timeout=timeout,
+            env=env, defines=defines,
+            subprocess_runner=subprocess_runner,
+            allow_scripting=allow_scripting,
+            tree_files=tree_files,
+            _installed_version=installed_version,
+        )
+        return {rules[0].stem: result}
+
+    if not is_available():
+        return {
+            r.stem: SpatchResult(
+                rule=r.stem, rule_path=str(r),
+                errors=["spatch is not installed"],
+                returncode=-1,
+            )
+            for r in rules
+        }
+
+    inventory_error: str | None = None
+
+    def target_inventory() -> set[str] | None:
+        nonlocal tree_files, inventory_error
+        if tree_files is None:
+            try:
+                if target.is_dir():
+                    tree_files = _walk_c_h(target)
+            except OSError as exc:
+                tree_files = set()
+                inventory_error = _source_inventory_error(exc)
+        return tree_files
+
+    parts = []
+    rule_stems = []
+    batched_rules = []
+    refused: dict[str, SpatchResult] = {}
+    alias_of: dict[str, str] = {}
+    colliding_ids: set[str] = set()
+    isolated_stems: set[str] = set()
+    for r in rules:
+        # Use the same descriptor-bound cap and regular-file check as the
+        # single-rule lane; a refused rule must not discard its siblings.
+        try:
+            text = read_text_gated(r, _RULE_MAX_BYTES, encoding="utf-8")
+        except ReadBudgetExceededError:
+            refused[r.stem] = SpatchResult(
+                rule=r.stem, rule_path=str(r),
+                errors=[f"Rule file exceeds {_RULE_MAX_BYTES}-byte cap"],
+                returncode=-1,
+            )
+            continue
+        except (OSError, ValueError) as e:
+            refused[r.stem] = SpatchResult(
+                rule=r.stem, rule_path=str(r),
+                errors=[f"Rule file unreadable (must be UTF-8 text): {e}"],
+                returncode=-1,
+            )
+            continue
+        refusal = rule_version_refusal(text, installed_version)
+        if refusal:
+            refused[r.stem] = SpatchResult(
+                rule=r.stem, rule_path=str(r), errors=[refusal], returncode=-1,
+            )
+            continue
+        # Scripting + marker gates — same policy as run_rule, applied
+        # before the batch tempfile is written. Refused rules never
+        # reach spatch (and never reach the batch nonce rewrite).
+        if not allow_scripting and contains_script_block(text):
+            refused[r.stem] = SpatchResult(
+                rule=r.stem, rule_path=str(r),
+                errors=[_SCRIPT_BLOCK_REFUSAL],
+                returncode=-1,
+            )
+            continue
+        if not allow_scripting and RESULT_PREFIX in text:
+            refused[r.stem] = SpatchResult(
+                rule=r.stem, rule_path=str(r),
+                errors=[_RESULT_MARKER_REFUSAL],
+                returncode=-1,
+            )
+            continue
+        view, ambiguous = _lexical_scan(text)
+        needs_reporter = RESULT_PREFIX not in text and "script:python" not in view
+        if ambiguous or _LIFECYCLE_BLOCK_RE.search(view) or needs_reporter:
+            isolated_stems.add(r.stem)
+        parts.append(f"// --- begin {r.stem} ---\n{text}\n")
+        rule_stems.append(r.stem)
+        batched_rules.append(r)
+        # Alias map for the demux: several shipped rule files emit
+        # 'rule' ids that differ from their file stem (e.g.
+        # va_arg_mismatch.cocci emits only va_arg_promoted_type*,
+        # double_close.cocci's second leg emits double_fclose).
+        # Pre-fix the demux keyed on stems only and silently dropped
+        # every alias emission — 100% of some rules' output.
+        # File stems are routing aliases too: a literal emitted ID
+        # must not steal another file's implicit stem attribution.
+        for emitted in _emitted_rule_ids(text) | {r.stem}:
+            prior = alias_of.setdefault(emitted, r.stem)
+            if prior != r.stem:
+                colliding_ids.add(emitted)
+
+    if not rule_stems:
+        return refused
+
+    def _individual_results(selected: list[Path]) -> dict[str, SpatchResult]:
+        return {
+            r.stem: _record_inventory_error(run_rule(
+                target, r,
+                include_dirs=include_dirs,
+                no_includes=no_includes,
+                timeout=timeout,
+                env=env, defines=defines,
+                subprocess_runner=subprocess_runner,
+                allow_scripting=allow_scripting,
+                tree_files=target_inventory(),
+                _installed_version=installed_version,
+            ), inventory_error)
+            for r in selected
+        }
+
+    if colliding_ids:
+        # A nonce proves that a batch emitted the record, not WHICH
+        # rule emitted it. Once IDs overlap, demultiplexing cannot
+        # recover ownership. Preserve each rule's own matches/errors
+        # with isolated runs; never combine this ambiguous batch.
+        logger.warning(
+            "Coccinelle batch has colliding result IDs %r — running "
+            "accepted rules individually to preserve attribution",
+            sorted(colliding_ids),
+        )
+        out = _individual_results(batched_rules)
+        out.update(refused)
+        return out
+
+    if isolated_stems:
+        out = {}
+        # Keep invocation groups in input order. Only contiguous runs
+        # without lifecycle state share a process.
+        for isolated, group in groupby(
+            batched_rules, key=lambda r: r.stem in isolated_stems,
+        ):
+            selected = list(group)
+            if isolated:
+                out.update(_individual_results(selected))
+            else:
+                grouped = run_rules_batched(
+                    target, selected,
+                    include_dirs=include_dirs, no_includes=no_includes,
+                    timeout=timeout, env=env, defines=defines,
+                    subprocess_runner=subprocess_runner,
+                    allow_scripting=allow_scripting,
+                    tree_files=target_inventory(),
+                    _installed_version=installed_version,
+                )
+                out.update({
+                    stem: _record_inventory_error(result, inventory_error)
+                    for stem, result in grouped.items()
+                })
+        out.update(refused)
+        return {r.stem: out[r.stem] for r in rules if r.stem in out}
+
+    # Same per-invocation evidence nonce as run_rule (see _make_nonce):
+    # one nonce covers the whole batch invocation.
+    nonce = _make_nonce()
+    combined = "\n".join(parts).replace(RESULT_PREFIX, _nonced_prefix(nonce))
+
+    target = Path(target).absolute()
+    run_env = dict(env) if env is not None else RaptorConfig.get_safe_env()
+    # Same private-TMPDIR scratch as run_rule — see the comment there.
+    # The batch rule file is materialised inside it for the same
+    # reason as run_rule's: the scratch dir is the sandbox's writable
+    # ``output=`` surface, the one place the confined spatch can read
+    # it from.
+    with scratch_dir("raptor-cocci-tmp-", env=run_env) as spatch_scratch:
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                suffix=".cocci", prefix="raptor-cocci-batch-",
+                dir=str(spatch_scratch),
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(combined)
+            tmp_path = Path(tmp_name)
+        except OSError:
+            out = {
+                s: SpatchResult(
+                    rule=s, errors=["failed to write batch file"],
+                    returncode=-1,
+                )
+                for s in rule_stems
+            }
+            out.update(refused)
+            return out
+
+        cmd = [_spatch_path() or _SPATCH_BIN, "--sp-file", str(tmp_path)]
+        if target.is_dir():
+            cmd.extend(["--dir", str(target)])
+        else:
+            cmd.append(str(target))
+        if no_includes:
+            cmd.append("--no-includes")
+        if include_dirs:
+            for d in include_dirs:
+                cmd.extend(["-I", str(d)])
+        cmd.extend(["--quiet", "--parse-error-msg"])
+        if defines:
+            for k, v in defines.items():
+                cmd.extend(["-D", f"{k}={v}"])
+
+        if target.is_file():
+            spatch_cwd = target.parent
+        elif target.is_dir():
+            spatch_cwd = target
+        else:
+            spatch_cwd = None
+        runner = _confined_default_runner(
+            subprocess_runner, spatch_cwd, spatch_scratch, include_dirs)
+
+        start = time.monotonic()
+        try:
+            proc = runner(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, env=run_env,
+                cwd=str(spatch_cwd) if spatch_cwd else None,
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial_stdout = exc.stdout if isinstance(
+                exc.stdout, str,
+            ) else (
+                exc.stdout.decode("utf-8", errors="replace")
+                if exc.stdout else ""
+            )
+            partial_stderr = exc.stderr if isinstance(
+                exc.stderr, str,
+            ) else (
+                exc.stderr.decode("utf-8", errors="replace")
+                if exc.stderr else ""
+            )
+            # Keep the forgery warning from the abandoned batch, but do
+            # not adopt its incomplete matches or examined-file claims.
+            _warn_forged_markers(
+                partial_stdout, partial_stderr,
+                nonce=nonce, rule_name="batch", target=target,
+            )
+            logger.warning(
+                "Coccinelle batch timed out after %ss — retrying %d "
+                "accepted rules individually with the same per-rule timeout",
+                timeout, len(batched_rules),
+            )
+            out = _individual_results(batched_rules)
+            out.update(refused)
+            return out
+        except OSError as e:
+            out = {
+                s: SpatchResult(
+                    rule=s, errors=[str(e)], returncode=-1,
+                )
+                for s in rule_stems
+            }
+            out.update(refused)
+            return out
+
+        elapsed = int((time.monotonic() - start) * 1000)
+        errors = _parse_errors(proc.stderr)
+        all_matches = _dedup_matches(
+            _parse_results(proc.stdout, "batch", nonce=nonce, diagnostics=errors)
+            + _parse_results(proc.stderr, "batch", nonce=nonce, diagnostics=errors),
+        )
+        forged = _warn_forged_markers(
+            proc.stdout, proc.stderr,
+            nonce=nonce, rule_name="batch", target=target,
+        )
+
+        by_rule = _demux_batch_matches(all_matches, rule_stems, alias_of, diagnostics=errors)
+
+        # Match run_rule's result contract: files_examined is
+        # populated (one shared tree walk for the whole batch —
+        # coverage consumers previously read zero files from the
+        # batch path), and every SpatchResult gets its OWN errors
+        # list — passing one shared list object meant a consumer
+        # mutating one result's errors silently edited all of them.
+        #
+        # Engine failure must never read as verified silence — the
+        # same rc-synthesis run_rule applies: a nonzero batch exit
+        # whose stderr matches no known error pattern previously
+        # yielded errors=[] with the full tree in files_examined, so
+        # coverage/refutation consumers read a crashed sweep as
+        # examined-clean.
+        if proc.returncode != 0 and not errors:
+            stderr_tail = (proc.stderr or "").strip()[-500:]
+            errors.append(
+                f"spatch exited with code {proc.returncode}"
+                + (f": {stderr_tail}" if stderr_tail else "")
+            )
+        if proc.returncode != 0 or errors:
+            logger.warning(
+                "Coccinelle batch failed (exit %s) — retrying %d "
+                "accepted rules individually to preserve per-rule results",
+                proc.returncode, len(batched_rules),
+            )
+            out = _individual_results(batched_rules)
+            out.update(refused)
+            return out
+        try:
+            batch_examined = _collect_files_examined(
+                target, {m.file for m in all_matches},
+                no_includes=no_includes, tree_files=target_inventory(),
+            )
+        except OSError as exc:
+            inventory_error = _source_inventory_error(exc)
+            batch_examined = []
+        out = {
+            s: _record_inventory_error(SpatchResult(
+                rule=s, rule_path=str(r),
+                matches=by_rule.get(s, []),
+                files_examined=list(batch_examined),
+                errors=list(errors),
+                elapsed_ms=elapsed,
+                returncode=proc.returncode,
+                forged_markers=forged,
+            ), inventory_error)
+            for s, r in zip(rule_stems, batched_rules)
+        }
+        out.update(refused)
+        return out
+
+
+def _demux_batch_matches(
+    all_matches: list[SpatchMatch],
+    rule_stems: list[str],
+    alias_of: dict[str, str],
+    *, diagnostics: list[str] | None = None,
+) -> dict[str, list[SpatchMatch]]:
+    """Attribute batch matches to their emitting rule file.
+
+    ``alias_of`` maps every emitted rule id (scanned from the rule
+    text) plus each file stem to the owning stem. An id that maps to
+    no batched rule is logged loudly — never silently dropped: with
+    the evidence nonce in place any parsed match came from a batched
+    rule's own scripting, so an unattributable id means the alias
+    scan missed an emission shape and needs fixing.
+    """
+    by_rule: dict[str, list[SpatchMatch]] = {s: [] for s in rule_stems}
+    unassigned = 0
+    for m in all_matches:
+        stem = alias_of.get(m.rule)
+        if stem is None or stem not in by_rule:
+            unassigned += 1
+            logger.warning(
+                "batched COCCIRESULT rule id %r not attributable to "
+                "any batched rule file (stems: %s) — match at %s:%s "
+                "dropped from per-rule results",
+                m.rule, ", ".join(sorted(by_rule)), m.file, m.line,
+            )
+            continue
+        by_rule[stem].append(m)
+    if unassigned and diagnostics is not None:
+        diagnostics.append(f"Coccinelle batch has {unassigned} match(es) with unassigned rule identities")
+    return by_rule
+
+
+def _dedup_matches(matches: list[SpatchMatch]) -> list[SpatchMatch]:
+    """Remove duplicate matches (same file+full source span+rule+message),
+    preserving order.
+
+    The ``message`` field MUST be part of the key. Multi-rule cocci
+    files (PR-4 function_inventory, source_intel multi-message rules)
+    legitimately emit multiple distinct messages at the same
+    (file, line) — for example ``def:foo`` and ``call:bar`` both
+    landing at line 1 of a one-line function definition that also
+    contains a call. Dropping `message` from the key would silently
+    coalesce these into a single match, losing the per-message
+    information. End positions are equally significant: two match extents
+    starting at the same token must not collapse into an arbitrary span.
+    """
     seen: set = set()
     result = []
     for m in matches:
-        key = (m.file, m.line, m.column, m.rule)
+        key = (m.file, m.line, m.column, m.line_end, m.column_end, m.rule, m.message)
         if key not in seen:
             seen.add(key)
             result.append(m)
     return result
 
 
-def _collect_files_examined(target: Path, match_files: set) -> List[str]:
+def _source_inventory_error(exc: OSError) -> str:
+    return f"Coccinelle source inventory unavailable: {type(exc).__name__}"
+
+
+def _record_inventory_error(result: SpatchResult, error: str | None) -> SpatchResult:
+    if error:
+        if error not in result.errors:
+            result.errors.append(error)
+        result.files_examined = sorted({match.file for match in result.matches})
+    return result
+
+
+def _walk_c_h(target: Path) -> set[str]:
+    """One recursive enumeration of the target's C source surface.
+
+    Both .c and .h — with includes enabled, spatch examines
+    preprocessed translation units which pull headers in via
+    #include expansion, and operators tracking "did the rule examine
+    this header?" need .h in the list. Under ``--no-includes`` the
+    headers are NEVER parsed; ``_collect_files_examined`` filters
+    them back out so the claim tracks what spatch actually saw.
+    """
+    files: set[str] = set()
+    for path in target.rglob("*"):
+        if not path.name.endswith((".c", ".h")):
+            continue
+        try:
+            if path.is_file():
+                files.add(str(path))
+        except OSError as exc:
+            # Older supported Python versions can raise for inaccessible
+            # metadata. An unverifiable entry cannot establish file coverage.
+            logger.debug("Coccinelle source inventory skipped an entry: %s", type(exc).__name__)
+    return files
+
+
+def _collect_files_examined(
+    target: Path,
+    match_files: set,
+    *,
+    tree_files: set[str] | None = None,
+    no_includes: bool = False,
+) -> list[str]:
     """Build files_examined from the target path plus any match files.
 
-    spatch has no machine-readable log of which files it processed, so we
-    approximate: for a single file target we know exactly; for a directory
-    we enumerate *.c AND *.h (spatch examines headers too — pre-fix
-    only `.c` was counted, so the files_examined report under-
-    counted by ~50% on typical C projects, and any rule that
-    matched in a header silently failed to surface in
-    files_examined even though it WAS examined).
+    spatch has no machine-readable log of which files it processed,
+    so we approximate: for a single file target we know exactly; for
+    a directory we enumerate *.c, plus *.h only when includes are
+    enabled (header coverage is then approximate — only headers a
+    scanned TU actually #includes were seen). Under ``no_includes``
+    — exactly what the prereqs sweep and the untrusted-target
+    recommendation use — spatch never opens a header, so listing
+    ``*.h`` claimed verified silence for files the run was
+    structurally blind to, and ``to_coverage_record`` propagated the
+    over-claim into coverage-coccinelle.json.
+
+    ``tree_files``: pre-enumerated directory walk to reuse. The walk is
+    loop-invariant across the rules of one run, so multi-rule callers
+    (run_rules) enumerate once and pass it in — per-rule re-walks cost
+    minutes of stat traffic on kernel-scale targets.
     """
     if target.is_file():
         examined = {str(target)} | match_files
     elif target.is_dir():
-        # Both .c and .h — spatch examines preprocessed
-        # translation units which include headers via #include
-        # expansion. Operators tracking "did the rule examine
-        # this header?" need .h in the list.
-        examined = (
-            {str(f) for f in target.rglob("*.c")}
-            | {str(f) for f in target.rglob("*.h")}
-            | match_files
-        )
+        walked = tree_files if tree_files is not None else _walk_c_h(target)
+        if no_includes:
+            walked = {f for f in walked if not f.endswith(".h")}
+        examined = walked | match_files
     else:
         examined = set(match_files)
     return sorted(examined)
@@ -381,13 +1608,16 @@ def _inject_harness(rule_text: str, rule_name: str) -> str:
 
     Adds an @script:python block that emits COCCIRESULT JSON lines for
     each match. Binds the first position metavariable from the first
-    named rule — only correct for single-rule SmPL files. Multi-rule
-    files where the position variable is declared in a later rule will
-    produce an "unbound metavariable" error from spatch.
+    named rule — only correct for single-rule SmPL files, so files
+    with more than one distinct rule name are detected and returned
+    un-harnessed (spatch still runs, just without COCCIRESULT
+    structured output).
 
-    If no position metavariable is found, returns the rule unchanged
-    (matches won't produce structured output, but spatch still runs).
+    If no position metavariable is found, returns the rule unchanged.
+    The caller still executes it but discloses unavailable reporting.
     """
+    # Reuse the lexer view so comment/string examples cannot supply a
+    # position binding or masquerade as a second named rule.
     # `re.ASCII` so `\w` matches only ASCII identifiers. Pre-fix the
     # bare pattern admitted Unicode word chars (Cyrillic, Greek,
     # CJK, fullwidth letters) — and the captured pos_var is then
@@ -399,11 +1629,34 @@ def _inject_harness(rule_text: str, rule_name: str) -> str:
     # variable visually but not structurally. Stick to ASCII for
     # the harness-injected identifier; legitimate Coccinelle rules
     # use ASCII metavariable names per convention.
-    if not re.search(r"position\s+\w+", rule_text, re.ASCII):
+    view, ambiguous = _lexical_scan(rule_text)
+    if ambiguous:
         return rule_text
-
-    pos_match = re.search(r"position\s+(\w+)", rule_text, re.ASCII)
+    pos_match = re.search(r"\bposition\s+(\w+)", view, re.ASCII)
+    if pos_match is None:
+        return rule_text
     pos_var = pos_match.group(1)
+
+    # ASCII-restricted via re.ASCII above, but the captured name
+    # becomes a Python identifier inside the @script:python@ harness
+    # below — it sits in scope alongside ``json``, ``sys``, ``int``,
+    # ``_p``, ``_m`` etc. A hostile coccinelle rule could pick a
+    # name that shadows a builtin (``int``, ``open``, ``__import__``)
+    # or our own scratch vars and confuse the embedded interpreter.
+    # Reject anything in the Python builtin/keyword namespace or
+    # starting with a DUNDER (``__``); rule names that fail this
+    # check skip harness injection (spatch still runs, just
+    # without COCCIRESULT structured output).
+    #
+    # Pre-fix this rejected ALL underscore-prefixed names
+    # (``startswith("_")`` was the first clause), which clobbered
+    # legitimate C-style single-underscore positions like
+    # ``position _pos``. Single-underscore now flows through —
+    # only the Python-dunder pattern + the explicit
+    # ``_COCCI_POS_VAR_DENY`` blocklist (``_p`` / ``_m`` etc.)
+    # block injection.
+    if pos_var.startswith("__") or pos_var in _COCCI_POS_VAR_DENY:
+        return rule_text
 
     # Detect multi-rule .cocci files. Pre-fix the harness only
     # bound to the FIRST `@rule_name@` block, so:
@@ -421,7 +1674,7 @@ def _inject_harness(rule_text: str, rule_name: str) -> str:
     # silently emitting partial / wrong data.
     # `re.ASCII` for the same identifier-scope reason as above —
     # rule names are Python identifiers in the harness.
-    rule_names = re.findall(r"@(\w+)@", rule_text, re.ASCII)
+    rule_names = re.findall(r"@[ \t]*(\w+)[ \t]*@", view, re.ASCII)
     if len(set(rule_names)) > 1:
         # Multi-rule file — harness injection isn't safe.
         # Caller handles the no-output case via spatch's
@@ -432,6 +1685,14 @@ def _inject_harness(rule_text: str, rule_name: str) -> str:
     rule_id = rule_names[0]
 
     safe_name = _SAFE_NAME_RE.sub("_", rule_name)
+    # ``json.dumps(safe_name)`` produces a properly-quoted Python
+    # string literal — including escapes for any backslashes or
+    # double quotes that might end up in safe_name after a future
+    # widening of _SAFE_NAME_RE. Pre-fix the f-string interpolated
+    # safe_name BETWEEN double quotes; today's regex (``[A-Za-z0-9_-]``)
+    # prevents quote/backslash chars but a single regex change
+    # would let a hostile rule break out of the string literal.
+    safe_name_repr = json.dumps(safe_name)
 
     harness = f"""
 
@@ -441,22 +1702,54 @@ def _inject_harness(rule_text: str, rule_name: str) -> str:
 
 import json, sys
 for _p in {pos_var}:
-    _m = {{"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "{safe_name}"}}
+    _m = {{"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": {safe_name_repr}}}
     sys.stderr.write("{RESULT_PREFIX}" + json.dumps(_m) + "\\n")
 """
     return rule_text + harness
 
 
-def _parse_results(output: str, rule_name: str) -> List[SpatchMatch]:
-    """Parse COCCIRESULT lines from spatch stdout or stderr."""
+def _output_lines(output: str) -> Iterable[str]:
+    """Bound large multiline output without changing adapter operations.
+
+    Small and sparse streams retain the direct C splitter; dense native
+    streams use shared display-line iteration with bounded temporary lists.
+    """
+    if (type(output) is str and len(output) >= 16 * 1024
+            and output.count("\n", 0, 16 * 1024) >= 32):
+        return iter_splitlines(output)
+    return output.splitlines()
+
+
+def _parse_results(
+    output: str, rule_name: str, nonce: str | None = None,
+    *, diagnostics: list[str] | None = None,
+) -> list[SpatchMatch]:
+    """Parse COCCIRESULT lines from spatch stdout or stderr.
+
+    When ``nonce`` is given (every runner invocation passes one), only
+    lines carrying the per-invocation ``COCCIRESULT-<nonce>:`` marker
+    are accepted — a bare ``COCCIRESULT:`` line (or one with a guessed
+    nonce) planted in hostile source and re-emitted by spatch's diff
+    output is NOT parseable evidence (U14-F2). ``nonce=None`` keeps
+    the legacy plain-prefix parse for callers that post-process raw
+    spatch output outside a runner invocation (unit tests). When supplied,
+    ``diagnostics`` receives a count-only notice for unusable authenticated
+    rows; raw malformed content is never copied into execution errors.
+    """
+    prefix = _nonced_prefix(nonce) if nonce else RESULT_PREFIX
+    # Stripping a display line cannot create an absent literal prefix.
+    if type(output) is str and type(prefix) is str and prefix not in output:
+        return []
     matches = []
-    for line in output.splitlines():
+    malformed = 0
+    for line in _output_lines(output):
         line = line.strip()
-        if line.startswith(RESULT_PREFIX):
-            json_str = line[len(RESULT_PREFIX):]
+        if line.startswith(prefix):
+            json_str = line[len(prefix):]
             try:
                 d = json.loads(json_str)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                malformed += 1
                 continue
             # Type-guard: spatch's @script:python harness always emits
             # an object, but a malformed rule (operator-supplied SmPL
@@ -465,13 +1758,67 @@ def _parse_results(output: str, rule_name: str) -> List[SpatchMatch]:
             # with AttributeError, taking out the WHOLE result-parsing
             # loop for that invocation. Skip non-object payloads.
             if not isinstance(d, dict):
+                malformed += 1
                 continue
             d.setdefault("rule", rule_name)
             try:
-                matches.append(SpatchMatch.from_dict(d))
-            except (TypeError, ValueError, KeyError):
+                match = SpatchMatch.from_dict(d)
+                # No path means no source match. Optional bad coordinates stay
+                # unknown instead of costing this match or neighboring rows.
+                if not match.file:
+                    malformed += 1
+                    continue
+                if not match.rule:
+                    match.rule = rule_name
+                matches.append(match)
+            except (TypeError, ValueError, KeyError, OverflowError):
+                malformed += 1
                 continue
+    if malformed and diagnostics is not None:
+        diagnostics.append(f"Coccinelle emitted {malformed} malformed structured result row(s)")
     return matches
+
+
+def _forged_marker_lines(output: str, nonce: str) -> Iterator[str]:
+    """COCCIRESULT-shaped lines that do NOT carry the invocation nonce.
+
+    These are exactly the lines the pre-nonce parser would have
+    accepted as verified matches: a repo-planted ``COCCIRESULT:{...}``
+    surviving in an ``#if 0`` block, a #define continuation, or any
+    context line spatch's diff output re-emits. Rejected from the
+    match set by _parse_results; surfaced here as an attack signal.
+    """
+    prefix = _nonced_prefix(nonce)
+    if type(output) is str and "COCCIRESULT" not in output:
+        return
+    for line in _output_lines(output):
+        s = line.strip()
+        if not s.startswith("COCCIRESULT"):
+            continue
+        if s.startswith(prefix):
+            continue
+        yield s[:200]
+
+
+def _warn_forged_markers(
+    stdout: str, stderr: str, *, nonce: str, rule_name: str, target: Path,
+) -> int:
+    """Count + log forged COCCIRESULT markers across both streams."""
+    count = 0
+    first = ""
+    for marker in chain(_forged_marker_lines(stdout or "", nonce),
+                        _forged_marker_lines(stderr or "", nonce)):
+        count += 1
+        if count == 1:
+            first = escape_nonprintable(marker)[:200]
+    if count:
+        logger.warning(
+            "COCCIRESULT forgery signal: %d marker line(s) without the "
+            "per-invocation nonce rejected (rule %s, target %s) — "
+            "likely hostile-source evidence-forgery attempt; first: %s",
+            count, rule_name, target, first,
+        )
+    return count
 
 
 _ERROR_PATTERNS = (
@@ -480,14 +1827,16 @@ _ERROR_PATTERNS = (
 )
 
 
-def _parse_errors(stderr: str) -> List[str]:
+def _parse_errors(stderr: str) -> list[str]:
     """Extract error messages from spatch stderr, ignoring info lines."""
     errors = []
-    for line in stderr.splitlines():
+    for line in _output_lines(stderr):
         line = line.strip()
         if not line:
             continue
-        if line.startswith(RESULT_PREFIX):
+        if line.startswith("COCCIRESULT"):
+            # Covers both the plain prefix and the per-invocation
+            # nonced marker (COCCIRESULT-<nonce>:).
             continue
         if line.startswith("init_defs_builtins:"):
             continue
@@ -497,3 +1846,140 @@ def _parse_errors(stderr: str) -> List[str]:
         if any(p in low for p in _ERROR_PATTERNS):
             errors.append(line)
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Multi-file batching: caps and per-file demultiplexing
+# ---------------------------------------------------------------------------
+
+# Files handed to one spatch invocation when a caller chunks a file
+# list for batching. Trades fork/sandbox amortisation against blast
+# radius, in both directions:
+#   * Lower and the per-invocation overhead dominates again — at 25
+#     files the sandboxed startup cost (~120-150 ms: namespace +
+#     Landlock setup, rule materialisation, OCaml init) amortises to
+#     ~5-6 ms/file; below ~8 files most of the batching win is gone.
+#   * Higher and one batch failure or timeout throws away more files'
+#     work (a failed batch propagates an error to EVERY member — see
+#     demux_result_by_file), the batch timeout has to stretch further,
+#     and argv length grows on deep trees.
+BATCH_CHUNK_FILES = 25
+
+# Headroom per additional batched file when scaling a single-file
+# timeout to a chunk, and the cap on how far the scaled timeout may
+# stretch. See derive_batch_timeout_s for the two-direction rationale.
+_BATCH_PER_FILE_TIMEOUT_S = 10
+_BATCH_TIMEOUT_CAP_FACTOR = 4
+
+
+def derive_batch_workers(cpu_count: int | None = None) -> int:
+    """Worker-pool width for running batched spatch invocations.
+
+    Each spatch process is single-threaded, so a pool of concurrent
+    batch invocations is what actually fans the sweep across cores.
+    Derived, both directions:
+      * Higher and the pool competes with everything else on the box —
+        the audit orchestrator's LLM worker pool, joern's JVM, and the
+        per-invocation sandbox setup serialise on kernel resources;
+        beyond ~16 lanes the measured speedup on kernel-scale files
+        plateaued while memory (each spatch peaks at ~50-200 MB on
+        large TUs) kept climbing.
+      * Lower and the parallel win evaporates: single-lane spatch on a
+        63k-file tree is a >13 h/rule floor; even 2 lanes halves it.
+    Above the two-worker floor, cpu//4 leaves headroom for the
+    orchestrator and sandbox supervisors. The floor can exceed the CPU
+    count on a one-CPU host: this width is a scheduling heuristic, not
+    a hard CPU limit.
+    """
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 1
+    return min(16, max(2, cpu_count // 4))
+
+
+def derive_batch_timeout_s(base_timeout_s: int, n_files: int) -> int:
+    """Scale a single-file spatch timeout to an *n_files* batch.
+
+    ``base + 10 s x (n - 1)``, capped at ``4 x base``. Both directions:
+      * Longer (uncapped linear x n) and one pathological batch stalls
+        a worker lane for K single-file timeouts — at the leg's 120 s
+        base and K=25 that is 50 minutes of lane time lost to work the
+        serial path would have abandoned per-file.
+      * Shorter (no per-file headroom) and a batch of ordinary files
+        trips the single-file budget purely by being a batch — the
+        typical per-file cost is well under 1 s, but individual
+        kernel-scale TUs measured in the tens of seconds, and a
+        tripped batch timeout discards every member's work (callers
+        degrade to per-file recompute).
+    """
+    if n_files <= 1:
+        return base_timeout_s
+    scaled = base_timeout_s + _BATCH_PER_FILE_TIMEOUT_S * (n_files - 1)
+    return min(scaled, base_timeout_s * _BATCH_TIMEOUT_CAP_FACTOR)
+
+
+def demux_result_by_file(
+    result: SpatchResult,
+    file_set: list[Path],
+    target_root: Path,
+) -> dict[str, SpatchResult]:
+    """Split one multi-file batch result into per-file results.
+
+    Returns ``{relative_path: SpatchResult}`` with an entry for EVERY
+    file in *file_set* (keys are relative to *target_root* when the
+    entry resolves under it, else the argv spelling). Matches
+    attribute by ``SpatchMatch.file`` — spatch echoes the argv path in
+    the position metavariable. A match-free file gets an empty-match
+    result whose ``files_examined`` carries itself only when the batch
+    has no reported parse/output error. Quiet-member attribution comes
+    from argv, not the match set, and is not a complete-parse witness.
+
+    A failed batch (``not result.ok``) propagates the error to EVERY
+    member with ``files_examined=[]`` so no consumer can read a member
+    of a crashed batch as refuted / examined-clean; callers degrade
+    those files to per-file recompute. Unassigned matches likewise
+    invalidate every member: guessing an attribution or dropping a hit
+    must never manufacture verified silence.
+    """
+    root = Path(target_root).resolve()
+    relative_paths: dict[str, str] = {}
+
+    def _rel(spelling: str) -> str:
+        if spelling in relative_paths:
+            return relative_paths[spelling]
+        # A report may contain thousands of matches for one input. Resolve
+        # each spelling once per batch, including failed/outside-root paths.
+        relative = spelling
+        p = Path(spelling)
+        if p.is_absolute():
+            try:
+                relative = str(p.resolve().relative_to(root))
+            except (ValueError, OSError):
+                relative_paths[spelling] = spelling
+                return spelling
+        relative_paths[spelling] = relative
+        return relative
+
+    by_file: dict[str, list[SpatchMatch]] = {}
+    for m in result.matches:
+        by_file.setdefault(_rel(m.file), []).append(m)
+
+    members = [_rel(str(Path(f).absolute())) for f in file_set]
+    errors = list(result.errors)
+    if by_file.keys() - set(members):
+        # Never turn an unassigned authentic hit into verified silence.
+        # Do not guess by basename: distinct source files can share it.
+        errors.append("Coccinelle batch contains matches outside its input file set")
+    failed = not result.ok or bool(errors)
+    out: dict[str, SpatchResult] = {}
+    for rel in members:
+        out[rel] = SpatchResult(
+            rule=result.rule,
+            rule_path=result.rule_path,
+            matches=list(by_file.get(rel, [])),
+            files_examined=[] if failed else [rel],
+            errors=list(errors),
+            elapsed_ms=result.elapsed_ms,
+            returncode=result.returncode,
+            forged_markers=result.forged_markers,
+        )
+    return out

@@ -1,4 +1,4 @@
-"""Tokenise a Dockerfile into an ordered list of :class:`Instruction`.
+r"""Tokenise a Dockerfile into an ordered list of :class:`Instruction`.
 
 Each instruction carries:
   * ``directive`` — the keyword (``FROM``, ``RUN``, ``COPY``, …),
@@ -25,9 +25,11 @@ Behaviours:
     (``# syntax=...``, ``# escape=\\``) which we currently
     ignore — their behaviour is dockerfile-frontend-specific and
     not relevant to the consumers we serve.
-  * Heredoc bodies (``<<EOF`` / ``<<-EOF``) are kept intact in the
-    instruction's ``args`` text — consumers don't need to peer
-    inside them today.
+  * Heredoc bodies (``<<EOF`` / ``<<-EOF``) are consumed up to their
+    terminator and NEVER parsed as instructions — a heredoc'd
+    ``FROM evil/image`` line must not reset stage tracking or plant
+    phantom instructions in the stream. Bodies are preserved in the
+    instruction's ``raw`` span; ``args`` carries the marker line.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +58,107 @@ _KNOWN_DIRECTIVES = frozenset({
 # ``FROM <image> [AS <stage>]`` — extract the stage name when
 # present. We tolerate both ``AS`` and ``as`` since either shows
 # up in practice.
+# (?<!\s) pins the match to the start of its whitespace run: a bare
+# leading \s+ re-consumes a hostile run from every scan position —
+# quadratic in the line length; the earliest match always starts at
+# the run start, so the match is unchanged.
 _FROM_AS_RE = re.compile(
-    r"\s+AS\s+(?P<name>[A-Za-z0-9_-]+)\s*$",
+    r"(?<!\s)\s+AS\s+(?P<name>[A-Za-z0-9_-]+)\s*$",
     re.IGNORECASE,
 )
+
+
+# One heredoc marker TOKEN: ``<<EOF``, ``<<-EOF``, ``<<"EOF"`` — no
+# whitespace between ``<<`` and the tag (BuildKit's lexer rule), tag
+# identifier-shaped so arithmetic ``1<<2`` never matches. Matched only
+# at positions _heredoc_tags has verified to be token-initial and
+# unquoted.
+_HEREDOC_TOKEN_RE = re.compile(
+    r"<<(?P<chomp>-?)(?P<q>[\"']?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=q)"
+)
+
+# Directives whose args may open heredocs (per the Dockerfile
+# reference); scoping the scan avoids false marker hits elsewhere.
+# ``ONBUILD`` is a compound wrapper: BuildKit parses the WRAPPED
+# instruction's heredocs (``ONBUILD RUN <<EOF``), so the scan must
+# unwrap it — see the dispatch in :func:`parse_dockerfile`.
+_HEREDOC_DIRECTIVES = frozenset({"RUN", "COPY", "ADD"})
+
+
+def _heredoc_tags(args: str) -> list[tuple[str, bool]]:
+    """``(tag, chomp)`` pairs for heredocs opened by an instruction's
+    args, in order — ``chomp`` is True for the ``<<-`` form (its
+    terminator may be tab-indented; the plain ``<<`` terminator must
+    match the line exactly, mirroring BuildKit).
+
+    BuildKit's lexer opens a heredoc only for an UNQUOTED token that
+    BEGINS with ``<<`` — a bare regex sweep over the whole args string
+    instead treated ANY ``<<identifier`` as a marker, so
+    ``echo "placeholder <<VERSION"``, ``sed 's/<<X>>/y/'`` and
+    ``$((1<<bits))`` each opened a phantom heredoc that swallowed
+    every later instruction to EOF (a regression for legitimate
+    Dockerfiles AND a one-token evasion primitive hiding later
+    RUN/FROM lines from apt/SBOM extraction). This quote-state scan
+    enforces the token rule: markers count only at token start,
+    outside single/double quotes and backslash escapes; ``<<<``
+    here-strings stay excluded.
+    """
+    tags: list[tuple[str, bool]] = []
+    in_single = False
+    in_double = False
+    escaped = False
+    token_start = True
+    i = 0
+    n = len(args)
+    while i < n:
+        c = args[i]
+        if escaped:
+            escaped = False
+            token_start = False
+            i += 1
+            continue
+        if in_single:
+            in_single = c != "'"
+            token_start = False
+            i += 1
+            continue
+        if c == "\\":
+            escaped = True
+            i += 1
+            continue
+        if in_double:
+            in_double = c != '"'
+            token_start = False
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+            token_start = False
+            i += 1
+            continue
+        if c == '"':
+            in_double = True
+            token_start = False
+            i += 1
+            continue
+        if c.isspace():
+            token_start = True
+            i += 1
+            continue
+        if (
+            token_start
+            and args.startswith("<<", i)
+            and not args.startswith("<<<", i)
+        ):
+            m = _HEREDOC_TOKEN_RE.match(args, i)
+            if m:
+                tags.append((m.group("tag"), m.group("chomp") == "-"))
+                i = m.end()
+                token_start = False
+                continue
+        token_start = False
+        i += 1
+    return tags
 
 
 class DockerfileSyntaxError(ValueError):
@@ -73,12 +172,12 @@ class DockerfileSyntaxError(ValueError):
 class Instruction:
     directive: str
     args: str
-    stage_name: Optional[str]
+    stage_name: str | None
     line: int
     raw: str
 
 
-def parse_dockerfile(text: str) -> List[Instruction]:
+def parse_dockerfile(text: str) -> list[Instruction]:
     """Parse the Dockerfile source into an ordered list of
     instructions.
 
@@ -86,9 +185,9 @@ def parse_dockerfile(text: str) -> List[Instruction]:
     iterating multiple times (consumers walking ``FROM`` lines vs
     ``RUN`` lines independently).
     """
-    out: List[Instruction] = []
-    current_stage: Optional[str] = None
-    raw_lines = text.splitlines()
+    out: list[Instruction] = []
+    current_stage: str | None = None
+    raw_lines = split_lines(text)
     i = 0
     while i < len(raw_lines):
         # Skip blank + comment-only lines. Track i for line numbers.
@@ -120,13 +219,16 @@ def parse_dockerfile(text: str) -> List[Instruction]:
             line = next_line
         i += 1
 
-        raw = "\n".join(chunks)
         # Strip the trailing backslashes for the LOGICAL line, but
-        # keep them in ``raw`` so consumers can round-trip.
+        # keep them in ``raw`` so consumers can round-trip. Comment-
+        # only continuation chunks are transparent to Docker and are
+        # excluded here too — joining them in left a bare ``#`` plus
+        # comment prose embedded mid-args for downstream tokenisers.
         logical = " ".join(
             (c.rstrip()[:-1] if c.rstrip().endswith("\\") else c)
             .strip()
             for c in chunks
+            if not c.strip().startswith("#")
         )
 
         # Split directive from args.
@@ -135,6 +237,40 @@ def parse_dockerfile(text: str) -> List[Instruction]:
             continue
         directive = parts[0].upper()
         args = parts[1] if len(parts) > 1 else ""
+
+        # Consume heredoc bodies (see module docstring): every marker
+        # token on the logical line (token-initial, unquoted — see
+        # _heredoc_tags) opens a body that runs to its terminator line
+        # — BuildKit's rule: the plain ``<<`` terminator matches the
+        # line EXACTLY, ``<<-`` additionally allows tab indentation.
+        # (A blanket strip() closed ``<<`` heredocs at space-indented
+        # tag lines BuildKit treats as body — re-entering the real
+        # remainder as phantom instructions.) Body lines join ``raw``
+        # but are never re-entered as instructions. An unterminated
+        # heredoc consumes to EOF — matching the build frontend, which
+        # would refuse such a file anyway. ``ONBUILD`` is a compound
+        # wrapper whose WRAPPED instruction opens the heredocs
+        # (``ONBUILD RUN <<EOF``) — scan the unwrapped args, or the
+        # body lines parse as phantom instructions here too.
+        heredoc_directive = directive
+        heredoc_args = args
+        if directive == "ONBUILD":
+            wrapped = args.split(None, 1)
+            heredoc_directive = wrapped[0].upper() if wrapped else ""
+            heredoc_args = wrapped[1] if len(wrapped) > 1 else ""
+        if heredoc_directive in _HEREDOC_DIRECTIVES:
+            for tag, chomp in _heredoc_tags(heredoc_args):
+                while i < len(raw_lines):
+                    body_line = raw_lines[i]
+                    chunks.append(body_line)
+                    i += 1
+                    terminator = (
+                        body_line.lstrip("\t") if chomp else body_line
+                    )
+                    if terminator == tag:
+                        break
+
+        raw = "\n".join(chunks)
 
         if directive not in _KNOWN_DIRECTIVES:
             # Unknown directive — surface but don't crash. Could be

@@ -1,0 +1,759 @@
+"""Shared atomic-file-write primitive.
+
+Consumers reach here rather than reinventing the tempfile-plus-rename
+dance. Semantics guaranteed:
+
+  * A concurrent reader NEVER sees a partial file — either the old
+    bytes or the new bytes, never a truncation-in-progress.
+  * On success, the destination is fully committed to disk (fsync
+    on the tempfile before rename, best-effort fsync of the parent
+    directory after rename for power-loss durability).
+  * On failure — including ``KeyboardInterrupt`` / ``BaseException``
+    — the temporary is cleaned up and ``path`` is left in its prior
+    state.
+  * When the destination already exists, its permission bits are
+    preserved (so an operator ``chmod 0o600`` isn't silently widened
+    to 0o644) UNLESS an explicit ``mode=`` is passed, in which case
+    the caller's mode wins.
+  * The tempfile is created with ``O_EXCL | O_NOFOLLOW`` and a
+    PID+TID+random suffix so:
+      - a symlink squat at the tempfile path is rejected loudly
+        rather than followed (defence against local attacker on a
+        shared filesystem);
+      - two threads in the same process racing on the same ``path``
+        each get their own tempfile;
+      - two processes racing (parallel CI matrix, two operators)
+        each get their own tempfile.
+
+Symlink handling at the destination path:
+
+  * The perm probe uses ``lstat`` so we never inherit the target of
+    a symlink at ``path``.
+  * ``os.replace(tmp, path)`` REPLACES the symlink itself with a
+    regular file — this is the standard "atomic write to path X"
+    contract. If a caller wants to write through a symlink to its
+    target, they should resolve the path first.
+
+``rename_without_replace`` moves any owned entry to an absent name;
+``publish_new_directory`` additionally requires a real source directory.
+The directory helper publishes complete same-filesystem directory trees
+without replacing an occupied destination. It provides atomic visibility,
+not fsync durability; callers retain staging ownership on failure.
+
+The primitive is intended for durability-critical writers (state
+stores, sandbox files, credentials). Regeneratable outputs (scripts,
+one-shot corpus generators) shouldn't use it — the fsync overhead is
+unearned for outputs that just get re-run on failure. Those writers
+use the EXCLUSIVE-create family below instead:
+
+  * ``open_exclusive_artifact`` / ``write_new_bytes`` /
+    ``write_new_text`` — ``O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC``
+    creation of a NEW artifact. The artifact's directory is (or was)
+    inside a sandboxed child's write grant, so anything already
+    occupying the destination name — a planted symlink aimed at a
+    victim file, a reader-less FIFO, a pre-created file — makes the
+    open fail closed instead of following/truncating/blocking.
+    ``replace=True`` adds an lstat-honest pre-unlink for writers that
+    own the name and legitimately re-emit it (campaign logs, staged
+    seeds): ``Path.unlink`` removes a planted symlink ITSELF (never
+    its target), and the O_EXCL create still fails loud if something
+    reappears in the unlink→open window.
+  * ``open_hardened_append`` — the trail-append open shape
+    (``O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`` + post-open
+    fstat S_ISREG refusal) for callers that keep a long-lived append
+    handle and therefore cannot route through
+    ``core.json.append_jsonl``'s one-shot write.
+
+Consumers:
+  * ``packages/sca`` fixer / rewriter modules — via the thin
+    ``packages/sca/_atomic.py`` wrapper (delegates atomic_write_text
+    / atomic_write_bytes to the primitive; preserves the sca-side
+    positional-args API for 15+ existing call sites).
+  * Every ``core.json.save_json`` caller (threat models, checklists,
+    run reports, LLM detection cache, scorecard) transitively via
+    ``save_json``'s delegation.
+  * Direct-call consumers: core annotations, labeled attempts, binary
+    fingerprint store, witness store, coverage store, sandbox
+    calibration cache, sandbox summary + audit-degraded markers.
+
+Client-locality caveat (WSL drvfs/9p, no behaviour change): on a
+Windows-interop mount the ``os.replace`` commit is executed by the
+9p server, and readers within the same distro (one client) keep the
+full old-bytes-or-new-bytes guarantee exactly as on a local
+filesystem — this covers every consumer above (annotation saves,
+``save_json`` metadata writes, the JSON cache's puts) when writer
+and reader share the distro. Readers on ANOTHER client (Windows
+side, another distro) go through their own attribute/dentry caches:
+they still never see a torn file, but can keep observing the
+pre-replace content for the cache window after the commit, and the
+fsync durability legs are delegated to the 9p server. Placement
+guidance lives in docs/wsl.md.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Buffer, Iterable
+
+import errno
+import hashlib
+import logging
+import os
+import secrets
+import shutil
+import stat as _stat
+import threading
+from pathlib import Path
+
+from .directory import publish_new_directory, rename_without_replace  # noqa: F401 — public filesystem primitives
+
+
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+# Perm mask: only the low 9 bits are legal via ``mode=``. Rejects
+# setuid (0o4000), setgid (0o2000), sticky (0o1000). None of the
+# durability-critical consumers should be shipping files with those
+# bits set; requiring an explicit path (chmod after the write) forces
+# an operator to think about it.
+_MODE_MASK = 0o777
+
+
+def _validate_mode(mode: int | None) -> None:
+    """Reject ``mode`` values outside 0o000..0o777.
+
+    Raises ``ValueError`` on anything not representable as a plain
+    POSIX file mode. Explicit rejection beats silent masking: a caller
+    passing ``mode=0o4755`` is either confused or trying to install a
+    setuid file — either way we want to fail loud, not paper over it.
+    """
+    if mode is None:
+        return
+    if not isinstance(mode, int):
+        msg = f"mode must be int (0o000..0o777), got {type(mode).__name__}"
+        raise ValueError(msg)
+    if not (0 <= mode <= _MODE_MASK):
+        msg = f"mode must be in 0o000..0o777, got 0o{mode:o}"
+        raise ValueError(msg)
+
+
+def _resolve_effective_mode(
+    path: Path,
+    mode: int | None,
+) -> int:
+    """Pick the mode to apply to the new file.
+
+    Precedence:
+      1. Explicit ``mode=`` from caller wins.
+      2. Else preserve existing perms if destination is a regular
+         file (guards the operator-chmod case).
+      3. Else default 0o644.
+
+    Uses ``lstat`` so a symlink at ``path`` never lets us inherit
+    the symlink target's perms — the atomic replace would then destroy
+    the symlink AND install a file with unrelated perms. Only preserves
+    when the existing entry is a regular file; symlinks / sockets /
+    devices fall back to the default.
+    """
+    if mode is not None:
+        return mode
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return 0o644
+    # PermissionError etc propagate — an inaccessible parent is a
+    # real problem the caller should see, not silently downgrade to
+    # 0o644 (which would be a chmod-widening event on the eventual
+    # rename).
+    if _stat.S_ISREG(st.st_mode):
+        return _stat.S_IMODE(st.st_mode)
+    return 0o644
+
+
+def _close_write_fd(fd: int, *, write_failed: bool) -> None:
+    """Keep the operation's failure authoritative if closing also fails."""
+    try:
+        os.close(fd)
+    except BaseException:
+        if not write_failed:
+            raise
+        try:
+            logging.getLogger(__name__).warning(
+                "artifact descriptor cleanup failed", exc_info=True,
+            )
+        except BaseException:
+            pass  # Diagnostics must not replace the active operation error.
+
+
+def write_text_atomically(
+    path: str | Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    tmp_prefix: str = ".atomic-",
+    mode: int | None = None,
+    replace: bool = True,
+    root: Path | None = None,
+) -> None:
+    """Write ``content`` (str) to ``path`` atomically.
+
+    Thin wrapper over :func:`write_bytes_atomically`; encodes to
+    bytes and delegates. See module docstring for full semantics.
+
+    ``path.parent`` is created if missing.
+
+    ``mode`` semantics: see :func:`write_bytes_atomically`.
+    """
+    write_bytes_atomically(
+        path,
+        content.encode(encoding),
+        tmp_prefix=tmp_prefix,
+        mode=mode,
+        replace=replace,
+        root=root,
+    )
+
+
+def _atomic_temporary_name(name: str, prefix: str, nonce: str, parent: Path | int) -> str:
+    """Retain short staging names and bound long ones to the destination FS."""
+    if "\x00" in name or "\x00" in prefix:
+        raise ValueError("NUL in atomic staging name")
+    conventional = f"{prefix}{name}.{os.getpid()}.{threading.get_ident()}.{nonce}.tmp"
+    # Preserve normal component validation even when the fallback discards an
+    # overlong prefix. It must never turn a path-bearing prefix into a name.
+    Path(name).with_name(conventional)
+    try:
+        limit = (os.fpathconf(parent, 'PC_NAME_MAX') if isinstance(parent, int)
+                 else os.pathconf(parent, 'PC_NAME_MAX'))
+    except (AttributeError, OSError, ValueError):
+        limit = 255
+    if limit <= 0:
+        limit = 255
+    if len(os.fsencode(conventional)) <= limit:
+        return conventional
+    digest = hashlib.sha256(os.fsencode(name)).hexdigest()[:16]
+    temporary = f"{prefix}{digest}.{nonce}.tmp"
+    if len(os.fsencode(temporary)) > limit:
+        temporary = f".atomic-{digest}.{nonce}.tmp"
+    if len(os.fsencode(temporary)) > limit:
+        raise OSError(errno.ENAMETOOLONG,
+                      'Filesystem name limit cannot accommodate an atomic staging file', name)
+    return temporary
+
+
+def write_bytes_atomically(
+    path: str | Path,
+    content: Buffer | Iterable[Buffer],
+    *,
+    tmp_prefix: str = ".atomic-",
+    mode: int | None = None,
+    replace: bool = True,
+    root: Path | None = None,
+) -> None:
+    """Write bytes or an iterable of byte chunks to ``path`` atomically.
+
+    Chunks are consumed incrementally. If iteration or writing fails, the
+    previous destination remains intact and the temporary file is removed.
+
+    With ``root``, directory creation and publication stay anchored beneath
+    that existing root without following symlinks. Streaming and no-clobber
+    publication retain the same semantics as ordinary atomic writes.
+
+    See module docstring for full semantics. Binary variant so
+    callers writing JSONL / images / archives don't have to double-
+    encode.
+
+    ``path.parent`` is created if missing.
+
+    With ``replace=False``, publish using a hard link: an occupied final
+    name raises FileExistsError and remains untouched. Readers see only
+    complete files. Filesystems without hard-link support refuse the write
+    rather than falling back to a non-atomic or overwriting publication.
+
+    ``mode`` (optional): when set to an integer in ``0o000..0o777``,
+    applied via ``os.fchmod`` on the tempfile BEFORE the rename so
+    the atomic rename installs a file that already has the requested
+    permissions — no window where the file exists at default perms
+    before a chmod tightens them. Callers with security-sensitive
+    writes (credentials, session tokens, per-user state) should pass
+    ``mode=0o600``. Setuid / setgid / sticky bits are rejected —
+    callers that genuinely need those bits must chmod explicitly.
+
+    When ``mode`` is None (default), preserves existing perms if the
+    destination is a regular file (guards the operator-chmod case),
+    else uses 0o644.
+    """
+    _validate_mode(mode)
+    path = Path(path)
+    if root is not None:
+        _write_bytes_beneath(path, content, root=Path(root), tmp_prefix=tmp_prefix, mode=mode, replace=replace)
+        return
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    effective_mode = _resolve_effective_mode(path, mode)
+
+    # Tempfile name = prefix + basename + PID + TID + random suffix.
+    # Each component blocks a specific attack / collision:
+    #   - PID: two processes on shared FS don't collide
+    #   - TID: two threads in same process don't collide
+    #   - random: an attacker who knows PID + TID (via /proc, ps)
+    #     still can't predict the full path to pre-create a squat
+    #     file. Combined with O_EXCL + O_NOFOLLOW below, symlink-
+    #     through and pre-created-file attacks fail loud.
+    tmp = path.with_name(_atomic_temporary_name(
+        path.name, tmp_prefix, secrets.token_hex(4), parent,
+    ))
+
+    # O_EXCL: refuse if tempfile already exists (attacker squat, or
+    # stale from a crashed prior invocation — either way the operator
+    # should see and clean up rather than us silently overwriting).
+    # O_NOFOLLOW: refuse if tempfile is a symlink. Defence-in-depth
+    # against a squatter who predicts the tempfile name.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+
+    fd = os.open(tmp, flags, effective_mode)
+    try:
+        # The close lives in a finally that starts IMMEDIATELY after
+        # the open succeeds, so every exception path — including a
+        # BaseException raised inside the fchmod window — closes the
+        # fd before the outer handler unlinks the tempfile.
+        write_failed = False
+        try:
+            try:
+                # O_CREAT + mode gets umask-adjusted. Explicit fchmod
+                # bypasses umask so the caller's requested mode WINS
+                # regardless of the process's umask. On the preserve-
+                # existing path this is a no-op.
+                os.fchmod(fd, effective_mode)
+            except (OSError, AttributeError):
+                # Windows + some mounts don't honour fchmod — the
+                # O_CREAT mode argument was already best-effort.
+                pass
+            # ``os.write`` may return a SHORT count (interrupted by a
+            # signal after partial progress, filesystem-specific
+            # limits on single-call sizes). Pre-fix the single call
+            # ignored the return value: a positive short write then
+            # fsync'd and ``os.replace``'d a TRUNCATED file as
+            # committed — the exact torn-write the primitive exists
+            # to prevent. Loop until every byte is written; a
+            # zero-progress write raises instead of spinning.
+            views: Iterable[memoryview]
+            if isinstance(content, Buffer):
+                views = (memoryview(content),)
+            else:
+                views = (memoryview(chunk) for chunk in content)
+            for view in views:
+                view = view.cast("B")
+                written = 0
+                while written < len(view):
+                    n = os.write(fd, view[written:])
+                    if n <= 0:
+                        raise OSError(
+                            f"short write to {tmp}: os.write returned {n}",
+                        )
+                    written += n
+            os.fsync(fd)
+        except BaseException:
+            write_failed = True
+            raise
+        finally:
+            _close_write_fd(fd, write_failed=write_failed)
+        # Atomic rename. Same-FS on POSIX is atomic by spec; the
+        # tempfile sits in the same directory to guarantee that.
+        # Cross-FS raises EXDEV — but tmp lives in path.parent so
+        # this is unreachable in practice.
+        if replace:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)
+            tmp.unlink()
+        # Best-effort durability: fsync the parent directory so the
+        # rename survives a power loss. Windows + some mounts don't
+        # support directory fsync — silent fallback is fine.
+        try:
+            flush_failed = False
+            dir_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass  # Best-effort flush is complete before directory close.
+            except BaseException:
+                flush_failed = True
+                raise
+            finally:
+                _close_write_fd(dir_fd, write_failed=flush_failed)
+        except OSError:
+            pass
+    except BaseException:
+        # Catch BaseException (which includes KeyboardInterrupt)
+        # explicitly — that's the exact scenario a torn write would
+        # otherwise happen in. Best-effort clean up of the tempfile.
+        # Descriptor close is attempted before we get here: the inner
+        # try/finally spans everything from the successful os.open
+        # (fchmod included) through the fsync, and on the O_EXCL
+        # failure path the fd never existed.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            try:
+                logging.getLogger(__name__).warning(
+                    "atomic write temporary cleanup failed for %s", tmp, exc_info=True,
+                )
+            except BaseException:
+                pass  # Diagnostics must not replace the active operation error.
+        raise
+
+
+def _write_bytes_beneath(path: Path, content: Buffer | Iterable[Buffer], *, root: Path,
+                         tmp_prefix: str, mode: int | None, replace: bool) -> None:
+    """Use a pinned parent for creation, publication, and failure cleanup."""
+    from core.source.beneath import open_dir_beneath
+    relative = path.relative_to(root)
+    if not relative.name or "/" in tmp_prefix or "\x00" in tmp_prefix:
+        raise ValueError("Unsafe anchored atomic destination")
+    parent_fd = open_dir_beneath(root, relative.parent, create=True)
+    temporary = ''
+    created = False
+    operation_failed = False
+    try:
+        temporary = _atomic_temporary_name(
+            relative.name, tmp_prefix, secrets.token_hex(8), parent_fd,
+        )
+        effective_mode = mode if mode is not None else 0o644
+        if mode is None:
+            try:
+                previous = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+                if _stat.S_ISREG(previous.st_mode):
+                    effective_mode = _stat.S_IMODE(previous.st_mode) & 0o777
+            except FileNotFoundError:
+                pass
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
+                     effective_mode, dir_fd=parent_fd)
+        created = True
+        write_failed = False
+        try:
+            try:
+                os.fchmod(fd, effective_mode)
+            except (OSError, AttributeError):
+                pass
+            views = (memoryview(content),) if isinstance(content, Buffer) else (memoryview(chunk) for chunk in content)
+            for view in views:
+                view = view.cast("B")
+                written = 0
+                while written < len(view):
+                    count = os.write(fd, view[written:])
+                    if count <= 0:
+                        raise OSError("Atomic write made no progress")
+                    written += count
+            os.fsync(fd)
+        except BaseException:
+            write_failed = True
+            raise
+        finally:
+            _close_write_fd(fd, write_failed=write_failed)
+        if replace:
+            os.replace(temporary, relative.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            created = False
+        else:
+            os.link(temporary, relative.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+            os.unlink(temporary, dir_fd=parent_fd)
+            created = False
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+    except BaseException:
+        operation_failed = True
+        raise
+    finally:
+        try:
+            if created:
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    if not operation_failed:
+                        raise
+                    try:
+                        logging.getLogger(__name__).warning("anchored atomic temporary cleanup failed", exc_info=True)
+                    except BaseException:
+                        pass  # Diagnostics must not replace the active operation error.
+        finally:
+            _close_write_fd(parent_fd, write_failed=operation_failed)
+
+
+def open_exclusive_artifact(
+    path: str | Path,
+    *,
+    mode: int | None = None,
+    replace: bool = False,
+) -> int:
+    """Exclusively create the NEW artifact at *path*; return the fd.
+
+    ``O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC``: anything
+    already occupying the destination — a planted symlink (even a
+    dangling one, which passes ``exists() == False``), a FIFO, a
+    pre-created file — fails the open with ``OSError``
+    (``FileExistsError`` for an occupied name) instead of being
+    followed or truncated. Generalises the seed-writer idiom the
+    corpus profiler carried locally.
+
+    ``replace=True``: for writers that OWN the name and legitimately
+    re-emit it (campaign logs, staged seeds, generated scripts) —
+    pre-unlink with lstat honesty (``Path.unlink`` removes a planted
+    symlink/FIFO ITSELF, never what it points at; a directory at the
+    name still raises), then the O_EXCL create fails loud if anything
+    reappears in the unlink→open window.
+
+    ``mode`` (optional) is validated like the atomic writers'
+    (0o000..0o777, no setuid/setgid/sticky). When SET, it is enforced
+    via best-effort ``fchmod`` so the caller-requested mode (0o600
+    secrets, 0o755 scripts) wins over the process umask. When ``None``
+    (default), the file is created with the conventional 0o644 masked
+    by the process umask — the behaviour of the plain ``open("w")``
+    these writers replaced, and of ``open_hardened_append`` /
+    ``core.json.append_jsonl`` in the same discipline. Both
+    directions matter: fchmod-forcing an unrequested default silently
+    WIDENED artifacts past a restrictive umask (0o600 under
+    ``umask 077`` became a world-readable 0o644 — target-derived
+    crash artifacts on multi-user hosts), while an explicit mode must
+    keep beating the umask (a 0o755 generated script must execute).
+
+    The caller owns the returned fd (``os.fdopen`` or ``os.close``).
+    """
+    _validate_mode(mode)
+    p = Path(path)
+    if replace:
+        p.unlink(missing_ok=True)
+    fd = os.open(
+        str(p),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
+        0o644 if mode is None else mode,
+    )
+    try:
+        if mode is not None:
+            try:
+                os.fchmod(fd, mode)
+            except (OSError, AttributeError):
+                # Windows + some mounts don't honour fchmod — the O_CREAT
+                # mode argument was already best-effort.
+                pass
+    except BaseException:
+        _close_write_fd(fd, write_failed=True)
+        raise
+    return fd
+
+
+def write_new_bytes(
+    path: str | Path,
+    content: bytes,
+    *,
+    mode: int | None = None,
+    replace: bool = False,
+) -> None:
+    """Write *content* to a NEW artifact at *path* via
+    :func:`open_exclusive_artifact` (see there for the refusal,
+    ``mode`` and ``replace`` semantics — an explicit ``mode`` beats
+    the umask, the default honours it). Raises ``OSError`` on refusal
+    or write failure; no tempfile, no fsync — for regeneratable
+    outputs where the atomic writers' durability cost is unearned."""
+    fd = open_exclusive_artifact(path, mode=mode, replace=replace)
+    write_failed = False
+    try:
+        view = memoryview(content)
+        written = 0
+        while written < len(view):
+            n = os.write(fd, view[written:])
+            if n <= 0:
+                raise OSError(
+                    f"short write to {path}: os.write returned {n}",
+                )
+            written += n
+    except BaseException:
+        write_failed = True
+        raise
+    finally:
+        _close_write_fd(fd, write_failed=write_failed)
+
+
+def write_new_text(
+    path: str | Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    mode: int | None = None,
+    replace: bool = False,
+) -> None:
+    """Text variant of :func:`write_new_bytes`."""
+    write_new_bytes(
+        path, content.encode(encoding), mode=mode, replace=replace,
+    )
+
+
+def open_hardened_append(path: str | Path, *, mode: int = 0o644) -> int:
+    """Open *path* for appending with the hardened trail shape; return
+    the fd.
+
+    ``O_NOFOLLOW`` refuses a planted symlink (ELOOP); ``O_NONBLOCK``
+    makes a planted reader-less FIFO fail fast (ENXIO) instead of
+    blocking the writer forever; the post-open ``fstat`` S_ISREG
+    check refuses everything else non-regular (a FIFO that has a
+    reader, a device). Same flags as ``core.json.append_jsonl`` — use
+    this when the caller keeps a persistent append handle (streamed
+    event trails) instead of appending one record per call.
+
+    Raises ``OSError`` on refusal. The caller owns the returned fd.
+    """
+    _validate_mode(mode)
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK
+    )
+    fd = os.open(str(path), flags, mode)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(
+                f"refusing to append to {path}: not a regular file "
+                "(planted FIFO/device at the trail path?)",
+            )
+    except BaseException:
+        _close_write_fd(fd, write_failed=True)
+        raise
+    return fd
+
+
+def open_hardened_read(path: str | Path) -> int:
+    """Open *path* for reading with the hardened trail shape; return
+    the fd.
+
+    Mirror of :func:`open_hardened_append` for the read side:
+    ``O_NOFOLLOW`` refuses a planted symlink (ELOOP); ``O_NONBLOCK``
+    makes a planted reader-less FIFO fail fast instead of blocking
+    the opener forever (and is a no-op once the fd is a regular
+    file); the post-open ``fstat`` S_ISREG check refuses everything
+    else non-regular (a FIFO with a writer, a device such as
+    /dev/zero that reads forever). Use this to REOPEN an artifact the
+    process wrote earlier into a directory that untrusted children
+    also write under.
+
+    Raises ``OSError`` on refusal. The caller owns the returned fd.
+    """
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK
+    fd = os.open(str(path), flags)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(
+                f"refusing to read {path}: not a regular file "
+                "(planted FIFO/device at the artifact path?)",
+            )
+    except BaseException:
+        _close_write_fd(fd, write_failed=True)
+        raise
+    return fd
+
+
+def rmtree_hardened(path: str | Path) -> bool:
+    """Remove a directory tree a sandboxed child may have griefed;
+    return whether the path is actually gone.
+
+    A compromised child can leave a mode-0 subdirectory inside its
+    write grant, which makes a plain ``rmtree(ignore_errors=True)``
+    fail silently — the scratch dirs then accumulate without bound
+    (or, worse, the caller logs "removed" over a tree that is still
+    there). Try ordinary removal first so normal trees need no chmod
+    walk. If residue remains, restore traversal permissions top-down
+    (chmod each subdirectory before descending into it), then retry.
+
+    Symlink discipline: ``os.walk(followlinks=False)`` still LISTS a
+    symlink-to-directory in dirnames (it just doesn't descend), and
+    ``os.chmod`` follows symlinks (Linux has no lchmod) — chmoding it
+    would apply 0o700 to the symlink's TARGET, which a hostile child
+    can point anywhere outside its grant. Skip links: rmtree removes
+    the link itself without descending, and a link needs no
+    permission restore anyway. A symlink ROOT is refused outright
+    (``False``, no side effects) BEFORE any chmod or walk:
+    ``os.walk`` always follows its ``top`` argument — ``followlinks``
+    only governs entries found during the descent — so walking a
+    link root would chmod the link TARGET's subtree.
+
+    Reject non-directory roots, invalid paths, and root/current/parent
+    markers without changing permissions. Filesystem errors report False;
+    cancellation still propagates. Returns True only when absence can be
+    confirmed (including the was-never-there case), never on an inspection
+    refusal, so callers can log honestly.
+    """
+    try:
+        node = Path(path)
+        # An empty/current-directory marker, parent marker, or filesystem
+        # root cannot be an exclusively allocated scratch directory.
+        if not node.name or node.name == "..":
+            return False
+        p = str(node)
+        original = os.lstat(p)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    if not _stat.S_ISDIR(original.st_mode):
+        return False
+    try:
+        shutil.rmtree(p, ignore_errors=True)
+    except (OSError, ValueError):
+        return False
+    try:
+        current = os.lstat(p)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    # Refuse changed targets before permission restoration. lstat on the
+    # normalized spelling also refuses root links with a trailing / or /.
+    if (not _stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)):
+        return False
+    try:
+        os.chmod(p, 0o700)
+    except OSError:
+        pass
+    try:
+        for root, dirs, _files in os.walk(p):
+            for name in dirs:
+                entry = os.path.join(root, name)
+                if os.path.islink(entry):
+                    continue
+                try:
+                    os.chmod(entry, 0o700)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        shutil.rmtree(p, ignore_errors=True)
+    except (OSError, ValueError):
+        return False
+    try:
+        os.lstat(p)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+
+__all__ = [
+    "open_exclusive_artifact",
+    "open_hardened_append",
+    "open_hardened_read",
+    "rmtree_hardened",
+    "write_bytes_atomically",
+    "write_new_bytes",
+    "write_new_text",
+    "write_text_atomically",
+]

@@ -1,0 +1,288 @@
+"""Tests for ``packages.source_intel.conditional``."""
+
+from __future__ import annotations
+
+
+import pytest
+
+from packages.source_intel.conditional import (
+    _index_file,
+    clear_cache,
+    enclosing_condition,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache_between_tests(monkeypatch):
+    """Wrap the parser in a private LRU, preserving the caller's warm cache."""
+    from functools import lru_cache
+    from importlib import import_module
+
+    conditional = import_module("packages.source_intel.conditional")
+    cached = conditional._index_file_stat
+    monkeypatch.setattr(
+        conditional, "_index_file_stat",
+        lru_cache(**cached.cache_parameters())(cached.__wrapped__),
+    )
+
+
+# =====================================================================
+# Skip / edge cases
+# =====================================================================
+
+
+def test_empty_file_path_returns_none():
+    assert enclosing_condition("", 1) is None
+
+
+def test_missing_file_returns_none(tmp_path):
+    assert enclosing_condition(str(tmp_path / "no-such-file.c"), 1) is None
+
+
+def test_zero_or_negative_line_returns_none(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text("int x;\n")
+    assert enclosing_condition(str(f), 0) is None
+    assert enclosing_condition(str(f), -5) is None
+
+
+def test_unconditional_line_returns_none(tmp_path):
+    """A line that's not inside any #if* block → None."""
+    f = tmp_path / "plain.c"
+    f.write_text("int x;\nint y;\nint z;\n")
+    assert enclosing_condition(str(f), 2) is None
+
+
+# =====================================================================
+# Basic #if / #endif tracking
+# =====================================================================
+
+
+def test_simple_ifdef_block(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "int outside;\n"            # line 1
+        "#ifdef CONFIG_FOO\n"       # line 2
+        "int inside;\n"             # line 3
+        "#endif\n"                  # line 4
+        "int after;\n"              # line 5
+    )
+    assert enclosing_condition(str(f), 3) == "CONFIG_FOO"
+    assert enclosing_condition(str(f), 1) is None
+    assert enclosing_condition(str(f), 5) is None
+
+
+def test_if_with_expression(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#if defined(CONFIG_A) && !defined(CONFIG_B)\n"
+        "int conditional;\n"
+        "#endif\n"
+    )
+    assert (enclosing_condition(str(f), 2)
+            == "defined(CONFIG_A) && !defined(CONFIG_B)")
+
+
+def test_ifndef_block(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#ifndef _GUARD_H\n"
+        "int header_body;\n"
+        "#endif\n"
+    )
+    assert enclosing_condition(str(f), 2) == "_GUARD_H"
+
+
+# =====================================================================
+# Nesting — innermost wins
+# =====================================================================
+
+
+def test_nested_blocks_innermost_returned(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#ifdef OUTER\n"        # line 1
+        "int outer_only;\n"     # line 2
+        "#ifdef INNER\n"        # line 3
+        "int both;\n"           # line 4
+        "#endif\n"              # line 5
+        "int outer_again;\n"    # line 6
+        "#endif\n"              # line 7
+    )
+    assert enclosing_condition(str(f), 4) == "INNER"
+    assert enclosing_condition(str(f), 2) == "OUTER"
+    assert enclosing_condition(str(f), 6) == "OUTER"
+
+
+def test_three_level_nesting(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#ifdef A\n"        # 1
+        "#ifdef B\n"        # 2
+        "#ifdef C\n"        # 3
+        "int deep;\n"       # 4
+        "#endif\n"          # 5
+        "#endif\n"          # 6
+        "#endif\n"          # 7
+    )
+    assert enclosing_condition(str(f), 4) == "C"
+
+
+# =====================================================================
+# Adjacent blocks
+# =====================================================================
+
+
+def test_adjacent_blocks_independent(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#ifdef A\n"        # 1
+        "int a_block;\n"    # 2
+        "#endif\n"          # 3
+        "#ifdef B\n"        # 4
+        "int b_block;\n"    # 5
+        "#endif\n"          # 6
+    )
+    assert enclosing_condition(str(f), 2) == "A"
+    assert enclosing_condition(str(f), 5) == "B"
+
+
+# =====================================================================
+# Malformed input
+# =====================================================================
+
+
+def test_unclosed_if_block_ignored(tmp_path):
+    """Malformed source with #ifdef but no matching #endif — the
+    block is not recorded; lookups return None within the unclosed
+    region (rather than fabricating a synthetic block to EOF)."""
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#ifdef NEVER_CLOSED\n"
+        "int inside;\n"
+        # no #endif
+    )
+    # Implementation choice: drop unclosed blocks rather than synthesise
+    # EOF. Test pins the contract.
+    assert enclosing_condition(str(f), 2) is None
+
+
+def test_stray_endif_ignored(tmp_path):
+    """An #endif without a matching opener is silently ignored — same
+    posture as malformed-source handling above."""
+    f = tmp_path / "x.c"
+    f.write_text(
+        "int normal;\n"
+        "#endif\n"
+        "int after;\n"
+    )
+    assert enclosing_condition(str(f), 1) is None
+    assert enclosing_condition(str(f), 3) is None
+
+
+# =====================================================================
+# #elif / #else continuation
+# =====================================================================
+
+
+def test_elif_inherits_outer_condition(tmp_path):
+    """#elif is treated as continuation; the outer #if's condition is
+    what's reported. v1 limitation — Stage D LLM consumer is aware."""
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#if defined(A)\n"      # 1
+        "int a_branch;\n"        # 2
+        "#elif defined(B)\n"     # 3
+        "int b_branch;\n"        # 4
+        "#endif\n"               # 5
+    )
+    # In v1, line 4 is reported as inside the #if A block. Reflects
+    # the documented limitation; downstream may refine.
+    assert enclosing_condition(str(f), 4) == "defined(A)"
+
+
+# =====================================================================
+# Indexing (cached parse)
+# =====================================================================
+
+
+def test_index_file_returns_blocks(tmp_path):
+    f = tmp_path / "x.c"
+    f.write_text(
+        "#ifdef A\n"
+        "int x;\n"
+        "#endif\n"
+    )
+    blocks = _index_file(str(f))
+    assert len(blocks) == 1
+    assert blocks[0].start_line == 1
+    assert blocks[0].end_line == 3
+    assert blocks[0].condition == "A"
+    assert blocks[0].directive == "ifdef"
+
+
+def test_index_file_caches_unchanged_and_invalidates_on_edit(tmp_path):
+    """The cache key includes the file's stat identity: repeated
+    lookups on an UNCHANGED file are served from cache, while an
+    edited file re-parses automatically — no ``clear_cache`` needed.
+    A path-only key would keep serving pre-edit conditional blocks
+    to fresh analyze() runs in long-lived processes."""
+    from packages.source_intel.conditional import _index_file_stat
+
+    f = tmp_path / "x.c"
+    f.write_text("#ifdef A\nint x;\n#endif\n")
+    clear_cache()
+    first = _index_file(str(f))
+    assert first[0].condition == "A"
+    hits_before = _index_file_stat.cache_info().hits
+    again = _index_file(str(f))
+    assert again == first
+    assert _index_file_stat.cache_info().hits == hits_before + 1
+
+    # Mutate the file: the stat identity changes, so the lookup must
+    # re-parse and surface the NEW condition without an explicit
+    # cache clear.
+    import os
+    f.write_text("#ifdef B\nint y;\n#endif\n")
+    os.utime(f, ns=(1, 1))  # force a distinct stat identity even on
+    #                         coarse-mtime filesystems
+    refreshed = _index_file(str(f))
+    assert refreshed[0].condition == "B"
+
+
+def test_clear_cache_still_drops_entries(tmp_path):
+    """``clear_cache`` remains the explicit whole-cache reset."""
+    from packages.source_intel.conditional import _index_file_stat
+
+    f = tmp_path / "x.c"
+    f.write_text("#ifdef A\nint x;\n#endif\n")
+    _index_file(str(f))
+    assert _index_file_stat.cache_info().currsize >= 1
+    clear_cache()
+    assert _index_file_stat.cache_info().currsize == 0
+
+
+class TestReadDiscipline:
+    def test_fifo_refuses_instead_of_wedging(self, tmp_path):
+        """Walked target entries are target content: a planted
+        reader-less FIFO must refuse at the open (empty index), not
+        block the indexer forever. Bounded child so a regression
+        fails instead of hanging the suite."""
+        import multiprocessing
+        import os
+
+        from packages.source_intel.conditional import _index_file
+
+        fifo = tmp_path / "wedge.h"
+        os.mkfifo(fifo)
+        child = multiprocessing.Process(target=_index_file, args=(fifo,))
+        child.start()
+        child.join(timeout=20)
+        try:
+            assert not child.is_alive(), (
+                "_index_file blocked on a planted FIFO"
+            )
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join()

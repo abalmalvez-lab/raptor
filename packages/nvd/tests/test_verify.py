@@ -31,7 +31,7 @@ class _NvdStubHttp:
 
 
 def _nvd_payload(refs: list[dict]) -> dict:
-    return {"vulnerabilities": [{"cve": {"id": "CVE-TEST", "references": refs}}]}
+    return {"vulnerabilities": [{"cve": {"id": "CVE-2024-0001", "references": refs}}]}
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +54,7 @@ def test_match_exact(stub) -> None:
     stub.add(json=_nvd_payload([
         {"url": "https://github.com/curl/curl/commit/fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", "tags": ["Patch"]},
     ]))
-    v = verify("CVE-TEST", "curl/curl", "fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", _client())
+    v = verify("CVE-2024-0001", "curl/curl", "fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", _client())
     assert v.verdict == Verdict.MATCH_EXACT
     assert v.source == "nvd"
 
@@ -63,7 +63,7 @@ def test_orphan_no_patch_refs(stub) -> None:
     stub.add(json=_nvd_payload([
         {"url": "https://github.com/curl/curl/commit/fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", "tags": ["Third Party Advisory"]},
     ]))
-    v = verify("CVE-TEST", "curl/curl", "fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", _client())
+    v = verify("CVE-2024-0001", "curl/curl", "fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", _client())
     assert v.verdict == Verdict.ORPHAN
 
 
@@ -71,7 +71,7 @@ def test_hallucination(stub) -> None:
     stub.add(json=_nvd_payload([
         {"url": "https://github.com/curl/curl/commit/fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", "tags": ["Patch"]},
     ]))
-    v = verify("CVE-TEST", "other/repo", "deadbeefcafebabe1234567890abcdef12345678", _client())
+    v = verify("CVE-2024-0001", "other/repo", "deadbeefcafebabe1234567890abcdef12345678", _client())
     assert v.verdict == Verdict.LIKELY_HALLUCINATION
 
 
@@ -79,12 +79,21 @@ def test_dispute_bench_refused(stub) -> None:
     stub.add(json=_nvd_payload([
         {"url": "https://github.com/curl/curl/commit/fb4415d8aee6c10a4ce3328c42b9c2e4eb5bbafb", "tags": ["Patch"]},
     ]))
-    v = verify("CVE-TEST", "", "", _client())
+    v = verify("CVE-2024-0001", "", "", _client())
     assert v.verdict == Verdict.DISPUTE
 
 
-def test_orphan_on_fetch_error(stub) -> None:
+def test_unknown_on_transient_fetch_error(stub) -> None:
+    # A transient failure (outage/quota) means the oracle could not
+    # look — that must never read as a don't-penalize ORPHAN.
     for _ in range(6):
         stub.add(status=500)
-    v = verify("CVE-TEST", "curl/curl", "abc1234", _client())
+    v = verify("CVE-2024-0001", "curl/curl", "abc1234", _client())
+    assert v.verdict == Verdict.UNKNOWN
+    assert "transient" in (v.notes or "")
+
+
+def test_orphan_on_definitive_404(stub) -> None:
+    stub.add(status=404)
+    v = verify("CVE-2024-0001", "curl/curl", "abc1234", _client())
     assert v.verdict == Verdict.ORPHAN

@@ -1,0 +1,1200 @@
+"""Collector — batches per-review I/O for the audit orchestrator.
+
+Buffers ``append_audit_log`` (N file opens) writes that flush once at
+the end of the review loop, and dual-writes each review to the journal.
+
+``record_review`` (one file per function, no contention) stays
+per-call — batching it adds complexity for no gain.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import threading
+from dataclasses import asdict, dataclass, field
+from typing import Any, TYPE_CHECKING, cast
+
+from .verification_results import ReviewPublicationScope, VerificationScope
+
+from core.coverage.journal import CLEAN_BASIS_VERDICT
+
+from .journal import (
+    ReviewJournalEntry,
+    append_entry,
+    compute_domain_model_hash,
+    flush_journal,
+    now_iso,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from .review_input_scope import ReviewInputScope
+
+logger = logging.getLogger(__name__)
+
+_GUARD_TYPE_VALUES = frozenset({
+    "bounds", "null_safety", "validation", "sanitisation",
+    "lifetime", "ordering", "concurrency", "other",
+})
+
+_FUNC_NAME_RE = None  # lazy compile
+
+
+def _get_func_name_re():
+    global _FUNC_NAME_RE
+    if _FUNC_NAME_RE is None:
+        import re
+        _FUNC_NAME_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(")
+    return _FUNC_NAME_RE
+
+
+_NOISE_NAMES = frozenset({
+    "caller", "callers", "function", "method",
+    "return", "returns", "check", "checks",
+    "ensure", "ensures", "validate", "validates",
+    "NULL", "null", "True", "False", "None",
+    "assert", "sizeof", "static", "inline",
+})
+
+
+def extract_weaknesses(
+    hypotheses: list[dict[str, Any]],
+    function: str = "",
+    file: str = "",
+    cwe: str | None = None,
+) -> list[dict[str, Any]]:
+    """Extract weakness records from cross-function guard-shaped hypotheses.
+
+    A weakness is a hypothesis where the function's correctness depends
+    on an external entity (caller, framework) providing a guarantee it
+    does not verify itself.
+    """
+    result: list[dict[str, Any]] = []
+    pat = _get_func_name_re()
+    for h in hypotheses:
+        scope = str(h.get("counter_scope") or "").strip().lower()
+        if scope != "cross_function":
+            continue
+        guard_type = str(h.get("guard_type") or "").strip().lower()
+        if guard_type not in _GUARD_TYPE_VALUES:
+            continue
+        assumed = (h.get("assumed_property") or "").strip()
+        mechanism = (h.get("mechanism") or "").strip()
+        counter = (h.get("counter") or "").strip()
+        guarded_by: list[str] = []
+        if counter:
+            for m in pat.finditer(counter):
+                name = m.group(1)
+                if name not in _NOISE_NAMES and name != function:
+                    guarded_by.append(name)
+        conf = str(h.get("confidence") or "").strip().lower()
+        if conf not in ("high", "medium", "low"):
+            conf = "medium"
+        w: dict[str, Any] = {
+            "property": assumed or mechanism[:200],
+            "guard_type": guard_type,
+            "assumed_by": f"{file}:{function}" if file else function,
+            "guarded_by": guarded_by,
+            "mechanism": mechanism[:200],
+            "confidence": conf,
+            "source": "structured_pass",
+        }
+        h_cwe = h.get("cwe") or cwe
+        if h_cwe:
+            w["cwe_class"] = str(h_cwe)
+        result.append(w)
+    return result
+
+
+#: Per-run-dir snapshot of the latest journaled strategy set per
+#: reviewed site, for strategy inheritance on corrective re-journal
+#: writes (see ``_inherited_strategies``). Maps run-dir → (journal
+#: size at snapshot time, site → strategies). Built lazily on the
+#: first strategies-less audit write — the mid-loop review path
+#: always carries gap strategies and never touches this. A ``None``
+#: snapshot records a FAILED build (degraded — retried once the
+#: journal grows past the recorded size, like any lookup miss; the
+#: size is measured BEFORE the parse, so mid-parse growth fails
+#: toward a retry, never toward pinning the degraded marker).
+_STRATEGY_SNAPSHOTS: dict[str, tuple[int, dict[tuple, list[str]] | None]] = {}
+_STRATEGY_SNAPSHOTS_LOCK = threading.Lock()
+
+
+def _journal_size(out_dir: Path) -> int:
+    # Sum over the shard set: the snapshot key must keep growing
+    # monotonically across a shard roll, not reset to the new file.
+    from core.coverage.journal import journal_shard_paths
+    total = 0
+    for shard in journal_shard_paths(out_dir):
+        try:
+            total += shard.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _build_strategy_snapshot(out_dir: Path) -> dict[tuple, list[str]] | None:
+    """Parse the run's journal into a site → strategies map.
+
+    Returns ``None`` when the parse FAILED or the journal loaded
+    incompletely (memory-bounded loader stopped early) — an explicit
+    degraded marker, distinct from ``{}`` (parsed fine, nothing
+    eligible). A degraded parse must not pass off the rows it
+    happened to reach as the run's strategy state: a silently
+    returned partial map makes every site past the cutoff journal
+    corrective rows with ``strategies: []``, which cross-run verdict
+    reuse then refuses as ``strategy_changed`` — so the degrade is
+    uniform (no donations) and loud instead.
+    """
+    snapshot: dict[tuple, list[str]] = {}
+    try:
+        from core.coverage import journal_mac
+
+        from .journal import (
+            is_function_grade,
+            is_mechanical_echo,
+            load_entries_checked,
+        )
+        loaded = load_entries_checked(out_dir)
+        if not loaded.complete:
+            # An over-budget journal loads as a bounded PARTIAL list
+            # WITHOUT raising — the same silent-partial hazard as a
+            # mid-loop exception, so it takes the same uniform
+            # degrade (the reason string is loader-generated).
+            logger.warning(
+                "strategy-inheritance snapshot degraded for %s — the "
+                "journal loaded incompletely (%s); corrective journal "
+                "rows will record empty strategies until the journal "
+                "grows and a re-parse succeeds",
+                out_dir, loaded.reason,
+            )
+            return None
+        for e in loaded.entries:
+            if e.verdict == "error" or not is_function_grade(e):
+                continue
+            if getattr(e, "edge_callee", None):
+                continue
+            if not (e.strategies or []):
+                continue
+            # Mechanical echo rows are not reviews: their
+            # ``post-loop-mechanical`` tag is a row-kind marker, not
+            # a briefing, and donating it turns the corrective row
+            # itself into an echo for every is_mechanical_echo
+            # consumer (dropped from reviewed counts, refused by
+            # cross-run reuse as strategy_changed).
+            if is_mechanical_echo(e):
+                continue
+            # The journal lives in a target-writable run dir: only
+            # rows this install's writer stamped may donate a
+            # briefing (same gate the fold-side backfill applies).
+            if journal_mac.entry_provenance(e) != journal_mac.ROW_VERIFIED:
+                continue
+            site = (e.file, e.function, e.line_start or 0)
+            # Entries arrive in append order; later entries overwrite
+            # so the newest record wins.
+            snapshot[site] = list(e.strategies)
+    except Exception as exc:
+        # The exception message can carry journal-derived bytes —
+        # escape and bound it before the operator-facing WARNING; the
+        # full traceback stays at DEBUG.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        logger.warning(
+            "strategy-inheritance snapshot failed for %s — corrective "
+            "journal rows will record empty strategies until the "
+            "journal grows and a re-parse succeeds: %s",
+            out_dir,
+            sanitise_for_terminal(f"{type(exc).__name__}: {exc}"),
+        )
+        logger.debug(
+            "strategy-inheritance snapshot detail", exc_info=True,
+        )
+        return None
+    return snapshot
+
+
+def _inherited_strategies(
+    out_dir: Path,
+    file: str,
+    function: str,
+    line_start: int,
+) -> list[str] | None:
+    """Latest strategy set this run's journal recorded for a site.
+
+    Corrective re-journal writers (deepen re-reviews, post-loop
+    resolution passes, final-status corrections) re-describe a
+    function the run already reviewed, but their synthetic gap dicts
+    historically carried no ``strategies`` — the corrective row then
+    journaled ``strategies: []``, shadowed the original row in the
+    latest-per-site collapse, and cross-run verdict reuse refused the
+    function as ``strategy_changed`` on every later run. The review's
+    actual briefing is in the run's own journal; inherit it.
+
+    Site-bound: only a row at the same ``line_start`` (or a span-less
+    legacy row) donates, so same-named siblings never cross-donate.
+    Returns None when the run journaled nothing usable — the entry
+    then records ``[]`` exactly as before (the fold-side sibling
+    backfill in ``core.audit.gaps`` remains the safety net).
+
+    Caching: one snapshot per run dir, refreshed on a lookup MISS
+    when the journal has grown since — so the corrective pass costs
+    one journal parse total in the common case (every corrected
+    function was journaled mid-loop, before the first corrective
+    write), and a later-segment site missing from an early snapshot
+    still resolves without re-parsing per append.
+    """
+    key_dir = str(out_dir)
+
+    def _lookup(
+        snapshot: dict[tuple, list[str]] | None,
+    ) -> list[str] | None:
+        if snapshot is None:
+            # Degraded build — nothing donates (the caller's []
+            # fallback applies, same as a site the run never
+            # journaled).
+            return None
+        found = snapshot.get((file, function, line_start or 0))
+        if found is None and line_start:
+            found = snapshot.get((file, function, 0))
+        return found
+
+    with _STRATEGY_SNAPSHOTS_LOCK:
+        cached = _STRATEGY_SNAPSHOTS.get(key_dir)
+        if cached is None:
+            cached = (_journal_size(out_dir),
+                      _build_strategy_snapshot(out_dir))
+            _STRATEGY_SNAPSHOTS[key_dir] = cached
+        size, snapshot = cached
+        found = _lookup(snapshot)
+        if found is None and _journal_size(out_dir) > size:
+            cached = (_journal_size(out_dir),
+                      _build_strategy_snapshot(out_dir))
+            _STRATEGY_SNAPSHOTS[key_dir] = cached
+            found = _lookup(cached[1])
+        return found
+
+
+def append_journal_for_outcome(
+    *,
+    out_dir: Path,
+    target_path: Path,
+    run_id: str,
+    outcome: Any,
+    gap: dict[str, Any],
+    checked_by: list[str] | None = None,
+    domain_model_hash: str | None = None,
+    producer: str | None = None,
+    verification_scope: VerificationScope | None = None,
+    publication_scope: ReviewPublicationScope | None = None,
+    review_input_scope: ReviewInputScope | None = None,
+    source_roots: dict[str, Path] | None = None,
+) -> ReviewJournalEntry | None:
+    """Append one ``ReviewJournalEntry`` for a completed review outcome.
+
+    Shared by ``Collector.submit`` (which caches the domain-model
+    hash across a batch) and orchestrator's per-call
+    ``_commit_outcome`` (which passes ``None`` and pays the compute
+    cost per call — cheap, a single file hash). Extracted to keep
+    every review outcome — batched or per-call — flowing into the
+    review journal, since the design makes the journal the LLM
+    review record.
+
+    ``checked_by`` is vestigial: accepted for call-site compatibility
+    (orchestrator still passes it) but NOT persisted — the journal
+    schema has no checked_by column; model attribution lands via
+    ``entry.model``.
+
+    ``producer`` distinguishes /audit vs /agentic write sites so
+    ``import_journal`` doesn't have to guess from run_id string
+    prefixes (amendment §1 A2 / final review Finding #2). Default
+    ``"audit"`` matches the historical convention — /agentic call
+    sites pass ``"agentic"`` explicitly.
+
+    An optional pipeline-created verification scope binds the claim and
+    known source version around journal hashing. It does not certify a
+    proof or an immutable build; unbound callers retain legacy behaviour.
+    A separate publication scope binds an already reviewed source unit even
+    when no claim was established. Both supplied bindings must pass.
+
+    Return the appended entry, or None when admission or append failed. Callers
+    that remove pending work use this exact acknowledgement, rather than
+    unrelated journal growth. The caller still owns batch durability.
+
+    Best-effort: any failure logs at DEBUG and swallows so an
+    unrelated review can't be lost when a hash / concept lookup
+    misbehaves.
+    """
+    if producer is None:
+        producer = "audit"
+
+    # Stamp the receiver-qualified name on the outcome so every
+    # surface past this chokepoint (audit-log rows, progress lines,
+    # post-loop promotion entries) can report ``Class.method`` instead
+    # of a bare name that collides with same-named siblings.
+    qualified = gap.get("qualified_name") or ""
+    if qualified:
+        try:
+            outcome.function_qualified = qualified
+        except Exception:
+            logger.debug("qualified-name stamp failed", exc_info=True)
+    else:
+        qualified = getattr(outcome, "function_qualified", "") or ""
+
+    source_hash = ""
+    from .refutation_source import capture_source_identity
+    from .source_anchor import (
+        context_source_anchor_version, make_context_source_anchor, make_source_anchor,
+        parse_context_source_anchor, parse_source_anchor,
+    )
+    from .review_claims import read_history
+    from .review_context_inputs import context_inputs_current, context_inputs_record_digest
+    from .reference_inputs import reference_inputs_current, review_context_digest
+    from .review_input_scope import ReviewInputScope
+
+    from .binary_review_scope import BinaryReviewPublicationScope
+    binary_scope = getattr(outcome, "binary_publication_scope", None)
+    initial_review = getattr(outcome, "review_result", None) or {}
+    has_binary_binding = "binary_review_binding" in initial_review
+    binary_record = initial_review.get("binary_review_binding")
+    if binary_scope is not None or has_binary_binding:
+        if (not isinstance(binary_scope, BinaryReviewPublicationScope)
+                or not has_binary_binding or binary_record != binary_scope.record()):
+            logger.warning("journal binary review lost its live module binding")
+            return None
+
+    def binary_current():
+        review = getattr(outcome, "review_result", None) or {}
+        if binary_scope is None:
+            return (not has_binary_binding and "binary_review_binding" not in review
+                    and getattr(outcome, "binary_publication_scope", None) is None)
+        return (getattr(outcome, "binary_publication_scope", None) is binary_scope
+                and review.get("binary_review_binding") == binary_scope.record()
+                and binary_scope.matches(outcome, gap) and binary_scope.current(target_path))
+
+    if not binary_current():
+        return None
+    raw_history = initial_review.get("review_claims")
+    history = read_history(raw_history)
+    has_context_inputs = isinstance(raw_history, dict) and "source_inputs" in raw_history
+    has_references = isinstance(raw_history, dict) and "reference_inputs" in raw_history
+    if has_references and not has_context_inputs:
+        logger.warning("journal reference inputs lost their target source binding")
+        return None
+    context_inputs = history.get("source_inputs") if history is not None else None
+    reference_inputs = (history["reference_inputs"] if history["reference_inputs"] is not None else {}) if (
+        history is not None and has_references) else None
+    context_digest = review_context_digest(context_inputs, reference_inputs) if has_context_inputs else None
+    attached_scope = getattr(outcome, "review_input_scope", None)
+    if ((attached_scope is not None and not isinstance(attached_scope, ReviewInputScope))
+            or (review_input_scope is not None and not isinstance(review_input_scope, ReviewInputScope))
+            or (attached_scope is not None and review_input_scope is not None and attached_scope != review_input_scope)):
+        logger.warning("journal review input scopes are invalid or disagree")
+        return None
+    input_scope = review_input_scope if review_input_scope is not None else attached_scope
+    if input_scope is not None and not has_context_inputs:
+        logger.warning("journal review input scope lost its dependency record")
+        return None
+    context_version = 3 if has_references else context_inputs.get("version") if isinstance(context_inputs, dict) else None
+    context_primary: str | None = None
+    effective_roots = dict(source_roots) if isinstance(source_roots, dict) else {}
+    if source_roots is not None and not isinstance(source_roots, dict):
+        return None
+    if input_scope is not None:
+        captured_roots = input_scope.roots()
+        if captured_roots is None:
+            return None
+        from pathlib import Path
+        try:
+            if any(label in effective_roots and Path(effective_roots[label]).resolve() != root
+                   for label, root in captured_roots.items()):
+                logger.warning("journal review input root configuration changed")
+                return None
+        except (OSError, ValueError, TypeError):
+            return None
+        effective_roots.update(captured_roots)
+    if has_context_inputs:
+        # Portable incompleteness can retain a fresh concern only when its
+        # original live stamps are supplied separately. It never grants reuse.
+        if (history is None or not isinstance(context_inputs, dict)
+                or (has_references and context_inputs.get("version") != 2)
+                or context_inputs_record_digest(context_inputs) is None
+                or (context_digest is None and input_scope is None)):
+            logger.warning("journal review context input binding is incomplete")
+            return None
+        if input_scope is not None:
+            if not input_scope.matches(file=outcome.file, function=outcome.function,
+                                       line_start=gap.get("line_start", 0), source_inputs=context_inputs):
+                return None
+            if input_scope.origin.source_identity is None:
+                return None
+            context_primary = input_scope.origin.source_identity.sha256
+        else:
+            primary_inputs = [row["sha256"] for row in context_inputs["sources"]
+                              if row.get("root", "target") == "target" and row["file"] == outcome.file]
+            if len(primary_inputs) != 1:
+                logger.warning("journal review context has no unique primary source")
+                return None
+            context_primary = primary_inputs[0]
+
+    require_reference_current = False
+
+    def context_current():
+        if getattr(outcome, "review_input_scope", None) != attached_scope:
+            return False
+        current_review = getattr(outcome, "review_result", None) or {}
+        current_history = current_review.get("review_claims")
+        current_has_inputs = isinstance(current_history, dict) and "source_inputs" in current_history
+        current_has_references = isinstance(current_history, dict) and "reference_inputs" in current_history
+        if current_has_inputs != has_context_inputs or current_has_references != has_references:
+            return False
+        if has_references and (not isinstance(current_history, dict)
+                               or current_history.get("reference_inputs") != reference_inputs):
+            return False
+        if not has_context_inputs:
+            return True
+        if not isinstance(current_history, dict) or current_history.get("source_inputs") != context_inputs:
+            return False
+        if input_scope is not None:
+            return (input_scope.matches(file=outcome.file, function=outcome.function,
+                                        line_start=gap.get("line_start", 0), source_inputs=context_inputs)
+                    and input_scope.current(target_path)
+                    and (not require_reference_current or reference_inputs_current(reference_inputs)))
+        admitted, _ = context_inputs_current(context_inputs, target_path, source_roots=effective_roots)
+        return admitted and (not has_references or reference_inputs_current(reference_inputs))
+
+    inherited_anchor = getattr(outcome, "reused_source_anchor", None) if getattr(outcome, "reused", False) else None
+    inherited_parts = parse_source_anchor(inherited_anchor)
+    inherited_context = parse_context_source_anchor(inherited_anchor)
+    inherited_before = None
+    if inherited_anchor is not None:
+        if inherited_parts is None:
+            logger.warning("journal reused source anchor is invalid")
+            return None
+        if inherited_context is not None and (
+                not has_context_inputs or (input_scope is None and (
+                    inherited_context[2] != context_digest
+                    or context_source_anchor_version(inherited_anchor) != context_version))):
+            logger.warning("journal reused context anchor does not match its inputs")
+            return None
+        inherited_before = capture_source_identity(target_path, outcome.file)
+        if inherited_before is None or inherited_before.sha256 != inherited_parts[0]:
+            logger.warning("journal reused source binding changed")
+            return None
+
+    def binding_current(*, after_hash=False):
+        try:
+            from .claim_verification import ClaimVerification
+            from .refutation_source import capture_source_identity
+
+            if not isinstance(verification_scope, VerificationScope):
+                logger.warning("journal verification scope has an invalid type")
+                return False
+            review = getattr(outcome, "review_result", None) or {}
+            mechanism = getattr(outcome, "hypothesis", "") or review.get("hypothesis") or ""
+            current = capture_source_identity(target_path, verification_scope.file) if (
+                verification_scope.source_identity is not None) else None
+            reason = ClaimVerification({"mechanism": verification_scope.hypothesis},
+                binding=verification_scope).scope_rejection(file=outcome.file, function=outcome.function,
+                    line_start=gap.get("line_start", 0), hypothesis=mechanism, source_identity=current)
+            if reason is None and review.get("hypothesis", mechanism) != mechanism:
+                reason = "claim-revised"
+            published_claims = getattr(outcome, "hypotheses", None)
+            if reason is None and published_claims and not any(
+                    isinstance(claim, dict) and claim.get("mechanism") == verification_scope.hypothesis
+                    for claim in published_claims):
+                reason = "claim-revised"
+            if reason is None and after_hash and verification_scope.source_identity is not None and not source_hash:
+                reason = "source-hash-unavailable"
+            if reason:
+                from .check_trace import record_claim_scope_rejection, record_source_invalidation
+
+                receipts = tuple(filter(None, [getattr(outcome, "evidence_tool", ""),
+                                               review.get("ondemand_synth_receipt")]))
+                if reason == "source-version-drift":
+                    record_source_invalidation(out_dir, verification_scope, source_identity_after=current,
+                        prior_receipts=receipts, prior_outcomes=(), phase="journal_admission")
+                else:
+                    record_claim_scope_rejection(out_dir, verification_scope, reason=reason, receipts=receipts,
+                        attempted_scope={"file": outcome.file, "function": outcome.function,
+                            "line_start": gap.get("line_start", 0), "hypothesis": mechanism,
+                            "phase": "journal_admission"})
+                return False
+            return True
+        except Exception:
+            logger.warning("could not admit bound journal source", exc_info=True)
+            return False
+
+    def publication_current(*, after_hash=False):
+        current = None
+        reason = "invalid_publication_scope"
+        if isinstance(publication_scope, ReviewPublicationScope):
+            current = capture_source_identity(target_path, outcome.file)
+            reason = "publication_scope_or_source_changed"
+            if publication_scope.matches(file=outcome.file, function=outcome.function,
+                    line_start=gap.get("line_start", 0),
+                    line_end=gap.get("line_end") or gap.get("line_start", 0), source_identity=current):
+                if not after_hash or source_hash:
+                    return True
+                reason = "publication_source_hash_unavailable"
+        try:
+            from .record import append_audit_log
+
+            append_audit_log(out_dir, {"action": "review_publication_rejected", "file": outcome.file,
+                "function": outcome.function, "line_start": gap.get("line_start", 0), "reason": reason,
+                "role": "context_provenance_not_verification_evidence",
+                "expected": asdict(publication_scope) if isinstance(publication_scope, ReviewPublicationScope) else None,
+                "observed_source_identity": asdict(current) if current is not None else None})
+        except Exception:
+            logger.warning("could not record review publication rejection", exc_info=True)
+        return False
+
+    if not context_current():
+        return None
+    if verification_scope is not None and not binding_current():
+        return None
+    if publication_scope is not None and not publication_current():
+        return None
+    edge_callee = gap.get("edge_callee") or None
+    try:
+        if edge_callee:
+            # Tier-1 edge entry: two-span hash (caller + callee spans
+            # concatenated) so drift in EITHER endpoint resurfaces
+            # the edge. Empty when uncomputable — the entry then
+            # journals without drift evidence, same as functions.
+            from .edge_review import edge_source_hash
+            callee_span = gap.get("edge_callee_span") or ()
+            if (gap.get("edge_callee_file") and len(callee_span) == 2):
+                source_hash = edge_source_hash(
+                    target_path,
+                    outcome.file,
+                    (gap.get("line_start", 0), gap.get("line_end")
+                     or gap.get("line_start", 0)),
+                    gap["edge_callee_file"],
+                    (callee_span[0], callee_span[1]),  # type: ignore[misc]
+                )
+        else:
+            from core.inventory.binary_builder import BINARY_PATH_PREFIX
+            if outcome.file.startswith(BINARY_PATH_PREFIX):
+                from .record import binary_source_hash
+                h = binary_source_hash(
+                    out_dir, outcome.file, outcome.function,
+                )
+            else:
+                from .record import _compute_hash
+                h = _compute_hash(
+                    target_path,
+                    outcome.file,
+                    gap.get("line_start", 0),
+                    gap.get("line_end"),
+                )
+            if h:
+                source_hash = h
+    except (ImportError, OSError):
+        pass
+    except Exception:
+        logger.debug("source hash computation failed for %s", outcome.file, exc_info=True)
+
+    if (not binary_current() or (binary_scope is not None and source_hash != binary_scope.module_anchor())):
+        return None
+    if binary_scope is not None:
+        source_hash = binary_scope.anchor()
+    if not context_current():
+        return None
+    if verification_scope is not None and not binding_current(after_hash=True):
+        return None
+    if publication_scope is not None and not publication_current(after_hash=True):
+        return None
+    if inherited_parts is not None:
+        inherited_after = capture_source_identity(target_path, outcome.file)
+        if inherited_after != inherited_before or source_hash != inherited_parts[1]:
+            logger.warning("journal reused source binding changed during hashing")
+            return None
+        source_hash = cast(str, inherited_anchor)
+    elif verification_scope is not None and verification_scope.source_identity is not None:
+        try:
+            source_hash = make_source_anchor(verification_scope.source_identity.sha256, source_hash)
+        except ValueError:
+            logger.warning("journal known source cannot be represented by a source anchor")
+            return None
+    elif publication_scope is not None:
+        try:
+            source_hash = make_source_anchor(publication_scope.source_identity.sha256, source_hash)
+        except ValueError:
+            logger.warning("journal publication source cannot be represented by a source anchor")
+            return None
+
+    if has_context_inputs:
+        if context_primary is None:
+            return None
+        bound_primary = parse_source_anchor(source_hash)
+        if bound_primary is not None and bound_primary[0] != context_primary:
+            logger.warning("journal review context primary differs from its source scope")
+            return None
+        span_hash = bound_primary[1] if bound_primary is not None else source_hash
+        try:
+            reusable = (context_digest is not None
+                        and context_inputs_current(context_inputs, target_path, source_roots=effective_roots)[0]
+                        and (not has_references or reference_inputs_current(reference_inputs)))
+            # A fresh pass may retain an older reference as unknown context,
+            # but a known tag must remain current through the append barrier.
+            require_reference_current = has_references and reusable
+            source_hash = make_context_source_anchor(context_primary, span_hash,
+                context_digest if reusable else None, context_version=cast(int, context_version))
+        except ValueError:
+            logger.warning("journal review context source cannot be represented by an anchor")
+            return None
+
+    hypotheses_list: list[dict[str, str]] = []
+    if getattr(outcome, "hypotheses", None):
+        hypotheses_list = outcome.hypotheses
+    elif getattr(outcome, "hypothesis", None):
+        hypotheses_list = [
+            {"mechanism": outcome.hypothesis, "confidence": "unknown"},
+        ]
+
+    weaknesses: list[dict[str, Any]] | None = None
+    if hypotheses_list:
+        review_result = getattr(outcome, "review_result", None)
+        _cwe = (review_result.get("cwe") if review_result else None) or None
+        ws = extract_weaknesses(
+            hypotheses_list,
+            function=outcome.function,
+            file=outcome.file,
+            cwe=_cwe,
+        )
+        if ws:
+            weaknesses = ws
+            try:
+                outcome.weaknesses = ws
+            except Exception:
+                pass
+
+    # ``evidence_tools`` is the CONFIRMING receipt only. The old union
+    # with ``tools_dispatched`` blurred exactly the distinction
+    # promotion_alarm documents as never-blur: a tool that
+    # ran and came back refuted/inconclusive journaled as evidence, so
+    # feedback's referee treated the claim as tool-evidenced (an
+    # LLM-only /validate ruling could then never demote it), and
+    # survival/attribution telemetry credited channels that merely
+    # dispatched. Dispatched-tool provenance keeps its own field.
+    evidence_tools: list[str] = []
+    if getattr(outcome, "evidence_tool", ""):
+        evidence_tools = [outcome.evidence_tool]
+    tools_dispatched = sorted(
+        str(t) for t in (getattr(outcome, "tools_dispatched", None) or ())
+    )
+    tools_skipped = sorted(
+        str(t) for t in (getattr(outcome, "tools_skipped", None) or ())
+    ) or None
+
+    reading_list_items: list[str] = []
+    review_result = getattr(outcome, "review_result", None)
+    if review_result and review_result.get("reading_list"):
+        # Prefer subjects while retaining legacy question labels. The journal
+        # declares list[str]; preserve malformed leaves as visible text rather
+        # than persisting null.
+        reading_list_items = [
+            q if isinstance(q := item.get("subject") or item.get("question"), str) and q
+            else str(item)
+            for item in review_result["reading_list"]
+            if isinstance(item, dict)
+        ]
+
+    study_receipts: list[dict] = []
+    if review_result and review_result.get("study_receipts"):
+        study_receipts = [
+            r for r in review_result["study_receipts"]
+            if isinstance(r, dict)
+        ]
+
+    domain_concepts: list[str] = []
+    invariants_available: list[str] = []
+    try:
+        from core.concepts.audit_bridge import (
+            _find_domain_model,
+            _guard_in_scope,
+            _relevance_score,
+        )
+        dm = _find_domain_model(out_dir)
+        if dm:
+            for section in ("concepts", "invariants"):
+                for item in dm.get(section, []):
+                    score = _relevance_score(
+                        item, outcome.file, outcome.function, "",
+                    )
+                    if score > 1.0:
+                        domain_concepts.append(
+                            item.get("id") or item.get("concept", ""),
+                        )
+            for inv in dm.get("invariants", []):
+                inv_role = inv.get("role", "boost")
+                if inv_role == "guard" and not _guard_in_scope(
+                    inv, outcome.file or "",
+                ):
+                    continue
+                inv_id = inv.get("id", "")
+                if inv_id:
+                    invariants_available.append(inv_id)
+    except ImportError:
+        pass
+    except Exception:
+        logger.debug("domain model context failed for %s:%s", outcome.file, outcome.function, exc_info=True)
+
+    if domain_model_hash is None:
+        try:
+            domain_model_hash = compute_domain_model_hash(out_dir)
+        except (ImportError, OSError):
+            domain_model_hash = None
+        except Exception:
+            logger.debug("domain model hash failed", exc_info=True)
+            domain_model_hash = None
+
+    # Per-function domain-model slice stamp: the fingerprint of the
+    # domain-model prompt blocks THIS review was briefed with
+    # (same code path as build_context's assembly — see
+    # core.audit.context.domain_slice_hash_for). The gap fold's
+    # context-staleness gate compares it against a recompute so a
+    # model regeneration that leaves this function's slice
+    # byte-identical keeps the verdict reuse-eligible. Best-effort:
+    # any failure stamps nothing and the whole-model-hash behaviour
+    # applies (fail toward re-review). Edge rows and binary-path rows
+    # are not stamped — their prompt context is assembled differently
+    # and function-grade verdict reuse is what the stamp serves.
+    domain_slice_hash: str | None = None
+    if not edge_callee and domain_model_hash is not None:
+        try:
+            from core.inventory.binary_builder import BINARY_PATH_PREFIX
+            if not outcome.file.startswith(BINARY_PATH_PREFIX):
+                from .context import domain_slice_hash_for
+                domain_slice_hash = domain_slice_hash_for(
+                    out_dir,
+                    target_path,
+                    outcome.file,
+                    outcome.function,
+                    gap.get("line_start", 0),
+                    gap.get("line_end"),
+                )
+        except (ImportError, OSError):
+            domain_slice_hash = None
+        except Exception:
+            logger.debug(
+                "domain slice hash failed for %s:%s",
+                outcome.file, outcome.function, exc_info=True,
+            )
+            domain_slice_hash = None
+
+    verdict_rationale = None
+    counter_hypothesis = None
+    if review_result:
+        verdict_rationale = review_result.get("verdict_rationale") or None
+        counter_hypothesis = review_result.get("counter_hypothesis") or None
+
+    # Tier-2 folded edge verdicts: persisted ONLY for edges the gap
+    # actually listed (the model must never invent edges), with the
+    # verdict vocabulary clamped. Absent section -> absent field.
+    edge_verdicts: list[dict] | None = None
+    listed = {
+        str(e.get("callee"))
+        for e in (gap.get("edge_contracts") or [])
+        if isinstance(e, dict)
+    }
+    if listed and review_result:
+        cleaned: list[dict] = []
+        for ev in review_result.get("edge_verdicts") or []:
+            if not isinstance(ev, dict):
+                continue
+            callee = str(ev.get("callee") or "")
+            verdict = str(ev.get("verdict") or "")
+            if callee in listed and verdict in (
+                    "clean", "suspicious", "finding"):
+                row = {"callee": callee, "verdict": verdict}
+                if isinstance(ev.get("call_line"), int):
+                    row["call_line"] = ev["call_line"]
+                if ev.get("note"):
+                    row["note"] = str(ev["note"])[:500]
+                cleaned.append(row)
+        edge_verdicts = cleaned or None
+
+    # Reduced-context and reused verdicts are journaled with their
+    # provenance so cross-run verdict reuse can (a) refuse to treat a
+    # reduced-context verdict as durable coverage and (b) keep a
+    # chain of reuses pointing at the run that actually reviewed.
+    context_reduced = bool(getattr(outcome, "context_reduced", False)) or None
+    reused = bool(getattr(outcome, "reused", False)) or None
+    reused_from_run = (getattr(outcome, "reused_from_run", "") or None) if reused else None
+    # Cadence-tick promotions journal immediately but unsettled: the
+    # mark rides into the row so readers (verdict reuse, report) can
+    # tell a finalized finding from one the post-loop passes have not
+    # yet confirmed or retracted.
+    provisional = bool(getattr(outcome, "provisional", False)) or None
+
+    # Promotion-without-tool-evidence alarm: the journal write is the
+    # chokepoint every review outcome flows through, so an evidence-less
+    # ``finding`` here means the tool-gated promotion invariant was
+    # bypassed upstream.  Enforcing — a violating finding is demoted to
+    # suspicious BEFORE the entry is built, so the journal, the
+    # audit-log row, and the tallies that follow all carry the gated
+    # status instead of shipping the bypass.
+    #
+    # Reused verdicts are exempt — single authority with the
+    # findings-export mirror: ``promotion_alarm.is_reuse_exempt``
+    # (see its docstring for the verdict_reuse doctrine).
+    from .promotion_alarm import is_reuse_exempt
+    if not is_reuse_exempt(outcome):
+        try:
+            from .promotion_alarm import check_and_emit
+            check_and_emit(
+                out_dir, outcome, stage="journal-write", run_id=run_id,
+                enforce=True,
+            )
+        except Exception:
+            logger.debug("promotion alarm hook failed", exc_info=True)
+
+    strategies = list(gap.get("strategies") or [])
+    if (
+        not strategies
+        and producer == "audit"
+        and not edge_callee
+    ):
+        # Strategy inheritance for corrective writers whose synthetic
+        # gaps carry no strategies (see ``_inherited_strategies``).
+        strategies = _inherited_strategies(
+            out_dir, outcome.file, outcome.function,
+            gap.get("line_start", 0),
+        ) or []
+
+    # External hypothesis-seed provenance: which sibling-hypotheses
+    # claims were injected into this review's context (id + source
+    # only — the claims themselves live in the seed file and the
+    # intake receipt). Audit-trail field, never verdict weight.
+    seed_provenance: list[dict] | None = None
+    stamped_seeds = gap.get("seed_hypotheses")
+    if isinstance(stamped_seeds, list) and stamped_seeds:
+        seed_provenance = [
+            {
+                "id": str(s.get("id", ""))[:200],
+                "source": str(s.get("source", ""))[:200],
+            }
+            for s in stamped_seeds
+            if isinstance(s, dict)
+        ] or None
+
+    entry = ReviewJournalEntry(
+        ts=now_iso(),
+        run_id=run_id,
+        file=outcome.file,
+        function=outcome.function,
+        function_qualified=qualified or None,
+        verdict=outcome.status,
+        source_hash=source_hash,
+        edge_callee=edge_callee,
+        edge_verdicts=edge_verdicts,
+        line_start=gap.get("line_start", 0),
+        line_end=gap.get("line_end"),
+        cwe=review_result.get("cwe") if review_result else None,
+        strategies=strategies,
+        domain_model_hash=domain_model_hash,
+        domain_slice_hash=domain_slice_hash,
+        domain_concepts_available=domain_concepts,
+        invariants_available=invariants_available,
+        hypotheses=hypotheses_list,
+        body=getattr(outcome, "body", "") or "",
+        reading_list_items=reading_list_items,
+        study_receipts=study_receipts,
+        review_claims=(history if has_context_inputs else
+                       read_history(review_result.get("review_claims")) if review_result else None),
+        model=getattr(outcome, "model", None) or None,
+        evidence_tools=evidence_tools,
+        tools_dispatched=tools_dispatched,
+        tools_skipped=tools_skipped,
+        cost_usd=getattr(outcome, "cost_usd", None) or None,
+        duration_s=getattr(outcome, "duration_s", None) or None,
+        verdict_rationale=verdict_rationale,
+        counter_hypothesis=counter_hypothesis,
+        context_reduced=context_reduced,
+        reused=reused,
+        reused_from_run=reused_from_run,
+        seed_provenance=seed_provenance,
+        # Seed-forced re-review marker (--seed-rereview): this row is
+        # a FRESH review of an already-covered function, scheduled by
+        # the hypothesis-seed intake. Provenance only, mirroring
+        # seed_provenance — no verdict weight; absent on ordinary
+        # rows.
+        seed_rereview=(True if gap.get("seed_rereview") else None),
+        provisional=provisional,
+        producer=producer,
+        # Machine-readable failure class on error verdicts only:
+        # separates environment-caused non-reviews from genuine
+        # per-function review errors for journal readers.
+        error_class=(
+            (getattr(outcome, "error_class", "") or None)
+            if outcome.status == "error" else None
+        ),
+        weaknesses=weaknesses,
+        from_composition=(True if gap.get("from_composition") else None),
+        cross_entry_rendered=(
+            review_result.get("cross_entry_rendered")
+            if review_result and "cross_entry_rendered" in review_result
+            else None
+        ),
+        cross_entry_receipt=(
+            review_result.get("cross_entry_receipt")
+            if review_result and review_result.get("cross_entry_receipt")
+            else None
+        ),
+        # What a clean was minted from (see ReviewJournalEntry). Every
+        # clean row carries it — an absent basis marks a pre-field row,
+        # which the reuse fold screens (traced rows refused, traceless
+        # ones imported at most once per completed run).
+        clean_basis=(
+            (getattr(outcome, "clean_basis", "") or CLEAN_BASIS_VERDICT)
+            if outcome.status == "clean" else None
+        ),
+    )
+    if not context_current() or not binary_current():
+        return None
+    try:
+        append_entry(out_dir, entry)
+        return entry
+    except Exception:
+        logger.debug(
+            "journal append failed for %s:%s",
+            outcome.file, outcome.function, exc_info=True,
+        )
+        return None
+
+
+def journal_acknowledges_outcome(acknowledgement, outcome, gap) -> bool:
+    """Require the exact occurrence and verdict acknowledged by the writer."""
+    matched = (isinstance(acknowledgement, ReviewJournalEntry)
+            and (acknowledgement.file, acknowledgement.function, acknowledgement.line_start,
+                 acknowledgement.line_end, acknowledgement.verdict) == (
+                outcome.file, outcome.function, gap.get("line_start", 0),
+                gap.get("line_end"), outcome.status))
+    if not matched:
+        return False
+    from .binary_review_scope import BinaryReviewPublicationScope
+    scope = getattr(outcome, "binary_publication_scope", None)
+    review = getattr(outcome, "review_result", None) or {}
+    if scope is None and "binary_review_binding" not in review:
+        return True
+    return (isinstance(scope, BinaryReviewPublicationScope)
+            and review.get("binary_review_binding") == scope.record()
+            and scope.matches(outcome, gap) and scope.current(scope.module.path)
+            and acknowledgement.source_hash == scope.anchor())
+
+
+@dataclass
+class Collector:
+    """Buffers review outcomes and batches disk writes."""
+
+    out_dir: Path
+    target_path: Path
+    run_id: str = ""
+
+    _log_entries: list[dict[str, Any]] = field(default_factory=list)
+    _domain_model_hash: str | None = field(default=None, repr=False)
+    source_roots: dict[str, Path] | None = field(default=None, repr=False)
+
+    def submit(
+        self,
+        outcome: Any,
+        gap: dict[str, Any],
+        *,
+        batch: bool = False,
+    ) -> ReviewJournalEntry | None:
+        # Journal is the sole LLM review store (see amendment §2).
+        # ``record_review``'s coverage-audit.json write and
+        # ``mark_checked``'s checklist stamp were removed at Phase-3
+        # completion; the journal captures verdict/body/context and
+        # the coverage store imports it at run completion. Model
+        # attribution travels via ``entry.model`` — there is no
+        # separate checked_by record.
+        acknowledgement = self._append_journal_entry(outcome, gap)
+        if not journal_acknowledges_outcome(acknowledgement, outcome, gap):
+            return None
+        try:
+            self._record_acknowledged_outcome(outcome, gap, batch=batch)
+        except Exception:
+            # Optional grading and telemetry cannot revoke a journal write
+            # that has already succeeded, or make its caller retry it.
+            logger.warning(
+                "post-journal collection failed for %s:%s",
+                outcome.file, outcome.function, exc_info=True,
+            )
+        return acknowledgement
+
+    def _record_acknowledged_outcome(
+        self, outcome: Any, gap: dict[str, Any], *, batch: bool,
+    ) -> None:
+        # Mirror _commit_outcome after the journal settles the status.
+        # Clean grading needs the target root to revalidate scoped negative
+        # evidence against current source; dispatch metadata is insufficient.
+        compute = getattr(outcome, "compute_tier", None)
+        if callable(compute):
+            try:
+                outcome.verification_tier = compute(target_path=self.target_path)
+            except Exception:
+                logger.debug(
+                    "verification tier compute failed for %s:%s",
+                    outcome.file, outcome.function, exc_info=True,
+                )
+
+        entry: dict[str, Any] = {
+            "action": "orchestrator_review",
+            "key": f"{outcome.file}:{outcome.function}:{gap.get('line_start', 0)}",
+            "status": outcome.status,
+            "verification_tier": getattr(
+                outcome, "verification_tier", "",
+            ) or "speculative",
+            "model": outcome.model,
+            "cost_usd": outcome.cost_usd,
+            "duration_s": outcome.duration_s,
+        }
+        qualified = (
+            gap.get("qualified_name")
+            or getattr(outcome, "function_qualified", "")
+        )
+        if qualified:
+            entry["function_qualified"] = qualified
+        if outcome.hypothesis:
+            entry["hypothesis"] = outcome.hypothesis
+        if outcome.hypotheses:
+            entry["hypotheses"] = outcome.hypotheses
+        if outcome.evidence_tool:
+            entry["evidence_tool"] = outcome.evidence_tool
+        if outcome.review_result and outcome.review_result.get("preconditions"):
+            entry["preconditions"] = outcome.review_result["preconditions"]
+        if outcome.review_result and outcome.review_result.get("prompt_budget_event"):
+            # Prompt-budget disclosure (priority-0 elision / residual
+            # overshoot) rides the same per-row audit-log channel as
+            # preconditions.
+            entry["prompt_budget"] = outcome.review_result["prompt_budget_event"]
+        strategies = gap.get("strategies")
+        if strategies:
+            entry["strategies"] = strategies
+        if batch:
+            entry["batch"] = True
+        self._log_entries.append(entry)
+
+        # ── SAGE: store hypothesis verdict ───────────────────────────────
+        src_hash = gap.get("_sage_source_hash", "")
+        if src_hash and outcome.status != "error" and outcome.hypothesis:
+            try:
+                from core.sage.hooks import store_audit_hypothesis_verdict
+                store_audit_hypothesis_verdict(
+                    repo_path=str(self.target_path),
+                    file_path=outcome.file,
+                    function=outcome.function,
+                    hypothesis=outcome.hypothesis,
+                    status=outcome.status,
+                    evidence_tool=outcome.evidence_tool or "",
+                    source_hash=src_hash,
+                )
+            except Exception:
+                logger.debug(
+                    "SAGE hypothesis store failed for %s:%s",
+                    outcome.file, outcome.function, exc_info=True,
+                )
+
+    def _append_journal_entry(
+        self,
+        outcome: Any,
+        gap: dict[str, Any],
+    ) -> ReviewJournalEntry | None:
+        """Append the review outcome to the journal (batch-cached hash)."""
+        return append_journal_for_outcome(
+            out_dir=self.out_dir,
+            target_path=self.target_path,
+            run_id=self.run_id,
+            outcome=outcome,
+            gap=gap,
+            domain_model_hash=self._get_domain_model_hash(),
+            source_roots=self.source_roots,
+        )
+
+    def _get_domain_model_hash(self) -> str | None:
+        """Compute and cache the domain-model.json content hash."""
+        if self._domain_model_hash is not None:
+            return self._domain_model_hash or None
+        from .journal import compute_domain_model_hash
+        h = compute_domain_model_hash(self.out_dir)
+        self._domain_model_hash = h or ""
+        return h
+
+    def invalidate_domain_model_cache(self) -> None:
+        """Call after the domain model changes (e.g. JIT study loop)."""
+        self._domain_model_hash = None
+        # cache_clear() cannot raise; only a partial install (import
+        # failure) can legitimately fail here.
+        with contextlib.suppress(ImportError):
+            from core.concepts.audit_bridge import _load_cached
+            _load_cached.cache_clear()
+
+    def pending_count(self) -> int:
+        """Buffered rows not yet on disk — the journal checkpoint's
+        provably-empty assertion reads this AFTER :meth:`flush` (a
+        failed write retains its rows, and the checkpoint must skip
+        rather than compact across a write path it cannot prove
+        drained). Journal rows never buffer here (``submit`` appends
+        them synchronously), so zero means every submitted outcome is
+        on disk."""
+        return len(self._log_entries)
+
+    def flush(self) -> None:
+        """Write all buffered state to disk in bulk.
+
+        Re-usable, not a one-shot latch: the orchestrator flushes once
+        after the main review loop and again at the true end of the
+        run, and post-loop passes (callee-contract propagation, dark
+        verification, IRIS/live-sink telemetry) keep submitting in
+        between — a latch tripped by the first flush silently
+        discarded everything they buffered. Entries are dropped from
+        the buffer only once written; a failed write keeps them for
+        the next flush (end-of-run or the SIGTERM hook) instead of
+        marking them flushed and losing them. Never raises.
+        """
+        try:
+            flush_journal(self.out_dir)
+        except Exception:
+            logger.debug("journal fsync failed", exc_info=True)
+
+        try:
+            self._flush_audit_log()
+        except Exception:  # noqa: BLE001 — "never raises" must be exception-total:
+            # flush runs from end-of-run paths and the SIGTERM hook,
+            # where an uncaught row-shape surprise would take the
+            # whole shutdown path down with it.
+            logger.warning(
+                "audit-log flush failed — %d buffered entries retained "
+                "for the next flush",
+                len(self._log_entries), exc_info=True,
+            )
+
+    def _flush_audit_log(self) -> None:
+        """Append buffered rows via the hardened, shard-rolling writer.
+
+        Each row goes through ``core.audit.record.append_audit_log``:
+        the O_APPEND|O_NOFOLLOW hardening (a symlink planted at the
+        trail path in the target-writable run dir is refused instead
+        of followed), the audit-log integrity stamp at the write
+        boundary (the buffered ``orchestrator_review`` rows are
+        exactly the class the resume reader grants suppression
+        authority), and per-row shard resolution — a large flush that
+        crosses the roll threshold moves to the next shard mid-batch
+        instead of pushing one shard past the reader's per-shard
+        budget. Written rows leave the buffer even when a mid-batch
+        append fails, so only the unwritten tail is retained for the
+        next flush (same retention contract as the pre-fix per-row
+        ``pop(0)``, without its O(n²) element shifts per flush).
+        """
+        from .record import append_audit_log
+
+        written = 0
+        try:
+            while written < len(self._log_entries):
+                append_audit_log(
+                    self.out_dir, self._log_entries[written])
+                written += 1
+        finally:
+            del self._log_entries[:written]

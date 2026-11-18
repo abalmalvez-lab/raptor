@@ -19,9 +19,14 @@ pre-check) can filter by rule.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, TYPE_CHECKING
 
-from .models import SpatchResult
+from core.sarif import emit
+
+
+if TYPE_CHECKING:
+    from .models import SpatchResult
+    from collections.abc import Iterable
 
 
 # SARIF level mapping. spatch doesn't emit severity; we treat every
@@ -36,112 +41,96 @@ _TOOL_FULL_NAME = "Coccinelle (spatch)"
 _TOOL_INFO_URI = "https://coccinelle.gitlabpages.inria.fr/website/"
 
 
-def _rel_to_repo(file_path: str, repo_path: Path) -> str:
-    """Best-effort repo-relative path. SpatchMatch's ``file`` is
-    sometimes absolute (when spatch was given an absolute target) or
-    target-relative (when given a relative target). Normalize so two
-    findings at the same line dedupe across spatch invocations."""
+def _rel_to_repo(file_path: str, repo_path: Path | None) -> str:
+    """Normalize a match lexically against the already resolved target root.
+
+    Keep explicit outside-target paths as supplied; never borrow a local
+    basename or follow source-file symlinks while formatting a report.
+    """
+    from core.paths import to_repo_relative
+
     if not file_path:
         return ""
-    try:
-        p = Path(file_path)
-        if p.is_absolute():
-            return str(p.resolve().relative_to(repo_path.resolve()))
-    except (ValueError, OSError):
-        # Cross-FS, non-repo path — leave as-is.
-        pass
-    return file_path
+    # Spatch supplies filesystem paths, not file:// URIs. Preserve legacy
+    # spelling for URI-looking names rather than rebinding their basename.
+    if repo_path is None or file_path.startswith("file://"):
+        return file_path
+    relative = to_repo_relative(file_path, repo_path, outside_root="relative")
+    confined = to_repo_relative(relative, repo_path) if relative is not None else None
+    return confined if confined is not None else file_path
 
 
 def results_to_sarif(
     results: Iterable[SpatchResult],
     repo_path: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Turn a sequence of per-rule ``SpatchResult`` into a SARIF 2.1.0
     document. Rules with no matches still appear in
     ``tool.driver.rules`` so operators see the rule corpus that ran;
     only the ``results`` list filters to actual matches.
     """
-    repo_path = Path(repo_path)
+    try:
+        resolved_root = Path(repo_path).resolve()
+    except (OSError, RuntimeError):
+        # Report formatting must not discard findings when the target has
+        # disappeared or its root can no longer be resolved.
+        resolved_root = None
 
     # Collect distinct rule definitions. ``rule`` is the rule's stem
     # (filename without .cocci), used as ``ruleId`` in results.
-    rule_defs: List[Dict[str, Any]] = []
-    seen_rule_ids: set = set()
-    sarif_results: List[Dict[str, Any]] = []
-    notifications: List[Dict[str, Any]] = []
+    rule_index = emit.RuleIndex()
+    sarif_results: list[dict[str, Any]] = []
+    notifications: list[dict[str, Any]] = []
+    relative_paths: dict[str, str] = {}
 
     for r in results:
         rule_id = r.rule or "(unnamed)"
-        if rule_id not in seen_rule_ids:
-            rule_defs.append({
-                "id": rule_id,
-                "name": rule_id,
-                "shortDescription": {"text": rule_id},
-                "fullDescription": {"text": (
-                    f"Coccinelle rule emitted from {r.rule_path}"
-                    if r.rule_path else f"Coccinelle rule {rule_id}"
-                )},
-                "defaultConfiguration": {"level": _DEFAULT_LEVEL},
-                "helpUri": _TOOL_INFO_URI,
-            })
-            seen_rule_ids.add(rule_id)
+        rule_index.add(emit.minimal_rule(
+            rule_id,
+            full_description=(
+                f"Coccinelle rule emitted from {r.rule_path}"
+                if r.rule_path else f"Coccinelle rule {rule_id}"
+            ),
+            level=_DEFAULT_LEVEL,
+            help_uri=_TOOL_INFO_URI,
+        ))
 
         for match in r.matches:
-            file_rel = _rel_to_repo(match.file, repo_path)
-            sarif_results.append({
-                "ruleId": rule_id,
-                "level": _DEFAULT_LEVEL,
-                "message": {
-                    "text": match.message or f"{rule_id} matched",
-                },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {"uri": file_rel},
-                        "region": {
-                            "startLine": match.line,
-                            **({"endLine": match.line_end}
-                               if match.line_end else {}),
-                            **({"startColumn": match.column}
-                               if match.column else {}),
-                            **({"endColumn": match.column_end}
-                               if match.column_end else {}),
-                        },
-                    },
-                }],
-            })
+            if type(match.file) is str:
+                file_rel = relative_paths.get(match.file)
+                if file_rel is None:
+                    file_rel = _rel_to_repo(match.file, resolved_root)
+                    relative_paths[match.file] = file_rel
+            else:
+                # String adapters may override operations or disable hashing.
+                file_rel = _rel_to_repo(match.file, resolved_root)
+            sarif_results.append(emit.result(
+                rule_id,
+                match.message or f"{rule_id} matched",
+                [emit.location(file_rel, emit.source_region(
+                    match.line, end_line=match.line_end,
+                    column=match.column, end_column=match.column_end,
+                ))],
+                level=_DEFAULT_LEVEL,
+            ))
 
         # spatch errors → SARIF tool-execution notifications. Distinct
         # from results — operators see the rule had a problem without
         # mistaking it for a finding.
-        for err in r.errors or []:
-            notifications.append({
+        notifications.extend({
                 "level": "error",
                 "message": {"text": err[:500]},
                 "associatedRule": {"id": rule_id},
-            })
+            } for err in r.errors or [])
 
-    run: Dict[str, Any] = {
-        "tool": {
-            "driver": {
-                "name": _TOOL_NAME,
-                "fullName": _TOOL_FULL_NAME,
-                "informationUri": _TOOL_INFO_URI,
-                "rules": rule_defs,
-            },
-        },
-        "results": sarif_results,
-    }
+    run: dict[str, Any] = emit.run(
+        _TOOL_NAME, rule_index.rules(), sarif_results,
+        full_name=_TOOL_FULL_NAME, information_uri=_TOOL_INFO_URI,
+    )
     if notifications:
         run["invocations"] = [{
             "executionSuccessful": False,
             "toolExecutionNotifications": notifications,
         }]
 
-    return {
-        "$schema":
-            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master"
-            "/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [run],
-    }
+    return emit.document([run], schema_uri=emit.SCHEMA_URI_COMMITTEE)

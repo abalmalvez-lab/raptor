@@ -25,10 +25,12 @@ Threat model:
     permissive policy — by the time we observe its behaviour, the
     binary has already executed. Defense against malicious binary
     updates lives upstream (signed installers, package-hash
-    verification). The cache itself is mode-0600 with sha256 self-
-    integrity check; tampering by an attacker who can write
-    ``~/.cache/raptor/`` is bounded by the attacker's existing
-    same-UID access.
+    verification). The cache itself is mode-0600; on load the cached
+    ``binary_sha256`` is re-checked against the on-disk binary (a
+    staleness / corruption guard, not an integrity seal — the
+    observational fields carry no digest of their own). Tampering by
+    an attacker who can write ``~/.cache/raptor/`` is bounded by the
+    attacker's existing same-UID access.
 
 API:
     calibrate_binary(bin_path, probe_args, *, env_keys=()) → SandboxProfile
@@ -38,23 +40,30 @@ API:
     load_or_calibrate(bin_path, probe_args, *, env_keys=(), force=False)
         Cache-first variant. The default cc_dispatch consumer
         path. ``force=True`` skips the cache and recalibrates.
-    clear_cache(bin_path=None)
+    clear_cache(bin_path=None, *, errors=None)
         Drop one or all cache entries. ``raptor sandbox calibrate
         --clear`` calls this.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import logging
 import os
+import stat
 import tempfile
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
 
+from core.atomic_fs import write_text_atomically
+from core.json import dumps_artifact, dumps_canonical
+from core.sandbox.evidence import _unique_evidence_object
+from core.security.log_sanitisation import sanitise_exception_message, sanitise_for_terminal
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +75,11 @@ logger = logging.getLogger(__name__)
 # attacker can read+write either way, but discouraging cross-user
 # bleed reduces the surface for misconfigured shared homedirs
 # (e.g. tmpfs /home setups in CI).
-_CACHE_VERSION = 1
+# Earlier records did not require trusted, loss-free observations.
+_CACHE_VERSION = 3
+# Match the observation reader's total input ceiling. Cache entries are
+# normally much smaller, but damaged artifacts must not be unbounded.
+_MAX_CACHE_BYTES = 64 * 1024 * 1024
 _CACHE_DIR = Path.home() / ".cache" / "raptor" / "sandbox-profiles"
 
 
@@ -132,12 +145,12 @@ class SandboxProfile:
     binary_sha256: str
     env_signature: str
     captured_at: str
-    probe_args: List[str] = field(default_factory=list)
-    paths_read: List[str] = field(default_factory=list)
-    paths_written: List[str] = field(default_factory=list)
-    paths_stat: List[str] = field(default_factory=list)
-    proxy_hosts: List[str] = field(default_factory=list)
-    connect_targets: List[ConnectTarget] = field(default_factory=list)
+    probe_args: list[str] = field(default_factory=list)
+    paths_read: list[str] = field(default_factory=list)
+    paths_written: list[str] = field(default_factory=list)
+    paths_stat: list[str] = field(default_factory=list)
+    proxy_hosts: list[str] = field(default_factory=list)
+    connect_targets: list[ConnectTarget] = field(default_factory=list)
     cache_version: int = _CACHE_VERSION
 
     def to_json(self) -> str:
@@ -146,15 +159,50 @@ class SandboxProfile:
         normalised at construction time so two probes of the same
         binary produce identical JSON modulo timestamp)."""
         d = asdict(self)
-        return json.dumps(d, indent=2)
+        # Filesystem paths and argv may contain surrogate-escaped bytes.
+        # JSON escapes retain them without producing invalid UTF-8 text.
+        return dumps_artifact(d, ensure_ascii=True)
 
     @classmethod
-    def from_json(cls, raw: str) -> "SandboxProfile":
-        d = json.loads(raw)
-        connects = [
-            ConnectTarget(**t) for t in d.get("connect_targets", [])
-        ]
+    def from_json(cls, raw: str) -> SandboxProfile:
+        try:
+            d = json.loads(raw, object_pairs_hook=_unique_evidence_object)
+        except RecursionError as exc:
+            raise ValueError("SandboxProfile JSON is too deeply nested") from exc
+        if not isinstance(d, dict):
+            msg = (
+                f"SandboxProfile JSON must be an object, "
+                f"got {type(d).__name__}"
+            )
+            raise TypeError(msg)
+        for name in ("binary_path", "binary_sha256", "env_signature",
+                     "captured_at"):
+            if name in d and not isinstance(d[name], str):
+                raise TypeError(f"SandboxProfile {name} must be a string")
+        for name in ("probe_args", "paths_read", "paths_written",
+                     "paths_stat", "proxy_hosts"):
+            if name in d and (
+                not isinstance(d[name], list)
+                or any(not isinstance(item, str) for item in d[name])
+            ):
+                raise TypeError(f"SandboxProfile {name} must be a list of strings")
+        if "cache_version" in d and type(d["cache_version"]) is not int:
+            raise TypeError("SandboxProfile cache_version must be an integer")
+        targets = d.get("connect_targets", [])
+        if not isinstance(targets, list):
+            raise TypeError("SandboxProfile connect_targets must be a list")
+        connects = []
+        for target in targets:
+            if not isinstance(target, dict):
+                raise TypeError("SandboxProfile connection must be an object")
+            if (not isinstance(target.get("ip"), str)
+                    or not isinstance(target.get("family"), str)
+                    or type(target.get("port")) is not int):
+                raise TypeError("SandboxProfile connection has invalid field types")
+            connects.append(ConnectTarget(**target))
         d["connect_targets"] = connects
+        # A missing version cannot promote a legacy record into this epoch.
+        d.setdefault("cache_version", 1)
         return cls(**d)
 
 
@@ -163,17 +211,38 @@ class SandboxProfile:
 # ---------------------------------------------------------------------------
 
 
+
+
+
 def _sha256_file(path: Path) -> str:
-    """sha256 of file content, streamed so large binaries don't
-    OOM. 64KiB blocks balance syscall overhead vs memory."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(65536)
+    """Fingerprint one regular binary without unbounded special-file reads."""
+    fd = None
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(errno.EINVAL, "calibration binary is not a regular file", str(path))
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1 << 20))
             if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+                raise OSError(errno.EIO, "calibration binary shortened while hashing", str(path))
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise OSError(errno.EIO, "calibration binary grew while hashing", str(path))
+        after = os.fstat(fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise OSError(errno.EIO, "calibration binary changed while hashing", str(path))
+        return digest.hexdigest()
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _env_signature(env_keys: Iterable[str]) -> str:
@@ -195,17 +264,22 @@ def _env_signature(env_keys: Iterable[str]) -> str:
         # "FOOBAR=baz" — a synthetic edge case in practice but
         # cheap to defend.
         parts.append(f"{len(k)}:{k}={len(v)}:{v}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    # POSIX environ decodes non-UTF-8 bytes with surrogateescape. Recover
+    # those bytes while retaining the historical encoding for valid text.
+    return hashlib.sha256(
+        "\n".join(parts).encode("utf-8", errors="surrogateescape")
+    ).hexdigest()
 
 
-def _fingerprint(bin_sha: str, env_sig: str) -> str:
-    """Cache key = sha256(binary content || env signature). Combines
-    both so a binary used with different relevant env produces
-    distinct profiles."""
+def _fingerprint(bin_sha: str, env_sig: str,
+                 probe_args: Iterable[str] = ("--version",)) -> str:
+    """Cache identity includes binary content, environment, and argv."""
     h = hashlib.sha256()
     h.update(bin_sha.encode("ascii"))
     h.update(b"\0")
     h.update(env_sig.encode("ascii"))
+    h.update(b"\0")
+    h.update(dumps_canonical(list(probe_args)).encode("ascii"))
     return h.hexdigest()
 
 
@@ -219,6 +293,38 @@ def _now_iso() -> str:
     ).isoformat().replace("+00:00", "Z")
 
 
+def _probe_env(env_keys: Iterable[str]) -> dict | None:
+    """Child env for the calibration probe, honouring ``env_keys``.
+
+    The cache key discriminates on the ``env_keys`` values, so the
+    probe must actually SEE them — pre-fix the probe never received
+    an env and the sandbox spawned it under ``get_safe_env()``, which
+    strips exactly the discriminator variables (e.g.
+    ``CLAUDE_CODE_USE_BEDROCK`` / ``ANTHROPIC_BASE_URL``): every env
+    shape produced the identical measurement, and a Bedrock-configured
+    operator got a direct-endpoint profile cached under the Bedrock
+    fingerprint.
+
+    Returns ``get_safe_env()`` overlaid with exactly the declared
+    discriminator keys from the operator environment (set → copied
+    in; unset → removed, so a stale allowlisted value can't leak
+    through). ``None`` when no keys are declared — the sandbox then
+    applies its own safe-env default, unchanged.
+    """
+    keys = sorted(set(env_keys or ()))
+    if not keys:
+        return None
+    from core.config import RaptorConfig
+    env = RaptorConfig.get_safe_env()
+    for k in keys:
+        v = os.environ.get(k)
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Probe spawn
 # ---------------------------------------------------------------------------
@@ -226,11 +332,11 @@ def _now_iso() -> str:
 
 def _spawn_probe(
     bin_path: Path,
-    probe_args: List[str],
+    probe_args: list[str],
     *,
     timeout: float,
-    extra_env: Optional[dict] = None,
-) -> Tuple["SandboxProfile", int]:
+    extra_env: dict | None = None,
+) -> tuple[SandboxProfile, int]:
     """Run the probe under sandbox(observe=True, audit-log proxy).
 
     Returns (partial_profile_with_observed_data, return_code). The
@@ -261,6 +367,15 @@ def _spawn_probe(
         # binary should ever actually reach. The placeholder isn't
         # an allowlist for the probe — audit_log_only sees through
         # it — but it satisfies the API contract.
+        # require_proxy_netns is deliberately NOT set here: the
+        # probe binary is operator-designated and trusted (codeql,
+        # claude, ...), and nothing from a scanned repo reaches this
+        # execution. Calibration is MEASUREMENT, not containment —
+        # audit_log_only already lets every CONNECT through by
+        # design, so the netns tier adds no enforcement here and
+        # requiring it would only make calibration fail on
+        # netns-less hosts (00015 requires the netns tier only for
+        # repo-influenced egress).
         result = sandbox_run(
             [str(bin_path)] + list(probe_args),
             target=str(scratch_path),
@@ -273,24 +388,54 @@ def _spawn_probe(
             env=extra_env,
             timeout=timeout,
         )
-        nonce = result.sandbox_info.get("observe_nonce")
-        observed = parse_observe_log(scratch_path, expected_nonce=nonce)
+        nonce = result.sandbox_info.get("observe_nonce")  # type: ignore[attr-defined]
+        # current_run=True: this parse reads a run THIS process just
+        # executed. On a degraded host that produced no nonce it
+        # refuses the target-writable legacy log location and demotes
+        # nonce trust — without it a probed binary on such a host
+        # could plant a forged log and poison the cached Landlock
+        # allowlists this profile feeds.
+        observed = parse_observe_log(
+            scratch_path, expected_nonce=nonce,
+            sandbox_info=result.sandbox_info,  # type: ignore[attr-defined]
+            current_run=True,
+        )
+        if not observed.nonce_trusted:
+            raise RuntimeError(
+                "calibration observation is untrusted; profile was not cached")
+        if observed.capture_incomplete or observed.budget_truncated:
+            raise RuntimeError(
+                "calibration observation is incomplete; profile was not cached")
 
         # Hostnames from the proxy event log (which records the
         # CONNECT target by name regardless of allow/deny). De-dup
         # + sort so repeated probes of the same binary produce
         # identical profiles (modulo timestamp).
-        events = result.sandbox_info.get("proxy_events") or ()
+        events = result.sandbox_info.get("proxy_events") or ()  # type: ignore[attr-defined]
+        if any(
+            isinstance(ev, dict) and ev.get("result") == "buffer_overflow"
+            and (ev.get("dropped", 0) > 0 or ev.get("dropped_denials", 0) > 0)
+            for ev in events
+        ):
+            raise RuntimeError(
+                "calibration proxy observation is incomplete; profile was not cached")
         hosts = sorted({
             ev["host"] for ev in events
             if isinstance(ev, dict) and ev.get("host")
         })
 
-        # Map observe ConnectTarget → our local dataclass.
-        connects = [
-            ConnectTarget(ip=t.ip, port=t.port, family=t.family)
-            for t in observed.connect_targets
-        ]
+        # Map observe ConnectTarget → our local dataclass. De-dup +
+        # sort like every other observational list so to_json's
+        # "identical JSON modulo timestamp" promise holds for repeat
+        # probes (frozen dataclass is hashable; sort by field tuple
+        # since order=True isn't set).
+        connects = sorted(
+            {
+                ConnectTarget(ip=t.ip, port=t.port, family=t.family)
+                for t in observed.connect_targets
+            },
+            key=lambda t: (t.family, t.ip, t.port),
+        )
 
         # Build the partial profile. Identity fields filled by
         # caller; we don't have them here.
@@ -348,21 +493,26 @@ def calibrate_binary(
 
     Raises:
         FileNotFoundError if bin_path doesn't exist.
+        OSError if the binary is unreadable, nonregular, or changes while hashing.
         RuntimeError if observe-mode failed to engage (no nonce
         produced — usually missing libseccomp / ptrace).
     """
+    # These inputs are reused for identity, probe environment, and
+    # execution. Materialise one-shot iterables before any consumer.
+    probe_args = tuple(probe_args)
+    env_keys = tuple(env_keys)
     bin_real = Path(bin_path).resolve()
     if not bin_real.exists():
-        raise FileNotFoundError(
-            f"calibrate_binary: {bin_path!r} does not exist"
-        )
+        msg = f"calibrate_binary: {bin_path!r} does not exist"
+        raise FileNotFoundError(msg)
 
     bin_sha = _sha256_file(bin_real)
     env_sig = _env_signature(env_keys)
-    fp = _fingerprint(bin_sha, env_sig)
+    fp = _fingerprint(bin_sha, env_sig, probe_args)
 
     profile, rc = _spawn_probe(
         bin_real, list(probe_args), timeout=timeout,
+        extra_env=_probe_env(env_keys),
     )
     # Fill identity fields the spawn helper couldn't know.
     profile.binary_path = str(bin_real)
@@ -380,16 +530,36 @@ def calibrate_binary(
         # observe-mode degraded silently. Don't cache an empty
         # profile — that would mask real reach behind a stale
         # placeholder. Raise so the caller can react.
-        raise RuntimeError(
+        msg = (
             f"calibrate_binary: probe of {bin_real} produced no "
             f"records. Either the binary's probe args don't "
             f"exercise its startup paths, or observe-mode failed "
             f"to engage on this host (libseccomp/ptrace check). "
             f"Probe rc={rc}."
         )
+        raise RuntimeError(msg)
 
     _save_to_cache(fp, profile)
     return profile
+
+
+def _load_matching_cache(bin_sha: str, env_sig: str,
+                         probe_args: Iterable[str]) -> SandboxProfile | None:
+    """Read current or legacy keys only when all measured inputs match."""
+    args = list(probe_args)
+    current = _fingerprint(bin_sha, env_sig, args)
+    # Old keys omitted argv. Their records still carry argv and env
+    # metadata, so exact matches remain usable without another probe.
+    legacy = hashlib.sha256((bin_sha + "\0" + env_sig).encode("ascii")).hexdigest()
+    for fingerprint in (current, legacy):
+        cached = _load_from_cache(fingerprint)
+        if (cached is not None
+                and cached.binary_sha256 == bin_sha
+                and cached.env_signature == env_sig
+                and cached.probe_args == args
+                and cached.cache_version == _CACHE_VERSION):
+            return cached
+    return None
 
 
 def load_or_calibrate(
@@ -403,38 +573,33 @@ def load_or_calibrate(
     """Return cached profile if fresh; calibrate otherwise.
 
     Cache freshness:
-      * cache file exists for the (binary_sha256, env_signature)
-        fingerprint, AND
+      * cache file exists for the (binary_sha256, env_signature,
+        probe_args) fingerprint, AND
       * the stored binary_sha256 still matches the current binary
         (defends against the cache surviving a binary update with
         the SAME path), AND
+      * stored environment and probe arguments match this request, AND
       * cache_version matches the current schema.
 
     `force=True` skips the freshness check and re-runs the probe.
     Useful after operator-side config changes that aren't covered
     by env_keys (e.g. ``~/.config/...``).
     """
+    # These inputs are reused for identity, probe environment, and
+    # execution. Materialise one-shot iterables before any consumer.
+    probe_args = tuple(probe_args)
+    env_keys = tuple(env_keys)
     bin_real = Path(bin_path).resolve()
     if not bin_real.exists():
-        raise FileNotFoundError(
-            f"load_or_calibrate: {bin_path!r} does not exist"
-        )
+        msg = f"load_or_calibrate: {bin_path!r} does not exist"
+        raise FileNotFoundError(msg)
 
     if not force:
         bin_sha = _sha256_file(bin_real)
         env_sig = _env_signature(env_keys)
-        fp = _fingerprint(bin_sha, env_sig)
-        cached = _load_from_cache(fp)
+        cached = _load_matching_cache(bin_sha, env_sig, probe_args)
         if cached is not None:
-            # Re-verify the on-disk binary still matches. The
-            # fingerprint already includes the sha; this check
-            # catches the (rare) case where the cache file was
-            # truncated/corrupted to a sha that happens to look
-            # right but content drifted.
-            if (cached.binary_sha256 == bin_sha
-                    and cached.cache_version == _CACHE_VERSION):
-                return cached
-            # Cache stale: fall through and recalibrate.
+            return cached
 
     return calibrate_binary(
         bin_real, probe_args=probe_args,
@@ -446,55 +611,105 @@ def _save_to_cache(fingerprint: str, profile: SandboxProfile) -> None:
     """Persist a profile. mode 0600, dir mode 0700."""
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(_CACHE_DIR, 0o700)
+        # 0o700 = owner-only — most restrictive POSIX mode.
+        os.chmod(_CACHE_DIR, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions
     except OSError as exc:
-        logger.warning("calibrate: cache dir setup failed: %s", exc)
+        logger.warning("calibrate: cache dir setup failed: %s",
+                       sanitise_exception_message(exc))
         return
     path = _cache_path_for(fingerprint)
-    # Atomic write: tempfile in the cache dir + rename. Avoids
-    # partial-content cache hits when the parent's process crashes
-    # mid-write.
+    # Atomic write: sandbox calibration cache. mode=0o600 to preserve
+    # the owner-only posture the previous mkstemp+chmod pattern installed
+    # (the shared primitive's default 0o644 would widen; the cache is
+    # owner-scoped, not shared). Primitive adds fsync-file + fsync-
+    # parent-dir durability the old direct-write lacked.
+    # 0o600 = owner-only file mode.
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions
     try:
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".calibrate-tmp-", suffix=".json",
-            dir=str(_CACHE_DIR),
+        write_text_atomically(
+            path, profile.to_json(),
+            mode=0o600, tmp_prefix=".calibrate-tmp-",
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(profile.to_json())
-            os.chmod(tmp_path, 0o600)
-            os.rename(tmp_path, path)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
     except OSError as exc:
         logger.warning("calibrate: cache write failed for %s: %s",
-                       path, exc)
+                       sanitise_for_terminal(str(path)),
+                       sanitise_exception_message(exc))
 
 
-def _load_from_cache(fingerprint: str) -> Optional[SandboxProfile]:
-    path = _cache_path_for(fingerprint)
-    if not path.exists():
-        return None
+
+def _read_cache_profile(path: Path) -> SandboxProfile:
+    """Read one bounded regular cache file without blocking on a FIFO."""
+    fd = os.open(
+        path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    read_failed = False
     try:
-        return SandboxProfile.from_json(
-            path.read_text(encoding="utf-8"),
-        )
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("calibration cache entry is not a regular file")
+        if metadata.st_size > _MAX_CACHE_BYTES:
+            raise ValueError("calibration cache entry exceeds the byte limit")
+        data = bytearray()
+        while len(data) <= _MAX_CACHE_BYTES:
+            chunk = os.read(fd, min(1 << 20, _MAX_CACHE_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > _MAX_CACHE_BYTES:
+            raise ValueError("calibration cache entry exceeds the byte limit")
+    except BaseException:
+        read_failed = True
+        raise
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            # Keep cancellation/body errors primary, but a close-only
+            # failure must still prevent successful metadata I/O.
+            if not read_failed:
+                raise
+    return SandboxProfile.from_json(data.decode("utf-8"))
+
+
+def _load_from_cache(fingerprint: str) -> SandboxProfile | None:
+    path = _cache_path_for(fingerprint)
+    try:
+        return _read_cache_profile(path)
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError, TypeError, KeyError) as exc:
         # Corrupt cache file (manual edit, partial write that
         # somehow escaped the atomic rename). Treat as miss; the
         # caller will recalibrate and overwrite.
         logger.warning(
             "calibrate: cache load failed for %s: %s "
-            "(treating as miss)", path, exc,
+            "(treating as miss)", sanitise_for_terminal(str(path)),
+            sanitise_exception_message(exc),
         )
         return None
 
 
-def clear_cache(bin_path=None) -> int:
+@contextlib.contextmanager
+def _cache_entry_paths(*, report_errors: bool):
+    """Own diagnostic enumeration so filesystem errors cannot look empty."""
+    directory = _CACHE_DIR
+    if not report_errors:
+        yield directory.glob("*.json")
+        return
+    try:
+        entries = os.scandir(directory)
+    except FileNotFoundError:
+        yield ()
+        return
+    with entries as iterator:
+        yield (directory / entry.name for entry in iterator
+               if entry.name.endswith(".json"))
+
+
+def clear_cache(
+    bin_path=None, *, errors: list[tuple[Path, OSError]] | None = None,
+) -> int:
     """Delete one or all cache entries; return count removed.
 
     `bin_path=None` drops every entry. Otherwise the binary's sha
@@ -502,38 +717,53 @@ def clear_cache(bin_path=None) -> int:
     we drop EVERY env-variant of the named binary, since the
     operator's intent on `--clear <bin>` is "forget what we knew
     about this tool", not "forget one specific env shape").
+
+    Entry I/O failures leave that entry alone and cleanup continues. When
+    supplied, errors receives (path, original OSError) pairs so explicit
+    cleanup commands can distinguish partial failure from an empty cache.
+    Missing-entry races and unidentifiable corrupt profiles remain quiet.
+    With a collector, enumeration uses explicit scandir so native directory
+    errors propagate rather than appearing empty; its iterator always closes.
     """
-    if not _CACHE_DIR.exists():
+    if errors is None and not _CACHE_DIR.exists():
         return 0
 
-    if bin_path is None:
+    with _cache_entry_paths(report_errors=errors is not None) as paths:
+        if bin_path is None:
+            n = 0
+            for p in paths:
+                try:
+                    p.unlink()
+                    n += 1
+                except FileNotFoundError:
+                    pass  # Another cleanup already removed this entry.
+                except OSError as exc:
+                    if errors is not None:
+                        errors.append((p, exc))
+            return n
+
+        bin_real = Path(bin_path).resolve()
+        if not bin_real.exists():
+            return 0
+        target_sha = _sha256_file(bin_real)
         n = 0
-        for p in _CACHE_DIR.glob("*.json"):
+        for p in paths:
             try:
-                p.unlink()
-                n += 1
-            except OSError:
-                pass
+                cached = _read_cache_profile(p)
+                if cached.binary_sha256 == target_sha:
+                    p.unlink()
+                    n += 1
+            except FileNotFoundError:
+                continue  # Another cleanup already removed this entry.
+            except OSError as exc:
+                if errors is not None:
+                    errors.append((p, exc))
+                continue
+            except (ValueError, TypeError, KeyError):
+                # A corrupt profile cannot identify the requested binary.
+                # Leave it alone; --clear-all retains its existing reset role.
+                continue
         return n
-
-    bin_real = Path(bin_path).resolve()
-    if not bin_real.exists():
-        return 0
-    target_sha = _sha256_file(bin_real)
-    n = 0
-    for p in _CACHE_DIR.glob("*.json"):
-        try:
-            cached = SandboxProfile.from_json(
-                p.read_text(encoding="utf-8"),
-            )
-            if cached.binary_sha256 == target_sha:
-                p.unlink()
-                n += 1
-        except (OSError, ValueError, TypeError, KeyError):
-            # Unreadable entry — leave alone; operator can rm -rf
-            # the cache dir if they want a hard reset.
-            continue
-    return n
 
 
 def cache_dir() -> Path:

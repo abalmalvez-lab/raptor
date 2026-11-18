@@ -3,7 +3,28 @@ rules:
     message: AES-ECB is insecure. Use AEAD modes like GCM. Verify migration plan.
     languages: [java, kotlin]
     severity: HIGH
-    pattern: Cipher.getInstance("AES/ECB/PKCS5Padding")
+    patterns:
+      - pattern: javax.crypto.Cipher.getInstance($ALGO, ...)
+      - metavariable-regex:
+          metavariable: $ALGO
+          regex: '(?i)^"AES/ECB/[^"]+"$'
+    metadata:
+      cwe: ["CWE-327"]
+      asvs: ["V3.11"]
+
+  # A bare algorithm leaves the mode and padding to the selected provider.
+  - id: raptor.crypto.aes.default-ecb.java
+    message: >-
+      Bare AES leaves the mode and padding to provider-specific defaults,
+      which may select ECB. Review the selected provider and specify an
+      explicit authenticated mode such as AES/GCM/NoPadding where appropriate.
+    languages: [java, kotlin]
+    severity: HIGH
+    patterns:
+      - pattern: javax.crypto.Cipher.getInstance($ALGO, ...)
+      - metavariable-regex:
+          metavariable: $ALGO
+          regex: '(?i)^"AES"$'
     metadata:
       cwe: ["CWE-327"]
       asvs: ["V3.11"]
@@ -12,7 +33,11 @@ rules:
     message: AES-ECB is insecure. Use AEAD modes like GCM. Verify migration plan.
     languages: [python]
     severity: HIGH
-    pattern: Crypto.Cipher.AES.new($K, Crypto.Cipher.AES.MODE_ECB, ...)
+    pattern-either:
+      - pattern: Crypto.Cipher.AES.new($K, Crypto.Cipher.AES.MODE_ECB, ...)
+      - pattern: Crypto.Cipher.AES.new($K, mode=Crypto.Cipher.AES.MODE_ECB, ...)
+      - pattern: Crypto.Cipher.AES.new(key=$K, mode=Crypto.Cipher.AES.MODE_ECB, ...)
+      - pattern: cryptography.hazmat.primitives.ciphers.modes.ECB()
     metadata:
       cwe: ["CWE-327"]
       asvs: ["V3.11"]

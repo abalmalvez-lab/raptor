@@ -1,0 +1,1028 @@
+"""Tests for the live-finding string-theory injection prescreen.
+
+Soundness bar: a false "refuted" suppresses a real bug, so every
+tricky liftability fixture (partial anchors, re.search, flags/count
+arguments, Ruby line anchors, the re.match trailing-newline quirk)
+must yield NO signal. Exact whole-string charset shapes retain conditional
+model evidence, without source-effect refutation or sink authority.
+"""
+
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+pytest.importorskip("z3")
+
+from core.dataflow import injection_prescreen as ip
+from core.dataflow.smt_barrier import ValidatorSpec, extract_validator_from_line
+from core.dataflow.injection_prescreen import (
+    PrescreenVerdict,
+    prescreen_finding,
+    sink_classes_for_rule,
+    snapshot_stats,
+)
+
+# ---------------------------------------------------------------------------
+# Fixture helpers
+# ---------------------------------------------------------------------------
+
+def test_prescreen_declines_charset_after_shared_budget_expiry():
+    from core.smt_solver.session import query_budget
+
+    spec = ValidatorSpec(kind="charset", var_name="name", charset="A-Za-z0-9")
+    classes = frozenset({"pathtrav", "sqli"})
+    with query_budget(0):
+        sound, reason, _elapsed = ip._spec_neutralizes_all(spec, classes)
+    assert sound is False
+    assert "budget" in reason
+    assert ip._spec_neutralizes_all(spec, classes)[0] is True
+
+
+# Line numbers (1-based) are load-bearing for the AST dominance checks.
+# Direct aliasing keeps these guard controls independent of call-return contracts.
+# The refuting charset is DOTLESS: '.' is a pathtrav danger char ('.'
+# builds '..' segments), so dot-admitting charsets must decline.
+GUARD_APP = """\
+import os
+import re
+
+
+def handler(request):
+    name = request.args.get('name')
+    if not re.match(r'^[A-Za-z0-9_+-]+$', name):
+        return None
+    cfg = name
+    open(cfg)
+"""
+GUARD_SOURCE_LINE = 6
+GUARD_VALIDATOR_LINE = 7
+GUARD_SINK_LINE = 10
+
+# The historical whoogle shape admits '.' — sound for the join-shape
+# seen there, but the charset proof has no join-shape model, so the
+# prescreen must not refute pathtrav on it.
+GUARD_APP_WHOOGLE = GUARD_APP.replace("[A-Za-z0-9_+-]", "[A-Za-z0-9_.+-]")
+
+
+SUB_APP = """\
+import os
+import re
+
+
+def handler(request):
+    name = request.args.get('name')
+    name = re.sub(r'[/\\\\.]+', '', name)
+    open(name)
+"""
+SUB_SOURCE_LINE = 6
+SUB_VALIDATOR_LINE = 7
+SUB_SINK_LINE = 8
+
+
+def _step(file_path: str, line: int, label: str = "step"):
+    return SimpleNamespace(
+        file_path=file_path, line=line, column=1, snippet="", label=label,
+    )
+
+
+def _path(file_name: str, source_line: int, step_lines: list,
+          sink_line: int):
+    return SimpleNamespace(
+        source=_step(file_name, source_line, "source"),
+        sink=_step(file_name, sink_line, "sink"),
+        intermediate_steps=[_step(file_name, ln) for ln in step_lines],
+    )
+
+
+@pytest.fixture
+def guard_repo(tmp_path):
+    (tmp_path / "app.py").write_text(GUARD_APP, encoding="utf-8")
+    return tmp_path
+
+
+@pytest.fixture
+def sub_repo(tmp_path):
+    (tmp_path / "app.py").write_text(SUB_APP, encoding="utf-8")
+    return tmp_path
+
+
+def _guard_path():
+    return _path("app.py", GUARD_SOURCE_LINE,
+                 [GUARD_VALIDATOR_LINE], GUARD_SINK_LINE)
+
+
+def _sub_path():
+    return _path("app.py", SUB_SOURCE_LINE,
+                 [SUB_VALIDATOR_LINE], SUB_SINK_LINE)
+
+
+def _write_app(tmp_path, body: str, name: str = "app.py"):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Rule-id → sink-class mapping
+# ---------------------------------------------------------------------------
+
+
+class TestSinkClassMapping:
+    @pytest.mark.parametrize("rule_id,expected", [
+        ("py/path-injection", {"pathtrav"}),
+        # command-LINE-injection families flag argv-element sinks too,
+        # so the argv-context danger model joins the shell model.
+        ("py/command-line-injection", {"cmdi", "cmdi_argv"}),
+        ("py/command-injection", {"cmdi"}),
+        ("js/xss", {"xss"}),
+        ("js/reflected-xss", {"xss"}),
+        ("java/sql-injection", {"sqli"}),
+        ("raptor.injection.command-shell", set()),
+        ("semgrep.python.path-traversal.open", {"pathtrav"}),
+    ])
+    def test_rule_patterns(self, rule_id, expected):
+        assert set(sink_classes_for_rule(rule_id)) == expected
+
+    def test_non_injection_rules_map_to_nothing(self):
+        for rule_id in ("cpp/integer-overflow", "py/weak-crypto",
+                        "js/prototype-pollution", ""):
+            assert sink_classes_for_rule(rule_id) == frozenset()
+
+    def test_explicit_cwe_fallback(self):
+        assert "pathtrav" in sink_classes_for_rule("custom/rule-1",
+                                                   cwe="CWE-22")
+        assert "sqli" in sink_classes_for_rule("custom/rule-1", cwe="CWE-89")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end refutations
+# ---------------------------------------------------------------------------
+
+
+class TestGuardFormRefutation:
+    def test_dotless_charset_retains_nonrefuting_model(self, guard_repo):
+        verdict = prescreen_finding(
+            paths=[_guard_path()], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert isinstance(verdict, PrescreenVerdict)
+        assert verdict.refuted is False
+        assert verdict.paths_checked == 1
+        (ev,) = verdict.evidence
+        assert ev["validator_file"] == "app.py"
+        assert ev["validator_line"] == GUARD_VALIDATOR_LINE
+        assert ev["kind"] == "charset"
+        assert ev["sink_classes"] == ["pathtrav"]
+        assert verdict.solver_ms >= 0
+
+    def test_whoogle_dot_charset_declines_pathtrav(self, tmp_path):
+        # '.' is in the pathtrav danger model ('..' segments) and the
+        # charset proof carries no join-shape model — a dot-admitting
+        # charset must not refute a pathtrav finding.
+        repo = _write_app(tmp_path, GUARD_APP_WHOOGLE)
+        assert prescreen_finding(
+            paths=[_guard_path()], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_insufficient_charset_no_refutation(self, tmp_path):
+        # Charset PERMITS '/' — the danger char survives; the Z3 proof
+        # comes back sat and the prescreen must not refute.
+        app = GUARD_APP.replace("[A-Za-z0-9_+-]", "[A-Za-z0-9_/+-]")
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_guard_path()], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_sub_form_retains_nonrefuting_model(self, sub_repo):
+        verdict = prescreen_finding(
+            paths=[_sub_path()], repo_root=sub_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+        (ev,) = verdict.evidence
+        assert ev["kind"] == "charset_sub"
+
+    def test_fullmatch_retains_nonrefuting_cmdi_model(self, tmp_path):
+        # fullmatch has no trailing-newline quirk, so a charset
+        # excluding every cmdi danger char yields a conditional model.
+        # Dotted, dash-free: the command-line-injection rule family
+        # also puts the argv-context model in play, and '-' is an argv
+        # danger char (option injection).
+        app = GUARD_APP.replace(
+            "re.match(r'^[A-Za-z0-9_+-]+$', name)",
+            "re.fullmatch(r'[A-Za-z0-9_.]+', name)",
+        )
+        repo = _write_app(tmp_path, app)
+        verdict = prescreen_finding(
+            paths=[_guard_path()], repo_root=repo,
+            rule_id="py/command-line-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+
+# ---------------------------------------------------------------------------
+# Liftability: every tricky shape must yield NO signal
+# ---------------------------------------------------------------------------
+
+
+class TestLiftabilityConservatism:
+    @pytest.mark.parametrize("validator_line", [
+        # re.search constrains nothing about the whole string.
+        "    if not re.search(r'^[A-Za-z0-9_+-]+$', name):",
+        # Unanchored re.match — suffix unconstrained.
+        "    if not re.match(r'[A-Za-z0-9_+-]+', name):",
+        # Partial anchor (no $) — suffix unconstrained.
+        "    if not re.match(r'^[A-Za-z0-9_+-]+', name):",
+        # Flags argument changes matching semantics (e.g. MULTILINE
+        # turns $ into a line anchor) — call must close after the var.
+        "    if not re.match(r'^[A-Za-z0-9_+-]+$', name, re.MULTILINE):",
+        "    if not re.match(r'^[A-Za-z0-9_+-]+$', name, re.I):",
+        # Negated class inverts the language.
+        "    if not re.match(r'^[^/\\\\]+$', name):",
+        # Shorthand classes are not literal charsets.
+        "    if not re.match(r'^[\\w.+-]+$', name):",
+    ])
+    def test_unliftable_python_guards(self, tmp_path, validator_line):
+        lines = GUARD_APP.splitlines()
+        lines[GUARD_VALIDATOR_LINE - 1] = validator_line
+        repo = _write_app(tmp_path, "\n".join(lines) + "\n")
+        assert prescreen_finding(
+            paths=[_guard_path()], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_sub_with_count_arg_unliftable(self, tmp_path):
+        # count=1 strips only the first occurrence — later danger
+        # chars survive, so the strip claim is false.
+        app = SUB_APP.replace(
+            "re.sub(r'[/\\\\.]+', '', name)",
+            "re.sub(r'[/\\\\.]+', '', name, 1)",
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_sub_path()], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_match_dollar_refused_for_cmdi(self, tmp_path):
+        # Python's $ under re.match tolerates one trailing newline and
+        # "\n" is a cmdi danger char — the same guard that soundly
+        # refutes pathtrav must NOT refute cmdi.
+        app = GUARD_APP
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_guard_path()], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_ruby_guards_refused(self, tmp_path):
+        # Ruby ^/$ are always line anchors — the whole-string charset
+        # claim never holds, whatever the pattern.
+        app = (
+            "def handler(request)\n"
+            "  name = params[:name]\n"
+            "  return nil unless name =~ /^[A-Za-z0-9_+-]+$/\n"
+            "  File.open(name)\n"
+            "end\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.rb")
+        path = _path("app.rb", 2, [3], 4)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo, rule_id="rb/path-injection",
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# Dominance / value-chain conservatism
+# ---------------------------------------------------------------------------
+
+
+class TestDominanceConservatism:
+    def test_guard_without_exit_no_signal(self, tmp_path):
+        app = GUARD_APP.replace("        return None", "        pass")
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_guard_path()], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_validator_for_unrelated_variable_no_signal(self, tmp_path):
+        # Guard constrains `other`; the sink consumes `name`.
+        app = GUARD_APP.replace(
+            "    name = request.args.get('name')",
+            "    name = request.args.get('name')\n"
+            "    other = request.args.get('other')",
+        ).replace(
+            "re.match(r'^[A-Za-z0-9_+-]+$', name)",
+            "re.match(r'^[A-Za-z0-9_+-]+$', other)",
+        )
+        repo = _write_app(tmp_path, app)
+        # Lines shift by one after the inserted assignment.
+        path = _path("app.py", GUARD_SOURCE_LINE,
+                     [GUARD_VALIDATOR_LINE + 1], GUARD_SINK_LINE + 1)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo, rule_id="py/path-injection",
+        ) is None
+
+    def test_cross_file_validator_no_signal(self, guard_repo):
+        (guard_repo / "other.py").write_text(GUARD_APP, encoding="utf-8")
+        path = _path("app.py", GUARD_SOURCE_LINE, [], GUARD_SINK_LINE)
+        path.intermediate_steps = [_step("other.py", GUARD_VALIDATOR_LINE)]
+        assert prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_path_escape_refused(self, guard_repo):
+        path = _path("app.py", GUARD_SOURCE_LINE,
+                     [GUARD_VALIDATOR_LINE], GUARD_SINK_LINE)
+        path.intermediate_steps = [_step("../outside.py", 7)]
+        assert prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-path all-or-nothing
+# ---------------------------------------------------------------------------
+
+
+class TestMultiPath:
+    def test_all_paths_modelled_without_refutation(self, guard_repo):
+        verdict = prescreen_finding(
+            paths=[_guard_path(), _guard_path()], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+        assert verdict.paths_checked == 2
+        assert len(verdict.evidence) == 2
+
+    def test_one_unliftable_path_kills_the_signal(self, guard_repo):
+        bare = _path("app.py", GUARD_SOURCE_LINE, [], GUARD_SINK_LINE)
+        assert prescreen_finding(
+            paths=[_guard_path(), bare], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_path_cap_yields_no_signal(self, guard_repo):
+        paths = [_guard_path() for _ in range(ip.MAX_PRESCREEN_PATHS + 1)]
+        assert prescreen_finding(
+            paths=paths, repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# Gates, timeout threading, telemetry
+# ---------------------------------------------------------------------------
+
+
+class TestGatesAndTelemetry:
+    def test_unsupported_language_no_signal(self, tmp_path):
+        repo = _write_app(tmp_path, "int main() { return 0; }\n",
+                          name="app.c")
+        path = _path("app.c", 1, [1], 1)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo, rule_id="cpp/path-injection",
+        ) is None
+
+    def test_z3_unavailable_no_signal(self, guard_repo):
+        with patch.object(ip, "_z3_available", return_value=False):
+            assert prescreen_finding(
+                paths=[_guard_path()], repo_root=guard_repo,
+                rule_id="py/path-injection",
+            ) is None
+
+    def test_solver_timeout_is_threaded(self, guard_repo):
+        seen = {}
+
+        def fake_prove(spec, sink_class, timeout_ms=None):
+            seen["timeout_ms"] = timeout_ms
+            return SimpleNamespace(sound=False, counterexample=None,
+                                   reasoning="z3 returned unknown")
+
+        with patch.object(ip, "prove_neutralizes", side_effect=fake_prove):
+            verdict = prescreen_finding(
+                paths=[_guard_path()], repo_root=guard_repo,
+                rule_id="py/path-injection",
+            )
+        assert verdict is None  # unknown/timeout can never refute
+        assert seen["timeout_ms"] == ip.SOLVER_TIMEOUT_MS
+
+    def test_stats_counters(self, guard_repo, tmp_path):
+        before = snapshot_stats()
+        prescreen_finding(
+            paths=[_guard_path()], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        after_refute = snapshot_stats()
+        assert after_refute["attempted"] == before["attempted"] + 1
+        assert after_refute["refuted"] == before["refuted"]
+        assert after_refute["no_signal"] == before["no_signal"] + 1
+        assert after_refute["lifted"] == before["lifted"] + 1
+
+        bare = _path("app.py", GUARD_SOURCE_LINE, [], GUARD_SINK_LINE)
+        prescreen_finding(
+            paths=[bare], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        after_miss = snapshot_stats()
+        assert after_miss["no_signal"] == after_refute["no_signal"] + 1
+        assert after_miss["refuted"] == after_refute["refuted"]
+
+
+class TestNonPythonRebindKill:
+    """a204f309: the non-Python value-reach must apply the rebind-KILL, so
+    a charset guard whose variable is re-tainted after the guard does NOT
+    suppress a live JS/TS/Java finding."""
+
+    _SPEC = extract_validator_from_line(
+        "  if (!/^[A-Za-z0-9]+$/.test(p)) return;", "javascript",
+    )
+
+    def _refute(self, src, step_line, sink_line):
+        assert self._SPEC is not None
+        return ip._step_refutes_path(
+            spec=self._SPEC, step_file="app.js", step_line=step_line,
+            sink_file="app.js", sink_line=sink_line, source_text=src,
+            language="javascript", sink_classes=frozenset({"pathtrav"}),
+        )
+
+    def test_no_rebind_still_refutes(self):
+        # legitimate guard, value flows straight to the sink -> suppressed
+        src = (
+            "function h(req){\n"
+            "  let p = req.query.name;\n"
+            "  if (!/^[A-Za-z0-9]+$/.test(p)) return;\n"   # 3 validator
+            "  fs.readFile(p);\n"              # 4 sink
+            "}\n"
+        )
+        refuted, _reason, _conf = self._refute(src, 3, 4)
+        assert refuted is True
+
+    def test_rebind_to_attacker_data_does_not_refute(self):
+        # p re-tainted after the guard -> the charset proof is stale -> the
+        # finding must fall through to LLM validation, not be suppressed.
+        src = (
+            "function h(req){\n"
+            "  let p = req.query.name;\n"
+            "  if (!/^[A-Za-z0-9]+$/.test(p)) return;\n"   # 3 validator
+            "  p = req.query.evil;\n"                   # 4 rebind
+            "  fs.readFile(p);\n"              # 5 sink
+            "}\n"
+        )
+        refuted, reason, _conf = self._refute(src, 3, 5)
+        assert refuted is False
+        assert "value chain" in reason
+
+
+# ---------------------------------------------------------------------------
+# Branch-wrapped validators must never refute a live finding.
+# ---------------------------------------------------------------------------
+
+BRANCH_GUARD_APP = """\
+import os
+import re
+
+
+def handler(request):
+    name = request.args.get('name')
+    if request.strict:
+        if not re.match(r'^[A-Za-z0-9_+-]+$', name):
+            return None
+    cfg = name
+    open(cfg)
+"""
+BRANCH_GUARD_VALIDATOR_LINE = 8
+BRANCH_GUARD_SINK_LINE = 11
+
+BRANCH_SUB_APP = """\
+import os
+import re
+
+
+def handler(request):
+    name = request.args.get('name')
+    if request.clean:
+        name = re.sub(r'[/\\\\.]+', '', name)
+    open(name)
+"""
+BRANCH_SUB_VALIDATOR_LINE = 8
+BRANCH_SUB_SINK_LINE = 9
+
+
+class TestBranchWrappedValidatorNeverRefutes:
+    """`if cond: <sanitizer>` sanitizes only on some paths — the sink
+    stays live whenever the branch is skipped, so the prescreen must
+    yield NO signal (a refutation here suppresses a real finding)."""
+
+    def test_branch_wrapped_guard_no_signal(self, tmp_path):
+        repo = _write_app(tmp_path, BRANCH_GUARD_APP)
+        path = _path("app.py", 6, [BRANCH_GUARD_VALIDATOR_LINE],
+                     BRANCH_GUARD_SINK_LINE)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_branch_wrapped_sub_no_signal(self, tmp_path):
+        repo = _write_app(tmp_path, BRANCH_SUB_APP)
+        path = _path("app.py", 6, [BRANCH_SUB_VALIDATOR_LINE],
+                     BRANCH_SUB_SINK_LINE)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# _read_source containment (shared contained/capped helper)
+# ---------------------------------------------------------------------------
+
+
+class TestReadSourceContainment:
+    def test_relative_path_reads(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        assert ip._read_source(tmp_path, "a.py") == "x = 1\n"
+
+    def test_traversal_refused(self, tmp_path):
+        (tmp_path / "outside.py").write_text("secret", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        assert ip._read_source(repo, "../outside.py") is None
+
+    def test_symlink_escape_refused(self, tmp_path):
+        outside = tmp_path / "outside.py"
+        outside.write_text("secret", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(outside, repo / "link.py")
+        assert ip._read_source(repo, "link.py") is None
+
+
+# ---------------------------------------------------------------------------
+# Comment / string decoys must never certify — the lift and the
+# dominance layers both require the validator span to be executable
+# code, not prose (comment-stripped/string-blanked view anchoring).
+# ---------------------------------------------------------------------------
+
+
+class TestDecoyValidatorsNeverRefute:
+    def test_python_comment_sub_decoy_no_refutation(self, tmp_path):
+        # The sanitizer exists only inside a trailing comment on a
+        # real code line — the flow is live and must reach the LLM.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    name = request.args.get('name')\n"
+            "    p = str(name)  # name = re.sub(r'[/\\\\.]+', '', name)\n"
+            "    open(name)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [7], 8)], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_python_docstring_guard_decoy_no_refutation(self, tmp_path):
+        # Validator text inside a (multi-line) string literal: the
+        # line-level view alone cannot see the enclosing quotes, so
+        # the anchor must come from the whole-file view.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    name = request.args.get('name')\n"
+            "    doc = '''example:\n"
+            "    if not re.match(r'^[A-Za-z0-9_+-]+$', name): return\n"
+            "    '''\n"
+            "    open(name)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [8], 10)], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_js_comment_guard_decoy_no_refutation(self, tmp_path):
+        app = (
+            "function h(req){\n"
+            "  let name = req.query.name;\n"
+            "  // if (!/^[a-z0-9]+$/.test(name)) { return; }\n"
+            "  exec('ls ' + name);\n"
+            "}\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.js")
+        assert prescreen_finding(
+            paths=[_path("app.js", 2, [3], 4)], repo_root=repo,
+            rule_id="js/command-line-injection",
+        ) is None
+
+    def test_js_block_comment_guard_decoy_no_refutation(self, tmp_path):
+        app = (
+            "function h(req){\n"
+            "  let name = req.query.name;\n"
+            "  /*\n"
+            "  if (!/^[a-z0-9]+$/.test(name)) { return; }\n"
+            "  */\n"
+            "  exec('ls ' + name);\n"
+            "}\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.js")
+        assert prescreen_finding(
+            paths=[_path("app.js", 2, [4], 6)], repo_root=repo,
+            rule_id="js/command-line-injection",
+        ) is None
+
+    def test_js_string_guard_decoy_no_refutation(self, tmp_path):
+        app = (
+            "function h(req){\n"
+            "  let name = req.query.name;\n"
+            "  let doc = \"if (!/^[a-z0-9]+$/.test(name)) { return; }\";\n"
+            "  exec('ls ' + name);\n"
+            "}\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.js")
+        assert prescreen_finding(
+            paths=[_path("app.js", 2, [3], 4)], repo_root=repo,
+            rule_id="js/command-line-injection",
+        ) is None
+
+    def test_real_validator_control_still_refutes(self, guard_repo):
+        # Two-direction guard: the anchored lift must keep certifying
+        # the genuine guard shape.
+        verdict = prescreen_finding(
+            paths=[_guard_path()], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+
+class TestNestedScopeRebindKill:
+    """A nested function rebinding an enclosing-scope name via
+    nonlocal/global executes on any call between validator and sink —
+    the chain must drop such names (kill-only, mirroring the
+    class-body arm)."""
+
+    def test_nonlocal_rebind_never_refutes(self, tmp_path):
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    raw = request.args.get('name')\n"
+            "    if not re.fullmatch(r'[A-Za-z0-9_+-]+', raw):\n"
+            "        return None\n"
+            "    y = raw\n"
+            "    def taint():\n"
+            "        nonlocal y\n"
+            "        y = request.environ['EVIL']\n"
+            "    taint()\n"
+            "    os.system(y)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [7], 14)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_global_rebind_never_refutes(self, tmp_path):
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    global g\n"
+            "    g = request.args.get('name')\n"
+            "    if not re.fullmatch(r'[A-Za-z0-9_+-]+', g):\n"
+            "        return None\n"
+            "    def taint():\n"
+            "        global g\n"
+            "        g = 'evil; rm -rf /'\n"
+            "    taint()\n"
+            "    os.system(g)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 7, [8], 14)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_inline_rebind_control_still_kills(self, tmp_path):
+        # Control from the finding: the same rebind inline (not
+        # nested) was already killed pre-fix.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    raw = request.args.get('name')\n"
+            "    if not re.fullmatch(r'[A-Za-z0-9_+-]+', raw):\n"
+            "        return None\n"
+            "    y = raw\n"
+            "    y = request.environ['EVIL']\n"
+            "    os.system(y)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [7], 11)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_nested_fn_without_escape_still_refutes(self, tmp_path):
+        # Two-direction guard: a nested function binding only its OWN
+        # local (no nonlocal/global) must not kill the chain.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    y = request.args.get('name')\n"
+            # Dash-free: the rule family puts the argv model in play.
+            "    if not re.fullmatch(r'[A-Za-z0-9_.]+', y):\n"
+            "        return None\n"
+            "    def helper():\n"
+            "        y = 'local-only'\n"
+            "        return y\n"
+            "    helper()\n"
+            "    os.system(y)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        verdict = prescreen_finding(
+            paths=[_path("app.py", 6, [7], 13)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+
+class TestBranchWrappedLexicalGuards:
+    """A JS/Java guard whose enclosing conditional is hidden by a '{'
+    inside a multi-line comment / template literal must yield NO
+    signal — the sink runs on paths that skipped the guard."""
+
+    HOSTILE_JS = (
+        "function run(x) {\n"
+        "  if (opts.paranoid) {\n"
+        "    /*\n"
+        "      {\n"
+        "    */\n"
+        "    if (!/^[a-z0-9]+$/.test(x)) return;\n"  # line 6 = guard
+        "  }\n"
+        "  exec(x);\n"                               # line 8 = sink
+        "}\n"
+    )
+    HONEST_JS = (
+        "function run(x) {\n"
+        "  if (!/^[a-z0-9]+$/.test(x)) return;\n"    # line 2 = guard
+        "  exec(x);\n"                               # line 3 = sink
+        "}\n"
+    )
+
+    def test_comment_hidden_branch_wrap_yields_no_signal(self, tmp_path):
+        (tmp_path / "hostile.js").write_text(self.HOSTILE_JS)
+        verdict = prescreen_finding(
+            paths=[_path("hostile.js", 1, [6], 8)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is None
+
+    def test_unconditional_guard_still_refutes(self, tmp_path):
+        """Two-direction control: the same guard NOT branch-wrapped
+        keeps refuting."""
+        (tmp_path / "honest.js").write_text(self.HONEST_JS)
+        verdict = prescreen_finding(
+            paths=[_path("honest.js", 1, [2], 3)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+
+class TestBalancedPhantomPairE2E:
+    ATTACK = (
+        "function run(x) {\n"
+        "  if (opts.paranoid) {\n"
+        "    if (!/^[a-z0-9]+$/.test(x)) return;\n"   # line 3 = guard
+        "    if (a) /{/.test(x);\n"                   # phantom '{'
+        "  }\n"
+        "  exec(x);\n"                                 # line 6 = sink
+        "}\n"
+        "if (b) /}/.test(y);\n"                        # rebalancing '}'
+    )
+    KEYWORD_SWALLOW = (
+        "function run(x) {\n"
+        "  q = a / 1; if (opts.paranoid && c / 2 > 0) {\n"
+        "    if (!/^[a-z0-9]+$/.test(x)) return;\n"   # line 3 = guard
+        "  }\n"
+        "  exec(x);\n"                                 # line 5 = sink
+        "}\n"
+    )
+
+    def test_balanced_phantom_pair_yields_no_signal(self, tmp_path):
+        """Statement-position regex literals carrying a balanced
+        phantom brace pair must not certify the branch-wrapped guard
+        as dominating (valid JS; the wrap is real)."""
+        (tmp_path / "a.js").write_text(self.ATTACK)
+        verdict = prescreen_finding(
+            paths=[_path("a.js", 1, [3], 6)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is None
+
+    def test_division_swallowed_keyword_yields_no_signal(self, tmp_path):
+        """Two genuine divisions around the wrap's 'if': the greedy
+        tracker blanking must not reach the conditional classifier —
+        the wrap is real and the finding stays live."""
+        (tmp_path / "b.js").write_text(self.KEYWORD_SWALLOW)
+        verdict = prescreen_finding(
+            paths=[_path("b.js", 1, [3], 5)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is None
+class TestArgvContextDangerModel:
+    """Argument-position command sinks (CWE-88 / *-command-line-
+    injection rules): a charset admitting space/dash/quote blocks none
+    of the argv attack characters, so it must never refute such a
+    finding — even though it excludes every shell metachar."""
+
+    ARGV_JAVA = (
+        "class R {\n"
+        "  void run(String x) throws Exception {\n"
+        '    if (!x.matches("[A-Za-z0-9 ._\'-]+")) return;\n'  # line 3
+        '    new ProcessBuilder("tool", x).start();\n'          # line 4
+        "  }\n"
+        "}\n"
+    )
+    CLEAN_JAVA = (
+        "class R {\n"
+        "  void run(String x) throws Exception {\n"
+        '    if (!x.matches("[A-Za-z0-9_.]+")) return;\n'       # line 3
+        '    new ProcessBuilder("tool", x).start();\n'          # line 4
+        "  }\n"
+        "}\n"
+    )
+
+    def test_rule_and_cwe_put_argv_class_in_play(self):
+        classes = sink_classes_for_rule(
+            "java/command-line-injection", "CWE-88",
+        )
+        assert "cmdi_argv" in classes
+        assert "cmdi_argv" in sink_classes_for_rule(
+            "js/command-line-injection",
+        )
+
+    def test_space_dash_quote_charset_yields_no_signal(self, tmp_path):
+        (tmp_path / "R.java").write_text(self.ARGV_JAVA.replace('new ProcessBuilder("tool", x).start()', "consume(x)"))
+        verdict = prescreen_finding(
+            paths=[_path("R.java", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="java/command-line-injection", cwe="CWE-88",
+        )
+        assert verdict is None
+
+    def test_argv_clean_charset_still_refutes(self, tmp_path):
+        """Two-direction control: a charset clean of BOTH the shell
+        and the argv danger sets keeps refuting."""
+        (tmp_path / "R.java").write_text(self.CLEAN_JAVA.replace('new ProcessBuilder("tool", x).start()', "consume(x)"))
+        verdict = prescreen_finding(
+            paths=[_path("R.java", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="java/command-line-injection", cwe="CWE-88",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+
+    @pytest.mark.parametrize("source", [ARGV_JAVA, CLEAN_JAVA], ids=["argv-dangerous", "argv-clean"])
+    def test_constructor_arguments_require_a_sink_slot_contract(self, tmp_path, source):
+        (tmp_path / "R.java").write_text(source)
+        verdict = prescreen_finding(
+            paths=[_path("R.java", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="java/command-line-injection", cwe="CWE-88",
+        )
+        assert verdict is None
+
+
+class TestExoticLineTerminators:
+    """Producers count lines by \\n; str.splitlines() also breaks on
+    U+2028 etc., so one exotic terminator planted in a line-1 comment
+    shifted every line-keyed judgment and the guard became unfindable
+    (signal loss on attacker-chosen input)."""
+
+    def test_u2028_in_comment_does_not_shift_line_judgments(self, tmp_path):
+        js = (
+            "function run(x) {\n"
+            "  // prose\u2028// still raw LF line two\n"
+            "  if (!/^[a-z0-9]+$/.test(x)) return;\n"   # line 3 = guard
+            "  exec(x);\n"                               # line 4 = sink
+            "}\n"
+        )
+        (tmp_path / "shift.js").write_text(js)
+        verdict = prescreen_finding(
+            paths=[_path("shift.js", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="js/command-injection", cwe="CWE-78",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+    def test_split_source_lines_is_newline_only(self):
+        from core.dataflow.smt_barrier import split_source_lines
+        text = "a\u2028bc\n2nd\r\n3rd\n"
+        lines = split_source_lines(text)
+        assert lines[0] == "a\u2028bc"
+        assert lines[1] == "2nd\r"
+        assert lines[2] == "3rd"
+
+
+class TestResourceBounds:
+    def test_step_cap_declines(self, guard_repo):
+        path = _path(
+            "app.py", GUARD_SOURCE_LINE,
+            [GUARD_VALIDATOR_LINE] * (ip.MAX_PRESCREEN_STEPS + 1),
+            GUARD_SINK_LINE,
+        )
+        assert prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_step_at_cap_still_refutes(self, guard_repo):
+        path = _path(
+            "app.py", GUARD_SOURCE_LINE,
+            [GUARD_VALIDATOR_LINE] * ip.MAX_PRESCREEN_STEPS,
+            GUARD_SINK_LINE,
+        )
+        verdict = prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+
+    def test_file_read_and_view_computed_once_per_file(
+            self, guard_repo, monkeypatch):
+        """The whole-file blanked view used to be recomputed per STEP
+        (O(steps x file) on hostile many-step paths); it must be
+        cached per (file, language) within one finding."""
+        reads: list = []
+        views: list = []
+        real_read = ip._read_source
+        real_view = ip.code_view_lines
+
+        def counting_read(root, rel):
+            reads.append(rel)
+            return real_read(root, rel)
+
+        def counting_view(text, lang):
+            views.append(lang)
+            return real_view(text, lang)
+
+        monkeypatch.setattr(ip, "_read_source", counting_read)
+        monkeypatch.setattr(ip, "code_view_lines", counting_view)
+        path = _path(
+            "app.py", GUARD_SOURCE_LINE,
+            [GUARD_VALIDATOR_LINE, GUARD_VALIDATOR_LINE,
+             GUARD_VALIDATOR_LINE],
+            GUARD_SINK_LINE,
+        )
+        verdict = prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is False
+        assert verdict.evidence
+        assert len(reads) == 1
+        assert len(views) == 1
+
+    def test_mixed_language_paths_yield_no_signal(self, guard_repo):
+        """A finding whose paths cross differently-typed files must
+        not be judged under one path's grammar."""
+        (guard_repo / "other.c").write_text("int main() {}\n")
+        good = _guard_path()
+        alien = _path("other.c", 1, [1], 1)
+        assert prescreen_finding(
+            paths=[good, alien], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_stats_snapshot_is_lock_guarded(self):
+        # Mechanical pin: the counters and snapshot share one lock.
+        assert isinstance(ip._STATS_LOCK, type(ip.threading.Lock()))

@@ -5,24 +5,115 @@ produced it, when, and whether it succeeded. Tools use start_run/complete_run/fa
 """
 
 import contextlib
+import json
+import logging
 import os
 import re
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
-from core.json import load_json, save_json
+from core.json import append_jsonl, load_json, save_json
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:                                    # pragma: no cover
+    _HAS_FCNTL = False
 
 logger = logging.getLogger(__name__)
 
 RUN_METADATA_FILE = ".raptor-run.json"
+
+#: Read budget for the run metadata file. It lives in the
+#: sandbox-writable run dir, so its size is attacker-writable; a
+#: legitimate stamp is a few KB. Single-homed so every reader stays
+#: on one spelling.
+RUN_METADATA_MAX_BYTES = 1024 * 1024
+
+
+def _load_meta(path: Path) -> Any:
+    """Read a ``.raptor-run.json`` under the shared byte budget.
+
+    EVERY reader of the metadata file in this module routes through
+    here (or :func:`load_run_metadata`, its run-dir spelling) — the
+    file is sandbox-writable mid-run, so an oversize plant follows
+    the malformed-file contract (warn, return None) instead of
+    buffering unbounded. The uncapped readers this replaces put the
+    OOM inside the contention gate (every future start in the
+    project loads every sibling's metadata), the victim run's own
+    finalisers, and resume — the exact lanes the budget exists for.
+    The closure test derives the reader set and pins the routing.
+    """
+    return load_json(path, max_bytes=RUN_METADATA_MAX_BYTES)
+
+
+class RunOwnershipError(ValueError):
+    """A lifecycle finaliser declared a command that does not match the
+    run's recorded owner.
+
+    Raised when ``complete_run`` / ``fail_run`` / ``cancel_run`` /
+    ``interrupt_run`` is called with ``expected_command`` and the run
+    directory's ``.raptor-run.json`` records a DIFFERENT command. Only
+    the flow that started a run owns its terminal transition — a
+    sub-step that writes into another command's run directory (the
+    observed case: the in-session ``/understand --map`` mapping phase
+    running with ``--out`` pointed at an ``/audit``-owned dir) must not
+    finalise it. Pre-fix, that mapping step stamped the audit run
+    ``completed`` minutes in, so the later SIGTERM drain hit the
+    double-finalisation refusal and ``raptor-audit resume`` refused a
+    run that was in fact interrupted mid-flight.
+
+    PID-based enforcement is deliberately NOT used here: the offending
+    finaliser runs in the SAME session (same ``session_pid``) as the
+    legitimate one, and ``tool_pid`` is a fresh shell per stub
+    invocation even for the legitimate flow — the discriminator that
+    actually separates owner from trespasser is the command name.
+    """
+
 
 # Status enum
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
+# Interrupted: the run was stopped by an external supervisor (SIGTERM
+# grace drain, harness background-shell cap) with its artifacts intact.
+# Terminal for the double-finalisation guard, but explicitly resumable
+# via resume_run() — and deliberately NOT reaped by
+# core.run.tmp_reaper.reap_stale_runs (failed/cancelled only).
+STATUS_INTERRUPTED = "interrupted"
+
+#: ``extra``-dict markers that stamp a terminal transition as a
+#: HEURISTIC verdict — written by machinery that judged a run it did
+#: not start (the abandon sweeps' ``abandon_sweep``, the lifecycle
+#: hook's Stop-path ``hook_finalize``). The precedence rule in
+#: :func:`_update_status` keys on them, both directions:
+#:
+#:   * a REAL (marker-less) terminal transition — the owner's own
+#:     complete/fail/cancel/interrupt — SUPERSEDES a heuristic
+#:     terminal state regardless of arrival order (the recovery
+#:     clause overrides it and consumes the marker);
+#:   * a heuristic write NEVER overrides an existing terminal state
+#:     (the marked-write no-op clause — the heuristic lost the race);
+#:   * real vs real keeps first-writer-wins (the terminal guard).
+#:
+#: Pre-fix only ``abandon_sweep`` (heuristic FAILURES) had this
+#: discipline; the hook's Stop-path completions were unmarked, so a
+#: hook that misjudged an IN-FLIGHT run's dead-looking worker stamped
+#: a FINAL ``completed`` that the owner's real ``fail_run`` was then
+#: refused against — a failed scan read Completed forever (observed
+#: as the openant exit-path flake under peak parallel-test load).
+_HEURISTIC_FINALIZE_MARKERS = ("abandon_sweep", "hook_finalize")
+
+
+def _heuristic_marks(extra: Any) -> list[str]:
+    """The heuristic-finalisation markers present in an ``extra``
+    dict (``[]`` for anything that is not a dict — metadata is
+    sandbox-adjacent file content, so shape is never assumed)."""
+    if not isinstance(extra, dict):
+        return []
+    return [m for m in _HEURISTIC_FINALIZE_MARKERS if extra.get(m)]
 
 # `_cleanup_abandoned` freshness threshold. A sibling run in
 # status=running that was created within this many seconds is treated
@@ -32,6 +123,18 @@ STATUS_CANCELLED = "cancelled"
 # seconds) but tighter than a real abandon (Esc-cancelled runs sit
 # in 'running' state until the session terminates, often hours).
 _ABANDON_FRESHNESS_S = 30.0
+
+# Run-dir activity grace for the same-session abandon sweep. A
+# stub-driven run's recorded ``tool_pid`` is the lifecycle stub's
+# transient shell — dead seconds after start even for a healthy run —
+# so a dead worker alone must not prove abandonment. Any write inside
+# the run dir within this window (journal appends, tool output, the
+# coverage hook's .reads-manifest) reads as a live run. One hour is
+# generous headroom over the longest quiet stretch a live analysis
+# shows between run-dir writes (a single long LLM call); the cost of
+# the width is only a DELAYED relabel of a real Esc-then-retry abandon
+# — a later sweep (or the dead-session branch) still catches it.
+_ABANDON_ACTIVITY_GRACE_S = 3600.0
 
 # Known command prefixes for inferring command type from directory names.
 # Includes both legacy prefixes (raptor_, autonomous, exploitability-validation)
@@ -47,6 +150,8 @@ _PREFIX_MAP = {
     # Validation (legacy: exploitability-validation)
     "validate": "validate",
     "exploitability-validation": "validate",
+    # Dynamic instrumentation
+    "frida": "frida",
     # Other commands
     "understand": "understand",
     "code-understanding": "understand",
@@ -54,25 +159,35 @@ _PREFIX_MAP = {
     "web": "web",
     "crash-analysis": "crash-analysis",
     "oss-forensics": "oss-forensics",
+    "openant": "openant",
 }
 
 
-def _find_claude_ancestor() -> Optional[int]:
+def _find_claude_ancestor() -> int | None:
     """Walk the process tree to find the nearest 'claude' ancestor PID.
 
     Returns the PID of the claude process, or None if not found.
     Works from any depth: Bash tool calls, hooks, Python subprocesses.
+    Uses /proc on Linux, ps(1) on macOS.
     """
+    import sys
     pid = os.getpid()
     for _ in range(20):
         try:
             pid = os.getppid() if pid == os.getpid() else _read_ppid(pid)
-        except (OSError, ValueError):
+        except (OSError, ValueError, IndexError):
             return None
         if pid <= 1:
             return None
         try:
-            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            if sys.platform == "linux":
+                comm = Path(f"/proc/{pid}/comm").read_text(
+                    encoding="utf-8"
+                ).strip()
+            else:
+                comm = _read_comm_ps(pid)
+                if comm is None:
+                    return None
         except OSError:
             return None
         if comm == "claude":
@@ -80,58 +195,254 @@ def _find_claude_ancestor() -> Optional[int]:
     return None
 
 
-def _read_ppid(pid: int) -> int:
-    """Read PPID from /proc/<pid>/stat (Linux-only).
+def _read_comm_ps(pid: int) -> str | None:
+    """Read process name via ps(1) — portable fallback for non-Linux."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "comm=", "-p", str(pid)],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        return out.strip().rsplit("/", 1)[-1]
+    except (subprocess.SubprocessError, OSError):
+        return None
 
-    Race-aware error wrapping. Pre-fix `read_text()` raised
-    `FileNotFoundError` if the target process exited between the
-    caller's check (`os.kill(pid, 0)`) and the read; the unhandled
-    exception bubbled out of the ancestor walk in `_get_session_pid`
-    and aborted whatever lifecycle code was probing the parent
-    chain. The walk is best-effort — if a PID disappears mid-walk,
-    raise `ProcessLookupError` (the same exception class
-    `os.kill(pid, 0)` raises) so callers handle "ancestor died" via
+
+def _read_ppid(pid: int) -> int:
+    """Read PPID — /proc on Linux, ps(1) elsewhere.
+
+    Race-aware error wrapping. If a PID disappears mid-walk,
+    raises ProcessLookupError so callers handle "ancestor died" via
     one well-known exception type.
     """
+    import sys
+    if sys.platform != "linux":
+        return _read_ppid_ps(pid)
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except FileNotFoundError as exc:
-        raise ProcessLookupError(
-            f"_read_ppid: /proc/{pid}/stat vanished — process exited"
-        ) from exc
+        msg = f"_read_ppid: /proc/{pid}/stat vanished — process exited"
+        raise ProcessLookupError(msg) from exc
     except PermissionError:
-        # /proc is normally world-readable for `stat`, but a kernel
-        # built with hidepid=2 / a pid namespace boundary can hide
-        # the file. Treat as "unknown" via PermissionError pass-through.
         raise
     except OSError as exc:
-        # Other I/O failure (rare — /proc unmounted, ENFILE). Map
-        # to ProcessLookupError so the walker has one error class
-        # to handle for "we can't determine the parent".
-        raise ProcessLookupError(
-            f"_read_ppid: /proc/{pid}/stat unreadable: {exc}"
-        ) from exc
+        msg = f"_read_ppid: /proc/{pid}/stat unreadable: {exc}"
+        raise ProcessLookupError(msg) from exc
     # Format: pid (comm) state ppid ...
-    # comm can contain spaces/parens, so find the last ')' first
     close_paren = stat.rfind(")")
     fields = stat[close_paren + 2:].split()
-    return int(fields[1])  # ppid is field index 1 after state
+    return int(fields[1])
 
 
-def _get_session_pid() -> Optional[int]:
+def _read_ppid_ps(pid: int) -> int:
+    """Read PPID via ps(1) — portable fallback."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        return int(out.strip())
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        msg = f"_read_ppid_ps: ps failed for pid {pid}: {exc}"
+        raise ProcessLookupError(msg) from exc
+
+
+def _get_session_pid() -> int | None:
     """Get the PID of the Claude Code session process.
 
-    Walks the ancestor tree to find the 'claude' process rather than
-    using getppid(), because the immediate parent varies by context
-    (Bash tool shell, hook sh wrapper, Python subprocess).
-    Falls back to CLAUDECODE env var check + getppid() on non-Linux.
+    Delegates to the ONE shared session resolver
+    (``core.project.sessions.resolve_session_pid``: validated
+    ``RAPTOR_SESSION_PID`` env credential first — correct beneath
+    nested ``claude -p`` subagents and across PID namespaces — then
+    the claude-ancestor tree walk). Binding readers, run-metadata
+    recording, the contention gate, and the abandon sweeps must all
+    agree on one identity; two resolvers meant a run recorded under a
+    subagent pid that the sweeps then judged dead the moment the
+    subagent exited.
+
+    The CLAUDECODE env + getppid() fallback survives ONLY here — for
+    run-metadata recording in claude-less contexts (bare-shell libexec
+    flows). It is never used for project-binding resolution.
     """
-    ancestor = _find_claude_ancestor()
-    if ancestor is not None:
-        return ancestor
+    from core.project.sessions import resolve_session_pid
+    pid = resolve_session_pid()
+    if pid is not None:
+        return pid
     if not os.environ.get("CLAUDECODE"):
         return None
-    return os.getppid()
+    ppid = os.getppid()
+    if ppid <= 1:
+        # Detached launch (setsid/nohup with CLAUDECODE inherited): the
+        # launcher exited and this process reparented to init, so
+        # getppid() is 1 — a pid that is always alive and never a
+        # claude session. Recording it as the owning session made every
+        # liveness verifier read the run as live-owned forever (and the
+        # resume guard refuse forever). No session is the honest answer.
+        return None
+    return ppid
+
+
+def _session_stamp(pid: int) -> dict[str, str]:
+    """Identity stamp for *pid*, recorded beside ``session_pid`` in run
+    metadata so the liveness verifiers can tell "this exact process"
+    from "some process that recycled the PID" — including another real
+    claude session, which every comm check accepts by construction.
+    Keys absent when unreadable (legacy semantics apply on read)."""
+    from core.project import sessions as _sessions
+    stamp: dict[str, str] = {}
+    start = _sessions.proc_starttime(pid)
+    if start is not None:
+        stamp["session_start"] = start
+    boot = _sessions.boot_id()
+    if boot is not None:
+        stamp["session_boot_id"] = boot
+    ns = _sessions.pidns_id()
+    if ns is not None:
+        stamp["session_pidns"] = ns
+    machine = _sessions.machine_id()
+    if machine is not None:
+        # Per-install identity (hashed — never the raw machine-id, and
+        # never logged): lets the liveness verifiers tell "prior boot
+        # of THIS machine" (provably dead) from "another machine
+        # sharing the filesystem" (unverifiable — fail open).
+        stamp["session_machine_id"] = machine
+    return stamp
+
+
+def _worker_stamp(session_bound: bool) -> dict[str, Any]:
+    """Identity of the worker process recorded as ``tool_pid`` —
+    ``{}`` when nothing with a run-tracking lifetime is recordable.
+
+    The credential is only useful when the recorded process's lifetime
+    tracks the run, so the policy is per launch shape:
+
+    * Session-bound runs record the parent as before (the harness's
+      transient tool shell — dead seconds later, the safe direction:
+      the session identity carries ownership and the worker's death
+      never blocks anything).
+    * Sessionless runs record a worker ONLY when detached (parent is
+      init): the calling process itself is then the long-lived
+      orchestrator, and its lifetime IS the run's. A sessionless run
+      with a live interactive parent records nothing — that parent
+      shell outlives the run by hours, and recording it would wedge
+      resume/compaction on every crashed bare-shell run until the
+      terminal closed (the pid-1 wedge class with a different
+      always-alive pid).
+    * A detached launch (setsid/nohup, established practice for long
+      orchestrators) reparents to PID 1 before ``start_run`` executes,
+      and PID 1 is always alive — recording it wedged every in-flight
+      guard into refusing forever (observed live on a detached audit
+      run). pid<=1 therefore NEVER lands in the metadata: the calling
+      process is recorded instead, and if the caller itself is pid 1
+      (an orchestrator running as container init) nothing is recorded
+      — legacy pid-less posture rather than a poisoned credential.
+
+    ``tool_pid_start`` binds the identity as (pid, starttime) — the
+    standard PID-reuse discriminator (``/proc/<pid>/stat`` field 22,
+    the same read the session stamps use) — so liveness verifiers can
+    tell "this exact worker" from "some process that recycled the
+    pid". Absent off-Linux or when unreadable; readers then apply the
+    legacy bare-pid semantics (see :func:`_tool_pid_alive`).
+    """
+    pid: int | None = os.getppid()
+    if pid is not None and pid <= 1:
+        pid = os.getpid()
+        if pid <= 1:
+            pid = None  # container-init orchestrator: nothing recordable
+    elif not session_bound:
+        pid = None  # live interactive parent: outlives the run
+    if pid is None:
+        return {}
+    stamp: dict[str, Any] = {"tool_pid": pid}
+    from core.project import sessions as _sessions
+    start = _sessions.proc_starttime(pid)
+    if start is not None:
+        stamp["tool_pid_start"] = start
+    return stamp
+
+
+# Claude Code session ids are uuid-shaped; the hook payload and the
+# env credential are both harness-authored, but the meta value crosses
+# an on-disk file others can write — validate the shape on both sides.
+_SESSION_ID_RE = re.compile(r"[0-9a-fA-F][0-9a-fA-F-]{7,63}")
+
+
+def _harness_session_id() -> str | None:
+    """The harness session id Claude Code injects into tool-call
+    subprocess environments — the SAME id its SessionEnd hook payload
+    carries for the owning session (subagent tool calls inherit the
+    top-level session's id; a nested ``claude -p`` process's own hooks
+    carry ITS id, which never matches a run this session stamped).
+    Recording it at run start lets the SessionEnd hook prove "the
+    ending session IS this run's owner" and finalize immediately.
+    None outside a harness session or on a non-uuid-shaped value.
+    """
+    for var in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"):
+        value = os.environ.get(var, "")
+        if value and _SESSION_ID_RE.fullmatch(value):
+            return value
+    return None
+
+
+def _session_alive_for_meta(meta: dict) -> bool:
+    """Is the session that owns this run metadata still alive?
+
+    Boolean projection of :func:`_session_liveness_for_meta` —
+    ``foreign`` (unverifiable) reads as alive: the fail-open direction
+    for sweeps (skip rather than fail a run they cannot judge). The
+    contention GATE consumes the tri-state directly so an unverifiable
+    holder does not block new runs forever.
+    """
+    return _session_liveness_for_meta(meta) != "dead"
+
+
+def _session_liveness_for_meta(meta: dict) -> str:
+    """Liveness verdict for the session that owns this run metadata:
+    ``"alive"`` / ``"dead"`` / ``"foreign"`` (unverifiable).
+
+    Stamped metadata (``session_start`` + ``session_boot_id``) gets the
+    full identity check: a live claude process at the recorded pid with
+    a MISMATCHING stamp is a recycled pid — the owner is dead. Foreign
+    stamps (other boot / machine / pid namespace) are unverifiable here
+    and return ``"foreign"`` — consumers choose the fail direction
+    (sweeps treat it as alive; the contention gate applies an age
+    ceiling, see ``_live_conflicting_run``). Exception: a stamp from a
+    PRIOR BOOT of this same machine (``session_machine_id`` matches,
+    boot_id differs) is provably dead — see ``_prior_boot_entry``.
+    Unstamped (pre-series) metadata keeps the legacy comm-checked
+    ``_pid_alive`` — alive/dead only, never foreign.
+    """
+    pid = meta.get("session_pid")
+    if isinstance(pid, str) and pid.isascii() and pid.isdigit():
+        pid = int(pid)  # stringified pid: read like the hooks do
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return "dead"
+    start = meta.get("session_start")
+    boot = meta.get("session_boot_id")
+    if start and boot:
+        from core.project import sessions as _sessions
+        fields = {"starttime": str(start), "boot_id": str(boot)}
+        pidns = meta.get("session_pidns")
+        if pidns:
+            fields["pidns"] = str(pidns)
+        machine = meta.get("session_machine_id")
+        if machine:
+            fields["machine_id"] = str(machine)
+        if _sessions._foreign_entry(fields):
+            # One foreign shape IS decidable: a stamp carrying THIS
+            # machine's identity but another boot_id was written
+            # during a prior boot of this machine — its process
+            # cannot be alive anywhere. Without this, every crashed
+            # run's meta read foreign→alive forever after a reboot:
+            # permanent status=running zombies that also held the
+            # project run-contention gate.
+            if _sessions._prior_boot_entry(fields):
+                return "dead"  # prior boot of this machine — dead
+            return "foreign"  # unverifiable
+        return ("alive" if _sessions._identity_matches(pid, fields)
+                else "dead")
+    return "alive" if _pid_alive(pid) else "dead"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -157,11 +468,21 @@ def _pid_alive(pid: int) -> bool:
     accepts the residual PID-reuse risk on macOS/BSD where the
     canonical /proc isn't available.
     """
-    if pid <= 0:
+    if pid <= 1:
+        # PID 1 (init) can never be a claude session, and the EPERM
+        # path below returns alive BEFORE the comm cross-check — a
+        # reparented-to-init record (session_pid=1, written by a
+        # detached launch before the recorder refused such pids) read
+        # as a live owner forever, so its abandoned runs were never
+        # swept.
         return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
+        return False
+    except OverflowError:
+        # A pid beyond the platform's pid_t (plantable metadata int)
+        # cannot be a live process; OverflowError is not an OSError.
         return False
     except PermissionError:
         return True  # alive but owned by another user
@@ -174,14 +495,604 @@ def _pid_alive(pid: int) -> bool:
         # Non-Linux or `/proc` not mounted — best-effort accept.
         return True
     try:
-        comm = proc_comm.read_text(errors="replace").strip().lower()
+        comm = proc_comm.read_text(encoding="utf-8", errors="replace").strip().lower()
     except OSError:
         return True
     return "claude" in comm
 
 
-def start_run(output_dir: Path, command: str, extra: Dict[str, Any] = None,
-              target: str = None) -> Path:
+def _run_recently_active(run_dir: Path) -> bool:
+    """Run-dir activity heartbeat for the same-session abandon sweep.
+
+    True when the run dir (or anything inside it, bounded scan) was
+    modified within :data:`_ABANDON_ACTIVITY_GRACE_S`. This is the
+    liveness signal that survives the lifecycle stub's transient shell:
+    ``tool_pid`` is dead seconds after a healthy stub-driven start, so
+    pre-fix a second same-command run in the same session false-failed
+    a live paid first run — and the terminal-status guard then refused
+    its real completion. Scan errors read as active (fail toward
+    keeping: a wrongly-kept abandon is relabelled by a later sweep; a
+    wrongly-failed live run misfiles paid results).
+
+    mtime caveat (WSL drvfs/9p, no behaviour change): on a
+    Windows-interop mount the mtimes read here pass through the 9p
+    attribute cache — same-client writes stay coherent, but another
+    client's writes (Windows side, another distro) can surface late,
+    which would read a cross-client-active run as quiet. Every caller
+    of this probe (the same-session abandon sweep, the foreign-holder
+    contention ceiling, project clean's liveness check) runs in the
+    same distro — one 9p client — as the run's usual writers, so the
+    signal holds; the one caller that contemplates writers elsewhere
+    (the foreign-holder ceiling's cross-machine leg) already fails
+    open on activity-probe imprecision by its own doctrine. See
+    docs/wsl.md.
+    """
+    import time
+
+    from core.run.tmp_reaper import _recent_activity
+    now = time.time()
+    try:
+        # The top-level dir mtime alone catches file creation/removal.
+        if now - Path(run_dir).stat().st_mtime < _ABANDON_ACTIVITY_GRACE_S:
+            return True
+    except OSError:
+        return True
+    return _recent_activity(Path(run_dir), now, _ABANDON_ACTIVITY_GRACE_S)
+
+
+def _tool_pid_alive(pid: Any, starttime: Any = None) -> bool:
+    """Liveness check for a run's recorded ``tool_pid`` (the worker
+    process that called ``start_run`` — a Bash-tool shell, a Python
+    orchestrator, etc.).
+
+    Unlike :func:`_pid_alive` there is NO ``comm == claude`` cross-check:
+    the tool process is deliberately NOT a claude binary. The identity
+    axis is *starttime*: when the record carries a ``tool_pid_start``
+    stamp, alive requires the live process's ``/proc/<pid>/stat``
+    starttime to MATCH — a recycled pid means the original worker is
+    dead. Legacy records (no stamp) keep the plain ``kill(pid, 0)``
+    probe with its residual pid-reuse risk; that failure direction is
+    safe — a reused PID keeps a genuinely abandoned run in ``running``
+    state until its owning session dies (the dead-session branch then
+    sweeps it), whereas a false "dead" would fail a live run.
+
+    ``pid <= 1`` is NEVER live evidence — PID 1 is always alive, so a
+    reparented-to-init record (detached setsid/nohup launch) wedged the
+    resume/compact guards into refusing forever. This rejection applies
+    to legacy records too: init never called ``start_run``.
+
+    Missing / malformed pids return False so legacy metadata (written
+    before ``tool_pid`` was recorded) falls back to the old behaviour.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OverflowError:
+        return False  # beyond pid_t — see _pid_alive
+    except PermissionError:
+        # Alive but owned by another user — the identity check below
+        # still works: /proc/<pid>/stat is world-readable.
+        pass
+    stamp = _valid_starttime(starttime)
+    if stamp is not None:
+        from core.project import sessions as _sessions
+        live = _sessions.proc_starttime(pid)
+        if live is not None:
+            return live == stamp
+        # Unverifiable (off-Linux reader of a Linux-stamped record, or
+        # the process exited between the kill probe and the /proc
+        # read racing a same-instant pid recycle): keep the bare-alive
+        # verdict — the legacy posture. Fail direction: guards refuse
+        # once and succeed on retry; sweeps skip and re-judge later.
+    return True
+
+
+def _valid_starttime(value: Any) -> str | None:
+    """Canonical form of a recorded ``tool_pid_start`` stamp, or
+    ``None`` for anything malformed.
+
+    The stamp lives in sandbox-writable metadata, so its type and
+    content are plantable. A malformed stamp must degrade to the
+    LEGACY (bare-pid) semantics, never to "identity mismatch, worker
+    dead": comparing a stringified non-numeric value against the live
+    starttime always mismatches, which would let a planted stamp
+    defeat the in-flight guards on a genuinely live worker — the
+    fail-open direction. The recorder only ever writes the decimal
+    string from ``/proc/<pid>/stat``; the int form is accepted too (a
+    hand-repaired record survives a JSON round-trip as int), nothing
+    else.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return value
+    return None
+
+
+_PID1_NOTE_EMITTED = False
+
+
+def _pid1_noted() -> bool:
+    """True when this process already warned about a pid-1 record
+    (later occurrences demote to debug)."""
+    global _PID1_NOTE_EMITTED
+    was = _PID1_NOTE_EMITTED
+    _PID1_NOTE_EMITTED = True
+    return was
+
+
+def worker_liveness_for_meta(meta: dict) -> tuple[bool, str]:
+    """Liveness verdict for a run's recorded worker, with a detail
+    line naming exactly what was checked — the in-flight guards quote
+    it in their refusals so the operator can see which evidence drove
+    the decision (a bare "worker is alive" was undiagnosable when the
+    evidence was PID 1).
+
+    The meta-level chokepoint for worker liveness: every consumer
+    that judges a recorded WORKER (the resume guard, the
+    journal-compact guard, the abandon sweep, the clean-safety
+    predicate, the lifecycle hook's finalizer) routes here so none
+    re-invents bare-pid semantics. The run-start contention gate is
+    deliberately NOT a consumer — it contends on SESSION identity
+    (see ``_live_conflicting_run``), and a sessionless run holds no
+    contention, before or after worker stamps existed.
+    Rules (see :func:`_tool_pid_alive`):
+
+    * no / malformed recorded pid — not alive (legacy pre-``tool_pid``
+      metadata keeps its old fall-through behaviour);
+    * ``pid <= 1`` — never live evidence (reparented-to-init record);
+      logged once per check so the not-in-flight decision is visible;
+    * stamped record (``tool_pid_start``) — alive requires pid alive
+      AND matching /proc starttime (a recycled pid is the original
+      worker dead);
+    * legacy bare-pid record — plain existence probe (old behaviour,
+      minus the pid<=1 rejection, which is safe to ratchet).
+    """
+    pid = meta.get("tool_pid")
+    if pid is None:
+        return False, "no recorded worker pid (legacy or pid-less record)"
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False, "recorded worker pid is malformed — not a credential"
+    if pid == 1:
+        # One note per process (the sweeps re-evaluate every sibling
+        # run each pass — a lingering legacy record must not turn
+        # every start into a warning storm).
+        note = logger.debug if _pid1_noted() else logger.warning
+        note(
+            "run metadata records worker pid 1 — never a liveness "
+            "credential (PID 1 is always alive; the record was written "
+            "by a process reparented to init). Treating the run as "
+            "not in flight.",
+        )
+        return False, (
+            "recorded worker pid 1 is not a liveness credential "
+            "(reparented-to-init record) — treated as not in flight"
+        )
+    start = _valid_starttime(meta.get("tool_pid_start"))
+    alive = _tool_pid_alive(pid, start)
+    if start:
+        detail = (
+            f"recorded worker pid {pid} is alive and its start time "
+            "matches the record"
+            if alive else
+            f"recorded worker pid {pid} is dead, or a different "
+            "process recycled the pid (start time mismatch)"
+        )
+    else:
+        detail = (
+            f"recorded worker pid {pid} is alive (legacy record "
+            "without a start-time stamp — identity unverified)"
+            if alive else
+            f"recorded worker pid {pid} is dead"
+        )
+    return alive, detail
+
+
+@contextlib.contextmanager
+def _metadata_lock(meta_path: Path):
+    """Cross-process exclusive lock guarding a ``.raptor-run.json``
+    read-modify-write window.
+
+    Same idiom as ``core.coverage.store.coverage_store_lock``: flock a
+    sibling ``.lock`` file (not the JSON itself, which ``save_json``
+    atomically replaces), hold it across the whole load → mutate → save
+    window, degrade to a no-op without fcntl (non-POSIX). Without it,
+    concurrent ``_update_status`` writers (a run's own completion racing
+    a sweep's ``fail_run``, or parallel workers updating ``extra``)
+    last-writer-wins and one update is silently dropped.
+
+    The ``.lock`` file is deliberately left behind (one zero-byte
+    sibling per run dir): unlinking after unlock races — another
+    process may already hold an fd to the old inode while a third
+    creates a fresh file at the path, splitting lockers across two
+    inodes and silently breaking mutual exclusion.
+
+    The lock path lives inside the run dir — inside a sandboxed
+    child's write grant (the metadata FILE is masked from the child
+    by the mount namespace; its ``.lock`` sibling is not), so the
+    open must not trust what it finds there: O_NOFOLLOW keeps a
+    planted symlink from making this (unsandboxed) process create an
+    attacker-chosen path and flock an aliased inode; O_NONBLOCK plus
+    the fstat S_ISREG refusal keeps a planted FIFO from wedging every
+    lifecycle finaliser (complete/fail/interrupt/resume block forever
+    on a bare FIFO open). Same discipline as the coverage journal's
+    append open one package over.
+
+    Client-locality caveat (WSL drvfs/9p, no behaviour change): on a
+    Windows-interop mount this flock — like the project op lock and
+    every sibling ``.lock`` idiom — is client-local: it serialises
+    processes within one distro but excludes nothing on the Windows
+    side or in other distros mounting the same drive. A run dir on
+    such a mount keeps same-distro update integrity and silently
+    loses the cross-context guarantee. See docs/wsl.md.
+    """
+    if not _HAS_FCNTL:
+        yield
+        return
+    path = Path(meta_path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    fd = None
+    try:
+        fd = os.open(
+            str(lock_path),
+            os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        # Regularity plus foreign-uid refusal (shared checker): the
+        # sandboxed child can pre-create the predictable `.lock`
+        # sibling; adopting it — the open SUCCEEDS, so the degrade arm
+        # below never fired — hands the child a standing hold over
+        # every lifecycle finaliser.
+        from core.atomic_fs.fs_lock import (
+            acquire_flock_bounded,
+            validate_lock_fd,
+        )
+        validate_lock_fd(fd, lock_path)
+    except OSError as exc:
+        # Lock file uncreatable (read-only dir mid-teardown, ENOSPC) or
+        # tamper-shaped (symlink → ELOOP, FIFO → ENXIO / S_ISREG
+        # refusal, foreign-uid lock file) — proceed unserialised rather
+        # than failing the lifecycle, but LOUDLY: a silent unlocked
+        # degrade turned an injected error into invisible lost-update
+        # windows.
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        logger.warning(
+            "metadata lock unavailable for %s (%s) — proceeding "
+            "UNSERIALISED; concurrent status updates may be lost",
+            path.name, exc,
+        )
+        yield
+        return
+    except BaseException:
+        if fd is not None:
+            retiring_fd, fd = fd, None
+            try:
+                os.close(retiring_fd)
+            except BaseException:
+                pass  # Preserve the unexpected setup error after consuming the descriptor.
+        raise
+    operation_failed = False
+    try:
+        try:
+            if not acquire_flock_bounded(
+                    fd, lock_path, subject="metadata", stamp=True,
+                    expiry_note=("proceeding UNSERIALISED; concurrent "
+                                 "status updates may be lost")):
+                # A holder that outlives the generous bounded wait is
+                # wedged or hostile — same loud unserialised disposition
+                # as an unopenable lock, never an unbounded silent stall
+                # (the helper emits the warning at expiry).
+                yield
+                return
+        except BaseException:
+            operation_failed = True
+            raise
+        try:
+            yield
+        except BaseException:
+            operation_failed = True
+            raise
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BaseException:
+                if not operation_failed:
+                    raise
+    finally:
+        try:
+            os.close(fd)
+        except BaseException:
+            if not operation_failed:
+                raise
+
+
+def _contention_project_dir(output_dir: Path) -> Path | None:
+    """The directory run-start contention keys on, or ``None``.
+
+    Only managed project output dirs contend — standalone timestamped
+    runs under ``out/`` never did and still don't. Lazy import: the
+    check resolves through the project registry.
+    """
+    parent = Path(output_dir).parent
+    try:
+        from core.project.project import is_project_output_dir
+        if is_project_output_dir(parent):
+            return parent
+    except Exception:  # noqa: BLE001 — contention is a QoL gate, never
+        pass           # a reason a run can't start
+    return None
+
+
+def _gate_session_alive(pid: int) -> bool:
+    """Liveness probe for the run-start contention gate ONLY.
+
+    :func:`_pid_alive` treats an unsignallable pid (EPERM) as alive —
+    conservative and correct for cleanup (skip rather than sweep), but
+    a DoS primitive for the GATE: planted sibling metadata with
+    ``session_pid=1`` reads as a live session forever, refusing every
+    start (and queueing ``--wait`` indefinitely). Here EPERM falls
+    through to the ``/proc/<pid>/comm`` cross-check, which is world-
+    readable on Linux — another operator's real claude session still
+    counts as live (contention preserved cross-user), while init or a
+    root daemon does not. Without a readable comm (non-Linux), only a
+    signallable pid is accepted: unverifiable never blocks a start.
+    """
+    if pid <= 0:
+        return False
+    signallable = True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OverflowError:
+        return False  # beyond pid_t — see _pid_alive
+    except PermissionError:
+        signallable = False
+    proc_comm = Path(f"/proc/{pid}/comm")
+    try:
+        comm = proc_comm.read_text(
+            encoding="utf-8", errors="replace").strip().lower()
+    except OSError:
+        return signallable
+    return "claude" in comm
+
+
+# Gate-side age ceiling for FOREIGN-stamped running markers (see the
+# _live_conflicting_run docstring for the two-direction trade-off).
+_FOREIGN_HOLDER_CONTENTION_CEILING_S = 24 * 3600
+
+
+def _foreign_holder_past_ceiling(run_dir: Path, meta: dict) -> bool:
+    """True when a foreign-stamped running marker is past the gate's
+    contention ceiling AND its run dir shows no recent write activity.
+
+    A missing, unparseable, or FUTURE-DATED timestamp counts as past
+    the ceiling — a forged marker must not earn a longer (or with a
+    far-future stamp, INFINITE) hold by gaming the field the ceiling
+    reads; the activity probe still protects a genuinely live run (it
+    keeps writing), and modest clock skew is absorbed by the same
+    probe plus a one-hour tolerance.
+    """
+    if _run_recently_active(run_dir):
+        return False
+    ts_str = meta.get("timestamp")
+    if isinstance(ts_str, str):
+        try:
+            started = datetime.fromisoformat(ts_str)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            age_s = (datetime.now(timezone.utc) - started).total_seconds()
+            if age_s < -3600.0:
+                return True  # future-dated forgery — no extended hold
+            return age_s >= _FOREIGN_HOLDER_CONTENTION_CEILING_S
+        except ValueError:
+            pass
+    return True
+
+
+def _live_conflicting_run(project_dir: Path, self_dir: Path,
+                          self_session_pid: int | None) -> dict | None:
+    """Find a sibling run that makes a new start contention.
+
+    A sibling contends when its metadata says ``status=running`` AND
+    its recorded ``session_pid`` is a live claude session belonging to
+    a DIFFERENT session than ours. Everything else is explicitly not
+    contention:
+
+    * dead recorded pid — a crashed run; detectable, must never block
+      forever (this is why run-in-progress lives in metadata rather
+      than a flock: the stub start/complete flow spans processes, so
+      no single process could hold a lock for the run's duration);
+    * same session — parallel runs from one session stay legal (the
+      `_cleanup_abandoned` freshness doctrine already supports them);
+    * no recorded pid (legacy metadata) — unverifiable; never block on
+      what can't be checked;
+    * import-restored run (``IMPORTED_RUN_MARKER_FILE`` present) — the
+      marker's ``status=running`` describes a session on the EXPORTING
+      machine, never one this gate could be protecting (and a forged
+      archive gains nothing by self-labelling imported: skipping only
+      DECLINES the contention it was trying to mint);
+    * FOREIGN-stamped holder (other machine / pid namespace —
+      unverifiable here) past the age ceiling with a write-quiet run
+      dir. Without the ceiling one child-rewritten or hand-planted
+      marker held the gate FOREVER (the sweeps deliberately fail open
+      on foreign stamps and never clear it): a permanent
+      denial-of-service on every future run in the project. Ceiling
+      trade-offs both directions: too SHORT and a genuinely live
+      cross-machine run on a shared filesystem loses its contention
+      protection mid-flight (the activity probe absorbs most of this
+      — a live run keeps writing); too LONG and a planted marker
+      denies the project for that whole window. 24h covers the
+      longest legitimate runs observed while bounding the DoS; the
+      sweeps stay fail-open (the run keeps ``status=running`` and its
+      dir; only the GATE stops honouring it).
+    """
+    self_name = Path(self_dir).name
+    try:
+        children = list(Path(project_dir).iterdir())
+    except OSError:
+        return None
+    for d in children:
+        try:
+            if (not d.is_dir() or d.name.startswith((".", "_"))
+                    or d.name == self_name):
+                continue
+            meta_path = d / RUN_METADATA_FILE
+            if not meta_path.exists():
+                continue
+            meta = _load_meta(meta_path)
+        except OSError:
+            continue
+        if not isinstance(meta, dict) or meta.get("status") != STATUS_RUNNING:
+            continue
+        owner = meta.get("session_pid")
+        if isinstance(owner, str) and owner.isascii() and owner.isdigit():
+            owner = int(owner)  # stringified pid: read like the hooks
+        if not isinstance(owner, int) or isinstance(owner, bool):
+            continue
+        if self_session_pid is not None and owner == self_session_pid:
+            continue
+        try:
+            from core.project.findings_utils import run_is_imported
+            if run_is_imported(d):
+                continue  # restored marker — see the docstring bullet
+        except OSError:
+            pass
+        # Stamped metadata gets the identity check (a recycled claude
+        # pid must not hold contention forever); unstamped falls back
+        # to the gate's EPERM-aware comm probe.
+        if meta.get("session_start") and meta.get("session_boot_id"):
+            liveness = _session_liveness_for_meta(meta)
+            if liveness == "dead":
+                continue
+            if (liveness == "foreign"
+                    and _foreign_holder_past_ceiling(d, meta)):
+                logger.warning(
+                    "run contention gate: ignoring foreign-stamped "
+                    "running marker in %s — older than the %dh "
+                    "contention ceiling and write-quiet (the marker "
+                    "is left untouched)",
+                    d.name, _FOREIGN_HOLDER_CONTENTION_CEILING_S // 3600,
+                )
+                continue
+        elif not _gate_session_alive(owner):
+            continue
+        # Sibling metadata is FILE CONTENT another workspace user can
+        # plant — terminal-sanitise every field that reaches the
+        # contention message (pid is already validated as an int).
+        from core.security.log_sanitisation import sanitise_for_terminal
+        return {
+            "pid": owner,
+            "operation": sanitise_for_terminal(
+                str(meta.get("command") or "run"), max_len=64),
+            "since": sanitise_for_terminal(
+                str(meta.get("timestamp") or "unknown"), max_len=64),
+            "run_dir": sanitise_for_terminal(d.name, max_len=128),
+        }
+    return None
+
+
+@contextlib.contextmanager
+def _project_run_gate(project_dir: Path, output_dir: Path, command: str,
+                      session_pid: int | None, wait: bool = False):
+    """Run-start contention gate for managed project dirs.
+
+    Holds the project op lock (``.op.lock``) across the whole
+    [contention check → metadata write] window so two simultaneous
+    starts can't both pass the check; the flock guards only that
+    read-modify-write, NOT the run itself. Run-in-progress is the run
+    metadata (``status=running`` + live ``session_pid``) — see
+    ``_live_conflicting_run`` for why.
+
+    On contention: raises ``ProjectRunContention`` IMMEDIATELY (no
+    grace — a live run holds the project for minutes-to-hours, so a
+    silent retry window would just add latency to the refusal) with
+    the holder named. ``wait=True`` queues instead: poll until the
+    live run finishes or dies.
+    """
+    import time as _time
+
+    from core.project.oplock import ProjectRunContention, project_op_lock
+
+    # Re-entrant stamp: raptor.py's lifecycle wrapper start_run()s the
+    # run dir, then the child (raptor_agentic.py) start_run()s the SAME
+    # dir to enrich metadata. The second call is not a new run start —
+    # gating it against SIBLINGS could kill a run whose parent already
+    # passed the gate. It still queues on the project op lock exactly
+    # like a fresh start: without the flock, a start_run into a dir
+    # whose own metadata reads status=running (the crashed-run-dir
+    # restart shape as much as the documented enrichment flows) wrote
+    # its metadata mid-sweep behind the journal-reindex sweep's back —
+    # the one writer class the sweep's whole-duration ``.op.lock``
+    # could not fence. Same wait=True posture as the fresh path below,
+    # and safe from self-deadlock by the lock's own discipline: the
+    # flock guards only each holder's short read-modify-write window
+    # (the parent's gate released it before the child ever runs), and
+    # no run-machinery path calls start_run while holding ``.op.lock``
+    # (holders are this gate, the journal sweep, and the mutating
+    # /project subcommands). Non-waiting semantics would be dishonest
+    # here in both directions: refusing on contention could kill a
+    # legitimate enrichment mid-flight, and proceeding on contention
+    # would keep the bypass. Lock order unchanged: ``.op.lock``
+    # (outermost) before the metadata lock start_run takes inside.
+    own_running = False
+    with contextlib.suppress(OSError):
+        own = _load_meta(Path(output_dir) / RUN_METADATA_FILE)
+        own_running = (isinstance(own, dict)
+                       and own.get("status") == STATUS_RUNNING)
+    if own_running:
+        with project_op_lock(project_dir, f"run-start:{command}",
+                             wait=True):
+            yield
+        return
+
+    waiting_printed = False
+    while True:
+        with contextlib.ExitStack() as stack:
+            # Blocking flock: op-lock holders (mutations, other starts'
+            # RMW windows) are short-lived, unlike the run itself.
+            stack.enter_context(project_op_lock(
+                project_dir, f"run-start:{command}", wait=True))
+            holder = _live_conflicting_run(project_dir, output_dir,
+                                           session_pid)
+            if holder is None:
+                yield
+                return
+            if not wait:
+                msg = (
+                    f"a run is already in progress on this project: "
+                    f"{holder['operation']} (session pid {holder['pid']}, "
+                    f"since {holder['since']}, run {holder['run_dir']}) — "
+                    f"let it finish or pass --wait to queue"
+                )
+                raise ProjectRunContention(
+                    msg,
+                    holder,
+                )
+        if not waiting_printed:
+            import sys as _sys
+            print(f"  waiting for in-progress {holder['operation']} run "
+                  f"(session pid {holder['pid']}) to finish...",
+                  file=_sys.stderr)
+            waiting_printed = True
+        _time.sleep(2.0)
+
+
+def start_run(output_dir: Path, command: str,
+              extra: dict[str, Any] | None = None,
+              target: str | None = None,
+              target_identity: dict[str, Any] | None = None,
+              wait_for_project: bool = False,
+              retry_of: Path | None = None,
+              parent_run: Path | None = None) -> Path:
     """Write initial .raptor-run.json with status=running.
 
     Call this at the start of a command. Returns the output_dir (for chaining).
@@ -191,9 +1102,16 @@ def start_run(output_dir: Path, command: str, extra: Dict[str, Any] = None,
     Records the session PID so sweep can check if the session is still alive.
     Also marks any abandoned runs from the same session and command type as
     failed (handles the Esc-then-retry scenario).
+
+    In a managed project dir, a live run owned by ANOTHER session is
+    contention: raises ``core.project.oplock.ProjectRunContention``
+    immediately (``wait_for_project=True`` queues instead). Crashed
+    runs (status=running, dead recorded pid) never block.
     """
+    from core.run.safe_io import safe_run_mkdir
+
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     session_pid = _get_session_pid()
 
@@ -201,50 +1119,351 @@ def start_run(output_dir: Path, command: str, extra: Dict[str, Any] = None,
     if session_pid is not None:
         _cleanup_abandoned(output_dir.parent, command, session_pid)
 
-    metadata = {
-        "version": 1,
-        "command": command,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "status": STATUS_RUNNING,
-        "extra": extra or {},
-    }
-    if session_pid is not None:
-        metadata["session_pid"] = session_pid
-        metadata["tool_pid"] = os.getppid()
-    if target:
-        metadata["target_path"] = str(target)
-    # Order: persist metadata FIRST, then mark as active.
-    #
-    # Pre-fix `set_active_run_dir(output_dir)` ran BEFORE `save_json`.
-    # If `save_json` crashed (disk full, EIO, permission flip), the
-    # "active run dir" pointer was already set to a directory with
-    # no metadata file. Subsequent sandbox-summary writes (and any
-    # other consumer that resolves "the active run") would target
-    # a directory the rest of the system can't recognise as a real
-    # run — `is_run_directory()` returns False, recovery / sweep
-    # logic doesn't see it.
-    #
-    # Persist first; mark active only on success. The original
-    # justification (sandbox calls inside `_setup_checklist_symlink`
-    # need the active dir set) still holds for those — they run
-    # AFTER the active-dir set, which now happens AFTER the
-    # metadata write, so the timing window for that case is
-    # unchanged.
-    #
-    # Lazy import to avoid circular core.sandbox load on metadata import.
-    from core.sandbox.summary import set_active_run_dir
-    save_json(output_dir / RUN_METADATA_FILE, metadata)
+    # Sweep temp artifacts orphaned by earlier hard-killed runs — their
+    # atexit/exit-path cleanups never fire on SIGKILL/OOM/SIGTERM —
+    # aged-out per-process audit logs (opt-in via
+    # RAPTOR_LOG_REAP_MAX_AGE_D; audit data is never deleted by
+    # default), and aged-out failed/cancelled sibling run dirs
+    # (completed runs are results and are never age-reaped).
+    from core.run.tmp_reaper import (
+        reap_stale_logs,
+        reap_stale_runs,
+        reap_stale_tmp,
+    )
+
+    reap_stale_tmp()
+    reap_stale_logs()
+    reap_stale_runs(output_dir.parent)
+
+    with contextlib.ExitStack() as _gate:
+        # Contention gate BEFORE the run dir is created, so a refused
+        # start leaves nothing behind (the raptor.py wrapper pre-creates
+        # the dir on its own path and rmdir()s it on refusal).
+        project_dir = _contention_project_dir(output_dir)
+        if project_dir is not None:
+            _gate.enter_context(_project_run_gate(
+                project_dir, output_dir, command, session_pid,
+                wait=wait_for_project))
+        safe_run_mkdir(output_dir)
+
+        # The whole prior-metadata read → pin resolution → save below
+        # is one read-modify-write on .raptor-run.json: take the same
+        # cross-process lock every other RMW on this file takes, so a
+        # re-entrant start racing a concurrent locked terminal
+        # transition (a finaliser's _update_status) can't clobber it
+        # wholesale. Lock ordering: project op lock (above) before the
+        # metadata lock — no path takes them in the other order.
+        _gate.enter_context(_metadata_lock(output_dir / RUN_METADATA_FILE))
+
+        # Seal the provenance manifest NOW, before any analysis runs. The
+        # source-control snapshot in particular must be taken here — the tree
+        # can change mid-run or after, and the only honest record of what
+        # produced this run is the state at its start. complete_run merges in
+        # end-of-run facts (models that fired, engine versions).
+        from core.run.provenance import build_start_manifest
+
+        metadata = {
+            "version": 2,
+            "command": command,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": STATUS_RUNNING,
+            "manifest": build_start_manifest(target=target, target_identity=target_identity),
+            "extra": extra or {},
+        }
+        # Worker identity: recorded per _worker_stamp's lifetime policy
+        # — session-bound runs keep the parent-shell credential;
+        # sessionless DETACHED runs (whose CLAUDECODE fallback resolved
+        # no session because the parent is init) previously recorded
+        # pid 1 and wedged every in-flight guard; sessionless
+        # interactive runs record nothing, as before.
+        metadata.update(_worker_stamp(session_bound=session_pid is not None))
+        if session_pid is not None:
+            metadata["session_pid"] = session_pid
+            metadata.update(_session_stamp(session_pid))
+            sid = _harness_session_id()
+            if sid:
+                # Owner-end proof for the SessionEnd hook: a SessionEnd
+                # payload whose session_id matches this stamp is the
+                # owner's OWN graceful end — the run is then genuinely
+                # unowned and may be finalized immediately.
+                metadata["session_id"] = sid
+        if target:
+            metadata["target_path"] = str(target)
+
+        # Session ownership — WRITE-ONCE while running (same doctrine
+        # as the pin below): a re-entrant start on a dir some session
+        # already owns and is still running must not re-own it — that
+        # would silently kill the first session's hook attribution and
+        # contention identity. resume_run is the sanctioned re-owning
+        # path (it refreshes the full stamp).
+        _prior_meta = _load_meta(output_dir / RUN_METADATA_FILE)
+        from core.run.report_identity import identity_for_start
+        retry_metadata = _load_meta(Path(retry_of) / RUN_METADATA_FILE) if retry_of is not None else None
+        reporting_identity = identity_for_start(command, _prior_meta, retry_metadata=retry_metadata,
+                                                           retry_directory=Path(retry_of) if retry_of is not None else None,
+                                                           target=target)
+        metadata["reporting_identity"] = reporting_identity
+        if retry_of is not None:
+            reporting_identity["retry_of"]["local"] = Path(retry_of).resolve() == output_dir.resolve()
+        if parent_run is not None:
+            from core.run.report_identity import checkpoint, valid_identity
+            parent_metadata = _load_meta(Path(parent_run) / RUN_METADATA_FILE)
+            parent_identity = parent_metadata.get("reporting_identity") if isinstance(parent_metadata, dict) else None
+            if (Path(parent_run).resolve() == output_dir.resolve()
+                    and (not valid_identity(parent_identity)
+                         or parent_identity["run_id"] == reporting_identity["run_id"])):
+                raise ValueError("A lifecycle run cannot be its own parent")
+            reporting_identity["parent_execution"] = {
+                "directory": str(parent_run), "identity_available": valid_identity(parent_identity),
+                "local": Path(parent_run).resolve() == output_dir.resolve(),
+                **({k: parent_identity[k] for k in ("run_id", "pass_id", "attempt_id")} if valid_identity(parent_identity) else {}),
+                "checkpoint": checkpoint(Path(parent_run), parent_identity),
+            }
+        if (isinstance(_prior_meta, dict) and reporting_identity == _prior_meta.get("reporting_identity")
+                and isinstance(_prior_meta.get("extra"), dict) and isinstance(_prior_meta["extra"].get("resumes"), list)):
+            metadata["extra"] = {**(extra or {}), "resumes": _prior_meta["extra"]["resumes"]}
+        _prior_owner_live = (
+            isinstance(_prior_meta, dict)
+            and _prior_meta.get("status") == STATUS_RUNNING
+            and (
+                (_prior_meta.get("session_pid") is not None
+                 and _session_alive_for_meta(_prior_meta))
+                # A live SESSIONLESS owner (detached orchestrator,
+                # identified by its worker stamp) is just as much a
+                # live owner: a re-entrant start must not clobber the
+                # credential the in-flight guards rely on.
+                or (_prior_meta.get("session_pid") is None
+                    and worker_liveness_for_meta(_prior_meta)[0])
+            )
+        )
+        if _prior_owner_live:
+            for _k in ("session_pid", "tool_pid", "tool_pid_start",
+                       "session_start", "session_boot_id",
+                       "session_pidns", "session_machine_id",
+                       "session_id"):
+                if _k in _prior_meta:
+                    metadata[_k] = _prior_meta[_k]
+                else:
+                    metadata.pop(_k, None)
+
+        # Project pin — WRITE-ONCE. A start_run on a dir
+        # whose metadata is already status=running (the documented
+        # re-entrant flows: the raptor.py wrapper followed by
+        # raptor_agentic's own start; /understand→/validate sharing an
+        # --out) preserves the first start's pin: re-resolving here is
+        # exactly the mid-run ambient re-resolution pinning exists to
+        # kill. A conflicting explicit --project is a hard error.
+        from core.run.pin import (
+            ProjectArgvError,
+            _frozen_pins,
+            freeze_run_pin,
+            get_process_project,
+            resolve_pin_for_start,
+        )
+        # Prior pin: the PROCESS FREEZE CACHE first (the on-disk marker
+        # sits in the sandbox write grant handed to prompt-injectable
+        # children, so a re-entrant start must never re-derive
+        # write-once state from a file a hostile child may have
+        # rewritten), then disk for cross-process re-entrant flows.
+        # A dir that EVER carried a pin keeps it regardless of status:
+        # /understand → /validate reusing one --out is one pinned dir,
+        # and re-resolving after the first command completed raced
+        # mid-gap project switches.
+        frozen = _frozen_pins.get(str(output_dir.resolve()))
+        prior = _prior_meta
+        prior_pin: tuple[str | None, str] | None = None
+        if frozen is not None:
+            prior_pin = (frozen.project, frozen.source)
+        else:
+            if isinstance(prior, dict) and "project" in prior:
+                _pp = prior.get("project")
+                if _pp is not None and not isinstance(_pp, str):
+                    # A pin is a string or null by construction —
+                    # anything else is corruption or tampering, and
+                    # silently coercing it would strip the pin
+                    # cross-process.
+                    logger.warning(
+                        "run pin in %s has non-string project %r — "
+                        "treating as pinned-projectless; the marker "
+                        "may have been tampered with", output_dir, _pp)
+                    _pp = None
+                prior_pin = (_pp,
+                             str(prior.get("project_source") or "none"))
+            # Out-of-grant witness check: the disk marker sits inside
+            # the sandbox write grant; the session ledger's pin record
+            # (written at the FIRST start, outside the grant) is the
+            # arbiter for cross-process re-entrant flows. It is
+            # consulted even when the marker carries NO pin — a child
+            # that deletes/corrupts the marker must not convert a
+            # re-entrant start into a fresh ambient re-pin.
+            _witness_found = False
+            try:
+                from core.project.sessions import ledger_pin_witness
+                found, witnessed, wit_source = ledger_pin_witness(
+                    output_dir)
+                _witness_found = found
+                if found and (prior_pin is None
+                              or witnessed != prior_pin[0]):
+                    logger.warning(
+                        "run pin in %s (%r) disagrees with the session "
+                        "ledger witness (%r) — using the witness; the "
+                        "marker may have been tampered with",
+                        output_dir,
+                        prior_pin[0] if prior_pin else "<missing>",
+                        witnessed)
+                    prior_pin = (witnessed, wit_source or "session")
+            except Exception:  # noqa: BLE001 — witness is best-effort
+                logger.debug("pin witness check failed", exc_info=True)
+            if (prior_pin is not None and not _witness_found):
+                # No witness and no freeze: the disk pin is
+                # UNCORROBORATED (the witness lives in the STARTING
+                # session's ledger, so a legitimate reuse across a
+                # claude relaunch arrives here too — the dead
+                # session's ledger is pruned). It stands when it
+                # AGREES with start-time resolution; on DISAGREEMENT
+                # neither side may elect silently — a planted marker
+                # in a reused --out dir must not become the first pin
+                # and seed the first witness, and a legitimate
+                # restart-reuse must not lose its pin to whatever the
+                # session ambient happens to be. The operator
+                # disambiguates.
+                _fresh_project, _fresh_source = resolve_pin_for_start()
+                if _fresh_project != prior_pin[0]:
+                    if get_process_project() is not None:
+                        # An explicit --project IS the operator's
+                        # disambiguation: re-pin to it. (Without this,
+                        # the error's own "--project <fresh>" remedy
+                        # re-derived the same disagreement here and
+                        # looped on the same hard error.)
+                        logger.warning(
+                            "re-pinning %s from uncorroborated %r to "
+                            "%r per explicit --project", output_dir,
+                            prior_pin[0], _fresh_project)
+                        prior_pin = (_fresh_project, _fresh_source)
+                    else:
+                        # The prior name is marker-derived — this
+                        # branch IS the planted/reused-marker case,
+                        # and every catcher bare-prints str(e) to
+                        # stderr — so escape it before interpolating
+                        # (repr on the description already escapes;
+                        # the --project remedy did not). A control-
+                        # char name can never be a real registry
+                        # project (charset-validated), so the escaped
+                        # remedy only changes hostile spellings;
+                        # legitimate names escape to themselves. The
+                        # fresh side is registry-validated already.
+                        from core.security.log_sanitisation import (
+                            sanitise_for_terminal,
+                        )
+                        _keep = (sanitise_for_terminal(
+                            prior_pin[0], max_len=120)
+                            if prior_pin[0] else "-")
+                        _fresh = (_fresh_project if _fresh_project
+                                  else "-")
+                        _prior_disp = (
+                            f"'{_keep}'" if prior_pin[0]
+                            else "'no project'")
+                        msg = (
+                            f"the run dir {output_dir} carries an "
+                            f"uncorroborated pin to "
+                            f"{_prior_disp} (no "
+                            f"ledger witness — reused across a "
+                            f"relaunch, or a pre-existing marker), "
+                            f"while this start resolves to "
+                            f"{_fresh_project or 'no project'!r}. "
+                            f"Pass --project {_keep} to keep the "
+                            f"dir's pin, or --project {_fresh} to "
+                            f"re-pin it."
+                        )
+                        raise ProjectArgvError(msg)
+        if prior_pin is not None:
+            pin_project, pin_source = prior_pin
+            override = get_process_project()
+            if override is not None:
+                wanted = None if override == "-" else override
+                if wanted != pin_project:
+                    msg = (
+                        f"--project {override!r} conflicts with the "
+                        f"run's existing pin {pin_project!r} in "
+                        f"{output_dir} — a run dir is pinned to one "
+                        "project for its whole lifetime"
+                    )
+                    raise ProjectArgvError(msg)
+        else:
+            pin_project, pin_source = resolve_pin_for_start()
+        metadata["project"] = pin_project
+        metadata["project_source"] = pin_source
+        if pin_project is not None and not target:
+            # A PINNED marker always seals a target witness: the
+            # one-target write gate (pinned_write_target_ok) treats a
+            # pin without target_path as tamper-shaped — the deletion
+            # forgery — so a target-less start inherits the pinned
+            # project's own target (which is also what the run is
+            # implicitly pointed at under DEFAULT TARGET resolution).
+            try:
+                from core.project.project import ProjectManager
+                _pinned_proj = ProjectManager().load(pin_project)
+                if _pinned_proj is not None and _pinned_proj.target:
+                    metadata["target_path"] = str(_pinned_proj.target)
+            except Exception:  # noqa: BLE001 — witness is best-effort
+                logger.debug("pin: could not seal the project target "
+                             "into the run marker", exc_info=True)
+        freeze_run_pin(output_dir, pin_project, pin_source)
+        # Order: persist metadata FIRST, then mark as active.
+        #
+        # Pre-fix `set_active_run_dir(output_dir)` ran BEFORE `save_json`.
+        # If `save_json` crashed (disk full, EIO, permission flip), the
+        # "active run dir" pointer was already set to a directory with
+        # no metadata file. Subsequent sandbox-summary writes (and any
+        # other consumer that resolves "the active run") would target
+        # a directory the rest of the system can't recognise as a real
+        # run — `is_run_directory()` returns False, recovery / sweep
+        # logic doesn't see it.
+        #
+        # Persist first; mark active only on success. The original
+        # justification (sandbox calls inside `_setup_checklist_symlink`
+        # need the active dir set) still holds for those — they run
+        # AFTER the active-dir set, which now happens AFTER the
+        # metadata write, so the timing window for that case is
+        # unchanged.
+        #
+        # Lazy import to avoid circular core.sandbox load on metadata import.
+        from core.sandbox.summary import set_active_run_dir
+        save_json(output_dir / RUN_METADATA_FILE, metadata)
+        # Ledger write under the metadata lock: a concurrent reader
+        # must never see committed metadata without its ledger record.
+        if session_pid is not None:
+            from core.project.sessions import ledger_record_start
+            ledger_record_start(output_dir, pid=session_pid,
+                                pin_project=pin_project, record_pin=True,
+                                pin_source=pin_source)
     set_active_run_dir(output_dir)
-    _setup_checklist_symlink(output_dir)
+    _run_target = metadata.get("target_path")
+    _setup_checklist_symlink(
+        output_dir,
+        target=_run_target if isinstance(_run_target, str) else None,
+    )
     return output_dir
 
 
 def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> None:
-    """Mark abandoned runs from the same session and command type as failed.
+    """Mark abandoned sibling runs as failed.
 
-    An abandoned run is one that has status=running, same session_pid (same
-    Claude Code session), and same command type. This happens when the user
-    presses Esc and retries the same command.
+    Two abandonment shapes, both status=running and past the freshness
+    gate:
+
+    - Same session_pid AND same command type AND the run's recorded
+      worker (``tool_pid``) is dead — the Esc-then-retry case (user
+      cancelled and reissued the same command in one session). The
+      worker-liveness gate keeps long-lived parallel runs of the same
+      command in the same session from being false-failed.
+    - Owning session DEAD — the recorded session_pid no longer maps to
+      a live claude process (session SIGKILL'd, machine rebooted, or
+      PID recycled by something else). No live owner means no lifecycle
+      hook will ever finalize the run: without this branch such runs
+      sat in status=running forever, regardless of command type. The
+      current session's own runs are excluded (its in-flight runs of
+      OTHER command types are healthy).
 
     Recent siblings (created within ``_ABANDON_FRESHNESS_S`` seconds)
     are LEFT ALONE even on the (session_pid, command) match. Pre-fix
@@ -276,18 +1495,52 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
             meta_path = d / RUN_METADATA_FILE
             if not meta_path.exists():
                 continue
-            meta = load_json(meta_path)
+            meta = _load_meta(meta_path)
         except OSError:
             # Per-child stat may fail even after iterdir succeeded.
             continue
-        if not meta:
+        if not isinstance(meta, dict) or not meta:
+            # Corrupt or non-object metadata (torn write, hostile or
+            # malformed run dir): not sweepable — never crash the sweep.
             continue
-        if (meta.get("status") == STATUS_RUNNING
-                and meta.get("command") == command
-                and meta.get("session_pid") == session_pid):
+        if meta.get("status") != STATUS_RUNNING:
+            continue
+        run_session = meta.get("session_pid")
+        # Same-session retry additionally requires the run's own worker
+        # (``tool_pid``, recorded at start_run) to be DEAD. The freshness
+        # gate alone is not enough: a legitimate parallel run of the same
+        # command in the same session that has been going for more than
+        # _ABANDON_FRESHNESS_S seconds would otherwise be failed here,
+        # and the terminal-status guard in _update_status would then
+        # refuse its real completion — misfiling a live run's results.
+        # An Esc-cancelled run's tool process IS dead, so the case this
+        # branch exists for still cleans up. Runs predating tool_pid
+        # recording have no pid and keep the old (freshness-only) gate.
+        same_session_retry = (
+            meta.get("command") == command
+            and run_session == session_pid
+            and not worker_liveness_for_meta(meta)[0]
+            # Stub-driven runs record a transient shell as tool_pid, so
+            # a dead worker alone is not abandonment evidence — the run
+            # dir must ALSO be write-quiet past the activity grace.
+            and not _run_recently_active(d)
+        )
+        session_dead = (
+            isinstance(run_session, int)
+            and run_session != session_pid
+            and not _session_alive_for_meta(meta)
+            # A legacy detached record (session_pid<=1, written before
+            # the recorder refused reparented-to-init pids) has no
+            # checkable owner at all — owner-LESS, not owner-dead. Its
+            # orchestrator may still be running, so only a write-quiet
+            # run is an abandon; a live one keeps appending output.
+            and not (run_session <= 1 and _run_recently_active(d))
+        )
+        if same_session_retry or session_dead:
             # Freshness gate — skip recent siblings (probable
-            # concurrent in-flight run of the same command type from
-            # the same session, NOT an Esc-then-retry).
+            # concurrent in-flight run, NOT an abandon; for the
+            # dead-session branch it also absorbs the window where
+            # a just-spawned run's owning session is still booting).
             ts_str = meta.get("timestamp")
             if isinstance(ts_str, str):
                 try:
@@ -301,11 +1554,21 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
                     # Malformed timestamp — fall through to fail_run
                     # (the run is questionable either way).
                     pass
-            fail_run(d, "abandoned — replaced by new run in same session",
+            reason = (
+                "abandoned — replaced by new run in same session"
+                if same_session_retry
+                else "abandoned — owning session terminated"
+            )
+            # ``abandon_sweep`` marks this as a heuristic verdict: if
+            # the sweep was wrong (the run was in fact live), its real
+            # finaliser may override the failed status — see the
+            # recovery clause in ``_update_status``.
+            fail_run(d, reason, extra={"abandon_sweep": True},
                      record_timing=False)
 
 
-def _setup_checklist_symlink(run_dir: Path) -> None:
+def _setup_checklist_symlink(run_dir: Path,
+                             target: str | None = None) -> None:
     """Create a checklist.json symlink in the run dir pointing to the project-level checklist.
 
     Only acts in project mode (active project detected via .active symlink).
@@ -313,22 +1576,47 @@ def _setup_checklist_symlink(run_dir: Path) -> None:
 
     If no project-level checklist exists yet, promotes the newest run-level
     checklist from sibling run dirs.
+
+    ``target``: the run's resolved target path (``start_run``'s sealed
+    ``target_path``). When both it and the project checklist's recorded
+    ``target_path`` are known ABSOLUTE paths and they resolve to
+    different locations, the symlink is REFUSED with a loud warning —
+    inheriting an inventory that describes a different tree silently
+    audits target B against target A's items. A file target inside the
+    recorded tree is still a mismatch: the inventory's items are the
+    tree's, not the file's. The run then builds its own checklist
+    downstream, exactly as a first project run does. When either side
+    is unknown (target-less start, legacy checklist without
+    ``target_path``, a relative recorded path whose anchor is lost),
+    the historical inheritance is preserved — refusing on unknowns
+    would break every standalone-shaped flow for a guard that cannot
+    actually compare anything.
     """
 
-    # Determine project output dir from .active symlink only
+    # THE RUN PIN decides which project this is (start_run sealed it
+    # just before calling here). Pre-fix this read the AMBIENT layers
+    # (get_active_name), which never see a --project override: a run
+    # pinned to X in a session bound to Y got no symlink — or worse,
+    # triggered _promote_checklist (a durable write) in Y.
     project_dir = None
     try:
-        from core.startup import PROJECTS_DIR, get_active_name
-        name = get_active_name()
-        if name:
-            from core.json import load_json as _load
-            data = _load(PROJECTS_DIR / f"{name}.json")
-            if data:
-                candidate = Path(data.get("output_dir", ""))
-                if candidate.is_dir():
-                    project_dir = candidate
-    except Exception:
-        pass
+        from core.run.pin import pin_project_dir
+        candidate = pin_project_dir(run_dir)
+        if candidate is not None and candidate.is_dir():
+            project_dir = candidate
+    except (FileNotFoundError, ImportError, json.JSONDecodeError, KeyError, PermissionError) as exc:
+        # Narrowed from bare Exception. Pre-fix a corrupt project
+        # JSON, a renamed field, or a PermissionError on PROJECTS_DIR
+        # all silently degraded to standalone mode — runs that
+        # should have been filed under an active project went into
+        # bare out/, and operators only noticed when /project status
+        # didn't include the run. Surface the cause.
+        from core.logging import get_logger as _get_logger
+        _get_logger().warning(
+            "run.metadata: active-project lookup failed (%s); "
+            "treating as standalone",
+            exc,
+        )
 
     if not project_dir:
         return  # Standalone mode
@@ -336,6 +1624,12 @@ def _setup_checklist_symlink(run_dir: Path) -> None:
     # Don't create symlink if a real checklist already exists in the run dir
     checklist_in_run = run_dir / "checklist.json"
     if checklist_in_run.exists() and not checklist_in_run.is_symlink():
+        return
+
+    # A run-local SHARDED checklist (checklist/index.json — e.g. a
+    # scoped build's run-local inventory) is a real checklist too: a
+    # symlink beside it would shadow it for every accessor read.
+    if (run_dir / "checklist" / "index.json").is_file():
         return
 
     # Don't create symlink if it already exists
@@ -346,6 +1640,50 @@ def _setup_checklist_symlink(run_dir: Path) -> None:
     project_checklist = project_dir / "checklist.json"
     if not project_checklist.exists():
         _promote_checklist(project_dir)
+
+    # Target-match gate: never inherit an inventory recorded against a
+    # DIFFERENT target (checked after promotion so a just-promoted
+    # checklist is vetted too). Costs one bounded JSON parse at run
+    # start — the price of not silently steering a whole run's review
+    # loop, coverage, and journal at the wrong tree's item list.
+    from core.inventory import checklist_exists
+    if target and checklist_exists(project_dir):
+        # Meta accessor: reads the sharded layout's index manifest
+        # when the project slot is sharded (the single-file probe
+        # alone silently skipped the gate there), full single files
+        # otherwise. Unreadable/corrupt checklists read as {} — the
+        # guard only acts on a POSITIVE mismatch.
+        from core.inventory import read_checklist_meta
+        recorded: str = ""
+        try:
+            recorded = str(
+                read_checklist_meta(project_dir).get("target_path") or "")
+        except (OSError, ValueError):
+            recorded = ""
+        if recorded and Path(recorded).is_absolute():
+            # RuntimeError alongside OSError: on Python 3.10-3.12,
+            # Path.resolve() raises it on symlink loops — a planted
+            # loop in either path must fail OPEN (keep inheritance,
+            # never fail the lifecycle start), same as any other
+            # uncomparable input.
+            try:
+                _mismatch = (
+                    Path(recorded).resolve() != Path(target).resolve()
+                )
+            except (OSError, RuntimeError):
+                _mismatch = False
+            if _mismatch:
+                from core.logging import get_logger
+                get_logger(__name__).warning(
+                    "checklist inheritance refused for %s: the project "
+                    "checklist %s was built for target %s but this run "
+                    "targets %s — inheriting it would audit this run's "
+                    "target against the other tree's inventory. This "
+                    "run proceeds without it; commands that need an "
+                    "inventory build a fresh one for the actual target.",
+                    run_dir, project_checklist, recorded, target,
+                )
+                return
 
     # Create relative symlink: run_dir/checklist.json → ../checklist.json
     #
@@ -391,9 +1729,15 @@ def _promote_checklist(project_dir: Path) -> None:
 
     Scans sibling run dirs for checklist.json files. Takes the newest
     and copies it to project_dir/checklist.json, merging checked_by
-    from older checklists.
+    from older checklists. Candidates must be JSON objects — any other
+    shape is skipped with a warning (a non-dict document would brick
+    the project slot for every reader). Every candidate passes the
+    checklist frame gate: a TAMPERED run-local frame is skipped with a warning
+    (promotion re-stamps at project level, so promoting one would
+    launder it into a verified project checklist); unstamped legacy
+    and relocated frames stay promotable at the legacy tier.
     """
-    from core.json import load_json, save_json
+    from core.json import load_json
 
     try:
         children = list(project_dir.iterdir())
@@ -418,31 +1762,118 @@ def _promote_checklist(project_dir: Path) -> None:
     # checklist became "newest" each time. Run-dir names embed a
     # PID + monotonic-ns tail (see core/run/output.unique_run_suffix),
     # so name-tie-break gives a chronologically meaningful disambiguation.
-    checklists = []
-    for d in sorted(children, key=lambda d: (_safe_mtime(d), d.name), reverse=True):
+    # Run-dir artifacts: sibling checklists are sandbox-writable; the
+    # shared run-artifact budget bounds the promotion scan.
+    from core.coverage.record import RUN_ARTIFACT_MAX_BYTES
+
+    # STREAMING merge: the newest parsed checklist is the promotion
+    # base and each older sibling is loaded, folded into it, and
+    # released before the next load. Accumulating every sibling first
+    # held N × the per-file budget live at once — a project with many
+    # runs turned promotion into the run start's high-water mark.
+    from core.inventory import _single_file_frame_gate
+    from core.inventory.builder import _carry_forward_coverage
+    promoted = None
+    for d in sorted(children, key=lambda d: (_safe_mtime(d), d.name),
+                    reverse=True):
         try:
             if not d.is_dir() or d.name.startswith((".", "_")):
                 continue
             cl = d / "checklist.json"
-            if not cl.exists() or cl.is_symlink():
+            # Run-LOCAL checklists only: a symlinked slot is the
+            # project's own checklist (self-promotion). Either
+            # on-disk form qualifies — single file or a run-local
+            # sharded dir.
+            has_single = cl.exists() and not cl.is_symlink()
+            # ``not cl.is_symlink()`` on the sharded arm too: with a
+            # dangling project symlink still in the slot, the accessor
+            # read below would resolve THROUGH it to the project's own
+            # sharded checklist — self-promotion.
+            has_sharded = (
+                (d / "checklist" / "index.json").is_file()
+                and not (d / "checklist").is_symlink()
+                and not cl.is_symlink()
+            )
+            if not has_single and not has_sharded:
                 continue
         except OSError:
             continue
-        data = load_json(cl)
-        if data:
-            checklists.append(data)
+        if has_single:
+            # Promotion must read the run-LOCAL file only — the
+            # accessor would follow a symlinked slot back to the
+            # project checklist (self-promotion).
+            data = load_json(cl, max_bytes=RUN_ARTIFACT_MAX_BYTES)  # checklist-direct-read: run-local only, symlink-excluded above
+            # Shape gate BEFORE the frame gate: this direct read can
+            # hand back any JSON value, and a non-dict candidate (a
+            # list, a string, a number) is corrupt for every consumer
+            # — read_checklist returns {} for one. Ungated, a truthy
+            # non-dict would dodge the dict-guarded frame and scope
+            # gates, crash _carry_forward_coverage on the
+            # older-siblings path, or win newest and be installed by
+            # save_checklist as a project checklist every reader then
+            # refuses. Same degrade direction as a tampered frame:
+            # loud warning naming the file + the rebuild remedy, then
+            # skip to the next-newest sibling.
+            if data is not None and not isinstance(data, dict):
+                from core.logging import get_logger
+                get_logger(__name__).warning(
+                    "checklist promotion: candidate at %s is not a "
+                    "JSON object (%s) — a non-dict checklist is "
+                    "corrupt for every reader. Skipping to the "
+                    "next-newest sibling; rebuild the inventory to "
+                    "restore this run's checklist.",
+                    cl, type(data).__name__,
+                )
+                continue
+            # Frame gate on the raw candidate: save_checklist below
+            # RE-STAMPS whatever it is handed at project level, so an
+            # ungated promotion would launder a frame every direct
+            # read refuses as tampered into a freshly-verified project
+            # checklist. A TAMPERED candidate is skipped (loud warning
+            # from the gate, naming the file + the rebuild remedy) and
+            # the scan continues to the next-newest sibling — the same
+            # degrade direction as the sharded arm, whose accessor
+            # read already returns {} for a tampered index. If no
+            # candidate survives, nothing is promoted (fail-closed).
+            # Unstamped/relocated candidates demote-and-promote at the
+            # legacy tier, exactly like every other reader.
+            if isinstance(data, dict) and not _single_file_frame_gate(
+                    data, cl, "checklist promotion"):
+                continue
+        else:
+            from core.inventory import read_checklist
+            # Accessor read: read_checklist is dict-or-{} by contract
+            # (non-dict, tampered, and integrity-failed documents all
+            # come back as {}), so the sharded arm needs no shape gate
+            # — the `if not data` below drops the empty degrade.
+            data = read_checklist(d)
+        if not data:
+            continue
+        if isinstance(data, dict) and data.get("scope"):
+            # Scope-collision rule: a scoped build's run-local
+            # checklist is PARTIAL by construction — promoting it
+            # would install a reduced file set as the project-level
+            # inventory every sibling run inherits. The project slot
+            # only ever holds the full-tree form.
+            continue
+        if promoted is None:
+            promoted = data  # newest wins the base
+        else:
+            _carry_forward_coverage(data, promoted)
 
-    if not checklists:
+    if promoted is None:
         return
 
-    # Start with newest, merge checked_by from older ones
-    promoted = checklists[0]
-    if len(checklists) > 1:
-        from core.inventory.builder import _carry_forward_coverage
-        for older in checklists[1:]:
-            _carry_forward_coverage(older, promoted)
-
-    save_json(project_dir / "checklist.json", promoted)
+    # Accessor write: an over-budget promoted inventory lands in the
+    # sharded layout instead of a single file every reader refuses.
+    from core.inventory import ChecklistBudgetExceededError, save_checklist
+    try:
+        save_checklist(project_dir, promoted)
+    except ChecklistBudgetExceededError as exc:
+        from core.logging import get_logger
+        get_logger(__name__).warning(
+            "checklist promotion skipped: %s", exc,
+        )
 
 
 def _finalize_sandbox_summary(output_dir: Path) -> None:
@@ -457,11 +1888,14 @@ def _finalize_sandbox_summary(output_dir: Path) -> None:
     the lifecycle. The active-run state is always cleared in finally.
     """
     # Lazy import to keep core.sandbox out of metadata import time.
-    from core.sandbox.summary import (
-        summarize_and_write, set_active_run_dir, get_active_run_dir,
-        SUMMARY_FILE,
-    )
     import logging
+
+    from core.sandbox.summary import (
+        SUMMARY_FILE,
+        get_active_run_dir,
+        set_active_run_dir,
+        summarize_and_write,
+    )
     log = logging.getLogger(__name__)
     try:
         result = summarize_and_write(output_dir)
@@ -474,7 +1908,7 @@ def _finalize_sandbox_summary(output_dir: Path) -> None:
                 result.get("total_denials", 0),
                 output_dir / SUMMARY_FILE,
             )
-    except Exception:  # noqa: BLE001 — never fail lifecycle on summary error
+    except Exception:
         # Debug-only log so a developer can find swallowed exceptions
         # when investigating "why is my summary missing?". INFO would be
         # too noisy if the failure is recurrent.
@@ -503,41 +1937,964 @@ def _finalize_sandbox_summary(output_dir: Path) -> None:
             set_active_run_dir(None)
 
 
-# Sandbox summary is finalized BEFORE the status update in every terminal-
-# state transition. If the process crashes between the two:
-#  - finalize-then-status-update path: status stays "running", summary on
-#    disk. A later cleanup-of-stale-runs marks the status appropriately;
-#    summary is already there. No data lost.
+def _finalize_sandbox_triage(output_dir: Path) -> str | None:
+    """Best-effort: classify this run's sandbox telemetry
+    (sandbox-summary.json / proxy-events.jsonl) into a clean / notable /
+    suspicious verdict and write sandbox-triage.json. Returns the
+    verdict string (or None: no telemetry / triage failed) so the
+    terminal-state transitions can surface it in .raptor-run.json.
+
+    Must run AFTER _finalize_sandbox_summary — triage reads
+    sandbox-summary.json, which that call just wrote. Rules-based, no LLM
+    call, no network: cheap enough to run unconditionally on every
+    terminal-state transition rather than requiring an operator to invoke
+    ``raptor-sandbox-triage`` by hand. See core/sandbox/triage.py's module
+    docstring for the signal taxonomy and known limitations.
+
+    Broad except, mirrors _finalize_sandbox_summary: lifecycle hooks must
+    never raise out of complete_run / fail_run / cancel_run on account of
+    a triage failure.
+    """
+    from core.sandbox.triage import triage_run, TRIAGE_FILE
+    import logging
+    log = logging.getLogger(__name__)
+    try:
+        # Current lifecycle runs fail closed on provenance: the run dir is
+        # target-writable until this point, so unstamped artefacts must not
+        # be allowed to drive a verdict. Manual/post-hoc triage keeps legacy
+        # support for genuinely old runs.
+        result = triage_run(output_dir, allow_legacy=False)
+        # Discoverability: only log when there's something to see — a
+        # clean run (the common case) shouldn't add chatter. Mirrors the
+        # "if result is not None" gate in _finalize_sandbox_summary.
+        if result is not None and result["verdict"] != "clean":
+            log.warning(
+                "sandbox triage: verdict=%s (%d signal(s)) → %s",
+                result["verdict"], len(result["signals"]),
+                output_dir / TRIAGE_FILE,
+            )
+        return None if result is None else result["verdict"]
+    except Exception:  # noqa: BLE001 — never fail lifecycle on triage error
+        log.debug(
+            "_finalize_sandbox_triage: triage_run failed",
+            exc_info=True,
+        )
+        return None
+
+
+def _finalize_egress_summary(output_dir: Path) -> None:
+    """Write egress-summary.json and log a one-line egress report.
+
+    Best-effort, mirrors _finalize_sandbox_summary: never raises.
+    """
+    try:
+        from core.sandbox.egress_summary import finalize_egress_summary
+        finalize_egress_summary(output_dir)
+    except Exception:  # noqa: BLE001 — never fail lifecycle
+        import logging
+        logging.getLogger(__name__).debug(
+            "_finalize_egress_summary failed for %s",
+            output_dir, exc_info=True,
+        )
+
+
+    # Activity joins the existing sources after their final writers have run.
+    # It is independent of the egress convenience summary's success.
+    try:
+        from core.sandbox.activity import finalize as finalize_activity
+        finalize_activity(output_dir)
+        import logging
+        logging.getLogger(__name__).info('sandbox activity → %s', output_dir / 'sandbox-activity.txt')
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning('sandbox activity report unavailable for %s', output_dir,
+                                            exc_info=True)
+
+
+# Sandbox summary + triage are finalized BEFORE the status update in every
+# terminal-state transition. If the process crashes between them:
+#  - finalize-then-status-update path: status stays "running", summary/triage
+#    on disk. A later cleanup-of-stale-runs marks the status appropriately;
+#    the artifacts are already there. No data lost.
 #  - status-update-then-finalize path (the alternative): status flips to
-#    "completed" but no summary; reader assumes "no denials" because no
-#    file. Misleading.
+#    "completed" but no summary/triage; reader assumes "no denials" because
+#    no file. Misleading.
 # Finalizing first preserves the data; status update is just the signal.
+# Triage runs strictly after summary within each finalize call — it reads
+# sandbox-summary.json, which the summary finalize step just wrote.
 
-def complete_run(output_dir: Path, extra: Dict[str, Any] = None) -> None:
-    """Update .raptor-run.json to status=completed."""
+def ensure_run_command(output_dir: Path,
+                       expected_command: str | None) -> None:
+    """Refuse a terminal transition on a run another command owns.
+
+    ``expected_command`` is the command the FINALISER believes it is
+    finishing. ``None`` (caller made no claim) checks nothing — the
+    legacy surface stays valid. When a claim is made and the run's
+    recorded ``command`` differs, raises :class:`RunOwnershipError`
+    BEFORE any finalisation side effect (sandbox summary/triage
+    flush, journal merge, status flip) touches the foreign run.
+
+    Missing or malformed metadata is not an ownership violation —
+    those cases keep their existing handling in ``_update_status``
+    (FileNotFoundError / ValueError there).
+    """
+    if expected_command is None:
+        return
+    metadata = _load_meta(Path(output_dir) / RUN_METADATA_FILE)
+    if not isinstance(metadata, dict):
+        return
+    owner = metadata.get("command")
+    if owner and owner != expected_command:
+        msg = (
+            f"run {output_dir} is owned by command {owner!r} — refusing "
+            f"the terminal transition claimed by {expected_command!r}. "
+            f"Only the flow that started a run may finalise it; a "
+            f"sub-step writing into another command's run directory "
+            f"(e.g. /understand --map with --out pointed at an /audit "
+            f"dir) must leave the owner's lifecycle alone."
+        )
+        raise RunOwnershipError(msg)
+
+
+def complete_run(output_dir: Path, extra: dict[str, Any] | None = None,
+                 manifest: dict[str, Any] | None = None,
+                 expected_command: str | None = None) -> None:
+    """Update .raptor-run.json to status=completed.
+
+    ``manifest`` merges end-of-run provenance into the manifest sealed at
+    start_run. Top-level keys overwrite; the start-sealed source_control /
+    environment snapshots are preserved unless explicitly overwritten.
+
+    Standard end-of-run provenance the lifecycle can derive itself — engine
+    versions (``detect_engines``) and ``deterministically_reproducible`` (from
+    the command) — is filled automatically for EVERY completion path, so a
+    caller only needs to pass the facts unique to it (the models that fired).
+    Callers still win on conflict: an explicitly-passed key is never clobbered.
+
+    ``expected_command`` (optional) asserts ownership: see
+    :func:`ensure_run_command`. Checked before the sandbox summary /
+    triage finalisers so a refused completion leaves no side effects
+    in the foreign run directory.
+    """
+    ensure_run_command(output_dir, expected_command)
     _finalize_sandbox_summary(output_dir)
-    _update_status(output_dir, STATUS_COMPLETED, extra)
+    _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
+    if _triage_verdict is not None:
+        # Surface the verdict in .raptor-run.json so cross-run views
+        # (/project status, /review) can flag non-clean runs without
+        # opening every sandbox-triage.json. Callers win on conflict,
+        # matching the extra-merge contract above.
+        extra = dict(extra or {})
+        extra.setdefault("sandbox_triage", _triage_verdict)
+    _update_status(output_dir, STATUS_COMPLETED, extra, manifest=manifest)
+    # Merge this run's review journal into the project-level index BEFORE
+    # the coverage snapshot — ``import_journal`` reads the index, not
+    # per-run journal files. Living here (the completion chokepoint)
+    # covers every ``complete_run`` caller, including the Python
+    # pipelines that never go through the libexec lifecycle shim.
+    _merge_run_journal(output_dir)
+    # Materialise the LLM read-coverage record from the plugin's .reads-manifest
+    # FIRST, so the snapshot below imports it alongside the scanner records.
+    _convert_reads_manifest(output_dir)
+    # Stamp findings with provenance_refs back to this run's manifest. Must run
+    # AFTER _update_status (manifest sealed) and BEFORE _snapshot_run_coverage
+    # (coverage importer pulls findings into the store; we want them stamped
+    # by then). Best-effort: a stamping failure must not fail the lifecycle.
+    _stamp_findings_provenance(output_dir)
+    # Snapshot AFTER the status/manifest write so coverage provenance can read
+    # the sealed manifest (engine versions / resolved models).
+    _snapshot_run_coverage(output_dir)
+    # LAST, after the status write above stamps this run completed, so
+    # the split detector sees the run's own end-state as final.
+    _refresh_project_readjudication(output_dir)
 
 
-def fail_run(output_dir: Path, error: str = None, extra: Dict[str, Any] = None,
-             record_timing: bool = True) -> None:
-    """Update .raptor-run.json to status=failed."""
+def _stamp_findings_provenance(output_dir: Path) -> None:
+    """Best-effort: stamp every finding in this run's ``findings.json`` (and
+    ``sca/findings.json``) with a ``provenance_refs`` field pointing back to
+    the run's manifest, so downstream consumers (``/project correlate``, the
+    citation view, audit reports) can trace each finding to the run that
+    produced it.
+
+    Idempotent (re-runs do nothing). Never raises — lifecycle hooks must not
+    fail on a stamping error. See ``core/run/findings.py``.
+    """
+    import logging
+    try:
+        from core.run.findings import stamp_findings_in_run
+        stamp_findings_in_run(Path(output_dir))
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "_stamp_findings_provenance failed for %s", output_dir, exc_info=True
+        )
+
+
+def _journal_project_dir(out_dir: Path) -> Path | None:
+    """Project-level directory a run's journal should merge into.
+
+    THE RUN PIN decides: a run pinned to project P merges into P's
+    index wherever the run dir physically sits; a standalone
+    (pin-null) run merges nowhere. The pre-fix ambient
+    ``get_active_name()`` read at COMPLETION time meant a mid-flight
+    ``/project use B`` (with B's dir an ancestor of the run) merged
+    the run's verdicts into B's index, which cross-run reuse then
+    silently trusted. The write requires an authoritative pin;
+    pre-series (pin-less) run dirs keep the legacy parent-marker probe
+    so their projections don't regress at landing.
+    """
+    try:
+        out_res = Path(out_dir).resolve()
+    except OSError:
+        return None
+    try:
+        from core.run.pin import (
+            legacy_probe_allowed,
+            pin_project_dir,
+            pinned_write_target_ok,
+            resolve_run_pin,
+        )
+        pin = resolve_run_pin(out_res)
+        if not _pin_witness_ok(out_res, pin):
+            return None
+        if pin.authoritative:
+            proj_dir = pin_project_dir(out_res, for_write=True)
+            if proj_dir is not None and not pinned_write_target_ok(out_res):
+                return None
+            return proj_dir.resolve() if proj_dir is not None else None
+        if not legacy_probe_allowed(pin):
+            # Corrupt or deleted marker: tamper evidence, not a legacy
+            # dir — never fall through to topology inference.
+            return None
+    except Exception:  # noqa: BLE001 — resolver failure: no fallthrough
+        return None
+    parent = out_res.parent
+    if _is_out_root(parent):
+        # A stray checklist.json at the out-root must not turn it
+        # into a pseudo project store for every marker-less run
+        # beneath it (the pin walk stops at the out-root; this direct
+        # parent probe needs the same boundary).
+        return None
+    from core.inventory import checklist_exists
+    if checklist_exists(parent) or (
+        parent / "coverage.json"
+    ).exists():
+        return parent
+    return None
+
+
+def _is_out_root(directory: Path) -> bool:
+    """Is *directory* the configured out-root? (Runs live UNDER it —
+    it is never itself a project dir.)"""
+    try:
+        from core.config import RaptorConfig
+        return directory.resolve() == Path(
+            RaptorConfig.get_out_dir()).resolve()
+    except Exception:  # noqa: BLE001 — out-root unknown
+        return False
+
+
+def _pin_witness_ok(run_dir, pin) -> bool:
+    """Verify a resolved pin against the session ledger's out-of-grant
+    witness before a privileged project-store write. True when no
+    witness exists (unverifiable — pre-witness runs, sessionless
+    contexts keep their existing posture) or when it AGREES with the
+    resolved pin; False on disagreement (the disk marker sits inside
+    the sandbox write grant and was rewritten or deleted under us).
+    A frozen pin needs no witness — it was sealed by the owner.
+    """
+    try:
+        from core.run.pin import _frozen_pins
+        if str(Path(run_dir).resolve()) in _frozen_pins:
+            return True
+        from core.project.sessions import ledger_pin_witness
+        found, witnessed, _wit_source = ledger_pin_witness(run_dir)
+        if not found:
+            return True
+        resolved = pin.project if pin.authoritative else None
+        if witnessed != resolved:
+            logger.warning(
+                "pin: SUPPRESSED project-store write for %s — the run "
+                "marker resolves %r but the session ledger witnessed "
+                "%r at start. The marker may have been tampered with.",
+                run_dir, resolved, witnessed)
+            return False
+        return True
+    except Exception:  # noqa: BLE001 — witness is an aid, never a crash
+        logger.debug("pin witness check failed", exc_info=True)
+        return True
+
+
+def project_run_projections(output_dir: Path,
+                            project_dir: Path | None = None) -> None:
+    """Re-run the project-facing completion projections for one run.
+
+    The journal-index merge, reads-manifest conversion, coverage
+    snapshot, and project re-adjudication refresh normally fire
+    exactly once, at ``complete_run`` — a run
+    ADOPTED into a project after the fact (retro-created project,
+    ``raptor project add``/``adopt``) already had its completion and
+    missed them, so its verdicts stay invisible to cross-run reuse,
+    ``/review``, and ``/project coverage``. Same best-effort semantics
+    as the completion chokepoint: each step no-ops or logs at debug,
+    never raises. Idempotent — the index merge is latest-ts keyed and
+    the coverage import is interval-union.
+
+    IMPORTED runs are refused wholesale: the import path quarantines
+    the run's trust-bearing artifacts (coverage records, journals,
+    checklist), but ``.reads-manifest`` ships at its canonical path —
+    re-running the projections on such a run would convert a forged
+    manifest into a fresh ``coverage-read.json`` and fold it into the
+    durable store, re-minting exactly the examined-coverage trust the
+    quarantine stripped. The marker is best-effort by design (missing
+    or unreadable reads as not-imported, matching its other
+    consumers); planting one only DEMOTES a run's standing.
+    """
+    try:
+        from core.project.findings_utils import run_is_imported
+        if run_is_imported(Path(output_dir)):
+            logger.info(
+                "projections skipped for imported run %s — import "
+                "quarantined its trust artifacts; adopt/add must not "
+                "re-mint them from archive-supplied inputs",
+                Path(output_dir).name,
+            )
+            return
+    except Exception:  # noqa: BLE001 — predicate is an aid, never a crash
+        logger.debug("imported-run check failed for %s",
+                     output_dir, exc_info=True)
+    _merge_run_journal(output_dir, project_dir=project_dir)
+    _convert_reads_manifest(output_dir)
+    _snapshot_run_coverage(output_dir, project_dir=project_dir)
+    _refresh_project_readjudication(output_dir, project_dir=project_dir)
+
+
+def _merge_run_journal(output_dir: Path,
+                       project_dir: Path | None = None) -> None:
+    """Best-effort: merge this run's review journals (run root + one-
+    level tool subdirs, see ``merge_run_into_index``) into the
+    project-level index so sibling runs, resume, and the coverage-
+    store import see its verdicts.
+
+    Lives at the completion chokepoint so EVERY ``complete_run`` /
+    ``interrupt_run`` caller gets it — including the Python pipelines
+    that never go through the libexec lifecycle shim. No-op for a
+    standalone run (no project dir resolves — see
+    :func:`_journal_project_dir`). Never raises — lifecycle hooks
+    must not fail on a merge error.
+    """
+    try:
+        run_dir = Path(output_dir)
+        # An explicit project_dir comes from a trusted caller that
+        # KNOWS the governing project (the adoption path, whose
+        # registry is authoritative for it and which target-validated
+        # the run before moving it) — ambient re-resolution through
+        # the default registry would miss custom-registry projects.
+        proj = project_dir if project_dir is not None \
+            else _journal_project_dir(run_dir)
+        if proj is None:
+            return
+        from core.coverage.journal import merge_run_into_index
+        merged = merge_run_into_index(proj, run_dir)
+        if merged:
+            logger.info(
+                "journal: %d entries merged into project index", merged,
+            )
+    except Exception:
+        logger.debug(
+            "_merge_run_journal failed for %s", output_dir, exc_info=True
+        )
+
+
+def _refresh_project_readjudication(output_dir: Path,
+                                    project_dir: Path | None = None) -> None:
+    """Best-effort completion projection: refresh the PROJECT-level
+    re-adjudication queue (``<project>/_report/readjudication-queue.
+    jsonl``) so a completing run's verdicts are cross-checked against
+    every SIBLING run's recorded disproofs and confirmed verdicts. The
+    import-time detector (validation-helper ``--findings``) only sees
+    the destination run's own container; without this hook a
+    cross-run contradiction stayed invisible until an operator
+    happened to run ``/project report``.
+
+    Read-only over the project's run dirs plus one atomic queue write,
+    byte-budgeted (see ``readjudication.refresh_project_queue``).
+    THE RUN PIN decides the project, with the same witness and
+    write-target gates as the other completion projections —
+    AUTHORITATIVE pins only: the legacy parent-marker probe serves
+    shared ``--out`` dirs, whose contradiction seam the import-time
+    detector already covers, and a marker-less topology inference must
+    not mint project-store writes. Never raises — lifecycle hooks must
+    not fail on an additive trail.
+    """
+    try:
+        proj = project_dir
+        if proj is None:
+            out_res = Path(output_dir).resolve()
+            from core.run.pin import (
+                pin_project_dir,
+                pinned_write_target_ok,
+                resolve_run_pin,
+            )
+            pin = resolve_run_pin(out_res)
+            if not pin.authoritative:
+                return
+            if not _pin_witness_ok(out_res, pin):
+                return
+            proj = pin_project_dir(out_res, for_write=True)
+            if proj is None or not pinned_write_target_ok(out_res):
+                return
+        from core.project.readjudication import refresh_project_queue
+        queue_path = refresh_project_queue(Path(proj))
+        if queue_path is not None:
+            logger.info(
+                "readjudication: project queue refreshed → %s", queue_path,
+            )
+    except Exception:
+        logger.debug(
+            "_refresh_project_readjudication failed for %s",
+            output_dir, exc_info=True,
+        )
+
+
+def _convert_reads_manifest(output_dir: Path) -> None:
+    """Turn the coverage plugin's ``.reads-manifest`` (the files the LLM read
+    this run, captured by the PostToolUse-on-Read hook) into a
+    ``coverage-read.json`` record so LLM read-extent reaches the store.
+
+    Labelled ``read`` (not ``llm``): a whole-file *read* is shallow coverage —
+    it is NOT a function-level review. The store distinguishes read from
+    reviewed by depth, so a file the LLM merely read still surfaces in the
+    LLM-review gap (the gap /audit fills). The plugin captures the reads but
+    nothing converted them — this wires that conversion at run completion.
+    Best-effort: a missing/empty manifest is a no-op, and a failure must never
+    break the lifecycle.
+    """
+    import logging
+    try:
+        from core.coverage.record import build_from_manifest, write_record
+        record = build_from_manifest(Path(output_dir), "read")
+        if record:
+            write_record(Path(output_dir), record, tool_name="read")
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "_convert_reads_manifest failed for %s", output_dir, exc_info=True
+        )
+
+
+def _snapshot_run_coverage(output_dir: Path,
+                           project_dir: Path | None = None) -> None:
+    """Best-effort: fold a just-completed run's coverage into the project's
+    durable ``coverage.json`` so it survives out-of-band deletion of the run
+    dir (manual ``rm``, tmpfs) — not only ``/project clean``.
+
+    Scoped to THIS run's records + findings (bounded cost); project-level
+    ``checked_by`` / annotations live in the project checklist and are captured
+    by the on-demand ``--store`` union, surviving deletion regardless. No-op
+    for a standalone ``out/`` run (no project store). The coverage.json
+    read-modify-write is taken under :func:`coverage_store_lock` so parallel
+    run completions (and a concurrent clean) can't last-writer-wins each other.
+    Never raises — lifecycle hooks must not fail on a snapshot error.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    try:
+        run_dir = Path(output_dir)
+        # THE RUN PIN decides which project store receives the
+        # snapshot. Pre-fix `proj = run_dir.parent` + a
+        # checklist-marker probe: a standalone run whose parent
+        # happened to carry a checklist merged coverage into a
+        # pseudo-store there, and an --out run under a FOREIGN
+        # project's dir merged into that project. Pin-less legacy runs
+        # keep the parent-marker shape so their projections don't
+        # regress at landing.
+        # Explicit project_dir = trusted adoption-path caller (see
+        # _merge_run_journal) — skip ambient pin re-resolution.
+        proj = project_dir
+        if proj is None:
+            try:
+                from core.run.pin import (
+                    legacy_probe_allowed,
+                    pin_project_dir,
+                    pinned_write_target_ok,
+                    resolve_run_pin,
+                )
+                pin = resolve_run_pin(run_dir)
+                from core.run.metadata import _pin_witness_ok
+                if not _pin_witness_ok(run_dir, pin):
+                    return               # marker disagrees with witness
+                if pin.authoritative:
+                    proj = pin_project_dir(run_dir, for_write=True)
+                    if proj is None:
+                        return           # standalone by pin — no store
+                    if not pinned_write_target_ok(run_dir):
+                        return           # one-target gate: foreign target
+                elif not legacy_probe_allowed(pin):
+                    return               # corrupt/deleted marker: tamper
+            except Exception:  # noqa: BLE001 — no privileged fallthrough
+                return
+        if proj is None:
+            if _is_out_root(run_dir.parent):
+                return  # same out-root boundary as _journal_project_dir
+            proj = run_dir.parent
+        from core.inventory import checklist_exists, read_checklist
+        if not checklist_exists(proj):
+            return                       # standalone run — no durable project store
+        from core.coverage.importer import (
+            _inventory_paths,
+            import_journal,
+            import_run_dir,
+            import_run_findings,
+        )
+        from core.coverage.store import (
+            CoverageStore,
+            StoreWriteOverBudget,
+            coverage_store_lock,
+        )
+
+        # Accessor read: flock + the sharded checklist/ layout, under
+        # the checklist budget class.
+        checklist = read_checklist(proj)
+        if not checklist:
+            return
+        cov_path = proj / "coverage.json"
+        with coverage_store_lock(cov_path):
+            store = CoverageStore(cov_path)
+            store.set_content_id(checklist)
+            import_run_dir(store, run_dir, checklist)
+            import_run_findings(store, run_dir, _inventory_paths(checklist))
+            # Import LLM review existence from the project-level
+            # journal index. Replaces the pre-migration
+            # ``import_checked_by(store, checklist)`` path — the
+            # journal is now authoritative for LLM review state and
+            # the coverage store projects it into (file, line, tool)
+            # intervals so ``store.who_checked_function`` keeps
+            # returning ``audit`` / ``agentic`` labels unchanged.
+            import_journal(store, proj, checklist)
+            try:
+                store.save()
+            except StoreWriteOverBudget as e:
+                # Loud refusal, never a silent debug swallow: the
+                # snapshot is skipped but the on-disk store stays
+                # readable (writing past the cap destroyed the whole
+                # durable union on the next load).
+                log.warning("coverage store snapshot refused: %s", e)
+                return
+            _append_coverage_progress(proj, run_dir, store, checklist)
+    except Exception:
+        log.debug("_snapshot_run_coverage failed for %s", output_dir, exc_info=True)
+
+
+def _append_coverage_progress(proj: Path, run_dir: Path, store,
+                              checklist: dict[str, Any]) -> None:
+    """Append one line to the project's ``coverage-progress.jsonl``.
+
+    The accumulation promise ("each run reviews only remaining gaps")
+    was never measured — no artifact recorded whether the reviewed
+    count actually moves run over run. One JSON line per completed
+    run, computed from the just-saved store, gives the cross-run
+    trend for free. Called under ``coverage_store_lock``, so the
+    append cannot interleave with a parallel completion. Best-effort.
+    """
+    import logging
+    try:
+        from core.coverage.store_summary import store_view
+        view = store_view(store, checklist)
+        row = {
+            "run": run_dir.name,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "items": view.get("total_functions", 0),
+            "examined": view.get("functions_covered", 0),
+            "llm_reviewable": view.get("llm_reviewable", 0),
+            "llm_reviewed": view.get("functions_reviewed", 0),
+        }
+        append_jsonl(proj / "coverage-progress.jsonl", row)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "coverage progress append failed for %s", run_dir, exc_info=True,
+        )
+
+
+def _already_terminal(output_dir: Path, caller: str,
+                      allow_refail: bool = False,
+                      incoming_extra: dict[str, Any] | None = None) -> bool:
+    """Shared pre-check for the non-complete finalisers (fail_run /
+    cancel_run / interrupt_run): True when the run is ALREADY terminal
+    and the finaliser must return before ANY side effect.
+
+    Re-validate the current status BEFORE the side effects: a sweep's
+    or supervisor-drain's finaliser racing a just-completed run must
+    not re-run the sandbox summary/triage finalisers, manifest
+    conversion, or journal merge against the terminal run dir (the
+    locked ``_update_status`` would refuse the status flip anyway,
+    but by then the finalisers had already rewritten it). Pre-hoist,
+    only fail_run carried this check — cancel_run/interrupt_run
+    re-ran every side effect against completed runs.
+
+    ``allow_refail`` (fail_run only): a failed->failed re-stamp is a
+    SUPPORTED merge lane — a genuine failure landing after a
+    sweep-stamped abandon must consume the ``abandon_sweep`` marker
+    (or a later stray complete_run launders the real failure via the
+    recovery clause), and an idempotent re-fail refreshes the error
+    text. Both contracts are pinned in the abandon-sweep recovery
+    tests; the side effects on that lane are overwrite-idempotent.
+    Best-effort — ``_update_status`` re-validates under the metadata
+    lock.
+
+    ``incoming_extra`` (the caller's ``extra`` dict, or None): a REAL
+    (heuristic-marker-less) finaliser is NOT blocked by a terminal
+    state that was itself stamped by a heuristic finaliser (see
+    ``_HEURISTIC_FINALIZE_MARKERS``) — the real verdict proceeds to
+    the locked ``_update_status``, whose recovery clause adjudicates
+    the override. Without this, a lifecycle hook that misjudged an
+    in-flight run's worker as dead stamped ``completed`` and this
+    pre-check refused the owner's genuine ``fail_run`` outright — the
+    failed run read Completed forever. The side effects the real
+    finaliser then re-runs against the heuristically-stamped dir are
+    the same overwrite-idempotent set as the refail lane.
+    """
+    meta_now = _load_meta(Path(output_dir) / RUN_METADATA_FILE)
+    if not isinstance(meta_now, dict):
+        return False
+    status = meta_now.get("status")
+    if status not in _TERMINAL_STATUSES:
+        return False
+    if allow_refail and status == STATUS_FAILED:
+        return False
+    if (not _heuristic_marks(incoming_extra)
+            and _heuristic_marks(meta_now.get("extra"))):
+        # Real verdict vs heuristic stamp: real wins regardless of
+        # arrival order — let _update_status adjudicate under the lock.
+        return False
+    logger.warning(
+        "%s: %s is already %r — refusing without side effects "
+        "(probable sweep/supervisor racing the run's own finaliser)",
+        caller, output_dir, status,
+    )
+    return True
+
+
+def fail_run(output_dir: Path, error: str | None = None,
+             extra: dict[str, Any] | None = None,
+             record_timing: bool = True,
+             expected_command: str | None = None) -> None:
+    """Update .raptor-run.json to status=failed.
+
+    ``expected_command`` (optional) asserts ownership — see
+    :func:`ensure_run_command`. Sweep/cleanup callers that legitimately
+    fail runs they did not start (dead-session abandons, lifecycle
+    hooks) simply make no claim.
+    """
+    ensure_run_command(output_dir, expected_command)
+    if _already_terminal(output_dir, "fail_run", allow_refail=True,
+                         incoming_extra=extra):
+        return
     extra = extra or {}
     if error:
         extra["error"] = error
     _finalize_sandbox_summary(output_dir)
+    _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
+    if _triage_verdict is not None:
+        extra.setdefault("sandbox_triage", _triage_verdict)
     _update_status(output_dir, STATUS_FAILED, extra, record_timing=record_timing)
+    # The LLM's reads happened regardless of how the run ended — convert
+    # the manifest so the read coverage survives. Pre-fix only
+    # complete_run converted, so every failed/cancelled/interrupted
+    # run's reads were silently lost (the raw manifest lingers but no
+    # importer reads raw manifests). The manifest is left in place, and
+    # a later resume→complete re-converts it with any new reads —
+    # write_record overwrites, so this is idempotent, never additive.
+    _convert_reads_manifest(output_dir)
 
 
-def cancel_run(output_dir: Path, extra: Dict[str, Any] = None) -> None:
-    """Update .raptor-run.json to status=cancelled."""
+def cancel_run(output_dir: Path, extra: dict[str, Any] | None = None,
+               expected_command: str | None = None) -> None:
+    """Update .raptor-run.json to status=cancelled.
+
+    ``expected_command`` (optional) asserts ownership — see
+    :func:`ensure_run_command`.
+    """
+    ensure_run_command(output_dir, expected_command)
+    if _already_terminal(output_dir, "cancel_run", incoming_extra=extra):
+        return
     _finalize_sandbox_summary(output_dir)
+    _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
+    if _triage_verdict is not None:
+        extra = dict(extra or {})
+        extra.setdefault("sandbox_triage", _triage_verdict)
     _update_status(output_dir, STATUS_CANCELLED, extra)
+    _convert_reads_manifest(output_dir)  # see fail_run
+
+
+def interrupt_run(output_dir: Path, reason: str | None = None,
+                  extra: dict[str, Any] | None = None,
+                  expected_command: str | None = None) -> None:
+    """Update .raptor-run.json to status=interrupted.
+
+    For runs stopped by an external supervisor (SIGTERM drain, harness
+    shell cap) whose artifacts are intact and which a later
+    :func:`resume_run` may re-enter. Unlike ``fail_run`` the run is
+    not an error: journal/ledger state on disk is coherent up to the
+    interruption point.
+
+    ``expected_command`` (optional) asserts ownership — see
+    :func:`ensure_run_command`.
+    """
+    ensure_run_command(output_dir, expected_command)
+    if _already_terminal(output_dir, "interrupt_run", incoming_extra=extra):
+        return
+    extra = dict(extra or {})
+    if reason:
+        extra["interrupt_reason"] = reason
+    _finalize_sandbox_summary(output_dir)
+    _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
+    if _triage_verdict is not None:
+        extra.setdefault("sandbox_triage", _triage_verdict)
+    _update_status(output_dir, STATUS_INTERRUPTED, extra)
+    _convert_reads_manifest(output_dir)  # see fail_run
+    # An interrupted run's journal verdicts are real reviews — merge them
+    # into the project index so sibling runs (and the eventual resume)
+    # see them.
+    _merge_run_journal(output_dir)
+
+
+#: Statuses :func:`resume_run` accepts as re-enterable. ``completed``
+#: is deliberately absent — a completed run's results are final; new
+#: work belongs in a new run (cross-run verdict reuse imports the
+#: prior verdicts there at $0).
+RESUMABLE_STATUSES = frozenset({
+    STATUS_INTERRUPTED, STATUS_FAILED, STATUS_CANCELLED, STATUS_RUNNING,
+})
+
+
+def resume_run(output_dir: Path, note: str | None = None) -> int:
+    """Re-enter an interrupted/failed run AS THE SAME RUN.
+
+    Flips status back to ``running`` (the one sanctioned
+    terminal→running transition — ``_update_status`` refuses it for
+    everyone else), records a segment row in ``extra.resumes`` and
+    refreshes ``session_pid``/``tool_pid`` so the abandon sweeps track
+    the resuming session, not the dead one.
+
+    A ``running`` status is also accepted — a SIGKILLed run never got
+    a terminal transition and sits in ``running`` until a sweep finds
+    it; resuming it is exactly the recovery this function exists for.
+
+    Returns the new segment number (2 for the first resume).
+    Raises FileNotFoundError when there is no run metadata, and
+    ValueError when the status is not resumable (notably
+    ``completed``).
+    """
+    path = Path(output_dir) / RUN_METADATA_FILE
+    with _metadata_lock(path):
+        metadata = _load_meta(path)
+        if metadata is None:
+            msg = f"No {RUN_METADATA_FILE} in {output_dir} — not a run directory"
+            raise FileNotFoundError(msg)
+        if not isinstance(metadata, dict):
+            # ValueError (not TypeError): malformed on-disk data — the
+            # same convention _update_status uses for this exact case.
+            msg = (
+                f"Malformed {RUN_METADATA_FILE} in {output_dir} — "
+                "expected JSON object"
+            )
+            raise ValueError(msg)  # noqa: TRY004
+        current = metadata.get("status")
+        if current not in RESUMABLE_STATUSES:
+            msg = (
+                f"run status {current!r} is not resumable "
+                f"(resumable: {', '.join(sorted(RESUMABLE_STATUSES))})"
+            )
+            raise ValueError(msg)
+        extra = metadata.get("extra") or {}
+        resumes = extra.get("resumes")
+        if not isinstance(resumes, list):
+            resumes = []
+        segment = len(resumes) + 2
+        from core.run.report_identity import identity_for_resume
+        metadata["reporting_identity"] = identity_for_resume(metadata, Path(output_dir), segment)
+        row: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "prior_status": current,
+            "segment": segment,
+        }
+        if note:
+            row["note"] = note
+        resumes.append(row)
+        extra["resumes"] = resumes
+        metadata["extra"] = extra
+        metadata["status"] = STATUS_RUNNING
+        # The prior segment's end_timestamp/duration describe segment 1
+        # only; drop them so the eventual terminal transition records
+        # the full multi-segment envelope from the original start.
+        metadata.pop("end_timestamp", None)
+        metadata.pop("duration_seconds", None)
+        prior_session_pid = metadata.get("session_pid")
+        session_pid = _get_session_pid()
+        # Worker identity ALWAYS refreshes to the resuming shape —
+        # segment N's liveness credential must be segment N's worker,
+        # not segment 1's stale one (a stale-dead credential reads the
+        # resumed run as not-in-flight and lets a second resume
+        # double-drive it; a stale-alive one blocks it). The old keys
+        # are popped first so a refresh that records nothing (the
+        # sessionless-interactive shape) leaves the legacy pid-less
+        # posture, never segment 1's stamp paired with segment N's pid.
+        metadata.pop("tool_pid", None)
+        metadata.pop("tool_pid_start", None)
+        metadata.update(_worker_stamp(session_bound=session_pid is not None))
+        if session_pid is not None:
+            metadata["session_pid"] = session_pid
+            # Refresh the FULL identity stamp with the pid — a resumed
+            # run owned by a different session must never carry the old
+            # session's stamp (the verifiers would judge the live
+            # resumed run abandoned: stamp != live process at new pid).
+            for key in ("session_start", "session_boot_id",
+                        "session_pidns", "session_machine_id",
+                        "session_id"):
+                metadata.pop(key, None)
+            metadata.update(_session_stamp(session_pid))
+            resumed_sid = _harness_session_id()
+            if resumed_sid:
+                metadata["session_id"] = resumed_sid
+        else:
+            # Sessionless resume (detached orchestrator, bare shell):
+            # the prior owner's session identity is stale — keeping a
+            # dead session's stamp would get the resumed run swept as
+            # "owning session terminated" mid-flight. No session is
+            # the honest owner record; the refreshed worker stamp
+            # above carries the in-flight signal instead.
+            metadata.pop("session_pid", None)
+            for key in ("session_start", "session_boot_id",
+                        "session_pidns", "session_machine_id",
+                        "session_id"):
+                metadata.pop(key, None)
+        save_json(path, metadata)
+        # Pin sealing and ledger write under the metadata lock: a
+        # concurrent terminal transition must not interleave between
+        # the resumed metadata and its ledger record.
+        if session_pid is not None:
+            _restored_pin = None
+            try:
+                from core.project.sessions import ledger_pin_witness
+                from core.run.pin import freeze_run_pin, resolve_run_pin
+                _pin = resolve_run_pin(output_dir)
+                _marker_project = (_pin.project if _pin.authoritative
+                                   else None)
+                _found, _witnessed, _wsource = ledger_pin_witness(output_dir)
+                _fallback = False
+                if not _found and isinstance(prior_session_pid, int) \
+                        and not isinstance(prior_session_pid, bool):
+                    _found, _witnessed, _wsource = ledger_pin_witness(
+                        output_dir, pid=prior_session_pid)
+                    _fallback = True
+                if _found and _witnessed != _marker_project:
+                    if _fallback:
+                        logger.warning(
+                            "resume: run pin in %s (%r) disagrees with the "
+                            "PRIOR owner's ledger witness (%r) — freezing "
+                            "projectless (fallback witnesses veto, never "
+                            "elect); the marker may have been tampered "
+                            "with", output_dir, _marker_project, _witnessed)
+                        _witnessed, _wsource = None, "none"
+                    else:
+                        logger.warning(
+                            "resume: run pin in %s (%r) disagrees with the "
+                            "session ledger witness (%r) — restoring the "
+                            "witness; the marker may have been tampered "
+                            "with", output_dir, _marker_project, _witnessed)
+                    _wsource = _wsource or "session"
+                    # Already holding _metadata_lock(path); write
+                    # directly — no nested re-acquisition needed.
+                    _fresh = _load_meta(path)
+                    if isinstance(_fresh, dict):
+                        _fresh["project"] = _witnessed
+                        _fresh["project_source"] = _wsource
+                        save_json(path, _fresh)
+                    freeze_run_pin(output_dir, _witnessed, _wsource)
+                    _restored_pin = (_witnessed, _wsource)
+                elif _pin.authoritative:
+                    freeze_run_pin(output_dir, _pin.project, _pin.source)
+                    _restored_pin = (_pin.project, _pin.source)
+            except Exception:  # noqa: BLE001 — seal is best-effort
+                logger.debug("resume pin seal failed", exc_info=True)
+            from core.project.sessions import ledger_record_resume
+            prior = (prior_session_pid
+                     if isinstance(prior_session_pid, int)
+                     and not isinstance(prior_session_pid, bool) else None)
+            ledger_record_resume(Path(output_dir),
+                                 prior_session_pid=prior, pid=session_pid,
+                                 pin_project=(_restored_pin[0]
+                                              if _restored_pin else None),
+                                 pin_source=(_restored_pin[1]
+                                              if _restored_pin else None),
+                                 record_pin=_restored_pin is not None)
+    # Re-mark as the active run so sandbox summaries and coverage
+    # tracking attach to the resumed segment.
+    from core.sandbox.summary import set_active_run_dir
+    set_active_run_dir(Path(output_dir))
+    return segment
+
+
+def reopen_run(output_dir: Path, note: str | None = None) -> None:
+    """Flip a spuriously ``completed`` run back to ``interrupted``.
+
+    The one sanctioned completed→interrupted transition, for
+    contradiction recovery: a step that did not own the run stamped it
+    completed (e.g. a mapping-phase ``raptor-run-lifecycle complete``
+    on an /audit dir), leaving the real workflow's completion refused
+    by the terminal-status guard and resume refusing the "completed"
+    run. Callers (``raptor-audit resume --reopen``) are responsible
+    for verifying the contradiction — this helper only requires that
+    the current status IS ``completed`` and records the reopen with a
+    timestamped note so the status history stays auditable.
+
+    Raises FileNotFoundError when there is no metadata file and
+    ValueError when the current status is not ``completed``.
+    """
+    path = Path(output_dir) / RUN_METADATA_FILE
+    with _metadata_lock(path):
+        metadata = _load_meta(path)
+        if metadata is None:
+            msg = f"No {RUN_METADATA_FILE} in {output_dir}"
+            raise FileNotFoundError(msg)
+        if not isinstance(metadata, dict):
+            msg = (
+                f"Malformed {RUN_METADATA_FILE} in {output_dir} — "
+                "expected JSON object"
+            )
+            raise ValueError(msg)  # noqa: TRY004 — malformed on-disk data
+        current = metadata.get("status")
+        if current != STATUS_COMPLETED:
+            msg = f"reopen_run: expected status 'completed', got {current!r}"
+            raise ValueError(msg)
+        extra = metadata.get("extra") or {}
+        reopens = extra.get("reopens")
+        if not isinstance(reopens, list):
+            reopens = []
+        row: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "prior_status": current,
+        }
+        if note:
+            row["note"] = note
+        reopens.append(row)
+        extra["reopens"] = reopens
+        metadata["extra"] = extra
+        metadata["status"] = STATUS_INTERRUPTED
+        save_json(path, metadata)
+    logger.warning(
+        "reopen_run: %s flipped completed → interrupted (%s)",
+        output_dir, note or "no note",
+    )
 
 
 @contextlib.contextmanager
-def tracked_run(output_dir: Path, command: str, extra: Dict[str, Any] = None,
-                target: str = None):
+def tracked_run(output_dir: Path, command: str,
+                extra: dict[str, Any] | None = None,
+                target: str | None = None):
     """Context manager for run lifecycle. Writes metadata automatically.
 
     Usage:
@@ -564,9 +2921,57 @@ def tracked_run(output_dir: Path, command: str, extra: Dict[str, Any] = None,
         raise
 
 
-def load_run_metadata(run_dir: Path) -> Optional[Dict[str, Any]]:
-    """Load .raptor-run.json from a run directory. Returns None if missing."""
-    return load_json(run_dir / RUN_METADATA_FILE)
+def load_run_metadata(run_dir: Path) -> dict[str, Any] | None:
+    """Load .raptor-run.json from a run directory. Returns None if missing.
+
+    Byte-budgeted (same 1 MiB the start_run ownership probe applies to
+    this exact file): the run dir is sandbox-writable mid-run, so an
+    oversize plant loads as None instead of buffering unbounded — the
+    bash hook's read of the same file is capped for the same reason.
+    """
+    return _load_meta(run_dir / RUN_METADATA_FILE)
+
+
+def corroborate_target_path(run_dir: Path, candidate) -> str | None:
+    """Check a recovered target path against the run's sealed metadata.
+
+    Tools that lose the operator-supplied ``--target`` recover it from
+    run artefacts (e.g. checklist.json's ``target_path``) — but those
+    artefacts are written into the run dir by analysis stages and can
+    drift or be tampered with. The ``target_path`` sealed into
+    ``.raptor-run.json`` at :func:`start_run` is the authoritative
+    record of what this run was pointed at.
+
+    Returns ``None`` when the candidate is consistent with the sealed
+    path, or when there is nothing to corroborate against (no metadata
+    file, no ``target_path`` field — older runs). Returns a
+    human-readable mismatch description otherwise; callers should
+    refuse the recovered path and tell the operator to pass the target
+    explicitly.
+    """
+    if not candidate:
+        return None
+    meta = load_run_metadata(Path(run_dir))
+    sealed = (meta or {}).get("target_path")
+    if not sealed or not isinstance(sealed, str):
+        return None
+    try:
+        if Path(sealed).resolve() == Path(candidate).resolve():
+            return None
+    except OSError:
+        return None
+    # The mismatch text is printed by every consumer shim (the 11
+    # enrich/normalize/cpg-cache scripts) — and ``candidate`` is the
+    # LLM-writable checklist value that fires exactly in the
+    # tamper-detected case. Escape both paths here so every consumer
+    # print is terminal-safe at the chokepoint.
+    from core.security.log_sanitisation import sanitise_for_terminal
+    return (
+        f"recovered target path "
+        f"{sanitise_for_terminal(str(candidate), max_len=200)} does not "
+        f"match the target_path sealed in {RUN_METADATA_FILE} "
+        f"({sanitise_for_terminal(sealed, max_len=200)})"
+    )
 
 
 def is_run_directory(path: Path, *, strict: bool = True) -> bool:
@@ -606,10 +3011,7 @@ def is_run_directory(path: Path, *, strict: bool = True) -> bool:
 
     typical_files = {"findings.json", "checklist.json", "scan_metrics.json",
                      "orchestrated_report.json", "validation-report.md"}
-    if any((path / f).exists() for f in typical_files):
-        return True
-
-    return False
+    return any((path / f).exists() for f in typical_files)
 
 
 def infer_command_type(run_dir: Path) -> str:
@@ -649,22 +3051,72 @@ def generate_run_metadata(run_dir: Path) -> None:
         mtime = run_dir.stat().st_mtime
         timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
+    # Adopted/legacy dirs never had provenance sealed at run time, and it
+    # cannot be reconstructed (today's git/model/tool state is unrelated to
+    # the run that produced these artifacts). Stamp the manifest as
+    # explicitly unavailable so cite/reporting degrade honestly rather than
+    # backfilling current values.
+    from core.run.provenance import UNAVAILABLE_MANIFEST
+
     metadata = {
-        "version": 1,
+        "version": 2,
         "command": command,
         "timestamp": timestamp,
         "status": STATUS_COMPLETED,  # Assume completed if it exists
+        "manifest": dict(UNAVAILABLE_MANIFEST),
         "extra": {"adopted": True},
     }
 
     save_json(run_dir / RUN_METADATA_FILE, metadata)
 
 
-_TERMINAL_STATUSES = frozenset({STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED})
+def write_run_pin(run_dir: Path, project: str | None, source: str) -> None:
+    """Rewrite a run dir's project pin — the SANCTIONED rewrites only:
+    adoption into a project (``adopted``), removal from one (``none``),
+    and merge-synthesised dirs (``merged``). A run in flight is never
+    re-pinned; these all operate on non-live dirs by construction.
+
+    Upserts into existing metadata (all other keys preserved) and
+    updates the process pin freeze cache so in-process consumers —
+    the projections that fire right after adoption — see the rewrite
+    rather than the pre-move resolution.
+    """
+    from core.run.pin import freeze_run_pin
+    rewrite_sources = ("adopted", "none", "merged")
+    if source not in rewrite_sources:
+        msg = (f"invalid pin rewrite source {source!r} "
+               f"(one of {rewrite_sources})")
+        raise ValueError(msg)
+    path = Path(run_dir) / RUN_METADATA_FILE
+    # Same lock every other read-modify-write on this file takes:
+    # racing a completing run's _update_status must not lose either
+    # write (a resurrected status=running reads as abandoned and gets
+    # sweep-failed; a dropped pin orphans the run).
+    with _metadata_lock(path):
+        meta = _load_meta(path)
+        if not isinstance(meta, dict):
+            meta = {}
+        if (meta.get("status") == STATUS_RUNNING
+                and _session_alive_for_meta(meta)):
+            msg = (f"refusing to re-pin {run_dir}: the run is live "
+                   f"(owned by session {meta.get('session_pid')}) — "
+                   "a run in flight is never re-pinned")
+            raise ValueError(msg)
+        meta["project"] = project
+        meta["project_source"] = source
+        save_json(path, meta)
+    freeze_run_pin(run_dir, project, source)
 
 
-def _update_status(output_dir: Path, status: str, extra: Dict[str, Any] = None,
-                   record_timing: bool = True) -> None:
+_TERMINAL_STATUSES = frozenset({
+    STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_INTERRUPTED,
+})
+
+
+def _update_status(output_dir: Path, status: str,
+                   extra: dict[str, Any] | None = None,
+                   record_timing: bool = True,
+                   manifest: dict[str, Any] | None = None) -> None:
     """Update the status field in .raptor-run.json.
 
     When record_timing is True (default), also records end_timestamp and
@@ -685,40 +3137,179 @@ def _update_status(output_dir: Path, status: str, extra: Dict[str, Any] = None,
     rather than hidden.
 
     Raises FileNotFoundError if metadata file doesn't exist (call start_run first).
+
+    The whole read-modify-write runs under :func:`_metadata_lock` so
+    concurrent writers (parallel workers, a sweep racing a completion)
+    serialise instead of last-writer-wins dropping each other's updates.
     """
     path = Path(output_dir) / RUN_METADATA_FILE
-    metadata = load_json(path)
-    if metadata is None:
-        raise FileNotFoundError(f"No {RUN_METADATA_FILE} in {output_dir} — call start_run() first")
-    current = metadata.get("status")
-    if current in _TERMINAL_STATUSES and current != status:
-        logger.warning(
-            "Refusing to overwrite terminal status %r → %r in %s "
-            "(probable double-finalisation; investigate caller)",
-            current, status, output_dir,
-        )
+    with _metadata_lock(path):
+        metadata = _load_meta(path)
+        if metadata is None:
+            if path.exists():
+                # The file is THERE but the budgeted read refused it
+                # (oversize plant / unreadable) — a FileNotFoundError
+                # here misled callers that had just enumerated the
+                # file. Same malformed-on-disk contract (ValueError)
+                # as the non-dict branch below.
+                msg = (f"Unreadable {RUN_METADATA_FILE} in {output_dir}"
+                       f" — over budget or malformed; refusing the "
+                       f"status update")
+                raise ValueError(msg)
+            msg = f"No {RUN_METADATA_FILE} in {output_dir} — call start_run() first"
+            raise FileNotFoundError(msg)
+        if not isinstance(metadata, dict):
+            # ValueError (not TypeError): malformed on-disk data, and the
+            # exception type callers already handle.
+            msg = f"Malformed {RUN_METADATA_FILE} in {output_dir} — expected JSON object"
+            raise ValueError(msg)  # noqa: TRY004
+        current = metadata.get("status")
+        incoming_marks = _heuristic_marks(extra)
+        if current in _TERMINAL_STATUSES and incoming_marks:
+            # A heuristic-marked write (abandon sweep, lifecycle-hook
+            # Stop finalisation) onto an ALREADY-TERMINAL status is a
+            # no-op: the heuristic judged the run from a stale
+            # status=running read and lost the race — the earlier
+            # terminal state is the truth. Merging instead (the
+            # pre-fix behaviour for failed→failed, which skips the
+            # terminal guard below) overwrote a REAL failure's error
+            # with the sweep's message and planted the marker, so a
+            # later stray complete_run laundered the genuine failure
+            # to completed via the recovery clause. Same-status writes
+            # are caught too: a heuristic ``completed`` merged onto a
+            # real ``completed`` would plant its marker and hand a
+            # later stray fail_run the recovery clause. Heuristic-first
+            # orderings are unaffected: their write lands on
+            # status=running, and the consume/recovery clauses below
+            # still let the real finaliser supersede it.
+            logger.info(
+                "Ignoring %s-stamped %r write onto terminal status %r "
+                "in %s (the heuristic finaliser lost the race)",
+                "/".join(incoming_marks), status, current, output_dir,
+            )
+            return
+        if current in _TERMINAL_STATUSES and current != status:
+            # Recovery clause: a terminal status stamped by a heuristic
+            # finaliser (abandon sweep's ``failed``, lifecycle hook's
+            # Stop-path ``completed``/``failed`` — see
+            # ``_HEURISTIC_FINALIZE_MARKERS``) is a judged verdict, not
+            # a real terminal transition. If the heuristic was wrong
+            # (the run was live), the run's own finaliser must not be
+            # refused — pre-fix a wrongly-abandoned paid run could
+            # never record its actual completion, and a hook-stamped
+            # ``completed`` on an in-flight run silently beat the
+            # owner's real ``fail_run`` (a failed scan read Completed
+            # forever). Only REAL writes reach here: heuristic-marked
+            # incoming writes returned in the no-op clause above.
+            # The override clears the heuristic's markers and error so
+            # the true outcome isn't contaminated.
+            stamped_extra = metadata.get("extra")
+            stored_marks = _heuristic_marks(stamped_extra)
+            if stored_marks:
+                logger.warning(
+                    "Overriding %s-stamped %r → %r in %s "
+                    "(the heuristic finaliser misjudged a live run)",
+                    "/".join(stored_marks), current, status, output_dir,
+                )
+                assert stamped_extra is not None
+                for _mark in _HEURISTIC_FINALIZE_MARKERS:
+                    stamped_extra.pop(_mark, None)
+                # The error field was set by the same heuristic that
+                # set the marker — drop it so the true outcome isn't
+                # contaminated by the wrong abandon/exit reason.
+                stamped_extra.pop("error", None)
+                metadata["extra"] = stamped_extra
+            else:
+                logger.warning(
+                    "Refusing to overwrite terminal status %r → %r in %s "
+                    "(probable double-finalisation; investigate caller)",
+                    current, status, output_dir,
+                )
+                return
+        metadata["status"] = status
+
+        # A GENUINE terminal write supersedes a prior heuristic stamp:
+        # consume the markers when a real (unmarked) terminal write
+        # arrives. Without this, the extras merge below preserved the
+        # marker alongside the real outcome, and a later stray
+        # finaliser took the recovery branch — flipping a genuinely
+        # failed run to completed (or vice versa) and deleting the
+        # real error (the exact laundering the terminal guard exists
+        # to prevent). Covers the same-status lanes the recovery
+        # clause skips: failed→failed refail merges and a real
+        # complete_run landing on a hook-stamped ``completed``.
+        if status in _TERMINAL_STATUSES and not incoming_marks:
+            _prior_extra = metadata.get("extra")
+            if isinstance(_prior_extra, dict):
+                _consumed = [m for m in _HEURISTIC_FINALIZE_MARKERS
+                             if _prior_extra.pop(m, None)]
+                if _consumed:
+                    logger.info(
+                        "%s marker consumed by a real %r write in %s — "
+                        "the status is now terminal",
+                        "/".join(_consumed), status, output_dir,
+                    )
+
+        if record_timing:
+            now = datetime.now(timezone.utc)
+            metadata["end_timestamp"] = now.isoformat()
+            start_ts = metadata.get("timestamp")
+            if start_ts:
+                try:
+                    start_dt = datetime.fromisoformat(start_ts)
+                    metadata["duration_seconds"] = round((now - start_dt).total_seconds(), 1)
+                except (ValueError, TypeError):
+                    pass
+
+        if extra:
+            existing_extra = metadata.get("extra") or {}
+            existing_extra.update(extra)
+            metadata["extra"] = existing_extra
+
+        if manifest:
+            # Merge caller-supplied end-of-run provenance into the start-sealed
+            # manifest. Shallow top-level merge: source_control / environment
+            # (sealed at start) stay put; models land here.
+            existing_manifest = metadata.get("manifest") or {}
+            existing_manifest.update(manifest)
+            metadata["manifest"] = existing_manifest
+
+        if status == STATUS_COMPLETED:
+            _apply_standard_provenance(metadata, Path(output_dir))
+
+        save_json(path, metadata)
+
+        # Ledger finish under the metadata lock: a concurrent resume
+        # must not interleave between the terminal metadata and its
+        # ledger record.
+        if status in _TERMINAL_STATUSES:
+            owner = metadata.get("session_pid")
+            if isinstance(owner, int) and not isinstance(owner, bool):
+                from core.project.sessions import ledger_record_finish
+                ledger_record_finish(output_dir, status, pid=owner)
+
+
+def _apply_standard_provenance(metadata: dict[str, Any], output_dir: Path) -> None:
+    """Fill the manifest with the standard end-of-run provenance the lifecycle
+    derives itself — engine versions + ``deterministically_reproducible`` — so
+    EVERY completion path enriches uniformly without per-command wiring.
+
+    Caller-supplied keys win (``setdefault``): the lifecycle only fills gaps,
+    never clobbers a value a command passed via ``complete_run(manifest=...)``.
+    Skipped when there's no real manifest to enrich — a run that predates
+    manifest capture carries the ``provenance: unavailable`` stamp, and a run
+    whose ``start_run`` never sealed one has no ``manifest`` key at all.
+    """
+    existing = metadata.get("manifest")
+    if not existing or existing.get("provenance") == "unavailable":
         return
-    metadata["status"] = status
-
-    if record_timing:
-        now = datetime.now(timezone.utc)
-        metadata["end_timestamp"] = now.isoformat()
-        start_ts = metadata.get("timestamp")
-        if start_ts:
-            try:
-                start_dt = datetime.fromisoformat(start_ts)
-                metadata["duration_seconds"] = round((now - start_dt).total_seconds(), 1)
-            except (ValueError, TypeError):
-                pass
-
-    if extra:
-        existing_extra = metadata.get("extra", {})
-        existing_extra.update(extra)
-        metadata["extra"] = existing_extra
-    save_json(path, metadata)
+    from core.run.provenance import standard_completion_provenance
+    standard = standard_completion_provenance(output_dir, metadata.get("command"))
+    for key, value in standard.items():
+        existing.setdefault(key, value)
 
 
-def parse_timestamp_from_name(name: str) -> Optional[str]:
+def parse_timestamp_from_name(name: str) -> str | None:
     """Try to extract an ISO timestamp from a directory name.
 
     Matches patterns like:

@@ -23,12 +23,12 @@ export and doing it right costs nothing.
 import os
 import tempfile
 from core.sandbox import run as _sandbox_run
+from packages.binary_analysis._execution_policy import crash_execution_policy, gdb_command
 # GDB needs ptrace(), which seccomp blocks in the `full` profile. Use
 # profile='debug' — same filesystem/network isolation as full, but ptrace
 # is permitted so gdb can trace its target. Landlock is engaged with
 # target=output=<tempdir holding the gdb script + binary>.
 from pathlib import Path
-from typing import List, Optional
 
 from packages.binary_analysis._validators import (
     validate_byte_count,
@@ -42,12 +42,13 @@ logger = get_logger()
 class GDBDebugger:
     """Wrapper around GDB for automated debugging."""
 
-    def __init__(self, binary_path: Path):
-        self.binary = Path(binary_path)
+    def __init__(self, binary_path: Path) -> None:
+        self.binary = Path(binary_path).resolve()
         if not self.binary.exists():
-            raise FileNotFoundError(f"Binary not found: {binary_path}")
+            msg = f"Binary not found: {binary_path}"
+            raise FileNotFoundError(msg)
 
-    def run_commands(self, commands: List[str], input_file: Optional[Path] = None, timeout: int = 30) -> str:
+    def run_commands(self, commands: list[str], input_file: Path | None = None, timeout: int = 30) -> str:
         """
         Run GDB with a list of commands.
 
@@ -83,18 +84,25 @@ class GDBDebugger:
         # inherits the binary's directory permissions, which
         # we control.
         # binary_dir resolves to the analyser's binary working
-        # area — same dir we already pass to landlock as a
-        # writable path (line 81 below).
+        # area — the same dir this module already passes to the
+        # sandbox as a writable path when running the debugger.
         binary_dir = self.binary.parent
         try:
             binary_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+        # The script must live in binary_dir BY DESIGN: the mount-ns
+        # sandbox gives the debugged child a fresh tmpfs at /tmp, so a
+        # host-/tmp script would be invisible inside the sandbox —
+        # binary_dir is the bind-mounted, sandbox-visible location.
+        # That same dir is target-writable, so the write goes through
+        # the fd mkstemp returned (O_EXCL-created, race-free): a
+        # close-then-reopen-by-path write_text would follow a symlink
+        # swapped in at the (leakable via /proc) tempfile name.
         fd, script_name = tempfile.mkstemp(
             prefix=".raptor_gdb_", suffix=".txt", dir=str(binary_dir),
         )
         script_file = Path(script_name)
-        os.close(fd)
         # mkstemp defaults to 0o600 on POSIX, but "defaults to" is a
         # platform contract that has shifted on edge cases (a custom
         # umask, a broken libc fallback, a future Python release that
@@ -103,14 +111,27 @@ class GDBDebugger:
         # host even briefly. Set the mode explicitly so the protection
         # holds regardless of platform defaults.
         try:
-            os.chmod(script_file, 0o600)
-        except OSError:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError):
             # Some non-Unix filesystems (FAT mounted /tmp on a USB,
             # Windows path under WSL) don't support POSIX modes;
             # the chmod failure isn't fatal.
             pass
+        except BaseException:
+            # No stream has adopted this descriptor yet. Attempt both cleanups
+            # without replacing the operation error or retrying a consumed fd.
+            try:
+                os.close(fd)
+            except BaseException:
+                pass
+            try:
+                script_file.unlink(missing_ok=True)
+            except BaseException:
+                pass
+            raise
         try:
-            script_file.write_text(gdb_script)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(gdb_script)
         except BaseException:
             script_file.unlink(missing_ok=True)
             raise
@@ -118,23 +139,24 @@ class GDBDebugger:
         # Landlock needs a directory to engage — use the binary's parent
         # and the gdb-script tempdir. Both are the same /tmp in practice
         # when the binary was also placed in /tmp; we pass both for
-        # coverage. Landlock allows reads everywhere (gcc includes etc.),
-        # writes only to these.
-        binary_dir = str(self.binary.parent.resolve())
+        # coverage. Reads are restricted to the replay workspace and system
+        # runtime files; writes remain scoped to the replay workspace.
+        binary_dir_str = str(self.binary.parent.resolve())
         script_dir = str(script_file.parent.resolve())
 
         # Build GDB command
-        cmd = ["gdb", "-batch", "-x", str(script_file), str(self.binary)]
+        cmd = gdb_command(script_file, self.binary)
 
         # Run with input redirection if provided.
         # profile='debug' permits ptrace while keeping all other seccomp
         # blocks, namespace net/pid isolation, and Landlock active.
         try:
             if input_file:
-                with open(input_file, "rb") as f:
+                with Path(input_file).open("rb") as f:
                     result = _sandbox_run(
                         cmd, profile="debug",
-                        target=binary_dir, output=script_dir,
+                        **crash_execution_policy(self.binary.parent),
+                        target=binary_dir_str, output=script_dir,
                         stdin=f,
                         capture_output=True,
                         text=True,
@@ -144,7 +166,8 @@ class GDBDebugger:
             else:
                 result = _sandbox_run(
                     cmd, profile="debug",
-                    target=binary_dir, output=script_dir,
+                    **crash_execution_policy(self.binary.parent),
+                    target=binary_dir_str, output=script_dir,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
@@ -183,16 +206,16 @@ class GDBDebugger:
         return self.run_commands(commands, input_file=input_file)
 
     def examine_memory(self, input_file: Path, address: str, num_bytes: int = 64) -> str:
-        """Examine memory at address.
+        r"""Examine memory at address.
 
         Args:
             input_file: Crash input file fed to the binary via stdin.
             address: Hex address, 0x<1-16 hex digits>. See _validators for
                      the full threat model (GDB scripts are newline-delimited,
-                     so \\n here injects a second command).
+                     so \n here injects a second command).
             num_bytes: Byte count, 1..4096. Embedded verbatim into the GDB
                      script; validated to block str-disguised-as-int inputs
-                     like "64\\nshell id".
+                     like "64\nshell id".
 
         Raises:
             ValueError: If address or num_bytes fails validation.

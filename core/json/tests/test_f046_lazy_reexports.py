@@ -19,8 +19,8 @@ Acceptance tests:
      load_json_with_comments} — round-trip identical to direct
      submodule import.
   3. AttributeError raised for unknown names (PEP 562 contract).
-  4. `__all__` still includes all 7 names (no documentation drift).
-  5. dir(core.json) surfaces all 7 (IDE tab-completion).
+  4. `__all__` still includes every public name (no documentation drift).
+  5. dir(core.json) surfaces every public name (IDE tab-completion).
   6. `import core.json` alone does NOT eagerly load `core.json.cache`
      into `sys.modules` (the proof that the re-export is lazy).
 
@@ -30,23 +30,42 @@ fence — pre-fix it eagerly imports cache.
 
 from __future__ import annotations
 
+import contextlib
+
+from core.testing.module_registry import fresh_module_tree
 import sys
+from typing import Iterator
 
 import pytest
 
 
-def _force_fresh_core_json_import():
-    """Drop core.json + core.json.cache from sys.modules so a fresh
-    `import core.json` re-runs __init__.py top-level."""
-    for mod in list(sys.modules):
-        if mod == "core.json" or mod.startswith("core.json."):
-            del sys.modules[mod]
+@contextlib.contextmanager
+def _fresh_core_json_window() -> Iterator[None]:
+    """Drop core.json + submodules from sys.modules so a fresh
+    `import core.json` re-runs __init__.py top-level, then RESTORE
+    the pre-purge module objects on exit.
+
+    Restoration is load-bearing: production modules bind names from
+    core.json at import time (`from core.json import load_json` in
+    packages/openant/recovery.py), so those functions live in the
+    ORIGINAL core.json.utils namespace. Leaving fresh duplicates in
+    sys.modules would make a later test's `import core.json.utils`
+    resolve a module object production code never reads — its
+    patch.object() calls would land on the wrong module.
+    """
+    with fresh_module_tree("core.json"):
+        yield
 
 
-def test_f046_import_core_json_does_not_eagerly_load_cache():
+@pytest.fixture
+def fresh_core_json() -> Iterator[None]:
+    with _fresh_core_json_window():
+        yield
+
+
+def test_f046_import_core_json_does_not_eagerly_load_cache(fresh_core_json):
     """After `import core.json`, `core.json.cache` should NOT yet be
     in sys.modules. Lazy access via __getattr__ pulls it on demand."""
-    _force_fresh_core_json_import()
     import core.json  # noqa: F401  — side-effect import
     assert "core.json.cache" not in sys.modules, (
         "core.json.cache eagerly loaded by `import core.json`; "
@@ -54,11 +73,11 @@ def test_f046_import_core_json_does_not_eagerly_load_cache():
     )
 
 
-def test_f046_lazy_attribute_access_returns_correct_objects():
+def test_f046_lazy_attribute_access_returns_correct_objects(fresh_core_json):
     """After `import core.json`, accessing each lazy name must return
     the same object as a direct submodule import."""
-    _force_fresh_core_json_import()
     import core.json
+    from core.json import bounded as bounded_mod
     from core.json import cache as cache_mod
     from core.json import utils as utils_mod
 
@@ -69,38 +88,80 @@ def test_f046_lazy_attribute_access_returns_correct_objects():
     assert core.json.load_json is utils_mod.load_json
     assert core.json.save_json is utils_mod.save_json
     assert core.json.load_json_with_comments is utils_mod.load_json_with_comments
+    assert core.json.load_json_stream_bounded is bounded_mod.load_json_stream_bounded
 
 
-def test_f046_unknown_attribute_raises_attribute_error():
+def test_f046_unknown_attribute_raises_attribute_error(fresh_core_json):
     """PEP 562 __getattr__ must raise AttributeError for unknown
     names so the standard 'module has no attribute' error reaches
     callers."""
-    _force_fresh_core_json_import()
     import core.json
     with pytest.raises(AttributeError, match=r"has no attribute"):
         _ = core.json.this_symbol_does_not_exist  # type: ignore[attr-defined]
 
 
-def test_f046_dir_includes_all_public_names():
+def test_f046_dir_includes_all_public_names(fresh_core_json):
     """`dir(core.json)` must surface all 7 public re-exports so IDE
     tab-completion and inspection tools see them."""
-    _force_fresh_core_json_import()
     import core.json
     names = set(dir(core.json))
     expected = {
         "CacheEnvelope", "JsonCache", "MISSING", "TTL_FOREVER",
-        "load_json", "save_json", "load_json_with_comments",
+        "load_json", "save_json", "load_json_with_comments", "load_json_stream_bounded",
     }
     missing = expected - names
     assert not missing, f"dir(core.json) missing: {missing}"
 
 
-def test_f046_all_unchanged():
-    """`__all__` must still list all 7 public names — no
-    documentation drift introduced by the lazy refactor."""
-    _force_fresh_core_json_import()
+def test_f046_fresh_import_window_restores_preexisting_modules():
+    """The fresh-import window must hand back the ORIGINAL core.json*
+    module objects when it closes.
+
+    In-process regression for the deterministic 2-test repro: running
+    this file then packages/openant test_recovery's
+    test_nonfinite_confidence_dropped_record_stays_serializable in one
+    pytest process. recovery.py binds `from core.json import load_json`
+    at import time; the recovery test patches `_orjson` on whatever
+    `import core.json.utils` resolves at call time. If this file's
+    purge leaves fresh duplicates in sys.modules, the patch lands on a
+    module object the held load_json never reads and the orjson lane
+    stays live.
+    """
+    import core.json.utils as utils_before
+
+    held = utils_before.load_json  # what an import-time consumer holds
+    with _fresh_core_json_window():
+        import core.json
+
+        # The window really is fresh: lazy access re-imports utils
+        # as a new module object.
+        _ = core.json.load_json
+        assert sys.modules["core.json.utils"] is not utils_before
+
+    import core.json.utils as utils_after
+
+    assert utils_after is utils_before, (
+        "fresh-import window did not restore the pre-purge "
+        "core.json.utils; import-time consumers now hold a module "
+        "object patch.object() can no longer reach"
+    )
+    assert held.__globals__ is utils_after.__dict__
+
+
+def test_f046_all_unchanged(fresh_core_json):
+    """`__all__` must list every public name — no documentation
+    drift introduced by the lazy refactor (or by later additions:
+    ``append_jsonl`` / ``load_jsonl`` joined with core.json.jsonl;
+    the bounded loaders joined with core.json.bounded)."""
     import core.json
     assert set(core.json.__all__) == {
-        "CacheEnvelope", "JsonCache", "MISSING", "TTL_FOREVER",
-        "load_json", "save_json", "load_json_with_comments",
+        "CacheEnvelope", "DEFAULT_JSON_MAX_BYTES",
+        "JsonBudgetExceededError", "JsonCache",
+        "MISSING", "RE_DATABASE_MAX_BYTES", "TTL_FOREVER",
+        "append_jsonl", "dumps_artifact", "dumps_canonical",
+        "dumps_display", "iterencode_canonical",
+        "load_json", "load_json_bounded", "load_json_stream_bounded",
+        "load_json_unbounded",
+        "load_json_with_comments", "load_jsonl", "loads",
+        "loads_bounded", "save_json",
     }

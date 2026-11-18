@@ -24,7 +24,35 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+
+
+# Historical cve-diff default; also the last-resort fallback when the
+# shared model registry resolves nothing (the Claude Code OAuth path
+# can still serve it without an API key — see resolve_auth).
+FALLBACK_MODEL_ID = "claude-opus-4-7"
+
+
+def default_model_id() -> str:
+    """Default model for cve-diff's LLM stages (discovery agent,
+    root-cause analysis).
+
+    Resolves through the shared model registry —
+    :func:`core.llm.config._get_default_primary_model` walks the
+    operator ``--model`` pin, ``~/.config/raptor/models.json``, and the
+    provider env-key autodetect — so the operator's configured primary
+    drives cve-diff exactly like the other pipelines (same private-
+    helper convention as ``core/audit/orchestrator.py``). Falls back
+    to :data:`FALLBACK_MODEL_ID` when nothing is configured.
+    """
+    try:
+        from core.llm.config import _get_default_primary_model
+
+        mc = _get_default_primary_model()
+        if mc is not None and mc.model_name:
+            return mc.model_name
+    except Exception:  # noqa: BLE001 — registry trouble must never break the CLI
+        pass
+    return FALLBACK_MODEL_ID
 
 
 @dataclass(frozen=True)
@@ -37,7 +65,7 @@ class AuthDecision:
     dispatcher route in :mod:`core.llm.providers` handles auth.
     """
     provider: str
-    api_key: Optional[str] = None
+    api_key: str | None = None
     via_dispatcher: bool = False
 
 
@@ -51,13 +79,19 @@ def resolve_auth(model_id: str) -> AuthDecision:
     via_dispatcher = bool(os.environ.get("RAPTOR_LLM_SOCKET"))
 
     # Claude Code OAuth fallback for Anthropic-family models when
-    # neither dispatcher nor ANTHROPIC_API_KEY is available.
-    # Historical cve-diff behaviour preserved (operator without an
-    # Anthropic key but with Claude Code installed gets free
-    # Anthropic-routed analysis).
+    # neither dispatcher nor direct SDK auth is available. Historical
+    # cve-diff behaviour preserved (operator without an Anthropic key
+    # but with Claude Code installed gets free Anthropic-routed
+    # analysis). Direct SDK auth means EITHER first-party spelling
+    # (member sites of core.security.credential_env.
+    # ANTHROPIC_FIRST_PARTY_AUTH_VARS): the SDK reads
+    # ANTHROPIC_AUTH_TOKEN too, so a bearer-token-only operator must
+    # not be demoted to the claudecode subprocess route.
+    # CLAUDE_CODE_OAUTH_TOKEN is excluded — the SDK does not read it.
     if (provider == "anthropic"
             and not via_dispatcher
-            and not os.environ.get("ANTHROPIC_API_KEY")):
+            and not os.environ.get("ANTHROPIC_API_KEY")
+            and not os.environ.get("ANTHROPIC_AUTH_TOKEN")):
         return AuthDecision(provider="claudecode")
 
     # Everything else: hand off to ``core.llm.providers``. Pass

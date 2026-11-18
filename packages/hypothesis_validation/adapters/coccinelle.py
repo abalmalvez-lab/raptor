@@ -13,41 +13,56 @@ is injected by packages/coccinelle.runner._inject_harness — LLM-supplied
 rules must contain only declarative SmPL patterns.
 """
 
-import re
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Dict, Optional
+from core.run.scratch import temporary_text
 
 from packages import coccinelle as coccinelle_pkg
+from packages.coccinelle.runner import contains_script_block
 
 from .base import ToolAdapter, ToolCapability, ToolEvidence, make_sandbox_runner
 
 
-# Annotations that introduce code execution into SmPL. Any of these in a
-# rule body (after the `@`) means the LLM is trying to run code, not match
-# patterns. We refuse such rules outright rather than try to neutralise.
-_FORBIDDEN_ANNOTATION_RE = re.compile(
-    r"@\s*(script\s*:|finalize\s*:|initialize\s*:)",
-    re.IGNORECASE,
-)
-
-
 def _contains_forbidden_blocks(rule: str) -> bool:
-    """Return True when the rule has @script:, @finalize:, or @initialize:.
+    """Return True when the rule declares an SmPL scripting construct
+    (@script:/@finalize:/@initialize: header, or a script:-constraint).
 
-    Comments are not stripped first — SmPL `//` comments don't span `@` lines
-    in practice, and being conservative (rejecting commented-out script
-    blocks too) is fine: an LLM has no reason to emit commented script
-    blocks. See _FORBIDDEN_ANNOTATION_RE for the matched syntax.
+    Delegates to the ONE shared gate — the runner's
+    ``contains_script_block`` — so this adapter, the runner's own
+    refusal, and checker synthesis agree on what counts as scripting.
+    A local weaker regex previously admitted spellings the real spatch
+    parser accepts (comment tokens inside the header, headers spanning
+    lines, the constraint form); the shared gate matches over the
+    lexer's view of the rule instead of its raw bytes.
     """
-    return bool(_FORBIDDEN_ANNOTATION_RE.search(rule))
+    return contains_script_block(rule)
+
+
+# Tokens that packages/coccinelle's runner keys its COCCIRESULT
+# extraction-harness injection on (raw substring checks over the whole
+# rule text, comments included). A rule carrying either token would run
+# WITHOUT the harness, emit no COCCIRESULT lines, and read as a clean
+# "no matches" — silently turning a rule that actually matched into a
+# refutation. Reject such rules up front: an LLM-generated declarative
+# rule never legitimately contains them (RAPTOR injects the result
+# scripting itself). Checked case-folded and any-language ("script:"
+# covers script:python AND script:ocaml / spelling-case variants) —
+# strictly wider than the runner's exact-substring keying, so every
+# rule that would suppress the harness is rejected here first; the
+# extra width only ever refuses more, never less.
+_HARNESS_SUPPRESSING_TOKENS = ("script:", "cocciresult")
+
+
+def _contains_harness_suppressors(rule: str) -> bool:
+    """True when the rule text would disable result-harness injection."""
+    low = rule.lower()
+    return any(tok in low for tok in _HARNESS_SUPPRESSING_TOKENS)
 
 
 _SYNTAX_EXAMPLE = """\
 // Find malloc() return values used without a NULL check.
 // Write the matching pattern only — RAPTOR injects the result-extraction
-// script automatically. Do NOT include @script:, @finalize:, or
-// @initialize: blocks; they will be rejected.
+// script automatically. Rules that carry their own script, finalize, or
+// initialize annotations are rejected.
 @unchecked@
 expression E;
 position p;
@@ -70,7 +85,7 @@ class CoccinelleAdapter(ToolAdapter):
             Set False for tests or trusted environments.
     """
 
-    def __init__(self, *, sandbox: bool = True):
+    def __init__(self, *, sandbox: bool = True) -> None:
         self._sandbox = sandbox
 
     @property
@@ -106,7 +121,7 @@ class CoccinelleAdapter(ToolAdapter):
         target: Path,
         *,
         timeout: int = 300,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
     ) -> ToolEvidence:
         if not self.is_available():
             return ToolEvidence(
@@ -131,42 +146,40 @@ class CoccinelleAdapter(ToolAdapter):
                 ),
             )
 
+        if _contains_harness_suppressors(rule):
+            return ToolEvidence(
+                tool=self.name, rule=rule, success=False,
+                error=(
+                    "rule contains text ('script:python' or 'COCCIRESULT:') "
+                    "that would disable RAPTOR's result-extraction harness "
+                    "and make every run read as 'no matches'; remove it — "
+                    "RAPTOR injects the result scripting itself"
+                ),
+            )
+
         if env is None:
             from core.config import RaptorConfig
             env = RaptorConfig.get_safe_env()
 
         # spatch needs the rule as a file. Write to temp then run.
-        rule_file: Optional[Path] = None
         try:
-            tmp = NamedTemporaryFile(
-                prefix="cocci_hv_", suffix=".cocci",
-                mode="w", delete=False,
-            )
-            tmp.write(rule)
-            tmp.close()
-            rule_file = Path(tmp.name)
-
-            subprocess_runner = (
-                make_sandbox_runner(target=target) if self._sandbox else None
-            )
-            result = coccinelle_pkg.run_rule(
-                target=target,
-                rule=rule_file,
-                timeout=timeout,
-                env=env,
-                subprocess_runner=subprocess_runner,
-            )
+            with temporary_text(rule, prefix="cocci_hv_", suffix=".cocci",
+                                strict_cleanup=False) as rule_file:
+                subprocess_runner = (
+                    make_sandbox_runner(target=target) if self._sandbox else None
+                )
+                result = coccinelle_pkg.run_rule(
+                    target=target,
+                    rule=rule_file,
+                    timeout=timeout,
+                    env=env,
+                    subprocess_runner=subprocess_runner,
+                )
         except OSError as e:
             return ToolEvidence(
                 tool=self.name, rule=rule, success=False,
                 error=f"failed to invoke spatch: {e}",
             )
-        finally:
-            if rule_file is not None:
-                try:
-                    rule_file.unlink()
-                except OSError:
-                    pass
 
         if not result.ok:
             return ToolEvidence(

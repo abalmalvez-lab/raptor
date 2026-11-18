@@ -1,0 +1,300 @@
+"""Producer-kind resolution: which tool wrote a journal entry, and
+whether it counts as a function-grade review.
+
+/audit entries are function-grade (may suppress gaps, may be reused);
+/agentic entries are finding-grade (one scanner finding analysed — never
+a function review). The kind must resolve identically for the coverage
+importer's tool label and the audit gap fold, and the function-grade
+index collapse must not let a newer finding-grade entry shadow an older
+audit verdict.
+"""
+
+from core.coverage.journal import (
+    ReviewJournalEntry,
+    entry_producer,
+    is_function_grade,
+    latest_function_grade_index,
+    merge_into_index,
+    now_iso,
+)
+
+
+def _entry(
+    *,
+    producer=None,
+    run_id="audit_20260101_000000",
+    verdict="clean",
+    file="src/a.c",
+    function="f",
+    ts=None,
+    strategies=None,
+    edge_callee=None,
+    body=None,
+    model=None,
+) -> ReviewJournalEntry:
+    return ReviewJournalEntry(
+        ts=ts or now_iso(),
+        run_id=run_id,
+        file=file,
+        function=function,
+        verdict=verdict,
+        source_hash="",
+        producer=producer,
+        strategies=strategies or [],
+        edge_callee=edge_callee,
+        body=body,
+        model=model,
+    )
+
+
+class TestEntryProducer:
+    def test_explicit_producer_wins(self):
+        assert entry_producer(_entry(producer="agentic")) == "agentic"
+        assert entry_producer(_entry(producer="audit",
+                                     run_id="agentic_x")) == "audit"
+
+    def test_legacy_agentic_prefixes(self):
+        assert entry_producer(_entry(run_id="agentic_20260101")) == "agentic"
+        assert entry_producer(_entry(run_id="scan_20260101")) == "agentic"
+        assert entry_producer(_entry(run_id="scan-20260101_1200")) == "agentic"
+        assert entry_producer(_entry(run_id="agentic")) == "agentic"
+        assert entry_producer(_entry(run_id="scan")) == "agentic"
+
+    def test_legacy_standalone_target_shape_is_agentic(self):
+        # The launcher's standalone shape carries the TARGET between
+        # the tool name and the timestamp
+        # (command_target_YYYYMMDD_HHMMSS_pidN_MMMM) — legacy /agentic
+        # rows under it must stay finding-grade, or adopted standalone
+        # runs would durably suppress never-reviewed functions.
+        assert entry_producer(_entry(
+            run_id="agentic_zlib_20260101_120000_pid123")) == "agentic"
+        assert entry_producer(_entry(
+            run_id="scan_mytarget_20260101_120000_pid7_0042")) == "agentic"
+        assert entry_producer(_entry(
+            run_id="agentic_my_lib_20260101_120000")) == "agentic"
+
+    def test_legacy_default_is_audit(self):
+        assert entry_producer(_entry(run_id="audit_20260101")) == "audit"
+        assert entry_producer(_entry(run_id="")) == "audit"
+        assert entry_producer(_entry(run_id="myproject_run")) == "audit"
+
+    def test_hand_named_dirs_do_not_demote(self):
+        # The legacy heuristic is scoped to the MACHINE-generated name
+        # shape: a hand-named audit run dir like "scan-of-x" must not
+        # demote its reviews to finding-grade.
+        assert entry_producer(_entry(run_id="scan-of-x")) == "audit"
+        assert entry_producer(_entry(run_id="scanner-1")) == "audit"
+        assert entry_producer(_entry(run_id="agentic-myrun")) == "audit"
+
+
+class TestIsFunctionGrade:
+    def test_audit_entries_are_function_grade(self):
+        assert is_function_grade(_entry(producer="audit"))
+        assert is_function_grade(_entry(run_id="audit_x"))
+
+    def test_agentic_entries_are_finding_grade(self):
+        assert not is_function_grade(_entry(producer="agentic"))
+        assert not is_function_grade(_entry(run_id="agentic_20260101"))
+        assert not is_function_grade(
+            _entry(run_id="agentic_zlib_20260101_120000_pid123"))
+
+    def test_validate_entries_are_finding_grade(self):
+        """Feedback-written entries for functions no audit reviewed:
+        one validated finding is not a function review."""
+        assert not is_function_grade(_entry(producer="validate"))
+        # Never inferred from run_id — explicit stamp only.
+        assert is_function_grade(_entry(run_id="validate_20260101"))
+
+
+class TestLatestFunctionGradeIndex:
+    def test_finding_grade_entries_excluded(self, tmp_path):
+        project = tmp_path / "project"
+        run = project / "run1"
+        run.mkdir(parents=True)
+        from core.coverage.journal import append_entry
+        append_entry(run, _entry(producer="agentic", verdict="suspicious"))
+        merge_into_index(project, run)
+
+        assert latest_function_grade_index(project) == {}
+
+    def test_newer_agentic_entry_does_not_shadow_audit_verdict(
+        self, tmp_path,
+    ):
+        """The plain load_index collapse keeps the newest entry of any
+        kind; the function-grade collapse must keep the audit verdict
+        even when an /agentic analysis is more recent."""
+        project = tmp_path / "project"
+        run = project / "run1"
+        run.mkdir(parents=True)
+        from core.coverage.journal import append_entry, load_index
+        audit = _entry(producer="audit", verdict="clean")
+        append_entry(run, audit)
+        newer = _entry(producer="agentic", verdict="suspicious")
+        assert newer.ts > audit.ts
+        append_entry(run, newer)
+        merge_into_index(project, run)
+
+        collapsed = latest_function_grade_index(project)
+        # Site-keyed collapse (file:function@line_start; these test
+        # entries carry no span, so @0).
+        assert set(collapsed) == {"src/a.c:f@0"}
+        assert collapsed["src/a.c:f@0"].verdict == "clean"
+        assert entry_producer(collapsed["src/a.c:f@0"]) == "audit"
+        # And the shadowing premise holds on the plain collapse (the
+        # two entries share model + empty-strategy index keys only when
+        # producers differ on ts — assert the plain view disagrees so
+        # this test fails loudly if load_index grows kind-awareness).
+        plain = load_index(project)
+        assert plain["src/a.c:f"].verdict == "suspicious"
+
+    def test_multiple_functions_collapse_independently(self, tmp_path):
+        project = tmp_path / "project"
+        run = project / "run1"
+        run.mkdir(parents=True)
+        from core.coverage.journal import append_entry
+        append_entry(run, _entry(function="f", producer="audit"))
+        append_entry(run, _entry(function="g", producer="agentic"))
+        append_entry(run, _entry(function="h", run_id="audit_x"))
+        merge_into_index(project, run)
+
+        assert set(latest_function_grade_index(project)) == {
+            "src/a.c:f@0", "src/a.c:h@0",
+        }
+
+
+class TestPerSiteIndexKeys:
+    """Same-named items at different spans (macro redefinitions, C++
+    overloads) must not evict each other at merge time, and legacy
+    span-less index keys must be re-homed losslessly."""
+
+    def _site_entry(self, line, ts=None):
+        entry = _entry(function="SSHINT", ts=ts)
+        entry.line_start = line
+        return entry
+
+    def test_same_named_sites_do_not_evict(self, tmp_path):
+        project = tmp_path / "project"
+        run = project / "run1"
+        run.mkdir(parents=True)
+        from core.coverage.journal import append_entry, load_index_full
+        append_entry(run, self._site_entry(10))
+        append_entry(run, self._site_entry(30))
+        merge_into_index(project, run)
+        entries = load_index_full(project).values()
+        spans = sorted(e.line_start for e in entries
+                       if e.function == "SSHINT")
+        assert spans == [10, 30], (
+            "both sites must survive the merge — pre-fix the second "
+            "evicted the first (shared span-less index key)"
+        )
+        collapsed = latest_function_grade_index(project)
+        assert {"src/a.c:SSHINT@10", "src/a.c:SSHINT@30"} <= set(collapsed)
+
+    def test_legacy_spanless_key_rehomed_losslessly(self, tmp_path):
+        import json
+        project = tmp_path / "project"
+        project.mkdir(parents=True)
+        run = project / "run1"
+        run.mkdir()
+        from core.coverage.journal import (
+            INDEX_FILENAME,
+            append_entry,
+            load_index_full,
+        )
+        # Simulate a pre-fix index: one row under a span-less key.
+        legacy = self._site_entry(10)
+        legacy_key = legacy.index_key.rsplit("@", 1)[0]
+        (project / INDEX_FILENAME).write_text(json.dumps({
+            "schema_version": 1,
+            "entries": {legacy_key: legacy.to_dict()},
+        }))
+        # Any subsequent merge re-homes the legacy row.
+        append_entry(run, self._site_entry(30))
+        merge_into_index(project, run)
+        raw = json.loads((project / INDEX_FILENAME).read_text())["entries"]
+        assert legacy_key not in raw, "legacy key must be re-homed"
+        entries = load_index_full(project).values()
+        spans = sorted(e.line_start for e in entries
+                       if e.function == "SSHINT")
+        assert spans == [10, 30], "re-homing must not lose the entry"
+
+
+class TestEntryEarnsFunctionCoverage:
+    """The single screening rule for both coverage projection lanes —
+    pinned here (beside the substrate it guards) so a weakened
+    predicate fails inside core/coverage, not only in the audit-side
+    matrix oracle."""
+
+    def test_unresolved_and_edge_rows_never_earn(self):
+        from core.coverage.journal import entry_earns_function_coverage
+        assert not entry_earns_function_coverage(
+            _entry(verdict="dark"))
+        assert not entry_earns_function_coverage(
+            _entry(verdict="error"))
+        assert not entry_earns_function_coverage(
+            _entry(edge_callee="lib.c:callee"))
+
+    def test_settled_rows_earn(self):
+        from core.coverage.journal import entry_earns_function_coverage
+        for verdict in ("clean", "suspicious", "finding", "dormant"):
+            assert entry_earns_function_coverage(
+                _entry(verdict=verdict)), verdict
+
+    def test_mechanical_echo_rows_never_earn(self):
+        # Post-loop pattern-scan echo rows carry producer=audit and a
+        # settled verdict, but no review examined the function — a
+        # mark would read never-reviewed functions as reviewed in
+        # every store-derived view. Both echo spellings screened: the
+        # strategy tag and the body prefix.
+        from core.coverage.journal import entry_earns_function_coverage
+        assert not entry_earns_function_coverage(_entry(
+            verdict="suspicious",
+            strategies=["post-loop-mechanical", "decomp-sweep"],
+        ))
+        assert not entry_earns_function_coverage(_entry(
+            verdict="suspicious",
+            body="[mechanical] pattern match in f",
+        ))
+
+    def test_agent_mark_rows_never_earn(self):
+        # Review-grade marks are operator-tier: a --mark row whose
+        # invocation-context stamp is not "operator" is an agent
+        # self-assertion with no evidence gate — it must not retire
+        # the function from review in any store-derived view.
+        from core.coverage.journal import entry_earns_function_coverage
+        assert not entry_earns_function_coverage(_entry(
+            producer="mark", model="agent-mark",
+        ))
+        # A mark row with NO stamp at all demotes too — absence of
+        # the operator stamp is absence of the authority (fail-low).
+        # (Hardcoded-era rows stamped "operator" unconditionally and
+        # grandfather at operator tier; only the stamp decides.)
+        assert not entry_earns_function_coverage(_entry(
+            producer="mark", model=None,
+        ))
+
+    def test_operator_mark_rows_still_earn(self):
+        from core.coverage.journal import entry_earns_function_coverage
+        assert entry_earns_function_coverage(_entry(
+            producer="mark", model="operator",
+        ))
+        # Ordinary review rows with a real model name are untouched
+        # (the screen keys on producer="mark", never on model alone).
+        assert entry_earns_function_coverage(_entry(
+            producer="audit", model="model-a",
+        ))
+
+    def test_consistency_census_rows_never_earn(self):
+        # The consistency census's LLM-free synthesized outcomes are
+        # the second mechanically-minted row kind — they carry
+        # NEITHER pattern-echo marker, so the screen must recognise
+        # their own tag and body prefix. Both spellings pinned.
+        from core.coverage.journal import entry_earns_function_coverage
+        assert not entry_earns_function_coverage(_entry(
+            verdict="suspicious",
+            strategies=["consistency-census"],
+        ))
+        assert not entry_earns_function_coverage(_entry(
+            verdict="finding",
+            body="[consistency:handler-outcome] census-confirmed",
+        ))

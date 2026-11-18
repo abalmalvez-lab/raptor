@@ -1,0 +1,922 @@
+"""Tests for the shared atomic-file-write primitive.
+
+Pins the contract two consumers rely on
+(``core/annotations/storage.py`` + ``brain/auto_notes.py``):
+
+  * Parent-dir auto-created.
+  * A concurrent reader never sees a truncated / half-written file.
+  * On write failure, ``path`` is left unchanged and no tempfile
+    dangles.
+  * ``os.replace`` semantics: same-inode overwrite works even when
+    ``path`` already exists.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from core.testing.module_bindings import patch_module_attribute
+from core import atomic_fs
+
+from core.atomic_fs import write_text_atomically
+
+
+class TestWriteTextAtomically:
+    def test_creates_parent_dir(self, tmp_path):
+        target = tmp_path / "deep" / "nested" / "note.md"
+        write_text_atomically(target, "hello\n")
+        assert target.read_text() == "hello\n"
+
+    def test_overwrites_existing_atomically(self, tmp_path):
+        target = tmp_path / "note.md"
+        target.write_text("v1\n")
+        write_text_atomically(target, "v2\n")
+        assert target.read_text() == "v2\n"
+
+    def test_leaves_no_tempfile_on_success(self, tmp_path):
+        target = tmp_path / "note.md"
+        write_text_atomically(target, "body")
+        # Every entry in the dir should be either the target or an
+        # unrelated file — no leftover ``.atomic-*.tmp``.
+        siblings = list(tmp_path.iterdir())
+        assert siblings == [target]
+
+    def test_preserves_prior_state_on_write_error(
+        self, tmp_path, monkeypatch,
+    ):
+        """If the OS write fails mid-way, ``path`` retains its prior
+        content and the tempfile is cleaned up."""
+        target = tmp_path / "note.md"
+        target.write_text("prior\n")
+
+        # Monkeypatch os.fsync to raise — simulates a mid-write
+        # failure after the buffer's flushed but before the rename.
+        import os
+        real_fsync = os.fsync
+
+        def boom(fd):
+            raise OSError("simulated fsync failure")
+
+        patch_module_attribute(monkeypatch, atomic_fs, "os", "fsync", boom)
+        with pytest.raises(OSError):
+            write_text_atomically(target, "new\n")
+
+        # Prior content survives.
+        assert target.read_text() == "prior\n"
+        # And no dangling tempfile (write should have unlinked it).
+        siblings = [
+            p for p in tmp_path.iterdir()
+            if p.name.startswith(".atomic-")
+        ]
+        assert siblings == []
+        # Restore for the fixture teardown.
+        patch_module_attribute(monkeypatch, atomic_fs, "os", "fsync", real_fsync)
+
+    def test_fd_closed_when_fchmod_window_raises_baseexception(
+        self, tmp_path, monkeypatch,
+    ):
+        """The pre-write interrupt closes its staging descriptor, even after unlink."""
+        import errno
+        import os
+
+        target = tmp_path / "note.md"
+        target.write_text("prior\n")
+        opened_fds: list[tuple[int, tuple[int, int]]] = []
+        real_open, real_close = os.open, os.close
+
+        def capturing_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            try:
+                info = os.fstat(fd)
+            except BaseException:
+                real_close(fd)
+                raise
+            opened_fds.append((fd, (info.st_dev, info.st_ino)))
+            return fd
+
+        def interrupt(fd, mode):
+            raise KeyboardInterrupt
+
+        patch_module_attribute(monkeypatch, atomic_fs, "os", "open", capturing_open)
+        patch_module_attribute(monkeypatch, atomic_fs, "os", "fchmod", interrupt)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                write_text_atomically(target, "new\n")
+            assert len(opened_fds) == 1
+            fd, identity = opened_fds[0]
+            # The writer unlinks staging on failure, so directory contents
+            # cannot identify a leaked open file. Compare its original inode
+            # and device; a different file may legitimately reuse the number.
+            try:
+                current = os.fstat(fd)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+            else:
+                assert (current.st_dev, current.st_ino) != identity, (
+                    f"original staging descriptor remains open: fd {fd}")
+            assert target.read_text() == "prior\n"
+            assert [p for p in tmp_path.iterdir() if p.name.startswith(".atomic-")] == []
+        finally:
+            # Keep a regressed writer from leaking into later tests. A number
+            # recycled for a different file is borrowed and must stay open.
+            for fd, identity in opened_fds:
+                try:
+                    current = os.fstat(fd)
+                except OSError:
+                    continue
+                if (current.st_dev, current.st_ino) == identity:
+                    real_close(fd)
+
+    @pytest.mark.parametrize('retirement', ['closed', 'leaked_unlinked', 'recycled_in_tree'])
+    def test_fd_cleanup_oracle_rejects_leaks_and_accepts_recycling(
+        self, tmp_path, monkeypatch, retirement,
+    ):
+        import errno
+        import os
+
+        operation = tmp_path / 'operation'
+        operation.mkdir()
+        real_close = os.close
+        with (operation / 'recycled').open('x+b') as replacement_owner:
+            replacement = replacement_owner.fileno()
+            info = os.fstat(replacement)
+            replacement_identity = (info.st_dev, info.st_ino)
+            owned = {}
+            calls = []
+
+            def writer(target, text):
+                staging = target.parent / '.atomic-owned-oracle'
+                fd = atomic_fs.os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                info = os.fstat(fd)
+                identity = (info.st_dev, info.st_ino)
+                owned[fd] = identity
+                assert identity != replacement_identity
+                os.unlink(staging)
+                assert os.fstat(fd).st_nlink == 0
+                calls.append(fd)
+                try:
+                    atomic_fs.os.fchmod(fd, 0o600)
+                finally:
+                    if retirement == 'closed':
+                        real_close(fd)
+                        owned.pop(fd)
+                    elif retirement == 'recycled_in_tree':
+                        # Atomically close the original and reuse its number, with
+                        # no interval in which another thread can acquire the slot.
+                        os.dup2(replacement, fd)
+                        owned[fd] = replacement_identity
+
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setitem(globals(), 'write_text_atomically', writer)
+                    if retirement == 'leaked_unlinked':
+                        with pytest.raises(AssertionError, match='original staging descriptor'):
+                            self.test_fd_closed_when_fchmod_window_raises_baseexception(operation, patch)
+                    else:
+                        self.test_fd_closed_when_fchmod_window_raises_baseexception(operation, patch)
+                assert len(calls) == 1
+                assert os.fstat(replacement).st_ino == replacement_identity[1]
+                if retirement == 'recycled_in_tree':
+                    info = os.fstat(calls[0])
+                    assert (info.st_dev, info.st_ino) == replacement_identity
+            finally:
+                # Also reclaim the deliberately leaking control on the old oracle.
+                # A recycled number belonging to another file is never ours to close.
+                for fd, identity in owned.items():
+                    try:
+                        info = os.fstat(fd)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            raise
+                        continue
+                    if (info.st_dev, info.st_ino) == identity:
+                        real_close(fd)
+
+    def test_custom_tmp_prefix(self, tmp_path):
+        """Callers can pass a distinct ``tmp_prefix`` so operators
+        grepping for dangling temporaries can tell what module
+        was writing."""
+        # We can't observe the tempfile after success (it's renamed),
+        # but we can check the API accepts the kwarg without error.
+        target = tmp_path / "note.md"
+        write_text_atomically(
+            target, "content", tmp_prefix=".myservice-",
+        )
+        assert target.read_text() == "content"
+
+
+class TestModeParameter:
+    """The optional ``mode`` argument pins perms via ``os.fchmod`` on
+    the tempfile BEFORE rename, so the atomic rename installs a file
+    with the correct permissions in a single atomic step — no
+    chmod-after-rename window where a reader could see the file
+    with the wrong perms."""
+
+    def test_mode_applied_to_new_file(self, tmp_path):
+        # Fresh destination: mode= should be applied to the created
+        # file. Confirms security-sensitive callers can write with
+        # 0o600 straight through the atomic path.
+        target = tmp_path / "secret.tok"
+        write_text_atomically(target, "hunter2\n", mode=0o600)
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert target.read_text() == "hunter2\n"
+
+    def test_mode_overrides_preserve_existing(self, tmp_path):
+        # If destination already exists at 0o644, an explicit
+        # mode=0o600 should tighten it — the caller's declared
+        # mode wins over the "preserve existing" default.
+        target = tmp_path / "note.md"
+        target.write_text("v1")
+        target.chmod(0o644)
+        write_text_atomically(target, "v2", mode=0o600)
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert target.read_text() == "v2"
+
+    def test_mode_none_preserves_existing_perms(self, tmp_path):
+        # mode=None (default): existing perms preserved so an
+        # operator's ``chmod 0o600`` isn't silently widened by our
+        # next write. This is the guard against the concrete regression
+        # of tightening operator-set perms.
+        target = tmp_path / "note.md"
+        target.write_text("v1")
+        target.chmod(0o600)
+        write_text_atomically(target, "v2")
+        assert target.stat().st_mode & 0o777 == 0o600
+
+    def test_mode_none_new_file_uses_default(self, tmp_path):
+        # mode=None on a fresh destination: use conventional 0o644.
+        target = tmp_path / "note.md"
+        write_text_atomically(target, "content")
+        assert target.stat().st_mode & 0o777 == 0o644
+
+    def test_mode_rejects_setuid(self, tmp_path):
+        # Setuid bit rejected — no consumer of this primitive should
+        # be shipping setuid files without an explicit chmod step.
+        with pytest.raises(ValueError, match="0o000..0o777"):
+            write_text_atomically(
+                tmp_path / "x", "content", mode=0o4755,
+            )
+
+    def test_mode_rejects_setgid_and_sticky(self, tmp_path):
+        with pytest.raises(ValueError):
+            write_text_atomically(tmp_path / "x", "c", mode=0o2755)
+        with pytest.raises(ValueError):
+            write_text_atomically(tmp_path / "x", "c", mode=0o1755)
+
+    def test_mode_rejects_negative(self, tmp_path):
+        with pytest.raises(ValueError):
+            write_text_atomically(tmp_path / "x", "c", mode=-1)
+
+    def test_mode_rejects_non_int(self, tmp_path):
+        # Explicit type validation — a caller passing "0o600" (str)
+        # would otherwise land silently as garbage perms.
+        with pytest.raises(ValueError, match="mode must be int"):
+            write_text_atomically(tmp_path / "x", "c", mode="0o600")
+
+    def test_mode_zero_is_legal(self, tmp_path):
+        # mode=0 is silly (locks the operator out) but technically a
+        # legal POSIX mode. Accept it — don't silently interpret 0
+        # as "no mode specified".
+        target = tmp_path / "locked.tok"
+        write_text_atomically(target, "content", mode=0)
+        assert target.stat().st_mode & 0o777 == 0
+        # Cleanup: restore perms so pytest tmpdir can remove it.
+        target.chmod(0o600)
+
+
+class TestAdversarial:
+    """Concurrent-writer + squat-attack + symlink-handling contract.
+
+    Every test here maps to a class of bug that would compound
+    silently across every downstream consumer of the primitive.
+    """
+
+    def test_concurrent_same_process_threads(self, tmp_path):
+        # Two threads writing the same path must NOT corrupt the
+        # tempfile via shared-name collision. Pre-fix, the tempfile
+        # name was PID-only; two threads computed identical tempfile
+        # paths and the second's O_TRUNC clobbered the first's
+        # in-flight write.
+        import threading as _th
+        target = tmp_path / "shared.md"
+        errs: list[BaseException] = []
+
+        def writer(tag: str):
+            try:
+                write_text_atomically(target, tag * 1000)
+            except BaseException as e:  # noqa: BLE001
+                errs.append(e)
+
+        threads = [
+            _th.Thread(target=writer, args=(chr(ord("a") + i),))
+            for i in range(8)
+        ]
+        from core.testing.threads import retiring_threads
+
+        with retiring_threads(threads, release=lambda: None, timeout=60):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # No writer should have blown up.
+        assert errs == [], f"concurrent writers failed: {errs}"
+        # File contents must be one writer's payload in full — never
+        # a mixed / truncated snapshot.
+        got = target.read_text()
+        assert len(got) == 1000, (
+            f"torn write: got {len(got)} bytes, expected 1000 "
+            f"(sample: {got[:20]!r})"
+        )
+        # All bytes should be the same char (one writer's payload).
+        assert len(set(got)) == 1, (
+            f"mixed content: {sorted(set(got))!r}"
+        )
+
+    def test_rejects_symlink_squat_at_tempfile(self, tmp_path):
+        # An attacker who predicts the tempfile name can pre-create
+        # it as a symlink to sensitive content. With O_EXCL + O_NOFOLLOW
+        # our open should refuse loudly rather than follow the symlink
+        # and truncate the attacker's chosen target.
+        #
+        # The random suffix makes an ACTUAL squat impossible to stage
+        # in a test (we can't predict what the primitive will name its
+        # tempfile). Instead we assert the flags are present in the
+        # write path via source inspection — a refactor that drops
+        # O_EXCL or O_NOFOLLOW is caught by this test.
+        import inspect
+        import core.atomic_fs as af
+        src = inspect.getsource(af.write_bytes_atomically)
+        assert "O_EXCL" in src, (
+            "O_EXCL missing from write path — refactor introduced "
+            "a tempfile squat window (attacker could pre-create "
+            "the tempfile, our O_CREAT alone would follow into it)"
+        )
+        assert "O_NOFOLLOW" in src, (
+            "O_NOFOLLOW missing from write path — refactor introduced "
+            "a tempfile symlink-follow window (attacker could "
+            "pre-create the tempfile as a symlink to their target)"
+        )
+
+    def test_perm_preserve_does_not_inherit_symlink_target_mode(
+        self, tmp_path,
+    ):
+        # If ``path`` is a symlink to a file with 0o644, our perm
+        # probe must NOT copy the target's 0o644 onto the new file
+        # (which would silently change perms if the operator intended
+        # tight perms on the eventual real file). Pre-fix used
+        # ``path.stat()`` which followed the link.
+        real = tmp_path / "real.md"
+        real.write_text("real content")
+        real.chmod(0o644)
+        sym = tmp_path / "link.md"
+        sym.symlink_to(real)
+
+        # Write via the symlink path with mode=None.
+        write_text_atomically(sym, "new content")
+
+        # The rename should have REPLACED the symlink with a
+        # regular file (standard atomic-write contract) — and the
+        # new file should have the default 0o644 (not inherited
+        # from an lstat of a non-file). Real file unchanged.
+        assert not sym.is_symlink(), (
+            "atomic write should replace symlink with regular file"
+        )
+        assert sym.read_text() == "new content"
+        assert real.read_text() == "real content"
+        # Perms on the new regular file: default 0o644 (symlink
+        # itself has no meaningful mode to preserve).
+        assert sym.stat().st_mode & 0o777 == 0o644
+
+
+class TestCrossConsumerConsistency:
+    """Consumers pass content through the same primitive."""
+
+    def test_annotations_writes_via_shared_helper(
+        self, tmp_path, monkeypatch,
+    ):
+        """core/annotations/storage.py's write_annotation should go
+        through write_text_atomically — verify by patching the shared
+        helper and confirming it's called with a path inside tmp_path."""
+        from core.annotations import storage as _storage
+        from core.annotations.storage import write_annotation
+        from core.annotations.models import Annotation
+
+        seen = []
+        import core.atomic_fs as atomic_fs
+        real = atomic_fs.write_text_atomically
+
+        def spy(path, content, **kwargs):
+            seen.append(("annotations", Path(path)))
+            return real(path, content, **kwargs)
+
+        # storage.py binds ``write_text_atomically`` at module load,
+        # so patch BOTH the source module attribute AND the resolved
+        # binding in storage.py's namespace — otherwise the storage
+        # module keeps calling the original.
+        monkeypatch.setattr(atomic_fs, "write_text_atomically", spy)
+        monkeypatch.setattr(_storage, "write_text_atomically", spy)
+        ann = Annotation(
+            file="foo/bar.py",
+            function="baz",
+            metadata={"source": "human", "status": "clean"},
+            body="test note",
+        )
+        write_annotation(tmp_path, ann)
+        # Spy fired at least once, and every recorded write landed
+        # under tmp_path. Weak "any(kind == 'annotations')" wouldn't
+        # catch a bug where write_annotation routed elsewhere and the
+        # spy was called for an unrelated reason.
+        assert len(seen) >= 1
+        assert all(
+            tmp_path in p.parents or p == tmp_path
+            for _, p in seen
+        )
+
+
+
+class TestShortWriteCompletion:
+    def test_short_os_write_still_commits_full_content(
+        self, tmp_path, monkeypatch,
+    ):
+        """A partial ``os.write`` must not commit a truncated file.
+
+        ``os.write`` is allowed to return a short count (signal after
+        partial progress, per-call filesystem limits). Simulate a
+        kernel that writes at most 4 bytes per call and assert the
+        committed file still carries every byte. Pre-fix the single
+        unchecked ``os.write`` call fsync'd and renamed the 4-byte
+        truncation into place as if committed.
+        """
+        import os as _os
+
+        from core.atomic_fs import write_bytes_atomically
+
+        target = tmp_path / "blob.bin"
+        content = b"0123456789abcdef" * 4
+        real_write = _os.write
+
+        def short_write(fd, data):
+            return real_write(fd, bytes(memoryview(data)[:4]))
+
+        patch_module_attribute(monkeypatch, atomic_fs, "os", "write", short_write)
+        write_bytes_atomically(target, content)
+        monkeypatch.undo()
+        assert target.read_bytes() == content
+
+    def test_zero_progress_write_raises_and_cleans_up(
+        self, tmp_path, monkeypatch,
+    ):
+        """A zero-return ``os.write`` must raise, not loop forever or
+        commit — and the tempfile must be cleaned up."""
+
+        from core.atomic_fs import write_bytes_atomically
+
+        target = tmp_path / "blob.bin"
+        patch_module_attribute(monkeypatch, atomic_fs, "os", "write", lambda fd, data: 0)
+        with pytest.raises(OSError):
+            write_bytes_atomically(target, b"payload")
+        monkeypatch.undo()
+        assert not target.exists()
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestOpenExclusiveArtifact:
+    """The exclusive-create family: anything occupying the
+    destination name refuses the open instead of being followed,
+    truncated, or blocked on."""
+
+    def test_creates_new_file(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "artifact.bin"
+        fd = open_exclusive_artifact(target)
+        try:
+            os.write(fd, b"payload")
+        finally:
+            os.close(fd)
+        assert target.read_bytes() == b"payload"
+
+    def test_refuses_existing_file(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "artifact.bin"
+        target.write_bytes(b"old")
+        with pytest.raises(OSError):
+            open_exclusive_artifact(target)
+        assert target.read_bytes() == b"old"
+
+    def test_refuses_dangling_symlink(self, tmp_path):
+        """A dangling symlink passes ``exists() == False`` — the
+        exact blind spot O_EXCL closes: creating through it would
+        materialise the attacker-chosen target."""
+        from core.atomic_fs import open_exclusive_artifact
+
+        victim = tmp_path / "victim"
+        link = tmp_path / "artifact.bin"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_exclusive_artifact(link)
+        assert not victim.exists()
+
+    def test_refuses_symlink_to_existing_victim(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        victim = tmp_path / "victim"
+        victim.write_text("do not touch")
+        link = tmp_path / "artifact.bin"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_exclusive_artifact(link)
+        assert victim.read_text() == "do not touch"
+
+    def test_replace_removes_planted_symlink_not_its_target(
+        self, tmp_path,
+    ):
+        from core.atomic_fs import write_new_bytes
+
+        victim = tmp_path / "victim"
+        victim.write_text("do not touch")
+        link = tmp_path / "artifact.bin"
+        link.symlink_to(victim)
+        write_new_bytes(link, b"fresh", replace=True)
+        assert victim.read_text() == "do not touch"
+        assert not link.is_symlink()
+        assert link.read_bytes() == b"fresh"
+
+    def test_replace_overwrites_own_previous_emission(self, tmp_path):
+        from core.atomic_fs import write_new_bytes
+
+        target = tmp_path / "artifact.bin"
+        write_new_bytes(target, b"run one", replace=True)
+        write_new_bytes(target, b"run two", replace=True)
+        assert target.read_bytes() == b"run two"
+
+    def test_replace_refuses_directory(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "artifact.bin"
+        target.mkdir()
+        with pytest.raises(OSError):
+            open_exclusive_artifact(target, replace=True)
+        assert target.is_dir()
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_replace_removes_planted_fifo(self, tmp_path):
+        import os
+
+        from core.atomic_fs import write_new_bytes
+
+        target = tmp_path / "artifact.bin"
+        os.mkfifo(target)
+        write_new_bytes(target, b"fresh", replace=True)
+        assert target.read_bytes() == b"fresh"
+
+    def test_mode_wins_over_umask(self, tmp_path):
+        import os
+        import stat
+
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "script.sh"
+        old_umask = os.umask(0o077)
+        try:
+            fd = open_exclusive_artifact(target, mode=0o755)
+            os.close(fd)
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+    def test_mode_rejects_setuid(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        with pytest.raises(ValueError):
+            open_exclusive_artifact(tmp_path / "f", mode=0o4755)
+
+    def test_default_mode_honours_umask(self, tmp_path):
+        # Two-direction pair with test_mode_wins_over_umask: an
+        # EXPLICIT mode beats the umask (0o755 scripts stay
+        # executable), but the unrequested DEFAULT must be masked by
+        # it — fchmod-forcing the default widened 0o600 (umask 077)
+        # artifacts to a world-readable 0o644 on restrictive-umask
+        # multi-user hosts, where the plain open("w") these writers
+        # replaced and the append family in this module both honour
+        # the umask.
+        import os
+        import stat
+
+        from core.atomic_fs import write_new_text
+
+        target = tmp_path / "artifact.txt"
+        old_umask = os.umask(0o077)
+        try:
+            write_new_text(target, "crash bytes\n")
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    def test_explicit_mode_wins_over_umask_through_write_new(self, tmp_path):
+        import os
+        import stat
+
+        from core.atomic_fs import write_new_bytes
+
+        target = tmp_path / "script.sh"
+        old_umask = os.umask(0o077)
+        try:
+            write_new_bytes(target, b"#!/bin/sh\n", mode=0o755)
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+    def test_write_new_text_round_trip(self, tmp_path):
+        from core.atomic_fs import write_new_text
+
+        target = tmp_path / "artifact.txt"
+        write_new_text(target, "héllo\n")
+        assert target.read_text(encoding="utf-8") == "héllo\n"
+
+
+class TestOpenHardenedAppend:
+
+    def test_appends_not_truncates(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_append
+
+        target = tmp_path / "trail.log"
+        for chunk in (b"one\n", b"two\n"):
+            fd = open_hardened_append(target)
+            try:
+                os.write(fd, chunk)
+            finally:
+                os.close(fd)
+        assert target.read_bytes() == b"one\ntwo\n"
+
+    def test_refuses_symlink(self, tmp_path):
+        from core.atomic_fs import open_hardened_append
+
+        victim = tmp_path / "victim"
+        victim.write_text("do not touch")
+        link = tmp_path / "trail.log"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_hardened_append(link)
+        assert victim.read_text() == "do not touch"
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_readerless_fifo_without_blocking(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_append
+
+        target = tmp_path / "trail.log"
+        os.mkfifo(target)
+        with pytest.raises(OSError):
+            open_hardened_append(target)
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_fifo_with_reader(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_append
+
+        target = tmp_path / "trail.log"
+        os.mkfifo(target)
+        reader = os.open(str(target), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            with pytest.raises(OSError):
+                open_hardened_append(target)
+        finally:
+            os.close(reader)
+
+
+class TestRmtreeHardened:
+    """Griefing-resistant tree removal (the chmod-walk-then-rmtree
+    shape shared by symex private tmps, fuzzing env rootfs, and sca
+    venv scratch)."""
+
+    def test_removes_griefed_mode0_subtree(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        victim = tmp_path / "scratch"
+        nested = victim / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "f").write_text("x")
+        (victim / "a").chmod(0o000)
+        try:
+            assert rmtree_hardened(victim) is True
+            assert not victim.exists()
+        finally:
+            if victim.exists():  # restore so pytest tmp cleanup works
+                (victim / "a").chmod(0o700)
+
+    def test_removes_mode0_root(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        victim = tmp_path / "scratch"
+        victim.mkdir()
+        (victim / "f").write_text("x")
+        victim.chmod(0o000)
+        try:
+            assert rmtree_hardened(victim) is True
+            assert not victim.exists()
+        finally:
+            if victim.exists():
+                victim.chmod(0o700)
+
+    def test_never_chmods_through_symlink(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside.chmod(0o755)
+        victim = tmp_path / "scratch"
+        victim.mkdir()
+        (victim / "evil").symlink_to(outside)
+        assert rmtree_hardened(victim) is True
+        assert not victim.exists()
+        assert outside.exists()
+        assert (outside.stat().st_mode & 0o777) == 0o755
+
+    def test_symlink_root_not_followed(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        # The target carries a restrictive-mode SUBDIRECTORY: os.walk
+        # always follows its `top` argument (followlinks only governs
+        # the descent), so an unrefused link root would restore 0o700
+        # onto the target's subtree through the link before rmtree
+        # ever refused it. The refusal must come first — no chmod, no
+        # walk, no side effects.
+        target = tmp_path / "real"
+        sub = target / "locked"
+        sub.mkdir(parents=True)
+        (sub / "keep").write_text("x")
+        sub.chmod(0o555)
+        target.chmod(0o755)
+        link = tmp_path / "scratch"
+        link.symlink_to(target)
+        try:
+            result = rmtree_hardened(link)
+            assert result is False
+            assert link.is_symlink()
+            assert (sub / "keep").read_text() == "x"
+            assert (target.stat().st_mode & 0o777) == 0o755
+            assert (sub.stat().st_mode & 0o777) == 0o555
+        finally:
+            sub.chmod(0o700)  # so pytest tmp cleanup works
+
+    def test_missing_path_reports_gone(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        assert rmtree_hardened(tmp_path / "never-there") is True
+
+    def test_reports_false_when_removal_blocked(self, tmp_path):
+        import os
+
+        from core.atomic_fs import rmtree_hardened
+
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses permission checks")
+        parent = tmp_path / "jail"
+        victim = parent / "scratch"
+        victim.mkdir(parents=True)
+        (victim / "f").write_text("x")
+        parent.chmod(0o500)  # no write: victim cannot be unlinked
+        try:
+            assert rmtree_hardened(victim) is False
+            assert victim.exists()
+        finally:
+            parent.chmod(0o700)
+
+
+class TestOpenHardenedRead:
+
+    def test_reads_regular_file(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_read
+
+        target = tmp_path / "artifact.log"
+        target.write_bytes(b"one\ntwo\n")
+        fd = open_hardened_read(target)
+        try:
+            assert os.read(fd, 1 << 16) == b"one\ntwo\n"
+        finally:
+            os.close(fd)
+
+    def test_refuses_symlink(self, tmp_path):
+        from core.atomic_fs import open_hardened_read
+
+        victim = tmp_path / "victim"
+        victim.write_text("attacker-chosen content")
+        link = tmp_path / "artifact.log"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_hardened_read(link)
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_writerless_fifo_without_blocking(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_read
+
+        target = tmp_path / "artifact.log"
+        os.mkfifo(target)
+        # O_NONBLOCK makes the read-side open of a writerless FIFO
+        # return immediately; the fstat gate must then refuse it —
+        # a plain open() here blocks forever.
+        with pytest.raises(OSError):
+            open_hardened_read(target)
+
+    def test_refuses_character_device(self):
+        from pathlib import Path
+
+        from core.atomic_fs import open_hardened_read
+
+        if not Path("/dev/null").exists():
+            pytest.skip("/dev/null unavailable")
+        with pytest.raises(OSError):
+            open_hardened_read("/dev/null")
+
+
+def test_byte_chunks_are_written_incrementally_even_with_short_writes(tmp_path, monkeypatch):
+    import os
+    from core.atomic_fs import write_bytes_atomically
+
+    target = tmp_path / "chunks.bin"
+    observed = []
+    real_write = os.write
+
+    def short_write(fd, data):
+        count = real_write(fd, data[:2])
+        observed.append(bytes(data[:count]))
+        return count
+
+    def chunks():
+        yield b"first"
+        assert b"".join(observed) == b"first"
+        yield memoryview(b"second")
+
+    patch_module_attribute(monkeypatch, atomic_fs, "os", "write", short_write)
+    write_bytes_atomically(target, chunks(), mode=0o600)
+    assert target.read_bytes() == b"firstsecond"
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
+def test_failed_chunk_iterator_keeps_previous_file_and_cleans_temp(tmp_path, error):
+    from core.atomic_fs import write_bytes_atomically
+
+    target = tmp_path / "chunks.bin"
+    target.write_bytes(b"original")
+
+    def chunks():
+        yield b"partial replacement"
+        raise error("interrupted producer")
+
+    with pytest.raises(error):
+        write_bytes_atomically(target, chunks())
+    assert target.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_invalid_byte_chunk_cannot_publish_partial_output(tmp_path):
+    from core.atomic_fs import write_bytes_atomically
+
+    target = tmp_path / "chunks.bin"
+    target.write_bytes(b"original")
+    with pytest.raises(TypeError):
+        write_bytes_atomically(target, iter([b"partial", "not bytes"]))
+    assert target.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_short_writes_count_bytes_for_multibyte_buffers(tmp_path, monkeypatch, chunked):
+    from array import array
+    import os
+    from core.atomic_fs import write_bytes_atomically
+
+    content = array("I", [0x01020304, 0x05060708])
+    target = tmp_path / "buffer.bin"
+    real_write = os.write
+
+    def short_write(fd, data):
+        return real_write(fd, memoryview(data).cast("B")[:3])
+
+    patch_module_attribute(monkeypatch, atomic_fs, "os", "write", short_write)
+    write_bytes_atomically(target, iter([content]) if chunked else content)
+    assert target.read_bytes() == content.tobytes()

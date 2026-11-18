@@ -7,9 +7,15 @@ high-bit-set values as two's-complement negatives when ``signed=True``.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Union
+from collections.abc import Mapping
+from typing import Any
 
 from .availability import z3
+from ._validation import require_bool, require_bv, require_width
+
+
+# Keep decimal diagnostic integers short; this is not a profile width limit.
+_MAX_RENDERED_BOUND_BITS = 1024
 
 
 def bv_to_int(raw: int, width: int, signed: bool) -> int:
@@ -35,23 +41,54 @@ def bv_to_int(raw: int, width: int, signed: bool) -> int:
       declared width — width/raw mismatch from a wrong decl size or
       a hand-constructed test). Same: silent truncation hides the bug.
     """
-    if width <= 0:
-        raise ValueError(
-            f"bv_to_int: width={width} must be positive (degenerate decl?)"
+    require_width(width)
+    require_bool(signed, argument="signed")
+    if type(raw) is not int:
+        raise ValueError("bv_to_int: raw must be an integer")
+    bits = raw.bit_length()
+    if raw < 0 or bits > width:
+        upper = str(1 << width) if width <= _MAX_RENDERED_BOUND_BITS else f"2**{width}"
+        raw_text = str(raw) if bits <= _MAX_RENDERED_BOUND_BITS else (
+            f"<{bits}-bit {'negative' if raw < 0 else 'nonnegative'} integer>"
         )
-    upper = 1 << width
-    if not 0 <= raw < upper:
-        raise ValueError(
-            f"bv_to_int: raw={raw} out of range [0, {upper}) for width={width}"
-        )
-    if signed and raw >= (1 << (width - 1)):
-        return raw - upper
+        msg = f"bv_to_int: raw={raw_text} out of range [0, {upper}) for width={width}"
+        raise ValueError(msg)
+    if signed and bits == width:
+        return raw - (1 << width)
     return raw
+
+
+def _named_entries(mapping: Mapping[Any, Any], *, argument: str) -> tuple[tuple[str, Any], ...]:
+    """Snapshot textual identities before hashing or model evaluation."""
+    entries: list[tuple[str, Any]] = []
+    names: set[str] = set()
+    for name, value in mapping.items():
+        if not isinstance(name, str):
+            raise ValueError(f"{argument} names must be strings")
+        name = str.__str__(name)
+        if name in names:
+            raise ValueError(f"duplicate {argument} name {name!r}")
+        names.add(name)
+        entries.append((name, value))
+    return tuple(entries)
+
+
+def _signedness_context(signed):
+    """Snapshot explicit flags, including entries absent from this model."""
+    if type(signed) is bool:
+        return signed
+    if not isinstance(signed, Mapping):
+        raise ValueError("signed must be a boolean or a mapping of names to booleans")
+    context = {}
+    for name, value in _named_entries(signed, argument="signedness map"):
+        require_bool(value, argument=f"signed[{name!r}]")
+        context[name] = value
+    return context
 
 
 def _resolve_signedness(
     name: str,
-    signed: Union[bool, Mapping[str, bool]],
+    signed: bool | Mapping[str, bool],
 ) -> bool:
     """Resolve per-decl signedness from either a bool default or a map.
 
@@ -73,98 +110,90 @@ def _resolve_signedness(
     """
     if isinstance(signed, bool):
         return signed
-    return bool(signed.get(name, False))
+    if not isinstance(signed, Mapping):
+        raise ValueError("signed must be a boolean or a mapping of names to booleans")
+    return require_bool(signed.get(name, False), argument=f"signed[{name!r}]")
 
 
 def format_witness(
     model: Any,
-    signed: Union[bool, Mapping[str, bool]],
-) -> Dict[str, int]:
+    signed: bool | Mapping[str, bool],
+) -> dict[str, int]:
     """Render every concrete BitVec decl in a Z3 model as ``{name: int}``.
 
     `signed` accepts either a global `bool` (legacy) or a
     `Mapping[str, bool]` per-decl signedness map (preferred for
     mixed-type constraint sets). See `_resolve_signedness`.
+
+    Aliases for repeated names are display labels. Consumers that need
+    source-variable identity should use ``format_vars`` with their own
+    expression registry, not infer identity from a generated alias.
     """
-    # Collision detection on `name = str(decl)`. Z3 decls with the
-    # same name in different scopes (e.g. a constraint set that
-    # combined two parsed expressions, each with its own `x`) all
-    # stringify to `"x"` — pre-fix the second decl's value silently
-    # OVERWROTE the first in `out[name] = ...`. The model then
-    # appeared to have one variable when it really had two, and
-    # consumers comparing constraints against the witness saw the
-    # wrong value for one of them. Surface the collision via a
-    # disambiguating suffix (`x`, `x__1`, `x__2`, ...) so all values
-    # survive and the operator can see the multiplicity in the
-    # output.
-    out: Dict[str, int] = {}
-    for decl in model.decls():
-        val = model[decl]
-        if not z3.is_bv_value(val):
-            continue
-        name = str(decl)
-        # Disambiguate same-named decls.
+    signed = _signedness_context(signed)
+    if z3 is None or not isinstance(model, z3.ModelRef):
+        raise ValueError("model must be a Z3 model")
+    declarations = model.decls()
+    entries = [(decl, model[decl]) for decl in declarations]
+    entries = [(decl, value) for decl, value in entries if z3.is_bv_value(value)]
+    # Generated display aliases must not take any declaration's real name,
+    # even when that declaration occurs later in the model's traversal.
+    reserved = {str(decl) for decl in declarations}
+    out: dict[str, int] = {}
+    next_suffix: dict[str, int] = {}
+    for decl, val in entries:
+        base_name = str(decl)
+        name = base_name
         if name in out:
-            suffix = 1
-            while f"{name}__{suffix}" in out:
+            suffix = next_suffix.get(base_name, 1)
+            while f"{base_name}__{suffix}" in reserved or f"{base_name}__{suffix}" in out:
                 suffix += 1
-            name = f"{name}__{suffix}"
+            name = f"{base_name}__{suffix}"
+            next_suffix[base_name] = suffix + 1
         out[name] = bv_to_int(
-            val.as_long(), val.size(), _resolve_signedness(name, signed),
+            val.as_long(), val.size(), _resolve_signedness(base_name, signed),
         )
     return out
 
 
 def format_vars(
     model: Any,
-    vars_: Dict[str, Any],
-    signed: Union[bool, Mapping[str, bool]],
+    vars_: Mapping[str, Any],
+    signed: bool | Mapping[str, bool],
     *,
     completion: bool = False,
-) -> Dict[str, int]:
-    """Render the caller's named variables from a Z3 model.
+) -> dict[str, int]:
+    """Render named bitvector expressions from a model without mutating it.
 
-    Unlike ``format_witness``, this walks the caller's variable registry
-    rather than the model's top-level decls — useful when free variables
-    need ``model_completion=True`` to yield a concrete value.
+    Registry keys are output identities and signedness-map keys. Stored text
+    defines name identity; duplicate textual names are rejected. Expressions
+    may be variables, constants, or derived terms in the model's context.
+    Unmapped signedness keys retain unsigned rendering.
 
-    `signed` accepts either a global `bool` (legacy) or a
-    `Mapping[str, bool]` per-decl signedness map. Per-decl is
-    preferred — see `_resolve_signedness`.
-
-    `completion` semantics (default False):
-      * False — `model[var]` returns None for variables Z3 didn't
-        constrain. The function silently skips them. Pre-fix
-        operators reading the resulting witness saw ONLY the
-        constrained vars but had no signal that OTHER vars
-        existed as unconstrained. A `pop_rdi_ret` solver model
-        with 8 free vars and 1 constrained showed only the 1
-        constrained — operators concluded the witness was
-        complete and tried to apply it, missing the 7 free
-        slots.
-      * True — Z3 fills any unconstrained variable with an
-        arbitrary concrete value (model completion). The
-        returned dict is then complete but the values for
-        unconstrained vars are arbitrary (a single satisfying
-        assignment, not "any").
-
-    The default stays False for back-compat. A debug-level log
-    line on each silent skip lets operators investigate
-    suspicious witness gaps without changing the public API.
+    With completion=False, omit expressions that do not evaluate to concrete
+    values. With completion=True, evaluate using a private model copy so
+    arbitrary completion values cannot contaminate the caller's model.
+    Validate the complete registry before any evaluation or completion.
     """
-    out: Dict[str, int] = {}
-    for name, var in vars_.items():
-        if completion:
-            val = model.eval(var, model_completion=True)
-        else:
-            val = model[var]
+    signed = _signedness_context(signed)
+    require_bool(completion, argument="completion")
+    if z3 is None or not isinstance(model, z3.ModelRef):
+        raise ValueError("model must be a Z3 model")
+    if not isinstance(vars_, Mapping):
+        raise ValueError("variable registry must be a mapping")
+    registry = _named_entries(vars_, argument="variable registry")
+    for name, expression in registry:
+        require_bv(expression, argument=f"expression for {name!r}")
+        if expression.ctx != model.ctx:
+            raise ValueError("variable expressions must share the model's Z3 context")
+    evaluation_model = model.translate(model.ctx) if completion else model
+    out: dict[str, int] = {}
+    for name, var in registry:
+        val = evaluation_model.eval(var, model_completion=completion)
         if val is None or not z3.is_bv_value(val):
             # Pre-fix this skip was silent. Log so operators
             # tailing debug see WHICH vars went unconstrained.
-            # `model[var] is None` (the unconstrained case) and
-            # "not a bv_value" (the corrupt-state case) are both
-            # surfaced via the same debug line — both indicate
-            # the witness will be incomplete.
+            # An unevaluated expression has no concrete bitvector value;
+            # do not replace it with an arbitrary completion silently.
             try:
                 from core.logging import get_logger
                 get_logger(__name__).debug(
@@ -172,7 +201,7 @@ def format_vars(
                     "(consider completion=True for model_completion semantics)",
                     name, name, val,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 — observability must never break witness extraction (matches core/logging emitter guards)
                 pass
             continue
         out[name] = bv_to_int(

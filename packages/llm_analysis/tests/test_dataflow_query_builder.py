@@ -1,10 +1,11 @@
 """Tests for the mechanical CodeQL query builder (Tier 1 + Tier 2)."""
 
+import functools
+import pytest
 import sys
 import textwrap
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from packages.llm_analysis import dataflow_query_builder as _dqb
 from packages.llm_analysis.dataflow_query_builder import (
@@ -18,6 +19,30 @@ from packages.llm_analysis.dataflow_query_builder import (
 
 
 # Tier 1 — discovery ---------------------------------------------------------
+
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolated_query_discovery_cache(monkeypatch, tmp_path):
+    """Own discovery memoization and keep incidental host-tool lookup local."""
+    from types import ModuleType
+    from packages.llm_analysis import dataflow_query_builder
+
+    original = dataflow_query_builder.discover_prebuilt_queries
+    private = functools.lru_cache(**original.cache_parameters())(original.__wrapped__)
+    monkeypatch.setattr(dataflow_query_builder, "discover_prebuilt_queries", private)
+    monkeypatch.setitem(globals(), "discover_prebuilt_queries", private)
+    # A real owned root lets the shipped-extra-pack breadth assertions run
+    # without depending on an operator-populated ~/.codeql tree.
+    pack_root = tmp_path / "packs"
+    pack_root.mkdir(parents=True)
+    monkeypatch.setattr(dataflow_query_builder, "_DEFAULT_PACK_ROOT", pack_root)
+    tools = ModuleType("shutil")
+    tools.__dict__.update(vars(dataflow_query_builder.shutil))
+    tools.which = lambda *args, **kwargs: None
+    monkeypatch.setattr(dataflow_query_builder, "shutil", tools)
 
 
 def _write_query(path: Path, *, kind: str, cwe_tag: str, qid: str = "raptor/test") -> None:
@@ -784,6 +809,73 @@ class TestBuildTemplateQuery:
         assert "go" in langs
 
 
+class TestBuildPredicateProbeQuery:
+    """Vacuity-control probe assembly: one standalone selector per
+    LLM-written predicate, sharing the taint template's exact
+    per-language header."""
+
+    def _probe(self, role, **overrides):
+        kwargs = dict(
+            language="python",
+            source_predicate_body="none()",
+            sink_predicate_body="exists(Call c)",
+            probe_role=role,
+        )
+        kwargs.update(overrides)
+        from packages.llm_analysis.dataflow_query_builder import (
+            build_predicate_probe_query,
+        )
+        return build_predicate_probe_query(**kwargs)
+
+    def test_source_probe_selects_issource(self):
+        q = self._probe("source")
+        assert q is not None
+        assert "IrisConfig::isSource(n)" in q
+        assert "none()" in q
+        # Both predicate bodies stay in the module so a body that
+        # compiled inside the flow query compiles identically here.
+        assert "exists(Call c)" in q
+        assert "import python" in q
+
+    def test_sink_probe_selects_issink(self):
+        q = self._probe("sink")
+        assert q is not None
+        assert "IrisConfig::isSink(n)" in q
+
+    def test_probe_is_a_problem_query_without_flow_select(self):
+        q = self._probe("source")
+        assert "@kind problem" in q
+        assert "@kind path-problem" not in q
+        assert "IrisFlow::flowPath" not in q
+        assert "import IrisFlow::PathGraph" not in q
+
+    def test_cpp_probe_keeps_alias_header(self):
+        q = self._probe("source", language="cpp")
+        assert q is not None
+        assert "FlowSources as FS" in q
+
+    def test_unknown_role_returns_none(self):
+        assert self._probe("both") is None
+
+    def test_unknown_language_returns_none(self):
+        assert self._probe("source", language="cobol") is None
+
+    def test_blank_predicate_returns_none(self):
+        assert self._probe("source", source_predicate_body="  ") is None
+        assert self._probe("source", sink_predicate_body="") is None
+
+    def test_every_template_carries_the_shared_flow_tail(self):
+        # Drift guard: the probe builder splits each taint template on
+        # this tail to reuse its header — a template that loses the
+        # tail makes the builder refuse and the vacuity control abstain
+        # (never mis-assemble). Both directions pinned here.
+        for lang, template in _dqb._TAINT_TEMPLATES.items():
+            assert template.count(_dqb._FLOW_QUERY_TAIL) == 1, lang
+            assert template.count("@kind path-problem") == 1, lang
+            q = self._probe("source", language=lang)
+            assert q is not None, lang
+
+
 class TestSchemas:
     def test_template_predicate_schema_has_required_fields(self):
         assert "source_predicate_body" in TEMPLATE_PREDICATE_SCHEMA
@@ -874,3 +966,66 @@ class TestCweInference:
         # "subprocess-shell-true" should hit the command-injection
         # pattern, not be vaguely classified as something generic.
         assert infer_cwe_from_rule_id("subprocess-shell-true") == "CWE-78"
+
+
+class TestNoSqlInferencePrecedence:
+    """"nosql-injection" contains "sql-injection" as a substring — the
+    NoSQL pattern must win in the first-match loop or NoSQL findings
+    get validated through the SQL-injection prebuilt query (wrong
+    lens)."""
+
+    def test_nosql_rule_ids_map_to_cwe_943(self):
+        for rule in (
+            "nosql-injection",
+            "nosql_injection",
+            "python.mongo.nosql_injection",
+            "mongo-query-injection",
+            "nosqli",
+        ):
+            assert infer_cwe_from_rule_id(rule) == "CWE-943", rule
+
+    def test_sql_rule_ids_still_map_to_cwe_89(self):
+        # Two-direction: plain SQL naming keeps its mapping.
+        for rule in ("sql-injection", "sqli", "python.django.sql-injection"):
+            assert infer_cwe_from_rule_id(rule) == "CWE-89", rule
+
+
+class TestMemoryCorruptionInference:
+    """Native-code rule names resolve to the same CWEs the import-time
+    normalizer assigns, so Tier 1 query routing works whichever
+    pipeline leg infers the CWE."""
+
+    def test_memory_corruption_patterns(self):
+        cases = {
+            "heap-buffer-overflow": "CWE-122",
+            "stack-buffer-overflow": "CWE-120",
+            "buffer_overflow": "CWE-120",
+            "format-string": "CWE-134",
+            "integer-overflow": "CWE-190",
+            "double-free": "CWE-415",
+            "use-after-free": "CWE-416",
+            "cpp/uaf": "CWE-416",
+            "null-pointer-dereference": "CWE-476",
+            "null_deref": "CWE-476",
+            "out-of-bounds-write": "CWE-787",
+            "out-of-bounds-read": "CWE-125",
+        }
+        for rule, cwe in cases.items():
+            assert infer_cwe_from_rule_id(rule) == cwe, rule
+
+
+class TestResolvedPackPointersImportGuard:
+    """`_resolved_pack_pointers` must degrade to {} when core.config is
+    not importable (test/script contexts) — the same guard `_pack_roots`
+    already carries. An ImportError escaping crashes Tier 1 discovery
+    despite the docstring's silent-failure promise."""
+
+    def test_core_config_import_failure_returns_empty(self, monkeypatch):
+        import packages.llm_analysis.dataflow_query_builder as dqb
+        # codeql "on PATH" so the import site is actually reached.
+        patch_module_attribute(monkeypatch, dqb, 'shutil', "which",
+                            lambda name: "/usr/bin/codeql")
+        # A None sys.modules entry makes `from core.config import ...`
+        # raise ImportError without touching the real module state.
+        monkeypatch.setitem(sys.modules, "core.config", None)
+        assert dqb._resolved_pack_pointers() == {}

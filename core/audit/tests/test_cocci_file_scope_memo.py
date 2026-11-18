@@ -1,0 +1,446 @@
+"""File-scoped Coccinelle memoization.
+
+spatch scans the whole file regardless of which function is under
+audit, so the orchestrator's coccinelle leg memoizes the FILE sweep
+(one spatch per rule-content x file-content) and derives each
+function's verdict afterwards. Covers: per-function match
+attribution, single-spawn across functions, error results never
+pinned, substrate skips preserved, vocab-rendered rules keyed on the
+rendered bytes with a bounded tempfile lifecycle, and the
+byte-compatible single-function wrapper (including both directions
+of its +50 fallback window). Hermetic — spatch is stubbed at the
+``packages.coccinelle.runner`` boundary.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from core.audit.orchestrator import _run_tool_chain
+from core.audit.sweep import (
+    run_coccinelle_file_sweep,
+    run_coccinelle_sweep,
+    scope_coccinelle_result,
+)
+from core.audit.sweep_memo import SweepMemo
+
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _fresh_caches():
+    from contextlib import ExitStack
+
+    from core.audit import substrate
+    from core.testing.module_state import isolated_module_state
+
+    with ExitStack() as scope:
+        scope.enter_context(isolated_module_state(
+            substrate, {"_LANG_CACHE": {}}, lock=substrate._LANG_LOCK,
+        ))
+        scope.enter_context(isolated_module_state(
+            substrate, {"_TREE_CACHE": {}}, lock=substrate._TREE_LOCK,
+        ))
+        yield
+
+
+class _Cfg:
+    """Minimal OrchestratorConfig stand-in for _run_tool_chain."""
+
+    def __init__(self, target: Path):
+        self.target_path = target
+        self.out_dir = None
+        self.codeql_db_path = None
+        self.project_sinks = None
+        self.sweep_memo = SweepMemo()
+
+
+class _Match:
+    def __init__(self, line: int):
+        self.line = line
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"line": self.line, "file": "src/a.c"}
+
+
+def _stub_runner(
+    monkeypatch,
+    *,
+    match_lines: list[int] | None = None,
+    returncode: int = 0,
+    errors: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Fake ``packages.coccinelle.runner``; returns the call log."""
+    import packages.coccinelle.runner as cocci_runner
+
+    calls: list[dict[str, Any]] = []
+
+    def _run_rule(target, rule, **kw):
+        rule_text = ""
+        try:
+            rule_text = Path(rule).read_text()
+        except OSError:
+            pass
+        calls.append({
+            "target": str(target), "rule": str(rule),
+            "rule_text": rule_text,
+        })
+        return SimpleNamespace(
+            matches=[_Match(n) for n in (match_lines or [])],
+            errors=list(errors or []),
+            returncode=returncode,
+        )
+
+    monkeypatch.setattr(cocci_runner, "is_available", lambda: True)
+    monkeypatch.setattr(cocci_runner, "run_rule", _run_rule)
+    return calls
+
+
+def _write_tree(tmp_path: Path) -> Path:
+    (tmp_path / "src").mkdir(exist_ok=True)
+    body = "int f(void){ return 0; }\n" * 120
+    (tmp_path / "src" / "a.c").write_text(body)
+    (tmp_path / "src" / "index.php").write_text(
+        "<?php function f() { return 0; }\n",
+    )
+    rule = tmp_path / "rules" / "check.cocci"
+    rule.parent.mkdir(exist_ok=True)
+    rule.write_text("@@ @@\n")
+    return rule
+
+
+def _dispatch(
+    cfg: _Cfg,
+    rule: Path,
+    *,
+    function_name: str,
+    line_start: int,
+    file_path: str = "src/a.c",
+    domain_vocab: Any = None,
+    skipped: set | None = None,
+) -> list[str]:
+    return _run_tool_chain(
+        [{"type": "coccinelle", "config": {"rule": str(rule)}}],
+        config=cfg,
+        file_path=file_path,
+        function_name=function_name,
+        source="",
+        hypothesis="use after free of `p`",
+        line_start=line_start,
+        domain_vocab=domain_vocab,
+        skipped_types=skipped,
+    )
+
+
+class TestFileScopedMemoAttribution:
+    def test_match_confirms_the_owning_function_only(
+        self, tmp_path, monkeypatch,
+    ):
+        """One spatch run; the match at line 2 confirms the function
+        that spans it and NOT a later function in the same file."""
+        rule = _write_tree(tmp_path)
+        calls = _stub_runner(monkeypatch, match_lines=[2])
+        cfg = _Cfg(tmp_path)
+
+        confirmed_a = _dispatch(cfg, rule, function_name="a", line_start=1)
+        confirmed_b = _dispatch(cfg, rule, function_name="b", line_start=100)
+
+        assert confirmed_a == ["coccinelle:check"]
+        assert confirmed_b == []
+        assert len(calls) == 1, (
+            "the second function in the same file must replay the "
+            "memoized file sweep, not spawn a second spatch"
+        )
+
+    def test_error_results_never_pinned(self, tmp_path, monkeypatch):
+        rule = _write_tree(tmp_path)
+        calls = _stub_runner(monkeypatch, returncode=2)
+        cfg = _Cfg(tmp_path)
+
+        _dispatch(cfg, rule, function_name="a", line_start=1)
+        _dispatch(cfg, rule, function_name="b", line_start=100)
+
+        assert len(calls) == 2, (
+            "a failed spatch run must be retried on the next dispatch"
+        )
+
+    def test_substrate_skip_preserved_without_spawning(
+        self, tmp_path, monkeypatch,
+    ):
+        rule = _write_tree(tmp_path)
+        calls = _stub_runner(monkeypatch, match_lines=[2])
+        cfg = _Cfg(tmp_path)
+
+        skipped: set = set()
+        confirmed = _dispatch(
+            cfg, rule, function_name="f", line_start=1,
+            file_path="src/index.php", skipped=skipped,
+        )
+        assert confirmed == []
+        assert "coccinelle" in skipped
+        assert not calls, "spatch must not spawn on a PHP subject"
+
+
+class TestVocabRenderedMemo:
+    # The @vocab marker sits immediately before the construct it
+    # extends (an inline alternation here) — renderer contract.
+    _VOCAB_RULE = (
+        "@r@ expression E; @@\n"
+        "// @vocab: deallocators\n"
+        "* \\(kfree\\|free\\)(E)\n"
+    )
+
+    def _vocab(self, *names: str) -> SimpleNamespace:
+        return SimpleNamespace(deallocators=frozenset(names))
+
+    def _rule(self, tmp_path: Path) -> Path:
+        rule = tmp_path / "rules" / "dealloc.cocci"
+        rule.write_text(self._VOCAB_RULE)
+        return rule
+
+    def test_same_vocab_hits_the_memo(self, tmp_path, monkeypatch):
+        _write_tree(tmp_path)
+        rule = self._rule(tmp_path)
+        calls = _stub_runner(monkeypatch, match_lines=[2])
+        cfg = _Cfg(tmp_path)
+        vocab = self._vocab("my_free")
+
+        _dispatch(cfg, rule, function_name="a", line_start=1,
+                  domain_vocab=vocab)
+        _dispatch(cfg, rule, function_name="b", line_start=100,
+                  domain_vocab=vocab)
+
+        assert len(calls) == 1
+        # The RENDERED rule (spliced vocabulary) is what ran.
+        assert "my_free" in calls[0]["rule_text"]
+
+    def test_vocab_change_is_a_miss(self, tmp_path, monkeypatch):
+        _write_tree(tmp_path)
+        rule = self._rule(tmp_path)
+        calls = _stub_runner(monkeypatch, match_lines=[2])
+        cfg = _Cfg(tmp_path)
+
+        _dispatch(cfg, rule, function_name="a", line_start=1,
+                  domain_vocab=self._vocab("my_free"))
+        _dispatch(cfg, rule, function_name="a", line_start=1,
+                  domain_vocab=self._vocab("other_free"))
+
+        assert len(calls) == 2
+        assert "other_free" in calls[1]["rule_text"]
+
+    def test_rendered_tempfile_does_not_outlive_the_step(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_tree(tmp_path)
+        rule = self._rule(tmp_path)
+        calls = _stub_runner(monkeypatch, match_lines=[2])
+        cfg = _Cfg(tmp_path)
+
+        _dispatch(cfg, rule, function_name="a", line_start=1,
+                  domain_vocab=self._vocab("my_free"))
+
+        rendered = Path(calls[0]["rule"])
+        assert rendered != rule, "a rendered tempfile must have run"
+        assert not rendered.exists(), (
+            "the rendered tempfile must be unlinked when the step ends"
+        )
+
+    def test_memo_hit_never_dereferences_the_dead_tempfile(
+        self, tmp_path, monkeypatch,
+    ):
+        """The memoized result's rule_id is the SOURCE rule path, so
+        replay works after the rendered tempfile is gone."""
+        _write_tree(tmp_path)
+        rule = self._rule(tmp_path)
+        calls = _stub_runner(monkeypatch, match_lines=[2])
+        cfg = _Cfg(tmp_path)
+        vocab = self._vocab("my_free")
+
+        _dispatch(cfg, rule, function_name="a", line_start=1,
+                  domain_vocab=vocab)
+        assert not Path(calls[0]["rule"]).exists()
+        confirmed = _dispatch(
+            cfg, rule, function_name="a", line_start=1,
+            domain_vocab=vocab,
+        )
+        assert confirmed == ["coccinelle:dealloc"]
+        assert len(calls) == 1
+
+
+class TestSingleFunctionWrapper:
+    """run_coccinelle_sweep keeps its historical semantics."""
+
+    def test_in_range_match_confirms(self, tmp_path, monkeypatch):
+        rule = _write_tree(tmp_path)
+        _stub_runner(monkeypatch, match_lines=[2])
+        res = run_coccinelle_sweep(
+            target_path=tmp_path, file_path="src/a.c",
+            function_name="f", cocci_rule=str(rule),
+            line_start=1, line_end=10,
+        )
+        assert res.outcome == "confirmed"
+        assert res.function_name == "f"
+        assert res.matches == [{"line": 2, "file": "src/a.c"}]
+        assert res.rule_id == str(rule)
+
+    def test_out_of_range_match_refutes(self, tmp_path, monkeypatch):
+        rule = _write_tree(tmp_path)
+        _stub_runner(monkeypatch, match_lines=[80])
+        res = run_coccinelle_sweep(
+            target_path=tmp_path, file_path="src/a.c",
+            function_name="f", cocci_rule=str(rule),
+            line_start=1, line_end=10,
+        )
+        assert res.outcome == "refuted"
+        assert res.matches == []
+
+    def test_fallback_window_boundary_both_directions(
+        self, tmp_path, monkeypatch,
+    ):
+        """Without line_end, the +50 window binds exactly: a match AT
+        line_start+50 confirms; one line past it remains inconclusive."""
+        rule = _write_tree(tmp_path)
+        _stub_runner(monkeypatch, match_lines=[51])
+        inside = run_coccinelle_sweep(
+            target_path=tmp_path, file_path="src/a.c",
+            function_name="f", cocci_rule=str(rule), line_start=1,
+        )
+        assert inside.outcome == "confirmed"
+
+        _stub_runner(monkeypatch, match_lines=[52])
+        outside = run_coccinelle_sweep(
+            target_path=tmp_path, file_path="src/a.c",
+            function_name="f", cocci_rule=str(rule), line_start=1,
+        )
+        assert outside.outcome == "inconclusive"
+        assert outside.matches == []
+        assert "end is unknown" in outside.details["reason"]
+
+    def test_containment_escape_keeps_empty_function_name(
+        self, tmp_path, monkeypatch,
+    ):
+        _stub_runner(monkeypatch)
+        res = run_coccinelle_sweep(
+            target_path=tmp_path, file_path="../../etc/shadow",
+            function_name="foo", cocci_rule="rule.cocci",
+        )
+        assert res.outcome == "error"
+        assert res.function_name == ""
+        assert any("escapes" in e for e in res.errors)
+
+    def test_refutation_carries_substrate_receipt(
+        self, tmp_path, monkeypatch,
+    ):
+        rule = _write_tree(tmp_path)
+        _stub_runner(monkeypatch, match_lines=[])
+        res = run_coccinelle_sweep(
+            target_path=tmp_path, file_path="src/a.c",
+            function_name="f", cocci_rule=str(rule), line_start=1,
+        )
+        assert res.outcome == "refuted"
+        assert res.details["substrate"]["covered"] is True
+
+
+class TestScoperIsolation:
+    def test_scoping_never_mutates_the_file_result(self, tmp_path):
+        from core.audit.sweep import SweepResult
+
+        file_result = SweepResult(
+            tool="coccinelle", file_path="src/a.c", function_name="",
+            outcome="confirmed", rule_id="r.cocci",
+            matches=[{"line": 2}, {"line": 80}],
+        )
+        scoped = scope_coccinelle_result(
+            file_result, target_path=tmp_path, function_name="f",
+            line_start=1, line_end=10,
+        )
+        assert scoped.matches == [{"line": 2}]
+        scoped.matches.append({"line": 999})
+        assert file_result.matches == [{"line": 2}, {"line": 80}]
+        assert file_result.function_name == ""
+
+    def test_file_sweep_is_file_scoped(self, tmp_path, monkeypatch):
+        rule = _write_tree(tmp_path)
+        _stub_runner(monkeypatch, match_lines=[80])
+        res = run_coccinelle_file_sweep(
+            target_path=tmp_path, file_path="src/a.c",
+            cocci_rule=str(rule),
+        )
+        assert res.outcome == "confirmed"
+        assert res.function_name == ""
+        assert res.matches == [{"line": 80, "file": "src/a.c"}]
+
+
+def test_vocab_memo_hits_create_no_additional_rule_files(tmp_path, monkeypatch):
+    from engine.coccinelle import vocab_renderer as renderer
+
+    _write_tree(tmp_path)
+    case = TestVocabRenderedMemo()
+    rule = case._rule(tmp_path)
+    calls = _stub_runner(monkeypatch, match_lines=[2])
+    cfg = _Cfg(tmp_path)
+    vocab = case._vocab("custom_free")
+    _dispatch(cfg, rule, function_name="first", line_start=1, domain_vocab=vocab)
+
+    def forbidden(*a, **kw):
+        raise AssertionError("memo hit must not materialize a rendered rule")
+
+    patch_module_attribute(monkeypatch, renderer, 'tempfile', "NamedTemporaryFile", forbidden)
+    assert _dispatch(cfg, rule, function_name="first", line_start=1, domain_vocab=vocab)
+    assert _dispatch(cfg, rule, function_name="later", line_start=100, domain_vocab=vocab) == []
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_cold_materialization_failure_keeps_unmemoized_render_retry(tmp_path, monkeypatch, failures):
+    from engine.coccinelle import vocab_renderer as renderer
+
+    _write_tree(tmp_path)
+    case = TestVocabRenderedMemo()
+    rule = case._rule(tmp_path)
+    calls = _stub_runner(monkeypatch, match_lines=[2])
+    cfg = _Cfg(tmp_path)
+    create = renderer.tempfile.NamedTemporaryFile
+    attempts = []
+
+    def fail_first(*a, **kw):
+        attempts.append(1)
+        if len(attempts) <= failures:
+            raise OSError("temporary write failure")
+        return create(*a, **kw)
+
+    patch_module_attribute(monkeypatch, renderer, 'tempfile', "NamedTemporaryFile", fail_first)
+    assert _dispatch(cfg, rule, function_name="f", line_start=1, domain_vocab=case._vocab("custom_free"))
+    assert len(attempts) == 2
+    assert ("custom_free" in calls[0]["rule_text"]) == (failures == 1)
+    assert not cfg.sweep_memo._entries
+
+
+def test_vocab_checkpoint_replay_needs_no_temporary_rule(tmp_path, monkeypatch):
+    from core.audit.sweep_checkpoint import reset_checkpoint_registry
+    from engine.coccinelle import vocab_renderer as renderer
+
+    _write_tree(tmp_path)
+    case = TestVocabRenderedMemo()
+    rule = case._rule(tmp_path)
+    calls = _stub_runner(monkeypatch, match_lines=[2])
+    cfg = _Cfg(tmp_path)
+    cfg.out_dir = tmp_path / "run"
+    cfg.out_dir.mkdir()
+    vocab = case._vocab("custom_free")
+    assert _dispatch(cfg, rule, function_name="f", line_start=1, domain_vocab=vocab)
+    reset_checkpoint_registry()
+    resumed = _Cfg(tmp_path)
+    resumed.out_dir = cfg.out_dir
+
+    def forbidden(*a, **kw):
+        raise AssertionError("checkpoint replay must not materialize a rule")
+
+    patch_module_attribute(monkeypatch, renderer, 'tempfile', "NamedTemporaryFile", forbidden)
+    assert _dispatch(resumed, rule, function_name="f", line_start=1, domain_vocab=vocab)
+    assert len(calls) == 1

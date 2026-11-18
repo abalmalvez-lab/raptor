@@ -1,0 +1,692 @@
+"""Compute the minimal Python file set for a CodeQL PR scan.
+
+Parses every .py file under the SCAN_ROOTS code roots (core/,
+packages/, engine/) with the stdlib ast module, builds a reverse
+import graph, then walks outward from the changed-file set to collect
+everything that transitively depends on a change.  Emits a dynamic CodeQL config with ``paths:`` restricted
+to that closure.
+
+Falls back to full scan when:
+  - the closure exceeds FULL_SCAN_THRESHOLD of the total file count
+  - import parsing fails on enough files to make the graph unreliable
+  - no changed-file list is available (schedule / workflow_dispatch)
+
+The import-graph half of this module (build_graph, discover_py_files,
+transitive_dependents, init_imports) is the live library surface —
+test_scope.py and test_impact.py drive CI dispatch with it. The
+scoped-config emitter below (main()) has NO CI caller today:
+codeql.yml gates per-language matrix entries via compute_filters.py
+instead of consuming a scoped config. It remains usable standalone:
+
+    python3 .github/scripts/codeql_scope.py \
+        --changed-files /tmp/changed_files.txt \
+        --base-config  .github/codeql/codeql-config.yml \
+        --out          /tmp/codeql-scoped-config.yml
+
+Exit code 0 always.  Writes the config and prints a summary.
+Sets GITHUB_OUTPUT ``codeql_scoped_config`` to the output path
+and ``codeql_scope_mode`` to ``scoped`` or ``full``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import os
+import sys
+from collections import defaultdict, deque
+from collections.abc import Callable
+from pathlib import Path
+
+
+# Top-level code roots the import graph covers. engine/ is a code
+# root like the other two — its rule engines carry their own
+# precision/regression suites (semgrep ReDoS gate, per-rule coccinelle
+# tests, vocab renderer) which import through ``engine.`` dotted
+# paths; leaving it out of the graph made every engine-only PR
+# dispatch zero test tiers.
+SCAN_ROOTS = ("core", "packages", "engine")
+
+FULL_SCAN_THRESHOLD = 0.60
+
+PARSE_FAILURE_THRESHOLD = 0.05
+
+def is_root_module_path(path: str) -> bool:
+    """True for a repo-root .py file (raptor.py, raptor_agentic.py,
+    conftest.py, ...).
+
+    Pattern-based on purpose, never a name list and never a disk
+    check: the graph-coverage decision must hold for files a PR just
+    DELETED (a glob cannot see them), and a hand-maintained entry-
+    module list silently dropped new entry points before (root
+    modules outside it dispatched zero test tiers whether edited or
+    deleted).
+    """
+    return path.endswith(".py") and "/" not in path and path != ".py"
+
+
+def discover_root_modules(repo: Path) -> list[Path]:
+    """Every repo-root .py file, derived from the tree."""
+    return sorted(
+        p.relative_to(repo) for p in repo.glob("*.py") if p.is_file()
+    )
+
+
+def discover_py_files(
+    repo: Path, extra_roots: tuple[str, ...] = ()
+) -> list[Path]:
+    """Walk SCAN_ROOTS (+ extra_roots) and collect every .py file,
+    plus every repo-root .py entry module."""
+    files: list[Path] = []
+    for root in (*SCAN_ROOTS, *extra_roots):
+        root_path = repo / root
+        if not root_path.is_dir():
+            continue
+        files.extend(p.relative_to(repo) for p in root_path.rglob("*.py"))
+    files.extend(discover_root_modules(repo))
+    return files
+
+
+def file_to_module(path: Path) -> str | None:
+    """Convert a file path to a dotted module name.
+
+    core/llm/client.py        -> core.llm.client
+    core/llm/__init__.py      -> core.llm
+    packages/sca/findings.py  -> packages.sca.findings
+    raptor.py                 -> raptor
+    """
+    if not path.name:
+        return None
+    parts = list(path.with_suffix("").parts)
+    if not parts:
+        return None
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts:
+        return None
+    return ".".join(parts)
+
+
+def module_to_files(module: str, all_modules: dict[str, Path]) -> list[Path]:
+    """Resolve a module name to the file(s) it could refer to.
+
+    ``import core.llm`` might mean core/llm/__init__.py or
+    core/llm.py.  ``from core.llm import client`` means
+    core/llm/client.py.  We return all matches.
+    """
+    hits: list[Path] = []
+    if module in all_modules:
+        hits.append(all_modules[module])
+    # A dotted import ``from X.Y import Z`` might mean X/Y/Z.py
+    # (submodule) or an attribute of X/Y/__init__.py (already covered
+    # by the parent module being in all_modules).  We don't need to
+    # distinguish — both are valid edges.
+    return hits
+
+
+def _get_str_literal(node: ast.expr) -> str | None:
+    """Extract a plain string from an AST node, or None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _extract_dynamic_imports(nodes: list[ast.AST]) -> list[str]:
+    """Find importlib.import_module("x") and __import__("x") calls.
+
+    Handles both ``importlib.import_module("x")`` (attribute form)
+    and ``import_module("x")`` after ``from importlib import
+    import_module`` (bare-name form).
+    """
+    bare_names: set[str] = set()
+    for node in nodes:
+        if (isinstance(node, ast.ImportFrom)
+                and node.module == "importlib"
+                and node.level == 0):
+            for alias in node.names:
+                if alias.name == "import_module":
+                    bare_names.add(alias.asname or alias.name)
+
+    modules: list[str] = []
+    for node in nodes:
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            # importlib.import_module("mod.name")
+            if (func.attr == "import_module"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "importlib"):
+                val = _get_str_literal(node.args[0])
+                if val:
+                    modules.append(val)
+        elif isinstance(func, ast.Name):
+            if func.id in bare_names or func.id == "__import__":
+                val = _get_str_literal(node.args[0])
+                if val:
+                    modules.append(val)
+    return modules
+
+
+def _extract_lazy_export_dicts(tree: ast.Module) -> list[str]:
+    """Find PEP 562 lazy-export dicts assigned to conventional names.
+
+    Only matches module-level ``Assign`` where the target name
+    contains ``EXPORT`` or ``LAZY`` (e.g. ``_LAZY_EXPORTS``).
+    """
+    modules: list[str] = []
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name)
+            and ("EXPORT" in t.id or "LAZY" in t.id)
+            for t in node.targets
+        ):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            continue
+        for val in node.value.values:
+            if not isinstance(val, ast.Tuple) or len(val.elts) < 1:
+                continue
+            mod = _get_str_literal(val.elts[0])
+            if mod:
+                modules.append(mod)
+    return modules
+
+
+# Derived from SCAN_ROOTS so a widened root set widens the
+# string-constant module extraction with it (the core|packages
+# hardcoding would silently drop e.g. mock.patch("engine.x.y") edges).
+_MODULE_PATH_RE = __import__("re").compile(
+    r"^(?:" + "|".join(SCAN_ROOTS) + r")\.[a-z_][a-z0-9_.]*[a-z0-9_]$"
+)
+
+
+def _extract_parametrize_modules(nodes: list[ast.AST]) -> list[str]:
+    """Find project-internal module paths in string constants.
+
+    Catches the pattern where a test parametrizes over module path
+    strings and calls ``importlib.import_module(param)`` in the body,
+    or uses ``mock.patch("core.some.module.func")`` — the variable-arg
+    call is invisible to ``_extract_dynamic_imports``, but the string
+    literals are extractable.
+
+    Only matches strings that look like valid dotted module paths
+    (no spaces, colons, format specifiers, etc.).
+    """
+    modules: list[str] = []
+    for node in nodes:
+        if not isinstance(node, ast.Constant):
+            continue
+        if not isinstance(node.value, str):
+            continue
+        val = node.value
+        if _MODULE_PATH_RE.match(val):
+            modules.append(val)
+    return modules
+
+
+def extract_imports(
+    path: Path,
+    repo: Path,
+    root_modules: frozenset[str] | None = None,
+    literal_references: dict[str, set[Path]] | None = None,
+    *,
+    source_tree: ast.Module | None = None,
+    division_references: list[ast.BinOp] | None = None,
+) -> list[str] | None:
+    """Parse a .py file and return the dotted module names it imports.
+
+    Covers static imports, importlib.import_module() /
+    __import__() with string literals, PEP 562 lazy-export
+    dicts, and project-internal module paths in string constants
+    (e.g. ``@pytest.mark.parametrize`` arguments).
+
+    ``root_modules`` is the set of repo-root module names (raptor,
+    raptor_agentic, ...) whose imports must be kept alongside the
+    SCAN_ROOTS ones; when None it is derived from the tree. Callers
+    looping over many files (``build_graph``) pass it once. ``source_tree``
+    lets a caller reuse an already parsed tree without reading/parsing twice.
+    An optional ``division_references`` list receives path-division nodes
+    during the same read-only walk, avoiding a separate consumer traversal.
+    """
+    if root_modules is None:
+        root_modules = frozenset(
+            p.stem for p in discover_root_modules(repo)
+        )
+    try:
+        if source_tree is None:
+            source = (repo / path).read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source, filename=str(path))
+        else:
+            tree = source_tree
+    except (SyntaxError, ValueError):
+        return None
+    except OSError:
+        # A discovered path that cannot be read — in practice a
+        # dangling .py symlink: rglob lists it, read_text raises
+        # FileNotFoundError. Uncaught it crashed the whole scope job
+        # (fail-closed but misattributed, on every PR, whatever it
+        # touched). An unreadable file has no extractable imports, so
+        # report it as a parse failure like a syntactically broken
+        # one: callers count it against PARSE_FAILURE_THRESHOLD, and
+        # a CHANGED unreadable path is caught by
+        # missing_graph_covered_py (not a regular file) and fails
+        # toward full dispatch.
+        return None
+
+    modules: list[str] = []
+    own_package = ".".join(path.parts[:-1]) if len(path.parts) > 1 else ""
+
+    # Preserve breadth-first order within each kind. Names have only inert
+    # context children, and parsed constants have no AST children. Keep the
+    # constants themselves for module paths and literal script references;
+    # walk every other subtree, including expressions and nested scopes.
+    declarations, calls, constants = [], [], []
+    pending = deque([tree])
+    while pending:
+        node = pending.popleft()
+        if isinstance(node, ast.Name):
+            continue
+        if isinstance(node, ast.Constant):
+            constants.append(node)
+            if (literal_references is not None and isinstance(node.value, str)
+                    and node.value in literal_references):
+                literal_references[node.value].add(path)
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            declarations.append(node)
+        elif isinstance(node, ast.Call):
+            calls.append(node)
+        elif (division_references is not None and isinstance(node, ast.BinOp)
+              and isinstance(node.op, ast.Div)):
+            division_references.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+    for node in declarations:
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0 or node.module is None:
+                # Relative import — resolve against the file's package.
+                # level=1 means current package, level=2 means parent,
+                # etc. The level walk applies whether or not a module
+                # is named: `from .. import client` arrives with
+                # module=None and level=2, and resolving it against
+                # the CURRENT package (instead of the parent) minted
+                # wrong edges — under-scoped CodeQL PR scans and test
+                # dispatch missed genuinely-affected files.
+                pkg_parts = own_package.split(".") if own_package else []
+                up = node.level - 1
+                if up > 0 and len(pkg_parts) >= up:
+                    pkg_parts = pkg_parts[:-up]
+                base = ".".join([*pkg_parts, node.module]) if node.module else ".".join(pkg_parts)
+            else:
+                base = node.module
+
+            if base:
+                modules.append(base)
+                # ``from X import Y`` — Y might be a submodule.
+                if node.names:
+                    modules.extend(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
+
+    # Dynamic imports: importlib.import_module("x") / __import__("x").
+    # Alias discovery must finish before matching calls, including when
+    # the alias import occurs later in the original traversal.
+    modules.extend(_extract_dynamic_imports(declarations + calls))
+
+    # PEP 562 lazy-export dicts in __init__.py files.
+    if path.name == "__init__.py":
+        modules.extend(_extract_lazy_export_dicts(tree))
+
+    # Project-internal module paths in string constants (parametrize etc.).
+    modules.extend(_extract_parametrize_modules(constants))
+
+    # Only keep imports that point into our scan roots or at a
+    # repo-root entry module. Filtering to SCAN_ROOTS alone erased
+    # every ``import raptor_agentic`` edge: the root modules sat in
+    # the graph as NODES but could never acquire reverse-dependents,
+    # so a PR editing only a root entry module dispatched zero test
+    # tiers while the tests importing it silently went unrun.
+    prefixes = tuple(root + "." for root in SCAN_ROOTS)
+    return [
+        m for m in modules
+        if m in SCAN_ROOTS or m.startswith(prefixes)
+        or m in root_modules
+    ]
+
+
+def build_graph(
+    py_files: list[Path], repo: Path,
+    *, literal_references: dict[str, set[Path]] | None = None,
+    on_parsed: Callable[[Path, str, ast.Module], None] | None = None,
+    on_divisions: Callable[[Path, str, list[ast.BinOp]], None] | None = None,
+) -> tuple[dict[Path, set[Path]], int]:
+    """Build a reverse dependency graph: file → files that depend on it.
+
+    Returns (reverse_graph, parse_failure_count). An optional read-only
+    ``on_parsed`` consumer runs once per successfully parsed file, before
+    import extraction, so another census can reuse the source and tree
+    without retaining the repository's entire AST forest.
+    ``on_divisions`` receives the same source and its read-only division
+    nodes after import extraction, in breadth-first order. Both consumers
+    run within one file's lifetime; neither runs for a failed parse.
+    """
+    # Module name → file path mapping.
+    mod_to_file: dict[str, Path] = {}
+    for f in py_files:
+        mod = file_to_module(f)
+        if mod:
+            mod_to_file[mod] = f
+
+    forward: dict[Path, set[Path]] = defaultdict(set)
+    parse_failures = 0
+
+    root_modules = frozenset(p.stem for p in discover_root_modules(repo))
+    for f in py_files:
+        if on_parsed is None and on_divisions is None:
+            imports = extract_imports(f, repo, root_modules, literal_references)
+        else:
+            try:
+                source = (repo / f).read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source, filename=str(f))
+            except (OSError, SyntaxError, ValueError):
+                imports = None
+            else:
+                if on_parsed is not None:
+                    on_parsed(f, source, tree)
+                divisions = [] if on_divisions is not None else None
+                imports = extract_imports(
+                    f, repo, root_modules, literal_references, source_tree=tree,
+                    division_references=divisions,
+                )
+                if on_divisions is not None:
+                    on_divisions(f, source, divisions)
+        if imports is None:
+            parse_failures += 1
+            continue
+        for imp in imports:
+            targets = module_to_files(imp, mod_to_file)
+            for t in targets:
+                if t != f:
+                    forward[f].add(t)
+
+    # Invert: for each target, who imports it?
+    reverse: dict[Path, set[Path]] = defaultdict(set)
+    for src, deps in forward.items():
+        for dep in deps:
+            reverse[dep].add(src)
+
+    return dict(reverse), parse_failures
+
+
+def missing_graph_covered_py(
+    changed_py: set[Path], repo: Path
+) -> list[str]:
+    """Changed .py paths the import graph is responsible for but which
+    are absent from disk — deleted files, or the pre-rename path of a
+    renamed file.
+
+    The reverse graph resolves edges only through files present on
+    disk (``discover_py_files`` → ``mod_to_file``), so a deleted or
+    renamed-away module has no key in it: the importers the change
+    just broke silently drop out of the closure. Callers must treat
+    any hit as "cannot map" and fail toward a FULL scan / dispatch,
+    never toward zero.
+
+    Only graph-covered paths count (under ``SCAN_ROOTS`` or a
+    repo-root entry module — ``is_root_module_path``, which is
+    pattern-based exactly so a DELETED root module still counts);
+    a deleted .py elsewhere was never in the graph, so its absence
+    proves nothing about lost edges.
+    """
+    missing: list[str] = []
+    for f in sorted(changed_py):
+        s = str(f)
+        if not s.endswith(".py"):
+            continue
+        covered = (
+            any(s.startswith(r + "/") for r in SCAN_ROOTS)
+            or is_root_module_path(s)
+        )
+        if covered and not (repo / f).is_file():
+            missing.append(s)
+    return missing
+
+
+def transitive_dependents(
+    changed: set[Path], reverse: dict[Path, set[Path]]
+) -> set[Path]:
+    """BFS outward from changed files through the reverse graph."""
+    closure = set(changed)
+    frontier = list(changed)
+    while frontier:
+        current = frontier.pop()
+        for dep in reverse.get(current, []):
+            if dep not in closure:
+                closure.add(dep)
+                frontier.append(dep)
+    return closure
+
+
+def init_imports(
+    changed: set[Path], all_files: list[Path]
+) -> set[Path]:
+    """If any __init__.py changed, pull in the whole package.
+
+    A change to __init__.py can affect every sibling via implicit
+    re-exports, namespace changes, or __all__ modifications.
+    """
+    extra: set[Path] = set()
+    for f in changed:
+        if f.name == "__init__.py":
+            pkg_dir = f.parent
+            for af in all_files:
+                if af != f and str(af).startswith(str(pkg_dir) + "/"):
+                    extra.add(af)
+    return extra
+
+
+def load_base_config(path: Path) -> dict:
+    """Load the base CodeQL config YAML (simple enough to avoid PyYAML)."""
+    # The config is simple key-value + list YAML.  Parse just what we
+    # need: name and paths-ignore.
+    config: dict = {"name": "RAPTOR CodeQL config", "paths-ignore": []}
+    if not path.is_file():
+        return config
+    text = path.read_text(encoding="utf-8")
+    current_list_key: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            continue
+        if stripped.startswith("- ") and current_list_key:
+            val = stripped[2:].strip().strip("'\"")
+            config.setdefault(current_list_key, []).append(val)
+        elif ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if val:
+                config[key] = val
+                current_list_key = None
+            else:
+                current_list_key = key
+    return config
+
+
+def write_scoped_config(
+    out_path: Path,
+    base_config: dict,
+    scoped_paths: list[str] | None,
+) -> None:
+    """Write a CodeQL config YAML.
+
+    If scoped_paths is None, writes the base config unchanged (full scan).
+    Otherwise, adds a ``paths:`` directive restricting extraction.
+    """
+    lines = [f"name: {base_config.get('name', 'RAPTOR CodeQL config')}", ""]
+
+    def _yaml_val(v: str) -> str:
+        return f"'{v}'" if "*" in v else v
+
+    if scoped_paths is not None:
+        # CodeQL's Python extractor (walk_dir in
+        # exclude_pip_21_3_build_dir_options) treats each paths: entry as a
+        # directory to walk — file-level paths crash with NotADirectoryError.
+        # Deduplicate to parent directories instead.
+        # str(Path("f.py").parent) is already "." for root-level files.
+        dirs = sorted({str(Path(p).parent) for p in scoped_paths})
+        lines.append("paths:")
+        lines.extend(f"  - {_yaml_val(d)}" for d in dirs)
+        lines.append("")
+
+    pi = base_config.get("paths-ignore", [])
+    if pi:
+        lines.append("paths-ignore:")
+        lines.extend(f"  - {_yaml_val(p)}" for p in pi)
+        lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--changed-files",
+        help="File listing changed paths, one per line",
+    )
+    parser.add_argument(
+        "--base-config",
+        default=".github/codeql/codeql-config.yml",
+        help="Base CodeQL config to extend",
+    )
+    parser.add_argument(
+        "--out",
+        default="/tmp/codeql-scoped-config.yml",
+        help="Output path for the scoped config",
+    )
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Repository root",
+    )
+    args = parser.parse_args()
+
+    repo = Path(args.repo).resolve()
+    out_path = Path(args.out)
+    base_config = load_base_config(repo / args.base_config)
+    gh_output = os.environ.get("GITHUB_OUTPUT")
+
+    def set_output(key: str, val: str) -> None:
+        if gh_output:
+            with open(gh_output, "a", encoding="utf-8") as fh:
+                fh.write(f"{key}={val}\n")
+
+    # Load changed files.
+    changed_py: set[Path] = set()
+    full_reason: str | None = None
+
+    if not args.changed_files:
+        full_reason = "no changed-file list provided"
+    else:
+        cf_path = Path(args.changed_files)
+        if not cf_path.is_file():
+            full_reason = f"changed-file list not found: {cf_path}"
+        else:
+            all_changed = [
+                line.strip()
+                for line in cf_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if not all_changed:
+                full_reason = "changed-file list is empty"
+            else:
+                changed_py = {
+                    Path(f) for f in all_changed if f.endswith(".py")
+                }
+                # If workflow or config files changed, full scan.
+                ci_triggers = {
+                    ".github/workflows/codeql.yml",
+                    ".github/codeql/codeql-config.yml",
+                    "pyproject.toml",
+                }
+                if any(f in ci_triggers for f in all_changed):
+                    full_reason = "CI/config file changed"
+                elif any(
+                    f.startswith("requirements") and f.endswith(".txt")
+                    for f in all_changed
+                ):
+                    full_reason = "requirements file changed"
+                elif not changed_py:
+                    full_reason = "no Python files in changeset"
+                else:
+                    missing = missing_graph_covered_py(changed_py, repo)
+                    if missing:
+                        # Deleted / renamed-away modules have no key in
+                        # the reverse graph — their broken importers
+                        # cannot be resolved, so scan everything.
+                        full_reason = (
+                            "changed Python file(s) missing from disk "
+                            f"(deleted or renamed): {', '.join(missing)}"
+                        )
+
+    # Discover all .py files and build the graph.
+    all_py = discover_py_files(repo)
+    total = len(all_py)
+
+    if full_reason:
+        print(f"::notice::CodeQL Python scope: full scan ({full_reason})")
+        write_scoped_config(out_path, base_config, None)
+        set_output("codeql_scoped_config", str(out_path))
+        set_output("codeql_scope_mode", "full")
+        return 0
+
+    print(f"Building import graph for {total} Python files...")
+    reverse_graph, parse_failures = build_graph(all_py, repo)
+
+    if total > 0 and parse_failures / total > PARSE_FAILURE_THRESHOLD:
+        full_reason = (
+            f"too many parse failures ({parse_failures}/{total} = "
+            f"{parse_failures / total:.0%} > {PARSE_FAILURE_THRESHOLD:.0%})"
+        )
+        print(f"Full scan: {full_reason}")
+        write_scoped_config(out_path, base_config, None)
+        set_output("codeql_scoped_config", str(out_path))
+        set_output("codeql_scope_mode", "full")
+        return 0
+
+    # Expand __init__.py changes to their package.
+    changed_py |= init_imports(changed_py, all_py)
+
+    # Compute transitive closure.
+    closure = transitive_dependents(changed_py, reverse_graph)
+
+    ratio = len(closure) / total if total > 0 else 1.0
+
+    if ratio >= FULL_SCAN_THRESHOLD:
+        msg = (f"closure {len(closure)}/{total} files "
+               f"({ratio:.0%} >= {FULL_SCAN_THRESHOLD:.0%} threshold)")
+        print(f"::notice::CodeQL Python scope: full scan ({msg})")
+        write_scoped_config(out_path, base_config, None)
+        set_output("codeql_scoped_config", str(out_path))
+        set_output("codeql_scope_mode", "full")
+        return 0
+
+    # Scoped scan.
+    scoped_paths = [str(f) for f in sorted(closure) if (repo / f).exists()]
+    write_scoped_config(out_path, base_config, scoped_paths)
+    set_output("codeql_scoped_config", str(out_path))
+    set_output("codeql_scope_mode", "scoped")
+
+    msg = (f"scoped to {len(closure)}/{total} files ({ratio:.0%}) — "
+           f"{len(changed_py)} changed, {len(closure) - len(changed_py)} dependents")
+    print(f"::notice::CodeQL Python scope: {msg}")
+    if parse_failures:
+        print(f"  Parse failures: {parse_failures} (below threshold)")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,366 @@
+"""Sanitizer catalog and CFG-aware recognizer — Phase 6 of the sanitizer-cut arc.
+
+Layered on top of :mod:`core.dataflow.known_safe_calls` (the curated
+table — ``all_entries()`` is the live census of entries, sink classes
+and languages; hardcoding counts here drifted twice). The known-safe
+table stays the single source of truth for *which* calls are
+sanitizers; this module adds two things on top:
+
+1. A CWE → sink-class mapping so a finding tagged with a CWE
+   identifier (the shape every static analyser emits) can be matched
+   against the catalogue's sink-class keys.
+2. A recognizer :func:`match_sanitizers_in_cfg` that walks a CFG
+   produced by :mod:`core.analysis.cfg_builder` and returns the set
+   of nodes whose statement-level calls (or, for the C/C++ call
+   graph, whose own function name) are catalogue sanitizers for the
+   given CWE + language.
+
+Phase 7 will consume the returned node set as the *candidate
+sanitizer set* in its vertex-cut suppression test: removing those
+nodes from the graph and asking "is the sink still reachable from
+the source?" answers the suppression question without ever calling
+the LLM.
+
+No new sanitizer data lands here — duplicating the known-safe table
+risks the two going out of sync as new entries are reviewed in.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import (
+    Any,
+    TypeVar,
+TYPE_CHECKING,
+)
+
+from core.dataflow.known_safe_calls import (
+    all_entries,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+
+N = TypeVar("N")
+
+
+# ---------------------------------------------------------------------------
+# Symbol-bound binding (Phase 3 of value-binding arc)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SanitizerBinding:
+    """One catalog-matched sanitizer call located in a CFG.
+
+    Where Phase 6 returned just the CFG node, Phase 3 returns the
+    full binding: the node, the matched dotted callable, the
+    *input symbols* the call's args read (bare-name surface from
+    Phase 1's :class:`CallSite.arg_names`), and the *output symbols*
+    the call's return flows into (Phase 1's
+    :class:`CallSite.assigned_names`).
+
+    Phase 4's four-condition gate reads these to decide whether the
+    sanitizer is on the source-to-sink *value* flow — not just the
+    *control* flow. The four conditions:
+
+      1. ``callable`` is in :func:`sanitizer_callables_for_cwe`
+      2. ``input_symbols ∩ symbols_tainted_at(node)`` is non-empty
+      3. ``output_symbols`` reaches the sink arg via reaching-defs
+      4. removing the value-bound subset of bindings cuts every
+         source → sink path
+
+    Additional source contracts must also be established before a match
+    becomes eligible for any proof. Structural/name matching leaves these
+    requirements unresolved and visible on the binding.
+
+    Bindings synthesised from C/C++ call-graph nodes (no value
+    layer) carry empty ``input_symbols`` / ``output_symbols`` —
+    condition 2 always fails, so Phase 4 downgrades to
+    ``candidate_only`` rather than suppressing.
+    """
+    node: Any
+    callable: str
+    input_symbols: frozenset[str]
+    output_symbols: frozenset[str]
+    lineno: int
+    unverified_source_contracts: frozenset[str] = frozenset()
+
+    def __post_init__(self):
+        if (type(self.unverified_source_contracts) is not frozenset
+                or any(type(value) is not str or not value for value in self.unverified_source_contracts)):
+            raise ValueError("unverified source contracts must be a frozenset of nonempty strings")
+
+
+def nodes_of(bindings: Iterable[SanitizerBinding]) -> set[Any]:
+    """Project a binding set down to its underlying CFG nodes.
+
+    Helper for Phase 7's vertex-cut consumer (which works on nodes,
+    not bindings). Two bindings on the same node — e.g. a call site
+    that matches two sink classes for the same CWE — collapse to
+    one entry.
+    """
+    return {b.node for b in bindings}
+
+
+# ---------------------------------------------------------------------------
+# CWE → sink-class mapping
+# ---------------------------------------------------------------------------
+
+
+# Mapping from CWE identifier (canonical form ``CWE-<n>`` and bare
+# numeric ``<n>`` both accepted by the lookup) to the catalogue's
+# sink-class keys. Only the classes for which the curated table
+# actually carries entries are mapped — adding a CWE here without a
+# matching catalogue entry would silently mean "no sanitizers
+# recognized" and is not worth modelling as data.
+#
+# Each tuple is the set of sink classes the CWE neutralizes. CWE-94
+# (code injection) intentionally maps to nothing — the catalog has
+# no recognized sanitizers for it, and pretending otherwise would
+# produce false suppressions in Phase 7.
+_CWE_TO_SINK_CLASSES: Mapping[str, frozenset] = {
+    # Cross-site scripting and variants
+    "CWE-79": frozenset({"xss"}),
+    "CWE-80": frozenset({"xss"}),
+    "CWE-87": frozenset({"xss"}),
+    "CWE-116": frozenset({"xss"}),
+    # SQL injection family
+    "CWE-89": frozenset({"sqli"}),
+    "CWE-564": frozenset({"sqli"}),  # Hibernate-specific SQLi variant
+    # OS command / shell injection
+    "CWE-77": frozenset({"cmdi"}),
+    "CWE-78": frozenset({"cmdi"}),
+    # Argument injection: the attack channel is the argv POSITION
+    # (option injection, tokenizer splits, re-join quoting), which the
+    # shell-quoting sanitizers catalogued under ``cmdi`` do not
+    # neutralize (``shlex.quote("-rf")`` is still ``-rf``).  Mapping
+    # CWE-88 to ``cmdi`` selected exactly those sanitizers — and the
+    # ``cmdi`` danger model (shell metachars only) proved charsets
+    # SOUND against none of the argv attack characters.  ``cmdi_argv``
+    # carries the argv-context danger model (a superset of ``cmdi``,
+    # see ``smt_barrier._DANGER_CHARS``) and no catalogue entries, so
+    # sanitizer lookups for CWE-88 abstain instead of endorsing
+    # shell-context quoting.
+    "CWE-88": frozenset({"cmdi_argv"}),
+    # Path traversal family
+    "CWE-22": frozenset({"pathtrav"}),
+    "CWE-23": frozenset({"pathtrav"}),
+    "CWE-35": frozenset({"pathtrav"}),
+    "CWE-36": frozenset({"pathtrav"}),
+    "CWE-37": frozenset({"pathtrav"}),
+    "CWE-38": frozenset({"pathtrav"}),
+}
+
+
+def _normalize_cwe(cwe: str) -> str:
+    """Accept ``"CWE-79"``, ``"cwe-79"``, ``"79"``, ``"CWE-079"`` and
+    return the canonical ``"CWE-79"`` form. Returns the input
+    unchanged when it doesn't look like a CWE id so unknown lookups
+    return a clean empty set rather than raising.
+
+    Delegates to :func:`core.cve.cwe.canonicalize_cwe` with a
+    bare-number fallback (the shared canonicaliser rejects plain
+    ``"79"`` since it isn't prefixed) and preserves the
+    return-raw-on-unknown semantics the catalog's lookup depends on.
+    """
+    from core.cve.cwe import canonicalize_cwe, format_cwe
+    canon = canonicalize_cwe(cwe)
+    if canon is not None:
+        # canonicalize_cwe preserves leading zeros in the number
+        # group; re-run through format_cwe to strip them (CWE-079 →
+        # CWE-79 for consistent catalog keys).
+        return format_cwe(canon.split("-", 1)[1]) or canon
+    # Bare number (``"79"``) is not accepted by the shared
+    # canonicaliser but the sanitizer catalog historically has.
+    raw = cwe.strip()
+    if raw.isdigit():
+        return format_cwe(raw) or cwe
+    return cwe
+
+
+def sink_classes_for_cwe(cwe: str) -> frozenset:
+    """Return the catalog sink-class keys that ``cwe`` neutralizes.
+
+    Empty frozenset for unknown CWEs — Phase 7 should treat that as
+    "no sanitizer suppression possible" and let the finding through.
+    """
+    return _CWE_TO_SINK_CLASSES.get(_normalize_cwe(cwe), frozenset())
+
+
+# ---------------------------------------------------------------------------
+# Catalog query
+# ---------------------------------------------------------------------------
+
+
+def sanitizer_callables_for_cwe(
+    cwe: str, language: str,
+) -> set[str]:
+    """Return the set of ``library_call`` identifiers from the
+    known-safe catalogue candidates for ``cwe`` and ``language``.
+    Membership does not establish additional source contracts.
+
+    The set this function returns is the input to Phase 7's
+    vertex-cut deletion: nodes in the CFG whose called callables
+    intersect this set are the sanitizer candidates.
+    """
+    sink_classes = sink_classes_for_cwe(cwe)
+    if not sink_classes:
+        return set()
+    out: set[str] = set()
+    for entry in all_entries():
+        if entry.sink_class in sink_classes and language in entry.languages:
+            out.add(entry.library_call)
+    return out
+
+
+def all_sanitizer_callables(language: str) -> set[str]:
+    """Every candidate for ``language``, irrespective of sink class.
+
+    This is a census, never authority for an unclassified sink or an
+    unresolved source contract.
+    """
+    return {
+        entry.library_call
+        for entry in all_entries()
+        if language in entry.languages
+    }
+
+
+def source_contracts_for_callable(callable_name: str, cwe: str, language: str) -> frozenset[str]:
+    """Derive requirements from the live catalogue, without a second allowlist."""
+    classes = sink_classes_for_cwe(cwe)
+    contracts: set[str] = set()
+    for entry in all_entries():
+        if (entry.library_call == callable_name and entry.sink_class in classes
+                and language in entry.languages):
+            contracts.update(entry.source_contracts)
+    return frozenset(contracts)
+
+
+def repo_shadows_module_root(
+    repo_root: str, root: str,
+) -> bool:
+    """True when the scanned repo ships an import-resolvable module
+    that shadows ``root`` — a source or legacy sourceless bytecode
+    module, or a package with a source or bytecode ``__init__``.
+
+    Import-target ORIGIN check: ``import html`` inside such a repo
+    resolves to the REPO's file at runtime (the script directory
+    precedes the stdlib on sys.path), so the written name is the
+    repo's object, not the stdlib/site-packages identity a catalog
+    entry names. A malformed root refuses too (True) — the caller is
+    deciding whether to TRUST an identity, and an unclassifiable one
+    must not be trusted.
+    """
+    if not root or not root.isidentifier():
+        return True
+    try:
+        from pathlib import Path as _Path
+
+        base = _Path(repo_root)
+        return any(
+            (base / f"{root}{suffix}").is_file()
+            or (base / root / f"__init__{suffix}").is_file()
+            for suffix in (".py", ".pyc")
+        )
+    except OSError:
+        return True
+
+
+# ---------------------------------------------------------------------------
+# CFG recognizer
+# ---------------------------------------------------------------------------
+
+
+def _node_calls(node: N) -> Iterable[str]:
+    """Extract the set of callable names from a CFG node — the
+    legacy projection used when the node has no Phase-1 ``call_sites``.
+
+    Duck-typed for both producers from
+    :mod:`core.analysis.cfg_builder`:
+
+    * :class:`PyCFGNode` — ``calls`` field, frozen set of statement-
+      level call names.
+    * :class:`CallGraphNode` — the node ``name`` is itself the
+      callee (a function-granularity call graph treats every node
+      as a call).
+    """
+    if hasattr(node, "calls"):
+        return getattr(node, "calls") or ()
+    if hasattr(node, "name"):
+        return (getattr(node, "name"),)
+    return ()
+
+
+def match_sanitizers_in_cfg(
+    graph, cwe: str, language: str,
+) -> frozenset[SanitizerBinding]:
+    """Return the set of :class:`SanitizerBinding` records that
+    correspond to catalog-matched sanitizer calls in ``graph`` for
+    ``cwe`` + ``language``.
+
+    The graph must satisfy :class:`core.analysis.dominators.Graph`
+    (``nodes()`` available). Each binding carries the node, the
+    matched callable, the call's input/output symbols (from Phase
+    1's :class:`CallSite`), and the call's line number. Multiple
+    matched calls on the same node produce multiple bindings; use
+    :func:`nodes_of` to collapse to the legacy node-set view.
+
+    Recognition fall-backs:
+
+    * **Phase-1 nodes** (``call_sites`` non-empty): one binding per
+      matched :class:`CallSite`, with full ``input_symbols`` and
+      ``output_symbols``.
+    * **Legacy ``PyCFGNode``** (only the old ``calls`` frozenset):
+      one binding per matched name; symbol sets empty. Phase 4 will
+      downgrade to ``candidate_only`` because the value-binding
+      gate's input/output conditions can't fire.
+    * **Call-graph node** (function-granularity, no call_sites and
+      no calls field): one binding for the node itself when its
+      ``name`` matches; symbol sets empty. Same Phase 4 downgrade.
+
+    Returns an empty frozenset when the CWE has no catalog-recognised
+    sanitizers — Phase 7 must check this and decline to suppress
+    rather than falsely conclude "every path is sanitized".
+    """
+    sanitizer_names = sanitizer_callables_for_cwe(cwe, language)
+    if not sanitizer_names:
+        return frozenset()
+    bindings: list[SanitizerBinding] = []
+    for node in graph.nodes():
+        call_sites = getattr(node, "call_sites", ()) or ()
+        if call_sites:
+            bindings.extend(SanitizerBinding(
+                        node=node,
+                        callable=cs.name,
+                        input_symbols=cs.arg_names,
+                        output_symbols=cs.assigned_names,
+                        lineno=cs.lineno,
+                        unverified_source_contracts=source_contracts_for_callable(cs.name, cwe, language),
+                    ) for cs in call_sites if cs.name in sanitizer_names)
+            continue
+        # Legacy / call-graph fallback: matched names with empty
+        # symbol layer. Phase 4 downgrades these to candidate_only.
+        node_calls = set(_node_calls(node))
+        bindings.extend(SanitizerBinding(
+                node=node,
+                callable=matched_name,
+                input_symbols=frozenset(),
+                output_symbols=frozenset(),
+                lineno=getattr(node, "lineno", 0),
+                unverified_source_contracts=source_contracts_for_callable(matched_name, cwe, language),
+            ) for matched_name in node_calls & sanitizer_names)
+    return frozenset(bindings)
+
+
+__all__ = [
+    "SanitizerBinding",
+    "all_sanitizer_callables",
+    "match_sanitizers_in_cfg",
+    "repo_shadows_module_root",
+    "nodes_of",
+    "sanitizer_callables_for_cwe",
+    "source_contracts_for_callable",
+    "sink_classes_for_cwe",
+]

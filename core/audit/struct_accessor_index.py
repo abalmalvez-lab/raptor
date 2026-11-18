@@ -1,0 +1,291 @@
+"""Struct-field co-accessor index for concurrency analysis.
+
+Builds an index of which functions access which struct fields, and
+under what locking discipline.  Used to surface "these other functions
+touch the same fields under different locking" context for the LLM's
+concurrency review.
+
+Single backend: a source-regex scan (``build_index_from_source``) over
+each function's source for ``->field`` / ``.field`` patterns and
+lock/unlock calls.  A Joern-CPG backend used to live here but was
+never wired to production and could not produce lock context; the
+regex path is the one the orchestrator consumes.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from itertools import chain, groupby, islice
+from operator import attrgetter
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AccessorRecord:
+    """One function's access to a struct field."""
+    function: str
+    file: str
+    field: str
+    lock_held: str = ""    # lock name/type if any, or ""
+    line: int = 0
+
+
+@dataclass
+class CoAccessorGroup:
+    """A struct field accessed by multiple functions with different locking."""
+    field: str
+    accessors: list = field(default_factory=list)  # type: ignore[operator]
+    lock_conflict: bool = False
+
+    @property
+    def description(self) -> str:
+        # Non-list inputs retain the original iteration behavior.
+        funcs = ([a.function for a in self.accessors]
+                 if type(self.accessors) is not list else None)
+        locked = [a for a in self.accessors if a.lock_held]
+        unlocked = [a for a in self.accessors if not a.lock_held]
+        if locked and unlocked:
+            locked_names = ", ".join(a.function for a in locked[:3])
+            unlocked_names = ", ".join(a.function for a in unlocked[:3])
+            return (
+                f"`{self.field}` accessed under lock by {locked_names} "
+                f"but without lock by {unlocked_names}"
+            )
+        unique_locks = {a.lock_held for a in locked}
+        if len(unique_locks) > 1:
+            parts = []
+            # Keep direct scans for small lock families.
+            if len(unique_locks) < 4:
+                for lock in sorted(unique_locks):
+                    names = [a.function for a in locked if a.lock_held == lock]
+                    parts.append(f"{', '.join(names[:2])} (under {lock})")
+            else:
+                # Sort only the private list, preserving encounter order
+                # within each lock and avoiding a scan per distinct lock.
+                del unique_locks
+                lock_key = attrgetter("lock_held")
+                locked.sort(key=lock_key)
+                for lock, accessors in groupby(locked, key=lock_key):
+                    names = [a.function for a in islice(accessors, 2)]
+                    parts.append(f"{', '.join(names)} (under {lock})")
+            return f"`{self.field}` accessed under different locks: {'; '.join(parts)}"
+        if funcs is None:
+            n = len(self.accessors)
+            names_str = ", ".join([a.function for a in self.accessors[:4]])
+        else:
+            n = len(funcs)
+            names_str = ", ".join(funcs[:4])
+        suffix = f" (+{n - 4} more)" if n > 4 else ""
+        return f"`{self.field}` accessed by {names_str}{suffix}"
+
+
+# \b pins the receiver to a word start: unanchored, every position
+# inside a long identifier run starts a fresh scan of the rest of
+# the run — quadratic on hostile source. A mid-word start is a false
+# token (the tail of a longer identifier) either way.
+_FIELD_ACCESS_RE = re.compile(
+    r"\b(?:\w+)\s*(?:->|\.)\s*(\w+)",
+)
+
+_LOCK_CALL_RE = re.compile(
+    r"\b(mutex_lock|mutex_lock_interruptible|mutex_lock_killable"
+    r"|spin_lock|spin_lock_irq|spin_lock_irqsave|spin_lock_bh"
+    r"|read_lock|write_lock|down_read|down_write"
+    r"|rcu_read_lock|rw_lock"
+    r"|pthread_mutex_lock"
+    # Go/C++ method-call shape: real code locks through a receiver
+    # (``mu.Lock()``, ``m.lock()``) — the old ``sync.Mutex.Lock``
+    # pattern matched only the TYPE's qualified name, which never
+    # appears at a call site.
+    r"|\.(?:Lock|RLock)"
+    r"|\.acquire)\s*\(",
+    re.IGNORECASE,
+)
+
+_UNLOCK_CALL_RE = re.compile(
+    r"\b(mutex_unlock|spin_unlock|spin_unlock_irq|spin_unlock_irqrestore"
+    r"|spin_unlock_bh|read_unlock|write_unlock|up_read|up_write"
+    r"|rcu_read_unlock|rw_unlock"
+    r"|pthread_mutex_unlock"
+    r"|\.Unlock|\.RUnlock"
+    r"|\.release)\s*\(",
+    re.IGNORECASE,
+)
+
+# The optional '&' gates its own trailing whitespace — the naive
+# ``\s*&?\s*`` pair was quadratic on a lock call followed by a
+# whitespace run.
+_LOCK_NAME_RE = re.compile(
+    r"\b(?:mutex_lock|spin_lock\w*|down_read|down_write"
+    r"|read_lock|write_lock|rcu_read_lock"
+    r"|pthread_mutex_lock)\s*\(\s*(?:&\s*)?(\w+(?:->\w+)*)",
+)
+
+_NOISE_FIELDS = frozenset({
+    "next", "prev", "head", "tail", "data", "len", "size", "count",
+    "type", "flags", "status", "state", "ops", "name", "list",
+    "lock", "mutex", "spinlock", "refcount", "ref",
+})
+
+_MIN_FIELD_LEN = 3
+
+
+def build_index_from_source(
+    gaps: Sequence[dict[str, Any]],
+) -> dict[str, list[AccessorRecord]]:
+    """Build struct-field accessor index from function source code.
+
+    Scans each function's source for ``->field`` / ``.field`` patterns
+    and determines whether the access happens under a lock.
+
+    Returns: ``{"field_name": [AccessorRecord, ...]}``
+    """
+    index: dict[str, list[AccessorRecord]] = {}
+
+    for gap in gaps:
+        func_name = gap.get("name", "")
+        file_path = gap.get("file", "")
+        source = gap.get("source", "")
+        if not (func_name and file_path and source):
+            continue
+
+        fields = _extract_fields(source)
+        if not fields:
+            continue
+
+        lock_name = _detect_lock(source)
+
+        for f in fields:
+            record = AccessorRecord(
+                function=func_name,
+                file=file_path,
+                field=f,
+                lock_held=lock_name,
+            )
+            bucket = index.get(f)
+            if bucket is None:
+                bucket = []
+                index[f] = bucket
+            bucket.append(record)
+
+    return index
+
+
+def get_co_accessors(
+    index: dict[str, list[AccessorRecord]],
+    function: str,
+    file: str,
+    *,
+    min_accessors: int = 2,
+    same_file_only: bool = False,
+) -> list[CoAccessorGroup]:
+    """Find fields accessed by both the given function and others.
+
+    Returns groups where the reviewed function and at least one other
+    function access the same field, prioritising groups with lock
+    conflicts.
+    """
+    groups: list[CoAccessorGroup] = []
+
+    for field_name, records in index.items():
+        mine = [r for r in records if r.function == function and r.file == file]
+        if not mine:
+            continue
+
+        if same_file_only is True:
+            others = [
+                r for r in records
+                if not (r.function == function and r.file == file) and r.file == file
+            ]
+        else:
+            others = [
+                r for r in records
+                if not (r.function == function and r.file == file)
+            ]
+            if same_file_only:
+                others = [r for r in others if r.file == file]
+
+        unique_funcs = {r.function for r in others}
+        if len(unique_funcs) < min_accessors - 1:
+            continue
+
+        deduped = _dedupe_accessors(chain(mine, others))
+
+        my_locks = {r.lock_held for r in mine}
+        other_locks = {r.lock_held for r in others}
+        my_nonempty = my_locks - {""}
+        other_nonempty = other_locks - {""}
+        has_conflict = bool(
+            my_nonempty != other_nonempty
+            or ("" in my_locks and other_nonempty)
+            or ("" in other_locks and my_nonempty)
+        )
+
+        groups.append(CoAccessorGroup(
+            field=field_name,
+            accessors=deduped,
+            lock_conflict=has_conflict,
+        ))
+
+    groups.sort(key=lambda g: (not g.lock_conflict, -len(g.accessors)))
+    return groups
+
+
+def format_co_accessor_context(
+    groups: list[CoAccessorGroup],
+    *,
+    max_groups: int = 5,
+) -> str | None:
+    """Format co-accessor groups for injection into the LLM review context."""
+    if not groups:
+        return None
+
+    parts = ["[Struct-field co-accessor analysis]"]
+    for g in groups[:max_groups]:
+        prefix = "[LOCK CONFLICT] " if g.lock_conflict else ""
+        parts.append(f"  - {prefix}{g.description}")
+    if len(groups) > max_groups:
+        parts.append(f"  - ... and {len(groups) - max_groups} more")
+    return "\n".join(parts)
+
+
+def _extract_fields(source: str) -> set[str]:
+    """Extract struct field names from ``->field`` and ``.field`` patterns."""
+    fields: set[str] = set()
+    if type(source) is str and "." not in source and "->" not in source:
+        return fields
+    for m in _FIELD_ACCESS_RE.finditer(source):
+        f = m.group(1)
+        if len(f) >= _MIN_FIELD_LEN and f not in _NOISE_FIELDS:
+            fields.add(f)
+    return fields
+
+
+def _detect_lock(source: str) -> str:
+    """Detect if the function holds a lock, return the lock name or ""."""
+    lock_m = _LOCK_CALL_RE.search(source)
+    if not lock_m:
+        return ""
+    name_m = _LOCK_NAME_RE.search(source)
+    if name_m:
+        return name_m.group(1)
+    return lock_m.group(1)
+
+
+def _dedupe_accessors(records: Iterable[AccessorRecord]) -> list[AccessorRecord]:
+    """Remove duplicate (function, file) entries, keep first."""
+    seen: set[tuple[str, str]] = set()
+    result: list[AccessorRecord] = []
+    for r in records:
+        key = (r.function, r.file)
+        if key not in seen:
+            seen.add(key)
+            result.append(r)
+    return result

@@ -1,0 +1,959 @@
+"""Binary-oracle call-edge extraction — Inc 2b Tiers 1 and 2.
+
+The asymmetric companion to Inc 2's ``absent``-direction suppression
+witness: extract the binary's direct call graph, then for each
+``(caller, callee)`` edge cross-reference back to the source inventory.
+A source function with an incoming binary edge — even if the source
+graph thinks no caller exists — gets a positive reachability witness
+(``binary_call_edge``).
+
+Tier scope (per design §6 + Phase 4 edge-gap measurement):
+  * Tier 1 — DIRECT edges via r2 ``axffj`` per function. Catches
+    ~92% of all binary call sites (the indirect-call fraction sat
+    at 8.1% aggregate in the 4-corpus measurement). Misses fn-
+    pointer / vtable / ESIL-needed cases.
+  * Tier 2 — vtable resolution via r2 ``av`` for C++. Runs
+    unconditionally after Tier 1; each vtable slot becomes a
+    synthetic ``<vtable@addr>`` → method edge merged into the same
+    edge index. No-op on binaries without vtables.
+  * Tier 3 (deferred) — ESIL emulation for constant fn-pointer
+    propagation.
+
+The witness is HEURISTIC (not corpus-earned for hard suppression) —
+binary-edge ⇒ reachable is affirmative evidence that flows into the
+LLM prompt + reach_witness chokepoint, but doesn't license dropping a
+finding the way ``binary_oracle_absent`` does. Future corpus
+measurement can promote it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from core.atomic_fs import write_text_atomically
+from core.hash import sha256_file as _sha256_file
+from core.json import JsonBudgetExceededError, dumps_artifact, load_json_bounded
+
+
+logger = logging.getLogger(__name__)
+
+
+# Edge-index cache schema version. Bump on any incompatible change to
+# the serialised edge format (BinaryEdgeIndex fields, edge record
+# shape). Old cache entries with a stale version are ignored and the
+# extractor re-runs from scratch.
+# v2: the payload carries a mandatory ``binary_sha256`` binding the
+# entry to the analysed binary's content (see _load_cached_index);
+# v1 entries lack the field and re-extract once.
+_EDGE_CACHE_VERSION = 2
+
+# One cached edge index. Indexes are per-build-id and grow with
+# the binary's call graph; the cache dir is shared, so a planted
+# oversize file must be refused before the read.
+_MAX_EDGE_CACHE_BYTES = 256 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class BinaryCallEdge:
+    """One direct call edge in the binary."""
+    caller: str
+    callee: str
+    binary_path: str
+
+
+@dataclass
+class BinaryEdgeIndex:
+    """Per-binary direct-call-edge extraction result.
+
+    ``edges`` is the full edge set; ``callees`` is the set of source-
+    function names that appear as a callee somewhere (cheap "is X
+    binary-called?" check used by the reach_witness stage)."""
+    binary_path: str
+    edges: list[BinaryCallEdge] = field(default_factory=list)
+    callees: set[str] = field(default_factory=set)
+
+
+def _content_hash(binary_path: Path) -> str | None:
+    """sha256 of the binary's file content — cache key fallback when
+    ``.note.gnu.build-id`` is absent (stripped Go, PGO-stripped vendor
+    binaries)."""
+    try:
+        return _sha256_file(binary_path)
+    except OSError:
+        return None
+
+
+def _identity_cache_key(binary_path: Path) -> str | None:
+    """Edge-cache key: the module's content-identity VALUE via the
+    kind-aware front door (build-id for ELF, LC_UUID for the thin
+    Mach-O slice, canonical GUID+age for PE, whole-file sha256
+    otherwise).  Every kind's value is a lowercase hex run, so
+    ``_cache_path_for``'s validator applies unchanged; ELF and
+    hash-fallback keys are byte-identical to the historical
+    build-id-or-hash scheme, keeping existing cache entries valid.
+    The format sniff means no readelf spawn ever runs on non-ELF
+    bytes."""
+    try:
+        from core.binary.identity import content_identity
+        ident = content_identity(binary_path)
+    except Exception:  # noqa: BLE001 — cache keying is an optimisation; the hash fallback still keys
+        ident = None
+    if ident is not None:
+        return ident.value
+    return _content_hash(binary_path)
+
+
+def _fn_addr(f: dict) -> int | None:
+    """Function entry address from an ``aflj`` record. r2 6.x keys this
+    as ``addr``; r2 5.x (the version Ubuntu/Debian apt ships, used by the
+    nightly CI corpus job) keys it as ``offset``. Accept either so the
+    extractor works across the r2 versions operators actually have
+    installed. Returns ``None`` when neither key holds an int — the
+    caller skips that function rather than crashing on ``f['addr']``.
+    JSON booleans are not numeric addresses."""
+    for key in ("addr", "offset"):
+        v = f.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return None
+
+
+def _edge_cache_dir() -> Path:
+    """Edge-index cache root: ``out/binary-oracle-precision/edge-cache/``
+    (re-using the existing binary_oracle output convention). Cache
+    entries keyed by binary build_id."""
+    from core.config import RaptorConfig
+    return Path(RaptorConfig.BASE_OUT_DIR) / "binary-oracle-precision" / "edge-cache"
+
+
+_BUILD_ID_RE = re.compile(r"^[0-9a-f]{8,128}$")
+
+
+def _cache_path_for(build_id: str) -> Path | None:
+    """Cache path for a given build_id, or ``None`` when the build_id
+    isn't a safely-embeddable hex string. Belt-and-braces against any
+    future regression in the upstream identity helpers: a hostile
+    binary defines its own identity bytes (``.note.gnu.build-id``,
+    LC_UUID, RSDS record) and could otherwise drive cache-file path
+    composition. Validate at use-site, not just at production."""
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        return None
+    return _edge_cache_dir() / f"{build_id}.json"
+
+
+def _load_cached_index(
+    cache_file: Path,
+    binary_path: str,
+) -> BinaryEdgeIndex | None:
+    """Load a previously-extracted edge index from cache. Returns None
+    when the cache file is missing, malformed, or version-mismatched
+    (caller falls back to full extraction)."""
+    if not cache_file.is_file():
+        return None
+    try:
+        # Bounded helper (capped read + growth re-check), not plain
+        # load_json: the cache dir is shared, so the stat-then-
+        # uncapped-read window would let a racing writer balloon the
+        # read past the gate.
+        payload = load_json_bounded(
+            cache_file, max_bytes=_MAX_EDGE_CACHE_BYTES,
+        )
+    except JsonBudgetExceededError as e:
+        logger.warning("edge cache refused: %s", e)
+        return None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != _EDGE_CACHE_VERSION:
+        return None
+    # Cross-target collision check: two binaries with the same build_id
+    # (reproducible-build collision, or a pre-poisoned cache file an
+    # attacker dropped under out/) would silently mis-attribute edges
+    # to the wrong target. Insist the cache's ``binary_path`` matches
+    # the binary we're looking up; otherwise treat as miss and re-run
+    # extraction. Defends against the cache-poisoning vector flagged by
+    # adversarial review (forged edges to censor LLM scrutiny on a
+    # real bug — earns_suppression=False on this witness prevents
+    # finding-suppression, but censorship via misattribution is still
+    # within reach without this check).
+    # The field must be PRESENT and match. Accepting a record that
+    # merely omits ``binary_path`` (or carries a non-string) would let
+    # a pre-poisoned cache file bypass the collision check entirely —
+    # missing/None is a cache miss, not a pass.
+    cached_path = payload.get("binary_path")
+    if not isinstance(cached_path, str):
+        logger.warning(
+            "binary_oracle_edges: cache entry for %s lacks a valid "
+            "binary_path field; treating as cache miss",
+            binary_path,
+        )
+        return None
+    if cached_path != binary_path:
+        logger.warning(
+            "binary_oracle_edges: cache build_id collision; cached "
+            "path=%s wanted=%s; treating as cache miss",
+            cached_path, binary_path,
+        )
+        return None
+    # Content binding: version and
+    # binary_path only bind the entry to a NAME. The cache outlives
+    # the run, so an extraction persisted while impostor bytes sat at
+    # the name (pin-bracket withholds the edges from THAT run, but the
+    # impl already wrote the cache), or a pre-poisoned file dropped
+    # under the shared cache dir with the right version+path, would be
+    # served on the NEXT run — after the identity pin re-verifies
+    # against the restored honest binary. Bind the payload to the
+    # binary's content sha, exactly as _try_graph_store binds
+    # graph-store reuse. Same posture as binary_path: the field must
+    # be PRESENT and match — missing/non-string is a miss, never a
+    # pass (a crafted payload could otherwise just omit it).
+    cached_sha = payload.get("binary_sha256")
+    if not isinstance(cached_sha, str):
+        logger.warning(
+            "binary_oracle_edges: cache entry for %s lacks a valid "
+            "binary_sha256 field; treating as cache miss",
+            binary_path,
+        )
+        return None
+    current_sha = _content_hash(Path(binary_path))
+    if current_sha is None or cached_sha != current_sha:
+        logger.warning(
+            "binary_oracle_edges: cache entry for %s was extracted "
+            "from different binary content than the bytes now at the "
+            "name; treating as cache miss (re-extracting)",
+            binary_path,
+        )
+        return None
+    edges_raw = payload.get("edges", [])
+    if not isinstance(edges_raw, list):
+        return None
+    idx = BinaryEdgeIndex(binary_path=binary_path)
+    for r in edges_raw:
+        if not isinstance(r, dict):
+            continue
+        caller = r.get("caller")
+        callee = r.get("callee")
+        bp = r.get("binary_path") or binary_path
+        if (
+            isinstance(caller, str)
+            and isinstance(callee, str)
+            and isinstance(bp, str)
+        ):
+            idx.edges.append(BinaryCallEdge(
+                caller=caller, callee=callee, binary_path=bp))
+            idx.callees.add(callee)
+    return idx
+
+
+def _save_cached_index(cache_file: Path, idx: BinaryEdgeIndex) -> None:
+    """Persist the edge index. Best-effort — IO failures are logged at
+    debug and don't break the extraction path."""
+    try:
+        # Content binding: stamp the sha of the bytes at the name at
+        # save time so the load side can refuse the entry once the
+        # binary's content changes (or was never what the entry
+        # claims). An entry the saver cannot hash could only ever
+        # load as a miss — skip the write instead of persisting a
+        # payload one field short of the contract in a shared dir.
+        content_sha = _content_hash(Path(idx.binary_path))
+        if content_sha is None:
+            logger.debug(
+                "binary_oracle_edges: cache write skipped for %s "
+                "(binary unreadable at save time — cannot bind the "
+                "entry to its content)", idx.binary_path)
+            return
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version":       _EDGE_CACHE_VERSION,
+            "binary_path":   idx.binary_path,
+            "binary_sha256": content_sha,
+            "edges": [
+                {"caller": e.caller, "callee": e.callee,
+                 "binary_path": e.binary_path}
+                for e in idx.edges
+            ],
+        }
+        # Atomic write: edge-index cache is the per-build-id snapshot
+        # the reachability chokepoint consults. A torn write leaves
+        # JSON that fails to parse and drops the cached edges — the
+        # next run re-extracts from scratch (slow, ~10-30s per binary).
+        write_text_atomically(
+            cache_file,
+            # indent=None: edge lists can be large; keep the cache
+            # entry dense.
+            dumps_artifact(payload, indent=None),
+            tmp_prefix=".edge-cache-",
+        )
+    except OSError as e:
+        logger.debug("binary_oracle_edges: cache write failed: %s", e)
+
+
+def _try_graph_store(binary_path: Path) -> BinaryEdgeIndex | None:
+    """Try to read call edges from an existing binary graph store.
+
+    Returns None if no graph store is found or it has no CALLS edges.
+    This avoids re-running r2 when /understand --map has already mapped
+    the binary."""
+    try:
+        from packages.binary_analysis.graph_store import (
+            graph_path_for_run,
+            graph_summary,
+            query_edges,
+        )
+    except ImportError:
+        return None
+    requested_sha256 = _content_hash(binary_path)
+    if not requested_sha256:
+        return None
+    raptor_dir_str = os.environ.get("RAPTOR_DIR", "")
+    search_dirs = [binary_path.parent]
+    raptor_dir = Path(raptor_dir_str) if raptor_dir_str else None
+    if raptor_dir and raptor_dir.is_dir():
+        out_dir = raptor_dir / "out"
+        if out_dir.is_dir():
+            search_dirs.append(out_dir)
+    # The last-activated project bookmark lives in the projects root
+    # (``core.project.project.PROJECTS_DIR / ".active"``), not under
+    # RAPTOR_DIR — the old RAPTOR_DIR-relative path never existed, so
+    # the project-dir search leg never fired.
+    projects_dir: Path | None
+    try:
+        from core.project.project import PROJECTS_DIR as projects_dir_  # noqa: N812
+        projects_dir = projects_dir_
+    except ImportError:
+        projects_dir = None
+    if projects_dir is not None:
+        active = Path(projects_dir) / ".active"
+        if active.is_symlink() or active.exists():
+            try:
+                project_dir = active.resolve()
+                if project_dir.is_dir():
+                    search_dirs.append(project_dir)
+            except OSError:
+                pass
+    for d in search_dirs:
+        try:
+            children = list(d.iterdir()) if d.is_dir() else []
+        except OSError:
+            continue
+        for sub in children:
+            if not sub.is_dir():
+                continue
+            gpath = graph_path_for_run(sub)
+            if not gpath.is_file():
+                continue
+            try:
+                summary = graph_summary(gpath)
+                latest = summary.get("latest_snapshot") or {}
+                if latest.get("binary_sha256") != requested_sha256:
+                    continue
+                raw_edges = query_edges(gpath, kind=None)
+            except Exception as exc:  # noqa: BLE001 - best-effort cache reuse only
+                logger.debug(
+                    "binary_oracle_edges: ignoring unreadable graph store %s: %s",
+                    gpath,
+                    exc,
+                )
+                continue
+            if not raw_edges:
+                continue
+            edges = []
+            callees: set[str] = set()
+            for e in raw_edges:
+                if e.get("kind") not in _CALL_KINDS:
+                    continue
+                src = e.get("source") or {}
+                tgt = e.get("target") or {}
+                # Graph-store node names come from r2 and carry its
+                # ``sym.`` / ``fcn.`` / … prefixes; the inventory join
+                # downstream is by BARE source-function name, and this
+                # store result SHADOWS fresh r2 extraction (which does
+                # clean), so uncleaned names silently dropped every
+                # join.
+                caller = _clean_r2_function_name(src.get("name", ""))
+                callee = _clean_r2_function_name(tgt.get("name", ""))
+                if caller and callee:
+                    edges.append(BinaryCallEdge(
+                        caller=caller,
+                        callee=callee,
+                        binary_path=str(binary_path),
+                    ))
+                    callees.add(callee)
+            if edges:
+                logger.info(
+                    "binary_oracle_edges: reused %d edges from graph store %s",
+                    len(edges), gpath,
+                )
+                return BinaryEdgeIndex(
+                    binary_path=str(binary_path),
+                    edges=edges,
+                    callees=callees,
+                )
+    return None
+
+
+def extract_direct_call_edges(
+    binary_path: Path,
+    *,
+    timeout: int = 300,
+    use_cache: bool = True,
+) -> BinaryEdgeIndex:
+    """Run r2 ``aaa`` + ``aflj`` then per-function ``axffj`` to harvest
+    direct call edges. Returns an index keyed by both edge list and
+    callee set. Empty index when r2 is unavailable or fails (the
+    consumer treats absence as 'no binary evidence'; never licenses
+    additional suppression).
+
+    Identity-pinned binaries (project-store entries whose content
+    witness was verified fd-honestly at load —
+    ``RaptorConfig.BINARY_ORACLE_IDENTITY_PINS``) are re-verified
+    BRACKETING the extraction, the same discipline the classify pass
+    applies: fd-honest open + fstat + hash before anything reads the
+    path (including the content-keyed caches, whose keys are derived
+    by name), fd held across the extraction, held-fd re-hash +
+    by-name inode check after. Any failure — including a load-time
+    ``None`` pin — WITHHOLDS the edges (empty index, the documented
+    'no binary evidence' shape): edges are positive-reachability
+    evidence attributed to the pinned path, and bytes the witness
+    never verified must not steer reachability under its authority.
+    Never a run refusal, and unpinned paths (auto-detect, --binary,
+    env-build) verify nothing. Residual stated honestly: r2 re-opens
+    the path by name inside its sandbox, so a swap-in/swap-back pair
+    completing entirely within the extraction evades both bracket
+    checks.
+
+    ``use_cache`` controls the per-build_id cache (under
+    ``out/binary-oracle-precision/edge-cache/<build_id>.json``).
+    A cache hit returns near-instantly; a miss runs the full r2
+    extraction and persists the result. Pass False to force re-extract
+    (test scenarios, debugging cache staleness)."""
+    binary_path = Path(binary_path)
+    from core.config import RaptorConfig
+    pins = RaptorConfig.BINARY_ORACLE_IDENTITY_PINS
+    key = str(binary_path)
+    if key not in pins:
+        return _extract_direct_call_edges_impl(
+            binary_path, timeout=timeout, use_cache=use_cache)
+    from core.security.log_sanitisation import escape_nonprintable
+    pin = pins[key]
+    if pin is None:
+        # Demoted at load time (witness unverifiable: plant or
+        # content drift) — already warned there; edges from those
+        # bytes carry no witness authority.
+        logger.warning(
+            "binary_oracle_edges: %s was demoted at witness load — "
+            "withholding its call edges (no binary evidence)",
+            escape_nonprintable(key))
+        return BinaryEdgeIndex(binary_path=key)
+    # Same-package bracket helpers as the classify pass (shared so
+    # the two consumers cannot drift on what 'verified' means).
+    from core.analysis.binary_oracle import (
+        _pin_open_verified,
+        _pin_still_holds,
+    )
+    held = _pin_open_verified(binary_path, pin)
+    if held is None:
+        logger.warning(
+            "binary_oracle_edges: identity pin for %s did not verify "
+            "(fd-honest open failed, or content/inode changed since "
+            "the witness read) — withholding its call edges "
+            "(no binary evidence)",
+            escape_nonprintable(key))
+        return BinaryEdgeIndex(binary_path=key)
+    failed = False
+    try:
+        idx = _extract_direct_call_edges_impl(
+            binary_path, timeout=timeout, use_cache=use_cache)
+        if not _pin_still_holds(held, binary_path, pin):
+            logger.warning(
+                "binary_oracle_edges: identity pin for %s did not "
+                "hold across the extraction (content/inode changed "
+                "while r2 ran) — withholding its call edges "
+                "(no binary evidence)",
+                escape_nonprintable(key))
+            return BinaryEdgeIndex(binary_path=key)
+        return idx
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            held.close()
+        except BaseException as exc:
+            if not failed and not isinstance(exc, OSError):
+                raise
+
+
+def _extract_direct_call_edges_impl(
+    binary_path: Path,
+    *,
+    timeout: int,
+    use_cache: bool,
+) -> BinaryEdgeIndex:
+    """The unbracketed extraction body (see the public wrapper)."""
+    if use_cache:
+        from_graph = _try_graph_store(binary_path)
+        if from_graph is not None:
+            return from_graph
+    if not shutil.which("r2"):
+        logger.info("binary_oracle_edges: r2 not found; skipping")
+        return BinaryEdgeIndex(binary_path=str(binary_path))
+    if not binary_path.is_file():
+        return BinaryEdgeIndex(binary_path=str(binary_path))
+
+    # Cache lookup keyed by the module's content identity
+    # (mechanically-derived; changes whenever the binary's code
+    # does): GNU build-id for ELF, per-format identity for PE /
+    # Mach-O, and a content sha256 for everything without one
+    # (stripped Go, PGO-stripped vendor binaries, custom-link
+    # binaries that drop .note.gnu.build-id — slower than a 40-char
+    # hex constant but bounded: one full-file digest per extraction).
+    cache_key = _identity_cache_key(binary_path) if use_cache else None
+    cache_file = _cache_path_for(cache_key) if cache_key else None
+    build_id = cache_key  # alias for the log message + cache payload
+    if cache_file is not None:
+        cached = _load_cached_index(cache_file, str(binary_path))
+        if cached is not None:
+            logger.info(
+                "binary_oracle_edges: cache hit for %s (build_id=%s, %d edges)",
+                binary_path.name, build_id[:12] if build_id else "", len(cached.edges))
+            return cached
+
+    # ``aaa`` is the heavy analyse-all; ~10s on a snappy_unittest-sized
+    # binary, longer on larger ones. Single r2 invocation that builds
+    # the function list AND iterates axffj per function. Subprocess
+    # errors (timeout, segfault, r2 missing post-which-check race) must
+    # NOT crash the inventory build — the module's contract is positive-
+    # evidence-only that degrades gracefully to "no binary evidence".
+    # r2 is a powerful binary-analysis tool with a large parser attack
+    # surface (CVE history in ELF/PDB parsers); the binary it analyses
+    # is operator-supplied and may be attacker-controlled. Use the full
+    # sandbox (namespace + Landlock + network deny) so a malicious ELF
+    # triggering an r2 bug cannot escape to operator-level code exec.
+    # ``target`` = the binary's containing directory so Landlock allows
+    # the necessary reads; no write paths needed (we capture stdout).
+    from core.sandbox import run as _sandbox_run
+    try:
+        # errors="replace": r2 stdout over a malformed/hostile ELF can
+        # carry non-UTF-8 bytes; strict decoding raises
+        # UnicodeDecodeError (a ValueError, NOT in the caught tuple
+        # below) and would crash the must-not-crash inventory path.
+        fns_proc = _sandbox_run(
+            ["r2", "-q", "-c", "aaa; aflj", str(binary_path)],
+            target=str(binary_path.parent), block_network=True,
+            capture_output=True, text=True, check=False, timeout=timeout,
+            errors="replace",
+        )
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError,
+            OSError) as e:
+        logger.warning(
+            "binary_oracle_edges: aflj aborted for %s: %s",
+            binary_path, e,
+        )
+        return BinaryEdgeIndex(binary_path=str(binary_path))
+    try:
+        fns = json.loads(fns_proc.stdout or "[]")
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("binary_oracle_edges: aflj parse failed for %s",
+                       binary_path)
+        return BinaryEdgeIndex(binary_path=str(binary_path))
+    if not isinstance(fns, list):
+        return BinaryEdgeIndex(binary_path=str(binary_path))
+
+    # Build addr → name map for resolving callee addresses.
+    addr_to_name: dict[int, str] = {}
+    for f in fns:
+        addr = _fn_addr(f)
+        name = f.get("name")
+        if addr is not None and isinstance(name, str):
+            addr_to_name[addr] = _clean_r2_function_name(name)
+
+    # Only functions with a resolvable entry address are eligible — the
+    # axffj script keys every batch on that address. A record missing
+    # both ``addr`` and ``offset`` (malformed / partial r2 output) is
+    # dropped here rather than KeyError-ing the whole extraction.
+    eligible_fns = [f for f in fns
+                    if not f.get("name", "").startswith("sym.imp.")
+                    and f.get("size", 0) > 0
+                    and _fn_addr(f) is not None]
+
+    # Single r2 invocation for ALL axffj calls (adversarial review
+    # B P2-2 perf cliff fix). The prior implementation re-ran the
+    # heavy ``aaa`` analyse-all step PER BATCH — on a 5k-function
+    # binary at BATCH=200 that's 25 redundant ``aaa`` runs, each
+    # taking seconds. Total: minutes instead of seconds for big
+    # binaries. The script-file approach drives a single r2 session
+    # so ``aaa`` runs once and every axffj reuses its analysis state.
+    #
+    # Use a script file (``r2 -i``) rather than a giant ``-c`` string
+    # — argv length limits (POSIX ARG_MAX, typically 128KB) would cap
+    # the latter at ~few-thousand axffj calls, below the size of any
+    # serious application.
+    index = BinaryEdgeIndex(binary_path=str(binary_path))
+    import tempfile
+    script_lines = ["aaa"]
+    for f in eligible_fns:
+        addr = _fn_addr(f)
+        script_lines.append(f"echo BATCH {addr}")
+        script_lines.append(f"axffj @ {addr}")
+    # Tier 2 rides the SAME r2 session: ``av`` reuses the ``aaa``
+    # analysis state already built above. A separate ``r2 -c "aaa;
+    # av"`` invocation re-ran the heavy analyse-all a second time —
+    # doubling the dominant cost of edge extraction per binary. The
+    # sentinel line splits the transcript so vtable text can't bleed
+    # into the last axffj batch's JSON.
+    script_lines.append(f"echo {_VTABLE_SENTINEL}")
+    script_lines.append("av")
+    # The r2 script lives in its OWN scratch directory, never in the
+    # target build dir: writing RAPTOR-controlled files into the tree
+    # being analysed both litters it and hands an attacker-writable
+    # location influence over what we execute. The scratch dir is
+    # passed as the sandbox ``output`` so it is bind-mounted (readable
+    # + writable) inside mount-ns — the per-sandbox /tmp would
+    # otherwise hide it from r2. TemporaryDirectory guarantees the
+    # script is removed however the block exits.
+    complete_run = True
+    try:
+        with tempfile.TemporaryDirectory(
+                prefix="raptor-bo-edges-") as scratch:
+            script_path = os.path.join(scratch, "axffj.r2")
+            with Path(script_path).open("w", encoding="utf-8") as script_file:
+                script_file.write("\n".join(script_lines) + "\n")
+            proc = _sandbox_run(
+                ["r2", "-q", "-i", script_path, str(binary_path)],
+                target=str(binary_path.parent), output=scratch,
+                block_network=True,
+                capture_output=True, text=True, check=False,
+                timeout=timeout, errors="replace",
+            )
+            if proc.returncode != 0:
+                # r2 killed mid-script (OOM, sandbox rlimit, signal)
+                # leaves a PARTIAL transcript. Parse it best-effort
+                # for THIS run — the witness is promote-only, so a
+                # partial edge set can only rescue fewer functions —
+                # but it must never be cached: a cached partial index
+                # is reused by every later run under this build-id
+                # and permanently forfeits the missing rescues while
+                # reading green (never cache a partial result — the
+                # exception paths' standing rule).
+                complete_run = False
+                logger.warning(
+                    "binary_oracle_edges: r2 rc=%s for %s — using "
+                    "partial edges for this run only, not caching",
+                    proc.returncode, binary_path,
+                )
+            axffj_part, vtable_part = _split_at_vtable_sentinel(
+                proc.stdout or "")
+            _parse_axffj_batch(axffj_part, addr_to_name, index)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError,
+            OSError) as e:
+        # OSError also covers scratch-dir / script creation failure —
+        # the module's contract is must-not-crash: degrade to "no
+        # binary evidence" (and never cache a partial result).
+        logger.warning(
+            "binary_oracle_edges: axffj script aborted for %s: %s",
+            binary_path, e,
+        )
+        return index
+
+    # Tier 2: vtable resolution. C++ virtual dispatch is the dominant
+    # share of source-graph "indirect" edges on real codebases (leveldb
+    # 9.3% indirect, mostly vtables). r2's ``av`` walks the binary's
+    # vtables and prints each slot's method; we treat every slot as a
+    # potentially-dispatched callee with a synthetic ``<vtable@<addr>>``
+    # caller. No-op on C binaries with no vtables.
+    vtable_edges = _parse_vtable_output(vtable_part, str(binary_path))
+    for edge in vtable_edges:
+        index.edges.append(edge)
+        index.callees.add(edge.callee)
+
+    if cache_file is not None and complete_run:
+        _save_cached_index(cache_file, index)
+        logger.info(
+            "binary_oracle_edges: cached %d edges for %s (build_id=%s)",
+            len(index.edges), binary_path.name, build_id[:12] if build_id else "")
+    return index
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — vtable resolution
+# ---------------------------------------------------------------------------
+
+# r2 ``av`` text output: a sequence of vtable blocks, each beginning
+# with ``Vtable Found at 0x<addr>`` followed by ``<slot_addr> :
+# <method>`` lines. No JSON variant exists in r2 today (``avj`` /
+# ``avrj`` return empty); we parse the text.
+_VTABLE_HEADER_RE = re.compile(r"Vtable Found at 0x([0-9a-fA-F]+)")
+_VTABLE_SLOT_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s*:\s*(\S+)")
+
+# Transcript separator between the axffj batches and the trailing
+# ``av`` output in the single-session script (see
+# ``extract_direct_call_edges``). Distinct from the ``BATCH `` prefix
+# and never produced by r2 itself.
+_VTABLE_SENTINEL = "RAPTOR_VTABLES"
+
+
+def _split_at_vtable_sentinel(output: str) -> tuple[str, str]:
+    """Split a combined script transcript into ``(axffj_part,
+    vtable_part)`` at the first :data:`_VTABLE_SENTINEL` line. A
+    transcript without the sentinel (r2 killed before reaching it)
+    is all axffj — the vtable part degrades to empty."""
+    before: list[str] = []
+    after: list[str] = []
+    seen = False
+    for raw_line in output.splitlines():
+        plain = re.sub(r"\x1b\[[\d;]*m", "", raw_line).strip()
+        if not seen and plain == _VTABLE_SENTINEL:
+            seen = True
+            continue
+        (after if seen else before).append(raw_line)
+    return "\n".join(before), "\n".join(after)
+
+
+def _parse_vtable_output(
+    output: str,
+    binary_path: str,
+) -> list[BinaryCallEdge]:
+    """Parse r2 ``av`` text and emit one synthetic edge per vtable
+    slot: ``<vtable@<addr>>`` → ``method``. Each method that appears in
+    any vtable slot is, by construction, a candidate target for the
+    binary's virtual dispatch sites — affirmative reachability evidence
+    source extraction often misses.
+
+    Returns an empty list when the text carries no vtables (pure C
+    binary, stripped binary where vtable detection fails) — over-
+    approximating vtables would create false-promote, which the
+    suppression direction can't tolerate."""
+    edges: list[BinaryCallEdge] = []
+    current_vtable: str | None = None
+    for line in (output or "").splitlines():
+        # Strip ANSI escapes r2 emits in interactive-style output.
+        plain = re.sub(r"\x1b\[[\d;]*m", "", line)
+        m_hdr = _VTABLE_HEADER_RE.search(plain)
+        if m_hdr:
+            current_vtable = f"<vtable@0x{m_hdr.group(1).lower()}>"
+            continue
+        if current_vtable is None:
+            continue
+        m_slot = _VTABLE_SLOT_RE.match(plain)
+        if not m_slot:
+            continue
+        method = _clean_r2_function_name(m_slot.group(1))
+        # Filter slot junk: pure-virtual placeholders (``0x00000000``),
+        # bare hex addresses r2 couldn't resolve, section markers
+        # (``section.text``), and r2-internal location names
+        # (``loc.NNN``) — none of these are real callees.
+        if not method or method.startswith(
+                ("0x", "section.", "loc.", "0")):
+            continue
+        # Require at least one non-hex character somewhere in the
+        # name to weed out raw addresses that slipped through.
+        if not any(c.isalpha() or c == "_" for c in method):
+            continue
+        edges.append(BinaryCallEdge(
+            caller=current_vtable, callee=method,
+            binary_path=binary_path,
+        ))
+    return edges
+
+
+# Graph-store edge kinds that represent calls (vs contains/xref rows).
+_CALL_KINDS = frozenset({"CALLS", "CALLS_FUNCTION", "CALLS_SURFACE"})
+
+_R2_PREFIXES = ("sym.", "method.", "func.", "fcn.", "dbg.", "imp.")
+
+
+def _clean_r2_function_name(name: str) -> str:
+    """r2 prefixes functions with one of ``sym.``, ``method.``,
+    ``func.``, ``fcn.``, ``dbg.``, ``imp.`` (PLT stub) depending on
+    source (symbol table, decoded vtable, recovered, DWARF debug-info,
+    PLT). Strip the prefix(es) iteratively — r2 can stack prefixes
+    (``sym.imp.malloc`` → ``malloc``, ``method.sym.X`` → ``X``)."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _R2_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                changed = True
+                break
+    return name
+
+
+def _parse_axffj_batch(
+    output: str,
+    addr_to_name: dict[int, str],
+    index: BinaryEdgeIndex,
+) -> None:
+    """Parse the concatenated axffj output: ``BATCH <addr>`` separators
+    delimit each function's refs, each refs block is a JSON array of
+    ``{type, at, ref, name}``."""
+    current_caller: str | None = None
+    buf: list[str] = []
+    for raw_line in output.splitlines():
+        line = re.sub(r"\x1b\[[\d;]*m", "", raw_line)
+        if line.startswith("BATCH "):
+            _flush_axffj(buf, current_caller, addr_to_name, index)
+            try:
+                caller_addr = int(line[len("BATCH "):], 0)
+                current_caller = addr_to_name.get(caller_addr)
+            except ValueError:
+                current_caller = None
+            buf = []
+        else:
+            buf.append(line)
+    _flush_axffj(buf, current_caller, addr_to_name, index)
+
+
+def _flush_axffj(
+    buf: list[str],
+    caller: str | None,
+    addr_to_name: dict[int, str],
+    index: BinaryEdgeIndex,
+) -> None:
+    """Parse a single function's axffj JSON output and append CALL
+    edges to the index. A malformed (truncated) JSON block from a
+    crashed/killed r2 emits one bad batch in the middle of the
+    stream; we log + skip rather than silently swallow."""
+    if not caller or not buf:
+        return
+    text = "\n".join(buf).strip()
+    if not text or text == "[]":
+        return
+    try:
+        refs = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "binary_oracle_edges: dropped axffj batch for %s: "
+            "malformed JSON (%s)", caller, e,
+        )
+        return
+    if not isinstance(refs, list):
+        return
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        if ref.get("type") != "CALL":
+            continue
+        callee_addr = ref.get("ref")
+        if not isinstance(callee_addr, int):
+            continue
+        callee_name = addr_to_name.get(callee_addr)
+        if not callee_name:
+            # Use the ref's name when r2 has it (matches sym.imp.printf
+            # style for library calls).
+            raw = ref.get("name")
+            if isinstance(raw, str):
+                callee_name = _clean_r2_function_name(raw)
+        if not callee_name:
+            continue
+        index.edges.append(BinaryCallEdge(
+            caller=caller, callee=callee_name,
+            binary_path=index.binary_path,
+        ))
+        index.callees.add(callee_name)
+
+
+def load_cached_edge_index(binary_path: Path) -> BinaryEdgeIndex | None:
+    """Cache-only edge-index lookup — NEVER invokes r2.
+
+    Consults the two persisted edge sources in order:
+
+      1. an existing binary graph store (``/understand --map`` output,
+         matched by content sha256), then
+      2. the per-build-id edge cache written by
+         ``extract_direct_call_edges`` (populated by ``/agentic`` /
+         ``/codeql`` ``--binary-edges`` runs — Inc 2b).
+
+    Returns ``None`` on any miss. Consumers that must stay fast (audit
+    prep) use this instead of ``extract_direct_call_edges`` so a cold
+    cache costs one identity read, not a 10-30s r2 ``aaa`` run.
+    """
+    binary_path = Path(binary_path)
+    if not binary_path.is_file():
+        return None
+    from_graph = _try_graph_store(binary_path)
+    if from_graph is not None:
+        return from_graph
+    cache_key = _identity_cache_key(binary_path)
+    cache_file = _cache_path_for(cache_key) if cache_key else None
+    if cache_file is None:
+        return None
+    cached = _load_cached_index(cache_file, str(binary_path))
+    if cached is not None:
+        logger.debug(
+            "binary_oracle_edges: cache-only hit for %s (%d edges)",
+            binary_path.name, len(cached.edges),
+        )
+    return cached
+
+
+def annotate_inventory_with_edges(
+    inventory: dict,
+    indices: list[BinaryEdgeIndex],
+) -> dict[str, int]:
+    """Walk the inventory and mark each native-language item whose
+    name is a binary-edge callee in ANY of the supplied indices.
+    Per-item annotation: ``metadata.binary_oracle_edges = [{caller,
+    binary_path}, ...]``. Top-level summary:
+    ``inventory.binary_oracle_edges = {n_callees, n_binaries}``.
+
+    Best-effort — non-native items are skipped, missing metadata is
+    silently initialised, exceptions logged at debug. Returns a small
+    counts dict for caller-side logging."""
+    counts = {"annotated": 0, "total_edges": 0}
+    if not indices:
+        return counts
+    # Map: callee_name → list of (caller, binary_path)
+    edges_by_callee: dict[str, list[tuple[str, str]]] = {}
+    for idx in indices:
+        for edge in idx.edges:
+            edges_by_callee.setdefault(edge.callee, []).append(
+                (edge.caller, edge.binary_path))
+            counts["total_edges"] += 1
+
+    from .binary_oracle import _NATIVE_LANGUAGES
+    files = inventory.get("files") or []
+    for f in files:
+        lang = (f.get("language") or "").lower()
+        if lang not in _NATIVE_LANGUAGES:
+            continue
+        for item in f.get("items") or []:
+            if item.get("kind", "function") != "function":
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or name not in edges_by_callee:
+                continue
+            meta = item.get("metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+                item["metadata"] = meta
+            meta["binary_oracle_edges"] = [
+                {"caller": caller, "binary_path": bp}
+                for caller, bp in edges_by_callee[name]
+            ]
+            counts["annotated"] += 1
+    if counts["annotated"]:
+        inventory["binary_oracle_edges"] = {
+            "n_callees_with_edges": counts["annotated"],
+            "n_binaries":           len(indices),
+            "total_edges":          counts["total_edges"],
+        }
+    return counts
+
+
+__all__ = [
+    "BinaryCallEdge",
+    "BinaryEdgeIndex",
+    "annotate_inventory_with_edges",
+    "extract_direct_call_edges",
+    "load_cached_edge_index",
+]

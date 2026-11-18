@@ -1,0 +1,1244 @@
+"""Multi-language identifier/concept resolution for the study loop.
+
+The reading-list study loop verifies external-contract assumptions a
+review relied on ("Does ``json.loads`` reject NaN?") against the actual
+source.  The C/C++ path lives in ``libexec/raptor-study-prep``; this
+module is the equivalent resolution machinery for the other first-class
+languages: Python, Go, Java, JavaScript/TypeScript, Rust, PHP, Kotlin,
+C#, and Swift.
+
+Two resolution modes, mirroring the C/C++ study-prep shapes:
+
+- **identifier**: find the type/function/constant a question names,
+  extract its definition and doc comment via the inventory extractor
+  layer (tree-sitter when installed, AST/regex fallback otherwise),
+  and emit :class:`~core.concepts.model.StudyItem` records that
+  ``run_study`` consumes unchanged.
+- **concept**: find module/package docs and README sections relevant
+  to the question, emitted in the ``related_docs`` shape that
+  ``run_study`` already loads as prompt context.
+
+Honest boundaries: identifiers that cannot be statically resolved
+(dynamic dispatch, monkey-patching, external dependencies) are returned
+as *unresolved with a reason* — never guessed.  The study consumer marks
+the originating reading-list item unresolvable rather than treating it
+as resolved-clean.
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from core.inventory.extractors import (
+    KIND_CLASS,
+    KIND_FUNCTION,
+    KIND_GLOBAL,
+    KIND_MACRO,
+    extract_items,
+)
+from core.inventory.languages import LANGUAGE_MAP
+
+from .model import StudyItem
+from core.source.lines import split_lines
+
+logger = logging.getLogger(__name__)
+
+_SORT_CONTENTS_IMPL = sorted
+
+# rglob scan budget for header-stem sibling directories (entries
+# VISITED, not matched) — bounds directory materialisation on scanned
+# targets. Wide enough for real include trees; a subtree wider than
+# this is scanned partially rather than slurped.
+_STEM_DIR_SCAN_BOUND = 10_000
+
+
+def _read_capped(path: Path, max_chars: int | None = None) -> str | None:
+    """Capped text read of scanned-target content (degrades to None).
+
+    Routes through ``core.source.read_text_capped`` so every read this
+    module performs over the (untrusted) target tree pays a byte
+    budget; truncation degrades to the capped prefix.
+    """
+    from core.source import read_text_capped
+
+    if max_chars is None:
+        got = read_text_capped(path)
+    else:
+        got = read_text_capped(path, max_chars)
+    return None if got is None else got[0]
+
+
+# ------------------------------------------------------------------
+# Language support
+# ------------------------------------------------------------------
+
+#: Languages the study loop can resolve identifiers in (beyond C/C++).
+#: Follows the inventory extractor layer: each of these has a wired
+#: tree-sitter grammar branch plus an AST/regex fallback.
+STUDY_LANGUAGES: frozenset[str] = frozenset({
+    "python", "go", "java", "javascript", "typescript", "tsx", "rust",
+    "php", "kotlin", "csharp", "swift",
+})
+
+#: File suffixes covered by :data:`STUDY_LANGUAGES`.
+STUDY_SUFFIXES: frozenset[str] = frozenset(
+    suffix for suffix, lang in LANGUAGE_MAP.items()
+    if lang in STUDY_LANGUAGES
+)
+
+_C_SUFFIXES = frozenset(
+    suffix for suffix, lang in LANGUAGE_MAP.items() if lang in ("c", "cpp")
+)
+
+
+def language_for_path(path: str | Path | None) -> str | None:
+    """Study-resolvable language for *path*, or None.
+
+    C/C++ returns None here — that path is handled by the dedicated
+    study-prep machinery, not this module. None and other
+    non-path-like values answer None: callers feed this straight
+    from LLM-authored artifacts where a path field can arrive null.
+    """
+    if not isinstance(path, (str, Path)):
+        return None
+    suffix = Path(path).suffix.lower()
+    lang = LANGUAGE_MAP.get(suffix)
+    return lang if lang in STUDY_LANGUAGES else None
+
+
+def is_study_supported_path(path: str | Path | None) -> bool:
+    """True when the study loop has ANY resolver for *path* (C/C++ or
+    one of :data:`STUDY_LANGUAGES`). None and other non-path-like
+    values are unsupported, same contract as
+    :func:`language_for_path`."""
+    if not isinstance(path, (str, Path)):
+        return False
+    suffix = Path(path).suffix.lower()
+    return suffix in _C_SUFFIXES or suffix in STUDY_SUFFIXES
+
+
+# ------------------------------------------------------------------
+# Result container
+# ------------------------------------------------------------------
+
+@dataclass
+class LangResolution:
+    """Outcome of a multi-language resolution pass."""
+
+    items: list[StudyItem] = field(default_factory=list)
+    #: ``[{"name", "reason", "language"}]`` — identifiers that could
+    #: not be statically resolved.  The consumer marks the originating
+    #: reading-list items unresolvable with the recorded reason.
+    unresolved: list[dict] = field(default_factory=list)
+    #: ``[{"file", "reason"}]`` — same shape study-prep writes; loaded
+    #: by ``run_study`` as doc context.
+    related_docs: list[dict] = field(default_factory=list)
+
+
+# ------------------------------------------------------------------
+# Identifier extraction from questions
+# ------------------------------------------------------------------
+
+_BACKTICK_RE = re.compile(r"`([A-Za-z_][\w.:]*)`")
+_DOTTED_RE = re.compile(
+    r"\b([A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)+)\b",
+)
+_BARE_RE = re.compile(
+    r"\b([A-Za-z_]\w*_\w+|[A-Z][a-z]+[A-Z]\w*|[a-z]+[A-Z]\w*)\b",
+)
+# PHP instance access: the receiver of ``$obj->method`` is a runtime
+# value, so only the member name is statically resolvable — extract
+# the tail alone (static ``Class::method`` keeps its qualifier via
+# the dotted pattern above).
+_PHP_ARROW_RE = re.compile(r"\$[A-Za-z_]\w*\s*->\s*([A-Za-z_]\w*)")
+
+_QUESTION_STOPWORDS = frozenset({
+    # question scaffolding that survives the shape filters
+    "does_not", "is_not", "non_zero", "so_called",
+})
+
+
+def extract_question_identifiers(
+    question: str, context: str = "",
+) -> list[str]:
+    """Candidate identifiers named by a reading-list question.
+
+    Order of preference: backtick-quoted names, dotted/qualified paths
+    (``json.loads``, ``bytes::from``), then bare identifier-shaped
+    tokens (snake_case, CamelCase, mixedCase).  Plain lowercase words
+    are ignored — they are prose, not identifiers.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(name: str) -> None:
+        name = name.strip(".:")
+        if not name or name.lower() in _QUESTION_STOPWORDS:
+            return
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+
+    for text in (question, context):
+        if not text:
+            continue
+        for m in _BACKTICK_RE.finditer(text):
+            _add(m.group(1))
+        for m in _DOTTED_RE.finditer(text):
+            _add(m.group(1))
+        for m in _PHP_ARROW_RE.finditer(text):
+            _add(m.group(1))
+        for m in _BARE_RE.finditer(text):
+            _add(m.group(1))
+    return out
+
+
+def identifier_tail(name: str) -> str:
+    """Last path segment of a qualified identifier
+    (``json.loads`` → ``loads``, ``Vec::new`` → ``new``,
+    ``$obj->method`` → ``method``)."""
+    return re.split(r"\.|::|->", name)[-1]
+
+
+# ------------------------------------------------------------------
+# Source-tree walking
+# ------------------------------------------------------------------
+
+_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "vendor", "third_party",
+    "third-party", "external", "dist", "__pycache__", ".venv", "venv",
+    ".tox", ".mypy_cache", ".pytest_cache", "site-packages",
+})
+
+
+def has_study_sources(root: Path) -> bool:
+    """True when *root* contains at least one non-C study-resolvable
+    source file (vendor dirs excluded)."""
+    return bool(_iter_source_files(Path(root), max_files=1))
+
+
+def _iter_source_files(
+    root: Path, *, max_files: int = 4000,
+    suffixes: frozenset[str] | None = None,
+) -> list[Path]:
+    """Supported-language source files under *root*, vendor dirs skipped."""
+    wanted = STUDY_SUFFIXES if suffixes is None else suffixes
+    out: list[Path] = []
+    stack = [root]
+    while stack and len(out) < max_files:
+        d = stack.pop()
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if len(out) >= max_files:
+                break
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name not in _SKIP_DIRS and not entry.name.startswith("."):
+                        stack.append(entry)
+                    continue
+                if entry.suffix.lower() in wanted and entry.is_file():
+                    out.append(entry)
+            except OSError:
+                continue
+    return out
+
+
+# ------------------------------------------------------------------
+# Include-chase scoping (C/C++)
+# ------------------------------------------------------------------
+
+# Bounds for the include-graph chase.  Depth 3 covers the observed
+# shared-header shape (source.c → local.h → <sub/umbrella.h> →
+# <sub/detail.h>); the file cap keeps a kernel-sized fan-out bounded.
+_INCLUDE_CHASE_MAX_DEPTH = 3
+_INCLUDE_CHASE_MAX_FILES = 400
+
+_INCLUDE_RE = re.compile(r'#\s*include\s*[<"]([^>"]+)[>"]')
+
+
+def include_scope_files(
+    source_root: Path,
+    source_file: str,
+    *,
+    max_depth: int = _INCLUDE_CHASE_MAX_DEPTH,
+    max_files: int = _INCLUDE_CHASE_MAX_FILES,
+) -> list[Path]:
+    """Files reachable from *source_file*'s ``#include`` graph.
+
+    A study question's identifiers are overwhelmingly defined either
+    in the request's subsystem directory or in a header its source
+    file (transitively) includes.  The subsystem pass covers the
+    former; this chase supplies the latter — on a tree large enough
+    to defeat the flat root-scan cap, a definition sitting in a
+    shared header root (``include/linux/...``) is otherwise reported
+    as not-found even though it is plainly reachable from the
+    reviewed code.
+
+    Quoted includes resolve against the including file's directory
+    first; both forms then fall back to the tree root and its
+    conventional header roots (``include/``, ``include/uapi/``).
+    Every resolved header whose sibling directory shares its stem
+    (``linux/widget.h`` → ``linux/widget/``) pulls that directory's
+    headers in too — the umbrella-plus-directory split is standard
+    kernel layout.  Non-C/C++ source files return ``[]``: import
+    graphs for the other study languages don't map onto files this
+    way, and their trees are covered by the existing passes.
+
+    Containment: candidates must resolve inside the resolved root, so
+    a chase can never follow ``..`` or a symlink out of the pinned
+    tree.  Results are returned as paths under *source_root* as given
+    (unresolved), matching how the resolver derives relative paths.
+    """
+    root = Path(source_root)
+    start = root / source_file
+    if start.suffix.lower() not in _C_SUFFIXES:
+        return []
+    try:
+        root_res = root.resolve()
+    except OSError:
+        return []
+    # The chase START file must satisfy the same containment the
+    # candidates do — source_file is a reading-list item field
+    # (LLM/audit-derived), and an absolute or ``..``-carrying value
+    # otherwise escapes the pinned tree before the first candidate is
+    # ever checked (the escaped file's text would be read and scanned
+    # for #include lines).
+    from core.paths import confine
+    if confine(root, source_file) is None:
+        return []
+    if not start.is_file():
+        return []
+
+    def _contained(p: Path) -> bool:
+        try:
+            return p.resolve().is_relative_to(root_res)
+        except OSError:
+            return False
+
+    fallback_dirs = [root, root / "include", root / "include" / "uapi"]
+    out: list[Path] = []
+    seen: set[Path] = {start}
+
+    def _add(p: Path) -> bool:
+        if p in seen or len(out) >= max_files or not _contained(p):
+            return False
+        seen.add(p)
+        out.append(p)
+        return True
+
+    def _expand_stem_dir(header: Path) -> None:
+        sib = header.parent / header.stem
+        if not sib.is_dir() or sib.is_symlink():
+            return
+        # Iterate lazily with a scan bound, then sort the matches:
+        # sorted(rglob("*")) materialised the WHOLE subtree before the
+        # cap ran, so a huge scanned-target directory ballooned memory
+        # for a handful of wanted files. The bound trades exhaustive
+        # coverage of pathologically wide subtrees for a fixed scan
+        # budget; matches within the budget stay deterministic via the
+        # post-scan sort.
+        matches: list[Path] = []
+        scanned = 0
+        try:
+            for e in sib.rglob("*"):
+                scanned += 1
+                if scanned > _STEM_DIR_SCAN_BOUND:
+                    break
+                try:
+                    if e.is_file() and e.suffix.lower() in _C_SUFFIXES:
+                        matches.append(e)
+                except OSError:
+                    continue
+        except OSError:
+            return
+        for e in sorted(matches):
+            if len(out) >= max_files:
+                return
+            _add(e)
+
+    frontier = [start]
+    for _depth in range(max_depth):
+        if not frontier or len(out) >= max_files:
+            break
+        next_frontier: list[Path] = []
+        for f in frontier:
+            # Capped: include lines live near the top; a pathological
+            # header must not be slurped whole to find them.
+            got = _read_capped(f)
+            if got is None:
+                continue
+            text = got
+            for ref in _INCLUDE_RE.findall(text):
+                if len(out) >= max_files:
+                    break
+                for d in (f.parent, *fallback_dirs):
+                    cand = d / ref
+                    try:
+                        if not cand.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    if _add(cand):
+                        next_frontier.append(cand)
+                        _expand_stem_dir(cand)
+                    # First existing candidate satisfies the ref,
+                    # whether or not it was new/contained.
+                    break
+        frontier = next_frontier
+    return out
+
+
+# ------------------------------------------------------------------
+# Doc comments
+# ------------------------------------------------------------------
+
+_LINE_COMMENT = {
+    "go": ("//",),
+    "java": ("//",),
+    "javascript": ("//",),
+    "typescript": ("//",),
+    "tsx": ("//",),
+    "rust": ("///", "//!", "//"),
+    "python": ("#",),
+    "php": ("//", "#"),
+    "kotlin": ("//",),
+    "csharp": ("///", "//"),
+    "swift": ("///", "//"),
+}
+
+# Lines that sit between a doc comment and the definition and should be
+# skipped while scanning upwards (annotations / attributes / decorators).
+_ATTR_LINE = re.compile(r"^\s*(?:@\w|#\[|#!\[)")
+
+
+def _doc_comment_above(
+    lines: list[str], def_line: int, language: str,
+) -> str:
+    """Contiguous comment block immediately above *def_line* (1-based)."""
+    prefixes = _LINE_COMMENT.get(language, ("//",))
+    collected: list[str] = []
+    i = def_line - 2  # index of the line above the definition
+    # Skip attribute/annotation/decorator lines
+    while i >= 0 and _ATTR_LINE.match(lines[i]):
+        i -= 1
+    # Block comment ending directly above (/** ... */ or /* ... */)
+    if i >= 0 and lines[i].strip().endswith("*/"):
+        block: list[str] = []
+        while i >= 0:
+            block.append(lines[i])
+            if lines[i].lstrip().startswith(("/*", "/**")):
+                break
+            i -= 1
+        block.reverse()
+        text = "\n".join(
+            ln.strip().lstrip("/*").rstrip("*/").lstrip("*").strip()
+            for ln in block
+        ).strip()
+        return text[:1000]
+    # Line-comment block
+    while i >= 0:
+        stripped = lines[i].strip()
+        matched = next((p for p in prefixes if stripped.startswith(p)), None)
+        if matched is None:
+            break
+        collected.append(stripped[len(matched):].strip())
+        i -= 1
+    collected.reverse()
+    return "\n".join(collected).strip()[:1000]
+
+
+def _python_docstrings(content: str) -> dict[tuple[str, int], str]:
+    """Map ``(name, lineno)`` → docstring for defs/classes in *content*."""
+    out: dict[tuple[str, int], str] = {}
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            doc = ast.get_docstring(node)
+            if doc:
+                out[(node.name, node.lineno)] = doc[:1000]
+    return out
+
+
+# ------------------------------------------------------------------
+# Constant / definition regex fallback
+# ------------------------------------------------------------------
+
+def _const_pattern(language: str, name: str) -> re.Pattern | None:
+    esc = re.escape(name)
+    if language == "python":
+        return re.compile(rf"^{esc}[ \t]*(?::[^=\n]+)?=[ \t]*\S", re.MULTILINE)
+    if language == "go":
+        # The assignment branch's separator is subsumed by the value
+        # class ([^=\n] includes horizontal whitespace) — the naive
+        # ``[ \t]+[^=\n]*`` overlapped two spans, quadratic on a
+        # name followed by a whitespace run with no '='. Same
+        # language.
+        return re.compile(
+            rf"^[ \t]*(?:const|var)\s+(?:\([ \t]*)?{esc}\b|"
+            rf"^[ \t]*{esc}[ \t][^=\n]*=",
+            re.MULTILINE,
+        )
+    if language == "rust":
+        # The visibility spec's class excludes newlines: an
+        # unterminated ``pub(`` otherwise re-scans to EOF from every
+        # line's anchor (quadratic on ``pub(`` floods). Trade-off: a
+        # visibility spec split across lines won't match — acceptable
+        # for this regex fallback tier.
+        return re.compile(
+            rf"^[ \t]*(?:pub(?:\([^)\n]*\))?\s+)?(?:const|static)\s+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "java":
+        # ``final``/``static`` field declarations. Horizontal-only
+        # ``[ \t]+`` after each modifier: interior ``\s+`` under the
+        # MULTILINE ^-anchors let the modifier loop swallow
+        # newline-separated keyword floods from every line's anchor
+        # (quadratic on keyword floods). Each branch's required
+        # keyword stays out of its own modifier loop, and the
+        # type/name separator is a single ``[ \t]`` after a type
+        # class that itself absorbs blanks — a variable-length
+        # separator overlapping the type class was quadratic on
+        # space floods. Trade-off: a declaration split across lines
+        # won't match — acceptable for this regex fallback tier.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|static)[ \t]+)*"
+            rf"final[ \t]+\w[\w<>\[\], \t]*[ \t]{esc}\s*=|"
+            rf"^[ \t]*(?:(?:public|private|protected|final)[ \t]+)*"
+            rf"static[ \t]+\w[\w<>\[\], \t]*[ \t]{esc}\s*=",
+            re.MULTILINE,
+        )
+    if language in ("javascript", "typescript", "tsx"):
+        return re.compile(
+            rf"^[ \t]*(?:export\s+)?(?:const|let|var)\s+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "php":
+        # ``const`` (module or class scope, optionally typed) and the
+        # runtime ``define('NAME', ...)`` form. Horizontal-only
+        # ``[ \t]+`` between the keywords: interior ``\s+`` under a
+        # MULTILINE ^-anchor is quadratic on keyword/blank floods.
+        # Trade-off: a declaration split across lines won't match —
+        # acceptable for this regex fallback tier.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|final)[ \t]+)*"
+            rf"const[ \t]+(?:\w+[ \t]+)?{esc}\s*=|"
+            rf"\bdefine\s*\(\s*['\"]{esc}['\"]",
+            re.MULTILINE,
+        )
+    if language == "kotlin":
+        # ``const val`` compile-time constants and top-level/object
+        # ``val`` bindings. Horizontal-only ``[ \t]+`` between the
+        # keywords — same flood-safety/split-across-lines trade-off
+        # as the php arm above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)?"
+            rf"(?:const[ \t]+)?val[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "csharp":
+        # ``const`` fields and ``static readonly`` fields — the two
+        # C# constant spellings. Like the Java arm, each branch's
+        # required keyword stays out of its own modifier loop, the
+        # type/name separator is a single ``[ \t]`` after a type
+        # class that itself absorbs blanks, and inter-keyword
+        # whitespace is horizontal-only (interior ``\s+`` under a
+        # MULTILINE ^-anchor is quadratic on keyword floods).
+        # Trade-off: a declaration split across lines won't match —
+        # acceptable for this regex fallback tier.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)*"
+            rf"const[ \t]+\w[\w<>\[\],. \t]*[ \t]{esc}\s*=|"
+            rf"^[ \t]*(?:(?:public|private|protected|internal|static)[ \t]+)*"
+            rf"readonly[ \t]+\w[\w<>\[\],. \t]*[ \t]{esc}\s*=",
+            re.MULTILINE,
+        )
+    if language == "swift":
+        # ``let`` constants (optionally typed, optionally scoped
+        # ``static``/``class``). Horizontal-only ``[ \t]+`` — same
+        # flood-safety/split-across-lines trade-off as the arms above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|internal|fileprivate|open"
+            rf"|static|class|final)[ \t]+)*let[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    return None
+
+
+# Type/class definitions — the inventory extractor emits functions and
+# globals as items but records classes only as method metadata, so type
+# lookups need their own pass.
+def _type_pattern(language: str, name: str) -> re.Pattern | None:
+    esc = re.escape(name)
+    if language == "python":
+        return re.compile(rf"^class\s+{esc}\b", re.MULTILINE)
+    if language == "go":
+        return re.compile(
+            rf"^type\s+{esc}\s+(?:struct|interface)\b", re.MULTILINE,
+        )
+    if language == "rust":
+        # Newline-free visibility class — same flood-safety and
+        # split-across-lines trade-off as the const pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:pub(?:\([^)\n]*\))?\s+)?"
+            rf"(?:struct|enum|trait|union|type)\s+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "java":
+        # Horizontal-only ``[ \t]+`` after each modifier — same
+        # flood-safety and split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|abstract|final|static)[ \t]+)*"
+            rf"(?:class|interface|enum|record)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language in ("javascript", "typescript", "tsx"):
+        # Bounded keyword gaps (\s{1,64}): unbounded ``\s+`` let
+        # every line anchor re-scan a shared whitespace run before
+        # failing at the name — quadratic over planted keyword lines.
+        # 64 whitespace chars per gap sits far above real code.
+        return re.compile(
+            rf"^[ \t]*(?:export\s{{1,64}})?(?:abstract\s{{1,64}})?"
+            rf"(?:class|interface|enum|type)\s{{1,64}}{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "php":
+        # Horizontal-only ``[ \t]+`` between keywords — same
+        # flood-safety/split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:abstract|final|readonly)[ \t]+)*"
+            rf"(?:class|interface|trait|enum)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "kotlin":
+        # ``enum class`` / ``data class`` etc. fall out of the
+        # modifier loop naturally (``enum``/``data`` are modifiers
+        # here). Horizontal-only ``[ \t]+`` — same flood-safety/
+        # split-across-lines trade-off as the const pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|internal|abstract|final|open"
+            rf"|sealed|data|enum|annotation|inner)[ \t]+)*"
+            rf"(?:class|interface|object)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "csharp":
+        # Horizontal-only ``[ \t]+`` between keywords — same
+        # flood-safety/split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|internal|abstract"
+            rf"|sealed|static|partial|readonly)[ \t]+)*"
+            rf"(?:class|interface|struct|enum|record)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "swift":
+        # Horizontal-only ``[ \t]+`` between keywords — same
+        # flood-safety/split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|internal|fileprivate|open"
+            rf"|final|indirect)[ \t]+)*"
+            rf"(?:class|struct|enum|protocol|actor|typealias)"
+            rf"[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    return None
+
+
+def _slice_block(lines: list[str], start_line: int, *, max_lines: int = 60) -> str:
+    """Definition text from *start_line* (1-based) to the end of its
+    brace-balanced block (or dedent for Python), capped."""
+    i = start_line - 1
+    if i >= len(lines):
+        return ""
+    first = lines[i]
+    indent = len(first) - len(first.lstrip())
+    depth = 0
+    seen_open = False
+    end = min(len(lines), i + max_lines)
+    j = i
+    while j < end:
+        line = lines[j]
+        depth += line.count("{") - line.count("}")
+        if "{" in line:
+            seen_open = True
+        if seen_open and depth <= 0:
+            j += 1
+            break
+        if (
+            not seen_open
+            and j > i
+            and line.strip()
+            and (len(line) - len(line.lstrip())) <= indent
+        ):
+            break
+        j += 1
+    return "\n".join(lines[i:j])[:_MAX_DEFINITION_CHARS]
+
+
+# Identifier appears as a dynamic attribute assignment — evidence of
+# monkey-patching / prototype patching we refuse to "resolve".
+def _dynamic_assignment_found(
+    contents: dict[Path, tuple[str, str]], name: str,
+) -> bool:
+    tail = identifier_tail(name)
+    pattern = re.compile(rf"[\w\)\]]\.{re.escape(tail)}\s*=[^=]")
+    # PHP's analog is a closure assigned to a property — dynamic
+    # method injection. The RHS keyword requirement is what keeps
+    # ordinary property initialisation (``$this->total = 0``) from
+    # mislabelling an unresolved identifier as monkey-patching.
+    php_pattern = re.compile(
+        rf"->\s*{re.escape(tail)}\s*=\s*(?:static[ \t]+)?(?:function|fn)\b",
+    )
+    for lang, content in contents.values():
+        if tail not in content:
+            continue
+        if lang == "python" and re.search(
+            # Bounded first-argument span: unbounded, every "setattr("
+            # planted in hostile source re-scans the rest of it —
+            # quadratic. Real receiver expressions sit far below the
+            # bound.
+            rf"\bsetattr\s*\([^,]{{1,500}},\s*['\"]{re.escape(tail)}['\"]",
+            content,
+        ):
+            return True
+        # Scoped to PHP contents so C's ``ps->field = v`` never trips
+        # the reason.
+        if lang == "php" and php_pattern.search(content):
+            return True
+        if pattern.search(content):
+            return True
+    return False
+
+
+# ------------------------------------------------------------------
+# Kind mapping (mirror the C/C++ study-prep item shapes)
+# ------------------------------------------------------------------
+
+_KIND_MAP = {
+    KIND_FUNCTION: "function",
+    KIND_CLASS: "struct",
+    KIND_GLOBAL: "macro",
+    KIND_MACRO: "macro",
+}
+
+_CALL_RE = re.compile(r"\b([A-Za-z_]\w{2,})\s*\(")
+_CALL_STOPWORDS = frozenset({
+    "if", "for", "while", "switch", "return", "catch", "match",
+    "assert", "print", "println", "printf", "len", "cap", "new",
+    "make", "range", "defer", "func", "fn", "def", "lambda", "super",
+    "self", "this", "typeof", "instanceof", "await", "async", "yield",
+    "raise", "except", "elif", "else", "try", "with", "import",
+})
+
+
+def _extract_calls(definition: str) -> list[str]:
+    calls: list[str] = []
+    seen: set[str] = set()
+    for m in _CALL_RE.finditer(definition):
+        name = m.group(1)
+        if name in _CALL_STOPWORDS or name in seen:
+            continue
+        seen.add(name)
+        calls.append(name)
+        if len(calls) >= 20:
+            break
+    return calls
+
+
+# ------------------------------------------------------------------
+# Identifier resolution
+# ------------------------------------------------------------------
+
+_MAX_MATCHES_PER_IDENT = 5
+_MAX_DEFINITION_CHARS = 2400
+
+
+def resolve_identifiers(
+    source_root: Path,
+    identifiers: list[str],
+    *,
+    scope: Path | None = None,
+    files: list[Path] | None = None,
+    max_files: int = 4000,
+    include_c: bool = False,
+) -> LangResolution:
+    """Resolve *identifiers* against non-C sources under *scope*
+    (default: *source_root*).
+
+    With ``include_c`` True, C/C++ sources are resolved too — the
+    study consumer's per-batch splice for questions raised after the
+    one-shot C study-prep (which never re-runs, so the study corpus
+    otherwise never gains definitions for them).
+
+    With ``files`` set, exactly those files are scanned instead of
+    walking a directory — the include-chase pass hands the resolver a
+    targeted file set (a huge tree defeats both the flat cap and any
+    per-directory scope when the definition lives in a shared header
+    root such as ``include/``).
+
+    Returns study items for every definition found, plus an
+    ``unresolved`` record (with reason) for each identifier that has no
+    static definition in the scanned tree.
+    """
+    result = LangResolution()
+    if not identifiers:
+        return result
+
+    root = Path(source_root)
+    suffixes = (
+        frozenset(STUDY_SUFFIXES | _C_SUFFIXES) if include_c else None
+    )
+    if files is not None:
+        wanted = STUDY_SUFFIXES if suffixes is None else suffixes
+        files = [
+            f for f in files
+            if f.suffix.lower() in wanted and f.is_file()
+        ][:max_files]
+    else:
+        files = _iter_source_files(
+            Path(scope) if scope else root,
+            max_files=max_files,
+            suffixes=suffixes,
+        )
+    if not files:
+        for name in identifiers:
+            result.unresolved.append({
+                "name": name,
+                "language": "",
+                "reason": "no study-resolvable source files in scope",
+            })
+        return result
+
+    # Candidates keyed by FULL identifier: two identifiers sharing a
+    # tail (json.loads / pickle.loads) must EACH end up resolved or in
+    # the unresolved report — a tail-keyed dict kept only one and the
+    # other silently vanished from the caller's accounting.
+    candidates: list[tuple[str, str]] = []
+    _seen_idents: set[str] = set()
+    for n in identifiers:
+        if n not in _seen_idents:
+            _seen_idents.add(n)
+            candidates.append((n, identifier_tail(n)))
+    tails_ordered: list[str] = list(dict.fromkeys(t for _, t in candidates))
+    idents_by_tail: dict[str, list[str]] = {}
+    for orig, tail in candidates:
+        idents_by_tail.setdefault(tail, []).append(orig)
+
+    def _lang_for(path: Path) -> str | None:
+        lang = language_for_path(path)
+        if lang is None and include_c:
+            candidate = LANGUAGE_MAP.get(path.suffix.lower())
+            if candidate in ("c", "cpp"):
+                return candidate
+        return lang
+
+    # Read + language-tag every candidate file once; grep-scope to
+    # files that mention at least one identifier tail. Reads are
+    # per-file capped (core.source.read_text_capped): this loop runs
+    # over SCANNED-target content on the default study path and
+    # retains matching texts — one planted multi-hundred-MB file must
+    # not balloon resident memory.
+    from core.source import read_text_capped
+
+    contents: dict[Path, tuple[str, str]] = {}
+    for f in files:
+        lang = _lang_for(f)
+        if lang is None:
+            continue
+        got = read_text_capped(f)
+        if got is None:
+            continue
+        text = got[0]
+        if any(tail in text for tail in tails_ordered):
+            contents[f] = (lang, text)
+
+    matched: dict[str, list[StudyItem]] = {}
+    lang_seen: dict[str, str] = {}
+    file_items: dict[Path, list] = {}
+    # These immutable native snapshots never change during resolution.
+    # Keep foreign paths/text on their original repeated-sort path.
+    ordered_contents = (sorted(contents.items()) if sorted is _SORT_CONTENTS_IMPL and all(
+        type(path) is type(root) and type(lang) is str and type(content) is str
+        for path, (lang, content) in contents.items()
+    ) else None)
+
+    for path, (lang, content) in (ordered_contents if ordered_contents is not None else sorted(contents.items())):
+        rel = (
+            str(path.relative_to(root))
+            if path.is_relative_to(root) else str(path)
+        )
+        wanted_tails = [t for t in tails_ordered if t in content]
+        if not wanted_tails:
+            continue
+        lines = split_lines(content)
+        py_docs = _python_docstrings(content) if lang == "python" else {}
+
+        try:
+            code_items = extract_items(str(path), lang, content)
+        except Exception:
+            logger.debug("extract_items failed for %s", path, exc_info=True)
+            code_items = []
+        file_items[path] = code_items
+
+        for ci in code_items:
+            tail_hit = next(
+                (t for t in wanted_tails if ci.name == t
+                 or ci.name.endswith("." + t)),
+                None,
+            )
+            if tail_hit is None:
+                continue
+            meta = getattr(ci, "metadata", None)
+            class_name = getattr(meta, "class_name", None) if meta else None
+            # A tail may serve several full identifiers — resolve it
+            # for EVERY candidate that passes the qualifier check, so
+            # each identifier gets its own accounting.
+            matching_origs: list[str] = []
+            for orig in idents_by_tail[tail_hit]:
+                # Qualified questions (Foo.bar): require the match to
+                # live in a namespace whose tail chain is consistent
+                # when we can check it (class name from metadata).
+                qualifier = None
+                parts = re.split(r"\.|::", orig)
+                if len(parts) >= 2:
+                    qualifier = parts[-2]
+                if qualifier and class_name and qualifier != class_name:
+                    # e.g. question names json.loads; this is
+                    # Foo.loads — a different contract.  Skip rather
+                    # than guess.
+                    continue
+                matching_origs.append(orig)
+            if not matching_origs:
+                continue
+
+            start = max(1, ci.line_start or 1)
+            end = ci.line_end or start
+            definition = "\n".join(lines[start - 1:end])
+            definition = definition[:_MAX_DEFINITION_CHARS]
+
+            if lang == "python":
+                doc = py_docs.get((ci.name, start), "")
+                if not doc:
+                    doc = _doc_comment_above(lines, start, lang)
+            else:
+                doc = _doc_comment_above(lines, start, lang)
+
+            kind = _KIND_MAP.get(ci.kind, "function")
+            from .receipts import detect_stale_doc
+            calls = _extract_calls(definition) if kind == "function" else []
+            stale_doc = detect_stale_doc(doc, definition, ci.name, lang)
+            for orig in matching_origs:
+                lang_seen.setdefault(orig, lang)
+                bucket = matched.setdefault(orig, [])
+                if len(bucket) >= _MAX_MATCHES_PER_IDENT:
+                    continue
+                item = StudyItem(
+                    id=f"{lang}_{ci.kind}_{ci.name}_{rel}_{start}".replace("/", "_"),
+                    kind=kind,
+                    name=ci.name,
+                    file=rel,
+                    line=start,
+                    definition=definition,
+                    doc_comment=doc,
+                    calls=list(calls),
+                    relevance_tier=0,
+                    stale_doc=stale_doc,
+                )
+                if class_name:
+                    item.related_items = [class_name]
+                bucket.append(item)
+
+    # Type + constant regex fallback for identifiers the extractors
+    # missed (classes/structs are only method metadata in the
+    # inventory layer; constants may be missed without tree-sitter).
+    _FALLBACK_PASSES = (
+        ("struct", _type_pattern),
+        ("macro", _const_pattern),
+    )
+    for orig, tail in candidates:
+        if orig in matched:
+            continue
+        for kind, pattern_fn in _FALLBACK_PASSES:
+            if orig in matched:
+                break
+            for path, (lang, content) in (ordered_contents if ordered_contents is not None else sorted(contents.items())):
+                if tail not in content:
+                    continue
+                pat = pattern_fn(lang, tail)
+                if pat is None:
+                    continue
+                m = pat.search(content)
+                if not m:
+                    continue
+                lang_seen.setdefault(orig, lang)
+                lines = split_lines(content)
+                line_no = content.count("\n", 0, m.start()) + 1
+                # ^[ \t]* anchors keep the match on one line, but a
+                # match can still start at the newline of line N-1
+                # when the pattern begins with the anchor itself.
+                while line_no <= len(lines) and tail not in lines[line_no - 1]:
+                    line_no += 1
+                rel = (
+                    str(path.relative_to(root))
+                    if path.is_relative_to(root) else str(path)
+                )
+                doc = _doc_comment_above(lines, line_no, lang)
+                if lang == "python" and not doc:
+                    doc = _python_docstrings(content).get(
+                        (tail, line_no), "",
+                    )
+                from .receipts import detect_stale_doc
+                snippet = _slice_block(lines, line_no)
+                matched[orig] = [StudyItem(
+                    id=(
+                        f"{lang}_{kind}_{tail}_{rel}_{line_no}"
+                    ).replace("/", "_"),
+                    kind=kind,
+                    name=tail,
+                    file=rel,
+                    line=line_no,
+                    definition=snippet,
+                    doc_comment=doc,
+                    relevance_tier=0,
+                    stale_doc=detect_stale_doc(doc, snippet, tail, lang),
+                )]
+                break
+
+    # Callers among resolved items: reverse map over scanned contents
+    resolved_names = {
+        it.name for bucket in matched.values() for it in bucket
+    }
+    if resolved_names:
+        caller_map: dict[str, list[str]] = {}
+        for _path, (lang, content) in contents.items():
+            fn_items = [
+                ci for ci in file_items.get(_path, [])
+                if ci.kind == KIND_FUNCTION
+            ]
+            lines = split_lines(content)
+            for ci in fn_items:
+                start = max(1, ci.line_start or 1)
+                end = ci.line_end or start
+                body = "\n".join(lines[start - 1:end])
+                for name in resolved_names:
+                    if name != ci.name and re.search(
+                        rf"\b{re.escape(name)}\s*\(", body,
+                    ):
+                        callers = caller_map.setdefault(name, [])
+                        if ci.name not in callers and len(callers) < 10:
+                            callers.append(ci.name)
+        for bucket in matched.values():
+            for it in bucket:
+                it.callers = caller_map.get(it.name, [])
+
+    for bucket in matched.values():
+        result.items.extend(bucket)
+
+    # Unresolved: honest reasons, never guesses. What lands here is
+    # extractor-shape-dependent, not language-binary: e.g. a C# method
+    # without its grammar resolves in K&R brace style (GenericExtractor
+    # recognises `type name(...) {` on one line) but not in Allman
+    # style (brace on the next line), where it arrives here with the
+    # referenced-but-undefined reason below.
+    for orig, tail in candidates:
+        if orig in matched:
+            continue
+        referenced = any(tail in c for _l, c in contents.values())
+        if not referenced:
+            reason = (
+                "not found in the scanned source tree — likely an "
+                "external dependency or training-knowledge contract"
+            )
+        elif _dynamic_assignment_found(contents, orig):
+            reason = (
+                "only dynamic attribute assignment found (monkey-"
+                "patching / prototype patching) — cannot statically "
+                "resolve"
+            )
+        else:
+            reason = (
+                "referenced in source but no static definition found "
+                "(dynamic dispatch, re-export, or external dependency)"
+            )
+        result.unresolved.append({
+            "name": orig,
+            "language": lang_seen.get(orig, ""),
+            "reason": reason,
+        })
+
+    return result
+
+
+# ------------------------------------------------------------------
+# Study-list merge (per-batch consumer dispatch)
+# ------------------------------------------------------------------
+
+def merge_into_study_list(
+    study_list_path: Path,
+    items: list[StudyItem],
+    *,
+    related_docs: list[dict] | None = None,
+    unresolved: list[dict] | None = None,
+) -> int:
+    """Merge resolved items into an existing ``study-list.json``.
+
+    Used by the study consumer to add per-batch multi-language
+    resolutions after study-prep has already run.  Deduplicates on
+    item id and on ``(name, file, line)``.  Returns the number of
+    items actually added.  Creates a minimal skeleton when the file
+    does not exist yet.
+    """
+    from core.atomic_fs.fs_lock import artifact_lock
+
+    path = Path(study_list_path)
+    # Cross-process lock over the whole load → merge → save window:
+    # the shared-out_dir pattern (study loop beside /audit's consumer)
+    # makes this the same lost-update shape as canonical promotion —
+    # two unserialised writers silently drop each other's items.
+    with artifact_lock(path, subject="study list"):
+        return _merge_into_study_list_locked(
+            path, items, related_docs=related_docs,
+            unresolved=unresolved,
+        )
+
+
+def _merge_into_study_list_locked(
+    path: Path,
+    items: list[StudyItem],
+    *,
+    related_docs: list[dict] | None,
+    unresolved: list[dict] | None,
+) -> int:
+    """Body of :func:`merge_into_study_list`; caller holds the lock."""
+    from dataclasses import asdict
+
+    from core.json import load_json, save_json
+
+    data: dict = {"target": "", "source_root": "", "items": []}
+    if path.is_file():
+        loaded = load_json(path, max_bytes=64 * 1024 * 1024)
+        if isinstance(loaded, dict):
+            data = loaded
+    existing = data.setdefault("items", [])
+    seen_ids = {i.get("id") for i in existing if isinstance(i, dict)}
+    seen_keys = {
+        (i.get("name"), i.get("file"), i.get("line"))
+        for i in existing if isinstance(i, dict)
+    }
+    added = 0
+    for item in items:
+        key = (item.name, item.file, item.line)
+        if item.id in seen_ids or key in seen_keys:
+            continue
+        existing.append(asdict(item))
+        seen_ids.add(item.id)
+        seen_keys.add(key)
+        added += 1
+
+    if related_docs:
+        docs = data.setdefault("related_docs", [])
+        doc_files = {d.get("file") for d in docs if isinstance(d, dict)}
+        for d in related_docs:
+            if d.get("file") not in doc_files:
+                docs.append(d)
+                doc_files.add(d.get("file"))
+
+    if unresolved:
+        recs = data.setdefault("unresolved_identifiers", [])
+        rec_names = {r.get("name") for r in recs if isinstance(r, dict)}
+        for r in unresolved:
+            if r.get("name") not in rec_names:
+                recs.append(r)
+                rec_names.add(r.get("name"))
+
+    save_json(path, data)
+    return added
+
+
+# ------------------------------------------------------------------
+# Concept resolution (docs / READMEs / module docs)
+# ------------------------------------------------------------------
+
+_DOC_SUFFIXES = frozenset((".md", ".rst", ".txt"))
+_DOC_DIR_NAMES = ("doc", "docs", "documentation")
+_STOP_KEYWORDS = frozenset({
+    "does", "the", "that", "this", "with", "from", "when", "what",
+    "how", "why", "are", "and", "for", "not", "can", "will", "should",
+    "would", "into", "have", "has", "its", "any", "all",
+})
+
+
+def _concept_keywords(question: str) -> set[str]:
+    words = re.findall(r"[A-Za-z_][\w.]{3,}", question)
+    return {
+        w.lower() for w in words if w.lower() not in _STOP_KEYWORDS
+    }
+
+
+def resolve_concept_docs(
+    source_root: Path,
+    questions: list[str],
+    *,
+    max_docs: int = 10,
+) -> list[dict]:
+    """Find README/module docs relevant to concept-resolution questions.
+
+    Returns entries in the ``related_docs`` shape ``run_study`` loads:
+    ``{"file": <path>, "reason": <one-liner>}``.
+    """
+    if not questions:
+        return []
+    root = Path(source_root)
+    keywords: set[str] = set()
+    for q in questions:
+        keywords |= _concept_keywords(q)
+    if not keywords:
+        return []
+
+    candidates: list[Path] = []
+    try:
+        for entry in sorted(root.iterdir()):
+            if entry.is_file() and entry.suffix.lower() in _DOC_SUFFIXES:
+                candidates.append(entry)
+            elif (
+                entry.is_dir()
+                and entry.name.lower() in _DOC_DIR_NAMES
+                and not entry.is_symlink()
+            ):
+                candidates.extend(
+                    p for p in sorted(entry.rglob("*"))
+                    if p.is_file() and p.suffix.lower() in _DOC_SUFFIXES
+                )
+    except OSError:
+        return []
+
+    results: list[dict] = []
+    for doc in candidates:
+        if len(results) >= max_docs:
+            break
+        got = _read_capped(doc, 8192)
+        if got is None:
+            continue
+        snippet = got
+        snippet_lower = snippet.lower()
+        hits = [k for k in keywords if k in snippet_lower]
+        if len(hits) >= 2 or (hits and doc.name.lower().startswith("readme")):
+            results.append({
+                "file": str(doc),
+                "reason": f"mentions {', '.join(sorted(hits)[:4])}",
+            })
+    return results

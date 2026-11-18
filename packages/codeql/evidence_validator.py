@@ -1,11 +1,11 @@
-"""Corpus-runner :class:`Validator` adapter that drives the CodeQL
+r"""Corpus-runner :class:`Validator` adapter that drives the CodeQL
 :class:`DataflowValidator` with the sanitizer-evidence pipeline enabled.
 
 This is the operator-facing measurement entry point. Wire via:
 
-    libexec/raptor-corpus-run --output evidence.csv \\
+    core/dataflow/scripts/corpus-run --output evidence.csv \
         --validator packages.codeql.evidence_validator:CodeQLEvidenceValidator
-    libexec/raptor-corpus-metrics evidence.csv
+    core/dataflow/scripts/corpus-metrics evidence.csv
 
 The resulting metrics compare against the TrivialValidator baseline
 (precision/recall/F1 on the same corpus). PR1's exit criterion —
@@ -21,17 +21,19 @@ the rule-id-driven SMT profile heuristic falls back to defaults.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, TYPE_CHECKING
 
-from core.dataflow.finding import Finding, Step
 from core.dataflow.llm_bridge import make_evidence_collector
-from core.dataflow.sanitizer_evidence import CandidateValidator
 from core.dataflow.validator import ValidatorVerdict
 from packages.codeql.dataflow_validator import (
     DataflowPath,
     DataflowStep,
     DataflowValidator,
 )
+
+if TYPE_CHECKING:
+    from core.dataflow.finding import Finding, Step
+    from core.dataflow.sanitizer_evidence import CandidateValidator
 
 
 # packages/codeql/evidence_validator.py → repo root via parents[2].
@@ -58,23 +60,25 @@ class CodeQLEvidenceValidator:
     def __init__(
         self,
         llm_client: Any = None,
-        repo_root: Optional[Path] = None,
-        cache: Optional[Dict[str, Tuple[CandidateValidator, ...]]] = None,
+        repo_root: Path | None = None,
+        cache: dict[str, tuple[CandidateValidator, ...]] | None = None,
     ) -> None:
         self._injected_llm_client = llm_client
         self._repo_root = repo_root or _DEFAULT_REPO_ROOT
-        self._cache: Dict[str, Tuple[CandidateValidator, ...]] = (
+        self._cache: dict[str, tuple[CandidateValidator, ...]] = (
             cache if cache is not None else {}
         )
         # Lazy: the LLMClient (default-constructed) brings up the
         # egress proxy at __init__ time. Defer until we actually need
         # to call the LLM, so importing this module + zero-arg
         # construction stays cheap.
-        self._validator: Optional[DataflowValidator] = None
+        self._validator: DataflowValidator | None = None
 
     def _get_dataflow_validator(self) -> DataflowValidator:
         if self._validator is None:
-            llm = self._injected_llm_client or _construct_default_llm_client()
+            llm = self._injected_llm_client
+            if llm is None:
+                llm = _construct_default_llm_client()
             collector = make_evidence_collector(llm, cache=self._cache)
             self._validator = DataflowValidator(
                 llm, evidence_collector=collector
@@ -97,6 +101,22 @@ class CodeQLEvidenceValidator:
                 dp, self._repo_root
             )
         except Exception:
+            return ValidatorVerdict.UNCERTAIN
+
+        # Error-state results don't raise: validate_dataflow_path
+        # returns them with ``error`` set and ``is_exploitable=False``
+        # as a DEFAULT, not a verdict (the DataflowValidation contract:
+        # such results carry no evidential weight). Mapping them to
+        # NOT_EXPLOITABLE would count transport failures as confident
+        # negatives in the corpus precision/recall metrics.
+        if result.error:
+            return ValidatorVerdict.UNCERTAIN
+
+        # Dict-splat construction lets a model-emitted literal null
+        # land as None despite the bool annotation — an abstention,
+        # not a "not exploitable" ruling; a falsy read would count
+        # it as a confident negative in the corpus metrics.
+        if result.is_exploitable is None:
             return ValidatorVerdict.UNCERTAIN
 
         return (

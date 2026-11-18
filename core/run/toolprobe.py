@@ -1,0 +1,212 @@
+"""External-tool probing — the one way to ask "is tool X here, and
+which version?".
+
+Consolidates the ``shutil.which`` + ``--version`` subprocess idiom
+repeated across the tree. The copies had drifted on three axes this
+module fixes once:
+
+* **Environment**: several probes inherited the caller's full
+  environment (semgrep, coccinelle, tool_readiness, the corpora
+  toolchain recorder) instead of ``RaptorConfig.get_safe_env()`` —
+  version probes exec real binaries, and env-injection vectors
+  (``JAVA_TOOL_OPTIONS``, ``LD_PRELOAD``…) apply to them like any
+  other subprocess. Probes here always use the sanitised env
+  (``safe_subprocess_env``): when ``core.config`` cannot import,
+  the probe gets a minimal allowlisted env — never the parent's.
+* **TOCTOU**: some probes ``which()``-checked availability and then
+  exec'd the BARE tool name, letting a PATH rewrite between check and
+  exec swap the binary (the race packages/coccinelle/runner.py
+  documents). Probes here exec the resolved absolute path.
+* **Working directory**: version probes run from the filesystem root,
+  stopping project/ancestor configuration discovery before tool startup.
+  Relative PATH results are pinned absolute before changing directory.
+* **Output access**: tools print versions to stdout or stderr
+  (``java -version``!) — :attr:`ToolInfo.first_line` implements the
+  common ``stdout-else-stderr`` first-line convention; the raw streams
+  stay available for tool-specific parsing.
+
+Argv is always list-based; nothing here goes near a shell.
+
+The per-process cache exists for hot callers (per-finding probes) and
+caches negative results too. It is OPT-IN per call site: callers whose
+tests patch ``subprocess.run`` per-test (the norm for version()
+surfaces) pass ``use_cache=False`` and stay hermetic without knowing
+about this module's state. :func:`reset_probe_cache` is the test hook.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import logging
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import threading
+from dataclasses import dataclass, field
+from core.security.env_sanitisation import safe_subprocess_env
+from core.run.scratch import scratch_dir
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["ToolInfo", "probe", "reported_version", "reset_probe_cache"]
+
+# (?<!\d) pins the match to the start of its digit run (a bare
+# leading \d+ re-scans a digit run from every position — quadratic);
+# the earliest match always starts at the run start, so the
+# extracted version is unchanged.
+_VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?")
+
+#: Per-stream retention cap on probe output (see the run call for the
+#: rationale). 64k chars keeps every real tool's banner intact.
+_CAPTURE_RETAIN_CHARS = 64 * 1024
+
+_CACHE_LOCK = threading.Lock()
+_CACHE: dict[tuple[str, tuple[str, ...], bool], ToolInfo | None] = {}
+
+
+def reported_version(value: object) -> str | None:
+    """Bound an optional tool-reported label without parsing or probing it.
+
+    Empty/missing metadata is unknown (the empty string); malformed metadata
+    returns None. Printable labels up to 256 characters preserve development
+    and vendor suffixes without retaining arbitrary report payloads.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value) > 256 or (value and not value.isprintable()):
+        return None
+    return value
+
+
+@dataclass(frozen=True)
+class ToolInfo:
+    """Result of one tool probe.
+
+    ``returncode is None`` means the probe subprocess itself failed
+    (timeout / exec error) — the tool exists on PATH but did not
+    answer. A missing tool is represented by :func:`probe` returning
+    ``None``, not by a ``ToolInfo``.
+    """
+
+    name: str
+    path: str
+    args: tuple[str, ...] = ("--version",)
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    # Not part of identity/comparison; carried for diagnostics.
+    error: str = field(default="", compare=False)
+
+    @property
+    def first_line(self) -> str | None:
+        """First line of stdout-else-stderr (the convention most
+        version probes implement by hand), or ``None`` when the tool
+        produced no output."""
+        out = (self.stdout or self.stderr or "").strip()
+        return out.splitlines()[0] if out else None
+
+    def version_tuple(self) -> tuple[int, ...] | None:
+        """Best-effort ``(major, minor[, patch])`` ints from the first
+        version-looking token in :attr:`first_line`, or ``None``."""
+        line = self.first_line
+        if not line:
+            return None
+        m = _VERSION_RE.search(line)
+        if not m:
+            return None
+        return tuple(int(g) for g in m.groups() if g is not None)
+
+
+@contextmanager
+def _probe_environment(isolated_home: bool):
+    env = safe_subprocess_env(strip_target_markers=True)
+    if not isolated_home:
+        yield env
+        return
+    # Some --version commands initialize settings and logs. Keep those writes
+    # inside the caller's writable scratch, never in the operator's HOME.
+    with scratch_dir("raptor-toolprobe-", dir=env.get("TMPDIR"), keepalive=True) as home:
+        env["HOME"] = str(home)
+        for name, suffix in (("XDG_CONFIG_HOME", ".config"),
+                             ("XDG_CACHE_HOME", ".cache"),
+                             ("XDG_DATA_HOME", ".local/share")):
+            path = Path(home) / suffix
+            path.mkdir(mode=0o700, parents=True)
+            env[name] = str(path)
+        yield env
+
+
+def probe(
+    name: str,
+    *,
+    args: tuple[str, ...] = ("--version",),
+    timeout: float = 10,
+    use_cache: bool = False,
+    isolated_home: bool = False,
+) -> ToolInfo | None:
+    """Locate *name* on PATH and run it with *args*.
+
+    Returns ``None`` when the tool is not on PATH. Otherwise returns a
+    :class:`ToolInfo`; a probe-execution failure (timeout, exec error)
+    yields ``returncode=None`` with empty streams rather than raising.
+
+    ``isolated_home=True`` gives stateful tools a temporary HOME and XDG
+    directories, removed after the probe (including timeout/error paths).
+
+    ``use_cache=True`` memoises per ``(name, args, isolated_home)`` — including the
+    not-on-PATH result — for hot call sites; leave it off where tests
+    patch ``shutil.which`` / ``subprocess.run`` per-test.
+    """
+    key = (name, args, isolated_home)
+    if use_cache:
+        with _CACHE_LOCK:
+            if key in _CACHE:
+                return _CACHE[key]
+    path = shutil.which(name)
+    if path is None:
+        info: ToolInfo | None = None
+    else:
+        try:
+            path = os.path.abspath(path)
+            with _probe_environment(isolated_home) as env:
+                proc = subprocess.run(
+                    [path, *args],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                    cwd=os.sep,
+                    env=env,
+                )
+            # Retention cap: probes exec whatever PATH resolves, and a
+            # hostile tool can answer --version with an arbitrarily
+            # large stream — every ToolInfo consumer wants a first
+            # line, not the payload. The capture itself stays
+            # subprocess.run (the module's patched-run test contract);
+            # the timeout limits elapsed execution, not the number of
+            # captured bytes or the transient capture buffer size.
+            info = ToolInfo(
+                name=name, path=path, args=args,
+                returncode=proc.returncode,
+                stdout=(proc.stdout or "")[:_CAPTURE_RETAIN_CHARS],
+                stderr=(proc.stderr or "")[:_CAPTURE_RETAIN_CHARS],
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("toolprobe: %s %s failed: %s", name, args, exc)
+            info = ToolInfo(
+                name=name, path=path, args=args,
+                returncode=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+    if use_cache:
+        with _CACHE_LOCK:
+            _CACHE[key] = info
+    return info
+
+
+def reset_probe_cache() -> None:
+    """Clear the probe cache (test hook)."""
+    with _CACHE_LOCK:
+        _CACHE.clear()

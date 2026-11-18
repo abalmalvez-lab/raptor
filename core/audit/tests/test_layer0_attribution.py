@@ -1,0 +1,158 @@
+"""Layer 0 source pre-sweep attribution: span-sliced reads.
+
+The pre-sweep used to read the WHOLE FILE for every evidence record and
+run the pattern checks over it, so a match anywhere in the file was
+attributed to every item of that file — bare declarations included
+(e.g. a TOCTOU access()/open() pair elsewhere in the file pinned to an
+``int tty_flag = 0;`` line). The read is now sliced to the record's
+line span, binding matches to the function that actually contains them.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from core.audit.diagnostics import read_function_source
+
+_SOURCE = """\
+int tty_flag = 0;
+
+static int
+check_and_open(const char *path)
+{
+\tif (access(path, R_OK) != 0)
+\t\treturn -1;
+\treturn open(path, 0);
+}
+
+static int
+unrelated(int x)
+{
+\treturn x + 1;
+}
+"""
+
+
+def _target(tmp_path: Path) -> Path:
+    (tmp_path / "f.c").write_text(_SOURCE, encoding="utf-8")
+    return tmp_path
+
+
+class TestSpanSlicedRead:
+    def test_span_limits_read_to_the_function(self, tmp_path):
+        src = read_function_source(
+            _target(tmp_path), "f.c", "check_and_open",
+            line_start=3, line_end=9,
+        )
+        assert "access(" in src
+        assert "open(" in src
+        assert "tty_flag" not in src
+        assert "unrelated" not in src
+
+    def test_declaration_span_sees_no_calls_from_elsewhere(self, tmp_path):
+        # The whole-file read attributed the access()/open() TOCTOU
+        # pair to the tty_flag declaration; its own one-line span
+        # contains neither call.
+        src = read_function_source(
+            _target(tmp_path), "f.c", "tty_flag",
+            line_start=1, line_end=1,
+        )
+        assert src == "int tty_flag = 0;"
+        assert "access(" not in src
+
+    def test_no_span_preserves_whole_file_read(self, tmp_path):
+        src = read_function_source(_target(tmp_path), "f.c", "check_and_open")
+        assert "tty_flag" in src
+        assert "unrelated" in src
+
+
+class TestPathContainment:
+    """file_path comes from LLM-writable run artefacts: an absolute
+    path discards target_path under `/` semantics and `../` escapes
+    the root — both must refuse (CWE-22).  Legitimate relative reads,
+    subdirectories included, keep working."""
+
+    def test_absolute_path_refused(self, tmp_path):
+        target = _target(tmp_path)
+        outside = tmp_path.parent / "secret.txt"
+        outside.write_text("sentinel-outside", encoding="utf-8")
+        assert read_function_source(target, str(outside), "f") == ""
+
+    def test_dotdot_escape_refused(self, tmp_path):
+        target = tmp_path / "root"
+        target.mkdir()
+        (target / "f.c").write_text(_SOURCE, encoding="utf-8")
+        (tmp_path / "secret.txt").write_text(
+            "sentinel-outside", encoding="utf-8",
+        )
+        assert read_function_source(
+            target, "../secret.txt", "f",
+        ) == ""
+
+    def test_relative_path_still_reads(self, tmp_path):
+        target = _target(tmp_path)
+        sub = target / "sub"
+        sub.mkdir()
+        (sub / "g.c").write_text("int g;\n", encoding="utf-8")
+        assert "tty_flag" in read_function_source(target, "f.c", "f")
+        assert read_function_source(target, "sub/g.c", "g") == "int g;\n"
+
+    def test_toctou_fires_only_on_the_containing_function(self, tmp_path):
+        from core.audit.binary_layer0 import (
+            callees_from_source,
+            scan_function,
+        )
+
+        target = _target(tmp_path)
+
+        def _findings(name, ls, le):
+            src = read_function_source(
+                target, "f.c", name, line_start=ls, line_end=le)
+            return scan_function(
+                name, callees_from_source(src), source=src,
+                file="f.c", language="c",
+            )
+
+        toctou_in = [f for f in _findings("check_and_open", 3, 9)
+                     if f.vuln_type == "toctou"]
+        assert toctou_in, "TOCTOU pair inside the function must fire"
+        toctou_decl = [f for f in _findings("tty_flag", 1, 1)
+                       if f.vuln_type == "toctou"]
+        assert toctou_decl == []
+
+
+class TestSpanLineModel:
+    r"""The span slice speaks the checklist's \n line model.
+
+    Spans come from the pinned checklist (inventory, \n-counted); a
+    splitlines() view shifted the whole "function source" after any
+    in-comment form feed, so the Layer-0 pre-sweep pattern checks ran
+    against neighbouring padding functions instead of the real body.
+    """
+
+    def test_form_feed_above_span_does_not_shift_it(self, tmp_path):
+        (tmp_path / "v.c").write_bytes(
+            b"/* p\x0c\x0cad */\n"       # 1
+            b"void pad1() {}\n"          # 2
+            b"void pad2() {}\n"          # 3
+            b"void vuln(char *p) {\n"    # 4
+            b"    strcpy(b, p);\n"       # 5
+            b"}\n"                       # 6
+        )
+        src = read_function_source(tmp_path, "v.c", "vuln", 4, 6)
+        assert src == "void vuln(char *p) {\n    strcpy(b, p);\n}"
+
+    def test_bare_carriage_return_above_span_does_not_shift_it(
+        self, tmp_path,
+    ):
+        # The OTHER plantable byte: the read must not let universal
+        # newline translation turn a bare \r into a break either.
+        (tmp_path / "v.c").write_bytes(
+            b'const char *B = "a\rb";\n'   # 1
+            b"void pad1() {}\n"            # 2
+            b"void vuln(char *p) {\n"      # 3
+            b"    strcpy(b, p);\n"         # 4
+            b"}\n"                         # 5
+        )
+        src = read_function_source(tmp_path, "v.c", "vuln", 3, 5)
+        assert src == "void vuln(char *p) {\n    strcpy(b, p);\n}"

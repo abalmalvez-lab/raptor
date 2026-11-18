@@ -1,0 +1,450 @@
+"""Parsed constructs select conditional reading, never applicability or proof."""
+
+from dataclasses import replace
+
+import pytest
+
+from core.audit import orchestrator as orch
+from core.audit.knowledge_context import reference_delivery, reference_sections
+from core.audit.knowledge_runtime import AuditKnowledgeRuntime
+from core.audit.llm_review import make_review_fn
+from core.audit.reference_foundation import foundation_answers, review_has_current_foundation
+from core.audit.reference_inputs import reference_inputs_from_delivery, review_context_digest
+from core.audit.source_anchor import make_context_source_anchor, parse_source_anchor
+from core.audit.tests.test_foundation_rollout import _entry, _fold, _signed, _target
+from core.llm.providers import StructuredResponse
+from core.llm.prompt_budget import fit_to_budget
+from core.language_reference import ReferenceContext, lookup
+from core.testing.treesitter import requires_ts
+
+
+_ARITHMETIC = "unsigned f(unsigned short a, int b) { return (unsigned)(a + b) < a; }"
+_COMPOUND_ARITHMETIC = "unsigned f(unsigned a, unsigned b) { a += b; return a; }"
+_SHIFT = "unsigned f(unsigned a, unsigned n) { return a << n; }"
+_BITWISE = "unsigned f(unsigned a, unsigned b) { return a & b; }"
+_UPDATE = "int f(int a) { return a++; }"
+_UNARY = "int f(short a) { return -a; }"
+_DIVISION = "int f(int a, int b) { return a % b; }"
+_CONDITIONAL = "int f(int condition, int a, int b) { return condition ? a : b; }"
+_LOGICAL = "int f(int a, int b) { return a && b; }"
+
+
+@pytest.fixture(autouse=True)
+def isolated_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+
+def _ids(answers):
+    return {entry.entry_id for answer in answers for entry in answer.entries}
+
+
+@requires_ts("c")
+@pytest.mark.parametrize("source", [_ARITHMETIC, _COMPOUND_ARITHMETIC, _SHIFT, _BITWISE, _UPDATE, _UNARY,
+                                   _DIVISION, _CONDITIONAL, _LOGICAL], ids=["binary", "compound", "shift", "bitwise", "update", "unary-sign", "division", "conditional", "logical"])
+def test_initial_arithmetic_review_receives_conditional_rules_without_request(tmp_path, source):
+    (tmp_path / "unit.c").write_text(source + "\n")
+    runtime = AuditKnowledgeRuntime(tmp_path, orch.StudyQueue(), deadline=float("inf"), window=0)
+    prompts = []
+
+    class Client:
+        def generate_structured(self, prompt, schema, **kwargs):
+            prompts.append(prompt)
+            return StructuredResponse(result={"status": "clean", "body": "Scripted review",
+                "reading_list": [], "language_reference_requests": []}, raw="", cost=0, model="scripted")
+
+    ctx = {"file": "unit.c", "function": "f", "line_start": 1, "line_end": 1,
+           "source": source, "language": "c"}
+    runtime.wrap_review(make_review_fn(Client(), escalate_clean=False))(
+        ctx, orch.OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path / "out"))
+    assert len(prompts) == 1
+    if source == _SHIFT:
+        assert "c.integer-shift v1:" in prompts[0]
+        assert "c.integer-usual-conversions v1:" not in prompts[0]
+        assert "c.integer-definedness v1:" not in prompts[0]
+    elif source == _LOGICAL:
+        assert "c.scalar-logical v1:" in prompts[0]
+        assert "c.integer-usual-conversions v1:" not in prompts[0]
+        assert "c.integer-definedness v1:" not in prompts[0]
+    elif source == _CONDITIONAL:
+        assert "c.integer-conditional v1:" in prompts[0]
+        assert "c.integer-usual-conversions v1:" in prompts[0]
+        assert "c.integer-definedness v1:" not in prompts[0]
+    elif source == _UNARY:
+        assert "c.integer-unary-sign v1:" in prompts[0]
+        assert "c.integer-usual-conversions v1:" not in prompts[0]
+        assert "c.integer-definedness v1:" not in prompts[0]
+        assert "c.integer-update v1:" not in prompts[0]
+    else:
+        assert "c.integer-usual-conversions v1:" in prompts[0]
+        if source == _BITWISE:
+            assert "c.integer-definedness v1:" not in prompts[0]
+            assert "c.integer-shift v1:" not in prompts[0]
+        else:
+            assert "c.integer-definedness v1:" in prompts[0]
+            if source == _UPDATE:
+                assert "c.integer-update v1:" in prompts[0]
+            elif source == _DIVISION:
+                assert "c.integer-division v1:" in prompts[0]
+    assert "Target language edition is unknown" in prompts[0]
+
+
+@pytest.mark.parametrize("source,extra", [
+    (_ARITHMETIC, {"c.integer-usual-conversions", "c.integer-definedness"}),
+    ("int f(int a, int b) { return a < b; }", {"c.integer-usual-conversions"}),
+    ('int f(void) { /* a + b; a += b; a << n; a & b; a++; +a; a / b; a ? b : c; a && b; !a */ const char *s = "a * b; a *= b; a >>= n; a |= b; --a; -a; a %= b; a ? b : c; a || b; !a"; return 0; }', set()),
+    ("int f(void) { return 0; }", set()),
+])
+@requires_ts("c")
+def test_selection_uses_parsed_operators_not_comments_or_strings(source, extra):
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    assert _ids(answers) == {"c.integer-promotion", "c.integer-conversion"} | extra
+
+
+@pytest.mark.parametrize("operator,extra", [("+=", set()), ("-=", set()), ("*=", set()),
+                                         ("/=", {"c.integer-division"}), ("%=", {"c.integer-division"})],
+                         ids=["add", "subtract", "multiply", "divide", "remainder"])
+@requires_ts("c")
+def test_compound_arithmetic_selects_conditional_integer_reading(operator, extra):
+    source = f"unsigned f(unsigned a, unsigned b) {{ a {operator} b; return a; }}"
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    assert _ids(answers) == {"c.integer-promotion", "c.integer-conversion",
+                             "c.integer-usual-conversions", "c.integer-definedness"} | extra
+
+
+@pytest.mark.parametrize("expression", ["return a & b", "return a ^ b", "return a | b",
+    "a &= b; return a", "a ^= b; return a", "a |= b; return a"],
+    ids=["and", "xor", "or", "and-assignment", "xor-assignment", "or-assignment"])
+@requires_ts("c")
+def test_bitwise_operators_select_conversion_reading(expression):
+    source = f"unsigned f(unsigned a, unsigned b) {{ {expression}; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions"}
+
+
+@pytest.mark.parametrize("expression", ["a++", "a--", "++a", "--a"],
+                         ids=["post-increment", "post-decrement", "pre-increment", "pre-decrement"])
+@requires_ts("c")
+def test_update_syntax_selects_value_and_store_composition(expression):
+    source = f"int f(int a) {{ return {expression}; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions",
+        "c.integer-definedness", "c.integer-update"}
+
+
+@pytest.mark.parametrize("expression", ["+a", "-a"], ids=["plus", "minus"])
+@requires_ts("c")
+def test_unary_sign_selects_promoted_result_reading(expression):
+    source = f"int f(short a) {{ return {expression}; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-unary-sign"}
+
+
+@pytest.mark.parametrize("expression", ["return a / b", "return a % b", "a /= b; return a", "a %= b; return a"],
+                         ids=["division", "remainder", "division-assignment", "remainder-assignment"])
+@requires_ts("c")
+def test_division_syntax_selects_quotient_and_remainder_conditions(expression):
+    source = f"int f(int a, int b) {{ {expression}; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions",
+        "c.integer-definedness", "c.integer-division"}
+
+
+@pytest.mark.parametrize("source", [
+    "int f(int a) { return ~a; }", "int f(int a) { return !a; }",
+    "int *f(int *a) { return &*a; }", "int f(int *a) { return *a; }",
+    "int f(int a) { return --a; }",
+], ids=["complement", "logical-not", "address", "indirection", "decrement"])
+@requires_ts("c")
+def test_other_unary_syntax_does_not_select_sign_reading(source):
+    assert "c.integer-unary-sign" not in _ids(foundation_answers(
+        "c", request_id="owned", source=source, file="unit.c"))
+
+
+@pytest.mark.parametrize("expression", ["+a", "-a", "~a", "!a"],
+                         ids=["plus", "minus", "complement", "logical-not"])
+@requires_ts("c")
+def test_other_unary_operators_do_not_select_update_composition(expression):
+    source = f"int f(int a) {{ return {expression}; }}"
+    assert "c.integer-update" not in _ids(foundation_answers(
+        "c", request_id="owned", source=source, file="unit.c"))
+
+
+@pytest.mark.parametrize("expression", ["a && b", "a || b", "!a"], ids=["and", "or", "not"])
+@requires_ts("c")
+def test_logical_operators_select_scalar_reading_without_bitwise_conversions(expression):
+    source = f"unsigned f(unsigned a, unsigned b) {{ return {expression}; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.scalar-logical"}
+
+
+@pytest.mark.parametrize("expression", ["return a << n", "return a >> n", "a <<= n", "a >>= n"],
+                         ids=["left", "right", "left-assignment", "right-assignment"])
+@requires_ts("c")
+def test_shift_syntax_selects_its_own_conditional_rule(expression):
+    source = f"unsigned f(unsigned a, unsigned n) {{ {expression}; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-shift"}
+
+
+@pytest.mark.parametrize("budget", [1, 100_000], ids=["omitted", "delivered"])
+@pytest.mark.parametrize("source,entry_ids", [
+    (_SHIFT, {"c.integer-promotion", "c.integer-conversion", "c.integer-shift"}),
+    (_UPDATE, {"c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions",
+               "c.integer-definedness", "c.integer-update"}),
+    (_UNARY, {"c.integer-promotion", "c.integer-conversion", "c.integer-unary-sign"}),
+    (_DIVISION, {"c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions",
+                 "c.integer-definedness", "c.integer-division"}),
+    (_CONDITIONAL, {"c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions",
+                    "c.integer-conditional"}),
+    (_LOGICAL, {"c.integer-promotion", "c.integer-conversion", "c.scalar-logical"}),
+], ids=["shift", "update", "unary-sign", "division", "conditional", "logical"])
+@requires_ts("c")
+def test_operator_core_and_prerequisites_fit_as_one_bundle(budget, source, entry_ids):
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    sections = reference_sections(answers)
+    kept, shed = fit_to_budget(sections, budget_tokens=budget)
+    delivery = reference_delivery(answers, kept)
+    references = reference_inputs_from_delivery(delivery, answers)
+    expected = budget > 1
+    assert delivery[0]["delivered"] is expected
+    assert review_has_current_foundation({"reference_inputs": references}, source=source, file="unit.c") is expected
+    if expected:
+        assert kept == sections and shed == []
+        assert {row["id"] for row in references["entries"]} == entry_ids
+    else:
+        assert kept == [] and shed == sections and references is None
+
+
+@pytest.mark.parametrize("operator,extra", [("=", set()), ("<<=", {"c.integer-shift"}),
+                                         ("&=", {"c.integer-usual-conversions"})],
+                         ids=["plain", "shift", "bitwise"])
+@requires_ts("c")
+def test_other_assignments_do_not_imply_arithmetic_reading(operator, extra):
+    source = f"unsigned f(unsigned a, unsigned b) {{ a {operator} b; return a; }}"
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion"} | extra
+
+
+def test_missing_parser_keeps_foundation_without_claiming_construct_coverage(monkeypatch):
+    monkeypatch.setattr("core.audit.ts_extract._parse_file", lambda *args: None)
+    assert _ids(foundation_answers("c", request_id="owned", source=_ARITHMETIC, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion"}
+
+
+@requires_ts("c")
+def test_parse_errors_keep_foundation():
+    assert _ids(foundation_answers("c", request_id="owned", source="int f( { a +", file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion"}
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("source", [_ARITHMETIC, _COMPOUND_ARITHMETIC, _SHIFT, _BITWISE, _UPDATE, _UNARY,
+                                   _DIVISION, _CONDITIONAL, _LOGICAL], ids=["binary", "compound", "shift", "bitwise", "update", "unary-sign", "division", "conditional", "logical"])
+@requires_ts("c")
+def test_prior_foundation_only_review_resurfaces_for_new_construct_reading(tmp_path, reuse, source):
+    root = _target(tmp_path)
+    (root / "unit.c").write_text(source + "\n")
+    old = _signed(tmp_path / "old", _entry(root, current=True))
+    assert not _fold(root, [old], reuse=reuse)[0]
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("source", [_ARITHMETIC, _COMPOUND_ARITHMETIC, _SHIFT, _BITWISE, _UPDATE, _UNARY,
+                                   _DIVISION, _CONDITIONAL, _LOGICAL], ids=["binary", "compound", "shift", "bitwise", "update", "unary-sign", "division", "conditional", "logical"])
+@requires_ts("c")
+def test_actual_selected_rules_allow_same_source_reuse(tmp_path, reuse, source):
+    root = _target(tmp_path)
+    (root / "unit.c").write_text(source + "\n")
+    row = _entry(root, current=True)
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+    history = {**row.review_claims, "reference_inputs": references}
+    primary, span = parse_source_anchor(row.source_hash)
+    row = replace(row, review_claims=history, source_hash=make_context_source_anchor(
+        primary, span, review_context_digest(history["source_inputs"], references), context_version=3))
+    signed = _signed(tmp_path / "current", row)
+    assert _fold(root, [signed], reuse=reuse)[0] == {"unit.c:f"}
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("source,missing_core", [(_UNARY, "c.integer-unary-sign"),
+                                               (_DIVISION, "c.integer-division"),
+                                               (_CONDITIONAL, "c.integer-conditional"),
+                                               (_LOGICAL, "c.scalar-logical")],
+                         ids=["unary-sign", "division", "conditional", "logical"])
+@requires_ts("c")
+def test_generic_arithmetic_reading_cannot_replace_operator_delivery(tmp_path, reuse, source, missing_core):
+    root = _target(tmp_path)
+    (root / "unit.c").write_text(source + "\n")
+    row = _entry(root, current=True)
+    answers = (
+        lookup("prior-arithmetic", "", ReferenceContext("c"), entry_id="c.integer-definedness"),
+        lookup("prior-conversion", "", ReferenceContext("c"), entry_id="c.integer-conversion"),
+    )
+    references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+    assert {entry["id"] for entry in references["entries"]} == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions", "c.integer-definedness"}
+    assert missing_core not in {entry["id"] for entry in references["entries"]}
+    history = {**row.review_claims, "reference_inputs": references}
+    primary, span = parse_source_anchor(row.source_hash)
+    row = replace(row, review_claims=history, source_hash=make_context_source_anchor(
+        primary, span, review_context_digest(history["source_inputs"], references), context_version=3))
+    signed = _signed(tmp_path / "prior", row)
+    assert _fold(root, [signed], reuse=reuse, require=False)[0] == {"unit.c:f"}
+    assert not _fold(root, [signed], reuse=reuse)[0]
+
+
+def test_oversized_source_keeps_bounded_foundation():
+    source = " " * (256 * 1024 + 1)
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion"}
+
+
+@requires_ts("c")
+def test_conditional_syntax_selects_type_and_selected_value_reading():
+    source = _CONDITIONAL
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.integer-usual-conversions", "c.integer-conditional"}
+
+
+@requires_ts("c")
+def test_conditional_syntax_with_unknown_arm_types_keeps_integer_conditions():
+    source = "int *f(int condition, int *a, int *b) { return condition ? a : b; }"
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    assert answers[0].status == "needs_target_facts"
+    core = next(entry for entry in answers[0].entries if entry.entry_id == "c.integer-conditional")
+    assert "two integer arms" in core.rule
+    assert "Pointer" in core.conditions[1]
+    assert "both arm types and ranks" in core.required_target_facts
+
+
+@requires_ts("c")
+def test_logical_syntax_selects_scalar_result_and_evaluation_reading():
+    source = _LOGICAL
+    assert _ids(foundation_answers("c", request_id="owned", source=source, file="unit.c")) == {
+        "c.integer-promotion", "c.integer-conversion", "c.scalar-logical"}
+
+
+@requires_ts("c")
+def test_pointer_logical_syntax_keeps_scalar_and_access_conditions():
+    source = "int f(int *a, int *b) { return a || b; }"
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    assert answers[0].status == "needs_target_facts"
+    assert _ids(answers) == {"c.integer-promotion", "c.integer-conversion", "c.scalar-logical"}
+    core = next(entry for entry in answers[0].entries if entry.entry_id == "c.scalar-logical")
+    assert "arithmetic and pointer types" in core.conditions[0]
+    assert "nor permits a dereference" in core.conditions[-1]
+    assert "actual scalar operand types" in core.required_target_facts
+
+
+@pytest.mark.parametrize("source", [_BITWISE, _UNARY, _CONDITIONAL], ids=["bitwise", "unary-sign", "conditional"])
+@requires_ts("c")
+def test_unrelated_operators_do_not_imply_logical_reading(source):
+    assert "c.scalar-logical" not in _ids(foundation_answers(
+        "c", request_id="owned", source=source, file="unit.c"))
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("complete_history", [False, True], ids=["base-only", "source-selected"])
+@requires_ts("c")
+def test_parser_loss_does_not_retire_source_from_foundation_only_history(tmp_path, monkeypatch, reuse, complete_history):
+    root = _target(tmp_path)
+    (root / "unit.c").write_text(_ARITHMETIC + "\n")
+    row = _entry(root, current=True)
+    if complete_history:
+        answers = foundation_answers("c", request_id="prior", source=_ARITHMETIC, file="unit.c")
+        references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+        history = {**row.review_claims, "reference_inputs": references}
+        primary, span = parse_source_anchor(row.source_hash)
+        row = replace(row, review_claims=history, source_hash=make_context_source_anchor(
+            primary, span, review_context_digest(history["source_inputs"], references), context_version=3))
+    signed = _signed(tmp_path / "prior", row)
+    assert _fold(root, [signed], reuse=reuse, require=False)[0] == {"unit.c:f"}
+    assert bool(_fold(root, [signed], reuse=reuse)[0]) is complete_history
+    monkeypatch.setattr("core.audit.ts_extract._parse_file", lambda *args: None)
+    answers = foundation_answers("c", request_id="owned", source=_ARITHMETIC, file="unit.c")
+    assert _ids(answers) == {"c.integer-promotion", "c.integer-conversion"}
+    assert "parser unavailable" in answers[0].reason
+    assert not _fold(root, [signed], reuse=reuse)[0]
+
+
+@pytest.mark.parametrize("source,reason", [
+    pytest.param("int f( { a +", "parse errors", id="parse-error"),
+    pytest.param(" " * (256 * 1024 + 1), "source limit", id="source-limit"),
+    pytest.param("int f(int a) { a + 1;" + "a;" * 3000 + "}", "traversal limit", id="node-limit"),
+])
+@requires_ts("c")
+def test_incomplete_selection_keeps_reading_without_source_aware_cache_credit(source, reason):
+    answers = foundation_answers("c", request_id="owned", source=source, file="unit.c")
+    references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+    history = {"reference_inputs": references}
+    assert _ids(answers) == {"c.integer-promotion", "c.integer-conversion"}
+    assert reason in answers[0].reason
+    assert review_has_current_foundation(history)
+    assert not review_has_current_foundation(history, source=source, file="unit.c")
+
+
+@pytest.mark.parametrize("source,file", [("", "unit.c"), (None, "unit.c"),
+                                         (_ARITHMETIC, None), (_ARITHMETIC, "unit.cpp")])
+def test_missing_source_selection_cannot_become_base_only_cache_query(source, file):
+    answers = foundation_answers("c", request_id="owned")
+    references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+    history = {"reference_inputs": references}
+    assert review_has_current_foundation(history)
+    assert not review_has_current_foundation(history, source=source, file=file)
+
+
+@requires_ts("c")
+def test_wrong_parser_language_preserves_reading_but_not_cache_credit(monkeypatch):
+    from core.audit import ts_extract
+    parsed = ts_extract._parse_file("unit.c", _ARITHMETIC)
+    assert parsed is not None
+    tree, _language, raw = parsed
+    monkeypatch.setattr(ts_extract, "_parse_file", lambda *args: (tree, "cpp", raw))
+    answers = foundation_answers("c", request_id="owned", source=_ARITHMETIC, file="unit.c")
+    references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+    assert _ids(answers) == {"c.integer-promotion", "c.integer-conversion"}
+    assert not review_has_current_foundation({"reference_inputs": references}, source=_ARITHMETIC, file="unit.c")
+
+
+@requires_ts("c")
+def test_source_aware_cache_resolves_one_captured_selection(monkeypatch):
+    from core.audit import ts_extract
+    answers = foundation_answers("c", request_id="owned", source=_ARITHMETIC, file="unit.c")
+    references = reference_inputs_from_delivery(reference_delivery(answers, reference_sections(answers)), answers)
+    original = ts_extract._parse_file
+    calls = []
+    def counted(file, source):
+        calls.append((file, source))
+        return original(file, source)
+    monkeypatch.setattr(ts_extract, "_parse_file", counted)
+    assert review_has_current_foundation({"reference_inputs": references}, source=_ARITHMETIC, file="unit.c")
+    assert calls == [("unit.c", _ARITHMETIC)]
+
+
+@requires_ts("c")
+def test_warm_parse_cache_cannot_hide_parser_loss_or_prevent_recovery(monkeypatch):
+    from collections import OrderedDict
+    from copy import deepcopy
+    from core.audit import ts_extract
+    from core.testing.module_state import isolated_module_state
+
+    with isolated_module_state(ts_extract, {"_PARSE_CACHE": OrderedDict()},
+                               lock=ts_extract._PARSE_CACHE_LOCK):
+        answers = foundation_answers("c", request_id="prior", source=_ARITHMETIC, file="unit.c")
+        references = reference_inputs_from_delivery(
+            reference_delivery(answers, reference_sections(answers)), answers)
+        history = {"reference_inputs": references}
+        original_history = deepcopy(history)
+        cached = ts_extract._parse_file("unit.c", _ARITHMETIC)
+        assert cached is not None
+        assert review_has_current_foundation(history, source=_ARITHMETIC, file="unit.c")
+        with monkeypatch.context() as patch:
+            patch.setattr(ts_extract, "_get_parser", lambda language: None)
+            fallback = foundation_answers("c", request_id="degraded", source=_ARITHMETIC, file="unit.c")
+            assert _ids(fallback) == {"c.integer-promotion", "c.integer-conversion"}
+            assert "parser unavailable" in fallback[0].reason
+            assert not review_has_current_foundation(history, source=_ARITHMETIC, file="unit.c")
+        assert ts_extract._parse_file("unit.c", _ARITHMETIC) is cached
+        assert review_has_current_foundation(history, source=_ARITHMETIC, file="unit.c")
+        assert history == original_history

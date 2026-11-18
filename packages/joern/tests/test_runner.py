@@ -1,0 +1,1779 @@
+"""Tests for packages.joern.runner."""
+
+from __future__ import annotations
+
+from core.testing.module_registry import mock_module_registry
+
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import ClassVar
+
+import pytest
+
+from packages.joern.models import JoernCPG
+from packages.joern.runner import (
+    _build_taint_query,
+    _escape_scala_string,
+    _parse_errors,
+    _parse_output,
+    _read_cpg_manifest,
+    _target_content_hash,
+    _validate_query,
+    _validate_substitution_value,
+    _write_cpg_manifest,
+    build_cpg,
+    build_cpg_cached,
+    cleanup_cpg,
+    cpg_cache_slot_name,
+    load_cached_cpg,
+    run_query,
+    run_taint_query,
+)
+
+# ── Query validation ────────────────────────────────────────────────
+
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+class TestValidateQuery:
+    def test_clean_query(self):
+        assert _validate_query('cpg.method.name("foo").l') is None
+
+    def test_blocks_java_io(self):
+        err = _validate_query('java.io.File("/etc/passwd")')
+        assert err is not None
+        assert "blocked pattern" in err
+
+    def test_blocks_runtime_exec(self):
+        err = _validate_query('Runtime.exec("ls")')
+        assert err is not None
+
+    def test_blocks_process_builder(self):
+        err = _validate_query("new ProcessBuilder(cmd)")
+        assert err is not None
+
+    def test_blocks_reflection(self):
+        err = _validate_query('Class.forName("Evil")')
+        assert err is not None
+
+    def test_blocks_classloader_and_handle_reflection(self):
+        # The enumerable bypasses of the original list — each reaches
+        # code execution in the unsandboxed joern JVM without any
+        # blocked token.
+        for query in (
+            'getClass.getClassLoader.loadClass("java.lang.Runtime")',
+            'classOf[Runtime].getMethod ("exec")',
+            "classOf[X].getConstructor().newInstance()",
+            "MethodHandles.lookup()",
+            "loader.defineClass(name, bytes, 0, bytes.length)",
+            "field.setAccessible(true)",
+        ):
+            assert _validate_query(query) is not None, query
+
+    def test_plain_method_traversals_stay_clean(self):
+        # The blocklist must not eat legitimate CPG traversals.
+        for query in (
+            'cpg.method.name("getMethodTable").l',
+            "cpg.method.fullName.l",
+            'cpg.call.name("instantiate").l',
+        ):
+            assert _validate_query(query) is None, query
+
+    def test_length_cap(self):
+        err = _validate_query("x" * 5000)
+        assert err is not None
+        assert "cap" in err
+
+    def test_scala_io_blocked(self):
+        err = _validate_query('scala.io.Source.fromFile("x")')
+        assert err is not None
+
+
+class TestValidateSubstitutionValue:
+    def test_simple_identifier(self):
+        assert _validate_substitution_value("parse_header")
+
+    def test_qualified_name(self):
+        assert _validate_substitution_value("os.system")
+
+    def test_deep_qualified(self):
+        assert _validate_substitution_value("java.lang.Runtime")
+
+    def test_empty_rejected(self):
+        assert not _validate_substitution_value("")
+
+    def test_injection_rejected(self):
+        assert not _validate_substitution_value('"); system("id')
+
+    def test_spaces_rejected(self):
+        assert not _validate_substitution_value("ignore instructions")
+
+    def test_semicolon_rejected(self):
+        assert not _validate_substitution_value("foo; bar")
+
+    def test_leading_dot_rejected(self):
+        assert not _validate_substitution_value(".hidden")
+
+    def test_trailing_dot_rejected(self):
+        assert not _validate_substitution_value("trailing.")
+
+    def test_underscore_leading(self):
+        assert _validate_substitution_value("_internal")
+
+    def test_numbers_in_name(self):
+        assert _validate_substitution_value("parse2")
+
+
+class TestEscapeScalaString:
+    def test_backslash(self):
+        assert _escape_scala_string("a\\b") == "a\\\\b"
+
+    def test_quote(self):
+        assert _escape_scala_string('a"b') == 'a\\"b'
+
+    def test_newline(self):
+        assert _escape_scala_string("a\nb") == "a\\nb"
+
+    def test_clean_passthrough(self):
+        assert _escape_scala_string("clean") == "clean"
+
+
+# ── Output parsing ──────────────────────────────────────────────────
+
+class TestParseDarkMethods:
+    def test_joern_dark_lines(self):
+        from packages.joern.runner import _parse_dark_methods
+
+        out = "JOERN_DARK:parse_hdr\nnoise\nJOERN_DARK:decode\n"
+        assert _parse_dark_methods(out) == ["parse_hdr", "decode"]
+
+    def test_joern_diag_line_from_tiered_taint(self):
+        """tiered_taint.sc emits JOERN_DIAG:dark_methods:<count>:<sample>
+        — the parser must pick up the sample names (pre-fix, nothing
+        emitted the JOERN_DARK shape at all, so dark_methods was
+        always empty)."""
+        from packages.joern.runner import _parse_dark_methods
+
+        out = (
+            "JOERN_TIER:sinks:12 sink arguments across 4 call sites\n"
+            "JOERN_DIAG:dark_methods:3:parse_hdr,decode,init_tbl\n"
+        )
+        assert _parse_dark_methods(out) == [
+            "parse_hdr", "decode", "init_tbl",
+        ]
+
+    def test_no_markers(self):
+        from packages.joern.runner import _parse_dark_methods
+
+        assert _parse_dark_methods("plain output\n") == []
+
+
+class TestParseOutput:
+    def test_empty(self):
+        flows, errors = _parse_output("")
+        assert flows == []
+        assert errors == []
+
+    def test_single_flow(self):
+        steps = [
+            {"file": "a.c", "function": "f", "line": 1,
+             "code": "x", "variable": "x"},
+            {"file": "a.c", "function": "f", "line": 5,
+             "code": "memcpy(dst, x, n)", "variable": "x"},
+        ]
+        output = (
+            "JOERN_FLOWS_START\n"
+            f"JOERN_FLOW:{json.dumps(steps)}\n"
+            "JOERN_FLOWS_END\n"
+        )
+        flows, _errors = _parse_output(output)
+        assert len(flows) == 1
+        assert len(flows[0].steps) == 2
+        assert not flows[0].is_inter_procedural
+
+    def test_inter_procedural(self):
+        steps = [
+            {"file": "a.c", "function": "caller", "line": 1,
+             "code": "x", "variable": "x"},
+            {"file": "b.c", "function": "callee", "line": 5,
+             "code": "system(x)", "variable": "x"},
+        ]
+        output = (
+            "JOERN_FLOWS_START\n"
+            f"JOERN_FLOW:{json.dumps(steps)}\n"
+            "JOERN_FLOWS_END\n"
+        )
+        flows, _ = _parse_output(output)
+        assert flows[0].is_inter_procedural
+
+    def test_malformed_json_produces_error(self):
+        output = (
+            "JOERN_FLOWS_START\n"
+            "JOERN_FLOW:{not json\n"
+            "JOERN_FLOWS_END\n"
+        )
+        flows, errors = _parse_output(output)
+        assert flows == []
+        assert len(errors) == 1
+
+    def test_ignores_lines_outside_markers(self):
+        output = (
+            "some jvm output\n"
+            "JOERN_FLOWS_START\n"
+            "JOERN_FLOWS_END\n"
+            "more output\n"
+        )
+        flows, errors = _parse_output(output)
+        assert flows == []
+        assert errors == []
+
+    def test_subprocess_transport_bad_record_recorded_without_sentinels(self):
+        # The subprocess transport never prints the final-expression
+        # sentinels; a dropped flow must still reach result.errors so
+        # refuting callers don't read it as a genuine negative.
+        output = (
+            "some jvm output\n"
+            "JOERN_FLOW:{not json\n"
+        )
+        flows, errors = _parse_output(output)
+        assert flows == []
+        assert len(errors) == 1
+        assert "failed to parse flow" in errors[0]
+
+    def test_subprocess_transport_good_record_without_sentinels(self):
+        steps = [
+            {"file": "a.c", "function": "f", "line": 1,
+             "code": "x", "variable": "x"},
+        ]
+        flows, errors = _parse_output(f"JOERN_FLOW:{json.dumps(steps)}\n")
+        assert len(flows) == 1
+        assert errors == []
+
+    def test_quote_bearing_genuine_failure_not_suppressed(self):
+        # jsonEsc deliberately injects \" into printed records —
+        # escaped quotes in the payload must not read as echo noise.
+        output = (
+            "JOERN_FLOWS_START\n"
+            'JOERN_FLOW:[{"code":"puts(\\"hi\\")", broken\n'
+            "JOERN_FLOWS_END\n"
+        )
+        flows, errors = _parse_output(output)
+        assert flows == []
+        assert len(errors) == 1
+
+    def test_final_expression_echo_first_and_last_lines_parse(self):
+        # Server transport: records ride the final expression's
+        # string echo — binder prefix on the first line, closing
+        # triple quote on the last.
+        first = [{"file": "a.c", "function": "f", "line": 1,
+                  "code": "x", "variable": "x"}]
+        last = [{"file": "b.c", "function": "g", "line": 2,
+                 "code": "y", "variable": "y"}]
+        output = (
+            'val res0: String = """JOERN_FLOWS_START\n'
+            f"JOERN_FLOW:{json.dumps(first)}\n"
+            f"JOERN_FLOW:{json.dumps(last)}\n"
+            'JOERN_FLOWS_END"""\n'
+        )
+        flows, errors = _parse_output(output)
+        assert [f.steps[0].file for f in flows] == ["a.c", "b.c"]
+        assert errors == []
+
+    def test_escaped_value_echo_deduped_against_println_copy(self):
+        # A transcript carrying the println copy AND a single-line
+        # Java-escaped value echo of the same record yields it once,
+        # with no error for the echo line.
+        steps = [{"file": "a.c", "function": "f", "line": 1,
+                  "code": "x", "variable": "x"}]
+        record = f"JOERN_FLOW:{json.dumps(steps)}"
+        echoed = record.replace("\\", "\\\\").replace('"', '\\"')
+        output = (
+            f"{record}\n"
+            f'val res0: String = "{echoed}"\n'
+        )
+        flows, errors = _parse_output(output)
+        assert len(flows) == 1
+        assert errors == []
+
+
+class TestParseErrors:
+    def test_extracts_errors(self):
+        stderr = "WARNING: something\nERROR: bad thing\ninfo line\n"
+        errors = _parse_errors(stderr)
+        assert any("bad thing" in e for e in errors)
+
+    def test_ignores_deprecation_warnings(self):
+        stderr = "error: deprecated feature used\n"
+        errors = _parse_errors(stderr)
+        assert errors == []
+
+    def test_empty(self):
+        assert _parse_errors("") == []
+
+
+# ── Mock runner for integration ─────────────────────────────────────
+
+def _mock_runner(stdout="", stderr="", returncode=0):
+    """Create a mock subprocess runner."""
+    def runner(cmd, **kwargs):
+        return SimpleNamespace(
+            stdout=stdout, stderr=stderr,
+            returncode=returncode,
+        )
+    return runner
+
+
+class TestBuildCpg:
+    def test_non_directory_raises(self, tmp_path: Path):
+        f = tmp_path / "file.c"
+        f.write_text("int main() {}")
+        with pytest.raises(ValueError, match="directory"):
+            build_cpg(f, subprocess_runner=_mock_runner())
+
+    def test_creates_cpg_handle(self, tmp_path: Path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f() { return 0; }")
+
+        cpg = build_cpg(
+            target,
+            subprocess_runner=_mock_runner(),
+            output_dir=tmp_path / "out",
+        )
+        assert cpg.target == target
+        assert cpg.path.parent == tmp_path / "out"
+
+    def test_timeout_returns_cpg(self, tmp_path: Path):
+        target = tmp_path / "src"
+        target.mkdir()
+
+        def timeout_runner(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        cpg = build_cpg(
+            target,
+            subprocess_runner=timeout_runner,
+            output_dir=tmp_path / "out",
+        )
+        assert cpg.target == target
+
+    def test_os_error_returns_cpg(self, tmp_path: Path):
+        target = tmp_path / "src"
+        target.mkdir()
+
+        def error_runner(cmd, **kwargs):
+            raise OSError("no joern")
+
+        cpg = build_cpg(
+            target,
+            subprocess_runner=error_runner,
+            output_dir=tmp_path / "out",
+        )
+        assert cpg.target == target
+
+
+class TestRunQuery:
+    def test_cpg_not_found(self, tmp_path: Path):
+        cpg = JoernCPG(path=tmp_path / "missing.bin", target=tmp_path)
+        result = run_query(cpg, "cpg.method.l")
+        assert not result.ok
+        assert "not found" in result.errors[0]
+
+    def test_dangerous_query_rejected(self, tmp_path: Path):
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        result = run_query(cpg, 'java.io.File("/etc/passwd")')
+        assert not result.ok
+        assert "blocked" in result.errors[0]
+
+    def test_successful_query(self, tmp_path: Path):
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        steps = [
+            {"file": "a.c", "function": "f", "line": 1,
+             "code": "x", "variable": "x"},
+        ]
+        stdout = (
+            "JOERN_FLOWS_START\n"
+            f"JOERN_FLOW:{json.dumps(steps)}\n"
+            "JOERN_FLOWS_END\n"
+        )
+        result = run_query(
+            cpg, "cpg.method.l",
+            subprocess_runner=_mock_runner(stdout=stdout),
+        )
+        assert result.ok
+        assert result.flow_count == 1
+
+
+class TestRunTaintQuery:
+    def test_invalid_source_method(self, tmp_path: Path):
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        flows = run_taint_query(cpg, '"); evil("', "memcpy")
+        assert flows == []
+
+    def test_invalid_sink_call(self, tmp_path: Path):
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        flows = run_taint_query(cpg, "parse_header", "a b c")
+        assert flows == []
+
+    def test_valid_query_dispatches(self, tmp_path: Path):
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        steps = [
+            {"file": "a.c", "function": "parse_header",
+             "line": 1, "code": "len", "variable": "len"},
+            {"file": "a.c", "function": "parse_header",
+             "line": 5, "code": "memcpy(dst, src, len)",
+             "variable": "len"},
+        ]
+        stdout = (
+            "JOERN_FLOWS_START\n"
+            f"JOERN_FLOW:{json.dumps(steps)}\n"
+            "JOERN_FLOWS_END\n"
+        )
+        flows = run_taint_query(
+            cpg, "parse_header", "memcpy",
+            subprocess_runner=_mock_runner(stdout=stdout),
+        )
+        assert len(flows) == 1
+        assert flows[0].source_method == "parse_header"
+
+    def test_qualified_sink_accepted(self, tmp_path: Path):
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        flows = run_taint_query(
+            cpg, "handler", "os.system",
+            subprocess_runner=_mock_runner(),
+        )
+        assert isinstance(flows, list)
+
+
+class TestBuildTaintQuery:
+    def test_basic_query(self):
+        q = _build_taint_query("foo", "bar")
+        assert 'name("foo")' in q
+        assert 'name("bar")' in q
+        assert "reachableByFlows" in q
+
+    def test_with_param(self):
+        q = _build_taint_query("foo", "bar", "len")
+        assert 'name("len")' in q
+
+
+class TestCleanupCpg:
+    def test_removes_file(self, tmp_path: Path):
+        cpg_dir = tmp_path / "cpg_dir"
+        cpg_dir.mkdir()
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert not f.exists()
+        assert not cpg_dir.exists()
+
+    def test_missing_file_no_error(self, tmp_path: Path):
+        cpg = JoernCPG(
+            path=tmp_path / "gone.bin", target=tmp_path,
+        )
+        cleanup_cpg(cpg)
+
+    def test_non_empty_dir_preserved(self, tmp_path: Path):
+        cpg_dir = tmp_path / "cpg_dir"
+        cpg_dir.mkdir()
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        (cpg_dir / "other.txt").write_text("keep")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert not f.exists()
+        assert cpg_dir.exists()
+
+    def test_removes_importcpg_workspace_copy(self, tmp_path: Path):
+        """importCpg copies the CPG into workspace/ under the query
+        cwd (the CPG dir) — cleanup must remove it, then the now-empty
+        dir."""
+        cpg_dir = tmp_path / "cpg_dir"
+        ws = cpg_dir / "workspace" / "cpg.bin" / "overlays"
+        ws.mkdir(parents=True)
+        (cpg_dir / "workspace" / "cpg.bin" / "cpg.bin").write_bytes(b"copy")
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert not f.exists()
+        assert not (cpg_dir / "workspace").exists()
+        assert not cpg_dir.exists()
+
+    def test_workspace_symlink_not_followed(self, tmp_path: Path):
+        """A symlink squatting at workspace/ must not be traversed —
+        its target survives; only the CPG artifacts go."""
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "precious.txt").write_text("keep")
+        cpg_dir = tmp_path / "cpg_dir"
+        cpg_dir.mkdir()
+        (cpg_dir / "workspace").symlink_to(victim)
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert (victim / "precious.txt").exists()
+
+    def test_removes_stray_query_scratch_dirs(self, tmp_path: Path):
+        """A hard-killed query never reaches run_query's own rmtree —
+        its raptor-query-* scratch (wrapper + workspace copy) must not
+        pin the CPG dir alive forever. Strays qualify by AGE."""
+        cpg_dir = tmp_path / "cpg_dir"
+        stray = cpg_dir / "raptor-query-abc123"
+        (stray / "workspace").mkdir(parents=True)
+        (stray / "workspace" / "cpg.bin").write_bytes(b"copy")
+        (stray / "query.sc").write_text("cpg.method.l")
+        old = time.time() - 25 * 3600
+        os.utime(stray, (old, old))
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert not stray.exists()
+        assert not cpg_dir.exists()
+
+    def test_fresh_query_scratch_survives_sibling_cleanup(
+            self, tmp_path: Path):
+        """A FRESH raptor-query-* dir is a sibling session's possibly
+        in-flight query against the same shared cache slot — a
+        sibling's cleanup_cpg must not delete its cwd/tmpdir out from
+        under it mid-query. It ages into the sweep instead."""
+        cpg_dir = tmp_path / "cpg_dir"
+        live = cpg_dir / "raptor-query-live01"
+        live.mkdir(parents=True)
+        (live / "query.sc").write_text("cpg.method.l")
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert (live / "query.sc").exists()
+        # The slot dir stays (non-empty) — reclaimed by a later
+        # cleanup once the stray ages out.
+        assert cpg_dir.exists()
+
+    def test_stray_query_dir_symlink_not_followed(self, tmp_path: Path):
+        """Same symlink guard as workspace/: a link squatting at a
+        raptor-query-* name is never traversed."""
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "precious.txt").write_text("keep")
+        cpg_dir = tmp_path / "cpg_dir"
+        cpg_dir.mkdir()
+        (cpg_dir / "raptor-query-evil").symlink_to(victim)
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert (victim / "precious.txt").exists()
+
+
+class TestRunQueryScratchCwd:
+    def test_fallback_runner_gets_per_query_cwd(self, tmp_path: Path):
+        """The TypeError fallback (runner without sandbox kwargs) must
+        still pin cwd to a per-query scratch dir INSIDE the CPG dir —
+        importCpg drops a workspace/ copy under the process cwd, which
+        pre-fix-one was whatever directory the CALLER ran from, and
+        pre-fix-two was the CPG dir itself, shared with every
+        concurrent query against the same cache slot."""
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        seen: dict = {}
+
+        def bare_runner(cmd, capture_output, text, timeout, cwd, pass_fds=()):
+            seen["cwd"] = Path(cwd)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        result = run_query(
+            cpg, "cpg.method.l", subprocess_runner=bare_runner,
+        )
+        assert result.ok
+        assert seen["cwd"] != tmp_path
+        assert not seen["cwd"].exists()
+        assert seen["cwd"].name.startswith("raptor-query-")
+
+    def test_concurrent_queries_get_distinct_cwds(self, tmp_path: Path):
+        """The collision the scratch dir exists to prevent: two
+        queries against the SAME CPG must never share a cwd, or their
+        importCpg workspace/ copies race."""
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cwds: list[Path] = []
+
+        def bare_runner(cmd, capture_output, text, timeout, cwd, pass_fds=()):
+            cwds.append(Path(cwd))
+            # The scratch cwd must exist while the query runs.
+            assert Path(cwd).is_dir()
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        run_query(cpg, "cpg.method.l", subprocess_runner=bare_runner)
+        run_query(cpg, "cpg.method.l", subprocess_runner=bare_runner)
+        assert len(cwds) == 2
+        assert cwds[0] != cwds[1]
+
+    def test_query_scratch_removed_after_run(self, tmp_path: Path):
+        """The per-query dir (cwd + wrapper script + workspace copy)
+        is reclaimed after every query — success and JVM-error alike —
+        so a long-lived cache slot never accumulates per-query
+        scratch."""
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        def ok_runner(cmd, capture_output, text, timeout, cwd, pass_fds=()):
+            # Simulate importCpg's workspace copy inside the cwd.
+            (Path(cwd) / "workspace").mkdir()
+            (Path(cwd) / "workspace" / "cpg.bin").write_bytes(b"copy")
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def raising_runner(cmd, capture_output, text, timeout, cwd, pass_fds=()):
+            raise OSError("boom")
+
+        run_query(cpg, "cpg.method.l", subprocess_runner=ok_runner)
+        assert list(tmp_path.glob("raptor-query-*")) == []
+
+        result = run_query(
+            cpg, "cpg.method.l", subprocess_runner=raising_runner,
+        )
+        assert not result.ok
+        assert list(tmp_path.glob("raptor-query-*")) == []
+
+    def test_default_tempdir_prefix_is_reaper_registered(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """build_cpg's own mkdtemp scratch must be visible to the tmp
+        reaper so orphans from crashed runs get reclaimed."""
+        from core.run import tmp_reaper
+
+        target = tmp_path / "src"
+        target.mkdir()
+        cpg = build_cpg(target, subprocess_runner=_mock_runner())
+        try:
+            assert cpg.path.parent.name.startswith("raptor-joern-cpg-")
+            assert "raptor-joern-cpg-" in tmp_reaper._dir_prefixes()
+        finally:
+            cleanup_cpg(cpg)
+
+
+# ── Template slot injection defense ─────────────────────────────────
+
+class TestTemplateSlotInjection:
+    """Verify that attacker-controlled function/param names cannot
+    inject code into Joern query templates."""
+
+    INJECTION_PAYLOADS: ClassVar[list[str]] = [
+        '"); Runtime.getRuntime().exec("id"); //',
+        "foo\nval x = 1",
+        'a"b',
+        "os.system; import java.io._",
+        "__import__('os').system('id')",
+        "${Runtime.getRuntime().exec('id')}",
+    ]
+
+    def test_substitution_rejects_injections(self):
+        for payload in self.INJECTION_PAYLOADS:
+            assert not _validate_substitution_value(payload), (
+                f"should have rejected: {payload!r}"
+            )
+
+    def test_escape_neutralizes_quotes(self):
+        assert '"' not in _escape_scala_string("test").replace('\\"', "")
+
+    def test_query_validation_catches_dangerous_patterns(self):
+        for payload in self.INJECTION_PAYLOADS:
+            escaped = _escape_scala_string(payload)
+            query = f'cpg.method.name("{escaped}").l'
+            err = _validate_query(query)
+            if "Runtime" in payload or "import java" in payload:
+                assert err is not None, (
+                    f"should have caught dangerous pattern in: {query}"
+                )
+
+
+def _valid_cpg_bytes(methods: int = 5) -> bytes:
+    """Minimal structurally-valid cpg.bin: a flatgraph-shaped JSON tail
+    manifest with a positive METHOD count. The cache gates require a
+    parseable method count (an anchor-less blob now reads as a
+    truncated/killed write, not as "unknown, accept")."""
+    return b"FLATGRAPH" + json.dumps({
+        "version": 1,
+        "nodes": [{"nodeLabel": "METHOD", "nnodes": methods}],
+    }).encode()
+
+
+class TestCPGCaching:
+    def test_content_hash_stable(self, tmp_path):
+        (tmp_path / "a.c").write_text("int main() {}")
+        h1 = _target_content_hash(tmp_path)
+        h2 = _target_content_hash(tmp_path)
+        assert h1 == h2
+
+    def test_content_hash_changes_on_edit(self, tmp_path):
+        f = tmp_path / "a.c"
+        f.write_text("int main() {}")
+        h1 = _target_content_hash(tmp_path)
+        # Same byte length — only the CONTENT differs.
+        f.write_text("int main() {;}"[:13])
+        h2 = _target_content_hash(tmp_path)
+        assert h1 != h2
+
+    def test_content_hash_ignores_mtime(self, tmp_path):
+        # An unchanged tree must produce an unchanged key across mtime
+        # churn (builds, checkouts, tooling touches). The pre-fix
+        # mtime-based key rebuilt the CPG at every resumed-audit
+        # segment start on a git-clean target.
+        import os
+        import time
+        f = tmp_path / "a.c"
+        f.write_text("int main() {}")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.py").write_text("x = 1\n")
+        h1 = _target_content_hash(tmp_path)
+        future = int(time.time()) + 100
+        os.utime(f, (future, future))
+        os.utime(tmp_path / "sub" / "b.py", (future, future))
+        h2 = _target_content_hash(tmp_path)
+        assert h1 == h2
+
+    def test_content_hash_ignores_directory_order(self, tmp_path, monkeypatch):
+        # The key must be a function of the sorted file set, not of
+        # the order the OS yields directory entries.
+        import os as os_mod
+        for name in ("m.c", "a.c", "z.c"):
+            (tmp_path / name).write_text(f"// {name}\n")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "s.c").write_text("// s\n")
+        h1 = _target_content_hash(tmp_path)
+
+        real_walk = os_mod.walk
+
+        def shuffled_walk(top, *args, **kwargs):
+            for root, dirs, files in real_walk(top, *args, **kwargs):
+                dirs.reverse()
+                files.reverse()
+                yield root, dirs, files
+
+        import packages.joern.runner as runner_mod
+        patch_module_attribute(monkeypatch, runner_mod, 'os', "walk", shuffled_walk)
+        h2 = _target_content_hash(tmp_path)
+        assert h1 == h2
+
+    def test_content_hash_excludes_dot_and_dependency_dirs(self, tmp_path):
+        (tmp_path / "a.c").write_text("int main() {}")
+        h1 = _target_content_hash(tmp_path)
+        # VCS / dependency dirs never enter the key (and the same rule
+        # is passed to the CPG build — see CPG_EXCLUDE_REGEX parity).
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "hook.py").write_text("x = 1\n")
+        (tmp_path / "node_modules").mkdir()
+        (tmp_path / "node_modules" / "dep.js").write_text("var x;\n")
+        (tmp_path / "vendor").mkdir()
+        (tmp_path / "vendor" / "lib.c").write_text("int v;\n")
+        h2 = _target_content_hash(tmp_path)
+        assert h1 == h2
+        # A real source file still changes the key.
+        (tmp_path / "b.c").write_text("int f() { return 0; }")
+        assert _target_content_hash(tmp_path) != h1
+
+    def test_committed_run_marker_cannot_carve_a_blind_spot(self, tmp_path):
+        # Exclusions are never derived from repo content: a hostile
+        # tree committing a .raptor-run.json marker must NOT remove
+        # its subtree from the key — otherwise edits there would
+        # serve a silently stale CPG to every joern-backed check.
+        (tmp_path / "a.c").write_text("int main() {}")
+        marked = tmp_path / "src"
+        marked.mkdir()
+        (marked / ".raptor-run.json").write_text("{}")
+        (marked / "handler.c").write_text("int h(void) { return 1; }")
+        h1 = _target_content_hash(tmp_path)
+        (marked / "handler.c").write_text("int h(void) { return 2; }")
+        assert _target_content_hash(tmp_path) != h1
+        (marked / "backdoor.c").write_text("int bd(void) { return 0; }")
+        assert _target_content_hash(tmp_path) != h1
+
+    def test_declared_exclude_dirs_pruned_from_key(self, tmp_path):
+        # Caller-declared output roots (the ONLY sanctioned run-output
+        # exclusion) are pruned from the key; build_cpg_cached passes
+        # the same list to the build as --exclude.
+        (tmp_path / "a.c").write_text("int main() {}")
+        out_root = tmp_path / "out"
+        run_dir = out_root / "audit_1234"
+        run_dir.mkdir(parents=True)
+        h1 = _target_content_hash(tmp_path, exclude_dirs=[out_root])
+        (run_dir / "checker.py").write_text("print('generated')\n")
+        h2 = _target_content_hash(tmp_path, exclude_dirs=[out_root])
+        assert h1 == h2
+        # Undeclared, the same artifacts enter the key (rebuild —
+        # safe, never stale).
+        assert _target_content_hash(tmp_path) != h1
+
+    def test_content_hash_filename_cannot_forge_another_tree(self, tmp_path):
+        # ':' and '\n' are legal in POSIX filenames: a single file
+        # whose NAME embeds another tree's "path:digest" line must not
+        # collide with that tree's key — a collision would serve one
+        # tree's cached CPG for the other.
+        import hashlib as hashlib_mod
+        body = b"int f(void) { return 0; }\n"
+        honest = tmp_path / "honest"
+        honest.mkdir()
+        (honest / "a.c").write_bytes(b"int a;\n")
+        (honest / "b.c").write_bytes(body)
+        digest_a = hashlib_mod.sha256(b"int a;\n").hexdigest()
+        forged = tmp_path / "forged"
+        forged.mkdir()
+        (forged / f"a.c:{digest_a}\nb.c").write_bytes(body)
+        assert _target_content_hash(honest) != _target_content_hash(forged)
+
+    def test_content_hash_skips_non_regular_files(self, tmp_path):
+        # A symlink to a device (git-committable) or a FIFO named
+        # like source must be skipped, not opened — reading either
+        # blocks the orchestrator forever.
+        import os
+        (tmp_path / "a.c").write_text("int main() {}")
+        h1 = _target_content_hash(tmp_path)
+        os.symlink("/dev/zero", tmp_path / "zero.c")
+        os.mkfifo(tmp_path / "pipe.c")
+        h2 = _target_content_hash(tmp_path)
+        assert h1 == h2
+        # A symlink to a REGULAR source file still counts as content.
+        os.symlink(tmp_path / "a.c", tmp_path / "alias.c")
+        assert _target_content_hash(tmp_path) != h1
+
+    def test_exclude_regex_matches_key_walk_semantics(self):
+        # CPG_EXCLUDE_REGEX is the frontend-side mirror of the key
+        # walk's directory rule: excluded DIRECTORY components only;
+        # dot-FILES are source and stay in both.
+        import re
+        from packages.joern.runner import CPG_EXCLUDE_REGEX
+        rx = re.compile(CPG_EXCLUDE_REGEX)
+        excluded = [
+            "vendor/lib.c",
+            "third_party/x/y.cpp",
+            "a/node_modules/dep.js",
+            ".git/hook.py",
+            "src/.tox/env.py",
+            "__pycache__/m.py",
+        ]
+        kept = [
+            "src/app.c",
+            "src/.hidden.c",       # dot-FILE: in key, in graph
+            "src/vendor.c",        # name contains, not a component
+            "vendored/lib.c",      # prefix, not the excluded name
+        ]
+        for p in excluded:
+            assert rx.fullmatch(p), f"should exclude: {p}"
+        for p in kept:
+            assert not rx.fullmatch(p), f"should keep: {p}"
+
+    def test_load_cached_cpg_honours_precomputed_hash(self, tmp_path):
+        # build_cpg_cached hashes the tree ONCE, before the build, and
+        # threads that hash into both the freshness check and the
+        # manifest write — load_cached_cpg must trust the precomputed
+        # value rather than re-walking a tree that may have gained
+        # transient build artifacts.
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        cache = tmp_path / "cache"
+        cpg_dir = cache / "joern-cpg"
+        cpg_dir.mkdir(parents=True)
+        (cpg_dir / "cpg.bin").write_bytes(_valid_cpg_bytes())
+        _write_cpg_manifest(cpg_dir, target, "pinnedhash", {"c"}, 100)
+
+        assert load_cached_cpg(target, cache) is None
+        hit = load_cached_cpg(
+            target, cache, current_content_hash="pinnedhash")
+        assert hit is not None
+        assert hit.path == cpg_dir / "cpg.bin"
+
+    def test_manifest_roundtrip(self, tmp_path):
+        cpg_dir = tmp_path / "joern-cpg"
+        cpg_dir.mkdir()
+        (cpg_dir / "cpg.bin").write_bytes(b"graph fixture")
+        _write_cpg_manifest(cpg_dir, Path("/src"), "abc123", {"c"}, 500)
+        m = _read_cpg_manifest(cpg_dir)
+        assert m["content_hash"] == "abc123"
+        assert m["build_time_ms"] == 500
+        assert "c" in m["languages"]
+
+    def test_manifest_missing_returns_none(self, tmp_path):
+        assert _read_cpg_manifest(tmp_path) is None
+
+    def test_load_cached_cpg_reproduces_recorded_exclusions(self, tmp_path):
+        # Read-only consumers (guard-dominance's warm-server probe)
+        # pass neither a precomputed hash nor exclude_dirs. A cache
+        # built under caller-declared exclusions must not read as
+        # permanently stale for them: the freshness walk reproduces
+        # the manifest's recorded exclusion contract.
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        run_dir = target / "out" / "audit_1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "artifact.py").write_text("x = 1\n")
+
+        cache = tmp_path / "cache"
+        cpg_dir = cache / "joern-cpg"
+        cpg_dir.mkdir(parents=True)
+        (cpg_dir / "cpg.bin").write_bytes(_valid_cpg_bytes())
+
+        content_hash = _target_content_hash(
+            target, exclude_dirs=(run_dir,))
+        _write_cpg_manifest(
+            cpg_dir, target, content_hash, {"c"}, 100,
+            exclude_dirs=(str(run_dir),),
+        )
+        # Run artifacts churn after the build — exactly the noise the
+        # declared exclusion exists to keep out of the key.
+        (run_dir / "artifact.py").write_text("x = 2\n")
+
+        assert load_cached_cpg(target, cache) is not None
+
+    def test_run_output_exclude_dirs_in_target(self, tmp_path):
+        from packages.joern.runner import run_output_exclude_dirs
+        out_dir = tmp_path / "out" / "audit_1"
+        out_dir.mkdir(parents=True)
+        assert run_output_exclude_dirs(out_dir, tmp_path) == (
+            str(out_dir.resolve()),
+        )
+
+    def test_run_output_exclude_dirs_outside_target(self, tmp_path):
+        from packages.joern.runner import run_output_exclude_dirs
+        target = tmp_path / "src"
+        target.mkdir()
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        assert run_output_exclude_dirs(out_dir, target) == ()
+
+    def test_run_output_exclude_dirs_target_itself(self, tmp_path):
+        # out_dir == target must never be declared: excluding the
+        # whole tree would empty the key and the graph.
+        from packages.joern.runner import run_output_exclude_dirs
+        assert run_output_exclude_dirs(tmp_path, tmp_path) == ()
+
+    def test_run_output_exclude_dirs_absent_inputs(self, tmp_path):
+        from packages.joern.runner import run_output_exclude_dirs
+        assert run_output_exclude_dirs(None, tmp_path) == ()
+        assert run_output_exclude_dirs(tmp_path / "out", None) == ()
+
+    def test_load_cached_cpg_miss(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        assert load_cached_cpg(target, cache) is None
+
+    def test_load_cached_cpg_hit(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+
+        cache = tmp_path / "cache"
+        cpg_dir = cache / "joern-cpg"
+        cpg_dir.mkdir(parents=True)
+        (cpg_dir / "cpg.bin").write_bytes(_valid_cpg_bytes())
+
+        content_hash = _target_content_hash(target)
+        _write_cpg_manifest(cpg_dir, target, content_hash, {"c"}, 100)
+
+        result = load_cached_cpg(target, cache)
+        assert result is not None
+        assert result.path == cpg_dir / "cpg.bin"
+
+    def test_load_cached_cpg_stale(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+
+        cache = tmp_path / "cache"
+        cpg_dir = cache / "joern-cpg"
+        cpg_dir.mkdir(parents=True)
+        (cpg_dir / "cpg.bin").write_bytes(_valid_cpg_bytes())
+
+        _write_cpg_manifest(cpg_dir, target, "stale_hash", {"c"}, 100)
+
+        result = load_cached_cpg(target, cache)
+        assert result is None
+
+    def test_build_cpg_cached_uses_cache(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+
+        cache = tmp_path / "cache"
+        cpg_dir = cache / "joern-cpg"
+        cpg_dir.mkdir(parents=True)
+        (cpg_dir / "cpg.bin").write_bytes(_valid_cpg_bytes())
+
+        content_hash = _target_content_hash(target)
+        _write_cpg_manifest(cpg_dir, target, content_hash, {"c"}, 100)
+
+        build_called = []
+
+        def fake_runner(cmd, **kw):
+            build_called.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        result = build_cpg_cached(
+            target, cache, subprocess_runner=fake_runner,
+        )
+        assert result.path == cpg_dir / "cpg.bin"
+        assert len(build_called) == 0
+
+
+class TestValidateSubstitutionValueFullmatch:
+    def test_trailing_newline_rejected(self):
+        # A $-anchored match() admits "foo\n"; fullmatch must not.
+        assert not _validate_substitution_value("parse_header\n")
+
+    def test_trailing_newline_qualified_rejected(self):
+        assert not _validate_substitution_value("os.system\n")
+
+
+class TestBuildCpgSandbox:
+    """on_progress must never bypass the sandbox.
+
+    With core.sandbox available, the build routes through the sandbox
+    runner (the raw-Popen stall monitor is dropped); the monitor path
+    only runs when the sandbox is absent.
+    """
+
+    def _spy_runner(self, calls):
+        def runner(cmd, **kwargs):
+            calls.append({"cmd": cmd, "kwargs": kwargs})
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        return runner
+
+    def test_progress_path_routes_through_sandbox(self, tmp_path, monkeypatch):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f() { return 0; }")
+
+        calls: list = []
+        monkeypatch.setattr(
+            "packages.joern.runner._default_sandbox_runner",
+            lambda: self._spy_runner(calls),
+        )
+
+        def no_raw_popen(*a, **kw):
+            raise AssertionError(
+                "stall monitor must not spawn a raw Popen when the "
+                "sandbox is available"
+            )
+
+        monkeypatch.setattr(
+            "packages.joern.runner.subprocess.Popen", no_raw_popen,
+        )
+
+        progress: list = []
+        cpg = build_cpg(
+            target, on_progress=progress.append, output_dir=tmp_path / "out",
+        )
+        assert cpg.target == target.resolve()
+        assert len(calls) == 1
+        assert calls[0]["kwargs"]["block_network"] is True
+        assert calls[0]["kwargs"]["target"] == str(target.resolve())
+        assert progress  # coarse note replaces per-file streaming
+
+    def test_non_monitor_branch_blocks_network(self, tmp_path, monkeypatch):
+        target = tmp_path / "src"
+        target.mkdir()
+
+        calls: list = []
+        monkeypatch.setattr(
+            "packages.joern.runner._default_sandbox_runner",
+            lambda: self._spy_runner(calls),
+        )
+
+        build_cpg(target, output_dir=tmp_path / "out")
+        assert calls[0]["kwargs"]["block_network"] is True
+
+    def test_sandbox_unavailable_keeps_stall_monitor(self, tmp_path, monkeypatch):
+        target = tmp_path / "src"
+        target.mkdir()
+
+        def _fake_optout_runner(cmd, **kwargs):
+            return subprocess.run(cmd, **kwargs)
+
+        # The opt-out lane is detected by the marker attribute, not
+        # by identity with subprocess.run (the fallback now wraps it
+        # to inject the sanitised env).
+        _fake_optout_runner._raptor_unsandboxed = True
+        monkeypatch.setattr(
+            "packages.joern.runner._default_sandbox_runner",
+            lambda: _fake_optout_runner,
+        )
+
+        called: dict = {}
+
+        def fake_monitor_build(cmd, cpg_path, target_, languages, timeout,
+                               on_progress):
+            called["cmd"] = cmd
+            return JoernCPG(path=cpg_path, target=target_)
+
+        monkeypatch.setattr(
+            "packages.joern.runner._build_cpg_with_stall_monitor",
+            fake_monitor_build,
+        )
+
+        build_cpg(target, on_progress=lambda m: None,
+                  output_dir=tmp_path / "out")
+        assert "cmd" in called
+
+
+class TestStallMonitorStdoutDrain:
+    """A chatty joern-parse stdout must not wedge the monitored build.
+
+    Regression: stdout was PIPE'd but only read after exit, so a child
+    emitting more than the OS pipe buffer (~64KB) on stdout blocked in
+    write(), stalled its stderr progress, and got killed as a spurious
+    timeout/stall.
+    """
+
+    def test_chatty_stdout_completes_and_is_parsed(self, tmp_path):
+        import sys as _sys
+
+        from packages.joern.runner import _build_cpg_with_stall_monitor
+
+        # Writes 256KB of noise plus a language line to stdout — far
+        # past the pipe buffer an undrained child deadlocks on.
+        script = (
+            "import sys\n"
+            "sys.stdout.write('noise\\n' * (256 * 1024 // 6))\n"
+            "sys.stdout.write('language: c\\n')\n"
+        )
+        cpg = _build_cpg_with_stall_monitor(
+            [_sys.executable, "-c", script],
+            cpg_path=tmp_path / "cpg.bin",
+            target=tmp_path,
+            languages=None,
+            timeout=20,
+            on_progress=lambda m: None,
+        )
+        # Pre-fix the child hit the 20s wait timeout and the fallback
+        # JoernCPG carried no languages and no build time.
+        assert cpg.languages == {"c"}
+        assert cpg.build_time_ms < 20_000
+
+
+class TestDefaultSandboxRunnerFailClosed:
+    """The try-import-sandbox-except-bare-subprocess shape is gone:
+    sandbox unimportable -> raise naming the remedy, unless the
+    operator explicitly opted into unsandboxed execution."""
+
+    def test_raises_when_sandbox_unimportable(self, monkeypatch):
+        from core.run.sandbox_policy import (
+            ALLOW_UNSANDBOXED_ENV,
+            SandboxUnavailableError,
+        )
+        from packages.joern.runner import _default_sandbox_runner
+        monkeypatch.delenv(ALLOW_UNSANDBOXED_ENV, raising=False)
+        with mock_module_registry({"core.sandbox": None}):
+            with pytest.raises(SandboxUnavailableError, match="joern"):
+                _default_sandbox_runner()
+
+    def test_optout_returns_bare_subprocess_with_event(self, monkeypatch):
+        import sys as _sys
+
+
+        import core.run.sandbox_policy as policy_mod
+        from packages.joern.runner import _default_sandbox_runner
+        monkeypatch.setenv(policy_mod.ALLOW_UNSANDBOXED_ENV, "1")
+        events: list = []
+        monkeypatch.setattr(
+            policy_mod, "log_security_event",
+            lambda etype, msg, **kw: events.append(etype),
+        )
+        with mock_module_registry({"core.sandbox": None}):
+            runner = _default_sandbox_runner()
+        assert events == ["unsandboxed_tool_fallback"]
+        # The opt-out waives the sandbox, never env hygiene: the
+        # fallback must hand joern-parse a SANITISED environment, not
+        # the operator's full credential env.
+        assert getattr(runner, "_raptor_unsandboxed", False)
+        monkeypatch.setenv("SUPER_SECRET_TOKEN", "hunter2")
+        proc = runner(
+            [_sys.executable, "-c",
+             "import os,sys; sys.exit("
+             "1 if 'SUPER_SECRET_TOKEN' in os.environ else 0)"],
+            capture_output=True, timeout=30,
+        )
+        assert proc.returncode == 0, "operator env leaked to joern-parse"
+
+
+# ── Failed builds must never poison the cache ───────────────────────
+
+
+class TestFailedBuildCacheGate:
+    def _timeout_runner(self, cpg_bytes: bytes | None):
+        """Runner that (optionally) leaves a partial cpg.bin, then
+        raises TimeoutExpired — the killed-mid-write shape."""
+        def runner(cmd, **kw):
+            if cpg_bytes is not None:
+                out = Path(cmd[cmd.index("--output") + 1])
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(cpg_bytes)
+            raise subprocess.TimeoutExpired(cmd, 1)
+        return runner
+
+    def test_timeout_marks_failed_and_removes_partial(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        out = tmp_path / "out"
+        cpg = build_cpg(
+            target, output_dir=out,
+            subprocess_runner=self._timeout_runner(b"partial-write"),
+        )
+        assert cpg.build_failed is True
+        # The partial file is deleted — nothing downstream can mistake
+        # it for a complete graph.
+        assert not cpg.exists()
+
+    def test_timeout_build_is_never_manifested(self, tmp_path):
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        cache = tmp_path / "cache"
+        cpg = build_cpg_cached(
+            target, cache,
+            subprocess_runner=self._timeout_runner(b"partial-write"),
+        )
+        assert cpg.build_failed is True
+        slot = cpg_cache_slot_name((), target=target)
+        assert not (cache / slot / "manifest.json").exists()
+
+    def test_unparseable_method_count_not_manifested(self, tmp_path):
+        # A "successful" build whose cpg.bin has no flatgraph tail
+        # manifest (truncated, or a format the probe cannot vouch for)
+        # must not be cached — pre-fix it became a permanent cache hit
+        # that every later run served while every import failed.
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        cache = tmp_path / "cache"
+
+        def runner(cmd, **kw):
+            out = Path(cmd[cmd.index("--output") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"\x00truncated, no manifest anchor")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        cpg = build_cpg_cached(target, cache, subprocess_runner=runner)
+        try:
+            assert cpg.exists()  # this run may still use the build
+            slot = cpg_cache_slot_name((), target=target)
+            assert not (cache / slot / "manifest.json").exists()
+        finally:
+            cleanup_cpg(cpg)
+
+    def test_valid_build_still_manifested(self, tmp_path):
+        # Two-direction: a build whose tail manifest parses is cached.
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        cache = tmp_path / "cache"
+
+        def runner(cmd, **kw):
+            out = Path(cmd[cmd.index("--output") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(_valid_cpg_bytes(methods=3))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        cpg = build_cpg_cached(target, cache, subprocess_runner=runner)
+        assert cpg.build_failed is False
+        slot = cpg_cache_slot_name((), target=target)
+        manifest = _read_cpg_manifest(cache / slot)
+        assert manifest is not None
+        assert manifest["method_count"] == 3
+
+    def test_load_rejects_anchorless_cached_cpg(self, tmp_path):
+        # Legacy/poisoned cache entries: cpg.bin with no parseable
+        # tail manifest is served no more — reject and rebuild.
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int main() {}")
+        cache = tmp_path / "cache"
+        cpg_dir = cache / "joern-cpg"
+        cpg_dir.mkdir(parents=True)
+        (cpg_dir / "cpg.bin").write_bytes(b"\x00truncated")
+        _write_cpg_manifest(
+            cpg_dir, target, _target_content_hash(target), {"c"}, 100,
+        )
+        assert load_cached_cpg(target, cache) is None
+
+
+# ── Stall monitor: timer-based kill decision ────────────────────────
+
+
+class _FakeParseProc:
+    """Popen stand-in: iterable stderr + kill/poll bookkeeping."""
+
+    def __init__(self, stderr_lines):
+        self.stderr = iter(stderr_lines)
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+    def poll(self):
+        return 1 if self.killed else None
+
+
+class TestStallMonitor:
+    def _monitor(self, lines=()):
+        from packages.joern.runner import _StallMonitor
+        return _StallMonitor(_FakeParseProc(lines)), None
+
+    def test_slow_but_completed_file_not_killed_by_reader(self):
+        # Pre-fix the kill decision ran in the per-line loop: it only
+        # ever fired when the NEXT line arrived — i.e. after the
+        # allegedly stalled file had already completed — killing a
+        # healthy build retroactively.
+        import time as _time
+        monitor, _ = self._monitor(["Parsing slow_file.c\n"])
+        monitor._threshold = 0.001  # calibrated, tiny
+        monitor._last_progress = _time.monotonic() - 100  # huge gap
+        monitor.run()  # consumes the (late but successful) line
+        assert monitor.was_killed is False
+        assert monitor._proc.killed is False
+
+    def test_watchdog_kills_during_silence(self, monkeypatch):
+        # A genuinely hung joern-parse emits nothing — only a timer
+        # can catch it (the reader blocks in the stderr read).
+        import time as _time
+
+        import packages.joern.runner as runner_mod
+        monkeypatch.setattr(runner_mod, "_STALL_POLL_INTERVAL_S", 0.01)
+        monitor, _ = self._monitor([])
+        monitor._threshold = 0.02
+        monitor._last_progress = _time.monotonic()
+        monitor.watch()  # returns once it kills
+        assert monitor.was_killed is True
+        assert monitor._proc.killed is True
+
+    def test_watchdog_idle_while_uncalibrated(self, monkeypatch):
+        # No threshold yet (fewer than N calibration files): the
+        # watchdog must not kill; the outer proc.wait timeout covers
+        # a pre-calibration hang.
+        import packages.joern.runner as runner_mod
+        monkeypatch.setattr(runner_mod, "_STALL_POLL_INTERVAL_S", 0.01)
+        monitor, _ = self._monitor([])
+        assert monitor._threshold is None
+        # Finish the "build" shortly after so watch() exits.
+        import threading as _threading
+        _threading.Timer(0.05, monitor._done.set).start()
+        monitor.watch()
+        assert monitor.was_killed is False
+
+    def test_watchdog_exits_without_kill_when_build_finishes(
+        self, monkeypatch,
+    ):
+        # Two-direction: progress keeps arriving (reader updates
+        # _last_progress), build exits, watchdog never fires.
+        import time as _time
+
+        import packages.joern.runner as runner_mod
+        monkeypatch.setattr(runner_mod, "_STALL_POLL_INTERVAL_S", 0.01)
+        monitor, _ = self._monitor([])
+        monitor._threshold = 10.0
+        monitor._last_progress = _time.monotonic()
+        monitor._done.set()  # reader hit EOF: build finished
+        monitor.watch()
+        assert monitor.was_killed is False
+
+
+# ── run_query validates the EXECUTED script body ────────────────────
+
+
+class TestRunQueryScriptBodyValidation:
+    def _cpg(self, tmp_path):
+        cpg_path = tmp_path / "cpg.bin"
+        cpg_path.write_bytes(_valid_cpg_bytes())
+        return JoernCPG(path=cpg_path, target=tmp_path)
+
+    def _spy_runner(self, calls):
+        def runner(cmd, **kw):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return runner
+
+    def test_script_file_body_is_validated(self, tmp_path):
+        # Pre-fix validation ran on the PATH string, so a .sc body
+        # carrying a blocked pattern executed unvalidated.
+        script = tmp_path / "evil.sc"
+        script.write_text('new ProcessBuilder("id").start()\n')
+        calls = []
+        result = run_query(
+            self._cpg(tmp_path), str(script),
+            subprocess_runner=self._spy_runner(calls),
+        )
+        assert any("blocked pattern" in e for e in result.errors)
+        assert calls == []  # joern never invoked
+
+    def test_substituted_values_are_validated(self, tmp_path):
+        # Substitutions splice in AFTER the old check ran — the
+        # resolved body (template + values) is what must be validated.
+        script = tmp_path / "template.sc"
+        script.write_text("cpg.call.name(__SINKS__).l\n")
+        calls = []
+        result = run_query(
+            self._cpg(tmp_path), str(script),
+            substitutions={"__SINKS__": 'Runtime.exec("id")'},
+            subprocess_runner=self._spy_runner(calls),
+        )
+        assert any("blocked pattern" in e for e in result.errors)
+        assert calls == []
+
+    def test_clean_script_with_substitutions_executes(self, tmp_path):
+        # Two-direction: the production shape (in-repo template +
+        # identifier-list substitution) still runs, including bodies
+        # longer than the inline query length cap.
+        script = tmp_path / "sinks.sc"
+        script.write_text(
+            "// " + "x" * 5000 + "\n"  # over _QUERY_MAX_LEN, still fine
+            "cpg.call.name(__SINK_NAMES__).l\n"
+        )
+        calls = []
+        result = run_query(
+            self._cpg(tmp_path), str(script),
+            substitutions={"__SINK_NAMES__": '"system", "exec"'},
+            subprocess_runner=self._spy_runner(calls),
+        )
+        assert result.errors == []
+        assert len(calls) == 1
+
+    def test_inline_query_length_cap_still_enforced(self, tmp_path):
+        calls = []
+        result = run_query(
+            self._cpg(tmp_path), "cpg.method.l" + " " * 5000,
+            subprocess_runner=self._spy_runner(calls),
+        )
+        assert any("cap" in e for e in result.errors)
+        assert calls == []
+
+
+class TestStallKillAddressesTheGroup:
+    """The unsandboxed joern-parse lane's stall/timeout kills must
+    address the process GROUP: joern-parse may be a shell wrapper
+    whose JVM child survives a leader-only kill (the shape the server
+    documents and defends with start_new_session+killpg)."""
+
+    def _wrapper_with_grandchild(self):
+        import subprocess as sp
+        from packages.joern.server import _proc_starttime
+        proc = sp.Popen(
+            ["bash", "-c", "sleep 300 & echo $!; wait"],
+            stdout=sp.PIPE, text=True,
+            start_new_session=True,  # as the build Popen now spawns
+        )
+        from core.testing.processes import cleanup_on_startup_error
+        with cleanup_on_startup_error(proc, process_group=True):
+            assert proc.stdout is not None
+            grandchild = int(proc.stdout.readline())
+            # (pid, starttime) names this process INCARNATION. The anchor
+            # read cannot race the kill: the grandchild's 300s sleep pins
+            # it alive here, before the monitor exists. None only without
+            # procfs, where the identity check below degrades away.
+            return proc, grandchild, _proc_starttime(grandchild)
+
+    @staticmethod
+    def _gone(pid: int, starttime: int | None) -> bool:
+        """True once *pid* has been KILLED — a zombie counts as gone,
+        and so does a RECYCLED pid (same number, different starttime).
+
+        The waits below poll the condition the stall monitor CONTROLS:
+        the group SIGKILL landing on the grandchild. A kill victim is
+        observable the instant it dies — it disappears outright or
+        turns zombie awaiting its reaper — but WHEN the zombie is
+        reaped belongs to whoever inherited it, not to the monitor. On
+        an idle host init adopts the orphaned grandchild and reaps
+        near-instantly, so kill-0 aliveness happens to work; under
+        load the reap lags, and inside a nested pid namespace (the
+        mandated runner for kill-exercising tests) the orphan
+        reparents to ns-init — the pytest process itself — which never
+        waits on strangers, so the zombie persists for the life of the
+        run and the kill-0 deadline times out. Counting a zombie as
+        gone cannot mask a missed kill in the other direction: a
+        grandchild the monitor failed to signal stays in state R/S,
+        which still reads as not-gone. Same semantics as the sibling
+        escalation tests' ``_pid_gone`` and the production
+        ``_pgid_alive`` zombie confirmation; without procfs the coarse
+        kill-0 answer stands (there the platform reaper owns orphans).
+
+        The starttime anchor closes the reuse hole on a churning
+        host: once the reaped grandchild's pid is handed to a
+        stranger, kill-0 sees a live non-zombie and the poll runs out
+        its deadline against a process the monitor never owned. A
+        mismatched starttime proves the recorded incarnation no
+        longer exists — which for a 300s sleeper means it was killed.
+        Matching starttime keeps the strict direction: the original
+        grandchild still running reads as not-gone.
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass  # EPERM-class: somebody is there — check its state below.
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return False  # no procfs — accept the coarse kill-0 answer
+        fields = stat.rsplit(")", 1)[-1].split()
+        if fields[0] == "Z":
+            return True
+        # /proc/<pid>/stat field 22 (starttime), 0-indexed 19 after
+        # the state field that follows the ")"-terminated comm.
+        return starttime is not None and int(fields[19]) != starttime
+
+    def test_stall_kill_reaps_wrapper_spawned_grandchild(self):
+        import os
+        import signal as sig
+        import threading
+        import time as time_mod
+        from packages.joern.runner import _StallMonitor
+        proc, grandchild, anchor = self._wrapper_with_grandchild()
+        try:
+            mon = _StallMonitor(proc)
+            mon._threshold = 0.1
+            mon._last_progress = time_mod.monotonic() - 60
+            t = threading.Thread(target=mon.watch)
+            t.start()
+            t.join(15)
+            proc.wait(10)
+            # The deadline bounds only the FAILURE mode: a grandchild
+            # the kill genuinely missed is a 300s sleeper that stays
+            # not-gone for every poll, while a killed one satisfies
+            # the first poll that observes it — so a generous ceiling
+            # buys load immunity without ever masking a miss.
+            gone = False
+            deadline = time_mod.monotonic() + 20
+            while time_mod.monotonic() < deadline:
+                if self._gone(grandchild, anchor):
+                    gone = True
+                    break
+                time_mod.sleep(0.05)
+            assert mon.was_killed
+            # Assert the RECORDED observation — never re-roll the
+            # predicate. ``_gone`` answers a racy question (kill-0 +
+            # /proc reads on a pid a churning host may already have
+            # recycled to a short-lived stranger), and its transient
+            # not-gone answers (stat vanishing between kill-0 and the
+            # read, a momentary dead-transitional state) are benign
+            # inside the poll loop but final in a re-evaluation: one
+            # transient after the loop already saw the kill land
+            # would indict a kill that landed.
+            assert gone, (
+                "wrapper-spawned grandchild survived the stall kill"
+            )
+        finally:
+            with __import__("contextlib").suppress(OSError):
+                os.killpg(proc.pid, sig.SIGKILL)
+
+    def test_kill_helper_tolerates_mock_pids(self):
+        # Handle-shaped mocks reach the helper from tests; a non-int
+        # pid must fall back to proc.kill(), never raise.
+        from unittest.mock import MagicMock
+        from packages.joern.runner import _kill_build_group
+        proc = MagicMock()
+        proc.pid = MagicMock()
+        _kill_build_group(proc)
+        proc.kill.assert_called_once()
+
+
+# ── Sandbox CPU-limit plumbing at the two spawn sites ───────────────
+
+class TestSandboxCpuLimitsPlumbing:
+    """Both sandboxed spawns must carry a wall-sized RLIMIT_CPU
+    override, and injected runners without the kwarg must keep
+    working via the TypeError fallback."""
+
+    def _patch_budget(self, monkeypatch, *, standing: int, cpus: int) -> None:
+        import os as _os
+
+        import core.sandbox.preexec as preexec
+        monkeypatch.setattr(
+            preexec, "standing_cpu_seconds", lambda: standing,
+        )
+        monkeypatch.setattr(
+            _os, "sched_getaffinity", lambda pid: set(range(cpus)),
+            raising=False,
+        )
+
+    def _capturing_runner(self, captured: dict, stdout: str = ""):
+        def runner(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                stdout=stdout, stderr="", returncode=0,
+            )
+        return runner
+
+    def test_build_spawn_raises_cpu_for_long_wall(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The defect direction: a 4 h wall must carry a CPU budget the
+        # multi-threaded JVM cannot exhaust before the wall.
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f() { return 0; }")
+        captured: dict = {}
+        build_cpg(
+            target,
+            subprocess_runner=self._capturing_runner(captured),
+            output_dir=tmp_path / "out",
+            timeout=14400,
+        )
+        assert captured["limits"] == {"cpu_seconds": 14400 * 8 + 300}
+
+    def test_query_spawn_floors_at_standing_for_short_wall(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The other direction: a short wall must not tighten the
+        # standing sandbox posture.
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+        captured: dict = {}
+        run_query(
+            cpg, "cpg.method.l",
+            subprocess_runner=self._capturing_runner(captured),
+            timeout=300,
+        )
+        assert captured["limits"] == {"cpu_seconds": 3600}
+
+    def test_build_strict_runner_falls_back_without_limits(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # An injected runner without the sandbox kwargs (bare
+        # subprocess.run shape) must still be reached via the
+        # TypeError fallback.
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        target = tmp_path / "src"
+        target.mkdir()
+        calls: list = []
+
+        def strict_runner(cmd, capture_output, text, timeout, cwd, pass_fds=()):
+            calls.append(cmd)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        cpg = build_cpg(
+            target,
+            subprocess_runner=strict_runner,
+            output_dir=tmp_path / "out",
+        )
+        assert cpg.target == target
+        assert len(calls) == 1
+
+    def test_query_strict_runner_falls_back_without_limits(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+        calls: list = []
+
+        def strict_runner(cmd, capture_output, text, timeout, cwd, pass_fds=()):
+            calls.append(cmd)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        result = run_query(
+            cpg, "cpg.method.l", subprocess_runner=strict_runner,
+        )
+        assert result.errors == []
+        assert len(calls) == 1
+
+
+def test_default_parser_policy_typeerror_never_retries_without_sandbox(tmp_path, monkeypatch):
+    import packages.joern.runner as runner
+    calls = []
+    def rejected(command, **kwargs):
+        calls.append(kwargs)
+        raise TypeError("out-of-policy inherited descriptor")
+    monkeypatch.setattr(runner, "_default_sandbox_runner", lambda: rejected)
+    graph = build_cpg(tmp_path, output_dir=tmp_path / "output")
+    assert graph.build_failed
+    assert len(calls) == 1
+    assert "target" in calls[0]
+
+
+def test_default_query_policy_typeerror_never_retries_without_sandbox(tmp_path, monkeypatch):
+    import packages.joern.runner as runner
+    calls = []
+    graph_path = tmp_path / "cpg.bin"
+    graph_path.write_bytes(_valid_cpg_bytes())
+    def rejected(command, **kwargs):
+        calls.append(kwargs)
+        raise TypeError("out-of-policy inherited descriptor")
+    monkeypatch.setattr(runner, "_default_sandbox_runner", lambda: rejected)
+    result = run_query(JoernCPG(graph_path, tmp_path), "cpg.method.name.l")
+    assert result.errors and "sandbox rejected" in result.errors[0]
+    assert len(calls) == 1
+
+
+def test_parser_uses_the_runtime_in_its_toolchain_identity(tmp_path, monkeypatch):
+    from packages.joern import prereqs, runner
+    java = str(tmp_path / "jdk/bin/java")
+    (tmp_path / "jdk/bin").mkdir(parents=True)
+    (tmp_path / "jdk/release").write_text("JDK fixture")
+    monkeypatch.setattr(prereqs, "_java_path", lambda: java)
+    command = runner._jvm_scratch_command(["joern-parse"], tmp_path)
+    assert f"JAVACMD={java}" in command
+    assert f"JAVA_HOME={tmp_path / 'jdk'}" in command
+
+
+def test_parser_does_not_infer_java_home_from_a_system_shim(tmp_path, monkeypatch):
+    from packages.joern import prereqs, runner
+    monkeypatch.setattr(prereqs, "_java_path", lambda: "/usr/bin/java")
+    monkeypatch.setattr(prereqs, "_jdk_home", lambda java: None)
+    command = runner._jvm_scratch_command(["joern-parse"], tmp_path)
+    assert "JAVACMD=/usr/bin/java" in command
+    assert not any(value.startswith("JAVA_HOME=") for value in command)
+
+
+def test_macos_parser_does_not_fall_back_to_an_unselected_jdk(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from packages.joern import prereqs, runner
+    monkeypatch.setattr(runner, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(prereqs, "_java_path", lambda: None)
+    with pytest.raises(RuntimeError, match="real JDK"):
+        runner._jvm_scratch_command(["joern-parse"], tmp_path)

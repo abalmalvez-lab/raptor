@@ -1,0 +1,362 @@
+"""``extract_to_dir`` — safely unpack a Tier-1 archive into a directory.
+
+Delegates to the hardened ``core.zip`` / ``core.tar`` primitives (which already
+do zip-slip + bomb defense and filter to regular files), writing member bytes
+to disk under ``dest`` and re-validating each path stays inside ``dest``. Tar
+paths stream: members go straight from the primitive to a disk-writing sink,
+so peak memory is one member — never the aggregate budget. Only regular files
+are ever created — no symlinks or device nodes — so symlink-escape attacks are
+impossible by construction.
+"""
+
+import errno
+import logging
+import tarfile
+from pathlib import Path
+from typing import Any
+
+from core.atomic_fs import write_bytes_atomically
+from core.source.streams import preserving_stream_error
+from core.tar import (
+    TarEntryCountExceeded,
+    TarTotalBytesExceeded,
+    extract_files_from_tar,
+)
+from core.zip import (
+    DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_MEMBER_BYTES,
+    ZipEntryCountExceeded,
+    ZipOpenError,
+    ZipTotalBytesExceeded,
+    extract_files_from_zip,
+)
+
+from contextlib import closing
+from itertools import chain
+
+from .compression import _TAR_MAGIC_OFFSET, iter_decompressed, looks_like_tar
+from .detect import detect_format
+from .errors import ArchiveError, DecompressionLimitExceeded, UnsupportedArchive
+
+logger = logging.getLogger(__name__)
+
+# Invalid member names and conflicting archive paths can be skipped. Resource
+# and filesystem failures (ENOSPC/EDQUOT/EIO/EACCES, etc.) must abort so callers
+# never publish truncated output as a complete, reusable source cache.
+_MEMBER_PATH_ERRORS = frozenset({
+    errno.EINVAL, errno.ENAMETOOLONG, errno.EILSEQ,
+    errno.EEXIST, errno.ENOTDIR, errno.EISDIR,
+})
+
+DEFAULT_MAX_TOTAL_BYTES = 2 << 30  # 2 GiB summed across all extracted members
+DEFAULT_MAX_FILES = DEFAULT_MAX_ENTRIES
+
+# Compression suffixes stripped to name a single decompressed file.
+_SINGLE_SUFFIXES = (".gz", ".xz", ".bz2", ".zst")
+
+
+def _keep_files(info: Any) -> str | None:
+    """Selector for the zip/tar primitives: keep regular files, skip dirs.
+
+    Handles both ``ZipInfo`` (``.filename`` + ``.is_dir()``) and ``TarInfo``
+    (``.name``; the tar primitive already filtered to ``isfile()``)."""
+    is_dir = getattr(info, "is_dir", None)
+    if callable(is_dir) and is_dir():
+        return None
+    return getattr(info, "filename", None) or getattr(info, "name", None)
+
+
+def _iter_file_chunks(fh, chunk_bytes: int = 1 << 20):
+    """Yield ``fh`` in bounded chunks so the tar primitive can stream the
+    archive without the whole file ever being resident in memory."""
+    return iter(lambda: fh.read(chunk_bytes), b"")
+
+
+def _single_file_name(src: Path) -> str:
+    """Filename for a single decompressed file: the archive name minus its
+    compression suffix (``notes.txt.gz`` → ``notes.txt``), else ``<name>.out``."""
+    name = src.name
+    low = name.lower()
+    for suf in _SINGLE_SUFFIXES:
+        if low.endswith(suf):
+            return name[: -len(suf)] or "decompressed.out"
+    return name + ".out"
+
+
+def _safe_dest_path(dest_root: Path, member_name: str) -> Path | None:
+    """Resolve ``member_name`` under ``dest_root`` or return None if it escapes.
+
+    The primitives already reject traversal; this is the write-boundary
+    re-check (defense in depth) so we can never write outside ``dest_root``.
+    Returns None for any name that escapes OR can't be resolved at all (e.g. an
+    embedded NUL/control byte that makes resolve() raise ValueError) — such a
+    member is simply dropped rather than crashing extraction.
+    """
+    rel = member_name.lstrip("/\\")
+    try:
+        root = dest_root.resolve()
+        target = (root / rel).resolve()
+        target.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return target
+
+
+def _count_reason(reasons: dict[str, int], reason: str, n: int = 1) -> None:
+    reasons[reason] = reasons.get(reason, 0) + n
+
+
+def _write_member_bytes(target: Path, data: bytes, *, root: Path) -> bool:
+    """Publish complete members; skip invalid paths without hiding IO failures."""
+    started = False
+
+    def payload():
+        nonlocal started
+        started = True
+        yield data
+
+    try:
+        write_bytes_atomically(target, payload(), root=root.resolve())
+    except (OSError, ValueError) as exc:
+        # Before content consumption these are invalid names/open paths. After
+        # consumption, only destination-name conflicts may be skipped: an
+        # EINVAL/EILSEQ during write or fsync remains a failed extraction.
+        path_error = (isinstance(exc, OSError) and exc.errno in _MEMBER_PATH_ERRORS
+                      and (not started or exc.errno in {
+                          errno.EEXIST, errno.ENOTDIR, errno.EISDIR, errno.ENAMETOOLONG,
+                      }))
+        if not path_error and not (isinstance(exc, ValueError) and not started):
+            raise
+        logger.warning("core.archive: skipping unwritable member %r (%s)",
+                       target, exc)
+        return False
+    return True
+
+
+def _write_members(members: dict[str, bytes], dest: Path,
+                   max_total: int, max_files: int) -> dict[str, Any]:
+    if len(members) > max_files:
+        msg = f"archive has {len(members)} files — exceeds cap of {max_files}"
+        raise DecompressionLimitExceeded(msg, cap="entry_count")
+    total = 0
+    written = 0
+    reasons: dict[str, int] = {}
+    for name, data in members.items():
+        total += len(data)
+        if total > max_total:
+            msg = f"archive exceeds {max_total} bytes extracted — refusing as bomb"
+            raise DecompressionLimitExceeded(msg, cap="total_bytes")
+        target = _safe_dest_path(dest, name)
+        if target is None:
+            logger.warning("core.archive: dropping out-of-tree member %r", name)
+            _count_reason(reasons, "out_of_tree")
+            continue
+        if not _write_member_bytes(target, data, root=dest):
+            _count_reason(reasons, "unwritable")
+            continue
+        written += 1
+    return {"files": written, "bytes": total,
+            "dropped": sum(reasons.values()), "dropped_reasons": reasons}
+
+
+class _DiskSink:
+    """Streams selected members straight to disk with the same running
+    byte / file-count budget ``_write_members`` enforces — but the
+    member bytes never accumulate in a dict, so peak memory is one
+    member (bounded by ``max_member_bytes``) instead of the whole
+    archive's ``max_total`` (2 GiB by default)."""
+
+    def __init__(self, dest: Path, max_total: int, max_files: int):
+        self._dest = dest
+        self._max_total = max_total
+        self._max_files = max_files
+        self.total = 0
+        self.written = 0
+        self.dropped_reasons: dict[str, int] = {}
+        self._seen = 0
+
+    def __call__(self, name: str, data: bytes) -> None:
+        self._seen += 1
+        if self._seen > self._max_files:
+            raise DecompressionLimitExceeded(
+                f"archive has {self._seen} files — exceeds cap of "
+                f"{self._max_files}", cap="entry_count")
+        self.total += len(data)
+        if self.total > self._max_total:
+            raise DecompressionLimitExceeded(
+                f"archive exceeds {self._max_total} bytes extracted — "
+                f"refusing as bomb", cap="total_bytes")
+        target = _safe_dest_path(self._dest, name)
+        if target is None:
+            logger.warning("core.archive: dropping out-of-tree member %r", name)
+            _count_reason(self.dropped_reasons, "out_of_tree")
+            return
+        if not _write_member_bytes(target, data, root=self._dest):
+            _count_reason(self.dropped_reasons, "unwritable")
+            return
+        self.written += 1
+
+    def stats(self) -> dict[str, Any]:
+        return {"files": self.written, "bytes": self.total,
+                "dropped": sum(self.dropped_reasons.values()),
+                "dropped_reasons": dict(self.dropped_reasons)}
+
+
+class _OversizedSingleFile(Exception):
+    """Stop a member before the atomic writer can publish truncated content."""
+
+
+def _write_single_file(chunks, src: Path, dest: Path, *,
+                       max_files: int, max_member_bytes: int) -> dict[str, Any]:
+    """Stream one member under both the entry and per-member limits."""
+    if max_files < 1:
+        raise DecompressionLimitExceeded(
+            f"archive has 1 file — exceeds cap of {max_files}", cap="entry_count")
+    name = _single_file_name(src)
+    target = _safe_dest_path(dest, name)
+    if target is None:  # pragma: no cover — plain basename never escapes
+        raise UnsupportedArchive(f"cannot derive a safe name for {src}")
+    total = 0
+
+    def counted_chunks():
+        nonlocal total
+        for chunk in chunks:
+            total += len(chunk)
+            if total > max_member_bytes:
+                raise _OversizedSingleFile
+            yield chunk
+
+    try:
+        write_bytes_atomically(target, counted_chunks(), root=dest.resolve())
+    except _OversizedSingleFile:
+        return {"files": 0, "bytes": 0, "dropped": 1,
+                "dropped_reasons": {"oversized": 1}}
+    return {"files": 1, "bytes": total, "dropped": 0}
+
+
+def extract_to_dir(path, dest, *,
+                   max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+                   max_files: int = DEFAULT_MAX_FILES,
+                   max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES) -> dict[str, Any]:
+    """Extract a Tier-1 archive (``path``) into ``dest``; return a summary dict
+    ``{"format", "files", "bytes", "dropped", "dropped_reasons"}``.
+    ``dropped`` counts members rejected at the write boundary —
+    out-of-tree or unwritable names — plus members the zip/tar
+    primitives' safety filters rejected (traversal / absolute /
+    oversized / ... names, and zip's encrypted entries).
+    ``dropped_reasons`` breaks that count down per reason (the
+    :class:`core.zip.safe_member.UnsafeMemberReason` vocabulary plus
+    ``"encrypted"`` / ``"out_of_tree"`` / ``"unwritable"``) so a
+    consumer can tell hostile member names from benign skips instead
+    of treating a degraded extraction as a clean success.
+
+    Tier 1: zip, tar, ``.tar.{gz,xz,bz2}``, and single-file gz/bz2/xz/zst.
+    Raises ``UnsupportedArchive`` for unknown formats and
+    ``DecompressionLimitExceeded`` / ``ArchiveError`` on unsafe or corrupt
+    input — a corrupt or truncated tar OR zip REFUSES instead of returning
+    an empty "success" summary that downstream consumers would treat as a
+    complete extraction. Filesystem resource and write/close failures propagate
+    as OSError; only invalid member names/path conflicts are dropped.
+    Limits must be non-negative integers. Single compressed files count as
+    one member, including empty files; oversized members are skipped with
+    an ``"oversized"`` reason and leave any existing destination unchanged.
+    """
+    for name, limit in (("max_total_bytes", max_total_bytes),
+                        ("max_files", max_files),
+                        ("max_member_bytes", max_member_bytes)):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    src = Path(path)
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    fmt = detect_format(src)
+    if fmt is None:
+        msg = f"{src} is not a recognised archive"
+        raise UnsupportedArchive(msg)
+
+    # Memory posture: every tar-shaped path streams — the archive is
+    # fed to the primitive in bounded chunks AND each selected member
+    # is handed to a disk-writing sink as soon as it is read, so peak
+    # memory is one member (max_member_bytes), never the aggregate
+    # max_total_bytes (2 GiB by default — previously held wholesale in
+    # a dict before any write, ~3 GiB stacked with the compressed-tar
+    # buffer). Zip is the exception: its central directory lives at
+    # the end of the archive so the hardened primitive is seek-based
+    # and returns member bytes; its own running ``max_total_bytes``
+    # cap bounds that dict. The primitives' bomb exceptions are mapped
+    # to DecompressionLimitExceeded.
+    sink = _DiskSink(dest, max_total_bytes, max_files)
+    # Count members the primitives skip (safety-filter rejects +
+    # zip's encrypted entries) into the summary — per reason — so a
+    # degraded extraction is visible to consumers; pre-fix those
+    # skips were debug logs only and the summary read as a clean
+    # success. One counter serves both the zip and tar arms.
+    skip_reasons: dict[str, int] = {}
+
+    def _count_skip(_info: Any, reason: str) -> None:
+        _count_reason(skip_reasons, reason)
+
+    try:
+        if fmt == "zip":
+            members = extract_files_from_zip(
+                src, selector=_keep_files, max_member_bytes=max_member_bytes,
+                max_entry_count=max_files, max_total_bytes=max_total_bytes,
+                on_skipped=_count_skip)
+            stats = _write_members(members, dest, max_total_bytes, max_files)
+        elif fmt == "tar":
+            # Stream the on-disk tar member-by-member ("r|*"). read_bytes()
+            # would materialise the whole archive in RAM before any cap
+            # applies — the caps below only bound bytes already read.
+            with preserving_stream_error(Path(src).open("rb")) as fh:
+                extract_files_from_tar(
+                    _iter_file_chunks(fh), selector=_keep_files, mode="r|*",
+                    max_member_bytes=max_member_bytes,
+                    max_total_bytes=max_total_bytes, max_entry_count=max_files,
+                    sink=sink, on_skipped=_count_skip)
+            stats = sink.stats()
+        else:
+            # gz/bz2/xz/zst: a compressed tar OR a single compressed
+            # file. Stream-decompress either way; buffer only enough
+            # head bytes to sniff the tar magic at offset 257.
+            with preserving_stream_error(closing(
+                    iter_decompressed(src, fmt, max_bytes=max_total_bytes))) as chunks:
+                head = b""
+                for chunk in chunks:
+                    head += chunk
+                    if len(head) > _TAR_MAGIC_OFFSET + 8:
+                        break
+                if looks_like_tar(head):
+                    extract_files_from_tar(
+                        chain([head], chunks), selector=_keep_files, mode="r|",
+                        max_member_bytes=max_member_bytes,
+                        max_total_bytes=max_total_bytes, max_entry_count=max_files,
+                        sink=sink, on_skipped=_count_skip)
+                    stats = sink.stats()
+                else:
+                    stats = _write_single_file(
+                        chain([head], chunks), src, dest,
+                        max_files=max_files, max_member_bytes=max_member_bytes)
+    except (ZipTotalBytesExceeded, TarTotalBytesExceeded) as e:
+        raise DecompressionLimitExceeded(str(e), cap="total_bytes") from e
+    except (ZipEntryCountExceeded, TarEntryCountExceeded) as e:
+        raise DecompressionLimitExceeded(str(e), cap="entry_count") from e
+    except ZipOpenError as e:
+        # Corrupt / unreadable zip — REFUSE, typed, mirroring the tar
+        # arm below (a silently-empty extraction used to be promoted
+        # into raptor's sha-keyed _sources cache as a complete tree).
+        raise ArchiveError(f"corrupt or unreadable zip archive: {e}") from e
+    except tarfile.TarError as e:
+        # TarOpenError (unreadable archive) + mid-stream ReadError on a
+        # truncated tar. Both REFUSE, typed, instead of leaking raw
+        # tarfile exceptions or converting corruption into empty success.
+        raise ArchiveError(f"corrupt or unreadable tar archive: {e}") from e
+
+    reasons: dict[str, int] = dict(stats.get("dropped_reasons") or {})
+    for reason, n in skip_reasons.items():
+        _count_reason(reasons, reason, n)
+    stats["dropped"] = int(stats.get("dropped") or 0) + sum(
+        skip_reasons.values())
+    stats["dropped_reasons"] = reasons
+    stats["format"] = fmt
+    return stats

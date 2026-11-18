@@ -10,7 +10,7 @@ Categories covered (drawn from public anti-analysis literature like
 Joe Sandbox / Cuckoo / Pafish / al-khaser):
 
   - Hostname / domainname sentinel checks
-  - DMI vendor/product blacklist
+  - DMI vendor/product blocklist
   - CPU identity triple lookup ((family, model, stepping) anomalies)
   - machine-id well-known-bad list
   - CPU count anomaly (==1 → sandbox heuristic)
@@ -35,22 +35,36 @@ import unittest
 from pathlib import Path
 
 import pytest
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
+
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
     reason="adversarial fingerprint tests are Linux-only",
 )
 
+# Whole-module capability gate: everything here exercises persona fingerprinting (etc-overlay mounts),
+# which the sandbox only delivers when mount-namespace isolation is
+# available. On hosts where user namespaces work but mount capability
+# is denied (AppArmor-restricted runners, outer seccomp filters) the
+# sandbox degrades by design — the honest outcome for these tests
+# there is a named SKIP, not a mid-flight mount failure.
+pytestmark = [pytestmark, requires_mount]
+
 
 def _mount_ns_usable() -> bool:
     if not shutil.which("newuidmap") or not shutil.which("newgidmap"):
         return False
     sysctl = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-    if sysctl.exists() and sysctl.read_text().strip() == "1":
-        return False
-    return True
+    return not (sysctl.exists() and sysctl.read_text().strip() == "1")
 
 
+@requires_landlock
+@requires_userns
 class TestAdversarialFingerprint(unittest.TestCase):
     """Each test spawns a sandbox with sanitise_host_fingerprint=True
     and runs an adversary's fingerprint check. The check exits 0 if
@@ -101,7 +115,7 @@ class TestAdversarialFingerprint(unittest.TestCase):
 
     # === Hostname checks (Pafish/al-khaser pattern) ===
 
-    def test_hostname_not_in_sandbox_blacklist(self):
+    def test_hostname_not_in_sandbox_blocklist(self):
         script = textwrap.dedent("""
             HN=$(hostname)
             for bad in sandbox cuckoo malware analyst sample raptor; do
@@ -112,9 +126,9 @@ class TestAdversarialFingerprint(unittest.TestCase):
             done
             exit 0
         """)
-        self._assert_undetected(script, "hostname blacklist")
+        self._assert_undetected(script, "hostname blocklist")
 
-    # === DMI vendor blacklist (most common anti-analysis check) ===
+    # === DMI vendor blocklist (most common anti-analysis check) ===
 
     def test_dmi_vendor_not_virtualbox_or_vmware(self):
         script = textwrap.dedent("""
@@ -128,7 +142,7 @@ class TestAdversarialFingerprint(unittest.TestCase):
             done
             exit 0
         """)
-        self._assert_undetected(script, "DMI vendor blacklist")
+        self._assert_undetected(script, "DMI vendor blocklist")
 
     # === CPU identity triple sanity ===
 
@@ -260,6 +274,84 @@ print(total)
             exit 0
         """)
         self._assert_undetected(script, "cpuinfo vs cpu/online cross-check")
+
+    def test_cgroup_path_not_a_host_session_scope(self):
+        """A host cgroup path (systemd user slice / session scope)
+        names the operator's uid and login session — and reads as
+        "this process was launched from someone's interactive session,
+        not a real workload." The fresh cgroup ns shows "0::/"."""
+        script = textwrap.dedent("""
+            C=$(cat /proc/self/cgroup)
+            for bad in user.slice session- .scope; do
+                if echo "$C" | grep -q "$bad"; then
+                    echo "DETECTED host cgroup path: $C" >&2
+                    exit 1
+                fi
+            done
+            exit 0
+        """)
+        self._assert_undetected(script, "cgroup session-scope check")
+
+    def test_cpuinfo_count_matches_cpu_enumeration_dirs(self):
+        """readdir cross-check one directory over: /sys/devices/system/
+        node/node0 and /sys/bus/cpu/devices both enumerate cpuN
+        entries. A count that disagrees with cpuinfo reveals the mask
+        stopped at /sys/devices/system/cpu."""
+        script = textwrap.dedent("""
+            CINFO=$(grep -c '^processor' /proc/cpuinfo)
+            for D in /sys/devices/system/node/node0 /sys/bus/cpu/devices
+            do
+                [ -d "$D" ] || continue
+                N=$(ls "$D" | grep -c '^cpu[0-9]')
+                if [ "$CINFO" != "$N" ]; then
+                    echo "DETECTED cpuinfo=$CINFO != $D cpus=$N" >&2
+                    exit 1
+                fi
+                # Real sysfs cpuN entries are RELATIVE symlinks; an
+                # absolute target is a mask tell of its own.
+                L=$(readlink "$D/cpu0")
+                case "$L" in
+                    /*) echo "DETECTED absolute cpu0 link in $D: $L" >&2
+                        exit 1;;
+                esac
+            done
+            exit 0
+        """)
+        self._assert_undetected(script, "cpuinfo vs cpu-enum readdir")
+
+    def test_cpuinfo_count_matches_schedstat(self):
+        """/proc/schedstat's per-cpu rows AND its domain cpumask must
+        both agree with cpuinfo — a 4-CPU story whose scheduler domain
+        spans 8 CPUs is a contradiction in one read."""
+        script = textwrap.dedent("""
+            [ -r /proc/schedstat ] || exit 0
+            CINFO=$(grep -c '^processor' /proc/cpuinfo)
+            ROWS=$(grep -c '^cpu[0-9]' /proc/schedstat)
+            if [ "$CINFO" != "$ROWS" ]; then
+                echo "DETECTED cpuinfo=$CINFO != schedstat rows=$ROWS" >&2
+                exit 1
+            fi
+            MASK=$(awk '/^domain/ {print $2; exit}' /proc/schedstat)
+            [ -n "$MASK" ] || exit 0
+            BITS=$(python3 -c '
+import sys
+print(bin(int(sys.argv[1].replace(",", ""), 16)).count("1"))
+' "$MASK")
+            if [ "$CINFO" != "$BITS" ]; then
+                echo "DETECTED cpuinfo=$CINFO != domain-mask bits=$BITS" >&2
+                exit 1
+            fi
+            # Both mask surfaces must print the SAME kernel format —
+            # a width/grouping disagreement between schedstat and
+            # node0's cpumap is a one-read contradiction.
+            CMAP=/sys/devices/system/node/node0/cpumap
+            if [ -r "$CMAP" ] && [ "$(cat $CMAP)" != "$MASK" ]; then
+                echo "DETECTED domain-mask $MASK != cpumap $(cat $CMAP)" >&2
+                exit 1
+            fi
+            exit 0
+        """)
+        self._assert_undetected(script, "cpuinfo vs schedstat cross-check")
 
     def test_cpuinfo_count_matches_proc_stat(self):
         """/proc/stat shows one cpu line per CPU. Mismatch reveals

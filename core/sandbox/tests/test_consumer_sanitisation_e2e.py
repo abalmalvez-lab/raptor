@@ -25,6 +25,12 @@ import unittest
 from pathlib import Path
 
 import pytest
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
+
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -72,6 +78,10 @@ class TestDebuggerKwargCombo(_ConsumerE2EBase):
     target+output + sanitise_host_fingerprint=True. profile=debug
     permits ptrace; sanitisation must still engage."""
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_persona_engages_under_profile_debug(self):
         from core.sandbox import run as sandbox_run
         result = sandbox_run(
@@ -83,6 +93,7 @@ class TestDebuggerKwargCombo(_ConsumerE2EBase):
         )
         self._assert_persona_engaged(result)
 
+    @requires_landlock
     def test_uname_release_still_real_under_profile_debug(self):
         """Capability surface preserved even under profile=debug —
         regression guard for an exploit_feasibility consumer that
@@ -99,10 +110,14 @@ class TestDebuggerKwargCombo(_ConsumerE2EBase):
         self.assertEqual(result.stdout.strip(), os.uname().release)
 
 
+@requires_landlock
+@requires_userns
 class TestCrashAnalyserKwargCombo(_ConsumerE2EBase):
     """Replicates crash_analyser.py — three combos: (1) profile=debug
     for GDB/LLDB, (2) block_network=True for plain ASAN replay."""
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_persona_under_profile_debug_with_stdin(self):
         """GDB/LLDB sites pass stdin=<input_file>. Combine that with
         profile=debug + target+output + sanitise."""
@@ -120,6 +135,8 @@ class TestCrashAnalyserKwargCombo(_ConsumerE2EBase):
             )
         self._assert_persona_engaged(result, "(profile=debug + stdin)")
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_persona_under_block_network(self):
         """Plain `run_binary` path: block_network=True + target+output
         + sanitise. No profile=debug, no ptrace."""
@@ -134,10 +151,14 @@ class TestCrashAnalyserKwargCombo(_ConsumerE2EBase):
         self._assert_persona_engaged(result, "(block_network=True)")
 
 
+@requires_landlock
+@requires_userns
 class TestAflRunnerKwargCombo(_ConsumerE2EBase):
     """Replicates afl_runner.py:709 — block_network + readable_paths +
     target+output + sanitise_host_fingerprint."""
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_persona_with_readable_paths(self):
         from core.sandbox import run as sandbox_run
         # readable_paths is the kwarg that afl-showmap passes (paths
@@ -160,6 +181,7 @@ class TestPersonaConsistencyAcrossConsumers(_ConsumerE2EBase):
     cpu_count across consumer kwarg combos — otherwise two consumers
     of the same persona could produce inconsistent fingerprints."""
 
+    @requires_landlock
     def test_machine_id_identical_across_combos(self):
         from core.sandbox import run as sandbox_run
         def _machine_id(**kwargs):
@@ -180,6 +202,10 @@ class TestPersonaConsistencyAcrossConsumers(_ConsumerE2EBase):
             "RAPTOR install) — not dependent on the sandbox profile",
         )
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_cpu_count_consistent_across_combos(self):
         from core.sandbox import run as sandbox_run
         def _nproc(**kwargs):
@@ -205,6 +231,10 @@ class TestCodeqlKwargCombo(_ConsumerE2EBase):
     identity surfaces while preserving real CPU count + affinity
     (otherwise codeql autobuild's `make -j$(nproc)` serialises)."""
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_persona_engages_with_host_cpu_count(self):
         from core.sandbox import run as sandbox_run
         from core.sandbox.fingerprint import HOST_CPU_COUNT
@@ -218,6 +248,7 @@ class TestCodeqlKwargCombo(_ConsumerE2EBase):
         )
         self._assert_persona_engaged(result, "(codeql kwarg combo)")
 
+    @requires_landlock
     def test_host_cpu_count_preserves_real_parallelism(self):
         """With HOST_CPU_COUNT, nproc inside the sandbox must equal
         the host's schedulable CPU count — not the default 4. Proves
@@ -241,6 +272,10 @@ class TestCodeqlKwargCombo(_ConsumerE2EBase):
             f"expected {expected}, got {result.stdout.strip()!r}",
         )
 
+    @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Siblings that pass mountlessly (validation refusals, degraded-posture checks) stay ungated.
+    @requires_mount
     def test_host_cpu_count_still_masks_machine_id(self):
         """Identity surfaces must STILL be masked even when CPU count
         is preserved — operator-machine-id leak is the original
@@ -259,6 +294,7 @@ class TestCodeqlKwargCombo(_ConsumerE2EBase):
         self.assertEqual(result.stdout.strip(), _MACHINE_ID)
 
 
+@requires_landlock
 class TestProfileDebugDoesNotBreakPtrace(_ConsumerE2EBase):
     """The debugger/crash_analyser sites use profile=debug specifically
     so ptrace works (seccomp ptrace block is lifted). Sanitisation
@@ -287,6 +323,7 @@ class TestProfileDebugDoesNotBreakPtrace(_ConsumerE2EBase):
             ["python3", "-c", py_script],
             profile="debug",
             target=self.tmp.name, output=self.tmp.name,
+            allow_path_divergence=True,
             capture_output=True, text=True, timeout=15,
             sanitise_host_fingerprint=True,
         )

@@ -1,0 +1,713 @@
+"""Containerized repo builds with artifact extraction.
+
+The build-on-demand seam for consumers that need a COMPILED artifact
+from a source tree (/validate Stage E feasibility, the mitigation
+matrix, future instrumented builds): copy the repo into a build
+context, run the build command inside a container (build systems
+execute repo-influenced code — the container IS the containment), and
+extract the produced ELF executables from the image.
+
+Failure posture: a build failure is a structured outcome, never an
+exception — every consumer degrades to its no-binary behaviour with
+the reason recorded. Complex projects whose dependencies the default
+build image lacks simply fail here and the caller proceeds as today.
+
+Hardening variants: the canonical mitigation-matrix postures are
+expressed as :class:`~core.env.spec.ToolchainSpec` values whose flags
+are injected via ``CFLAGS``/``CXXFLAGS``/``LDFLAGS`` prepended to the
+build command — effective for well-behaved make/cmake builds; a build
+that ignores the ambient flags produces a variant whose posture the
+analyzer then measures as unchanged (the matrix reports what the
+binary IS, not what we asked for).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+import stat
+import uuid
+from dataclasses import dataclass, field
+from contextlib import contextmanager
+from pathlib import Path
+
+from core.atomic_fs import rename_without_replace
+from core.env.spec import ToolchainSpec
+from core.run.scratch import scratch_dir
+from core.source.streams import preserving_stream_error
+
+logger = logging.getLogger(__name__)
+
+#: Toolchain image for containerized builds: the official gcc image
+#: carries gcc/g++/make. Callers override per call; no env knob.
+#: Digest-pinned (tag kept for readability; the daemon resolves by
+#: digest): a mutable tag can be force-repointed upstream, and the
+#: build RUN step executes with the repo's code in context — the
+#: supply-chain window is not worth the convenience.
+DEFAULT_BUILD_IMAGE = (
+    "gcc:13@sha256:"
+    "056fa682471704249f619f65ccec87d671ad5f1b20878da54d60b0b863486621"
+)
+
+#: Ownership label for build-scoped images (mirrors provision()'s
+#: exact-scope cleanup convention).
+BUILD_LABEL = "raptor-env-build.id"
+
+#: Canonical mitigation-matrix postures (design: exactly three — the
+#: realistic extremes plus whatever the plain build produces).
+HARDENED_TOOLCHAIN = ToolchainSpec(
+    cflags=("-fstack-protector-strong", "-fPIE", "-D_FORTIFY_SOURCE=2",
+            "-O1"),
+    ldflags=("-Wl,-z,relro,-z,now", "-pie"),
+)
+SOFT_TOOLCHAIN = ToolchainSpec(
+    cflags=("-fno-stack-protector", "-fno-pie", "-D_FORTIFY_SOURCE=0",
+            "-O1"),
+    ldflags=("-Wl,-z,norelro,-z,lazy", "-no-pie"),
+)
+
+#: AFL++ build image for instrumented fuzz builds (/fuzz env
+#: build-on-demand). Pinned release tag: the SAME image supplies the
+#: run-time afl-fuzz (its exported rootfs is the campaign substrate),
+#: so compile-time and run-time AFL versions agree by construction.
+#: Digest-pinned stable-branch build (afl-fuzz++5.03a). NOT the
+#: v5.02c release tag: that release mis-classifies sanitizer-only
+#: crashes as normal runs whenever a cmplog binary is attached (-c) —
+#: a silent false-negative verified live and absent from this build
+#: (full matrix re-verified: cmplog discovery from a plain twin AND
+#: ASAN crash classification both correct).
+AFL_BUILD_IMAGE = (
+    "aflplusplus/aflplusplus:stable@sha256:"
+    "1a05a7eb0db2ad6ad510e29ee4e2c4a916a51e6397ef88bf04d477700c7a06f6"
+)
+
+#: AFL++ builds with KNOWN defects that make fuzzing results silently
+#: wrong — consumers must refuse to run campaigns with these (a loud
+#: failure beats false negatives). Keyed by the version token embedded
+#: in the afl-fuzz binary. v5.02c is the current RELEASE tag, so
+#: anyone "upgrading" the pin to the newest release reintroduces it —
+#: that is exactly what this blocklist is for.
+#: Scope note: the artifact-level scan in packages/fuzzing/env_build
+#: guards ENV-BUILT campaigns; host-mode campaigns use the operator's
+#: afl-fuzz and are not scanned — a host-installed broken release has
+#: the same defect (worth a doctor-style probe if it ever bites).
+AFL_BROKEN_VERSIONS: dict[str, str] = {
+    "++5.02c": (
+        "attaching a cmplog binary (-c) suppresses sanitizer crash "
+        "classification: ASAN aborts exit(1) and afl-fuzz records "
+        "crashing inputs as normal runs — SILENT FALSE NEGATIVES "
+        "(verified live; fixed on the stable branch / 5.03a+)"
+    ),
+}
+
+#: Toolchain for AFL-instrumented builds: afl-clang-fast wraps the
+#: image's clang and injects coverage instrumentation via CC/CXX —
+#: effective for well-behaved make/cmake builds, same caveat as the
+#: mitigation postures above.
+AFL_TOOLCHAIN = ToolchainSpec(
+    cc="afl-clang-fast",
+    cxx="afl-clang-fast++",
+    instrumentation=("afl",),
+)
+
+_ELF_MAGIC = b"\x7fELF"
+
+
+@dataclass
+class BuildProduct:
+    """Outcome of one containerized build."""
+
+    ok: bool
+    reason: str = ""                 # "" | rejected_input | copy_failed |
+    #                                  build_failed | export_failed |
+    #                                  no_artifacts
+    detail: str = ""
+    artifacts: dict[str, Path] = field(default_factory=dict)
+    #: relative-in-repo name -> extracted host path
+    checksums: dict[str, str] = field(default_factory=dict)
+    #: relative-in-repo name -> sha256 of the extracted bytes
+    toolchain: ToolchainSpec | None = None
+    base_image: str = DEFAULT_BUILD_IMAGE
+    build_command: str = ""
+    build_subdir: str = ""
+    #: working dir of the build relative to the repo root ("" = root)
+    rootfs: Path | None = None
+    #: populated only when the caller passed ``keep_rootfs``: the
+    #: exported image filesystem (repo at ``/src``, built artifacts in
+    #: place, toolchain runtime included) for ``sandbox(rootfs=...)``
+    #: consumers. Large (the full flattened image); caller owns cleanup.
+
+
+def containerized_build(
+    repo_dir: Path | str,
+    command: str,
+    *,
+    out_dir: Path | str,
+    toolchain: ToolchainSpec | None = None,
+    base_image: str = DEFAULT_BUILD_IMAGE,
+    timeout_seconds: int = 600,
+    keep_rootfs: Path | str | None = None,
+    run_env: dict[str, str] | None = None,
+    aux_builds: dict[str, dict[str, str]] | None = None,
+    subdir: str = "",
+) -> BuildProduct:
+    """Build *repo_dir* with *command* in a container; extract ELF
+    executables produced under the repo tree into ``out_dir``.
+
+    ``subdir``: working directory for the build RELATIVE to the repo
+    root ("" = the root). Thread it from
+    :func:`core.build.resolve.resolve_build_command` — a detector-
+    synthesized command for a build system living in a subdirectory
+    (GNU screen's autotools live in src/) fails at the root. It cannot
+    be folded into *command* as ``cd <subdir> && `` because the
+    toolchain/env prefix would then apply to the ``cd`` only.
+
+    ``run_env``: extra KEY=VALUE pairs prefixed to the build RUN line
+    (e.g. AFL_USE_ASAN=1 — instrumentation toggles the wrapper compiler
+    reads from its environment). Values are shell-quoted; keys must be
+    identifier-shaped.
+
+    ``aux_builds``: additional same-source build stages, mapping a
+    sibling directory name (e.g. "src-cmplog") to its own extra env.
+    Each stage runs the SAME command with the toolchain prefix, the
+    stage's env ONLY (``run_env`` is not inherited: the canonical
+    cmplog twin wants compare logging without the main stage's
+    sanitizer — see the in-function comment for the version hazard
+    this depends on). Aux artifacts stay in the image/rootfs; only
+    /src artifacts are extracted.
+
+    ``keep_rootfs``: when set, the exported image filesystem is written
+    there and survives the call (``product.rootfs``) for
+    ``sandbox(rootfs=...)`` consumers — in-image fuzzing runs the built
+    binary against the exact toolchain runtime that produced it. The
+    directory is LARGE (the full flattened image, potentially millions
+    of inodes): point it at disk-backed run storage, never a tmpfs,
+    and delete it when the run is done. The path must not already
+    exist. Partial exports stay in private sibling scratch until the
+    build succeeds; failures reclaim only this call's scratch.
+
+    Never raises for build-class failures; see :class:`BuildProduct`.
+    """
+    def build(rootfs: Path | None = None) -> BuildProduct:
+        return _containerized_build(
+            repo_dir, command, out_dir=out_dir, toolchain=toolchain,
+            base_image=base_image, timeout_seconds=timeout_seconds,
+            keep_rootfs=rootfs, run_env=run_env, aux_builds=aux_builds,
+            subdir=subdir,
+        )
+    if not keep_rootfs:
+        return build()
+    keep = Path(keep_rootfs)
+    try:
+        # Reserve exclusively before any build work. An existing tree is
+        # operator-owned, even when a build would otherwise have failed.
+        keep.mkdir(parents=True)
+    except OSError as exc:
+        return BuildProduct(ok=False, reason="rejected_input", detail=str(exc)[:500])
+    try:
+        reservation = keep.lstat()
+    except BaseException:
+        # Setup failed before any image data exists; only an empty
+        # reservation can be removed here.
+        try:
+            keep.rmdir()
+        except BaseException:
+            pass
+        raise
+    try:
+        with scratch_dir("raptor-rootfs-build-", dir=keep.parent, keepalive=True) as scratch:
+            rootfs = scratch / "rootfs"
+            product = build(rootfs)
+            if product.ok:
+                try:
+                    if not stat.S_ISDIR(rootfs.lstat().st_mode):
+                        raise OSError("staged rootfs is not a real directory")
+                    current = keep.lstat()
+                    if (current.st_dev, current.st_ino) != (reservation.st_dev, reservation.st_ino):
+                        raise FileExistsError("rootfs destination changed during build")
+                    os.replace(rootfs, keep)
+                except OSError as exc:
+                    product.ok = False
+                    product.reason = "export_failed"
+                    product.detail = f"rootfs publication failed: {exc}"[:500]
+                    product.rootfs = None
+                else:
+                    product.rootfs = keep
+            return product
+    finally:
+        # Only remove our original EMPTY reservation, never a replacement
+        # or data written there while the build ran. All partial image data
+        # is confined to scratch_dir, whose cleanup handles restricted trees.
+        try:
+            current = keep.lstat()
+            if (current.st_dev, current.st_ino) == (reservation.st_dev, reservation.st_ino):
+                keep.rmdir()
+        except OSError:
+            pass
+
+
+@contextmanager
+def _image_cleanup(build_id: str):
+    """Attempt both exact-scope cleanups without masking raised build errors."""
+    from core.container.lifecycle import prune_labeled_dangling, remove_labeled_images
+
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        first_error = None
+        for action in (
+            lambda: remove_labeled_images(BUILD_LABEL, build_id,
+                                          tag_repo="raptor-env-build", tag_value=build_id),
+            lambda: prune_labeled_dangling(BUILD_LABEL, build_id),
+        ):
+            try:
+                action()
+            except BaseException as exc:
+                try:
+                    logger.warning("Build image cleanup failed for %s", build_id, exc_info=True)
+                except BaseException:
+                    pass
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None and not failed:
+            raise first_error
+
+
+@contextmanager
+def _artifact_outputs(product: BuildProduct):
+    """Roll back only files this extraction published if the operation fails."""
+    receipts: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        yield receipts
+    except BaseException:
+        for path, identity in reversed(receipts):
+            try:
+                info = path.lstat()
+                if (info.st_dev, info.st_ino) == identity:
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+            except BaseException:
+                try:
+                    logger.warning("Partial build artifact retained at %s", path, exc_info=True)
+                except BaseException:
+                    pass
+        product.artifacts.clear()
+        product.checksums.clear()
+        raise
+
+
+def _containerized_build(
+    repo_dir: Path | str,
+    command: str,
+    *,
+    out_dir: Path | str,
+    toolchain: ToolchainSpec | None,
+    base_image: str,
+    timeout_seconds: int,
+    keep_rootfs: Path | str | None,
+    run_env: dict[str, str] | None = None,
+    aux_builds: dict[str, dict[str, str]] | None = None,
+    subdir: str = "",
+) -> BuildProduct:
+    from core.container.build import build_image
+    from core.container.export import export_rootfs
+
+    repo = Path(repo_dir)
+    out = Path(out_dir)
+    build_id = uuid.uuid4().hex[:12]
+    tag = f"raptor-env-build:{build_id}"
+    product = BuildProduct(ok=False, toolchain=toolchain,
+                           base_image=base_image, build_command=command,
+                           build_subdir=subdir)
+
+    # Refuse untrusted Dockerfile-bound values BEFORE any work. The
+    # build command reaches this seam from detector/LLM synthesis over
+    # repo content and toolchains/base images can arrive from on-disk
+    # specs, so a hostile value is an EXPECTED input, not a programmer
+    # error: it gets the structured-failure path (module contract:
+    # build-class failures never raise). run_env keys/values and aux
+    # stage names come from RAPTOR constants — their validators keep
+    # raising ValueError (programmer error), unchanged.
+    try:
+        _validate_build_command(command)
+        _validate_base_image(base_image)
+        _validate_subdir(subdir)
+        _flag_prefix(toolchain)  # validates every toolchain field
+    except ValueError as exc:
+        product.reason, product.detail = "rejected_input", str(exc)[:500]
+        return product
+
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        product.reason, product.detail = "export_failed", str(exc)[:500]
+        return product
+
+    # Large source/rootfs copies belong on the selected artifact filesystem,
+    # not a potentially RAM-backed system temp mount. The private workspace
+    # may live inside the source tree; exclude exactly it to prevent recursion.
+    with scratch_dir("raptor-env-build-", dir=out, keepalive=True) as tmp:
+        ctx = tmp / "context"
+        try:
+            copy_source = repo.resolve()
+            workspace = tmp.resolve()
+
+            def ignored(directory, names):
+                return {name for name in names
+                        if name == ".git" or Path(directory) / name == workspace}
+
+            shutil.copytree(copy_source, ctx / "src", ignore=ignored, symlinks=True)
+        except OSError as exc:
+            product.reason, product.detail = "copy_failed", str(exc)[:500]
+            return product
+
+        # LABEL is the FIRST instruction so every intermediate step
+        # image the legacy builder commits inherits it — that is what
+        # scopes the dangling-cache prune below to exactly this build.
+        env_prefix = _env_prefix(run_env)
+        dockerfile = (
+            f"FROM {base_image}\n"
+            f"LABEL {BUILD_LABEL}={build_id}\n"
+            f"COPY src /src\n"
+        )
+        # Aux stages copy BEFORE any build runs so every stage starts
+        # from the pristine tree, not one polluted by another stage's
+        # objects.
+        for aux_name in (aux_builds or {}):
+            _validate_aux_name(aux_name)
+            dockerfile += f"COPY src /{aux_name}\n"
+        # A validated subdir extends WORKDIR rather than folding a
+        # `cd` into the command: the RUN line must stay a plain
+        # command so the exported assignments below govern all of it.
+        wd_suffix = f"/{subdir}" if subdir else ""
+        dockerfile += (
+            f"WORKDIR /src{wd_suffix}\n"
+            + _run_line(env_prefix, _flag_prefix(toolchain), command)
+        )
+        for aux_name, aux_env in (aux_builds or {}).items():
+            # aux stages do NOT inherit run_env: the canonical use is
+            # an AFL cmplog twin, which wants compare logging WITHOUT
+            # the main stage's sanitizer (sanitized compare tracing is
+            # needlessly slow). Safe ONLY because AFL_BUILD_IMAGE pins
+            # a build where crash classification is independent of the
+            # -c binary's instrumentation — the v5.02c release gets
+            # this wrong (silent sanitizer-crash false negatives,
+            # found empirically; see the pin comment).
+            dockerfile += (
+                f"WORKDIR /{aux_name}{wd_suffix}\n"
+                + _run_line(_env_prefix(aux_env),
+                            _flag_prefix(toolchain), command)
+            )
+        try:
+            with _artifact_outputs(product) as receipts, _image_cleanup(build_id):
+                built = build_image(
+                    context_dir=str(ctx), tag=tag, dockerfile_text=dockerfile,
+                    timeout_seconds=timeout_seconds,
+                    labels={BUILD_LABEL: build_id},
+                    # The RUN step executes the UNTRUSTED build system:
+                    # consent-to-build is not consent to egress (metadata
+                    # credential theft, bridge pivot, exfiltration).
+                    # Dependency-fetching builds fail here and take the
+                    # documented degrade path.
+                    network="none",
+                    force_rm=True,
+                )
+                if not built.ok:
+                    product.reason = "build_failed"
+                    # Both streams: under the legacy builder the failing
+                    # step's output (`configure: error: ...`) is on STDOUT
+                    # — a stderr-only detail showed just the deprecation
+                    # banner and hid the real error.
+                    product.detail = "\n".join(
+                        tail for tail in ((built.stderr_tail or "")[-1000:],
+                                          (built.logs_tail or "")[-1000:])
+                        if tail.strip())
+                    return product
+
+                rootfs = Path(keep_rootfs) if keep_rootfs else Path(tmp) / "rootfs"
+                exported = export_rootfs(tag, rootfs)
+                if not exported.ok:
+                    product.reason = "export_failed"
+                    # ExportOutcome carries the diagnostics in reason +
+                    # stderr (there is no 'detail' field — the old getattr
+                    # shipped every failure with an empty detail).
+                    product.detail = (
+                        f"{exported.reason}: {exported.stderr}".strip(": ")
+                    )[:500]
+                    return product
+
+                for rel, src in _elf_executables(rootfs / "src").items():
+                    staged = tmp / f"artifact-{len(product.artifacts)}"
+                    shutil.copy2(src, staged)
+                    # Analysis needs content, never an executable/setuid file.
+                    staged.chmod(0o444)
+                    checksum = _sha256(staged)
+                    info = staged.lstat()
+                    identity = (info.st_dev, info.st_ino)
+                    for _attempt in range(16):
+                        dest = out / _dest_name(rel, out)
+                        # Register before the syscall: cancellation can arrive
+                        # after a successful rename but before Python resumes.
+                        receipts.append((dest, identity))
+                        try:
+                            rename_without_replace(staged, dest)
+                            break
+                        except FileExistsError:
+                            continue
+                    else:
+                        raise OSError("artifact publication repeatedly collided")
+                    product.artifacts[rel] = dest
+                    product.checksums[rel] = checksum
+        except OSError as exc:
+            product.reason, product.detail = "export_failed", str(exc)[:500]
+            return product
+
+    if not product.artifacts:
+        product.reason = "no_artifacts"
+        product.detail = "build succeeded but produced no ELF executables"
+        return product
+    product.ok = True
+    return product
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with preserving_stream_error(path.open("rb")) as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dest_name(rel: str, out: Path) -> str:
+    """Flatten a repo-relative path into a unique extraction file name.
+
+    ``a/b`` and a literal ``a__b`` must not collide (an attacker-
+    authored tree could otherwise steer which binary survives to be
+    analysed): suffix an index until the name is free.
+    """
+    base = rel.replace("/", "__")
+    name, i = base, 1
+    while os.path.lexists(out / name):
+        name = f"{base}.{i}"
+        i += 1
+    return name
+
+
+def _validate_aux_name(name: str) -> None:
+    """Aux stage names become image paths and Dockerfile tokens."""
+    import re as _re
+
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        raise ValueError(f"invalid aux build name: {name!r}")
+    if name in ("src", "usr", "bin", "sbin", "lib", "lib64", "etc",
+                "opt", "tmp", "var", "proc", "sys", "dev", "run",
+                "boot", "home", "root"):
+        raise ValueError(
+            f"aux build name {name!r} collides with the source tree or "
+            f"an image system directory")
+
+
+#: Toolchain values are single-quote-wrapped on the generated RUN line;
+#: shape-allowlists (not blocklists) keep every quote/escape/whitespace
+#: class out by construction. Compiler names may carry a wrapper path
+#: (``/usr/lib/ccache/gcc``); flag tokens cover the real mitigation /
+#: instrumentation vocabulary (``-Wl,-z,relro,-z,now``,
+#: ``-D_FORTIFY_SOURCE=2``, ``-I/opt/include``, ``-std=c++17``).
+_TOOL_NAME_RE = re.compile(r"[A-Za-z0-9._+/-]+")
+_FLAG_TOKEN_RE = re.compile(r"[A-Za-z0-9._+/=,:-]+")
+#: Image references as the Dockerfile FROM line accepts them
+#: (registry/repo:tag@digest); anything else — whitespace, newlines,
+#: quotes — cannot start a well-formed reference.
+_IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
+
+
+def _validate_build_command(command: str) -> None:
+    """Refuse build commands that can escape their Dockerfile RUN line.
+
+    The command is UNTRUSTED (detector/LLM synthesis over repo content,
+    on-disk specs) and is interpolated raw into the generated
+    Dockerfile, so anything that terminates or extends the RUN line is
+    an instruction-injection primitive:
+
+    * newline / CR — starts a NEW Dockerfile instruction. ``COPY
+      --from=attacker/image`` makes the daemon pull an attacker image
+      (host-side egress) and BuildKit ``RUN --network=default``
+      restores exactly the egress the ``network="none"`` build
+      containment exists to deny.
+    * a leading dash — parsed as a RUN flag (``--network``,
+      ``--mount``) by BuildKit when no env/flag prefix precedes the
+      command.
+    * a trailing backslash — Dockerfile line continuation absorbs the
+      NEXT generated instruction into this RUN's shell text.
+
+    A legitimate build command has no use for any of these shapes.
+    """
+    if any(ch in command for ch in "\n\r\x00"):
+        raise ValueError(
+            "build command contains a line break or NUL — refusing "
+            "(Dockerfile instruction injection)")
+    if command.lstrip().startswith("-"):
+        raise ValueError(
+            "build command starts with '-' — refusing (would parse as "
+            "a Dockerfile RUN flag such as --network)")
+    if command.rstrip().endswith("\\"):
+        raise ValueError(
+            "build command ends with '\\' — refusing (Dockerfile line "
+            "continuation would absorb the next generated instruction)")
+
+
+def _validate_base_image(base_image: str) -> None:
+    """Base images enter the generated FROM line; enforce reference
+    shape so a value can never smuggle additional instructions."""
+    if not _IMAGE_REF_RE.fullmatch(base_image):
+        raise ValueError(f"invalid base image reference: {base_image!r}")
+
+
+#: Segments of a build subdir as the WORKDIR line accepts them. Same
+#: threat model as the build command: the value comes from detector
+#: synthesis over repo content (directory NAMES in the scanned tree),
+#: so it is UNTRUSTED and interpolated raw into the Dockerfile.
+_SUBDIR_SEGMENT_RE = re.compile(r"[A-Za-z0-9._+-]+")
+
+
+def _validate_subdir(subdir: str) -> None:
+    """Refuse build subdirs that can escape their WORKDIR line or the
+    /src tree. Empty string ("" = build at the repo root) is valid."""
+    if not subdir:
+        return
+    if any(ch in subdir for ch in "\n\r\x00\\ \t'\""):
+        raise ValueError(
+            "build subdir contains whitespace, a quote, or a line "
+            "break — refusing (Dockerfile instruction injection)")
+    if subdir.startswith(("/", "-")):
+        raise ValueError(f"build subdir must be relative: {subdir!r}")
+    segments = subdir.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        raise ValueError(f"build subdir escapes the repo tree: {subdir!r}")
+    for seg in segments:
+        if not _SUBDIR_SEGMENT_RE.fullmatch(seg):
+            raise ValueError(f"invalid build subdir segment: {seg!r}")
+
+
+def _run_line(env_prefix: str, flag_prefix: str, command: str) -> str:
+    """The Dockerfile RUN line, with all assignments EXPORTED.
+
+    A bare ``KEY=V command`` prefix binds to the first simple command
+    only: for a chained build (``autoreconf -fi && ./configure &&
+    make``) the toolchain flags silently never reached configure or
+    make — a "hardened" mitigation-matrix posture compiled with no
+    hardening at all. ``export A=..; command`` governs every command
+    in the chain (including an operator-embedded ``cd``).
+    """
+    assignments = f"{env_prefix}{flag_prefix}".strip()
+    if not assignments:
+        return f"RUN {command}\n"
+    return f"RUN export {assignments}; {command}\n"
+
+
+def _env_prefix(run_env: dict[str, str] | None) -> str:
+    """KEY='VALUE' prefix for the RUN line (empty when None).
+
+    Keys must be identifier-shaped (they come from RAPTOR constants,
+    never from the scanned repo); values are single-quote-wrapped with
+    embedded quotes rejected rather than escaped.
+    """
+    import re as _re
+
+    if not run_env:
+        return ""
+    parts = []
+    for k, v in run_env.items():
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            raise ValueError(f"invalid run_env key: {k!r}")
+        if "'" in v or "\n" in v or "\r" in v:
+            raise ValueError(f"invalid run_env value for {k!r}")
+        parts.append(f"{k}='{v}'")
+    return " ".join(parts) + " "
+
+
+def _flag_prefix(toolchain: ToolchainSpec | None) -> str:
+    """Ambient-flag env prefix for the RUN line (empty when None).
+
+    Every field is shape-validated at this chokepoint — toolchains can
+    arrive from on-disk specs, not only the module constants, and each
+    value lands single-quoted on the generated Dockerfile RUN line
+    (see :func:`_validate_build_command` for the injection shapes).
+    """
+    if toolchain is None:
+        return ""
+    for label, value in (("cc", toolchain.cc), ("cxx", toolchain.cxx)):
+        if value and not _TOOL_NAME_RE.fullmatch(value):
+            raise ValueError(f"invalid toolchain {label}: {value!r}")
+    for label, tokens in (("cflags", toolchain.cflags),
+                          ("ldflags", toolchain.ldflags)):
+        for token in tokens:
+            if not _FLAG_TOKEN_RE.fullmatch(token):
+                raise ValueError(
+                    f"invalid toolchain {label} token: {token!r}")
+    cflag_list = list(toolchain.cflags)
+    if toolchain.debug and "-g" not in cflag_list:
+        cflag_list.append("-g")
+    cflags = " ".join(cflag_list)
+    ldflags = " ".join(toolchain.ldflags)
+    parts = []
+    if toolchain.cc:
+        parts.append(f"CC='{toolchain.cc}'")
+    if toolchain.cxx:
+        parts.append(f"CXX='{toolchain.cxx}'")
+    if cflags:
+        parts.append(f"CFLAGS='{cflags}' CXXFLAGS='{cflags}'")
+    if ldflags:
+        parts.append(f"LDFLAGS='{ldflags}'")
+    return (" ".join(parts) + " ") if parts else ""
+
+
+def _elf_executables(root: Path) -> dict[str, Path]:
+    """ELF executables under *root*, keyed by repo-relative path.
+
+    Walks with ``os.walk(followlinks=False)``: the rootfs comes out
+    of an attacker-influenced containerized build, so directory-
+    symlink recursion must stay off explicitly (``pathlib``'s ``**``
+    recurses into directory symlinks only via 3.13's
+    ``recurse_symlinks=True`` opt-in; it's
+    ``glob.glob(recursive=True)`` that followed them by default) —
+    a followed pair of in-tree self-links (``loop -> .`` +
+    ``up -> ..``, both of which survive tar extraction under
+    ``filter="data"``) would give combinatorial path expansion
+    materialised eagerly in the TRUSTED parent, and a followed link
+    into the toolchain rootfs would misattribute image binaries as
+    repo build artifacts. The per-entry file checks below already
+    skip symlinked FILES; never ENTERING symlinked directories closes
+    the traversal too (same idiom as the codeql_trust pack walk).
+    """
+    found: dict[str, Path] = {}
+    if not root.is_dir():
+        return found
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            try:
+                if not path.is_file() or path.is_symlink():
+                    continue
+                if not path.stat().st_mode & 0o111:
+                    continue
+                with preserving_stream_error(path.open("rb")) as fh:
+                    try:
+                        magic = fh.read(4)
+                    except OSError:
+                        continue
+                    if magic != _ELF_MAGIC:
+                        continue
+            except OSError:
+                continue
+            found[str(path.relative_to(root))] = path
+    return found

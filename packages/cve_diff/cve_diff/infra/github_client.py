@@ -27,18 +27,47 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import sys
 import threading
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
+
+# Shape validation for the two values every URL in this module embeds.
+# slug/sha reach this chokepoint from advisory-derived data and from
+# free-form LLM tool arguments, and each request carries the operator's
+# GITHUB_TOKEN — without a shape gate, path traversal
+# ("owner/repo/../../../user") and query injection ("abc1234?per_page=1")
+# steer token-authenticated GETs to arbitrary api.github.com endpoints
+# and feed the response back into LLM context / run artifacts.
+#
+# Slug: owner (alnum + hyphen, GitHub's rule) "/" repo (alnum . _ -).
+# A repo segment of only dots ("." / "..") is additionally rejected in
+# ``valid_slug`` — "owner/.." would normalise into a different path.
+_SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
+# Commit ids here are hex object names (short form tolerated; length
+# policy is the callers' concern, injection is ours).
+_SHA_RE = re.compile(r"\A[0-9a-fA-F]{4,64}\Z")
+
+
+def valid_slug(slug: str) -> bool:
+    if not slug or _SLUG_RE.match(slug) is None:
+        return False
+    repo = slug.partition("/")[2]
+    return repo.strip(".") != ""
+
+
+def valid_sha(sha: str) -> bool:
+    return bool(sha) and _SHA_RE.match(sha) is not None
 
 
 class _CacheInfo:
     """Minimal stand-in for ``functools.lru_cache``'s ``CacheInfo`` so
     callers using ``cache_info()`` (e.g. ``get_commit``'s hit/miss
     telemetry) keep working after the lru_cache → _cache_unless_none swap."""
-    __slots__ = ("hits", "misses", "currsize")
+    __slots__ = ("currsize", "hits", "misses")
 
-    def __init__(self, hits: int, misses: int, currsize: int):
+    def __init__(self, hits: int, misses: int, currsize: int) -> None:
         self.hits = hits
         self.misses = misses
         self.currsize = currsize
@@ -87,7 +116,6 @@ def _cache_unless_none(func: Callable) -> Callable:
 
 from core.http import HttpError
 from core.http.egress_backend import EgressClient
-
 from cve_diff.infra.rate_limit import TokenBucket
 
 _UNAUTH_CAPACITY = 50
@@ -104,7 +132,7 @@ _warn_lock = threading.Lock()
 
 def _token() -> str | None:
     tok = os.environ.get("GITHUB_TOKEN")
-    return tok if tok else None
+    return tok or None
 
 
 def warn_if_token_missing(echo=None) -> None:
@@ -182,7 +210,7 @@ def _headers() -> dict[str, str]:
     return h
 
 
-def _get(url: str) -> Optional[dict[str, Any]]:
+def _get(url: str) -> dict[str, Any] | None:
     """GET ``url`` against the GitHub API. Returns JSON dict or None.
 
     Returns None on any error (network, timeout, non-2xx). On 401/403/429
@@ -210,23 +238,23 @@ def _get(url: str) -> Optional[dict[str, Any]]:
 
 
 @_cache_unless_none
-def get_repo(slug: str) -> Optional[dict[str, Any]]:
+def get_repo(slug: str) -> dict[str, Any] | None:
     """``GET /repos/{slug}`` — fork/archived/stars/created_at/language/size."""
-    if not slug or "/" not in slug:
+    if not valid_slug(slug):
         return None
     return _get(f"https://api.github.com/repos/{slug}")
 
 
 @_cache_unless_none
-def get_languages(slug: str) -> Optional[dict[str, Any]]:
+def get_languages(slug: str) -> dict[str, Any] | None:
     """``GET /repos/{slug}/languages`` — used by shape_dynamic."""
-    if not slug or "/" not in slug:
+    if not valid_slug(slug):
         return None
     return _get(f"https://api.github.com/repos/{slug}/languages")
 
 
 @_cache_unless_none
-def commit_exists(slug: str, sha: str) -> Optional[bool]:
+def commit_exists(slug: str, sha: str) -> bool | None:
     """Return True if ``sha`` resolves in ``slug``, False on 404, None on skip.
 
     Used for commit-graph membership checks: if a fix_commit doesn't resolve
@@ -237,7 +265,7 @@ def commit_exists(slug: str, sha: str) -> Optional[bool]:
     ``None`` is returned for auth failures / rate limits / network errors —
     the caller treats this as "can't tell" and applies no penalty.
     """
-    if not slug or "/" not in slug or not sha:
+    if not valid_slug(slug) or not valid_sha(sha):
         return None
     if not _bucket().try_acquire():
         return None
@@ -258,16 +286,16 @@ def commit_exists(slug: str, sha: str) -> Optional[bool]:
 
 
 @_cache_unless_none
-def _get_commit_cached(slug: str, sha: str) -> Optional[dict[str, Any]]:
+def _get_commit_cached(slug: str, sha: str) -> dict[str, Any] | None:
     """Inner cached implementation of ``get_commit``. Wrapped by the
     public ``get_commit`` so we can record hit/miss counters via
     ``api_status`` without losing lru_cache semantics."""
-    if not slug or "/" not in slug or not sha:
+    if not valid_slug(slug) or not valid_sha(sha):
         return None
     return _get(f"https://api.github.com/repos/{slug}/commits/{sha}")
 
 
-def get_commit(slug: str, sha: str) -> Optional[dict[str, Any]]:
+def get_commit(slug: str, sha: str) -> dict[str, Any] | None:
     """``GET /repos/{slug}/commits/{sha}`` — full commit body (files + parents).
 
     Memoized via ``_get_commit_cached`` so `get_commit_files` and the
@@ -277,8 +305,10 @@ def get_commit(slug: str, sha: str) -> Optional[dict[str, Any]]:
 
     Telemetry caveat: under ``ProcessPoolExecutor`` (bench's
     ``-w 4``) each worker has its own per-process ``functools.lru_cache``
-    and counter — totals are aggregated across workers but per-worker
-    counts can race. Within a single process there's also a small
+    and counter — cross-worker totals exist only because the bench
+    ships each CVE's counter delta back on its result record and the
+    parent ``api_status.absorb()``s it (module globals never cross the
+    process boundary). Within a single process there's also a small
     window between the two ``cache_info()`` reads where another thread
     could populate the cache; the resulting hit/miss attribution is
     still approximately correct over many calls and never worse than
@@ -286,9 +316,9 @@ def get_commit(slug: str, sha: str) -> Optional[dict[str, Any]]:
     (bench summary, not correctness-critical), so we accept the
     looseness rather than thread per-call locking.
     """
-    info_before = _get_commit_cached.cache_info()
+    info_before = _get_commit_cached.cache_info()  # type: ignore[attr-defined]
     result = _get_commit_cached(slug, sha)
-    info_after = _get_commit_cached.cache_info()
+    info_after = _get_commit_cached.cache_info()  # type: ignore[attr-defined]
     # Avoid the api_status import at module-load time (avoids a circular
     # path during startup; api_status is part of the same package).
     from cve_diff.infra import api_status
@@ -299,7 +329,7 @@ def get_commit(slug: str, sha: str) -> Optional[dict[str, Any]]:
     return result
 
 
-def _files_from_commit(data: Optional[dict[str, Any]]) -> Optional[list[str]]:
+def _files_from_commit(data: dict[str, Any] | None) -> list[str] | None:
     if data is None:
         return None
     files = data.get("files")
@@ -316,7 +346,7 @@ def _files_from_commit(data: Optional[dict[str, Any]]) -> Optional[list[str]]:
     return out
 
 
-def get_commit_files(slug: str, sha: str) -> Optional[list[str]]:
+def get_commit_files(slug: str, sha: str) -> list[str] | None:
     """Return the list of changed filenames in ``sha``, or None on skip.
 
     Backs `commit_shape_score` — classifying the fix commit's actual diff by
@@ -329,30 +359,6 @@ def get_commit_files(slug: str, sha: str) -> Optional[list[str]]:
     treats that as skip-worthy (rare but uninformative).
     """
     return _files_from_commit(get_commit(slug, sha))
-
-
-def get_parent_commit_files(slug: str, sha: str) -> Optional[list[str]]:
-    """Return the changed-files list of ``sha``'s first parent, or None.
-
-    Backs `parent_chain_score`. First fetches the candidate commit (memoized
-    with `get_commit`), extracts ``parents[0].sha``, then fetches the parent
-    commit to pull its files. Returns None on any fetch failure, on a root
-    commit (no parents), or on a merge commit whose mainline parent isn't
-    resolvable — all treated as "can't tell" skips upstream.
-    """
-    commit = get_commit(slug, sha)
-    if commit is None:
-        return None
-    parents = commit.get("parents") or []
-    if not parents or not isinstance(parents, list):
-        return None
-    first = parents[0]
-    if not isinstance(first, dict):
-        return None
-    parent_sha = first.get("sha")
-    if not isinstance(parent_sha, str) or not parent_sha:
-        return None
-    return _files_from_commit(get_commit(slug, parent_sha))
 
 
 def reset_for_tests() -> None:

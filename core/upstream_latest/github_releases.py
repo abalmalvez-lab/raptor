@@ -28,12 +28,35 @@ cve-diff upstream resolver) share one implementation.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+import re
+from typing import Any, TYPE_CHECKING
+from urllib.parse import quote
 
 from core.http import HttpClient, HttpError
-from core.json import JsonCache
 
 from ._version_filter import highest_stable
+
+if TYPE_CHECKING:
+    from core.json import JsonCache
+
+# ``owner/name`` — exactly one slash, both components restricted to
+# GitHub's own username/repo character set. Slugs are read out of the
+# target's manifests, so they must not be able to reshape the API URL
+# below (extra path segments, ``..``, query strings).
+_REPO_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def _validated_slug(repo: str) -> str:
+    if not _REPO_SLUG_RE.fullmatch(repo or ""):
+        msg = f"GitHub repo slug refused: {repo!r} is not owner/name"
+        raise UpstreamLookupError(msg)
+    # The character class admits dots, so all-dot components ("." /
+    # "..") would pass the shape check while still traversing the URL
+    # path — refuse them explicitly.
+    if any(set(part) == {"."} for part in repo.split("/")):
+        msg = f"GitHub repo slug refused: {repo!r} is not owner/name"
+        raise UpstreamLookupError(msg)
+    return repo
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +85,9 @@ def latest_release(
     repo: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache] = None,
+    cache: JsonCache | None = None,
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
-    github_token: Optional[str] = None,
+    github_token: str | None = None,
 ) -> str:
     """Return the ``tag_name`` of the latest stable GitHub release.
 
@@ -76,20 +99,18 @@ def latest_release(
     If the project doesn't cut proper releases, this returns
     HTTP 404 — caller should fall back to ``latest_tag``.
     """
-    url = f"{GITHUB_API_BASE}/repos/{repo}/releases/latest"
+    url = f"{GITHUB_API_BASE}/repos/{_validated_slug(repo)}/releases/latest"
     data = _fetch_cached_json(
         url, http=http, cache=cache, ttl_seconds=ttl_seconds,
         github_token=github_token,
     )
     if not isinstance(data, dict):
-        raise UpstreamLookupError(
-            f"GitHub /releases/latest for {repo} returned non-object"
-        )
+        msg = f"GitHub /releases/latest for {repo} returned non-object"
+        raise UpstreamLookupError(msg)
     tag = data.get("tag_name")
     if not isinstance(tag, str) or not tag.strip():
-        raise UpstreamLookupError(
-            f"GitHub /releases/latest for {repo} missing tag_name"
-        )
+        msg = f"GitHub /releases/latest for {repo} missing tag_name"
+        raise UpstreamLookupError(msg)
     return tag.strip()
 
 
@@ -98,9 +119,9 @@ def resolve_tag_to_sha(
     tag: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache] = None,
+    cache: JsonCache | None = None,
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
-    github_token: Optional[str] = None,
+    github_token: str | None = None,
 ) -> str:
     """Resolve a tag to its 40-char commit SHA.
 
@@ -119,51 +140,55 @@ def resolve_tag_to_sha(
     to construct the target SHA when proposing a bump from
     ``<sha-A>  # was v6`` to ``<sha-B>  # was v7``.
     """
-    url = f"{GITHUB_API_BASE}/repos/{repo}/git/refs/tags/{tag}"
+    url = (f"{GITHUB_API_BASE}/repos/{_validated_slug(repo)}"
+           f"/git/refs/tags/{quote(tag, safe='')}")
     data = _fetch_cached_json(
         url, http=http, cache=cache, ttl_seconds=ttl_seconds,
         github_token=github_token,
     )
     if not isinstance(data, dict):
-        raise UpstreamLookupError(
-            f"GitHub /git/refs/tags/{tag} for {repo} returned non-object"
-        )
+        msg = f"GitHub /git/refs/tags/{tag} for {repo} returned non-object"
+        raise UpstreamLookupError(msg)
     obj = data.get("object") or {}
     sha = obj.get("sha")
     obj_type = obj.get("type")
     if not isinstance(sha, str) or len(sha) != 40:
-        raise UpstreamLookupError(
-            f"GitHub /git/refs/tags/{tag} for {repo} missing sha"
-        )
+        msg = f"GitHub /git/refs/tags/{tag} for {repo} missing sha"
+        raise UpstreamLookupError(msg)
     if obj_type == "tag":
         # Annotated tag — chase the tag object to get the
         # underlying commit SHA.
-        tag_url = f"{GITHUB_API_BASE}/repos/{repo}/git/tags/{sha}"
+        tag_url = (f"{GITHUB_API_BASE}/repos/{_validated_slug(repo)}"
+                   f"/git/tags/{sha}")
         tag_data = _fetch_cached_json(
             tag_url, http=http, cache=cache, ttl_seconds=ttl_seconds,
             github_token=github_token,
         )
         if not isinstance(tag_data, dict):
-            raise UpstreamLookupError(
-                f"GitHub /git/tags/{sha} for {repo} returned non-object"
-            )
+            msg = f"GitHub /git/tags/{sha} for {repo} returned non-object"
+            raise UpstreamLookupError(msg)
         inner_obj = tag_data.get("object") or {}
         inner_sha = inner_obj.get("sha")
         if not isinstance(inner_sha, str) or len(inner_sha) != 40:
-            raise UpstreamLookupError(
-                f"GitHub /git/tags/{sha} for {repo} missing inner sha"
-            )
+            msg = f"GitHub /git/tags/{sha} for {repo} missing inner sha"
+            raise UpstreamLookupError(msg)
         return inner_sha
     return sha
+
+
+# Page budget for the tags scan. Small on purpose: 300 tags of headroom
+# covers real nightly cadences without turning every lookup on a
+# tag-less repo into an unbounded API walk.
+_TAGS_PAGE_CAP = 3
 
 
 def latest_tag(
     repo: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache] = None,
+    cache: JsonCache | None = None,
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
-    github_token: Optional[str] = None,
+    github_token: str | None = None,
     per_page: int = 100,
 ) -> str:
     """Return the highest stable-semver tag in the repo.
@@ -175,27 +200,37 @@ def latest_tag(
 
     Use this when ``latest_release`` 404s (project doesn't ship
     GitHub Releases, only tags).
+
+    Scans up to :data:`_TAGS_PAGE_CAP` pages: the tags endpoint is
+    commit-date ordered, so a project that cuts nightlies buries its
+    stable tags pages deep — a single-page read concluded
+    NoStableVersionsFound after seeing 100 pre-releases.
     """
-    url = (
-        f"{GITHUB_API_BASE}/repos/{repo}/tags?per_page={per_page}"
+    base_url = (
+        f"{GITHUB_API_BASE}/repos/{_validated_slug(repo)}"
+        f"/tags?per_page={per_page}"
     )
-    data = _fetch_cached_json(
-        url, http=http, cache=cache, ttl_seconds=ttl_seconds,
-        github_token=github_token,
-    )
-    if not isinstance(data, list):
-        raise UpstreamLookupError(
-            f"GitHub /tags for {repo} returned non-list"
+    names: list[str] = []
+    for page in range(1, _TAGS_PAGE_CAP + 1):
+        # Page 1 keeps the bare URL so existing cache keys stay valid.
+        url = base_url if page == 1 else f"{base_url}&page={page}"
+        data = _fetch_cached_json(
+            url, http=http, cache=cache, ttl_seconds=ttl_seconds,
+            github_token=github_token,
         )
-    names = [
-        entry["name"] for entry in data
-        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
-    ]
+        if not isinstance(data, list):
+            msg = f"GitHub /tags for {repo} returned non-list"
+            raise UpstreamLookupError(msg)
+        names.extend(
+            entry["name"] for entry in data
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        )
+        if len(data) < per_page:
+            break  # short page = last page; no further requests
     winner = highest_stable(names)
     if winner is None:
-        raise NoStableVersionsFound(
-            f"no stable-semver tags found for {repo}"
-        )
+        msg = f"no stable-semver tags found for {repo}"
+        raise NoStableVersionsFound(msg)
     return winner
 
 
@@ -207,9 +242,9 @@ def _fetch_cached_json(
     url: str,
     *,
     http: HttpClient,
-    cache: Optional[JsonCache],
+    cache: JsonCache | None,
     ttl_seconds: int,
-    github_token: Optional[str],
+    github_token: str | None,
 ) -> Any:
     """Cached GET-JSON wrapper.
 
@@ -217,7 +252,23 @@ def _fetch_cached_json(
     return cached value without HTTP. Operators wanting to force
     a refresh pass ``ttl_seconds=0``.
     """
-    cache_key = f"upstream_latest:gh:{url}"
+    # Include a fingerprint of the token in the cache key so two
+    # processes with different GitHub tokens (e.g. a personal token
+    # that sees private fork releases vs an unauthenticated probe
+    # against the same URL) don't share cached data. Pre-fix the
+    # cache key was token-agnostic — the second caller saw the
+    # first's view of the world regardless of auth differences.
+    # We hash the token rather than embed it so an inspection of
+    # the cache directory doesn't surface raw credentials.
+    if github_token:
+        from core.hash import sha256_string
+        token_fp = sha256_string(github_token)[:12]
+    else:
+        token_fp = "anon"
+    from urllib.parse import quote as _quote
+    # Percent-encode the URL into one key segment (raw URLs carry "//",
+    # an empty segment the cache layer refuses) so keys stay injective.
+    cache_key = f"upstream_latest:gh:{token_fp}:{_quote(url, safe='')}"
     if cache is not None and ttl_seconds > 0:
         cached = cache.get(cache_key, ttl_seconds=ttl_seconds)
         if cached is not None:
@@ -235,9 +286,8 @@ def _fetch_cached_json(
         # Surface the original error with a more actionable wrapper
         # (the caller cares "did this work" / "did it 404 / 403 /
         # 5xx" — same fail-soft fallthrough either way).
-        raise UpstreamLookupError(
-            f"GitHub fetch failed for {url}: {exc}"
-        ) from exc
+        msg = f"GitHub fetch failed for {url}: {exc}"
+        raise UpstreamLookupError(msg) from exc
     if cache is not None and ttl_seconds > 0:
         cache.put(cache_key, data, ttl_seconds=ttl_seconds)
     return data

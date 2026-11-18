@@ -47,10 +47,10 @@ is **not validated** without this smoke test.
 from __future__ import annotations
 
 import json
-import sys
 
 import pytest
 
+from core.sandbox import evidence as evidence_mod
 from core.sandbox.seatbelt_audit import (
     DENIALS_FILE,
     OBSERVE_FILE,
@@ -58,7 +58,6 @@ from core.sandbox.seatbelt_audit import (
     parse_log_entry,
     start_log_streamer,
 )
-
 
 # ---------------------------------------------------------------------------
 # Cross-module pinning
@@ -167,14 +166,16 @@ class TestLogStreamerFilenameRouting:
     def test_default_appends_to_denials_file(self, tmp_path):
         s = LogStreamer(tmp_path)
         s._append_record({"hello": "world", "audit": True})
-        assert (tmp_path / DENIALS_FILE).exists()
-        assert not (tmp_path / OBSERVE_FILE).exists()
+        evdir = tmp_path / evidence_mod.AUDIT_SUBDIR
+        assert (evdir / DENIALS_FILE).exists()
+        assert not (evdir / OBSERVE_FILE).exists()
 
     def test_observe_mode_appends_to_observe_file(self, tmp_path):
         s = LogStreamer(tmp_path, observe_mode=True)
         s._append_record({"hello": "world", "observe": True})
-        assert (tmp_path / OBSERVE_FILE).exists()
-        assert not (tmp_path / DENIALS_FILE).exists()
+        evdir = tmp_path / evidence_mod.AUDIT_SUBDIR
+        assert (evdir / OBSERVE_FILE).exists()
+        assert not (evdir / DENIALS_FILE).exists()
 
     def test_observe_mode_filename_attribute_pinned(self, tmp_path):
         # Internal attribute is part of the contract because both
@@ -195,7 +196,7 @@ class TestLogStreamerFilenameRouting:
         )
         s._append_record(rec)
 
-        log_path = tmp_path / OBSERVE_FILE
+        log_path = tmp_path / evidence_mod.AUDIT_SUBDIR / OBSERVE_FILE
         assert log_path.exists()
         loaded = json.loads(log_path.read_text().strip())
         assert loaded["observe"] is True
@@ -339,7 +340,8 @@ class TestNonceStamping:
         )
         s._append_record(rec)
         loaded = json.loads(
-            (tmp_path / OBSERVE_FILE).read_text().strip(),
+            (tmp_path / evidence_mod.AUDIT_SUBDIR / OBSERVE_FILE)
+            .read_text().strip(),
         )
         assert loaded["nonce"] == "nonce-XYZ"
 
@@ -356,10 +358,8 @@ class TestNonceStamping:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="macOS sandbox-exec + log stream — Darwin only",
-)
+# macOS sandbox-exec + log stream — Darwin only (real-kernel binding).
+@pytest.mark.darwin_native
 class TestObserveModeDarwinE2E:
     """End-to-end on macOS: sandbox(observe=True) writes a parseable
     .sandbox-observe.jsonl and does not pollute .sandbox-denials.jsonl.
@@ -370,7 +370,8 @@ class TestObserveModeDarwinE2E:
     def test_e2e(self, tmp_path):
         from core.sandbox import run as sandbox_run
         from core.sandbox.observe_profile import (
-            OBSERVE_FILENAME, parse_observe_log,
+            OBSERVE_FILENAME,
+            parse_observe_log,
         )
 
         run_dir = tmp_path / "observe-run"
@@ -390,8 +391,11 @@ class TestObserveModeDarwinE2E:
         )
         assert result.returncode == 0
 
-        observe_log = run_dir / OBSERVE_FILENAME
-        denials_log = run_dir / ".sandbox-denials.jsonl"
+        from core.sandbox.evidence import resolve_read_path
+        observe_log = resolve_read_path(run_dir, OBSERVE_FILENAME)
+        denials_log = resolve_read_path(
+            run_dir, ".sandbox-denials.jsonl",
+        )
 
         if not observe_log.exists():
             pytest.skip(

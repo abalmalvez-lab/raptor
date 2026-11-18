@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Run lifecycle — records start and stop timestamps/status.
 
 Usage:
   raptor-run-lifecycle start <command> --target <path> [--out <dir>]
-  raptor-run-lifecycle complete <output_dir>
-  raptor-run-lifecycle fail <output_dir> [message]
-  raptor-run-lifecycle cancel <output_dir>
+  raptor-run-lifecycle complete <output_dir> [--model <id>] [--command <name>]
+  raptor-run-lifecycle fail <output_dir> [message] [--command <name>]
+  raptor-run-lifecycle cancel <output_dir> [--command <name>]
+  raptor-run-lifecycle interrupt <output_dir> [message] [--command <name>]
 
 start: resolves output directory, writes .raptor-run.json with status=running
 complete: updates status=completed
 fail: updates status=failed with optional error message
 cancel: updates status=cancelled
+interrupt: updates status=interrupted (supervisor stop; resumable —
+  e.g. `raptor-audit resume <output_dir>` for audit runs)
+
+--command on the terminal actions asserts ownership: the value is the
+command the CALLER believes it is finalising. When it does not match
+the run's recorded command, the transition is refused (exit 1) and the
+run's status is left untouched. This is the mechanical guard against a
+sub-step finalising a run it does not own — e.g. an in-session
+/understand --map running with --out pointed at an /audit-owned dir
+must pass `--command understand`, which refuses against the audit run
+instead of stamping it completed hours before the audit finishes.
+Omitting --command preserves the legacy unchecked surface.
 
 This script only writes metadata. Coverage, cleanup, and reporting
 are handled by their respective tools.
@@ -19,7 +34,8 @@ import sys
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
-import os
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -28,12 +44,32 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
+from core.run.metadata import complete_run, fail_run, start_run  # noqa: E402
+from core.run.output import TargetMismatchError, get_output_dir  # noqa: E402
+from core.security.log_sanitisation import sanitise_for_terminal  # noqa: E402
 
-from core.run.output import get_output_dir, TargetMismatchError
-from core.run.metadata import start_run, complete_run, fail_run
+
+def _pop_flag(rest: list, name: str):
+    """Extract ``<name> <value>`` from *rest* in place; None if absent.
+
+    Shared by the terminal actions, whose surfaces mix a positional
+    message with optional flags — argparse would reject the free-form
+    message text the callers already pass.
+    """
+    if name not in rest:
+        return None
+    i = rest.index(name)
+    if i + 1 < len(rest):
+        value = rest[i + 1]
+        del rest[i:i + 2]
+        return value
+    del rest[i:i + 1]  # dangling flag — treat as absent
+    return None
 
 
 def main():
@@ -76,12 +112,30 @@ def main():
                             help="Target path (preferred form)")
         parser.add_argument("--out", dest="explicit_out", default=None,
                             help="Explicit output directory override")
+        parser.add_argument("--retry-of", type=Path, help="Explicit failed/interrupted run to retry as a new attempt; does not imply supersession")
+        parser.add_argument("--parent-run", type=Path, help="Explicit workflow parent run; records provenance without inferring coverage")
+        parser.add_argument(
+            "--max-cost-usd", dest="max_cost_usd", default=None,
+            type=float,
+            help="Per-run USD budget cap; pre-flight gate refuses "
+                 "to start when scorecard estimate exceeds the cap",
+        )
+        parser.add_argument(
+            "--wait", action="store_true",
+            help="Queue behind an in-progress run on the same project "
+                 "instead of refusing immediately",
+        )
+        parser.add_argument(
+            "--project", default=None, metavar="NAME",
+            help="Pin this run to the named project (precedence over "
+                 "the session binding and the last-activated default); "
+                 "'-' = explicitly projectless. Invalid values are a "
+                 "hard error, never a fallback.",
+        )
         # `sys.argv[2:]` so the `start` subcommand isn't re-parsed.
-        try:
-            args = parser.parse_args(sys.argv[2:])
-        except SystemExit:
-            # argparse already printed a clean usage message to stderr.
-            raise
+        # On bad args argparse raises SystemExit after printing a
+        # clean usage message to stderr.
+        args = parser.parse_args(sys.argv[2:])
 
         # `--target` takes precedence over the positional form so a
         # script that explicitly passes `--target X` always wins.
@@ -89,51 +143,179 @@ def main():
         # ordering-dependent.
         target_path = args.target_flag or args.positional_target
 
+        if args.project is not None:
+            from core.run.pin import set_process_project
+            set_process_project(args.project)
+
+        from core.project.registry_home import RegistryHomeError
+        from core.run.pin import ProjectArgvError
         try:
             out_dir = get_output_dir(args.command, target_path=target_path,
                                      explicit_out=args.explicit_out)
-        except TargetMismatchError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            if str(out_dir) != str(out_dir).strip() or any(not c.isprintable() for c in str(out_dir)):
+                raise ValueError("Lifecycle output directory contains whitespace or control characters unsupported by the OUTPUT_DIR protocol")
+        except (TargetMismatchError, ProjectArgvError,
+                RegistryHomeError, ValueError) as e:
+            # RegistryHomeError: an invalid RAPTOR_REGISTRY_HOME is a
+            # hard error, never a projectless fallback — same CLI
+            # contract as the other designed refusals (one ERROR line,
+            # exit 1, no OUTPUT_DIR sentinel).
+            print(f"ERROR: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
             sys.exit(1)
 
-        start_run(out_dir, args.command, target=target_path)
+        # Run-start contention (managed project dirs only): a live run
+        # owned by another session refuses IMMEDIATELY with the holder
+        # named; --wait queues. Crashed runs (dead recorded pid) never
+        # block — see core.run.metadata._live_conflicting_run.
+        from core.project.oplock import OpLockContention
+        try:
+            start_run(out_dir, args.command, target=target_path,
+                      wait_for_project=args.wait, **({"retry_of": args.retry_of} if args.retry_of else {}),
+                      **({"parent_run": args.parent_run} if args.parent_run else {}))
+        except (OpLockContention, ProjectArgvError, ValueError) as e:
+            print(f"ERROR: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            # Disk-full / permission failures at the start boundary
+            # must keep the CLI contract (one ERROR line, exit 1) —
+            # a raw traceback here broke every caller that parses
+            # stderr. The half-born dir is left for inspection; a
+            # marker-less dir is inert to run discovery.
+            print(f"ERROR: could not start the run in {sanitise_for_terminal(str(out_dir))}: {sanitise_for_terminal(str(e), max_len=2000)}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        # Pre-flight cost gate (scorecard-derived). When
+        # --max-cost-usd is set, compare against the scorecard
+        # estimate. Shared implementation lives in raptor.py so the
+        # two entry points cannot drift; the estimate line goes to
+        # stderr so stdout stays single-line OUTPUT_DIR= for callers
+        # that parse it. The gate runs BEFORE the sentinel prints:
+        # callers treat OUTPUT_DIR= as "the run started, write here",
+        # so a gate refusal (exit 1, run marked failed) must not hand
+        # them a directory to write into.
+        if args.max_cost_usd is not None:
+            # No explicit target on the command line usually means the
+            # run's target came from the active project — resolve the
+            # same default so the operator's declared budget cap still
+            # applies instead of being dropped because of HOW the
+            # target was supplied.
+            gate_target = target_path
+            if not gate_target:
+                try:
+                    from core.run.output import resolve_default_target
+                    gate_target = resolve_default_target()
+                except Exception:  # noqa: BLE001
+                    gate_target = None
+            if gate_target:
+                try:
+                    from raptor import _preflight_cost_gate
+                    if _preflight_cost_gate(
+                        str(gate_target), args.max_cost_usd, out_dir,
+                        estimate_stream=sys.stderr,
+                    ):
+                        sys.exit(1)
+                except SystemExit:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    sys.stderr.write(f"  (estimate skipped: {sanitise_for_terminal(str(e), max_len=2000)})\n")
+            else:
+                # An operator-declared cap must never vanish silently:
+                # say the pre-flight estimate could not run. The
+                # runtime cost cap still enforces during execution.
+                sys.stderr.write(
+                    "WARNING: --max-cost-usd was set but no target path "
+                    "could be resolved; pre-flight cost estimate skipped "
+                    "(the runtime cap still enforces during execution)\n"
+                )
+
         print(f"OUTPUT_DIR={out_dir}")
 
     elif action == "complete":
         if len(sys.argv) < 3:
-            print("Usage: raptor-run-lifecycle complete <output_dir>", file=sys.stderr)
+            print("Usage: raptor-run-lifecycle complete <output_dir> "
+                  "[--model <id>] [--command <name>]",
+                  file=sys.stderr)
             sys.exit(1)
+        # Optional --model: the ambient harness model only the agent knows
+        # (RAPTOR's Python can't read /model — no env var). The /understand
+        # skill instructs the agent to pass its own model id here.
+        # Optional --command: ownership claim (see module docstring).
+        rest = list(sys.argv[3:])
+        claim = _pop_flag(rest, "--command")
+        model = _pop_flag(rest, "--model")
         try:
-            complete_run(Path(sys.argv[2]))
-        except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            # Ownership gate FIRST — before the journal merge below
+            # touches the (possibly foreign) run's project index.
+            from core.run.metadata import ensure_run_command
+            ensure_run_command(Path(sys.argv[2]), claim)
+            manifest = None
+            if model:
+                from core.run.provenance import harness_model_entry
+                entry = harness_model_entry(model)
+                if entry:
+                    manifest = {"models": [entry]}
+            # The review-journal → project-index merge happens inside
+            # ``complete_run`` (the completion chokepoint), so it fires
+            # for direct Python callers as well as this shim.
+            complete_run(Path(sys.argv[2]), manifest=manifest,
+                         expected_command=claim)
+        except Exception as e:  # noqa: BLE001 — CLI boundary: report and exit
+            print(f"ERROR: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
             sys.exit(1)
 
     elif action == "fail":
         if len(sys.argv) < 3:
-            print("Usage: raptor-run-lifecycle fail <output_dir> [message]", file=sys.stderr)
+            print("Usage: raptor-run-lifecycle fail <output_dir> [message] "
+                  "[--command <name>]", file=sys.stderr)
             sys.exit(1)
-        message = sys.argv[3] if len(sys.argv) > 3 else "unknown error"
+        rest = list(sys.argv[3:])
+        claim = _pop_flag(rest, "--command")
+        message = rest[0] if rest else "unknown error"
         try:
-            fail_run(Path(sys.argv[2]), message)
-        except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            fail_run(Path(sys.argv[2]), message, expected_command=claim)
+        except Exception as e:  # noqa: BLE001 — CLI boundary: report and exit
+            print(f"ERROR: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
             sys.exit(1)
 
     elif action == "cancel":
         if len(sys.argv) < 3:
-            print("Usage: raptor-run-lifecycle cancel <output_dir>", file=sys.stderr)
+            print("Usage: raptor-run-lifecycle cancel <output_dir> "
+                  "[--command <name>]", file=sys.stderr)
             sys.exit(1)
+        rest = list(sys.argv[3:])
+        claim = _pop_flag(rest, "--command")
         try:
             from core.run.metadata import cancel_run
-            cancel_run(Path(sys.argv[2]))
-        except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            cancel_run(Path(sys.argv[2]), expected_command=claim)
+        except Exception as e:  # noqa: BLE001 — CLI boundary: report and exit
+            print(f"ERROR: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
+            sys.exit(1)
+
+    elif action == "interrupt":
+        if len(sys.argv) < 3:
+            print("Usage: raptor-run-lifecycle interrupt <output_dir> "
+                  "[message] [--command <name>]",
+                  file=sys.stderr)
+            sys.exit(1)
+        rest = list(sys.argv[3:])
+        claim = _pop_flag(rest, "--command")
+        message = rest[0] if rest else None
+        try:
+            # ``interrupt_run`` gates ownership (expected_command)
+            # and merges the journal into the project index itself —
+            # an interrupted run's verdicts are real reviews and must
+            # reach sibling runs and the resume.
+            from core.run.metadata import interrupt_run
+            interrupt_run(Path(sys.argv[2]), message,
+                          expected_command=claim)
+        except Exception as e:  # noqa: BLE001 — CLI boundary: report and exit
+            print(f"ERROR: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
             sys.exit(1)
 
     else:
-        print(f"Unknown action: {action}", file=sys.stderr)
-        print("Actions: start, complete, fail, cancel", file=sys.stderr)
+        print(f"Unknown action: {sanitise_for_terminal(action)}", file=sys.stderr)
+        print("Actions: start, complete, fail, cancel, interrupt", file=sys.stderr)
         sys.exit(1)
 
 

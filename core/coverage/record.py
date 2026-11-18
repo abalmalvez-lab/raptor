@@ -5,23 +5,237 @@ Built from the reads manifest (populated by the PostToolUse hook),
 Semgrep JSON output, CodeQL SARIF, and findings.json.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, cast
 
-from core.json import load_json, save_json
+from core.json import DEFAULT_JSON_MAX_BYTES, load_json, save_json
+from core.run.toolprobe import reported_version
 
 COVERAGE_RECORD_FILE = "coverage-record.json"  # legacy single-file name
+
+# ─── Subdir record trust policy (load chokepoint) ───────────────────
+# load_records() also globs coverage-*.json one level down because
+# some producers write records into their own run-dir subdir. But
+# several of those subdirs are SANDBOX WRITE GRANTS handed to child
+# processes that execute over (or ARE) untrusted input — the external
+# OpenAnt scanner owns openant_scan/, the pattern scanners' children
+# write into scan/ and codeql/. A child that can drop
+# ``coverage-llm.json`` (or any review-capable label — the label
+# space is unlimited, so top-level-name dedup is no defense) into its
+# grant would mint FULL review credit in every consumer of this
+# loader: store_view/--fail-under, the --residual view, the /audit
+# and --gap-audit covered-set fold. The load is therefore the one
+# chokepoint where subdir trust is enforced, so every consumer
+# inherits it:
+#
+#   * _REVIEW_RECORD_SUBDIRS — review-record producer homes whose
+#     records load unrestricted (autonomous/: the llm_analysis agent
+#     writes its journal-derived review record there). NOTE the true
+#     guard for autonomous/: the agent's per-finding `claude -p`
+#     sub-agent DOES receive autonomous/ as its OS-level write grant
+#     (packages/llm_analysis/cc_dispatch.py) — what keeps it from
+#     minting records there is that child's CLI tool allowlist
+#     (Read,Grep,Glob: no Write/Edit/Bash), structurally tied to this
+#     entry by core/coverage/tests/test_record_subdir_policy.py.
+#     Widening that allowlist without moving this entry behind the
+#     refusal trips the tie test.
+#   * _SCANNER_RECORD_SUBDIRS — established scanner homes (scan/,
+#     codeql/, sca/). Their legitimate records are scanner-grade
+#     only, so records that would carry review credit — a label
+#     classifying (llm, analysed), or the legacy nested ``files{}``
+#     shape (which the audit fold credits for any non-runtime
+#     category) — are REFUSED from these dirs.
+#   * anything else (openant_scan/ and unknown subdirs): refused
+#     outright. Review-capable coverage only ever loads from the
+#     run-dir TOP LEVEL, which the parent writes outside any child
+#     grant.
+#
+# Both directions: a forged openant_scan/coverage-llm.json earns
+# nothing anywhere; legitimate scan/coverage-semgrep.json,
+# codeql/coverage-codeql.json, autonomous/coverage-journal.json and
+# every top-level record load exactly as before
+# (core/coverage/tests/test_record_subdir_policy.py).
+_REVIEW_RECORD_SUBDIRS = frozenset({"autonomous"})
+_SCANNER_RECORD_SUBDIRS = frozenset({"scan", "codeql", "sca"})
+
+# Bound on individually-named refusals per load (a hostile child can
+# plant thousands of records to spam the log; the tail is counted).
+_SUBDIR_REFUSAL_LOG_CAP = 5
+
+# Nested-candidate intake bounds. Path-tier refusal is free (no read),
+# but candidates in TRUSTED subdirs must be READ to shape-check — and
+# scanner homes are child write grants, so both the candidate COUNT
+# and the cumulative BYTES of that read class are child-inflatable
+# (near-budget sparse plants otherwise cost a full artifact read
+# each, on EVERY render/store build/audit load). Legit populations
+# are a handful of KB-scale records per home; the caps only exist so
+# a plant campaign degrades to counted refusals instead of a
+# parent stall.
+_NESTED_CANDIDATE_CAP = 64
+# One run-artifact budget for the whole class (the value
+# RUN_ARTIFACT_MAX_BYTES re-exports below).
+_NESTED_READ_MAX_BYTES = DEFAULT_JSON_MAX_BYTES
+
+
+def _subdir_record_refusal(subdir: str, data: dict[str, Any]) -> str | None:
+    """SHAPE-tier refusal reason for a record loaded from
+    ``run_dir/<subdir>/``, or ``None`` when it may load. Only reached
+    for candidates that survived the PATH tier (trusted subdirs) —
+    the unknown-subdir arm stays as a belt for direct callers."""
+    if subdir in _REVIEW_RECORD_SUBDIRS:
+        return None
+    from .registry import CATEGORY_LLM, DEPTH_ANALYSED, classify
+    review_shaped = (
+        classify(str(data.get("tool") or "")) == (CATEGORY_LLM, DEPTH_ANALYSED)
+        # The legacy nested shape earns covered keys in the audit fold
+        # regardless of the label's grade — review-capable by shape.
+        or isinstance(data.get("files"), dict)
+    )
+    if subdir in _SCANNER_RECORD_SUBDIRS:
+        if review_shaped:
+            return "review-capable record in a scanner subdir"
+        return None
+    return "record outside the trusted-subdir set"
+
+#: Read budget for run-dir JSON artifacts (coverage records, findings,
+#: /understand outputs). Run dirs sit inside the sandbox write grant,
+#: so artifact SIZE is attacker-writable like every other property —
+#: a sparse multi-GiB plant costs no disk and OOM-killed the importer
+#: /render/backfill process the containment boundary keeps alive.
+#: The value is the loader's own capped-by-default budget
+#: (``core.json.DEFAULT_JSON_MAX_BYTES``, 256 MiB — rationale and
+#: both-direction trade-off documented there), re-exported under the
+#: run-artifact name this package's readers and their tests key on;
+#: the shared enforcement is ``load_json(max_bytes=...)`` (stat-gated,
+#: no read on refusal).
+RUN_ARTIFACT_MAX_BYTES = DEFAULT_JSON_MAX_BYTES
+
+#: Cap on how many flow-trace-*.json files one reader globs from a
+#: run dir. Both the per-file SIZE and the file COUNT are run-dir-
+#: writable; an unbounded glob of tiny traces is the same memory
+#: lever as one huge trace. Single-homed here (beside the byte
+#: budget) for BOTH consumers of the glob — the importer's
+#: understand-points walk and the edges module's touched-edge
+#: capture. Deterministic prefix: alphabetical order.
+MAX_FLOW_TRACE_FILES = 512
 READS_MANIFEST = ".reads-manifest"
+
+# Ceiling on how much of the reads manifest a single reader ingests.
+# Legitimate /agentic runs produce manifests under 5 MB even on large
+# monorepos; 64 MB is a generous ceiling. In adversarial cases (the
+# PostToolUse hook fires on every Read, an LLM in a tight loop reads
+# thousands of small files) the manifest can reach hundreds of MB —
+# better a partial coverage record than an OOM.
+_MANIFEST_CAP = 64 * 1024 * 1024
+
+
+def read_manifest_lines(manifest_path: Path) -> set[str]:
+    r"""Read reads-manifest paths under a shared flock with a size cap.
+
+    Single reader for the hook-written ``.reads-manifest`` so every
+    consumer — ``build_from_manifest``, ``build_from_findings``, and
+    the audit report's unrecorded-reads cross-reference — gets the
+    same reader-writer coordination, special-file refusal, and memory
+    ceiling. Public deliberately: a second bespoke parser shipped
+    beside this one with a bare ``.open()`` and reintroduced exactly
+    the FIFO/symlink/unbounded-read attacks documented below.
+
+    Line integrity against in-flight writers (the PostToolUse hook in
+    plugins/coverage/) comes from the writers themselves: both hook
+    writers (the bash ``raptor-hook-json _append`` helper and
+    track_read.py) emit each line as a single lock-free
+    ``O_APPEND`` write, which POSIX keeps un-interleaved. The LOCK_SH
+    taken here is belt-and-braces only — it no longer pairs with a
+    writer-side LOCK_EX (that serialisation was removed) and guards
+    solely against hypothetical non-append writers. fcntl.flock is
+    non-fatal: on platforms without flock (Windows; raptor doesn't
+    really support them but the import is best-effort) we fall back
+    to an unlocked read. On WSL drvfs/9p mounts the LOCK_SH here is
+    additionally client-local (serialises against same-distro writers
+    only) — inert for this reader, whose integrity already rests on
+    the writers' single-write ``O_APPEND`` discipline, not the lock;
+    see docs/wsl.md for the general caveat.
+
+    Use ``rstrip("\r\n")`` not ``strip()`` — the latter also trims
+    leading/trailing spaces, but POSIX permits filenames that
+    legitimately START or END with a space. ``track_read`` already
+    rejects NUL/CR/LF in the path itself, so a manifest line carrying
+    a filename with a trailing space made it in legitimately. Only
+    newline-style line terminators need removing.
+
+    Best-effort: returns an empty set when the manifest is missing or
+    unreadable.
+    """
+    files: set[str] = set()
+    # fd-discipline open (core.source.open_regular): the manifest is
+    # inside the sandbox write grant, so any check-by-name probe
+    # races a swap — the pre-fix lstat→open window ingested a
+    # swapped-in symlink's FOREIGN file into the coverage record, and
+    # a planted FIFO blocked the open forever. O_NOFOLLOW +
+    # O_NONBLOCK + fstat(S_ISREG) on the OPENED fd close both.
+    from core.source import open_regular
+    f = open_regular(manifest_path, "rb")
+    if f is None:
+        if manifest_path.exists():
+            # Existed but refused: FIFO/device/symlink plant (or a
+            # vanish race). Loud — same message class as before.
+            import logging
+            logging.getLogger(__name__).warning(
+                "reads-manifest at %s is not a regular file — ignored",
+                manifest_path)
+        return files
+    try:
+        try:
+            import fcntl as _fcntl
+        except ImportError:
+            _fcntl = None  # type: ignore[assignment]
+        with f:
+            if _fcntl is not None:
+                try:
+                    _fcntl.flock(f, _fcntl.LOCK_SH)
+                except OSError:
+                    pass
+            # Byte-counted (binary read): the previous text-mode loop
+            # counted decoded CHARS against the cap (~4x overshoot on
+            # multi-byte content), and a single over-long line was
+            # materialised whole before the cap fired — the bounded
+            # readline keeps one capped chunk the worst case.
+            budget = _MANIFEST_CAP
+            while True:
+                line = f.readline(budget + 1)
+                if not line:
+                    break
+                budget -= len(line)
+                if budget < 0:
+                    # Cap hit — log and stop. The remaining entries
+                    # don't make it into the coverage record.
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "coverage manifest %s exceeded %d-byte cap; "
+                        "truncating coverage record (read %d files)",
+                        manifest_path, _MANIFEST_CAP, len(files),
+                    )
+                    break
+                text = line.rstrip(b"\r\n").decode("utf-8", "replace")
+                if text:
+                    files.add(text)
+            # The flock releases when the file is closed.
+    except OSError:
+        pass
+    return files
 
 
 def build_from_manifest(run_dir: Path, tool: str,
-                        rules_applied: List[str] = None,
-                        extra_files: List[str] = None) -> Optional[Dict[str, Any]]:
+                        rules_applied: list[str] | None = None,
+                        extra_files: list[str] | None = None) -> dict[str, Any] | None:
     """Build a coverage record from the reads manifest.
 
     The manifest is populated by the PostToolUse hook on Read.
-    Deduplicates and normalises paths relative to the target.
+    Deduplicates the raw manifest lines; path normalisation against the
+    target happens downstream when the record is imported
+    (:mod:`core.coverage.importer`).
 
     Args:
         run_dir: Run output directory containing .reads-manifest.
@@ -35,24 +249,10 @@ def build_from_manifest(run_dir: Path, tool: str,
     run_dir = Path(run_dir)
     manifest = run_dir / READS_MANIFEST
 
-    files = set()
-
-    # Read manifest. Use `rstrip("\r\n")` not `strip()` — the latter
-    # also trims leading/trailing spaces, but POSIX permits filenames
-    # that legitimately START or END with a space. `track_read`
-    # already rejects NUL/CR/LF in the path itself (batch 207), so
-    # a manifest line carrying a filename with a trailing space
-    # made it in legitimately and was then silently mangled by
-    # `strip()` here. Only newline-style line terminators need
-    # removing.
-    if manifest.exists():
-        try:
-            for line in manifest.read_text().splitlines():
-                line = line.rstrip("\r\n")
-                if line:
-                    files.add(line)
-        except OSError:
-            pass
+    # Locked, capped, streaming read — the manifest is appended to by
+    # the PostToolUse hook (LOCK_EX side), so this reader needs the
+    # same LOCK_SH coordination as ``build_from_findings``.
+    files = read_manifest_lines(manifest)
 
     # Add extra files from tool-specific sources
     if extra_files:
@@ -72,46 +272,219 @@ def build_from_manifest(run_dir: Path, tool: str,
     return record
 
 
-def build_from_semgrep(run_dir: Path, semgrep_json_path: Path,
-                       rules_applied: List[str] = None) -> Optional[Dict[str, Any]]:
-    """Build a coverage record from Semgrep JSON output.
+def cleanup_manifest(run_dir: Path) -> bool:
+    """Remove the consumed ``.reads-manifest`` from *run_dir*.
 
-    Reads paths.scanned from Semgrep's JSON output for authoritative
-    file list, and errors for files_failed.
+    Callers that fold the manifest into a coverage record (e.g. the
+    validation helper's ``build_from_findings`` + ``write_record``
+    sequence) delete it afterwards so the run-completion hook's
+    manifest→``coverage-read.json`` conversion doesn't re-count the
+    same reads.  Best-effort: returns True when a manifest was
+    removed, False when none existed or removal failed.
     """
-    data = load_json(semgrep_json_path)
-    if not data or not isinstance(data, dict):
-        return None
-
-    paths = data.get("paths", {})
-    scanned = paths.get("scanned", [])
-    if not scanned:
-        return None
-
-    errors = data.get("errors", [])
-    version = data.get("version", "")
-
-    record = {
-        "tool": "semgrep",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "files_examined": sorted(scanned),
-    }
-    if version:
-        record["version"] = version
-    if rules_applied:
-        record["rules_applied"] = rules_applied
-    if errors:
-        record["files_failed"] = [
-            {"path": e.get("path", ""), "reason": e.get("message", "error")}
-            for e in errors if e.get("path")
-        ]
-
-    return record
+    manifest = Path(run_dir) / READS_MANIFEST
+    try:
+        manifest.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
-def build_from_cocci(spatch_results: List[Any],
-                     spatch_version: Optional[str] = None,
-                     ) -> Optional[Dict[str, Any]]:
+@dataclass
+class SemgrepOutputSummary:
+    """Derived facts only; decoded tool reports are never retained."""
+
+    record: dict[str, Any] | None
+    dropped_files: dict[str, list[str]]
+    skipped_paths: dict[str, int]
+    input_errors: int
+    files_failed: list[dict[str, str]]
+    skipped_rules: int = 0  # incompatible-rule notices across the supplied packs
+    result_locations: frozenset[tuple[str, str, int, int, int, int]] = frozenset()
+    location_rows_rejected: int = 0
+    locations_truncated: bool = False
+
+
+def read_semgrep_outputs(json_paths: list[Path], rules_applied: list[str] | None = None,
+                         *, max_bytes: int | None = None,
+                         location_rule_ids: frozenset[str] = frozenset(),
+                         location_limit: int = 100_000) -> SemgrepOutputSummary:
+    """Read each bounded pack output once and union its actual examined files.
+
+    Language-specific packs need not examine the same files. Errors and skips
+    also belong to individual packs; retain their union without retaining the
+    much larger result arrays. Optional requested-rule location keys are
+    projected during that same decode; rejected rows and key-budget loss are
+    disclosed separately and never erase otherwise valid coverage facts.
+    Duplicate paths are read once, with no cache
+    surviving this call. The shared run-artifact byte ceiling remains the
+    default; callers with a stricter existing ceiling can preserve it.
+    """
+    if max_bytes is None:
+        max_bytes = RUN_ARTIFACT_MAX_BYTES
+    scanned: set[str] = set()
+    failed: dict[tuple[str, str], dict[str, str]] = {}
+    dropped: dict[str, set[str]] = {}
+    skipped: dict[str, set[str]] = {}
+    version = ""
+    input_errors = 0
+    skipped_rules = 0
+    result_locations: set[tuple[str, str, int, int, int, int]] = set()
+    location_rows_rejected = 0
+    locations_truncated = False
+
+    def consume(path: Path) -> None:
+        nonlocal version, input_errors, skipped_rules, location_rows_rejected, locations_truncated
+        data = load_json(path, max_bytes=max_bytes)
+        if not isinstance(data, dict):
+            input_errors += 1
+            return
+        # Optional derived identities only: recovery adapters can deduplicate
+        # while this bounded report is already decoded. Coverage-only callers
+        # retain no result rows or location keys.
+        if location_rule_ids:
+            results = data.get("results", [])
+            if not isinstance(results, list):
+                location_rows_rejected += 1
+                results = []
+            for result in results:
+                if not isinstance(result, dict) or not isinstance(result.get("check_id"), str):
+                    location_rows_rejected += 1
+                    continue
+                rule_id = next((rule for rule in location_rule_ids
+                                if result["check_id"] == rule or result["check_id"].endswith("." + rule)), None)
+                if rule_id is None:
+                    continue
+                file = result.get("path")
+                start, end = result.get("start"), result.get("end")
+                if (not isinstance(file, str) or not file or "\x00" in file
+                        or not isinstance(start, dict) or not isinstance(end, dict)):
+                    location_rows_rejected += 1
+                    continue
+                points = (start.get("line"), start.get("col"), end.get("line"), end.get("col"))
+                if (any(type(point) is not int or point <= 0 for point in points)
+                        or (points[2], points[3]) < (points[0], points[1])):
+                    location_rows_rejected += 1
+                    continue
+                coordinates = cast("tuple[int, int, int, int]", points)
+                location_key = (rule_id, file, *coordinates)
+                if location_key in result_locations or len(result_locations) < max(0, location_limit):
+                    result_locations.add(location_key)
+                else:
+                    locations_truncated = True
+                    location_rows_rejected += 1
+        damaged = False
+        paths = data.get("paths", {})
+        if not isinstance(paths, dict):
+            damaged = True
+            paths = {}
+        examined = paths.get("scanned", [])
+        if not isinstance(examined, list):
+            damaged = True
+            examined = []
+        has_files = False
+        for item in examined:
+            if isinstance(item, str) and item and "\x00" not in item:
+                scanned.add(item)
+                has_files = True
+            else:
+                damaged = True
+        label = reported_version(data.get("version"))
+        if label is None:
+            damaged = True
+        elif has_files and not version:
+            version = label
+        errors = data.get("errors", [])
+        if not isinstance(errors, list):
+            damaged = True
+            errors = []
+        for error in errors:
+            if not isinstance(error, dict):
+                damaged = True
+                continue
+            level = error.get("level", "error")
+            if (not isinstance(level, str) or level.strip().lower() not in
+                    ("debug", "info", "warn", "warning", "error", "fatal")):
+                damaged = True
+            file = error.get("path")
+            if file is not None and (not isinstance(file, str) or "\x00" in file):
+                damaged = True
+            kind = error.get("type")
+            if isinstance(kind, list) and kind:
+                kind = kind[0]
+            if kind == "IncompatibleRule":
+                skipped_rules += 1
+                continue
+            if not isinstance(file, str) or not file or "\x00" in file:
+                continue
+            failure_reason = "error"
+            for key in ("message", "long_msg", "short_msg"):
+                text = error.get(key)
+                if isinstance(text, str) and text:
+                    failure_reason = text[:500]
+                    break
+            failed.setdefault((file, failure_reason), {"path": file, "reason": failure_reason})
+            if isinstance(kind, str) and kind in {
+                "Timeout", "OutOfMemory", "FixpointTimeout", "TimeoutDuringInterfile",
+            }:
+                dropped.setdefault(file, set()).add(kind)
+        exclusions = paths.get("skipped", [])
+        if not isinstance(exclusions, list):
+            damaged = True
+            exclusions = []
+        for exclusion in exclusions:
+            if not isinstance(exclusion, dict):
+                damaged = True
+                continue
+            file = exclusion.get("path")
+            if not isinstance(file, str) or not file or "\x00" in file:
+                damaged = True
+                continue
+            reason = exclusion.get("reason")
+            reason = reason if isinstance(reason, str) and reason else "unspecified"
+            skipped.setdefault(reason, set()).add(file)
+        input_errors += int(damaged)
+
+    for path in dict.fromkeys(Path(path) for path in json_paths):
+        consume(path)
+    failed_rows = list(failed.values())
+    record: dict[str, Any] | None = None
+    if scanned:
+        record = {"tool": "semgrep", "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "files_examined": sorted(scanned)}
+        if version:
+            record["version"] = version
+        if rules_applied:
+            record["rules_applied"] = rules_applied
+        if failed:
+            record["files_failed"] = failed_rows
+    return SemgrepOutputSummary(
+        record, {path: sorted(kinds) for path, kinds in sorted(dropped.items())},
+        {reason: len(files) for reason, files in skipped.items()}, input_errors, failed_rows,
+        skipped_rules=skipped_rules, result_locations=frozenset(result_locations),
+        location_rows_rejected=location_rows_rejected, locations_truncated=locations_truncated,
+    )
+
+
+def build_from_semgrep(_run_dir: Path, semgrep_json_path: Path,
+                       rules_applied: list[str] | None = None,
+                       extra_error_json_paths: list[Path] | None = None,
+                       ) -> dict[str, Any] | None:
+    """Build tool coverage from the union of supplied Semgrep pack outputs.
+
+    The historical ``extra_error_json_paths`` argument now contributes examined
+    files as well as errors: different rule languages can scan different files.
+    Single-output callers retain the existing record shape and byte ceiling.
+    """
+    return read_semgrep_outputs([semgrep_json_path, *(extra_error_json_paths or [])],
+                                rules_applied=rules_applied).record
+
+
+def build_from_cocci(spatch_results: list[Any],
+                     spatch_version: str | None = None,
+                     ) -> dict[str, Any] | None:
     """Build a coverage record from a list of ``SpatchResult``.
 
     Source of truth is the runner's structured output, NOT the
@@ -139,8 +512,8 @@ def build_from_cocci(spatch_results: List[Any],
         return None
 
     files: set = set()
-    rules_applied: List[str] = []
-    failures: List[Dict[str, str]] = []
+    rules_applied: list[str] = []
+    failures: list[dict[str, str]] = []
 
     for r in spatch_results:
         # Defensive attribute access — these are SpatchResult fields
@@ -155,17 +528,16 @@ def build_from_cocci(spatch_results: List[Any],
         # spatch errors → failures with the rule name as ``path``
         # (no per-file binding from spatch errors; the rule itself
         # is what failed).
-        for err in getattr(r, "errors", []) or []:
-            failures.append({
+        failures.extend({
                 "path": rule_name,
                 "reason": str(err)[:500],
-            })
+            } for err in getattr(r, "errors", []) or [])
 
     if not files and not rules_applied:
         # Skipped run with no signal at all — don't write a record.
         return None
 
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "tool": "coccinelle",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "files_examined": sorted(files),
@@ -174,181 +546,203 @@ def build_from_cocci(spatch_results: List[Any],
         record["version"] = spatch_version
     if rules_applied:
         record["rules_applied"] = sorted(set(rules_applied))
+    # Match the sibling builders (semgrep, codeql): drop failures with
+    # an empty path — a SpatchResult with errors but no rule name
+    # would otherwise emit a phantom empty-path files_failed entry.
+    failures = [f for f in failures if f["path"]]
     if failures:
         record["files_failed"] = failures
 
     return record
 
 
-def build_from_codeql(sarif_path: Path) -> Optional[Dict[str, Any]]:
-    """Build a coverage record from CodeQL SARIF output.
+class CodeQLCoverageAccumulator:
+    """Run-local coverage facts; never retain decoded SARIF or result arrays."""
 
-    Extracts: files from artifacts, packs from tool.extensions,
-    rules from tool.driver.rules, failures from invocations.
+    def __init__(self, repo_root: Path | None = None) -> None:
+        self._root = Path(repo_root).resolve() if repo_root is not None else None
+        self._files: set[str] = set()
+        self._packs: set[str] = set()
+        self._rules: set[str] = set()
+        self._failures: dict[tuple[str, str], dict[str, str]] = {}
+        self._versions: set[str] = set()
+
+    def add_report(self, data: Any) -> None:
+        """Consume one already bounded/decoded report, without mutating it."""
+        from urllib.parse import unquote
+        from core.paths import to_repo_relative
+        from core.sarif.parser import ArtifactUriResolver, sarif_uri_path
+
+        files, packs, rules, failures = self._files, self._packs, self._rules, self._failures
+        root = self._root
+        def _rows(container: Any, key: str):
+            value = container.get(key) if isinstance(container, dict) else None
+            if isinstance(value, list):
+                for row in value:
+                    if isinstance(row, dict):
+                        yield row
+
+        def _dict(container: Any, key: str) -> dict[str, Any]:
+            value = container.get(key) if isinstance(container, dict) else None
+            return value if isinstance(value, dict) else {}
+
+        def _str(container: Any, key: str, default: str = "") -> str:
+            value = container.get(key) if isinstance(container, dict) else None
+            return value if isinstance(value, str) else default
+
+        for run in _rows(data, "runs"):
+            resolver = ArtifactUriResolver(run)
+
+            def local_path(artifact: dict[str, Any]) -> str | None:
+                path = sarif_uri_path(resolver.resolve(artifact))
+                if path is None:
+                    return None
+                # Decode exactly once, after checking the original authority.
+                path = unquote(path)
+                if not path or path.startswith(("//", "\\\\")) or any(ord(c) < 32 or ord(c) == 127 for c in path):
+                    return None
+                # An encoded literal file:// prefix is a filename, not a second
+                # URI layer for the filesystem helper to strip.
+                if path.startswith("file://"):
+                    path = "./" + path
+                if root is not None:
+                    relative = to_repo_relative(path, root, outside_root="relative")
+                    # The strict check is now relative and does no repeated
+                    # root resolution or source-file filesystem reads.
+                    return to_repo_relative(relative, root) if relative is not None else None
+                return path
+
+            artifacts = run.get("artifacts")
+            for index in range(len(artifacts) if isinstance(artifacts, list) else 0):
+                file = local_path({"index": index})
+                if file:
+                    files.add(file)
+            tool = _dict(run, "tool")
+            driver = _dict(tool, "driver")
+            version = _str(driver, "version") or _str(driver, "semanticVersion")
+            if version:
+                self._versions.add(version)
+            rules.update(_str(rule, "id") for rule in _rows(driver, "rules"))
+            for extension in _rows(tool, "extensions"):
+                name, ver = _str(extension, "name"), _str(extension, "version")
+                if name:
+                    packs.add(f"{name}@{ver}" if ver else name)
+                rules.update(_str(rule, "id") for rule in _rows(extension, "rules"))
+            for invocation in _rows(run, "invocations"):
+                for channel in ("toolExecutionNotifications", "toolConfigurationNotifications"):
+                    for note in _rows(invocation, channel):
+                        if note.get("level") not in ("error", "warning"):
+                            continue
+                        reason = _str(_dict(note, "message"), "text", "unknown")
+                        for location in _rows(note, "locations"):
+                            artifact = _dict(_dict(location, "physicalLocation"), "artifactLocation")
+                            file = local_path(artifact)
+                            if file:
+                                failures.setdefault((file, reason), {"path": file, "reason": reason})
+
+
+    def build_record(self) -> dict[str, Any] | None:
+        files, packs, rules, failures = self._files, self._packs, self._rules, self._failures
+        if not files:
+            return None
+        record: dict[str, Any] = {
+            "tool": "codeql", "timestamp": datetime.now(timezone.utc).isoformat(),
+            "files_examined": sorted(files),
+        }
+        if len(self._versions) == 1:
+            record["version"] = next(iter(self._versions))
+        elif self._versions:
+            record["versions"] = sorted(self._versions)
+        if packs:
+            record["packs"] = sorted(packs)
+        rules.discard("")
+        if rules:
+            record["rules_applied"] = sorted(rules)
+        if failures:
+            record["files_failed"] = list(failures.values())
+        return record
+
+
+
+def build_from_codeql(sarif_path: Path, *, extra_sarif_paths: list[Path] | None = None,
+                      repo_root: Path | None = None) -> dict[str, Any] | None:
+    """Union metadata from supplied language reports; decode each input once.
+
+    The optional target root confines declared artifact coverage to that tree.
+    Existing single-report callers retain the same record shape and read budget.
     """
-    data = load_json(sarif_path)
-    if not data or not isinstance(data, dict):
-        return None
-
-    files = []
-    packs = []
-    rules = []
-    failures = []
-    version = ""
-
-    for run in data.get("runs", []):
-        # Files extracted
-        for artifact in run.get("artifacts", []):
-            uri = artifact.get("location", {}).get("uri", "")
-            if uri:
-                files.append(uri)
-
-        # Tool info
-        tool = run.get("tool", {})
-        driver = tool.get("driver", {})
-        version = version or driver.get("version", "")
-        rules.extend(r.get("id", "") for r in driver.get("rules", []))
-
-        # Packs
-        for ext in tool.get("extensions", []):
-            name = ext.get("name", "")
-            ver = ext.get("version", "")
-            packs.append(f"{name}@{ver}" if ver else name)
-
-        # Extraction failures
-        for inv in run.get("invocations", []):
-            for notif in inv.get("toolExecutionNotifications", []):
-                if notif.get("level") in ("error", "warning"):
-                    loc = notif.get("locations", [{}])[0] if notif.get("locations") else {}
-                    path = loc.get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
-                    failures.append({
-                        "path": path,
-                        "reason": notif.get("message", {}).get("text", "unknown"),
-                    })
-
-    if not files:
-        return None
-
-    record = {
-        "tool": "codeql",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "files_examined": sorted(set(files)),
-    }
-    if version:
-        record["version"] = version
-    if packs:
-        record["packs"] = packs
-    if rules:
-        record["rules_applied"] = sorted(set(rules))
-    if failures:
-        record["files_failed"] = [f for f in failures if f["path"]]
-
-    return record
+    accumulator = CodeQLCoverageAccumulator(repo_root)
+    for path in dict.fromkeys([Path(sarif_path), *(Path(path) for path in extra_sarif_paths or [])]):
+        accumulator.add_report(load_json(path, max_bytes=RUN_ARTIFACT_MAX_BYTES))
+    return accumulator.build_record()
 
 
-def build_from_findings(findings_path: Path, reads_manifest_path: Path = None,
-                        tool: str = "llm") -> Optional[Dict[str, Any]]:
+def build_from_findings(findings_path: Path, reads_manifest_path: Path | None = None,
+                        tool: str = "llm") -> dict[str, Any] | None:
     """Build a coverage record from findings.json + optional reads manifest.
 
     Combines two signals:
     - files_examined: files the LLM opened (from reads manifest)
     - functions_analysed: functions the LLM produced findings/rulings for
     """
-    findings_data = load_json(findings_path)
+    # LLM-written AND sandbox-writable: the importer's read of the
+    # same file is budgeted (_load_findings_file); the builder's
+    # read pays the identical bound.
+    findings_data = load_json(findings_path,
+                              max_bytes=RUN_ARTIFACT_MAX_BYTES)
     if not findings_data or not isinstance(findings_data, dict):
         return None
 
     findings = findings_data.get("findings", [])
+    if not isinstance(findings, list):
+        # findings.json is LLM-written — shape drift (a string / dict
+        # where the list belongs) must degrade like an empty file,
+        # not crash the validation-helper coverage step.
+        return None
 
     # Functions analysed (from findings with rulings)
     functions = []
     finding_files = set()
     for f in findings:
+        if not isinstance(f, dict):
+            continue
         file_path = f.get("file", "")
         func = f.get("function", "")
-        if file_path and func:
+        if isinstance(file_path, str) and isinstance(func, str) \
+                and file_path and func:
             functions.append({"file": file_path, "function": func})
             finding_files.add(file_path)
 
-    # Files examined (from reads manifest).
-    #
-    # Pre-fix `read_text().splitlines()` materialised the entire
-    # manifest into memory in two passes — once as a single
-    # string, then split into a list of lines. For a long-running
-    # /agentic session that read tens of thousands of files, the
-    # manifest can grow to multi-MB; in adversarial cases (a
-    # PostToolUse hook fires on every Read, an LLM in a tight
-    # loop reads thousands of small files), the manifest can
-    # reach hundreds of MB. The double-buffering then took
-    # 2x peak RSS just for the read.
-    #
-    # Cap the read at 64 MB. Legitimate /agentic runs produce
-    # manifests under 5 MB even on large monorepos; 64 MB is a
-    # generous ceiling. Stream line-by-line so the manifest
-    # isn't fully buffered. On read failure (OSError), the cap
-    # is irrelevant — we just skip.
-    _MANIFEST_CAP = 64 * 1024 * 1024
+    # Files examined (from reads manifest) — locked, capped,
+    # streaming read shared with ``build_from_manifest``.
     read_files = set()
-    if reads_manifest_path and reads_manifest_path.exists():
-        try:
-            # Hold a shared flock during the read so an in-flight
-            # writer (the PostToolUse hook in plugins/coverage/) can't
-            # interleave a partial line into our buffered iteration.
-            # Pre-fix the reader iterated line-by-line without any
-            # lock — a writer's append occurring between the kernel
-            # buffer-fill and our newline-split would surface as a
-            # torn final line in the iteration. The hook side already
-            # serialises appends via flock LOCK_EX on the same path;
-            # taking LOCK_SH here completes the reader-writer
-            # coordination. fcntl.flock is non-fatal: on platforms
-            # without flock (Windows; raptor doesn't really support
-            # them but the import is best-effort) we fall back to
-            # unlocked read.
-            try:
-                import fcntl as _fcntl
-            except ImportError:
-                _fcntl = None
-            with open(reads_manifest_path, "r", encoding="utf-8",
-                      errors="replace") as f:
-                if _fcntl is not None:
-                    try:
-                        _fcntl.flock(f, _fcntl.LOCK_SH)
-                    except OSError:
-                        pass
-                bytes_read = 0
-                for line in f:
-                    bytes_read += len(line)
-                    if bytes_read > _MANIFEST_CAP:
-                        # Cap hit — log and stop. The remaining
-                        # entries don't make it into the
-                        # coverage record. Better partial than
-                        # OOM.
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "coverage manifest %s exceeded %d-byte cap; "
-                            "truncating coverage record (read %d files)",
-                            reads_manifest_path, _MANIFEST_CAP, len(read_files),
-                        )
-                        break
-                    line = line.rstrip("\r\n")
-                    if line:
-                        read_files.add(line)
-                # The flock releases when the file is closed.
-        except OSError:
-            pass
+    if reads_manifest_path:
+        read_files = read_manifest_lines(reads_manifest_path)
 
     all_files = sorted(read_files | finding_files)
 
     if not all_files and not functions:
         return None
 
-    record = {
+    record: dict[str, Any] = {
         "tool": tool,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if all_files:
         record["files_examined"] = all_files
     if functions:
+        # NEVER stamped: these rows are derived from findings.json —
+        # LLM-written AND sandbox-writable run-dir content (the
+        # comment at the top of this builder). Stamping would mint
+        # install-key trust onto attacker-writable input, laundering
+        # a planted findings.json row into a verified coverage row
+        # with unconditional, non-staleness-bound gap-fold credit.
+        # Same rule as build_from_annotations: creation is a trusted
+        # act only when the creation INPUT is trusted. These rows
+        # carry no source hash either, so they earn no gap-fold
+        # review credit at all — findings-bearing functions staying
+        # in review view is the correct direction — while the store
+        # lane still counts them as examination extent.
         record["functions_analysed"] = functions
 
     return record
@@ -358,7 +752,7 @@ def build_from_annotations(
     annotations_dir: Path,
     *,
     tool_name: str = "annotations",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Build a coverage record from a tree of annotation .md files.
 
     Every annotated function counts as "examined" for coverage purposes:
@@ -395,10 +789,10 @@ def build_from_annotations(
     from core.annotations import iter_all_annotations
 
     files = set()
-    functions: List[Dict[str, str]] = []
+    functions: list[dict[str, str]] = []
     seen = set()
-    statuses: Dict[str, int] = {}
-    sources: Dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    sources: dict[str, int] = {}
     for ann in iter_all_annotations(annotations_dir):
         if ann.file:
             files.add(ann.file)
@@ -406,7 +800,7 @@ def build_from_annotations(
         if key in seen:
             continue
         seen.add(key)
-        entry: Dict[str, str] = {"file": ann.file, "function": ann.function}
+        entry: dict[str, str] = {"file": ann.file, "function": ann.function}
         # Include verdict + source-line hash inline when the
         # annotation metadata carries them. /audit's status enum
         # (clean / suspicious / finding / error) flows straight
@@ -424,6 +818,15 @@ def build_from_annotations(
             sources[src] = sources.get(src, 0) + 1
     if not files and not functions:
         return None
+    # Annotation projections are NEVER stamped. The .md substrate is
+    # human-editable plaintext in a target-writable directory, and its
+    # provenance metadata is forgeable — a builder stamp here would
+    # launder a planted annotation into a verified coverage row. Rows
+    # carry the annotation's ``hash`` (the canonical span digest), so
+    # the gap fold grants review credit only behind positive source
+    # evidence: exact hash match against the current source. Hashless
+    # notes re-review (over-review, the safe direction); the durable
+    # importer lane still counts them as examination coverage.
     return {
         "tool": tool_name,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -435,8 +838,103 @@ def build_from_annotations(
     }
 
 
-def write_record(run_dir: Path, record: Dict[str, Any],
-                 tool_name: str = None) -> Path:
+def build_from_journal(run_dir: Path,
+                       tool_name: str = "journal") -> dict[str, Any] | None:
+    """Build a coverage record from review-journal.jsonl.
+
+    Replaces ``build_from_annotations`` for runs that emit journal
+    entries instead of annotation .md files (post-migration /agentic).
+
+    Args:
+        run_dir: Run output directory containing review-journal.jsonl.
+        tool_name: ``tool`` field for the resulting record.
+
+    Returns:
+        Coverage record dict, or None when no journal entries exist
+        (edge-contract rows alone count as none — they never
+        participate). A journal whose rows are all screened
+        (dark/error) still yields a record: empty
+        ``functions_analysed`` with the unresolved counts visible in
+        ``journal_statuses``.
+    """
+    from core.coverage import journal_mac
+    from core.coverage.journal import (
+        entry_earns_function_coverage,
+        load_entries,
+    )
+
+    entries = load_entries(run_dir)
+    if not entries:
+        return None
+
+    # The record's tool label is review-grade (llm/ANALYSED — see
+    # core/coverage/registry.py), so a functions_analysed row here is
+    # a durable "this function was reviewed" mark. Latest-per-key
+    # across ALL non-edge rows FIRST, then the shared screening
+    # predicate — the same order as the store's journal import (the
+    # index collapses latest-per-key before its screen), so the two
+    # durable lanes agree: a Reflexion correction — not the seed row —
+    # determines the recorded status, and a later error/dark row
+    # parks the credit until re-review (over-review direction). Edge
+    # rows never participate: they carry the EDGE subject's verdict
+    # under the caller's (file, function) and would mark a
+    # never-reviewed function.
+    best: dict[tuple[str, str], Any] = {}
+    for entry in entries:
+        if entry.edge_callee:
+            continue
+        key = (entry.file, entry.function)
+        existing = best.get(key)
+        if existing is None or entry.ts > existing.ts:
+            best[key] = entry
+
+    functions: list[dict[str, str]] = []
+    statuses: dict[str, int] = {}
+    for (file, function), entry in best.items():
+        if entry.verdict:
+            # Screened rows stay counted here (observability: the
+            # record still says "this journal carried N unresolved
+            # rows") — they just never become coverage rows.
+            statuses[entry.verdict] = statuses.get(entry.verdict, 0) + 1
+        if not entry_earns_function_coverage(entry):
+            continue
+        func_entry: dict[str, str] = {"file": file, "function": function}
+        if entry.verdict:
+            func_entry["status"] = entry.verdict
+        if entry.source_hash:
+            func_entry["hash"] = entry.source_hash
+        # The coverage row is a PROJECTION of the journal row, so it
+        # inherits — never upgrades — the journal row's provenance
+        # tier: only a MAC-verified journal entry earns a stamped
+        # coverage row. Unstamped/tampered journal rows (planted
+        # lines, pre-MAC legacy) flow through UNSTAMPED carrying
+        # their source hash, and the gap fold's exact-hash gate
+        # decides — stamping them here would launder a forged
+        # journal line into verified review credit.
+        if journal_mac.entry_provenance(entry) == journal_mac.ROW_VERIFIED:
+            token = journal_mac.mint_coverage_row(func_entry, tool_name)
+            if token:
+                func_entry[journal_mac.TOKEN_KEY] = token
+        functions.append(func_entry)
+
+    if not functions and not statuses:
+        return None
+    # Deliberately NO files_examined: the record's tool label is
+    # review-grade (llm/analysed — see core/coverage/registry.py), and
+    # the importer marks files_examined WHOLE-FILE under the record's
+    # tool. A journal entry reviews one function, not its whole file;
+    # emitting the file list here inflated every containing file to
+    # reviewed. functions_analysed carries the exact spans.
+    return {
+        "tool": tool_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "functions_analysed": functions,
+        "journal_statuses": statuses,
+    }
+
+
+def write_record(run_dir: Path, record: dict[str, Any],
+                 tool_name: str | None = None) -> Path:
     """Write a coverage record to the run directory.
 
     Args:
@@ -445,17 +943,20 @@ def write_record(run_dir: Path, record: Dict[str, Any],
         tool_name: If provided, writes coverage-<tool_name>.json.
                    Otherwise writes the legacy coverage-record.json.
     """
-    if tool_name:
-        filename = f"coverage-{tool_name}.json"
-    else:
-        filename = COVERAGE_RECORD_FILE
+    filename = f"coverage-{tool_name}.json" if tool_name else COVERAGE_RECORD_FILE
     path = Path(run_dir) / filename
     save_json(path, record)
     return path
 
 
-def load_records(run_dir: Path) -> List[Dict[str, Any]]:
+def load_records(run_dir: Path) -> list[dict[str, Any] | list[Any]]:
     """Load all coverage records from a run directory.
+
+    Per-tool entries are record OBJECTS; the legacy fallback may
+    contribute one LIST element (the historical list-of-records
+    shape — core.audit.loaders.load_coverage_records splices it
+    flat, and the coverage importer's per-record boundary contains
+    it), so the element type is genuinely ``dict | list``.
 
     The per-tool glob `coverage-*.json` overlaps the legacy
     single-file name `coverage-record.json` (`record` matches
@@ -472,29 +973,108 @@ def load_records(run_dir: Path) -> List[Dict[str, Any]]:
     path.
     """
     run_dir = Path(run_dir)
-    records = []
-    # Per-tool files (must be dicts with a "tool" key)
-    for p in sorted(run_dir.glob("coverage-*.json")):
+    records: list[dict[str, Any] | list[Any]] = []
+    seen_tools = set()
+    # Per-tool files at the run-dir top level AND in immediate tool subdirs.
+    # Producers write coverage records into their own subdir (agentic's scanner
+    # -> scan/, codeql -> codeql/), while a standalone /scan writes them at the
+    # top level. Subdir candidates pay the trust policy above (several
+    # subdirs are child sandbox write grants — a forged review-grade
+    # record there minted review credit in every consumer). Top level is
+    # listed first so it wins the per-tool de-dup if a tool's record is
+    # in both places.
+    top = sorted(run_dir.glob("coverage-*.json"))
+    nested = sorted(run_dir.glob("*/coverage-*.json"))
+    refused: list[str] = []
+    # PATH tier — decided from the path alone, BEFORE any byte is
+    # read: a candidate outside the trusted subdirs refuses on its
+    # parent's name (reading first handed a hostile child a
+    # 256MiB-per-plant read on every render — the refusal needs only
+    # p.parent.name). Survivors are then count-capped: only trusted
+    # (but still child-writable) scanner homes remain, where a plant
+    # campaign could otherwise stack thousands of shape-check reads.
+    trusted = _REVIEW_RECORD_SUBDIRS | _SCANNER_RECORD_SUBDIRS
+    kept_nested: list[Path] = []
+    for p in nested:
+        if p.parent.name not in trusted:
+            refused.append(
+                f"{p.parent.name}/{p.name} "
+                f"(record outside the trusted-subdir set)")
+        else:
+            kept_nested.append(p)
+    if len(kept_nested) > _NESTED_CANDIDATE_CAP:
+        refused.extend(
+            f"{p.parent.name}/{p.name} (nested candidate cap)"
+            for p in kept_nested[_NESTED_CANDIDATE_CAP:])
+        kept_nested = kept_nested[:_NESTED_CANDIDATE_CAP]
+    # Cumulative byte budget for the nested READ class (stat-gated
+    # per candidate, before its read): one artifact budget for the
+    # whole class, the running-budget idiom of the sibling readers.
+    # Refuse-and-continue, not stop: a small legit record after a
+    # near-budget plant still loads.
+    nested_budget = _NESTED_READ_MAX_BYTES
+    for p in top + kept_nested:
         if p.name == COVERAGE_RECORD_FILE:
             continue
-        data = load_json(p)
+        if p.parent != run_dir:
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size > nested_budget:
+                refused.append(
+                    f"{p.parent.name}/{p.name} (nested read budget)")
+                continue
+            nested_budget -= size
+        data = load_json(p, max_bytes=RUN_ARTIFACT_MAX_BYTES)
         if isinstance(data, dict) and "tool" in data:
+            tool = data.get("tool")
+            if not isinstance(tool, str):
+                # Records are run-dir JSON; a non-string tool label is
+                # unusable by every consumer (registry lookup, tool-key
+                # dicts, sorted views) and an unhashable one crashed
+                # the de-dup below. Skip the record, keep the rest.
+                continue
+            if p.parent != run_dir:
+                # SHAPE tier — needs the parsed record (trusted
+                # scanner homes may not carry review-capable shapes).
+                reason = _subdir_record_refusal(p.parent.name, data)
+                if reason is not None:
+                    refused.append(f"{p.parent.name}/{p.name} ({reason})")
+                    continue
+            if tool in seen_tools:
+                continue
+            seen_tools.add(tool)
             records.append(data)
-    # Legacy single file (if no per-tool files found)
+    if refused:
+        # Refused names are child-chosen bytes — escape before logging.
+        import logging
+
+        from core.security.log_sanitisation import escape_nonprintable
+        shown = [escape_nonprintable(r)[:300]
+                 for r in refused[:_SUBDIR_REFUSAL_LOG_CAP]]
+        extra = len(refused) - len(shown)
+        logging.getLogger(__name__).warning(
+            "coverage load: refused %d subdir record(s) in %s: %s%s — "
+            "review-capable coverage loads from the run-dir top level "
+            "or a trusted producer subdir only (see the subdir trust "
+            "policy in core/coverage/record.py)",
+            len(refused), run_dir, "; ".join(shown),
+            f"; +{extra} more" if extra > 0 else "")
+    # Legacy single file (if no per-tool files found). Historical
+    # shapes are a record OBJECT or a LIST of records (downstream,
+    # core.audit.loaders.load_coverage_records splices the list flat)
+    # — any other JSON shape is refused rather than handed to
+    # consumers that expect a mapping.
     if not records:
-        legacy = load_json(run_dir / COVERAGE_RECORD_FILE)
-        if legacy:
+        legacy = load_json(run_dir / COVERAGE_RECORD_FILE,
+                           max_bytes=RUN_ARTIFACT_MAX_BYTES)
+        if legacy and isinstance(legacy, (dict, list)):
             records.append(legacy)
     return records
 
 
-def load_record(run_dir: Path) -> Optional[Dict[str, Any]]:
+def load_record(run_dir: Path) -> dict[str, Any] | None:
     """Load a coverage record from a run directory. Legacy single-file API."""
-    return load_json(Path(run_dir) / COVERAGE_RECORD_FILE)
-
-
-def cleanup_manifest(run_dir: Path) -> None:
-    """Remove the reads manifest after converting to a coverage record."""
-    manifest = Path(run_dir) / READS_MANIFEST
-    if manifest.exists():
-        manifest.unlink(missing_ok=True)
+    return load_json(Path(run_dir) / COVERAGE_RECORD_FILE,
+                     max_bytes=RUN_ARTIFACT_MAX_BYTES)

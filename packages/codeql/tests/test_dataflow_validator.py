@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 # packages/codeql/tests/ -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from packages.codeql.dataflow_validator import _infer_bv_profile
 
@@ -114,18 +115,18 @@ class TestInferBVProfileInvalidHints:
 # ---------------------------------------------------------------------
 
 
-from pathlib import Path as _Path
-from unittest.mock import MagicMock
+from pathlib import Path as _Path  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
 
-from core.dataflow.sanitizer_evidence import (
+from core.dataflow.sanitizer_evidence import (  # noqa: E402
     PROVENANCE_LLM,
     SEMANTICS_SQL_ESCAPE,
     CandidateValidator,
     SanitizerEvidence,
     StepAnnotation,
 )
-from core.security.prompt_envelope import UntrustedBlock
-from packages.codeql.dataflow_validator import (
+from core.security.prompt_envelope import UntrustedBlock  # noqa: E402
+from packages.codeql.dataflow_validator import (  # noqa: E402
     DataflowPath,
     DataflowStep,
     SANITIZER_EVIDENCE_INSTRUCTIONS,
@@ -173,7 +174,7 @@ class TestBuildSanitizerEvidenceBlock:
 
     def test_no_collector_returns_none(self):
         result = _build_sanitizer_evidence_block(
-            None, _dp(), _Path("/tmp"), MagicMock()
+            None, _dp(), _Path("."), MagicMock()
         )
         assert result is None
 
@@ -182,7 +183,7 @@ class TestBuildSanitizerEvidenceBlock:
             return None
 
         result = _build_sanitizer_evidence_block(
-            _collector, _dp(), _Path("/tmp"), MagicMock()
+            _collector, _dp(), _Path("."), MagicMock()
         )
         assert result is None
 
@@ -191,7 +192,7 @@ class TestBuildSanitizerEvidenceBlock:
             return _evidence_with_one_candidate()
 
         result = _build_sanitizer_evidence_block(
-            _collector, _dp(), _Path("/tmp"), MagicMock()
+            _collector, _dp(), _Path("."), MagicMock()
         )
         assert isinstance(result, UntrustedBlock)
         assert result.kind == "sanitizer-evidence"
@@ -205,7 +206,7 @@ class TestBuildSanitizerEvidenceBlock:
 
         log = MagicMock()
         result = _build_sanitizer_evidence_block(
-            _collector, _dp(), _Path("/tmp"), log
+            _collector, _dp(), _Path("."), log
         )
         assert result is None
         assert log.warning.called
@@ -257,3 +258,712 @@ class TestSanitizerEvidenceInstructions:
         """The inlined_helpers field is the honest 'we didn't follow
         these' caveat. The LLM must know to weigh that gap."""
         assert "inlined helpers" in SANITIZER_EVIDENCE_INSTRUCTIONS.lower()
+
+
+class TestLlmFailureIsErrorState:
+    """An LLM/transport failure during validation must surface as an
+    explicit error state, never as a silent not-exploitable verdict."""
+
+    def _validator_with_failing_llm(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import packages.codeql.dataflow_validator as dv
+
+        llm = MagicMock()
+        llm.generate_structured.side_effect = RuntimeError("transport down")
+        validator = dv.DataflowValidator(llm)
+
+        monkeypatch.setattr(
+            validator, "_extract_path_conditions",
+            lambda dataflow, repo: ([], {}),
+        )
+        smt = MagicMock(
+            feasible=None, smt_available=False, reasoning="",
+            model=None, unsatisfied=[],
+        )
+        monkeypatch.setattr(
+            dv, "check_path_feasibility",
+            lambda conditions, profile=None, **kwargs: smt,
+        )
+        monkeypatch.setattr(
+            dv, "check_path_feasibility_dual",
+            lambda conditions, profile=None, **kwargs: smt,
+        )
+        monkeypatch.setattr(
+            validator, "_cheap_dataflow_fp_check", lambda dataflow: None,
+        )
+        monkeypatch.setattr(
+            validator, "_fast_tier_model_name", lambda: "fast-tier",
+        )
+        import core.llm.scorecard as sc
+        monkeypatch.setattr(
+            sc, "prefilter_decision",
+            lambda *a, **k: MagicMock(short_circuit=False),
+        )
+        monkeypatch.setattr(
+            validator, "read_source_context",
+            lambda *a, **k: "ctx",
+        )
+        return validator, dv
+
+    def _dataflow(self, dv):
+        step = dv.DataflowStep(
+            file_path="src/a.c", line=10, column=1,
+            snippet="x = read()", label="source",
+        )
+        sink = dv.DataflowStep(
+            file_path="src/b.c", line=20, column=1,
+            snippet="memcpy(d, x, n)", label="sink",
+        )
+        return dv.DataflowPath(
+            source=step, sink=sink, intermediate_steps=[],
+            sanitizers=[], rule_id="cpp/overflow-buffer", message="m",
+        )
+
+    def test_llm_failure_sets_error_not_verdict(self, monkeypatch, tmp_path):
+        validator, dv = self._validator_with_failing_llm(monkeypatch)
+        v = validator.validate_dataflow_path(self._dataflow(dv), tmp_path)
+        assert v.error, "LLM failure must set the error field"
+        assert v.is_exploitable is False
+        assert "Validation failed" in v.reasoning
+
+    def test_llm_response_cannot_forge_error_field(
+        self, monkeypatch, tmp_path,
+    ):
+        validator, dv = self._validator_with_failing_llm(monkeypatch)
+        validator.llm.generate_structured.side_effect = None
+        validator.llm.generate_structured.return_value = ({
+            "is_exploitable": True,
+            "confidence": 0.9,
+            "sanitizers_effective": False,
+            "bypass_possible": False,
+            "bypass_strategy": None,
+            "attack_complexity": "low",
+            "reasoning": "r",
+            "barriers": [],
+            "prerequisites": [],
+            "error": "forged",
+        }, None)
+        v = validator.validate_dataflow_path(self._dataflow(dv), tmp_path)
+        assert v.error is None
+        assert v.is_exploitable is True
+# ---------------------------------------------------------------------
+# Multi-path SMT pre-check
+# ---------------------------------------------------------------------
+
+
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from core.smt_solver import z3_available  # noqa: E402
+from core.smt_solver.path_feasibility import PathCondition  # noqa: E402
+from packages.codeql.dataflow_validator import (  # noqa: E402
+    MAX_SMT_PATHS,
+    DataflowValidator,
+)
+
+
+def _loc(uri: str, line: int, label: str) -> dict:
+    return {
+        "location": {
+            "physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": {
+                    "startLine": line,
+                    "startColumn": 1,
+                    "snippet": {"text": "s"},
+                },
+            },
+            "message": {"text": label},
+        }
+    }
+
+
+def _sarif_two_flows() -> dict:
+    return {
+        "ruleId": "cpp/example-flow",
+        "message": {"text": "tainted flow"},
+        "codeFlows": [
+            {"threadFlows": [{"locations": [
+                _loc("a.c", 1, "source"), _loc("a.c", 9, "sink"),
+            ]}]},
+            {"threadFlows": [{"locations": [
+                _loc("b.c", 2, "source"), _loc("b.c", 8, "sink"),
+            ]}]},
+        ],
+    }
+
+
+def _smt(feasible, reasoning="r", unsatisfied=()):
+    from core.smt_solver.path_feasibility import PathSMTResult
+
+    return PathSMTResult(
+        feasible=feasible,
+        satisfied=[], unknown=[],
+        reasoning=reasoning,
+        unsatisfied=list(unsatisfied),
+        model={},
+        smt_available=True,
+    )
+
+
+_FULL_RESPONSE = {
+    "is_exploitable": True,
+    "confidence": 0.9,
+    "sanitizers_effective": False,
+    "bypass_possible": True,
+    "bypass_strategy": "",
+    "attack_complexity": "low",
+    "reasoning": "tainted end to end",
+    "barriers": [],
+    "prerequisites": [],
+}
+
+
+def _validator() -> DataflowValidator:
+    llm = MagicMock()
+    llm.scorecard = None
+    llm.generate_structured.return_value = (dict(_FULL_RESPONSE), "raw")
+    v = DataflowValidator(llm_client=llm)
+    v.read_source_context = MagicMock(return_value="ctx")
+    v._extract_path_conditions = MagicMock(return_value=([], {}))
+    v._cheap_dataflow_fp_check = MagicMock(return_value=None)
+    v._fast_tier_model_name = MagicMock(return_value="stub-fast")
+    return v
+
+
+class TestExtractAlternativePaths:
+    def test_primary_carries_alternatives(self):
+        v = _validator()
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        assert dp is not None
+        assert dp.source.file_path == "a.c"
+        assert len(dp.alternatives) == 1
+        assert dp.alternatives[0].source.file_path == "b.c"
+        assert dp.alternatives[0].alternatives == []
+
+    def test_single_flow_has_no_alternatives(self):
+        v = _validator()
+        sarif = _sarif_two_flows()
+        sarif["codeFlows"] = sarif["codeFlows"][:1]
+        dp = v.extract_dataflow_from_sarif(sarif)
+        assert dp is not None
+        assert dp.alternatives == []
+
+    def test_unusable_first_flow_falls_through_to_next(self):
+        v = _validator()
+        sarif = _sarif_two_flows()
+        sarif["codeFlows"][0]["threadFlows"][0]["locations"] = [
+            _loc("a.c", 1, "lonely"),
+        ]
+        dp = v.extract_dataflow_from_sarif(sarif)
+        assert dp is not None
+        assert dp.source.file_path == "b.c"
+        assert dp.alternatives == []
+
+
+class TestMultiPathSMT:
+    def _validate(self, v, smt_side_effects):
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        with patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
+            side_effect=smt_side_effects,
+        ), patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            return v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+
+    def test_unbound_unsat_cannot_discard_primary_path(self):
+        v = _validator()
+        result = self._validate(v, [
+            _smt(False, "contradiction", ["x > 1", "x < 0"]),
+            _smt(True, "sat"),
+        ])
+        assert result.is_exploitable is True
+        assert result.smt_path_index == 0
+        assert result.smt_paths_checked == 1
+        assert v._extract_path_conditions.call_count == 1
+        assert result.smt_diagnostics["modeled_feasible"] is False
+        assert result.smt_diagnostics["conflicts"] == ["x > 1", "x < 0"]
+
+    def test_model_contradiction_cannot_skip_source_review(self):
+        v = _validator()
+        result = self._validate(v, [
+            _smt(False, "c1", ["a == 1", "a == 2"]),
+            _smt(False, "c2", ["b != b"]),
+        ])
+        assert result.is_exploitable is True
+        assert result.reasoning == _FULL_RESPONSE["reasoning"]
+        assert result.barriers == []
+        assert v.llm.generate_structured.call_count == 1
+        assert result.smt_diagnostics["oracle_scope"] == "llm-extracted-predicates"
+
+    def test_first_sat_checks_only_one_path(self):
+        v = _validator()
+        result = self._validate(v, [_smt(True, "sat")])
+        assert result.smt_path_index == 0
+        assert result.smt_paths_checked == 1
+        assert v._extract_path_conditions.call_count == 1
+
+    def test_single_path_unsat_is_diagnostic(self):
+        v = _validator()
+        result = self._validate_with_alternatives(v, 0, _smt(False, "contradiction", ["x > 1", "x < 0"]))
+        assert result.is_exploitable is True
+        assert result.barriers == []
+        assert result.smt_diagnostics["conflicts"] == ["x > 1", "x < 0"]
+        assert result.smt_paths_checked == 1
+        assert v.llm.generate_structured.call_count == 1
+
+    def _validate_with_alternatives(self, v, n_alternatives, smt_result):
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        extra = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        dp.alternatives = [extra] * n_alternatives
+        with patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
+            return_value=smt_result,
+        ), patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            return v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+
+    @pytest.mark.parametrize("n_alternatives", [MAX_SMT_PATHS - 1, MAX_SMT_PATHS + 1])
+    def test_unverified_models_do_not_buy_more_path_extraction(self, n_alternatives):
+        v = _validator()
+        result = self._validate_with_alternatives(v, n_alternatives, _smt(False, "c", ["u"]))
+        assert result.is_exploitable is True
+        assert v.llm.generate_structured.call_count == 1
+        assert v._extract_path_conditions.call_count == 1
+        assert result.smt_paths_checked == 1
+        assert result.smt_path_index == 0
+
+
+
+class TestSignednessProfileSelection:
+    """Choose an explicit modeling profile without granting source authority.
+
+    Guessed signedness uses the dual checker; an explicit hint selects one
+    profile. Neither choice establishes actual source types or conversions.
+    """
+
+    def _run(self, v):
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        with patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility",
+            return_value=_smt(True, "sat"),
+        ) as single, patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
+            return_value=_smt(True, "sat"),
+        ) as dual, patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+        return single, dual
+
+    def test_unpinned_signedness_uses_dual_checker(self):
+        v = _validator()  # hint {} — signedness not pinned
+        single, dual = self._run(v)
+        assert dual.call_count == 1
+        assert single.call_count == 0
+
+    def test_pinned_signedness_uses_single_profile(self):
+        v = _validator()
+        v._extract_path_conditions = MagicMock(
+            return_value=([], {"width": 64, "signed": True}),
+        )
+        single, dual = self._run(v)
+        assert single.call_count == 1
+        assert dual.call_count == 0
+        assert single.call_args.kwargs["profile"].signed is True
+
+    def test_non_bool_signed_hint_counts_as_unpinned(self):
+        v = _validator()
+        v._extract_path_conditions = MagicMock(
+            return_value=([], {"signed": "yes"}),
+        )
+        single, dual = self._run(v)
+        assert dual.call_count == 1
+        assert single.call_count == 0
+
+    @pytest.mark.skipif(
+        not z3_available(), reason="z3-solver not installed",
+    )
+    def test_signed_error_guard_does_not_refute_end_to_end(self):
+        # The empirical repro: `ret < 0` is unsat under the default
+        # unsigned profile; pre-fix a single such guard refuted the
+        # whole finding pre-LLM. With the dual checker the finding
+        # proceeds to full analysis.
+        v = _validator()
+        v._extract_path_conditions = MagicMock(
+            return_value=([PathCondition("ret < 0", step_index=0)], {}),
+        )
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        with patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            result = v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+        assert result.is_exploitable is True  # full LLM analysis ran
+        assert v.llm.generate_structured.call_count == 1
+
+
+class TestWitnessSteering:
+    def test_steering_target_picks_last_condition_identifier(self):
+        from packages.codeql.dataflow_validator import _steering_target
+        conds = [
+            PathCondition("size > 0", step_index=0),
+            PathCondition("Count * 16 < limit", step_index=1),
+        ]
+        assert _steering_target(conds) == "Count"
+
+    def test_steering_target_skips_null_and_literals(self):
+        from packages.codeql.dataflow_validator import _steering_target
+        assert _steering_target(
+            [PathCondition("NULL != 0x10", step_index=0)]
+        ) is None
+        assert _steering_target([]) is None
+
+    def test_steering_target_never_yields_hex_fragments(self):
+        # The regex alone guarantees this (leading letter/underscore
+        # + digit lookbehind) — pinned so the guarantee survives a
+        # future regex change.
+        from packages.codeql.dataflow_validator import _steering_target
+        conds = [PathCondition("0xdead < buffer_len", step_index=0)]
+        assert _steering_target(conds) == "buffer_len"
+
+    def _capture_prefer(self, rule_id, conditions):
+        v = _validator()
+        v._extract_path_conditions = MagicMock(return_value=(conditions, {}))
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        dp.rule_id = rule_id
+        with patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
+            return_value=_smt(True, "sat"),
+        ) as smt_mock, patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+        return smt_mock.call_args.kwargs.get("prefer_witness")
+
+    def test_overflow_rule_steers_to_max(self):
+        prefer = self._capture_prefer(
+            "cpp/integer-overflow",
+            [PathCondition("count * size < cap", step_index=0)],
+        )
+        assert prefer == ("count", "max")
+
+    def test_non_overflow_rule_does_not_steer(self):
+        prefer = self._capture_prefer(
+            "cpp/buffer-overflow",
+            [PathCondition("count * size < cap", step_index=0)],
+        )
+        assert prefer is None
+
+    def test_unidentifiable_target_skips_steering(self):
+        prefer = self._capture_prefer("cpp/integer-overflow", [])
+        assert prefer is None
+
+
+class TestReadSourceContext:
+    def _v(self) -> DataflowValidator:
+        llm = MagicMock()
+        llm.scorecard = None
+        return DataflowValidator(llm_client=llm)
+
+    def test_reads_marked_window(self, tmp_path):
+        f = tmp_path / "a.c"
+        f.write_text(
+            "\n".join(f"line{i}" for i in range(1, 30)) + "\n",
+            encoding="utf-8",
+        )
+        out = self._v().read_source_context(
+            str(f), 10, context_lines=2, repo_root=tmp_path)
+        assert ">>>" in out and "line10" in out
+        assert "line20" not in out
+
+    def test_out_of_root_refused(self, tmp_path):
+        outside = tmp_path / "outside.c"
+        outside.write_text("secret\n", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        out = self._v().read_source_context(
+            str(outside), 1, repo_root=repo)
+        assert out == ""
+
+
+class TestSourceContextLineModel:
+    r"""read_source_context speaks CodeQL's \n line model.
+
+    The line number comes from CodeQL SARIF (\n-counted); a
+    splitlines() view put the >>> marker and the whole context window
+    on the wrong lines after any in-literal form feed.
+    """
+
+    def _validator(self):
+        from unittest.mock import MagicMock
+
+        return DataflowValidator(MagicMock())
+
+    def test_marker_lands_on_the_reported_line(self, tmp_path):
+        src = tmp_path / "vuln.c"
+        src.write_bytes(
+            'const char *P = "a\x0c\x0cb";\n'
+            "void safe(void) {}\n"
+            "void handle(char *d, const char *s) {\n"
+            "    strcpy(d, s);\n"
+            "}\n".encode()
+        )
+        out = self._validator().read_source_context(
+            str(src), 4, context_lines=1, repo_root=tmp_path,
+        )
+        marked = [ln for ln in out.split("\n") if ln.startswith(">>>")]
+        assert len(marked) == 1
+        assert "strcpy(d, s);" in marked[0]
+
+    def test_clean_twin_content_unchanged(self, tmp_path):
+        src = tmp_path / "vuln.c"
+        src.write_text("int a;\nint b;\nint c;\n")
+        out = self._validator().read_source_context(
+            str(src), 2, context_lines=1, repo_root=tmp_path,
+        )
+        assert ">>>    2: int b;" in out
+
+
+@pytest.mark.skipif(not z3_available(), reason="z3-solver not installed")
+@pytest.mark.parametrize("hint", [{}, {"width": 32, "signed": True}], ids=["guessed", "pinned"])
+def test_unmodeled_scalar_mutation_cannot_short_circuit_dataflow_analysis(tmp_path, hint):
+    validator = _validator()
+    conditions = [PathCondition(text, n) for n, text in enumerate(
+        ["Value == 1", "Value = 2", "Value == 2"])]
+    validator._extract_path_conditions = MagicMock(return_value=(conditions, hint))
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    # The SMT solver is real; only incidental prescreen and paid analysis are
+    # replaced. A false refutation here would bypass the supplied analysis.
+    with patch.object(validator, "_injection_prescreen", return_value=None), patch(
+        "core.llm.scorecard.prefilter_decision",
+        return_value=SimpleNamespace(short_circuit=False),
+    ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+        "packages.codeql.dataflow_validator.load_methodology", return_value="",
+    ):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert validator.llm.generate_structured.call_count == 1
+    assert validator._extract_path_conditions.call_count == 1
+
+
+@pytest.mark.parametrize(('text', 'expected'), [
+    ('strlen("Count") < Limit', 'Limit'),
+    ('probe(Count) == probe(Count)', None),
+    ('NULL < Null', 'Null'),
+    ('not > 0', 'not'),
+    ('0x10 < Count', 'Count'),
+    ('Count is at least 1', 'Count'),
+])
+def test_steering_target_matches_plain_source_identity(text, expected):
+    from packages.codeql.dataflow_validator import _steering_target
+
+    assert _steering_target([PathCondition(text, 0)]) == expected
+
+
+@pytest.mark.skipif(not z3_available(), reason="Z3 unavailable")
+def test_codeql_steering_reaches_real_case_sensitive_solver(tmp_path):
+    from core.smt_solver.path_feasibility import check_path_feasibility
+
+    v = _validator()
+    conditions = [PathCondition('count == 2', 0), PathCondition('Count <= 9', 1)]
+    v._extract_path_conditions = MagicMock(return_value=(conditions, {'width': 8, 'signed': False}))
+    dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+    dp.rule_id = 'cpp/integer-overflow'
+    solved = []
+
+    def solve(*args, **kwargs):
+        result = check_path_feasibility(*args, **kwargs)
+        solved.append(result)
+        return result
+
+    with patch('packages.codeql.dataflow_validator.check_path_feasibility', side_effect=solve), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ), patch.object(v, '_injection_prescreen', return_value=None):
+        result = v.validate_dataflow_path(dp, tmp_path)
+    assert result.is_exploitable is True
+    assert solved[0].feasible is True
+    assert solved[0].model == {'count': 2, 'Count': 9}
+    assert v.llm.generate_structured.call_count == 1
+
+
+@pytest.mark.skipif(not z3_available(), reason='Z3 unavailable')
+@pytest.mark.parametrize('hint', [{}, {'width': 32, 'signed': True}], ids=['guessed', 'pinned'])
+def test_opaque_call_occurrences_do_not_short_circuit_analysis(tmp_path, hint):
+    validator = _validator()
+    conditions = [PathCondition('next_value() == 0', 0), PathCondition('next_value() == 1', 1)]
+    validator._extract_path_conditions = MagicMock(return_value=(conditions, hint))
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    with patch.object(validator, '_injection_prescreen', return_value=None), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert validator.llm.generate_structured.call_count == 1
+    assert validator._extract_path_conditions.call_count == 1
+
+
+@pytest.mark.skipif(not z3_available(), reason='Z3 unavailable')
+@pytest.mark.parametrize('hint', [{}, {'width': 32, 'signed': True}, {'width': 32, 'signed': False}],
+                         ids=['guessed', 'signed', 'unsigned'])
+@pytest.mark.parametrize('ordinary_contradiction', [False, True])
+def test_unbound_callee_models_cannot_suppress_findings(tmp_path, hint, ordinary_contradiction):
+    texts = ['Value == 0', 'Value == 1', 'min(0, 4) > 4'] if ordinary_contradiction else ['min(0, 4) > 4']
+    guard = ' && '.join(texts)
+    source = ('int min(int Value, int Other) { return Value + Other + 5; }\n'
+              f'int Read(int Value) {{ if({guard}) return 1; return 0; }}\n')
+    for name in ('a.c', 'b.c'):
+        (tmp_path / name).write_text(source)
+    validator = _validator()
+    validator.read_source_context.return_value = source
+    validator._extract_path_conditions.return_value = ([PathCondition(text, i) for i, text in enumerate(texts)], hint)
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    with patch.object(validator, '_injection_prescreen', return_value=None), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ), patch('core.smt_solver.path_feasibility._summarise_call', side_effect=AssertionError('unbound summary built')):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert validator.llm.generate_structured.call_count == 1
+
+
+@pytest.mark.skipif(not z3_available(), reason='Z3 unavailable')
+@pytest.mark.parametrize('hint', [{}, {'width': 32, 'signed': True}], ids=['guessed', 'pinned'])
+def test_alternative_path_with_unbound_callee_reaches_analysis(tmp_path, hint):
+    validator = _validator()
+    validator._extract_path_conditions.side_effect = [
+        ([PathCondition('Value == 0', 0), PathCondition('Value == 1', 1)], hint),
+        ([PathCondition('min(0, 4) > 4', 0)], hint),
+    ]
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    with patch.object(validator, '_injection_prescreen', return_value=None), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert result.smt_path_index == 0 and result.smt_paths_checked == 1
+    assert validator.llm.generate_structured.call_count == 1
+
+
+@pytest.mark.skipif(not z3_available(), reason='Z3 unavailable')
+@pytest.mark.parametrize('hint', [{}, {'width': 32, 'signed': True}, {'width': 32, 'signed': False}],
+                         ids=['guessed', 'signed', 'unsigned'])
+@pytest.mark.parametrize('ordinary_contradiction', [False, True])
+def test_untyped_wide_call_return_cannot_refute_source_path(tmp_path, hint, ordinary_contradiction):
+    texts = ['Value == 0', 'Value == 1', 'fetch_width() >= 0'] if ordinary_contradiction else [
+        'fetch_width() > 0xffffffff',
+    ]
+    # The wide return satisfies its guard; neither 32-bit signedness does.
+    guard = ' && '.join(texts)
+    source = ('unsigned long long fetch_width(void) { return 0x100000000ULL; }\n'
+              f'int Read(int Value) {{ if({guard}) return 1; return 0; }}\n')
+    for name in ('a.c', 'b.c'):
+        (tmp_path / name).write_text(source)
+    validator = _validator()
+    validator.read_source_context.return_value = source
+    validator._extract_path_conditions.return_value = ([PathCondition(text, i) for i, text in enumerate(texts)], hint)
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    path.rule_id = 'cpp/integer-overflow'
+    with patch.object(validator, '_injection_prescreen', return_value=None), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert validator.llm.generate_structured.call_count == 1
+
+
+@pytest.mark.skipif(not z3_available(), reason='Z3 unavailable')
+@pytest.mark.parametrize('missing_core', [False, True], ids=['call-dependent', 'missing-native-core'])
+def test_untyped_signed_call_is_not_an_unsigned_source_refutation(tmp_path, missing_core):
+    from core.smt_solver import path_feasibility as paths
+
+    validator = _validator()
+    validator._extract_path_conditions.return_value = (
+        [PathCondition('read_signed() < 0', 0)], {'width': 32, 'signed': False},
+    )
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    real = paths._new_solver
+
+    def solver_factory(*args, **kwargs):
+        solver = real(*args, **kwargs)
+        if missing_core:
+            solver.unsat_core = lambda: []
+        return solver
+
+    with patch.object(validator, '_injection_prescreen', return_value=None), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ), patch.object(paths, '_new_solver', side_effect=solver_factory):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert validator.llm.generate_structured.call_count == 1
+
+
+@pytest.mark.parametrize('polarity', ['false', 'true', '', 0, 1, None, [], {}],
+                         ids=['string-false', 'string-true', 'empty-string', 'zero', 'one', 'null', 'list', 'dict'])
+def test_malformed_extraction_polarity_cannot_short_circuit_analysis(tmp_path, polarity):
+    validator = _validator()
+    # Exercise the actual extraction adapter, with a mocked response only.
+    validator._extract_path_conditions = DataflowValidator._extract_path_conditions.__get__(validator)
+    extraction = {
+        'path_width': 32, 'path_signed': False,
+        'path_conditions': [
+            {'condition': 'Value == 0', 'negated': False},
+            {'condition': 'Value == 0', 'negated': polarity},
+        ],
+    }
+    validator.llm.generate_structured.side_effect = [(extraction, 'raw'), (dict(_FULL_RESPONSE), 'raw')]
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    with patch.object(validator, '_injection_prescreen', return_value=None), patch(
+        'core.llm.scorecard.prefilter_decision', return_value=SimpleNamespace(short_circuit=False),
+    ), patch('core.llm.scorecard.record_prefilter_outcome'), patch(
+        'packages.codeql.dataflow_validator.load_methodology', return_value='',
+    ):
+        result = validator.validate_dataflow_path(path, tmp_path)
+    assert result.is_exploitable is True
+    assert validator.llm.generate_structured.call_count == 2
+
+
+@pytest.mark.parametrize('negated', [False, True])
+def test_extraction_preserves_actual_boolean_polarity(tmp_path, negated):
+    validator = _validator()
+    validator.llm.generate_structured.return_value = ({
+        'path_conditions': [{'condition': 'Value == 0', 'negated': negated}],
+        'path_width': 32, 'path_signed': False,
+    }, 'raw')
+    path = validator.extract_dataflow_from_sarif(_sarif_two_flows())
+    conditions, hint = DataflowValidator._extract_path_conditions(validator, path, tmp_path)
+    assert len(conditions) == 1 and conditions[0].negated is negated
+    assert hint == {'width': 32, 'signed': False}

@@ -13,26 +13,38 @@ import unittest
 
 from core.function_taxonomy import (
     ALLOC_FUNCS,
+    DEVICE_CONTROL_FUNCS,
     ENTRY_POINT_HINTS,
     EXEC_FUNCS,
     FORMAT_STRING_FUNCS,
     INTEGER_PARSE_FUNCS,
+    IPC_FUNCS,
+    KERNEL_USERSPACE_FUNCS,
     MACOS_DANGEROUS_SUBSTRINGS,
     MEMORY_COPY_FUNCS,
     NETWORK_INGEST_FUNCS,
     PARSER_FUNCS,
+    PROCESS_BOUNDARY_FUNCS,
+    PROCESS_BOUNDARY_MARKERS,
     SCAN_FAMILY_FUNCS,
+    STREAM_INPUT_FUNCS,
     STRING_OVERFLOW_FUNCS,
     TOCTOU_FUNCS,
+    WIN32_DYNAMIC_LOAD_FUNCS,
+    WIN32_REGISTRY_INGEST_FUNCS,
+    WIN32_SEH_FUNCS,
     fortified,
 )
-
 
 ALL_DANGEROUS_CATEGORIES = [
     STRING_OVERFLOW_FUNCS, SCAN_FAMILY_FUNCS, MEMORY_COPY_FUNCS,
     FORMAT_STRING_FUNCS, EXEC_FUNCS, ALLOC_FUNCS,
     NETWORK_INGEST_FUNCS, PARSER_FUNCS, INTEGER_PARSE_FUNCS,
     TOCTOU_FUNCS,
+    STREAM_INPUT_FUNCS, PROCESS_BOUNDARY_FUNCS, IPC_FUNCS,
+    KERNEL_USERSPACE_FUNCS, DEVICE_CONTROL_FUNCS,
+    WIN32_REGISTRY_INGEST_FUNCS, WIN32_DYNAMIC_LOAD_FUNCS,
+    WIN32_SEH_FUNCS,
 ]
 
 
@@ -91,7 +103,7 @@ class TestSafeVariantsExcluded(unittest.TestCase):
     def test_atof_float_strto_excluded_from_integer_parse(self):
         """Float-parsing CVEs are fundamentally different from integer
         overflow (no map to memory corruption). Float APIs out."""
-        for name in {"atof", "strtod", "strtof", "strtold"}:
+        for name in ("atof", "strtod", "strtof", "strtold"):
             self.assertNotIn(name, INTEGER_PARSE_FUNCS,
                              f"{name!r} is float-parsing, not integer")
 
@@ -141,6 +153,175 @@ class TestKeyParsersPresent(unittest.TestCase):
     def test_lua_python_embedded_scripting_present(self):
         self.assertIn("luaL_loadstring", PARSER_FUNCS)
         self.assertIn("Py_CompileString", PARSER_FUNCS)
+
+
+# === Source-side categories (data-flow classification) ===
+
+class TestStreamInputFuncs(unittest.TestCase):
+    """STREAM_INPUT_FUNCS = bounded line / delimiter / fd-level
+    input that isn't ubiquitous. fgets/getline are the signature
+    parse-attacker-line patterns; pread/readv signal positional or
+    scatter-gather I/O."""
+
+    def test_fgets_and_getline_present(self):
+        self.assertIn("fgets", STREAM_INPUT_FUNCS)
+        self.assertIn("getline", STREAM_INPUT_FUNCS)
+        self.assertIn("getdelim", STREAM_INPUT_FUNCS)
+
+    def test_pread_readv_present(self):
+        self.assertIn("pread", STREAM_INPUT_FUNCS)
+        self.assertIn("readv", STREAM_INPUT_FUNCS)
+
+    def test_ubiquitous_read_fread_excluded(self):
+        """read/fread are ubiquitous per module policy — must not
+        be in STREAM_INPUT_FUNCS (their presence carries zero
+        fuzz-priority signal). Consumers that want them add them
+        explicitly (see exploit_feasibility.constants.
+        BINARY_SAFE_INPUT_FUNCTIONS)."""
+        self.assertNotIn("read", STREAM_INPUT_FUNCS)
+        self.assertNotIn("fread", STREAM_INPUT_FUNCS)
+
+    def test_gets_not_duplicated_here(self):
+        """gets() is banned by C11 Annex K and lives in
+        STRING_OVERFLOW_FUNCS — must not be duplicated here."""
+        self.assertNotIn("gets", STREAM_INPUT_FUNCS)
+        self.assertIn("gets", STRING_OVERFLOW_FUNCS)
+
+
+class TestProcessBoundaryFuncs(unittest.TestCase):
+    """PROCESS_BOUNDARY_FUNCS = direct attacker-controlled env
+    sources. Currently only `getenv`. argv/envp are main()
+    parameters, not function calls, so out of scope (this module
+    is a function-name catalog). secure_getenv and getauxval are
+    NOT here — they're markers (see PROCESS_BOUNDARY_MARKERS)."""
+
+    def test_getenv_present(self):
+        self.assertIn("getenv", PROCESS_BOUNDARY_FUNCS)
+
+    def test_markers_not_in_funcs(self):
+        """secure_getenv returns NULL in suid context (sanitiser,
+        not source); getauxval is kernel-supplied. Both live in
+        PROCESS_BOUNDARY_MARKERS and must NOT contaminate the
+        attacker-source set that downstream consumers treat as
+        taint origins."""
+        self.assertNotIn("secure_getenv", PROCESS_BOUNDARY_FUNCS)
+        self.assertNotIn("getauxval", PROCESS_BOUNDARY_FUNCS)
+
+    def test_setenv_excluded(self):
+        """setenv/putenv are sinks (writing env), not sources of
+        attacker-controlled data."""
+        self.assertNotIn("setenv", PROCESS_BOUNDARY_FUNCS)
+        self.assertNotIn("putenv", PROCESS_BOUNDARY_FUNCS)
+
+
+class TestProcessBoundaryMarkers(unittest.TestCase):
+    """PROCESS_BOUNDARY_MARKERS = suid-context signal functions.
+    Separate from PROCESS_BOUNDARY_FUNCS because their returns are
+    NOT attacker-controlled (NULL in suid, or kernel-supplied),
+    so they're not taint sources. Their presence at a call site
+    weights the suspicion of co-located plain getenv calls."""
+
+    def test_secure_getenv_present(self):
+        self.assertIn("secure_getenv", PROCESS_BOUNDARY_MARKERS)
+
+    def test_getauxval_present(self):
+        self.assertIn("getauxval", PROCESS_BOUNDARY_MARKERS)
+
+
+class TestIpcFuncs(unittest.TestCase):
+    """IPC_FUNCS = inter-process communication source primitives.
+    Several explicit exclusions per the CVE-shape policy — see
+    docstring on the set."""
+
+    def test_sysv_shm_present(self):
+        self.assertIn("shmat", IPC_FUNCS)
+        self.assertIn("shmget", IPC_FUNCS)
+
+    def test_message_queues_present(self):
+        self.assertIn("mq_receive", IPC_FUNCS)
+        self.assertIn("msgrcv", IPC_FUNCS)
+
+    def test_mmap_excluded(self):
+        """mmap usage is dominantly file-backed read-only; the
+        attacker-controlled MAP_SHARED case is not distinguishable
+        from the call site, so the category excludes it per the
+        CVE-shape policy."""
+        self.assertNotIn("mmap", IPC_FUNCS)
+
+    def test_shm_open_excluded(self):
+        """shm_open returns an fd; the actual read goes through
+        mmap (excluded above) or read (ubiquitous). Flagging
+        shm_open alone gives a category with no live read
+        primitive — drop per the CVE-shape policy."""
+        self.assertNotIn("shm_open", IPC_FUNCS)
+
+    def test_pipe_excluded(self):
+        """pipe/mkfifo are setup primitives — the actual attacker
+        data read happens via read() on the resulting fd (which
+        is ubiquitous and excluded everywhere)."""
+        self.assertNotIn("pipe", IPC_FUNCS)
+        self.assertNotIn("mkfifo", IPC_FUNCS)
+
+
+class TestKernelUserspaceFuncs(unittest.TestCase):
+    """KERNEL_USERSPACE_FUNCS = kernel-side functions reading
+    userspace data. These do not appear in user-space binary
+    import tables — value is for source-code analysis of kernel
+    modules / drivers where userspace pointers are the canonical
+    L1 source. Covers bare copies, allocator wrappers, and
+    iovec/pages interfaces."""
+
+    def test_bare_copy_primitives_present(self):
+        self.assertIn("copy_from_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("_copy_from_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("raw_copy_from_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("__copy_from_user_inatomic",
+                      KERNEL_USERSPACE_FUNCS)
+
+    def test_get_user_present(self):
+        self.assertIn("get_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("__get_user", KERNEL_USERSPACE_FUNCS)
+
+    def test_string_variants_present(self):
+        self.assertIn("strncpy_from_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("strnlen_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("strndup_user", KERNEL_USERSPACE_FUNCS)
+
+    def test_allocator_wrappers_present(self):
+        """memdup_user-family is more common at call sites in
+        modern kernel code than bare copy_from_user."""
+        self.assertIn("memdup_user", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("memdup_user_nul", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("vmemdup_user", KERNEL_USERSPACE_FUNCS)
+
+    def test_iovec_pages_interfaces_present(self):
+        """iovec + get_user_pages cover scatter-gather + DMA paths."""
+        self.assertIn("import_iovec", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("import_single_range", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("_copy_from_iter", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("copy_from_iter_full", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("get_user_pages", KERNEL_USERSPACE_FUNCS)
+        self.assertIn("get_user_pages_fast", KERNEL_USERSPACE_FUNCS)
+
+    def test_copy_to_user_excluded(self):
+        """copy_to_user is a sink (kernel writes to user), not a
+        source — must not be in this set."""
+        self.assertNotIn("copy_to_user", KERNEL_USERSPACE_FUNCS)
+        self.assertNotIn("put_user", KERNEL_USERSPACE_FUNCS)
+
+
+class TestDeviceControlFuncs(unittest.TestCase):
+    """DEVICE_CONTROL_FUNCS = ioctl-style driver command entry points.
+
+    These are function-name shaped and therefore live in the shared
+    function taxonomy; source-intel can classify them as L1 context
+    without needing a parallel catalog.
+    """
+
+    def test_ioctl_family_present(self):
+        self.assertIn("ioctl", DEVICE_CONTROL_FUNCS)
+        self.assertIn("unlocked_ioctl", DEVICE_CONTROL_FUNCS)
+        self.assertIn("compat_ioctl", DEVICE_CONTROL_FUNCS)
 
 
 # === Cross-category invariants ===
@@ -193,7 +374,125 @@ class TestCrossCategory(unittest.TestCase):
                 self.assertIsInstance(member, str,
                                       f"non-string member: {member!r}")
                 self.assertGreater(len(member), 0,
-                                   f"empty-string member in category")
+                                   "empty-string member in category")
+
+
+# === Win32 / darwin seed sets ===
+
+class TestWin32Seeds(unittest.TestCase):
+    """The Win32 seed vocabulary: curated additions to the existing
+    categories plus the three new groups — every entry follows the
+    module's CVE-shape and ubiquity rules."""
+
+    def test_shlwapi_and_mbcs_copy_in_overflow(self):
+        for name in ("StrCpyA", "StrCpyW", "StrCatA", "StrCatW",
+                     "_mbscpy", "_mbscat"):
+            self.assertIn(name, STRING_OVERFLOW_FUNCS)
+
+    def test_rtl_copy_forms_in_memory_copy(self):
+        self.assertIn("RtlCopyMemory", MEMORY_COPY_FUNCS)
+        self.assertIn("RtlMoveMemory", MEMORY_COPY_FUNCS)
+
+    def test_winsock_ingest_names(self):
+        for name in ("WSARecv", "WSARecvFrom", "WSAAccept",
+                     "AcceptEx"):
+            self.assertIn(name, NETWORK_INGEST_FUNCS)
+
+    def test_device_control_gains_windows_callers(self):
+        self.assertIn("DeviceIoControl", DEVICE_CONTROL_FUNCS)
+        self.assertIn("NtDeviceIoControlFile", DEVICE_CONTROL_FUNCS)
+
+    def test_registry_group_is_read_primitives_only(self):
+        """Setup calls (open/create) deliberately absent — same
+        rationale as IPC_FUNCS excluding shm_open."""
+        self.assertIn("RegQueryValueExW", WIN32_REGISTRY_INGEST_FUNCS)
+        self.assertIn("RegGetValueA", WIN32_REGISTRY_INGEST_FUNCS)
+        self.assertNotIn("RegOpenKeyExA", WIN32_REGISTRY_INGEST_FUNCS)
+        self.assertNotIn("RegOpenKeyExW", WIN32_REGISTRY_INGEST_FUNCS)
+        self.assertNotIn("RegCreateKeyExW",
+                         WIN32_REGISTRY_INGEST_FUNCS)
+
+    def test_dynamic_load_excludes_getprocaddress(self):
+        """GetProcAddress is a pure lookup and even more ubiquitous
+        than LoadLibrary — the ubiquity rule keeps it out."""
+        self.assertIn("LoadLibraryW", WIN32_DYNAMIC_LOAD_FUNCS)
+        self.assertIn("LoadLibraryExA", WIN32_DYNAMIC_LOAD_FUNCS)
+        self.assertNotIn("GetProcAddress", WIN32_DYNAMIC_LOAD_FUNCS)
+
+    def test_seh_markers_present(self):
+        for name in ("SetUnhandledExceptionFilter", "RtlUnwind",
+                     "_except_handler4", "__C_specific_handler"):
+            self.assertIn(name, WIN32_SEH_FUNCS)
+
+    def test_seh_personality_post_strip_alias(self):
+        """Both spellings of the x64 personality routine are present:
+        the raw export and the once-stripped form a single-underscore
+        symbol normaliser hands consumers."""
+        self.assertIn("_C_specific_handler", WIN32_SEH_FUNCS)
+
+    def test_safe_variants_stay_out(self):
+        """Microsoft `_s` and StringCch* safe variants never join
+        the dangerous sets."""
+        for cat in ALL_DANGEROUS_CATEGORIES:
+            self.assertNotIn("StrCpyNA", cat)      # bounded shlwapi
+            self.assertNotIn("memcpy_s", cat)
+            self.assertNotIn("StringCchPrintfA", cat)
+
+    def test_service_entry_hints(self):
+        self.assertIn("ServiceMain", ENTRY_POINT_HINTS)
+        self.assertIn("wWinMain", ENTRY_POINT_HINTS)
+
+    def test_group_sizes_reasonable(self):
+        self.assertGreaterEqual(len(WIN32_REGISTRY_INGEST_FUNCS), 4)
+        self.assertLess(len(WIN32_REGISTRY_INGEST_FUNCS), 16)
+        self.assertGreaterEqual(len(WIN32_DYNAMIC_LOAD_FUNCS), 2)
+        self.assertLess(len(WIN32_DYNAMIC_LOAD_FUNCS), 10)
+        self.assertGreaterEqual(len(WIN32_SEH_FUNCS), 4)
+        self.assertLess(len(WIN32_SEH_FUNCS), 15)
+
+
+class TestDarwinSeeds(unittest.TestCase):
+    """The darwin IOKit / XPC seed groups (union membership is
+    guarded by TestMacosSubstringGroups below)."""
+
+    def test_iokit_user_client_entries(self):
+        from core.function_taxonomy import MACOS_IOKIT_SUBSTRINGS
+        for name in ("IOConnectCallMethod",
+                     "IOConnectCallStructMethod", "IOServiceOpen"):
+            self.assertIn(name, MACOS_IOKIT_SUBSTRINGS)
+
+    def test_ioconnect_dispatch_family_complete(self):
+        """The IOConnectCall* family is a CLOSED API set, listed
+        exhaustively — exact-name consumers must match the async
+        variants too, not just the sync three."""
+        from core.function_taxonomy import MACOS_IOKIT_SUBSTRINGS
+        expected = {
+            "IOConnectCallMethod",
+            "IOConnectCallScalarMethod",
+            "IOConnectCallStructMethod",
+            "IOConnectCallAsyncMethod",
+            "IOConnectCallAsyncScalarMethod",
+            "IOConnectCallAsyncStructMethod",
+        }
+        family = {name for name in MACOS_IOKIT_SUBSTRINGS
+                  if name.startswith("IOConnectCall")}
+        self.assertEqual(family, expected)
+
+    def test_xpc_ingress_entries(self):
+        from core.function_taxonomy import MACOS_XPC_INGRESS_SUBSTRINGS
+        for name in ("xpc_connection_set_event_handler", "xpc_main",
+                     "xpc_dictionary_get_data"):
+            self.assertIn(name, MACOS_XPC_INGRESS_SUBSTRINGS)
+
+    def test_seed_scale_not_exhaustive(self):
+        """Seed lists stay small and curated (learn-vocab doctrine:
+        project vocabulary comes from study/IRIS, not hardcodes)."""
+        from core.function_taxonomy import (
+            MACOS_IOKIT_SUBSTRINGS,
+            MACOS_XPC_INGRESS_SUBSTRINGS,
+        )
+        self.assertLess(len(MACOS_IOKIT_SUBSTRINGS), 15)
+        self.assertLess(len(MACOS_XPC_INGRESS_SUBSTRINGS), 15)
 
 
 # === fortified() helper ===
@@ -250,6 +549,141 @@ class TestSizeBounds(unittest.TestCase):
     def test_macos_substrings_nontrivial(self):
         self.assertGreater(len(MACOS_DANGEROUS_SUBSTRINGS), 10)
 
+    def test_stream_input_size_reasonable(self):
+        n = len(STREAM_INPUT_FUNCS)
+        self.assertGreater(n, 4, f"only {n} entries — pruned too far?")
+        self.assertLess(n, 20, f"{n} entries — likely bloat")
+
+    def test_process_boundary_size_reasonable(self):
+        n = len(PROCESS_BOUNDARY_FUNCS)
+        self.assertGreaterEqual(n, 1,
+                                f"only {n} entries — pruned too far?")
+        self.assertLess(n, 10, f"{n} entries — likely bloat")
+
+    def test_process_boundary_markers_size_reasonable(self):
+        n = len(PROCESS_BOUNDARY_MARKERS)
+        self.assertGreaterEqual(n, 1)
+        self.assertLess(n, 10)
+
+    def test_ipc_size_reasonable(self):
+        n = len(IPC_FUNCS)
+        self.assertGreater(n, 2, f"only {n} entries — pruned too far?")
+        self.assertLess(n, 15, f"{n} entries — likely bloat")
+
+    def test_kernel_userspace_size_reasonable(self):
+        """Linux kernel uaccess + memdup_user + iovec/pages
+        interfaces — meaningful range is 10-40."""
+        n = len(KERNEL_USERSPACE_FUNCS)
+        self.assertGreater(n, 10, f"only {n} entries — pruned too far?")
+        self.assertLess(n, 40, f"{n} entries — likely bloat")
+
+    def test_device_control_size_reasonable(self):
+        n = len(DEVICE_CONTROL_FUNCS)
+        self.assertGreaterEqual(n, 3)
+        self.assertLess(n, 10)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMacosSubstringGroups:
+    """Drift guards for the categorised macOS substring groups.
+
+    MACOS_DANGEROUS_SUBSTRINGS is derived as the union of the category
+    groups; every symbol must live in exactly one group so consumers
+    (surface_classification) can classify from the taxonomy alone.
+    """
+
+    def test_union_is_complete(self):
+        from core.function_taxonomy import (
+            MACOS_BYTE_BUFFER_SUBSTRINGS,
+            MACOS_DANGEROUS_SUBSTRINGS,
+            MACOS_FILESYSTEM_URL_SUBSTRINGS,
+            MACOS_IOKIT_SUBSTRINGS,
+            MACOS_PARSER_SUBSTRINGS,
+            MACOS_PROCESS_EXEC_SUBSTRINGS,
+            MACOS_SECURITY_BOUNDARY_SUBSTRINGS,
+            MACOS_XPC_INGRESS_SUBSTRINGS,
+        )
+
+        union = (
+            MACOS_PARSER_SUBSTRINGS
+            | MACOS_FILESYSTEM_URL_SUBSTRINGS
+            | MACOS_SECURITY_BOUNDARY_SUBSTRINGS
+            | MACOS_BYTE_BUFFER_SUBSTRINGS
+            | MACOS_PROCESS_EXEC_SUBSTRINGS
+            | MACOS_IOKIT_SUBSTRINGS
+            | MACOS_XPC_INGRESS_SUBSTRINGS
+        )
+        assert union == MACOS_DANGEROUS_SUBSTRINGS
+
+    def test_groups_are_disjoint(self):
+        from core.function_taxonomy import (
+            MACOS_BYTE_BUFFER_SUBSTRINGS,
+            MACOS_FILESYSTEM_URL_SUBSTRINGS,
+            MACOS_IOKIT_SUBSTRINGS,
+            MACOS_PARSER_SUBSTRINGS,
+            MACOS_PROCESS_EXEC_SUBSTRINGS,
+            MACOS_SECURITY_BOUNDARY_SUBSTRINGS,
+            MACOS_XPC_INGRESS_SUBSTRINGS,
+        )
+
+        groups = [
+            MACOS_PARSER_SUBSTRINGS,
+            MACOS_FILESYSTEM_URL_SUBSTRINGS,
+            MACOS_SECURITY_BOUNDARY_SUBSTRINGS,
+            MACOS_BYTE_BUFFER_SUBSTRINGS,
+            MACOS_PROCESS_EXEC_SUBSTRINGS,
+            MACOS_IOKIT_SUBSTRINGS,
+            MACOS_XPC_INGRESS_SUBSTRINGS,
+        ]
+        for i, a in enumerate(groups):
+            for b in groups[i + 1:]:
+                assert not a & b
+
+    def test_pre_split_names_all_retained(self):
+        # SUBSET, not equality: the pin's job is split-integrity —
+        # the categorised groups must never LOSE a pre-split entry.
+        # Curated growth (the darwin IOKit/XPC groups) is governed
+        # by the union/disjoint guards above plus each addition's
+        # own membership pins, so an equality pin here would only
+        # re-churn this list on every legitimate addition.
+        from core.function_taxonomy import MACOS_DANGEROUS_SUBSTRINGS
+
+        assert MACOS_DANGEROUS_SUBSTRINGS >= frozenset({
+            "CFPropertyListCreateWithData", "CFPropertyListCreateFromXMLData",
+            "CFReadStreamRead", "CFDataGetBytes",
+            "CFStringCreateWithBytes", "CFURLCreateWithBytes",
+            "CFXMLParserCreate", "CFXMLTreeCreateFromData",
+            "Foundation.Data.contentsOf",
+            "Foundation.Data.base64Encoded",
+            "Foundation.Data.write",
+            "Foundation.Data.Iterator",
+            "Foundation.URL.fileURLWithPath",
+            "Foundation.URL.absoluteString",
+            "Foundation.JSONSerialization",
+            "Foundation.PropertyListSerialization",
+            "Foundation.PropertyListDecoder",
+            "Foundation.JSONDecoder",
+            "SecPolicyCreateSSL",
+            "SecTrustEvaluate",
+            "SecItemCopyMatching",
+            "SecKeychainItem",
+            "NSDataReadingOptions",
+            "NSDataBase64DecodingOptions",
+            "NSStringFromBytes",
+            "NSTask",
+            "Foundation.Process",
+        })
+
+    def test_security_entries_covered_by_prefixes(self):
+        from core.function_taxonomy import (
+            MACOS_SECURITY_BOUNDARY_PREFIXES,
+            MACOS_SECURITY_BOUNDARY_SUBSTRINGS,
+        )
+
+        for entry in MACOS_SECURITY_BOUNDARY_SUBSTRINGS:
+            assert any(
+                entry.startswith(p) for p in MACOS_SECURITY_BOUNDARY_PREFIXES
+            ), entry

@@ -51,6 +51,31 @@ class TestValidateVector:
     def test_garbage(self):
         assert not validate_vector("not a vector")
 
+    def test_reordered_metrics_accepted(self):
+        # CVSS v3.1 spec §6 Table 15: metrics may appear in any order.
+        assert validate_vector("CVSS:3.1/AC:L/AV:N/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+    def test_reordered_with_extension_first(self):
+        assert validate_vector("CVSS:3.1/E:H/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+    def test_reordered_missing_metric_rejected(self):
+        assert not validate_vector("CVSS:3.1/AC:L/AV:N/PR:N/UI:N/S:U/C:H/I:H")
+
+    def test_reordered_duplicate_key_rejected(self):
+        assert not validate_vector("CVSS:3.1/AC:L/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+    def test_reordered_invalid_base_value_rejected(self):
+        assert not validate_vector("CVSS:3.1/AC:L/AV:X/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+    def test_trailing_newline_rejected(self):
+        assert not validate_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\nrm -rf")
+
+    def test_non_string_input_rejected(self):
+        assert not validate_vector(None)
+        assert not validate_vector(["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"])
+        assert not validate_vector({"AV": "N"})
+        assert not validate_vector(9.8)
+
 
 class TestParseVector:
     def test_parse_all_metrics(self):
@@ -173,6 +198,18 @@ class TestComputeScoreSafe:
         assert score == 9.8
         assert label == "Critical"
 
+    def test_reordered_vector_scores(self):
+        score, label = compute_score_safe("CVSS:3.1/AC:L/AV:N/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert score == 9.8
+        assert label == "Critical"
+
+    def test_non_string_returns_none(self):
+        # The "safe" contract covers LLM structured-output glitches
+        # where cvss_vector arrives as a list / dict / number.
+        assert compute_score_safe({"AV": "N"}) == (None, None)
+        assert compute_score_safe(["CVSS:3.1/AV:N"]) == (None, None)
+        assert compute_score_safe(9.8) == (None, None)
+
 
 class TestScoreFinding:
     """Tests for score_finding — single finding dict."""
@@ -202,6 +239,15 @@ class TestScoreFinding:
         f = {"cvss_vector": "not-a-vector"}
         score_finding(f)
         assert "cvss_score_estimate" not in f
+
+    def test_non_string_vector_unchanged(self):
+        # One finding carrying a structured (non-string) cvss_vector
+        # must not raise and abort the caller's whole findings loop.
+        from packages.cvss import score_finding
+        for bad in (["CVSS:3.1/AV:N"], {"AV": "N"}, 9.8):
+            f = {"cvss_vector": bad}
+            score_finding(f)
+            assert "cvss_score_estimate" not in f
 
     def test_overwrites_existing_score(self):
         from packages.cvss import score_finding
@@ -236,3 +282,92 @@ class TestScoreFindings:
     def test_empty_list(self):
         from packages.cvss import score_findings
         score_findings([])  # Should not raise
+
+
+class TestScoreForLabel:
+    """Tests for ``score_for_label`` — the inverse of the
+    ``_SEVERITY`` threshold table. Returns a representative
+    numeric for advisories that ship a label but no parseable
+    CVSS vector."""
+
+    def test_critical_returns_lower_bound(self):
+        from packages.cvss import score_for_label
+        # Lower bound of the Critical tier per CVSS v3.1's
+        # severity-rating table (table 14 in the spec).
+        assert score_for_label("critical") == 9.0
+
+    def test_high_returns_lower_bound(self):
+        from packages.cvss import score_for_label
+        assert score_for_label("high") == 7.0
+
+    def test_medium_returns_lower_bound(self):
+        from packages.cvss import score_for_label
+        assert score_for_label("medium") == 4.0
+
+    def test_low_returns_lower_bound(self):
+        from packages.cvss import score_for_label
+        assert score_for_label("low") == 0.1
+
+    def test_none_returns_zero(self):
+        from packages.cvss import score_for_label
+        # CVSS "None" tier means no impact. Distinct from a
+        # missing label (which returns None at the function level).
+        assert score_for_label("none") == 0.0
+
+    def test_info_returns_subloss_value(self):
+        """``info`` is operator-convenience (commented-out deps,
+        hand-tagged low-risk findings). Not in CVSS proper but
+        the SCA pipeline labels findings ``info`` in several
+        paths; we map it to a sub-Low value so consumers that
+        receive an ``info``-labelled finding without a numeric
+        don't crash."""
+        from packages.cvss import score_for_label
+        assert score_for_label("info") == 0.0
+
+    def test_case_insensitive(self):
+        """Upstream advisories capitalise inconsistently
+        (``"CRITICAL"`` from NVD, ``"Critical"`` from GHSA,
+        ``"critical"`` from PYSEC). All three must resolve."""
+        from packages.cvss import score_for_label
+        assert score_for_label("CRITICAL") == 9.0
+        assert score_for_label("Critical") == 9.0
+        assert score_for_label("critical") == 9.0
+
+    def test_whitespace_tolerant(self):
+        """Hand-edited advisories sometimes ship leading /
+        trailing whitespace. Strip before lookup."""
+        from packages.cvss import score_for_label
+        assert score_for_label("  high  ") == 7.0
+
+    def test_unknown_returns_none(self):
+        from packages.cvss import score_for_label
+        assert score_for_label("bogus") is None
+
+    def test_empty_returns_none(self):
+        from packages.cvss import score_for_label
+        assert score_for_label("") is None
+        assert score_for_label(None) is None
+
+    def test_monotone_in_severity(self):
+        """The label→score direction must be monotone-increasing
+        across CVSS tiers, matching v3.1's severity-rating
+        order. Pins the table so a future drift in ``_SEVERITY``
+        — e.g. someone adding an out-of-order tier — breaks
+        here loudly rather than silently flipping rank order
+        in downstream risk-formula consumers."""
+        from packages.cvss import score_for_label
+        scores = [
+            score_for_label(label)
+            for label in ("none", "low", "medium", "high", "critical")
+        ]
+        assert scores == sorted(scores), (
+            f"label→score is not monotone: {scores}"
+        )
+
+    def test_info_maps_below_low(self):
+        from packages.cvss import score_for_label
+        info_score = score_for_label("info")
+        low_score = score_for_label("low")
+        assert info_score is not None
+        assert low_score is not None
+        assert info_score < low_score

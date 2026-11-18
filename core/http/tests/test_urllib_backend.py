@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+from contextlib import ExitStack
+
 import gzip
-import sys
-from pathlib import Path
-from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-# core/http/tests/test_urllib_backend.py -> repo root
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from packages.web.tests.http_server import start_http_server
+
 
 from core.http import (
     DEFAULT_RETRIES,
@@ -21,26 +23,36 @@ from core.http import (
     default_client,
 )
 from core.http.urllib_backend import (
-    UrllibClient, _HostCircuitBreaker,
-    reset_default_circuit_breaker,
+    UrllibClient,
+    _HostCircuitBreaker,
 )
+
+from core.testing.module_bindings import patch_module_attribute
+
+import core.http.urllib_backend as _clock_consumer
+
+
 
 
 @pytest.fixture(autouse=True)
-def _reset_default_breaker():
-    """Fresh module-level breaker per test — earlier tests' 429/5xx
-    paths trip the singleton and would leak state into later tests
-    that share an UrllibClient without an explicit ``circuit_breaker``
-    kwarg."""
-    reset_default_circuit_breaker()
-    yield
-    reset_default_circuit_breaker()
+def _reset_default_breaker(monkeypatch):
+    from core.http import urllib_backend
+    from core.testing.module_state import isolated_module_state
+
+    with isolated_module_state(
+        urllib_backend, {"_DEFAULT_CIRCUIT_BREAKER": None},
+        lock=urllib_backend._DEFAULT_CIRCUIT_BREAKER_LOCK,
+    ):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
 
 
 def _stub_response(body: bytes, *, status: int = 200,
                    content_encoding: str = "",
                    reason: str = "OK",
-                   extra_headers: Optional[dict] = None,
+                   extra_headers: dict | None = None,
                    final_url: str = "") -> MagicMock:
     """Build a stub urllib3 HTTPResponse: stream() yields body in one chunk."""
     resp = MagicMock()
@@ -98,20 +110,48 @@ class TestSuccess:
         assert call.kwargs["headers"]["Content-Type"] == "application/json"
 
     def test_get_bytes(self):
-        client, pool = _client_with_mock_pool(_stub_response(b"\x01\x02\xff"))
+        client, _pool = _client_with_mock_pool(_stub_response(b"\x01\x02\xff"))
         out = client.get_bytes("https://example.com/binary")
         assert out == b"\x01\x02\xff"
 
-    def test_gzip_body_decompressed_as_defence_in_depth(self):
-        """If urllib3's auto-decode misses (some servers send gzip without
-        the header), the magic-byte sniffer in _fetch_once decodes it."""
+    def test_gzip_body_decompressed_when_content_encoding_declared(self):
+        """Decode exactly the declared encoding through the real HTTP reader."""
+        import io
+        import urllib3
         body = gzip.compress(b'{"hello": "world"}')
-        # decode_content=True in urllib3 normally decompresses, but to
-        # force the fallback path we lie via the stub: stream() returns
-        # the raw gzipped bytes as if urllib3 didn't decode.
-        client, _ = _client_with_mock_pool(_stub_response(body))
+        actual = urllib3.response.HTTPResponse(
+            body=io.BytesIO(body), status=200,
+            headers={"Content-Encoding": "gzip"}, preload_content=False,
+        )
+        client, _ = _client_with_mock_pool(actual)
         result = client.get_json("https://example.com/api")
         assert result == {"hello": "world"}
+
+    def test_gzip_shaped_body_without_content_encoding_untouched(self):
+        """A body that merely IS a gzip stream (no Content-Encoding)
+        must arrive verbatim. OCI layer blobs are gzip files; the
+        pre-fix magic-byte sniff transparently decompressed them,
+        corrupting sha256 verification of the content address and
+        opening decompression amplification."""
+        payload = gzip.compress(b"layer-tar-bytes" * 100)
+        client, _ = _client_with_mock_pool(_stub_response(payload))
+        out = client.get_bytes("https://example.com/blob")
+        assert out == payload
+
+    def test_accept_encoding_identity_disables_transport_decode(self):
+        """Accept-Encoding: identity is the raw-bytes contract: the
+        pool request must run with decode_content=False and the body
+        must come back verbatim even when the server claims gzip."""
+        payload = gzip.compress(b"blob-bytes")
+        client, pool = _client_with_mock_pool(
+            _stub_response(payload, content_encoding="gzip"),
+        )
+        out = client.request(
+            "GET", "https://example.com/blob",
+            headers={"Accept-Encoding": "identity"},
+        ).body
+        assert out == payload
+        assert pool.request.call_args.kwargs["decode_content"] is False
 
     def test_release_conn_called(self):
         """Connection is returned to the pool after every request — this
@@ -141,7 +181,7 @@ class TestConnectionPooling:
         """The default pool manager is constructed with maxsize > 1
         so concurrent calls to the same host don't serialise on a
         single connection."""
-        from core.http.urllib_backend import _new_pool_manager, _DEFAULT_POOL_MAXSIZE
+        from core.http.urllib_backend import _DEFAULT_POOL_MAXSIZE, _new_pool_manager
         pool = _new_pool_manager()
         # urllib3 stores maxsize on connection_pool_kw.
         assert pool.connection_pool_kw.get("maxsize") == _DEFAULT_POOL_MAXSIZE
@@ -228,23 +268,25 @@ class TestNotModified:
 
 class TestTotalTimeout:
 
-    @patch("core.http.urllib_backend.time.monotonic")
-    @patch("core.http.urllib_backend.time.sleep")
-    def test_deadline_caps_retries(self, _mock_sleep, mock_monotonic):
+    def test_deadline_caps_retries(self):
         """If the wall-clock deadline elapses, raise immediately
         without continuing the backoff schedule. Worst case without
         this: ~1 hour spent in retries; with this, capped to total_timeout."""
-        # Simulate clock jumping forward by 1000s on each call. With
-        # default total_timeout=600, the deadline is exceeded before
-        # the second iteration.
-        ticks = iter([0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000])
-        mock_monotonic.side_effect = lambda: next(ticks)
-        client, pool = _client_with_mock_pool([
-            _stub_response(b"", status=503),
-            _stub_response(b"", status=503),
-        ])
-        with pytest.raises(HttpError, match="Total timeout"):
-            client.get_json("https://example.com/api", total_timeout=600)
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'monotonic') as mock_monotonic,
+        ):
+            # Simulate clock jumping forward by 1000s on each call. With
+            # default total_timeout=600, the deadline is exceeded before
+            # the second iteration.
+            ticks = iter([0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000])
+            mock_monotonic.side_effect = lambda: next(ticks)
+            client, _pool = _client_with_mock_pool([
+                _stub_response(b"", status=503),
+                _stub_response(b"", status=503),
+            ])
+            with pytest.raises(HttpError, match="Total timeout"):
+                client.get_json("https://example.com/api", total_timeout=600)
 
     def test_short_total_timeout_actually_fires_real_clock(self):
         """REGRESSION TEST. Before the fix, deadline was computed as
@@ -268,13 +310,15 @@ class TestTotalTimeout:
         with pytest.raises(HttpError):
             client.get_json("https://example.com/api", total_timeout=1)
         elapsed = _time.monotonic() - t0
-        # Cap is 1s; allow generous slop for sleep granularity but well
-        # under 5s (which is where the previous bug would have led with
-        # default per-attempt timeout=30). The pre-fix max() would have
-        # let this run through the full backoff schedule.
-        assert elapsed < 5, (
-            f"total_timeout=1 took {elapsed:.1f}s — "
-            f"deadline computation may have regressed to max(total, timeout)"
+        # Cap is 1s; the assert bound carries seconds of load headroom
+        # while the code-side bound a regression would serve (the full
+        # backoff schedule under the default per-attempt timeout=30)
+        # sits far past it — the separation contract the wallclock
+        # chokepoint enforces.
+        from core.testing.wallclock import check_wall_deadline
+        check_wall_deadline(
+            elapsed, 5, code_bound_s=30,
+            what="get_json with total_timeout=1",
         )
 
 
@@ -377,6 +421,44 @@ class TestStreamBytes:
                 pass
         resp.release_conn.assert_called_once()  # finally fires on exception
 
+    def test_wallclock_abort_is_httperror(self, monkeypatch):
+        """The slowloris wallclock abort must raise an HttpError
+        subclass: both real consumers (OCI blob pull, web_fetch's
+        best-effort body) wrap iteration in `except HttpError` only —
+        a builtin TimeoutError escaped their degradation entirely on
+        exactly the paths the cap protects."""
+        from core.http import HttpError as _HttpError
+        from core.http import StreamWallclockExceeded
+
+        def _dripping(cs, decode_content=True):
+            while True:
+                yield b"x"
+
+        resp = MagicMock()
+        resp.status = 200
+        resp.headers = {}
+        resp.stream = _dripping
+        resp.release_conn = MagicMock()
+        client = UrllibClient(
+            _http=MagicMock(request=MagicMock(return_value=resp)),
+        )
+        # Advance the stream's clock past the cap deterministically:
+        # the generator reads time.monotonic per chunk.
+        import time as _stdlib_time
+        real_monotonic = _stdlib_time.monotonic
+        clock = {"skew": 0.0}
+        monkeypatch.setattr(
+            _stdlib_time, "monotonic",
+            lambda: real_monotonic() + clock["skew"],
+        )
+        with pytest.raises(StreamWallclockExceeded) as exc_info:
+            for _ in client.stream_bytes(
+                "https://example.com/slow", total_timeout=5,
+            ):
+                clock["skew"] += 10.0  # a chunk "took" 10s
+        assert isinstance(exc_info.value, _HttpError)
+        resp.release_conn.assert_called_once()
+
     def test_url_validation_at_call_time(self):
         """URL validation must fail at call time, not deferred to
         first iteration — the generator-split must preserve fail-fast."""
@@ -412,6 +494,95 @@ class TestStreamBytes:
         assert client._http.request.call_count == 0
 
 
+class TestStreamPostRedirectRevalidation:
+    """stream_bytes revalidates the post-redirect final URL before
+    yielding any body byte — same gate as the buffered path."""
+
+    def test_https_to_http_downgrade_redirect_refused(self):
+        """A followed https -> http redirect on a streamed download must
+        raise HttpError before any body byte is yielded — the TLS
+        downgrade gate `_fetch_once` already had."""
+        resp = _stub_response(b"x" * 100,
+                              final_url="http://attacker.example/payload")
+
+        class HttpsOnly(UrllibClient):
+            _ALLOWED_SCHEMES = ("https",)
+
+        pool = MagicMock()
+        pool.request.return_value = resp
+        client = HttpsOnly(_http=pool)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError, match="refused redirect"):
+            next(it)
+        resp.release_conn.assert_called_once()
+
+    def test_redirect_to_disallowed_scheme_refused_for_default_client(self):
+        """Even the default (http+https) client refuses a redirect whose
+        final URL fails _validate_url — e.g. embedded credentials."""
+        resp = _stub_response(b"x",
+                              final_url="https://user:pw@example.com/blob")
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError, match="refused redirect"):
+            next(it)
+
+    def test_same_scheme_redirect_streams_normally(self):
+        """A validated https -> https redirect still streams the body."""
+        resp = _stub_response(b"abc",
+                              final_url="https://cdn.example.com/blob")
+        client, _pool = _client_with_mock_pool(resp)
+        chunks = list(client.stream_bytes("https://example.com/blob"))
+        assert b"".join(chunks) == b"abc"
+
+    def test_relative_geturl_resolved_not_refused(self):
+        """urllib3 geturl() can return a relative path on a 200 response
+        (Location header without redirect) — resolve, don't refuse."""
+        resp = _stub_response(b"data", final_url="/v1/blob")
+        client, _pool = _client_with_mock_pool(resp)
+        chunks = list(client.stream_bytes("https://example.com/v1/blob"))
+        assert b"".join(chunks) == b"data"
+
+    def test_falsy_geturl_falls_back_to_request_url(self):
+        """geturl() returning '' (no URL recorded) must not trigger
+        revalidation or refusal."""
+        resp = _stub_response(b"ok", final_url="")
+        client, _pool = _client_with_mock_pool(resp)
+        chunks = list(client.stream_bytes("https://example.com/blob"))
+        assert b"".join(chunks) == b"ok"
+
+
+class TestStreamErrorSnippetRedaction:
+    """The 4xx body snippet embedded in a streaming-path HttpError is
+    redacted and decoded tolerantly — parity with the buffered path."""
+
+    def test_4xx_body_secret_redacted_in_stream_error(self):
+        """A token echoed in a 4xx body must not appear verbatim in the
+        HttpError raised by the streaming path (parity with
+        `_fetch_once`'s redaction)."""
+        token = "ghp_" + "a" * 36
+        resp = _stub_response(
+            f"invalid token {token}".encode(),
+            status=403, reason="Forbidden", final_url="",
+        )
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError) as excinfo:
+            next(it)
+        assert token not in str(excinfo.value)
+        assert excinfo.value.status == 403
+
+    def test_4xx_non_utf8_body_does_not_crash(self):
+        """Non-UTF-8 error bodies decode with errors='replace' instead
+        of raising UnicodeDecodeError from the error path itself."""
+        resp = _stub_response(b"\xff\xfe bad", status=404,
+                              reason="Not Found", final_url="")
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError) as excinfo:
+            next(it)
+        assert excinfo.value.status == 404
+
+
 # ---------------------------------------------------------------------------
 # Error paths
 # ---------------------------------------------------------------------------
@@ -427,28 +598,45 @@ class TestErrors:
         assert ei.value.status == 400
         assert pool.request.call_count == 1
 
-    @patch("core.http.urllib_backend.time.sleep")
-    def test_429_retries_with_backoff(self, _mock_sleep):
-        # Two 429s, then success.
-        client, pool = _client_with_mock_pool([
-            _stub_response(b"", status=429, reason="Too Many"),
-            _stub_response(b"", status=429, reason="Too Many"),
-            _stub_response(b'{"ok": true}'),
-        ])
-        result = client.get_json("https://example.com/api")
-        assert result == {"ok": True}
-        assert pool.request.call_count == 3
+    def test_429_retries_with_backoff(self):
+        # Two 429s, then success. Use a high-threshold breaker so the
+        # retry-then-recover path is exercised without tripping the
+        # circuit mid-loop.
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            pool = MagicMock()
+            pool.request.side_effect = [
+                _stub_response(b"", status=429, reason="Too Many"),
+                _stub_response(b"", status=429, reason="Too Many"),
+                _stub_response(b'{"ok": true}'),
+            ]
+            client = UrllibClient(
+                _http=pool,
+                circuit_breaker=_HostCircuitBreaker(threshold=10),
+            )
+            result = client.get_json("https://example.com/api")
+            assert result == {"ok": True}
+            assert pool.request.call_count == 3
 
-    @patch("core.http.urllib_backend.time.sleep")
-    def test_500_retries_then_raises(self, _mock_sleep):
-        # Always 500 for every attempt — default = 1 initial + DEFAULT_RETRIES.
-        attempts = DEFAULT_RETRIES + 1
-        responses = [_stub_response(b"err", status=500, reason="Internal")
-                     for _ in range(attempts)]
-        client, pool = _client_with_mock_pool(responses)
-        with pytest.raises(HttpError, match="Exhausted retries"):
-            client.get_json("https://example.com/api")
-        assert pool.request.call_count == attempts
+    def test_500_retries_then_raises(self):
+        # Always 500 — circuit breaker trips after 2 failures and
+        # aborts the retry loop immediately.
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            pool = MagicMock()
+            pool.request.side_effect = [
+                _stub_response(b"err", status=500, reason="Internal")
+                for _ in range(DEFAULT_RETRIES + 1)
+            ]
+            client = UrllibClient(
+                _http=pool,
+                circuit_breaker=_HostCircuitBreaker(threshold=10),
+            )
+            with pytest.raises(HttpError, match="Exhausted retries"):
+                client.get_json("https://example.com/api")
+            assert pool.request.call_count == DEFAULT_RETRIES + 1
 
     def test_size_limit_enforced(self):
         # Build a stub whose stream() yields 200 bytes; max_bytes=100.
@@ -468,19 +656,21 @@ class TestErrors:
         with pytest.raises(HttpError, match="not valid JSON"):
             client.get_json("https://example.com/api")
 
-    @patch("core.http.urllib_backend.time.sleep")
-    def test_network_error_retries_then_raises(self, _mock_sleep):
+    def test_network_error_retries_then_raises(self):
         """Connection-level errors (urllib3 MaxRetryError, timeout etc.)
         are retried — same backoff schedule as 5xx."""
-        from urllib3.exceptions import MaxRetryError
-        pool = MagicMock()
-        pool.request.side_effect = MaxRetryError(
-            pool=None, url="https://example.com/api", reason="connection refused",
-        )
-        client = UrllibClient(_http=pool)
-        with pytest.raises(HttpError, match="Exhausted retries"):
-            client.get_json("https://example.com/api")
-        assert pool.request.call_count == DEFAULT_RETRIES + 1
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            from urllib3.exceptions import MaxRetryError
+            pool = MagicMock()
+            pool.request.side_effect = MaxRetryError(
+                pool=None, url="https://example.com/api", reason="connection refused",
+            )
+            client = UrllibClient(_http=pool)
+            with pytest.raises(HttpError, match="Exhausted retries"):
+                client.get_json("https://example.com/api")
+            assert pool.request.call_count == DEFAULT_RETRIES + 1
 
     def test_proxy_403_is_permanent_no_retry(self):
         """When the in-process proxy returns 403 (host not on allowlist),
@@ -500,21 +690,23 @@ class TestErrors:
         # Single attempt — no retry storm.
         assert pool.request.call_count == 1
 
-    @patch("core.http.urllib_backend.time.sleep")
-    def test_other_proxy_errors_are_retried(self, _mock_sleep):
+    def test_other_proxy_errors_are_retried(self):
         """ProxyError that ISN'T a 403 (e.g., proxy unreachable) is
         transient and should retry like any other connection error."""
-        from urllib3.exceptions import ProxyError
-        pool = MagicMock()
-        # No "403"/"Forbidden" in the message → treated as transient.
-        pool.request.side_effect = ProxyError(
-            "Cannot connect to proxy.",
-            OSError("connection refused"),
-        )
-        client = UrllibClient(_http=pool)
-        with pytest.raises(HttpError, match="Exhausted retries"):
-            client.get_json("https://example.com/api")
-        assert pool.request.call_count == DEFAULT_RETRIES + 1
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            from urllib3.exceptions import ProxyError
+            pool = MagicMock()
+            # No "403"/"Forbidden" in the message → treated as transient.
+            pool.request.side_effect = ProxyError(
+                "Cannot connect to proxy.",
+                OSError("connection refused"),
+            )
+            client = UrllibClient(_http=pool)
+            with pytest.raises(HttpError, match="Exhausted retries"):
+                client.get_json("https://example.com/api")
+            assert pool.request.call_count == DEFAULT_RETRIES + 1
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +863,25 @@ class TestRequest:
         with pytest.raises(HttpError, match="not valid JSON"):
             resp.json()
 
+    def test_response_json_tolerates_bom(self):
+        """BOM-prefixed valid JSON bodies parse — core.json.loads
+        names HTTP bodies as an intended source and strips the BOM."""
+        client, _ = _client_with_mock_pool(
+            _stub_response(b'\xef\xbb\xbf{"x": 1}'),
+        )
+        resp = client.request("GET", "https://example.com/api")
+        assert resp.json() == {"x": 1}
+
+    def test_response_json_rejects_non_finite(self):
+        """NaN/Infinity constants are refused as HttpError instead of
+        flowing unguarded into consumers."""
+        client, _ = _client_with_mock_pool(
+            _stub_response(b'{"a": NaN}'),
+        )
+        resp = client.request("GET", "https://example.com/api")
+        with pytest.raises(HttpError, match="not valid JSON"):
+            resp.json()
+
     def test_arbitrary_methods_accepted(self):
         """request() supports DELETE/PUT/PATCH/HEAD without explicit
         helper methods. Verify the method string is forwarded."""
@@ -693,36 +904,61 @@ class TestRetriesOptOut:
             client.get_json("https://example.com/api", retries=0)
         assert pool.request.call_count == 1
 
-    @patch("core.http.urllib_backend.time.sleep")
-    def test_retries_three_means_four_attempts(self, _mock_sleep):
-        """retries=3 → up to 4 total attempts (1 initial + 3 retries)."""
-        responses = [_stub_response(b"", status=503) for _ in range(8)]
-        client, pool = _client_with_mock_pool(responses)
-        with pytest.raises(HttpError, match="Exhausted retries"):
-            client.get_json("https://example.com/api", retries=3)
-        assert pool.request.call_count == 4
+    def test_retries_three_means_four_attempts(self):
+        """retries=3 → up to 4 total attempts (1 initial + 3 retries).
+        High-threshold breaker so all 4 attempts execute."""
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            pool = MagicMock()
+            pool.request.side_effect = [
+                _stub_response(b"", status=503) for _ in range(8)
+            ]
+            client = UrllibClient(
+                _http=pool,
+                circuit_breaker=_HostCircuitBreaker(threshold=10),
+            )
+            with pytest.raises(HttpError, match="Exhausted retries"):
+                client.get_json("https://example.com/api", retries=3)
+            assert pool.request.call_count == 4
 
-    def test_no_sleep_after_final_attempt(self):
+    def test_no_sleep_after_final_attempt(self, monkeypatch):
         """REGRESSION: each schedule slot owns the sleep AFTER its
         attempt. The final slot has no next attempt, so we MUST NOT
         sleep before raising 'Exhausted retries' — otherwise retries=0
         + 503 sleeps schedule[0] (1s), and a default-config full
         failure burns the trailing 300s slot for nothing.
+
+        Asserted on the sleep CALL itself (recorded via a time-module
+        shim), not on wall clock: the old elapsed < 0.5 bound sat one
+        scheduler stall away from the buggy 1s sleep it distinguished.
         """
         import time as _time
+        import core.http.urllib_backend as _backend
+
+        class _RecordingTime:
+            """Delegates to the real time module; records sleeps."""
+
+            def __init__(self) -> None:
+                self.sleeps: list[float] = []
+
+            def sleep(self, seconds: float) -> None:
+                self.sleeps.append(seconds)
+
+            def __getattr__(self, name):
+                return getattr(_time, name)
+
+        shim = _RecordingTime()
+        monkeypatch.setattr(_backend, "time", shim)
         pool = MagicMock()
         pool.request.return_value = _stub_response(b"", status=503)
         client = UrllibClient(_http=pool)
 
-        t0 = _time.monotonic()
         with pytest.raises(HttpError):
             client.get_json("https://example.com/api", retries=0)
-        elapsed = _time.monotonic() - t0
-        # Real wall-clock — well under schedule[0]=1s. Slop allows
-        # for slow CI scheduling but well below the buggy 1s sleep.
-        assert elapsed < 0.5, (
-            f"retries=0 took {elapsed:.2f}s — likely slept the final "
-            f"schedule slot before raising"
+        assert shim.sleeps == [], (
+            f"retries=0 slept {shim.sleeps} — the final schedule slot "
+            f"must not sleep before raising"
         )
 
     def test_post_json_documents_idempotency(self):
@@ -733,19 +969,88 @@ class TestRetriesOptOut:
 
 
 class TestFollowRedirects:
-    """follow_redirects=False surfaces 3xx responses to the caller
-    instead of chasing them — security-scanning patterns need this."""
+    """Redirects are never followed by this backend — 3xx responses
+    surface to the caller. Non-following used to be ACCIDENTAL
+    (retries=False zeroed urllib3's redirect budget while the code
+    passed redirect=True); these tests pin it as deliberate, since
+    the post-response revalidation checks only generic URL gates and
+    following would bypass caller-level address policy (e.g. the OCI
+    registry SSRF gate)."""
 
-    def test_default_follows_redirects(self):
-        """Default behaviour passes redirect=True to urllib3."""
+    def test_redirect_pinned_false_by_default(self):
+        """The pool.request call must pass redirect=False even for
+        default follow_redirects=True — non-following must not
+        depend on retries=False side effects."""
         client, pool = _client_with_mock_pool(_stub_response(b'{"ok": true}'))
         client.get_json("https://example.com/api")
-        assert pool.request.call_args.kwargs["redirect"] is True
+        assert pool.request.call_args.kwargs["redirect"] is False
+
+    def test_redirect_pinned_false_for_stream_bytes(self):
+        """The streaming path is pinned the same way."""
+        client, pool = _client_with_mock_pool(_stub_response(b"data"))
+        list(client.stream_bytes("https://example.com/blob"))
+        assert pool.request.call_args.kwargs["redirect"] is False
 
     def test_follow_redirects_false_passed_through(self):
         client, pool = _client_with_mock_pool(_stub_response(b'{"ok": true}'))
         client.get_json("https://example.com/api", follow_redirects=False)
         assert pool.request.call_args.kwargs["redirect"] is False
+
+    def test_302_not_followed_against_real_server(self, monkeypatch):
+        """A local handler returning 302 must yield the 302 response
+        unfollowed — the follow target must never be requested. Real
+        localhost server (not a mock): this pins the wire behaviour
+        the accidental retries=False coupling used to provide."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        hits: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header("Location", "/followed")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    body = b"FOLLOWED"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        # The direct client snapshots proxy env at construction —
+        # drop any operator proxy so the request hits loopback.
+        for var in ("http_proxy", "HTTP_PROXY", "https_proxy",
+                    "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+                    "no_proxy", "NO_PROXY"):
+            monkeypatch.delenv(var, raising=False)
+
+        with ExitStack() as cleanup:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            start_http_server(server, cleanup.callback)
+            port = server.server_address[1]
+            client = UrllibClient(circuit_breaker=_HostCircuitBreaker())
+            resp = client.request(
+                "GET", f"http://127.0.0.1:{port}/start",
+            )
+            assert resp.status == 302
+            assert resp.headers["location"] == "/followed"
+            assert resp.body == b""
+            assert hits == ["/start"], (
+                f"redirect target was requested: {hits}"
+            )
+
+    def test_docstring_states_redirects_not_followed(self):
+        """The request() docstring must not claim redirect
+        following — it documents the deliberate non-follow contract
+        (pre-fix it claimed 'follows up to 10 redirects')."""
+        doc = UrllibClient.request.__doc__
+        assert "Redirects are NOT followed" in doc
 
     def test_3xx_with_no_follow_raises(self):
         """3xx with follow_redirects=False reaches the >= 400 check via
@@ -1011,7 +1316,7 @@ class TestHostCircuitBreaker:
         the open threshold."""
         import core.http.urllib_backend as ub
         t = [1000.0]
-        monkeypatch.setattr(ub.time, "monotonic", lambda: t[0])
+        patch_module_attribute(monkeypatch, ub, "time", "monotonic", lambda: t[0])
         cb = _HostCircuitBreaker(threshold=2, window=60.0, cooldown=120.0)
         cb.record_failure("a.example", 443)
         t[0] = 1100.0  # +100s, past the 60s window
@@ -1022,7 +1327,7 @@ class TestHostCircuitBreaker:
     def test_cooldown_elapses_closes_circuit(self, monkeypatch):
         import core.http.urllib_backend as ub
         t = [1000.0]
-        monkeypatch.setattr(ub.time, "monotonic", lambda: t[0])
+        patch_module_attribute(monkeypatch, ub, "time", "monotonic", lambda: t[0])
         cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
         cb.record_failure("a.example", 443)
         cb.record_failure("a.example", 443)
@@ -1043,39 +1348,47 @@ class TestUrllibClientCircuitBreakerWiring:
 
     def test_two_429s_then_third_request_fails_fast(self):
         """After two 429s on host A, a third request to host A must
-        raise immediately without invoking the pool."""
-        cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
-        # 6 stub responses (one per backoff slot) — but the third
-        # request should fail fast before the pool is hit again.
-        r429 = _stub_response(b"", status=429, reason="Too Many Requests")
-        pool = MagicMock()
-        pool.request.return_value = r429
-        client = UrllibClient(_http=pool, circuit_breaker=cb)
+        raise immediately without invoking the pool.
 
-        # First request: 3 attempts (retries=2 + initial), every
-        # attempt returns 429, cumulative sleep is 1+2 = 3s under
-        # the default schedule. Each 429 records a failure → circuit
-        # opens at 2nd record. total_timeout=60 leaves plenty of
-        # headroom for the 3s of total backoff.
-        with pytest.raises(HttpError):
-            client.get_json(
-                "https://rate-limited.example.com/x",
-                total_timeout=60, retries=2,
+        ``time.sleep`` is patched: the first request runs the full
+        3-attempt 429 sequence whose 1+2=3s of real backoff is wall-clock
+        cost only — the assertion is about breaker *state*, not timing —
+        matching every other retry test in this file."""
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+            # 6 stub responses (one per backoff slot) — but the third
+            # request should fail fast before the pool is hit again.
+            r429 = _stub_response(b"", status=429, reason="Too Many Requests")
+            pool = MagicMock()
+            pool.request.return_value = r429
+            client = UrllibClient(_http=pool, circuit_breaker=cb)
+
+            # First request: 3 attempts (retries=2 + initial), every
+            # attempt returns 429, cumulative sleep is 1+2 = 3s under
+            # the default schedule. Each 429 records a failure → circuit
+            # opens at 2nd record. total_timeout=60 leaves plenty of
+            # headroom for the 3s of total backoff.
+            with pytest.raises(HttpError):
+                client.get_json(
+                    "https://rate-limited.example.com/x",
+                    total_timeout=60, retries=2,
+                )
+
+            is_open, _ = cb.is_open("rate-limited.example.com", 443)
+            assert is_open is True
+
+            # Second request to the same host: must NOT hit the pool.
+            pool.request.reset_mock()
+            with pytest.raises(HttpError, match="Circuit open"):
+                client.get_json(
+                    "https://rate-limited.example.com/y",
+                    total_timeout=10, retries=2,
+                )
+            assert pool.request.call_count == 0, (
+                "Circuit-open path must not invoke the urllib3 pool"
             )
-
-        is_open, _ = cb.is_open("rate-limited.example.com", 443)
-        assert is_open is True
-
-        # Second request to the same host: must NOT hit the pool.
-        pool.request.reset_mock()
-        with pytest.raises(HttpError, match="Circuit open"):
-            client.get_json(
-                "https://rate-limited.example.com/y",
-                total_timeout=10, retries=2,
-            )
-        assert pool.request.call_count == 0, (
-            "Circuit-open path must not invoke the urllib3 pool"
-        )
 
     def test_other_host_still_succeeds_when_one_host_open(self):
         """Per-host isolation through the wiring path."""
@@ -1122,30 +1435,518 @@ class TestUrllibClientCircuitBreakerWiring:
         callers don't have to re-trip the breaker on every fresh
         client (each ~90s of retry budget burned per sample on a
         rate-limited host)."""
-        # Two CONSECUTIVE clients, each constructed with no explicit
-        # breaker. They should share the singleton.
-        r429 = _stub_response(b"", status=429)
-        pool1 = MagicMock()
-        pool1.request.return_value = r429
-        client1 = UrllibClient(_http=pool1)
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            # Two CONSECUTIVE clients, each constructed with no explicit
+            # breaker. They should share the singleton.
+            r429 = _stub_response(b"", status=429)
+            pool1 = MagicMock()
+            pool1.request.return_value = r429
+            client1 = UrllibClient(_http=pool1)
 
-        # Trip the breaker via client1.
-        with pytest.raises(HttpError):
-            client1.get_json(
-                "https://shared-host.example.com/x",
+            # Trip the breaker via client1.
+            with pytest.raises(HttpError):
+                client1.get_json(
+                    "https://shared-host.example.com/x",
+                    total_timeout=60, retries=2,
+                )
+
+            # Now build a fresh client. It MUST see the open circuit.
+            pool2 = MagicMock()
+            pool2.request.return_value = r429
+            client2 = UrllibClient(_http=pool2)
+
+            with pytest.raises(HttpError, match="Circuit open"):
+                client2.get_json(
+                    "https://shared-host.example.com/y",
+                    total_timeout=10, retries=2,
+                )
+            # Confirm pool2 was never invoked — the second client benefits
+            # from the first client's discovery without redoing the work.
+            assert pool2.request.call_count == 0
+
+def test_circuit_break_attribute_on_pre_request_check():
+    """When the breaker is already open, the pre-request check
+    raises HttpError with circuit_break=True so downstream log
+    helpers can demote the noise to DEBUG."""
+    with (
+        mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+    ):
+        cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+        cb.record_failure("noisy.example.com", 443)
+        cb.record_failure("noisy.example.com", 443)
+
+        pool = MagicMock()
+        client = UrllibClient(_http=pool, circuit_breaker=cb)
+        with pytest.raises(HttpError) as exc_info:
+            client.get_json("https://noisy.example.com/pkg")
+        assert exc_info.value.circuit_break is True
+        assert exc_info.value.status is None
+        assert pool.request.call_count == 0
+
+def test_circuit_break_attribute_belongs_to_next_request():
+    """A request whose own failures open the breaker completes its
+    retry schedule and raises the ordinary exhausted-retries error —
+    the ``circuit_break=True`` marker belongs to the NEXT request's
+    entry fail-fast, never to a mid-schedule abort."""
+    with (
+        mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+    ):
+        cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+        r429 = _stub_response(b"", status=429, reason="Too Many")
+        pool = MagicMock()
+        pool.request.return_value = r429
+        client = UrllibClient(_http=pool, circuit_breaker=cb)
+        with pytest.raises(HttpError) as exc_info:
+            client.get_json(
+                "https://tripped.example.com/x",
                 total_timeout=60, retries=2,
             )
+        assert not exc_info.value.circuit_break
 
-        # Now build a fresh client. It MUST see the open circuit.
-        pool2 = MagicMock()
-        pool2.request.return_value = r429
-        client2 = UrllibClient(_http=pool2)
-
-        with pytest.raises(HttpError, match="Circuit open"):
-            client2.get_json(
-                "https://shared-host.example.com/y",
-                total_timeout=10, retries=2,
+        with pytest.raises(HttpError) as exc_next:
+            client.get_json(
+                "https://tripped.example.com/y",
+                total_timeout=60, retries=2,
             )
-        # Confirm pool2 was never invoked — the second client benefits
-        # from the first client's discovery without redoing the work.
-        assert pool2.request.call_count == 0
+        assert exc_next.value.circuit_break is True
+
+
+class TestOperatorProxyEnv:
+    """UrllibClient must honour the operator's proxy env when no pool
+    manager is injected — mandatory-egress-proxy hosts have no direct
+    route. Injected pools (EgressClient's chokepoint) disable the
+    snapshot so no_proxy can never bypass the chokepoint."""
+
+    def test_no_proxy_env_uses_direct_pool(self, monkeypatch):
+        from core.http.urllib_backend import UrllibClient
+        for var in ("http_proxy", "https_proxy", "all_proxy",
+                    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(var, raising=False)
+        client = UrllibClient()
+        assert client._proxy_pools == {}
+        assert client._pool_for("https://api.osv.dev/v1") is client._http
+
+    def test_proxy_env_routes_via_proxy_manager(self, monkeypatch):
+        import urllib3 as _u3
+
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv("https_proxy", "http://proxy.corp:3128")
+        monkeypatch.setenv("http_proxy", "http://proxy.corp:3128")
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        client = UrllibClient()
+        pool = client._pool_for("https://api.osv.dev/v1")
+        assert isinstance(pool, _u3.ProxyManager)
+        assert pool.proxy.host == "proxy.corp"
+        assert pool.proxy.port == 3128
+        # http and https share one manager when the URL is identical
+        assert client._pool_for("http://example.com/") is pool
+
+    def test_no_proxy_entries_bypass_proxy(self, monkeypatch):
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv("https_proxy", "http://proxy.corp:3128")
+        monkeypatch.setenv("no_proxy", "169.254.169.254,internal.corp")
+        client = UrllibClient()
+        assert client._pool_for("https://internal.corp/x") is client._http
+        assert client._pool_for("https://sub.internal.corp/x") is client._http
+        assert client._pool_for("https://api.osv.dev/v1") is not client._http
+
+    def test_all_proxy_fallback(self, monkeypatch):
+        import urllib3 as _u3
+
+        from core.http.urllib_backend import UrllibClient
+        for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("all_proxy", "http://proxy.corp:3128")
+        client = UrllibClient()
+        assert isinstance(
+            client._pool_for("https://api.osv.dev/v1"), _u3.ProxyManager,
+        )
+
+    def test_injected_pool_disables_env_snapshot(self, monkeypatch):
+        """EgressClient regression guard: an injected pool is used
+        exclusively — env proxy vars must not reroute it and no_proxy
+        must not bypass it."""
+        from unittest.mock import MagicMock
+
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv("https_proxy", "http://proxy.corp:3128")
+        monkeypatch.setenv("no_proxy", "*")
+        injected = MagicMock()
+        client = UrllibClient(_http=injected)
+        assert client._pool_for("https://api.osv.dev/v1") is injected
+
+    def test_malformed_proxy_env_does_not_break_construction(
+        self, monkeypatch,
+    ):
+        """A schemeless or socks proxy value must not raise from
+        UrllibClient() — loopback/no_proxy-only uses never touch the
+        proxy and must keep working (regression: eager ProxyManager
+        construction raised ProxySchemeUnknown from every client)."""
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv("https_proxy", "proxy.corp:3128")  # schemeless
+        monkeypatch.setenv("http_proxy", "socks5://proxy.corp:1080")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+        client = UrllibClient()  # must not raise
+        # no_proxy'd hosts route direct, untouched by the bad value.
+        assert client._pool_for("http://127.0.0.1:8080/x") is client._http
+        assert client._pool_for("https://localhost/x") is client._http
+
+    def test_malformed_proxy_env_fails_proxied_request_clearly(
+        self, monkeypatch,
+    ):
+        from core.http import HttpError
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv("https_proxy", "socks5://proxy.corp:1080")
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        client = UrllibClient()
+        with pytest.raises(HttpError, match="invalid proxy configuration"):
+            client._pool_for("https://api.osv.dev/v1")
+        # Cached: the second attempt fails identically, not from a
+        # fresh construction path.
+        with pytest.raises(HttpError, match="invalid proxy configuration"):
+            client._pool_for("https://api.osv.dev/v1")
+
+    def test_proxy_error_message_redacts_credentials(self, monkeypatch):
+        from core.http import HttpError
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv(
+            "https_proxy", "socks5://user:hunter2secret@proxy.corp:1080")
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        client = UrllibClient()
+        with pytest.raises(HttpError) as exc_info:
+            client._pool_for("https://api.osv.dev/v1")
+        assert "hunter2secret" not in str(exc_info.value)
+
+    def test_proxy_manager_construction_is_lazy(self, monkeypatch):
+        """No ProxyManager exists until a proxied request needs one."""
+        from core.http.urllib_backend import UrllibClient
+        monkeypatch.setenv("https_proxy", "http://proxy.corp:3128")
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        client = UrllibClient()
+        assert client._proxy_pools == {}
+        client._pool_for("https://api.osv.dev/v1")
+        assert "https" in client._proxy_pools
+
+    def test_proxy_url_basic_auth_extracted(self, monkeypatch):
+        from core.http.urllib_backend import _new_proxy_manager
+        pm = _new_proxy_manager("http://user:secret@proxy.corp:3128")
+        assert pm.proxy.host == "proxy.corp"
+        assert pm.proxy.port == 3128
+        assert pm.proxy_headers.get("proxy-authorization", "").startswith(
+            "Basic ",
+        )
+
+
+class TestHostInNoProxy:
+    def test_matching(self):
+        from core.http.urllib_backend import _host_in_no_proxy
+        assert _host_in_no_proxy("anything.example", ("*",))
+        assert _host_in_no_proxy("example.com", ("example.com",))
+        assert _host_in_no_proxy("a.example.com", ("example.com",))
+        assert _host_in_no_proxy("a.example.com", (".example.com",))
+        assert _host_in_no_proxy("example.com", ("example.com:443",), 443)
+        assert not _host_in_no_proxy("notexample.com", ("example.com",))
+        assert not _host_in_no_proxy("example.com", ())
+        assert _host_in_no_proxy("169.254.169.254", ("169.254.169.254",))
+
+
+class TestBoundedDrainOnAbort:
+    """After an abort (SizeLimitExceeded, 4xx snippet), cleanup must
+    not read a hostile remainder to EOF — drain is budgeted and the
+    connection is closed when more remains."""
+
+    class _HostileResponse:
+        """Response with a huge remainder that tracks post-abort
+        reads. stream() raises the caller into the abort path after
+        the first chunk; read() then serves from a 10 MB remainder."""
+
+        def __init__(self, remainder_bytes: int = 10 * 1024 * 1024):
+            self.status = 200
+            self.reason = "OK"
+            self.headers = {}
+            self._remainder = remainder_bytes
+            self.bytes_drained = 0
+            self.closed = False
+            self.released = False
+
+        def stream(self, chunk_size, decode_content=None):
+            yield b"x" * 1024   # first chunk trips max_bytes below
+
+        def read(self, amt=None, decode_content=None):
+            if self.closed or self._remainder <= 0:
+                return b""
+            take = self._remainder if amt is None else min(amt, self._remainder)
+            self._remainder -= take
+            self.bytes_drained += take
+            return b"y" * take
+
+        def drain_conn(self):
+            # urllib3 2.x semantics: read to EOF, unbounded.
+            while self.read(2 ** 20):
+                pass
+
+        def geturl(self):
+            return ""
+
+        def close(self):
+            self.closed = True
+
+        def release_conn(self):
+            self.released = True
+
+    def test_size_limit_abort_does_not_drain_hostile_remainder(self):
+        resp = self._HostileResponse()
+        pool = MagicMock()
+        pool.request.return_value = resp
+        client = UrllibClient(_http=pool)
+        with pytest.raises(SizeLimitExceeded):
+            client.request("GET", "https://example.com/huge",
+                           max_bytes=512, retries=0)
+        # Budgeted: never reads the 10 MB remainder (pre-fix
+        # drain_conn consumed all of it), and the connection is
+        # closed rather than returned poisoned.
+        assert resp.bytes_drained <= 64 * 1024
+        assert resp.closed
+        assert resp.released
+
+    def test_stream_bytes_abort_does_not_drain_hostile_remainder(self):
+        resp = self._HostileResponse()
+        pool = MagicMock()
+        pool.request.return_value = resp
+        client = UrllibClient(_http=pool)
+        with pytest.raises(SizeLimitExceeded):
+            for _ in client.stream_bytes(
+                "https://example.com/huge", max_bytes=512,
+            ):
+                pass
+        assert resp.bytes_drained <= 64 * 1024
+        assert resp.closed
+        assert resp.released
+
+    def test_small_partial_remainder_is_closed_without_more_reads(self):
+        """Even a small unread remainder can stall; close rather than drain."""
+        resp = self._HostileResponse(remainder_bytes=2048)
+        pool = MagicMock()
+        pool.request.return_value = resp
+        client = UrllibClient(_http=pool)
+        with pytest.raises(SizeLimitExceeded):
+            client.request("GET", "https://example.com/big",
+                           max_bytes=512, retries=0)
+        assert resp.bytes_drained == 0
+        assert resp.closed
+        assert resp.released
+
+
+# ---------------------------------------------------------------------------
+# HttpError contract hardening: port accessor, raise_on_status=False for
+# transient statuses, stream-path exception translation
+# ---------------------------------------------------------------------------
+
+class TestInvalidPortTranslation:
+
+    def test_out_of_range_port_raises_http_error(self):
+        client, _pool = _client_with_mock_pool(_stub_response(b"{}"))
+        with pytest.raises(HttpError, match="invalid port"):
+            client.get_json("https://example.com:99999/api")
+
+
+class TestRaiseOnStatusFalseTransient:
+
+    def test_final_503_response_returned_not_raised(self):
+        resp = _stub_response(b"try later", status=503, reason="Unavailable")
+        client, _pool = _client_with_mock_pool(resp)
+        out = client.request(
+            "GET", "https://example.com/x",
+            retries=0, raise_on_status=False,
+        )
+        assert isinstance(out, Response)
+        assert out.status == 503
+        assert out.body == b"try later"
+
+    def test_final_429_response_returned_not_raised(self):
+        resp = _stub_response(
+            b"slow down", status=429, reason="Too Many Requests",
+            extra_headers={"Retry-After": "1"},
+        )
+        client, _pool = _client_with_mock_pool(resp)
+        out = client.request(
+            "GET", "https://example.com/x",
+            retries=0, raise_on_status=False,
+        )
+        assert out.status == 429
+
+    def test_transient_still_retries_before_returning(self):
+        bad = _stub_response(b"nope", status=503, reason="Unavailable")
+        good = _stub_response(b'{"ok": 1}')
+        client, pool = _client_with_mock_pool([bad, good])
+        with mock_module_attribute(_clock_consumer, 'time', 'sleep'):
+            out = client.request(
+                "GET", "https://example.com/x",
+                retries=1, raise_on_status=False,
+            )
+        assert out.status == 200
+        assert pool.request.call_count == 2
+
+    def test_default_raise_on_status_unchanged(self):
+        resp = _stub_response(b"nope", status=503, reason="Unavailable")
+        client, _pool = _client_with_mock_pool(resp)
+        with pytest.raises(HttpError):
+            client.request("GET", "https://example.com/x", retries=0)
+
+
+class TestStreamExceptionTranslation:
+
+    def test_request_failure_translates_to_http_error(self):
+        import urllib3.exceptions as u3e
+
+        pool = MagicMock()
+        pool.request.side_effect = u3e.ProtocolError("connection reset")
+        client = UrllibClient(_http=pool)
+        it = client.stream_bytes("https://example.com/blob", retries=0)
+        with pytest.raises(HttpError, match="stream request failed"):
+            list(it)
+
+    def test_mid_stream_failure_translates_to_http_error(self):
+        import urllib3.exceptions as u3e
+
+        def _chunks(chunk_size, decode_content=True):
+            yield b"first"
+            raise u3e.ProtocolError("connection reset mid-body")
+
+        resp = MagicMock()
+        resp.status = 200
+        resp.headers = {}
+        resp.stream = _chunks
+        resp.read = lambda *a, **kw: b""
+        resp.release_conn = MagicMock()
+        resp.geturl = lambda: ""
+        client = UrllibClient(_http=MagicMock(
+            request=MagicMock(return_value=resp)))
+        it = client.stream_bytes("https://example.com/blob", retries=0)
+        collected = []
+        with pytest.raises(HttpError, match="aborted mid-body"):
+            for chunk in it:
+                collected.append(chunk)
+        assert collected == [b"first"]
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker vs backoff schedule — per-request granularity
+# ---------------------------------------------------------------------------
+
+
+class TestBreakerPerRequestGranularity:
+    """The breaker fail-fasts SUBSEQUENT requests; a request already in
+    flight completes its documented backoff schedule. Both directions
+    pinned: schedule reachable for status-driven failures AND hard-down
+    hosts still bounded to one request's budget + cooldown."""
+
+    def test_in_flight_request_completes_schedule_despite_open_breaker(self):
+        """Default threshold (2) opens the circuit on the 2nd 429 of a
+        single request — the in-flight request must still fire every
+        remaining schedule slot instead of being capped at one retry."""
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as _mock_sleep,
+        ):
+            cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+            r429 = _stub_response(b"", status=429, reason="Too Many Requests")
+            pool = MagicMock()
+            pool.request.return_value = r429
+            client = UrllibClient(_http=pool, circuit_breaker=cb)
+            with pytest.raises(HttpError, match="Exhausted retries"):
+                client.get_json(
+                    "https://rate-limited.example.com/x",
+                    total_timeout=600, retries=4,
+                )
+            # All 5 attempts (initial + 4 retries) reached the pool.
+            assert pool.request.call_count == 5
+
+            # ...and the breaker still protects the NEXT request.
+            assert cb.is_open("rate-limited.example.com", 443)[0] is True
+            pool.request.reset_mock()
+            with pytest.raises(HttpError, match="Circuit open"):
+                client.get_json("https://rate-limited.example.com/y")
+            assert pool.request.call_count == 0
+
+    def test_retry_after_honoured_beyond_first_retry(self):
+        """Retry-After steers EVERY slot's sleep — pre-fix the breaker
+        aborted after the second 429, so a host asking for a pause was
+        blocklisted instead of retried per its own instruction; a
+        mid-schedule success must also close the circuit again."""
+        with (
+            mock_module_attribute(_mock_owner('core.http.urllib_backend'), 'time', 'sleep') as mock_sleep,
+        ):
+            cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+            r429 = _stub_response(
+                b"", status=429, reason="Too Many Requests",
+                extra_headers={"Retry-After": "7"},
+            )
+            ok = _stub_response(b'{"ok": 1}')
+            pool = MagicMock()
+            pool.request.side_effect = [r429, r429, r429, ok]
+            client = UrllibClient(_http=pool, circuit_breaker=cb)
+            result = client.get_json(
+                "https://flaky.example.com/x", total_timeout=600, retries=3,
+            )
+            assert result == {"ok": 1}
+            sleeps = [c.args[0] for c in mock_sleep.call_args_list]
+            assert sleeps == [7, 7, 7]
+            assert cb.is_open("flaky.example.com", 443)[0] is False
+
+
+class TestStreamErrorBodyReadTranslation:
+    """A server that answers 4xx/5xx headers then stalls or resets
+    during the bounded error-body read raises raw urllib3 types from
+    resp.read() — those must translate to HttpError like the mid-body
+    loop (consumers guard the stream with ``except HttpError`` only)."""
+
+    def test_4xx_snippet_read_timeout_translates_to_httperror(self):
+        import urllib3.exceptions as u3e
+
+        resp = _stub_response(b"", status=503,
+                              reason="Service Unavailable", final_url="")
+
+        def _raise(*a, **kw):
+            raise u3e.ReadTimeoutError(None, "https://example.com/blob",
+                                       "Read timed out.")
+
+        resp.read = _raise
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError) as excinfo:
+            next(it)
+        assert excinfo.value.status == 503
+        assert "error-body read failed" in str(excinfo.value)
+
+    def test_4xx_snippet_protocol_error_translates_to_httperror(self):
+        import urllib3.exceptions as u3e
+
+        resp = _stub_response(b"", status=404,
+                              reason="Not Found", final_url="")
+
+        def _raise(*a, **kw):
+            raise u3e.ProtocolError("Connection broken: reset")
+
+        resp.read = _raise
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError):
+            next(it)
+
+    def test_4xx_snippet_normal_read_still_reports_status(self):
+        # Two-direction: the happy 4xx path (readable error body)
+        # keeps its status + redacted-snippet shape.
+        resp = _stub_response(b"nope", status=418,
+                              reason="Teapot", final_url="")
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError) as excinfo:
+            next(it)
+        assert excinfo.value.status == 418
+        assert "418" in str(excinfo.value)

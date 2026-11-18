@@ -1,0 +1,449 @@
+"""Hermeticity contracts of the ``libexec/raptor-self-test`` harness.
+
+The self-test promises that tier-0 children can never resolve a paid
+external LLM and that its cases exercise real outcomes (no vacuous
+assertions). These tests import the script as a module and pin:
+
+* the tier-0 env scrub covers every env signal
+  ``core.llm.detection`` treats as an available external LLM, and the
+  models-config discovery path is redirected to an empty stub;
+* ``case_project_lifecycle`` actually fails when the project manager
+  breaks, and keeps all state under the scratch tree;
+* the tool-matrix classifies an unexercised (build-failed) AFL entry
+  as a visible skip, never a clean pass;
+* the no-secret-leakage sweep sees both the outputs and the logs
+  trees, in both directions.
+
+Everything runs against scratch/tmp state: fake HOME, scrubbed env,
+no network, no LLM calls.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+
+import pytest
+
+
+from core.testing.standalone_cli import run_standalone_cli
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SCRIPT = REPO_ROOT / "libexec" / "raptor-self-test"
+
+
+@pytest.fixture(scope="module")
+def selftest() -> Any:
+    """Import the script with trust scoped only to module execution."""
+    absent_module = object()
+    prior_module = sys.modules.get("raptor_self_test", absent_module)
+    try:
+        loader = importlib.machinery.SourceFileLoader(
+            "raptor_self_test", str(SCRIPT),
+        )
+        spec = importlib.util.spec_from_loader("raptor_self_test", loader)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["raptor_self_test"] = mod
+        with (
+            pytest.MonkeyPatch.context() as scope,
+            patch.object(sys, "path", sys.path.copy()),
+        ):
+            scope.setenv("_RAPTOR_TRUSTED", "1")
+            inherited_dir = os.environ.get("RAPTOR_DIR")
+            scope.setenv("RAPTOR_DIR", inherited_dir if inherited_dir is not None else "")
+            if inherited_dir is None:
+                scope.delenv("RAPTOR_DIR")
+            spec.loader.exec_module(mod)
+        yield mod
+    finally:
+        if prior_module is absent_module:
+            sys.modules.pop("raptor_self_test", None)
+        else:
+            sys.modules["raptor_self_test"] = prior_module
+
+
+def _make_ctx(selftest: "ModuleType", scratch: Path) -> Any:
+    args = argparse.Namespace(
+        timeout=120, keep=False, model=None, max_llm_cost=2.0,
+        only=[], with_llm=False, deep=False, json=None, case_workers=1,
+    )
+    return selftest.Ctx(scratch, args)
+
+
+def _poison_llm_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Set every LLM env signal plus a keyed models.json in a fake HOME
+    and via RAPTOR_CONFIG — the worst-case operator environment a
+    tier-0 child must never see."""
+    keyed = {"models": [{"provider": "openai", "model": "gpt-fixture",
+                         "api_key": "unit-test-inline-key"}]}
+    home = tmp_path / "poison-home"
+    cfg_dir = home / ".config" / "raptor"
+    cfg_dir.mkdir(parents=True)
+    # Key-bearing fixtures must be private (0600): the models-config
+    # permission gate fail-closes on a group/other-readable keyed
+    # file, and the poison here is the CONTENT being reachable, not
+    # its mode.
+    (cfg_dir / "models.json").write_text(json.dumps(keyed))
+    (cfg_dir / "models.json").chmod(0o600)
+    explicit = tmp_path / "keyed-models.json"
+    explicit.write_text(json.dumps(keyed))
+    explicit.chmod(0o600)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("RAPTOR_CONFIG", str(explicit))
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+                "MISTRAL_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
+                "RAPTOR_BEDROCK_MODEL", "RAPTOR_BEDROCK_PROFILE",
+                "RAPTOR_LLM_SOCKET"):
+        monkeypatch.setenv(var, "unit-test-poison")
+    return home
+
+
+class TestTier0LlmScrub:
+    def test_scrub_covers_every_detection_signal(self, selftest) -> None:
+        # Every env var core.llm.detection counts toward external-LLM
+        # availability (cloud keys, the Bedrock opt-in signals, the
+        # dispatcher socket) plus the Claude Code marker must be in
+        # the scrub set — one omission makes tier-0 children able to
+        # dispatch paid calls.
+        required = {
+            "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+            "MISTRAL_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
+            "RAPTOR_BEDROCK_MODEL", "RAPTOR_BEDROCK_PROFILE",
+            "RAPTOR_LLM_SOCKET", "CLAUDECODE",
+        }
+        missing = required - set(selftest._LLM_ENV_VARS)
+        assert not missing, f"tier-0 scrub misses LLM signals: {missing}"
+
+    def test_env_t0_strips_signals_and_neutralises_config(
+        self, selftest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _poison_llm_env(monkeypatch, tmp_path)
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        env = ctx.env_t0()
+        for var in selftest._LLM_ENV_VARS:
+            assert var not in env, f"{var} survived the tier-0 scrub"
+        # Config discovery must resolve to the empty stub, defeating
+        # both $RAPTOR_CONFIG and the HOME-path fallback.
+        assert env["RAPTOR_CONFIG"] == str(ctx.empty_models_config)
+        assert json.loads(ctx.empty_models_config.read_text()) == {
+            "models": [],
+        }
+
+    def test_env_t0_child_resolves_no_external_llm(
+        self, selftest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Functional: with the worst-case poisoned operator env, a
+        # child running the real detection must report no external
+        # LLM (the paid-call gate for every tier-0 case).
+        _poison_llm_env(monkeypatch, tmp_path)
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        env = ctx.env_t0()
+        env.setdefault("RAPTOR_DIR", str(REPO_ROOT))
+        probe = (
+            "import os, sys\n"
+            "sys.path.insert(0, os.environ['RAPTOR_DIR'])\n"
+            "from core.llm.detection import detect_llm_availability\n"
+            "print('EXTERNAL', detect_llm_availability().external_llm)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe], env=env, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        assert proc.returncode == 0, proc.stderr[-500:]
+        assert "EXTERNAL False" in proc.stdout, (
+            f"tier-0 child still resolves an external LLM:\n"
+            f"{proc.stdout}{proc.stderr[-300:]}"
+        )
+
+    def test_env_llm_keeps_operator_env(
+        self, selftest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Tier 1 is the other direction: the operator's keys and
+        # config must stay visible.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "unit-test-value")
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        env = ctx.env_llm()
+        assert env["ANTHROPIC_API_KEY"] == "unit-test-value"
+        assert env.get("RAPTOR_CONFIG") != str(ctx.empty_models_config)
+
+
+class TestChildSessionIsolation:
+    @pytest.mark.parametrize("mode", ["tier0", "isolated-home", "llm"])
+    def test_child_env_preserves_install_protection(
+        self, selftest, tmp_path, monkeypatch, mode,
+    ):
+        monkeypatch.setenv("RAPTOR_INSTALL_PROTECTED", "1")
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        env = (ctx.env_llm() if mode == "llm" else
+               ctx.env_t0(isolated_home=mode == "isolated-home"))
+        assert env["RAPTOR_INSTALL_PROTECTED"] == "1"
+
+    @pytest.mark.parametrize("mode", ["tier0", "isolated-home", "llm"])
+    @pytest.mark.parametrize("ci", [False, True])
+    def test_real_child_cannot_restore_operator_session(
+        self, selftest, tmp_path, monkeypatch, mode, ci,
+    ):
+        operator = tmp_path / "operator"
+        operator.mkdir()
+        inherited = {
+            "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli",
+            "CLAUDE_SESSION_ID": "foreign-session",
+            "RAPTOR_SESSION_PID": str(os.getpid()),
+            "RAPTOR_SESSION_TOKEN": "foreign-token",
+            "_RAPTOR_SCRATCH_AUTH": "foreign-scratch-authorization",
+            "RAPTOR_REGISTRY_HOME": str(operator),
+            "RAPTOR_OUT_DIR": str(operator),
+            "RAPTOR_CALLER_DIR": str(operator), "RAPTOR_LAUNCH_TARGET": "target",
+        }
+        for key, value in inherited.items():
+            monkeypatch.setenv(key, value)
+        # This child is launched without a protected mount namespace.
+        # Marker propagation is checked separately above; claiming protection
+        # here correctly makes process_init reject an ordinary CI checkout.
+        monkeypatch.delenv("RAPTOR_INSTALL_PROTECTED", raising=False)
+        if ci:
+            monkeypatch.setenv("CI", "true")
+        else:
+            monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        env = (ctx.env_llm() if mode == "llm" else
+               ctx.env_t0(isolated_home=mode == "isolated-home"))
+        # An actual dispatcher import must not consult a foreign broker or
+        # replace the scratch registry with the operator's restored settings.
+        code = (
+            "import os, sys; sys.path.insert(0, sys.argv[1]); "
+            "import core.startup.process_init; "
+            "assert not os.environ.get('CLAUDE_SESSION_ID'); "
+            "assert not os.environ.get('RAPTOR_SESSION_TOKEN'); "
+            "assert os.environ['RAPTOR_REGISTRY_HOME'] == sys.argv[2]; "
+            "assert os.environ['RAPTOR_OUT_DIR'] == sys.argv[3]"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", code, str(REPO_ROOT),
+             str(ctx.home / ".raptor"), str(ctx.outs)],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not list(operator.iterdir())
+        for key in inherited:
+            if key not in {"RAPTOR_REGISTRY_HOME", "RAPTOR_OUT_DIR"}:
+                assert key not in env
+        assert "RAPTOR_INSTALL_PROTECTED" not in env
+        assert (env.get("CI") == "true") == ci
+        assert ("ANTHROPIC_API_KEY" in env) == (mode == "llm")
+
+    def test_children_own_temp_root_and_remove_launch_markers(
+        self, selftest, tmp_path, monkeypatch,
+    ):
+        for key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID"):
+            monkeypatch.setenv(key, "operator-session")
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        for env in (ctx.env_t0(), ctx.env_llm()):
+            assert env["TMPDIR"] == str(ctx.child_tmp)
+            assert ctx.child_tmp.is_dir()
+            assert not any(key in env for key in
+                           ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID"))
+
+
+class TestProjectLifecycleCase:
+    def test_broken_project_manager_fails_the_case(
+        self, selftest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A project manager that exits nonzero on every subcommand
+        # must fail the case (it used to pass unconditionally).
+        fake_repo = tmp_path / "fake-repo"
+        (fake_repo / "libexec").mkdir(parents=True)
+        stub = fake_repo / "libexec" / "raptor-project-manager"
+        stub.write_text("#!/bin/sh\nexit 1\n")
+        stub.chmod(0o755)
+        monkeypatch.setattr(selftest, "_RAPTOR_DIR", fake_repo)
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        ctx.fixture.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(AssertionError):
+            selftest.case_project_lifecycle(ctx)
+
+    @pytest.mark.slow
+    def test_lifecycle_passes_and_stays_in_scratch(
+        self, selftest, tmp_path: Path,
+    ) -> None:
+        # Good direction: against the real project manager the whole
+        # step list succeeds, and no state leaks outside the scratch
+        # tree (isolated HOME registry + RAPTOR_OUT_DIR data dirs).
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        ctx.fixture.mkdir(parents=True, exist_ok=True)
+        (ctx.fixture / "app.py").write_text("x = 1\n")
+        repo_projects = REPO_ROOT / "out" / "projects"
+        before = (set(os.listdir(repo_projects))
+                  if repo_projects.is_dir() else set())
+        selftest.case_project_lifecycle(ctx)
+        after = (set(os.listdir(repo_projects))
+                 if repo_projects.is_dir() else set())
+        assert after == before, (
+            f"project state leaked into the checkout: {after - before}"
+        )
+        # The case's own end-state check: scratch registry left empty.
+        registry = ctx.home / ".raptor" / "projects"
+        assert not list(registry.glob("*.json"))
+
+
+class TestRunLifecycleCase:
+    def test_fail_leg_asserted_end_to_end(
+        self, selftest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # start → complete → start → fail, with the fail leg now
+        # checked (exit 0 + status=failed recorded in run2's dir).
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        ctx.fixture.mkdir(parents=True, exist_ok=True)
+        (ctx.fixture / "app.py").write_text("x = 1\n")
+        selftest.case_run_lifecycle(ctx)
+        status = json.loads(
+            (ctx.outs / "lifecycle" / "run2" / ".raptor-run.json")
+            .read_text()
+        )
+        assert status.get("status") == "failed"
+
+
+class TestToolMatrixSkip:
+    def test_failed_afl_build_returns_skip_verdict(
+        self, selftest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        stub = tmp_path / "afl-clang-fast"
+        stub.write_text("#!/bin/sh\necho 'no such target' >&2\nexit 1\n")
+        stub.chmod(0o755)
+        patch_module_attribute(monkeypatch,
+            selftest, 'shutil', "which",
+            lambda name, *a, **k: (
+                str(stub) if name in ("afl-clang-fast", "afl-gcc") else None
+            ),
+        )
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        native = ctx.fixture / "native"
+        native.mkdir(parents=True)
+        (native / "main.c").write_text("int main(void){return 0;}\n")
+        verdict = selftest._run_afl_matrix(ctx, dict(os.environ))
+        assert verdict.get("skip"), "build failure must yield a skip verdict"
+        # The old shape returned rc=0, which sat inside afl-showmap's
+        # expected set and read as a clean pass forever.
+        assert verdict.get("rc") != 0
+        assert selftest._matrix_entry_status(verdict, [0, 2], False) == "skip"
+
+    def test_matrix_entry_status_directions(self, selftest) -> None:
+        st = selftest._matrix_entry_status
+        assert st({"rc": 0}, [0, 2], False) == "pass"
+        assert st({"rc": 2}, [0, 2], False) == "pass"
+        assert st({"rc": 7}, [0, 2], False) == "fail"
+        assert st({"rc": 0, "fallback": True}, [0], False) == "degraded"
+        assert st({"rc": 0, "fallback": True}, [0], True) == "fail"
+        # skip wins over everything — it must never read as pass.
+        assert st({"rc": 0, "skip": "x"}, [0], False) == "skip"
+
+
+class TestNoSecretLeakageSweep:
+    def test_clean_trees_pass(self, selftest, tmp_path: Path) -> None:
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        (ctx.outs / "report.md").write_text("all clean\n")
+        (ctx.logs / "scan.log").write_text("$ scan\nok\n")
+        selftest.case_no_secret_leakage(ctx)
+
+    def test_marker_in_outputs_fails(self, selftest, tmp_path: Path) -> None:
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        (ctx.outs / "combined.sarif").write_text("token sk-FAKE-leak\n")
+        with pytest.raises(AssertionError, match="leaked"):
+            selftest.case_no_secret_leakage(ctx)
+
+    def test_marker_in_logs_fails(self, selftest, tmp_path: Path) -> None:
+        # The logs tree is where the hostile fixture's consumers write
+        # their captured stdout — a masking regression lands here.
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        (ctx.logs / "trust-mask-hostile.log").write_text(
+            "report: key sk-FAKE-leak\n"
+        )
+        with pytest.raises(AssertionError, match="leaked"):
+            selftest.case_no_secret_leakage(ctx)
+
+    def test_oversize_files_reported_not_silent(
+        self, selftest, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        ctx = _make_ctx(selftest, tmp_path / "scratch")
+        big = ctx.outs / "huge.sarif"
+        with open(big, "wb") as fh:
+            fh.write(b"sk-FAKE-hidden")
+            fh.truncate(50_000_001)  # sparse: st_size counts, no disk cost
+        selftest.case_no_secret_leakage(ctx)
+        assert "not swept" in capsys.readouterr().out
+
+
+class TestHelpTextTruthful:
+    def test_max_llm_cost_documented_per_case(self) -> None:
+        env = dict(os.environ)
+        env["_RAPTOR_TRUSTED"] = "1"
+        proc = run_standalone_cli(
+            [sys.executable, str(SCRIPT), "--help"], env=env,
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            timeout=120, check=False,
+        )
+        assert proc.returncode == 0
+        # The cap is enforced per case (audit 0.50, agentic 1.00), so
+        # the help must not promise a single total ceiling.
+        assert "per-case USD ceiling" in proc.stdout
+        assert "total USD ceiling" not in proc.stdout
+
+
+def test_joern_matrix_resolves_host_launcher_symlink(selftest, tmp_path, monkeypatch):
+    from packages.joern import prereqs, runner
+
+    installation = tmp_path / "installation"
+    installation.mkdir()
+    launcher = installation / "joern-parse"
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    alias = tmp_path / "user-bin" / "joern-parse"
+    alias.parent.mkdir()
+    alias.symlink_to(launcher)
+    patch_module_attribute(monkeypatch, selftest, 'shutil', "which",
+                        lambda name: str(alias) if name == "joern-parse" else None)
+    monkeypatch.setattr(prereqs, "_joern_parse_resolved", False)
+    monkeypatch.setattr(prereqs, "_resolved_joern_parse", None)
+    monkeypatch.setattr(prereqs, "joern_tool_paths", lambda: [str(installation)])
+    monkeypatch.setattr(runner, "_jvm_scratch_command", lambda command, directory: command)
+    ctx = _make_ctx(selftest, tmp_path / "scratch")
+    entry = next(spec for spec in selftest._matrix_specs(ctx) if spec["name"] == "joern-parse")
+    assert entry["argv"][0] == str(launcher)
+    assert entry["require"] == str(launcher)
+    assert str(alias) not in entry["argv"]
+    assert entry["kwargs"]["tool_paths"] == [str(installation)]
+
+
+@pytest.fixture(autouse=True)
+def _forward_selftest_tool_lookup(selftest, monkeypatch):
+    """Own resolver state and forward the matrix's delegated Joern lookup."""
+    from packages.joern import prereqs
+
+    for name in ("_resolved_joern", "_joern_resolved", "_resolved_joern_parse",
+                 "_joern_parse_resolved", "_resolved_java", "_java_resolved"):
+        monkeypatch.setattr(prereqs, name, getattr(prereqs, name))
+    prereqs.reset_path_cache()
+    patch_module_attribute(monkeypatch, prereqs, "shutil", "which",
+                           lambda *args, **kwargs: selftest.shutil.which(*args, **kwargs))

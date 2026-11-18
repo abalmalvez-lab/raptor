@@ -1,13 +1,78 @@
 rules:
+  # Known gaps (not cheaply expressible as literal-keysize patterns, left for a
+  # dedicated pass):
+  #   * EC: weak curves are named (secp160r1, prime192v1, ...) not sized —
+  #     needs a curve-name allowlist/blocklist rule per library.
+  #   * DH/DHE: parameter strength usually comes from loaded parameter files
+  #     or library defaults rather than an inline integer.
+
   - id: raptor.crypto.rsa.small-key.java
     message: RSA key size too small. Use >= 2048 bits. Verify by regenerating keys and updating tests.
-    languages: [java, kotlin]
+    languages: [java]
     severity: HIGH
     patterns:
       - pattern: |
-          KeyPairGenerator $KPG = KeyPairGenerator.getInstance("RSA");
+          java.security.KeyPairGenerator $KPG = java.security.KeyPairGenerator.getInstance("RSA", ...);
+          ...
+          $KPG.initialize($N, ...);
+      - metavariable-comparison:
+          metavariable: $N
+          comparison: $N < 2048
+    metadata:
+      cwe: ["CWE-326"]
+      asvs: ["V3.11"]
+
+  - id: raptor.crypto.rsa.small-key.kotlin
+    message: RSA key size too small. Use >= 2048 bits. Verify by regenerating keys and updating tests.
+    languages: [kotlin]
+    severity: HIGH
+    patterns:
+      - pattern-either:
+          - pattern: |
+              val $KPG = java.security.KeyPairGenerator.getInstance("RSA", ...)
+              ...
+              $KPG.initialize($N, ...)
+          - pattern: |
+              var $KPG = java.security.KeyPairGenerator.getInstance("RSA", ...)
+              ...
+              $KPG.initialize($N, ...)
+      - metavariable-comparison:
+          metavariable: $N
+          comparison: $N < 2048
+    metadata:
+      cwe: ["CWE-326"]
+      asvs: ["V3.11"]
+
+  - id: raptor.crypto.dsa.small-key.java
+    message: DSA key size too small. Use >= 2048 bits (or prefer EdDSA/ECDSA). Verify by regenerating keys.
+    languages: [java]
+    severity: HIGH
+    patterns:
       - pattern: |
-          $KPG.initialize($N, ...)
+          java.security.KeyPairGenerator $KPG = java.security.KeyPairGenerator.getInstance("DSA", ...);
+          ...
+          $KPG.initialize($N, ...);
+      - metavariable-comparison:
+          metavariable: $N
+          comparison: $N < 2048
+    metadata:
+      cwe: ["CWE-326"]
+      asvs: ["V3.11"]
+
+  - id: raptor.crypto.dsa.small-key.kotlin
+    message: DSA key size too small. Use >= 2048 bits (or prefer EdDSA/ECDSA). Verify by regenerating keys.
+    languages: [kotlin]
+    severity: HIGH
+    patterns:
+      - pattern-either:
+          - pattern: |
+              val $KPG = java.security.KeyPairGenerator.getInstance("DSA", ...)
+              ...
+              $KPG.initialize($N, ...)
+          - pattern: |
+              var $KPG = java.security.KeyPairGenerator.getInstance("DSA", ...)
+              ...
+              $KPG.initialize($N, ...)
       - metavariable-comparison:
           metavariable: $N
           comparison: $N < 2048
@@ -20,7 +85,33 @@ rules:
     languages: [python]
     severity: HIGH
     patterns:
-      - pattern: rsa.generate_private_key(public_exponent=$E, key_size=$N, ...)
+      - pattern-either:
+          # cryptography.hazmat
+          - pattern: cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key(public_exponent=$E, key_size=$N, ...)
+          - pattern: cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key($E, $N, ...)
+          - pattern: cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key($E, key_size=$N, ...)
+          # pycryptodome / pycrypto
+          - pattern: Crypto.PublicKey.RSA.generate($N, ...)
+          - pattern: Crypto.PublicKey.RSA.generate(bits=$N, ...)
+      - metavariable-comparison:
+          metavariable: $N
+          comparison: $N < 2048
+    metadata:
+      cwe: ["CWE-326"]
+      asvs: ["V3.11"]
+
+  - id: raptor.crypto.dsa.small-key.python
+    message: DSA key size too small. Use >= 2048 bits (or prefer EdDSA/ECDSA). Verify with known-answer tests.
+    languages: [python]
+    severity: HIGH
+    patterns:
+      - pattern-either:
+          # cryptography.hazmat
+          - pattern: cryptography.hazmat.primitives.asymmetric.dsa.generate_private_key(key_size=$N, ...)
+          - pattern: cryptography.hazmat.primitives.asymmetric.dsa.generate_private_key($N, ...)
+          # pycryptodome / pycrypto
+          - pattern: Crypto.PublicKey.DSA.generate($N, ...)
+          - pattern: Crypto.PublicKey.DSA.generate(bits=$N, ...)
       - metavariable-comparison:
           metavariable: $N
           comparison: $N < 2048
@@ -34,6 +125,9 @@ rules:
     severity: HIGH
     patterns:
       - pattern: rsa.GenerateKey($R, $N)
+      - pattern-inside: |
+          import "crypto/rsa"
+          ...
       - metavariable-comparison:
           metavariable: $N
           comparison: $N < 2048

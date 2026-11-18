@@ -1,0 +1,1393 @@
+"""Tests for core.analysis.reachability_gates — generic finding gates."""
+
+from core.testing.reachability_state import isolated_reachability_caches
+
+
+import json
+import re
+from typing import ClassVar
+
+import pytest
+
+import core.analysis.reachability_gates as rg
+from core.analysis.reachability_gates import (
+    _prose_only,
+    build_sink_reachable_set,
+    compute_demotion_verdict,
+    has_safety_self_contradiction,
+    is_conduit_candidate,
+    is_entry_unreachable,
+    query_sink_arg_index,
+    query_unguarded_sinks,
+)
+
+
+@pytest.fixture(autouse=True)
+def _owned_reachability_caches(monkeypatch):
+    """Own inventory indexes while retaining warm caller state."""
+    with isolated_reachability_caches():
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
+# ─── build_sink_reachable_set ────────────────────────────────────────────────
+
+
+class TestBuildSinkReachableSet:
+    def test_none_context_map(self):
+        assert build_sink_reachable_set(None) is None
+
+    def test_no_call_edges(self):
+        assert build_sink_reachable_set({"sinks": [{"function": "f"}]}) is None
+
+    def test_transitive_reach(self):
+        cm = {
+            "sinks": [{"function": "dangerous_handler"}],
+            "call_edges": [
+                {"caller": "main", "callee": "parse"},
+                {"caller": "parse", "callee": "dangerous_handler"},
+            ],
+        }
+        reachable = build_sink_reachable_set(cm)
+        assert "main" in reachable
+        assert "parse" in reachable
+        assert "dangerous_handler" in reachable
+
+    def test_libc_sinks_auto_seeded(self):
+        cm = {
+            "sinks": [],
+            "call_edges": [
+                {"caller": "copy_data", "callee": "memcpy"},
+                {"caller": "main", "callee": "copy_data"},
+            ],
+        }
+        reachable = build_sink_reachable_set(cm)
+        assert "memcpy" in reachable
+        assert "copy_data" in reachable
+        assert "main" in reachable
+
+    def test_unreachable_function(self):
+        cm = {
+            "sinks": [{"function": "sink"}],
+            "call_edges": [
+                {"caller": "caller_a", "callee": "sink"},
+                {"caller": "isolated", "callee": "helper"},
+            ],
+        }
+        reachable = build_sink_reachable_set(cm)
+        assert "caller_a" in reachable
+        assert "isolated" not in reachable
+
+    def test_non_dict_entries_skipped_not_crashed(self):
+        # context-map.json is LLM-produced and only shape-validated at
+        # the top level; the /audit post-deepen sweep calls this with
+        # no enclosing try, so a string entry in ANY list must skip.
+        cm = {
+            "sinks": ["dangerous_handler", {"function": "sink"}],
+            "call_edges": [
+                "main -> parse",
+                {"caller": "main", "callee": "sink"},
+            ],
+        }
+        reachable = build_sink_reachable_set(cm)
+        assert "main" in reachable
+        assert "sink" in reachable
+
+    def test_list_valued_fields_dropped_not_crashed(self):
+        # Wrong-typed FIELD values are as plausible an LLM emission as
+        # wrong-typed entries: a list of callers, a list of sink
+        # names. The ingestion walker drops the field; the edge / sink
+        # entry contributes nothing instead of raising unhashable-type.
+        cm = {
+            "sinks": [{"function": ["s1", "s2"]}, {"function": "sink"}],
+            "call_edges": [
+                {"caller": ["a", "b"], "callee": "sink"},
+                {"caller": "main", "callee": "sink"},
+            ],
+        }
+        reachable = build_sink_reachable_set(cm)
+        assert "main" in reachable
+        assert "sink" in reachable
+
+    def test_non_list_collections_fail_soft(self):
+        # A scalar where a collection belongs skips the collection —
+        # same fail-soft as an absent key (gate declines, caller does
+        # not demote).
+        assert build_sink_reachable_set({"call_edges": 7}) is None
+        assert build_sink_reachable_set(
+            {"call_edges": "main->sink", "sinks": [{"function": "sink"}]},
+        ) is None
+        # Sinks scalar: edges alone can still seed from libc names.
+        cm = {
+            "sinks": 7,
+            "call_edges": [{"caller": "main", "callee": "memcpy"}],
+        }
+        assert build_sink_reachable_set(cm) == {"main", "memcpy"}
+
+
+# ─── is_entry_unreachable ────────────────────────────────────────────────────
+
+
+class TestIsEntryUnreachable:
+    def test_no_context_map(self):
+        assert is_entry_unreachable("f", None) is False
+
+    def test_no_call_edges(self):
+        assert is_entry_unreachable("f", {"entry_points": []}) is False
+
+    def test_entry_point_not_unreachable(self):
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [{"caller": "main", "callee": "parse"}],
+        }
+        assert is_entry_unreachable("main", cm) is False
+
+    def test_called_function_not_unreachable(self):
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [{"caller": "main", "callee": "parse"}],
+        }
+        assert is_entry_unreachable("parse", cm) is False
+
+    def test_orphan_function_is_unreachable(self):
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [{"caller": "main", "callee": "parse"}],
+        }
+        assert is_entry_unreachable("orphan_fn", cm) is True
+
+    def test_no_entry_points_never_unreachable(self):
+        cm = {
+            "entry_points": [],
+            "call_edges": [{"caller": "a", "callee": "b"}],
+        }
+        assert is_entry_unreachable("orphan_fn", cm) is False
+
+    def test_non_dict_entries_skipped_not_crashed(self):
+        # Same guard class as the sinks walk: string entries in
+        # entry_points or call_edges skip instead of raising.
+        cm = {
+            "entry_points": ["main", {"name": "main"}],
+            "call_edges": ["main -> parse",
+                           {"caller": "main", "callee": "parse"}],
+        }
+        assert is_entry_unreachable("main", cm) is False
+        assert is_entry_unreachable("parse", cm) is False
+        assert is_entry_unreachable("orphan_fn", cm) is True
+
+    def test_list_valued_name_dropped_not_crashed(self):
+        # A list where the entry-point name belongs drops the field:
+        # that entry can no longer prove entry-point status, but the
+        # sweep must not die on unhashable-type.
+        cm = {
+            "entry_points": [{"name": ["main"]}, {"name": "handler"}],
+            "call_edges": [{"caller": "handler", "callee": "parse"}],
+        }
+        assert is_entry_unreachable("handler", cm) is False
+        assert is_entry_unreachable("parse", cm) is False
+        assert is_entry_unreachable("orphan_fn", cm) is True
+
+    def test_non_list_collections_fail_soft(self):
+        # Scalar collection values read as absent — the gate declines
+        # (False = don't demote), it never raises.
+        assert is_entry_unreachable(
+            "f", {"entry_points": 42, "call_edges": 42},
+        ) is False
+        assert is_entry_unreachable(
+            "f",
+            {"entry_points": "main",
+             "call_edges": [{"caller": "a", "callee": "b"}]},
+        ) is False
+        assert is_entry_unreachable(
+            "f",
+            {"entry_points": [{"name": "main"}], "call_edges": {"a": "b"}},
+        ) is False
+
+
+# ─── Context-map ingestion walker: generative field-domain sweep ────────────
+
+
+# Wrong-shape values covering the JSON domain an LLM-written map can
+# carry at any level: null, scalars, strings, lists (nested), dicts.
+_HOSTILE_VALUES = [
+    None, 7, 3.5, True, "text", [], ["x"], [["x"]], {}, {"k": "v"},
+]
+
+
+def _valid_context_map():
+    return {
+        "entry_points": [{"name": "main"}],
+        "call_edges": [{"caller": "main", "callee": "sink"}],
+        "sinks": [{"function": "sink"}],
+    }
+
+
+class TestContextMapIngestionDomainSweep:
+    """Every (collection, level, hostile value) combination must be
+    absorbed by the ingestion walker — the public gates return their
+    fail-soft shape, never raise. Parametrizes over the module's own
+    consumed-surface schema so a new collection/field automatically
+    joins the sweep."""
+
+    @staticmethod
+    def _assert_gates_survive(cm):
+        result = build_sink_reachable_set(cm)
+        assert result is None or isinstance(result, set)
+        assert isinstance(is_entry_unreachable("orphan_fn", cm), bool)
+        assert isinstance(is_entry_unreachable("main", cm), bool)
+
+    @pytest.mark.parametrize("key", sorted(rg._CONTEXT_MAP_STR_FIELDS))
+    @pytest.mark.parametrize("bad", _HOSTILE_VALUES)
+    def test_hostile_collection_value(self, key, bad):
+        cm = _valid_context_map()
+        cm[key] = bad
+        self._assert_gates_survive(cm)
+
+    @pytest.mark.parametrize("key", sorted(rg._CONTEXT_MAP_STR_FIELDS))
+    @pytest.mark.parametrize("bad", _HOSTILE_VALUES)
+    def test_hostile_entry(self, key, bad):
+        cm = _valid_context_map()
+        cm[key] = [bad, *cm[key]]
+        self._assert_gates_survive(cm)
+
+    @pytest.mark.parametrize(
+        "key,field_name",
+        sorted(
+            (key, field_name)
+            for key, fields in rg._CONTEXT_MAP_STR_FIELDS.items()
+            for field_name in fields
+        ),
+    )
+    @pytest.mark.parametrize("bad", _HOSTILE_VALUES)
+    def test_hostile_field_value(self, key, field_name, bad):
+        cm = _valid_context_map()
+        cm[key] = [dict(cm[key][0], **{field_name: bad}), *cm[key]]
+        self._assert_gates_survive(cm)
+
+    def test_schema_covers_every_walked_collection(self):
+        # Closure pin: the walker schema names every context_map
+        # collection this module reads. A new read of an unlisted key
+        # must extend the schema (KeyError here otherwise).
+        import inspect
+
+        source = inspect.getsource(rg)
+        walked = set(re.findall(
+            r"_context_map_entries\(\s*context_map,\s*\"(\w+)\"", source,
+        ))
+        direct = set(re.findall(r"context_map\.get\(\"(\w+)\"", source))
+        assert walked == set(rg._CONTEXT_MAP_STR_FIELDS)
+        # No literal-key .get() reads outside the walker itself.
+        assert direct == set()
+
+
+# ─── is_conduit_candidate ────────────────────────────────────────────────────
+
+
+class TestIsConduitCandidate:
+    def test_mentions_dangerous_call(self):
+        assert is_conduit_candidate("passes input to strcpy( dest, src)") is True
+
+    def test_mentions_memcpy_call(self):
+        assert is_conduit_candidate("calls memcpy(dst, src, n) without bounds") is True
+
+    def test_conduit_phrase(self):
+        assert is_conduit_candidate("forwards data to the downstream handler") is True
+
+    def test_local_logic_bug(self):
+        assert is_conduit_candidate(
+            "off-by-one in null terminator write at dst[di]"
+        ) is False
+
+    def test_word_execution_not_matched(self):
+        assert is_conduit_candidate(
+            "leads to arbitrary code execution via buffer overflow"
+        ) is False
+
+    def test_word_query_not_matched(self):
+        assert is_conduit_candidate(
+            "decodes URL-encoded query string characters"
+        ) is False
+
+
+# ─── compute_demotion_verdict ────────────────────────────────────────────────
+
+
+class TestComputeDemotionVerdict:
+    def test_entry_unreachable_fires_first(self):
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [{"caller": "main", "callee": "parse"}],
+        }
+        verdict = compute_demotion_verdict("orphan", "calls strcpy(", cm)
+        assert verdict is not None
+        assert "entry-unreachability" in verdict
+
+    def test_no_demotion_for_reachable_function(self):
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [
+                {"caller": "main", "callee": "parse"},
+                {"caller": "parse", "callee": "memcpy"},
+            ],
+            "sinks": [{"function": "memcpy"}],
+        }
+        verdict = compute_demotion_verdict("parse", "local logic bug", cm)
+        assert verdict is None
+
+    def test_self_contradiction_fires(self):
+        cm = {
+            "entry_points": [{"name": "banner"}],
+            "call_edges": [
+                {"caller": "banner", "callee": "memcpy"},
+            ],
+            "sinks": [{"function": "memcpy"}],
+        }
+        verdict = compute_demotion_verdict(
+            "banner",
+            "copies a fixed-size static string into a caller-provided buffer",
+            cm,
+        )
+        assert verdict is not None
+        assert "self-contradiction" in verdict
+
+    def test_guarded_sink_evidence_names_tested_sinks(self):
+        """The demotion string must record WHICH sinks the guarded
+        verdict covered — it tests a curated subset, not all of
+        DANGEROUS_LIBC_SINKS, and the suppression must be auditable
+        against that list."""
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [
+                {"caller": "main", "callee": "parse"},
+                {"caller": "parse", "callee": "memcpy"},
+            ],
+            "sinks": [{"function": "memcpy"}],
+        }
+        server = _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/2")
+        verdict = compute_demotion_verdict(
+            "parse", "copies input with memcpy(", cm, joern_server=server,
+        )
+        assert verdict is not None
+        assert "guarded-sink" in verdict
+        assert "tested sinks:" in verdict
+        for name in rg.guard_tested_sinks():
+            assert name in verdict
+        # Names the verdict does NOT cover must not be claimed.
+        assert "sqlite3_exec" not in verdict
+
+    def test_sink_unreachable_conduit(self):
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [
+                {"caller": "main", "callee": "wrapper"},
+                {"caller": "handler", "callee": "memcpy"},
+            ],
+            "sinks": [{"function": "memcpy"}],
+        }
+        verdict = compute_demotion_verdict(
+            "wrapper", "passes input to strcpy( dest, src)", cm,
+        )
+        assert verdict is not None
+        assert "sink-unreachability" in verdict
+
+
+# ─── has_safety_self_contradiction ──────────────────────────────────────────
+
+
+class TestHasSafetySelfContradiction:
+    def test_fixed_size_static_string(self):
+        body = "copies a fixed-size static string kBanner into a caller buffer"
+        assert has_safety_self_contradiction(body) is True
+
+    def test_saturating_arithmetic(self):
+        body = "implements saturating subtraction, correctly returning zero"
+        assert has_safety_self_contradiction(body) is True
+
+    def test_correctly_bounded(self):
+        body = "the function correctly bounded the output to MAX_LEN bytes"
+        assert has_safety_self_contradiction(body) is True
+
+    def test_cannot_overflow(self):
+        body = "the copy size is capped so it cannot overflow the destination"
+        assert has_safety_self_contradiction(body) is True
+
+    def test_hypothetical_caller_violation(self):
+        body = "if a caller violates this contract and provides a smaller buffer"
+        assert has_safety_self_contradiction(body) is True
+
+    def test_hypothetical_caller_provides(self):
+        body = "if a caller provides a buffer smaller than N, overflow occurs"
+        assert has_safety_self_contradiction(body) is True
+
+    def test_real_bug_no_bounds(self):
+        body = "does not check output bounds, allowing overflow"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_real_bug_format_string(self):
+        body = "attacker-controlled path in format string passed to snprintf"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_real_bug_fixed_size_buffer(self):
+        body = "strcpy overflows the fixed-size stack buffer"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_negation_not_correctly(self):
+        body = "the function does not correctly implement bounds checking"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_negation_however_before(self):
+        body = "However, the function correctly handles input validation"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_negation_fails_to(self):
+        body = "The function fails to correctly validate the input length"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_negation_without_bounded(self):
+        body = "without correctly bounded checks on the size parameter"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_specific_caller_not_hypothetical(self):
+        body = "The caller handle_connection provides untrusted data directly"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_cross_paragraph_caller_mention_is_not_hypothetical(self):
+        # The old greedy ``.*`` + DOTALL paired an "if a caller" aside
+        # in one paragraph with an unrelated verb pages later,
+        # demoting real findings as self-contradiction. The verb must
+        # be in the same sentence/line.
+        body = (
+            "Even if a caller is well-behaved, this is irrelevant here.\n\n"
+            "The parser copies the attacker-controlled length field "
+            "into a stack buffer. The network layer passes raw bytes "
+            "through without validation, so the overflow is directly "
+            "triggerable."
+        )
+        assert has_safety_self_contradiction(body) is False
+
+    def test_same_sentence_far_verb_is_not_matched(self):
+        # Same line but beyond the 120-char proximity bound: treated
+        # as unrelated clauses, not a hypothetical-caller finding.
+        filler = "and the surrounding logic is complex " * 5
+        body = f"if a caller exists {filler} then something passes by"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_same_sentence_violation_still_matched(self):
+        body = (
+            "This only matters if a caller violates the documented "
+            "size contract."
+        )
+        assert has_safety_self_contradiction(body) is True
+
+    def test_correctly_handles_is_not_safety_assertion(self):
+        body = "The function correctly handles content-type but path is not normalized before fopen"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_properly_validates_is_not_safety_assertion(self):
+        body = "The function properly validates using normalize_path but this happens after fopen"
+        assert has_safety_self_contradiction(body) is False
+
+    def test_correctly_implements_is_not_safety_assertion(self):
+        body = "The function correctly implements response formatting but the path is attacker-controlled"
+        assert has_safety_self_contradiction(body) is False
+
+
+# ─── Prose-only scoping of the text-based gates ──────────────────────────────
+
+
+class TestProseOnlyScoping:
+    """Quoted target content cannot plant demotion triggers — only
+    prose is scanned by the text-based gates."""
+
+    def test_prose_assertion_still_fires(self):
+        assert has_safety_self_contradiction(
+            "The copy is correctly bounded by the length check."
+        )
+
+    def test_negated_prose_still_suppressed(self):
+        assert not has_safety_self_contradiction(
+            "The copy is not correctly bounded."
+        )
+
+    def test_fenced_code_does_not_fire(self):
+        body = (
+            "Overflow when len exceeds the buffer.\n"
+            "```c\n"
+            "/* this buffer is correctly bounded */\n"
+            "memcpy(dst, src, len);\n"
+            "```\n"
+        )
+        assert not has_safety_self_contradiction(body)
+
+    def test_unterminated_fence_stripped_to_end(self):
+        body = "Overflow here.\n```\ncorrectly bounded forever"
+        assert not has_safety_self_contradiction(body)
+
+    def test_inline_code_does_not_fire(self):
+        body = (
+            "The comment `// correctly bounded` is wrong: "
+            "len is attacker-controlled."
+        )
+        assert not has_safety_self_contradiction(body)
+
+    def test_quote_line_does_not_fire(self):
+        body = (
+            "Overflow when len exceeds the buffer.\n"
+            "> the code claims the value cannot overflow\n"
+        )
+        assert not has_safety_self_contradiction(body)
+
+    def test_conduit_prose_still_fires(self):
+        assert is_conduit_candidate(
+            "The wrapper passes user input to memcpy(dst, src, n)."
+        )
+
+    def test_conduit_code_block_does_not_fire(self):
+        body = (
+            "Local off-by-one in the loop bound.\n"
+            "```c\nmemcpy(dst, src, n);\n```\n"
+        )
+        assert not is_conduit_candidate(body)
+
+    def test_prose_only_keeps_surrounding_prose(self):
+        stripped = _prose_only("before `code` after")
+        assert "before" in stripped
+        assert "after" in stripped
+        assert "code" not in stripped
+
+
+# ─── Joern caller override for entry-unreachability ─────────────────────────
+
+
+class _FakeJoernServer:
+    """Minimal stub for JoernServer that returns controlled query results."""
+
+    def __init__(self, raw_output="", errors=None, alive=True):
+        self._raw_output = raw_output
+        self._errors = errors or []
+        self._alive = alive
+
+    def is_alive(self):
+        return self._alive
+
+    def query(self, cpgql, *, timeout=30, validate=False):
+        class _Result:
+            pass
+        r = _Result()
+        r.raw_output = self._raw_output
+        r.errors = self._errors
+        return r
+
+
+class TestEntryUnreachableJoernOverride:
+    """Joern caller query prevents false entry-unreachability demotions."""
+
+    _cm: ClassVar[dict] = {
+        "entry_points": [{"name": "main"}],
+        "call_edges": [{"caller": "main", "callee": "parse"}],
+    }
+
+    def test_unreachable_without_joern(self):
+        assert is_entry_unreachable("orphan", self._cm) is True
+
+    def test_joern_callers_override_unreachability(self):
+        stdout = 'JOERN_CALLER:{"caller":"dispatch","file":"src/dispatch.c","line":42,"code":"orphan(buf)"}'
+        server = _FakeJoernServer(raw_output=stdout)
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_joern_no_callers_stays_unreachable(self):
+        # Healthy query, genuinely zero records: demotion preserved.
+        server = _FakeJoernServer(raw_output="")
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is True
+
+    def test_joern_error_blocks_demotion(self):
+        # A degraded consultation is not proof of zero callers.
+        server = _FakeJoernServer(raw_output="", errors=["timeout"])
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_phantom_flow_errors_do_not_blind_the_gate(self):
+        # server.query folds JOERN_FLOW-scan parse noise into
+        # result.errors on EVERY query (echoed script source, repo
+        # text carrying the marker). Those phantom errors say nothing
+        # about the caller query — a healthy zero-caller answer must
+        # still let the demotion proceed.
+        server = _FakeJoernServer(
+            raw_output="",
+            errors=["failed to parse flow: unparseable JOERN_FLOW: "
+                    "payload '...': Expecting value"],
+        )
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is True
+
+    def test_phantom_flow_errors_do_not_drop_found_callers(self):
+        stdout = (
+            'JOERN_CALLER:{"caller":"dispatch","file":"src/d.c",'
+            '"line":42,"code":"orphan(buf)"}'
+        )
+        server = _FakeJoernServer(
+            raw_output=stdout,
+            errors=["failed to parse flow: unparseable JOERN_FLOW: "
+                    "payload '...': Expecting value"],
+        )
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_real_error_alongside_phantoms_still_blocks(self):
+        server = _FakeJoernServer(
+            raw_output="",
+            errors=[
+                "failed to parse flow: unparseable JOERN_FLOW: payload",
+                "query failed: server restarting",
+            ],
+        )
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_joern_dead_server_blocks_demotion(self):
+        server = _FakeJoernServer(alive=False)
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_joern_exception_blocks_demotion(self):
+        class _RaisingServer:
+            def is_alive(self):
+                return True
+
+            def query(self, cpgql, *, timeout=30, validate=False):
+                raise RuntimeError("connection reset")
+
+        assert is_entry_unreachable(
+            "orphan", self._cm, joern_server=_RaisingServer(),
+        ) is False
+
+    def test_joern_garbled_records_block_demotion(self):
+        # Records were printed but none decoded: a garbled transcript
+        # is a degraded consultation, not evidence of zero callers.
+        server = _FakeJoernServer(
+            raw_output='JOERN_CALLER:{"caller":"disp", TRUNCATED\n',
+        )
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_joern_truncated_echo_blocks_demotion(self):
+        # Server transport: the value echo is the ONLY record carrier;
+        # a width-truncated echo is a dropped record — treating it as
+        # noise turned the reply into a healthy-looking zero and the
+        # finding was wrongfully demoted.
+        server = _FakeJoernServer(
+            raw_output=(
+                'val res0: String = "JOERN_CALLER:{\\"caller\\":\\"disp'
+            ),
+        )
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+    def test_joern_echoed_caller_overrides_unreachability(self):
+        # Server transport: the record rides the final expression's
+        # string echo, first line prefixed with the val-resN binder.
+        stdout = (
+            'val res3: String = """JOERN_CALLER:{"caller":"dispatch",'
+            '"file":"src/dispatch.c","line":42,"code":"orphan(buf)"}"""'
+        )
+        server = _FakeJoernServer(raw_output=stdout)
+        assert is_entry_unreachable("orphan", self._cm, joern_server=server) is False
+
+
+class TestJoernFindCallersTriState:
+    """_joern_find_callers mirrors the GUARD_UNAVAILABLE doctrine."""
+
+    def test_dead_server_unavailable(self):
+        assert rg._joern_find_callers(
+            "fn", _FakeJoernServer(alive=False)) is None
+
+    def test_result_errors_unavailable(self):
+        server = _FakeJoernServer(raw_output="", errors=["boom"])
+        assert rg._joern_find_callers("fn", server) is None
+
+    def test_healthy_zero_records_is_empty_list(self):
+        assert rg._joern_find_callers("fn", _FakeJoernServer()) == []
+
+    def test_invalid_name_is_deterministic_empty(self):
+        # Structurally unqueryable — not transient, graph verdict stands.
+        assert rg._joern_find_callers(
+            "fn; rm -rf", _FakeJoernServer()) == []
+
+    def test_multiline_echo_first_and_last_records_parse(self):
+        # First echoed line carries the binder prefix, last carries
+        # the closing triple quote; both records must decode.
+        stdout = (
+            'val res0: String = """JOERN_CALLER:{"caller":"a",'
+            '"file":"a.c","line":1,"code":"orphan(x)"}\n'
+            'JOERN_CALLER:{"caller":"b","file":"b.c","line":2,'
+            '"code":"orphan(y)"}"""'
+        )
+        callers = rg._joern_find_callers("orphan", _FakeJoernServer(raw_output=stdout))
+        assert [c["caller"] for c in callers] == ["a", "b"]
+
+    def test_single_line_escaped_echo_recovered(self):
+        # Short strings echo single-quoted with Java-escaped content.
+        stdout = (
+            'val res1: String = "JOERN_CALLER:{\\"caller\\":\\"cb\\",'
+            '\\"file\\":\\"t.c\\",\\"line\\":7,\\"code\\":\\"orphan(z)\\"}"'
+        )
+        callers = rg._joern_find_callers("orphan", _FakeJoernServer(raw_output=stdout))
+        assert callers == [
+            {"caller": "cb", "file": "t.c", "line": 7, "code": "orphan(z)"},
+        ]
+
+
+# ─── query_unguarded_sinks ──────────────────────────────────────────────────
+
+
+class TestQueryUnguardedSinks:
+    def test_none_server(self):
+        assert query_unguarded_sinks("fn", None) == []
+
+    def test_dead_server(self):
+        server = _FakeJoernServer(alive=False)
+        assert query_unguarded_sinks("fn", server) == []
+
+    def test_invalid_function_name(self):
+        server = _FakeJoernServer()
+        assert query_unguarded_sinks("fn; rm -rf", server) == []
+
+    def test_echoed_records_parse_and_dedupe(self):
+        # Server transport: records ride the final expression echo;
+        # the summary line and closing quotes are framing.
+        stdout = (
+            'val res2: String = """JOERN_GUARD_SUMMARY:1/3\n'
+            'JOERN_UNGUARDED:{"sink":"memcpy","line":10,'
+            '"code":"memcpy(d, s, n)","guarded":false}"""'
+        )
+        server = _FakeJoernServer(raw_output=stdout)
+        sinks = query_unguarded_sinks("fn", server)
+        assert sinks == [{
+            "sink": "memcpy", "line": 10,
+            "code": "memcpy(d, s, n)", "guarded": False,
+        }]
+
+
+    def test_phantom_flow_errors_do_not_drop_sink_evidence(self):
+        # Same transport noise the caller/arg-index queries already
+        # tolerate: benign JOERN_FLOW-scan parse errors ride
+        # result.errors on healthy replies. Treating them as fatal
+        # silently removed the unguarded-sink lines from the review
+        # prompt on the server transport.
+        stdout = (
+            'val res2: String = """JOERN_GUARD_SUMMARY:1/3\n'
+            'JOERN_UNGUARDED:{"sink":"memcpy","line":10,'
+            '"code":"memcpy(d, s, n)","guarded":false}"""'
+        )
+        server = _FakeJoernServer(
+            raw_output=stdout,
+            errors=["failed to parse flow: unparseable JOERN_FLOW: "
+                    "payload '...': Expecting value"],
+        )
+        sinks = query_unguarded_sinks("fn", server)
+        assert [s["sink"] for s in sinks] == ["memcpy"]
+
+    def test_real_error_alongside_phantoms_still_degrades(self):
+        server = _FakeJoernServer(
+            raw_output="JOERN_UNGUARDED:{}",
+            errors=[
+                "failed to parse flow: unparseable JOERN_FLOW: payload",
+                "query failed: server restarting",
+            ],
+        )
+        assert query_unguarded_sinks("fn", server) == []
+
+
+class TestQuerySinkArgIndex:
+    def test_none_server(self):
+        assert query_sink_arg_index("fn", "memcpy", None) == []
+
+    def test_dead_server(self):
+        server = _FakeJoernServer(alive=False)
+        assert query_sink_arg_index("fn", "memcpy", server) == []
+
+    def test_invalid_sink_name(self):
+        server = _FakeJoernServer()
+        assert query_sink_arg_index("fn", "sink; bad", server) == []
+
+    def test_echoed_record_parses(self):
+        stdout = (
+            'val res0: String = """JOERN_SINK_ARG:{"sink":"memcpy",'
+            '"arg_index":2,"arg_code":"src","source_param":"buf"}"""'
+        )
+        server = _FakeJoernServer(raw_output=stdout)
+        args = query_sink_arg_index("fn", "memcpy", server)
+        assert args == [{
+            "sink": "memcpy", "arg_index": 2,
+            "arg_code": "src", "source_param": "buf",
+        }]
+
+
+class _RecordingSinkArgServer(_FakeJoernServer):
+    """Fake server that also records the rendered queries."""
+
+    def __init__(self, raw_output="", errors=None, alive=True):
+        super().__init__(raw_output=raw_output, errors=errors, alive=alive)
+        self.queries: list[str] = []
+
+    def query(self, cpgql, *, timeout=30, validate=False):
+        self.queries.append(cpgql)
+        return super().query(cpgql, timeout=timeout, validate=validate)
+
+
+class TestQuerySinkArgIndices:
+    """Batched variant: every sink in ONE REPL submission."""
+
+    def test_none_server(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        assert query_sink_arg_indices("fn", ["memcpy"], None) == []
+
+    def test_all_sinks_in_one_submission(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        server = _RecordingSinkArgServer()
+        query_sink_arg_indices("fn", ["memcpy", "strcpy"], server)
+        assert len(server.queries) == 1
+        assert 'List("memcpy", "strcpy")' in server.queries[0]
+
+    def test_invalid_sink_dropped_valid_kept(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        server = _RecordingSinkArgServer()
+        query_sink_arg_indices("fn", ["sink; bad", "memcpy"], server)
+        assert len(server.queries) == 1
+        assert 'List("memcpy")' in server.queries[0]
+
+    def test_all_sinks_invalid_never_queries(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        server = _RecordingSinkArgServer()
+        assert query_sink_arg_indices("fn", ["sink; bad"], server) == []
+        assert server.queries == []
+
+    def test_budget_scales_sublinearly_with_sink_count(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        class _TimeoutRecorder(_FakeJoernServer):
+            def __init__(self):
+                super().__init__()
+                self.timeouts: list[int] = []
+
+            def query(self, cpgql, *, timeout=30, validate=False):
+                self.timeouts.append(timeout)
+                return super().query(cpgql, timeout=timeout,
+                                     validate=validate)
+
+        server = _TimeoutRecorder()
+        query_sink_arg_indices("fn", ["memcpy"], server)
+        query_sink_arg_indices("fn", ["s1", "s2"], server)
+        query_sink_arg_indices(
+            "fn", [f"s{i}" for i in range(11)], server,
+        )
+        # 30 x ceil(sqrt(N)): base for one sink, 2x for two, 4x for
+        # the widest dispatch menus.
+        assert server.timeouts == [30, 60, 120]
+
+    def test_batch_error_falls_back_to_per_sink_pass(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        record = (
+            'JOERN_SINK_ARG:{"sink":"memcpy","arg_index":2,'
+            '"arg_code":"src","source_param":"buf"}'
+        )
+
+        class _BatchFailsSinglesWork(_FakeJoernServer):
+            def __init__(self):
+                super().__init__()
+                self.queries: list[str] = []
+
+            def query(self, cpgql, *, timeout=30, validate=False):
+                self.queries.append(cpgql)
+
+                class _R:
+                    pass
+
+                r = _R()
+                if 'List("memcpy", "strcpy")' in cpgql:
+                    r.errors = ["query timed out after 60s"]
+                    r.raw_output = ""
+                else:
+                    r.errors = []
+                    r.raw_output = record if '"memcpy"' in cpgql else ""
+                return r
+
+        server = _BatchFailsSinglesWork()
+        args = query_sink_arg_indices("fn", ["memcpy", "strcpy"], server)
+        # Batch degraded -> one per-sink pass recovered memcpy's record.
+        assert len(server.queries) == 3
+        assert [a["sink"] for a in args] == ["memcpy"]
+
+    def test_single_sink_error_does_not_recurse(self):
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        server = _RecordingSinkArgServer(errors=["boom"])
+        assert query_sink_arg_indices("fn", ["memcpy"], server) == []
+        assert len(server.queries) == 1
+
+    def test_records_ordered_by_caller_sink_order(self):
+        # Caller order first (matching the per-sink loop this
+        # replaces), then arg index, then source param.
+        from core.analysis.reachability_gates import query_sink_arg_indices
+
+        stdout = (
+            'JOERN_SINK_ARG:{"sink":"memcpy","arg_index":3,'
+            '"arg_code":"n","source_param":"len"}\n'
+            'JOERN_SINK_ARG:{"sink":"strcpy","arg_index":2,'
+            '"arg_code":"s","source_param":"buf"}\n'
+            'JOERN_SINK_ARG:{"sink":"memcpy","arg_index":2,'
+            '"arg_code":"src","source_param":"buf"}\n'
+        )
+        server = _FakeJoernServer(raw_output=stdout)
+        args = query_sink_arg_indices(
+            "fn", ["strcpy", "memcpy"], server,
+        )
+        assert [(a["sink"], a["arg_index"]) for a in args] == [
+            ("strcpy", 2), ("memcpy", 2), ("memcpy", 3),
+        ]
+
+
+# ─── _joern_find_callers reads its query from _QUERIES_DIR ───────────────────
+
+
+class _RecordingJoernServer:
+    """Joern server stub that records every query it receives."""
+
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def is_alive(self) -> bool:
+        return True
+
+    def query(self, query: str, timeout: int = 0, validate: bool = False):
+        self.queries.append(query)
+
+        class _Result:
+            errors = None
+            raw_output = (
+                "JOERN_CALLER:" + json.dumps({"caller": "main"}) + "\n"
+            )
+
+        return _Result()
+
+
+class TestJoernCallersQueriesDir:
+    def test_reads_query_from_queries_dir(self, tmp_path, monkeypatch):
+        # The module constant is the single authority for the query
+        # path; redirecting it redirects the lookup.
+        (tmp_path / "callers.sc").write_text(
+            "cpg.method.name(\"__FUNCTION__\")", encoding="utf-8",
+        )
+        monkeypatch.setattr(rg, "_QUERIES_DIR", tmp_path)
+        server = _RecordingJoernServer()
+        callers = rg._joern_find_callers("target_fn", server)
+        assert callers == [{"caller": "main"}]
+        assert server.queries == ['cpg.method.name("target_fn")']
+
+    def test_missing_query_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rg, "_QUERIES_DIR", tmp_path / "absent")
+        server = _RecordingJoernServer()
+        assert rg._joern_find_callers("target_fn", server) == []
+        assert server.queries == []
+
+
+# ─── Single-sourced sink vocabulary (drift guards) ───────────────────────────
+
+
+class TestSinkVocabularySingleSource:
+    """The regex and both Joern query sink lists derive from one authority."""
+
+    def test_conduit_regex_matches_every_authority_name(self):
+        from core.analysis import reachability_gates as rg
+
+        for name in rg.DANGEROUS_LIBC_SINKS:
+            assert rg._CONDUIT_CALL_RE.search(f"calls {name}(buf, n)"), name
+
+    def test_conduit_regex_preserves_pre_derivation_coverage(self):
+        # The hand-written regex covered exec-family variants the set
+        # lacked; the set was expanded to the union so the derived
+        # regex loses nothing.
+        from core.analysis import reachability_gates as rg
+
+        for name in ("fgets", "gets", "execl", "execle", "execv",
+                     "execve", "execvp", "execvpe", "execlp", "execlpe"):
+            assert rg._CONDUIT_CALL_RE.search(f"{name}(x)"), name
+        assert not rg._CONDUIT_CALL_RE.search("my_memcpy_wrapper(x)")
+        assert not rg._CONDUIT_CALL_RE.search("memcpy_s(x)")
+
+    def test_query_sink_lists_are_authority_subsets(self):
+        from core.analysis import reachability_gates as rg
+
+        assert set(rg._CORE_QUERY_SINKS) <= rg.DANGEROUS_LIBC_SINKS
+        # fopen/open are the documented unguarded-query extras.
+        assert set(rg._UNGUARDED_QUERY_SINKS) - rg.DANGEROUS_LIBC_SINKS == {
+            "fopen", "open",
+        }
+        # The public evidence accessor exposes exactly the tested list.
+        assert rg.guard_tested_sinks() == rg._CORE_QUERY_SINKS
+
+    def test_guard_query_renders_pre_split_literal(self):
+        from core.analysis import reachability_gates as rg
+
+        rendered = rg._GUARD_QUERY_TEMPLATE.replace(
+            "__SINK_NAMES__", rg._scala_string_list(rg._CORE_QUERY_SINKS),
+        )
+        assert (
+            'val sinkNames = List("memcpy", "memmove", "strcpy", "strcat", '
+            '"sprintf", "gets", "strncpy", "strncat", "snprintf", "system", '
+            '"popen", "execve", "execvp")'
+        ) in rendered
+
+    def test_unguarded_sc_renders_pre_split_literal(self):
+        from core.analysis import reachability_gates as rg
+
+        sc = (rg._QUERIES_DIR / "unguarded_sinks.sc").read_text()
+        assert "__SINK_NAMES__" in sc
+        # No leftover hardcoded sink names in the template file.
+        assert '"memcpy"' not in sc
+        rendered = sc.replace(
+            "__SINK_NAMES__",
+            rg._scala_string_list(rg._UNGUARDED_QUERY_SINKS),
+        )
+        assert (
+            'val sinkNames = List("memcpy", "memmove", "strcpy", "strcat", '
+            '"sprintf", "gets", "strncpy", "strncat", "snprintf", "system", '
+            '"popen", "execve", "execvp", "fopen", "open")'
+        ) in rendered
+
+
+# ─── check_sink_guarded tri-state (transient degradation) ────────────────────
+
+
+class TestCheckSinkGuardedTriState:
+    """The guard verdict must distinguish transient degradation
+    (GUARD_UNAVAILABLE — fail closed at promotion vetoes, never cache)
+    from the deterministic non-answers (None).  Pre-fix both collapsed
+    into None, so a promotion whose veto channel was down proceeded as
+    if the veto had declined — trap verdicts flapped with server
+    state."""
+
+    def test_no_server_is_none(self):
+        assert rg.check_sink_guarded("fn", None) is None
+
+    def test_dead_server_is_unavailable(self):
+        server = _FakeJoernServer(alive=False)
+        assert rg.check_sink_guarded("fn", server) == rg.GUARD_UNAVAILABLE
+
+    def test_query_errors_are_unavailable(self):
+        server = _FakeJoernServer(raw_output="", errors=["server restarting"])
+        assert rg.check_sink_guarded("fn", server) == rg.GUARD_UNAVAILABLE
+
+    def test_garbled_reply_is_unavailable(self):
+        server = _FakeJoernServer(raw_output="scala compile spew")
+        assert rg.check_sink_guarded("fn", server) == rg.GUARD_UNAVAILABLE
+
+    def test_query_exception_is_unavailable(self):
+        class _Boom(_FakeJoernServer):
+            def query(self, *a, **kw):
+                raise RuntimeError("socket reset")
+        assert rg.check_sink_guarded("fn", _Boom()) == rg.GUARD_UNAVAILABLE
+
+    def test_no_tested_sinks_is_none(self):
+        server = _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/0")
+        assert rg.check_sink_guarded("fn", server) is None
+
+    def test_invalid_name_is_none(self):
+        server = _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/1")
+        assert rg.check_sink_guarded("not valid!", server) is None
+
+    def test_guarded_and_unguarded_still_verdict(self):
+        assert rg.check_sink_guarded(
+            "fn", _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/2"),
+        ) == "guarded"
+        assert rg.check_sink_guarded(
+            "fn", _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:1/2"),
+        ) == "unguarded"
+
+    def test_bare_scalar_without_marker_is_unavailable(self):
+        # The legacy protocol (final-expression ``guarded/total`` with
+        # no marker) is gone: a transcript carrying only a bare scalar
+        # can't be attributed to the guard query, so it degrades.
+        server = _FakeJoernServer(raw_output="3/5")
+        assert rg.check_sink_guarded("fn", server) == rg.GUARD_UNAVAILABLE
+
+    def test_server_echo_framed_summary_parses(self):
+        # Server transport: /query-sync drops println and echo-frames
+        # the final expression — the shape that used to pin the gate
+        # at GUARD_UNAVAILABLE for whole joern-enabled runs.
+        server = _FakeJoernServer(
+            raw_output='val res0: String = "JOERN_GUARD_SUMMARY:0/3"',
+        )
+        assert rg.check_sink_guarded("fn", server) == "guarded"
+
+    def test_ansi_wrapped_summary_parses(self):
+        server = _FakeJoernServer(
+            raw_output="\x1b[32mJOERN_GUARD_SUMMARY:1/3\x1b[0m",
+        )
+        assert rg.check_sink_guarded("fn", server) == "unguarded"
+
+    def test_dual_emit_println_and_echo_agree(self):
+        # Subprocess transcript carrying BOTH the println copy and the
+        # value echo of the same summary.
+        server = _FakeJoernServer(
+            raw_output=(
+                "JOERN_GUARD_SUMMARY:2/5\n"
+                'val res1: String = "JOERN_GUARD_SUMMARY:2/5"\n'
+            ),
+        )
+        assert rg.check_sink_guarded("fn", server) == "unguarded"
+
+    def test_phantom_flow_errors_do_not_blind_the_guard(self):
+        # A parseable summary is authoritative even when server.query
+        # folded JOERN_FLOW-scan noise into result.errors.
+        server = _FakeJoernServer(
+            raw_output="JOERN_GUARD_SUMMARY:0/2",
+            errors=["failed to parse flow: unparseable JOERN_FLOW: x"],
+        )
+        assert rg.check_sink_guarded("fn", server) == "guarded"
+
+    def test_garbage_after_marker_is_unavailable(self):
+        server = _FakeJoernServer(
+            raw_output="JOERN_GUARD_SUMMARY:banana",
+        )
+        assert rg.check_sink_guarded("fn", server) == rg.GUARD_UNAVAILABLE
+
+    def test_guard_query_template_dual_emits_marker(self):
+        # The template must println the summary AND return it as the
+        # final expression so both transports carry it.
+        assert 'println(summary)' in rg._GUARD_QUERY_TEMPLATE
+        assert rg._GUARD_QUERY_TEMPLATE.rstrip().endswith("summary")
+        assert "JOERN_GUARD_SUMMARY:" in rg._GUARD_QUERY_TEMPLATE
+
+    def test_unavailable_never_demotes(self):
+        """compute_demotion_verdict must not demote on a degraded
+        guard consultation (demotion requires positive 'guarded')."""
+        cm = {
+            "entry_points": [{"name": "main"}],
+            "call_edges": [
+                {"caller": "main", "callee": "parse"},
+                {"caller": "parse", "callee": "memcpy"},
+            ],
+            "sinks": [{"function": "memcpy"}],
+        }
+        server = _FakeJoernServer(errors=["restarting"])
+        verdict = compute_demotion_verdict(
+            "parse", "copies input with memcpy(", cm, joern_server=server,
+        )
+        assert verdict is None
+
+
+class TestCheckSinkGuardedDegradeLoudness:
+    """Degraded guard probes must be operator-visible: the probe feeds
+    suppression decisions, so a down channel warns instead of logging
+    at DEBUG (invisible at default level)."""
+
+    _LOGGER = "core.analysis.reachability_gates"
+
+    def _warnings(self, caplog) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+
+    def test_query_exception_warns(self, caplog) -> None:
+        class _Boom(_FakeJoernServer):
+            def query(self, *a, **kw):
+                raise RuntimeError("socket reset")
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            verdict = rg.check_sink_guarded("fn", _Boom())
+        assert verdict == rg.GUARD_UNAVAILABLE
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        assert "fn" in warnings[0]
+
+    def test_missing_marker_warns_with_errors(self, caplog) -> None:
+        server = _FakeJoernServer(
+            raw_output="", errors=["server restarting"],
+        )
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            verdict = rg.check_sink_guarded("fn", server)
+        assert verdict == rg.GUARD_UNAVAILABLE
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        assert "server restarting" in warnings[0]
+
+    def test_exception_message_escaped_and_bounded(self, caplog) -> None:
+        # A hostile exception message (control bytes + flooding
+        # length — server/reply bytes ride exception text) must land
+        # escaped and truncated in the WARNING; the traceback is
+        # DEBUG-only.
+        hostile = "\x1b]0;pwn\x07" + "A" * 100_000
+
+        class _Boom(_FakeJoernServer):
+            def query(self, *a, **kw):
+                raise RuntimeError(hostile)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            verdict = rg.check_sink_guarded("fn", _Boom())
+        assert verdict == rg.GUARD_UNAVAILABLE
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        assert "\x1b" not in warnings[0]
+        assert "\\x1b" in warnings[0]
+        assert "chars]" in warnings[0]  # explicit elision marker
+        assert len(warnings[0]) < 1000  # bounded, not the 100 KB flood
+
+    def test_malformed_summary_warns_escaped(self, caplog) -> None:
+        # Server-derived reply text is escaped before logging —
+        # control bytes must not reach the terminal raw.
+        server = _FakeJoernServer(
+            raw_output="JOERN_GUARD_SUMMARY:\x1b[31mbanana",
+        )
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            verdict = rg.check_sink_guarded("fn", server)
+        assert verdict == rg.GUARD_UNAVAILABLE
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        assert "\x1b" not in warnings[0]
+
+    def test_healthy_verdicts_do_not_warn(self, caplog) -> None:
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            assert rg.check_sink_guarded(
+                "fn", _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/2"),
+            ) == "guarded"
+            assert rg.check_sink_guarded(
+                "fn", _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:1/2"),
+            ) == "unguarded"
+        assert self._warnings(caplog) == []
+
+    def test_deterministic_non_answers_do_not_warn(self, caplog) -> None:
+        # No server / dead server / invalid name / no tested sinks are
+        # deterministic non-answers or health-gate territory, not
+        # per-probe degradation — they stay quiet here.
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            assert rg.check_sink_guarded("fn", None) is None
+            assert rg.check_sink_guarded(
+                "fn", _FakeJoernServer(alive=False),
+            ) == rg.GUARD_UNAVAILABLE
+            assert rg.check_sink_guarded(
+                "bad name!",
+                _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/1"),
+            ) is None
+            assert rg.check_sink_guarded(
+                "fn", _FakeJoernServer(raw_output="JOERN_GUARD_SUMMARY:0/0"),
+            ) is None
+        assert self._warnings(caplog) == []
+
+
+class TestBinaryOracleAbsentUnannotatedNamesake:
+    """The suppression invariant ("EVERY returned candidate is dead")
+    must be structural: an unannotated FUNCTION namesake blocks the
+    verdict (mirrors is_lexically_dead's all() rule) instead of being
+    skipped while a sibling's absent verdict licenses suppression."""
+
+    @staticmethod
+    def _inventory(items):
+        return {"files": [{"path": "src/a.c", "items": items}]}
+
+    _ABSENT = {
+        "name": "dead_fn", "kind": "function",
+        "line_start": 10, "line_end": 20,
+        "metadata": {"binary_oracle": {
+            "classification": "absent",
+            "binaries": [{"tier": "full", "path": "b", "build_id": "x"}],
+        }},
+    }
+
+    def test_annotated_absent_still_fires(self):
+        from core.analysis.reachability import binary_oracle_absent
+
+        inv = self._inventory([dict(self._ABSENT)])
+        assert binary_oracle_absent(inv, "src/a.c", "dead_fn") is True
+
+    def test_unannotated_function_namesake_blocks(self):
+        from core.analysis.reachability import binary_oracle_absent
+
+        unannotated = {"name": "dead_fn", "kind": "function",
+                       "line_start": 40, "line_end": 50, "metadata": {}}
+        inv = self._inventory([dict(self._ABSENT), unannotated])
+        assert binary_oracle_absent(inv, "src/a.c", "dead_fn") is False
+
+    def test_unannotated_non_function_namesake_does_not_block(self):
+        from core.analysis.reachability import binary_oracle_absent
+
+        macro = {"name": "dead_fn", "kind": "macro",
+                 "line_start": 60, "line_end": 70, "metadata": {}}
+        inv = self._inventory([dict(self._ABSENT), macro])
+        assert binary_oracle_absent(inv, "src/a.c", "dead_fn") is True
+
+
+class TestProseOnlyIndentedAndExoticQuotes:
+    """_prose_only stripped fenced/inline/plain-quote forms only:
+    markdown INDENTED code blocks and non-space/tab-indented quote
+    lines carried planted target text into the demotion gates."""
+
+    _PLANT = "the buffer is correctly bounded"
+
+    def test_indented_code_block_stripped(self):
+        from core.analysis.reachability_gates import (
+            _prose_only,
+            has_safety_self_contradiction,
+        )
+        body = (
+            "Overflow in copy loop.\n\n"
+            f"    // {self._PLANT}\n\n"
+            "Attacker reaches this."
+        )
+        assert self._PLANT not in _prose_only(body)
+        assert not has_safety_self_contradiction(body)
+
+    def test_tab_indented_block_stripped(self):
+        from core.analysis.reachability_gates import _prose_only
+        body = f"Real bug.\n\n\t// {self._PLANT}\n\nEvidence."
+        assert self._PLANT not in _prose_only(body)
+
+    def test_multiline_indented_run_stripped_as_one_block(self):
+        from core.analysis.reachability_gates import _prose_only
+        body = (
+            "Prose.\n\n"
+            "    line one\n"
+            f"    {self._PLANT}\n"
+            "    line three\n\n"
+            "More prose."
+        )
+        out = _prose_only(body)
+        assert self._PLANT not in out
+        assert "More prose." in out
+
+    def test_nbsp_indented_quote_line_stripped(self):
+        from core.analysis.reachability_gates import (
+            _prose_only,
+            has_safety_self_contradiction,
+        )
+        body = (
+            "Overflow in copy loop.\n\n"
+            f" > {self._PLANT}\n\n"
+            "Attacker reaches this."
+        )
+        assert self._PLANT not in _prose_only(body)
+        assert not has_safety_self_contradiction(body)
+
+    def test_indented_conduit_text_no_longer_fires(self):
+        from core.analysis.reachability_gates import is_conduit_candidate
+        body = (
+            "Real overflow.\n\n"
+            "    passes buf to memcpy(dst, src, n)\n\n"
+            "evidence."
+        )
+        assert not is_conduit_candidate(body)
+
+    def test_model_prose_assertion_still_fires(self):
+        # Direction pin: an UNQUOTED safety assertion in flowing
+        # prose keeps firing the gate.
+        from core.analysis.reachability_gates import (
+            has_safety_self_contradiction,
+        )
+        body = (
+            "The copy is correctly bounded by the length check, "
+            "yet this finding claims otherwise."
+        )
+        assert has_safety_self_contradiction(body)
+
+    def test_short_prose_indent_under_four_spaces_kept(self):
+        from core.analysis.reachability_gates import _prose_only
+        body = "Point one.\n  continuation kept as prose\nPoint two."
+        assert "continuation kept as prose" in _prose_only(body)

@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
+"""Run all context-map enrichers in sequence, loading shared data once.
+
+Usage: raptor-enrich-context-map <understand_dir>
+
+A combined alternative to calling each enricher script separately
+(which rebuilds the checklist/inventory 3-4 times): loads checklist
+and context-map once, runs each enricher function in sequence, and
+saves the result once at the end. NOTE: covers the callgraph /
+forward-reachable / ast-view / sites / sinks stages only, and no
+production skill dispatches it yet — map.md still runs the standalone
+shims, which remain the production path.
+"""
+import argparse
+import logging
+import sys
+import tempfile
+from pathlib import Path
+
+# ─── trust-marker check (do not import; inline by design) ───
+# fmt: off
+import os  # noqa: E402
+if not (os.environ.get("CLAUDECODE")
+        or os.environ.get("_RAPTOR_TRUSTED")):
+    sys.stderr.write(
+        f"{sys.argv[0]}: internal dispatch script.\n"
+        "  Run via 'bin/raptor' instead.\n"
+        "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
+    )
+    sys.exit(2)
+# fmt: on
+# ─── end trust-marker check ─────────────────────────────────
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
+from core.artifacts.context_map_budget import (  # noqa: E402
+    save_context_map,
+)
+from core.json import load_json  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+def _stage_failed(stage: str, exc: Exception) -> None:
+    """One loud stderr line per failed stage, escaped in-file.
+
+    EVERY stage's failure lane must route through here. The script
+    configures no logging ITSELF — substrate imports happen to
+    install an escaping console formatter as a side effect, but a
+    lane's escaping (and its visibility: a bare logger record can
+    vanish, leaving "no enrichments applied" with zero diagnostic)
+    must not hang on a transitive import any refactor can drop. The
+    print below owns the terminal escape; the standalone shims print
+    explicit skip reasons. Traceback detail stays on the debug
+    channel."""
+    from core.security.log_sanitisation import sanitise_for_terminal
+    # Exception text can quote target-file/LLM-artifact bytes.
+    print(f"raptor-enrich-context-map: {stage} failed: "
+          f"{exc.__class__.__name__}: {sanitise_for_terminal(str(exc))}",
+          file=sys.stderr)
+    logger.debug("%s failed", stage, exc_info=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="raptor-enrich-context-map",
+        description="Run all context-map enrichers (callgraph, ast-view, "
+                    "sites, sinks) in one pass, sharing loaded data.",
+    )
+    parser.add_argument("understand_dir", help="path to /understand run dir")
+    args = parser.parse_args()
+
+    understand_dir = Path(args.understand_dir).resolve()
+    if not understand_dir.is_dir():
+        print(f"raptor-enrich-context-map: {understand_dir} is not a "
+              "directory", file=sys.stderr)
+        return 1
+
+    context_map_path = understand_dir / "context-map.json"
+    if not context_map_path.exists():
+        print(f"raptor-enrich-context-map: {context_map_path} not found",
+              file=sys.stderr)
+        return 1
+
+    context_map = load_json(context_map_path)
+    if not isinstance(context_map, dict):
+        print(f"raptor-enrich-context-map: {context_map_path} is not a "
+              "JSON object", file=sys.stderr)
+        return 1
+
+    from core.inventory import read_checklist
+    checklist = read_checklist(understand_dir)
+    target_path = checklist.get("target_path")
+
+    # checklist.json is a mutable run artefact — corroborate the
+    # recovered target against the target_path sealed into
+    # .raptor-run.json at run start before touching that tree.
+    if target_path:
+        from core.run.metadata import corroborate_target_path
+        mismatch = corroborate_target_path(understand_dir, target_path)
+        if mismatch:
+            print(f"raptor-enrich-context-map: {mismatch}; refusing "
+                  "recovered target", file=sys.stderr)
+            return 1
+
+    summary: list[str] = []
+
+    if not target_path:
+        print("raptor-enrich-context-map: checklist missing target_path; "
+              "only callgraph enrichment available", file=sys.stderr)
+
+    # 1. Call-graph edges (uses checklist only). Store routing
+    # mirrors the per-stage sibling (raptor-enrich-context-map-
+    # callgraph): the combined shim was the sibling-drift producer
+    # that never ingested, so maps enriched through it carried only
+    # the capped in-artifact list.
+    try:
+        from core.orchestration.context_map_callgraph import (
+            enrich_with_call_edges,
+        )
+        graph_store = None
+        if target_path:
+            try:
+                from core.understand_graph.store import graph_path_for_run
+                candidate = graph_path_for_run(
+                    understand_dir, str(target_path))
+                if not candidate.resolve().is_relative_to(understand_dir):
+                    graph_store = candidate
+            except Exception:  # noqa: BLE001 — routing is additive; enrichment must survive resolution failure
+                graph_store = None
+        n_edges = enrich_with_call_edges(
+            context_map, checklist=checklist,
+            graph_store=graph_store, run_dir=understand_dir,
+            target_path=str(target_path or ""),
+        )
+        if n_edges:
+            summary.append(f"callgraph: {n_edges} edges")
+    except Exception as e:
+        _stage_failed("callgraph enrichment", e)
+
+    # 2. Inventory shared by ast-view, forward-reachable, and sites.
+    # Reuse the checklist as the inventory — no re-parse of the
+    # target tree (invariants in core.orchestration.checklist_inventory).
+    from core.orchestration.checklist_inventory import (
+        inventory_from_checklist,
+    )
+    inventory = inventory_from_checklist(checklist)
+    if inventory is None and target_path:
+        try:
+            from core.inventory.builder import build_inventory
+            with tempfile.TemporaryDirectory() as td:
+                inventory = build_inventory(str(target_path), td)
+        except Exception as e:
+            _stage_failed("inventory build", e)
+
+    # 3. Forward reachability (needs target_path + inventory)
+    if target_path:
+        try:
+            from core.orchestration.context_map_callgraph import (
+                enrich_with_forward_reachable,
+            )
+            n_ep = enrich_with_forward_reachable(
+                context_map, Path(target_path), inventory=inventory,
+            )
+            if n_ep:
+                summary.append(f"forward-reachable: {n_ep} entry points")
+        except Exception as e:
+            _stage_failed("forward-reachable enrichment", e)
+
+    # 4. AST views (needs target_path + inventory)
+    if inventory and target_path:
+        try:
+            from core.orchestration.context_map_ast_view import (
+                enrich_with_ast_view,
+            )
+            n_ast = enrich_with_ast_view(
+                context_map, Path(target_path), inventory=inventory,
+            )
+            if n_ast:
+                summary.append(f"ast-view: {n_ast} entries")
+        except Exception as e:
+            _stage_failed("ast-view enrichment", e)
+
+    # 5. Sites (source_intel — spatch, needs target_path)
+    if target_path:
+        try:
+            from packages.code_understanding.context_map_sites import (
+                enrich_context_map_with_sites,
+            )
+            from packages.source_intel import analyze
+            from packages.source_intel.progress import RuleProgressPrinter
+            # The shared inventory doubles as source_intel's pre-built
+            # checklist (enclosing-function lookups + truthful skip
+            # reasons) — saves another tree parse.
+            # Progress goes to stderr (stdout stays reserved for the
+            # result line): one line per cocci rule as it starts plus
+            # a 30s idle heartbeat — a large C target used to sit
+            # >300s with zero output here.
+            print(
+                f"raptor-enrich-context-map: running source_intel "
+                f"(cocci) on {target_path} ...",
+                file=sys.stderr, flush=True,
+            )
+            with RuleProgressPrinter(sys.stderr, label="cocci") as prog:
+                si = analyze(
+                    Path(target_path), checklist=inventory,
+                    progress=prog.on_rule,
+                )
+            counts = enrich_context_map_with_sites(
+                context_map, si, repo_root=target_path,
+            )
+            from packages.code_understanding.context_map_sites import (
+                total_enriched_sites,
+            )
+            if total_enriched_sites(counts):
+                summary.append(
+                    f"sites: {counts['ownership_model']} ownership + "
+                    f"{counts['privilege_model']} privilege + "
+                    f"{counts['shared_state']} shared-state + "
+                    f"{counts['crypto_inventory']} crypto"
+                )
+        except Exception as e:
+            _stage_failed("sites enrichment", e)
+
+    # 6. Sink discovery (needs target_path)
+    if target_path:
+        try:
+            from core.orchestration.context_map_sinks import (
+                enrich_with_sink_discovery,
+            )
+            extra_sinks = None
+            try:
+                from core.iris.api import get_project_sinks
+                iris_sinks = get_project_sinks(out_dir=understand_dir)
+                if iris_sinks:
+                    extra_sinks = iris_sinks
+            except Exception as e:  # noqa: BLE001
+                logger.debug("IRIS sink fetch failed: %s", e)
+            # ``extra_sinks`` / ``run_dir`` support depends on the
+            # substrate revision; pass them only when the signature
+            # accepts them so the whole sink stage doesn't die on a
+            # TypeError (which the handler below would eat).
+            import inspect
+            sink_params = inspect.signature(
+                enrich_with_sink_discovery).parameters
+            sink_kwargs = {}
+            if "run_dir" in sink_params:
+                # Audit-discovered sinks (discovered-sinks.json in the
+                # run dir / project siblings) merge only when the
+                # substrate knows the run dir.
+                sink_kwargs["run_dir"] = understand_dir
+            if "extra_sinks" in sink_params:
+                sink_kwargs["extra_sinks"] = extra_sinks
+            elif extra_sinks:
+                logger.warning(
+                    "IRIS sinks available but enrich_with_sink_discovery "
+                    "predates extra_sinks — continuing without them")
+            n_sinks = enrich_with_sink_discovery(
+                context_map, Path(target_path), **sink_kwargs,
+            )
+            if n_sinks:
+                summary.append(f"sinks: {n_sinks} entries")
+        except Exception as e:
+            _stage_failed("sink enrichment", e)
+
+    # Save unconditionally through the producer chokepoint: even a
+    # no-op enrichment pass must not let an oversize or pretty-printed
+    # map from an earlier writer survive — compact re-encoding alone
+    # can bring an over-read-cap artifact back under the consumer cap,
+    # and the chokepoint degrades further only when the compact form
+    # still exceeds the producer budget.
+    applied = save_context_map(context_map_path, context_map)
+    if applied:
+        summary.append(f"size budget: {'; '.join(applied)}")
+
+    if summary:
+        print(f"raptor-enrich-context-map: {', '.join(summary)} "
+              f"in {context_map_path}")
+    else:
+        print("raptor-enrich-context-map: no enrichments applied")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

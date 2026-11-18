@@ -3,6 +3,19 @@
 //
 // Catches the CVE-2022-2602 / CVE-2023-4622 class: lock acquired,
 // error path returns without unlock. Covers common kernel lock variants.
+//
+// Coverage tracks engine/coccinelle/source_intel/concurrency/lock_sites.cocci
+// (the enumeration counterpart) for the subset where imbalance semantics
+// apply. Trylock variants are intentionally excluded — the lock may not be
+// held on the failure path, so "return with trylock-held" would FP. Userspace
+// pthread mutex is enumerated by lock_sites.cocci but not bug-detected here;
+// this rule remains kernel-focused. Keep the two files' kernel-locking name
+// sets aligned when extending.
+// A syntactic acquire call does not prove successful acquisition; indirect
+// releases and ownership transfer also require caller context. Selected
+// address-of forms are not exhaustive lock-discipline coverage.
+// @role: detection
+// raptor: confirm-only
 
 // Spinlock: error return with lock held
 @spin_held@
@@ -11,8 +24,10 @@ position p;
 constant C;
 @@
 
-\(spin_lock\|spin_lock_irq\|spin_lock_bh\)(&L);
-... when != \(spin_unlock\|spin_unlock_irq\|spin_unlock_bh\)(&L)
+// @vocab: lock_acquires
+\(spin_lock\|spin_lock_irq\|spin_lock_bh\|raw_spin_lock\|raw_spin_lock_irq\|raw_spin_lock_bh\)(&L);
+// @vocab: lock_releases
+... when != \(spin_unlock\|spin_unlock_irq\|spin_unlock_bh\|raw_spin_unlock\|raw_spin_unlock_irq\|raw_spin_unlock_bh\)(&L)
 (
 * return@p -C;
 |
@@ -28,7 +43,7 @@ L << spin_held.L;
 
 import json, sys
 for _p in p:
-    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Return with spin_lock held on %s" % L}
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Possible return with spin_lock held on %s — review acquisition success, indirect releases and ownership" % L}
     sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
 
 // Mutex: error return with lock held
@@ -38,7 +53,13 @@ position p;
 constant C;
 @@
 
+// @vocab: lock_acquires
 \(mutex_lock\|mutex_lock_interruptible\|mutex_lock_killable\)(&M);
+// The release guard must extend in lockstep with the acquire
+// alternation above: a learned acquire wrapper without its matching
+// release wrapper in the when-guard turns every balanced
+// wrapper-locked function into an imbalance verdict.
+// @vocab: lock_releases
 ... when != mutex_unlock(&M)
 (
 * return@p -C;
@@ -55,7 +76,7 @@ M << mutex_held.M;
 
 import json, sys
 for _p in p:
-    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Return with mutex_lock held on %s" % M}
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Possible return with mutex_lock held on %s — review acquisition success, indirect releases and ownership" % M}
     sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
 
 // Spinlock irqsave: error return with lock held (two-arg variant)
@@ -65,8 +86,8 @@ position p;
 constant C;
 @@
 
-spin_lock_irqsave(&L, F);
-... when != spin_unlock_irqrestore(&L, F)
+\(spin_lock_irqsave\|raw_spin_lock_irqsave\)(&L, F);
+... when != \(spin_unlock_irqrestore\|raw_spin_unlock_irqrestore\)(&L, F)
 (
 * return@p -C;
 |
@@ -82,7 +103,34 @@ L << irqsave_held.L;
 
 import json, sys
 for _p in p:
-    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Return with spin_lock_irqsave held on %s" % L}
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Possible return with spin_lock_irqsave held on %s — review acquisition success, indirect releases and ownership" % L}
+    sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
+
+// RW lock irqsave: error return with lock held (two-arg variant)
+@rw_irqsave_held@
+expression L, F;
+position p;
+constant C;
+@@
+
+\(read_lock_irqsave\|write_lock_irqsave\)(&L, F);
+... when != \(read_unlock_irqrestore\|write_unlock_irqrestore\)(&L, F)
+(
+* return@p -C;
+|
+* return@p NULL;
+|
+* return@p;
+)
+
+@script:python@
+p << rw_irqsave_held.p;
+L << rw_irqsave_held.L;
+@@
+
+import json, sys
+for _p in p:
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Possible return with rw_lock_irqsave held on %s — review acquisition success, indirect releases and ownership" % L}
     sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
 
 // RW lock: error return with lock held
@@ -109,5 +157,5 @@ L << rw_held.L;
 
 import json, sys
 for _p in p:
-    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Return with rw_lock held on %s" % L}
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column), "line_end": int(_p.line_end), "col_end": int(_p.column_end), "rule": "lock_imbalance", "message": "Possible return with rw_lock held on %s — review acquisition success, indirect releases and ownership" % L}
     sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")

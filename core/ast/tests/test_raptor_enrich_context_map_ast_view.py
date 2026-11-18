@@ -8,23 +8,40 @@ by the skill markdown when it calls the wrapper.
 
 import json
 import os
-import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 
-REPO_ROOT = Path(os.environ["RAPTOR_DIR"])
+from core.testing.standalone_cli import run_standalone_cli
+
+# Module-level marker — every test spawns the real
+# libexec/raptor-enrich-context-map-ast-view wrapper as a subprocess.
+# Top tests at 11s; opt-in via ``pytest -m integration``.
+pytestmark = pytest.mark.integration
+
+
+# parents[3] = core/ast/tests → core/ast → core → repo root. Anchor to
+# this file, not $RAPTOR_DIR, so the wrapper resolves within this
+# worktree (RAPTOR_DIR may point at a different checkout).
+REPO_ROOT = Path(__file__).resolve().parents[3]
 WRAPPER = REPO_ROOT / "libexec" / "raptor-enrich-context-map-ast-view"
 
 
 def _run(*args, **kwargs):
     """Invoke the wrapper as a real subprocess (matches how skills call it)."""
     env = {**os.environ, "_RAPTOR_TRUSTED": "1"}
-    return subprocess.run(
+    _launch_env = dict(
+        env,
+        _RAPTOR_SCRATCH_AUTH="stale-test-authorization",
+        RAPTOR_SESSION_PID="invalid",
+        RAPTOR_SESSION_TOKEN="stale",
+    )
+    return run_standalone_cli(
         [str(WRAPPER), *args],
         capture_output=True, text=True, timeout=30,
-        env=env, **kwargs,
+        env=_launch_env, **kwargs,
     )
 
 
@@ -142,7 +159,7 @@ class RaptorEnrichContextMapAstViewTests(unittest.TestCase):
             # Strip both trust markers — must refuse.
             env = {k: v for k, v in os.environ.items()
                    if k not in ("CLAUDECODE", "_RAPTOR_TRUSTED")}
-            proc = subprocess.run(
+            proc = run_standalone_cli(
                 [str(WRAPPER), str(tmp)],
                 capture_output=True, text=True, timeout=10, env=env,
             )

@@ -81,9 +81,9 @@ def test_missing_runs_key_handled():
     assert d.baseline_count == 0
 
 
-def test_null_runs_handled():
-    d = diff_sarif_data({"runs": None}, {"runs": None})
-    assert d.baseline_count == 0
+def test_null_runs_refused():
+    with pytest.raises(ValueError, match="runs must be an array"):
+        diff_sarif_data({"runs": None}, {"runs": None})
 
 
 def test_runs_with_no_results_key_handled():
@@ -198,10 +198,10 @@ def test_non_dataflow_results_excluded_from_diff():
     assert d.augmented_count == 1
 
 
-def test_malformed_result_filtered_out():
+def test_malformed_dataflow_result_refuses_diff():
     """A SARIF result that looks like a dataflow but has an empty
     URI / line=0 will fail Step validation in from_sarif_result;
-    treat that as not-a-finding rather than raising."""
+    refuse the measurement rather than silently removing a path."""
     bad = {
         "ruleId": "x",
         "message": {"text": "y"},
@@ -210,9 +210,8 @@ def test_malformed_result_filtered_out():
             _sarif_step("b.py", 1, "y", "sink"),
         ]}]}],
     }
-    d = diff_sarif_data(_sarif_doc(bad), _sarif_doc())
-    # Bad result doesn't contribute to baseline.
-    assert d.baseline_count == 0
+    with pytest.raises(ValueError):
+        diff_sarif_data(_sarif_doc(bad), _sarif_doc())
 
 
 # ---------------------------------------------------------------------

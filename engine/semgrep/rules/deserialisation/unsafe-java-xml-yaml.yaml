@@ -1,0 +1,64 @@
+rules:
+  # ---------------------------------------------------------------------------
+  # Java — XMLDecoder deserialises arbitrary beans and executes their
+  # setters/constructors: RCE-equivalent on attacker-controlled input.
+  # Pattern-only, matching the objectinputstream rule's posture: the
+  # presence of the API on a stream is the finding; reachability from
+  # untrusted input is adjudicated downstream.
+  # ---------------------------------------------------------------------------
+  - id: raptor.deserialisation.java.xmldecoder
+    message: >-
+      An XMLDecoder constructor appears in this code. Review the input origin and later decoding operations; permissive decoding of untrusted XML can construct objects and invoke methods. Prefer restricted data parsing and explicit object construction.
+    languages: [java, kotlin]
+    severity: HIGH
+    pattern-either:
+      - pattern: new XMLDecoder($STREAM)
+      - pattern: new XMLDecoder($STREAM, ...)
+    metadata:
+      cwe: ["CWE-502"]
+      owasp_top_10: ["A8:2021-Software and Data Integrity Failures"]
+      tags: ["security", "deserialisation", "xmldecoder"]
+
+  # ---------------------------------------------------------------------------
+  # Java — constructor spelling is a review candidate: acceptance of
+  # custom Java tags depends on the SnakeYAML version and loader policy.
+  # Explicit SafeConstructor spellings are excluded from this narrow rule.
+  # ---------------------------------------------------------------------------
+  - id: raptor.deserialisation.java.snakeyaml-unsafe-constructor
+    message: >-
+      Review this SnakeYAML constructor's version and loader policy before
+      parsing untrusted YAML. Permissive Java tag handling can instantiate
+      attacker-chosen types; constructor spelling alone does not establish
+      that tags are accepted. Restrict allowed tags and types, for example
+      with SafeConstructor and suitable LoaderOptions.
+    languages: [java, kotlin]
+    severity: HIGH
+    patterns:
+      - pattern: new Yaml(...)
+      - pattern-not: new Yaml(new SafeConstructor(...), ...)
+      - pattern-not: new Yaml(new org.yaml.snakeyaml.constructor.SafeConstructor(...), ...)
+    metadata:
+      cwe: ["CWE-502"]
+      owasp_top_10: ["A8:2021-Software and Data Integrity Failures"]
+      tags: ["security", "deserialisation", "snakeyaml"]
+
+  # ---------------------------------------------------------------------------
+  # Java — Jackson polymorphic default typing turns every readValue of
+  # attacker JSON into a gadget-instantiation primitive.
+  # enableDefaultTyping() is the deprecated spelling;
+  # activateDefaultTyping(...) without a restrictive validator is the
+  # modern one. Both are mechanically checkable misconfigurations.
+  # ---------------------------------------------------------------------------
+  - id: raptor.deserialisation.java.jackson-default-typing
+    message: >-
+      A default-typing configuration call appears in this code. Confirm the mapper API, library version, validator and later use with untrusted input before concluding attacker-chosen type construction. Prefer explicit model types or a suitably restrictive validator.
+    languages: [java, kotlin]
+    severity: HIGH
+    pattern-either:
+      - pattern: $MAPPER.enableDefaultTyping()
+      - pattern: $MAPPER.enableDefaultTyping(...)
+      - pattern: $MAPPER.activateDefaultTyping(LaissezFaireSubTypeValidator.instance, ...)
+    metadata:
+      cwe: ["CWE-502"]
+      owasp_top_10: ["A8:2021-Software and Data Integrity Failures"]
+      tags: ["security", "deserialisation", "jackson"]

@@ -1,0 +1,538 @@
+"""Maven pom.xml parser.
+
+Walks ``<dependencies>``, ``<dependencyManagement>/<dependencies>``,
+``<build>/<plugins>``, ``<build>/<pluginManagement>/<plugins>``, and
+``<parent>``. Handles namespaced and namespace-less POMs (some toy/test
+POMs omit the namespace).
+
+We do **not** invoke Maven. We do simple top-level ``<properties>``
+substitution because the vast majority of real POMs use it. Anything we
+can't resolve drops to ``parser_confidence: medium`` and ``pin_style:
+unknown`` — the user sees the ambiguity rather than a guessed version.
+
+Parent-POM inheritance IS resolved when the pipeline has installed a
+:mod:`pom_inheritance` resolver (``set_inheritance_resolver``): step 6
+of :func:`parse` fills managed versions from the merged parent-chain +
+BOM view. Without a resolver (default, tests, ``--offline``) such
+dependencies surface as ``version=None`` — no version, no match,
+explicitly logged.
+
+XML safety: defusedxml's ``ElementTree.fromstring`` rejects DTDs and
+entity declarations by default, blocking billion-laughs and external-
+entity attacks from a hostile target repo.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, TYPE_CHECKING
+
+from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl
+from . import _safe_read, pom_inheritance as _inh, register
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+try:
+    from defusedxml import ElementTree as DET  # type: ignore[import-untyped]
+    from defusedxml.common import (  # type: ignore[import-untyped]
+        DefusedXmlException,
+    )
+    _AVAILABLE = True
+except ImportError:                       # pragma: no cover — env-dependent
+    DET = None                            # type: ignore[assignment]
+    DefusedXmlException = Exception       # type: ignore[assignment,misc]
+    _AVAILABLE = False
+    logger.warning(
+        "sca.parsers.pom: 'defusedxml' not installed — pom.xml files will "
+        "be skipped. `uv pip install defusedxml` to enable Maven SCA coverage."
+    )
+
+ECOSYSTEM = "Maven"
+
+# POMs may carry a namespace (http/https × 4.0.0/4.1.0) or none;
+# ``_strip_namespaces`` flattens every variant so a single XPath works.
+# ``${...}`` substitution shares ``pom_inheritance``'s budgeted
+# resolver (one grammar, one size bound) — see ``_resolve``.
+
+# Scope values defined by Maven. ``main`` is the runtime
+# ship-with-the-product set; ``provided`` / ``system`` are
+# "supplied by the runtime container" — CVEs there apply only
+# if the runtime version matches the declared version, so
+# they're surfaced under a distinct scope for severity
+# triage. ``test`` deps don't ship and should be tier-downgraded
+# downstream.
+_SCOPE_MAP = {
+    "compile": "main",
+    "runtime": "main",
+    "provided": "provided",
+    "system": "system",
+    "test": "test",
+    "import": "build",
+}
+
+
+def parse(path: Path) -> list[Dependency]:
+    """Return all dependencies declared in ``path``."""
+    root = _load_root(path)
+    if root is None:
+        return []
+
+    properties = _collect_properties(root)
+    deps: list[Dependency] = []
+
+    # 1) Top-level <dependencies>/<dependency>
+    for dep_el in root.findall("./dependencies/dependency"):
+        d = _build_dep(dep_el, path, properties, scope_default="compile",
+                       is_managed=False, is_plugin=False)
+        if d is not None:
+            deps.append(d)
+
+    # 2) <dependencyManagement>/<dependencies>/<dependency>
+    for dep_el in root.findall("./dependencyManagement/dependencies/dependency"):
+        d = _build_dep(dep_el, path, properties, scope_default="import",
+                       is_managed=True, is_plugin=False)
+        if d is not None:
+            deps.append(d)
+
+    # 3) Plugin coordinates from <build>/<plugins> and pluginManagement.
+    plugin_paths = (
+        "./build/plugins/plugin",
+        "./build/pluginManagement/plugins/plugin",
+        "./reporting/plugins/plugin",
+    )
+    for xpath in plugin_paths:
+        for plug_el in root.findall(xpath):
+            d = _build_dep(plug_el, path, properties, scope_default="build",
+                           is_managed=False, is_plugin=True)
+            if d is not None:
+                deps.append(d)
+
+    # 4) <parent> — parent POM coordinate; record as build-scope so it's
+    #    visible to OSV but doesn't pollute application dependency lists.
+    parent = root.find("./parent")
+    if parent is not None:
+        d = _build_dep(parent, path, properties, scope_default="build",
+                       is_managed=False, is_plugin=False)
+        if d is not None:
+            d.scope = "build"
+            deps.append(d)
+
+    # 5) Resolve local <dependencyManagement> inheritance — top-level
+    # <dependency> entries that omit <version> inherit it from the
+    # matching <dependencyManagement> entry in the SAME POM.
+    _resolve_local_dep_management(deps)
+
+    # 6) Resolve INHERITED dependency-management when a resolver is
+    # installed (set_inheritance_resolver). Walks the local +
+    # network parent chain plus BOM imports, then fills in versions
+    # for child deps still at ``version=None`` from the merged
+    # managed view. Closes the Spring Boot starter-parent case and
+    # the in-house multi-module-monorepo case. No-op when no
+    # resolver has been installed (default, tests, --offline).
+    resolver = _inh.get_inheritance_resolver()
+    if resolver is not None:
+        try:
+            view = resolver.resolve(path, root)
+        except Exception as e:                              # noqa: BLE001
+            # The resolver is best-effort: any unexpected failure
+            # falls through to local-only behaviour. Operators
+            # see the deps they would have seen pre-resolver, not
+            # a crash.
+            logger.warning(
+                "sca.parsers.pom: inheritance resolver failed on "
+                "%s: %s", path, e,
+            )
+            view = None
+        if view is not None:
+            _apply_inherited_view(deps, properties, view)
+
+    return deps
+
+
+def extract_project_license(path: Path) -> str | None:
+    """License the POM declares for the PROJECT ITSELF.
+
+    ``<licenses>`` describes the project, not its deps — it feeds the
+    SBOM metadata/root component, never ``Dependency.declared_license``
+    (dep licenses come from registry enrichment, or stay None for the
+    policy's ``on_unknown`` path).
+    """
+    root = _load_root(path)
+    if root is None:
+        return None
+    return _extract_license(root)
+
+
+def _load_root(path: Path):
+    """Read + defused-parse + namespace-strip a POM; None on failure."""
+    if not _AVAILABLE:
+        logger.warning(
+            "sca.parsers.pom: skipping %s — 'defusedxml' not installed", path,
+        )
+        return None
+    text = _safe_read.read_bounded(path, follow_symlinks=False)
+    if text is None:
+        # ``read_bounded`` already logged the underlying reason.
+        return None
+
+    try:
+        root = DET.fromstring(text)
+    except DET.ParseError as e:
+        logger.warning("sca.parsers.pom: XML parse failed for %s: %s", path, e)
+        return None
+    except DefusedXmlException as e:
+        # XXE / DTD / entity-expansion blocked by defusedxml. Treat as a
+        # hostile manifest: emit nothing and surface a warning so the
+        # operator sees the file was rejected — in the canonical
+        # parse-failed shape, so the refusal reaches the run report's
+        # structured parse_failures rather than only the log stream.
+        logger.warning(
+            "sca.parsers.pom: XML parse failed for %s: "
+            "defused XML protection rejected hostile construct: %s",
+            path, e,
+        )
+        return None
+
+    _strip_namespaces(root)
+    # A POM's document element is always <project> (any namespace,
+    # stripped above). Rejecting other roots keeps arbitrary XML that
+    # happens to be named pom.xml from being mined for coincidental
+    # <dependencies> shapes now that namespace stripping is
+    # namespace-agnostic.
+    if root.tag != "project":
+        logger.warning(
+            "sca.parsers.pom: XML parse failed for %s: root element "
+            "%r is not <project> — not a Maven POM",
+            path, root.tag,
+        )
+        return None
+    return root
+
+
+def _apply_inherited_view(
+    deps: list[Dependency],
+    properties: dict[str, str],
+    view: Any,
+) -> None:
+    """Fill in ``version=None`` deps from the inheritance view's
+    merged managed-map. Also extends ``properties`` with inherited
+    keys so later property resolution can pick them up (callers
+    that re-resolve properties on already-built deps would still
+    use this).
+
+    Properties are merged into the child's dict, but child values
+    win (we only ``setdefault``), so a child's own property
+    override stays authoritative."""
+    for k, v in view.properties.items():
+        properties.setdefault(k, v)
+
+    for dep in deps:
+        if dep.version is not None:
+            continue
+        # Maven coord — split package back into (group, artifact).
+        # Dependency.name shape is "groupId:artifactId" for the
+        # Maven ecosystem.
+        if ":" not in dep.name:
+            continue
+        group, artifact = dep.name.split(":", 1)
+        inherited = view.managed.get((group, artifact))
+        if not inherited:
+            continue
+        # Resolve any ${...} in the inherited value against the
+        # MERGED child-wins property set built above — parent-chain
+        # managed versions arrive RAW from the resolver precisely so
+        # a child's property override applies here (Maven's
+        # effective-POM precedence); resolving against the view's
+        # ancestor-only properties reported the parent's stale pin.
+        # EMBEDDED references (``2.${jackson.minor}.0``) resolve the
+        # same way — the old whole-string-only pass left them
+        # unresolved AND let them through the whole-string-only
+        # refusal gate below, the exact poisoned state the gate
+        # exists to stop.
+        resolved, fully = _inh._resolve_property_refs(
+            inherited, properties, origin=str(dep.declared_in),
+        )
+        if not resolved or not fully or "${" in resolved:
+            # Some reference no scope defines (or a property whose
+            # own value is still ``${...}``-shaped): the result is
+            # not a version — letting it flow verbatim into
+            # ``dep.version`` / purl poisons CVE matching. Leave the
+            # dep unpinned instead.
+            continue
+        dep.version = resolved
+        dep.pin_style = _classify_version(resolved)[0]
+        if dep.pin_style is PinStyle.RANGE:
+            dep.version_floor, dep.version_ceiling = _range_corridor(resolved)
+        dep.parser_confidence = _confidence(True, resolved, dep.scope == "build")
+        dep.purl = build_purl("maven", artifact, resolved, namespace=group)
+
+
+def _resolve_local_dep_management(deps: list[Dependency]) -> None:
+    """For any compile/runtime/test-scoped dep with version=None,
+    look up its (groupId:artifactId) in the import-scoped managed
+    deps and copy the version across. Mutates in place.
+
+    The managed entries themselves keep ``scope="build"`` — they
+    aren't installed; they only provide version pinning."""
+    managed_version: dict = {}
+    for d in deps:
+        if d.scope == "build" and d.version:
+            # Managed entries come in as scope="build" via the
+            # "import" scope_default in _SCOPE_MAP.
+            managed_version[d.name] = d.version
+    for d in deps:
+        if d.scope in ("build",):
+            continue
+        if d.version:
+            continue
+        inherited = managed_version.get(d.name)
+        if inherited:
+            d.version = inherited
+            d.pin_style = _classify_version(inherited)[0]
+            if d.pin_style is PinStyle.RANGE:
+                d.version_floor, d.version_ceiling = _range_corridor(inherited)
+            d.parser_confidence = _confidence(True, inherited, False)
+            if ":" in d.name:
+                g, a = d.name.split(":", 1)
+                d.purl = f"pkg:maven/{g}/{a}@{inherited}"
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+def _extract_license(root) -> str | None:
+    """Collect names from ``<licenses>/<license>/<name>``; returns SPDX-OR
+    when multiple are listed."""
+    names: list[str] = []
+    for el in root.findall("./licenses/license"):
+        n = _text(el, "name")
+        if n and n.strip():
+            names.append(n.strip())
+    if not names:
+        return None
+    return " OR ".join(names) if len(names) > 1 else names[0]
+
+
+def _strip_namespaces(root) -> None:
+    """Drop any XML namespace prefix from every element tag in-place.
+
+    Handling namespaced and namespace-less POMs at every XPath site
+    is noisy; flattening once at the top is cheaper and easier to read.
+
+    Namespace-agnostic on purpose: real POMs declare the namespace as
+    ``http://maven.apache.org/POM/4.0.0``, ``https://...`` (mirrors and
+    IDE templates emit the TLS spelling), or the 4.1.0 revision. An
+    exact-string strip of only the http/4.0.0 form left every other
+    variant fully namespaced, so all XPath lookups missed and the POM
+    yielded zero deps with no warning. The root-tag check in
+    ``_load_root`` keeps non-POM XML rejected.
+    """
+    for el in root.iter():
+        if isinstance(el.tag, str) and el.tag.startswith("{"):
+            el.tag = el.tag.split("}", 1)[-1]
+
+
+def _collect_properties(root) -> dict[str, str]:
+    """Read top-level ``<properties>`` for ${...} substitution.
+
+    Maven also exposes built-ins like ``${project.version}`` —
+    we resolve a small allowlist of those (project.version,
+    project.groupId, project.artifactId) since they're extremely common.
+    """
+    props: dict[str, str] = {}
+    props_el = root.find("./properties")
+    if props_el is not None:
+        for child in props_el:
+            if isinstance(child.tag, str) and child.text is not None:
+                props[child.tag] = child.text.strip()
+
+    # Built-in project.* coordinates.
+    for key, xpath in (
+        ("project.version", "./version"),
+        ("project.groupId", "./groupId"),
+        ("project.artifactId", "./artifactId"),
+    ):
+        el = root.find(xpath)
+        if el is not None and el.text:
+            props.setdefault(key, el.text.strip())
+        # Also resolve the parent coordinate if no top-level override.
+        if key not in props:
+            par = root.find("./parent" + xpath[1:])
+            if par is not None and par.text:
+                props[key] = par.text.strip()
+    return props
+
+
+def _resolve(
+    value: str | None, properties: dict[str, str], *, origin: str = "",
+) -> tuple[str | None, bool]:
+    """Substitute ${...} placeholders. Return (resolved, fully_resolved).
+
+    Delegates to the shared budgeted resolver: an unbudgeted
+    substitution pass over an attacker-sized element replicates
+    property values once per reference (file-size-squared growth from
+    one hostile POM). ``(None, False)`` on budget breach — the breach
+    is recorded as a structured parse failure by the shared helper."""
+    if value is None:
+        return None, True
+    text = value.strip()
+    if not text:
+        return None, True
+    return _inh._resolve_property_refs(text, properties, origin=origin)
+
+
+def _build_dep(
+    el,
+    path: Path,
+    properties: dict[str, str],
+    *,
+    scope_default: str,
+    is_managed: bool,
+    is_plugin: bool,
+) -> Dependency | None:
+    """Materialise one Dependency from a <dependency>/<plugin>/<parent> element."""
+    group_text = _text(el, "groupId")
+    artifact_text = _text(el, "artifactId")
+    version_text = _text(el, "version")
+    scope_text = _text(el, "scope")
+
+    origin = str(path)
+    group, group_ok = _resolve(group_text, properties, origin=origin)
+    artifact, artifact_ok = _resolve(artifact_text, properties, origin=origin)
+    version, version_ok = _resolve(version_text, properties, origin=origin)
+
+    if not artifact:
+        # Without an artifactId there's nothing to record.
+        return None
+    # Plugins may omit groupId (defaults to org.apache.maven.plugins).
+    if not group:
+        if is_plugin:
+            group = "org.apache.maven.plugins"
+            group_ok = True
+        else:
+            return None
+
+    name = f"{group}:{artifact}"
+    pin_style, version_for_record = _classify_version(version)
+    version_floor, version_ceiling = (
+        _range_corridor(version_for_record)
+        if pin_style is PinStyle.RANGE else (None, None)
+    )
+    fully_resolved = group_ok and artifact_ok and version_ok
+
+    raw_scope = (scope_text or scope_default).strip().lower()
+    scope = _SCOPE_MAP.get(raw_scope, "main")
+    if is_plugin:
+        scope = "build"
+    if is_managed and not is_plugin and raw_scope != "import":
+        # Managed deps that aren't BOM imports are still version
+        # constraints, not actual deps — record as "build" to avoid
+        # double-counting alongside their consuming <dependency> entry.
+        scope = "build"
+
+    confidence = _confidence(fully_resolved, version_for_record, is_managed)
+    purl = build_purl("maven", artifact, version_for_record, namespace=group)
+
+    return Dependency(
+        ecosystem=ECOSYSTEM,
+        name=name,
+        version=version_for_record,
+        declared_in=path,
+        scope=scope,
+        is_lockfile=False,
+        pin_style=pin_style,
+        direct=not is_managed,
+        purl=purl,
+        parser_confidence=confidence,
+        version_floor=version_floor,
+        version_ceiling=version_ceiling,
+    )
+
+
+def _text(el, tag: str) -> str | None:
+    child = el.find(tag)
+    if child is None:
+        return None
+    return child.text
+
+
+# Single-interval Maven range — ``[1.0,2.0)`` / ``(,1.0]`` / ``[1.5,)``.
+# Value classes exclude the structural delimiters so matching stays
+# linear-time on hostile input (same posture as nuget.py's bracket
+# grammar). Multi-interval unions (``(,1.0],[1.2,)``) don't match and
+# carry no corridor.
+_RANGE_RE = re.compile(
+    r"^([\[\(])([^,\[\]\(\)]*),([^,\[\]\(\)]*)([\]\)])$"
+)
+
+
+def _range_corridor(
+    version: str | None,
+) -> tuple[str | None, str | None]:
+    """Return ``(floor, ceiling)`` corridor bounds from a single-interval
+    Maven range, or ``(None, None)`` for anything else.
+
+    harden records these so its upgrade candidate selection stays inside
+    the declared range instead of over-bumping past the upper bound and
+    relying on the rewriter's fail-closed backstop.
+    """
+    if not version:
+        return None, None
+    m = _RANGE_RE.match(version.strip())
+    if m is None:
+        return None, None
+    floor = m.group(2).strip() or None
+    ceiling = m.group(3).strip() or None
+    return floor, ceiling
+
+
+def _classify_version(version: str | None) -> tuple[PinStyle, str | None]:
+    """Map a Maven version expression to a PinStyle plus a usable string."""
+    if version is None or version == "":
+        return PinStyle.UNKNOWN, None
+    v = version.strip()
+    if "${" in v:
+        # Unresolved placeholder.
+        return PinStyle.UNKNOWN, v
+    if v in ("LATEST", "RELEASE", "*"):
+        return PinStyle.WILDCARD, v
+    if v.startswith("[") and v.endswith("]") and "," not in v:
+        # Hard requirement: "[1.2.3]"
+        return PinStyle.EXACT, v[1:-1]
+    if any(ch in v for ch in "[](),"):
+        return PinStyle.RANGE, v
+    return PinStyle.EXACT, v
+
+
+def _confidence(
+    fully_resolved: bool,
+    version: str | None,
+    is_managed: bool,
+) -> Confidence:
+    # Deliberately NOT the shared ``_base`` ladder: Maven confidence
+    # keys on property-resolution completeness and dependencyManagement
+    # provenance, not on pin style.
+    if not fully_resolved:
+        return Confidence("medium",
+                          reason="POM property substitution incomplete")
+    if version is None:
+        # Either a managed entry whose version comes from a parent we
+        # don't read, or an inherited version. Either way the matcher
+        # can't act without one — flag it.
+        return Confidence(
+            "medium",
+            reason="POM dependency has no resolvable version",
+        )
+    if is_managed:
+        return Confidence("high", reason="POM dependencyManagement entry")
+    return Confidence("high", reason="POM dependency block")
+
+
+
+register(filenames=["pom.xml"])(parse)

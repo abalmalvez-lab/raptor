@@ -1,0 +1,234 @@
+"""libsodium corpus driver — C precision corpus.
+
+libsodium v1.0.20 — pure C, ~40k LOC. Autotools build with two
+configurations (O0+coverage / O2+--gc-sections); ground truth from
+``make check`` (60+ test binaries). Mirrors the zlib driver structure
+but uses libsodium's static archive ``libsodium.a`` as both the
+candidate-enumeration source and the link target for the classifier
+binary.
+
+Cache layout::
+
+    out/binary-oracle-precision/cache/libsodium/<sha-prefix>/
+        build_o0/        # autotools build, includes .gcda after make check
+        build_o2/        # autotools build
+        sentinel.ok      # version-stamped; absent → full rebuild
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Literal, TYPE_CHECKING
+
+from core.inventory.binary_oracle_corpora._cache import has_gcov_data, prepared_corpus
+
+from core.inventory.binary_oracle_corpora._sandbox_exec import (
+    run_build_step,
+    run_tool,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+LIBSODIUM_URL = "https://github.com/jedisct1/libsodium.git"
+LIBSODIUM_TAG = "1.0.20-RELEASE"
+# Bumped to 2: sandbox-wrapped test-binary invocation + writable_paths
+# for gcov + broader gcda reset (whole build_dir, not just src/libsodium).
+# Old caches need a fresh build for the new workload semantics.
+CACHE_VERSION = "2"
+
+
+@dataclass
+class _LibsodiumDriver:
+    name: str = "libsodium"
+    description: str = (
+        "libsodium v1.0.20 — pure C, ~40k LOC, autotools + gcov. "
+        "Ground truth from `make check` (60+ test binaries).")
+    mode: Literal["gcov"] = "gcov"
+
+    def prepare(self, work_dir: Path) -> dict[str, Any]:
+        work_dir = work_dir.resolve()
+        tag_dir = work_dir / LIBSODIUM_TAG.replace("-", "_")
+        build_o0 = tag_dir / "build_o0"
+        build_o2 = tag_dir / "build_o2"
+
+        with prepared_corpus(
+            tag_dir, version=CACHE_VERSION, build=lambda: _build_fresh(tag_dir, build_o0, build_o2),
+            persistent=(build_o0, build_o2), required=(build_o0 / "test/default/aead_aegis128l", build_o2 / "test/default/aead_aegis128l"),
+            transient=(tag_dir / "src",), ready=lambda: has_gcov_data(build_o0),
+        ):
+            live = _collect_gcov_liveness(build_o0)
+            candidates = _enumerate_candidates(build_o0)
+            from .toolchain import record_toolchain
+            toolchain = record_toolchain(cc="gcc", gcov="gcov")
+            return {
+                # ``aead_aegis128l`` is one of the test executables — it's
+                # statically linked against libsodium.a and exercises a broad
+                # slice of the library, so ``--gc-sections`` produces a
+                # realistic mix of absent / inlined / symbol_present.
+                "o2_binary":            build_o2 / "test" / "default"
+                                        / "aead_aegis128l",
+                "candidate_functions":  candidates,
+                "live_set":             live,
+                "toolchain":            toolchain,
+            }
+
+
+def _build_fresh(tag_dir: Path, build_o0: Path, build_o2: Path) -> None:
+    """Clone (shallow, tag-only) → autogen → configure × 2 → build × 2
+    → run the single target test binary on the O0 coverage build."""
+    tag_dir.mkdir(parents=True, exist_ok=True)
+    src = tag_dir / "src"
+
+    from core.git import clone_repository, get_safe_git_env
+    from core.git.clone import safe_git_command
+
+    logger.info("libsodium: cloning %s (tag %s) → %s",
+                LIBSODIUM_URL, LIBSODIUM_TAG, src)
+    if not clone_repository(LIBSODIUM_URL, src, depth=1):
+        msg = f"libsodium: clone failed for {LIBSODIUM_URL}"
+        raise RuntimeError(msg)
+    subprocess.run(
+        safe_git_command("-C", str(src), "fetch", "--depth", "1",
+                         "origin", LIBSODIUM_TAG),
+        # Dials origin outside the sandbox egress proxy — keep the
+        # operator proxy vars (get_safe_git_env contract).
+        env=get_safe_git_env(preserve_proxy=True), check=True, timeout=60,
+    )
+    subprocess.run(
+        safe_git_command("-C", str(src), "checkout", "FETCH_HEAD"),
+        env=get_safe_git_env(), check=True, timeout=60,
+    )
+
+    # Fetched build system — sandboxed with sanitised env (see
+    # _sandbox_exec).
+    run_build_step(["./autogen.sh"], cwd=src, timeout=120)
+
+    for build_dir, cflags, ldflags, target_only in [
+        (build_o0, "-O0 -g --coverage", "--coverage", True),
+        (build_o2,
+         "-O2 -g -ffunction-sections -fdata-sections",
+         "-Wl,--gc-sections", False),
+    ]:
+        build_dir.mkdir(parents=True)
+        flags = {"CFLAGS": cflags, "LDFLAGS": ldflags}
+        # scope=tag_dir: out-of-tree autotools build — under mount-ns
+        # isolation the sibling src/ tree is invisible unless the
+        # sandbox root spans both src/ and the build dir.
+        run_build_step(
+            [str((src / "configure").resolve()),
+             "--enable-static", "--disable-shared"],
+            cwd=build_dir, scope=tag_dir, extra_env=flags, timeout=180,
+        )
+        # libsodium's test binaries (the only artifacts with realistic
+        # --gc-sections DCE on a libsodium-linked executable) are only
+        # produced by ``make check`` — plain ``make`` builds just the
+        # static archive. ``TESTS=`` builds the check_PROGRAMS targets
+        # without executing them; only the O0 coverage path needs to
+        # actually run the target binary (below).
+        run_build_step(["make", "-j4"], cwd=build_dir, scope=tag_dir,
+                       extra_env=flags, timeout=600)
+        run_build_step(["make", "check", "TESTS="], cwd=build_dir,
+                       scope=tag_dir, extra_env=flags, timeout=900)
+        if target_only:
+            # Reset gcov counters and run ONLY the classifier target
+            # binary. This aligns ground truth (what gcov saw executed)
+            # with what the classifier evaluates (a single test binary).
+            # Without this, ``make check`` aggregated execution across
+            # 60+ tests but the classifier sees one slice — so most
+            # cross-test-active functions misclassify as absent FPs.
+            #
+            # Walk the WHOLE build_dir (not just src/libsodium) —
+            # adversarial review E P1-5. libtool can emit .gcda under
+            # ``test/*/.libs/*.gcda`` and other layouts; the prior
+            # narrow reset left stale .gcda from earlier ``make check``
+            # runs in those locations, contaminating the live_set.
+            for gcda in build_dir.rglob("*.gcda"):
+                try:
+                    gcda.unlink()
+                except OSError:
+                    pass
+            # Sandbox the libsodium test-binary invocation. Upstream
+            # tag is trusted but supply-chain compromise on a pinned
+            # ref is the residual risk; running an executable should
+            # be contained (Landlock + namespace; no network needed).
+            # scope=tag_dir: the binary reads its expected-output
+            # fixture from the SRC tree (out-of-tree autotools srcdir
+            # — src/test/default/aead_aegis128l.exp) and gcov writes
+            # .gcda files across the whole build tree; both live
+            # under tag_dir, and writable_paths don't survive into
+            # the mount-ns view.
+            target = build_dir / "test" / "default" / "aead_aegis128l"
+            run_build_step(
+                [str(target)], cwd=target.parent, scope=tag_dir,
+                timeout=60,
+            )
+
+
+
+# ---------------------------------------------------------------------------
+# gcov parsing — reuses the zlib regex; libsodium gcov format is identical.
+# ---------------------------------------------------------------------------
+
+_GCOV_FN_RE = re.compile(r"^Function '([^']+)'")
+_GCOV_LINES_RE = re.compile(r"^Lines executed:([\d.]+)% of \d+")
+
+
+def _collect_gcov_liveness(build_dir: Path) -> set[str]:
+    """Walk ``src/libsodium/sodium/`` and the per-area subdirs for
+    .gcda/.c pairs, run ``gcov -f``, accumulate functions with > 0%
+    line execution. libsodium splits its source across many subdirs
+    (codecs, runtime, version, crypto_*, etc.) so we recurse."""
+    libsodium_root = build_dir / "src" / "libsodium"
+    if not libsodium_root.is_dir():
+        logger.warning("libsodium: %s missing", libsodium_root)
+        return set()
+
+    live: set[str] = set()
+    for gcda in libsodium_root.rglob("*.gcda"):
+        gcda_dir = gcda.parent
+        out = run_tool(
+            ["gcov", "-f", gcda.name], cwd=gcda_dir,
+            check=False, timeout=60,
+        ).stdout
+        current = None
+        for line in out.splitlines():
+            m = _GCOV_FN_RE.match(line)
+            if m:
+                current = m.group(1)
+                continue
+            if current:
+                m2 = _GCOV_LINES_RE.match(line)
+                if m2:
+                    if float(m2.group(1)) > 0:
+                        live.add(current)
+                    current = None
+    return live
+
+
+def _enumerate_candidates(build_o0: Path) -> list[str]:
+    """Functions defined in ``libsodium.a`` — the candidate population.
+
+    libtool prefixes symbols in archived objects with ``libsodium_la-``
+    on the OBJECT FILE names, but the symbols themselves are unprefixed
+    (just the C function name). Use nm directly on the archive."""
+    archive = build_o0 / "src" / "libsodium" / ".libs" / "libsodium.a"
+    if not archive.exists():
+        logger.warning("libsodium: %s missing", archive)
+        return []
+    out = run_tool(["nm", str(archive)],
+                   check=False, timeout=30).stdout
+    fns: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-2] in ("T", "t", "W", "w"):
+            fns.add(parts[-1])
+    return sorted(fns)
+
+
+driver = _LibsodiumDriver()

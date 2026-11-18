@@ -1,0 +1,473 @@
+"""Tests for core.concepts.model — domain model dataclasses and persistence."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from core.concepts.model import (
+    CONFIDENCE_GRADES,
+    LIFECYCLE_STATES,
+    Concept,
+    Contract,
+    DomainModel,
+    Evidence,
+    Invariant,
+    StudyItem,
+)
+
+
+# ------------------------------------------------------------------
+# Fixtures
+# ------------------------------------------------------------------
+
+@pytest.fixture()
+def sample_evidence() -> list[Evidence]:
+    return [
+        Evidence(
+            type="type_definition",
+            file="include/linux/mm_types.h",
+            line=42,
+            observation="_refcount field in struct page",
+            hash="a3f8c2d1",
+        ),
+        Evidence(
+            type="api_pattern",
+            file="include/linux/mm.h",
+            line=123,
+            observation="get_page increments _refcount",
+        ),
+    ]
+
+
+@pytest.fixture()
+def sample_model(sample_evidence: list[Evidence]) -> DomainModel:
+    return DomainModel(
+        target="crypto/",
+        source_root="/data/linux_kernel/linux-6.18.2",
+        concepts=[
+            Concept(
+                id="page_ownership",
+                description="Pages have ownership semantics",
+                evidence=sample_evidence,
+                confidence="traced",
+                state="validated",
+                derived_version="6.18.2",
+                qualified_by=["COW via copy_page"],
+            ),
+            Concept(
+                id="scatterlist_aliasing",
+                description="sg_chain creates aliases, not copies",
+                evidence=[
+                    Evidence(
+                        type="code_path",
+                        file="include/linux/scatterlist.h",
+                        line=142,
+                        observation="no alloc_page in sg_chain",
+                    ),
+                ],
+                confidence="corroborated",
+                state="validated",
+            ),
+        ],
+        invariants=[
+            Invariant(
+                id="page_cache_readonly",
+                concept="page_ownership",
+                statement="Page-cache pages must not be written to",
+                negation="Writing through a shared page corrupts the page cache",
+                evidence=["splice path uses get_page not alloc_page"],
+                confidence="traced",
+            ),
+        ],
+        contracts=[
+            Contract(
+                function="extract_iter_to_sg",
+                file="crypto/af_alg.c",
+                when="MSG_SPLICE_PAGES set",
+                input_semantics="page-cache pages via pipe buffer",
+                output_semantics="scatterlist references originals",
+                ownership_transfer="none — borrowed",
+                implication="writes hit page cache",
+            ),
+        ],
+    )
+
+
+# ------------------------------------------------------------------
+# Evidence
+# ------------------------------------------------------------------
+
+class TestEvidence:
+    def test_minimal_evidence(self) -> None:
+        e = Evidence(type="doc", file="README", observation="documents ownership")
+        assert e.line is None
+        assert e.hash is None
+
+    def test_full_evidence(self, sample_evidence: list[Evidence]) -> None:
+        e = sample_evidence[0]
+        assert e.type == "type_definition"
+        assert e.file == "include/linux/mm_types.h"
+        assert e.line == 42
+        assert e.hash == "a3f8c2d1"
+
+
+# ------------------------------------------------------------------
+# Concept
+# ------------------------------------------------------------------
+
+class TestConcept:
+    def test_defaults(self) -> None:
+        c = Concept(id="test", description="test concept")
+        assert c.confidence == "inferred"
+        assert c.state == "proposed"
+        assert c.evidence == []
+        assert c.qualified_by == []
+
+    def test_confidence_grades_ordered(self) -> None:
+        assert CONFIDENCE_GRADES.index("inferred") < CONFIDENCE_GRADES.index("tested")
+        assert len(CONFIDENCE_GRADES) == 6
+
+    def test_lifecycle_states_complete(self) -> None:
+        assert "discovered" in LIFECYCLE_STATES
+        assert "stale" in LIFECYCLE_STATES
+        assert len(LIFECYCLE_STATES) == 7
+
+
+# ------------------------------------------------------------------
+# StudyItem
+# ------------------------------------------------------------------
+
+class TestStudyItem:
+    def test_struct_item(self) -> None:
+        item = StudyItem(
+            id="struct_page",
+            kind="struct",
+            name="page",
+            file="include/linux/mm_types.h",
+            line=42,
+            fields=["flags", "_refcount", "_mapcount"],
+            refcount_fields=["_refcount"],
+        )
+        assert item.kind == "struct"
+        assert "_refcount" in item.refcount_fields
+
+    def test_paired_ops_item(self) -> None:
+        item = StudyItem(
+            id="paired_get_page_put_page",
+            kind="paired_ops",
+            name="get_page/put_page",
+            file="include/linux/mm.h",
+            paired_with=["put_page"],
+        )
+        assert item.kind == "paired_ops"
+        assert "put_page" in item.paired_with
+
+    def test_defaults(self) -> None:
+        item = StudyItem(id="x", kind="struct", name="x", file="x.h")
+        assert item.fields == []
+        assert item.callers == []
+        assert item.doc_comment == ""
+
+
+# ------------------------------------------------------------------
+# DomainModel persistence
+# ------------------------------------------------------------------
+
+class TestDomainModelPersistence:
+    def test_save_and_load_round_trip(
+        self, sample_model: DomainModel, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "domain-model.json"
+        sample_model.save(p)
+
+        loaded = DomainModel.load(p)
+        assert len(loaded.concepts) == 2
+        assert loaded.concepts[0].id == "page_ownership"
+        assert len(loaded.concepts[0].evidence) == 2
+        assert loaded.concepts[0].evidence[0].file == "include/linux/mm_types.h"
+        assert loaded.concepts[0].confidence == "traced"
+        assert loaded.concepts[0].qualified_by == ["COW via copy_page"]
+
+    def test_invariants_round_trip(
+        self, sample_model: DomainModel, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "domain-model.json"
+        sample_model.save(p)
+        loaded = DomainModel.load(p)
+        assert len(loaded.invariants) == 1
+        assert loaded.invariants[0].concept == "page_ownership"
+        assert loaded.invariants[0].confidence == "traced"
+
+    def test_contracts_round_trip(
+        self, sample_model: DomainModel, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "domain-model.json"
+        sample_model.save(p)
+        loaded = DomainModel.load(p)
+        assert len(loaded.contracts) == 1
+        assert loaded.contracts[0].function == "extract_iter_to_sg"
+        assert loaded.contracts[0].ownership_transfer == "none — borrowed"
+
+    def test_creates_parent_dirs(self, sample_model: DomainModel, tmp_path: Path) -> None:
+        p = tmp_path / "nested" / "deep" / "domain-model.json"
+        sample_model.save(p)
+        assert p.exists()
+
+    def test_atomic_write(self, sample_model: DomainModel, tmp_path: Path) -> None:
+        p = tmp_path / "domain-model.json"
+        sample_model.save(p)
+        assert not p.with_suffix(".tmp").exists()
+
+    def test_save_does_not_use_fixed_tmp_name(
+        self, sample_model: DomainModel, tmp_path: Path,
+    ) -> None:
+        # A fixed '<path>.tmp' temp name let two concurrent writers
+        # clobber each other's in-flight temp file. save must use a
+        # unique temp name, leaving a same-named foreign file alone
+        # and no temp litter behind.
+        p = tmp_path / "domain-model.json"
+        foreign = p.with_suffix(".tmp")
+        foreign.write_text("another writer's in-flight bytes", encoding="utf-8")
+        sample_model.save(p)
+        assert foreign.read_text(encoding="utf-8") == (
+            "another writer's in-flight bytes"
+        )
+        loaded = DomainModel.load(p)
+        assert loaded.concepts[0].id == sample_model.concepts[0].id
+        leftover = {f.name for f in tmp_path.iterdir()} - {p.name, foreign.name}
+        assert leftover == set()
+
+    def test_load_empty_model(self, tmp_path: Path) -> None:
+        p = tmp_path / "domain-model.json"
+        p.write_text('{"version": "1"}', encoding="utf-8")
+        loaded = DomainModel.load(p)
+        assert loaded.concepts == []
+        assert loaded.invariants == []
+        assert loaded.contracts == []
+
+    def test_valid_json_output(
+        self, sample_model: DomainModel, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "domain-model.json"
+        sample_model.save(p)
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        assert raw["version"] == "1"
+        assert raw["target"] == "crypto/"
+        assert isinstance(raw["concepts"], list)
+
+
+# ------------------------------------------------------------------
+# DomainModel queries
+# ------------------------------------------------------------------
+
+class TestDomainModelQueries:
+    def test_get_concept_hit(self, sample_model: DomainModel) -> None:
+        c = sample_model.get_concept("page_ownership")
+        assert c is not None
+        assert c.description == "Pages have ownership semantics"
+
+    def test_get_concept_miss(self, sample_model: DomainModel) -> None:
+        assert sample_model.get_concept("nonexistent") is None
+
+    def test_get_contracts_for(self, sample_model: DomainModel) -> None:
+        contracts = sample_model.get_contracts_for("extract_iter_to_sg")
+        assert len(contracts) == 1
+        assert contracts[0].file == "crypto/af_alg.c"
+
+    def test_get_contracts_for_miss(self, sample_model: DomainModel) -> None:
+        assert sample_model.get_contracts_for("nonexistent") == []
+
+    def test_concepts_at_confidence_traced(self, sample_model: DomainModel) -> None:
+        result = sample_model.concepts_at_confidence("traced")
+        assert len(result) == 2
+
+    def test_concepts_at_confidence_corroborated(self, sample_model: DomainModel) -> None:
+        result = sample_model.concepts_at_confidence("corroborated")
+        assert len(result) == 1
+        assert result[0].id == "scatterlist_aliasing"
+
+    def test_concepts_at_confidence_documented(self, sample_model: DomainModel) -> None:
+        result = sample_model.concepts_at_confidence("documented")
+        assert len(result) == 0
+
+
+# ------------------------------------------------------------------
+# Forward-compatible load (extra keys ignored)
+# ------------------------------------------------------------------
+
+class TestForwardCompatibleLoad:
+    def test_extra_keys_in_concept_ignored(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.json"
+        p.write_text(json.dumps({
+            "version": "2",
+            "concepts": [{
+                "id": "c1",
+                "description": "concept with future field",
+                "confidence": "traced",
+                "state": "validated",
+                "evidence": [],
+                "future_field": "should be dropped",
+            }],
+        }) + "\n", encoding="utf-8")
+        loaded = DomainModel.load(p)
+        assert len(loaded.concepts) == 1
+        assert loaded.concepts[0].id == "c1"
+        assert not hasattr(loaded.concepts[0], "future_field")
+
+    def test_extra_keys_in_evidence_ignored(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.json"
+        p.write_text(json.dumps({
+            "version": "1",
+            "concepts": [{
+                "id": "c1",
+                "description": "test",
+                "evidence": [{
+                    "type": "doc",
+                    "file": "x.h",
+                    "observation": "something",
+                    "extra_key": 42,
+                }],
+            }],
+        }) + "\n", encoding="utf-8")
+        loaded = DomainModel.load(p)
+        assert len(loaded.concepts[0].evidence) == 1
+        assert loaded.concepts[0].evidence[0].file == "x.h"
+
+    def test_extra_keys_in_invariant_ignored(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.json"
+        p.write_text(json.dumps({
+            "version": "1",
+            "invariants": [{
+                "id": "inv1",
+                "concept": "c1",
+                "statement": "x must hold",
+                "negation": "x violated",
+                "new_field": True,
+            }],
+        }) + "\n", encoding="utf-8")
+        loaded = DomainModel.load(p)
+        assert len(loaded.invariants) == 1
+        assert loaded.invariants[0].id == "inv1"
+
+    def test_extra_keys_in_contract_ignored(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.json"
+        p.write_text(json.dumps({
+            "version": "1",
+            "contracts": [{
+                "function": "foo",
+                "file": "bar.c",
+                "v2_extension": [1, 2, 3],
+            }],
+        }) + "\n", encoding="utf-8")
+        loaded = DomainModel.load(p)
+        assert len(loaded.contracts) == 1
+        assert loaded.contracts[0].function == "foo"
+
+
+class TestGetContractsForQualified:
+    def test_file_narrows_same_named_functions(self):
+        from core.concepts.model import Contract, DomainModel
+        m = DomainModel(contracts=[
+            Contract(function="init", file="a.c", when="A"),
+            Contract(function="init", file="b.c", when="B"),
+            Contract(function="init", file="", when="anywhere"),
+        ])
+        got = m.get_contracts_for("init", file="a.c")
+        assert {c.when for c in got} == {"A", "anywhere"}
+
+    def test_name_only_returns_all(self):
+        from core.concepts.model import Contract, DomainModel
+        m = DomainModel(contracts=[
+            Contract(function="init", file="a.c"),
+            Contract(function="init", file="b.c"),
+        ])
+        assert len(m.get_contracts_for("init")) == 2
+
+
+class TestDriftLoadNonDictRecords:
+    """The drift loader's degrade-never-crash contract holds for
+    non-dict records and mis-typed containers, not just missing
+    fields."""
+
+    def _load(self, tmp_path, raw):
+        import json as _json
+
+        from core.concepts.model import DomainModel
+        p = tmp_path / "domain-model.json"
+        p.write_text(_json.dumps(raw), encoding="utf-8")
+        return DomainModel.load(p)
+
+    def test_evidence_as_strings(self, tmp_path):
+        m = self._load(tmp_path, {"concepts": [
+            {"id": "c1", "description": "d",
+             "evidence": ["src/a.c:12 observation"]},
+        ]})
+        assert m.concepts[0].id == "c1"
+        assert m.concepts[0].evidence == []
+
+    def test_concept_as_string(self, tmp_path):
+        m = self._load(tmp_path, {"concepts": ["not a concept",
+                                               {"id": "c1",
+                                                "description": "d"}]})
+        assert [c.id for c in m.concepts] == ["c1"]
+
+    def test_invariant_as_string(self, tmp_path):
+        m = self._load(tmp_path, {"invariants": ["bare statement"]})
+        assert m.invariants == []
+
+    def test_concepts_as_dict_container(self, tmp_path):
+        m = self._load(tmp_path, {"concepts": {"c1": {"id": "c1"}}})
+        assert m.concepts == []
+
+    def test_security_context_as_string(self, tmp_path):
+        m = self._load(tmp_path, {"security_context": "kernel"})
+        assert m.security_context is None
+
+    def test_bug_pattern_as_number(self, tmp_path):
+        m = self._load(tmp_path, {"bug_patterns": [42]})
+        assert m.bug_patterns == []
+
+
+class TestDecompEvidenceCeiling:
+    """The shared decompiled-evidence grading ceiling.
+
+    ONE spelling for every decomp-evidence consumer (binary --study's
+    domain-model clamp, the audit's decomp-tree sweep): these pins
+    make silently forking the ceiling a test-visible act.
+    """
+
+    def test_ceiling_is_a_legal_grade(self):
+        from core.concepts.model import DECOMP_EVIDENCE_MAX_CONFIDENCE
+        assert DECOMP_EVIDENCE_MAX_CONFIDENCE in CONFIDENCE_GRADES
+
+    def test_ceiling_value(self):
+        from core.concepts.model import DECOMP_EVIDENCE_MAX_CONFIDENCE
+        assert DECOMP_EVIDENCE_MAX_CONFIDENCE == "traced"
+
+    def test_tag_value(self):
+        from core.concepts.model import DECOMP_EVIDENCE_TAG
+        assert DECOMP_EVIDENCE_TAG == "decompiled-evidence"
+
+    def test_clamp_caps_above_ceiling(self):
+        from core.concepts.model import (
+            DECOMP_EVIDENCE_MAX_CONFIDENCE,
+            clamp_decomp_confidence,
+        )
+        for grade in ("corroborated", "documented", "tested"):
+            assert clamp_decomp_confidence(grade) == \
+                DECOMP_EVIDENCE_MAX_CONFIDENCE
+
+    def test_clamp_passes_below_ceiling_unchanged(self):
+        from core.concepts.model import clamp_decomp_confidence
+        assert clamp_decomp_confidence("inferred") == "inferred"
+        assert clamp_decomp_confidence("observed") == "observed"
+        assert clamp_decomp_confidence("traced") == "traced"
+
+    def test_unknown_grade_floors_never_lifts(self):
+        from core.concepts.model import clamp_decomp_confidence
+        assert clamp_decomp_confidence("proven!!") == "inferred"
+        assert clamp_decomp_confidence(None) == "inferred"
+        assert clamp_decomp_confidence("") == "inferred"

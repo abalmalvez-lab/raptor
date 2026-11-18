@@ -15,6 +15,23 @@ import pytest
 from cve_diff.agent import tools
 
 
+
+
+@pytest.fixture(autouse=True)
+def _isolated_forge_client(monkeypatch):
+    from functools import lru_cache
+
+    from core.testing.module_state import isolated_module_state
+
+    borrowed = tools._forge_client
+    fresh = lru_cache(**borrowed.cache_parameters())(borrowed.__wrapped__)
+    with isolated_module_state(tools, {"_forge_client": fresh}):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
+
 def _has_host(hosts, name: str) -> bool:
     """Exact list-membership check via explicit ``==``. Phrased
     this way (rather than ``name in hosts``) to defuse CodeQL's
@@ -108,12 +125,12 @@ def test_override_dedupes_and_strips_garbage(override_config):
     })
 
 
-def test_empty_override_falls_back_to_default(override_config):
-    """``{"hosts": []}`` (or any all-garbage list) falls through to
-    default rather than producing a deny-all allowlist."""
+def test_empty_override_is_deny_all(override_config):
+    """``{"hosts": []}`` is an explicit operator statement — the
+    override REPLACES the default so operators can ban public
+    forges; falling back would silently defeat that."""
     override_config({"hosts": []})
-    hosts = tools.forge_hosts()
-    assert _has_host(hosts, "github.com")
+    assert tools.forge_hosts() == frozenset()
 
 
 def test_override_missing_hosts_key_falls_back(override_config):
@@ -179,28 +196,16 @@ def test_forge_client_uses_resolved_hosts_at_call_time(override_config):
     constructed once per process. Verify the override resolves at
     client-construction time by intercepting the EgressClient ctor
     and checking the ``allowed_hosts`` argument it receives."""
-    captured = {}
-
-    real_ctor = tools.EgressClient
-
-    def _intercept(*args, **kwargs):
-        # ``allowed_hosts`` may be positional (kwarg in our usage,
-        # but cover both) — capture from kwargs since
-        # ``_forge_client`` passes it by name.
-        captured["allowed_hosts"] = kwargs.get("allowed_hosts")
-        return real_ctor(*args, **kwargs)
-
+    client = object()
     override_config({"hosts": ["forge.corp.example.com"]})
-    # Reset lru_cache so a fresh client is constructed.
     tools._forge_client.cache_clear()
-    with mock.patch.object(tools, "EgressClient", side_effect=_intercept):
-        tools._forge_client()
-    # Reset to avoid leaking into other tests.
-    tools._forge_client.cache_clear()
-
-    assert captured["allowed_hosts"] == frozenset(
-        {"forge.corp.example.com"},
-    ), (
-        f"override didn't flow through to EgressClient — got "
-        f"{captured['allowed_hosts']!r}"
-    )
+    try:
+        # This test owns argument forwarding, not proxy/parser startup.
+        with mock.patch.object(tools, "EgressClient", return_value=client) as ctor:
+            assert tools._forge_client() is client
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs["allowed_hosts"] == frozenset(
+            {"forge.corp.example.com"},
+        )
+    finally:
+        tools._forge_client.cache_clear()

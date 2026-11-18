@@ -1,0 +1,149 @@
+"""Module-level reachability for RubyGems deps.
+
+Walks ``*.rb`` files outside Ruby's test conventions (``spec/``,
+``test/``, ``features/``, ``__tests__/``), extracts ``require '...'`` /
+``require_relative`` statements, and matches against the gem's name.
+
+Caveats:
+  - Some gems' require name differs from the gem name (e.g.
+    ``rest-client`` requires as ``rest_client``). We try the exact gem
+    name first, then a ``-`` → ``_`` normalised variant.
+  - Bundler-generated stubs (``bundle exec``) sometimes omit the
+    ``require`` because Bundler injects them; we'd miss those. Hence
+    confidence is ``medium`` for not-reachable verdicts.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from ..models import Confidence, Reachability
+from ._shared import format_evidence as _format_evidence
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines
+from ..parsers import _safe_read
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+_DEFAULT_MAX_DEPTH = 12
+
+_TEST_DIR_NAMES = {"spec", "test", "tests", "features", "__tests__"}
+
+# ``require 'name'`` / ``require "name"`` — including possible ``::``
+# subpaths (``require 'rails/all'``).
+# Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+# ``^\s*`` spelling re-scans a run of blank lines from every line
+# start inside it — quadratic on attacker-supplied source files.
+_REQUIRE_RE = re.compile(
+    r"""^[^\S\n]*(?:require|require_relative)\s+
+        (['"])([^'"]+)\1""",
+    re.MULTILINE | re.VERBOSE,
+)
+
+
+def scan_imports(
+    target: Path, *, max_depth: int = _DEFAULT_MAX_DEPTH,
+) -> dict[str, list[tuple[Path, int, bool]]]:
+    """Return ``{require_target: [(file, line, is_test), ...]}``.
+
+    Each ``require_target`` is the literal first-segment of the require
+    string — ``require 'rails/all'`` keys on ``rails`` so a dep on
+    ``rails`` matches.
+    """
+    target = target.resolve()
+    out: dict[str, list[tuple[Path, int, bool]]] = {}
+    for rb_file in _walk_ruby_sources(target, max_depth=max_depth):
+        is_test = _is_test_file(rb_file, target)
+        text = _safe_read.read_bounded(rb_file, follow_symlinks=False)
+        if text is None:
+            continue
+        for spec, line in _requires_in(text):
+            head = spec.split("/", 1)[0]
+            out.setdefault(head, []).append((rb_file, line, is_test))
+    return out
+
+
+def resolve_dep(
+    dep_name: str,
+    scan: dict[str, list[tuple[Path, int, bool]]],
+    *,
+    target: Path | None = None,
+) -> Reachability:
+    """Look up ``dep_name`` in the scan, trying both the gem name and a
+    ``-`` → ``_`` normalised variant."""
+    candidates = {dep_name}
+    if "-" in dep_name:
+        candidates.add(dep_name.replace("-", "_"))
+    elif "_" in dep_name:
+        candidates.add(dep_name.replace("_", "-"))
+    matches: list[tuple[Path, int, bool]] = []
+    for cand in candidates:
+        matches.extend(scan.get(cand, []))
+
+    if not matches:
+        return Reachability(
+            verdict="not_reachable",
+            confidence=Confidence(
+                "medium",
+                reason=(f"no `require '{dep_name}'` found "
+                        f"(also tried {sorted(candidates - {dep_name})})"),
+            ),
+            evidence=[],
+        )
+    non_test = [h for h in matches if not h[2]]
+    if non_test:
+        return Reachability(
+            verdict="imported",
+            confidence=Confidence(
+                "high",
+                reason="`require` found in non-test Ruby source",
+            ),
+            evidence=_format_evidence(non_test, target=target),
+        )
+    return Reachability(
+        verdict="not_reachable",
+        confidence=Confidence(
+            "medium",
+            reason="gem required only by spec/test code",
+        ),
+        evidence=_format_evidence(matches, target=target),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+def _requires_in(text: str) -> Iterable[tuple[str, int]]:
+    # Rolling-cursor line numbers — the naive full-prefix count is
+    # quadratic on dense-require files.
+    for m, line in _iter_matches_with_lines(
+            text, _REQUIRE_RE.finditer(text)):
+        yield m.group(2), line
+
+
+def _walk_ruby_sources(
+    target: Path, *, max_depth: int,
+) -> Iterable[Path]:
+    # Ruby-specific extras: ``tmp/`` and ``log/`` (Rails
+    # conventions). Both passed to the shared walker so other reach
+    # scanners still see those subtrees.
+    from ._walker import iter_source_files
+    return iter_source_files(
+        target, {".rb"}, max_depth=max_depth,
+        extra_excluded_dir_names=frozenset({"tmp", "log"}),
+    )
+
+
+def _is_test_file(path: Path, target: Path) -> bool:
+    rel_parts = path.relative_to(target).parts
+    if any(p in _TEST_DIR_NAMES for p in rel_parts):
+        return True
+    return bool(path.name.endswith("_spec.rb") or path.name.endswith("_test.rb"))
+

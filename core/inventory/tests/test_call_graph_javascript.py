@@ -4,11 +4,13 @@ The Python extractor's tests in ``test_call_graph.py`` cover the
 language-agnostic shape of ``FileCallGraph``; here we pin the
 JS-specific data shapes (ESM imports, CommonJS require,
 destructured require, dynamic import, bracket dispatch, eval).
-The resolver in :mod:`core.inventory.reachability` is unchanged —
+The resolver in :mod:`core.analysis.reachability` is unchanged —
 it just consumes the per-file dicts emitted by either extractor.
 """
 
 from __future__ import annotations
+
+from core.testing.reachability_state import isolated_reachability_caches
 
 import pytest
 
@@ -19,6 +21,17 @@ from core.inventory.call_graph import (
     INDIRECTION_EVAL,
     extract_call_graph_javascript,
 )
+
+
+@pytest.fixture(autouse=True)
+def _owned_reachability_caches(monkeypatch):
+    """Own inventory indexes while retaining warm caller state."""
+    with isolated_reachability_caches():
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
 
 
 pytest.importorskip("tree_sitter_javascript")
@@ -274,7 +287,7 @@ def test_resolver_called_against_js_data():
     just like Python's. Synthesise an inventory entry from the JS
     extractor and verify ``function_called`` returns CALLED for a
     matching qualified name."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_javascript(
         "import lodash from 'lodash';\n"
@@ -294,7 +307,7 @@ def test_resolver_called_against_js_data():
 def test_resolver_uncertain_on_eval():
     """File uses eval AND mentions the target tail name (via a
     bracket-string literal) → UNCERTAIN."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_javascript(
         "import lodash from 'lodash';\n"
@@ -314,7 +327,7 @@ def test_resolver_uncertain_on_eval():
 
 def test_resolver_not_called_when_function_unused():
     """JS file imports lodash but never calls .get."""
-    from core.inventory.reachability import Verdict, function_called
+    from core.analysis.reachability import Verdict, function_called
 
     cg = extract_call_graph_javascript(
         "import lodash from 'lodash';\n"
@@ -424,3 +437,135 @@ def test_js_nested_class_marked_nested():
     inners = [c for c in g.classes if c.name == "Inner"]
     if inners:
         assert inners[0].nested is True
+
+
+# ---------------------------------------------------------------------------
+# argument_identifiers extraction — load-bearing for downstream
+# function-as-argument registration detection (Express, Fastify, etc.).
+# Tests pin: bare identifiers captured, non-identifiers (strings,
+# arrows, member accesses, object literals) skipped, ordering preserved.
+# ---------------------------------------------------------------------------
+
+
+def test_js_argument_identifiers_bare_function_arg():
+    g = extract_call_graph_javascript(
+        "app.get('/users', listUsers);\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["app", "get"])
+    assert call.argument_identifiers == ["listUsers"]
+
+
+def test_js_argument_identifiers_multiple():
+    g = extract_call_graph_javascript(
+        "app.use(authMiddleware, loggingMiddleware);\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["app", "use"])
+    assert call.argument_identifiers == ["authMiddleware", "loggingMiddleware"]
+
+
+def test_js_argument_identifiers_skip_string_literal():
+    g = extract_call_graph_javascript(
+        "router.post('/login', loginHandler);\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["router", "post"])
+    # String literal '/login' filtered; only loginHandler kept.
+    assert call.argument_identifiers == ["loginHandler"]
+
+
+def test_js_argument_identifiers_skip_arrow_function():
+    g = extract_call_graph_javascript(
+        "app.get('/x', (req, res) => res.send('ok'));\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["app", "get"])
+    # Inline arrow function not a bare identifier — skipped.
+    assert call.argument_identifiers == []
+
+
+def test_js_argument_identifiers_skip_member_access():
+    g = extract_call_graph_javascript(
+        "app.get('/x', controller.handle);\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["app", "get"])
+    # Member access `controller.handle` not a bare identifier — skipped.
+    # (Captured elsewhere when invoked as a call; here as an arg
+    # value we conservatively skip — bare references are the
+    # load-bearing case.)
+    assert call.argument_identifiers == []
+
+
+def test_js_argument_identifiers_empty_no_args():
+    g = extract_call_graph_javascript(
+        "init();\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["init"])
+    assert call.argument_identifiers == []
+
+
+def test_js_argument_identifiers_preserves_order():
+    g = extract_call_graph_javascript(
+        "compose(first, second, third);\n"
+    )
+    call = next(c for c in g.calls if c.chain == ["compose"])
+    assert call.argument_identifiers == ["first", "second", "third"]
+
+
+def test_js_argument_identifiers_round_trips_via_dict():
+    """Schema round-trip: argument_identifiers survives
+    to_dict/from_dict serialisation."""
+    g = extract_call_graph_javascript(
+        "app.get('/x', handler);\n"
+    )
+    d = g.to_dict()
+    g2 = FileCallGraph.from_dict(d)
+    call = next(c for c in g2.calls if c.chain == ["app", "get"])
+    assert call.argument_identifiers == ["handler"]
+
+
+def test_js_argument_identifiers_omitted_from_dict_when_empty():
+    """Backwards-compat: argument_identifiers absent from dict
+    when empty (inventory size discipline)."""
+    g = extract_call_graph_javascript(
+        "init();\n"
+    )
+    d = g.to_dict()
+    init_entry = next(c for c in d["calls"] if c["chain"] == ["init"])
+    assert "argument_identifiers" not in init_entry
+
+
+# ---------------------------------------------------------------------------
+# new Function — assigned-then-called
+# ---------------------------------------------------------------------------
+
+
+def test_new_function_assigned_then_called_flags_eval():
+    """``new Function`` compiles code at runtime whether invoked
+    immediately or stored first — the stored form (the common style)
+    previously lost the eval masking flag."""
+    g = extract_call_graph_javascript(
+        'const f = new Function("return 1");\nf();\n'
+    )
+    assert INDIRECTION_EVAL in g.indirection
+
+
+def test_new_of_ordinary_class_not_flagged():
+    g = extract_call_graph_javascript("const w = new Widget();\nw.run();\n")
+    assert INDIRECTION_EVAL not in g.indirection
+
+
+# ---------------------------------------------------------------------------
+# receiver_class narrowing — exactly this.<method>()
+# ---------------------------------------------------------------------------
+
+
+def test_this_field_chain_not_tagged_with_enclosing_class():
+    """In ``this.helper.render()`` the method belongs to the FIELD's
+    class; tagging the enclosing class made the resolver drop the real
+    caller edge."""
+    g = extract_call_graph_javascript(
+        "class Widget {\n"
+        "  render() { this.helper.render(); this.draw(); }\n"
+        "}\n"
+    )
+    per = {tuple(c.chain): c.receiver_class for c in g.calls}
+    assert per[("this", "helper", "render")] is None
+    assert per[("this", "draw")] == "Widget"

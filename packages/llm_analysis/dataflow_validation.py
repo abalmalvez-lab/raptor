@@ -19,11 +19,18 @@ pre-built CodeQL database (typically produced by the same /agentic run's
 exhausted, the helper is a no-op.
 """
 
+import copy
 import functools
 import logging
+import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
+from core.llm.coerce import structured_result, to_lower_token_safe
+from core.paths import strip_file_uri
+from core.run.finding_status import read_verdict
+from core.security.log_sanitisation import escape_nonprintable
 from core.security.prompt_envelope import neutralize_tag_forgery
 from packages.hypothesis_validation import Hypothesis
 from packages.hypothesis_validation.adapters import CodeQLAdapter
@@ -34,10 +41,16 @@ from packages.hypothesis_validation.runner import validate
 from .dataflow_dispatch_client import DispatchClient
 from .dataflow_query_builder import (
     TEMPLATE_PREDICATE_SCHEMA,
+    build_predicate_probe_query,
     build_template_query,
     discover_prebuilt_query,
     infer_cwe_from_rule_id,
     supported_languages_for_template,
+)
+from .verification_tier import (
+    LLM_AUTHORED_DV_TIERS,
+    dataflow_premises_mechanical,
+    unbound_smt_refutation,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,7 +80,7 @@ _COMPILE_ERROR_MARKERS = (
 DEFAULT_BUDGET_THRESHOLD = 0.60
 
 
-def discover_codeql_databases(out_dir: Path) -> Dict[str, Path]:
+def discover_codeql_databases(out_dir: Path) -> dict[str, Path]:
     """Find all CodeQL databases produced by the CodeQL agent for this run.
 
     Returns a dict {language: database_path} keyed by the database's
@@ -94,14 +107,16 @@ def discover_codeql_databases(out_dir: Path) -> Dict[str, Path]:
     if not codeql_dir.is_dir():
         return {}
 
-    out: Dict[str, Path] = {}
+    out: dict[str, Path] = {}
 
     # Strategy 1: read the agent's report for authoritative DB paths.
     report_path = codeql_dir / "codeql_report.json"
     if report_path.is_file():
         try:
-            import json
-            data = json.loads(report_path.read_text())
+            from core.json import load_json
+            data = load_json(report_path, max_bytes=64 * 1024 * 1024)
+            if not isinstance(data, dict):
+                data = {}
             for lang, info in (data.get("databases_created") or {}).items():
                 if not isinstance(info, dict) or not info.get("success"):
                     continue
@@ -113,7 +128,9 @@ def discover_codeql_databases(out_dir: Path) -> Dict[str, Path]:
                     norm = _normalise_language(lang) or lang
                     if norm not in out:
                         out[norm] = p
-        except (OSError, ValueError, json.JSONDecodeError):
+        except OSError:
+            # Parse failures already fold to None inside load_json;
+            # only filesystem probes below the parse can still raise.
             pass
 
     # Strategy 2: fallback scan of the codeql output dir.
@@ -132,8 +149,8 @@ def discover_codeql_databases(out_dir: Path) -> Dict[str, Path]:
 def discover_codeql_database(
     out_dir: Path,
     *,
-    language: Optional[str] = None,
-) -> Optional[Path]:
+    language: str | None = None,
+) -> Path | None:
     """Backward-compatible single-DB discovery.
 
     When `language` is provided, returns the matching DB or None.
@@ -145,11 +162,11 @@ def discover_codeql_database(
     if not dbs:
         return None
     if language:
-        return dbs.get(_normalise_language(language))
+        return dbs.get(_normalise_language(language))  # type: ignore[arg-type]
     return next(iter(dbs.values()))
 
 
-def _read_codeql_db_language(marker: Path) -> Optional[str]:
+def _read_codeql_db_language(marker: Path) -> str | None:
     """Read primaryLanguage from a codeql-database.yml without importing yaml.
 
     The CodeQL marker file is small (usually <1KB) and uses simple
@@ -168,7 +185,7 @@ def _read_codeql_db_language(marker: Path) -> Optional[str]:
     return None
 
 
-def _infer_language_from_dirname(name: str) -> Optional[str]:
+def _infer_language_from_dirname(name: str) -> str | None:
     """Fallback when codeql-database.yml lacks primaryLanguage.
 
     Recognises the DatabaseManager naming convention: `<lang>-db`,
@@ -197,7 +214,7 @@ _LANGUAGE_ALIASES = {
 }
 
 
-def _normalise_language(lang: str) -> Optional[str]:
+def _normalise_language(lang: str) -> str | None:
     """Map any language tag to the CodeQL canonical form, lowercase."""
     if not lang:
         return None
@@ -205,7 +222,7 @@ def _normalise_language(lang: str) -> Optional[str]:
     return _LANGUAGE_ALIASES.get(s, s)
 
 
-def _eligible_for_validation(finding: Dict, analysis: Dict) -> bool:
+def _eligible_for_validation(finding: dict, analysis: dict) -> bool:
     """Filter: should this finding's dataflow claim be validated?
 
     Eligibility is conservative — we only validate when we're confident
@@ -237,14 +254,15 @@ def _eligible_for_validation(finding: Dict, analysis: Dict) -> bool:
     """
     if "error" in analysis:
         return False
-    if not analysis.get("is_exploitable"):
+    if read_verdict(analysis, "is_exploitable") is not True:
+        # Only confirmed-exploitable findings are selected for
+        # validation; an abstained verdict has nothing to validate
+        # (and the validator must never manufacture one).
         return False
     if finding.get("has_dataflow"):
         return False
     summary = analysis.get("dataflow_summary") or ""
-    if not summary.strip():
-        return False
-    return True
+    return bool(summary.strip())
 
 
 # Validation-specific guidance prepended to every Hypothesis.context. Tells
@@ -333,20 +351,57 @@ _MAX_CLAIM_LENGTH = 1500
 _MAX_REASONING_EXCERPT = 800
 
 
-def validate_dataflow_claims(
-    findings: List[Dict],
-    results_by_id: Dict[str, Dict],
+def _effective_deep_validate(
+    analysis: dict | None,
     *,
-    codeql_db: Optional[Path] = None,
-    codeql_dbs: Optional[Dict[str, Path]] = None,
+    deep_validate: bool,
+    deep_validate_disabled: bool,
+) -> tuple[bool, bool]:
+    """Tri-state Tier 2/3 decision for ONE finding.
+
+    Returns ``(effective, auto_enabled)``:
+
+      --no-deep-validate  → never (opt-out, hard kill — wins even
+                            against --deep-validate)
+      --deep-validate     → always (opt-in, force-on)
+      neither (default)   → auto: enabled iff the LLM emitted
+                            ``path_conditions`` (top-level or nested
+                            under ``dataflow_validation``); an empty
+                            list means "no applicable conditions",
+                            not "extracted some", so it does NOT
+                            auto-enable.
+
+    Module-level (not inlined at the call site) so the precedence
+    contract is directly testable.
+    """
+    if deep_validate_disabled:
+        return False, False
+    if deep_validate:
+        return True, False
+    nested_dv = (analysis or {}).get("dataflow_validation")
+    if not isinstance(nested_dv, dict):
+        nested_dv = {}
+    effective = bool(
+        nested_dv.get("path_conditions")
+        or (analysis or {}).get("path_conditions")
+    )
+    return effective, effective
+
+
+def validate_dataflow_claims(
+    findings: list[dict],
+    results_by_id: dict[str, dict],
+    *,
+    codeql_db: Path | None = None,
+    codeql_dbs: dict[str, Path] | None = None,
     repo_path: Path,
     llm_client: Any,
-    cost_tracker: Optional[Any] = None,
+    cost_tracker: Any | None = None,
     budget_threshold: float = DEFAULT_BUDGET_THRESHOLD,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Callable[[str], None] | None = None,
     deep_validate: bool = False,
     deep_validate_disabled: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate LLM dataflow claims via hypothesis_validation + CodeQL.
 
     Updates `results_by_id` in place. Returns a metrics dict with:
@@ -375,6 +430,11 @@ def validate_dataflow_claims(
         results_by_id: Per-finding analysis results, keyed by finding_id.
             Mutated in place.
         codeql_db: Path to pre-built CodeQL database. None ⇒ no-op.
+        codeql_dbs: Per-language CodeQL DB map (language → path). None ⇒
+            treated as empty. `codeql_db`, when also given, is merged in
+            as a `"_default"` wildcard entry; paths missing on disk are
+            dropped. Each finding is validated against the DB matching
+            its language, falling back to `"_default"`.
         repo_path: Repository root, used as the Hypothesis target for
             audit-trail clarity.
         llm_client: Anything implementing `generate_structured(...)` —
@@ -385,10 +445,18 @@ def validate_dataflow_claims(
         budget_threshold: Fraction of total budget above which validation
             is skipped. Default 0.60.
         progress_callback: Optional `(message) -> None` for progress.
+        deep_validate: Operator's `--deep-validate` — force-enable
+            Tier 2/3 LLM-backed predicate generation for every finding.
+            When neither this nor `deep_validate_disabled` is set,
+            Tier 2/3 is auto-enabled per finding iff its analysis
+            carries `path_conditions`.
+        deep_validate_disabled: Operator's `--no-deep-validate` — hard
+            opt-out: Tier 2/3 never runs. Takes precedence over
+            `deep_validate` and the per-finding auto-gate.
 
     Never raises — returns 0 and logs on any error.
     """
-    metrics: Dict[str, Any] = {
+    metrics: dict[str, Any] = {
         "n_eligible": 0,
         "n_validated": 0,
         "n_cache_hits": 0,
@@ -408,9 +476,15 @@ def validate_dataflow_claims(
         "n_deep_validate_auto_enabled": 0,
     }
 
-    # Master kill-switch — bail before doing any work.
+    # Master kill-switches — bail before doing any work.
     try:
         from core.config import RaptorConfig
+        if not RaptorConfig.CODEQL_ENABLED:
+            logger.info(
+                "dataflow validation skipped: CODEQL_ENABLED is False",
+            )
+            metrics["skipped_reason"] = "codeql_disabled"
+            return metrics
         if not RaptorConfig.IRIS_TIER1_ENABLED:
             logger.info(
                 "dataflow validation skipped: IRIS_TIER1_ENABLED is False",
@@ -430,12 +504,18 @@ def validate_dataflow_claims(
         codeql_dbs = dict(codeql_dbs)  # don't mutate caller's dict
         codeql_dbs.setdefault("_default", Path(codeql_db))
     if not codeql_dbs:
+        structural = _try_structural_fallback(
+            findings, results_by_id, repo_path=repo_path, metrics=metrics,
+            progress_callback=progress_callback,
+        )
+        if structural is not None:
+            return structural
         logger.info("dataflow validation skipped: no CodeQL database available")
         metrics["skipped_reason"] = "no_database"
         return metrics
 
     # Drop missing-on-disk entries up front so we don't pretend a DB exists.
-    valid_dbs: Dict[str, Path] = {}
+    valid_dbs: dict[str, Path] = {}
     for lang, p in codeql_dbs.items():
         p = Path(p)
         if p.exists():
@@ -443,6 +523,12 @@ def validate_dataflow_claims(
         else:
             logger.info("CodeQL database not found, skipping: %s", p)
     if not valid_dbs:
+        structural = _try_structural_fallback(
+            findings, results_by_id, repo_path=repo_path, metrics=metrics,
+            progress_callback=progress_callback,
+        )
+        if structural is not None:
+            return structural
         metrics["skipped_reason"] = "database_missing"
         return metrics
 
@@ -456,7 +542,7 @@ def validate_dataflow_claims(
 
     # Cache one adapter per database so repeated findings reuse the
     # same instance (cheap; adapters are stateless beyond the path).
-    adapters: Dict[str, Any] = {}
+    adapters: dict[str, Any] = {}
     for lang, db in valid_dbs.items():
         a = CodeQLAdapter(database_path=db)
         if a.is_available():
@@ -474,12 +560,61 @@ def validate_dataflow_claims(
         metrics["skipped_reason"] = "adapter_unavailable"
         return metrics
 
+    # ── Tier 1 batch pre-pass ──────────────────────────────────────────
+    # Collect all prebuilt query paths that the per-finding loop would
+    # invoke individually, then run them in a single JVM invocation per
+    # adapter. Saves ~4-6s of JVM+DB overhead per additional query.
+    tier1_batch: dict[str, ToolEvidence] = {}
+    _batch_by_adapter: dict[str, set] = {}
+    for _f in findings:
+        _fid = _f.get("finding_id")
+        if not _fid or _fid not in results_by_id:
+            continue
+        if not _eligible_for_validation(_f, results_by_id[_fid]):
+            continue
+        _adapter = _pick_adapter_for_finding(_f, adapters)
+        if _adapter is None:
+            continue
+        _lang = _finding_language(_f)
+        _cwe = (_f.get("cwe_id") or "").upper().strip()
+        if not _cwe:
+            _cwe = (infer_cwe_from_rule_id(_f.get("rule_id", "")) or "").upper().strip()
+        if _lang and _cwe:
+            _qp = discover_prebuilt_query(_lang, _cwe)
+            if _qp is not None:
+                _adapter_key = _adapter.name + ":" + str(getattr(_adapter, "_database_path", ""))
+                _batch_by_adapter.setdefault(_adapter_key, set()).add(str(_qp))
+    # Run one batch per adapter (typically just one).
+    _adapter_lookup = {}
+    for lang, a in adapters.items():
+        _akey = a.name + ":" + str(getattr(a, "_database_path", ""))
+        _adapter_lookup[_akey] = a
+    for _akey, _qpaths in _batch_by_adapter.items():
+        _a = _adapter_lookup.get(_akey)
+        if _a is None:
+            continue
+        _n = len(_qpaths)
+        if _n < 2:
+            continue
+        if progress_callback:
+            progress_callback(f"Batch-running {_n} prebuilt CodeQL queries")
+        _batch_results = _a.run_prebuilt_queries_batch(
+            [Path(p) for p in _qpaths],
+        )
+        tier1_batch.update(_batch_results)
+    if tier1_batch:
+        logger.debug(
+            "Tier 1 batch pre-pass: %d queries across %d adapter(s)",
+            sum(len(v) for v in _batch_by_adapter.values()),
+            len(_batch_by_adapter),
+        )
+
     # Within-run cache: two findings with the same claim+target+function+cwe
     # produce the same Hypothesis hash and the same validation result.
     # Re-running them through the LLM costs 2× and yields nothing new.
     # Cache scope is the call only — cross-run caching is a future feature
     # (would need a persistent store keyed on the project + revision).
-    cache: Dict[str, Any] = {}
+    cache: dict[str, tuple[Any, str]] = {}
 
     for finding in findings:
         fid = finding.get("finding_id")
@@ -510,17 +645,6 @@ def validate_dataflow_claims(
             continue
 
         hypothesis = _build_hypothesis(finding, analysis, repo_path)
-        cache_key = _hypothesis_cache_key(hypothesis)
-
-        if cache_key in cache:
-            metrics["n_cache_hits"] += 1
-            _attach_result(analysis, cache[cache_key])
-            if cache[cache_key].refuted and analysis.get("dataflow_validation", {}).get("recommends_downgrade"):
-                metrics["n_recommended_downgrades"] += 1
-            continue
-
-        if progress_callback:
-            progress_callback(f"Validating dataflow for {fid}")
 
         # Usage-driven deep_validate gate. The operator's choice
         # forms a tri-state:
@@ -539,94 +663,114 @@ def validate_dataflow_claims(
         #                            silently make the entire Tier
         #                            4 + path_conditions investment
         #                            unreachable.
-        if deep_validate_disabled:
-            effective_deep_validate = False
-        elif deep_validate:
-            effective_deep_validate = True
+        # Computed BEFORE the cache lookup: the gate joins the cache
+        # key, so a duplicate-claim finding whose analysis would run
+        # deeper tiers never silently reuses a shallower finding's
+        # result (verdicts must not depend on iteration order).
+        effective_deep_validate, auto_enabled = _effective_deep_validate(
+            analysis,
+            deep_validate=deep_validate,
+            deep_validate_disabled=deep_validate_disabled,
+        )
+
+        cache_key = _hypothesis_cache_key(
+            hypothesis,
+            deep_validate=effective_deep_validate,
+            tier4_inputs=_tier4_input_key(analysis),
+            finding=finding,
+            database_path=getattr(adapter, "_database_path", None),
+        )
+
+        cached = cache.get(cache_key)
+        if cached is not None:
+            # Cache stores the PRE-Tier-4 result: the SMT refinement
+            # below is local (no LLM cost) and writes the structured
+            # `smt_witness` side-band into the specific finding's
+            # analysis dict, so it must run per finding — a cache hit
+            # that skipped it would leave the duplicate finding
+            # without its witness.
+            metrics["n_cache_hits"] += 1
+            result, tier_used = cached
         else:
-            nested_dv = (analysis or {}).get("dataflow_validation") or {}
-            effective_deep_validate = bool(
+            if progress_callback:
+                progress_callback(f"Validating dataflow for {fid}")
+            if auto_enabled:
+                metrics["n_deep_validate_auto_enabled"] += 1
+
+            try:
+                result, tier_used = _validate_one_hypothesis(
+                    hypothesis, finding, adapter, llm_client,
+                    deep_validate=effective_deep_validate,
+                    tier1_batch=tier1_batch,
+                )
+            except Exception as e:  # noqa: BLE001 — never let a single validation crash the loop
+                logger.warning(
+                    "dataflow validation errored on %s (lang adapter %s): %s",
+                    fid, adapter.name, e,
+                )
+                metrics["n_errors"] += 1
+                continue
+
+            # Track which tier produced the verdict.
+            metrics.setdefault("n_tier1_prebuilt", 0)
+            metrics.setdefault("n_tier2_template", 0)
+            metrics.setdefault("n_tier3_retry", 0)
+            if tier_used == "prebuilt":
+                metrics["n_tier1_prebuilt"] += 1
+            elif tier_used == "template":
+                metrics["n_tier2_template"] += 1
+            elif tier_used == "retry":
+                metrics["n_tier3_retry"] += 1
+
+            # ----- Telemetry: did the LLM populate path_conditions? -----
+            # The Tier 4 design (PR #442) depends on the LLM emitting
+            # `path_conditions` when the CWE warrants. Track presence per
+            # finding (and break down by CWE) so the operator can see if
+            # the schema-extension is paying off — without this, a Tier 4
+            # of all-zeros could be either "LLM never populates" or "LLM
+            # populates but SMT always returns no_check"; very different
+            # remediations.
+            # The setdefault calls live OUTSIDE the cond_present gate
+            # so the counters are always present in the metrics dict
+            # (with value 0 when nothing populated). Without that, an
+            # absent counter is ambiguous between "code path never ran"
+            # and "code path ran, found nothing" — different
+            # remediations. Tier 1/2/3 counters above use the same
+            # always-init-then-conditional-increment pattern.
+            metrics.setdefault("n_path_conditions_populated", 0)
+            metrics.setdefault("path_conditions_by_cwe", {})
+            nested_dv = (analysis or {}).get("dataflow_validation")
+            if not isinstance(nested_dv, dict):
+                nested_dv = {}
+            cond_present = bool(
                 nested_dv.get("path_conditions")
                 or (analysis or {}).get("path_conditions")
             )
-            if effective_deep_validate:
-                metrics["n_deep_validate_auto_enabled"] += 1
+            if cond_present:
+                metrics["n_path_conditions_populated"] += 1
+                # Prefer the LLM analysis result's cwe_id over the
+                # SARIF-derived finding's. The finding object often
+                # lacks cwe_id at the top level — Semgrep findings in
+                # particular only carry rule_id; the analysis call is
+                # what classifies the CWE. Without this fallback the
+                # by-cwe breakdown buckets everything under "UNKNOWN"
+                # which defeats the breakdown's purpose.
+                cwe = (
+                    (finding.get("cwe_id") or "").strip()
+                    or ((analysis or {}).get("cwe_id") or "").strip()
+                ).upper() or "UNKNOWN"
+                metrics["path_conditions_by_cwe"][cwe] = (
+                    metrics["path_conditions_by_cwe"].get(cwe, 0) + 1
+                )
 
-        try:
-            result, tier_used = _validate_one_hypothesis(
-                hypothesis, finding, adapter, llm_client,
-                deep_validate=effective_deep_validate,
-            )
-        except Exception as e:  # never let a single validation crash the loop
-            logger.warning(
-                "dataflow validation errored on %s (lang adapter %s): %s",
-                fid, adapter.name, e,
-            )
-            metrics["n_errors"] += 1
-            continue
+            # Tier label rides the cache so a duplicate-claim finding
+            # gets the same honest method stamp as the first.
+            cache[cache_key] = (result, tier_used)
+            metrics["n_validated"] += 1
 
-        # Track which tier produced the verdict.
-        metrics.setdefault("n_tier1_prebuilt", 0)
-        metrics.setdefault("n_tier2_template", 0)
-        metrics.setdefault("n_tier3_retry", 0)
-        if tier_used == "prebuilt":
-            metrics["n_tier1_prebuilt"] += 1
-        elif tier_used == "template":
-            metrics["n_tier2_template"] += 1
-        elif tier_used == "retry":
-            metrics["n_tier3_retry"] += 1
-
-        # ----- Telemetry: did the LLM populate path_conditions? -----
-        # The Tier 4 design (PR #442) depends on the LLM emitting
-        # `path_conditions` when the CWE warrants. Track presence per
-        # finding (and break down by CWE) so the operator can see if
-        # the schema-extension is paying off — without this, a Tier 4
-        # of all-zeros could be either "LLM never populates" or "LLM
-        # populates but SMT always returns no_check"; very different
-        # remediations.
-        # The setdefault calls live OUTSIDE the cond_present gate
-        # so the counters are always present in the metrics dict
-        # (with value 0 when nothing populated). Without that, an
-        # absent counter is ambiguous between "code path never ran"
-        # and "code path ran, found nothing" — different
-        # remediations. Tier 1/2/3 counters above use the same
-        # always-init-then-conditional-increment pattern.
-        metrics.setdefault("n_path_conditions_populated", 0)
-        metrics.setdefault("path_conditions_by_cwe", {})
-        nested_dv = (analysis or {}).get("dataflow_validation") or {}
-        cond_present = bool(
-            nested_dv.get("path_conditions")
-            or (analysis or {}).get("path_conditions")
-        )
-        if cond_present:
-            metrics["n_path_conditions_populated"] += 1
-            # Prefer the LLM analysis result's cwe_id over the
-            # SARIF-derived finding's. The finding object often
-            # lacks cwe_id at the top level — Semgrep findings in
-            # particular only carry rule_id; the analysis call is
-            # what classifies the CWE. Without this fallback the
-            # by-cwe breakdown buckets everything under "UNKNOWN"
-            # which defeats the breakdown's purpose.
-            cwe = (
-                (finding.get("cwe_id") or "").strip()
-                or (analysis or {}).get("cwe_id", "").strip()
-            ).upper() or "UNKNOWN"
-            metrics["path_conditions_by_cwe"][cwe] = (
-                metrics["path_conditions_by_cwe"].get(cwe, 0) + 1
-            )
-
-        # ----- Tier 4: SMT path-feasibility refinement -----
-        # Reads `path_conditions` + `path_profile` from the LLM analysis
-        # (added in this PR's schema extension). Conservative refinement:
-        # may upgrade `inconclusive` → `refuted` when SMT proves the
-        # conditions are unsatisfiable, and may attach a witness model
-        # to `confirmed` for downstream consumers (/exploit). NEVER
-        # downgrades `confirmed` → `refuted` on SMT alone — when CodeQL
-        # and SMT disagree the more conservative CodeQL signal wins
-        # (logged as a disagreement metric for offline review).
-        # Same always-init pattern as the path_conditions counters
-        # above: present-with-zero is meaningfully distinct from
-        # absent.
+        # Tier 4 records LLM-predicate diagnostics, not source proof.
+        # Rechecks run per finding, including pre-Tier-4 cache hits. Retain
+        # legacy refuted/disagree counters at zero for report compatibility.
         metrics.setdefault("n_tier4_smt_refuted", 0)
         metrics.setdefault("n_tier4_smt_witness", 0)
         metrics.setdefault("n_tier4_smt_disagree", 0)
@@ -634,17 +778,10 @@ def validate_dataflow_claims(
         result, smt_outcome = _tier4_smt_refine(
             result, finding, analysis, metrics=metrics,
         )
-        if smt_outcome and smt_outcome != "no_check":
-            if smt_outcome == "smt_refuted":
-                metrics["n_tier4_smt_refuted"] += 1
-            elif smt_outcome == "smt_witness":
-                metrics["n_tier4_smt_witness"] += 1
-            elif smt_outcome == "smt_disagree":
-                metrics["n_tier4_smt_disagree"] += 1
+        if smt_outcome == "smt_witness":
+            metrics["n_tier4_smt_witness"] += 1
 
-        cache[cache_key] = result
-        metrics["n_validated"] += 1
-        _attach_result(analysis, result)
+        _attach_result(analysis, result, tier=tier_used)
         if analysis.get("dataflow_validation", {}).get("recommends_downgrade"):
             metrics["n_recommended_downgrades"] += 1
 
@@ -665,7 +802,8 @@ def _build_strategy_block(
     cwe: str,
     file_path: str,
     function: str,
-    finding: Dict,
+    finding: dict,
+    repo_path: Path | None = None,
 ) -> str:
     """Render CWE-strategy guidance for the IRIS validator prompt.
 
@@ -680,9 +818,10 @@ def _build_strategy_block(
     """
     try:
         from core.llm.cwe_strategies import (
-            pick_strategies, render_strategies,
+            pick_strategies,
+            render_strategies,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — fail-open validation loop
         return ""
 
     candidate_cwes = [cwe] if cwe else []
@@ -698,11 +837,13 @@ def _build_strategy_block(
             function_calls_made=tuple(function_calls),
             candidate_cwes=tuple(candidate_cwes),
             max_strategies=3,
+            # Kernel targets get the linux_kernel signal profile.
+            target_path=repo_path,
         )
         if not picked:
             return ""
         rendered = render_strategies(picked)
-    except Exception:
+    except Exception:  # noqa: BLE001 — fail-open validation loop
         return ""
     return (
         "## Bug-class lenses for this validation\n"
@@ -716,7 +857,7 @@ def _build_strategy_block(
     )
 
 
-def _build_hypothesis(finding: Dict, analysis: Dict, repo_path: Path):
+def _build_hypothesis(finding: dict, analysis: dict, repo_path: Path):
     """Construct a Hypothesis from a finding + LLM analysis.
 
     Target-derived content (scanner `message`, LLM `reasoning`,
@@ -742,7 +883,7 @@ def _build_hypothesis(finding: Dict, analysis: Dict, repo_path: Path):
     # specifically: it's not a generic hypothesis test, it's testing a
     # Semgrep-found candidate against a CodeQL database. Concrete
     # guidance reduces wasted query-generation iterations.
-    trusted_parts: List[str] = [_VALIDATION_TASK_GUIDANCE]
+    trusted_parts: list[str] = [_VALIDATION_TASK_GUIDANCE]
     if file_path:
         trusted_parts.append(
             f"Reported location: {_sanitize_for_prompt(str(file_path))}:{start_line}"
@@ -768,13 +909,14 @@ def _build_hypothesis(finding: Dict, analysis: Dict, repo_path: Path):
     # exposure than for SQL injection / XSS.
     strategy_block = _build_strategy_block(
         cwe=cwe, file_path=file_path, function=function, finding=finding,
+        repo_path=repo_path,
     )
     if strategy_block:
         trusted_parts.append(strategy_block)
 
     # Target-derived bits (LLM-rendered or directly from target source)
     # go inside an untrusted-block envelope.
-    untrusted_inner: List[str] = []
+    untrusted_inner: list[str] = []
     message = finding.get("message") or ""
     if message:
         untrusted_inner.append(
@@ -786,6 +928,29 @@ def _build_hypothesis(finding: Dict, analysis: Dict, repo_path: Path):
         untrusted_inner.append(
             "LLM reasoning excerpt: " + _sanitize_for_prompt(excerpt)
         )
+
+    # RAPTOR's own prior verified outcomes for this finding (Tier-3
+    # retrieval). L3-retrieved exemplars first (recency / dedup /
+    # diversity ranked), legacy VerifiedOutcome rollup as fallback;
+    # best-effort, empty (no prior corpus) -> no block. These carry
+    # scanned-repo-derived fields (exploit code, file paths), so they
+    # go INSIDE the untrusted envelope, not trusted_parts; the renderer
+    # already tag-forgery-defangs the values.
+    try:
+        from core.labeled_attempts.view import exemplar_slot_for_finding
+        slot = exemplar_slot_for_finding(
+            {"id": rule_id, "cwe_id": cwe, "file": file_path},
+        )
+        if slot.block:
+            untrusted_inner.append(slot.block)
+        if slot.exemplar_ids:
+            # The analysis record persists with the run output — carry
+            # which exemplars were in the validator's prompt so A/B
+            # attribution can join them to the validation outcome
+            # (same shape as LabeledAttempt.exemplars_used).
+            analysis["exemplars_used"] = list(slot.exemplar_ids)
+    except Exception:
+        logger.warning("exemplar lookup failed for %s", rule_id, exc_info=True)
 
     parts = list(trusted_parts)
     if untrusted_inner:
@@ -803,10 +968,47 @@ def _build_hypothesis(finding: Dict, analysis: Dict, repo_path: Path):
         target_function=function,
         cwe=cwe,
         context="\n".join(parts),
+        # Dataflow-claim validation asserts the reported flow IS
+        # real/reachable — a covered source-bound zero-flow result can
+        # therefore refute it. Declared here, at
+        # formation time, so the verdict ladder never needs the
+        # evaluating LLM's phrasing-aware reading to pick the
+        # direction of a zero-match proof.
+        polarity="reachability",
     )
 
 
-def _hypothesis_cache_key(h) -> str:
+def _tier4_input_key(analysis: dict | None) -> "tuple[str, ...]":
+    """Stable encoding of the analysis fields Tier 4 SMT consumes.
+
+    Joins the within-run cache key: two findings with identical
+    hypotheses but different `path_conditions` / `path_profile` reach
+    different Tier 4 outcomes, so they must not share a cached result.
+    Tolerates schema-violating shapes (non-list conditions, non-string
+    profile) the same way Tier 4 itself does.
+    """
+    dv = (analysis or {}).get("dataflow_validation")
+    if not isinstance(dv, dict):
+        dv = {}
+    conditions = (
+        dv.get("path_conditions")
+        or (analysis or {}).get("path_conditions")
+        or []
+    )
+    if not isinstance(conditions, (list, tuple)):
+        conditions = [conditions]
+    profile = dv.get("path_profile") or (analysis or {}).get("path_profile") or ""
+    return (*(str(c) for c in conditions), str(profile))
+
+
+def _hypothesis_cache_key(
+    h,
+    *,
+    deep_validate: bool = False,
+    tier4_inputs: "tuple[str, ...]" = (),
+    finding: dict | None = None,
+    database_path: Path | None = None,
+) -> str:
     """Cheap content-addressed key for within-run caching.
 
     Uses hashlib.sha256 over a stable JSON encoding of the
@@ -815,24 +1017,140 @@ def _hypothesis_cache_key(h) -> str:
     single run, "foo bar" and "foo  bar" are unlikely to come from the
     same finding twice and getting both validated separately is harmless;
     we'd rather avoid false cache hits.
+
+    `deep_validate` and `tier4_inputs` join the payload because they
+    change which tiers run and what Tier 4 evaluates: without them, a
+    duplicate-hypothesis finding that would have run Tier 2/3/4 reused
+    an earlier finding's shallow Tier 1 result, making verdicts
+    iteration-order dependent.
+
+    Context, finding location/coverage inputs, and database identity also
+    distinguish results. A match or coverage check for one finding must not
+    become evidence for a different source location or database.
     """
     import hashlib
     import json
+    finding = finding or {}
     payload = {
         "claim": h.claim,
+        "context": h.context,
+        "database_path": str(database_path) if database_path is not None else "",
+        "finding_scope": {
+            "prebuilt_sub_static_exemption": _taint_sub_static_exemption(finding),
+            "language": _finding_language(finding),
+            "file": str(finding.get("file_path") or finding.get("file") or ""),
+            "line": str(finding.get("start_line") or finding.get("line") or 0),
+            "function": str(
+                finding.get("function_name") or finding.get("function")
+                or finding.get("entry_function") or ""
+            ),
+            "cwe": str(finding.get("cwe_id") or ""),
+            "rule": str(finding.get("rule_id") or ""),
+        },
         "target": str(h.target),
         "target_function": h.target_function,
         "cwe": h.cwe,
+        "deep_validate": bool(deep_validate),
+        "tier4_inputs": list(tier4_inputs),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+#: Producer identity of the cross-file taint engine (the ``tool``
+#: field of its findings in every intake shape). Local constant so
+#: the gate does not import ``core.taint``; pinned against
+#: ``core.taint.emission.PRODUCER`` by test.
+_TAINT_PRODUCER = "taint-crossfile"
+
+#: The one tier value that IS source-static derivation; any other
+#: non-empty tier string on a taint path marks a hop CodeQL's
+#: source-language dataflow cannot be expected to represent.
+_TIER_RESOLVED_STATIC = "resolved_static"
+
+#: Step tags marking producer approximations (taint-all-params
+#: fallback, binding-by-convention guesses) — sub-static even when
+#: the tier field reads static.
+_SUB_STATIC_TAGS = frozenset({"assumed_propagation", "binding_approx"})
+
+
+def _taint_path_tiers(finding: dict) -> list[str]:
+    """Every tier string recorded on the finding: the path-level
+    ``path_tier`` (scan-shape ``metadata`` / validation-shape
+    ``taint_crossfile`` blocks) plus per-step ``properties.tier`` across
+    primary and sibling paths.
+    """
+    tiers: list[str] = []
+    for block_key in ("metadata", "taint_crossfile"):
+        block = finding.get(block_key)
+        if isinstance(block, dict):
+            tier = block.get("path_tier")
+            if isinstance(tier, str) and tier:
+                tiers.append(tier)
+    path = finding.get("dataflow_path")
+    paths = [path]
+    if isinstance(path, dict):
+        alternatives = path.get("alternative_paths")
+        if isinstance(alternatives, list):
+            paths.extend(alternatives)
+    # Producer and SARIF paths retain flat sibling alternatives. A static
+    # primary does not make an approximated sibling representable in CodeQL.
+    for path in paths:
+        if not isinstance(path, dict):
+            continue
+        steps = [path.get("source"), *(  # type: ignore[misc]
+            path.get("steps") if isinstance(path.get("steps"), list)
+            else []
+        ), path.get("sink")]
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            props = step.get("properties")
+            if not isinstance(props, dict):
+                continue
+            tier = props.get("tier")
+            if isinstance(tier, str) and tier:
+                tiers.append(tier)
+            tags = props.get("tags")
+            if isinstance(tags, (list, tuple)) and any(
+                isinstance(t, str) and t in _SUB_STATIC_TAGS
+                for t in tags
+            ):
+                # Represent a tag hit as a sub-static tier entry.
+                tiers.append("tag:" + next(
+                    t for t in tags
+                    if isinstance(t, str) and t in _SUB_STATIC_TAGS
+                ))
+    return tiers
+
+
+def _taint_sub_static_exemption(finding: dict) -> bool:
+    """True when the finding is a cross-file taint engine candidate
+    whose path carries POSITIVE sub-static evidence — a recorded tier
+    below ``resolved_static`` or an approximation tag on any hop.
+
+    Such flows rode edges (dispatch tables, getattr dispatch,
+    taint-all-params fallbacks) that CodeQL's source-language dataflow
+    cannot represent; a Tier 1 query finding no path there is silence,
+    not refutation evidence. Producer-scoped by the ``tool`` /
+    ``source_type`` fields; a taint finding whose recorded tiers are
+    ALL resolved_static (or that records no tier evidence at all)
+    stays fully checkable — the exemption needs positive evidence,
+    never shape drift."""
+    if (
+        finding.get("tool") != _TAINT_PRODUCER
+        and finding.get("source_type") != "taint"
+    ):
+        return False
+    tiers = _taint_path_tiers(finding)
+    return any(t != _TIER_RESOLVED_STATIC for t in tiers)
+
+
 def tier1_check_finding(
-    finding: Dict,
-    codeql_dbs: Dict[str, Path],
+    finding: dict,
+    codeql_dbs: dict[str, Path],
     *,
-    target_path: Optional[Path] = None,
+    target_path: Path | None = None,
 ) -> str:
     """Free Tier 1 dataflow check for a single finding — no LLM,
     no Hypothesis context, no orchestration. Instrumented wrapper
@@ -901,10 +1219,10 @@ def tier1_check_finding(
 
 
 def _tier1_check_finding_inner(
-    finding: Dict,
-    codeql_dbs: Dict[str, Path],
+    finding: dict,
+    codeql_dbs: dict[str, Path],
     *,
-    target_path: Optional[Path] = None,
+    target_path: Path | None = None,
 ) -> str:
     """Inner implementation of ``tier1_check_finding`` — split out so
     the public wrapper can time + log around all return paths without
@@ -921,6 +1239,21 @@ def _tier1_check_finding_inner(
             return "no_check"
     except ImportError:
         pass
+
+    # Tier-aware exemption: a cross-file taint candidate whose path
+    # carries sub-static hops gets no_check — never a hard refutation
+    # — from this gate (CodeQL cannot represent the approximated
+    # edges, so its silence is not evidence). Runs before any
+    # discovery/DB work: the exemption also saves the invocation.
+    # Counted here per finding; the wrapper's verdict line shows the
+    # resulting no_check.
+    if _taint_sub_static_exemption(finding):
+        logger.info(
+            "tier1_check_finding: taint-crossfile sub-static path — "
+            "no_check exemption (rule=%s)",
+            escape_nonprintable(str(finding.get("rule_id") or "?")),
+        )
+        return "no_check"
 
     language = _finding_language(finding)
     if not language:
@@ -975,7 +1308,7 @@ def _tier1_check_finding_inner(
     target = Path(target_path) if target_path is not None else Path(db)
     try:
         ev = adapter.run_prebuilt_query(prebuilt_path, target)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — fail-open validation loop
         logger.debug("tier1_check_finding: adapter raised: %s", e)
         return "no_check"
 
@@ -989,30 +1322,53 @@ def _tier1_check_finding_inner(
 
 def _validate_one_hypothesis(
     hypothesis: "Hypothesis",
-    finding: Dict,
+    finding: dict,
     adapter: Any,
     llm_client: Any,
     *,
     deep_validate: bool = False,
+    tier1_batch: dict[str, ToolEvidence] | None = None,
 ) -> "tuple[ValidationResult, str]":
     """Run a hypothesis through Tier 1 → Tier 2 → Tier 3 in order.
 
     Args:
+        hypothesis: The Hypothesis under test. Its `cwe` (with a
+            `finding` fallback) selects the Tier 1 prebuilt query, its
+            `target` is what that query runs against, and it is passed
+            whole to Tier 2/3 predicate generation and the legacy
+            fallback `validate()`.
+        finding: Finding dict — supplies the language, the CWE fallback
+            (inferred from `rule_id` when the hypothesis carries none),
+            the file/function coverage gate for Tier 1, and the
+            location match for the prebuilt verdict.
+        adapter: CodeQL adapter used to run the Tier 1 prebuilt query
+            and Tier 2/3 template queries; its `_database_path` (when
+            set) drives the Tier 1 coverage gate.
+        llm_client: LLM client consulted only by Tier 2/3 (source/sink
+            predicate generation) and the legacy fallback `validate()`;
+            never used by Tier 1.
         deep_validate: When False (default), Tier 2/3 LLM-backed predicate
             generation is skipped — Tier 1's verdict is returned even if
             inconclusive. Tier 1 is free (just CodeQL); Tier 2/3 burns
             LLM tokens. Operators opt in via `--deep-validate` to spend
             tokens trying to refute Tier 1-inconclusive findings.
+        tier1_batch: Optional map of prebuilt-query path → ToolEvidence
+            from the batched Tier 1 pre-pass. When the discovered
+            query's path is present, the cached evidence is used
+            instead of re-running the query via `adapter`.
 
     Returns (ValidationResult, tier_label). Tier label is one of:
       "prebuilt"               — Tier 1 produced a definitive verdict
       "prebuilt-inconclusive"  — Tier 1 inconclusive, deep_validate=False
                                  (no Tier 2 attempted)
+      "skipped-deep"           — no prebuilt answer, deeper tiers disabled
       "template"               — Tier 2 succeeded with LLM-filled template
       "retry"                  — Tier 3 succeeded after >=1 retry
+      "template-failed"        — template compilation retries exhausted
       "fallback"               — fell through to legacy generic validate()
 
-    The tier label is metric-only; the verdict is unchanged regardless.
+    The tier label identifies premise provenance for downstream authority
+    checks as well as telemetry. It does not alter the verdict returned here.
     """
     language = _finding_language(finding)
     cwe = (hypothesis.cwe or finding.get("cwe_id") or "").upper().strip()
@@ -1065,7 +1421,11 @@ def _validate_one_hypothesis(
                     adapter_db,
                 )
             else:
-                ev = adapter.run_prebuilt_query(prebuilt_path, hypothesis.target)
+                _qp_key = str(prebuilt_path)
+                if tier1_batch and _qp_key in tier1_batch:
+                    ev = tier1_batch[_qp_key]
+                else:
+                    ev = adapter.run_prebuilt_query(prebuilt_path, hypothesis.target)
                 verdict = _verdict_from_prebuilt(
                     ev, finding, prebuilt_path, codeql_db=adapter_db,
                 )
@@ -1121,19 +1481,19 @@ def _validate_one_hypothesis(
 
 def _try_template_with_retry(
     hypothesis: "Hypothesis",
-    finding: Dict,
+    finding: dict,
     adapter: Any,
     llm_client: Any,
     language: str,
 ) -> "tuple[ValidationResult, bool, int]":
     """Tier 2 + Tier 3: ask LLM for source/sink predicates, retry on compile fail.
 
-    Returns (result, succeeded, n_retries). `succeeded=False` means we
-    exhausted retries without a compile-able query — caller should fall
-    through to the next tier.
+    Returns (result, succeeded, n_retries). `succeeded=False` means no
+    usable template result was produced. The caller returns this inconclusive
+    result as template-failed instead of trying the generic fallback.
     """
-    last_compile_error: Optional[str] = None
-    last_evidence: Optional[ToolEvidence] = None
+    last_compile_error: str | None = None
+    last_evidence: ToolEvidence | None = None
 
     for attempt in range(_MAX_COMPILE_RETRIES + 1):
         # Ask the LLM for source/sink predicates only. On retry, the
@@ -1161,10 +1521,32 @@ def _try_template_with_retry(
 
         if ev.success:
             # Tool ran cleanly — verdict is determined by matches.
-            # Use the Tier 2 verdict semantic: no matches DOES refute,
-            # because the LLM customised the predicates to match the
-            # specific claim.
-            verdict = _verdict_from_template(ev, finding)
+            # Use the Tier 2 verdict semantic: no matches DOES refute
+            # (the LLM customised the predicates to the specific
+            # claim), but only after the DB-coverage gate confirms the
+            # finding's file/function was actually extracted.
+            verdict = _verdict_from_template(
+                ev, finding,
+                codeql_db=getattr(adapter, "_database_path", None),
+            )
+            if verdict == "refuted":
+                # Predicate-vacuity control: the coverage gate proves
+                # the DB contains the finding's file/function, but not
+                # that the LLM's endpoint models select ANY node — a
+                # vacuous isSource/isSink body makes "no flow"
+                # vacuously true and would hard-downgrade a real
+                # finding. Only would-be refutations pay the probe
+                # cost (same compiled DB, warm evaluator).
+                vacuity = _template_vacuity_reason(
+                    adapter, language, predicates, hypothesis.target,
+                )
+                if vacuity is not None:
+                    result = _wrap_result(ev, "inconclusive", tier="template")
+                    result.reasoning = (
+                        "[template] zero-flow refutation withheld — "
+                        + vacuity
+                    )
+                    return result, True, attempt
             return (
                 _wrap_result(ev, verdict, tier="template"),
                 True,
@@ -1192,6 +1574,59 @@ def _try_template_with_retry(
     )
 
 
+def _template_vacuity_reason(
+    adapter: Any,
+    language: str,
+    predicates: dict,
+    target: Path,
+) -> str | None:
+    """Predicate-vacuity control for Tier 2 zero-flow refutations.
+
+    A zero-match taint query refutes only when its endpoint models
+    actually select something. The three-layer coverage gate
+    (`_refutation_coverage_ok`) verifies the DB contains the finding's
+    file and function — it cannot see that an LLM-written isSource or
+    isSink body selects zero nodes anywhere, which makes "no flow"
+    vacuously true. Each predicate is run standalone through the same
+    adapter/DB (mechanical selector assembled by
+    `build_predicate_probe_query`; warm evaluator, no LLM call).
+
+    Returns a refuse-to-refute reason when a predicate is vacuous or a
+    probe could not run, None when both predicates demonstrably select
+    nodes. Same condemn-toward-abstain posture as the coverage gate:
+    every failure direction degrades to inconclusive, never to
+    refuted. Analogue of the negative controls elsewhere in the repo
+    (patch_gate's unpatched-copy control, checker_synthesis'
+    _fix_mutant_control) — Tier 2 previously had none.
+    """
+    role_labels = (("source", "isSource"), ("sink", "isSink"))
+    for role, label in role_labels:
+        probe = build_predicate_probe_query(
+            language=language,
+            source_predicate_body=predicates.get("source_predicate_body", ""),
+            sink_predicate_body=predicates.get("sink_predicate_body", ""),
+            probe_role=role,
+        )
+        if probe is None:
+            return f"could not build the {label} vacuity probe query"
+        try:
+            ev = adapter.run(probe, target)
+        except Exception as e:  # noqa: BLE001 — probe failure must abstain, not crash
+            return f"{label} vacuity probe errored: {e}"
+        if not ev.success:
+            return (
+                f"{label} vacuity probe failed: "
+                f"{(ev.error or 'no error detail')[:200]}"
+            )
+        if not ev.matches:
+            return (
+                f"{label} predicate selected 0 nodes in the whole "
+                f"database — vacuous {role} model, 'no flow' would be "
+                "vacuously true"
+            )
+    return None
+
+
 def _is_compile_error(error_text: str) -> bool:
     """Heuristic: does this error look like a CodeQL compile failure?"""
     if not error_text:
@@ -1201,37 +1636,47 @@ def _is_compile_error(error_text: str) -> bool:
 
 def _tier4_smt_refine(
     result: "ValidationResult",
-    finding: Dict,
-    analysis: Dict,
-    metrics: Optional[Dict[str, Any]] = None,
+    finding: dict,
+    analysis: dict,
+    metrics: dict[str, Any] | None = None,
 ) -> "tuple[ValidationResult, str]":
-    """Tier 4: SMT path-feasibility refinement on a Tier 1/2/3 result.
+    """Record SMT predicate diagnostics without changing a source verdict.
 
-    Reads the LLM's `path_conditions` and `path_profile` (added in
-    PR-G+ schema extension) from either:
-      * `analysis['dataflow_validation']` (deep-validation output), or
-      * `analysis` (top-level analysis output).
+    Conditions and profile hints come from LLM analysis, not an admitted
+    source/type/reachability model. SAT, UNSAT and unknown therefore retain
+    the original ValidationResult object and its evidence. An owned diagnostic
+    record preserves the mathematical result and its assumptions. A model for
+    an already confirmed result also retains the legacy display-only witness.
 
-    Conservative refinement rules:
-      * `inconclusive` + SMT proves unsat → `refuted` (with unsat-core
-        as evidence)
-      * `confirmed` + SMT proves sat → keep `confirmed`, attach witness
-        model as additional evidence (downstream /exploit uses this as
-        a PoC seed)
-      * `confirmed` + SMT proves unsat → DISAGREEMENT — keep `confirmed`
-        (CodeQL-found path is the conservative signal), log + count as
-        disagreement metric for offline review
-      * Anything else → no change
-
-    Returns (possibly-refined ValidationResult, outcome label).
-    Outcome label is one of: "no_check", "smt_unavailable", "smt_error",
-    "smt_no_change", "smt_refuted", "smt_witness", "smt_disagree".
-
-    Never raises — failure modes (Z3 missing, conditions unparseable,
-    parser exception) all fall through to "no_check" / "smt_unavailable"
-    / "smt_error" so production callers stay unaffected.
+    Returns the original result and one of no_check, smt_unavailable,
+    smt_error, smt_no_change or smt_witness. Never raises: malformed inputs,
+    missing solvers and unexpected failures retain the original result.
     """
-    dataflow_validation = (analysis or {}).get("dataflow_validation") or {}
+    try:
+        # This record belongs to the current query. An unavailable, failed
+        # or skipped recheck cannot leave a previous model in its place.
+        if isinstance(analysis, dict):
+            analysis.pop("smt_witness", None)
+            analysis.pop("smt_diagnostics", None)
+        return _tier4_smt_refine_inner(result, finding, analysis, metrics=metrics)
+    except Exception as e:  # noqa: BLE001 — never-raises contract (see docstring)
+        if isinstance(analysis, dict):
+            analysis.pop("smt_witness", None)
+            analysis.pop("smt_diagnostics", None)
+        logger.warning("Tier 4 SMT refinement errored: %s", e)
+        return result, "smt_error"
+
+
+def _tier4_smt_refine_inner(
+    result: "ValidationResult",
+    finding: dict,
+    analysis: dict,
+    metrics: dict[str, Any] | None = None,
+) -> "tuple[ValidationResult, str]":
+    """Implementation of `_tier4_smt_refine` — see the wrapper's docstring."""
+    dataflow_validation = (analysis or {}).get("dataflow_validation")
+    if not isinstance(dataflow_validation, dict):
+        dataflow_validation = {}
     conditions = (
         dataflow_validation.get("path_conditions")
         or (analysis or {}).get("path_conditions")
@@ -1239,11 +1684,14 @@ def _tier4_smt_refine(
     )
     if not conditions:
         return result, "no_check"
-    profile_name = (
+    # Invalid profile shapes request dual-signedness diagnostics. A declared
+    # LLM hint still supplies only a uniform-width mathematical assumption,
+    # not source integer types, conversions or reachability evidence.
+    profile_name = to_lower_token_safe(
         dataflow_validation.get("path_profile")
-        or (analysis or {}).get("path_profile")
-        or "uint64"
-    ).strip().lower()
+        or (analysis or {}).get("path_profile"),
+        "",
+    ) or None
 
     try:
         from packages.exploit_feasibility.smt_path import validate_path
@@ -1260,7 +1708,7 @@ def _tier4_smt_refine(
     # a SOFT bias, not a deadline contract. CWE-680 (integer
     # overflow → buffer overflow) inherits CWE-787's longer
     # ceiling because the chained-condition encoding is larger.
-    cwe = (finding.get("cwe_id") or "").upper().strip()
+    cwe = str(finding.get("cwe_id") or "").upper().strip()
     if cwe in ("CWE-125", "CWE-787", "CWE-680"):
         smt_timeout_ms = 10_000
     elif cwe in ("CWE-190", "CWE-191", "CWE-476"):
@@ -1277,7 +1725,7 @@ def _tier4_smt_refine(
         # rather than crashing the whole tier loop.
         logger.debug("Tier 4 SMT: input rejected: %s", e)
         return result, "smt_error"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — fail-open validation loop
         logger.debug("Tier 4 SMT: check raised: %s", e)
         return result, "smt_error"
 
@@ -1295,110 +1743,46 @@ def _tier4_smt_refine(
             kind = (r.get("kind") if isinstance(r, dict) else "") or "UNKNOWN"
             rej_kinds[kind] = rej_kinds.get(kind, 0) + 1
 
-    if not smt.get("smt_available"):
+    if smt.get("smt_available") is not True:
         return result, "smt_unavailable"
 
-    # Build a one-line evidence record describing the SMT outcome.
-    # Goes onto the existing ValidationResult.evidence list so the
-    # report renderer + /exploit downstream can see why the verdict
-    # was refined.
-    def _smt_evidence(label: str, summary: str) -> Evidence:
-        return Evidence(
-            tool="smt",
-            rule="path-feasibility",
-            summary=summary,
-            matches=[],
-            success=True,
-            error=None,
-        )
-
+    # These predicates and type hints are LLM-authored. Their mathematical
+    # verdict never establishes a source path or refutes a source finding.
     feasible = smt.get("feasible")
-    unsat_list = smt.get("unsatisfied") or []
-    model = smt.get("model") or {}
-
-    # Decision matrix.
-    if feasible is False:
-        unsat = ", ".join(unsat_list) or "(no specific core)"
-        if result.verdict == "inconclusive":
-            ev = _smt_evidence(
-                "refuted",
-                f"SMT proved path conditions unsatisfiable; conflict: {unsat}",
-            )
-            refined = ValidationResult(
-                verdict="refuted",
-                evidence=list(result.evidence) + [ev],
-                iterations=result.iterations,
-                reasoning=(
-                    (result.reasoning or "") +
-                    "\n[smt] inconclusive → refuted: unsat path conditions"
-                ),
-            )
-            return refined, "smt_refuted"
-        if result.verdict == "confirmed":
-            # SMT-CodeQL disagreement. Keep CodeQL's signal (conservative)
-            # but record the divergence.
-            logger.warning(
-                "Tier 4 SMT-CodeQL disagreement on %s: CodeQL confirmed but "
-                "SMT proves path conditions unsat (conflict: %s). Keeping "
-                "CodeQL verdict.",
-                finding.get("finding_id") or finding.get("file_path"),
-                unsat,
-            )
-            ev = _smt_evidence(
-                "disagreement",
-                f"SMT-CodeQL disagreement: SMT unsat (conflict: {unsat})",
-            )
-            refined = ValidationResult(
-                verdict=result.verdict,
-                evidence=list(result.evidence) + [ev],
-                iterations=result.iterations,
-                reasoning=result.reasoning,
-            )
-            return refined, "smt_disagree"
-
+    if type(feasible) is not bool or (feasible is True and (
+        smt.get("unknown") or smt.get("unknown_reasons")
+    )):
+        feasible = None
+    model = dict(smt.get("model") or {})
+    analysis["smt_diagnostics"] = {
+        "oracle_scope": "llm-extracted-predicates",
+        "modeled_feasible": feasible,
+        "path_conditions": copy.deepcopy(conditions),
+        "path_profile": profile_name,
+        "reasoning": smt.get("reasoning") or "",
+        "conflicts": copy.deepcopy(smt.get("unsatisfied") or []),
+        "unknown": copy.deepcopy(smt.get("unknown") or []),
+        "unknown_reasons": copy.deepcopy(smt.get("unknown_reasons") or []),
+        "model": dict(model),
+        "anon_var_map": dict(smt.get("anon_var_map") or {}),
+        "summary_axioms": list(smt.get("summary_axioms") or []),
+        "refutation_uses_call_terms": smt.get("refutation_uses_call_terms"),
+    }
     if feasible is True and result.verdict == "confirmed":
-        model_str = ", ".join(f"{k}={v}" for k, v in model.items())
-        ev = _smt_evidence(
-            "witness",
-            f"SMT witness for path conditions: {model_str or '(no model)'}",
-        )
-        # Attach a structured witness record so downstream consumers
-        # (/exploit's prompt builder) can read it without parsing the
-        # reasoning string. The same model is also in `evidence` for
-        # report rendering, but a typed field is much easier to use
-        # as a PoC seed: the LLM gets concrete values that already
-        # satisfy the dangerous-path conditions and can amplify them
-        # rather than guess from scratch. Pre-fix the witness model
-        # was buried in a free-text evidence summary that /exploit's
-        # prompt builder dumped verbatim — useful for audit but not
-        # for steering exploit generation.
+        # Preserve the existing display record without adding source proof
+        # evidence, changing the verdict, or claiming controllable inputs.
         if model:
-            (analysis or {}).setdefault("smt_witness", {}).update({
+            analysis["smt_witness"] = {
                 "model": dict(model),
-                "path_conditions": list(conditions),
+                "path_conditions": copy.deepcopy(conditions),
                 "path_profile": profile_name,
-                # Map each `_anon_N` in the model to the original
-                # function-call subexpression Z3's parser substituted
-                # (e.g. `strlen(argv[1])`). Lets the /exploit prompt
-                # renderer show meaningful labels — without this the
-                # LLM sees `_anon_0 = 32` and can't connect that to
-                # anything actionable. Empty dict when no
-                # substitution happened (named-locals conditions).
                 "anon_var_map": dict(smt.get("anon_var_map") or {}),
-            })
-        refined = ValidationResult(
-            verdict=result.verdict,
-            evidence=list(result.evidence) + [ev],
-            iterations=result.iterations,
-            reasoning=(
-                (result.reasoning or "") +
-                f"\n[smt] confirmed + witness: {model_str}"
-            ),
-        )
-        return refined, "smt_witness"
-
-    # feasible is None (Z3 unavailable / conditions unparseable)
-    # or no actionable change. Leave the verdict alone.
+                "summary_axioms": list(smt.get("summary_axioms") or []),
+                "wp_predicate": smt.get("wp_predicate"),
+                "wp_conjuncts": list(smt.get("wp_conjuncts") or []),
+                "wp_complete": smt.get("wp_complete", False) is True,
+            }
+        return result, "smt_witness"
     return result, "smt_no_change"
 
 
@@ -1422,7 +1806,7 @@ def _wrap_result(
         or f"{tier}: {len(evidence.matches)} match(es)"
     )
     return ValidationResult(
-        verdict=verdict,
+        verdict=verdict,  # type: ignore[arg-type]
         evidence=[rec],
         iterations=1,
         reasoning=f"[{tier}] {reason}",
@@ -1431,9 +1815,9 @@ def _wrap_result(
 
 def _verdict_from_prebuilt(
     evidence: ToolEvidence,
-    finding: Dict,
-    query_path: Optional[Path] = None,
-    codeql_db: Optional[Path] = None,
+    finding: dict,
+    query_path: Path | None = None,
+    codeql_db: Path | None = None,
 ) -> str:
     """Derive verdict from a prebuilt-query result.
 
@@ -1483,6 +1867,10 @@ def _verdict_from_prebuilt(
         if _any_match_at_finding_location(evidence.matches, finding):
             return "confirmed"
         return "inconclusive"
+    if _taint_sub_static_exemption(finding):
+        # Prebuilt silence cannot disprove producer-recorded approximate
+        # edges. Independent deeper hypothesis validation stays available.
+        return "inconclusive"
     # No matches. Refutation is justified only when the query has broad
     # source coverage AND we can verify the finding's file is in the
     # DB. The two checks together rule out the most common false-
@@ -1490,34 +1878,53 @@ def _verdict_from_prebuilt(
     # never indexed the finding's file.
     if query_path is None or not _query_is_in_extras_pack(query_path):
         return "inconclusive"
+    if not _refutation_coverage_ok(finding, codeql_db):
+        return "inconclusive"
+    return "refuted"
+
+
+def _refutation_coverage_ok(finding: dict, codeql_db: Path | None) -> bool:
+    """Shared DB-coverage gate for every refuted-on-zero-matches verdict.
+
+    A clean zero-match run against a DB that never extracted the
+    finding's file/function is indistinguishable from "the flow truly
+    doesn't exist" — refuting in that state silently downgrades real
+    findings. Both the Tier 1 prebuilt verdict and the Tier 2/3
+    template verdict must pass this gate before returning "refuted";
+    real-world CodeQL DBs miss files for ordinary reasons (build
+    failures skipping a class, paths-ignore in the operator's
+    codeql-config.yml, DB built from a different commit).
+
+    Returns True only when coverage is POSITIVELY verified. `None`
+    for `codeql_db` means coverage cannot be verified at all — refuse
+    to refute (hard guarantee against the silent-FN path where a
+    caller accidentally drops the DB arg).
+    """
     if codeql_db is None:
-        # No DB to verify coverage against — refuse to refute. This is
-        # a hard guarantee against the silent-FN path where a caller
-        # accidentally drops the DB arg (or `_database_path` was None).
         # Always log at WARNING so the gap is visible in operator logs.
         logger.warning(
-            "Tier 1 declines to refute %s: no codeql_db supplied for "
+            "declining to refute %s: no codeql_db supplied for "
             "coverage check (caller bug or test misconfiguration)",
             finding.get("file_path") or finding.get("file"),
         )
-        return "inconclusive"
+        return False
     if not _finding_file_in_db(finding, codeql_db):
         logger.info(
-            "Tier 1 declines to refute %s: file not in DB index at %s",
+            "declining to refute %s: file not in DB index at %s",
             finding.get("file_path") or finding.get("file"), codeql_db,
         )
-        return "inconclusive"
+        return False
     # Layer 2 coverage check: file is indexed but the named function
     # may have changed since DB build, or extraction silently dropped
     # it. Cheap second-line check before allowing refutation.
     if not _finding_function_in_db(finding, codeql_db):
         logger.info(
-            "Tier 1 declines to refute %s: function %r not in DB source text",
+            "declining to refute %s: function %r not in DB source text",
             finding.get("file_path") or finding.get("file"),
             finding.get("function_name") or finding.get("function")
             or finding.get("entry_function"),
         )
-        return "inconclusive"
+        return False
     # Layer 3 (Java only): authoritative check via CodeQL callable
     # inventory. Catches the bytecode-extraction failure case where
     # the .java file IS in src.zip and the function name appears in
@@ -1530,17 +1937,35 @@ def _verdict_from_prebuilt(
         layer3 = _function_in_codeql_inventory(finding, codeql_db, language)
         if layer3 is False:
             logger.info(
-                "Tier 1 declines to refute %s: function %r not in CodeQL "
+                "declining to refute %s: function %r not in CodeQL "
                 "callable inventory (extraction missed it)",
                 finding.get("file_path") or finding.get("file"),
                 finding.get("function_name") or finding.get("function")
                 or finding.get("entry_function"),
             )
-            return "inconclusive"
-    return "refuted"
+            return False
+    return True
 
 
-@functools.lru_cache(maxsize=64)
+def _db_coverage_identity(db_path: Path) -> tuple:
+    """Identify sequential DB replacements without query-scratch mtime churn."""
+    def file_identity(path: Path) -> tuple | None:
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    try:
+        root = db_path.stat()
+        root_identity = (root.st_dev, root.st_ino)
+    except OSError:
+        root_identity = None
+    return (root_identity, file_identity(db_path / "src.zip"),
+            file_identity(db_path / "codeql-database.yml"))
+
+
 def _db_indexed_files(db_path: Path) -> "frozenset[str]":
     """Return the set of source file paths indexed in a CodeQL DB.
 
@@ -1550,18 +1975,24 @@ def _db_indexed_files(db_path: Path) -> "frozenset[str]":
     can match by suffix — finding paths are typically relative
     (`src/foo.py`) and may not anchor to the same root.
 
-    Cached per (resolved) DB path. The src.zip is read once per
-    process per DB; subsequent queries are a frozenset membership
-    check. Falls back to `frozenset()` (i.e. "DB has no indexed
+    Cached per DB path and source/metadata generation. Unchanged
+    databases reuse the index; sequential replacements refresh it. Falls back to `frozenset()` (i.e. "DB has no indexed
     files we know about") on any I/O / zip error — the caller
     should treat empty as "can't verify coverage" and avoid the
     refuted verdict, which is the safe default.
     """
+    db_path = Path(db_path)
+    return _db_indexed_files_cached(db_path, _db_coverage_identity(db_path))
+
+
+@functools.lru_cache(maxsize=64)
+def _db_indexed_files_cached(db_path: Path, generation: tuple) -> "frozenset[str]":
     src_zip = Path(db_path) / "src.zip"
     if not src_zip.is_file():
         return frozenset()
     try:
         import zipfile
+
         from core.zip import UnsafeMemberReason, safe_member_reason
         names = []
         with zipfile.ZipFile(src_zip) as zf:
@@ -1581,15 +2012,23 @@ def _db_indexed_files(db_path: Path) -> "frozenset[str]":
         return frozenset()
 
 
-def _resolve_finding_in_db(finding: Dict, db_path: Path) -> Optional[str]:
+def _db_indexed_files_cache_clear() -> None:
+    _db_indexed_files_cached.cache_clear()
+
+
+_db_indexed_files.cache_clear = _db_indexed_files_cache_clear  # type: ignore[attr-defined]
+
+
+def _resolve_finding_in_db(finding: dict, db_path: Path) -> str | None:
     """Return the indexed-source entry that matches the finding's file,
     or None if no match.
 
-    Match strategy: (1) full file_path suffix match; (2) basename
-    fallback. The two-step approach trades a tiny FP risk (two files
-    with the same basename in different dirs) for catching real-world
-    cases where the finding's path is project-relative but the DB's
-    index is repo-root-relative — they don't anchor to the same root.
+    Match strategy: (1) full file_path suffix match on a path-component
+    boundary; (2) basename fallback. The two-step approach trades a
+    tiny FP risk (two files with the same basename in different dirs)
+    for catching real-world cases where the finding's path is
+    project-relative but the DB's index is repo-root-relative — they
+    don't anchor to the same root.
 
     Used by both `_finding_file_in_db` (returns bool) and
     `_finding_function_in_db` (needs the entry path to read its
@@ -1599,27 +2038,51 @@ def _resolve_finding_in_db(finding: Dict, db_path: Path) -> Optional[str]:
     if not file_path:
         return None
     # Strip uri-style prefixes some scanners use
-    if file_path.startswith("file://"):
-        file_path = file_path[len("file://"):]
+    file_path = strip_file_uri(file_path)
     indexed = _db_indexed_files(Path(db_path))
     if not indexed:
         return None
     needle = file_path.lstrip("/")
-    # Step 1: full-path suffix match (preferred — unambiguous)
-    for entry in indexed:
-        if entry.endswith(needle) or entry.endswith("/" + needle):
+    if not needle:
+        return None
+    return _match_needle_in_index(indexed, needle)
+
+
+@functools.lru_cache(maxsize=4096)
+def _match_needle_in_index(indexed: "frozenset[str]", needle: str) -> str | None:
+    """Match a repo-relative path against the DB's indexed entries.
+
+    Keyed on the index frozenset itself so the memo can never go stale:
+    a re-read of src.zip produces a new frozenset and therefore a new
+    cache key. This resolution runs several times per finding (file
+    gate, function gate, per verdict) — without the memo a monorepo DB
+    with ~100k entries pays a full linear scan on every call.
+
+    Suffix matches anchor to a path-component boundary (`==` or a
+    preceding "/"): a bare `endswith(needle)` also matched mid-component
+    (needle "app/main.py" matched entry "webapp/main.py"), letting a
+    DIFFERENT file satisfy the coverage gate and steer a refuted
+    verdict from the wrong file's contents. Sorted iteration keeps the
+    chosen entry deterministic when several match.
+    """
+    entries = sorted(indexed)
+    slash_needle = "/" + needle
+    # Step 1: full-path suffix match on a component boundary (preferred)
+    for entry in entries:
+        if entry == needle or entry.endswith(slash_needle):
             return entry
-    # Step 2: basename fallback
-    basename = Path(needle).name
+    # Step 2: basename fallback (deliberate trade-off — see caller)
+    basename = needle.rsplit("/", 1)[-1]
     if not basename:
         return None
-    for entry in indexed:
-        if Path(entry).name == basename:
+    slash_basename = "/" + basename
+    for entry in entries:
+        if entry == basename or entry.endswith(slash_basename):
             return entry
     return None
 
 
-def _finding_file_in_db(finding: Dict, db_path: Path) -> bool:
+def _finding_file_in_db(finding: dict, db_path: Path) -> bool:
     """True when the finding's file path appears in the DB's source
     archive. Thin wrapper over `_resolve_finding_in_db`.
 
@@ -1629,19 +2092,78 @@ def _finding_file_in_db(finding: Dict, db_path: Path) -> bool:
     return _resolve_finding_in_db(finding, db_path) is not None
 
 
-@functools.lru_cache(maxsize=128)
-def _read_db_source(db_path: Path, indexed_path: str) -> Optional[str]:
+# Per-member read budget for src.zip source texts. The only consumer
+# is the word-boundary function-name scan in `_finding_function_in_db`
+# — it does not need the substrate's general 64 MB member cap, and an
+# adversarial DB with many huge ZIP_STORED "source" members would
+# otherwise materialise each of them in full. A member over this
+# budget reads as None. The function-coverage gate blocks only positive
+# evidence of a missing function, so an unavailable read does not itself
+# block refutation. File and callable-inventory coverage checks are separate.
+_DB_SOURCE_MEMBER_CAP = 10 * 1024 * 1024
+
+# Total characters the memo below may retain. The old
+# lru_cache(maxsize=128) bounded ENTRIES, not bytes — 128 entries of
+# 64 MB members retained ~8 GB for process lifetime.
+_DB_SOURCE_CACHE_BUDGET = 64 * 1024 * 1024
+_DB_SOURCE_CACHE_MAX_ENTRIES = 128
+
+_db_source_cache: dict[tuple[str, str], tuple[tuple, str | None]] = {}
+_db_source_cache_chars = 0
+
+
+def _read_db_source(db_path: Path, indexed_path: str) -> str | None:
     """Read a single indexed source file's text from `<db>/src.zip`.
 
-    Returns None on any error — caller treats that as 'can't verify'
-    and biases away from refutation. Cached per (db, path) so repeat
-    findings in the same file don't re-open the zip.
+    Returns None on any error or on an over-budget member. The
+    function-coverage caller treats this as unknown and does not block
+    refutation on that basis alone.
+    Cached per (db, path) with a generation stamp so replaced archives
+    refresh in place; repeat findings need not re-open the zip. The memo
+    is bounded by total retained characters (insertion-order eviction),
+    not just entry count.
     """
-    src_zip = Path(db_path) / "src.zip"
+    global _db_source_cache_chars
+    key = (str(db_path), indexed_path)
+    generation = _db_coverage_identity(Path(db_path))
+    cached = _db_source_cache.get(key)
+    if cached is not None:
+        if cached[0] == generation:
+            return cached[1]
+        _db_source_cache_chars -= len(cached[1]) if cached[1] else 0
+        _db_source_cache.pop(key)
+    text = _read_db_source_uncached(Path(db_path), indexed_path)
+    _db_source_cache[key] = (generation, text)
+    _db_source_cache_chars += len(text) if text else 0
+    while ((_db_source_cache_chars > _DB_SOURCE_CACHE_BUDGET
+            or len(_db_source_cache) > _DB_SOURCE_CACHE_MAX_ENTRIES)
+           and len(_db_source_cache) > 1):
+        old_key = next(iter(_db_source_cache))
+        if old_key == key:
+            break
+        _, old_text = _db_source_cache.pop(old_key)
+        _db_source_cache_chars -= len(old_text) if old_text else 0
+    return text
+
+
+def _db_source_cache_clear() -> None:
+    """Reset the memo — mirrors the lru_cache API this replaced so
+    existing ``_read_db_source.cache_clear()`` callers keep working."""
+    global _db_source_cache_chars
+    _db_source_cache.clear()
+    _db_source_cache_chars = 0
+
+
+_read_db_source.cache_clear = _db_source_cache_clear  # type: ignore[attr-defined]
+
+
+def _read_db_source_uncached(db_path: Path, indexed_path: str) -> str | None:
+    src_zip = db_path / "src.zip"
     if not src_zip.is_file():
         return None
     try:
         import zipfile
+
         from core.zip import UnsafeMemberReason, safe_member_reason
         with zipfile.ZipFile(src_zip) as zf:
             info = zf.getinfo(indexed_path)
@@ -1649,8 +2171,14 @@ def _read_db_source(db_path: Path, indexed_path: str) -> Optional[str]:
             # ``_db_indexed_files`` which already filtered via
             # ``safe_member_reason``, but re-check at the read site
             # so a future caller that constructs ``indexed_path`` by
-            # other means is still gated.
-            if safe_member_reason(info) != UnsafeMemberReason.SAFE:
+            # other means is still gated — with the tighter
+            # scan-appropriate member budget on top.
+            reason = safe_member_reason(info, max_size=_DB_SOURCE_MEMBER_CAP)
+            if reason != UnsafeMemberReason.SAFE:
+                logger.debug(
+                    "declining to read %s from %s: %s",
+                    indexed_path, src_zip, reason.value,
+                )
                 return None
             with zf.open(info) as f:
                 return f.read().decode("utf-8", errors="replace")
@@ -1659,7 +2187,7 @@ def _read_db_source(db_path: Path, indexed_path: str) -> Optional[str]:
         return None
 
 
-def _finding_function_in_db(finding: Dict, db_path: Path) -> bool:
+def _finding_function_in_db(finding: dict, db_path: Path) -> bool:
     """Layer 2 coverage check: does the finding's named function appear
     in the indexed source text?
 
@@ -1708,7 +2236,7 @@ def _finding_function_in_db(finding: Dict, db_path: Path) -> bool:
 _LAYER3_LANGUAGES = frozenset({"java"})
 
 
-def _layer3_probe_path(language: str) -> Optional[Path]:
+def _layer3_probe_path(language: str) -> Path | None:
     """Locate the callable-inventory probe `.ql` shipped with the
     in-repo extras pack for `language`. Returns None if no probe is
     available — caller treats that as 'Layer 3 disabled' and biases
@@ -1730,10 +2258,7 @@ def _layer3_probe_path(language: str) -> Optional[Path]:
     return None
 
 
-@functools.lru_cache(maxsize=8)
-def _db_callable_inventory(
-    db_path: Path, language: str,
-) -> "Optional[frozenset[tuple[str, str]]]":
+def _db_callable_inventory(db_path: Path, language: str) -> "frozenset[tuple[str, str]] | None":
     """Return the set of `(relative_path, function_name)` callables
     extracted in the DB, by running a one-time probe query.
 
@@ -1746,8 +2271,8 @@ def _db_callable_inventory(
         toward refute, since None is indistinguishable from
         'function genuinely not in DB'.
 
-    Cached per (db, language). The probe runs at most once per
-    (DB, language) per process; subsequent finding-level lookups
+    Cached per (db, language, generation). The probe runs once per
+    unchanged database generation; subsequent finding-level lookups
     are O(1) frozenset membership tests.
 
     Cost: ~5-15s warm (CodeQL evaluator startup + SARIF interpret),
@@ -1755,6 +2280,14 @@ def _db_callable_inventory(
     /agentic run the dataflow query has already been compiled
     before Layer 3 fires, so we pay the warm cost only.
     """
+    db_path = Path(db_path)
+    return _db_callable_inventory_cached(db_path, language, _db_coverage_identity(db_path))
+
+
+@functools.lru_cache(maxsize=8)
+def _db_callable_inventory_cached(
+    db_path: Path, language: str, generation: tuple,
+) -> "frozenset[tuple[str, str]] | None":
     probe_path = _layer3_probe_path(language)
     if probe_path is None:
         logger.debug(
@@ -1767,7 +2300,7 @@ def _db_callable_inventory(
             logger.debug("Layer 3 probe: CodeQL adapter unavailable")
             return None
         ev = adapter.run_prebuilt_query(probe_path, Path(db_path))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — fail-open validation loop
         logger.warning(
             "Layer 3 callable-inventory probe failed for %s (%s): %s",
             db_path, language, e,
@@ -1798,9 +2331,16 @@ def _db_callable_inventory(
     return frozenset(inventory)
 
 
+def _db_callable_inventory_cache_clear() -> None:
+    _db_callable_inventory_cached.cache_clear()
+
+
+_db_callable_inventory.cache_clear = _db_callable_inventory_cache_clear  # type: ignore[attr-defined]
+
+
 def _function_in_codeql_inventory(
-    finding: Dict, db_path: Path, language: str,
-) -> Optional[bool]:
+    finding: dict, db_path: Path, language: str,
+) -> bool | None:
     """Layer 3 coverage check: does the finding's named function
     actually exist in the CodeQL-extracted callable inventory?
 
@@ -1826,14 +2366,16 @@ def _function_in_codeql_inventory(
     if inventory is None:
         return None  # probe unavailable — defer to Layer 2
     file_path = (finding.get("file_path") or finding.get("file") or "").strip()
-    if file_path.startswith("file://"):
-        file_path = file_path[len("file://"):]
+    file_path = strip_file_uri(file_path)
     needle = file_path.lstrip("/")
     # Suffix match — finding's path may not anchor to DB's source root.
+    # Component-boundary anchored: a bare endswith also matched
+    # mid-component (needle "app/main.py" vs entry "webapp/main.py"),
+    # accepting the wrong file as extraction-coverage proof.
     for entry_file, entry_fn in inventory:
         if entry_fn != fn:
             continue
-        if entry_file.endswith(needle) or entry_file.endswith("/" + needle):
+        if entry_file == needle or entry_file.endswith("/" + needle):
             return True
     # Basename fallback — same trade-off as Layer 1
     basename = Path(needle).name
@@ -1872,32 +2414,56 @@ def _query_is_in_extras_pack(query_path: Path) -> bool:
 
 def _verdict_from_template(
     evidence: ToolEvidence,
-    finding: Dict,
+    finding: dict,
+    codeql_db: Path | None = None,
 ) -> str:
     """Derive verdict from a Tier 2 LLM-customised query result.
 
     Unlike Tier 1, the LLM tailored the source/sink predicates to the
     specific claim, so absence of matches IS evidence of refutation —
     the LLM's own claim is being tested against the exact dataflow it
-    described.
+    described. That reasoning only holds when the DB demonstrably
+    covers the finding's file and function: a tailored query still
+    returns a clean zero against a DB that never extracted the file,
+    so refutation additionally requires the same coverage gate Tier 1
+    applies (`_refutation_coverage_ok`).
 
     Verdict logic:
       - tool failed → inconclusive
       - matches at location → confirmed
       - matches elsewhere → inconclusive
-      - no matches at all → refuted (LLM's specific claim, no path found)
+      - no matches, DB coverage of the finding verified → refuted
+      - no matches, coverage unverifiable → inconclusive (absence of
+        coverage is not refutation)
     """
     if not evidence.success:
         return "inconclusive"
     if not evidence.matches:
+        if not _refutation_coverage_ok(finding, codeql_db):
+            return "inconclusive"
         return "refuted"
     if _any_match_at_finding_location(evidence.matches, finding):
         return "confirmed"
     return "inconclusive"
 
 
+def _same_file_component_suffix(path_a: str, path_b: str) -> bool:
+    """True when the two path spellings can denote the same file:
+    equal after normalisation, or one is a path-component suffix of
+    the other (``==`` or preceded by ``/`` — the same boundary rule as
+    `_match_needle_in_index`, which was hardened against mid-component
+    matches for the refutation path)."""
+    a = strip_file_uri(path_a or "").lstrip("/")
+    b = strip_file_uri(path_b or "").lstrip("/")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return a.endswith("/" + b) or b.endswith("/" + a)
+
+
 def _any_match_at_finding_location(
-    matches: List[Dict], finding: Dict,
+    matches: list[dict], finding: dict,
 ) -> bool:
     """True when any match's file:line is close to the finding's location.
 
@@ -1907,49 +2473,78 @@ def _any_match_at_finding_location(
     that's on the line above).
     """
     target_file = (finding.get("file_path") or finding.get("file") or "")
-    target_line = int(finding.get("start_line") or finding.get("line") or 0)
+    try:
+        target_line = int(finding.get("start_line") or finding.get("line") or 0)
+    except (ValueError, TypeError):
+        target_line = 0
     if not target_file:
-        # Without a target line we can't location-match; assume any
-        # match supports the finding (same file at minimum).
+        # No file to location-match; assume any match supports the finding.
         return bool(matches)
 
-    target_basename = Path(target_file).name
     for m in matches:
         m_file = m.get("file") or ""
         if not m_file:
             continue
-        if Path(m_file).name != target_basename:
+        # Component-boundary path match (same rule as
+        # `_match_needle_in_index`): a bare basename comparison let a
+        # same-named file in a DIFFERENT directory (two utils.py in a
+        # monorepo) confirm the finding and grade the verdict
+        # tool_backed off an unrelated match. Differently-rooted
+        # spellings of the SAME file (project-relative vs
+        # repo-root-relative, or an engine emitting basenames) still
+        # match via the suffix rule.
+        if not _same_file_component_suffix(target_file, m_file):
             continue
-        m_line = int(m.get("line") or 0)
+        try:
+            m_line = int(m.get("line") or 0)
+        except (ValueError, TypeError):
+            m_line = 0
+        # A non-positive line means the engine could NOT localize the match —
+        # that is not an at-location match (the Tier-2 verdict would
+        # read "confirmed" precisely when the engine has no line
+        # evidence). Only a missing target_line relaxes the check.
+        if m_line <= 0:
+            continue
         if target_line == 0 or abs(m_line - target_line) <= 5:
             return True
     return False
 
 
-def _finding_language(finding: Dict) -> Optional[str]:
+# Extension → CodeQL language map. ONE table shared by
+# `_finding_language` (tier selection) and `_pick_adapter_for_finding`
+# (adapter selection): the two previously carried separate literal
+# copies that drifted (.hh/.c++/.h++/.tcc present in one, absent in the
+# other), so a finding could get a language for tier selection while
+# the adapter picker returned None and the finding was skipped as
+# "no DB for language" despite a matching adapter existing.
+_EXT_TO_LANG: dict[str, str] = {
+    ".py":  "python", ".pyi": "python",
+    ".java": "java", ".kt": "java",
+    ".c":  "cpp", ".h": "cpp", ".cc": "cpp", ".cpp": "cpp",
+    ".cxx": "cpp", ".hpp": "cpp", ".hxx": "cpp",
+    ".hh": "cpp", ".c++": "cpp", ".h++": "cpp", ".tcc": "cpp",
+    ".js": "javascript", ".jsx": "javascript",
+    ".ts": "javascript", ".tsx": "javascript",
+    ".go": "go",
+    ".rb": "ruby",
+    ".cs": "csharp",
+    ".swift": "swift",
+    ".rs": "rust",
+}
+
+
+def _finding_language(finding: dict) -> str | None:
     """Infer the finding's language from file extension or language field.
 
     Same precedence as _pick_adapter_for_finding so the tier-selection
-    and adapter-selection agree.
+    and adapter-selection agree (both read `_EXT_TO_LANG`).
     """
     file_path = (finding.get("file_path") or finding.get("file") or "").lower()
-    ext_to_lang = {
-        ".py":  "python", ".pyi": "python",
-        ".java": "java", ".kt": "java",
-        ".c":  "cpp", ".h": "cpp", ".cc": "cpp", ".cpp": "cpp",
-        ".cxx": "cpp", ".hpp": "cpp", ".hxx": "cpp",
-        ".js": "javascript", ".jsx": "javascript",
-        ".ts": "javascript", ".tsx": "javascript",
-        ".go": "go",
-    }
-    for ext, lang in ext_to_lang.items():
+    for ext, lang in _EXT_TO_LANG.items():
         if file_path.endswith(ext):
             return lang
     fl = finding.get("language") or finding.get("languages")
-    if isinstance(fl, list):
-        candidates = fl
-    else:
-        candidates = [fl] if fl else []
+    candidates = fl if isinstance(fl, list) else [fl] if fl else []
     for c in candidates:
         norm = _normalise_language(str(c))
         if norm:
@@ -1957,13 +2552,95 @@ def _finding_language(finding: Dict) -> Optional[str]:
     return None
 
 
+# Promoted IRIS taint specs, rendered once per target path. The store
+# lookup is cheap but disk-touching; the Tier 2 retry loop can call
+# _ask_llm_for_predicates several times per finding.
+_IRIS_NOTE_CACHE: dict[str, str] = {}
+_IRIS_NOTE_MAX_PER_ROLE = 8
+
+
+def _iris_spec_note(target: Any) -> str:
+    """Prompt note listing promoted project taint specs (provenance: iris).
+
+    Loaded from the persistent per-project IRIS store; empty string
+    when no store / no specs / any failure. Spec names originate from
+    target-derived analysis, so they are defanged before injection.
+    """
+    key = str(target or "")
+    cached = _IRIS_NOTE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    note = ""
+    try:
+        from core.iris.api import load_project_specs
+
+        specs = load_project_specs(
+            target_path=Path(key) if key else None,
+        )
+        if specs:
+            by_role: dict[str, list] = {}
+            for spec in specs:
+                by_role.setdefault(spec.role, []).append(spec)
+            lines = [
+                (
+                    "Project-specific taint knowledge (promoted IRIS "
+                    "specs from the persistent project store — "
+                    "provenance: iris):"
+                ),
+            ]
+            for role in ("source", "sink", "sanitiser", "propagator"):
+                entries = by_role.get(role, [])[:_IRIS_NOTE_MAX_PER_ROLE]
+                if not entries:
+                    continue
+                rendered = ", ".join(
+                    neutralize_tag_forgery(
+                        f"{s.function} ({s.file})" if s.file else s.function
+                    )[:120]
+                    for s in entries
+                )
+                lines.append(f"- {role}s: {rendered}")
+            if len(lines) > 1:
+                lines.append(
+                    "Consider these project functions when writing the "
+                    "isSource/isSink predicate bodies — flows through "
+                    "them are invisible to stock catalogs."
+                )
+                note = "\n".join(lines)
+    except Exception:
+        logger.debug("IRIS spec note failed", exc_info=True)
+        note = ""
+
+    _IRIS_NOTE_CACHE[key] = note
+    return note
+
+
+def _context_sanitised_at_assembly(context: str) -> str:
+    """Pass through a Hypothesis.context whose sanitisation happened at
+    assembly time — the named contract point for the envelope audit.
+
+    ``_build_hypothesis`` defangs every untrusted inner piece
+    (scanner message, LLM reasoning, exemplar blocks) via
+    ``_sanitize_for_prompt`` and then wraps them in the deliberate
+    ``<untrusted_finding_context>`` envelope, with trusted guidance /
+    strategy blocks outside it. Re-running the sanitiser over the
+    ASSEMBLED string at interpolation time neutralised the legitimate
+    envelope open/close tags (leaving reflected target text unmarked
+    as data — by design indistinguishable from forged, neutralised
+    tags) and backslash-escaped trusted headings, destroying the very
+    injection defence the envelope provides. So: sanitise the pieces
+    once, at assembly; interpolate the assembled whole verbatim.
+    """
+    return context
+
+
 def _ask_llm_for_predicates(
     hypothesis: "Hypothesis",
     llm_client: Any,
     language: str,
     *,
-    previous_error: Optional[str] = None,
-) -> Optional[Dict[str, str]]:
+    previous_error: str | None = None,
+) -> dict[str, str] | None:
     """Ask the LLM to write JUST the source and sink predicate bodies.
 
     The system prompt and Hypothesis.context already contain the IRIS
@@ -1974,21 +2651,31 @@ def _ask_llm_for_predicates(
     appended to the prompt so the LLM can correct AST class names or
     other resolution errors.
     """
-    # ``hypothesis.claim`` and ``hypothesis.context`` originate from
-    # callers that may have pulled text from external advisory data
-    # or prior LLM output — defang forged envelope-close tags before
-    # interpolating into the prompt. Audit surface enforced by
-    # core/security/prompt_envelope_audit.
+    # ``hypothesis.claim`` originates from callers that may have pulled
+    # text from external advisory data or prior LLM output — defang
+    # forged envelope-close tags before interpolating into the prompt.
+    # Audit surface enforced by core/security/prompt_envelope_audit.
     prompt_parts = [
         f"Language: {language}",
         f"Hypothesis: {_sanitize_for_prompt(hypothesis.claim)}",
     ]
     if hypothesis.target_function:
-        prompt_parts.append(f"Target function: {hypothesis.target_function}")
+        # Target-derived identifier (the finding's function name) —
+        # same defang the IRIS spec note applies to the identical data
+        # class; the generated predicates are compiled and run, so a
+        # tag-forgery carrier here could steer which flows the
+        # mechanical validator reports.
+        prompt_parts.append(
+            "Target function: "
+            + _sanitize_for_prompt(str(hypothesis.target_function))
+        )
     if hypothesis.cwe:
-        prompt_parts.append(f"CWE: {hypothesis.cwe}")
+        prompt_parts.append(f"CWE: {_sanitize_for_prompt(str(hypothesis.cwe))}")
     if hypothesis.context:
-        prompt_parts.append(_sanitize_for_prompt(hypothesis.context))
+        prompt_parts.append(_context_sanitised_at_assembly(hypothesis.context))
+    iris_note = _iris_spec_note(getattr(hypothesis, "target", None))
+    if iris_note:
+        prompt_parts.append(iris_note)
     prompt_parts.append(
         "Write ONLY the bodies of the isSource(DataFlow::Node n) and "
         "isSink(DataFlow::Node n) predicates. The surrounding query "
@@ -2034,52 +2721,39 @@ def _ask_llm_for_predicates(
             system_prompt=None,
             task_type="audit",
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — fail-open validation loop
         logger.warning("LLM call for predicates failed: %s", e)
         return None
-    if not isinstance(response, dict):
-        # DispatchClient returns a dict on success, None on failure.
-        # Other client implementations may return objects with .result.
-        result = getattr(response, "result", None)
-        if isinstance(result, dict):
-            response = result
-        else:
-            return None
-    return response
+    # DispatchClient returns a dict on success, None on failure; other
+    # client implementations return objects with .result — one
+    # spelling of that tolerance lives in core.llm.coerce.
+    result = structured_result(response)
+    return result if isinstance(result, dict) else None
 
 
 def _pick_adapter_for_finding(
-    finding: Dict, adapters: Dict[str, Any],
-) -> Optional[Any]:
+    finding: dict, adapters: dict[str, Any],
+) -> Any | None:
     """Return the adapter whose DB matches the finding's language.
 
     Priority order:
-      1. Single "_default" key (legacy callers passing one DB) → always wins
-      2. Exact language match by file extension
-      3. Exact language match by Semgrep `language` field on the finding
+      1. Exact language match by file extension
+      2. Exact language match by Semgrep `language` field on the finding
+      3. "_default" wildcard — the FALLBACK, per the
+         validate_dataflow_claims contract ("each finding is validated
+         against the DB matching its language, falling back to
+         `_default`"). Checking it first instead would disable language
+         routing entirely whenever `codeql_db` and `codeql_dbs` are
+         both supplied, validating e.g. C++ findings against a Python
+         DB. Single-DB legacy callers still land here because no
+         language key exists to match.
       4. None — caller should skip the finding
     """
-    if "_default" in adapters:
-        return adapters["_default"]
-
     # File extension is more reliable than Semgrep language tags
     file_path = (
         finding.get("file_path") or finding.get("file") or ""
     ).lower()
-    ext_map = {
-        ".c": "cpp", ".h": "cpp", ".cc": "cpp", ".cpp": "cpp",
-        ".cxx": "cpp", ".hpp": "cpp", ".hxx": "cpp",
-        ".java": "java", ".kt": "java",
-        ".py": "python", ".pyi": "python",
-        ".js": "javascript", ".jsx": "javascript",
-        ".ts": "javascript", ".tsx": "javascript",
-        ".go": "go",
-        ".rb": "ruby",
-        ".cs": "csharp",
-        ".swift": "swift",
-        ".rs": "rust",
-    }
-    for ext, lang in ext_map.items():
+    for ext, lang in _EXT_TO_LANG.items():
         if file_path.endswith(ext):
             if lang in adapters:
                 return adapters[lang]
@@ -2087,16 +2761,13 @@ def _pick_adapter_for_finding(
 
     # Fall back to Semgrep's language field if the finding has it
     fl = finding.get("language") or finding.get("languages")
-    if isinstance(fl, list):
-        candidates = fl
-    else:
-        candidates = [fl] if fl else []
+    candidates = fl if isinstance(fl, list) else [fl] if fl else []
     for c in candidates:
         norm = _normalise_language(str(c))
         if norm and norm in adapters:
             return adapters[norm]
 
-    return None
+    return adapters.get("_default")
 
 
 # How old a DB can be before we warn. CodeQL builds tend to take minutes-
@@ -2111,8 +2782,10 @@ def _db_is_stale(db_path: Path, repo_path: Path) -> bool:
     """True when the DB is older than recent source changes.
 
     Compares the DB's mtime to the most recent mtime of any tracked
-    source file under repo_path. Recursive walk is bounded — we sample
-    enough files to make a confident call without scanning huge trees.
+    source file under repo_path. The walk is bounded in VISITED
+    entries, not just sampled files: skip dirs are pruned in place so
+    they are never descended into, and the walk stops at the sample
+    cap.
 
     Conservative: returns False when we can't get reliable timestamps,
     because false-positive staleness warnings cause operator fatigue.
@@ -2124,22 +2797,38 @@ def _db_is_stale(db_path: Path, repo_path: Path) -> bool:
     if not repo_path or not repo_path.exists():
         return False
 
-    # Sample up to ~200 files; covers typical-sized repos and gives a
-    # reasonable freshness signal without walking massive monorepos.
+    # Sample up to ~200 SOURCE files; covers typical-sized repos and
+    # gives a reasonable freshness signal without walking massive
+    # monorepos. VCS/build metadata is excluded: `.git/` objects are
+    # touched by any git operation (fetch, gc, status refreshing the
+    # index) after the DB build, so an unfiltered first-200 sample
+    # minted false staleness warnings while deep-tree source edits
+    # were never sampled at all. Pruning (dirnames[:]) rather than
+    # filtering matters for cost too: rglob('*') still VISITED every
+    # entry under a skip dir before discarding it, so a packfile-heavy
+    # .git or million-entry node_modules paid a full lstat walk for a
+    # warn-only freshness check.
+    skip_dirs = {".git", ".hg", ".svn", "node_modules", "__pycache__",
+                 "build", "dist", ".venv", "venv"}
     newest_source = 0.0
     sampled = 0
     sample_cap = 200
-    for child in repo_path.rglob("*"):
-        if sampled >= sample_cap:
-            break
-        if child.is_file():
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for name in filenames:
+            child = Path(dirpath) / name
             try:
+                if not child.is_file():
+                    continue
                 st = child.stat().st_mtime
             except OSError:
                 continue
-            if st > newest_source:
-                newest_source = st
+            newest_source = max(newest_source, st)
             sampled += 1
+            if sampled >= sample_cap:
+                break
+        if sampled >= sample_cap:
+            break
 
     return newest_source > db_mtime + _DB_STALE_GRACE_SECONDS
 
@@ -2164,7 +2853,86 @@ def _sanitize_for_prompt(text: str) -> str:
     return neutralize_tag_forgery(text)
 
 
-def _attach_result(analysis: Dict, result) -> None:
+def _try_structural_fallback(
+    findings: list[dict],
+    results_by_id: dict[str, dict],
+    *,
+    repo_path: Path,
+    metrics: dict[str, Any],
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any] | None:
+    """Structural validation fallback when no CodeQL database is available.
+
+    Only processes findings that already have a ``dataflow_path``
+    (e.g. from Semgrep Pro SARIF codeFlows). No LLM calls — pure
+    AST analysis via tree-sitter.
+
+    Returns the metrics dict on success, None if the structural
+    validator is unavailable or no findings are eligible.
+    """
+    try:
+        from core.dataflow.structural_validator import validate_structurally
+    except ImportError:
+        return None
+
+    eligible = [
+        f for f in findings
+        if f.get("has_dataflow") and f.get("dataflow_path")
+    ]
+    if not eligible:
+        return None
+
+    if progress_callback:
+        progress_callback(
+            f"Structural validation: {len(eligible)} finding(s) with dataflow paths"
+        )
+
+    n_validated = 0
+    n_downgrades = 0
+    for finding in eligible:
+        finding_id = finding.get("finding_id", "")
+        analysis = results_by_id.get(finding_id, {})
+        if not analysis:
+            continue
+
+        try:
+            result = validate_structurally(
+                finding["dataflow_path"],
+                repo_path,
+                language=finding.get("language"),
+            )
+            _attach_result(analysis, result, method="structural-treesitter")
+            n_validated += 1
+            if result.refuted and read_verdict(analysis, "is_exploitable") is True:
+                n_downgrades += 1
+        except Exception as exc:  # noqa: BLE001 — fail-open validation loop
+            logger.debug(
+                "structural validation error for %s: %s", finding_id, exc,
+            )
+            metrics["n_errors"] = metrics.get("n_errors", 0) + 1
+
+    metrics["n_eligible"] = len(eligible)
+    metrics["n_validated"] = n_validated
+    metrics["n_recommended_downgrades"] = n_downgrades
+    metrics["skipped_reason"] = ""
+    metrics["validation_method"] = "structural-treesitter"
+
+    if progress_callback:
+        progress_callback(
+            f"Structural validation complete: {n_validated} validated, "
+            f"{n_downgrades} downgrade(s) recommended"
+        )
+
+    return metrics
+
+
+def _attach_result(
+    analysis: dict,
+    result,
+    *,
+    method: str | None = None,
+    tier: str | None = None,
+) -> None:
     """Record the validation outcome on the analysis dict — NON-DESTRUCTIVE.
 
     Sets the `dataflow_validation` block with the verdict, reasoning,
@@ -2178,36 +2946,67 @@ def _attach_result(analysis: Dict, result) -> None:
     AFTER validation. If we mutated is_exploitable here, those tasks
     would see a pre-judged finding instead of the original analysis,
     undermining their independence.
+
+    ``method`` MUST reflect the actual producer of the verdict —
+    ``verification_tier`` grants ``tool_backed`` weight to mechanical
+    methods only, so a dishonest stamp would launder an LLM-shaped
+    verdict into "mechanically corroborated". When ``method`` is not
+    given it is derived from ``tier`` (the tier label returned by
+    `_validate_one_hypothesis`): LLM-authored tiers (Tier 2 template
+    predicates, Tier 3 retry, legacy fallback — the LLM wrote the
+    query) stamp ``"codeql-iris-llm"``; everything else (prebuilt
+    pack-resident queries) keeps ``"codeql-iris"``. The structural
+    lane passes ``method="structural-treesitter"`` explicitly. ``tier``
+    is persisted alongside so consumers can audit the stamp.
     """
+    evidence = []
+    for e in result.evidence:
+        # Each finding owns its records; cached results and other findings
+        # must not share mutable match/model dictionaries with this output.
+        if isinstance(e, dict):
+            evidence.append(copy.deepcopy(e))
+        elif hasattr(e, "to_dict"):
+            evidence.append(copy.deepcopy(e.to_dict()))
+        else:
+            evidence.append(str(e))  # type: ignore[arg-type]
     recommends_downgrade = (
-        result.refuted and bool(analysis.get("is_exploitable"))
+        result.refuted and read_verdict(analysis, "is_exploitable") is True
     )
-    analysis["dataflow_validation"] = {
+    if method is None:
+        method = (
+            "codeql-iris-llm" if tier in LLM_AUTHORED_DV_TIERS
+            else "codeql-iris"
+        )
+    block: dict[str, Any] = {
         "verdict": result.verdict,
         "reasoning": result.reasoning,
-        "evidence": [e.to_dict() for e in result.evidence],
+        "evidence": evidence,
         "iterations": result.iterations,
         "recommends_downgrade": recommends_downgrade,
+        "method": method,
     }
+    if tier is not None:
+        block["tier"] = tier
+    analysis["dataflow_validation"] = block
 
 
 def run_validation_pass(
     *,
-    findings: List[Dict],
-    results_by_id: Dict[str, Dict],
+    findings: list[dict],
+    results_by_id: dict[str, dict],
     out_dir: Path,
     repo_path: Path,
     dispatch_fn: Callable,
     analysis_model: Any,
-    role_resolution: Dict[str, Any],
+    role_resolution: dict[str, Any],
     dispatch_mode: str,
-    cost_tracker: Optional[Any] = None,
-    cross_family_resolver: Optional[Callable] = None,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    cost_tracker: Any | None = None,
+    cross_family_resolver: Callable | None = None,
+    progress_callback: Callable[[str], None] | None = None,
     budget_threshold: float = DEFAULT_BUDGET_THRESHOLD,
     deep_validate: bool = False,
     deep_validate_disabled: bool = False,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Orchestrator-side hook: discover DB, pick model, run the pass.
 
     Tier 1 (free, CodeQL-only) runs whenever a database is available.
@@ -2241,6 +3040,18 @@ def run_validation_pass(
 
     codeql_dbs = discover_codeql_databases(out_dir)
     if not codeql_dbs:
+        metrics: dict[str, Any] = {
+            "n_eligible": 0, "n_validated": 0, "n_cache_hits": 0,
+            "n_recommended_downgrades": 0, "n_errors": 0,
+            "n_skipped_no_db_for_language": 0, "n_stale_db_warnings": 0,
+            "skipped_reason": "", "n_deep_validate_auto_enabled": 0,
+        }
+        structural = _try_structural_fallback(
+            findings, results_by_id, repo_path=repo_path, metrics=metrics,
+            progress_callback=progress_callback,
+        )
+        if structural is not None:
+            return structural
         logger.info("dataflow validation skipped: no CodeQL database in run dir")
         return None
 
@@ -2256,12 +3067,12 @@ def run_validation_pass(
     ):
         try:
             cross = cross_family_resolver(analysis_model, role_resolution)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — fail-open validation loop
             logger.debug("cross_family_resolver raised: %s", e)
             cross = None
         if cross is not None:
             validation_model = cross
-            logger.info(
+            logger.debug(
                 "dataflow validation: cross-family checker = %s",
                 getattr(cross, "model_name", "?"),
             )
@@ -2283,7 +3094,36 @@ def run_validation_pass(
     )
 
 
-def reconcile_dataflow_validation(results_by_id: Dict[str, Dict]) -> Dict[str, int]:
+def _panel_verdict_supports(analysis: dict, stage: str) -> bool:
+    """True when *stage*'s ``panel-verdict`` stamp stands behind the
+    finding's current verdict with at least TWO genuine model votes.
+
+    ``panel-verdict`` marks an abstained-primary finding whose verdict
+    IS the panel's own (unanimous among voters — a split panel stamps
+    ``disputed``). Support strength follows vote count, mirroring the
+    ``agreed`` gate below: ``agreed`` is the primary plus at least one
+    panel vote (two model signals), so a two-vote panel behind an
+    abstained primary carries the same weight — treating the stamp as
+    NO support hard-flipped findings with equal-or-stronger backing
+    depending only on which slot abstained. A SINGLE-vote panel-verdict
+    is one model's verdict with no second signal and still loses to the
+    tool, exactly like an unsupported primary. Votes are re-derived
+    from the stage's recorded analyses through read_verdict (junk
+    entries are non-votes; a missing analyses list means no derivable
+    support — the tool wins, the conservative direction)."""
+    if analysis.get(stage) != "panel-verdict":
+        return False
+    entries = analysis.get(f"{stage}_analyses")
+    if not isinstance(entries, list):
+        return False
+    votes = sum(
+        1 for entry in entries
+        if read_verdict(entry, "is_exploitable") is True
+    )
+    return votes >= 2
+
+
+def reconcile_dataflow_validation(results_by_id: dict[str, dict]) -> dict[str, int]:
     """Apply downgrades from the validation pass after consensus/judge.
 
     Called at the end of orchestration (after consensus, judge, retry,
@@ -2304,6 +3144,21 @@ def reconcile_dataflow_validation(results_by_id: Dict[str, Dict]) -> Dict[str, i
         wrong (e.g. wrong language, missed an indirection) and refutes
         a finding everything else agrees on.
 
+    Premise-honesty gate on the HARD path: the terminal flip is a
+    mechanical verdict overriding an LLM analysis, so it is reserved
+    for validation blocks whose query premises were themselves
+    mechanical (``verification_tier.dataflow_premises_mechanical`` —
+    the same predicate that grants ``tool_backed``). A refutation
+    whose CodeQL predicates were LLM-AUTHORED (``method ==
+    "codeql-iris-llm"``, or an LLM-authored ``tier``, or no method
+    stamp at all — fail-closed) is one model's judgement dressed in
+    query syntax: it takes the SOFT shape instead — the downgrade
+    signal is preserved as ``validation_disputed`` plus a
+    ``validation_downgrade_withheld`` reason and lowered confidence;
+    only the verdict flip is withheld. Saved Tier 4 refutations derived only
+    from unbound SMT predicates are skipped entirely: they support neither
+    a hard downgrade nor a confidence reduction.
+
     Returns dict {n_hard_downgrades, n_soft_downgrades, n_skipped}.
     """
     n_hard = 0
@@ -2316,17 +3171,29 @@ def reconcile_dataflow_validation(results_by_id: Dict[str, Dict]) -> Dict[str, i
             continue
         if not v.get("recommends_downgrade"):
             continue
-        if not analysis.get("is_exploitable"):
+        if unbound_smt_refutation(v):
+            analysis["validation_downgrade_withheld"] = "unbound-smt-predicates"
             n_skipped += 1
-            continue  # already not-exploitable for some other reason
+            continue
+        if read_verdict(analysis, "is_exploitable") is not True:
+            n_skipped += 1
+            continue  # already not-exploitable (or abstained) — no downgrade to apply
 
-        # Soft-downgrade gate: was the original verdict supported by
-        # consensus or judge? Both fields default to absent — only
-        # explicit "agreed" counts as support, so a missing field
-        # (consensus/judge weren't run) doesn't accidentally trigger
-        # the soft path.
-        consensus_agreed = analysis.get("consensus") == "agreed"
-        judge_agreed = analysis.get("judge") == "agreed"
+        # Soft-downgrade gate: was the current verdict supported by
+        # consensus or judge? Both fields default to absent — only an
+        # explicit "agreed" stamp, or a "panel-verdict" stamp backed
+        # by two genuine votes (see _panel_verdict_supports), counts
+        # as support, so a missing field (consensus/judge weren't
+        # run), "no-verdict", or "disputed" doesn't accidentally
+        # trigger the soft path.
+        consensus_agreed = (
+            analysis.get("consensus") == "agreed"
+            or _panel_verdict_supports(analysis, "consensus")
+        )
+        judge_agreed = (
+            analysis.get("judge") == "agreed"
+            or _panel_verdict_supports(analysis, "judge")
+        )
         if consensus_agreed or judge_agreed:
             # Soft: keep exploitable, lower confidence, flag the dispute
             analysis["validation_disputed"] = True
@@ -2344,16 +3211,47 @@ def reconcile_dataflow_validation(results_by_id: Dict[str, Dict]) -> Dict[str, i
             n_soft += 1
             continue
 
+        if not dataflow_premises_mechanical(v):
+            # Premise-honesty gate: the validation verdict's own query
+            # premises are LLM-authored (or unstamped — fail-closed).
+            # Symmetric replacement, not a drop: the refutation keeps
+            # its full steering weight as a recorded dispute with
+            # lowered confidence; only the terminal is_exploitable
+            # flip is withheld.
+            analysis["validation_disputed"] = True
+            if (
+                v.get("method") == "codeql-iris-llm"
+                or v.get("tier") in LLM_AUTHORED_DV_TIERS
+            ):
+                withheld_reason = "llm-authored-premises"
+            elif v.get("method") is None:
+                withheld_reason = "missing-method"
+            else:
+                withheld_reason = "unrecognized-method"
+            analysis["validation_downgrade_withheld"] = withheld_reason
+            current_conf = (analysis.get("confidence") or "").lower()
+            if current_conf in ("high", "medium", ""):
+                analysis["confidence_pre_validation"] = analysis.get("confidence")
+                analysis["confidence"] = "low"
+            n_soft += 1
+            continue
+
         # Hard: flip is_exploitable, re-score CVSS
         analysis["is_exploitable_pre_validation"] = analysis["is_exploitable"]
         analysis["is_exploitable"] = False
+        method = v.get("method", "codeql-iris")
+        method_label = (
+            "Tree-sitter structural validation"
+            if method == "structural-treesitter"
+            else "CodeQL dataflow validation"
+        )
         analysis["validation_downgrade_reason"] = (
-            f"CodeQL dataflow validation refuted the claim: {v.get('reasoning', '')}"
+            f"{method_label} refuted the claim: {v.get('reasoning', '')}"
         )
         try:
             from packages.cvss import score_finding
             score_finding(analysis)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — fail-open validation loop
             logger.debug("score_finding failed during reconciliation: %s", e)
         n_hard += 1
 
@@ -2367,22 +3265,36 @@ def reconcile_dataflow_validation(results_by_id: Dict[str, Dict]) -> Dict[str, i
 def _fraction_used(cost_tracker: Any) -> float:
     """Compute fraction of budget consumed.
 
-    CostTracker exposes either `fraction_used()` or `total_cost`/`budget`.
-    Be defensive — different versions of the orchestrator have evolved
-    the API.
+    The orchestrator's CostTracker exposes `fraction_used` as a
+    property; other tracker shapes expose a `fraction_used()` method
+    or `total_cost` + `budget`/`max_cost` attributes. Be defensive —
+    different versions of the orchestrator have evolved the API.
     """
     fn = getattr(cost_tracker, "fraction_used", None)
     if callable(fn):
         try:
             return float(fn())
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
+            # Narrowed: TypeError if fn doesn't return numeric,
+            # ValueError on float() conversion failure,
+            # AttributeError if cost_tracker exposes the name but
+            # the implementation chained through a missing field.
+            pass
+    elif fn is not None:
+        # Property/attribute form — the orchestrator's CostTracker
+        # exposes ``fraction_used`` as a property.
+        try:
+            return float(fn)
+        except (TypeError, ValueError):
             pass
     total = getattr(cost_tracker, "total_cost", None)
-    budget = getattr(cost_tracker, "budget", None) or getattr(cost_tracker, "max_cost", None)
-    if total is not None and budget:
+    budget = getattr(cost_tracker, "budget", None)
+    if budget is None:
+        budget = getattr(cost_tracker, "max_cost", None)
+    if total is not None and budget is not None:
         try:
             return float(total) / float(budget)
-        except Exception:
+        except (TypeError, ValueError, ZeroDivisionError):
             return 0.0
     return 0.0
 

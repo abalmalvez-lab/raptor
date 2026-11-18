@@ -14,6 +14,7 @@ Goal: catch regressions in either direction —
 import importlib.util
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _load_agentic_module():
@@ -24,14 +25,15 @@ def _load_agentic_module():
     or sys.path shape.
     """
     repo_root = Path(__file__).resolve().parents[3]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    spec = importlib.util.spec_from_file_location(
-        "raptor_agentic_for_tests", repo_root / "raptor_agentic.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    with patch.object(sys, "path", list(sys.path)):
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        spec = importlib.util.spec_from_file_location(
+            "raptor_agentic_for_tests", repo_root / "raptor_agentic.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
 
 
 def _full_metrics(**overrides):

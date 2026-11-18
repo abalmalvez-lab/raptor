@@ -21,10 +21,17 @@ consumer reads into memory rather than to disk, so
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from typing import Dict, Iterable, Set
+import re
+import zlib
+import unicodedata
 
-from core.tar import extract_files_from_tar
+from core.tar import TarOpenError, extract_files_from_tar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +41,261 @@ logger = logging.getLogger(__name__)
 # 64 MB is generous; anything larger is malicious or pointless.
 DEFAULT_MAX_ENTRY_BYTES = 64 * 1024 * 1024
 
+# The entry-count floor matches the shared tar reader. Larger OCI layers
+# receive a bounded allowance proportional to their descriptor size.
+DEFAULT_MAX_ENTRY_COUNT = 50_000
+ENTRY_COUNT_BUDGET_CEILING = 250_000
+COMPRESSED_BYTES_PER_ENTRY = 8 * 1024
+
+
+def layer_entry_count_budget(compressed_size: int | None) -> int:
+    """Admit large merged filesystems while bounding dense header floods.
+
+    A merged RAPTOR filesystem has about 80,000 entries. Keep the old
+    50,000-entry floor for small/unknown inputs; large layers get one
+    entry per 8 KiB of source bytes, capped at 250,000. Decompression and
+    selection byte limits remain independent. The descriptor's size/digest
+    still require verification.
+    """
+    if not compressed_size or compressed_size <= 0:
+        return DEFAULT_MAX_ENTRY_COUNT
+    return min(ENTRY_COUNT_BUDGET_CEILING,
+               max(DEFAULT_MAX_ENTRY_COUNT, compressed_size // COMPRESSED_BYTES_PER_ENTRY))
+
+# ---------------------------------------------------------------------------
+# Decompression budget — READ THIS BEFORE CHANGING ANY OF THE THREE
+# CONSTANTS BELOW. This limit has flip-flopped; both failure modes
+# have bitten in production:
+#
+#   * Unbounded (before fa7449b67): a hostile registry could serve a
+#     kilobyte-sized gzip blob that stream-decompresses to hundreds of
+#     GB. The walk selects only a handful of paths, but stream-mode
+#     tarfile must DECOMPRESS every member's data to skip past it and
+#     the digest check requires draining to EOF — so "selective"
+#     extraction still pays full decompression CPU. gzip tops out
+#     near 1030:1, so the exposure is real (42.zip-class DoS).
+#   * Flat 256 MiB (fa7449b67 → the ratio budget below): refused
+#     PLAINLY LEGITIMATE base-image layers and silently degraded
+#     package inventories to partial. Measured on the exact layers a
+#     stress sweep refused: python:3.8 211 MB → 597 MB (2.83x),
+#     mysql:8 132 MB → 548 MB (4.14x), rust:alpine3.16 216 MB →
+#     667 MB (3.09x). Ordinary distro layers routinely decompress to
+#     1-2 GB; no flat cap can both admit them and stop bombs.
+#
+# A bomb is a RATIO, not a size. The budget scales with the
+# compressed bytes actually fetched (which upstream already bounds:
+# dockerfile_from skips layers over its max_layer_bytes and
+# stream_blob enforces its own stream budget):
+#
+#   budget = min(CEILING, max(FLOOR, RATIO * compressed_size))
+#
+#   * RATIO 12: three times the worst legitimate ratio measured
+#     above (4.14x); real gzip bombs run 100-1030x. Lowering this
+#     back toward ~4 will re-refuse legitimate layers; raising it
+#     multiplies the CPU a hostile blob can burn per fetched byte.
+#   * FLOOR 256 MiB: small layers may decompress this far regardless
+#     of ratio (sparse/text layers legitimately hit high ratios at
+#     small absolute size; 256 MiB of gunzip is ~1 s of CPU, not a
+#     DoS). This is exactly the old flat cap, demoted to the
+#     small-input allowance.
+#   * CEILING 8 GiB: absolute work bound no observed legitimate
+#     layer approaches; keeps worst-case CPU bounded even for
+#     callers with large compressed-size caps.
+#
+# The regression tests (test_blob_budget.py) pin both directions:
+# legit-shape large layers accepted, bomb-shape ratios refused.
+# ---------------------------------------------------------------------------
+DECOMPRESSION_RATIO_BOUND = 12
+DECOMPRESSION_BUDGET_FLOOR = 256 * 1024 * 1024
+DECOMPRESSION_BUDGET_CEILING = 8 * 1024 * 1024 * 1024
+
+
+def layer_decompression_budget(compressed_size: int | None) -> int:
+    """Aggregate decompressed-bytes budget for one layer extraction.
+
+    ``compressed_size`` is the layer's transferred size (manifest
+    descriptor ``size``); ``None`` / non-positive values (absent or
+    lying manifests) get the floor — refusing to scale a budget off
+    unverified zero keeps a hostile manifest from picking its own
+    bound in either direction.
+    """
+    if not compressed_size or compressed_size <= 0:
+        return DECOMPRESSION_BUDGET_FLOOR
+    return min(
+        DECOMPRESSION_BUDGET_CEILING,
+        max(
+            DECOMPRESSION_BUDGET_FLOOR,
+            DECOMPRESSION_RATIO_BOUND * compressed_size,
+        ),
+    )
+
+
+class UnsupportedLayerMediaType(ValueError):
+    """Raised for a layer whose ``mediaType`` names a compression
+    this module cannot decode (e.g. ``+zstd``) or that isn't a tar
+    layer at all. Loud by design: silently skipping a valid-but-
+    undecodable layer yields a partial package inventory that is
+    indistinguishable from a clean one — an image author could pick
+    zstd layers specifically to evade scanning."""
+
+
+class WantedEntryRefused(ValueError):
+    """Raised when a WANTED path exists in the layer but the safety
+    filter refused it (oversize, unsafe member shape). Loud for the
+    same reason as :class:`UnsupportedLayerMediaType`: an image whose
+    dpkg status file is inflated past ``max_entry_bytes`` would
+    otherwise produce a falsely-clean, complete-looking inventory —
+    exactly the silent-partial evasion this module refuses for media
+    types. Non-wanted refused entries stay debug-level skips."""
+
+
+class DecompressionBudgetExceeded(ValueError):
+    """Raised when a gzip layer's decompressed output outruns the
+    ratio budget computed from the bytes ACTUALLY fetched. See the
+    rationale block on the budget constants above."""
+
+
+def _gunzip_ratio_guarded(
+    chunks: Iterable[bytes],
+    *,
+    ratio: int | None = None,
+    floor: int | None = None,
+    ceiling: int | None = None,
+) -> Iterator[bytes]:
+    """Incrementally gunzip ``chunks`` with an output budget that
+    scales with the compressed bytes ACTUALLY fetched so far.
+
+    The declared-size budget (``layer_decompression_budget``) trusts
+    the manifest descriptor: a manifest that DECLARES a large layer
+    but serves a kilobytes-sized bomb buys ``RATIO * declared`` of
+    decompression CPU (up to the ceiling) for almost no transfer.
+    Enforcing the ratio against fetched bytes as they stream removes
+    that amplification — a lying descriptor cannot raise the budget
+    beyond what the served bytes themselves justify. Trade-off,
+    documented both ways: this is stricter than the declared-size
+    budget for layers whose highly-compressible content FRONT-loads
+    the stream (a >3 GiB run of zeros before ~256 MiB of compressed
+    input now refuses mid-stream); a bomb is a ratio, and that shape
+    is the bomb shape. Raising the floor admits bigger such runs but
+    hands every hostile blob that much free CPU.
+
+    Raises :class:`DecompressionBudgetExceeded` on budget breach and
+    :class:`core.tar.TarOpenError` on corrupt gzip framing (matching
+    what ``tarfile.open(mode="r|gz")`` surfaced before this wrapper
+    took over decompression).
+    """
+    # Module-attribute lookup at CALL time (not def-time defaults) so
+    # the budget constants stay one knob, monkeypatchable in tests.
+    ratio = DECOMPRESSION_RATIO_BOUND if ratio is None else ratio
+    floor = DECOMPRESSION_BUDGET_FLOOR if floor is None else floor
+    ceiling = DECOMPRESSION_BUDGET_CEILING if ceiling is None else ceiling
+    decomp = zlib.decompressobj(31)  # 31 = gzip container framing
+    fetched = 0
+    produced = 0
+    step = 1 << 20  # bound each decompress call's output allocation
+
+    def _check_budget() -> None:
+        budget = min(ceiling, max(floor, ratio * fetched))
+        if produced > budget:
+            raise DecompressionBudgetExceeded(
+                f"layer decompression exceeds the fetched-bytes budget "
+                f"({produced} produced from {fetched} fetched; "
+                f"ratio bound {ratio}, floor {floor}) — bomb-shape; "
+                f"refusing"
+            )
+
+    for chunk in chunks:
+        fetched += len(chunk)
+        data = bytes(chunk)
+        while data:
+            if decomp.eof:
+                # Keep the completed decoder across chunk boundaries; the
+                # next gzip member may start in a later transport chunk.
+                if not data.strip(b"\x00"):
+                    return
+                decomp = zlib.decompressobj(31)
+            try:
+                out = decomp.decompress(data, step)
+            except zlib.error as exc:
+                raise TarOpenError(
+                    f"corrupt gzip layer stream: {exc}") from exc
+            if out:
+                produced += len(out)
+                _check_budget()
+                yield out
+            if decomp.eof:
+                data = decomp.unused_data
+                continue
+            data = decomp.unconsumed_tail
+    if not decomp.eof:
+        raise TarOpenError("incomplete gzip layer stream")
+    try:
+        out = decomp.flush()
+    except zlib.error as exc:
+        raise TarOpenError(f"corrupt gzip layer stream: {exc}") from exc
+    if out:
+        produced += len(out)
+        _check_budget()
+        yield out
+
+
+def _tar_mode_for_media_type(media_type: str) -> str:
+    """Map an OCI/Docker layer ``mediaType`` to the ``tarfile`` open
+    mode. Gzip and uncompressed tar layers are supported; anything
+    else (zstd, unknown) raises :class:`UnsupportedLayerMediaType`.
+
+    An empty ``media_type`` keeps the historical gzip default for
+    callers without manifest context.
+    """
+    mt = (media_type or "").split(";", 1)[0].strip().lower()
+    if not mt:
+        return "r|gz"
+    # OCI: application/vnd.oci.image.layer.v1.tar+gzip
+    # Docker: application/vnd.docker.image.rootfs.diff.tar.gzip
+    # (plus the *.foreign / nondistributable variants of each).
+    if mt.endswith(("+gzip", ".gzip")):
+        return "r|gz"
+    # Uncompressed: application/vnd.oci.image.layer.v1.tar,
+    # application/vnd.docker.image.rootfs.diff.tar.
+    if mt.endswith((".tar", "+tar")):
+        return "r|"
+    raise UnsupportedLayerMediaType(
+        f"unsupported layer mediaType {media_type!r}: only gzip and "
+        f"uncompressed tar layers can be decoded"
+    )
+
+
+class UnresolvedLayerHardlinks(ValueError):
+    """Selected layer-local hard links need additional regular target files."""
+
+    def __init__(self, paths: set[str]):
+        super().__init__("selected hard links require additional layer-local targets")
+        self.paths = paths
+
 
 def extract_files_from_layer(
     layer_chunks: Iterable[bytes],
-    wanted_paths: Set[str],
+    wanted_paths: set[str],
     *,
     max_entry_bytes: int = DEFAULT_MAX_ENTRY_BYTES,
-) -> Dict[str, bytes]:
+    media_type: str = "",
+    compressed_size: int | None = None,
+    max_selected_bytes: int | None = None,
+    resolve_selected_hardlinks: bool = False,
+    expected_diff_id: str | None = None,
+    selected_symlinks: dict[str, str] | None = None,
+    discover_path: Callable[[str], bool] | None = None,
+) -> dict[str, bytes]:
     """Pull specific files out of a streamed layer blob.
 
-    ``layer_chunks`` is the raw gzipped-tar byte stream (from
-    :meth:`OciRegistryClient.stream_blob`).
+    ``layer_chunks`` is the raw layer byte stream (from
+    :meth:`OciRegistryClient.stream_blob`). ``media_type`` is the
+    layer descriptor's ``mediaType`` from the image manifest; it
+    selects the decompression mode (gzip vs uncompressed tar) and
+    unsupported compressions raise
+    :class:`UnsupportedLayerMediaType` instead of silently yielding
+    an empty (falsely clean) result. When empty, the historical
+    gzip default applies.
     ``wanted_paths`` is the set of in-archive paths we care about,
     e.g. ``{"var/lib/dpkg/status", "lib/apk/db/installed"}``. Paths
     are matched against the tar entry name with leading ``./`` and
@@ -60,42 +311,221 @@ def extract_files_from_layer(
     Skips entries larger than ``max_entry_bytes`` with a debug log
     — defends against pathological / malicious inputs without
     inflating memory.
+
+    ``compressed_size`` (the manifest descriptor's ``size`` for this
+    layer) scales the aggregate decompression budget — the
+    ratio-shaped bomb test documented on the module constants.
+    ``None`` applies the floor budget.
+
+    ``discover_path`` can additionally select normalised member paths while
+    streaming. Discovered files share all selection, memory and link checks.
+
+    ``expected_diff_id`` verifies the complete uncompressed tar stream against
+    the image config, in addition to verification of the compressed source.
+
+    ``resolve_selected_hardlinks`` opts into memory-only resolution against
+    other selected regular files in this same layer. Missing target selections
+    raise ``UnresolvedLayerHardlinks`` for a bounded replay by the caller.
+    Symlinks are never traversed. An explicit ``selected_symlinks`` output
+    may retain their direct same-directory target names as metadata only,
+    after complete stream verification. No host links are followed or created.
+
+    ``max_selected_bytes`` optionally bounds the combined selected payload,
+    in addition to the per-entry and decompression limits.
+
+    Integrity: ``layer_chunks`` typically comes from
+    :meth:`OciRegistryClient.stream_blob`, which verifies the blob's
+    sha256 only once the stream is consumed to EOF. The early-exit
+    walk used to stop as soon as every wanted path had been seen,
+    which skipped that verification entirely — extracted content
+    was returned from an unauthenticated prefix of the blob. Now the
+    remaining stream is always drained to EOF before results are
+    returned, so a digest mismatch raises (from the source iterator)
+    instead of handing back unverified bytes. The walk also covers
+    the whole archive (no early exit) and refuses duplicate wanted
+    paths (``unique_keys``): first-occurrence-wins plus early exit
+    diverged from tar/overlay last-wins semantics, letting an image
+    author show this scanner a benign copy while the runtime saw a
+    later, different one.
     """
-    if not wanted_paths:
+    if max_selected_bytes is not None and max_selected_bytes <= 0:
+        raise ValueError("max_selected_bytes must be positive")
+    if expected_diff_id is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_diff_id):
+        raise ValueError("expected_diff_id must be a sha256 digest")
+    mode = _tar_mode_for_media_type(media_type)
+    if not wanted_paths and discover_path is None:
         return {}
 
     normalised_wanted = {_normalise_tar_path(p) for p in wanted_paths}
 
-    def _select(member) -> str | None:
-        name = _normalise_tar_path(member.name)
-        return name if name in normalised_wanted else None
+    selected_bytes = 0
+    hardlinks: dict[str, str] = {}
+    symlinks: dict[str, str] = {}
+    regular_names: set[str] = set()
 
-    return extract_files_from_tar(
-        layer_chunks,
+    def _wanted(name: str) -> bool:
+        if name in normalised_wanted:
+            return True
+        if discover_path is not None and discover_path(name):
+            normalised_wanted.add(name)
+            return True
+        return False
+
+    def _select(member) -> str | None:
+        nonlocal selected_bytes
+        name = _normalise_tar_path(member.name)
+        if not _wanted(name):
+            return None
+        if name in hardlinks or name in symlinks:
+            raise ValueError("duplicate selected layer path")
+        if member.size < 0:
+            raise WantedEntryRefused("negative selected layer entry size")
+        regular_names.add(name)
+        selected_bytes += member.size
+        if max_selected_bytes is not None and selected_bytes > max_selected_bytes:
+            raise ValueError("selected layer files exceed memory budget")
+        return name
+
+    def _refuse_wanted_skip(member, reason: str) -> None:
+        # Failures channel for the safety filter: a WANTED path that
+        # exists but is refused (e.g. oversize dpkg status) must be
+        # loud — a silent skip yields the falsely-clean inventory
+        # documented on WantedEntryRefused. Unwanted refused entries
+        # keep the extractor's debug-level skip.
+        name = _normalise_tar_path(member.name)
+        if _wanted(name):
+            raise WantedEntryRefused(
+                f"layer entry {member.name!r} matches wanted path "
+                f"{name!r} but was refused by the safety filter "
+                f"({reason}, declared size {member.size})"
+            )
+
+    def _nonregular(member) -> None:
+        name = _normalise_tar_path(member.name)
+        if member.isdir() or not _wanted(name):
+            return
+        if member.issym() and selected_symlinks is not None:
+            if (member.size != 0 or name in hardlinks or name in regular_names or name in symlinks
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,255}", member.linkname)
+                    or member.linkname in {".", ".."}):
+                raise WantedEntryRefused("unsafe or duplicate selected symlink metadata")
+            symlinks[name] = member.linkname
+            return
+        if not member.islnk() or not resolve_selected_hardlinks:
+            raise WantedEntryRefused("selected layer entry is not a regular file")
+        target = _normalise_tar_path(member.linkname)
+        for value in (name, target):
+            if (not value or len(value) > 4096 or "\\" in value
+                    or unicodedata.normalize("NFKC", value) != value
+                    or any(ord(c) < 32 or ord(c) == 127 for c in value)
+                    or any(p in {"", ".", ".."} for p in value.split("/"))):
+                raise WantedEntryRefused("unsafe selected hard-link path")
+        if name in hardlinks or name in regular_names or name in symlinks:
+            raise ValueError("duplicate selected layer path")
+        hardlinks[name] = target
+
+    chunk_iter = iter(layer_chunks)
+    if mode == "r|gz":
+        # Decompression runs OUTSIDE tarfile so its output budget can
+        # scale with the compressed bytes actually fetched — the
+        # declared-size budget below stays as the allocation bound
+        # for header/metadata accounting inside the extractor.
+        tar_source: Iterable[bytes] = _gunzip_ratio_guarded(chunk_iter)
+        tar_mode = "r|"
+    else:
+        tar_source = chunk_iter
+        tar_mode = mode
+
+    def _verify_tar(source):
+        digest = hashlib.sha256()
+        total = 0
+        for chunk in source:
+            total += len(chunk)
+            if total > layer_decompression_budget(compressed_size):
+                raise ValueError("uncompressed layer exceeds decompression budget")
+            digest.update(chunk)
+            yield chunk
+        if "sha256:" + digest.hexdigest() != expected_diff_id:
+            raise ValueError("uncompressed layer diff ID mismatch")
+
+    tar_iter = iter(_verify_tar(tar_source) if expected_diff_id is not None else tar_source)
+    found = extract_files_from_tar(
+        tar_iter,
         selector=_select,
-        mode="r|gz",
+        mode=tar_mode,
         max_member_bytes=max_entry_bytes,
         # Layer member names are legitimately absolute; we read
         # into memory rather than extract to disk, so escape doesn't
         # apply.
         allow_absolute_paths=True,
-        # Early-exit once we've found everything — saves streaming
-        # through the rest of the layer.
-        expected_count=len(normalised_wanted),
+        # No expected_count early exit: the walk must see the whole
+        # archive so a duplicated wanted path can't shadow the copy
+        # the runtime actually sees, and the source has to be
+        # consumed to EOF for digest verification anyway. The
+        # max_total_bytes cap below bounds the decompression work.
+        unique_keys=True,
+        # Explicit caps for untrusted registry layers. The
+        # decompression budget scales with the layer's compressed
+        # size (ratio-shaped bomb test — see the rationale block on
+        # the constants above); the fetched-bytes guard above is the
+        # tighter live bound for gzip layers.
+        max_entry_count=layer_entry_count_budget(compressed_size),
+        max_total_bytes=layer_decompression_budget(compressed_size),
+        on_skipped=_refuse_wanted_skip,
+        on_nonregular=_nonregular if resolve_selected_hardlinks or selected_symlinks is not None else None,
     )
+    # Drain the source to EOF before returning anything. stream_blob
+    # only performs its sha256 check on exhaustion; returning after
+    # an early exit would skip the check by construction, so no
+    # extracted content leaves this function until the source
+    # iterator has run to completion (raising on digest mismatch).
+    # Exhaust the decoded iterator too: tar EOF can precede gzip trailer
+    # validation, including the decoder's incomplete-stream check.
+    for _ in tar_iter:
+        pass
+    for _ in chunk_iter:
+        pass
+    unresolved = dict(hardlinks)
+    for _ in range(min(len(hardlinks), 32)):
+        previous = len(unresolved)
+        for name, target in list(unresolved.items()):
+            if target in found:
+                found[name] = found[target]
+                del unresolved[name]
+        if not unresolved or len(unresolved) == previous:
+            break
+    if unresolved:
+        missing = set(unresolved.values()) - normalised_wanted
+        if missing:
+            raise UnresolvedLayerHardlinks(missing)
+        raise WantedEntryRefused("cyclic or missing selected hard-link target")
+    if selected_symlinks is not None:
+        selected_symlinks.update(symlinks)
+    return found
+
+
+_LEADING_PREFIX_RE = re.compile(r"^(?:\.?/)+")
 
 
 def _normalise_tar_path(p: str) -> str:
     """Remove leading ``./`` and ``/`` so the same logical path
-    matches across builders that emit different shapes."""
-    while p.startswith("./"):
-        p = p[2:]
-    while p.startswith("/"):
-        p = p[1:]
-    return p
+    matches across builders that emit different shapes.
+
+    Single regex pass (constant-time amortised) replaces the
+    previous two ``while`` loops which were O(n) per leading
+    component on attacker-controlled prefixes. A malicious layer
+    entry like ``./././...`` repeated 10M times forced 10M string
+    slices through the old loops; the regex bounds peak memory
+    + CPU regardless of the leading prefix.
+    """
+    return _LEADING_PREFIX_RE.sub("", p)
 
 
 __all__ = [
     "DEFAULT_MAX_ENTRY_BYTES",
+    "DecompressionBudgetExceeded",
+    "UnsupportedLayerMediaType",
+    "WantedEntryRefused",
+    "UnresolvedLayerHardlinks",
     "extract_files_from_layer",
 ]

@@ -1,0 +1,224 @@
+"""LLM review of binary files found in test directories.
+
+The mechanical ``binary_in_tests`` detector flags non-text files in
+``tests/``, ``test/``, ``__tests__/``, and ``fixtures/`` directories.
+Many legitimate packages include binary test fixtures — this stage asks
+the LLM to judge whether the binary's claimed purpose (per surrounding
+test code) is plausible.
+
+**Mechanical override:** the LLM verdict is additive signal.  A "benign"
+LLM verdict does not suppress the mechanical ``binary_in_tests`` finding.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from pathlib import Path
+
+from core.llm.task_types import TaskType
+from . import (
+    StageResult,
+    TaintedString,
+    UntrustedBlock,
+    run_stage,
+)
+from ..parsers._safe_read import read_bounded, scan_root_context
+from .prompts import BINARY_IN_TESTS_SYSTEM
+from .schemas import BinaryInTestsVerdict
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..models import SupplyChainFinding
+
+logger = logging.getLogger(__name__)
+
+_MAX_CONTEXT_CHARS = 50_000
+
+# Per-file read budget for surrounding test code. The prompt keeps
+# at most a 10K-char slice per file, so anything past a megabyte is
+# never useful — but pre-bound, a planted 64 MB "test file" was
+# fully buffered before the slice.
+_MAX_TEST_FILE_BYTES = 1 * 1024 * 1024
+
+
+def review_binary_in_tests(
+    client,
+    findings: list[SupplyChainFinding],
+    target: Path,
+) -> list[SupplyChainFinding]:
+    """Enrich binary_in_tests findings with LLM plausibility assessment.
+
+    Reads surrounding test files to provide context for the LLM's
+    judgement.  Returns the same list with enriched findings.
+    """
+    bin_findings = [
+        f for f in findings
+        if f.kind == "binary_in_tests"
+    ]
+    if not bin_findings:
+        return findings
+
+    for finding in bin_findings:
+        binary_path = finding.evidence.get("path", "")
+        file_size = finding.evidence.get("file_size", 0)
+
+        context = _gather_test_context(target, binary_path)
+
+        verdict = _review_one(
+            client, binary_path, file_size, context,
+            finding.dependency.name, finding.dependency.ecosystem,
+        )
+        if verdict is None:
+            continue
+
+        finding.evidence["llm_binary_verdict"] = verdict.verdict
+        finding.evidence["llm_binary_confidence"] = verdict.confidence
+        finding.evidence["llm_binary_reasoning"] = verdict.reasoning
+        if verdict.referenced_in_tests is not None:
+            finding.evidence["llm_binary_referenced"] = verdict.referenced_in_tests
+
+        if verdict.verdict == "suspicious":
+            if finding.severity in ("info", "low"):
+                finding.severity = "medium"
+        elif verdict.verdict == "malicious":
+            if finding.severity not in ("critical",):
+                finding.severity = "high"
+
+    return findings
+
+
+def _review_one(
+    client,
+    binary_path: str,
+    file_size: int,
+    context: str,
+    pkg_name: str,
+    ecosystem: str,
+) -> BinaryInTestsVerdict | None:
+    """Run the LLM on a single binary-in-tests finding."""
+    content_parts = [
+        f"Binary file: {binary_path}",
+        f"Size: {file_size:,} bytes",
+    ]
+    if context:
+        content_parts.append(f"\nSurrounding test code:\n{context}")
+    else:
+        content_parts.append("\nNo surrounding test code references this file.")
+
+    result: StageResult = run_stage(
+        client=client,
+        system=BINARY_IN_TESTS_SYSTEM,
+        untrusted_blocks=(
+            UntrustedBlock(
+                content="\n".join(content_parts),
+                kind="BINARY_CONTEXT",
+                origin=f"{ecosystem}/{pkg_name} test binary {binary_path}",
+            ),
+        ),
+        slots={
+            "package_name": TaintedString(value=pkg_name, trust="untrusted"),
+            "ecosystem": TaintedString(value=ecosystem, trust="trusted"),
+        },
+        schema_cls=BinaryInTestsVerdict,
+        task_type=TaskType.ANALYSE,
+    )
+
+    if result.error or result.model is None:
+        logger.debug("sca.llm.binary_in_tests: %s/%s failed: %s",
+                      ecosystem, pkg_name, result.error)
+        return None
+
+    verdict: BinaryInTestsVerdict = result.model  # type: ignore[assignment]
+    if result.preflight_hit and verdict.confidence == "high":
+        verdict = verdict.model_copy(update={"confidence": "medium"})
+    return verdict
+
+
+def _gather_test_context(target: Path, binary_path: str) -> str:
+    """Read nearby test files that might reference the binary.
+
+    ``binary_path`` is finding evidence derived from an UNTRUSTED
+    repo, and everything read here lands verbatim in the LLM prompt
+    (off-host). Containment is therefore non-negotiable:
+
+      * the evidence path must resolve INSIDE ``target`` — an
+        absolute or traversal-shaped path degrades to "no context"
+        instead of steering the directory walk out of the repo;
+      * each surrounding test file is read through the package's
+        bounded no-follow chokepoint (``_safe_read.read_bounded``)
+        under ``scan_root_context(target)``, so a repo-planted
+        symlink to a host file is refused while legitimate in-root
+        symlinks (monorepo layouts) keep working;
+      * reads are size-bounded — the prompt keeps a 10K-char slice,
+        so a planted multi-GB "test file" must not be buffered.
+    """
+    if not binary_path:
+        return ""
+
+    try:
+        root = target.resolve()
+        rel = Path(binary_path)
+        if rel.is_absolute():
+            logger.warning(
+                "sca.llm.binary_in_tests: refusing absolute evidence "
+                "path %s (must be repo-relative)", binary_path,
+            )
+            return ""
+        binary = target / rel
+        # Resolve the PARENT (the directory we're about to glob):
+        # a ``tests -> /etc`` directory symlink or a ``..`` segment
+        # in the evidence path must not walk host directories.
+        parent = binary.parent.resolve()
+        if parent != root and not parent.is_relative_to(root):
+            logger.warning(
+                "sca.llm.binary_in_tests: refusing evidence path %s "
+                "(resolves outside the scan root)", binary_path,
+            )
+            return ""
+        if not binary.exists():
+            return ""
+    except OSError as e:
+        logger.debug(
+            "sca.llm.binary_in_tests: cannot resolve context dir "
+            "for %s: %s", binary_path, e,
+        )
+        return ""
+
+    binary_name = binary.name
+    chunks: list[str] = []
+    total = 0
+
+    with scan_root_context(target):
+        for test_file in (
+            sorted(parent.glob("*.py"))
+            + sorted(parent.glob("*.js"))
+            + sorted(parent.glob("*.ts"))
+        ):
+            if test_file.name == binary_name:
+                continue
+            text = read_bounded(
+                test_file, max_bytes=_MAX_TEST_FILE_BYTES,
+                follow_symlinks=False,
+            )
+            if text is None:
+                continue
+            if binary_name not in text:
+                continue
+            try:
+                shown = test_file.relative_to(root)
+            except ValueError:
+                shown = Path(test_file.name)
+            header = f"--- {shown} ---\n"
+            idx = text.find(binary_name)
+            if idx <= 10_000:
+                chunk = header + text[:10_000]
+            else:
+                start = max(0, idx - 5_000)
+                chunk = header + text[start:start + 10_000]
+            if total + len(chunk) > _MAX_CONTEXT_CHARS:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+
+    return "\n".join(chunks)

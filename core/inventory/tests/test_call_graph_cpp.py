@@ -18,12 +18,25 @@ This file pins the C++-specific extensions:
 
 from __future__ import annotations
 
+from core.testing.reachability_state import isolated_reachability_caches
+
 import pytest
 
 from core.inventory.call_graph import (
     INDIRECTION_FN_POINTER,
     extract_call_graph_cpp,
 )
+
+
+@pytest.fixture(autouse=True)
+def _owned_reachability_caches(monkeypatch):
+    """Own inventory indexes while retaining warm caller state."""
+    with isolated_reachability_caches():
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
+
 
 
 pytest.importorskip("tree_sitter_cpp")
@@ -415,7 +428,7 @@ class TestFunctionCalledIntegration:
         """``ns::Foo::bar()`` invoked via implicit-this from
         ``ns::Foo::other()`` — resolver synthesises
         ``ns.Foo.bar`` from the file's namespace + receiver_class."""
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             Verdict, function_called,
         )
 
@@ -596,7 +609,7 @@ class TestCrossFileFullyQualifiedCall:
         """File A defines ``ns::Util::helper()``; file B calls
         ``ns::Util::helper()`` directly. The resolver matches via
         the dotted-chain fast-path, NOT via the import map."""
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             Verdict, function_called,
         )
 
@@ -628,7 +641,7 @@ class TestCrossFileFullyQualifiedCall:
         """Strict equality: target ``ns.Other.helper`` doesn't
         match chain ``ns::Util::helper`` — must return
         NOT_CALLED."""
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             Verdict, function_called,
         )
 
@@ -644,7 +657,7 @@ class TestCrossFileFullyQualifiedCall:
         """Chain ``["Util", "helper"]`` (no namespace prefix) must
         NOT match target ``ns.Util.helper``. Strict equality
         guards against partial-match false positives."""
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             Verdict, function_called,
         )
 
@@ -718,7 +731,7 @@ class TestCallersCalleesIndexParity:
     returned the C++ caller in method_match instead of definitive."""
 
     def test_callers_of_namespace_class_method_definitive(self):
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             callers_of, InternalFunction,
         )
 
@@ -759,7 +772,7 @@ class TestCallersCalleesIndexParity:
     def test_callees_of_namespace_class_method_definitive(self):
         """Symmetric: callees_of(use) lists ns::Util::helper as
         a definitive callee."""
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             callees_of, InternalFunction,
         )
 
@@ -798,7 +811,7 @@ class TestCallersCalleesIndexParity:
         NOT match the seeded ``ns.Util.helper`` qualified name —
         falls through to method_match_overinclusive. Strict
         equality guards against over-promoting partial matches."""
-        from core.inventory.reachability import (
+        from core.analysis.reachability import (
             callers_of, InternalFunction,
         )
 
@@ -832,3 +845,30 @@ class TestCallersCalleesIndexParity:
         assert not any(
             c.file_path == "src/main.cpp" for c in r.definitive
         )
+
+
+# ---------------------------------------------------------------------------
+# Function-pointer pre-pass runs for C++ too
+# ---------------------------------------------------------------------------
+
+
+class TestCppFnPointerPrePass:
+    """The C++ walk() override previously skipped the fn-ptr
+    declaration pre-pass entirely, so C++ files never flagged bare
+    calls through declared pointers."""
+
+    def test_namespace_scope_fn_ptr_flagged(self):
+        g = extract_call_graph_cpp(
+            "namespace n {\n"
+            "void (*handler)(int) = handler_impl;\n"
+            "void use() { handler(1); }\n"
+            "}\n"
+        )
+        assert INDIRECTION_FN_POINTER in g.indirection
+
+    def test_method_calls_not_flagged(self):
+        g = extract_call_graph_cpp(
+            "class C { public: void m(); };\n"
+            "void f() { C c; c.m(); }\n"
+        )
+        assert INDIRECTION_FN_POINTER not in g.indirection

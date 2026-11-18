@@ -1,0 +1,155 @@
+"""Tool registry: classify coverage tool labels by category and depth.
+
+Coverage is keyed by tool label (e.g. ``semgrep``, ``claude:audit``,
+``gcov:campaign-1``). The label's *base* (before ``:``) maps to a
+category (static / llm / runtime) and a depth on the
+scanned -> analysed -> dataflow-traced -> runtime-tested ladder.
+
+The category is what consumers query on -- ``gaps(category="llm")`` =
+"what has no LLM examined yet, regardless of scanner coverage". Depth is
+a finer signal kept for later prioritisation; it does not gate gaps().
+
+Unknown tools fall back to ``unknown`` / ``scanned`` -- the most
+conservative depth -- so a new producer is never silently credited as
+deep coverage. The mapping is intentionally small and easy to extend.
+"""
+
+from __future__ import annotations
+
+
+CATEGORY_STATIC = "static"
+CATEGORY_LLM = "llm"
+CATEGORY_RUNTIME = "runtime"
+CATEGORY_UNKNOWN = "unknown"
+
+# Depth ladder, shallow -> deep.
+DEPTH_SCANNED = "scanned"
+DEPTH_ANALYSED = "analysed"
+DEPTH_DATAFLOW = "dataflow-traced"
+DEPTH_RUNTIME = "runtime-tested"
+
+# base tool -> (category, depth)
+_REGISTRY = {
+    "semgrep": (CATEGORY_STATIC, DEPTH_SCANNED),
+    "coccinelle": (CATEGORY_STATIC, DEPTH_SCANNED),
+    "codeql": (CATEGORY_STATIC, DEPTH_SCANNED),
+    "claude": (CATEGORY_LLM, DEPTH_ANALYSED),
+    "llm": (CATEGORY_LLM, DEPTH_ANALYSED),
+    # "read" = the LLM *read* the file (reads-manifest, whole-file) — llm
+    # category but only SCANNED depth, i.e. NOT a function-level review. The
+    # read-vs-reviewed distinction: reviewed = llm at depth >= analysed.
+    "read": (CATEGORY_LLM, DEPTH_SCANNED),
+    # "understand" = /understand IDENTIFIES attack surface (entry points /
+    # sinks / flows) — a structural map, NOT a per-function vuln review. So it
+    # is llm-extent but only SCANNED depth (not "reviewed"): the functions it
+    # flags are review *targets*, and must stay in the review gap, not drop out
+    # of it. (Uses the same not-reviewed bucket as "read"; the depth ladder has
+    # no distinct "mapped" rung and the review axis is depth's only consumer.)
+    "understand": (CATEGORY_LLM, DEPTH_SCANNED),
+    # "openant" = the external OpenAnt scanner ANALYSED a unit covering
+    # this function (the analyzed-units overlay, packages/openant/
+    # coverage.py). Scanner grade by design: an external LLM scanner
+    # reading/analysing a function is llm-extent examination evidence —
+    # exactly the `read`/`understand` bucket — but it is NOT a RAPTOR
+    # review, so it must stay at SCANNED depth, structurally outside
+    # every review-covered set (store_summary's reviewed screens, the
+    # audit gap fold's (llm, analysed) gate, the --fail-under percent).
+    # Registering it above the unknown/scanned default only fixes the
+    # CATEGORY (llm, so the extent views attribute it) — the depth is
+    # deliberately identical to the default so a registry regression
+    # can never promote scanner marks into review credit.
+    "openant": (CATEGORY_LLM, DEPTH_SCANNED),
+    # "backlog-drain" = a witness-backlog drain landed a tool-witnessed
+    # suspicious row for this function (core/audit/backlog_drain.py,
+    # finding-grade journal producer). The witness is a synthesized
+    # STATIC checker (Semgrep/Coccinelle rule) matching the row's own
+    # site — pattern-scanner extent, not a per-function LLM review, so
+    # static category. Depth is deliberately identical to the
+    # unknown/scanned default: registering here only fixes the CATEGORY
+    # (so extent views attribute drain marks to the static tier) — a
+    # registry regression can never promote drain marks into review
+    # credit or drop the function out of the LLM-review gap.
+    "backlog-drain": (CATEGORY_STATIC, DEPTH_SCANNED),
+    "audit": (CATEGORY_LLM, DEPTH_ANALYSED),
+    # "journal" = a coverage record derived from review-journal entries
+    # (build_from_journal; /agentic writes coverage-journal.json). Every
+    # functions_analysed entry is a per-function LLM review verdict, so the
+    # label is review-grade. Pre-registration it fell to the unknown/scanned
+    # default and journal-derived function marks never counted as reviewed.
+    "journal": (CATEGORY_LLM, DEPTH_ANALYSED),
+    # "mark" = an operator --mark journaled as a review assertion
+    # (producer="mark" flows through import_journal as the store
+    # label). Review-grade by definition of the label: agent-context
+    # mark rows never reach the store — the import screens them
+    # (journal.is_agent_mark; review-grade marks are operator-tier)
+    # and the CLI demotes non-operator marks to the map-grade
+    # "understand" channel at write time.
+    "mark": (CATEGORY_LLM, DEPTH_ANALYSED),
+    # checked_by source_labels are command:stage (all LLM-driven; scanners
+    # use the file-level coverage records, not checked_by).
+    "validate": (CATEGORY_LLM, DEPTH_ANALYSED),
+    "agentic": (CATEGORY_LLM, DEPTH_ANALYSED),
+    "annotations": (CATEGORY_LLM, DEPTH_ANALYSED),
+    "gcov": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "lcov": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "llvm-cov": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "llvm": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "afl": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "fuzz": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    # binary-coverage tracers, addr2line/DWARF-resolved to source.
+    "bincov": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "drcov": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "frida": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "sancov": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    # Python-test runtime (coverage.py / pytest-cov).
+    "coverage.py": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "coverage": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+    "pytest": (CATEGORY_RUNTIME, DEPTH_RUNTIME),
+}
+_DEFAULT: tuple[str, str] = (CATEGORY_UNKNOWN, DEPTH_SCANNED)
+
+# Full-label overrides, consulted before the base mapping. The machine
+# tier of annotations — agent-written notes and non-TTY-stamped
+# ``source=human`` notes, marked ``<tool>:machine`` by
+# ``import_annotations`` — is HINT-tier by the annotations doctrine:
+# real llm-extent examination evidence, but NOT an operator-grade
+# function review. Keep it at scanned depth (the same not-reviewed
+# bucket as ``read``/``understand``) so agent notes never clear
+# functions from the LLM-review gap the way human-grade annotations
+# do; without the override the label's base resolved to
+# ``annotations`` = analysed, full review credit.
+_EXACT: dict[str, tuple[str, str]] = {
+    "annotations:machine": (CATEGORY_LLM, DEPTH_SCANNED),
+}
+
+
+def _base(tool_label: str) -> str:
+    return tool_label.split(":", 1)[0]
+
+
+def classify(tool_label: str) -> tuple[str, str]:
+    """Return ``(category, depth)`` for a tool label.
+
+    A ``:machine`` suffix is a generic demotion marker: producers
+    (``import_annotations``, ``import_functions_analysed``) append it
+    to rows whose review claim could not be verified (no human-grade
+    provenance / no MAC / no current source hash). Such a label keeps
+    its base category but never grades above scanned depth — the mark
+    remains real examination evidence, but must not clear the
+    function from the LLM-review gap the way a verified review does.
+    """
+    exact = _EXACT.get(tool_label)
+    if exact is not None:
+        return exact
+    category, depth = _REGISTRY.get(_base(tool_label), _DEFAULT)
+    if depth == DEPTH_ANALYSED and tool_label.endswith(":machine"):
+        return (category, DEPTH_SCANNED)
+    return (category, depth)
+
+
+def category_of(tool_label: str) -> str:
+    return classify(tool_label)[0]
+
+
+def depth_of(tool_label: str) -> str:
+    return classify(tool_label)[1]

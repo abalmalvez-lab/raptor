@@ -1,6 +1,6 @@
 """Egress-allowlisted backend for :class:`core.http.HttpClient`.
 
-Routes outbound HTTPS through the in-process proxy at
+Routes outbound HTTP(S) through the in-process proxy at
 :mod:`core.sandbox.proxy`. The proxy enforces a hostname allowlist —
 CONNECT to anything outside the registered hosts is refused — closing
 the gap that direct urlopen leaves open: a parser compromise can't
@@ -52,57 +52,99 @@ Upstream proxy autodetect: when ``HTTPS_PROXY`` is set in the parent
 environment at first ``get_proxy`` call, the in-process proxy chains
 through it for outbound connections (except ``NO_PROXY`` matches).
 Lets RAPTOR work behind corporate proxies transparently.
+
+Inside a macOS seatbelt child behind the parent's egress proxy, the
+profile denies bind/listen, so no in-process proxy can start there.
+The client then routes through the parent proxy named by the
+spawn-layer marker (:data:`core.sandbox.seatbelt.PARENT_EGRESS_PROXY_ENV`)
+— only when the kernel reports this process as sandboxed and the
+marker matches ``HTTPS_PROXY``. The parent proxy enforces its own
+hostname allowlist and is the only egress the profile admits.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Iterable
-
-import urllib3
+import os
+import re
+import sys
+from collections.abc import Iterable
 
 from core.http import DEFAULT_USER_AGENT
 from core.http.urllib_backend import UrllibClient
 
 logger = logging.getLogger(__name__)
 
+_LOOPBACK_PROXY_RE = re.compile(r"http://127\.0\.0\.1:[1-9][0-9]{0,4}")
+
+
+def _process_is_sandboxed() -> bool:
+    """Kernel truth: is this process running under a seatbelt profile?"""
+    try:
+        import ctypes
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        check = lib.sandbox_check
+        check.restype = ctypes.c_int
+        check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        return check(os.getpid(), None, 0) == 1
+    except (OSError, AttributeError) as exc:
+        logger.debug(
+            "sandbox_check() unavailable (%s); assuming not sandboxed",
+            exc,
+        )
+        return False
+
+
+def seatbelt_parent_proxy_url() -> str | None:
+    """Parent egress-proxy URL for a seatbelt child behind it, else None."""
+    if sys.platform != "darwin":
+        return None
+    from core.sandbox.seatbelt import PARENT_EGRESS_PROXY_ENV
+    url = os.environ.get(PARENT_EGRESS_PROXY_ENV)
+    if not url or url != os.environ.get("HTTPS_PROXY"):
+        return None
+    if not _LOOPBACK_PROXY_RE.fullmatch(url):
+        return None
+    if int(url.rsplit(":", 1)[1]) > 65535:
+        return None
+    if not _process_is_sandboxed():
+        return None
+    return url
+
 
 class EgressClient(UrllibClient):
     """HttpClient backend that routes via :mod:`core.sandbox.proxy`.
 
-    Restricts URLs to https only — the underlying proxy is
-    HTTPS-CONNECT-only, so an http:// request would forward-proxy as
-    ``GET http://host/`` and fail at the proxy. Rejecting at the
-    validator gives the caller a clear immediate error rather than
-    a confusing late one.
+    Both HTTP and HTTPS use CONNECT through the enforcement proxy.
     """
-
-    _ALLOWED_SCHEMES = ("https",)
 
     def __init__(
         self,
         allowed_hosts: Iterable[str],
         user_agent: str = DEFAULT_USER_AGENT,
     ) -> None:
-        from core.sandbox.proxy import get_proxy
-        proxy = get_proxy(list(allowed_hosts))
-        proxy_url = f"http://127.0.0.1:{proxy.port}"
+        proxy_url = seatbelt_parent_proxy_url()
+        if proxy_url is None:
+            from core.sandbox.proxy import get_proxy
+            proxy = get_proxy(list(allowed_hosts))
+            proxy_url = f"http://127.0.0.1:{proxy.port}"
         # urllib3.ProxyManager forwards every request through the proxy
         # unconditionally — no no_proxy autodetect (unlike the stdlib
-        # urllib.request.ProxyHandler we used pre-pooling). retries=False
-        # so urllib3's retry doesn't fight UrllibClient's own.
-        # maxsize matches UrllibClient (10) — connections to the proxy.
-        # Each carries its own CONNECT tunnel; 10 simultaneous tunnels
-        # is well within the in-process proxy's 64-tunnel cap.
-        from core.http.urllib_backend import _DEFAULT_POOL_MAXSIZE
-        proxy_pool = urllib3.ProxyManager(
-            proxy_url,
-            retries=False,
-            cert_reqs="CERT_REQUIRED",
-            maxsize=_DEFAULT_POOL_MAXSIZE,
-        )
+        # urllib.request.ProxyHandler we used pre-pooling). Built via
+        # the shared helper so this pool carries the SAME secure
+        # defaults as every other pool construction — notably the
+        # certifi CA pin (pre-fix this pool alone fell back to the
+        # system trust store: stale-CA MITM residual, plus hard
+        # failure on hosts with no system bundle). retries=False so
+        # urllib3's retry doesn't fight UrllibClient's own; maxsize
+        # matches UrllibClient (10) — connections to the proxy, each
+        # carrying its own CONNECT tunnel, well within the in-process
+        # proxy's 64-tunnel cap.
+        from core.http.urllib_backend import _new_proxy_manager
+        from core.http._connect import ConnectProxyManager
+        proxy_pool = _new_proxy_manager(proxy_url, manager_class=ConnectProxyManager)
         logger.debug(
-            "core.http.EgressClient: routing via in-process proxy at %s",
+            "core.http.EgressClient: routing via egress proxy at %s",
             proxy_url,
         )
         super().__init__(user_agent=user_agent, _http=proxy_pool)

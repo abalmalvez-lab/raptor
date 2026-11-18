@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Stage E SMT verb: CWE-680 integer overflow → buffer overflow.
 
 Usage:
@@ -13,31 +15,35 @@ The canonical CWE-680 pattern:
   for (i = 0; i < count; i++) buf[i] = ...;  // OOB write past wrap
 
 The verb composes ``check_overflow``'s wrap predicate with ``check_oob``'s
-bound-violation predicate into a single check — saves operators from
-running both verbs separately and reconciling the verdicts.
+bound-violation predicate into a single model. Elements must have positive
+size, the loop starts at zero, and the allocation multiplication must overflow.
+Offsets remain modular at the selected width; the comparison concerns the
+element start, not its full extent or pointer arithmetic. Signed profiles
+are abstract modular arithmetic: signed C overflow is undefined. Neither
+SAT nor UNSAT establishes source allocation/access semantics.
 
 ``--profile`` defaults to ``uint32`` (most CWE-680 findings involve
 32-bit unsigned arithmetic). Override to match the C type of
 ``alloc_size`` (the wrapped result).
 
-``--guard`` is repeatable. Pass any visible guards (e.g.
-``--guard 'count > 0'`` to exclude the degenerate count=0 case).
+``--guard`` is repeatable. Pass visible source guards (e.g.
+``--guard 'count <= 1000'``). The zero-based loop domain is intrinsic.
 
 Output: JSON to stdout matching :func:`validate_path`'s shape.
 
-  feasible=true   CWE-680 IS reachable; ``model`` shows a concrete
-                  (count, element_size, index) triple satisfying both
-                  the wrap AND the OOB write
-  feasible=false  guards rule out either the wrap or the OOB
+  feasible=true   model satisfies the domain, overflow, and modular
+                  start-offset predicates
+  feasible=false  no assignment satisfies this model and its guards
   feasible=null   Z3 unavailable / unencodable
 """
 import argparse
-import json
 import sys
+import json
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
-import os
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -46,11 +52,13 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
 
-from packages.exploit_feasibility.smt_verbs import check_overflow_to_oob
+from packages.exploit_feasibility.smt_verbs import check_overflow_to_oob  # noqa: E402
 
 
 def main() -> int:
@@ -68,6 +76,9 @@ def main() -> int:
                    help="Bitvector profile name (default: uint32)")
     p.add_argument("--guard", action="append", default=[],
                    help="Visible bounds-check / path condition (repeat)")
+    # Accept --source and --function for compatibility with sweep runner
+    p.add_argument("--source", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--function", default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
 
     try:
@@ -82,7 +93,12 @@ def main() -> int:
         print(f"raptor-smt-check-overflow-to-oob: {e}", file=sys.stderr)
         return 2
 
-    json.dump(result, sys.stdout, indent=2)
+    # ensure_ascii: this JSON goes to the operator terminal; JSON
+    # escapes C0 but passes C1 controls (single-byte CSI/OSC) raw
+    # when ensure_ascii is off (dumps_display is exactly that).
+    # ASCII output stays valid JSON for parsing consumers.
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=True,
+                                default=str))
     sys.stdout.write("\n")
     return 0
 

@@ -1,0 +1,1037 @@
+"""Persistent coverage store (Phase 3).
+
+Phase 2 wrote one immutable ``coverage-record.json`` per tool per run and
+unioned them at query time. Phase 3 adds ``CoverageStore`` + a persistent
+``coverage.json``: a (file, line-interval)-keyed record of which tool
+examined which lines, surviving across pipeline stages and runs. Tools
+report what they examined via :meth:`mark`; consumers query it.
+
+Coverage is keyed by *tool label* (e.g. ``semgrep``, ``claude:audit``,
+``gcov:campaign-1``). The label both names the producer and -- via the
+tool registry (a later step) -- its depth on the
+scanned -> analysed -> dataflow-traced -> runtime-tested ladder. The
+store treats the label as an opaque string; categorisation lives in the
+registry, not here.
+
+This is the file-keyed coverage sink (per-tool line intervals nested
+under each file; function views are joined from the inventory at query
+time, never used as a storage key). Per-run provenance
+(tool version, resolved model, timestamp, target identity) is sourced
+separately from the run manifest (``.raptor-run.json``) and joined in by
+callers -- coverage does not embed it, and keys on file *content* SHA
+(via the inventory), so it is identical whether the target arrived as a
+git clone or a zip extraction. See the design memo.
+
+Intervals are inclusive ``[lo, hi]`` line ranges, kept sorted and
+coalesced per tool. Above ``_BITMAP_THRESHOLD`` intervals the in-memory
+representation switches to a line-number set ("bitmap" — sparse
+runtime/gcov data); the public API is identical and the on-disk form is
+always intervals.
+"""
+
+from __future__ import annotations
+
+import bisect
+import contextlib
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+from core.atomic_fs import write_text_atomically
+from core.atomic_fs.fs_lock import (
+    _HAS_FCNTL,  # noqa: F401 — re-exported lock-availability probe
+    sidecar_flock,
+)
+from core.json import dumps_artifact
+from core.logging import get_logger as _get_logger
+
+from .registry import category_of
+from .schema import (
+    _is_int,
+    _opt_int,
+    check_version,
+    iter_file_entries,
+    iter_item_entries,
+    normalise_loaded_files,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+COVERAGE_STORE_FILE = "coverage.json"
+SCHEMA_VERSION = 1
+
+Interval = list[int]  # [lo, hi], inclusive
+
+
+@contextlib.contextmanager
+def coverage_store_lock(coverage_path):
+    """Cross-process exclusive lock guarding a ``coverage.json``
+    read-modify-write window.
+
+    The durable store is mutated by two best-effort paths that each
+    load -> mutate -> save: a run's completion snapshot and ``/project clean``'s
+    snapshot. Without a lock, two racing (a run finishing during a clean, or
+    several parallel runs completing at once) last-writer-wins and one
+    snapshot's contribution is dropped. Hold this across the WHOLE window:
+    acquire BEFORE constructing the store and release AFTER ``save()``.
+
+    Locks a sibling ``.lock`` file (not ``coverage.json`` itself, which
+    ``save()`` atomically replaces). No-op without fcntl (non-POSIX) —
+    degrades to the prior last-writer-wins, no regression.
+
+    Client-locality caveat (WSL drvfs/9p, no behaviour change): on a
+    Windows-interop mount this flock is client-local — snapshot
+    writers within one distro stay serialised, but Windows-side
+    processes and other distros mounting the same drive are not
+    excluded and degrade to last-writer-wins. A store on the distro's
+    Linux filesystem keeps the full guarantee. See docs/wsl.md.
+    """
+    # The hoisted sidecar idiom (core.atomic_fs.fs_lock): hardened
+    # open (O_NOFOLLOW / O_NONBLOCK / regularity — the lock file lives
+    # in a run directory sandboxed target code may hold a write grant
+    # on), foreign-uid refusal (a pre-created lock file opens FINE and
+    # would otherwise hand its creator a standing hold over every
+    # snapshot writer), and a bounded announce-once wait so a wedged
+    # holder degrades loudly instead of stalling snapshots forever.
+    # Every lock-unavailable shape degrades to the no-lock path (same
+    # as non-POSIX) — snapshot writers are best-effort.
+    path = Path(coverage_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with sidecar_flock(lock_path, subject="coverage store"):
+        yield
+
+
+def _coalesce(intervals: list[Interval]) -> list[Interval]:
+    """Sort and merge overlapping or adjacent inclusive intervals."""
+    if not intervals:
+        return []
+    ordered = sorted([lo, hi] if lo <= hi else [hi, lo] for lo, hi in intervals)
+    merged: list[Interval] = [list(ordered[0])]
+    for lo, hi in ordered[1:]:
+        last = merged[-1]
+        if lo <= last[1] + 1:          # overlapping or adjacent
+            last[1] = max(last[1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
+def _covered_count(intervals: list[Interval]) -> int:
+    return sum(hi - lo + 1 for lo, hi in intervals)
+
+
+def _overlap_count(intervals: list[Interval], lo: int, hi: int) -> int:
+    """Lines in ``[lo, hi]`` already present in ``intervals``."""
+    total = 0
+    for a, b in intervals:
+        left, right = max(a, lo), min(b, hi)
+        if left <= right:
+            total += right - left + 1
+    return total
+
+
+# --- bitmap fallback --------------------------------------------------------
+#
+# A (file, tool) contribution is normally a coalesced interval list. For
+# sparse runtime/gcov data — many small disjoint executed-line ranges — that
+# list grows large and every incremental mark re-coalesces it (O(K log K) per
+# mark → O(K^2 log K) to build). Above ``_BITMAP_THRESHOLD`` intervals the
+# in-memory representation switches to a line-number ``set`` ("bitmap"): mark
+# becomes O(range) with no re-sort. The public API is identical regardless of
+# backend, and the ON-DISK form is always intervals (``to_dict`` normalises),
+# so the persisted schema and its validation (schema.py) are unchanged.
+
+_BITMAP_THRESHOLD = 50
+
+# Cap on how many line numbers a single (file, tool) contribution may
+# materialise as a Python set. The set backend stores one int per
+# covered VALUE (~55 bytes each), so magnitudes matter, and two inputs
+# legitimately or maliciously reach address/huge magnitudes: binary
+# items mark ADDRESS-space intervals (a 5 MB .text is ~5M values →
+# ~270 MB as a set), and forged journal/checklist spans can declare
+# multi-billion-line ranges (the journal-parse clamp covers only ONE
+# of the inputs feeding mark()). Above the cap the contribution stays
+# in (or demotes back to) the interval-list representation, which is
+# O(#intervals) regardless of span width.
+# Trade-off, both directions: LOWER costs re-coalescing perf for
+# genuinely dense line coverage (interval marks are O(K log K) each);
+# HIGHER re-opens the per-contribution memory detonation. 1M covers
+# any real source file's line count while keeping the worst case
+# ~55 MB per contribution.
+_BITMAP_MAX_LINES = 1_000_000
+
+# Byte budget for loading coverage.json. Even very large projects'
+# stores are tens of MiB; 256 MiB is generous headroom while keeping
+# a hostile store (e.g. from an imported project archive) unread.
+_MAX_STORE_BYTES = 256 * 1024 * 1024
+
+
+class StoreWriteOverBudget(RuntimeError):
+    """The serialized store would exceed the read budget — the write
+    refuses so the ON-DISK store always stays readable. Writing past
+    the cap silently destroyed the durable coverage union: the next
+    construction warned "unreadable ... starting empty" and the layer
+    that survives /project clean — including ``found_then_lost``
+    re-review flags whose holding runs were already cleaned — was
+    gone. Same shape and rationale as the journal index's
+    ``IndexWriteOverBudget``; the byte bound must sit at the write
+    because per-run intake caps bound row COUNT, not the merged
+    store's serialized size."""
+
+
+def _set_to_intervals(lines: set) -> list[Interval]:
+    """Coalesce a line-number set into sorted inclusive intervals."""
+    out: list[Interval] = []
+    for ln in sorted(lines):
+        if out and ln <= out[-1][1] + 1:
+            out[-1][1] = ln
+        else:
+            out.append([ln, ln])
+    return out
+
+
+def _cov_to_intervals(value) -> list[Interval]:
+    """Normalise a coverage value (interval list or line set) to intervals."""
+    if isinstance(value, set):
+        return _set_to_intervals(value)
+    return value
+
+
+def _cov_covers_line(value, line: int) -> bool:
+    if isinstance(value, set):
+        return line in value
+    return any(lo <= line <= hi for lo, hi in value)
+
+
+def _cov_overlap(value, lo: int, hi: int) -> int:
+    if isinstance(value, set):
+        # Iterate the SMALLER side: a range() scan over an
+        # address-magnitude or forged multi-billion-line query range
+        # is a CPU detonation; membership over the set is bounded by
+        # the set's own size (already capped at _BITMAP_MAX_LINES).
+        if hi - lo + 1 > len(value):
+            return sum(1 for ln in value if lo <= ln <= hi)
+        return sum(1 for ln in range(lo, hi + 1) if ln in value)
+    return _overlap_count(value, lo, hi)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def content_identity(checklist: dict[str, Any]) -> str | None:
+    """A deterministic content-equivalence id over the inventory's analyzed
+    source: ``sha256`` of the sorted ``(relpath, content_sha256)`` set.
+
+    Equal iff the analyzed file content is byte-identical — so a git checkout
+    and a zip of the same source resolve to the SAME id (``git-X ≡ zip-X``),
+    while CRLF / file-selection drift correctly yields different ids. Derived
+    from the inventory, which already excludes ``.git`` / archive container /
+    build artifacts — NOT from any acquisition hash (that's the run manifest's
+    loose per-method stamp). Returns ``None`` for an empty inventory.
+    """
+    entries = [
+        f"{fe['path']}\0{fe['sha256']}"
+        for fe in iter_file_entries(checklist)
+        if fe.get("path") and fe.get("sha256")
+    ]
+    if not entries:
+        return None
+    # surrogateescape (via the core.hash chokepoint) round-trips
+    # non-UTF-8 bytes in paths — JSON happily carries lone surrogates
+    # from non-UTF-8 filenames, and a raw .encode("utf-8") crashed the
+    # whole identity computation on the first one. Identical output
+    # for valid UTF-8.
+    from core.hash import sha256_string
+    digest = sha256_string("\n".join(sorted(entries)))
+    return f"content:{digest[:16]}"
+
+
+def iter_inventory_items(
+    checklist: dict[str, Any],
+) -> Iterator[tuple[str, str, int, int | None, str, dict[str, Any]]]:
+    """Yield ``(file, name, line_start, line_end, kind, item)`` for every
+    inventory item — :func:`iter_inventory_functions` plus the raw item
+    dict, for consumers that read builder-stamped item fields (e.g. the
+    ``script_handler`` classification) alongside the normalised row.
+
+    Handles the ``items`` key with ``functions`` fallback (matching
+    ``core.inventory``). ``line_end`` may be ``None`` when the extractor
+    couldn't determine it. ``kind`` defaults to ``"function"`` for legacy
+    entries lacking it.
+
+    The checklist is a run-dir JSON artifact, so shapes AND values are
+    attacker-writable: rows are walked tolerantly and every numeric
+    field is normalised to a genuine int (``_opt_int``) — a forged
+    ``"line_start": "1"`` previously flowed into interval arithmetic
+    and crashed every store query that touched the function. The raw
+    ``item`` dict is NOT normalised — readers must validate what they
+    take from it.
+    """
+    for fe in iter_file_entries(checklist):
+        path = fe.get("path")
+        if not path or not isinstance(path, str):
+            continue
+        for fn in iter_item_entries(fe):
+            name = fn.get("name")
+            if not name or not isinstance(name, str):
+                continue
+            kind = fn.get("kind")
+            if not isinstance(kind, str) or not kind:
+                kind = "function"
+            address = _opt_int(fn.get("address"))
+            if address is not None:
+                # Binary items: the store's intervals for binary:<stem>
+                # files live in address space (importer._function_ranges
+                # marks the same ranges) — line numbers don't exist.
+                size = _opt_int(fn.get("size")) or 0
+                yield (
+                    path,
+                    name,
+                    address,
+                    address + max(size - 1, 0),
+                    kind,
+                    fn,
+                )
+                continue
+            yield (
+                path,
+                name,
+                _opt_int(fn.get("line_start")) or 0,
+                _opt_int(fn.get("line_end")),
+                kind,
+                fn,
+            )
+
+
+def iter_inventory_functions(
+    checklist: dict[str, Any],
+) -> Iterator[tuple[str, str, int, int | None, str]]:
+    """Yield ``(file, name, line_start, line_end, kind)`` for every inventory
+    item. See :func:`iter_inventory_items` (this drops the item dict)."""
+    for file, name, lo, hi, kind, _item in iter_inventory_items(checklist):
+        yield (file, name, lo, hi, kind)
+
+
+class CoverageStore:
+    """Persistent, line-interval coverage keyed by file and tool label.
+
+    Load on construction, mutate via :meth:`mark` / :meth:`set_file_meta`
+    / :meth:`link_finding`, persist with :meth:`save`.
+    """
+
+    def __init__(self, coverage_path: Path, target: str | None = None) -> None:
+        self.path = Path(coverage_path)
+        self.target = target
+        self.content_id: str | None = None
+        self.version = SCHEMA_VERSION
+        self._files: dict[str, dict[str, Any]] = {}
+        # Per-file finding lookups, built lazily and kept in sync by
+        # link_finding (the only findings mutator — see its
+        # invariant note). _finding_index: id -> list position, so a
+        # re-link is O(1) instead of a linear scan per insert (an
+        # import of one big findings.json was quadratic, and it runs
+        # under the cross-process coverage_store_lock at every run
+        # completion — one large or hostile findings.json stalled
+        # every sibling run's snapshot). _line_index: sorted finding
+        # lines (all / retained) per file, so function_verdict is a
+        # bisect instead of a full findings scan per inventory
+        # function per render.
+        self._finding_index: dict[str, dict[str, int]] = {}
+        self._line_index: dict[str, tuple[list[int], list[int]]] = {}
+        # Set when an EXISTING store exceeded the read budget at
+        # construction: this instance then holds an empty view of a
+        # durable union that is still on disk, and save() refuses (a
+        # small save from a degraded instance would atomically replace
+        # the whole union — the exact silent-destruction direction the
+        # write budget exists to prevent).
+        self._load_degraded_over_budget = False
+        if self.path.exists():
+            # A corrupt / unreadable store must not crash every coverage
+            # consumer — degrade to empty (the store is largely reconstructible
+            # via backfill from per-run records). A successfully-parsed payload
+            # is normalised tolerantly (see schema.py) so a single malformed
+            # entry doesn't poison queries.
+            #
+            # Bounded load: the store can arrive via /project import,
+            # so the st_size gate (before any read) keeps an oversize
+            # coverage.json from being buffered — it degrades to the
+            # same warn-and-start-empty path as a corrupt one
+            # (load_json strict raises ValueError on oversize).
+            from core.json.utils import load_json
+            over_budget_size: int | None = None
+            try:
+                size = self.path.stat().st_size
+                if size > _MAX_STORE_BYTES:
+                    over_budget_size = size
+            except OSError:
+                pass
+            if over_budget_size is not None:
+                # Over-budget is NOT the corrupt-store case: the
+                # durable union on disk is (presumably) intact, just
+                # bigger than the reader admits. Degrading silently
+                # here made every consumer see empty coverage AND left
+                # this instance one save() away from replacing the
+                # union — say exactly what happened and name the
+                # remedy.
+                self._load_degraded_over_budget = True
+                _get_logger(__name__).error(
+                    "coverage store %s is %d bytes — over the %d-byte "
+                    "read budget. This process sees EMPTY coverage "
+                    "(function verdicts, found_then_lost re-review "
+                    "flags, and tool coverage are all invisible) and "
+                    "this store instance REFUSES to save. Compact it "
+                    "first: libexec/raptor-audit coverage compact %s",
+                    self.path, over_budget_size, _MAX_STORE_BYTES,
+                    self.path)
+                data: dict[str, Any] = {}
+            else:
+                try:
+                    data = load_json(  # type: ignore[assignment]
+                        self.path, strict=True, max_bytes=_MAX_STORE_BYTES,
+                    )
+                except (ValueError, OSError, RecursionError) as exc:
+                    # RecursionError: Python <= 3.13's stdlib parser is
+                    # recursive — a nesting-bomb coverage.json (orjson
+                    # absent) must degrade to empty like any other corrupt
+                    # store, per the contract above.
+                    _get_logger(__name__).warning(
+                        "coverage store %s: unreadable (%s); starting empty",
+                        self.path, exc)
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            self.version = data.get("version", SCHEMA_VERSION)
+            check_version(self.version, SCHEMA_VERSION, str(self.path))
+            # Stored target wins when present; the constructor-supplied
+            # target covers new stores and existing stores whose
+            # persisted target is missing or empty.
+            self.target = data.get("target") or target
+            self.content_id = data.get("content_id")
+            self._files = normalise_loaded_files(
+                data.get("files", {}) or {}, str(self.path))
+
+    # --- mutation ---------------------------------------------------------
+
+    def _entry(self, file: str) -> dict[str, Any]:
+        return self._files.setdefault(
+            file,
+            {
+                "total_lines": None, "sloc": None,
+                "tools": {}, "findings": [], "provenance": {},
+            },
+        )
+
+    def mark(self, file: str, start: int, end: int, tool: str) -> int:
+        """Record that ``tool`` examined lines ``[start, end]`` of ``file``.
+
+        Returns the number of *newly* covered lines for that tool (the
+        delta) -- 0 means the range was already fully covered by it.
+
+        Intake chokepoint: every coverage producer (importer lanes,
+        operator ``--mark``, runtime collectors) funnels through here,
+        and several of them relay values straight out of run-dir JSON.
+        Non-int bounds / non-str keys are refused with a warning
+        (returning 0) rather than stored — a forged ``"42"`` bound
+        detonated later in interval arithmetic at every query, and a
+        non-string file/tool key broke the sorted() walks over the
+        store. Genuine-int normalisation matches schema.py's load-side
+        validation, so nothing this method accepts is dropped on the
+        next load.
+        """
+        start_i, end_i = _opt_int(start), _opt_int(end)
+        if start_i is None or end_i is None \
+                or not isinstance(file, str) or not isinstance(tool, str):
+            _get_logger(__name__).warning(
+                "coverage store: refusing mark with malformed "
+                "file/tool/bounds (%s, %r-%r, %s)",
+                type(file).__name__, start, end, type(tool).__name__)
+            return 0
+        start, end = start_i, end_i
+        if start > end:
+            start, end = end, start
+        entry = self._entry(file)
+        existing = entry["tools"].get(tool, [])
+        newly = (end - start + 1) - _cov_overlap(existing, start, end)
+        width = end - start + 1
+        if isinstance(existing, set):
+            if len(existing) + width > _BITMAP_MAX_LINES:
+                # Address-magnitude / forged span: expanding it into
+                # the set would materialise one int per value. Demote
+                # the contribution back to intervals instead.
+                entry["tools"][tool] = _coalesce(
+                    _set_to_intervals(existing) + [[start, end]])
+            else:
+                existing.update(range(start, end + 1))   # already a bitmap
+        else:
+            merged = _coalesce(existing + [[start, end]])
+            if (len(merged) > _BITMAP_THRESHOLD
+                    and _covered_count(merged) <= _BITMAP_MAX_LINES):
+                # Sparse/heavy contribution — switch to a line set so further
+                # marks don't keep re-coalescing a long list. Gated on the
+                # covered-line COUNT as well as the interval count: the
+                # set costs memory per covered VALUE, so wide (address-
+                # space, forged) spans must stay intervals however many
+                # fragments they arrive in.
+                bits: set = set()
+                for lo, hi in merged:
+                    bits.update(range(lo, hi + 1))
+                entry["tools"][tool] = bits
+            else:
+                entry["tools"][tool] = merged
+        return newly
+
+    def set_file_meta(
+        self, file: str, total_lines: int | None = None, sloc: int | None = None,
+    ) -> None:
+        """Record line counts (from the inventory) so coverage % is defined.
+
+        Genuine ints only (same normalisation as the load side): a
+        forged ``"lines": "100"`` stored here crashed the coverage-%
+        division at every render.
+        """
+        if not isinstance(file, str):
+            return
+        entry = self._entry(file)
+        if _is_int(total_lines):
+            entry["total_lines"] = total_lines
+        if _is_int(sloc):
+            entry["sloc"] = sloc
+
+    def link_finding(
+        self,
+        file: str,
+        finding_id: str,
+        line: int | None = None,
+        retained: bool = True,
+    ) -> None:
+        """Link a finding to a file.
+
+        ``line`` (when known) lets the finding be attributed to a function
+        for verdict computation. ``retained`` is whether the finding's
+        bulky detail is still on disk; ``/project clean`` flips it to
+        ``False`` when it deletes the only run that held the detail, which
+        turns the function's verdict into ``found_then_lost``. Dedup by id;
+        a later call refreshes ``line``/``retained``.
+
+        ``line`` is normalised to a genuine int (``_opt_int``, the same
+        rule the load side applies) — findings.json is LLM-written
+        inside the sandbox write grant, and a forged ``"line": "42"``
+        linked here crashed ``function_verdict``'s range compare at
+        every subsequent render. A finding with an unusable line keeps
+        its file-level link (never dropped), it just cannot be
+        attributed to a function.
+        """
+        if not isinstance(file, str):
+            return
+        line = _opt_int(line)
+        finding_id = str(finding_id)
+        entry = self._entry(file)
+        # O(1) dedup via the per-file id index (built lazily from the
+        # loaded list). Invariant: this method is the ONLY mutator of
+        # entry["findings"] after load — readers (_findings,
+        # finding_ids, summaries) never mutate — so an existing index
+        # stays in sync through appends here. first-occurrence
+        # setdefault preserves the pre-index update semantics for
+        # legacy stores carrying duplicate ids.
+        index = self._finding_index.get(file)
+        if index is None:
+            index = {}
+            for i, f in enumerate(entry["findings"]):
+                index.setdefault(f["id"], i)
+            self._finding_index[file] = index
+        pos = index.get(finding_id)
+        self._line_index.pop(file, None)   # lines/retained may change
+        if pos is not None:
+            f = entry["findings"][pos]
+            if line is not None:
+                f["line"] = line
+            f["retained"] = retained
+            return
+        index[finding_id] = len(entry["findings"])
+        entry["findings"].append(
+            {"id": finding_id, "line": line, "retained": retained}
+        )
+
+    def stamp_coverage(self, file: str, tool: str, **provenance: Any) -> None:
+        """Attach provenance (engine version / resolved model / timestamp /
+        acquisition target / framework_sha / run) to a ``(file, tool)``
+        contribution — the who/what-version/when that makes a durable
+        coverage entry self-substantiating. Read from the run manifest at
+        import time. Latest stamp wins (a re-examination refreshes it);
+        ``None`` values are dropped so they don't clobber a known value."""
+        entry = self._entry(file)
+        slot = entry["provenance"].setdefault(tool, {})
+        slot.update({k: v for k, v in provenance.items() if v is not None})
+
+    # --- queries (file/line level; inventory-join queries come next step) -
+
+    def tool_provenance(self, file: str, tool: str) -> dict[str, Any]:
+        """The provenance stamp for a ``(file, tool)`` contribution, or ``{}``."""
+        entry = self._files.get(file)
+        if not entry:
+            return {}
+        return dict(entry.get("provenance", {}).get(tool, {}))
+
+    def provenance_summary(self) -> dict[str, Any]:
+        """Aggregate provenance across the store for reporting: distinct engine
+        versions per tool, distinct resolved models, and the newest run
+        timestamp seen. ``{}``-ish when nothing is stamped."""
+        tools: dict[str, set] = {}
+        models: set = set()
+        newest: str | None = None
+        for entry in self._files.values():
+            for tool, p in entry.get("provenance", {}).items():
+                versions = tools.setdefault(tool, set())
+                if p.get("version"):
+                    versions.add(p["version"])
+                for m in p.get("models") or []:
+                    models.add(m)
+                ts = p.get("timestamp")
+                if ts and (newest is None or ts > newest):
+                    newest = ts
+        return {
+            "tools": {t: sorted(vs) for t, vs in sorted(tools.items())},
+            "models": sorted(models),
+            "newest": newest,
+        }
+
+    def who_checked(self, file: str, line: int) -> list[str]:
+        """Tool labels whose intervals cover ``line`` of ``file``."""
+        entry = self._files.get(file)
+        if not entry:
+            return []
+        return sorted(
+            tool for tool, value in entry["tools"].items()
+            if _cov_covers_line(value, line)
+        )
+
+    def covered_lines(self, file: str) -> list[Interval]:
+        """Union of all tools' intervals for ``file`` (coalesced)."""
+        entry = self._files.get(file)
+        if not entry:
+            return []
+        return _coalesce(
+            [iv for value in entry["tools"].values()
+             for iv in _cov_to_intervals(value)]
+        )
+
+    def file_coverage(self, file: str) -> float:
+        """Percent of ``file``'s lines covered by at least one tool.
+
+        Returns 0.0 when the file is unknown or its ``total_lines`` has
+        not been set from the inventory yet.
+        """
+        entry = self._files.get(file)
+        if not entry or not entry.get("total_lines"):
+            return 0.0
+        return _covered_count(self.covered_lines(file)) / entry["total_lines"] * 100.0
+
+    def finding_ids(self, file: str) -> list[str]:
+        entry = self._files.get(file)
+        return [f["id"] for f in entry["findings"]] if entry else []
+
+    def _findings(self, file: str) -> list[dict[str, Any]]:
+        entry = self._files.get(file)
+        return entry["findings"] if entry else []
+
+    def _finding_lines(self, file: str) -> tuple[list[int], list[int]]:
+        """Sorted finding lines for ``file``: ``(all, retained)``.
+
+        Built lazily per file and invalidated by link_finding, so a
+        render's per-inventory-function verdict walk is a bisect per
+        query instead of a scan of every finding in the file per
+        function (quadratic on finding-heavy files). The int guard
+        mirrors link_finding's intake normalisation for stores
+        written before it existed.
+        """
+        cached = self._line_index.get(file)
+        if cached is None:
+            all_lines: list[int] = []
+            retained_lines: list[int] = []
+            for f in self._findings(file):
+                ln = f.get("line")
+                # Inline _is_int (bool is an int subclass) — spelled
+                # with isinstance so the type checker narrows too.
+                if not isinstance(ln, int) or isinstance(ln, bool):
+                    continue
+                all_lines.append(ln)
+                if f.get("retained", True):
+                    retained_lines.append(ln)
+            all_lines.sort()
+            retained_lines.sort()
+            cached = (all_lines, retained_lines)
+            self._line_index[file] = cached
+        return cached
+
+    def files(self) -> list[str]:
+        return sorted(self._files)
+
+    # --- inventory-join queries (function level) --------------------------
+
+    def tool_coverage_of_range(
+        self, file: str, lo: int, hi: int,
+    ) -> dict[str, int]:
+        """``{tool: covered_line_count}`` over ``[lo, hi]`` (only tools that
+        cover at least one line)."""
+        entry = self._files.get(file)
+        if not entry:
+            return {}
+        out: dict[str, int] = {}
+        for tool, value in entry["tools"].items():
+            n = _cov_overlap(value, lo, hi)
+            if n:
+                out[tool] = n
+        return out
+
+    def who_checked_function(
+        self, file: str, lo: int, hi: int,
+    ) -> dict[str, str]:
+        """``{tool: 'full' | 'partial (N%)'}`` for a function's line range."""
+        total = hi - lo + 1
+        if total <= 0:                       # malformed range (hi < lo)
+            return {}
+        out: dict[str, str] = {}
+        for tool, n in self.tool_coverage_of_range(file, lo, hi).items():
+            out[tool] = "full" if n >= total else f"partial ({n / total * 100:.0f}%)"
+        return out
+
+    def function_covered(
+        self, file: str, lo: int, hi: int, category: str | None = None,
+    ) -> bool:
+        """True if any tool covers a line of ``[lo, hi]``. When ``category``
+        is given, only tools of that category count (e.g. ``"llm"`` -> has
+        any LLM examined this function?)."""
+        for tool in self.tool_coverage_of_range(file, lo, hi):
+            if category is None or category_of(tool) == category:
+                return True
+        return False
+
+    def unchecked_functions(
+        self, checklist: dict[str, Any], category: str | None = None,
+    ) -> list[tuple[str, str, int]]:
+        """Inventory functions with no coverage (the gap). When ``category``
+        is given, functions with no coverage *by that category*. Returns
+        ``[(file, name, line_start)]``.
+
+        The check is category-only, NOT depth-aware: any llm-category
+        mark — including a whole-file read/understand mark, which is
+        scanned-depth — clears a function from ``category="llm"``.
+        This is therefore a coarser view than the review gap /audit
+        fills (read is not reviewed); depth-aware consumers use the
+        store-view's ``llm_gap_functions`` (store_summary), which
+        joins depth through the registry."""
+        gaps: list[tuple[str, str, int]] = []
+        for file, name, lo, hi, _kind in iter_inventory_functions(checklist):
+            # No line_end -> probe the single declaration line.
+            high = hi if hi is not None else lo
+            if not self.function_covered(file, lo, high, category):
+                gaps.append((file, name, lo))
+        return gaps
+
+    def import_inventory_meta(self, checklist: dict[str, Any]) -> None:
+        """Populate per-file ``total_lines`` / ``sloc`` from the inventory so
+        :meth:`file_coverage` is defined."""
+        for fe in iter_file_entries(checklist):
+            path = fe.get("path")
+            if path and isinstance(path, str):
+                self.set_file_meta(path, fe.get("lines"), fe.get("sloc"))
+
+    def set_content_id(self, checklist: dict[str, Any]) -> str | None:
+        """Set the store's content-equivalence id from the inventory (see
+        :func:`content_identity`). Two acquisitions of identical source —
+        a git checkout and a zip — get the same id, so coverage is recognised
+        as being for the same target regardless of how it was acquired."""
+        cid = content_identity(checklist)
+        if cid is not None:
+            self.content_id = cid
+        return self.content_id
+
+    # --- verdict-bearing coverage (the three states) ----------------------
+
+    def function_verdict(self, file: str, lo: int, hi: int) -> str:
+        """One of: ``unexamined`` / ``clean`` / ``open`` / ``found_then_lost``.
+
+        - open:            a finding lands in it and its detail is retained.
+        - found_then_lost: a finding landed in it but its detail was deleted
+                           (the run that held it was cleaned). Kept as a fact;
+                           does NOT count as covered -- it's a re-review gap.
+        - clean:           examined (a tool covered it), no finding lands in it.
+        - unexamined:      no finding and no tool examined the range.
+
+        Findings are checked FIRST: a finding *is* examination evidence (a tool
+        flagged this code), so a function with a finding is never ``unexamined``
+        even if no whole-file coverage record happens to cover its line. The
+        safe direction — surface the finding rather than bury it as a gap.
+
+        Findings linked without a ``line`` can't be attributed to a function,
+        so they don't affect a function verdict (they remain a file-level
+        signal via ``finding_ids``).
+        """
+        lo_i, hi_i = _opt_int(lo), _opt_int(hi)
+        if lo_i is None or hi_i is None:
+            # Unattributable range (a hostile checklist reached a
+            # caller that skipped normalisation): the safe direction
+            # is the re-review gap, never a crash or a clean verdict.
+            return "unexamined"
+        lo, hi = lo_i, hi_i
+        all_lines, retained_lines = self._finding_lines(file)
+
+        def _any_in(lines: list[int]) -> bool:
+            i = bisect.bisect_left(lines, lo)
+            return i < len(lines) and lines[i] <= hi
+
+        if _any_in(all_lines):
+            if _any_in(retained_lines):
+                return "open"
+            return "found_then_lost"
+        if not self.tool_coverage_of_range(file, lo, hi):
+            return "unexamined"
+        return "clean"
+
+    def function_verdicts(
+        self, checklist: dict[str, Any],
+    ) -> list[tuple[str, str, int, str]]:
+        """``(file, name, line_start, verdict)`` for every inventory function."""
+        out: list[tuple[str, str, int, str]] = []
+        for file, name, lo, hi, _kind in iter_inventory_functions(checklist):
+            high = hi if hi is not None else lo
+            out.append((file, name, lo, self.function_verdict(file, lo, high)))
+        return out
+
+    def review_gap(
+        self, checklist: dict[str, Any],
+    ) -> list[tuple[str, str, int, str]]:
+        """Functions needing (re-)review: ``unexamined`` or ``found_then_lost``.
+
+        Returns ``(file, name, line_start, verdict)``. ``found_then_lost`` is
+        the case where a previously-found finding's detail was discarded --
+        surfaced here so it's re-examined rather than silently skipped.
+        """
+        return [
+            row for row in self.function_verdicts(checklist)
+            if row[3] in ("unexamined", "found_then_lost")
+        ]
+
+    # --- persistence ------------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        # Normalise any in-memory line-set ("bitmap") back to intervals so the
+        # on-disk form is always intervals (stable schema; JSON-serialisable;
+        # validated by schema.py). Does not mutate the live store.
+        files_out: dict[str, Any] = {}
+        for path, entry in self._files.items():
+            tools = entry.get("tools", {})
+            if any(isinstance(v, set) for v in tools.values()):
+                entry = dict(entry)
+                entry["tools"] = {
+                    t: _cov_to_intervals(v) for t, v in tools.items()
+                }
+            files_out[path] = entry
+        return {
+            "version": self.version,
+            "generated_at": _now_iso(),
+            "target": self.target,
+            "content_id": self.content_id,
+            "files": files_out,
+        }
+
+    def save(self) -> Path:
+        """Atomically write ``coverage.json``, bounded by the read
+        budget.
+
+        Atomic write: coverage.json is a merged per-run artefact that
+        downstream tools (gap analysis, diff between runs, project
+        report) load as canonical. A torn write on interrupt would
+        leave malformed JSON that fails to parse and blocks every
+        subsequent read.
+
+        Write budget (the journal index's IndexWriteOverBudget twin):
+        the constructor degrades an over-``_MAX_STORE_BYTES`` store to
+        EMPTY, so writing past the cap silently destroyed the durable
+        coverage union — the layer that survives /project clean,
+        including found_then_lost re-review flags — on the next load.
+        Hostile run-dir findings/records can inflate the in-memory
+        store (link_finding grows one entry per distinct id) until one
+        oversized save erases everything; refusing the write keeps the
+        on-disk store readable and the loss visible instead of silent.
+        """
+        if self._load_degraded_over_budget:
+            # Refusing cuts both ways: this instance keeps whatever
+            # marks callers added after construction unpersisted (they
+            # re-derive from per-run records on the next healthy
+            # load); saving instead would atomically replace the
+            # whole on-disk union with this instance's near-empty
+            # view. The union is the durable layer — refuse.
+            raise StoreWriteOverBudget(
+                f"coverage store at {self.path} exceeded the "
+                f"{_MAX_STORE_BYTES}-byte read budget at load and "
+                "this instance degraded to empty — saving would "
+                "replace the durable coverage union with it. Compact "
+                "the store first: libexec/raptor-audit coverage "
+                f"compact {self.path}"
+            )
+        # Compact serialisation (indent=None): the store is a
+        # byte-budgeted artifact, and the indented form spends the
+        # read budget on whitespace (measured ~1.5-2x on list-heavy
+        # documents). Trade-off, both directions: compact halves the
+        # on-disk size a project accumulates before hitting the
+        # budget; indented is directly human-readable — but the store
+        # is machine-merged state inspected via jq/summary tooling,
+        # not hand-edited, so budget headroom wins.
+        content = dumps_artifact(
+            self.to_dict(), indent=None, sort_keys=True) + "\n"
+        size = len(content.encode("utf-8"))
+        if size > _MAX_STORE_BYTES:
+            raise StoreWriteOverBudget(
+                f"coverage store at {self.path} would serialize to "
+                f"{size} bytes (over the {_MAX_STORE_BYTES} byte read "
+                "budget) — refusing to write a store its own reader "
+                "must degrade to empty; compact the on-disk store "
+                "with libexec/raptor-audit coverage compact "
+                f"{self.path} and re-run"
+            )
+        write_text_atomically(self.path, content,
+                              tmp_prefix=".~savejson-")
+        return self.path
+
+
+# ── On-disk compaction ───────────────────────────────────────────────
+
+#: Elevated read bound for the operator-invoked compaction path ONLY:
+#: it exists to read stores the normal budget refuses (RAPTOR's own
+#: merged artifact, opened deliberately by the operator to shrink it),
+#: while still bounding a hostile plant. 4x the read budget covers the
+#: worst indented-vs-compact inflation with margin.
+_COMPACT_READ_MAX_BYTES = 4 * _MAX_STORE_BYTES
+
+
+def _store_backup_path(path: Path) -> Path:
+    """First free ``.pre-compact`` sibling — an existing backup is
+    never overwritten."""
+    base = path.with_name(path.name + ".pre-compact")
+    if not os.path.lexists(base):
+        return base
+    n = 2
+    while True:
+        candidate = base.with_name(f"{base.name}.{n}")
+        if not os.path.lexists(candidate):
+            return candidate
+        n += 1
+
+
+@dataclass(frozen=True)
+class StoreCompactStats:
+    """Exact accounting, including the backup actually created (if any)."""
+
+    bytes_before: int
+    bytes_after: int
+    backup: Path | None = None
+
+
+def compact_store_file(path: Path) -> tuple[int, int]:
+    """Compact a coverage store; return its before/after byte counts.
+
+    Unchanged stores retain their inode and create no backup. Rewrites
+    preserve the original at the first free ``.pre-compact`` sibling.
+    See :func:`compact_store_file_disclosed` for the actual backup path.
+    """
+    stats = compact_store_file_disclosed(path)
+    return stats.bytes_before, stats.bytes_after
+
+
+def compact_store_file_disclosed(path: Path) -> StoreCompactStats:
+    """Normalise under the writers' lock, bounded to the remedial budget.
+
+    A required lock refuses unsafe unlocked compaction. Source version
+    checks also detect non-cooperating edits before backup/publication.
+    The source must itself be regular, never a final-component symlink.
+    """
+    from core.json.bounded import loads_bounded
+    from core.source.gated import read_bytes_gated
+
+    p = Path(path)
+    if not p.parent.is_dir():
+        raise ValueError(f"no coverage store at {p}")
+    lock = p.with_suffix(p.suffix + ".lock")
+    with sidecar_flock(lock, subject="coverage store compaction",
+                       create_parent=False, required=True):
+        try:
+            original = p.lstat()
+        except OSError as exc:
+            raise ValueError(f"no coverage store at {p}: {exc}") from exc
+        raw = read_bytes_gated(p, _COMPACT_READ_MAX_BYTES, follow_symlinks=False)
+        version_before = _store_file_version(original)
+        _check_store_version(p, version_before)
+        data = loads_bounded(raw.decode("utf-8-sig"),
+                             max_bytes=_COMPACT_READ_MAX_BYTES)
+        if not isinstance(data, dict):
+            raise ValueError(f"coverage store at {p} is not a JSON object")
+        version = data.get("version", SCHEMA_VERSION)
+        check_version(version, SCHEMA_VERSION, str(p))
+        out = {
+            "version": version,
+            # Storage maintenance does not generate new coverage.
+            "generated_at": data.get("generated_at") or _now_iso(),
+            "target": data.get("target"),
+            "content_id": data.get("content_id"),
+            "files": normalise_loaded_files(data.get("files", {}) or {}, str(p)),
+        }
+        content = dumps_artifact(out, indent=None, sort_keys=True) + "\n"
+        after = len(content.encode("utf-8"))
+        if after > _MAX_STORE_BYTES:
+            raise StoreWriteOverBudget(
+                f"coverage store at {p} still serialises to {after} bytes "
+                f"compacted (over the {_MAX_STORE_BYTES}-byte read budget) "
+                "— the durable union genuinely outgrew the budget. File "
+                "left untouched; shrink the project's runs, then delete "
+                "the store and let the per-run-record backfill rebuild it."
+            )
+        _check_store_version(p, version_before)
+        before = len(raw)
+        if raw == content.encode("utf-8"):
+            return StoreCompactStats(before, after)
+        backup = _store_backup_path(p)
+        os.link(p, backup, follow_symlinks=False)
+        linked = None
+        try:
+            # Linking changes ctime, but must not change identity, size,
+            # or mtime. Both names must still denote the same version.
+            linked = _store_file_version(backup.lstat())
+            if linked[:4] != version_before[:4]:
+                raise ValueError(f"coverage store at {p} changed during backup")
+            _check_store_version(p, linked)
+            write_text_atomically(p, content, tmp_prefix=".~savejson-")
+        except BaseException:
+            # A failed publication needs no extra full-size backup when
+            # both names still denote the intact original. Otherwise keep
+            # the recovery copy; never remove the sole remaining version.
+            try:
+                if (linked is not None
+                        and _store_file_version(p.lstat()) == linked
+                        and _store_file_version(backup.lstat()) == linked):
+                    backup.unlink()
+            except OSError:
+                _get_logger(__name__).warning(
+                    "Could not clean compaction backup %s; retained for recovery",
+                    backup, exc_info=True,
+                )
+            raise
+        return StoreCompactStats(before, after, backup)
+
+
+def _store_file_version(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def _check_store_version(path: Path, expected: tuple[int, int, int, int, int]) -> None:
+    try:
+        actual = _store_file_version(path.lstat())
+    except OSError as exc:
+        raise ValueError(f"coverage store at {path} changed during compaction") from exc
+    if actual != expected:
+        raise ValueError(f"coverage store at {path} changed during compaction")

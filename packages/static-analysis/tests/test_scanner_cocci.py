@@ -27,8 +27,9 @@ import pytest
 #   [2] packages/
 #   [3] <repo root>
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+if __name__ == "__main__":
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
 # packages/static-analysis has a hyphen — load via importlib.
 _SCANNER_PATH = Path(_REPO_ROOT) / "packages/static-analysis/scanner.py"
@@ -75,6 +76,69 @@ def test_repo_has_c_cpp_source_bounded_scan(tmp_path):
     ) is False
 
 
+def test_repo_has_c_cpp_source_git_objects_do_not_exhaust_cap(tmp_path):
+    """A populated ``.git`` must not consume the probe budget: 300
+    loose objects walked before one deep real source file previously
+    exhausted the 200-file cap and reported a kernel-style C repo as
+    non-C — silently disabling cocci (default-on), compiler-scan and
+    expanded-semgrep."""
+    objects = tmp_path / ".git" / "objects" / "aa"
+    objects.mkdir(parents=True)
+    for i in range(300):
+        (objects / f"{i:040d}").write_bytes(b"x")
+    deep = tmp_path / "drivers" / "net" / "wireless" / "ath"
+    deep.mkdir(parents=True)
+    (deep / "main.c").write_text("int main(void){return 0;}\n")
+    assert _scanner._repo_has_c_cpp_source(tmp_path) is True
+
+
+def test_repo_has_c_cpp_source_vendored_noise_pruned(tmp_path):
+    """Vendored/build noise dirs are pruned and never consume the
+    budget (same discipline as the hunt dispatcher's sibling)."""
+    vendored = tmp_path / "node_modules" / "dep"
+    vendored.mkdir(parents=True)
+    for i in range(250):
+        (vendored / f"m{i}.js").write_text("\n")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main(void){return 0;}\n")
+    assert _scanner._repo_has_c_cpp_source(tmp_path) is True
+
+
+def test_c_cpp_probe_distinguishes_exhaustion_from_no_source(tmp_path):
+    """The tri-state probe: a completed walk with no C source is an
+    honest negative; a budget-exhausted walk is UNDECIDED and must be
+    distinguishable so consumers can be loud about the coverage gap."""
+    for i in range(5):
+        (tmp_path / f"f{i}.py").write_text("\n")
+    assert _scanner._c_cpp_source_probe(tmp_path) == (False, False)
+    for i in range(250):
+        (tmp_path / f"g{i}.txt").write_text("\n")
+    assert _scanner._c_cpp_source_probe(tmp_path) == (False, True)
+
+
+def test_stage_skip_on_probe_exhaustion_is_loud(tmp_path, capsys):
+    """When a stage skips because the probe ran out of budget rather
+    than because the walk proved the repo non-C, the skip must reach
+    the operator on stderr as a gap record — not a debug line."""
+    for i in range(250):
+        (tmp_path / f"g{i}.txt").write_text("\n")
+    out = _scanner.run_compiler_scan_stage(tmp_path, tmp_path)
+    assert out == []
+    err = capsys.readouterr().err
+    assert "compiler-scan" in err
+    assert "probe budget exhausted" in err
+
+
+def test_stage_skip_on_honest_negative_stays_quiet(tmp_path, capsys):
+    """A completed walk that found no C source keeps the historical
+    quiet skip — a Python repo is not a coverage gap."""
+    (tmp_path / "only.py").write_text("\n")
+    out = _scanner.run_compiler_scan_stage(tmp_path, tmp_path)
+    assert out == []
+    assert "probe budget exhausted" not in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------
 # Shipped rules discovery
 # ---------------------------------------------------------------------
@@ -109,7 +173,8 @@ def test_run_cocci_skips_when_spatch_missing(tmp_path):
     """spatch off PATH → returns [] without crash. Every consumer
     treats [] as "no SARIF added"."""
     (tmp_path / "x.c").write_text("\n")
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
     with patch(
         "packages.coccinelle.runner.is_available", return_value=False,
     ):
@@ -120,7 +185,8 @@ def test_run_cocci_skips_when_spatch_missing(tmp_path):
 def test_run_cocci_skips_when_no_c_source(tmp_path):
     """Python-only target → skipped silently (cocci is C-only)."""
     (tmp_path / "main.py").write_text("\n")
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
     with patch(
         "packages.coccinelle.runner.is_available", return_value=True,
     ):
@@ -132,7 +198,8 @@ def test_run_cocci_skips_when_no_shipped_rules_dir(tmp_path):
     """No shipped rules → skipped silently (minimal install /
     packaging strip). Don't error; let other tools provide signal."""
     (tmp_path / "x.c").write_text("\n")
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
     with patch(
         "packages.coccinelle.runner.is_available", return_value=True,
     ), patch.object(_scanner, "_shipped_cocci_rules_dir",
@@ -146,14 +213,17 @@ def test_run_cocci_skips_when_no_shipped_rules_dir(tmp_path):
 # ---------------------------------------------------------------------
 
 
-def test_run_cocci_writes_sarif_with_matches(tmp_path):
+@pytest.mark.parametrize("coverage_write_fails", [False, True])
+def test_run_cocci_writes_sarif_with_matches(tmp_path, monkeypatch, coverage_write_fails):
     """Mocked ``spatch_run_rules`` returns synthetic results;
     ``run_cocci`` must emit a valid SARIF at out_dir/cocci.sarif
     containing the rule + match."""
     (tmp_path / "x.c").write_text("\n")
-    rules_dir = tmp_path / "rules"; rules_dir.mkdir()
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
     (rules_dir / "stub.cocci").write_text("@r@\n@@\n@@\n")
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
 
     from packages.coccinelle.models import SpatchMatch, SpatchResult
     fake_results = [SpatchResult(
@@ -161,13 +231,21 @@ def test_run_cocci_writes_sarif_with_matches(tmp_path):
         matches=[SpatchMatch(file="x.c", line=1, message="found")],
     )]
 
+    if coverage_write_fails:
+        def fail_write(*args, **kwargs):
+            raise OSError('planted coverage write failure')
+        monkeypatch.setattr('core.coverage.record.write_record', fail_write)
     with patch(
         "packages.coccinelle.runner.is_available", return_value=True,
     ), patch(
         "packages.coccinelle.runner.run_rules", return_value=fake_results,
     ):
-        sarifs = _scanner.run_cocci(tmp_path, out, rules_dir=rules_dir)
+        coverage = []
+        sarifs = _scanner.run_cocci(tmp_path, out, rules_dir=rules_dir, on_coverage=coverage.append)
 
+    assert len(coverage) == 1
+    assert coverage[0]['tool'] == 'coccinelle'
+    assert coverage[0]['rules_applied'] == ['stub']
     assert len(sarifs) == 1
     sarif_path = Path(sarifs[0])
     assert sarif_path.name == "cocci.sarif"
@@ -184,9 +262,11 @@ def test_run_cocci_emits_sarif_even_when_no_matches(tmp_path):
     rule definitions in the driver, empty results list). Operators
     see what rules ran in the combined output."""
     (tmp_path / "x.c").write_text("\n")
-    rules_dir = tmp_path / "rules"; rules_dir.mkdir()
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
     (rules_dir / "stub.cocci").write_text("@r@\n@@\n@@\n")
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
 
     from packages.coccinelle.models import SpatchResult
     with patch(
@@ -214,12 +294,14 @@ def test_run_cocci_emits_sarif_even_when_no_matches(tmp_path):
     not shutil.which("spatch"),
     reason="spatch not installed — skip real-spatch E2E",
 )
+@pytest.mark.slow  # genuine cost: full analyze()/spatch E2E through the sandbox exceeds the 10s default-tier budget; logic-level coverage stays default-tier
 def test_e2e_real_spatch_finds_missing_null_check(tmp_path):
     """End-to-end: real spatch executes the shipped
     ``missing_null_check`` rule against a tiny C fixture, the
     scanner emits SARIF, and the SARIF carries the expected match.
     Pin against the shipped rule corpus so corpus drift surfaces here."""
-    src_dir = tmp_path / "src"; src_dir.mkdir()
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
     # Classic missing-NULL-check pattern — malloc result dereferenced
     # without IS_ERR/NULL check.
     (src_dir / "vuln.c").write_text(
@@ -229,7 +311,8 @@ def test_e2e_real_spatch_finds_missing_null_check(tmp_path):
         "    *p = 42;\n"
         "}\n"
     )
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
 
     sarifs = _scanner.run_cocci(tmp_path, out)
     assert sarifs, "expected SARIF emission against shipped rules"

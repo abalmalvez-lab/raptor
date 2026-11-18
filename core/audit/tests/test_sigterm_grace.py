@@ -1,0 +1,384 @@
+"""SIGTERM grace: handler semantics (unit) + stubbed-loop drain (E2E).
+
+Unit tests drive the handler functions directly with module state
+reset around each; the E2E half SIGTERMs a child process running the
+real orchestrator loop with a stub review_fn and asserts the graceful
+drain: prompt exit 130, harvested in-flight completion, flushed
+ledgers/journal, salvage exports on disk.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from contextlib import ExitStack
+from pathlib import Path
+
+import pytest
+
+import core.audit.orchestrator as orch
+from core.audit.orchestrator import OrchestratorConfig, OrchestratorResult
+from core.testing.processes import reap_on_exit
+from core.testing.threads import retiring_threads
+from core.testing.standalone_cli import run_standalone_cli, standalone_cli_env
+
+_RAPTOR_DIR = Path(__file__).resolve().parents[3]
+_CHECKLIST_CLI = str(_RAPTOR_DIR / "libexec" / "raptor-build-checklist")
+
+
+@pytest.fixture(autouse=True)
+def _reset_term_state():
+    """Own shutdown state and keep incidental OS/thread mocks local."""
+    from core.testing.audit_shutdown import isolated_audit_shutdown
+
+    with isolated_audit_shutdown(orch):
+        yield
+
+
+class TestCheckBudgetSigterm:
+
+    def test_sigterm_rides_budget_rails(self, tmp_path):
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+        result = OrchestratorResult()
+        assert orch._check_budget(config, time.monotonic(), result) is False
+        orch._sigterm_event.set()
+        assert orch._check_budget(config, time.monotonic(), result) is True
+        assert result.terminated_by == "sigterm"
+
+
+class TestInstallSigtermGrace:
+
+    def test_installs_once_main_thread(self, monkeypatch):
+        calls = []
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        monkeypatch.setattr(
+            "signal.signal", lambda sig, h: calls.append((sig, h)),
+        )
+        assert orch.install_sigterm_grace() is True
+        assert calls and calls[0][0] == signal.SIGTERM
+        # Second call: already installed, no re-registration.
+        assert orch.install_sigterm_grace() is True
+        assert len(calls) == 1
+
+    def test_worker_thread_refuses(self, monkeypatch):
+        import threading
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        results = []
+        t = threading.Thread(
+            target=lambda: results.append(orch.install_sigterm_grace()),
+        )
+        with retiring_threads((t,), release=lambda: None, timeout=5):
+            t.start()
+            t.join()
+        assert results == [False]
+
+    def test_registration_failure_degrades(self, monkeypatch):
+        def _boom(sig, h):
+            raise ValueError("not in main thread")
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        monkeypatch.setattr("signal.signal", _boom)
+        assert orch.install_sigterm_grace() is False
+
+    def test_install_uninstall_roundtrip_restores_disposition(
+            self, monkeypatch):
+        """The handler is process-wide state: a REAL install must be
+        reversible, or it leaks past the installing test and every
+        later fork child in this process inherits salvage semantics
+        instead of dying on TERM."""
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        prev = signal.getsignal(signal.SIGTERM)
+        assert prev is not orch._handle_sigterm
+        assert orch.install_sigterm_grace() is True
+        assert signal.getsignal(signal.SIGTERM) is orch._handle_sigterm
+        assert orch.uninstall_sigterm_grace() is True
+        assert signal.getsignal(signal.SIGTERM) is prev
+        # Idempotent: nothing installed, nothing to restore.
+        assert orch.uninstall_sigterm_grace() is False
+
+    def test_uninstall_leaves_foreign_handler_untouched(
+            self, monkeypatch):
+        """A handler installed OVER ours is someone else's state —
+        uninstall clears only the bookkeeping."""
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        prev = signal.getsignal(signal.SIGTERM)
+        assert orch.install_sigterm_grace() is True
+
+        def _foreign(signum, frame):
+            pass
+
+        signal.signal(signal.SIGTERM, _foreign)
+        try:
+            assert orch.uninstall_sigterm_grace() is True
+            assert signal.getsignal(signal.SIGTERM) is _foreign
+            assert orch._sigterm_state["installed"] is False
+        finally:
+            signal.signal(signal.SIGTERM, prev)
+
+
+class TestHandlerSemantics:
+
+    def test_first_term_requests_shutdown_and_arms_watchdog(self, monkeypatch):
+        threads = []
+
+        class _FakeThread:
+            def __init__(self, **kw):
+                threads.append(kw)
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(orch._threading, "Thread", _FakeThread)
+        orch._handle_sigterm(signal.SIGTERM, None)
+        assert orch.is_sigterm_requested()
+        assert orch.is_shutdown_requested()
+        assert len(threads) == 1
+        assert threads[0]["daemon"] is True
+
+    def test_second_term_exits_immediately_after_flush(self, monkeypatch):
+        exits = []
+        flushed = []
+        monkeypatch.setattr(orch.os, "_exit", lambda code: exits.append(code))
+        monkeypatch.setattr(
+            orch._threading, "Thread",
+            lambda **kw: type("T", (), {"start": lambda self: None})(),
+        )
+        orch._sigterm_flush_hooks.append(lambda: flushed.append(True))
+        orch._handle_sigterm(signal.SIGTERM, None)
+        assert exits == []
+        orch._handle_sigterm(signal.SIGTERM, None)
+        assert exits == [130]
+        assert flushed == [True]
+
+    def test_watchdog_flushes_then_exits_130(self, monkeypatch):
+        exits = []
+        order = []
+        monkeypatch.setattr(orch.os, "_exit", lambda code: exits.append(code))
+        orch._sigterm_flush_hooks.append(lambda: order.append("flush"))
+        orch._sigterm_watchdog(0.0)
+        assert exits == [130]
+        assert order == ["flush"]
+
+    def test_flush_hook_failure_never_blocks_exit(self, monkeypatch):
+        exits = []
+        monkeypatch.setattr(orch.os, "_exit", lambda code: exits.append(code))
+
+        def _bad_hook():
+            raise RuntimeError("disk gone")
+
+        orch._sigterm_flush_hooks.append(_bad_hook)
+        orch._sigterm_watchdog(0.0)
+        assert exits == [130]
+
+
+# ── E2E: stubbed loop, real SIGTERM ─────────────────────────────────
+
+_FUNC_TEMPLATE = """\
+int handle_{name}(const char *input, unsigned len) {{
+    char buf[{size}];
+    unsigned i;
+    if (!input)
+        return -1;
+    if (len > sizeof(buf))
+        len = sizeof(buf);
+    for (i = 0; i < len; i++) {{
+        buf[i] = input[i];
+        if (buf[i] == '\\n')
+            break;
+    }}
+    if (i > 4 && buf[0] == 'H') {{
+        memcpy(buf, input + 1, len - 1);
+        return (int)i + {size};
+    }}
+    return (int)i;
+}}
+"""
+
+_DRIVER = textwrap.dedent("""\
+    import sys, time
+    sys.path.insert(0, sys.argv[3])
+    from pathlib import Path
+    from core.audit.orchestrator import (
+        OrchestratorConfig, ReviewOutcome, run_orchestrator,
+    )
+    from core.audit.tests.test_resume_e2e import _review_loop_only
+
+    def review_fn(ctx, config):
+        time.sleep(0.6)   # window for the parent's SIGTERM
+        return ReviewOutcome(
+            file=ctx["file"], function=ctx["function"],
+            status="clean", body="stub review", cost_usd=0.25,
+        )
+
+    config = OrchestratorConfig(
+        target_path=Path(sys.argv[1]),
+        out_dir=Path(sys.argv[2]),
+        max_cost_usd=10.0,
+        max_workers=1,
+        prefilter=False,
+        batch_sloc_threshold=0,
+        sweep_validate_findings=False,
+        validate=False,
+        deepen_suspicious=False,
+        clean_check=False,
+        adversarial=False,
+        enable_session_context=False,
+        propagate_constraints=False,
+        include_stale=False,
+        on_demand_synthesis=False,
+        open_discovery=False,
+        joern_overrides={"enabled": False},
+        iris=False,
+        sage_recall=False,
+        immediate_verify=False,
+        max_refinements=0,
+    )
+    with _review_loop_only():
+        result = run_orchestrator(config, review_fn)
+    print("TERMINATED_BY=" + result.terminated_by, flush=True)
+    sys.exit(130 if result.terminated_by == "sigterm" else 0)
+""")
+
+
+@pytest.mark.slow
+class TestSigtermE2E:
+
+    def test_sigterm_drains_and_salvages(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+        body = ["#include <string.h>", ""]
+        body += [_FUNC_TEMPLATE.format(name=n, size=64) for n in names]
+        (target / "proto.c").write_text("\n".join(body))
+
+        out = tmp_path / "audit-run"
+        env = dict(os.environ, CLAUDECODE="1", _RAPTOR_TRUSTED="1",
+                   PYTHONPATH=str(_RAPTOR_DIR))
+        with standalone_cli_env(env=env, data_home=env["XDG_DATA_HOME"]) as env, ExitStack() as children:
+            r = run_standalone_cli(
+                [sys.executable, _CHECKLIST_CLI, str(target), str(out)],
+                env=env, data_home=env["XDG_DATA_HOME"], capture_output=True, text=True, check=False,
+            )
+            assert r.returncode == 0, f"build-checklist failed: {r.stderr}"
+
+            driver = tmp_path / "driver.py"
+            driver.write_text(_DRIVER)
+            journal = out / "review-journal.jsonl"
+
+            def _entries() -> int:
+                if not journal.is_file():
+                    return 0
+                return sum(
+                    1 for line in journal.read_text().splitlines() if line
+                )
+
+            # A file cannot fill a PIPE while the parent waits for journal
+            # progress, and preserves diagnostics from early child failures.
+            log_path = tmp_path / "sigterm-child.log"
+            with log_path.open("w+") as log:
+                child = subprocess.Popen(
+                    [sys.executable, str(driver), str(target), str(out),
+                     str(_RAPTOR_DIR)],
+                    env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+                )
+                children.enter_context(reap_on_exit(child))
+                try:
+                    deadline = time.monotonic() + 180
+                    while time.monotonic() < deadline:
+                        if child.poll() is not None:
+                            pytest.fail(
+                                "child finished before SIGTERM window:\n"
+                                + log_path.read_text()
+                            )
+                        if _entries() >= 2:
+                            break
+                        time.sleep(0.1)
+                    else:
+                        pytest.fail("no journal entries in time:\n" + log_path.read_text())
+
+                    at_term = _entries()
+                    term_sent = time.monotonic()
+                    child.send_signal(signal.SIGTERM)
+                    try:
+                        child.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        pytest.fail("child did not drain within 60s of SIGTERM")
+                    drain_s = time.monotonic() - term_sent
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=10)
+                log.seek(0)
+                stdout = log.read()
+
+            # Graceful conclusion: exit 130-style, prompt (well under the
+            # watchdog's forced-exit bound), stop reason named.
+            assert child.returncode == 130
+            assert "TERMINATED_BY=sigterm" in stdout
+            assert drain_s < 25, f"drain took {drain_s:.1f}s"
+
+            # Harvest-first: the in-flight review completed and journaled;
+            # dispatch stopped (not all six functions reviewed).
+            final_entries = _entries()
+            assert final_entries >= at_term
+            assert final_entries < 6, (
+                "SIGTERM must stop dispatching remaining reviews"
+            )
+
+            # Salvage artifacts: flushed audit log (collector buffer),
+            # graded export, tier diagnostics, reconciled ledger.
+            assert (out / ".audit-log.jsonl").is_file()
+            assert (out / "findings-graded.json").is_file()
+            assert (out / "tier-diagnostics.json").is_file()
+            ledger = json.loads((out / "cost-breakdown.json").read_text())
+            assert ledger["totals"]["cost_usd"] == pytest.approx(
+                0.25 * final_entries,
+            )
+
+
+class TestGuardRestoresForeignBaseline:
+    """The conftest guard must hand back a legitimate pre-test
+    handler (the case a pytest plugin's SIGTERM handler exercises)
+    even when the grace handler leaked in and the production
+    uninstall's bookkeeping was lost — SIG_DFL is the fallback for an
+    unrecoverable baseline only, never a replacement for a
+    recoverable one.
+
+    Two tests, definition order load-bearing: the first leaves the
+    poisoned state for its own guard teardown to unwind; the second
+    witnesses what the guard restored.
+    """
+
+    @staticmethod
+    def _foreign_handler(signum: int, frame: object) -> None:
+        raise AssertionError("marker handler is never invoked")
+
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def _foreign_baseline(cls):
+        # Class scope: installs BEFORE the function-scoped conftest
+        # guard snapshots, so the guard sees this handler as ``prev``.
+        baseline = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, cls._foreign_handler)
+        yield
+        try:
+            signal.signal(signal.SIGTERM, baseline)
+        except TypeError:  # baseline None = C-installed handler
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    def test_grace_leak_with_lost_bookkeeping(self):
+        assert orch.install_sigterm_grace() is True
+        assert signal.getsignal(signal.SIGTERM) is orch._handle_sigterm
+        # An earlier teardown cleared the uninstall's bookkeeping
+        # while the handler stayed installed: the production uninstall
+        # can no longer act, only the guard's belt-and-braces path
+        # remains — and its snapshot is the foreign handler.
+        orch._sigterm_state["installed"] = False
+        orch._sigterm_state["prev"] = None
+
+    def test_guard_restored_the_foreign_handler(self):
+        assert signal.getsignal(signal.SIGTERM) is self._foreign_handler

@@ -1,0 +1,168 @@
+"""Tests for ``packages/describe/deps.py``."""
+
+from __future__ import annotations
+
+from core.testing.logging_state import isolated_cli_logging, owned_log_handler
+
+from packages.describe.deps import (
+    DependencyCounts,
+    detect_dependency_counts,
+)
+
+
+class TestDetectDependencyCounts:
+    def test_empty_tree_returns_empty(self, tmp_path):
+        result = detect_dependency_counts(tmp_path)
+        assert result == DependencyCounts(by_ecosystem={}, truncated=False)
+
+    def test_npm_direct_deps_counted(self, tmp_path):
+        (tmp_path / "package.json").write_text(
+            '{"name": "demo", "version": "1.0.0",'
+            '"dependencies": {'
+            '  "react": "^18.0.0",'
+            '  "lodash": "^4.17.21",'
+            '  "express": "^4.18.0"'
+            '},'
+            '"devDependencies": {'
+            '  "jest": "^29.0.0"'
+            '}'
+            '}'
+        )
+        result = detect_dependency_counts(tmp_path)
+        # 3 prod + 1 dev = 4 direct deps. /sca's npm parser
+        # counts both dependencies + devDependencies as direct.
+        assert result.by_ecosystem.get("npm", 0) == 4
+
+    def test_gomod_direct_deps_counted(self, tmp_path):
+        # /sca's gomod parser uses ecosystem id "Go" (matches its
+        # registry name, not the manifest filename).
+        (tmp_path / "go.mod").write_text(
+            "module example.com/demo\n\n"
+            "go 1.21\n\n"
+            "require (\n"
+            "    github.com/gin-gonic/gin v1.9.1\n"
+            "    github.com/sirupsen/logrus v1.9.3\n"
+            ")\n"
+        )
+        result = detect_dependency_counts(tmp_path)
+        assert result.by_ecosystem.get("Go", 0) >= 2
+
+    def test_cargo_direct_deps_counted(self, tmp_path):
+        # /sca's cargo parser uses ecosystem id "Cargo".
+        (tmp_path / "Cargo.toml").write_text(
+            '[package]\n'
+            'name = "demo"\n'
+            'version = "0.1.0"\n'
+            'edition = "2021"\n\n'
+            '[dependencies]\n'
+            'tokio = "1"\n'
+            'serde = "1"\n'
+        )
+        result = detect_dependency_counts(tmp_path)
+        assert result.by_ecosystem.get("Cargo", 0) >= 2
+
+    def test_multiple_ecosystems_counted_independently(self, tmp_path):
+        # Ecosystem ids come from /sca parsers verbatim:
+        # package_json → "npm", gomod → "Go".
+        (tmp_path / "package.json").write_text(
+            '{"name": "d", "version": "0.1.0",'
+            '"dependencies": {"react": "^18.0.0"}}'
+        )
+        (tmp_path / "go.mod").write_text(
+            "module demo\n\n"
+            "go 1.21\n\n"
+            "require github.com/gin-gonic/gin v1.9.1\n"
+        )
+        result = detect_dependency_counts(tmp_path)
+        assert result.by_ecosystem.get("npm", 0) >= 1
+        assert result.by_ecosystem.get("Go", 0) >= 1
+
+    def test_lockfile_alone_does_not_inflate_count(self, tmp_path):
+        # No package.json — just a lockfile. Lockfile is_lockfile=True
+        # so the count stays 0 (avoids reporting transitive-dep counts
+        # as direct).
+        (tmp_path / "package-lock.json").write_text(
+            '{"name": "d", "lockfileVersion": 3, "packages": {'
+            '  "": {"name": "d"},'
+            '  "node_modules/a": {"version": "1.0.0"},'
+            '  "node_modules/b": {"version": "1.0.0"},'
+            '  "node_modules/c": {"version": "1.0.0"}'
+            '}}'
+        )
+        result = detect_dependency_counts(tmp_path)
+        # Even with 3 transitive packages in the lockfile,
+        # by_ecosystem stays empty because is_lockfile=True
+        # manifests are skipped.
+        assert "npm" not in result.by_ecosystem
+
+
+class TestBestEffortAndLoggerRestore:
+    def test_manifest_contract_drift_degrades_and_restores_loggers(
+        self, tmp_path, monkeypatch,
+    ):
+        """A ManifestInfo shape the filter can't read (contract drift)
+        must degrade to an empty result — never crash /describe — and
+        must never leave the sca loggers clamped at WARNING."""
+        import logging
+
+        class _DriftedManifest:
+            # No is_lockfile attribute at all.
+            path = tmp_path / "package.json"
+            ecosystem = "npm"
+
+        monkeypatch.setattr(
+            "packages.sca.discovery.find_manifests",
+            lambda _p: [_DriftedManifest()],
+        )
+        disc = logging.getLogger("packages.sca.discovery")
+        pars = logging.getLogger("packages.sca.parsers")
+        prev_disc, prev_pars = disc.level, pars.level
+        try:
+            result = detect_dependency_counts(tmp_path)
+        finally:
+            restored = (disc.level, pars.level)
+        assert result.by_ecosystem == {}
+        assert restored == (prev_disc, prev_pars)
+
+
+class TestThreadScopedSuppression:
+    @isolated_cli_logging(logger_names=("packages.sca.discovery",))
+    def test_concurrent_threads_records_survive_window(
+        self, tmp_path, monkeypatch,
+    ):
+        """The suppression window is THREAD-scoped: another thread
+        logging through the sca loggers while /describe counts deps
+        keeps its records (a process-global level clamp dropped
+        them)."""
+        import logging
+        import threading
+
+        records: list[str] = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record.getMessage())
+
+        disc = logging.getLogger("packages.sca.discovery")
+        with owned_log_handler(disc, _Cap()):
+            disc.setLevel(logging.INFO)
+
+            def fake_find(_path):
+                # While the suppression window is open, a concurrent
+                # thread emits an INFO record on the same logger.
+                t = threading.Thread(
+                    target=lambda: disc.info("concurrent sca info line"),
+                )
+                from core.testing.threads import retiring_threads
+
+                with retiring_threads([t], release=lambda: None, timeout=5):
+                    t.start()
+                    t.join(timeout=5)
+                    assert not t.is_alive()
+                return []
+
+            monkeypatch.setattr(
+                "packages.sca.discovery.find_manifests", fake_find,
+            )
+            detect_dependency_counts(tmp_path)
+        assert "concurrent sca info line" in records

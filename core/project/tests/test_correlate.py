@@ -133,6 +133,37 @@ class TestFindDisagreements(TestCase):
         self.assertIn("gpt-4o", models)
         self.assertIn("claude-3-opus", models)
 
+    def test_scan_vs_orchestrated_shape_same_location(self):
+        """A scan-shaped finding (`file`) and an orchestrated agentic
+        finding (`file_path`) at the same location must share a dedup
+        key so cross-run-type disagreements fire."""
+        findings = {
+            "scan-001": [_make_finding(file="src/a.c", function="fn",
+                                       line=7, final_status="confirmed")],
+            "agentic-001": [{
+                "file_path": "src/a.c", "function": "fn", "line": 7,
+                "vuln_type": "bof", "is_true_positive": False,
+            }],
+        }
+        result = _find_disagreements(findings, {})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["disagreement_type"], "positive_vs_negative")
+        self.assertEqual(result[0]["file"], "src/a.c")
+
+    def test_orchestrated_findings_do_not_collide_across_files(self):
+        """Same-named functions in different files stay distinct even
+        when the path arrives as file_path."""
+        findings = {
+            "agentic-001": [
+                {"file_path": "src/a.c", "function": "fn", "line": 7,
+                 "vuln_type": "bof", "is_exploitable": True},
+                {"file_path": "src/b.c", "function": "fn", "line": 7,
+                 "vuln_type": "bof", "is_true_positive": False},
+            ],
+        }
+        # Different files → different keys → no verdict set mixes both.
+        self.assertEqual(_find_disagreements(findings, {}), [])
+
     def test_model_from_analysed_by_field(self):
         findings = {
             "run-A": [_make_finding(final_status="exploitable", analysed_by="gpt-4o")],
@@ -148,7 +179,18 @@ class TestFindDisagreements(TestCase):
 
 class TestNewAndResolved(TestCase):
     def _make_run_dirs(self, names):
+        # ``addCleanup`` wires up shutil.rmtree so the mkdtemp'd dir
+        # is removed after the test method even when an assertion
+        # fails or the test raises. Pre-fix the helper called
+        # ``tempfile.mkdtemp`` without any teardown — every call
+        # leaked a directory under ``$TMPDIR`` for the full pytest
+        # session, accumulating to dozens of stale dirs across the
+        # CorrelateProject + NewAndResolved + BuildToolGaps suites.
+        # On constrained-tmpfs CI runners the leak occasionally
+        # surfaced as cryptic ENOSPC failures in unrelated tests.
+        import shutil
         d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         dirs = []
         for n in names:
             p = Path(d) / n
@@ -199,6 +241,20 @@ class TestNewAndResolved(TestCase):
         self.assertEqual(len(result["new_findings"]), 0)
         self.assertEqual(len(result["potentially_resolved"]), 0)
 
+    def test_vanished_run_dir_does_not_crash(self):
+        """A run dir deleted mid-correlation (`/project clean` racing
+        the pass) must sort as oldest, not raise FileNotFoundError."""
+        dirs = self._make_run_dirs(["validate-001", "validate-002"])
+        dirs.append(dirs[0].parent / "validate-gone")  # never created
+        findings = {
+            "validate-001": [],
+            "validate-002": [_make_finding(final_status="exploitable")],
+        }
+        types = {"validate-001": "validate", "validate-002": "validate",
+                 "validate-gone": "validate"}
+        result = _find_new_and_resolved(findings, dirs, types)
+        self.assertEqual(len(result["new_findings"]), 1)
+
     def test_finding_in_all_runs_not_new(self):
         dirs = self._make_run_dirs(["validate-001", "validate-002", "validate-003"])
         f = _make_finding(final_status="exploitable")
@@ -218,7 +274,11 @@ class TestNewAndResolved(TestCase):
 
 class TestBuildToolGaps(TestCase):
     def _make_run_dirs(self, names):
+        # See TestNewAndResolved._make_run_dirs for the rationale —
+        # same helper, same addCleanup-driven teardown.
+        import shutil
         d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         dirs = []
         for n in names:
             p = Path(d) / n
@@ -251,6 +311,23 @@ class TestBuildToolGaps(TestCase):
             "validate-001": [_make_finding(file="x.c")],
         }
         types = {"scan-001": "scan", "validate-001": "validate"}
+        result = _build_tool_gaps(dirs, findings, types)
+        self.assertEqual(result["scanned_not_validated"], [])
+        self.assertEqual(result["validated_not_scanned"], [])
+
+    def test_agentic_file_path_counts_as_llm_coverage(self):
+        """Orchestrated agentic findings carry file_path; they must
+        register as LLM coverage so scanned files aren't reported as
+        never-validated."""
+        dirs = self._make_run_dirs(["scan-001", "agentic-001"])
+        findings = {
+            "scan-001": [_make_finding(file="x.c")],
+            "agentic-001": [{
+                "file_path": "x.c", "function": "fn", "line": 1,
+                "vuln_type": "bof", "is_true_positive": True,
+            }],
+        }
+        types = {"scan-001": "scan", "agentic-001": "agentic"}
         result = _build_tool_gaps(dirs, findings, types)
         self.assertEqual(result["scanned_not_validated"], [])
         self.assertEqual(result["validated_not_scanned"], [])
@@ -395,7 +472,10 @@ class TestCorrelateProject(TestCase):
 
         run_specs: list of (run_name, command, findings_list)
         """
+        # addCleanup-driven teardown; see TestNewAndResolved.
+        import shutil
         base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(base), ignore_errors=True)
         runs_dir = base / "runs"
         runs_dir.mkdir()
 

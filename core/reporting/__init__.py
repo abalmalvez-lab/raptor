@@ -24,6 +24,11 @@ from .findings import (
     findings_summary_line,
     findings_summary,
 )
+from .witnesses import build_witness_summary, render_witness_summary
+from .document import Block, Inline, ReportContext, ReportDocument, StageEnvelope
+from .options import ReportOptions
+from .renderers import available_formats, render_document
+from .service import complete_reporting
 
 # Public re-export surface (see module docstring for layering).
 # Order matches the import groups above; both layers are intentionally
@@ -35,6 +40,8 @@ __all__ = [
     "ReportSection",
     "render_report",
     "render_console_table",
+    # Layer 2 by the docstring's layering (findings-aware) — listed
+    # here with its .formatting import group.
     "get_display_status",
     "title_case_type",
     "truncate_path",
@@ -46,4 +53,9 @@ __all__ = [
     "build_findings_summary",
     "findings_summary_line",
     "findings_summary",
+    # Layer 2 — witness summary
+    "build_witness_summary",
+    "render_witness_summary",
+    "Block", "Inline", "ReportContext", "ReportDocument", "StageEnvelope", "ReportOptions",
+    "available_formats", "render_document", "complete_reporting",
 ]

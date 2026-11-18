@@ -1,0 +1,234 @@
+"""Tests for core.run.toolprobe — shared which + version probing.
+
+Pins the drift fixes the consolidation makes: probes exec the
+RESOLVED path (not the bare name — the check-then-exec PATH race),
+and run under the sanitised env from ``RaptorConfig.get_safe_env()``
+(several hand-rolled probes inherited the caller's full environment).
+"""
+
+from __future__ import annotations
+
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
+import subprocess
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from core.run.toolprobe import ToolInfo, probe, reset_probe_cache
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probe_patch_targets(monkeypatch):
+    """Keep probe mocks local, including delegated discovery and execution."""
+    import core.run.toolprobe as consumer
+
+    patch_module_attribute(
+        monkeypatch, consumer, "subprocess", "run", consumer.subprocess.run,
+    )
+    patch_module_attribute(
+        monkeypatch, consumer, "shutil", "which", consumer.shutil.which,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _clean_cache():
+    """Probe into a private cache, restoring borrowed entries under its lock."""
+    from importlib import import_module
+
+    from core.testing.module_state import isolated_module_state
+
+    toolprobe = import_module("core.run.toolprobe")
+    with isolated_module_state(
+        toolprobe, {"_CACHE": {}}, lock=toolprobe._CACHE_LOCK,
+    ):
+        yield
+
+
+class TestProbe:
+    def test_missing_tool_returns_none(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value=None):
+            assert probe("no-such-tool-xyz") is None
+
+    @pytest.mark.parametrize('failure', [subprocess.TimeoutExpired('fixture', 10), OSError('fixture')])
+    def test_isolated_home_is_cleaned_after_failure(self, tmp_path, monkeypatch, failure):
+        home = tmp_path / 'operator'
+        home.mkdir()
+        monkeypatch.setenv('HOME', str(home))
+        captured = []
+        def fail(*args, **kwargs):
+            captured.append(Path(kwargs['env']['HOME']))
+            assert captured[-1].is_dir()
+            raise failure
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value='/fixture/tool'), mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run', side_effect=fail):
+            info = probe('fixture', isolated_home=True)
+        assert info.returncode is None
+        assert len(captured) == 1 and captured[0] != home
+        assert not captured[0].exists()
+        assert list(home.iterdir()) == []
+
+    def test_cache_separates_isolated_and_operator_home(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value='/fixture/tool'), mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as run:
+            run.return_value = MagicMock(stdout='1.2.3\n', stderr='', returncode=0)
+            regular = probe('fixture', use_cache=True)
+            isolated = probe('fixture', use_cache=True, isolated_home=True)
+            assert probe('fixture', use_cache=True) is regular
+            assert probe('fixture', use_cache=True, isolated_home=True) is isolated
+            assert run.call_count == 2
+
+    def test_probe_runs_resolved_path_not_bare_name(self):
+        # Drift fix pin: the semgrep copy which()-checked then exec'd
+        # the BARE name, re-resolving PATH at exec time (TOCTOU). The
+        # shared probe must exec the resolved absolute path.
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="1.2.3\n", stderr="", returncode=0)
+            info = probe("sometool")
+            argv = mock_run.call_args[0][0]
+            assert argv == ["/opt/bin/sometool", "--version"]
+        assert info is not None
+        assert info.path == "/opt/bin/sometool"
+
+    def test_probe_uses_safe_env(self):
+        # Drift fix pin: hand-rolled probes inherited the full caller
+        # env; the shared probe passes RaptorConfig.get_safe_env().
+        from core.config import RaptorConfig
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run, \
+                patch.object(
+                    RaptorConfig, "get_safe_env",
+                    return_value={"PATH": "/sanitised"},
+                ) as mock_env:
+            mock_run.return_value = MagicMock(
+                stdout="", stderr="", returncode=0)
+            probe("sometool")
+            assert mock_env.called
+            assert mock_run.call_args.kwargs["env"] == {"PATH": "/sanitised"}
+
+    def test_probe_env_fails_closed_without_core_config(self, monkeypatch):
+        # Pre-fix the probe's env helper returned None when
+        # core.config could not import — subprocess then INHERITED
+        # the caller's full environment (secrets and injection
+        # vectors included). The shared helper fails closed to a
+        # minimal allowlist instead; env= must never be None.
+        import sys as _sys
+        monkeypatch.setenv("SUPER_SECRET_API_KEY", "hunter2")
+        monkeypatch.setitem(_sys.modules, "core.config", None)
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="", stderr="", returncode=0)
+            probe("sometool")
+            env = mock_run.call_args.kwargs["env"]
+            assert env is not None
+            assert "SUPER_SECRET_API_KEY" not in env
+            assert "PATH" in env
+
+    def test_probe_failure_yields_toolinfo_not_raise(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(
+                    _mock_owner('core.run.toolprobe'), 'subprocess', 'run',
+                    side_effect=subprocess.TimeoutExpired("sometool", 10),
+                ):
+            info = probe("sometool")
+        assert info is not None
+        assert info.returncode is None
+        assert info.first_line is None
+        assert "TimeoutExpired" in info.error
+
+    def test_custom_args_and_timeout(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/java"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="", stderr='openjdk version "21.0.1"\n',
+                returncode=0)
+            info = probe("java", args=("-version",), timeout=5)
+            assert mock_run.call_args[0][0] == ["/opt/bin/java", "-version"]
+            assert mock_run.call_args.kwargs["timeout"] == 5
+        assert info is not None
+        # stderr fallback: java prints its version there.
+        assert info.first_line == 'openjdk version "21.0.1"'
+
+
+class TestToolInfoParsing:
+    def test_first_line_prefers_stdout(self):
+        info = ToolInfo(name="t", path="/t", stdout="1.2.3\nrest",
+                        stderr="err", returncode=0)
+        assert info.first_line == "1.2.3"
+
+    def test_version_tuple(self):
+        info = ToolInfo(name="t", path="/t",
+                        stdout="tool version 2.10.4 (build x)\n",
+                        returncode=0)
+        assert info.version_tuple() == (2, 10, 4)
+
+    def test_version_tuple_two_component(self):
+        info = ToolInfo(name="t", path="/t", stdout="spatch version 1.3\n",
+                        returncode=0)
+        assert info.version_tuple() == (1, 3)
+
+    def test_version_tuple_none_when_unparseable(self):
+        info = ToolInfo(name="t", path="/t", stdout="no digits here\n",
+                        returncode=0)
+        assert info.version_tuple() is None
+
+
+class TestCache:
+    def test_cache_memoises_positive_and_negative(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="1.0\n", stderr="", returncode=0)
+            probe("sometool", use_cache=True)
+            probe("sometool", use_cache=True)
+            assert mock_run.call_count == 1
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value=None) as mock_which:
+            assert probe("gone-tool", use_cache=True) is None
+            assert probe("gone-tool", use_cache=True) is None
+            assert mock_which.call_count == 1
+
+    def test_uncached_by_default(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="1.0\n", stderr="", returncode=0)
+            probe("sometool")
+            probe("sometool")
+            assert mock_run.call_count == 2
+
+    def test_reset_probe_cache(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="1.0\n", stderr="", returncode=0)
+            probe("sometool", use_cache=True)
+            reset_probe_cache()
+            probe("sometool", use_cache=True)
+            assert mock_run.call_count == 2
+
+    def test_cache_key_includes_args(self):
+        with mock_module_attribute(_mock_owner('core.run.toolprobe'), 'shutil', 'which', return_value="/opt/bin/sometool"), \
+                mock_module_attribute(_mock_owner('core.run.toolprobe'), 'subprocess', 'run') as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="1.0\n", stderr="", returncode=0)
+            probe("sometool", use_cache=True)
+            probe("sometool", args=("-V",), use_cache=True)
+            assert mock_run.call_count == 2
+
+
+@pytest.fixture(autouse=True)
+def _owned_probe_scratch():
+    from core.run import tmp_reaper
+    from core.testing.module_state import isolated_module_state
+    from core.testing.scratch_state import isolated_scratch_keepalive
+
+    with isolated_module_state(tmp_reaper, {
+        "_RUNTIME_DIR_PREFIXES": set(tmp_reaper._RUNTIME_DIR_PREFIXES),
+    }), isolated_scratch_keepalive():
+        yield

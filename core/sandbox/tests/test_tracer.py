@@ -9,37 +9,52 @@ where the end-to-end test will live.
 
 from __future__ import annotations
 
-import sys as _sys
-import pytest as _pytest
-pytestmark = _pytest.mark.skipif(
-    _sys.platform != "linux",
-    reason="Linux-only sandbox internals (mount-ns / Landlock / seccomp / ptrace tracer / pid1 shim) — see core/sandbox/_macos_spawn.py for the macOS path",
-)
 
 
-import ctypes
-import json
-import os
-import platform
-import struct
-import subprocess
-import sys
-import time
 
-import pytest
-
-from core.sandbox import tracer
+import core.sandbox.tracer as _os_fault_consumer
+from core.testing.module_bindings import patch_module_attribute
 
 
-# Skip the whole module on archs the tracer doesn't support (currently
-# x86_64 + aarch64). On supported archs the SeizeAndDetach test runs
-# real ptrace; on unsupported archs the module-level skip avoids
-# pulling in code paths that need _arch_info().
+
+
+
+
+
+import ctypes  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import platform  # noqa: E402
+import struct  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+from core.sandbox import evidence as evidence_mod  # noqa: E402
+from core.sandbox import tracer  # noqa: E402
+
+
+def _denials_jsonl(run_dir):
+    """Evidence-relocated denials path: <run_dir>/.audit/<name>."""
+    return evidence_mod.evidence_write_path(
+        run_dir, tracer._DENIALS_FILENAME,
+    )
+
+
+# Keep the supported-architecture contract for the pure controls.
+# Actual kernel tests add explicit Linux-native restrictions below.
 pytestmark = pytest.mark.skipif(
     not tracer._is_supported_arch(),
     reason=f"tracer doesn't support {platform.machine()} (x86_64/aarch64 only)",
 )
 
+
+_requires_linux_tracer = pytest.mark.skipif(
+    sys.platform != "linux" or not tracer._is_supported_arch(),
+    reason="requires Linux ptrace/process_vm_readv on a supported architecture",
+)
 
 class TestLibcCacheSentinel:
     """N1: _get_libc caches BOTH success and failure to avoid repeated
@@ -53,8 +68,7 @@ class TestLibcCacheSentinel:
         call_count = [0]
         def fake_find(name):
             call_count[0] += 1
-            return None
-        monkeypatch.setattr("ctypes.util.find_library", fake_find)
+        patch_module_attribute(monkeypatch, tracer, "ctypes.util", "find_library", fake_find)
 
         first = tracer._get_libc()
         second = tracer._get_libc()
@@ -102,17 +116,17 @@ class TestArchSupport:
         info = tracer._ARCH_INFO[arch]
         # Six syscall args is the Linux ABI on all supported archs.
         assert len(info["arg_offsets"]) == 6, (
-            f"{arch}: expected 6 arg offsets, got {len(info["arg_offsets"])}")
+            f"{arch}: expected 6 arg offsets, got {len(info['arg_offsets'])}")
         # All offsets land within the regs region.
         assert info["user_regs_size"] > 0, (
             f"{arch}: user_regs_size must be > 0")
         assert 0 <= info["syscall_nr_offset"] < info["user_regs_size"], (
-            f"{arch}: syscall_nr_offset {info["syscall_nr_offset"]} out of "
-            f"range [0, {info["user_regs_size"]})")
+            f"{arch}: syscall_nr_offset {info['syscall_nr_offset']} out of "
+            f"range [0, {info['user_regs_size']})")
         for i, off in enumerate(info["arg_offsets"]):
             assert 0 <= off < info["user_regs_size"], (
                 f"{arch}: arg[{i}] offset {off} out of range "
-                f"[0, {info["user_regs_size"]})")
+                f"[0, {info['user_regs_size']})")
         # Syscall table must cover the union of b2 (blocklist) + b3
         # (file/network) syscalls — emptiness would mean the audit
         # tracer reports `unknown_<nr>` for everything.
@@ -146,7 +160,7 @@ class TestArchSupport:
             # typo (e.g., a hex value pasted as decimal).
             assert nr < 10000, (
                 f"{arch}: syscall_nr {nr} suspiciously large "
-                f"(name={info["syscall_table"][nr]!r})")
+                f"(name={info['syscall_table'][nr]!r})")
 
 
 class TestSyscallNameLookup:
@@ -262,6 +276,135 @@ class TestDenialTypeMapping:
     def test_unknown_syscall_defaults_to_seccomp(self):
         assert tracer._denial_type("unknown_99999") == "seccomp"
 
+    @pytest.mark.parametrize("name", [
+        "stat", "lstat", "newfstatat", "access",
+        "faccessat", "faccessat2",
+    ])
+    def test_stat_family_typed_as_path_syscall(self, name):
+        # Observe-mode stat-family syscalls map to the file-path
+        # "write" bucket (same convention as read-only opens — "write"
+        # here means "file-path syscall"), not the "seccomp" fallback
+        # reserved for blocklist hits.
+        assert tracer._denial_type(name) == "write"
+
+    def test_every_tabled_stat_syscall_is_mapped(self):
+        # The mechanism: no syscall the tables register as
+        # stat-family may hit the seccomp fallback.
+        stat_family = {"stat", "lstat", "newfstatat", "access",
+                       "faccessat", "faccessat2"}
+        for info in tracer._ARCH_INFO.values():
+            for name in info["syscall_table"].values():
+                if name in stat_family:
+                    assert name in tracer._NAME_TO_TYPE
+
+    @pytest.mark.parametrize("name", sorted(tracer._MUTATION_PATH_ARGS))
+    def test_mutation_family_typed_as_path_syscall(self, name):
+        # Mutation syscalls are file-path syscalls — "write" bucket,
+        # never the "seccomp" fallback reserved for blocklist hits.
+        assert tracer._denial_type(name) == "write"
+
+
+class TestMutationSyscallCoverage:
+    """The audit trace set must cover filesystem
+    mutations that need no open() — unlink/rename/link/symlink/mkdir/
+    mknod/truncate/chmod/chown/xattr — including exactly the metadata
+    ops the Landlock ABI gap leaves unrestricted at enforcement."""
+
+    MUTATIONS = (
+        "unlink", "unlinkat", "rename", "renameat", "renameat2",
+        "link", "linkat", "symlink", "symlinkat", "mkdir", "mkdirat",
+        "mknod", "mknodat", "truncate", "chmod", "fchmodat",
+        "chown", "fchownat", "lchown", "setxattr", "lsetxattr",
+        "removexattr", "lremovexattr",
+    )
+
+    def test_all_mutations_in_seccomp_audit_trace_set(self):
+        # Without the seccomp TRACE rule the kernel never notifies
+        # the tracer — the tracer-side tables alone do nothing.
+        from core.sandbox import seccomp
+        for name in self.MUTATIONS:
+            assert name in seccomp._AUDIT_EXTRA_TRACE_SYSCALLS, (
+                f"{name} missing from the audit trace set — mutation "
+                f"invisible to the audit JSONL")
+
+    def test_all_mutations_have_path_arg_index(self):
+        for name in self.MUTATIONS:
+            idx = tracer._path_arg_index(name)
+            assert idx is not None, (
+                f"{name}: no path arg index — record would carry no "
+                f"path")
+            assert 0 <= idx <= 5
+
+    def test_mutation_path_arg_positions_match_abi(self):
+        # Pin the per-syscall ABI positions: a drifted index makes
+        # the tracer deref the wrong argument.
+        expected = {
+            "unlink": (0, None), "unlinkat": (1, 0),
+            "rename": (0, None), "renameat": (1, 0),
+            "renameat2": (1, 0),
+            # link/linkat: the NEW path (created entry) is logged.
+            "link": (1, None), "linkat": (3, 2),
+            # symlink/symlinkat: linkpath — `target` is an arbitrary
+            # string, not necessarily a path.
+            "symlink": (1, None), "symlinkat": (2, 1),
+            "mkdir": (0, None), "mkdirat": (1, 0),
+            "mknod": (0, None), "mknodat": (1, 0),
+            "truncate": (0, None),
+            "chmod": (0, None), "fchmodat": (1, 0),
+            "chown": (0, None), "fchownat": (1, 0),
+            "lchown": (0, None),
+            "setxattr": (0, None), "lsetxattr": (0, None),
+            "removexattr": (0, None), "lremovexattr": (0, None),
+        }
+        assert tracer._MUTATION_PATH_ARGS == expected
+
+    def test_x86_64_mutation_syscall_numbers(self):
+        # arch/x86/entry/syscalls/syscall_64.tbl transcription pins.
+        t = tracer._X86_64_SYSCALL_NAMES
+        assert t[87] == "unlink"
+        assert t[263] == "unlinkat"
+        assert t[82] == "rename"
+        assert t[316] == "renameat2"
+        assert t[86] == "link"
+        assert t[88] == "symlink"
+        assert t[83] == "mkdir"
+        assert t[133] == "mknod"
+        assert t[76] == "truncate"
+        assert t[90] == "chmod"
+        assert t[92] == "chown"
+        assert t[94] == "lchown"
+        assert t[188] == "setxattr"
+        assert t[197] == "removexattr"
+
+    def test_aarch64_mutation_syscall_numbers(self):
+        # include/uapi/asm-generic/unistd.h transcription pins.
+        # aarch64 is at-only: legacy non-at names must be absent.
+        t = tracer._AARCH64_SYSCALL_NAMES
+        assert t[35] == "unlinkat"
+        assert t[38] == "renameat"
+        assert t[276] == "renameat2"
+        assert t[37] == "linkat"
+        assert t[36] == "symlinkat"
+        assert t[34] == "mkdirat"
+        assert t[33] == "mknodat"
+        assert t[45] == "truncate"
+        assert t[53] == "fchmodat"
+        assert t[54] == "fchownat"
+        assert t[5] == "setxattr"
+        assert t[14] == "removexattr"
+        assert "unlink" not in t.values()
+        assert "rename" not in t.values()
+        assert "chmod" not in t.values()
+
+    def test_every_tabled_mutation_syscall_is_mapped(self):
+        # No tabled mutation may hit the "seccomp" type fallback or
+        # lack a path-arg entry.
+        for info in tracer._ARCH_INFO.values():
+            for name in info["syscall_table"].values():
+                if name in self.MUTATIONS:
+                    assert name in tracer._NAME_TO_TYPE
+                    assert name in tracer._MUTATION_PATH_ARGS
+
 
 class TestRegisterDecode:
     """Decoder is arch-agnostic: takes a raw user_regs_struct buffer +
@@ -341,7 +484,7 @@ class TestJsonlRecordWrite:
         )
         assert ok is True
 
-        path = tmp_path / tracer._DENIALS_FILENAME
+        path = _denials_jsonl(tmp_path)
         assert path.exists()
         records = [json.loads(line) for line in path.read_text().splitlines() if line]
         assert len(records) == 1
@@ -363,7 +506,7 @@ class TestJsonlRecordWrite:
             tracer._write_record(tmp_path, "openat", 257,
                                  [i, 0, 0, 0, 0, 0], target_pid=1)
 
-        path = tmp_path / tracer._DENIALS_FILENAME
+        path = _denials_jsonl(tmp_path)
         records = [json.loads(line) for line in path.read_text().splitlines() if line]
         assert len(records) == 3
         # First arg differs per record; assert against args[0] specifically.
@@ -379,10 +522,12 @@ class TestJsonlRecordWrite:
 
     def test_o_nofollow_refuses_symlink(self, tmp_path):
         # Mirror the same defense record_denial uses — symlink at the
-        # JSONL path must NOT be followed.
+        # JSONL path (inside the .audit/ evidence dir) must NOT be
+        # followed.
         target = tmp_path / "evil-target"
         target.write_text("ATTACKER OWNED\n")
-        link = tmp_path / tracer._DENIALS_FILENAME
+        link = _denials_jsonl(tmp_path)
+        link.parent.mkdir(mode=0o700)
         os.symlink(target, link)
 
         ok = tracer._write_record(tmp_path, "openat", 257,
@@ -501,12 +646,15 @@ class TestReadRegsContract:
             readonly.chmod(0o700)
 
 
+@pytest.mark.linux_native
+@_requires_linux_tracer
 class TestSeizeAndDetachLifecycle:
     """End-to-end sanity test of the ptrace handshake against a real
     child. Forks a sleep process, attaches via PTRACE_SEIZE, verifies
     the attach succeeded, then detaches cleanly. Doesn't drive the
     full event loop — that needs seccomp integration (commit 4)."""
 
+    @pytest.mark.slow
     def test_seize_interrupt_detach_against_sleeping_child(self):
         # Fork a sleeper, SEIZE it, INTERRUPT to bring to a group-stop,
         # waitpid for the stop, then DETACH. This is the minimal full
@@ -534,7 +682,7 @@ class TestSeizeAndDetachLifecycle:
             assert interrupted is True
 
             # Reap the stop event.
-            wpid, status = os.waitpid(child.pid, 0)
+            _wpid, status = os.waitpid(child.pid, 0)
             assert os.WIFSTOPPED(status), \
                 f"expected stop after INTERRUPT, got status={status:#x}"
 
@@ -578,7 +726,9 @@ class TestMultiProcessSupport:
         # one of these, the test fails AND the comment in _ptrace_seize
         # needs updating.
         from core.sandbox.tracer import (
-            _PTRACE_O_TRACEFORK, _PTRACE_O_TRACEVFORK, _PTRACE_O_TRACECLONE,
+            _PTRACE_O_TRACECLONE,
+            _PTRACE_O_TRACEFORK,
+            _PTRACE_O_TRACEVFORK,
         )
         assert _PTRACE_O_TRACEFORK == 0x00000002
         assert _PTRACE_O_TRACEVFORK == 0x00000004
@@ -598,8 +748,11 @@ class TestMultiProcessSupport:
         # These are stable kernel UAPI; if they ever change the
         # tracer dispatch is silently broken.
         from core.sandbox.tracer import (
-            _PTRACE_EVENT_FORK, _PTRACE_EVENT_VFORK, _PTRACE_EVENT_CLONE,
-            _PTRACE_EVENT_EXIT, _PTRACE_EVENT_SECCOMP,
+            _PTRACE_EVENT_CLONE,
+            _PTRACE_EVENT_EXIT,
+            _PTRACE_EVENT_FORK,
+            _PTRACE_EVENT_SECCOMP,
+            _PTRACE_EVENT_VFORK,
         )
         assert _PTRACE_EVENT_FORK == 1
         assert _PTRACE_EVENT_VFORK == 2
@@ -628,6 +781,8 @@ class TestPathDereference:
     our OWN PID — process_vm_readv on self is always permitted (no
     ptrace_attach needed)."""
 
+    @pytest.mark.linux_native
+    @_requires_linux_tracer
     def test_reads_self_string(self):
         # Construct a known string in our address space, hand its
         # pointer to _read_tracee_string, expect the bytes back.
@@ -638,6 +793,8 @@ class TestPathDereference:
         # NUL terminator is stripped.
         assert result == "raptor-audit-test-marker"
 
+    @pytest.mark.linux_native
+    @_requires_linux_tracer
     def test_reads_path_like_string(self):
         # Real-world shape: a path the operator would care about.
         marker = b"/etc/hostname\0"
@@ -653,6 +810,8 @@ class TestPathDereference:
         result = tracer._read_tracee_string(os.getpid(), 0)
         assert result is None
 
+    @pytest.mark.linux_native
+    @_requires_linux_tracer
     def test_reads_long_string_truncates_at_max(self):
         # Bound: max_bytes prevents pathological never-NUL'd
         # buffers from making us read forever.
@@ -665,6 +824,8 @@ class TestPathDereference:
         assert len(result) == 50
         assert result == "A" * 50
 
+    @pytest.mark.linux_native
+    @_requires_linux_tracer
     def test_handles_non_utf8_bytes(self):
         # Filename can contain arbitrary bytes (Linux filesystems
         # don't enforce encoding). errors='replace' keeps the
@@ -719,7 +880,7 @@ class TestRecordWithPath:
 
         records = [
             json.loads(line) for line in
-            (tmp_path / tracer._DENIALS_FILENAME).read_text().splitlines()
+            _denials_jsonl(tmp_path).read_text().splitlines()
             if line
         ]
         r = records[0]
@@ -740,7 +901,7 @@ class TestRecordWithPath:
         assert ok is True
         records = [
             json.loads(line) for line in
-            (tmp_path / tracer._DENIALS_FILENAME).read_text().splitlines()
+            _denials_jsonl(tmp_path).read_text().splitlines()
             if line
         ]
         r = records[0]
@@ -779,21 +940,60 @@ class TestSignalReadyHandshake:
         # closed via the finally clause. Without it, a transient
         # broken-pipe / disk-full would leak the fd in the tracer
         # process for the rest of its lifetime.
+        #
+        # Closure is verified by RECORDING the close call, not by
+        # re-closing the fd and expecting EBADF: in a process with
+        # live background threads (proxy singletons from earlier
+        # tests in the same worker) the freed fd number can be reused
+        # between _signal_ready's close and the re-close — the EBADF
+        # probe then closes an UNRELATED live descriptor and the test
+        # flakes.
         rd, wr = os.pipe()
+        real_close = os.close
+        closed: list[int] = []
         try:
             def boom(*a, **k):
                 raise OSError("simulated write failure")
-            monkeypatch.setattr(os, "write", boom)
+            patch_module_attribute(monkeypatch, _os_fault_consumer, "os", "write", boom)
+            patch_module_attribute(monkeypatch, _os_fault_consumer, "os", "close", closed.append)
 
             # Must not raise; must close wr.
             tracer._signal_ready(wr)
-
-            # Verify wr is closed: re-closing it should raise
-            # OSError(EBADF). Don't catch — let pytest report.
-            with pytest.raises(OSError):
-                os.close(wr)
+            assert closed == [wr]
         finally:
-            try:
-                os.close(rd)
-            except OSError:
-                pass
+            monkeypatch.undo()
+            for fd in (wr, rd):
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+
+
+class TestEchildWritesSummary:
+    """The ECHILD wait-loop exit is a near-normal end-of-run shape
+    (the race between the last tracee's reap and the traced-set
+    bookkeeping), not a crash — it must still append the audit_summary
+    record. Without it, budget_truncated/drop counts silently read as
+    "no drops" for such runs, and consumers can't tell the difference
+    from a mid-run tracer death."""
+
+    def test_summary_record_written_on_echild_exit(self, tmp_path):
+        from unittest import mock
+
+        if tracer._arch_info() is None:
+            pytest.skip("unsupported arch")
+        with mock.patch.object(tracer, "_ptrace_seize",
+                               return_value=True), \
+                mock.patch("os.waitpid",
+                           side_effect=ChildProcessError):
+            rc = tracer.trace(4194000, tmp_path)
+        assert rc == 0
+        from core.sandbox import evidence as evidence_mod
+        log = (evidence_mod.audit_dir_path(tmp_path)
+               / tracer._DENIALS_FILENAME)
+        assert log.exists(), "no JSONL written on the ECHILD exit"
+        records = [json.loads(x) for x in
+                   log.read_text().splitlines()]
+        assert any(r.get("type") == "audit_summary" for r in records), (
+            f"audit_summary missing from ECHILD-exit JSONL: {records}"
+        )

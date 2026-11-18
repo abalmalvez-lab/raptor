@@ -1,0 +1,141 @@
+"""SCA-test fixtures.
+
+Most pipeline tests don't care about the cascade resolver — they're
+exercising parsers, finding shapes, CLI plumbing. But ``cli.main``
+defaults to ``enable_transitive_expansion=True`` for production
+correctness, which fires ``npm --version`` (~1s on most systems) and
+sometimes ``pip --version`` / ``go version`` per scan.
+
+Session-autouse fixture below pre-populates the per-process tool-
+availability cache with ``False`` for every resolver tool so the
+probes return immediately without running subprocess. The cascade
+gracefully no-ops when no resolver is "available". Tests that need
+to exercise the real resolver-availability codepath (or a
+specifically-mocked resolver) can clear/override the cache via the
+``unstub_check_tool_cache`` fixture.
+
+Net effect on the dev box: removes ~1s from every test that calls
+``cli.main`` or ``run_sca`` with default options.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+from core.testing.module_state import isolated_module_state
+
+
+# ---------------------------------------------------------------------------
+# LLM isolation: default-deny live API calls
+# ---------------------------------------------------------------------------
+#
+# SCA tests must NOT hit real LLM providers by default. Prior state:
+# several pipeline/verify tests exercised the full SCA pipeline —
+# including the triage / inline-review / upgrade-impact passes — and
+# those passes call ``packages.sca.llm.get_llm_client()`` internally.
+# When those tests ran without an explicit stub, ``get_llm_client()``
+# read the operator's local LLM config, resolved to a real provider,
+# and made live API calls to whatever model was auto-selected
+# (Gemini-flash-lite in the observed case), silently costing money
+# per test run and shipping fixture content over the wire.
+#
+# The autouse fixture below patches ``get_llm_client`` to return
+# ``None`` for every SCA test. SCA pipeline code paths already handle
+# the ``None`` case gracefully — they treat it as "LLM disabled — skip
+# the review pass" — so tests exercising pipeline logic that isn't
+# specifically about LLM behaviour continue to pass unchanged.
+#
+# Tests that need a stubbed client (e.g. ``@patch("...get_llm_client")``
+# with a MagicMock return value) work as before: the inner context-
+# managed patch shadows this fixture's outer patch for the duration
+# of the test.
+#
+# Tests that genuinely need a live LLM (e.g. a specific-model smoke
+# test) opt in with ``@pytest.mark.integration``, which the root
+# ``pytest.ini`` deselects by default anyway.
+
+
+
+@pytest.fixture(autouse=True)
+def _sca_no_live_llm(request):
+    """Deny live LLM calls in SCA tests; see comment above."""
+    if request.node.get_closest_marker("integration"):
+        yield
+        return
+    with patch("packages.sca.llm.get_llm_client", return_value=None):
+        yield
+
+
+# Tool probes the resolver registry runs. Conservative — real list
+# lives in the per-resolver ``is_available`` methods. Adding more here
+# is harmless (extra cache entries that never get queried).
+_TOOL_PROBES = (
+    ("npm", "--version"),
+    ("pnpm", "--version"),
+    ("yarn", "--version"),
+    ("pip", "--version"),
+    ("pip-compile", "--version"),
+    ("poetry", "--version"),
+    ("uv", "--version"),
+    ("go", "version"),
+    ("cargo", "--version"),
+    ("bundle", "--version"),
+    ("composer", "--version"),
+    ("dotnet", "--version"),
+    ("mvn", "--version"),
+    ("gradle", "--version"),
+)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _stub_resolver_tool_probes_at_session_start():
+    """Pre-populate ``_CHECK_TOOL_CACHE`` so ``is_available`` returns
+    False for every resolver tool without spawning subprocess.
+
+    Tests that exercise real-tool detection should depend on
+    ``unstub_check_tool_cache`` to install an empty test-owned cache.
+    """
+    from packages.sca import resolvers
+    with isolated_module_state(
+            resolvers, {"_CHECK_TOOL_CACHE": dict.fromkeys(_TOOL_PROBES, False)}):
+        yield
+
+
+@pytest.fixture
+def unstub_check_tool_cache(monkeypatch):
+    """Opt-out fixture for tests that want to exercise the real
+    ``_check_tool`` path (e.g. a regression test that the npm probe
+    is actually invoked end-to-end). Installs an empty owned cache
+    and restores the session cache on teardown.
+    """
+    from packages.sca import resolvers
+    # Share the body's undo stack when it patches this same binding.
+    monkeypatch.setattr(resolvers, "_CHECK_TOOL_CACHE", {})
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _accept_degraded_egress_tier(monkeypatch):
+    """These tests exercise resolver/pipeline semantics, not sandbox
+    tier posture. CI runners block unprivileged user namespaces
+    (apparmor_restrict_unprivileged_userns=1), so the netns egress
+    tier is unavailable there and the require_proxy_netns fail-closed
+    guard (00015) would refuse every sandboxed call. Accept the
+    degraded tier for the tests via the guard's own documented opt-in;
+    the guard's behavior has its own dedicated tests in
+    core/sandbox/tests/test_proxy_netns_enforcement.py.
+    Subprocess-based e2e tests inherit it via os.environ."""
+    monkeypatch.setenv("RAPTOR_ALLOW_DEGRADED_UNTRUSTED", "1")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sca_scratch():
+    from core.run import tmp_reaper
+    from core.testing.module_state import isolated_module_state
+    from core.testing.scratch_state import isolated_scratch_keepalive
+
+    with isolated_module_state(tmp_reaper, {
+        "_RUNTIME_DIR_PREFIXES": set(tmp_reaper._RUNTIME_DIR_PREFIXES),
+    }), isolated_scratch_keepalive():
+        yield

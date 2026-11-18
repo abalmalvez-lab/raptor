@@ -17,30 +17,40 @@ core/sandbox/landlock.py:449,453,499,571,587 / seccomp.py / _spawn.py /
 ptrace_probe.py. Operators monitoring sandbox stderr can grep for a
 single prefix across all degraded-mode signals.
 
-This is the W35.C precedent API (single-arg bytes). W36.D cherry-picks
-this helper for rlimit-parity DiD wires; W36.E.1 wires it at the
-mount_ns + preexec DiD sites. Fail-CLOSED sites at landlock / mount_ns /
+Single-arg bytes API. Fail-CLOSED sites at landlock / mount_ns /
 preexec use direct ``os.write(2, ...) + os._exit(N)`` per the design
-intent above.
+intent above. The emitted prefix is the neutral ``sandbox: `` — these
+lines can reach the TARGET-visible stderr stream, and a framework-
+branded prefix would hand any payload one strcmp of attribution; the
+helper rewrites the legacy branded prefix so call sites cannot
+reintroduce it.
 """
 
 import os
 
-_PREFIX = b"RAPTOR: "
+# Neutral on purpose: these warnings can reach the TARGET-visible
+# stderr stream (fork-safe writes from a dying child), and a branded
+# prefix hands any payload one strcmp's worth of "I am being analysed
+# by RAPTOR" attribution. Operators grep for "sandbox:" instead.
+_PREFIX = b"sandbox: "
+_LEGACY_PREFIX = b"RAPTOR: "
 
 
 def warn_post_fork(message: bytes) -> None:
-    """Emit a fork-safe degraded-mode warning to stderr.
+    r"""Emit a fork-safe degraded-mode warning to stderr.
 
     `message` must be `bytes` (already encoded; no f-strings). The
-    `RAPTOR: ` prefix is prepended automatically unless `message`
-    already starts with it. The caller should include a trailing
-    `\\n` in `message`.
+    neutral `sandbox: ` prefix is prepended automatically (a legacy
+    `RAPTOR: ` prefix on the message is rewritten — the framework
+    name must not reach a target-visible stream). The caller should
+    include a trailing `\n` in `message`.
 
     Errors are swallowed — stderr may be closed/redirected in a
     sandboxed child; the alternative is letting preexec_fn raise,
     which is worse than a silent fail for a defense-in-depth signal.
     """
+    if message.startswith(_LEGACY_PREFIX):
+        message = message[len(_LEGACY_PREFIX):]
     if not message.startswith(_PREFIX):
         message = _PREFIX + message
     try:

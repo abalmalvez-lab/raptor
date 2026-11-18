@@ -1,0 +1,272 @@
+"""Threshold-based exit-code evaluation for findings.
+
+Replaces the standalone ``raptor-sca-gate`` binary. The same logic is now
+exposed as flags on:
+
+  - the main scan path (``bin/raptor-sca <target> --fail-on-severity high``)
+  - the render path (``bin/raptor-sca render findings.json --fail-on-severity high``)
+
+Returns ``(passed, failure_messages)`` so callers can decide exit code
+and how to report.
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from typing import TextIO, TYPE_CHECKING
+
+from core.security.log_sanitisation import sanitise_for_terminal as _sft
+
+from .findings import severity_rank
+from .kinds import SUPPLY_CHAIN_IMAGE_CAPABILITY_DRIFT
+from .rows import FindingRow
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+_SEVERITY_CHOICES = ("info", "low", "medium", "high", "critical")
+
+
+@dataclass
+class ThresholdConfig:
+    """Threshold knobs for "fail this build if ..." logic.
+
+    All fields default to a non-failing value; callers populate from
+    CLI args. ``is_active`` returns False when nothing is set, in which
+    case ``evaluate`` is a no-op (always passes).
+    """
+    fail_on_severity: str | None = None
+    fail_on_kev: bool = False
+    fail_on_incomplete: bool = False
+    fail_on_supply_chain: str | None = None
+    fail_on_hygiene: str | None = None
+    fail_on_license: str | None = None
+    include_suppressed: bool = False
+    fail_on_capability_drift: bool = False
+    max_added_capability_buckets: int | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return (self.fail_on_severity is not None
+                or self.fail_on_kev
+                or self.fail_on_incomplete
+                or self.fail_on_supply_chain is not None
+                or self.fail_on_hygiene is not None
+                or self.fail_on_license is not None
+                or self.fail_on_capability_drift
+                or self.max_added_capability_buckets is not None)
+
+
+def evaluate(
+    rows: Sequence[dict], cfg: ThresholdConfig,
+) -> tuple[bool, list[str]]:
+    """Evaluate findings against thresholds.
+
+    Returns ``(passed, failure_messages)``. ``passed=True`` → caller
+    exits 0. ``passed=False`` → caller exits 1 and surfaces the
+    messages.
+    """
+    if not cfg.is_active:
+        return True, []
+
+    sev_floor = (severity_rank(cfg.fail_on_severity)
+                 if cfg.fail_on_severity else None)
+    sc_floor = (severity_rank(cfg.fail_on_supply_chain)
+                if cfg.fail_on_supply_chain else None)
+    hyg_floor = (severity_rank(cfg.fail_on_hygiene)
+                 if cfg.fail_on_hygiene else None)
+    lic_floor = (severity_rank(cfg.fail_on_license)
+                 if cfg.fail_on_license else None)
+
+    fails: list[str] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"finding {index}: expected an object")
+        if "suppressed" in row and type(row["suppressed"]) is not bool:
+            raise ValueError(f"finding {index}: suppression status must be a boolean")
+        if row.get("severity", "info") not in (*_SEVERITY_CHOICES, "none"):
+            raise ValueError(f"finding {index}: invalid severity")
+        if not isinstance(row.get("vuln_type"), str) or not row["vuln_type"]:
+            raise ValueError(f"finding {index}: missing finding type")
+        fr = FindingRow.from_row(row)
+        if fr is None:
+            # Hand-edited or third-party-tool findings.json may contain
+            # non-dict elements; skip rather than crash.
+            continue
+        if fr.is_scan_health and cfg.fail_on_incomplete:
+            fails.append("[incomplete] " + _sft(fr.description or fr.id or "scan coverage unavailable"))
+            continue
+        if fr.suppressed and not cfg.include_suppressed:
+            continue
+        rank = severity_rank(fr.severity)
+        # The description embeds OSV advisory free text (attacker-
+        # writable markdown) — escape control bytes and bound length
+        # at construction so every fail line print_result later emits
+        # to the CI/operator terminal is already terminal-safe. The
+        # severity slot beside it is just as attacker-writable on
+        # hand-edited / third-party findings.json (FindingRow accepts
+        # any string, and unknown severities rank 0 — passing the
+        # info/none floors): rank on the raw value, print the escaped
+        # one.
+        sev = _sft(str(fr.severity), max_len=32)
+        desc = _sft(fr.description or fr.id or "(no description)")
+        if fr.is_vulnerable_dependency:
+            if sev_floor is not None and rank >= sev_floor:
+                fails.append(f"[{sev}] {desc}")
+                continue
+            if cfg.fail_on_kev and fr.sca.get("in_kev"):
+                fails.append(f"[KEV] {desc}")
+        elif fr.is_supply_chain:
+            if sc_floor is not None and rank >= sc_floor:
+                fails.append(f"[supply-chain {sev}] {desc}")
+            # Drift-specific gates layer on top of (and may fire
+            # independently of) the supply-chain severity floor —
+            # operators may want to gate on drift without gating on
+            # other supply-chain signals.
+            if fr.vuln_type == SUPPLY_CHAIN_IMAGE_CAPABILITY_DRIFT:
+                if cfg.fail_on_capability_drift:
+                    fails.append(f"[capability-drift] {desc}")
+                if cfg.max_added_capability_buckets is not None:
+                    # The findings row builder nests evidence under
+                    # the row's ``sca`` block; a top-level
+                    # ``evidence`` (hand-edited / third-party
+                    # findings.json) is accepted as fallback. Reading
+                    # only the top level made this gate vacuous — it
+                    # never saw the buckets, so it never failed.
+                    # Defensive: either source may also carry a
+                    # non-dict evidence field or a non-list
+                    # ``added_buckets``. Treat anything we can't
+                    # count as zero added buckets rather than crash
+                    # the build gate.
+                    ev = fr.sca.get("evidence")
+                    if not isinstance(ev, dict):
+                        ev = fr.raw.get("evidence")
+                    if not isinstance(ev, dict):
+                        ev = {}
+                    raw_added = ev.get("added_buckets")
+                    added = raw_added if isinstance(raw_added, list) else []
+                    if len(added) > cfg.max_added_capability_buckets:
+                        fails.append(
+                            f"[capability-drift +{len(added)} buckets > "
+                            f"max {cfg.max_added_capability_buckets}] "
+                            f"{desc}"
+                        )
+        elif fr.is_hygiene:
+            if hyg_floor is not None and rank >= hyg_floor:
+                fails.append(f"[hygiene {sev}] {desc}")
+        elif fr.is_license:
+            # License findings had no gate branch at all — a policy
+            # violation could never fail a build regardless of the
+            # configured floors. Same floor-per-class shape as the
+            # hygiene / supply-chain buckets (and the diff layer's
+            # canonical-key treatment of license rows).
+            if lic_floor is not None and rank >= lic_floor:
+                fails.append(f"[license {sev}] {desc}")
+
+    return len(fails) == 0, fails
+
+
+def add_threshold_args(parser) -> None:
+    """Register the shared --fail-on-* flags on an argparse parser."""
+    parser.add_argument(
+        "--fail-on-severity",
+        choices=_SEVERITY_CHOICES, default=None,
+        help="exit 1 if any vulnerable_dependency finding meets-or-exceeds "
+             "this severity (CI gate)",
+    )
+    parser.add_argument("--fail-on-incomplete", action="store_true",
+                        help="exit 1 when recorded scan-health gaps make coverage incomplete")
+    parser.add_argument(
+        "--fail-on-kev", action="store_true",
+        help="exit 1 if any vulnerable_dependency is on CISA's KEV list, "
+             "even below --fail-on-severity",
+    )
+    parser.add_argument(
+        "--fail-on-supply-chain",
+        choices=_SEVERITY_CHOICES, default=None,
+        help="exit 1 if any supply_chain finding meets-or-exceeds this severity",
+    )
+    parser.add_argument(
+        "--fail-on-hygiene",
+        choices=_SEVERITY_CHOICES, default=None,
+        help="exit 1 if any hygiene finding meets-or-exceeds this severity",
+    )
+    parser.add_argument(
+        "--fail-on-license",
+        choices=_SEVERITY_CHOICES, default=None,
+        help="exit 1 if any license finding meets-or-exceeds this severity",
+    )
+    parser.add_argument(
+        "--include-suppressed", action="store_true",
+        help="evaluate findings the operator marked suppressed in "
+             ".raptor-sca-suppress.yml (default: skip them)",
+    )
+    parser.add_argument(
+        "--fail-on-capability-drift", action="store_true",
+        help=(
+            "exit 1 if any image_capability_drift finding is present, "
+            "regardless of severity. Use when you want to gate on "
+            "binary-shape change without coupling to the supply-chain "
+            "severity ladder."
+        ),
+    )
+    parser.add_argument(
+        "--max-added-capability-buckets",
+        type=int, default=None, metavar="N",
+        help=(
+            "exit 1 if any image_capability_drift finding has MORE "
+            "than N added capability buckets. Use 0 to fail on any "
+            "new bucket; higher values tolerate small-scope drift."
+        ),
+    )
+
+
+def cfg_from_args(args) -> ThresholdConfig:
+    """Build a ``ThresholdConfig`` from an argparse Namespace."""
+    return ThresholdConfig(
+        fail_on_severity=getattr(args, "fail_on_severity", None),
+        fail_on_kev=getattr(args, "fail_on_kev", False),
+        fail_on_incomplete=getattr(args, "fail_on_incomplete", False),
+        fail_on_supply_chain=getattr(args, "fail_on_supply_chain", None),
+        fail_on_hygiene=getattr(args, "fail_on_hygiene", None),
+        fail_on_license=getattr(args, "fail_on_license", None),
+        include_suppressed=getattr(args, "include_suppressed", False),
+        fail_on_capability_drift=getattr(
+            args, "fail_on_capability_drift", False,
+        ),
+        max_added_capability_buckets=getattr(
+            args, "max_added_capability_buckets", None,
+        ),
+    )
+
+
+def print_result(
+    passed: bool, fails: list[str], *,
+    prog: str = "raptor-sca",
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+) -> None:
+    """Print the pass/fail summary in the legacy gate's format."""
+    if out is None:
+        out = sys.stdout
+    if err is None:
+        err = sys.stderr
+    if passed:
+        print(f"{prog}: pass — no findings above thresholds", file=out)
+        return
+    print(f"{prog}: fail — {len(fails)} finding(s) above thresholds:",
+          file=err)
+    for line in fails[:50]:
+        print(f"  {line}", file=err)
+    if len(fails) > 50:
+        print(f"  … and {len(fails) - 50} more", file=err)
+
+
+__all__ = [
+    "ThresholdConfig",
+    "add_threshold_args",
+    "cfg_from_args",
+    "evaluate",
+    "print_result",
+]

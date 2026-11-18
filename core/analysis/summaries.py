@@ -1,0 +1,572 @@
+"""Per-function security summaries for inter-procedural reasoning.
+
+Summaries capture security-relevant function behavior: taint propagation
+rules, precondition guards, return conditions, error paths, and resolved
+callees/callers.  Two producers:
+
+1. Mechanical (Joern CPG) — structural facts, high confidence.
+2. LLM review — semantic understanding from the review loop,
+   medium confidence, covers behavior Joern can't see (conditional
+   sanitization, protocol semantics, design intent).
+
+Summaries are injected into the LLM's review context for callee
+functions so the reviewer has inter-procedural knowledge without
+re-reading every callee's source.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from core.analysis.taint_approx import function_key
+from core.evidence import EvidenceTier
+
+logger = logging.getLogger(__name__)
+
+
+def _prompt_field_defence() -> Any:
+    """The shared render defence, with a flatten-only fallback.
+
+    Lazy so core.analysis keeps working without core.audit; the
+    fallback preserves the load-bearing property (no embedded newline
+    survives into a trusted line-shaped prompt region).
+    """
+    try:
+        from core.audit.prompt_defence import defend_prompt_field
+    except Exception:
+        def defend_prompt_field(value: Any, max_length: int = 200) -> str:
+            text = " ".join(str(value).split())
+            return text[:max_length]
+    return defend_prompt_field
+
+
+@dataclass
+class TaintRule:
+    """A parameter→callee taint propagation path from the CPG."""
+    source_param: str
+    source_index: int
+    sink_call: str
+    sink_arg_index: int
+    hop_count: int = 0
+    evidence_tier: EvidenceTier = EvidenceTier.XREF_BACKED
+
+
+@dataclass
+class Precondition:
+    """A conditional guard on a parameter extracted from the CPG."""
+    param: str
+    param_index: int
+    conditions: list
+    evidence_tier: EvidenceTier = EvidenceTier.XREF_BACKED
+
+
+@dataclass
+class ReturnCondition:
+    """A return statement with its dominating conditions."""
+    code: str
+    line: int = -1
+    conditions: list = field(default_factory=list)
+    evidence_tier: EvidenceTier = EvidenceTier.XREF_BACKED
+
+
+@dataclass
+class FunctionSummary:
+    """Security summary of a function from mechanical or LLM analysis."""
+
+    function: str
+    file: str
+    taint_rules: list[TaintRule] = field(default_factory=list)
+    preconditions: list[Precondition] = field(default_factory=list)
+    returns: list[ReturnCondition] = field(default_factory=list)
+    error_paths: list[str] = field(default_factory=list)
+    callees: list[str] = field(default_factory=list)
+    callers: list[str] = field(default_factory=list)
+    state_transitions: list[str] = field(default_factory=list)
+    evidence_tier: EvidenceTier = EvidenceTier.XREF_BACKED
+    source: str = "mechanical"
+    confidence: str = "high"
+
+    def is_empty(self) -> bool:
+        return (
+            not self.taint_rules
+            and not self.preconditions
+            and not self.returns
+            and not self.error_paths
+            and not self.state_transitions
+        )
+
+    def format_for_context(self, depth: str = "full") -> str:
+        """Render as text for LLM context injection.
+
+        depth="oneline" — one-sentence summary for GLANCE context.
+        depth="full"    — complete summary for DEEP_DIVE context.
+
+        Every data field (names, params, conditions, code excerpts,
+        state prose) may derive from analysed source or an LLM
+        summary of it, and this rendering lands RAW in other
+        functions' review prompts — each field passes through
+        ``defend_prompt_field`` (newline flatten + tag/heading
+        neutralise + cap) so an embedded newline cannot mint a forged
+        heading or instruction line in trusted prompt position.
+        """
+        _dpf = _prompt_field_defence()
+        if self.is_empty():
+            if depth == "oneline":
+                return (
+                    f"`{_dpf(self.function, 120)}()`: no CPG-derived "
+                    f"security signals."
+                )
+            return ""
+
+        if depth == "oneline":
+            parts = []
+            if self.taint_rules:
+                sinks = sorted({r.sink_call for r in self.taint_rules})
+                parts.append(
+                    "taint→" + ",".join(_dpf(s, 80) for s in sinks)
+                )
+            if self.preconditions:
+                parts.append(f"{len(self.preconditions)} guards")
+            if self.error_paths:
+                parts.append(f"{len(self.error_paths)} error returns")
+            detail = "; ".join(parts) if parts else "utility"
+            return f"`{_dpf(self.function, 120)}()`: {detail}."
+
+        lines = [
+            f"### CPG summary: `{_dpf(self.function, 120)}()` "
+            f"[{self.evidence_tier.value}]"
+        ]
+
+        if self.taint_rules:
+            lines.append("**Taint propagation:**")
+            for r in self.taint_rules:
+                tier_tag = f" [{r.evidence_tier.value}]" if r.evidence_tier != self.evidence_tier else ""
+                lines.append(
+                    f"- param `{_dpf(r.source_param, 120)}` → "
+                    f"`{_dpf(r.sink_call, 120)}()` arg #{r.sink_arg_index}"
+                    + (f" ({r.hop_count} hops)" if r.hop_count > 1 else "")
+                    + tier_tag
+                )
+
+        if self.preconditions:
+            lines.append("**Guards:**")
+            for p in self.preconditions:
+                conds = ", ".join(_dpf(c, 80) for c in p.conditions[:3])
+                lines.append(
+                    f"- param `{_dpf(p.param, 120)}` guarded by: {conds}"
+                )
+
+        if self.returns:
+            lines.append("**Returns:**")
+            for rc in self.returns[:5]:
+                cond_str = ""
+                if rc.conditions:
+                    cond_str = f" when {_dpf(rc.conditions[0], 60)}"
+                lines.append(f"- `{_dpf(rc.code, 80)}`{cond_str}")
+
+        if self.error_paths:
+            lines.append("**Error returns:**")
+            lines.extend(
+                f"- `{_dpf(ep, 80)}`" for ep in self.error_paths[:3]
+            )
+
+        if self.state_transitions:
+            lines.append("**State transitions:**")
+            lines.extend(
+                f"- {_dpf(st, 80)}" for st in self.state_transitions[:5]
+            )
+
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "function": self.function,
+            "file": self.file,
+            "taint_rules": [
+                {
+                    "source_param": r.source_param,
+                    "source_index": r.source_index,
+                    "sink_call": r.sink_call,
+                    "sink_arg_index": r.sink_arg_index,
+                    "hop_count": r.hop_count,
+                    "evidence_tier": r.evidence_tier.value,
+                }
+                for r in self.taint_rules
+            ],
+            "preconditions": [
+                {
+                    "param": p.param,
+                    "param_index": p.param_index,
+                    "conditions": p.conditions,
+                    "evidence_tier": p.evidence_tier.value,
+                }
+                for p in self.preconditions
+            ],
+            "returns": [
+                {
+                    "code": r.code,
+                    "line": r.line,
+                    "conditions": r.conditions,
+                    "evidence_tier": r.evidence_tier.value,
+                }
+                for r in self.returns
+            ],
+            "error_paths": self.error_paths,
+            "callees": self.callees,
+            "callers": self.callers,
+            "state_transitions": self.state_transitions,
+            "evidence_tier": self.evidence_tier.value,
+            "source": self.source,
+            "confidence": self.confidence,
+        }
+
+
+def _parse_evidence_tier(data: dict[str, Any]) -> EvidenceTier:
+    """Parse an evidence tier from a dict, defaulting to XREF_BACKED."""
+    raw = data.get("evidence_tier", "")
+    if raw:
+        try:
+            return EvidenceTier(raw)
+        except ValueError:
+            pass
+    return EvidenceTier.XREF_BACKED
+
+
+def parse_taint_lines(raw: str) -> list[TaintRule]:
+    """Parse SUMMARY_TAINT: lines from Joern query output."""
+    rules = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("SUMMARY_TAINT:"):
+            continue
+        try:
+            data = json.loads(line[len("SUMMARY_TAINT:"):].strip())
+            rules.append(TaintRule(
+                source_param=data.get("source_param", ""),
+                source_index=data.get("source_index", -1),
+                sink_call=data.get("sink_call", ""),
+                sink_arg_index=data.get("sink_arg_index", -1),
+                hop_count=data.get("hop_count", 0),
+                evidence_tier=_parse_evidence_tier(data),
+            ))
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            logger.debug("failed to parse taint line: %s", line[:200])
+    return rules
+
+
+def parse_guard_lines(raw: str) -> list[Precondition]:
+    """Parse SUMMARY_GUARD: lines from Joern query output."""
+    guards = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("SUMMARY_GUARD:"):
+            continue
+        try:
+            data = json.loads(line[len("SUMMARY_GUARD:"):].strip())
+            guards.append(Precondition(
+                param=data.get("param", ""),
+                param_index=data.get("param_index", -1),
+                conditions=data.get("conditions", []),
+                evidence_tier=_parse_evidence_tier(data),
+            ))
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            logger.debug("failed to parse guard line: %s", line[:200])
+    return guards
+
+
+def parse_return_lines(raw: str) -> list[ReturnCondition]:
+    """Parse SUMMARY_RETURN: lines from Joern query output."""
+    returns = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("SUMMARY_RETURN:"):
+            continue
+        try:
+            data = json.loads(line[len("SUMMARY_RETURN:"):].strip())
+            returns.append(ReturnCondition(
+                code=data.get("code", ""),
+                line=data.get("line", -1),
+                conditions=data.get("conditions", []),
+                evidence_tier=_parse_evidence_tier(data),
+            ))
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            logger.debug("failed to parse return line: %s", line[:200])
+    return returns
+
+
+def parse_error_lines(raw: str) -> list[str]:
+    """Parse SUMMARY_ERROR: lines from Joern query output."""
+    errors = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("SUMMARY_ERROR:"):
+            continue
+        try:
+            data = json.loads(line[len("SUMMARY_ERROR:"):].strip())
+            errors.append(data.get("code", ""))
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            logger.debug("failed to parse error line: %s", line[:200])
+    return errors
+
+
+def build_summary_from_query_outputs(
+    function: str,
+    file: str,
+    *,
+    taint_output: str = "",
+    guard_output: str = "",
+    return_output: str = "",
+    error_output: str = "",
+    callees: list[str] | None = None,
+    callers: list[str] | None = None,
+    state_transitions: list[str] | None = None,
+    source: str = "mechanical",
+    confidence: str = "high",
+) -> FunctionSummary:
+    """Build a FunctionSummary from raw Joern query output strings."""
+    return FunctionSummary(
+        function=function,
+        file=file,
+        taint_rules=parse_taint_lines(taint_output),
+        preconditions=parse_guard_lines(guard_output),
+        returns=parse_return_lines(return_output),
+        error_paths=parse_error_lines(error_output),
+        callees=callees or [],
+        callers=callers or [],
+        state_transitions=state_transitions or [],
+        source=source,
+        confidence=confidence,
+    )
+
+
+# Identifier immediately followed by an open paren — the way review
+# prose names a concrete call ("passes fmt to sprintf(dst, fmt)").
+# Name run bounded — separator fills keep the \b live at every
+# planted head, so an unbounded run is re-scanned per head.
+_CALL_SHAPED_NAME_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_.]{0,128})\s*\(")
+
+# Fallback label when a reaches-sink assumption doesn't name the sink
+# concretely. Kept stable so dedup in propagate_taint_upward (keyed on
+# (source_param, sink_call)) behaves.
+_UNSPECIFIED_SINK = "unspecified_sink"
+
+
+def _sink_name_from_assumption(text: str) -> str:
+    """Best-effort sink name from a free-text reaches-sink assumption.
+
+    Preference order: a known dangerous libc/library sink named as a
+    whole word ("passes buf to memcpy without a bounds check"), then
+    the first call-shaped identifier ("reaches sprintf(dst, fmt)"),
+    else the stable :data:`_UNSPECIFIED_SINK` label. Labeling only —
+    the flow claim itself comes from the structured ``check_type``,
+    never from this parse.
+    """
+    if text:
+        from core.analysis.reachability_gates import DANGEROUS_LIBC_SINKS
+        for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text):
+            if m.group(0) in DANGEROUS_LIBC_SINKS:
+                return m.group(0)
+        m2 = _CALL_SHAPED_NAME_RE.search(text)
+        if m2:
+            return m2.group(1)
+    return _UNSPECIFIED_SINK
+
+
+def summary_from_review_result(
+    function: str,
+    file: str,
+    review_result: dict[str, Any],
+) -> FunctionSummary | None:
+    """Extract a FunctionSummary from an LLM review outcome.
+
+    The LLM discovers security behavior that Joern can't see —
+    conditional sanitization, protocol semantics, design intent.
+    This converts the structured review output into a summary
+    that flows to subsequent callers via taint_summary_results.
+
+    Taint rules: a review precondition with
+    ``check_type == "function_reaches_sink"`` is a structured
+    param-flow claim ("THIS function passes ``parameter`` to a
+    dangerous API"), so it becomes a HEURISTIC-tier
+    :class:`TaintRule` — this is what makes
+    :func:`propagate_taint_upward` functional on LLM summaries
+    (it returns ``[]`` for a callee summary with no taint_rules).
+    """
+    if not review_result:
+        return None
+
+    preconditions = []
+    taint_rules: list[TaintRule] = []
+    for pc in review_result.get("preconditions") or []:
+        if not isinstance(pc, dict):
+            continue
+        param = pc.get("parameter", pc.get("param", ""))
+        assumption = pc.get("assumption", "")
+        if param and assumption:
+            # Default -1 (unknown), matching the taint-rule branch
+            # below: defaulting to 0 fabricated a concrete index that
+            # _param_index_of then "recovered" for ANY named param,
+            # binding inherited taint to whichever caller symbol
+            # feeds callee arg 0.
+            preconditions.append(Precondition(
+                param=param,
+                param_index=pc.get("param_index", -1),
+                conditions=[assumption],
+                evidence_tier=EvidenceTier.HEURISTIC,
+            ))
+        if param and pc.get("check_type") == "function_reaches_sink":
+            # sink_arg_index unknowable from prose — -1 marks it.
+            # source_index -1 (unless the result carries one) lets
+            # propagate_taint_upward recover the index by name from
+            # the sibling precondition record.
+            taint_rules.append(TaintRule(
+                source_param=param,
+                source_index=pc.get("param_index", -1),
+                sink_call=_sink_name_from_assumption(assumption),
+                sink_arg_index=-1,
+                evidence_tier=EvidenceTier.HEURISTIC,
+            ))
+
+    callees = review_result.get("callees", [])
+    callers = review_result.get("callers", [])
+
+    if not preconditions and not taint_rules and not callees and not callers:
+        return None
+
+    return FunctionSummary(
+        function=function,
+        file=file,
+        taint_rules=taint_rules,
+        preconditions=preconditions,
+        callees=callees[:20] if isinstance(callees, list) else [],
+        callers=callers[:20] if isinstance(callers, list) else [],
+        source="llm",
+        confidence="medium",
+        evidence_tier=EvidenceTier.HEURISTIC,
+    )
+
+
+def _param_index_of(summary: FunctionSummary, param_name: str) -> int:
+    """Best-effort parameter index of ``param_name`` in ``summary``'s
+    own function, recovered from records that carry both the name and
+    a concrete index (mechanical taint rules, preconditions).
+
+    ``FunctionSummary`` doesn't store the parameter list itself, so
+    this is the only in-summary source of name→index evidence.
+    Returns -1 when nothing pins the index down.
+    """
+    for r in summary.taint_rules:
+        if r.source_param == param_name and r.source_index >= 0:
+            return r.source_index
+    for p in summary.preconditions:
+        if p.param == param_name and p.param_index >= 0:
+            return p.param_index
+    return -1
+
+
+def propagate_taint_upward(
+    callee_summary: FunctionSummary,
+    caller_summary: FunctionSummary,
+    call_args: list[dict[str, Any]],
+) -> list[TaintRule]:
+    """Inherit callee taint rules into the caller's summary.
+
+    If ``parse_header(user_input)`` has taint_rule param[0]→return,
+    and ``handle_request`` calls it with its own param ``user_input``,
+    then handle_request inherits: param.user_input → var.header_result.
+
+    call_args maps callee param indices to caller param names:
+      [{"callee_index": 0, "caller_param": "user_input"}]
+
+    Returns new TaintRule objects added to caller_summary.
+    """
+    if not callee_summary.taint_rules or not call_args:
+        return []
+
+    arg_map = {a["callee_index"]: a["caller_param"] for a in call_args if "callee_index" in a}
+    inherited = []
+
+    for rule in callee_summary.taint_rules:
+        source_index = rule.source_index
+        if source_index < 0:
+            # An inherited rule carries no index of its own — recover
+            # it from the callee summary's other records by name.
+            # Without this, a once-inherited rule could never match
+            # ``arg_map`` (keyed on callee param indices), capping
+            # propagation at a single hop.
+            source_index = _param_index_of(
+                callee_summary, rule.source_param,
+            )
+        caller_param = arg_map.get(source_index)
+        if not caller_param:
+            continue
+
+        new_rule = TaintRule(
+            source_param=caller_param,
+            # Pin the caller-side index when the caller's own records
+            # know it, so the NEXT hop's arg_map lookup can match.
+            source_index=_param_index_of(caller_summary, caller_param),
+            sink_call=rule.sink_call,
+            sink_arg_index=rule.sink_arg_index,
+            hop_count=rule.hop_count + 1,
+            evidence_tier=EvidenceTier.HEURISTIC,
+        )
+        if not any(
+            r.source_param == new_rule.source_param and r.sink_call == new_rule.sink_call
+            for r in caller_summary.taint_rules
+        ):
+            caller_summary.taint_rules.append(new_rule)
+            inherited.append(new_rule)
+
+    return inherited
+
+
+def resolve_scc_summaries(
+    scc: list[str],
+    summaries: dict[str, FunctionSummary],
+    call_edges: list[dict[str, Any]],
+    max_iterations: int = 3,
+) -> int:
+    """Fixed-point propagation for strongly-connected components.
+
+    Functions in an SCC are mutually recursive — callee-first ordering
+    can't break the cycle. Iterate taint propagation within the SCC
+    until no new rules are discovered or max_iterations is reached.
+
+    Returns the number of new rules propagated.
+    """
+    total_new = 0
+    # Set view: membership runs per edge per iteration; list
+    # membership made the loop O(edges x |scc|).
+    scc_set = set(scc)
+
+    for _iteration in range(max_iterations):
+        round_new = 0
+        for edge in call_edges:
+            caller_key = function_key(
+                edge.get("caller_file", ""), edge.get("caller", ""),
+            )
+            callee_file = edge.get("callee_file") or edge.get("caller_file", "")
+            callee_key = function_key(callee_file, edge.get("callee", ""))
+
+            if caller_key not in scc_set or callee_key not in scc_set:
+                continue
+            if caller_key not in summaries or callee_key not in summaries:
+                continue
+
+            call_args = edge.get("args", [])
+            new_rules = propagate_taint_upward(
+                summaries[callee_key], summaries[caller_key], call_args,
+            )
+            round_new += len(new_rules)
+
+        total_new += round_new
+        if round_new == 0:
+            break
+
+    return total_new

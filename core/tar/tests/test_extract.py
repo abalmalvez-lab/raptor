@@ -10,9 +10,15 @@ from __future__ import annotations
 import gzip
 import io
 import tarfile
+
+import pytest
 from typing import List, Optional
 
-from core.tar.extract import extract_files_from_tar
+from core.tar.extract import (
+    TarOpenError,
+    TarTotalBytesExceeded,
+    extract_files_from_tar,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +63,15 @@ def _select_by_extensions(*exts: str):
             if member.name.endswith(e):
                 return member.name
         return None
+    return _s
+
+
+def _select_named(*names: str):
+    """Selector factory that keeps only exactly-named members."""
+    wanted = set(names)
+
+    def _s(member: tarfile.TarInfo) -> Optional[str]:
+        return member.name if member.name in wanted else None
     return _s
 
 
@@ -258,25 +273,27 @@ def test_directory_member_skipped():
     assert out == {"adir/inside.txt": b"data"}
 
 
-def test_invalid_archive_returns_empty():
-    """Garbage bytes → empty dict, no crash. Consumers can decide
-    whether to log/warn — we just don't blow up."""
-    out = extract_files_from_tar(
-        b"this is not a tar archive",
-        selector=_select_all,
-        mode="r:*",
-    )
-    assert out == {}
+def test_invalid_archive_refuses():
+    """Garbage bytes → TarOpenError (fail closed). Returning an empty
+    dict converted corrupt attacker-influenced input into a
+    "successfully empty" result downstream consumers treated as a
+    complete extraction."""
+    with pytest.raises(TarOpenError):
+        extract_files_from_tar(
+            b"this is not a tar archive",
+            selector=_select_all,
+            mode="r:*",
+        )
 
 
-def test_invalid_gzip_stream_returns_empty():
-    """Truncated / corrupt gzip stream → empty, no crash."""
-    out = extract_files_from_tar(
-        _chunks(b"\x1f\x8b\x00\x00garbage", size=2),
-        selector=_select_all,
-        mode="r|gz",
-    )
-    assert out == {}
+def test_invalid_gzip_stream_refuses():
+    """Truncated / corrupt gzip stream → TarOpenError (fail closed)."""
+    with pytest.raises(TarOpenError):
+        extract_files_from_tar(
+            _chunks(b"\x1f\x8b\x00\x00garbage", size=2),
+            selector=_select_all,
+            mode="r|gz",
+        )
 
 
 def test_empty_archive_returns_empty():
@@ -309,3 +326,380 @@ def test_selector_is_only_called_on_files():
         buf.getvalue(), selector=_s, mode="r:*",
     )
     assert seen == [("afile.txt", True)]
+
+
+def test_max_total_and_entry_caps_with_default_unchanged():
+    from core.tar.extract import TarEntryCountExceeded, TarTotalBytesExceeded
+    raw = _make_tar([(f"f{i}", b"A" * 100) for i in range(5)])
+    # Default (no caps): all extracted — existing callers unaffected.
+    assert len(extract_files_from_tar(raw, selector=lambda m: m.name, mode="r:")) == 5
+    # Aggregate-bytes cap raises (never silently truncates).
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            raw, selector=lambda m: m.name, mode="r:", max_total_bytes=250)
+    # Entry-count cap raises.
+    with pytest.raises(TarEntryCountExceeded):
+        extract_files_from_tar(
+            raw, selector=lambda m: m.name, mode="r:", max_entry_count=2)
+
+
+# ---------------------------------------------------------------------------
+# Decompression budget — max_total_bytes counts skipped members too
+#
+# In stream mode (``r|gz``) tarfile must decompress a member's data
+# even to skip past it, so a gzip-bomb layer whose huge member is
+# skipped (selector miss, safety-filter reject) would burn unbounded
+# CPU if only kept members' bytes counted. Every member's
+# header-declared size is charged against the budget — before the
+# member's data is consumed — so the walk aborts ahead of
+# decompressing a bomb member.
+# ---------------------------------------------------------------------------
+
+
+def test_selector_missed_member_counts_toward_total_bytes():
+    """A big member the selector skips must still trip the budget —
+    the OCI gzip-bomb shape (huge non-wanted member first)."""
+    raw = _make_tar([
+        ("bomb.bin", b"\x00" * 10_000),
+        ("var/lib/dpkg/status", b"wanted"),
+    ], gzipped=True)
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            _chunks(raw),
+            selector=_select_named("var/lib/dpkg/status"),
+            mode="r|gz",
+            max_total_bytes=1_000,
+        )
+
+
+def test_safety_filter_rejected_member_counts_toward_total_bytes():
+    """A member the safety filter rejects (oversized per-member) is
+    skipped-and-decompressed in stream mode — it must count too."""
+    raw = _make_tar([
+        ("oversized.bin", b"\x00" * 10_000),
+        ("small.txt", b"ok"),
+    ], gzipped=True)
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            _chunks(raw),
+            selector=lambda m: m.name,
+            mode="r|gz",
+            max_member_bytes=100,
+            max_total_bytes=1_000,
+        )
+
+
+def test_budget_check_happens_before_member_data_is_consumed():
+    """The budget must trip at header-read time, BEFORE tarfile pulls
+    the bomb member's data from the stream — that early abort is the
+    entire CPU-DoS defense."""
+    bomb = b"\x00" * 1_000_000
+    raw = _make_tar([("bomb.bin", bomb)])  # uncompressed → byte-countable
+
+    consumed = 0
+
+    def _counting_chunks():
+        nonlocal consumed
+        for i in range(0, len(raw), 512):
+            chunk = raw[i:i + 512]
+            consumed += len(chunk)
+            yield chunk
+
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            _counting_chunks(),
+            selector=lambda m: None,  # everything is skipped
+            mode="r|",
+            max_total_bytes=10_000,
+        )
+    # Header blocks plus tarfile read-ahead only — nowhere near the
+    # 1 MB member body.
+    assert consumed < len(bomb) // 2
+
+
+def test_kept_members_still_enforce_budget_in_stream_mode():
+    """Kept bytes trip the cap in stream mode too."""
+    raw = _make_tar([(f"f{i}", b"A" * 100) for i in range(5)], gzipped=True)
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            _chunks(raw),
+            selector=lambda m: m.name,
+            mode="r|gz",
+            max_total_bytes=250,
+        )
+
+
+def test_under_budget_mixed_kept_and_skipped_succeeds():
+    raw = _make_tar([
+        ("skip.bin", b"\x00" * 300),
+        ("keep.txt", b"payload"),
+    ], gzipped=True)
+    out = extract_files_from_tar(
+        _chunks(raw),
+        selector=_select_named("keep.txt"),
+        mode="r|gz",
+        max_total_bytes=1_000,
+    )
+    assert out == {"keep.txt": b"payload"}
+
+
+def test_no_cap_leaves_skipped_members_unbudgeted():
+    """max_total_bytes=None (the opt-out) is unchanged: no counting,
+    no exception, big skipped members tolerated."""
+    raw = _make_tar([
+        ("big-skip.bin", b"\x00" * 50_000),
+        ("keep.txt", b"data"),
+    ], gzipped=True)
+    out = extract_files_from_tar(
+        _chunks(raw),
+        selector=_select_named("keep.txt"),
+        mode="r|gz",
+        max_total_bytes=None,
+    )
+    assert out == {"keep.txt": b"data"}
+
+
+def test_expected_count_short_circuits_before_later_bomb():
+    """Once the wanted members are found, the walk stops — a bomb
+    member AFTER the last wanted one must not trip the budget."""
+    raw = _make_tar([
+        ("keep.txt", b"data"),
+        ("bomb.bin", b"\x00" * 50_000),
+    ], gzipped=True)
+    out = extract_files_from_tar(
+        _chunks(raw),
+        selector=_select_named("keep.txt"),
+        mode="r|gz",
+        max_total_bytes=10_000,
+        expected_count=1,
+    )
+    assert out == {"keep.txt": b"data"}
+
+
+# ---------------------------------------------------------------------------
+# Header-time metadata budget — GNU longname / pax record data is
+# materialised in memory inside tf.next() (and, for buffered modes,
+# inside tarfile.open's firstmember parse); max_total_bytes must bound
+# it BEFORE the allocation.
+# ---------------------------------------------------------------------------
+
+
+def _metadata_bomb(name_len: int, fmt: int) -> bytes:
+    """A gzipped tar whose FIRST member carries a huge name: GNU
+    format stores it as a longname record, pax format as an extended
+    header record — both are header-time in-memory allocations."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=fmt) as tf:
+        info = tarfile.TarInfo(name="d/" + "a" * name_len)
+        info.size = 0
+        tf.addfile(info)
+    return gzip.compress(buf.getvalue())
+
+
+def test_gnu_longname_bomb_aborts_within_budget_stream_mode():
+    bomb = _metadata_bomb(8 * 1024 * 1024, tarfile.GNU_FORMAT)
+    assert len(bomb) < 64 * 1024  # tiny wire size, huge declared name
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            bomb, selector=lambda m: m.name, mode="r|gz",
+            max_total_bytes=1024 * 1024,
+        )
+
+
+def test_gnu_longname_bomb_aborts_within_budget_buffered_mode():
+    """Buffered modes parse the first member inside tarfile.open
+    itself — the budget must already be armed there."""
+    bomb = _metadata_bomb(8 * 1024 * 1024, tarfile.GNU_FORMAT)
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            bomb, selector=lambda m: m.name, mode="r:*",
+            max_total_bytes=1024 * 1024,
+        )
+
+
+def test_pax_header_bomb_aborts_within_budget():
+    bomb = _metadata_bomb(8 * 1024 * 1024, tarfile.PAX_FORMAT)
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            bomb, selector=lambda m: m.name, mode="r|gz",
+            max_total_bytes=1024 * 1024,
+        )
+
+
+def test_longname_chain_of_empty_records_is_bounded():
+    """Each metadata record charges at least its header block, so an
+    archive that is nothing but longname records cannot spin the
+    parser unbudgeted."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w",
+                      format=tarfile.GNU_FORMAT) as tf:
+        for i in range(200):
+            info = tarfile.TarInfo(name=f"d{i}/" + "b" * 200)
+            info.size = 0
+            tf.addfile(info)
+    raw = gzip.compress(buf.getvalue())
+    with pytest.raises(TarTotalBytesExceeded):
+        extract_files_from_tar(
+            raw, selector=lambda m: m.name, mode="r|gz",
+            max_total_bytes=10_000,
+        )
+
+
+def test_legitimate_long_name_under_budget_extracts():
+    """The metadata budget must not refuse ordinary deep-path
+    archives: a 300-char name is a normal GNU longname record."""
+    long_name = "pkg/" + "sub/" * 60 + "leaf.txt"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w",
+                      format=tarfile.GNU_FORMAT) as tf:
+        info = tarfile.TarInfo(name=long_name)
+        content = b"payload"
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+    raw = gzip.compress(buf.getvalue())
+    found = extract_files_from_tar(
+        raw, selector=lambda m: m.name, mode="r|gz",
+        max_total_bytes=1024 * 1024,
+    )
+    assert found == {long_name: b"payload"}
+
+
+# ---------------------------------------------------------------------------
+# sink mode — members stream out instead of accumulating in the dict
+# ---------------------------------------------------------------------------
+
+
+def test_sink_receives_members_and_dict_holds_placeholders():
+    raw = _make_tar([("a.txt", b"alpha"), ("b.txt", b"beta")])
+    streamed = {}
+    found = extract_files_from_tar(
+        raw, selector=lambda m: m.name, mode="r:",
+        sink=streamed.__setitem__,
+    )
+    assert streamed == {"a.txt": b"alpha", "b.txt": b"beta"}
+    # Placeholders keep expected_count / unique_keys semantics without
+    # retaining the bytes.
+    assert found == {"a.txt": b"", "b.txt": b""}
+
+
+def test_sink_exception_aborts_walk():
+    raw = _make_tar([("a.txt", b"alpha"), ("b.txt", b"beta")])
+    seen = []
+
+    def sink(key, data):
+        seen.append(key)
+        raise RuntimeError("budget blown")
+
+    with pytest.raises(RuntimeError, match="budget blown"):
+        extract_files_from_tar(
+            raw, selector=lambda m: m.name, mode="r:", sink=sink,
+        )
+    assert seen == ["a.txt"]
+
+
+def test_truncated_gz_via_seekable_mode_raises_typed_mid_iteration():
+    """Seekable auto-detect mode ("r:*" — the SCA consumer's mode)
+    defers decompression, so a .tar.gz truncated mid-stream OPENS fine
+    and only fails inside the member walk — pre-fix that surfaced as a
+    raw builtins.EOFError ("Compressed file ended before the
+    end-of-stream marker"), crashing consumers that guard the
+    documented ``except (TarOpenError, tarfile.TarError)`` shape.
+    The mid-iteration failure must be typed like the open path."""
+    from core.tar.extract import TarReadError
+
+    import os as _os
+    raw = _make_tar(
+        [("pkg/a.py", b"x" * 512), ("pkg/b.py", _os.urandom(200_000))],
+        gzipped=True,
+    )
+    # Cut near the END: tarfile.open's firstmember parse succeeds (a
+    # truncation early enough fails AT OPEN, which was already typed);
+    # the corruption then surfaces from the second member's read,
+    # inside the iteration loop.
+    truncated = raw[: len(raw) - 4096]
+    with pytest.raises(TarReadError) as excinfo:
+        extract_files_from_tar(truncated, selector=_select_all, mode="r:*")
+    # The typed contract: TarReadError IS a TarOpenError IS a
+    # tarfile.TarError — every existing guard catches it.
+    assert isinstance(excinfo.value, TarOpenError)
+    assert isinstance(excinfo.value, tarfile.TarError)
+
+
+def test_intact_seekable_archive_still_extracts():
+    # Two-direction: the translation wrappers must not perturb a
+    # healthy r:* walk.
+    raw = _make_tar([("pkg/a.py", b"data")], gzipped=True)
+    out = extract_files_from_tar(raw, selector=_select_all, mode="r:*")
+    assert out == {"pkg/a.py": b"data"}
+
+
+def test_bitflipped_xz_via_seekable_mode_raises_typed():
+    """A bit-flipped ``.tar.xz`` (the SCA consumer's ``r:*`` mode
+    auto-detects xz) opens fine and surfaces ``lzma.LZMAError`` from
+    the member read mid-walk — LZMAError subclasses neither TarError
+    nor OSError, so pre-fix it escaped every translation wrap raw and
+    crashed consumers guarding the documented typed shape.
+    (``zlib.error`` is the raw-deflate sibling in the same tuple;
+    open-time gz corruption is wrapped by tarfile itself.)"""
+    import io as _io
+    import os as _os
+
+    from core.tar.extract import TarReadError
+
+    lzma = pytest.importorskip("lzma")
+
+    buf = _io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:xz") as tf:
+        for name in ("pkg/a.bin", "pkg/b.bin"):
+            data = _os.urandom(300_000)  # incompressible: flips land in payload
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, _io.BytesIO(data))
+    blob = bytearray(buf.getvalue())
+    # Flip one bit well past the xz/tar headers so tarfile.open's
+    # firstmember parse succeeds and the corruption surfaces from the
+    # second member's read, inside the iteration loop.
+    blob[int(len(blob) * 0.75)] ^= 0x01
+
+    with pytest.raises(TarReadError) as excinfo:
+        extract_files_from_tar(bytes(blob), selector=_select_all, mode="r:*")
+    assert isinstance(excinfo.value, TarOpenError)
+    assert isinstance(excinfo.value, tarfile.TarError)
+    assert isinstance(excinfo.value.__cause__, lzma.LZMAError)
+
+
+def test_intact_xz_archive_still_extracts():
+    # Two-direction: the widened translation tuple must not perturb a
+    # healthy xz walk.
+    import io as _io
+
+    pytest.importorskip("lzma")
+    buf = _io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:xz") as tf:
+        info = tarfile.TarInfo(name="pkg/a.py")
+        info.size = 4
+        tf.addfile(info, _io.BytesIO(b"data"))
+    out = extract_files_from_tar(
+        buf.getvalue(), selector=_select_all, mode="r:*")
+    assert out == {"pkg/a.py": b"data"}
+
+
+class TestPackageExportClosure:
+    """The package facade must re-export its submodules' public API.
+
+    Pinned mechanically over the submodule __all__ lists so a name
+    added to a submodule cannot silently miss the facade (TarReadError
+    was listed in extract.__all__ yet not importable from core.tar).
+    """
+
+    def test_every_submodule_export_reachable_from_package(self):
+        import core.tar as pkg
+        from core.tar import extract, safe_member
+
+        for name in (*extract.__all__, *safe_member.__all__):
+            assert hasattr(pkg, name), f"core.tar lacks {name}"
+            assert name in pkg.__all__, f"core.tar.__all__ lacks {name}"
+
+    def test_tar_read_error_importable_and_typed(self):
+        from core.tar import TarOpenError, TarReadError
+        assert issubclass(TarReadError, TarOpenError)

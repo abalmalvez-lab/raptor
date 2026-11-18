@@ -1,0 +1,569 @@
+"""Reachability audit harness — corpus-agnostic measurement of the
+reachability substrate's classification accuracy.
+
+Given a target tree plus a label map (function → ``"dead"`` | ``"live"``),
+classify every labelled function with the shipped reachability signals and
+report:
+
+  * coverage — labelled-dead functions correctly classified dead;
+  * **false-suppress** — labelled-live functions wrongly classified dead.
+    This is the false-negative-critical metric: a witness kind earns the
+    right to *enforce* (hard-suppress) only once its false-suppress count
+    is zero across a labelled corpus. Until then, surface-only.
+
+The harness is deliberately corpus-agnostic: it takes a directory and a
+label map, names no particular corpus, and is driven by tests (a committed
+synthetic corpus) and, off-repo, by whatever labelled trees the operator
+points it at.
+
+``classify_reachability`` composes the public accessors in precedence
+order; it is the read-only "audit" sibling of the /agentic enrichment
+prepass (which mutates a checklist with the same precedence).
+"""
+
+from __future__ import annotations
+
+import logging
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
+from functools import wraps
+
+from core.paths import path_to_module
+
+logger = logging.getLogger(__name__)
+
+# Verdicts that mean "not reachable in this deployment" (dead).
+_DEAD_VERDICTS = frozenset({
+    "module_aborts", "lexical_dead", "build_excluded",
+    "no_path_from_entry", "not_called", "binary_oracle_absent",
+})
+# Verdicts that mean "reachable / has a live path".
+_LIVE_VERDICTS = frozenset({
+    "reachable", "framework_callable", "registered_via_call", "called",
+    "frida_runtime_trace", "frida_call_edge", "binary_call_edge",
+})
+# "uncertain" is neither — the substrate declines to claim.
+
+# Every string a PRECEDENCE stage can return. Keep in lockstep with
+# the stage functions above. The drift guard in test_reach_witness
+# asserts this literal is fully partitioned into _DEAD_VERDICTS /
+# _LIVE_VERDICTS / {"uncertain"} AND fully mapped in
+# reach_witness.VERDICTS — a new stage verdict added without both
+# entries fails the guard instead of silently falling to the
+# uncertain fail-safe (binary_call_edge already slipped through once
+# when the guard derived the emitted set from the _DEAD/_LIVE sets
+# themselves, making its premise circular).
+_STAGE_VERDICTS = frozenset({
+    "module_aborts", "lexical_dead", "frida_runtime_trace",
+    "frida_call_edge", "binary_oracle_absent", "build_excluded",
+    "framework_callable", "registered_via_call", "binary_call_edge",
+    "reachable", "no_path_from_entry", "called", "not_called",
+    # The interstitial vacuity stage returns "uncertain" EXPLICITLY (a
+    # terminal stop, not a fall-through): interstitial spans must never
+    # reach the graph stages below it. Deliberately outside the
+    # dead/live partition — uncertain is the neither-claim bucket.
+    "uncertain",
+})
+
+_joern_server = ContextVar("raptor_reachability_joern", default=None)
+
+
+def set_joern_server(server) -> Token:
+    """Set a Joern server for indirect-call resolution.
+
+    When set, the ``not_called`` verdict from ``_stage_one_hop`` is
+    checked against Joern's CPG callers query before firing. This
+    catches function-pointer callbacks, struct dispatch, and other
+    indirect calls that tree-sitter misses.
+
+    Call with None to clear.
+    """
+    return _joern_server.set(server)
+
+
+def reset_joern_server(token) -> None:
+    """Restore the caller's registration after a nested graph session."""
+    _joern_server.reset(token)
+
+
+def bind_joern_context(callback):
+    """Capture this graph binding for a thread without leaking it to later jobs."""
+    server = _joern_server.get()
+
+    @wraps(callback)
+    def bound(*args, **kwargs):
+        token = set_joern_server(server)
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            reset_joern_server(token)
+    return bound
+
+
+def submit_with_joern(executor, callback, *args, **kwargs):
+    return executor.submit(bind_joern_context(callback), *args, **kwargs)
+
+
+@dataclass
+class _ClassifyCtx:
+    """Per-target inputs shared by the precedence stages."""
+    inventory: dict[str, object]
+    file_path: str
+    name: str
+    line: int
+    module: str
+    target: object          # reachability.InternalFunction
+    class_name: str | None = None   # enclosing class, for method qualnames
+
+
+# --- precedence stages: each (ctx, R) -> verdict string | None -------------
+# R is the core.analysis.reachability module (the accessors). A stage returns
+# its verdict when it fires, else None to fall through to the next stage.
+
+def _stage_module_aborts(ctx: _ClassifyCtx, R) -> str | None:
+    abort = R.module_aborts_on_load(ctx.inventory, ctx.file_path)
+    if not abort:
+        return None
+    abort_line = abort.get("line")
+    if not isinstance(abort_line, int) or abort_line <= 0:
+        # A record without a usable line can't prove the function
+        # binds BELOW the abort. Defaulting the missing line to 0
+        # made every function in the file read below it — a SOUND
+        # witness hard-suppressing on malformed evidence.
+        logger.warning(
+            "module_aborts record for %s lacks a line; witness skipped",
+            ctx.file_path,
+        )
+        return None
+    line = ctx.line or _item_line_start(
+        ctx.inventory, ctx.file_path, ctx.name)
+    if line and line > abort_line:
+        return "module_aborts"
+    return None
+
+
+def _stage_lexical_dead(ctx: _ClassifyCtx, R) -> str | None:
+    if R.is_lexically_dead(ctx.inventory, ctx.file_path, ctx.name, ctx.line):
+        return "lexical_dead"
+    return None
+
+
+def _stage_frida_call_edge(ctx: _ClassifyCtx, R) -> str | None:
+    """Promote if frida observed a call INTO the function at runtime."""
+    if R.frida_call_edge_present(ctx.inventory, ctx.file_path, ctx.name,
+                                 ctx.line):
+        return "frida_call_edge"
+    return None
+
+
+def _stage_binary_oracle_absent(ctx: _ClassifyCtx, R) -> str | None:
+    if R.binary_oracle_absent(
+        ctx.inventory, ctx.file_path, ctx.name, ctx.line,
+    ):
+        return "binary_oracle_absent"
+    return None
+
+
+def _stage_frida_runtime_trace(ctx: _ClassifyCtx, R) -> str | None:
+    """Promote if frida observed the function at runtime."""
+    if R.frida_runtime_trace_present(
+        ctx.inventory, ctx.file_path, ctx.name, ctx.line,
+    ):
+        return "frida_runtime_trace"
+    return None
+
+
+def _stage_binary_call_edge(ctx: _ClassifyCtx, R) -> str | None:
+    if R.binary_call_edge_present(
+        ctx.inventory, ctx.file_path, ctx.name, ctx.line,
+    ):
+        return "binary_call_edge"
+    return None
+
+
+def _stage_build_excluded(ctx: _ClassifyCtx, R) -> str | None:
+    if R.build_excluded(ctx.inventory, ctx.file_path):
+        return "build_excluded"
+    return None
+
+
+def _stage_framework(ctx: _ClassifyCtx, R) -> str | None:
+    if R.is_framework_callable(ctx.inventory, ctx.target):
+        return "framework_callable"
+    return None
+
+
+def _stage_registered(ctx: _ClassifyCtx, R) -> str | None:
+    if R.is_registered_via_call(ctx.inventory, ctx.target):
+        return "registered_via_call"
+    return None
+
+
+def _stage_interstitial_vacuous(ctx: _ClassifyCtx, R) -> str | None:
+    """Interstitial spans never enter a call graph — stop at uncertain.
+
+    An ``interstitial`` checklist item is a synthetic file-scope span
+    (name ``interstitial:<start>-<end>``), not a callable symbol: no
+    extractor emits call edges into or out of that NAME, so the graph
+    stages below (entry-reachability, 1-hop) can only ever manufacture
+    ``no_path_from_entry`` / ``not_called`` for it — a vacuous verdict,
+    not evidence. Reachable for script-per-file handler spans is not
+    claimed either (whether the file is request-addressable is
+    deployment knowledge the graph doesn't have); ``uncertain`` keeps
+    every consumer's behavior at "analyse it". The sound line-based
+    witnesses above (module_aborts, lexical_dead) still apply — a
+    handler span below an unconditional module abort is dead
+    regardless of kind.
+
+    Sites resolve to interstitial items only via
+    ``core.inventory.lookup.lookup_function``'s stamp-gated handler
+    enclosure; the guard keys on item kind, so an unstamped
+    interstitial reaching here (a direct caller) gets the same
+    vacuity treatment.
+    """
+    items = _candidate_items(ctx.inventory, ctx.file_path, ctx.name)
+    for it in items:
+        if isinstance(it, dict) and it.get("kind") == "interstitial":
+            return "uncertain"
+    # Name-shape fallback for spans the item index cannot resolve
+    # (span boundaries drift between checklist vintages, so a caller
+    # holding an older span name misses the index): the ``:`` makes
+    # the prefix impossible as a real identifier in any inventoried
+    # language, and the 1-hop stage below returns NOT_CALLED even for
+    # names with no inventory item at all — exactly the manufactured
+    # verdict this stage exists to stop.
+    if not items and ctx.name.startswith("interstitial:"):
+        return "uncertain"
+    return None
+
+
+def _stage_entry(ctx: _ClassifyCtx, R) -> str | None:
+    er = R.entry_reachability(ctx.inventory, ctx.target)
+    if er == "reachable":
+        return "reachable"
+    if er == "no_path_from_entry":
+        # CHA: entry-reachability follows resolved call edges, not the
+        # over-inclusive method-dispatch index. A polymorphic-dispatch override
+        # (or any Go method — Go interfaces are structural) whose name is
+        # dispatched via an unresolved member call could be reached at runtime
+        # through interface/virtual dispatch even when no resolved path exists.
+        # Fall through to UNCERTAIN rather than claim no_path_from_entry — the
+        # same FN-safe rule the 1-hop stage applies to NOT_CALLED.
+        if R.is_virtual_dispatch_candidate(
+                ctx.inventory, ctx.class_name, ctx.name):
+            return None
+        return "no_path_from_entry"
+    return None
+
+
+def _stage_one_hop(ctx: _ClassifyCtx, R) -> str | None:
+    # A method called only via ``this.m()`` / ``self.m()`` resolves through the
+    # method-match index under its CLASS-qualified name (``mod.Class.m``); the
+    # bare ``mod.m`` form misses it and reads not_called. Try the class-qualified
+    # name first (when the item is a method), then the bare form (top-level
+    # functions / where the class-qualified form isn't how the file is indexed).
+    candidates = []
+    if ctx.class_name:
+        candidates.append(f"{ctx.module}.{ctx.class_name}.{ctx.name}")
+    candidates.append(f"{ctx.module}.{ctx.name}")
+    verdicts = []
+    for qn in candidates:
+        try:
+            verdicts.append(R.function_called(ctx.inventory, qn).verdict)
+        except ValueError:
+            continue
+    if R.Verdict.CALLED in verdicts:
+        return "called"
+    if R.Verdict.NOT_CALLED in verdicts:
+        # CHA: before demoting, check whether this is a polymorphic-dispatch
+        # override that's dispatched via an unresolved member call somewhere —
+        # a virtual call could reach it at runtime even though no resolved edge
+        # exists. If so fall through to UNCERTAIN (not_called would be unsafe);
+        # precise typed dispatch resolution is CodeQL's (Tier 2) job.
+        if R.is_virtual_dispatch_candidate(ctx.inventory, ctx.class_name, ctx.name):
+            return None
+        if _joern_has_callers(ctx.name):
+            logger.debug(
+                "not_called overridden by Joern callers for %s", ctx.name,
+            )
+            return "called"
+        return "not_called"
+    return None
+
+
+def _joern_has_callers(function_name: str) -> bool:
+    """Check whether Joern finds callers that tree-sitter missed.
+
+    Advisory PROMOTE channel only: it can rescue a graph-derived
+    not_called, never demote.  The tri-state ``None`` (consultation
+    unavailable) therefore maps to False — no rescue, the graph
+    verdict stands, same as a run without a Joern lane.
+    """
+    server = _joern_server.get()
+    if server is None:
+        return False
+    try:
+        from core.analysis.reachability_gates import _joern_find_callers
+        return bool(_joern_find_callers(function_name, server))
+    except Exception:  # noqa: BLE001 — advisory cross-check: any failure means "no extra callers"
+        return False
+
+
+# Ordered precedence. Sound witnesses (module_aborts / lexical_dead) first so
+# they win where they apply (they can hard-suppress); build_excluded
+# (heuristic, whole-file) next so it catches anything in a never-compiled file
+# — incl. functions above a module-abort line and framework-decorated ones,
+# since a file the build never compiles registers nothing; then the specific
+# reachable reasons (framework / registration) before the general
+# entry-reachability and the 1-hop fallback. Adding a witness = insert a stage
+# here + a VERDICTS entry in reach_witness.
+PRECEDENCE = (
+    _stage_module_aborts,
+    _stage_lexical_dead,
+    # Frida runtime-trace promote (SOUND). Empirical runtime
+    # observation is the strongest reachability evidence — if frida
+    # saw the function execute, it's alive regardless of what static
+    # analysis (binary oracle, build_excluded, call graph) claims.
+    # MUST precede _stage_binary_oracle_absent so runtime evidence
+    # vetoes a stale/wrong "absent" verdict from nm+DWARF.
+    _stage_frida_runtime_trace,
+    _stage_frida_call_edge,
+    # binary_oracle absent is mechanically derivable from nm + DWARF —
+    # stronger than build_excluded (build-config parsing heuristic), so
+    # checked first among C/C++/Rust/Go dead witnesses. SOUND +
+    # corpus-earned; current attestation figures live on the
+    # ``binary_oracle_absent`` VerdictSpec in reach_witness (and the
+    # design memo) — re-measure with
+    # core/analysis/scripts/binary-oracle-precision.
+    _stage_binary_oracle_absent,
+    _stage_build_excluded,
+    _stage_framework,
+    _stage_registered,
+    # Interstitial spans stop here: their synthetic names never enter
+    # a call graph, so the graph stages below could only manufacture
+    # vacuous dead verdicts for them (see the stage docstring). MUST
+    # precede _stage_entry / _stage_one_hop; sits after the sound
+    # line-based dead witnesses and the runtime promotes above, which
+    # all remain valid for a file-scope span.
+    _stage_interstitial_vacuous,
+    # Binary direct-call-edge promote (Inc 2b Tier 1). Affirmative
+    # reachability evidence: if the binary shows an incoming direct
+    # call to this function, it's reachable in this build — even when
+    # source extraction missed the edge (header-only inline,
+    # address-taken-then-direct-called). MUST run BEFORE _stage_entry:
+    # entry-reachability is a heuristic graph walk and returns the
+    # negative ``no_path_from_entry`` verdict when it fails — without
+    # this ordering, a function the binary mechanically proves
+    # reachable would get the dead verdict from _stage_entry first
+    # and the binary evidence would never be consulted. Affirmative
+    # binary evidence beats heuristic source-graph dead claims.
+    _stage_binary_call_edge,
+    _stage_entry,
+    _stage_one_hop,
+)
+
+
+def _candidate_items(
+    inventory: dict[str, object], file_path: str, name: str,
+) -> list:
+    """Same-name items for ``(file_path, name)`` via the shared
+    reachability inverse index — hash-lookup-fast instead of the
+    O(N_files) linear scan every ``classify_reachability`` call was
+    paying twice (class-name lookup + accessors) on 30k-file
+    inventories."""
+    from core.analysis.reachability import _get_bo_item_index
+    by_name = _get_bo_item_index(inventory).get(
+        file_path.replace("\\", "/"))
+    if not by_name:
+        return []
+    return by_name.get(name) or []
+
+
+def _item_line_start(
+    inventory: dict[str, object], file_path: str, name: str,
+) -> int:
+    """``line_start`` of the (single) matching item, or 0. Used when a
+    caller passed ``line == 0`` — resolving the item's own span keeps
+    line-conditioned witnesses (module_aborts) usable for line-less
+    queries. Ambiguous names (several same-name items) return 0: we
+    can't know which one the caller means."""
+    items = _candidate_items(inventory, file_path, name)
+    if len(items) != 1:
+        return 0
+    try:
+        return int(items[0].get("line_start") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _lookup_class_name(
+    inventory: dict[str, object], file_path: str, name: str, line: int,
+) -> str | None:
+    """The enclosing class of the ``(file_path, name)`` item, if any — used to
+    build a method's class-qualified name for the 1-hop check.
+
+    Line disambiguation goes through the shared
+    ``_select_item_by_line`` heuristic: production callers (the
+    /agentic chokepoint via ``_finding_coords``) pass the line OF THE
+    FINDING, which is typically INSIDE the function — the previous
+    exact ``line_start`` equality never matched those, so
+    ``class_name`` resolved to None and the method lost its
+    class-qualified 1-hop resolution and the CHA fallthrough.
+    """
+    from core.analysis.reachability import _select_item_by_line
+    for it in _select_item_by_line(
+            _candidate_items(inventory, file_path, name), line):
+        return (it.get("metadata") or {}).get("class_name")
+    return None
+
+
+def classify_reachability(
+    inventory: dict[str, object],
+    file_path: str,
+    name: str,
+    line: int,
+    module: str,
+) -> str:
+    """Strongest applicable reachability verdict for one function — the first
+    stage in :data:`PRECEDENCE` that fires, else ``"uncertain"``. Single
+    source of truth consumed by the CodeQL prefilter, the /agentic enrichment
+    prepass, and the /validate demoter.
+
+    Every verdict is also recorded into the per-language verdict-frequency
+    log (see ``core.analysis.reach_verdict_log``). Counts accumulate
+    in-memory and flush to a sidecar at process exit — gives empirical
+    grounding for "which language needs better framework-catalog
+    coverage" questions without burdening any consumer.
+    """
+    from core.analysis import reach_verdict_log
+    from core.analysis import reachability as R
+    ctx = _ClassifyCtx(
+        inventory=inventory, file_path=file_path, name=name, line=line,
+        module=module,
+        target=R.InternalFunction(file_path=file_path, name=name, line=line),
+        class_name=_lookup_class_name(inventory, file_path, name, line),
+    )
+    verdict = "uncertain"
+    for stage in PRECEDENCE:
+        result = stage(ctx, R)
+        if result:
+            verdict = result
+            break
+    reach_verdict_log.record_verdict(
+        R._file_language(inventory, file_path), verdict)
+    return verdict
+
+
+@dataclass
+class AuditReport:
+    total: int = 0
+    caught_dead: int = 0          # labelled dead, classified dead
+    missed_dead: int = 0          # labelled dead, classified live/uncertain
+    false_suppress: int = 0       # labelled LIVE, classified dead (FN-critical)
+    live_ok: int = 0              # labelled live, classified live/uncertain
+    not_found: int = 0            # labelled fn not in inventory (extraction
+                                  # gap, NOT a reachability misclassification)
+    per_verdict: dict[str, int] = field(default_factory=dict)
+    false_suppress_detail: list = field(default_factory=list)
+    missed_detail: list = field(default_factory=list)
+    not_found_detail: list = field(default_factory=list)
+
+    @property
+    def coverage(self) -> float:
+        dead = self.caught_dead + self.missed_dead
+        return self.caught_dead / dead if dead else 1.0
+
+
+
+
+def audit_corpus(
+    target_dir: str,
+    labels: dict[tuple[str, str], str],
+    *,
+    inventory: dict[str, object] | None = None,
+) -> AuditReport:
+    """Classify each labelled ``(rel_path, func_name) → "dead"|"live"`` and
+    tally coverage + false-suppress. ``inventory`` may be supplied (tests
+    inject a synthetic one to stay tree-sitter-independent); otherwise it's
+    built from ``target_dir``.
+    """
+    if inventory is None:
+        import tempfile
+
+        from core.inventory.builder import build_inventory
+        with tempfile.TemporaryDirectory() as td:
+            inventory = build_inventory(target_dir, td)
+
+    # Index items by (rel_path, name) → EVERY line, for label lookup.
+    # Same-name items in one file (overloads, #if/#else branches,
+    # nested defs) each keep their line — measuring only the
+    # last-seen variant's line scored a duplicated name at an
+    # arbitrary variant.
+    lines_of: dict[tuple[str, str], list[int]] = {}
+    for f in inventory.get("files", []):  # type: ignore[union-attr,attr-defined]
+        if not isinstance(f, dict):
+            continue
+        rel = f.get("path") or ""
+        for it in f.get("items", []):
+            if isinstance(it, dict) and it.get("kind", "function") == "function":
+                lines_of.setdefault(
+                    (rel, it.get("name") or ""), [],
+                ).append(int(it.get("line_start") or 0))
+
+    report = AuditReport()
+    for (rel, name), label in labels.items():
+        module = path_to_module(rel)
+        if not module:
+            # No module derivable from the path (extension-less
+            # scripts, exotic layouts) — an extraction/derivation
+            # gap, NOT a reachability verdict. Silently skipping
+            # shrank the total, the coverage AND the false-suppress
+            # denominators without trace, refuting the "bucketed
+            # separately so it can't masquerade" promise.
+            report.not_found += 1
+            report.not_found_detail.append((rel, name))
+            continue
+        if (rel, name) not in lines_of:
+            # The labelled function isn't in the inventory at all — an
+            # extraction gap, not a reachability verdict. Bucket it
+            # separately so it can't masquerade as a false-suppress (which
+            # would falsely fail the FN gate) or a coverage miss.
+            report.not_found += 1
+            report.not_found_detail.append((rel, name))
+            continue
+        # Classify EVERY same-name variant and score the worst
+        # verdict for the label: a live-labelled row false-suppresses
+        # if ANY variant classifies dead; a dead-labelled row is
+        # caught only when EVERY variant classifies dead.
+        verdicts = [
+            classify_reachability(inventory, rel, name, line, module)
+            for line in lines_of[(rel, name)]
+        ]
+        dead_flags = [v in _DEAD_VERDICTS for v in verdicts]
+        if label == "dead":
+            # Worst for a dead label = a live-reading variant.
+            worst_idx = (
+                dead_flags.index(False) if not all(dead_flags) else 0
+            )
+        else:
+            # Worst for a live label = a dead-reading variant.
+            worst_idx = dead_flags.index(True) if any(dead_flags) else 0
+        verdict = verdicts[worst_idx]
+        report.total += 1
+        report.per_verdict[verdict] = report.per_verdict.get(verdict, 0) + 1
+        is_dead = verdict in _DEAD_VERDICTS
+        if label == "dead":
+            if is_dead:
+                report.caught_dead += 1
+            else:
+                report.missed_dead += 1
+                report.missed_detail.append((rel, name, verdict))
+        elif is_dead:
+            report.false_suppress += 1
+            report.false_suppress_detail.append((rel, name, verdict))
+        else:
+            report.live_ok += 1
+    return report
+
+
+__all__ = ["AuditReport", "audit_corpus", "classify_reachability"]

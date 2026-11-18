@@ -1,0 +1,336 @@
+"""Detector for ``known_exfil_destination``.
+
+Greps the project source for URLs / domains that recur in
+known supply-chain attacks as exfiltration or payload-staging
+endpoints. The match list lives in
+``packages/sca/data/exfil_destinations.json`` so it can be extended
+without code changes; each entry carries a category + severity +
+human-readable reason.
+
+The check is an *enumeration of known-bad shapes* (paste sites,
+URL shorteners, anonymous file-sharing, Tor, Discord webhooks,
+Telegram bots, raw IP URLs). It catches the recurring shapes that
+attackers reach for; it doesn't catch novel C2 hosts. The recall
+floor is the bundled list — operators extend the file as new
+patterns surface.
+
+Walk policy:
+- Same vendored-tree exclusions as the artefact walks.
+- Source extensions only (``.py``, ``.js``, ``.ts``, ``.sh``,
+  ``.json``, ``.yaml``, ``.toml``, ``.md``, ``.html``). README and
+  docs files commonly link to legitimate URLs; the list is
+  curated such that those won't trigger.
+- Cap each file's read at 1 MB; URLs in larger files are an
+  unusual shape worth a separate flag if it ever happens.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from core.json import load_json_bounded
+
+from ..discovery import EXCLUDED_DIR_NAMES
+from ..models import Confidence, Dependency, Manifest
+from ..parsers import _safe_read
+from ._source_exts import SOURCE_CODE_EXTS as _SOURCE_CODE_EXTS
+from ._closest_manifest import project_host_dep
+from ._closest_manifest import rel_to_target as _rel
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+logger = logging.getLogger(__name__)
+
+_DATA_FILE = Path(__file__).resolve().parent.parent / "data" / \
+    "exfil_destinations.json"
+
+# Canonical skip set + this walker's extras. Drift-free: a new entry
+# in discovery.EXCLUDED_DIR_NAMES propagates to every walker.
+_EXCLUDED_DIRS: set[str] = EXCLUDED_DIR_NAMES | {
+    "site-packages",        # any virtualenv that snuck in
+}
+
+# Files we'll scan: the shared source/config set (kept in
+# ``_source_exts`` so this walker and typosquat_domain can't drift
+# apart again) plus documentation formats — an exfil indicator in a
+# doc is still an indicator. Exclude binary / archive types.
+_SCAN_EXTS: set[str] = set(_SOURCE_CODE_EXTS) | {
+    ".md", ".rst", ".txt", ".html",
+}
+
+_MAX_BYTES_PER_FILE = 1024 * 1024
+_DEFAULT_MAX_DEPTH = 12
+
+# Generic URL regex — captures
+# `<scheme>://[userinfo@]<host>[:port][/path][?qs]`. The optional
+# userinfo section (``user:pass@``) is consumed BEFORE the host
+# capture: URL semantics resolve ``https://api.github.com@pastebin.com/x``
+# to host ``pastebin.com`` (everything before ``@`` is userinfo the
+# server never sees), so a regex that captured the userinfo as the
+# host would evaluate the decoy name while the runtime connects to
+# the real destination. The group requires a literal ``@`` to consume
+# anything, so plain URLs are unaffected.
+# IGNORECASE: URL schemes are case-insensitive at runtime —
+# ``HTTPS://pastebin.com/x`` fetches exactly like the lowercase
+# spelling, so a cased scheme must not slip past the extractor.
+_URL_RE = re.compile(
+    rb"\bhttps?://(?:[A-Za-z0-9._%+:\-]*@)?"
+    rb"(?P<host>[A-Za-z0-9.\-]+)(?::\d+)?(?P<rest>[^\s'\"<>`)\]]*)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ExfilFinding:
+    dependency: Dependency
+    detail: str
+    path: Path
+    line: int
+    severity: str
+    confidence: Confidence
+    category: str
+
+
+# Compiled rules cache — one load per process, then reuse.
+_RULES_CACHE: list[_Rule] | None = None
+
+
+@dataclass(frozen=True)
+class _Rule:
+    category: str
+    severity: str
+    reason: str
+    host_suffix: str | None      # match on URL host
+    pattern: re.Pattern | None   # match on the full URL
+    tld: str | None              # match on TLD (e.g., "onion")
+
+
+def scan_target(
+    target: Path,
+    manifests: Iterable[Manifest],
+    *,
+    max_depth: int = _DEFAULT_MAX_DEPTH,
+) -> list[ExfilFinding]:
+    """Walk ``target`` source files; return URL-pattern matches."""
+    rules = _load_rules()
+    if not rules:
+        return []
+    target = target.resolve()
+    manifests_list = list(manifests)
+    out: list[ExfilFinding] = []
+    for path in _walk_source_files(target, max_depth=max_depth):
+        out.extend(_scan_file(path, target, manifests_list, rules))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+def _load_rules() -> list[_Rule]:
+    global _RULES_CACHE
+    if _RULES_CACHE is not None:
+        return _RULES_CACHE
+    if not _DATA_FILE.exists():
+        logger.warning(
+            "sca.supply_chain.exfil_destinations: no data file at %s",
+            _DATA_FILE,
+        )
+        _RULES_CACHE = []
+        return _RULES_CACHE
+    try:
+        # Repo-bundled data file; ValueError also covers the
+        # byte-budget refusal.
+        data = load_json_bounded(_DATA_FILE, max_bytes=8 * 1024 * 1024)
+    except (OSError, ValueError) as e:
+        logger.warning(
+            "sca.supply_chain.exfil_destinations: cannot read %s: %s",
+            _DATA_FILE, e,
+        )
+        _RULES_CACHE = []
+        return _RULES_CACHE
+
+    entries = data.get("entries") if isinstance(data, dict) else None
+    rules: list[_Rule] = []
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            severity = entry.get("severity") or "medium"
+            reason = entry.get("reason") or "matches known-bad pattern"
+            category = entry.get("category") or "unspecified"
+            pattern_raw = entry.get("pattern")
+            pattern: re.Pattern | None = None
+            if isinstance(pattern_raw, str):
+                try:
+                    pattern = re.compile(pattern_raw)
+                except re.error as e:
+                    logger.warning(
+                        "sca.supply_chain.exfil_destinations: bad pattern "
+                        "%r: %s", pattern_raw, e,
+                    )
+                    continue
+            host_suffix = (
+                entry.get("host") if isinstance(entry.get("host"), str)
+                else None
+            )
+            tld = entry.get("tld") if isinstance(entry.get("tld"), str) else None
+            if not (pattern or host_suffix or tld):
+                continue
+            rules.append(_Rule(
+                category=str(category),
+                severity=str(severity),
+                reason=str(reason),
+                host_suffix=host_suffix,
+                pattern=pattern,
+                tld=tld,
+            ))
+    _RULES_CACHE = rules
+    return rules
+
+
+def _scan_file(
+    path: Path, target: Path, manifests: list[Manifest],
+    rules: list[_Rule],
+) -> Iterable[ExfilFinding]:
+    data = _safe_read.read_head_bytes(path, max_bytes=_MAX_BYTES_PER_FILE)
+    if not data:
+        # ``read_head_bytes`` already logged any underlying reason.
+        return
+    seen: set[tuple[str, str]] = set()         # (category, host) dedup per file
+    # Line numbers via a rolling (last_pos, last_line) cursor — the
+    # naive ``data.count(b"\n", 0, m.start())`` per finding is
+    # O(matches × file_length), which dominates on URL-heavy files.
+    last_pos = 0
+    last_line = 1
+    for m in _URL_RE.finditer(data):
+        last_line += data.count(b"\n", last_pos, m.start())
+        last_pos = m.start()
+        url_bytes = m.group(0)
+        host_bytes = m.group("host") or b""
+        # errors="replace" cannot raise — no dead UnicodeDecodeError
+        # handler needed.
+        url = url_bytes.decode("utf-8", errors="replace")
+        host = host_bytes.decode("utf-8", errors="replace").lower()
+        for rule in rules:
+            if not _matches_rule(rule, url, host):
+                continue
+            key = (rule.category, host)
+            if key in seen:
+                continue
+            seen.add(key)
+            line = last_line
+            yield ExfilFinding(
+                dependency=_project_host_dep(manifests, path, target),
+                detail=(
+                    f"`{_rel(path, target)}:{line}` references `{url}` — "
+                    f"{rule.reason}"
+                ),
+                path=path,
+                line=line,
+                severity=rule.severity,
+                confidence=Confidence(
+                    "high" if rule.pattern is not None else "medium",
+                    reason=f"matches {rule.category} pattern",
+                ),
+                category=rule.category,
+            )
+
+
+def _matches_rule(rule: _Rule, url: str, host: str) -> bool:
+    if rule.tld is not None and host.endswith("." + rule.tld.lower()):
+        return True
+    if rule.host_suffix is not None:
+        suffix = rule.host_suffix.lower()
+        if host == suffix or host.endswith("." + suffix):
+            return True
+    if rule.pattern is not None and rule.pattern.search(url):
+        # The ``raw_ip`` pattern matches every IPv4. Threat model is
+        # "WAN IP bypasses CDN/DNS oversight" — loopback, RFC 1918,
+        # link-local, and the documentation prefixes (TEST-NET) don't
+        # fit. Filter them out here rather than complicate the regex
+        # in data/exfil_destinations.json.
+        return not (rule.category == "raw_ip" and _is_non_routable_ipv4(host))
+    return False
+
+
+def _is_non_routable_ipv4(host: str) -> bool:
+    """True if ``host`` is an IPv4 address that's not WAN-routable.
+
+    Scope is narrow on purpose: loopback / RFC 1918 private / link-
+    local. Operators binding services to ``127.0.0.1`` /
+    ``192.168.x`` / ``10.x.x.x`` aren't bypassing CDN oversight;
+    they're using local infrastructure.
+
+    We DON'T use ``is_private`` — Python's ``ipaddress`` includes
+    IANA special-purpose ranges (TEST-NET-1/2/3, 192.0.2/24, etc.)
+    in that bucket, but those ranges look like real WAN IPs to a
+    casual reader and are exactly what the rule's threat model
+    wants to flag (a payload pointing at a "real-looking" IP). So
+    we check the three RFC 1918 prefixes explicitly.
+    """
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_link_local:
+        return True
+    rfc1918 = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    )
+    return any(ip in net for net in rfc1918)
+
+
+def _walk_source_files(target: Path, *, max_depth: int) -> Iterable[Path]:
+    """Walk source files looking for hardcoded URLs / IPs / Tor onions.
+
+    Skips test directories and test-shaped filenames — fixtures
+    intentionally contain things this detector flags (mocked exfil
+    destinations, fake C2 URLs), so scanning them produces only
+    self-finding noise. Operators auditing a security-research repo
+    where the test corpus IS the target can fork the detector or
+    filter on path post-hoc.
+    """
+    from .._test_paths import TEST_DIR_NAMES, is_test_path
+
+    base = len(target.parts)
+    for dirpath, dirnames, filenames in os.walk(str(target), followlinks=False):
+        cur = Path(dirpath)
+        depth = len(cur.parts) - base
+        if depth >= max_depth:
+            dirnames[:] = []
+        else:
+        # Sorted so evidence/walk order is filesystem-independent
+        # (parity with reachability._walker's determinism rule).
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in _EXCLUDED_DIRS and d not in TEST_DIR_NAMES
+            )
+        for fn in sorted(filenames):
+            if Path(fn).suffix.lower() not in _SCAN_EXTS:
+                continue
+            full = cur / fn
+            if is_test_path(full, target):
+                continue
+            yield full
+
+
+def _project_host_dep(
+    manifests: list[Manifest], path: Path, target: Path,
+) -> Dependency:
+    return project_host_dep(
+        manifests, path, target,
+        reason="placeholder for known-exfil finding host",
+    )
+
+
+__all__ = ["ExfilFinding", "scan_target"]

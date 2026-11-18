@@ -1,0 +1,920 @@
+"""Tree-sitter structural validation of claimed dataflow paths.
+
+When CodeQL is unavailable, this module validates SARIF ``codeFlows``
+paths (e.g. from Semgrep Pro) by checking that:
+
+1. Each step location exists and is parseable.
+2. Consecutive steps are linked by a call site in the AST.
+3. Sanitizer-NAMED calls lying inside the path's per-file
+   source→sink line window (in the same enclosing function as a
+   step) are identified — position evidence only: nothing here
+   proves the tainted value flows through them.
+4. Branch guards enclosing each step are extracted as
+   ``path_conditions`` for SMT Tier 4.
+
+This is **structural** validation — it confirms the call chain
+exists in source, not that tainted data actually flows through it.
+Confidence is clearly lower than CodeQL IRIS.  The priority cascade
+is hardwired: CodeQL IRIS > structural tree-sitter > LLM-only.
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import re
+import unicodedata
+import warnings
+from dataclasses import dataclass, field
+from functools import lru_cache, partial
+from pathlib import Path
+from typing import Any
+
+from core.inventory.call_graph import (
+    FileCallGraph,
+    extract_call_graph_c,
+    extract_call_graph_cpp,
+    extract_call_graph_go,
+    extract_call_graph_java,
+    extract_call_graph_javascript,
+    extract_call_graph_python,
+    extract_call_graph_ruby,
+    extract_call_graph_rust,
+)
+from core.inventory.languages import detect_language
+from core.source import DEFAULT_MAX_SOURCE_CHARS, read_contained_bytes, read_text_capped
+from core.source.lines import split_lines
+
+logger = logging.getLogger(__name__)
+
+_EXTRACTORS = {
+    "python": extract_call_graph_python,
+    "javascript": extract_call_graph_javascript,
+    # TS / TSX need their own grammars — the bare JS extractor default
+    # parses typed code into ERROR nodes and loses most call edges,
+    # corrupting caller attribution downstream.
+    "typescript": partial(extract_call_graph_javascript, language="typescript"),
+    "tsx": partial(extract_call_graph_javascript, language="tsx"),
+    "java": extract_call_graph_java,
+    "go": extract_call_graph_go,
+    "rust": extract_call_graph_rust,
+    "ruby": extract_call_graph_ruby,
+    "c": extract_call_graph_c,
+    "cpp": extract_call_graph_cpp,
+}
+
+_SANITIZER_RE = re.compile(
+    r'(?:^|_)(?:sanitiz|sanitise|escape|encode|validat'
+    r'|filter|clean|purify|strip|bleach|quote'
+    r'|parameteriz|prepared|bind)',
+)
+
+@dataclass
+class StepVerification:
+    """Result of verifying one step in a dataflow path."""
+    step_index: int
+    file: str
+    line: int
+    function: str | None
+    exists: bool
+    call_link_to_next: bool | None = None
+    has_indirection: bool = False
+    # A broken link (call_link_to_next=False) whose endpoint step
+    # properties carry a sub-``resolved_static`` tier or an
+    # ``assumed_propagation``/``binding_approx`` tag — the producer
+    # itself declared the hop beyond source-static derivation, so
+    # tree-sitter's failure to re-derive it is not refutation
+    # evidence. Only ever True for producers that serialize per-step
+    # tier properties (the cross-file taint engine).
+    link_tier_gated: bool = False
+    sanitizer_calls: list[str] = field(default_factory=list)
+    branch_guards: list[str] = field(default_factory=list)
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "step_index": self.step_index,
+            "file": self.file,
+            "line": self.line,
+            "exists": self.exists,
+        }
+        if self.function:
+            d["function"] = self.function
+        if self.call_link_to_next is not None:
+            d["call_link_to_next"] = self.call_link_to_next
+        if self.has_indirection:
+            d["has_indirection"] = True
+        # Present-only (like has_indirection) so evidence dicts for
+        # producers without step tiers stay byte-identical.
+        if self.link_tier_gated:
+            d["link_tier_gated"] = True
+        if self.sanitizer_calls:
+            d["sanitizer_calls"] = self.sanitizer_calls
+        if self.branch_guards:
+            d["branch_guards"] = self.branch_guards
+        if self.detail:
+            d["detail"] = self.detail
+        return d
+
+
+@dataclass
+class StructuralResult:
+    """Validation result matching the IRIS output shape."""
+    verdict: str
+    reasoning: str
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    sanitizers: list[str] = field(default_factory=list)
+    path_conditions: list[dict[str, Any]] = field(default_factory=list)
+    confidence: str = "low"
+    method: str = "structural-treesitter"
+
+    @property
+    def refuted(self) -> bool:
+        return self.verdict == "refuted"
+
+    @property
+    def iterations(self) -> int:
+        return 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "reasoning": self.reasoning,
+            "evidence": self.evidence,
+            "sanitizers": self.sanitizers,
+            "path_conditions": self.path_conditions,
+            "confidence": self.confidence,
+            "method": self.method,
+        }
+
+
+def _resolve_file(step: dict, repo_path: Path) -> Path | None:
+    """Resolve a step's file path against the repo root.
+
+    Rejects paths that escape ``repo_path`` (traversal defense — step
+    files originate from SARIF which is untrusted scanner output).
+    """
+    raw = step.get("file") or ""
+    if not raw:
+        return None
+    p = Path(raw)
+    # Parent traversal is a path segment, not literal dots in a filename.
+    if ".." in p.parts:
+        return None
+    try:
+        repo_resolved = repo_path.resolve()
+        candidate = (p if p.is_absolute() else repo_path / p).resolve()
+        if candidate.is_relative_to(repo_resolved) and candidate.exists():
+            return candidate
+    except (OSError, RuntimeError, ValueError):
+        # Both absolute and relative scanner paths can fail resolution.
+        # Unavailable source is no evidence for a structural verdict.
+        return None
+    return None
+
+
+def _read_file_content(path: Path, repo_path: Path | None = None) -> str | None:
+    """Read file content with the shared size cap, None on failure.
+
+    Step files are SARIF-named paths into the scanned (untrusted)
+    repo — a planted multi-hundred-MB file must not be materialised
+    whole per finding. A valid prefix can omit a later call while
+    retaining both endpoint functions, so it cannot establish that
+    a call edge is absent. Truncated or invalid UTF-8 reads decline
+    validation rather than supplying altered source to the parser.
+    """
+    try:
+        if repo_path is not None:
+            # Anchor runtime reads beneath the analysed root at open time.
+            # UTF-8 needs at most four bytes per character; retain the
+            # existing character budget after the bounded byte read.
+            raw = read_contained_bytes(repo_path, path, 4 * DEFAULT_MAX_SOURCE_CHARS)
+            if raw is None or raw[1]:
+                return None
+            content = raw[0].decode("utf-8")
+            return content if len(content) <= DEFAULT_MAX_SOURCE_CHARS else None
+        got = read_text_capped(path, errors="strict", newline="")
+    except UnicodeDecodeError:
+        return None
+    if got is None or got[1]:
+        return None
+    return got[0]
+
+
+def _extract_graph(content: str, language: str) -> FileCallGraph | None:
+    """Extract call graph for the given language.
+
+    Returns ``None`` (no evidence) when the language is unsupported,
+    its tree-sitter grammar isn't installed, or graph parsing fails.  The extractors degrade to
+    an EMPTY — but truthy — graph on a missing grammar, which the link
+    check would otherwise misread as proof that the call chain is
+    broken and refute the finding with high confidence; an environment
+    gap must stay inconclusive, not become a suppression.
+    """
+    # Python AST treats bare CR as a newline, unlike scanner coordinates.
+    # Decline those graph spans rather than associating them with LF rows.
+    if language == "python" and "\r" in content.replace("\r\n", ""):
+        return None
+    extractor = _EXTRACTORS.get(language)
+    if extractor is None:
+        return None
+    if language != "python":
+        # Python's extractor uses the stdlib ast module; every other
+        # extractor needs the matching tree-sitter grammar.
+        try:
+            from core.inventory.extractors import _TS_AVAILABLE, _ts_language, _ts_parser_for
+        except ImportError:
+            return None
+        if not _TS_AVAILABLE or _ts_language(language) is None:
+            return None
+    try:
+        if language != "python":
+            # Acquire the tree here so a parser failure cannot become an
+            # empty inventory graph and masquerade as call-edge absence.
+            parser = _ts_parser_for(language)
+            if parser is None:
+                return None
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+            if tree is None:
+                return None
+            return extractor(content, _tree=tree)  # type: ignore[operator]
+        graph = extractor(content)  # type: ignore[operator]
+        if language == "python" and not graph.calls:
+            # The inventory extractor also returns no calls on a failed parse.
+            # Distinguish that failure from valid source containing no calls.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                ast.parse(content)
+        return graph
+    except Exception:  # noqa: BLE001 — hostile source: any parse failure degrades to no-graph
+        return None
+
+
+# Hostile-SARIF work bound on the step walk. Not lower: real SARIF
+# taint paths run a few dozen steps, and parity with
+# MAX_PRESCREEN_STEPS keeps both SARIF-path consumers refusing
+# pathological paths at the same size (a path one accepts is never
+# silently rejected by the other). Not higher: each step can name a
+# DISTINCT file, so the walk stays O(steps × read+parse) even with the
+# per-file caches — an uncapped step count lets a planted SARIF buy
+# unbounded parse work per finding. Over-cap paths degrade to
+# inconclusive; a partial walk must never ground a refutation.
+MAX_STRUCTURAL_STEPS = 64
+
+
+@lru_cache(maxsize=8)
+def _extract_functions_cached(language: str, content: str) -> tuple[Any, ...] | None:
+    """Memoized function-span extraction for the enclosing-function
+    lookup. The span path runs once per STEP (module-level lines have
+    no caller-attributed calls), and pre-memo each run re-parsed the
+    whole file — O(steps × parse) on attacker-sized inputs. Keyed on
+    the content itself; maxsize bounds retained content to a handful
+    of already-size-capped files. Returns a tuple: lru_cache shares
+    the result across callers, so it must be immutable. None records
+    unavailable spans without retrying the same failed parse per step.
+    """
+    from core.inventory import extractors
+    try:
+        if language == "python":
+            # Match the AST syntax domain and identifier spelling of the graph.
+            return tuple(item for item in extractors.PythonExtractor().extract(
+                "<structural-validator>", content)
+                if isinstance(item, extractors.FunctionInfo))
+        # Native regex fallback can omit a scope while the graph still has its
+        # calls. Parse explicitly so span failures remain unresolved attribution.
+        from core.run.gaps import parse_origin
+        extractor = extractors.TreeSitterExtractor(language)
+        with parse_origin("<structural-validator>"):
+            tree = extractor.parser.parse(content.encode())
+        if tree is None:
+            raise RuntimeError("Function-span parser returned no tree")
+        return tuple(extractor.extract("<structural-validator>", content, _tree=tree,
+                                       raise_on_error=True))
+    except Exception:
+        logger.debug("function-span extraction failed", exc_info=True)
+        return None
+
+
+def _enclosing_function_state(
+    line: int,
+    graph: FileCallGraph,
+    content: str,
+    language: str,
+) -> tuple[str | None, bool]:
+    """Enclosing-function name for ``line`` plus whether the two
+    attribution sources agree on it.
+
+    The name comes from call sites' caller field when a call on the
+    line carries one, else from ``extract_functions`` spans.
+    ``resolved`` is False when the sources DIVERGE — the span names a
+    function but the graph attributes calls inside that span to no
+    caller at all (the arrow-function / extractor-gap shape: the span
+    extractor sees ``const run = (x) => {…}`` as function ``run``
+    while the call-graph extractor tags its calls ``caller=None``) —
+    or attributes its calls to an enclosing function's name,
+    or when multiple graph callers share the same source line,
+    or when span extraction itself failed, leaving "module level"
+    indistinguishable from "could not tell".  An unresolved
+    attribution must never ground a broken-link refutation: filtering
+    ``graph.calls`` by a caller name the graph never uses finds
+    vacuous emptiness, not evidence.
+    """
+    line_callers = [c.caller for c in graph.calls if c.line == line]
+    callers_at = [caller for caller in line_callers if caller]
+    if callers_at:
+        # A line can contain calls from several functions or module scope.
+        # Keep the existing positive-match heuristic, but an arbitrary first
+        # caller cannot establish absence when location attribution is ambiguous.
+        caller = callers_at[0]
+        return caller, all(other == caller for other in line_callers)
+
+    span_name: str | None = None
+    span_lo = span_hi = 0
+    extraction_ok = True
+    ancestor_names: set[str] = set()
+    try:
+        funcs = _extract_functions_cached(language, content)
+        if funcs is None:
+            return None, False
+        for f in funcs:
+            if f.line_start <= line and (f.line_end is None or line <= f.line_end):
+                # Extractors may list enclosing definitions before nested ones.
+                # Keep the tightest containing span, independent of that order.
+                end = f.line_end if f.line_end is not None else line
+                if span_name is not None and (
+                    f.line_start < span_lo
+                    or (f.line_start == span_lo and end >= span_hi)
+                ):
+                    continue
+                # Python AST identifiers use NFKC; spans retain source spelling.
+                span_name = (unicodedata.normalize("NFKC", f.name)
+                             if language == "python" else f.name)
+                span_lo = f.line_start
+                span_hi = end
+        if span_name is not None:
+            for f in funcs:
+                if (f.line_end is not None
+                        and f.line_start <= span_lo and span_hi <= f.line_end
+                        and (f.line_start < span_lo or span_hi < f.line_end)):
+                    name = (unicodedata.normalize("NFKC", f.name)
+                            if language == "python" else f.name)
+                    if name != span_name:
+                        ancestor_names.add(name)
+    except Exception:
+        logger.debug("function-at-line lookup failed", exc_info=True)
+        extraction_ok = False
+    if span_name is None:
+        # Module level is trustworthy only when extraction actually
+        # ran; a failed extractor conflates "module level" with
+        # "unknown".
+        return None, extraction_ok
+    # Named nested-child callers are legitimate. Calls assigned to a known
+    # ancestor instead of this span reveal the same scope gap as caller=None.
+    divergent_in_span = any(
+        (c.caller is None or c.caller in ancestor_names)
+        and span_lo <= c.line <= span_hi
+        for c in graph.calls
+    )
+    return span_name, extraction_ok and not divergent_in_span
+
+
+def _find_enclosing_function(
+    line: int,
+    graph: FileCallGraph,
+    content: str,
+    language: str,
+) -> str | None:
+    """Enclosing-function name only (see
+    :func:`_enclosing_function_state` for the agreement flag)."""
+    return _enclosing_function_state(line, graph, content, language)[0]
+
+
+def _check_call_link(
+    from_func: str | None,
+    to_func: str | None,
+    graph: FileCallGraph,
+    cross_file: bool = False,
+    attribution_resolved: bool = True,
+) -> tuple[bool | None, bool]:
+    """Check if from_func calls to_func via the call graph.
+
+    Returns (link_found, has_indirection).
+    link_found: True=confirmed, False=refuted, None=inconclusive.
+
+    ``attribution_resolved=False`` (either endpoint's enclosing-
+    function attribution diverged between the span extractor and the
+    call graph — see :func:`_enclosing_function_state`) downgrades a
+    would-be refutation to inconclusive: the emptiness of a filter
+    keyed on a name the graph never uses is not evidence that the
+    call chain is broken.  Positive matches still count — a found
+    edge is a found edge.
+    """
+    if not to_func:
+        return None, False
+
+    if not cross_file and from_func and from_func == to_func:
+        # Consecutive steps inside the SAME function (the normal shape
+        # of an intra-procedural taint path: source line → assignment
+        # → sink line) are linked by straight-line control flow, not
+        # by a call edge.  Requiring a self-call edge here refuted
+        # every intra-procedural path with high confidence.
+        return True, False
+
+    to_name = to_func.split(".")[-1]
+
+    if from_func:
+        calls_from_func = [
+            c for c in graph.calls if c.caller == from_func
+        ]
+    else:
+        calls_from_func = [c for c in graph.calls if c.caller is None]
+
+    for call in calls_from_func:
+        if not call.chain:
+            continue
+        if call.chain[-1] == to_name:
+            return True, False
+        to_parts = to_func.split(".")
+        if call.chain[-len(to_parts):] == to_parts:
+            return True, False
+
+    if cross_file:
+        for alias, target in graph.imports.items():
+            if to_name == alias or to_name in target.split("."):
+                return True, False
+
+    if not cross_file and from_func:
+        # Return-flow hop: the path's next step lives in a CALLER of
+        # this step's function (source inside a callee, data coming
+        # back over the return value — ``x = get_input(); eval(x)``).
+        # The graph holds the REVERSE edge (to_func → from_func); a
+        # forward-edge-only model refuted every such intra-file path
+        # with high confidence. Same-file only: cross-file same-name
+        # edges are too weak to confirm on.
+        from_name = from_func.split(".")[-1]
+        from_parts = from_func.split(".")
+        for call in graph.calls:
+            if call.caller != to_func or not call.chain:
+                continue
+            if (call.chain[-1] == from_name
+                    or call.chain[-len(from_parts):] == from_parts):
+                return True, False
+
+    has_indirection = bool(graph.indirection)
+    if has_indirection:
+        return None, True
+
+    if cross_file:
+        return None, False
+
+    if not attribution_resolved:
+        return None, False
+
+    return False, False
+
+
+def _identify_sanitizer_calls(
+    calls: list,
+    label: str,
+) -> list[str]:
+    """Identify sanitizer/validator calls from call sites and labels."""
+    found = []
+    for call in calls:
+        if not call.chain:
+            continue
+        name = call.chain[-1].lower()
+        if _SANITIZER_RE.search(name):
+            found.append(".".join(call.chain))
+
+    if label and _SANITIZER_RE.search(label.lower()):
+        found.append(f"label:{label}")
+
+    return found
+
+
+_BRANCH_GUARD_RE = re.compile(
+    r'^\s*(?:if|elif|else\s+if|while|for)\s*[\(]?\s*(.+?)\s*[\)]?\s*[:{]?\s*$'
+)
+
+
+def _extract_branch_guards_from_content(
+    content: str,
+    line: int,
+    _language: str,
+) -> list[str]:
+    """Extract branch guard conditions enclosing the given line.
+
+    Regex + indentation scan only: walks up to 30 preceding lines and
+    collects ``if``/``elif``/``else if``/``while``/``for`` headers at
+    strictly shallower indent. No tree-sitter — best-effort textual
+    evidence for SMT Tier 4, not a parse.
+    """
+    guards: list[str] = []
+    lines = split_lines(content)
+    if line < 1 or line > len(lines):
+        return guards
+
+    scan_start = max(0, line - 30)
+    indent_at_line = len(lines[line - 1]) - len(lines[line - 1].lstrip())
+
+    # range stops at scan_start >= 0, so every yielded index is valid.
+    for i in range(line - 2, scan_start - 1, -1):
+        src_line = lines[i]
+        indent = len(src_line) - len(src_line.lstrip())
+        if indent < indent_at_line:
+            m = _BRANCH_GUARD_RE.match(src_line)
+            if m:
+                cond = m.group(1).strip()
+                if cond and len(cond) < 200:
+                    guards.append(cond)
+            indent_at_line = indent
+
+    return guards
+
+
+#: Step tags that mark a hop as producer-approximated even when the
+#: tier field reads static: ``assumed_propagation`` (taint-all-params
+#: fallback at an unresolvable call) and ``binding_approx``
+#: (receiver/binding guessed by convention).
+_SUB_STATIC_TAGS = frozenset({"assumed_propagation", "binding_approx"})
+
+#: The one tier value that IS source-static derivation. Any other
+#: explicit tier value (``resolved_convention``, ``heuristic_dynamic``,
+#: ``unresolved`` — or an unknown/malformed value, conservatively) marks
+#: the step as beyond what tree-sitter can be expected to re-derive.
+_TIER_RESOLVED_STATIC = "resolved_static"
+
+
+def _step_sub_static(step: dict) -> bool:
+    """True when the step's serialized properties place it below
+    source-static resolution — a tier other than ``resolved_static``,
+    or an approximation tag. Steps without properties (every producer
+    except the cross-file taint engine) are never sub-static, which is
+    what keeps the tier gate producer-scoped."""
+    props = step.get("properties")
+    if not isinstance(props, dict):
+        return False
+    tier = props.get("tier")
+    if "tier" in props and tier != _TIER_RESOLVED_STATIC:
+        return True
+    tags = props.get("tags")
+    if isinstance(tags, (list, tuple)):
+        return any(
+            isinstance(t, str) and t in _SUB_STATIC_TAGS for t in tags
+        )
+    return False
+
+
+def _build_all_steps(dataflow_path: dict) -> list[dict]:
+    """Build the ordered step list from a dataflow_path dict."""
+    source = dataflow_path.get("source")
+    sink = dataflow_path.get("sink")
+    intermediate = dataflow_path.get("steps") or []
+
+    steps = []
+    if source:
+        steps.append(source)
+    steps.extend(intermediate)
+    if sink:
+        steps.append(sink)
+    return steps
+
+
+def validate_structurally(
+    dataflow_path: dict[str, Any],
+    repo_path: Path,
+    *,
+    language: str | None = None,
+) -> StructuralResult:
+    """Validate a claimed dataflow path using tree-sitter structural analysis.
+
+    Args:
+        dataflow_path: Dict with ``source``, ``sink``, ``steps`` keys,
+            each containing ``file``, ``line``, ``label``, ``snippet``.
+        repo_path: Repository root for resolving relative paths.
+        language: Override language detection (optional).
+
+    Returns:
+        StructuralResult with verdict, evidence, and path_conditions.
+        Findings with alternative paths decline this single-path check.
+    """
+    if dataflow_path.get("alternative_paths"):
+        return StructuralResult(
+            verdict="inconclusive",
+            reasoning=(
+                "Dataflow finding has alternative paths; single-path structural "
+                "validation cannot adjudicate the whole finding"
+            ),
+            confidence="low",
+        )
+    steps = _build_all_steps(dataflow_path)
+    if len(steps) < 2:
+        return StructuralResult(
+            verdict="inconclusive",
+            reasoning="Dataflow path has fewer than 2 steps",
+            confidence="low",
+        )
+    if len(steps) > MAX_STRUCTURAL_STEPS:
+        # SARIF is untrusted scanner output over an untrusted repo —
+        # decline the walk instead of paying per-step file reads and
+        # parses on a pathological path. Inconclusive, never refuted:
+        # declining is always sound.
+        return StructuralResult(
+            verdict="inconclusive",
+            reasoning=(
+                f"Dataflow path has {len(steps)} steps — exceeds the "
+                f"{MAX_STRUCTURAL_STEPS}-step bound; structural "
+                f"validation declined"),
+            confidence="low",
+        )
+
+    for index, step in enumerate(steps):
+        line = step.get("line")
+        if line is not None and (isinstance(line, bool) or not isinstance(line, int)):
+            return StructuralResult(
+                verdict="inconclusive",
+                reasoning=f"Step {index} has non-integer line metadata",
+                confidence="low",
+            )
+
+    verifications: list[StepVerification] = []
+    all_sanitizers: list[str] = []
+    seen_sanitizers: set[tuple[str, str]] = set()
+    all_conditions: list[dict[str, Any]] = []
+    file_cache: dict[str, tuple[str | None, str | None, FileCallGraph | None]] = {}
+
+    # Per-file source→sink line window. Sanitizer-call collection is
+    # bounded to it: a call named like a sanitizer AFTER the sink (or
+    # before the source) cannot lie between source and sink, and the
+    # downstream prompt treats the list as barrier evidence — a
+    # hostile repo planting validate_noop() anywhere in the function
+    # must not bias the judgment.
+    window: dict[str, tuple[int, int]] = {}
+    for s in steps:
+        s_file = s.get("file", "") or ""
+        s_line = s.get("line", 0) or 0
+        if not s_file or s_line < 1:
+            continue
+        resolved_source = _resolve_file(s, repo_path)
+        if resolved_source is None:
+            continue
+        # Match file_cache keys so aliases of one file share its window.
+        source_key = str(resolved_source)
+        lo, hi = window.get(source_key, (s_line, s_line))
+        window[source_key] = (min(lo, s_line), max(hi, s_line))
+
+    for i, step in enumerate(steps):
+        file_path_str = step.get("file", "")
+        line = step.get("line", 0) or 0
+        label = step.get("label", "") or ""
+
+        resolved = _resolve_file(step, repo_path)
+        if resolved is None:
+            verifications.append(StepVerification(
+                step_index=i, file=file_path_str, line=line,
+                function=None, exists=False,
+                detail=f"File not found: {file_path_str}",
+            ))
+            continue
+
+        cache_key = str(resolved)
+        if cache_key not in file_cache:
+            content = _read_file_content(resolved, repo_path)
+            lang = language or detect_language(str(resolved))
+            graph = _extract_graph(content, lang) if content and lang else None
+            file_cache[cache_key] = (content, lang, graph)
+        content, lang, graph = file_cache[cache_key]
+
+        if content is None:
+            verifications.append(StepVerification(
+                step_index=i, file=file_path_str, line=line,
+                function=None, exists=False,
+                detail="Could not read file",
+            ))
+            continue
+
+        # Scanner coordinates and branch guards count LF source lines,
+        # not display separators inside comments or strings. The shared
+        # helper also omits a phantom line after a trailing newline.
+        line_count = len(split_lines(content))
+        if line < 1 or line > line_count:
+            verifications.append(StepVerification(
+                step_index=i, file=file_path_str, line=line,
+                function=None, exists=False,
+                detail=f"Line {line} exceeds file length {line_count}",
+            ))
+            continue
+
+        func_name = None
+        func_resolved = True
+        if graph and lang:
+            func_name, func_resolved = _enclosing_function_state(
+                line, graph, content, lang,
+            )
+
+        sanitizer_calls = []
+        if graph:
+            win_lo, win_hi = window.get(cache_key, (line, line))
+            calls_in_range = [
+                c for c in graph.calls
+                if c.caller == func_name and win_lo <= c.line <= win_hi
+            ]
+            sanitizer_calls = _identify_sanitizer_calls(calls_in_range, label)
+            # Result-level list deduped: consecutive steps in the same
+            # function see the same call sites, and the prompt
+            # consumer counts entries as independent evidence.
+            for s_name in sanitizer_calls:
+                key = (cache_key, s_name)
+                if key not in seen_sanitizers:
+                    seen_sanitizers.add(key)
+                    all_sanitizers.append(s_name)
+
+        guards: list[str] = []
+        if lang and content:
+            guards = _extract_branch_guards_from_content(content, line, lang)
+            all_conditions.extend({
+                    "text": g,
+                    "step_index": i,
+                    "negated": False,
+                } for g in guards)
+
+        call_link: bool | None = None
+        has_indirection = False
+        link_tier_gated = False
+        if i < len(steps) - 1:
+            next_step = steps[i + 1]
+            next_resolved = _resolve_file(next_step, repo_path)
+            cross_file = next_resolved is not None and str(next_resolved) != cache_key
+
+            next_func = None
+            next_func_resolved = True
+            if next_resolved and str(next_resolved) not in file_cache:
+                next_content = _read_file_content(next_resolved, repo_path)
+                next_lang = language or detect_language(str(next_resolved))
+                next_graph = _extract_graph(next_content, next_lang) if next_content and next_lang else None
+                file_cache[str(next_resolved)] = (next_content, next_lang, next_graph)
+            if next_resolved:
+                next_content, next_lang, next_graph = file_cache[str(next_resolved)]
+                next_line = next_step.get("line", 0) or 0
+                if next_graph and next_lang and next_content:
+                    next_func, next_func_resolved = _enclosing_function_state(
+                        next_line, next_graph, next_content, next_lang,
+                    )
+
+            if graph:
+                call_link, has_indirection = _check_call_link(
+                    func_name, next_func, graph, cross_file=cross_file,
+                    attribution_resolved=(
+                        func_resolved and next_func_resolved
+                    ),
+                )
+            # Tier gate on a would-be refutation: when either endpoint
+            # of the broken link carries producer-declared sub-static
+            # properties (dispatch-table hop, assumed propagation),
+            # tree-sitter cannot re-derive the edge the producer's
+            # heuristic rode — its absence is not evidence the chain
+            # is broken. Same doctrine as the attribution_resolved
+            # downgrade in _check_call_link; recorded on the
+            # verification so _compute_verdict demotes refuted →
+            # inconclusive instead of losing the signal.
+            if call_link is False and (
+                _step_sub_static(step) or _step_sub_static(next_step)
+            ):
+                link_tier_gated = True
+
+        verifications.append(StepVerification(
+            step_index=i, file=file_path_str, line=line,
+            function=func_name, exists=True,
+            call_link_to_next=call_link,
+            has_indirection=has_indirection,
+            link_tier_gated=link_tier_gated,
+            sanitizer_calls=sanitizer_calls,
+            branch_guards=guards,
+        ))
+
+    return _compute_verdict(verifications, all_sanitizers, all_conditions)
+
+
+def _compute_verdict(
+    verifications: list[StepVerification],
+    sanitizers: list[str],
+    path_conditions: list[dict[str, Any]],
+) -> StructuralResult:
+    """Derive a verdict from step verifications."""
+    if not verifications:
+        return StructuralResult(
+            verdict="inconclusive",
+            reasoning="No steps to verify",
+            confidence="low",
+        )
+
+    total = len(verifications)
+    missing = [v for v in verifications if not v.exists]
+
+    expected_links = verifications[:-1]
+    unresolved_links = [v for v in expected_links if v.call_link_to_next is None]
+    links = [v for v in verifications if v.call_link_to_next is not None]
+    confirmed_links = [v for v in links if v.call_link_to_next is True]
+    # Tier-gated broken links (producer-declared sub-static hop at an
+    # endpoint) are demoted out of the refutation set: they behave
+    # like "could not verify", never like "proven broken". Empty for
+    # every producer that serializes no step tiers, so the verdict
+    # branches below are unchanged for those.
+    broken_links = [
+        v for v in links
+        if v.call_link_to_next is False and not v.link_tier_gated
+    ]
+    tier_gated_links = [
+        v for v in links
+        if v.call_link_to_next is False and v.link_tier_gated
+    ]
+    indirect_links = [v for v in verifications if v.has_indirection and v.call_link_to_next is None]
+
+    evidence = [v.to_dict() for v in verifications]
+
+    if len(missing) > total // 2:
+        return StructuralResult(
+            verdict="inconclusive",
+            reasoning=f"{len(missing)}/{total} steps not found on disk",
+            evidence=evidence,
+            sanitizers=sanitizers,
+            path_conditions=path_conditions,
+            confidence="low",
+        )
+
+    if broken_links and not indirect_links:
+        broken_descs = [
+            f"step {v.step_index} ({v.function or '?'}) → step {v.step_index + 1}"
+            for v in broken_links
+        ]
+        return StructuralResult(
+            verdict="refuted",
+            reasoning=(
+                f"Call chain broken at {len(broken_links)} link(s): "
+                + "; ".join(broken_descs)
+            ),
+            evidence=evidence,
+            sanitizers=sanitizers,
+            path_conditions=path_conditions,
+            confidence="high" if not missing else "medium",
+        )
+
+    if confirmed_links and not broken_links and not missing \
+            and not tier_gated_links and not unresolved_links:
+        return StructuralResult(
+            verdict="confirmed",
+            reasoning=(
+                f"All {len(confirmed_links)} call link(s) verified in AST"
+                + (f"; {len(sanitizers)} sanitizer(s) identified" if sanitizers else "")
+            ),
+            evidence=evidence,
+            sanitizers=sanitizers,
+            path_conditions=path_conditions,
+            confidence="high" if not indirect_links else "medium",
+        )
+
+    if confirmed_links and not broken_links:
+        return StructuralResult(
+            verdict="confirmed",
+            reasoning=(
+                f"{len(confirmed_links)}/{len(expected_links)} call link(s) verified"
+                + (f"; {len(unresolved_links)} unresolved" if unresolved_links else "")
+                + (f"; {len(indirect_links)} indirect" if indirect_links else "")
+                + (
+                    f"; {len(tier_gated_links)} unverifiable "
+                    "(sub-static hop)"
+                    if tier_gated_links else ""
+                )
+                + (f"; {len(missing)} step(s) not found" if missing else "")
+            ),
+            evidence=evidence,
+            sanitizers=sanitizers,
+            path_conditions=path_conditions,
+            confidence="medium",
+        )
+
+    parts = []
+    if confirmed_links:
+        parts.append(f"{len(confirmed_links)} verified")
+    if broken_links:
+        parts.append(f"{len(broken_links)} broken")
+    if tier_gated_links:
+        parts.append(
+            f"{len(tier_gated_links)} broken-link refutation(s) demoted "
+            "(sub-static hop tier)"
+        )
+    if indirect_links:
+        parts.append(f"{len(indirect_links)} indirect")
+
+    return StructuralResult(
+        verdict="inconclusive",
+        reasoning=(
+            f"Mixed call chain evidence: {', '.join(parts)}" if parts
+            else "No call link could be resolved (caller attribution "
+                 "ambiguous or no graph evidence)"
+        ),
+        evidence=evidence,
+        sanitizers=sanitizers,
+        path_conditions=path_conditions,
+        confidence="low",
+    )

@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from packages.llm_analysis.correlation import correlate_results, _build_clusters
 
@@ -192,6 +193,71 @@ class TestBuildClusters:
         assert clusters[0]["pattern"] == "split"
         assert clusters[0]["models_agreed"] is False
 
+    def test_abstention_is_its_own_pattern(self):
+        """An abstained model (verdict field absent — errored /
+        refused record shapes) is a different agreement pattern from
+        an explicit False vote. Pre-fix the pattern key defaulted a
+        MISSING is_exploitable to False, clustering a finding whose
+        second model never produced a verdict together with findings
+        that model actually ruled not-exploitable."""
+        matrix = {
+            "f-001": {"gemini": {"is_exploitable": True},
+                      "gpt-5": {"reasoning": "request timed out"}},
+            "f-002": {"gemini": {"is_exploitable": True},
+                      "gpt-5": {"is_exploitable": False}},
+        }
+        clusters = _build_clusters(matrix, {})
+        assert clusters == []
+
+    def test_matching_abstentions_still_cluster(self):
+        # Two-direction: identical (voter, abstainer) patterns DO
+        # group — the key change only separates abstention from
+        # False; missing-key and schema-nulled None are the SAME
+        # abstention pattern (read_verdict folds both to None).
+        matrix = {
+            "f-001": {"gemini": {"is_exploitable": True},
+                      "gpt-5": {"reasoning": "request timed out"}},
+            "f-002": {"gemini": {"is_exploitable": True},
+                      "gpt-5": {"is_exploitable": None}},
+        }
+        clusters = _build_clusters(matrix, {})
+        assert len(clusters) == 1
+        assert sorted(clusters[0]["finding_ids"]) == ["f-001", "f-002"]
+
+    def test_all_abstain_panel_is_not_unanimous(self):
+        """A panel where every member abstained (None verdicts —
+        errored / refused / schema-failed models) must not mint a
+        "unanimous" cluster from zero actual verdicts: pre-fix
+        None == None satisfied the agreement check while the same
+        findings' confidence signals correctly read no-verdict."""
+        matrix = {
+            "f-001": {"gemini": {"is_exploitable": None},
+                      "gpt-5": {"is_exploitable": None}},
+            "f-002": {"gemini": {"is_exploitable": None},
+                      "gpt-5": {"is_exploitable": None}},
+        }
+        clusters = _build_clusters(matrix, {})
+        assert len(clusters) == 1
+        assert clusters[0]["pattern"] == "no-verdict"
+        assert clusters[0]["models_agreed"] is False
+
+    def test_abstainer_does_not_break_unanimity(self):
+        """Mirror direction: real voters agreeing + one abstainer is
+        still unanimous — abstentions never create (or mask) a
+        dispute (the tally contract)."""
+        matrix = {
+            "f-001": {"gemini": {"is_exploitable": True},
+                      "gpt-5": {"is_exploitable": True},
+                      "mistral": {"is_exploitable": None}},
+            "f-002": {"gemini": {"is_exploitable": True},
+                      "gpt-5": {"is_exploitable": True},
+                      "mistral": {"is_exploitable": None}},
+        }
+        clusters = _build_clusters(matrix, {})
+        assert len(clusters) == 1
+        assert clusters[0]["pattern"] == "unanimous"
+        assert clusters[0]["models_agreed"] is True
+
     def test_multiple_clusters(self):
         matrix = {
             "f-001": {"gemini": {"is_exploitable": True}, "gpt-5": {"is_exploitable": True}},
@@ -201,3 +267,162 @@ class TestBuildClusters:
         }
         clusters = _build_clusters(matrix, {})
         assert len(clusters) == 2
+
+
+class TestAbstentions:
+    """Missing/null is_exploitable is an abstention, never a False
+    vote — pre-fix bool(None) turned errored models into 'not
+    exploitable' verdicts."""
+
+    def test_abstainer_plus_agreeing_verdicts_still_high(self):
+        results = {
+            "f-001": _make_result("f-001", [
+                _make_analysis("gemini", True),
+                _make_analysis("gpt-5", True),
+                _make_analysis("claude", None),  # errored — abstains
+            ]),
+        }
+        result = correlate_results(results)
+        assert result["confidence_signals"]["f-001"] == "high"
+
+    def test_single_real_verdict_with_abstainers_not_disputed(self):
+        results = {
+            "f-001": _make_result("f-001", [
+                _make_analysis("gemini", True),
+                _make_analysis("gpt-5", None),
+                _make_analysis("claude", None),
+            ]),
+        }
+        result = correlate_results(results)
+        # One real verdict + abstainers is unanimous-among-voters,
+        # not a 2-1 majority against.
+        assert result["confidence_signals"]["f-001"] == "high"
+        assert result["unique_insights"] == []
+
+    def test_all_abstain_is_not_high_negative(self):
+        results = {
+            "f-001": _make_result("f-001", [
+                _make_analysis("gemini", None),
+                _make_analysis("gpt-5", None),
+            ]),
+        }
+        result = correlate_results(results)
+        # Zero real verdicts must never mint 'high-negative'.
+        assert result["confidence_signals"]["f-001"] == "no-verdict"
+        assert result["summary"]["agreed"] == 0
+        assert result["summary"]["disputed"] == 0
+
+    def test_missing_key_is_abstention_too(self):
+        analyses = [
+            _make_analysis("gemini", False),
+            {"model": "gpt-5", "reasoning": "errored"},  # no key at all
+            _make_analysis("claude", False),
+        ]
+        results = {"f-001": _make_result("f-001", analyses)}
+        result = correlate_results(results)
+        assert result["confidence_signals"]["f-001"] == "high-negative"
+
+    def test_disputed_majority_excludes_abstainers(self):
+        results = {
+            "f-001": _make_result("f-001", [
+                _make_analysis("gemini", True),
+                _make_analysis("gpt-5", True),
+                _make_analysis("claude", False),
+                _make_analysis("mistral", None),  # abstains
+            ]),
+        }
+        result = correlate_results(results)
+        assert result["confidence_signals"]["f-001"] == "disputed"
+        # Minority is the single dissenting REAL vote, not the
+        # abstainer-inflated fake majority.
+        minority = [u["model"] for u in result["unique_insights"]
+                    if u["finding_id"] == "f-001"]
+        assert minority == ["claude"]
+
+
+class TestStaleVerdictNormalisation:
+    """The active model's per-model entry is refreshed from the
+    post-pipeline top-level result — but a present-but-None top-level
+    field must never convert a real vote into an abstention."""
+
+    @staticmethod
+    def _results(top_exploitable):
+        return {
+            "f1": {
+                "analysed_by": "m1",
+                "is_exploitable": top_exploitable,
+                "exploitability_score": 0.9,
+                "ruling": None,
+                "multi_model_analyses": [
+                    {"model": "m1", "is_exploitable": True,
+                     "exploitability_score": 0.9},
+                    {"model": "m2", "is_exploitable": False,
+                     "exploitability_score": 0.1},
+                ],
+            },
+        }
+
+    def test_present_none_does_not_clobber_vote(self):
+        results = self._results(top_exploitable=None)
+        out = correlate_results(results)
+        # m1's real True vote survives; the panel stays a 1v1 dispute
+        # instead of collapsing to a single-voter "high-negative".
+        assert out["agreement_matrix"]["f1"]["m1"]["is_exploitable"] is True
+        assert out["confidence_signals"]["f1"] == "disputed"
+
+    def test_real_value_still_normalises(self):
+        # Two-direction: a genuine post-pipeline flip IS pulled in.
+        results = self._results(top_exploitable=False)
+        out = correlate_results(results)
+        assert out["agreement_matrix"]["f1"]["m1"]["is_exploitable"] is False
+        assert out["confidence_signals"]["f1"] == "high-negative"
+
+
+class TestTieHandling:
+    """A 1-vs-1 dispute has no majority — neither side may be framed
+    as the dissenting minority against an implied consensus."""
+
+    @staticmethod
+    def _tied():
+        return {
+            "f1": {
+                "analysed_by": "m1",
+                "is_exploitable": True,
+                "multi_model_analyses": [
+                    {"model": "m1", "is_exploitable": True,
+                     "reasoning": "yes"},
+                    {"model": "m2", "is_exploitable": False,
+                     "reasoning": "no"},
+                ],
+            },
+        }
+
+    def test_even_split_lists_both_sides_with_own_verdicts(self):
+        out = correlate_results(self._tied())
+        insights = out["unique_insights"]
+        assert len(insights) == 2
+        by_model = {i["model"]: i for i in insights}
+        assert by_model["m1"]["verdict"] is True
+        assert by_model["m2"]["verdict"] is False
+        assert all(i["tie"] is True for i in insights)
+
+    def test_real_minority_still_framed_as_minority(self):
+        # Two-direction: a genuine 2v1 keeps the minority framing.
+        results = {
+            "f1": {
+                "analysed_by": "m1",
+                "is_exploitable": True,
+                "multi_model_analyses": [
+                    {"model": "m1", "is_exploitable": True},
+                    {"model": "m2", "is_exploitable": True},
+                    {"model": "m3", "is_exploitable": False,
+                     "reasoning": "dissent"},
+                ],
+            },
+        }
+        out = correlate_results(results)
+        insights = out["unique_insights"]
+        assert len(insights) == 1
+        assert insights[0]["model"] == "m3"
+        assert insights[0]["verdict"] is False
+        assert "tie" not in insights[0]

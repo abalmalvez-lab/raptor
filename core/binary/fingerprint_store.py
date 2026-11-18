@@ -50,14 +50,15 @@ crashes on a corrupt entry would block scans.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
-import tempfile
 from pathlib import Path
-from typing import Iterator, Optional, Tuple
+from collections.abc import Iterator
 
-from core.binary.fingerprint import CapabilityFingerprint
+from core.binary.fingerprint import (
+    FINGERPRINT_SCHEMA_VERSION,
+    CapabilityFingerprint,
+)
+from core.json import load_json, save_json
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ def _ref_filename(ref: str) -> str:
 
 def save_fingerprint(
     store_dir: Path, ref: str, fingerprint: CapabilityFingerprint,
-) -> Optional[Path]:
+) -> Path | None:
     """Atomically write ``fingerprint`` to ``store_dir`` keyed
     by ``ref``. Replaces any previous entry for the same ref.
 
@@ -105,38 +106,23 @@ def save_fingerprint(
         "fingerprint": fingerprint.to_dict(),
     }
     final_path = store_dir / _ref_filename(ref)
-    # Atomic write: tmp file in the same dir (so rename is on
-    # the same filesystem and stays atomic), then os.replace.
+    # Atomic write: fingerprint is the drift-detector's on-disk baseline.
+    # A torn write would corrupt JSON, get skipped as unreadable, and
+    # silently disable drift signal for that ref until the next scan.
     try:
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=".tmp-", suffix=".json", dir=store_dir,
-        )
-    except OSError as e:
-        logger.warning(
-            "core.binary.fingerprint_store: tempfile failed for %s: %s",
-            store_dir, e,
-        )
-        return None
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, sort_keys=True, indent=2)
-        os.replace(tmp_name, final_path)
+        save_json(final_path, payload, sort_keys=True)
     except OSError as e:
         logger.warning(
             "core.binary.fingerprint_store: write failed for %s: %s",
             final_path, e,
         )
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
         return None
     return final_path
 
 
 def load_fingerprint(
     store_dir: Path, ref: str,
-) -> Optional[CapabilityFingerprint]:
+) -> CapabilityFingerprint | None:
     """Load the most recently stored fingerprint for ``ref``.
 
     Returns ``None`` when:
@@ -152,13 +138,11 @@ def load_fingerprint(
     file_path = store_dir / _ref_filename(ref)
     if not file_path.is_file():
         return None
-    try:
-        with open(file_path, "r") as f:
-            payload = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+    payload = load_json(file_path, max_bytes=8 * 1024 * 1024)
+    if payload is None:
         logger.debug(
-            "core.binary.fingerprint_store: load failed for %s: %s",
-            file_path, e,
+            "core.binary.fingerprint_store: load failed for %s",
+            file_path,
         )
         return None
     if not isinstance(payload, dict):
@@ -174,6 +158,21 @@ def load_fingerprint(
     fp_dict = payload.get("fingerprint")
     if not isinstance(fp_dict, dict):
         return None
+    # Embedded fingerprint shape is versioned separately from the
+    # store wrapper. Bucket-shape evolution (e.g. adding new BUCKETS
+    # in fingerprint.py) bumps FINGERPRINT_SCHEMA_VERSION; a stale
+    # baseline at the old shape would otherwise produce false-positive
+    # drift for every binary whose imports newly populate the new
+    # buckets. Treat shape mismatch as "no baseline" — operator
+    # re-fingerprints on next run.
+    fp_version = fp_dict.get("schema_version")
+    if fp_version != FINGERPRINT_SCHEMA_VERSION:
+        logger.debug(
+            "core.binary.fingerprint_store: fingerprint shape version "
+            "%s != %s for %s; treating as no baseline",
+            fp_version, FINGERPRINT_SCHEMA_VERSION, file_path,
+        )
+        return None
     try:
         return CapabilityFingerprint.from_dict(fp_dict)
     except (KeyError, TypeError, ValueError) as e:
@@ -186,7 +185,7 @@ def load_fingerprint(
 
 def iter_refs(
     store_dir: Path,
-) -> Iterator[Tuple[str, CapabilityFingerprint]]:
+) -> Iterator[tuple[str, CapabilityFingerprint]]:
     """Yield ``(ref, fingerprint)`` for every entry in the store.
 
     Useful for store-wide audits / CI gates / drift-detection
@@ -196,18 +195,14 @@ def iter_refs(
     if not store_dir.is_dir():
         return
     for entry in sorted(store_dir.iterdir()):
+        # The .json suffix filter is load-bearing for crash recovery
+        # too: an in-flight atomic write's temp (save_json names them
+        # .~savejson-<name>.json.<pid>.<tid>.<rand>.tmp; the atomic_fs
+        # default prefix is .atomic-) always ends .tmp, so a process
+        # killed mid-write leaves nothing this walk can pick up.
         if not entry.is_file() or not entry.name.endswith(".json"):
             continue
-        if entry.name.startswith(".tmp-"):
-            # An in-flight atomic write left a tmp file behind
-            # (process killed mid-write). Skip silently — the
-            # final-named entry is what's load-bearing.
-            continue
-        try:
-            with open(entry, "r") as f:
-                payload = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            continue
+        payload = load_json(entry, max_bytes=8 * 1024 * 1024)
         if not isinstance(payload, dict):
             continue
         if payload.get("schema_version") != STORE_SCHEMA_VERSION:
@@ -215,6 +210,10 @@ def iter_refs(
         ref = payload.get("ref")
         fp_dict = payload.get("fingerprint")
         if not isinstance(ref, str) or not isinstance(fp_dict, dict):
+            continue
+        # See load_fingerprint() for why embedded shape version is
+        # checked separately from the wrapper.
+        if fp_dict.get("schema_version") != FINGERPRINT_SCHEMA_VERSION:
             continue
         try:
             fp = CapabilityFingerprint.from_dict(fp_dict)

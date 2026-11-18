@@ -15,10 +15,12 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import stat
 import sys
+from io import StringIO
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
 
+from core.atomic_fs import write_bytes_atomically
 from core.dataflow.finding import Finding
 from core.dataflow.label import (
     GroundTruth,
@@ -26,12 +28,17 @@ from core.dataflow.label import (
     VERDICT_TRUE_POSITIVE,
 )
 from core.dataflow.validator import TrivialValidator, Validator, ValidatorVerdict
+from core.source import read_text_capped
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 _DEFAULT_CORPUS_DIR = Path(__file__).resolve().parent / "corpus" / "findings"
 
 
-CSV_HEADER: List[str] = [
+CSV_HEADER: list[str] = [
     "finding_id",
     "producer",
     "rule_id",
@@ -43,14 +50,49 @@ CSV_HEADER: List[str] = [
 ]
 
 
-def iter_corpus(corpus_dir: Path) -> Iterable[Tuple[Finding, GroundTruth]]:
-    """Yield ``(finding, label)`` for every paired entry in the corpus dir."""
-    for fp in sorted(corpus_dir.glob("*.json")):
+def _read_corpus_json(path: Path) -> str:
+    """Capped read of one corpus record; loud failure.
+
+    Corpus rows are measurement input — a silently skipped or
+    truncated row skews every rate computed downstream, so unreadable
+    and over-cap both refuse instead of degrading.
+    """
+    got = read_text_capped(path, errors="strict")
+    if got is None:
+        msg = f"corpus record unreadable: {path}"
+        raise OSError(msg)
+    text, truncated = got
+    if truncated:
+        msg = f"corpus record over the read cap: {path}"
+        raise OSError(msg)
+    return text
+
+
+def iter_corpus(corpus_dir: Path) -> Iterable[tuple[Finding, GroundTruth]]:
+    """Yield paired records, refusing mismatched or duplicate finding IDs."""
+    seen_ids: set[str] = set()
+    paths = sorted(corpus_dir.glob("*.json"))
+    finding_paths = {p for p in paths if not p.name.endswith(".label.json")}
+    for label_path in paths:
+        if label_path.name.endswith(".label.json"):
+            finding_path = label_path.with_name(label_path.name.removesuffix(".label.json") + ".json")
+            if finding_path not in finding_paths:
+                raise ValueError(f"orphan corpus label without finding: {label_path}")
+    for fp in paths:
         if fp.name.endswith(".label.json"):
             continue
-        finding = Finding.from_json(fp.read_text())
+        finding = Finding.from_json(_read_corpus_json(fp))
         label_path = fp.with_suffix(".label.json")
-        label = GroundTruth.from_json(label_path.read_text())
+        label = GroundTruth.from_json(_read_corpus_json(label_path))
+        if label.finding_id != finding.finding_id:
+            msg = (
+                f"corpus finding/label id mismatch: {fp}: "
+                f"finding {finding.finding_id!r}, label {label.finding_id!r}"
+            )
+            raise ValueError(msg)
+        if finding.finding_id in seen_ids:
+            raise ValueError(f"duplicate corpus finding_id {finding.finding_id!r}: {fp}")
+        seen_ids.add(finding.finding_id)
         yield finding, label
 
 
@@ -69,32 +111,49 @@ def _classify_agreement(validator_label: str, ground_truth: str) -> str:
     return "agree" if validator_label == ground_truth else "disagree"
 
 
-def run(corpus_dir: Path, validator: Validator, output: Path) -> int:
-    """Run validator against every corpus entry; write CSV to output.
+def _csv_row_bytes(values: Iterable[object]) -> bytes:
+    with StringIO(newline="") as stream:
+        csv.writer(stream).writerow(values)
+        return stream.getvalue().encode("utf-8")
 
-    Returns the number of findings processed.
+
+def run(corpus_dir: Path, validator: Validator, output: Path) -> int:
+    """Process every entry before publishing the complete measurement CSV.
+
+    Returns the number of findings processed. Failures before publication
+    retain the previous output. Destination symlinks are followed and the
+    parent directory must exist. New CSVs are private; existing permission
+    bits are retained.
     """
+    output = output.resolve()
+    if not output.parent.is_dir():
+        raise FileNotFoundError(f"CSV output directory does not exist: {output.parent}")
+    try:
+        mode = stat.S_IMODE(output.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o600
     rows = 0
-    with output.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(CSV_HEADER)
+
+    def chunks() -> Iterable[bytes]:
+        nonlocal rows
+        yield _csv_row_bytes(CSV_HEADER)
         for finding, label in iter_corpus(corpus_dir):
             verdict = validator.validate(finding)
             v_label = verdict_to_label(verdict)
             agreement = _classify_agreement(v_label, label.verdict)
-            writer.writerow(
-                [
-                    finding.finding_id,
-                    finding.producer,
-                    finding.rule_id,
-                    label.verdict,
-                    label.fp_category or "",
-                    verdict.value,
-                    v_label,
-                    agreement,
-                ]
-            )
+            yield _csv_row_bytes([
+                finding.finding_id,
+                finding.producer,
+                finding.rule_id,
+                label.verdict,
+                label.fp_category or "",
+                verdict.value,
+                v_label,
+                agreement,
+            ])
             rows += 1
+
+    write_bytes_atomically(output, chunks(), mode=mode)
     return rows
 
 
@@ -102,21 +161,26 @@ def load_validator(spec: str) -> Validator:
     """Load a validator from a ``module.path:ClassName`` import spec."""
     module_path, _, class_name = spec.partition(":")
     if not module_path or not class_name:
-        raise ValueError(
-            f"validator spec must be `module.path:ClassName`, got {spec!r}"
-        )
+        msg = f"validator spec must be `module.path:ClassName`, got {spec!r}"
+        raise ValueError(msg)
+    # ``module_path`` is from the operator's ``--validator`` CLI
+    # flag. The operator invoking RAPTOR can already execute any
+    # Python; importing the validator they explicitly named adds
+    # no privilege. Not a public API, not attacker-controllable.
+    # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
     module = importlib.import_module(module_path)
     cls = getattr(module, class_name)
     instance = cls()
     if not isinstance(instance, Validator):
-        raise TypeError(
+        msg = (
             f"{spec!r} loaded but does not implement Validator protocol "
             f"(missing .validate(finding))"
         )
+        raise TypeError(msg)
     return instance
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--corpus-dir",
@@ -143,6 +207,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.corpus_dir.is_dir():
         print(f"corpus dir not found: {args.corpus_dir}", file=sys.stderr)
         return 2
+
+    # Labels are written against exact upstream commits: any pinned
+    # fixture clone that IS present must sit at its SOURCES.md pin
+    # before the runner proceeds (absent clones are fine — in-tree
+    # fixtures need none). A drifted clone silently mis-scores every
+    # validator measured against the corpus.
+    from core.dataflow.corpus_sources import (
+        CorpusPinError,
+        verify_present_pinned_clones,
+    )
+    try:
+        verified = verify_present_pinned_clones()
+    except CorpusPinError as exc:
+        print(f"corpus fixture pin verification failed: {exc}",
+              file=sys.stderr)
+        return 2
+    for src_name in verified:
+        print(f"fixture clone verified at pin: {src_name}",
+              file=sys.stderr)
 
     validator: Validator = (
         load_validator(args.validator) if args.validator else TrivialValidator()

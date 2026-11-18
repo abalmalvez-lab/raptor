@@ -14,13 +14,18 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
+import os
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
 
+from core.llm.scorecard import integrity
+
+from core.testing.logging_state import owned_log_handler
 from core.llm.scorecard import (
     ModelScorecard,
     EventType,
@@ -32,6 +37,22 @@ from core.llm.scorecard.scorecard import (
     MAX_DISAGREEMENT_SAMPLES,
     _wilson_upper_bound,
 )
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    try:
+        yield
+    finally:
+        raptor.propagate = orig
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +121,35 @@ def test_below_floor_returns_learning(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _record_correct(sc, dc, model, n):
-    for _ in range(n):
-        sc.record_event(dc, model, EventType.CHEAP_SHORT_CIRCUIT, "correct")
+# Seeded evidence cycles across three distinct targets so the earned
+# trust clears the cross-target diversity floor (REPO_DIVERSITY_FLOOR)
+# — these helpers build cells whose authority may spend anywhere.
+# The diversity gate itself has its own battery below.
+_REPOS = ("/proj/alpha", "/proj/beta", "/proj/gamma")
 
 
-def _record_incorrect(sc, dc, model, n):
-    for _ in range(n):
-        sc.record_event(dc, model, EventType.CHEAP_SHORT_CIRCUIT, "incorrect")
+def _record_correct(sc: ModelScorecard, dc: str, model: str, n: int) -> None:
+    # One batched write (record_events), not n record_event calls:
+    # each single call is a full flock + load + verify + fsync +
+    # rename cycle, so seeding 200 events one-by-one costs seconds of
+    # pure disk churn on CI runners (the exact waste the bulk API's
+    # docstring names). Per-event recording keeps its own coverage in
+    # the single-event tests and the concurrency battery.
+    sc.record_events([
+        {"decision_class": dc, "model": model,
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT,
+         "outcome": "correct", "repo": _REPOS[i % len(_REPOS)]}
+        for i in range(n)
+    ])
+
+
+def _record_incorrect(sc: ModelScorecard, dc: str, model: str, n: int) -> None:
+    sc.record_events([
+        {"decision_class": dc, "model": model,
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT,
+         "outcome": "incorrect", "repo": _REPOS[i % len(_REPOS)]}
+        for i in range(n)
+    ])
 
 
 def test_clean_run_eventually_trusted(tmp_path):
@@ -198,10 +240,12 @@ def test_schema_includes_version_field(tmp_path):
 
 
 def test_all_event_types_present_in_cells(tmp_path):
-    """A cell that's only seen ``cheap_short_circuit`` still has
-    zero-counts for the other 4 event types so operators inspecting
-    the JSON see a uniform shape, not 'why is `tool_evidence`
-    missing?'"""
+    """A cell that's only seen ``cheap_short_circuit`` still has every event
+    type present (v2: each as an age-bucket map) so operators inspecting the
+    JSON see a uniform shape, not 'why is `tool_evidence` missing?'. Untouched
+    types are empty ``{}``; the touched type has a current-month bucket."""
+    from core.llm.scorecard.freshness import flatten_counts
+
     path = tmp_path / "sc.json"
     sc = ModelScorecard(path)
     sc.record_event(
@@ -210,9 +254,248 @@ def test_all_event_types_present_in_cells(tmp_path):
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     cell = on_disk["models"]["m"]["x:y"]
     for et in ALL_EVENT_TYPES:
-        assert et in cell["events"]
-        assert "correct" in cell["events"][et]
-        assert "incorrect" in cell["events"][et]
+        assert et in cell["events"]              # uniform shape: all types present
+    # Untouched types are empty bucket maps.
+    assert cell["events"][EventType.MULTI_MODEL_CONSENSUS] == {}
+    # The touched type has a single current-month "YYYY-MM" bucket.
+    cheap = cell["events"][EventType.CHEAP_SHORT_CIRCUIT]
+    assert flatten_counts(cheap) == (1, 0)
+    assert all(len(k) == 7 and k[4] == "-" for k in cheap)
+
+
+def test_v1_file_migrates_to_v2_buckets(tmp_path):
+    """A v1 (flat-events) scorecard file loads, migrates to v2 age-bucketed
+    shape keyed by the cell's last-seen month, preserves counts (so the verdict
+    is unchanged), and bumps the persisted version on the next write."""
+    path = tmp_path / "sc.json"
+    v1 = {
+        "version": 1,
+        "models": {"m": {"x:y": {
+            "first_seen_at": "2026-03-01T00:00:00+00:00",
+            "last_seen_at": "2026-04-15T00:00:00+00:00",
+            "model_version": "",
+            "policy_override": "auto",
+            "events": {
+                "cheap_short_circuit":   {"correct": 47, "incorrect": 1},
+                "multi_model_consensus": {"correct": 0, "incorrect": 0},
+                "judge_review":          {"correct": 0, "incorrect": 0},
+                "tool_evidence":         {"correct": 0, "incorrect": 0},
+                "operator_feedback":     {"correct": 0, "incorrect": 0},
+            },
+            "disagreement_samples": [],
+        }}},
+    }
+    path.write_text(json.dumps(v1), encoding="utf-8")
+    integrity.stamp_file(path)
+
+    sc = ModelScorecard(path)
+    # In-memory migration preserves counts on the read path.
+    stats = {(s.model, s.decision_class): s for s in sc.get_stats()}
+    cheap_stat = stats[("m", "x:y")].events[EventType.CHEAP_SHORT_CIRCUIT]
+    assert (cheap_stat.correct, cheap_stat.incorrect) == (47, 1)
+
+    # A write persists the migrated v2 shape.
+    sc.record_event("x:y", "m", EventType.JUDGE_REVIEW, "correct")
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["version"] == 2
+    cell = on_disk["models"]["m"]["x:y"]
+    # Flat counts folded into the last-seen month bucket (2026-04), untouched.
+    assert cell["events"]["cheap_short_circuit"] == {"2026-04": {"correct": 47, "incorrect": 1}}
+    # Zero-count types became empty bucket maps.
+    assert cell["events"]["multi_model_consensus"] == {}
+
+
+def test_version_less_v1_file_gets_migrated_on_load(tmp_path):
+    """Adversarial: a version-LESS file with v1-shaped flat events must NOT be
+    silently stamped v2 while the events stay flat (which would only self-heal
+    lazily as cells are touched). __enter__ now defensively runs v1->v2 even
+    when no version key is present."""
+    path = tmp_path / "sc.json"
+    path.write_text(json.dumps({
+        # NO `version` key
+        "models": {"m": {"x:y": {
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "last_seen_at": "2026-04-15T00:00:00+00:00",
+            "model_version": "", "policy_override": "auto",
+            "events": {
+                "cheap_short_circuit": {"correct": 50, "incorrect": 1},
+                "multi_model_consensus": {"correct": 0, "incorrect": 0},
+                "judge_review": {"correct": 0, "incorrect": 0},
+                "tool_evidence": {"correct": 0, "incorrect": 0},
+                "operator_feedback": {"correct": 0, "incorrect": 0},
+            },
+            "disagreement_samples": [],
+        }}},
+    }))
+    integrity.stamp_file(path)
+    sc = ModelScorecard(path)
+    # Trigger a write so the migrated shape persists.
+    sc.record_event("x:y", "m", EventType.JUDGE_REVIEW, "correct")
+    on_disk = json.loads(path.read_text())
+    assert on_disk["version"] == 2
+    # Cheap counts must be bucketed under last_seen month (not still flat).
+    cheap = on_disk["models"]["m"]["x:y"]["events"]["cheap_short_circuit"]
+    assert cheap == {"2026-04": {"correct": 50, "incorrect": 1}}
+
+
+def test_freshness_weighting_flips_verdict_on_recent_regression(tmp_path):
+    """A model that was reliable long ago but regressed recently: unweighted,
+    the stale correct counts dilute the recent failures and the cell stays
+    trusted; freshness-weighted, the 2-year-old data decays away and the recent
+    regression flips the verdict to FALL_THROUGH. This is the whole point."""
+    from datetime import datetime, timezone
+
+    from core.llm.scorecard.freshness import bucket_key
+
+    now = datetime.now(timezone.utc)
+    cur = bucket_key(now)
+    stale = f"{now.year - 2:04d}-{now.month:02d}"   # ~24 months ago
+    fixture = {
+        "version": 2,
+        "models": {"m": {"x:y": {
+            "first_seen_at": f"{stale}-01T00:00:00+00:00",
+            "last_seen_at": f"{cur}-01T00:00:00+00:00",
+            "model_version": "",
+            "policy_override": "auto",
+            "events": {
+                "cheap_short_circuit": {
+                    cur:   {"correct": 0, "incorrect": 15},     # recent: all wrong
+                    stale: {"correct": 2000, "incorrect": 0},   # 2y stale: all right
+                },
+                "multi_model_consensus": {},
+                "judge_review": {},
+                "tool_evidence": {},
+                "operator_feedback": {},
+            },
+            "disagreement_samples": [],
+            # Three distinct targets: the diversity gate is not what
+            # this test measures — freshness weighting is.
+            "repos": {
+                "0" * 16: f"{cur}-01T00:00:00+00:00",
+                "1" * 16: f"{cur}-01T00:00:00+00:00",
+                "2" * 16: f"{cur}-01T00:00:00+00:00",
+            },
+        }}},
+    }
+    path = tmp_path / "sc.json"
+    path.write_text(json.dumps(fixture), encoding="utf-8")
+    integrity.stamp_file(path)
+
+    # Decay OFF: 15/2015 ≈ 0.7% miss-rate → trusted.
+    off = ModelScorecard(path)
+    assert off.should_short_circuit("x:y", "m") == Policy.SHORT_CIRCUIT
+    # Decay ON (30-day half-life): the 2-year-stale correct counts decay to ~0,
+    # the recent failures dominate → fall through (regression surfaces).
+    on = ModelScorecard(path, freshness_half_life_days=30)
+    assert on.should_short_circuit("x:y", "m") == Policy.FALL_THROUGH
+
+
+def test_measure_freshness_impact_counts_flips(tmp_path):
+    """The offline gate reports how many trusted cells fall out of SHORT_CIRCUIT
+    under a candidate half-life — the cold-start check before enabling decay."""
+    from datetime import datetime, timezone
+
+    from core.llm.scorecard.freshness import bucket_key
+
+    now = datetime.now(timezone.utc)
+    cur = bucket_key(now)
+    stale = f"{now.year - 2:04d}-{now.month:02d}"
+
+    def _cell(cheap_buckets, seen_month):
+        return {
+            "first_seen_at": f"{stale}-01T00:00:00+00:00",
+            "last_seen_at": f"{seen_month}-01T00:00:00+00:00",
+            "model_version": "", "policy_override": "auto",
+            "events": {
+                "cheap_short_circuit": cheap_buckets,
+                "multi_model_consensus": {}, "judge_review": {},
+                "tool_evidence": {}, "operator_feedback": {},
+            },
+            "disagreement_samples": [],
+        }
+
+    fixture = {"version": 2, "models": {"m": {
+        # regresses recently → flips OUT of short-circuit under decay
+        "x:y": _cell({cur: {"correct": 0, "incorrect": 15},
+                      stale: {"correct": 2000, "incorrect": 0}}, cur),
+        # consistently good recently → stays trusted (≥73 clean obs needed for
+        # Wilson UB ≤ ceiling with zero failures)
+        "x:z": _cell({cur: {"correct": 100, "incorrect": 0}}, cur),
+    }}}
+    path = tmp_path / "sc.json"
+    path.write_text(json.dumps(fixture), encoding="utf-8")
+    integrity.stamp_file(path)
+
+    out = ModelScorecard(path).measure_freshness_impact(30)
+    assert out["cells"] == 2
+    assert out["short_circuit_baseline"] == 2     # both trusted unweighted
+    assert out["short_circuit_weighted"] == 1     # only the stable one survives
+    assert out["flipped_out"] == 1
+    assert out["flipped_out_to_fall_through"] == 1
+    assert out["flipped_in"] == 0
+
+
+def test_register_uses_records_calls_without_touching_verdict(tmp_path):
+    """Usage registration is a volume/presence signal: it bumps `calls` +
+    last_seen and makes a used-but-unscored model APPEAR, without creating
+    reliability outcomes (verdict stays LEARNING)."""
+    sc = ModelScorecard(tmp_path / "sc.json")
+    sc.register_uses([
+        {"model": "haiku", "decision_class": "_usage", "calls": 3,
+         "model_version": "haiku-20251001"},
+        {"model": "haiku", "decision_class": "_usage", "calls": 2},
+    ])
+    stats = {(s.model, s.decision_class): s for s in sc.get_stats()}
+    assert ("haiku", "_usage") in stats           # the model now appears
+    cell = stats[("haiku", "_usage")]
+    assert cell.calls == 5                         # 3 + 2 accumulated
+    assert cell.model_version == "haiku-20251001"
+    # No reliability outcomes recorded → verdict is LEARNING, routing unaffected.
+    assert sc.should_short_circuit("_usage", "haiku") == Policy.LEARNING
+    assert cell.events[EventType.CHEAP_SHORT_CIRCUIT].total() == 0
+
+
+def test_register_uses_aggregates_cost_and_tokens(tmp_path):
+    """Lifecycle enrichment: register_uses sums cost / tokens / latency_sum and
+    takes the MAX of latency_max — the 'did I get value for money' axis."""
+    sc = ModelScorecard(tmp_path / "sc.json")
+    sc.register_uses([{
+        "model": "haiku", "decision_class": "_usage",
+        "calls": 3, "cost_usd": 0.05, "tokens": 1200,
+        "input_tokens": 1000, "output_tokens": 200,
+        "latency_ms_sum": 4500, "latency_ms_max": 1800,
+    }])
+    sc.register_uses([{
+        "model": "haiku", "decision_class": "_usage",
+        "calls": 2, "cost_usd": 0.02, "tokens": 400,
+        "input_tokens": 350, "output_tokens": 50,
+        "latency_ms_sum": 2200, "latency_ms_max": 1300,
+    }])
+    cell = {(s.model, s.decision_class): s for s in sc.get_stats()}[("haiku", "_usage")]
+    assert cell.calls == 5
+    assert abs(cell.cost_usd - 0.07) < 1e-9
+    assert cell.tokens == 1600
+    assert cell.input_tokens == 1350
+    assert cell.output_tokens == 250
+    assert cell.latency_ms_sum == 6700
+    assert cell.latency_ms_max == 1800           # max, not sum
+
+
+def test_register_uses_records_schema_valid_events(tmp_path):
+    """Lifecycle batched-write for schema validity: register_uses with
+    schema_valid_pass / schema_valid_fail bumps the SCHEMA_VALID event slot
+    in the current-month bucket — the universal "does this model follow the
+    schema" axis fed by every generate_structured call."""
+    sc = ModelScorecard(tmp_path / "sc.json")
+    sc.register_uses([{
+        "model": "haiku", "decision_class": "_structured",
+        "calls": 5, "schema_valid_pass": 4, "schema_valid_fail": 1,
+    }])
+    cell = sc.get_stat("_structured", "haiku")
+    assert cell is not None
+    ev = cell.events[EventType.SCHEMA_VALID]
+    assert (ev.correct, ev.incorrect) == (4, 1)
+    assert cell.calls == 5
 
 
 def test_model_first_layout(tmp_path):
@@ -242,6 +525,37 @@ def test_corrupt_json_falls_through_to_empty(tmp_path):
     sc.record_event("x:y", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct")
 
 
+def test_corrupt_json_quarantined_before_fresh_start(tmp_path):
+    """A write over a corrupt sidecar must preserve the corrupt bytes
+    aside (timestamped ``.corrupt`` sibling, mirroring the
+    ``.unverified`` quarantine) — pre-fix the fresh empty state was
+    atomically persisted OVER the accumulated history with nothing
+    left to inspect or recover."""
+    path = tmp_path / "sc.json"
+    corrupt = "{not valid json — months of history lived here"
+    path.write_text(corrupt, encoding="utf-8")
+    sc = ModelScorecard(path)
+    sc.record_event("x:y", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct")
+    quarantined = list(tmp_path.glob("sc.json.*.corrupt"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == corrupt
+    # Fresh state proceeded: the sidecar is valid JSON carrying the event.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "m" in data["models"]
+
+
+def test_corrupt_json_read_only_leaves_file_in_place(tmp_path):
+    """Other direction: a read-only context persists nothing, so the
+    corrupt file stays put (no quarantine churn from mere reads)."""
+    path = tmp_path / "sc.json"
+    corrupt = "{not valid json"
+    path.write_text(corrupt, encoding="utf-8")
+    sc = ModelScorecard(path)
+    assert sc.should_short_circuit("x:y", "m") == Policy.LEARNING
+    assert path.read_text(encoding="utf-8") == corrupt
+    assert not list(tmp_path.glob("*.corrupt"))
+
+
 def test_schema_version_mismatch_raises(tmp_path):
     """A sidecar from a future schema version refuses to be opened
     — surfacing a hard error beats silently downgrading data."""
@@ -250,6 +564,7 @@ def test_schema_version_mismatch_raises(tmp_path):
         json.dumps({"version": SCHEMA_VERSION + 99, "models": {}}),
         encoding="utf-8",
     )
+    integrity.stamp_file(path)
     sc = ModelScorecard(path)
     with pytest.raises(RuntimeError, match="schema version mismatch"):
         sc.should_short_circuit("x:y", "m")
@@ -281,11 +596,13 @@ def test_samples_capped_at_max(tmp_path):
     """Beyond MAX_DISAGREEMENT_SAMPLES we keep the most recent —
     older entries reflect older model snapshots, less useful."""
     sc = ModelScorecard(tmp_path / "sc.json")
-    for i in range(MAX_DISAGREEMENT_SAMPLES + 5):
-        sc.record_event(
-            "x:y", "m", EventType.CHEAP_SHORT_CIRCUIT, "incorrect",
-            sample={"this_reasoning": f"sample-{i}"},
-        )
+    sc.record_events([
+        {"decision_class": "x:y", "model": "m",
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT,
+         "outcome": "incorrect",
+         "sample": {"this_reasoning": f"sample-{i}"}}
+        for i in range(MAX_DISAGREEMENT_SAMPLES + 5)
+    ])
     stats = sc.get_stat("x:y", "m")
     assert len(stats.disagreement_samples) == MAX_DISAGREEMENT_SAMPLES
     # Most recent kept.
@@ -349,6 +666,7 @@ def test_reset_older_than(tmp_path):
     ).replace(microsecond=0).isoformat()
     on_disk["models"]["m"]["old"]["last_seen_at"] = long_ago
     path.write_text(json.dumps(on_disk), encoding="utf-8")
+    integrity.stamp_file(path)
 
     n = sc.reset(older_than_days=90)
     assert n == 1
@@ -378,8 +696,9 @@ def test_reset_requires_a_filter(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _bump_in_subprocess(path_str: str, dc: str, model: str, n: int):
-    """Module-level so multiprocessing.Pool can pickle it."""
+def _bump_in_subprocess(path_str: str, dc: str, model: str, n: int, data_home: str):
+    """Use this test's key even when a persistent forkserver predates it."""
+    os.environ["XDG_DATA_HOME"] = data_home
     sc = ModelScorecard(Path(path_str))
     for _ in range(n):
         sc.record_event(
@@ -387,11 +706,21 @@ def _bump_in_subprocess(path_str: str, dc: str, model: str, n: int):
         )
 
 
+@pytest.mark.slow
+@pytest.mark.filterwarnings("ignore:This process.*fork:DeprecationWarning")
 def test_concurrent_writes_do_not_lose_updates(tmp_path):
-    """Two processes recording on different cells of the same
+    """Four processes recording on different cells of the same
     sidecar must each see all of their own increments preserved.
     Without flock, a read-modify-write race would lose one set of
-    increments."""
+    increments.
+
+    Marked ``slow`` because it forks 4 Python subprocesses and runs
+    100 record-event calls end-to-end (~7s). Under contended CI
+    load the subprocess startup timing can drift enough to flake
+    despite the flock being correct — nightly slow-tier runs
+    where the box isn't juggling 12k other tests give the stress
+    test the headroom it needs.
+    """
     path = tmp_path / "sc.json"
 
     procs = []
@@ -399,13 +728,21 @@ def test_concurrent_writes_do_not_lose_updates(tmp_path):
     for i in range(4):
         p = multiprocessing.Process(
             target=_bump_in_subprocess,
-            args=(str(path), f"dc{i}", "m", 25),
+            args=(str(path), f"dc{i}", "m", 25, os.environ["XDG_DATA_HOME"]),
         )
         p.start()
         procs.append(p)
-    for p in procs:
-        p.join()
-        assert p.exitcode == 0, f"subprocess exited {p.exitcode}"
+    try:
+        for p in procs:
+            # A wedged writer must fail without leaking its siblings.
+            p.join(timeout=60)
+            assert not p.is_alive(), "subprocess wedged past the join timeout"
+            assert p.exitcode == 0, f"subprocess exited {p.exitcode}"
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.kill()
+            p.join()
 
     sc = ModelScorecard(path)
     stats = {s.decision_class: s for s in sc.get_stats()}
@@ -445,9 +782,16 @@ def test_get_stats_materialises_all_cells(tmp_path):
 def _trusted_cell(sc, dc="x:y", model="m"):
     """Build out a trustworthy cell: 200 correct → Wilson UB safely
     under 5%, so without any shadow_rate the cell should
-    short-circuit deterministically."""
-    for _ in range(200):
-        sc.record_event(dc, model, EventType.CHEAP_SHORT_CIRCUIT, "correct")
+    short-circuit deterministically. Evidence spans three targets so
+    the diversity floor is cleared (see ``_REPOS``). Seeded through
+    the batch API — one lock/fsync cycle, not 200 (see
+    ``_record_correct``)."""
+    sc.record_events([
+        {"decision_class": dc, "model": model,
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT,
+         "outcome": "correct", "repo": _REPOS[i % len(_REPOS)]}
+        for i in range(200)
+    ])
 
 
 def test_shadow_rate_zero_never_shadows(tmp_path):
@@ -477,10 +821,11 @@ def test_shadow_rate_does_not_affect_fall_through(tmp_path):
     call, so SHADOW would be redundant — and confusing."""
     sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=1.0)
     # 50/50 → Wilson UB way over ceiling → fall through
-    for _ in range(50):
-        sc.record_event("x:y", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct")
-    for _ in range(50):
-        sc.record_event("x:y", "m", EventType.CHEAP_SHORT_CIRCUIT, "incorrect")
+    sc.record_events([
+        {"decision_class": "x:y", "model": "m",
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT, "outcome": outcome}
+        for outcome in ["correct"] * 50 + ["incorrect"] * 50
+    ])
     # Even with shadow_rate=1, this never returns SHADOW because
     # the cell is fall-through.
     seen = {sc.should_short_circuit("x:y", "m") for _ in range(50)}
@@ -764,13 +1109,10 @@ class TestAutoGc:
 
         raptor_logger = logging.getLogger("raptor")
         captor = _Capture(level=logging.INFO)
-        raptor_logger.addHandler(captor)
-        try:
+        with owned_log_handler(raptor_logger, captor):
             sc.record_event(
                 "x:y", "fresh", EventType.CHEAP_SHORT_CIRCUIT, "correct",
             )
-        finally:
-            raptor_logger.removeHandler(captor)
 
         # Summary line carries the per-model breakdown + outcome
         # tallies. Operators wanting historical data grep this line.
@@ -810,13 +1152,10 @@ class TestAutoGc:
 
         raptor_logger = logging.getLogger("raptor")
         captor = _Capture(level=logging.INFO)
-        raptor_logger.addHandler(captor)
-        try:
+        with owned_log_handler(raptor_logger, captor):
             sc.record_event(
                 "x:y", "fresh-2", EventType.CHEAP_SHORT_CIRCUIT, "correct",
             )
-        finally:
-            raptor_logger.removeHandler(captor)
         assert not any(
             "auto-GC" in r.getMessage() for r in captured
         )
@@ -852,3 +1191,504 @@ class TestAutoGc:
             assert data.get("last_gc_at"), (
                 "last_gc_at must be stamped after first auto-GC pass"
             )
+
+
+def test_safe_coercion_tolerates_wrong_type_scalar_cell_fields(tmp_path):
+    """Adversarial: hand-edited cells with wrong-type scalar fields
+    (e.g. ``"calls": "abc"``, ``"cost_usd": None``) must NOT abort the
+    read/write — `_safe_int`/`_safe_float` coerce to 0 instead. Subsequent
+    `register_uses` then bumps from the coerced default."""
+    path = tmp_path / "sc.json"
+    path.write_text(json.dumps({"version": 2, "models": {"m": {"x:y": {
+        "first_seen_at": "2026-05-01T00:00:00+00:00",
+        "last_seen_at": "2026-05-01T00:00:00+00:00",
+        "model_version": "", "policy_override": "auto",
+        "events": {et: {} for et in ALL_EVENT_TYPES},
+        "disagreement_samples": [],
+        # garbage scalar fields:
+        "calls": "abc",
+        "cost_usd": None,
+        "tokens": "garbage",
+        "latency_ms_sum": [1, 2, 3],
+    }}}}))
+    integrity.stamp_file(path)
+    sc = ModelScorecard(path)
+    stats = {(s.model, s.decision_class): s for s in sc.get_stats()}
+    cell = stats[("m", "x:y")]
+    assert cell.calls == 0 and cell.cost_usd == 0.0 and cell.tokens == 0
+    assert cell.latency_ms_sum == 0
+    # And a register_uses bumps cleanly from the defaults
+    sc.register_uses([{"model": "m", "decision_class": "x:y",
+                       "calls": 2, "cost_usd": 0.5}])
+    after = sc.get_stat("x:y", "m")
+    assert after.calls == 2 and abs(after.cost_usd - 0.5) < 1e-9
+
+
+class TestRecordEventsBatch:
+    """record_events: one lock/write cycle, same cell state as the
+    per-event path, and all-entries-validated-before-lock atomicity."""
+
+    def test_batch_matches_per_event_recording(self, tmp_path):
+        sc_a = ModelScorecard(tmp_path / "a.json")
+        for _ in range(3):
+            sc_a.record_event("x:y", "m", EventType.MULTI_MODEL_CONSENSUS,
+                              "correct")
+        sc_a.record_event("x:y", "m", EventType.MULTI_MODEL_CONSENSUS,
+                          "incorrect")
+
+        sc_b = ModelScorecard(tmp_path / "b.json")
+        sc_b.record_events(
+            [{"decision_class": "x:y", "model": "m",
+              "event_type": EventType.MULTI_MODEL_CONSENSUS,
+              "outcome": "correct"}] * 3
+            + [{"decision_class": "x:y", "model": "m",
+                "event_type": EventType.MULTI_MODEL_CONSENSUS,
+                "outcome": "incorrect"}]
+        )
+
+        stats_a = sc_a.get_stat("x:y", "m")
+        stats_b = sc_b.get_stat("x:y", "m")
+        counts_a = stats_a.events[EventType.MULTI_MODEL_CONSENSUS]
+        counts_b = stats_b.events[EventType.MULTI_MODEL_CONSENSUS]
+        assert (counts_a.correct, counts_a.incorrect) == (3, 1)
+        assert (counts_b.correct, counts_b.incorrect) == (3, 1)
+
+    def test_bad_entry_rejected_before_any_write(self, tmp_path):
+        path = tmp_path / "sc.json"
+        sc = ModelScorecard(path)
+        with pytest.raises(ValueError):
+            sc.record_events([
+                {"decision_class": "x:y", "model": "m",
+                 "event_type": EventType.MULTI_MODEL_CONSENSUS,
+                 "outcome": "correct"},
+                {"decision_class": "x:y", "model": "m",
+                 "event_type": "not-a-real-event", "outcome": "correct"},
+            ])
+        # Validation runs before the lock: the good entry must NOT
+        # have been persisted (atomic no-write on a bad batch).
+        assert not path.exists() or "m" not in json.dumps(
+            json.loads(path.read_text()))
+
+    def test_missing_model_or_class_rejected(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        with pytest.raises(ValueError):
+            sc.record_events([{"decision_class": "", "model": "m",
+                               "event_type": EventType.MULTI_MODEL_CONSENSUS,
+                               "outcome": "correct"}])
+
+    def test_empty_batch_is_noop(self, tmp_path):
+        path = tmp_path / "sc.json"
+        ModelScorecard(path).record_events([])
+        assert not path.exists()
+
+    def test_batch_sample_retained_on_incorrect(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json", retain_samples=True)
+        sc.record_events([
+            {"decision_class": "x:y", "model": "m",
+             "event_type": EventType.MULTI_MODEL_CONSENSUS,
+             "outcome": "incorrect",
+             "sample": {"this_reasoning": "r1", "other_reasoning": "r2"}},
+        ])
+        stats = sc.get_stat("x:y", "m")
+        assert stats.disagreement_samples
+        assert stats.disagreement_samples[0]["this_reasoning"] == "r1"
+
+
+def test_reset_older_than_keeps_timestampless_cells(tmp_path):
+    """A cell with no ``last_seen_at`` (e.g. adopted legacy history)
+    has unknown age: an age-filtered reset must keep it. Deleting it
+    stays reserved for scoped/full resets."""
+    path = tmp_path / "sc.json"
+    sc = ModelScorecard(path)
+    sc.record_event("legacy", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct")
+    sc.record_event("old", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct")
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    # Strip the legacy cell's timestamp; age the other one out.
+    del on_disk["models"]["m"]["legacy"]["last_seen_at"]
+    long_ago = (
+        datetime.now(timezone.utc) - timedelta(days=200)
+    ).replace(microsecond=0).isoformat()
+    on_disk["models"]["m"]["old"]["last_seen_at"] = long_ago
+    path.write_text(json.dumps(on_disk), encoding="utf-8")
+    integrity.stamp_file(path)
+
+    n = sc.reset(older_than_days=90)
+    assert n == 1
+    remaining = {s.decision_class for s in sc.get_stats()}
+    assert remaining == {"legacy"}
+
+
+def test_reset_full_still_removes_timestampless_cells(tmp_path):
+    """The keep-on-unknown-age rule only applies to the age filter:
+    ``all_=True`` (and scoped resets) still delete such cells."""
+    path = tmp_path / "sc.json"
+    sc = ModelScorecard(path)
+    sc.record_event("legacy", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct")
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    del on_disk["models"]["m"]["legacy"]["last_seen_at"]
+    path.write_text(json.dumps(on_disk), encoding="utf-8")
+    integrity.stamp_file(path)
+
+    assert sc.reset(all_=True) == 1
+    assert sc.get_stats() == []
+
+
+def test_short_circuit_uses_own_reads_trust_verdict(tmp_path, monkeypatch):
+    """The key-unusable clamp must act on THIS read's integrity
+    verdict. ``_last_read_trusted`` is instance state overwritten by
+    every read, so a concurrent thread's read landing between the lock
+    release and the policy check could flip it — pre-fix, a
+    force_short_circuit pin on an unverifiable sidecar could win.
+    Simulate the interleaving by flipping the flag right after the
+    lock scope exits; the captured in-lock verdict must still clamp."""
+    import contextlib
+    import os
+
+    # This test destroys the resolved key file, and release archives
+    # ship without conftest.py (export-ignore) — the suite-level XDG
+    # pin can be absent when this file runs from an extracted tree.
+    # Pin XDG_DATA_HOME in-test so the key mints under tmp_path.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+
+    sc_path = tmp_path / "sc.json"
+    sc = ModelScorecard(sc_path)
+    sc.record_event("dc", "m1", "cheap_short_circuit", "correct")
+    sc.set_policy_override("dc", "m1", "force_short_circuit")
+
+    # Make the key unusable (symlinked key files are refused), so the
+    # next read keeps the content but cannot verify it.
+    from core.llm.scorecard import integrity
+    key_path = integrity._key_path()
+    # Hard stop before the destructive ops: never unlink a key that
+    # resolved outside this test's tmp dir.
+    assert key_path.is_relative_to(tmp_path), key_path
+    real = tmp_path / "elsewhere.key"
+    real.write_bytes(key_path.read_bytes())
+    os.unlink(key_path)
+    key_path.symlink_to(real)
+    assert not integrity.key_usable()
+
+    reader = ModelScorecard(sc_path)
+    orig_with_lock = reader._with_lock
+
+    @contextlib.contextmanager
+    def racing_with_lock(**kwargs):
+        with orig_with_lock(**kwargs) as data:
+            yield data
+        # Another thread's trusted read lands immediately after our
+        # lock release, overwriting the shared instance flag.
+        reader._last_read_trusted = True
+
+    monkeypatch.setattr(reader, "_with_lock", racing_with_lock)
+    assert reader.should_short_circuit("dc", "m1") == Policy.LEARNING
+
+
+def test_migrate_events_tolerates_non_dict_entry():
+    """A hand-edited event entry that isn't a dict must normalise to
+    an empty bucket map — pre-fix it raised TypeError out of the
+    locked write and aborted the migration."""
+    from core.llm.scorecard.scorecard import _migrate_events_v1_to_v2
+
+    cell = {
+        "last_seen_at": "2026-01-01T00:00:00+00:00",
+        "events": {
+            "cheap_short_circuit": "garbage",
+            "tool_evidence": {"correct": 2, "incorrect": 1},
+        },
+    }
+    _migrate_events_v1_to_v2(cell)
+    assert cell["events"]["cheap_short_circuit"] == {}
+    assert cell["events"]["tool_evidence"] == {
+        "2026-01": {"correct": 2, "incorrect": 1},
+    }
+
+
+class TestSeenTimestampParsing:
+    """Age comparisons on ``last_seen_at`` parse the stamp instead of
+    comparing lexicographically against a ``+00:00``-suffixed cutoff:
+    adopt ingests operator-blessed foreign history, whose Z-suffix or
+    naive stamps compared in the conservative direction only by
+    accident of string ordering."""
+
+    def _cell(self, path, seen):
+        import json as _json
+        path.write_text(_json.dumps({
+            "version": 2,
+            "models": {"m": {"dc": {
+                "last_seen_at": seen, "events": {},
+            }}},
+        }))
+
+    def test_reset_age_filter_parses_z_suffix(self, tmp_path):
+        path = tmp_path / "sc.json"
+        self._cell(path, "2020-01-01T00:00:00Z")
+        # auto-GC off so the stale cell survives adopt's locked write
+        # and RESET is the surface under test.
+        sc = ModelScorecard(path, auto_gc_after_days=None)
+        assert sc.adopt_unverified() is True
+        assert sc.reset(older_than_days=30) == 1
+
+    def test_reset_age_filter_parses_naive_as_utc(self, tmp_path):
+        path = tmp_path / "sc.json"
+        self._cell(path, "2020-01-01T00:00:00")
+        sc = ModelScorecard(path, auto_gc_after_days=None)
+        assert sc.adopt_unverified() is True
+        assert sc.reset(older_than_days=30) == 1
+
+    def test_unparseable_stamp_kept_by_age_filter(self, tmp_path):
+        path = tmp_path / "sc.json"
+        self._cell(path, "not-a-timestamp")
+        sc = ModelScorecard(path, auto_gc_after_days=None)
+        assert sc.adopt_unverified() is True
+        # Age unknown → conservative keep (like timestampless cells).
+        assert sc.reset(older_than_days=30) == 0
+
+    def test_auto_gc_parses_z_suffix(self, tmp_path):
+        path = tmp_path / "sc.json"
+        self._cell(path, "2020-01-01T00:00:00Z")
+        sc = ModelScorecard(path, auto_gc_after_days=30,
+                            auto_gc_interval_seconds=0)
+        assert sc.adopt_unverified() is True
+        sc.record_event("dc2", "m2", "cheap_short_circuit", "correct")
+        import json as _json
+        raw = _json.loads(path.read_text())
+        assert "dc" not in raw["models"].get("m", {})
+
+
+class TestFlockWarningOnce:
+    def test_unavailable_flock_warns_once_per_path(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """The 'flock not available' warning claimed log-once but
+        fired on EVERY lock cycle — log noise on NFS-class
+        filesystems."""
+        import logging as _logging
+
+        import core.llm.scorecard.scorecard as sc_mod
+
+        def broken_flock(fd, op):
+            raise OSError("flock unsupported here")
+
+        monkeypatch.setattr(sc_mod.fcntl, "flock", broken_flock)
+        sc = ModelScorecard(tmp_path / "sc.json")
+        with caplog.at_level(_logging.WARNING, logger="raptor"):
+            sc.get_stats()
+            sc.get_stats()
+            sc.record_event("dc", "m", "cheap_short_circuit", "correct")
+        hits = [r for r in caplog.records
+                if "flock not available" in r.getMessage()]
+        assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# Target-diversity gate on should_short_circuit
+# ---------------------------------------------------------------------------
+
+
+class TestTargetDiversityGate:
+    """Short-circuit authority must be EARNED on REPO_DIVERSITY_FLOOR
+    distinct targets before it spends on a target that contributed no
+    evidence; a contributing target always spends its own trust. Two
+    directions per the seam contract: withheld on ungrounded trust,
+    preserved on grounded trust, and absence only DEMOTES (LEARNING),
+    never flips to FALL_THROUGH or drops data."""
+
+    DC = "codeql:py/sql-injection"
+
+    def _seed(self, sc, repos, n=100, outcome="correct"):
+        for i in range(n):
+            sc.record_event(
+                self.DC, "haiku", EventType.CHEAP_SHORT_CIRCUIT, outcome,
+                repo=repos[i % len(repos)] if repos else None,
+            )
+
+    # -- withheld: trust farmed on one target cannot spend elsewhere --
+
+    def test_single_target_trust_does_not_spend_cross_target(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/hostile"])
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/operators-next-target",
+        ) == Policy.LEARNING
+
+    def test_no_target_identity_gets_no_same_target_grant(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/hostile"])
+        assert sc.should_short_circuit(self.DC, "haiku") == Policy.LEARNING
+
+    def test_two_targets_still_below_floor(self, tmp_path):
+        """Refusal one short of the floor — the counterpart of the
+        replay-at-3 test below, so the constant cannot silently
+        drift downward."""
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/a", "/proj/b"])
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/stranger",
+        ) == Policy.LEARNING
+
+    def test_legacy_records_count_zero_diversity(self, tmp_path):
+        """Records written before the ledger existed (no repo kwarg)
+        fail CLOSED: never 'unknown = distinct'. Existing accumulated
+        trust stops granting cross-target skips until distinct keyed
+        targets accrue."""
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, [])          # legacy: no repo on any record
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/anything",
+        ) == Policy.LEARNING
+        assert sc.should_short_circuit(self.DC, "haiku") == Policy.LEARNING
+
+    # -- preserved: grounded trust spends --
+
+    def test_contributing_target_spends_its_own_trust(self, tmp_path):
+        """Byte-identical evidence to the withheld case except the
+        receipt: the querying target IS the one that contributed."""
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/hostile"])
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/hostile",
+        ) == Policy.SHORT_CIRCUIT
+
+    def test_floor_distinct_targets_open_the_cross_target_gate(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/a", "/proj/b", "/proj/c"])
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/stranger",
+        ) == Policy.SHORT_CIRCUIT
+        # ...and a target-agnostic query too (batch/CLI-style callers).
+        assert sc.should_short_circuit(self.DC, "haiku") == Policy.SHORT_CIRCUIT
+
+    # -- absence demotes; it never flips or overrides --
+
+    def test_gate_demotes_to_learning_not_fall_through(self, tmp_path):
+        """The evidence is GOOD, it just hasn't demonstrated
+        generalisation — LEARNING (keep measuring, which grows the
+        missing diversity), never FALL_THROUGH (which would brand the
+        cell untrusted)."""
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/only"])
+        policy = sc.should_short_circuit(self.DC, "haiku", repo="/proj/x")
+        assert policy == Policy.LEARNING
+        assert policy != Policy.FALL_THROUGH
+
+    def test_measured_fall_through_unchanged_by_diversity(self, tmp_path):
+        """A cell with real misses falls through on the measured
+        policy regardless of how diverse its evidence is — the gate
+        only ever WITHHOLDS a grant, it cannot upgrade one."""
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/a", "/proj/b", "/proj/c"], n=90)
+        self._seed(sc, ["/proj/a", "/proj/b", "/proj/c"], n=10,
+                   outcome="incorrect")
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/a",
+        ) == Policy.FALL_THROUGH
+
+    def test_operator_pin_beats_the_gate(self, tmp_path):
+        """force_short_circuit is explicit operator intent — it
+        already beats measured drift, and it beats the diversity
+        gate the same way."""
+        sc = ModelScorecard(tmp_path / "sc.json")
+        self._seed(sc, ["/proj/only"])
+        sc.set_policy_override(self.DC, "haiku", "force_short_circuit")
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/x",
+        ) == Policy.SHORT_CIRCUIT
+
+    # -- ledger mechanics --
+
+    def test_ledger_only_tracks_cheap_short_circuit_events(self, tmp_path):
+        """Other event types don't feed the gate's Wilson math, so a
+        repo passed with them must not inflate its target diversity."""
+        path = tmp_path / "sc.json"
+        sc = ModelScorecard(path)
+        for repo in ("/proj/a", "/proj/b", "/proj/c"):
+            sc.record_event(self.DC, "haiku", EventType.JUDGE_REVIEW,
+                            "correct", repo=repo)
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        cell = on_disk["models"]["haiku"][self.DC]
+        assert cell.get("repos", {}) == {}
+
+    def test_raw_target_path_never_persists(self, tmp_path):
+        """Only the hash lands in the sidecar — it outlives the run
+        and must not leak host filesystem layout."""
+        from core.llm.scorecard.scorecard import repo_key
+        path = tmp_path / "sc.json"
+        sc = ModelScorecard(path)
+        target = "/proj/customer-engagement-acme"
+        sc.record_event(self.DC, "haiku", EventType.CHEAP_SHORT_CIRCUIT,
+                        "correct", repo=target)
+        raw = path.read_text(encoding="utf-8")
+        assert target not in raw
+        assert "acme" not in raw
+        assert repo_key(target) in raw
+
+    def test_repo_key_is_stable_and_path_normalised(self):
+        from core.llm.scorecard.scorecard import repo_key
+        assert repo_key("/proj/a") == repo_key("/proj/a")
+        assert repo_key("/proj/x/../a") == repo_key("/proj/a")
+        assert repo_key(Path("/proj/a")) == repo_key("/proj/a")
+        assert repo_key("/proj/a") != repo_key("/proj/b")
+        assert len(repo_key("/proj/a")) == 16
+
+    def test_ledger_capped_and_eviction_only_shrinks_grants(self, tmp_path):
+        """Cap enforced at MAX_REPO_KEYS with oldest-last-seen evicted
+        first. Eviction can only WITHHOLD (an evicted target loses its
+        same-target grant) — the ≥floor cross-target grant survives
+        because the ledger still holds far more than the floor."""
+        from core.llm.scorecard.scorecard import MAX_REPO_KEYS
+        path = tmp_path / "sc.json"
+        sc = ModelScorecard(path)
+        for i in range(MAX_REPO_KEYS + 5):
+            sc.record_event(self.DC, "haiku", EventType.CHEAP_SHORT_CIRCUIT,
+                            "correct", repo=f"/proj/t{i:03d}")
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        repos = on_disk["models"]["haiku"][self.DC]["repos"]
+        assert len(repos) == MAX_REPO_KEYS
+        # Cross-target grant still opens (diversity far above floor)
+        # once the cell also clears the Wilson floor.
+        self._seed(sc, ["/proj/t000"], n=100)
+        assert sc.should_short_circuit(
+            self.DC, "haiku", repo="/proj/never-seen",
+        ) == Policy.SHORT_CIRCUIT
+
+    def test_eviction_order_is_oldest_last_seen(self):
+        """Unit check on the eviction primitive: the stalest
+        last-seen entries go first, newest survive."""
+        from core.llm.scorecard.scorecard import MAX_REPO_KEYS
+        cell = {"repos": {}}
+        for i in range(MAX_REPO_KEYS + 3):
+            ModelScorecard._note_repo(
+                cell, f"k{i:03d}", f"2026-01-{(i % 27) + 1:02d}T00:00:00",
+            )
+        repos = cell["repos"]
+        assert len(repos) == MAX_REPO_KEYS
+        # The three stalest timestamps at eviction time are gone;
+        # the most recent writes survive.
+        assert f"k{MAX_REPO_KEYS + 2:03d}" in repos
+
+    def test_under_cap_keeps_every_target(self, tmp_path):
+        """Counter-direction of the cap: below MAX_REPO_KEYS nothing
+        is evicted — every contributing target keeps its grant."""
+        from core.llm.scorecard.scorecard import MAX_REPO_KEYS
+        path = tmp_path / "sc.json"
+        sc = ModelScorecard(path)
+        n = min(10, MAX_REPO_KEYS)
+        for i in range(n):
+            sc.record_event(self.DC, "haiku", EventType.CHEAP_SHORT_CIRCUIT,
+                            "correct", repo=f"/proj/t{i}")
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert len(on_disk["models"]["haiku"][self.DC]["repos"]) == n
+
+    def test_junk_shaped_ledger_reads_as_zero_diversity(self, tmp_path):
+        """A hand-corrupted ``repos`` value withholds authority
+        (fail-closed) instead of raising out of the trust surface."""
+        path = tmp_path / "sc.json"
+        sc = ModelScorecard(path)
+        self._seed(sc, ["/proj/a", "/proj/b", "/proj/c"])
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        on_disk["models"]["haiku"][self.DC]["repos"] = "junk"
+        path.write_text(json.dumps(on_disk), encoding="utf-8")
+        integrity.stamp_file(path)
+        assert ModelScorecard(path).should_short_circuit(
+            self.DC, "haiku", repo="/proj/a",
+        ) == Policy.LEARNING

@@ -13,6 +13,7 @@ import pytest
 
 from core.sandbox import cli as cli_mod
 from core.sandbox import state
+from core.sandbox.tests.capability import requires_landlock, requires_userns
 
 
 @pytest.fixture
@@ -23,16 +24,20 @@ def parser():
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    state._cli_sandbox_audit = False
-    state._cli_sandbox_audit_verbose = False
-    state._cli_sandbox_disabled = False
-    state._cli_sandbox_profile = None
-    yield
-    state._cli_sandbox_audit = False
-    state._cli_sandbox_audit_verbose = False
-    state._cli_sandbox_disabled = False
-    state._cli_sandbox_profile = None
+def reset_state(monkeypatch):
+    """Pin every CLI setting these tests may change, preserving borrowed state."""
+    for name, value in {
+        "_cli_sandbox_audit": False,
+        "_cli_sandbox_audit_verbose": False,
+        "_cli_sandbox_disabled": False,
+        "_cli_sandbox_profile": None,
+        "_cli_sandbox_readable_paths": None,
+        "_cli_sandbox_tool_paths": None,
+        "_cli_sandbox_audit_budget": None,
+        "_cli_sandbox_disable_consent": None,
+        "_cli_sandbox_floor": None,
+    }.items():
+        monkeypatch.setattr(state, name, value)
 
 
 class TestArgparseShape:
@@ -172,6 +177,7 @@ class TestAuditBudgetFlag:
             cli_mod.apply_cli_args(args)
 
 
+@requires_userns
 class TestRunUntrustedForwardsAuditKwargs:
     """run_untrusted is a thin convenience wrapper around run() — it
     forwards **kwargs. Audit kwargs should propagate. Covers the
@@ -192,6 +198,11 @@ class TestRunUntrustedForwardsAuditKwargs:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr(ctx, "run", spy_run)
+        # The darwin arm of run_untrusted's entry gate smoke-tests the
+        # REAL host's sandbox-exec; pretend it holds so the plumbing
+        # under test is reached on every platform (including
+        # emulated-darwin runs — the gate itself has its own tests).
+        monkeypatch.setattr(ctx, "check_seatbelt_available", lambda: True)
 
         # Call run_untrusted with audit=True. target+output required
         # (run_untrusted enforces); audit is forwarded via **kwargs.
@@ -226,12 +237,16 @@ class TestRunTrustedRejectsAuditKwargs:
             run_trusted(["true"], audit_verbose=True)
 
 
-class TestProfileSetIsTrimmedToFour:
-    """Confirms `audit` and `audit-verbose` are GONE from PROFILES."""
+class TestProfileSet:
+    """Pins the canonical profile names + confirms ``audit`` /
+    ``audit-verbose`` are GONE from PROFILES (post-#269 contract)."""
 
-    def test_only_four_profiles(self):
+    def test_canonical_profiles(self):
         from core.sandbox.profiles import PROFILES
-        assert set(PROFILES) == {"full", "debug", "network-only", "none"}
+        assert set(PROFILES) == {
+            "full", "strict", "target_run", "debug", "frida", "rr",
+            "chromium", "network-only", "none",
+        }
 
     def test_no_audit_mode_field_in_profile_dicts(self):
         from core.sandbox.profiles import PROFILES
@@ -246,6 +261,7 @@ class TestProfileSetIsTrimmedToFour:
 class TestSandboxAuditKwarg:
     """Per-call audit/audit_verbose kwargs on context.sandbox()."""
 
+    @requires_landlock
     def test_audit_kwarg_engages_audit_mode(self, monkeypatch, tmp_path):
         # No CLI flag, but per-call audit=True. Should still engage.
         from core.sandbox import probes
@@ -265,9 +281,14 @@ class TestSandboxAuditKwarg:
                 use_egress_proxy=True,
                 proxy_hosts=["api.example.com"],
             ):
-                # Audit engaged via per-call kwarg → proxy acquired.
-                assert proxy_inst._audit_count == 1
-            assert proxy_inst._audit_count == 0
+                # Audit engaged via per-call kwarg → THIS context's
+                # lane carries the bit; the global count is untouched.
+                lanes = (list(proxy_inst._unix_lanes.values())
+                         + list(proxy_inst._tcp_lanes.values()))
+                assert [ln.audit_log_only for ln in lanes] == [True]
+                assert proxy_inst._audit_count == 0
+            assert not proxy_inst._unix_lanes
+            assert not proxy_inst._tcp_lanes
         finally:
             proxy_mod._reset_for_tests()
 
@@ -282,3 +303,79 @@ class TestSandboxAuditKwarg:
         assert (state._cli_sandbox_audit or True) is True
         # Both unset → not engaged.
         assert (state._cli_sandbox_audit or False) is False
+
+
+class TestAllowlistExtensionFlags:
+    """--sandbox-readable-path / --sandbox-tool-path: the self-service
+    recovery levers for read denials. Validated at parse time, stored
+    in module state, merged into every sandbox() by context.py."""
+
+    def test_readable_path_propagates(self, parser, tmp_path):
+        f = tmp_path / "cfg.txt"
+        f.write_text("x")
+        args = parser.parse_args(
+            ["--sandbox-readable-path", str(f),
+             "--sandbox-readable-path", str(tmp_path)])
+        cli_mod.apply_cli_args(args, parser)
+        assert state._cli_sandbox_readable_paths == [
+            str(f.resolve()), str(tmp_path.resolve())]
+
+    def test_tool_path_propagates(self, parser, tmp_path):
+        args = parser.parse_args(["--sandbox-tool-path", str(tmp_path)])
+        cli_mod.apply_cli_args(args, parser)
+        assert state._cli_sandbox_tool_paths == [str(tmp_path.resolve())]
+
+    def test_missing_readable_path_rejected(self, parser, tmp_path):
+        args = parser.parse_args(
+            ["--sandbox-readable-path", str(tmp_path / "typo")])
+        with pytest.raises(ValueError, match="does not exist"):
+            cli_mod.apply_cli_args(args, None)
+        assert state._cli_sandbox_readable_paths is None
+
+    def test_tool_path_must_be_directory(self, parser, tmp_path):
+        f = tmp_path / "afile"
+        f.write_text("x")
+        args = parser.parse_args(["--sandbox-tool-path", str(f)])
+        with pytest.raises(ValueError, match="not a directory"):
+            cli_mod.apply_cli_args(args, None)
+        assert state._cli_sandbox_tool_paths is None
+
+    def test_incoherent_with_no_sandbox(self, parser, tmp_path):
+        args = parser.parse_args(
+            ["--no-sandbox", "--sandbox-readable-path", str(tmp_path)])
+        with pytest.raises(ValueError, match="incoherent"):
+            cli_mod.apply_cli_args(args, None)
+
+    def test_incoherent_with_profile_none(self, parser, tmp_path):
+        args = parser.parse_args(
+            ["--sandbox", "none", "--sandbox-tool-path", str(tmp_path)])
+        with pytest.raises(ValueError, match="incoherent"):
+            cli_mod.apply_cli_args(args, None)
+
+    # The readable-paths union lands in _make_preexec_fn — the Linux
+    # lane's plumbing (requires_landlock already keeps it off real
+    # macs; the marker keeps it out of emulated-darwin runs too).
+    @pytest.mark.linux_native
+    @requires_landlock
+    def test_context_merges_cli_readable_paths(self, tmp_path):
+        """sandbox() must union the CLI extension into the caller's
+        readable_paths kwarg (dedup included)."""
+        from unittest import mock
+
+        from core.sandbox import context
+
+        captured = {}
+        state._cli_sandbox_readable_paths = [str(tmp_path), "/usr"]
+
+        real = context._make_preexec_fn
+
+        def spy(limits, **kw):
+            captured["readable"] = kw.get("readable_paths")
+            return real(limits, **kw)
+
+        with mock.patch.object(context, "_make_preexec_fn", side_effect=spy), \
+             context.sandbox(target="/tmp", output="/tmp",
+                             restrict_reads=True):
+            pass
+        assert captured["readable"] is not None
+        assert str(tmp_path) in captured["readable"]

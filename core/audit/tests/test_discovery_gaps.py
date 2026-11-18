@@ -1,0 +1,389 @@
+"""Tests for discovery gaps in the orchestrator.
+
+Gap 4:  confidence gate in _compile_eager_invariants
+Gap 5:  staleness check in _load_domain_model
+Gap 9:  _refute_domain_model_invariants
+Item 2: reading-list scope filter
+Gap 3:  mid-loop compilation (tested via _compile_eager_invariants reuse)
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from core.audit.shared_state import SharedState
+from core.concepts.compiler import CompilationResult
+
+
+
+class TestConfidenceGate:
+    """Gap 4: _compile_eager_invariants skips low-confidence invariants."""
+
+    def test_inferred_invariants_skipped(self, tmp_path: Path) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _compile_eager_invariants,
+        )
+
+        dm = {
+            "invariants": [
+                {
+                    "id": "low",
+                    "statement": "s",
+                    "negation": "n",
+                    "confidence": "inferred",
+                },
+                {
+                    "id": "high",
+                    "statement": "s",
+                    "negation": "n",
+                    "confidence": "traced",
+                },
+            ],
+        }
+
+        shared = SharedState(domain_model=dm)
+
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            resume=False,
+        )
+
+        with patch(
+            "core.concepts.compiler.compile_invariant",
+        ) as mock_compile:
+            mock_compile.return_value = CompilationResult(invariant_id="high", errors=["failed"])
+            _compile_eager_invariants(config, shared, {})
+
+        compiled_ids = [
+            call.args[0].id for call in mock_compile.call_args_list
+        ]
+        assert "low" not in compiled_ids
+        assert compiled_ids and set(compiled_ids) == {"high"}
+
+    def test_stale_invariants_skipped(self, tmp_path: Path) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _compile_eager_invariants,
+        )
+
+        dm = {
+            "invariants": [
+                {
+                    "id": "stale_one",
+                    "statement": "s",
+                    "negation": "n",
+                    "confidence": "traced",
+                    "state": "stale",
+                },
+            ],
+        }
+
+        shared = SharedState(domain_model=dm)
+
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            resume=False,
+        )
+
+        with patch(
+            "core.concepts.compiler.compile_invariant",
+        ) as mock_compile:
+            _compile_eager_invariants(config, shared, {})
+
+        assert not mock_compile.called
+
+
+class TestStalenessOnLoad:
+    """Gap 5/10: _load_domain_model marks stale invariants."""
+
+    def test_mismatched_hash_marked_stale(self, tmp_path: Path) -> None:
+        src = tmp_path / "target" / "f.c"
+        src.parent.mkdir(parents=True)
+        src.write_text("original content\n")
+
+        dm = {
+            "invariants": [
+                {
+                    "id": "i",
+                    "source_hash": "wrong_hash",
+                    "source_hash_span": {
+                        "file": "f.c", "start": 1, "end": 1,
+                    },
+                },
+            ],
+        }
+        dm_path = tmp_path / "domain-model.json"
+        dm_path.write_text(json.dumps(dm))
+
+        from core.audit.orchestrator import OrchestratorConfig, _load_domain_model
+
+        config = OrchestratorConfig(
+            target_path=tmp_path / "target",
+            out_dir=tmp_path,
+            resume=False,
+        )
+
+        # Patch the consumer re-export: importing it while the canonical
+        # function is mocked can retain that mock after patch teardown.
+        with patch(
+            "core.audit.journal.load_domain_model",
+            return_value=dm,
+        ):
+            result = _load_domain_model(config)
+
+        assert result["invariants"][0].get("state") == "stale"
+
+
+class TestConceptRefutation:
+    """Gap 9: _refute_domain_model_invariants."""
+
+    def test_refuted_invariant_confidence_lowered(self) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _refute_domain_model_invariants,
+        )
+
+        dm = {
+            "invariants": [
+                {
+                    "id": "i",
+                    "statement": "all inputs are sanitised",
+                    "negation": "an unsanitised input exists",
+                    "confidence": "traced",
+                },
+            ],
+        }
+
+        shared = MagicMock()
+        shared.domain_model = dm
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.out_dir = None
+        config.llm_client = None
+
+        refutation_response = {
+            "verdict": "refuted",
+            "argument": "counter-example found",
+        }
+
+        mock_client = MagicMock()
+        mock_client.generate_structured.return_value = (refutation_response, {})
+
+        with patch(
+            "core.audit.orchestrator._run_llm_client",
+            return_value=mock_client,
+        ):
+            changed = _refute_domain_model_invariants(config, shared)
+
+        assert changed == 1
+        assert dm["invariants"][0]["confidence"] == "observed"
+
+    def test_stands_verdict_upgrades(self) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _refute_domain_model_invariants,
+        )
+
+        dm = {
+            "invariants": [
+                {
+                    "id": "i",
+                    "statement": "x",
+                    "confidence": "traced",
+                },
+            ],
+        }
+
+        shared = MagicMock()
+        shared.domain_model = dm
+
+        config = MagicMock(spec=OrchestratorConfig)
+        config.out_dir = None
+        config.llm_client = None
+
+        mock_client = MagicMock()
+        mock_client.generate_structured.return_value = (
+            {"verdict": "stands", "argument": "solid"}, {},
+        )
+
+        with patch(
+            "core.audit.orchestrator._run_llm_client",
+            return_value=mock_client,
+        ):
+            changed = _refute_domain_model_invariants(config, shared)
+
+        assert changed == 1
+        assert dm["invariants"][0]["confidence"] == "corroborated"
+
+    def test_empty_model_returns_zero(self) -> None:
+        from core.audit.orchestrator import _refute_domain_model_invariants
+
+        shared = MagicMock()
+        shared.domain_model = None
+
+        config = MagicMock()
+        assert _refute_domain_model_invariants(config, shared) == 0
+
+    def test_needs_evidence_unchanged(self) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _refute_domain_model_invariants,
+        )
+
+        dm = {
+            "invariants": [
+                {"id": "i", "statement": "x", "confidence": "traced"},
+            ],
+        }
+
+        shared = MagicMock()
+        shared.domain_model = dm
+        config = MagicMock(spec=OrchestratorConfig)
+        config.out_dir = None
+        config.llm_client = None
+
+        mock_client = MagicMock()
+        mock_client.generate_structured.return_value = (
+            {"verdict": "needs_evidence", "argument": "unclear"}, {},
+        )
+
+        with patch(
+            "core.audit.orchestrator._run_llm_client",
+            return_value=mock_client,
+        ):
+            changed = _refute_domain_model_invariants(config, shared)
+
+        assert changed == 0
+        assert dm["invariants"][0]["confidence"] == "traced"
+
+    def test_unknown_confidence_skipped(self) -> None:
+        """Unknown confidence grades must not be upgraded or degraded."""
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _refute_domain_model_invariants,
+        )
+
+        for verdict in ("stands", "refuted"):
+            dm = {
+                "invariants": [
+                    {"id": "i", "statement": "x", "confidence": "bogus_typo"},
+                ],
+            }
+
+            shared = MagicMock()
+            shared.domain_model = dm
+            config = MagicMock(spec=OrchestratorConfig)
+            config.out_dir = None
+            config.llm_client = None
+
+            mock_client = MagicMock()
+            mock_client.generate_structured.return_value = (
+                {"verdict": verdict, "argument": "test"}, {},
+            )
+
+            with patch(
+                "core.audit.orchestrator._run_llm_client",
+                return_value=mock_client,
+            ):
+                changed = _refute_domain_model_invariants(config, shared)
+
+            assert changed == 0, f"verdict={verdict} should skip unknown confidence"
+            assert dm["invariants"][0]["confidence"] == "bogus_typo"
+            assert "state" not in dm["invariants"][0]
+
+
+class TestEagerCompileReturnKeys:
+    """Gap 3: _compile_eager_invariants returns matched file:function keys."""
+
+    def test_returns_matched_keys(self, tmp_path: Path) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _compile_eager_invariants,
+        )
+
+        dm = {
+            "invariants": [
+                {
+                    "id": "inv1",
+                    "statement": "s",
+                    "negation": "n",
+                    "confidence": "traced",
+                },
+            ],
+        }
+
+        shared = SharedState(domain_model=dm)
+
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            resume=False,
+        )
+
+        checklist = {
+            "a.c:foo": {
+                "file": "a.c", "name": "foo",
+                "line_start": 1, "line_end": 10,
+            },
+        }
+
+        compiled = CompilationResult(
+            invariant_id="inv1", rule_id="r1", rule_body="rule body", dual_control=True,
+        )
+
+        def _prescreen(dm, config, gaps, mf):
+            mf["a.c:foo"] = [{"detector": "test"}]
+            return 1
+
+        with (
+            patch(
+                "core.concepts.compiler.compile_invariant",
+                return_value=compiled,
+            ),
+            patch(
+                "core.audit.orchestrator._run_invariant_prescreening",
+                side_effect=_prescreen,
+            ),
+            patch(
+                "core.audit.orchestrator._run_llm_client",
+                return_value=type("C", (), {
+                    "generate_structured": lambda *a, **kw: ({}, None),
+                })(),
+            ),
+        ):
+            _compile_eager_invariants(config, shared, checklist)
+
+        assert "a.c:foo" in shared.mechanical_findings
+
+    def test_returns_empty_set_no_invariants(self, tmp_path: Path) -> None:
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            _compile_eager_invariants,
+        )
+
+        shared = MagicMock()
+        shared.domain_model = None
+
+        config = OrchestratorConfig(
+            target_path=tmp_path,
+            out_dir=tmp_path,
+            resume=False,
+        )
+
+        _compile_eager_invariants(config, shared, {})
+
+
+class TestScopeWarning:
+    """Item 2: out-of-scope reading-list items carry scope_warning."""
+
+    def test_scope_warning_field_exists(self) -> None:
+        from core.concepts.reading_list import ReadingListItem
+        item = ReadingListItem(
+            id="t", question="q", source_command="/audit",
+            scope_warning="out-of-root: /other/file.c is outside /target",
+        )
+        assert item.scope_warning.startswith("out-of-root")

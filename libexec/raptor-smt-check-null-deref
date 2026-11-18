@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Stage E SMT verb: CWE-476 null-pointer dereference.
 
 Usage:
@@ -23,12 +25,13 @@ Output: JSON to stdout matching :func:`validate_path`'s shape.  Of interest:
   feasible=null   Z3 unavailable / unencodable
 """
 import argparse
-import json
 import sys
+import json
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
-import os
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -37,11 +40,13 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
 
-from packages.exploit_feasibility.smt_verbs import check_null_deref
+from packages.exploit_feasibility.smt_verbs import check_null_deref  # noqa: E402
 
 
 def main() -> int:
@@ -55,6 +60,9 @@ def main() -> int:
                    help="Bitvector profile name (default: uint64)")
     p.add_argument("--guard", action="append", default=[],
                    help="Path condition / null-check (repeat)")
+    # Accept --source and --function for compatibility with sweep runner
+    p.add_argument("--source", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--function", default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
 
     try:
@@ -67,7 +75,12 @@ def main() -> int:
         print(f"raptor-smt-check-null-deref: {e}", file=sys.stderr)
         return 2
 
-    json.dump(result, sys.stdout, indent=2)
+    # ensure_ascii: this JSON goes to the operator terminal; JSON
+    # escapes C0 but passes C1 controls (single-byte CSI/OSC) raw
+    # when ensure_ascii is off (dumps_display is exactly that).
+    # ASCII output stays valid JSON for parsing consumers.
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=True,
+                                default=str))
     sys.stdout.write("\n")
     return 0
 

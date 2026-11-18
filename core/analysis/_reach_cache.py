@@ -1,0 +1,797 @@
+"""Persistent on-disk cache for reachability adjacency indices.
+
+Sibling to :mod:`core.analysis.reachability`. The substrate's
+in-process cache (``_INDEX_CACHE``) hits once per inventory
+identity inside a single process; this module persists the
+built index across processes so a cold start doesn't pay the
+~300ms build cost every time.
+
+Threat model: cache files live at ``~/.cache/raptor/reachability/``
+mode 0600, dir mode 0700. The on-disk format is DATA-ONLY (a
+versioned JSON document behind a magic header) — restored bytes are
+decoded into plain dataclass fields, never executed. The historical
+pickle format was retired because no amount of open-time gating
+(O_NOFOLLOW, fstat, UID/mode, size, magic) can authenticate the
+restored bytes themselves: a poisoned cache entry restored from a
+backup/archive by the operator or CI passes every gate and
+``pickle.loads`` is code execution. Corrupt / unparseable / legacy
+cache files are silently treated as misses; the caller rebuilds.
+
+Fingerprinting: the inventory's per-file ``sha256`` is the
+authoritative content hash (build_inventory computes it). We
+fold every file's sha256 into a single fingerprint plus a
+schema-version constant so an index-shape change invalidates
+all old cache entries without manual cleanup.
+
+When the inventory lacks ``sha256`` on its files (test
+fixtures, hand-built inventories), the fingerprint returns
+``None`` and the persistent layer auto-disables — the in-
+process cache is still active, just no disk-spill.
+
+API:
+
+  * :func:`compute_fingerprint` — ``inventory -> str | None``
+  * :func:`load_index`            — ``fingerprint -> _AdjacencyIndex | None``
+  * :func:`save_index`            — ``(fingerprint, index) -> None``
+  * :func:`clear_cache`           — drop everything; returns count
+  * :func:`cache_dir`             — accessor for tests / status output
+
+Module is intentionally underscore-prefixed in the package
+namespace; consumers go through :mod:`core.analysis.reachability`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import stat
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from core.atomic_fs import write_bytes_atomically
+
+if TYPE_CHECKING:
+    from .reachability import _AdjacencyIndex
+
+logger = logging.getLogger(__name__)
+
+
+# Bump when ``_AdjacencyIndex`` field shape changes (rename, type
+# change, new mandatory field). Existing cache entries become misses
+# automatically. Don't bump for pure additive changes that an old
+# cache could still satisfy — the in-process build is fast enough
+# that operators don't need version-skew sympathy.
+#
+# V4 (2026-05-16): per-language alias canonicalisation extended
+# ``qualified_to_internal`` with ``<pkg>.<Class>.<method>`` entries
+# for Java/C#/PHP/Rust/JS-TS/Ruby method definitions. An old V3
+# cache returned ``InternalFunction(verdict=UNCERTAIN)`` for
+# class-qualified queries that the new build would have resolved
+# to ``CALLED``/``NOT_CALLED`` — a real correctness regression on
+# stale caches, so this is a bump-worthy change.
+#
+# V5 (2026-05-17): index pass-2 fully-qualified-call fast-path
+# promotes C++ ``ns::Util::helper()`` chains (and any other
+# language's fully-qualified shape) from method_match_overinclusive
+# to definitive forward/reverse edges. An old V4 cache would have
+# returned these callers in ``method_match_overinclusive`` instead
+# of ``definitive`` — same correctness shift, bump for parity.
+# V6 (2026-05-23): _AdjacencyIndex grew a `framework_registered`
+# field (S2: JS / Go function-as-argument framework registration
+# via _FRAMEWORK_REGISTRATION_TAILS + CallSite.argument_identifiers).
+# An old V5 cache returns _AdjacencyIndex instances without the
+# new attribute — AttributeError on access by is_registered_via_call.
+# V7 (2026-05-26): _AdjacencyIndex grew `override_methods` (CHA virtual-
+# dispatch candidates). Same hazard: an old pickle lacks the attribute.
+# V8 (2026-05-28): override_methods now seeded for Go methods (every
+# Go method is a structural-interface virtual-dispatch candidate). Changed
+# index contents; a V7 pickle would serve stale verdicts.
+# V9 (2026-05-28): Rust now uses tree-sitter item extraction (impl→
+# class assoc) + trait impls record the trait as a base → override_methods
+# gains Rust trait-impl methods. Changed index contents; bump to rebuild.
+# V10: on-disk format switched from pickle to data-only JSON (see the
+# module docstring's threat model). Legacy pickle entries are ignored
+# — different fingerprint (the version salts it), different suffix,
+# different magic — and regenerated.
+# V11 (2026-09-14): extractor identity now probes grammars by actual
+# import (the extractor's own probe) instead of find_spec. find_spec
+# succeeds on any FINDABLE module — including import-time-failing
+# stubs and broken wheels — so a degraded-extraction index could be
+# persisted under the full-toolchain fingerprint and served to later
+# full-toolchain runs. Bump flushes any entry persisted under an
+# over-claimed identity.
+# V13: direct C implementation includes contribute caller/callee edges.
+# An older index silently omits wrapper callers of included static helpers.
+_CACHE_VERSION = 13
+
+# Test-override seam: when set (tests monkeypatch a tmp dir here) it
+# wins over the env-derived default. Production leaves it None so
+# ``_cache_dir()`` re-reads ``XDG_CACHE_HOME`` on every call — an env
+# pin installed AFTER this module is imported (test harness, sandboxed
+# run) still redirects the cache instead of being silently ignored by
+# an import-time snapshot.
+_CACHE_DIR: Path | None = None
+
+
+def _cache_dir() -> Path:
+    """Cache root, resolved at call time: ``$XDG_CACHE_HOME/raptor/
+    reachability`` (default ``~/.cache/raptor/reachability``)."""
+    if _CACHE_DIR is not None:
+        return _CACHE_DIR
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "raptor" / "reachability"
+
+# A short header sentinel prefixed to each cache entry. Lets us
+# version-bump the on-disk format without colliding with a stale
+# entry of the same name. Also doubles as a cheap "is this a raptor
+# cache file" check before handing bytes to the JSON decoder. The
+# numeric suffix tracks ``_CACHE_VERSION``.
+_HEADER_MAGIC = b"RAPTOR-REACHABILITY-CACHE-V13\n"
+
+# Suffix of current-format entries. Legacy ``.pickle`` entries are
+# never loaded, but eviction / clearing still sweeps them so retired
+# files don't squat the cache dir forever.
+_CACHE_SUFFIX = ".json"
+_LEGACY_SUFFIXES = (".pickle",)
+
+# Hard cap on cache-file size. A genuine reachability index for a
+# kernel-scale target weighs in the low MB; anything past this is
+# either corruption or an attacker who's planted a pathological file
+# in the cache dir. Refuse rather than decode-DoS the process.
+# 64 MiB is comfortably above the largest legitimate observed cache
+# (linux kernel 6.x reachability index lands at ~12 MiB compressed).
+_MAX_INDEX_BYTES = 64 * 1024 * 1024
+
+# Maximum number of cache entries on disk. When exceeded after a save,
+# the oldest entries (by mtime) are evicted.
+_MAX_CACHE_ENTRIES = 32
+
+# Grammar modules the inventory's call-graph extractors probe (mirrors
+# the ``_import_grammar`` call sites in ``core.inventory.call_graph``).
+# Their availability determines extraction QUALITY for the same source
+# bytes: without a grammar a language's files get empty call graphs.
+_GRAMMAR_MODULES: tuple[str, ...] = (
+    "tree_sitter_c",
+    "tree_sitter_c_sharp",
+    "tree_sitter_cpp",
+    "tree_sitter_go",
+    "tree_sitter_java",
+    "tree_sitter_javascript",
+    "tree_sitter_kotlin",
+    "tree_sitter_lua",
+    "tree_sitter_php",
+    "tree_sitter_ruby",
+    "tree_sitter_rust",
+    "tree_sitter_scala",
+    "tree_sitter_swift",
+    "tree_sitter_typescript",
+)
+
+# Computed once per process — grammar availability doesn't change
+# mid-process (imports are cached), and the probe performs real
+# grammar imports through the shared failure-caching importer.
+_EXTRACTOR_IDENTITY: str | None = None
+
+
+def _extractor_identity() -> str:
+    """Availability signature of the call-graph extraction toolchain.
+
+    Folded into the fingerprint so that installing (or removing) a
+    tree-sitter grammar invalidates cached indices: the per-file
+    sha256 rows describe the SOURCE, not the extraction quality — the
+    same source extracted without a parser yields a degraded adjacency
+    index, and serving it after the parser is installed would pin the
+    degraded verdicts forever.
+    """
+    global _EXTRACTOR_IDENTITY
+    if _EXTRACTOR_IDENTITY is not None:
+        return _EXTRACTOR_IDENTITY
+    # Probe by ACTUAL import via the extractor's own shared,
+    # failure-caching importer — not importlib.util.find_spec.
+    # find_spec answers "is a module by this name findable?", which is
+    # true for import-time-failing stubs and broken wheels alike; the
+    # extractor only gets call graphs from grammars it can IMPORT. A
+    # findable-but-unimportable grammar would make the identity claim
+    # a toolchain the extraction never had, letting a degraded index
+    # be persisted under (and served from) the full-toolchain
+    # fingerprint. Sharing import_grammar makes this signature
+    # definitionally the set the extractors saw in this process.
+    from core.inventory._ts_cache import import_grammar
+    available = []
+    for mod in _GRAMMAR_MODULES:
+        try:
+            ok = import_grammar(mod) is not None
+        except Exception:  # noqa: BLE001 — corrupted wheel: degrade, never crash
+            # import_grammar catches (and failure-caches) ImportError
+            # only; a findable module raising anything else at import
+            # time — a corrupted pure-python wheel raising
+            # SyntaxError is the canonical shape — would otherwise
+            # propagate through compute_fingerprint and crash every
+            # reachability consumer out of its documented degrade
+            # path. Extraction fail-softs per file on the same wheel,
+            # so "unavailable" is exactly the identity the extractors
+            # will effectively have.
+            ok = False
+        if ok:
+            available.append(mod)
+    _EXTRACTOR_IDENTITY = ",".join(available)
+    return _EXTRACTOR_IDENTITY
+
+
+def compute_fingerprint(inventory: dict[str, Any]) -> str | None:
+    """Return a stable content fingerprint for ``inventory``, or
+    ``None`` if the inventory lacks the per-file sha256 we need
+    (test fixtures often do).
+
+    The fingerprint folds:
+      * ``_CACHE_VERSION``                         — schema-shape salt
+      * extractor identity (available grammars)    — extraction quality
+      * sorted ``(path, sha256)`` over every file  — content shape
+
+    Excluding ``mtime`` and other volatile fields is deliberate —
+    two builds of the same source tree at different times should
+    yield the same fingerprint.
+    """
+    files = inventory.get("files")
+    if not isinstance(files, list) or not files:
+        return None
+
+    digest = hashlib.sha256()
+    digest.update(f"v={_CACHE_VERSION}\n".encode("ascii"))
+    digest.update(f"x={_extractor_identity()}\n".encode("utf-8"))
+    # Sort by path so dict-insertion-order variation across builders
+    # doesn't change the fingerprint.
+    rows = []
+    for fr in files:
+        if not isinstance(fr, dict):
+            continue
+        path = fr.get("path")
+        sha = fr.get("sha256")
+        if not isinstance(path, str) or not isinstance(sha, str):
+            # Missing sha256 on any file → can't form a stable
+            # fingerprint. Bail out (auto-disable for this inventory).
+            return None
+        rows.append((path, sha))
+    if not rows:
+        return None
+    rows.sort()
+    for path, sha in rows:
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _cache_path_for(fingerprint: str) -> Path | None:
+    # Defense in depth: ``compute_fingerprint`` always returns a
+    # SHA-256 hexdigest, but a future refactor could route an
+    # attacker-controlled string here. Reject anything that isn't
+    # exactly 64 lowercase hex chars so a fingerprint like
+    # ``../../../tmp/poison`` cannot construct a path outside the
+    # cache root. Returns ``None`` on rejection; callers treat it
+    # as a cache miss / no-op write.
+    if not isinstance(fingerprint, str) or not _FINGERPRINT_RE.fullmatch(fingerprint):
+        logger.warning(
+            "reach_cache: invalid fingerprint %r; refusing to construct path",
+            fingerprint,
+        )
+        return None
+    return _cache_dir() / f"{fingerprint}{_CACHE_SUFFIX}"
+
+
+# ---------------------------------------------------------------------------
+# Data-only codec for _AdjacencyIndex
+#
+# Node encoding: an InternalFunction becomes the 3-list
+# ``[file_path, name, line]``; an ExternalFunction becomes its bare
+# ``qualified_name`` string. The JSON type (list vs string)
+# disambiguates on decode. Sets round-trip as lists; tuple-keyed
+# dicts flatten into row lists. The decoder validates shapes and
+# raises ValueError/TypeError on anything unexpected — load_index
+# maps that to a cache miss.
+# ---------------------------------------------------------------------------
+
+
+def _index_to_jsonable(index: "_AdjacencyIndex") -> dict[str, Any]:
+    from .reachability import InternalFunction
+
+    def enc(node: Any) -> Any:
+        if isinstance(node, InternalFunction):
+            return [node.file_path, node.name, node.line]
+        return node.qualified_name
+
+    return {
+        "forward": [
+            [enc(src), [enc(d) for d in dsts]]
+            for src, dsts in index.forward.items()
+        ],
+        "reverse": [
+            [enc(dst), [enc(s) for s in srcs]]
+            for dst, srcs in index.reverse.items()
+        ],
+        "uncertain_tail_paths": [
+            [tail, sorted(paths)]
+            for tail, paths in index.uncertain_tail_paths.items()
+        ],
+        "masked_file_callers": [
+            [path, flag, [enc(fn) for fn in fns]]
+            for path, (flag, fns) in index.masked_file_callers.items()
+        ],
+        "method_match": [
+            [tail, [[enc(fn), cls] for fn, cls in pairs]]
+            for tail, pairs in index.method_match.items()
+        ],
+        "uncertain_callees": [
+            [enc(src), sorted(names)]
+            for src, names in index.uncertain_callees.items()
+        ],
+        "has_method_dispatch": [
+            [enc(src), bool(flag)]
+            for src, flag in index.has_method_dispatch.items()
+        ],
+        "definitions": [
+            [file_path, name, [enc(fn) for fn in fns]]
+            for (file_path, name), fns in index.definitions.items()
+        ],
+        "class_of_method": [
+            [enc(fn), cls] for fn, cls in index.class_of_method.items()
+        ],
+        "class_bases": [
+            [file_path, cls, list(bases)]
+            for (file_path, cls), bases in index.class_bases.items()
+        ],
+        "override_methods": [
+            [cls, meth] for cls, meth in index.override_methods
+        ],
+        "framework_callable": [enc(fn) for fn in index.framework_callable],
+        "framework_registered": [
+            enc(fn) for fn in index.framework_registered
+        ],
+        "qualified_to_internal": [
+            [qname, enc(fn)]
+            for qname, fn in index.qualified_to_internal.items()
+        ],
+        "call_lines": [
+            [enc(src), enc(dst), list(lines)]
+            for (src, dst), lines in index.call_lines.items()
+        ],
+        "test_paths": sorted(index.test_paths),
+    }
+
+
+# Every field _index_to_jsonable writes. A well-formed cache entry
+# carries all of them; anything less is foreign/corrupt → miss.
+_MANDATORY_INDEX_FIELDS = frozenset({
+    "forward", "reverse", "uncertain_tail_paths",
+    "masked_file_callers", "method_match",
+    "uncertain_callees", "has_method_dispatch", "definitions",
+    "class_of_method", "class_bases", "override_methods",
+    "framework_callable", "framework_registered",
+    "qualified_to_internal", "call_lines", "test_paths",
+})
+
+
+def _index_from_jsonable(data: dict[str, Any]) -> "_AdjacencyIndex":
+    from .reachability import (
+        ExternalFunction,
+        InternalFunction,
+        _AdjacencyIndex,
+    )
+
+    if not isinstance(data, dict):
+        raise ValueError("index document must be a JSON object")
+    missing = _MANDATORY_INDEX_FIELDS - data.keys()
+    if missing:
+        # save_index always writes every field; a document without
+        # them (e.g. a bare ``{}`` planted under valid magic) is not a
+        # cache entry this module produced → miss, not a valid empty
+        # index.
+        raise ValueError(
+            f"index document missing mandatory fields: {sorted(missing)}"
+        )
+
+    def dec_internal(v: Any) -> Any:
+        if (
+            not isinstance(v, list) or len(v) != 3
+            or not isinstance(v[0], str) or not isinstance(v[1], str)
+            or not isinstance(v[2], int) or isinstance(v[2], bool)
+        ):
+            raise ValueError(f"bad internal-function record: {v!r}")
+        return InternalFunction(file_path=v[0], name=v[1], line=v[2])
+
+    def dec_node(v: Any) -> Any:
+        if isinstance(v, str):
+            return ExternalFunction(qualified_name=v)
+        return dec_internal(v)
+
+    def str_only(v: Any) -> str:
+        if not isinstance(v, str):
+            raise ValueError(f"expected string, got {v!r}")
+        return v
+
+    def opt_str(v: Any) -> str | None:
+        if v is None:
+            return None
+        return str_only(v)
+
+    def int_only(v: Any) -> int:
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(f"expected int, got {v!r}")
+        return v
+
+    def bool_only(v: Any) -> bool:
+        if not isinstance(v, bool):
+            raise ValueError(f"expected boolean dispatch flag, got {v!r}")
+        return v
+
+    def list_only(v: Any) -> list:
+        if not isinstance(v, list):
+            raise ValueError(f"expected list collection, got {v!r}")
+        return v
+
+    def rows(key: str) -> list:
+        value = data.get(key, [])
+        if not isinstance(value, list):
+            raise ValueError(f"field {key} must be a list")
+        # test_paths is the sole scalar-list field; every other field
+        # encodes records as arrays, never iterable strings or objects.
+        if key != "test_paths" and any(not isinstance(row, list) for row in value):
+            raise ValueError(f"field {key} records must be lists")
+        return value
+
+    return _AdjacencyIndex(
+        forward={
+            dec_internal(src): {dec_node(d) for d in list_only(dsts)}
+            for src, dsts in rows("forward")
+        },
+        reverse={
+            dec_node(dst): {dec_internal(s) for s in list_only(srcs)}
+            for dst, srcs in rows("reverse")
+        },
+        uncertain_tail_paths={
+            str_only(tail): {str_only(pp) for pp in list_only(paths)}
+            for tail, paths in rows("uncertain_tail_paths")
+        },
+        masked_file_callers={
+            str_only(path): (
+                str_only(flag),
+                tuple(dec_internal(fn) for fn in list_only(fns)),
+            )
+            for path, flag, fns in rows("masked_file_callers")
+        },
+        method_match={
+            str_only(tail): {
+                (dec_internal(fn), opt_str(cls)) for fn, cls in list_only(pairs)
+            }
+            for tail, pairs in rows("method_match")
+        },
+        uncertain_callees={
+            dec_internal(src): {str_only(n) for n in list_only(names)}
+            for src, names in rows("uncertain_callees")
+        },
+        has_method_dispatch={
+            dec_internal(src): bool_only(flag)
+            for src, flag in rows("has_method_dispatch")
+        },
+        definitions={
+            (str_only(file_path), str_only(name)):
+                {dec_internal(fn) for fn in list_only(fns)}
+            for file_path, name, fns in rows("definitions")
+        },
+        class_of_method={
+            dec_internal(fn): str_only(cls)
+            for fn, cls in rows("class_of_method")
+        },
+        class_bases={
+            (str_only(file_path), str_only(cls)):
+                tuple(str_only(b) for b in list_only(bases))
+            for file_path, cls, bases in rows("class_bases")
+        },
+        override_methods={
+            (str_only(cls), str_only(meth))
+            for cls, meth in rows("override_methods")
+        },
+        framework_callable={
+            dec_internal(fn) for fn in rows("framework_callable")
+        },
+        framework_registered={
+            dec_internal(fn) for fn in rows("framework_registered")
+        },
+        qualified_to_internal={
+            str_only(qname): dec_internal(fn)
+            for qname, fn in rows("qualified_to_internal")
+        },
+        call_lines={
+            (dec_internal(src), dec_node(dst)): tuple(
+                int_only(ln) for ln in list_only(lines)
+            )
+            for src, dst, lines in rows("call_lines")
+        },
+        test_paths=frozenset(str_only(p) for p in rows("test_paths")),
+    )
+
+
+def load_index(fingerprint: str | None) -> _AdjacencyIndex | None:
+    """Return the cached index for ``fingerprint``, or ``None`` if
+    the cache is cold / corrupt / disabled.
+
+    Disabled signals (return ``None`` without surfacing an error):
+      * ``fingerprint is None`` — caller flagged the inventory as
+        not fingerprintable.
+      * cache dir missing — fresh install / cleared cache.
+      * file missing — fingerprint not seen before.
+      * magic header mismatch — file present but wrong format
+        (manual edit, version skew with an unbumped constant,
+        legacy pickle entry).
+      * JSON decode / shape-validation failure — corrupted file.
+    """
+    if fingerprint is None:
+        return None
+    path = _cache_path_for(fingerprint)
+    if path is None:
+        return None
+    # UID + mode gate before decoding. The payload is data-only JSON
+    # (never executed), so this gate is hygiene rather than the RCE
+    # boundary it had to be under the retired pickle format — but a
+    # foreign-owned or world-writable cache entry is still not a
+    # trustworthy source of reachability verdicts. We refuse
+    # to load any cache file not owned by the current user OR with
+    # group/other write permission set. Closes:
+    #   * Containerised builds where the cache was populated by
+    #     one UID and the runtime user differs.
+    #   * Symlink plants from a less-privileged process redirecting
+    #     to attacker-writable content.
+    #   * Multi-user dev hosts where another user could write to
+    #     a shared ``~/.cache``.
+    # TOCTOU defence: open the file ONCE, then validate via the
+    # opened FD's fstat(). Pre-fix the path-based ``lstat()`` then a
+    # separate ``read_bytes()`` left a race window where an attacker
+    # who could win it could swap the inode between the two calls —
+    # e.g. lstat sees a regular file, read_bytes reads a symlink. The
+    # ``O_NOFOLLOW`` flag refuses to traverse a symlink at the
+    # original path (Linux: opens fail with ELOOP). fstat on the FD
+    # is authoritative for the actually-opened inode.
+    import stat as _stat
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.debug("reach_cache: open failed for %s: %s", path, exc)
+        return None
+    failed = False
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
+            logger.debug("reach_cache: fstat failed for %s: %s", path, exc)
+            return None
+        # ``O_NOFOLLOW`` already refused symlinks at the original
+        # path, but a separate check covers the (paranoid) shape of
+        # an O_NOFOLLOW-ignoring filesystem.
+        if _stat.S_ISLNK(st.st_mode):
+            logger.warning(
+                "reach_cache: cache entry %s is a symlink — "
+                "refusing to load",
+                path,
+            )
+            return None
+        if not _stat.S_ISREG(st.st_mode):
+            logger.debug("reach_cache: cache entry %s is not a regular file", path)
+            return None
+        if st.st_uid != os.getuid():
+            logger.warning(
+                "reach_cache: cache entry %s owned by uid=%d, current uid=%d — "
+                "refusing to load",
+                path, st.st_uid, os.getuid(),
+            )
+            return None
+        if st.st_mode & 0o022:
+            logger.warning(
+                "reach_cache: cache entry %s has group/world write perms "
+                "(mode=%o) — refusing to load",
+                path, st.st_mode & 0o777,
+            )
+            return None
+        # Short-circuit size check via ``st.st_size`` BEFORE any
+        # read. Pre-fix we walked the read loop up to 64 MiB before
+        # bailing on the running ``total > _MAX_INDEX_BYTES`` check
+        # — fine for the legitimate case (cache files weigh single
+        # MiB) but wasteful on a planted pathological file.
+        if st.st_size > _MAX_INDEX_BYTES:
+            logger.warning(
+                "reach_cache: cache entry %s size %d exceeds %d bytes "
+                "— refusing to load",
+                path, st.st_size, _MAX_INDEX_BYTES,
+            )
+            return None
+        try:
+            # Read via os.read in a loop until EOF — read_bytes can't
+            # take an fd directly. The pre-flight size check above
+            # bounds total memory; the in-loop check stays as
+            # defence-in-depth against TOCTOU file-growth between
+            # fstat and the reads.
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                buf = os.read(fd, min(1 << 20, _MAX_INDEX_BYTES - total + 1))
+                if not buf:
+                    break
+                total += len(buf)
+                if total > _MAX_INDEX_BYTES:
+                    logger.warning(
+                        "reach_cache: cache entry %s exceeds %d bytes — "
+                        "refusing to load",
+                        path, _MAX_INDEX_BYTES,
+                    )
+                    return None
+                chunks.append(buf)
+            blob = b"".join(chunks)
+        except OSError as exc:
+            logger.debug("reach_cache: load failed for %s: %s", path, exc)
+            return None
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            os.close(fd)
+        except BaseException as exc:
+            if not failed and not isinstance(exc, OSError):
+                raise
+    if not blob.startswith(_HEADER_MAGIC):
+        logger.debug(
+            "reach_cache: cache file %s has wrong magic; ignoring", path,
+        )
+        return None
+    try:
+        idx = _index_from_jsonable(json.loads(blob[len(_HEADER_MAGIC):]))
+    except (json.JSONDecodeError, UnicodeDecodeError, AttributeError,
+            KeyError, IndexError, TypeError, ValueError,
+            RecursionError) as exc:
+        # Any decode or shape-validation failure — corruption, a
+        # hand-edited file, a field renamed without a version bump —
+        # is a cache miss; the consumer rebuilds and overwrites.
+        # RecursionError: deeply nested JSON (``[[[[…``) blows the
+        # interpreter stack inside json.loads — fail-to-miss, never
+        # crash the consuming reachability pipeline.
+        logger.debug(
+            "reach_cache: decode failed for %s: %s "
+            "(treating as miss)", path, exc,
+        )
+        return None
+    return idx
+
+
+def save_index(
+    fingerprint: str | None,
+    index: _AdjacencyIndex,
+) -> None:
+    """Persist ``index`` under ``fingerprint``. Atomic write
+    (tempfile + rename) so a process crash mid-write can't leave a
+    partial cache. mode 0600. ``fingerprint=None`` is a no-op."""
+    if fingerprint is None:
+        return
+    path = _cache_path_for(fingerprint)
+    if path is None:
+        return
+    try:
+        cache_root = _cache_dir()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(cache_root, 0o700)
+    except OSError as exc:
+        logger.debug("reach_cache: dir setup failed: %s", exc)
+        return
+    # Atomic write: reachability cache, mode=0o600 to preserve the
+    # owner-only posture the previous mkstemp+chmod pattern installed.
+    # Compact separators keep the adjacency rows dense; the format is
+    # Python-version independent by construction (plain JSON).
+    # Keep only a small output buffer alongside the JSONable graph, rather
+    # than retaining the full JSON string, UTF-8 bytes and prefixed payload.
+    # A private exception unwinds the atomic writer before its rename when
+    # the running byte count (including the header) exceeds the read cap.
+    class _IndexTooLarge(Exception):
+        pass
+
+    def chunks():
+        total = len(_HEADER_MAGIC)
+        if total > _MAX_INDEX_BYTES:
+            raise _IndexTooLarge(total)
+        yield _HEADER_MAGIC
+        pending = bytearray()
+        encoder = json.JSONEncoder(separators=(",", ":"))
+        for piece in encoder.iterencode(_index_to_jsonable(index)):
+            encoded = piece.encode("utf-8")
+            total += len(encoded)
+            if total > _MAX_INDEX_BYTES:
+                raise _IndexTooLarge(total)
+            pending.extend(encoded)
+            # Coalesce encoder tokens to avoid a syscall for each scalar
+            # or punctuation token; this does not change the emitted bytes.
+            if len(pending) >= 64 * 1024:
+                yield pending
+                pending = bytearray()
+        if pending:
+            yield pending
+
+    try:
+        write_bytes_atomically(
+            path, chunks(),
+            mode=0o600, tmp_prefix=".reach-tmp-",
+        )
+    except _IndexTooLarge as exc:
+        logger.warning(
+            "reach_cache: index for this target serializes to at least %d "
+            "bytes, past the loader's %d-byte cap — not caching "
+            "(reachability recomputes each run for targets this large)",
+            exc.args[0], _MAX_INDEX_BYTES,
+        )
+        return
+    except OSError as exc:
+        logger.debug("reach_cache: write failed for %s: %s", path, exc)
+        return
+    _evict_oldest()
+
+
+def _cache_entries() -> list:
+    """Every cache entry on disk — current format plus retired
+    legacy suffixes (never loaded, but swept by eviction/clearing
+    so they don't squat the cache dir forever)."""
+    entries: list = []
+    cache_root = _cache_dir()
+    for suffix in (_CACHE_SUFFIX, *_LEGACY_SUFFIXES):
+        for path in cache_root.glob(f"*{suffix}"):
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                continue
+            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                entries.append(path)
+    return entries
+
+
+def _evict_oldest() -> None:
+    """Remove oldest cache entries (by mtime) when count exceeds cap."""
+    from core.atomic_fs.cache_eviction import evict_oldest_files
+    try:
+        entries = _cache_entries()
+    except OSError:
+        return
+    evict_oldest_files(entries, _MAX_CACHE_ENTRIES)
+
+
+def clear_cache() -> int:
+    """Delete every cache entry; return the count removed."""
+    if not _cache_dir().exists():
+        return 0
+    n = 0
+    for p in _cache_entries():
+        try:
+            p.unlink()
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def cache_dir() -> Path:
+    """Public accessor for the cache root (call-time resolution)."""
+    return _cache_dir()
+
+
+__all__ = [
+    "cache_dir",
+    "clear_cache",
+    "compute_fingerprint",
+    "load_index",
+    "save_index",
+]

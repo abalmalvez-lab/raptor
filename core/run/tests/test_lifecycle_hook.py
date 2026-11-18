@@ -2,18 +2,26 @@
 
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from core.json import load_json, save_json
 from core.run.metadata import (
-    RUN_METADATA_FILE, STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
+    RUN_METADATA_FILE,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
 )
+from core.testing.processes import cleanup_on_startup_error, reap_on_exit
+from core.testing.standalone_cli import run_standalone_cli
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # core/run/tests/ → raptor/
 HOOK_SCRIPT = REPO_ROOT / "libexec" / "raptor-lifecycle-hook"
@@ -55,6 +63,21 @@ def _status(d: Path) -> str:
     return load_json(d / RUN_METADATA_FILE).get("status")
 
 
+#: PostToolUseFailure stdin payload for a failed RAPTOR pipeline call —
+#: the only shape that may stamp the failure marker.
+RAPTOR_BASH_FAILURE = json.dumps({
+    "tool_name": "Bash",
+    "tool_input": {"command": "libexec/raptor-run-lifecycle start scan"},
+})
+
+
+@contextmanager
+def _stdin(payload: str):
+    with patch.object(sys, "stdin", io.StringIO(payload)) as stream, \
+            patch.object(sys, "argv", list(sys.argv)):
+        yield stream
+
+
 class TestToolFailureMarker(unittest.TestCase):
     """tool-failure mode writes a soft marker without changing status."""
 
@@ -63,25 +86,60 @@ class TestToolFailureMarker(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-20260503", "scan")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
-                       return_value=SESSION_PID):
+                 patch("core.run.metadata._get_session_pid",
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertTrue((run / FAILURE_MARKER).exists())
             self.assertEqual(_status(run), STATUS_RUNNING)
 
-    def test_marks_all_running_in_session(self):
+    def test_marks_only_newest_running_in_session(self):
+        # Stamping EVERY running run let a failed single-call command
+        # poison an unrelated in-flight run (the next Stop fail_run's
+        # it). With no run dir named in the command, only the newest
+        # running run — the one a just-failed single-call belongs to —
+        # gets the marker.
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run1 = _make_running_run(out, "scan-001", "scan")
             run2 = _make_running_run(out, "agentic-002", "agentic")
+            meta = load_json(run2 / RUN_METADATA_FILE)
+            meta["timestamp"] = "2026-05-03T13:00:00+00:00"  # newer
+            save_json(run2 / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
-                       return_value=SESSION_PID):
+                 patch("core.run.metadata._get_session_pid",
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
+                sys.argv = ["hook", "tool-failure"]
+                _hook_mod.main()
+            self.assertFalse((run1 / FAILURE_MARKER).exists())
+            self.assertTrue((run2 / FAILURE_MARKER).exists())
+
+    def test_marks_the_run_named_in_the_command(self):
+        # A failing command that carries a run dir (lifecycle-managed
+        # commands carry their OUTPUT_DIR) attributes the marker to
+        # THAT run, even when a newer run is in flight.
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            run1 = _make_running_run(out, "scan-001", "scan")
+            run2 = _make_running_run(out, "agentic-002", "agentic")
+            meta = load_json(run2 / RUN_METADATA_FILE)
+            meta["timestamp"] = "2026-05-03T13:00:00+00:00"  # newer
+            save_json(run2 / RUN_METADATA_FILE, meta)
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command":
+                               f"libexec/raptor-run-lifecycle complete {run1}"},
+            })
+            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
+                 patch("core.run.metadata._get_session_pid",
+                       return_value=SESSION_PID), \
+                 _stdin(payload):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertTrue((run1 / FAILURE_MARKER).exists())
-            self.assertTrue((run2 / FAILURE_MARKER).exists())
+            self.assertFalse((run2 / FAILURE_MARKER).exists())
 
     def test_skips_different_session(self):
         with TemporaryDirectory() as tmp:
@@ -89,8 +147,9 @@ class TestToolFailureMarker(unittest.TestCase):
             run = _make_running_run(out, "scan-001", "scan",
                                     session_pid=88888)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
-                       return_value=SESSION_PID):
+                 patch("core.run.metadata._get_session_pid",
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
@@ -103,27 +162,149 @@ class TestToolFailureMarker(unittest.TestCase):
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
-                       return_value=SESSION_PID):
+                 patch("core.run.metadata._get_session_pid",
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
 
 
-class TestStopHook(unittest.TestCase):
-    """Stop mode: complete or fail single-call runs with dead tool_pid."""
+class TestToolFailureFiltering(unittest.TestCase):
+    """Only failed Bash calls on the libexec/raptor-* dispatch surface
+    may stamp the failure marker: the hook-config `matcher` filters by
+    tool NAME only, so an unrelated failed Bash call (a typo'd grep)
+    would otherwise flip a successful run to failed at the next Stop."""
 
-    def test_completes_when_no_marker(self):
+    def _run_hook(self, tmp: str, payload: str) -> Path:
+        out = Path(tmp) / "out"
+        run = _make_running_run(out, "scan-001", "scan")
+        with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
+             patch("core.run.metadata._get_session_pid",
+                   return_value=SESSION_PID), \
+             _stdin(payload):
+            sys.argv = ["hook", "tool-failure"]
+            _hook_mod.main()
+        return run
+
+    def test_unrelated_bash_failure_writes_no_marker(self):
+        payload = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep -r pattern /nonexistent"},
+        })
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, payload)
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_non_bash_tool_failure_writes_no_marker(self):
+        payload = json.dumps({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "libexec/raptor-agentic"},
+        })
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, payload)
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_malformed_stdin_writes_no_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, "{not json")
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_empty_stdin_writes_no_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, "")
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_raptor_dispatch_failure_writes_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, RAPTOR_BASH_FAILURE)
+            self.assertTrue((run / FAILURE_MARKER).exists())
+
+    def test_mention_only_command_writes_no_marker(self):
+        # Commands that merely MENTION the dispatch surface fail for
+        # their own reasons: CLAUDE.md's dispatch rule instructs
+        # `ls libexec/raptor-<name>*`, which exits 2 on a glob miss —
+        # a marker here flips a successful run to Failed at Stop.
+        for command in (
+            "ls libexec/raptor-coverage*",
+            "grep -n verdict libexec/raptor-agentic",
+            "cat libexec/raptor-run-lifecycle",
+        ):
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })
+            with TemporaryDirectory() as tmp:
+                run = self._run_hook(tmp, payload)
+                self.assertFalse(
+                    (run / FAILURE_MARKER).exists(),
+                    f"mention-only command stamped a marker: {command}",
+                )
+
+    def test_invocation_shapes_write_marker(self):
+        # Command-position invocations, including behind a path
+        # prefix or a shell separator, are the relevant shapes.
+        for command in (
+            "libexec/raptor-coverage-summary --gaps",
+            '"$CLAUDE_PROJECT_DIR"/libexec/raptor-run-lifecycle start scan',
+            "cd /repo && libexec/raptor-agentic --repo /x",
+            "true; libexec/raptor-verified-outcomes out/run",
+        ):
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })
+            with TemporaryDirectory() as tmp:
+                run = self._run_hook(tmp, payload)
+                self.assertTrue(
+                    (run / FAILURE_MARKER).exists(),
+                    f"invocation shape missed: {command}",
+                )
+
+
+    def test_posttooluse_event_rejected_by_failure_filter(self):
+        """PostToolUse (not PostToolUseFailure) must not stamp a marker."""
+        payload = json.dumps({
+            "tool_name": "Bash",
+            "hook_event_name": "PostToolUse",
+            "tool_input": {"command": "libexec/raptor-run-lifecycle start scan"},
+            "tool_response": "Process exited with code 1",
+        })
+        result = _hook_mod._tool_failure_command(io.StringIO(payload))
+        self.assertIsNone(result)
+
+    def test_posttoolusefailure_event_accepted(self):
+        """PostToolUseFailure (explicit) is still accepted."""
+        payload = json.dumps({
+            "tool_name": "Bash",
+            "hook_event_name": "PostToolUseFailure",
+            "tool_input": {"command": "libexec/raptor-run-lifecycle start scan"},
+        })
+        result = _hook_mod._tool_failure_command(io.StringIO(payload))
+        self.assertIsNotNone(result)
+
+    def test_legacy_no_event_name_accepted(self):
+        """Legacy payloads without hook_event_name are still accepted."""
+        result = _hook_mod._tool_failure_command(
+            io.StringIO(RAPTOR_BASH_FAILURE))
+        self.assertIsNotNone(result)
+
+
+class TestStopHook(unittest.TestCase):
+    """Stop mode: fail single-call runs with dead tool_pid + failure marker."""
+
+    def test_unknown_stays_running_without_marker(self):
+        """Dead worker + no failure marker = unknown, not completed."""
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
-            self.assertEqual(_status(run), STATUS_COMPLETED)
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
+            self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_fails_when_marker_present(self):
         with TemporaryDirectory() as tmp:
@@ -131,11 +312,11 @@ class TestStopHook(unittest.TestCase):
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             (run / FAILURE_MARKER).write_text("")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
             meta = load_json(run / RUN_METADATA_FILE)
             self.assertIn("tool exited with error", meta["extra"]["error"])
@@ -146,32 +327,25 @@ class TestStopHook(unittest.TestCase):
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             (run / FAILURE_MARKER).write_text("")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
 
-    def test_cleans_up_marker_on_complete(self):
-        """Marker from a previous intermediate failure is cleaned on complete."""
+    def test_no_marker_no_complete(self):
+        """No failure marker + dead worker → stays running (unknown)."""
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run = _make_running_run(out, "agentic-001", "agentic", tool_pid=1)
-            # Stale marker that shouldn't persist
-            (run / FAILURE_MARKER).write_text("")
-            # Remove marker to simulate LLM recovery — but actually we want
-            # to test that Stop cleans it up even on the fail path.
-            # Test the complete path instead: no marker.
-            (run / FAILURE_MARKER).unlink()
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
-            self.assertEqual(_status(run), STATUS_COMPLETED)
-            self.assertFalse((run / FAILURE_MARKER).exists())
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
+            self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_skips_multi_turn_validate(self):
         with TemporaryDirectory() as tmp:
@@ -179,11 +353,11 @@ class TestStopHook(unittest.TestCase):
             run = _make_running_run(out, "validate-001", "validate",
                                     tool_pid=1)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_skips_multi_turn_understand(self):
@@ -192,11 +366,11 @@ class TestStopHook(unittest.TestCase):
             run = _make_running_run(out, "understand-001", "understand",
                                     tool_pid=1)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_skips_alive_tool_pid(self):
@@ -204,11 +378,12 @@ class TestStopHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=12345)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=True):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                 patch("core.run.metadata._tool_pid_alive",
+                       return_value=True):
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_skips_different_session(self):
@@ -217,11 +392,11 @@ class TestStopHook(unittest.TestCase):
             run = _make_running_run(out, "scan-001", "scan",
                                     session_pid=88888, tool_pid=1)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_skips_already_completed(self):
@@ -232,15 +407,15 @@ class TestStopHook(unittest.TestCase):
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
 
-    def test_handles_no_tool_pid(self):
-        """Runs without tool_pid (pre-change) are acted on if session matches."""
+    def test_handles_no_tool_pid_stays_running(self):
+        """Runs without tool_pid and no failure marker stay running."""
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             d = out / "scan-001"
@@ -254,11 +429,11 @@ class TestStopHook(unittest.TestCase):
             }
             save_json(d / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
-            self.assertEqual(_status(d), STATUS_COMPLETED)
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
+            self.assertEqual(_status(d), STATUS_RUNNING)
 
 
 class TestSessionEndHook(unittest.TestCase):
@@ -270,10 +445,10 @@ class TestSessionEndHook(unittest.TestCase):
             run1 = _make_running_run(out, "scan-001", "scan")
             run2 = _make_running_run(out, "validate-002", "validate")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID):
-                sys.argv = ["hook", "session-end"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "session-end"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run1), STATUS_FAILED)
             self.assertEqual(_status(run2), STATUS_FAILED)
 
@@ -283,10 +458,10 @@ class TestSessionEndHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "validate-001", "validate")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID):
-                sys.argv = ["hook", "session-end"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "session-end"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
             meta = load_json(run / RUN_METADATA_FILE)
             self.assertIn("session ended", meta["extra"]["error"])
@@ -297,10 +472,10 @@ class TestSessionEndHook(unittest.TestCase):
             run = _make_running_run(out, "scan-001", "scan")
             (run / FAILURE_MARKER).write_text("")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID):
-                sys.argv = ["hook", "session-end"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "session-end"]):
+                    _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
 
     def test_skips_non_running(self):
@@ -311,10 +486,10 @@ class TestSessionEndHook(unittest.TestCase):
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID):
-                sys.argv = ["hook", "session-end"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "session-end"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
 
     def test_skips_different_session(self):
@@ -323,10 +498,10 @@ class TestSessionEndHook(unittest.TestCase):
             run = _make_running_run(out, "scan-001", "scan",
                                     session_pid=88888)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID):
-                sys.argv = ["hook", "session-end"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "session-end"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
 
@@ -345,11 +520,11 @@ class TestLLMOverride(unittest.TestCase):
             self.assertEqual(_status(run), STATUS_COMPLETED)
             # Now Stop fires — should skip because not running
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
 
     def test_llm_fail_prevents_hook_action(self):
@@ -361,11 +536,11 @@ class TestLLMOverride(unittest.TestCase):
             fail_run(run, "analysis found nothing")
             self.assertEqual(_status(run), STATUS_FAILED)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
             meta = load_json(run / RUN_METADATA_FILE)
             self.assertEqual(meta["extra"]["error"], "analysis found nothing")
@@ -374,33 +549,53 @@ class TestLLMOverride(unittest.TestCase):
 class TestProjectDirScan(unittest.TestCase):
     """Hook scans both .active project dir and out/."""
 
-    def test_scans_active_project(self):
+    def test_finalizes_project_run_via_ledger(self):
+        """Project runs with a failure marker are finalized via the
+        session run ledger (project runs live TWO levels below the out
+        root, unreachable by the legacy one-level walk)."""
+        import os
+
+        from core.project import sessions
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            proj = repo / "projects" / "myapp"
+            proj = repo / "out" / "projects" / "myapp"
             run = _make_running_run(proj, "scan-001", "scan", tool_pid=1)
-            active = repo / ".active"
-            active.symlink_to(proj)
+            (run / FAILURE_MARKER).write_text("")
+            sessions_dir = repo / "sessions.d"
             with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch.object(sessions, "SESSIONS_DIR", sessions_dir), \
+                 patch.object(sessions, "_comm",
+                              lambda pid: "claude"
+                              if pid in (SESSION_PID, os.getpid())
+                              else None), \
+                 patch.object(sessions, "_pid_running",
+                              lambda pid: pid in (SESSION_PID,
+                                                  os.getpid())), \
+                 patch.object(sessions, "proc_starttime",
+                              lambda pid: None if sys.platform != "linux" else "7"), \
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
-            self.assertEqual(_status(run), STATUS_COMPLETED)
+                 patch("core.run.metadata._pid_alive",
+                       return_value=False):
+                sessions.record_session("myapp", pid=SESSION_PID)
+                sessions.ledger_record_start(run, pid=SESSION_PID)
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
+            self.assertEqual(_status(run), STATUS_FAILED)
 
     def test_scans_out_dir(self):
+        """Out-dir scan finds runs; without failure marker, stays running."""
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             out = repo / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
-            self.assertEqual(_status(run), STATUS_COMPLETED)
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
+            self.assertEqual(_status(run), STATUS_RUNNING)
 
     def test_skips_hidden_dirs(self):
         with TemporaryDirectory() as tmp:
@@ -408,11 +603,11 @@ class TestProjectDirScan(unittest.TestCase):
             out = repo / "out"
             run = _make_running_run(out, ".internal", "scan", tool_pid=1)
             with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._find_claude_ancestor",
+                 patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
                  patch("core.run.metadata._pid_alive", return_value=False):
-                sys.argv = ["hook", "stop"]
-                _hook_mod.main()
+                with patch.object(sys, "argv", ["hook", "stop"]):
+                    _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
 
@@ -420,7 +615,11 @@ class TestMultiTurnGuard(unittest.TestCase):
     """Verify the multi-turn command list is complete."""
 
     def test_multi_turn_set_contents(self):
-        self.assertEqual(MULTI_TURN, {"validate", "understand"})
+        # ``audit`` is here because its run is finalized by the
+        # orchestrator itself (possibly in a background shell); the
+        # Stop hook once stamped an in-flight audit ``completed``
+        # after that shell died.
+        self.assertEqual(MULTI_TURN, {"validate", "understand", "audit"})
 
     def test_all_multi_turn_skipped_by_stop(self):
         """Every command in _MULTI_TURN_COMMANDS is skipped by Stop."""
@@ -429,12 +628,12 @@ class TestMultiTurnGuard(unittest.TestCase):
                 out = Path(tmp) / "out"
                 run = _make_running_run(out, f"{cmd}-001", cmd, tool_pid=1)
                 with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                     patch("core.run.metadata._find_claude_ancestor",
+                     patch("core.run.metadata._get_session_pid",
                            return_value=SESSION_PID), \
                      patch("core.run.metadata._pid_alive",
                            return_value=False):
-                    sys.argv = ["hook", "stop"]
-                    _hook_mod.main()
+                    with patch.object(sys, "argv", ["hook", "stop"]):
+                        _hook_mod.main()
                 self.assertEqual(
                     _status(run), STATUS_RUNNING,
                     f"Stop should skip multi-turn command '{cmd}'")
@@ -446,20 +645,66 @@ class TestMultiTurnGuard(unittest.TestCase):
                 out = Path(tmp) / "out"
                 run = _make_running_run(out, f"{cmd}-001", cmd)
                 with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                     patch("core.run.metadata._find_claude_ancestor",
+                     patch("core.run.metadata._get_session_pid",
                            return_value=SESSION_PID):
-                    sys.argv = ["hook", "session-end"]
-                    _hook_mod.main()
+                    with patch.object(sys, "argv", ["hook", "session-end"]):
+                        _hook_mod.main()
                 self.assertEqual(
                     _status(run), STATUS_FAILED,
                     f"SessionEnd should catch multi-turn command '{cmd}'")
 
 
 class TestE2EHookScript(unittest.TestCase):
-    """Run the actual hook script as a subprocess."""
+    """Run the actual hook script as a subprocess.
+
+    The event-mode smoke tests spawn the hook hermetically: with an
+    inherited environment, a run from inside a live claude session
+    resolved THAT session and swept its real run ledger and real
+    ``out/`` — ``session-end`` fails every running run of the session
+    (``abandon_sweep``), ``stop`` can stamp ``hook_finalize``
+    completions, and ``tool-failure`` drops failure markers into real
+    run directories.
+    """
+
+    @staticmethod
+    def _hermetic_invocation(tmp: Path) -> tuple[list[str], dict[str, str]]:
+        """A byte-identical hook copy rooted in *tmp* + a scrubbed env.
+
+        The hook finalises runs on two lanes the test must never
+        reach: the session run ledger under ``$HOME`` and the out-dir
+        scan (``$RAPTOR_OUT_DIR`` plus the unconditional
+        ``REPO_ROOT/out``, where ``REPO_ROOT`` derives from the
+        SCRIPT's own location — no env var moves it). A fresh HOME
+        (no registered sessions.d entry) with the session credential
+        pair popped empties the ledger lane; running a copy of the
+        script from *tmp* relocates ``REPO_ROOT/out`` to an empty tmp
+        tree — the subprocess twin of the in-process tests'
+        ``patch.object(_hook_mod, "REPO_ROOT", ...)``. PYTHONPATH
+        carries the real repo for the copy's imports, and
+        CLAUDECODE=1 satisfies the trust gate from the child's own
+        env rather than the invoking session's.
+        """
+        libexec = tmp / "libexec"
+        libexec.mkdir()
+        hook_copy = libexec / "raptor-lifecycle-hook"
+        hook_copy.write_bytes(HOOK_SCRIPT.read_bytes())
+        home = tmp / "home"
+        home.mkdir()
+        out_scan = tmp / "out-scan"
+        out_scan.mkdir()
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["RAPTOR_OUT_DIR"] = str(out_scan)
+        env["CLAUDECODE"] = "1"
+        env["RAPTOR_DIR"] = str(REPO_ROOT)
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(REPO_ROOT), env.get("PYTHONPATH")) if p)
+        env.pop("RAPTOR_SESSION_PID", None)
+        env.pop("RAPTOR_SESSION_TOKEN", None)
+        return [sys.executable, str(hook_copy)], env
 
     def test_invalid_arg_exits_nonzero(self):
-        result = subprocess.run(
+        result = run_standalone_cli(
             [sys.executable, str(HOOK_SCRIPT), "bogus"],
             capture_output=True, text=True,
         )
@@ -467,7 +712,7 @@ class TestE2EHookScript(unittest.TestCase):
         self.assertIn("Usage", result.stderr)
 
     def test_no_args_exits_nonzero(self):
-        result = subprocess.run(
+        result = run_standalone_cli(
             [sys.executable, str(HOOK_SCRIPT)],
             capture_output=True, text=True,
         )
@@ -477,31 +722,354 @@ class TestE2EHookScript(unittest.TestCase):
         """In Claude Code env, stop runs without error."""
         if not os.environ.get("CLAUDECODE"):
             self.skipTest("Requires CLAUDECODE environment")
-        result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT), "stop"],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0)
+        with TemporaryDirectory() as tmp:
+            argv, env = self._hermetic_invocation(Path(tmp))
+            result = run_standalone_cli(
+                [*argv, "stop"],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_tool_failure_runs_in_claudecode(self):
         """In Claude Code env, tool-failure runs without error."""
         if not os.environ.get("CLAUDECODE"):
             self.skipTest("Requires CLAUDECODE environment")
-        result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT), "tool-failure"],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0)
+        with TemporaryDirectory() as tmp:
+            argv, env = self._hermetic_invocation(Path(tmp))
+            result = run_standalone_cli(
+                [*argv, "tool-failure"],
+                capture_output=True, text=True, env=env, timeout=120,
+                input=RAPTOR_BASH_FAILURE,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_session_end_runs_in_claudecode(self):
         """In Claude Code env, session-end runs without error."""
         if not os.environ.get("CLAUDECODE"):
             self.skipTest("Requires CLAUDECODE environment")
-        result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT), "session-end"],
-            capture_output=True, text=True,
+        with TemporaryDirectory() as tmp:
+            argv, env = self._hermetic_invocation(Path(tmp))
+            result = run_standalone_cli(
+                [*argv, "session-end"],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestSessionEndLivenessProof(unittest.TestCase):
+    """session-end proves the recorded session dead before reaping.
+
+    A SessionEnd event can fire from a context that inherited the
+    parent session's identity env (a nested subagent ending its own
+    session) while the recorded session_pid is alive and mid-pipeline
+    — pre-fix the reap failed the parent's live run. Stamped metas
+    (session_start + session_boot_id) get the full identity check;
+    whatever IS reaped carries ``extra.abandon_sweep`` so the
+    metadata recovery clause can self-heal a misjudged reap.
+    """
+
+    def _isolated(self, tmp: Path, session_pid: int):
+        """Patch stack confining the hook to *tmp* and *session_pid*.
+
+        The stub tests use REAL (recyclable) pids, so the ledger and
+        the configured out dir must not leak real runs into the scan.
+        """
+        return (
+            patch.object(_hook_mod, "REPO_ROOT", tmp),
+            patch("core.run.metadata._get_session_pid",
+                  return_value=session_pid),
+            patch("core.project.sessions.ledger_runs",
+                  side_effect=Exception("no ledger in this test")),
+            patch("core.config.RaptorConfig.get_out_dir",
+                  return_value=tmp / "out"),
         )
-        self.assertEqual(result.returncode, 0)
+
+    def _run_session_end(self, tmp: Path, session_pid: int,
+                         payload: str = "") -> None:
+        p1, p2, p3, p4 = self._isolated(tmp, session_pid)
+        with p1, p2, p3, p4, _stdin(payload):
+            sys.argv = ["hook", "session-end"]
+            _hook_mod.main()
+
+    @staticmethod
+    def _spawn_claude_shaped_stub(tmp: Path) -> subprocess.Popen:
+        """A live stub whose comm reads ``claude`` (comm comes from
+        the execve filename, so a symlink to the interpreter named
+        ``claude`` suffices — no real session)."""
+        link = tmp / "claude"
+        link.symlink_to(sys.executable)
+        proc = subprocess.Popen(
+            [str(link), "-c",
+             "import time; print('ready', flush=True); time.sleep(300)"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        with cleanup_on_startup_error(proc):
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "ready"
+            return proc
+
+    @staticmethod
+    def _reap_stub(proc: subprocess.Popen) -> None:
+        with reap_on_exit(proc, wait_timeout=10):
+            pass
+
+    @staticmethod
+    def _stamp_meta(run: Path, **fields) -> None:
+        meta = load_json(run / RUN_METADATA_FILE)
+        meta.update(fields)
+        save_json(run / RUN_METADATA_FILE, meta)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_live_stamped_session_is_skipped(self):
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)  # live stub readable
+                self._stamp_meta(run, **stamp)
+                self._run_session_end(tmp, stub.pid)
+                self.assertEqual(_status(run), STATUS_RUNNING)
+                self.assertIsNone(stub.poll())
+            finally:
+                self._reap_stub(stub)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_dead_stamped_session_is_reaped_with_marker(self):
+        from core.project.sessions import boot_id, pidns_id
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            dead_pid = 2_000_000_000  # inert: beyond pid_max
+            run = _make_running_run(tmp / "out", "validate-001",
+                                    "validate", session_pid=dead_pid)
+            # Live boot/ns so the stamp is judged HERE (a foreign
+            # stamp reads as alive — fail-open — and would skip).
+            self._stamp_meta(
+                run, session_start="12345",
+                session_boot_id=boot_id(), session_pidns=pidns_id(),
+            )
+            self._run_session_end(tmp, dead_pid)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            meta = load_json(run / RUN_METADATA_FILE)
+            self.assertIs(meta["extra"]["abandon_sweep"], True)
+            self.assertIn("session ended", meta["extra"]["error"])
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_recycled_pid_is_treated_dead_and_reaped(self):
+        # A live claude-shaped process at the recorded pid whose
+        # starttime does not match the stamp is a RECYCLED pid — the
+        # recorded session is gone; the run is reaped (with marker),
+        # and the impostor process is never signalled.
+        from core.project.sessions import boot_id, pidns_id, proc_starttime
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                real_start = proc_starttime(stub.pid)
+                self.assertIsNotNone(real_start)
+                self._stamp_meta(
+                    run, session_start=str(int(real_start) + 1),
+                    session_boot_id=boot_id(), session_pidns=pidns_id(),
+                )
+                self._run_session_end(tmp, stub.pid)
+                self.assertEqual(_status(run), STATUS_FAILED)
+                meta = load_json(run / RUN_METADATA_FILE)
+                self.assertIs(meta["extra"]["abandon_sweep"], True)
+                self.assertIsNone(stub.poll())
+            finally:
+                self._reap_stub(stub)
+
+    def test_legacy_meta_keeps_unconditional_reap(self):
+        # No identity fields — no proof is possible either way; the
+        # pre-existing reap applies, now with the recovery marker.
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = _make_running_run(tmp / "out", "scan-001", "scan")
+            self._run_session_end(tmp, SESSION_PID)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            meta = load_json(run / RUN_METADATA_FILE)
+            self.assertIs(meta["extra"]["abandon_sweep"], True)
+
+    def test_matching_session_id_finalizes_despite_live_owner(self):
+        # Owner-end proof: the SessionEnd payload's session_id equals
+        # the id start_run recorded — the ending session IS the owner,
+        # so the run is finalized immediately even though the owner
+        # process still breathes while its own hook executes.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(run, session_id=sid, **stamp)
+                # No ``reason`` in the payload: absent reads as a real
+                # end (the enum may grow) — finalize.
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({"session_id": sid,
+                                        "hook_event_name": "SessionEnd"}))
+                self.assertEqual(_status(run), STATUS_FAILED)
+                meta = load_json(run / RUN_METADATA_FILE)
+                self.assertIs(meta["extra"]["abandon_sweep"], True)
+                self.assertIsNone(stub.poll())  # owner never signalled
+            finally:
+                self._reap_stub(stub)
+
+    def _matching_id_session_end(self, reason: str) -> str:
+        """Run session-end with a matching recorded/payload session_id
+        and the given payload ``reason``; returns the run's status."""
+        from core.run.metadata import _session_stamp
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(run, session_id=sid, **stamp)
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({"session_id": sid,
+                                        "reason": reason,
+                                        "hook_event_name": "SessionEnd"}))
+                self.assertIsNone(stub.poll())
+                return _status(run)
+            finally:
+                self._reap_stub(stub)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_reason_clear_keeps_liveness_skip(self):
+        # /clear retires the session id but the owner PROCESS survives
+        # (a background orchestrator may still finalize its run) — the
+        # matching id must NOT finalize; the liveness gate applies.
+        self.assertEqual(self._matching_id_session_end("clear"),
+                         STATUS_RUNNING)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_reason_resume_keeps_liveness_skip(self):
+        self.assertEqual(self._matching_id_session_end("resume"),
+                         STATUS_RUNNING)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_reason_logout_finalizes(self):
+        # A real end reason (and any future unknown one) finalizes.
+        self.assertEqual(self._matching_id_session_end("logout"),
+                         STATUS_FAILED)
+
+    def test_mismatched_session_id_keeps_liveness_skip(self):
+        # A different session's end (e.g. a nested subagent's own
+        # SessionEnd, which carries ITS id) must not reap the live
+        # owner's run.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(
+                    run,
+                    session_id="aaaaaaaa-1111-2222-3333-444444444444",
+                    **stamp)
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({
+                        "session_id":
+                            "bbbbbbbb-5555-6666-7777-888888888888",
+                        "hook_event_name": "SessionEnd"}))
+                self.assertEqual(_status(run), STATUS_RUNNING)
+            finally:
+                self._reap_stub(stub)
+
+    def test_absent_payload_session_id_keeps_liveness_skip(self):
+        # No payload id (or unreadable stdin) proves nothing — the
+        # liveness-gated behaviour applies unchanged.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(
+                    run,
+                    session_id="aaaaaaaa-1111-2222-3333-444444444444",
+                    **stamp)
+                self._run_session_end(tmp, stub.pid, payload="")
+                self.assertEqual(_status(run), STATUS_RUNNING)
+            finally:
+                self._reap_stub(stub)
+
+    def test_meta_without_recorded_id_keeps_liveness_skip(self):
+        # A stamped meta that predates session_id recording offers no
+        # owner-end proof: a payload id matches nothing, the live
+        # owner keeps its run.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(run, **stamp)
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({
+                        "session_id":
+                            "aaaaaaaa-1111-2222-3333-444444444444",
+                        "hook_event_name": "SessionEnd"}))
+                self.assertEqual(_status(run), STATUS_RUNNING)
+            finally:
+                self._reap_stub(stub)
+
+    def test_reaped_run_recovers_through_real_finaliser(self):
+        # End-to-end self-heal: a hook-reaped run's real finaliser
+        # overrides the heuristic verdict via the metadata recovery
+        # clause, clearing the marker and the sweep's error.
+        from core.run.metadata import complete_run
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = _make_running_run(tmp / "out", "validate-001",
+                                    "validate")
+            self._run_session_end(tmp, SESSION_PID)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            complete_run(run)
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            meta = load_json(run / RUN_METADATA_FILE)
+            extra = meta.get("extra") or {}
+            self.assertNotIn("abandon_sweep", extra)
+            self.assertNotIn("error", extra)
 
 
 if __name__ == "__main__":

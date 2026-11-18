@@ -17,6 +17,7 @@ Returns:
 import os
 import sys
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -25,7 +26,7 @@ script_dir = Path(__file__).parent
 skill_dir = script_dir.parent
 sys.path.insert(0, str(skill_dir))
 
-from src.store import EvidenceStore
+from src.store import EvidenceStore  # noqa: E402
 
 
 def check_prerequisites():
@@ -54,6 +55,12 @@ def create_working_directory(timestamp=None):
     """
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    elif not re.fullmatch(r"[0-9]{8}_[0-9]{6}", timestamp):
+        # The value is spliced into the workdir path — a path-shaped
+        # timestamp ("../..") would escape .out/. Orchestrator-supplied
+        # in practice; validate the documented shape anyway.
+        msg = f"--timestamp must be YYYYMMDD_HHMMSS, got {timestamp!r}"
+        raise ValueError(msg)
 
     workdir = Path(f".out/oss-forensics-{timestamp}")
     workdir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +85,7 @@ def initialize_evidence_store(workdir):
     return evidence_path
 
 
-def main():
+def main() -> None:
     """Main entry point."""
     import argparse
 

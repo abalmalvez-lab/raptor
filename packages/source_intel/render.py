@@ -1,0 +1,1497 @@
+"""Render :class:`SourceIntelResult` evidence into prompt-friendly
+strings for Stage D / `/exploit` / `/agentic` consumers.
+
+The output is a list of human-readable lines; ordering puts the
+strongest signal first (literal observations before alias-only).
+Consumers concatenate the lines into a structured block under
+TaintedString / UntrustedBlock envelopes per the project's prompt-
+envelope discipline.
+
+Three styles surfaced in Phase 2:
+  * ``stage_d`` — evidence supporting/against a Stage D ruling
+  * ``exploit_plan`` — constraints to plan around for /exploit
+  * ``agentic_variant`` — seed candidates for variant hunting
+
+For substrate, all three render the same content with style-specific
+phrasing. Axes 2-7 may diverge per style when their evidence
+classes have distinct interpretations per consumer.
+
+Also provides ``derive_mitigations_found()`` — structured list of
+``Mitigation`` records per design strict invariant ("mitigations_found:
+[...] shape; no boolean hardened. Absence ≠ unhardened.").
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from packages.source_intel.analyze import (
+    GRADE_DOMINATES,
+    GRADE_SAME_FUNCTION,
+    GRADE_SAME_PATH,
+    KIND_ACCESS,
+    KIND_ALLOC_SIZE,
+    KIND_MALLOC,
+    KIND_NO_STACK_PROTECTOR,
+    KIND_NONNULL,
+    KIND_NORETURN,
+    KIND_RETURNS_NONNULL,
+    KIND_WUR,
+    AbortEvidence,
+    BoundaryEvidence,
+    AllocationEvidence,
+    AttributeEvidence,
+    CapabilityEvidence,
+    CLevelSourceEvidence,
+    DoubleFreeEvidence,
+    HazardEvidence,
+    LsmEvidence,
+    NullGuardEvidence,
+    PairedFreeEvidence,
+    PrivilegeBackWalkEvidence,
+    SourceIntelResult,
+    WarnEvidence,
+)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.build.build_flags import BuildFlagsContext
+
+
+@dataclass(frozen=True)
+class Mitigation:
+    """Structured mitigation entry per design strict invariant.
+
+    ``name`` is the canonical mitigation kind (abort_dominates,
+    fortify_blocks, etc.). ``axis`` is the source_intel axis id
+    that detected it. ``confidence`` is one of:
+        * ``"high"`` — strong evidence (DOMINATES grade, exact
+          line match, FORTIFY blocks intercepted call site)
+        * ``"medium"`` — moderate (same_path grade, near-line)
+        * ``"low"`` — same_function grade with proximity,
+          informational signals
+
+    Absence of a mitigation in the list does NOT imply unhardened —
+    it means source_intel didn't detect that mitigation (which may
+    be a coverage gap, not real absence). Per the design strict
+    invariant: never emit ``hardened: True/False``; only the
+    structured-list shape.
+    """
+
+    name: str
+    axis: str  # "axis_1" through "axis_8"
+    confidence: str  # "low" | "medium" | "high"
+    detail: str
+    location: tuple | None = None  # (file, line) or None
+
+
+_STYLES = ("stage_d", "exploit_plan", "agentic_variant")
+
+
+# Stage E binary-verdict values that supersede source_intel's
+# EXPLOITABLE-leaning signal. Per design: "Binary observation
+# supersedes source intent when both available (Stage E binary wins)."
+# When the binary side says the bug can't reach exploitable runtime
+# (RELRO blocks GOT overwrite, no usable ROP, sanitizer in production
+# build, etc.), source_intel's structural evidence is reframed as
+# informational rather than verdict-bearing.
+#
+# Verdicts from ``packages.exploit_feasibility.api:analyze_binary``:
+#   "exploitable" | "likely_exploitable"  — binary agrees with EXPLOITABLE
+#   "blocked"                              — binary says NO
+#   "requires_environment"                 — binary says probably-NO
+_BINARY_SUPERSEDING_VERDICTS = frozenset({
+    "blocked",
+    "requires_environment",
+})
+
+
+def _supersession_prefix(binary_verdict: str | None) -> str | None:
+    """Return a one-line SUPERSEDED marker when the binary verdict
+    overrides source_intel; ``None`` otherwise.
+
+    Stage E semantics: binary observation always wins over source
+    intent when both are available. This prefix tells the consumer
+    LLM: "the following source_intel observations are factually
+    correct, but the binary side already proved the path isn't
+    exploitable — weigh them as context, not as exploitability
+    evidence."
+    """
+    if binary_verdict is None:
+        return None
+    if binary_verdict not in _BINARY_SUPERSEDING_VERDICTS:
+        return None
+    return (
+        f"SUPERSEDED: binary verdict `{binary_verdict}` from "
+        f"packages.exploit_feasibility — the following source_intel "
+        f"observations are STRUCTURALLY CORRECT but DO NOT change "
+        f"exploitability. Binary side already proved the primitive "
+        f"can't reach exploitable runtime. Treat the lines below as "
+        f"context for the verdict explanation, not as evidence "
+        f"for/against EXPLOITABLE."
+    )
+
+
+# Fixed rule-stem mapping: these report families currently have no retained
+# representation. Rule attempts identify applicable coverage limits, not
+# emitted matches or findings. Keep this notice in the existing text channel.
+_UNCONSUMED_REPORT_FAMILIES = (
+    ("refcount_pairs", "refcount_get, refcount_put"),
+    ("lock_pairs", "lock_take, lock_release, lock_leak"),
+    ("cred_manipulation", "cred"),
+    ("setuid_setgid", "setid"),
+)
+
+
+def derive_evidence_strings(
+    result: SourceIntelResult,
+    finding_function: str | None = None,
+    build_flags: BuildFlagsContext | None = None,
+    style: str = "stage_d",
+    max_lines: int | None = None,
+    binary_verdict: str | None = None,
+    privilege_back_walk: PrivilegeBackWalkEvidence | None = None,
+) -> list[str]:
+    """Render source_intel evidence for a finding into prompt lines.
+
+    Args:
+      result: the per-target SourceIntelResult
+      finding_function: the function the finding cites (used to filter
+        WUR evidence to relevant functions; when None, all observations
+        surface)
+      build_flags: per-target build-flag context (for compile-enforcement
+        interpretation of WUR — `__must_check` is binding only if
+        `-Werror=unused-result` was on)
+      style: "stage_d" | "exploit_plan" | "agentic_variant" — chooses
+        framing. Substrate ships identical content per style; axis-N
+        PRs can diverge.
+      max_lines: cap the number of returned lines (for context-tight
+        prompt budgets); None = no cap.
+      binary_verdict: optional Stage E binary-side verdict from
+        :mod:`packages.exploit_feasibility`. Per design Stage E,
+        the binary observation supersedes source intent when both
+        are available. When this verdict is ``"blocked"`` or
+        ``"requires_environment"`` (binary says NOT exploitable),
+        the rendered output is prefixed with a SUPERSEDED marker
+        and reframed as informational-only: the LLM should weigh
+        the binary verdict over any source_intel EXPLOITABLE signal.
+        ``None`` (default): no binary side; emit unchanged.
+      privilege_back_walk: optional legacy caller observations rendered
+        as informational context after the C-level source lines. Recorded
+        flags establish neither enforced gating nor an ungated caller;
+        ``no_callers`` results render nothing. ``None`` omits the line.
+
+    Skipped results emit a skip notice; results with no relevant
+    observations emit an absence acknowledgement. The output may also
+    disclose incomplete rule execution, unretained report families or
+    binary supersession. A zero
+    line budget returns an empty list.
+    """
+    if style not in _STYLES:
+        msg = f"unknown style: {style!r} (expected one of {_STYLES})"
+        raise ValueError(msg)
+    if max_lines == 0:
+        return []
+
+    lines: list[str] = []
+
+    if result.is_skipped:
+        # Surface the skip reason so consumers know there was no
+        # evidence at all — distinct from "evidence ran and found
+        # nothing." This is critical: consumers MUST NOT interpret
+        # an empty block as "unhardened".
+        lines.append(
+            f"Source_intel skipped: {result.skipped_reason}. "
+            f"No evidence either way."
+        )
+        # Stage E supersession still applies even when source_intel
+        # was skipped — the consumer needs to see the binary verdict
+        # disposition regardless.
+        prefix = _supersession_prefix(binary_verdict)
+        if prefix is not None:
+            lines = [prefix] + lines
+        return _truncate(lines, max_lines)
+
+    if result.rules_failed:
+        lines.append(
+            f"Source_intel incomplete: {len(result.rules_failed)} rule failure(s). "
+            f"Missing observations do not establish clean coverage."
+        )
+
+    unconsumed_families = [
+        families for rule, families in _UNCONSUMED_REPORT_FAMILIES
+        if rule in result.rules_executed
+    ]
+    if unconsumed_families:
+        lines.append(
+            "Source_intel coverage limitation: reports in these families are "
+            "not retained in this result when emitted: "
+            + "; ".join(unconsumed_families)
+            + ". This notice is not a finding and does not establish whether "
+            "these reports were emitted. Their absence here does not establish "
+            "absence of those operations or findings."
+        )
+
+    # Filter attributes to the finding's function when supplied.
+    # Unknown-attribution observations (function_name stays "" for
+    # non-adjacent alias matches) are RETAINED, matching every other
+    # axis's unknown-function handling below — absence of attribution
+    # must not silently mean absence of evidence for one axis only.
+    observations = list(result.attributes)
+    if finding_function:
+        observations = [
+            ev for ev in observations
+            if ev.function_name == finding_function
+            or not ev.function_name
+        ]
+    # Literal observations first, then known-alias.
+    observations.sort(key=lambda ev: 0 if ev.match_source == "literal" else 1)
+
+    for ev in observations:
+        line = _render_attribute_line(ev, build_flags, style)
+        if line is not None:
+            lines.append(line)
+
+    # Abort evidence (axis 2). Filter to the finding's function when
+    # supplied (same composition as attributes). Strongest grade
+    # first so dominate-grade signal appears at the top.
+    aborts = list(result.aborts)
+    if finding_function:
+        aborts = [
+            ab for ab in aborts
+            if ab.enclosing_function == finding_function
+            or ab.enclosing_function is None
+        ]
+    _GRADE_ORDER = {
+        GRADE_DOMINATES: 0,
+        GRADE_SAME_PATH: 1,
+        GRADE_SAME_FUNCTION: 2,
+    }
+    aborts.sort(key=lambda ab: _GRADE_ORDER.get(ab.grade, 99))
+    for ab in aborts:
+        lines.append(_render_abort_line(ab, style))
+
+    # Allocation evidence (axis 3). Filter to the finding's function
+    # when supplied. Phase 6a: only the field-assignment shape lands;
+    # later shapes are added as axis-3-expansion ships.
+    allocations = list(result.allocations)
+    if finding_function:
+        allocations = [
+            ae for ae in allocations
+            if ae.enclosing_function == finding_function
+            or ae.enclosing_function is None
+        ]
+    for ae in allocations:
+        lines.append(_render_allocation_line(ae, style))
+
+    # Axis-7 hazard evidence (deprecated_func / signed_alloc / type
+    # confusion / unsafe temp). Filter to finding's function when
+    # supplied. Critical for memory-corruption CWEs — strcpy at a
+    # CWE-120 sink line IS direct supporting evidence.
+    hazards = list(result.hazards)
+    if finding_function:
+        hazards = [
+            h for h in hazards
+            if h.enclosing_function in (finding_function, None)
+        ]
+    for h in hazards:
+        lines.append(_render_hazard_line(h, style))
+
+    # Axis-3 paired-free evidence — INFORMATIONAL for memory-leak
+    # findings. When an alloc IS paired with a free in-function the
+    # leak claim is suspect (cocci can't prove all-paths-free, only
+    # "some-path-free"). Filter to finding's function.
+    paired_frees = list(result.paired_frees)
+    if finding_function:
+        paired_frees = [
+            p for p in paired_frees
+            if p.enclosing_function in (finding_function, None)
+        ]
+    for p in paired_frees:
+        lines.append(_render_paired_free_line(p, style))
+
+    # Axis-3 double-free evidence. Direct EXPLOITABLE-supporting
+    # evidence for cpp/double-free findings. Filter to finding's
+    # function.
+    double_frees = list(result.double_frees)
+    if finding_function:
+        double_frees = [
+            d for d in double_frees
+            if d.enclosing_function in (finding_function, None)
+        ]
+    for d in double_frees:
+        lines.append(_render_double_free_line(d, style))
+
+    # Capability call observations retain source context. Existing grades
+    # do not establish result consumption, denial polarity or sink gating.
+    capabilities = list(result.capabilities)
+    if finding_function:
+        capabilities = [
+            c for c in capabilities
+            if c.enclosing_function in (finding_function, None)
+        ]
+    for c in capabilities:
+        lines.append(_render_capability_line(c, style))
+
+    # LSM hook observations retain their existing independent rendering.
+    lsm_hooks = list(result.lsm_hooks)
+    if finding_function:
+        lsm_hooks = [
+            hook for hook in lsm_hooks
+            if hook.enclosing_function in (finding_function, None)
+        ]
+    for hook in lsm_hooks:
+        lines.append(_render_lsm_line(hook, style))
+
+    # L1 source table evidence — C/C++ process, stream, fd, and socket
+    # input origins. Filter to the finding function when supplied.
+    c_sources = list(result.c_level_sources)
+    if finding_function:
+        c_sources = [
+            src for src in c_sources
+            if src.enclosing_function in (finding_function, None)
+        ]
+    for src in c_sources:
+        lines.append(_render_c_level_source_line(src, style))
+
+    # Retain legacy back-walk observations as informational context.
+    # Neither its flags nor call examples prove gating or an ungated path.
+    if privilege_back_walk is not None:
+        line = _render_privilege_back_walk_line(
+            privilege_back_walk, style,
+        )
+        if line is not None:
+            lines.append(line)
+
+    # Axis-2 observations carry a check shape and location, without
+    # establishing expression identity, sink order or dominance.
+    null_guards = list(result.null_guards)
+    if finding_function:
+        null_guards = [
+            ng for ng in null_guards
+            if ng.enclosing_function in (finding_function, None)
+        ]
+    for ng in null_guards:
+        lines.append(_render_null_guard_line(ng, style))
+
+    # Axis-6 sanitizer context. Surfaced once per finding (target-wide,
+    # not per-call-site) when build_flags carries observed sanitizers.
+    # The LLM weighs this in two opposing directions per consumer:
+    #   * Production-equivalent builds: a memory bug in code compiled
+    #     with -fsanitize=address / KASAN is caught at the cost of a
+    #     panic — bug becomes DoS, not RCE.
+    #   * Test / CI builds with sanitizers: bug surface is wider than
+    #     production, but the finding may be a sanitizer-only artefact.
+    sanitizer_line = _render_sanitizers_line(build_flags, style)
+    if sanitizer_line is not None:
+        lines.append(sanitizer_line)
+
+    # Retain existing boundary-call records as informational sites. Keep
+    # earlier evidence priority and the shared unknown-function policy.
+    boundaries = result.boundary_crossings
+    if finding_function:
+        boundaries = tuple(
+            ev for ev in boundaries
+            if ev.enclosing_function in (finding_function, None)
+        )
+    for boundary in boundaries:
+        lines.append(_render_boundary_line(boundary, style))
+
+    # Warning calls are context only, after existing evidence. Avoid
+    # formatting entries that the final positive line budget would discard.
+    for warning in result.warns:
+        if max_lines is not None and 0 <= max_lines <= len(lines):
+            break
+        if finding_function and warning.enclosing_function not in (finding_function, None):
+            continue
+        lines.append(_render_warning_line(warning, style))
+
+    # When source_intel ran but found nothing relevant — emit an
+    # explicit "no signal" line so the consumer prompt template
+    # carries the absence acknowledgement.
+    if not lines:
+        lines.append(
+            "Source_intel ran; no attribute or proximity evidence for "
+            f"{finding_function or '<finding function>'}. "
+            f"Absence of evidence is NOT evidence of unhardened code."
+        )
+
+    # Stage E binary-supersedes (Phase C PR2). When the binary side
+    # says NOT exploitable, prepend a SUPERSEDED marker reframing
+    # everything below as informational. Always applies — even when
+    # only the "no signal" line was emitted — so the consumer sees
+    # the consistent "binary wins" disposition.
+    prefix = _supersession_prefix(binary_verdict)
+    if prefix is not None:
+        lines = [prefix] + lines
+
+    return _truncate(lines, max_lines)
+
+
+def _render_allocation_line(ae: AllocationEvidence, style: str) -> str:
+    """Render one unchecked-allocation observation."""
+    fn_text = (
+        f"function `{ae.enclosing_function}`"
+        if ae.enclosing_function
+        else f"in {ae.location[0]} near line {ae.location[1]}"
+    )
+    field_text = (
+        f"field `->{ae.target_field}`"
+        if ae.target_field
+        else "the assigned location"
+    )
+
+    if style == "stage_d":
+        prefix = "Unchecked allocation shape"
+    elif style == "exploit_plan":
+        prefix = "Primitive candidate — unchecked allocation shape"
+    else:
+        prefix = "Variant hint — unchecked alloc shape"
+
+    caveat = ""
+    if ae.conditional_on:
+        caveat = (
+            f" (CONDITIONAL: gated by `#if* {ae.conditional_on}` — "
+            f"downweight unless the actual build enables this.)"
+        )
+
+    return (
+        f"{prefix}: `{ae.allocator}` at {ae.location[0]}:{ae.location[1]} "
+        f"{fn_text} stores into {field_text}, reported without a matched "
+        f"NULL-check pattern. This observation does not establish allocator "
+        f"failure behaviour, downstream dereference, or a crashing path "
+        f"(CWE-476).{caveat}"
+    )
+
+
+def _render_hazard_line(h: HazardEvidence, style: str) -> str:
+    """Render one axis-7 hazard observation."""
+    fn_text = (
+        f"function `{h.enclosing_function}`"
+        if h.enclosing_function
+        else f"in {h.location[0]} near line {h.location[1]}"
+    )
+    if style == "stage_d":
+        prefix = "Hazardous call site — unsafe-by-design API"
+    elif style == "exploit_plan":
+        prefix = "Primitive — unsafe API at sink"
+    else:
+        prefix = "Variant hint — hazardous API"
+    explainer = {
+        "deprecated_func": (
+            "doesn't carry its own bounds; caller must have "
+            "established length safety. Direct supporting evidence "
+            "for cpp/unbounded-write."
+        ),
+        "signed_alloc": (
+            "signed multiplication into alloc size — classic "
+            "CWE-190 → CWE-122 source. Supports an uncontrolled-"
+            "allocation-size finding."
+        ),
+        "type_confusion_cast": (
+            "casts between incompatible pointer types without "
+            "validation — supports type-confusion variants of "
+            "CWE-704."
+        ),
+        "unsafe_temp": (
+            "predictable filename + race window between name and "
+            "open — supports CWE-377 / CWE-379."
+        ),
+    }.get(h.kind, "")
+    return (
+        f"{prefix}: `{h.detail}` ({h.kind}) at "
+        f"{h.location[0]}:{h.location[1]} {fn_text}. {explainer}"
+    )
+
+
+def _render_paired_free_line(p: PairedFreeEvidence, style: str) -> str:
+    """Render one axis-3 paired-alloc/free observation."""
+    fn_text = (
+        f"function `{p.enclosing_function}`"
+        if p.enclosing_function
+        else f"in {p.location[0]} near line {p.location[1]}"
+    )
+    if style == "stage_d":
+        prefix = "Memory-leak suspect signal — alloc paired with free"
+    elif style == "exploit_plan":
+        prefix = "Constraint — free pairing observed"
+    else:
+        prefix = "Variant hint — paired alloc/free"
+    return (
+        f"{prefix}: `{p.allocator}` at "
+        f"{p.location[0]}:{p.location[1]} {fn_text} IS paired with a "
+        f"`{p.free_fn}` call in the same function. Cocci can prove "
+        f"\"some-path-free\", not \"all-paths-free\" — error paths "
+        f"may still leak — but a cpp/memory-leak claim on this "
+        f"alloc-site is suspect."
+    )
+
+
+def _render_double_free_line(d: DoubleFreeEvidence, style: str) -> str:
+    """Render one axis-3 double-free observation."""
+    fn_text = (
+        f"function `{d.enclosing_function}`"
+        if d.enclosing_function
+        else f"in {d.location[0]} near line {d.location[1]}"
+    )
+    if style == "stage_d":
+        prefix = "Primitive — double-free observed"
+    elif style == "exploit_plan":
+        prefix = "Primitive — double-free at sink"
+    else:
+        prefix = "Variant hint — double-free shape"
+    site_label = {"first": "First", "second": "Second"}.get(d.role, "Matched")
+    return (
+        f"{prefix}: `{d.free_fn}` called twice on the same expression "
+        f"with no intervening reassignment to NULL or a new "
+        f"allocation. {site_label} free at "
+        f"{d.location[0]}:{d.location[1]} {fn_text}. Direct "
+        f"supporting evidence for cpp/double-free (CWE-415)."
+    )
+
+
+# Constants the in-function capability render treats as "root-
+# equivalent". Mirrors ``adapter.py:_PRIVILEGED_CAP_CONSTANTS`` and
+# ``analyze.py:_PRIVILEGED_CAP_CONSTANTS_FOR_EVIDENCE``. Single
+# source of truth for "which CAP_ kills the bug as a meaningful
+# escalation" lives in adapter.py per Phase B PR3; copy is kept
+# here to avoid an import cycle (render → adapter → render).
+# Lifting to a shared constants module is a follow-up.
+_PRIVILEGED_CAP_CONSTANTS_FOR_RENDER = frozenset({
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_MODULE",
+    "CAP_SYS_RAWIO",
+    "CAP_SYS_BOOT",
+    "CAP_DAC_OVERRIDE",
+    "CAP_DAC_READ_SEARCH",
+})
+
+# Capability-check functions that test the GLOBAL/INIT user
+# namespace's credentials. A True return means the caller holds
+# that capability against the host root user — true privilege
+# escalation if the bug is reachable.
+#
+# Functions NOT in this set are namespace-scoped (or otherwise
+# weaker): `ns_capable(ns, CAP)` returns True for a userns admin
+# holding CAP inside `ns`, even if the userns was created by an
+# otherwise-unprivileged process. `has_capability_noaudit`,
+# `ptracer_capable`, and similar variants gate against task or
+# tracer creds — not always equivalent to global root.
+#
+# These legacy constant/function tables describe credential scope only.
+# The renderer treats calls as observations and does not infer enforced
+# denial, exploitability, or an attacker-held credential from these sets.
+_GLOBAL_CRED_CAP_FUNCTIONS = frozenset({
+    "capable",
+})
+
+# Capability-check functions that gate against namespace-scoped
+# credentials. Surfacing as a SEPARATE set (rather than
+# "everything not in global") so future additions (perfmon_capable,
+# bpf_capable) are explicit choices, not silent inclusions.
+_NS_SCOPED_CAP_FUNCTIONS = frozenset({
+    "ns_capable",
+    "ns_capable_noaudit",
+    "has_capability",
+    "has_capability_noaudit",
+    "capable_wrt_inode_uidgid",
+    "file_ns_capable",
+    "ptracer_capable",
+    "checkpoint_restore_ns_capable",
+})
+
+_CAP_CONST_RE = re.compile(r"\bCAP_[A-Z_]+\b")
+
+
+def _privileged_cap_constant_on_line(
+    file_path: str, line_no: int,
+) -> str | None:
+    """Return a privileged constant token from an admitted source line.
+
+    This informational lookup does not establish capability enforcement or
+    justify a privilege-gate mitigation from a call-site observation.
+    """
+    from packages.source_intel._source_view import sanitized_lines
+    lines = sanitized_lines(file_path)
+    if lines is None:
+        return None
+    if line_no < 1 or line_no > len(lines):
+        return None
+    for m in _CAP_CONST_RE.finditer(lines[line_no - 1]):
+        if m.group(0) in _PRIVILEGED_CAP_CONSTANTS_FOR_RENDER:
+            return m.group(0)
+    return None
+
+
+def _render_capability_line(c: CapabilityEvidence, style: str) -> str:
+    """Render call-site information without inferring privilege enforcement."""
+    fn_text = (
+        f"function `{c.enclosing_function}`"
+        if c.enclosing_function
+        else f"in {c.location[0]} near line {c.location[1]}"
+    )
+    if style == "stage_d":
+        prefix = "Capability observation — call near sink"
+    elif style == "exploit_plan":
+        prefix = "Constraint to verify — capability-call relationship"
+    else:
+        prefix = "Variant hint — capability-call observation"
+    return (
+        f"{prefix}: `{c.cap_function}(...)` at "
+        f"{c.location[0]}:{c.location[1]} {fn_text} — "
+        f"recorded heuristic grade `{c.grade}`. This observation does not "
+        f"establish privilege gating or sink reachability. Result consumption, "
+        f"denial polarity, a terminating denial branch and ordering before "
+        f"the relevant sink or call edge require reviewed evidence."
+    )
+
+
+def _render_privilege_back_walk_line(
+    bw: PrivilegeBackWalkEvidence, style: str,
+) -> str | None:
+    """Keep retained caller-walk records informational when relation is absent."""
+    if bw.no_callers:
+        return None
+    return (
+        f"Capability back-walk observation: function `{bw.finding_function}` "
+        f"has a recorded summary within depth {bw.depth_used}. Current records "
+        f"do not establish reviewed denial-exit enforcement before each "
+        f"relevant call edge. Neither all-path privilege gating nor an "
+        f"ungated path is established by this summary."
+    )
+
+
+def _render_warning_line(warning: WarnEvidence, style: str) -> str:
+    """Render a warning-call observation without inferring runtime effects."""
+    if style == "stage_d":
+        prefix = "Warning call observed"
+    elif style == "exploit_plan":
+        prefix = "Review site — warning call"
+    else:
+        prefix = "Variant hint — warning call"
+    return (
+        f"{prefix}: `{warning.warn_fn}` at "
+        f"{warning.location[0]}:{warning.location[1]}. This call-site "
+        f"observation does not establish runtime emission, termination "
+        f"behaviour or mitigation of this finding."
+    )
+
+
+def _render_boundary_line(boundary: BoundaryEvidence, style: str) -> str:
+    """Render a boundary-call site without inferring data-flow or success."""
+    if style == "stage_d":
+        prefix = "User-boundary call observed"
+    elif style == "exploit_plan":
+        prefix = "Review site — user-boundary call"
+    else:
+        prefix = "Variant hint — user-boundary call"
+    return (
+        f"{prefix}: `{boundary.boundary_fn}` at "
+        f"{boundary.location[0]}:{boundary.location[1]}. This name-based "
+        f"observation does not establish argument identity, transfer success "
+        f"or relation to this finding's sink."
+    )
+
+
+def _render_lsm_line(hook: LsmEvidence, style: str) -> str:
+    """Render one axis-4 LSM hook observation."""
+    fn_text = (
+        f"function `{hook.enclosing_function}`"
+        if hook.enclosing_function
+        else f"in {hook.location[0]} near line {hook.location[1]}"
+    )
+    if style == "stage_d":
+        prefix = "LSM-name call observed"
+    elif style == "exploit_plan":
+        prefix = "Review site — possible LSM hook"
+    else:
+        prefix = "Variant hint — possible LSM hook"
+    return (
+        f"{prefix}: `{hook.hook_name}` at "
+        f"{hook.location[0]}:{hook.location[1]} {fn_text}. A name-prefix "
+        f"match does not establish hook identity, return-value handling, "
+        f"reachability of this finding's sink or active policy. Verify "
+        f"those before treating this site as a privilege constraint."
+    )
+
+
+def _render_null_guard_line(ng: NullGuardEvidence, style: str) -> str:
+    """Render one axis-2 null-guard observation."""
+    fn_text = (
+        f"function `{ng.enclosing_function}`"
+        if ng.enclosing_function
+        else f"in {ng.location[0]} near line {ng.location[1]}"
+    )
+    if style == "stage_d":
+        prefix = "Check observation — null-guard shape"
+    elif style == "exploit_plan":
+        prefix = "Review site — null-guard shape"
+    else:
+        prefix = "Variant hint — null guard"
+    kind_phrase = {
+        "bang": "`if (!e)`",
+        "eq_null": "`if (e == NULL)`",
+        "is_err": "`IS_ERR(e)` / `IS_ERR_OR_NULL(e)`",
+    }.get(ng.kind, ng.kind)
+    return (
+        f"{prefix}: {kind_phrase}-shape null check at "
+        f"{ng.location[0]}:{ng.location[1]} {fn_text}. This observation "
+        f"does not establish that the checked expression matches this "
+        f"finding, that the check precedes its sink, or that all null "
+        f"paths are guarded."
+    )
+
+
+def _render_abort_line(ab: AbortEvidence, style: str) -> str:
+    """Render one abort-evidence observation."""
+    fn_text = (
+        f"function `{ab.enclosing_function}`"
+        if ab.enclosing_function
+        else f"in {ab.location[0]} near line {ab.location[1]}"
+    )
+    grade_phrase = {
+        GRADE_DOMINATES: "DOMINATES the function body (depth-1, no early exit precedes)",
+        GRADE_SAME_PATH: "appears on a nested control-flow path (depth>1, inside if/loop/switch)",
+        GRADE_SAME_FUNCTION: "shares the function with the sink",
+    }.get(ab.grade, ab.grade)
+
+    if style == "stage_d":
+        prefix = "Control-flow signal — abort-class call near sink"
+    elif style == "exploit_plan":
+        prefix = "DoS-only constraint — abort proximate to sink"
+    else:
+        prefix = "Variant hint — abort proximity"
+
+    caveat = ""
+    if ab.conditional_on:
+        caveat = (
+            f" (CONDITIONAL: gated by `#if* {ab.conditional_on}` — "
+            f"downweight unless the actual build enables this.)"
+        )
+    if ab.grade == GRADE_SAME_PATH:
+        # Phase C PR1: explicit weaker-than-dominates caveat.
+        # `same_path` means the abort sits inside a nested branch
+        # (depth>1) — execution that enters that branch DOES hit the
+        # abort, but other branches in the function bypass it. This
+        # is mid-strength evidence, NOT a guarantee like `dominates`.
+        caveat += (
+            " Grade `same_path` is mid-strength: the abort sits on "
+            "SOME control-flow path through the function but other "
+            "branches (else / loop fall-through / different switch "
+            "arms) bypass it. The bug primitive may reach runtime via "
+            "an unguarded branch. Stronger grade `dominates` (depth-1, "
+            "no early exit) would be needed to prove DoS-only outcome."
+        )
+    if ab.grade == GRADE_SAME_FUNCTION:
+        caveat += (
+            " Grade `same_function` is weak: the abort may be on an "
+            "unrelated path within the function. Stronger grades "
+            "(`same_path`, `dominates`) require axis-2-expansion."
+        )
+    return (
+        f"{prefix}: `{ab.macro}` call at {ab.location[0]}:{ab.location[1]} "
+        f"{fn_text} — {grade_phrase}. If this abort is reached before "
+        f"the bug primitive, the program halts and the bug becomes "
+        f"DoS-only.{caveat}"
+    )
+
+
+def _render_attribute_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str | None:
+    """Dispatch to the per-kind renderer. Unknown kinds return None
+    (silently dropped — render is best-effort).
+
+    When ``conditional_on`` is set, the rendered line is suffixed with
+    a caveat: matches under unknown ``#ifdef`` blocks may not apply
+    to the binary that was actually built.
+    """
+    if ev.kind == KIND_WUR:
+        line = _render_wur_line(ev, build_flags, style)
+    elif ev.kind == KIND_NONNULL:
+        line = _render_nonnull_line(ev, build_flags, style)
+    elif ev.kind == KIND_ALLOC_SIZE:
+        line = _render_alloc_size_line(ev, build_flags, style)
+    elif ev.kind == KIND_RETURNS_NONNULL:
+        line = _render_returns_nonnull_line(ev, build_flags, style)
+    elif ev.kind == KIND_NORETURN:
+        line = _render_noreturn_line(ev, build_flags, style)
+    elif ev.kind == KIND_MALLOC:
+        line = _render_malloc_line(ev, build_flags, style)
+    elif ev.kind == KIND_NO_STACK_PROTECTOR:
+        line = _render_no_stack_protector_line(ev, build_flags, style)
+    elif ev.kind == KIND_ACCESS:
+        line = _render_access_line(ev, build_flags, style)
+    else:
+        return None
+    return _append_conditional_caveat(line, ev)
+
+
+def _append_conditional_caveat(
+    line: str,
+    ev: AttributeEvidence,
+) -> str:
+    """Append the ``conditional_on`` caveat when the match is under
+    an ``#if*`` block. Caller-side ``derive_evidence_strings`` consumes
+    the suffix as part of the single evidence string."""
+    if not ev.conditional_on:
+        return line
+    return (
+        f"{line} (CONDITIONAL: this annotation is gated by "
+        f"`#if* {ev.conditional_on}` — downweight unless the actual "
+        f"build is known to enable this config.)"
+    )
+
+
+# =====================================================================
+# Per-evidence-kind line builders
+# =====================================================================
+
+
+def _render_wur_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render author intent with observed warning-as-error settings.
+
+    Per-target flags can aggregate different translation units. They
+    do not establish a particular caller's flags or compile outcome.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+    src_text = (
+        "literal __attribute__((warn_unused_result))"
+        if ev.match_source == "literal"
+        else f"known alias `{ev.raw_match}`"
+    )
+
+    enforcement = _enforcement_phrase(build_flags)
+
+    if style == "stage_d":
+        prefix = "Author intent — must-check contract"
+    elif style == "exploit_plan":
+        prefix = "Constraint — caller-must-check contract"
+    else:  # agentic_variant
+        prefix = "Variant hint — must-check signal"
+
+    return (
+        f"{prefix}: {fn_text} annotated as warn_unused_result via "
+        f"{src_text}. {enforcement}"
+    )
+
+
+def _render_nonnull_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render the caller contract and observed build-setting context.
+
+    Annotation and flag observations do not establish compiled checks,
+    a runtime NULL, or its relationship to a dereference.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    null_check_phrase = _nonnull_null_check_phrase(build_flags)
+
+    if style == "stage_d":
+        prefix = "Author intent + compiler signal — nonnull"
+    elif style == "exploit_plan":
+        prefix = "Constraint — caller-must-be-non-null contract"
+    else:
+        prefix = "Variant hint — nonnull annotation"
+
+    return (
+        f"{prefix}: {fn_text} annotated nonnull (caller must pass "
+        f"non-null). {null_check_phrase}"
+    )
+
+
+def _nonnull_null_check_phrase(build_flags: BuildFlagsContext | None) -> str:
+    """Compose the dead-code-elimination caveat for nonnull."""
+    if build_flags is None or build_flags.extraction_confidence == "absent":
+        return (
+            "Compiler-elimination status unknown (build flags not in "
+            "evidence); a NULL reaching this function may be more or "
+            "less exploitable depending on -fdelete-null-pointer-checks."
+        )
+    if build_flags.delete_null_pointer_checks is False:
+        return (
+            "Build flags observed include -fno-delete-null-pointer-checks. "
+            "This observation does not establish preserved defensive null "
+            "checks or the behaviour of a NULL in the compiled function."
+        )
+    if build_flags.delete_null_pointer_checks is True:
+        return (
+            "Build flags observed include -fdelete-null-pointer-checks; "
+            "the compiler may eliminate null checks. This observation "
+            "does not establish which checks were removed or whether "
+            "a NULL reaches a dereference."
+        )
+    return (
+        "Compiler-elimination status not pinned by observed flags — "
+        "default depends on -O level and compiler version."
+    )
+
+
+def _render_alloc_size_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render the declared allocation-size contract and observed settings.
+
+    The annotation does not establish the actual returned allocation size
+    or runtime interception of operations involving that buffer.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    fortify_phrase = _alloc_size_fortify_phrase(build_flags)
+
+    if style == "stage_d":
+        prefix = "Author intent + compiler signal — alloc_size"
+    elif style == "exploit_plan":
+        prefix = "Constraint — alloc_size advertises returned buffer size"
+    else:
+        prefix = "Variant hint — alloc_size annotation"
+
+    return (
+        f"{prefix}: {fn_text} declares a returned buffer byte size based on "
+        f"the annotated parameter(s). {fortify_phrase}"
+    )
+
+
+def _alloc_size_fortify_phrase(build_flags: BuildFlagsContext | None) -> str:
+    """Describe observed FORTIFY settings without asserting runtime checks."""
+    if build_flags is None or build_flags.extraction_confidence == "absent":
+        return (
+            "FORTIFY_SOURCE status unknown (build flags not in evidence); "
+            "runtime bounds-checking on the returned buffer is not established."
+        )
+    level = build_flags.fortify_source_level
+    if level is None:
+        setting = "No _FORTIFY_SOURCE setting captured in observed flags."
+    elif level == 1 and build_flags.source == "kconfig":
+        setting = "CONFIG_FORTIFY_SOURCE enabled observed (represented as level 1)."
+    elif level == 1:
+        setting = "_FORTIFY_SOURCE=1 observed (limited fortification setting)."
+    elif level == 0:
+        setting = "_FORTIFY_SOURCE=0 observed (explicitly disabled setting)."
+    else:
+        setting = f"_FORTIFY_SOURCE={level} observed."
+    return (
+        f"{setting} This observation does not establish runtime bounds "
+        f"checks on operations involving the returned buffer or that an "
+        f"overflow is caught; inspect the calls and compiled checks."
+    )
+
+
+def _render_returns_nonnull_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render the return-value promise and observed build settings.
+
+    A wrong annotation warrants caller-path review; the observation
+    does not establish compiled checks or a runtime dereference.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    caveat = _returns_nonnull_caveat_phrase(build_flags)
+
+    if style == "stage_d":
+        prefix = "Author claim — returns_nonnull"
+    elif style == "exploit_plan":
+        prefix = "Constraint — caller may skip null check on return"
+    else:
+        prefix = "Variant hint — returns_nonnull annotation"
+
+    return (
+        f"{prefix}: {fn_text} promises never to return NULL. {caveat}"
+    )
+
+
+def _returns_nonnull_caveat_phrase(
+    build_flags: BuildFlagsContext | None,
+) -> str:
+    if build_flags is None or build_flags.extraction_confidence == "absent":
+        return (
+            "Compiler-elimination status unknown (build flags not in "
+            "evidence); if the annotation is wrong, a returned NULL "
+            "may bypass defensive caller checks depending on "
+            "-fdelete-null-pointer-checks."
+        )
+    if build_flags.delete_null_pointer_checks is False:
+        return (
+            "Build flags observed include -fno-delete-null-pointer-checks. "
+            "This observation does not establish preserved caller checks "
+            "or the compiled behaviour if the annotation is wrong."
+        )
+    if build_flags.delete_null_pointer_checks is True:
+        return (
+            "Build flags observed include -fdelete-null-pointer-checks; "
+            "if the annotation is wrong, the compiler may eliminate "
+            "caller-side null checks. This observation does not establish "
+            "which checks were removed or whether a returned NULL "
+            "reaches a dereference."
+        )
+    return (
+        "Compiler-elimination status not pinned by observed flags — "
+        "default depends on -O level and compiler version."
+    )
+
+
+def _render_noreturn_line(
+    ev: AttributeEvidence,
+    _build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render noreturn evidence.
+
+    Records a promise not to return normally, without proving an
+    abort, source-to-sink control flow or exploitability outcome.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    if style == "stage_d":
+        prefix = "Control-flow signal — noreturn"
+    elif style == "exploit_plan":
+        prefix = "Control-flow constraint to verify — noreturn annotation"
+    else:
+        prefix = "Variant hint — noreturn annotation"
+
+    return (
+        f"{prefix}: {fn_text} is declared noreturn, promising not to return "
+        f"normally. This observation does not establish termination, an "
+        f"abort before the bug primitive, or a DoS-only outcome; inspect "
+        f"the implementation and its relationship to the finding's path."
+    )
+
+
+def _render_malloc_line(
+    ev: AttributeEvidence,
+    _build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render malloc evidence.
+
+    The annotation declares the function as an allocator — returned
+    pointer is fresh and unaliased. The gcc 11+ paramised form
+    `malloc(free_fn[, n])` pairs the allocator with its deallocator.
+    Source_intel records the annotation; combined with alloc_size,
+    the LLM can recognise allocator semantics even when the function
+    name doesn't say "malloc".
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    if style == "stage_d":
+        prefix = "Allocator signal — malloc"
+    elif style == "exploit_plan":
+        prefix = "Constraint — function declared as allocator"
+    else:
+        prefix = "Variant hint — malloc annotation"
+
+    return (
+        f"{prefix}: {fn_text} declared as an allocator — returned "
+        f"pointer is fresh and unaliased per the annotation. May be "
+        f"paired with a deallocator on gcc 11+ (`malloc(free_fn)`)."
+    )
+
+
+def _render_no_stack_protector_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render no_stack_protector evidence.
+
+    The annotation requests omission of stack-protector instrumentation.
+    It does not establish the compiled layout or an overflow path.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    sp_phrase = _stack_protector_phrase(build_flags)
+
+    if style == "stage_d":
+        prefix = "Hardening annotation — no_stack_protector"
+    elif style == "exploit_plan":
+        prefix = "Constraint to verify — no_stack_protector annotation"
+    else:
+        prefix = "Variant hint — no_stack_protector annotation"
+
+    return (
+        f"{prefix}: {fn_text} is annotated to opt out of stack-protector "
+        f"instrumentation. This observation does not establish an overflow, "
+        f"saved-return-address reachability, absence of other defences, "
+        f"or the instrumentation in the compiled binary. {sp_phrase}"
+    )
+
+
+def _stack_protector_phrase(build_flags: BuildFlagsContext | None) -> str:
+    """Phrase describing what the build-wide stack protector level is —
+    the no_stack_protector attribute matters most when the build was
+    otherwise enabling canary insertion."""
+    if build_flags is None or build_flags.extraction_confidence == "absent":
+        return (
+            "Build-wide stack-protector level unknown; the opt-out "
+            "matters most when the rest of the binary was canary-"
+            "protected."
+        )
+    level = build_flags.stack_protector_level
+    if level in ("strong", "all"):
+        return (
+            f"Build flags observed include -fstack-protector-{level}; "
+            f"this does not establish which functions in the compiled "
+            f"binary contain canary instrumentation."
+        )
+    if level == "weak":
+        return (
+            "Build flags include -fstack-protector (weak); the opt-out "
+            "matters for functions that would have qualified for "
+            "canary insertion."
+        )
+    if level == "none":
+        return (
+            "Build flags observed include -fno-stack-protector; this "
+            "does not establish the instrumentation in the compiled binary "
+            "or the flags used for this function."
+        )
+    return (
+        "Build-wide stack-protector status not pinned by observed flags."
+    )
+
+
+def _render_access_line(
+    ev: AttributeEvidence,
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str:
+    """Render access evidence.
+
+    Declares which pointer parameters are read-only / write-only /
+    read-write, and optionally ties access width to another parameter.
+    The annotation and observed FORTIFY settings do not establish
+    runtime bounds-checking on those parameters.
+    """
+    fn_text = (
+        f"function `{ev.function_name}`"
+        if ev.function_name
+        else f"function in {ev.location[0]} at line {ev.location[1]}"
+    )
+
+    fortify_phrase = _access_fortify_phrase(build_flags)
+
+    if style == "stage_d":
+        prefix = "Author intent + compiler signal — access"
+    elif style == "exploit_plan":
+        prefix = "Constraint — declared parameter access pattern"
+    else:
+        prefix = "Variant hint — access annotation"
+
+    return (
+        f"{prefix}: {fn_text} declares parameter access pattern "
+        f"(read_only / write_only / read_write, possibly tied to a size "
+        f"parameter). {fortify_phrase}"
+    )
+
+
+def _access_fortify_phrase(build_flags: BuildFlagsContext | None) -> str:
+    """Describe observed FORTIFY settings for the declared access pattern."""
+    if build_flags is None or build_flags.extraction_confidence == "absent":
+        return (
+            "FORTIFY_SOURCE status unknown; runtime bounds-checking "
+            "on the annotated parameters is not established."
+        )
+    level = build_flags.fortify_source_level
+    if level is None:
+        setting = "No _FORTIFY_SOURCE setting captured in observed flags."
+    elif level == 1 and build_flags.source == "kconfig":
+        setting = "CONFIG_FORTIFY_SOURCE enabled observed (represented as level 1)."
+    elif level == 1:
+        setting = "_FORTIFY_SOURCE=1 observed (limited fortification setting)."
+    elif level == 0:
+        setting = "_FORTIFY_SOURCE=0 observed (explicitly disabled setting)."
+    else:
+        setting = f"_FORTIFY_SOURCE={level} observed."
+    return (
+        f"{setting} This observation does not establish runtime bounds "
+        f"checks on the annotated parameters or that caller overflows "
+        f"are caught; inspect the calls and compiled checks."
+    )
+
+
+def _enforcement_phrase(build_flags: BuildFlagsContext | None) -> str:
+    """Compose the compile-enforcement caveat from build flag context."""
+    if build_flags is None or build_flags.extraction_confidence == "absent":
+        return (
+            "Compile-enforcement status unknown (build flags not in "
+            "evidence); advisory only."
+        )
+    if build_flags.werror_unused_result is True:
+        return (
+            "Build flags observed include -Werror=unused-result. "
+            "This observation does not establish the setting used for "
+            "a particular caller or whether an ignored return "
+            "caused compilation to fail."
+        )
+    if build_flags.werror_unused_result is False:
+        return (
+            "Build flags observed include -Wno-error=unused-result. "
+            "This observation does not establish warning suppression "
+            "or a particular caller's compile outcome; the annotation "
+            "remains advisory context."
+        )
+    return (
+        "Build flags observed but -Werror=unused-result not set; "
+        "advisory unless -Werror is added."
+    )
+
+
+# =====================================================================
+# Axis 6 — sanitizer build context
+# =====================================================================
+
+
+# Sanitizer names worth surfacing in evidence — both userspace
+# (-fsanitize=X) and kernel-config-derived. Restricted to those that
+# materially change exploitability reasoning for memory-corruption
+# CWEs. We deliberately drop sanitizers that only affect undefined-
+# behaviour (UBSAN) for non-memory CWEs, because the prose framing
+# below is memory-specific.
+_RELEVANT_SANITIZERS = frozenset({
+    "address",       # -fsanitize=address (userspace ASan)
+    "kasan",         # CONFIG_KASAN (kernel ASan)
+    "kfence",        # CONFIG_KFENCE
+    "hwaddress",     # -fsanitize=hwaddress (HW-tag ASan)
+    "memory",        # -fsanitize=memory (MSan — uninit reads)
+    "thread",        # -fsanitize=thread (TSan — races)
+    "undefined",     # -fsanitize=undefined (UBSan — int overflows etc.)
+    "ubsan",         # CONFIG_UBSAN
+    "kcsan",         # CONFIG_KCSAN
+    "kcov",          # CONFIG_KCOV (not a sanitizer per se but the
+                     # fuzzer-coverage runtime that often pairs with KASAN)
+})
+
+
+def _render_c_level_source_line(src: CLevelSourceEvidence, style: str) -> str:
+    """Render a C/C++ L1 source observation."""
+    fn_text = (
+        f"function `{src.enclosing_function}`"
+        if src.enclosing_function else "unknown function"
+    )
+    file_path, line_no = src.location
+    if style == "exploit_plan":
+        return (
+            f"C/C++ L1 source: `{src.source_name}` ({src.source_kind}) in "
+            f"{fn_text} at {file_path}:{line_no}. Treat data from this "
+            f"origin as attacker-controlled when planning exploitability."
+        )
+    if style == "agentic_variant":
+        return (
+            f"Variant-hunt seed: `{src.source_name}` ({src.source_kind}) "
+            f"feeds input in {fn_text} at {file_path}:{line_no}."
+        )
+    return (
+        f"C/C++ L1 source: `{src.source_name}` ({src.source_kind}) "
+        f"observed in {fn_text} at {file_path}:{line_no}; downstream "
+        f"buffers/values may be attacker-controlled."
+    )
+
+
+def _render_sanitizers_line(
+    build_flags: BuildFlagsContext | None,
+    style: str,
+) -> str | None:
+    """Summarise observed sanitizer and coverage settings.
+
+    Return None when flag evidence is absent or no recorded name is
+    in the existing relevance set. Settings can aggregate translation
+    units and do not establish instrumentation at a particular finding.
+    """
+    if build_flags is None:
+        return None
+    if build_flags.extraction_confidence == "absent":
+        return None
+    enabled = tuple(
+        s for s in build_flags.sanitizers_enabled
+        if s in _RELEVANT_SANITIZERS
+    )
+    if not enabled:
+        return None
+
+    listed = ", ".join(enabled)
+    if style == "stage_d":
+        prefix = "Build-flag context — observed sanitizer/coverage settings"
+    elif style == "exploit_plan":
+        prefix = "Constraint to verify — sanitizer/coverage settings"
+    else:
+        prefix = "Variant hint — sanitizer build"
+
+    return (
+        f"{prefix}: {listed}. This observation does not establish "
+        f"instrumentation at the finding, runtime detection or termination, "
+        f"a DoS-only outcome, or equivalence to the production binary. "
+        f"Inspect the effective instrumentation and runtime options; "
+        f"verify production-binary coverage separately."
+    )
+
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+
+def _truncate(lines: list[str], max_lines: int | None) -> list[str]:
+    """Cap line count for tight prompt budgets."""
+    if max_lines is None or len(lines) <= max_lines:
+        return lines
+    return lines[:max_lines]
+
+
+def derive_mitigations_found(
+    result: SourceIntelResult,
+    finding_function: str | None = None,
+    _finding_file: str | None = None,
+    _finding_line: int | None = None,
+) -> list[Mitigation]:
+    """Return the structured `mitigations_found` list for a finding.
+
+    Per design strict invariant: a positively-detected mitigation
+    earns an entry; ABSENCE earns no entry (don't emit
+    ``hardened: False`` because we may have missed signal).
+
+    Walks the evidence axes carried on ``result`` itself:
+
+      * axis_2 abort  — abort-class call in finding's function
+        (`abort_dominates` grade=dominates, `abort_on_path`
+        grade=same_path, `abort_proximate` grade=same_function)
+      * axis_4 capability calls remain informational: current records
+        do not establish the denial-exit relation required for a gate
+      * axis_6 fortify — FORTIFY_SOURCE observed in build flags
+        (`fortify_source`)
+      * axis_3 paired — alloc paired with free in function
+        (`paired_free` — informational for leak findings)
+
+    Result-independent axes (dead-code, downstream validation) are
+    verdict-side checks in the adapter and are NOT re-derived here.
+    ``_finding_file`` / ``_finding_line`` are reserved for future
+    per-location filtering and currently unused.
+
+    Each entry includes location when known so Stage D LLM can
+    cross-reference the source.
+    """
+    mitigations: list[Mitigation] = []
+
+    # axis_2 abort — same function as finding
+    for ab in result.aborts:
+        if (finding_function and ab.enclosing_function
+                and ab.enclosing_function != finding_function):
+            continue
+        if ab.grade == GRADE_DOMINATES:
+            confidence = "high"
+            name = "abort_dominates"
+        elif ab.grade == GRADE_SAME_PATH:
+            confidence = "medium"
+            name = "abort_on_path"
+        else:
+            confidence = "low"
+            name = "abort_proximate"
+        mitigations.append(Mitigation(
+            name=name, axis="axis_2", confidence=confidence,
+            detail=f"{ab.macro} ({ab.grade})",
+            location=ab.location,
+        ))
+
+    # Capability observations carry no reviewed denial-exit relation, so
+    # they remain informational and do not create privilege_gate entries.
+
+    # axis_6 FORTIFY — surface only when level present. Kernel
+    # CONFIG_FORTIFY_SOURCE doesn't tier (kconfig level=1 intercepts
+    # like glibc level 2), so kconfig-sourced flags grade high at any
+    # enabled level — mirroring the adapter's verdict threshold.
+    if result.build_flags and result.build_flags.fortify_source_level:
+        level = result.build_flags.fortify_source_level
+        confidence = (
+            "high"
+            if level >= 2 or result.build_flags.source == "kconfig"
+            else "medium"
+        )
+        mitigations.append(Mitigation(
+            name="fortify_source",
+            axis="axis_6", confidence=confidence,
+            detail=f"_FORTIFY_SOURCE={level} ({result.build_flags.source})",
+            location=None,
+        ))
+
+    # axis_3 paired-free — informational for cpp/memory-leak FPs
+    for pf in result.paired_frees:
+        if (finding_function and pf.enclosing_function
+                and pf.enclosing_function != finding_function):
+            continue
+        mitigations.append(Mitigation(
+            name="paired_free",
+            axis="axis_3", confidence="medium",
+            detail=f"{pf.allocator} paired with {pf.free_fn}",
+            location=pf.location,
+        ))
+
+    # axis_2 sub-class: warn-class is informational, not a real
+    # mitigation; null-guards likewise (axis-3's `when !=` does the
+    # verdict work). We don't emit these as mitigations to avoid
+    # false-confidence in Stage D output.
+
+    return mitigations
+
+
+def aggregate_confidence(mitigations: list[Mitigation]) -> str:
+    """Compute overall confidence per design strict invariant:
+    "confidence capped at strongest individual signal; no
+    multiplicative inflation".
+
+    Multiple mediums do NOT combine into a high. Multiple highs
+    don't combine into something stronger than high. The single
+    strongest signal wins.
+
+    Returns one of: "high" | "medium" | "low" | "none" (no
+    evidence at all).
+    """
+    if not mitigations:
+        return "none"
+    ranks = {"high": 3, "medium": 2, "low": 1}
+    best = max(ranks.get(m.confidence, 0) for m in mitigations)
+    return next(
+        (k for k, v in ranks.items() if v == best),
+        "none",
+    )

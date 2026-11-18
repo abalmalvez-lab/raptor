@@ -27,19 +27,24 @@ Limitations (see :doc:`README`):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, TYPE_CHECKING
 
-from core.http import HttpClient
+from core.http import HttpError
 
 from .auth import (
     lookup_credentials,
     parse_www_authenticate,
 )
-from .image_ref import ImageRef
 
+if TYPE_CHECKING:
+    from .image_ref import ImageRef
+    from core.http import HttpClient
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +54,7 @@ logger = logging.getLogger(__name__)
 # schema 2 — without it, some registries fall back to schema 1
 # which we deliberately do NOT support (deprecated, missing
 # digest invariants we rely on).
-_MANIFEST_ACCEPT = ", ".join([
+_MANIFEST_ACCEPT = ", ".join([  # noqa: FLY002 — per-entry comments below
     # OCI Image Manifest v1
     "application/vnd.oci.image.manifest.v1+json",
     # OCI Image Index v1 (multi-arch)
@@ -61,16 +66,336 @@ _MANIFEST_ACCEPT = ", ".join([
 ])
 
 
-def _parse_link_next(link_header: Optional[str]) -> Optional[str]:
+# Size caps on registry-returned JSON. Hostile / compromised mirror
+# can serve multi-GiB responses; cap before json.loads to bound
+# memory. 16 MiB is generous for real manifests/tags lists (typical
+# manifest <10 KiB, tags list a few MiB at most).
+_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+
+# The one digest algorithm this client speaks. Content addresses are
+# recomputed from response bytes and compared against requested
+# references, so the grammar is deliberately strict — a looser OCI
+# grammar would admit algorithms we can't verify.
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_TAGS_BYTES = 16 * 1024 * 1024
+# Aggregate budgets across ALL tags/list pages. The per-page byte cap
+# resets each iteration, so without these a hostile registry
+# (selectable via target-derived image refs) could feed 50 pages ×
+# 16 MiB of tag data that gets retained wholesale — and cached — by
+# callers. Docker Hub's biggest real repos are low-thousands of tags.
+_MAX_TAGS_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_TAGS_TOTAL_COUNT = 50_000
+# OCI tag grammar caps names at 128 chars; anything longer is not a
+# real tag and only inflates the retained list.
+_MAX_TAG_LENGTH = 128
+_MAX_TOKEN_BYTES = 256 * 1024  # token-exchange responses are tiny
+
+# Depth cap on registry-returned JSON, enforced right after every
+# json.loads of registry bytes. The RecursionError mapping at those
+# sites only fires on interpreters whose C parser still exhausts its
+# stack inside the byte caps — CPython 3.14 grew the C-stack headroom,
+# so a 100k-deep bracket bomb parses cleanly there and a nested bomb
+# would otherwise flow onward as a "legitimate" value (or surface as
+# the wrong RegistryError). Real OCI payloads nest ~10 levels; 100 is
+# generous, and the explicit bound makes nested-bomb refusal a
+# contract of THIS client rather than of the interpreter's stack.
+_MAX_JSON_NESTING = 100
+
+
+def _reject_deep_nesting(
+    obj: object, *, max_depth: int = _MAX_JSON_NESTING,
+) -> None:
+    """Raise ValueError when *obj* nests containers deeper than
+    *max_depth*. Iterative walk — measuring the depth must not itself
+    be able to blow the recursion limit."""
+    stack: list[tuple[object, int]] = [(obj, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children: "list[object]" = list(node.values())
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if children and depth >= max_depth:
+            msg = (
+                f"nesting depth exceeds {max_depth} — refusing "
+                f"attacker-shaped deeply nested JSON"
+            )
+            raise ValueError(msg)
+        for child in children:
+            stack.append((child, depth + 1))
+
+
+# Extra token-service hosts per registry that are NOT in the
+# registry-family table (which lists egress hosts; gitlab.com issues
+# tokens for registry.gitlab.com without being an egress host of the
+# family; the Docker Hub aliases exist for callers that address the
+# API endpoint directly instead of the canonical name).
+_REALM_HOST_EXTRAS: dict[str, frozenset[str]] = {
+    "registry.gitlab.com":  frozenset({"gitlab.com"}),
+    "registry-1.docker.io": frozenset({"auth.docker.io"}),
+    "index.docker.io":      frozenset({"auth.docker.io"}),
+}
+
+
+def _allowed_realm_hosts(registry: str) -> frozenset[str]:
+    """Realm hosts allowed for ``registry`` beyond its own host.
+
+    Derived from ``registry_hosts._REGISTRY_FAMILIES`` — the auth
+    endpoints already live there (Docker Hub's ``auth.docker.io``,
+    Elastic's ``docker-auth.elastic.co``) — plus the curated extras
+    above. Deriving instead of hand-mirroring keeps the realm gate
+    from drifting when a family is added: the May-2026 elastic family
+    addition never reached the old hand-maintained allowlist, so
+    every elastic token exchange fail-closed at this gate despite
+    egress allowing the auth host.
+
+    Deliberate trade-off: this widens acceptable realm hosts from the
+    hand-curated token endpoints to a family's full egress list (a
+    docker.io realm may now name its CDN hosts) — every family host
+    is operated by the same registry operator and already trusted for
+    the blobs themselves, and the drift-proofing is worth that
+    same-operator widening.
+    """
+    from .registry_hosts import _REGISTRY_FAMILIES
+    hosts: set[str] = set()
+    for predicate, family_hosts in _REGISTRY_FAMILIES:
+        if predicate(registry):
+            hosts.update(
+                h for h in family_hosts
+                if isinstance(h, str) and not h.startswith("*.")
+            )
+            break
+    hosts.update(_REALM_HOST_EXTRAS.get(registry, ()))
+    return frozenset(hosts)
+
+
+def _validate_realm(registry: str, realm: str) -> None:
+    """Raise :class:`RegistryError` if ``realm`` is not an HTTPS
+    URL whose host is the registry itself or on the per-registry
+    token-service allowlist.
+
+    SSRF defence: closes the credential-handover attack where a
+    malicious / compromised registry returns
+    ``WWW-Authenticate: Bearer realm="https://attacker.com/steal"``.
+    """
+    from urllib.parse import urlsplit
+    parts = urlsplit(realm)
+    if parts.scheme != "https":
+        raise RegistryError(
+            401,
+            f"refusing non-HTTPS realm from {registry}: "
+            f"{realm!r} (SSRF defence)",
+        )
+    if not parts.hostname:
+        raise RegistryError(
+            401, f"{registry} realm has no host: {realm!r}",
+        )
+    host = parts.hostname.lower()
+    # Case-fold ``registry`` for the lookup too — ``parse_image_ref``
+    # lowercases, but the defensive fold closes any future caller
+    # path that passes a mixed-case registry.
+    registry_lower = registry.lower()
+    # ``parts.hostname`` is port-stripped; compare against the
+    # registry's HOST, not the port-bearing authority string, or a
+    # self-hosted registry on a nonstandard port (``reg.example:5000``)
+    # can never satisfy realm==self and every bearer exchange
+    # fail-closes.
+    from .registry_hosts import _split_registry_host_port
+    try:
+        registry_host, _port, _bracketed = _split_registry_host_port(
+            registry_lower)
+    except ValueError:
+        registry_host = registry_lower
+    allowed = _allowed_realm_hosts(registry_lower)
+    if host == registry_host or host in allowed:
+        return
+    raise RegistryError(
+        401,
+        f"refusing realm host {host!r} for registry {registry!r} "
+        f"(not on token-service allowlist; SSRF defence)",
+    )
+
+
+
+def _safe_error_snippet(resp) -> str:
+    """Short response-body excerpt for error messages, with
+    credential-shaped substrings masked.
+
+    Non-2xx bodies are peer-controlled and can echo the request's
+    ``Authorization`` header (Basic base64 or bearer token) straight
+    back — a hostile or misconfigured peer would then plant the
+    operator's registry credentials into exceptions, logs, and
+    scorecards. Redact before the text ever reaches an error string;
+    the extra pre-truncation slack keeps a token that straddles the
+    200-char boundary recognisable to the redactor.
+
+    A bodyless response (redirects, HEAD-ish errors) yields a named
+    placeholder instead of an empty string — error messages that
+    interpolate this must never trail off into ``": "`` with the
+    actual failure detail lost.
+    """
+    from core.security.redaction import redact_secrets
+    snippet = redact_secrets(resp.text[:600], reveal_secrets=False)[:200]
+    if snippet.strip():
+        return snippet
+    status = getattr(resp, "status_code", "?")
+    location = (resp.headers or {}).get("Location") or \
+        (resp.headers or {}).get("location")
+    if location:
+        return (
+            f"(HTTP {status} with empty body; Location present — "
+            f"redirect not followed at this call site)"
+        )
+    return f"(HTTP {status} with empty body)"
+
+
+# Blob GETs are the one OCI surface where off-registry redirects are
+# part of the protocol: Docker Hub (and most large registries) answer
+# ``/v2/<name>/blobs/<digest>`` with a 307 whose Location is a
+# pre-signed CDN URL on a different origin. core.http deliberately
+# never follows redirects (the backend can't run this client's address
+# policy), so the client follows them here — bounded, re-validated,
+# and with registry credentials confined to the registry origin.
+_BLOB_REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+_MAX_BLOB_REDIRECT_HOPS = 3
+
+# Byte budget for one layer blob fetched from a redirect target.
+# The buffered ``request()`` default cap (50 MB) is far below real
+# layer sizes (Debian-based images routinely carry 100-400 MB
+# layers); the CDN hop streams through ``stream_bytes`` instead, so
+# this bounds cumulative stream size, not RSS. Content addressing +
+# the post-stream digest check keep integrity; the budget is a
+# denial-of-service bound only.
+_MAX_BLOB_BYTES = 2 * 1024 ** 3
+
+
+def _validate_blob_redirect_target(location: str, *, base_url: str) -> str:
+    """Resolve a blob-GET redirect ``Location`` against ``base_url``
+    and hold the target to the same host policy as any registry host.
+
+    Returns the absolute URL to fetch. Raises :class:`ValueError`
+    naming the refusal when the target is not https, carries
+    userinfo, or fails the parse-time / resolved-address gates. The
+    CDN host is deliberately NOT run through ``api_endpoint_for``'s
+    registry knowledge — it is expected to be off-registry — but it
+    gets the full SSRF policy: name-shape validation plus
+    every-resolved-address-must-be-global.
+    """
+    from urllib.parse import urljoin, urlparse
+
+    from .registry_hosts import (
+        _validate_registry_host,
+        validate_resolved_registry_addresses,
+    )
+    target = urljoin(base_url, location.strip())
+    parsed = urlparse(target)
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"redirect target scheme {parsed.scheme!r} is not https",
+        )
+    if "@" in parsed.netloc:
+        raise ValueError("redirect target carries userinfo")
+    authority = parsed.netloc
+    if not authority:
+        raise ValueError("redirect target has no host")
+    _validate_registry_host(authority)
+    validate_resolved_registry_addresses(authority)
+    return target
+
+
+# CDN hosts already on the proxy — avoids repeated get_proxy calls.
+_cdn_hosts_extended: set[str] = set()
+
+
+def _extend_proxy_for_cdn_host(cdn_host: str, ref: "ImageRef") -> None:
+    """Dynamically extend the egress proxy allowlist for a CDN host
+    that appeared in a blob redirect.
+
+    Called ONLY after ``_validate_blob_redirect_target`` has passed —
+    the host is already SSRF-validated (HTTPS, hostname grammar, all
+    resolved addresses global).
+
+    The trust chain:
+      operator chose target → target references registry →
+      registry already on allowlist → registry redirects to CDN →
+      CDN host SSRF-validated here → added to proxy.
+
+    No-op when the proxy singleton is not running (plain UrllibClient
+    path, tests), or when the host was already extended.
+    """
+    host = cdn_host.lower()
+    if host in _cdn_hosts_extended:
+        return
+    try:
+        from core.sandbox.proxy import get_proxy
+        get_proxy([host])
+        _cdn_hosts_extended.add(host)
+        logger.info(
+            "oci.client: extended proxy allowlist with CDN host %s "
+            "(blob redirect from %s)", host, ref.registry,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "oci.client: could not extend proxy for CDN host %s "
+            "(proxy may not be running)", host,
+        )
+
+
+def _validate_link_next(
+    raw: str | None, *, repository: str,
+) -> str | None:
+    """Validate a ``Link: rel=next`` URL extracted from a registry
+    response. Returns the URL if it's a relative path under
+    ``/v2/<repository>/`` (the only shape the OCI spec produces
+    for tags/list pagination); returns None otherwise.
+
+    Rejection cases:
+    * Absolute URL (any scheme + host) — registry could redirect
+      us at an attacker-controlled endpoint, bypassing the
+      api_endpoint_for() + realm-validation chain.
+    * Path traversal (``..`` segments) — registry could escape
+      out of the repository scope.
+    * Cross-repo path — pagination must stay within the same
+      repository's tag list.
+    """
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    # Must be a relative path. Scheme presence (`://`) or
+    # authority-relative (`//host`) shapes are rejected.
+    if "://" in s or s.startswith("//"):
+        return None
+    if not s.startswith("/v2/"):
+        return None
+    # Path-traversal guard.
+    path = s.split("?", 1)[0]
+    if any(seg in (".", "..") for seg in path.split("/")):
+        return None
+    # Stay within the same repository's namespace.
+    expected_prefix = f"/v2/{repository}/"
+    if not path.startswith(expected_prefix):
+        return None
+    return s
+
+
+def _parse_link_next(link_header: str | None) -> str | None:
     """Pull the ``<url>`` of the ``rel="next"`` entry out of an
     RFC-5988 ``Link:`` header. Returns None if no next link, or
     the header is absent / malformed.
 
     The OCI Distribution Spec lets registries paginate
-    ``/tags/list`` via this header; URLs may be relative (path
-    only) or absolute. We strip leading whitespace + the angle
-    brackets but otherwise pass the value through verbatim — the
-    HTTP client below treats both shapes.
+    ``/tags/list`` via this header; registries may emit relative
+    (path-only) or absolute URLs. We strip leading whitespace + the
+    angle brackets and pass the value through verbatim; the caller
+    then runs it through :func:`_validate_link_next`, which accepts
+    only relative ``/v2/<repository>/`` paths (absolute URLs are
+    rejected as an SSRF guard, ending pagination), and
+    ``_authed_request`` resolves the surviving path against the
+    registry's API endpoint.
     """
     if not link_header:
         return None
@@ -93,21 +418,22 @@ class ManifestResponse:
     """A registry manifest fetch result.
 
     ``content_type`` tells consumers which parser to dispatch
-    (image manifest vs image index). ``digest`` is the
-    server-reported manifest digest from ``Docker-Content-Digest``
-    — load-bearing for caching, since it's what an immutable
-    reference would point at."""
+    (image manifest vs image index). ``digest`` is the sha256 of
+    ``raw`` COMPUTED by this client — load-bearing for caching, and
+    safe for it precisely because it is derived from the bytes rather
+    than echoed from the ``Docker-Content-Digest`` header (which is
+    cross-checked and must agree)."""
     raw: bytes
-    parsed: Dict[str, Any]
+    parsed: dict[str, Any]
     content_type: str
-    digest: Optional[str]
+    digest: str | None
 
 
 class RegistryError(RuntimeError):
     """Raised on non-2xx responses we can't recover from. Carries
     the status code + a short error string so callers can decide
     whether to retry, fall back, or surface to operators."""
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str) -> None:
         self.status = status
         super().__init__(f"registry error {status}: {message}")
 
@@ -116,10 +442,15 @@ class OciRegistryClient:
     """Stateful client tied to a single :class:`HttpClient` and an
     optional ``BasicCredentials``-providing callable.
 
-    State held: per-(realm, service, scope) bearer-token cache. The
-    cache is a plain dict — bounded by distinct image references
+    State held: per-(realm, service, scope) bearer-token cache plus a
+    per-registry memo of the most recent challenge triple (the triple
+    is only discoverable from a 401 challenge, so the memo is what
+    lets later requests attach a cached token on their FIRST attempt).
+    Both are plain dicts — bounded by distinct image references
     consulted in a single process; tokens are short-lived (5-15 min
-    typically) so there's no hard expiry tracking.
+    typically) so there's no hard expiry tracking: an expired token
+    surfaces as a 401, which evicts it and re-exchanges. Not
+    thread-safe — one client per thread, like the HttpClient it wraps.
     """
 
     def __init__(
@@ -127,13 +458,17 @@ class OciRegistryClient:
         http: HttpClient,
         *,
         credentials_lookup=None,
-    ):
+    ) -> None:
         self.http = http
         # ``credentials_lookup(registry: str) -> BasicCredentials | None``.
         # Default uses the documented chain; tests inject a stub.
         self._lookup = credentials_lookup or lookup_credentials
         # Token cache keyed by (realm, service, scope).
-        self._tokens: Dict[Tuple[str, str, str], str] = {}
+        self._tokens: dict[tuple[str, str, str], str] = {}
+        # Most recent challenge triple seen per registry — the key
+        # under which the next request for that registry looks up a
+        # cached token for its first attempt.
+        self._last_challenge: dict[str, tuple[str, str, str]] = {}
 
     # ----- Public API -----
 
@@ -143,6 +478,15 @@ class OciRegistryClient:
         When ``ref.digest`` is set, returns it without a network
         call. Otherwise issues a HEAD on the tag and reads the
         ``Docker-Content-Digest`` response header.
+
+        The HEAD path has no body to hash, so the returned value is a
+        SERVER CLAIM, not a verified content address. It is safe to use
+        only as a fetch reference: ``fetch_manifest`` re-verifies any
+        digest-shaped reference against the bytes it actually returns,
+        so a lying HEAD is caught at fetch time. Do not key caches or
+        name files on this value without fetching through it first.
+        The shape is validated here so a malformed header can't smuggle
+        path syntax into later URL construction.
         """
         if ref.digest:
             return ref.digest
@@ -156,14 +500,55 @@ class OciRegistryClient:
                 f"manifest HEAD missing Docker-Content-Digest "
                 f"for {ref.to_canonical()}",
             )
+        if not _DIGEST_RE.match(digest):
+            raise RegistryError(
+                resp.status_code,
+                f"malformed Docker-Content-Digest for "
+                f"{ref.to_canonical()}: {digest[:80]!r}",
+            )
         return digest
 
     def fetch_manifest(
-        self, ref: ImageRef, *, reference: Optional[str] = None,
+        self, ref: ImageRef, *, reference: str | None = None,
     ) -> ManifestResponse:
         """Fetch the manifest for ``ref``. If ``reference`` is given,
         it overrides ``ref``'s reference (used to fetch a child
-        manifest from an image-index list of platforms)."""
+        manifest from an image-index list of platforms).
+
+        Digest discipline: any digest-shaped pin (the ``reference``
+        override — commonly an image-index entry the registry itself
+        supplied — or ``ref.digest``) must be a verifiable sha256
+        content address. Pins in other algorithms are refused BEFORE
+        the fetch: the pre-fix check only compared pins that started
+        with ``sha256:``, so a ``sha512:``/``md5:`` pin was fetched
+        and used with no content authentication at all.
+        """
+        requested_pin: str | None = None
+        if reference is not None:
+            # The override is only ever an index-supplied digest (child
+            # manifest of a multi-arch pick) — enforce the digest shape
+            # on EVERY value, not just colon-bearing ones. A colon-less
+            # index entry previously fell through and was fetched as a
+            # mutable TAG with no pin cross-check while the caller
+            # believed it content-addressed — and dot-segments / query
+            # syntax rode into the authed URL path below.
+            if not _DIGEST_RE.match(reference):
+                raise RegistryError(
+                    0,
+                    f"refusing manifest reference {reference[:80]!r} "
+                    f"for {ref.to_canonical()}: pinned digest is not "
+                    f"a verifiable sha256 content address",
+                )
+            requested_pin = reference
+        elif ref.digest:
+            if not _DIGEST_RE.match(ref.digest):
+                raise RegistryError(
+                    0,
+                    f"refusing digest pin {ref.digest[:80]!r} for "
+                    f"{ref.to_canonical()}: not a verifiable sha256 "
+                    f"content address",
+                )
+            requested_pin = ref.digest
         url = self._manifest_url(ref, reference=reference)
         resp = self._authed_request(
             "GET", ref.registry, url,
@@ -173,30 +558,67 @@ class OciRegistryClient:
             raise RegistryError(
                 resp.status_code,
                 f"manifest GET failed for {ref.to_canonical()}: "
-                f"{resp.text[:200]}",
+                f"{_safe_error_snippet(resp)}",
             )
-        try:
-            parsed = json.loads(resp.content)
-        except (ValueError, TypeError) as e:
+        if len(resp.content) > _MAX_MANIFEST_BYTES:
             raise RegistryError(
                 resp.status_code,
-                f"manifest JSON parse failed for "
-                f"{ref.to_canonical()}: {e}",
+                f"manifest exceeds {_MAX_MANIFEST_BYTES}-byte cap "
+                f"for {ref.to_canonical()} (got {len(resp.content)})",
             )
         content_type = resp.headers.get("Content-Type", "") \
             or resp.headers.get("content-type", "")
-        digest = resp.headers.get("Docker-Content-Digest") \
+        # The digest we report is COMPUTED from the body, never echoed
+        # from the Docker-Content-Digest header: downstream consumers
+        # key forever-caches and filenames on it, so it must be a
+        # provable content address, not a server claim. The header and
+        # the requested reference (fetch-by-digest / index sub-manifest
+        # picks) are cross-checked against the computed value and a
+        # disagreement is an integrity failure, not a soft fallback.
+        # Digest verification runs BEFORE json.loads so bytes that
+        # fail the cross-check are never fed to the parser at all.
+        computed = "sha256:" + hashlib.sha256(resp.content).hexdigest()
+        header_digest = resp.headers.get("Docker-Content-Digest") \
             or resp.headers.get("docker-content-digest")
+        if (header_digest and header_digest.startswith("sha256:")
+                and header_digest != computed):
+            raise RegistryError(
+                resp.status_code,
+                f"manifest digest mismatch for {ref.to_canonical()}: "
+                f"header claims {header_digest}, body hashes to "
+                f"{computed}",
+            )
+        if requested_pin and requested_pin != computed:
+            raise RegistryError(
+                resp.status_code,
+                f"manifest digest mismatch for {ref.to_canonical()}: "
+                f"requested {requested_pin}, body hashes to {computed}",
+            )
+        # RecursionError: registry JSON is attacker-shaped; deeply
+        # nested arrays/objects within the size cap blow the parser's
+        # recursion limit. Convert to the module's error type instead
+        # of letting it escape as an unhandled crash. The explicit
+        # depth gate covers interpreters that parse the same nesting
+        # without ever raising RecursionError (CPython 3.14+).
+        try:
+            parsed = json.loads(resp.content)
+            _reject_deep_nesting(parsed)
+        except (ValueError, TypeError, RecursionError) as e:
+            raise RegistryError(
+                resp.status_code,
+                f"manifest JSON parse failed for "
+                f"{ref.to_canonical()}: {type(e).__name__}: {e}",
+            ) from e
         return ManifestResponse(
             raw=resp.content, parsed=parsed,
             content_type=content_type.split(";", 1)[0].strip(),
-            digest=digest,
+            digest=computed,
         )
 
     def list_tags(
         self, ref: ImageRef, *, per_page: int = 100,
         max_pages: int = 50,
-    ) -> List[str]:
+    ) -> list[str]:
         """Return the full tag list for ``ref.repository`` on its
         registry, following ``Link`` headers across pages.
 
@@ -218,11 +640,20 @@ class OciRegistryClient:
         rare; the cap prevents an unbounded walk from a
         misconfigured Link chain.
 
+        Aggregate budgets: cumulative response bytes and total tag
+        count are bounded across pages (the per-page caps alone let a
+        hostile registry stream max_pages × 16 MiB into a retained —
+        and downstream-cached — list). Exceeding either budget raises
+        :class:`RegistryError` rather than silently truncating.
+        Tags longer than the OCI grammar's 128-char maximum are
+        dropped like other non-tag entries.
+
         Raises :class:`RegistryError` on non-200 or malformed
         response.
         """
-        all_tags: List[str] = []
-        next_url: Optional[str] = (
+        all_tags: list[str] = []
+        total_bytes = 0
+        next_url: str | None = (
             f"/v2/{ref.repository}/tags/list?n={per_page}"
         )
         for _ in range(max_pages):
@@ -233,16 +664,34 @@ class OciRegistryClient:
                 raise RegistryError(
                     resp.status_code,
                     f"tags/list failed for {ref.repository} on "
-                    f"{ref.registry}: {resp.text[:200]}",
+                    f"{ref.registry}: {_safe_error_snippet(resp)}",
+                )
+            if len(resp.content) > _MAX_TAGS_BYTES:
+                raise RegistryError(
+                    resp.status_code,
+                    f"tags/list exceeds {_MAX_TAGS_BYTES}-byte cap "
+                    f"for {ref.repository} (got {len(resp.content)})",
+                )
+            total_bytes += len(resp.content)
+            if total_bytes > _MAX_TAGS_TOTAL_BYTES:
+                raise RegistryError(
+                    resp.status_code,
+                    f"tags/list pagination exceeds aggregate "
+                    f"{_MAX_TAGS_TOTAL_BYTES}-byte budget for "
+                    f"{ref.repository} on {ref.registry}",
                 )
             try:
                 data = json.loads(resp.content)
-            except (ValueError, TypeError) as e:
+                _reject_deep_nesting(data)
+            except (ValueError, TypeError, RecursionError) as e:
+                # RecursionError: deep nesting within the byte cap.
+                # The depth gate covers interpreters that parse the
+                # same nesting without raising (CPython 3.14+).
                 raise RegistryError(
                     resp.status_code,
                     f"tags/list JSON parse failed for "
-                    f"{ref.repository}: {e}",
-                )
+                    f"{ref.repository}: {type(e).__name__}: {e}",
+                ) from e
             tags = data.get("tags") if isinstance(data, dict) else None
             if not isinstance(tags, list):
                 raise RegistryError(
@@ -251,14 +700,32 @@ class OciRegistryClient:
                     f"for {ref.repository}",
                 )
             # Filter to non-empty strings — registries occasionally
-            # include nulls for in-progress pushes.
-            all_tags.extend(t for t in tags if isinstance(t, str) and t)
+            # include nulls for in-progress pushes. Overlong entries
+            # violate the OCI tag grammar (128-char max) and are
+            # dropped the same way.
+            all_tags.extend(
+                t for t in tags
+                if isinstance(t, str) and t and len(t) <= _MAX_TAG_LENGTH
+            )
+            if len(all_tags) > _MAX_TAGS_TOTAL_COUNT:
+                raise RegistryError(
+                    resp.status_code,
+                    f"tags/list exceeds {_MAX_TAGS_TOTAL_COUNT}-tag "
+                    f"budget for {ref.repository} on {ref.registry}",
+                )
 
-            # Follow ``Link: <url>; rel="next"`` if present. The
-            # URL is relative to the registry root, but some
-            # registries return absolute URLs — normalise.
-            next_url = _parse_link_next(
+            # Follow ``Link: <url>; rel="next"`` if present.
+            # Must be a relative path under ``/v2/`` for the same
+            # repository — absolute URLs / path traversal / cross-
+            # repo references are rejected (registry-controlled URL
+            # would otherwise bypass the api_endpoint_for() routing
+            # and the realm validation; relative paths route through
+            # _authed_request as expected).
+            raw_next = _parse_link_next(
                 resp.headers.get("Link") or resp.headers.get("link"),
+            )
+            next_url = _validate_link_next(
+                raw_next, repository=ref.repository,
             )
         return all_tags
 
@@ -275,28 +742,180 @@ class OciRegistryClient:
         consume the entire iterator (or ensure the underlying
         response is closed) — leaking a half-read response leaks
         the registry connection.
+
+        The stream is hashed as it is consumed and checked against
+        ``digest`` once exhausted — blobs are content-addressed, so a
+        registry that serves different bytes is an integrity failure
+        (RegistryError after the final chunk). A caller that stops
+        early skips the check by construction; only fully-consumed
+        streams are verified.
         """
-        url = f"/v2/{ref.repository}/blobs/{digest}"
-        resp = self._authed_request(
-            "GET", ref.registry, url, stream=True,
-        )
-        if resp.status_code != 200:
+        if not _DIGEST_RE.match(digest):
+            # Also keeps digest inert in the URL path below.
             raise RegistryError(
-                resp.status_code,
-                f"blob GET failed for {digest} in "
-                f"{ref.to_canonical()}: {resp.text[:200]}",
+                0, f"malformed blob digest: {digest[:80]!r}",
             )
+        url = f"/v2/{ref.repository}/blobs/{digest}"
+        # Blobs are content-addressed: the sha256 below must run over
+        # exactly the bytes the registry stores. ``Accept-Encoding:
+        # identity`` pins the raw-bytes contract in the HTTP backend
+        # (no transport decompression), so a gzip-shaped blob is never
+        # transparently mutated before hashing.
+        # ``max_bytes`` override: the buffered request() default cap
+        # (50 MB) is far below real layer sizes, so a DIRECT-serving
+        # registry (self-hosted registry:2 / Harbor / GitLab — no CDN
+        # redirect) would hard-fail every >50 MB layer mid-buffer with
+        # an uncontracted exception type. The blob budget applies to
+        # both serving shapes; HttpError raised during the buffered
+        # fetch is translated to the module's contract below.
         try:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    yield chunk
-        finally:
+            resp = self._authed_request(
+                "GET", ref.registry, url,
+                headers={"Accept-Encoding": "identity"}, stream=True,
+                max_bytes=_MAX_BLOB_BYTES,
+            )
+        except HttpError as exc:
+            raise RegistryError(
+                getattr(exc, "status", 0) or 0,
+                f"blob GET failed for {digest} in "
+                f"{ref.to_canonical()}: {exc}",
+            ) from exc
+        # Registries answer blob GETs with a redirect to a pre-signed
+        # CDN URL (Docker Hub 307s every layer to its CDN; the
+        # pre-signed query string IS the authorisation). core.http
+        # never follows redirects, so follow them here: bounded hops,
+        # every target re-validated through the registry host policy,
+        # and the registry's Authorization confined to the registry
+        # origin — same-origin redirects re-enter the authed path,
+        # cross-origin targets are fetched with a clean request (per
+        # the OCI distribution spec the registry credential must not
+        # leak to the storage host).
+        from .registry_hosts import api_endpoint_for
+        current_url = f"https://{api_endpoint_for(ref.registry)}{url}"
+        hops = 0
+        cdn_stream: Iterator[bytes] | None = None
+        while resp.status_code in _BLOB_REDIRECT_STATUSES:
+            status = resp.status_code
+            location = (
+                resp.headers.get("Location")
+                or resp.headers.get("location")
+            )
             resp.close()
+            if hops >= _MAX_BLOB_REDIRECT_HOPS:
+                raise RegistryError(
+                    status,
+                    f"blob GET for {digest} in {ref.to_canonical()} "
+                    f"exceeded {_MAX_BLOB_REDIRECT_HOPS} redirect hops",
+                )
+            if not location:
+                raise RegistryError(
+                    status,
+                    f"blob GET for {digest} in {ref.to_canonical()} "
+                    f"redirected ({status}) without a Location header",
+                )
+            try:
+                current_url = _validate_blob_redirect_target(
+                    location, base_url=current_url,
+                )
+            except ValueError as exc:
+                raise RegistryError(
+                    status,
+                    f"refusing blob redirect for {digest} in "
+                    f"{ref.to_canonical()}: {exc}",
+                ) from exc
+            hops += 1
+            from urllib.parse import urlparse
+            parsed = urlparse(current_url)
+            if parsed.netloc == api_endpoint_for(ref.registry):
+                # Same-origin — stay on the authed path (the
+                # registry may still demand its bearer token) and
+                # keep looping: the registry may redirect again.
+                path = parsed.path + (
+                    f"?{parsed.query}" if parsed.query else ""
+                )
+                try:
+                    resp = self._authed_request(
+                        "GET", ref.registry, path,
+                        headers={"Accept-Encoding": "identity"},
+                        stream=True, max_bytes=_MAX_BLOB_BYTES,
+                    )
+                except HttpError as exc:
+                    raise RegistryError(
+                        getattr(exc, "status", 0) or 0,
+                        f"blob GET failed for {digest} in "
+                        f"{ref.to_canonical()}: {exc}",
+                    ) from exc
+                continue
+            # Off-origin CDN — terminal hop: clean request (no
+            # registry credential; the pre-signed URL is the
+            # authorisation) through the true streaming surface.
+            # The buffered ``request()`` path caps bodies at its
+            # default byte budget, far below real layer sizes;
+            # ``stream_bytes`` yields chunks without buffering
+            # under the dedicated blob budget. Terminal by design:
+            # registries redirect registry → storage in one hop, and
+            # ``stream_bytes`` cannot expose a further redirect's
+            # status — a misbehaving chain surfaces as the loud
+            # empty-body error below.
+            _extend_proxy_for_cdn_host(parsed.netloc, ref)
+            cdn_stream = self.http.stream_bytes(
+                current_url,
+                headers={"Accept-Encoding": "identity"},
+                max_bytes=_MAX_BLOB_BYTES,
+            )
+            break
+        if cdn_stream is None:
+            if resp.status_code != 200:
+                raise RegistryError(
+                    resp.status_code,
+                    f"blob GET failed for {digest} in "
+                    f"{ref.to_canonical()}: {_safe_error_snippet(resp)}",
+                )
+            chunk_iter: Iterator[bytes] = resp.iter_content(
+                chunk_size=chunk_size,
+            )
+            close = resp.close
+        else:
+            chunk_iter = cdn_stream
+            close = getattr(cdn_stream, "close", lambda: None)
+        hasher = hashlib.sha256()
+        total = 0
+        try:
+            for chunk in chunk_iter:
+                if chunk:
+                    hasher.update(chunk)
+                    total += len(chunk)
+                    yield chunk
+        except HttpError as exc:
+            # stream_bytes raises lazily on first iteration (4xx,
+            # size budget, refused redirect); carry the blob context.
+            raise RegistryError(
+                getattr(exc, "status", 0) or 0,
+                f"blob GET failed for {digest} in "
+                f"{ref.to_canonical()}: {exc}",
+            ) from exc
+        finally:
+            close()
+        if cdn_stream is not None and total == 0:
+            raise RegistryError(
+                200,
+                f"blob GET for {digest} in {ref.to_canonical()} "
+                f"returned an empty body from the redirect target "
+                f"(possibly a further redirect, which the terminal "
+                f"CDN hop does not follow)",
+            )
+        computed = "sha256:" + hasher.hexdigest()
+        if computed != digest:
+            raise RegistryError(
+                200,
+                f"blob digest mismatch for {ref.to_canonical()}: "
+                f"requested {digest}, body hashes to {computed}",
+            )
 
     # ----- Internals -----
 
     def _manifest_url(
-        self, ref: ImageRef, *, reference: Optional[str] = None,
+        self, ref: ImageRef, *, reference: str | None = None,
     ) -> str:
         return (
             f"/v2/{ref.repository}/manifests/"
@@ -306,8 +925,9 @@ class OciRegistryClient:
     def _authed_request(
         self, method: str, registry: str, url_path: str,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         stream: bool = False,
+        max_bytes: int | None = None,
     ):
         """Issue ``METHOD https://<api-endpoint><url_path>`` with the
         appropriate auth header. The API endpoint is resolved via
@@ -316,21 +936,50 @@ class OciRegistryClient:
         rewrites to ``registry-1.docker.io`` (the v2 API endpoint).
         On 401, parse the ``WWW-Authenticate`` challenge, exchange
         for a bearer token (cached), and retry once. Subsequent
-        failures bubble up as :class:`RegistryError`."""
-        from .registry_hosts import api_endpoint_for
-        full_url = f"https://{api_endpoint_for(registry)}{url_path}"
+        failures bubble up as :class:`RegistryError`.
+
+        Address policy runs twice here: ``api_endpoint_for`` applies
+        the parse-time gate to the NAME, then
+        ``validate_resolved_registry_addresses`` re-validates the
+        addresses the host actually resolves to. The second gate is
+        what stops DNS rebinding / private-DNS answers: a
+        target-derived registry with an innocent-looking hostname
+        must not drive this client at loopback / RFC1918 /
+        link-local / metadata endpoints (including NAT64-embedded
+        IPv4 in AAAA answers)."""
+        from .registry_hosts import (
+            api_endpoint_for,
+            validate_resolved_registry_addresses,
+        )
+        endpoint = api_endpoint_for(registry)
+        try:
+            validate_resolved_registry_addresses(endpoint)
+        except ValueError as exc:
+            raise RegistryError(0, str(exc)) from exc
+        full_url = f"https://{endpoint}{url_path}"
         req_headers = dict(headers) if headers else {}
         # First attempt with whatever auth is already cached for
-        # this registry's most-recent (realm, service, scope) tuple.
-        # Cache is keyed by the challenge triple, so we don't have
-        # one yet — make the unauthenticated attempt first to
-        # discover the realm.
+        # this registry's most-recent (realm, service, scope) tuple —
+        # repeat calls for the same image must skip the exchange
+        # dance. The triple is only discoverable from a 401 challenge,
+        # so the very first call for a registry goes out
+        # unauthenticated and takes the challenge path below.
+        used_cache_key: tuple[str, str, str] | None = None
+        last_challenge = self._last_challenge.get(registry)
+        if last_challenge is not None:
+            cached_token = self._tokens.get(last_challenge)
+            if cached_token is not None:
+                req_headers["Authorization"] = f"Bearer {cached_token}"
+                used_cache_key = last_challenge
         # raise_on_status=False so the 401-with-WWW-Authenticate
         # challenge reaches the retry path below instead of being
         # converted to an exception by the backend.
+        request_kwargs: dict[str, Any] = {}
+        if max_bytes is not None:
+            request_kwargs["max_bytes"] = max_bytes
         resp = self.http.request(
             method, full_url, headers=req_headers, stream=stream,
-            raise_on_status=False,
+            raise_on_status=False, **request_kwargs,
         )
         if resp.status_code != 401:
             return resp
@@ -357,6 +1006,7 @@ class OciRegistryClient:
             resp.close()
             return self.http.request(
                 method, full_url, headers=req_headers, stream=stream,
+                raise_on_status=False, **request_kwargs,
             )
 
         realm = params.get("realm", "")
@@ -368,11 +1018,47 @@ class OciRegistryClient:
                 f"{registry} 401 with no realm — cannot exchange "
                 f"for bearer token",
             )
+        # SSRF defence: the realm URL comes from the registry's own
+        # WWW-Authenticate header, but a compromised mirror could
+        # return e.g. ``Bearer realm="https://attacker.com/steal"``
+        # and we'd post HTTP Basic credentials to it. Constrain the
+        # realm to https + an explicit allowlist of token-service
+        # hosts per registry (most are sub-domains of the registry
+        # host; explicit list keeps the surface small).
+        _validate_realm(registry, realm)
+        cache_key = (realm, service, scope)
+        # Evict only the token that actually failed: a 401 while
+        # presenting the cached token for THIS exact triple means that
+        # token is stale/expired. A 401 with no token attached (first
+        # contact) or with a token cached under a different triple
+        # (scope change between repositories) says nothing about other
+        # cache entries — those stay.
+        if used_cache_key == cache_key:
+            self._tokens.pop(cache_key, None)
+        self._last_challenge[registry] = cache_key
         token = self._exchange_token(registry, realm, service, scope)
         req_headers["Authorization"] = f"Bearer {token}"
         resp.close()
+        retry = self.http.request(
+            method, full_url, headers=req_headers, stream=stream,
+            raise_on_status=False, **request_kwargs,
+        )
+        if retry.status_code != 401:
+            return retry
+        # Still 401: the token may have come from the cache under a
+        # triple OTHER than the one this request presented first
+        # (interleaved multi-repo scans rotate _last_challenge), so
+        # the eviction above never fired and _exchange_token handed
+        # back a stale cached token. One forced re-exchange closes
+        # that window; a second 401 after a fresh token is a real
+        # authorization failure and is returned to the caller.
+        retry.close()
+        self._tokens.pop(cache_key, None)
+        token = self._exchange_token(registry, realm, service, scope)
+        req_headers["Authorization"] = f"Bearer {token}"
         return self.http.request(
             method, full_url, headers=req_headers, stream=stream,
+            raise_on_status=False, **request_kwargs,
         )
 
     def _exchange_token(
@@ -407,7 +1093,7 @@ class OciRegistryClient:
             sep = "&" if "?" in realm else "?"
             token_url = f"{realm}{sep}{urlencode(qs_pairs)}"
 
-        headers: Dict[str, str] = {}
+        headers: dict[str, str] = {}
         creds = self._lookup(registry)
         if creds is not None:
             headers["Authorization"] = f"Basic {creds.to_basic_header()}"
@@ -420,15 +1106,27 @@ class OciRegistryClient:
             raise RegistryError(
                 resp.status_code,
                 f"token exchange at {realm} failed: "
-                f"{resp.text[:200]}",
+                f"{_safe_error_snippet(resp)}",
+            )
+        if len(resp.content) > _MAX_TOKEN_BYTES:
+            raise RegistryError(
+                resp.status_code,
+                f"token exchange response exceeds {_MAX_TOKEN_BYTES}b "
+                f"(got {len(resp.content)}) — likely hostile or "
+                f"misconfigured token service",
             )
         try:
             payload = json.loads(resp.content)
-        except (ValueError, TypeError) as e:
+            _reject_deep_nesting(payload)
+        except (ValueError, TypeError, RecursionError) as e:
+            # RecursionError: deep nesting within the byte cap.
+            # The depth gate covers interpreters that parse the
+            # same nesting without raising (CPython 3.14+).
             raise RegistryError(
                 resp.status_code,
-                f"token exchange at {realm} returned non-JSON: {e}",
-            )
+                f"token exchange at {realm} returned non-JSON: "
+                f"{type(e).__name__}: {e}",
+            ) from e
         # Token may be in ``token`` or ``access_token`` per the
         # registry spec — both must be supported.
         token = payload.get("token") or payload.get("access_token")
@@ -442,7 +1140,7 @@ class OciRegistryClient:
 
 
 __all__ = [
-    "OciRegistryClient",
     "ManifestResponse",
+    "OciRegistryClient",
     "RegistryError",
 ]

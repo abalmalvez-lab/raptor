@@ -1,0 +1,545 @@
+"""CLI for the recall-measurement harness (core/recall/scripts/recall-measure)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import logging
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from core.json import load_json, save_json
+from core.recall.manifest import PROFILES, ManifestError, load_manifest
+from core.recall.matcher import clean_region_hits, match_findings
+from core.recall.crossfile_python import main as crossfile_python_main
+from core.recall.cvefix_manifest import main as cvefix_manifest_main
+from core.recall.juliet_manifest import main as juliet_manifest_main
+from core.recall.nodegoat_manifest import main as nodegoat_manifest_main
+from core.recall.owasp_manifest import main as owasp_manifest_main
+from core.recall.runner import (
+    RunnerError,
+    collect_findings,
+    run_pipeline,
+    verify_pinned_clone,
+)
+from core.logging import configure_cli_logging
+from core.recall.score import (
+    collect_toolchain,
+    compare_reports,
+    render_markdown,
+    score,
+)
+
+logger = logging.getLogger(__name__)
+
+# Byte budget for operator-supplied recall reports.
+_MAX_REPORT_BYTES = 64 * 1024 * 1024
+
+
+def _load_report_file(path: Path) -> Any:
+    """Strict bounded load of an operator-supplied report path.
+
+    Raises OSError/ValueError (matching the CLI error handlers); a
+    missing file raises instead of returning None so every failure
+    reaches the same error-and-exit-2 path.
+    """
+    data = load_json(path, strict=True, max_bytes=_MAX_REPORT_BYTES)
+    if data is None:
+        msg = f"{path}: file not found"
+        raise OSError(msg)
+    return data
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_out() -> Path:
+    # Microseconds + pid: recall sweeps are exactly the parallel
+    # workload where second-granularity default dirs collide and one
+    # run's report silently overwrites another's (mkdir(exist_ok) hid
+    # the collision).
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return Path("out/recall-measure/runs") / f"{ts}_p{os.getpid()}"
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    try:
+        manifest = load_manifest(args.manifest)
+    except ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.profile:
+        if args.profile not in PROFILES:
+            print(f"error: unknown profile {args.profile!r} "
+                  f"(choose from {sorted(PROFILES)})", file=sys.stderr)
+            return 2
+        manifest.profile = args.profile
+    if PROFILES[manifest.profile]["uses_llm"] and not args.allow_llm:
+        print(
+            f"error: profile {manifest.profile!r} runs LLM analysis on "
+            "every finding — pass --allow-llm to accept the cost, or "
+            "use scan / scan-codeql for a free baseline",
+            file=sys.stderr)
+        return 2
+
+    out_dir = args.out or _default_out()
+    from core.recall.reporting import prepare_recall_report
+    try:
+        prepare_recall_report(args, out_dir, (Path(manifest.local_path) if Path(manifest.local_path).is_absolute()
+                                            else _repo_root() / manifest.local_path))
+    except (ValueError, OSError) as exc:
+        from core.security.log_sanitisation import sanitise_for_terminal
+        print(f"error: {sanitise_for_terminal(str(exc), max_len=300)}", file=sys.stderr)
+        return 2
+    out_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = _repo_root()
+    pipeline_dir = (args.pipeline_dir.resolve()
+                    if args.pipeline_dir else repo_root)
+    if not (pipeline_dir / "raptor.py").is_file():
+        print(f"error: --pipeline-dir {pipeline_dir} does not contain "
+              "raptor.py", file=sys.stderr)
+        return 2
+
+    try:
+        # Manifest-relative paths resolve against the HARNESS tree; the
+        # pipeline dir only selects which detector build runs, so two
+        # builds can be measured against one manifest.
+        target = verify_pinned_clone(manifest, repo_root)
+        pipeline_out = run_pipeline(
+            manifest, target, pipeline_dir, out_dir / "pipeline.log",
+            timeout_s=args.timeout)
+        produced = collect_findings(pipeline_out, source_root=target)
+    except RunnerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    matches = match_findings(manifest.expected, produced,
+                             manifest.tolerance)
+    clean_hits = clean_region_hits(manifest.clean_regions, produced,
+                                   manifest.tolerance)
+    report = score(manifest, matches, clean_hits,
+                   toolchain=collect_toolchain(),
+                   run_output_dir=str(pipeline_out))
+
+    report_dict = report.to_dict()
+
+    # Mechanical-warm section: when the profile's pipeline produced
+    # suppression evidence records, score them as would-suppress
+    # counts (raw numbers unchanged). Plain scan produces none today.
+    suppressions = pipeline_out / "suppressions.jsonl"
+    if suppressions.is_file():
+        from core.recall.warm import (
+            apply_would_suppress,
+            load_suppression_records,
+            matched_expected_entries,
+        )
+        records = load_suppression_records(suppressions)
+        expected_dicts = [e.to_dict() for e in manifest.expected]
+        report_dict["warm"] = apply_would_suppress(
+            report_dict, records,
+            matched_expected=matched_expected_entries(
+                report_dict, expected_dicts))
+
+    json_path = out_dir / "report.json"
+    save_json(json_path, report_dict)
+    md = render_markdown(report)
+    if args._report_options.enabled:
+        (out_dir / "report.md").write_text(md, encoding="utf-8")
+    print(md)
+    print(f"report: {json_path}")
+    from core.recall.reporting import complete_recall_report
+    complete_recall_report(args, report, out_dir, warm_present="warm" in report_dict)
+    return 0
+
+
+def _cmd_census(args: argparse.Namespace) -> int:
+    from core.recall.census import build_census, render_census_markdown
+    from core.recall.matcher import clean_region_hits
+
+    try:
+        report = _load_report_file(args.report)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read report: {exc}", file=sys.stderr)
+        return 2
+
+    if args.fn:
+        return _fn_census(args, report)
+    clean_fps = report.get("clean_region_fps", [])
+
+    # Rule attribution: reports produced before the score() rules
+    # field need a re-match against the run dir's SARIFs.
+    rules_by_id: dict[str, list[str]] | None = None
+    if clean_fps and not any(e.get("rules") for e in clean_fps):
+        run_dir = args.run_dir or (
+            Path(report["run_output_dir"])
+            if report.get("run_output_dir") else None)
+        if (run_dir is None or not Path(run_dir).is_dir()
+                or args.manifest is None):
+            print("warning: report carries no rule attribution and no "
+                  "usable run dir + manifest — census will rank "
+                  "idioms/CWEs only", file=sys.stderr)
+        else:
+            try:
+                manifest = load_manifest(args.manifest)
+            except ManifestError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            produced = collect_findings(Path(run_dir),
+                                        source_root=args.source_root)
+            hits = clean_region_hits(manifest.clean_regions, produced,
+                                     manifest.tolerance)
+            rules_by_id = {
+                h.expected.id: sorted(
+                    {str(p.get("rule_id")) for p in h.hits
+                     if p.get("rule_id")})
+                for h in hits
+            }
+
+    census = build_census(clean_fps, source_root=args.source_root,
+                          rules_by_id=rules_by_id)
+    md = render_census_markdown(census)
+    out_dir = args.out or args.report.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_json(out_dir / "census.json", census)
+    (out_dir / "census.md").write_text(md, encoding="utf-8")
+    print(md)
+    print(f"census: {out_dir / 'census.json'}")
+    return 0
+
+
+def _fn_census(args: argparse.Namespace, report: dict) -> int:
+    from core.recall.fn_census import (
+        build_fn_census,
+        render_fn_census_markdown,
+    )
+
+    missed = report.get("missed", [])
+    produced = None
+    run_dir = args.run_dir or (
+        Path(report["run_output_dir"])
+        if report.get("run_output_dir") else None)
+    if run_dir is not None and Path(run_dir).is_dir():
+        produced = collect_findings(Path(run_dir),
+                                    source_root=args.source_root)
+    else:
+        print("warning: no usable run dir — the census will not name "
+              "the rules firing per missed CWE", file=sys.stderr)
+
+    census = build_fn_census(missed, source_root=args.source_root,
+                             per_cwe=report.get("per_cwe"),
+                             produced=produced)
+    md = render_fn_census_markdown(census)
+    out_dir = args.out or args.report.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_json(out_dir / "fn-census.json", census)
+    (out_dir / "fn-census.md").write_text(md, encoding="utf-8")
+    print(md)
+    print(f"fn census: {out_dir / 'fn-census.json'}")
+    return 0
+
+
+def _cmd_warm(args: argparse.Namespace) -> int:
+    from core.recall.warm import (
+        apply_would_suppress,
+        load_suppression_records,
+        matched_expected_entries,
+        render_warm_markdown,
+    )
+
+    try:
+        report = _load_report_file(args.report)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read report: {exc}", file=sys.stderr)
+        return 2
+    records = load_suppression_records(args.suppressions)
+    # No manifest => damage is UNKNOWN, never zero. matched stays None
+    # so apply_would_suppress marks the section damage_measured=False
+    # (the vacuous-zero blindness class from the b44 stop-ship).
+    matched: list[dict] | None = None
+    if args.manifest:
+        try:
+            manifest = load_manifest(args.manifest)
+        except ManifestError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        matched = matched_expected_entries(
+            report, [e.to_dict() for e in manifest.expected])
+    else:
+        print(
+            "warning: no --manifest — true-finding damage is UNKNOWN "
+            "(not zero); enforcement decisions require a manifest-backed "
+            "damage measurement",
+            file=sys.stderr,
+        )
+    warm = apply_would_suppress(report, records, matched_expected=matched)
+    md = render_warm_markdown(warm)
+    out_dir = args.out or args.report.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_json(out_dir / "warm.json", warm)
+    (out_dir / "warm.md").write_text(md, encoding="utf-8")
+    print(md)
+    return 0
+
+
+def _cmd_verify_enforced(args: argparse.Namespace) -> int:
+    from core.recall.verify_enforced import (
+        render_verify_markdown,
+        verify_enforced_paths,
+    )
+
+    try:
+        manifest = load_manifest(args.manifest)
+    except ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    result = verify_enforced_paths(
+        args.suppressions,
+        [e.to_dict() for e in manifest.expected],
+        line_drift=args.line_drift,
+        include_candidates=args.include_candidates,
+    )
+    md = render_verify_markdown(result)
+    if args.out:
+        args.out.mkdir(parents=True, exist_ok=True)
+        save_json(args.out / "verify-enforced.json", result)
+        (args.out / "verify-enforced.md").write_text(
+            md, encoding="utf-8")
+    print(md)
+    # Exit 1 when review is required: an enforcement decision gated on
+    # this tool cannot proceed on a non-clean set (the b44 lesson).
+    return 0 if result["clean"] else 1
+
+
+def _cmd_flip_gate(args: argparse.Namespace) -> int:
+    from core.recall.flip_gate import (
+        FlipGateError,
+        evaluate_flip_gate,
+        load_reports,
+        render_public,
+    )
+
+    try:
+        baseline = load_reports(args.baseline)
+        candidate = load_reports(args.candidate)
+        result = evaluate_flip_gate(
+            baseline, candidate, fp_ceiling=args.fp_ceiling,
+            min_uplift=args.min_uplift,
+            profiles=(args.baseline_profile, args.candidate_profile),
+            allow_legacy_baseline=args.allow_legacy_baseline)
+    except (OSError, ValueError, FlipGateError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    report_path = args.report or (
+        (args.candidate if args.candidate.is_dir()
+         else args.candidate.parent) / "flip-gate-report.json")
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(report_path, result)
+    except OSError as exc:
+        print(f"error: cannot write report: {exc}", file=sys.stderr)
+        return 2
+    # stdout stays number-free (hide-gaps): verdict + mechanism names;
+    # every figure lives in the report file.
+    print(render_public(result, report_path))
+    return 0 if result["passed"] else 1
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    try:
+        base = _load_report_file(args.base)
+        new = _load_report_file(args.new)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read report: {exc}", file=sys.stderr)
+        return 2
+    delta = compare_reports(base, new)
+    # ensure_ascii: terminal lane — JSON escapes C0 but passes C1
+    # controls raw without it; stays valid JSON for consumers.
+    print(json.dumps(delta, indent=2, ensure_ascii=True, default=str))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(logging.INFO, fmt="[%(levelname)s] %(message)s")
+    p = argparse.ArgumentParser(
+        prog="recall-measure",
+        description=("End-to-end detector-recall measurement: run a "
+                     "detection profile against a ground-truth target "
+                     "and score found/expected per CWE. Reports are "
+                     "recall-ground-truth class — never feed them to "
+                     "FP-suppression or scorecard learning stores."),
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    run_p = sub.add_parser("run", help="run a manifest and score recall")
+    run_p.add_argument("--manifest", type=Path, required=True)
+    run_p.add_argument("--out", type=Path, default=None,
+                       help="report dir (default: "
+                            "out/recall-measure/runs/<ts>)")
+    run_p.add_argument("--profile", default=None,
+                       help="override the manifest's detection profile")
+    run_p.add_argument("--allow-llm", action="store_true",
+                       help="required for LLM-tier profiles (agentic)")
+    run_p.add_argument("--pipeline-dir", type=Path, default=None,
+                       help="RAPTOR checkout whose raptor.py runs the "
+                            "profile (default: this tree) — lets two "
+                            "detector builds be measured against one "
+                            "manifest for before/after deltas")
+    run_p.add_argument("--timeout", type=int, default=4 * 3600,
+                       help="pipeline timeout in seconds")
+    run_p.set_defaults(func=_cmd_run)
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(run_p)
+
+    cmp_p = sub.add_parser("compare",
+                           help="delta two report JSONs (older first)")
+    cmp_p.add_argument("base", type=Path)
+    cmp_p.add_argument("new", type=Path)
+    cmp_p.set_defaults(func=_cmd_compare)
+
+    fg_p = sub.add_parser(
+        "flip-gate",
+        help="three-part default-flip gate vs a frozen baseline: "
+             "recall uplift + clean-region FP ceiling + "
+             "no-displacement; stdout is pass/fail + mechanism names "
+             "only (numbers go to the local report file); exit 1 on "
+             "FAIL, 2 when the sides are not comparable")
+    fg_p.add_argument("--baseline", type=Path, required=True,
+                      help="frozen baseline reports: the "
+                           "out/eval-baselines/<id>/ dir (scanned "
+                           "recursively) or a single report.json")
+    fg_p.add_argument("--candidate", type=Path, required=True,
+                      help="candidate run reports: dir or report.json")
+    fg_p.add_argument("--baseline-profile", default="agentic",
+                      help="declared detection profile every frozen-"
+                           "baseline report must carry (closed "
+                           "vocabulary; default: agentic)")
+    fg_p.add_argument("--candidate-profile", default="agentic-taint",
+                      help="declared detection profile every candidate "
+                           "report must carry (default: agentic-taint; "
+                           "same-profile build-vs-build comparisons "
+                           "must declare both sides explicitly)")
+    fg_p.add_argument("--allow-legacy-baseline", action="store_true",
+                      help="grandfather a frozen baseline whose "
+                           "reports predate the clean_region_total/"
+                           "label_digest pins: ABSENT pins are "
+                           "accepted on the baseline side only "
+                           "(present-but-mismatched still refuses, "
+                           "the candidate side always requires them) "
+                           "and the grandfather is called out on "
+                           "stdout. Clean remedy: re-freeze the "
+                           "baseline with the current scorer")
+    fg_p.add_argument("--fp-ceiling", type=int, default=0,
+                      help="allowed clean-region FP growth over the "
+                           "baseline (default 0: no growth)")
+    fg_p.add_argument("--min-uplift", type=float, default=0.0,
+                      help="required aggregate recall uplift margin; "
+                           "uplift must exceed it strictly (default "
+                           "0: any positive uplift)")
+    fg_p.add_argument("--report", type=Path, default=None,
+                      help="numeric report path (default: "
+                           "flip-gate-report.json beside the "
+                           "candidate)")
+    fg_p.set_defaults(func=_cmd_flip_gate)
+
+    cen_p = sub.add_parser(
+        "census",
+        help="rank clean-region FPs by rule, CWE, and sanitizer idiom "
+             "(--fn: rank MISSED findings by chain-breaking construct)")
+    cen_p.add_argument("--fn", action="store_true",
+                       help="census the missed expected findings "
+                            "instead of the clean-region FPs")
+    cen_p.add_argument("--report", type=Path, required=True)
+    cen_p.add_argument("--manifest", type=Path, default=None,
+                       help="needed to recompute rule attribution for "
+                            "reports that predate the rules field")
+    cen_p.add_argument("--run-dir", type=Path, default=None,
+                       help="pipeline run dir override (default: the "
+                            "report's run_output_dir)")
+    cen_p.add_argument("--source-root", type=Path, default=None,
+                       help="clean-case source tree (the pinned "
+                            "benchmark clone) for idiom classification")
+    cen_p.add_argument("--out", type=Path, default=None,
+                       help="census output dir (default: report's dir)")
+    cen_p.set_defaults(func=_cmd_census)
+
+    warm_p = sub.add_parser(
+        "warm",
+        help="score suppression records as would-suppress counts "
+             "(raw numbers unchanged)")
+    warm_p.add_argument("--report", type=Path, required=True)
+    warm_p.add_argument("--suppressions", type=Path, required=True)
+    warm_p.add_argument("--manifest", type=Path, default=None,
+                        help="enables the true-finding damage check")
+    warm_p.add_argument("--out", type=Path, default=None)
+    warm_p.set_defaults(func=_cmd_warm)
+
+    ve_p = sub.add_parser(
+        "verify-enforced",
+        help="per-finding review of suppression records near expected "
+             "findings (the systematic form of the b44 manual catch); "
+             "exit 1 when review is required")
+    ve_p.add_argument("--suppressions", type=Path, required=True)
+    ve_p.add_argument("--manifest", type=Path, required=True)
+    ve_p.add_argument("--line-drift", type=int, default=2)
+    ve_p.add_argument("--include-candidates", action="store_true",
+                      help="also review candidate-tier records")
+    ve_p.add_argument("--out", type=Path, default=None)
+    ve_p.set_defaults(func=_cmd_verify_enforced)
+
+    ow_p = sub.add_parser(
+        "owasp-manifest",
+        help="generate the OWASP Benchmark recall manifest from the "
+             "pinned clone")
+    ow_p.set_defaults(func=None)
+
+    jl_p = sub.add_parser(
+        "juliet-manifest",
+        help="generate the HELD-OUT Juliet Java manifest (generalization "
+             "checks only — never tune against it)")
+    jl_p.set_defaults(func=None)
+
+    cf_p = sub.add_parser(
+        "cvefix-manifest",
+        help="bridge a CVE fix commit into a recall manifest + "
+             "fp-only post-fix twin (candidate labels — hand-verify)")
+    cf_p.set_defaults(func=None)
+
+    ng_p = sub.add_parser(
+        "nodegoat-manifest",
+        help="wrap a local NodeGoat labels overlay into a recall "
+             "manifest (pin + structure; labels stay local)")
+    ng_p.set_defaults(func=None)
+
+    xf_p = sub.add_parser(
+        "crossfile-python",
+        help="generate synthetic cross-file Python fixture packages "
+             "+ manifest (machinery ships; generated content stays "
+             "local)")
+    xf_p.set_defaults(func=None)
+
+    args, rest = p.parse_known_args(argv)
+    if args.cmd == "owasp-manifest":
+        return owasp_manifest_main(rest)
+    if args.cmd == "juliet-manifest":
+        return juliet_manifest_main(rest)
+    if args.cmd == "cvefix-manifest":
+        return cvefix_manifest_main(rest)
+    if args.cmd == "nodegoat-manifest":
+        return nodegoat_manifest_main(rest)
+    if args.cmd == "crossfile-python":
+        return crossfile_python_main(rest)
+    if rest:
+        p.error(f"unrecognized arguments: {' '.join(rest)}")
+    if args.cmd == "run":
+        from core.reporting.options import options_from_args
+        args._report_options = options_from_args(args, p)
+    return args.func(args)
+
+
+if __name__ == "__main__":  # python -m core.recall.cli
+    raise SystemExit(main())

@@ -7,8 +7,10 @@ Provides:
 - EvidenceStore instances
 """
 
+import importlib
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -17,8 +19,121 @@ import pytest
 # .claude/skills/oss-forensics/github-evidence-kit/tests/conftest.py -> .claude/skills/oss-forensics/github-evidence-kit
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
+
+def _stub_google_modules() -> None:
+    """Keep the suite hermetic when google-cloud-bigquery is absent.
+
+    ``src.clients.gharchive`` imports the Google client libraries at
+    module level, so on hosts without them every test module that
+    (transitively) imports ``src.clients`` died at collection. The
+    unit tests never touch live BigQuery — they only need the imports
+    to resolve — so inject a minimal module tree. Real installs are
+    untouched (the stub only fills a missing import), and any test
+    that accidentally reaches for a live query on a stubbed host
+    fails loudly.
+    """
+    modules_available = True
+    # Probe independently: a missing BigQuery wheel must not prevent loading
+    # an installed oauth2 module before deciding which imports need stubs.
+    for name in (
+        "google.auth", "google.auth.exceptions", "google.cloud",
+        "google.cloud.bigquery", "google.oauth2", "google.oauth2.service_account",
+    ):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            modules_available = False
+    if modules_available:
+        return
+
+    sys.modules.setdefault("google", types.ModuleType("google"))
+
+    auth = types.ModuleType("google.auth")
+    auth_exceptions = types.ModuleType("google.auth.exceptions")
+
+    class _GoogleAuthError(Exception):
+        pass
+
+    class _DefaultCredentialsError(_GoogleAuthError):
+        pass
+
+    auth_exceptions.GoogleAuthError = _GoogleAuthError
+    auth_exceptions.DefaultCredentialsError = _DefaultCredentialsError
+    auth.exceptions = auth_exceptions
+
+    def _default(scopes=None):
+        raise _DefaultCredentialsError(
+            "stubbed google.auth — no live credentials in unit tests")
+    auth.default = _default
+
+    oauth2 = types.ModuleType("google.oauth2")
+    service_account = types.ModuleType("google.oauth2.service_account")
+
+    class _Credentials:
+        @staticmethod
+        def from_service_account_info(info, scopes=None):
+            return object()
+
+        @staticmethod
+        def from_service_account_file(path, scopes=None):
+            return object()
+
+    service_account.Credentials = _Credentials
+    oauth2.service_account = service_account
+
+    cloud = types.ModuleType("google.cloud")
+    bigquery = types.ModuleType("google.cloud.bigquery")
+    bigquery._raptor_test_stub = True
+
+    class _QueryJobConfig:
+        def __init__(self, **kw):
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class _ScalarQueryParameter:
+        def __init__(self, name, type_, value):
+            self.name, self.type_, self.value = name, type_, value
+
+    class _Client:
+        def __init__(self, credentials=None, project=None):
+            self.project = project
+
+        def query(self, *args, **kwargs):
+            raise RuntimeError(
+                "stubbed google.cloud.bigquery — unit tests must not "
+                "issue live queries")
+
+    bigquery.Client = _Client
+    bigquery.QueryJobConfig = _QueryJobConfig
+    bigquery.ScalarQueryParameter = _ScalarQueryParameter
+    cloud.bigquery = bigquery
+
+    for name, mod in {
+        "google.auth": auth,
+        "google.auth.exceptions": auth_exceptions,
+        "google.oauth2": oauth2,
+        "google.oauth2.service_account": service_account,
+        "google.cloud": cloud,
+        "google.cloud.bigquery": bigquery,
+    }.items():
+        # Keep the parent attribute consistent with the module cache. A
+        # partial SDK install may already have real auth/oauth2 modules;
+        # setdefault preserves those, so linking a fresh stub onto google
+        # would split attribute-based imports from sys.modules lookups.
+        actual = sys.modules.setdefault(name, mod)
+        parent_name, attr = name.rsplit(".", 1)
+        parent = sys.modules[parent_name]
+        setattr(parent, attr, actual)
+
+
+_stub_google_modules()
+
 from src import EvidenceStore, load_evidence_from_json
 
+
+@pytest.fixture
+def google_module_stubber():
+    return _stub_google_modules
 
 # =============================================================================
 # FIXTURE DATA PATHS

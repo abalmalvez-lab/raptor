@@ -23,34 +23,46 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import random
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
 
 from core.dataflow.adapters.codeql import from_sarif_result
 from core.dataflow.finding import Finding, Step
+from core.json import load_json
+from core.paths import confine
+from core.sarif.parser import SARIF_MAX_BYTES
+from core.source import read_text_capped
+from core.source.lines import split_lines
 from core.dataflow.label import (
     FP_MISSING_SANITIZER_MODEL,
     GroundTruth,
     VERDICT_FALSE_POSITIVE,
     VERDICT_TRUE_POSITIVE,
 )
+from typing import TYPE_CHECKING
+
+# CodeQL SARIF over corpus code — the SARIF budget class shared with
+# core.sarif.parser.load_sarif (one constant, aliased for the local
+# call sites).
+_MAX_SARIF_BYTES = SARIF_MAX_BYTES
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-_TESTNAME_RE = re.compile(r"BenchmarkTest\d{5}")
+_TESTNAME_RE = re.compile(r"(?:^|/)(BenchmarkTest[0-9]{5})\.java\Z")
 
 
-def parse_expected_results(csv_path: Path) -> Dict[str, Tuple[int, bool]]:
+def parse_expected_results(csv_path: Path) -> dict[str, tuple[int, bool]]:
     """Return ``test_name -> (cwe, is_real_vulnerability)``.
 
     Skips ``#``-prefixed comment lines (OWASP's CSV format starts with
     one) and any row that doesn't begin with ``BenchmarkTest``.
     """
-    mapping: Dict[str, Tuple[int, bool]] = {}
-    with csv_path.open() as f:
+    mapping: dict[str, tuple[int, bool]] = {}
+    with csv_path.open(encoding="utf-8") as f:
         for raw_line in f:
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("#"):
@@ -62,13 +74,20 @@ def parse_expected_results(csv_path: Path) -> Dict[str, Tuple[int, bool]]:
             if not test_name.startswith("BenchmarkTest"):
                 continue
             try:
-                mapping[test_name] = (int(cwe), real.lower() == "true")
+                cwe_id = int(cwe)
             except ValueError:
                 continue
+            truth = real.lower()
+            if truth not in {"true", "false"}:
+                raise ValueError(f"Invalid truth flag for {test_name}: {real!r}")
+            expected = (cwe_id, truth == "true")
+            if test_name in mapping and mapping[test_name] != expected:
+                raise ValueError(f"conflicting expected labels for {test_name}")
+            mapping[test_name] = expected
     return mapping
 
 
-def _test_name_for_finding(finding: Finding) -> Optional[str]:
+def _test_name_for_finding(finding: Finding) -> str | None:
     """Locate the BenchmarkTestNNNNN this finding belongs to.
 
     Searches source then sink then intermediate steps for the first
@@ -77,7 +96,7 @@ def _test_name_for_finding(finding: Finding) -> Optional[str]:
     for step in (finding.source, finding.sink, *finding.intermediate_steps):
         m = _TESTNAME_RE.search(step.file_path)
         if m:
-            return m.group(0)
+            return m.group(1)
     return None
 
 
@@ -99,20 +118,26 @@ def _rewrite_finding_paths_and_snippets(
     """
     from dataclasses import replace
 
+
     def _fix_path(p: str) -> str:
         if p.startswith(repo_relative_prefix):
             return p
         return f"{repo_relative_prefix.rstrip('/')}/{p.lstrip('/')}"
 
-    line_cache: Dict[Path, List[str]] = {}
+    line_cache: dict[Path, list[str]] = {}
 
-    def _read_line(rel_path: str, line: int) -> Optional[str]:
-        full = repo_root / rel_path
+    def _read_line(rel_path: str, line: int) -> str | None:
+        full = confine(repo_root, rel_path)
+        if full is None:
+            return None
         if full not in line_cache:
-            try:
-                line_cache[full] = full.read_text().splitlines()
-            except OSError:
-                line_cache[full] = []
+            # Capped read: SARIF-named paths into the benchmark clone;
+            # a snippet past the cap just stays empty (no-signal).
+            got = read_text_capped(full, newline="")
+            # The capped reader retains a raw prefix when an over-cap
+            # first line has no LF. It is context, not a complete snippet.
+            complete = got is not None and (not got[1] or "\n" in got[0])
+            line_cache[full] = split_lines(got[0]) if got is not None and complete else []
         lines = line_cache[full]
         if 1 <= line <= len(lines):
             return lines[line - 1].strip()
@@ -140,20 +165,23 @@ def _rewrite_finding_paths_and_snippets(
 
 
 def _balance_subsample(
-    findings_with_labels: Sequence[Tuple[Finding, GroundTruth]],
+    findings_with_labels: Sequence[tuple[Finding, GroundTruth]],
     target: int,
     *,
     seed: int = 0,
-) -> List[Tuple[Finding, GroundTruth]]:
+) -> list[tuple[Finding, GroundTruth]]:
     """Pick target entries with TP/FP balance close to 50/50."""
-    tps = [(f, l) for f, l in findings_with_labels if l.verdict == VERDICT_TRUE_POSITIVE]
-    fps = [(f, l) for f, l in findings_with_labels if l.verdict == VERDICT_FALSE_POSITIVE]
+    tps = [(f, label) for f, label in findings_with_labels if label.verdict == VERDICT_TRUE_POSITIVE]
+    fps = [(f, label) for f, label in findings_with_labels if label.verdict == VERDICT_FALSE_POSITIVE]
     n_tp = min(len(tps), target // 2)
     n_fp = min(len(fps), target - n_tp)
     n_tp = min(len(tps), target - n_fp)
     rng = random.Random(seed)
-    chosen_tps = rng.sample(tps, n_tp) if n_tp <= len(tps) else tps
-    chosen_fps = rng.sample(fps, n_fp) if n_fp <= len(fps) else fps
+    # n_tp / n_fp are min()-clamped above, so sample() can never be
+    # asked for more than the population (the old conditional's else
+    # arms were unreachable).
+    chosen_tps = rng.sample(tps, n_tp)
+    chosen_fps = rng.sample(fps, n_fp)
     chosen = chosen_tps + chosen_fps
     chosen.sort(key=lambda x: x[0].finding_id)
     return chosen
@@ -166,19 +194,27 @@ def generate(
     repo_relative_prefix: str,
     repo_root: Path,
     target_count: int = 30,
-    cwe_filter: Optional[int] = 78,
+    cwe_filter: int | None = 78,
     seed: int = 0,
     labeler: str = "owasp-benchmark-generator",
     labeled_at: str = "2026-05-10",
-) -> List[Tuple[Finding, GroundTruth]]:
+) -> list[tuple[Finding, GroundTruth]]:
     expected = parse_expected_results(expected_results_csv)
 
-    sarif = json.loads(sarif_path.read_text())
+    try:
+        sarif = load_json(sarif_path, strict=True, max_bytes=_MAX_SARIF_BYTES)
+    except (OSError, ValueError) as e:
+        msg = f"SARIF read/parse failed: {sarif_path}: {e}"
+        raise RuntimeError(msg) from e
+    if sarif is None:
+        # Strict load_json still soft-returns None for a missing file.
+        msg = f"SARIF read/parse failed: {sarif_path}: missing file"
+        raise RuntimeError(msg)
     runs = sarif.get("runs", [])
     if not runs:
         return []
 
-    pairs: List[Tuple[Finding, GroundTruth]] = []
+    pairs: list[tuple[Finding, GroundTruth]] = []
     seen_ids: set = set()
     for run in runs:
         for result in run.get("results", []):
@@ -247,19 +283,31 @@ def generate(
     return _balance_subsample(pairs, target_count, seed=seed)
 
 
-def write_corpus(pairs: Sequence[Tuple[Finding, GroundTruth]], out_dir: Path) -> int:
+def write_corpus(pairs: Sequence[tuple[Finding, GroundTruth]], out_dir: Path) -> int:
+    """Write paired records after checking all finding identities."""
+    seen: set[str] = set()
+    for finding, label in pairs:
+        if any(char in finding.finding_id for char in ("/", "\\", ":", "\x00")):
+            raise ValueError(f"corpus finding id must be a filename component: {finding.finding_id!r}")
+        if finding.finding_id.endswith(".label"):
+            raise ValueError(f"corpus finding id uses reserved .label suffix: {finding.finding_id!r}")
+        if finding.finding_id != label.finding_id:
+            raise ValueError(f"corpus finding/label id mismatch: {finding.finding_id!r}, {label.finding_id!r}")
+        if finding.finding_id in seen:
+            raise ValueError(f"duplicate corpus finding id: {finding.finding_id!r}")
+        seen.add(finding.finding_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     for finding, label in pairs:
         (out_dir / f"{finding.finding_id}.json").write_text(
-            finding.to_json(indent=2)
+            finding.to_json(indent=2), encoding="utf-8",
         )
         (out_dir / f"{finding.finding_id}.label.json").write_text(
-            label.to_json(indent=2)
+            label.to_json(indent=2), encoding="utf-8",
         )
     return len(pairs)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sarif", type=Path, required=True)
     parser.add_argument("--expected-results", type=Path, required=True)

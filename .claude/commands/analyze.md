@@ -1,5 +1,6 @@
 ---
 description: Analyze existing SARIF findings with LLM
+dispatch: python3 raptor.py analyze
 ---
 
 # /analyze - RAPTOR LLM Analysis
@@ -7,6 +8,8 @@ description: Analyze existing SARIF findings with LLM
 Analyzes existing SARIF files with LLM (for findings from previous scans).
 
 Execute: `python3 raptor.py analyze --repo <path> --sarif <sarif-file>`
+
+**`--help` / `-h`:** If the user passes only `--help` or `-h`, run `python3 raptor.py analyze --help` and present its output. That command is side-effect-free (no run, lifecycle, output directory, or LLM dispatcher) and is the complete, authoritative flag list — do NOT start analysis or hand-summarise flags from this doc.
 
 Use when you already have SARIF findings and want LLM analysis.
 

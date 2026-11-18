@@ -5,8 +5,10 @@ to avoid duplication across diff.py, merge.py, and coverage.
 """
 
 from collections import defaultdict
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import stat
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 from core.json import load_json
 from core.logging import get_logger
@@ -14,30 +16,145 @@ from core.logging import get_logger
 logger = get_logger()
 
 
-def get_finding_id(finding: Dict[str, Any]) -> Optional[str]:
+def get_finding_id(finding: dict[str, Any]) -> str | None:
     """Extract finding ID, checking both 'id' and 'finding_id' fields."""
     return finding.get("id") or finding.get("finding_id")
 
 
-def dedup_key(finding: Dict[str, Any]) -> Tuple[str, str, int]:
-    """Dedup key for a finding: (file, function, line). More stable than ID."""
-    return (finding.get("file", ""), finding.get("function", ""), finding.get("line", 0))
+# Marker file stamped by ``/project import`` into every restored run
+# directory (and the restored project root). Run dirs carrying it came
+# from an UNSIGNED archive: their findings' statuses are
+# attacker-selectable claims, so merge folds must never let them
+# override locally-produced statuses (see core.project.merge).
+IMPORTED_RUN_MARKER_FILE = ".raptor-imported.json"
 
 
-def group_key(finding: Dict[str, Any]) -> Tuple[str, str, str]:
+def run_is_imported(run_dir: Path) -> bool:
+    """True when *run_dir* carries the ``/project import`` marker.
+
+    Best-effort read: a missing, unparseable, or falsey marker means
+    "not imported" — locally-produced runs never carry the file, and
+    an attacker gains nothing by planting a truthy one (it only
+    DEMOTES the run's standing in merges).
+    """
+    marker = Path(run_dir) / IMPORTED_RUN_MARKER_FILE
+    if not marker.is_file():
+        return False
+    # Budgeted: a legitimate marker is ~100 bytes, the run dir is
+    # child-writable, and this predicate runs per sibling in merge /
+    # report / gate loops — an oversize plant reads as "not imported"
+    # (planting one only DEMOTES a run's standing anyway).
+    data = load_json(marker, max_bytes=1024 * 1024)
+    return bool(isinstance(data, dict) and data.get("imported"))
+
+
+def safe_run_mtime(path: Path) -> float:
+    """``st_mtime`` of a run dir, or 0.0 when it has vanished.
+
+    Run dirs can disappear between enumeration and the stat — an
+    operator runs ``/project clean``, a parallel pruner unlinks an old
+    run, the dir sat on a flaky network mount. Pre-fix callers ran a
+    bare ``d.stat()`` inside a sort key and the whole correlate/report
+    pass crashed with FileNotFoundError. Treat unstattable dirs as
+    mtime 0 (they sort oldest) and log so the operator sees the
+    disappearance.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError as exc:
+        logger.warning(
+            "project: run dir %s vanished during scan (%s) — treating as oldest",
+            path.name, exc,
+        )
+        return 0.0
+
+
+def finding_file(finding: dict[str, Any]) -> str:
+    """File path for a finding, tolerant of both serialised shapes.
+
+    Scan-shaped findings carry ``file``; orchestrated /agentic results
+    carry ``file_path`` (see ``core/run/orchestrated_report_schema.py``).
+    Pre-fix ``dedup_key`` read only ``file``, so every agentic finding
+    keyed as ``("", fn, line)`` — cross-run-type disagreement detection
+    never fired, tool-gap analysis skipped agentic findings entirely,
+    and same-named functions in different files collided.
+
+    The path is lightly normalised (``./``-prefixes and redundant
+    separators collapsed) so the same relative location keys
+    identically regardless of which producer wrote it.
+    """
+    fp = finding.get("file") or finding.get("file_path") or ""
+    if not isinstance(fp, str) or not fp:
+        return ""
+    return str(PurePosixPath(fp))
+
+
+def _key_str(value: Any) -> str:
+    """Coerce a key component to str.
+
+    Finding rows are LLM-authored and import-restored — a hostile row
+    carrying a dict/list in ``function``/``vuln_type`` produced an
+    UNHASHABLE key tuple, and one such row TypeError'd every consumer
+    that indexes by key (/project findings, report, merge, diff,
+    correlate all wedge; main() does not catch TypeError). Non-str
+    scalars stringify; unhashable containers collapse to a stable
+    repr-ish string so the row still participates in dedup.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001 — a __str__ bomb must not wedge views
+        return "?"
+
+
+def _key_line(value: Any) -> int:
+    """Coerce a line component to int-or-0 (same hostile-row rationale
+    as :func:`_key_str` — a list-valued ``line`` made the tuple
+    unhashable)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def dedup_key(finding: dict[str, Any]) -> tuple[str, str, int]:
+    """Dedup key for a finding: (file, function, line). More stable than ID.
+
+    Uses :func:`finding_file` so scan-shaped (``file``) and orchestrated
+    (``file_path``) findings at the same location share a key. Every
+    component is coerced hashable — see :func:`_key_str`.
+    """
+    return (finding_file(finding), _key_str(finding.get("function", "")),
+            _key_line(finding.get("line") or 0))
+
+
+def group_key(finding: dict[str, Any]) -> tuple[str, str, str]:
     """Semantic group key: (file, function, vuln_type).
 
     Findings with the same group key are likely the same logical bug
     (e.g. TOCTOU check at line 7 and use at line 10).
+
+    Uses :func:`finding_file` for the same reason as ``dedup_key``:
+    orchestrated /agentic findings carry ``file_path``, not ``file``,
+    and keying them all under file ``""`` collapsed same-function /
+    same-type findings in DIFFERENT files into one "vuln" across
+    `/project findings`, run summaries, and merge stats.
     """
     return (
-        finding.get("file", ""),
-        finding.get("function", ""),
-        finding.get("vuln_type", ""),
+        finding_file(finding),
+        _key_str(finding.get("function", "")),
+        _key_str(finding.get("vuln_type", "")),
     )
 
 
-def group_findings(findings: List[Dict[str, Any]]) -> Dict[Tuple, List[Dict[str, Any]]]:
+def group_findings(findings: list[dict[str, Any]]) -> dict[tuple, list[dict[str, Any]]]:
     """Group findings by (file, function, vuln_type).
 
     Returns:
@@ -45,25 +162,262 @@ def group_findings(findings: List[Dict[str, Any]]) -> Dict[Tuple, List[Dict[str,
         Single-finding groups represent unique vulns.
         Multi-finding groups represent one logical vuln with multiple locations.
     """
-    groups: Dict[Tuple, List[Dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for f in findings:
         groups[group_key(f)].append(f)
     return dict(groups)
 
 
-def count_vulns(findings: List[Dict[str, Any]]) -> int:
+def count_vulns(findings: list[dict[str, Any]]) -> int:
     """Count logical vulns (semantic groups) rather than raw findings."""
     return len(group_findings(findings))
 
 
-def load_findings_from_dir(run_dir: Path) -> List[Dict[str, Any]]:
-    """Load findings list from a run directory's findings.json."""
-    data = load_json(run_dir / "findings.json")
-    if data is None:
-        logger.debug(f"No findings.json in {run_dir}")
-        return []
-    if isinstance(data, list):
-        return data
+# Byte gate applied BEFORE parsing any per-run findings file. Import
+# admits archives up to a 10 GiB aggregate extraction budget, so a
+# single restored findings.json can be enormous — and report/merge
+# generation load_json()s each run's findings wholesale into memory.
+# 64 MiB holds hundreds of thousands of findings rows; above it the
+# hostile-artifact hypothesis dominates and the file is skipped with
+# a warning rather than parsed. The import-side provenance-ref
+# rewriter (core/project/export.py) skips oversized files at the same
+# bound, so the two ends of the pipeline agree.
+MAX_FINDINGS_JSON_BYTES = 64 * 1024 * 1024
+
+
+def _load_size_gated_json(path: Path, *, strict: bool = False) -> Any | None:
+    """``load_json`` under the findings-file byte budget.
+
+    Returns ``None`` for missing files (matching ``load_json``) and
+    for files over :data:`MAX_FINDINGS_JSON_BYTES` — the skip is
+    logged at warning citing the gate so an operator investigating a
+    missing run in a report sees why. The budget is ALSO passed as
+    ``max_bytes`` — load_json re-checks it on the OPEN fd and after a
+    capped read, so a file that grows between the advisory ``stat()``
+    and the read is refused instead of buffered unbounded (the
+    previous name-based pre-gate alone left exactly that window).
+    """
+    try:
+        info = path.lstat() if strict else path.stat()
+        size = info.st_size
+    except FileNotFoundError:
+        return None
+    except OSError:
+        if strict:
+            raise
+        return None
+    if strict and not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"Cannot merge findings from non-regular file: {path}")
+    if size > MAX_FINDINGS_JSON_BYTES:
+        if strict:
+            raise ValueError(f"Cannot merge oversized findings file: {path}")
+        logger.warning(
+            "skipping %s: %d bytes exceeds the %d-byte findings-file "
+            "gate — this run's findings are EXCLUDED from every "
+            "merged project view (/project findings, report, "
+            "correlate, diff) until the file shrinks. If the file is "
+            "RAPTOR's own oversized artifact (kernel-scale runs), "
+            "inspect it directly (jq streams it) or split/trim it; "
+            "if its origin is unknown, treat it as hostile and do "
+            "not parse it wholesale.",
+            path, size, MAX_FINDINGS_JSON_BYTES,
+        )
+        return None
+    try:
+        data = load_json(path, strict=strict, max_bytes=MAX_FINDINGS_JSON_BYTES)
+    except RecursionError as exc:
+        raise ValueError(f"Findings JSON is nested too deeply: {path}") from exc
+    if strict and data is None:
+        raise ValueError(f"Cannot merge missing or null findings file: {path}")
+    return data
+
+
+def findings_from_report_context(report_context) -> list[dict[str, Any]]:
+    """Project-domain rows from a frozen capture, without reading live artifacts."""
+    rows = []
+    for finding in report_context.findings:
+        native = finding.get("native")
+        if isinstance(native, dict):
+            from copy import deepcopy
+            rows.append(deepcopy(native))
+        elif report_context.kind in {"scan", "codeql"}:
+            rows.append({"finding_id": finding.get("source_id"), "tool": finding.get("tool"),
+                         "file": finding.get("file"), "line": finding.get("line"),
+                         "vuln_type": finding.get("rule_id"), "message": finding.get("message"),
+                         "function": finding.get("function") or "", "rule_scope": finding.get("rule_scope"),
+                         "status": "unconfirmed", "suppressed": finding.get("suppressed") is True,
+                         "report_occurrence_ref": finding["occurrence_ref"],
+                         "report_snapshot_id": report_context.snapshot_id})
+    return rows
+
+
+@dataclass
+class FindingsLoadDisclosure:
+    """Additive counts from selected, decoded findings collections.
+
+    Missing/unreadable files and invalid collection shapes have no known row
+    count. Shadowed fallback artifacts contribute nothing. A caller may reuse
+    an instance across loads; normal list-returning callers need not supply it.
+    """
+    total_rows: int = 0
+    discarded_rows: int = 0
+
+
+def _finding_rows(data: Any, path: Path, *, strict: bool = False, disclosure: FindingsLoadDisclosure | None = None) -> list[dict[str, Any]]:
+    """Validate collection shape; tolerant views retain only object rows."""
     if isinstance(data, dict):
-        return data.get("findings", data.get("results", []))
-    return []
+        # An explicitly empty primary collection is authoritative.
+        if "findings" in data:
+            data = data["findings"]
+        elif "results" in data:
+            data = data["results"]
+        elif not data:
+            data = []  # Legacy empty envelopes.
+    if not isinstance(data, list):
+        message = f"Invalid findings collection in {path}: expected a list"
+        if strict:
+            raise ValueError(message)
+        logger.warning(message)
+        return []
+    rows = [row for row in data if isinstance(row, dict)]
+    if disclosure is not None:
+        disclosure.total_rows += len(data)
+        disclosure.discarded_rows += len(data) - len(rows)
+    if len(rows) != len(data):
+        message = f"Invalid findings rows in {path}: expected objects"
+        if strict:
+            raise ValueError(message)
+        logger.warning(message)
+    return rows
+
+
+def load_findings_from_dir(run_dir: Path, *, report_context=None, discover_report=True, strict: bool = False, disclosure: FindingsLoadDisclosure | None = None) -> list[dict[str, Any]]:
+    """Load findings list from a run directory's findings.json.
+
+    Standalone ``/openant`` runs write their translated findings to
+    ``openant_findings.json`` and no top-level ``findings.json``, so the
+    unified project views (findings / report / correlate / diff) never
+    saw them. Fall back to that file when ``findings.json`` is absent —
+    fallback-only, because ``/agentic`` runs write BOTH and their
+    ``findings.json`` already contains the merged OpenAnt rows (reading
+    both would double-count). The rows are already normalised to the
+    common finding shape by the translator, so they group, dedup, and
+    render through the same machinery.
+
+    Oversized files (see :data:`MAX_FINDINGS_JSON_BYTES`) are skipped
+    with a warning rather than parsed wholesale into memory. With
+    ``strict=True``, refuse unreadable, oversized or malformed artifacts
+    instead of excluding data; destructive merges must use this mode.
+    ``disclosure`` receives structured counts, including discarded non-object
+    rows, for callers that account for every input row.
+    """
+    run_dir = Path(run_dir)
+    path = run_dir / "findings.json"
+    data = _load_size_gated_json(path, strict=strict)
+    if data is None:
+        path = run_dir / "openant_findings.json"
+        data = _load_size_gated_json(path, strict=strict)
+    if data is None:
+        if not any((run_dir / name).exists() for name in ("findings.json", "openant_findings.json")):
+            manifest = run_dir / "reporting-manifest.json"
+            if strict and report_context is None and discover_report:
+                try:
+                    info = manifest.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ValueError(f"Cannot merge non-regular reporting manifest: {manifest}")
+            if report_context is None and discover_report and manifest.exists():
+                from core.reporting.writer import load_committed_report
+                try:
+                    report_context, _, _ = load_committed_report(run_dir)
+                except (OSError, ValueError, TypeError):
+                    if strict:
+                        raise
+                    logger.warning("Committed findings snapshot unavailable in %s", run_dir)
+            if report_context is not None:
+                rows = findings_from_report_context(report_context)
+                if disclosure is not None:
+                    disclosure.total_rows += len(rows)
+                return rows
+        logger.debug("No findings.json in %s", run_dir)
+        return []
+    return _finding_rows(data, path, strict=strict, disclosure=disclosure)
+
+
+def oversized_findings_files(run_dir: Path) -> list[Path]:
+    """The findings artifacts :func:`load_findings_from_dir` would skip
+    for size in *run_dir* — a stat-only preview of the byte gate.
+
+    Follows the loader's fallback chain exactly: ``findings.json``
+    first; ``openant_findings.json`` is consulted only when the primary
+    is missing or itself over the gate. A readable primary therefore
+    shadows an oversized fallback file — the loader never reads it, so
+    no gate would fire and previewing it anyway would report a
+    phantom. Size is the only axis previewed: a parse failure on an
+    under-gate primary (a different, pre-existing exclusion channel)
+    still falls back inside the loader without registering here.
+
+    Callers that recompute-and-REPLACE artifacts derived from a whole
+    project's findings (the completion-time re-adjudication sweep) use
+    this to refuse the replace when the recomputation would silently
+    exclude a run's rows.
+    """
+    out: list[Path] = []
+    for name in ("findings.json", "openant_findings.json"):
+        path = run_dir / name
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue  # missing — the loader falls through to the next name
+        if size > MAX_FINDINGS_JSON_BYTES:
+            out.append(path)
+            continue  # skipped by the gate — the next name IS consulted
+        break  # this is the file the loader reads; later names never are
+    return out
+
+
+def load_sca_findings_from_dir(run_dir: Path, *, disclosure: FindingsLoadDisclosure | None = None) -> list[dict[str, Any]]:
+    """Load SCA findings from a run's ``sca/findings.json`` subdir.
+
+    ``/sca`` and ``/agentic`` write dependency findings to
+    ``<run_dir>/sca/findings.json`` (a bare list of rows) rather than the
+    top-level ``findings.json`` that :func:`load_findings_from_dir` reads,
+    so the unified project view never saw them. The rows are already
+    normalised to the common finding shape (``id`` / ``file`` = manifest
+    path / ``function`` = package name / ``line`` / ``severity`` /
+    ``vuln_type`` = ``sca:<class>:<kind>``), so they group, dedup, and
+    render through the same machinery — they're only *discovered*
+    separately. Kept distinct from :func:`load_findings_from_dir` so
+    correlate / merge_runs / run-summary keep their code-finding scope;
+    the findings view opts in explicitly. Oversized files are skipped
+    with a warning (same gate as :func:`load_findings_from_dir`).
+    """
+    path = Path(run_dir) / "sca" / "findings.json"
+    data = _load_size_gated_json(path)
+    return [] if data is None else _finding_rows(data, path, disclosure=disclosure)
+
+
+def merge_sca_findings(run_dirs: list[Path]) -> list[dict[str, Any]]:
+    """Collect + dedup SCA findings across runs.
+
+    Dedup by stable finding id, falling back to ``dedup_key``
+    (file, function, line). ``run_dirs`` is ordered (later overrides
+    earlier), so the latest run's copy of a recurring finding wins —
+    matching :func:`core.project.merge.merge_findings` semantics for
+    code findings.
+    """
+    merged: dict[Any, dict[str, Any]] = {}
+    for run_dir in run_dirs:
+        for finding in load_sca_findings_from_dir(Path(run_dir)):
+            # SCA rows always carry a stable finding_id, so the fallback
+            # is for malformed/legacy rows only. Use group_key (includes
+            # vuln_type), NOT dedup_key (file, function, line) — every SCA
+            # row has line=0 and file=manifest, so dedup_key would collide
+            # distinct findings on the same package (a slopsquat AND a CVE
+            # on `lodash` share ("package.json","lodash",0)). group_key
+            # keeps them distinct via the sca:<class>:<kind> vuln_type.
+            key = get_finding_id(finding) or group_key(finding)
+            merged[key] = finding
+    return list(merged.values())

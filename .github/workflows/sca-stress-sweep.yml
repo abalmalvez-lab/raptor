@@ -1,0 +1,411 @@
+name: SCA stress sweep
+
+# Regression-detection sweep that scans every sample in
+# ``PROJECT_SAMPLES`` and diffs scan diagnostics (deps_analysed /
+# vuln_findings / per-finding eco breakdown / elapsed) against
+# the committed baseline at
+# ``packages/sca/data/calibration/stress_baseline.json``.
+#
+# Catches the silent-regression class of bug — the canonical
+# example was the OSV ``Cargo → crates.io`` ecosystem-name
+# mismatch that quietly zeroed every Rust CVE lookup. Validation
+# + refit metrics still passed because Cargo signal density was
+# already 0%, but the stress sweep would have flagged
+# ``alacritty-0.13 vuln_findings 6 → 0 (-100%)``.
+#
+# Runs on:
+#   - manual dispatch (workflow_dispatch) — operator triggers
+#     when investigating. The refresh-baseline input (boolean,
+#     default false) is the operator-investigated signal: after
+#     fail-level drift (rc=2) has been investigated and adjudicated
+#     as legitimate, a dispatch with refresh-baseline=true captures
+#     the new baseline and opens the same reviewable refresh PR the
+#     warn path uses — REFUSED whenever any scan errored (timeout,
+#     clone failure, driver exception), the driver itself crashed
+#     in a post-sweep phase, or the sweep is incomplete; a baseline
+#     is never captured from a broken run. Decision
+#     logic: decide_baseline_refresh in
+#     packages/sca/calibration/stress.py.
+#   - weekly cron (Monday 04:00 UTC) — catches drift from
+#     external service shifts (registry data, OSV updates). Cron
+#     runs never see the input: rc=2 stays red until an operator
+#     investigates.
+#
+# Network: hits OSV / KEV / EPSS / multiple package registries
+# / OCI registries. Per-host circuit breaker bounds 429 cascades
+# but the sweep is still ~6-10 min wallclock against fresh
+# caches.
+
+on:
+  workflow_dispatch:
+    inputs:
+      refresh-baseline:
+        description: >-
+          Operator has investigated fail-level drift and adjudicated
+          it as legitimate — capture a new baseline even at rc=2 and
+          open the refresh PR. Refused when any scan errored.
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# A new push or cron firing while a previous run is in-flight
+# supersedes it — the most-recent state is the one that matters.
+concurrency:
+  group: sca-stress-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VENV_PATH: .venv
+
+jobs:
+  sweep:
+    # Upstream maintenance only, including manual dispatch.
+    if: github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    # Base-image layer scanning joined the sweep (blob redirects +
+    # distro matching), and CI runners start cold every week — the
+    # 51-project sweep runs ~30 min wallclock, and an earlier
+    # 30-minute budget canceled a run AFTER the summary printed but
+    # before the step could exit (losing the rc output and skipping
+    # the baseline-refresh step). The end-of-sweep timeout-retry
+    # pass adds up to one per-scan budget (clone 300s + scan 600s =
+    # 15 min) per timed-out project, sequentially — a warm-cache
+    # success is ~1 min, only a retry that ALSO times out burns the
+    # full 15. Arithmetic: 30 min sweep + two full-budget failed
+    # retries (30 min) = 60 min worst case; 90 keeps headroom over
+    # that (also covering the elapsed re-measure phase's up-to-3
+    # warm re-scans, ~1 min each). More simultaneous full-budget
+    # retry failures than two means systemic registry distress —
+    # rc=2 either way, and the SIGTERM post-mortem still prints
+    # the partial summary.
+    # Trade-off both ways: lower re-risks canceling a healthy run
+    # after its summary but before the refresh step (the past
+    # incident); higher delays noticing a genuinely hung run and
+    # burns runner minutes on it.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The sweep clones and scans the PROJECT_SAMPLES corpus with a
+          # contents:write token in scope; keep that token out of
+          # .git/config so the scan path can't reach it (same hardening
+          # as refresh-sca-data.yml / sca-self-bump.yml). The refresh-PR
+          # step already authenticates via the gh credential helper
+          # (gh auth setup-git).
+          persist-credentials: false
+
+      - name: Enable the netns egress tier (unprivileged user namespaces)
+        # The SCA resolvers dry-run untrusted manifests with egress
+        # confined to the sandbox's netns tier, and the sandbox fails
+        # closed when that tier is unavailable (require_proxy_netns —
+        # the port-scoped Landlock fallback cannot enforce the hostname
+        # allowlist). Ubuntu 24.04 runner images block unprivileged
+        # user namespaces via AppArmor by default and the tier needs
+        # newuidmap/newgidmap from the uidmap package.
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+
+      # CVSS v4 scoring is a locked project extra; include it in the
+      # cached profile so installs and scoring share the project's pin.
+      - name: Restore or rebuild CVSS venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-runtime-cvss
+          uv-export-extra-args: --no-dev --extra cvss
+          save-on-rebuild: 'true'
+
+      - name: Expose runtime interpreter to subsequent steps
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
+              output.write(str(Path(os.environ["VENV_PATH"]).resolve() / "bin") + "\n")
+          PYTHON
+
+      - name: Run stress sweep
+        id: sweep
+        env:
+          _RAPTOR_TRUSTED: '1'
+          # Progress and heartbeat lines must reach the log AS THEY
+          # HAPPEN: a hard-killed run flushes nothing, and a sweep
+          # once died mid-flight leaving a block-buffered tail (and
+          # its post-mortem) unwritten.
+          PYTHONUNBUFFERED: '1'
+          # Boolean workflow_dispatch input ('true'/'false'); empty
+          # on cron/push. Passed via env, never interpolated into
+          # the script body.
+          REFRESH_BASELINE: ${{ inputs.refresh-baseline }}
+        # Drives the full sweep via run_sweep_and_report — the
+        # never-summary-less driver: per-scan failures (including
+        # endpoint distress: 429 storms, circuit-breaker fail-fast,
+        # retry exhaustion) degrade the affected project with a
+        # named reason; driver-phase failures print traceback +
+        # partial summary; SIGTERM prints in-flight scans before
+        # dying; heartbeat lines name in-flight scans for hard
+        # kills. Exit codes from diffs_to_exit_code:
+        #   0 = ok, 1 = warn (small drift), 2 = fail (large drift
+        #   or scan error).
+        # When only warns are present (rc=1), the baseline-refresh
+        # step below writes the updated baseline and opens a PR —
+        # upstream CVE churn shouldn't block the workflow.
+        # Only rc=2 (fail) is a real regression and fails the job —
+        # UNLESS this is a manual dispatch with refresh-baseline=true
+        # (the operator-investigated signal) and every fail is drift
+        # rather than a scan error: then the baseline is captured,
+        # the refresh PR is the green outcome, and the job passes.
+        # decide_baseline_refresh gates that capture — any errored
+        # scan, driver-phase crash, or incomplete sweep refuses the
+        # refresh and keeps the red behaviour.
+        # The driver imports packages.sca.* relative to the checkout
+        # root: stdin scripts (``python -``) already resolve imports
+        # from the cwd (sys.path[0] == ''), and the step runs from the
+        # workspace root — no sys.path edits (the repo bans them).
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from pathlib import Path
+          from packages.sca.calibration.project_samples import PROJECT_SAMPLES
+          from packages.sca.calibration.stress import (
+              configure_sweep_logging,
+              decide_baseline_refresh,
+              run_sweep_and_report, write_baseline,
+          )
+
+          # One console handler ([LEVEL] form) + one DEBUG file
+          # handler. Do NOT basicConfig here — RAPTOR's logging
+          # bootstrap attaches its own root console handler at first
+          # pipeline import, and a driver-installed bare handler then
+          # printed every record twice (see configure_sweep_logging).
+          configure_sweep_logging(
+              Path.home() / ".raptor/cache/sca/stress/debug.log",
+          )
+          print(f"running {len(PROJECT_SAMPLES)} samples...", flush=True)
+          baseline = Path(
+              "packages/sca/data/calibration/stress_baseline.json"
+          )
+          rendered_lines = []
+
+          def _out(line):
+              rendered_lines.append(str(line))
+              print(line, flush=True)
+
+          # Caller-owned sink: a post-sweep phase crash returns rc=2
+          # with a complete, error-free results list — only this sink
+          # tells the refresh gate that rc=2 was earned by the crash.
+          driver_failures: list[str] = []
+          rc, results = run_sweep_and_report(
+              PROJECT_SAMPLES, baseline,
+              git_clone_timeout=300,
+              sca_timeout=600,
+              max_workers=4,
+              out=_out,
+              driver_failure_sink=driver_failures,
+          )
+          rendered = "\n".join(rendered_lines)
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as f:
+                  f.write("## SCA Stress Sweep\n\n```\n")
+                  f.write(rendered)
+                  f.write("\n```\n")
+
+          # Baseline capture is gated by decide_baseline_refresh:
+          # warns only (rc=1) → write the refreshed baseline so the
+          # next step can commit it. rc=2 → NOT updated (operator
+          # must investigate) UNLESS this dispatch carries the
+          # refresh-baseline=true adjudication AND every fail is
+          # drift — any errored scan, driver-phase crash, or
+          # incomplete sweep refuses.
+          operator_refresh = (
+              os.environ.get("REFRESH_BASELINE", "") == "true"
+          )
+          decision = decide_baseline_refresh(
+              rc, results,
+              operator_refresh=operator_refresh,
+              expected_count=len(PROJECT_SAMPLES),
+              driver_failures=driver_failures,
+          )
+          if decision.allowed:
+              commit_sha = os.environ.get("GITHUB_SHA", "unknown")
+              write_baseline(results, baseline, captured_with_commit=commit_sha)
+              print(f"\nBaseline refreshed at {baseline} ({decision.reason})")
+          elif operator_refresh:
+              # The operator asked for a refresh and didn't get one —
+              # say why, in the log AND the step summary.
+              print(f"\n{decision.reason}", flush=True)
+              if summary_path:
+                  # Fenced: the reason can embed scan-error text from
+                  # untrusted repos — same treatment as the sweep table.
+                  with open(summary_path, "a") as f:
+                      f.write("\n**Baseline refresh:**\n\n```\n")
+                      f.write(decision.reason)
+                      f.write("\n```\n")
+
+          out = os.environ.get("GITHUB_OUTPUT", "")
+          if out:
+              with open(out, "a") as f:
+                  f.write(f"rc={rc}\n")
+                  if rc == 2 and decision.allowed:
+                      f.write("forced_refresh=1\n")
+
+          # rc=2 → fail the step (real regression), unless the
+          #   operator-dispatched refresh captured the baseline —
+          #   the refresh PR is then the (green) outcome
+          # rc=1 → exit 0 (warn-only drift handled by baseline PR)
+          # rc=0 → exit 0 (no drift)
+          #
+          # os._exit, not sys.exit: interpreter shutdown JOINS every
+          # still-running worker thread (timeout-abandoned scans and
+          # their OSV/enrichment pools are abandoned by design, and
+          # any leaked pool manager thread joins its processes) — a
+          # slow or wedged orphan then holds this step "running" long
+          # after the summary printed, until the job timeout reaps
+          # it. Everything durable is already on disk: the
+          # GITHUB_STEP_SUMMARY / GITHUB_OUTPUT writes above closed
+          # their files, the baseline write (when allowed) completed,
+          # and stdout/stderr are flushed here.
+          sys.stdout.flush()
+          sys.stderr.flush()
+          os._exit(2 if rc == 2 and not decision.allowed else 0)
+          PY
+
+      - name: Open baseline-refresh PR
+        # When the sweep had warn-only drift (rc=1), or an operator
+        # dispatch with refresh-baseline=true captured a baseline at
+        # fail-level drift (forced_refresh=1). Either way the refresh
+        # arrives as a reviewable PR, never a direct push.
+        if: steps.sweep.outputs.rc == '1' || steps.sweep.outputs.forced_refresh == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCED_REFRESH: ${{ steps.sweep.outputs.forced_refresh }}
+        run: |
+          set -euo pipefail
+          BASELINE="packages/sca/data/calibration/stress_baseline.json"
+          if git diff --quiet -- "$BASELINE"; then
+            echo "Baseline unchanged — nothing to commit."
+            exit 0
+          fi
+
+          BRANCH="auto/sca-stress-baseline-refresh"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
+          git checkout -B "$BRANCH"
+          git add "$BASELINE"
+          if [[ "${FORCED_REFRESH:-}" == "1" ]]; then
+            COMMIT_MSG="chore(sca): refresh stress-sweep baseline
+
+          Fail-level drift investigated and adjudicated as legitimate by
+          the operator who dispatched this run with refresh-baseline=true.
+          Auto-generated by .github/workflows/sca-stress-sweep.yml."
+          else
+            COMMIT_MSG="chore(sca): refresh stress-sweep baseline
+
+          Upstream data drift (new CVEs, registry changes) shifted
+          per-project vuln_findings counts past the warn threshold.
+          Auto-generated by .github/workflows/sca-stress-sweep.yml."
+          fi
+          git commit -m "$COMMIT_MSG"
+
+          # Replay the baseline commit onto current main before opening
+          # the PR — a branch cut from the dispatch-time checkout can be
+          # merges stale when the SCA automation runs back-to-back, and
+          # a stale base turns any file overlap into a PR merge
+          # conflict. The baseline file has this single writer, so the
+          # rebase is conflict-free; a genuine overlap fails HERE,
+          # loudly, instead of opening a conflicted PR.
+          git fetch origin main
+          git rebase origin/main
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" || true
+          fi
+          git push --force-with-lease origin "$BRANCH"
+
+          if [[ "${FORCED_REFRESH:-}" == "1" ]]; then
+            BODY=$(cat <<'EOF'
+          ## Stress-sweep baseline refresh (operator-adjudicated)
+
+          Fail-level drift was investigated and adjudicated as legitimate by
+          the operator who dispatched this run with `refresh-baseline: true`.
+          This PR updates `packages/sca/data/calibration/stress_baseline.json`
+          to accept the new counts as the expected baseline.
+
+          **Review checklist:**
+          - [ ] Diff shows only `vuln_findings` / `deps_analysed` / `eco_breakdown` changes — no structural edits
+          - [ ] The adjudication is traceable (issue / landed change that explains the fail-level drift)
+          - [ ] No scan errors were present (the sweep refuses to capture a baseline from a broken run)
+
+          Auto-generated by `.github/workflows/sca-stress-sweep.yml`.
+          EOF
+          )
+          else
+            BODY=$(cat <<'EOF'
+          ## Stress-sweep baseline refresh
+
+          Upstream data drift (new CVEs published, registry metadata changes)
+          shifted per-project diagnostics past the ±25% warn threshold. This
+          PR updates `packages/sca/data/calibration/stress_baseline.json` to
+          accept the new counts as the expected baseline.
+
+          **Review checklist:**
+          - [ ] Diff shows only `vuln_findings` / `deps_analysed` / `eco_breakdown` changes — no structural edits
+          - [ ] Changes are plausibly upstream drift (new CVEs, not zeroed-out counts)
+          - [ ] No `fail`-level drifts were present (those block the workflow and don't trigger this PR)
+
+          Auto-generated by `.github/workflows/sca-stress-sweep.yml`.
+          EOF
+          )
+          fi
+
+          pr_num=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+          if [[ -n "$pr_num" ]]; then
+            gh pr edit --repo "$GITHUB_REPOSITORY" "$pr_num" --body "$BODY"
+            echo "Updated existing PR #$pr_num"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(sca): refresh stress-sweep baseline" \
+              --body "$BODY"
+          fi
+          for lbl in automated sca; do
+            gh pr edit --repo "$GITHUB_REPOSITORY" "$BRANCH" --add-label "$lbl" 2>/dev/null \
+              || echo "label '$lbl' not in repo; skipping"
+          done
+
+      - name: Upload sweep artefacts
+        # Always run — failed sweeps + drift reports are exactly
+        # what operators want to inspect. The scan output dirs
+        # live under the stress-clones cache root and are too big
+        # for an artefact; just the per-sample summary table goes.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: sca-stress-sweep-${{ github.run_id }}
+          path: |
+            ~/.raptor/cache/sca/stress/clones/*/out/findings.json
+            ~/.raptor/cache/sca/stress/clones/*/out/report.md
+          retention-days: 14
+          if-no-files-found: warn

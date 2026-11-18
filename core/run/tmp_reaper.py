@@ -1,0 +1,1487 @@
+"""Reap stale RAPTOR temp artifacts orphaned by killed runs.
+
+Several long-lived runtime components park small artifacts in the system
+temp dir and clean them up on exit:
+
+  - ``raptor-llm-<run_id>-*/``  — LLM dispatcher socket dir
+    (:mod:`core.llm.dispatcher.server`; ``shutdown()`` + ``atexit``)
+  - ``raptor-cc-cwd-*/``        — neutral cwd for ``claude -p`` dispatch
+    (:mod:`core.llm.cc_adapter`; ``atexit``)
+  - ``raptor-joern-ws-*/``      — disposable Joern server workspace
+    (:mod:`packages.joern.server`; removed on ``stop()``)
+  - ``raptor-calibrate-*/``     — sandbox calibration scratch
+    (:mod:`core.sandbox.calibrate`; ``TemporaryDirectory``)
+  - ``raptor_auto_*/``          — automated-scan clone scratch
+    (``packages/static-analysis/scanner.py``; rmtree in ``finally``)
+  - ``raptor_git_*/``           — agentic git clone scratch
+    (``raptor_agentic.py``; rmtree + its own stale sweep)
+  - ``raptor_decomp_*/``        — r2 decompilation scratch
+    (:mod:`core.audit.orchestrator`; rmtree in ``finally``)
+  - ``audit_sweep_*.yaml``      — per-hypothesis Semgrep rule files
+    (:mod:`core.audit.hypothesis_mapping`; unlinked in the sweep's
+    ``finally``)
+  - ``raptor-audit-cfg-*.json`` — sandbox audit-config tempfiles
+    (:mod:`core.sandbox._spawn`; unlinked in lifecycle + own sweep)
+  - ``raptor-cocci-tmp-*/`` and ``raptor-cocci-*.cocci`` — spatch
+    scratch dir and harnessed rule files
+    (``packages/coccinelle/runner.py``; cleaned in its finally)
+  - ``cocci-output-*`` / ``cocci_small_output-*`` — spatch's own
+    per-file working copies, stranded when spatch is killed
+  - ``wrapped-script*.sc``      — written by the Joern JVM launcher
+    itself next to our workspace dirs
+
+All of those cleanups are exit-path-only: SIGKILL, OOM, and unhandled
+SIGTERM (Python does not run ``atexit`` hooks on SIGTERM) skip them, so
+every hard-killed run leaks its set. This module sweeps such orphans at
+the start of the next run.
+
+Kept ``raptor-observe-*`` dirs are deliberately NOT reaped: the operator
+passed ``--keep`` to preserve them for re-inspection. Disposable observations
+use the distinct ``raptor-observe-tmp-`` prefix and are swept after crashes;
+explicit ``--out`` paths are caller-owned and never registered.
+
+Safety posture (world-writable /tmp on a shared box):
+
+  - Only entries directly under a sweep root — :func:`tempfile.gettempdir`,
+    the real system tmp root (under the launcher gettempdir() is the
+    per-session TMPDIR, so root-level strays from bare-shell runs were
+    otherwise invisible forever), and the lane-socket fallback base
+    ``/run/user/<uid>`` (lane dirs only) — whose name
+    matches a known RAPTOR prefix, an anchored third-party tool name
+    that only RAPTOR's own tool runs strand here
+    (``_ANCHORED_DIR_PREFIXES``), or a neutral de-branded scratch name
+    anchored to its exact mkdtemp suffix
+    (``_MKDTEMP_ANCHORED_DIR_PREFIXES``) are considered.
+  - ``lstat`` only — a symlink planted at a matching name is never
+    followed, and anything not owned by the current euid is skipped.
+  - Entries younger than the age floor are skipped, so a concurrent
+    run's live artifacts survive even if the liveness probes miss.
+  - Dirs that any live process uses as its cwd, or that contain a unix
+    socket something still answers on, are skipped regardless of age.
+  - Removal is best-effort; errors never propagate to the caller.
+
+Set ``RAPTOR_TMP_REAP_MAX_AGE_H=0`` to disable the sweep, or to another
+number of hours to move the age floor (default 24; floors below two
+scratch-keepalive ticks clamp to 30 min — see ``_max_age_seconds``).
+"""
+
+from __future__ import annotations
+
+from contextlib import closing
+import errno
+import logging
+import math
+import os
+import socket
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+from core.atomic_fs import rmtree_hardened
+
+logger = logging.getLogger(__name__)
+
+# Dir prefixes whose creators ALWAYS intend cleanup — presence past the
+# age floor means the owning process died without its exit path.
+_DIR_PREFIXES = (
+    # Disposable observe CLI output; scratch_dir holds a keepalive until
+    # its ExitStack exits. --keep uses a separate, unreaped namespace.
+    "raptor-observe-tmp-",
+    # Disposable orchestration inventories, protected by scratch keepalive.
+    "raptor-orchestration-inventory-",
+    # Private offline CodeQL kit preparation/import scratch.
+    "raptor-codeql-offline-",
+    "raptor-codeql-import-",
+    # Corpus receipt-replay temporary target/output trees.
+    "receipt-replay-",
+    "raptor-web-browser-",
+    "raptor-rr-replay-",
+    "raptor-rr-verify-",
+    # Native installation-namespace probe; TemporaryDirectory normally
+    # removes it, but SIGKILL/OOM can strand the probe's scratch tree.
+    "raptor-native-ns-probe-",
+    "raptor-llm-",
+    "raptor-cc-cwd-",
+    "raptor-joern-ws-",
+    "raptor-calibrate-",
+    "raptor_auto_",
+    # Package-metadata parsers use protected, whole-workspace scratch.
+    "raptor-rpm-",
+    # Shared scratch owners formerly missed by the native-tempfile census.
+    # The prompt cache renews its pin until process-owned teardown.
+    "binoracle_prov_",
+    "codeql_resolve_",
+    "cc-sysprompt-",
+    "raptor_git_",
+    "raptor_decomp_",
+    # Per-invocation spatch scratch (packages/coccinelle/runner.py);
+    # rmtree'd in the runner's finally, so survival past the floor
+    # means the whole RAPTOR process died mid-sweep.
+    "raptor-cocci-tmp-",
+    # Barrier-synthesis scratch (core/dataflow/barrier_synth.py);
+    # rmtree'd in the CLI's finally when auto-created.
+    "trust-synth-work-",
+    # IRIS per-refinement CodeQL pack scratch (core/iris/codeql_runner.py);
+    # rmtree'd in the runner's finally.
+    "raptor-iris-codeql-",
+    # Offline Semgrep cache-check scratch; TemporaryDirectory cleans it
+    # on normal exit, while killed checks leave it for the reaper.
+    "raptor-semgrep-check-",
+    # Line-checker build scratch (packages/binary_analysis/
+    # blamed_lines.py TemporaryDirectory); cleaned on exit, leaked on
+    # SIGKILL/OOM.
+    "raptor-line-checker-",
+    # Historical recon-agent clone scratch (the deprecated
+    # packages/recon agent, since removed, used this prefix). Kept so
+    # the sweep still reclaims leftovers written by older installs.
+    "raptor_recon_",
+    # CPython multiprocessing's own resource dir — leaks when a process
+    # (e.g. a sandboxed child we SIGKILL) dies without cleanup.
+    "pymp-",
+    # Joern CPG build scratch (packages/joern/runner.py mkdtemp);
+    # rmtree'd on the runner's exit path, so hard-killed Joern builds
+    # leak one per invocation — observed accumulating by the hundreds.
+    "raptor-joern-cpg-",
+    # Private one-shot query graphs/workspaces, kept alive until the
+    # query runner releases them; reclaim copies stranded by SIGKILL.
+    "raptor-query-",
+    # cve-diff working dirs (packages/cve_diff cli TemporaryDirectory
+    # and the bench harness's cve-diff-bench- mkdtemp — both match
+    # this prefix); cleaned on exit, leaked on SIGKILL/OOM.
+    "cve-diff-",
+    # Ghidra working copies: session/headless scratch (rmtree'd in
+    # their finally blocks) and the persistent server's work dir
+    # (removed on stop(); survives when the parent dies or a worker
+    # hangs past the join grace).
+    "raptor-ghidra-",
+    # eBPF ISA-probe object-build scratch (packages/ghidra/
+    # ebpf_probe.py TemporaryDirectory); cleaned up in the probe's
+    # finally, so survival past the floor means the process died
+    # mid-probe (SIGKILL/OOM skip the cleanup).
+    "raptor-ebpf-probe-",
+    # eBPF TLV cross-check decode scratch (packages/binary_analysis/
+    # corpus_profile.py TemporaryDirectory); cleaned by the context
+    # manager on exit, so survival past the floor means the process
+    # died mid-decode (SIGKILL/OOM skip the cleanup).
+    "raptor-ebpf-xcheck-",
+    # Per-session pytest temp containment (root conftest.py): the test
+    # session points TMPDIR/tempfile.tempdir at one scratch dir so raw
+    # tempfile call sites in tests and code under test land inside it.
+    # Removed on normal session exit; a killed test session leaks one
+    # dir per pytest process (one per xdist worker), reclaimed here by
+    # any later process's sweep.
+    "raptor-pytest-",
+    # Coordinator-isolation probe output dirs (core/sandbox/tests/
+    # test_coordinator_isolation.py): removed via atexit, but the first
+    # ones are minted at collection time — before the conftest TMPDIR
+    # containment exists — so a killed collection/run leaks them
+    # directly under the system tmp (one per collecting worker).
+    "raptor-coord-isolation-",
+    # r2 analysis scratch (packages/binary_analysis/
+    # radare2_understand.py, via core.run.scratch); removed when the
+    # analysis exits.
+    "r2-sandbox-",
+    # Cocci-hunt sandbox scratch (packages/code_understanding/dispatch/
+    # hunt_cocci_dispatch.py, via core.run.scratch); removed when the
+    # dispatch exits.
+    "raptor-cocci-hunt-",
+    # Binary-oracle env-build artifact dir (core/analysis/
+    # binary_oracle_cli.py); the artifacts outlive the resolve call and
+    # are rmtree'd atexit, which SIGKILL skips.
+    "raptor-oracle-envbuild-",
+    # Binary-oracle c++filt demangle scratch (core/analysis/
+    # binary_oracle.py TemporaryDirectory); context-managed, so
+    # survival past the floor means the process died mid-batch
+    # (SIGKILL/OOM skip __exit__).
+    "raptor-bo-demangle-",
+    "raptor-bininspect-",
+    "raptor-elf-facts-",
+    "raptor-smt-child-",
+    # Corpus excerpt trees (core/audit/corpus/run_corpus.py); ownership
+    # passes to the corpus loop, released in its finally. The owner
+    # holds a scratch keepalive while live (excerpt trees are written
+    # once, then read for multi-day runs — quiet mtime is normal), so
+    # presence past the floor always means a dead owner.
+    "corpus-excerpt-",
+    # Compose staging copies (core/container/compose.py); ownership
+    # passes to the caller, cleanup_staging() after down_stack. The
+    # owner holds a scratch keepalive while the stack runs (bind-mount
+    # sources don't refresh the top-level mtime).
+    "raptor-compose-",
+    # Env-provisioner work dirs (core/env/provision.py; removed at
+    # Environment.teardown / provision failure). The owner holds a
+    # scratch keepalive while the environment is live (a sandbox
+    # rootfs's mtime froze at export). The startswith match also
+    # covers core/env/build.py's raptor-env-build- staging contexts —
+    # same always-cleaned contract, context-manager lifetime.
+    "raptor-env-",
+    # Consented-exec staging copies of 0444 run-dir artifacts
+    # (core/sandbox/exec_stage.py; context-manager lifetime). Normally
+    # placed under exec_workdir()'s session dir; this entry covers the
+    # default-temp-dir fallback — a SIGKILLed run must never strand a
+    # mode-0o500 copy of an attacker-built binary in the system tmp.
+    "raptor-exec-stage-",
+    # cve-env source-checkout work dirs (packages/cve_env
+    # tools/source_build.py; cleanup()-scoped). retain() hands
+    # ownership to the operator — a retained dir surviving past the
+    # age floor is forgotten debug output, reclaimed like
+    # raptor_recon_ above.
+    "cve-env-source-",
+    # cve-env fused-build docker contexts (packages/cve_env
+    # agent/tools.py; rmtree'd on build failure, kept for the agent
+    # session on success — kept contexts have no exit-path cleanup at
+    # all and are reclaimed only by this sweep past the age floor).
+    "cve-env-dfgbuild-",
+    # Joern compat-matrix scratch (packages/joern/scripts/
+    # compat_matrix.py): per-version fixture/CPG dirs (via
+    # core.run.scratch) and the auto-created download workdir
+    # (rmtree'd unless --keep; --keep survivors past the floor are
+    # forgotten debug output, same contract as raptor_recon_).
+    "joern-matrix-",
+    # SCA stress-run ephemeral clone root (packages/sca/calibration/
+    # stress.py, RAPTOR_SCA_STRESS_EPHEMERAL=1 mode; rmtree'd in its
+    # finally).
+    "raptor-sca-stress-",
+    # Egress-proxy lane socket dirs (core/sandbox/proxy.py
+    # make_lane_dir; caller-owned rmtree with atexit + SIGTERM hooks,
+    # so only SIGKILL strands one). A live lane's socket still answers
+    # and the in-use probe below keeps it out of the sweep. Lanes
+    # minted under make_lane_dir's short-path fallback bases
+    # (/run/user/<uid>, /tmp when the ambient temp dir is deep) are
+    # swept too, under the same guards — the fallback bases are extra
+    # sweep roots (see _sweep_roots; the /run/user base is lane-only).
+    ".raptor-lane-",
+    # Sandbox root stubs (core/sandbox/_spawn mkdtemp and the mount-ns
+    # pid-named fallback); removed post-exit by _cleanup_stub, leaked
+    # when the orchestrator itself is killed first. A child that
+    # legitimately outlives the age floor (a multi-day fuzz campaign)
+    # is NOT protected by the probes — a pivoted child's host-visible
+    # cwd is "/", not the stub — and its stub WILL be reaped. That is
+    # benign by construction, not by the floor: host-side the stub is
+    # an empty dentry (the mount tree lives in the child's namespace,
+    # which keeps its own references; rmtree lazy-detaches without
+    # disturbing the child), and _cleanup_stub tolerates the dir
+    # already being gone.
+    ".raptor-sbx-",
+    # Landlock-only restricted-posture private scratch
+    # (core/sandbox/context.py); rmtree'd at context teardown. A live
+    # context holds a keepalive registration (core.run.scratch) for
+    # exactly the reaper's sake: a sandboxed campaign can sit
+    # mtime-quiet past the floor while its TMPDIR still points here.
+    # Legacy branded name — fresh mints use the neutral .scr- prefix
+    # in _MKDTEMP_ANCHORED_DIR_PREFIXES below.
+    ".raptor-scratch-",
+    # Persona home tmpdirs (core/sandbox/context.py); rmtree'd at
+    # context teardown. Legacy branded name — fresh mints use the
+    # neutral .fp- prefix below.
+    "raptor-persona-",
+    # Test scratch from core/sandbox/tests/test_spawn_lifecycle_
+    # hardening.py (addCleanup'd there now, but strays from
+    # non-contained historical runs persist) — same test-only
+    # contract as raptor-coord-isolation- above.
+    "raptor-pdsig-",
+    "raptor-hifd-",
+    # --- Derivation-swept production scratch (one block) -----------
+    # Every prefix below was found by the mechanical mkdtemp /
+    # TemporaryDirectory sweep over production call sites (the census
+    # test derives the same set and asserts coverage — a NEW
+    # uncovered prefix fails there instead of stranding scratch
+    # forever). All are cleaned on exit paths only (finally blocks,
+    # context-manager __exit__, GC): SIGKILL and OOM skip every exit
+    # path, so cross-process reclamation needs the static entry. The
+    # age floor plus the in-use probes keep live dirs safe; each name
+    # is distinctly tool-scoped, so the prefix match cannot claim an
+    # operator's own files.
+    "audit-codeql-",
+    "binmatch-precision-",
+    "codeql-sweep-",
+    "codeql-warmup-",
+    "ghsa-resolve-",
+    "hv_sandbox_",
+    "raptor-bo-edges-",
+    "raptor-bo-stream-",
+    "raptor-bq-",
+    "raptor-describe-",
+    "raptor-doctor-probe-",
+    "raptor-feas-seccomp-",
+    "raptor-feas-loader-",
+    "raptor-feas-parser-",
+    "raptor-gcov-",
+    "raptor-joern-uds-",
+    "raptor-ls-remote-",
+    "expanded_semgrep_",
+    "raptor-afl-probe-",
+    "raptor-fuzz-probe-",
+    "raptor-toolprobe-",
+    "raptor-resolver-home-",
+    "raptor-rootfs-export-",
+    "raptor-rootfs-extract-",
+    "raptor-sca-",
+    "raptor-symex-",
+    "raptor_cc_probe_",
+    "raptor_dc_",
+    "raptor_fm_",
+    "raptor_gt_",
+    "raptor_pg_",
+    "raptor_selftest_",
+    "raptor_study_probe_",
+    "recall-sarif-chunks-",
+    "sanitizer-cut-precision-",
+    "semgrep-sbx-",
+    "source_intel_rules_",
+)
+
+# Third-party scratch names carry no RAPTOR marker and end in a bare
+# word, so a plain prefix match would also claim an operator's own
+# same-named files (a scala-repl-pp source checkout, a
+# semmleTempDir.bak someone parked). These match only when the
+# remainder after the prefix is exactly the creating tool's random
+# decimal/hex suffix.
+_ANCHORED_DIR_PREFIXES = (
+    # CodeQL CLI's own scratch dirs, stranded when a codeql child is
+    # killed — same third-party contract as spatch's cocci-output-
+    # entries in _FILE_PATTERNS.
+    "semmleTempDir",
+    "codeql-packaging",
+    # Joern's script-wrapping scratch (a nested JVM ignores the
+    # launcher's java.io.tmpdir argv flag), stranded by every
+    # timeout-killed `joern --script` query — the dir sibling of the
+    # wrapped-script*.sc entry in _FILE_PATTERNS.
+    "scala-repl-pp",
+)
+
+# Neutral child-visible scratch names, de-branded so the target
+# cannot fingerprint the framework from its TMPDIR: the Landlock-only
+# private scratch (.scr-) and the persona home (.fp-), both minted by
+# core/sandbox/context.py, rmtree'd at context teardown, and
+# keepalive-registered while their context lives. Too short to claim
+# on prefix alone — an operator's ".scr-notes" must survive — so
+# these match only when the remainder is exactly a tempfile random
+# suffix.
+_MKDTEMP_ANCHORED_DIR_PREFIXES = (
+    ".scr-",
+    ".fp-",
+)
+
+# tempfile's random names draw eight characters from
+# lowercase+digits+underscore.
+_MKDTEMP_SUFFIX_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789_")
+_MKDTEMP_SUFFIX_LEN = 8
+
+
+def _mkdtemp_anchored_match(name: str, prefix: str) -> bool:
+    """True when *name* is *prefix* + one exact tempfile random suffix."""
+    rest = name[len(prefix):]
+    return (name.startswith(prefix)
+            and len(rest) == _MKDTEMP_SUFFIX_LEN
+            and all(c in _MKDTEMP_SUFFIX_CHARS for c in rest))
+
+
+_TOOL_RANDOM_CHARS = frozenset("0123456789abcdef")
+
+
+def _anchored_name_match(name: str, prefix: str, suffix: str = "") -> bool:
+    """True when *name* is *prefix* + tool-random hex/decimal + *suffix*.
+
+    The middle must be at least 4 characters: every creating tool
+    appends a long random number, and the floor keeps short
+    operator-made names (a "scala-repl-pp2" copy) out of reach.
+    """
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return False
+    middle = (name[len(prefix):len(name) - len(suffix)] if suffix
+              else name[len(prefix):])
+    return (len(middle) >= 4
+            and all(c in _TOOL_RANDOM_CHARS for c in middle))
+
+# Prefixes registered at runtime by core.run.scratch.scratch_dir for
+# system-tmp scratch areas. Per-process: a registration made here is
+# visible to every later sweep in the SAME process (a long-lived
+# orchestrator reaping strays from an earlier crashed run), but not to
+# unrelated processes — cross-process reaping still requires a static
+# _DIR_PREFIXES entry above.
+_RUNTIME_DIR_PREFIXES: set[str] = set()
+
+
+def register_dir_prefix(prefix: str) -> None:
+    """Register *prefix* for the stale-tmp dir sweep (this process)."""
+    if prefix:
+        _RUNTIME_DIR_PREFIXES.add(prefix)
+
+
+def _dir_prefixes() -> tuple[str, ...]:
+    return _DIR_PREFIXES + tuple(_RUNTIME_DIR_PREFIXES)
+
+
+# File patterns with the same always-cleaned contract.
+_FILE_PATTERNS = (
+    ("audit_sweep_", ".yaml"),
+    ("raptor-audit-cfg-", ".json"),
+    ("raptor-cocci-", ".cocci"),
+    ("wrapped-script", ".sc"),
+    # spatch's own per-file working copies. Normally confined to the
+    # private scratch dir above; these top-level patterns catch strays
+    # from spatch invocations that predate the scoped TMPDIR (or any
+    # tool invoking spatch without one). Empty suffix = prefix match.
+    ("cocci-output-", ""),
+    ("cocci_small_output-", ""),
+)
+
+# Same anchored contract as _ANCHORED_DIR_PREFIXES, for files:
+# joern-parse's frontend output-capture tempfiles (x2cpg<random>stdout
+# / stderr), stranded when the parse driver is killed mid-frontend.
+# RAPTOR's own parses now confine the driver's tmpdir to the build
+# output dir, so these catch strays predating that and non-RAPTOR
+# joern invocations.
+_ANCHORED_FILE_PATTERNS = (
+    ("x2cpg", "stdout"),
+    ("x2cpg", "stderr"),
+)
+
+# Pid-owned sidecar files. The root conftest points every pytest
+# process's default scorecard ledger at
+# ``raptor-pytest-scorecard-<pid>.json`` (plus its ``.lock`` flock
+# sibling) so test-minted cells never reach production telemetry.
+# Those names start with the ``raptor-pytest-`` DIR prefix above, so
+# the classifier routed them into dir candidates, where the S_ISDIR
+# squat guard skipped them every sweep — they accreted unbounded (one
+# pair per pytest process). The embedded pid is the liveness contract
+# (the reap_dead_pid_dirs precedent): a dead owner's pair is garbage
+# regardless of age, and a LIVE owner's lock sibling must never be
+# unlinked — a second process could then create and "hold" a fresh
+# lock file beside the live holder's flock. Non-pid spellings under
+# the prefix keep the dir-branch squat semantics.
+_PID_FILE_PATTERNS = (
+    ("raptor-pytest-scorecard-", ".json"),
+    ("raptor-pytest-scorecard-", ".json.lock"),
+)
+
+
+def _pid_file_match(name: str, prefix: str, suffix: str) -> int | None:
+    """The embedded pid when *name* is ``<prefix><digits><suffix>``
+    exactly; None otherwise."""
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return None
+    digits = name[len(prefix):len(name) - len(suffix)]
+    if not digits or not digits.isascii() or not digits.isdigit():
+        return None
+    return int(digits)
+
+
+# --------------------------------------------------------------------
+# Pid-liveness doctrine: namespaces and age floors
+# --------------------------------------------------------------------
+#
+# ``os.kill(pid, 0)`` verdicts are only meaningful about pids in the
+# CALLER'S pid namespace and only within one pid-reuse epoch. Inside a
+# child pid namespace every other session's live pid probes ESRCH
+# ("invisible from here", not "dead"), and even in the root namespace
+# a name-embedded pid may have been minted inside another namespace
+# (where it meant a different process) or already recycled. Every
+# liveness-based deletion below is therefore double-gated: refuse
+# entirely outside the root namespace, and never let ESRCH alone reap
+# a YOUNG entry — the mtime age floor is the backstop.
+
+# Fixed inode of the initial pid namespace's nsfs entry
+# (PROC_PID_INIT_INO in include/linux/proc_ns.h; ABI-stable since
+# namespace proc inodes were introduced).
+_PROC_PID_INIT_INO = 0xEFFFFFFC
+
+
+def _in_child_pid_ns() -> bool:
+    """True when this process runs in a non-initial pid namespace —
+    where kill(2) verdicts about other sessions' pids are meaningless.
+
+    Two unprivileged probes, either one sufficing to refuse:
+
+    - the ``/proc/self/ns/pid`` nsfs inode versus the kernel's fixed
+      initial-namespace inode. This works even under ``--mount-proc``,
+      where the remounted ``/proc`` hides every outer namespace (and
+      makes the NSpid line below single-entry). In every coherent
+      ``/proc`` shape — host-mounted or remounted — this primary
+      answers first and the NSpid leg below never decides.
+    - the NSpid entry count in ``/proc/self/status``: more than one
+      entry proves nesting below the namespace that mounted this
+      ``/proc``. Belt-and-braces for INCOHERENT ``/proc`` shapes
+      only: a ``/proc/self/ns/pid`` masked or bind-mounted from an
+      outer namespace (container runtimes overmounting proc entries)
+      while ``status`` still reflects nesting. Deliberately kept
+      although no test exercises it — it is dead code wherever
+      ``/proc`` is self-consistent — because a hit here can only ADD
+      a refusal (the fail-safe direction), never suppress one.
+
+    Non-Linux platforms have no pid namespaces, so the probe reads
+    False there (verdicts are always in-namespace). On Linux, probe
+    ERRORS read True — a ``/proc`` too broken to answer is not a
+    ``/proc`` to base deletions on (fail toward keeping).
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        if os.stat("/proc/self/ns/pid").st_ino != _PROC_PID_INIT_INO:
+            return True
+        with open("/proc/self/status", "rb") as fh:
+            for line in fh:
+                if line.startswith(b"NSpid:"):
+                    return len(line.split()) > 2
+        return False
+    except OSError:
+        return True
+
+
+# Age floor for pid-liveness dir reaping (reap_dead_pid_dirs): a dir
+# younger than this is NEVER reaped, whatever the liveness verdict.
+# A live session's scratch is always recently touched (core.run.scratch
+# keepalive-refreshes owned dirs' mtimes at most one interval apart),
+# so a young dir is presumed to belong to a live concurrent session
+# whose pid this process simply cannot judge. Churn-prone limit — both
+# directions:
+#   - LOWERED, ESRCH edges back toward being sufficient on its own: a
+#     concurrent session whose pid is invisible from here (nested
+#     containers, namespaced batteries) or already recycled loses LIVE
+#     scratch mid-run — the exact collateral this floor exists to
+#     stop. It must never drop below two keepalive ticks
+#     (2 * core.run.scratch._KEEPALIVE_INTERVAL_S) or a live
+#     keepalive'd dir could age past it between refreshes.
+#   - RAISED, killed sessions' scratch survives that much longer, and
+#     the leak this sweep exists for (one killed session's
+#     multi-million-inode build tree exhausted /tmp's inode table)
+#     gets that much more time to starve the filesystem. Hours, not
+#     days: past ~4h this sweep stops adding value over the 24h
+#     stale-tmp age gate.
+# The two-direction regression test pins both bounds.
+_PID_DIR_AGE_FLOOR_S: float = 3600.0
+
+# Age floor for UNVERIFIABLE owners — pid 1 (init in every namespace:
+# a probe against it is meaningless, and no kill() call with pid <= 1
+# is ever made) and EPERM verdicts (some process holds the pid under
+# another uid: the same-euid owner either exited and the pid was
+# recycled, or minted the name inside another namespace). Age-governed
+# instead of kept forever. Both directions:
+#   - LOWERED toward the dead floor, a quiet-but-live keepalive-less
+#     dir whose in-namespace pid collides with another uid's host
+#     process gets a shrinking survival margin; 24h matches the
+#     stale-tmp sweep's default floor, which the same dirs were
+#     already subject to.
+#   - RAISED, namespace-minted ``raptor-pytest-1-*`` roots (in-ns
+#     pid 1) accrete for that much longer — the observed pileup this
+#     floor exists to clear ran to hundreds of dirs.
+_UNVERIFIABLE_PID_DIR_AGE_FLOOR_S: float = 24 * 3600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    """Conservative liveness for the pid-file contract: only a
+    confirmed-dead pid reads False. EPERM means alive under another
+    uid; any other surprise reads alive. Pid reuse at worst delays a
+    reap — the safe direction. OverflowError is in the net because
+    ``os.kill`` raises it (not OSError) for out-of-range pids — a
+    single poison-named file must read "alive" (kept, skipped), never
+    abort the sweep for every entry after it.
+
+    Namespace honesty: inside a child pid namespace every outer
+    session's pid probes ESRCH ("invisible from here", not "dead"),
+    so everything reads alive there — a dead owner's pair is
+    reclaimed by the next root-namespace sweep instead. pid 1 is init
+    in EVERY namespace: it reads alive without probing (no kill()
+    call is ever made with pid <= 1)."""
+    if pid <= 1:
+        return True
+    if _in_child_pid_ns():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, OverflowError):
+        return True
+    return True
+
+
+_MAX_AGE_ENV = "RAPTOR_TMP_REAP_MAX_AGE_H"
+_DEFAULT_MAX_AGE_H = 24.0
+
+# Per-process JSONL audit logs under RaptorConfig.LOG_DIR. One file per
+# process and no rotation, so test suites alone mint hundreds per day.
+# OPT-IN, unlike the tmp sweep: logs are audit data with forensic value,
+# and deleting audit data must be an operator decision, not a default.
+_LOG_MAX_AGE_ENV = "RAPTOR_LOG_REAP_MAX_AGE_D"
+
+# Failed/cancelled run dirs (reap_stale_runs). Completed runs are
+# results and are never age-reaped.
+_RUN_MAX_AGE_ENV = "RAPTOR_RUN_REAP_MAX_AGE_D"
+_DEFAULT_RUN_AGE_D = 30.0
+
+# Mirrors core.run.metadata.RUN_METADATA_FILE — literal here to keep
+# this module import-light (metadata imports US at start_run time).
+_RUN_METADATA_FILE = ".raptor-run.json"
+
+# Real run metadata is a few hundred bytes; 1 MiB is generous
+# headroom while keeping a planted oversize file unread.
+_RUN_METADATA_MAX_BYTES = 1 << 20
+
+
+def _max_age_seconds() -> float | None:
+    """Age floor in seconds, or None when the sweep is disabled."""
+    raw = os.environ.get(_MAX_AGE_ENV, "")
+    if raw:
+        try:
+            hours = float(raw)
+            if not math.isfinite(hours) or (
+                    hours > 0 and not math.isfinite(hours * 3600.0)):
+                raise ValueError("non-finite temp retention")
+        except ValueError:
+            logger.debug("ignoring non-numeric %s=%r", _MAX_AGE_ENV, raw)
+            hours = _DEFAULT_MAX_AGE_H
+    else:
+        hours = _DEFAULT_MAX_AGE_H
+    if hours <= 0:
+        return None
+    floor_s = hours * 3600.0
+    # A floor below two keepalive ticks could reap a LIVE registered
+    # scratch dir between refreshes (core.run.scratch keeps owned
+    # dirs at most one interval stale). Clamp loudly rather than
+    # honour a data-loss window.
+    from core.run.scratch import _KEEPALIVE_INTERVAL_S
+    min_floor = 2 * _KEEPALIVE_INTERVAL_S
+    if floor_s < min_floor:
+        logger.warning(
+            "%s=%g sets a %ds age floor below the scratch-keepalive "
+            "safety minimum; clamping to %ds",
+            _MAX_AGE_ENV, hours, int(floor_s), int(min_floor),
+        )
+        return min_floor
+    return floor_s
+
+
+def _live_cwds() -> set[str] | None:
+    """Working directories of every process this user can inspect."""
+    cwds: set[str] = set()
+    if sys.platform == "darwin":
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/lsof", "-a", "-u", str(os.geteuid()), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5, cwd="/",
+                env={"PATH": "/usr/bin:/bin:/usr/sbin", "LC_ALL": "C"},
+            )
+            if result.returncode != 0 or result.stderr.strip():
+                return None  # lsof warnings can mean a partial process census.
+            return {os.path.realpath(line[1:]) for line in result.stdout.splitlines()
+                    if line.startswith("n/")} or None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            cwds.add(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            continue
+    return cwds or None
+
+
+def _socket_answers(sock_path: Path) -> bool:
+    """True when something still accepts connections on *sock_path*."""
+    from core.source.streams import preserving_stream_error
+    with preserving_stream_error(closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))) as stream:
+        try:
+            stream.settimeout(0.2)
+            stream.connect(str(sock_path))
+            return True
+        except OSError as exc:
+            # A refused/missing endpoint is dead; ambiguous errors retain it.
+            return exc.errno not in (errno.ECONNREFUSED, errno.ENOENT)
+
+
+# Bounded deep-scan budget for the internal-activity probe. Hitting the
+# cap reads as "in use" — an unjudgeable dir is kept, and since the cap
+# fires on every sweep, a dead dir with more entries than the budget is
+# NEVER reaped by this sweep (deliberate fail-toward-keeping: giant
+# strays are the operator's call, not an automated sweep's).
+_DEEP_SCAN_MAX_ENTRIES = 4096
+
+
+def _recent_activity(path: Path, now: float, max_age: float) -> bool:
+    """Retain recent or unjudgeable activity under a bounded, lazy scan.
+
+    Consume at most one entry beyond the metadata budget, never a whole
+    directory listing before checking it. Do not descend into symlink entries;
+    revalidate directory identities around each scan. Pending directory state
+    is bounded by the same budget, and each iterator closes before descent.
+    Errors, changed identities and exhausted budgets retain the tree.
+    """
+    from core.source.streams import preserving_stream_error
+    seen = 0
+    path = Path(path)
+    try:
+        initial = os.lstat(path)
+        if not stat.S_ISDIR(initial.st_mode) or not initial.st_ino:
+            return True
+        pending = [(path, (initial.st_dev, initial.st_ino))]
+        while pending:
+            current, expected = pending.pop()
+            observed = os.lstat(current)
+            if (not stat.S_ISDIR(observed.st_mode)
+                    or (observed.st_dev, observed.st_ino) != expected
+                    or now - observed.st_mtime < max_age):
+                return True
+            with preserving_stream_error(os.scandir(current)) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > _DEEP_SCAN_MAX_ENTRIES:
+                        return True
+                    info = entry.stat(follow_symlinks=False)
+                    if now - info.st_mtime < max_age:
+                        return True
+                    if stat.S_ISDIR(info.st_mode):
+                        if not info.st_ino:
+                            return True
+                        pending.append((current / entry.name, (info.st_dev, info.st_ino)))
+            observed = os.lstat(current)
+            if (not stat.S_ISDIR(observed.st_mode)
+                    or (observed.st_dev, observed.st_ino) != expected
+                    or now - observed.st_mtime < max_age):
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _dir_in_use(path: Path, live_cwds: set[str] | None) -> bool:
+    """Liveness probes for a candidate dir: cwd references, live sockets.
+
+    The socket scan covers TOP-LEVEL entries only. Every covered
+    prefix keeps its socket at the top of its dir (lane.sock,
+    llm.sock); a future prefix that nests its socket needs this
+    walk deepened or it will be reaped while live.
+    """
+    if live_cwds is None:
+        return True  # Cannot establish liveness: never delete on that guess.
+    p = os.path.realpath(path)
+    if any(cwd == p or cwd.startswith(p + os.sep) for cwd in live_cwds):
+        return True
+    from core.source.streams import preserving_stream_error
+    try:
+        with preserving_stream_error(os.scandir(path)) as entries:
+            for entry in entries:
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISSOCK(mode) and _socket_answers(Path(entry.path)):
+                    return True
+    except OSError:
+        return True
+    return False
+
+
+
+# Fixed roots swept IN ADDITION to gettempdir(). Under the launcher,
+# gettempdir() is the per-session TMPDIR — strays with reaper-known
+# prefixes minted at the REAL system tmp root (bare-shell runs,
+# pre-containment sessions, the lane-socket short-path fallback) were
+# invisible to every launcher-session sweep and accumulated forever.
+# Module-level so tests can pin the sweep to private roots. Every root
+# gets the identical per-entry guards (same-euid, age floor, internal
+# activity, live-cwd/socket probes, identity re-check).
+_SYSTEM_TMP_ROOTS: tuple[str, ...] = ("/tmp",)
+
+# Keep in sync with core/sandbox/proxy.py's _LANE_DIR_PREFIX (proxy.py
+# imports heavier machinery; this module stays import-light).
+_LANE_DIR_PREFIX = ".raptor-lane-"
+
+
+def _lane_fallback_bases() -> tuple[str, ...]:
+    """``make_lane_dir()``'s fixed short-path fallback bases that are
+    not already full sweep roots (see core/sandbox/proxy.py: the lane
+    dir falls back to ``/run/user/<uid>`` then ``/tmp`` when the
+    ambient temp path would overflow ``sun_path``). ``/tmp`` is a full
+    root via _SYSTEM_TMP_ROOTS; ``/run/user/<uid>`` is swept for lane
+    dirs ONLY — the one RAPTOR artifact ever minted there."""
+    return (f"/run/user/{os.getuid()}",)
+
+
+def _sweep_roots() -> list[tuple[Path, bool]]:
+    """``(root, lane_only)`` pairs, existing dirs only, deduped by
+    realpath (a bare-shell run's gettempdir() IS the system root)."""
+    roots: list[tuple[Path, bool]] = []
+    seen: set[str] = set()
+
+    def _add(base: str, lane_only: bool) -> None:
+        if not base or not os.path.isdir(base):
+            return
+        try:
+            real = os.path.realpath(base)
+        except OSError:
+            return
+        if real in seen:
+            return
+        seen.add(real)
+        roots.append((Path(base), lane_only))
+
+    _add(tempfile.gettempdir(), False)
+    for base in _SYSTEM_TMP_ROOTS:
+        _add(base, False)
+    for base in _lane_fallback_bases():
+        _add(base, True)
+    return roots
+
+
+def _unchanged_artifact(path: Path, original: os.stat_result) -> bool:
+    """Revalidate the candidate without following a replacement symlink."""
+    current = path.lstat()
+    return ((current.st_dev, current.st_ino, current.st_mode, current.st_uid,
+             current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            == (original.st_dev, original.st_ino, original.st_mode, original.st_uid,
+                original.st_size, original.st_mtime_ns, original.st_ctime_ns))
+
+
+def _confirmed_absent(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _remove_candidate_directory(path: Path, original: os.stat_result) -> bool:
+    """Keep refusals local and count only confirmed removals of judged trees."""
+    try:
+        return (_unchanged_artifact(path, original)
+                and rmtree_hardened(path) and _confirmed_absent(path))
+    except OSError:
+        logger.debug("directory reap failed for %s", path, exc_info=True)
+        return False
+
+
+def _unlink_candidate_file(path: Path, original: os.stat_result) -> bool:
+    """A changed or refreshed file is a new candidate for a later sweep."""
+    try:
+        if not _unchanged_artifact(path, original):
+            return False
+        path.unlink()
+        return _confirmed_absent(path)
+    except OSError:
+        logger.debug("file reap failed for %s", path, exc_info=True)
+        return False
+
+
+def reap_stale_tmp(now: float | None = None) -> list[Path]:
+    """Remove orphaned RAPTOR temp artifacts; return the reaped paths.
+
+    Best-effort by contract: any per-entry error skips that entry, any
+    unexpected error aborts silently with a debug log. Never raises.
+    """
+    try:
+        return _reap(now)
+    except Exception as exc:  # noqa: BLE001 — sweep must never block a run
+        logger.debug("stale-tmp sweep aborted: %s", exc)
+        return []
+
+
+def _reap(now: float | None) -> list[Path]:
+    max_age = _max_age_seconds()
+    if max_age is None:
+        return []
+
+    dir_candidates: list[Path] = []
+    file_candidates: list[Path] = []
+    pid_file_candidates: list[tuple[Path, int]] = []
+    for tmp_root, lane_only in _sweep_roots():
+        try:
+            names = os.listdir(tmp_root)
+        except OSError:
+            continue
+        for name in names:
+            if lane_only:
+                # Narrow-scope root: only the lane-dir fallback ever
+                # lands RAPTOR artifacts here — everything else in it
+                # belongs to other subsystems entirely.
+                if name.startswith(_LANE_DIR_PREFIX):
+                    dir_candidates.append(tmp_root / name)
+                continue
+            # Pid-file patterns are checked FIRST: their names also
+            # match the raptor-pytest- dir prefix, and the dir branch's
+            # S_ISDIR squat guard would silently skip them forever.
+            pid: int | None = None
+            for pre, suf in _PID_FILE_PATTERNS:
+                pid = _pid_file_match(name, pre, suf)
+                if pid is not None:
+                    break
+            if pid is not None:
+                pid_file_candidates.append((tmp_root / name, pid))
+                continue
+            if any(name.startswith(p) for p in _dir_prefixes()) or any(
+                _anchored_name_match(name, p)
+                for p in _ANCHORED_DIR_PREFIXES
+            ) or any(
+                _mkdtemp_anchored_match(name, p)
+                for p in _MKDTEMP_ANCHORED_DIR_PREFIXES
+            ):
+                dir_candidates.append(tmp_root / name)
+            elif any(
+                name.startswith(pre) and name.endswith(suf)
+                for pre, suf in _FILE_PATTERNS
+            ) or any(
+                _anchored_name_match(name, pre, suf)
+                for pre, suf in _ANCHORED_FILE_PATTERNS
+            ):
+                file_candidates.append(tmp_root / name)
+    if (not dir_candidates and not file_candidates
+            and not pid_file_candidates):
+        return []
+
+    if now is None:
+        import time
+
+        now = time.time()
+    # NaN makes every age comparison false; an infinite clock can make
+    # every entry look old. Neither is permission to delete anything.
+    if not math.isfinite(now):
+        return []
+    euid = os.geteuid()
+    reaped: list[Path] = []
+
+    # /proc scan only when a dir is actually up for consideration.
+    live_cwds: set[str] | None = None
+    cwd_probe_done = False
+
+    for path in dir_candidates:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue  # symlink or file squatting on our prefix — not ours
+        if st.st_uid != euid:
+            continue
+        if now - st.st_mtime < max_age:
+            continue
+        # Internal-activity probe: the top-level mtime freezes at
+        # creation for most covered dirs, so a >floor LIVE campaign
+        # writing inside its scratch would otherwise be reaped mid-run.
+        if _recent_activity(path, now, max_age):
+            continue
+        if not cwd_probe_done:
+            live_cwds = _live_cwds()
+            cwd_probe_done = True
+        if _dir_in_use(path, live_cwds):
+            continue
+        # Same validation-to-delete identity pin as reap_stale_runs:
+        # a same-uid writer swapping a different entry (or a symlink —
+        # S_ISDIR on lstat is then false) into this name between the
+        # checks above and the rmtree is skipped this sweep.
+        try:
+            st2 = path.lstat()
+        except OSError:
+            continue
+        if (
+            (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+            or not stat.S_ISDIR(st2.st_mode)
+        ):
+            logger.debug(
+                "tmp reaper: %s changed identity between validation "
+                "and delete; skipping this sweep", path,
+            )
+            continue
+        if _recent_activity(path, now, max_age):
+            continue
+        if _remove_candidate_directory(path, st):
+            reaped.append(path)
+
+    for path in file_candidates:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_uid != euid:
+            continue
+        if now - st.st_mtime < max_age:
+            continue
+        if _unlink_candidate_file(path, st):
+            reaped.append(path)
+
+    # Pid-owned sidecars: the embedded pid, not age, is the contract —
+    # a dead owner's pair is reaped even when fresh; a live owner's
+    # pair (its flock target in particular) is kept even when old.
+    for path, pid in pid_file_candidates:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_uid != euid:
+            continue
+        if _pid_alive(pid):
+            continue
+        if _unlink_candidate_file(path, st):
+            reaped.append(path)
+
+    if reaped:
+        logger.info(
+            "reaped %d stale temp artifact(s) from earlier interrupted runs",
+            len(reaped),
+        )
+    return reaped
+
+
+def reap_dead_pid_dirs(root: Path, prefix: str, *, keep: int = 0,
+                       pid_suffix: bool = False) -> list[Path]:
+    """Remove ``<prefix><pid>`` dirs under *root* whose pid is dead.
+
+    For scratch families whose name embeds the owning pid as THE
+    liveness contract (the root conftest's darwin-emulation basetemp
+    roots, ``raptor-pytest-emu-<pid>``): per-pid roots defeat both
+    pytest's keep-last-N retention (it prunes numbered runs under one
+    shared basetemp, never sibling per-pid roots) and the stale-tmp
+    sweep's cadence, so dead sessions accreted tens of thousands of
+    inodes each.
+
+    A dead-probing pid is strong evidence the session is gone — but
+    only within this process's pid namespace and one pid-reuse epoch,
+    so it is never sufficient on its own:
+
+      - In a child pid namespace (``unshare`` batteries, nested CI
+        containers) EVERY outer session's live pid probes ESRCH; a
+        sweep running there deleted concurrent sessions' LIVE scratch
+        under the shared system tmp mid-run. The sweep refuses to run
+        at all outside the root namespace (:func:`_in_child_pid_ns`).
+      - Even in the root namespace a dead-probing pid may be a
+        namespace-minted name (a session's in-namespace pid means
+        nothing here) or sit in a reuse window, so ESRCH alone never
+        reaps a YOUNG dir: the mtime age floor
+        (``_PID_DIR_AGE_FLOOR_S``) is the backstop — a live session's
+        scratch is keepalive-refreshed and always recently touched.
+      - Unverifiable owners (pid 1 — init in every namespace — and
+        EPERM probes) are governed by the longer
+        ``_UNVERIFIABLE_PID_DIR_AGE_FLOOR_S`` instead of being kept
+        forever (observed: hundreds of namespace-minted
+        ``raptor-pytest-1-*`` roots accreting unreaped).
+      - Dirs this euid cannot remove (root-owned strays from
+        privileged runs) are skipped without probing and disclosed
+        once per sweep — never crashed on, never spammed per entry.
+
+    ``keep`` retains that many of the most-recently-modified DEAD dirs
+    for post-mortem inspection, mirroring pytest's own retention
+    semantics at the per-pid level.
+
+    ``pid_suffix=True`` widens the exact ``prefix + digits`` name rule
+    to ``prefix + digits + "-" + anything`` — the shape mkdtemp-minted
+    per-session scratch gets when its caller embeds the owning pid in
+    the mkdtemp prefix (``raptor-pytest-<pid>-<rand>``). The pid
+    segment stays digits-anchored between the literal prefix and the
+    literal ``-``, so sibling families that put WORDS there
+    (``raptor-pytest-emu-<pid>``) never match a widened sweep of the
+    shorter prefix, and a planted name cannot smuggle a live pid past
+    the check by decoration — the decoration is never parsed.
+
+    Safety posture matches the launcher's dead-session sweep: lstat
+    only (a symlink squatting on the name is never followed), dirs
+    only, same-euid only, exact-shape names, live pids always kept.
+    Best-effort by contract — never raises.
+    """
+    try:
+        return _reap_dead_pid_dirs(root, prefix, keep,
+                                   pid_suffix=pid_suffix)
+    except Exception as exc:  # noqa: BLE001 — sweep must never block a run
+        logger.debug("dead-pid dir sweep aborted: %s", exc)
+        return []
+
+
+def _reap_dead_pid_dirs(root: Path, prefix: str, keep: int, *,
+                        pid_suffix: bool = False) -> list[Path]:
+    if _in_child_pid_ns():
+        logger.debug(
+            "dead-pid dir sweep skipped under %s: this process runs in "
+            "a child pid namespace, where kill() verdicts about other "
+            "sessions' pids are meaningless", root,
+        )
+        return []
+    import time
+
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    now = time.time()
+    euid = os.geteuid()
+    dead: list[tuple[float, Path, os.stat_result]] = []
+    foreign_owned = 0
+    unremovable = 0
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        rest = name[len(prefix):]
+        if pid_suffix:
+            digits, sep, tail = rest.partition("-")
+            if not (sep and tail):
+                continue
+        else:
+            digits = rest
+        # ASCII-only, then a guarded parse: str.isdigit() accepts
+        # non-ASCII digits int() rejects (a planted `²` name would
+        # raise and — through the wrapper's blanket except — silently
+        # abort the WHOLE sweep, a one-dir DoS any local user can
+        # place in sticky /tmp). pid 0 is never a reapable owner
+        # (kill(0,0) probes the caller's own process group — reads
+        # eternally live — and no real scratch embeds it).
+        if not (digits.isascii() and digits.isdigit()):
+            continue
+        try:
+            pid = int(digits)
+        except ValueError:
+            continue
+        if pid == 0:
+            continue
+        if pid == os.getpid():
+            continue
+        path = root / name
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        if st.st_uid != euid:
+            # Not removable by this euid (root-owned strays from
+            # privileged runs): skip without probing; disclosed once
+            # per sweep below.
+            foreign_owned += 1
+            continue
+        age = now - st.st_mtime
+        if age < _PID_DIR_AGE_FLOOR_S:
+            # Young dir: never reaped on a liveness verdict alone —
+            # see the floor's rationale at its definition.
+            continue
+        if pid == 1:
+            # pid 1 is init in EVERY pid namespace: such names are
+            # minted by sessions running inside their own namespace
+            # (their in-namespace pid is 1), so the real owner is
+            # unknowable from here — and no kill() call with
+            # pid <= 1 is ever made. Age-governed.
+            if age >= _UNVERIFIABLE_PID_DIR_AGE_FLOOR_S:
+                dead.append((st.st_mtime, path, st))
+            continue
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OverflowError):
+            # Dead in this (root) namespace — or a pid beyond pid_t
+            # (a planted huge-digit name), which no live process can
+            # hold. The age floor above already vouched this is not a
+            # live concurrent session's fresh scratch.
+            dead.append((st.st_mtime, path, st))
+        except OSError:
+            # EPERM: some process holds this pid under another uid —
+            # the same-euid owner either exited and the pid was
+            # recycled, or minted the name inside another namespace.
+            # Unverifiable either way: age-governed so old strays are
+            # cleaned instead of accreting forever.
+            if age >= _UNVERIFIABLE_PID_DIR_AGE_FLOOR_S:
+                dead.append((st.st_mtime, path, st))
+            continue
+        else:
+            continue  # alive; keep
+    dead.sort(key=lambda entry: entry[0], reverse=True)
+    reaped: list[Path] = []
+    for _, path, st in dead[max(keep, 0):]:
+        # Same validation-to-delete identity pin as the sibling
+        # sweeps: everything above judged an lstat snapshot; deletion
+        # is by pathname. A dir that VANISHED since classification (a
+        # concurrent sweep or the owner's own cleanup won the race —
+        # historically this raced rmtree into FileNotFoundError
+        # mid-walk) is skipped and never reported reaped; a same-uid
+        # writer swapping a different entry (or a symlink — S_ISDIR
+        # on lstat is then false) into the name is skipped this
+        # sweep.
+        try:
+            st2 = path.lstat()
+        except OSError:
+            continue
+        if (
+            (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+            or not stat.S_ISDIR(st2.st_mode)
+        ):
+            logger.debug(
+                "dead-pid dir sweep: %s changed identity between "
+                "validation and delete; skipping this sweep", path,
+            )
+            continue
+        if _remove_candidate_directory(path, st):
+            reaped.append(path)
+        else:
+            # Partial-permission residue (e.g. root-owned entries
+            # inside a same-euid dir): rmtree could not finish. Count
+            # for the bounded disclosure below instead of failing or
+            # logging per entry; the dir is retried on later sweeps
+            # and remains visible to an operator.
+            unremovable += 1
+    if foreign_owned:
+        logger.info(
+            "dead-pid dir sweep: left %d %s* dir(s) under %s in place "
+            "(owned by another user — not removable from this account)",
+            foreign_owned, prefix, root,
+        )
+    if unremovable:
+        logger.info(
+            "dead-pid dir sweep: %d %s* dir(s) under %s resisted "
+            "removal (permission residue inside); left in place",
+            unremovable, prefix, root,
+        )
+    if reaped:
+        logger.info(
+            "reaped %d dead-owner %s* dir(s) under %s",
+            len(reaped), prefix, root,
+        )
+    return reaped
+
+
+def reap_stale_runs(parent: Path, now: float | None = None) -> list[Path]:
+    """Remove aged-out failed/cancelled run dirs under *parent*.
+
+    Nothing else deletes flat run dirs: ``_cleanup_abandoned`` only
+    relabels status, and ``/project clean`` is manual and
+    project-scoped. Failed runs are usually a few KB of metadata, but
+    interrupted agentic runs can strand tens of MB (a 37M checklist was
+    observed in one), and either way they pile up forever.
+
+    Deliberately narrow:
+
+      - Only dirs carrying a ``.raptor-run.json`` whose status is
+        ``failed`` or ``cancelled``. Completed runs are RESULTS — never
+        auto-deleted. Running runs belong to the liveness machinery
+        (`_cleanup_abandoned`, the lifecycle hook), not to age sweeps.
+      - Only past the age floor: ``RAPTOR_RUN_REAP_MAX_AGE_D`` (default
+        30 days, 0 disables), judged by the run's END timestamp (when
+        it failed), falling back to the start timestamp — clamped by
+        the dir mtime so a freshly SWEEP-failed old run (sweeps record
+        no end_timestamp) gets a full window, not instant deletion —
+        see :func:`_run_age_seconds`.
+      - In-use probe before deletion: a dir some live process has as
+        its cwd (or with a socket still answering) is skipped.
+      - lstat-only + current-euid ownership, same posture as the tmp
+        sweep; non-run dirs (logs/, llm_cache/, projects/) carry no run
+        metadata and are never touched.
+
+    Best-effort by contract — never raises.
+    """
+    try:
+        return _reap_runs(parent, now)
+    except Exception as exc:  # noqa: BLE001 — sweep must never block a run
+        logger.debug("stale-run sweep aborted: %s", exc)
+        return []
+
+
+def _reap_runs(parent: Path, now: float | None) -> list[Path]:
+    raw = os.environ.get(_RUN_MAX_AGE_ENV, "")
+    if raw:
+        try:
+            days = float(raw)
+            if not math.isfinite(days) or (
+                    days > 0 and not math.isfinite(days * 86400.0)):
+                raise ValueError("non-finite run retention")
+        except ValueError:
+            logger.debug("ignoring non-numeric %s=%r", _RUN_MAX_AGE_ENV, raw)
+            days = _DEFAULT_RUN_AGE_D
+    else:
+        days = _DEFAULT_RUN_AGE_D
+    if days <= 0:
+        return []
+    max_age = days * 86400.0
+
+    parent = Path(parent)
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return []
+    if now is None:
+        import time
+
+        now = time.time()
+    # NaN makes every age comparison false; an infinite clock can make
+    # every entry look old. Neither is permission to delete anything.
+    if not math.isfinite(now):
+        return []
+    euid = os.geteuid()
+    reaped: list[Path] = []
+    live_cwds: set[str] | None = None
+    cwd_probe_done = False
+    for d in children:
+        try:
+            st = d.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != euid:
+            continue
+        if d.name.startswith((".", "_")):
+            continue
+        meta_path = d / _RUN_METADATA_FILE
+        # Bounded load (st_size gate before read): the sweep runs at
+        # the start of every run over whatever the parent dir holds,
+        # so a planted multi-GiB metadata file must not be buffered
+        # just to decide reapability. Oversize/malformed/unreadable
+        # all degrade to None → skip, matching the old best-effort
+        # except-continue behaviour.
+        from core.json.utils import load_json
+
+        meta = load_json(meta_path, max_bytes=_RUN_METADATA_MAX_BYTES)
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("status") not in ("failed", "cancelled"):
+            continue
+        age = _run_age_seconds(meta, st, now)
+        if age < max_age:
+            continue
+        # In-use probe: a failed status is a claim, not proof nothing
+        # is still reading the dir (an operator inspecting the journal,
+        # a resume about to flip it back to running). A live process
+        # cwd'd inside — or a socket still answering — keeps the dir
+        # this sweep, same probes as the tmp sweep.
+        if not cwd_probe_done:
+            live_cwds = _live_cwds()
+            cwd_probe_done = True
+        if _dir_in_use(d, live_cwds):
+            continue
+        # Everything above was decided against the lstat() snapshot
+        # `st`; deletion is by pathname. A writer with access to the
+        # parent can swap a different entry into this name between
+        # validation and rmtree — e.g. rename a completed sibling
+        # here — and the reaper would delete the wrong directory.
+        # Narrow that window: re-lstat immediately before deleting
+        # and require the same identity (st_dev, st_ino) and still-
+        # a-directory; anything swapped in (replacement dir OR
+        # symlink — S_ISDIR on lstat is false for a symlink) is
+        # skipped this sweep. Below the top level shutil.rmtree's
+        # fd-based traversal handles symlinks itself.
+        try:
+            st2 = d.lstat()
+        except OSError:
+            continue
+        if (
+            (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+            or not stat.S_ISDIR(st2.st_mode)
+        ):
+            logger.warning(
+                "run reaper: %s changed identity between validation "
+                "and delete; skipping this sweep", d,
+            )
+            continue
+        # A resume can change status or timing without replacing the run
+        # directory. Do not delete using the earlier metadata snapshot.
+        if load_json(meta_path, max_bytes=_RUN_METADATA_MAX_BYTES) != meta:
+            continue
+        if _remove_candidate_directory(d, st):
+            reaped.append(d)
+    if reaped:
+        logger.info(
+            "reaped %d failed/cancelled run dir(s) older than %g days "
+            "under %s", len(reaped), days, parent,
+        )
+    return reaped
+
+
+def _run_age_seconds(meta: dict, st: os.stat_result, now: float) -> float:
+    """Age from the run's END timestamp, then start — clamped by the
+    dir-mtime evidence (``min``).
+
+    The END timestamp (when the run actually failed / was cancelled)
+    comes first: aging from the START deleted a long-lived run right
+    after it failed — a multi-week campaign that failed yesterday was
+    already "30 days old" by its start stamp, and the next sweep
+    rmtree'd its journal and partial results.
+
+    The mtime clamp covers the sweep-failed path: both abandon sweeps
+    call ``fail_run(..., record_timing=False)``, which records NO
+    ``end_timestamp`` (sweeps make no timing claim) — but their
+    metadata rewrite refreshes the dir mtime, so never reporting an
+    age older than the mtime evidence restarts the reap window for a
+    freshly-swept old-start run instead of deleting it on the very
+    next sweep.
+    """
+    from datetime import datetime, timezone
+
+    mtime_age = now - st.st_mtime
+    for key in ("end_timestamp", "timestamp"):
+        ts = meta.get(key)
+        if not isinstance(ts, str):
+            continue
+        try:
+            stamped = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if stamped.tzinfo is None:
+            stamped = stamped.replace(tzinfo=timezone.utc)
+        return min(now - stamped.timestamp(), mtime_age)
+    return mtime_age
+
+
+def reap_stale_logs(now: float | None = None) -> list[Path]:
+    """Remove per-process audit logs older than the operator's age floor.
+
+    ``core.logging`` writes one ``raptor_<epoch>_pid<pid>_<ns>.jsonl``
+    per process into ``RaptorConfig.LOG_DIR`` with no rotation, so the
+    dir accumulates a file for every raptor process ever started. A
+    live process keeps its file's mtime fresh, so an age gate alone is
+    a safe liveness proxy here.
+
+    DISABLED unless the operator opts in: these files are the audit
+    trail, and audit data is only deleted on explicit instruction —
+    set ``RAPTOR_LOG_REAP_MAX_AGE_D=<days>`` (e.g. 14) to enable.
+    Best-effort by contract — never raises.
+    """
+    try:
+        return _reap_logs(now)
+    except Exception as exc:  # noqa: BLE001 — sweep must never block a run
+        logger.debug("stale-log sweep aborted: %s", exc)
+        return []
+
+
+def _reap_logs(now: float | None) -> list[Path]:
+    raw = os.environ.get(_LOG_MAX_AGE_ENV, "")
+    if not raw:
+        return []  # opt-in only — never delete audit data by default
+    try:
+        days = float(raw)
+        if not math.isfinite(days) or (
+                days > 0 and not math.isfinite(days * 86400.0)):
+            raise ValueError("non-finite log retention")
+    except ValueError:
+        logger.debug("ignoring non-numeric %s=%r", _LOG_MAX_AGE_ENV, raw)
+        return []
+    if days <= 0:
+        return []
+    max_age = days * 86400.0
+
+    from core.config import RaptorConfig
+
+    log_dir = Path(RaptorConfig.LOG_DIR)
+    if not log_dir.is_dir():
+        return []
+    if now is None:
+        import time
+
+        now = time.time()
+    # NaN makes every age comparison false; an infinite clock can make
+    # every entry look old. Neither is permission to delete anything.
+    if not math.isfinite(now):
+        return []
+    euid = os.geteuid()
+    reaped: list[Path] = []
+    for path in log_dir.glob("raptor_*.jsonl"):
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != euid:
+            continue
+        if now - st.st_mtime < max_age:
+            continue
+        if _unlink_candidate_file(path, st):
+            reaped.append(path)
+    if reaped:
+        logger.info("reaped %d audit log file(s) older than %g days",
+                    len(reaped), days)
+    return reaped

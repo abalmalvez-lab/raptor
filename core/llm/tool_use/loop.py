@@ -18,7 +18,10 @@ Multi-turn loop, in order per iteration:
    pause; conversation resumes by re-sending the same messages).
 7. If response carries no tool calls and is none of the above, the
    model gave up mid-turn — terminate with ``max_tokens``, ``refused``,
-   or ``provider_error`` per the response's stop reason.
+   or ``provider_error`` per the response's stop reason. Exception:
+   with ``max_tokens_nudges > 0``, a ``max_tokens`` stop instead
+   injects a be-concise user nudge and continues, up to that many
+   times per run.
 8. Otherwise, dispatch each :class:`ToolCall` block. Handler exception
    or :class:`ToolHandlerTimeout` either becomes an ``is_error=True``
    :class:`ToolResult` (default) or terminates the loop with reason
@@ -41,16 +44,18 @@ Every termination emits a :class:`LoopTerminated` event and returns a
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.llm.providers import LLMProvider
 
-from core.security.prompt_envelope import wrap_tool_result
+from core.security.prompt_envelope import unwrap_untrusted, wrap_tool_result
 from core.security.prompt_input_preflight import preflight
 
 from .types import (
@@ -62,6 +67,7 @@ from .types import (
     LoopTerminated,
     Message,
     StopReason,
+    StreamDelta,
     TextBlock,
     ToolCall,
     ToolCallBlocked,
@@ -73,8 +79,114 @@ from .types import (
     ToolResult,
     ToolResultPreflight,
     TurnCompleted,
+    TurnResponse,
     TurnStarted,
 )
+
+# User message injected when a turn is cut off by the per-turn output
+# token limit and the loop still has ``max_tokens_nudges`` budget —
+# see the constructor docstring.
+_MAX_TOKENS_NUDGE = (
+    "Your previous response was cut off by the per-turn output token "
+    "limit. Continue from where you stopped. Be concise, and split "
+    "long output across multiple smaller tool calls."
+)
+
+
+@dataclass(frozen=True)
+class SubmissionState:
+    """Context passed to ``submission_warning`` callables each iter.
+
+    The loop has TWO independent gates that can each end the run —
+    iteration cap and cost cap. The warning callable looks at the
+    state of BOTH and decides which (if any) to surface to the
+    model. The right warning depends on the operator's tuning AND
+    the model's actual budget profile (a thoughtful model burns
+    cost-cap before iter-cap; a terse one is the reverse). A
+    one-axis warning ("3 iters left!") would miss the cost case
+    entirely.
+    """
+
+    iters_remaining: int
+    """``max_iterations - iteration - 1``. The number of additional
+    LLM turns the loop is willing to take. Always finite (the loop
+    has a positive ``max_iterations`` by construction)."""
+
+    iters_max: int
+    """``max_iterations``. Useful for computing fraction-remaining
+    without re-deriving it from the loop state."""
+
+    cost_so_far: float
+    """Cumulative cost in USD across all turns this run, post-
+    compute_cost. The same value the loop checks against
+    ``max_cost_usd`` in its pre-flight."""
+
+    cost_cap: float | None
+    """``max_cost_usd`` from construction, or None if no cost cap
+    was set. The callable should NOT warn on cost when this is
+    None (no cap → no exhaustion gate)."""
+
+
+@dataclass(frozen=True)
+class InFireMutatorContext:
+    """Context passed to ``in_fire_mutator`` callables each iter.
+
+    Fired after the assistant's turn has produced its tool results
+    but BEFORE the next user message is finalised — the mutator's
+    returned text (if non-empty) is appended as a ``TextBlock`` to
+    the same user message carrying that turn's tool results, so the
+    model sees the injected note interleaved with its own tool
+    output.
+
+    Distinct from ``submission_warning``:
+      * ``submission_warning`` handles budget-terminal nudges
+        ("time's running out — submit").
+      * ``in_fire_mutator`` handles technique-steering nudges
+        ("researcher note: try shape X to close the chain").
+
+    Both hooks fire on the same iteration boundary; both returns are
+    appended to the same ``user_content`` list; both are optional
+    and skipped when the terminal tool has just fired.
+    """
+
+    iteration: int
+    """0-indexed loop iteration this call fires for."""
+
+    iters_remaining: int
+    """``max_iterations - iteration - 1``. Same semantics as
+    ``SubmissionState.iters_remaining``."""
+
+    iters_max: int
+    """``max_iterations``."""
+
+    cost_so_far: float
+    """Cumulative cost in USD across all turns this run."""
+
+    cost_cap: float | None
+    """``max_cost_usd`` from construction, or None."""
+
+    messages: Sequence[Message]
+    """Immutable snapshot of the conversation history up to and
+    including this turn's assistant response but BEFORE the
+    tool-result user message is appended. Mutator may inspect but
+    must not modify."""
+
+    tool_results: Sequence[Any]
+    """The tool result blocks this turn produced. Mutator inspects
+    these to decide whether to inject steering."""
+
+logger = logging.getLogger(__name__)
+
+
+# Cap on stranded daemon threads from timed-out tool handlers.
+# 32 is generous — operator diagnostics rarely need more than a
+# handful of recent timeouts; old ones are dropped to bound memory.
+_MAX_STRANDED_TOOL_THREADS = 32
+
+# Extra attempts when a streaming turn fails before ANY content chunk
+# arrived (nothing consumed → re-issuing the turn is side-effect
+# free). Bounded so a hard-down endpoint still fails promptly.
+_STREAM_PRE_CONTENT_RETRIES = 2
 
 
 class ToolUseLoop:
@@ -94,7 +206,7 @@ class ToolUseLoop:
 
     def __init__(
         self,
-        provider: "LLMProvider",
+        provider: LLMProvider,
         tools: Sequence[ToolDef],
         *,
         system: str | None = None,
@@ -110,6 +222,12 @@ class ToolUseLoop:
         events: Callable[[LoopEvent], None] | None = None,
         terminate_on_handler_error: bool = False,
         refuse_on_indicators: Sequence[str] = (),
+        should_continue: Callable[[], bool] | None = None,
+        submission_warning: Callable[[SubmissionState], str | None] | None = None,
+        in_fire_mutator: Callable[[InFireMutatorContext], str | None] | None = None,
+        nudge_on_no_tool_call: str | None = None,
+        max_tokens_nudges: int = 0,
+        stream: bool = False,
         **provider_specific: Any,
     ) -> None:
         """``refuse_on_indicators``: prompt-injection corpus names
@@ -124,23 +242,31 @@ class ToolUseLoop:
         loaded corpora so a typo can't silently disable
         enforcement."""
         if not provider.supports_tool_use():
-            raise ValueError(
+            msg = (
                 "ToolUseLoop requires a provider with tool-use support; "
                 "the bound model rejects it"
             )
+            raise ValueError(msg)
         self._provider = provider
         self._tools = list(tools)
+        # Daemon threads whose handler outlived its timeout — kept for
+        # operator introspection (see _dispatch_tool). Initialised
+        # here, not lazily at first strand, so the attribute is always
+        # present for diagnostics readers.
+        self._stranded_tool_threads: list[threading.Thread] = []
         self._tools_by_name: dict[str, ToolDef] = {t.name: t for t in tools}
         if len(self._tools_by_name) != len(self._tools):
-            raise ValueError(
+            msg = (
                 "ToolUseLoop tools must have unique names; "
                 "duplicate handler binding would dispatch ambiguously"
             )
+            raise ValueError(msg)
         if terminal_tool is not None and terminal_tool not in self._tools_by_name:
-            raise ValueError(
+            msg = (
                 f"ToolUseLoop terminal_tool {terminal_tool!r} is not in the "
                 "registered tools; loop would never terminate via that path"
             )
+            raise ValueError(msg)
         if not isinstance(max_iterations, int) or max_iterations < 1:
             # Reject 0 (loop terminates before any work is done — looks
             # like a "max iterations hit" outcome but actually no LLM
@@ -149,10 +275,11 @@ class ToolUseLoop:
             # is always False for non-negative iters when max_iter is
             # negative, producing an infinite loop bounded only by the
             # cost / token / wall-clock caps if those happen to be set).
-            raise ValueError(
+            msg = (
                 f"ToolUseLoop max_iterations must be a positive int; "
                 f"got {max_iterations!r}"
             )
+            raise ValueError(msg)
 
         # Validate refuse-on-indicators against loaded corpora so a
         # typo in the consumer's allowlist surfaces at construction
@@ -163,10 +290,11 @@ class ToolUseLoop:
             known = set(loaded_corpora())
             unknown = [c for c in refuse_on_indicators if c not in known]
             if unknown:
-                raise ValueError(
+                msg = (
                     f"ToolUseLoop refuse_on_indicators contains unknown "
                     f"corpora {unknown!r}. Loaded corpora: {sorted(known)!r}"
                 )
+                raise ValueError(msg)
 
         self._system = system
         self._terminal_tool = terminal_tool
@@ -181,6 +309,59 @@ class ToolUseLoop:
         self._events = events
         self._terminate_on_handler_error = terminate_on_handler_error
         self._refuse_on_indicators = frozenset(refuse_on_indicators)
+        # Caller-supplied predicate evaluated at the top of each loop
+        # iteration. Returning False asks the loop to terminate cleanly
+        # with ``terminated_by="give_up"``. Useful for cost-control
+        # signals raised by handlers (e.g. the exploit-engine's
+        # candidate-diversity-collapse detector: when the model has
+        # submitted three byte-identical verify_run candidates, there's
+        # no point letting the budget keep ticking).
+        self._should_continue = should_continue
+        # Submission discipline: when an agentic consumer needs the
+        # model to FINALISE its work via a specific terminal tool
+        # (e.g. /exploit's ``verify_run`` + ``submit_exploit``), a
+        # thoughtful model can burn the iteration budget exploring
+        # without ever submitting — Gadi Evron diagnosed this as the
+        # ``agent_no_submit`` failure mode (~25% of runs in his
+        # corpus). Two opt-in hooks:
+        #
+        #   ``submission_warning``: callable evaluated each iteration
+        #     with ``iterations_remaining``. Return a non-empty string
+        #     to inject as a ``TextBlock`` into the user message
+        #     carrying that turn's tool results, or None to suppress
+        #     this iteration. Typical pattern: warn only when remaining
+        #     drops below K so the message isn't repeated every turn.
+        #
+        #   ``nudge_on_no_tool_call``: static text injected as a new
+        #     user message when the assistant turn returns no tool
+        #     calls AND no terminal stop reason (today: would
+        #     terminate with ``max_tokens``/``refused``/``provider_error``;
+        #     under the nudge, the loop continues instead). Use this
+        #     to steer a model that emits prose-only mid-task back to
+        #     the tools.
+        #
+        # Both default to None — existing consumers are unaffected.
+        self._submission_warning = submission_warning
+        # In-fire steering hook: called after each turn's tool
+        # results are gathered; returned text is appended to the
+        # user message alongside the tool results. Complements
+        # ``submission_warning`` — that surfaces budget-terminal
+        # nudges; this surfaces technique-steering nudges. Default
+        # None → no injection, byte-identical to pre-hook behaviour.
+        self._in_fire_mutator = in_fire_mutator
+        self._nudge_on_no_tool_call = nudge_on_no_tool_call
+        # ``max_tokens_nudges``: how many times per run a mid-turn
+        # ``max_tokens`` stop (the model's turn was cut off by
+        # ``max_tokens_per_turn`` before it produced a complete tool
+        # call) recovers by injecting a be-concise user nudge and
+        # continuing, instead of terminating the whole run. A single
+        # over-long turn is a per-turn output overflow, not a terminal
+        # condition — the conversation state is intact and the model
+        # can resume. Bounded (never unlimited) so a model that keeps
+        # overflowing still terminates with the honest ``max_tokens``
+        # reason. Default 0 → existing terminal behaviour.
+        self._max_tokens_nudges = max(0, int(max_tokens_nudges))
+        self._stream = stream and self._provider.supports_streaming()
         self._provider_specific = provider_specific
 
     # ------------------------------------------------------------------
@@ -214,20 +395,140 @@ class ToolUseLoop:
         total_cost_usd = 0.0
         tool_calls_made = 0
         terminal_tool_input: dict[str, Any] | None = None
+        # Per-turn token accounting — one (input, output) tuple appended
+        # per assistant turn added to ``messages``. Mirrors the message
+        # append order so downstream consumers (trajectory bridge) can
+        # zip messages+tokens by assistant-turn index.
+        per_turn_tokens: list[tuple[int, int]] = []
+        # Remaining budget for mid-turn max_tokens recovery — see the
+        # ``max_tokens_nudges`` constructor docstring.
+        mt_nudges_left = self._max_tokens_nudges
         wall_start = time.monotonic()
+        # Effective cache opt-ins for THIS run. ``history_through_index``
+        # is a message index; context truncation pops head messages, so
+        # the frozen constructor value must be remapped as messages
+        # drop — otherwise the cache breakpoint silently lands on an
+        # unintended message (cache-efficiency loss, misleading
+        # TurnStarted telemetry; the bounds check prevents a crash).
+        # A local copy: the caller's CacheControl is never mutated.
+        cache_control = self._cache_control
 
-        # x-source: seed known_values from prompt + history
+        # x-source: seed known_values from prompt + history. History
+        # seeding applies the SAME trust rule as in-run discovery:
+        # user-authored text and successful tool results only (both
+        # live in user-role messages — the loop itself persists tool
+        # results that way, and the wire protocol allows them nowhere
+        # else). Assistant prose must NOT seed: in-run it never enters
+        # known_values, so seeding it here let a persisted trajectory
+        # containing hallucinated or injected assistant text launder
+        # undiscovered values past the pre-dispatch ToolCallBlocked
+        # gate on resume. The loop's OWN user-role injections
+        # (nudges, submission warnings, in-fire steering) never seed
+        # in-run either — on resume they are recognised by the
+        # ``loop_injected`` tag stamped at append time, with an
+        # exact-text fallback for the static nudges so histories
+        # rebuilt without the tag stay covered. Residual: dynamic
+        # warning/steering text in a tag-stripped rebuilt history
+        # cannot be told apart from user text.
         known_values: set[str] = set()
+        # Every union below routes through the shared-cap merge; warn
+        # once per run when the cap clips (past it, x-source gated
+        # fields false-block newly discovered values — safe direction,
+        # but the operator should see why).
+        _cap_warned = [False]
+
+        def _absorb(new_values: set[str]) -> None:
+            if _merge_known_values(known_values, new_values) and not _cap_warned[0]:
+                _cap_warned[0] = True
+                logger.warning(
+                    "x-source: known_values cap (%d) reached — further "
+                    "discovered values will not register and gated "
+                    "fields may block them",
+                    _MAX_KNOWN_VALUES,
+                )
+
         if next_message:
-            known_values |= _extract_tokens_from_text(next_message)
+            _absorb(_extract_tokens_from_text(next_message))
         for msg in history:
+            if msg.role != "user":
+                continue
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    known_values |= _extract_tokens_from_text(block.text)
+                    if (getattr(block, "loop_injected", False)
+                            or block.text == _MAX_TOKENS_NUDGE
+                            or (self._nudge_on_no_tool_call is not None
+                                and block.text
+                                == self._nudge_on_no_tool_call)):
+                        continue
+                    _absorb(_extract_tokens_from_text(block.text))
                 elif isinstance(block, ToolResult) and not block.is_error:
-                    known_values |= _extract_values_from_json(block.content)
+                    # The loop persists the messages-bound tool-result
+                    # copy envelope-WRAPPED (wrap_tool_result below)
+                    # and records the raw bytes on ``raw_content`` —
+                    # in-run discovery extracted from those exact
+                    # bytes, so resume must too (extracting from the
+                    # wrapped string made json.loads fail and fall
+                    # back to tokenisation, which both seeded tokens
+                    # the in-run gate refuses and dropped multi-word
+                    # leaf values the run legitimately discovered).
+                    #
+                    # Without ``raw_content`` the shapes are
+                    # ambiguous: a textual unwrap heuristic cannot
+                    # distinguish a loop-wrapped result from attacker
+                    # output that ARRIVED envelope-shaped, and
+                    # unwrapping the latter would seed inner values
+                    # (whitespace-containing JSON leaves) the in-run
+                    # tokenisation rule refused — laundering. So:
+                    # envelope-shaped content with no raw provenance
+                    # seeds NOTHING (fail closed — only the safe
+                    # false-block direction, and only for histories
+                    # that violated the persistence contract); plain
+                    # raw content seeds under the in-run rule
+                    # unchanged.
+                    raw = getattr(block, "raw_content", None)
+                    if raw is not None:
+                        _absorb(_extract_values_from_json(raw))
+                    elif unwrap_untrusted(block.content) == block.content:
+                        _absorb(_extract_values_from_json(block.content))
 
         for iteration in range(self._max_iterations):
+            # ---- pre-flight: caller-supplied give-up predicate ---------
+            # A False return asks the loop to terminate cleanly. Useful
+            # for any consumer that wants to short-circuit on a caller-
+            # side signal (e.g. candidate-diversity collapse, external
+            # abort). A predicate that raises is treated as "keep going"
+            # so a bug in the caller's predicate cannot crash the loop;
+            # the exception is logged at WARNING so the bug is visible.
+            if self._should_continue is not None:
+                try:
+                    keep_going = self._should_continue()
+                except Exception:        # noqa: BLE001
+                    logger.warning(
+                        "should_continue predicate raised; treating as "
+                        "keep-going (iteration=%d)",
+                        iteration,
+                        exc_info=True,
+                    )
+                    keep_going = True
+                if not keep_going:
+                    self._emit(LoopTerminated(
+                        reason="give_up",
+                        iterations=iteration,
+                        total_cost_usd=total_cost_usd,
+                    ))
+                    return ToolLoopResult(
+                        final_text="",
+                        terminal_tool_input=None,
+                        messages=messages,
+                        iterations=iteration,
+                        tool_calls_made=tool_calls_made,
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        total_cost_usd=total_cost_usd,
+                        terminated_by="give_up",
+                        per_turn_tokens=tuple(per_turn_tokens),
+                    )
+
             # ---- pre-flight: cost budget --------------------------------
             if (
                 self._max_cost_usd is not None
@@ -238,10 +539,15 @@ class ToolUseLoop:
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
                 ))
-                raise CostBudgetExceeded(
+                msg_0 = (
                     f"cost budget ${self._max_cost_usd:.4f} reached "
                     f"(cumulative ${total_cost_usd:.4f}); aborting "
                     "before next turn"
+                )
+                raise CostBudgetExceeded(
+                    msg_0,
+                    messages=messages,
+                    tool_calls_made=tool_calls_made,
                 )
 
             # ---- pre-flight: wall-clock budget --------------------------
@@ -270,6 +576,7 @@ class ToolUseLoop:
                     total_output_tokens=total_output_tokens,
                     total_cost_usd=total_cost_usd,
                     terminated_by="max_seconds",
+                    per_turn_tokens=tuple(per_turn_tokens),
                 )
 
             # ---- pre-flight: total-tokens budget ------------------------
@@ -298,6 +605,7 @@ class ToolUseLoop:
                     total_output_tokens=total_output_tokens,
                     total_cost_usd=total_cost_usd,
                     terminated_by="max_total_tokens",
+                    per_turn_tokens=tuple(per_turn_tokens),
                 )
 
             # ---- pre-flight: context window -----------------------------
@@ -310,18 +618,45 @@ class ToolUseLoop:
                         iterations=iteration,
                         total_cost_usd=total_cost_usd,
                     ))
-                    raise ContextOverflow(
+                    msg_0 = (
                         f"request estimate ~{request_estimate} tokens "
                         f"would exceed model context window {window}; "
                         "set context_policy=TRUNCATE_OLDEST or shorten "
                         "input"
                     )
+                    raise ContextOverflow(
+                        msg_0,
+                        messages=messages,
+                        tool_calls_made=tool_calls_made,
+                    )
                 # TRUNCATE_OLDEST: drop oldest user/assistant pair until
                 # estimate fits. Pairing-aware so tool_use/tool_result
-                # links can't dangle.
-                messages = self._truncate_oldest(messages, window)
+                # links can't dangle. ``tool_calls_made`` flows through
+                # so a ContextOverflow raised from inside truncation
+                # carries the same partial-state count as the other
+                # raise sites in this loop.
+                before = len(messages)
+                messages = self._truncate_oldest(
+                    messages, window, tool_calls_made=tool_calls_made,
+                )
+                # _truncate_oldest pops from the HEAD only, so the
+                # index shifts down by exactly the drop count; a
+                # breakpoint whose message was itself dropped is gone.
+                dropped = before - len(messages)
+                idx = cache_control.history_through_index
+                if dropped and idx is not None:
+                    from dataclasses import replace as _dc_replace
+                    new_idx = idx - dropped
+                    cache_control = _dc_replace(
+                        cache_control,
+                        history_through_index=(
+                            new_idx if new_idx >= 0 else None
+                        ),
+                    )
 
-            cache_breakpoints = self._count_cache_breakpoints(messages)
+            cache_breakpoints = self._count_cache_breakpoints(
+                messages, cache_control,
+            )
             self._emit(TurnStarted(
                 iteration=iteration,
                 input_token_estimate=request_estimate,
@@ -330,19 +665,31 @@ class ToolUseLoop:
 
             # ---- the turn -----------------------------------------------
             try:
-                response = self._provider.turn(
-                    messages,
-                    self._tools,
-                    system=self._system,
-                    max_tokens=self._max_tokens_per_turn,
-                    cache_control=self._cache_control,
-                    **self._provider_specific,
+                if self._stream:
+                    response = self._consume_stream(
+                        iteration, messages, cache_control,
+                    )
+                else:
+                    response = self._provider.turn(
+                        messages,
+                        self._tools,
+                        system=self._system,
+                        max_tokens=self._max_tokens_per_turn,
+                        cache_control=cache_control,
+                        **self._provider_specific,
+                    )
+            except Exception as exc:
+                from core.llm.providers import is_credit_exhausted
+                reason = (
+                    "credit_exhausted"
+                    if is_credit_exhausted(exc)
+                    else "provider_error"
                 )
-            except Exception:
                 self._emit(LoopTerminated(
-                    reason="provider_error",
+                    reason=reason,  # type: ignore[arg-type]
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    error_message=str(exc),
                 ))
                 raise
 
@@ -361,9 +708,37 @@ class ToolUseLoop:
                 role="assistant",
                 content=list(response.content),
             ))
+            per_turn_tokens.append(
+                (int(response.input_tokens), int(response.output_tokens)),
+            )
 
             # ---- termination by stop_reason -----------------------------
-            if response.stop_reason is StopReason.COMPLETE:
+            # A COMPLETE that arrives WITH tool calls (OpenAI-compat
+            # endpoints can report finish_reason "stop" while the
+            # message still carries tool_calls) is treated as tool-use:
+            # returning here would leave the just-appended assistant
+            # message holding dangling tool_use blocks (the next
+            # provider call rejects a tool_use without a matching
+            # tool_result) and silently drop the calls the model
+            # requested — fall through to the dispatch path instead.
+            has_tool_calls = any(
+                isinstance(b, ToolCall) for b in response.content
+            )
+            if response.stop_reason is StopReason.COMPLETE and not has_tool_calls:
+                # ``nudge_on_no_tool_call``: when the consumer set the
+                # opt-in nudge AND the assistant turn returned no tool
+                # calls (COMPLETE without tool calls means the model
+                # finalised via text), inject the nudge as a user
+                # message and continue iterating instead of
+                # terminating. The consumer's contract: the model's
+                # "I'm done" is premature; prod it back to the tools.
+                if self._nudge_on_no_tool_call is not None:
+                    messages.append(Message(
+                        role="user",
+                        content=[TextBlock(text=self._nudge_on_no_tool_call,
+                                           loop_injected=True)],
+                    ))
+                    continue
                 final_text = _join_text(response.content)
                 self._emit(LoopTerminated(
                     reason="complete",
@@ -380,6 +755,7 @@ class ToolUseLoop:
                     total_output_tokens=total_output_tokens,
                     total_cost_usd=total_cost_usd,
                     terminated_by="complete",
+                    per_turn_tokens=tuple(per_turn_tokens),
                 )
 
             # ---- PAUSE_TURN: model pause-resumed extended thinking ----
@@ -395,16 +771,52 @@ class ToolUseLoop:
             tool_calls = [b for b in response.content if isinstance(b, ToolCall)]
             if not tool_calls:
                 # No tool calls AND not COMPLETE/PAUSE_TURN — model gave
-                # up mid-turn. Map to the matching termination reason
-                # (max_tokens / refused / provider_error) so callers can
-                # tell the difference.
+                # up mid-turn under a hard stop (max_tokens / refused /
+                # provider_error). The ``nudge_on_no_tool_call`` hook
+                # deliberately does NOT fire here: for refused /
+                # provider_error the model literally can't continue
+                # (content filter tripped, provider returned error),
+                # and a nudge would be wasted budget. Soft-stop nudging
+                # is handled in the COMPLETE branch above.
+                #
+                # max_tokens is the one recoverable hard stop: the turn
+                # was cut off by ``max_tokens_per_turn``, but the
+                # conversation state is intact and the model can
+                # resume. With nudge budget remaining, inject a
+                # be-concise user message and continue instead of
+                # terminating the whole run.
+                if (
+                    response.stop_reason is StopReason.MAX_TOKENS
+                    and mt_nudges_left > 0
+                ):
+                    mt_nudges_left -= 1
+                    if not response.content:
+                        # A truncated turn may carry no complete
+                        # content blocks; providers reject an empty
+                        # assistant message on the next call — drop it
+                        # (and its token-accounting mirror entry;
+                        # totals above already counted the spend).
+                        messages.pop()
+                        per_turn_tokens.pop()
+                    messages.append(Message(
+                        role="user",
+                        content=[TextBlock(text=_MAX_TOKENS_NUDGE,
+                                           loop_injected=True)],
+                    ))
+                    logger.warning(
+                        "turn cut off by max_tokens_per_turn — "
+                        "nudging the model to continue concisely "
+                        "(%d nudge(s) left, iteration=%d)",
+                        mt_nudges_left, iteration,
+                    )
+                    continue
                 term_reason = _stop_reason_to_term(response.stop_reason)
                 # Forward error_message from the provider's TurnResponse
                 # so callers can present the actual error rather than
                 # only seeing it in warning logs.
                 err = response.error_message
                 self._emit(LoopTerminated(
-                    reason=term_reason,
+                    reason=term_reason,  # type: ignore[arg-type]
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
                     error_message=err,
@@ -420,6 +832,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by=term_reason,    # type: ignore[arg-type]
                     error_message=err,
+                    per_turn_tokens=tuple(per_turn_tokens),
                 )
 
             # ---- dispatch tools -----------------------------------------
@@ -434,6 +847,42 @@ class ToolUseLoop:
                 tool_calls_made += 1
                 self._emit(ToolCallDispatched(iteration=iteration, call=call))
 
+                # ---- parse-failed call containment ----
+                # A truncated/unparseable streaming call carries a
+                # placeholder {} input, not model-authored arguments.
+                # Never dispatch it (and, via is_error below, never
+                # let it set terminal_tool_input) — synthesise the
+                # re-issue error the model can act on next turn.
+                if getattr(call, "input_parse_error", False):
+                    result = ToolResult(
+                        tool_use_id=call.id,
+                        content=(
+                            f"tool call {call.name!r} was truncated — "
+                            "its JSON arguments did not parse and the "
+                            "call was NOT executed. Re-issue the call "
+                            "with complete arguments (keep them "
+                            "concise if the turn ran out of output "
+                            "tokens)."
+                        ),
+                        is_error=True,
+                    )
+                    duration = 0.0
+                    # Skip x-source validation and dispatch entirely.
+                    raw_content = result.content
+                    self._emit(ToolCallReturned(
+                        iteration=iteration,
+                        call_id=call.id,
+                        result=result,
+                        duration_s=duration,
+                    ))
+                    tool_results.append(ToolResult(
+                        tool_use_id=result.tool_use_id,
+                        content=wrap_tool_result(raw_content, call.name),
+                        is_error=True,
+                        raw_content=raw_content,
+                    ))
+                    continue
+
                 # ---- x-source pre-dispatch validation ----
                 discovered = _get_discovered_fields(
                     self._tools_by_name.get(call.name),
@@ -441,8 +890,11 @@ class ToolUseLoop:
                 blocked: dict[str, str] = {}
                 for field in discovered:
                     val = call.input.get(field)
-                    if isinstance(val, str) and val not in known_values:
-                        blocked[field] = val
+                    offending = list(_iter_undiscovered_values(
+                        val, known_values,
+                    ))
+                    if offending:
+                        blocked[field] = "; ".join(offending[:3])
 
                 if blocked:
                     self._emit(ToolCallBlocked(
@@ -455,7 +907,7 @@ class ToolUseLoop:
                         content=(
                             "x-source validation: "
                             + ", ".join(
-                                f"{f}={v!r}" for f, v in sorted(blocked.items())
+                                f"{f}={v}" for f, v in sorted(blocked.items())
                             )
                             + " not found in prompt or prior tool outputs. "
                             "Discover these values first."
@@ -470,7 +922,7 @@ class ToolUseLoop:
                     except ToolHandlerTimeout as exc:
                         if self._terminate_on_handler_error:
                             self._emit(LoopTerminated(
-                                reason="tool_error",
+                                reason="tool_timeout",
                                 iterations=iteration + 1,
                                 total_cost_usd=total_cost_usd,
                             ))
@@ -519,8 +971,10 @@ class ToolUseLoop:
                 #   1. Preflight on RAW content (event always fires
                 #      so operators see indicators regardless of
                 #      whether refuse is opted-in).
-                #   2. Extract x-source values from RAW (envelope
-                #      tags would pollute the discovered-values set).
+                #   2. Decide refuse-on-injection, then extract
+                #      x-source values from RAW (envelope tags would
+                #      pollute the discovered-values set; refused
+                #      content never seeds).
                 #   3. Emit ToolCallReturned with the RAW result.
                 #   4. Wrap (or refuse) for the message copy.
                 raw_content = result.content
@@ -533,10 +987,28 @@ class ToolUseLoop:
                         indicators=pf.indicators,
                     ))
 
+                # Refuse-on-injection decision (applied to the
+                # message copy below): any indicator from the
+                # consumer's opt-in list fired. Computed BEFORE
+                # x-source discovery so refused content contributes
+                # nothing.
+                refuse_hit = (
+                    self._refuse_on_indicators
+                    and pf.has_injection_indicators
+                    and any(
+                        ind in self._refuse_on_indicators
+                        for ind in pf.indicators
+                    )
+                )
+
                 # x-source value discovery: only on successful raw
-                # results (errors don't carry tool-output values).
-                if not result.is_error:
-                    known_values |= _extract_values_from_json(raw_content)
+                # results (errors don't carry tool-output values),
+                # and never from injection-refused content — the
+                # refusal's intent is "this content contributes
+                # nothing", so its leaf strings must not become
+                # dispatchable through discovered fields either.
+                if not result.is_error and not refuse_hit:
+                    _absorb(_extract_values_from_json(raw_content))
 
                 self._emit(ToolCallReturned(
                     iteration=iteration,
@@ -546,19 +1018,11 @@ class ToolUseLoop:
                 ))
 
                 # Refuse-on-injection: replace the message copy with
-                # a synthetic error if any indicator from the
-                # consumer's opt-in list fired. The original content
-                # never reaches the LLM but consumers/operators saw
-                # it via the ToolCallReturned event above and the
-                # ToolResultPreflight event further above.
-                refuse_hit = (
-                    self._refuse_on_indicators
-                    and pf.has_injection_indicators
-                    and any(
-                        ind in self._refuse_on_indicators
-                        for ind in pf.indicators
-                    )
-                )
+                # a synthetic error when the opt-in indicator fired.
+                # The original content never reaches the LLM but
+                # consumers/operators saw it via the ToolCallReturned
+                # event above and the ToolResultPreflight event
+                # further above.
                 if refuse_hit:
                     matched = sorted(
                         ind for ind in pf.indicators
@@ -581,6 +1045,10 @@ class ToolUseLoop:
                         tool_use_id=result.tool_use_id,
                         content=wrap_tool_result(raw_content, call.name),
                         is_error=result.is_error,
+                        # Provenance for resume-time x-source seeding:
+                        # the exact raw bytes in-run discovery
+                        # extracted from (see run_with_history).
+                        raw_content=raw_content,
                     )
 
                 tool_results.append(message_result)
@@ -594,7 +1062,82 @@ class ToolUseLoop:
 
             # Append tool results as user message — this keeps multi-call
             # batches in one message, matching Anthropic's wire shape.
-            messages.append(Message(role="user", content=list(tool_results)))
+            user_content: list[Any] = list(tool_results)
+            # Submission-discipline nudge: when the consumer set
+            # ``submission_warning``, evaluate it with the number of
+            # iterations remaining AFTER this turn completes (i.e., what
+            # the model has left to finalise its answer). A non-empty
+            # return is appended as a TextBlock to the same user message
+            # carrying the tool results — so the model sees the warning
+            # immediately after the tool output it just consumed,
+            # exactly the moment it would otherwise decide "let me run
+            # one more probe before submitting." The text comes AFTER
+            # the tool results so the model reads its data first, then
+            # the prod to submit.
+            # Both hooks below skip when this turn fired the terminal
+            # tool — the model just submitted, the loop is about to
+            # exit, and a "submit now!" nudge or steering push after
+            # the model already submitted is noise the consumer
+            # doesn't want surfaced. Computed once so a future off-by-
+            # one debate on either callsite can't silently drift the
+            # other.
+            iters_remaining = self._max_iterations - (iteration + 1)
+            if (
+                self._submission_warning is not None
+                and terminal_tool_input is None
+            ):
+                state = SubmissionState(
+                    iters_remaining=iters_remaining,
+                    iters_max=self._max_iterations,
+                    cost_so_far=total_cost_usd,
+                    cost_cap=self._max_cost_usd,
+                )
+                try:
+                    warning = self._submission_warning(state)
+                except Exception:        # noqa: BLE001
+                    logger.warning(
+                        "submission_warning callable raised; suppressing "
+                        "this iteration (iteration=%d)",
+                        iteration,
+                        exc_info=True,
+                    )
+                    warning = None
+                if warning:
+                    user_content.append(
+                        TextBlock(text=warning, loop_injected=True),
+                    )
+            # In-fire mutator hook: same injection pattern as
+            # submission_warning but purpose is technique-steering,
+            # not budget nudging. Skipped when the terminal tool
+            # fired (no next turn to steer).
+            if (
+                self._in_fire_mutator is not None
+                and terminal_tool_input is None
+            ):
+                mutator_ctx = InFireMutatorContext(
+                    iteration=iteration,
+                    iters_remaining=iters_remaining,
+                    iters_max=self._max_iterations,
+                    cost_so_far=total_cost_usd,
+                    cost_cap=self._max_cost_usd,
+                    messages=tuple(messages),
+                    tool_results=tuple(tool_results),
+                )
+                try:
+                    steering = self._in_fire_mutator(mutator_ctx)
+                except Exception:        # noqa: BLE001
+                    logger.warning(
+                        "in_fire_mutator callable raised; suppressing "
+                        "this iteration (iteration=%d)",
+                        iteration,
+                        exc_info=True,
+                    )
+                    steering = None
+                if steering:
+                    user_content.append(
+                        TextBlock(text=steering, loop_injected=True),
+                    )
+            messages.append(Message(role="user", content=user_content))
 
             # ---- post-dispatch termination checks -----------------------
             if terminal_tool_input is not None:
@@ -613,6 +1156,7 @@ class ToolUseLoop:
                     total_output_tokens=total_output_tokens,
                     total_cost_usd=total_cost_usd,
                     terminated_by="terminal_tool",
+                    per_turn_tokens=tuple(per_turn_tokens),
                 )
 
         # ---- max_iterations hit -----------------------------------------
@@ -631,6 +1175,7 @@ class ToolUseLoop:
             total_output_tokens=total_output_tokens,
             total_cost_usd=total_cost_usd,
             terminated_by="max_iterations",
+            per_turn_tokens=tuple(per_turn_tokens),
         )
 
     # ------------------------------------------------------------------
@@ -640,6 +1185,182 @@ class ToolUseLoop:
     def _emit(self, event: LoopEvent) -> None:
         if self._events is not None:
             self._events(event)
+
+    def _consume_stream(
+        self,
+        iteration: int,
+        messages: list[Message],
+        cache_control: CacheControl,
+    ) -> TurnResponse:
+        """Call ``turn_stream()`` and accumulate chunks into a
+        :class:`TurnResponse`, with bounded pre-content retry.
+
+        A stream that fails before ANY content/tool-use chunk arrived
+        left no partial state — re-issuing the turn is safe, so it is
+        retried up to ``_STREAM_PRE_CONTENT_RETRIES`` times (no sleep:
+        the provider layer owns transient-error backoff; this only
+        covers the reconnect). Once partial content was consumed, a
+        retry could double-execute the turn, so the failure propagates
+        as the provider's converted typed error instead."""
+        for attempt in range(_STREAM_PRE_CONTENT_RETRIES + 1):
+            content_seen = [False]
+            try:
+                return self._consume_stream_once(
+                    iteration, messages, content_seen, cache_control,
+                )
+            except Exception as exc:
+                from core.llm.providers import is_credit_exhausted
+                if (
+                    content_seen[0]
+                    or is_credit_exhausted(exc)
+                    or attempt >= _STREAM_PRE_CONTENT_RETRIES
+                ):
+                    raise
+                logger.warning(
+                    "stream failed before any content (attempt %d/%d, "
+                    "iteration=%d) — retrying the turn: %s",
+                    attempt + 1, _STREAM_PRE_CONTENT_RETRIES + 1,
+                    iteration, exc,
+                )
+        msg = "unreachable: stream retry loop exited without returning"
+        raise AssertionError(msg)
+
+    def _consume_stream_once(
+        self,
+        iteration: int,
+        messages: list[Message],
+        content_seen: list[bool],
+        cache_control: CacheControl,
+    ) -> TurnResponse:
+        """One ``turn_stream()`` pass. ``content_seen[0]`` flips to
+        True as soon as a content-bearing chunk arrives, so the caller
+        can tell a pre-content failure (retryable) from a mid-content
+        one (not) even when this raises."""
+        content_blocks: list[TextBlock | ToolCall] = []
+        text_parts: list[str] = []
+        tool_calls: dict[str, dict] = {}
+        tool_call_order: list[str] = []
+        in_text = False
+        input_tokens = output_tokens = cache_read = cache_write = 0
+        stop = StopReason.ERROR
+
+        for chunk in self._provider.turn_stream(
+            messages,
+            self._tools,
+            system=self._system,
+            max_tokens=self._max_tokens_per_turn,
+            cache_control=cache_control,
+            **self._provider_specific,
+        ):
+            if chunk.type in (
+                "text_delta", "tool_call_start",
+                "tool_call_delta", "tool_call_end",
+                # ``usage`` counts as consumed too: its StreamDelta
+                # has already reached subscribers, so a silent retry
+                # would double-emit it and a delta-summing subscriber
+                # would double-count tokens against the loop's own
+                # accounting. Forfeits pre-content retries only for a
+                # provider that emits usage BEFORE content — all
+                # three in-repo providers accumulate usage and emit
+                # it after the content loop, so this costs nothing
+                # today; it is the loop-contract guard for any future
+                # provider ordering.
+                "usage",
+            ):
+                content_seen[0] = True
+            self._emit(StreamDelta(iteration=iteration, chunk=chunk))
+
+            if chunk.type == "text_delta":
+                if not in_text and tool_calls:
+                    self._flush_text(text_parts, content_blocks)
+                    text_parts = []
+                in_text = True
+                text_parts.append(chunk.text)
+
+            elif chunk.type == "tool_call_start":
+                if in_text:
+                    self._flush_text(text_parts, content_blocks)
+                    text_parts = []
+                    in_text = False
+                tool_calls[chunk.tool_call_id] = {
+                    "name": chunk.tool_call_name,
+                    "input_parts": [],
+                }
+                tool_call_order.append(chunk.tool_call_id)
+
+            elif chunk.type == "tool_call_delta":
+                tc = tool_calls.get(chunk.tool_call_id)
+                if tc:
+                    tc["input_parts"].append(chunk.tool_call_input_delta)
+
+            elif chunk.type == "tool_call_end":
+                tc = tool_calls.get(chunk.tool_call_id)
+                if tc:
+                    raw = "".join(tc["input_parts"])
+                    parse_error = False
+                    try:
+                        args = json.loads(raw) if raw else {}
+                        if not isinstance(args, dict):
+                            # 'null', '[1,2]', '"str"' parse cleanly
+                            # but ToolCall.input is a dict — a non-dict
+                            # would crash handler dispatch. Same
+                            # treatment as a parse failure.
+                            msg = (
+                                f"parsed JSON is {type(args).__name__},"
+                                " expected object"
+                            )
+                            raise ValueError(msg)
+                    except (ValueError, TypeError):
+                        # Routine per-turn max_tokens truncation cuts
+                        # tool-call JSON mid-argument. The call block
+                        # must still be accumulated (the next turn's
+                        # tool_result needs a matching tool_use), but
+                        # flagged so the dispatch path NEVER invokes
+                        # the handler — dispatching with a synthetic
+                        # {} executes side effects, or 'submits' the
+                        # terminal tool, with arguments the model
+                        # never authored.
+                        logger.warning(
+                            "stream: unparseable tool-call JSON for "
+                            "%r: %r — the call will not be dispatched",
+                            tc["name"], raw[:400],
+                        )
+                        args = {}
+                        parse_error = True
+                    content_blocks.append(ToolCall(
+                        id=chunk.tool_call_id,
+                        name=tc["name"],
+                        input=args,
+                        input_parse_error=parse_error,
+                    ))
+
+            elif chunk.type == "usage":
+                input_tokens = chunk.input_tokens
+                output_tokens = chunk.output_tokens
+                cache_read = chunk.cache_read_tokens
+                cache_write = chunk.cache_write_tokens
+
+            elif chunk.type == "done":
+                stop = chunk.stop_reason or StopReason.ERROR
+
+        self._flush_text(text_parts, content_blocks)
+
+        return TurnResponse(
+            content=content_blocks,
+            stop_reason=stop,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        )
+
+    @staticmethod
+    def _flush_text(
+        parts: list[str],
+        blocks: list,
+    ) -> None:
+        if parts:
+            blocks.append(TextBlock(text="".join(parts)))
 
     def _dispatch_one(self, call: ToolCall) -> ToolResult:
         """Invoke the handler for ``call.name`` with optional timeout
@@ -656,7 +1377,9 @@ class ToolUseLoop:
             )
 
         if self._tool_timeout_s is None:
-            content = tool.handler(call.input)
+            content = _validated_handler_content(
+                call.name, tool.handler(call.input),
+            )
             return ToolResult(tool_use_id=call.id, content=content)
 
         # Best-effort timeout: run the handler on a thread; the parent
@@ -679,8 +1402,6 @@ class ToolUseLoop:
         # all references after `_dispatch_tool` returned —
         # impossible to introspect even when the operator KNEW
         # they had timeouts.
-        if not hasattr(self, "_stranded_tool_threads"):
-            self._stranded_tool_threads: list[threading.Thread] = []
         result_holder: dict[str, Any] = {}
         exc_holder: dict[str, BaseException] = {}
 
@@ -702,10 +1423,20 @@ class ToolUseLoop:
             # accumulating leaks via `loop._stranded_tool_threads`.
             # Don't try to kill — Python doesn't support it; the
             # daemon flag handles process-exit cleanup.
+            #
+            # Cap the list to keep memory bounded: a misbehaving
+            # handler that hangs on a blocking syscall accumulates one
+            # zombie thread per timeout, each holding its handler's
+            # stack + any FDs/sockets it opened. Drop oldest references
+            # past the cap — the threads themselves still live (daemon
+            # cleanup at process exit), we just stop holding refs.
             self._stranded_tool_threads.append(thread)
-            raise ToolHandlerTimeout(
-                f"tool {call.name!r} exceeded {self._tool_timeout_s}s timeout"
-            )
+            if len(self._stranded_tool_threads) > _MAX_STRANDED_TOOL_THREADS:
+                self._stranded_tool_threads = (
+                    self._stranded_tool_threads[-_MAX_STRANDED_TOOL_THREADS:]
+                )
+            msg = f"tool {call.name!r} exceeded {self._tool_timeout_s}s timeout"
+            raise ToolHandlerTimeout(msg)
         if "exc" in exc_holder:
             captured = exc_holder["exc"]
             if isinstance(captured, Exception):
@@ -726,11 +1457,17 @@ class ToolUseLoop:
             # the per-tool error path sees it like any other
             # handler failure; the operator can re-Ctrl-C if they
             # really want to abort.
-            raise RuntimeError(
+            msg = (
                 f"tool {call.name!r} handler raised "
                 f"{type(captured).__name__} (non-Exception BaseException)"
-            ) from captured
-        return ToolResult(tool_use_id=call.id, content=result_holder["text"])
+            )
+            raise RuntimeError(msg) from captured
+        return ToolResult(
+            tool_use_id=call.id,
+            content=_validated_handler_content(
+                call.name, result_holder["text"],
+            ),
+        )
 
     def _estimate_static_tokens(self) -> int:
         """System + tools cost. Doesn't change across iterations of a
@@ -777,20 +1514,27 @@ class ToolUseLoop:
             self._estimate_message_tokens(m) for m in messages
         )
 
-    def _count_cache_breakpoints(self, messages: Sequence[Message]) -> int:
+    def _count_cache_breakpoints(
+        self,
+        messages: Sequence[Message],
+        cache_control: CacheControl | None = None,
+    ) -> int:
         """How many regions opted in for caching this turn. Reported in
         :class:`TurnStarted` events for telemetry; doesn't drive
-        behaviour."""
+        behaviour. ``cache_control`` is the run's EFFECTIVE (possibly
+        truncation-remapped) opt-ins; defaults to the constructor
+        value for direct callers."""
+        cc = cache_control if cache_control is not None else self._cache_control
         if not self._provider.supports_prompt_caching():
             return 0
         n = 0
-        if self._cache_control.system and self._system:
+        if cc.system and self._system:
             n += 1
-        if self._cache_control.tools and self._tools:
+        if cc.tools and self._tools:
             n += 1
         if (
-            self._cache_control.history_through_index is not None
-            and 0 <= self._cache_control.history_through_index < len(messages)
+            cc.history_through_index is not None
+            and 0 <= cc.history_through_index < len(messages)
         ):
             n += 1
         return n
@@ -799,10 +1543,12 @@ class ToolUseLoop:
         self,
         messages: list[Message],
         window: int,
+        *,
+        tool_calls_made: int = 0,
     ) -> list[Message]:
-        """Drop oldest user/assistant pairs until estimate fits.
+        r"""Drop oldest user/assistant pairs until estimate fits.
 
-        Pairing-aware: a user-role message carrying :class:`ToolResult`\\ s
+        Pairing-aware: a user-role message carrying :class:`ToolResult`\ s
         is a *response* to the prior assistant turn. We never drop a
         ToolResult message without also dropping its matching ToolCall,
         otherwise the next ``provider.turn()`` rejects the conversation
@@ -840,12 +1586,52 @@ class ToolUseLoop:
                 messages.pop(0)
                 total -= per_msg.pop(0)
 
+        # The pair-drop above only covers tool_call/tool_result links.
+        # In a plain text-turn history, dropping the oldest USER
+        # message leaves an assistant message at the head — providers
+        # reject a conversation that opens mid-exchange (assistant
+        # first, or a tool_result whose tool_use was dropped), turning
+        # the first truncation into a hard 400. Keep dropping until a
+        # plain user message leads; the extra drops only reduce the
+        # estimate further.
+        while len(messages) > 1 and (
+            messages[0].role == "assistant"
+            or any(isinstance(b, ToolResult) for b in messages[0].content)
+        ):
+            messages.pop(0)
+            total -= per_msg.pop(0)
+
         if total >= window:
-            raise ContextOverflow(
+            msg = (
                 f"request estimate ~{total} tokens still exceeds window "
                 f"{window} after truncating to {len(messages)} message(s); "
                 "the trailing message itself is too large — shorten the "
                 "prompt or use a model with a bigger context"
+            )
+            raise ContextOverflow(
+                msg,
+                messages=messages,
+                tool_calls_made=tool_calls_made,
+            )
+        # The head-cleanup loop stops at one message, so a pathological
+        # history can end as a SINGLE leading assistant turn or
+        # orphaned tool-result — a shape every provider rejects.
+        # Raise the typed truncation error instead of shipping a
+        # guaranteed 400.
+        if messages and (
+            messages[0].role == "assistant"
+            or any(isinstance(b, ToolResult) for b in messages[0].content)
+        ):
+            msg = (
+                "truncation reduced the conversation to a single "
+                f"{messages[0].role} message that cannot open a "
+                "conversation (assistant turn or orphaned tool_result) "
+                "— resume with a fresh user prompt or a bigger context"
+            )
+            raise ContextOverflow(
+                msg,
+                messages=messages,
+                tool_calls_made=tool_calls_made,
             )
         return messages
 
@@ -853,6 +1639,26 @@ class ToolUseLoop:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _validated_handler_content(tool_name: str, content: Any) -> str:
+    """Type-check a handler's return value at the dispatch site.
+
+    A handler returning non-str (None, dict, ...) used to sail into
+    ``ToolResult`` and explode later in ``preflight``/
+    ``wrap_tool_result`` — OUTSIDE the per-tool error containment, so
+    the whole run died with an unattributed traceback instead of an
+    ``is_error`` result. Raising here makes the wrong-return-type
+    member of the handler-failure enumeration flow through the same
+    ``terminate_on_handler_error`` policy as exceptions and timeouts.
+    """
+    if not isinstance(content, str):
+        msg = (
+            f"tool {tool_name!r} handler returned "
+            f"{type(content).__name__}, expected str"
+        )
+        raise TypeError(msg)
+    return content
 
 
 def _join_text(content: Sequence[Any]) -> str:
@@ -891,7 +1697,48 @@ def _stop_reason_to_term(reason: StopReason) -> str:
 
 _TOKEN_SPLIT = re.compile(r"[\s,;|\"'`(){}\[\]]+")
 _MIN_TOKEN_LEN = 3
+# Hard bound on the per-run discovered-values set — enforced at every
+# extraction lane AND at the shared-union merge (it was previously a
+# walk-local check only, so the non-JSON token fallback and the per-run
+# union escaped it: one hostile 24 MB tool result retained a
+# multi-million-entry set in the orchestration process for the whole
+# run). Trade-off, both directions: LARGER retains more legitimately
+# discovered values on very chatty runs (past the cap, new discoveries
+# stop registering and x-source gated fields start false-blocking —
+# the safe direction, loudly warned once); SMALLER bounds memory
+# tighter but false-blocks earlier. 50k values at the length ceiling
+# below is a few tens of MB worst-case — small next to message
+# history, large next to any honest run's discovery volume.
 _MAX_KNOWN_VALUES = 50_000
+# Per-value length ceiling. The pre-dispatch gate compares EXACT
+# strings, so a multi-KB "value" has no legitimate x-source use (no
+# model echoes a 6 MB blob byte-exactly into a tool argument) — but an
+# unbounded leaf let a single JSON string retain megabytes. Trade-off,
+# both directions: LARGER admits longer genuine values (full URLs with
+# long query strings, deep paths) at more retained bytes per entry;
+# SMALLER bounds memory but false-blocks any gated field whose genuine
+# value exceeds it. 1024 covers observed URL/path/id shapes with wide
+# margin. Oversized leaves are SKIPPED, not truncated — a truncated
+# entry could never match the exact-string gate anyway.
+_MAX_KNOWN_VALUE_LEN = 1024
+
+
+def _merge_known_values(dest: set[str], src: set[str]) -> bool:
+    """Merge newly extracted values into the run's shared set,
+    enforcing ``_MAX_KNOWN_VALUES`` on the UNION (the extraction-lane
+    budgets bound each result; without this, repeated near-cap results
+    still grew the run set monotonically across up to 50 iterations).
+    Already-known members are free. Returns True when the cap clipped
+    at least one new value — the caller warns once per run."""
+    clipped = False
+    for v in src:
+        if v in dest:
+            continue
+        if len(dest) >= _MAX_KNOWN_VALUES:
+            clipped = True
+            break
+        dest.add(v)
+    return clipped
 
 
 def _extract_tokens_from_text(text: str) -> set[str]:
@@ -899,23 +1746,37 @@ def _extract_tokens_from_text(text: str) -> set[str]:
 
     Splits on whitespace/punctuation, strips edge junk, includes
     slash-split components (``"owner/repo"`` yields both the whole
-    string and ``"owner"``, ``"repo"``).
+    string and ``"owner"``, ``"repo"``). Budgeted: stops collecting at
+    ``_MAX_KNOWN_VALUES`` and skips tokens over the per-value length
+    ceiling — this is the lane hostile non-JSON blobs (file contents,
+    command output) hit.
     """
     values: set[str] = set()
     for raw in _TOKEN_SPLIT.split(text):
+        if len(values) >= _MAX_KNOWN_VALUES:
+            break
         token = raw.strip(".,;:!?()[]{}\"'<>")
-        if len(token) < _MIN_TOKEN_LEN:
+        if not (_MIN_TOKEN_LEN <= len(token) <= _MAX_KNOWN_VALUE_LEN):
             continue
         values.add(token)
         if "/" in token:
             for part in token.split("/"):
-                if len(part) >= _MIN_TOKEN_LEN:
+                # Strict accounting: a top-of-token check alone lets
+                # the boundary token's slash-parts finish over the
+                # cap — the constant advertises a bound the lane
+                # itself must honour exactly.
+                if len(values) >= _MAX_KNOWN_VALUES:
+                    break
+                if _MIN_TOKEN_LEN <= len(part) <= _MAX_KNOWN_VALUE_LEN:
                     values.add(part)
     return values
 
 
 def _extract_values_from_json(text: str) -> set[str]:
-    """Walk a JSON tool result and collect leaf strings."""
+    """Walk a JSON tool result and collect leaf strings. Budgeted like
+    the token fallback: at most ``_MAX_KNOWN_VALUES`` entries, each at
+    most ``_MAX_KNOWN_VALUE_LEN`` chars (oversized leaves are skipped
+    whole — see the constant's rationale)."""
     try:
         obj = json.loads(text)
     except (json.JSONDecodeError, TypeError):
@@ -932,12 +1793,33 @@ def _extract_values_from_json(text: str) -> set[str]:
         elif isinstance(node, list):
             for v in node:
                 _walk(v, depth + 1)
-        elif isinstance(node, str) and len(node) >= _MIN_TOKEN_LEN:
+        elif isinstance(node, str):
+            if not (_MIN_TOKEN_LEN <= len(node) <= _MAX_KNOWN_VALUE_LEN):
+                return
             values.add(node)
             if "/" in node:
                 for part in node.split("/"):
-                    if len(part) >= _MIN_TOKEN_LEN:
+                    # Strict accounting — same boundary rule as the
+                    # token lane: the walk-entry check alone lets a
+                    # boundary leaf's slash-parts finish over the cap.
+                    if len(values) >= _MAX_KNOWN_VALUES:
+                        break
+                    if _MIN_TOKEN_LEN <= len(part) <= _MAX_KNOWN_VALUE_LEN:
                         values.add(part)
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            # Numeric leaves register their str() form: the
+            # pre-dispatch gate requires numbers to have been
+            # "discovered in string form" (str(val) membership), and
+            # str leaves were the only shape collected — a
+            # numerically-typed discovered value (pid, port, count)
+            # was permanently blocked with a misleading
+            # "discover these values first" error. bool stays
+            # excluded (structural; the gate passes it
+            # unconditionally); the min-token-length rule applies to
+            # the rendered form like any other value.
+            rendered = str(node)
+            if _MIN_TOKEN_LEN <= len(rendered) <= _MAX_KNOWN_VALUE_LEN:
+                values.add(rendered)
 
     _walk(obj)
     return values
@@ -953,3 +1835,55 @@ def _get_discovered_fields(tool: ToolDef | None) -> set[str]:
         for name, schema in props.items()
         if isinstance(schema, dict) and schema.get("x-source") == "discovered"
     }
+
+
+# Depth bound for the x-source container walk — model-authored JSON
+# has no legitimate use for deeper nesting in a discovered field.
+_GATE_MAX_DEPTH = 20
+
+
+def _iter_undiscovered_values(val: Any, known_values: set[str],
+                              depth: int = 0):
+    """Yield the undiscovered value carriers inside *val*.
+
+    The pre-dispatch gate used to check ``isinstance(val, str)`` only —
+    any non-string carrier (a list-wrapped URL, a dict, an int) holding
+    an undiscovered value dispatched unchecked, violating the ToolDef
+    contract that discovered fields are "validated against known_values
+    before dispatch" (PoC: list-wrapped URL dispatched while the
+    identical string was blocked). Recurse into containers — including
+    dict KEYS, which carry data just as well as values — and treat
+    every string by the same membership rule as the top level.
+    Non-string scalars: bool/None are structural and pass; numbers must
+    have been discovered in string form (a discovered field has no
+    legitimate use for a never-seen number). Unknown carrier types fail
+    closed.
+
+    Yields display strings for the block message; empty iteration means
+    the value passes.
+    """
+    if depth > _GATE_MAX_DEPTH:
+        yield f"<nesting deeper than {_GATE_MAX_DEPTH} levels>"
+        return
+    if val is None or isinstance(val, bool):
+        return
+    if isinstance(val, str):
+        if val not in known_values:
+            yield val
+        return
+    if isinstance(val, (int, float)):
+        if str(val) not in known_values:
+            yield str(val)
+        return
+    if isinstance(val, dict):
+        for k, v in val.items():
+            yield from _iter_undiscovered_values(k, known_values, depth + 1)
+            yield from _iter_undiscovered_values(v, known_values, depth + 1)
+        return
+    if isinstance(val, (list, tuple, set, frozenset)):
+        for item in val:
+            yield from _iter_undiscovered_values(item, known_values,
+                                                 depth + 1)
+        return
+    # Unrecognised carrier — fail closed rather than dispatch it.
+    yield f"<unsupported value type {type(val).__name__}>"

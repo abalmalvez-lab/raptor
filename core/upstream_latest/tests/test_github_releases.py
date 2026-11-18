@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pytest
 
@@ -14,20 +14,19 @@ from core.upstream_latest.github_releases import (
     latest_tag,
 )
 
-
 # ---------------------------------------------------------------------------
 # Stub HttpClient — records every URL hit + headers, replies with
 # operator-supplied payloads.
 # ---------------------------------------------------------------------------
 
 class _StubHttp:
-    def __init__(self, urls: Dict[str, Any], *,
-                 raise_on: Optional[str] = None,
-                 raise_with: Optional[Exception] = None):
+    def __init__(self, urls: dict[str, Any], *,
+                 raise_on: str | None = None,
+                 raise_with: Exception | None = None):
         self._urls = urls
         self._raise_on = raise_on
         self._raise_with = raise_with or HttpError("stub error")
-        self.calls: List[Dict[str, Any]] = []
+        self.calls: list[dict[str, Any]] = []
 
     def get_json(self, url: str, **kwargs):
         self.calls.append({"url": url, "headers": kwargs.get("headers", {})})
@@ -40,9 +39,9 @@ class _StubHttp:
 
 class _StubCache:
     def __init__(self):
-        self.store: Dict[str, Any] = {}
-        self.gets: List[str] = []
-        self.puts: List[str] = []
+        self.store: dict[str, Any] = {}
+        self.gets: list[str] = []
+        self.puts: list[str] = []
 
     def get(self, key: str, *, ttl_seconds: int):
         self.gets.append(key)
@@ -312,3 +311,58 @@ def test_resolve_tag_malformed_object_raises() -> None:
     })
     with pytest.raises(UpstreamLookupError):
         resolve_tag_to_sha("x/y", "v1", http=http)
+
+
+def test_repo_slug_shapes_rejected() -> None:
+    # Slugs come out of target manifests; they must not be able to
+    # reshape the API URL (extra segments, traversal, query strings).
+    for bad in ("owner/name/extra", "owner", "../secrets",
+                "owner/..", "owner/name?x=1", "owner/name#f",
+                "a/b/../c", ""):
+        with pytest.raises(UpstreamLookupError, match="slug refused"):
+            latest_release(bad, http=_StubHttp({}), cache=None)
+
+
+def test_tag_is_percent_encoded_in_url() -> None:
+    seen = []
+
+    class _Spy(_StubHttp):
+        def get_json(self, url, **kw):
+            seen.append(url)
+            return super().get_json(url, **kw)
+
+    tag = "v1.0/../evil?x=1"
+    from urllib.parse import quote
+    url = (f"https://api.github.com/repos/o/r/git/refs/tags/"
+           f"{quote(tag, safe='')}")
+    http = _Spy({url: {"object": {"sha": "a" * 40, "type": "commit"}}})
+    assert resolve_tag_to_sha("o/r", tag, http=http, cache=None) == "a" * 40
+    assert seen == [url]
+
+
+def test_latest_tag_follows_pagination_past_pre_release_page() -> None:
+    """A stable tag beyond a full first page of pre-releases must be
+    found: the tags endpoint is commit-date ordered, so a project that
+    cuts nightlies buries its stable tags pages deep."""
+    base = "https://api.github.com/repos/owner/repo/tags"
+    page1 = [{"name": f"nightly-{i:03d}"} for i in range(100)]
+    page2 = [{"name": "v1.4.0"}, {"name": "v1.2.0"}]
+    http = _StubHttp({
+        f"{base}?per_page=100": page1,
+        f"{base}?per_page=100&page=2": page2,
+    })
+    assert latest_tag("owner/repo", http=http) == "v1.4.0"
+
+
+def test_latest_tag_page_scan_is_bounded() -> None:
+    """All-pre-release repos stop at the page cap, then raise."""
+    base = "https://api.github.com/repos/owner/repo/tags"
+    urls = {f"{base}?per_page=100": [
+        {"name": f"nightly-{i:03d}"} for i in range(100)]}
+    for page in range(2, 10):
+        urls[f"{base}?per_page=100&page={page}"] = [
+            {"name": f"nightly-{page}-{i:03d}"} for i in range(100)]
+    http = _StubHttp(urls)
+    with pytest.raises(NoStableVersionsFound):
+        latest_tag("owner/repo", http=http)
+    assert len(http.calls) <= 3

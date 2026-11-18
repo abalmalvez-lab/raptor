@@ -1,6 +1,6 @@
-"""End-to-end test: run the libexec shims against the real corpus.
+"""End-to-end test: run the corpus shims against the real corpus.
 
-Verifies the full pipeline (libexec shim → core module → CSV → metrics)
+Verifies the full pipeline (script → core module → CSV → metrics)
 works against the committed corpus without any LLM/network dependencies.
 """
 
@@ -12,25 +12,50 @@ from pathlib import Path
 
 import pytest
 
-from core.dataflow.label import VERDICT_FALSE_POSITIVE, VERDICT_TRUE_POSITIVE
+
+# Module-level marker — every test in this file spawns real Python
+# subprocesses against the corpus shims (raptor-corpus-run +
+# raptor-corpus-metrics). Skipped from default fast-tier; opt in
+# with ``pytest -m integration``.
+pytestmark = pytest.mark.integration
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_LIBEXEC = _REPO_ROOT / "libexec"
+# Shims moved out of libexec/ (which is for framework-internal scripts
+# the launcher/hooks/other libexec scripts invoke) into the dataflow
+# package's own ``scripts/`` directory. Dev-tooling co-located with
+# the module it operates on; no longer pretends to be LLM-callable
+# internal infrastructure.
+_SCRIPTS = _REPO_ROOT / "core" / "dataflow" / "scripts"
 _CORPUS = _REPO_ROOT / "core" / "dataflow" / "corpus" / "findings"
 
 
 def _shim(name: str) -> Path:
-    p = _LIBEXEC / name
+    # Strip the historical "raptor-" prefix from libexec days — the
+    # scripts no longer live in PATH-shaped /libexec so a project-
+    # qualifying prefix on the filename is redundant.
+    short = name.removeprefix("raptor-")
+    p = _SCRIPTS / short
     if not p.exists() or not p.is_file():
-        pytest.skip(f"libexec shim missing: {p}")
+        pytest.skip(f"corpus script missing: {p}")
     return p
+
+
+def _shim_env() -> dict:
+    # The scripts' sys.path bootstrap is the RAPTOR_DIR hard lookup
+    # (launcher contract) — provide it the way the launcher would,
+    # pointing at THIS checkout so the tests exercise this tree.
+    import os
+    env = dict(os.environ)
+    env["RAPTOR_DIR"] = str(_REPO_ROOT)
+    return env
 
 
 def test_corpus_run_shim_produces_csv_with_one_row_per_finding(tmp_path: Path):
     out = tmp_path / "result.csv"
     rc = subprocess.call(
-        [sys.executable, str(_shim("raptor-corpus-run")), "--output", str(out)]
+        [sys.executable, str(_shim("raptor-corpus-run")), "--output", str(out)],
+        env=_shim_env(),
     )
     assert rc == 0
     assert out.exists()
@@ -44,7 +69,8 @@ def test_corpus_run_shim_produces_csv_with_one_row_per_finding(tmp_path: Path):
 def test_corpus_run_shim_then_metrics_shim_succeeds(tmp_path: Path):
     csv_path = tmp_path / "result.csv"
     rc = subprocess.call(
-        [sys.executable, str(_shim("raptor-corpus-run")), "--output", str(csv_path)]
+        [sys.executable, str(_shim("raptor-corpus-run")), "--output", str(csv_path)],
+        env=_shim_env(),
     )
     assert rc == 0
 
@@ -53,13 +79,16 @@ def test_corpus_run_shim_then_metrics_shim_succeeds(tmp_path: Path):
         capture_output=True,
         text=True,
         check=False,
+        env=_shim_env(),
     )
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout
     assert "Total findings:" in out
     assert "Precision:" in out
-    assert VERDICT_TRUE_POSITIVE in out or "True positives" in out
-    assert VERDICT_FALSE_POSITIVE in out or "False positives" in out
+    assert "Classified true-positive labels:" in out
+    assert "Classified false-positive labels:" in out
+    assert "validator-confirmed:" in out and "missed:" in out
+    assert "suppressed:" in out and "leaked:" in out
 
 
 def test_metrics_shim_pivot_gate_passes_on_seed_corpus(tmp_path: Path):
@@ -68,10 +97,12 @@ def test_metrics_shim_pivot_gate_passes_on_seed_corpus(tmp_path: Path):
     grow the corpus where the gate becomes meaningful."""
     csv_path = tmp_path / "result.csv"
     subprocess.check_call(
-        [sys.executable, str(_shim("raptor-corpus-run")), "--output", str(csv_path)]
+        [sys.executable, str(_shim("raptor-corpus-run")), "--output", str(csv_path)],
+        env=_shim_env(),
     )
     rc = subprocess.call(
         [sys.executable, str(_shim("raptor-corpus-metrics")),
-         str(csv_path), "--check-pivot-gate"]
+         str(csv_path), "--check-pivot-gate"],
+        env=_shim_env(),
     )
     assert rc == 0

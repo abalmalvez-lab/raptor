@@ -37,25 +37,30 @@ versions.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any
 
+from core.hash import sha256_file
 from core.function_taxonomy import (
     ALLOC_FUNCS,
     EXEC_FUNCS,
     FORMAT_STRING_FUNCS,
     INTEGER_PARSE_FUNCS,
+    IPC_FUNCS,
+    KERNEL_TRACE_FUNCS,
     MEMORY_COPY_FUNCS,
     NETWORK_INGEST_FUNCS,
     PARSER_FUNCS,
+    PROCESS_BOUNDARY_FUNCS,
+    RUNTIME_PRIVILEGE_FUNCS,
     SCAN_FAMILY_FUNCS,
+    STREAM_INPUT_FUNCS,
     STRING_OVERFLOW_FUNCS,
     TOCTOU_FUNCS,
 )
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +68,36 @@ logger = logging.getLogger(__name__)
 # Schema version. Bump when changing the meaning of any
 # fingerprint field. Consumers check this on read and refuse to
 # diff across versions (better to recompute than mis-attribute).
-FINGERPRINT_SCHEMA_VERSION = 1
+#
+# v2: added stream_input / process_boundary / ipc buckets. A binary
+# fingerprinted under v1 may legitimately have these capabilities
+# but they were not surfaced — re-fingerprint rather than diff across
+# the bump.
+# v3: added runtime_privilege / kernel_trace buckets — supply-chain
+# forensic surface (setuid / bpf / ptrace / perf_event_open et al.).
+# Same re-fingerprint guidance as v1→v2.
+# v4: tier-1 (radare2) imports are normalised through
+# ``strip_import_prefix`` before bucketing, matching the manifest
+# path. A Mach-O / PE binary fingerprinted under v3 could carry
+# systematically EMPTY buckets (``_strcpy`` never matched the bare
+# ``strcpy`` taxonomy) — diffing v3 against v4 would surface every
+# real capability as a spurious high-severity addition, so
+# re-fingerprint instead.
+#
+# Migration is operator-transparent: ``fingerprint_store._load_fingerprint``
+# treats any stored fingerprint whose ``schema_version`` doesn't equal
+# the current ``FINGERPRINT_SCHEMA_VERSION`` as "no baseline" and
+# the next scan re-fingerprints from bytes.  No manual cache flush
+# needed; the first scan after the bump pays the re-fingerprint cost
+# (sub-millisecond per binary via :mod:`core.binary.elf`).
+FINGERPRINT_SCHEMA_VERSION = 4
 
 
 # Per-bucket capability classification. Single source of truth —
 # the SCA bump detector and any future capability-aware consumer
 # imports from here so the bucket names stay consistent across
 # fingerprints + findings + drift records.
-BUCKETS: Tuple[Tuple[str, FrozenSet[str]], ...] = (
+BUCKETS: tuple[tuple[str, frozenset[str]], ...] = (
     ("exec", EXEC_FUNCS),
     ("network", NETWORK_INGEST_FUNCS),
     ("string_overflow", STRING_OVERFLOW_FUNCS),
@@ -81,15 +108,26 @@ BUCKETS: Tuple[Tuple[str, FrozenSet[str]], ...] = (
     ("parser", PARSER_FUNCS),
     ("integer_parse", INTEGER_PARSE_FUNCS),
     ("toctou", TOCTOU_FUNCS),
+    ("stream_input", STREAM_INPUT_FUNCS),
+    ("process_boundary", PROCESS_BOUNDARY_FUNCS),
+    ("ipc", IPC_FUNCS),
+    # Added in v3 — supply-chain forensic surface.
+    ("runtime_privilege", RUNTIME_PRIVILEGE_FUNCS),
+    ("kernel_trace", KERNEL_TRACE_FUNCS),
 )
 
 # Buckets that warrant high-severity treatment when they appear
 # as a NEW addition (drift detection, bump capability-delta).
 # ``exec`` is RCE-flavoured; ``network`` is exfil-flavoured.
-HIGH_SEVERITY_BUCKETS: FrozenSet[str] = frozenset({"exec", "network"})
+# ``runtime_privilege`` and ``kernel_trace`` are the supply-chain
+# forensic flavour — their presence in a package's native binary
+# is rare and high-signal regardless of the host being a delta.
+HIGH_SEVERITY_BUCKETS: frozenset[str] = frozenset({
+    "exec", "network", "runtime_privilege", "kernel_trace",
+})
 
 
-def bucket_imports(imports: Set[str]) -> Dict[str, Set[str]]:
+def bucket_imports(imports: set[str]) -> dict[str, set[str]]:
     """Classify an import set by capability bucket.
 
     Returns ``{bucket_name: {fn1, fn2, ...}}`` for each bucket
@@ -98,7 +136,7 @@ def bucket_imports(imports: Set[str]) -> Dict[str, Set[str]]:
     ubiquitous functions like ``malloc`` / ``printf`` / ``read``
     aren't signal at fingerprint scale either.
     """
-    out: Dict[str, Set[str]] = {}
+    out: dict[str, set[str]] = {}
     for bucket_name, fn_set in BUCKETS:
         matched = imports & fn_set
         if matched:
@@ -130,9 +168,9 @@ class CapabilityFingerprint:
     arch: str
     bits: int
     binary_format: str        # 'elf' / 'mach-o' / 'pe'
-    capability_buckets: Dict[str, List[str]] = field(default_factory=dict)
+    capability_buckets: dict[str, list[str]] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Full JSON-ready representation INCLUDING the
         informational ``binary_path``. For storage / operator-
         facing rendering / SBOM property. Use
@@ -155,7 +193,7 @@ class CapabilityFingerprint:
             },
         }
 
-    def _comparison_dict(self) -> Dict[str, Any]:
+    def _comparison_dict(self) -> dict[str, Any]:
         """The fields that define identity for comparison / drift
         detection. Excludes ``binary_path`` (legitimately varies
         across machines / tempdirs for the same bytes)."""
@@ -164,13 +202,21 @@ class CapabilityFingerprint:
         return d
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CapabilityFingerprint":
+    def from_dict(cls, data: dict[str, Any]) -> CapabilityFingerprint:
+        try:
+            schema_ver = int(data.get("schema_version", 0))
+        except (ValueError, TypeError):
+            schema_ver = 0
+        try:
+            bits_val = int(data.get("bits", 0))
+        except (ValueError, TypeError):
+            bits_val = 0
         return cls(
-            schema_version=int(data.get("schema_version", 0)),
+            schema_version=schema_ver,
             binary_path=str(data.get("binary_path", "")),
             binary_sha256=str(data.get("binary_sha256", "")),
             arch=str(data.get("arch", "")),
-            bits=int(data.get("bits", 0)),
+            bits=bits_val,
             binary_format=str(data.get("binary_format", "")),
             capability_buckets={
                 str(k): list(v) for k, v in (
@@ -197,7 +243,7 @@ class CapabilityFingerprint:
 
 def capability_fingerprint(
     binary_path: Path,
-) -> Optional[CapabilityFingerprint]:
+) -> CapabilityFingerprint | None:
     """Compute the capability fingerprint of ``binary_path``.
 
     Tier dispatch:
@@ -244,7 +290,7 @@ def capability_fingerprint(
 
 def _fingerprint_via_elf(
     binary_path: Path, content_hash: str,
-) -> Optional[CapabilityFingerprint]:
+) -> CapabilityFingerprint | None:
     """Try the stdlib ELF parser. Returns ``None`` for non-ELF
     inputs or unrecoverable parse failures — caller falls
     through to tier 1."""
@@ -267,13 +313,14 @@ def _fingerprint_via_elf(
 
 def _fingerprint_via_radare2(
     binary_path: Path, content_hash: str,
-) -> Optional[CapabilityFingerprint]:
+) -> CapabilityFingerprint | None:
     """Tier 1 fallback. Used for PE / Mach-O and any input the
     ELF parser couldn't identify. Returns ``None`` if radare2
     isn't installed, or if the analyser couldn't extract any
     meaningful signal from the file (empty bytes, unrecognised
     format, etc.)."""
     try:
+        from packages.binary_analysis._symbols import strip_import_prefix
         from packages.binary_analysis.radare2_understand import (
             analyse_binary_context,
             probe_capability,
@@ -310,11 +357,11 @@ def _fingerprint_via_radare2(
         return None
 
     # Empty file, unrecognised format, or anything radare2 opened
-    # but couldn't classify yields a fully-empty context. Reject
-    # — a fingerprint of "I have nothing to say about this file"
-    # only pollutes the fingerprint store (drift detection would
-    # match every unparseable file to every other one via the
-    # empty-string SHA isn't even unique once the file is empty).
+    # but couldn't classify yields a fully-empty context. Reject —
+    # a fingerprint of "I have nothing to say about this file"
+    # only pollutes the fingerprint store: drift detection would
+    # match every unparseable file to every other one, since the
+    # empty capability shape is shared by all of them.
     if (not ctx.binary_format and not ctx.arch
             and not ctx.imports):
         logger.debug(
@@ -324,7 +371,16 @@ def _fingerprint_via_radare2(
         )
         return None
 
-    buckets = bucket_imports(set(ctx.imports))
+    # Normalise import names the same way the manifest path does
+    # (manifest._normalise_symbol → strip_import_prefix): r2 emits
+    # Mach-O imports with a leading ``_`` (``_strcpy``) and PE ones
+    # can carry ``__imp_`` / ``sym.imp.`` prefixes, while the bucket
+    # taxonomy holds bare names. Without this, tier-1 fingerprints
+    # (the only tier PE / Mach-O reach) report systematically empty
+    # buckets for binaries that clearly import dangerous functions.
+    buckets = bucket_imports({
+        strip_import_prefix(item) for item in ctx.imports
+    })
     return CapabilityFingerprint(
         schema_version=FINGERPRINT_SCHEMA_VERSION,
         binary_path=str(binary_path),
@@ -339,22 +395,19 @@ def _fingerprint_via_radare2(
 def _sha256_of_file(path: Path, *, chunk_size: int = 64 * 1024) -> str:
     """Stream-hash a file. ``64KB`` chunks balance throughput vs
     memory across small (binaries) + large (containers) inputs.
+
+    Thin wrapper over :func:`core.hash.sha256_file` — the repo's
+    single streamed-hash chokepoint — so hash-policy changes
+    apply here too.
     """
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    return sha256_file(Path(path), chunk_size=chunk_size)
 
 
 __all__ = [
     "BUCKETS",
-    "CapabilityFingerprint",
     "FINGERPRINT_SCHEMA_VERSION",
     "HIGH_SEVERITY_BUCKETS",
+    "CapabilityFingerprint",
     "bucket_imports",
     "capability_fingerprint",
 ]

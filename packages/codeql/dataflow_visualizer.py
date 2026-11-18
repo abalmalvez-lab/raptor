@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 CodeQL Dataflow Visualizer
 
@@ -10,16 +9,23 @@ Creates visual representations of CodeQL dataflow paths in multiple formats:
 """
 
 import json
+import os
 import sys
-from pathlib import Path
-from typing import Dict, List
 from html import escape
+from pathlib import Path
 
-# Add parent directory to path for imports
-# packages/codeql/dataflow_visualizer.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[2]))
+# `os.environ["RAPTOR_DIR"]` (no fallback) is the canonical project
+# root marker — see CLAUDE.md "Python path safety"; a KeyError surfaces
+# the configuration problem at startup instead of a positional walk
+# silently breaking under relocation.
+if __name__ == "__main__":
+    sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
+from core.atomic_fs import write_text_atomically
+from core.llm.context_window import DATAFLOW_STEP_CONTEXT_LINES
 from core.logging import get_logger
+from core.source import read_contained_text_capped
+from core.source.lines import split_lines
 from packages.codeql.dataflow_validator import DataflowPath
 
 logger = get_logger()
@@ -36,7 +42,7 @@ class DataflowVisualizer:
     - DOT: Graphviz format for custom rendering
     """
 
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path) -> None:
         """
         Initialize visualizer.
 
@@ -52,7 +58,7 @@ class DataflowVisualizer:
         dataflow: DataflowPath,
         finding_id: str,
         repo_path: Path
-    ) -> Dict[str, Path]:
+    ) -> dict[str, Path]:
         """
         Generate all visualization formats for a dataflow path.
 
@@ -69,27 +75,27 @@ class DataflowVisualizer:
         # Generate each format
         try:
             outputs['html'] = self.generate_html(dataflow, finding_id, repo_path)
-            self.logger.info(f"Generated HTML visualization: {outputs['html']}")
-        except Exception as e:
-            self.logger.warning(f"Failed to generate HTML: {e}")
+            self.logger.info("Generated HTML visualization: %s", outputs['html'])
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning("Failed to generate HTML: %s", e)
 
         try:
             outputs['mermaid'] = self.generate_mermaid(dataflow, finding_id)
-            self.logger.info(f"Generated Mermaid diagram: {outputs['mermaid']}")
-        except Exception as e:
-            self.logger.warning(f"Failed to generate Mermaid: {e}")
+            self.logger.info("Generated Mermaid diagram: %s", outputs['mermaid'])
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning("Failed to generate Mermaid: %s", e)
 
         try:
             outputs['ascii'] = self.generate_ascii(dataflow, finding_id)
-            self.logger.info(f"Generated ASCII visualization: {outputs['ascii']}")
-        except Exception as e:
-            self.logger.warning(f"Failed to generate ASCII: {e}")
+            self.logger.info("Generated ASCII visualization: %s", outputs['ascii'])
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning("Failed to generate ASCII: %s", e)
 
         try:
             outputs['dot'] = self.generate_dot(dataflow, finding_id)
-            self.logger.info(f"Generated DOT file: {outputs['dot']}")
-        except Exception as e:
-            self.logger.warning(f"Failed to generate DOT: {e}")
+            self.logger.info("Generated DOT file: %s", outputs['dot'])
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning("Failed to generate DOT: %s", e)
 
         return outputs
 
@@ -102,7 +108,9 @@ class DataflowVisualizer:
         """
         Generate interactive HTML visualization.
 
-        Creates a self-contained HTML file with embedded D3.js visualization.
+        Embeds graph data and styles in the HTML and loads D3.js from an
+        external CDN for the interactive view. If the library cannot load,
+        the page displays an unavailable-library notice.
 
         Args:
             dataflow: DataflowPath object
@@ -153,12 +161,12 @@ class DataflowVisualizer:
         })
         edges.append({'source': sink_id - 1, 'target': sink_id})
 
-        # Read source code for each location. In some super niche cases, this might be a vulnerability, albeit very unlikely and low impact.
-        # Anyhoo, we fix it by ensuring the file path is within the repo.
+        # Resolve for distinct outside-root messaging; the anchored reader
+        # checks containment again when opening each source file.
         for node in nodes:
             try:
                 # Validate file path to prevent directory traversal
-                file_path = (repo_path / node['file']).resolve()
+                file_path = (repo_path / str(node['file'])).resolve()
                 repo_resolved = repo_path.resolve()
                 try:
                     file_path.relative_to(repo_resolved)
@@ -167,23 +175,66 @@ class DataflowVisualizer:
                     continue
                 
                 if file_path.exists():
-                    with open(file_path) as f:
-                        lines = f.readlines()
+                    # Capped read (shared 10 MB default), mirroring
+                    # the two siblings that already adopted it
+                    # (autonomous_analyzer.read_vulnerable_code,
+                    # dataflow_validator.read_source_context): this
+                    # runs per node per finding under the analyzer's
+                    # default enable_visualization=True, and a node
+                    # located in a repo's multi-hundred-MB
+                    # generated/blob file was pulled into memory
+                    # each time.
+                    got = read_contained_text_capped(
+                        repo_resolved, file_path, newline="",
+                    )
+                    if got is None:
+                        node['code_context'] = (
+                            f"Error reading file: {node['file']}"
+                        )
+                        continue
+                    content, truncated = got
+                    lines = split_lines(content)
+                    # SARIF regions are external input: startLine is
+                    # copied verbatim from the result JSON, so a
+                    # malformed document can carry a non-integer
+                    # here. Refuse it explicitly instead of relying
+                    # on the arithmetic below to raise into the
+                    # broad handler.
+                    line_no = node['line']
+                    if isinstance(line_no, bool) or not isinstance(line_no, int):
+                        node['code_context'] = (
+                            "Invalid line number in dataflow node"
+                        )
+                        continue
+                    if truncated and line_no > len(lines):
+                        node['code_context'] = (
+                            "Source beyond the capped read "
+                            f"(file truncated at {len(lines)} lines)"
+                        )
+                        continue
 
-                    start = max(0, node['line'] - 6)
-                    end = min(len(lines), node['line'] + 5)
+                    # Same per-node window the analysis prompt's
+                    # dataflow snippets use: the HTML report is the
+                    # operator's view of what the classifier judged —
+                    # a diverging report window would show the
+                    # operator more (or less) context than the
+                    # analysis actually saw.
+                    start = max(0, line_no - DATAFLOW_STEP_CONTEXT_LINES - 1)
+                    end = min(len(lines), line_no + DATAFLOW_STEP_CONTEXT_LINES)
 
                     context = []
                     for i in range(start, end):
-                        marker = ">>>" if i == node['line'] - 1 else "   "
+                        marker = ">>>" if i == line_no - 1 else "   "
                         context.append(f"{marker} {i + 1:4d} | {lines[i].rstrip()}")
 
-                    # HTML-escape to prevent injection using code_context
-                    node['code_context'] = escape('\n'.join(context))
+                    # D3's .text() handles escaping on the client side;
+                    # pre-escaping here causes double encoding of angle
+                    # brackets and ampersands in source snippets.
+                    node['code_context'] = '\n'.join(context)
                 else:
-                    node['code_context'] = escape(f"File not found: {node['file']}")
-            except Exception as e:
-                node['code_context'] = escape(f"Error reading file: {e}")
+                    node['code_context'] = f"File not found: {node['file']}"
+            except Exception as e:  # noqa: BLE001
+                node['code_context'] = f"Error reading file: {e}"
 
         # Generate HTML
         html_content = self._create_html_template(
@@ -195,8 +246,11 @@ class DataflowVisualizer:
             sanitizers=dataflow.sanitizers
         )
 
-        with open(output_file, 'w') as f:
-            f.write(html_content)
+        # Atomic write (repeated at every artifact writer in this
+        # module): the visualizer emits at predictable names in the
+        # reused run dir — a bare open("w") follows a planted symlink;
+        # os.replace replaces the symlink itself.
+        write_text_atomically(output_file, html_content)
 
         return output_file
 
@@ -205,26 +259,25 @@ class DataflowVisualizer:
         finding_id: str,
         rule_id: str,
         message: str,
-        nodes: List[Dict],
-        edges: List[Dict],
-        sanitizers: List[str]
+        nodes: list[dict],
+        edges: list[dict],
+        sanitizers: list[str]
     ) -> str:
         """Create HTML template with embedded visualization."""
 
-        # JSON-encode then defang `</` → `<\/` so any string in
-        # the data can't break out of the surrounding `<script>`
-        # block via a literal `</script>` substring. The browser's
-        # HTML parser searches for `</script>` regardless of JS
-        # string syntax — JSON encoding doesn't help (json.dumps
-        # produces `"</script>"` which is still `</script>` to
-        # the HTML parser). `<\/script>` is byte-equivalent in
-        # JS string literals (`\/` is just `/`) so the data round-
-        # trips identically; HTML parser sees `<\/script>` (not
-        # `</script>`) so the script context isn't closed.
-        # Same defence pattern OWASP recommends for any JSON
-        # embedded inline in `<script>...`.
+        # JSON-encode then escape EVERY `<` as the JSON unicode
+        # escape `\u003c` so no string in the data can influence the
+        # surrounding `<script>` block's HTML parsing. The browser's
+        # HTML parser scans script content for `</script>`, `<script`,
+        # AND `<!--` (the script-data-escaped states) regardless of JS
+        # string syntax — JSON encoding doesn't help, and the previous
+        # `</`-only defang left `<!--<script` able to drive the parser
+        # into the double-escaped state (render-break). `\u003c` is
+        # plain JSON, so the data round-trips byte-identically after
+        # parsing while the HTML parser never sees a `<` inside the
+        # block.
         def _safe_json(obj):
-            return json.dumps(obj).replace("</", "<\\/")
+            return json.dumps(obj).replace("<", "\\u003c")
         nodes_json = _safe_json(nodes)
         edges_json = _safe_json(edges)
 
@@ -234,7 +287,12 @@ class DataflowVisualizer:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RAPTOR Dataflow Visualization - {escape(finding_id)}</title>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <!-- Executed third-party script in a security artifact:
+         crossorigin + no-referrer harden the fetch. An offline /
+         blocked-CDN open degrades to a visible notice (guard in the
+         main script) instead of a silently blank page. -->
+    <script src="https://d3js.org/d3.v7.min.js"
+            crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <style>
         * {{
             margin: 0;
@@ -502,6 +560,16 @@ class DataflowVisualizer:
     </div>
 
     <script>
+        // Offline / blocked-CDN guard: without d3 the page used to
+        // fail silently with a blank canvas. Surface the degradation
+        // where the graph would render.
+        if (typeof d3 === "undefined") {{
+            document.getElementById("node-details").textContent =
+                "d3 failed to load (offline or CDN blocked) — the " +
+                "interactive graph is unavailable; the finding data " +
+                "is still embedded in this file's source.";
+            throw new Error("d3 unavailable");
+        }}
         const nodes = {nodes_json};
         const edges = {edges_json};
 
@@ -620,7 +688,7 @@ class DataflowVisualizer:
         lines.append("")
 
         # Add source node
-        lines.append(f'    A0["🔴 SOURCE<br/>{self._escape_mermaid(dataflow.source.label)}<br/><i>{self._escape_mermaid(dataflow.source.file_path)}:{dataflow.source.line}</i>"]')
+        lines.append(f'    A0["⚠️ SOURCE<br/>{self._escape_mermaid(dataflow.source.label)}<br/><i>{self._escape_mermaid(dataflow.source.file_path)}:{dataflow.source.line}</i>"]')
         lines.append('    style A0 fill:#f48771,stroke:#fff,stroke-width:2px,color:#000')
         lines.append("")
 
@@ -669,31 +737,71 @@ class DataflowVisualizer:
         if dataflow.sanitizers:
             lines.append("")
             lines.append("**Detected Sanitizers:**")
-            for san in dataflow.sanitizers:
-                lines.append(f"- {san}")
+            # Same provenance and threat as rule_id/message above:
+            # sanitizer labels come from SARIF flow-step text quoting
+            # the target's source (function names etc.), so they get
+            # the same defang before landing in the report markdown.
+            lines.extend(
+                f"- {sanitise_string(str(san), max_chars=256)}"
+                for san in dataflow.sanitizers
+            )
 
-        with open(output_file, 'w') as f:
-            f.write('\n'.join(lines))
+        write_text_atomically(output_file, '\n'.join(lines))
 
         return output_file
 
     def _escape_mermaid(self, text: str) -> str:
-        """Escape text for Mermaid syntax."""
+        """Escape text for Mermaid syntax.
+
+        Sanitise BEFORE the syntax escapes: node label and path text
+        comes from SARIF produced over the untrusted repo (labels
+        quote target source), so control/bidi bytes get the same
+        escape_nonprintable treatment the rule/message fields already
+        receive — Mermaid-syntax escaping alone left raw control
+        bytes in the artifact file.
+        """
+        from core.security.log_sanitisation import escape_nonprintable
+        # Node labels are single-line: a literal newline (multi-line
+        # SARIF step label) splits the node declaration mid-statement
+        # and the whole .mmd fails to render. Collapse whitespace
+        # FIRST so legitimate newlines become spaces; whatever
+        # control/bidi bytes remain are then escaped.
+        # Every normalised character contributes at least one escaped
+        # character. A 61-character prefix therefore determines both the
+        # displayed first 57 characters and whether the 60-character cap
+        # needs an ellipsis, without copying/escaping a discarded suffix.
+        prefix: list[str] = []
+        separated = False
+        for char in str(text):
+            if char.isspace():
+                separated = bool(prefix)
+                continue
+            if separated:
+                prefix.append(' ')
+                separated = False
+                if len(prefix) == 61:
+                    break
+            prefix.append(char)
+            if len(prefix) == 61:
+                break
+        text = escape_nonprintable(''.join(prefix))
+
         # Truncate long text
         if len(text) > 60:
             text = text[:57] + "..."
 
-        # Escape special characters
+        # Escape special characters. '#' first: every later
+        # replacement introduces '&#NN;' entities, so escaping '#'
+        # after them would mangle the entities themselves.
+        text = text.replace('#', '&#35;')
         text = text.replace('"', '&quot;')
         text = text.replace('[', '&#91;')
         text = text.replace(']', '&#93;')
         text = text.replace('(', '&#40;')
         text = text.replace(')', '&#41;')
         text = text.replace('<', '&lt;')
-        text = text.replace('>', '&gt;')
-        text = text.replace('#', '&#35;')
+        return text.replace('>', '&gt;')
 
-        return text
 
     def generate_ascii(self, dataflow: DataflowPath, finding_id: str) -> Path:
         """
@@ -708,19 +816,30 @@ class DataflowVisualizer:
         """
         output_file = self.output_dir / f"{finding_id}_dataflow.txt"
 
+        # Same provenance and threat as the mermaid sibling above:
+        # labels/snippets come from SARIF over the UNTRUSTED repo
+        # (snippet text IS target source). core.logging's console
+        # chokepoint (EscapingConsoleFormatter) escapes logger-routed
+        # terminal lines, but this block is ALSO persisted verbatim
+        # to the artifact FILE, which no formatter touches — the
+        # per-site sanitise is load-bearing for the file lane.
+        from core.security.prompt_output_sanitise import sanitise_string
+
+        def _clean(value, cap=256):
+            return sanitise_string(str(value), max_chars=cap)
+
         lines = []
         lines.append("=" * 80)
         lines.append("CODEQL DATAFLOW VISUALIZATION")
         lines.append("=" * 80)
         lines.append("")
-        lines.append(f"Rule: {dataflow.rule_id}")
-        lines.append(f"Message: {dataflow.message}")
+        lines.append(f"Rule: {_clean(dataflow.rule_id)}")
+        lines.append(f"Message: {_clean(dataflow.message, 1024)}")
         lines.append("")
 
         if dataflow.sanitizers:
             lines.append("Detected Sanitizers:")
-            for san in dataflow.sanitizers:
-                lines.append(f"  • {san}")
+            lines.extend(f"  • {_clean(san)}" for san in dataflow.sanitizers)
             lines.append("")
 
         lines.append("=" * 80)
@@ -730,12 +849,12 @@ class DataflowVisualizer:
 
         # Source
         lines.append("┌─────────────────────────────────────────────────────────────────────────────┐")
-        lines.append("│ 🔴 SOURCE (User-Controlled Input)                                          │")
+        lines.append("│ ⚠️ SOURCE (User-Controlled Input)                                          │")
         lines.append("└─────────────────────────────────────────────────────────────────────────────┘")
-        lines.append(f"  Location: {dataflow.source.file_path}:{dataflow.source.line}:{dataflow.source.column}")
-        lines.append(f"  Label: {dataflow.source.label}")
+        lines.append(f"  Location: {_clean(dataflow.source.file_path)}:{dataflow.source.line}:{dataflow.source.column}")
+        lines.append(f"  Label: {_clean(dataflow.source.label)}")
         if dataflow.source.snippet:
-            lines.append(f"  Snippet: {dataflow.source.snippet[:70]}")
+            lines.append(f"  Snippet: {_clean(dataflow.source.snippet, 70)}")
         lines.append("")
         lines.append("       │")
         lines.append("       │  Data flows through...")
@@ -755,10 +874,10 @@ class DataflowVisualizer:
                 lines.append(f"│ ⚙️  STEP {i}: Intermediate Processing                                       │")
                 lines.append("└─────────────────────────────────────────────────────────────────────────────┘")
 
-            lines.append(f"  Location: {step.file_path}:{step.line}:{step.column}")
-            lines.append(f"  Label: {step.label}")
+            lines.append(f"  Location: {_clean(step.file_path)}:{step.line}:{step.column}")
+            lines.append(f"  Label: {_clean(step.label)}")
             if step.snippet:
-                lines.append(f"  Snippet: {step.snippet[:70]}")
+                lines.append(f"  Snippet: {_clean(step.snippet, 70)}")
             lines.append("")
             lines.append("       │")
             lines.append("       ▼")
@@ -768,24 +887,23 @@ class DataflowVisualizer:
         lines.append("┌─────────────────────────────────────────────────────────────────────────────┐")
         lines.append("│ 🔥 SINK (Dangerous Operation)                                              │")
         lines.append("└─────────────────────────────────────────────────────────────────────────────┘")
-        lines.append(f"  Location: {dataflow.sink.file_path}:{dataflow.sink.line}:{dataflow.sink.column}")
-        lines.append(f"  Label: {dataflow.sink.label}")
+        lines.append(f"  Location: {_clean(dataflow.sink.file_path)}:{dataflow.sink.line}:{dataflow.sink.column}")
+        lines.append(f"  Label: {_clean(dataflow.sink.label)}")
         if dataflow.sink.snippet:
-            lines.append(f"  Snippet: {dataflow.sink.snippet[:70]}")
+            lines.append(f"  Snippet: {_clean(dataflow.sink.snippet, 70)}")
         lines.append("")
 
         lines.append("=" * 80)
         lines.append("")
 
-        with open(output_file, 'w') as f:
-            f.write('\n'.join(lines))
+        write_text_atomically(output_file, '\n'.join(lines))
 
         # Also print to logger for terminal viewing
         self.logger.info("ASCII Dataflow Visualization:")
         for line in lines[:30]:  # Print first 30 lines to log
             self.logger.info(line)
         if len(lines) > 30:
-            self.logger.info(f"... ({len(lines) - 30} more lines in {output_file})")
+            self.logger.info("... (%s more lines in %s)", len(lines) - 30, output_file)
 
         return output_file
 
@@ -831,40 +949,50 @@ class DataflowVisualizer:
         lines.append("")
 
         # Edges
-        for i in range(sink_id):
-            lines.append(f'    node{i} -> node{i + 1};')
+        lines.extend(f'    node{i} -> node{i + 1};' for i in range(sink_id))
 
         lines.append("}")
 
-        with open(output_file, 'w') as f:
-            f.write('\n'.join(lines))
+        write_text_atomically(output_file, '\n'.join(lines))
 
         # Add instructions
         instructions_file = self.output_dir / f"{finding_id}_dataflow_instructions.txt"
-        with open(instructions_file, 'w') as f:
-            f.write(f"To render the DOT file:\n\n")
-            f.write(f"# Install Graphviz (if not already installed):\n")
-            f.write(f"# macOS: brew install graphviz\n")
-            f.write(f"# Ubuntu: sudo apt-get install graphviz\n\n")
-            f.write(f"# Render to PNG:\n")
-            f.write(f"dot -Tpng {output_file.name} -o {finding_id}_dataflow.png\n\n")
-            f.write(f"# Render to SVG:\n")
-            f.write(f"dot -Tsvg {output_file.name} -o {finding_id}_dataflow.svg\n\n")
-            f.write(f"# Render to PDF:\n")
-            f.write(f"dot -Tpdf {output_file.name} -o {finding_id}_dataflow.pdf\n")
+        write_text_atomically(instructions_file, (
+            "To render the DOT file:\n\n"
+            "# Install Graphviz (if not already installed):\n"
+            "# macOS: brew install graphviz\n"
+            "# Ubuntu: sudo apt-get install graphviz\n\n"
+            "# Render to PNG:\n"
+            f"dot -Tpng {output_file.name} -o {finding_id}_dataflow.png\n\n"
+            "# Render to SVG:\n"
+            f"dot -Tsvg {output_file.name} -o {finding_id}_dataflow.svg\n\n"
+            "# Render to PDF:\n"
+            f"dot -Tpdf {output_file.name} -o {finding_id}_dataflow.pdf\n"
+        ))
 
         return output_file
 
     def _escape_dot(self, text: str) -> str:
-        """Escape text for DOT syntax."""
+        r"""Escape text for DOT syntax.
+
+        Backslashes are escaped first: escaping quotes before backslashes
+        would let text ending in a backslash produce ``\\"`` (an escaped
+        backslash followed by a bare quote), which re-terminates the DOT
+        string early.
+        """
         if len(text) > 50:
             text = text[:47] + "..."
-        return text.replace('"', '\\"').replace('\n', '\\n')
+        return (
+            text.replace('\\', '\\\\')
+            .replace('"', '\\"')
+            .replace('\n', '\\n')
+        )
 
 
-def main():
+def main() -> None:
     """CLI entry point for testing."""
     import argparse
+
     from packages.codeql.dataflow_validator import DataflowValidator
 
     parser = argparse.ArgumentParser(description="Visualize CodeQL dataflow paths")

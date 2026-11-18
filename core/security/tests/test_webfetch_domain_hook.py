@@ -1,0 +1,328 @@
+"""Robustness tests for the per-agent WebFetch domain-allowlist hook.
+
+`.claude/hooks/webfetch-domain-allowlist.py` is the mechanical
+narrowing behind the WebFetch-capable agents' network posture. Three
+modes are pinned here:
+
+  * static hostname allowlist (b4: oss github / wayback agents)
+  * ``--https-any`` (b4: ioc-extractor)
+  * ``--anchor-file`` (crash-report-fetcher): https + same registrable
+    domain as the operator-supplied URL, extra hosts as logged
+    operator-visible additions, fail-closed on a missing/invalid
+    anchor.
+
+The hook is exercised as a subprocess with the real PreToolUse stdin
+contract (JSON with tool_input.url; exit 0 allow / exit 2 block).
+"""
+
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+_REPO = Path(__file__).resolve().parents[3]
+_HOOK = _REPO / ".claude" / "hooks" / "webfetch-domain-allowlist.py"
+
+
+def _run_hook(args, url=None, stdin=None):
+    """Run the hook. Returns (rc, stderr)."""
+    if stdin is None:
+        stdin = json.dumps(
+            {"tool_name": "WebFetch", "tool_input": {"url": url}})
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK), *args],
+        input=stdin, capture_output=True, text=True, check=False,
+    )
+    return proc.returncode, proc.stderr
+
+
+class TestStaticAllowlistMode(unittest.TestCase):
+
+    def test_listed_host_allowed(self):
+        rc, _ = _run_hook(["github.com"], "https://github.com/o/r")
+        self.assertEqual(rc, 0)
+
+    def test_unlisted_host_blocked(self):
+        rc, err = _run_hook(["github.com"], "https://evil.example/x")
+        self.assertEqual(rc, 2)
+        self.assertIn("not in this agent's allowlist", err)
+
+    def test_http_blocked_even_for_listed_host(self):
+        rc, err = _run_hook(["github.com"], "http://github.com/o/r")
+        self.assertEqual(rc, 2)
+        self.assertIn("https", err)
+
+    def test_unparseable_stdin_blocked(self):
+        rc, _ = _run_hook(["github.com"], stdin="not json")
+        self.assertEqual(rc, 2)
+
+    def test_missing_url_blocked(self):
+        rc, _ = _run_hook(
+            ["github.com"],
+            stdin=json.dumps({"tool_name": "WebFetch", "tool_input": {}}))
+        self.assertEqual(rc, 2)
+
+    def test_unknown_flag_blocked_fail_closed(self):
+        rc, err = _run_hook(
+            ["--frobnicate", "github.com"], "https://github.com/o/r")
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown flag", err)
+
+
+class TestHttpsAnyMode(unittest.TestCase):
+
+    def test_any_https_host_allowed(self):
+        rc, _ = _run_hook(["--https-any"], "https://vendor.example/report")
+        self.assertEqual(rc, 0)
+
+    def test_http_blocked(self):
+        rc, _ = _run_hook(["--https-any"], "http://vendor.example/report")
+        self.assertEqual(rc, 2)
+
+
+class TestAnchorFileMode(unittest.TestCase):
+
+    def _anchor(self, tmp, *lines):
+        path = Path(tmp) / "fetcher.anchor"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_anchor_host_allowed(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://trac.ffmpeg.org/ticket/1")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://trac.ffmpeg.org/ticket/1")
+            self.assertEqual(rc, 0)
+
+    def test_same_registrable_domain_sibling_allowed(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://trac.ffmpeg.org/ticket/1")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://attachments.ffmpeg.org/file/2")
+            self.assertEqual(rc, 0)
+
+    def test_other_registrable_domain_blocked(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://trac.ffmpeg.org/ticket/1")
+            rc, err = _run_hook(["--anchor-file", str(anchor)],
+                                "https://evil.example/exfil")
+            self.assertEqual(rc, 2)
+            self.assertIn("registrable domain", err)
+
+    def test_suffix_squat_blocked(self):
+        # evil-ffmpeg.org shares a suffix string but not the
+        # registrable domain.
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://trac.ffmpeg.org/ticket/1")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://evil-ffmpeg.org/x")
+            self.assertEqual(rc, 2)
+
+    def test_multi_label_public_suffix_not_treated_as_one_domain(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://bugs.foo.co.uk/1")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://www.foo.co.uk/2")
+            self.assertEqual(rc, 0)
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://bar.co.uk/x")
+            self.assertEqual(rc, 2)
+
+    def test_shared_hosting_unrelated_tenants_blocked_and_subdomains_allowed(self):
+        """Multi-tenant PSL suffixes (surge.sh, up.railway.app, s3.amazonaws.com)
+        must isolate unrelated tenants while allowing subdomains of the
+        anchored tenant."""
+        cases = [
+            (
+                "https://tenant-a.surge.sh/report",
+                "https://cdn.tenant-a.surge.sh/asset.js",
+                "https://tenant-b.surge.sh/exfil",
+                "https://surge.sh/",
+            ),
+            (
+                "https://app-a.up.railway.app/bug",
+                "https://api.app-a.up.railway.app/v1",
+                "https://app-b.up.railway.app/exfil",
+                "https://up.railway.app/",
+            ),
+            (
+                "https://bucket-a.s3.amazonaws.com/crash.dmp",
+                "https://sub.bucket-a.s3.amazonaws.com/part",
+                "https://bucket-b.s3.amazonaws.com/steal",
+                "https://s3.amazonaws.com/",
+            ),
+        ]
+        for anchor_url, allowed_sub, unrelated_tenant, bare_suffix in cases:
+            with self.subTest(anchor=anchor_url), TemporaryDirectory() as tmp:
+                anchor = self._anchor(tmp, anchor_url)
+                rc, err = _run_hook(["--anchor-file", str(anchor)], allowed_sub)
+                self.assertEqual(rc, 0, f"{allowed_sub} should be allowed: {err}")
+                rc, _ = _run_hook(["--anchor-file", str(anchor)], unrelated_tenant)
+                self.assertEqual(rc, 2, f"{unrelated_tenant} must be blocked")
+                rc, _ = _run_hook(["--anchor-file", str(anchor)], bare_suffix)
+                self.assertEqual(rc, 2, f"{bare_suffix} must be blocked")
+
+    def test_unknown_suffix_remains_exact_host_only(self):
+        """Default-rule suffixes not in the PSL do not grant sibling access."""
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://a.internal.invalid/report")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://a.internal.invalid/other")
+            self.assertEqual(rc, 0)
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://b.internal.invalid/other")
+            self.assertEqual(rc, 2)
+
+    def test_extra_host_line_allowed_and_logged(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(
+                tmp,
+                "https://trac.ffmpeg.org/ticket/1",
+                "cdn.attachments.example",
+            )
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://cdn.attachments.example/poc.bin")
+            self.assertEqual(rc, 0)
+            log = Path(str(anchor) + ".log").read_text(encoding="utf-8")
+            self.assertIn("allow\tcdn.attachments.example", log)
+
+    def test_malformed_extra_host_ignored_without_breaking_anchor(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(
+                tmp,
+                "https://trac.ffmpeg.org/ticket/1",
+                "not a valid host/path",
+                "cdn.attachments.example",
+            )
+            rc, err = _run_hook(["--anchor-file", str(anchor)],
+                                "https://trac.ffmpeg.org/ticket/2")
+            self.assertEqual(rc, 0, err)
+            rc, err = _run_hook(["--anchor-file", str(anchor)],
+                                "https://cdn.attachments.example/poc.bin")
+            self.assertEqual(rc, 0, err)
+
+    def test_denied_fetch_is_logged(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://trac.ffmpeg.org/ticket/1")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://evil.example/x")
+            self.assertEqual(rc, 2)
+            log = Path(str(anchor) + ".log").read_text(encoding="utf-8")
+            self.assertIn("deny\tevil.example", log)
+
+    def test_http_blocked_regardless_of_anchor(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "https://trac.ffmpeg.org/ticket/1")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "http://trac.ffmpeg.org/ticket/1")
+            self.assertEqual(rc, 2)
+
+    def test_missing_anchor_file_blocked_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            rc, err = _run_hook(
+                ["--anchor-file", str(Path(tmp) / "absent.anchor")],
+                "https://trac.ffmpeg.org/ticket/1")
+            self.assertEqual(rc, 2)
+            self.assertIn("missing or unreadable", err)
+
+    def test_empty_anchor_file_blocked_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "# comment only")
+            rc, err = _run_hook(["--anchor-file", str(anchor)],
+                                "https://trac.ffmpeg.org/ticket/1")
+            self.assertEqual(rc, 2)
+            self.assertIn("no anchor URL", err)
+
+    def test_non_https_anchor_blocked_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "http://trac.ffmpeg.org/ticket/1")
+            rc, err = _run_hook(["--anchor-file", str(anchor)],
+                                "https://trac.ffmpeg.org/ticket/1")
+            self.assertEqual(rc, 2)
+            self.assertIn("valid https URL", err)
+
+    def test_bare_hostname_anchor_accepted(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(tmp, "trac.ffmpeg.org")
+            rc, _ = _run_hook(["--anchor-file", str(anchor)],
+                              "https://trac.ffmpeg.org/ticket/1")
+            self.assertEqual(rc, 0)
+
+    def test_anchor_file_flag_without_value_blocked(self):
+        rc, err = _run_hook(["--anchor-file"], "https://a.example/x")
+        self.assertEqual(rc, 2)
+        self.assertIn("requires a path", err)
+
+
+class TestFetcherAgentWiring(unittest.TestCase):
+    """The crash-report-fetcher frontmatter must wire this hook in
+    anchor-file mode — the enforcement lives there, not in prose."""
+
+    def test_fetcher_frontmatter_wires_anchor_mode(self):
+        agent = (_REPO / ".claude" / "agents"
+                 / "crash-report-fetcher-agent.md").read_text(
+                     encoding="utf-8")
+        self.assertIn("webfetch-domain-allowlist.py", agent)
+        self.assertIn("--anchor-file", agent)
+        # Session-scoped: a single repo-global anchor was
+        # last-writer-wins across concurrent investigations.
+        self.assertIn(
+            ".claude/run/crash-report-fetcher-{session}.anchor", agent)
+
+    def test_fetcher_frontmatter_wires_write_allowlist(self):
+        """The fetcher's Write grant is narrowed to its single
+        artifact — prose alone let a steered fetcher rewrite the very
+        anchor that constrains its WebFetch."""
+        agent = (_REPO / ".claude" / "agents"
+                 / "crash-report-fetcher-agent.md").read_text(
+                     encoding="utf-8")
+        self.assertIn("write-path-allowlist.py bug-report.json", agent)
+
+    def test_session_placeholder_resolves_from_env(self):
+        """{session} in --anchor-file resolves via RAPTOR_SESSION_PID,
+        so writer (raptor-fetch-anchor) and enforcer agree; outside
+        the launcher it degrades to 'default' (the pre-existing
+        single-session shape), never to a fetch allowed without an
+        anchor."""
+        import os
+        with TemporaryDirectory() as td:
+            anchor = Path(td) / "a-77.anchor"
+            anchor.write_text("https://tracker.example.org/t/1\n")
+            template = str(Path(td) / "a-{session}.anchor")
+            env = dict(os.environ)
+            env["RAPTOR_SESSION_PID"] = "77"
+            proc = subprocess.run(
+                [sys.executable, str(_HOOK), "--anchor-file", template],
+                input=json.dumps({"tool_name": "WebFetch", "tool_input":
+                                  {"url": "https://tracker.example.org/x"}}),
+                capture_output=True, text=True, check=False, env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # Wrong session's anchor is invisible: fail-closed.
+            env["RAPTOR_SESSION_PID"] = "88"
+            proc = subprocess.run(
+                [sys.executable, str(_HOOK), "--anchor-file", template],
+                input=json.dumps({"tool_name": "WebFetch", "tool_input":
+                                  {"url": "https://tracker.example.org/x"}}),
+                capture_output=True, text=True, check=False, env=env,
+            )
+            self.assertEqual(proc.returncode, 2)
+
+    def test_log_lines_escape_control_bytes(self):
+        """A hostile URL with an interior newline must not forge audit
+        rows in the decision log."""
+        with TemporaryDirectory() as td:
+            anchor = Path(td) / "a.anchor"
+            anchor.write_text("https://tracker.example.org/t/1\n")
+            _run_hook(["--anchor-file", str(anchor)],
+                      "https://tracker.example.org/x?d=a\nforged\tallow")
+            log = (Path(td) / "a.anchor.log").read_text(encoding="utf-8")
+            lines = [ln for ln in log.splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 1, log)
+            self.assertIn("\\x0a", lines[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

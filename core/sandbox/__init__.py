@@ -1,4 +1,4 @@
-"""Subprocess sandboxing via Linux user namespaces, Landlock, and seccomp.
+r"""Subprocess sandboxing via Linux user namespaces, Landlock, and seccomp.
 
 Provides network, filesystem, and syscall-level isolation plus resource
 limits for subprocesses that handle untrusted content. Falls back
@@ -12,7 +12,8 @@ Six independent isolation layers (any combination may be active):
   profiles. Runs alongside the optional egress proxy, never combined.
 - PID namespace (--pid --fork): hides host PIDs from the sandbox,
   blocking kill() / ptrace against host processes. The sandboxed
-  command runs as PID 1 in its own namespace.
+  command runs as PID 2 in its own namespace, behind the minimal
+  PID-1 waiter described in the mount-namespace bullet below.
 - IPC namespace (--ipc): isolates SysV shm / sem / message queues. A
   compromised child can't use host-wide IPC resource-limits to DoS
   other processes, nor read same-UID apps' shm segments by key.
@@ -23,8 +24,14 @@ Six independent isolation layers (any combination may be active):
   `newuidmap`/`newgidmap` to set up the 0-->caller_uid mapping, the
   child then does all mount operations via ctypes BEFORE Landlock
   install (Landlock blocks mount topology changes on kernel 6.15+),
-  pivot_roots into the tmpfs, installs Landlock + seccomp, unshares
-  pid-ns and fork-execs the target as PID 1. Per-sandbox `/tmp` and
+  pivot_roots into the tmpfs, unshares pid-ns and forks the
+  GRANDCHILD, which mounts a fresh /proc for the new pid-ns and only
+  then installs Landlock + seccomp and execs the target. The target
+  runs as PID 2: PID 1 of the pid-ns is a minimal in-process waiter
+  (`_pid1_split_for_waiter`) that mirrors the target's exit status
+  (128+sig for signals) and forwards termination signals — a
+  PID-1-target would see kernel-distorted default signal handling.
+  Per-sandbox `/tmp` and
   `/run`, host `/usr`/`/lib`/`/etc` etc. bind-mounted read-only,
   caller's target + output bind-mounted at their ORIGINAL absolute
   paths (no argv rewriting needed). Requires the `uidmap` package
@@ -39,11 +46,15 @@ Six independent isolation layers (any combination may be active):
   read-wide. When `restrict_reads=True` is set, reads are also
   restricted (default allowlist: system dirs + target + output).
   Independent of namespaces — works on its own if ns unavailable.
-- Seccomp-bpf (libseccomp): blocklist of escape-vector syscalls.
-  Returns EPERM to the target — graceful failure, actionable
-  diagnostics. Unresolved-architecture syscalls are skipped with a
-  one-shot warning. SCMP_FLTATR_ACT_BADARCH = KILL_PROCESS, set
-  explicitly so 32-bit-compat entry (int 0x80, x32) can't bypass.
+- Seccomp-bpf (libseccomp): blocklist on the SYSCALL axis
+  (escape-vector syscalls; near-zero breakage because tools don't use
+  them), allowlist / deny-by-default on the socket(2)/socketpair(2)
+  FAMILY and TYPE axes (see seccomp.py's module docstring — a family
+  denylist kept failing open one live member at a time). Returns
+  EPERM to the target — graceful failure, actionable diagnostics.
+  Unresolved-architecture syscalls are skipped with a one-shot
+  warning. SCMP_FLTATR_ACT_BADARCH = KILL_PROCESS, set explicitly so
+  32-bit-compat entry (int 0x80, x32) can't bypass.
 
 Integrity guard: `check_landlock_available()` fork-runs a functional
 self-test on first call — installs a ruleset with
@@ -106,11 +117,27 @@ Sanitised host fingerprint (sanitise_host_fingerprint=True):
   canonical "boring Debian 12 cloud VM on QEMU/KVM with Intel Xeon"
   values for hostname (`localhost`), `/etc/os-release` (Debian 12
   stub), `/etc/machine-id` (deterministic pseudo-random — looks
-  real, identical across operators), `/sys/class/dmi/id/*` (QEMU),
-  `/proc/cpuinfo` (canonical Xeon model + microcode + cache,
-  configurable processor count via cpu_count=N defaulting to 4),
-  `/proc/version` (trimmed to `Linux version <host-release>`), and
-  uname() nodename / domainname (via CLONE_NEWUTS + sethostname).
+  real, PER-INSTALL: derived from the install path, so two operators
+  never share one), `/etc/{passwd,group}` (neutral system tables —
+  no operator login/home), the FULL `/sys/class/dmi/id/*` identity
+  story (one coherent QEMU/SeaBIOS guest across every world-readable
+  file INCLUDING `modalias` and its `uevent` twin, both synthesized
+  from the same story), `/proc/cpuinfo` (canonical Xeon model +
+  microcode + cache, configurable processor count via cpu_count=N
+  defaulting to 4), `/proc/meminfo` (consistent ~4 GiB/CPU story,
+  non-round total), `/proc/{stat,uptime,loadavg,interrupts,softirqs,
+  schedstat}` (internally consistent with the claimed CPU count and
+  a per-install fake uptime), `/proc/sys/kernel/random/boot_id`
+  (independent per-install digest), `/sys/devices/system/cpu`,
+  `/sys/devices/system/node/node0`, and `/sys/bus/cpu/devices`
+  (tmpfs with exactly the claimed cpuN entries) plus node0 cpu
+  lists, `/proc/version` (trimmed to `Linux version
+  <host-release>`), and uname() nodename / domainname (via
+  CLONE_NEWUTS + sethostname). /proc/self/cgroup reads "0::/" on
+  every namespace lane (CLONE_NEWCGROUP in the fork backend — the
+  only namespace lane since the unshare-CLI fallback was deleted),
+  persona or not; the no-namespace last-resort fallback keeps the
+  host cgroup path visible.
   All hide-intent values — no "sandbox" / "raptor" / "Generic CPU"
   / all-zero sentinels that anti-analysis-aware binaries can
   trivially detect. Implemented in core/sandbox/fingerprint.py.
@@ -154,15 +181,27 @@ Sanitised host fingerprint (sanitise_host_fingerprint=True):
     bypass our overlay.
   - Vendor leakage via flags-line — Intel vs AMD distinguishable
     by flag-set differences. Trade-off accepted for SIMD compat.
-  - /proc/meminfo, /sys/firmware/*, /dev/mem — host-real. UEFI/BIOS
-    + RAM size leakage. Out of v1 scope; meminfo masking deserves
-    its own audit (JVM heap auto-sizing, Postgres shared_buffers
-    consumers).
-  - /sys/class/dmi/id/{board_serial, product_uuid, chassis_*} —
-    only `sys_vendor` and `product_name` are bind-masked. Defended
-    by `restrict_reads=True`'s allowlist (DMI not on default
-    readable set); pass `restrict_reads=False` and the omitted
-    DMI identity files become host-real.
+  - Kernel memory-accounting bypasses of the meminfo story:
+    sysinfo(2), /proc/vmstat, /proc/zoneinfo, and devtmpfs's
+    mountinfo `size=` option still reflect host RAM (zoneinfo's
+    per-cpu pageset blocks also reveal the host CPU count). Same
+    class as CPUID: syscall/kernel surfaces no file mask can reach.
+  - Multi-NUMA hosts: only node0 is masked — a node1+ entry (and
+    the /sys/devices/system/node readdir) still shows the host's
+    real topology beside the claimed single-node story.
+  - /sys/firmware/*, /dev/mem — host-real (UEFI/BIOS leakage);
+    root-only DMI files (product_uuid, *_serial) stay unmasked but
+    are unreadable from the sandbox uid.
+  - The kernel RELEASE string (uname, /proc/version[_signature])
+    keeps the host flavor (e.g. a cloud-vendor suffix), which can
+    contradict the Debian story on cloud hosts — uname is
+    deliberately host-real (see above), so the persona's distro
+    story is only as strong as the kernel string allows.
+  - /proc/{uptime,stat} are STATIC per run (re-reading across a
+    sleep shows frozen values); mountinfo enumerates the mask
+    mounts themselves and tmpfs options carry the mounter's host
+    uid (intrinsic to unprivileged userns mounts — every rootless
+    container shows this).
   - sanitise_host_fingerprint=True with `target=None` AND
     `output=None` produces partial coverage: UTS-ns + affinity
     still apply (no mount-ns needed for those), but the file
@@ -181,7 +220,7 @@ Log-output hygiene:
   colour flips, window-title spoofing, cursor-movement to overwrite
   prior lines with forged "all clear" entries.
   `core.security.log_sanitisation.escape_nonprintable()` replaces
-  non-printable chars with `\\xHH` literals before logging; the
+  non-printable chars with `\xHH` literals before logging; the
   proxy's CONNECT parser uses the predicate form
   `has_nonprintable()` to reject such requests outright with a 400
   Bad Request.
@@ -212,14 +251,28 @@ Threat model — what the sandbox DOES protect against:
   AF_INET/AF_INET6 SOCK_DGRAM; proxy resolves target hostnames.
 - Hostname-level egress control — egress proxy enforces allowlist by
   CONNECT host, not just port (unlike Landlock's port-only allowlist).
-- Unix-domain-socket creation (`socket(AF_UNIX, ...)`) — blocked by
-  seccomp, closes the `connect("/var/run/docker.sock")` escape vector.
-  (`socketpair(AF_UNIX)` is NOT blocked — it returns an isolated pair
-  with no external address; blocking broke Rust's std::process spawn
-  without closing any real attack.)
-- AF_PACKET / AF_NETLINK / SOCK_RAW sockets — blocked by seccomp.
+- Unix-domain-socket creation (`socket(AF_UNIX, ...)`) —
+  PROFILE-CONDITIONAL: denied by seccomp on the preexec-only lane
+  (closes the `connect("/var/run/docker.sock")` escape vector on
+  Landlock-only hosts); the mount-ns lane's allow_unix_sockets and
+  the frida profile admit AF_UNIX, with the mount-ns lane's
+  connect(2)s routed through the _unix_scope supervisor
+  (SCMP_ACT_NOTIFY — the supervisor executes the connect on the
+  child's behalf against a per-run scope). (`socketpair(AF_UNIX)`
+  stream/seqpacket is NOT blocked — it returns an isolated pair with
+  no external address; blocking broke Rust's std::process spawn
+  without closing any real attack. The DGRAM shape is conditionally
+  denied — a connected dgram half takes destination-bearing sendto.)
+- Every other socket family, and every socket type outside
+  STREAM/DGRAM/SEQPACKET — denied by construction: socket(2) and
+  socketpair(2) are allowlist-inverted on both the family axis
+  (AF_INET/AF_INET6 + AF_UNIX-per-profile) and the type axis, so
+  AF_PACKET / AF_NETLINK / SOCK_RAW / the SOCK_PACKET remap /
+  kernel-internal transports (SCTP, DCCP, MPTCP, SMC by protocol
+  row) and families no kernel ships yet all get EPERM without
+  enumeration.
 - `ptrace()` of any process — blocked by seccomp in `full`, allowed in
-  `debug` profile for gdb/rr use.
+  `debug` profile for GDB/LLDB; `rr` for contained Linux rr replay.
 - `process_vm_readv` / `process_vm_writev` cross-process memory access
   — blocked by seccomp.
 - `keyctl` / `add_key` / `request_key` kernel keyring manipulation —
@@ -238,10 +291,22 @@ Threat model — what the sandbox DOES protect against:
 - `kill()` of host processes — PID namespace hides host PIDs; attacker
   inside sandbox sees ns-local PIDs only.
 - SysV IPC cross-process access — IPC namespace isolates shm/sem/msg.
-- Fork bombs — RLIMIT_NPROC=1024 applied via `prlimit --nproc` wrapper
-  inside the user namespace (ns-local UID nobody has zero pre-existing
-  processes so the limit bounds the sandbox without affecting host
-  work). Configurable via `~/.config/raptor/sandbox.json`.
+- Nested `unshare(CLONE_NEWUSER|CLONE_NEWNS)` — denied at the
+  seccomp layer on every execution lane (unshare / clone with any
+  CLONE_NEW* flag / setns; clone3 → ENOSYS): the fork backend's
+  grandchild filter and the subprocess lanes' preexec both carry the
+  rules now that no lane bootstraps through the `unshare` CLI under
+  its own filter. Requires an engaged seccomp profile + libseccomp
+  (the strict profile refuses without them). Defence in depth behind
+  it: Landlock rules bind to dentries (not paths) and inherit into
+  nested namespaces, and NO_NEW_PRIVS blocks seccomp drop.
+- Fork bombs — RLIMIT_NPROC=1024 applied inside the user namespace
+  (the spawn grandchild's setrlimit; the ns-local UID has zero
+  pre-existing processes so the limit bounds the sandbox without
+  affecting host work); BOTH no-namespace lanes — the plain
+  subprocess fallback and the Landlock-only audit/observe lane —
+  bound growth relative to current same-UID usage. Configurable via
+  `~/.config/raptor/sandbox.json`.
 - Privilege escalation via setuid binaries (PR_SET_NO_NEW_PRIVS).
 - Core-dump credential exfil — RLIMIT_CORE=0 suppresses core dumps; a
   crashed child can't leak the contents of files it read into its
@@ -253,9 +318,9 @@ Threat model — what the sandbox DOES protect against:
   instrumented binaries reserve ~56 TiB of shadow-memory VA on
   x86_64, and any finite limit breaks them. Memory containment
   belongs to an external cgroup v2 `memory.max`.
-- PATH hijack of the sandbox's own setup binaries — `unshare`,
-  `prlimit`, `/bin/sh`, `mount`, `mkdir` are resolved against a
-  hardcoded safe bin-dir list (`/usr/sbin`, `/usr/bin`, `/sbin`,
+- PATH hijack of the sandbox's own setup binaries — `unshare` (the
+  engagement probe), `newuidmap`/`newgidmap`, `/bin/sh`, `mount`,
+  `mkdir` are resolved against a hardcoded safe bin-dir list (`/usr/sbin`, `/usr/bin`, `/sbin`,
   `/bin`, `/usr/local/bin`), NOT the inherited PATH. Closes the
   "malicious .envrc poisons PATH before the sandbox builds itself"
   class of bypass. A missing binary is a HARD FAIL
@@ -281,19 +346,29 @@ Threat model — what the sandbox DOES protect against:
   CURL_CA_BUNDLE, SSL_CERT_FILE, SSL_CERT_DIR, plus the base LD_*
   / PYTHON* / JAVA_TOOL_OPTIONS / GIT_SSH_COMMAND / KUBECONFIG /
   etc. set). Caller-supplied `env=` is NOT filtered against the
-  blocklist — callers legitimately use names from it as defensive
-  neutralisers (e.g. `GIT_CONFIG_GLOBAL=/dev/null` to isolate git
-  from user config). `env=None` is treated as "no env kwarg" (not
+  blocklist by default — callers legitimately use names from it as
+  defensive neutralisers (e.g. `GIT_CONFIG_GLOBAL=/dev/null` to
+  isolate git from user config) — except under `strict_env=True`
+  (default ON for `run_untrusted()`; see W36.B below), which strips
+  the blocklist names. `env=None` is treated as "no env kwarg" (not
   "inherit os.environ wholesale" which is subprocess's default).
 - Socket FDs via `pass_fds=[...]` — `sandbox().run()` stats each
-  pass_fds entry and rejects S_ISSOCK. Pipes (S_ISFIFO) still pass.
-  Closes the "inherited Unix-socket FD reaches /var/run/docker.sock"
-  vector without breaking legitimate pipe-based stdin passing.
+  pass_fds entry and rejects S_ISSOCK, with ONE narrow carve-out: a
+  connected anonymous AF_UNIX SOCK_STREAM socketpair half whose
+  other half is held by the calling process (SO_PEERCRED peer pid ==
+  own pid; `_anon_socketpair_problem`) is admitted — that shape is
+  capability-equivalent to the stdio pipes already allowed. Every
+  other socket (pathname/abstract endpoints, INET families,
+  listeners, foreign-created pairs) stays refused, and
+  `pass_fds_declared` cannot override the refusal. Pipes (S_ISFIFO)
+  still pass. Closes the "inherited Unix-socket FD reaches
+  /var/run/docker.sock" vector without breaking legitimate
+  pipe-based stdin passing or parent-created worker transports.
 - `shell=True` misuse — rejected with TypeError. subprocess with
   shell=True reinterprets argv into `sh -c argv[0] argv[1:]`, which
-  silently mangles our `unshare ... -- cmd` list construction AND
-  is a shell-injection surface for any caller whose argv contains
-  attacker-influenced strings.
+  breaks deterministic argv construction AND is a shell-injection
+  surface for any caller whose argv contains attacker-influenced
+  strings.
 - Controlling-tty keystroke-sniff — `run_untrusted()` defaults
   `start_new_session=True` so the child is a new session leader
   with no controlling tty, and `stdin=subprocess.DEVNULL` so fd 0
@@ -301,6 +376,30 @@ Threat model — what the sandbox DOES protect against:
   RAPTOR invocation can't open `/dev/tty` to passively read
   operator keystrokes. (TIOCSTI injection is separately blocked by
   seccomp.)
+- Fileless exec (memfd / fd-exec) — restricted-reads children
+  (`run_untrusted()` / `strict` / any `restrict_reads=True` call)
+  are denied `memfd_create` wholesale and `execveat` with
+  AT_EMPTY_PATH at the seccomp layer, and Landlock handles the
+  EXECUTE right with grants only on the read allowlist's directory
+  rules + the writable grants. A payload can no longer become an
+  arbitrary in-memory process image via
+  `execve("/proc/self/fd/<memfd>")` — Landlock alone can never
+  close that spelling (memfd inodes live on a kernel-internal
+  SB_NOUSER mount exempt from its rules), which is why the seccomp
+  deny is the load-bearing layer. Residuals, stated: exec of
+  ON-DISK payloads written under the writable grants remains
+  allowed (auditable tree, swept at teardown; O_TMPFILE/unlinked
+  inodes follow their directory's grant); in-process code loading
+  (dlopen / mmap PROT_EXEC of readable files) is not an execve and
+  is out of scope; hosts without libseccomp keep the memfd gap
+  (the existing seccomp-lost warning covers the degradation);
+  `restrict_reads=False` opts out of this deny along with the read
+  restriction it rides on; the `frida` profile keeps `memfd_create`
+  (agent injection writes frida-agent.so into a memfd the target
+  dlopen-maps — consented instrumentation on a lane that already
+  grants ptrace/process_vm_*; the execveat AT_EMPTY_PATH arm still
+  installs there, and every other profile builds the full two-arm
+  deny — see the carve-out rationale in seccomp.py).
 - Child-planted symlink TOCTOU on parent-side writes into `output`:
   `{output}/proxy-events.jsonl` is opened with O_NOFOLLOW + fstat
   S_ISREG check; `{output}/.home/{,.config,.cache,.local,...}` are
@@ -340,15 +439,6 @@ What the sandbox does NOT protect against:
   that write predictable `/tmp` paths without O_NOFOLLOW can be
   symlink-raced. Mount-ns mounts a fresh tmpfs at `/tmp` inside the
   sandbox and closes this; Landlock-only mode does not.
-- Nested `unshare(CLONE_NEWUSER|CLONE_NEWNS)` on distros WITHOUT the
-  `kernel.apparmor_restrict_unprivileged_userns=1` sysctl — we can't
-  block unshare/setns/mount at the seccomp layer because our own
-  bootstrap uses the `unshare` CLI AFTER seccomp is installed in
-  preexec. A child on such a distro can create a nested user-ns
-  with CAP_SYS_ADMIN-in-ns and experiment with bind-mount tricks.
-  Landlock rules bind to dentries (not paths) and inherit into
-  nested namespaces, so bind-mounts don't grant new dentry access;
-  NO_NEW_PRIVS blocks seccomp drop. Bounded but not ironclad.
 - UDP outbound when `block_network=False` AND no egress proxy —
   Landlock's network rule is TCP-connect only. For full network-off
   set `block_network=True` (the `full` profile default). For
@@ -400,11 +490,14 @@ What the sandbox does NOT protect against:
   (libseccomp returns negative for unknown names). One-shot warning
   lists any unresolved syscalls so operators can decide.
 - `pass_fds` non-socket FD abuse — pipes and regular-file FDs are
-  allowed through. Sockets are rejected (see above). Callers passing
-  `close_fds=False` are rejected with TypeError.
-- Caller `env=` override bypasses `get_safe_env()` entirely —
-  neither the allowlist nor the DANGEROUS_ENV_VARS blocklist is
-  applied. Explicit `env=` is a "you know what you're doing"
+  allowed through. Sockets are rejected except an own anonymous
+  connected AF_UNIX SOCK_STREAM socketpair half (pipe-equivalent;
+  see above). Callers passing `close_fds=False` are rejected with
+  TypeError.
+- Caller `env=` override bypasses `get_safe_env()` — the allowlist
+  is never applied to it, and the DANGEROUS_ENV_VARS blocklist only
+  under `strict_env=True` (default ON for `run_untrusted()`; see
+  W36.B below). Explicit `env=` is a "you know what you're doing"
   signal. Logged at INFO so the override is auditable.
 - Tools that hardcode `/home/<user>/...` paths (not via `$HOME`)
   bypass `fake_home` and hit the real path → EACCES under
@@ -430,9 +523,16 @@ What the sandbox does NOT protect against:
   crafted TERM values. Accepted residual — stripping either would
   break legitimate coloured output and shell-invocation paths.
 
-Profiles (downgrade path for tools that need a blocked capability):
+Profiles (the complete profiles.PROFILES table — downgrades for tools
+that need a blocked capability, plus the two ratchets):
 - `full` (default): net-ns + Landlock + seccomp + rlimits.
-- `debug`: full, but seccomp permits ptrace (for gdb/rr).
+- `strict`: full + restrict_reads defaulted True (and fake_home when
+  output= is set) — the fail-closed ratchet.
+- `target_run`: full's layers with the network OPEN.
+- `debug`: full, but seccomp permits ptrace (for GDB/LLDB).
+- `rr`: Linux replay with mandatory private namespaces and scoped per-task counters.
+- `frida`: network open + Landlock + the frida seccomp profile
+  (AF_UNIX + memfd carve-outs for consented instrumentation).
 - `network-only`: drops Landlock AND seccomp; keeps net-ns.
 - `none`: rlimits only. Last resort.
 Set via `--sandbox <profile>` on the CLI. CLI flag is AUTHORITATIVE
@@ -545,9 +645,11 @@ Module layout:
                    subprocess.Popen(preexec_fn=...). Parent does
                    newuidmap on the child's PID (setuid-root helper,
                    bypasses the /proc/self/uid_map EPERM that direct
-                   unprivileged writes hit). Used when mount-ns is
-                   engaged; bypassed for Landlock-only which stays on
-                   the subprocess+preexec path.
+                   unprivileged writes hit). The ONLY namespace lane:
+                   serves mount-ns AND mountless namespace shapes
+                   (need_unshare routing in context.py). Hosts where
+                   no namespace can engage fall back to the
+                   subprocess+preexec Landlock-only path.
 - observe.py     — result interpretation, blocked-stderr detection,
                    SIGSYS labelling for seccomp kills; ASAN bug_type
                    and attempted_path are sanitised via
@@ -581,31 +683,59 @@ Related shared helpers (core.security):
 """
 
 # Public re-exports — the surface other code imports from `core.sandbox`.
+# Re-exports for private symbols some tests / callers depend on.
+# Keeping them at the package level preserves backward compatibility while
+# the real definitions live in focused submodules.
+from . import state as _state
 from .cli import (
     add_cli_args,
     apply_cli_args,
     disable_from_cli,
     set_cli_profile,
 )
-from .context import run, run_trusted, run_untrusted, run_untrusted_networked, sandbox
-from .landlock import check_landlock_available, _get_landlock_abi
+from .context import (
+    run,
+    run_trusted,
+    run_untrusted,
+    run_untrusted_networked,
+    sandbox,
+    spawn_backend_available,
+)
+from .errors import (
+    SANDBOX_ENGAGE_EXIT_CODE,
+    SandboxDisableRefusedError,
+    SandboxFloorError,
+    SandboxSetupError,
+)
+from .exec_stage import executable_stage
+from .landlock import _get_landlock_abi, check_landlock_available
+from .mount import _build_mount_script
 from .observe import _BLOCKED_PATTERNS, _check_blocked, _interpret_result, _path_within
 from .observe_profile import (
-    OBSERVE_FILENAME, ConnectTarget, ObserveProfile, parse_observe_log,
+    OBSERVE_FILENAME,
+    ConnectTarget,
+    ObserveProfile,
+    parse_observe_log,
 )
-from .preexec import _DEFAULT_LIMITS, _load_user_limits, _make_preexec_fn
-from .mount import _build_mount_script
+from .preexec import _DEFAULT_LIMITS, _load_user_limits, _make_preexec_fn, set_pdeathsig
 from .probes import (
-    check_mount_available, check_net_available, check_sandbox_available,
+    check_child_unix_sockets_available,
+    check_mount_available,
+    check_net_available,
+    check_pidns_supervision_available,
+    check_sandbox_available,
     check_seatbelt_available,
+    check_unshare_engages,
 )
-from .profiles import DEFAULT_PROFILE, PROFILES, _SANDBOX_KWARGS
+from .profiles import _SANDBOX_KWARGS, DEFAULT_PROFILE, PROFILES
+from .python_paths import python_runtime_tool_paths
 from .seccomp import check_seccomp_available
-
-# Re-exports for private symbols some tests / callers depend on.
-# Keeping them at the package level preserves backward compatibility while
-# the real definitions live in focused submodules.
-from . import state as _state
+from .supervised import (
+    SupervisedHandle,
+    SupervisedTeardownError,
+    spawn_supervised,
+)
+from .tiers import ContainmentTier
 
 _cache_lock = _state._cache_lock
 
@@ -623,7 +753,8 @@ def __getattr__(name):
     """
     if hasattr(_state, name):
         return getattr(_state, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
 
 
 # Note: `__getattr__` above handles READS of state names through the
@@ -634,23 +765,65 @@ def __getattr__(name):
 # fixture already does this.
 
 __all__ = [
-    # Context manager and convenience wrappers
-    "sandbox", "run", "run_trusted", "run_untrusted", "run_untrusted_networked",
-    # CLI surface
-    "add_cli_args", "apply_cli_args", "disable_from_cli", "set_cli_profile",
-    # Availability probes (exposed for the startup banner)
-    "check_sandbox_available", "check_net_available",
-    "check_mount_available", "check_landlock_available",
-    "check_seatbelt_available",
-    "check_seccomp_available",
+    "DEFAULT_PROFILE",
+    "OBSERVE_FILENAME",
     # Named profiles
-    "PROFILES", "DEFAULT_PROFILE", "_SANDBOX_KWARGS",
+    "PROFILES",
+    "SANDBOX_ENGAGE_EXIT_CODE",
+    "_BLOCKED_PATTERNS",
+    "_DEFAULT_LIMITS",
+    "_SANDBOX_KWARGS",
+    "ConnectTarget",
+    "ObserveProfile",
+    # CLI-disable refusal (typed subtype; consent gate said no)
+    "SandboxDisableRefusedError",
+    # Containment-floor refusal (typed subtype with achievable/floor)
+    "SandboxFloorError",
+    # Engagement-failure signal (fail-loud, never silently degrade)
+    "SandboxSetupError",
+    # Containment-tier lattice (the floor contract's vocabulary)
+    "ContainmentTier",
+    # Supervised process trees — teardown plumbing, NOT a sandbox
+    # (no confinement; see core.sandbox.supervised)
+    "SupervisedHandle",
+    "SupervisedTeardownError",
+    "_build_mount_script",
+    "_cache_lock",
+    "_check_blocked",
     # Private re-exports kept for backward compatibility — see the
     # block comment above; tests + a few internal callers reach into
     # these names directly so the public name stays stable.
     "_get_landlock_abi",
-    "_BLOCKED_PATTERNS", "_check_blocked", "_interpret_result", "_path_within",
-    "OBSERVE_FILENAME", "ConnectTarget", "ObserveProfile", "parse_observe_log",
-    "_DEFAULT_LIMITS", "_load_user_limits", "_make_preexec_fn",
-    "_build_mount_script",
+    "_interpret_result",
+    "_load_user_limits",
+    "_make_preexec_fn",
+    "_path_within",
+    # CLI surface
+    "add_cli_args",
+    "apply_cli_args",
+    "check_child_unix_sockets_available",
+    "check_landlock_available",
+    "check_mount_available",
+    "check_net_available",
+    "check_pidns_supervision_available",
+    # Availability probes (exposed for the startup banner)
+    "check_sandbox_available",
+    "check_seatbelt_available",
+    "check_seccomp_available",
+    "check_unshare_engages",
+    "disable_from_cli",
+    # Consented-exec staging for 0444 run-dir artifacts
+    "executable_stage",
+    "parse_observe_log",
+    "python_runtime_tool_paths",
+    "run",
+    "run_trusted",
+    "run_untrusted",
+    "run_untrusted_networked",
+    # Context manager and convenience wrappers
+    "sandbox",
+    "set_cli_profile",
+    "set_pdeathsig",
+    "spawn_backend_available",
+    "spawn_supervised",
 ]

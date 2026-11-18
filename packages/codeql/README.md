@@ -6,7 +6,7 @@ Fully autonomous CodeQL security analysis with intelligent language detection, b
 
 ✅ **Phase 1 Complete - Foundation**
 
-- ✅ Autonomous language detection (10 languages supported)
+- ✅ Autonomous language detection (11 languages supported)
 - ✅ Intelligent build system detection and command generation
 - ✅ SHA256-based database caching (reuse databases for unchanged repos)
 - ✅ Parallel database creation for multi-language repositories
@@ -21,10 +21,10 @@ Fully autonomous CodeQL security analysis with intelligent language detection, b
 packages/codeql/
 ├── agent.py                  # Main orchestrator (CLI entry point)
 ├── language_detector.py      # Auto-detect languages in repos
-├── build_detector.py         # Auto-detect build systems & generate commands
 ├── database_manager.py       # Database lifecycle management with caching
 ├── query_runner.py           # CodeQL suite execution & SARIF generation
-└── __init__.py              # Package exports
+└── __init__.py              # Package exports (re-exports BuildDetector
+                              #   from core/build/build_detector.py)
 
 codeql_dbs/                   # Database cache directory (gitignored)
 └── <repo_hash>/
@@ -64,11 +64,11 @@ python3 packages/codeql/agent.py --repo /path/to/code --languages java,python
 ### Custom Build Command
 
 ```bash
-# Your example from earlier
-export CODEQL_CLI=/Users/daniel/reverse_engineering/codeql/codeql
+# Point CODEQL_CLI at a specific CLI bundle when several are installed
+export CODEQL_CLI=/opt/codeql/codeql
 
 python3 packages/codeql/agent.py \
-  --repo /Users/daniel/O365/CSR/Code/CodeQL-Crypto-Research/GHUniverse/acme-access-main \
+  --repo /path/to/java-project \
   --languages java \
   --build-command "mvn clean compile -DskipTests"
 ```
@@ -119,27 +119,47 @@ export RAPTOR_OUT_DIR=/custom/output/dir
 
 ### RaptorConfig Settings
 
-All configuration is centralized in `core/config.py`:
+CodeQL resource settings live in **`tuning.json`** at the repo root (the
+single source of truth, resolved by `core.tuning.get_tuning()`).
+`RaptorConfig` exposes them as classproperties for code that wants the
+resolved integers directly; new CodeQL invocations should use
+`packages.codeql.CodeQLTunables.from_tuning()` instead so the flag set
+stays consistent across consumers.
+
+`tuning.json` keys:
+
+```jsonc
+{
+  "codeql_ram_mb":  "auto",   // -M MB; "auto" = 25% of system RAM clamped [2048, 16384]
+  "codeql_threads": "auto",   // -j N;  "auto" = 0 = all CPUs (override the codeql default of 1)
+  "max_codeql_workers": 2     // parallel codeql operations in same process
+}
+```
+
+Adding a new CodeQL invocation:
 
 ```python
-# Database storage
-CODEQL_DB_DIR = REPO_ROOT / "codeql_dbs"
+from packages.codeql import CodeQLTunables
 
-# Timeouts
-CODEQL_TIMEOUT = 1800              # 30 minutes (database creation)
-CODEQL_ANALYZE_TIMEOUT = 2400      # 40 minutes (query execution)
+cmd = [codeql, "database", "analyze", db, query, "--format=sarif-latest", f"--output={sarif}"]
+CodeQLTunables.from_tuning().append_to(cmd, include_disk_cache=False)
+```
 
-# Resources
-CODEQL_RAM_MB = 8192               # 8GB RAM for analysis
-CODEQL_THREADS = 0                 # 0 = use all CPUs
-CODEQL_MAX_PATHS = 4               # Max dataflow paths per query
+For `database create`, pass `include_disk_cache=True` (the `--max-disk-cache`
+flag is only valid there).  See `packages/codeql/tunables.py` for the
+full surface; the trust-witness corpus walker (`core.dataflow.cvefix_walk`)
+is a worked operator example with CLI overrides for `--threads`/`--ram`/
+`--max-disk-cache`.
 
-# Caching
-CODEQL_DB_CACHE_DAYS = 7           # Keep databases for 7 days
-CODEQL_DB_AUTO_CLEANUP = True      # Auto-cleanup old databases
+Non-tuning settings still live in `core/config.py`:
 
-# Parallel processing
-MAX_CODEQL_WORKERS = 2             # Parallel operations
+```python
+CODEQL_DB_DIR        = REPO_ROOT / "codeql_dbs"
+CODEQL_TIMEOUT       = 1800   # 30 minutes (database creation)
+CODEQL_ANALYZE_TIMEOUT = 2400 # 40 minutes (query execution)
+CODEQL_MAX_PATHS     = 4      # Max dataflow paths per query
+CODEQL_DB_CACHE_DAYS = 7      # Keep databases for 7 days
+CODEQL_DB_AUTO_CLEANUP = True # Auto-cleanup old databases
 ```
 
 ## Output Structure
@@ -194,10 +214,37 @@ python3 packages/codeql/language_detector.py --repo /path/to/code --json
 
 **Fallback**: No-build mode for interpreted languages
 
+### Buildless extraction (default for C/C++, Java, C#)
+
+Databases for every language in `BUILDLESS_DEFAULT_LANGUAGES` (C/C++,
+Java, C#) are created with `--build-mode=none` **by default** — the
+extractor parses the source without invoking any build system, so an
+untrusted repo's build scripts (Make/CMake/configure/Maven/MSBuild —
+repo-controlled code) never execute. Buildless needs a per-language
+CLI floor: an older CLI skips C/C++ with a clear error (no safe
+alternative exists), while Java/C# fall back to the traced/autobuild
+path with a loud disclosure banner.
+
+Operators opt into traced-build extraction explicitly, asserting trust
+in the repo:
+
+```bash
+# traced build with auto-detected build system
+python3 raptor_codeql.py --repo /path/to/code --traced-build
+
+# an explicit build command also implies a traced build
+python3 raptor_codeql.py --repo /path/to/code --languages cpp \
+  --build-command "make -j"
+```
+
+Traced builds still run under the sandbox (network blocked, safe env),
+but they execute repo-controlled code by design — buildless mode removes
+that vector entirely.
+
 **Test build detection:**
 
 ```bash
-python3 packages/codeql/build_detector.py --repo /path/to/code --language java --json
+python3 core/build/build_detector.py --repo /path/to/code --language java --json
 ```
 
 ## Database Caching
@@ -302,10 +349,15 @@ CODEQL_TIMEOUT = 3600  # 60 minutes
 
 ### Out of memory
 
-```python
-# Reduce RAM allocation in core/config.py
-CODEQL_RAM_MB = 4096  # 4GB instead of 8GB
+Edit `tuning.json` at the repo root (or run `/tune balanced` to do it):
+
+```jsonc
+{
+  "codeql_ram_mb": 4096   // 4GB instead of "auto"
+}
 ```
+
+`CodeQLTunables.from_tuning()` picks this up immediately on the next run.
 
 ## Next Steps (Phase 2)
 
@@ -324,7 +376,7 @@ Phase 2 will add autonomous vulnerability analysis:
 
 ```bash
 python3 packages/codeql/agent.py \
-  --repo /Users/daniel/O365/CSR/Code/CodeQL-Crypto-Research/GHUniverse/acme-access-main
+  --repo /path/to/java-maven-project
 
 # Output:
 # ✓ Detected java (confidence: 0.92)

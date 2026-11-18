@@ -1,0 +1,1588 @@
+"""Tests for the corpus run-history store and reporting CLI."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+import core.audit.corpus.history as history
+import core.audit.corpus.run_corpus as run_corpus
+
+
+@pytest.fixture(autouse=True)
+def _isolated_store(tmp_path, monkeypatch):
+    """Every test writes to a tmp store, never the operator's real one."""
+    monkeypatch.setenv(
+        history.HISTORY_ENV, str(tmp_path / "history.jsonl"),
+    )
+
+
+def _label(fid="a.c:f", span_sha="0123456789ab", expected="clean"):
+    return SimpleNamespace(
+        function_id=fid,
+        bug_class="auth",
+        expected_status=expected,
+        expected_mechanism="",
+        expected_mode_results={},
+        source=SimpleNamespace(
+            repo="test", sha="x", file="a.c",
+            line_start=1, line_end=6, span_sha=span_sha,
+        ),
+    )
+
+
+def _row(fid="a.c:f", expected="clean", actual="clean", **kw):
+    row = {
+        "function_id": fid,
+        "bug_class": "auth",
+        "expected": expected,
+        "actual": actual,
+        "match": expected == actual,
+        "hypothesis": "",
+        "evidence_tool": "",
+        "model": "",
+        "cost_usd": 0.0,
+        "duration_s": 0.0,
+        "error_reason": "",
+    }
+    row.update(kw)
+    return row
+
+
+def _label_rec(fid, actual, *, match=None, run_id="r", expected="clean",
+               **kw):
+    rec = {
+        "record": "label",
+        "run_id": run_id,
+        "function_id": fid,
+        "span_sha": "",
+        "bug_class": "auth",
+        "expected": expected,
+        "actual": actual,
+        "match": (expected == actual) if match is None else match,
+        "skipped": False,
+        "attribution": "",
+        "observed_mechanisms": [],
+        "error_reason": "",
+        "model": "",
+        "cost_usd": 0.0,
+        "duration_s": 0.0,
+    }
+    rec.update(kw)
+    return rec
+
+
+def _run_rec(run_id, *, tree="", config=None, timestamp="", **kw):
+    rec = {
+        "record": "run",
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "pipeline_tree_sha": tree,
+        "config": config or {},
+        "label_set_hash": "",
+        "gates": {"passed": True, "failures": []},
+        "totals": {"labels": 0, "reviewed": 0, "matched": 0,
+                   "errors": 0, "skipped": 0, "wall_s": 0, "llm_s": 0},
+        "cost_usd": 0.0,
+        "imported": False,
+    }
+    rec.update(kw)
+    return rec
+
+
+class TestStorePath:
+    def test_env_override_wins(self, monkeypatch, tmp_path):
+        override = tmp_path / "elsewhere.jsonl"
+        monkeypatch.setenv(history.HISTORY_ENV, str(override))
+        assert history.store_path() == override
+
+    def test_default_under_local_share(self, monkeypatch):
+        monkeypatch.delenv(history.HISTORY_ENV, raising=False)
+        path = history.store_path()
+        assert path.name == "corpus-history.jsonl"
+        assert ".local" in str(path)
+
+
+class TestLabelSetHash:
+    def test_order_independent(self):
+        a = [_label("a.c:f"), _label("b.c:g", span_sha="ba9876543210")]
+        assert history.label_set_hash(a) == history.label_set_hash(
+            list(reversed(a)),
+        )
+
+    def test_span_sha_changes_hash(self):
+        assert history.label_set_hash(
+            [_label(span_sha="0123456789ab")],
+        ) != history.label_set_hash([_label(span_sha="ba9876543210")])
+
+    def test_missing_span_sha_tolerated(self):
+        lb = _label()
+        del lb.source.span_sha
+        assert len(history.label_set_hash([lb])) == 64
+
+
+class TestRecordRun:
+    def test_round_trip(self, tmp_path):
+        store = tmp_path / "store.jsonl"
+        out = tmp_path / "corpus-full-v9" / "results.json"
+        out.parent.mkdir()
+        out.write_text("{}")
+        ok = history.record_run(
+            [_row()], {"wall_s": 5.0, "cost_usd": 1.25, "total_spend_usd": 4.5, "model": "m"},
+            output_path=out, run_tag="1700000000",
+            labels=[_label()],
+            config={"mode": "security", "triage": "off"},
+            store=store,
+        )
+        assert ok is True
+        runs, labels_by_run = history.load_store(store)
+        assert len(runs) == 1
+        run = runs[0]
+        assert run["run_id"] == "corpus-full-v9"
+        assert run["timestamp"].startswith("2023-11-14")
+        assert run["config"] == {"mode": "security", "triage": "off"}
+        assert len(run["label_set_hash"]) == 64
+        assert run["cost_usd"] == 1.25
+        assert run["total_spend_usd"] == 4.5
+        assert run["totals"]["labels"] == 1
+        assert run["totals"]["matched"] == 1
+        assert run["imported"] is False
+        assert run["gates"]["passed"] is True
+        recs = labels_by_run["corpus-full-v9"]
+        assert len(recs) == 1
+        assert recs[0]["function_id"] == "a.c:f"
+        assert recs[0]["span_sha"] == "0123456789ab"
+        assert recs[0]["match"] is True
+
+    def test_gate_failures_recorded(self, tmp_path):
+        store = tmp_path / "store.jsonl"
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        # A missed finding fails the class-recall gate.
+        history.record_run(
+            [_row(expected="finding", actual="clean", match=False)],
+            {"model": ""}, output_path=out, store=store,
+        )
+        runs, _ = history.load_store(store)
+        assert runs[0]["gates"]["passed"] is False
+        assert runs[0]["gates"]["failures"]
+
+    def test_append_only(self, tmp_path):
+        store = tmp_path / "store.jsonl"
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        for _ in range(2):
+            history.record_run([_row()], {}, output_path=out, store=store)
+        runs, labels_by_run = history.load_store(store)
+        assert len(runs) == 2
+        assert len(labels_by_run[runs[0]["run_id"]]) == 2
+
+    def test_failure_warns_never_raises(self, tmp_path, capsys):
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")  # store parent is a file -> OSError
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        ok = history.record_run(
+            [_row()], {}, output_path=out,
+            store=blocker / "store.jsonl",
+        )
+        assert ok is False
+        assert "not recorded" in capsys.readouterr().err
+
+    def test_append_records_refuses_symlinked_store(self, tmp_path):
+        # append_records routes through the hardened trail writer
+        # (O_NOFOLLOW single-write appends): a symlink planted at the
+        # store path is refused instead of followed. A plain buffered
+        # ``open("a")`` would follow it silently.
+        victim = tmp_path / "victim.jsonl"
+        victim.write_text("")
+        store = tmp_path / "store.jsonl"
+        store.symlink_to(victim)
+        with pytest.raises(OSError):
+            history.append_records(store, [{"record": "run", "run_id": "r"}])
+        assert victim.read_text() == ""
+
+    def test_append_records_appends_whole_lines(self, tmp_path):
+        # Direction two: a regular store path keeps today's contract —
+        # existing content preserved, one parseable JSON object per
+        # line, key-stable output.
+        store = tmp_path / "store.jsonl"
+        store.write_text('{"record":"run","run_id":"pre"}\n')
+        history.append_records(
+            store,
+            [{"record": "run", "run_id": "r1"},
+             {"record": "label", "run_id": "r1", "function_id": "a.c:f"}],
+        )
+        lines = store.read_text().splitlines()
+        assert len(lines) == 3
+        parsed = [json.loads(line) for line in lines]
+        assert parsed[0]["run_id"] == "pre"
+        assert [p["record"] for p in parsed[1:]] == ["run", "label"]
+        # sort_keys stability (the store is diffed across runs)
+        assert lines[1] == json.dumps(
+            {"record": "run", "run_id": "r1"}, sort_keys=True)
+
+    def test_record_run_symlinked_store_warns_never_raises(
+            self, tmp_path, capsys):
+        # The raises-OSError change stays inside record_run's
+        # best-effort contract: a symlinked store makes it warn and
+        # return False, exactly like any other store failure.
+        victim = tmp_path / "victim.jsonl"
+        victim.write_text("")
+        store = tmp_path / "store.jsonl"
+        store.symlink_to(victim)
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        ok = history.record_run([_row()], {}, output_path=out, store=store)
+        assert ok is False
+        assert "not recorded" in capsys.readouterr().err
+
+    def test_row_without_function_id_skipped(self, tmp_path, capsys):
+        store = tmp_path / "store.jsonl"
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        history.record_run(
+            [_row(), {"bug_class": "auth"}], {},
+            output_path=out, store=store,
+        )
+        _, labels_by_run = history.load_store(store)
+        assert len(next(iter(labels_by_run.values()))) == 1
+        assert "without function_id" in capsys.readouterr().err
+
+
+class TestRunIdForOutput:
+    def test_generic_stem_uses_directory(self, tmp_path):
+        assert history.run_id_for_output(
+            tmp_path / "corpus-full-v3" / "results.json",
+        ) == "corpus-full-v3"
+
+    def test_named_output_uses_stem(self, tmp_path):
+        assert history.run_id_for_output(
+            tmp_path / "my-experiment.json",
+        ) == "my-experiment"
+
+
+class TestIterRecords:
+    def test_malformed_lines_skipped_with_warning(self, tmp_path, capsys):
+        store = tmp_path / "store.jsonl"
+        store.write_text(
+            json.dumps(_run_rec("r1")) + "\n"
+            + "{corrupt json\n"
+            + json.dumps({"no": "record field"}) + "\n"
+            + json.dumps(_label_rec("a.c:f", "clean", run_id="r1")) + "\n"
+        )
+        recs = list(history.iter_records(store))
+        assert [r["record"] for r in recs] == ["run", "label"]
+        err = capsys.readouterr().err
+        assert "malformed history line skipped" in err
+        assert "unrecognized history record" in err
+
+    def test_missing_store_yields_nothing(self, tmp_path):
+        assert list(history.iter_records(tmp_path / "nope.jsonl")) == []
+
+
+class TestClassifyFlip:
+    def test_errored(self):
+        assert history.classify_flip(
+            _label_rec("f", "clean"), _label_rec("f", "error", match=False),
+        ) == "errored"
+
+    def test_recovered(self):
+        assert history.classify_flip(
+            _label_rec("f", "error", match=False),
+            _label_rec("f", "clean", match=True),
+        ) == "recovered"
+
+    def test_error_to_mismatch_is_regressed(self):
+        assert history.classify_flip(
+            _label_rec("f", "error", match=False),
+            _label_rec("f", "finding", match=False),
+        ) == "regressed"
+
+    def test_improved(self):
+        assert history.classify_flip(
+            _label_rec("f", "clean", expected="finding", match=False),
+            _label_rec("f", "finding", expected="finding", match=True),
+        ) == "improved"
+
+    def test_regressed(self):
+        assert history.classify_flip(
+            _label_rec("f", "clean", match=True),
+            _label_rec("f", "finding", match=False),
+        ) == "regressed"
+
+    def test_lateral_keeps_match(self):
+        assert history.classify_flip(
+            _label_rec("f", "finding", expected="finding", match=True),
+            _label_rec("f", "suspicious", expected="finding", match=True),
+        ) == "lateral"
+
+
+class TestCompareRuns:
+    @pytest.mark.parametrize("before, after, delta", [(4.0, 9.0, 5.0), (0, 0, 0)], ids=["recorded", "zero"])
+    def test_total_spend_is_separate_from_label_cost(self, before, after, delta):
+        a = _run_rec("a", cost_usd=1.0, total_spend_usd=before)
+        b = _run_rec("b", cost_usd=2.0, total_spend_usd=after)
+        diff = history.compare_runs(a, b, {}, {})
+        assert diff["cost_delta"] == 1.0
+        assert diff["total_spend_a"] == before
+        assert diff["total_spend_b"] == after
+        assert diff["total_spend_delta"] == delta
+        output = history.format_compare(diff)
+        assert "Label-attributed cost: $1.0000 -> $2.0000" in output
+        assert f"Recorded total spend: ${before:.4f} -> ${after:.4f} (delta ${delta:+.4f})" in output
+
+    @pytest.mark.parametrize("value", [None, True, -1, "3.0", float("nan"), float("inf"), 10**1000],
+                             ids=["absent", "bool", "negative", "string", "nan", "infinity", "overflow"])
+    def test_missing_or_invalid_total_is_not_inferred_from_label_cost(self, value):
+        a = _run_rec("a", cost_usd=2.0, total_spend_usd=value)
+        b = _run_rec("b", cost_usd=4.0, total_spend_usd=0)
+        diff = history.compare_runs(a, b, {}, {})
+        assert diff["total_spend_a"] is None
+        assert diff["total_spend_delta"] is None
+        assert "Recorded total spend: unknown -> $0.0000 (delta unknown)" in history.format_compare(diff)
+
+    def test_legacy_comparison_without_total_fields_still_formats_unknown(self):
+        diff = history.compare_runs(_run_rec("a"), _run_rec("b"), {}, {})
+        for key in ("total_spend_a", "total_spend_b", "total_spend_delta"):
+            del diff[key]
+        assert "Recorded total spend: unknown -> unknown (delta unknown)" in history.format_compare(diff)
+
+    def test_listing_distinguishes_label_cost_and_recorded_total(self):
+        output = history.format_runs([_run_rec("known", cost_usd=1, total_spend_usd=5), _run_rec("legacy")])
+        assert "Label $" in output and "Total $" in output
+        assert "1.0000" in output and "$5.0000" in output
+        assert "unknown" in output
+
+    def test_expectation_revision_is_visible_without_verdict_flip(self):
+        a = {"a.c:f": _label_rec("a.c:f", "clean", expected="clean", match=True)}
+        b = {"a.c:f": _label_rec("a.c:f", "clean", expected="finding", match=False)}
+        diff = history.compare_runs(_run_rec("a"), _run_rec("b"), a, b)
+        assert diff["expectation_changes"] == [{
+            "function_id": "a.c:f", "from_recorded": True, "from": "clean",
+            "to_recorded": True, "to": "finding",
+        }]
+        assert diff["flips"] == {}
+        assert diff["common_label_matches"]["matched_a"] == 1
+        assert diff["common_label_matches"]["matched_b"] == 0
+        output = history.format_compare(diff)
+        assert "match deltas may reflect label revisions" in output
+        assert "a.c:f: expected 'clean' -> 'finding'" in output
+
+    def test_missing_expectation_is_distinct_from_explicit_null(self):
+        a = _label_rec("a.c:f", "clean")
+        del a["expected"]
+        b = {**a, "expected": None}
+        diff = history.compare_runs(_run_rec("a"), _run_rec("b"), {"a.c:f": a}, {"a.c:f": b})
+        assert diff["expectation_changes"] == [{
+            "function_id": "a.c:f", "from_recorded": False, "from": None,
+            "to_recorded": True, "to": None,
+        }]
+        assert "expected (unrecorded) -> None" in history.format_compare(diff)
+
+    def test_expectation_details_escape_terminal_output_and_preserve_recorded_values(self):
+        fid = "function\x1b[31m"
+        a = {fid: _label_rec(fid, "clean", expected="clean\x1b[31m")}
+        b = {fid: _label_rec(fid, "clean", expected="finding")}
+        diff = history.compare_runs(_run_rec("a"), _run_rec("b"), a, b)
+        assert diff["expectation_changes"][0]["from"] == "clean\x1b[31m"
+        assert diff["expectation_changes"][0]["function_id"] == fid
+        assert "\x1b" not in history.format_compare(diff)
+
+    def test_legacy_comparison_without_expectation_changes_still_formats(self):
+        run = _run_rec("a")
+        labels = {"a.c:f": _label_rec("a.c:f", "clean")}
+        diff = history.compare_runs(run, run, labels, labels)
+        assert diff["expectation_changes"] == []
+        del diff["expectation_changes"]
+        assert "recorded label expectations differ" not in history.format_compare(diff)
+
+    def test_configuration_changes_preserve_nulls_and_do_not_change_flips(self):
+        config_a = {"mode": "security", "llm_cache_policy": {"enabled": True, "ttl_seconds": None}}
+        config_b = {"mode": "quality", "llm_cache_policy": {"enabled": True, "ttl_seconds": 120},
+                    "integer_abi": None}
+        a, b = _run_rec("a", config=config_a), _run_rec("b", config=config_b)
+        labels_a = {"a.c:f": _label_rec("a.c:f", "clean", expected="finding", match=False)}
+        labels_b = {"a.c:f": _label_rec("a.c:f", "finding", expected="finding", match=True)}
+        diff = history.compare_runs(a, b, labels_a, labels_b)
+        assert diff["configuration_changes"] == [
+            {"field": "integer_abi", "from_recorded": False, "from": None, "to_recorded": True, "to": None},
+            {"field": "llm_cache_policy", "from_recorded": True, "from": config_a["llm_cache_policy"],
+             "to_recorded": True, "to": config_b["llm_cache_policy"]},
+            {"field": "mode", "from_recorded": True, "from": "security", "to_recorded": True, "to": "quality"},
+        ]
+        assert len(diff["flips"]["improved"]) == 1
+        output = history.format_compare(diff)
+        assert "verdict changes alone do not isolate fix impact" in output
+        assert "integer_abi: (unrecorded) -> None" in output
+        assert "mode: 'security' -> 'quality'" in output
+
+    def test_equal_recorded_configuration_and_missing_legacy_configuration_do_not_warn(self):
+        for a, b in [(_run_rec("a"), _run_rec("b")),
+                     (_run_rec("a", config={"integer_abi": None}), _run_rec("b", config={"integer_abi": None}))]:
+            diff = history.compare_runs(a, b, {}, {})
+            assert diff["configuration_changes"] == []
+            assert "recorded configuration differs" not in history.format_compare(diff)
+
+    def test_configuration_details_are_terminal_safe_and_report_removals(self):
+        a = _run_rec("a", config={"field\x1b[31m": "value\x1b[31m"})
+        diff = history.compare_runs(a, _run_rec("b"), {}, {})
+        assert diff["configuration_changes"][0]["from_recorded"] is True
+        assert diff["configuration_changes"][0]["to_recorded"] is False
+        output = history.format_compare(diff)
+        assert "(unrecorded)" in output
+        assert "\x1b" not in output
+
+    def test_flips_attribution_and_cost(self):
+        run_a = _run_rec("va", cost_usd=1.0)
+        run_b = _run_rec("vb", cost_usd=3.0)
+        labels_a = {
+            "a.c:f": _label_rec(
+                "a.c:f", "clean", expected="finding", match=False,
+                attribution="wrong_verdict",
+            ),
+            "b.c:g": _label_rec("b.c:g", "clean", match=True),
+            "c.c:h": _label_rec(
+                "c.c:h", "clean", match=True, skipped=True,
+            ),
+            "only_a.c:x": _label_rec("only_a.c:x", "clean"),
+        }
+        labels_b = {
+            "a.c:f": _label_rec(
+                "a.c:f", "finding", expected="finding", match=True,
+                attribution="attributed",
+                observed_mechanisms=["smt"],
+            ),
+            "b.c:g": _label_rec(
+                "b.c:g", "error", match=False,
+                error_reason="llm_error:boom",
+            ),
+            "c.c:h": _label_rec("c.c:h", "clean", match=True),
+            "only_b.c:y": _label_rec("only_b.c:y", "clean"),
+        }
+        diff = history.compare_runs(run_a, run_b, labels_a, labels_b)
+        assert diff["common"] == 3
+        assert diff["only_in_a"] == ["only_a.c:x"]
+        assert diff["only_in_b"] == ["only_b.c:y"]
+        flips = diff["flips"]
+        assert [f["function_id"] for f in flips["improved"]] == ["a.c:f"]
+        assert [f["function_id"] for f in flips["errored"]] == ["b.c:g"]
+        assert flips["errored"][0]["error_reason"] == "llm_error:boom"
+        # skipped rows are excluded from the matched/reviewed counts
+        assert (diff["matched_a"], diff["reviewed_a"]) == (2, 3)
+        assert (diff["matched_b"], diff["reviewed_b"]) == (3, 4)
+        assert diff["common_label_matches"] == {
+            "matched_a": 1, "reviewed_a": 2, "matched_b": 2, "reviewed_b": 3,
+        }
+        assert diff["cost_delta"] == pytest.approx(2.0)
+        changes = {c["function_id"] for c in diff["attribution_changes"]}
+        assert "a.c:f" in changes
+
+        report = history.format_compare(diff)
+        assert "improved (1)" in report
+        assert "errored (1)" in report
+        assert "clean -> finding" in report
+        assert "wrong_verdict -> attributed" in report
+        assert "Matched on shared labels (reviewed): 1/2 -> 2/3 (+1)" in report
+        assert "shared labels have different non-skipped counts" in report
+
+    def test_different_run_sizes_do_not_change_shared_label_summary(self):
+        a, b = _run_rec("a"), _run_rec("b")
+        shared = _label_rec("shared.c:f", "clean", match=True)
+        labels_a = {"shared.c:f": shared, "extra.c:g": _label_rec("extra.c:g", "clean", match=True)}
+        labels_b = {"shared.c:f": dict(shared)}
+        diff = history.compare_runs(a, b, labels_a, labels_b)
+        assert diff["common_label_matches"] == {
+            "matched_a": 1, "reviewed_a": 1, "matched_b": 1, "reviewed_b": 1,
+        }
+        assert (diff["matched_a"], diff["matched_b"]) == (2, 1)
+        assert diff["flips"] == {}
+        output = history.format_compare(diff)
+        assert "Matched on shared labels (reviewed): 1/1 -> 1/1 (+0)" in output
+        assert "Matched in whole runs (reviewed): 2/2 -> 1/1 (-1)" in output
+
+    def test_disjoint_runs_report_no_shared_comparison(self):
+        diff = history.compare_runs(_run_rec("a"), _run_rec("b"),
+                                    {"a.c:f": _label_rec("a.c:f", "clean")},
+                                    {"b.c:g": _label_rec("b.c:g", "clean")})
+        assert diff["common_label_matches"] == {
+            "matched_a": 0, "reviewed_a": 0, "matched_b": 0, "reviewed_b": 0,
+        }
+        assert "no shared labels" in history.format_compare(diff)
+
+    def test_legacy_comparison_without_shared_summary_still_formats(self):
+        run = _run_rec("a")
+        diff = history.compare_runs(run, run, {}, {})
+        del diff["common_label_matches"]
+        output = history.format_compare(diff)
+        assert "Matched in whole runs" in output
+        assert "Matched on shared labels" not in output
+
+    def test_no_flips(self):
+        run = _run_rec("v")
+        labels = {"a.c:f": _label_rec("a.c:f", "clean")}
+        diff = history.compare_runs(run, run, labels, dict(labels))
+        assert diff["flips"] == {}
+        assert "No verdict flips." in history.format_compare(diff)
+
+
+class TestResolveRun:
+    def _runs(self):
+        return [
+            _run_rec("corpus-full-v2", timestamp="t1"),
+            _run_rec("corpus-full-v3", timestamp="t2"),
+            _run_rec("corpus-full-v3", timestamp="t3"),
+        ]
+
+    def test_exact_match_latest_wins(self):
+        run = history.resolve_run(self._runs(), "corpus-full-v3")
+        assert run["timestamp"] == "t3"
+
+    def test_unique_substring(self):
+        assert history.resolve_run(
+            self._runs(), "v2",
+        )["run_id"] == "corpus-full-v2"
+
+    def test_ambiguous_raises(self):
+        with pytest.raises(ValueError, match="ambiguous"):
+            history.resolve_run(self._runs(), "corpus-full")
+
+    def test_no_match_raises(self):
+        with pytest.raises(ValueError, match="no run matches"):
+            history.resolve_run(self._runs(), "v9")
+
+
+class TestImport:
+    def _write(self, tmp_path, name, payload):
+        d = tmp_path / name
+        d.mkdir()
+        path = d / "results.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_cli_import_to_compare_retains_both_spend_figures(self, tmp_path, capsys):
+        before = self._write(tmp_path, "before", {
+            "meta": {"cost_usd": 1.0, "total_spend_usd": 4.0}, "results": [_row()],
+        })
+        after = self._write(tmp_path, "after", {
+            "meta": {"cost_usd": 2.0, "total_spend_usd": 9.0}, "results": [_row()],
+        })
+        store = tmp_path / "store.jsonl"
+        assert history.main(["--store", str(store), "import", str(before), str(after)]) == 0
+        capsys.readouterr()
+        assert history.main(["--store", str(store), "compare", "before", "after"]) == 0
+        output = capsys.readouterr().out
+        assert "Label-attributed cost: $1.0000 -> $2.0000" in output
+        assert "Recorded total spend: $4.0000 -> $9.0000 (delta $+5.0000)" in output
+
+    def test_wrapped_shape_with_meta(self, tmp_path):
+        store = tmp_path / "store.jsonl"
+        path = self._write(tmp_path, "corpus-full-v3", {
+            "meta": {"wall_s": 9.0, "cost_usd": 3.6, "model": "default",
+                     "count": 1, "triage": "off", "total_spend_usd": 8.5},
+            "results": [_row(actual="suspicious", match=False,
+                             attribution="wrong_verdict",
+                             observed_mechanisms=["smt"])],
+        })
+        run_id = history.import_results(path, store)
+        assert run_id == "corpus-full-v3"
+        runs, labels_by_run = history.load_store(store)
+        run = runs[0]
+        assert run["imported"] is True
+        assert run["total_spend_usd"] == 8.5
+        assert run["config"]["triage"] == "off"
+        assert run["config"]["model"] == "default"
+        assert run["pipeline_tree_sha"] == ""
+        assert run["label_set_hash"] == ""
+        assert run["timestamp"]  # synthesized from file mtime
+        rec = labels_by_run["corpus-full-v3"][0]
+        assert rec["attribution"] == "wrong_verdict"
+        assert rec["span_sha"] == ""
+
+    def test_older_shape_missing_fields(self, tmp_path):
+        # v2-era rows: no error_reason, meta without triage/prefilter;
+        # even older: a bare list with rows missing match/skipped.
+        store = tmp_path / "store.jsonl"
+        row = _row()
+        del row["error_reason"]
+        v2 = self._write(tmp_path, "corpus-full-v2", {
+            "meta": {"wall_s": 1.0, "cost_usd": 0.0, "model": "default",
+                     "count": 1},
+            "results": [row],
+        })
+        bare = self._write(tmp_path, "corpus-bare", [
+            {"function_id": "a.c:f", "bug_class": "auth",
+             "expected": "clean", "actual": "clean"},
+        ])
+        history.import_results(v2, store)
+        history.import_results(bare, store)
+        runs, labels_by_run = history.load_store(store)
+        assert [r["run_id"] for r in runs] == [
+            "corpus-full-v2", "corpus-bare",
+        ]
+        assert runs[0]["config"]["triage"] is None
+        assert labels_by_run["corpus-full-v2"][0]["error_reason"] == ""
+        assert labels_by_run["corpus-bare"][0]["match"] is False
+        for run in runs:
+            assert run["total_spend_usd"] is None
+            for key in ("model_resolved", "llm_cache", "llm_cache_policy", "integer_abi"):
+                assert key not in run["config"]
+
+    @pytest.mark.parametrize("cache, policy, abi", [
+        ("off", {"enabled": False, "ttl_seconds": None}, "llp64"),
+        ("on", {"enabled": True, "ttl_seconds": 120.0}, None),
+    ], ids=["bypassed-no-expiry", "enabled-null-abi"])
+    def test_recorded_config_survives_import(self, tmp_path, monkeypatch, cache, policy, abi):
+        # The importing host's policy must not replace recorded settings.
+        monkeypatch.setenv("RAPTOR_LLM_CACHE", "off" if cache == "on" else "on")
+        monkeypatch.setenv("RAPTOR_LLM_CACHE_TTL_S", "999")
+        recorded = {"model_resolved": "fixture/resolved-model", "llm_cache": cache,
+                    "llm_cache_policy": policy, "integer_abi": abi}
+        path = self._write(tmp_path, "saved", {
+            "meta": {"model": "fixture-alias", **recorded, "unrelated": "not configuration"},
+            "results": [_row()],
+        })
+        original = path.read_bytes()
+        store = tmp_path / "store.jsonl"
+        history.import_results(path, store)
+        runs, _ = history.load_store(store)
+        config = runs[0]["config"]
+        assert {key: config[key] for key in recorded} == recorded
+        assert config["model"] == "fixture-alias"
+        assert "unrelated" not in config
+        assert path.read_bytes() == original
+
+    def test_unrecognized_shape_raises(self, tmp_path):
+        store = tmp_path / "store.jsonl"
+        path = self._write(tmp_path, "not-results", {"foo": "bar"})
+        with pytest.raises(ValueError, match="not a corpus results"):
+            history.import_results(path, store)
+
+
+class TestStability:
+    def test_duplicate_headers_do_not_make_independent_repeats(self):
+        runs = [_run_rec("reused", tree="t" * 40), _run_rec("reused", tree="t" * 40)]
+        labels = {"reused": [_label_rec("a.c:f", "clean", run_id="reused"),
+                             _label_rec("a.c:f", "finding", run_id="reused")]}
+        assert history.stability_groups(runs, labels) == []
+        assert "distinct recorded run IDs" in history.format_stability([])
+
+    @pytest.mark.parametrize("field, changed", [
+        ("pipeline_tree_sha", "u" * 40), ("pipeline_tree_sha", ""),
+        ("profile", "cold"), ("label_set_hash", "c" * 64),
+        ("label_files_sha256", "c" * 64), ("config", {"mode": "quality"}),
+    ], ids=["tree", "missing-tree", "profile", "label-set", "definitions", "config"])
+    def test_stale_header_cannot_establish_matching_context(self, field, changed):
+        old = _run_rec("reused", tree="t" * 40, profile="deployed",
+                       label_set_hash="a" * 64, label_files_sha256="b" * 64)
+        other = {**old, "run_id": "other"}
+        latest = {**old, field: changed}
+        labels = {"reused": [_label_rec("a.c:f", "finding", run_id="reused")],
+                  "other": [_label_rec("a.c:f", "clean", run_id="other")]}
+        assert history.stability_groups([old, other, latest], labels) == []
+
+    def test_cli_discloses_reused_ids_and_uses_latest_header_order(self, tmp_path, capsys):
+        store = tmp_path / "store.jsonl"
+        history.append_records(store, [
+            _run_rec("reused", tree="u" * 40), _label_rec("a.c:f", "clean", run_id="reused"),
+            _run_rec("other", tree="t" * 40), _label_rec("a.c:f", "clean", run_id="other"),
+            _run_rec("reused", tree="t" * 40), _label_rec("a.c:f", "finding", run_id="reused"),
+        ])
+        runs, labels = history.load_store(store)
+        groups = history.stability_groups(runs, labels)
+        assert len(groups) == 1
+        assert groups[0]["run_ids"] == ["other", "reused"]
+        assert groups[0]["reused_run_ids"] == ["reused"]
+        assert history.main(["--store", str(store), "stability"]) == 0
+        output = capsys.readouterr().out
+        assert "latest header and merged label history" in output
+        assert "1/1 comparable label(s) unstable" in output
+
+    @pytest.mark.parametrize("field", ["label_set_hash", "label_files_sha256"])
+    def test_different_recorded_label_fingerprints_split_groups(self, field):
+        runs, labels = self._store()
+        for run in runs[:2]:
+            run.update(label_set_hash="a" * 64, label_files_sha256="b" * 64)
+        runs[1][field] = "c" * 64
+        assert history.stability_groups(runs, labels) == []
+
+    @pytest.mark.parametrize("field", ["label_set_hash", "label_files_sha256"])
+    @pytest.mark.parametrize("value", [None, {"invalid": True}], ids=["missing", "invalid-type"])
+    def test_unknown_fingerprint_does_not_mix_with_recorded_fingerprint(self, field, value):
+        runs, labels = self._store()
+        for run in runs[:2]:
+            run.update(label_set_hash="a" * 64, label_files_sha256="b" * 64)
+        runs[1][field] = value
+        assert history.stability_groups(runs, labels) == []
+
+    def test_legacy_variance_is_retained_with_incomplete_provenance_notice(self):
+        runs, labels = self._store()
+        groups = history.stability_groups(runs, labels)
+        assert len(groups) == 1
+        assert groups[0]["label_provenance_recorded"] is False
+        assert groups[0]["label_set_hash"] == groups[0]["label_files_sha256"] == ""
+        output = history.format_stability(groups)
+        assert "label provenance is incomplete" in output
+        assert "1/2 comparable label(s) unstable" in output
+
+    def test_cli_reads_recorded_label_provenance_from_store(self, tmp_path, capsys):
+        runs, labels = self._store()
+        for run in runs[:2]:
+            run.update(label_set_hash="a" * 64, label_files_sha256="b" * 64)
+        store = tmp_path / "store.jsonl"
+        for run in runs:
+            history.append_records(store, [run, *labels[run["run_id"]]])
+        assert history.main(["--store", str(store), "stability"]) == 0
+        output = capsys.readouterr().out
+        assert "set=aaaaaaaaaaaa definitions=bbbbbbbbbbbb" in output
+        assert "label provenance is incomplete" not in output
+        assert "1/2 comparable label(s) unstable" in output
+
+    def test_recorded_fingerprints_are_retained_and_terminal_safe(self):
+        runs, labels = self._store()
+        fingerprint = "\x1b[31m" + "a" * 64
+        for run in runs[:2]:
+            run.update(label_set_hash=fingerprint, label_files_sha256="b" * 64)
+        groups = history.stability_groups(runs, labels)
+        assert groups[0]["label_set_hash"] == fingerprint
+        assert groups[0]["label_provenance_recorded"] is True
+        assert "\x1b" not in history.format_stability(groups)
+
+    def _store(self):
+        config = {"mode": "security", "triage": "off"}
+        runs = [
+            _run_rec("r1", tree="t" * 40, config=config),
+            _run_rec("r2", tree="t" * 40, config=config),
+            _run_rec("r3", tree="u" * 40, config=config),
+            _run_rec("imported", tree="", config=config),
+        ]
+        labels_by_run = {
+            "r1": [_label_rec("a.c:f", "clean", run_id="r1"),
+                   _label_rec("b.c:g", "clean", run_id="r1")],
+            "r2": [_label_rec("a.c:f", "finding", run_id="r2",
+                              match=False),
+                   _label_rec("b.c:g", "clean", run_id="r2")],
+            "r3": [_label_rec("a.c:f", "clean", run_id="r3")],
+            "imported": [_label_rec("a.c:f", "error", run_id="imported",
+                                    match=False)],
+        }
+        return runs, labels_by_run
+
+    def test_same_tree_same_config_variance(self):
+        runs, labels_by_run = self._store()
+        groups = history.stability_groups(runs, labels_by_run)
+        # r3 has a different tree, imported has none: one group.
+        assert len(groups) == 1
+        g = groups[0]
+        assert g["run_ids"] == ["r1", "r2"]
+        assert g["comparable_labels"] == 2
+        assert set(g["unstable"]) == {"a.c:f"}
+        report = history.format_stability(groups)
+        assert "1/2 comparable label(s) unstable" in report
+        assert "r1=clean, r2=finding" in report
+
+    def test_config_split_prevents_grouping(self):
+        runs, labels_by_run = self._store()
+        runs[1]["config"] = {"mode": "quality", "triage": "off"}
+        assert history.stability_groups(runs, labels_by_run) == []
+
+    def test_no_groups_message(self):
+        report = history.format_stability([])
+        assert "No comparable run groups" in report
+
+
+class TestTrend:
+    def test_label_history_in_run_order(self):
+        runs = [
+            _run_rec("r1", timestamp="2026-01-01T00:00:00+00:00"),
+            _run_rec("r2", timestamp="2026-01-02T00:00:00+00:00"),
+        ]
+        labels_by_run = {
+            "r1": [_label_rec("a.c:f", "clean", run_id="r1")],
+            "r2": [_label_rec("a.c:f", "error", run_id="r2", match=False,
+                              error_reason="llm_error:x")],
+        }
+        report = history.format_trend("a.c:f", runs, labels_by_run)
+        lines = report.splitlines()
+        assert lines[0] == "History for a.c:f:"
+        assert "r1" in report and "r2" in report
+        assert "llm_error:x" in report
+
+    def test_unknown_label(self):
+        assert history.format_trend("nope", [], {}).startswith(
+            "No history",
+        )
+
+
+class TestCli:
+    def test_runs_on_empty_store(self, tmp_path, capsys):
+        rc = history.main(
+            ["--store", str(tmp_path / "none.jsonl"), "runs"],
+        )
+        assert rc == 0
+        assert "No runs recorded." in capsys.readouterr().out
+
+    def test_compare_unknown_run_fails(self, tmp_path, capsys):
+        rc = history.main(
+            ["--store", str(tmp_path / "none.jsonl"),
+             "compare", "a", "b"],
+        )
+        assert rc == 1
+        assert "no run matches" in capsys.readouterr().err
+
+    def test_import_then_compare(self, tmp_path, capsys):
+        store = tmp_path / "store.jsonl"
+        for name, actual in (("run-v1", "clean"), ("run-v2", "finding")):
+            d = tmp_path / name
+            d.mkdir()
+            (d / "results.json").write_text(json.dumps({
+                "meta": {"model": "default", "cost_usd": 0.0},
+                "results": [_row(
+                    expected="finding", actual=actual,
+                    match=actual == "finding",
+                )],
+            }))
+            assert history.main(
+                ["--store", str(store), "import",
+                 str(d / "results.json")],
+            ) == 0
+        rc = history.main(["--store", str(store), "compare", "v1", "v2"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "improved (1)" in out
+        assert "clean -> finding" in out
+
+    def test_import_bad_path_fails(self, tmp_path, capsys):
+        rc = history.main(
+            ["--store", str(tmp_path / "s.jsonl"),
+             "import", str(tmp_path / "missing.json")],
+        )
+        assert rc == 1
+        assert "import failed" in capsys.readouterr().err
+
+    def test_trend_unknown_label_exits_nonzero(self, tmp_path):
+        assert history.main(
+            ["--store", str(tmp_path / "none.jsonl"),
+             "trend", "--label", "a.c:f"],
+        ) == 1
+
+    def test_env_var_resolves_store(self, tmp_path, monkeypatch, capsys):
+        store = tmp_path / "env-store.jsonl"
+        monkeypatch.setenv(history.HISTORY_ENV, str(store))
+        store.write_text(json.dumps(_run_rec("env-run")) + "\n")
+        assert history.main(["runs"]) == 0
+        assert "env-run" in capsys.readouterr().out
+
+
+class TestWriterHook:
+    """The run_corpus hook records after results.json is finalized;
+    probes are opt-in via --record-probe; failure never fails the run."""
+
+    def _patch_common(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+
+        import core.audit.corpus.label as label_mod
+
+        @contextmanager
+        def fake_project(run_tag):
+            yield f"corpus-{run_tag}"
+
+        src = tmp_path / "repo"
+        src.mkdir(exist_ok=True)
+        (src / "a.c").write_text("int f(void) { return 0; }\n")
+        monkeypatch.setattr(
+            label_mod, "load_all_labels",
+            lambda bug_class=None: [_label()],
+        )
+        monkeypatch.setattr(
+            run_corpus, "_resolve_source_dirs",
+            lambda labels, do_fetch=False: {"test": src},
+        )
+        monkeypatch.setattr(
+            run_corpus, "_corpus_project_context", fake_project,
+        )
+
+    def test_audit_run_records_history(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            run_corpus, "_run_audit",
+            lambda labels, dirs, **kw: ([_row()], []),
+        )
+        store = tmp_path / "hook-store.jsonl"
+        monkeypatch.setenv(history.HISTORY_ENV, str(store))
+        out = tmp_path / "corpus-hook-run" / "results.json"
+        out.parent.mkdir()
+        rc = run_corpus.main(["--output", str(out)])
+        assert rc == 0
+        runs, labels_by_run = history.load_store(store)
+        assert len(runs) == 1
+        run = runs[0]
+        assert run["run_id"] == "corpus-hook-run"
+        assert run["config"]["mode"] == "security"
+        assert run["config"]["triage"] == "off"
+        assert run["config"]["prefilter"] == "off"
+        assert run["config"]["scope"] == "excerpt"
+        assert len(run["label_set_hash"]) == 64
+        assert run["imported"] is False
+        recs = labels_by_run["corpus-hook-run"]
+        assert [r["function_id"] for r in recs] == ["a.c:f"]
+        assert recs[0]["span_sha"] == "0123456789ab"
+
+    def test_gate_fail_run_still_records(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            run_corpus, "_run_audit",
+            lambda labels, dirs, **kw: (
+                [_row(expected="finding", actual="clean", match=False)],
+                [],
+            ),
+        )
+        monkeypatch.setattr(
+            "core.audit.corpus.label.load_all_labels",
+            lambda bug_class=None: [_label(expected="finding")],
+        )
+        store = tmp_path / "hook-store.jsonl"
+        monkeypatch.setenv(history.HISTORY_ENV, str(store))
+        out = tmp_path / "results.json"
+        rc = run_corpus.main(["--output", str(out)])
+        assert rc == run_corpus.EXIT_GATE_FAIL
+        runs, _ = history.load_store(store)
+        assert len(runs) == 1
+        assert runs[0]["gates"]["passed"] is False
+
+    def test_probe_not_recorded_by_default(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            run_corpus, "_run_probe",
+            lambda labels, dirs, **kw: [
+                _row(evidence_tool="probe"),
+            ],
+        )
+        store = tmp_path / "hook-store.jsonl"
+        monkeypatch.setenv(history.HISTORY_ENV, str(store))
+        out = tmp_path / "results.json"
+        rc = run_corpus.main(["--probe", "--output", str(out)])
+        assert rc == 0
+        assert not store.exists()
+
+    def test_probe_recorded_with_flag(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            run_corpus, "_run_probe",
+            lambda labels, dirs, **kw: [
+                _row(evidence_tool="probe"),
+            ],
+        )
+        store = tmp_path / "hook-store.jsonl"
+        monkeypatch.setenv(history.HISTORY_ENV, str(store))
+        out = tmp_path / "results.json"
+        rc = run_corpus.main(
+            ["--probe", "--record-probe", "--output", str(out)],
+        )
+        assert rc == 0
+        runs, _ = history.load_store(store)
+        assert len(runs) == 1
+        assert runs[0]["config"]["mode"] == "probe"
+        assert runs[0]["config"]["triage"] is None
+
+    def test_store_failure_does_not_fail_run(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        self._patch_common(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            run_corpus, "_run_audit",
+            lambda labels, dirs, **kw: ([_row()], []),
+        )
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        monkeypatch.setenv(
+            history.HISTORY_ENV, str(blocker / "store.jsonl"),
+        )
+        out = tmp_path / "results.json"
+        rc = run_corpus.main(["--output", str(out)])
+        assert rc == 0
+        assert "not recorded" in capsys.readouterr().err
+
+
+class TestProfileField:
+    """RUN records carry the knowledge profile; pre-profile records
+    read as deployed everywhere."""
+
+    def test_build_run_record_stamps_profile(self):
+        rec = history.build_run_record(
+            [_row()], {},
+            run_id="r", timestamp="", tree_sha="t",
+            config={}, labels_hash="", profile="cold",
+        )
+        assert rec["profile"] == "cold"
+
+    def test_default_profile_is_deployed(self):
+        rec = history.build_run_record(
+            [_row()], {},
+            run_id="r", timestamp="", tree_sha="t",
+            config={}, labels_hash="",
+        )
+        assert rec["profile"] == "deployed"
+
+    def test_old_records_read_as_deployed(self):
+        rec = _run_rec("old")
+        rec.pop("profile", None)
+        assert history.run_profile(rec) == "deployed"
+        assert history.run_profile({"profile": ""}) == "deployed"
+        assert history.run_profile({"profile": "cold"}) == "cold"
+
+    def test_record_run_threads_profile(self, tmp_path):
+        store = tmp_path / "s.jsonl"
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        assert history.record_run(
+            [_row()], {}, output_path=out, labels=[_label()],
+            config={"mode": "security"}, store=store, profile="cold",
+        )
+        runs, _ = history.load_store(store)
+        assert runs[0]["profile"] == "cold"
+
+    def test_stability_never_mixes_profiles(self):
+        config = {"mode": "security"}
+        runs = [
+            _run_rec("c1", tree="t" * 40, config=config, profile="cold"),
+            _run_rec("c2", tree="t" * 40, config=config, profile="cold"),
+            _run_rec("d1", tree="t" * 40, config=config,
+                     profile="deployed"),
+            _run_rec("old", tree="t" * 40, config=config),
+        ]
+        runs[3].pop("profile", None)
+        labels_by_run = {
+            rid: [_label_rec("a.c:f", "clean", run_id=rid)]
+            for rid in ("c1", "c2", "d1", "old")
+        }
+        groups = history.stability_groups(runs, labels_by_run)
+        by_profile = {g["profile"]: g["run_ids"] for g in groups}
+        assert by_profile["cold"] == ["c1", "c2"]
+        # The pre-profile record groups with deployed runs.
+        assert by_profile["deployed"] == ["d1", "old"]
+        report = history.format_stability(groups)
+        assert "profile cold" in report
+        assert "profile deployed" in report
+
+    def test_format_runs_shows_profile_column(self):
+        rec = _run_rec("r1", tree="t" * 40, config={"mode": "security"},
+                       profile="cold")
+        old = _run_rec("r0", tree="t" * 40, config={"mode": "security"})
+        old.pop("profile", None)
+        out = history.format_runs([rec, old])
+        assert "Profile" in out
+        assert "cold" in out
+        assert "deployed" in out
+
+    def test_import_reads_profile_from_meta(self, tmp_path):
+        store = tmp_path / "s.jsonl"
+        results = tmp_path / "results.json"
+        results.write_text(json.dumps({
+            "meta": {"model": "m", "profile": "cold"},
+            "results": [_row()],
+        }))
+        history.import_results(results, store)
+        runs, _ = history.load_store(store)
+        assert runs[0]["profile"] == "cold"
+
+    def test_import_without_profile_reads_deployed(self, tmp_path):
+        store = tmp_path / "s.jsonl"
+        results = tmp_path / "results.json"
+        results.write_text(json.dumps({
+            "meta": {"model": "m"},
+            "results": [_row()],
+        }))
+        history.import_results(results, store)
+        runs, _ = history.load_store(store)
+        assert runs[0]["profile"] == "deployed"
+
+    def test_compare_flags_profile_mismatch(self):
+        a = _run_rec("cold-run", profile="cold")
+        b = _run_rec("dep-run", profile="deployed")
+        diff = history.compare_runs(a, b, {}, {})
+        out = history.format_compare(diff)
+        assert "Profiles: cold -> deployed" in out
+        assert "PROFILES DIFFER" in out
+
+    def test_compare_silent_for_deployed_pair(self):
+        a = _run_rec("r1")
+        b = _run_rec("r2")
+        a.pop("profile", None)
+        b.pop("profile", None)
+        out = history.format_compare(history.compare_runs(a, b, {}, {}))
+        assert "Profiles:" not in out
+
+
+class TestSelectionField:
+    """Subset refires must be distinguishable from full runs."""
+
+    def test_default_selection_is_full(self):
+        rec = history.build_run_record(
+            [_row()], {}, run_id="r", timestamp="", tree_sha="t",
+            config={}, labels_hash="",
+        )
+        assert rec["selection"] == "full"
+
+    def test_refire_selection_recorded(self, tmp_path):
+        store = tmp_path / "s.jsonl"
+        out = tmp_path / "results.json"
+        out.write_text("{}")
+        history.record_run(
+            [_row()], {}, output_path=out, labels=[_label()],
+            config={}, store=store,
+            selection={"class": None, "labels": ["a.c:f"]},
+        )
+        runs, _ = history.load_store(store)
+        assert runs[0]["selection"] == {
+            "class": None, "labels": ["a.c:f"],
+        }
+
+    def test_describe_selection(self):
+        assert history.describe_selection({"selection": "full"}) == "full"
+        assert history.describe_selection({}) == ""  # pre-selection record
+        assert history.describe_selection(
+            {"selection": {"class": "auth", "labels": []}},
+        ) == "refire: class=auth"
+        assert history.describe_selection(
+            {"selection": {"class": None, "labels": ["a", "b"]}},
+        ) == "refire: 2 label(s)"
+
+    def test_compare_flags_refire_runs(self):
+        a = _run_rec("full-run")
+        b = _run_rec("refire-run")
+        b["selection"] = {"class": None, "labels": ["a.c:f"]}
+        out = history.format_compare(history.compare_runs(a, b, {}, {}))
+        assert "selective refire" in out
+        assert "not a full-run regression" in out
+
+    def test_compare_silent_for_full_and_old_records(self):
+        a = _run_rec("r1")  # pre-selection record (no field)
+        b = _run_rec("r2")
+        b["selection"] = "full"
+        out = history.format_compare(history.compare_runs(a, b, {}, {}))
+        assert "selective refire" not in out
+
+
+class TestRefireDeltas:
+    def _store_with(self, tmp_path, records):
+        store = tmp_path / "s.jsonl"
+        history.append_records(store, records)
+        return store
+
+    def test_flip_is_phrased_with_prior_run(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "clean", run_id="v1",
+                       expected="finding", match=False),
+            _run_rec("v2"),
+            _label_rec("a.c:f", "finding", run_id="v2",
+                       expected="finding", match=True),
+        ])
+        lines = history.refire_deltas(
+            store, ["a.c:f"], current_run_id="v2",
+        )
+        assert lines == [
+            "a.c:f: clean -> finding (expected finding) — "
+            "IMPROVED, now matches [vs v1]",
+        ]
+
+    def test_unchanged_label_says_so(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "clean", run_id="v1",
+                       expected="finding", match=False),
+            _run_rec("v2"),
+            _label_rec("a.c:f", "clean", run_id="v2",
+                       expected="finding", match=False),
+        ])
+        lines = history.refire_deltas(
+            store, ["a.c:f"], current_run_id="v2",
+        )
+        assert lines == [
+            "a.c:f: clean — unchanged since v1 (still mismatched)",
+        ]
+
+    def test_no_prior_history(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "finding", run_id="v1",
+                       expected="finding", match=True),
+        ])
+        lines = history.refire_deltas(
+            store, ["a.c:f"], current_run_id="v1",
+        )
+        assert lines == [
+            "a.c:f: finding (expected finding, matches) — "
+            "no prior history",
+        ]
+
+    def test_prior_found_across_intervening_runs(self, tmp_path):
+        """The latest PRIOR record wins even when the label skipped
+        the run in between."""
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "error", run_id="v1",
+                       expected="finding", match=False),
+            _run_rec("v2"),  # refire of some OTHER label
+            _label_rec("b.c:g", "clean", run_id="v2"),
+            _run_rec("v3"),
+            _label_rec("a.c:f", "finding", run_id="v3",
+                       expected="finding", match=True),
+        ])
+        lines = history.refire_deltas(
+            store, ["a.c:f"], current_run_id="v3",
+        )
+        assert lines == [
+            "a.c:f: error -> finding (expected finding) — "
+            "RECOVERED, now matches [vs v1]",
+        ]
+
+    def test_missing_store_or_run_returns_empty(self, tmp_path):
+        assert history.refire_deltas(
+            tmp_path / "absent.jsonl", ["a.c:f"], current_run_id="x",
+        ) == []
+        store = self._store_with(tmp_path, [_run_rec("v1")])
+        assert history.refire_deltas(
+            store, ["a.c:f"], current_run_id="nope",
+        ) == []
+
+    def test_reused_output_path_takes_last_header(self, tmp_path):
+        """Same --output twice -> same run id; the newest header is
+        the current run."""
+        store = self._store_with(tmp_path, [
+            _run_rec("same"),
+            _label_rec("a.c:f", "clean", run_id="same"),
+            _run_rec("same"),
+            _label_rec("a.c:f", "finding", run_id="same",
+                       expected="clean", match=False),
+        ])
+        lines = history.refire_deltas(
+            store, ["a.c:f"], current_run_id="same",
+        )
+        # Merged label records degrade to "unchanged" — but never a
+        # crash and never a phantom prior run.
+        assert len(lines) == 1
+        assert "unchanged" in lines[0] or "no prior history" in lines[0]
+
+
+class TestFullRunDelta:
+    def _store_with(self, tmp_path, records):
+        store = tmp_path / "s.jsonl"
+        history.append_records(store, records)
+        return store
+
+    def test_full_run_gets_a_compare_vs_latest_prior(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v4"),
+            _label_rec("a.c:f", "clean", run_id="v4",
+                       expected="finding", match=False),
+            _label_rec("a.c:g", "clean", run_id="v4",
+                       expected="clean", match=True),
+            _run_rec("v5"),
+            _label_rec("a.c:f", "finding", run_id="v5",
+                       expected="finding", match=True),
+            _label_rec("a.c:g", "clean", run_id="v5",
+                       expected="clean", match=True),
+        ])
+        out = history.full_run_delta(store, "v5")
+        assert out is not None
+        assert "Compare v4" in out
+        assert "a.c:f" in out
+
+    def test_no_prior_run_returns_none(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "clean", run_id="v1"),
+        ])
+        assert history.full_run_delta(store, "v1") is None
+
+    def test_unknown_run_or_missing_store_return_none(self, tmp_path):
+        store = self._store_with(tmp_path, [_run_rec("v1")])
+        assert history.full_run_delta(store, "ghost") is None
+        assert history.full_run_delta(tmp_path / "absent.jsonl", "v1") is None
+
+    def test_disjoint_label_sets_return_none(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "clean", run_id="v1"),
+            _run_rec("v2"),
+            _label_rec("b.c:g", "clean", run_id="v2"),
+        ])
+        assert history.full_run_delta(store, "v2") is None
+
+    def test_intervening_disjoint_run_does_not_hide_older_overlap(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("baseline"), _label_rec("a.c:f", "clean", run_id="baseline"),
+            _run_rec("unrelated"), _label_rec("b.c:g", "clean", run_id="unrelated"),
+            _run_rec("current"), _label_rec("a.c:f", "finding", run_id="current"),
+        ])
+        output = history.full_run_delta(store, "current")
+        assert output is not None
+        assert "Compare baseline" in output
+
+    @pytest.mark.parametrize("field, before, after", [
+        ("mode", "quality", "security"),
+        ("model_resolved", "fixture/other", "fixture/current"),
+        ("llm_cache_policy", {"enabled": False}, {"enabled": True}),
+        ("integer_abi", "lp64", "llp64"),
+        ("max_seconds", 100, 200),
+    ], ids=["mode", "model", "cache-policy", "abi", "budget"])
+    def test_matching_configuration_is_preferred_to_newer_overlap(self, tmp_path, field, before, after):
+        store = self._store_with(tmp_path, [
+            _run_rec("matching", config={field: after}), _label_rec("a.c:f", "clean", run_id="matching"),
+            _run_rec("different", config={field: before}), _label_rec("a.c:f", "finding", run_id="different"),
+            _run_rec("current", config={field: after}), _label_rec("a.c:f", "finding", run_id="current"),
+        ])
+        output = history.full_run_delta(store, "current")
+        assert output is not None
+        assert "preferred matching recorded profile and configuration" in output
+        assert "Compare matching" in output
+
+    def test_matching_profile_is_preferred(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("matching", profile="cold"), _label_rec("a.c:f", "clean", run_id="matching"),
+            _run_rec("different", profile="deployed"), _label_rec("a.c:f", "finding", run_id="different"),
+            _run_rec("current", profile="cold"), _label_rec("a.c:f", "finding", run_id="current"),
+        ])
+        output = history.full_run_delta(store, "current")
+        assert output is not None
+        assert "Compare matching" in output
+
+    def test_reused_prior_id_keeps_latest_header_context(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("reused", config={"mode": "security"}), _label_rec("a.c:f", "clean", run_id="reused"),
+            _run_rec("reused", config={"mode": "quality"}), _label_rec("a.c:f", "finding", run_id="reused"),
+            _run_rec("current", config={"mode": "security"}), _label_rec("a.c:f", "clean", run_id="current"),
+        ])
+        output = history.full_run_delta(store, "current")
+        assert output is not None
+        assert "no matching recorded context" in output
+        assert "mode: 'quality' -> 'security'" in output
+        assert "preferred matching recorded profile" not in output
+
+    def test_fallback_retains_latest_overlap_and_context_warning(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("older", config={"mode": "quality"}), _label_rec("a.c:f", "clean", run_id="older"),
+            _run_rec("latest", config={"mode": "quality"}), _label_rec("a.c:f", "finding", run_id="latest"),
+            _run_rec("disjoint", config={"mode": "security"}), _label_rec("b.c:g", "clean", run_id="disjoint"),
+            _run_rec("current", config={"mode": "security"}), _label_rec("a.c:f", "clean", run_id="current"),
+        ])
+        output = history.full_run_delta(store, "current")
+        assert output is not None
+        assert "no matching recorded context" in output
+        assert "Compare latest" in output
+        assert "recorded configuration differs" in output
+
+
+class TestLabelKindSeparation:
+    """Synthetic-mutant runs never mix with real-label runs anywhere
+    in the history surfaces: compare refuses structurally, stability
+    partitions on the kind, trend renders per-kind sections, and the
+    post-run delta reports only consider same-kind priors."""
+
+    def _store_with(self, tmp_path, records):
+        store = tmp_path / "s.jsonl"
+        history.append_records(store, records)
+        return store
+
+    def test_pre_kind_records_read_as_real(self):
+        assert history.run_label_kind(_run_rec("v1")) == "real"
+        assert history.run_label_kind(
+            _run_rec("v1", label_kind="synthetic_mutant"),
+        ) == "synthetic_mutant"
+
+    def test_run_record_carries_kind(self):
+        rec = history.build_run_record(
+            [], {}, run_id="m1", timestamp="", tree_sha="t",
+            config={}, labels_hash="",
+            label_kind="synthetic_mutant",
+        )
+        assert rec["label_kind"] == "synthetic_mutant"
+        default = history.build_run_record(
+            [], {}, run_id="v1", timestamp="", tree_sha="t",
+            config={}, labels_hash="",
+        )
+        assert default["label_kind"] == "real"
+
+    def test_label_records_carry_kind(self):
+        rows = [
+            {"function_id": "a.c:f",
+             "label_kind": "synthetic_mutant"},
+            {"function_id": "a.c:g"},
+        ]
+        recs = history.build_label_records(rows, run_id="m1")
+        assert recs[0]["label_kind"] == "synthetic_mutant"
+        assert recs[1]["label_kind"] == "real"
+
+    def test_compare_refuses_across_kinds(self):
+        real = _run_rec("v1")
+        mutant = _run_rec("m1", label_kind="synthetic_mutant")
+        with pytest.raises(ValueError, match="label kinds"):
+            history.compare_runs(real, mutant, {}, {})
+
+    def test_compare_cli_reports_cross_kind_refusal(
+        self, tmp_path, capsys,
+    ):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "clean", run_id="v1"),
+            _run_rec("m1", label_kind="synthetic_mutant"),
+            _label_rec("a.c:f", "finding", run_id="m1",
+                       label_kind="synthetic_mutant"),
+        ])
+        rc = history.main(["--store", str(store), "compare",
+                           "v1", "m1"])
+        assert rc == 1
+        assert "label kinds" in capsys.readouterr().err
+
+    def test_same_kind_compare_notes_mutant_framing(self, tmp_path):
+        a = _run_rec("m1", label_kind="synthetic_mutant")
+        b = _run_rec("m2", label_kind="synthetic_mutant")
+        diff = history.compare_runs(a, b, {}, {})
+        out = history.format_compare(diff)
+        assert "mutation-operator regression" in out
+
+    def test_stability_partitions_on_kind(self):
+        runs = [
+            _run_rec("v1", tree="t1"),
+            _run_rec("m1", tree="t1", label_kind="synthetic_mutant"),
+            _run_rec("m2", tree="t1", label_kind="synthetic_mutant"),
+        ]
+        labels = {
+            "v1": [_label_rec("a.c:f", "clean", run_id="v1")],
+            "m1": [_label_rec("a.c:f", "finding", run_id="m1",
+                              label_kind="synthetic_mutant")],
+            "m2": [_label_rec("a.c:f", "clean", run_id="m2",
+                              label_kind="synthetic_mutant")],
+        }
+        groups = history.stability_groups(runs, labels)
+        # v1 never groups with the mutant runs despite the same tree
+        # and config; the two mutant runs group with each other.
+        assert len(groups) == 1
+        assert groups[0]["label_kind"] == "synthetic_mutant"
+        assert set(groups[0]["run_ids"]) == {"m1", "m2"}
+        assert "a.c:f" in groups[0]["unstable"]
+        assert "kind synthetic_mutant" in history.format_stability(
+            groups,
+        )
+
+    def test_trend_partitions_kinds(self):
+        runs = [
+            _run_rec("v1"),
+            _run_rec("m1", label_kind="synthetic_mutant"),
+        ]
+        labels = {
+            "v1": [_label_rec("a.c:f", "clean", run_id="v1")],
+            "m1": [_label_rec("a.c:f", "finding", run_id="m1",
+                              label_kind="synthetic_mutant")],
+        }
+        out = history.format_trend("a.c:f", runs, labels)
+        assert "Label kind: real" in out
+        assert "Label kind: synthetic_mutant" in out
+        assert "partitioned" in out
+
+    def test_full_run_delta_skips_other_kind_priors(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("m1", label_kind="synthetic_mutant"),
+            _label_rec("a.c:f", "clean", run_id="m1",
+                       expected="finding", match=False,
+                       label_kind="synthetic_mutant"),
+            _run_rec("v1"),
+            _label_rec("a.c:f", "finding", run_id="v1",
+                       expected="finding", match=True),
+            _run_rec("m2", label_kind="synthetic_mutant"),
+            _label_rec("a.c:f", "finding", run_id="m2",
+                       expected="finding", match=True,
+                       label_kind="synthetic_mutant"),
+        ])
+        out = history.full_run_delta(store, "m2")
+        # The interleaved real run v1 is not the prior; m1 is.
+        assert out is not None
+        assert "m1" in out
+        assert "v1" not in out
+
+    def test_refire_deltas_only_same_kind_priors(self, tmp_path):
+        store = self._store_with(tmp_path, [
+            _run_rec("v1"),
+            _label_rec("a.c:f", "finding", run_id="v1",
+                       expected="finding", match=True),
+            _run_rec("m1", label_kind="synthetic_mutant"),
+            _label_rec("a.c:f", "clean", run_id="m1",
+                       expected="finding", match=False,
+                       label_kind="synthetic_mutant"),
+        ])
+        lines = history.refire_deltas(
+            store, ["a.c:f"], current_run_id="m1",
+        )
+        # The real run's record must not phrase a cross-kind flip.
+        assert len(lines) == 1
+        assert "no prior history" in lines[0]
+
+    def test_import_reads_meta_kind(self, tmp_path):
+        results = tmp_path / "mutant-results.json"
+        results.write_text(json.dumps({
+            "meta": {"label_kind": "synthetic_mutant"},
+            "results": [
+                {"function_id": "a.c:f",
+                 "label_kind": "synthetic_mutant"},
+            ],
+        }))
+        store = tmp_path / "s.jsonl"
+        run_id = history.import_results(results, store)
+        runs, labels = history.load_store(store)
+        assert history.run_label_kind(runs[0]) == "synthetic_mutant"
+        assert labels[run_id][0]["label_kind"] == "synthetic_mutant"
+
+    def test_import_refuses_row_meta_kind_mismatch(self, tmp_path):
+        # A re-wrapped/hand-edited artifact must carry the kind
+        # verbatim: an explicit row kind contradicting meta refuses,
+        # never silently defaults.
+        results = tmp_path / "results.json"
+        results.write_text(json.dumps({
+            "meta": {"label_kind": "real"},
+            "results": [
+                {"function_id": "a.c:f",
+                 "label_kind": "synthetic_mutant"},
+            ],
+        }))
+        with pytest.raises(ValueError, match="mixed-kind import"):
+            history.import_results(results, tmp_path / "s.jsonl")
+
+    def test_import_kindless_rows_inherit_meta_kind(self, tmp_path):
+        # Kind-less rows under a synthetic meta must never be
+        # recorded as real.
+        results = tmp_path / "results.json"
+        results.write_text(json.dumps({
+            "meta": {"label_kind": "synthetic_mutant"},
+            "results": [{"function_id": "a.c:f"}],
+        }))
+        store = tmp_path / "s.jsonl"
+        run_id = history.import_results(results, store)
+        _, labels = history.load_store(store)
+        assert labels[run_id][0]["label_kind"] == "synthetic_mutant"
+
+    def test_runs_listing_shows_kind(self):
+        out = history.format_runs([
+            _run_rec("m1", label_kind="synthetic_mutant"),
+        ])
+        assert "synthetic_mutant" in out
+        assert "Kind" in out
+
+
+class TestInvalidUtf8Line:
+    def test_one_bad_line_does_not_kill_the_generator(self, tmp_path):
+        # The decode happens in the loop header — one invalid-UTF-8
+        # line raised UnicodeDecodeError and lost every record after
+        # it, the exact failure the docstring promises to prevent.
+        from core.audit.corpus.history import iter_records
+
+        p = tmp_path / "store.jsonl"
+        with p.open("wb") as f:
+            f.write(b'{"record": "run", "n": 1}\n')
+            f.write(b'\xff\xfe not utf8 \xff\n')
+            f.write(b'{"record": "run", "n": 2}\n')
+        recs = list(iter_records(p))
+        assert [r["n"] for r in recs] == [1, 2]

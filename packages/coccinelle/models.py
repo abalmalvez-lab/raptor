@@ -1,7 +1,19 @@
 """Data models for Coccinelle results."""
 
 from dataclasses import dataclass, field
-from typing import List
+import math
+
+
+def _coordinate(value) -> int:
+    """Accept legacy integer strings, but never truncate or invent positions."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return 0
+    try:
+        return max(0, int(value))
+    except (ValueError, OverflowError):
+        return 0
 
 
 @dataclass
@@ -20,14 +32,19 @@ class SpatchMatch:
     def from_dict(cls, d: dict) -> "SpatchMatch":
         if not d or not isinstance(d, dict):
             return cls(file="", line=0)
+        def text(key: str) -> str:
+            value = d.get(key)
+            return value if isinstance(value, str) else ""
+
+        file = text("file")
         return cls(
-            file=d.get("file", ""),
-            line=int(d.get("line", 0)),
-            column=int(d.get("col", d.get("column", 0))),
-            line_end=int(d.get("line_end", 0)),
-            column_end=int(d.get("col_end", d.get("column_end", 0))),
-            rule=d.get("rule", ""),
-            message=d.get("message", ""),
+            file=file if "\x00" not in file else "",
+            line=_coordinate(d.get("line")),
+            column=_coordinate(d["col"] if d.get("col") is not None else d.get("column")),
+            line_end=_coordinate(d.get("line_end")),
+            column_end=_coordinate(d["col_end"] if d.get("col_end") is not None else d.get("column_end")),
+            rule=text("rule"),
+            message=text("message"),
         )
 
     def to_dict(self) -> dict:
@@ -48,11 +65,16 @@ class SpatchResult:
 
     rule: str
     rule_path: str = ""
-    matches: List[SpatchMatch] = field(default_factory=list)
-    files_examined: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    matches: list[SpatchMatch] = field(default_factory=list)
+    files_examined: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
     elapsed_ms: int = 0
     returncode: int = 0
+    # COCCIRESULT-shaped output lines that did NOT carry the runner's
+    # per-invocation nonce — rejected from ``matches`` and counted here
+    # as an attack signal (hostile source planting forged evidence
+    # lines that spatch's diff output re-emits).
+    forged_markers: int = 0
 
     @property
     def ok(self) -> bool:
@@ -71,4 +93,5 @@ class SpatchResult:
             "errors": self.errors,
             "elapsed_ms": self.elapsed_ms,
             "returncode": self.returncode,
+            "forged_markers": self.forged_markers,
         }

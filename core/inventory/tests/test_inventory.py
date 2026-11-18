@@ -1,13 +1,9 @@
 """Tests for core.inventory — shared source inventory."""
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
-
-# core/inventory/tests/test_inventory.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from core.inventory import (
     build_inventory,
@@ -19,7 +15,7 @@ from core.inventory import (
     extract_functions,
     extract_items,
     count_sloc,
-    _get_items as get_items,
+    get_items,
     should_exclude,
     is_binary_file,
     is_generated_file,
@@ -30,6 +26,7 @@ from core.inventory import (
     KIND_FUNCTION,
     KIND_GLOBAL,
     KIND_MACRO,
+    KIND_CLASS,
     PythonExtractor,
     JavaScriptExtractor,
     CExtractor,
@@ -51,7 +48,9 @@ class TestLanguageDetection:
 
     def test_typescript(self):
         assert detect_language("baz.ts") == "typescript"
-        assert detect_language("baz.tsx") == "typescript"
+        # .tsx is its own language (needs tree-sitter-typescript's tsx grammar,
+        # which parses JSX; the plain typescript grammar errors on JSX).
+        assert detect_language("baz.tsx") == "tsx"
 
     def test_c(self):
         assert detect_language("main.c") == "c"
@@ -125,6 +124,71 @@ class TestExclusions:
         assert excluded is False
         assert reason is None
 
+    def test_root_anchored_nested_not_excluded(self):
+        # First-party source under a package/dir segment named like an anchored
+        # exclude (samples/examples/demo/doc) must NOT be excluded — it's the
+        # silent-FN bug. Anchored names only match at the scan-root top level.
+        for p in (
+            "src/main/java/org/springframework/samples/petclinic/Owner.java",
+            "src/main/java/com/app/examples/PaymentExample.java",
+            "app/demo/widget.py",
+            "lib/doc/Renderer.java",
+        ):
+            assert should_exclude(p, DEFAULT_EXCLUDES) is False, p
+            assert match_exclusion_reason(p, DEFAULT_EXCLUDES)[0] is False, p
+
+    def test_root_anchored_top_level_still_excluded(self):
+        # Intent preserved: a TOP-LEVEL examples/ samples/ docs/ dir is still a
+        # throwaway demo/docs dir and stays excluded.
+        for p in ("examples/Demo.java", "samples/app.py", "docs/conf.py"):
+            assert should_exclude(p, DEFAULT_EXCLUDES) is True, p
+
+    def test_non_anchored_excluded_at_any_depth(self):
+        # Unambiguous non-source dirs keep pruning anywhere (NOT anchored).
+        for p in (
+            "src/node_modules/pkg/index.js",
+            "module/target/classes/Gen.java",
+            "a/b/.git/config",
+            "pkg/tests/test_x.py",
+            "x/build/out.js",
+        ):
+            assert should_exclude(p, DEFAULT_EXCLUDES) is True, p
+
+
+class TestRootAnchoredDirExclusionWalk:
+    """build_inventory must not silently drop first-party source nested under a
+    package/dir segment named like an anchored exclude (samples/examples/…),
+    while still pruning a genuine TOP-LEVEL demo dir and all non-anchored
+    dependency/build dirs at any depth."""
+
+    def _tree(self, root: Path):
+        # nested 'samples' package — first-party, MUST be inventoried
+        f1 = root / "src/main/java/com/app/samples/Bean.java"
+        # normal source — control
+        f2 = root / "src/main/java/com/app/Main.java"
+        # TOP-LEVEL examples dir — throwaway, stays pruned (+ warning)
+        f3 = root / "examples/Demo.java"
+        # non-anchored dependency dir — pruned at any depth
+        f4 = root / "src/node_modules/pkg/index.js"
+        for f in (f1, f2, f3, f4):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("class X { public void m() {} }\n")
+        return f1, f2, f3, f4
+
+    def test_nested_anchored_included_top_level_pruned(self, tmp_path, caplog):
+        import logging
+        self._tree(tmp_path)
+        with caplog.at_level(logging.WARNING):
+            inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        paths = {f["path"] for f in inv["files"] if not f.get("_excluded")}
+        assert "src/main/java/com/app/samples/Bean.java" in paths   # FN bug fixed
+        assert "src/main/java/com/app/Main.java" in paths           # control
+        assert "examples/Demo.java" not in paths                    # top-level pruned
+        assert not any("node_modules" in p for p in paths)          # dep pruned anywhere
+        # never SILENTLY drop source: top-level examples/ holding source warns.
+        assert any("examples" in r.message and "source file" in r.message
+                   for r in caplog.records)
+
 
 # ── Extractors ──────────────────────────────────────────────────────
 
@@ -154,6 +218,26 @@ class TestPythonExtractor:
         funcs = PythonExtractor().extract("test.py", code)
         assert funcs[0].checked_by == []
 
+    def test_mixed_payload_functions_and_top_level_items(self):
+        # Contract pin: extract() returns a MIX of FunctionInfo (defs)
+        # and plain CodeItem `top_level` units (module-scope calls).
+        # The declared return type is list[CodeItem] -- the annotation
+        # previously claimed list[FunctionInfo] while shipping this mix.
+        code = (
+            "import os\n"
+            "def foo(): pass\n"
+            "os.system('true')\n"
+        )
+        items = PythonExtractor().extract("test.py", code)
+        funcs = [i for i in items if isinstance(i, FunctionInfo)]
+        top_level = [i for i in items if i.kind == "top_level"]
+        assert [f.name for f in funcs] == ["foo"]
+        assert len(top_level) == 1
+        assert top_level[0].line_start == 3
+        # The top_level unit is a base CodeItem, not a FunctionInfo.
+        assert not isinstance(top_level[0], FunctionInfo)
+        assert isinstance(top_level[0], CodeItem)
+
 
 class TestJavaScriptExtractor:
     def test_function_declaration(self):
@@ -173,6 +257,25 @@ class TestJavaScriptExtractor:
         funcs = JavaScriptExtractor().extract("test.js", code)
         assert all(f.name != "if" for f in funcs)
 
+    def test_object_method_arrow_spacings_still_match(self):
+        for line in (
+            "handler: (req) => {",
+            "handler: (req) =>{",
+            "handler: (req)=> {",
+            "handler: async (req) => {",
+            "handler: function (req) {",
+            "handler: (req) {",
+        ):
+            funcs = JavaScriptExtractor().extract("t.js", line + "\n}\n")
+            assert [f.name for f in funcs] == ["handler"], line
+
+    def test_object_method_whitespace_run_is_linear(self):
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "m: ()" + " " * 8192 + "x\n"
+        with cpu_budget(1.0, what="js object-method whitespace run"):
+            assert JavaScriptExtractor().extract("t.js", hostile) == []
+
 
 class TestCExtractor:
     def test_ansi_style(self):
@@ -191,6 +294,23 @@ class TestCExtractor:
         code = "if (x) {\n}\nint real(void) {\n}\n"
         funcs = CExtractor().extract("test.c", code)
         assert all(f.name != "if" for f in funcs)
+
+    def test_ansi_declaration_prefix_shapes_still_match(self):
+        for line, name in (
+            ("static void *alloc_page(size_t n) {", "alloc_page"),
+            ("unsigned long long wide(void) {", "wide"),
+            ("static  inline  int   spaced(int x) {", "spaced"),
+            ("z_streamp * deref(void) {", "deref"),
+        ):
+            funcs = CExtractor().extract("t.c", line + "\n}\n")
+            assert [f.name for f in funcs] == [name], line
+
+    def test_ansi_word_space_run_scans_in_linear_time(self):
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "a " * 8000 + "\n"
+        with cpu_budget(1.0, what="c extractor word-space run"):
+            assert CExtractor().extract("t.c", hostile) == []
 
 
 class TestJavaExtractor:
@@ -221,6 +341,36 @@ class TestGenericExtractor:
         funcs = GenericExtractor().extract("test.rb", code)
         assert len(funcs) == 1
         assert funcs[0].name == "foo"
+
+    def test_brace_style_modifier_shapes_still_match(self):
+        for line, name in (
+            ("public static int foo(int x) {", "foo"),
+            ("private void bar() {", "bar"),
+            ("static string baz(string s) {", "baz"),
+            ("int qux(void) {", "qux"),
+            ("publicstatic void glued(int x) {", "glued"),
+        ):
+            funcs = GenericExtractor().extract("t.cs", line + "\n}\n")
+            assert [f.name for f in funcs] == [name], line
+
+    def test_whitespace_run_line_scans_in_linear_time(self):
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "public" + " " * 8192 + "(\n"
+        with cpu_budget(1.0, what="generic extractor whitespace run"):
+            assert GenericExtractor().extract("t.cs", hostile) == []
+
+    def test_oversized_line_is_skipped_not_scanned(self):
+        from core.testing.wallclock import cpu_budget
+
+        # Two-direction bound check: a line beyond the cap is skipped
+        # outright (no scan cost), while a normal declaration on the
+        # next line is still extracted.
+        content = ("x" * (GenericExtractor._MAX_LINE + 1) + "\n"
+                   + "public int ok() {\n}\n")
+        with cpu_budget(1.0, what="generic extractor oversized line"):
+            funcs = GenericExtractor().extract("t.cs", content)
+        assert [f.name for f in funcs] == ["ok"]
 
 
 class TestExtractFunctions:
@@ -294,11 +444,20 @@ class TestBuildInventory:
             f"expected pruned 'tests/' dir record, got {excluded_paths!r}"
         )
 
-    def test_generated_file_excluded(self, tmp_path):
+    def test_generated_file_excluded_when_corroborated(self, tmp_path):
+        """Marker + generated-shaped name: excluded as before."""
         src = tmp_path / "src"
         src.mkdir()
         (src / "real.py").write_text("def real(): pass\n")
-        (src / "gen.py").write_text("# auto-generated by tool\ndef gen(): pass\n")
+        # codegen/ is a corroborating path hint but NOT a
+        # DEFAULT_EXCLUDES pattern, so the file reaches the
+        # content-marker stage (unlike e.g. *_pb2.py, which the
+        # pattern pass drops before content is read).
+        codegen = src / "codegen"
+        codegen.mkdir()
+        (codegen / "api.py").write_text(
+            "# auto-generated by tool\ndef gen(): pass\n"
+        )
 
         inv = build_inventory(str(src), str(tmp_path / "out"))
 
@@ -307,6 +466,28 @@ class TestBuildInventory:
         assert "real.py" in file_paths
         excluded_reasons = [e["reason"] for e in inv["excluded_files"]]
         assert "generated_file" in excluded_reasons
+
+    def test_uncorroborated_marker_stays_in_inventory(self, tmp_path):
+        """The in-file marker is target-controlled text: alone (normal
+        name, normal location) it must NOT buy exclusion — one planted
+        comment line would otherwise hide a file from every analysis
+        tier. The claim rides along as a visible flag instead."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "real.py").write_text("def real(): pass\n")
+        (src / "handlers.py").write_text(
+            "# auto-generated by tool\ndef backdoor(): pass\n"
+        )
+
+        inv = build_inventory(str(src), str(tmp_path / "out"))
+
+        by_path = {f["path"]: f for f in inv["files"]}
+        assert "handlers.py" in by_path
+        assert by_path["handlers.py"].get("generated_marker") == "uncorroborated"
+        assert "real.py" in by_path
+        assert by_path["real.py"].get("generated_marker") is None
+        excluded_reasons = [e["reason"] for e in inv["excluded_files"]]
+        assert "generated_file" not in excluded_reasons
 
     def test_multi_language(self, tmp_path):
         src = tmp_path / "src"
@@ -462,6 +643,51 @@ class TestCoverageStats:
         update_coverage(inv, [{"file": "app.py", "function": "foo"}], "validate:stage-a")
         assert "validate:stage-a" in inv["files"][0]["functions"][0]["checked_by"]
 
+    def test_update_coverage_class_key_disambiguates_twins(self):
+        # Items carry class context as metadata.class_name (the shape
+        # the extractors serialise) — a class-carrying caller must
+        # mark ONLY its twin. Pre-fix the item side read a bare
+        # `class` key nothing writes: the documented shape matched
+        # nothing (silent total mark loss) and twins always collided.
+        inv = {
+            "files": [{
+                "path": "app.py",
+                "functions": [
+                    {"name": "do_thing", "checked_by": [],
+                     "metadata": {"class_name": "ClassA"}},
+                    {"name": "do_thing", "checked_by": [],
+                     "metadata": {"class_name": "ClassB"}},
+                ],
+            }]
+        }
+        update_coverage(
+            inv,
+            [{"file": "app.py", "function": "do_thing", "class": "ClassA"}],
+            "audit:review",
+        )
+        funcs = inv["files"][0]["functions"]
+        assert funcs[0]["checked_by"] == ["audit:review"]
+        assert funcs[1]["checked_by"] == []
+
+    def test_update_coverage_bare_name_still_matches_methods(self):
+        # Legacy callers without class info keep working (bare-name
+        # fallback) even though items now derive a class key.
+        inv = {
+            "files": [{
+                "path": "app.py",
+                "functions": [
+                    {"name": "do_thing", "checked_by": [],
+                     "metadata": {"class_name": "ClassA"}},
+                ],
+            }]
+        }
+        update_coverage(
+            inv, [{"file": "app.py", "function": "do_thing"}], "validate:stage-a",
+        )
+        assert inv["files"][0]["functions"][0]["checked_by"] == [
+            "validate:stage-a",
+        ]
+
     def test_update_coverage_deduplicates(self):
         inv = {
             "files": [{
@@ -597,10 +823,64 @@ class TestExtractItems:
     def test_c_macros(self):
         code = "#define BUF_SIZE 1024\n#define MAX(a,b) ((a)>(b)?(a):(b))\nvoid foo() {}\n"
         items = extract_items("test.c", "c", code)
-        macros = [i for i in items if i.kind == KIND_MACRO]
-        names = [m.name for m in macros]
-        assert "BUF_SIZE" in names
-        assert "MAX" in names
+        kinds = {i.name: i.kind for i in items}
+        # Object-like literal macro → inert constant_macro;
+        # function-like macro stays a reviewable macro.
+        assert kinds.get("BUF_SIZE") == "constant_macro"
+        assert kinds.get("MAX") == KIND_MACRO
+
+    def test_c_multi_declarator_globals(self):
+        # `int a, b, c;` declares three globals — pre-fix only `a` was kept,
+        # the rest fell to interstitial. Pointer/array declarators too.
+        code = "int a, b, c;\nchar *p, q[8];\nvoid f(void) {}\n"
+        items = extract_items("test.c", "c", code)
+        names = {g.name for g in items if g.kind == KIND_GLOBAL}
+        if not names:
+            import pytest
+            pytest.skip("tree-sitter not available — C globals are TS-only")
+        assert {"a", "b", "c", "p", "q"} <= names
+
+    def test_c_typedef_and_record_defs_are_class_kind(self):
+        code = (
+            "typedef struct { int x; } Foo;\n"
+            "struct Bar { int y; };\n"
+            "enum Color { RED, GREEN };\n"
+            "typedef int myint;\n"
+        )
+        items = extract_items("test.c", "c", code)
+        types = {t.name for t in items if t.kind == KIND_CLASS}
+        if not types:
+            import pytest
+            pytest.skip("tree-sitter not available — C type defs are TS-only")
+        assert {"Foo", "Bar", "Color", "myint"} <= types
+
+    def test_c_forward_decl_and_prototype_not_captured(self):
+        # A forward declaration / use-of-existing-type is not a type
+        # definition; a prototype is not a global. Neither should be emitted.
+        code = (
+            "struct FwdDecl;\n"
+            "struct FwdDecl use_it;\n"   # global of an existing type
+            "int proto(int x);\n"        # prototype, not a global
+            "void real(void) {}\n"
+        )
+        items = extract_items("test.c", "c", code)
+        if not any(i.kind in (KIND_GLOBAL, KIND_CLASS) for i in items):
+            import pytest
+            pytest.skip("tree-sitter not available — C globals/types are TS-only")
+        types = {t.name for t in items if t.kind == KIND_CLASS}
+        globals_ = {g.name for g in items if g.kind == KIND_GLOBAL}
+        assert "FwdDecl" not in types       # no body -> not a definition
+        assert "proto" not in globals_      # prototype is not a global
+        assert "use_it" in globals_         # the global IS captured
+
+    def test_js_multi_declarator_globals(self):
+        code = "const a = 1, b = 2;\nlet x = 3;\n"
+        items = extract_items("test.js", "javascript", code)
+        names = {g.name for g in items if g.kind == KIND_GLOBAL}
+        if not names:
+            import pytest
+            pytest.skip("tree-sitter not available — JS globals are TS-only")
+        assert {"a", "b", "x"} <= names
 
     def test_returns_code_items(self):
         code = "def foo(): pass\n"
@@ -731,6 +1011,55 @@ class TestDefaultCacheDir:
         absolute = default_cache_dir(str(proj))
         assert rel == absolute
 
+    def test_default_cache_root_reads_home_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """$HOME is read per call, not snapshotted at import: a HOME
+        pin installed after the module was imported redirects the
+        default cache root (fabricated HOME — never the real one)."""
+        import core.inventory.builder as builder
+        monkeypatch.setattr(builder, "_DEFAULT_INVENTORY_CACHE_ROOT", None)
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        monkeypatch.setenv("HOME", str(home_a))
+        assert builder._default_inventory_cache_root() == (
+            home_a / ".raptor" / "cache" / "inventory"
+        )
+        # Changing HOME after the first call takes effect on the next.
+        monkeypatch.setenv("HOME", str(home_b))
+        cache = builder.default_cache_dir(str(tmp_path))
+        assert cache.parent == home_b / ".raptor" / "cache" / "inventory"
+        assert not home_a.exists() and not home_b.exists()
+
+    def test_default_cache_root_seam_wins_over_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The monkeypatch seam (what this suite's other tests use)
+        wins over the env-derived default."""
+        import core.inventory.builder as builder
+        monkeypatch.setenv("HOME", str(tmp_path / "ignored"))
+        monkeypatch.setattr(
+            builder, "_DEFAULT_INVENTORY_CACHE_ROOT", tmp_path / "pinned",
+        )
+        assert builder._default_inventory_cache_root() == tmp_path / "pinned"
+
+    def test_reach_cache_writes_land_under_the_conftest_pin(self) -> None:
+        """Every ``build_inventory`` in this suite persists a
+        reachability index; the conftest's XDG_CACHE_HOME pin is what
+        keeps those writes out of the developer's real
+        ``~/.cache/raptor/reachability/`` (whose small eviction budget
+        a single suite run would otherwise churn through). Fail loudly
+        if the pin disappears or stops steering the store."""
+        import os
+
+        from core.analysis import _reach_cache
+
+        pinned = os.environ.get("XDG_CACHE_HOME")
+        assert pinned, "conftest must pin XDG_CACHE_HOME for this suite"
+        assert _reach_cache._cache_dir() == (
+            Path(pinned) / "raptor" / "reachability"
+        )
+
     def test_build_inventory_uses_default_when_output_dir_omitted(
         self, tmp_path, monkeypatch,
     ):
@@ -773,3 +1102,1269 @@ class TestDefaultCacheDir:
         inv = build_inventory(str(src), str(explicit))
         assert inv["total_files"] == 1
         assert (explicit / "checklist.json").is_file()
+
+
+class TestAllowUnreachableView:
+    """U5: allow_unreachable threads through build_inventory to the
+    TranslationView, so isolation mode keeps disabled C/C++ code for
+    review instead of blanking #if 0."""
+
+    def _c_names(self, tmp_path, allow_unreachable):
+        from core.inventory.builder import build_inventory
+        src = tmp_path / "src"
+        src.mkdir(exist_ok=True)
+        (src / "m.c").write_text(
+            "#if 0\n"
+            "void disabled_fn(void){ dangerous(); }\n"
+            "#endif\n"
+            "void live_fn(void){ ok(); }\n"
+        )
+        out = tmp_path / ("au" if allow_unreachable else "def")
+        inv = build_inventory(
+            str(src), str(out), allow_unreachable=allow_unreachable,
+        )
+        return {i["name"] for f in inv["files"] for i in f["items"]
+                if i.get("kind", "function") == "function"}
+
+    def test_default_blanks_if0(self, tmp_path):
+        assert self._c_names(tmp_path, False) == {"live_fn"}
+
+    def test_isolation_keeps_disabled_code(self, tmp_path):
+        assert self._c_names(tmp_path, True) == {"disabled_fn", "live_fn"}
+
+    def test_cache_dirs_isolated_by_mode(self, tmp_path):
+        from core.inventory.builder import default_cache_dir
+        d_def = default_cache_dir(str(tmp_path))
+        d_iso = default_cache_dir(str(tmp_path), allow_unreachable=True)
+        assert d_def != d_iso
+        # Default mode must hash identically to the no-arg call so existing
+        # persistent caches are not invalidated when this lands.
+        assert default_cache_dir(str(tmp_path), allow_unreachable=False) == d_def
+
+
+class TestConfigAwareView:
+    """U12: a build macro config (compile_commands.json / .config) threads
+    through build_inventory so config-aware #ifdef arms are blanked, and a
+    config change invalidates the cache even when file contents are equal."""
+
+    _SRC = (
+        "#ifdef CONFIG_FEATURE\n"
+        "void feature_sink(char *q){ system(q); }\n"
+        "#endif\n"
+        "void always_live(void){ return; }\n"
+    )
+
+    def _names(self, inv):
+        return {i["name"] for f in inv["files"] for i in f["items"]
+                if i.get("kind", "function") == "function"}
+
+    def test_feature_off_blanks_guarded_sink(self, tmp_path):
+        (tmp_path / "m.c").write_text(self._SRC)
+        (tmp_path / ".config").write_text("# CONFIG_FEATURE is not set\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        assert self._names(inv) == {"always_live"}
+
+    def test_feature_on_keeps_guarded_sink(self, tmp_path):
+        (tmp_path / "m.c").write_text(self._SRC)
+        (tmp_path / ".config").write_text("CONFIG_FEATURE=y\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        assert self._names(inv) == {"always_live", "feature_sink"}
+
+    def test_no_config_is_conservative(self, tmp_path):
+        # No build artifacts → #ifdef untouched → sink kept (live in some
+        # build; blanking it would be a false negative).
+        (tmp_path / "m.c").write_text(self._SRC)
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        assert self._names(inv) == {"always_live", "feature_sink"}
+
+    def test_config_change_invalidates_persistent_cache(self, tmp_path):
+        # The critical correctness check: same file content, default
+        # (persistent, config-keyed) cache. Flipping the config must NOT
+        # serve a stale blanked entry for the now-live arm.
+        (tmp_path / "m.c").write_text(self._SRC)
+        (tmp_path / ".config").write_text("# CONFIG_FEATURE is not set\n")
+        assert self._names(build_inventory(str(tmp_path))) == {"always_live"}
+        (tmp_path / ".config").write_text("CONFIG_FEATURE=y\n")
+        assert self._names(build_inventory(str(tmp_path))) == {
+            "always_live", "feature_sink"}
+
+    def test_cache_key_folds_config_fingerprint(self, tmp_path):
+        from core.inventory.builder import default_cache_dir
+        d_plain = default_cache_dir(str(tmp_path))
+        d_cfg = default_cache_dir(str(tmp_path), config_fingerprint="abc123")
+        assert d_plain != d_cfg
+        # Empty fingerprint must hash identically to the no-arg call so
+        # non-C projects' existing caches are untouched.
+        assert default_cache_dir(str(tmp_path), config_fingerprint="") == d_plain
+
+
+class TestCppTuMembership:
+    """C/C++ build-membership: a source TU absent from compile_commands.json is
+    marked build_excluded (heuristic); headers are exempt; no manifest → never
+    fires. Asserts the file-level record (set pre-extraction) so it holds on
+    both extractor paths."""
+
+    def _be_map(self, tmp_path, with_manifest):
+        import json
+        (tmp_path / "built.c").write_text("int f(void){ return 0; }\n")
+        (tmp_path / "unbuilt.c").write_text("int g(void){ return 0; }\n")
+        (tmp_path / "util.h").write_text("static inline int h(void){ return 0; }\n")
+        if with_manifest:
+            (tmp_path / "compile_commands.json").write_text(json.dumps([
+                {"directory": str(tmp_path), "file": "built.c",
+                 "arguments": ["cc", "-c", "built.c"]},
+            ]))
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        return {f["path"]: ("build_excluded" in f) for f in inv["files"]}
+
+    def test_unbuilt_excluded_built_and_header_not(self, tmp_path):
+        be = self._be_map(tmp_path, with_manifest=True)
+        assert be.get("unbuilt.c") is True     # absent from manifest → excluded
+        assert be.get("built.c") is False      # in manifest → not excluded
+        assert be.get("util.h") is False       # header exempt — never a TU
+
+    def test_no_manifest_never_excludes(self, tmp_path):
+        be = self._be_map(tmp_path, with_manifest=False)
+        assert not any(be.values())            # membership unknown → never fire
+
+    def test_manifest_change_invalidates_persistent_cache(self, tmp_path):
+        # Same file content, default persistent (TU-fingerprint-keyed) cache:
+        # adding unbuilt.c to the manifest must drop its build_excluded mark.
+        (tmp_path / "built.c").write_text("int f(void){ return 0; }\n")
+        (tmp_path / "unbuilt.c").write_text("int g(void){ return 0; }\n")
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text(json.dumps([{"directory": str(tmp_path), "file": "built.c",
+                                   "arguments": ["cc", "-c", "built.c"]}]))
+        inv1 = build_inventory(str(tmp_path))
+        assert {f["path"]: ("build_excluded" in f)
+                for f in inv1["files"]}.get("unbuilt.c") is True
+        cc.write_text(json.dumps([
+            {"directory": str(tmp_path), "file": "built.c",
+             "arguments": ["cc", "-c", "built.c"]},
+            {"directory": str(tmp_path), "file": "unbuilt.c",
+             "arguments": ["cc", "-c", "unbuilt.c"]},
+        ]))
+        inv2 = build_inventory(str(tmp_path))
+        assert {f["path"]: ("build_excluded" in f)
+                for f in inv2["files"]}.get("unbuilt.c") is False
+
+
+class TestRustCrateMembership:
+    """Rust crate-module membership: a .rs not reachable via the mod tree from
+    any crate root is marked build_excluded; no Cargo.toml → never fires.
+    Record-level (set pre-extraction) so it holds on both extractor paths."""
+
+    def _be_map(self, tmp_path, with_cargo):
+        (tmp_path / "src").mkdir()
+        if with_cargo:
+            (tmp_path / "Cargo.toml").write_text(
+                '[package]\nname = "x"\nversion = "0.1.0"\n')
+        (tmp_path / "src" / "lib.rs").write_text("mod util;\npub fn api(){}\n")
+        (tmp_path / "src" / "util.rs").write_text("pub fn helper(){}\n")
+        (tmp_path / "src" / "orphan.rs").write_text("pub fn dead(){}\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        return {f["path"]: ("build_excluded" in f)
+                for f in inv["files"] if f["path"].endswith(".rs")}
+
+    def test_orphan_excluded_intree_not(self, tmp_path):
+        be = self._be_map(tmp_path, with_cargo=True)
+        assert be.get("src/orphan.rs") is True   # no mod path → excluded
+        assert be.get("src/lib.rs") is False      # crate root
+        assert be.get("src/util.rs") is False     # reached via `mod util;`
+
+    def test_no_cargo_never_excludes(self, tmp_path):
+        be = self._be_map(tmp_path, with_cargo=False)
+        assert not any(be.values())               # not a crate → unknown
+
+    def test_mod_tree_change_invalidates_persistent_cache(self, tmp_path):
+        # Same orphan.rs content, default persistent (mod-fingerprint-keyed)
+        # cache: adding `mod orphan;` to lib.rs must drop its build_excluded.
+        (tmp_path / "src").mkdir()
+        (tmp_path / "Cargo.toml").write_text(
+            '[package]\nname = "x"\nversion = "0.1.0"\n')
+        (tmp_path / "src" / "lib.rs").write_text("mod util;\n")
+        (tmp_path / "src" / "util.rs").write_text("")
+        (tmp_path / "src" / "orphan.rs").write_text("pub fn d(){}\n")
+        inv1 = build_inventory(str(tmp_path))
+        assert {f["path"]: ("build_excluded" in f)
+                for f in inv1["files"]}.get("src/orphan.rs") is True
+        (tmp_path / "src" / "lib.rs").write_text("mod util;\nmod orphan;\n")
+        inv2 = build_inventory(str(tmp_path))
+        assert {f["path"]: ("build_excluded" in f)
+                for f in inv2["files"]}.get("src/orphan.rs") is False
+
+
+class TestRustExtraction:
+    """Rust item extraction via tree-sitter (previously a regex fallback that
+    dropped impl methods sharing a trait-decl name and never associated methods
+    with their impl type). impl methods now extract with class_name = the impl
+    target; ``pub`` is an entry; and a trait-impl method dispatched via
+    ``&dyn Trait`` reads UNCERTAIN (the trait is recorded as a base → CHA),
+    while a never-dispatched inherent method stays dead. Needs tree-sitter-rust."""
+
+    _SRC = (
+        "pub fn public_api() {}\n"
+        "fn private_free() {}\n"
+        "trait Handler { fn handle(&self); }\n"
+        "struct Foo;\n"
+        "impl Handler for Foo {\n"
+        "    fn handle(&self) { self.helper(); }\n"
+        "    fn helper(&self) {}\n"
+        "}\n"
+        "impl Foo { fn inherent_dead(&self) {} }\n"
+        "fn dispatch(h: &dyn Handler) { h.handle(); }\n")
+
+    def _build(self, tmp_path):
+        pytest.importorskip("tree_sitter_rust")
+        (tmp_path / "m.rs").write_text(self._SRC)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_impl_methods_extracted_with_class(self, tmp_path):
+        inv = self._build(tmp_path)
+        meta = {it["name"]: (it.get("metadata") or {})
+                for f in inv["files"] for it in f["items"]
+                if it.get("kind", "function") == "function"}
+        # impl method `handle` (line 6) is extracted, not dropped by the
+        # same-named trait decl, and associated with its impl target Foo.
+        assert "handle" in meta and meta["handle"]["class_name"] == "Foo"
+        assert meta["helper"]["class_name"] == "Foo"
+        assert meta["public_api"]["visibility"] == "pub"
+
+    def test_rust_dispatch_verdicts(self, tmp_path):
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), "m")
+            return None
+
+        assert verdict("public_api") == "reachable"        # pub → entry
+        assert verdict("handle") == "uncertain"             # trait dispatch
+        assert verdict("inherent_dead") == "no_path_from_entry"  # genuinely dead
+        assert verdict("private_free") == "no_path_from_entry"   # private, uncalled
+
+
+class TestExtractionCompleteness:
+    """Per-language method↔class association + completeness gaps found by audit:
+    C++ inline methods (class_specifier name wasn't resolved → class_name=None),
+    Java enum methods (enum_declaration wasn't a class type), and JS private
+    methods (``#priv`` — private_property_identifier was dropped). Each case
+    skips without its grammar."""
+
+    def _items(self, tmp_path, fn, src):
+        (tmp_path / fn).write_text(src)
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        return {it["name"]: (it.get("metadata") or {}).get("class_name")
+                for f in inv["files"] for it in f["items"]
+                if it.get("kind", "function") == "function"}
+
+    def test_cpp_methods_associate_with_class(self, tmp_path):
+        pytest.importorskip("tree_sitter_cpp")
+        items = self._items(
+            tmp_path, "a.cpp",
+            "class Foo { public: void inl() {} };\n"
+            "struct Bar { void bm() {} };\n"
+            "template<class T> class Tpl { public: void tm() {} };\n")
+        assert items.get("inl") == "Foo"
+        assert items.get("bm") == "Bar"
+        assert items.get("tm") == "Tpl"
+
+    def test_cpp_out_of_line_methods_get_receiver(self, tmp_path):
+        # Out-of-line definitions (``Scanner::parseBody`` in a
+        # .cpp, ``inline T Reader::getElement`` in a header)
+        # sit at translation-unit level: class_name stayed None, so
+        # receiver-qualified pins/labels never matched and (with
+        # overloads sharing the bare name) the functions were never
+        # scheduled for review.
+        pytest.importorskip("tree_sitter_cpp")
+        items = self._items(
+            tmp_path, "o.cpp",
+            "void Scanner::parseBody(const char* p) {}\n"
+            "template <typename T>\n"
+            "inline T Reader::getElement(int index) { return T(); }\n"
+            "static char *ns::Klass::dup(const char *s) { return 0; }\n"
+            "int plain_fn(int x) { return x; }\n")
+        assert items.get("parseBody") == "Scanner"
+        assert items.get("getElement") == "Reader"
+        assert items.get("dup") == "Klass"       # rightmost qualifier
+        assert items.get("plain_fn") is None     # unqualified: unchanged
+
+    def test_cpp_operator_overloads_extracted(self, tmp_path):
+        # Operator overloads were dropped entirely (operator_name /
+        # reference_declarator unhandled) — a vuln in operator[] / operator=
+        # would be invisible.
+        pytest.importorskip("tree_sitter_cpp")
+        items = self._items(
+            tmp_path, "op.cpp",
+            "class Foo { public:\n"
+            "  Foo& operator+(const Foo& o) { return *this; }\n"
+            "  int& operator[](int i) { static int x; return x; }\n"
+            "  operator bool() const { return true; }\n};\n")
+        assert items.get("operator+") == "Foo"
+        assert items.get("operator[]") == "Foo"
+        assert items.get("operator bool") == "Foo"   # conversion operator
+
+    def test_java_enum_methods_associate(self, tmp_path):
+        pytest.importorskip("tree_sitter_java")
+        items = self._items(
+            tmp_path, "E.java", "enum E { X; void ev() {} E() {} }\n")
+        assert items.get("ev") == "E"
+
+    def test_js_private_method_extracted(self, tmp_path):
+        pytest.importorskip("tree_sitter_javascript")
+        items = self._items(tmp_path, "a.js", "class C { #priv() {} m() {} }")
+        assert items.get("#priv") == "C"   # was dropped entirely
+        assert items.get("m") == "C"
+
+    def test_csharp_operators_and_indexer_extracted(self, tmp_path):
+        # Operator overloads / conversions / indexers carry logic — were
+        # dropped (not in C# func types).
+        pytest.importorskip("tree_sitter_c_sharp")
+        items = self._items(
+            tmp_path, "a.cs",
+            "class C {\n"
+            "  public static C operator +(C a, C b) { return a; }\n"
+            "  public int this[int i] { get { return i; } }\n"
+            "  public static explicit operator int(C c) { return 0; }\n}\n")
+        assert items.get("operator+") == "C"
+        assert items.get("this[]") == "C"
+        assert items.get("operator int") == "C"
+
+    def test_ruby_operator_methods_extracted(self, tmp_path):
+        # ``def []=`` / ``def <=>`` — the name is an ``operator`` node, not an
+        # identifier; previously dropped.
+        pytest.importorskip("tree_sitter_ruby")
+        items = self._items(
+            tmp_path, "a.rb",
+            "class C\n  def []=(k, v); end\n  def <=>(o); 0; end\n  def m; end\nend\n")
+        assert items.get("[]=") == "C"
+        assert items.get("<=>") == "C"
+
+
+class TestGoReachability:
+    """End-to-end Go dead-code coverage. Go needed no new substrate (it was
+    already complete via //go:build ignore → build_excluded, init-panic →
+    module_aborts, dead-island → no_path_from_entry); this locks the composed
+    verdicts in as a regression guard, mirroring TestCppTuMembership /
+    TestRustCrateMembership. Record-level assertions run on both extractor
+    paths; verdict assertions need the Go call-graph extractor (tree-sitter-go)
+    and skip without it, per the stdlib-path convention."""
+
+    _FILES = {
+        "go.mod": "module x\ngo 1.21\n",
+        "ig.go": ("//go:build ignore\n\npackage main\n"
+                  "func orphan(q string){ _ = q }\nfunc main(){ orphan(\"x\") }\n"),
+        "abort.go": ("package m\nfunc init(){ panic(\"disabled\") }\n"
+                     "func sink(q string){ _ = q }\n"),
+        "live.go": "package m\nfunc Exported(){ helper() }\nfunc helper(){}\n",
+        "island.go": "package m\nfunc islA(){ islB() }\nfunc islB(){ islA() }\n",
+    }
+
+    def _build(self, tmp_path):
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_go_dead_code_records_both_paths(self, tmp_path):
+        # Content-detected records (no extraction needed) — both paths.
+        by = {f["path"]: f for f in self._build(tmp_path)["files"]}
+        assert "build_excluded" in by["ig.go"]              # //go:build ignore
+        assert by["abort.go"].get("module_aborts_on_load")  # init(){ panic(...) }
+
+    def test_go_composed_verdicts(self, tmp_path):
+        # Verdicts compose over the Go call graph → need tree-sitter-go.
+        import pytest
+        pytest.importorskip("tree_sitter_go")
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(rel, name):
+            for f in inv["files"]:
+                if f["path"] != rel:
+                    continue
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        m = ".".join(rel.rsplit(".", 1)[0].split("/"))
+                        return classify_reachability(
+                            inv, rel, name, int(it.get("line_start") or 0), m)
+            return None
+
+        assert verdict("abort.go", "sink") == "module_aborts"
+        assert verdict("ig.go", "orphan") == "build_excluded"
+        assert verdict("island.go", "islA") == "no_path_from_entry"
+        assert verdict("live.go", "Exported") == "reachable"   # over-fire control
+
+
+class TestGoInterfaceDispatch:
+    """Go CHA-analog. Go has no inheritance and its call graph emits no
+    ClassDef, but the item extractor records each method's receiver type as
+    class_name, and Go interfaces are STRUCTURAL — any method can satisfy an
+    interface. So an unexported method dispatched via an interface-typed
+    receiver (``x.serve()``) could be reached at runtime even though entry-
+    reachability finds no resolved path; it must read UNCERTAIN, not
+    no_path_from_entry. A method whose name is never dispatched stays dead.
+    Type-free over-approximation (a same-named method on an unrelated type also
+    reads uncertain) — FN-safe. Needs tree-sitter-go."""
+
+    _SRC = (
+        "package main\n"
+        "type handler interface { serve() }\n"
+        "type A struct{}\n"
+        "func (a *A) serve() {}\n"      # unexported, iface-dispatched
+        "func (a *A) deadOne() {}\n"    # unexported, never dispatched
+        "type B struct{}\n"
+        "func (b *B) serve() {}\n"      # name collides with dispatched serve
+        "func Run(h handler) { h.serve() }\n")  # exported entry, dispatches
+
+    def test_go_interface_dispatched_method_is_uncertain(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "go.mod").write_text("module x\ngo 1.21\n")
+        (tmp_path / "m.go").write_text(self._SRC)
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(name, cls):
+            for f in inv["files"]:
+                if not f["path"].endswith("m.go"):
+                    continue
+                for it in f["items"]:
+                    md = it.get("metadata") or {}
+                    if it.get("name") == name and md.get("class_name") == cls:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), "m")
+            return None
+
+        # dispatched via h.serve() → reachable at runtime via the interface
+        assert verdict("serve", "A") == "uncertain"
+        # same-name method on an unrelated type → also uncertain (FN-safe)
+        assert verdict("serve", "B") == "uncertain"
+        # never dispatched → stays dead (gate prevents blanket promotion)
+        assert verdict("deadOne", "A") == "no_path_from_entry"
+
+
+class TestJavaFrameworkEntries:
+    """End-to-end Java framework-dispatch entry coverage. Spring / Jakarta
+    container-managed methods (routes, @EventListener / @Scheduled, @Bean
+    factories, JPA callbacks, and the public methods of @Service / @Component /
+    @RestController beans) have no in-project caller; without modelling them as
+    entries they read not_called and get surface-demoted. Verdicts need the
+    Java call-graph extractor (tree-sitter-java) and skip without it. Adding
+    entries only grows the reachable set, so the controls (a plain class, an
+    @Async / @Transactional method, a private bean method) must stay
+    not_called — that is the FP/FN-safety guard."""
+
+    _FILES = {
+        # @RestController stereotype: public route method = entry; the private
+        # helper is reachable only through the closure from it.
+        "Api.java": ("package x;\n@RestController\npublic class Api {\n"
+                     "  @GetMapping public String handle() { return fmt(); }\n"
+                     "  private String fmt() { return \"x\"; }\n}\n"),
+        # @Service stereotype: an uncalled PUBLIC method is still a bean entry;
+        # the private helper is not.
+        "Svc.java": ("package x;\n@Service\npublic class Svc {\n"
+                     "  public void process() {}\n"
+                     "  private void helper() {}\n}\n"),
+        # method-level dispatch annotations on a plain (non-stereotype) class.
+        "Ev.java": ("package x;\npublic class Ev {\n"
+                    "  @EventListener public void on() {}\n"
+                    "  @Scheduled public void tick() {}\n}\n"),
+        # nested: a @Service INNER class in a plain OUTER class. The inner
+        # public method is a bean entry; the outer plain method (declared after
+        # the inner class) must NOT inherit the inner stereotype.
+        "Nest.java": ("package x;\npublic class Nest {\n"
+                      "  @Service public static class Inner {\n"
+                      "    public void innerBean() {}\n  }\n"
+                      "  public void outerPlain() {}\n}\n"),
+        # controls — must stay not_called:
+        "Ctl.java": ("package x;\npublic class Ctl {\n"
+                     "  @Async public void bg() {}\n"
+                     "  @Transactional public void wr() {}\n"
+                     "  public void dead() {}\n}\n"),
+    }
+
+    def _build(self, tmp_path):
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_java_stdlib_path_inert(self, tmp_path, monkeypatch):
+        # On the stdlib path (CI without tree-sitter-java) annotations are not
+        # captured, so the feature is inert: methods are still extracted and
+        # fall through to the existing 1-hop verdict — never a crash, never a
+        # hard suppression.
+        import core.inventory.extractors as ex
+        monkeypatch.setattr(ex, "_TS_AVAILABLE", False)
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+        saw = False
+        for f in inv["files"]:
+            for it in f["items"]:
+                if it.get("name") == "process":
+                    saw = True
+                    v = classify_reachability(
+                        inv, f["path"], "process",
+                        int(it.get("line_start") or 0), "Svc")
+                    assert v != "reachable"   # not promoted without annotations
+        assert saw   # extraction still works on the stdlib path
+
+    def test_java_framework_entry_verdicts(self, tmp_path):
+        pytest.importorskip("tree_sitter_java")
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(rel, name):
+            for f in inv["files"]:
+                if f["path"] != rel:
+                    continue
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        m = rel.rsplit(".", 1)[0]
+                        return classify_reachability(
+                            inv, rel, name, int(it.get("line_start") or 0), m)
+            return None
+
+        # gains: framework-dispatched methods become reachable.
+        assert verdict("Api.java", "handle") == "reachable"    # @GetMapping + stereotype
+        assert verdict("Api.java", "fmt") == "reachable"       # reachable via closure
+        assert verdict("Svc.java", "process") == "reachable"   # public bean method
+        assert verdict("Ev.java", "on") == "reachable"         # @EventListener
+        assert verdict("Ev.java", "tick") == "reachable"       # @Scheduled
+        assert verdict("Nest.java", "innerBean") == "reachable"  # inner @Service bean
+        # controls: entries only grow the set, so these stay demoted.
+        assert verdict("Svc.java", "helper") == "not_called"   # private bean method
+        assert verdict("Nest.java", "outerPlain") == "not_called"  # no stereotype leak
+        assert verdict("Ctl.java", "bg") == "not_called"       # @Async is not an entry
+        assert verdict("Ctl.java", "wr") == "not_called"       # @Transactional is not an entry
+        assert verdict("Ctl.java", "dead") == "not_called"     # plain uncalled
+
+    def test_java_framework_base_extends_implements(self, tmp_path):
+        # extends/implements a framework base → methods are entries (closes the
+        # interface-dispatch residuals type-free: Spring Data repos + dispatched
+        # framework-interface @Override impls).
+        pytest.importorskip("tree_sitter_java")
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "OwnerRepository.java").write_text(
+            "package x;\npublic interface OwnerRepository "
+            "extends JpaRepository<Owner,Integer> {\n  Owner findByLastName(String n);\n}\n")
+        (tmp_path / "PetValidator.java").write_text(
+            "package x;\npublic class PetValidator implements Validator {\n"
+            "  @Override public void validate(Object o) {}\n}\n")
+        (tmp_path / "Plain.java").write_text(
+            "package x;\npublic class Plain {\n  public void lonely() {}\n}\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(rel, name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name and f["path"].endswith(rel):
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), f["path"].rsplit(".", 1)[0])
+            return None
+
+        assert verdict("OwnerRepository.java", "findByLastName") == "reachable"  # Spring Data
+        assert verdict("PetValidator.java", "validate") == "reachable"           # Validator impl
+        assert verdict("Plain.java", "lonely") == "not_called"                   # control
+
+
+class TestVirtualDispatchCHA:
+    """Type-free Class Hierarchy Analysis: a polymorphic-dispatch OVERRIDE (a
+    method of a class that extends/implements something) whose name is
+    dispatched via an unresolved member call (``h.handle()``) reads UNCERTAIN,
+    not NOT_CALLED — a virtual call could reach it at runtime even with no
+    resolved edge. Surface-only; precise typed resolution is CodeQL's job."""
+
+    _FILES = {
+        "Handler.java": "package x;\npublic interface Handler { void handle(); }\n",
+        "FooHandler.java": (
+            "package x;\npublic class FooHandler implements Handler {\n"
+            "  public void handle() {}\n}\n"),
+        "Dispatcher.java": (
+            "package x;\npublic class Dispatcher {\n"
+            "  void run(Handler h) { h.handle(); }\n}\n"),
+        # controls
+        "Plain.java": "package x;\npublic class Plain {\n  public void dead() {}\n}\n",
+        "Lonely.java": (
+            "package x;\npublic class Lonely implements Handler {\n"
+            "  public void unrelated() {}\n}\n"),
+        # name-collision: an override candidate whose name matches an UNRELATED
+        # dispatched name (Closeable.close, not Widget). Type-free CHA can't
+        # tell the receiver types apart, so it stays UNCERTAIN — the FN-safe
+        # over-approximation (the type-free ceiling). Pinned so a refactor can't
+        # silently "correct" it to not_called (which would risk an FN if the
+        # collision were a real hierarchy). Tier 2 declared-type capture is the
+        # precise fix.
+        "Widget.java": "package x;\npublic class Widget {}\n",
+        "Gadget.java": (
+            "package x;\npublic class Gadget extends Widget {\n"
+            "  private void close() {}\n}\n"),
+        "Stream.java": (
+            "package x;\npublic class Stream {\n"
+            "  void use(java.io.Closeable c) throws Exception { c.close(); }\n}\n"),
+    }
+
+    def test_override_dispatched_reads_uncertain(self, tmp_path):
+        pytest.importorskip("tree_sitter_java")
+        from core.analysis.reach_audit import classify_reachability
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(rel, name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name and f["path"].endswith(rel):
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), f["path"].rsplit(".", 1)[0])
+            return None
+
+        # the impl, overriding + dispatched via h.handle() → uncertain (not demoted)
+        assert verdict("FooHandler.java", "handle") == "uncertain"
+        # controls stay not_called:
+        assert verdict("Plain.java", "dead") == "not_called"          # no base, not dispatched
+        assert verdict("Lonely.java", "unrelated") == "not_called"    # has base but name not dispatched
+        # name-collision override candidate → UNCERTAIN (FN-safe over-approx)
+        assert verdict("Gadget.java", "close") == "uncertain"
+
+
+class TestTypeScriptCHA:
+    """CHA for TypeScript. TS wraps class bases in extends_clause /
+    implements_clause, which the JS/TS walker did not descend into, so TS
+    classes recorded NO bases and CHA never saw any override candidate — a
+    virtual-dispatch override (a method of a class that implements an
+    interface, dispatched via an interface-typed receiver) wrongly read
+    not_called. With heritage capture fixed, CHA fires for TS too: the
+    override reads UNCERTAIN, controls stay not_called. Needs
+    tree-sitter-typescript."""
+
+    def test_ts_heritage_extends_implements_captured(self):
+        pytest.importorskip("tree_sitter_typescript")
+        from core.inventory.call_graph import extract_call_graph_javascript
+        g = extract_call_graph_javascript(
+            "class C extends B implements I, J {}", language="typescript")
+        bases = {c.name: c.bases for c in g.classes}
+        assert bases["C"] == ["B", "I", "J"]
+
+    def test_ts_override_dispatched_reads_uncertain(self, tmp_path):
+        pytest.importorskip("tree_sitter_typescript")
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "shapes.ts").write_text(
+            "interface IShape { area(): number; }\n"
+            "class Circle implements IShape { area(): number { return 1; } }\n"
+            "class Calc { total(s: IShape): number { return s.area(); } }\n")
+        (tmp_path / "plain.ts").write_text("class Plain { dead(): void {} }\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(rel, name, cls):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    md = it.get("metadata") or {}
+                    if (it.get("name") == name and md.get("class_name") == cls
+                            and f["path"].endswith(rel)):
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), f["path"].rsplit(".", 1)[0])
+            return None
+
+        # Circle.area overrides IShape.area and is dispatched via s.area()
+        # (s: IShape) → a virtual call could reach it → uncertain, not dead.
+        assert verdict("shapes.ts", "area", "Circle") == "uncertain"
+        # control: no base, not dispatched → not_called
+        assert verdict("plain.ts", "dead", "Plain") == "not_called"
+
+
+class TestReceiverTypeCapture:
+    """``CallSite.receiver_type`` — the declared type of a length-2
+    ``recv.m()`` receiver (a method parameter, local variable, or class
+    field). Captured substrate for type-aware consumers; the per-language
+    walkers (Java/C#/TS) resolve the receiver's declared type from scope.
+    Plain JS carries no type annotations, so it stays None. Each case
+    skips without its grammar."""
+
+    def test_java_receiver_type(self):
+        pytest.importorskip("tree_sitter_java")
+        from core.inventory.call_graph import extract_call_graph_java
+        g = extract_call_graph_java(
+            "package x;\nclass C {\n  Foo field;\n"
+            "  void r(Bar param) { Baz local = mk(); param.a(); local.b();"
+            " field.c(); chained().d(); }\n}\n")
+        by_chain = {".".join(c.chain): c.receiver_type for c in g.calls}
+        assert by_chain.get("param.a") == "Bar"      # parameter
+        assert by_chain.get("local.b") == "Baz"       # local
+        assert by_chain.get("field.c") == "Foo"       # field
+        assert by_chain.get("chained.d") is None      # chained — unresolvable
+
+    def test_csharp_receiver_type(self):
+        pytest.importorskip("tree_sitter_c_sharp")
+        from core.inventory.call_graph import extract_call_graph_csharp
+        g = extract_call_graph_csharp(
+            "class C {\n  Foo field;\n"
+            "  void R(Bar param) { Baz local = M(); param.A(); local.B();"
+            " field.C(); Chained().D(); }\n}\n")
+        by_chain = {".".join(c.chain): c.receiver_type for c in g.calls}
+        assert by_chain.get("param.A") == "Bar"
+        assert by_chain.get("local.B") == "Baz"
+        assert by_chain.get("field.C") == "Foo"
+        assert by_chain.get("Chained.D") is None
+
+    def test_typescript_receiver_type(self):
+        pytest.importorskip("tree_sitter_typescript")
+        from core.inventory.call_graph import extract_call_graph_javascript
+        g = extract_call_graph_javascript(
+            "class C {\n  field: Foo;\n"
+            "  run(param: Bar): void { const local: Baz = mk();"
+            " param.a(); local.b(); field.c(); chained().d(); }\n}\n",
+            language="typescript")
+        by_chain = {".".join(c.chain): c.receiver_type for c in g.calls}
+        assert by_chain.get("param.a") == "Bar"
+        assert by_chain.get("local.b") == "Baz"
+        assert by_chain.get("field.c") == "Foo"
+        assert by_chain.get("chained.d") is None
+
+    def test_plain_js_has_no_receiver_type(self):
+        pytest.importorskip("tree_sitter_javascript")
+        from core.inventory.call_graph import extract_call_graph_javascript
+        g = extract_call_graph_javascript(
+            "class C { run(param) { param.a(); } }", language="javascript")
+        assert all(c.receiver_type is None for c in g.calls)
+
+
+class TestTypeScriptCoverage:
+    """End-to-end TypeScript coverage. Typed TS was parsed with the JS grammar,
+    which errors on type annotations / decorators → ZERO functions extracted
+    (the whole TS ecosystem was invisible to the inventory + reachability).
+    Switching to tree-sitter-typescript fixes extraction; class methods extract
+    (property_identifier / type_identifier names); decorators are captured; and
+    NestJS / Angular / TypeORM dispatch decorators + class stereotypes promote
+    methods to framework entries. All needs tree-sitter-typescript and skips
+    without it."""
+
+    _FILES = {
+        "users.controller.ts": (
+            "import { Controller, Get, Post } from '@nestjs/common';\n"
+            "@Controller('users')\nexport class UsersController {\n"
+            "  @Get() findAll(): string { return 'all'; }\n"
+            "  @Post() create(): void {}\n"
+            "  private deadHelper(): void {}\n}\n"),
+        "users.service.ts": (
+            "import { Injectable } from '@nestjs/common';\n"
+            "@Injectable()\nexport class UsersService {\n"
+            "  findOne(): string { return 'one'; }\n}\n"),
+        "user.entity.ts": (
+            "import { Entity, Column } from 'typeorm';\n"
+            "@Entity()\nexport class User {\n"
+            "  getName(): string { return this.name; }\n}\n"),
+        "orphan.ts": "function reallyDead(): number { return 9; }\n",
+    }
+
+    def _build(self, tmp_path):
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_typed_ts_extracts_functions(self, tmp_path):
+        pytest.importorskip("tree_sitter_typescript")
+        inv = self._build(tmp_path)
+        names = {it["name"] for f in inv["files"] for it in f["items"]}
+        # class methods + top-level fn extracted (was 0 under the JS grammar).
+        assert {"findAll", "create", "findOne", "getName", "reallyDead"} <= names
+
+    def test_ts_decorators_captured(self, tmp_path):
+        pytest.importorskip("tree_sitter_typescript")
+        inv = self._build(tmp_path)
+        meta = {}
+        for f in inv["files"]:
+            for it in f["items"]:
+                meta[it["name"]] = it.get("metadata") or {}
+        # method decorator on attributes, class decorator on class_attributes.
+        assert any(a.startswith("Get") for a in meta["findAll"]["attributes"])
+        assert any(a.startswith("Controller") for a in meta["findAll"]["class_attributes"])
+        assert any(a.startswith("Injectable") for a in meta["findOne"]["class_attributes"])
+
+    def test_ts_framework_entry_verdicts(self, tmp_path):
+        pytest.importorskip("tree_sitter_typescript")
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(rel, name):
+            for f in inv["files"]:
+                if f["path"] != rel:
+                    continue
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        m = rel.rsplit(".", 1)[0]
+                        return classify_reachability(
+                            inv, rel, name, int(it.get("line_start") or 0), m)
+            return None
+
+        assert verdict("users.controller.ts", "findAll") == "reachable"   # @Get
+        assert verdict("users.controller.ts", "create") == "reachable"    # @Post
+        assert verdict("users.service.ts", "findOne") == "reachable"      # @Injectable bean
+        assert verdict("user.entity.ts", "getName") == "reachable"        # @Entity accessor
+        # over-fire controls — entries only grow the set:
+        assert verdict("users.controller.ts", "deadHelper") == "not_called"  # private
+        assert verdict("orphan.ts", "reallyDead") == "not_called"            # uncalled
+
+    def test_ts_intra_class_this_method_resolves(self, tmp_path):
+        # A private helper reached only via this.helper() from a framework
+        # entry must resolve (class-qualified 1-hop), not read not_called.
+        pytest.importorskip("tree_sitter_typescript")
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "svc.ts").write_text(
+            "@Injectable()\nexport class Svc {\n"
+            "  handle() { return this.step(); }\n"        # public bean entry
+            "  private step() { return this.deep(); }\n"  # via this.
+            "  private deep() { return 1; }\n"            # via this. (transitive)
+            "  private orphan() { return 2; }\n}\n",       # genuinely uncalled
+            encoding="utf-8")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), "svc")
+            return None
+
+        assert verdict("handle") == "reachable"   # @Injectable public method
+        assert verdict("step") == "called"        # via this.step()
+        assert verdict("deep") == "called"        # via this.deep() (transitive)
+        assert verdict("orphan") == "not_called"  # genuinely uncalled control
+
+
+class TestCSharpCoverage:
+    """End-to-end C# / ASP.NET coverage. C# used the regex extractor (no
+    attribute/visibility capture); now wired to tree-sitter-c-sharp so methods
+    extract (name = identifier before parameter_list, NOT the return type) with
+    attributes + visibility, and ASP.NET routing attributes / [ApiController]
+    stereotypes promote action methods to framework entries. Needs
+    tree-sitter-c-sharp; skips without it."""
+
+    _FILES = {
+        "UsersController.cs": (
+            "[ApiController]\n[Route(\"api/users\")]\n"
+            "public class UsersController : ControllerBase {\n"
+            "  [HttpGet] public IActionResult GetAll() { return Ok(Fmt()); }\n"
+            "  [HttpPost] public IActionResult Create() { return Ok(); }\n"
+            "  private string Fmt() { return \"x\"; }\n"
+            "  private string DeadHelper() { return \"never\"; }\n}\n"),
+        "Svc.cs": (
+            "public class Svc {\n  public string Lonely() { return \"x\"; }\n}\n"),
+    }
+
+    def _build(self, tmp_path):
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_csharp_extracts_methods_and_attributes(self, tmp_path):
+        pytest.importorskip("tree_sitter_c_sharp")
+        inv = self._build(tmp_path)
+        meta = {it["name"]: (it.get("metadata") or {})
+                for f in inv["files"] for it in f["items"]}
+        # method name is GetAll (not the return type IActionResult).
+        assert {"GetAll", "Create", "Fmt", "Lonely"} <= set(meta)
+        assert "HttpGet" in meta["GetAll"]["attributes"]
+        assert "ApiController" in meta["GetAll"]["class_attributes"]
+        assert meta["Fmt"]["visibility"] == "private"
+
+    def test_csharp_framework_entry_verdicts(self, tmp_path):
+        pytest.importorskip("tree_sitter_c_sharp")
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0),
+                            f["path"].rsplit(".", 1)[0])
+            return None
+
+        assert verdict("GetAll") == "reachable"     # [HttpGet]
+        assert verdict("Create") == "reachable"     # [HttpPost]
+        assert verdict("Fmt") == "called"           # called intra-class by GetAll
+        assert verdict("DeadHelper") == "not_called"  # private uncalled
+        assert verdict("Lonely") == "not_called"    # public, non-stereotype class
+
+    def test_csharp_base_class_stereotypes(self, tmp_path):
+        # Base CLASSES (no attribute) the runtime dispatches into — captured
+        # from the C# base_list into class_attributes.
+        pytest.importorskip("tree_sitter_c_sharp")
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "f.cs").write_text(
+            "public class BlogController : ControllerBase {\n"
+            "  public IActionResult Index() { return Ok(); }\n}\n"
+            "public class ChatHub : Hub {\n  public void Send(string m) {} }\n"
+            "public class Plain {\n  public void Dead() {} }\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), f["path"].rsplit(".", 1)[0])
+            return None
+
+        assert verdict("Index") == "reachable"   # : ControllerBase (no [attr])
+        assert verdict("Send") == "reachable"     # : Hub (SignalR)
+        assert verdict("Dead") == "not_called"    # plain class control
+
+
+class TestRubyCoverage:
+    """End-to-end Ruby / Rails coverage. Ruby used the regex extractor; now
+    wired to tree-sitter-ruby (class name = constant, methods, superclass
+    captured). Rails dispatch is CONVENTION-based (no annotations): methods of a
+    class inheriting a framework base (*Controller / job / mailer) are
+    framework entries. Needs tree-sitter-ruby; skips without it."""
+
+    _FILES = {
+        "users_controller.rb": (
+            "class UsersController < ApplicationController\n"
+            "  before_action :authenticate\n"
+            "  def index\n    @u = fetch\n  end\n"
+            "  def show; end\n"
+            "  private\n  def fetch; User.all; end\n"
+            "  def authenticate; end\nend\n"),
+        "widget_job.rb": (
+            "class WidgetJob < ApplicationJob\n  def perform(id); end\nend\n"),
+        "plain.rb": "class PlainThing\n  def lonely; end\nend\n",
+    }
+
+    def _build(self, tmp_path):
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_ruby_extracts_methods_and_superclass(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        inv = self._build(tmp_path)
+        meta = {it["name"]: (it.get("metadata") or {})
+                for f in inv["files"] for it in f["items"]}
+        assert {"index", "show", "fetch", "perform", "lonely"} <= set(meta)
+        assert meta["index"]["class_name"] == "UsersController"
+        assert "ApplicationController" in meta["index"]["class_attributes"]
+
+    def test_ruby_rails_framework_entry_verdicts(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0),
+                            f["path"].rsplit(".", 1)[0])
+            return None
+
+        # controller actions + private callbacks/helpers are Rails-dispatched.
+        assert verdict("index") == "reachable"
+        assert verdict("show") == "reachable"
+        assert verdict("authenticate") == "reachable"   # before_action callback
+        assert verdict("fetch") == "reachable"           # helper in a controller
+        assert verdict("perform") == "reachable"         # job entry
+        assert verdict("lonely") == "not_called"         # plain class control
+
+
+class TestPythonFrameworkConvention:
+    """Python class-based views (Django/DRF/Flask). Decorator-dispatched views
+    are handled by is_framework_callable; this covers the CONVENTION — a method
+    of a class subclassing a framework CBV base (APIView/ListView/MethodView)
+    is dispatched by the framework with no in-project caller. Requires the
+    extractor to capture Python class bases into class_attributes."""
+
+    _FILES = {
+        "views.py": (
+            "import rest_framework.views\n"
+            "class UserView(rest_framework.views.APIView):\n"
+            "    def get(self, request): return self._fmt()\n"
+            "    def _fmt(self): return 'x'\n"
+            "class BlogList(ListView):\n"
+            "    def get_queryset(self): return []\n"
+            "class Plain:\n"
+            "    def dead(self): return 9\n"),
+    }
+
+    def test_python_class_bases_captured(self, tmp_path):
+        (tmp_path / "views.py").write_text(self._FILES["views.py"])
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+        meta = {it["name"]: (it.get("metadata") or {})
+                for f in inv["files"] for it in f["items"]}
+        # dotted base recorded by simple tail name; plain class has none.
+        assert "APIView" in meta["get"]["class_attributes"]
+        assert "ListView" in meta["get_queryset"]["class_attributes"]
+        assert meta["dead"]["class_attributes"] == []
+
+    def test_python_class_bases_captured_stdlib_path(self):
+        # CI has no tree-sitter grammar → the stdlib ast PythonExtractor runs.
+        # Exercise it DIRECTLY (not build_inventory, which prefers tree-sitter
+        # where installed) so base capture is verified on the fallback path
+        # regardless of environment. See feedback-test-on-stdlib-extractor-path.
+        from core.inventory.extractors import PythonExtractor
+        meta = {fi.name: fi.metadata
+                for fi in PythonExtractor().extract("views.py", self._FILES["views.py"])}
+        assert "APIView" in meta["get"].class_attributes        # dotted base
+        assert "ListView" in meta["get_queryset"].class_attributes
+        assert meta["dead"].class_attributes == []
+
+    def test_python_cbv_methods_are_entries(self, tmp_path):
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "views.py").write_text(self._FILES["views.py"])
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), "views")
+            return None
+
+        assert verdict("get") == "reachable"           # DRF APIView verb handler
+        assert verdict("get_queryset") == "reachable"   # Django ListView hook
+        assert verdict("dead") == "not_called"          # non-CBV control
+
+    def test_python_convention_breadth(self, tmp_path):
+        # Beyond web CBVs: Django management commands, DRF serializers, forms,
+        # admin — methods dispatched by the framework with no in-project caller.
+        from core.analysis.reach_audit import classify_reachability
+        (tmp_path / "fw.py").write_text(
+            "from django.core.management.base import BaseCommand\n"
+            "class Command(BaseCommand):\n"
+            "    def handle(self, *a, **k): return self._work()\n"
+            "    def _work(self): return 1\n"
+            "from rest_framework import serializers\n"
+            "class UserSer(serializers.ModelSerializer):\n"
+            "    def validate_email(self, v): return v\n"
+            "class ContactForm(forms.Form):\n"
+            "    def clean_email(self): return 1\n"
+            "class Plain:\n"
+            "    def dead(self): return 9\n")
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0), "fw")
+            return None
+
+        assert verdict("handle") == "reachable"          # Django mgmt command
+        assert verdict("_work") == "reachable"            # transitively via this
+        assert verdict("validate_email") == "reachable"   # DRF serializer hook
+        assert verdict("clean_email") == "reachable"      # Django form hook
+        assert verdict("dead") == "not_called"            # control
+
+
+class TestLibraryEntryMode:
+    """Opt-in library mode (build_inventory(treat_exports_as_entries=True)):
+    for the dynamic/JVM langs (entry_model='none'), a library's exported/public
+    symbols are entry points — the API surface is reachable by consumers. OFF
+    by default so an application's dead public functions are still surfaced.
+    Private/internal symbols stay dead even in library mode; functions reachable
+    FROM the public API become reachable via the closure."""
+
+    def _verds(self, tmp_path, files, library):
+        for fn, src in files.items():
+            (tmp_path / fn).write_text(src)
+        inv = build_inventory(str(tmp_path), str(tmp_path / "out"),
+                              treat_exports_as_entries=library)
+        from core.analysis.reach_audit import classify_reachability
+        out = {}
+        for f in inv["files"]:
+            mod = ".".join(f["path"].rsplit(".", 1)[0].split("/"))
+            for it in f["items"]:
+                if it.get("kind", "function") == "function":
+                    out[it.get("name")] = classify_reachability(
+                        inv, f["path"], it.get("name"),
+                        int(it.get("line_start") or 0), mod)
+        return out
+
+    def test_default_app_mode_public_not_entry(self, tmp_path):
+        v = self._verds(tmp_path, {"x.py": "def public_api(): pass\n"}, False)
+        assert v["public_api"] == "not_called"   # default: public != entry
+
+    def test_python_library_mode(self, tmp_path):
+        files = {"x.py": (
+            "def public_api():\n    return _helper()\n"
+            "def _helper():\n    return 1\n"
+            "def _orphan():\n    return 2\n"
+            "class C:\n  def method(self): pass\n  def _priv(self): pass\n")}
+        v = self._verds(tmp_path, files, True)
+        assert v["public_api"] == "reachable"     # public top-level
+        assert v["_helper"] == "reachable"         # reachable FROM the API
+        assert v["_orphan"] == "no_path_from_entry"  # private + unreachable: dead-island fires
+        assert v["method"] == "reachable"          # public method
+        assert v["_priv"] == "no_path_from_entry"  # private method: dead-island fires
+
+    def test_ts_export_and_java_php_public(self, tmp_path):
+        for grammar in ("tree_sitter_typescript", "tree_sitter_java",
+                        "tree_sitter_php"):
+            pytest.importorskip(grammar)
+        files = {
+            "x.ts": "export function expApi(){}\nfunction internalFn(){}\n",
+            "x.java": "public class C { public void pubApi(){} private void prv(){} }\n",
+            "x.php": "<?php\nclass D { public function phpApi(){} private function phpPrv(){} }\n",
+        }
+        v = self._verds(tmp_path, files, True)
+        assert v["expApi"] == "reachable"          # TS export
+        assert v["internalFn"] == "not_called"     # non-export -> dead
+        assert v["pubApi"] == "reachable"          # Java public
+        assert v["prv"] == "not_called"            # Java private stays dead
+        assert v["phpApi"] == "reachable"          # PHP public
+        assert v["phpPrv"] == "not_called"         # PHP private stays dead
+
+
+class TestPhpCoverage:
+    """End-to-end PHP / Laravel + Symfony coverage. PHP used the regex
+    extractor; now wired to tree-sitter-php (class/method names, visibility,
+    #[…] attributes, extends/implements). Framework dispatch is both
+    attribute-based (Symfony #[Route]) and base-class/interface convention
+    (Laravel/Symfony Controller/AbstractController/Command/ShouldQueue). Needs
+    tree-sitter-php; skips without it."""
+
+    _FILES = {
+        "UserController.php": (
+            "<?php\nclass UserController extends AbstractController {\n"
+            "  #[Route('/list')]\n"
+            "  public function list(): Response { return $this->fmt(); }\n"
+            "  private function fmt(): string { return 'x'; }\n}\n"),
+        "WidgetJob.php": (
+            "<?php\nclass WidgetJob implements ShouldQueue {\n"
+            "  public function handle() {}\n}\n"),
+        "Plain.php": "<?php\nclass Plain {\n  public function lonely() {}\n}\n",
+        # attribute-only Symfony command (no `extends Command`) — modern
+        # Symfony marks dispatch by class attribute, not base class.
+        "FooCommand.php": (
+            "<?php\n#[AsCommand(name: 'app:foo')]\nclass FooCommand {\n"
+            "  public function execute(): int { return 0; }\n}\n"),
+        # controller extending a PROJECT-custom base → caught by the
+        # *Controller naming convention, not an explicit framework base.
+        "BlogController.php": (
+            "<?php\nclass BlogController extends BaseController {\n"
+            "  public function index(): Response { return new Response(); }\n}\n"),
+    }
+
+    def _build(self, tmp_path):
+        for rel, c in self._FILES.items():
+            (tmp_path / rel).write_text(c)
+        return build_inventory(str(tmp_path), str(tmp_path / "out"))
+
+    def test_php_extracts_methods_attrs_bases(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        inv = self._build(tmp_path)
+        meta = {it["name"]: (it.get("metadata") or {})
+                for f in inv["files"] for it in f["items"]}
+        assert {"list", "fmt", "handle", "lonely"} <= set(meta)
+        assert "Route" in meta["list"]["attributes"]
+        assert "AbstractController" in meta["list"]["class_attributes"]
+        assert "ShouldQueue" in meta["handle"]["class_attributes"]
+        assert meta["fmt"]["visibility"] == "private"
+
+    def test_php_framework_entry_verdicts(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        from core.analysis.reach_audit import classify_reachability
+        inv = self._build(tmp_path)
+
+        def verdict(name):
+            for f in inv["files"]:
+                for it in f["items"]:
+                    if it.get("name") == name:
+                        return classify_reachability(
+                            inv, f["path"], name,
+                            int(it.get("line_start") or 0),
+                            f["path"].rsplit(".", 1)[0])
+            return None
+
+        assert verdict("list") == "reachable"      # #[Route] + AbstractController
+        assert verdict("fmt") == "reachable"        # method of a controller class
+        assert verdict("handle") == "reachable"     # implements ShouldQueue
+        assert verdict("lonely") == "not_called"    # plain class control
+        assert verdict("execute") == "reachable"    # class #[AsCommand] attribute
+        assert verdict("index") == "reachable"      # *Controller naming convention
+
+
+# ---------------------------------------------------------------------------
+# _drain_futures — the stall watchdog on the extractor pool (U09-F1)
+# ---------------------------------------------------------------------------
+
+
+class TestDrainFutures:
+    def test_clean_drain_returns_empty_and_collects_all(self):
+        import concurrent.futures as cf
+        from core.inventory.builder import _drain_futures
+
+        seen = []
+        with cf.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(lambda k=k: k) for k in range(5)]
+            stalled = _drain_futures(
+                futures, 30, lambda fut: seen.append(fut.result()),
+            )
+        assert stalled == set()
+        assert sorted(seen) == [0, 1, 2, 3, 4]
+
+    def test_zero_completion_window_returns_stalled_set(self):
+        import concurrent.futures as cf
+        import threading
+        from core.inventory.builder import _drain_futures
+
+        release = threading.Event()
+        seen = []
+        pool = cf.ThreadPoolExecutor(max_workers=2)
+        try:
+            fast = pool.submit(lambda: "fast")
+            hung = pool.submit(release.wait)
+            stalled = _drain_futures(
+                [fast, hung], 0.2,
+                lambda fut: seen.append(fut.result()),
+            )
+            # The fast future completed (progress reset the window);
+            # the hung one is reported stalled instead of blocking
+            # forever — the pre-fix as_completed loop never returned.
+            assert stalled == {hung}
+            assert seen == ["fast"]
+        finally:
+            release.set()  # unblock the worker so shutdown can join
+            pool.shutdown(wait=True)
+
+    def test_exceptions_are_delivered_to_on_done(self):
+        import concurrent.futures as cf
+        from core.inventory.builder import _drain_futures
+
+        def _boom():
+            raise ValueError("bad file")
+
+        outcomes = []
+
+        def _on_done(fut):
+            try:
+                fut.result()
+                outcomes.append("ok")
+            except ValueError:
+                outcomes.append("error")
+
+        with cf.ThreadPoolExecutor(max_workers=1) as pool:
+            stalled = _drain_futures(
+                [pool.submit(_boom), pool.submit(lambda: 1)], 30, _on_done,
+            )
+        assert stalled == set()
+        assert sorted(outcomes) == ["error", "ok"]

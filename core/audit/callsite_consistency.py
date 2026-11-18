@@ -1,0 +1,1616 @@
+"""Detect call-site deviations via Engler-style statistical inference.
+
+If a function's return value is captured at most call sites but discarded
+at a few, the discarding sites are likely bugs — missing error checks,
+ignored validation results, swallowed status codes.
+
+Phase 1 of the consistency programme upgrades the per-site boolean
+``discarded`` to a six-value **usage enum** (design
+/tmp/consistency-unchecked-return-design.md §2.1):
+
+* ``tested`` — a condition / comparison consumes the result;
+* ``captured_used`` — assigned and the binding is read later;
+* ``captured_unused`` — assigned then never read. Go shapes live
+  here: ``_ = f()`` blank discard, and ``v, err := f()`` where ``err``
+  is never consulted before rebinding/exit;
+* ``discarded`` — bare expression statement;
+* ``acknowledged`` — explicit-discard idioms (C/C++ ``(void)f()``,
+  Rust ``let _ =``, Python ``_ =``, Swift ``_ =``): the author
+  demonstrably saw the return, so the site refutes rather than
+  supports a deviation;
+* ``propagated`` — ``return f()`` / ``yield f()``: the caller inherits
+  the obligation.
+
+The per-callee aggregate is a first-class artifact
+(:class:`CalleeCensus` → ``return-census.json``), consumed by the
+``consistency`` verification channel, ``spec_inference`` (one majority
+computation in the tree) and the flag/mode comparator.
+
+Intellectual ancestor: Engler et al., "Bugs as Deviant Behavior: A
+General Approach to Inferring Errors in Systems Code" (SOSP 2001,
+doi:10.1145/502034.502041).
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from bisect import bisect_left
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
+from typing import Any
+
+from .prompt_defence import sanitise_for_prompt
+from typing import TYPE_CHECKING
+from core.source.lines import iter_source_lines, split_lines
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from tree_sitter import Node
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tree-sitter availability
+# ---------------------------------------------------------------------------
+
+try:
+    from .condition_extraction import _get_parser
+    from .ts_extract import (
+        _CALL_TYPES,
+        _FUNCTION_TYPES,
+        _find_enclosing_function,
+        _get_func_name,
+        _node_line,
+        _node_text,
+        _walk_descendants,
+    )
+    _TS_AVAILABLE = True
+except ImportError:
+    _TS_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+# Lead-path floors (registered in core.audit.consistency_stats —
+# the enumerable floors table references these constants; per-run
+# overrides never reach this legacy deviation-lead path).
+# Trade-off, both directions: LOWER min sites / threshold surfaces
+# deviants from tiny families whose "majority" is two or three
+# accidental agreements (lead noise the 40-lead cap then spends on);
+# HIGHER hides real deviants in mid-size families — a 3-site family
+# with 2 checks is exactly the smallest census Engler-style inference
+# can speak about, and 0.75 keeps a single dissenting site from
+# dissolving a 3/4 convention.
+MIN_CALL_SITES = 3
+MAJORITY_THRESHOLD = 0.75
+
+# Usage enum (§2.1). Plain strings so the census JSON stays greppable.
+USAGE_TESTED = "tested"
+USAGE_CAPTURED_USED = "captured_used"
+USAGE_CAPTURED_UNUSED = "captured_unused"
+USAGE_DISCARDED = "discarded"
+USAGE_ACKNOWLEDGED = "acknowledged"
+USAGE_PROPAGATED = "propagated"
+
+ALL_USAGES = (
+    USAGE_TESTED,
+    USAGE_CAPTURED_USED,
+    USAGE_CAPTURED_UNUSED,
+    USAGE_DISCARDED,
+    USAGE_ACKNOWLEDGED,
+    USAGE_PROPAGATED,
+)
+
+# Deviant-eligible classes: the return demonstrably went unobserved.
+DEVIANT_USAGES = frozenset({USAGE_DISCARDED, USAGE_CAPTURED_UNUSED})
+
+# Contract-source "majority" thresholds (§2.2.5 — the exact
+# spec_inference._infer_from_caller_usage floor). Registered in
+# core.audit.consistency_stats; a run-config override reaches them
+# through the per-census fields below.
+# Trade-off, both directions: LOWER lets small/weak majorities mint
+# contract-grade premises (majority_says_check) AND definitive
+# discard-ok refutations (majority_says_discard_ok) — the refutation
+# direction is suppression-adjacent, a stuffed discard-majority
+# clears real deviants; HIGHER withholds the discard-ok refutation
+# from honest printf-class callees, flooding leads with noise the
+# convention already answers.
+MAJORITY_CONTRACT_MIN_SITES = 4
+MAJORITY_CONTRACT_RATIO = 0.8
+
+_SECURITY_CALLEE_RE = re.compile(
+    r"\b(?:valid|verif|check|auth|saniti|pars|escap|encod|decod|"
+    r"connect|open|clos|lock|unlock|init|clean|free|dealloc|"
+    r"login|permit|sign|hash|crypt|token|certif|handshake|"
+    r"resolv|bind|listen|accept|recv|send|write|read|exec|eval|"
+    r"compil|load|fetch|query|prepar|marshal|unmarshal|deseriali)",
+    re.IGNORECASE,
+)
+
+# String tokens plus the block-comment OPENER only: the closer is
+# located with str.find below. The previous single-regex spelling
+# (`/\*.*?\*/` in the alternation) re-scanned the rest of the file
+# from every ``/*`` that never closes — quadratic on hostile source.
+# The string openers are pinned to UNESCAPED delimiters ((?<!\\)):
+# an unterminated literal whose interior repeats escaped delimiters
+# (`"` + `\"`*n) otherwise makes every embedded delimiter a fresh
+# match attempt that re-scans to end-of-file — quadratic on hostile
+# source (measured exp 2.0; pinned, exp 1.0). Both directions: on a
+# well-formed token stream no string opens at an escaped delimiter,
+# so matches are unchanged (repo-corpus differential: divergences
+# only where the old scan opened a string at a `\"`/`\'` pair, a
+# tokenization no real lexer produces); dropping the pin re-opens
+# the quadratic.
+_STRING_OR_COMMENT_OPEN_RE = re.compile(
+    r'(?<!\\)"(?:[^"\\]|\\.)*"'
+    r"|(?<!\\)'(?:[^'\\]|\\.)*'"
+    r"|/\*",
+    re.DOTALL,  # an escape may consume a newline (line continuation)
+)
+
+
+def _strip_block_comments(source: str) -> str:
+    """Remove ``/* ... */`` comments; string literals are matched so
+    a comment-lookalike inside one is kept verbatim.
+
+    Single left-to-right token scan: each character is visited once,
+    a ``/*`` looks up its closer with ``str.find``, and once one
+    opener has no closer no later opener can have one either, so the
+    failed end-of-file lookup happens at most once.
+    """
+    out: list[str] = []
+    pos = 0
+    no_closer = False
+    while True:
+        m = _STRING_OR_COMMENT_OPEN_RE.search(source, pos)
+        if m is None:
+            out.append(source[pos:])
+            return "".join(out)
+        out.append(source[pos : m.start()])
+        token = m.group()
+        if token != "/*":
+            out.append(token)  # string literal: kept verbatim
+            pos = m.end()
+            continue
+        end = -1 if no_closer else source.find("*/", m.end())
+        if end == -1:
+            # Never closes: not a comment. Keep the chars and keep
+            # scanning after the opener (no token starts at '*').
+            no_closer = True
+            out.append(token)
+            pos = m.end()
+        else:
+            pos = end + 2  # drop the comment
+
+
+_KEYWORDS = frozenset({
+    "if", "else", "elif", "while", "for", "switch", "case", "catch",
+    "return", "yield", "raise", "throw", "new", "delete", "sizeof",
+    "typeof", "instanceof", "assert", "print", "println",
+    "import", "from", "class", "struct", "enum", "interface",
+    "try", "except", "finally", "with", "as", "in", "range",
+    "func", "function", "def", "fn", "pub", "private", "protected",
+    "var", "let", "const", "auto", "static", "extern", "volatile",
+    "int", "char", "void", "bool", "float", "double", "long",
+    "string", "byte", "uint", "int32", "int64", "uint32", "uint64",
+    "package", "type", "go", "defer", "select",
+    "not", "and", "or", "is", "None", "True", "False",
+    "null", "nil", "undefined", "true", "false",
+})
+
+
+@dataclass
+class CallSite:
+    """A single call site in the codebase."""
+
+    file: str
+    line: int
+    callee: str
+    enclosing_function: str
+    discarded: bool = False
+    #: Six-value usage classification (§2.1). When constructed with the
+    #: legacy boolean only, the usage is derived coarsely; when
+    #: constructed with a usage, ``discarded`` is derived (True for the
+    #: deviant-eligible classes) so the legacy majority statistics stay
+    #: consistent with the enum.
+    usage: str = ""
+    #: The site sits inside an error handler / error-return branch —
+    #: acting on the value there may be impossible (§2.3
+    #: ``deviant-on-error-path``).
+    on_error_path: bool = False
+    #: Which extractor produced this row: "ts" (tree-sitter, in-file),
+    #: "regex" (fallback, in-file) or "cpg" (Joern, cross-file). Provenance for the mixed majority
+    #: statistic, plus the deviation pass's safety rule: a deviation
+    #: verdict must not rest on a usage class the extracting engine
+    #: cannot produce.
+    engine: str = "ts"
+
+    def __post_init__(self) -> None:
+        if not self.usage:
+            self.usage = (
+                USAGE_DISCARDED if self.discarded else USAGE_CAPTURED_USED
+            )
+        else:
+            self.discarded = self.usage in DEVIANT_USAGES
+
+    @property
+    def is_deviant_eligible(self) -> bool:
+        return self.usage in DEVIANT_USAGES
+
+    def to_dict(self) -> dict:
+        return {
+            "file": self.file,
+            "line": self.line,
+            "enclosing_function": self.enclosing_function,
+            "usage": self.usage,
+            "on_error_path": self.on_error_path,
+            "engine": self.engine,
+        }
+
+
+@dataclass
+class CallSiteDeviation:
+    """A call site that deviates from the majority pattern."""
+
+    callee: str
+    file: str
+    line: int
+    enclosing_function: str
+    total_sites: int
+    captured_count: int
+    discarded_count: int
+    security_relevant: bool = False
+    usage: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.security_relevant:
+            self.security_relevant = bool(_SECURITY_CALLEE_RE.search(self.callee))
+
+    @property
+    def confidence(self) -> float:
+        majority = max(self.captured_count, self.discarded_count)
+        return majority / self.total_sites if self.total_sites else 0.0
+
+    def to_dict(self) -> dict:
+        d = {
+            "callee": self.callee,
+            "file": self.file,
+            "line": self.line,
+            "enclosing_function": self.enclosing_function,
+            "total_sites": self.total_sites,
+            "captured_count": self.captured_count,
+            "discarded_count": self.discarded_count,
+            "confidence": round(self.confidence, 2),
+            "security_relevant": self.security_relevant,
+        }
+        if self.usage:
+            d["usage"] = self.usage
+        return d
+
+
+@dataclass
+class CalleeCensus:
+    """Per-callee return-usage aggregate — the ``return-census.json``
+    row (§2.1). ``contract`` is filled by the failure-semantics binder
+    (:mod:`core.audit.return_contracts`); the census itself is pure
+    AST arithmetic."""
+
+    callee: str
+    sites: list[CallSite] = field(default_factory=list)
+    security_relevant: bool = False
+    contract: dict[str, Any] | None = None
+    # True when the census build hit its site cap / deadline: the
+    # majority statistics are computed over PARTIAL data and must not
+    # mint definitive verdicts (census_verdict gates on this).
+    truncated: bool = False
+    #: Effective contract-majority floors for THIS census. Default to
+    #: the module constants (identical behaviour); the prepass stamps
+    #: run-config overrides here so majority_says_check /
+    #: majority_says_discard_ok and every consumer taking a census
+    #: entry (return-contract binding included) read one value.
+    #: Deliberately not serialised: floors are per-run, and a
+    #: cache-reloaded census is re-stamped by the run that loads it.
+    contract_min_sites: int = MAJORITY_CONTRACT_MIN_SITES
+    contract_ratio: float = MAJORITY_CONTRACT_RATIO
+
+    def __post_init__(self) -> None:
+        if not self.security_relevant:
+            self.security_relevant = bool(
+                _SECURITY_CALLEE_RE.search(self.callee),
+            )
+
+    @property
+    def n(self) -> int:
+        return len(self.sites)
+
+    def count(self, usage: str) -> int:
+        return sum(1 for s in self.sites if s.usage == usage)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        c = dict.fromkeys(ALL_USAGES, 0)
+        for s in self.sites:
+            c[s.usage] = c.get(s.usage, 0) + 1
+        return c
+
+    @property
+    def considered(self) -> int:
+        """Sites participating in the check-majority statistic.
+
+        ``acknowledged`` refutes rather than votes (§2.3) and
+        ``propagated`` transfers the obligation (§2.1), so neither
+        side of the ratio counts them.
+        """
+        return self.n - self.count(USAGE_ACKNOWLEDGED) - self.count(
+            USAGE_PROPAGATED,
+        )
+
+    @property
+    def check_ratio(self) -> float:
+        considered = self.considered
+        if considered <= 0:
+            return 0.0
+        return self.count(USAGE_TESTED) / considered
+
+    @property
+    def discard_ratio(self) -> float:
+        considered = self.considered
+        if considered <= 0:
+            return 0.0
+        deviant = sum(1 for s in self.sites if s.usage in DEVIANT_USAGES)
+        return deviant / considered
+
+    @property
+    def deviants(self) -> list[CallSite]:
+        return [s for s in self.sites if s.usage in DEVIANT_USAGES]
+
+    @property
+    def acknowledged_sites(self) -> list[CallSite]:
+        return [s for s in self.sites if s.usage == USAGE_ACKNOWLEDGED]
+
+    @property
+    def conforming(self) -> list[CallSite]:
+        """The checking exhibits (majority-leg witnesses)."""
+        return [s for s in self.sites if s.usage == USAGE_TESTED]
+
+    @property
+    def majority_says_check(self) -> bool:
+        """§2.2.5 majority evidence: the project's own convention."""
+        return (
+            self.considered >= self.contract_min_sites
+            and self.check_ratio >= self.contract_ratio
+        )
+
+    @property
+    def majority_says_discard_ok(self) -> bool:
+        """Symmetric inference (§2.2.5): majority-discards ⇒
+        discard-ok — printf-class noise suppressed without any
+        hardcoded ignore list."""
+        return (
+            self.considered >= self.contract_min_sites
+            and self.discard_ratio >= self.contract_ratio
+        )
+
+    @property
+    def all_python(self) -> bool:
+        return bool(self.sites) and all(
+            s.file.endswith(".py") for s in self.sites
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "callee": self.callee,
+            "sites": self.n,
+            "counts": self.counts,
+            "check_ratio": round(self.check_ratio, 3),
+            "security_relevant": self.security_relevant,
+            "deviants": [s.to_dict() for s in self.deviants],
+        }
+        if self.contract is not None:
+            d["contract"] = self.contract
+        if self.truncated:
+            d["truncated"] = True
+        return d
+
+    def to_full_dict(self) -> dict[str, Any]:
+        """Lossless form for the prep cache — unlike :meth:`to_dict`
+        (the operator-facing ``return-census.json`` row, which keeps
+        only counts and deviant sites), this serialises EVERY site so
+        a resumed segment can reload the census instead of re-walking
+        the tree."""
+        d: dict[str, Any] = {
+            "callee": self.callee,
+            "security_relevant": self.security_relevant,
+            "truncated": self.truncated,
+            "sites": [
+                {
+                    "file": st.file,
+                    "line": st.line,
+                    "callee": st.callee,
+                    "enclosing_function": st.enclosing_function,
+                    "discarded": st.discarded,
+                    "usage": st.usage,
+                    "on_error_path": st.on_error_path,
+                    "engine": st.engine,
+                }
+                for st in self.sites
+            ],
+        }
+        if self.contract is not None:
+            d["contract"] = self.contract
+        return d
+
+    @classmethod
+    def from_full_dict(cls, d: dict[str, Any]) -> "CalleeCensus":
+        sites = [
+            CallSite(
+                file=sd.get("file", ""),
+                line=int(sd.get("line", 0)),
+                callee=sd.get("callee", d.get("callee", "")),
+                enclosing_function=sd.get("enclosing_function", ""),
+                discarded=bool(sd.get("discarded", False)),
+                usage=sd.get("usage", ""),
+                on_error_path=bool(sd.get("on_error_path", False)),
+                engine=sd.get("engine", ""),
+            )
+            for sd in d.get("sites", [])
+            if isinstance(sd, dict)
+        ]
+        return cls(
+            callee=d.get("callee", ""),
+            sites=sites,
+            security_relevant=bool(d.get("security_relevant", False)),
+            contract=d.get("contract"),
+            truncated=bool(d.get("truncated", False)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared parse cache
+# ---------------------------------------------------------------------------
+# The census, the flag/mode comparator and the cleanup comparator all
+# walk the same trees; one parse per (file, content) is kept in a small
+# LRU so the prep-phase passes stop re-parsing the same sources.
+
+_PARSE_CACHE_MAX = 256
+_parse_cache: OrderedDict[
+    tuple[str, str], tuple[tuple[str, str], tuple[Any, str | None]],
+] = OrderedDict()
+
+
+def parse_source_cached(file_path: str, source: str):
+    """Parse *source* with tree-sitter, returning ``(tree, lang)``.
+
+    Returns ``(None, None)`` when tree-sitter (or the grammar for the
+    file's language) is unavailable. Language detection goes strictly
+    through ``core.inventory.languages`` (the dedup wave-3 rule — no
+    per-module extension lists).
+    """
+    if not _TS_AVAILABLE:
+        return None, None
+    # Native string keys resolve hash collisions by content equality and
+    # retain references, not copies. Adapters can customise equality, hashing
+    # or encoding; parse them afresh instead of treating their hash as identity.
+    key = (file_path, source) if type(file_path) is str and type(source) is str else None
+    if key is not None:
+        cached = _parse_cache.get(key)
+        if cached is not None:
+            cached_key, result = cached
+            if cached_key[1] is source:
+                _parse_cache.move_to_end(cached_key)
+            else:
+                # Adopt the latest equal input: repeated hits on that object
+                # then use string identity rather than rescan its content.
+                del _parse_cache[cached_key]
+                _parse_cache[key] = (key, result)
+            return result
+    from core.inventory.languages import detect_language
+    lang = detect_language(file_path)
+    parser = _get_parser(lang) if lang else None
+    if not lang or not parser:
+        result = (None, None)
+    else:
+        src_bytes = source.encode("utf-8", errors="replace")
+        # parse_origin: a budget-abandoned parse must name this
+        # file on the run's analysis-gap trail.
+        from core.run.gaps import parse_origin
+        with parse_origin(file_path):
+            result = (parser.parse(src_bytes), lang)  # type: ignore[assignment]
+    if key is not None:
+        if len(_parse_cache) >= _PARSE_CACHE_MAX:
+            _parse_cache.popitem(last=False)
+        _parse_cache[key] = (key, result)
+    return result
+
+
+def clear_parse_cache() -> None:
+    """Drop cached trees (tests / long-lived processes)."""
+    _parse_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Tree-sitter extraction
+# ---------------------------------------------------------------------------
+
+def _callee_name_ts(call_node: Node, _lang: str, src: bytes) -> str | None:
+    """Extract the function/method name from a call node."""
+    func = call_node.child_by_field_name("function")
+    if func is None:
+        func = call_node.child_by_field_name("name")
+    if func is None:
+        if call_node.children:
+            func = call_node.children[0]
+        else:
+            return None
+
+    if func.type in ("identifier", "name"):
+        return _node_text(func, src)
+
+    if func.type in ("member_expression", "attribute",
+                      "field_expression", "selector_expression"):
+        for child in reversed(func.children):
+            if child.type in ("identifier", "property_identifier",
+                              "field_identifier"):
+                return _node_text(child, src)
+
+    if func.type == "scoped_identifier":
+        name_node = func.child_by_field_name("name")
+        if name_node:
+            return _node_text(name_node, src)
+
+    text = _node_text(func, src)
+    if "." in text:
+        return text.rsplit(".", 1)[-1]
+    return text
+
+
+# Go assignment forms whose left-hand side can be the blank
+# identifier.  `_ = f()` (and `_, _ = g()`) is an explicit discard of
+# the return value — the classic CWE-252 shape — yet structurally it
+# is an assignment, so a naive parent-walk would classify it captured.
+_GO_ASSIGN_TYPES = ("assignment_statement", "short_var_declaration")
+
+# Wrapper nodes the classification walk passes through transparently.
+_TRANSPARENT_TYPES = (
+    "expression_list", "parenthesized_expression", "await_expression",
+    "argument", "try_expression",
+)
+
+# Capture parents: (node type → LHS field name) per shape. The name
+# field of a declarator carries the binding; assignment LHS carries
+# the target expression.
+_ASSIGN_LHS_FIELDS = {
+    "assignment_expression": "left",
+    "assignment": "left",
+    "assignment_statement": "left",
+    "short_var_declaration": "left",
+    "augmented_assignment": "left",
+    "init_declarator": "declarator",
+    "variable_declarator": "name",
+    "let_declaration": "pattern",
+}
+
+_RETURN_TYPES = (
+    "return_statement", "return_expression", "yield", "yield_expression",
+    "yield_statement", "throw_statement",
+)
+
+_COMPARISON_OPS = frozenset({
+    "==", "!=", "<", ">", "<=", ">=", "===", "!==", "<=>",
+})
+
+# Condition-bearing constructs: node type → the field whose subtree
+# consumes the value as a truth test.
+_CONDITION_FIELDS = {
+    "if_statement": "condition",
+    "while_statement": "condition",
+    "do_statement": "condition",
+    "conditional_expression": "condition",
+    "ternary_expression": "condition",
+    "switch_statement": "condition",
+    "expression_switch_statement": "value",
+    "match_statement": "subject",
+    "match_expression": "value",
+    "if_expression": "condition",
+    "while_expression": "condition",
+    "elif_clause": "condition",
+    "guard_statement": "condition",
+    "for_statement": "condition",
+}
+
+_ASSERT_TYPES = ("assert_statement", "assert_expression")
+
+if _TS_AVAILABLE:
+    _ALL_FUNCTION_TYPES = frozenset(
+        t for types in _FUNCTION_TYPES.values() for t in types
+    )
+else:
+    _ALL_FUNCTION_TYPES = frozenset()
+
+# Error-handler node types per language (deviant-on-error-path).
+_ERROR_HANDLER_NODE_TYPES = frozenset({
+    "except_clause", "catch_clause", "catch_block", "rescue",
+    "catch_formal_parameter", "finally_clause",
+})
+
+
+def _contains(ancestor: Node, node: Node) -> bool:
+    return (
+        ancestor.start_byte <= node.start_byte
+        and node.end_byte <= ancestor.end_byte
+    )
+
+
+def _is_blank_discard_assignment(assign_node: Node, src: bytes) -> bool:
+    """True when every LHS identifier is the Go blank identifier ``_``.
+
+    ``v, _ := f()`` partially captures and stays captured; only an
+    all-blank LHS (``_ = f()``, ``_, _ = g()``) is a discard.
+    """
+    left = assign_node.child_by_field_name("left")
+    if left is None or left.type != "expression_list":
+        return False
+    idents = [c for c in left.children if c.is_named]
+    if not idents:
+        return False
+    return all(
+        c.type == "identifier" and _node_text(c, src) == "_"
+        for c in idents
+    )
+
+
+def _lhs_identifiers(lhs_node, src: bytes) -> list[str]:
+    """Bound identifier names on an assignment/declarator LHS."""
+    if lhs_node is None:
+        return []
+    if lhs_node.type in ("identifier", "name", "field_identifier"):
+        return [_node_text(lhs_node, src)]
+    names: list[str] = [_node_text(n, src) for n in _walk_descendants(lhs_node) if n.type in ("identifier", "name", "field_identifier")]
+    return names
+
+
+def _condition_consumes(parent: Node, node) -> bool:
+    """True when *parent* is a condition-bearing construct whose
+    condition field contains *node* (the call feeds a truth test)."""
+    field_name = _CONDITION_FIELDS.get(parent.type)
+    if field_name is None:
+        return parent.type in _ASSERT_TYPES
+    cond = parent.child_by_field_name(field_name)
+    return cond is not None and _contains(cond, node)
+
+
+def _is_write_target(id_node) -> bool:
+    """Is this identifier the target of an assignment / declaration
+    (a write, not a read)?"""
+    node = id_node
+    while node.parent is not None:
+        parent = node.parent
+        lhs_field = _ASSIGN_LHS_FIELDS.get(parent.type)
+        if lhs_field is not None:
+            lhs = parent.child_by_field_name(lhs_field)
+            return lhs is not None and _contains(lhs, id_node)
+        if parent.type in _TRANSPARENT_TYPES or parent.type in (
+                "tuple", "pattern_list", "tuple_pattern"):
+            node = parent
+            continue
+        return False
+    return False
+
+
+_ID_NODE_TYPES = ("identifier", "name", "field_identifier")
+
+# Shared empty row list for index misses (callers never mutate rows).
+_NO_OCCURRENCES: list[tuple[int, bool, bool]] = []
+
+
+class _ScopeReadIndex:
+    """Document-ordered identifier occurrences, classified only on demand.
+
+    Index names once per file, then compute immutable usage facts only for
+    names actually queried by captured bindings. Each name is classified
+    once; unqueried identifiers need no write-target or condition walk.
+    """
+
+    __slots__ = ("_root", "_src", "_nodes_by_name", "_by_name")
+
+    def __init__(self, root: Node, src: bytes) -> None:
+        self._root = root
+        self._src = src
+        self._nodes_by_name: dict[str, list[Node]] | None = None
+        self._by_name: dict[str, list[tuple[int, bool, bool]]] = {}
+
+    def occurrences(self, name: str) -> list[tuple[int, bool, bool]]:
+        """Document-ordered ``(start_byte, is_write, is_tested)`` rows."""
+        cached = self._by_name.get(name)
+        if cached is not None:
+            return cached
+        if self._nodes_by_name is None:
+            nodes: dict[str, list[Node]] = defaultdict(list)
+            for node in _walk_descendants(self._root):
+                if node.type in _ID_NODE_TYPES:
+                    nodes[_node_text(node, self._src)].append(node)
+            self._nodes_by_name = dict(nodes)
+        pending = self._nodes_by_name.get(name, ())
+        if not pending:
+            return self._by_name.get(name, _NO_OCCURRENCES)
+        rows = []
+        for node in pending:
+            is_write = _is_write_target(node)
+            is_tested = (not is_write) and _read_is_tested(node)
+            rows.append((node.start_byte, is_write, is_tested))
+        self._by_name[name] = rows
+        # Publish facts before releasing nodes: overlapping readers may
+        # duplicate pure work, but must never observe a false empty row.
+        self._nodes_by_name.pop(name, None)
+        return rows
+
+
+def _classify_binding_usage(
+    anchor: Node, names: list[str], lang: str, src: bytes,
+    index: _ScopeReadIndex | None = None,
+) -> str:
+    """Classify a captured binding: is it later tested, read, rebound
+    without a read, or never touched (§2.1 ``captured_used`` vs
+    ``captured_unused`` vs ``tested``).
+
+    Reads come from *index* rather than a per-site descendant walk.
+    Only occurrences in ``[anchor.end_byte, scope.end_byte)`` count —
+    identifier leaves never straddle scope boundaries, so that byte
+    interval selects exactly the scope-descendant occurrences after
+    the anchor. Without an *index*, one is built eagerly over the
+    enclosing scope — costlier than the old per-call walk when called
+    per site, so callers in a loop must build ONE index per file and
+    pass it through.
+    """
+    live = {n for n in names if n and n != "_"}
+    if not live:
+        return USAGE_CAPTURED_UNUSED
+    func = _find_enclosing_function(anchor, lang)
+    scope = func if func is not None else _root_of(anchor)
+    if index is None:
+        index = _ScopeReadIndex(scope, src)
+    used = False
+    for name in live:
+        occ = index.occurrences(name)
+        i = bisect_left(occ, (anchor.end_byte,))
+        while i < len(occ):
+            start, is_write, is_tested = occ[i]
+            if start >= scope.end_byte:
+                break
+            if is_write:
+                # Rebinding ends the scan for this name (§2.1: a read
+                # must dominate the rebinding to count).
+                break
+            used = True
+            if is_tested:
+                return USAGE_TESTED
+            i += 1
+    if used:
+        return USAGE_CAPTURED_USED
+    return USAGE_CAPTURED_UNUSED
+
+
+def _root_of(node):
+    while node.parent is not None:
+        node = node.parent
+    return node
+
+
+def _read_is_tested(id_node) -> bool:
+    """Does this identifier read feed a condition / comparison?"""
+    node = id_node
+    while node.parent is not None:
+        parent = node.parent
+        if _condition_consumes(parent, id_node):
+            return True
+        if parent.type in ("binary_expression", "comparison_operator",
+                           "binary_operator", "relational_expression",
+                           "equality_expression"):
+            for child in parent.children:
+                if not child.is_named and child.type in _COMPARISON_OPS:
+                    return True
+        if parent.type in _ALL_FUNCTION_TYPES:
+            return False
+        node = parent
+    return False
+
+
+def _classify_usage_ts(
+    call_node, lang: str, src: bytes,
+    index: _ScopeReadIndex | None = None,
+) -> str:
+    """Six-value usage classification for one call site (§2.1).
+
+    This grew out of the phase-0 ``_is_discarded_ts`` seam; the walk
+    structure is the same, each step now lands in a usage class
+    instead of a boolean. *index* (one per file) makes the captured-
+    binding read scan a lookup instead of a scope walk.
+    """
+    node = call_node
+    while node.parent:
+        parent = node.parent
+        ptype = parent.type
+
+        if ptype == "expression_statement":
+            return USAGE_DISCARDED
+
+        if ptype == "cast_expression" and lang in ("c", "cpp"):
+            ty = parent.child_by_field_name("type")
+            if ty is not None and _node_text(ty, src).strip() == "void":
+                return USAGE_ACKNOWLEDGED
+            node = parent
+            continue
+
+        if ptype in _RETURN_TYPES:
+            return USAGE_PROPAGATED
+
+        if lang == "go" and ptype in _GO_ASSIGN_TYPES:
+            if _is_blank_discard_assignment(parent, src):
+                # Go blank discard: assigned-then-never-readable —
+                # deviant-eligible, unlike the acknowledged idioms
+                # (§2.1: "Go shapes live here").
+                return USAGE_CAPTURED_UNUSED
+            lhs = parent.child_by_field_name("left")
+            return _classify_binding_usage(
+                parent, _lhs_identifiers(lhs, src), lang, src, index,
+            )
+
+        if lang == "python" and ptype == "assignment":
+            lhs = parent.child_by_field_name("left")
+            names = _lhs_identifiers(lhs, src)
+            if names == ["_"]:
+                return USAGE_ACKNOWLEDGED
+            return _classify_binding_usage(parent, names, lang, src, index)
+
+        if lang == "rust" and ptype == "let_declaration":
+            pat = parent.child_by_field_name("pattern")
+            if pat is not None and _node_text(pat, src).strip() == "_":
+                return USAGE_ACKNOWLEDGED
+            return _classify_binding_usage(
+                parent, _lhs_identifiers(pat, src), lang, src, index,
+            )
+
+        lhs_field = _ASSIGN_LHS_FIELDS.get(ptype)
+        if lhs_field is not None:
+            lhs = parent.child_by_field_name(lhs_field)
+            if lhs is not None and _contains(lhs, node):
+                # The call computes the *target*, not the value.
+                node = parent
+                continue
+            return _classify_binding_usage(
+                parent, _lhs_identifiers(lhs, src), lang, src, index,
+            )
+
+        if _condition_consumes(parent, node):
+            return USAGE_TESTED
+
+        if ptype in ("binary_expression", "comparison_operator",
+                     "relational_expression", "equality_expression"):
+            for child in parent.children:
+                if not child.is_named and child.type in _COMPARISON_OPS:
+                    return USAGE_TESTED
+            node = parent
+            continue
+
+        if ptype in ("unary_expression", "not_operator"):
+            node = parent
+            continue
+
+        if ptype in ("argument_list", "arguments"):
+            # Consumed as an argument to another call.
+            return USAGE_CAPTURED_USED
+
+        if ptype in _TRANSPARENT_TYPES:
+            node = parent
+            continue
+
+        # Any other consuming context (subscript, field access, string
+        # interpolation, …): the value is observed.
+        return USAGE_CAPTURED_USED
+    return USAGE_DISCARDED
+
+
+def _is_discarded_ts(call_node, src: bytes, lang: str = "c") -> bool:
+    """Phase-0 boolean seam, kept for compatibility: True when the
+    usage classification lands in a deviant-eligible class."""
+    return _classify_usage_ts(call_node, lang, src) in DEVIANT_USAGES
+
+
+def _on_error_path_ts(call_node, lang: str, src: bytes) -> bool:
+    """Is the call inside an error handler / Go `if err != nil` arm?"""
+    node = call_node.parent
+    while node is not None:
+        if node.type in _ERROR_HANDLER_NODE_TYPES:
+            return True
+        if lang == "go" and node.type == "if_statement":
+            cond = node.child_by_field_name("condition")
+            if cond is not None:
+                text = _node_text(cond, src)
+                if "err" in text and "!=" in text and "nil" in text:
+                    return True
+        node = node.parent
+    return False
+
+
+def _parse_file(source: str, file_path: str):
+    """Parse source with tree-sitter, return (tree, lang) or (None, None)."""
+    return parse_source_cached(file_path, source)
+
+
+# Self-limits for the census build: the census runs BEFORE the
+# prepass budget's first check, so it must bound itself. Usage
+# classification is index-backed (one identifier walk per file, then
+# bisect lookups per site — see _ScopeReadIndex), so per-file cost is
+# O(file) and the wall-clock deadline is the primary DoS backstop; the
+# site cap is a secondary bound on census size. On cap/deadline the
+# build STOPS and every produced entry is stamped ``truncated``
+# (partial majority statistics may hint, never mint definitive
+# verdicts).
+_CENSUS_BUDGET_S = 30.0
+# Derived-budget parameters (budget_s=None): the fixed 30s default
+# covered ~18% of a kernel-scale scope (measured 28.2 ms/file on
+# linux-7.2 mm/fs/kernel slices -> ~166 s for the 5,903-file scoped
+# census; every segment logged 'census deadline exceeded'). The
+# derivation allows 50 ms/file (~1.8x measured headroom), floored at
+# the old default and ceilinged hard. Both directions: LOWER ceiling
+# re-creates kernel-scale truncation (partial majority statistics);
+# HIGHER lets a pathological/hostile tree hold the prep phase — the
+# ceiling is the DoS backstop the fixed default used to be. At the
+# ceiling the census still stamps ``truncated`` and verdicts stay
+# hint-tier, exactly as before.
+#: Sentinel default: budget derives from the census size. Explicit
+#: floats (and explicit None = unlimited) are honoured verbatim.
+_DERIVE_BUDGET = object()
+
+_CENSUS_PER_FILE_S = 0.05
+_CENSUS_BUDGET_CEILING_S = 600.0
+
+
+def _derive_census_budget_s(n_files: int) -> float:
+    return min(
+        max(_CENSUS_BUDGET_S, _CENSUS_PER_FILE_S * n_files),
+        _CENSUS_BUDGET_CEILING_S,
+    )
+# Trade-off, both directions: HIGHER admits honest large first-party
+# modules whole (a 24k-line module with >2000 sites used to truncate,
+# degrading cross-file majority statistics to partial data); LOWER
+# tightens the per-file work and index memory a hostile file can
+# demand before the deadline notices. 20000 gives ~10x headroom over
+# the observed honest-module shape while the deadline above remains
+# the hard stop for pathological inputs.
+_CENSUS_MAX_SITES_PER_FILE = 20000
+
+
+class _CensusLimiter:
+    """Site cap + wall-clock deadline for one census build."""
+
+    def __init__(self, deadline: float | None,
+                 max_sites_per_file: int) -> None:
+        self.deadline = deadline
+        self.max_sites_per_file = max_sites_per_file
+        self.hit: str = ""
+
+    def file_exhausted(self, sites_in_file: int) -> bool:
+        if sites_in_file >= self.max_sites_per_file:
+            self.hit = (
+                f"site cap ({self.max_sites_per_file}/file) reached"
+            )
+            return True
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            self.hit = "census deadline exceeded"
+            return True
+        return False
+
+
+def _extract_callsites_ts(
+    file_path: str, source: str,
+    limiter: _CensusLimiter | None = None,
+) -> list[CallSite] | None:
+    """Extract call sites via tree-sitter. Returns None if unavailable."""
+    tree, lang = _parse_file(source, file_path)
+    if tree is None or lang is None:
+        return None
+
+    call_types = _CALL_TYPES.get(lang, ())
+    if not call_types:
+        return None
+
+    src = source.encode("utf-8", errors="replace")
+    sites: list[CallSite] = []
+    # One lazily-built identifier index shared by every site in the
+    # file — the captured-binding read scan is a lookup, not a walk.
+    read_index = _ScopeReadIndex(tree.root_node, src)
+
+    for node in _walk_descendants(tree.root_node):
+        if node.type not in call_types:
+            continue
+
+        callee = _callee_name_ts(node, lang, src)
+        if not callee or callee in _KEYWORDS:
+            continue
+        if len(callee) < 2:
+            continue
+
+        if limiter is not None and limiter.file_exhausted(len(sites)):
+            logger.warning(
+                "callsite_consistency: census truncated in %s (%s)",
+                file_path, limiter.hit,
+            )
+            break
+
+        enclosing = _find_enclosing_function(node, lang)
+        func_name = _get_func_name(enclosing, lang, src) if enclosing else "<module>"
+
+        sites.append(CallSite(
+            file=file_path,
+            line=_node_line(node),
+            callee=callee,
+            enclosing_function=func_name,
+            usage=_classify_usage_ts(node, lang, src, read_index),
+            on_error_path=_on_error_path_ts(node, lang, src),
+        ))
+
+    return sites
+
+
+# ---------------------------------------------------------------------------
+# Regex fallback — keeps the coarse classes (§2.1: "regex fallback
+# keeps today's coarse classes"; no read-scan without a tree).
+# ---------------------------------------------------------------------------
+
+# The modifier branch pins its whitespace run with (?=\S) — the run
+# must end where the non-whitespace tail begins (same language: the
+# lazy tail absorbed any remainder) — and \b pins the name group to
+# a word start. The naive ``\s+.*?(\w+)`` let the run split against
+# the lazy tail and the tail split against the name — quadratic even
+# at the anchored match call.
+_FUNC_HEADER_RE = re.compile(
+    r"\s*(?:"
+    r"(?:def|func|function|fn)\s+"
+    r"(?:\([^)]*\)\s+)?"
+    r"(\w+)"
+    r"|(?:public|private|protected|static|async|export|default)\s+"
+    r"(?=\S).*?\b(\w+)\s*\("
+    r")",
+)
+
+# \b keeps the unanchored scan from restarting inside an identifier
+# run (quadratic); earliest-start matches and captures unchanged.
+# The dotted chain is bounded: a ".a"-unit storm makes every
+# component start re-walk the run when no call paren follows —
+# quadratic in the line.  Real call chains sit far inside 32
+# links (beyond it, the match binds the last 32 components).
+_CALL_IN_LINE_RE = re.compile(
+    r"\b(\w+(?:\.\w+){0,32})\s*\(",
+)
+
+# C/C++-style function definition or prototype: type token(s), then
+# the function name, then a parameter list, ending in `{` (definition),
+# `;` (prototype/declaration) or nothing (K&R brace-on-next-line).
+# Without this the fallback census counted every same-repo prototype
+# (`int do_auth(void);` in a header) as a DISCARDED call site — a
+# phantom deviant per declaration — and never tracked the enclosing
+# function for C (every site attributed to ``<module>``). Keyword
+# lookahead keeps control-flow lines (`if (f() != 0)`) and
+# `return f();` on the call-site path.
+_C_FUNC_HEADER_RE = re.compile(
+    r"^\s*"
+    r"(?:__attribute__\s*\(\([^()]*(?:\([^()]*\)[^()]*)*\)\)\s*)*"
+    r"(?!(?:if|else|while|for|switch|do|case|goto|return|yield|"
+    r"sizeof|new|delete|throw|await)\b)"
+    r"(?:[A-Za-z_]\w*[ \t*&]+)+"
+    r"(?:__attribute__\s*\(\([^()]*(?:\([^()]*\)[^()]*)*\)\)\s*)*"
+    r"(?P<name>[A-Za-z_]\w*)\s*"
+    r"\([^;{}()]*\)\s*"
+    r"(?P<tail>[{;])?\s*$",
+)
+
+_ASSIGN_LINE_RE = re.compile(
+    r"^\s*(?:(?:const|let|var|auto|int|char|void|bool|string|float|double|"
+    r"long|unsigned|size_t|ssize_t|[\w:*&]+)\s+)?"
+    r"\w+\s*(?::=|=[^=])"
+)
+
+_RETURN_LINE_RE = re.compile(r"^\s*(?:return|yield)\s+")
+
+_COND_LINE_RE = re.compile(
+    r"^\s*(?:if|while|elif|else\s+if|assert)\s*[\s(]"
+)
+
+_STMT_ONLY_LINE_RE = re.compile(
+    r"^\s*(\w+(?:\.\w+)*)\s*\(",
+)
+
+# Go blank-identifier assignment: `_ = f()`, `_, _ = g()`.  An
+# explicit discard, not a capture — mirrors _is_blank_discard_assignment
+# on the tree-sitter path.  Anchored to an all-blank LHS so `v, _ = f()`
+# still counts as captured.
+_GO_BLANK_ASSIGN_RE = re.compile(
+    r"^\s*_\s*(?:,\s*_\s*)*=[^=]"
+)
+
+# Acknowledged-discard idioms per language (§2.1).
+_C_VOID_CAST_RE = re.compile(r"^\s*\(\s*void\s*\)")
+_RUST_LET_UNDERSCORE_RE = re.compile(r"^\s*let\s+_\s*=")
+_PY_UNDERSCORE_ASSIGN_RE = re.compile(r"^\s*_\s*=[^=]")
+# Swift wildcard assignment — covers `_ = f()` and `_ = try? f()`
+# (the `let _ =` spelling rides _RUST_LET_UNDERSCORE_RE's shape).
+# This lives ONLY in the regex table: the census has no swift entry in
+# ts_extract._CALL_TYPES, so .swift files always take this fallback —
+# an acknowledged verdict here is what lets a security-role callee's
+# census refutation hand off to the fail_open try?-erasure leg (§2.3).
+_SWIFT_UNDERSCORE_ASSIGN_RE = re.compile(r"^\s*(?:let\s+)?_\s*=[^=]")
+
+
+# Only bypass pure, built-in classifiers; replaced providers retain their calls.
+_REGEX_SPLIT_IMPL = split_lines
+_NO_CALL_CLASSIFIERS = (
+    _C_FUNC_HEADER_RE,
+    _GO_BLANK_ASSIGN_RE,
+    _C_VOID_CAST_RE,
+    _RUST_LET_UNDERSCORE_RE,
+    _PY_UNDERSCORE_ASSIGN_RE,
+    _SWIFT_UNDERSCORE_ASSIGN_RE,
+    _ASSIGN_LINE_RE,
+    _RETURN_LINE_RE,
+    _COND_LINE_RE,
+    _STMT_ONLY_LINE_RE,
+    _CALL_IN_LINE_RE,
+)
+
+
+def _extract_callsites_regex(
+    file_path: str, source: str,
+    limiter: _CensusLimiter | None = None,
+) -> list[CallSite]:
+    """Regex fallback for call site extraction.
+
+    Honours the same census limiter as the tree-sitter path — the
+    self-limits exist to stop a hostile file stalling prep, and a
+    host without the relevant grammar (where this fallback is the
+    ONLY extractor) is exactly where an unbounded walk would bite.
+    """
+    sites: list[CallSite] = []
+    lines = (
+        iter_source_lines(source)
+        if type(source) is str and split_lines is _REGEX_SPLIT_IMPL
+        else split_lines(source)
+    )
+    native_path = type(file_path) is str
+    if native_path:
+        is_go = file_path.endswith(".go")
+        is_python = file_path.endswith(".py")
+        is_swift = file_path.endswith(".swift")
+    current_func = "<module>"
+
+    for lineno_0, line in enumerate(lines):
+        lineno = lineno_0 + 1
+
+        if limiter is not None and limiter.file_exhausted(len(sites)):
+            logger.warning(
+                "callsite_consistency: census truncated in %s (%s)",
+                file_path, limiter.hit,
+            )
+            break
+
+        fm = _FUNC_HEADER_RE.match(line)
+        if fm:
+            current_func = fm.group(1) or fm.group(2) or current_func
+            continue
+
+        # The first header regex also accepts bare `def name` / `fn name`.
+        # Keep it and the limiter above this shortcut. Check providers per
+        # row because an overridden limiter or header can replace them.
+        if (
+            native_path and type(line) is str and "(" not in line
+            and _C_FUNC_HEADER_RE is _NO_CALL_CLASSIFIERS[0]
+            and _GO_BLANK_ASSIGN_RE is _NO_CALL_CLASSIFIERS[1]
+            and _C_VOID_CAST_RE is _NO_CALL_CLASSIFIERS[2]
+            and _RUST_LET_UNDERSCORE_RE is _NO_CALL_CLASSIFIERS[3]
+            and _PY_UNDERSCORE_ASSIGN_RE is _NO_CALL_CLASSIFIERS[4]
+            and _SWIFT_UNDERSCORE_ASSIGN_RE is _NO_CALL_CLASSIFIERS[5]
+            and _ASSIGN_LINE_RE is _NO_CALL_CLASSIFIERS[6]
+            and _RETURN_LINE_RE is _NO_CALL_CLASSIFIERS[7]
+            and _COND_LINE_RE is _NO_CALL_CLASSIFIERS[8]
+            and _STMT_ONLY_LINE_RE is _NO_CALL_CLASSIFIERS[9]
+            and _CALL_IN_LINE_RE is _NO_CALL_CLASSIFIERS[10]
+        ):
+            continue
+
+        cm = _C_FUNC_HEADER_RE.match(line)
+        if cm and cm.group("name") not in _KEYWORDS:
+            if cm.group("tail") != ";":
+                # Definition header: subsequent sites belong to it.
+                current_func = cm.group("name")
+            # Either way the line itself declares — the name-plus-
+            # parens here is not a call site.
+            continue
+
+        stripped = line.lstrip()
+        # Determine how this line consumes return values.
+        is_blank_discard = (
+            (is_go if native_path else file_path.endswith(".go"))
+            and bool(_GO_BLANK_ASSIGN_RE.match(stripped))
+        )
+        is_acknowledged = bool(
+            _C_VOID_CAST_RE.match(stripped)
+            or _RUST_LET_UNDERSCORE_RE.match(stripped)
+            or ((is_python if native_path else file_path.endswith(".py"))
+                and _PY_UNDERSCORE_ASSIGN_RE.match(stripped))
+            or ((is_swift if native_path else file_path.endswith(".swift"))
+                and _SWIFT_UNDERSCORE_ASSIGN_RE.match(stripped))
+        )
+        is_assign = bool(_ASSIGN_LINE_RE.match(stripped))
+        is_return = bool(_RETURN_LINE_RE.match(stripped))
+        is_cond = bool(_COND_LINE_RE.match(stripped))
+        is_stmt_only = bool(_STMT_ONLY_LINE_RE.match(line))
+
+        for m in _CALL_IN_LINE_RE.finditer(line):
+            callee_full = m.group(1)
+            callee = callee_full.rsplit(".", 1)[-1] if "." in callee_full else callee_full
+            if callee in _KEYWORDS or len(callee) < 2:
+                continue
+
+            if is_blank_discard:
+                usage = USAGE_CAPTURED_UNUSED
+            elif is_acknowledged:
+                usage = USAGE_ACKNOWLEDGED
+            elif is_cond:
+                usage = USAGE_TESTED
+            elif is_return:
+                usage = USAGE_PROPAGATED
+            elif is_assign:
+                usage = USAGE_CAPTURED_USED
+            elif is_stmt_only:
+                usage = USAGE_DISCARDED
+            else:
+                usage = USAGE_CAPTURED_USED
+
+            sites.append(CallSite(
+                file=file_path,
+                line=lineno,
+                callee=callee,
+                enclosing_function=current_func,
+                usage=usage,
+                engine="regex",
+            ))
+
+    return sites
+
+
+# ---------------------------------------------------------------------------
+# Statistical analysis
+# ---------------------------------------------------------------------------
+
+def build_return_census(
+    source_texts: dict[str, str],
+    *,
+    joern_server=None,
+    budget_s: "float | None | object" = _DERIVE_BUDGET,
+    max_sites_per_file: int = _CENSUS_MAX_SITES_PER_FILE,
+) -> dict[str, CalleeCensus]:
+    """One parse per file → per-callee usage census (§2.1).
+
+    The artifact behind ``return-census.json``; also the site index
+    the deviation detector and the flag/mode comparator share.
+
+    Self-limiting: ``budget_s`` (wall-clock, None = unlimited) and
+    ``max_sites_per_file`` bound the extraction so a hostile file
+    cannot stall prep for hours. When either trips, the
+    remaining extraction is skipped and every produced entry is
+    stamped ``truncated`` — partial statistics never read as a
+    complete census downstream.
+    """
+    all_sites: list[CallSite] = []
+    if budget_s is _DERIVE_BUDGET:
+        budget_s = _derive_census_budget_s(len(source_texts))
+    limiter = _CensusLimiter(
+        (time.monotonic() + budget_s) if budget_s is not None else None,  # type: ignore[operator]
+        max_sites_per_file,
+    )
+    truncated = False
+
+    for file_path, source in source_texts.items():
+        if limiter.deadline is not None \
+                and time.monotonic() > limiter.deadline:
+            limiter.hit = "census deadline exceeded"
+            truncated = True
+            logger.warning(
+                "callsite_consistency: census deadline hit before %s; "
+                "remaining files skipped", file_path,
+            )
+            break
+        ts_sites = _extract_callsites_ts(file_path, source, limiter)
+        if limiter.hit:
+            truncated = True
+        if ts_sites is not None:
+            all_sites.extend(ts_sites)
+        else:
+            cleaned = _strip_block_comments(source) if "/*" in source else source
+            all_sites.extend(
+                _extract_callsites_regex(file_path, cleaned, limiter),
+            )
+            if limiter.hit:
+                truncated = True
+
+    if joern_server is not None and all_sites:
+        seen_callees = frozenset({s.callee for s in all_sites})
+        seen_keys = {(s.file, s.line, s.callee) for s in all_sites}
+        try:
+            cpg_sites = _extract_callsites_cpg(joern_server, seen_callees)
+            added = 0
+            for cs in cpg_sites:
+                key = (cs.file, cs.line, cs.callee)
+                if key not in seen_keys:
+                    all_sites.append(cs)
+                    seen_keys.add(key)
+                    added += 1
+            if added:
+                logger.debug(
+                    "callsite_consistency: CPG added %d cross-file sites",
+                    added,
+                )
+        except Exception:
+            logger.debug(
+                "callsite_consistency: CPG enhancement failed",
+                exc_info=True,
+            )
+
+    by_callee: dict[str, CalleeCensus] = {}
+    grouped: dict[str, list[CallSite]] = defaultdict(list)
+    for site in all_sites:
+        grouped[site.callee].append(site)
+    for callee, sites in sorted(grouped.items()):
+        by_callee[callee] = CalleeCensus(
+            callee=callee, sites=sites, truncated=truncated,
+        )
+    return by_callee
+
+
+def census_to_dict(census: dict[str, CalleeCensus]) -> dict[str, Any]:
+    """Serializable form of the census (``return-census.json``)."""
+    return {callee: c.to_dict() for callee, c in sorted(census.items())}
+
+
+def _deviations_from_census(
+    census: dict[str, CalleeCensus],
+    min_sites: int = MIN_CALL_SITES,
+    threshold: float = MAJORITY_THRESHOLD,
+) -> list[CallSiteDeviation]:
+    """Legacy lead shape from the census. Same majority arithmetic as
+    the pre-enum detector: ``captured`` = every non-deviant class."""
+    deviations: list[CallSiteDeviation] = []
+
+    for callee, c in sorted(census.items()):
+        if c.n < min_sites:
+            continue
+
+        captured = [s for s in c.sites if not s.discarded]
+        deviant = c.deviants
+        total = c.n
+
+        if not deviant or not captured:
+            continue
+
+        captured_ratio = len(captured) / total
+        discarded_ratio = len(deviant) / total
+
+        if captured_ratio >= threshold:
+            flagged = deviant
+        elif discarded_ratio >= threshold:
+            # Reverse direction: capture-minority among a discarding
+            # majority. Kept as a (weak) lead; the census's symmetric
+            # ignorability (majority_says_discard_ok) refutes the
+            # majority-leg *verdict* for these callees.
+            flagged = [s for s in captured if s.usage != USAGE_ACKNOWLEDGED]
+        else:
+            continue
+
+        deviations.extend(CallSiteDeviation(
+                callee=callee,
+                file=site.file,
+                line=site.line,
+                enclosing_function=site.enclosing_function,
+                total_sites=total,
+                captured_count=len(captured),
+                discarded_count=len(deviant),
+                usage=site.usage,
+            ) for site in flagged)
+
+    return deviations
+
+
+def _find_deviations(
+    sites: list[CallSite],
+    min_sites: int = MIN_CALL_SITES,
+    threshold: float = MAJORITY_THRESHOLD,
+) -> list[CallSiteDeviation]:
+    """Find call sites that deviate from the majority pattern."""
+    grouped: dict[str, list[CallSite]] = defaultdict(list)
+    for site in sites:
+        grouped[site.callee].append(site)
+    census = {
+        callee: CalleeCensus(callee=callee, sites=cs)
+        for callee, cs in grouped.items()
+    }
+    return _deviations_from_census(census, min_sites, threshold)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+_CPG_CALLEE_CAP = 100
+_CPG_BATCH_SIZE = 25
+
+
+def _extract_callsites_cpg(
+    joern_server,
+    callee_names: frozenset[str],
+) -> list[CallSite]:
+    """Query Joern CPG for cross-file callsite data.
+
+    Batches callees into groups to avoid per-callee query overhead that
+    can deadlock the JVM under sustained load.  Caps at _CPG_CALLEE_CAP
+    callees (prioritised by name length as a proxy for specificity).
+
+    Usage classes are coarse on this leg (control-structure →
+    ``tested``, return → ``propagated``, non-blank assignment →
+    ``captured_used``, blank assignment / bare statement →
+    ``discarded``): the phase-0 hole where a Go ``_ = f()`` counted as
+    captured because ANY assignment ancestor did is closed by testing
+    the assignment's LHS code for the all-blank shape.
+    """
+    from .cross_function_verify import _run_query, _safe_name
+
+    safe_callees = []
+    for callee in callee_names:
+        safe = _safe_name(callee)
+        if safe is not None:
+            safe_callees.append((callee, safe))
+
+    if not safe_callees:
+        return []
+
+    safe_callees.sort(key=lambda t: -len(t[0]))
+    if len(safe_callees) > _CPG_CALLEE_CAP:
+        logger.debug(
+            "callsite_consistency: capping CPG callees %d → %d",
+            len(safe_callees), _CPG_CALLEE_CAP,
+        )
+        safe_callees = safe_callees[:_CPG_CALLEE_CAP]
+
+    sites: list[CallSite] = []
+    for batch_start in range(0, len(safe_callees), _CPG_BATCH_SIZE):
+        batch = safe_callees[batch_start:batch_start + _CPG_BATCH_SIZE]
+        names_scala = ", ".join(f'"{s}"' for _, s in batch)
+        name_to_orig = {s: orig for orig, s in batch}
+
+        query = (
+            f"val targets = List({names_scala})\n"
+            f"cpg.call.filter(c => targets.contains(c.name)).map {{ call =>\n"
+            f"  val enc = call.method.name\n"
+            f"  val fname = call.file.name.headOption.getOrElse(\"\")\n"
+            f"  val ln = call.lineNumber.getOrElse(0)\n"
+            f"  val tested = call.inAst.isControlStructure.nonEmpty\n"
+            f"  val propagated = call.inAst.isReturn.nonEmpty\n"
+            f"  val assigns = "
+            f"call.inAst.isCall.name(\"<operator>.assignment.*\").l\n"
+            f"  val blank = assigns.nonEmpty && assigns.forall(a => "
+            f"a.argument(1).code.trim.matches(\"_(\\\\s*,\\\\s*_)*\"))\n"
+            f"  val captured = assigns.nonEmpty && !blank\n"
+            # Consumed as an argument to a REAL call (f(g(x))): the
+            # value is observed — tree-sitter's leg classifies this
+            # captured_used, and without the parity this leg called
+            # it discarded (deviant), flipping majority stats by
+            # extraction engine. <operator>.* calls are excluded:
+            # assignment/arithmetic operators are calls in the CPG,
+            # and the assignment case must stay governed by the
+            # blank-LHS logic above.
+            f"  val asArg = call.inCall"
+            f".filterNot(_.name.startsWith(\"<operator>\")).nonEmpty\n"
+            f"  val usage = if (tested) \"tested\" "
+            f"else if (propagated) \"propagated\" "
+            f"else if (captured) \"captured_used\" "
+            f"else if (asArg) \"captured_used\" "
+            f"else \"discarded\"\n"
+            f"  val callee = call.name\n"
+            f"  (callee, enc, fname, ln, usage)\n"
+            f"}}.l"
+        )
+
+        raw = _run_query(joern_server, query)
+        if not raw:
+            continue
+
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) < 5:
+                continue
+            callee_name = str(item[0])
+            orig = name_to_orig.get(callee_name, callee_name)
+            usage = str(item[4])
+            if usage not in ALL_USAGES:
+                # Back-compat: an old-style boolean payload.
+                usage = (
+                    USAGE_DISCARDED if usage.lower() == "true"
+                    else USAGE_CAPTURED_USED
+                )
+            sites.append(CallSite(
+                file=str(item[2]),
+                line=int(item[3]),
+                callee=orig,
+                enclosing_function=str(item[1]),
+                usage=usage,
+                engine="cpg",
+            ))
+
+    return sites
+
+
+def detect_callsite_deviations(
+    source_texts: dict[str, str],
+    *,
+    min_sites: int = MIN_CALL_SITES,
+    threshold: float = MAJORITY_THRESHOLD,
+    extra_security_names: frozenset | None = None,
+    joern_server=None,
+    census: dict[str, CalleeCensus] | None = None,
+) -> list[CallSiteDeviation]:
+    """Detect call sites that deviate from the majority return-value handling.
+
+    *extra_security_names*: additional callee names considered
+    security-relevant (e.g. from IRIS spec store).
+
+    When *joern_server* is provided, CPG queries supplement the
+    source_texts-based extraction with cross-file callsites from the
+    entire indexed codebase.
+
+    When *census* is provided (the prep phase already built it), the
+    extraction pass is skipped entirely — one census per run.
+
+    Returns deviations sorted by (security_relevant desc, confidence desc).
+    """
+    if census is None:
+        census = build_return_census(
+            source_texts, joern_server=joern_server,
+        )
+
+    deviations = _deviations_from_census(census, min_sites, threshold)
+    extra = extra_security_names or frozenset()
+    for d in deviations:
+        if d.callee in extra:
+            d.security_relevant = True
+    deviations.sort(key=lambda d: (not d.security_relevant, -d.confidence, d.file, d.line))
+    return deviations
+
+
+def format_callsite_deviations_for_prompt(
+    deviations: Sequence[CallSiteDeviation],
+) -> str:
+    """Format deviations for injection into the LLM review prompt."""
+    if not deviations:
+        return ""
+
+    parts = ["### Return-value handling deviations\n"]
+    for d in deviations:
+        safe_callee = sanitise_for_prompt(d.callee, content_type="name")
+        safe_file = sanitise_for_prompt(d.file, content_type="path")
+        safe_enclosing = sanitise_for_prompt(d.enclosing_function, content_type="name")
+        majority = "captured" if d.captured_count > d.discarded_count else "discarded"
+        minority = "discarded" if majority == "captured" else "captured"
+        ratio = d.captured_count if majority == "captured" else d.discarded_count
+        parts.append(
+            f"- `{safe_callee}()` return value {minority} at "
+            f"{safe_file}:{d.line} (in `{safe_enclosing}`), "
+            f"but {majority} at {ratio}/{d.total_sites} other sites"
+        )
+        if minority == "discarded":
+            parts.append(
+                f"  → CHECK: Is the return value of `{safe_callee}()` "
+                f"meaningful here? If callers typically check it, this "
+                f"may be a missing error/validation check."
+            )
+    return "\n".join(parts)

@@ -1,206 +1,39 @@
-"""Path-filter computation for the test-suite workflow.
+"""CodeQL per-language path filters for the CI workflows.
 
-Replaces the third-party ``dorny/paths-filter`` action. Reads the set
-of changed files for the current event from ``$CHANGED_FILES_LIST``
-(one path per line) and writes ``<filter>=true|false`` lines to
-``$GITHUB_OUTPUT``. If ``$CHANGED_FILES_LIST`` is unset or points at a
-missing file, every filter is forced to ``true`` (safe fallback for
-events without a meaningful diff base).
+Reads the set of changed files for the current event from
+``$CHANGED_FILES_LIST`` (one path per line) and writes
+``<filter>=true|false`` lines to ``$GITHUB_OUTPUT``.  If
+``$CHANGED_FILES_LIST`` is unset or points at a missing file, every
+filter is forced to ``true`` (safe fallback for events without a
+meaningful diff base).
 
-The ``FILTERS`` dict is the single source of truth for what each
-subsystem-scoped CI job depends on. ``.github/tests/test_filter_coverage.py``
-imports it directly to verify that every ``core.*`` / ``packages.*``
-import made by a subsystem's source is covered by the corresponding
-filter's globs.
+Subsystem-level test dispatch (sandbox, sca, llm_analysis, etc.) is
+handled by ``test_scope.py`` via import-graph analysis.  This file
+retains only the CodeQL per-language gates (codeql_python, codeql_cpp,
+codeql_actions) used by ``codeql.yml``. Python source triggers honour the
+scanner config's exclusions; unfamiliar config shapes retain broad matching.
+Dependency and workflow metadata keep their original triggers.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
+import re
 import sys
 from pathlib import Path
 
 
 FILTERS: dict[str, list[str]] = {
-    "python": [
-        "core/**",
-        "packages/**",
-        ".github/tests/**",
-        "test/**",
-        "*.py",
-        "requirements*.txt",
-        "pyproject.toml",
-        ".github/workflows/tests.yml",
-    ],
-    # Direct + transitive deps for sandbox (validated by
-    # .github/tests/test_filter_coverage.py).
-    "sandbox": [
-        "core/sandbox/**",
-        "core/security/**",
-        "core/config/**",
-        "core/run/**",
-        "libexec/raptor-run-sandboxed",
-        "libexec/raptor-pid1-shim",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    # Direct + transitive deps for exploit_feasibility. Note: pre-#447
-    # `core/config.py`, `core/logging.py`, `core/progress.py`,
-    # `core/schema_constants.py` were bare .py files; #447 promoted
-    # each to a package directory. The bare-form globs have been
-    # dropped from every filter below — restore them only if those
-    # files are re-added (current main has package directories only).
-    "exploit_feasibility": [
-        "packages/exploit_feasibility/**",
-        "packages/binary_analysis/**",
-        "packages/codeql/smt_path_validator.py",
-        "core/function_taxonomy/**",
-        "core/hash/**",
-        "core/json/**",
-        "core/logging/**",
-        "core/config/**",
-        "core/orchestration/**",
-        "core/sandbox/**",
-        "core/smt_solver/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    # CI lint / filter-coverage tests. Gated narrowly so a code-only PR
-    # doesn't pay for them. Includes the prompt-envelope audit source
-    # because the prompt_audit filter-coverage test imports it.
-    "ci_lint": [
-        ".github/scripts/**",
-        ".github/tests/**",
-        ".github/workflows/tests.yml",
-        "core/security/prompt_envelope_audit.py",
-    ],
-    # Heavy subsystem tests carved out from the broad ``python`` fast
-    # tier. Each subsystem's globs are validated by
-    # ``.github/tests/test_filter_coverage.py`` against the actual
-    # imports in its source tree. When a code-only PR doesn't touch a
-    # subsystem, its tier is skipped — net runtime saving on most PRs.
-    "codeql": [
-        "packages/codeql/**",
-        "core/build/**",
-        "core/config/**",
-        "core/coverage/**",
-        "core/dataflow/**",
-        "core/git/**",
-        "core/hash/**",
-        "core/inventory/**",
-        "core/json/**",
-        "core/llm/**",
-        "core/logging/**",
-        "core/orchestration/**",
-        "core/run/**",
-        "core/sandbox/**",
-        "core/sarif/**",
-        "core/security/**",
-        "core/smt_solver/**",
-        "core/zip/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    "llm_analysis": [
-        "packages/llm_analysis/**",
-        "packages/binary_analysis/**",
-        "packages/checker_synthesis/**",
-        "packages/codeql/**",
-        "packages/cvss/**",
-        "packages/exploit_feasibility/**",
-        "packages/exploitability_validation/**",
-        "packages/fuzzing/**",
-        "packages/hypothesis_validation/**",
-        "core/annotations/**",
-        "core/ast/**",
-        "core/config/**",
-        "core/coverage/**",
-        "core/inventory/**",
-        "core/json/**",
-        "core/llm/**",
-        "core/logging/**",
-        "core/orchestration/**",
-        "core/progress/**",
-        "core/reporting/**",
-        "core/run/**",
-        "core/sage/**",
-        "core/sandbox/**",
-        "core/sarif/**",
-        "core/schema_constants/**",
-        "core/security/**",
-        "core/smt_solver/**",
-        "core/zip/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    "cve_diff": [
-        "packages/cve_diff/**",
-        "packages/nvd/**",
-        "packages/osv/**",
-        "core/config/**",
-        "core/git/**",
-        "core/http/**",
-        "core/json/**",
-        "core/llm/**",
-        "core/security/**",
-        "core/url_patterns.py",
-        "core/url_patterns/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    "fuzzing": [
-        "packages/fuzzing/**",
-        "packages/autonomous/**",
-        "packages/binary_analysis/**",
-        "core/config/**",
-        "core/hash/**",
-        "core/json/**",
-        "core/logging/**",
-        "core/sandbox/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    "sage": [
-        "core/sage/**",
-        "core/config/**",
-        "core/hash/**",
-        "core/llm/**",
-        "core/logging/**",
-        "core/sandbox/**",
-        "core/security/**",
-        "packages/autonomous/**",
-        "packages/exploit_feasibility/**",
-        "packages/llm_analysis/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    "orchestration": [
-        "core/orchestration/**",
-        "core/ast/**",
-        "core/config/**",
-        "core/hash/**",
-        "core/inventory/**",
-        "core/json/**",
-        "core/llm/**",
-        "core/run/**",
-        "core/sandbox/**",
-        "core/schema_constants/**",
-        "core/security/**",
-        "packages/codeql/**",
-        "packages/exploitability_validation/**",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
-    ],
-    # CodeQL per-language scoping. Each matrix entry in codeql.yml
-    # gates on the corresponding filter, so a python-only PR skips the
-    # c-cpp and actions matrix entries (and vice versa).
     "codeql_python": [
         "**/*.py",
         "requirements*.txt",
         "pyproject.toml",
+        "uv.lock",
         ".github/workflows/codeql.yml",
         ".github/codeql/**",
+        ".github/scripts/ci_push_base.py",
     ],
     "codeql_cpp": [
         "**/*.c",
@@ -211,6 +44,7 @@ FILTERS: dict[str, list[str]] = {
         "**/*.hh",
         ".github/workflows/codeql.yml",
         ".github/codeql/**",
+        ".github/scripts/ci_push_base.py",
     ],
     "codeql_actions": [
         ".github/workflows/**",
@@ -218,42 +52,7 @@ FILTERS: dict[str, list[str]] = {
         "action.yml",
         "action.yaml",
         ".github/codeql/**",
-    ],
-    # Prompt-envelope audit: AST-based heuristic that scans a registered
-    # list of prompt-construction files for untrusted-attribute
-    # interpolations bypassing UntrustedBlock / neutralize_tag_forgery.
-    # Only re-runs when an audited file, the audit module, or the test
-    # itself changes. Hardcoded list mirrors
-    # ``_PROMPT_CONSTRUCTION_FILES`` in
-    # core/security/prompt_envelope_audit.py — drift caught by the
-    # filter-coverage lint in .github/tests/test_filter_coverage.py.
-    "prompt_audit": [
-        # Audit module + allowlist (same file)
-        "core/security/prompt_envelope_audit.py",
-        # Audit test file
-        "core/security/tests/test_prompt_envelope_audit.py",
-        # Registered prompt-builder files
-        "packages/llm_analysis/agent.py",
-        "packages/llm_analysis/dataflow_validation.py",
-        "packages/llm_analysis/orchestrator.py",
-        "packages/llm_analysis/prefilter.py",
-        "packages/llm_analysis/tasks.py",
-        "packages/llm_analysis/crash_agent.py",
-        "packages/llm_analysis/prompts/analysis.py",
-        "packages/llm_analysis/prompts/exploit.py",
-        "packages/llm_analysis/prompts/patch.py",
-        "packages/hypothesis_validation/runner.py",
-        "packages/codeql/autonomous_analyzer.py",
-        "packages/codeql/dataflow_validator.py",
-        "packages/codeql/build_detector.py",
-        "packages/web/fuzzer.py",
-        "packages/autonomous/dialogue.py",
-        "core/llm/multi_model/prompt_helpers.py",
-        "packages/cve_diff/cve_diff/agent/loop.py",
-        "packages/cve_diff/cve_diff/agent/prompt.py",
-        "packages/cve_diff/cve_diff/analysis/analyzer.py",
-        "requirements*.txt",
-        ".github/workflows/tests.yml",
+        ".github/scripts/ci_push_base.py",
     ],
 }
 
@@ -294,6 +93,73 @@ def match_glob(path: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(path, pattern)
 
 
+CONFIG = Path(__file__).resolve().parents[2] / ".github/codeql/codeql-config.yml"
+
+
+def _ignored_source_patterns() -> tuple[str, ...]:
+    """Recognise the config's scalar list; unfamiliar shapes keep broad scans.
+
+    Restrict this optimisation to the current simple config rather than adding
+    a YAML dependency to the selector. Metadata edits always trigger scans.
+    """
+    patterns = []
+    seen_name = seen_list = False
+    try:
+        for line in CONFIG.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            if not line.startswith(" "):
+                if value.startswith("name: ") and not seen_name and not seen_list:
+                    label = value[len("name: "):]
+                    if label.startswith('"'):
+                        if not isinstance(json.loads(label), str):
+                            return ()
+                    elif not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_. -]*", label):
+                        return ()
+                    seen_name = True
+                    continue
+                if value == "paths-ignore:" and not seen_list:
+                    seen_list = True
+                    continue
+                return ()
+            if not seen_list or not line.startswith("  - "):
+                return ()
+            value = line[4:].strip()
+            if not value.startswith('"'):
+                return ()  # JSON-quoted scalars are unambiguous YAML strings.
+            value = json.loads(value)
+            if (not isinstance(value, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_./*\-]+", value)
+                    or any(part in ("", ".", "..") or "**" in part and part != "**"
+                           for part in value.split("/"))):
+                return ()
+            patterns.append(value)
+    except (OSError, ValueError):
+        return ()
+    return tuple(patterns)
+
+
+def _ignored_source(path: str, pattern: str) -> bool:
+    """Match CodeQL's segment stars and recursive directory prefixes."""
+    parts, tokens = path.split("/"), pattern.split("/")
+
+    def expand(positions):
+        for j, token in enumerate(tokens):
+            if token == "**" and j in positions:
+                positions.add(j + 1)
+        return positions
+
+    positions = expand({0})
+    for part in parts:
+        if len(tokens) in positions:
+            return True  # A matched directory includes its descendants.
+        positions = expand({j if tokens[j] == "**" else j + 1
+                            for j in positions
+                            if tokens[j] == "**" or fnmatch.fnmatchcase(part, tokens[j])})
+    return len(tokens) in positions
+
+
 def evaluate(changed_files: list[str] | None) -> dict[str, bool]:
     """Return ``{filter_name: matched}`` for every filter in ``FILTERS``.
 
@@ -301,25 +167,41 @@ def evaluate(changed_files: list[str] | None) -> dict[str, bool]:
     on so a CI mistake errs toward running tests.
     """
     if changed_files is None:
-        return {name: True for name in FILTERS}
+        return dict.fromkeys(FILTERS, True)
+    ignored = _ignored_source_patterns()
+    python_sources = [path for path in changed_files
+                      if not any(_ignored_source(path, pattern) for pattern in ignored)]
     out: dict[str, bool] = {}
     for name, patterns in FILTERS.items():
         out[name] = any(
-            match_glob(f, p) for f in changed_files for p in patterns
+            match_glob(f, p) for p in patterns
+            for f in (python_sources if name == "codeql_python" and p == "**/*.py"
+                      else changed_files)
         )
     return out
 
 
 def _read_changed_files() -> list[str] | None:
+    """Return the list of changed files, or ``None`` if unavailable.
+
+    A real PR always changes at least one file, so an *empty* list file
+    means the upstream diff fetch silently produced zero entries (e.g.
+    a fork-PR ``gh api .../pulls/N/files`` call that returned an empty
+    page on partial auth). Treat that as "diff base unavailable" and
+    force every filter on, rather than skipping all jobs.
+    """
     list_path = os.environ.get("CHANGED_FILES_LIST")
     if not list_path:
         return None
     p = Path(list_path)
     if not p.is_file():
         return None
-    return [
-        line.strip() for line in p.read_text().splitlines() if line.strip()
+    files = [
+        line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
+    if not files:
+        return None
+    return files
 
 
 def main() -> int:
@@ -332,11 +214,17 @@ def main() -> int:
     results = evaluate(changed)
 
     with open(output, "a", encoding="utf-8") as fh:
-        for name, hit in results.items():
-            fh.write(f"{name}={'true' if hit else 'false'}\n")
+        fh.writelines(f"{name}={'true' if hit else 'false'}\n" for name, hit in results.items())
 
     if changed is None:
-        print("No diff base available — forcing all filters to true.")
+        list_path = os.environ.get("CHANGED_FILES_LIST")
+        if list_path and Path(list_path).is_file():
+            print(
+                f"Diff base produced empty file list ({list_path}) — "
+                "treating as unavailable and forcing all filters to true."
+            )
+        else:
+            print("No diff base available — forcing all filters to true.")
     else:
         print(f"Changed files: {len(changed)}")
         for name, hit in results.items():

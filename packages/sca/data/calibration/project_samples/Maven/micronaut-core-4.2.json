@@ -1,0 +1,2929 @@
+{
+  "_source": {
+    "fetched_at": "2026-10-29T21:59:54Z",
+    "git_ref": "v4.2.0",
+    "license": "MIT (RAPTOR-generated fields only; upstream advisory data retains its own terms)",
+    "name": "RAPTOR SCA scan of micronaut-core-4.2",
+    "project_license": "Apache-2.0",
+    "provenance": "Scan output produced by RAPTOR's SCA pipeline against https://github.com/micronaut-projects/micronaut-core.git@v4.2.0. Project source not redistributed.",
+    "url": "https://github.com/micronaut-projects/micronaut-core.git"
+  },
+  "findings": [
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2023-6378"
+        ],
+        "id": "GHSA-vmq6-5m68-f53m"
+      },
+      "cvss_score": 7.1,
+      "dep_name": "ch.qos.logback:logback-classic",
+      "dep_version": "1.4.11",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.009,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:ch.qos.logback:logback-classic:1.4.11:GHSA-vmq6-5m68-f53m",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/ch.qos.logback/logback-classic@1.4.11",
+      "raptor_risk_estimate": 12.7834718227875,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.7834718227875
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-18401"
+        ],
+        "id": "GHSA-72hv-8253-57qq"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "com.fasterxml.jackson.core:jackson-core",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00408,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-core:2.15.3:GHSA-72hv-8253-57qq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-core@2.15.3",
+      "raptor_risk_estimate": 27.416424789356295,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.416424789356295
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-89425"
+        ],
+        "id": "GHSA-7hhh-6rmp-j9qf"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "com.fasterxml.jackson.core:jackson-core",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00532,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-core:2.15.3:GHSA-7hhh-6rmp-j9qf",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-core@2.15.3",
+      "raptor_risk_estimate": 27.451825953844786,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.451825953844786
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-68494"
+        ],
+        "id": "GHSA-r7wm-3cxj-wff9"
+      },
+      "cvss_score": 8.7,
+      "dep_name": "com.fasterxml.jackson.core:jackson-core",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00463,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-core:2.15.3:GHSA-r7wm-3cxj-wff9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-core@2.15.3",
+      "raptor_risk_estimate": 29.88473631270581,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 29.88473631270581
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59888"
+        ],
+        "id": "GHSA-3pjw-73gf-8qr5"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00423,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-3pjw-73gf-8qr5",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 11.645343806776873,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.645343806776873
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59889"
+        ],
+        "id": "GHSA-5gvw-p9qm-jgwh"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00346,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-5gvw-p9qm-jgwh",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 11.63600781949125,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.63600781949125
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-54515"
+        ],
+        "id": "GHSA-5jmj-h7xm-6q6v"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00443,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-5jmj-h7xm-6q6v",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 9.497411432962874,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.497411432962874
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-91777"
+        ],
+        "id": "GHSA-cxp5-3px4-pw24"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00487,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-cxp5-3px4-pw24",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 27.43897875705461,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.43897875705461
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-83557"
+        ],
+        "id": "GHSA-gx83-3vf8-gh7j"
+      },
+      "cvss_score": 5.6,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00717,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-gx83-3vf8-gh7j",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 20.664644783858392,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 20.664644783858392
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-54514"
+        ],
+        "id": "GHSA-hgj6-7826-r7m5"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00368,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-hgj6-7826-r7m5",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 9.489996737765999,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.489996737765999
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-54512"
+        ],
+        "id": "GHSA-j3rv-43j4-c7qm"
+      },
+      "cvss_score": 8.1,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00944,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-j3rv-43j4-c7qm",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 21.00901769118708,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 21.00901769118708
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-68497"
+        ],
+        "id": "GHSA-q4xh-88c3-wmh7"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00628,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-q4xh-88c3-wmh7",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 27.479233306997166,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.479233306997166
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-54513"
+        ],
+        "id": "GHSA-rmj7-2vxq-3g9f"
+      },
+      "cvss_score": 8.1,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.01226,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-rmj7-2vxq-3g9f",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 14.633216772005246,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 14.633216772005246
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-77310"
+        ],
+        "id": "GHSA-vvgp-rfg2-7rr6"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00313,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-vvgp-rfg2-7rr6",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 9.484559294621624,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.484559294621624
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-19032"
+        ],
+        "id": "GHSA-wjgm-6hv5-3cvf"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00572,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-wjgm-6hv5-3cvf",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 27.463245684324946,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.463245684324946
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-91776"
+        ],
+        "id": "GHSA-wv8q-qhhj-9h54"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "com.fasterxml.jackson.core:jackson-databind",
+      "dep_version": "2.15.3",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00487,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.fasterxml.jackson.core:jackson-databind:2.15.3:GHSA-wv8q-qhhj-9h54",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.15.3",
+      "raptor_risk_estimate": 27.43897875705461,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.43897875705461
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "BIT-wiremock-2023-41329",
+          "CVE-2023-41329",
+          "PYSEC-2026-2050"
+        ],
+        "id": "GHSA-pmxq-pj47-j8j4"
+      },
+      "cvss_score": 3.9,
+      "dep_name": "com.github.tomakehurst:wiremock-jre8",
+      "dep_version": "2.33.2",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00629,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.github.tomakehurst:wiremock-jre8:2.33.2:GHSA-pmxq-pj47-j8j4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.github.tomakehurst/wiremock-jre8@2.33.2",
+      "raptor_risk_estimate": 4.295845014306863,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "not_evaluated"
+      },
+      "risk_components": {
+        "final": 4.295845014306863
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2022-45868"
+        ],
+        "id": "GHSA-22wj-vf5f-wrvj"
+      },
+      "cvss_score": 7.8,
+      "dep_name": "com.h2database:h2",
+      "dep_version": "2.1.214",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00321,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:com.h2database:h2:2.1.214:GHSA-22wj-vf5f-wrvj",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/com.h2database/h2@2.1.214",
+      "raptor_risk_estimate": 12.625648796511841,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "not_evaluated"
+      },
+      "risk_components": {
+        "final": 12.625648796511841
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-50560"
+        ],
+        "id": "GHSA-563q-j3cm-6jxm"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00397,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-563q-j3cm-6jxm",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 12.358633942900122,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.358633942900122
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-47244"
+        ],
+        "id": "GHSA-5x3r-wrvg-rp6q"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00384,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-5x3r-wrvg-rp6q",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 9.491578539408,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.491578539408
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-56819"
+        ],
+        "id": "GHSA-93wv-jw9v-4972"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00665,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-93wv-jw9v-4972",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 27.489796557691314,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.489796557691314
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-48043"
+        ],
+        "id": "GHSA-c2gf-v879-257j"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00753,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-c2gf-v879-257j",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 9.528058839776625,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 9.528058839776625
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59900"
+        ],
+        "id": "GHSA-c69g-56f8-xwqj"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00398,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-c69g-56f8-xwqj",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 12.358762650816747,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.358762650816747
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42587"
+        ],
+        "id": "GHSA-f6hv-jmp6-3vwv"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0099,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-f6hv-jmp6-3vwv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 27.582581867842602,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.582581867842602
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-55163"
+        ],
+        "id": "GHSA-prj3-ccx8-p6x4"
+      },
+      "cvss_score": 8.2,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.01101,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-prj3-ccx8-p6x4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 14.794754114909248,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 14.794754114909248
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-33871"
+        ],
+        "id": "GHSA-w9fj-cfpg-grvv"
+      },
+      "cvss_score": 8.7,
+      "dep_name": "io.netty:netty-codec-http2",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.01145,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http2:4.1.101.Final:GHSA-w9fj-cfpg-grvv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http2@4.1.101.Final",
+      "raptor_risk_estimate": 15.70401375963187,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 15.70401375963187
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42585"
+        ],
+        "id": "GHSA-38f8-5428-x5cv"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00267,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-38f8-5428-x5cv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.37617023941374,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.37617023941374
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59898"
+        ],
+        "id": "GHSA-4mp9-239f-g9hg"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00439,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-4mp9-239f-g9hg",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 11.288905790581122,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.288905790581122
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42584"
+        ],
+        "id": "GHSA-57rv-r2g8-2cj3"
+      },
+      "cvss_score": 7.3,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00838,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-57rv-r2g8-2cj3",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.539186892018005,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.539186892018005
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2024-29025"
+        ],
+        "id": "GHSA-5jpm-x58v-624v"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0138,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-5jpm-x58v-624v",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.69392424002415,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.69392424002415
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-56746"
+        ],
+        "id": "GHSA-6cqp-g7gg-8hr5"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00408,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-6cqp-g7gg-8hr5",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 11.643525107954998,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.643525107954998
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-55831"
+        ],
+        "id": "GHSA-6jqx-86gh-f27w"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00665,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-6jqx-86gh-f27w",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.489796557691314,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.489796557691314
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-67735"
+        ],
+        "id": "GHSA-84h7-rjj3-6jx4"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0032,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-84h7-rjj3-6jx4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.391301382299947,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.391301382299947
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59903"
+        ],
+        "id": "GHSA-8c42-7qj2-3j46"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00324,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-8c42-7qj2-3j46",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 11.633340394552496,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.633340394552496
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42587"
+        ],
+        "id": "GHSA-f6hv-jmp6-3vwv"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0099,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-f6hv-jmp6-3vwv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.582581867842602,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.582581867842602
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-58056"
+        ],
+        "id": "GHSA-fghv-69vj-qj49"
+      },
+      "cvss_score": null,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0071,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-fghv-69vj-qj49",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 7.187779432349998,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.187779432349998
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59921"
+        ],
+        "id": "GHSA-gcjf-9mgh-3p7g"
+      },
+      "cvss_score": 5.7,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00465,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-gcjf-9mgh-3p7g",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 20.610591964906483,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 20.610591964906483
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-50020"
+        ],
+        "id": "GHSA-hvcg-qmg6-jm4c"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00232,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-hvcg-qmg6-jm4c",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.3661779752436,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.3661779752436
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-56745"
+        ],
+        "id": "GHSA-jppx-w49h-x2qq"
+      },
+      "cvss_score": 8.7,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0063,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-jppx-w49h-x2qq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 15.620437553771245,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 15.620437553771245
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42580"
+        ],
+        "id": "GHSA-m4cv-j2px-7723"
+      },
+      "cvss_score": 6.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00378,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-m4cv-j2px-7723",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.407859991496178,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.407859991496178
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-55833"
+        ],
+        "id": "GHSA-mvh2-crg5-v77c"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00665,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-mvh2-crg5-v77c",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 13.470790939734373,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 13.470790939734373
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-33870"
+        ],
+        "id": "GHSA-pwqr-wmgm-9rr8"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00701,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-pwqr-wmgm-9rr8",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.50007431512346,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.50007431512346
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-59899"
+        ],
+        "id": "GHSA-q4f6-jm68-57ww"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00609,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-q4f6-jm68-57ww",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 12.385920021224623,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.385920021224623
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-41417"
+        ],
+        "id": "GHSA-v8h7-rr48-vmmv"
+      },
+      "cvss_score": 5.3,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00318,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-v8h7-rr48-vmmv",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.390730395775936,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.390730395775936
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42581"
+        ],
+        "id": "GHSA-xxqh-mfjm-7mv9"
+      },
+      "cvss_score": 5.8,
+      "dep_name": "io.netty:netty-codec-http",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0063,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-codec-http:4.1.101.Final:GHSA-xxqh-mfjm-7mv9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-codec-http@4.1.101.Final",
+      "raptor_risk_estimate": 27.479804293521177,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.479804293521177
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-42578"
+        ],
+        "id": "GHSA-45q3-82m4-75jr"
+      },
+      "cvss_score": 2.9,
+      "dep_name": "io.netty:netty-handler-proxy",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.01065,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler-proxy:4.1.101.Final:GHSA-45q3-82m4-75jr",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler-proxy@4.1.101.Final",
+      "raptor_risk_estimate": 20.739289152887228,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 20.739289152887228
+      },
+      "severity": "low",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-44249"
+        ],
+        "id": "GHSA-3qp7-7mw8-wx86"
+      },
+      "cvss_score": 8.1,
+      "dep_name": "io.netty:netty-handler",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00987,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler:4.1.101.Final:GHSA-3qp7-7mw8-wx86",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler@4.1.101.Final",
+      "raptor_risk_estimate": 14.597105807397373,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 14.597105807397373
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-24970"
+        ],
+        "id": "GHSA-4g8c-wm8x-jfhw"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-handler",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.02192,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler:4.1.101.Final:GHSA-4g8c-wm8x-jfhw",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler@4.1.101.Final",
+      "raptor_risk_estimate": 27.925744768771363,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.925744768771363
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-75595"
+        ],
+        "id": "GHSA-c4c3-7fpv-j4q5"
+      },
+      "cvss_score": 9.1,
+      "dep_name": "io.netty:netty-handler",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00316,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler:4.1.101.Final:GHSA-c4c3-7fpv-j4q5",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler@4.1.101.Final",
+      "raptor_risk_estimate": 16.285318590586495,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 16.285318590586495
+      },
+      "severity": "critical",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-50010"
+        ],
+        "id": "GHSA-c653-97m9-rcg9"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-handler",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00491,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler:4.1.101.Final:GHSA-c653-97m9-rcg9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler@4.1.101.Final",
+      "raptor_risk_estimate": 13.446448355503122,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 13.446448355503122
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-75596"
+        ],
+        "id": "GHSA-fccg-mwvh-qqg4"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "io.netty:netty-handler",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00374,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler:4.1.101.Final:GHSA-fccg-mwvh-qqg4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler@4.1.101.Final",
+      "raptor_risk_estimate": 12.355673660817748,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.355673660817748
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45416"
+        ],
+        "id": "GHSA-x4gw-5cx5-pgmh"
+      },
+      "cvss_score": 7.5,
+      "dep_name": "io.netty:netty-handler",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00921,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-handler:4.1.101.Final:GHSA-x4gw-5cx5-pgmh",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-handler@4.1.101.Final",
+      "raptor_risk_estimate": 13.506605316534374,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 13.506605316534374
+      },
+      "severity": "high",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45536"
+        ],
+        "id": "GHSA-w573-9ffj-6ff9"
+      },
+      "cvss_score": 4.0,
+      "dep_name": "io.netty:netty-transport-native-epoll",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00136,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-transport-native-epoll:4.1.101.Final:GHSA-w573-9ffj-6ff9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-transport-native-epoll@4.1.101.Final",
+      "raptor_risk_estimate": 7.14495140676,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.14495140676
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-45536"
+        ],
+        "id": "GHSA-w573-9ffj-6ff9"
+      },
+      "cvss_score": 4.0,
+      "dep_name": "io.netty:netty-transport-native-kqueue",
+      "dep_version": "4.1.101.Final",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00136,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.netty:netty-transport-native-kqueue:4.1.101.Final:GHSA-w573-9ffj-6ff9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.netty/netty-transport-native-kqueue@4.1.101.Final",
+      "raptor_risk_estimate": 7.14495140676,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 7.14495140676
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-1002"
+        ],
+        "id": "GHSA-cphf-4846-3xx9"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "io.vertx:vertx-core",
+      "dep_version": "3.9.13",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00384,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:io.vertx:vertx-core:3.9.13:GHSA-cphf-4846-3xx9",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/io.vertx/vertx-core@3.9.13",
+      "raptor_risk_estimate": 27.409572951068203,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 27.409572951068203
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-34480"
+        ],
+        "id": "GHSA-3pxv-7cmr-fjr4"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "org.apache.logging.log4j:log4j-core",
+      "dep_version": "2.20.0",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.01046,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.apache.logging.log4j:log4j-core:2.20.0:GHSA-3pxv-7cmr-fjr4",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.20.0",
+      "raptor_risk_estimate": 12.442165380789747,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.442165380789747
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-34477"
+        ],
+        "id": "GHSA-6hg6-v5c8-fphq"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "org.apache.logging.log4j:log4j-core",
+      "dep_version": "2.20.0",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.0056,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.apache.logging.log4j:log4j-core:2.20.0:GHSA-6hg6-v5c8-fphq",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.20.0",
+      "raptor_risk_estimate": 11.303125217369999,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.303125217369999
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-34479"
+        ],
+        "id": "GHSA-h383-gmxw-35v2"
+      },
+      "cvss_score": 6.9,
+      "dep_name": "org.apache.logging.log4j:log4j-core",
+      "dep_version": "2.20.0",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00535,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.apache.logging.log4j:log4j-core:2.20.0:GHSA-h383-gmxw-35v2",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.20.0",
+      "raptor_risk_estimate": 12.376395635394372,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 12.376395635394372
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-68161"
+        ],
+        "id": "GHSA-vc5p-v9hr-52mj"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "org.apache.logging.log4j:log4j-core",
+      "dep_version": "2.20.0",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00767,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.apache.logging.log4j:log4j-core:2.20.0:GHSA-vc5p-v9hr-52mj",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.20.0",
+      "raptor_risk_estimate": 11.327451013612125,
+      "reachability": {
+        "confidence": {
+          "level": "medium",
+          "numeric": 0.7
+        },
+        "verdict": "imported"
+      },
+      "risk_components": {
+        "final": 11.327451013612125
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2025-8916"
+        ],
+        "id": "GHSA-4cx2-fc23-5wg6"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "org.bouncycastle:bcpkix-jdk15on",
+      "dep_version": "1.70",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00461,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.bouncycastle:bcpkix-jdk15on:1.70:GHSA-4cx2-fc23-5wg6",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/org.bouncycastle/bcpkix-jdk15on@1.70",
+      "raptor_risk_estimate": 6.92732981494606,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "not_evaluated"
+      },
+      "risk_components": {
+        "final": 6.92732981494606
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-5588"
+        ],
+        "id": "GHSA-wg6q-6289-32hp"
+      },
+      "cvss_score": 6.3,
+      "dep_name": "org.bouncycastle:bcpkix-jdk15on",
+      "dep_version": "1.70",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00777,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.bouncycastle:bcpkix-jdk15on:1.70:GHSA-wg6q-6289-32hp",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      },
+      "purl": "pkg:maven/org.bouncycastle/bcpkix-jdk15on@1.70",
+      "raptor_risk_estimate": 6.9501121570440105,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "not_evaluated"
+      },
+      "risk_components": {
+        "final": 6.9501121570440105
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95
+      }
+    },
+    {
+      "advisory": {
+        "aliases": [
+          "CVE-2026-53914"
+        ],
+        "id": "GHSA-r937-wjx7-w2jp"
+      },
+      "cvss_score": 6.7,
+      "dep_name": "org.jetbrains.kotlin:kotlin-gradle-plugin",
+      "dep_version": "${libs.versions.managed.kotlin.asProvider().get()}",
+      "direct": true,
+      "ecosystem": "Maven",
+      "epss": 0.00333,
+      "exploit_evidence": {
+        "edb_ids": [],
+        "github_poc_urls": [],
+        "kev_listed": false,
+        "msf_modules": []
+      },
+      "exposure_factor": 0.0,
+      "finding_id": "sca:vuln:Maven:org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.managed.kotlin.asProvider().get()}:GHSA-r937-wjx7-w2jp",
+      "in_kev": false,
+      "parser_confidence": {
+        "level": "medium",
+        "numeric": 0.7
+      },
+      "purl": "pkg:maven/org.jetbrains.kotlin/kotlin-gradle-plugin@${libs.versions.managed.kotlin.asProvider().get()}",
+      "raptor_risk_estimate": 3.994570163101565,
+      "reachability": {
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3
+        },
+        "verdict": "not_evaluated"
+      },
+      "risk_components": {
+        "final": 3.994570163101565
+      },
+      "severity": "medium",
+      "ssvc_automatable": null,
+      "ssvc_exploitation": null,
+      "transitive_depth": 0,
+      "version_match_confidence": {
+        "level": "medium",
+        "numeric": 0.7
+      }
+    }
+  ]
+}

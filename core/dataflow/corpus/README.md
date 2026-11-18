@@ -3,7 +3,7 @@
 Labeled dataflow findings used to measure the validator pipeline.
 
 This corpus is the prerequisite for every PR in the dataflow
-sanitizer-bypass work (see `~/design/dataflow-sanitizer-bypass.md`).
+sanitizer-bypass work.
 Each PR's exit criteria is a corpus delta — precision/recall/F1
 against this fixed label set, with a per-FP-category breakdown.
 
@@ -18,7 +18,7 @@ core/dataflow/corpus/
   README.md                          # this file
   SCHEMA.md                          # human-readable JSON reference
   FIXTURES.md                        # how target source trees are sourced
-  SOURCES.md                         # pinned URLs + commit shas (TBD)
+  SOURCES.md                         # pinned URLs + commit shas
   findings/                          # one .json + one .label.json per finding
     iris_e2e_codeql_py-command-injection_001.json
     iris_e2e_codeql_py-command-injection_001.label.json
@@ -26,20 +26,31 @@ core/dataflow/corpus/
 ```
 
 Run scripts (`run_corpus.py`, `corpus_metrics.py`) ship as task #4
-under `core/dataflow/` with `libexec/raptor-corpus-*` shims.
+under `core/dataflow/`. Operator-facing dev tooling lives at
+`core/dataflow/scripts/corpus-run` and
+`core/dataflow/scripts/corpus-metrics` — invoke directly; these are
+not framework-internal libexec shims and do not require the
+`_RAPTOR_TRUSTED` trust marker.
 
 ## Status
 
-PR0 seed: 7 hand-labeled findings drawn from existing in-tree iris
-fixtures (`packages/llm_analysis/tests/fixtures/iris_e2e/` and
-`iris_e2e_multilang/`). Six TPs across Python / JS / Java / Go / C +
-one Semgrep-style FP exhibiting the canonical
-`missing_sanitizer_model` class.
+155 committed finding/label pairs across five families:
 
-PR0 will not ship as final until at least 50 entries with realistic
-TP/FP balance — OWASP Benchmark Java (~30 entries, free TP/FP labels)
-and hand-labelled Juice Shop / WebGoat (~35 combined) populate via
-tasks #5 and #6.
+- `iris_e2e_*` — 7 seed findings from the in-tree iris fixtures
+  (`packages/llm_analysis/tests/fixtures/iris_e2e/` and
+  `iris_e2e_multilang/`); six TPs across Python / JS / Java / Go / C
+  plus one Semgrep-style `missing_sanitizer_model` FP.
+- `owasp_*` — 30 entries generated from OWASP Benchmark Java
+  (CodeQL CWE-78 against the pinned clone, free TP/FP labels; see
+  SOURCES.md for exact regeneration).
+- `juiceshop_*` (10) and `webgoat_*` (8) — hand-labelled entries
+  from the pinned Juice Shop / WebGoat clones.
+- `source_intel_*` — 100 memory-corruption entries (C/C++ CVE
+  fixtures pinned at the vulnerable commit; see SOURCES.md).
+
+Fixture clones are on-demand (FIXTURES.md); the corpus runner
+verifies any present clone against its SOURCES.md pin before
+proceeding.
 
 ## Pivot gate
 

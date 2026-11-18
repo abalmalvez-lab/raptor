@@ -3,26 +3,24 @@
 import copy
 import json
 import os
-import sys
 import time
+import typing
 import unittest.mock
 from pathlib import Path
 
-
-# core/orchestration/tests/ -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
+import pytest
 
 from core.orchestration.understand_bridge import (
-    find_understand_output,
-    load_understand_context,
-    enrich_checklist,
-    normalize_context_map,
     TRACE_SOURCE_LABEL,
     _extract_hashes,
     _find_stale_files,
     _rank_candidates,
+    enrich_checklist,
+    find_understand_output,
+    load_understand_context,
+    normalize_context_map,
 )
-
+from core.testing.standalone_cli import run_standalone_cli
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -190,7 +188,7 @@ class TestFindUnderstandOutput:
 
         _make_understand_dir(project_dir)
 
-        result_dir, stale = find_understand_output(validate_dir)
+        result_dir, _stale = find_understand_output(validate_dir)
         assert result_dir == project_dir / "understand-20260401-120000"
 
     def test_tier2_picks_newest_sibling(self, tmp_path):
@@ -202,7 +200,7 @@ class TestFindUnderstandOutput:
         time.sleep(0.01)
         new = _make_understand_dir(project_dir, "understand-20260402-120000")
 
-        result_dir, stale = find_understand_output(validate_dir)
+        result_dir, _stale = find_understand_output(validate_dir)
         assert result_dir == new
 
     def test_tier3_global_out_by_target_path(self, tmp_path, monkeypatch):
@@ -216,14 +214,14 @@ class TestFindUnderstandOutput:
 
         _make_understand_dir(
             out_root, "understand_20260401_120000",
-            checklist={"target_path": "/tmp/vulns", "files": []},
+            checklist={"target_path": "./vulns", "files": []},
         )
 
         # validate_dir outside out/ with no siblings
         validate_dir = tmp_path / "validate-run"
         validate_dir.mkdir()
 
-        result_dir, stale = find_understand_output(validate_dir, target_path="/tmp/vulns")
+        result_dir, _stale = find_understand_output(validate_dir, target_path="./vulns")
         assert result_dir == out_root / "understand_20260401_120000"
 
     def test_tier3_no_match_for_wrong_target(self, tmp_path, monkeypatch):
@@ -235,13 +233,13 @@ class TestFindUnderstandOutput:
 
         _make_understand_dir(
             out_root, "understand_20260401_120000",
-            checklist={"target_path": "/tmp/vulns", "files": []},
+            checklist={"target_path": "./vulns", "files": []},
         )
 
         validate_dir = tmp_path / "validate-run"
         validate_dir.mkdir()
 
-        result_dir, stale = find_understand_output(validate_dir, target_path="/tmp/other")
+        result_dir, _stale = find_understand_output(validate_dir, target_path="./other")
         assert result_dir is None
 
     def test_returns_none_when_no_candidates(self, tmp_path, monkeypatch):
@@ -253,7 +251,7 @@ class TestFindUnderstandOutput:
         validate_dir = tmp_path / "validate-run"
         validate_dir.mkdir()
 
-        result_dir, stale = find_understand_output(validate_dir, target_path="/tmp/vulns")
+        result_dir, _stale = find_understand_output(validate_dir, target_path="./vulns")
         assert result_dir is None
 
     def test_ignores_dirs_without_context_map(self, tmp_path):
@@ -266,7 +264,7 @@ class TestFindUnderstandOutput:
         empty.mkdir()
         _write_json(empty / ".raptor-run.json", {"version": 1, "command": "understand"})
 
-        result_dir, stale = find_understand_output(validate_dir)
+        result_dir, _stale = find_understand_output(validate_dir)
         assert result_dir is None
 
     def test_ignores_non_understand_dirs(self, tmp_path):
@@ -279,7 +277,7 @@ class TestFindUnderstandOutput:
         _write_json(scan / "context-map.json", {"sources": []})
         _write_json(scan / ".raptor-run.json", {"version": 1, "command": "scan"})
 
-        result_dir, stale = find_understand_output(validate_dir)
+        result_dir, _stale = find_understand_output(validate_dir)
         assert result_dir is None
 
 
@@ -512,6 +510,49 @@ class TestLoadUnderstandContextAttackSurface:
         assert len(surface["sources"]) == 1
         assert len(surface["sinks"]) == 1
         assert len(surface["trust_boundaries"]) == 1
+        assert len(surface["entry_points"]) == 1
+        assert len(surface["sink_details"]) == 1
+        assert len(surface["boundary_details"]) == 1
+        assert len(surface["unchecked_flows"]) == 1
+
+    def test_attack_surface_keeps_richer_context_map_fields(self, tmp_path):
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+
+        _write_json(understand_dir / "context-map.json", MINIMAL_CONTEXT_MAP)
+
+        load_understand_context(understand_dir, validate_dir)
+
+        surface = json.loads((validate_dir / "attack-surface.json").read_text())
+        assert surface["entry_points"][0]["id"] == "EP-001"
+        assert surface["boundary_details"][0]["id"] == "TB-001"
+        assert surface["sink_details"][0]["id"] == "SINK-001"
+        assert surface["unchecked_flows"][0]["sink"] == "SINK-001"
+
+    def test_source_trust_level_survives_into_attack_surface(self, tmp_path):
+        """A source's trust_level (provenance, assigned by /understand
+        --map) must ride through the bridge into attack-surface.json so
+        /validate Stage B's prompt sees it — the bridge copies whole
+        source dicts, so the field is preserved without special-casing."""
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+
+        ctx = dict(MINIMAL_CONTEXT_MAP)
+        ctx["sources"] = [{
+            "type": "http_route",
+            "entry": "POST /api/query @ src/routes/query.py:34",
+            "trust_level": "attacker_controlled",
+        }]
+        _write_json(understand_dir / "context-map.json", ctx)
+
+        load_understand_context(understand_dir, validate_dir)
+
+        surface = json.loads((validate_dir / "attack-surface.json").read_text())
+        assert surface["sources"][0]["trust_level"] == "attacker_controlled"
 
     def test_does_not_raise_on_non_string_file_during_stale_filter(self, tmp_path):
         # _references_file does `f in stale_files` — list-typed file would
@@ -670,7 +711,10 @@ class TestLoadUnderstandContextFlowTraces:
 
         paths = json.loads((validate_dir / "attack-paths.json").read_text())
         assert paths[0]["attacker_control"]["level"] == "full"
-        assert "SQLi" in paths[0]["trace_verdict"]
+        # trace_verdict is enum-constrained (derived from the summary
+        # booleans); the LLM's prose rides the note field.
+        assert paths[0]["trace_verdict"] == "flow_confirmed"
+        assert "SQLi" in paths[0]["trace_verdict_note"]
 
     def test_does_not_re_import_existing_path(self, tmp_path):
         understand_dir = tmp_path / "understand"
@@ -999,6 +1043,50 @@ class TestNormalizeContextMap:
             normalize_context_map(ctx, checklist)
         assert any("not present in checklist" in r.message for r in caplog.records)
 
+    def test_warns_excluded_wording_when_file_exists_under_target(self, tmp_path, caplog):
+        # A file present on disk under the target but absent from the
+        # inventory (exclude pattern, unsupported type) is a real
+        # reference — must not be labelled a hallucination.
+        target = tmp_path / "repo"
+        target.mkdir()
+        (target / "excluded.py").write_text("x = 1\n")
+        ctx = {"entry_points": [{"file": "excluded.py", "line": 1}]}
+        checklist = {"target_path": str(target),
+                     "files": [{"path": "real.py", "lines": 10}]}
+        with caplog.at_level("WARNING", logger="core.orchestration.understand_bridge"):
+            normalize_context_map(ctx, checklist)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("exists on disk but is not in the inventory" in m
+                   for m in messages)
+        assert not any("hallucination" in m for m in messages)
+
+    def test_warns_hallucination_when_file_missing_on_disk(self, tmp_path, caplog):
+        target = tmp_path / "repo"
+        target.mkdir()
+        ctx = {"entry_points": [{"file": "ghost.py", "line": 1}]}
+        checklist = {"target_path": str(target),
+                     "files": [{"path": "real.py", "lines": 10}]}
+        with caplog.at_level("WARNING", logger="core.orchestration.understand_bridge"):
+            normalize_context_map(ctx, checklist)
+        assert any("likely LLM hallucination" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_existence_probe_stays_inside_target(self, tmp_path, caplog):
+        # A traversal-shaped reference to a file that exists OUTSIDE the
+        # target must not earn the exists-on-disk wording — containment
+        # is checked before the filesystem probe.
+        target = tmp_path / "repo"
+        target.mkdir()
+        (tmp_path / "outside.py").write_text("x = 1\n")
+        ctx = {"entry_points": [{"file": "../outside.py", "line": 1}]}
+        checklist = {"target_path": str(target),
+                     "files": [{"path": "real.py", "lines": 10}]}
+        with caplog.at_level("WARNING", logger="core.orchestration.understand_bridge"):
+            normalize_context_map(ctx, checklist)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("likely LLM hallucination" in m for m in messages)
+        assert not any("exists on disk" in m for m in messages)
+
     def test_warns_on_line_past_end_of_file(self, caplog):
         ctx = {"sink_details": [{"file": "app.py", "line": 9999}]}
         checklist = self._checklist([{"path": "app.py", "lines": 50}])
@@ -1135,6 +1223,182 @@ class TestNormalizeContextMap:
 
 
 # ---------------------------------------------------------------------------
+# unloadable / empty checklist — one skip warning, never per-entry noise
+# ---------------------------------------------------------------------------
+
+class TestNormalizeWithoutFileInventory:
+    """A checklist with no file inventory (absent, budget-refused load,
+    or empty) yields ONE validation-skipped warning — never a
+    per-entry 'not present in checklist' warning for files that exist."""
+
+    def _map_referencing(self, *files):
+        return {
+            "entry_points": [
+                {"id": f"EP-{i:03d}", "file": f, "line": 1}
+                for i, f in enumerate(files)
+            ],
+            "sink_details": [{"id": "SINK-001", "file": files[0], "line": 1}],
+        }
+
+    def test_budget_refused_checklist_single_skip_warning(self, tmp_path, caplog):
+        # Real files on disk — the map's references are NOT hallucinations.
+        target = tmp_path / "repo"
+        target.mkdir()
+        (target / "a.py").write_text("x = 1\n")
+        (target / "b.py").write_text("y = 2\n")
+        # A checklist over a (tiny) read budget degrades to {} at the
+        # callers (load_json warns and returns None on budget refusal;
+        # the callers `or {}` it) — reproduce that load here.
+        checklist_path = tmp_path / "checklist.json"
+        checklist_path.write_text(json.dumps({
+            "target_path": str(target),
+            "files": [{"path": "a.py", "lines": 1},
+                      {"path": "b.py", "lines": 1}],
+        }))
+        from core.json import load_json
+        checklist = load_json(checklist_path, max_bytes=10) or {}
+        assert checklist == {}
+
+        ctx = self._map_referencing("a.py", "b.py")
+        with caplog.at_level("WARNING",
+                             logger="core.orchestration.understand_bridge"):
+            normalize_context_map(ctx, checklist, target_path=str(target))
+        messages = [r.getMessage() for r in caplog.records]
+        skip = [m for m in messages
+                if "skipping checklist-backed entry validation" in m]
+        assert len(skip) == 1
+        assert not any("not present in checklist" in m for m in messages)
+        assert not any("hallucination" in m for m in messages)
+
+    def test_populated_checklist_still_validates_per_entry(self, caplog):
+        # Ground truth present → the genuine per-entry warning survives.
+        ctx = self._map_referencing("nope.py")
+        with caplog.at_level("WARNING",
+                             logger="core.orchestration.understand_bridge"):
+            normalize_context_map(
+                ctx, {"files": [{"path": "real.py", "lines": 10}]})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("not present in checklist" in m for m in messages)
+        assert not any("skipping checklist-backed entry validation" in m
+                       for m in messages)
+
+    def test_checklist_free_passes_still_run(self, caplog):
+        # Path normalisation does not need the checklist and must
+        # survive the skip.
+        ctx = {"entry_points": [{"file": "./src/app.py", "line": 5}]}
+        with caplog.at_level("WARNING",
+                             logger="core.orchestration.understand_bridge"):
+            normalize_context_map(ctx, {})
+        assert ctx["entry_points"][0]["file"] == "src/app.py"
+
+
+# ---------------------------------------------------------------------------
+# library-surface augmentation (target_kind consumer)
+# ---------------------------------------------------------------------------
+
+class TestAugmentLibrarySurface:
+    """Pass 6 of normalize_context_map: the first consumer of target_kind.
+    For library/hybrid, the public API is surfaced as attack surface (trust
+    boundary + sources + backfilled entry points). Python items use name
+    convention so no metadata is needed (grammar-independent)."""
+
+    def _checklist(self, kind, items):
+        return {
+            "target_path": "/repo",
+            "target_kind": kind,
+            "target_kind_reason": "test",
+            "files": [{"path": "lib.py", "language": "python", "items": items}],
+        }
+
+    _ITEMS: typing.ClassVar[list] = [
+        {"name": "public_api", "kind": "function", "line_start": 1, "line_end": 3},
+        {"name": "another_pub", "kind": "function", "line_start": 5, "line_end": 7},
+        {"name": "_private", "kind": "function", "line_start": 9, "line_end": 11},
+    ]
+
+    def _origins(self, lst, origin):
+        return [x for x in lst if isinstance(x, dict) and x.get("origin") == origin]
+
+    def test_library_surfaces_exports_as_entry_points(self):
+        ctx = {}
+        normalize_context_map(ctx, self._checklist("library", self._ITEMS))
+        assert ctx["target_kind"] == "library"
+        eps = self._origins(ctx["entry_points"], "inventory-entry")
+        names = {e["name"] for e in eps}
+        assert names == {"public_api", "another_pub"}   # _private excluded
+        assert all(e["type"] == "library_api" for e in eps)
+        # boundary + source records
+        assert len(self._origins(ctx["trust_boundaries"], "library-surface")) == 1
+        assert len(self._origins(ctx["sources"], "library-surface")) == 1
+        assert ctx["sources"][-1]["trust_level"] == "attacker_controlled"
+
+    def test_no_cap_surfaces_all_exports(self):
+        items = [{"name": f"api_{i}", "kind": "function", "line_start": i}
+                 for i in range(200)]
+        ctx = {}
+        normalize_context_map(ctx, self._checklist("library", items))
+        assert len(self._origins(ctx["entry_points"], "inventory-entry")) == 200
+
+    def test_hybrid_also_enables(self):
+        ctx = {}
+        normalize_context_map(ctx, self._checklist("hybrid", self._ITEMS))
+        assert ctx["target_kind"] == "hybrid"
+        assert len(self._origins(ctx["entry_points"], "inventory-entry")) == 2
+
+    def test_dedups_against_llm_found_entry(self):
+        # The LLM already listed public_api; we must not double-list it.
+        ctx = {"entry_points": [{"id": "EP-001", "name": "public_api",
+                                 "file": "lib.py", "line": 1}]}
+        normalize_context_map(ctx, self._checklist("library", self._ITEMS))
+        names = [e["name"] for e in ctx["entry_points"]]
+        assert names.count("public_api") == 1
+        # the other export still gets added
+        assert "another_pub" in names
+
+    def test_idempotent(self):
+        ctx = {}
+        cl = self._checklist("library", self._ITEMS)
+        normalize_context_map(ctx, cl)
+        first = copy.deepcopy(ctx)
+        normalize_context_map(ctx, cl)   # second pass adds nothing
+        assert ctx == first
+
+    def test_application_is_stamped_only(self):
+        ctx = {}
+        normalize_context_map(ctx, self._checklist("application", self._ITEMS))
+        assert ctx["target_kind"] == "application"
+        assert "entry_points" not in ctx or not self._origins(
+            ctx.get("entry_points", []), "inventory-entry")
+        assert not self._origins(ctx.get("trust_boundaries", []), "library-surface")
+
+    def test_no_target_kind_is_noop(self):
+        # Pre-#719 checklist with no target_kind → nothing added/stamped.
+        ctx = {}
+        normalize_context_map(ctx, {"target_path": "/repo", "files": []})
+        assert "target_kind" not in ctx
+
+    def test_native_c_library_surfaces_non_static_linkage(self):
+        # A C library's attack surface is its non-static (external-linkage)
+        # functions, which the dynamic-langs-only export predicate would miss.
+        # _item_is_entry's linkage branch surfaces them; static stays internal.
+        ctx = {}
+        checklist = {
+            "target_path": "/repo", "target_kind": "library",
+            "files": [{"path": "lib.c", "language": "c", "items": [
+                {"name": "lib_encode", "kind": "function", "line_start": 10,
+                 "metadata": {"visibility": "extern"}},
+                {"name": "lib_decode", "kind": "function", "line_start": 20,
+                 "metadata": {"visibility": "extern"}},
+                {"name": "internal_helper", "kind": "function", "line_start": 30,
+                 "metadata": {"visibility": "static"}},
+            ]}],
+        }
+        normalize_context_map(ctx, checklist)
+        names = {e["name"] for e in self._origins(ctx["entry_points"], "inventory-entry")}
+        assert names == {"lib_encode", "lib_decode"}   # static excluded
+
+
+# ---------------------------------------------------------------------------
 # enrich_checklist
 # ---------------------------------------------------------------------------
 
@@ -1159,6 +1423,34 @@ class TestEnrichChecklist:
             f for f in checklist["files"] if f["path"] == "src/db/query.py"
         )
         assert db_file["functions"][0]["priority"] == "high"
+
+    def test_over_budget_persist_keeps_in_memory_enrichment(
+            self, tmp_path, monkeypatch, caplog):
+        # The persist step is best-effort: a checklist whose serialised
+        # form exceeds the single-file write budget must not blow the
+        # whole enrichment out of the pipeline — the in-memory markers
+        # are what the caller consumes; the write failure is warned.
+        import core.inventory
+        from core.inventory import ChecklistBudgetExceededError
+
+        def _boom(*_a, **_k):
+            raise ChecklistBudgetExceededError("over the write budget")
+
+        monkeypatch.setattr(core.inventory, "save_checklist", _boom)
+        checklist = copy.deepcopy(MINIMAL_CHECKLIST)
+        with caplog.at_level(
+                "WARNING",
+                logger="core.orchestration.understand_bridge"):
+            result = enrich_checklist(
+                checklist, copy.deepcopy(MINIMAL_CONTEXT_MAP),
+                output_dir=str(tmp_path))
+
+        routes_file = next(
+            f for f in result["files"]
+            if f["path"] == "src/routes/query.py"
+        )
+        assert routes_file["functions"][0]["priority"] == "high"
+        assert any("checklist" in r.getMessage() for r in caplog.records)
 
     def test_priority_targets_carry_resolved_entry_and_sink_details(self):
         # Each priority_target should include resolved file/line/name from
@@ -1649,7 +1941,7 @@ class TestEdgeCases:
         monkeypatch.setattr("core.config.RaptorConfig.get_out_dir",
                             staticmethod(lambda: project_dir))
 
-        result_dir, stale = find_understand_output(
+        result_dir, _stale = find_understand_output(
             validate_dir, target_path=str(target_dir),
         )
         assert result_dir == understand
@@ -1711,7 +2003,7 @@ class TestEdgeCases:
         })
 
         # d_no_checklist is newer by mtime but has no checklist → stale_count=1
-        best_dir, stale = _rank_candidates(
+        best_dir, _stale = _rank_candidates(
             [d_no_checklist, d_with_checklist], str(target),
         )
         assert best_dir == d_with_checklist
@@ -1721,10 +2013,12 @@ class TestEdgeCases:
 # raptor-build-checklist script
 # ---------------------------------------------------------------------------
 
+@pytest.mark.integration
 class TestBuildChecklistScript:
+    """Spawns the libexec/raptor-build-checklist binary as a real
+    subprocess — marker keeps the class out of default fast-tier runs."""
     def test_creates_checklist(self, tmp_path):
         """raptor-build-checklist creates checklist.json."""
-        import subprocess
         target = tmp_path / "src"
         target.mkdir()
         (target / "hello.c").write_text("int main() { return 0; }\n")
@@ -1732,10 +2026,365 @@ class TestBuildChecklistScript:
         out_dir.mkdir()
 
         repo_root = Path(__file__).parents[3]  # core/orchestration/tests -> repo root
-        result = subprocess.run(
+        result = run_standalone_cli(
             ["libexec/raptor-build-checklist", str(target), str(out_dir)],
-            capture_output=True, text=True, cwd=repo_root,
+            capture_output=True, text=True, cwd=repo_root, check=False,
         )
         assert result.returncode == 0, result.stderr
         assert "Checklist:" in result.stdout
         assert (out_dir / "checklist.json").exists()
+
+
+class TestStaleFileContainment:
+    """Checklist entry paths are external input — hashing must be
+    confined to the target tree."""
+
+    def test_relative_escape_treated_stale(self, tmp_path):
+        """``..`` paths must not be hashed — even when the outside
+        file's content matches the checklist hash (which would have
+        made the pre-fix code hash it and report it fresh)."""
+        import hashlib
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text("aaa")
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET")
+        h1 = {
+            "a.py": hashlib.sha256(b"aaa").hexdigest(),
+            "../secret.txt": hashlib.sha256(b"SECRET").hexdigest(),
+        }
+        assert _find_stale_files(h1, str(target)) == {"../secret.txt"}
+
+    def test_absolute_escape_treated_stale(self, tmp_path):
+        import hashlib
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("OUT")
+        h1 = {str(outside): hashlib.sha256(b"OUT").hexdigest()}
+        assert _find_stale_files(h1, str(target)) == {str(outside)}
+
+    def test_symlink_escape_treated_stale(self, tmp_path):
+        import hashlib
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("OUT")
+        (target / "link.txt").symlink_to(outside)
+        h1 = {"link.txt": hashlib.sha256(b"OUT").hexdigest()}
+        assert _find_stale_files(h1, str(target)) == {"link.txt"}
+
+    def test_contained_paths_unaffected(self, tmp_path):
+        import hashlib
+        target = tmp_path / "target"
+        (target / "sub").mkdir(parents=True)
+        (target / "sub" / "a.py").write_text("aaa")
+        h1 = {"sub/a.py": hashlib.sha256(b"aaa").hexdigest()}
+        assert _find_stale_files(h1, str(target)) == set()
+
+
+class TestMapFlowIds:
+    """Map-flow attack-path IDs derive from flow content, not list index."""
+
+    def test_map_flow_ids_stable_across_refreshed_maps(self, tmp_path):
+        """Index-based map-flow-<i> IDs collided across refreshed
+        context-maps: a DIFFERENT flow landing at index 0 was skipped
+        as already-imported. Content-hash IDs import both."""
+        from core.orchestration import understand_bridge as ub
+        validate_dir = tmp_path / "v"
+        validate_dir.mkdir()
+        map1 = {
+            "unchecked_flows": [{"entry_point": "EP-1", "sink": "SINK-1"}],
+            "sink_details": [
+                {"id": "SINK-1", "path_conditions": ["a > 1"]},
+            ],
+        }
+        map2 = {
+            "unchecked_flows": [{"entry_point": "EP-2", "sink": "SINK-2"}],
+            "sink_details": [
+                {"id": "SINK-2", "path_conditions": ["b > 2"]},
+            ],
+        }
+        s1 = ub._import_unchecked_flow_conditions(map1, validate_dir)
+        s2 = ub._import_unchecked_flow_conditions(map2, validate_dir)
+        assert s1["imported_as_paths"] == 1
+        assert s2["imported_as_paths"] == 1
+        paths = json.loads(
+            (validate_dir / "attack-paths.json").read_text(encoding="utf-8"))
+        assert len(paths) == 2
+        # Re-importing the same flow dedups against its own hash ID.
+        s3 = ub._import_unchecked_flow_conditions(map1, validate_dir)
+        assert s3["imported_as_paths"] == 0
+
+    def test_map_flow_legacy_index_id_not_duplicated(self, tmp_path):
+        """A flow already on disk under a legacy index ID must not be
+        re-imported under its new hash ID (name-string dedup)."""
+        from core.orchestration import understand_bridge as ub
+        validate_dir = tmp_path / "v"
+        validate_dir.mkdir()
+        _write_json(validate_dir / "attack-paths.json", [{
+            "id": "map-flow-000",
+            "name": "Imported from /understand --map: EP-1 → SINK-1",
+        }])
+        context_map = {
+            "unchecked_flows": [
+                {"entry_point": "EP-1", "sink": "SINK-1"},
+                {"entry_point": "EP-9", "sink": "SINK-1"},
+            ],
+            "sink_details": [
+                {"id": "SINK-1", "path_conditions": ["a > 1"]},
+            ],
+        }
+        stats = ub._import_unchecked_flow_conditions(context_map, validate_dir)
+        # EP-1 flow already present under the legacy ID; EP-9 is new.
+        assert stats["imported_as_paths"] == 1
+
+
+class TestUrlTargets:
+    """Web scans validate URL targets — no resolve(), no disk hashing."""
+
+    def test_tier2_matches_url_target_by_string(self, tmp_path):
+        validate_dir = tmp_path / "validate"
+        validate_dir.mkdir()
+        _make_understand_dir(
+            tmp_path,
+            checklist={"target_path": "https://app.example.test/"},
+        )
+
+        result_dir, stale = find_understand_output(
+            validate_dir, target_path="https://app.example.test",
+        )
+        assert result_dir is not None
+        assert stale == set()  # URL targets never hash-stale
+
+    def test_url_target_never_matches_filesystem_run(self, tmp_path):
+        validate_dir = tmp_path / "validate"
+        validate_dir.mkdir()
+        _make_understand_dir(
+            tmp_path, checklist={"target_path": str(tmp_path / "src")},
+        )
+
+        result_dir, _ = find_understand_output(
+            validate_dir, target_path="https://app.example.test",
+        )
+        assert result_dir is None
+
+    def test_url_target_picks_newest_without_hash_penalty(self, tmp_path):
+        """Pre-fix, Path('https://x')/rel escaped containment and every
+        web candidate ranked maximally stale; now recency decides."""
+        import os
+
+        validate_dir = tmp_path / "validate"
+        validate_dir.mkdir()
+        old = _make_understand_dir(
+            tmp_path, name="understand-20260401-090000",
+            checklist={
+                "target_path": "https://app.example.test",
+                "files": [{"path": "ignored.py", "sha256": "0" * 64}],
+            },
+        )
+        new = _make_understand_dir(
+            tmp_path, name="understand-20260401-110000",
+            checklist={
+                "target_path": "https://app.example.test",
+                "files": [{"path": "ignored.py", "sha256": "1" * 64}],
+            },
+        )
+        os.utime(old, (1_000_000_000, 1_000_000_000))
+        os.utime(new, (2_000_000_000, 2_000_000_000))
+
+        result_dir, stale = find_understand_output(
+            validate_dir, target_path="https://app.example.test",
+        )
+        assert result_dir == new
+        assert stale == set()
+
+
+class TestMalformedShapesDegradeGracefully:
+    """LLM-shaped/corrupt artifacts skip-with-warning instead of
+    crashing the bridge (the file's established degradation pattern)."""
+
+    def test_array_shaped_checklist_does_not_kill_discovery(
+            self, tmp_path):
+        # One candidate carrying an ARRAY-shaped checklist.json must
+        # not take down ranking — the healthy sibling still wins.
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "app.py").write_text("x = 1\n")
+        project_dir = tmp_path / "project"
+        validate_dir = project_dir / "validate-20260403-120000"
+        validate_dir.mkdir(parents=True)
+
+        bad = _make_understand_dir(project_dir,
+                                   "understand-20260401-120000")
+        _write_json(bad / "checklist.json", ["not", "an", "object"])
+        time.sleep(0.01)
+        good = _make_understand_dir(project_dir,
+                                    "understand-20260402-120000")
+        from core.hash import sha256_file
+        _write_json(good / "checklist.json", {
+            "target_path": str(target),
+            "files": [{"path": "app.py",
+                       "sha256": sha256_file(target / "app.py")}],
+        })
+
+        result_dir, stale = find_understand_output(
+            validate_dir, target_path=str(target))
+        assert result_dir == good
+        assert stale == set()
+
+    def test_array_shaped_checklist_skipped_in_target_search(
+            self, tmp_path, monkeypatch):
+        # Global-tier candidates gate on the recorded target — an
+        # array-shaped checklist must skip the candidate, not crash.
+        out_root = tmp_path / "out"
+        out_root.mkdir()
+        from core.config import RaptorConfig
+        monkeypatch.setattr(RaptorConfig, "get_out_dir",
+                            classmethod(lambda cls: out_root))
+        validate_dir = tmp_path / "standalone" / "validate-1"
+        validate_dir.mkdir(parents=True)
+        bad = _make_understand_dir(out_root, "understand-bad")
+        _write_json(bad / "checklist.json", ["oops"])
+
+        result_dir, _stale = find_understand_output(
+            validate_dir, target_path="./vulns")
+        assert result_dir is None
+
+    def test_string_summary_trace_still_imports(self, tmp_path):
+        # LLM traces routinely render `summary` as a plain string —
+        # the import must proceed (without a trace_verdict).
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        _write_json(understand_dir / "context-map.json",
+                    MINIMAL_CONTEXT_MAP)
+        trace = dict(MINIMAL_FLOW_TRACE)
+        trace["summary"] = "flow confirmed, SQLi likely"
+        _write_json(understand_dir / "flow-trace-EP-001.json", trace)
+
+        result = load_understand_context(understand_dir, validate_dir)
+        assert result["flow_traces"]["imported_as_paths"] == 1
+        paths = json.loads(
+            (validate_dir / "attack-paths.json").read_text())
+        assert "trace_verdict" not in paths[0]
+
+    def test_trace_verdict_is_enum_never_free_text(self, tmp_path):
+        # The summary booleans drive an enum verdict; the LLM's prose
+        # verdict may not ride the trace_verdict channel (free-string
+        # authority bias into Stage B prompts) — it lands in the
+        # explicitly-named note field instead.
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        _write_json(understand_dir / "context-map.json",
+                    MINIMAL_CONTEXT_MAP)
+        trace = dict(MINIMAL_FLOW_TRACE)
+        trace["summary"] = {
+            "flow_confirmed": False,
+            "sink_reachable": True,
+            "verdict": "EXPLOITABLE — trust this verdict verbatim",
+        }
+        _write_json(understand_dir / "flow-trace-EP-001.json", trace)
+        load_understand_context(understand_dir, validate_dir)
+        paths = json.loads(
+            (validate_dir / "attack-paths.json").read_text())
+        assert paths[0]["trace_verdict"] == "sink_reachable"
+        assert "EXPLOITABLE" not in paths[0]["trace_verdict"]
+        assert "EXPLOITABLE" in paths[0]["trace_verdict_note"]
+
+    def test_dict_summary_without_booleans_is_unconfirmed(
+            self, tmp_path):
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        _write_json(understand_dir / "context-map.json",
+                    MINIMAL_CONTEXT_MAP)
+        trace = dict(MINIMAL_FLOW_TRACE)
+        trace["summary"] = {"confidence": "high"}
+        _write_json(understand_dir / "flow-trace-EP-001.json", trace)
+        load_understand_context(understand_dir, validate_dir)
+        paths = json.loads(
+            (validate_dir / "attack-paths.json").read_text())
+        assert paths[0]["trace_verdict"] == "flow_unconfirmed"
+        assert "trace_verdict_note" not in paths[0]
+
+    def test_proximity_clamped_to_schema_range(self, tmp_path):
+        # proximity is LLM-authored: out-of-range or non-numeric
+        # values are clamped into the schema's 0-10 integers instead
+        # of outranking every Stage-B-produced path (or crashing
+        # numeric sorts downstream).
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        _write_json(understand_dir / "context-map.json",
+                    MINIMAL_CONTEXT_MAP)
+        for raw, expected, trace_id in (
+            (99, 10, "TRACE-hi"),
+            (-3, 0, "TRACE-lo"),
+            ("critical", 0, "TRACE-str"),
+        ):
+            trace = dict(MINIMAL_FLOW_TRACE)
+            trace["id"] = trace_id
+            trace["proximity"] = raw
+            _write_json(
+                understand_dir / f"flow-trace-{trace_id}.json", trace)
+        load_understand_context(understand_dir, validate_dir)
+        paths = json.loads(
+            (validate_dir / "attack-paths.json").read_text())
+        by_id = {p["id"]: p for p in paths}
+        assert by_id["TRACE-hi"]["proximity"] == 10
+        assert by_id["TRACE-lo"]["proximity"] == 0
+        assert by_id["TRACE-str"]["proximity"] == 0
+
+    def test_non_dict_entries_in_existing_paths_tolerated(
+            self, tmp_path):
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        _write_json(understand_dir / "context-map.json",
+                    MINIMAL_CONTEXT_MAP)
+        _write_json(understand_dir / "flow-trace-EP-001.json",
+                    MINIMAL_FLOW_TRACE)
+        _write_json(validate_dir / "attack-paths.json",
+                    ["stray-string", {"id": "other"}])
+
+        result = load_understand_context(understand_dir, validate_dir)
+        assert result["flow_traces"]["imported_as_paths"] == 1
+
+    def test_string_trust_boundaries_do_not_crash_surface_merge(
+            self, tmp_path):
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        cm = json.loads(json.dumps(MINIMAL_CONTEXT_MAP))
+        cm["trust_boundaries"] = ["JWT auth middleware"]
+        cm["boundary_details"] = [{"id": "TB-001", "gaps": ["none"]}]
+        _write_json(understand_dir / "context-map.json", cm)
+
+        result = load_understand_context(understand_dir, validate_dir)
+        assert result["context_map_loaded"] is True
+        assert result["attack_surface"]["trust_boundaries"] == 1
+
+    def test_non_string_trace_id_falls_back_to_stem(self, tmp_path):
+        understand_dir = tmp_path / "understand"
+        validate_dir = tmp_path / "validate"
+        understand_dir.mkdir()
+        validate_dir.mkdir()
+        _write_json(understand_dir / "context-map.json",
+                    MINIMAL_CONTEXT_MAP)
+        trace = dict(MINIMAL_FLOW_TRACE)
+        trace["id"] = {"nested": "id"}  # unhashable pre-fix
+        _write_json(understand_dir / "flow-trace-EP-001.json", trace)
+
+        result = load_understand_context(understand_dir, validate_dir)
+        assert result["flow_traces"]["imported_as_paths"] == 1
+        paths = json.loads(
+            (validate_dir / "attack-paths.json").read_text())
+        assert paths[0]["id"] == "flow-trace-EP-001"

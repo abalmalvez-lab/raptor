@@ -28,6 +28,44 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from core.testing.state_isolation import pin_user_state_dirs
+
+# Dispatch here is stubbed/mocked — pass wiring is under test, so the
+# transport kill switch the root conftest sets is cleared for this
+# module.
+pytestmark = pytest.mark.usefixtures("cc_spawn_machinery_enabled")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_active_project(tmp_path_factory, monkeypatch):
+    """Isolate the test from any operator-set active project.
+
+    The lifecycle subprocess reads ``~/.raptor/projects/.active`` to
+    decide if the run's target is inside the active project's bounds.
+    If the operator has a project active that points at a different
+    tree, this test's tmp_path target gets rejected with ''target X
+    is outside project Y'' and the launcher short-circuits before the
+    pointer write — making the test fail in operator-local
+    environments while passing in CI (which has no active project).
+
+    Own the registry through its shared parent/child resolution seam;
+    HOME alone cannot override an inherited RAPTOR_REGISTRY_HOME.
+    Scratch and session credentials also belong to this fixture.
+    """
+    fake_home = tmp_path_factory.mktemp("isolated-home")
+    registry = fake_home / ".raptor"
+    pin_user_state_dirs(monkeypatch, registry)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / ".local/share"))
+    scratch = fake_home / "tmp"
+    scratch.mkdir()
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(key, str(scratch))
+    monkeypatch.delenv("_RAPTOR_SCRATCH_AUTH", raising=False)
+    yield
+
 
 def _write_synthetic_project(tmp_path: Path) -> Path:
     """Project with both live (called from main) and dead
@@ -112,15 +150,17 @@ def test_agentic_launcher_writes_pointer_into_validate_dir(tmp_path):
         return rc_mock
 
     # Mock just enough to bypass the LLM dispatch; the rest of
-    # the flow stays real. Patch ``shutil.which`` so claude
+    # the flow stays real. Patch ``resolve_claude_cli`` so claude
     # appears to exist.
     from core.orchestration import agentic_passes
-    with patch("core.orchestration.agentic_passes.run_untrusted_networked",
+    with patch("core.orchestration.skill_dispatch.run_untrusted_networked",
                side_effect=_capture_dispatch), \
-         patch("core.orchestration.agentic_passes.shutil.which",
+         patch("core.llm.cc_adapter.resolve_claude_cli",
                return_value="/usr/bin/fake-claude"), \
          patch("core.security.rule_of_two."
-               "require_interactive_for_agentic_pass"):
+               "require_human_or_sandbox_for_agentic_pass"), \
+         patch("core.llm.cc_probe.probe_cc_session_model",
+               return_value="fake-model"):
         result = agentic_passes.run_validate_postpass(
             target=target,
             agentic_out_dir=agentic_out,
@@ -299,3 +339,48 @@ def test_e2e_pointer_drives_full_reuse_and_demotion(tmp_path):
     # Live path untouched.
     assert paths_by_id["p-live"]["proximity"] == 8
     assert paths_by_id["p-live"]["blockers"] == []
+
+
+# ---------------------------------------------------------------------------
+# C2-followup: --allow-unreachable threads through the agentic
+# post-pass into the prompt that drives the claude-code validation
+# sub-agent.
+# ---------------------------------------------------------------------------
+
+
+def test_build_validate_prompt_default_omits_allow_unreachable_note():
+    """Sanity: default prompt has no in-isolation-mode notice."""
+    from pathlib import Path
+
+    from core.orchestration.agentic_passes import _build_validate_prompt
+    prompt = _build_validate_prompt(
+        target=Path("/tmp/x"),
+        agentic_out_dir=Path("/tmp/x/out"),
+        validate_dir=Path("/tmp/x/validate"),
+        analysis_report=Path("/tmp/x/report.json"),
+        selection_file=Path("/tmp/x/sel.json"),
+        selected_count=3,
+    )
+    assert "OPERATOR FLAG: --allow-unreachable" not in prompt
+
+
+def test_build_validate_prompt_with_allow_unreachable_includes_notice():
+    """C2-followup: the operator flag surfaces as a prompt section
+    so the claude-code sub-agent knows to thread it into the
+    PipelineConfig when invoking the validation pipeline."""
+    from pathlib import Path
+
+    from core.orchestration.agentic_passes import _build_validate_prompt
+    prompt = _build_validate_prompt(
+        target=Path("/tmp/x"),
+        agentic_out_dir=Path("/tmp/x/out"),
+        validate_dir=Path("/tmp/x/validate"),
+        analysis_report=Path("/tmp/x/report.json"),
+        selection_file=Path("/tmp/x/sel.json"),
+        selected_count=3,
+        allow_unreachable=True,
+    )
+    assert "OPERATOR FLAG: --allow-unreachable" in prompt
+    assert "allow_unreachable=True" in prompt
+    assert "PipelineConfig" in prompt
+    assert "demote_unreachable_paths" in prompt

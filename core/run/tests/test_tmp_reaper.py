@@ -1,0 +1,1908 @@
+"""Tests for core.run.tmp_reaper — stale temp-artifact sweep.
+
+All tests point the reaper at a private tmp_path via a monkeypatched
+``tempfile.gettempdir`` so nothing touches the real system temp dir.
+"""
+
+import os
+import shutil
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+import core.run.tmp_reaper as _reaper_module
+from core.run.tmp_reaper import reap_stale_logs, reap_stale_runs, reap_stale_tmp
+
+
+from core.testing.module_bindings import patch_module_attribute
+from core.testing.module_views import scoped_function_imports
+
+import core.run.tmp_reaper as _tempfile_owner
+
+import core.atomic_fs as _storage_fault_consumer
+
+
+@pytest.fixture(autouse=True)
+def _owned_tempfile_namespace(monkeypatch):
+    """Share temporary-root faults only among this file's consumers."""
+    from core.testing.tempdirs import private_tempfile_module
+    import core.run.tmp_reaper as consumer_0
+
+    private = private_tempfile_module(consumer_0.tempfile)
+    monkeypatch.setattr(consumer_0, "tempfile", private)
+    monkeypatch.setitem(globals(), "tempfile", private)
+
+
+_OLD = time.time() - 25 * 3600  # past the 24h default age floor
+
+# The real namespace probe, captured at import — the autouse
+# root-namespace pin below replaces the module ATTRIBUTE for every
+# test. None on a tree that predates the probe.
+_REAL_IN_CHILD_PID_NS = getattr(_reaper_module, "_in_child_pid_ns", None)
+_REAL_LIVE_CWDS = _reaper_module._live_cwds
+
+
+@pytest.fixture(autouse=True)
+def _idle_fixture_cwds(monkeypatch):
+    # Unit sweeps own private roots. Native cwd discovery has explicit
+    # integration tests below; unknown host liveness still keeps dirs.
+    monkeypatch.setattr(_reaper_module, "_live_cwds", lambda: set())
+
+
+@pytest.fixture
+def native_cwd_probe(monkeypatch):
+    monkeypatch.setattr(_reaper_module, "_live_cwds", _REAL_LIVE_CWDS)
+
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path):
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    with pytest.MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, tmp_path)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(_user_state_in_tmp):
+    """Undo body patches before restoring the file-owned registry pins."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
+@pytest.fixture(autouse=True)
+def _pin_sweep_roots(monkeypatch):
+    """Hermeticity: the sweep also walks the real system tmp root and
+    the lane fallback base by default — every test here must operate
+    on private roots only. The multi-root tests re-point these
+    deliberately."""
+    import core.run.tmp_reaper as reaper_mod
+    monkeypatch.setattr(reaper_mod, "_SYSTEM_TMP_ROOTS", ())
+    monkeypatch.setattr(reaper_mod, "_lane_fallback_bases", lambda: ())
+
+
+@pytest.fixture(autouse=True)
+def _pin_root_pidns(monkeypatch):
+    """Hermeticity: this test session may itself run inside a pid
+    namespace (namespaced batteries, containerised CI), where the
+    reaper refuses pid-liveness reaping outright. Pin the probe to
+    the root-namespace shape; the namespace-behaviour tests override
+    it (``raising=False`` so a pre-probe tree still runs the
+    behavioural asserts instead of erroring in the fixture)."""
+    import core.run.tmp_reaper as reaper_mod
+    monkeypatch.setattr(
+        reaper_mod, "_in_child_pid_ns", lambda: False, raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _guard_pid_one_kill(monkeypatch):
+    """Doctrine guard: no code path exercised here — test or module
+    under test, on any tree — may issue a REAL kill() with pid <= 1,
+    signal 0 included. The kernel's answer to an unprivileged caller
+    is EPERM; raise it without making the syscall. (The SIGKILL drill
+    below runs its kill(0, 9) in a CHILD interpreter, out of reach of
+    this patch by design — it kills its own fresh process group.)"""
+    real_kill = os.kill
+
+    def guarded_kill(pid: int, sig: int) -> None:
+        if pid <= 1:
+            raise PermissionError(
+                "test guard: refusing kill() with pid <= 1")
+        real_kill(pid, sig)
+
+    monkeypatch.setattr(os, "kill", guarded_kill)
+
+
+@pytest.fixture
+def tmp_root(tmp_path, monkeypatch, _owned_tempfile_namespace):
+    monkeypatch.setattr(_tempfile_owner.tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.delenv("RAPTOR_TMP_REAP_MAX_AGE_H", raising=False)
+    return tmp_path
+
+
+def _make_old_dir(root, name, contents=()):
+    d = root / name
+    d.mkdir()
+    for fname in contents:
+        f = d / fname
+        f.write_text("x")
+        # Age the contents too: the internal-activity probe keeps any
+        # dir with a fresh entry inside (a live campaign's writes).
+        os.utime(f, (_OLD, _OLD))
+    os.utime(d, (_OLD, _OLD))
+    return d
+
+
+class TestDirReaping:
+
+    def test_stale_prefixed_dirs_reaped(self, tmp_root):
+        dirs = [
+            _make_old_dir(tmp_root, "raptor-afl-probe-abc12345"),
+            _make_old_dir(tmp_root, "raptor-fuzz-probe-abc12345"),
+            _make_old_dir(tmp_root, "raptor-toolprobe-abc12345"),
+            _make_old_dir(tmp_root, "expanded_semgrep_abc12345"),
+            _make_old_dir(tmp_root, "raptor-rootfs-export-abc12345"),
+            _make_old_dir(tmp_root, "raptor-rootfs-extract-abc12345"),
+            _make_old_dir(tmp_root, "raptor-native-ns-probe-abc12345"),
+            _make_old_dir(tmp_root, "raptor-orchestration-inventory-abc12345"),
+            _make_old_dir(tmp_root, "raptor-codeql-offline-abc12345"),
+            _make_old_dir(tmp_root, "raptor-codeql-import-abc12345"),
+            _make_old_dir(tmp_root, "raptor-llm-raptor-cafe0001-abc123"),
+            _make_old_dir(tmp_root, "raptor-cc-cwd-abc123"),
+            _make_old_dir(tmp_root, "raptor-joern-ws-abc123"),
+            _make_old_dir(tmp_root, "raptor-calibrate-abc123"),
+            _make_old_dir(tmp_root, "raptor_auto_abc123"),
+            _make_old_dir(tmp_root, "raptor-rpm-abc12345"),
+            _make_old_dir(tmp_root, "binoracle_prov_abc12345"),
+            _make_old_dir(tmp_root, "codeql_resolve_abc12345"),
+            _make_old_dir(tmp_root, "cc-sysprompt-abc12345"),
+            _make_old_dir(tmp_root, "raptor-sca-cascade-abc12345"),
+            _make_old_dir(tmp_root, "raptor_git_frk_abc1"),
+            _make_old_dir(tmp_root, "raptor_decomp_abc123"),
+            _make_old_dir(tmp_root, "raptor-cocci-tmp-abc123"),
+            _make_old_dir(tmp_root, "trust-synth-work-abc123"),
+            _make_old_dir(tmp_root, "raptor-iris-codeql-abc123"),
+            _make_old_dir(tmp_root, "raptor_recon_abc123"),
+            _make_old_dir(tmp_root, ".raptor-lane-abc123"),
+            _make_old_dir(tmp_root, ".raptor-sbx-abc123"),
+            _make_old_dir(tmp_root, ".raptor-scratch-abc123"),
+            _make_old_dir(tmp_root, "semmleTempDir123456"),
+            _make_old_dir(tmp_root, "codeql-packaging123456"),
+            _make_old_dir(tmp_root, "scala-repl-pp1234567890"),
+            _make_old_dir(tmp_root, "raptor-pdsig-abc123"),
+            _make_old_dir(tmp_root, "raptor-hifd-abc123"),
+            _make_old_dir(tmp_root, "raptor-persona-abc123"),
+            _make_old_dir(tmp_root, ".scr-a1b2c3_d"),
+            _make_old_dir(tmp_root, ".fp-zyx98_w0"),
+        ]
+        reaped = reap_stale_tmp()
+        assert sorted(reaped) == sorted(dirs)
+        for d in dirs:
+            assert not d.exists()
+
+    def test_stale_pytest_session_dir_reaped(self, tmp_root):
+        # The root conftest's session-tmp containment leaks exactly one
+        # ``raptor-pytest-*`` dir when a test session is SIGKILLed; the
+        # static prefix entry is the cross-process reclamation contract
+        # (runtime registration would die with the killed session).
+        d = _make_old_dir(
+            tmp_root, "raptor-pytest-abc123", ["tmpxyz", "litter.txt"],
+        )
+        assert reap_stale_tmp() == [d]
+        assert not d.exists()
+
+    def test_stale_coord_isolation_probe_dir_reaped(self, tmp_root):
+        # Coordinator-isolation probe dirs are atexit-cleaned, but the
+        # first ones are minted at collection time — before the
+        # conftest TMPDIR containment exists — so a SIGKILLed run
+        # strands them directly under the system tmp.
+        d = _make_old_dir(tmp_root, "raptor-coord-isolation-abc123")
+        assert reap_stale_tmp() == [d]
+        assert not d.exists()
+
+    def test_fresh_dir_kept(self, tmp_root):
+        d = tmp_root / "raptor-llm-raptor-cafe0002-fresh1"
+        d.mkdir()
+        assert reap_stale_tmp() == []
+        assert d.is_dir()
+
+    def test_anchored_prefixes_require_tool_random_suffix(self, tmp_root):
+        """Bare-word third-party names must not claim operator files."""
+        kept = [
+            _make_old_dir(tmp_root, "scala-repl-pp"),       # src checkout
+            _make_old_dir(tmp_root, "scala-repl-pp2"),      # operator copy
+            _make_old_dir(tmp_root, "semmleTempDir.bak"),
+            _make_old_dir(tmp_root, "codeql-packaging-notes"),
+        ]
+        stray = _make_old_dir(tmp_root, "scala-repl-pp98765")
+        reaped = reap_stale_tmp()
+        assert reaped == [stray]
+        for d in kept:
+            assert d.is_dir()
+
+    def test_neutral_prefixes_require_exact_mkdtemp_suffix(self, tmp_root):
+        """.scr-/.fp- are too short to claim on prefix alone."""
+        kept = [
+            _make_old_dir(tmp_root, ".scr-notes"),        # 5 chars
+            _make_old_dir(tmp_root, ".scr-myoldbackup"),  # 11 chars
+            _make_old_dir(tmp_root, ".scr-ABC123_x"),     # uppercase
+            _make_old_dir(tmp_root, ".fp-x"),
+            _make_old_dir(tmp_root, ".fp-12345678a"),     # 9 chars
+        ]
+        strays = [
+            _make_old_dir(tmp_root, ".scr-8charsfx"),
+            _make_old_dir(tmp_root, ".fp-_0a1b2c3"),
+        ]
+        reaped = reap_stale_tmp()
+        assert sorted(reaped) == sorted(strays)
+        for d in kept:
+            assert d.is_dir()
+
+    def test_foreign_prefix_kept(self, tmp_root):
+        d = _make_old_dir(tmp_root, "someone-elses-dir")
+        assert reap_stale_tmp() == []
+        assert d.is_dir()
+
+    def test_observe_keep_dirs_not_reaped(self, tmp_root):
+        # --keep / --out observe dirs are operator-preserved on purpose.
+        d = _make_old_dir(
+            tmp_root, "raptor-observe-abc123", [".sandbox-observe.jsonl"],
+        )
+        assert reap_stale_tmp() == []
+        assert d.is_dir()
+
+    def test_disposable_observe_orphan_reaped(self, tmp_root):
+        path = _make_old_dir(tmp_root, "raptor-observe-tmp-abcdefgh",
+                             [".sandbox-observe.jsonl"])
+        assert reap_stale_tmp() == [path]
+        assert not path.exists()
+
+    def test_kept_observe_with_real_suffix_survives(self, tmp_root):
+        path = _make_old_dir(tmp_root, "raptor-observe-abcdefgh",
+                             [".sandbox-observe.jsonl"])
+        assert reap_stale_tmp() == []
+        assert path.is_dir()
+
+    def test_symlink_squatting_on_prefix_kept(self, tmp_root):
+        target = tmp_root / "victim"
+        target.mkdir()
+        (target / "data.txt").write_text("precious")
+        link = tmp_root / "raptor-llm-raptor-cafe0003-planted"
+        link.symlink_to(target)
+        os.utime(link, (_OLD, _OLD), follow_symlinks=False)
+        assert reap_stale_tmp() == []
+        assert link.is_symlink()
+        assert (target / "data.txt").read_text() == "precious"
+
+    def test_dir_with_answering_socket_kept_then_reaped(self, monkeypatch):
+        # Own short root instead of the tmp_root fixture: AF_UNIX paths
+        # cap at ~108 chars and a nested pytest basetemp (custom TMPDIR)
+        # blows past it. Same workaround as test_proxy_netns_enforcement.
+        import tempfile
+        short_root = tempfile.mkdtemp(prefix="rpt_", dir="/tmp")
+        try:
+            monkeypatch.setattr(_tempfile_owner.tempfile, 'gettempdir', lambda: short_root)
+            monkeypatch.delenv("RAPTOR_TMP_REAP_MAX_AGE_H", raising=False)
+            d = _make_old_dir(Path(short_root),
+                              "raptor-llm-raptor-cafe0004-livesk")
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                srv.bind(str(d / "llm.sock"))
+                srv.listen(1)
+                # Age the socket file too — the internal-activity probe
+                # would otherwise keep the dir on the socket's fresh
+                # mtime and never exercise the answering-socket probe.
+                os.utime(d / "llm.sock", (_OLD, _OLD),
+                         follow_symlinks=False)
+                os.utime(d, (_OLD, _OLD))
+                assert reap_stale_tmp() == []
+                assert d.is_dir()
+            finally:
+                srv.close()
+            # Listener gone → ECONNREFUSED → dead → reaped.
+            assert reap_stale_tmp() == [d]
+            assert not d.exists()
+        finally:
+            shutil.rmtree(short_root, ignore_errors=True)
+
+    def test_old_dir_with_fresh_internal_write_kept(self, tmp_root):
+        # A live >floor campaign whose scratch top-level mtime froze at
+        # creation but whose tools still write inside must survive the
+        # sweep; once the internal activity ages out too, it's reaped.
+        d = _make_old_dir(tmp_root, "raptor_git_live1")
+        (d / "clone.log").write_text("x")  # fresh internal write
+        os.utime(d, (_OLD, _OLD))          # top level frozen at creation
+        assert reap_stale_tmp() == []
+        assert d.is_dir()
+        os.utime(d / "clone.log", (_OLD, _OLD))
+        assert reap_stale_tmp() == [d]
+        assert not d.exists()
+
+    def test_dir_serving_as_live_cwd_kept(self, tmp_root, native_cwd_probe):
+        d = _make_old_dir(tmp_root, "raptor-cc-cwd-livecwd")
+        proc = subprocess.Popen(
+            ["sleep", "30"], cwd=str(d),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            os.utime(d, (_OLD, _OLD))
+            assert reap_stale_tmp() == []
+            assert d.is_dir()
+        finally:
+            proc.terminate()
+            proc.wait()
+
+
+class TestFileReaping:
+
+    def test_stale_sweep_yaml_and_joern_script_reaped(self, tmp_root):
+        files = []
+        for name in ("audit_sweep_ab12cd34.yaml", "wrapped-script42.sc",
+                     "raptor-audit-cfg-ab12cd34.json",
+                     "raptor-cocci-ab12cd34.cocci",
+                     "cocci-output-3-abc123-file.c",
+                     "cocci_small_output-3-abc123-file.c",
+                     "x2cpg1234567890stdout",
+                     "x2cpg1234567890stderr"):
+            f = tmp_root / name
+            f.write_text("rules: []\n")
+            os.utime(f, (_OLD, _OLD))
+            files.append(f)
+        reaped = reap_stale_tmp()
+        assert sorted(reaped) == sorted(files)
+
+    def test_fresh_sweep_yaml_kept(self, tmp_root):
+        f = tmp_root / "audit_sweep_ab12cd34.yaml"
+        f.write_text("rules: []\n")
+        assert reap_stale_tmp() == []
+        assert f.is_file()
+
+    def test_prefix_without_suffix_kept(self, tmp_root):
+        f = tmp_root / "audit_sweep_notes.txt"
+        f.write_text("keep me")
+        os.utime(f, (_OLD, _OLD))
+        assert reap_stale_tmp() == []
+        assert f.is_file()
+
+    def test_anchored_file_pattern_requires_random_middle(self, tmp_root):
+        f = tmp_root / "x2cpg-mynotes-stdout"
+        f.write_text("keep me")
+        os.utime(f, (_OLD, _OLD))
+        assert reap_stale_tmp() == []
+        assert f.is_file()
+
+
+class TestConfigAndSafety:
+
+    def test_env_zero_disables_sweep(self, tmp_root, monkeypatch):
+        d = _make_old_dir(tmp_root, "raptor-llm-raptor-cafe0005-nosweep")
+        monkeypatch.setenv("RAPTOR_TMP_REAP_MAX_AGE_H", "0")
+        assert reap_stale_tmp() == []
+        assert d.is_dir()
+
+    def test_env_shrinks_age_floor(self, tmp_root, monkeypatch):
+        d = tmp_root / "raptor-llm-raptor-cafe0006-young1"
+        d.mkdir()
+        two_h = time.time() - 2 * 3600
+        os.utime(d, (two_h, two_h))
+        assert reap_stale_tmp() == []
+        monkeypatch.setenv("RAPTOR_TMP_REAP_MAX_AGE_H", "1")
+        assert reap_stale_tmp() == [d]
+
+    def test_floor_below_keepalive_minimum_clamped(self, tmp_root,
+                                                   monkeypatch):
+        """An operator floor under two keepalive ticks could reap a
+        LIVE registered scratch between refreshes; it must clamp."""
+        d = tmp_root / "raptor-llm-raptor-cafe0007-young2"
+        d.mkdir()
+        aged = time.time() - 25 * 60  # older than the raw 0.1h floor
+        os.utime(d, (aged, aged))
+        monkeypatch.setenv("RAPTOR_TMP_REAP_MAX_AGE_H", "0.1")
+        assert reap_stale_tmp() == []
+        assert d.is_dir()
+
+    def test_non_numeric_env_falls_back_to_default(self, tmp_root,
+                                                   monkeypatch):
+        d = _make_old_dir(tmp_root, "raptor-llm-raptor-cafe0007-badenv")
+        monkeypatch.setenv("RAPTOR_TMP_REAP_MAX_AGE_H", "soon")
+        assert reap_stale_tmp() == [d]
+
+    def test_never_raises(self, tmp_root, monkeypatch):
+        _make_old_dir(tmp_root, "raptor-llm-raptor-cafe0008-boom")
+
+        def _boom(*a, **kw):
+            raise RuntimeError("listdir exploded")
+
+        patch_module_attribute(monkeypatch, _reaper_module, "os", "listdir", _boom)
+        assert reap_stale_tmp() == []
+
+
+class TestLogReaping:
+    """Log reaping is OPT-IN: audit-trail files are never deleted
+    unless the operator sets RAPTOR_LOG_REAP_MAX_AGE_D."""
+
+    @pytest.fixture
+    def log_dir(self, tmp_path, monkeypatch):
+        from core.config import RaptorConfig
+        monkeypatch.setattr(RaptorConfig, "LOG_DIR", tmp_path)
+        monkeypatch.delenv("RAPTOR_LOG_REAP_MAX_AGE_D", raising=False)
+        return tmp_path
+
+    @staticmethod
+    def _log(root, name, age_s):
+        f = root / name
+        f.write_text("{}\n")
+        t = time.time() - age_s
+        os.utime(f, (t, t))
+        return f
+
+    def test_default_deletes_nothing(self, log_dir):
+        # No env set → audit data untouched no matter how old.
+        ancient = self._log(log_dir, "raptor_1_pid1_1.jsonl", 400 * 86400)
+        assert reap_stale_logs() == []
+        assert ancient.is_file()
+
+    def test_opt_in_reaps_old_keeps_fresh(self, log_dir, monkeypatch):
+        monkeypatch.setenv("RAPTOR_LOG_REAP_MAX_AGE_D", "14")
+        old = self._log(log_dir, "raptor_1_pid1_1.jsonl", 15 * 86400)
+        fresh = self._log(log_dir, "raptor_2_pid2_2.jsonl", 86400)
+        assert reap_stale_logs() == [old]
+        assert not old.exists()
+        assert fresh.is_file()
+
+    def test_non_log_files_kept(self, log_dir, monkeypatch):
+        monkeypatch.setenv("RAPTOR_LOG_REAP_MAX_AGE_D", "14")
+        other = self._log(log_dir, "notes.txt", 30 * 86400)
+        assert reap_stale_logs() == []
+        assert other.is_file()
+
+    def test_env_zero_stays_disabled(self, log_dir, monkeypatch):
+        old = self._log(log_dir, "raptor_1_pid1_1.jsonl", 30 * 86400)
+        monkeypatch.setenv("RAPTOR_LOG_REAP_MAX_AGE_D", "0")
+        assert reap_stale_logs() == []
+        assert old.is_file()
+
+    def test_non_numeric_env_deletes_nothing(self, log_dir, monkeypatch):
+        # Unlike the tmp sweep (worthless artifacts → fall back to the
+        # default), a garbled opt-in for AUDIT DATA must not delete.
+        old = self._log(log_dir, "raptor_1_pid1_1.jsonl", 400 * 86400)
+        monkeypatch.setenv("RAPTOR_LOG_REAP_MAX_AGE_D", "fortnight")
+        assert reap_stale_logs() == []
+        assert old.is_file()
+
+    def test_missing_log_dir_is_noop(self, tmp_path, monkeypatch):
+        from core.config import RaptorConfig
+        monkeypatch.setattr(RaptorConfig, "LOG_DIR", tmp_path / "absent")
+        monkeypatch.setenv("RAPTOR_LOG_REAP_MAX_AGE_D", "14")
+        assert reap_stale_logs() == []
+
+
+class TestRunReaping:
+
+    @pytest.fixture
+    def out_root(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("RAPTOR_RUN_REAP_MAX_AGE_D", raising=False)
+        return tmp_path
+
+    @staticmethod
+    def _run_dir(root, name, status, age_d=45.0, *, with_meta=True):
+        import json
+        from datetime import datetime, timedelta, timezone
+        d = root / name
+        d.mkdir()
+        if with_meta:
+            ts = datetime.now(timezone.utc) - timedelta(days=age_d)
+            (d / ".raptor-run.json").write_text(json.dumps({
+                "version": 2, "command": "scan", "status": status,
+                "timestamp": ts.isoformat(), "extra": {},
+            }))
+        # Back-date the dir mtime to match: the reaper clamps timestamp
+        # age by mtime evidence, and a genuinely old run's dir mtime IS
+        # old — only a fresh sweep rewrite refreshes it.
+        old = time.time() - age_d * 86400
+        os.utime(d, (old, old))
+        return d
+
+    def test_old_failed_and_cancelled_reaped(self, out_root):
+        failed = self._run_dir(out_root, "scan-001", "failed")
+        cancelled = self._run_dir(out_root, "fuzz-001", "cancelled")
+        reaped = reap_stale_runs(out_root)
+        assert sorted(reaped) == sorted([failed, cancelled])
+        assert not failed.exists() and not cancelled.exists()
+
+    def test_completed_and_running_never_reaped(self, out_root):
+        done = self._run_dir(out_root, "scan-001", "completed")
+        live = self._run_dir(out_root, "scan-002", "running")
+        assert reap_stale_runs(out_root) == []
+        assert done.is_dir() and live.is_dir()
+
+    def test_fresh_failed_kept(self, out_root):
+        fresh = self._run_dir(out_root, "scan-001", "failed", age_d=2.0)
+        assert reap_stale_runs(out_root) == []
+        assert fresh.is_dir()
+
+    def test_non_run_dirs_untouched(self, out_root):
+        logs = self._run_dir(out_root, "logs", "failed", with_meta=False)
+        (logs / "raptor_1.jsonl").write_text("{}")
+        assert reap_stale_runs(out_root) == []
+        assert logs.is_dir()
+
+    def test_env_zero_disables(self, out_root, monkeypatch):
+        failed = self._run_dir(out_root, "scan-001", "failed")
+        monkeypatch.setenv("RAPTOR_RUN_REAP_MAX_AGE_D", "0")
+        assert reap_stale_runs(out_root) == []
+        assert failed.is_dir()
+
+    def test_failed_run_aged_from_end_timestamp(self, out_root):
+        # Started 45 days ago, FAILED yesterday: kept — aging from the
+        # start stamp deleted a long run right after it failed (journal
+        # and partial results lost).
+        import json
+        from datetime import datetime, timedelta, timezone
+        d = self._run_dir(out_root, "scan-001", "failed", age_d=45.0)
+        meta = json.loads((d / ".raptor-run.json").read_text())
+        meta["end_timestamp"] = (
+            datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        (d / ".raptor-run.json").write_text(json.dumps(meta))
+        assert reap_stale_runs(out_root) == []
+        assert d.is_dir()
+
+    def test_failed_run_with_old_end_timestamp_reaped(self, out_root):
+        # Two-direction guard: an END past the floor still ages out.
+        import json
+        from datetime import datetime, timedelta, timezone
+        d = self._run_dir(out_root, "scan-001", "failed", age_d=60.0)
+        meta = json.loads((d / ".raptor-run.json").read_text())
+        meta["end_timestamp"] = (
+            datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+        (d / ".raptor-run.json").write_text(json.dumps(meta))
+        assert reap_stale_runs(out_root) == [d]
+        assert not d.exists()
+
+    def test_freshly_swept_old_run_kept(self, out_root):
+        # The sweep-failed path: abandon sweeps record NO end_timestamp
+        # (record_timing=False), but their metadata rewrite refreshes
+        # the dir mtime. A 45-day-old run swept-failed TODAY must get a
+        # full reap window, not instant deletion of its journal and
+        # partial results.
+        import json
+        d = self._run_dir(out_root, "scan-001", "failed", age_d=45.0)
+        meta = json.loads((d / ".raptor-run.json").read_text())
+        meta["extra"] = {"abandon_sweep": True,
+                         "error": "abandoned — owning session terminated"}
+        (d / ".raptor-run.json").write_text(json.dumps(meta))
+        os.utime(d, None)  # the sweep's atomic rewrite refreshed mtime
+        assert reap_stale_runs(out_root) == []
+        assert d.is_dir()
+
+    def test_swept_long_ago_still_reaped(self, out_root):
+        # Two-direction guard: once the SWEEP itself is past the floor
+        # (dir mtime old too), the run ages out normally.
+        import json
+        d = self._run_dir(out_root, "scan-001", "failed", age_d=60.0)
+        meta = json.loads((d / ".raptor-run.json").read_text())
+        meta["extra"] = {"abandon_sweep": True,
+                         "error": "abandoned — owning session terminated"}
+        (d / ".raptor-run.json").write_text(json.dumps(meta))
+        old = time.time() - 40 * 86400
+        os.utime(d, (old, old))
+        assert reap_stale_runs(out_root) == [d]
+        assert not d.exists()
+
+    def test_failed_run_in_use_as_cwd_kept(self, out_root, native_cwd_probe):
+        # A live process cwd'd inside an aged-out failed run (an
+        # operator inspecting the journal) keeps it this sweep.
+        import subprocess
+        d = self._run_dir(out_root, "scan-001", "failed", age_d=45.0)
+        proc = subprocess.Popen(
+            ["sleep", "30"], cwd=str(d),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert reap_stale_runs(out_root) == []
+            assert d.is_dir()
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_mtime_fallback_when_timestamp_malformed(self, out_root):
+        import json
+        d = out_root / "scan-001"
+        d.mkdir()
+        (d / ".raptor-run.json").write_text(json.dumps({
+            "status": "failed", "timestamp": "not-a-date", "extra": {},
+        }))
+        os.utime(d, (_OLD, _OLD))  # only ~25h — under the 30d floor
+        assert reap_stale_runs(out_root) == []
+        old = time.time() - 45 * 86400
+        os.utime(d, (old, old))
+        assert reap_stale_runs(out_root) == [d]
+
+    def test_missing_parent_is_noop(self, tmp_path):
+        assert reap_stale_runs(tmp_path / "absent") == []
+
+    def test_oversize_metadata_skipped_unread(self, out_root):
+        # A metadata file over the byte budget must not be parsed
+        # (bounded load) — the dir is skipped, not reaped, even
+        # though the padded JSON is valid and says failed+stale.
+        import json
+        from datetime import datetime, timedelta, timezone
+        d = out_root / "scan-001"
+        d.mkdir()
+        ts = datetime.now(timezone.utc) - timedelta(days=45)
+        (d / ".raptor-run.json").write_text(json.dumps({
+            "version": 2, "command": "scan", "status": "failed",
+            "timestamp": ts.isoformat(), "extra": {},
+            "padding": "x" * (2 << 20),
+        }))
+        assert reap_stale_runs(out_root) == []
+        assert d.is_dir()
+
+    def test_metadata_at_budget_still_reaped(self, out_root):
+        failed = self._run_dir(out_root, "scan-001", "failed")
+        assert (failed / ".raptor-run.json").stat().st_size <= (1 << 20)
+        assert reap_stale_runs(out_root) == [failed]
+
+    def test_swapped_dir_not_deleted(self, out_root, tmp_path, monkeypatch):
+        # Validation happens against an lstat snapshot; deletion is by
+        # pathname. If another writer swaps a different directory into
+        # the validated name in between (e.g. renames a completed
+        # sibling there), the reaper must notice the identity change
+        # and skip — not delete the swapped-in victim.
+        import shutil as _shutil
+
+        import core.run.tmp_reaper as reaper_mod
+
+        stale = self._run_dir(out_root, "scan-001", "failed")
+        victim = tmp_path / "victim-results"
+        victim.mkdir()
+        (victim / "findings.json").write_text("{}")
+
+        real_age = reaper_mod._run_age_seconds
+
+        def swap_then_age(meta, st, now):
+            # Runs after validation, before the delete: replace the
+            # validated dir with the victim under the same name.
+            _shutil.rmtree(stale)
+            os.rename(victim, stale)
+            return real_age(meta, st, now)
+
+        monkeypatch.setattr(reaper_mod, "_run_age_seconds", swap_then_age)
+        assert reaper_mod.reap_stale_runs(out_root) == []
+        assert (stale / "findings.json").is_file()
+
+
+class TestStartRunHook:
+
+    def test_start_run_invokes_sweeps(self, tmp_path, monkeypatch):
+        import core.run.tmp_reaper as reaper_mod
+        from core.run.metadata import start_run
+
+        calls = []
+        monkeypatch.setattr(
+            reaper_mod, "reap_stale_tmp", lambda: calls.append("tmp") or [],
+        )
+        monkeypatch.setattr(
+            reaper_mod, "reap_stale_logs", lambda: calls.append("logs") or [],
+        )
+        monkeypatch.setattr(
+            reaper_mod, "reap_stale_runs",
+            lambda parent: calls.append(("runs", parent)) or [],
+        )
+        out = tmp_path / "run"
+        start_run(out, "scan")
+        assert calls == ["tmp", "logs", ("runs", out.parent)]
+
+
+def _derived_production_scratch_prefixes(
+    repo_root: Path | None = None,
+) -> dict[str, list[str]]:
+    """Mechanically derive production scratch prefixes.
+
+    Sweeps every production source (tests / core/testing / subsystem scripts /
+    .github excluded) for ``tempfile.mkdtemp(prefix=...)``,
+    ``TemporaryDirectory(prefix=...)`` and ``scratch_dir(...)`` calls
+    that land in the SYSTEM tmp (no contained ``dir=``). All are exit-path-cleaned
+    only — SIGKILL and OOM skip finally/GC — so each derived prefix
+    needs static reaper coverage. This replaces the hand-picked
+    census tuple whose fail direction was disk-leak: a new production
+    mkdtemp prefix outside both hand lists stranded scratch forever.
+    """
+    import ast
+    import subprocess
+
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parents[3]
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "*.py", "libexec/*"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git unavailable — derivation needs the tracked list")
+    found: dict[str, list[str]] = {}
+    for rel in out:
+        parts = rel.split("/")
+        if (parts[:2] == ["core", "testing"]
+                or "tests" in parts or "scripts" in parts
+                or parts[0] == ".github"
+                or parts[-1].startswith("test_")
+                or parts[-1] == "conftest.py"):
+            continue
+        path = repo_root / rel
+        try:
+            src = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not any(name in src for name in ("mkdtemp", "TemporaryDirectory", "scratch_dir")):
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ""
+            if isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                name = node.func.id
+            if name not in ("mkdtemp", "TemporaryDirectory", "scratch_dir"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            dirv = kw.get("dir")
+            if dirv is not None and not (
+                    isinstance(dirv, ast.Constant) and dirv.value is None):
+                continue  # contained under an explicit parent dir
+            pv = kw.get("prefix")
+            if pv is None and name == "scratch_dir" and node.args:
+                pv = node.args[0]
+            if isinstance(pv, ast.Constant) and isinstance(pv.value, str):
+                found.setdefault(pv.value, []).append(rel)
+    return found
+
+
+# Derived prefixes adjudicated OUT of the reaper: their dirs hold
+# operator-facing OUTPUT, not scratch — reaping them would destroy
+# results (the observe-keep test pins the first).
+_REAPER_EXCLUDED_OUTPUT_PREFIXES = {
+    # sandbox observe dirs: --keep / --out operator-preserved on purpose
+    "raptor-observe-",
+    # default sandbox host-output dir: holds a crashed run's results
+    "raptor-host-out-",
+}
+
+
+@pytest.fixture(scope="module")
+def production_scratch_prefixes():
+    """Share only the immutable checkout scan, never synthetic fixture scans."""
+    import json
+    import sys
+    from types import MappingProxyType
+    from core.testing.standalone_cli import run_standalone_cli
+
+    # Preserve real discovery without collecting unrelated worker objects.
+    script = (
+        "import json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from core.run.tests.test_tmp_reaper import _derived_production_scratch_prefixes\n"
+        "print(json.dumps(_derived_production_scratch_prefixes()))\n"
+    )
+    result = run_standalone_cli(
+        [sys.executable, "-I", "-c", script,
+         str(Path(__file__).resolve().parents[3])],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return MappingProxyType({prefix: tuple(paths)
+                             for prefix, paths in json.loads(result.stdout).items()})
+
+
+class TestProductionScratchPrefixDerivation:
+    """The census IS the derivation: every discovered production
+    scratch prefix must be reaper-coverable through one of the three
+    matching mechanisms (or carry an adjudicated output-dir
+    exclusion)."""
+
+    def _covered(self, prefix: str) -> bool:
+        from core.run import tmp_reaper as tr
+        probe_name = prefix + "a1b2c3_4"  # one tempfile random suffix
+        if any(probe_name.startswith(e) for e in tr._dir_prefixes()):
+            return True
+        if any(tr._mkdtemp_anchored_match(probe_name, e)
+               for e in tr._MKDTEMP_ANCHORED_DIR_PREFIXES):
+            return True
+        return any(tr._anchored_name_match(probe_name, e)
+                   for e in tr._ANCHORED_DIR_PREFIXES)
+
+    @pytest.mark.parametrize("factory", ["native", "shared-positional", "shared-keyword", "shared-contained"])
+    def test_shared_test_helpers_excluded_without_hiding_runtime(self, tmp_path, monkeypatch, factory):
+        import subprocess
+        import sys
+        from core.testing.module_views import scoped_function_imports
+        from types import SimpleNamespace
+
+        files = {
+            "core/testing/expected_crash.py": "test-helper-",
+            "core/testing/nested/helper.py": "nested-test-helper-",
+            "core/testing_helpers/worker.py": "production-adjacent-",
+            "packages/testing/worker.py": "production-other-root-",
+            "core/run/worker.py": "production-worker-",
+        }
+        for rel, prefix in files.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if factory == "native":
+                source = f"import tempfile\ntempfile.mkdtemp(prefix={prefix!r})\n"
+            elif factory == "shared-positional":
+                source = f"from core.run.scratch import scratch_dir\nscratch_dir({prefix!r})\n"
+            elif factory == "shared-keyword":
+                source = f"from core.run.scratch import scratch_dir\nscratch_dir(prefix={prefix!r}, dir=None)\n"
+            else:
+                source = f"from core.run.scratch import scratch_dir\nscratch_dir({prefix!r}, dir='owned')\n"
+            path.write_text(source)
+
+        def tracked_files(command, **kwargs):
+            assert command == ["git", "-C", str(tmp_path), "ls-files", "*.py", "libexec/*"]
+            return SimpleNamespace(stdout="\n".join(files))
+
+        original_run = subprocess.run
+        with scoped_function_imports(
+            sys.modules[__name__], ("_derived_production_scratch_prefixes",),
+            {"subprocess": subprocess},
+        ) as imports, monkeypatch.context() as patch:
+            patch.setattr(imports.subprocess, "run", tracked_files)
+            assert subprocess.run is original_run
+            assert _derived_production_scratch_prefixes(tmp_path) == {
+                prefix: [rel] for rel, prefix in files.items()
+                if not rel.startswith("core/testing/") and factory != "shared-contained"
+            }
+
+    def test_every_derived_prefix_is_covered(self, production_scratch_prefixes):
+        found = production_scratch_prefixes
+        misses = {p: files for p, files in sorted(found.items())
+                  if p not in _REAPER_EXCLUDED_OUTPUT_PREFIXES
+                  and not self._covered(p)}
+        assert not misses, (
+            "production scratch prefixes without reaper coverage — a "
+            "SIGKILLed run strands them in the system tmp forever; add "
+            f"a _DIR_PREFIXES entry: {misses}"
+        )
+
+    def test_derivation_is_not_vacuous(self, production_scratch_prefixes):
+        # Two-direction guard: the sweep must actually see the known
+        # production sites (spellings pinned loosely so refactors that
+        # keep the prefix pass).
+        found = production_scratch_prefixes
+        assert len(found) >= 30, sorted(found)
+        assert "raptor-oracle-envbuild-" in found
+        assert any(p.startswith("raptor-sca-") for p in found)
+
+    def test_stale_production_scratch_reaped(self, tmp_root):
+        sample = ("raptor-oracle-envbuild-", "raptor-sca-npm-",
+                  "semgrep-sbx-", "raptor-gcov-")
+        dirs = [_make_old_dir(tmp_root, p + "stray01") for p in sample]
+        reaped = reap_stale_tmp()
+        assert sorted(reaped) == sorted(dirs)
+        for d in dirs:
+            assert not d.exists()
+
+
+# Representative sample for the own-pgid SIGKILL drill below (the
+# full census lives in the derivation test above).
+_SIGKILL_DRILL_PREFIXES = (
+    "raptor-oracle-envbuild-",
+    "raptor-sca-npm-",
+    "corpus-excerpt-",
+    "raptor-compose-",
+    "cve-env-source-",
+)
+
+
+class TestSigkilledProcessStrays:
+    """Own-pgid SIGKILL drill: a child process creates one scratch dir
+    per production prefix and kills its own process group — no
+    interpreter exit path (finally / atexit / __exit__) ever runs,
+    mirroring an OOM-kill or an operator ``kill -9`` of a pipeline.
+    A FRESH interpreter then sweeps: only the static prefix tuple is
+    visible cross-process, so this proves end-to-end reclamation."""
+
+    def test_strays_reaped_by_fresh_process_sweep(self, tmp_path):
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[3]
+        child_code = (
+            "import os, sys, tempfile\n"
+            "for prefix in sys.argv[1:]:\n"
+            "    tempfile.mkdtemp(prefix=prefix, dir=os.environ['TMPDIR'])\n"
+            "os.kill(0, 9)\n"  # SIGKILL own pgid: no exit path runs
+        )
+        env = {k: v for k, v in os.environ.items()
+               if k != "RAPTOR_TMP_REAP_MAX_AGE_H"}
+        env["TMPDIR"] = str(tmp_path)
+        proc = subprocess.run(
+            [sys.executable, "-c", child_code,
+             *_SIGKILL_DRILL_PREFIXES],
+            env=env, start_new_session=True, capture_output=True,
+            timeout=60,
+        )
+        assert proc.returncode == -9, proc.stderr.decode()
+        strays = list(tmp_path.iterdir())
+        assert len(strays) == len(_SIGKILL_DRILL_PREFIXES)
+        for d in strays:
+            os.utime(d, (_OLD, _OLD))
+
+        env["PYTHONPATH"] = str(repo_root)
+        sweeper = subprocess.run(
+            [sys.executable, "-c",
+             # Pin the sweep to the private TMPDIR root: the fresh
+             # interpreter would otherwise also walk the REAL system
+             # tmp root (production behaviour, hermetically wrong and
+             # count-perturbing here).
+             "import core.run.tmp_reaper as t;"
+             "t._SYSTEM_TMP_ROOTS = ();"
+             "t._lane_fallback_bases = lambda: ();"
+             # No process retains a cwd in these owned fixtures: the
+             # creator and its whole group were killed above. A desktop
+             # lsof warning about an unrelated mount is not this test's
+             # cwd-discovery concern (covered separately).
+             "t._live_cwds = lambda: set();"
+             "print(len(t.reap_stale_tmp()))"],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert sweeper.returncode == 0, sweeper.stderr
+        assert sweeper.stdout.strip() == str(len(strays))
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestLiveOwnerKeepalive:
+    """The ownership-transfer prefixes whose dirs can legitimately sit
+    mtime-quiet past the age floor WHILE ALIVE (env work dirs: sandbox
+    rootfs mtime froze at export; compose staging: bind-mount sources;
+    corpus excerpts: read-only for multi-day runs). Their owners hold a
+    scratch keepalive from creation to cleanup — that pairing is what
+    makes the static listing safe, and its absence (dead owner) is what
+    makes the dir reapable."""
+
+    _QUIET_LIVE_PREFIXES = ("raptor-env-", "raptor-compose-",
+                            "corpus-excerpt-")
+
+    @pytest.fixture(autouse=True)
+    def _isolated_keepalive(self, monkeypatch):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(scratch_mod, "_keepalive_paths", set())
+
+    def test_live_owner_survives_dead_owner_reaped(self, tmp_root):
+        from core.run import scratch as scratch_mod
+        from core.run.scratch import keepalive_register, keepalive_unregister
+        for prefix in self._QUIET_LIVE_PREFIXES:
+            d = _make_old_dir(tmp_root, prefix + "live01")
+            keepalive_register(d)
+            # >24h quiet, owner alive: the ticker's refresh protects it.
+            scratch_mod._keepalive_tick()
+            assert reap_stale_tmp() == [], prefix
+            assert d.is_dir(), prefix
+            # Owner cleaned up (or died — no more refresh): reclaimable.
+            keepalive_unregister(d)
+            os.utime(d, (_OLD, _OLD))
+            assert reap_stale_tmp() == [d], prefix
+            assert not d.exists(), prefix
+
+
+class TestDeadPidDirReaping:
+    """reap_dead_pid_dirs — per-pid scratch roots whose embedded pid is
+    the liveness contract (darwin-emu basetemp roots). Dirs are aged
+    past the pid-liveness age floor by default: a liveness verdict
+    alone never reaps a young dir (TestPidLivenessAgeFloor)."""
+
+    @staticmethod
+    def _pid_dir(root, pid, mtime=_OLD):
+        d = root / f"raptor-pytest-emu-{pid}"
+        d.mkdir()
+        (d / "litter").write_text("x")
+        if mtime is not None:
+            os.utime(d, (mtime, mtime))
+        return d
+
+    def _dead_pid(self):
+        # A pid that provably cannot be alive: spawn+reap our own child.
+        from core.testing.processes import reap_on_exit
+        proc = subprocess.Popen(["true"])
+        with reap_on_exit(proc):
+            proc.wait(timeout=10)
+            return proc.pid
+
+    def test_dead_pid_dir_reaped_live_and_own_kept(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        dead = self._pid_dir(tmp_path, self._dead_pid())
+        # The live owner is a spawned child, not getppid(): under a
+        # namespaced battery the controller IS pid 1 in the namespace,
+        # and a pid-1-named dir is age-governed, not liveness-kept.
+        owner = subprocess.Popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            live = self._pid_dir(tmp_path, owner.pid)  # provably alive
+            own = self._pid_dir(tmp_path, os.getpid())
+            assert reap_dead_pid_dirs(
+                tmp_path, "raptor-pytest-emu-") == [dead]
+            assert not dead.exists()
+            assert live.is_dir() and own.is_dir()
+        finally:
+            owner.terminate()
+            owner.wait(timeout=10)
+
+    def test_keep_retains_newest_dead_roots(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        now = time.time()
+        # Three dead roots with distinct ages, all past the liveness
+        # age floor; keep=2 must retain the two newest (pytest's
+        # keep-last-N retention, per-pid level).
+        pids = [self._dead_pid() for _ in range(3)]
+        oldest = self._pid_dir(tmp_path, pids[0], mtime=now - 4 * 3600)
+        mid = self._pid_dir(tmp_path, pids[1], mtime=now - 3 * 3600)
+        newest = self._pid_dir(tmp_path, pids[2], mtime=now - 2 * 3600)
+        reaped = reap_dead_pid_dirs(tmp_path, "raptor-pytest-emu-", keep=2)
+        assert reaped == [oldest]
+        assert mid.is_dir() and newest.is_dir()
+
+    def test_non_matching_names_and_symlinks_kept(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        dead_pid = self._dead_pid()
+        notes = tmp_path / "raptor-pytest-emu-notes"
+        notes.mkdir()
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "data").write_text("precious")
+        link = tmp_path / f"raptor-pytest-emu-{dead_pid}"
+        link.symlink_to(victim)
+        # Aged past every floor: the lstat gate, not the age floor,
+        # must be what refuses the squat.
+        os.utime(link, (_OLD, _OLD), follow_symlinks=False)
+        assert reap_dead_pid_dirs(tmp_path, "raptor-pytest-emu-") == []
+        assert notes.is_dir()
+        assert link.is_symlink()
+        assert (victim / "data").read_text() == "precious"
+
+    def test_foreign_owner_kept(self, tmp_path, monkeypatch):
+        from core.run import tmp_reaper
+        d = self._pid_dir(tmp_path, self._dead_pid())
+        patch_module_attribute(monkeypatch,
+            tmp_reaper, 'os', "geteuid", lambda: os.getuid() + 1,
+        )
+        assert tmp_reaper.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-emu-") == []
+        assert d.is_dir()
+
+    def test_never_raises(self, tmp_path, monkeypatch):
+        from core.run import tmp_reaper
+
+        def _boom(*a, **kw):
+            raise RuntimeError("listdir exploded")
+
+        patch_module_attribute(monkeypatch, tmp_reaper, 'os', "listdir", _boom)
+        assert tmp_reaper.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-emu-") == []
+
+
+class TestMultiRootSweep:
+    """The sweep covers the system tmp root and the lane fallback base
+    in addition to gettempdir() — under the launcher, gettempdir() is
+    the per-session TMPDIR and root-level strays were invisible."""
+
+    @pytest.fixture
+    def roots(self, tmp_path, monkeypatch, _owned_tempfile_namespace):
+        from core.run import tmp_reaper as reaper_mod
+        session = tmp_path / "session-tmp"
+        system = tmp_path / "system-tmp"
+        runuser = tmp_path / "run-user"
+        for d in (session, system, runuser):
+            d.mkdir()
+        monkeypatch.setattr(_tempfile_owner.tempfile, 'gettempdir', lambda: str(session))
+        monkeypatch.setattr(
+            reaper_mod, "_SYSTEM_TMP_ROOTS", (str(system),))
+        monkeypatch.setattr(
+            reaper_mod, "_lane_fallback_bases", lambda: (str(runuser),))
+        monkeypatch.delenv("RAPTOR_TMP_REAP_MAX_AGE_H", raising=False)
+        return session, system, runuser
+
+    def test_stale_strays_reaped_across_all_roots(self, roots):
+        session, system, runuser = roots
+        in_session = _make_old_dir(session, "raptor-pytest-abc123")
+        at_root = _make_old_dir(system, "raptor-pytest-def456")
+        stale_file = system / "audit_sweep_ab12cd34.yaml"
+        stale_file.write_text("rules: []\n")
+        os.utime(stale_file, (_OLD, _OLD))
+        lane = _make_old_dir(runuser, ".raptor-lane-a1b2c3d4")
+        reaped = reap_stale_tmp()
+        assert sorted(reaped) == sorted(
+            [in_session, at_root, stale_file, lane])
+        for p in (in_session, at_root, stale_file, lane):
+            assert not p.exists()
+
+    def test_lane_fallback_base_sweeps_lane_dirs_only(self, roots):
+        _session, _system, runuser = roots
+        # A reaper-known prefix that is NOT a lane: in /run/user/<uid>
+        # only make_lane_dir ever mints RAPTOR artifacts, so anything
+        # else there is out of scope no matter how stale.
+        other = _make_old_dir(runuser, "raptor-llm-raptor-cafe0009-x1")
+        assert reap_stale_tmp() == []
+        assert other.is_dir()
+
+    def test_fresh_and_live_root_strays_kept(self, roots, native_cwd_probe):
+        _session, system, _runuser = roots
+        fresh = system / "raptor-pytest-fresh1"
+        fresh.mkdir()  # young: age floor keeps it
+        live = _make_old_dir(system, "raptor-pytest-livecwd")
+        proc = subprocess.Popen(
+            ["sleep", "30"], cwd=str(live),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            os.utime(live, (_OLD, _OLD))
+            assert reap_stale_tmp() == []
+            assert fresh.is_dir() and live.is_dir()
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_foreign_owned_root_stray_kept(self, roots, monkeypatch):
+        from core.run import tmp_reaper as reaper_mod
+        _session, system, _runuser = roots
+        stray = _make_old_dir(system, "raptor-pytest-foreign1")
+        patch_module_attribute(monkeypatch,
+            reaper_mod, 'os', "geteuid", lambda: os.getuid() + 1)
+        assert reap_stale_tmp() == []
+        assert stray.is_dir()
+
+    def test_gettempdir_at_system_root_dedupes(self, roots, monkeypatch):
+        # Bare-shell shape: gettempdir() IS the system root — one
+        # sweep, no double-reporting.
+        _session, system, _runuser = roots
+        monkeypatch.setattr(_tempfile_owner.tempfile, 'gettempdir', lambda: str(system))
+        stray = _make_old_dir(system, "raptor-pytest-dedupe1")
+        assert reap_stale_tmp() == [stray]
+
+    def test_missing_extra_roots_skipped(self, roots, monkeypatch):
+        from core.run import tmp_reaper as reaper_mod
+        session, _system, _runuser = roots
+        monkeypatch.setattr(
+            reaper_mod, "_SYSTEM_TMP_ROOTS",
+            (str(session.parent / "absent"),))
+        stray = _make_old_dir(session, "raptor-pytest-onlyhere")
+        assert reap_stale_tmp() == [stray]
+
+
+class TestPidSuffixDirReaping:
+    """reap_dead_pid_dirs(pid_suffix=True) — mkdtemp-minted session
+    scratch whose caller embeds the owning pid in the prefix
+    (``raptor-pytest-<pid>-<rand>``). A killed session's scratch must
+    reclaim on the NEXT session's start, not after the 24h age gate
+    (one leaked multi-million-inode tree exhausted /tmp's inodes)."""
+
+    @staticmethod
+    def _sfx_dir(root, pid, tail="aB3xZ0", mtime=_OLD):
+        # Aged past the pid-liveness floor by default — a liveness
+        # verdict alone never reaps a young dir.
+        d = root / f"raptor-pytest-{pid}-{tail}"
+        d.mkdir()
+        (d / "litter").write_text("x")
+        if mtime is not None:
+            os.utime(d, (mtime, mtime))
+        return d
+
+    def _dead_pid(self):
+        from core.testing.processes import reap_on_exit
+        proc = subprocess.Popen(["true"])
+        with reap_on_exit(proc):
+            proc.wait(timeout=10)
+            return proc.pid
+
+    def test_dead_suffixed_dir_reaped_live_kept(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        dead = self._sfx_dir(tmp_path, self._dead_pid())
+        # Spawned child, not getppid(): under a namespaced battery the
+        # controller is pid 1 and its name would be age-governed.
+        owner = subprocess.Popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            live = self._sfx_dir(tmp_path, owner.pid)
+            got = reap_dead_pid_dirs(
+                tmp_path, "raptor-pytest-", pid_suffix=True)
+            assert got == [dead]
+            assert not dead.exists() and live.is_dir()
+        finally:
+            owner.terminate()
+            owner.wait(timeout=10)
+
+    def test_suffix_shape_is_strict(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        dead_pid = self._dead_pid()
+        # No suffix separator / no tail / word segment: never matched
+        # by the widened rule (the emu family and legacy random-only
+        # names stay with their own sweeps).
+        bare = tmp_path / f"raptor-pytest-{dead_pid}"
+        bare.mkdir()
+        emptytail = tmp_path / f"raptor-pytest-{dead_pid}-"
+        emptytail.mkdir()
+        emu = tmp_path / f"raptor-pytest-emu-{dead_pid}"
+        emu.mkdir()
+        legacy = tmp_path / "raptor-pytest-aB3xZ0"
+        legacy.mkdir()
+        assert reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == []
+        for d in (bare, emptytail, emu, legacy):
+            assert d.is_dir()
+
+    def test_without_flag_suffixed_names_untouched(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        d = self._sfx_dir(tmp_path, self._dead_pid())
+        assert reap_dead_pid_dirs(tmp_path, "raptor-pytest-") == []
+        assert d.is_dir()
+
+    def test_symlink_squat_never_followed(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "keep").write_text("x")
+        link = tmp_path / f"raptor-pytest-{self._dead_pid()}-sq"
+        link.symlink_to(victim)
+        os.utime(link, (_OLD, _OLD), follow_symlinks=False)
+        got = reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        # The lstat gate must refuse the squat OUTRIGHT — pin the
+        # return value and the link's survival, not just the victim's
+        # content (rmtree's own symlink refusal would mask a gate
+        # regression otherwise).
+        assert got == []
+        assert link.is_symlink()
+        assert (victim / "keep").exists()
+
+    def test_poison_digit_name_never_aborts_the_sweep(self, tmp_path):
+        # str.isdigit() accepts non-ASCII digits int() rejects: a
+        # planted `raptor-pytest-²-x` once raised ValueError and —
+        # through the never-raises wrapper — silently no-op'd the
+        # ENTIRE sweep (one-dir DoS, plantable by any local user in
+        # sticky /tmp). The legit dead sibling must still reap.
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        poison = tmp_path / "raptor-pytest-²-x"
+        poison.mkdir()
+        dead = self._sfx_dir(tmp_path, self._dead_pid())
+        got = reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == [dead]
+        assert not dead.exists() and poison.is_dir()
+
+    def test_poison_digit_name_never_aborts_emu_sweep(self, tmp_path):
+        # Same latent idiom on the exact-name branch (emu family).
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        poison = tmp_path / "raptor-pytest-emu-²"
+        poison.mkdir()
+        dead = tmp_path / f"raptor-pytest-emu-{self._dead_pid()}"
+        dead.mkdir()
+        os.utime(dead, (_OLD, _OLD))
+        got = reap_dead_pid_dirs(tmp_path, "raptor-pytest-emu-")
+        assert got == [dead]
+        assert poison.is_dir()
+
+    def test_pid_zero_never_reaped(self, tmp_path):
+        # kill(0, 0) probes the caller's own process group — pid 0
+        # reads eternally live; exclude it outright.
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        d = self._sfx_dir(tmp_path, 0)
+        assert reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == []
+        assert d.is_dir()
+
+
+class TestPidFileReaping:
+    """Pid-owned scorecard sidecars: the embedded pid is the liveness
+    contract — dead-owner pairs reap regardless of age, live-owner
+    pairs (the flock target especially) survive regardless of age,
+    and non-pid spellings under the shared prefix keep the dir
+    branch's squat semantics."""
+
+    @staticmethod
+    def _dead_pid():
+        from core.testing.processes import reap_on_exit
+        proc = subprocess.Popen(["true"])
+        with reap_on_exit(proc):
+            proc.wait(timeout=10)
+            return proc.pid
+
+    @staticmethod
+    def _sidecar_pair(root, pid, mtime=None):
+        pair = []
+        for suffix in (".json", ".json.lock"):
+            f = root / f"raptor-pytest-scorecard-{pid}{suffix}"
+            f.write_text("{}")
+            if mtime is not None:
+                os.utime(f, (mtime, mtime))
+            pair.append(f)
+        return pair
+
+    def test_dead_pid_pair_reaped_even_fresh(self, tmp_root):
+        pair = self._sidecar_pair(tmp_root, self._dead_pid())
+        assert sorted(reap_stale_tmp()) == sorted(pair)
+        assert not any(f.exists() for f in pair)
+
+    def test_live_pid_pair_kept_even_old(self, tmp_root):
+        own = self._sidecar_pair(tmp_root, os.getpid(), mtime=_OLD)
+        parent = self._sidecar_pair(tmp_root, os.getppid(), mtime=_OLD)
+        assert reap_stale_tmp() == []
+        assert all(f.exists() for f in own + parent)
+
+    def test_non_pid_spelling_keeps_squat_semantics(self, tmp_root):
+        # Matches the raptor-pytest- DIR prefix but not the pid-file
+        # grammar: stays a dir candidate, where the S_ISDIR guard
+        # skips a plain file ("squatting on our prefix — not ours").
+        f = tmp_root / "raptor-pytest-scorecard-notes.json"
+        f.write_text("{}")
+        os.utime(f, (_OLD, _OLD))
+        assert reap_stale_tmp() == []
+        assert f.exists()
+
+    def test_pid_file_match_grammar(self):
+        from core.run.tmp_reaper import _pid_file_match
+        pre = "raptor-pytest-scorecard-"
+        assert _pid_file_match(f"{pre}123.json", pre, ".json") == 123
+        assert _pid_file_match(
+            f"{pre}123.json.lock", pre, ".json.lock") == 123
+        # The .json pattern must not swallow the lock sibling.
+        assert _pid_file_match(f"{pre}123.json.lock", pre, ".json") is None
+        # Digits are mandatory and exclusive.
+        assert _pid_file_match(f"{pre}.json", pre, ".json") is None
+        assert _pid_file_match(f"{pre}12x3.json", pre, ".json") is None
+        assert _pid_file_match(f"{pre}123.txt", pre, ".json") is None
+
+    def test_poison_pid_kept_and_sweep_completes(self, tmp_root):
+        # os.kill raises OverflowError (not OSError) for out-of-range
+        # pids: a poison-named euid-owned file must be KEPT while the
+        # rest of the sweep still runs — one hostile name must never
+        # starve every candidate after it.
+        poison = tmp_root / f"raptor-pytest-scorecard-{10**30}.json"
+        poison.write_text("{}")
+        dead = self._sidecar_pair(tmp_root, self._dead_pid())
+        assert sorted(reap_stale_tmp()) == sorted(dead)
+        assert poison.exists()
+        assert not any(f.exists() for f in dead)
+
+    def test_dead_pid_pair_kept_in_child_pid_ns(self, tmp_root,
+                                                monkeypatch):
+        # Inside a child pid namespace every outer session's LIVE pid
+        # probes ESRCH — a "dead" verdict there would unlink a live
+        # holder's flock target, letting a second process "hold" a
+        # fresh lock beside it. The pair stays; the next
+        # root-namespace sweep reclaims genuinely dead pairs.
+        import core.run.tmp_reaper as reaper_mod
+        monkeypatch.setattr(
+            reaper_mod, "_in_child_pid_ns", lambda: True, raising=False,
+        )
+        pair = self._sidecar_pair(tmp_root, self._dead_pid())
+        assert reap_stale_tmp() == []
+        assert all(f.exists() for f in pair)
+
+    def test_pid_one_pair_kept_without_probing(self, tmp_root,
+                                               monkeypatch):
+        # pid 1 is init in every namespace: the file reads alive with
+        # NO kill() call (no probe with pid <= 1 is ever made).
+        import core.run.tmp_reaper as reaper_mod
+        calls: list[int] = []
+        real_kill = os.kill
+
+        def recording_kill(pid: int, sig: int):
+            calls.append(pid)
+            return real_kill(pid, sig)
+
+        patch_module_attribute(monkeypatch, reaper_mod, 'os', "kill", recording_kill)
+        pair = self._sidecar_pair(tmp_root, 1, mtime=_OLD)
+        assert reap_stale_tmp() == []
+        assert all(f.exists() for f in pair)
+        assert not [p for p in calls if p <= 1]
+
+
+class TestPidLivenessAgeFloor:
+    """The mtime age floor on pid-liveness dir reaping: ESRCH alone is
+    never sufficient for a YOUNG dir (namespace-minted names and pid
+    reuse make young+dead-probing a live-session signature)."""
+
+    @staticmethod
+    def _dead_pid() -> int:
+        from core.testing.processes import reap_on_exit
+        proc = subprocess.Popen(["true"])
+        with reap_on_exit(proc):
+            proc.wait(timeout=10)
+            return proc.pid
+
+    def _dir(self, root, pid, age_s):
+        d = root / f"raptor-pytest-{pid}-sess"
+        d.mkdir()
+        (d / "litter").write_text("x")
+        t = time.time() - age_s
+        os.utime(d, (t, t))
+        return d
+
+    def test_young_dead_dir_kept(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        d = self._dir(tmp_path, self._dead_pid(), age_s=60)
+        assert reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == []
+        assert d.is_dir()
+
+    def test_old_dead_dir_still_reaped(self, tmp_path):
+        # Two-direction guard: the floor must not neuter the sweep —
+        # dead-session cleanup is why it exists.
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        d = self._dir(tmp_path, self._dead_pid(), age_s=2 * 3600)
+        assert reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == [d]
+        assert not d.exists()
+
+    def test_floor_bounds_hold_their_rationale(self):
+        # Two-direction regression pin for the churn-prone limits
+        # (rationale inline at their definitions):
+        #  - the dead floor must cover at least two scratch-keepalive
+        #    ticks or a LIVE keepalive'd dir can age past it between
+        #    refreshes;
+        #  - it must stay within hours or the sweep stops adding value
+        #    over the 24h stale-tmp gate (inode-exhaustion leaks need
+        #    same-day reclamation);
+        #  - the unverifiable floor sits at or above the dead floor
+        #    (less evidence never reaps sooner) and stays finite and
+        #    bounded so namespace-minted pid-1 roots do get cleaned.
+        from core.run.scratch import _KEEPALIVE_INTERVAL_S
+        from core.run.tmp_reaper import (
+            _PID_DIR_AGE_FLOOR_S,
+            _UNVERIFIABLE_PID_DIR_AGE_FLOOR_S,
+        )
+        assert _PID_DIR_AGE_FLOOR_S >= 2 * _KEEPALIVE_INTERVAL_S
+        assert _PID_DIR_AGE_FLOOR_S <= 4 * 3600
+        assert (_UNVERIFIABLE_PID_DIR_AGE_FLOOR_S
+                >= _PID_DIR_AGE_FLOOR_S)
+        assert _UNVERIFIABLE_PID_DIR_AGE_FLOOR_S <= 7 * 86400
+
+
+class TestUnverifiableOwnerDirs:
+    """pid-1-named and EPERM-probing dirs: the owner is unknowable
+    from here (namespace-minted names, recycled pids), so they are
+    age-governed instead of kept forever — the observed accretion ran
+    to hundreds of never-reaped roots."""
+
+    def _dir(self, root, pid, age_s, name_tail="-sess"):
+        d = root / f"raptor-pytest-{pid}{name_tail}"
+        d.mkdir()
+        (d / "litter").write_text("x")
+        t = time.time() - age_s
+        os.utime(d, (t, t))
+        return d
+
+    def test_old_pid_one_dir_reaped(self, tmp_path):
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        d = self._dir(tmp_path, 1, age_s=25 * 3600)
+        assert reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == [d]
+        assert not d.exists()
+
+    def test_young_pid_one_dir_kept(self, tmp_path):
+        # Past the dead floor but under the unverifiable floor: a
+        # possibly-live namespaced session's own scratch survives.
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        d = self._dir(tmp_path, 1, age_s=2 * 3600)
+        assert reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == []
+        assert d.is_dir()
+
+    def test_no_kill_call_ever_probes_pid_one(self, tmp_path,
+                                              monkeypatch):
+        # Verified-pid discipline: pid 1 is classified without any
+        # kill() call — a probe against init is meaningless and a
+        # kill call with pid <= 1 is never allowed to exist.
+        import core.run.tmp_reaper as reaper_mod
+        calls: list[int] = []
+        real_kill = os.kill
+
+        def recording_kill(pid: int, sig: int):
+            calls.append(pid)
+            return real_kill(pid, sig)
+
+        patch_module_attribute(monkeypatch, reaper_mod, 'os', "kill", recording_kill)
+        self._dir(tmp_path, 1, age_s=25 * 3600)
+        reaper_mod.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert not [p for p in calls if p <= 1]
+
+    def test_eperm_owner_age_governed(self, tmp_path, monkeypatch):
+        # EPERM = some OTHER uid's process holds the pid now: the
+        # same-euid owner is gone or unknowable. Old dir reaped,
+        # young-ish (past dead floor only) dir kept.
+        import core.run.tmp_reaper as reaper_mod
+        target = subprocess.Popen(["true"])
+        target.wait(timeout=10)
+        eperm_pid = target.pid
+        real_kill = os.kill
+
+        def eperm_kill(pid: int, sig: int):
+            if pid == eperm_pid and sig == 0:
+                raise PermissionError("simulated foreign-uid holder")
+            return real_kill(pid, sig)
+
+        patch_module_attribute(monkeypatch, reaper_mod, 'os', "kill", eperm_kill)
+        old = self._dir(tmp_path, eperm_pid, age_s=25 * 3600)
+        young = self._dir(tmp_path, eperm_pid, age_s=2 * 3600,
+                          name_tail="-young")
+        got = reaper_mod.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == [old]
+        assert not old.exists() and young.is_dir()
+
+    def test_foreign_owned_dirs_skipped_quietly(self, tmp_path,
+                                                monkeypatch, caplog):
+        # Root-owned strays cannot be removed unprivileged: skipped
+        # without crashing, disclosed in ONE aggregated line — never
+        # per-entry spam, never a silent forever-retry.
+        import logging as _logging
+
+        import core.run.tmp_reaper as reaper_mod
+        for i in range(3):
+            self._dir(tmp_path, 1, age_s=25 * 3600,
+                      name_tail=f"-r{i}")
+        patch_module_attribute(monkeypatch,
+            reaper_mod, 'os', "geteuid", lambda: os.getuid() + 1)
+        with caplog.at_level(_logging.INFO, logger="core.run.tmp_reaper"):
+            got = reaper_mod.reap_dead_pid_dirs(
+                tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == []
+        assert len(list(tmp_path.iterdir())) == 3
+        disclosures = [r for r in caplog.records
+                       if "owned by another user" in r.getMessage()]
+        assert len(disclosures) == 1
+
+    def test_unremovable_dir_not_reported_reaped(self, tmp_path,
+                                                 monkeypatch, caplog):
+        # Permission residue INSIDE a same-euid dir (root-owned files
+        # from a privileged child): rmtree cannot finish. The sweep
+        # must not crash, must not claim the dir reaped, and must
+        # disclose once. Simulated at the rmtree seam — minting real
+        # root-owned residue needs privileges tests don't have.
+        import logging as _logging
+
+        import core.run.tmp_reaper as reaper_mod
+        d = self._dir(tmp_path, 1, age_s=25 * 3600)
+        patch_module_attribute(monkeypatch, _storage_fault_consumer, 'shutil', 'rmtree', lambda *a, **kw: None)
+        with caplog.at_level(_logging.INFO, logger="core.run.tmp_reaper"):
+            got = reaper_mod.reap_dead_pid_dirs(
+                tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == []
+        assert d.is_dir()
+        disclosures = [r for r in caplog.records
+                       if "resisted removal" in r.getMessage()]
+        assert len(disclosures) == 1
+
+
+class TestMidSweepVanish:
+    """A candidate dir can vanish between classification and removal
+    (a concurrent sweep, or the owner's own exit-path cleanup, wins
+    the race). Historically that race crashed the sweep mid-walk with
+    FileNotFoundError; today the sweep must finish the walk, still
+    reap the remaining dirs, and report only what it actually
+    removed."""
+
+    @staticmethod
+    def _dead_pid() -> int:
+        from core.testing.processes import reap_on_exit
+        proc = subprocess.Popen(["true"])
+        with reap_on_exit(proc):
+            proc.wait(timeout=10)
+            return proc.pid
+
+    def _dir(self, root, pid, age_s, tail="-sess"):
+        d = root / f"raptor-pytest-{pid}{tail}"
+        d.mkdir()
+        (d / "litter").write_text("x")
+        t = time.time() - age_s
+        os.utime(d, (t, t))
+        return d
+
+    def test_vanish_after_classification_not_reported_sweep_continues(
+            self, tmp_path, monkeypatch):
+        # The dir disappears while its pid is being probed — after
+        # the classifying lstat, before the delete pass. The pre-
+        # delete identity re-check must skip it (nothing to reap, so
+        # nothing to report) and the older sibling must still reap.
+        import shutil as _shutil
+
+        import core.run.tmp_reaper as reaper_mod
+        vanish_pid = self._dead_pid()
+        vanished = self._dir(tmp_path, vanish_pid, age_s=2 * 3600)
+        sibling = self._dir(tmp_path, self._dead_pid(),
+                            age_s=3 * 3600, tail="-sib")
+        real_kill = os.kill
+
+        def vanishing_kill(pid: int, sig: int):
+            if pid == vanish_pid and sig == 0 and vanished.exists():
+                _shutil.rmtree(vanished)
+            return real_kill(pid, sig)
+
+        patch_module_attribute(monkeypatch, reaper_mod, 'os', "kill", vanishing_kill)
+        got = reaper_mod.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == [sibling]  # only what THIS sweep removed
+        assert not sibling.exists()
+        assert not vanished.exists()
+
+    def test_vanish_between_identity_check_and_rmtree_never_crashes(
+            self, tmp_path, monkeypatch):
+        # The narrower window: the dir survives the pre-delete
+        # identity re-check and vanishes just before rmtree runs.
+        # Robustness there rests on rmtree's error suppression — with
+        # it mutated away, the sweep dies mid-walk (the historic
+        # FileNotFoundError shape) and the sibling below is never
+        # reaped.
+        import shutil as _shutil
+
+        import core.run.tmp_reaper as reaper_mod
+        target = self._dir(tmp_path, self._dead_pid(), age_s=2 * 3600)
+        sibling = self._dir(tmp_path, self._dead_pid(),
+                            age_s=3 * 3600, tail="-sib")
+        real_rmtree = _shutil.rmtree
+
+        def racing_rmtree(path, *args, **kwargs):
+            if Path(path) == target and target.exists():
+                real_rmtree(target)  # another actor wins the race
+            return real_rmtree(path, *args, **kwargs)
+
+        patch_module_attribute(monkeypatch, _storage_fault_consumer, 'shutil', 'rmtree', racing_rmtree)
+        got = reaper_mod.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == [target, sibling]  # newest-first delete order
+        assert not target.exists() and not sibling.exists()
+
+
+_UNSHARE_CMD = ("unshare", "-Urpf", "--mount-proc")
+_unshare_ok: "bool | None" = None
+
+
+def _unshare_available() -> bool:
+    global _unshare_ok
+    if _unshare_ok is None:
+        try:
+            _unshare_ok = subprocess.run(
+                [*_UNSHARE_CMD, "true"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=30,
+            ).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            _unshare_ok = False
+    return _unshare_ok
+
+
+class TestPidNamespaceRefusal:
+    """A pytest session inside a pid namespace (namespaced batteries,
+    nested CI containers) sees every OUTER session's live pid as dead
+    (ESRCH). The pre-fix sweep deleted their live scratch under the
+    shared /tmp mid-run; the reaper now refuses pid-liveness reaping
+    outside the root pid namespace."""
+
+    def test_probe_exists_and_answers(self):
+        # The REAL probe (import-time capture — the autouse pin
+        # replaces the module attribute): callable in any namespace,
+        # always a bool, never an exception.
+        assert _REAL_IN_CHILD_PID_NS is not None, (
+            "core.run.tmp_reaper._in_child_pid_ns is missing")
+        assert isinstance(_REAL_IN_CHILD_PID_NS(), bool)
+
+    def test_child_ns_keeps_even_dead_pid_dirs(self, tmp_path,
+                                               monkeypatch):
+        # Full refusal: in a child namespace even a genuinely dead
+        # pid's dir is left for the next root-namespace sweep — no
+        # verdict from in here is trustworthy about out there.
+        import core.run.tmp_reaper as reaper_mod
+        monkeypatch.setattr(
+            reaper_mod, "_in_child_pid_ns", lambda: True, raising=False,
+        )
+        proc = subprocess.Popen(["true"])
+        proc.wait(timeout=10)
+        d = tmp_path / f"raptor-pytest-{proc.pid}-oldsess"
+        d.mkdir()
+        os.utime(d, (_OLD, _OLD))
+        assert reaper_mod.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True) == []
+        assert d.is_dir()
+
+    def test_live_owner_looks_dead_from_child_ns_dir_survives(
+            self, tmp_path, monkeypatch):
+        # The observed collateral incident's shape: a concurrent LIVE
+        # session owns aged scratch; from inside a pid namespace its
+        # pid probes ESRCH (simulated at the kill seam — a real
+        # namespace cannot even see the pid to lie about it). Only
+        # the namespace refusal stands between the dir and rmtree; on
+        # the pre-fix logic it is deleted mid-run.
+        import core.run.tmp_reaper as reaper_mod
+        owner = subprocess.Popen(
+            ["sleep", "60"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert owner.poll() is None  # verified live
+            d = tmp_path / f"raptor-pytest-{owner.pid}-livesess"
+            d.mkdir()
+            (d / "in-flight").write_text("x")
+            os.utime(d / "in-flight", (_OLD, _OLD))
+            os.utime(d, (_OLD, _OLD))
+            monkeypatch.setattr(
+                reaper_mod, "_in_child_pid_ns", lambda: True,
+                raising=False,
+            )
+            real_kill = os.kill
+
+            def ns_blind_kill(pid: int, sig: int):
+                if pid == owner.pid and sig == 0:
+                    raise ProcessLookupError  # what a child ns reports
+                return real_kill(pid, sig)
+
+            patch_module_attribute(monkeypatch, reaper_mod, 'os', "kill", ns_blind_kill)
+            got = reaper_mod.reap_dead_pid_dirs(
+                tmp_path, "raptor-pytest-", pid_suffix=True)
+            assert got == []
+            assert d.is_dir() and (d / "in-flight").exists()
+            assert owner.poll() is None  # owner untouched throughout
+        finally:
+            owner.terminate()
+            owner.wait(timeout=10)
+
+    # The kernel's fixed initial-pid-namespace nsfs inode
+    # (PROC_PID_INIT_INO, ABI-stable). Deliberately a LOCAL copy, not
+    # an import: the skip decision below must never depend on the
+    # module constant under test — a wrong module constant has to
+    # fail the assertions, not turn them into a skip.
+    _KERNEL_PROC_PID_INIT_INO = 0xEFFFFFFC
+
+    def test_root_ns_host_reaps_through_the_real_probe(
+            self, tmp_path, monkeypatch):
+        # The inverse direction, end-to-end with the probe UNPINNED:
+        # on a root-namespace host the real probe must read False and
+        # the sweep must actually reap an aged dead-owner dir. This
+        # closes the silent no-reap regression: a probe stuck True
+        # (e.g. a wrong nsfs inode constant) makes every production
+        # sweep refuse forever, and every probe-pinning test here is
+        # blind to that.
+        import sys as _sys
+        if _sys.platform != "linux":
+            pytest.skip("pid namespaces are Linux-only")
+        try:
+            ino = os.stat("/proc/self/ns/pid").st_ino
+        except OSError:
+            pytest.skip("/proc/self/ns/pid unreadable on this host")
+        if ino != self._KERNEL_PROC_PID_INIT_INO:
+            pytest.skip("host itself runs inside a child pid "
+                        "namespace — no root-namespace reap to assert")
+        import core.run.tmp_reaper as reaper_mod
+        assert _REAL_IN_CHILD_PID_NS is not None, (
+            "core.run.tmp_reaper._in_child_pid_ns is missing")
+        # Undo the autouse root-namespace pin: the REAL probe decides.
+        monkeypatch.setattr(
+            reaper_mod, "_in_child_pid_ns", _REAL_IN_CHILD_PID_NS)
+        assert reaper_mod._in_child_pid_ns() is False
+        # Deliberately kill-free: this is the one test that runs a
+        # sweep OUTSIDE any pid namespace (the whole point), so it
+        # must not itself issue signals — the dead owner is a
+        # spawned-and-reaped child (exits on its own), the live owner
+        # is the provably-alive parent process, and the sweep's own
+        # probes are signal 0 only.
+        dead_proc = subprocess.Popen(["true"])
+        dead_proc.wait(timeout=10)
+        dead = tmp_path / f"raptor-pytest-{dead_proc.pid}-oldsess"
+        dead.mkdir()
+        os.utime(dead, (_OLD, _OLD))
+        young = tmp_path / f"raptor-pytest-{dead_proc.pid}-fresh"
+        young.mkdir()  # dead owner but under the age floor: kept
+        live = tmp_path / f"raptor-pytest-{os.getppid()}-livesess"
+        live.mkdir()
+        # Aged past the dead floor (the liveness probe, not the age
+        # gate, must be what keeps it) but under the unverifiable
+        # floor, so a parent that happens to be pid 1 still keeps.
+        aged = time.time() - 2 * 3600
+        os.utime(live, (aged, aged))
+        got = reaper_mod.reap_dead_pid_dirs(
+            tmp_path, "raptor-pytest-", pid_suffix=True)
+        assert got == [dead]
+        assert not dead.exists()
+        assert young.is_dir() and live.is_dir()
+
+    @pytest.mark.linux_native
+    def test_real_namespace_refuses_liveness_reaping(self, tmp_path):
+        # End-to-end against a REAL pid namespace: a live owner on
+        # the host, its aged dir (plus a genuinely dead sibling) in a
+        # PRIVATE root, the sweep run from inside unshare. Pre-fix,
+        # both probe ESRCH and both are reaped — the live session
+        # loses its scratch. Fixed, the in-namespace probe reads
+        # child and the sweep refuses.
+        if not _unshare_available():
+            pytest.skip("unprivileged unshare -Urpf --mount-proc "
+                        "unavailable on this host")
+        import sys as _sys
+        repo_root = Path(__file__).resolve().parents[3]
+        script = tmp_path / "ns_sweep.py"
+        script.write_text(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, sys.argv[2])\n"
+            "from core.run import tmp_reaper\n"
+            "print(json.dumps({\n"
+            "    'in_child_ns': tmp_reaper._in_child_pid_ns(),\n"
+            "    'reaped': [str(p) for p in tmp_reaper."
+            "reap_dead_pid_dirs(\n"
+            "        Path(sys.argv[1]), 'raptor-pytest-', "
+            "pid_suffix=True)],\n"
+            "}))\n"
+        )
+        root = tmp_path / "tmproot"
+        root.mkdir()
+        dead_proc = subprocess.Popen(["true"])
+        dead_proc.wait(timeout=10)
+        dead = root / f"raptor-pytest-{dead_proc.pid}-oldsess"
+        dead.mkdir()
+        os.utime(dead, (_OLD, _OLD))
+        owner = subprocess.Popen(
+            ["sleep", "120"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert owner.poll() is None
+            live = root / f"raptor-pytest-{owner.pid}-livesess"
+            live.mkdir()
+            os.utime(live, (_OLD, _OLD))
+            proc = subprocess.run(
+                [*_UNSHARE_CMD, _sys.executable, str(script),
+                 str(root), str(repo_root)],
+                capture_output=True, text=True, timeout=120,
+            )
+            assert proc.returncode == 0, proc.stderr
+            import json
+            result = json.loads(proc.stdout)
+            assert result["in_child_ns"] is True
+            assert result["reaped"] == []
+            assert live.is_dir() and dead.is_dir()
+            assert owner.poll() is None
+        finally:
+            owner.terminate()
+            owner.wait(timeout=10)
+
+
+@pytest.mark.parametrize("outcome", ["busy", "unavailable"], ids=["live-cwd", "unknown-liveness"])
+def test_darwin_cwd_probe_keeps_live_or_unverifiable_scratch(tmp_path, monkeypatch, outcome, native_cwd_probe):
+    import subprocess
+    from types import SimpleNamespace
+    from core.run import tmp_reaper as reaper
+
+    monkeypatch.setattr(reaper, "sys", SimpleNamespace(platform="darwin"))
+    def lsof(command, **kwargs):
+        assert command[:2] == ["/usr/sbin/lsof", "-a"]
+        return SimpleNamespace(returncode=0 if outcome == "busy" else 1,
+                               stdout="p123\nn" + str(tmp_path) + "\n", stderr="")
+    with scoped_function_imports(
+        reaper, ("_live_cwds",), {"subprocess": subprocess},
+    ) as imports:
+        monkeypatch.setattr(imports.subprocess, "run", lsof)
+        assert reaper._dir_in_use(tmp_path, reaper._live_cwds()) is True
+
+
+def test_unavailable_cwd_probe_is_cached_for_the_whole_sweep(tmp_root, monkeypatch):
+    from core.run import tmp_reaper as reaper
+    dirs = [_make_old_dir(tmp_root, 'raptor-cc-cwd-first'),
+            _make_old_dir(tmp_root, 'raptor-cc-cwd-second')]
+    probes = []
+    monkeypatch.setattr(reaper, '_live_cwds', lambda: probes.append('probe'))
+    assert reaper.reap_stale_tmp() == []
+    assert probes == ['probe']
+    assert all(path.is_dir() for path in dirs)

@@ -31,8 +31,16 @@ GITHUB_REPO_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Left-anchored with the scheme + exact host like the GitHub patterns
+# above: consumers apply .search() to full advisory reference URLs
+# (attacker-influencable lists), so an unanchored host let lookalikes
+# steer which commit is treated as the upstream fix —
+# `https://mirror.example.com/git.kernel.org/linus/<sha>` (host in the
+# PATH) and `https://notkernel.dance/<sha>` (suffix-matching host)
+# both matched as kernel.org fix-commit pointers.
 KERNEL_SHA_URL_RE = re.compile(
-    r"(?:kernel\.dance/|git\.kernel\.org/(?:linus|stable)/(?:c/)?)([a-f0-9]{7,64})\b",
+    r"https?://(?:kernel\.dance/|git\.kernel\.org/(?:linus|stable)/(?:c/)?)"
+    r"([a-f0-9]{7,64})\b",
     re.IGNORECASE,
 )
 
@@ -42,10 +50,10 @@ SHA_DISPLAY_LEN: int = 12
 
 
 def normalize_slug(slug: str) -> str:
-    """Lower-case, strip ``.git`` suffix, strip whitespace.
+    r"""Lower-case, strip ``.git`` suffix, strip whitespace.
 
     Pre-fix didn't strip TRAILING PUNCTUATION (`)`, `]`, `>`,
-    `,`, `.`, `;`). The capture regex `[^/]+/[^/#?\\s]+`
+    `,`, `.`, `;`). The capture regex `[^/]+/[^/#?\s]+`
     excludes only `/`, `#`, `?`, whitespace — so a URL
     appearing in prose like:
 
@@ -66,8 +74,7 @@ def normalize_slug(slug: str) -> str:
     # may have been captured: e.g. `slug.,`).
     while slug and slug[-1] in ")]>,.;":
         slug = slug[:-1]
-    if slug.endswith(".git"):
-        slug = slug[:-4]
+    slug = slug.removesuffix(".git")
     return slug.lower()
 
 

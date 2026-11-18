@@ -1,0 +1,474 @@
+"""Scorecard audit — Phase 1a of the calibrated-aggregation arc.
+
+Walks a scorecard sidecar (default ``out/llm_scorecard.json``) and reports
+per-(model, decision_class, event_type) sample-count distributions. The
+output answers one question: does the existing data support Dawid–Skene
+aggregation, or will the estimator reduce to its prior?
+
+This module is read-only and has no behaviour-changing side effects on
+``/agentic`` or ``/codeql``. It exists to gate Phase 1b (Beta priors
+parameterisation) — the chosen prior strength depends on the median cell
+sample count, which the audit measures.
+
+Verdict thresholds (configurable):
+
+* ``green``  — ≥ 50 %% of ``(model, decision_class)`` cells reach
+  ``N=30`` observations for the ``multi_model_consensus`` event type.
+  D–S will see signal across most partitions.
+* ``amber``  — 10–50 %% reach N=30. D–S will be informative on the
+  data-rich partitions and prior-dominated on the rest.
+* ``red``    — < 10 %% reach N=30. D–S reduces to prior almost
+  everywhere; revisit prior design before proceeding to Phase 2.
+
+See the calibrated-aggregation arc design for context.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+from core.json import dumps_artifact
+from core.llm.scorecard.paths import default_scorecard_path
+from core.llm.scorecard.scorecard import (
+    ALL_EVENT_TYPES,
+    EventType,
+    ModelScorecard,
+)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
+
+# Shared resolver (RAPTOR_SCORECARD_PATH override → RAPTOR_DIR-anchored
+# → relative fallback): the audit must read the SAME ledger analysis
+# runs write, regardless of the invoking cwd. Resolved lazily at each
+# entry point, NOT frozen at import — an env override set after import
+# (in-process callers, some test orders) must still win.
+
+# Sample-count thresholds reported in the cell-count histogram. N=10 is
+# the existing scorecard's ``sample_size_floor`` (where ``learning`` ends
+# and Wilson gating begins). N=30 is the conventional "moderately large"
+# threshold below which normal-approximation CIs are too optimistic. N=100
+# is a quality bar for per-class confusion-matrix estimation in D–S.
+THRESHOLDS: Sequence[int] = (10, 30, 100)
+
+# Phase 2 primarily consumes panel data; this is the event type whose
+# coverage decides the green / amber / red verdict.
+PRIMARY_EVENT_TYPE = EventType.MULTI_MODEL_CONSENSUS
+
+# Verdict ratio cut-offs for cells reaching N=30 on the primary event type.
+GREEN_RATIO = 0.50
+AMBER_RATIO = 0.10
+
+
+@dataclass
+class EventTypeSummary:
+    """Per-event-type stats across all cells."""
+    event_type: str
+    total_cells: int = 0
+    cells_with_any_data: int = 0
+    cells_at_thresholds: dict[int, int] = field(default_factory=dict)
+    total_observations: int = 0
+
+
+@dataclass
+class DecisionClassSummary:
+    """Per-decision-class stats — how many distinct models contribute and
+    what the median observation count is. D–S needs at least 2 models per
+    class to break vote ties; more is better."""
+    decision_class: str
+    distinct_models: int = 0
+    median_obs_primary: float = 0.0
+    total_obs_primary: int = 0
+
+
+@dataclass
+class AuditReport:
+    scorecard_path: str
+    schema_version: int | None
+    total_models: int
+    total_decision_classes: int
+    total_cells: int
+    event_type_summaries: list[EventTypeSummary]
+    decision_class_summaries: list[DecisionClassSummary]
+    primary_event_type: str
+    verdict: str  # "green" | "amber" | "red" | "no-data"
+    verdict_reason: str
+    # True when the sidecar failed HMAC verification under a usable
+    # key (tamper-or-legacy): the raw walk's content was discarded,
+    # mirroring the stats view's demotion. Additive field — JSON
+    # consumers tolerate extra keys.
+    sidecar_demoted: bool = False
+    # True when the integrity key itself was unusable: verification
+    # could not run at all, and the counts above include UNVERIFIED
+    # sidecar content (the introspection clamp, mirroring
+    # ``get_stats()``). Additive field — JSON consumers tolerate
+    # extra keys.
+    key_unusable: bool = False
+
+
+def _empty_event_summary(event_type: str) -> EventTypeSummary:
+    return EventTypeSummary(
+        event_type=event_type,
+        cells_at_thresholds=dict.fromkeys(THRESHOLDS, 0),
+    )
+
+
+def _iter_raw_event_counts(raw: dict) -> Iterator[tuple[str, int]]:
+    """Yield ``(event_type, cell_observation_count)`` straight from the
+    sidecar JSON, one pair per (cell, event type) that appears there.
+
+    ``ModelScorecard.get_stats()`` materialises only the known
+    ``ALL_EVENT_TYPES``, so event types written by a newer schema never
+    reach the stats view — the audit walks the raw sidecar as well so
+    those aren't silently dropped. Tolerates both the flat v1 bucket
+    shape (``{"correct": n, "incorrect": n}``) and the v2 age-bucket
+    shape (``{"YYYY-MM": {"correct": n, "incorrect": n}}``).
+    """
+    for by_dc in (raw.get("models") or {}).values():
+        if not isinstance(by_dc, dict):
+            continue
+        for cell in by_dc.values():
+            events = cell.get("events") if isinstance(cell, dict) else None
+            if not isinstance(events, dict):
+                continue
+            for event_type, buckets in events.items():
+                if not isinstance(buckets, dict):
+                    continue
+                if set(buckets) <= {"correct", "incorrect"}:
+                    n = (_safe_count(buckets.get("correct"))
+                         + _safe_count(buckets.get("incorrect")))
+                else:
+                    n = sum(
+                        _safe_count(b.get("correct"))
+                        + _safe_count(b.get("incorrect"))
+                        for b in buckets.values() if isinstance(b, dict)
+                    )
+                yield event_type, n
+
+
+def _safe_count(value: object) -> int:
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _load_raw(path: Path) -> dict | None:
+    """Read the sidecar JSON directly (without going through
+    ``ModelScorecard``) so we can surface ``schema_version`` and survive
+    a malformed file. Returns ``None`` when the file is missing."""
+    if not path.is_file():
+        return None
+    from core.json import load_json
+    try:
+        return load_json(path, strict=True, max_bytes=64 * 1024 * 1024)
+    except (OSError, ValueError) as exc:
+        msg = f"scorecard-audit: cannot read {path}: {exc}"
+        raise SystemExit(msg) from exc
+
+
+def audit(path: Path | None = None) -> AuditReport:
+    """Compute the audit report for the scorecard at ``path``.
+
+    Pure function modulo file IO — given identical input, output is
+    identical. No mutation; the stats half does take the shared read
+    flock (``ModelScorecard.get_stats``), while the raw event walk
+    reads the file directly — both halves apply the SAME integrity
+    demotion (see the gate below), so a sidecar that fails
+    verification under a usable key contributes to neither.
+
+    ``path=None`` resolves through the shared resolver at CALL time so
+    a ``RAPTOR_SCORECARD_PATH`` override set after import still wins.
+    """
+    if path is None:
+        path = default_scorecard_path()
+    from core.llm.scorecard import integrity
+    raw = _load_raw(path)
+    if raw is None or not isinstance(raw, dict):
+        return AuditReport(
+            scorecard_path=str(path),
+            schema_version=None,
+            total_models=0,
+            total_decision_classes=0,
+            total_cells=0,
+            event_type_summaries=[_empty_event_summary(et)
+                                  for et in ALL_EVENT_TYPES],
+            decision_class_summaries=[],
+            primary_event_type=PRIMARY_EVENT_TYPE,
+            verdict="no-data",
+            verdict_reason=(
+                f"scorecard file not found at {path}"
+                if raw is None
+                else f"scorecard is not a JSON object at {path}"
+            ),
+            # The key state is a property of the INSTALL, not the
+            # file — a no-data report must not claim a healthy key
+            # via the dataclass default when the key is unusable.
+            key_unusable=not integrity.key_usable(),
+        )
+
+    # Consistency note: the raw walk below and the stats view read
+    # the same same-user-writable file at two instants; a swap between
+    # them can yield halves describing different documents. Both
+    # halves demote independently (integrity holds either way) — the
+    # report is best-effort observability, not a single-snapshot view.
+    #
+    # Integrity gate for the RAW half of the report. The stats view
+    # below verifies through ``ModelScorecard`` and discards unverified
+    # content; reading the sidecar directly must not reopen that door —
+    # the raw walk's event-type keys (and ``version``) are otherwise
+    # attacker-chosen bytes from a same-user forger that end up counted
+    # and rendered. Mirror the scorecard's demotion semantics exactly:
+    # verified → full raw walk; unverified under a USABLE key
+    # (tamper-or-legacy) → discard; unusable key → operator-side
+    # condition, content stays readable for introspection, matching
+    # ``get_stats()``'s key-unusable clamp.
+    key_usable = integrity.key_usable()
+    sidecar_demoted = (
+        not integrity.verify(raw, integrity.extract_token(raw))
+        and key_usable
+    )
+    schema_version = None if sidecar_demoted else raw.get("version")
+
+    # Use ``ModelScorecard.get_stats()`` for the per-cell view — it handles
+    # the v2 age-bucket flattening and the migration path. The audit cares
+    # about cumulative observation counts, not per-bucket freshness, so
+    # default (unweighted) flattening is the right choice here.
+    sc = ModelScorecard(path)
+    stats_list = sc.get_stats()
+
+    event_summaries: dict[str, EventTypeSummary] = {
+        et: _empty_event_summary(et) for et in ALL_EVENT_TYPES
+    }
+    # Per decision-class: track distinct models and per-cell primary-event
+    # observation counts for median computation.
+    dc_models: dict[str, set] = defaultdict(set)
+    dc_obs_primary: dict[str, list[int]] = defaultdict(list)
+
+    distinct_models = set()
+    distinct_decision_classes = set()
+
+    for stats in stats_list:
+        distinct_models.add(stats.model)
+        distinct_decision_classes.add(stats.decision_class)
+        dc_models[stats.decision_class].add(stats.model)
+
+        for event_type, counts in stats.events.items():
+            # ``get_stats()`` only materialises ALL_EVENT_TYPES today;
+            # the fallback keeps the walk robust if that ever widens
+            # (unknown types from the sidecar itself are picked up by
+            # the raw walk below).
+            summary = event_summaries.get(event_type)
+            if summary is None:
+                summary = _empty_event_summary(event_type)
+                event_summaries[event_type] = summary
+            summary.total_cells += 1
+            n = counts.correct + counts.incorrect
+            summary.total_observations += n
+            if n > 0:
+                summary.cells_with_any_data += 1
+            for threshold in THRESHOLDS:
+                if n >= threshold:
+                    summary.cells_at_thresholds[threshold] = (
+                        summary.cells_at_thresholds.get(threshold, 0) + 1
+                    )
+
+            if event_type == PRIMARY_EVENT_TYPE:
+                dc_obs_primary[stats.decision_class].append(n)
+
+    # Event types the stats view cannot carry (written by a newer
+    # schema) — surface them under their own buckets so they aren't
+    # silently dropped. Types already summarised above are skipped so
+    # nothing double-counts.
+    raw_only: set[str] = set()
+    raw_events = () if sidecar_demoted else _iter_raw_event_counts(raw)
+    for event_type, n in raw_events:
+        if event_type in event_summaries and event_type not in raw_only:
+            continue  # already summarised via the stats view
+        raw_only.add(event_type)
+        summary = event_summaries.setdefault(
+            event_type, _empty_event_summary(event_type),
+        )
+        summary.total_cells += 1
+        summary.total_observations += n
+        if n > 0:
+            summary.cells_with_any_data += 1
+        for threshold in THRESHOLDS:
+            if n >= threshold:
+                summary.cells_at_thresholds[threshold] = (
+                    summary.cells_at_thresholds.get(threshold, 0) + 1
+                )
+
+    dc_summaries: list[DecisionClassSummary] = []
+    for dc, obs_list in sorted(dc_obs_primary.items()):
+        obs_list_sorted = sorted(obs_list)
+        if not obs_list_sorted:
+            median = 0.0
+        elif len(obs_list_sorted) % 2 == 1:
+            median = obs_list_sorted[len(obs_list_sorted) // 2]
+        else:
+            mid = len(obs_list_sorted) // 2
+            median = (obs_list_sorted[mid - 1] + obs_list_sorted[mid]) / 2
+        dc_summaries.append(DecisionClassSummary(
+            decision_class=dc,
+            distinct_models=len(dc_models[dc]),
+            median_obs_primary=float(median),
+            total_obs_primary=sum(obs_list_sorted),
+        ))
+
+    primary = event_summaries[PRIMARY_EVENT_TYPE]
+    cells_at_30 = primary.cells_at_thresholds.get(30, 0)
+    # ``total_cells`` counts cells that have the event-type key — which is
+    # every cell in the scorecard (``_empty_events()`` seeds all known
+    # types). The audit's ratio must be against cells that actually carry
+    # observations for the primary event type, otherwise a scorecard
+    # populated only via ``cheap_short_circuit`` would look like red rather
+    # than no-data.
+    cells_with_data = primary.cells_with_any_data
+    if sidecar_demoted:
+        # The stats view discarded the same content, so the counts
+        # above are (near-)empty either way — but the REASON must name
+        # the integrity failure, not masquerade as a producer that
+        # never ran.
+        verdict = "no-data"
+        reason = (
+            "sidecar failed integrity verification (missing or invalid "
+            "provenance token) — its content is demoted, not counted. "
+            "Re-bless genuine pre-MAC history with: "
+            "raptor-llm-scorecard adopt"
+        )
+    elif cells_with_data == 0:
+        verdict = "no-data"
+        reason = (
+            f"no cells carry any {PRIMARY_EVENT_TYPE} events; the panel "
+            "log (or its scorecard producer) has not run yet"
+        )
+    else:
+        ratio = cells_at_30 / cells_with_data
+        if ratio >= GREEN_RATIO:
+            verdict = "green"
+            reason = (
+                f"{cells_at_30}/{cells_with_data} cells "
+                f"({ratio:.1%}) reach N=30 on {PRIMARY_EVENT_TYPE}"
+            )
+        elif ratio >= AMBER_RATIO:
+            verdict = "amber"
+            reason = (
+                f"{cells_at_30}/{cells_with_data} cells "
+                f"({ratio:.1%}) reach N=30 on {PRIMARY_EVENT_TYPE} — "
+                "D–S will be informative on data-rich partitions, "
+                "prior-dominated on the rest"
+            )
+        else:
+            verdict = "red"
+            reason = (
+                f"{cells_at_30}/{cells_with_data} cells "
+                f"({ratio:.1%}) reach N=30 on {PRIMARY_EVENT_TYPE} — "
+                "D–S will reduce to prior almost everywhere; revisit "
+                "prior design before Phase 2"
+            )
+
+    return AuditReport(
+        scorecard_path=str(path),
+        schema_version=schema_version,
+        total_models=len(distinct_models),
+        total_decision_classes=len(distinct_decision_classes),
+        total_cells=sum(s.total_cells for s in event_summaries.values()
+                        if s.event_type == PRIMARY_EVENT_TYPE),
+        event_type_summaries=sorted(
+            event_summaries.values(), key=lambda s: s.event_type
+        ),
+        decision_class_summaries=dc_summaries,
+        primary_event_type=PRIMARY_EVENT_TYPE,
+        verdict=verdict,
+        verdict_reason=reason,
+        sidecar_demoted=sidecar_demoted,
+        key_unusable=not key_usable,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def render_markdown(report: AuditReport) -> str:
+    """Render captured readiness measurements through shared typed blocks."""
+    from core.reporting.renderers import render_document
+    from .audit_document import build_audit_document
+    return render_document(build_audit_document(report), "markdown").content.decode("utf-8")
+
+
+def render_json(report: AuditReport) -> str:
+    # ensure_ascii: this lane is written to the operator terminal by
+    # main(); JSON escapes C0 but passes C1 controls (U+0080-U+009F,
+    # incl. single-byte CSI/OSC) through raw when ensure_ascii is off,
+    # and the report carries sidecar-derived strings (event_type keys,
+    # decision_class values) that are attacker-choosable under the
+    # key-unusable clamp. ASCII output stays valid JSON for consumers
+    # that parse it (same rationale as cli.py's _dumps_json_lane).
+    payload = asdict(report)
+    return dumps_artifact(payload, sort_keys=True, ensure_ascii=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scorecard-audit",
+        description=(
+            "Audit a scorecard sidecar for data sufficiency. Gates "
+            "Phase 1b (Beta priors) of the calibrated-aggregation arc."
+        ),
+    )
+    parser.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the scorecard JSON (default: the shared "
+            "resolver's path, resolved at invocation). "
+            "Pass a project-local path to audit a project sidecar."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON instead of markdown. Phase 1b reads this shape.",
+    )
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(parser)
+    parser.epilog = "Portable exports require --report-output; native readiness exit codes and --json remain unchanged."
+    args = parser.parse_args(argv)
+    report_options = options_from_args(args, parser) if args.report_format or args.report_output or args.no_report else None
+    source = args.path if args.path is not None else default_scorecard_path()
+    if report_options is not None:
+        from .audit_completion import prepare
+        try:
+            prepare(report_options, source)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    report = audit(source)
+    if args.json:
+        sys.stdout.write(render_json(report))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render_markdown(report))
+
+    # Exit code mirrors the verdict so the audit is usable in CI gates:
+    #   0 = green, 1 = amber, 2 = red, 3 = no-data.
+    status = {"green": 0, "amber": 1, "red": 2, "no-data": 3}[report.verdict]
+    if report_options is not None:
+        from .audit_completion import emit
+        emit(report, report_options, status)
+    return status
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

@@ -1,0 +1,1096 @@
+"""Extract package installs from Dockerfile / devcontainer.json / shell / GHA.
+
+These files aren't manifests, but they declare deps just as authoritatively
+as ``requirements.txt`` — and they're routinely overlooked. A ``RUN
+pip install django==4.2.7`` baked into a Dockerfile is a real PyPI dep
+that needs CVE matching; ``apt install nginx=1.18.0-6`` is a Debian dep
+that needs OSV lookup.
+
+This package is **registry-driven**: each supported package manager is one
+entry in :data:`packages.sca.parsers.inline_installs._managers._MANAGERS`.
+Adding ``cargo install`` or ``gem install`` is ~10 lines in
+:mod:`._managers`.
+
+Module layout:
+
+  * :mod:`._managers` — per-PM argument parsers + the registry
+    table (~600 lines kept off the main file).
+  * This ``__init__`` — file-shape entry points (parse_dockerfile,
+    parse_devcontainer_json, parse_shell_script, parse_gha_workflow),
+    the shared shell-line scanner, and the ``register()`` calls
+    that wire each entry point to the parser dispatcher.
+
+What we extract:
+
+  - ``pip`` / ``pip3`` / ``python -m pip`` / ``python3 -m pip`` → PyPI
+  - ``apt`` / ``apt-get install`` → Debian
+  - ``yum`` / ``dnf install`` → Red Hat
+  - ``apk add`` / ``apk install`` → Alpine
+  - ``npm`` / ``yarn add`` / ``pnpm add`` / ``npx`` → npm
+  - ``cargo install`` / ``gem install`` / ``brew install`` /
+    ``go install`` → corresponding ecosystems
+
+Where we look:
+
+  - **Dockerfile** / **Containerfile**: each ``RUN`` instruction (with
+    backslash-continuation collapsing).
+  - **devcontainer.json**: ``postCreateCommand``, ``onCreateCommand``,
+    ``postStartCommand`` (string or array form). ``features`` block is
+    deferred — it needs a separate parser per feature.
+  - **shell scripts** (``*.sh``, ``*.bash``): every line.
+  - **GHA workflows** (``.github/workflows/*.yml``): every ``run:`` block
+    body is treated as shell.
+
+What we don't extract (yet):
+
+  - Unpinned installs (``pip install foo`` with no version): emitted with
+    ``version=None`` and ``pin_style=WILDCARD``. SBOM surfaces them but
+    advisory matching cannot fire without a version.
+  - ``-r requirements.txt`` / ``-c constraints.txt``: those files are
+    discovered separately, so we'd just dedupe.
+  - Dockerfile ``FROM`` base-image scanning is handled by a sibling
+    module (``packages.sca.dockerfile_from``), not this parser. That
+    module pulls the actual installed-package state from the base
+    image's registry layers — much more accurate than guessing
+    Debian / Red Hat / Alpine from inline ``apt-get install`` lines.
+
+All emitted Dependency rows carry ``source_kind`` ∈ ``{"dockerfile",
+"devcontainer", "shell_script", "gha_workflow", "gha_uses"}`` so the
+report can show where each dep came from.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+from core.json.jsonc import load_jsonc
+
+from ... import _gha_uses as _gha_uses_walk
+from ...models import Confidence, Dependency, PinStyle
+from ...naming import fold_name
+from .. import register
+from ...file_shapes import is_dockerfile as _is_dockerfile
+# Composite-action manifests carry run:/uses: steps too — the
+# broader predicate is deliberate for the inline-install lane.
+from ...file_shapes import is_gha_workflow_or_action as _is_gha_workflow
+from core.source.lines import split_lines
+
+from ._managers import (
+    _MANAGERS,
+    _NAME_RE,
+    _PkgManager,
+    _tokenise,
+    # Per-PM parsers re-exported for backwards compat — older
+    # callers may still ``from packages.sca.parsers.inline_installs
+    # import _parse_apt_args`` etc.
+    _classify_pip_token,
+    _emit_npm_pkg,
+    _legacy_single_spec,
+    _parse_apk_args,
+    _parse_apt_args,
+    _parse_brew_args,
+    _parse_cargo_args,
+    _parse_gem_args,
+    _parse_go_install_args,
+    _parse_npm_args,
+    _parse_npx_args,
+    _parse_pip_args,
+    _parse_versioned_flag_args,
+    _parse_yum_args,
+    _split_npm_token,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Text → Dependency rows
+# ---------------------------------------------------------------------------
+
+def _strip_inline_comment(line: str) -> str:
+    """Drop trailing ``# ...`` comments from a shell line.
+
+    Conservative: only strips ``#`` preceded by whitespace or at start, to
+    avoid butchering ``url=https://example.com/path#frag``.
+    """
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if i == 0 or line[i - 1].isspace():
+                return line[:i].rstrip()
+    return line
+
+
+def _collapse_continuations(text: str) -> list[tuple[int, str, bool]]:
+    r"""Join ``\``-continued lines into single logical lines.
+
+    Returns ``(starting_line_no, joined, is_commented)`` triples.
+    ``is_commented`` is True if every constituent line was a comment.
+    """
+    out: list[tuple[int, str, bool]] = []
+    raw = split_lines(text)
+    i = 0
+    while i < len(raw):
+        start = i + 1            # 1-indexed line number
+        chunks: list[str] = []
+        all_commented = True
+        while True:
+            line = raw[i]
+            stripped = line.lstrip()
+            commented = stripped.startswith("#")
+            if not commented:
+                all_commented = False
+            body = stripped.lstrip("#").lstrip() if commented else line
+            if body.rstrip().endswith("\\"):
+                chunks.append(body.rstrip()[:-1])
+                i += 1
+                if i >= len(raw):
+                    break
+                continue
+            chunks.append(body)
+            break
+        joined = " ".join(c.strip() for c in chunks).strip()
+        if joined:
+            out.append((start, joined, all_commented))
+        i += 1
+    return out
+
+
+# GitHub Actions template expressions: ``${{ matrix.x }}``, ``${{ env.Y }}``,
+# ``${{ secrets.Z }}``. Never literal install targets — stripped before
+# tokenising so they don't surface as phantom packages.
+#
+# The body is a counted repeat of "any non-``}`` char, or a ``}`` not
+# followed by another ``}``" instead of a lazy dot-star: an unclosed
+# ``${{`` no longer rescans to end-of-line from every opener
+# (measured quadratic), and the 400-char bound keeps each attempt
+# O(1) — real workflow expressions are a fraction of that.
+_GHA_EXPR_RE = re.compile(r"\$\{\{(?:[^}]|\}(?!\})){0,400}\}\}")
+
+# Shell I/O redirections — matched at the token level and stripped before
+# PM arg parsing so ``2>&1``, ``>> logfile``, ``> /dev/null`` etc. don't
+# leak through as phantom packages (``2>&1`` looks like package "2" with
+# a ``>`` version comparator to the PEP 508 classifier).
+#
+# The operator set is the POSIX shell redirection-token grammar —
+# optional IO-number prefix, then one operator, longest match first:
+# ``<<<  <<-  <<  <>  <&  >&  >>  >|  <  >`` plus bash's ``&>`` /
+# ``&>>``. Derived from the grammar rather than an enumerated list of
+# spellings: the previous enumeration let ``&>>`` (startswith ``&>``
+# but != ``&>``, so its target survived) and ``>|`` (fails a bare
+# ``[><]{1,3}$`` check) leak their targets through as phantom
+# packages. The operator may carry an IO-number prefix (``2>``) or
+# bash's ``{varname}`` fd-variable prefix (``{log}>out.txt``). The
+# single-char ``<`` / ``>`` arms refuse a following ``=`` so a bare
+# ``>=`` / ``<=`` comparator token is never treated as a redirect —
+# spaced quoted specs (``'foo >= 1.2'``) parse exactly as they did
+# before this grammar (the quote-blind tokenisation itself is a
+# separate, pre-existing bound).
+_REDIRECT_OP_RE = re.compile(
+    r"^(?:(?:\d*|\{\w+\})"
+    r"(?:<<<|<<-|<<|<>|<&|>&|>>|>\||<(?!=)|>(?!=))|&>>|&>)"
+)
+
+
+def _strip_redirects(args: str) -> str:
+    """Remove shell I/O redirection tokens (and, for a bare operator,
+    the following target word) from an argument string."""
+    tokens = args.split()
+    out: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        m = _REDIRECT_OP_RE.match(tok)
+        if m is None:
+            out.append(tok)
+            continue
+        if m.end() == len(tok):
+            # Bare operator: the NEXT word is its operand (redirect
+            # target, fd, or heredoc delimiter) — consume it too.
+            skip_next = True
+        # Operator with an attached operand (``2>&1``, ``>file``,
+        # ``&>>log``, ``>|out``): the whole token is the redirection.
+        continue
+    return " ".join(out)
+
+
+def _scan_shell_lines(
+    lines: list[tuple[int, str, bool]],
+    declared_in: Path,
+    source_kind: str,
+    skip_ecosystems: set | None = None,
+) -> list[Dependency]:
+    """Apply the manager patterns to each logical line; emit deps.
+
+    Each subline is one install command — at most one manager should apply.
+    We pick the *latest-starting* match so more-specific wrappers like
+    ``uv pip install`` win over the inner ``pip install``.
+
+    ``skip_ecosystems`` lets a caller suppress specific managers in
+    favour of a more authoritative source. The Dockerfile entry
+    point uses this to delegate apt/Debian extraction to
+    ``core.dockerfile.apt`` (POSIX-correct, sudo / pipe / bash -c
+    aware) without duplicating those packages.
+    """
+    skip_ecosystems = skip_ecosystems or set()
+    deps: list[Dependency] = []
+    for line_no, body, commented in lines:
+        cleaned = _strip_inline_comment(body)
+        # Drop GHA template expressions before tokenising. A workflow line
+        # like ``run: npm i ${{ matrix.npm-i }}`` would otherwise yield a
+        # bogus package "matrix.npm-i" (dots/dashes are legal npm chars) that
+        # 404s — the expression is a placeholder, never a literal install
+        # target. Harmless on non-GHA sources (the syntax doesn't occur).
+        cleaned = _GHA_EXPR_RE.sub(" ", cleaned)
+        for sub in _split_compound(cleaned):
+            best: tuple[_PkgManager, re.Match[str]] | None = None
+            for mgr in _MANAGERS:
+                if mgr.ecosystem in skip_ecosystems and not commented:
+                    continue
+                m = mgr.pattern.search(sub)
+                if not m:
+                    continue
+                if best is None or m.start() > best[1].start():
+                    best = (mgr, m)
+            if best is None:
+                continue
+            mgr, m = best
+            if commented and m.start() != 0:
+                # Comment lines have their leading ``#`` + whitespace
+                # stripped before reaching here, so an install verb at
+                # the very start (``m.start() == 0``) reflects a
+                # deliberate ``# pip install foo==1.0``-style
+                # disabled-install hint — keep it. Anything else is
+                # prose that happens to mention ``pip install`` /
+                # ``apt install`` mid-sentence (e.g. ``# uv pip
+                # install keeps a single source of truth``), where
+                # tokens past the install verb are English words, not
+                # package names. Skip to avoid emitting bogus deps.
+                continue
+            args = _strip_redirects(sub[m.end():])
+            for parsed in mgr.parse_args(args):
+                # Most managers yield (name, version, pin); the pip
+                # manager additionally yields (floor, ceiling) corridor
+                # bounds. Unpack defensively so both shapes work.
+                name, version, pin = parsed[0], parsed[1], parsed[2]
+                floor = parsed[3] if len(parsed) > 3 else None
+                ceiling = parsed[4] if len(parsed) > 4 else None
+                deps.append(_make_dep(
+                    name=name, version=version, pin_style=pin,
+                    version_floor=floor, version_ceiling=ceiling,
+                    ecosystem=mgr.ecosystem,
+                    purl_type=mgr.purl_type,
+                    purl_namespace=mgr.purl_namespace,
+                    declared_in=declared_in,
+                    source_kind=source_kind,
+                    commented=commented,
+                    line_no=line_no,
+                ))
+    return deps
+
+
+def _split_compound(line: str) -> list[str]:
+    """Split a shell line on ``&&`` / ``||`` / ``;`` / ``|`` / ``|&``
+    / background ``&`` outside quotes.
+
+    A pipeline is a command sequence like any other compound: without
+    the ``|`` split, everything after the pipe parsed as arguments of
+    the install verb — ``pip install requests | tee build.log`` minted
+    phantom deps ``tee`` and ``build-log`` (both REAL registry names,
+    so they drove live registry/OSV queries). Splitting scans each
+    side independently, which also keeps genuine post-pipe install
+    commands visible. A ``|`` glued to a preceding ``>`` or ``<`` is
+    NOT a pipe — shell tokenisation is longest-match, so ``>|`` is one
+    redirection operator (handled by ``_strip_redirects``)."""
+    out: list[str] = []
+    buf: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            buf.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if line[i:i+2] in ("&&", "||"):
+                out.append("".join(buf))
+                buf = []
+                i += 2
+                continue
+            if ch == ";":
+                out.append("".join(buf))
+                buf = []
+                i += 1
+                continue
+            if ch == "|" and not (i > 0 and line[i - 1] in "<>"):
+                out.append("".join(buf))
+                buf = []
+                i += 2 if line[i:i + 2] == "|&" else 1
+                continue
+            if ch == "&":
+                # Background / sequence separator (`cmd & cmd`) — the
+                # post-& command otherwise parsed as install
+                # arguments, the fixed pipe bug's sibling. Not a
+                # separator when the `&` is glued into an operator:
+                # `&&` never reaches here (consumed above), `>&`/`<&`
+                # fd-duplication keeps its `&` (previous char), and
+                # `&>`/`&>>` redirects keep theirs (next char).
+                if (i > 0 and line[i - 1] in "<>") or line[i + 1:i + 2] == ">":
+                    buf.append(ch)
+                    i += 1
+                    continue
+                out.append("".join(buf))
+                buf = []
+                i += 1
+                continue
+        buf.append(ch)
+        i += 1
+    if buf:
+        out.append("".join(buf))
+    return [s.strip() for s in out if s.strip()]
+
+
+def _make_dep(
+    *,
+    name: str,
+    version: str | None,
+    pin_style: PinStyle,
+    ecosystem: str,
+    purl_type: str,
+    purl_namespace: str | None,
+    declared_in: Path,
+    source_kind: str,
+    commented: bool,
+    line_no: int,
+    version_floor: str | None = None,
+    version_ceiling: str | None = None,
+) -> Dependency:
+    canon = fold_name(name, ecosystem)
+    purl_base = (
+        f"pkg:{purl_type}/{purl_namespace}/{canon}"
+        if purl_namespace else f"pkg:{purl_type}/{canon}"
+    )
+    purl = f"{purl_base}@{version}" if version else purl_base
+    return Dependency(
+        ecosystem=ecosystem,
+        name=canon,
+        version=version,
+        declared_in=declared_in,
+        scope="main",
+        is_lockfile=False,
+        pin_style=pin_style,
+        direct=True,
+        purl=purl,
+        parser_confidence=Confidence(
+            "medium",
+            reason=(
+                f"extracted from inline install command at "
+                f"{declared_in.name}:{line_no}"
+            ),
+        ),
+        commented_out=commented,
+        source_kind=source_kind,
+        version_floor=version_floor,
+        version_ceiling=version_ceiling,
+    )
+
+
+# ---------------------------------------------------------------------------
+# File-shape entry points
+# ---------------------------------------------------------------------------
+
+def parse_dockerfile(path: Path) -> list[Dependency]:
+    """Extract installs from a Dockerfile / Containerfile.
+
+    Three-pass design:
+
+    1. **apt / Debian** via ``core.dockerfile.extract_apt_packages``.
+       The shared substrate is POSIX-correct (shlex tokenisation,
+       sudo / pipe / subshell-paren / ``bash -c`` recursion / comment-
+       in-continuation handling) and carries multi-stage attribution.
+    2. **All other managers** (pip / yum / dnf / apk / npm / cargo /
+       gem / brew / go) via the legacy regex-based shell scanner,
+       with apt skipped to avoid duplicates.
+    3. **ARG version pins** via ``_arg_version_pins.extract``. The
+       canonical example is a devcontainer Dockerfile pinning
+       ``ARG SEMGREP_VERSION=1.117.0`` for build-time install.
+       The extractor maps a small set of well-known ARG names to
+       their SCA ecosystem; operator-supplied inline comments
+       (``# raptor-sca: PyPI:foo``) override the built-in map.
+
+    All three passes return ``Dependency`` rows; downstream
+    pipeline treats them uniformly. ARG pins carry
+    ``source_kind="dockerfile_arg"`` and ``scope="build"`` so the
+    operator can tell them apart from runtime app deps.
+    """
+    text = _safe_read(path)
+    if text is None:
+        return []
+    deps: list[Dependency] = []
+    # ARG pins first: when a Dockerfile both pins ``ARG FOO_VERSION=1.0``
+    # AND has ``RUN pip install foo==${FOO_VERSION}``, the RUN scanner
+    # emits ``foo@${FOO_VERSION}`` (literal placeholder string) and
+    # ``select_canonical_for_osv`` picks the first manifest row per
+    # ``(eco, name)``. Putting the ARG pass first means the concrete
+    # version (``1.0``) wins and the placeholder row is deduped out.
+    from . import _arg_version_pins
+    deps.extend(_arg_version_pins.extract(text, path))
+    # One core-dockerfile parse for the whole file: the apt extractor
+    # and the RUN-block pass both consume it — parsing twice doubled
+    # the work and double-warned (the second time without the path)
+    # on a raising input.
+    from core.dockerfile import parse_dockerfile as core_parse_dockerfile
+    try:
+        instructions = core_parse_dockerfile(text)
+    except Exception:                               # noqa: BLE001
+        logger.warning(
+            "sca.parsers.inline_installs: core.dockerfile parse "
+            "failed for %s — falling back to regex scanner",
+            path, exc_info=True,
+        )
+        instructions = None
+    apt_deps = _extract_apt_via_core_dockerfile(
+        text, path, instructions=instructions,
+    )
+    # Debian is suppressed in the shell-line scanner only when the
+    # core apt extractor actually RAN (it is the richer source —
+    # stage/scope attribution, base-image suite). When the core
+    # dockerfile parse failed, the regex scanner is the fallback the
+    # failure log promises: suppressing Debian there too meant apt
+    # deps were silently dropped while the log claimed a fallback.
+    skip: set[str] = {"Debian"} if apt_deps is not None else set()
+    deps.extend(apt_deps or [])
+    runs = _extract_dockerfile_run_blocks(text, instructions=instructions)
+    deps.extend(_scan_shell_lines(
+        runs, declared_in=path, source_kind="dockerfile",
+        skip_ecosystems=skip,
+    ))
+    return deps
+
+
+# Sentinel distinguishing "caller didn't pre-parse" (helper parses the
+# text itself — direct/test callers) from "caller parsed and it FAILED"
+# (``instructions=None`` — degrade to the documented fallback without
+# re-parsing and re-warning).
+_UNPARSED: Any = object()
+
+
+def _extract_apt_via_core_dockerfile(
+    text: str, path: Path, *, instructions: Any = _UNPARSED,
+) -> list[Dependency] | None:
+    """Use ``core.dockerfile.apt`` to extract Debian deps from a
+    Dockerfile.
+
+    Returns one ``Dependency`` per ``AptPackage``, or ``None`` when
+    the core dockerfile parse itself failed — the caller then lets
+    the regex shell-line scanner handle the Debian manager instead
+    of suppressing it (the actual fallback the log line promises).
+    ``stage`` is threaded into ``scope`` so multi-stage SBOMs
+    distinguish builder deps from runtime deps; absence of an ``AS
+    <stage>`` clause falls back to ``scope="main"`` (the legacy
+    default).
+
+    ``instructions``: pre-parsed ``core.dockerfile`` instructions
+    (``parse_dockerfile`` parses once for both passes); ``None``
+    means that parse failed.
+    """
+    from core.dockerfile import (
+        extract_apt_packages,
+        parse_dockerfile as core_parse_dockerfile,
+    )
+    if instructions is _UNPARSED:
+        try:
+            instructions = core_parse_dockerfile(text)
+        except Exception:                           # noqa: BLE001
+            logger.warning(
+                "sca.parsers.inline_installs: core.dockerfile parse "
+                "failed for %s — falling back to regex scanner",
+                path, exc_info=True,
+            )
+            instructions = None
+    if instructions is None:
+        return None
+    from ._base_image_suite import stage_image_map
+    stage_img = stage_image_map(instructions)
+    out: list[Dependency] = [_apt_package_to_dep(ap, path,
+                                       base_image=stage_img.get(ap.stage)) for ap in extract_apt_packages(instructions)]
+    return out
+
+
+def _apt_package_to_dep(ap, declared_in: Path,
+                        base_image: str | None = None) -> Dependency:
+    canon = fold_name(ap.name, "Debian")
+    purl_base = f"pkg:deb/debian/{canon}"
+    purl = f"{purl_base}@{ap.version}" if ap.version else purl_base
+    # Attribute the apt package to the Debian suite of the base image
+    # governing its build stage, so harden's opt-in ``--pin-debian`` can
+    # pin to a version that's actually installable there. A ``None`` suite
+    # (non-Debian base, undeterminable tag, no FROM) means "don't pin".
+    source_extra = None
+    if base_image:
+        from ._base_image_suite import debian_suite_from_image
+        source_extra = {
+            "base_image": base_image,
+            "suite": debian_suite_from_image(base_image),
+        }
+    return Dependency(
+        ecosystem="Debian",
+        name=canon,
+        version=ap.version,
+        declared_in=declared_in,
+        scope=ap.stage or "main",
+        is_lockfile=False,
+        pin_style=PinStyle.EXACT if ap.version else PinStyle.WILDCARD,
+        direct=True,
+        purl=purl,
+        parser_confidence=Confidence(
+            "high",
+            reason=(
+                f"core.dockerfile apt extractor at "
+                f"{declared_in.name}:{ap.line}"
+            ),
+        ),
+        commented_out=False,
+        source_kind="dockerfile",
+        source_extra=source_extra,
+    )
+
+
+def parse_devcontainer_json(path: Path) -> list[Dependency]:
+    """Extract installs from devcontainer.json post*Command hooks.
+
+    Shell content is grabbed from ``postCreateCommand``, ``onCreateCommand``,
+    ``postStartCommand``, ``updateContentCommand``. Each can be a string
+    (run via shell), an exec ARGV array (joined into one command line),
+    or an object of named parallel commands whose values are again
+    strings or arrays.
+    """
+    text = _safe_read(path)
+    if text is None:
+        return []
+    try:
+        data = _load_jsonc(text)
+    except Exception as e:                  # noqa: BLE001
+        # Canonical shape (logger segment + kind + "parse failed for
+        # <path>: <reason>") so the whole-file failure reaches the run
+        # report's structured parse_failures.
+        logger.warning(
+            "sca.parsers.inline_installs: devcontainer JSONC "
+            "parse failed for %s: %s", path, e,
+        )
+        return []
+    cmd_keys = (
+        "postCreateCommand",
+        "onCreateCommand",
+        "postStartCommand",
+        "updateContentCommand",
+        "postAttachCommand",
+    )
+    lines: list[tuple[int, str, bool]] = []
+    for key in cmd_keys:
+        val = data.get(key)
+        if val is None:
+            continue
+        for piece in _flatten_command(val):
+            lines.extend(_collapse_continuations(piece))
+    return _scan_shell_lines(lines, declared_in=path,
+                             source_kind="devcontainer")
+
+
+def parse_shell_script(path: Path) -> list[Dependency]:
+    """Extract installs from a ``.sh`` / ``.bash`` script."""
+    text = _safe_read(path)
+    if text is None:
+        return []
+    lines = _collapse_continuations(text)
+    return _scan_shell_lines(lines, declared_in=path,
+                             source_kind="shell_script")
+
+
+def parse_gha_workflow(path: Path) -> list[Dependency]:
+    """Extract installs and ``uses:`` action references from a GHA
+    workflow YAML.
+
+    Two extraction passes:
+
+      * ``run:`` block bodies → pip / apt / yum / dnf / apk installs
+        via ``_scan_shell_lines`` with ``source_kind="gha_workflow"``.
+      * ``uses: <owner>/<action>@<ref>`` lines → one Dependency per
+        reference with ``ecosystem="GitHub Actions"``,
+        ``source_kind="gha_uses"``. These flow through OSV CVE
+        matching (the GitHub Actions ecosystem is real) and through
+        the sunset detector (``supply_chain.gha_sunset``) for
+        deprecation / functionality-preservation alerts.
+
+    A workflow can contain both shapes; the parser returns a flat
+    union. ``uses:`` extraction is two-pass: the syntactic per-line
+    pass (robust against ad-hoc YAML conventions, exact line
+    numbers) unioned with a YAML document walk so non-plain
+    serializations (block scalars, flow maps, anchors) — which
+    GitHub runs identically — still produce Dependency rows.
+    """
+    text = _safe_read(path)
+    if text is None:
+        return []
+    runs = _extract_gha_run_blocks(text)
+    deps = _scan_shell_lines(
+        runs, declared_in=path, source_kind="gha_workflow",
+    )
+    deps.extend(_extract_gha_uses(text, declared_in=path))
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# GHA `uses:` extraction
+# ---------------------------------------------------------------------------
+
+# Match ``uses: owner/repo@ref`` and ``uses: owner/repo/sub@ref``,
+# with or without YAML quoting (``uses: "actions/checkout@v4"`` is
+# legal and common — the unquoted-only pattern silently skipped it).
+# Skip ``uses: ./local-action`` (no @ref), ``docker://image@digest``
+# (different threat model — Dockerfile FROM scanner covers it).
+#
+# The leading gap is ``\s*(?:-\s*)?`` — same language as the previous
+# ``\s*-?\s*`` but the whitespace runs are separated by a mandatory
+# ``-``, so a long all-space line no longer explores O(n^2) splits
+# (same fix as the gemfile/nuget parsers).
+_GHA_USES_RE = re.compile(
+    r"""
+    ^\s*(?:-\s*)?uses\s*:\s*
+    (?P<q>["']?)
+    (?P<spec>[A-Za-z0-9_./-]+@[A-Za-z0-9_./-]+)
+    (?P=q)
+    \s*(?:\#.*)?$
+    """,
+    re.VERBOSE,
+)
+
+_GHA_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _extract_gha_uses(
+    text: str, *, declared_in: Path,
+) -> list[Dependency]:
+    """Pull ``uses: owner/repo@ref`` references out of a workflow.
+
+    Each reference becomes one ``Dependency`` with ecosystem
+    ``"GitHub Actions"``, name ``owner/repo`` (or ``owner/repo/sub``
+    for sub-actions), version equal to the ref, and pin_style
+    classified by ref shape:
+
+      * 40-char hex → GIT (operator's pinning to the action's bytes)
+      * starts with ``v<digit>`` → CARET (semver-tag pin; Action
+        owner can re-publish, but it's the conventional pin shape)
+      * else → UNKNOWN (branch / odd ref)
+    """
+    out: list[Dependency] = []
+    seen_specs: set[str] = set()
+
+    def _spec_to_dep(spec: str, line_no: int) -> Dependency | None:
+        if spec.startswith(("./", "../", "docker://")):
+            return None
+        if "@" not in spec:
+            return None
+        action, ref = spec.rsplit("@", 1)
+        if "/" not in action:
+            return None
+        pin_style, version = classify_action_ref(ref)
+        return Dependency(
+            ecosystem="GitHub Actions",
+            name=action,
+            version=version,
+            declared_in=declared_in,
+            scope="build",
+            is_lockfile=False,
+            pin_style=pin_style,
+            direct=True,
+            purl=f"pkg:githubactions/{action}@{ref}",
+            parser_confidence=Confidence(
+                "high" if pin_style != PinStyle.UNKNOWN else "medium",
+                reason=(
+                    f"GHA uses: {action}@{ref}"
+                ),
+            ),
+            source_kind="gha_uses",
+            source_extra={"ref": ref, "line": line_no},
+        )
+
+    for line_no, raw in enumerate(split_lines(text), start=1):
+        m = _GHA_USES_RE.match(raw)
+        if not m:
+            continue
+        spec = m.group("spec")
+        seen_specs.add(spec)
+        dep = _spec_to_dep(spec, line_no)
+        if dep is not None:
+            out.append(dep)
+    # Second pass: YAML-walk the document so non-plain serializations
+    # (block scalars, flow mappings, quoted keys, anchors/aliases) —
+    # which GitHub runs identically — still become Dependency rows;
+    # without this an attacker-chosen serialization removed the
+    # action from OSV matching, sentinel pairing, sunset and
+    # freshness checks.  The regex pass keeps exact line numbers for
+    # plain shapes; walk-only specs get a best-effort line.  A YAML
+    # parse failure degrades to the regex-only behaviour.
+    walked = _gha_uses_walk.extract_uses_specs(text)
+    if walked:
+        for spec in dict.fromkeys(walked):
+            if spec in seen_specs:
+                continue
+            dep = _spec_to_dep(
+                spec, _gha_uses_walk.best_effort_line(text, spec),
+            )
+            if dep is not None:
+                out.append(dep)
+    return out
+
+
+def classify_action_ref(ref: str) -> tuple[PinStyle, str | None]:
+    """Classify a ``uses: <action>@<ref>`` reference.
+
+    ``ref`` is the version-shaped suffix. Mapping:
+
+      * 40-char hex SHA → ``GIT`` pin, version = ref (operator's
+        pinning to the action's bytes; immutable).
+      * ``v1`` / ``v1.2`` / ``v1.2.3`` (a leading ``v?digit``) →
+        ``CARET`` pin, version = ref (semver-tag convention; the
+        action's owner can re-publish the same tag, hence the
+        supply-chain warning from ``gha_drift``, but it's the
+        standard pin shape and the version IS the ref). Prefixed
+        tags like ``release-1.0`` do NOT match the version shape
+        and classify ``UNKNOWN`` — the ref is kept verbatim.
+      * Anything else → ``UNKNOWN``, version = ref.
+    """
+    if _GHA_SHA_RE.match(ref.lower()):
+        return PinStyle.GIT, ref
+    if re.match(r"^v?\d", ref) and "/" not in ref:
+        return PinStyle.CARET, ref
+    return PinStyle.UNKNOWN, ref
+
+
+# ---------------------------------------------------------------------------
+# Per-shape extractors
+# ---------------------------------------------------------------------------
+
+_DOCKERFILE_RUN_RE = re.compile(r"^\s*RUN\s+", re.IGNORECASE)
+
+
+def _extract_dockerfile_run_blocks(
+    text: str, *, instructions: Any = _UNPARSED,
+) -> list[tuple[int, str, bool]]:
+    """Yield ``(start_line, body, commented)`` for every RUN instruction.
+
+    Live RUN instructions (and their backslash-continuations) come from
+    :func:`core.dockerfile.parse_dockerfile` — the shared substrate
+    handles tokenisation, line-continuation collapsing, and multi-stage
+    AS-name tracking. Commented RUN blocks (``# RUN pip install foo``)
+    are surfaced via a tiny pre-pass below; the core parser skips
+    comments by design (correct for most consumers, but SCA wants to
+    surface commented installs as info-severity findings).
+
+    ``instructions``: pre-parsed instructions from the caller's single
+    parse; ``None`` means that parse failed — degrade to the regex RUN
+    scan. A raising input previously aborted the WHOLE file here
+    (discarding the ARG-pin deps already extracted).
+    """
+    if instructions is _UNPARSED:
+        from core.dockerfile import (
+            parse_dockerfile as _parse_dockerfile_core,
+        )
+        try:
+            instructions = _parse_dockerfile_core(text)
+        except Exception:                           # noqa: BLE001
+            logger.warning(
+                "sca.parsers.inline_installs: core.dockerfile parse "
+                "failed — falling back to regex RUN scan",
+                exc_info=True,
+            )
+            instructions = None
+    out: list[tuple[int, str, bool]]
+    if instructions is None:
+        out = _extract_live_run_blocks_regex(text)
+    else:
+        out = [(inst.line, inst.args, False) for inst in instructions
+               if inst.directive == "RUN" and inst.args]
+
+    # Commented RUN blocks — small inline pass. Rare but cheap to
+    # preserve behaviour. Honours backslash continuation across
+    # commented lines (``# RUN foo \`` then ``#  bar``).
+    out.extend(_extract_commented_run_blocks(text))
+
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _extract_live_run_blocks_regex(
+    text: str,
+) -> list[tuple[int, str, bool]]:
+    """Regex fallback for live RUN blocks when the core dockerfile
+    parser refuses the input. Mirrors the commented-block scanner's
+    continuation handling; deliberately simple — the goal is that a
+    pathological Dockerfile still yields its install lines rather
+    than zero deps."""
+    out: list[tuple[int, str, bool]] = []
+    raw = split_lines(text)
+    i = 0
+    while i < len(raw):
+        line = raw[i]
+        if line.lstrip().startswith("#"):
+            i += 1
+            continue
+        m = _DOCKERFILE_RUN_RE.match(line)
+        if m is None:
+            i += 1
+            continue
+        start = i + 1
+        chunks = [line[m.end():]]
+        while chunks[-1].rstrip().endswith("\\"):
+            chunks[-1] = chunks[-1].rstrip()[:-1]
+            i += 1
+            if i >= len(raw):
+                break
+            chunks.append(raw[i])
+        joined = " ".join(c.strip() for c in chunks).strip()
+        if joined:
+            out.append((start, joined, False))
+        i += 1
+    return out
+
+
+def _extract_commented_run_blocks(
+    text: str,
+) -> list[tuple[int, str, bool]]:
+    """Scan for ``# RUN ...`` blocks. Returns the same shape as the
+    live-RUN extractor with ``commented=True``."""
+    out: list[tuple[int, str, bool]] = []
+    raw = split_lines(text)
+    i = 0
+    while i < len(raw):
+        stripped = raw[i].lstrip()
+        if not stripped.startswith("#"):
+            i += 1
+            continue
+        body_line = stripped.lstrip("#").lstrip()
+        m = _DOCKERFILE_RUN_RE.match(body_line)
+        if m is None:
+            i += 1
+            continue
+        start = i + 1
+        chunks = [body_line[m.end():]]
+        while chunks[-1].rstrip().endswith("\\"):
+            chunks[-1] = chunks[-1].rstrip()[:-1]
+            i += 1
+            if i >= len(raw):
+                break
+            cont_line = raw[i].lstrip()
+            if cont_line.startswith("#"):
+                cont_line = cont_line.lstrip("#").lstrip()
+            chunks.append(cont_line)
+        joined = " ".join(c.strip() for c in chunks).strip()
+        if joined:
+            out.append((start, joined, True))
+        i += 1
+    return out
+
+
+# Both patterns are matched against the RIGHT-STRIPPED line: the old
+# inline form ended ``(\S.*?)?\s*$`` where the lazy body and the
+# trailing ``\s*`` both matched spaces, so a body followed by a long
+# space run backtracked quadratically (measured; same class as the
+# gemfile/nuget fixes). With trailing whitespace gone, a greedy body
+# capture is equivalent and linear.
+_GHA_RUN_OPEN_RE = re.compile(r"^(\s*)(?:-\s+)?run:\s*(\S.*)?$")
+_GHA_RUN_BLOCK_OPEN_RE = re.compile(r"^(\s*)(?:-\s+)?run:\s*([|>][+-]?)$")
+
+
+def _extract_gha_run_blocks(text: str) -> list[tuple[int, str, bool]]:
+    r"""Pull the body of every ``run:`` step out of a workflow.
+
+    Supports both inline (``run: pip install foo``) and block-scalar form
+    (``run: |\n  pip install foo``). Block bodies are dedented to their
+    first content line's indent.
+    """
+    out: list[tuple[int, str, bool]] = []
+    raw = split_lines(text)
+    i = 0
+    while i < len(raw):
+        # rstrip is part of the regex contract — see the pattern
+        # definitions above.
+        line = raw[i].rstrip()
+        block_m = _GHA_RUN_BLOCK_OPEN_RE.match(line)
+        if block_m:
+            base_indent = len(block_m.group(1))
+            block_lines: list[str] = []
+            start = i + 2
+            i += 1
+            block_indent: int | None = None
+            while i < len(raw):
+                nxt = raw[i]
+                if not nxt.strip():
+                    block_lines.append("")
+                    i += 1
+                    continue
+                indent = len(nxt) - len(nxt.lstrip())
+                if indent <= base_indent:
+                    break
+                if block_indent is None:
+                    block_indent = indent
+                block_lines.append(nxt[block_indent:] if indent >= block_indent
+                                   else nxt.lstrip())
+                i += 1
+            block_text = "\n".join(block_lines)
+            for ln, body, commented in _collapse_continuations(block_text):
+                out.append((start + ln - 1, body, commented))
+            continue
+        inline_m = _GHA_RUN_OPEN_RE.match(line)
+        if inline_m and inline_m.group(2):
+            body = inline_m.group(2).strip().strip("'\"")
+            out.append((i + 1, body, False))
+            i += 1
+            continue
+        i += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_read(path: Path) -> str | None:
+    # Delegates to the shared size-bounded reader. Caps at 50 MB
+    # (the package-wide default) — large enough for the biggest
+    # legitimate Dockerfile / shell / GHA workflow, small enough
+    # to refuse a hostile target-repo manifest that would
+    # otherwise OOM the parser before the sandbox memory limit
+    # kicks in. Returns None + logs a warning on bound violation;
+    # the caller already treats None as "skip this file".
+    # ``follow_symlinks=False`` matches every sibling parser: these
+    # paths come from the target repo, and a symlinked
+    # Dockerfile/script pointing outside the tree must be refused,
+    # not read.
+    from .._safe_read import read_bounded
+    return read_bounded(path, follow_symlinks=False)
+
+
+def _load_jsonc(text: str) -> dict:
+    """Tolerant JSON-with-comments loader (devcontainer.json convention).
+
+    Delegates to the shared string-aware loader so the ``//``-inside-a-URL
+    bug is fixed in exactly one place (see :mod:`core.json.jsonc`).
+    """
+    return load_jsonc(text)
+
+
+def _flatten_command(val: object) -> list[str]:
+    """devcontainer command fields can be string, list-of-strings, or
+    object (dict of named parallel commands, each again a string or
+    array).
+
+    Per the devcontainer spec a STRING runs via the shell but an
+    ARRAY is one argv exec'd directly — a true argv list joins into a
+    single command line (yielding each element as its own line meant
+    no manager pattern ever saw verb+args together, and every dep in
+    the spec's primary array shape was silently lost). Elements that
+    THEMSELVES carry whitespace mark the other in-the-wild array
+    shape — full command strings per element — which keeps
+    per-element scanning; see ``_join`` for the discriminator."""
+    def _join(items: list) -> list[str]:
+        parts = [v for v in items if isinstance(v, str)]
+        if not parts:
+            return []
+        # Discriminate the two array shapes seen in the wild: a true
+        # exec ARGV splits the verb across elements (no element
+        # carries whitespace) and joins into ONE command line; an
+        # array of FULL command strings (spec-invalid but common —
+        # each element already reads "pip install x") keeps
+        # per-element scanning, which also handles the
+        # ["bash", "-c", "<script>"] shape by scanning the script
+        # element on its own line.
+        if any(" " in part or "\t" in part for part in parts):
+            return parts
+        return [" ".join(parts)]
+
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, list):
+        return _join(val)
+    if isinstance(val, dict):
+        out: list[str] = []
+        for v in val.values():
+            if isinstance(v, str):
+                out.append(v)
+            elif isinstance(v, list):
+                out.extend(_join(v))
+        return out
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+def _is_devcontainer_json(path: Path) -> bool:
+    if path.name == "devcontainer.json":
+        return True
+    return path.name == ".devcontainer.json"
+
+
+def _is_shell_script(path: Path) -> bool:
+    return path.suffix in (".sh", ".bash")
+
+
+register(predicate=_is_dockerfile)(parse_dockerfile)
+register(predicate=_is_devcontainer_json)(parse_devcontainer_json)
+register(predicate=_is_shell_script)(parse_shell_script)
+register(predicate=_is_gha_workflow)(parse_gha_workflow)
+
+
+__all__ = [
+    "classify_action_ref",
+    "parse_dockerfile",
+    "parse_devcontainer_json",
+    "parse_shell_script",
+    "parse_gha_workflow",
+    # Re-exports kept for the back-compat import path
+    # ``from packages.sca.parsers.inline_installs import _parse_apt_args``;
+    # used internally by tests and by older external callers. Listing
+    # them in ``__all__`` is the canonical "yes this is intentional"
+    # signal to ruff F401 and to import-star semantics.
+    "_MANAGERS",
+    "_NAME_RE",
+    "_PkgManager",
+    "_classify_pip_token",
+    "_emit_npm_pkg",
+    "_legacy_single_spec",
+    "_parse_apk_args",
+    "_parse_apt_args",
+    "_parse_brew_args",
+    "_parse_cargo_args",
+    "_parse_gem_args",
+    "_parse_go_install_args",
+    "_parse_npm_args",
+    "_parse_npx_args",
+    "_parse_pip_args",
+    "_parse_versioned_flag_args",
+    "_parse_yum_args",
+    "_split_npm_token",
+    "_tokenise",
+]

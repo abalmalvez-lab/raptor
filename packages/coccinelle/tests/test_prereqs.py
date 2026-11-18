@@ -21,11 +21,13 @@ import pytest
 #   [2] packages/
 #   [3] <repo root>
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+if __name__ == "__main__":
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
-from packages.coccinelle.models import SpatchMatch, SpatchResult
-from packages.coccinelle.prereqs import (
+from packages.coccinelle import prereqs  # noqa: E402
+from packages.coccinelle.models import SpatchMatch, SpatchResult  # noqa: E402
+from packages.coccinelle.prereqs import (  # noqa: E402
     PrereqFacts,
     evaluate_finding,
     gather_prereqs,
@@ -105,7 +107,8 @@ def test_gather_prereqs_parses_def_and_call_messages(tmp_path):
     """Cocci result shape: ``def:<name>`` and ``call:<name>``
     messages → indexed into ``facts.defs`` and ``facts.calls``."""
     (tmp_path / "x.c").write_text("\n")
-    rules_dir = tmp_path / "rules"; rules_dir.mkdir()
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
 
     fake_results = [SpatchResult(
         rule="function_inventory",
@@ -137,7 +140,8 @@ def test_gather_prereqs_ignores_unknown_message_shapes(tmp_path):
     """Future rule additions may emit other COCCIRESULT shapes;
     the gather pass stays neutral and ignores them."""
     (tmp_path / "x.c").write_text("\n")
-    rules_dir = tmp_path / "rules"; rules_dir.mkdir()
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
 
     fake_results = [SpatchResult(
         rule="function_inventory",
@@ -157,6 +161,65 @@ def test_gather_prereqs_ignores_unknown_message_shapes(tmp_path):
     # No spurious entries from the unknown / empty messages:
     assert facts.calls == {}
     assert list(facts.defs.keys()) == ["f"]
+
+
+# ---------------------------------------------------------------------
+# gather_prereqs — errored sweeps hold no absence evidence
+# ---------------------------------------------------------------------
+
+
+def _gather_with(tmp_path, results):
+    (tmp_path / "x.c").write_text("\n")
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir(exist_ok=True)
+    with patch("packages.coccinelle.prereqs.spatch_available",
+               return_value=True), patch(
+        "packages.coccinelle.prereqs.spatch_run_rules",
+        return_value=results,
+    ):
+        return gather_prereqs(tmp_path, rules_dir=rules_dir)
+
+
+def test_gather_prereqs_all_rules_errored_is_skipped(tmp_path):
+    """A sweep in which every rule errored produced no absence
+    evidence — it must read as skipped (``rules_failed``), never as
+    an empty fact base whose every function_exists lookup answers
+    False (engine failure read as mechanical refutation)."""
+    facts = _gather_with(tmp_path, [SpatchResult(
+        rule="prereq-defs", returncode=2,
+        errors=["spatch: parse error"], elapsed_ms=10,
+    )])
+    assert facts.is_skipped is True
+    assert facts.skipped_reason == "rules_failed"
+
+
+def test_gather_prereqs_empty_result_set_is_skipped(tmp_path):
+    """Zero results (empty rules dir) is the same no-evidence shape."""
+    facts = _gather_with(tmp_path, [])
+    assert facts.is_skipped is True
+    assert facts.skipped_reason == "rules_failed"
+
+
+def test_gather_prereqs_partial_sweep_marks_incomplete(tmp_path):
+    """One rule ok + one errored: positive evidence is kept, but the
+    base is marked incomplete so absence answers abstain downstream."""
+    facts = _gather_with(tmp_path, [
+        SpatchResult(rule="a", matches=[
+            SpatchMatch(file="a.c", line=1, message="def:f"),
+        ]),
+        SpatchResult(rule="b", returncode=2, errors=["fatal error"]),
+    ])
+    assert facts.is_skipped is False
+    assert facts.complete is False
+    assert facts.function_exists("f") is True
+
+
+def test_gather_prereqs_clean_sweep_is_complete(tmp_path):
+    facts = _gather_with(tmp_path, [SpatchResult(rule="a", matches=[
+        SpatchMatch(file="a.c", line=1, message="def:f"),
+    ])])
+    assert facts.complete is True
+    assert facts.headers_parsed is False
 
 
 # ---------------------------------------------------------------------
@@ -198,6 +261,18 @@ def test_evaluate_finding_skips_for_non_c_cpp_files():
     )
     assert out["applicable"] is False
     assert out["skipped_reason"] == "non_c_cpp_file"
+
+
+def test_evaluate_finding_abstains_for_extensionless_file():
+    out = evaluate_finding(
+        {"function": "owned_candidate", "file": "src/unit"}, PrereqFacts()
+    )
+    assert out["applicable"] is True
+    assert out["checks"]["function_exists"] is None
+    assert out["checks"]["function_has_callers"] is None
+    assert out["details"]["abstained"] == "ext_not_in_fact_base"
+    assert out["skipped_reason"] is None
+
 
 
 def test_evaluate_finding_function_exists_with_callers():
@@ -248,16 +323,93 @@ def test_evaluate_finding_function_not_defined_locally():
 
 
 def test_evaluate_finding_files_with_no_extension_treated_as_c():
-    """Header-less or extensionless C source (e.g. driver code that
-    omits the .c suffix) — proceed as if C/C++ rather than skip,
-    since cocci will have scanned them. The empty extension fall-
-    through avoids a false "non_c_cpp_file" skip on these targets."""
+    """Retain a positive name witness for an extensionless finding.
+
+    This does not establish that the directory sweep examined the
+    extensionless file or can prove absence there.
+    """
     out = evaluate_finding(
         {"function": "foo", "file": "Makefile_target"},
         _facts(defs={"foo": [("a.c", 1)]}),
     )
     assert out["applicable"] is True
     assert out["checks"]["function_exists"] is True
+
+
+# ---------------------------------------------------------------------
+# evaluate_finding — condemn-toward-abstain
+# ---------------------------------------------------------------------
+
+
+def test_evaluate_finding_cpp_file_not_in_fact_base():
+    """The sweep parses C translation units only — a .cpp finding's
+    function can never appear in defs, so its absence proves nothing.
+    Pre-fix this minted function_exists=False for every C++ finding,
+    which core/audit/feedback accepted as a mechanical refutation."""
+    out = evaluate_finding(
+        {"function": "HandleRequest", "file": "src/server.cpp"},
+        _facts(),
+    )
+    assert out["applicable"] is False
+    assert out["skipped_reason"] == "ext_not_in_fact_base"
+    assert out["checks"]["function_exists"] is None
+
+
+def test_evaluate_finding_header_absence_abstains():
+    """Header-defined static/inline functions are invisible under
+    --no-includes: a .h finding's absent name answers null, never
+    False. A positive hit (defined in a parsed .c) still answers
+    True."""
+    out = evaluate_finding(
+        {"function": "inline_helper", "file": "include/util.h"},
+        _facts(),
+    )
+    assert out["applicable"] is True
+    assert out["checks"]["function_exists"] is None
+    assert out["details"]["abstained"] == "headers_not_parsed"
+
+    hit = evaluate_finding(
+        {"function": "shared", "file": "include/util.h"},
+        _facts(defs={"shared": [("a.c", 3)]}),
+    )
+    assert hit["checks"]["function_exists"] is True
+
+
+def test_evaluate_finding_partial_sweep_absence_abstains():
+    """Incomplete sweep (some rule errored): a .c finding's absent
+    name answers null — the errored rule may have been the one that
+    would have seen the definition."""
+    facts = _facts(defs={"other": [("a.c", 1)]})
+    facts.complete = False
+    out = evaluate_finding(
+        {"function": "parse_packet", "file": "src/net.c"}, facts,
+    )
+    assert out["applicable"] is True
+    assert out["checks"]["function_exists"] is None
+    assert out["details"]["abstained"] == "sweep_partial"
+
+
+def test_evaluate_finding_partial_sweep_positive_evidence_stands():
+    """Positive witnesses survive a partial sweep; only the
+    zero-callers claim degrades to null."""
+    facts = _facts(defs={"f": [("a.c", 1)]})
+    facts.complete = False
+    out = evaluate_finding({"function": "f", "file": "src/a.c"}, facts)
+    assert out["checks"]["function_exists"] is True
+    assert out["checks"]["function_has_callers"] is None
+    assert out["details"]["abstained"] == "sweep_partial"
+
+
+def test_evaluate_finding_complete_sweep_still_answers_false():
+    """Two-direction pin: with a complete fact base the absence
+    witness still fires — the abstention must not swallow the real
+    check."""
+    out = evaluate_finding(
+        {"function": "ghost_fn", "file": "src/a.c"},
+        _facts(defs={"main": [("a.c", 1)]}),
+    )
+    assert out["applicable"] is True
+    assert out["checks"]["function_exists"] is False
 
 
 # ---------------------------------------------------------------------
@@ -297,3 +449,43 @@ def test_e2e_real_spatch_orphan_static_helper(tmp_path):
         "helper_orphan has no caller in fixture — orphan-static-helper "
         "detection broke (rule corpus drift?)"
     )
+
+
+# ---------------------------------------------------------------------------
+# _has_c_cpp_source bounded walk
+# ---------------------------------------------------------------------------
+
+
+def test_has_c_cpp_source_ignores_vcs_internals(tmp_path):
+    """.git internals must not consume the file cap: a repo with
+    hundreds of loose objects and one real C file was read as
+    'no C source' pre-fix, silently skipping all prereq evidence."""
+    objects = tmp_path / ".git" / "objects"
+    objects.mkdir(parents=True)
+    for i in range(300):
+        (objects / f"obj{i:03d}").write_text("x")
+    native = tmp_path / "src" / "native"
+    native.mkdir(parents=True)
+    (native / "addon.c").write_text("int f(void) { return 0; }\n")
+    assert prereqs._has_c_cpp_source(tmp_path) is True
+
+
+def test_has_c_cpp_source_false_without_c(tmp_path):
+    (tmp_path / "app.js").write_text("x\n")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref\n")
+    assert prereqs._has_c_cpp_source(tmp_path) is False
+
+
+def test_has_c_cpp_source_cap_still_bounds_walk(tmp_path):
+    """Two-direction: the cap still applies to non-VCS files — a huge
+    source-free tree returns False without unbounded work."""
+    # Distractors at the walk root: os.walk processes a directory's
+    # files before descending, so these deterministically hit the cap
+    # before the subdirectory's C file is reached.
+    for i in range(250):
+        (tmp_path / f"d{i:03d}.md").write_text("x")
+    deep = tmp_path / "zz" / "deep"
+    deep.mkdir(parents=True)
+    (deep / "late.c").write_text("int f(void);\n")
+    assert prereqs._has_c_cpp_source(tmp_path, max_files=200) is False

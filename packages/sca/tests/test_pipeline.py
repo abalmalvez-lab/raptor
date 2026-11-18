@@ -1,0 +1,608 @@
+"""Tests for ``packages.sca.pipeline``.
+
+The end-to-end smoke uses an in-process fake HttpClient so the test
+runs offline and is deterministic.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import List
+
+import pytest
+
+from core.json import JsonCache
+from core.http import HttpError
+from packages.sca.models import Confidence, Dependency, PinStyle
+from packages.sca.osv import OSV_QUERY_BATCH_URL, OSV_VULN_URL_TEMPLATE
+from packages.sca.pipeline import (
+    RunOptions,
+    run_sca,
+    select_canonical_for_osv,
+)
+
+
+# ---------------------------------------------------------------------------
+# select_canonical_for_osv
+# ---------------------------------------------------------------------------
+
+def _dep(name: str, version: str | None, *, is_lockfile: bool = False,
+         path: str = "/x") -> Dependency:
+    return Dependency(
+        ecosystem="npm",
+        name=name,
+        version=version,
+        declared_in=Path(path),
+        scope="main",
+        is_lockfile=is_lockfile,
+        pin_style=PinStyle.EXACT,
+        direct=True,
+        purl="",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+
+
+def test_canonical_prefers_lockfile_over_manifest() -> None:
+    deps = [
+        _dep("lodash", "4.17.0"),                        # manifest
+        _dep("lodash", "4.17.21", is_lockfile=True),     # lockfile
+    ]
+    canonical = select_canonical_for_osv(deps)
+    assert len(canonical) == 1
+    assert canonical[0].is_lockfile is True
+    assert canonical[0].version == "4.17.21"
+
+
+def test_canonical_keeps_multiple_lockfile_versions() -> None:
+    """npm hoisting can install two copies of a dep at different
+    versions — both should reach OSV."""
+    deps = [
+        _dep("lodash", "4.17.21", is_lockfile=True, path="/a"),
+        _dep("lodash", "3.10.0", is_lockfile=True, path="/b"),
+    ]
+    canonical = select_canonical_for_osv(deps)
+    versions = sorted(d.version for d in canonical)
+    assert versions == ["3.10.0", "4.17.21"]
+
+
+def test_canonical_keeps_manifest_when_no_lockfile() -> None:
+    deps = [_dep("lodash", "4.17.21")]
+    canonical = select_canonical_for_osv(deps)
+    assert canonical == deps
+
+
+def test_canonical_drops_unversioned_rows() -> None:
+    deps = [_dep("lodash", None), _dep("safe", "1.0.0")]
+    canonical = select_canonical_for_osv(deps)
+    assert [d.name for d in canonical] == ["safe"]
+
+
+def test_canonical_dedups_repeated_lockfile_versions() -> None:
+    deps = [
+        _dep("lodash", "4.17.21", is_lockfile=True, path="/a"),
+        _dep("lodash", "4.17.21", is_lockfile=True, path="/b"),
+    ]
+    assert len(select_canonical_for_osv(deps)) == 1
+
+
+def test_canonical_keeps_distinct_manifest_versions() -> None:
+    """Two manifests declaring DIFFERENT versions of the same dep are
+    independent claims — both must reach OSV, or the vulnerable one
+    could be silently skipped."""
+    deps = [
+        _dep("requests", "2.31.0", path="/a/requirements.txt"),
+        _dep("requests", "2.19.1", path="/b/requirements.txt"),
+    ]
+    canonical = select_canonical_for_osv(deps)
+    versions = sorted(d.version for d in canonical)
+    assert versions == ["2.19.1", "2.31.0"]
+
+
+def test_canonical_dedups_repeated_manifest_versions() -> None:
+    """Identical (ecosystem, name, version) manifest duplicates still
+    collapse to a single canonical row."""
+    deps = [
+        _dep("requests", "2.31.0", path="/a/requirements.txt"),
+        _dep("requests", "2.31.0", path="/b/requirements.txt"),
+    ]
+    assert len(select_canonical_for_osv(deps)) == 1
+
+
+def test_canonical_resolved_manifest_version_beats_placeholder() -> None:
+    """A literal ``${VAR}`` "version" (Dockerfile RUN scanned before
+    ARG expansion) is the same declaration as the resolved ARG pin —
+    only the concrete version survives."""
+    deps = [
+        _dep("black", "20.8b1", path="/a/Dockerfile"),
+        _dep("black", "${BLACK_VERSION}", path="/a/Dockerfile"),
+    ]
+    canonical = select_canonical_for_osv(deps)
+    assert [d.version for d in canonical] == ["20.8b1"]
+
+
+def test_canonical_placeholder_only_manifest_row_survives() -> None:
+    """When every manifest row is a placeholder, one still surfaces so
+    the dep isn't silently dropped from the run."""
+    deps = [
+        _dep("black", "${BLACK_VERSION}", path="/a/Dockerfile"),
+        _dep("black", "${OTHER_VERSION}", path="/b/Dockerfile"),
+    ]
+    canonical = select_canonical_for_osv(deps)
+    assert len(canonical) == 1
+    assert canonical[0].version == "${BLACK_VERSION}"
+
+
+def test_canonical_keeps_corridor_row_when_nothing_better() -> None:
+    """A range pin (``pkg<2.0``) resolves to version=None but carries a
+    corridor bound — it must reach OSV via the corridor path rather
+    than being dropped."""
+    import dataclasses
+    corridor = dataclasses.replace(
+        _dep("rangy", None), version_ceiling="2.0.0",
+    )
+    canonical = select_canonical_for_osv([corridor, _dep("bare", None)])
+    assert [d.name for d in canonical] == ["rangy"]
+
+
+def test_canonical_prefers_versioned_row_over_corridor() -> None:
+    import dataclasses
+    corridor = dataclasses.replace(
+        _dep("lodash", None), version_ceiling="2.0.0",
+    )
+    canonical = select_canonical_for_osv(
+        [corridor, _dep("lodash", "4.17.21")],
+    )
+    assert len(canonical) == 1
+    assert canonical[0].version == "4.17.21"
+
+
+# ---------------------------------------------------------------------------
+# Full run_sca
+# ---------------------------------------------------------------------------
+
+class StubHttp:
+    """Routes a small allowlist of OSV / KEV / EPSS URLs to canned data."""
+
+    LOG4J_RECORD = {
+        "id": "GHSA-jfh8-c2jp-5v3q",
+        "modified": "2024-01-01T00:00:00Z",
+        "published": "2021-12-10T00:00:00Z",
+        "aliases": ["CVE-2021-44228"],
+        "summary": "Log4Shell",
+        "details": "Remote code execution.",
+        "affected": [{
+            "package": {"ecosystem": "Maven",
+                        "name": "org.apache.logging.log4j:log4j-core"},
+            "ranges": [{"type": "ECOSYSTEM",
+                        "events": [{"introduced": "2.0-beta9"},
+                                   {"fixed": "2.15.0"}]}],
+        }],
+        "severity": [{"type": "CVSS_V3",
+                      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"}],
+        "references": [{"type": "WEB", "url": "https://example.com/log4shell"}],
+    }
+
+    def __init__(self) -> None:
+        self.posts: List[tuple[str, dict]] = []
+        self.gets: List[str] = []
+
+    def post_json(self, url: str, body: dict, timeout: int = 30) -> dict:
+        self.posts.append((url, body))
+        if url == OSV_QUERY_BATCH_URL:
+            results = []
+            for q in body["queries"]:
+                if (q["package"]["ecosystem"] == "Maven"
+                        and q["package"]["name"]
+                            == "org.apache.logging.log4j:log4j-core"
+                        and q["version"] == "2.14.1"):
+                    results.append({"vulns": [{"id": "GHSA-jfh8-c2jp-5v3q"}]})
+                else:
+                    results.append({})
+            return {"results": results}
+        raise HttpError(f"unexpected POST {url}", status=404)
+
+    def get_json(self, url: str, timeout: int = 30) -> dict:
+        self.gets.append(url)
+        if url == OSV_VULN_URL_TEMPLATE.format("GHSA-jfh8-c2jp-5v3q"):
+            return self.LOG4J_RECORD
+        if "cisa.gov" in url:
+            return {"vulnerabilities":
+                    [{"cveID": "CVE-2021-44228"}]}
+        if "first.org" in url:
+            return {"data": [{"cve": "CVE-2021-44228", "epss": "0.97559"}]}
+        raise HttpError(f"unexpected GET {url}", status=404)
+
+    def get_bytes(self, *a, **k):
+        raise NotImplementedError
+
+
+def test_run_sca_end_to_end_against_log4shell_fixture(tmp_path: Path) -> None:
+    target = tmp_path / "repo"
+    out = tmp_path / "out"
+    target.mkdir()
+    (target / "pom.xml").write_text(
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        '<dependencies><dependency>'
+        '<groupId>org.apache.logging.log4j</groupId>'
+        '<artifactId>log4j-core</artifactId>'
+        '<version>2.14.1</version>'
+        '</dependency></dependencies></project>',
+        encoding="utf-8",
+    )
+
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(
+        target=target, output_dir=out,
+        options=RunOptions(enable_llm_review=False, enable_triage=False),
+        http=http, cache=cache,
+    )
+
+    assert result.deps_analysed == 1
+    assert result.vuln_findings == 1
+    assert result.in_kev == 1
+    assert result.findings_path.exists()
+    assert result.report_path.exists()
+    from core.understand_graph import graph_path_for_run, graph_summary
+    graph = graph_path_for_run(out, str(target))
+    graph_nodes = graph_summary(graph)["nodes"]
+    assert graph_nodes["dependency"] >= 1
+    assert graph_nodes["tool_verdict"] >= 1
+
+    # findings.json shape.
+    rows = json.loads(result.findings_path.read_text())
+    assert any(r["vuln_type"] == "sca:vulnerable_dependency" for r in rows)
+    sca_row = [r for r in rows
+               if r["vuln_type"] == "sca:vulnerable_dependency"][0]
+    assert sca_row["sca"]["in_kev"] is True
+    assert sca_row["sca"]["epss"] == pytest.approx(0.97559)
+    assert sca_row["sca"]["fixed_version"] == "2.15.0"
+
+    # Report exists and looks like markdown.
+    md = result.report_path.read_text()
+    assert "SCA Report" in md
+    assert "log4j-core" in md
+    assert "**KEV**" in md
+
+
+def test_run_sca_result_carries_in_process_eco_breakdown(
+    tmp_path: Path,
+) -> None:
+    """``RunResult.eco_breakdown`` partitions the vuln findings by
+    finding ecosystem, computed from the in-memory list — consumers
+    (e.g. the calibration stress sweep) must never have to re-read
+    findings.json for it, because a size-capped re-read of a large
+    artifact degrades to an empty breakdown that is indistinguishable
+    from a genuinely clean scan."""
+    target = tmp_path / "repo"
+    out = tmp_path / "out"
+    target.mkdir()
+    # Two ecosystems in the dep set; only the Maven dep matches an
+    # advisory in the stub. The breakdown counts FINDINGS, not deps.
+    (target / "pom.xml").write_text(
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        '<dependencies><dependency>'
+        '<groupId>org.apache.logging.log4j</groupId>'
+        '<artifactId>log4j-core</artifactId>'
+        '<version>2.14.1</version>'
+        '</dependency></dependencies></project>',
+        encoding="utf-8",
+    )
+    (target / "package.json").write_text(
+        '{"dependencies": {"lodash": "4.17.21"}}', encoding="utf-8",
+    )
+
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(
+        target=target, output_dir=out,
+        options=RunOptions(enable_llm_review=False, enable_triage=False),
+        http=http, cache=cache,
+    )
+
+    assert result.eco_breakdown == {"Maven": 1}
+    # Invariant: the breakdown always sums to the vuln-finding count.
+    assert sum(result.eco_breakdown.values()) == result.vuln_findings
+
+
+def test_run_sca_offline_mode_does_not_call_network(tmp_path: Path) -> None:
+    target = tmp_path / "repo"
+    out = tmp_path / "out"
+    target.mkdir()
+    (target / "package.json").write_text(
+        '{"dependencies": {"lodash": "^4.17.0"}}', encoding="utf-8",
+    )
+
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(
+        target=target, output_dir=out,
+        options=RunOptions(offline=True),
+        http=http, cache=cache,
+    )
+
+    # No advisory queries were sent.
+    assert http.posts == []
+    assert http.gets == []
+    # Still produces artefacts.
+    assert result.findings_path.exists()
+    assert result.report_path.exists()
+
+
+def test_run_sca_emits_hygiene_findings(tmp_path: Path) -> None:
+    target = tmp_path / "repo"
+    out = tmp_path / "out"
+    target.mkdir()
+    (target / "package.json").write_text(
+        '{"dependencies": {"lodash": "^4.17.0"}}',
+        encoding="utf-8",
+    )
+
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(
+        target=target, output_dir=out,
+        options=RunOptions(offline=True),     # no OSV calls
+        http=http, cache=cache,
+    )
+    rows = json.loads(result.findings_path.read_text())
+    hygiene_kinds = {r["vuln_type"] for r in rows
+                     if r["vuln_type"].startswith("sca:hygiene:")}
+    # No lockfile sibling and a caret-pinned dep ⇒ both checks fire.
+    assert "sca:hygiene:lockfile_missing" in hygiene_kinds
+    assert "sca:hygiene:loose_pin" in hygiene_kinds
+
+
+def test_run_sca_warm_cache_avoids_network_on_second_run(tmp_path: Path) -> None:
+    target = tmp_path / "repo"
+    out1 = tmp_path / "out1"
+    out2 = tmp_path / "out2"
+    target.mkdir()
+    (target / "pom.xml").write_text(
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        '<dependencies><dependency>'
+        '<groupId>org.apache.logging.log4j</groupId>'
+        '<artifactId>log4j-core</artifactId>'
+        '<version>2.14.1</version>'
+        '</dependency></dependencies></project>',
+        encoding="utf-8",
+    )
+
+    cache = JsonCache(root=tmp_path / "cache")
+    http1 = StubHttp()
+    run_sca(target, out1, RunOptions(enable_llm_review=False, enable_triage=False), http=http1, cache=cache)
+    posts_first = len(http1.posts)
+    gets_first = len(http1.gets)
+
+    http2 = StubHttp()
+    cache2 = JsonCache(root=tmp_path / "cache")     # same root, same data
+    result = run_sca(target, out2, RunOptions(enable_llm_review=False, enable_triage=False), http=http2, cache=cache2)
+    assert http2.posts == []
+    assert http2.gets == []
+    assert result.cache_hits > 0
+    # Sanity: first run actually did network work.
+    assert posts_first > 0 and gets_first > 0
+
+
+# ---------------------------------------------------------------------------
+# _find_previous_deps — PermissionError tolerance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="chmod 000 does not block reads for root")
+def test_find_previous_deps_skips_unreadable_sibling(tmp_path: Path) -> None:
+    """When ``output_dir`` lives under a shared root like /tmp/, the
+    parent contains other operators' / system dirs that the SCA
+    process can't stat. _find_previous_deps must skip those rather
+    than abort the whole version-diff stage."""
+    from packages.sca.pipeline import _find_previous_deps
+
+    out_dir = tmp_path / "current-run"
+    out_dir.mkdir()
+    sibling_ok = tmp_path / "prior-run"
+    sibling_ok.mkdir()
+    (sibling_ok / "findings.json").write_text("[]")
+    sibling_blocked = tmp_path / "blocked-run"
+    sibling_blocked.mkdir()
+    (sibling_blocked / "findings.json").write_text("[]")
+    sibling_blocked.chmod(0o000)
+    try:
+        result = _find_previous_deps(out_dir)
+        assert result == sibling_ok / "findings.json"
+    finally:
+        sibling_blocked.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="chmod 000 does not block reads for root")
+def test_find_previous_deps_unreadable_parent_returns_none(
+    tmp_path: Path,
+) -> None:
+    """If even iter'ing the parent fails entirely, return None —
+    don't raise out."""
+    from packages.sca.pipeline import _find_previous_deps
+
+    blocked_parent = tmp_path / "blocked-parent"
+    blocked_parent.mkdir()
+    out_dir = blocked_parent / "current-run"
+    out_dir.mkdir()
+    blocked_parent.chmod(0o000)
+    try:
+        assert _find_previous_deps(out_dir) is None
+    finally:
+        blocked_parent.chmod(0o755)
+
+
+def test_find_previous_deps_returns_most_recent_by_mtime(
+    tmp_path: Path,
+) -> None:
+    import time
+    from packages.sca.pipeline import _find_previous_deps
+
+    out_dir = tmp_path / "current"
+    out_dir.mkdir()
+    older = tmp_path / "older"
+    older.mkdir()
+    (older / "findings.json").write_text("[]")
+    newer = tmp_path / "newer"
+    newer.mkdir()
+    (newer / "findings.json").write_text("[]")
+    # Explicit day-scale mtime offsets, not a sleep — a sleep-based
+    # ordering flakes when a loaded runner writes both files within
+    # one timestamp granule (same class as the cache-eviction tests).
+    now = time.time()
+    os.utime(older / "findings.json", (now - 86400, now - 86400))
+    os.utime(newer / "findings.json", (now, now))
+    result = _find_previous_deps(out_dir)
+    assert result == newer / "findings.json"
+
+
+def test_run_sca_scan_reports_fixture_tree_manifests(tmp_path: Path) -> None:
+    """Scanning stays fully inclusive of fixture trees: manifests under
+    fixtures/ and testdata/ are genuine supply-chain surface, and their
+    findings must be REPORTED. Only the write paths (`fix` / `bump`)
+    accept --exclude globs; the scan side never filters these dirs.
+
+    Regression guard for the fixture-pin work: the exclusion knob is
+    write-only policy — adding fixture dirs to the scan walker (e.g. to
+    TEST_DIR_NAMES or EXCLUDED_DIR_NAMES) would silently drop these
+    findings and must fail here.
+    """
+    def _pom(version: str) -> str:
+        return (
+            '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+            '<dependencies><dependency>'
+            '<groupId>org.apache.logging.log4j</groupId>'
+            '<artifactId>log4j-core</artifactId>'
+            f'<version>{version}</version>'
+            '</dependency></dependencies></project>'
+        )
+
+    target = tmp_path / "repo"
+    out = tmp_path / "out"
+    # Distinct versions so the join keeps one dep row per tree (equal
+    # coordinates would canonicalise into a single finding).
+    for d, version in (("fixtures", "2.14.1"), ("testdata", "2.14.0")):
+        (target / d).mkdir(parents=True)
+        (target / d / "pom.xml").write_text(_pom(version), encoding="utf-8")
+
+    class _BothVulnerable(StubHttp):
+        """Flag BOTH 2.14.x pins (base stub matches 2.14.1 only)."""
+
+        def post_json(self, url: str, body: dict, timeout: int = 30) -> dict:
+            self.posts.append((url, body))
+            if url == OSV_QUERY_BATCH_URL:
+                results = []
+                for q in body["queries"]:
+                    if (q["package"]["name"]
+                            == "org.apache.logging.log4j:log4j-core"
+                            and q["version"] in ("2.14.0", "2.14.1")):
+                        results.append(
+                            {"vulns": [{"id": "GHSA-jfh8-c2jp-5v3q"}]})
+                    else:
+                        results.append({})
+                return {"results": results}
+            raise HttpError(f"unexpected POST {url}", status=404)
+
+    http = _BothVulnerable()
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(
+        target=target, output_dir=out,
+        options=RunOptions(enable_llm_review=False, enable_triage=False),
+        http=http, cache=cache,
+    )
+
+    assert result.deps_analysed == 2, (
+        "both fixture-tree manifests must be discovered and parsed"
+    )
+    rows = json.loads(result.findings_path.read_text())
+    vuln_files = {r["file"] for r in rows
+                  if r.get("vuln_type") == "sca:vulnerable_dependency"}
+    assert any("fixtures/pom.xml" in f for f in vuln_files), (
+        "fixtures/-tree manifest vuln finding must be reported by scan"
+    )
+    # The advisory layer canonicalises same-advisory rows, so the
+    # second tree may not get its own vuln row — but the scan must
+    # still REPORT the testdata/ manifest (any finding kind).
+    all_files = {r["file"] for r in rows}
+    assert any("testdata/pom.xml" in f for f in all_files), (
+        "testdata/-tree manifest must appear in scan findings"
+    )
+
+
+def test_canonical_merges_alias_name_regardless_of_order() -> None:
+    """A manifest declaring the package both plain and aliased at the
+    same version collapses to one row — the alias spelling must
+    survive first-seen order, or fix-materialisation can't rewrite
+    the aliased declaration."""
+    plain = _dep("lodash", "4.17.4")
+    aliased = _dep("lodash", "4.17.4")
+    aliased.alias_name = "my-lodash"
+    for order in ([plain, aliased], [aliased, plain]):
+        # Fresh copies per direction — the merge mutates the kept row.
+        a, b = order[0], order[1]
+        canonical = select_canonical_for_osv([a, b])
+        assert len(canonical) == 1
+        assert canonical[0].alias_name == "my-lodash", (
+            f"alias lost for order {[d.alias_name for d in order]}"
+        )
+        # reset for the second iteration
+        plain.alias_name = None
+        aliased.alias_name = "my-lodash"
+
+
+# ---------------------------------------------------------------------------
+# --no-cache must reach every registry-metadata client
+# ---------------------------------------------------------------------------
+
+
+def test_no_cache_zeroes_registry_metadata_ttl() -> None:
+    """The single-owner constructor zeroes the TTL under --no-cache
+    and keeps each client's own default otherwise — freshness is these
+    clients' whole reason to exist (recent_publish, maintainer_change,
+    yanked_version, transitive-drop, LLM registry views)."""
+    from packages.sca.pipeline import RunOptions, _registry_metadata_client
+    from packages.sca.registries.pypi import PyPIClient
+
+    fresh = _registry_metadata_client(
+        PyPIClient, http=None, cache=None,
+        options=RunOptions(no_cache=True))
+    assert fresh._ttl == 0
+    default = _registry_metadata_client(
+        PyPIClient, http=None, cache=None, options=RunOptions())
+    assert default._ttl > 0
+
+
+def test_registry_metadata_clients_route_through_single_owner() -> None:
+    """Closure over pipeline.py: no registry client may be constructed
+    directly — every construction routes through
+    _registry_metadata_client, so a new call site cannot silently
+    serve day-old registry metadata to a --no-cache run (the exact
+    drift the harden entry point documents and defends against)."""
+    import ast
+    import inspect
+
+    from packages.sca import pipeline as pipeline_mod
+
+    tree = ast.parse(inspect.getsource(pipeline_mod))
+    registry_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.ImportFrom) and node.module
+                and node.module.split(".")[0] == "registries"):
+            for alias in node.names:
+                registry_names.add(alias.asname or alias.name)
+    assert registry_names, "universe empty — import shape changed?"
+    offenders = [
+        (node.func.id, node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in registry_names
+    ]
+    assert offenders == [], (
+        f"registry client(s) constructed outside "
+        f"_registry_metadata_client: {offenders}"
+    )

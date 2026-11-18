@@ -6,35 +6,86 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
-# Vendor-published credential shapes. Each entry is a (vendor, regex)
-# tuple — the vendor label is documentation only; only the compiled
-# regex is used. Anchored on prefix-length-shape rather than just prefix
+# Vendor-published credential shapes. Each entry is a
+# (regex, replacement) tuple; context-anchored patterns keep the field
+# name visible via a capture group so redacted artifacts stay
+# triageable. Anchored on prefix-length-shape rather than just prefix
 # so a bare prefix in prose ("OpenAI's sk- format") doesn't false-match.
 _VENDOR_SECRET_PATTERNS = (
     # AWS access key ID (AKIA*) and secret-access-key context.
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED]"),
     # AWS temporary credentials (ASIA*).
-    re.compile(r"\bASIA[0-9A-Z]{16}\b"),
+    (re.compile(r"\bASIA[0-9A-Z]{16}\b"), "[REDACTED]"),
+    # AWS *secret access key*: 40 chars of base64 with no
+    # distinguishing prefix — anchor on the assignment context (the
+    # field name every SDK/config spelling uses) so ordinary 40-char
+    # base64 blobs in logs don't false-match.
+    (re.compile(
+        r"(?i)\b(aws_?secret_?(?:access_?)?key[\"']?\s*[=:]\s*[\"']?)"
+        r"[A-Za-z0-9/+=]{30,60}"),
+     r"\1[REDACTED]"),
+    # PEM private-key blocks (PKCS#8 `PRIVATE KEY`, PKCS#1
+    # `RSA PRIVATE KEY`, `EC/OPENSSH/...` variants). Body bounded;
+    # the END-less fallback below catches truncated dumps.
+    (re.compile(
+        r"-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY-----"
+        r"[A-Za-z0-9+/=\s]{0,20000}?"
+        r"-----END [A-Z0-9 ]{0,32}PRIVATE KEY-----"),
+     "[REDACTED-PRIVATE-KEY]"),
+    (re.compile(
+        r"-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY-----"
+        r"[ \t]*\r?\n[A-Za-z0-9+/=\r\n \t]{16,20000}"),
+     "[REDACTED-PRIVATE-KEY]"),
+    # Azure storage account key (connection-string AccountKey= field).
+    (re.compile(r"(?i)\b(AccountKey\s*=\s*)[A-Za-z0-9+/=]{40,}"),
+     r"\1[REDACTED]"),
+    # Azure AD client secret: `xQ~` marker + 30-45 char body.
+    (re.compile(r"\b[0-9A-Za-z]?[78]Q~[A-Za-z0-9_~.-]{30,45}"),
+     "[REDACTED]"),
     # GitHub personal access tokens / fine-grained / app tokens.
     # ghp_ / gho_ / ghu_ / ghs_ / ghr_ + 36-char alnum body.
-    re.compile(r"\bgh[opusr]_[A-Za-z0-9]{36}\b"),
+    (re.compile(r"\bgh[opusr]_[A-Za-z0-9]{36}\b"), "[REDACTED]"),
     # GitHub fine-grained PAT (github_pat_ + 22-char prefix + _ + 59-char body).
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b"),
-    # Slack tokens: xoxa-/xoxb-/xoxp-/xoxr-/xoxs-/xoxo- + version + body.
-    re.compile(r"\bxox[abporst]-[0-9A-Za-z-]{10,}\b"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b"), "[REDACTED]"),
+    # GitLab personal/project/group access token: `glpat-` + 20+ char body.
+    (re.compile(r"\bglpat-[0-9A-Za-z_-]{20,}"), "[REDACTED]"),
+    # Hugging Face access token: `hf_` + 30+ char alnum body.
+    (re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"), "[REDACTED]"),
+    # Slack tokens. Full letter class: beyond the app/bot/user set,
+    # `xoxc` (browser session) and `xoxe` (refresh) are live secret
+    # shapes — any xox?- + version + body redacts.
+    (re.compile(r"\bxox[a-z]-[0-9A-Za-z-]{10,}\b"), "[REDACTED]"),
+    # Google OAuth refresh token: `1//` + long base64url body. The
+    # body-length floor keeps Python floor-division expressions
+    # (`1//divisor`) from false-matching.
+    (re.compile(r"\b1//[0-9A-Za-z_-]{28,}"), "[REDACTED]"),
     # OpenAI API key: `sk-` prefix + 48 alphanumeric chars (legacy)
     # OR `sk-proj-` + ≥40 chars (project-scoped, current).
-    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}\b"),
+    (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}\b"), "[REDACTED]"),
     # Anthropic API key: `sk-ant-` + 95+ chars.
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{90,}\b"),
-    # JSON Web Token: 3 base64url segments separated by dots. Strict
-    # length floor on the body to avoid matching short dotted alphanum
-    # tokens (e.g. `a.b.c` in source code).
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{90,}\b"), "[REDACTED]"),
+    # JSON Web Token: 3 base64url segments separated by dots. The
+    # first segment is base64('{...') — `eyJ` for the canonical
+    # compact header but `eyA`/`ewo`/`ewk`/`ew0` for headers with
+    # whitespace after the brace (still valid JWTs to every verifier
+    # that base64-decodes first). Match the `e[wy]` prefix class
+    # (= any JSON-object first byte); strict length floors on all
+    # three segments keep `a.b.c`-style dotted tokens out.
+    (re.compile(
+        # Segment ceilings: the base64url class contains '-', so a
+    # dash-fill run makes every planted `e[wy]` head a live \b
+    # attempt that re-scans the run — quadratic in the logged
+    # text. Real JWT segments sit far below the caps (header
+    # 2048, payload/signature 4096); a segment beyond them
+    # escapes this redactor — the documented trade-off against
+    # an unbounded scan of hostile logs.
+    r"\be[wy][A-Za-z0-9_-]{7,2048}\.[A-Za-z0-9_-]{8,4096}"
+    r"\.[A-Za-z0-9_-]{8,4096}\b"),
+     "[REDACTED]"),
     # Google API key: `AIza` + 35 chars.
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[REDACTED]"),
     # Stripe live secret key.
-    re.compile(r"\bsk_live_[0-9A-Za-z]{24,}\b"),
+    (re.compile(r"\bsk_live_[0-9A-Za-z]{24,}\b"), "[REDACTED]"),
 )
 
 _SECRET_QUERY_KEYS = {
@@ -80,12 +131,98 @@ _SECRET_QUERY_KEYS = {
     "private_key",
 }
 
-_SECRET_FIELD_SUFFIXES = ("_token", "-token", "_secret", "-secret", "_key", "-key")
+_SECRET_FIELD_SUFFIXES = (
+    "_token", "-token", "_secret", "-secret", "_key", "-key",
+    "_password", "-password", "_passwd", "-passwd", "_pwd", "-pwd",
+)
+
+# Free-text KEY=value / key: value assignment shape. The NAME decides
+# (is_secret_field_name in the callback) — the regex itself is generic
+# so the name list stays in one place. Bounds keep false positives in
+# check: word-boundary'd name (≤64 chars, optional matching quotes),
+# short assignment run, and a ≥8-char value floor (below that the
+# "value" is usually prose: "password: use a strong one"). Values are
+# non-whitespace runs excluding quotes/angle-brackets so quoted values
+# redact inside their quotes and HTML/XML contexts don't over-consume.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w.-])"
+    r"([\"']?)"                 # optional opening quote on the name
+    r"([A-Za-z_][\w.-]{0,63})"  # field name
+    r"\1"                       # matching closing quote
+    r"(\s{0,8}[=:]\s{0,8})"     # assignment / mapping separator
+    r"([\"']?)"                 # optional opening quote on the value
+    # Value: length floor limits FPs; parens excluded so a value
+    # already redacted inside a prose-wrapped URL ("(...token=x)")
+    # doesn't swallow the closing wrapper. Comma/semicolon excluded so
+    # a JSON/JS-object member ('{"access_token": 12345678901, "next":
+    # true}') redacts the value without swallowing the separator and
+    # dragging the next member into the replacement. A secret
+    # containing a paren/comma/semicolon redacts up to it — partial
+    # (and below the 8-char floor, not at all), but this pass is the
+    # net under the URL/vendor passes, not the primary.
+    r"([^\s\"'<>(),;]{8,256})"
+)
+
+# Bare URL query/fragment pair (`?key=`, `&key=`, `#key=`). Catches
+# credentials in URL FRAGMENTS of URLs the main regex could not parse
+# whole — most importantly the remainder of a URL split by the 8 KB
+# match cap below, where the tail (`...&access_token=x`) is no longer
+# scheme-anchored. The [?&#] lead keeps it out of ordinary prose.
+_URL_PAIR_RE = re.compile(
+    r"([?&#][A-Za-z0-9_.~%-]{1,64})=([^\s\"'<>&()]{1,4096})"
+)
+
+
+# Code-expression value shapes the assignment pass must NOT redact.
+# `token = lexer.next_token()` / `signature = inspect.signature(func)` /
+# `auth = request.headers.get(...)` are diagnostic code snippets (LLM
+# reasoning quotes them into disagreement samples); their "values" are
+# dotted attribute paths or call expressions, never credentials.
+# Trade-off, both directions: skipping them preserves sample/log
+# diagnostic value; a REAL secret shaped exactly like a dotted
+# identifier path (segments starting with letters, no +/=) under a
+# secret-named assignment would evade — canonical dotted secrets
+# (JWTs) are caught by the vendor pattern that runs earlier, and
+# random credentials virtually never parse as attribute paths.
+_CODE_VALUE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\Z")
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    if not is_secret_field_name(match.group(2)):
+        return match.group(0)
+    value = match.group(5)
+    end = match.end()
+    is_call = end < len(match.string) and match.string[end] == "("
+    if is_call or _CODE_VALUE_RE.match(value):
+        return match.group(0)
+    return (f"{match.group(1)}{match.group(2)}{match.group(1)}"
+            f"{match.group(3)}{match.group(4)}[REDACTED]")
+
+
+def _redact_basic(match: re.Match[str]) -> str:
+    value = match.group(1)
+    mixed_case = value != value.lower() and value != value.upper()
+    if mixed_case or re.search(r"[0-9+/=]", value):
+        return "Basic [REDACTED]"
+    return match.group(0)
+
+
+def _redact_url_pair(match: re.Match[str]) -> str:
+    if not is_secret_field_name(match.group(1)[1:]):
+        return match.group(0)
+    return f"{match.group(1)}=[REDACTED]"
 
 
 def is_secret_field_name(name: object) -> bool:
     """Return whether a field/parameter name conventionally carries a secret value."""
     normalized = str(name).strip().lower()
+    # npm's canonical .npmrc secret spellings carry a LEADING
+    # underscore (`_authToken`, `_auth`, `_password`) — `_authtoken`
+    # is neither an exact member (`authtoken` is) nor a `_token`
+    # suffix match. Strip leading `_`/`-` so the npm spellings hit
+    # the same vocabulary; resolver/npm stderr quoting an .npmrc
+    # line is a routine leak path into shareable artifacts.
+    normalized = normalized.lstrip("_-")
     return normalized in _SECRET_QUERY_KEYS or normalized.endswith(
         _SECRET_FIELD_SUFFIXES
     )
@@ -93,10 +230,28 @@ def is_secret_field_name(name: object) -> bool:
 
 def _redact_url(match: re.Match[str]) -> str:
     raw_url = match.group(0)
+    # Prose-paren trim: parens are legitimate URL characters
+    # (wikipedia-style paths, tracking params), so the URL regex keeps
+    # them — excluding them truncated the match at the first '(' and
+    # let everything after it, query-string credentials included,
+    # escape redaction entirely. The cost is markdown-style wrapping
+    # ("(https://e/?token=x)"): peel trailing ')' beyond the count of
+    # '(' inside the match and re-append them verbatim, so balanced
+    # parens stay part of the URL and wrappers stay outside it.
+    trailing = ""
+    while raw_url.endswith(")") and raw_url.count("(") < raw_url.count(")"):
+        raw_url = raw_url[:-1]
+        trailing = ")" + trailing
+    return _redact_url_inner(raw_url) + trailing
+
+
+def _redact_url_inner(raw_url: str) -> str:
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
-        return raw_url
+        # Malformed authorities can still contain credentials. A parser
+        # rejection must not turn the redactor into a pass-through sink.
+        return "[REDACTED malformed URL]"
 
     # Don't bail when netloc is empty — schemeless or netloc-less inputs
     # (`/api?token=secret`, `data:...`, custom schemes) still carry
@@ -125,7 +280,7 @@ def _redact_url(match: re.Match[str]) -> str:
 
     query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
     redacted_pairs = [
-        (key, "[REDACTED]" if key.lower() in _SECRET_QUERY_KEYS else value)
+        (key, "[REDACTED]" if is_secret_field_name(key) else value)
         for key, value in query_pairs
     ]
     query = "&".join(
@@ -144,7 +299,7 @@ def _redact_url(match: re.Match[str]) -> str:
         fragment_pairs = parse_qsl(fragment, keep_blank_values=True)
         if fragment_pairs:
             fragment_pairs = [
-                (key, "[REDACTED]" if key.lower() in _SECRET_QUERY_KEYS else value)
+                (key, "[REDACTED]" if is_secret_field_name(key) else value)
                 for key, value in fragment_pairs
             ]
             fragment = "&".join(
@@ -173,23 +328,35 @@ def redact_secrets(value: object, *, reveal_secrets: bool = False) -> str:
         return text
 
     # Redact URLs first so query-string context is preserved without leaking values.
-    # URL token cap: PATH_MAX is 4096; HTTP/2 Authority + Path
-    # rarely exceeds 8 KB before proxies start rejecting. A
-    # 100 KB single URL is essentially never legitimate; cap at
-    # 8 KB so a pathological log line containing a megabyte-long
-    # quoted "URL" doesn't pin the regex engine on this scan.
-    # Pre-fix the unbounded `[^\s'"<>]+` would happily consume
-    # any length of non-whitespace, and `re.sub` has no cap on
-    # match length — operator-supplied logs containing such a
-    # string took O(n) per redact_secrets() call, multiplied
-    # across every record processed by reporters.
-    # `()` added to exclusions so URLs in prose (`see https://example.com/`
-    # at end of sentence, or `(https://example.com/?token=abc)`)
-    # don't have the trailing punctuation captured as URL chars
-    # — `_redact_url`'s urlsplit then includes the `)` in the
-    # path/query and the redacted output preserves the malformed
-    # tail visible in logs.
-    text = re.sub(r"https?://[^\s'\"<>()]{1,8192}", _redact_url, text)
+    # URL token cap — kept at 8 KB in BOTH directions on purpose:
+    #   * not lower: PATH_MAX is 4096 and HTTP/2 Authority + Path
+    #     rarely exceeds 8 KB before proxies start rejecting, so a
+    #     smaller cap would split real presigned URLs mid-query;
+    #   * not higher/unbounded: pre-cap, the unbounded `[^...]+`
+    #     consumed any length of non-whitespace and `re.sub` has no
+    #     match-length cap — a megabyte-long quoted "URL" in an
+    #     operator-supplied log pinned the regex engine per
+    #     redact_secrets() call, multiplied across every record.
+    # A URL LONGER than the cap is split at 8 KB: the head is parsed
+    # and redacted as a URL; the tail is no longer scheme-anchored, so
+    # the _URL_PAIR_RE pass below re-scans the whole text for bare
+    # `[?&#]key=value` pairs (plus the assignment pass) — a credential
+    # beyond the cap is still caught at pair granularity. Residual: a
+    # value the cap splits mid-token leaks its tail fragment.
+    #
+    # Parens are INCLUDED in the URL charset — they are legal and
+    # common in real URL paths/queries, and excluding them truncated
+    # the match at the first '(' so query credentials after it escaped
+    # entirely. Prose wrapping ("(https://e?token=x)") is handled by
+    # the unbalanced-trailing-paren trim in _redact_url.
+    text = re.sub(
+        # Any RFC-3986 scheme, not just http(s): connection strings
+        # (postgres://, mongodb+srv://, redis://, amqp://, ftp://, ...)
+        # carry credentials in the SAME userinfo/query positions and
+        # slipped through the http-only pattern verbatim.
+        r"\b[a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^\s'\"<>]{1,8192}",
+        _redact_url, text)
+    text = _URL_PAIR_RE.sub(_redact_url_pair, text)
 
     # Redact common authorization header schemes from logs and finding metadata.
     text = re.sub(
@@ -198,9 +365,18 @@ def redact_secrets(value: object, *, reveal_secrets: bool = False) -> str:
         text,
         flags=re.IGNORECASE,
     )
+    # Basic credentials are base64("user:pass"); real encodings carry
+    # a digit, '+', '/', '=' or mixed case essentially always, while
+    # an all-one-case digitless word after "Basic"/"basic" is prose
+    # ("basic understanding of heap grooming"). Trade-off, both
+    # directions: the value gate preserves prose in disagreement
+    # samples and reports; the residual — a credential whose base64
+    # happens to be all-one-case letters with no digits or padding —
+    # is a vanishing corner of the encoding space, accepted and
+    # pinned by test.
     text = re.sub(
-        r"Basic\s+[A-Za-z0-9+/]{8,}={0,2}",
-        "Basic [REDACTED]",
+        r"Basic\s+([A-Za-z0-9+/]{8,}={0,2})",
+        _redact_basic,
         text,
         flags=re.IGNORECASE,
     )
@@ -209,10 +385,23 @@ def redact_secrets(value: object, *, reveal_secrets: bool = False) -> str:
     # token shape published by the vendor; substring-only false positives
     # are acceptable here because the redaction target is shareable
     # logs / artifacts where false-positive redaction is far cheaper than
-    # a credential leak. Order doesn't matter — patterns are mutually
-    # disjoint by prefix.
-    for pattern in _VENDOR_SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
+    # a credential leak. Order doesn't matter for correctness even
+    # though the prefixes are NOT all disjoint (the generic
+    # `sk-(proj-)?` OpenAI arm also matches `sk-ant-…` prefixes):
+    # every overlapping pair substitutes the identical replacement
+    # text, so whichever arm wins first leaves nothing sensitive
+    # behind. Revisit if a pattern ever gains a distinct replacement.
+    for pattern, replacement in _VENDOR_SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+
+    # Free-text assignment shapes (`GITLAB_TOKEN=...`, `db_password:
+    # ...`, `"api_key": "..."`). Same name convention the URL
+    # query-parameter redaction has always used (is_secret_field_name)
+    # — pre-fix the mechanism was wired ONLY to URLs, so the identical
+    # secret in a config-style line passed through verbatim. Runs last:
+    # earlier passes may already have replaced the value ([REDACTED] is
+    # idempotent under this pattern).
+    text = _SECRET_ASSIGNMENT_RE.sub(_redact_assignment, text)
     return text
 
 
@@ -234,21 +423,16 @@ def redact_url_secrets_only(value: object, *, reveal_secrets: bool = False) -> s
     text = str(value)
     if reveal_secrets:
         return text
-    # URL token cap: PATH_MAX is 4096; HTTP/2 Authority + Path
-    # rarely exceeds 8 KB before proxies start rejecting. A
-    # 100 KB single URL is essentially never legitimate; cap at
-    # 8 KB so a pathological log line containing a megabyte-long
-    # quoted "URL" doesn't pin the regex engine on this scan.
-    # Pre-fix the unbounded `[^\s'"<>]+` would happily consume
-    # any length of non-whitespace, and `re.sub` has no cap on
-    # match length — operator-supplied logs containing such a
-    # string took O(n) per redact_secrets() call, multiplied
-    # across every record processed by reporters.
-    # `()` added to exclusions so URLs in prose (`see https://example.com/`
-    # at end of sentence, or `(https://example.com/?token=abc)`)
-    # don't have the trailing punctuation captured as URL chars
-    # — `_redact_url`'s urlsplit then includes the `)` in the
-    # path/query and the redacted output preserves the malformed
-    # tail visible in logs.
-    text = re.sub(r"https?://[^\s'\"<>()]{1,8192}", _redact_url, text)
-    return text
+    # URL token cap + paren handling: same trade-off and same split
+    # recovery as redact_secrets — see the comment there. This
+    # FP-averse variant adds only the `[?&#]key=value` pair pass
+    # (URL-shaped by construction), never the free-text assignment
+    # pass, so path components like `Bearer abc.dat` stay untouched.
+    text = re.sub(
+        # Any RFC-3986 scheme, not just http(s): connection strings
+        # (postgres://, mongodb+srv://, redis://, amqp://, ftp://, ...)
+        # carry credentials in the SAME userinfo/query positions and
+        # slipped through the http-only pattern verbatim.
+        r"\b[a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^\s'\"<>]{1,8192}",
+        _redact_url, text)
+    return _URL_PAIR_RE.sub(_redact_url_pair, text)

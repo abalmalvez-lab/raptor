@@ -1,0 +1,678 @@
+"""Pre-loop LLM summary extraction for inter-procedural context.
+
+Before the review loop, functions that have callers or callees in the
+work queue but lack mechanical (Joern/Python-AST) summaries get a
+focused LLM pass that extracts preconditions, taint flows, callees,
+and callers.  This guarantees every review has complete callee summary
+context regardless of review order.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any, TYPE_CHECKING
+
+from core.analysis.summaries import FunctionSummary, Precondition, TaintRule
+from core.evidence import EvidenceTier
+from core.orchestration.llm_json import strip_json_fences
+from core.security.prompt_framing import with_audit_framing
+from core.source.lines import slice_text, split_lines
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_SUMMARY_LINES_IMPL = split_lines
+_SUMMARY_TYPE_IMPL = type
+_SUMMARY_STR_IMPL = str
+_SUMMARY_SET_IMPL = set
+_SUMMARY_LEN_IMPL = len
+_SUMMARY_MIN_IMPL = min
+_SUMMARY_MAX_IMPL = max
+
+# Audit-purpose framing: this class was AUP-refused 18/18 in one
+# comparison audit and again 15/15 with the v1 one-paragraph framing;
+# the review class, which carries the full audit context, went 36/36
+# and 35/35 in the same runs. v2 framing + program-analysis task
+# vocabulary below. See core.security.prompt_framing for the history.
+_SUMMARY_SYSTEM_PROMPT = with_audit_framing(
+    "You are extracting a function's behavioural summary — the same "
+    "intermediate facts a static-analysis engine (Joern, CodeQL) "
+    "derives mechanically. The summary feeds the audit's verification "
+    "tools as inter-procedural context. Be precise and terse.\n\n"
+    "Analyse the function provided in the untrusted source-code block "
+    "(its file and function name are given in the slots) and return a "
+    "JSON object with these fields:\n\n"
+    '- "preconditions": list of {"parameter": str, "assumption": str} — '
+    "what each parameter must satisfy for correct execution (null "
+    "checks, bounds, valid state).\n"
+    '- "taint_flows": list of {"source_param": str, "source_index": int, '
+    '"sink_call": str, "sink_arg_index": int} — standard dataflow '
+    "summaries: parameters whose data reaches memory-, process-, or "
+    "query-affecting callees (memcpy, strcpy, system, exec, SQL, "
+    "etc.), so the verification tools can check the call sites.\n"
+    '- "callees": list of "file:function" strings for functions this function calls.\n'
+    '- "callers": list of "file:function" strings if visible from the source.\n'
+    '- "error_paths": list of return-statement strings for error/failure returns.\n'
+    '- "state_transitions": list of strings describing resource state changes '
+    "(lock acquire/release, file open/close, allocation/free).\n\n"
+    "Return ONLY the JSON object.  No explanation, no markdown fencing.",
+)
+
+
+def build_summary_prompt(
+    file_path: str,
+    function_name: str,
+    source: str,
+    *,
+    model_id: str = "",
+    hardened: bool = False,
+) -> tuple[str, str]:
+    """Envelope the summary-extraction prompt: source code in an
+    ``UntrustedBlock``, identifiers in slots, instructions in system.
+    Returns ``(user, system)``.
+
+    ``hardened=True`` renders the source datamarked instead of
+    plaintext — the escape hatch for sources the injection preflight
+    flags (security tooling reviewing itself trips the corpus
+    constantly): sentinel-interleaving breaks up the very phrasing the
+    preflight objected to, so the function gets an LLM summary instead
+    of none. Base64 stays off in both modes (the extraction ask over
+    an encoded payload is the measured hard-refusal conjunction).
+    """
+    from core.security.prompt_envelope import TaintedString, UntrustedBlock
+
+    from ._util import envelope_prompt
+
+    block = UntrustedBlock(
+        content=source[:_MAX_SOURCE_CHARS],
+        kind="source-code",
+        origin=f"{file_path}:{function_name}",
+    )
+    slots = {
+        "file": TaintedString(value=file_path, trust="untrusted"),
+        "function": TaintedString(value=function_name, trust="untrusted"),
+    }
+    # transparent_payload: the taint-extraction ask over an ENCODED
+    # payload is hard-refused 100% by Claude models while the same ask
+    # over plaintext succeeds (measured; see envelope_prompt's
+    # docstring). Compensating injection defences for the plaintext
+    # rendering: pre-call preflight over the source, post-parse
+    # source-grounding of every extracted claim, envelope-echo
+    # discard — see _ground_summary / summarize_functions.
+    if hardened:
+        # datamark_payload (not no_base64_payload): the ladder's whole
+        # admission argument is the sentinel interleaving, so it must
+        # hold on profiles whose default datamarking is off
+        # (CONSERVATIVE/unknown models) too.
+        return envelope_prompt(
+            _SUMMARY_SYSTEM_PROMPT, (block,), slots, model_id=model_id,
+            datamark_payload=True,
+        )
+    return envelope_prompt(
+        _SUMMARY_SYSTEM_PROMPT, (block,), slots, model_id=model_id,
+        transparent_payload=True,
+    )
+
+# Cap source length to keep LLM cost reasonable per function.
+_MAX_SOURCE_CHARS = 8000
+
+# Cap how many functions get the LLM summary pass. Both directions:
+# every candidate is one paid LLM call, so RAISING it buys spend
+# linearly (and candidate count is target-derived — a hostile,
+# densely-connected checklist must not buy an unbounded LLM bill;
+# this is a real spend bound, so it is DISCLOSED when it binds, not
+# scale-derived). LOWERING it starves the taint pass of summaries on
+# ordinary connected targets. Selection is priority-ordered, so the
+# slice keeps the highest-priority functions; when it binds,
+# identify_summary_candidates warns with the selection ratio.
+_MAX_FUNCTIONS = 80
+
+
+def _edge_endpoints(edge: dict[str, Any]) -> tuple[str, str] | None:
+    """Parse one context-map call edge into ``(caller_key, callee_key)``.
+
+    Mirrors the orchestrator's topo-ordering parse: edges carry either
+    split fields (``caller_file`` + ``caller``, ``callee_file`` +
+    ``callee``) or combined ``"file:function"`` strings; a callee with
+    no file defaults to the caller's file (same-TU call).
+    """
+    caller_file = edge.get("caller_file", "")
+    caller_func = edge.get("caller", "")
+    if not caller_file and ":" in caller_func:
+        caller_file, _, caller_func = caller_func.partition(":")
+        caller_func = caller_func.split("(")[0].strip()
+    if not caller_file or not caller_func:
+        return None
+    callee_raw = edge.get("callee", "")
+    callee_file = edge.get("callee_file", "")
+    callee_name = callee_raw
+    if not callee_file and ":" in callee_raw:
+        callee_file, _, callee_name = callee_raw.partition(":")
+        callee_name = callee_name.split("(")[0].strip()
+    if not callee_file:
+        callee_file = caller_file
+    if not callee_name:
+        return None
+    return f"{caller_file}:{caller_func}", f"{callee_file}:{callee_name}"
+
+
+def identify_summary_candidates(
+    workqueue: list[dict[str, Any]],
+    taint_summary_results: dict[str, Any] | None,
+    _checklist: dict[str, Any] | None,
+    *,
+    call_edges: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Find functions that need LLM summaries.
+
+    A function is a candidate when:
+    1. It has callers or callees in the work queue (connected).
+    2. It does not already have a mechanical summary.
+
+    Connectivity comes from two sources: a gap's own ``callees`` field
+    (legacy shape) and, when provided, the context map's ``call_edges``
+    — today's workqueue gaps carry no ``callees`` field, so without
+    the edges every function looks disconnected and the pass finds
+    zero candidates.
+    """
+    if not workqueue:
+        return []
+
+    existing = set(taint_summary_results or {})
+    queue_keys: set[str] = set()
+    queue_by_key: dict[str, dict[str, Any]] = {}
+
+    for gap in workqueue:
+        key = f"{gap['file']}:{gap['name']}"
+        queue_keys.add(key)
+        queue_by_key[key] = gap
+
+    connected: set[str] = set()
+    for gap in workqueue:
+        for ce in gap.get("callees", []):
+            ce_name = ce if isinstance(ce, str) else ce.get("name", "")
+            ce_file = "" if isinstance(ce, str) else ce.get("file", gap["file"])
+            ce_key = f"{ce_file}:{ce_name}"
+            if ce_key in queue_keys:
+                key = f"{gap['file']}:{gap['name']}"
+                connected.add(key)
+                connected.add(ce_key)
+
+    for edge in call_edges or []:
+        endpoints = _edge_endpoints(edge)
+        if endpoints is None:
+            continue
+        caller_key, callee_key = endpoints
+        if caller_key in queue_keys and callee_key in queue_keys:
+            connected.add(caller_key)
+            connected.add(callee_key)
+
+    candidates = []
+    for key in connected:
+        if key in existing:
+            continue
+        gap = queue_by_key.get(key)  # type: ignore[assignment]
+        if gap is None:
+            continue
+        candidates.append(gap)
+
+    candidates.sort(
+        key=lambda g: g.get("priority_score", 0.0), reverse=True,
+    )
+    if len(candidates) > _MAX_FUNCTIONS:
+        # Coverage-carrying disclosure: unsummarised functions look
+        # opaque to the taint pass, so the depth downgrade must be
+        # visible, not a silent slice.
+        logger.warning(
+            "LLM summary pass capped: %d of %d connected candidates "
+            "selected (highest priority_score first) — the taint pass "
+            "runs without summaries for the remainder",
+            _MAX_FUNCTIONS, len(candidates),
+        )
+    return candidates[:_MAX_FUNCTIONS]
+
+
+def run_llm_summary_pass(
+    candidates: list[dict[str, Any]],
+    target_path: Path,
+    config: Any,
+) -> dict[str, FunctionSummary]:
+    """Run focused LLM calls to extract summaries for candidates.
+
+    Returns a dict of "file:function" → FunctionSummary.
+    """
+    if not candidates:
+        return {}
+
+    try:
+        # Prefer the run's budget-governed client so summary spend
+        # enters the run ledger and the per-call reservation gate.
+        client = getattr(config, "llm_budget_client", None)
+        if client is None:
+            # Transcript seam: identical to LLMClient() with no
+            # session active.
+            from core.llm.transcript import build_llm_client
+            client = build_llm_client()
+    except Exception:
+        logger.debug("LLM client unavailable for summary pass", exc_info=True)
+        return {}
+
+    items_with_source = []
+    for gap in candidates:
+        file_path = gap["file"]
+        function_name = gap["name"]
+        source = _read_source(target_path, file_path, function_name,
+                              gap.get("line_start"), gap.get("line_end"))
+        if source:
+            items_with_source.append((file_path, function_name, source))
+
+    if not items_with_source:
+        return {}
+
+    # Budget-stop classification (run_parallel's documented exception
+    # contract: EVERY exception from fn — including the typed terminal
+    # LLMBudgetExceededError — becomes the item's on_error result, so
+    # budget-stop semantics must be classified here). Without it, a
+    # mid-pass exhaustion left every remaining candidate making a
+    # doomed reservation-gated call, each swallowed as a per-item
+    # failure and misattributed as an extraction failure.
+    import threading
+
+    budget_stop = threading.Event()
+    budget_skipped = [0]
+    skip_lock = threading.Lock()
+
+    def _do_one(item: tuple) -> tuple | None:
+        file_path, function_name, source = item
+        if budget_stop.is_set():
+            with skip_lock:
+                budget_skipped[0] += 1
+            return None
+        # Injection preflight over the source BEFORE choosing the
+        # rendering: the summary class defaults to a plaintext payload
+        # (see build_summary_prompt), so a source carrying known
+        # injection phrasing is escalated to the hardened datamarked
+        # rendering below — one LLM attempt whose failure degrades to
+        # the mechanical (Joern/AST) summary path.
+        from core.security.prompt_input_preflight import preflight
+
+        pf = preflight(source)
+        hardened = bool(pf.has_injection_indicators)
+        if hardened:
+            # Escape ladder instead of a flat skip: flagged sources
+            # (security tooling reviewing itself trips the corpus
+            # constantly) get the DATAMARKED rendering — the sentinel
+            # interleaving structurally breaks the phrasing the
+            # preflight flagged, so the plaintext-only risk this
+            # guard existed for does not apply. A refusal or failure
+            # on the hardened call degrades to mechanical summaries,
+            # exactly like the old skip.
+            logger.warning(
+                "llm_summary: injection indicators (%s) in %s:%s "
+                "source — using hardened (datamarked) rendering for "
+                "this function's summary",
+                ",".join(pf.indicators), file_path, function_name,
+            )
+        prompt, system_prompt = build_summary_prompt(
+            file_path, function_name, source,
+            model_id=getattr(client, "model_name", "") or "",
+            hardened=hardened,
+        )
+        # Short call class: minimal prompt, small response. The
+        # per-call ceiling (honoured by the claudecode transport;
+        # SDK providers ignore it) stops one wedged summary call
+        # from holding a worker for the transport's full 600s
+        # default. Timeout retries keep the client default cap of
+        # one — a short call's timeout is usually transient, and an
+        # identical retry is cheap.
+        from core.audit.llm_review import SHORT_CALL_TIMEOUT_S
+        try:
+            response = client.generate(
+                prompt,
+                system_prompt=system_prompt,
+                task_type="audit",
+                timeout_s=SHORT_CALL_TIMEOUT_S,
+                call_class="summary",
+            )
+        except Exception as exc:
+            from core.llm.client import is_budget_exceeded_error
+            if is_budget_exceeded_error(exc):
+                # Terminal for the run: stop dispatching, don't count
+                # the exhaustion as an extraction failure.
+                budget_stop.set()
+                return None
+            raise
+        # LLMResponse carries output in ``content`` (no ``text``
+        # attribute); str(response) is the dataclass repr, which the
+        # summary parser cannot read.
+        from core.audit.batch_glance import _response_text
+        text = _response_text(response)
+        summary = _parse_summary_response(text, function_name, file_path)
+        if summary is not None:
+            # Source-grounding: drop any extracted claim that does not
+            # correspond to the code it was extracted from (injection
+            # defence for the plaintext payload — see _ground_summary).
+            summary = _ground_summary(summary, source)
+        if summary and not summary.is_empty():
+            return (f"{file_path}:{function_name}", summary)
+        return None
+
+    from core.llm.concurrency import run_parallel
+    raw: list[tuple[str, FunctionSummary] | None] = run_parallel(
+        items_with_source, _do_one,
+        max_workers=client.recommended_max_workers,
+        label="llm-summaries",
+    )
+
+    results: dict[str, FunctionSummary] = {}
+    for r in raw:
+        if r is not None:
+            results[r[0]] = r[1]
+
+    if budget_stop.is_set():
+        logger.warning(
+            "llm_summary_pass stopped: run budget exhausted — %d "
+            "candidate(s) skipped without dispatch",
+            budget_skipped[0],
+        )
+    if results:
+        logger.info(
+            "llm_summary_pass: %d summaries extracted (%d failed) from %d candidates",
+            len(results), len(items_with_source) - len(results),
+            len(candidates),
+        )
+
+    return results
+
+
+def _read_source(
+    target_path: Path,
+    file_path: str,
+    _function_name: str,
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> str | None:
+    """Read function source from the target directory.
+
+    ``file_path`` comes from checklist-gap dicts (LLM-writable), so
+    the join is containment-checked (``core.paths.confine``): an
+    absolute value discards ``target_path`` under ``/`` semantics and
+    ``../`` values escape the root (CWE-22) — the whole file would
+    then flow into LLM summary prompts.
+    """
+    from core.paths import confine
+
+    full_path = confine(target_path, file_path)
+    if full_path is None:
+        logger.warning(
+            "_read_source: refusing path outside target root: %r",
+            file_path,
+        )
+        return None
+    if not full_path.is_file():
+        return None
+
+    # Bounded read: the previous read_text + post-hoc length refusal
+    # buffered a planted multi-hundred-MB file whole before deciding.
+    # Same contract (files over the summary budget read as
+    # unavailable), bounded memory.
+    from core.source import read_text_capped
+
+    got = read_text_capped(full_path, 500_000)
+    if got is None:
+        return None
+    text, truncated = got
+    if truncated:
+        return None
+
+    if line_start and line_start > 0:
+        if line_end and line_end < line_start:
+            # Inverted span: corrupt gap metadata. The empty slice it
+            # used to yield was silently dropped by the caller; skip
+            # loudly instead of guessing at a slice.
+            logger.warning(
+                "_read_source: inverted span %s:%s-%s — skipping",
+                file_path, line_start, line_end,
+            )
+            return None
+        if (_SUMMARY_TYPE_IMPL(text) is str and str.__len__(text) >= 16 * 1024
+                and _SUMMARY_TYPE_IMPL(line_start) is int
+                and (line_end is None or _SUMMARY_TYPE_IMPL(line_end) is int)
+                and split_lines is _SUMMARY_LINES_IMPL
+                and len is _SUMMARY_LEN_IMPL and min is _SUMMARY_MIN_IMPL
+                and max is _SUMMARY_MAX_IMPL):
+            end = max(line_end or line_start, line_start)
+            return slice_text(text, line_start, end)
+        lines = split_lines(text)
+        start = max(0, line_start - 1)
+        # A missing/zero line_end clamps to the start line rather than
+        # falling through to the whole file (up to 500KB into the
+        # summary prompt path).
+        end = min(len(lines), max(line_end or line_start, line_start))
+        return "\n".join(lines[start:end])
+
+    return text
+
+
+# Strict top-level schema for the summary response — the keys the
+# prompt declares, and nothing else. Unknown fields REJECT the whole
+# response (schema-invalid == malformed; caller already handles the
+# None return by skipping the summary). Same floor policy as
+# core.llm.response_validation.unknown_response_fields.
+_SUMMARY_RESPONSE_KEYS = frozenset({
+    "preconditions",
+    "taint_flows",
+    "callees",
+    "callers",
+    "error_paths",
+    "state_transitions",
+})
+
+
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SUMMARY_IDENT_IMPL = _IDENT_RE
+
+
+def _summary_identifiers(source: str) -> set[str]:
+    """Bound temporary matches at LF boundaries for the native identifier regex."""
+    if (_SUMMARY_TYPE_IMPL(source) is not _SUMMARY_STR_IMPL
+            or _SUMMARY_STR_IMPL.__len__(source) < 64 * 1024
+            or _IDENT_RE is not _SUMMARY_IDENT_IMPL
+            or set is not _SUMMARY_SET_IMPL
+            or len is not _SUMMARY_LEN_IMPL or min is not _SUMMARY_MIN_IMPL):
+        return set(_IDENT_RE.findall(source))
+    result: set[str] = set()
+    start = 0
+    while start < len(source):
+        limit = min(start + 32 * 1024, len(source))
+        if limit < len(source):
+            end = source.rfind("\n", start, limit)
+            if end < start:
+                end = source.find("\n", limit)
+                if end < 0:
+                    end = len(source)
+        else:
+            end = limit
+        # LF cannot belong to a match of this regex. Pos/endpos avoid copying
+        # source windows, and a single long line retains its complete tokens.
+        result.update(_IDENT_RE.findall(source, start, end))
+        start = end + 1
+    return result
+
+
+def _ground_summary(
+    summary: FunctionSummary, source: str,
+) -> FunctionSummary:
+    """Drop extracted claims that do not correspond to the source.
+
+    Injection defence for the plaintext-payload summary class: every
+    field the model extracts is checkable against the function source
+    it was extracted FROM. Parameters and sink calls must be
+    identifiers present in the source; callees/callers must name
+    identifiers in it (the prompt asks for callers only "if visible
+    from the source", so this drops hallucinations too); error paths
+    must literally occur in it. A prompt-injected response can then
+    at worst SUPPRESS true facts (the same failure mode as a refusal,
+    handled by the mechanical fallback) — it cannot fabricate a flow,
+    a callee, or a precondition on a nonexistent parameter.
+
+    Precondition CONDITIONS text is prose-tier and cannot be
+    content-grounded: legitimate assumptions paraphrase ("non-NULL"
+    for `if (buf == NULL)`) and reference caller-context names absent
+    from this source ("must be <= sizeof(buf)"). What IS enforced is
+    STRUCTURE containment — each entry is newline-flattened here
+    (embedded newlines defeated the per-line `- param …` framing and
+    minted forged headings in OTHER functions' prompts), and every
+    rendered field additionally passes through defend_prompt_field in
+    ``FunctionSummary.format_for_context`` with a hard length cap.
+    Residual: instruction-flavoured PROSE inside a condition survives
+    as inline data — the same declared residual as state transitions,
+    which pass through here by design (free prose, descriptive
+    context only, same render defence).
+    """
+    idents = _summary_identifiers(source)
+
+    def _known_name(raw: str) -> bool:
+        # Accept "file.c:function", "function", "function(...)" forms.
+        base = str(raw).rsplit(":", 1)[-1].split("(")[0].strip()
+        return bool(base) and base in idents
+
+    # Native text is immutable: defer its whitespace copy until the error
+    # paths need it. Source adapters keep their original split timing.
+    norm_source = (None if _SUMMARY_TYPE_IMPL(source) is _SUMMARY_STR_IMPL
+                   else " ".join(source.split()))
+
+    def _normalised_source() -> str:
+        nonlocal norm_source
+        if norm_source is None:
+            norm_source = " ".join(source.split())
+        return norm_source
+
+    summary.taint_rules = [
+        t for t in summary.taint_rules
+        if t.source_param in idents and _known_name(t.sink_call)
+    ]
+    grounded_pres = []
+    for p in summary.preconditions:
+        if p.param not in idents:
+            continue
+        p.conditions = [
+            " ".join(str(c).split())
+            for c in (p.conditions or [])
+            if str(c).strip()
+        ]
+        grounded_pres.append(p)
+    summary.preconditions = grounded_pres
+    summary.callees = [c for c in summary.callees if _known_name(c)]
+    summary.callers = [c for c in summary.callers if _known_name(c)]
+    summary.error_paths = [
+        e for e in summary.error_paths
+        if " ".join(str(e).split()) in _normalised_source()
+    ]
+    return summary
+
+
+def _parse_summary_response(
+    text: str,
+    function: str,
+    file: str,
+) -> FunctionSummary | None:
+    """Parse a JSON summary response into a FunctionSummary.
+
+    Returns None for malformed responses — including responses that
+    carry top-level fields outside :data:`_SUMMARY_RESPONSE_KEYS`
+    (strict unknown-field floor), and responses that echo envelope
+    structure (``<untrusted-`` — parroted envelope tags are evidence
+    the model is replaying attacker-adjacent structure rather than
+    answering; discard as contaminated).
+    """
+    text = text.strip()
+    if "<untrusted-" in text:
+        logger.warning(
+            "summary response for %s:%s discarded — envelope structure "
+            "echoed in output (possible injection contamination)",
+            file, function,
+        )
+        return None
+    text = strip_json_fences(text)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    unknown = sorted(k for k in data if k not in _SUMMARY_RESPONSE_KEYS)
+    if unknown:
+        logger.debug(
+            "summary response for %s:%s rejected — unknown fields %s",
+            file, function, unknown,
+        )
+        return None
+
+    preconditions = []
+    for pc in data.get("preconditions", []):
+        param = pc.get("parameter", pc.get("param", ""))
+        assumption = pc.get("assumption", pc.get("condition", ""))
+        if param and assumption:
+            preconditions.append(Precondition(
+                param=param,
+                param_index=pc.get("param_index", pc.get("source_index", 0)),
+                conditions=[assumption],
+                evidence_tier=EvidenceTier.HEURISTIC,
+            ))
+
+    taint_rules = []
+    for tf in data.get("taint_flows", []):
+        source_param = tf.get("source_param", "")
+        sink_call = tf.get("sink_call", "")
+        if source_param and sink_call:
+            taint_rules.append(TaintRule(
+                source_param=source_param,
+                source_index=tf.get("source_index", 0),
+                sink_call=sink_call,
+                sink_arg_index=tf.get("sink_arg_index", 0),
+                evidence_tier=EvidenceTier.HEURISTIC,
+            ))
+
+    callees = data.get("callees", [])
+    callers = data.get("callers", [])
+    error_paths = data.get("error_paths", [])
+    state_transitions = data.get("state_transitions", [])
+
+    if not isinstance(callees, list):
+        callees = []
+    if not isinstance(callers, list):
+        callers = []
+    if not isinstance(error_paths, list):
+        error_paths = []
+    if not isinstance(state_transitions, list):
+        state_transitions = []
+
+    return FunctionSummary(
+        function=function,
+        file=file,
+        taint_rules=taint_rules,
+        preconditions=preconditions,
+        callees=[str(c) for c in callees],
+        callers=[str(c) for c in callers],
+        error_paths=[str(e) for e in error_paths],
+        state_transitions=[str(s) for s in state_transitions],
+        source="llm",
+        confidence="medium",
+        evidence_tier=EvidenceTier.HEURISTIC,
+    )

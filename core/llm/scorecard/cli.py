@@ -2,12 +2,19 @@
 sidecar maintenance over the model scorecard.
 
 Subcommands:
-    list      — markdown table of all cells with derived columns
-    compare   — side-by-side two models on shared decision_classes
-    samples   — show disagreement-sample reasoning for a cell
-    pin       — set policy_override on a cell
-    unpin     — release a pin (set policy_override back to "auto")
-    reset     — delete cells (single, --model, --older-than, --all)
+    list          — markdown table of all cells with derived columns
+    summary       — one-shot dashboard (totals, policy, spend)
+    recommend     — cheapest trusted model for a decision_class
+    chain-closure — rank models by exploit chain-closure success
+    compare       — side-by-side two models on shared decision_classes
+    samples       — show disagreement-sample reasoning for a cell
+    pin           — set policy_override on a cell
+    unpin         — release a pin (set policy_override back to "auto")
+    reset         — delete cells (single, --model, --older-than, --all)
+    mark          — record an operator-feedback event on a cell
+    tool-evidence — back-propagate /validate outcomes onto the scorecard
+    adopt         — re-bless an unverified sidecar (stamp with this
+                    install's integrity token)
 
 Run ``raptor-llm-scorecard <subcommand> -h`` for per-subcommand
 flags.  All output is markdown so operators can paste it straight
@@ -18,13 +25,19 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any
 
+from core.llm.scorecard._render import scrub_cell
+
+from .paths import default_scorecard_path
 from .scorecard import (
     ALL_EVENT_TYPES,
+    DEFAULT_MISS_RATE_CEILING,
+    DEFAULT_SAMPLE_SIZE_FLOOR,
     EventType,
     ModelScorecard,
     Policy,
@@ -34,7 +47,12 @@ from .scorecard import (
 )
 
 
-DEFAULT_PATH = Path("out/llm_scorecard.json")
+# Shared resolver (RAPTOR_SCORECARD_PATH override → RAPTOR_DIR-anchored
+# → relative fallback): the CLI must read the SAME ledger analysis runs
+# write, regardless of the invoking cwd. Resolved lazily at
+# parser-build time, NOT frozen at import — an env override set after
+# import (in-process callers, some test orders) must still win, like
+# every other call site of the resolver.
 
 
 # ---------------------------------------------------------------------------
@@ -45,13 +63,20 @@ DEFAULT_PATH = Path("out/llm_scorecard.json")
 def _policy_for_stats(
     stats: DecisionClassStats,
     *,
-    sample_size_floor: int = 10,
-    miss_rate_ceiling: float = 0.05,
+    sample_size_floor: int = DEFAULT_SAMPLE_SIZE_FLOOR,
+    miss_rate_ceiling: float = DEFAULT_MISS_RATE_CEILING,
 ) -> str:
     """Re-derive the policy decision from a ``DecisionClassStats``
     snapshot. We don't read the live ``ModelScorecard.should_short_circuit``
     here because that's per-call and we want a self-contained
-    interpretation of the on-disk data."""
+    interpretation of the on-disk data.
+
+    The gate parameters default to the SUBSTRATE constants (never
+    re-hardcoded literals) so this column diverges from the live gate
+    only where the operator tuned a per-run knob the CLI cannot see —
+    a run configured with ``scorecard_freshness_half_life_days`` or a
+    custom ceiling. The default-view note in ``cmd_list`` names that
+    residual; ``--freshness`` mirrors the freshness half."""
     if stats.policy_override == "force_short_circuit":
         return Policy.SHORT_CIRCUIT
     if stats.policy_override == "force_fall_through":
@@ -67,7 +92,7 @@ def _policy_for_stats(
     return Policy.FALL_THROUGH
 
 
-def _format_policy(policy: str, n: int, sample_size_floor: int = 10) -> str:
+def _format_policy(policy: str, _n: int, sample_size_floor: int = 10) -> str:
     """Operator-friendly policy label."""
     if policy == Policy.SHORT_CIRCUIT:
         return "short-circuit"
@@ -76,10 +101,30 @@ def _format_policy(policy: str, n: int, sample_size_floor: int = 10) -> str:
     return f"learning (n<{sample_size_floor})"
 
 
+def _drift_marker(baseline: str, current: str) -> str:
+    """Prefix the policy column with a drift indicator when the freshness-weighted
+    verdict differs from the unweighted baseline. Surfaces silent regressions
+    (or improvements) in the `list` view when `--freshness` is used.
+
+      * ``↓`` — was trusted (short-circuit), recent data says otherwise (the
+        actionable signal — the model regressed in the recent window).
+      * ``↑`` — was distrusted, recent data trusts (the recovery signal).
+      * ``*`` — any other verdict change (fall-through ↔ learning).
+      * ``""`` — no drift.
+    """
+    if baseline == current:
+        return ""
+    if baseline == Policy.SHORT_CIRCUIT and current != Policy.SHORT_CIRCUIT:
+        return "↓ "
+    if current == Policy.SHORT_CIRCUIT and baseline != Policy.SHORT_CIRCUIT:
+        return "↑ "
+    return "* "
+
+
 def _wilson_ub_pct(
     stats: DecisionClassStats,
     event_type: str = EventType.CHEAP_SHORT_CIRCUIT,
-) -> Optional[float]:
+) -> float | None:
     """Wilson 95% upper bound on the chosen event slot's
     incorrect-rate as a percentage. None when n=0 (no observations).
 
@@ -124,7 +169,7 @@ def _event_correct_count(stats: DecisionClassStats, event_type: str) -> int:
     return stats.events[event_type].correct
 
 
-def _humanise_age(iso_ts: str, *, now: Optional[_dt.datetime] = None) -> str:
+def _humanise_age(iso_ts: str, *, now: _dt.datetime | None = None) -> str:
     """Render an ISO timestamp as a human-friendly relative age
     (``2h ago``, ``3d ago``). Empty string for missing/invalid ts."""
     if not iso_ts:
@@ -132,13 +177,21 @@ def _humanise_age(iso_ts: str, *, now: Optional[_dt.datetime] = None) -> str:
     try:
         ts = _dt.datetime.fromisoformat(iso_ts)
     except ValueError:
-        return iso_ts                              # pass through if unparseable
+        # An unparseable timestamp only comes from a forged/corrupt
+        # sidecar row (the writer always emits ISO) — escape + bound
+        # before it can reach a terminal render verbatim.
+        return _scrub_cell(iso_ts)
     if now is None:
         now = _dt.datetime.now(_dt.timezone.utc)
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=_dt.timezone.utc)
     delta = now - ts
     secs = delta.total_seconds()
+    if secs < 0:
+        # A future last_seen_at only comes from clock skew or a
+        # forged sidecar row — flag it instead of rendering a
+        # nonsensical negative age ("-42s ago").
+        return "in the future"
     if secs < 60:
         return f"{int(secs)}s ago"
     if secs < 3600:
@@ -157,9 +210,8 @@ def _parse_since(s: str) -> _dt.timedelta:
     """Parse strings like ``7d``, ``24h``, ``30m``, ``90d``."""
     m = re.fullmatch(r"(\d+)([smhd])", s)
     if not m:
-        raise argparse.ArgumentTypeError(
-            f"--since expects N[smhd] (e.g. 7d, 12h), got {s!r}"
-        )
+        msg = f"--since expects N[smhd] (e.g. 7d, 12h), got {s!r}"
+        raise argparse.ArgumentTypeError(msg)
     n, unit = int(m.group(1)), m.group(2)
     return {
         "s": _dt.timedelta(seconds=n),
@@ -170,13 +222,13 @@ def _parse_since(s: str) -> _dt.timedelta:
 
 
 def _filter_stats(
-    stats: List[DecisionClassStats], *,
-    consumer: Optional[str] = None,
-    since: Optional[_dt.timedelta] = None,
+    stats: list[DecisionClassStats], *,
+    consumer: str | None = None,
+    since: _dt.timedelta | None = None,
     only_untrusted: bool = False,
     only_learning: bool = False,
-    sample_size_floor: int = 10,
-) -> List[DecisionClassStats]:
+    sample_size_floor: int = DEFAULT_SAMPLE_SIZE_FLOOR,
+) -> list[DecisionClassStats]:
     """Apply CLI filter flags. Filters compose (AND)."""
     out = list(stats)
     if consumer is not None:
@@ -211,9 +263,9 @@ def _filter_stats(
 
 
 def _sort_stats(
-    stats: List[DecisionClassStats], *, sort_key: str,
+    stats: list[DecisionClassStats], *, sort_key: str,
     event_type: str = EventType.CHEAP_SHORT_CIRCUIT,
-) -> List[DecisionClassStats]:
+) -> list[DecisionClassStats]:
     """Apply CLI sort. Default is decision_class then model."""
     if sort_key == "savings":
         return sorted(
@@ -224,13 +276,15 @@ def _sort_stats(
     if sort_key == "miss-rate":
         return sorted(
             stats,
-            key=lambda s: (
-                _wilson_ub_pct(s, event_type)
+            key=lambda s: (  # type: ignore[arg-type]
+                _wilson_ub_pct(s, event_type)  # type: ignore[return-value]
                 if _wilson_ub_pct(s, event_type) is not None
                 else -1
             ),
             reverse=True,
         )
+    if sort_key == "cost":
+        return sorted(stats, key=lambda s: s.cost_usd, reverse=True)
     return sorted(stats, key=lambda s: (s.decision_class, s.model))
 
 
@@ -239,9 +293,63 @@ def _sort_stats(
 # ---------------------------------------------------------------------------
 
 
+def _stats_to_json(s: DecisionClassStats) -> dict[str, Any]:
+    """JSON-shape dict for a single cell — used by every command's --json
+    output. Keeps the shape stable so scripts / dashboards / CI gates can
+    depend on it (vs scraping the markdown table)."""
+    ev = s.events[EventType.CHEAP_SHORT_CIRCUIT]
+    return {
+        "decision_class": s.decision_class,
+        "model": s.model,
+        "model_version": s.model_version,
+        "policy": _policy_for_stats(s),
+        "policy_override": s.policy_override,
+        "n": ev.correct + ev.incorrect,
+        "max_miss_pct": _wilson_ub_pct(s, EventType.CHEAP_SHORT_CIRCUIT),
+        "cheap_correct": ev.correct,
+        "cheap_incorrect": ev.incorrect,
+        "calls": s.calls,
+        "cost_usd": s.cost_usd,
+        "tokens": s.tokens,
+        "input_tokens": s.input_tokens,
+        "output_tokens": s.output_tokens,
+        "latency_ms_sum": s.latency_ms_sum,
+        "latency_ms_max": s.latency_ms_max,
+        "first_seen_at": s.first_seen_at,
+        "last_seen_at": s.last_seen_at,
+    }
+
+
+def _scrub_cell(value: object) -> str:
+    """Escape + bound a sidecar-derived cell value (decision_class,
+    model, event_type) before terminal rendering — the sidecar is
+    same-user writable and readable without HMAC verification under
+    the key-unusable clamp, so these strings are attacker-choosable.
+    Routes through the shared ``scrub_cell`` (md_inline projection):
+    control bytes escaped AND in-slot markdown structure (pipes,
+    backticks) entity-escaped, so a forged cell cannot mint table
+    columns in the pasted report."""
+    return scrub_cell(value)
+
+
+def _dumps_json_lane(data: Any) -> str:
+    """Serialise a ``--json`` lane payload for the terminal.
+
+    ensure_ascii: JSON escapes C0 but passes C1 controls
+    (U+0080-U+009F, incl. single-byte CSI/OSC) through raw when
+    ensure_ascii is off — ``dumps_display`` is exactly that, and these
+    dicts carry the same sidecar-derived strings the table lanes scrub
+    (decision_class, model, model_version, timestamps). ASCII-encode
+    so the structured lane cannot carry live terminal controls either;
+    output stays valid JSON for consumers that parse it."""
+    return json.dumps(data, indent=2, ensure_ascii=True, default=str)
+
+
 def _render_table(
-    stats: List[DecisionClassStats],
+    stats: list[DecisionClassStats],
     event_type: str = EventType.CHEAP_SHORT_CIRCUIT,
+    *,
+    drift_map: dict[Any, str] | None = None,
 ) -> str:
     """Markdown table of cell summary lines. Columns are chosen for
     "what is this model good at?" research questions.
@@ -261,36 +369,44 @@ def _render_table(
         ev = s.events[event_type]
         n = ev.correct + ev.incorrect
         policy = _policy_for_stats(s)
+        # Drift marker is prepended to the policy column when the freshness-
+        # weighted verdict differs from the unweighted baseline — surfaces
+        # silent regressions/recoveries directly in the list view.
+        marker = ""
+        if drift_map is not None:
+            baseline = drift_map.get((s.decision_class, s.model), policy)
+            marker = _drift_marker(baseline, policy)
         rows.append((
-            s.decision_class,
-            s.model,
+            _scrub_cell(s.decision_class),
+            _scrub_cell(s.model),
             n,
             _format_wilson(s, event_type),
-            _format_policy(policy, s.events[
+            marker + _format_policy(policy, s.events[
                 EventType.CHEAP_SHORT_CIRCUIT].correct + s.events[
                 EventType.CHEAP_SHORT_CIRCUIT].incorrect),
             _event_correct_count(s, event_type),
             _humanise_age(s.last_seen_at),
+            s.calls,
+            f"${s.cost_usd:.4f}" if s.cost_usd else "$0",
         ))
     headers = (
-        "decision_class", "model", "n", "wilson_ub%",
-        "policy", correct_col, "last_seen",
+        "decision_class", "model", "n", "max_miss%",
+        "policy", correct_col, "last_seen", "calls", "$$",
     )
     widths = [
         max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0))
         for i in range(len(headers))
     ]
     lines = []
-    lines.append(" | ".join(h.ljust(w) for h, w in zip(headers, widths)))
+    lines.append(" | ".join(h.ljust(w) for h, w in zip(headers, widths, strict=True)))
     lines.append("-+-".join("-" * w for w in widths))
-    for r in rows:
-        lines.append(" | ".join(str(c).ljust(w) for c, w in zip(r, widths)))
+    lines.extend(" | ".join(str(c).ljust(w) for c, w in zip(r, widths, strict=True)) for r in rows)
     return "\n".join(lines)
 
 
 def _render_compare(
-    a_stats: List[DecisionClassStats],
-    b_stats: List[DecisionClassStats],
+    a_stats: list[DecisionClassStats],
+    b_stats: list[DecisionClassStats],
     *, model_a: str, model_b: str,
 ) -> str:
     """Side-by-side view of two models on decision_classes they
@@ -305,75 +421,50 @@ def _render_compare(
             f"_(no decision_classes seen by both {model_a} and "
             f"{model_b})_"
         )
+    def _cost(s: DecisionClassStats) -> str:
+        return f"${s.cost_usd:.4f}" if s.cost_usd else "$0"
+
     rows = []
     for dc in shared:
         a, b = by_dc_a[dc], by_dc_b[dc]
         a_ev = a.events[EventType.CHEAP_SHORT_CIRCUIT]
         b_ev = b.events[EventType.CHEAP_SHORT_CIRCUIT]
         rows.append((
-            dc,
+            _scrub_cell(dc),
             f"{a_ev.correct + a_ev.incorrect}",
             _format_wilson(a),
             _format_policy(_policy_for_stats(a),
                            a_ev.correct + a_ev.incorrect),
+            str(a.calls), _cost(a),
             f"{b_ev.correct + b_ev.incorrect}",
             _format_wilson(b),
             _format_policy(_policy_for_stats(b),
                            b_ev.correct + b_ev.incorrect),
+            str(b.calls), _cost(b),
         ))
     headers = (
         "decision_class",
-        f"{model_a} n", f"{model_a} wilson%", f"{model_a} policy",
-        f"{model_b} n", f"{model_b} wilson%", f"{model_b} policy",
+        f"{model_a} n", f"{model_a} max_miss%", f"{model_a} policy",
+        f"{model_a} calls", f"{model_a} $$",
+        f"{model_b} n", f"{model_b} max_miss%", f"{model_b} policy",
+        f"{model_b} calls", f"{model_b} $$",
     )
     widths = [
         max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0))
         for i in range(len(headers))
     ]
     lines = []
-    lines.append(" | ".join(h.ljust(w) for h, w in zip(headers, widths)))
+    lines.append(" | ".join(h.ljust(w) for h, w in zip(headers, widths, strict=True)))
     lines.append("-+-".join("-" * w for w in widths))
-    for r in rows:
-        lines.append(" | ".join(str(c).ljust(w) for c, w in zip(r, widths)))
+    lines.extend(" | ".join(str(c).ljust(w) for c, w in zip(r, widths, strict=True)) for r in rows)
     return "\n".join(lines)
 
 
 def _render_samples(stat: DecisionClassStats) -> str:
-    """Show disagreement-sample reasoning for a single cell.
-    Used for the "why did this model get it wrong?" research
-    question — operator reads through the LLM's reasoning when
-    cheap and full disagreed."""
-    if not stat.disagreement_samples:
-        return (
-            f"_(no disagreement samples for {stat.decision_class} on "
-            f"{stat.model})_"
-        )
-    lines = [
-        f"# {stat.decision_class} on {stat.model}",
-        f"_{len(stat.disagreement_samples)} sample(s); "
-        f"trust math: cheap claimed FP and was actually wrong_",
-        "",
-    ]
-    for i, sample in enumerate(stat.disagreement_samples, 1):
-        lines.append(f"## Sample {i} — {sample.get('ts', '?')} ({sample.get('event_type', '?')})")
-        cheap_r = sample.get("this_reasoning", "")
-        full_r = sample.get("other_reasoning", "")
-        note = sample.get("note", "")
-        if cheap_r:
-            lines.append("**Cheap (clear_fp):**")
-            lines.append(cheap_r)
-            lines.append("")
-        if full_r:
-            lines.append("**Full (overruled):**")
-            lines.append(full_r)
-            lines.append("")
-        if note:
-            # Operator-feedback shape: a single ``note`` field rather
-            # than the cheap-vs-full disagreement pair.
-            lines.append("**Operator note:**")
-            lines.append(note)
-            lines.append("")
-    return "\n".join(lines)
+    """Present recorded reasoning through the shared, sanitised renderer."""
+    from core.reporting.renderers import render_document
+    from .sample_document import build_sample_document
+    return render_document(build_sample_document(stat), "markdown").content.decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +474,26 @@ def _render_samples(stat: DecisionClassStats) -> str:
 
 def cmd_list(args: argparse.Namespace) -> int:
     sc = ModelScorecard(args.path)
-    stats = sc.get_stats()
-    since = _parse_since(args.since) if args.since else None
+    hl = getattr(args, "freshness_half_life_days", None)
+    stats = sc.get_stats(freshness_half_life_days=hl)
+    # Drift map: when freshness is on, compute the unweighted baseline policy
+    # per (dc, model) so the render can flag cells whose verdict changed under
+    # freshness — the silent-regression / silent-recovery signal.
+    drift_map: dict[Any, str] | None = None
+    if hl:
+        baseline = sc.get_stats()
+        drift_map = {
+            (s.decision_class, s.model): _policy_for_stats(s)
+            for s in baseline
+        }
+    # ``--since`` is declared ``type=str`` (handlers are also driven
+    # programmatically with pre-parsed namespaces), so argparse never
+    # converts it — surface a typo as a usage error, not a traceback.
+    try:
+        since = _parse_since(args.since) if args.since else None
+    except argparse.ArgumentTypeError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
     stats = _filter_stats(
         stats,
         consumer=args.consumer,
@@ -397,15 +506,461 @@ def cmd_list(args: argparse.Namespace) -> int:
         sort_key = "savings"
     elif args.by_miss_rate:
         sort_key = "miss-rate"
+    elif getattr(args, "by_cost", False):
+        sort_key = "cost"
     event_type = getattr(args, "event_type", EventType.CHEAP_SHORT_CIRCUIT)
     stats = _sort_stats(stats, sort_key=sort_key, event_type=event_type)
-    print(_render_table(stats, event_type=event_type))
+    impact = None
+    if getattr(args, "json", False) or getattr(args, "_report_options", None) is not None:
+        cells = []
+        for s in stats:
+            d = _stats_to_json(s)
+            if drift_map:
+                baseline = drift_map.get((s.decision_class, s.model))  # type: ignore[assignment]
+                if baseline and baseline != d["policy"]:
+                    d["freshness_drift"] = {"baseline_policy": baseline}
+            cells.append(d)
+        out: dict[str, Any] = {"cells": cells}
+        if hl:
+            out["freshness_half_life_days"] = hl
+            impact = sc.measure_freshness_impact(hl)
+            out["freshness_impact"] = impact
+        if getattr(args, "_report_options", None) is not None:
+            from .read_report import emit
+            emit(args, "list", {**out, "selected_event_type": event_type,
+                 "selection": {"consumer": args.consumer, "since": args.since,
+                               "fall_through_policy_only": args.untrusted, "learning_only": args.learning, "sort_key": sort_key},
+                 "selected_event_rows": [{"event_type": event_type, "correct": cell.events[event_type].correct,
+                     "incorrect": cell.events[event_type].incorrect, "n": cell.events[event_type].correct + cell.events[event_type].incorrect,
+                     "max_miss_pct": _wilson_ub_pct(cell, event_type),
+                     "correct_column": "calls_saved" if event_type == EventType.CHEAP_SHORT_CIRCUIT else "correct",
+                     "correct_column_value": _event_correct_count(cell, event_type)} for cell in stats]}, stats)
+        if getattr(args, "json", False):
+            print(_dumps_json_lane(out))
+            return 0
+    print(_render_table(stats, event_type=event_type, drift_map=drift_map))
+    if not hl:
+        # Divergence breadcrumb: the live gate applies the run
+        # config's scorecard_freshness_half_life_days, which this
+        # process cannot see — an operator auditing the routing
+        # decision must know the default view is the unweighted lens.
+        print(
+            "\nnote: policy column is unweighted with default gate "
+            "parameters; a run configured with freshness weighting "
+            "applies a different lens — mirror it with --freshness "
+            "DAYS."
+        )
+    if hl:
+        # When the freshness view is on, summarise its impact inline: how many
+        # currently-trusted cells would change verdict under this half-life —
+        # the cold-start signal to weigh before enabling freshness by default.
+        imp = impact if impact is not None else sc.measure_freshness_impact(hl)
+        extra = f", +{imp['flipped_in']} newly trusted" if imp["flipped_in"] else ""
+        print(
+            f"\nfreshness @{hl:g}d: {imp['flipped_out']} of "
+            f"{imp['short_circuit_baseline']} trusted cells fall out of "
+            f"short-circuit{extra}"
+        )
+    return 0
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    """One-shot dashboard: totals, policy breakdown, spend, most-used model,
+    cheapest-reliable, recent activity. The "open this every morning" view."""
+    sc = ModelScorecard(args.path)
+    hl = getattr(args, "freshness_half_life_days", None)
+    stats = sc.get_stats(freshness_half_life_days=hl)
+    if not stats:
+        print("scorecard is empty — no LLM calls recorded yet.")
+        from .read_report import emit
+        emit(args, "summary", {"cells_total": 0, "models_total": 0}, stats)
+        return 0
+
+    models = set()
+    short_circuit = learning = fall_through = 0
+    total_cost = 0.0
+    cost_per_model: dict[str, float] = {}
+    usage_calls_by_model: dict[str, int] = {}
+    real_calls_by_model: dict[str, int] = {}
+    usage_cell_by_model: dict[str, DecisionClassStats] = {}
+    # Keyed by (decision_class, model) — for cheapest-trusted picking.
+    sc_models_by_dc: dict[tuple[str, str], str] = {}
+
+    for s in stats:
+        models.add(s.model)
+        if s.decision_class == "_usage":
+            usage_cell_by_model[s.model] = s
+        # Underscore-prefixed cells (_usage roll-ups, _structured
+        # schema tallies) are bookkeeping, not policy cells — counting
+        # them in the breakdown inflated "learning" by one per model
+        # per bookkeeping axis.
+        if not s.decision_class.startswith("_"):
+            p = _policy_for_stats(s)
+            if p == Policy.SHORT_CIRCUIT:
+                short_circuit += 1
+                sc_models_by_dc[(s.decision_class, s.model)] = s.model
+            elif p == Policy.LEARNING:
+                learning += 1
+            elif p == Policy.FALL_THROUGH:
+                fall_through += 1
+        # ``_usage`` is the per-model roll-up of every real call and its
+        # spend. Other underscore-prefixed cells (e.g. ``_structured``)
+        # re-count a per-call subset of those same calls on a separate
+        # metric axis — summing them alongside ``_usage`` double-counts
+        # calls and spend.
+        is_subset_cell = (
+            s.decision_class.startswith("_")
+            and s.decision_class != "_usage"
+        )
+        if not is_subset_cell:
+            total_cost += s.cost_usd
+            cost_per_model[s.model] = cost_per_model.get(s.model, 0.0) + s.cost_usd
+            # Calls axis, per model: REAL decision classes carry
+            # ``calls`` too (register_uses on e.g. study_question) —
+            # those re-count calls the ``_usage`` roll-up already
+            # covers, so they are tallied separately and only used
+            # when the model has no roll-up (a sidecar written
+            # without a lifecycle flush). No real-dc COST writers
+            # exist, so the spend axis above needs no split.
+            if s.decision_class == "_usage":
+                usage_calls_by_model[s.model] = (
+                    usage_calls_by_model.get(s.model, 0) + s.calls
+                )
+            else:
+                real_calls_by_model[s.model] = (
+                    real_calls_by_model.get(s.model, 0) + s.calls
+                )
+
+    # Cheapest short-circuit (lowest $/call from each cell's _usage row).
+    cheapest: tuple | None = None
+    sc_aliases = {m for (_, m) in sc_models_by_dc}
+    for m in sc_aliases:
+        u = usage_cell_by_model.get(m)
+        if u and u.calls > 0:
+            cpc = u.cost_usd / u.calls
+            if cheapest is None or cpc < cheapest[1]:
+                cheapest = (m, cpc)
+
+    # Recent activity — cells touched in the last 7 days.
+    threshold = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=7)
+    recent = 0
+    for s in stats:
+        try:
+            t = _dt.datetime.fromisoformat(s.last_seen_at)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=_dt.timezone.utc)
+            if t > threshold:
+                recent += 1
+        except (ValueError, TypeError):
+            pass
+
+    calls_per_model: dict[str, int] = {
+        m: usage_calls_by_model.get(m, real_calls_by_model.get(m, 0))
+        for m in (set(usage_calls_by_model) | set(real_calls_by_model))
+    }
+    most_used = max(calls_per_model.items(), key=lambda x: x[1], default=(None, 0))
+
+    if getattr(args, "json", False) or getattr(args, "_report_options", None) is not None:
+        out = {
+            "cells_total": len(stats),
+            "models_total": len(models),
+            "policy_breakdown": {
+                "short_circuit": short_circuit, "learning": learning, "fall_through": fall_through,
+            },
+            "total_spend_usd": total_cost,
+            "spend_by_model": dict(cost_per_model),
+            "calls_by_model": dict(calls_per_model),
+            "most_used": (
+                {"model": most_used[0], "calls": most_used[1]}
+                if most_used[0] else None
+            ),
+            "cheapest_short_circuit": (
+                {"model": cheapest[0], "cost_per_call": cheapest[1]}
+                if cheapest else None
+            ),
+            "recent_cells_7d": recent,
+        }
+        from .read_report import emit
+        emit(args, "summary", out, stats)
+        if getattr(args, "json", False):
+            print(_dumps_json_lane(out))
+            return 0
+
+    print(f"scorecard summary ({args.path}):")
+    print(f"  cells: {len(stats)} across {len(models)} model(s)")
+    print(f"  policy: {short_circuit} trusted · {learning} learning · {fall_through} fall-through")
+    # Model names are sidecar-derived (same forgeable provenance as the
+    # table cells) — scrub before the terminal, like every other lane.
+    cost_lines = [f"{_scrub_cell(m)} ${c:.4f}" for m, c in sorted(
+        cost_per_model.items(), key=lambda x: -x[1]) if c > 0]
+    cost_break = " (" + ", ".join(cost_lines) + ")" if cost_lines else ""
+    print(f"  total spend: ${total_cost:.4f}{cost_break}")
+    if most_used[0] and most_used[1] > 0:
+        print(f"  most-used: {_scrub_cell(most_used[0])} ({most_used[1]} calls)")
+    if cheapest:
+        print(f"  cheapest trusted: {_scrub_cell(cheapest[0])} @ ${cheapest[1]:.4f}/call")
+    print(f"  recent activity: {recent} cells last seen in last 7d")
+    return 0
+
+
+def cmd_recommend(args: argparse.Namespace) -> int:
+    """Pick the model an operator should route a `decision_class` to: cheapest
+    trusted-by-the-data, with the runners-up listed. Combines per-(model, dc)
+    reliability (max_miss% from the cheap-tier slot) with the model's overall
+    cost-per-call from its `_usage` cell. The actionable payoff of the whole
+    scorecard system."""
+    sc = ModelScorecard(args.path)
+    target_dc = args.decision_class
+    stats = sc.get_stats(
+        freshness_half_life_days=getattr(args, "freshness_half_life_days", None))
+    candidates = []
+    usage_by_model = {}
+    for s in stats:
+        if s.decision_class == "_usage":
+            usage_by_model[s.model] = s
+        elif s.decision_class == target_dc:
+            candidates.append(s)
+    if not candidates:
+        print(
+            f"no scorecard data for decision_class {target_dc!r} — nothing to "
+            f"recommend. Use `list --prefix {target_dc.split(':')[0]}` to "
+            f"survey what's available.",
+            file=sys.stderr,
+        )
+        from .read_report import emit
+        emit(args, "recommend", {"decision_class": target_dc, "short_circuit": [], "learning": [],
+             "fall_through": [], "recommendation": None, "recorded_no_candidates": True}, stats)
+        return 0
+
+    # (model, max_miss_pct_or_None, cost_per_call_or_None, policy, n)
+    rows = []
+    for c in candidates:
+        ub = _wilson_ub_pct(c, EventType.CHEAP_SHORT_CIRCUIT)
+        u = usage_by_model.get(c.model)
+        cpc = (u.cost_usd / u.calls) if u and u.calls else None
+        ev = c.events[EventType.CHEAP_SHORT_CIRCUIT]
+        rows.append((c.model, ub, cpc, _policy_for_stats(c), ev.correct + ev.incorrect))
+
+    sc_rows = sorted(
+        (r for r in rows if r[3] == Policy.SHORT_CIRCUIT),
+        key=lambda r: r[2] if r[2] is not None else float("inf"),
+    )
+    learning = [r for r in rows if r[3] == Policy.LEARNING]
+    fall_through = sorted(
+        (r for r in rows if r[3] == Policy.FALL_THROUGH),
+        key=lambda r: r[1] if r[1] is not None else float("inf"),
+    )
+
+    hl = getattr(args, "freshness_half_life_days", None)
+
+    if getattr(args, "json", False) or getattr(args, "_report_options", None) is not None:
+        def _r(row):
+            m, ub, cpc, _pol, n = row
+            return {"model": m, "max_miss_pct": ub, "cost_per_call": cpc, "n": n}
+        out = {
+            "decision_class": target_dc,
+            "freshness_half_life_days": hl,
+            "short_circuit": [_r(r) for r in sc_rows],
+            "learning": [r[0] for r in learning],
+            "fall_through": [_r(r) for r in fall_through],
+            "recommendation": (
+                {"model": sc_rows[0][0], "reason": "cheapest short-circuit"}
+                if sc_rows else None
+            ),
+        }
+        if not sc_rows and fall_through:
+            out["least_bad"] = {"model": fall_through[0][0]}
+        from .read_report import emit
+        emit(args, "recommend", out, stats)
+        if getattr(args, "json", False):
+            print(_dumps_json_lane(out))
+            return 0
+
+    # Freshness banner — when an operator passes --freshness, surface that the
+    # ranking reflects weighted (recent-dominant) data so a different answer
+    # than unweighted has a visible breadcrumb.
+    suffix = f" (freshness half-life {hl:g}d)" if hl else ""
+    print(f"recommendation for {target_dc}{suffix}:")
+
+    def _fmt_ub(x) -> str:
+        return f"{x:.1f}% max_miss" if x is not None else "max_miss=n/a"
+
+    def _fmt_cpc(x) -> str:
+        return f"${x:.4f}/call" if x is not None else "no cost data"
+
+    # Model names are sidecar-derived (same forgeable provenance as the
+    # table cells) — scrub before the terminal, like every other lane.
+    if sc_rows:
+        m, ub, cpc, _, n = sc_rows[0]
+        cpc_note = " — cheapest trusted" if cpc is not None else " — trusted (no cost data to rank by)"
+        print(f"  use: {_scrub_cell(m)}  ({_fmt_ub(ub)} · n={n} · {_fmt_cpc(cpc)}){cpc_note}")
+        for m2, ub2, cpc2, _, _n2 in sc_rows[1:]:
+            print(f"  also trusted: {_scrub_cell(m2)} ({_fmt_ub(ub2)} · {_fmt_cpc(cpc2)})")
+    else:
+        print("  no trusted model — none meet the miss-rate ceiling")
+        if fall_through:
+            m, ub, cpc, _, n = fall_through[0]
+            print(f"  least-bad option: {_scrub_cell(m)} ({_fmt_ub(ub)} · n={n} · {_fmt_cpc(cpc)})")
+    if learning:
+        names = ", ".join(_scrub_cell(r[0]) for r in learning)
+        print(f"  still learning (insufficient data): {names}")
+    return 0
+
+
+def cmd_chain_closure(args: argparse.Namespace) -> int:
+    """Rank models by chain-closure success rate for a given
+    exploit_chain_closure decision_class.
+
+    Distinct from ``recommend``: that command optimises the
+    cheap-vs-expensive short-circuit trust question (CHEAP_SHORT_CIRCUIT
+    events), which isn't the right question for /exploit fires. Here we
+    look at EXPLOIT_CHAIN_CLOSURE events directly — how often did the
+    model actually weaponise the bug — and rank highest success rate
+    first, with cost per fire as a tiebreak.
+
+    Usage:
+      scorecard chain-closure                 # aggregate across CWEs
+      scorecard chain-closure --cwe cwe-121   # per-CWE ranking
+    """
+    sc = ModelScorecard(args.path)
+    stats = sc.get_stats(
+        freshness_half_life_days=getattr(
+            args, "freshness_half_life_days", None,
+        ),
+    )
+    # Target decision_class: aggregate or per-CWE.
+    target_dc = "exploit_chain_closure"
+    if getattr(args, "cwe", None):
+        target_dc = f"exploit_chain_closure:{args.cwe.lower()}"
+
+    candidates = []
+    usage_by_model = {}
+    for s in stats:
+        if s.decision_class == "_usage":
+            usage_by_model[s.model] = s
+        elif s.decision_class == target_dc:
+            candidates.append(s)
+
+    if not candidates:
+        # Honest remedy: the exploit-engine producer for this event
+        # type has not landed, so there is no flag or run that
+        # populates it yet — sending the operator to one is a wall.
+        msg = (
+            f"no chain-closure data for {target_dc!r} — nothing to rank. "
+            f"The exploit-engine producer for exploit_chain_closure "
+            f"events is not wired in this tree yet; this view populates "
+            f"once it lands."
+        )
+        from .read_report import emit
+        emit(args, "chain-closure", {"decision_class": target_dc, "candidates": [], "message": msg,
+             "recorded_no_candidates": True}, stats)
+        if getattr(args, "json", False):
+            print(_dumps_json_lane({
+                "decision_class": target_dc,
+                "candidates": [],
+                "message": msg,
+            }))
+        else:
+            print(msg, file=sys.stderr)
+        return 0
+
+    # For each candidate: n = successes + failures on this cell;
+    # success_rate = success / n; cost_per_fire from _usage.
+    rows = []
+    for c in candidates:
+        ev = c.events[EventType.EXPLOIT_CHAIN_CLOSURE]
+        n = ev.correct + ev.incorrect
+        rate = (ev.correct / n) if n else None
+        u = usage_by_model.get(c.model)
+        cpc = (u.cost_usd / u.calls) if u and u.calls else None
+        rows.append({
+            "model": c.model,
+            "n": n,
+            "successes": ev.correct,
+            "success_rate": rate,
+            "cost_per_call": cpc,
+        })
+    # Sort: highest success_rate first; ties broken by cheaper
+    # cost_per_call, then by larger n (more evidence).
+    #
+    # F5 fix: pre-fix used ``-(r["success_rate"] or -1.0)`` which
+    # collapsed rate=0.0 to -(-1.0)=1.0 — identical to rate=None
+    # (also 1.0) — so a 0/10 all-failures model with a low cost
+    # could sort ABOVE a rate=None cell (n=0, cost=inf), and the
+    # top row would then be handed to the "recommendation" field.
+    # Post-fix: rate=None sorts to the tail explicitly via a
+    # sentinel; rate=0.0 keeps its ordinal (worst rate wins the
+    # top of "least bad" tail).
+    def _sort_key(r):
+        rate = r["success_rate"]
+        rate_key = -rate if rate is not None else float("inf")
+        cost_key = (
+            r["cost_per_call"] if r["cost_per_call"] is not None
+            else float("inf")
+        )
+        return (rate_key, cost_key, -r["n"])
+
+    rows.sort(key=_sort_key)
+
+    # A recommendation is only meaningful when the top row has real
+    # positive success rate. Recommending a rate=0.0 model would be
+    # misleading — no wins observed. Return None in that case
+    # rather than pointing operators at a proven-failing model.
+    def _recommendation() -> str | None:
+        if not rows:
+            return None
+        top = rows[0]
+        if top["n"] and (top["success_rate"] or 0.0) > 0.0:  # type: ignore[operator]
+            return top["model"]  # type: ignore[return-value]
+        return None
+
+    if getattr(args, "json", False) or getattr(args, "_report_options", None) is not None:
+        out = {"decision_class": target_dc, "candidates": rows, "recommendation": _recommendation()}
+        from .read_report import emit
+        emit(args, "chain-closure", out, stats)
+        if getattr(args, "json", False):
+            print(_dumps_json_lane(out))
+            return 0
+
+    print(f"chain-closure ranking for {target_dc}:")
+    print(
+        f"  {'model':<28} {'n':>4} {'succ':>4} "
+        f"{'rate':>7} {'cost/fire':>10}",
+    )
+    for r in rows:
+        rate_s = f"{r['success_rate']*100:5.1f}%" if r['success_rate'] is not None else "  n/a"  # type: ignore[operator]
+        cpc_s = f"${r['cost_per_call']:.3f}" if r['cost_per_call'] is not None else "  n/a"
+        # Model names are sidecar-derived (forgeable) — scrub for the
+        # terminal, like the list/compare table cells.
+        print(
+            f"  {_scrub_cell(r['model']):<28} {r['n']:>4} {r['successes']:>4} "
+            f"{rate_s:>7} {cpc_s:>10}",
+        )
     return 0
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
     sc = ModelScorecard(args.path)
     all_stats = sc.get_stats()
+    if getattr(args, "json", False) or getattr(args, "_report_options", None) is not None:
+        by_dc_a = {s.decision_class: s for s in all_stats if s.model == args.model_a}
+        by_dc_b = {s.decision_class: s for s in all_stats if s.model == args.model_b}
+        out = {
+            "model_a": args.model_a, "model_b": args.model_b,
+            "shared": [
+                {
+                    "decision_class": dc,
+                    "model_a": _stats_to_json(by_dc_a[dc]),
+                    "model_b": _stats_to_json(by_dc_b[dc]),
+                }
+                for dc in sorted(set(by_dc_a) & set(by_dc_b))
+            ],
+        }
+        from .read_report import emit
+        emit(args, "compare", out, all_stats)
+        if getattr(args, "json", False):
+            print(_dumps_json_lane(out))
+            return 0
     print(_render_compare(
         all_stats, all_stats,
         model_a=args.model_a, model_b=args.model_b,
@@ -414,6 +969,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 
 def cmd_samples(args: argparse.Namespace) -> int:
+    from .sample_completion import emit as emit_samples
     sc = ModelScorecard(args.path)
     all_stats = sc.get_stats()
     matching = [
@@ -428,16 +984,30 @@ def cmd_samples(args: argparse.Namespace) -> int:
             + ")_",
             file=sys.stderr,
         )
+        emit_samples(args, matching, 1)
         return 1
     for stat in matching:
         print(_render_samples(stat))
         print()
+    emit_samples(args, matching, 0)
     return 0
+
+
+# Friendly CLI policy words -> the internal policy_override storage values
+# (kept verbose for an explicit on-disk format + unchanged verdict comparisons).
+# The CLI words match the `policy` column `list` prints, so the vocab is
+# consistent end to end.
+_PIN_VALUE_MAP = {
+    "short-circuit": "force_short_circuit",
+    "fall-through": "force_fall_through",
+    "auto": "auto",
+}
 
 
 def cmd_pin(args: argparse.Namespace) -> int:
     sc = ModelScorecard(args.path)
-    sc.set_policy_override(args.decision_class, args.model, args.as_)
+    override = _PIN_VALUE_MAP.get(args.as_, args.as_)
+    sc.set_policy_override(args.decision_class, args.model, override)
     print(
         f"Pinned {args.decision_class} on {args.model} as "
         f"{args.as_}.",
@@ -459,12 +1029,18 @@ def cmd_unpin(args: argparse.Namespace) -> int:
 
 def cmd_reset(args: argparse.Namespace) -> int:
     sc = ModelScorecard(args.path)
-    n = sc.reset(
-        decision_class=args.decision_class,
-        model=args.model,
-        older_than_days=args.older_than_days,
-        all_=args.all,
-    )
+    try:
+        n = sc.reset(
+            decision_class=args.decision_class,
+            model=args.model,
+            older_than_days=args.older_than_days,
+            all_=args.all,
+        )
+    except ValueError as e:
+        # A bare ``reset`` (no filter, no --all) is refused by the
+        # substrate; surface the reason instead of a traceback.
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
     print(f"Deleted {n} cell(s).", file=sys.stderr)
     return 0
 
@@ -478,36 +1054,70 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
     Operator-driven back-propagation: run after a /validate completes
     to update the scorecard with downstream-validation truth signal.
     """
-    import json as _json
+    from core.json import load_json
+
     from .tool_evidence import record_tool_evidence_outcomes
 
+    def _read_report(path: Path):
+        data = load_json(path, strict=True, max_bytes=64 * 1024 * 1024)
+        if data is None:
+            # strict load_json returns None for a missing file.
+            msg = f"{path}: file not found"
+            raise OSError(msg)
+        return data
+
     try:
-        analysis = _json.loads(Path(args.analysis).read_text(encoding="utf-8"))
+        analysis = _read_report(Path(args.analysis))
     except (OSError, ValueError) as e:
-        print(f"error: cannot read analysis report {args.analysis!r}: {e}",
+        print(f"✗ Cannot read analysis report {args.analysis!r}: {e}",
               file=sys.stderr)
         return 2
     try:
-        validation = _json.loads(Path(args.validation).read_text(encoding="utf-8"))
+        validation = _read_report(Path(args.validation))
     except (OSError, ValueError) as e:
-        print(f"error: cannot read validation report {args.validation!r}: {e}",
+        print(f"✗ Cannot read validation report {args.validation!r}: {e}",
               file=sys.stderr)
+        return 2
+
+    if not isinstance(analysis, dict):
+        print(
+            f"✗ Analysis report is not a JSON object: "
+            f"{type(analysis).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+    if not isinstance(validation, dict):
+        print(
+            f"✗ Validation report is not a JSON object: "
+            f"{type(validation).__name__}",
+            file=sys.stderr,
+        )
         return 2
 
     # Build {finding_id: validation_verdict} from the validation report.
     # Tolerate multiple possible shapes — both a flat ``findings`` list
     # and a nested ``results`` array.
     val_by_id: dict = {}
-    val_findings = validation.get("findings") or validation.get("results") or []
+    val_findings = (
+        validation.get("findings")
+        or validation.get("results")
+        or []
+    )
     for vf in val_findings:
+        if not isinstance(vf, dict):
+            # A hand-edited or corrupted report can carry non-dict
+            # list entries; same guard as the auto-back-prop walk.
+            continue
         fid = vf.get("finding_id")
         if not fid:
             continue
         verdict = vf.get("is_exploitable")
-        if verdict is None:
-            # inconclusive — skip
+        if not isinstance(verdict, bool):
+            # Inconclusive (None) or malformed (stringy "true"/"yes")
+            # — skip; same typed rule as the auto-back-prop join in
+            # tool_evidence.py.
             continue
-        val_by_id[fid] = bool(verdict)
+        val_by_id[fid] = verdict
 
     # Walk analysis records; emit one evidence record per finding the
     # validator concluded on. Skip records missing the model — without
@@ -518,6 +1128,8 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
     skipped_no_model = 0
     analysis_records = analysis.get("results") or []
     for r in analysis_records:
+        if not isinstance(r, dict):
+            continue
         fid = r.get("finding_id")
         if not fid or fid not in val_by_id:
             continue
@@ -525,10 +1137,20 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
         if not model:
             skipped_no_model += 1
             continue
+        analysis_verdict = r.get("is_exploitable")
+        if not isinstance(analysis_verdict, bool):
+            # The analysis model abstained (errored / refused /
+            # schema-failed response nulls the field): it cast no
+            # verdict, so grading it against the validator would mint
+            # a reliability event for a vote never cast. bool()
+            # coercion here previously turned that abstention into a
+            # "not exploitable" vote — same typed rule as the
+            # auto-back-prop join in tool_evidence.py.
+            continue
         records.append({
             "model": model,
             "rule_id": r.get("rule_id") or "unknown",
-            "analysis_verdict": bool(r.get("is_exploitable", False)),
+            "analysis_verdict": analysis_verdict,
             "validation_verdict": val_by_id[fid],
             "finding_id": fid,
             "analysis_reasoning": r.get("reasoning") or "",
@@ -544,6 +1166,24 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
         f"from {len(records)} joined finding(s).",
         file=sys.stderr,
     )
+    # Run-context annotation: when the validation run whose verdicts
+    # were just graded against executed with the sandbox disabled, the
+    # operator should see that the truth signal came from an
+    # unsandboxed run. Notice only — the recorded events are
+    # unchanged. Display-tier read (escaped + bounded label; see
+    # read_cli_disable_annotation's trust note).
+    try:
+        from core.sandbox.summary import read_cli_disable_annotation
+        _consent = read_cli_disable_annotation(Path(args.validation).parent)
+    except Exception:  # noqa: BLE001 — annotation must never block recording
+        _consent = None
+    if _consent is not None:
+        print(
+            "  run context: the validation run executed with the "
+            f"sandbox DISABLED (consent: {_consent}) — its verdicts "
+            "were produced unsandboxed.",
+            file=sys.stderr,
+        )
     if skipped_no_model:
         print(
             f"  notice: {skipped_no_model} analysis record(s) skipped "
@@ -551,11 +1191,38 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(
-        "  reminder: re-running this command on the same reports "
-        "double-records. Track external state (commit hash, run id) "
-        "if invoking from automation.",
+        "  note: re-running on the same reports is idempotent per "
+        "finding_id (atomic claim-and-record). Residual: a cell that "
+        "accumulates more findings than the seen-id cap between "
+        "imports evicts oldest ids, so a re-import that far apart "
+        "can double-count those findings — a bounded counting "
+        "error, not a trust flip.",
         file=sys.stderr,
     )
+    return 0
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    """Re-bless an unverified sidecar with this install's integrity
+    token (see ``core.llm.scorecard.integrity``). The verification
+    layer discards-and-quarantines content it cannot verify — this
+    is the deliberate operator path for keeping genuine pre-MAC
+    history. Inspect the JSON before adopting: adoption asserts
+    trust in every cell and pin it contains."""
+    sc = ModelScorecard(args.path)
+    try:
+        adopted = sc.adopt_unverified(source=args.file)
+    except (ValueError, OSError) as e:
+        print(f"adopt failed: {e}", file=sys.stderr)
+        return 1
+    if not adopted:
+        print(
+            "nothing to adopt — no quarantine file "
+            f"({args.path}.<timestamp>.unverified) and no sidecar "
+            "content",
+        )
+        return 1
+    print(f"adopted scorecard content into {args.path} (stamped).")
     return 0
 
 
@@ -582,8 +1249,9 @@ def cmd_mark(args: argparse.Namespace) -> int:
     sample = None
     if args.note:
         # Single-line operator note attached to the disagreement-
-        # samples log on incorrect outcomes. Bounded by
-        # ``record_event``'s caps + retain_samples gate.
+        # samples log on incorrect outcomes. Length-bounded at the
+        # sink (``_append_sample`` slices every string leaf to
+        # ``_MAX_REASONING_CHARS``) and gated by retain_samples.
         sample = {"note": args.note}
     sc.record_event(
         decision_class=args.decision_class,
@@ -613,6 +1281,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from core.reporting.options import add_report_arguments
     p = argparse.ArgumentParser(
         prog="raptor-llm-scorecard",
         description=(
@@ -622,10 +1291,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--path", type=Path, default=DEFAULT_PATH,
-        help=f"sidecar path (default: {DEFAULT_PATH})",
+        "--path", type=Path, default=default_scorecard_path(),
+        help=f"sidecar path (default: {default_scorecard_path()}),"
+             " resolved at invocation",
     )
-    sub = p.add_subparsers(dest="subcommand", required=True)
+    p.add_argument(
+        "--json", action="store_true",
+        help=(
+            "emit machine-parseable JSON instead of the markdown table — "
+            "applies to list / compare / recommend / summary. Lets scripts, "
+            "dashboards, and CI gates consume scorecard data directly."
+        ),
+    )
+    # Not required: a bare invocation defaults to `list` (see main()). Keeps
+    # `/scorecard` fast and useful instead of erroring on a missing subcommand.
+    sub = p.add_subparsers(dest="subcommand", required=False)
 
     # list
     p_list = sub.add_parser(
@@ -644,10 +1324,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list.add_argument(
         "--by-miss-rate", action="store_true",
         help=(
-            "sort by Wilson upper-95%% miss-rate (descending). For "
-            "non-cheap event slots, sorts by the wilson upper bound "
-            "on that slot's incorrect-rate."
+            "sort by worst-case miss-rate (descending) — the conservative "
+            "95%%-confidence upper bound shown in the max_miss%% column. For "
+            "non-cheap event slots, sorts by that slot's worst-case "
+            "incorrect-rate."
         ),
+    )
+    p_list.add_argument(
+        "--by-cost", action="store_true",
+        help="sort by total spend on this cell (descending) — the $$ column.",
     )
     p_list.add_argument(
         "--untrusted", action="store_true",
@@ -658,7 +1343,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show only cells still in learning mode (n<floor)",
     )
     p_list.add_argument(
-        "--consumer", type=str, default=None,
+        "--prefix", type=str, default=None, dest="consumer", metavar="PREFIX",
         help=(
             "filter by decision_class prefix "
             "(e.g. 'codeql' matches codeql:py/sql-injection etc.)"
@@ -672,7 +1357,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--event-type", type=str, default=EventType.CHEAP_SHORT_CIRCUIT,
         choices=list(ALL_EVENT_TYPES),
         help=(
-            "reframe n / wilson_ub%% / correct columns around the "
+            "reframe n / max_miss%% / correct columns around the "
             "chosen event slot. Default 'cheap_short_circuit' "
             "preserves the auto-policy view; pass "
             "'reasoning_divergence' / 'multi_model_consensus' / "
@@ -681,7 +1366,83 @@ def _build_parser() -> argparse.ArgumentParser:
             "column is always cheap-derived."
         ),
     )
+    p_list.add_argument(
+        "--freshness", dest="freshness_half_life_days",
+        type=float, default=None, metavar="DAYS",
+        help=(
+            "weight recent behaviour more heavily, halving an observation's "
+            "weight every DAYS days (exponential half-life), so the policy / "
+            "max_miss%% / calls columns reflect recent over stale history — "
+            "the same weighting the live gate applies when "
+            "scorecard_freshness_half_life_days is configured. Default: "
+            "unweighted (all-time)."
+        ),
+    )
     p_list.set_defaults(handler=cmd_list)
+    add_report_arguments(p_list)
+
+    # summary — the daily-driver dashboard
+    p_sum = sub.add_parser(
+        "summary",
+        help=(
+            "one-shot dashboard: cell totals, policy breakdown, total spend, "
+            "most-used model, cheapest trusted, recent activity"
+        ),
+    )
+    p_sum.add_argument(
+        "--freshness", dest="freshness_half_life_days",
+        type=float, default=None, metavar="DAYS",
+        help=(
+            "weight recent behaviour (half-life in days) so the policy "
+            "breakdown mirrors a freshness-configured live gate; same "
+            "as `list --freshness`. Default: unweighted (all-time)."
+        ),
+    )
+    p_sum.set_defaults(handler=cmd_summary)
+    add_report_arguments(p_sum)
+
+    # recommend — the actionable payoff
+    p_rec = sub.add_parser(
+        "recommend",
+        help=(
+            "pick the model to route a given decision_class to — cheapest "
+            "trusted (max_miss%% ≤ ceiling), with runners-up listed. The "
+            "operator-facing payoff of the whole scorecard."
+        ),
+    )
+    p_rec.add_argument(
+        "decision_class", type=str,
+        help="decision_class to recommend for (e.g. codeql:py/sql-injection)",
+    )
+    p_rec.add_argument(
+        "--freshness", dest="freshness_half_life_days",
+        type=float, default=None, metavar="DAYS",
+        help="weight recent behaviour (half-life in days); same as `list --freshness`",
+    )
+    p_rec.set_defaults(handler=cmd_recommend)
+    add_report_arguments(p_rec)
+
+    # chain-closure — rank models by /exploit chain-closure success
+    p_cc = sub.add_parser(
+        "chain-closure",
+        help=(
+            "rank models by /exploit chain-closure success rate. "
+            "Aggregate across CWEs by default; scope to one with "
+            "--cwe. Reads EXPLOIT_CHAIN_CLOSURE events populated by "
+            "/exploit --scorecard."
+        ),
+    )
+    p_cc.add_argument(
+        "--cwe", type=str, default=None,
+        help="scope to a specific CWE, e.g. --cwe cwe-121",
+    )
+    p_cc.add_argument(
+        "--freshness", dest="freshness_half_life_days",
+        type=float, default=None, metavar="DAYS",
+        help="weight recent behaviour (half-life in days)",
+    )
+    p_cc.set_defaults(handler=cmd_chain_closure)
+    add_report_arguments(p_cc)
 
     # compare
     p_cmp = sub.add_parser(
@@ -691,6 +1452,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("model_a", type=str)
     p_cmp.add_argument("model_b", type=str)
     p_cmp.set_defaults(handler=cmd_compare)
+    add_report_arguments(p_cmp)
 
     # samples
     p_smp = sub.add_parser(
@@ -703,6 +1465,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="restrict to a specific model (default: all models with data)",
     )
     p_smp.set_defaults(handler=cmd_samples)
+    add_report_arguments(p_smp)
 
     # pin
     p_pin = sub.add_parser(
@@ -716,8 +1479,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_pin.add_argument(
         "--as", type=str, dest="as_", required=True,
-        choices=("force_short_circuit", "force_fall_through", "auto"),
-        help="override value to set",
+        choices=("short-circuit", "fall-through", "auto"),
+        help=("policy to pin: short-circuit (always trust this cell) / "
+              "fall-through (never trust) / auto (back to data-driven)"),
     )
     p_pin.set_defaults(handler=cmd_pin)
 
@@ -814,12 +1578,63 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_te.set_defaults(handler=cmd_tool_evidence)
 
+    # adopt
+    p_adopt = sub.add_parser(
+        "adopt",
+        help=(
+            "re-bless an unverified sidecar (pre-MAC history or a "
+            "quarantined <sidecar>.unverified file) by stamping it "
+            "with this install's integrity token. Deliberate "
+            "operator action: the machinery never re-stamps "
+            "unverified content on its own — inspect the file "
+            "before adopting."
+        ),
+    )
+    p_adopt.add_argument(
+        "--file", type=Path, default=None,
+        help=(
+            "explicit source JSON to adopt (default: the newest "
+            "quarantine file <sidecar>.<timestamp>.unverified when "
+            "present, else the sidecar itself)"
+        ),
+    )
+    p_adopt.set_defaults(handler=cmd_adopt)
+
+    for view in (p_list, p_sum, p_rec, p_cc, p_cmp, p_smp):
+        view.epilog = "Portable exports require --report-output. --no-report retains the native on-screen view."
     return p
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    import sys as _sys
+    argv = list(_sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.subcommand in {"samples", "summary", "compare", "list", "recommend", "chain-closure"}:
+        from core.reporting.options import options_from_args
+        args._report_options = options_from_args(args, parser) if args.report_format or args.report_output or args.no_report else None
+        if args._report_options is not None:
+            try:
+                if args.subcommand == "samples":
+                    from .sample_completion import prepare
+                    prepare(args._report_options, args.path)
+                else:
+                    from .read_report import prepare as prepare_read
+                    prepare_read(args._report_options, args.path, args.subcommand)
+            except ValueError as exc:
+                parser.error(str(exc))
+    if getattr(args, "handler", None) is None:
+        # No subcommand given -> default to `list` (top-level optionals like
+        # --path stay before the appended subcommand, which argparse accepts).
+        # Print a discoverability footer so the operator still learns the other
+        # subcommands now that a bare invocation no longer errors into usage.
+        args = parser.parse_args([*argv, "list"])
+        rc = args.handler(args)
+        # Suppress the discoverability footer when --json is on so the
+        # emitted output stays valid JSON for downstream parsers.
+        if not getattr(args, "json", False):
+            print("\n(more subcommands: run `raptor-llm-scorecard -h`)")
+        return rc
     return args.handler(args)
 
 

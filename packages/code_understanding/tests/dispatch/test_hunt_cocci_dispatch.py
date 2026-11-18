@@ -14,6 +14,9 @@ Coverage:
     rule-gen failure, spatch error vs empty-result distinction
   * repo-language heuristic: detects C headers/sources, doesn't mis-fire
     on Python repos
+  * locked sandbox runner: restrict_reads/fake_home/network-block
+    controls, fail-closed when the sandbox is unavailable, scratch-dir
+    cleanup, UTF-8 rule tempfile regardless of locale
 """
 
 from __future__ import annotations
@@ -32,12 +35,13 @@ import pytest
 #   [3] packages/
 #   [4] <repo root>
 _REPO_ROOT = str(Path(__file__).resolve().parents[4])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+if __name__ == "__main__":
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
 
-from packages.code_understanding.dispatch import hunt_cocci_dispatch as mod
-from packages.coccinelle.models import SpatchMatch, SpatchResult
+from packages.code_understanding.dispatch import hunt_cocci_dispatch as mod  # noqa: E402
+from packages.coccinelle.models import SpatchMatch, SpatchResult  # noqa: E402
 
 
 # ---------------------------------------------------------------------
@@ -199,13 +203,13 @@ def test_matches_to_variants_preserves_unrelated_paths():
             ),
         ],
     )
-    variants = mod._spatch_matches_to_variants(result, "/tmp/some-repo")
+    variants = mod._spatch_matches_to_variants(result, "./some-repo")
     assert variants[0]["file"] == "/usr/include/sys/socket.h"
 
 
 def test_matches_to_variants_handles_empty_result():
     result = SpatchResult(rule="r", matches=[])
-    assert mod._spatch_matches_to_variants(result, "/tmp/repo") == []
+    assert mod._spatch_matches_to_variants(result, "./repo") == []
 
 
 # ---------------------------------------------------------------------
@@ -214,7 +218,7 @@ def test_matches_to_variants_handles_empty_result():
 
 
 def test_dispatch_rejects_empty_pattern():
-    out = mod.cocci_hunt_dispatch(_fake_model(), "", "/tmp/whatever")
+    out = mod.cocci_hunt_dispatch(_fake_model(), "", "./whatever")
     assert len(out) == 1
     assert "error" in out[0]
     assert "non-empty" in out[0]["error"]
@@ -375,6 +379,37 @@ def test_dispatch_distinguishes_empty_match_from_spatch_error(tmp_path):
     assert "bad rule syntax" in out[0]["error"]
 
 
+def test_dispatch_partial_matches_carry_degradation_note(tmp_path):
+    """spatch errored but still matched (a file failed to parse, a
+    per-file timeout hit): the incomplete match set must not read as
+    a complete answer. Each variant carries a degradation note — an
+    appended error ENTRY would be stripped by the substrate's error
+    filter and surface nowhere."""
+    (tmp_path / "x.c").write_text("\n")
+    fake_provider = mock.Mock()
+    fake_provider.generate.return_value = _fake_response(
+        "```cocci\n@r@\n@@\n@@\n```"
+    )
+    partial = SpatchResult(
+        rule="r",
+        matches=[SpatchMatch(file="x.c", line=3, message="hit")],
+        errors=["y.c: parse error"],
+        returncode=1,
+    )
+    with mock.patch.object(mod, "spatch_is_available", return_value=True), \
+         mock.patch.object(mod, "create_provider",
+                           return_value=fake_provider), \
+         mock.patch.object(mod, "spatch_run_rule",
+                           return_value=partial):
+        out = mod.cocci_hunt_dispatch(
+            _fake_model(), "p", str(tmp_path),
+        )
+    assert out, "partial matches must still be returned"
+    assert all("error" not in v for v in out)
+    assert all("match set may be partial" in v["degradation"] for v in out)
+    assert "y.c: parse error" in out[0]["degradation"]
+
+
 def test_dispatch_uses_sandbox_runner_by_default(tmp_path):
     """Critical adversarial finding: cocci rules CAN embed
     ``script:python`` blocks that execute in the spatch process.
@@ -469,6 +504,220 @@ def test_dispatch_explicit_spatch_runner_wins_over_sandbox(tmp_path):
         )
 
     assert captured_runner["runner"] is sentinel_runner
+
+
+# ---------------------------------------------------------------------
+# Locked sandbox runner — spatch executes LLM-emitted rules over
+# operator-influenced patterns (arbitrary-code-exec adjacent) and its
+# stdout returns to the caller, so the runner must read-restrict,
+# fake $HOME, and block the network rather than run read-everywhere.
+# ---------------------------------------------------------------------
+
+
+def test_locked_runner_passes_restrict_reads_and_fake_home(tmp_path):
+    """A runner built without restrict_reads/fake_home would run spatch
+    read-everywhere with the real $HOME. Pin that the locked runner
+    sets both, blocks network, and scopes target/output."""
+    target = tmp_path / "repo"
+    scratch = tmp_path / "scratch"
+    target.mkdir()
+    scratch.mkdir()
+
+    captured = {}
+
+    def _fake_sandbox_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    runner = mod._make_locked_sandbox_runner(target, scratch)
+    with mock.patch("core.sandbox.run", side_effect=_fake_sandbox_run):
+        runner(["spatch", "--version"], capture_output=True, text=True)
+
+    kw = captured["kwargs"]
+    assert kw["restrict_reads"] is True
+    assert kw["fake_home"] is True
+    assert kw["block_network"] is True
+    assert kw["target"] == str(target)
+    assert kw["output"] == str(scratch)
+    assert kw["caller_label"] == "understand-hunt-cocci"
+    # subprocess kwargs forward untouched
+    assert kw["capture_output"] is True
+    assert kw["text"] is True
+
+
+def test_locked_runner_tool_paths_for_nonsystem_spatch(tmp_path):
+    """spatch installed outside the system dirs (opam under a user
+    home) must stay readable under restrict_reads — the runner allows
+    the executable's directory via tool_paths, but only for absolute
+    command paths."""
+    target = tmp_path / "repo"
+    scratch = tmp_path / "scratch"
+    target.mkdir()
+    scratch.mkdir()
+    captured = {}
+
+    def _fake_sandbox_run(cmd, **kwargs):
+        captured[cmd[0]] = kwargs
+        return mock.Mock(returncode=0)
+
+    runner = mod._make_locked_sandbox_runner(target, scratch)
+    with mock.patch("core.sandbox.run", side_effect=_fake_sandbox_run):
+        runner(["/opt/coccinelle/bin/spatch", "--version"])
+        runner(["spatch", "--version"])
+
+    assert captured["/opt/coccinelle/bin/spatch"]["tool_paths"] == [
+        "/opt/coccinelle/bin"
+    ]
+    assert "tool_paths" not in captured["spatch"]
+
+
+def test_locked_runner_fails_closed_without_sandbox(tmp_path, monkeypatch):
+    """core.sandbox unimportable + no explicit opt-out env → raise, not
+    a silent bare-subprocess fallback."""
+    monkeypatch.delenv("RAPTOR_ALLOW_UNSANDBOXED_TOOLS", raising=False)
+    import core
+    from core.run.sandbox_policy import SandboxUnavailableError
+
+    # ``from core import sandbox`` resolves the attribute on the
+    # already-imported package first, so both the attribute and the
+    # sys.modules entry must be poisoned to simulate import failure.
+    monkeypatch.setitem(sys.modules, "core.sandbox", None)
+    monkeypatch.delattr(core, "sandbox", raising=False)
+    with pytest.raises(SandboxUnavailableError):
+        mod._make_locked_sandbox_runner(tmp_path, tmp_path)
+
+
+def test_locked_runner_explicit_optout_falls_back(tmp_path, monkeypatch):
+    """core.sandbox unimportable + RAPTOR_ALLOW_UNSANDBOXED_TOOLS=1 →
+    unsandboxed fallback (loud, but functional) that still hands the
+    child a SANITISED environment — the opt-out waives isolation,
+    never env hygiene (spatch parses hostile source and executes an
+    LLM-emitted rule; the bare subprocess.run fallback inherited the
+    operator's full credential env)."""
+    import core
+
+    monkeypatch.setenv("RAPTOR_ALLOW_UNSANDBOXED_TOOLS", "1")
+    monkeypatch.setenv("SUPER_SECRET_TOKEN", "hunter2")
+    monkeypatch.setitem(sys.modules, "core.sandbox", None)
+    monkeypatch.delattr(core, "sandbox", raising=False)
+    runner = mod._make_locked_sandbox_runner(tmp_path, tmp_path)
+    proc = runner(
+        [sys.executable, "-c",
+         "import os,sys; sys.exit(1 if 'SUPER_SECRET_TOKEN' in os.environ else 0)"],
+        capture_output=True, timeout=30,
+    )
+    assert proc.returncode == 0, "operator env leaked into the opt-out child"
+
+
+def _dispatch_with_captured_runner(tmp_path, exercise_runner):
+    """Run the default-sandbox dispatch with spatch mocked; hand the
+    captured subprocess_runner to ``exercise_runner`` while the
+    dispatch's scratch dir still exists."""
+    (tmp_path / "x.c").write_text("\n")
+    fake_provider = mock.Mock()
+    fake_provider.generate.return_value = _fake_response(
+        "```cocci\n@r@\nposition p;\n@@\nstrcpy@p(...)\n```"
+    )
+
+    def _capture_run_rule(*args, **kwargs):
+        exercise_runner(kwargs["subprocess_runner"])
+        return SpatchResult(rule="r", matches=[], returncode=0)
+
+    with mock.patch.object(mod, "spatch_is_available", return_value=True), \
+         mock.patch.object(mod, "create_provider",
+                           return_value=fake_provider), \
+         mock.patch.object(mod, "spatch_run_rule",
+                           side_effect=_capture_run_rule):
+        return mod.cocci_hunt_dispatch(
+            _fake_model(), "find strcpy", str(tmp_path),
+        )
+
+
+def test_dispatch_default_runner_is_locked_and_scratch_cleaned(tmp_path):
+    """End-to-end: the default sandbox=True path hands spatch a runner
+    that carries restrict_reads/fake_home, and the per-call scratch
+    output dir is removed once the dispatch returns."""
+    captured = {}
+
+    def _exercise(runner):
+        def _fake_sandbox_run(cmd, **kwargs):
+            captured["kwargs"] = kwargs
+            return mock.Mock(returncode=0)
+
+        with mock.patch("core.sandbox.run", side_effect=_fake_sandbox_run):
+            runner(["spatch", "--version"], timeout=5)
+
+    out = _dispatch_with_captured_runner(tmp_path, _exercise)
+
+    assert out == []  # clean no-match run
+    kw = captured["kwargs"]
+    assert kw["restrict_reads"] is True
+    assert kw["fake_home"] is True
+    assert kw["block_network"] is True
+    assert kw["target"] == str(Path(tmp_path))
+    scratch = Path(kw["output"])
+    assert not scratch.exists(), (
+        "per-call sandbox scratch dir leaked after dispatch returned"
+    )
+
+
+def test_dispatch_sandbox_unavailable_returns_error_variant(tmp_path):
+    """Runner construction failing (sandbox unavailable, no opt-out)
+    surfaces as the substrate's error-variant shape — spatch is never
+    invoked unisolated."""
+    (tmp_path / "x.c").write_text("\n")
+    fake_provider = mock.Mock()
+    fake_provider.generate.return_value = _fake_response(
+        "```cocci\n@r@\nposition p;\n@@\nstrcpy@p(...)\n```"
+    )
+    run_rule = mock.Mock()
+
+    with mock.patch.object(mod, "spatch_is_available", return_value=True), \
+         mock.patch.object(mod, "create_provider",
+                           return_value=fake_provider), \
+         mock.patch.object(mod, "spatch_run_rule", run_rule), \
+         mock.patch.object(mod, "_make_locked_sandbox_runner",
+                           side_effect=RuntimeError("no sandbox backend")):
+        out = mod.cocci_hunt_dispatch(
+            _fake_model(), "find strcpy", str(tmp_path),
+        )
+
+    assert len(out) == 1 and "error" in out[0]
+    assert "sandbox unavailable" in out[0]["error"]
+    run_rule.assert_not_called()
+
+
+def test_rule_tempfile_written_utf8_regardless_of_locale(tmp_path):
+    """The rule tempfile previously used the locale's preferred
+    encoding; a non-ASCII rule (models emit smart quotes / unicode in
+    comments) crashed with UnicodeEncodeError under a C/ASCII locale.
+    Pin the explicit utf-8 write."""
+    (tmp_path / "x.c").write_text("\n")
+    rule = "@r@\nposition p;\n@@\nstrcpy@p(...)\n// café — note"
+    fake_provider = mock.Mock()
+    fake_provider.generate.return_value = _fake_response(
+        f"```cocci\n{rule}\n```"
+    )
+    seen = {}
+
+    def _capture_run_rule(*args, **kwargs):
+        seen["rule_bytes"] = Path(kwargs["rule"]).read_bytes()
+        return SpatchResult(rule="r", matches=[], returncode=0)
+
+    with mock.patch.object(mod, "spatch_is_available", return_value=True), \
+         mock.patch.object(mod, "create_provider",
+                           return_value=fake_provider), \
+         mock.patch.object(mod, "spatch_run_rule",
+                           side_effect=_capture_run_rule), \
+         mock.patch("locale.getpreferredencoding",
+                    return_value="ascii", create=True):
+        out = mod.cocci_hunt_dispatch(
+            _fake_model(), "find strcpy", str(tmp_path), sandbox=False,
+        )
+
+    assert out == []
+    assert seen["rule_bytes"].decode("utf-8") == rule
 
 
 # ---------------------------------------------------------------------
@@ -633,3 +882,66 @@ def test_dispatch_signature_matches_HuntDispatchFn_protocol():
         f"signature drift — first 3 positional must be "
         f"(model, pattern, repo_path), got {positional[:3]}"
     )
+
+
+def test_repo_looks_c_cpp_noise_files_do_not_exhaust_budget(tmp_path):
+    """Hundreds of non-C files ahead of the first C source (docs
+    trees, vendored JS) must not consume the file budget before the
+    walk reaches src/ — that refused valid C targets."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    for i in range(250):
+        (docs / f"page{i:03d}.md").write_text("prose\n")
+    (tmp_path / "src" / "core").mkdir(parents=True)
+    (tmp_path / "src" / "core" / "main.c").write_text("int main(){}\n")
+    assert mod.repo_looks_c_cpp(str(tmp_path), max_files_to_check=200) is False
+    # The C file at position >200 in a flat count IS found once noise
+    # dirs are prunable — hidden/vendor dirs never count at all.
+    hidden = tmp_path / ".git" / "objects"
+    hidden.mkdir(parents=True)
+    for i in range(500):
+        (hidden / f"obj{i:03d}").write_text("blob\n")
+    node = tmp_path / "node_modules" / "pkg"
+    node.mkdir(parents=True)
+    for i in range(500):
+        (node / f"m{i:03d}.js").write_text("js\n")
+    assert mod.repo_looks_c_cpp(str(tmp_path), max_files_to_check=1000) is True
+
+
+def test_repo_looks_c_cpp_git_objects_never_counted(tmp_path):
+    """A real C repo whose walk surfaces .git internals first must
+    still be recognised within the default budget."""
+    hidden = tmp_path / ".git" / "objects"
+    hidden.mkdir(parents=True)
+    for i in range(300):
+        (hidden / f"{i:03d}").write_text("blob\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.c").write_text("int main(){}\n")
+    assert mod.repo_looks_c_cpp(str(tmp_path), max_files_to_check=200) is True
+
+
+def test_translate_refuses_pattern_exceeding_budget_ceiling():
+    """The rule-gen budget knob gates input size pre-flight — an
+    oversized pattern is refused without any provider call."""
+    fake_provider = mock.Mock()
+    with mock.patch.object(mod, "create_provider",
+                           return_value=fake_provider):
+        rule = mod.translate_pattern_to_cocci_rule(
+            "x" * 4_000_000, model=_fake_model(), max_cost_usd=0.05,
+        )
+    assert rule is None
+    fake_provider.generate.assert_not_called()
+
+
+def test_translate_normal_pattern_within_budget_proceeds():
+    fake_provider = mock.Mock()
+    fake_provider.generate.return_value = _fake_response(
+        "```cocci\n@r@\nexpression e;\n@@\nstrcpy(e, ...)\n```\n"
+    )
+    with mock.patch.object(mod, "create_provider",
+                           return_value=fake_provider):
+        rule = mod.translate_pattern_to_cocci_rule(
+            "find all strcpy calls", model=_fake_model(), max_cost_usd=0.05,
+        )
+    assert rule is not None
+    fake_provider.generate.assert_called_once()

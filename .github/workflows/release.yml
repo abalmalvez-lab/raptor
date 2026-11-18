@@ -13,16 +13,28 @@ on:
 
 # Don't cancel in-flight releases — two concurrent releases racing on
 # the same artifact upload would corrupt the GitHub Release record.
-# Queue instead, so concurrent dispatches serialize cleanly.
+# Queue instead, so concurrent dispatches serialize cleanly. Keyed on
+# the BARE tag name in both event shapes: a tag-push run's github.ref
+# is refs/tags/<tag> while a workflow_dispatch re-release of the SAME
+# tag carries the dispatch input (the validate step refuses any
+# refs/tags/-prefixed input, so the input is always bare) — a ref-only
+# key put those two runs in different groups and they never
+# serialized despite editing the same tag, stamp targets, and Release
+# record. github.ref_name is the bare tag on tag pushes, so both
+# spellings converge on one group.
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: release-${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
   contents: write
+  # `gh workflow run` — the Docker Hub re-dispatch below needs to
+  # create a workflow_dispatch event once the stamped tag has landed.
+  actions: write
 
 jobs:
   release:
+    if: github.repository == 'gadievron/raptor'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -43,7 +55,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.tag || github.ref }}
@@ -83,101 +95,14 @@ jobs:
           TAG: ${{ steps.tag.outputs.name }}
           REPO: ${{ github.repository }}
         run: |
-          PREV_TAG=$(git tag --sort=version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | awk -v tag="${TAG}" '$0 == tag {exit} {last=$0} END {print last}')
-
-          if [ -z "$PREV_TAG" ]; then
-            echo "No previous tag found, using all commits"
-            COMMITS=$(git log --pretty=format:"%s" HEAD)
-          else
-            echo "Comparing ${PREV_TAG}..${TAG}"
-            COMMITS=$(git log --pretty=format:"%s" "${PREV_TAG}..HEAD")
-          fi
-
-          FEATURES=$(echo "$COMMITS" | grep -iE '^feat(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-          FIXES=$(echo "$COMMITS" | grep -iE '^fix(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-          SECURITY=$(echo "$COMMITS" | grep -iE '^(security|sec)(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-          DOCS=$(echo "$COMMITS" | grep -iE '^docs(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-          OTHER=$(echo "$COMMITS" | grep -ivE '^(feat|fix|security|sec|docs|release|chore|ci|test|build|style)(\(.+\))?:' | sed 's/^/- /' || true)
-
-          CHANGELOG="## What's changed in ${TAG}"
-          if [ -n "$PREV_TAG" ]; then
-            CHANGELOG="${CHANGELOG} (since ${PREV_TAG})"
-          fi
-          CHANGELOG="${CHANGELOG}
-
-          "
-
-          [ -n "$FEATURES" ] && CHANGELOG="${CHANGELOG}### New features
-          ${FEATURES}
-
-          "
-          [ -n "$SECURITY" ] && CHANGELOG="${CHANGELOG}### Security
-          ${SECURITY}
-
-          "
-          [ -n "$FIXES" ] && CHANGELOG="${CHANGELOG}### Bug fixes
-          ${FIXES}
-
-          "
-          [ -n "$DOCS" ] && CHANGELOG="${CHANGELOG}### Docs
-          ${DOCS}
-
-          "
-          [ -n "$OTHER" ] && CHANGELOG="${CHANGELOG}### Other changes
-          ${OTHER}
-
-          "
-
-          if [ -n "$PREV_TAG" ]; then
-            CHANGELOG="${CHANGELOG}**Full diff:** https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
-          fi
-
-          echo "$CHANGELOG" > /tmp/changelog.md
+          python3 .github/scripts/changelog-generator --top 20 --repo "${REPO}" "${TAG}" > /tmp/changelog.md
           cat /tmp/changelog.md
           echo "file=/tmp/changelog.md" >> "$GITHUB_OUTPUT"
 
       - name: Stamp release version
         env:
           TAG: ${{ steps.tag.outputs.name }}
-        run: |
-          python3 -c "
-          import sys, re
-          tag = sys.argv[1]
-          ver = tag.lstrip('v')
-
-          # raptor-offset banner (lives under core/startup/assets/)
-          BANNER = 'core/startup/assets/raptor-offset'
-          text = open(BANNER).read()
-          def replace_banner(m):
-              prefix = m.group(1)
-              content = prefix + tag
-              pad = 76 - len(content)
-              return content + ' ' * pad + '║'
-          text = re.sub(r'(║\s+Based on Claude Code - )\S+[^║]*║', replace_banner, text)
-          open(BANNER, 'w').write(text)
-
-          # core/config.py VERSION
-          text = open('core/config.py').read()
-          text = re.sub(
-              r'^(\s+VERSION = \")[^\"]+(\")' ,
-              lambda m: m.group(1) + ver + m.group(2),
-              text, count=1, flags=re.MULTILINE)
-          open('core/config.py', 'w').write(text)
-
-          # README.md banner — 'Based on Claude Code (vX.Y.Z)' inside box
-          text = open('README.md').read()
-          def replace_readme(m):
-              prefix = m.group(1)
-              content = prefix + tag + ')'
-              pad = 76 - len(content)
-              return content + ' ' * pad + '║'
-          text = re.sub(r'(║\s+Based on Claude Code \()[^)]+\)[^║]*║', replace_readme, text)
-          open('README.md', 'w').write(text)
-          " "$TAG"
-          echo "Stamped:"
-          grep "Based on Claude Code" core/startup/assets/raptor-offset
-          grep 'VERSION = ' core/config.py | head -1
-          grep "Based on Claude Code" README.md
+        run: python3 .github/scripts/stamp-version "${TAG}"
 
       # Push the version-stamp commit and re-tag using a request-scoped
       # Authorization header. Pre-fix this step relied on the embedded
@@ -194,7 +119,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add core/startup/assets/raptor-offset core/config.py README.md
+          git add core/config/__init__.py pyproject.toml README.md CITATION.cff docs/installation.md
+          if [[ -f uv.lock ]]; then git add uv.lock; fi
           if ! git diff --cached --quiet; then
             git commit -m "release: stamp ${TAG}"
             git tag -a -f "${TAG}" -m "Release ${TAG}"
@@ -205,13 +131,53 @@ jobs:
               push --force "https://github.com/${REPO}" "refs/tags/${TAG}"
           fi
 
+      # The versioned Docker Hub image must be built from the STAMPED
+      # tag: the force-moved tag was pushed with the workflow token,
+      # and token-initiated pushes never trigger workflows — without
+      # this dispatch, dockerhub-publish would build :<version> from
+      # the pre-stamp commit. (Today the two trees build identical
+      # images — the Dockerfile COPYs only pyproject.toml/uv.lock, no
+      # stamp target — but the versioned image must be built from
+      # the ref it claims to be, and any future COPY of stamped
+      # files inherits correctness instead of silently shipping the
+      # previous version.) workflow_dispatch is the
+      # documented exception deliverable by GITHUB_TOKEN. Runs
+      # unconditionally after the stamp step: on a re-release the tag
+      # already points at the stamped commit, and the dispatch is
+      # idempotent (same tag -> same image content).
+      - name: Publish versioned Docker Hub image from the stamped tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          gh workflow run dockerhub-publish.yml --ref main -f tag="${TAG}"
+
       - name: Build release archives
         env:
           TAG: ${{ steps.tag.outputs.name }}
         run: |
+          set -euo pipefail
           NAME="raptor-${TAG}"
 
           git archive --format=tar --prefix="${NAME}/" HEAD | tar -x -C /tmp
+
+          # The published archive is the product: verify the extracted
+          # tree carries the runtime surface BEFORE packaging. .claude/
+          # is the LLM dispatch surface (slash commands, skills,
+          # agents, the SessionStart hook) — a .gitattributes
+          # export-ignore once shipped releases with all of it
+          # silently absent. Named oracle for the archive-content
+          # claim; test_release_workflow.sh pins the same set against
+          # the real .gitattributes.
+          for p in .claude/commands .claude/skills .claude/hooks \
+                   .claude/settings.json CLAUDE.md raptor.py bin \
+                   libexec core packages engine tiers; do
+            if [ ! -e "/tmp/${NAME}/${p}" ]; then
+              echo "::error::release archive missing runtime surface: ${p}"
+              exit 1
+            fi
+          done
 
           cd /tmp
           zip -r "${NAME}.zip" "${NAME}" -x "*.DS_Store"
@@ -226,14 +192,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.name }}
         run: |
+          set -euo pipefail
           NAME="raptor-${TAG}"
 
-          gh release delete "${TAG}" --yes 2>/dev/null || true
-
-          gh release create "${TAG}" \
-            --verify-tag \
-            --title "RAPTOR ${TAG}" \
-            --notes-file /tmp/changelog.md \
-            /tmp/${NAME}.zip \
-            /tmp/${NAME}.tar.gz \
-            /tmp/${NAME}-checksums.txt
+          if gh release view "${TAG}" &>/dev/null; then
+            gh release edit "${TAG}" \
+              --title "RAPTOR ${TAG}" \
+              --notes-file /tmp/changelog.md
+            gh release upload "${TAG}" --clobber \
+              "/tmp/${NAME}.zip" \
+              "/tmp/${NAME}.tar.gz" \
+              "/tmp/${NAME}-checksums.txt"
+          else
+            gh release create "${TAG}" \
+              --verify-tag \
+              --title "RAPTOR ${TAG}" \
+              --notes-file /tmp/changelog.md \
+              "/tmp/${NAME}.zip" \
+              "/tmp/${NAME}.tar.gz" \
+              "/tmp/${NAME}-checksums.txt"
+          fi

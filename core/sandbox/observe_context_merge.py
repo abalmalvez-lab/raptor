@@ -36,9 +36,12 @@ from __future__ import annotations
 
 import datetime
 from copy import deepcopy
-from typing import Iterable, Optional
+from collections.abc import Callable, Iterable
 
-from .observe_profile import ObserveProfile
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .observe_profile import ObserveProfile
 
 
 # Top-level key under which the runtime observation lands. Pinned by
@@ -56,18 +59,20 @@ def _now_iso() -> str:
 
 
 def _matches_path(observed: str, ep_or_sink: dict,
-                  target_dir: Optional[str] = None) -> bool:
+                  target_dir: str | None = None) -> bool:
     """Decide whether an observed absolute path corresponds to an
     entry point or sink record in the context map.
 
     Two modes:
 
     * ``target_dir`` set — STRICT. The observed path must lie under
-      the target directory (with a "/" boundary), and after stripping
-      the prefix it must equal the recorded relative path exactly.
-      Right shape for monorepos where many directories contain a
-      ``src/utils.py`` — the suffix heuristic below would falsely
-      match all of them.
+      the target directory (with a "/" boundary) and, after stripping
+      the prefix, equal the recorded relative path exactly — or,
+      failing the prefix test, be exactly equal to the recorded path
+      (deliberate fallback for callers that pre-normalised both sides
+      to the same shape). Right shape for monorepos where many
+      directories contain a ``src/utils.py`` — the suffix heuristic
+      below would falsely match all of them.
     * ``target_dir`` unset — SUFFIX HEURISTIC. The observed path is
       checked against the recorded relative path with a "/"-anchored
       endswith match. Backward-compat with callers that don't know
@@ -79,7 +84,7 @@ def _matches_path(observed: str, ep_or_sink: dict,
     or context map.
     """
     rel = ep_or_sink.get("file") or ep_or_sink.get("location")
-    if not rel:
+    if not isinstance(observed, str) or not isinstance(rel, str) or not rel:
         return False
 
     if target_dir is not None:
@@ -103,9 +108,32 @@ def _matches_path(observed: str, ep_or_sink: dict,
     return observed.endswith("/" + rel.lstrip("/"))
 
 
+def _path_matcher(observed_paths: Iterable[str],
+                  target_dir: str | None) -> Callable[[dict], bool]:
+    """Index strict matches once; retain the legacy suffix heuristic."""
+    if target_dir is None:
+        return lambda row: any(_matches_path(path, row) for path in observed_paths)
+    prefix = target_dir.rstrip("/") + "/"
+    relative, outside = set(), set()
+    for path in observed_paths:
+        if not isinstance(path, str):
+            continue
+        if path.startswith(prefix):
+            relative.add(path[len(prefix):])
+        else:
+            outside.add(path)
+
+    def matches(row: dict) -> bool:
+        rel = row.get("file") or row.get("location")
+        return (isinstance(rel, str) and bool(rel)
+                and (rel.lstrip("/") in relative or rel in outside))
+
+    return matches
+
+
 def _correlate_entry_points(profile: ObserveProfile,
                             entry_points: Iterable[dict],
-                            target_dir: Optional[str] = None) -> list:
+                            target_dir: str | None = None) -> list:
     """Return entry-point IDs whose file appears in paths_read.
 
     Caller passes the context map's ``entry_points`` list and (when
@@ -114,34 +142,40 @@ def _correlate_entry_points(profile: ObserveProfile,
     (or ``location`` as a fallback). Entries without an id are
     skipped — we can't surface an unkeyed correlation usefully.
     """
-    confirmed = []
-    for ep in entry_points or []:
+    confirmed: list[Any] = []
+    if not isinstance(entry_points, Iterable) or not entry_points:
+        return confirmed
+    matches = _path_matcher(profile.paths_read, target_dir)
+    for ep in entry_points:
+        if not isinstance(ep, dict):
+            continue
         ep_id = ep.get("id")
         if not ep_id:
             continue
-        for observed in profile.paths_read:
-            if _matches_path(observed, ep, target_dir=target_dir):
-                confirmed.append(ep_id)
-                break
+        if matches(ep):
+            confirmed.append(ep_id)
     return confirmed
 
 
 def _correlate_sinks(profile: ObserveProfile,
                      sink_details: Iterable[dict],
-                     target_dir: Optional[str] = None) -> list:
+                     target_dir: str | None = None) -> list:
     """Return sink IDs whose file appears in paths_written.
 
     Same shape as _correlate_entry_points but on the write side.
     """
-    confirmed = []
-    for sink in sink_details or []:
+    confirmed: list[Any] = []
+    if not isinstance(sink_details, Iterable) or not sink_details:
+        return confirmed
+    matches = _path_matcher(profile.paths_written, target_dir)
+    for sink in sink_details:
+        if not isinstance(sink, dict):
+            continue
         sink_id = sink.get("id")
         if not sink_id:
             continue
-        for observed in profile.paths_written:
-            if _matches_path(observed, sink, target_dir=target_dir):
-                confirmed.append(sink_id)
-                break
+        if matches(sink):
+            confirmed.append(sink_id)
     return confirmed
 
 
@@ -152,9 +186,7 @@ def _format_external_reach(profile: ObserveProfile) -> list:
     shows new endpoints clearly. Order preserved from the profile
     (first-seen order from the tracer log).
     """
-    out = []
-    for t in profile.connect_targets:
-        out.append(f"{t.ip}:{t.port} ({t.family})")
+    out = [f"{t.ip}:{t.port} ({t.family})" for t in profile.connect_targets]
     return out
 
 
@@ -162,10 +194,10 @@ def merge_observation_into_context_map(
     context_map: dict,
     profile: ObserveProfile,
     *,
-    target_dir: Optional[str] = None,
-    binary: Optional[str] = None,
-    command: Optional[Iterable[str]] = None,
-    captured_at: Optional[str] = None,
+    target_dir: str | None = None,
+    binary: str | None = None,
+    command: Iterable[str] | None = None,
+    captured_at: str | None = None,
 ) -> dict:
     """Return a new context map with runtime observation merged in.
 
@@ -182,7 +214,9 @@ def merge_observation_into_context_map(
             correlation is STRICT: an observed absolute path must
             start with ``target_dir`` (with "/" boundary) and the
             stripped suffix must equal the entry-point/sink relative
-            path EXACTLY. When None, falls back to a "/"-anchored
+            path EXACTLY (bare equality with the recorded path also
+            matches, for pre-normalised callers — see _matches_path).
+            When None, falls back to a "/"-anchored
             endswith heuristic that's prone to false positives in
             monorepos with same-named files in many directories
             (e.g. ``services/auth/src/utils.py`` and
@@ -191,7 +225,7 @@ def merge_observation_into_context_map(
             the context map is the canonical source.
         binary: optional path to the probed binary, recorded for
             traceability so a reader knows which binary produced this
-            evidence. None = "unknown" recorded literally.
+            evidence. None is stored as-is (JSON null).
         command: optional list of argv elements for the spawned probe;
             useful for re-running ("we observed claude --version, not
             claude --print 'hello'"). Coerced to a list before storing.
@@ -205,6 +239,10 @@ def merge_observation_into_context_map(
               "binary": "<path or None>",
               "command": [...],
               "captured_at": "2026-05-08T12:34:56Z",
+              "nonce_trusted": true,
+              "budget_truncated": false,
+              "capture_incomplete": false,
+              "dropped_by_category": {},
               "paths_read": [...],
               "paths_written": [...],
               "paths_stat": [...],
@@ -249,6 +287,10 @@ def merge_observation_into_context_map(
         "binary": binary,
         "command": list(command) if command else [],
         "captured_at": captured_at or _now_iso(),
+        "nonce_trusted": bool(profile.nonce_trusted),
+        "budget_truncated": bool(profile.budget_truncated),
+        "capture_incomplete": bool(getattr(profile, "capture_incomplete", False)),
+        "dropped_by_category": dict(profile.dropped_by_category),
         "paths_read": list(profile.paths_read),
         "paths_written": list(profile.paths_written),
         "paths_stat": list(profile.paths_stat),

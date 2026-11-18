@@ -1,17 +1,87 @@
 """Tests for project-level shared checklist via symlinks."""
 
 import os
-import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-# core/inventory/tests/test_shared_checklist.py -> repo root
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import pytest
 
-from core.inventory import save_checklist
+from core.inventory import read_checklist, save_checklist, update_checklist
 from core.json import load_json, save_json
-from core.run.metadata import _setup_checklist_symlink, _promote_checklist
+from core.run.metadata import _promote_checklist, _setup_checklist_symlink
+
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path):
+    """The symlink tests write the projects registry through the
+    module global; the root-conftest redirect of that global is
+    stripped from release extracts (conftest.py is export-ignore), so
+    the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    with pytest.MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, tmp_path)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(_user_state_in_tmp):
+    """Undo body patches before restoring the file-owned registry pins."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
+class TestReadChecklist(unittest.TestCase):
+
+    def test_round_trips_save(self):
+        with TemporaryDirectory() as d:
+            save_checklist(d, {"files": [], "total_items": 3})
+            loaded = read_checklist(d)
+            self.assertEqual(loaded["total_items"], 3)
+
+    def test_missing_returns_empty_without_side_effects(self):
+        with TemporaryDirectory() as d:
+            missing = Path(d) / "never-created"
+            self.assertEqual(read_checklist(missing), {})
+            # A pure read must not create the output dir (the write
+            # accessors' path resolution mkdirs; the reader must not).
+            self.assertFalse(missing.exists())
+
+    def test_malformed_returns_empty(self):
+        with TemporaryDirectory() as d:
+            (Path(d) / "checklist.json").write_text("{broken")
+            self.assertEqual(read_checklist(d), {})
+
+    def test_non_dict_returns_empty(self):
+        with TemporaryDirectory() as d:
+            (Path(d) / "checklist.json").write_text('["not", "a", "dict"]')
+            self.assertEqual(read_checklist(d), {})
+
+    def test_reads_through_project_symlink(self):
+        with TemporaryDirectory() as d:
+            project_dir = Path(d) / "project"
+            run_dir = project_dir / "run-001"
+            run_dir.mkdir(parents=True)
+            save_json(project_dir / "checklist.json", {"version": "proj"})
+            (run_dir / "checklist.json").symlink_to("../checklist.json")
+
+            self.assertEqual(read_checklist(str(run_dir))["version"], "proj")
+
+    def test_takes_the_writers_lock(self):
+        # The reader must contend on the same checklist.lock file the
+        # writers use — verified via a non-blocking flock probe while
+        # no reader/writer is active (the lock file exists after a
+        # save) and by asserting read_checklist creates/uses it.
+        import fcntl
+        with TemporaryDirectory() as d:
+            save_checklist(d, {"files": []})
+            read_checklist(d)
+            lock_path = Path(d) / "checklist.lock"
+            self.assertTrue(lock_path.exists())
+            # Sanity: the lock is free again after the read returns.
+            with open(lock_path, "w") as f:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 class TestSaveChecklist(unittest.TestCase):
@@ -65,6 +135,81 @@ class TestSaveChecklist(unittest.TestCase):
             self.assertEqual(loaded["v"], 2)
 
 
+class TestUpdateChecklist(unittest.TestCase):
+
+    def test_read_modify_write(self):
+        with TemporaryDirectory() as d:
+            save_checklist(d, {"files": [], "counter": 0})
+
+            def bump(data):
+                data["counter"] = data.get("counter", 0) + 1
+                return data
+
+            update_checklist(d, bump)
+            loaded = load_json(Path(d) / "checklist.json")
+            self.assertEqual(loaded["counter"], 1)
+
+    def test_creates_file_when_absent(self):
+        with TemporaryDirectory() as d:
+            update_checklist(d, lambda data: {"created": True})
+            loaded = load_json(Path(d) / "checklist.json")
+            self.assertTrue(loaded["created"])
+
+    def test_refuses_rmw_when_existing_file_corrupt(self):
+        # An existing-but-unloadable checklist must abort the
+        # read-modify-write, never be overwritten with a fresh
+        # near-empty checklist built from {}.
+        with TemporaryDirectory() as d:
+            corrupt = '{"files": [broken'
+            (Path(d) / "checklist.json").write_text(corrupt)
+            with self.assertRaises(ValueError):
+                update_checklist(d, lambda data: data)
+            # The corrupt bytes survive for diagnosis.
+            self.assertEqual(
+                (Path(d) / "checklist.json").read_text(), corrupt)
+
+    def test_refuses_rmw_when_existing_file_oversize(self):
+        import core.inventory as inv
+
+        with TemporaryDirectory() as d:
+            path = Path(d) / "checklist.json"
+            path.write_text('{"pad": "' + "x" * 100 + '"}')
+            original = path.read_text()
+            real_max = inv._MAX_CHECKLIST_BYTES
+            inv._MAX_CHECKLIST_BYTES = 10
+            try:
+                with self.assertRaises(ValueError):
+                    update_checklist(d, lambda data: data)
+            finally:
+                inv._MAX_CHECKLIST_BYTES = real_max
+            self.assertEqual(path.read_text(), original)
+
+    def test_passes_empty_dict_when_file_absent(self):
+        with TemporaryDirectory() as d:
+            received = []
+
+            def capture(data):
+                received.append(dict(data))
+                return {"ok": True}
+
+            update_checklist(d, capture)
+            self.assertEqual(received, [{}])
+
+    def test_preserves_existing_fields(self):
+        with TemporaryDirectory() as d:
+            save_checklist(d, {"files": [{"path": "a.py"}], "version": 1})
+
+            def add_field(data):
+                data["extra"] = "added"
+                return data
+
+            update_checklist(d, add_field)
+            loaded = load_json(Path(d) / "checklist.json")
+            self.assertEqual(loaded["version"], 1)
+            self.assertEqual(loaded["extra"], "added")
+            self.assertEqual(len(loaded["files"]), 1)
+
+
 class TestSetupChecklistSymlink(unittest.TestCase):
 
     def test_creates_symlink_in_project_mode(self):
@@ -74,53 +219,40 @@ class TestSetupChecklistSymlink(unittest.TestCase):
             project_dir.mkdir()
             run_dir.mkdir()
 
-            # Create project JSON and .active symlink
-            projects_dir = Path.home() / ".raptor" / "projects"
+            # Create the project JSON and .active symlink in the
+            # PER-TEST registry (the in-file autouse fixture pins the
+            # module global) — never the operator's real ~/.raptor
+            # store, which this test used to mutate and restore.
+            from core.project import project as project_mod
+            projects_dir = project_mod.PROJECTS_DIR
+            # Hard-stop before writing the registry: the .active
+            # symlink below hijacks machine-wide active-project
+            # resolution if it ever lands in the real store.
+            assert projects_dir != Path.home() / ".raptor" / "projects", (
+                projects_dir)
             projects_dir.mkdir(parents=True, exist_ok=True)
             active_link = projects_dir / ".active"
 
-            # Save/restore state
-            old_link = os.readlink(active_link) if active_link.is_symlink() else None
-
             save_json(projects_dir / "_test_shared.json", {
                 "name": "_test_shared",
-                "target": "/tmp",
+                "target": "./target",
                 "output_dir": str(project_dir),
             })
-            if active_link.is_symlink() or active_link.exists():
-                active_link.unlink()
             active_link.symlink_to("_test_shared.json")
 
-            try:
-                _setup_checklist_symlink(run_dir)
-                self.assertTrue((run_dir / "checklist.json").is_symlink())
-                target = os.readlink(run_dir / "checklist.json")
-                self.assertEqual(target, "../checklist.json")
-            finally:
-                (projects_dir / "_test_shared.json").unlink(missing_ok=True)
-                if active_link.is_symlink():
-                    active_link.unlink()
-                if old_link:
-                    active_link.symlink_to(old_link)
+            _setup_checklist_symlink(run_dir)
+            self.assertTrue((run_dir / "checklist.json").is_symlink())
+            target = os.readlink(run_dir / "checklist.json")
+            self.assertEqual(target, "../checklist.json")
 
     def test_no_symlink_in_standalone_mode(self):
         with TemporaryDirectory() as d:
             run_dir = Path(d) / "run-001"
             run_dir.mkdir()
 
-            # Ensure no active project
-            projects_dir = Path.home() / ".raptor" / "projects"
-            active_link = projects_dir / ".active"
-            old_link = os.readlink(active_link) if active_link.is_symlink() else None
-            if active_link.is_symlink():
-                active_link.unlink()
-
-            try:
-                _setup_checklist_symlink(run_dir)
-                self.assertFalse((run_dir / "checklist.json").exists())
-            finally:
-                if old_link:
-                    active_link.symlink_to(old_link)
+            # The per-test registry starts empty — no active project.
+            _setup_checklist_symlink(run_dir)
+            self.assertFalse((run_dir / "checklist.json").exists())
 
     def test_skips_existing_real_file(self):
         with TemporaryDirectory() as d:
@@ -176,6 +308,78 @@ class TestPromoteChecklist(unittest.TestCase):
 
             _promote_checklist(project_dir)
             self.assertFalse((project_dir / "checklist.json").exists())
+
+
+class TestChecklistWriteBudget(unittest.TestCase):
+    """Over-budget single-file serialisations switch the writer to
+    the sharded layout; only artifacts NO layout can store fail
+    fast."""
+
+    def _tiny_budget(self, n: int):
+        import core.inventory as inv
+        real = inv._MAX_CHECKLIST_BYTES
+        inv._MAX_CHECKLIST_BYTES = n
+        self.addCleanup(setattr, inv, "_MAX_CHECKLIST_BYTES", real)
+
+    def test_save_over_budget_emits_sharded_layout(self):
+        self._tiny_budget(64)
+        with TemporaryDirectory() as d:
+            save_checklist(
+                d, {"files": [{"path": "a/f.py", "items": []}],
+                    "pad": "x" * 200})
+            self.assertFalse((Path(d) / "checklist.json").exists())
+            self.assertTrue(
+                (Path(d) / "checklist" / "index.json").is_file())
+            loaded = read_checklist(d)
+            self.assertEqual(loaded["pad"], "x" * 200)
+            self.assertEqual(loaded["files"][0]["path"], "a/f.py")
+
+    def test_update_over_budget_switches_to_sharded(self):
+        with TemporaryDirectory() as d:
+            save_checklist(d, {"files": []})
+            # Budget the EXISTING small file still fits (RMW must load
+            # it) but the grown transform result does not.
+            self._tiny_budget(400)
+            update_checklist(
+                d, lambda data: {"files": [{"path": "a/f.py"}],
+                                 "pad": "x" * 600})
+            self.assertFalse((Path(d) / "checklist.json").exists())
+            self.assertEqual(read_checklist(d)["pad"], "x" * 600)
+
+    def test_unshardable_document_fails_fast(self):
+        # No 'files' list to shard: the stacked fail-fast still
+        # applies — never write an artifact every reader refuses.
+        from core.inventory import ChecklistBudgetExceededError
+        self._tiny_budget(64)
+        with TemporaryDirectory() as d:
+            with self.assertRaises(ChecklistBudgetExceededError):
+                save_checklist(d, {"pad": "x" * 200})
+            self.assertFalse((Path(d) / "checklist.json").exists())
+            self.assertFalse((Path(d) / "checklist").exists())
+
+    def test_indivisible_entry_fails_fast(self):
+        # A single file entry over the per-shard reader budget cannot
+        # be stored by any split.
+        import core.inventory as inv
+        from core.inventory import ChecklistBudgetExceededError
+        real = inv._MAX_CHECKLIST_SHARD_BYTES
+        inv._MAX_CHECKLIST_SHARD_BYTES = 128
+        self.addCleanup(
+            setattr, inv, "_MAX_CHECKLIST_SHARD_BYTES", real)
+        self._tiny_budget(64)
+        with TemporaryDirectory() as d:
+            with self.assertRaises(ChecklistBudgetExceededError) as ctx:
+                save_checklist(
+                    d, {"files": [{"path": "gen/huge.c",
+                                   "blob": "y" * 400}]})
+            self.assertIn("gen/huge.c", str(ctx.exception))
+            self.assertFalse((Path(d) / "checklist").exists())
+
+    def test_small_checklist_still_saves(self):
+        with TemporaryDirectory() as d:
+            save_checklist(d, {"files": [{"path": "a.py"}]})
+            self.assertEqual(
+                read_checklist(d)["files"][0]["path"], "a.py")
 
 
 if __name__ == "__main__":

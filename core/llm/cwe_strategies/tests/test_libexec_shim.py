@@ -9,11 +9,10 @@ trust-marker guard.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
-
+from core.testing.standalone_cli import run_standalone_cli
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SHIM = REPO_ROOT / "libexec" / "raptor-pick-strategies"
@@ -21,10 +20,15 @@ SHIM = REPO_ROOT / "libexec" / "raptor-pick-strategies"
 
 def _run(*args, env_extra=None):
     env = dict(os.environ)
-    env["_RAPTOR_TRUSTED"] = "1"
+    env.update(
+        _RAPTOR_TRUSTED="1",
+        _RAPTOR_SCRATCH_AUTH="stale-test-authorization",
+        RAPTOR_SESSION_PID="invalid",
+        RAPTOR_SESSION_TOKEN="stale",
+    )
     if env_extra:
         env.update(env_extra)
-    return subprocess.run(
+    return run_standalone_cli(
         [sys.executable, str(SHIM), *args],
         env=env, capture_output=True, text=True,
     )
@@ -39,7 +43,7 @@ class TestTrustMarker:
     def test_refuses_without_marker(self):
         env = {k: v for k, v in os.environ.items()
                if k not in ("_RAPTOR_TRUSTED", "CLAUDECODE")}
-        r = subprocess.run(
+        r = run_standalone_cli(  # noqa: PLW1510 — exit code asserted below
             [sys.executable, str(SHIM), "--cwe", "CWE-78"],
             env=env, capture_output=True, text=True,
         )
@@ -71,10 +75,24 @@ class TestCweSignal:
 
 
 class TestPathSignal:
-    def test_kernel_locking_picks_concurrency(self):
-        r = _run("--file", "kernel/locking/rwsem.c")
+    def test_kernel_locking_picks_concurrency(self, tmp_path):
+        # Kernel path fragments live in the linux_kernel profile —
+        # supplied here via --target on a kernel-marked tree (the
+        # detection path the run-time callers use).
+        (tmp_path / "Kconfig").write_text("config FOO\n")
+        r = _run(
+            "--file", "kernel/locking/rwsem.c",
+            "--target", str(tmp_path),
+        )
         assert r.returncode == 0
         assert "## Strategy: concurrency" in r.stdout
+
+    def test_kernel_locking_without_target_stays_generic(self):
+        # Without a kernel target the generic strategies carry no
+        # kernel path vocabulary — only general fires.
+        r = _run("--file", "kernel/locking/rwsem.c")
+        assert r.returncode == 0
+        assert "## Strategy: concurrency" not in r.stdout
 
     def test_crypto_path_picks_cryptography(self):
         r = _run("--file", "crypto/aes.c")
@@ -91,14 +109,26 @@ class TestKeywordSignal:
 
 class TestCallsSignal:
     def test_mutex_lock_callee_picks_concurrency(self):
-        r = _run("--calls", "mutex_lock,mutex_unlock")
+        # Kernel callee vocabulary rides the explicit profile flag.
+        r = _run(
+            "--calls", "mutex_lock,mutex_unlock",
+            "--profile", "linux_kernel",
+        )
+        assert r.returncode == 0
+        assert "## Strategy: concurrency" in r.stdout
+
+    def test_pthread_callee_picks_concurrency_without_profile(self):
+        r = _run("--calls", "pthread_mutex_lock,pthread_mutex_unlock")
         assert r.returncode == 0
         assert "## Strategy: concurrency" in r.stdout
 
 
 class TestIncludesSignal:
     def test_skbuff_include_picks_input_handling(self):
-        r = _run("--includes", "linux/skbuff.h")
+        r = _run(
+            "--includes", "linux/skbuff.h",
+            "--profile", "linux_kernel",
+        )
         assert r.returncode == 0
         assert "## Strategy: input_handling" in r.stdout
 

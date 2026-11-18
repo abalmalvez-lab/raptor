@@ -94,6 +94,43 @@ class TestDiskCache:
         assert len(stub.calls) == 1
 
 
+class TestNegativeCache:
+    def test_definitive_404_is_disk_cached(self, stub, tmp_path) -> None:
+        stub.add(status=404)
+        c1 = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert c1.get_payload("CVE-2024-1234") is None
+        calls_after_first = len(stub.calls)
+
+        c2 = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert c2.get_payload("CVE-2024-1234") is None
+        assert len(stub.calls) == calls_after_first  # served from disk
+
+    def test_transient_failure_not_disk_cached(self, stub, tmp_path) -> None:
+        # Retry exhaustion on 429 (NVD quota/outage) must not be
+        # recorded as a 7-day "CVE does not exist" — a later run
+        # sharing the cache dir must go back to the network.
+        for _ in range(6):
+            stub.add(status=429)
+        c1 = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert c1.get_payload("CVE-2024-1234") is None
+
+        stub._queue.clear()
+        stub.add(json=_cve_payload())
+        c2 = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert c2.get_payload("CVE-2024-1234") is not None
+
+    def test_transient_failure_memoized_within_process(self, stub, tmp_path) -> None:
+        # In-process the miss IS remembered, so one batch doesn't
+        # hammer a downed NVD with fresh retry storms per lookup.
+        for _ in range(6):
+            stub.add(status=503)
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert client.get_payload("CVE-2024-1234") is None
+        calls_after_first = len(stub.calls)
+        assert client.get_payload("CVE-2024-1234") is None
+        assert len(stub.calls) == calls_after_first
+
+
 class TestRateLimitRetry:
     def test_retries_on_429(self, stub) -> None:
         stub.add(status=429)
@@ -145,3 +182,108 @@ class TestApiKey:
         stub.add(json=_cve_payload())
         NvdClient(cache_enabled=False).get_payload("CVE-2024-9998")
         assert "apiKey" not in stub.calls[0]["headers"]
+
+
+class TestCveIdValidation:
+    """cve_id is validated + percent-encoded before joining the URL or
+    any cache key — advisory-derived values are not trusted."""
+
+    def test_malformed_id_returns_none_without_network(self, stub) -> None:
+        client = NvdClient(cache_enabled=False)
+        assert client.get_payload("not-a-cve") is None
+        assert client.get_payload("") is None
+        assert stub.calls == []
+
+    def test_query_smuggling_id_rejected(self, stub) -> None:
+        client = NvdClient(cache_enabled=False)
+        crafted = "CVE-2024-1234&resultsPerPage=2000"
+        assert client.get_payload(crafted) is None
+        assert stub.calls == []
+
+    def test_valid_id_is_percent_encoded_in_url(self, stub) -> None:
+        stub.add(json=_cve_payload())
+        client = NvdClient(cache_enabled=False)
+        assert client.get_payload("CVE-2024-1234") is not None
+        assert stub.calls[0]["url"].endswith("?cveId=CVE-2024-1234")
+
+    def test_surrounding_whitespace_is_tolerated(self, stub) -> None:
+        stub.add(json=_cve_payload())
+        client = NvdClient(cache_enabled=False)
+        assert client.get_payload("  CVE-2024-1234\n") is not None
+        assert stub.calls[0]["url"].endswith("?cveId=CVE-2024-1234")
+
+
+class TestRaiseOnTransient:
+    """Opt-in transient signalling for verdict-minting callers."""
+
+    def test_transient_failure_raises(self, stub, tmp_path) -> None:
+        from packages.nvd.client import NvdLookupError
+
+        for _ in range(6):
+            stub.add(status=503)
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        with pytest.raises(NvdLookupError):
+            client.get_payload("CVE-2024-1234", raise_on_transient=True)
+
+    def test_memoized_transient_still_raises(self, stub, tmp_path) -> None:
+        from packages.nvd.client import NvdLookupError
+
+        for _ in range(6):
+            stub.add(status=503)
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert client.get_payload("CVE-2024-1234") is None
+        calls_after_first = len(stub.calls)
+        # The in-process transient memo must keep its transient
+        # identity — a later raise_on_transient caller in the same
+        # batch must not read the memoized None as a definitive miss.
+        with pytest.raises(NvdLookupError):
+            client.get_payload("CVE-2024-1234", raise_on_transient=True)
+        assert len(stub.calls) == calls_after_first
+
+    def test_definitive_404_returns_none_not_raise(self, stub, tmp_path) -> None:
+        stub.add(status=404)
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert client.get_payload("CVE-2024-1234", raise_on_transient=True) is None
+
+    def test_default_shape_unchanged_on_transient(self, stub, tmp_path) -> None:
+        for _ in range(6):
+            stub.add(status=503)
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert client.get_payload("CVE-2024-1234") is None
+
+
+class TestIdNormalisation:
+    def test_case_variants_share_cache_and_quota(self, stub, tmp_path) -> None:
+        """CVE ids are case-insensitive; raw-case keys split both the
+        in-memory and 7-day disk caches, burning duplicate quota
+        against NVD's public 5-req/30s limit and letting a definitive
+        miss negative-cache under one spelling only. The core/cve
+        siblings (epss, vulnrichment) upper-case before keying — this
+        client is the remaining member."""
+        stub.add(json=_cve_payload())
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert client.get_payload("CVE-2024-1234") is not None
+        assert client.get_payload("cve-2024-1234") is not None
+        assert client.get_payload("Cve-2024-1234") is not None
+        assert len(stub.calls) == 1, (
+            f"case variants must share one fetch, saw {len(stub.calls)}"
+        )
+        cache_files = sorted(
+            p.name for p in (tmp_path / "nvd" / "nvd").glob("*.json")
+        )
+        assert cache_files == ["CVE-2024-1234.json"], cache_files
+
+    def test_lowercase_first_fetch_keys_canonical(self, stub, tmp_path) -> None:
+        stub.add(json=_cve_payload())
+        client = NvdClient(disk_cache_dir=tmp_path / "nvd")
+        assert client.get_payload("cve-2024-1234") is not None
+        assert client.get_payload("CVE-2024-1234") is not None
+        assert len(stub.calls) == 1
+
+    def test_unicode_digit_id_rejected_without_network(self, stub) -> None:
+        """Non-ASCII decimal digits pass an un-pinned \\d and would
+        mint junk cache keys / URLs — re.ASCII refuses them like the
+        core/cve sibling regexes."""
+        client = NvdClient(cache_enabled=False)
+        assert client.get_payload("CVE-2024-١٢٣٤") is None
+        assert stub.calls == []

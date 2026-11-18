@@ -1,0 +1,96 @@
+name: Refresh Public Suffix List
+
+on:
+  schedule:
+    - cron: '23 7 * * 2'
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - 'core/domains/**'
+      - '.github/scripts/refresh_public_suffix_list.py'
+      - '.github/workflows/refresh-public-suffix-list.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-suffix-list-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned test runner
+        run: python -m pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
+      - run: python -m pytest -q core/domains/tests
+
+  refresh:
+    if: github.repository == 'gadievron/raptor' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned test runner
+        run: python -m pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
+      - name: Download and validate list
+        run: python .github/scripts/refresh_public_suffix_list.py --summary-file "$RUNNER_TEMP/public-suffix-refresh.md"
+      - name: Test refreshed boundaries
+        run: python -m pytest -q core/domains/tests
+      - name: Open or update refresh PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          summary="$RUNNER_TEMP/public-suffix-refresh.md"
+          printf '\nValidation: downloaded list parsed successfully; domain boundary tests passed.\n' >> "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          if git diff --quiet -- core/domains/data/public_suffix_list.dat; then
+            printf '\nPR: no data changes; no PR created or updated.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          branch=auto/public-suffix-list-refresh
+          gh auth setup-git
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B "$branch"
+          git add core/domains/data/public_suffix_list.dat
+          git commit -m 'chore(security): refresh Public Suffix List'
+          git push --force origin "HEAD:refs/heads/$branch"
+          existing=$(gh pr list --repo "$REPO" --head "$branch" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            pr_url=$(gh pr create --repo "$REPO" --head "$branch" \
+              --title 'chore(security): refresh Public Suffix List' \
+              --body-file "$summary")
+            status=created
+          else
+            gh pr edit --repo "$REPO" "$existing" --body-file "$summary"
+            pr_url=$(gh pr view --repo "$REPO" "$existing" --json url --jq .url)
+            status=updated
+          fi
+          printf '\nPR %s: %s\n' "$status" "$pr_url" >> "$GITHUB_STEP_SUMMARY"
+          # Match the sibling refresh workflows: unavailable labels are nonfatal.
+          for label in automated data-refresh; do
+            if gh pr edit --repo "$REPO" "$branch" --add-label "$label" 2>/dev/null; then
+              printf -- '- Label `%s`: applied\n' "$label" >> "$GITHUB_STEP_SUMMARY"
+            else
+              printf -- '- Label `%s`: could not apply; refresh PR retained\n' "$label" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done

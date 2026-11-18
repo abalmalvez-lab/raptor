@@ -1,0 +1,110 @@
+rules:
+  # ---------------------------------------------------------------------------
+  # JavaScript/TypeScript — pattern: Express cookie with security flags disabled
+  # ---------------------------------------------------------------------------
+  - id: raptor.js.insecure-cookie-secure-false
+    message: >-
+      A cookie call specifies secure: false. Confirm the framework API and effective options after spreads or overrides, then review the final response and intended transport. Enable Secure where HTTPS-only cookie transmission is required.
+    languages: [javascript, typescript]
+    severity: HIGH
+    pattern: |
+      $RES.cookie($NAME, $VALUE, {..., secure: false, ...})
+    metadata:
+      cwe: ["CWE-614"]
+      tags: ["security", "javascript", "cookie"]
+
+  - id: raptor.js.insecure-cookie-httponly-false
+    message: >-
+      A cookie call specifies httpOnly: false. Confirm the framework API, effective options and whether script access to the final cookie is intended. Enable HttpOnly where client-side access is unnecessary.
+    languages: [javascript, typescript]
+    severity: HIGH
+    pattern: |
+      $RES.cookie($NAME, $VALUE, {..., httpOnly: false, ...})
+    metadata:
+      cwe: ["CWE-1004"]
+      tags: ["security", "javascript", "cookie"]
+
+  # ---------------------------------------------------------------------------
+  # JavaScript/TypeScript — taint: web sources -> filesystem path sinks
+  # ---------------------------------------------------------------------------
+  - id: raptor.js.path-traversal
+    message: >-
+      Potentially request-derived data reaches path construction or file I/O APIs. Review the actual operation, effective path and allowed roots before claiming traversal. path.join does not enforce confinement; validate the final destination against the intended base directory.
+    languages: [javascript, typescript]
+    severity: CRITICAL
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          # Express — receiver-name anchored: bare $REQ.query/.params/
+          # .body/.headers sources match those field names on any local
+          # object, tainting fully hardcoded data (self-taint).
+          - patterns:
+              - pattern-either:
+                  - pattern: $REQ.query[...]
+                  - pattern: $REQ.query.$PROP
+                  - pattern: $REQ.params[...]
+                  - pattern: $REQ.params.$PROP
+                  - pattern: $REQ.body[...]
+                  - pattern: $REQ.body.$PROP
+                  - pattern: $REQ.headers[...]
+                  - pattern: $REQ.headers.$PROP
+                  - pattern: $REQ.get($FIELD)
+                  - pattern: $REQ.header($FIELD)
+              - metavariable-regex:
+                  metavariable: $REQ
+                  regex: '(?i)^(req|request)$'
+          # Koa — receiver-name anchored (same self-taint shape as the
+          # Express block above).
+          - patterns:
+              - pattern-either:
+                  - pattern: $CTX.query[...]
+                  - pattern: $CTX.query.$PROP
+                  - pattern: $CTX.request.query[...]
+                  - pattern: $CTX.request.query.$PROP
+                  - pattern: $CTX.params[...]
+                  - pattern: $CTX.params.$PROP
+                  - pattern: $CTX.request.body[...]
+                  - pattern: $CTX.request.body.$PROP
+                  - pattern: $CTX.get($FIELD)
+                  - pattern: $CTX.request.get($FIELD)
+                  - pattern: $CTX.header[...]
+                  - pattern: $CTX.header.$PROP
+                  - pattern: $CTX.headers[...]
+                  - pattern: $CTX.headers.$PROP
+                  - pattern: $CTX.request.header[...]
+                  - pattern: $CTX.request.header.$PROP
+                  - pattern: $CTX.request.headers[...]
+                  - pattern: $CTX.request.headers.$PROP
+              - metavariable-regex:
+                  metavariable: $CTX
+                  regex: '(?i)^(c|ctx|context)$'
+          # Generic
+          - pattern: process.env[...]
+          - pattern: process.env.$PROP
+          - pattern: process.argv[...]
+    pattern-sinks:
+      - patterns:
+          - pattern: path.join($BASE, $PATH)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: fs.readFile($PATH, ...)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: fs.readFileSync($PATH, ...)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: fs.writeFile($PATH, ...)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: fs.writeFileSync($PATH, ...)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: fs.createReadStream($PATH)
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: fs.createWriteStream($PATH)
+          - focus-metavariable: $PATH
+    metadata:
+      cwe: ["CWE-22"]
+      owasp_top_10: ["A1:2021-Broken Access Control"]
+      tags: ["security", "javascript", "path-traversal", "taint"]

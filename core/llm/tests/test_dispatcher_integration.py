@@ -11,6 +11,8 @@ The full subprocess-end-to-end is exercised in
 
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
+import errno
 import http.server
 import json
 import os
@@ -24,6 +26,13 @@ import pytest
 from core.llm.config import ModelConfig
 from core.llm.dispatcher.auth import CredentialStore, ProviderRule
 from core.llm.dispatcher.server import LLMDispatcher
+from core.testing.processes import reap_on_exit
+from packages.web.tests.http_server import start_http_server
+
+# Module-level marker — every test in this file spins up a real HTTP
+# server on 127.0.0.1 and/or a real LLMDispatcher Unix socket. Three
+# tests here showed up at 12s each in the duration sweep.
+pytestmark = pytest.mark.integration
 
 
 # ---------------------------------------------------------------------------
@@ -64,17 +73,17 @@ class _CaptiveUpstream:
                 self.wfile.write(outer._body)
 
         self._server = http.server.HTTPServer(("127.0.0.1", 0), _H)
-        self.host, self.port = self._server.server_address
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        with ExitStack() as cleanup:
+            self._thread = start_http_server(self._server, cleanup.callback)
+            self.host, self.port = self._server.server_address
+            self._cleanup = cleanup.pop_all()
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
     def shutdown(self):
-        self._server.shutdown()
-        self._server.server_close()
+        self._cleanup.close()
 
 
 def _wired_dispatcher(creds, tmp_path, provider: str, upstream: _CaptiveUpstream):
@@ -86,14 +95,52 @@ def _wired_dispatcher(creds, tmp_path, provider: str, upstream: _CaptiveUpstream
         audit_path=tmp_path / "audit.jsonl",
         token_ttl_s=3600, token_budget=100,
     )
-    original = d._rules[provider]
-    d._rules[provider] = ProviderRule(
-        name=original.name,
-        upstream_base_url=upstream.base_url,
-        inject_headers=original.inject_headers,
-        strip_request_headers=original.strip_request_headers,
-    )
-    return d
+    with ExitStack() as rollback:
+        rollback.callback(d.shutdown)
+        original = d._rules[provider]
+        d._rules[provider] = ProviderRule(
+            name=original.name,
+            upstream_base_url=upstream.base_url,
+            inject_headers=original.inject_headers,
+            strip_request_headers=original.strip_request_headers,
+        )
+        rollback.pop_all()
+        return d
+
+
+@contextmanager
+def _worker_session(dispatcher, *, label):
+    """Own an in-process worker's token FD, environment and cached token."""
+    from core.llm.dispatcher import client
+
+    with ExitStack() as cleanup:
+        _, fd = dispatcher.allocate_worker(label=label)
+        identity = None
+
+        def close_unread_token():
+            # read_token() normally consumes and closes the descriptor. If
+            # another resource has reused its number, that resource is not
+            # ours. Before the initial fstat succeeds no consumer has run.
+            if identity is None:
+                os.close(fd)
+                return
+            try:
+                current = os.fstat(fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+            else:
+                if (current.st_dev, current.st_ino) == identity:
+                    os.close(fd)
+
+        cleanup.callback(close_unread_token)
+        stat = os.fstat(fd)
+        identity = (stat.st_dev, stat.st_ino)
+        with pytest.MonkeyPatch.context() as session:
+            session.setenv("RAPTOR_LLM_SOCKET", str(dispatcher.socket_path))
+            session.setenv("RAPTOR_LLM_TOKEN_FD", str(fd))
+            session.setattr(client, "_cached_token", None)
+            yield
 
 
 # ---------------------------------------------------------------------------
@@ -111,17 +158,12 @@ class TestProviderRouteSelection:
         self, fake_creds, tmp_path, monkeypatch,
     ):
         pytest.importorskip("anthropic")
-        upstream = _CaptiveUpstream()
-        d = _wired_dispatcher(fake_creds, tmp_path, "anthropic", upstream)
-        try:
-            _, fd = d.allocate_worker(label="ant-init")
-            monkeypatch.setenv("RAPTOR_LLM_SOCKET", str(d.socket_path))
-            monkeypatch.setenv("RAPTOR_LLM_TOKEN_FD", str(fd))
-
-            # Reset the worker-side token cache so this test sees the
-            # fresh FD instead of one from a previous test.
-            from core.llm.dispatcher import client as _client
-            _client._cached_token = None
+        with ExitStack() as cleanup:
+            upstream = _CaptiveUpstream()
+            cleanup.callback(upstream.shutdown)
+            d = _wired_dispatcher(fake_creds, tmp_path, "anthropic", upstream)
+            cleanup.callback(d.shutdown)
+            cleanup.enter_context(_worker_session(d, label='ant-init'))
 
             from core.llm.providers import AnthropicProvider
             cfg = ModelConfig(provider="anthropic", model_name="claude-3-haiku-20240307")
@@ -135,9 +177,6 @@ class TestProviderRouteSelection:
             assert isinstance(transport, httpx.HTTPTransport)
             # The SDK's base_url on the dispatcher path is the dummy http://_/...
             assert "http://_/anthropic" in str(provider.client.base_url)
-        finally:
-            upstream.shutdown()
-            d.shutdown()
 
     def test_anthropic_provider_uses_direct_sdk_when_no_socket(
         self, monkeypatch,
@@ -156,23 +195,18 @@ class TestProviderRouteSelection:
         self, fake_creds, tmp_path, monkeypatch,
     ):
         pytest.importorskip("openai")
-        upstream = _CaptiveUpstream()
-        d = _wired_dispatcher(fake_creds, tmp_path, "openai", upstream)
-        try:
-            _, fd = d.allocate_worker(label="oai-init")
-            monkeypatch.setenv("RAPTOR_LLM_SOCKET", str(d.socket_path))
-            monkeypatch.setenv("RAPTOR_LLM_TOKEN_FD", str(fd))
-            from core.llm.dispatcher import client as _client
-            _client._cached_token = None
+        with ExitStack() as cleanup:
+            upstream = _CaptiveUpstream()
+            cleanup.callback(upstream.shutdown)
+            d = _wired_dispatcher(fake_creds, tmp_path, "openai", upstream)
+            cleanup.callback(d.shutdown)
+            cleanup.enter_context(_worker_session(d, label='oai-init'))
 
             from core.llm.providers import OpenAICompatibleProvider
             cfg = ModelConfig(provider="openai", model_name="gpt-5")
             cfg.api_key = "should-not-be-used"
             provider = OpenAICompatibleProvider(cfg)
             assert "http://_/openai" in str(provider.client.base_url)
-        finally:
-            upstream.shutdown()
-            d.shutdown()
 
     def test_openai_compat_does_NOT_use_dispatcher_for_ollama(
         self, fake_creds, tmp_path, monkeypatch,
@@ -183,14 +217,12 @@ class TestProviderRouteSelection:
         ``RAPTOR_LLM_SOCKET`` set, the dispatcher path must NOT be
         taken for ``provider != "openai"``."""
         pytest.importorskip("openai")
-        upstream = _CaptiveUpstream()
-        d = _wired_dispatcher(fake_creds, tmp_path, "openai", upstream)
-        try:
-            _, fd = d.allocate_worker(label="ollama-init")
-            monkeypatch.setenv("RAPTOR_LLM_SOCKET", str(d.socket_path))
-            monkeypatch.setenv("RAPTOR_LLM_TOKEN_FD", str(fd))
-            from core.llm.dispatcher import client as _client
-            _client._cached_token = None
+        with ExitStack() as cleanup:
+            upstream = _CaptiveUpstream()
+            cleanup.callback(upstream.shutdown)
+            d = _wired_dispatcher(fake_creds, tmp_path, "openai", upstream)
+            cleanup.callback(d.shutdown)
+            cleanup.enter_context(_worker_session(d, label='ollama-init'))
 
             from core.llm.providers import OpenAICompatibleProvider
             cfg = ModelConfig(
@@ -203,22 +235,17 @@ class TestProviderRouteSelection:
             # Direct path → base_url is the local Ollama endpoint
             assert "http://_/" not in str(provider.client.base_url)
             assert "11434" in str(provider.client.base_url)
-        finally:
-            upstream.shutdown()
-            d.shutdown()
 
     def test_gemini_provider_uses_dispatcher_when_socket_set(
         self, fake_creds, tmp_path, monkeypatch,
     ):
         pytest.importorskip("google.genai")
-        upstream = _CaptiveUpstream()
-        d = _wired_dispatcher(fake_creds, tmp_path, "gemini", upstream)
-        try:
-            _, fd = d.allocate_worker(label="gem-init")
-            monkeypatch.setenv("RAPTOR_LLM_SOCKET", str(d.socket_path))
-            monkeypatch.setenv("RAPTOR_LLM_TOKEN_FD", str(fd))
-            from core.llm.dispatcher import client as _client
-            _client._cached_token = None
+        with ExitStack() as cleanup:
+            upstream = _CaptiveUpstream()
+            cleanup.callback(upstream.shutdown)
+            d = _wired_dispatcher(fake_creds, tmp_path, "gemini", upstream)
+            cleanup.callback(d.shutdown)
+            cleanup.enter_context(_worker_session(d, label='gem-init'))
 
             from core.llm.providers import GeminiProvider
             cfg = ModelConfig(provider="gemini", model_name="gemini-2.5-pro")
@@ -229,9 +256,6 @@ class TestProviderRouteSelection:
             # google-genai stores HttpOptions on _api_client.http_options
             base_url = client._api_client._http_options.base_url
             assert "http://_/gemini" in str(base_url)
-        finally:
-            upstream.shutdown()
-            d.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -256,12 +280,10 @@ class TestGrandchildRelay:
             audit_path=tmp_path / "audit.jsonl",
             token_ttl_s=60, token_budget=10,
         )
-        try:
-            _, parent_fd = d.allocate_worker(label="parent")
-            monkeypatch.setenv("RAPTOR_LLM_SOCKET", str(d.socket_path))
-            monkeypatch.setenv("RAPTOR_LLM_TOKEN_FD", str(parent_fd))
+        with ExitStack() as cleanup:
+            cleanup.callback(d.shutdown)
+            cleanup.enter_context(_worker_session(d, label='parent'))
             from core.llm.dispatcher import client as _client
-            _client._cached_token = None
 
             # Parent reads its own token via the cache (simulates
             # what AnthropicProvider did at startup).
@@ -282,8 +304,6 @@ class TestGrandchildRelay:
                     os.close(child_fd)
                 except OSError:
                     pass
-        finally:
-            d.shutdown()
 
     def test_grandchild_subprocess_uses_relayed_session(
         self, fake_creds, tmp_path,
@@ -302,9 +322,11 @@ class TestGrandchildRelay:
             "stop_sequence": None,
             "usage": {"input_tokens": 4, "output_tokens": 3},
         }).encode("utf-8")
-        upstream = _CaptiveUpstream(body=anthropic_response)
-        d = _wired_dispatcher(fake_creds, tmp_path, "anthropic", upstream)
-        try:
+        with ExitStack() as cleanup:
+            upstream = _CaptiveUpstream(body=anthropic_response)
+            cleanup.callback(upstream.shutdown)
+            d = _wired_dispatcher(fake_creds, tmp_path, "anthropic", upstream)
+            cleanup.callback(d.shutdown)
             # Parent script: read inherited token, immediately relay
             # to a grandchild that's spawned inline. Mimics what
             # raptor_agentic.py does when it spawns agent.py with
@@ -364,7 +386,9 @@ class TestGrandchildRelay:
                 },
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
+            cleanup.enter_context(reap_on_exit(proc, process_group=True))
             # 30s rather than 20s: matches the timeout used by sibling
             # parent+grandchild subprocess tests in this file (lines
             # 573, 782) and gives parallel xdist runs enough headroom
@@ -385,24 +409,19 @@ class TestGrandchildRelay:
             sent = {k.lower(): v for k, v in upstream.captured["headers"].items()}
             assert sent.get("x-api-key") == "test-anthropic-secret"
             assert "x-raptor-token" not in sent
-        finally:
-            upstream.shutdown()
-            d.shutdown()
 
 
 @pytest.fixture
-def clear_detection_cache():
-    """``detect_llm_availability`` caches its result at module scope.
-    Tests that drive different cache values must clear it both before
-    and after they run, otherwise they pollute later tests in the
-    suite (observed: test_ollama_warning emits an extra "no LLM
-    available" warning when our test left a False-cache behind)."""
-    from core.llm import detection
-    detection._cached_llm_availability = None
-    try:
-        yield
-    finally:
-        detection._cached_llm_availability = None
+def clear_detection_cache(monkeypatch):
+    """Retain caller availability and model selections across dispatcher checks."""
+    from core.llm import config, detection
+    from core.testing.llm_state import isolated_llm_resolution
+
+    with isolated_llm_resolution(config, detection):
+        try:
+            yield
+        finally:
+            monkeypatch.undo()
 
 
 class TestPhaseBChainE2E:
@@ -467,27 +486,25 @@ class TestPhaseBChainE2E:
                 self.end_headers()
                 self.wfile.write(resp)
 
-        upstream_server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
-        upstream_thread = threading.Thread(
-            target=upstream_server.serve_forever, daemon=True,
-        )
-        upstream_thread.start()
-        upstream_base = f"http://{upstream_server.server_address[0]}:{upstream_server.server_address[1]}"
+        with ExitStack() as cleanup:
+            upstream_server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+            start_http_server(upstream_server, cleanup.callback)
+            upstream_base = f"http://{upstream_server.server_address[0]}:{upstream_server.server_address[1]}"
 
-        d = LLMDispatcher(
-            run_id="chain-e2e", creds=fake_creds,
-            audit_path=tmp_path / "audit.jsonl",
-            token_ttl_s=120, token_budget=20,
-        )
-        original = d._rules["anthropic"]
-        d._rules["anthropic"] = ProviderRule(
-            name=original.name,
-            upstream_base_url=upstream_base,
-            inject_headers=original.inject_headers,
-            strip_request_headers=original.strip_request_headers,
-        )
+            d = LLMDispatcher(
+                run_id="chain-e2e", creds=fake_creds,
+                audit_path=tmp_path / "audit.jsonl",
+                token_ttl_s=120, token_budget=20,
+            )
+            cleanup.callback(d.shutdown)
+            original = d._rules["anthropic"]
+            d._rules["anthropic"] = ProviderRule(
+                name=original.name,
+                upstream_base_url=upstream_base,
+                inject_headers=original.inject_headers,
+                strip_request_headers=original.strip_request_headers,
+            )
 
-        try:
             from core.llm.dispatcher.spawn import spawn_worker
             repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.dirname(os.path.abspath(__file__))
@@ -573,7 +590,9 @@ class TestPhaseBChainE2E:
                 },
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
+            cleanup.enter_context(reap_on_exit(proc, process_group=True))
             stdout, stderr = proc.communicate(timeout=30)
             assert proc.returncode == 0, (
                 f"chain failed: rc={proc.returncode}\n"
@@ -588,8 +607,8 @@ class TestPhaseBChainE2E:
 
             # Child's own response landed on stderr (we used stderr to
             # not collide with the grandchild's stdout pass-through)
-            child_lines = [l for l in stderr.decode().splitlines()
-                           if l.startswith("{")]
+            child_lines = [line for line in stderr.decode().splitlines()
+                           if line.startswith("{")]
             assert len(child_lines) == 1, f"child output not found: {stderr.decode()!r}"
             c_payload = json.loads(child_lines[0])
             assert c_payload["who"] == "child"
@@ -618,8 +637,8 @@ class TestPhaseBChainE2E:
 
             # ---- audit log captured the dispatch events ----
             audit_lines = [
-                json.loads(l)
-                for l in (tmp_path / "audit.jsonl").read_text().splitlines()
+                json.loads(line)
+                for line in (tmp_path / "audit.jsonl").read_text().splitlines()
             ]
             dispatched = [a for a in audit_lines if a["event"] == "request.dispatch"]
             assert len(dispatched) == 2, (
@@ -631,10 +650,6 @@ class TestPhaseBChainE2E:
             # one — important for the "α (relax single-use)" decision.
             assert dispatched[0]["token_id"] == dispatched[1]["token_id"]
             assert dispatched[0]["worker_label"] == dispatched[1]["worker_label"]
-        finally:
-            upstream_server.shutdown()
-            upstream_server.server_close()
-            d.shutdown()
 
 
 class TestPhaseBChainE2EGemini:
@@ -685,30 +700,28 @@ class TestPhaseBChainE2EGemini:
                 self.end_headers()
                 self.wfile.write(gemini_response)
 
-        upstream_server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
-        upstream_thread = threading.Thread(
-            target=upstream_server.serve_forever, daemon=True,
-        )
-        upstream_thread.start()
-        upstream_base = (
-            f"http://{upstream_server.server_address[0]}:"
-            f"{upstream_server.server_address[1]}"
-        )
+        with ExitStack() as cleanup:
+            upstream_server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+            start_http_server(upstream_server, cleanup.callback)
+            upstream_base = (
+                f"http://{upstream_server.server_address[0]}:"
+                f"{upstream_server.server_address[1]}"
+            )
 
-        d = LLMDispatcher(
-            run_id="chain-e2e-gemini", creds=fake_creds,
-            audit_path=tmp_path / "audit.jsonl",
-            token_ttl_s=120, token_budget=20,
-        )
-        original = d._rules["gemini"]
-        d._rules["gemini"] = ProviderRule(
-            name=original.name,
-            upstream_base_url=upstream_base,
-            inject_headers=original.inject_headers,
-            strip_request_headers=original.strip_request_headers,
-        )
+            d = LLMDispatcher(
+                run_id="chain-e2e-gemini", creds=fake_creds,
+                audit_path=tmp_path / "audit.jsonl",
+                token_ttl_s=120, token_budget=20,
+            )
+            cleanup.callback(d.shutdown)
+            original = d._rules["gemini"]
+            d._rules["gemini"] = ProviderRule(
+                name=original.name,
+                upstream_base_url=upstream_base,
+                inject_headers=original.inject_headers,
+                strip_request_headers=original.strip_request_headers,
+            )
 
-        try:
             from core.llm.dispatcher.spawn import spawn_worker
             repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.dirname(os.path.abspath(__file__))
@@ -782,7 +795,9 @@ class TestPhaseBChainE2EGemini:
                 },
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
+            cleanup.enter_context(reap_on_exit(proc, process_group=True))
             stdout, stderr = proc.communicate(timeout=30)
             assert proc.returncode == 0, (
                 f"Gemini chain failed: rc={proc.returncode}\n"
@@ -795,8 +810,8 @@ class TestPhaseBChainE2EGemini:
             assert gc_payload["text"] == "gemini chain works"
 
             # Child's parsed Gemini response on stderr
-            child_lines = [l for l in stderr.decode().splitlines()
-                           if l.startswith("{")]
+            child_lines = [line for line in stderr.decode().splitlines()
+                           if line.startswith("{")]
             assert len(child_lines) == 1, f"child output not found: {stderr.decode()!r}"
             c_payload = json.loads(child_lines[0])
             assert c_payload["who"] == "child"
@@ -825,16 +840,12 @@ class TestPhaseBChainE2EGemini:
 
             # Audit confirms two dispatch events sharing one token
             audit_lines = [
-                json.loads(l)
-                for l in (tmp_path / "audit.jsonl").read_text().splitlines()
+                json.loads(line)
+                for line in (tmp_path / "audit.jsonl").read_text().splitlines()
             ]
             dispatched = [a for a in audit_lines if a["event"] == "request.dispatch"]
             assert len(dispatched) == 2
             assert dispatched[0]["token_id"] == dispatched[1]["token_id"]
-        finally:
-            upstream_server.shutdown()
-            upstream_server.server_close()
-            d.shutdown()
 
 
 class TestDetectLLMAvailabilityRecognizesDispatcher:
@@ -847,13 +858,24 @@ class TestDetectLLMAvailabilityRecognizesDispatcher:
     def test_external_llm_true_when_dispatcher_socket_set(
         self, monkeypatch, clear_detection_cache,
     ):
+        from types import ModuleType
         from core.llm import detection
+
+        # Availability is under test, not installed tools or legacy-config migration.
+        tools = ModuleType("shutil")
+        tools.__dict__.update(vars(detection.shutil))
+        tools.which = lambda *args, **kwargs: None
+        monkeypatch.setattr(detection, "shutil", tools)
+        monkeypatch.setattr(detection, "_check_litellm_installed", lambda: False)
+        monkeypatch.setattr(detection, "_check_litellm_migration", lambda: None)
+        monkeypatch.setattr(detection, "_config_has_keyed_models", lambda: False)
+        monkeypatch.setattr(detection, "_get_available_ollama_models", lambda: [])
         for k in (
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
             "GEMINI_API_KEY", "MISTRAL_API_KEY",
         ):
             monkeypatch.delenv(k, raising=False)
-        monkeypatch.setenv("RAPTOR_LLM_SOCKET", "/tmp/whatever-not-used.sock")
+        monkeypatch.setenv("RAPTOR_LLM_SOCKET", "./whatever-not-used.sock")
 
         result = detection.detect_llm_availability()
         assert result.external_llm is True
@@ -862,7 +884,18 @@ class TestDetectLLMAvailabilityRecognizesDispatcher:
     def test_external_llm_false_without_dispatcher_or_keys(
         self, monkeypatch, clear_detection_cache,
     ):
+        from types import ModuleType
         from core.llm import detection
+
+        # Availability is under test, not installed tools or legacy-config migration.
+        tools = ModuleType("shutil")
+        tools.__dict__.update(vars(detection.shutil))
+        tools.which = lambda *args, **kwargs: None
+        monkeypatch.setattr(detection, "shutil", tools)
+        monkeypatch.setattr(detection, "_check_litellm_installed", lambda: False)
+        monkeypatch.setattr(detection, "_check_litellm_migration", lambda: None)
+        monkeypatch.setattr(detection, "_config_has_keyed_models", lambda: False)
+        monkeypatch.setattr(detection, "_get_available_ollama_models", lambda: [])
         for k in (
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
             "GEMINI_API_KEY", "MISTRAL_API_KEY",
@@ -902,11 +935,16 @@ class TestEndToEndCredentialIsolationThroughProviders:
             "stop_sequence": None,
             "usage": {"input_tokens": 4, "output_tokens": 3},
         }).encode("utf-8")
-        upstream = _CaptiveUpstream(body=anthropic_response)
-        d = _wired_dispatcher(fake_creds, tmp_path, "anthropic", upstream)
-
-        try:
+        with ExitStack() as cleanup:
+            upstream = _CaptiveUpstream(body=anthropic_response)
+            cleanup.callback(upstream.shutdown)
+            d = _wired_dispatcher(fake_creds, tmp_path, "anthropic", upstream)
+            cleanup.callback(d.shutdown)
             from core.llm.dispatcher.spawn import spawn_worker
+            from core.testing.streams import pipe_streams
+            import selectors
+
+            ready_reader, ready_writer = cleanup.enter_context(pipe_streams())
 
             # Worker imports core.llm.providers.AnthropicProvider, builds
             # a ModelConfig, calls .generate() — exactly the production
@@ -922,7 +960,10 @@ class TestEndToEndCredentialIsolationThroughProviders:
                 "cfg = ModelConfig(provider='anthropic', model_name='claude-3-haiku-20240307')\n"
                 "cfg.api_key = 'dummy-not-used'\n"
                 "p = AnthropicProvider(cfg)\n"
-                "msg = p.client.messages.create(\n"
+                "with p.client:\n"
+                "    os.write(int(sys.argv[1]), b'R')\n"
+                "    os.close(int(sys.argv[1]))\n"
+                "    msg = p.client.messages.create(\n"
                 "    model='claude-3-haiku-20240307',\n"
                 "    max_tokens=64,\n"
                 "    messages=[{'role':'user','content':'hi'}],\n"
@@ -938,7 +979,8 @@ class TestEndToEndCredentialIsolationThroughProviders:
             )))
             proc = spawn_worker(
                 d,
-                cmd=[sys.executable, str(worker_src)],
+                cmd=[sys.executable, str(worker_src), str(ready_writer.fileno())],
+                pass_fds=(ready_writer.fileno(),),
                 label="phase-b-e2e",
                 env={
                     "PATH": os.environ.get("PATH", ""),
@@ -946,7 +988,16 @@ class TestEndToEndCredentialIsolationThroughProviders:
                 },
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
+            cleanup.enter_context(reap_on_exit(proc, process_group=True))
+            ready_writer.close()
+            # Cold provider imports have their own startup deadline. The
+            # original request/exit deadline starts once the client is ready.
+            selector = cleanup.enter_context(selectors.DefaultSelector())
+            selector.register(ready_reader, selectors.EVENT_READ)
+            assert selector.select(timeout=60), "provider startup exceeded 60 seconds"
+            assert os.read(ready_reader.fileno(), 1) == b"R", "worker exited before client readiness"
             stdout, stderr = proc.communicate(timeout=15)
             assert proc.returncode == 0, (
                 f"worker failed: rc={proc.returncode} "
@@ -963,6 +1014,3 @@ class TestEndToEndCredentialIsolationThroughProviders:
             assert sent.get("x-api-key") == "test-anthropic-secret"
             assert sent.get("x-api-key") != "dummy-not-used"
             assert "x-raptor-token" not in sent
-        finally:
-            upstream.shutdown()
-            d.shutdown()

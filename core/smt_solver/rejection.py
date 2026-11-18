@@ -27,12 +27,15 @@ instead of cloning the logic:
 """
 from __future__ import annotations
 
+from .session import solver_reason_unknown
+
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional, Union
+from typing import Any
 
 from .availability import z3
+
 from .config import BVProfile
 
 
@@ -121,7 +124,8 @@ class RejectionKind(str, Enum):
     length is unboundedly large (e.g. a 1 MB string of operators).  The
     cap lives in the encoder (``smt_path_validator._MAX_CONDITION_CHARS``)
     so it can be tuned per call site if a real-target condition ever
-    legitimately exceeds it."""
+    legitimately exceeds it. Because its contents are not inspected, this
+    rejection cannot establish unchanged scalar state between guards."""
 
     TOO_MANY_CONDITIONS = "too_many_conditions"
     """The caller passed more conditions to ``check_path_feasibility``
@@ -130,6 +134,28 @@ class RejectionKind(str, Enum):
     malformed upstream extraction or amplification.  The whole call
     degrades to ``feasible=None``; the rejection appears once in
     ``unknown_reasons``."""
+
+    ASSIGNMENT_SHAPED = "assignment_shaped"
+    """Condition looked like a program *statement* (assignment, compound
+    assignment, increment/decrement) rather than a Boolean guard.
+    Examples: ``input = realloc(input, n)``, ``count += 1``, ``ptr++``.
+
+    These aren't path *conditions* — they're path *effects*.  Mixing
+    them into the condition list is an LLM-extraction mistake: SMT
+    expects an SSA-renamed view where every reference to a name
+    denotes the same value, but an assignment between two guards on
+    the same name means later occurrences refer to a DIFFERENT value.
+    Path-validator entry points use this kind to mark value-flow segments.
+    A native UNSAT core crossing an unmodeled mutation cannot refute the
+    path. Independent contradictions within one segment remain useful.
+    Call occurrences are always fresh, regardless of mutation markers."""
+
+    UNMODELED_STATE_EFFECT = "unmodeled_state_effect"
+    """Input may expose mutable state or contain uninspected lexical structure.
+    Opaque arguments, incomplete literals/comments and untranslated source tokens
+    cannot establish purity or preserve scalar value
+    identity across the call. As with rejected assignments, native core
+    provenance must confine a refutation to one mutation-free segment."""
 
 
 # RejectionKinds that no encoder emits any more but that we've kept in
@@ -185,10 +211,10 @@ class Rejection:
 _HEX_LITERAL_RE = re.compile(r'0x[0-9a-f]+', re.IGNORECASE)
 # Decimal literals may carry a leading `-` so source-form expressions
 # like ``x > -10`` or ``errno == -EAGAIN`` (when the C macro expands
-# to a literal) are parseable. Hex literals stay positive-only —
-# `-0xff` isn't real source-form input; bit-pattern literals are
-# always written as their unsigned representation.
-_DEC_LITERAL_RE = re.compile(r'-?\d+')
+# to a literal) are parseable. Hex tokens denote unsigned-spelled bit
+# patterns here. Source adapters may normalize a proven C negative hex
+# constant to a signed decimal atom before submitting it.
+_DEC_LITERAL_RE = re.compile(r'-?[0-9]+')
 
 
 def propagate(text: str, sub: Rejection) -> Rejection:
@@ -229,18 +255,24 @@ def propagate(text: str, sub: Rejection) -> Rejection:
         # Truncate inner-text rendering at 80 chars so a deeply
         # nested expression doesn't blow up the rejection message.
         inner = sub.text if len(sub.text) <= 80 else sub.text[:77] + "..."
-        suffix = f" (in: {inner!r})" if not detail else f" (in: {inner!r})"
-        detail = f"{detail}{suffix}" if detail else f"(in: {inner!r})"
+        detail = f"{detail} (in: {inner!r})" if detail else f"(in: {inner!r})"
     return Rejection(text, sub.kind, detail, sub.hint)
+
+
+# This bounds diagnostic rendering only; profile admission is unchanged.
+_MAX_RENDERED_RANGE_BITS = 4096
 
 
 def parse_literal_value(
     tok: str,
     profile: BVProfile,
     *,
-    outer_text: Optional[str] = None,
-) -> Union[int, Rejection]:
+    outer_text: str | None = None,
+) -> int | Rejection:
     """Validate and convert a literal token, or return a structured rejection.
+
+    The profile must be an exact BVProfile value. Subclasses and duck-typed
+    profiles can change width or signedness between validation and use.
 
     Centralised so atom-position literals and bitmask-form literals
     across all encoders reject the same things:
@@ -250,6 +282,8 @@ def parse_literal_value(
       misleading verdict) → :data:`RejectionKind.LITERAL_OUT_OF_RANGE`.
     - Leading-zero decimals (octal in C, ambiguous if interpreted as
       base-10) → :data:`RejectionKind.LITERAL_AMBIGUOUS`.
+    - Decimal conversion refused by the runtime's digit budget
+      → :data:`RejectionKind.INPUT_TOO_LONG`; the budget is not raised.
     - Anything that isn't a clean hex or decimal literal
       → :data:`RejectionKind.UNRECOGNIZED_OPERAND`.
 
@@ -265,10 +299,15 @@ def parse_literal_value(
     stores ``outer_text`` in ``Rejection.text`` and folds the token
     into the detail message, removing the propagate dependency.
     """
+    # A mutable dispatch protocol cannot select one range here and a
+    # different native width when the caller constructs the literal.
+    if type(profile) is not BVProfile:
+        raise ValueError("literal profile must be an exact BVProfile value")
+    # Interpret the stored source characters, not subclass conversion hooks.
+    tok = str.__str__(tok)
     # Text anchor: prefer caller-supplied outer expression when
-    # provided, otherwise the bare token. Detail uniformly mentions
-    # the token via `{tok!r}` so the operator-facing message is the
-    # same regardless of anchoring choice.
+    # provided, otherwise the bare token. Conversion-budget refusals retain
+    # this anchor without repeating an oversized token in their detail.
     text = outer_text if outer_text is not None else tok
     is_hex = bool(_HEX_LITERAL_RE.fullmatch(tok))
     if is_hex:
@@ -284,7 +323,14 @@ def parse_literal_value(
                 f"leading-zero decimal is ambiguous with C octal (token {tok!r})",
                 hint="rewrite as hex (0x...) or strip the leading zero",
             )
-        v = int(tok)
+        try:
+            v = int(tok)
+        except ValueError:
+            return Rejection(
+                text, RejectionKind.INPUT_TOO_LONG,
+                "decimal literal exceeds the runtime integer conversion limit",
+                hint="use a shorter decimal or an equivalent hexadecimal literal within the selected profile",
+            )
     else:
         return Rejection(
             text, RejectionKind.UNRECOGNIZED_OPERAND,
@@ -305,8 +351,8 @@ def parse_literal_value(
     #   the bit pattern (0xC8) does — Z3 would silently
     #   reinterpret it as -56, producing a verdict that didn't
     #   match the source intent. Cap decimal literals at
-    #   2^(width-1) for signed profiles. (The regex rejects
-    #   leading '-', so we only see positive decimals here.)
+    #   2^(width-1) for signed profiles, with the asymmetric negative
+    #   endpoint admitted below.
     #
     # Pre-batch-210 the check used `v >= (1 << profile.width)`
     # uniformly, which over-accepted decimal literals (the `200`
@@ -315,26 +361,45 @@ def parse_literal_value(
     # at int32. This split restores hex support while keeping the
     # decimal sign-discipline.
     if is_hex or not profile.signed:
-        upper_exclusive = 1 << profile.width
-        lower_inclusive = 0  # hex + unsigned reject negatives
+        outside_range = v < 0 or v.bit_length() > profile.width
     else:
-        upper_exclusive = 1 << (profile.width - 1)
-        # Signed two's-complement range is asymmetric: ``int8`` covers
-        # ``-128..127`` (lower bound is ``-2^(width-1)``, upper is
-        # ``2^(width-1) - 1``). A decimal `-128` at int8 must be
-        # accepted; `-129` rejected.
-        lower_inclusive = -(1 << (profile.width - 1))
-    if v >= upper_exclusive or v < lower_inclusive:
+        # Complementing negatives retains the asymmetric signed minimum.
+        magnitude_bits = v.bit_length() if v >= 0 else (~v).bit_length()
+        outside_range = magnitude_bits >= profile.width
+    if outside_range:
         if is_hex:
             range_desc = f"{profile.width}-bit range"
         else:
             range_desc = f"{profile.describe()} range"
+        if profile.width <= _MAX_RENDERED_RANGE_BITS:
+            if is_hex or not profile.signed:
+                lower_inclusive, upper_exclusive = 0, 1 << profile.width
+            else:
+                upper_exclusive = 1 << (profile.width - 1)
+                lower_inclusive = -upper_exclusive
+            range_bounds = f"{lower_inclusive:#x}..{upper_exclusive - 1:#x}"
+        elif is_hex or not profile.signed:
+            range_bounds = f"0x0..(2**{profile.width})-1"
+        else:
+            range_bounds = f"-(2**{profile.width - 1})..(2**{profile.width - 1})-1"
         return Rejection(
             text, RejectionKind.LITERAL_OUT_OF_RANGE,
             f"value {v:#x} (from token {tok!r}) outside {range_desc} "
-            f"({lower_inclusive:#x}..{upper_exclusive - 1:#x})",
+            f"({range_bounds})",
         )
     return v
+
+
+# Failure modes ``classify_solver_unknown`` tolerates from
+# ``reason_unknown()`` — see the comment in the function body. Built
+# once at import time (``z3`` may be None when the soft dependency is
+# missing, in which case only the stdlib pair applies) and named so the
+# ``except`` clause is a statically-recognisable exception tuple.
+_REASON_UNKNOWN_RAISES: tuple[type[BaseException], ...] = (
+    AttributeError,
+    RuntimeError,
+    *((z3.Z3Exception,) if hasattr(z3, "Z3Exception") else ()),
+)
 
 
 def classify_solver_unknown(solver: Any) -> RejectionKind:
@@ -357,10 +422,8 @@ def classify_solver_unknown(solver: Any) -> RejectionKind:
     # a stub object is explicit-enough that we shouldn't crash, but
     # narrower TypeError-level mismatches should propagate.
     try:
-        reason = (solver.reason_unknown() or "").lower()
-    except (AttributeError,) + (
-        (z3.Z3Exception,) if hasattr(z3, "Z3Exception") else ()
-    ) + (RuntimeError,):
+        reason = (solver_reason_unknown(solver) or "").lower()
+    except _REASON_UNKNOWN_RAISES:
         return RejectionKind.SOLVER_UNKNOWN
     if "timeout" in reason or "canceled" in reason or "cancelled" in reason:
         return RejectionKind.SOLVER_TIMEOUT

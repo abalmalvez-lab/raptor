@@ -18,12 +18,45 @@ doesn't wrap it.
 
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO
 
-from core.config import RaptorConfig
-from core.logging import get_logger
+# Preserve the historical import surface without initializing configuration
+# or configuring the application logger for pure in-memory hashes.
+__all__ = [
+    "BinaryIO", "Path", "RaptorConfig", "get_logger", "hashlib", "logger",
+    "sha256_bytes", "sha256_file", "sha256_fileobj", "sha256_string", "sha256_tree",
+]
+_LAZY_EXPORTS = {
+    "RaptorConfig": ("core.config", "RaptorConfig"),
+    "get_logger": ("core.logging", "get_logger"),
+    "logger": ("core.hash._logging", "logger"),
+}
+for _cached_export in _LAZY_EXPORTS:
+    globals().pop(_cached_export, None)
+del _cached_export
 
-logger = get_logger()
+
+def __getattr__(name: str):
+    spec = _LAZY_EXPORTS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    module_name, attribute = spec
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
+
+
+def _export(name: str):
+    if name in globals():
+        return globals()[name]
+    return __getattr__(name)
+
 
 _FS_ENCODING = "utf-8"
 _FS_ERRORS = "surrogateescape"
@@ -40,15 +73,19 @@ _MAX_FILE_SIZE_NO_CAP_THRESHOLD = 10 ** 12
 
 def sha256_tree(
     root: Path,
-    max_file_size: Optional[int] = None,
-    chunk_size: Optional[int] = None,
+    max_file_size: int | None = None,
+    chunk_size: int | None = None,
 ) -> str:
     """Hash a directory tree (filenames + contents).
 
     Args:
         root: Root directory to hash.
-        max_file_size: Skip files larger than this. None = config default
-            (RaptorConfig.MAX_FILE_SIZE_FOR_HASH). Pass 10**12 to disable.
+        max_file_size: Skip the CONTENT of files larger than this; the
+            skipped file's name and declared size are still mixed into
+            the digest under a domain-separated marker, so trees
+            differing only in an over-cap file never hash identically.
+            None = config default (RaptorConfig.MAX_FILE_SIZE_FOR_HASH).
+            Pass 10**12 to disable.
         chunk_size: Read chunk size. None = config default
             (RaptorConfig.HASH_CHUNK_SIZE). Affects only read efficiency,
             not the digest.
@@ -56,10 +93,11 @@ def sha256_tree(
     Returns:
         SHA256 hex digest of the directory tree.
     """
+    config = _export("RaptorConfig")
     if max_file_size is None:
-        max_file_size = RaptorConfig.MAX_FILE_SIZE_FOR_HASH
+        max_file_size = config.MAX_FILE_SIZE_FOR_HASH
     if chunk_size is None:
-        chunk_size = RaptorConfig.HASH_CHUNK_SIZE
+        chunk_size = config.HASH_CHUNK_SIZE
     # Pre-fix `chunk_size=1` (or any tiny value) was accepted
     # verbatim — a buggy caller passing 1 would byte-by-byte
     # read every file, turning a sub-second tree-hash into a
@@ -74,10 +112,11 @@ def sha256_tree(
 
     h = hashlib.sha256()
     skipped = []
-    # `os.walk(followlinks=False)` instead of `rglob` so we don't
-    # follow symlinks during tree enumeration. Pre-fix `rglob`
-    # follows symlinks by default on Python < 3.13. Three failure
-    # modes:
+    # `os.walk(followlinks=False)` instead of `rglob` so the
+    # no-follow guarantee is explicit (`rglob` recurses into dir
+    # symlinks only via 3.13's `recurse_symlinks=True` opt-in; it's
+    # `glob.glob(recursive=True)` that followed them by default).
+    # Three failure modes guarded against:
     #   1. Symlink loop in the target tree → infinite enumeration,
     #      hash never completes.
     #   2. Symlink to a directory OUTSIDE root → that external
@@ -141,27 +180,42 @@ def sha256_tree(
     #     warning when the cap is hit (default: 100x
     #     max_file_size — operators can set MAX_TREE_HASH_BYTES
     #     in config to override).
+    #   * Mix a truncation marker into the digest when the cap
+    #     fires, so a truncated tree can never hash-collide with
+    #     an untruncated tree that happens to contain only the
+    #     hashed prefix.
     import os as __os
+    from contextlib import closing
+    from core.source.streams import owned_fd, preserving_stream_error
+
+    def close_read_fd(descriptor):
+        # Preserve best-effort pre-adoption closes and strict stream closes.
+        try:
+            __os.close(descriptor)
+        except OSError:
+            if stream_adopted:
+                raise
+
+    # max_file_size was defaulted from config above, so it is never
+    # None here — the fallback is simply 100x the per-file cap.
     cumulative_cap = getattr(
-        RaptorConfig, "MAX_TREE_HASH_BYTES",
-        100 * (max_file_size if max_file_size is not None else 100 * 1024 * 1024),
+        config, "MAX_TREE_HASH_BYTES", 100 * max_file_size,
     )
     cumulative_bytes = 0
-    truncated = False
+    truncated_at: str | None = None
     for p in all_files:
         if not p.is_file():
             continue
         try:
-            fd = __os.open(
-                str(p),
-                __os.O_RDONLY | __os.O_NOFOLLOW | getattr(__os, "O_CLOEXEC", 0),
-            )
+            from core.atomic_fs import open_hardened_read
+            fd = open_hardened_read(p)
         except OSError:
             # ELOOP on race-introduced symlink, ENOENT on
             # race-removed file, EACCES on race-changed perms
             # — all best-effort skip.
             continue
-        try:
+        stream_adopted = False
+        with owned_fd(fd, close_fd=close_read_fd):
             st = __os.fstat(fd)
             # The `< _MAX_FILE_SIZE_NO_CAP_THRESHOLD` test treats any
             # value >= 1 TiB as the "no per-file cap" sentinel. Pre-fix
@@ -181,34 +235,81 @@ def sha256_tree(
             if (max_file_size is not None
                     and max_file_size < _MAX_FILE_SIZE_NO_CAP_THRESHOLD
                     and st.st_size > max_file_size):
-                skipped.append(str(p.relative_to(root)))
+                rel = p.relative_to(root).as_posix()
+                skipped.append(rel)
+                # Mix a domain-separated SKIP record — name + declared
+                # size, never content (the gate exists to not read the
+                # bytes). Silently omitting the file made trees
+                # differing only in an over-cap file hash identically,
+                # so a stale artifact kept validating as fresh against
+                # a tree whose large file had been added or swapped.
+                # Same NUL-framed marker scheme as the cumulative-cap
+                # truncation record below: POSIX filenames cannot
+                # contain NUL, so no unskipped tree's name/content
+                # stream can reproduce it.
+                h.update(b"\x00[sha256_tree:skipped:")
+                h.update(rel.encode(_FS_ENCODING, errors=_FS_ERRORS))
+                h.update(b":")
+                h.update(str(st.st_size).encode("ascii"))
+                h.update(b"]\x00")
                 continue
             if cumulative_bytes + st.st_size > cumulative_cap:
-                truncated = True
+                truncated_at = p.relative_to(root).as_posix()
                 break
-            # surrogateescape round-trips non-UTF-8 bytes in filenames; plain
-            # .encode() raises UnicodeEncodeError for those.
-            h.update(p.relative_to(root).as_posix().encode(
+            # Length-framed per-file record. Pre-fix the relpath bytes
+            # and content bytes were concatenated raw into ONE running
+            # digest — no separator or length framing — so name/content
+            # boundary shifts collided trivially ({'a': 'bc'} and
+            # {'ab': 'c'} both hashed as sha256('abc')). Now each
+            # record is <name-len (8B LE)> <name bytes> <content
+            # sha256 digest> — unambiguously parseable, so distinct
+            # trees can no longer share a digest by moving bytes
+            # across the name/content boundary. (Digest values change
+            # for every tree vs the pre-fix scheme; in-tree consumers
+            # only stamp the value into run manifests as provenance —
+            # nothing caches across the change.)
+            #
+            # surrogateescape round-trips non-UTF-8 bytes in filenames;
+            # plain .encode() raises UnicodeEncodeError for those.
+            name_bytes = p.relative_to(root).as_posix().encode(
                 _FS_ENCODING, errors=_FS_ERRORS,
-            ))
-            with __os.fdopen(fd, "rb") as f:
-                fd = -1  # fdopen now owns it; don't close twice
-                for chunk in iter(lambda: f.read(chunk_size), b""):
-                    h.update(chunk)
+            )
+            h.update(len(name_bytes).to_bytes(8, "little"))
+            h.update(name_bytes)
+            content_h = hashlib.sha256()
+            stream = __os.fdopen(fd, "rb", closefd=False)
+            stream_adopted = True
+            with preserving_stream_error(closing(stream)) as f:
+                # Bound the read to the fstat'd size. Without this,
+                # a file that grows between fstat and read defeats
+                # both the per-file gate and the cumulative cap the
+                # fstat was meant to make authoritative — the read
+                # loop would consume the grown contents to EOF. For
+                # stable files this reads exactly st.st_size bytes,
+                # so digests remain chunk-size-independent.
+                remaining = st.st_size
+                while remaining > 0:
+                    chunk = f.read(min(chunk_size, remaining))
+                    if not chunk:
+                        break  # file shrank mid-read; racy anyway
+                    content_h.update(chunk)
                     cumulative_bytes += len(chunk)
-        finally:
-            if fd >= 0:
-                try:
-                    __os.close(fd)
-                except OSError:
-                    pass
+                    remaining -= len(chunk)
+            h.update(content_h.digest())
     if skipped:
-        logger.debug(f"Skipped {len(skipped)} large files during hashing")
-    if truncated:
-        logger.warning(
-            f"sha256_tree: hit cumulative byte cap "
-            f"({cumulative_cap} bytes) on {root}; "
-            f"hash reflects partial tree only"
+        _export("logger").debug("Skipped %s large files during hashing", len(skipped))
+    if truncated_at is not None:
+        # Domain-separate truncated digests: mix a marker plus the
+        # relpath of the file that tripped the cap. NUL bytes cannot
+        # appear in POSIX filenames, so no untruncated tree's
+        # filename stream can reproduce the marker — a truncated
+        # hash can no longer collide with the hash of a tree that
+        # contains only the hashed prefix.
+        h.update(b"\x00[sha256_tree:truncated:")
+        h.update(truncated_at.encode(_FS_ENCODING, errors=_FS_ERRORS))
+        h.update(b"]\x00")
+        _export("logger").warning(
+            "sha256_tree: hit cumulative byte cap (%s bytes) on %s at %s; hash reflects partial tree only (truncation marker mixed in)", cumulative_cap, root, truncated_at
         )
     return h.hexdigest()
 
@@ -218,19 +319,39 @@ def _chunk_floor(chunk_size: int) -> int:
     return max(int(chunk_size), 4096)
 
 
-def sha256_file(path: Path, chunk_size: Optional[int] = None) -> str:
+def sha256_file(path: Path, chunk_size: int | None = None) -> str:
     """Hash a single file, streaming in chunks (no full-file load).
 
     Use this in preference to ``hashlib.sha256(path.read_bytes())`` —
     streaming avoids OOM on multi-GB files.
+
+    NB: this opens BY NAME (and follows symlinks). When the digest is
+    a trust decision about an attacker-swappable path, open the file
+    fd-honest first (``core.source.open_regular``) and hash the opened
+    stream with :func:`sha256_fileobj` so the bytes hashed are the
+    bytes of the inode you verified.
+    """
+    from core.source.streams import preserving_stream_error
+
+    with preserving_stream_error(Path(path).open("rb")) as f:
+        return sha256_fileobj(f, chunk_size)
+
+
+def sha256_fileobj(f: BinaryIO, chunk_size: int | None = None) -> str:
+    """Hash an already-open binary stream from its CURRENT position.
+
+    The fd-honest sibling of :func:`sha256_file`: the caller owns the
+    open (and any O_NOFOLLOW / fstat discipline that came with it), so
+    check and use share one file description — nothing is re-opened by
+    name between them. The stream is left positioned at EOF; seek(0)
+    first to re-hash a stream already read once.
     """
     if chunk_size is None:
-        chunk_size = RaptorConfig.HASH_CHUNK_SIZE
+        chunk_size = _export("RaptorConfig").HASH_CHUNK_SIZE
     chunk_size = _chunk_floor(chunk_size)
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+    for chunk in iter(lambda: f.read(chunk_size), b""):
+        h.update(chunk)
     return h.hexdigest()
 
 

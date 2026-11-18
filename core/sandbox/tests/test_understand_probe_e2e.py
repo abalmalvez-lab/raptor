@@ -56,6 +56,7 @@ class TestUnderstandProbeFlowE2E(unittest.TestCase):
                 and check_ptrace_available()):
             self.skipTest("observe prerequisites unavailable")
 
+    @pytest.mark.slow
     def test_full_probe_flow_correlates_entry_points(self):
         from core.sandbox import run as sandbox_run
         from core.sandbox.observe_profile import (
@@ -160,8 +161,8 @@ class TestUnderstandProbeFlowE2E(unittest.TestCase):
                 )
                 self.assertNotIn(
                     "EP-ADMIN", confirmed,
-                    f"EP-ADMIN was not probed; runtime confirmation "
-                    f"is a false positive",
+                    "EP-ADMIN was not probed; runtime confirmation "
+                    "is a false positive",
                 )
 
                 # SINK-DB was not probed for write. Should not be

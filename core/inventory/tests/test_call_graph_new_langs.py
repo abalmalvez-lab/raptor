@@ -18,6 +18,7 @@ from core.inventory.call_graph import (
     INDIRECTION_WILDCARD_IMPORT,
     extract_call_graph_csharp,
     extract_call_graph_javascript,
+    extract_call_graph_lua,
     extract_call_graph_php,
     extract_call_graph_ruby,
     extract_call_graph_rust,
@@ -52,6 +53,23 @@ def test_rust_use_list():
 def test_rust_use_wildcard_flagged():
     g = extract_call_graph_rust("use foo::*;\n")
     assert INDIRECTION_WILDCARD_IMPORT in g.indirection
+
+
+def test_rust_reflect_masking():
+    # Type-erased dispatch (Any::downcast family, transmute) hides the
+    # concrete target → flag the file REFLECT so its functions hedge to
+    # uncertain. Caught through the turbofish ``generic_function`` wrapper
+    # (the common ``downcast_ref::<T>()`` form emits no normal chain edge).
+    assert INDIRECTION_REFLECT in extract_call_graph_rust(
+        "fn f(x: &dyn Any) { x.downcast_ref::<Foo>(); }\n").indirection
+    assert INDIRECTION_REFLECT in extract_call_graph_rust(
+        "fn f(b: Box<dyn Any>) { b.downcast::<Foo>(); }\n").indirection
+    assert INDIRECTION_REFLECT in extract_call_graph_rust(
+        "fn f() { let p: fn() = unsafe { std::mem::transmute(a) }; p(); }\n"
+    ).indirection
+    # plain calls must NOT be flagged.
+    assert INDIRECTION_REFLECT not in extract_call_graph_rust(
+        "fn f() { helper(); other.method(); }\n").indirection
 
 
 def test_rust_scoped_call():
@@ -183,17 +201,19 @@ pytest.importorskip("tree_sitter_php")
 
 
 def test_php_use_simple():
+    # Dot-joined, like package_name: the resolver compares dot-form
+    # module paths, so a backslash-joined binding can never match.
     g = extract_call_graph_php(
         '<?php\nuse Foo\\Bar\\Baz;\n'
     )
-    assert g.imports == {"Baz": "Foo\\Bar\\Baz"}
+    assert g.imports == {"Baz": "Foo.Bar.Baz"}
 
 
 def test_php_use_alias():
     g = extract_call_graph_php(
         '<?php\nuse Foo\\Bar as B;\n'
     )
-    assert g.imports == {"B": "Foo\\Bar"}
+    assert g.imports == {"B": "Foo.Bar"}
 
 
 def test_php_static_call():
@@ -658,3 +678,146 @@ def test_js_class_expression_assigned_to_const():
     method_names = [m[0] for m in foo.methods]
     assert "method" in method_names
     assert "helper" in method_names
+
+
+# ---------------------------------------------------------------------------
+# Lua
+# ---------------------------------------------------------------------------
+
+_LUA_TS_AVAILABLE = True
+try:
+    import tree_sitter_lua  # noqa: F401
+except ImportError:
+    _LUA_TS_AVAILABLE = False
+
+
+@pytest.mark.skipif(not _LUA_TS_AVAILABLE,
+                    reason="tree-sitter-lua not installed")
+class TestLuaCallGraph:
+
+    def test_require_import(self):
+        g = extract_call_graph_lua(
+            'local uci = require("luci.model.uci")\n'
+            'uci.cursor()\n',
+        )
+        assert "uci" in g.imports
+        assert g.imports["uci"] == "luci.model.uci"
+
+    def test_dot_call(self):
+        g = extract_call_graph_lua(
+            'local http = require("luci.http")\n'
+            'http.redirect("/cgi-bin/luci")\n',
+        )
+        chains = [tuple(c.chain) for c in g.calls]
+        assert ("http", "redirect") in chains
+
+    def test_colon_method_call(self):
+        g = extract_call_graph_lua(
+            'function M.run(self)\n'
+            '  self:dispatch()\n'
+            'end\n',
+        )
+        chains = [tuple(c.chain) for c in g.calls]
+        assert ("self", "dispatch") in chains
+
+    def test_pcall_records_callee(self):
+        g = extract_call_graph_lua(
+            'pcall(dangerous, 1, 2)\n',
+        )
+        chains = [tuple(c.chain) for c in g.calls]
+        assert ("dangerous",) in chains
+
+    def test_loadstring_indirection(self):
+        g = extract_call_graph_lua(
+            'loadstring("return 1")()\n',
+        )
+        assert INDIRECTION_EVAL in g.indirection
+
+    def test_nested_dot_chain(self):
+        g = extract_call_graph_lua(
+            'luci.model.uci.cursor()\n',
+        )
+        chains = [tuple(c.chain) for c in g.calls]
+        assert ("luci", "model", "uci", "cursor") in chains
+
+    def test_dofile_import(self):
+        g = extract_call_graph_lua(
+            'dofile("/usr/lib/lua/helper.lua")\n',
+        )
+        assert "helper" in g.imports
+
+    def test_enclosing_function(self):
+        g = extract_call_graph_lua(
+            'function dispatch(req)\n'
+            '  route(req)\n'
+            'end\n',
+        )
+        route_calls = [c for c in g.calls if c.chain == ["route"]]
+        assert len(route_calls) == 1
+        assert route_calls[0].caller == "dispatch"
+
+
+# ---------------------------------------------------------------------------
+# Ruby — sigiled-variable receivers
+# ---------------------------------------------------------------------------
+
+
+class TestRubyVariableReceivers:
+    """``@service.fetch()`` previously mis-parsed: the ivar matched no
+    branch, the METHOD identifier became the receiver, and the bare
+    ``["fetch"]`` chain minted a false definitive edge to any same-file
+    ``def fetch``."""
+
+    def test_ivar_receiver_keeps_sigil_head(self):
+        g = extract_call_graph_ruby(
+            "class C\n"
+            "  def go\n"
+            "    @service.fetch(1)\n"
+            "  end\n"
+            "  def fetch\n"
+            "  end\n"
+            "end\n"
+        )
+        chains = [c.chain for c in g.calls]
+        assert ["@service", "fetch"] in chains
+        assert ["fetch"] not in chains  # no false internal edge
+
+    def test_self_chain_keeps_self_head(self):
+        g = extract_call_graph_ruby(
+            "class C\n  def go\n    self.service.fetch(2)\n  end\nend\n"
+        )
+        chains = [c.chain for c in g.calls]
+        assert ["self", "service", "fetch"] in chains
+
+    def test_self_method_still_narrows_to_class(self):
+        g = extract_call_graph_ruby(
+            "class C\n  def go\n    self.helper\n    self.a.b\n  end\nend\n"
+        )
+        per = {tuple(c.chain): c.receiver_class for c in g.calls}
+        # Exactly self.<method> narrows; longer chains dispatch on the
+        # intermediate receiver's class.
+        assert per.get(("self", "helper")) == "C"
+        assert per.get(("self", "a", "b")) is None
+
+
+# ---------------------------------------------------------------------------
+# PHP — variable-variable callables + receiver narrowing
+# ---------------------------------------------------------------------------
+
+
+def test_php_variable_variable_call_flags_reflect():
+    """``$$x()`` (dynamic_variable_name) is the same unknowable
+    dispatch as ``$x()``; it previously fell through with no flag."""
+    g = extract_call_graph_php("<?php function f() { $$x(); } ?>")
+    assert INDIRECTION_REFLECT in g.indirection
+
+
+def test_php_this_field_chain_not_tagged_with_enclosing_class():
+    g = extract_call_graph_php(
+        "<?php class W {\n"
+        "  function m() { $this->helper->render(); $this->draw(); }\n"
+        "} ?>"
+    )
+    per = {tuple(c.chain): c.receiver_class for c in g.calls}
+    assert per.get(("this", "helper", "render")) is None
+    assert per.get(("this", "draw")) == "W"

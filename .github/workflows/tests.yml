@@ -7,34 +7,53 @@ on:
     branches: [ main ]
   merge_group:
   schedule:
-    # Daily full-suite run catches indirect breakage a path filter
-    # would miss (e.g. a refactor breaks an API contract without
-    # touching the tests that exercise it). Daily rather than weekly
-    # given the codebase's churn rate.
-    - cron: '0 6 * * *'
+    # Twice-weekly full-suite (force_full) run catches cross-tier
+    # breakage a path filter would miss — e.g. a refactor changes an
+    # API that another package's tests exercise, but the PR only
+    # touched the first package's paths so the second tier was
+    # skipped. PR + push-to-main are path-filtered; merge_group is the
+    # only other full-unfiltered run, and only fires when something is
+    # going through the merge queue. Mon+Thu keeps blind-spot latency
+    # under ~3-4 days on a quiet (no-merge) stretch while halving the
+    # redundant compute the old daily cron paid on active days.
+    - cron: '0 6 * * 1,4'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Finish active main runs; GitHub coalesces newer pending pushes.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  PYTHON_VERSION: '3.12'
+  PYTHON_VERSION: '3.14'
   VENV_PATH: .venv
-  # Opt the runner into Node.js 24 for JavaScript actions.
-  # GitHub deprecated Node.js 20 on 2025-09-19; runners enforce
-  # Node 24 by default from 2026-06-02 and remove Node 20 on
-  # 2026-09-16. astral-sh/setup-uv@v8.1.0 (and several others
-  # pinned in this workflow) still declares ``runs.using: node20``
-  # in its action.yml, so without this opt-in the runner emits a
-  # deprecation warning for every JS-action step. Lift this once
-  # all pinned JS actions ship a Node 24 release.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # CI-only hang net: dump every worker's Python stack if any single
+  # test runs >120s, then let it continue (the dump is the signal, not
+  # a failure). The slowest legit default-tier test is a few seconds,
+  # and the one slow/integration invocation here (the sandbox job's
+  # second step) completes in ~90s serial END TO END — so 120s only
+  # fires on a genuine hang, surfacing the stuck call in ~2 min instead
+  # of waiting out the job timeout. Set via PYTEST_ADDOPTS (not
+  # pytest.ini) so it covers every tier here but NOT local `pytest`,
+  # where it would dump on pdb / breakpoint sessions.
+  PYTEST_ADDOPTS: "-o faulthandler_timeout=120"
+  # Default-tier slow-test guard (root conftest.py). Fails the run if any
+  # test's call phase exceeds this many seconds — the preventive backstop
+  # for "real I/O that should be mocked" landing in the fast tier (the
+  # 14s/20s/84s class the --durations sweep found). 10s is well above the
+  # slowest legit default-tier test (~3s) with headroom for runner
+  # variance, and well below faulthandler's 120s hang net. NOT set in
+  # nightly.yml — its `-m "slow or integration"` tests are legitimately
+  # slow. A genuinely-heavy new test should be marked @pytest.mark.slow.
+  RAPTOR_MAX_TEST_SECONDS: "10"
+  # Randomise test execution order per CI run so order-dependent
+  # failures surface early. The run_id is numeric and unique, so
+  # each run shuffles differently but is reproducible from the ID.
+  RAPTOR_RANDOMISE_TESTS: ${{ github.run_id }}
 
 permissions:
   contents: read
-  # Needed by the pre_check job to query prior workflow runs at the
-  # current SHA via ``gh api repos/.../actions/runs``.
+  # The scope job reads successful nightly timing artifacts.
   actions: read
   # Needed by the ``changes`` job's ``gh api repos/.../pulls/.../files``
   # query to compute the changed-file list for path filtering. Covered
@@ -43,69 +62,69 @@ permissions:
   pull-requests: read
 
 jobs:
-  # Skip the workflow if a previous successful run of this same workflow
-  # already passed at the exact same commit SHA — catches the
-  # "PR fast-forward-merged → main push reruns the same SHA" case and
-  # explicit re-runs. Doc-only / .claude-only PRs are skipped naturally
-  # by the per-job path-filter gate in `changes`, not here.
-  pre_check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      should_skip: ${{ steps.dup.outputs.should_skip }}
-    steps:
-      - id: dup
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          WORKFLOW: ${{ github.workflow }}
-          SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-          should_skip=false
-          # Never dedup forced-full events: the operator triggered them
-          # deliberately (cron, manual dispatch) or the merge queue needs
-          # an authoritative pass.
-          if [[ "$EVENT" != "schedule" && "$EVENT" != "workflow_dispatch" \
-             && "$EVENT" != "merge_group" ]]; then
-            dup=$(gh api -X GET "repos/${REPO}/actions/runs" \
-                    -f "head_sha=${SHA}" -f "status=success" \
-                    --jq ".workflow_runs[] | select(.name==\"${WORKFLOW}\" and .id != ${RUN_ID}) | .id" \
-                  | head -n1 || true)
-            if [[ -n "${dup:-}" ]]; then
-              should_skip=true
-              echo "Skipping: prior successful run ${dup} already covered SHA ${SHA}"
-            fi
-          fi
-          echo "should_skip=${should_skip}" >> "$GITHUB_OUTPUT"
-
-  # Path-filter equivalent of dorny/paths-filter, implemented with the
-  # GitHub API for changed-file enumeration and a small in-tree Python
-  # script (``.github/scripts/compute_filters.py``) for glob matching.
-  # The script's FILTERS dict is the single source of truth, also
-  # imported by ``.github/tests/test_filter_coverage.py``.
+  # Changed-file enumeration via GitHub API, then import-graph-based
+  # test dispatch via test_scope.py.  CodeQL per-language filters
+  # (codeql_python, codeql_cpp, codeql_actions) live in codeql.yml's
+  # own changes job — this job handles test tiers only.
+  #
+  # The scope step always runs (even on force_full / schedule /
+  # merge_group) so that downstream jobs receive file lists and
+  # matrices.  Without --changed-files, test_scope.py falls back to
+  # full dispatch internally — every gate is set to true and every
+  # file list is populated from disk.
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # 5 rather than 2: the best-effort durations step downloads the
+    # shuffled-nightly junit artifacts, and a job-level timeout kill
+    # would override that step's continue-on-error.
+    timeout-minutes: 5
     outputs:
-      python: ${{ steps.filter.outputs.python }}
-      sandbox: ${{ steps.filter.outputs.sandbox }}
-      exploit_feasibility: ${{ steps.filter.outputs.exploit_feasibility }}
-      prompt_audit: ${{ steps.filter.outputs.prompt_audit }}
-      ci_lint: ${{ steps.filter.outputs.ci_lint }}
-      codeql: ${{ steps.filter.outputs.codeql }}
-      llm_analysis: ${{ steps.filter.outputs.llm_analysis }}
-      cve_diff: ${{ steps.filter.outputs.cve_diff }}
-      fuzzing: ${{ steps.filter.outputs.fuzzing }}
-      sage: ${{ steps.filter.outputs.sage }}
-      orchestration: ${{ steps.filter.outputs.orchestration }}
-      force_full: ${{ steps.force.outputs.force_full }}
+      # Fork PRs use runner rebuilds instead of private GHCR images.
+      pkg_access: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      # Per-tier gates (true/false).
+      python: ${{ steps.scope.outputs.python }}
+      sandbox: ${{ steps.scope.outputs.sandbox }}
+      sandbox_macos: ${{ steps.macos_scope.outputs.run }}
+      sandbox_macos_files: ${{ steps.macos_scope.outputs.files }}
+      sandbox_macos_audit: ${{ steps.macos_scope.outputs.native_audit }}
+      exploit_feasibility: ${{ steps.scope.outputs.exploit_feasibility }}
+      prompt_audit: ${{ steps.scope.outputs.prompt_audit }}
+      ci_lint: ${{ steps.scope.outputs.ci_lint }}
+      codeql: ${{ steps.scope.outputs.codeql }}
+      llm_analysis: ${{ steps.scope.outputs.llm_analysis }}
+      cve_diff: ${{ steps.scope.outputs.cve_diff }}
+      fuzzing: ${{ steps.scope.outputs.fuzzing }}
+      sage: ${{ steps.scope.outputs.sage }}
+      orchestration: ${{ steps.scope.outputs.orchestration }}
+      sca: ${{ steps.scope.outputs.sca }}
+      sca_matrix: ${{ steps.sca_matrix.outputs.matrix }}
+      source_intel: ${{ steps.scope.outputs.source_intel }}
+      engine: ${{ steps.scope.outputs.engine }}
+      # Dynamic batch matrix for the fast tier (JSON for fromJSON()).
+      python_matrix: ${{ steps.balance.outputs.python_matrix || steps.scope.outputs.python_matrix }}
+      # Per-tier affected file lists (space-separated paths).
+      sandbox_files: ${{ steps.scope.outputs.sandbox_files }}
+      exploit_feasibility_files: ${{ steps.scope.outputs.exploit_feasibility_files }}
+      codeql_files: ${{ steps.scope.outputs.codeql_files }}
+      llm_analysis_files: ${{ steps.scope.outputs.llm_analysis_files }}
+      cve_diff_files: ${{ steps.scope.outputs.cve_diff_files }}
+      fuzzing_files: ${{ steps.scope.outputs.fuzzing_files }}
+      sage_files: ${{ steps.scope.outputs.sage_files }}
+      orchestration_files: ${{ steps.scope.outputs.orchestration_files }}
+      sca_files: ${{ steps.scope.outputs.sca_files }}
+      source_intel_files: ${{ steps.scope.outputs.source_intel_files }}
+      engine_files: ${{ steps.scope.outputs.engine_files }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Resolve verified push base
+        id: push_base
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci_push_base.py --workflow tests.yml --compare-out "$RUNNER_TEMP/verified-push-compare.json"
 
       - id: force
         env:
@@ -125,27 +144,59 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BEFORE: ${{ github.event.before }}
+          BEFORE: ${{ steps.push_base.outputs.base }}
           AFTER: ${{ github.event.after }}
+          VERIFIED_COMPARE: ${{ steps.push_base.outputs.compare }}
         run: |
           set -euo pipefail
           out=/tmp/changed_files.txt
           : > "$out"
+          # ``--jq`` expressions use ``?`` + ``// []`` to suppress jq's
+          # ``cannot iterate over: null`` error on responses that are
+          # an error object (non-array) — very large PRs or transient
+          # API failures. We treat "no list" the same as the
+          # first-push case: fall through to compute_filters and
+          # force all filters true.
+          #
+          # Renames also emit ``previous_filename``: the OLD path of a
+          # renamed module is what other files still import, and
+          # test_scope.py resolves dependents from the changed paths —
+          # with only the new name in the list, the broken importers
+          # were never seeded and the PR dispatched zero tiers.
           case "$EVENT" in
             pull_request|pull_request_target)
               gh api --paginate \
                 "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-                --jq '.[].filename' >> "$out"
+                --jq '(. // [])[]? | .filename, (.previous_filename // empty)' >> "$out"
               ;;
             push)
-              if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
                 # First push to a new branch — no diff base. Fall through
                 # to the no-list path so compute_filters forces all true.
                 rm -f "$out"
               else
-                gh api --paginate \
-                  "repos/${REPO}/compare/${BEFORE}...${AFTER}" \
-                  --jq '.files[].filename' >> "$out"
+                # The compare API caps ``files`` at 300 entries and
+                # silently returns the FIRST 300 for a bigger diff —
+                # the key stays present, so the "no list" fail-open
+                # path never fires on truncation and every file past
+                # #300 would lose its dispatch (this repo lands
+                # multi-hundred-file patch trains as direct pushes).
+                # At the cap we cannot know what fell off: discard
+                # the list and fall through to full dispatch. Only
+                # ``.filename`` entries count toward the cap check —
+                # ``previous_filename`` rename companions don't.
+                resp=${VERIFIED_COMPARE:-/tmp/compare_response.json}
+                if [[ -z "${VERIFIED_COMPARE:-}" ]]; then
+                  gh api --paginate \
+                    "repos/${REPO}/compare/${BEFORE}...${AFTER}" > "$resp"
+                fi
+                jq -r '(.files // [])[]? | .filename, (.previous_filename // empty)' \
+                  "$resp" >> "$out"
+                files_n=$(jq -r '(.files // [])[]?.filename' "$resp" | wc -l)
+                if (( files_n >= 300 )); then
+                  echo "::notice::compare listed ${files_n} files — at the API's 300-file cap, list may be truncated; forcing full dispatch"
+                  rm -f "$out"
+                fi
               fi
               ;;
             *)
@@ -161,141 +212,329 @@ jobs:
             cat "$out"
           fi
 
-      - id: filter
+      # Import-graph-based test dispatch. Builds the reverse import
+      # graph with stdlib ast, walks outward from changed files, and
+      # maps affected test files to their CI tier. Falls back to full
+      # dispatch (all gates true, all file lists populated) when no
+      # changed-file list is available — covers force_full, first
+      # push to a new branch, and API truncation.
+      - id: scope
+        run: |
+          python3 .github/scripts/test_scope.py \
+            ${CHANGED_FILES_LIST:+--changed-files "$CHANGED_FILES_LIST"} \
+            --repo . --python-matrix-out "$RUNNER_TEMP/python-matrix.json"
         env:
           CHANGED_FILES_LIST: ${{ steps.changed_files.outputs.list }}
+
+      - name: Select sandbox files requiring macOS
+        id: macos_scope
+        env:
+          SCOPE_MODE: ${{ steps.scope.outputs.scope_mode }}
+          SANDBOX_FILES: ${{ steps.scope.outputs.sandbox_files }}
+        run: python3 .github/scripts/macos_test_scope.py
+
+      - id: sca_matrix
+        run: python3 .github/scripts/sca_test_matrix.py
+        env:
+          SCA_FILES: ${{ steps.scope.outputs.sca_files }}
+
+      # Scope first: docs and non-fast tiers do not need nightly artifacts.
+      # Best-effort per-test durations for the batch partitioner: pull
+      # the latest successful shuffled-nightly junit artifacts and
+      # convert them to a durations file so test_scope.py can balance
+      # batches by measured runtime instead of file count. Everything
+      # here is optional-quality-signal, never a gate: the step
+      # no-ops when the converter script is absent, when no successful
+      # nightly run exists yet, or when the artifacts have expired —
+      # and continue-on-error keeps any surprise failure from blocking
+      # dispatch (scope falls back to its no-durations behaviour on an
+      # empty path).
+      - id: durations
+        if: steps.scope.outputs.python == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SELECTED_MATRIX_FILE: ${{ steps.scope.outputs.python_matrix_file }}
         run: |
-          python3 .github/scripts/compute_filters.py
+          set -euo pipefail
+          [ -f .github/scripts/junit_durations.py ] || exit 0
+          # Timing data cannot improve a single batch. Keep the matrix in its
+          # file transport so broad selections cannot exceed environment limits.
+          python3 - <<'PYTHON' || exit 0
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          try:
+              selected = json.loads(Path(os.environ["SELECTED_MATRIX_FILE"]).read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              sys.exit(1)
+          if not isinstance(selected, list) or len(selected) < 2:
+              sys.exit(1)
+          PYTHON
+          run_id=$(gh api \
+            "repos/${REPO}/actions/workflows/nightly_shuffled.yml/runs?status=success&per_page=1" \
+            --jq '(.workflow_runs // [])[0].id // empty')
+          [ -n "$run_id" ] || exit 0
+          dl_dir="${RUNNER_TEMP}/shuffled-junit"
+          mkdir -p "$dl_dir"
+          gh run download "$run_id" --repo "$REPO" \
+            --pattern 'nightly-shuffled-fast-iter-*' --dir "$dl_dir" || exit 0
+          xmls=$(find "$dl_dir" -name '*.xml' -type f)
+          [ -n "$xmls" ] || exit 0
+          durations_path="${RUNNER_TEMP}/test_durations.json"
+          # shellcheck disable=SC2086 — the xml paths are runner-local
+          # artifact files, one per matrix iteration; word-splitting is
+          # the intended argv shape.
+          python3 .github/scripts/junit_durations.py \
+            "$durations_path" $xmls
+          echo "path=$durations_path" >> "$GITHUB_OUTPUT"
+
+      # Carry the selected matrix in a runner-local file: a full selection is
+      # already close to Linux's per-environment-string size limit.
+      - id: balance
+        if: steps.scope.outputs.python == 'true' && steps.durations.outputs.path != '' && steps.scope.outputs.python_matrix_file != ''
+        continue-on-error: true
+        env:
+          SELECTED_MATRIX_FILE: ${{ steps.scope.outputs.python_matrix_file }}
+          RAPTOR_TEST_DURATIONS: ${{ steps.durations.outputs.path }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, ".github/scripts")
+          from test_scope import batch_matrix
+
+          selected = json.loads(Path(os.environ["SELECTED_MATRIX_FILE"]).read_text(encoding="utf-8"))
+          files = [Path(path) for batch in selected for path in batch["files"].split()]
+          matrix = batch_matrix(files)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("python_matrix=" + json.dumps(matrix) + "\n")
+          PYTHON
+
+      - name: Record verified push scope v1
+        if: github.event_name == 'push'
+        run: echo 'Cumulative push scope completed.'
 
   deps:
-    needs: [pre_check, changes]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.python == 'true' ||
-       needs.changes.outputs.sandbox == 'true' ||
+      (needs.changes.outputs.sandbox == 'true' ||
+       needs.changes.outputs.sca == 'true' ||
        needs.changes.outputs.exploit_feasibility == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # was v8.1.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
+
+      - name: Compute exact venv identity
+        id: venv-key
+        env:
+          VENV_CACHE_PREFIX: venv
+          VENV_CACHE_EXPORT_ARGS: ''
+        run: python3 .github/scripts/ci_cache_key.py
+
+      - name: Restore venv from cache
+        id: venv-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ steps.venv-key.outputs.key }}
 
       - name: Create venv and install deps
+        if: steps.venv-cache.outcome != 'success' || steps.venv-cache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
-          uv venv $VENV_PATH
+          uv venv --clear --python "$(command -v python3)" "$VENV_PATH"
           source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
+          uv export --locked --no-hashes | uv pip install -r -
 
       - name: Verify venv exists
         run: test -d "$VENV_PATH" || (echo "venv missing at $VENV_PATH" && exit 1)
 
-      - name: Upload venv for this run
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # was v7
+      - name: Save venv to cache
+        continue-on-error: true
+        if: steps.venv-cache.outcome != 'success' || steps.venv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
-          name: venv-${{ github.run_id }}
           path: ${{ env.VENV_PATH }}
-          include-hidden-files: true
-          retention-days: 1
+          key: ${{ steps.venv-key.outputs.key }}
 
-  # Fast tier: everything under core/ and packages/ except the two
-  # heavyweight subdirs that get their own jobs (sandbox, exploit_feasibility).
-  # Split 2-way via pytest-split so the slowest CI job runs in parallel.
-  # No .test_durations file is committed: pytest-split falls back to random
-  # distribution on first run and converges over subsequent runs. The
-  # max(group1, group2) wallclock is still well below the unsplit total
-  # even when unbalanced, so the saving is meaningful from day one.
+  # Fast tier: everything under core/ and packages/ except the heavyweight
+  # subdirs that get their own jobs (sandbox, exploit_feasibility, sca, and
+  # the container tiers). Batching is dynamic, not pytest-split: the
+  # ``changes`` job's test_scope.py partitions the affected test files into
+  # 1-8 balanced batches (the strategy matrix below), so a single-file PR
+  # gets one runner and a broad refactor fans out.
   python-unit-tests-fast:
-    needs: [pre_check, changes, deps]
+    name: python-unit-tests-fast (${{ matrix.batch }})
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.python == 'true')
-    runs-on: ubuntu-latest
+      needs.changes.outputs.python == 'true'
+    # Repo variable RAPTOR_FAST_RUNNER (Settings → Variables) upsizes
+    # the fast-tier batch runners, e.g. a larger hosted-runner label.
+    # Unset or empty, the expression falls back to ubuntu-latest.
+    runs-on: ${{ vars.RAPTOR_FAST_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # Dynamic batching: test_scope.py partitions affected test files
+      # into 1-8 balanced batches based on count. A single-file PR
+      # gets 1 runner; a broad refactor gets up to 8.
       matrix:
-        # 4-way split: ~2x parallelism uplift over the 2-way split for
-        # the same per-runner setup cost (venv download + compileall).
-        # Sweet spot before per-runner overhead dominates the wall-clock
-        # win — a 5th group would mostly buy queueing + setup, not test
-        # parallelism.
-        group: [1, 2, 3, 4]
+        include: ${{ fromJSON(needs.changes.outputs.python_matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
+      - name: Enable unprivileged user namespaces
+        uses: ./.github/actions/enable-userns
+
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
+      # Corpus pin validation requires native parsers. Share nightly's
+      # locked grammar profile, isolated from the base venv cache.
+      - name: Restore or rebuild venv (with grammars)
+        id: fast_venv
+        uses: ./.github/actions/setup-venv
         with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
+          cache-key-prefix: venv-grammars
+          uv-export-extra-args: --extra grammars
+          save-on-rebuild: 'true'
 
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
+      - name: Verify corpus definition parsers
+        run: |
+          source $VENV_PATH/bin/activate
+          python - <<'PYTHON'
+          from core.inventory.extractors import _ts_parser_for
+          for language in ("c", "go"):
+              if _ts_parser_for(language) is None:
+                  raise SystemExit(f"{language} parser unavailable; rebuild the venv-grammars cache")
+          PYTHON
 
       - name: Cache Python bytecode
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # was v5.0.5
+        id: pycache
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
-          # __pycache__ contents are deterministic per (Python version,
-          # source contents). Caching by source-tree hash recovers the
-          # ~10–30s `compileall` adds per runner. Cache miss is a no-op
-          # — `compileall` regenerates from scratch.
+          # Exact hits skip compilation. Prefix restores validate checked-hash
+          # entries and rebuild only missing, stale or malformed bytecode.
           path: |
             core/**/__pycache__
             packages/**/__pycache__
-          key: pycache-${{ env.PYTHON_VERSION }}-${{ hashFiles('core/**/*.py', 'packages/**/*.py') }}
+            __pycache__
+          key: pycache-v2-${{ steps.fast_venv.outputs.cache-key }}-${{ hashFiles('core/**/*.py', 'packages/**/*.py', '*.py', '.github/scripts/compile_checked_bytecode.py') }}
           restore-keys: |
-            pycache-${{ env.PYTHON_VERSION }}-
+            pycache-v2-${{ steps.fast_venv.outputs.cache-key }}-
 
       - name: Compile Python sources
+        # Skipped on an exact cache hit — see the cache step comment.
+        if: steps.pycache.outcome != 'success' || steps.pycache.outputs.cache-hit != 'true'
         run: |
           source $VENV_PATH/bin/activate
-          python -m compileall -q core packages *.py
+          # checked-hash: import validates by content, so the cached
+          # pycs stay valid across checkout mtime churn.
+          python .github/scripts/compile_checked_bytecode.py core packages *.py
 
-      - name: Run unit tests (fast tier, group ${{ matrix.group }} of 4)
+      - name: Start LLM hostname tripwire
         run: |
           source $VENV_PATH/bin/activate
-          # The prompt-envelope audit runs in its own narrowly-scoped
-          # job (python-prompt-audit) so it doesn't fire on unrelated
-          # Python changes. Exclude it here to avoid duplicate runs.
-          # The .github/tests filter-coverage suite has its own job so
-          # we don't pull it into the fast tier either.
-          # Heavy subsystems carved into their own gated jobs are
-          # ignored here too — see the dedicated `python-unit-tests-*`
-          # jobs further down.
-          pytest -n auto --splits 4 --group ${{ matrix.group }} core packages \
-            --ignore=core/sandbox/tests \
-            --ignore=packages/exploit_feasibility/tests \
-            --ignore=packages/codeql/tests \
-            --ignore=packages/llm_analysis/tests \
-            --ignore=packages/cve_diff/tests \
-            --ignore=packages/fuzzing/tests \
-            --ignore=packages/oss_forensics/tests \
-            --ignore=core/sage/tests \
-            --ignore=core/orchestration/tests \
-            --ignore=core/security/tests/test_prompt_envelope_audit.py
+          python core/testing/llm_hosts_tripwire.py prepare \
+            --directory "$RUNNER_TEMP/llm-hosts"
+          sudo "$PWD/$VENV_PATH/bin/python" "$PWD/core/testing/llm_hosts_tripwire.py" serve \
+            --directory "$RUNNER_TEMP/llm-hosts" --hosts-file /etc/hosts \
+            > "$RUNNER_TEMP/llm-hosts/server.log" 2>&1 &
+          python core/testing/llm_hosts_tripwire.py wait \
+            --directory "$RUNNER_TEMP/llm-hosts"
+
+      - name: Run unit tests (batch ${{ matrix.batch }})
+        env:
+          TEST_FILES: ${{ matrix.files }}
+        run: |
+          source $VENV_PATH/bin/activate
+          # File list comes from test_scope.py's import-graph analysis.
+          # No --ignore or --splits needed — the list is already the
+          # precise set of affected test files for this batch.
+          # --dist worksteal: idle workers steal from stragglers, so a
+          # tail of slow tests on one worker no longer sets the batch
+          # wallclock (measured 20-26% faster than the default load
+          # mode on a mixed-duration suite, identical pass/fail set).
+          # The shuffled nightly deliberately keeps --dist loadfile —
+          # its file-per-worker grouping is what bounds module/class
+          # fixture instantiation under the seeded shuffle.
+          set -f  # word-split $TEST_FILES without glob expansion
+          rc=0
+          python -m pytest -p core.testing.llm_tripwire \
+            --llm-tripwire-dir "$RUNNER_TEMP/llm-tripwire" \
+            --llm-tripwire-host-dir "$RUNNER_TEMP/llm-hosts" \
+            --junitxml="$RUNNER_TEMP/pytest-fast.xml" \
+            -n auto --dist worksteal $TEST_FILES || rc=$?
+          # Affected files may contain only slow/integration cases, owned by
+          # their separate tiers. Preserve every other pytest failure status.
+          if [ "$rc" -eq 5 ]; then
+            echo "No default-tier cases in this affected-file batch."
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Stop LLM hostname tripwire and check connections
+        if: always()
+        run: |
+          sudo "$PWD/$VENV_PATH/bin/python" "$PWD/core/testing/llm_hosts_tripwire.py" stop \
+            --directory "$RUNNER_TEMP/llm-hosts"
+
+      - name: Upload LLM tripwire evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: llm-tripwire-${{ matrix.batch }}
+          path: |
+            ${{ runner.temp }}/llm-tripwire/**/*.jsonl
+            ${{ runner.temp }}/llm-hosts/*.jsonl
+            ${{ runner.temp }}/llm-hosts/endpoints.json
+            ${{ runner.temp }}/llm-hosts/server.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload fast-tier test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-fast-${{ matrix.batch }}-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pytest-fast.xml
+          if-no-files-found: error
+          retention-days: 7
 
       # Note: the CLI smoke tests for raptor.py used to live at
       # test/test_cli_smoke.py with a dedicated group-1 step (to dodge
@@ -310,35 +549,98 @@ jobs:
       # dedicated job (`ci-lint-tests`) gated on `.github/**` changes
       # so a code-only PR doesn't pay for them.
 
-  # Sandbox tier: ~251 heavyweight tests doing real namespace/mount/seccomp
-  # work. Gated on sandbox-related path changes only.
-  python-unit-tests-sandbox:
-    needs: [pre_check, changes, deps]
+  # SCA tier: ~3,255 tests covering manifest parsers across 12 ecosystems,
+  # the dep-resolver fleet, the bumper, the supply-chain detectors, and
+  # the calibration substrate. The size class (≈30% of the broad ``python``
+  # fast tier's collected count) is why it gets carved out — a single
+  # cluster of that magnitude blew out one shard of the 4-way pytest-split
+  # before this carve-out. Small measured selections consolidate runners;
+  # unknown costs retain the historical four-way split.
+  python-unit-tests-sca:
+    needs: [changes, deps]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.sandbox == 'true')
+      needs.changes.outputs.sca == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.sca_matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
+      - name: Enable unprivileged user namespaces
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
+        with:
+          save-on-rebuild: 'true'
+
+      - name: Run SCA tests (group ${{ matrix.group }} of ${{ matrix.groups }})
+        env:
+          SCA_FILES: ${{ needs.changes.outputs.sca_files }}
+        run: |
+          source $VENV_PATH/bin/activate
+          set -f  # word-split $SCA_FILES without glob expansion
+          rc=0
+          python -m pytest -n auto --splits ${{ matrix.groups }} --group ${{ matrix.group }} \
+            --durations-path packages/sca/test-durations.json $SCA_FILES \
+            || rc=$?
+          # Exit 5 = "no tests collected" — legitimate when path filtering
+          # narrows SCA_FILES to fewer files than split groups.
+          if [ "$rc" -eq 5 ]; then exit 0; fi
+          exit "$rc"
+
+  # Sandbox tier: tests doing real namespace/mount/seccomp
+  # work. Gated on sandbox-related path changes only. Bounded xdist
+  # parallelism uses the existing runner; loadfile keeps each module
+  # and its shared fixtures/resources together. Single-file selections
+  # stay in process rather than starting an idle second worker.
+  python-unit-tests-sandbox:
+    needs: [changes, deps]
+    if: |
+      needs.changes.outputs.sandbox == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
+      - name: Enable unprivileged user namespaces
+        uses: ./.github/actions/enable-userns
+
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
         with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
+          save-on-rebuild: 'true'
 
       - name: Run sandbox tests
         run: |
@@ -347,45 +649,414 @@ jobs:
           # root on sys.path so `from core.security.redaction import ...`
           # in sandbox sources resolves. Bare pytest only works when
           # `core` is included in the args (e.g. `pytest core packages`).
-          python -m pytest core/sandbox/tests
+          set -f
+          workers="$(python .github/scripts/pytest_workers.py $SANDBOX_FILES)"
+          python -m pytest -n "$workers" --dist loadfile $SANDBOX_FILES
+        env:
+          SANDBOX_FILES: ${{ needs.changes.outputs.sandbox_files }}
+
+      # Darwin-emulation gate: the same sandbox files again with
+      # RAPTOR_TEST_EMULATE_PLATFORM=darwin (root conftest):
+      # sys.platform is patched to "darwin" PRE-collection, pytest's
+      # basetemp is relocated under a darwin-shaped
+      # /private/var/folders path, and every *_native-marked test is
+      # deselected (emulation never stacks on real kernel behaviour).
+      # Linux-authored assertions against platform-resolved values or
+      # the Linux tmp layout fail HERE, in the cheap Linux lane,
+      # instead of on the macOS runner — which keeps catching what
+      # only a real Darwin kernel can: the darwin_native tests
+      # themselves. This uses the same bounded worker selection as the
+      # Linux pass, including the gate's nested-pytest contract tests.
+      - name: Run sandbox tests (emulated darwin platform)
+        env:
+          SANDBOX_FILES: ${{ needs.changes.outputs.sandbox_files }}
+          RAPTOR_TEST_EMULATE_PLATFORM: darwin
+        run: |
+          source $VENV_PATH/bin/activate
+          set -f
+          rc=0
+          workers="$(python .github/scripts/pytest_workers.py $SANDBOX_FILES)"
+          python -m pytest -n "$workers" --dist loadfile $SANDBOX_FILES || rc=$?
+          # Exit 5 = "no tests collected" — legitimate when path
+          # filtering narrows SANDBOX_FILES to files that are entirely
+          # *_native-marked (all deselected under emulation).
+          if [ "$rc" -eq 5 ]; then exit 0; fi
+          exit "$rc"
+
+      # Second invocation: the sandbox/exploit-feasibility slow +
+      # integration tier. The root pytest.ini addopts deselect these
+      # markers, so before this step the tier's only CI execution was
+      # nightly.yml — a PR could merge a sandbox regression that sat
+      # invisible until (and unless) the next nightly was triaged.
+      # This uses two workers within the existing runner rather than
+      # earning a separate job
+      # (and, like the job itself, also runs on force_full events:
+      # merge queue, the twice-weekly cron, dispatch).
+      #
+      # The exploit-feasibility job carries a mirrored step gated on
+      # its own filter, covering exploit-feasibility-only PRs that do
+      # not fire the sandbox gate.
+      #
+      # Fixed directories, NOT $SANDBOX_FILES: this is a regression
+      # safety net over the whole heavyweight surface, not an
+      # import-scoped tier — file-list narrowing could drop exactly the
+      # test that would have caught the regression. Not routed through
+      # _tier.yml: both its paths hardcode RAPTOR_MAX_TEST_SECONDS=10
+      # (which fails every slow-marked test by design) and its image
+      # path runs in the slim deps container that cannot host the
+      # namespace/mount work these tests do.
+      - name: Run sandbox slow/integration tier
+        env:
+          # Blank out the workflow-level 10s per-test guard for this
+          # step only — slow-marked tests legitimately exceed it, same
+          # rationale as nightly.yml not setting it. Empty string
+          # disables (root conftest treats unset and empty alike).
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          source $VENV_PATH/bin/activate
+          python -m pytest -n 2 --dist loadfile -m "slow or integration" \
+            core/sandbox packages/exploit_feasibility
+
+  # macOS sandbox tier: runs the same core/sandbox/tests on a real Darwin
+  # host so the darwin_only enforcement tests (sandbox-exec write-blocking,
+  # network-blocking, audit JSONL, Seatbelt profile enforcement) actually
+  # execute. The Linux sandbox job above only runs the cross-platform
+  # subset; the skipif(sys.platform != "darwin") tests are invisible there.
+  # Free on public repos — no runner-minute cost.
+  python-unit-tests-sandbox-macos:
+    needs: [changes]
+    if: |
+      needs.changes.outputs.sandbox_macos == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
+
+      - name: Compute exact venv identity
+        id: venv-key
+        env:
+          VENV_CACHE_PREFIX: venv
+          VENV_CACHE_EXPORT_ARGS: ''
+        run: python3 .github/scripts/ci_cache_key.py
+
+      - name: Restore venv from cache
+        id: venv-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ steps.venv-key.outputs.key }}
+
+      - name: Create venv and install deps
+        if: steps.venv-cache.outcome != 'success' || steps.venv-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          uv venv --clear --python "$(command -v python3)" "$VENV_PATH"
+          source $VENV_PATH/bin/activate
+          uv export --locked --no-hashes | uv pip install -r -
+
+      - name: Save venv to cache
+        continue-on-error: true
+        if: steps.venv-cache.outcome != 'success' || steps.venv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ steps.venv-key.outputs.key }}
+
+      - name: Run sandbox tests (macOS)
+        id: sandbox
+        timeout-minutes: 8
+        env:
+          SANDBOX_FILES: ${{ needs.changes.outputs.sandbox_macos_files }}
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          set -f
+          workers="$(python .github/scripts/pytest_workers.py $SANDBOX_FILES)"
+          python -m pytest -n "$workers" --dist loadfile $SANDBOX_FILES -v \
+            --junitxml="$RUNNER_TEMP/sandbox-macos.xml" 2>&1 | tee "$RUNNER_TEMP/sandbox-macos.log"
+
+      - name: Run native audit checks (macOS slow)
+        id: native_audit
+        if: needs.changes.outputs.sandbox_macos_audit == 'true'
+        timeout-minutes: 4
+        env:
+          # Empty disables the default-tier guard; zero enforces a zero-second limit.
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          python -m pytest -m "slow and darwin_native" \
+            core/sandbox/tests/test_macos_spawn.py -v \
+            --junitxml="$RUNNER_TEMP/sandbox-macos-audit.xml" 2>&1 | tee "$RUNNER_TEMP/sandbox-macos-audit.log"
+
+      - name: Retain macOS sandbox diagnostics
+        timeout-minutes: 2
+        continue-on-error: true
+        if: always() && (steps.sandbox.outcome != 'skipped' || steps.native_audit.outcome != 'skipped')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sandbox-macos-diagnostics
+          path: |
+            ${{ runner.temp }}/sandbox-macos*.log
+            ${{ runner.temp }}/sandbox-macos*.xml
+          if-no-files-found: warn
+
+  # PR-time sandbox feature-matrix subset: the u24 image x the {full,
+  # default} lanes of the weekly sandbox-matrix.yml, run against the
+  # prebuilt GHCR image published by sandbox-matrix-image.yml
+  # (--skip-build). The degradation lattice's end-to-end signal was
+  # weekly-only, so a real lattice regression could sit invisible for
+  # days until the Saturday run (or a manual dispatch) surfaced it;
+  # these two lanes are the cheap high-yield subset — `default` is
+  # stock docker confinement, the lane that catches the userns-denied
+  # class, `full` is the all-features lane. Measured warm cost is
+  # ~37s per lane cell plus the image pull.
+  #
+  # The weekly full matrix stays untouched as the unfiltered backstop:
+  # both images, all five lanes, fresh image builds. Fork PRs cannot
+  # pull the private GHCR image (restricted read-only token), so they
+  # take the build-fallback path: run-matrix.sh without --skip-build
+  # builds the u24 image on the runner first — slower, never blocked,
+  # the same two-path story as _tier.yml's image/runner split for
+  # raptor-ci-deps. Like every gated tier, force_full events also run
+  # it — each merge-queue entry and the twice-weekly full-suite cron pay the
+  # ~1-2 min pull + two lanes; accepted, a red matrix SHOULD block a
+  # merge. Known residual: the sandbox gate is import-graph-computed,
+  # so a PR touching only the matrix harness scripts under
+  # core/sandbox/scripts/feature-matrix does not fire this job —
+  # harness changes keep their weekly/dispatch coverage.
+  #
+  # Failure ergonomics: run-matrix.sh ends by printing report.py's lane
+  # matrix to the job log and exits with its verdict — nothing is
+  # swallowed. The failure step additionally lifts matrix.md +
+  # failures.txt into the step summary, and the artifact upload carries
+  # the same evidence shape as the weekly run.
+  sandbox-feature-matrix:
+    needs: [changes]
+    if: |
+      needs.changes.outputs.sandbox == 'true'
+    runs-on: ubuntu-latest
+    # 45: the warm path is ~5 (pull + two lanes); a requirements change
+    # invalidates the image's baked venv (sxv.reqhash mismatch) and each
+    # lane pip-installs fresh; the fork-PR build-fallback path pays a
+    # full u24 image build on top before any lane runs.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR matrix image
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fast path (same-repo events): GITHUB_TOKEN can read the repo-
+      # linked private package — the same actor/token login _tier.yml's
+      # container credentials use for raptor-ci-deps. A pull failure
+      # here is NOT downgraded to the build fallback: for a same-repo
+      # event it means the image was never published or the package's
+      # access broke, and that should be fixed once, loudly, not paid
+      # as a silent multi-minute build on every PR.
+      - name: Pull the prebuilt matrix image
+        if: needs.changes.outputs.pkg_access == 'true'
+        # GHA expressions via env:, never interpolated into the script
+        # body — the canonical hardening pattern this repo documents in
+        # refit-sca-calibration.yml.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" \
+            | docker login ghcr.io -u "$ACTOR" --password-stdin
+          owner="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          if ! docker pull "ghcr.io/${owner}/raptor-sandbox-matrix:u24"; then
+            echo "::error::ghcr.io/${owner}/raptor-sandbox-matrix:u24 is not available — dispatch the 'Sandbox matrix image' workflow once to publish it (and check the package still grants this repo access and is Private, not deleted), then re-run this job."
+            exit 1
+          fi
+          # run-matrix.sh --skip-build looks for the local build tag.
+          docker tag "ghcr.io/${owner}/raptor-sandbox-matrix:u24" \
+            raptor-sandbox-matrix:u24
+
+      - name: Run the matrix subset (u24 x full,default, prebuilt image)
+        if: needs.changes.outputs.pkg_access == 'true'
+        run: core/sandbox/scripts/feature-matrix/run-matrix.sh --image 24 --lanes full,default --skip-build
+
+      # Fork-PR fallback: the restricted token cannot pull the private
+      # package, so build the u24 image on the runner and run the same
+      # two lanes — slower but never blocked, replicating _tier.yml's
+      # runner fallback for raptor-ci-deps rather than skipping fork
+      # PRs out of the lattice signal.
+      - name: Run the matrix subset (u24 x full,default, fork build fallback)
+        if: needs.changes.outputs.pkg_access != 'true'
+        run: core/sandbox/scripts/feature-matrix/run-matrix.sh --image 24 --lanes full,default
+
+      - name: Surface the matrix report in the step summary
+        if: failure()
+        # RUNNER_TEMP is fresh per job on hosted runners, so the glob
+        # matches exactly the one run this job executed. failures.txt
+        # always exists but holds only a newline when the failure had no
+        # per-test lines (e.g. a stray-lane harness error) — the grep
+        # skips whitespace-only files; matrix.md always carries the lane
+        # verdicts, and the full detail is in the job log either way.
+        run: |
+          base="${RUNNER_TEMP}/raptor-sandbox-matrix"
+          for f in "$base"/*/matrix.md; do
+            [ -f "$f" ] && cat "$f" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for f in "$base"/*/failures.txt; do
+            if [ -f "$f" ] && grep -q '[^[:space:]]' "$f"; then
+              { echo; echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          true
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: sandbox-feature-matrix-pr-results
+          path: |
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/matrix.md
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/matrix.json
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/failures.txt
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/*/*/probe.json
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/*/*/pytest-*.out
+          retention-days: 14
+          if-no-files-found: warn
 
   # Exploit-feasibility integration tier: 11 × ~15 s tests calling
   # analyze_binary against real binaries. Gated on the package's real
   # upstream dependency surface.
   python-unit-tests-exploit-feasibility:
-    needs: [pre_check, changes, deps]
+    needs: [changes, deps]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.exploit_feasibility == 'true')
+      needs.changes.outputs.exploit_feasibility == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
+      - name: Enable unprivileged user namespaces
+        uses: ./.github/actions/enable-userns
+
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
         with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
+          save-on-rebuild: 'true'
 
       - name: Run exploit_feasibility integration tests
+        env:
+          EXPLOIT_FILES: ${{ needs.changes.outputs.exploit_feasibility_files }}
         run: |
           source $VENV_PATH/bin/activate
-          # See sandbox tests above for why `python -m pytest` is needed
-          # rather than bare `pytest`.
-          python -m pytest packages/exploit_feasibility/tests
+          set -f
+          workers="$(python .github/scripts/pytest_workers.py $EXPLOIT_FILES)"
+          python -m pytest -n "$workers" --dist loadfile $EXPLOIT_FILES
+
+      # Second invocation, mirroring the sandbox job's slow/integration
+      # step for THIS package's gate: an exploit-feasibility-only PR
+      # does not fire the sandbox gate, so without this step the
+      # package's slow/integration-marked tests would still run only in
+      # nightly.yml on such
+      # PRs. When both gates fire, the sandbox job already runs this
+      # exact directory with the same markers, so omit the duplicate.
+      # Same guard rationale as the sandbox step: blank the 10s per-test
+      # guard, slow-marked tests legitimately exceed it.
+      - name: Run exploit_feasibility slow/integration tier
+        if: needs.changes.outputs.sandbox != 'true'
+        env:
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          source $VENV_PATH/bin/activate
+          python -m pytest -n 2 --dist loadfile -m "slow or integration" packages/exploit_feasibility
+
+  # source_intel tier: Coccinelle-driven memory-corruption evidence.
+  # The real-spatch E2E (test_e2e_real_spatch_* etc.) are
+  # `skipif(not shutil.which("spatch"))`, and the broad ``python`` fast
+  # tier installs no spatch — so before this job they NEVER ran in CI.
+  # The CI deps image bakes in coccinelle so the container path gets
+  # real spatch coverage. Run the tool-backed integration/slow cases
+  # separately after the guarded default tier, rather than excluding them.
+  # The runner fallback (fork PRs) skips unavailable tools via the guards.
+  #
+  # Known: when a PR that changes the Dockerfile merges, ci-deps-image.yml
+  # and tests.yml fire concurrently — tests pull the old image (no new
+  # packages yet). The skipif guards degrade gracefully; the next push
+  # uses the rebuilt image. One-time per Dockerfile change, self-healing.
+  python-unit-tests-source-intel:
+    needs: [changes]
+    if: |
+      needs.changes.outputs.source_intel == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: source_intel
+      test_path: ${{ needs.changes.outputs.source_intel_files }}
+      # Scope outputs contain unique file paths, separated by one space.
+      # One selected file stays serial; broader selections use this runner's cores.
+      pytest_args: ${{ contains(needs.changes.outputs.source_intel_files, ' ') && '-n 2 --dist loadfile' || '' }}
+      native_pytest_markers: "(slow or integration) and not corpus"
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
+
+  # engine tier: the semgrep/coccinelle rule engines' own precision
+  # and regression suites (ReDoS gate, per-rule coccinelle tests,
+  # vocab/api-pack renderers). Same container story as source_intel:
+  # the CI deps image bakes in coccinelle so the spatch-driven rule
+  # tests execute for real on the image path; the runner fallback
+  # (fork PRs) skips them via their shutil.which guards while the
+  # hermetic renderer/pack suites still run.
+  python-unit-tests-engine:
+    needs: [changes]
+    if: |
+      needs.changes.outputs.engine == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: engine
+      test_path: ${{ needs.changes.outputs.engine_files }}
+      # Balance individual cases; engine has no shared module/class setup.
+      # One selected file stays serial to avoid worker startup overhead.
+      pytest_args: ${{ contains(needs.changes.outputs.engine_files, ' ') && '-n 2 --dist worksteal' || '' }}
+      native_pytest_markers: "integration and not corpus"
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
   # Prompt-envelope audit: AST-based heuristic over the registered
   # prompt-construction files. The test only needs stdlib + pytest
@@ -394,26 +1065,26 @@ jobs:
   # filter so it only fires when an audited file, the audit module,
   # or the test itself actually changes.
   python-prompt-audit:
-    needs: [pre_check, changes]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.prompt_audit == 'true')
+      needs.changes.outputs.prompt_audit == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install pytest
-        run: pip install pytest
+        # grep + pip install keeps pyproject.toml the single source
+        # of truth for the pytest pin (lint.yml's ruff idiom).
+        run: pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
 
       - name: Run prompt-envelope audit
         run: |
@@ -421,208 +1092,309 @@ jobs:
           # without needing the repo on PYTHONPATH.
           python -m pytest core/security/tests/test_prompt_envelope_audit.py -q
 
+  # The ReDoS idiom census now rides lint.yml's repo-invariants job
+  # (same whole-repo-invariant shape, shared checkout, and lint's
+  # no-paths-filter trigger is a superset of the old import-graph
+  # gate). test_scope.py still computes the redos_census tier; its
+  # output is simply unconsumed here.
+
   # CI lint / filter-coverage tests. Validates that compute_filters.py's
   # globs cover the actual import dependencies of subsystem-scoped jobs.
   # No project deps required — only pytest.
   ci-lint-tests:
-    needs: [pre_check, changes]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.ci_lint == 'true')
+      needs.changes.outputs.ci_lint == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install pytest
-        run: pip install pytest
+        # grep + pip install keeps pyproject.toml the single source
+        # of truth for the pytest pin (lint.yml's ruff idiom).
+        run: pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
 
       - name: Run CI filter-coverage tests
-        run: pytest .github/tests
+        id: ci_tests
+        # Both dirs: filter-coverage tests AND the checker-script
+        # detector tests (check_vocab_lists, check_env_docs,
+        # check_miswiring_detector, check_optional_dep_imports) —
+        # stdlib+pytest only. The ReDoS suite has a separate owner in
+        # lint.yml on PR/push/merge events, so do not execute it twice.
+        #
+        # NOTE: these are the detectors' UNIT TESTS (does the detector
+        # logic work), not the detectors themselves (is the repo clean).
+        # The detectors run against the tree in lint.yml's
+        # ``repo-invariants`` job on every PR and in the daily
+        # miswiring-scan.yml sweep.
+        run: |
+          python -m pytest .github/tests .github/scripts/tests \
+            --durations=20 \
+            --ignore=.github/tests/test_redos_idiom_census.py \
+            --junitxml="$RUNNER_TEMP/ci-lint.xml"
+
+      # A manual or scheduled Test Suite run does not trigger Lint.
+      # Retain the full default-tier census here on those events.
+      - name: Run ReDoS census for full-suite events
+        id: full_redos
+        if: ${{ !cancelled() && (steps.ci_tests.outcome == 'success' || steps.ci_tests.outcome == 'failure') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          # Whole-tree invariant, matching its lint.yml owner's 120s
+          # session budget. Unit tests retain their 10s phase guard.
+          RAPTOR_MAX_TEST_SECONDS: ""
+          RAPTOR_MAX_SESSION_SECONDS: '120'
+        run: |
+          python -m pytest .github/tests/test_redos_idiom_census.py -q \
+            --junitxml="$RUNNER_TEMP/ci-lint-redos.xml"
+
+      - name: Require complete ReDoS census execution
+        if: ${{ !cancelled() && (steps.full_redos.outcome == 'success' || steps.full_redos.outcome == 'failure') }}
+        run: |
+          python3 .github/scripts/check_skip_budget.py --lane redos-census --full \
+            --junit-xml "$RUNNER_TEMP/ci-lint-redos.xml"
+
+      # Self-censusing: this lane is the skip-budget gate's own home
+      # suite (and its simulations skip when bash/jq vanish from the
+      # runner), so it checks its own count. Fixed full collection of
+      # both dirs except the separately owned census, hence --full.
+      - name: Check skip count against the lane's recorded budget
+        run: |
+          python3 .github/scripts/check_skip_budget.py \
+            --lane ci-lint --full \
+            --junit-xml "$RUNNER_TEMP/ci-lint.xml"
+
+      - name: Run release-workflow simulation
+        # Bash test (pytest doesn't collect .sh): simulates the release
+        # workflow's tag/changelog/stamping steps against a disposable
+        # git fixture. Without an explicit step it ran in NO CI lane
+        # and its assertions (tag-move refusal, changelog injection
+        # defences) rotted silently.
+        run: bash .github/tests/test_release_workflow.sh
 
   # Heavy-subdir Python tiers — each gated on its own filter so a PR
   # touching only one package skips the others. Filters live in
   # compute_filters.FILTERS and are validated by ci-lint-tests above.
   python-unit-tests-codeql:
-    needs: [pre_check, changes, deps]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.codeql == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
-        with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
-      - name: Run codeql tests
-        run: |
-          source $VENV_PATH/bin/activate
-          python -m pytest packages/codeql/tests -n auto
+      needs.changes.outputs.codeql == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: codeql
+      test_path: ${{ needs.changes.outputs.codeql_files }}
+      timeout_minutes: 25
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
   python-unit-tests-llm-analysis:
-    needs: [pre_check, changes, deps]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.llm_analysis == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
-        with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
-      - name: Run llm_analysis tests
-        run: |
-          source $VENV_PATH/bin/activate
-          python -m pytest packages/llm_analysis/tests -n auto
+      needs.changes.outputs.llm_analysis == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: llm_analysis
+      test_path: ${{ needs.changes.outputs.llm_analysis_files }}
+      timeout_minutes: 25
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
   python-unit-tests-cve-diff:
-    needs: [pre_check, changes, deps]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.cve_diff == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
-        with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
-      - name: Run cve_diff tests
-        run: |
-          source $VENV_PATH/bin/activate
-          python -m pytest packages/cve_diff/tests -n auto
+      needs.changes.outputs.cve_diff == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: cve_diff
+      test_path: ${{ needs.changes.outputs.cve_diff_files }}
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
   python-unit-tests-fuzzing:
-    needs: [pre_check, changes, deps]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.fuzzing == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
-        with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
-      - name: Run fuzzing tests
-        run: |
-          source $VENV_PATH/bin/activate
-          python -m pytest packages/fuzzing/tests -n auto
+      needs.changes.outputs.fuzzing == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: fuzzing
+      test_path: ${{ needs.changes.outputs.fuzzing_files }}
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
+  # CANARY for the prebuilt-image migration (phase 2 of the fan-out
+  # fix). sage is the proving ground (NOTE: the tier now spawns
+  # subprocesses — the guard/capture tests run python, bash and jq
+  # pipelines, so the image must carry bash+jq): if green, the
+  # sound and the remaining pure-Python tiers can follow. It runs
+  # INSIDE ghcr.io/<owner>/raptor-ci-deps (deps baked in) instead of
+  # `needs: deps` + downloading the venv artifact — removing one
+  # venv-download from the fan-out that queues under a runner cap.
+  # sandbox (namespaces) + exploit_feasibility (radare2/gcc) will NOT
+  # migrate; the slim image can't host them.
+  # CANARY for the reusable-workflow migration. sage proves the _tier.yml
+  # two-path (image / runner-fallback) shape before the other container
+  # tiers (codeql, llm-analysis, fuzzing, orchestration) follow. The
+  # caller keeps its path-filter `if:` and name; _tier.yml picks the
+  # execution path from pkg_access.
   python-unit-tests-sage:
-    needs: [pre_check, changes, deps]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.sage == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
-        with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
-      - name: Run sage tests
-        run: |
-          source $VENV_PATH/bin/activate
-          python -m pytest core/sage/tests -n auto
+      needs.changes.outputs.sage == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: sage
+      test_path: ${{ needs.changes.outputs.sage_files }}
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
   python-unit-tests-orchestration:
-    needs: [pre_check, changes, deps]
+    needs: [changes]
     if: |
-      needs.pre_check.outputs.should_skip != 'true' &&
-      (needs.changes.outputs.force_full == 'true' ||
-       needs.changes.outputs.orchestration == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
-        with:
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Download venv artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # was v8.0.1
-        with:
-          name: venv-${{ github.run_id }}
-          path: ${{ env.VENV_PATH }}
-      - name: Restore venv permissions
-        run: chmod +x $VENV_PATH/bin/*
-      - name: Run orchestration tests
-        run: |
-          source $VENV_PATH/bin/activate
-          python -m pytest core/orchestration/tests -n auto
+      needs.changes.outputs.orchestration == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: orchestration
+      test_path: ${{ needs.changes.outputs.orchestration_files }}
+      use_container: ${{ needs.changes.outputs.pkg_access == 'true' }}
 
+  # Single aggregate gate over the whole suite. `needs:` every job and
+  # `if: always()` so it still runs when an upstream tier is path-filtered
+  # out (skipped) or fails. This is the one check to pin in a future
+  # branch-protection ruleset: individual tier job names can then change
+  # — notably the reusable-workflow `/ python-<tier>` rename — without
+  # touching protection. Skipped is a pass (event / path filters); only
+  # failure or cancellation blocks.
+  tests-passed:
+    name: tests-passed
+    if: always()
+    needs:
+      - changes
+      - deps
+      - python-unit-tests-fast
+      - python-unit-tests-sca
+      - python-unit-tests-sandbox
+      - python-unit-tests-sandbox-macos
+      - sandbox-feature-matrix
+      - python-unit-tests-exploit-feasibility
+      - python-prompt-audit
+      - ci-lint-tests
+      - python-unit-tests-codeql
+      - python-unit-tests-llm-analysis
+      - python-unit-tests-cve-diff
+      - python-unit-tests-source-intel
+      - python-unit-tests-engine
+      - python-unit-tests-fuzzing
+      - python-unit-tests-sage
+      - python-unit-tests-orchestration
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify all tiers passed
+        env:
+          # Results only: scope outputs can exceed the process environment limit.
+          NEEDS_JSON: >-
+            {
+              "changes": {"result": "${{ needs['changes'].result }}"},
+              "deps": {"result": "${{ needs['deps'].result }}"},
+              "python-unit-tests-fast": {"result": "${{ needs['python-unit-tests-fast'].result }}"},
+              "python-unit-tests-sca": {"result": "${{ needs['python-unit-tests-sca'].result }}"},
+              "python-unit-tests-sandbox": {"result": "${{ needs['python-unit-tests-sandbox'].result }}"},
+              "python-unit-tests-sandbox-macos": {"result": "${{ needs['python-unit-tests-sandbox-macos'].result }}"},
+              "sandbox-feature-matrix": {"result": "${{ needs['sandbox-feature-matrix'].result }}"},
+              "python-unit-tests-exploit-feasibility": {"result": "${{ needs['python-unit-tests-exploit-feasibility'].result }}"},
+              "python-prompt-audit": {"result": "${{ needs['python-prompt-audit'].result }}"},
+              "ci-lint-tests": {"result": "${{ needs['ci-lint-tests'].result }}"},
+              "python-unit-tests-codeql": {"result": "${{ needs['python-unit-tests-codeql'].result }}"},
+              "python-unit-tests-llm-analysis": {"result": "${{ needs['python-unit-tests-llm-analysis'].result }}"},
+              "python-unit-tests-cve-diff": {"result": "${{ needs['python-unit-tests-cve-diff'].result }}"},
+              "python-unit-tests-source-intel": {"result": "${{ needs['python-unit-tests-source-intel'].result }}"},
+              "python-unit-tests-engine": {"result": "${{ needs['python-unit-tests-engine'].result }}"},
+              "python-unit-tests-fuzzing": {"result": "${{ needs['python-unit-tests-fuzzing'].result }}"},
+              "python-unit-tests-sage": {"result": "${{ needs['python-unit-tests-sage'].result }}"},
+              "python-unit-tests-orchestration": {"result": "${{ needs['python-unit-tests-orchestration'].result }}"}
+            }
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+
+
+          def annotation(level, message):
+              message = str(message).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f"::{level}::{message}", flush=True)
+
+
+          def cell(value):
+              return str(value).replace('\r', ' ').replace('\n', ' ').replace('|', chr(92) + '|')
+
+
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          failed = {name: job['result'] for name, job in needs.items()
+                    if job['result'] not in ('success', 'skipped')}
+          run_url = (f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                     f"/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/"
+                     f"{os.environ['GITHUB_RUN_ATTEMPT']}")
+          summary = ['## Required job results', '', '| Job | Result |', '| --- | --- |']
+          for name, job in sorted(needs.items()):
+              print(f"{name}: {job['result']}", flush=True)
+              summary.append(f"| {cell(name)} | {cell(job['result'])} |")
+          for name, result in sorted(failed.items()):
+              annotation('error', f"Required job {name} reported {result}. Job details: {run_url}")
+          if failed:
+              summary += ['', f'[Inspect upstream jobs and runner annotations]({run_url}).', '']
+              # Fetch the current attempt only: earlier reruns must not supply stale failures.
+              # Diagnostics are best effort; they never change the prerequisite verdict.
+              try:
+                  endpoint = (f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                              f"{os.environ['GITHUB_RUN_ID']}/attempts/"
+                              f"{os.environ['GITHUB_RUN_ATTEMPT']}/jobs?per_page=100")
+                  response = subprocess.run(
+                      ['gh', 'api', '--paginate', '--slurp', endpoint],
+                      capture_output=True, text=True, timeout=30, check=True,
+                  )
+                  for page in json.loads(response.stdout):
+                      for job in page['jobs']:
+                          if job.get('conclusion') not in ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'):
+                              continue
+                          labels = ', '.join(job.get('labels') or []) or 'unknown'
+                          runner = job.get('runner_name') or 'not assigned'
+                          steps = [s['name'] for s in job.get('steps', [])
+                                   if s.get('conclusion') not in (None, 'success', 'skipped')]
+                          detail = ('Failed/cancelled steps: ' + ', '.join(steps) if steps else
+                                    'No failing step was reported; inspect job annotations for runner/service errors.')
+                          message = (f"{job['name']}: {job['conclusion']}; runner={runner}; "
+                                     f"labels={labels}. {detail} {job['html_url']}")
+                          annotation('error', message)
+                          summary.append(f"- {cell(message)}")
+              except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+                  annotation('warning', f"Could not retrieve upstream runner details. Inspect {run_url}. Required-job failures remain blocking.")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('\n'.join(summary) + '\n')
+          sys.exit(1 if failed else 0)

@@ -14,11 +14,18 @@ are confirmed vs theoretical, or adding more info about blockers.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from core.json import load_json
+from .caps import DEFAULT_CAP, cap_elements, truncation_marker_lines
 from .sanitize import sanitize as _sanitize, sanitize_id as _sid
+
+# Shared flow_trace rationale (see packages.diagram.caps): tree nodes
+# come from an LLM-written artifact with no upstream bound.
+_MAX_NODES = DEFAULT_CAP
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 _PROXIMITY_LABEL = {
@@ -39,15 +46,24 @@ def _proximity_desc(score: int) -> str:
 
 
 def _build_proximity_index(attack_paths: list[dict]) -> dict[str, int]:
-    """Return finding_id → best proximity score across all paths."""
+    """Return finding_id → best proximity score across all paths.
+
+    Keys are sanitized with the same ``_sid`` applied to tree node ids
+    — the join is by sanitized id on the node side, so raw keys would
+    never match a finding id containing a char outside [A-Za-z0-9_-].
+    """
     index: dict[str, int] = {}
     for path in attack_paths:
+        if not isinstance(path, dict):
+            continue  # malformed companion element — drop, keep the rest
         fid = path.get("finding") or path.get("finding_id", "")
         score = path.get("proximity", 0)
         try:
             score = int(score)
         except (TypeError, ValueError):
             score = 0
+        if fid:
+            fid = _sid(str(fid))
         if fid and score > index.get(fid, -1):
             index[fid] = score
     return index
@@ -57,7 +73,11 @@ def _build_disproven_index(disproven_list: list[dict]) -> dict[str, str]:
     """Return finding_id → why_wrong (first entry wins)."""
     index: dict[str, str] = {}
     for entry in disproven_list:
+        if not isinstance(entry, dict):
+            continue  # malformed companion element — drop, keep the rest
         fid = entry.get("finding", "")
+        if fid:
+            fid = _sid(str(fid))  # match sanitized node ids (see above)
         reason = entry.get("why_wrong", entry.get("lesson", ""))
         if fid and fid not in index and reason:
             index[fid] = reason
@@ -68,9 +88,15 @@ def _build_hypothesis_index(hypotheses: list[dict]) -> dict[str, str]:
     """Return finding_id → hypothesis status summary."""
     index: dict[str, str] = {}
     for h in hypotheses:
+        if not isinstance(h, dict):
+            continue  # malformed companion element — drop, keep the rest
         fid = h.get("finding") or h.get("finding_id", "")
+        if fid:
+            fid = _sid(str(fid))  # match sanitized node ids (see above)
         status = _sanitize(h.get("status", ""))
-        claim = h.get("claim") or h.get("hypothesis", "")
+        # str-coerce BEFORE slicing: a dict claim raised KeyError on
+        # the slice and lost the whole Attack Tree section.
+        claim = str(h.get("claim") or h.get("hypothesis", "") or "")
         if fid and fid not in index:
             index[fid] = f"{status}: {_sanitize(claim[:60])}" if claim else status
     return index
@@ -89,7 +115,7 @@ def _node_label(node: dict, proximity_idx: dict, disproven_idx: dict) -> str:
     if status == "confirmed" and nid in proximity_idx:
         score = proximity_idx[nid]
         desc = _proximity_desc(score)
-        parts.append(f"proximity {score}/10,{desc}" if desc else f"proximity {score}/10")
+        parts.append(f"proximity {score}/10 — {desc}" if desc else f"proximity {score}/10")
 
     # Why-wrong annotation on disproven nodes
     if status == "disproven" and nid in disproven_idx:
@@ -124,7 +150,14 @@ def _find_subgraph_groups(
 
     def children_of(nid: str) -> list[str]:
         raw = node_map.get(nid, {}).get("leads_to", "") or ""
-        return [t.strip() for t in raw.split(",") if t.strip() and t.strip() in node_map]
+        # Sanitize each target before the membership test: node_map
+        # keys are already sanitized ids, so a raw comparison silently
+        # disabled grouping whenever an id contained a char outside
+        # [A-Za-z0-9_-] (the flat edge paths already sanitize).
+        return [
+            _sid(t.strip()) for t in raw.split(",")
+            if t.strip() and _sid(t.strip()) in node_map
+        ]
 
     def descendants(nid: str, _seen: set | None = None) -> list[str]:
         # Cycle protection. Pre-fix `descendants(child)` recursed
@@ -164,7 +197,7 @@ def _find_subgraph_groups(
         if desc:
             groups[child] = desc
         else:
-            # Leaf child,keep ungrouped by putting it in its own single-item group
+            # Leaf child — keep ungrouped by putting it in its own single-item group
             groups[child] = []
 
     return groups if len(groups) >= 2 else None
@@ -178,6 +211,12 @@ def generate(
 ) -> str:
     root_id = _sid(data.get("root", "ROOT"))
     raw_nodes: list[dict] = data.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        raw_nodes = []
+    # flow_trace's ingestion idiom: malformed elements drop, the rest
+    # still renders (dict(n) below raised on a non-dict node and lost
+    # the whole section).
+    raw_nodes = [n for n in raw_nodes if isinstance(n, dict)]
 
     if not raw_nodes:
         return 'flowchart TD\n    EMPTY["No attack tree nodes"]'
@@ -202,6 +241,7 @@ def generate(
     # Shallow-copy each node before assigning the sanitized id, so
     # the caller's dict is untouched. The new list still references
     # the same shape information, just with id rewritten on a copy.
+    raw_nodes, dropped_nodes = cap_elements(raw_nodes, _MAX_NODES)
     nodes = [dict(n) for n in raw_nodes]
     for n in nodes:
         n["id"] = _sid(n.get("id", "?"))
@@ -234,7 +274,7 @@ def generate(
             prox_suffix = ""
             if group_id in proximity_idx:
                 score = proximity_idx[group_id]
-                prox_suffix = f",proximity {score}/10"
+                prox_suffix = f" — proximity {score}/10"
             hyp_suffix = ""
             if group_id in hyp_idx:
                 hyp_suffix = f",{hyp_idx[group_id]}"
@@ -261,8 +301,7 @@ def generate(
 
         # Root → subgroup edges
         if root_id:
-            for group_id in groups:
-                lines.append(f"    {root_id} --> {group_id}")
+            lines.extend(f"    {root_id} --> {group_id}" for group_id in groups)
 
         # Intra-subgraph edges
         lines.append("")
@@ -272,11 +311,41 @@ def generate(
             if node.get("id") not in all_subgraph_ids:
                 continue
             nid = node.get("id", "?")
+            if nid == root_id:
+                # Every root -> child edge was already drawn above;
+                # re-emitting here duplicated each of them. (The old
+                # guard tested the edge TARGET instead of the source,
+                # which both re-drew root's edges and dropped
+                # legitimate cycle edges INTO root.)
+                continue
             leads_to_raw = node.get("leads_to", "") or ""
             targets = [_sid(t.strip()) for t in leads_to_raw.split(",") if t.strip() and _sid(t.strip()) in node_map]
-            for target in targets:
-                if target != root_id:  # root edge already drawn above
-                    lines.append(f"    {nid} --> {target}")
+            lines.extend(f"    {nid} --> {target}" for target in targets)
+
+        # Nodes not reachable from the root (disconnected components)
+        # still get declared — silently dropping them left the status
+        # class list referencing nodes with no declaration, and the
+        # operator never learned those nodes existed.
+        orphan_nodes = [
+            n for n in nodes if n.get("id") not in all_subgraph_ids
+        ]
+        if orphan_nodes:
+            lines.append("")
+            lines.append("    %% Nodes not reachable from the root")
+            for node in orphan_nodes:
+                nid = node.get("id", "?")
+                status = node.get("status", "unexplored")
+                label = _node_label(node, proximity_idx, disproven_idx)
+                open_ch, close_ch = _node_shape(status)
+                lines.append(f"    {nid}{open_ch}{label}{close_ch}")
+            for node in orphan_nodes:
+                nid = node.get("id", "?")
+                leads_to_raw = node.get("leads_to", "") or ""
+                targets = [
+                    _sid(t.strip()) for t in leads_to_raw.split(",")
+                    if t.strip() and _sid(t.strip()) in node_map
+                ]
+                lines.extend(f"    {nid} --> {target}" for target in targets)
 
     else:
         # Flat rendering, original approach
@@ -295,8 +364,7 @@ def generate(
             nid = node.get("id", "?")
             leads_to_raw = node.get("leads_to", "") or ""
             targets = [_sid(t.strip()) for t in leads_to_raw.split(",") if t.strip() and _sid(t.strip()) in node_map]
-            for target in targets:
-                lines.append(f"    {nid} --> {target}")
+            lines.extend(f"    {nid} --> {target}" for target in targets)
 
     # Style classes
     status_groups: dict[str, list[str]] = {}
@@ -318,6 +386,23 @@ def generate(
     if root_id and root_id in node_map:
         lines.append(f"    style {root_id} stroke-width:3px")
 
+    # The proximity/disproven/hypothesis annotations join companion
+    # finding ids against tree NODE ids — nothing in the producer
+    # contract forces those to coincide. When enrichment data exists
+    # but no id matched any node, say so in the output instead of
+    # silently rendering an unannotated tree.
+    enrichment_keys = (
+        set(proximity_idx) | set(disproven_idx) | set(hyp_idx)
+    )
+    if enrichment_keys and not (enrichment_keys & set(node_map)):
+        lines.append(
+            "    %% note: companion finding ids matched no tree node id"
+            " — proximity/ruled-out annotations not shown"
+        )
+
+    lines.extend(truncation_marker_lines(
+        "TRUNC", dropped_nodes, "nodes", _MAX_NODES))
+
     return "\n".join(lines)
 
 
@@ -329,7 +414,8 @@ def generate_from_file(
 ) -> str:
     data = load_json(path)
     if data is None:
-        raise ValueError(f"Failed to load {path}")
+        msg = f"Failed to load {path}"
+        raise ValueError(msg)
     attack_paths = load_json(attack_paths_path) if attack_paths_path else None
     disproven_raw = load_json(disproven_path) if disproven_path else None
     disproven = disproven_raw.get("disproven", []) if isinstance(disproven_raw, dict) else disproven_raw

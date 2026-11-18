@@ -1,0 +1,256 @@
+name: Test tier
+
+# Reusable per-tier test runner with two execution paths, selected by the
+# `use_container` input the caller passes:
+#
+#   image  — runs inside ghcr.io/<owner>/raptor-ci-deps (deps baked in).
+#            The fast path for same-repo events; needs packages:read + a
+#            GHCR login.
+#   runner — builds deps on the bare runner via uv. The fallback for fork
+#            PRs, whose read-only token cannot pull a private GHCR package.
+#            Slower, but never blocked on the image's visibility.
+#
+# Exactly one path runs per call; the other is skipped via `if`. Inner
+# job names are STATIC (`image` / `runner`) on purpose: GitHub only
+# evaluates a job's `name:` expression when the job actually RUNS, so a
+# dynamic `${{ inputs.tier }}` name renders as the literal template on the
+# ever-present skipped twin. The tier is carried by the caller's job name
+# instead — checks read `python-unit-tests-<tier> / image` (or `/ runner`),
+# clean in both the run and skipped states.
+
+on:
+  workflow_call:
+    inputs:
+      tier:
+        description: Short tier id (e.g. "sage") — used in job display names.
+        required: true
+        type: string
+      test_path:
+        description: >-
+          pytest target — a directory (e.g. "core/sage/tests") or
+          space-separated file paths. Word-split by the shell; no
+          glob expansion (set -f).
+        required: true
+        type: string
+      pytest_args:
+        description: Extra pytest args.
+        required: false
+        type: string
+        default: "-n auto"
+      native_pytest_markers:
+        description: Additional slow/integration selection after the guarded default tier.
+        required: false
+        type: string
+        default: ""
+      python_version:
+        description: Runner-path Python (must track the image's base).
+        required: false
+        type: string
+        default: "3.14"
+      timeout_minutes:
+        description: Per-job timeout in minutes. Heavier tiers (codeql, llm_analysis) override the 20 default.
+        required: false
+        type: number
+        default: 20
+      use_container:
+        description: true → run in the prebuilt image; false → venv on the runner.
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # Fast path: deps are already on the image's system Python.
+  image:
+    if: ${{ inputs.use_container }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/raptor-ci-deps:main
+      credentials:
+        username: ${{ github.actor }}
+        # github.token is always available inside a called workflow — no
+        # `secrets: inherit` needed. Read access to the repo's own GHCR
+        # package is covered by the caller's packages:read grant.
+        password: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reconcile deps
+        # Skip if the image's baked deps match the checkout's lockfile.
+        # The hash check short-circuits the common path.
+        shell: bash
+        run: |
+          # uv.toml is not part of the baked image stamp. Its presence
+          # requires a fresh export even when project/lock hashes match.
+          if [ ! -f uv.toml ] && [ -f /etc/raptor-ci-deps.hash ] && \
+             sha256sum -c /etc/raptor-ci-deps.hash --status; then
+            echo "Image deps match checkout — skipping reconcile"
+          else
+            echo "Hash mismatch or missing — reconciling via uv"
+            uv export --locked --no-hashes --output-file "$RUNNER_TEMP/tier-requirements.txt"
+            uv pip sync --system "$RUNNER_TEMP/tier-requirements.txt"
+          fi
+      - name: Run tests
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+          PYTEST_EXTRA: ${{ inputs.pytest_args }}
+          NATIVE_PYTEST_MARKERS: ${{ inputs.native_pytest_markers }}
+          PYTEST_ADDOPTS: "-o faulthandler_timeout=120"
+          RAPTOR_MAX_TEST_SECONDS: "10"
+          RAPTOR_RANDOMISE_TESTS: ${{ github.run_id }}
+        run: |
+          set -f  # word-split $PYTEST_EXTRA without glob expansion
+          if [ -z "$NATIVE_PYTEST_MARKERS" ]; then
+            exec python -m pytest $TEST_PATH $PYTEST_EXTRA \
+              --junitxml="$RUNNER_TEMP/pytest-junit.xml"
+          fi
+          # Keep the default guard, and still run native coverage if it fails.
+          fast_status=0
+          python -m pytest $TEST_PATH $PYTEST_EXTRA \
+            --junitxml="$RUNNER_TEMP/pytest-junit.xml" || fast_status=$?
+          native_status=0
+          RAPTOR_MAX_TEST_SECONDS="" python -m pytest $TEST_PATH $PYTEST_EXTRA \
+            -m "$NATIVE_PYTEST_MARKERS" \
+            --junitxml="$RUNNER_TEMP/pytest-native-junit.xml" || native_status=$?
+          # Scoped files may have cases in only one partition. Both empty
+          # remains an error, and neither phase can hide the other's failure.
+          if [ "$fast_status" -ne 0 ] && [ "$fast_status" -ne 5 ]; then
+            exit "$fast_status"
+          fi
+          if [ "$native_status" -ne 0 ] && [ "$native_status" -ne 5 ]; then
+            exit "$native_status"
+          fi
+          if [ "$fast_status" -eq 5 ] && [ "$native_status" -eq 5 ]; then
+            exit 5
+          fi
+
+      # Skip-count budget over the junit the run just wrote. The lane
+      # key carries the execution path — the two paths run under
+      # different provisioning, so their counts are recorded
+      # separately. No --full: a path-filtered dispatch collects a
+      # subset, so only growth past the recorded count trips here; the
+      # force-full events and the nightlies provide the exact check.
+      - name: Check skip count against the lane's recorded budget
+        env:
+          TIER: ${{ inputs.tier }}
+        run: |
+          set -- --junit-xml "$RUNNER_TEMP/pytest-junit.xml"
+          if [ -f "$RUNNER_TEMP/pytest-native-junit.xml" ]; then
+            set -- "$@" --junit-xml "$RUNNER_TEMP/pytest-native-junit.xml"
+          fi
+          python3 .github/scripts/check_skip_budget.py \
+            --lane "${TIER}/image" \
+            "$@"
+
+      - name: Retain per-profile JUnit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-${{ inputs.tier }}-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pytest-junit.xml
+            ${{ runner.temp }}/pytest-native-junit.xml
+          if-no-files-found: error
+
+  # Fallback path: fork PRs can't pull the private image, so install into
+  # the runner's system Python (uv's cache keyed on uv.lock).
+  runner:
+    if: ${{ !inputs.use_container }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable unprivileged user namespaces
+        # Ubuntu 24.04 runners block unprivileged user namespaces via
+        # AppArmor by default; the sandbox's mount-ns backend needs them
+        # (plus newuidmap/newgidmap from uidmap). Without this, the
+        # untrusted-run fresh-procfs contract correctly refuses the
+        # host-procfs-visible fallback and every untrusted-target test
+        # fails at setup.
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ inputs.python_version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
+      - name: Install deps
+        # --system installs into the setup-python interpreter so the test
+        # step's `python` resolves the deps without venv activation,
+        # matching the image path's "system Python, no venv" model.
+        shell: bash
+        run: |
+          uv export --locked --no-hashes --output-file "$RUNNER_TEMP/tier-requirements.txt"
+          uv pip sync --system "$RUNNER_TEMP/tier-requirements.txt"
+      - name: Run tests
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+          PYTEST_EXTRA: ${{ inputs.pytest_args }}
+          NATIVE_PYTEST_MARKERS: ${{ inputs.native_pytest_markers }}
+          PYTEST_ADDOPTS: "-o faulthandler_timeout=120"
+          RAPTOR_MAX_TEST_SECONDS: "10"
+          RAPTOR_RANDOMISE_TESTS: ${{ github.run_id }}
+        run: |
+          set -f  # word-split $PYTEST_EXTRA without glob expansion
+          if [ -z "$NATIVE_PYTEST_MARKERS" ]; then
+            exec python -m pytest $TEST_PATH $PYTEST_EXTRA \
+              --junitxml="$RUNNER_TEMP/pytest-junit.xml"
+          fi
+          # Keep the default guard, and still run native coverage if it fails.
+          fast_status=0
+          python -m pytest $TEST_PATH $PYTEST_EXTRA \
+            --junitxml="$RUNNER_TEMP/pytest-junit.xml" || fast_status=$?
+          native_status=0
+          RAPTOR_MAX_TEST_SECONDS="" python -m pytest $TEST_PATH $PYTEST_EXTRA \
+            -m "$NATIVE_PYTEST_MARKERS" \
+            --junitxml="$RUNNER_TEMP/pytest-native-junit.xml" || native_status=$?
+          # Scoped files may have cases in only one partition. Both empty
+          # remains an error, and neither phase can hide the other's failure.
+          if [ "$fast_status" -ne 0 ] && [ "$fast_status" -ne 5 ]; then
+            exit "$fast_status"
+          fi
+          if [ "$native_status" -ne 0 ] && [ "$native_status" -ne 5 ]; then
+            exit "$native_status"
+          fi
+          if [ "$fast_status" -eq 5 ] && [ "$native_status" -eq 5 ]; then
+            exit 5
+          fi
+
+      # Same skip-count budget as the image path, recorded under its
+      # own lane key — this path installs onto the bare runner, so
+      # optional-tool skips legitimately differ from the image's.
+      - name: Check skip count against the lane's recorded budget
+        env:
+          TIER: ${{ inputs.tier }}
+        run: |
+          set -- --junit-xml "$RUNNER_TEMP/pytest-junit.xml"
+          if [ -f "$RUNNER_TEMP/pytest-native-junit.xml" ]; then
+            set -- "$@" --junit-xml "$RUNNER_TEMP/pytest-native-junit.xml"
+          fi
+          python3 .github/scripts/check_skip_budget.py \
+            --lane "${TIER}/runner" \
+            "$@"
+      - name: Retain per-profile JUnit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-${{ inputs.tier }}-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pytest-junit.xml
+            ${{ runner.temp }}/pytest-native-junit.xml
+          if-no-files-found: error

@@ -15,6 +15,7 @@ LLM client and verifies:
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -35,7 +36,7 @@ from packages.codeql.autonomous_analyzer import (
 
 class StubProvider:
     """Lives in ``client.providers`` so ``LLMClient`` doesn't need to
-    construct a real one. Every test test-case attaches a function to
+    construct a real one. Every test-case attaches a function to
     ``self.responder`` that returns a structured response."""
     def __init__(self):
         self.total_cost = 0.0
@@ -97,15 +98,18 @@ def _build_llm(tmp_path) -> "object":
     cfg.scorecard_shadow_rate = 0.0
 
     client = LLMClient.__new__(LLMClient)
+    from collections import OrderedDict
     client.config = cfg
     client.providers = {}
     client.total_cost = 0.0
     client.request_count = 0
     client.task_type_costs = {}
     client.short_circuits = 0
+    client._daily_quota_exhausted = set()
     client._stats_lock = threading.RLock()
-    client._key_locks = {}
+    client._key_locks = OrderedDict()
     client._key_locks_guard = threading.Lock()
+    client._key_locks_cap = 4096
     client._scorecard = None
 
     # Single shared provider for both opus-stub and haiku-stub —
@@ -236,11 +240,14 @@ def test_short_circuit_skips_full_when_scorecard_trusts_cell(llm):
     result should reflect the cheap reasoning."""
     client, prov = llm
     sc = ModelScorecard(client.config.scorecard_path)
-    # Build trust on the cell before the analyzer runs.
+    # Build trust on the cell before the analyzer runs — on the SAME
+    # target the analyzer will pass, so the diversity gate's
+    # same-target grant spends it.
     for _ in range(150):
         sc.record_event(
             "codeql:py/sql-injection", "haiku-stub",
             EventType.CHEAP_SHORT_CIRCUIT, "correct",
+            repo="/proj/alpha",
         )
     # Reset the lazy-built scorecard property so the next access
     # uses the seeded sidecar.
@@ -259,7 +266,9 @@ def test_short_circuit_skips_full_when_scorecard_trusts_cell(llm):
         return ({}, "raw")
     prov.responder = responder
 
-    result = analyzer.analyze_vulnerability(_finding(), "x = 'admin'")
+    result = analyzer.analyze_vulnerability(
+        _finding(), "x = 'admin'", repo_path=Path("/proj/alpha"),
+    )
 
     # Critical: full call was avoided.
     assert len(cheap_calls) == 1

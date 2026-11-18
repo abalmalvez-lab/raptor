@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# raptor-frida-patch-verify - runtime regression oracle for candidate
+# patches. Runs the same PoC input against the unpatched and patched
+# builds under a frida sink watch and compares sink reachability.
+#
+# Usage:
+#   libexec/raptor-frida-patch-verify --before <binary> --after <binary>
+#       --sink <fn> [--sink <fn> ...] [--poc <file>]
+#       [--location FILE:LINE] [--duration N] [--out DIR]
+#
+# If --out is omitted, an output dir is resolved via
+# raptor-run-lifecycle (active project or out/patch-verify_<ts>/).
+#
+# Exit codes are verdict-bearing: 0 Closed, 1 Still Fires,
+# 3 Inconclusive. 2 is reserved for every non-verdict failure
+# (usage, session error, trust-marker refusal, wrapper internals) so
+# an infrastructure problem can never read as a verdict.
+
+set -euo pipefail
+
+# ─── trust-marker check (do not source; inline by design) ───
+if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
+    echo "$0: internal dispatch script." >&2
+    echo "  Run via 'bin/raptor' instead." >&2
+    echo "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass." >&2
+    exit 2
+fi
+# ─── end trust-marker check ─────────────────────────────────
+
+# ─── resolve RAPTOR_DIR through symlinks (matches raptor-frida) ───
+SCRIPT="$0"
+_symhops=0
+while [ -L "$SCRIPT" ]; do
+    _symhops=$((_symhops + 1))
+    if [ "$_symhops" -gt 32 ]; then
+        echo "raptor-frida-patch-verify: symlink hop limit exceeded resolving $0" >&2
+        exit 2
+    fi
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
+    SCRIPT="$(readlink "$SCRIPT")"
+    [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
+done
+unset _symhops
+unset DIR
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
+
+if [ ! -f "$RAPTOR_DIR/raptor.py" ]; then
+    echo "raptor-frida-patch-verify: cannot find raptor.py under $RAPTOR_DIR" >&2
+    exit 2
+fi
+
+if [ ! -f "$RAPTOR_DIR/core/security/_dangerous_env_strip.sh" ]; then
+    echo "raptor-frida-patch-verify: env strip script missing" >&2
+    exit 2
+fi
+. "$RAPTOR_DIR/core/security/_dangerous_env_strip.sh"
+
+export RAPTOR_DIR
+# PYTHONPATH: prepend RAPTOR_DIR only — do NOT inherit parent PYTHONPATH
+# to prevent module injection from untrusted parent processes.
+export PYTHONPATH="$RAPTOR_DIR"
+# -P below removes cwd from module discovery while retaining this pinned
+# PYTHONPATH and installed user packages. Keep cwd for relative CLI inputs.
+
+# ─── short-circuit help (no lifecycle dir for a usage query) ────────
+for a in "$@"; do
+    case "$a" in
+        --)
+            break
+            ;;
+        -h|--help)
+            exec python3 -P -m packages.frida.patch_oracle "$@"
+            ;;
+    esac
+done
+
+# ─── extract --before and --out for lifecycle setup ─────────────────
+BEFORE=""
+OUT=""
+ARGS=("$@")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+    a="${ARGS[$i]}"
+    case "$a" in
+        # Everything after -- is positional: stop extracting wrapper
+        # flags (a --before/--out after -- must pass through verbatim,
+        # matching the short-circuit loop).
+        --)         break ;;
+        --before)   i=$((i + 1)); BEFORE="${ARGS[$i]:-}" ;;
+        --before=*) BEFORE="${a#--before=}" ;;
+        --out)      i=$((i + 1)); OUT="${ARGS[$i]:-}" ;;
+        --out=*)    OUT="${a#--out=}" ;;
+    esac
+    i=$((i + 1))
+done
+
+# Absolutize an existing relative --before so the lifecycle metadata
+# records a resolvable target (matches raptor-frida's abs_if_file).
+if [ -n "$BEFORE" ] && [ -f "$BEFORE" ] && [ "${BEFORE#/}" = "$BEFORE" ]; then
+    BEFORE="$(realpath -- "$BEFORE")"
+fi
+
+PASS_ARGS=("$@")
+if [ -z "$OUT" ]; then
+    if [ -z "$BEFORE" ]; then
+        echo "raptor-frida-patch-verify: --before is required" >&2
+        exit 2
+    fi
+    LIFECYCLE_OUT=$("$RAPTOR_DIR/libexec/raptor-run-lifecycle" \
+        start patch-verify --target "$BEFORE") || {
+        echo "raptor-frida-patch-verify: run lifecycle start failed" >&2
+        exit 2
+    }
+    echo "$LIFECYCLE_OUT" >&2
+    OUT="$(echo "$LIFECYCLE_OUT" | awk '/^OUTPUT_DIR=/ {sub(/^OUTPUT_DIR=/, ""); print; exit}')"
+    if [ -z "$OUT" ]; then
+        echo "raptor-frida-patch-verify: could not parse OUTPUT_DIR from lifecycle" >&2
+        exit 2
+    fi
+    LIFECYCLE_OWNED=1
+    PASS_ARGS+=("--out" "$OUT")
+else
+    LIFECYCLE_OWNED=0
+fi
+
+# ─── signal trap: forward to the child, decide disposition later ───
+# The trap must NOT write the lifecycle disposition: the exit status
+# after the signal decides it once, below — writing fail here and
+# complete after the wait made the final status a last-write race.
+# The child runs in its own session (setsid, when available) so the
+# whole tree gets the signal, not just the direct child.
+INTERRUPTED=""
+CHILD_GROUP=0
+if command -v setsid >/dev/null 2>&1; then
+    CHILD_GROUP=1
+fi
+_on_signal() {
+    INTERRUPTED="$1"
+    if [ -n "${CHILD_PID:-}" ]; then
+        if [ "$CHILD_GROUP" -eq 1 ]; then
+            kill -- "-$CHILD_PID" 2>/dev/null \
+                || kill "$CHILD_PID" 2>/dev/null || true
+        else
+            kill "$CHILD_PID" 2>/dev/null || true
+        fi
+    fi
+}
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+trap '_on_signal HUP'  HUP
+
+set +e
+if [ "$CHILD_GROUP" -eq 1 ]; then
+    setsid python3 -P -m packages.frida.patch_oracle "${PASS_ARGS[@]}" &
+else
+    python3 -P -m packages.frida.patch_oracle "${PASS_ARGS[@]}" &
+fi
+CHILD_PID=$!
+wait $CHILD_PID
+RC=$?
+if [ -n "$INTERRUPTED" ]; then
+    # A trapped signal interrupts the first wait before the child has
+    # exited; re-wait to collect the child's real disposition.
+    wait $CHILD_PID 2>/dev/null
+    RC=$?
+fi
+set -e
+
+trap - INT TERM HUP
+
+if [ $LIFECYCLE_OWNED -eq 1 ]; then
+    # 0/1/3 are verdicts (the run itself succeeded); only real
+    # failures mark the run failed.
+    case $RC in
+        0|1|3)
+            "$RAPTOR_DIR/libexec/raptor-run-lifecycle" complete "$OUT" || true
+            ;;
+        *)
+            if [ -n "$INTERRUPTED" ]; then
+                "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+                    "patch-verify interrupted by signal $INTERRUPTED (exited $RC)" || true
+            else
+                "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+                    "patch-verify exited $RC" || true
+            fi
+            ;;
+    esac
+fi
+
+exit $RC

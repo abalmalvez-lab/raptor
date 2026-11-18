@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
+"""Run raptor-sca with run-lifecycle integration.
+
+Called by ``bin/raptor-sca`` (user-facing CLI) or directly by the LLM.
+
+Usage:
+  raptor-sca-run <target> [flags]                    Scan a project
+  raptor-sca-run fix <target> [--allow-major]        Scan + fix CVEs + tighten pins
+  raptor-sca-run fix <target> --cve-only             Fix CVEs only
+  raptor-sca-run fix <target> --harden               Upgrade to latest safe versions
+  raptor-sca-run check <eco> <name> <version>        Pre-install safety verdict
+  raptor-sca-run upgrade <eco> <name> <from> <to>    Upgrade impact comparison
+  raptor-sca-run diff <baseline> <current>           Delta between two scan runs
+
+Only the scan path interacts with the run-lifecycle helpers (the
+findings.json + report.md produced are first-class run artefacts that
+the rest of RAPTOR consumes). The sub-commands run as-is and write
+their outputs to whatever ``--out`` the operator supplies.
+
+Target resolution for scan (per CLAUDE.md DEFAULT TARGET DIRECTORY):
+  1. Explicit positional argument (always bypasses the volatile gate)
+  2. Mechanical default chain (``core.run.output.resolve_default_target``):
+     active project's target, then $RAPTOR_CALLER_DIR — both layers
+     behind the volatile-target sanity gate
+  3. fail with exit code 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+# ─── trust-marker check (do not import; inline by design) ───
+# fmt: off
+import os  # noqa: E402
+if not (os.environ.get("CLAUDECODE")
+        or os.environ.get("_RAPTOR_TRUSTED")):
+    sys.stderr.write(
+        f"{sys.argv[0]}: internal dispatch script.\n"
+        "  Run via 'bin/raptor-sca' instead.\n"
+        "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
+    )
+    sys.exit(2)
+# fmt: on
+# ─── end trust-marker check ─────────────────────────────────
+
+from pathlib import Path  # noqa: E402
+
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO))
+import core.startup.process_init  # noqa: E402,F401
+from core.run.metadata import (  # noqa: E402
+    complete_run,
+    fail_run,
+    interrupt_run,
+    start_run,
+)
+from core.run.output import get_output_dir  # noqa: E402
+from packages.sca import cli as sca_cli  # noqa: E402
+from packages.sca.cli import SUBCOMMANDS as _SUBCOMMANDS  # noqa: E402
+from packages.sca.cli import _configure_logging, _print_summary  # noqa: E402
+
+_HELP = """\
+raptor-sca — dependency security scanner
+
+Commands:
+  raptor-sca <path>                              Scan for vulnerabilities
+  raptor-sca fix <path>                          Show fix plan (safe default)
+  raptor-sca fix <path> --apply                  Apply fixes in-place
+  raptor-sca fix <path> --apply --allow-major    Include major-version bumps
+  raptor-sca check PyPI django 4.2.10            Pre-install safety verdict
+  raptor-sca upgrade npm lodash 4.17.4 4.17.21   Upgrade impact comparison
+  raptor-sca diff old.json new.json              Delta between two scans
+
+CI gate (exit 1 if thresholds exceeded):
+  raptor-sca <path> --fail-on-severity high      Scan + fail on high+ findings
+  raptor-sca <path> --fail-on-kev                Fail if any KEV-listed CVE
+  raptor-sca render <findings.json> --fail-on-severity high
+                                                 Evaluate existing findings
+
+Utilities:
+  raptor-sca verify <path> --proposed <dir>      Confirm proposed fixes
+  raptor-sca fix-diff <findings.json>            Fetch upstream fix diffs
+                                                 via /cve-diff (LLM cost per
+                                                 CVE; capped, see --max-cves)
+  raptor-sca health                              Registry reachability check
+  raptor-sca purl PyPI django 4.2.10             Print canonical Package URL
+  raptor-sca render <findings.json>              Re-emit report.md / SARIF
+  raptor-sca sbom <command>                    SBOM inventory, notices and upgrade workflows
+  raptor-sca clean-cache --max-age 30            Reclaim disk from stale cache
+
+Run 'raptor-sca <command> --help' for command-specific options.
+Run 'raptor-sca --help-scan' for full scan options.
+"""
+
+
+def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+
+    if not raw and not os.environ.get("RAPTOR_CALLER_DIR"):
+        sys.stdout.write(_HELP)
+        return 0
+
+    if len(raw) == 1 and raw[0] in ("-h", "--help"):
+        sys.stdout.write(_HELP)
+        return 0
+
+    if len(raw) >= 1 and raw[0] == "--help-scan":
+        return _run_analyse(["--help"])
+
+    # Sub-commands bypass lifecycle: their artefacts aren't run-shaped
+    # (e.g., a single-line review verdict, a markdown delta report).
+    if raw and raw[0] in _SUBCOMMANDS:
+        return sca_cli.main(raw)
+
+    # Catch misspelled subcommands before they fall through to the scan
+    # path (where they'd fail as "not a directory").
+    if (raw and not raw[0].startswith("-")
+            and not raw[0].startswith("/")
+            and os.path.sep not in raw[0]
+            and not os.path.exists(raw[0])):
+        print(
+            f"raptor-sca: unknown subcommand {raw[0]!r}\n"
+            f"Run 'raptor-sca --help' for available commands.",
+            file=sys.stderr,
+        )
+        return 2
+
+    return _run_analyse(raw)
+
+
+# ---------------------------------------------------------------------------
+# Analyse-with-lifecycle path
+# ---------------------------------------------------------------------------
+
+def _parse_analyse(argv):
+    p = argparse.ArgumentParser(prog="raptor-sca")
+    # Target is optional here (can fall back to $RAPTOR_CALLER_DIR /
+    # active project); ``packages.sca.cli`` makes it required because
+    # it has no fallback. Every other flag comes from the shared
+    # registrar so the two surfaces don't drift.
+    p.add_argument("target", nargs="?",
+                   help="path to project (default: active project / "
+                        "$RAPTOR_CALLER_DIR)")
+    from packages.sca._scan_args import add_scan_args
+    add_scan_args(p)
+    return p.parse_args(argv)
+
+
+def _resolve_target(explicit):
+    """Explicit path, else the mechanical CLAUDE.md default chain.
+
+    ``resolve_default_target`` supplies the active-project layer AND
+    the volatile-target sanity gate (it refuses /tmp-class defaults
+    with its own loud banner) — a hand-rolled RAPTOR_CALLER_DIR
+    fallback here bypassed both, so a bare ``raptor-sca`` scanned
+    whatever scratch directory the shell happened to be in. Explicit
+    paths bypass the gate by contract.
+    """
+    if explicit:
+        return Path(explicit).resolve()
+    from core.run.output import resolve_default_target
+    default = resolve_default_target()
+    if default:
+        return Path(default).resolve()
+    return None
+
+
+def _run_analyse(argv):
+    from packages.sca.pipeline import run_sca
+
+    args = _parse_analyse(argv)
+    _configure_logging(args.verbose)
+
+    from packages.sca._scan_args import apply_no_llm_umbrella
+    apply_no_llm_umbrella(args)
+
+    target = _resolve_target(args.target)
+    if target is None:
+        # Covers both "no default signal at all" and a volatile
+        # default the gate refused (its banner already printed).
+        print(
+            "raptor-sca: no usable target — pass a path explicitly, "
+            "or set up an active project / $RAPTOR_CALLER_DIR.",
+            file=sys.stderr,
+        )
+        return 2
+    if not target.exists():
+        print(f"raptor-sca: target does not exist: {target}", file=sys.stderr)
+        return 2
+    if not target.is_dir():
+        print(f"raptor-sca: target is not a directory: {target}", file=sys.stderr)
+        return 2
+
+    from packages.sca._scan_args import effective_scan_plan
+    try:
+        plan = effective_scan_plan(args, target)
+    except ValueError as error:
+        print("raptor-sca: " + str(error), file=sys.stderr)
+        return 2
+    if args.explain_plan:
+        from core.json import dumps_artifact
+        print(dumps_artifact(plan, ensure_ascii=True))
+        return 0
+
+    try:
+        output_dir = get_output_dir(
+            command="sca",
+            target_name=target.name,
+            explicit_out=args.out,
+            target_path=str(target),
+        )
+    except Exception as e:                  # noqa: BLE001
+        print(f"raptor-sca: cannot resolve output dir: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        start_run(output_dir, "sca", target=str(target))
+    except Exception as e:
+        from core.project.oplock import OpLockContention
+        from core.run.pin import ProjectArgvError
+        if isinstance(e, (ProjectArgvError, OpLockContention)):
+            # Same CLI contract as raptor-run-lifecycle: a contended
+            # project prints the named-holder refusal, never a raw
+            # traceback.
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise
+
+    try:
+        # ``options_from_args`` resolves the repo-trust umbrella
+        # (``--no-trust-repo`` > ``--trust-repo`` > project ``config``
+        # marker > off) and propagates the resolved value to the
+        # process-wide ``cc_trust`` / ``codeql_trust`` overrides. Do NOT
+        # set the overrides from the raw flag here. It reads project
+        # registry/settings state, so it runs INSIDE this guard: any
+        # failure after start_run must mark the run failed rather than
+        # strand the record in 'running'.
+        from packages.sca._scan_args import options_from_args
+        options = options_from_args(args)
+        result = run_sca(target=target, output_dir=output_dir, options=options)
+    except KeyboardInterrupt:
+        # Ctrl-C is a BaseException the handler below never sees;
+        # without this the run record stays 'running' forever.
+        interrupt_run(output_dir, reason="operator interrupt (SIGINT)")
+        raise
+    except Exception as e:                  # noqa: BLE001
+        fail_run(output_dir, str(e))
+        print(f"raptor-sca: run failed: {e}", file=sys.stderr)
+        return 3
+
+    if args.baseline:
+        try:
+            sca_cli._emit_baseline_delta(
+                baseline_path=Path(args.baseline).resolve(),
+                current_findings=output_dir / "findings.json",
+                output_dir=output_dir,
+                emit_pr_comment=args.pr_comment,
+                pr_comment_label=args.pr_comment_label,
+            )
+        except Exception as e:              # noqa: BLE001
+            print(f"raptor-sca: baseline delta failed: {e}",
+                   file=sys.stderr)
+
+    # CI-gate threshold evaluation — only fires when --fail-on-* set.
+    # Read the findings BEFORE sealing the run: an unreadable
+    # findings.json is a run-artifact failure, and the exit code 3
+    # ('run failed') must agree with the recorded run status. A gate
+    # BREACH (exit 1) is not a run failure — the scan itself finished
+    # — so the run still completes in that case.
+    from packages.sca.thresholds import (
+        cfg_from_args,
+        print_result,
+    )
+    from packages.sca.thresholds import (
+        evaluate as eval_thresholds,
+    )
+    cfg = cfg_from_args(args)
+    if cfg.is_active:
+        from packages.sca.finding_stream import FindingsFile
+        from packages.sca.kinds import MAX_SELF_FINDINGS_BYTES
+        try:
+            passed, fails = eval_thresholds(FindingsFile(output_dir / "findings.json", max_bytes=MAX_SELF_FINDINGS_BYTES), cfg)
+        except (OSError, ValueError) as error:
+            fail_run(output_dir, "invalid findings for threshold check")
+            from core.security.log_sanitisation import sanitise_for_terminal
+            print("raptor-sca: " + sanitise_for_terminal(str(error)), file=sys.stderr)
+            return 3
+
+    complete_run(output_dir)
+    _print_summary(result)
+
+    if cfg.is_active:
+        print_result(passed, fails)
+        return 0 if passed else 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

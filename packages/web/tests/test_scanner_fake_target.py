@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import http.server
-import threading
-from contextlib import contextmanager
+import json
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from packages.web.scanner import WebScanner
+from packages.web.discovery import DiscoveryResult
+
+from packages.web.tests.http_server import start_http_server
 
 
 class _FakeTargetHandler(http.server.BaseHTTPRequestHandler):
@@ -33,26 +36,31 @@ class _FakeTargetHandler(http.server.BaseHTTPRequestHandler):
 @contextmanager
 def _fake_target():
     handler = type("FakeTargetHandler", (_FakeTargetHandler,), {"hits": []})
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with ExitStack() as cleanup:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        start_http_server(server, cleanup.callback)
         host, port = server.server_address
         yield f"http://{host}:{port}", handler
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
 
 
-def test_scanner_threads_crawl_limits_to_fake_target(tmp_path: Path):
+def test_scanner_threads_crawl_limits_to_fake_target(tmp_path: Path, monkeypatch):
     """A scanner-level fake target should honor operator crawl limits."""
-    with _fake_target() as (base_url, handler):
-        scanner = WebScanner(base_url, llm=None, out_dir=tmp_path, max_depth=0, max_pages=1)
-
-        result = scanner.scan()
+    with _fake_target() as (base_url, _handler):
+        with WebScanner(
+            base_url, llm=None, out_dir=tmp_path,
+            max_depth=0, max_pages=1, rate_limit=0,
+            block_private_ips=False,
+        ) as scanner:
+            # This fixture exercises crawl controls; discovery and checks have
+            # separate coverage and would issue unrelated probe requests here.
+            monkeypatch.setattr(scanner, "_phase_discovery",
+                                lambda: DiscoveryResult(urls=[base_url]))
+            monkeypatch.setattr(scanner, "_phase_passive_checks", lambda *_: [])
+            result = scanner.scan()
 
     assert result["discovery"]["total_pages"] == 1
-    assert handler.hits == ["/"]
     crawl_artifact = tmp_path / "crawl_results.json"
     assert crawl_artifact.exists()
+    crawl_data = json.loads(crawl_artifact.read_text(encoding="utf-8"))
+    assert crawl_data["stats"]["total_pages"] == 1
+    assert crawl_data["visited_urls"] == [base_url]

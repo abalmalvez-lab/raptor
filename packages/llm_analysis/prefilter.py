@@ -25,9 +25,11 @@ cold-start trust accumulation.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any
 
 from core.llm.task_types import TaskType
+from core.run.finding_status import read_verdict
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import (
     TaintedString,
@@ -42,12 +44,15 @@ logger = logging.getLogger(__name__)
 # packages/codeql/autonomous_analyzer.py:FP_PREFILTER_SCHEMA so cells
 # in the scorecard sidecar are comparable across consumers.
 FP_PREFILTER_SCHEMA = {
-    "verdict": (
-        "string — one of 'clear_fp' (this is clearly a false positive "
-        "and needs no further analysis) or 'needs_analysis' (any "
-        "uncertainty, or this looks like a real issue)"
-    ),
     "reasoning": "string — brief justification, 1-2 sentences",
+    "verdict": {
+        "type": "string",
+        "enum": ["clear_fp", "needs_analysis"],
+        "description": (
+            "clear_fp = clearly a false positive, needs no further analysis; "
+            "needs_analysis = any uncertainty, or this looks like a real issue"
+        ),
+    },
 }
 
 
@@ -82,8 +87,8 @@ def _fast_tier_model_name(client) -> str:
 
 
 def _cheap_fp_check(
-    client, item: Dict[str, Any],
-) -> Optional[Tuple[str, str]]:
+    client, item: dict[str, Any],
+) -> tuple[str, str] | None:
     """Ask the fast-tier model whether this finding is a clear false
     positive. Returns ``(verdict, reasoning)`` on success, ``None`` on
     call failure or unexpected response shape (caller treats as "no
@@ -142,12 +147,10 @@ def _cheap_fp_check(
             "Cheap FP check failed (falling through to full): %s", e,
         )
         return None
-    # ``LLMClient.generate_structured`` returns a StructuredResponse
-    # with ``.result`` dict. Older code paths (some test stubs) return
-    # a (dict, raw) tuple. Handle both.
-    result = getattr(response, "result", None)
-    if result is None and isinstance(response, tuple) and response:
-        result = response[0]
+    # Shared unwrap: handles both the StructuredResponse shape and the
+    # legacy (dict, raw) tuple some test stubs return.
+    from core.llm.structured_call import unwrap_structured_response
+    result = unwrap_structured_response(response).result
     if not isinstance(result, dict):
         return None
     verdict = str(result.get("verdict") or "").strip().lower()
@@ -161,7 +164,7 @@ def _cheap_fp_check(
     return verdict, reasoning
 
 
-def agentic_fp_analysis(reasoning: str) -> Dict[str, Any]:
+def agentic_fp_analysis(reasoning: str) -> dict[str, Any]:
     """Build a per-finding analysis dict from a cheap-tier ``clear_fp``
     verdict. Shape mirrors the keys consumers downstream of dispatch
     (orchestrator merge loop, /agentic summary print, console table)
@@ -174,7 +177,9 @@ def agentic_fp_analysis(reasoning: str) -> Dict[str, Any]:
         "is_exploitable": False,
         "exploitability_score": 0.0,
         "confidence": "medium",
-        "severity_assessment": "info",
+        # Canonical SEVERITY_LEVELS value — "info" is not in the enum
+        # and rendered inconsistently beside full-analysis results.
+        "severity_assessment": "informational",
         "ruling": "false_positive",
         "reasoning": (
             f"Fast-tier prefilter classified as false positive: "
@@ -196,14 +201,31 @@ def agentic_fp_analysis(reasoning: str) -> Dict[str, Any]:
 
 
 def prefilter_for_finding(
-    client, item: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+    client, item: dict[str, Any],
+    pending_claims: dict[str, dict[str, Any]] | None = None,
+    repo: str | Path | None = None,
+) -> dict[str, Any] | None:
     """Return a short-circuit analysis dict if the scorecard trusts a
     cheap-tier ``clear_fp`` verdict for this finding, or ``None`` to
     fall through to the full ANALYSE call.
 
     Bumps ``client.short_circuits`` on the short-circuit path so the
     /agentic summary can surface concrete savings.
+
+    ``pending_claims``: optional dict the caller shares across the
+    dispatch batch. On fall-through with an (untrusted) ``clear_fp``
+    claim, the claim is stashed under the finding id so
+    :func:`record_prefilter_outcomes` can adjudicate it against the
+    full analysis verdict afterwards. Without this recording the
+    ``agentic:<rule_id>`` scorecard cells never accumulate events and
+    ``should_short_circuit`` stays in learning mode forever — the
+    calibration loop is silently open.
+
+    ``repo``: the analysis target, threaded to the scorecard's
+    target-diversity gate. Callers pass the ORCHESTRATOR-resolved
+    repo path — deliberately not ``item["repo_path"]``, which comes
+    from the prep report (``setdefault``-stamped, so a prep-report-
+    carried value wins) and could mint fake target diversity.
     """
     from core.llm.scorecard import prefilter_decision
 
@@ -220,6 +242,7 @@ def prefilter_for_finding(
         decision_class=decision_class,
         model=fast_model_name,
         cheap_says_fp=cheap_says_fp,
+        repo=repo,
     )
     if decision.short_circuit:
         logger.info(
@@ -231,11 +254,127 @@ def prefilter_for_finding(
         if callable(record_short_circuit):
             record_short_circuit()
         return agentic_fp_analysis(cheap_reasoning)
+    if cheap_says_fp and pending_claims is not None:
+        finding_id = str(
+            item.get("finding_id") or item.get("group_id") or "",
+        )
+        if finding_id:
+            pending_claims[finding_id] = {
+                "decision_class": decision_class,
+                "model": fast_model_name,
+                "cheap_reasoning": cheap_reasoning,
+            }
     return None
+
+
+def make_prefilter_fn(
+    client, pending_claims: dict[str, dict[str, Any]] | None = None,
+    repo: str | Path | None = None,
+):
+    """Per-finding-memoized prefilter hook for ``dispatch_task``.
+
+    The dispatcher fans work out as (model x finding) pairs and calls
+    the prefilter hook once per PAIR, but the cheap FP check is
+    model-independent: without memoization an N-model run pays N
+    identical cheap-tier LLM calls per finding, races the
+    ``pending_claims`` writes from concurrent threads, and (on the
+    trusted short-circuit path) over-counts ``client.short_circuits``
+    N times. One cheap call per finding; every model's work item for
+    that finding reuses the verdict.
+
+    Thread-safe: a per-finding lock serialises the N model workers
+    for the SAME finding (exactly one cheap call), while different
+    findings still prefilter in parallel.
+    """
+    import threading
+
+    cache: dict[str, dict[str, Any] | None] = {}
+    locks: dict[str, threading.Lock] = {}
+    master = threading.Lock()
+
+    def prefilter_fn(item: dict[str, Any]) -> dict[str, Any] | None:
+        fid = str(
+            item.get("finding_id") or item.get("group_id") or "",
+        ) or f"@{id(item)}"
+        with master:
+            lock = locks.setdefault(fid, threading.Lock())
+        with lock:
+            if fid not in cache:
+                cache[fid] = prefilter_for_finding(
+                    client, item, pending_claims=pending_claims,
+                    repo=repo,
+                )
+            return cache[fid]
+
+    return prefilter_fn
+
+
+def record_prefilter_outcomes(
+    client,
+    pending_claims: dict[str, dict[str, Any]],
+    results: list[dict[str, Any]],
+    repo: str | Path | None = None,
+) -> int:
+    """Adjudicate stashed cheap ``clear_fp`` claims against the full
+    ANALYSE verdicts and record them to the scorecard.
+
+    Mirrors the recording step the codeql/SCA prefilter twins perform
+    inline after their full analysis; /agentic's split hook/dispatch
+    structure needs it as a post-batch pass. Returns the number of
+    events recorded. Best-effort — never raises.
+
+    ``repo``: the orchestrator-resolved analysis target for the
+    scorecard's diversity ledger (same provenance rule as
+    :func:`prefilter_for_finding` — never a finding-dict field).
+    """
+    if not pending_claims:
+        return 0
+    scorecard = getattr(client, "scorecard", None)
+    if scorecard is None:
+        return 0
+    from core.llm.scorecard import record_prefilter_outcome
+
+    n = 0
+    for result in results or []:
+        if not isinstance(result, dict) or "error" in result:
+            continue
+        claim = pending_claims.get(str(result.get("finding_id") or ""))
+        if claim is None:
+            continue
+        full_verdict = read_verdict(result, "is_true_positive")
+        if full_verdict is None:
+            # The full analysis abstained (quality-degraded response
+            # with no verdict field, or a malformed shape that is a
+            # non-verdict either way). An abstention is not a
+            # disagreement — recording it as "incorrect" would erode
+            # fast-tier trust on zero evidence, the same
+            # abstention-as-vote miscount the correlation engine
+            # filters out of verdict counting.
+            continue
+        try:
+            record_prefilter_outcome(
+                scorecard,
+                decision_class=claim["decision_class"],
+                model=claim["model"],
+                cheap_says_fp=True,
+                full_says_fp=(full_verdict is False),
+                cheap_reasoning=claim.get("cheap_reasoning", ""),
+                full_reasoning=str(result.get("reasoning") or ""),
+                repo=repo,
+            )
+            n += 1
+        except Exception:
+            logger.debug("prefilter outcome recording failed",
+                         exc_info=True)
+    if n:
+        logger.info("fast-tier prefilter scorecard: %d outcomes", n)
+    return n
 
 
 __all__ = [
     "FP_PREFILTER_SCHEMA",
     "agentic_fp_analysis",
+    "make_prefilter_fn",
     "prefilter_for_finding",
+    "record_prefilter_outcomes",
 ]

@@ -1,0 +1,419 @@
+"""Project-specific alias macro discovery.
+
+Header pre-pass that finds ``#define MACRO_NAME ... __attribute__((...))``
+patterns in the target's header files and classifies each by which
+attribute family it expands to. The discovered aliases augment the
+curated table in ``aliases.py``.
+
+Scope (Phase 3c v1):
+  * Walks ``*.h``, ``*.hpp``, ``*.hh``, ``*.hxx`` files under target.
+  * Recursive macro resolution up to depth 3 (cycle-safe).
+  * Per-family frequency cap of 30 — the top 30 discovered aliases by
+    usage count in source files. Bounds output size on large kernels
+    where dozens of project-specific aliases exist.
+  * Safe-grep only — no preprocessor expansion, no `#include` following,
+    no shelling out. Pure text inspection of header files; untrusted-
+    target safe by construction.
+
+What this does NOT do (deferred):
+  * Function-name binding: alias-discovery records the macro names,
+    not which functions they applied to. The PER-ALIAS cocci rules
+    that ship with each axis (e.g. ``attr_warn_unused_result.cocci``)
+    handle function binding when the alias spelling is known in
+    advance. Discovery extends the alias-scan pass in ``analyze.py``;
+    that pass records "alias spelling X was seen in this file" with
+    ``function_name=""``.
+  * Conditional discovery: we don't yet track when an alias is
+    ``#ifdef``-gated. Could be added if corpus shows it matters.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+from core.paths import confine
+from core.source import read_text_capped
+
+
+
+#: Per-family substring markers — the expansion of a discovered macro
+#: must contain at least one of these to be classified into the family.
+_KIND_MARKERS: dict[str, tuple[str, ...]] = {
+    "wur": (
+        "warn_unused_result",
+        "__warn_unused_result__",
+        "nodiscard",
+    ),
+    "nonnull": (
+        "nonnull",
+        "__nonnull__",
+    ),
+    "alloc_size": (
+        "alloc_size",
+        "__alloc_size__",
+    ),
+    "returns_nonnull": (
+        "returns_nonnull",
+        "__returns_nonnull__",
+    ),
+}
+
+#: Compiled identifier-boundary matchers per family marker. A marker
+#: only matches when not embedded in a longer identifier (so the
+#: ``nonnull`` marker does NOT match inside ``returns_nonnull``, but
+#: still matches ``__attribute__((nonnull(1)))`` where it is delimited
+#: by punctuation).
+_KIND_MARKER_RES: dict[str, tuple[re.Pattern[str], ...]] = {
+    family: tuple(
+        re.compile(
+            r"(?<![A-Za-z0-9_])" + re.escape(marker) + r"(?![A-Za-z0-9_])"
+        )
+        for marker in markers
+    )
+    for family, markers in _KIND_MARKERS.items()
+}
+
+
+#: Per-family alias-cap (highest-frequency aliases kept; rest discarded).
+#: Bounds the generated rule template / alias-scan size on dense kernels.
+PER_FAMILY_ALIAS_CAP: int = 30
+
+#: Maximum macro→macro resolution depth.
+MAX_RESOLUTION_DEPTH: int = 3
+
+#: Header file extensions inspected.
+_HEADER_EXTS: tuple[str, ...] = (".h", ".hpp", ".hh", ".hxx")
+
+#: Source file extensions inspected for frequency-counting alias usage.
+_SOURCE_EXTS: tuple[str, ...] = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx")
+
+#: Caps on admitted matching header/source files across the scan roots.
+#: Nonmatching entries and directories are still traversed; these caps
+#: do not bound total traversal work or elapsed time.
+_MAX_FILES_HEADER_SCAN: int = 2000
+_MAX_FILES_SOURCE_SCAN: int = 5000
+
+
+# Regex matching `#define MACRO_NAME[(args)] EXPANSION` — captures the
+# macro name and its expansion. Multi-line continuations (``\<newline>``)
+# are pre-joined before scanning so the regex sees a single line.
+# Every separator stays on that logical line. Function-like parameters
+# must immediately follow the name; object-like replacements need spacing.
+#
+# Macro names allow both upper and lower case: kernel uses ``__must_check``
+# (lowercase), glibc uses ``__wur``; conventional project macros use
+# uppercase (``MUST_CHECK``). Both shapes covered.
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs in scanned source.
+_DEFINE_RE = re.compile(
+    r"^[^\S\n]*#[^\S\n]*define[^\S\n]+([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\([^)\n]*\)[^\S\n]*|[^\S\n]+|(?=$))([^\n]*)$",
+    re.MULTILINE,
+)
+
+# Word-boundary token capture for macro names so we can count usage
+# in source files without false-positive substring matches. Same
+# identifier rules as ``_DEFINE_RE`` (>= 1 character — a two-char
+# minimum would silently drop single-character macros from recursive
+# expansion resolution, breaking alias chains routed through them).
+_TOKEN_NAME_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    """Outcome of a header pre-pass."""
+
+    #: Per-family discovered macro names, capped per ``PER_FAMILY_ALIAS_CAP``,
+    #: ordered by usage frequency in source files (descending).
+    aliases_by_family: dict[str, tuple[str, ...]]
+
+    #: Total number of header files scanned.
+    headers_scanned: int
+
+    #: Total number of source files scanned for frequency counts.
+    sources_scanned: int
+
+
+def discover_aliases(target: Path) -> DiscoveryResult:
+    """Walk header files under ``target``, discover project-specific
+    attribute alias macros, count their usage in source files, and
+    return the top per family.
+
+    Returns an empty :class:`DiscoveryResult` when ``target`` isn't a
+    directory or contains no headers — same skip semantics as the
+    rest of source_intel.
+
+    Scope: scans ``target`` recursively AND any sibling ``include/``
+    directory found by walking up to 2 parents. Many project
+    structures (openssl, curl, kernel out-of-tree builds, autotools
+    projects) keep public attribute-macro definitions in a parent
+    ``include/`` tree separate from the per-subsystem source. Without
+    the sibling walk, an operator narrowing the scan to one
+    subsystem (e.g. ``openssl/crypto``) gets zero aliases.
+    """
+    target = Path(target)
+    if not target.is_dir():
+        return DiscoveryResult(
+            aliases_by_family=dict.fromkeys(_KIND_MARKERS, ()),
+            headers_scanned=0,
+            sources_scanned=0,
+        )
+
+    scan_roots: list[Path] = [target]
+    # Walk up at most 2 parents looking for a sibling include/ tree.
+    # 1 hop covers `proj/crypto` → `proj/include`; 2 hops covers
+    # `proj/sub/comp` → `proj/include`. Stop sooner if we hit /.
+    for hops in (1, 2):
+        if len(target.parts) <= hops:
+            break
+        parent = target.parents[hops - 1]
+        sibling_include = parent / "include"
+        if sibling_include.is_dir() and sibling_include not in scan_roots:
+            scan_roots.append(sibling_include)
+            break  # one include/ sibling is enough; deeper hops
+                   # tend to false-positive on system /usr/include.
+
+    # Phase 1: scan headers across all roots, build macro_name →
+    # expansion map. Keep the first encountered definition as a text-scan
+    # policy; preprocessing order and conditional redefinitions are not evaluated.
+    macros: dict[str, str] = {}
+    headers_seen = 0
+    admitted_headers: set[Path] = set()
+    for root in scan_roots:
+        for entry in root.rglob("*"):
+            if headers_seen >= _MAX_FILES_HEADER_SCAN:
+                break
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() not in _HEADER_EXTS:
+                continue
+            resolved_entry = confine(root, entry)
+            if resolved_entry is not None and resolved_entry in admitted_headers:
+                continue
+            headers_seen += 1
+            if resolved_entry is None:
+                continue
+            # Overlapping roots share one admission/read per confined path,
+            # including entries whose read or lexical view is refused.
+            admitted_headers.add(resolved_entry)
+            got = read_text_capped(resolved_entry)
+            if got is None:
+                continue
+            text = _join_continuations(got[0])
+            # Classify only code-shaped expansion markers. A comment or
+            # string mentioning an attribute does not declare that family.
+            # Reuse the capped text and existing pure-view ambiguity policy.
+            from core.audit.source_view import sanitized_view_with_status
+            view = sanitized_view_with_status(text, str(resolved_entry))
+            if view.ambiguous:
+                continue
+            text = view.text
+            for m in _DEFINE_RE.finditer(text):
+                name = m.group(1)
+                expansion = m.group(2).strip()
+                macros.setdefault(name, expansion)
+
+    # Phase 2: classify each macro by family. A macro is in a family
+    # iff its FULLY-RESOLVED expansion (recursive macro lookup up to
+    # MAX_RESOLUTION_DEPTH) contains a family marker as a standalone
+    # token. Identifier-boundary matching, not substring: `nonnull`
+    # is a substring of `returns_nonnull`, and classifying a
+    # returns_nonnull alias into the nonnull(-args) family would tell
+    # downstream consumers the function's ARGUMENTS are annotated
+    # when only the return value is.
+    family_to_aliases: dict[str, list[str]] = defaultdict(list)
+    for name, expansion in macros.items():
+        resolved = _resolve_expansion(expansion, macros, depth=0)
+        for family, marker_res in _KIND_MARKER_RES.items():
+            if any(marker_re.search(resolved) for marker_re in marker_res):
+                family_to_aliases[family].append(name)
+
+    # Phase 3: count usage of each candidate macro in source files.
+    # Counted across ALL scan roots, not just `target`: attribute
+    # macros defined in a sibling include/ tree are normally APPLIED
+    # there too (public API headers), so a target-only count would
+    # report zero usage and the zero-usage filter below would drop
+    # exactly the aliases the sibling-include walk exists to find.
+    candidate_names: set[str] = set()
+    for names in family_to_aliases.values():
+        candidate_names.update(names)
+    usage_counts, sources_scanned = _count_usage_with_scan_count(scan_roots, candidate_names)
+
+    # Phase 4: sort within each family by usage frequency desc, cap.
+    out: dict[str, tuple[str, ...]] = {}
+    for family, names in family_to_aliases.items():
+        # Filter to candidates that appear at least once (drop dead
+        # defines — common in kernel headers where alternate-config
+        # branches define unused macros).
+        used = [n for n in names if usage_counts.get(n, 0) > 0]
+        # Sort: usage count desc, then alphabetical for stable order.
+        used.sort(key=lambda n: (-usage_counts.get(n, 0), n))
+        out[family] = tuple(used[:PER_FAMILY_ALIAS_CAP])
+
+    # Ensure every known family has a key (empty tuple if no aliases).
+    for family in _KIND_MARKERS:
+        out.setdefault(family, ())
+
+    return DiscoveryResult(
+        aliases_by_family=out,
+        headers_scanned=headers_seen,
+        sources_scanned=sources_scanned,
+    )
+
+
+# ---------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------
+
+
+def _join_continuations(text: str) -> str:
+    r"""Pre-join GNU make / cpp line-continuation backslashes so the
+    define regex sees a single logical line per macro.
+
+    Replaces ``\<newline>`` with a single space.
+    """
+    return re.sub(r"\\\n", " ", text)
+
+
+def _resolve_expansion(
+    expansion: str,
+    macros: dict[str, str],
+    *,
+    depth: int,
+    visited: set[str] | None = None,
+) -> str:
+    """Recursively expand any macro tokens in ``expansion`` using the
+    discovered macro table. Bounded by ``MAX_RESOLUTION_DEPTH`` and a
+    visited-set guard to prevent cycles (``#define A B`` + ``#define B A``).
+    """
+    if depth >= MAX_RESOLUTION_DEPTH:
+        return expansion
+    visited = set(visited) if visited else set()
+    # Depth and visited context are fixed within this call. Repeated
+    # occurrences of a token can share its expansion without retaining
+    # results across calls or changing cycle detection.
+    resolved_tokens: dict[str, str] = {}
+
+    def _replace_token(match: re.Match) -> str:
+        token = match.group(0)
+        if token in visited:
+            return token
+        if token not in macros:
+            return token
+        if token not in resolved_tokens:
+            resolved_tokens[token] = _resolve_expansion(
+                macros[token], macros, depth=depth + 1,
+                visited=visited | {token},
+            )
+        return resolved_tokens[token]
+
+    return _TOKEN_NAME_RE.sub(_replace_token, expansion)
+
+
+def _iter_source_files(scan_roots: list[Path]):
+    """Yield source files under every root in ``scan_roots`` whose
+    extensions are in ``_SOURCE_EXTS``, bounded by
+    ``_MAX_FILES_SOURCE_SCAN`` across all roots. Files are
+    de-duplicated by resolved path in case one root nests inside
+    another."""
+    seen = 0
+    yielded: set[Path] = set()
+    for root in scan_roots:
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            continue
+        for entry in root.rglob("*"):
+            if seen >= _MAX_FILES_SOURCE_SCAN:
+                return
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() not in _SOURCE_EXTS:
+                continue
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if resolved in yielded:
+                continue
+            if not (resolved == root_resolved
+                    or resolved.is_relative_to(root_resolved)):
+                # symlink escaping the scan root: never read content
+                # from outside the tree being scanned
+                continue
+            yielded.add(resolved)
+            seen += 1
+            # yield the RESOLVED path: in-root symlinked sources stay
+            # readable through the capped reader (which refuses
+            # final-component links by design)
+            yield resolved
+
+
+def _count_usage(scan_roots: list[Path], names: set[str]) -> dict[str, int]:
+    """Return lexical usage counts; see :func:`_count_usage_with_scan_count`."""
+    return _count_usage_with_scan_count(scan_roots, names)[0]
+
+
+def _count_usage_with_scan_count(
+    scan_roots: list[Path], names: set[str],
+) -> tuple[dict[str, int], int]:
+    """Count word-boundary macro mentions in admitted code views.
+
+    The defined name on its own ``#define NAME …`` line is excluded;
+    references to other macros in its expansion still count. Comments
+    and literals are blanked by the shared view. Unreadable or ambiguous
+    input contributes no counted mentions, not proof of macro absence.
+
+    Counts remain lexical heuristics, not actual macro invocation or
+    preprocessing activity. Returns zero for names not counted, plus the
+    number of admitted source entries, including read/view refusals.
+    """
+    counts: dict[str, int] = dict.fromkeys(names, 0)
+    if not names:
+        return counts, 0
+
+    # Compile one large regex with all the candidate names. Word
+    # boundaries on both sides eliminate substring false positives.
+    pattern = re.compile(r"\b(" + "|".join(
+        re.escape(n) for n in sorted(names, key=len, reverse=True)
+    ) + r")\b")
+
+    # Recognise the macro's own definition line so we can skip it.
+    # Matches ``#define NAME`` with whitespace + optional ``(args)``.
+    define_re = re.compile(
+        r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+    )
+
+    sources_scanned = 0
+    for entry in _iter_source_files(scan_roots):
+        sources_scanned += 1
+        got = read_text_capped(entry)
+        if got is None:
+            continue
+        text = got[0]
+        # Avoid lexical-view work when no candidate can occur at all.
+        if not pattern.search(text):
+            continue
+        from core.audit.source_view import sanitized_view_with_status
+        view = sanitized_view_with_status(text, str(entry))
+        if view.ambiguous:
+            continue
+        text = view.text
+        for line in text.split("\n"):  # line-model: universal-newline read_text_capped above
+            # Skip lines that DEFINE one of our candidates — those
+            # aren't usage, they're definition. (A define line may
+            # also mention OTHER macros in its expansion; we still
+            # count those via the inclusive word-boundary match below
+            # since they ARE usage from the define's perspective.)
+            define_match = define_re.match(line)
+            defined_name = define_match.group(1) if define_match else None
+            for m in pattern.finditer(line):
+                token = m.group(1)
+                if token == defined_name:
+                    # Define line for this macro — not usage.
+                    continue
+                counts[token] += 1
+    return counts, sources_scanned

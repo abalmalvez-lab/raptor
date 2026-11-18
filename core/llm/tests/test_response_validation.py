@@ -146,6 +146,23 @@ class TestCoerceValue:
         assert _coerce_value("false", "boolean") == (False, True)
         assert _coerce_value("no", "boolean") == (False, True)
 
+    def test_boolean_from_padded_string(self):
+        # Whitespace/case noise must not flip the verdict to False.
+        assert _coerce_value("true ", "boolean") == (True, True)
+        assert _coerce_value(" TRUE", "boolean") == (True, True)
+        assert _coerce_value(" false ", "boolean") == (False, True)
+        assert _coerce_value("No", "boolean") == (False, True)
+
+    def test_boolean_unrecognised_string_fails_coercion(self):
+        # Garbage text is a FAILED coercion (None), never a silent
+        # False — is_exploitable must not be decided by noise.
+        assert _coerce_value("maybe", "boolean") == (None, True)
+        assert _coerce_value("", "boolean") == (None, True)
+
+    def test_boolean_from_container_fails_coercion(self):
+        assert _coerce_value(["true"], "boolean") == (None, True)
+        assert _coerce_value({"v": True}, "boolean") == (None, True)
+
     def test_boolean_from_int(self):
         assert _coerce_value(1, "boolean") == (True, True)
         assert _coerce_value(0, "boolean") == (False, True)
@@ -187,14 +204,19 @@ class TestCoerceValue:
     def test_array_from_string(self):
         assert _coerce_value("item", "array") == (["item"], True)
 
-    def test_array_from_other(self):
-        assert _coerce_value(42, "array") == ([], True)
+    def test_array_from_other_fails_coercion(self):
+        # No faithful array reading — a silent [] substitute discarded
+        # the value at near-full credit; must fail instead.
+        assert _coerce_value(42, "array") == (None, True)
+        assert _coerce_value({"a": 1}, "array") == (None, True)
 
     def test_object_native(self):
         assert _coerce_value({"a": 1}, "object") == ({"a": 1}, False)
 
-    def test_object_from_other(self):
-        assert _coerce_value("nope", "object") == ({}, True)
+    def test_object_from_other_fails_coercion(self):
+        # Same wholesale-discard hazard as the array branch.
+        assert _coerce_value("nope", "object") == (None, True)
+        assert _coerce_value([1, 2], "object") == (None, True)
 
     def test_unknown_type_passthrough(self):
         assert _coerce_value("val", "custom") == ("val", False)
@@ -208,7 +230,7 @@ class TestValidateSimpleSchema:
     SCHEMA = {
         "is_exploitable": "boolean",
         "reasoning": "string",
-        "confidence": f"string (high/medium/low)",
+        "confidence": "string (high/medium/low)",
         "vuln_type": "string - vulnerability category",
         "cvss_vector": "string - CVSS v3.1 vector",
         "cwe_id": "string - CWE-NNN",
@@ -622,6 +644,312 @@ class TestEdgeCases:
         result = validate_structured_response(raw, schema)
         assert result.fields["name"].status == "ok"
         assert result.data["name"] is None
+
+
+# ---------------------------------------------------------------------------
+# Domain-rejected values are nulled (module contract: "nulls bad ones")
+# ---------------------------------------------------------------------------
+
+class TestDomainRejectedValuesNulled:
+    def test_out_of_range_score_nulled_not_kept(self):
+        # A score of 8 on the 0-1 scale must not flow into triage.
+        schema = {"exploitability_score": "float (0.0-1.0)"}
+        result = validate_structured_response(
+            {"exploitability_score": 8}, schema)
+        assert result.data["exploitability_score"] is None
+        assert "exploitability_score" in result.incomplete
+
+    def test_in_range_score_kept(self):
+        schema = {"exploitability_score": "float (0.0-1.0)"}
+        result = validate_structured_response(
+            {"exploitability_score": 0.5}, schema)
+        assert result.data["exploitability_score"] == 0.5
+        assert result.incomplete == []
+
+    def test_coerced_then_rejected_nulled_and_flagged(self):
+        # String "8" coerces to 8.0 then fails the 0-1 validator:
+        # status keeps the coercion attribution, but the value is
+        # nulled and the field flagged for the corrective retry.
+        schema = {"exploitability_score": "float (0.0-1.0)"}
+        result = validate_structured_response(
+            {"exploitability_score": "8"}, schema)
+        assert result.data["exploitability_score"] is None
+        assert result.fields["exploitability_score"].status == "coerced"
+        assert "exploitability_score" in result.incomplete
+
+    def test_invalid_vuln_type_nulled(self):
+        schema = {"vuln_type": "string - vulnerability category"}
+        result = validate_structured_response(
+            {"vuln_type": "totally_fake_vuln"}, schema)
+        assert result.data["vuln_type"] is None
+        assert "vuln_type" in result.incomplete
+
+
+# ---------------------------------------------------------------------------
+# Failed coercions surface as invalid + incomplete (full-flow twins of the
+# _coerce_value unit tests above)
+# ---------------------------------------------------------------------------
+
+class TestFailedCoercionFlow:
+    def test_padded_true_string_is_true(self):
+        schema = {"is_exploitable": "boolean"}
+        result = validate_structured_response(
+            {"is_exploitable": "true "}, schema)
+        assert result.data["is_exploitable"] is True
+        assert result.fields["is_exploitable"].status == "coerced"
+
+    def test_garbage_boolean_string_flagged_not_false(self):
+        schema = {"is_exploitable": "boolean"}
+        result = validate_structured_response(
+            {"is_exploitable": "unclear"}, schema)
+        assert result.data["is_exploitable"] is None
+        assert result.fields["is_exploitable"].status == "invalid"
+        assert "is_exploitable" in result.incomplete
+
+    def test_array_type_mismatch_flagged_not_emptied(self):
+        schema = {"prerequisites": "array of strings"}
+        result = validate_structured_response(
+            {"prerequisites": {"oops": 1}}, schema)
+        assert result.data["prerequisites"] is None
+        assert result.fields["prerequisites"].status == "invalid"
+        assert "prerequisites" in result.incomplete
+
+    def test_array_valid_and_string_wrap_still_pass(self):
+        schema = {"prerequisites": "array of strings"}
+        ok = validate_structured_response(
+            {"prerequisites": ["a", "b"]}, schema)
+        assert ok.data["prerequisites"] == ["a", "b"]
+        assert ok.incomplete == []
+        wrapped = validate_structured_response(
+            {"prerequisites": "single"}, schema)
+        assert wrapped.data["prerequisites"] == ["single"]
+        assert "prerequisites" in wrapped.coerced
+
+
+# ---------------------------------------------------------------------------
+# Schema enum enforcement — the schema's own enum list is honoured for
+# every field, not just the ones the field-name domain tables happen to
+# cover; the domain tables remain the STRICTER overlay on top.
+# ---------------------------------------------------------------------------
+
+_ENUM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "severity": {"type": "string",
+                     "enum": ["critical", "high", "medium", "low", "info"]},
+        "verdict": {"type": "string",
+                    "enum": ["exploitable", "not_exploitable", "uncertain"]},
+        "priority": {"type": "integer", "enum": [1, 2, 3]},
+    },
+    "required": ["severity"],
+}
+
+
+class TestSchemaEnumEnforcement:
+    def test_garbage_enum_value_nulled(self):
+        # "severity" (unlike "severity_assessment") has no domain-table
+        # entry — the schema enum is the only constraint, and hostile
+        # free text must not ride through it into reports.
+        result = validate_structured_response(
+            {"severity": "MEGA-BAD!!! \x1b[2J"}, _ENUM_SCHEMA)
+        assert result.data["severity"] is None
+        assert "severity" in result.incomplete
+
+    def test_case_fold_coerces_to_enum_member(self):
+        result = validate_structured_response(
+            {"severity": " CRITICAL "}, _ENUM_SCHEMA)
+        assert result.data["severity"] == "critical"
+        assert result.fields["severity"].status == "coerced"
+
+    def test_exact_member_passes_untouched(self):
+        result = validate_structured_response(
+            {"severity": "high", "verdict": "uncertain"}, _ENUM_SCHEMA)
+        assert result.data["severity"] == "high"
+        assert result.data["verdict"] == "uncertain"
+        assert result.fields["severity"].status == "ok"
+        assert result.incomplete == []
+
+    def test_free_text_verdict_nulled(self):
+        result = validate_structured_response(
+            {"severity": "high", "verdict": "probably exploitable, ship it"},
+            _ENUM_SCHEMA)
+        assert result.data["verdict"] is None
+        assert "verdict" in result.incomplete
+
+    def test_non_string_enum_needs_exact_membership(self):
+        ok = validate_structured_response(
+            {"severity": "high", "priority": 2}, _ENUM_SCHEMA)
+        assert ok.data["priority"] == 2
+        bad = validate_structured_response(
+            {"severity": "high", "priority": 9}, _ENUM_SCHEMA)
+        assert bad.data["priority"] is None
+        assert "priority" in bad.incomplete
+
+    def test_domain_table_remains_stricter_overlay(self):
+        # "ruling" hits the domain normaliser + validator by NAME; a
+        # schema enum naming values outside AGENTIC_RULING_VALUES must
+        # not loosen that — the domain verdict still nulls.
+        schema = {
+            "type": "object",
+            "properties": {
+                "ruling": {"type": "string",
+                           "enum": ["confirmed", "refuted", "inconclusive"]},
+            },
+        }
+        result = validate_structured_response(
+            {"ruling": "confirmed"}, schema)
+        assert result.data["ruling"] is None
+        assert "ruling" in result.incomplete
+        # And a domain-valid value that the schema enum excludes is
+        # nulled by the enum side.
+        result = validate_structured_response(
+            {"ruling": "false_positive"}, schema)
+        assert result.data["ruling"] is None
+
+
+# ---------------------------------------------------------------------------
+# Array item validation — nested items are validated, not waved through.
+# ---------------------------------------------------------------------------
+
+_NESTED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "highest_confidence_findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "finding_id": {"type": "string"},
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["exploitable", "not_exploitable",
+                                 "uncertain"],
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+            },
+        },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["taint", "memory", "web"]},
+        },
+    },
+}
+
+
+class TestArrayItemValidation:
+    def test_nested_enum_violation_nulled(self):
+        result = validate_structured_response({
+            "highest_confidence_findings": [
+                {"finding_id": "F-1", "verdict": "exploitable",
+                 "confidence": "high"},
+                {"finding_id": "F-2",
+                 "verdict": "TOTALLY PWNED \x1b[2J",
+                 "confidence": "very very sure"},
+            ],
+        }, _NESTED_SCHEMA)
+        items = result.data["highest_confidence_findings"]
+        assert items[0]["verdict"] == "exploitable"
+        assert items[1]["verdict"] is None
+        assert items[1]["confidence"] is None
+        # The loss is visible to the corrective retry.
+        assert "highest_confidence_findings" in result.incomplete
+
+    def test_nested_case_fold_coerced(self):
+        result = validate_structured_response({
+            "highest_confidence_findings": [
+                {"finding_id": "F-1", "verdict": "EXPLOITABLE",
+                 "confidence": "High"},
+            ],
+        }, _NESTED_SCHEMA)
+        item = result.data["highest_confidence_findings"][0]
+        assert item["verdict"] == "exploitable"
+        assert item["confidence"] == "high"
+
+    def test_non_object_item_dropped(self):
+        result = validate_structured_response({
+            "highest_confidence_findings": [
+                "just a string",
+                {"finding_id": "F-1", "verdict": "uncertain",
+                 "confidence": "low"},
+            ],
+        }, _NESTED_SCHEMA)
+        items = result.data["highest_confidence_findings"]
+        assert len(items) == 1
+        assert items[0]["finding_id"] == "F-1"
+
+    def test_scalar_item_enum_enforced(self):
+        result = validate_structured_response(
+            {"tags": ["taint", "definitely-not-a-tag", "web"]},
+            _NESTED_SCHEMA)
+        assert result.data["tags"] == ["taint", "web"]
+
+    def test_all_items_bad_nulls_the_field(self):
+        # Silently returning [] would hide a wholesale discard at
+        # near-full credit — same doctrine as the array coercion
+        # branch.
+        result = validate_structured_response(
+            {"tags": ["nope", "nada"]}, _NESTED_SCHEMA)
+        assert result.data["tags"] is None
+        assert "tags" in result.incomplete
+
+    def test_clean_arrays_untouched(self):
+        result = validate_structured_response({
+            "highest_confidence_findings": [
+                {"finding_id": "F-1", "verdict": "uncertain",
+                 "confidence": "low"},
+            ],
+            "tags": ["taint"],
+        }, _NESTED_SCHEMA)
+        assert result.data["tags"] == ["taint"]
+        assert result.incomplete == []
+        assert result.fields["tags"].status == "ok"
+
+
+_ARRAY_OF_ARRAYS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tag_groups": {
+            "type": "array",
+            "items": {
+                "type": "array",
+                "items": {"type": "string",
+                          "enum": ["taint", "memory", "web"]},
+            },
+        },
+    },
+}
+
+
+class TestNestedArrayValidation:
+    """Array-of-arrays: the scalar item branch must recurse into
+    array-typed items rather than waving the inner lists through with
+    their enum unenforced."""
+
+    def test_inner_enum_enforced(self):
+        result = validate_structured_response(
+            {"tag_groups": [["taint", "ZZZ"], ["memory"]]},
+            _ARRAY_OF_ARRAYS_SCHEMA)
+        assert result.data["tag_groups"] == [["taint"], ["memory"]]
+        # The loss is visible to the corrective retry.
+        assert "tag_groups" in result.incomplete
+
+    def test_non_list_inner_item_dropped(self):
+        result = validate_structured_response(
+            {"tag_groups": [["web"], "notalist", [1, 2]]},
+            _ARRAY_OF_ARRAYS_SCHEMA)
+        assert result.data["tag_groups"] == [["web"]]
+        assert "tag_groups" in result.incomplete
+
+    def test_clean_nested_arrays_untouched(self):
+        result = validate_structured_response(
+            {"tag_groups": [["taint", "web"], ["memory"]]},
+            _ARRAY_OF_ARRAYS_SCHEMA)
+        assert result.data["tag_groups"] == [["taint", "web"], ["memory"]]
+        assert result.incomplete == []
 
 
 # ---------------------------------------------------------------------------

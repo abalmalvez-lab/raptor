@@ -1,18 +1,59 @@
 """Tests for project report — merged view across all runs."""
 
 import json
+import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from core.project.project import Project
-from core.project.report import generate_project_report
-from core.run import start_run, complete_run
+from core.project.report import (
+    _finding_fingerprint,
+    generate_project_report,
+    render_annotations_markdown,
+    render_finding_markdown,
+    render_grouped_findings_markdown,
+)
+from core.run import complete_run, start_run
+
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path):
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    with pytest.MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, tmp_path)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(_user_state_in_tmp):
+    """Undo body patches before restoring the file-owned registry pins."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
+def _sca_row(name, *, severity="high", escalation_reasons=None):
+    sca = {"kind": "slopsquat_suspect", "ecosystem": "npm", "name": name}
+    if escalation_reasons is not None:
+        sca["evidence"] = {"escalation_reasons": escalation_reasons}
+    return {
+        "id": f"sca:supply_chain:slopsquat_suspect:npm:{name}",
+        "finding_id": f"sca:supply_chain:slopsquat_suspect:npm:{name}",
+        "vuln_type": "sca:supply_chain:slopsquat_suspect",
+        "tool": "sca", "file": "package.json", "function": name, "line": 0,
+        "severity": severity, "title": f"Slopsquat suspect: {name}",
+        "sca": sca,
+    }
 
 
 class TestProjectReport(unittest.TestCase):
 
-    def _make_project(self, tmpdir, runs):
+    def _make_project(self, tmpdir, runs, sca_runs=None):
         output_dir = Path(tmpdir) / "project"
         output_dir.mkdir()
         for name, findings in runs.items():
@@ -20,7 +61,12 @@ class TestProjectReport(unittest.TestCase):
             start_run(run_dir, "scan")
             complete_run(run_dir)
             (run_dir / "findings.json").write_text(json.dumps(findings))
-        return Project(name="test", target="/tmp/code", output_dir=str(output_dir))
+            sca_rows = (sca_runs or {}).get(name)
+            if sca_rows is not None:
+                (run_dir / "sca").mkdir()
+                (run_dir / "sca" / "findings.json").write_text(json.dumps(sca_rows))
+        return Project(name="test", target=str(Path(tmpdir) / "code"),
+                       output_dir=str(output_dir))
 
     def test_merged_findings(self):
         with TemporaryDirectory() as d:
@@ -37,6 +83,90 @@ class TestProjectReport(unittest.TestCase):
             stats = generate_project_report(p)
             self.assertEqual(stats["findings"], 3)  # a.c, b.c, c.c
             self.assertEqual(stats["runs"], 2)
+
+    def test_newest_run_wins_equal_status_ties(self):
+        """The merged report honours the latest-wins contract: run
+        enumeration is newest-first, so the report must feed the merge
+        folds oldest-first (pre-fix the OLDEST run won every tie, and
+        the SCA fold kept the oldest row outright)."""
+        with TemporaryDirectory() as d:
+            key = {"file": "a.c", "function": "main", "line": 10}
+            p = self._make_project(
+                d,
+                {
+                    "scan-20260401-100000": [
+                        {"id": "F-001", "note": "old", **key}],
+                    "scan-20260402-100000": [
+                        {"id": "F-001", "note": "new", **key}],
+                },
+                sca_runs={
+                    "scan-20260401-100000": [
+                        dict(_sca_row("leftpad"), note="old")],
+                    "scan-20260402-100000": [
+                        dict(_sca_row("leftpad"), note="new")],
+                },
+            )
+            generate_project_report(p)
+            data = json.loads(
+                (p.output_path / "_report" / "findings.json").read_text())
+            self.assertEqual(
+                [f["note"] for f in data["findings"]], ["new"])
+            self.assertEqual(
+                [f["note"] for f in data["sca_findings"]], ["new"])
+
+    def test_sca_findings_in_report(self):
+        """SCA findings (from each run's sca/ subdir) are counted and
+        appear in the aggregate report markdown under their own section."""
+        with TemporaryDirectory() as d:
+            p = self._make_project(
+                d,
+                {"scan-1": [{"id": "F-001", "file": "a.c", "function": "main", "line": 10}]},
+                sca_runs={"scan-1": [_sca_row("lodash-pro")]},
+            )
+            stats = generate_project_report(p)
+            self.assertEqual(stats["findings"], 1)
+            self.assertEqual(stats["sca_findings"], 1)
+            agg = next((p.output_path / "findings").glob("*.md"))
+            text = agg.read_text(encoding="utf-8")
+            self.assertIn("Supply chain / dependencies (SCA)", text)
+            self.assertIn("npm:lodash-pro", text)
+
+    def test_real_slopsquat_surfaces_in_report_e2e(self):
+        """Cross-package E2E: a slopsquat from the REAL SCA detector +
+        REAL serializer surfaces in the generated project report. Guards
+        the on-disk contract (SCA findings.json shape vs report reader).
+        Skipped if the optional SCA package isn't importable."""
+        try:
+            from packages.sca.findings import write_findings_json
+            from packages.sca.parsers.package_json import parse as parse_pkg
+            from packages.sca.supply_chain import _slopsquat_to_finding
+            from packages.sca.supply_chain.slopsquat import check_dep
+        except ImportError:
+            self.skipTest("optional SCA package not importable")
+
+        with TemporaryDirectory() as d:
+            p = self._make_project(d, {
+                "scan-1": [{"id": "F-1", "file": "a.c", "function": "main", "line": 1}],
+            })
+            run_dir = p.output_path / "scan-1"
+            pkg = run_dir / "pkg" / "package.json"
+            pkg.parent.mkdir(parents=True)
+            pkg.write_text(json.dumps({
+                "name": "victim", "dependencies": {"lodash-pro": "^1.0.0"},
+            }))
+            deps = parse_pkg(pkg)
+            ss = [f for f in (check_dep(dep) for dep in deps) if f]
+            self.assertTrue(ss, "real detector found no slopsquat in 'lodash-pro'")
+            write_findings_json(
+                run_dir / "sca" / "findings.json",
+                supply_chain_findings=[_slopsquat_to_finding(f) for f in ss],
+            )
+            stats = generate_project_report(p)
+            self.assertEqual(stats["sca_findings"], len(ss))
+            agg = next((p.output_path / "findings").glob("*.md"))
+            text = agg.read_text(encoding="utf-8")
+            self.assertIn("Supply chain / dependencies (SCA)", text)
+            self.assertIn("lodash-pro", text)
 
     def test_report_dir_created(self):
         with TemporaryDirectory() as d:
@@ -68,7 +198,8 @@ class TestProjectReport(unittest.TestCase):
         with TemporaryDirectory() as d:
             output_dir = Path(d) / "empty"
             output_dir.mkdir()
-            p = Project(name="test", target="/tmp", output_dir=str(output_dir))
+            p = Project(name="test", target=str(Path(d) / "code"),
+                        output_dir=str(output_dir))
             stats = generate_project_report(p)
             self.assertEqual(stats["findings"], 0)
             self.assertEqual(stats["runs"], 0)
@@ -149,5 +280,195 @@ class TestProjectReport(unittest.TestCase):
             self.assertEqual(stats["findings"], 1)
 
 
+class TestRenderGroupedFindingsMarkdownSca(unittest.TestCase):
+
+    def test_sca_section_appended(self):
+        code = [{"id": "F-1", "file": "a.c", "function": "main",
+                 "severity": "high", "title": "Overflow"}]
+        sca = [_sca_row("lodash-pro", severity="medium")]
+        md = render_grouped_findings_markdown(code, "proj", sca_findings=sca)
+        self.assertIn("## Supply chain / dependencies (SCA)", md)
+        self.assertIn("npm:lodash-pro", md)
+        # Code finding still rendered under its severity heading.
+        self.assertIn("## High", md)
+
+    def test_no_sca_no_section(self):
+        code = [{"id": "F-1", "file": "a.c", "severity": "high", "title": "X"}]
+        md = render_grouped_findings_markdown(code, "proj")
+        self.assertNotIn("Supply chain", md)
+
+    def test_sca_only_not_no_findings(self):
+        md = render_grouped_findings_markdown(
+            [], "proj", sca_findings=[_sca_row("expresss")])
+        self.assertNotIn("No findings.", md)
+        self.assertIn("## Supply chain / dependencies (SCA)", md)
+
+    def test_escalation_reasons_rendered_as_sub_bullet(self):
+        sca = [_sca_row("react-helper", severity="critical",
+                        escalation_reasons=[
+                            "co-occurs with recent_publish + low_bus_factor"])]
+        md = render_grouped_findings_markdown([], "proj", sca_findings=sca)
+        self.assertIn("escalated: co-occurs with recent_publish", md)
+
+    def test_no_escalation_reasons_no_sub_bullet(self):
+        md = render_grouped_findings_markdown(
+            [], "proj", sca_findings=[_sca_row("react-helper")])
+        self.assertNotIn("escalated:", md)
+
+
+    def test_finding_fingerprint_line_start_fallback(self):
+        """Findings with line_start instead of line must produce the same
+        fingerprint as those with line set to the same value."""
+        base = {"id": "F-1", "file": "a.c", "function": "f", "type": "cwe-120"}
+        with_line = {**base, "line": 42}
+        with_line_start = {**base, "line_start": 42}
+        self.assertEqual(
+            _finding_fingerprint(with_line),
+            _finding_fingerprint(with_line_start),
+        )
+
+    def test_finding_fingerprint_prefers_line_over_line_start(self):
+        base = {"id": "F-1", "file": "a.c", "function": "f", "type": "cwe-120"}
+        both = {**base, "line": 42, "line_start": 99}
+        line_only = {**base, "line": 42}
+        self.assertEqual(
+            _finding_fingerprint(both),
+            _finding_fingerprint(line_only),
+        )
+
+
+class TestMarkdownInertness(unittest.TestCase):
+    """Consistency tests: finding-derived strings stay inert in the
+    generated Markdown — fences can't be terminated early, headings
+    stay single-line, table cells can't add columns."""
+
+    @staticmethod
+    def _lines_outside_fences(md):
+        """Return the lines of ``md`` that render outside any ``` fence."""
+        outside = []
+        in_fence = False
+        for line in md.splitlines():
+            if line.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence:
+                outside.append(line)
+        return outside
+
+    def test_description_cannot_terminate_fence(self):
+        finding = {
+            "id": "F-INJ-1",
+            "title": "Fence injection",
+            "description": "before\n```\n# fake heading\n```\nafter",
+        }
+        md = render_finding_markdown(finding)
+        # The embedded ``` must not close the wrapping fence — the
+        # fake heading stays inside the code block.
+        self.assertNotIn("# fake heading", self._lines_outside_fences(md))
+        # Fences balance: an odd count would leave the rest of the
+        # document swallowed by an unterminated block.
+        fence_lines = [ln for ln in md.splitlines() if ln.startswith("```")]
+        self.assertEqual(len(fence_lines) % 2, 0)
+
+    def test_title_with_newline_renders_single_heading_line(self):
+        finding = {
+            "id": "F-INJ-2",
+            "title": "Login bypass\n# injected heading\n- injected list",
+        }
+        md = render_finding_markdown(finding)
+        lines = md.splitlines()
+        self.assertTrue(lines[0].startswith("# Login bypass"))
+        self.assertNotIn("# injected heading", lines)
+        self.assertNotIn("- injected list", lines)
+
+    def test_table_cells_with_pipe_do_not_add_columns(self):
+        finding = {
+            "id": "F-INJ-3",
+            "title": "Pipe cell",
+            "vuln_type": "cmd|injection",
+            "file": "src/x|y.c",
+        }
+        md = render_finding_markdown(finding)
+        table_lines = [ln for ln in md.splitlines() if ln.startswith("|")]
+        self.assertTrue(table_lines)
+        for line in table_lines:
+            # Two columns → exactly 3 unescaped pipes per row.
+            self.assertEqual(len(re.findall(r"(?<!\\)\|", line)), 3, line)
+
+    def test_grouped_markdown_title_stays_on_one_bullet_line(self):
+        code = [{
+            "id": "F-1", "file": "a.c", "severity": "high",
+            "title": "Overflow\n# injected heading",
+        }]
+        md = render_grouped_findings_markdown(code, "proj")
+        self.assertNotIn("# injected heading", md.splitlines())
+
+    def test_grouped_markdown_severity_cannot_inject_heading(self):
+        # severity is a finding-derived string too: a newline-bearing
+        # value injected a live heading line into the report pre-fix.
+        code = [{
+            "id": "F-1", "file": "a.c",
+            "severity": "high\n# injected heading",
+            "title": "Overflow",
+        }]
+        md = render_grouped_findings_markdown(code, "proj")
+        self.assertNotIn("# injected heading", md.splitlines())
+
+    def test_annotation_body_markdown_is_inert(self):
+        records = [{
+            "file": "src/auth.py", "function": "check_pw",
+            "status": "clean", "source": "manual",
+            "body": "```\n# fake heading\n```\n<script>x</script>",
+            "metadata": {},
+        }]
+        md = render_annotations_markdown(records, "proj")
+        lines = md.splitlines()
+        self.assertNotIn("# fake heading", lines)
+        self.assertNotIn("```", lines)
+        self.assertNotIn("<script>x</script>", md)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProvenanceMdScrub(unittest.TestCase):
+    def test_hostile_command_defanged_in_provenance_md(self):
+        # .raptor-run.json is child-writable during the run and
+        # restored verbatim by /project import — a hostile `command`
+        # must not land in provenance.md as live markdown / controls.
+        hostile = "# forged heading\n\x1b]0;pwned\x07scan"
+        with TemporaryDirectory() as d:
+            output_dir = Path(d) / "project"
+            output_dir.mkdir()
+            run_dir = output_dir / "scan-20260401"
+            start_run(run_dir, "scan")
+            complete_run(run_dir)
+            meta_path = run_dir / ".raptor-run.json"
+            meta = json.loads(meta_path.read_text())
+            meta["command"] = hostile
+            meta_path.write_text(json.dumps(meta))
+            (run_dir / "findings.json").write_text("[]")
+            p = Project(name="test", target=str(Path(d) / "code"),
+                        output_dir=str(output_dir))
+            stats = generate_project_report(p)
+            prov = (Path(stats["report_dir"]) / "provenance.md").read_text()
+        self.assertNotIn("\x1b", prov)
+        self.assertNotIn("\x07", prov)
+        # Line-leading '#' is defanged — no forged heading renders.
+        self.assertNotIn("\n# forged heading", prov)
+        self.assertIn("scan", prov)
+
+
+def test_clear_generated_findings_dir_unlinks_symlink(tmp_path):
+    """rmtree refuses symlinks with OSError — uncaught it crashed the
+    whole report pass; the link (not the pointed-to tree) is removed."""
+    from core.project.report import _clear_generated_findings_dir
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "keep.txt").write_text("x")
+    link = tmp_path / "findings"
+    link.symlink_to(real)
+    _clear_generated_findings_dir(link)
+    assert not link.exists()
+    assert (real / "keep.txt").exists()

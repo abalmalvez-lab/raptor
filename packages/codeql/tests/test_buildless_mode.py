@@ -1,0 +1,1303 @@
+"""Tests for buildless (--build-mode=none) C/C++ database creation.
+
+Buildless is the DEFAULT for languages in BUILDLESS_DEFAULT_LANGUAGES:
+an untrusted repo's build scripts must never execute during
+``codeql database create`` unless the operator explicitly opts into
+traced-build mode. CodeQL subprocesses are mocked — no codeql CLI or
+network — while cache-contract tests keep the real filesystem and
+metadata paths. Version-probe tests only need the probe seam.
+"""
+
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
+import logging
+import subprocess
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probe_patch_targets(monkeypatch):
+    """Keep probe mocks local, including delegated discovery and execution."""
+    import packages.codeql.database_manager as consumer
+
+    patch_module_attribute(
+        monkeypatch, consumer, "subprocess", "run", consumer.subprocess.run,
+    )
+
+    import core.run.toolprobe as delegate
+
+    patch_module_attribute(
+        monkeypatch, delegate, "subprocess", "run",
+        lambda *args, **kwargs: consumer.subprocess.run(*args, **kwargs),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    try:
+        raptor.propagate = True
+        yield
+    finally:
+        raptor.propagate = orig
+
+
+# packages/codeql/tests/test_buildless_mode.py -> repo root
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parents[3]))
+
+from core.build.build_detector import BuildSystem
+from packages.codeql.database_manager import (
+    BUILDLESS_DEFAULT_LANGUAGES,
+    DatabaseManager,
+)
+
+
+@pytest.fixture
+def db_manager(tmp_path):
+    """DatabaseManager with a fake codeql binary (no __init__ probing)."""
+    # Stay outside the scanned target, with a lifetime independent of pytest's
+    # reusable tmp_path names and retention policy.
+    with TemporaryDirectory(prefix="codeql-test-cache-", dir=tmp_path.parent) as cache:
+        with patch.object(DatabaseManager, '__init__', lambda self: None):
+            mgr = DatabaseManager()
+            mgr.codeql_cli = "/usr/bin/codeql"
+            mgr.db_root = Path(cache)
+        yield mgr
+
+
+def _build_system(tmp_path, command="make -j"):
+    return BuildSystem(
+        type="make", command=command, working_dir=tmp_path,
+        env_vars={}, confidence=1.0, detected_files=[],
+    )
+
+
+def _run_create(db_manager, tmp_path, *, language, build_system=None,
+                traced_build=False, version="2.26.3"):
+    """Run create_database with a capturing fake subprocess."""
+    captured = {"cmd": None}
+
+    def fake_run(cmd, **kwargs):
+        if "database" in cmd and "create" in cmd:
+            captured["cmd"] = list(cmd)
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = ""
+        r.stderr = "Finalizing database.\n"
+        return r
+
+    db_path = tmp_path / "db"
+    with patch('core.sandbox.run', side_effect=fake_run), \
+         patch.object(db_manager, 'get_codeql_version', return_value=version), \
+         patch.object(db_manager, '_count_database_files', return_value=0), \
+         patch.object(db_manager, 'save_metadata'), \
+         patch.object(db_manager, 'get_cached_database', return_value=None), \
+         patch.object(db_manager, 'compute_repo_hash', return_value='abc'), \
+         patch.object(db_manager, 'get_database_dir', return_value=db_path):
+        result = db_manager.create_database(
+            tmp_path, language, build_system, traced_build=traced_build,
+        )
+    return result, captured["cmd"]
+
+
+# ---------------------------------------------------------------------------
+# Version probe
+# ---------------------------------------------------------------------------
+
+
+class TestSupportsBuildlessCpp:
+    def _probe(self, db_manager, version):
+        with patch.object(db_manager, 'get_codeql_version', return_value=version):
+            return db_manager.supports_buildless_cpp()
+
+    def test_modern_cli_supported(self, db_manager):
+        supported, detail = self._probe(db_manager, "2.26.3")
+        assert supported
+        assert detail == "2.26.3"
+
+    def test_exact_minimum_supported(self, db_manager):
+        supported, _ = self._probe(db_manager, "2.16.0")
+        assert supported
+
+    def test_old_cli_unsupported(self, db_manager):
+        supported, detail = self._probe(db_manager, "2.15.5")
+        assert not supported
+        assert "2.16" in detail
+
+    def test_missing_version_unsupported(self, db_manager):
+        supported, detail = self._probe(db_manager, None)
+        assert not supported
+        assert "could not be determined" in detail
+
+    def test_unparseable_version_unsupported(self, db_manager):
+        supported, _detail = self._probe(db_manager, "release candidate")
+        assert not supported
+
+    def test_probe_is_cached_per_instance(self, db_manager):
+        calls = []
+
+        def counting(*a, **k):
+            calls.append(1)
+            return "2.26.3"
+
+        with patch.object(db_manager, 'get_codeql_version', side_effect=counting):
+            db_manager.supports_buildless_cpp()
+            db_manager.supports_buildless_cpp()
+        assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Buildless is the C/C++ default
+# ---------------------------------------------------------------------------
+
+
+class TestBuildlessDefault:
+    def test_cpp_is_a_buildless_default_language(self):
+        assert "cpp" in BUILDLESS_DEFAULT_LANGUAGES
+
+    def test_cpp_gets_build_mode_none(self, db_manager, tmp_path):
+        result, cmd = _run_create(db_manager, tmp_path, language="cpp")
+        assert result.success
+        assert "--build-mode=none" in cmd
+
+    def test_cpp_never_gets_a_build_command(self, db_manager, tmp_path):
+        # Even when a build system WAS detected, buildless mode must
+        # not pass --command — the repo's build never executes.
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="cpp",
+            build_system=_build_system(tmp_path, "make && ./configure"),
+        )
+        assert result.success
+        assert "--build-mode=none" in cmd
+        assert "--command" not in cmd
+
+    def test_metadata_records_buildless(self, db_manager, tmp_path):
+        result, _cmd = _run_create(
+            db_manager, tmp_path, language="cpp",
+            build_system=_build_system(tmp_path),
+        )
+        assert result.metadata.build_system == "buildless"
+        assert result.metadata.build_command == ""
+
+    def test_interpreted_language_unaffected(self, db_manager, tmp_path):
+        result, cmd = _run_create(db_manager, tmp_path, language="javascript")
+        assert result.success
+        assert "--build-mode=none" not in cmd
+
+    def test_java_defaults_to_buildless(self, db_manager, tmp_path):
+        """Java autobuild executes gradlew/mvnw from the repo — the
+        same code-execution vector the cpp gate closes, so java gets
+        the same buildless default."""
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="java",
+            build_system=_build_system(tmp_path, "mvn"),
+        )
+        assert result.success
+        assert "--build-mode=none" in cmd
+        assert "--command" not in cmd
+
+    def test_non_buildless_language_keeps_build_command(
+            self, db_manager, tmp_path):
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="go",
+            build_system=_build_system(tmp_path, "go build ./..."),
+        )
+        assert result.success
+        assert "--command" in cmd
+        assert "--build-mode=none" not in cmd
+
+    def test_csharp_is_buildless_by_default(self, db_manager, tmp_path):
+        result, cmd = _run_create(db_manager, tmp_path, language="csharp")
+        assert result.success
+        assert "--build-mode=none" in cmd
+
+    def test_java_traced_opt_in_keeps_build_command(self, db_manager, tmp_path):
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="java",
+            build_system=_build_system(tmp_path, "mvn"),
+            traced_build=True,
+        )
+        assert result.success
+        assert "--build-mode=none" not in cmd
+        assert "--command" in cmd
+
+    def test_java_old_cli_falls_back_to_traced_with_banner(
+        self, db_manager, tmp_path, caplog,
+    ):
+        """java/csharp on a CLI without buildless keep the
+        pre-existing traced behaviour — but loudly disclosed, never
+        silently."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="raptor"):
+            result, cmd = _run_create(
+                db_manager, tmp_path, language="java",
+                build_system=_build_system(tmp_path, "mvn"),
+                version="2.15.5",
+            )
+        assert result.success
+        assert "--build-mode=none" not in cmd
+        assert "--command" in cmd
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "trust marker" in joined
+
+    def test_go_traced_build_banners_without_trust(
+        self, db_manager, tmp_path, caplog,
+    ):
+        """Languages with no buildless mode (go) keep autobuild but
+        the untrusted-build banner must fire."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="raptor"):
+            result, _cmd = _run_create(db_manager, tmp_path, language="go")
+        assert result.success
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "trust marker" in joined
+
+    def test_go_traced_build_no_banner_with_trust(
+        self, db_manager, tmp_path, caplog,
+    ):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="raptor"):
+            result, _cmd = _run_create(
+                db_manager, tmp_path, language="go", traced_build=True,
+            )
+        assert result.success
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "trust marker" not in joined
+
+
+# ---------------------------------------------------------------------------
+# Explicit traced-build opt-in
+# ---------------------------------------------------------------------------
+
+
+class TestTracedOptIn:
+    def test_traced_build_restores_command(self, db_manager, tmp_path):
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="cpp",
+            build_system=_build_system(tmp_path, "make"),
+            traced_build=True,
+        )
+        assert result.success
+        assert "--build-mode=none" not in cmd
+        assert "--command" in cmd
+        assert cmd[cmd.index("--command") + 1] == "make"
+
+    def test_traced_build_skips_version_gate(self, db_manager, tmp_path):
+        # Old CLI + explicit traced opt-in: the traced path never
+        # needed build-mode support, so it must not be gated.
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="cpp",
+            build_system=_build_system(tmp_path, "make"),
+            traced_build=True, version="2.12.0",
+        )
+        assert result.success
+        assert "--build-mode=none" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# Graceful degradation on old / absent CLI
+# ---------------------------------------------------------------------------
+
+
+class TestOldCliDegradation:
+    def test_old_cli_clear_error_no_crash(self, db_manager, tmp_path):
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="cpp", version="2.15.5",
+        )
+        assert not result.success
+        assert result.database_path is None
+        assert any("buildless" in e for e in result.errors)
+        assert any("2.16" in e for e in result.errors)
+        # Critically: database create was never invoked — no silent
+        # fallback to a traced build.
+        assert cmd is None
+
+    def test_unknown_version_clear_error(self, db_manager, tmp_path):
+        result, cmd = _run_create(
+            db_manager, tmp_path, language="cpp", version=None,
+        )
+        assert not result.success
+        assert cmd is None
+
+    def test_error_mentions_explicit_opt_in(self, db_manager, tmp_path):
+        result, _cmd = _run_create(
+            db_manager, tmp_path, language="cpp", version="2.15.5",
+        )
+        joined = " ".join(result.errors)
+        assert "--traced-build" in joined or "traced" in joined
+
+
+# ---------------------------------------------------------------------------
+# Parallel creation threads the per-language opt-in
+# ---------------------------------------------------------------------------
+
+
+class TestParallelThreading:
+    def test_traced_languages_forwarded(self, db_manager, tmp_path):
+        calls = {}
+
+        shares = {}
+
+        def fake_create(repo_path, lang, build_system, force,
+                        audit_run_dir, traced_build=False,
+                        concurrent_workers=1):
+            calls[lang] = traced_build
+            shares[lang] = concurrent_workers
+            r = MagicMock()
+            r.success = True
+            return r
+
+        with patch.object(db_manager, 'create_database', side_effect=fake_create):
+            db_manager.create_databases_parallel(
+                tmp_path,
+                {"cpp": None, "javascript": None},
+                traced_languages={"cpp"},
+            )
+        assert calls == {"cpp": True, "javascript": False}
+        # Two concurrent builds share the cores two ways.
+        assert set(shares.values()) == {2}
+
+    def test_default_is_untraced(self, db_manager, tmp_path):
+        calls = {}
+
+        shares = {}
+
+        def fake_create(repo_path, lang, build_system, force,
+                        audit_run_dir, traced_build=False,
+                        concurrent_workers=1):
+            calls[lang] = traced_build
+            shares[lang] = concurrent_workers
+            r = MagicMock()
+            r.success = True
+            return r
+
+        with patch.object(db_manager, 'create_database', side_effect=fake_create):
+            db_manager.create_databases_parallel(tmp_path, {"cpp": None})
+        assert calls == {"cpp": False}
+        # A single build keeps the full-core auto value downstream.
+        assert shares == {"cpp": 1}
+
+
+# ---------------------------------------------------------------------------
+# Agent skips build detection for buildless languages
+# ---------------------------------------------------------------------------
+
+
+class TestAgentBuildlessRouting:
+    def _agent(self, tmp_path):
+        from packages.codeql.agent import CodeQLAgent
+        agent = CodeQLAgent.__new__(CodeQLAgent)
+        agent.repo_path = tmp_path
+        agent.out_dir = tmp_path / "out"
+        agent.start_time = 0.0
+        agent.language_detector = MagicMock()
+        agent.build_detector = MagicMock()
+        agent.database_manager = MagicMock()
+        agent.query_runner = MagicMock()
+        agent.build_detector.generate_no_build_config.return_value = BuildSystem(
+            type="no-build", command="", working_dir=tmp_path,
+            env_vars={}, confidence=1.0, detected_files=[],
+        )
+        agent.database_manager.create_databases_parallel.return_value = {}
+        return agent
+
+    def test_cpp_skips_build_detection(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.database_manager.supports_buildless.return_value = (
+            True, "2.26.3",
+        )
+        agent.run_autonomous_analysis(languages=["cpp"])
+        agent.build_detector.detect_build_system.assert_not_called()
+        agent.build_detector.synthesise_build_command.assert_not_called()
+        agent.build_detector.generate_no_build_config.assert_called_with("cpp")
+        _, kwargs = agent.database_manager.create_databases_parallel.call_args
+        assert kwargs["traced_languages"] == set()
+
+    def test_cpp_with_traced_build_runs_detection(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.build_detector.detect_build_system.return_value = None
+        agent.build_detector.synthesise_build_command.return_value = None
+        agent.run_autonomous_analysis(languages=["cpp"], traced_build=True)
+        agent.build_detector.detect_build_system.assert_called_with("cpp")
+        _, kwargs = agent.database_manager.create_databases_parallel.call_args
+        assert kwargs["traced_languages"] == {"cpp"}
+
+    def test_explicit_build_command_implies_traced(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(
+            languages=["cpp"], build_commands={"cpp": "make"},
+        )
+        _, kwargs = agent.database_manager.create_databases_parallel.call_args
+        assert kwargs["traced_languages"] == {"cpp"}
+        lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
+        assert lang_map["cpp"].command == "make"
+
+    def test_old_cli_skips_language_with_error(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.database_manager.supports_buildless.return_value = (
+            False, "CodeQL 2.15.5 < 2.16 — cpp --build-mode=none unsupported",
+        )
+        result = agent.run_autonomous_analysis(languages=["cpp"])
+        # cpp never reached database creation and never fell back to
+        # a traced build; the workflow reports a clear error.
+        lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
+        assert "cpp" not in lang_map
+        agent.build_detector.detect_build_system.assert_not_called()
+        assert any("buildless" in e for e in result.errors)
+
+    def test_java_routes_buildless_like_cpp(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.database_manager.supports_buildless.return_value = (
+            True, "2.26.3",
+        )
+        result = agent.run_autonomous_analysis(languages=["java"])
+        agent.build_detector.detect_build_system.assert_not_called()
+        agent.build_detector.generate_no_build_config.assert_called_with("java")
+        assert result.untrusted_build_languages == []
+
+    @pytest.mark.parametrize(
+        "lang", ["javascript", "typescript", "python", "ruby"],
+    )
+    def test_source_extracted_language_skips_build_detection(
+        self, tmp_path, lang,
+    ):
+        agent = self._agent(tmp_path)
+        result = agent.run_autonomous_analysis(languages=[lang])
+        agent.build_detector.detect_build_system.assert_not_called()
+        agent.build_detector.generate_no_build_config.assert_called_with(lang)
+        lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
+        assert lang_map[lang].command == ""
+        assert result.untrusted_build_languages == []
+
+    def test_source_extracted_language_traced_build_runs_detection(
+        self, tmp_path,
+    ):
+        agent = self._agent(tmp_path)
+        agent.build_detector.detect_build_system.return_value = BuildSystem(
+            type="npm", command="npm install && npm run build",
+            working_dir=tmp_path, env_vars={}, confidence=1.0,
+            detected_files=[],
+        )
+        agent.build_detector.validate_build_command.return_value = True
+        agent.run_autonomous_analysis(
+            languages=["javascript"], traced_build=True,
+        )
+        agent.build_detector.detect_build_system.assert_called_with(
+            "javascript",
+        )
+        lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
+        assert lang_map["javascript"].command == "npm install && npm run build"
+
+    def test_source_extracted_language_explicit_build_command_kept(
+        self, tmp_path,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(
+            languages=["javascript"],
+            build_commands={"javascript": "npm ci && npm run gen"},
+        )
+        lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
+        assert lang_map["javascript"].command == "npm ci && npm run gen"
+
+    def test_untrusted_autobuild_language_recorded(self, tmp_path):
+        """A compiled language with no buildless mode (go) executes
+        repo build logic via autobuild — it must land in the run
+        metadata when no trust was asserted."""
+        agent = self._agent(tmp_path)
+        agent.build_detector.detect_build_system.return_value = None
+        agent.build_detector.synthesise_build_command.return_value = None
+        result = agent.run_autonomous_analysis(languages=["go"])
+        assert result.untrusted_build_languages == ["go"]
+
+    def test_trusted_autobuild_language_not_recorded(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.build_detector.detect_build_system.return_value = None
+        agent.build_detector.synthesise_build_command.return_value = None
+        result = agent.run_autonomous_analysis(
+            languages=["go"], traced_build=True,
+        )
+        assert result.untrusted_build_languages == []
+
+
+class TestBuildlessDegradationSummary:
+    """Degradation visibility: unresolved-include diagnostics are
+    counted and surfaced so reduced coverage never reads as full
+    coverage in the run log."""
+
+    def _db_with_diag(self, tmp_path, lines):
+        db = tmp_path / "db"
+        diag = db / "diagnostic"
+        diag.mkdir(parents=True)
+        (diag / "extraction.jsonl").write_text("\n".join(lines))
+        return db
+
+    def test_counts_unresolved_includes(self, tmp_path):
+        from packages.codeql.database_manager import (
+            buildless_degradation_summary,
+        )
+        db = self._db_with_diag(tmp_path, [
+            '{"message": "could not find include file: config.h"}',
+            '{"message": "cannot open include file generated/proto.pb.h"}',
+            '{"message": "unrelated warning"}',
+        ])
+        hits, summary = buildless_degradation_summary(db)
+        assert hits == 2
+        assert "unresolved includes" in summary
+        assert "--traced-build" in summary
+
+    def test_clean_database_generic_notice(self, tmp_path):
+        from packages.codeql.database_manager import (
+            buildless_degradation_summary,
+        )
+        db = self._db_with_diag(tmp_path, [
+            '{"message": "extraction completed"}',
+        ])
+        hits, summary = buildless_degradation_summary(db)
+        assert hits == 0
+        assert "without executing the build" in summary
+
+    def test_missing_diagnostic_dir_is_generic_not_error(self, tmp_path):
+        from packages.codeql.database_manager import (
+            buildless_degradation_summary,
+        )
+        db = tmp_path / "db"
+        db.mkdir()
+        hits, summary = buildless_degradation_summary(db)
+        assert hits == 0
+        assert "without executing the build" in summary
+
+    def test_non_json_files_ignored(self, tmp_path):
+        from packages.codeql.database_manager import (
+            buildless_degradation_summary,
+        )
+        db = self._db_with_diag(tmp_path, ['{"message": "ok"}'])
+        (db / "diagnostic" / "notes.txt").write_text(
+            "could not find include file: decoy.h"
+        )
+        hits, _ = buildless_degradation_summary(db)
+        assert hits == 0
+
+
+class TestTracedBuildTrustIndependence:
+    """--traced-build does NOT imply --trust-repo, deliberately.
+
+    The pack-config check is an anomaly alarm: legitimate projects
+    essentially never carry custom CodeQL extractors or build hooks,
+    and the alarm matters most on repos the operator otherwise
+    trusts, where a poisoned analysis would be believed. A traced
+    run hitting unsafe pack config must still refuse and print the
+    findings; the operator escalates with --trust-repo only after
+    auditing them. Capability-wise traced-build dominates, but trust
+    encodes what the operator REVIEWED — the build system, not
+    yaml-buried extractor hooks.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_overrides(self, monkeypatch):
+        from contextlib import ExitStack
+        from functools import lru_cache
+
+        from core.security import cc_trust as cct, codeql_trust as qlt
+        from core.testing.module_state import isolated_module_state
+
+        borrowed = cct._scan_cached
+        fresh = lru_cache(**borrowed.cache_parameters())(borrowed.__wrapped__)
+        with ExitStack() as scope:
+            scope.enter_context(isolated_module_state(qlt, {"_trust_override_set": False}))
+            scope.enter_context(isolated_module_state(cct, {
+                "_trust_override_set": False, "_scan_cached": fresh,
+            }))
+            try:
+                yield
+            finally:
+                monkeypatch.undo()
+
+    def _run_main(self, tmp_path, extra_args):
+        """Drive agent.py main() on an empty repo (no languages ->
+        fast no-op path); only the trust side effects of arg
+        parsing matter here."""
+        import contextlib
+
+        import core.security.cc_trust as cct
+        import core.security.codeql_trust as qlt
+        from packages.codeql import agent as agent_mod
+        argv = ["agent.py", "--repo", str(tmp_path),
+                "--out", str(tmp_path / "out"), *extra_args]
+        with patch.object(sys, "argv", argv), \
+                contextlib.suppress(SystemExit):
+            agent_mod.main()
+        return (qlt._trust_override_set, cct._trust_override_set)
+
+    def test_traced_build_sets_no_trust_override(self, tmp_path):
+        ql, cc = self._run_main(tmp_path, ["--traced-build"])
+        assert ql is False
+        assert cc is False
+
+    def test_default_sets_neither(self, tmp_path):
+        ql, cc = self._run_main(tmp_path, [])
+        assert ql is False
+        assert cc is False
+
+
+# ---------------------------------------------------------------------------
+# Per-language probe + traced-failure buildless fallback
+# ---------------------------------------------------------------------------
+
+
+class TestSupportsBuildlessPerLanguage:
+    def _probe(self, db_manager, language, version):
+        with patch.object(db_manager, 'get_codeql_version',
+                          return_value=version):
+            return db_manager.supports_buildless(language)
+
+    def test_java_modern_cli_supported(self, db_manager):
+        supported, detail = self._probe(db_manager, "java", "2.26.3")
+        assert supported
+        assert detail == "2.26.3"
+
+    def test_java_exact_minimum_supported(self, db_manager):
+        supported, _ = self._probe(db_manager, "java", "2.16.4")
+        assert supported
+
+    def test_java_below_minimum_unsupported(self, db_manager):
+        supported, detail = self._probe(db_manager, "java", "2.16.3")
+        assert not supported
+        assert "java" in detail
+
+    def test_unknown_language_unsupported(self, db_manager):
+        supported, detail = self._probe(db_manager, "go", "2.26.3")
+        assert not supported
+        assert "go" in detail
+
+    def test_probe_cached_per_language(self, db_manager):
+        with patch.object(db_manager, 'get_codeql_version',
+                          return_value="2.26.3") as gv:
+            db_manager.supports_buildless("java")
+            db_manager.supports_buildless("java")
+            db_manager.supports_buildless("cpp")
+        assert gv.call_count == 2  # one probe per language, then cached
+
+    def test_java_in_buildless_defaults(self):
+        assert "java" in BUILDLESS_DEFAULT_LANGUAGES
+
+
+class TestBuildlessFallback:
+    def _run_with_failure_then_success(self, db_manager, tmp_path, *,
+                                       language, traced_build):
+        """First (traced) create fails; a buildless retry succeeds."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            r = MagicMock()
+            r.stdout = ""
+            if "database" in cmd and "create" in cmd:
+                calls.append(list(cmd))
+                if "--build-mode=none" in cmd:
+                    r.returncode = 0
+                    r.stderr = "Finalizing database.\n"
+                else:
+                    r.returncode = 1
+                    r.stderr = "autobuild failed\n"
+            else:
+                r.returncode = 0
+                r.stderr = ""
+            return r
+
+        db_path = tmp_path / "db"
+        with patch('core.sandbox.run', side_effect=fake_run), \
+             patch.object(db_manager, 'get_codeql_version',
+                          return_value="2.26.3"), \
+             patch.object(db_manager, '_count_database_files',
+                          return_value=0), \
+             patch.object(db_manager, 'save_metadata'), \
+             patch.object(db_manager, '_salvage_creation_log',
+                          return_value=""), \
+             patch.object(db_manager, 'get_cached_database',
+                          return_value=None), \
+             patch.object(db_manager, 'compute_repo_hash',
+                          return_value='abc'), \
+             patch.object(db_manager, 'get_database_dir',
+                          return_value=db_path):
+            result = db_manager.create_database(
+                tmp_path, language,
+                _build_system(tmp_path, "mvn package"),
+                traced_build=traced_build,
+            )
+        return result, calls
+
+    def test_traced_java_failure_falls_back_to_buildless(
+            self, db_manager, tmp_path):
+        result, calls = self._run_with_failure_then_success(
+            db_manager, tmp_path, language="java", traced_build=True)
+        assert len(calls) == 2
+        assert "--command" in calls[0] or "--build-mode=none" not in calls[0]
+        assert "--build-mode=none" in calls[1]
+        assert result.success
+        assert any("buildless fallback" in e for e in result.errors)
+
+    def test_untraced_failure_never_recurses(self, db_manager, tmp_path):
+        # go is not buildless-capable: a plain failure returns failure,
+        # exactly one create attempt.
+        result, calls = self._run_with_failure_then_success(
+            db_manager, tmp_path, language="go", traced_build=False)
+        assert len(calls) == 1
+        assert not result.success
+
+    def test_fallback_skipped_below_version_floor(
+            self, db_manager, tmp_path):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            r = MagicMock()
+            r.stdout = ""
+            r.stderr = "autobuild failed\n"
+            r.returncode = 1
+            if "database" in cmd and "create" in cmd:
+                calls.append(list(cmd))
+            return r
+
+        db_path = tmp_path / "db"
+        with patch('core.sandbox.run', side_effect=fake_run), \
+             patch.object(db_manager, 'get_codeql_version',
+                          return_value="2.16.3"), \
+             patch.object(db_manager, '_count_database_files',
+                          return_value=0), \
+             patch.object(db_manager, 'save_metadata'), \
+             patch.object(db_manager, '_salvage_creation_log',
+                          return_value=""), \
+             patch.object(db_manager, 'get_cached_database',
+                          return_value=None), \
+             patch.object(db_manager, 'compute_repo_hash',
+                          return_value='abc'), \
+             patch.object(db_manager, 'get_database_dir',
+                          return_value=db_path):
+            result = db_manager.create_database(
+                tmp_path, "java", _build_system(tmp_path, "mvn package"),
+                traced_build=True,
+            )
+        assert len(calls) == 1
+        assert not result.success
+
+
+# ---------------------------------------------------------------------------
+# Build mode joins the cache contract
+# ---------------------------------------------------------------------------
+
+
+def _plant_cached_db(db_manager, repo, language, build_system_value):
+    """Plant a valid cached DB + metadata in the manager's db_root."""
+    import json
+    from datetime import datetime, timezone
+
+    repo_hash = db_manager.compute_repo_hash(repo)
+    db = db_manager.get_database_dir(repo_hash, language)
+    (db / f"db-{language}").mkdir(parents=True)
+    (db / "codeql-database.yml").write_text(
+        f"primaryLanguage: {language}\n",
+    )
+    # > 10KB clears validate_database's minimal-substance check.
+    (db / f"db-{language}" / "blob.bin").write_bytes(b"\0" * 20480)
+    meta = {
+        "repo_path": str(repo), "repo_hash": repo_hash,
+        "language": language,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "codeql_version": "2.26.3", "success": True, "errors": [],
+        "build_system": build_system_value, "build_command": "",
+        "file_count": 1, "duration_seconds": 1.0,
+        "database_path": str(db),
+    }
+    db_manager.get_metadata_path(repo_hash, language).write_text(
+        json.dumps(meta),
+    )
+    return db
+
+
+@pytest.fixture
+def repo(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "main.cpp").write_text("int main(){return 0;}\n")
+    return r
+
+
+class TestBuildModeCacheContract:
+    """A cached DB's build mode is part of the serve contract: an
+    explicit traced request is never silently served a buildless
+    entry; the reverse direction serves, disclosed."""
+
+    def _create(self, db_manager, repo, *, traced_build,
+                expect_build=True):
+        ran = {"create": False}
+
+        def fake_run(cmd, **kwargs):
+            if "database" in cmd and "create" in cmd:
+                ran["create"] = True
+                staging = Path(cmd[3])
+                (staging / "db-cpp").mkdir(parents=True, exist_ok=True)
+                (staging / "codeql-database.yml").write_text(
+                    "primaryLanguage: cpp\n",
+                )
+                (staging / "db-cpp" / "trie.bin").write_bytes(
+                    b"\1" * 20480,
+                )
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = "Finalizing database.\n"
+            return r
+
+        with patch('core.sandbox.run', side_effect=fake_run), \
+             patch.object(db_manager, 'get_codeql_version',
+                          return_value="2.26.3"), \
+             patch.object(db_manager, '_count_database_files',
+                          return_value=1):
+            result = db_manager.create_database(
+                repo, "cpp", None, traced_build=traced_build,
+            )
+        assert ran["create"] is expect_build
+        return result
+
+    def test_traced_request_refuses_cached_buildless_db(
+            self, db_manager, repo, caplog):
+        """The repro shape: valid cached cpp DB with
+        build_system=buildless, then create_database(traced_build=
+        True) — must rebuild, never serve the buildless entry."""
+        _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        import logging
+        with caplog.at_level(logging.INFO, logger="raptor"):
+            result = self._create(db_manager, repo, traced_build=True)
+        assert result.success is True
+        assert result.cached is False
+        assert result.metadata.build_system != "buildless"
+        # Visible rebuild note, not a silent miss.
+        assert any(
+            "traced build" in rec.getMessage()
+            and "buildless" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_buildless_request_serves_traced_cache_disclosed(
+            self, db_manager, repo, caplog):
+        """Reverse direction: a traced entry is strictly higher
+        fidelity and nothing untrusted executes by serving it — so
+        serve it, but say so."""
+        planted = _plant_cached_db(db_manager, repo, "cpp", "make")
+        import logging
+        with caplog.at_level(logging.INFO, logger="raptor"):
+            result = self._create(
+                db_manager, repo, traced_build=False, expect_build=False,
+            )
+        assert result.cached is True
+        assert result.database_path == planted
+        assert any(
+            "Serving traced-build cached" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_buildless_request_serves_buildless_cache(
+            self, db_manager, repo):
+        planted = _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        result = self._create(
+            db_manager, repo, traced_build=False, expect_build=False,
+        )
+        assert result.cached is True
+        assert result.database_path == planted
+
+    def test_explicit_build_replaces_source_only_cache(
+            self, db_manager, repo):
+        """A generated-source build must not reuse the default
+        source-only database."""
+        (repo / "main.js").write_text("const value = 1;\n")
+        create_commands = []
+
+        def fake_codeql_create(cmd, **kwargs):
+            create_commands.append(list(cmd))
+            staging = Path(cmd[3])
+            database = staging / "db-javascript"
+            database.mkdir(parents=True)
+            (staging / "codeql-database.yml").write_text(
+                "primaryLanguage: javascript\n",
+            )
+            (database / "trie.bin").write_bytes(
+                bytes([len(create_commands)]) * 20480,
+            )
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = "Finalizing database.\n"
+            return result
+
+        real_subprocess_run = subprocess.run
+
+        def fake_codeql_version(cmd, **kwargs):
+            if cmd == [db_manager.codeql_cli, "version"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="CodeQL command-line toolchain release 2.26.3.\n",
+                    stderr="",
+                )
+            return real_subprocess_run(cmd, **kwargs)
+
+        source_only = BuildSystem(
+            type="no-build", command="", working_dir=repo,
+            env_vars={}, confidence=1.0, detected_files=[],
+        )
+        explicit_build = BuildSystem(
+            type="custom", command="npm run generate", working_dir=repo,
+            env_vars={}, confidence=1.0, detected_files=[],
+        )
+
+        with patch('core.sandbox.run', side_effect=fake_codeql_create), \
+             mock_module_attribute(
+                 _mock_owner('packages.codeql.database_manager'), 'subprocess', 'run',
+                 side_effect=fake_codeql_version,
+             ):
+            default_result = db_manager.create_database(
+                repo, "javascript", source_only,
+            )
+            traced_result = db_manager.create_database(
+                repo, "javascript", explicit_build, traced_build=True,
+            )
+
+        assert default_result.success is True
+        assert default_result.cached is False
+        assert default_result.metadata.build_system == "source-only"
+        assert traced_result.success is True
+        assert traced_result.cached is False
+        assert traced_result.metadata.build_system == "custom"
+        assert traced_result.metadata.build_command == "npm run generate"
+        assert len(create_commands) == 2
+
+        repo_hash = db_manager.compute_repo_hash(repo)
+        persisted = db_manager.load_metadata(repo_hash, "javascript")
+        assert persisted is not None
+        assert persisted.build_system == "custom"
+        assert persisted.build_command == "npm run generate"
+
+    def test_mode_agnostic_lookup_serves_either(self, db_manager, repo):
+        """Discovery-probe callers pass no mode and keep the old
+        behaviour."""
+        planted = _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        assert db_manager.get_cached_database(repo, "cpp") == planted
+
+    def test_traced_lookup_serves_source_no_build_cache(
+            self, db_manager, repo):
+        """A no-build entry records a create that ran build detection
+        and found no command, which is what a traced run produces."""
+        planted = _plant_cached_db(db_manager, repo, "python", "no-build")
+        assert db_manager.get_cached_database(
+            repo, "python", traced_build=True,
+        ) == planted
+
+    def test_sibling_acceptability_closes_the_race_window(
+            self, db_manager, repo):
+        """Lost-promote-race gate: for a traced cpp request the
+        sibling's canonical needs a POSITIVE non-buildless record."""
+        repo_hash = db_manager.compute_repo_hash(repo)
+        # No metadata at all → not acceptable for traced.
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", True) is False
+        _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", True) is False
+        # Buildless / mode-agnostic requests accept anything.
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", False) is True
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", None) is True
+        # Languages without a lower-fidelity default are out of scope.
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "go", True) is True
+        _plant_cached_db(
+            db_manager, repo, "javascript", "source-only",
+        )
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "javascript", True) is False
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "javascript", False) is True
+        _plant_cached_db(db_manager, repo, "python", "no-build")
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "python", True) is True
+
+
+class TestExtractionOutcomes:
+    @staticmethod
+    def _write_summary(db, attributes, source_id="cpp/extractor/summary"):
+        import json
+
+        path = db / "diagnostic" / "extractors" / "cpp" / "summary.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"source": {"id": source_id},
+                                    "attributes": attributes}, indent=2))
+        return path
+
+    def test_partial_extraction_warns_without_logging_target_text(self, tmp_path, caplog):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        self._write_summary(tmp_path, {"extractor-failures": 2,
+                                       "extractor-successes": 3,
+                                       "target": "hostile\u202e-source"})
+        with caplog.at_level(logging.INFO, logger="raptor"):
+            summary = report_cpp_extraction(tmp_path)
+        assert summary == {"available": True, "failures": 2, "successes": 3}
+        assert "2 failed invocation(s), 3 successful" in caplog.text
+        assert "coverage is incomplete" in caplog.text
+        assert "hostile" not in caplog.text
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_successes_do_not_claim_complete_coverage(self, tmp_path, caplog):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        self._write_summary(tmp_path, {"extractor-failures": 0,
+                                       "extractor-successes": 2})
+        with caplog.at_level(logging.INFO, logger="raptor"):
+            summary = report_cpp_extraction(tmp_path)
+        assert summary == {"available": True, "failures": 0, "successes": 2}
+        assert "does not establish full source coverage" in caplog.text
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.parametrize("attributes", [
+        {}, None, [], {"extractor-failures": 1},
+        {"extractor-failures": True, "extractor-successes": 1},
+        {"extractor-failures": -1, "extractor-successes": 1},
+        {"extractor-failures": "1", "extractor-successes": 1},
+        {"extractor-failures": 0, "extractor-successes": 0},
+        {"extractor-failures": 0, "extractor-successes": False},
+    ])
+    def test_invalid_counts_are_unknown(self, tmp_path, attributes):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        self._write_summary(tmp_path, attributes)
+        assert report_cpp_extraction(tmp_path) == {"available": False}
+
+    @pytest.mark.parametrize("payload", [
+        pytest.param("{", id="truncated-object"),
+        pytest.param("null", id="null"),
+        pytest.param("[]", id="array"),
+        pytest.param("{}\n{}", id="multiple-documents"),
+        pytest.param("[" * 2000, id="excessive-nesting"),
+    ])
+    def test_invalid_payload_is_unknown(self, tmp_path, payload):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        path = self._write_summary(tmp_path, {})
+        path.write_text(payload)
+        assert report_cpp_extraction(tmp_path) == {"available": False}
+
+    def test_missing_or_wrong_source_is_unknown(self, tmp_path):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        assert report_cpp_extraction(tmp_path) == {"available": False}
+        self._write_summary(tmp_path, {"extractor-failures": 0,
+                                       "extractor-successes": 1}, "other/summary")
+        assert report_cpp_extraction(tmp_path) == {"available": False}
+
+    def test_oversized_summary_is_unknown(self, tmp_path):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        path = self._write_summary(tmp_path, {})
+        with path.open("wb") as stream:
+            stream.truncate(1024 * 1024 + 1)
+        assert report_cpp_extraction(tmp_path) == {"available": False}
+
+    @pytest.mark.parametrize("traced", [False, True])
+    def test_created_database_reports_selected_path(self, db_manager, tmp_path, traced):
+        summary = {"available": True, "failures": 1, "successes": 2}
+        with patch("packages.codeql.database_manager.report_cpp_extraction",
+                   return_value=summary) as report:
+            result, _ = _run_create(
+                db_manager, tmp_path, language="cpp", traced_build=traced,
+                build_system=_build_system(tmp_path) if traced else None,
+            )
+        assert result.success
+        assert result.extraction_summary == summary
+        report.assert_called_once_with(result.database_path)
+
+    @pytest.mark.parametrize("race_hit", [False, True])
+    def test_cached_database_reports_selected_path(self, db_manager, tmp_path, race_hit):
+        cached = tmp_path / "cached-db"
+        summary = {"available": True, "failures": 1, "successes": 0}
+        with patch.object(db_manager, "get_cached_database",
+                          side_effect=[None, cached] if race_hit else [cached]), \
+             patch.object(db_manager, "compute_repo_hash", return_value="abc"), \
+             patch.object(db_manager, "load_metadata", return_value=None), \
+             patch.object(db_manager, "get_codeql_version", return_value="2.26.3"), \
+             patch("packages.codeql.database_manager.report_cpp_extraction",
+                   return_value=summary) as report:
+            result = db_manager.create_database(tmp_path, "cpp")
+        assert result.success and result.cached
+        assert result.extraction_summary == summary
+        report.assert_called_once_with(cached)
+
+    def test_other_language_does_not_read_cpp_summary(self, db_manager, tmp_path):
+        with patch("packages.codeql.database_manager.report_cpp_extraction") as report:
+            result, _ = _run_create(db_manager, tmp_path, language="java")
+        assert result.success
+        assert result.extraction_summary is None
+        report.assert_not_called()
+
+    def test_unreadable_summary_is_unknown(self, tmp_path):
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        with patch("packages.codeql.database_manager.load_json_bounded",
+                   side_effect=PermissionError):
+            assert report_cpp_extraction(tmp_path) == {"available": False}
+
+    def test_non_regular_summary_is_unknown(self, tmp_path):
+        import os
+
+        from packages.codeql.database_manager import report_cpp_extraction
+
+        path = self._write_summary(tmp_path, {})
+        path.unlink()
+        os.mkfifo(path)
+        assert report_cpp_extraction(tmp_path) == {"available": False}
+
+    def test_outcomes_survive_workflow_serialization(self, tmp_path):
+        import json
+
+        from packages.codeql.agent import CodeQLWorkflowResult
+        from packages.codeql.database_manager import DatabaseResult
+
+        summary = {"available": True, "failures": 1, "successes": 2}
+        database = DatabaseResult(
+            success=True, language="cpp", database_path=tmp_path, metadata=None,
+            errors=[], duration_seconds=0, extraction_summary=summary,
+        )
+        workflow = CodeQLWorkflowResult(
+            success=True, repo_path=str(tmp_path), timestamp="", duration_seconds=0,
+            languages_detected={}, databases_created={"cpp": database},
+            analyses_completed={}, total_findings=0, sarif_files=[], errors=[],
+        )
+        serialized = json.loads(json.dumps(workflow.to_dict()))
+        assert serialized["databases_created"]["cpp"]["extraction_summary"] == summary
+        assert serialized["databases_created"]["cpp"]["success"] is True
+        assert serialized["databases_created"]["cpp"]["errors"] == []
+
+
+def test_buildless_diagnostic_summary_reads_bounded_chunks(tmp_path, monkeypatch):
+    import io
+    from packages.codeql import database_manager as manager
+
+    db = tmp_path / 'owned-db'
+    diag = db / 'diagnostic'
+    diag.mkdir(parents=True)
+    path = diag / 'owned.jsonl'
+    path.write_text('owned placeholder\n')
+    text = 'could not find include owned.h\n' + 'x' * 300 + '\n'
+    requests = []
+
+    class Tracked(io.StringIO):
+        def read(self, size=-1):
+            requests.append(size)
+            assert 0 < size <= 65536, 'unbounded diagnostic text read'
+            return super().read(size)
+
+    original = Path.open
+
+    def opened(candidate, *args, **kwargs):
+        return Tracked(text) if candidate == path else original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', opened)
+    hits, summary = manager.buildless_degradation_summary(db)
+    assert requests
+    assert hits == 1
+    assert 'unresolved includes' in summary
+
+
+@pytest.mark.parametrize('chunk_size', [1, 7, 16, 64])
+@pytest.mark.parametrize('separator', ['\n', '\r\n', '\r', '\v', '\f', '\x1c', '\x1d', '\x1e', '\x85', '\u2028', '\u2029'])
+def test_streaming_include_count_preserves_logical_lines(monkeypatch, chunk_size, separator):
+    import io
+    from packages.codeql import database_manager as manager
+
+    text = separator.join([
+        'could not find include owned.h',
+        'include' + 'x' * 60 + 'could not open',
+        'cannot open' + 'x' * 60 + 'include',
+        'include missing and cannot open include again',
+        'could not find', 'include separate_line.h',
+        'x' * 300, 'include not found',
+    ])
+    expected = sum(bool(manager._UNRESOLVED_INCLUDE_RE.search(line)) for line in text.splitlines())
+    monkeypatch.setattr(manager, '_BUILDLESS_DIAGNOSTIC_CHUNK_CHARS', chunk_size)
+    assert manager._count_unresolved_include_lines(io.StringIO(text)) == expected
+
+
+def test_buildless_diagnostic_read_error_discards_partial_file_count(tmp_path, monkeypatch):
+    import io
+    from packages.codeql import database_manager as manager
+
+    db = tmp_path / 'owned-db'
+    diag = db / 'diagnostic'
+    diag.mkdir(parents=True)
+    path = diag / 'owned.jsonl'
+    path.write_text('owned placeholder\n')
+
+    class Refused(io.StringIO):
+        calls = 0
+
+        def read(self, size=-1):
+            self.calls += 1
+            if self.calls == 1:
+                return 'could not find include owned.h\n'
+            raise OSError('owned later read refusal')
+
+    original = Path.open
+
+    def opened(candidate, *args, **kwargs):
+        return Refused() if candidate == path else original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', opened)
+    hits, summary = manager.buildless_degradation_summary(db)
+    assert hits == 0
+    assert 'without executing the build' in summary
+
+
+def test_buildless_diagnostic_paths_are_consumed_during_discovery(tmp_path, monkeypatch):
+    from packages.codeql import database_manager as manager
+
+    db = tmp_path / 'owned-db'
+    diag = db / 'diagnostic'
+    diag.mkdir(parents=True)
+    files = [diag / 'a.jsonl', diag / 'b.jsonl']
+    for path in files:
+        path.write_text('could not find include owned.h\n')
+    opened = []
+    original_glob, original_open = Path.rglob, Path.open
+
+    def discover(candidate, pattern, *args, **kwargs):
+        if candidate == diag:
+            yield files[0]
+            assert opened == [files[0]], 'retained full diagnostic path listing before reading'
+            yield files[1]
+        else:
+            yield from original_glob(candidate, pattern, *args, **kwargs)
+
+    def tracked_open(candidate, *args, **kwargs):
+        if candidate in files:
+            opened.append(candidate)
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'rglob', discover)
+    monkeypatch.setattr(Path, 'open', tracked_open)
+    hits, summary = manager.buildless_degradation_summary(db)
+    assert hits == 2
+    assert 'unresolved includes' in summary
+    assert opened == files

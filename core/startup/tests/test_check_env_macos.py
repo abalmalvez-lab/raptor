@@ -16,26 +16,30 @@ import pytest
 from core.startup import init as startup_init
 
 
+import core.startup.init as _host_platform_consumer
+from core.testing.module_bindings import mock_module_attribute
+
+
 @pytest.fixture
-def reset_seatbelt_cache():
-    """check_seatbelt_available() caches its result process-wide;
-    tests here mock different return values so we must clear the
-    cache to avoid one test's mock leaking into another."""
+def reset_seatbelt_cache(monkeypatch):
+    """Pin a fresh probe result and restore the caller's cached answer."""
     from core.sandbox import state
-    state._seatbelt_available_cache = None
-    yield
-    state._seatbelt_available_cache = None
+    monkeypatch.setattr(state, "_seatbelt_available_cache", None)
 
 
 def test_check_env_macos_seatbelt_available(reset_seatbelt_cache):
     """When seatbelt smoke test passes, the banner shows
     'sandbox ✓ (seatbelt)' and emits no sandbox warning."""
-    with mock.patch.object(sys, "platform", "darwin"), \
+    with mock_module_attribute(_host_platform_consumer, 'sys', "platform", "darwin"), \
          mock.patch("core.sandbox.check_seatbelt_available",
                      return_value=True):
         parts, warnings = startup_init.check_env(set())
 
-    sandbox_parts = [p for p in parts if "sandbox" in p]
+    # Match the sandbox STATUS part only ("sandbox ✓ (…)" / "sandbox ✗").
+    # A bare substring test also caught unrelated parts that merely
+    # contain "sandbox" in a path (e.g. RAPTOR_CONFIG=/…/foo-sandbox/…),
+    # making the assertion depend on the checkout's directory name.
+    sandbox_parts = [p for p in parts if p.startswith("sandbox ")]
     assert sandbox_parts == ["sandbox ✓ (seatbelt)"]
     sandbox_warnings = [w for w in warnings if "sandbox" in w.lower()]
     assert sandbox_warnings == []
@@ -45,12 +49,16 @@ def test_check_env_macos_seatbelt_unavailable(reset_seatbelt_cache):
     """When seatbelt smoke test fails, the banner shows 'sandbox ✗'
     and emits a macOS-specific warning naming the diagnostic
     command operators can run."""
-    with mock.patch.object(sys, "platform", "darwin"), \
+    with mock_module_attribute(_host_platform_consumer, 'sys', "platform", "darwin"), \
          mock.patch("core.sandbox.check_seatbelt_available",
                      return_value=False):
         parts, warnings = startup_init.check_env(set())
 
-    sandbox_parts = [p for p in parts if "sandbox" in p]
+    # Match the sandbox STATUS part only ("sandbox ✓ (…)" / "sandbox ✗").
+    # A bare substring test also caught unrelated parts that merely
+    # contain "sandbox" in a path (e.g. RAPTOR_CONFIG=/…/foo-sandbox/…),
+    # making the assertion depend on the checkout's directory name.
+    sandbox_parts = [p for p in parts if p.startswith("sandbox ")]
     assert sandbox_parts == ["sandbox ✗"]
     sandbox_warnings = [w for w in warnings if "sandbox" in w.lower()]
     assert any("sandbox-exec" in w for w in sandbox_warnings), (

@@ -1,0 +1,282 @@
+"""SPDX 2.3 SBOM emitter — alternative output format.
+
+Some compliance pipelines mandate SPDX (NTIA's Minimum Elements
+for an SBOM cite both CycloneDX and SPDX as acceptable; specific
+procurement programmes may require one). This module emits SPDX
+2.3 JSON alongside the existing CycloneDX 1.5 output when the
+operator passes ``--spdx``, or preserves an SPDX input document.
+
+For SPDX input, preserve the complete source document unchanged in meaning.
+Otherwise export the dependency scan projection; this is not a complete
+cross-format inventory conversion. Findings are emitted separately.
+
+SPDX 2.3 spec: https://spdx.github.io/spdx-spec/v2.3/
+
+What's emitted for generated scan projections:
+
+  * One ``packages[]`` entry per Dependency (the SPDX equivalent
+    of CycloneDX's ``components[]``).
+  * Document-level metadata (name, namespace URI, creation info,
+    license-list version).
+  * ``relationships[]`` linking the SPDX document to its packages
+    via ``DESCRIBES``.
+
+What generated scan projections do NOT add:
+
+  * Vulnerability assertions — SPDX 2.3 doesn't have a native VEX
+    block. Operators wanting VEX-in-SPDX should
+    use the CycloneDX output for now.
+  * File-level metadata, snippets, hashes — retained for SPDX input,
+    but RAPTOR-side scans
+    don't compute file checksums per dep.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any, TYPE_CHECKING
+
+from core.json import save_json
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from .models import Dependency
+    from .sbom_import import ImportedBom
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+# SPDX license-list version we declare. Spec recommends pinning so
+# consumers know which SPDX-license-list snapshot the IDs validate
+# against. Bump when SPDX publishes a major addition.
+_SPDX_LICENSE_LIST_VERSION = "3.24"
+
+
+def write_sbom_spdx_json(
+    path: Path,
+    *,
+    deps: Iterable[Dependency],
+    target_name: str,
+    namespace_uri: str | None = None,
+    project_license: str | None = None,
+    source_bom: ImportedBom | None = None,
+) -> None:
+    """Render an SPDX 2.3 JSON SBOM and write it atomically."""
+    doc = render_sbom_spdx(
+        deps=deps, target_name=target_name,
+        namespace_uri=namespace_uri,
+        project_license=project_license, source_bom=source_bom,
+    )
+    save_json(path, doc, stream=True)
+
+
+def render_sbom_spdx(
+    *,
+    deps: Iterable[Dependency],
+    target_name: str,
+    namespace_uri: str | None = None,
+    project_license: str | None = None,
+    source_bom: ImportedBom | None = None,
+) -> dict[str, Any]:
+    """Build the SPDX 2.3 document dict (does not write to disk).
+
+    ``project_license`` — the scanned project's own manifest-declared
+    license. When known, a root ``SPDXRef-Project`` package carries it
+    as ``licenseDeclared``; dep packages never do — a dep's license
+    only ever comes from data that describes that dep.
+    """
+    if source_bom is not None:
+        if source_bom.format != "SPDX":
+            raise ValueError("SPDX preservation requires an SPDX source document")
+        # No scan assertions are inserted: retain namespace, creators, evidence
+        # and declared/concluded licences exactly. Findings are separate artifacts.
+        return deepcopy(source_bom.document)
+    deps_list = list(deps)
+    spdx_doc_id = "SPDXRef-DOCUMENT"
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Default namespace is a unique URI per document — SPDX requires
+    # globally-unique. We compose target name + timestamp; operators
+    # passing ``namespace_uri`` override.
+    if namespace_uri is None:
+        namespace_uri = (
+            f"https://raptor-sca.local/spdxdocs/"
+            f"{target_name}-{uuid.uuid4()}"
+        )
+
+    packages: list[dict[str, Any]] = []
+    relationships: list[dict[str, str]] = [
+        # SPDX requires a DESCRIBES relationship from the document
+        # to its top-level package(s). Without a single "root"
+        # package we DESCRIBE every dep — equivalent semantically.
+    ]
+    if project_license:
+        # Root package for the scanned project itself — the only
+        # place its manifest-declared license belongs. Emitted only
+        # when the license is known; a bare root package with all
+        # NOASSERTION fields adds nothing for consumers.
+        root_id = "SPDXRef-Project"
+        packages.append({
+            "SPDXID": root_id,
+            "name": target_name,
+            "downloadLocation": "NOASSERTION",
+            "filesAnalyzed": False,
+            "licenseDeclared": _spdx_license_value(project_license),
+            "licenseConcluded": "NOASSERTION",
+            "copyrightText": "NOASSERTION",
+            "supplier": "NOASSERTION",
+        })
+        relationships.append({
+            "spdxElementId": spdx_doc_id,
+            "relatedSpdxElement": root_id,
+            "relationshipType": "DESCRIBES",
+        })
+    seen_refs: set = set()
+    for d in deps_list:
+        spdx_id = _spdx_id_for(d, seen_refs)
+        package = _package_block(d, spdx_id)
+        packages.append(package)
+        relationships.append({
+            "spdxElementId": spdx_doc_id,
+            "relatedSpdxElement": spdx_id,
+            "relationshipType": "DESCRIBES",
+        })
+
+    return {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": spdx_doc_id,
+        "name": f"{target_name}-sbom",
+        "documentNamespace": namespace_uri,
+        "creationInfo": {
+            "created": created,
+            "creators": ["Tool: raptor-sca"],
+            "licenseListVersion": _SPDX_LICENSE_LIST_VERSION,
+        },
+        "packages": packages,
+        "relationships": relationships,
+    }
+
+
+def _package_block(dep: Dependency, spdx_id: str) -> dict[str, Any]:
+    """Render one Dependency as an SPDX ``packages[]`` entry."""
+    pkg: dict[str, Any] = {
+        "SPDXID": spdx_id,
+        "name": dep.name,
+        # SPDX requires either ``downloadLocation`` (URL) OR
+        # ``NOASSERTION``. We don't have download URLs in the
+        # mechanical pipeline; consumers needing them should
+        # derive from purl.
+        "downloadLocation": "NOASSERTION",
+        # ``filesAnalyzed=false`` — we don't compute per-file
+        # checksums for the dep tree. Required field on packages
+        # without ``files`` per SPDX 2.3.
+        "filesAnalyzed": False,
+        "externalRefs": [
+            {
+                "referenceCategory": "PACKAGE-MANAGER",
+                "referenceType": "purl",
+                "referenceLocator": dep.purl,
+            },
+        ],
+    }
+    if dep.version:
+        pkg["versionInfo"] = dep.version
+    # License — SPDX has two fields: declared (what the package
+    # says) vs concluded (what the analyser concluded). Without
+    # a separate concluded-license analysis pass, we use NOASSERTION
+    # for ``licenseConcluded`` per SPDX best practice.
+    if len(dep.license_declarations) > 1:
+        pkg["licenseDeclared"] = "NOASSERTION"
+        pkg["licenseComments"] = (
+            "Separate upstream declarations; relationship unspecified: "
+            + "; ".join(dep.license_declarations)
+        )
+    elif dep.declared_license:
+        pkg["licenseDeclared"] = _spdx_license_value(dep.declared_license)
+    else:
+        pkg["licenseDeclared"] = "NOASSERTION"
+    pkg["licenseConcluded"] = "NOASSERTION"
+    # ``copyrightText`` is required-or-NOASSERTION; we don't extract.
+    pkg["copyrightText"] = "NOASSERTION"
+    # Supplier — for OS packages we'd say ``Organization: <distro>``;
+    # for registry packages we don't reliably know. NOASSERTION.
+    pkg["supplier"] = "NOASSERTION"
+    return pkg
+
+
+def _spdx_license_value(declared: str) -> str:
+    """Validate the license string fits SPDX expression grammar.
+
+    SPDX 2.3 accepts: SPDX license IDs (``MIT``), composite
+    expressions (``MIT OR Apache-2.0``), or ``NOASSERTION``.
+    Free-text license strings should use ``LicenseRef-...``
+    in the document; we don't manage that today, so anything
+    not-obviously-SPDX falls back to ``NOASSERTION``.
+
+    Heuristic: SPDX IDs / expressions are short, alphanumeric +
+    ``- + . ()  AND OR WITH``. Anything else is flagged as
+    NOASSERTION rather than risking SPDX-validator rejection.
+    """
+    text = declared.strip()
+    if not text:
+        return "NOASSERTION"
+    # Accept obvious SPDX shapes; reject sentences / URLs / etc.
+    allowed_chars = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789-+. ()"
+    )
+    if not all(c in allowed_chars for c in text):
+        return "NOASSERTION"
+    # English-prose detector — reject any token that's all-lowercase
+    # AND all-alphabetic AND not an SPDX keyword (AND / OR / WITH).
+    # "See the LICENSE file for details" gets rejected because "see",
+    # "the", "license", "file", "for", "details" all match;
+    # "MIT OR Apache-2.0" passes because "mit" is too short, "or" is
+    # a keyword, "apache-2.0" isn't all-alphabetic.
+    keywords = {"and", "or", "with"}
+    prose_count = 0
+    for tok in text.split():
+        low = tok.lower()
+        if (tok.islower() and tok.isalpha()
+                and low not in keywords
+                and len(tok) >= 3):
+            prose_count += 1
+    if prose_count >= 2:
+        return "NOASSERTION"
+    return text
+
+
+def _spdx_id_for(dep: Dependency, seen: set) -> str:
+    """Stable SPDX-ID for a Dependency.
+
+    SPDX requires ``SPDXRef-<id>`` where id matches
+    ``[A-Za-z0-9.-]+`` (no underscores, slashes, colons). We
+    derive from ``ecosystem-name-version`` with non-conforming
+    chars replaced by ``-``, plus a collision suffix if needed.
+    """
+    base = f"{dep.ecosystem}-{dep.name}-{dep.version or 'unknown'}"
+    # ASCII-only: the SPDX id grammar is [A-Za-z0-9.-]+ and Unicode
+    # ``isalnum`` let non-ASCII letters through (SPDXRef-...-pakét).
+    safe = "".join(
+        c if ((c.isascii() and c.isalnum()) or c in ".-") else "-"
+        for c in base
+    )
+    spdx_id = f"SPDXRef-{safe}"
+    if spdx_id not in seen:
+        seen.add(spdx_id)
+        return spdx_id
+    # Collision (same dep declared in multiple manifests at the
+    # same version) — append a counter.
+    n = 2
+    while f"{spdx_id}-{n}" in seen:
+        n += 1
+    spdx_id = f"{spdx_id}-{n}"
+    seen.add(spdx_id)
+    return spdx_id
+
+
+__all__ = ["render_sbom_spdx", "write_sbom_spdx_json"]

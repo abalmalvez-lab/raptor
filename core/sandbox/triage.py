@@ -1,0 +1,1606 @@
+"""Rules-based triage over a completed run's sandbox telemetry.
+
+Reads <run_dir>/sandbox-summary.json, <run_dir>/proxy-events.jsonl, and
+<run_dir>/sandbox-audit-degraded.json (if present) and classifies the run
+into a 3-tier verdict — clean / notable / suspicious — based on whether any
+signature pattern resembling an escape/recon/credential-theft attempt fired,
+as distinct from ordinary "tool needed something the profile didn't allow"
+denial noise.
+
+Signals: escape_primitive_denied, escape_burst (temporal clustering),
+hostile_syscall_argument, seccomp_denied_unattributed, resolved_ip_screened,
+host_recon_pattern, host_retry_pattern, credential_path_touch,
+volume_anomaly, udp_posture_gap, dns_exfil_indicator, telemetry_tampering,
+provenance_unavailable, dns_exfil_unavailable.
+
+Pure, rules-based, offline: no LLM call, no network, no cost — cheap
+enough that core/run/metadata.py runs it unconditionally on every
+terminal-state transition (complete/fail/cancel/interrupt), right after
+the sandbox-summary finalise it reads from. libexec/raptor-sandbox-triage
+re-runs it by hand (stranded runs, post-hoc re-classification after
+editing telemetry). This is the cheap deterministic pre-filter a future
+LLM-based deeper-reasoning pass would consume, not a replacement for one.
+
+Known limitation: socket()/ioctl() denials collapse to a generic
+syscall="socket"/"ioctl" under audit tracing (see
+core/sandbox/tracer.py:_NAME_TO_TYPE) — the AF_UNIX/AF_NETLINK/AF_PACKET
+family and TIOCSTI/TIOCCONS/TIOCSCTTY ioctl-cmd detail isn't captured by the
+current tracer record shape, so escape_primitive_denied can't distinguish a
+docker.sock-escape attempt from an ordinary blocked AF_UNIX call. Fixing
+this means enriching tracer.py's record with decoded syscall arguments — a
+separate, larger change.
+"""
+
+from __future__ import annotations
+
+from .audit_control import AUDIT_CONTROL_TYPES, audit_capture_digest, valid_audit_capture
+
+import hashlib
+import json
+import os
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from core.atomic_fs import write_text_atomically
+from core.domains import DomainBoundary, InvalidHostname, domain_boundary, load_suffix_rules
+from core.json import dumps_artifact
+from core.sandbox import telemetry_mac
+from core.sandbox.escalation_signatures import (
+    DEFAULT_HOST_RECON_THRESHOLD,
+    ESCAPE_PRIMITIVE_SYSCALLS,
+    hostile_arg_label,
+    valid_syscall_args,
+    is_credential_path,
+)
+from core.sandbox.profiles import host_recon_threshold_for_profile
+from core.security.capped_read import path_may_exist, read_capped
+from core.security.log_sanitisation import sanitise_for_terminal
+from core.sandbox.proxy import (
+    PROXY_EVENTS_COUNT_FILENAME,
+    PROXY_EVENTS_FILENAME,
+)
+from core.sandbox.summary import (
+    AUDIT_DEGRADED_FILE,
+    MAX_DENIALS_PER_RUN,
+    SUMMARY_FILE,
+    _unique_evidence_object,
+    get_audit_degraded,
+    get_evidence_inode_mismatch,
+    get_evidence_write_failure,
+    get_proxy_persist_state,
+    get_run_posture,
+    reassert_audit_degraded,
+)
+
+TRIAGE_FILE = "sandbox-triage.json"
+
+# Control-plane record types written into the same denials stream by
+# core/sandbox/audit_budget.py and the tracer's credential-path
+# guaranteed-keep lane — not enforcement denials, must be excluded
+# from the enforcement-oriented signal checks below.
+_BUDGET_MARKER_TYPES = AUDIT_CONTROL_TYPES
+
+VERDICT_CLEAN = "clean"
+VERDICT_NOTABLE = "notable"
+VERDICT_SUSPICIOUS = "suspicious"
+
+SEVERITY_HIGH = "high"
+SEVERITY_MEDIUM = "medium"
+SEVERITY_LOW = "low"
+
+# Fraction of MAX_DENIALS_PER_RUN that counts as "near the cap" for
+# volume_anomaly's cap-proximity check.
+_VOLUME_ANOMALY_CAP_FRACTION = 0.9
+
+# Evidence bounds. Evidence values (hostnames, paths) are attacker-
+# controlled: a hostile target can mint thousands of distinct denied
+# hosts, each an arbitrarily long string, to bloat sandbox-triage.json
+# or to stuff content into a report a human or LLM pass later reads.
+# Signals keep the true `count`; only the illustrative evidence list
+# is capped, with an explicit elision marker so a capped list never
+# masquerades as complete.
+_MAX_EVIDENCE_ITEMS = 32
+_MAX_EVIDENCE_ITEM_LEN = 512
+
+# Escape-burst detection: N escape-primitive denials within a T-second
+# window signals a scripted sweep rather than one-off tool probing.
+_ESCAPE_BURST_COUNT = 5
+_ESCAPE_BURST_WINDOW_SECS = 10.0
+
+# Repeated-host retry: same denied host hit this many times is
+# persistence probing (distinct from breadth scanning).
+_HOST_RETRY_THRESHOLD = 10
+
+# DNS exfil: minimum distinct subdomains of one parent domain.
+_DNS_EXFIL_SUBDOMAIN_THRESHOLD = 20
+
+
+def _parse_ts(ts) -> float:
+    """Parse a denial timestamp to a comparable float.
+
+    Records use ISO 8601 strings (datetime.now(tz).isoformat()); accept
+    numeric values too for test convenience."""
+    import math
+
+    if isinstance(ts, bool):
+        raise ValueError("boolean denial timestamp")
+    if isinstance(ts, (int, float)):
+        value = float(ts)
+    else:
+        from datetime import datetime, timezone
+        parsed = datetime.fromisoformat(str(ts))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        value = parsed.timestamp()
+    if not math.isfinite(value):
+        raise ValueError("nonfinite denial timestamp")
+    return value
+
+
+# Verification outcomes for a triage input artifact. "verified" =
+# provenance token(s) present and valid; "legacy" = no token at all
+# (pre-MAC run, or no usable key when it was written) — accepted only
+# for explicit/manual re-triage of old artefacts, with a confidence
+# caveat; "tampered" = token(s) present-but-invalid, a mixed
+# stamped/unstamped stream, or an unstamped artifact seen during the
+# current lifecycle path. Failing records are excluded from signal
+# derivation and a HIGH signal fires, because the only writer that
+# stamps is this install's parent process: content that fails is
+# content something else wrote into the run dir, and the one thing
+# with both the motive and the write access is the target.
+# Pre-provenance writers omit the mac field. A present false-valued
+# token is failed provenance, not an old artifact eligible for legacy opt-in.
+_INTEGRITY_VERIFIED = "verified"
+_INTEGRITY_LEGACY = "legacy"
+_INTEGRITY_TAMPERED = "tampered"
+
+
+def _report_sha256(report: dict) -> str:
+    """Canonical hash of the WHOLE report minus its own token — the
+    MAC must cover everything consumers forward (verdict, signals,
+    inputs, caveats, ...), not a subset a target could rewrite."""
+    body = {k: v for k, v in report.items() if k != "mac"}
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, ensure_ascii=True)
+        .encode("utf-8")
+    ).hexdigest()
+
+
+def verify_triage_report(report: dict | None, run_dir: Path) -> str:
+    """Provenance state of a loaded sandbox-triage.json for downstream
+    consumers: 'verified' / 'legacy' (mac field absent) / 'tampered'.
+
+    ``run_dir`` is the directory the report was READ from — the run
+    binding is recomputed from it, so a report replayed from another
+    run fails verification even though its token was validly minted.
+    """
+    if not isinstance(report, dict):
+        return _INTEGRITY_TAMPERED
+    token = report.get("mac")
+    if "mac" not in report:
+        return _INTEGRITY_LEGACY
+    fields = telemetry_mac.triage_report_fields(
+        _report_sha256(report),
+        run=telemetry_mac.run_binding(run_dir),
+    )
+    return (_INTEGRITY_VERIFIED
+            if telemetry_mac.verify(fields, token)
+            else _INTEGRITY_TAMPERED)
+
+
+def _denials_sha256(denials: list[dict]) -> str:
+    return hashlib.sha256(
+        json.dumps(denials, sort_keys=True, ensure_ascii=True)
+        .encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_proxy_events(
+        events: list[dict], run: str, *, allow_legacy: bool = True,
+        count_record: dict | None = None,
+        over_bound: bool = False,
+        ) -> tuple[list[dict], int, str, str | None]:
+    """Partition proxy events by provenance. Returns
+    ``(usable_events, rejected_count, integrity, count_note)``.
+
+    ``count_record`` is the raw ``proxy-events.count.json`` sidecar
+    (or None when absent). The per-line seq MACs catch interior
+    deletion (gaps) but not SUFFIX/whole-file truncation between
+    persist batches — the surviving contiguous-from-0 stream fully
+    verifies. The MAC'd sidecar carries the writer's authoritative
+    count plus its tamper flags; a mismatch or flag marks the stream
+    tampered, and ``count_note`` names the reason for the report's
+    evidence list."""
+    # Reject malformed rows before either legacy acceptance or MAC work.
+    # Keep valid peers usable, but never attest the filtered stream as whole.
+    valid_events = [
+        event for event in events
+        if isinstance(event, dict)
+        and all(event.get(field) is None or isinstance(event[field], str)
+                for field in ("host", "result", "resolved_ip"))
+    ]
+    malformed_count = len(events) - len(valid_events)
+    events = valid_events
+    count_note: str | None = None
+
+    def _with_count(usable, rejected, integrity):
+        nonlocal count_note
+        rejected += malformed_count
+        checked = _INTEGRITY_TAMPERED if malformed_count else integrity
+        if over_bound:
+            # The file continued past the streaming caps: the tail is
+            # UNVERIFIED, so completeness cannot be attested — fail
+            # toward suspicious, but with the over-bound attribution
+            # (a count mismatch here is explained by the bound; the
+            # truncation/erasure note would name the wrong cause).
+            count_note = (
+                f"proxy-events file exceeds the triage streaming "
+                f"bound ({_MAX_EVENTS_STREAM_BYTES} bytes / "
+                f"{_MAX_EVENTS_PARSED} events) — {len(usable)} "
+                f"verified event(s) in the parsed prefix; events "
+                f"beyond the bound were not verified"
+            )
+            return usable, rejected, _INTEGRITY_TAMPERED, count_note
+        stamped_stream = any("mac" in e for e in events)
+        if count_record is None:
+            if stamped_stream and not allow_legacy:
+                count_note = (
+                    "proxy-events count sidecar missing for a "
+                    "stamped event stream (deleted?)"
+                )
+                checked = _INTEGRITY_TAMPERED
+            return usable, rejected, checked, count_note
+        token = (count_record.get("mac")
+                 if isinstance(count_record, dict) else None)
+        count = (count_record.get("count")
+                 if isinstance(count_record, dict) else None)
+        flags = (count_record.get("flags", [])
+                 if isinstance(count_record, dict) else [])
+        # Validate before canonicalizing MAC fields: arbitrary JSON shapes
+        # must produce a report rather than raise during flag iteration.
+        if (type(count) is not int or count < 0
+                or not isinstance(flags, list)
+                or not all(isinstance(flag, str) for flag in flags)):
+            count_note = "proxy-events count sidecar malformed"
+            return usable, rejected, _INTEGRITY_TAMPERED, count_note
+        fields = telemetry_mac.proxy_events_count_fields(
+            count, flags, run)
+        if not telemetry_mac.verify(fields, token):
+            count_note = (
+                "proxy-events count sidecar failed provenance "
+                "verification (forged or edited)"
+            )
+            return usable, rejected, _INTEGRITY_TAMPERED, count_note
+        if flags:
+            count_note = (
+                "writer-flagged proxy-events tampering: "
+                + ", ".join(sorted(str(f) for f in flags))
+            )
+            return usable, rejected, _INTEGRITY_TAMPERED, count_note
+        seqs = []
+        for e in usable:
+            seq = e.get("seq")
+            if type(seq) is not int or seq < 0:
+                count_note = "proxy-events stream has malformed sequence numbers"
+                return usable, rejected, _INTEGRITY_TAMPERED, count_note
+            seqs.append(seq)
+        max_seq = max(seqs) if seqs else -1
+        if len(usable) != count or max_seq != count - 1 or rejected:
+            # Direction matters for the operator: fewer survivors
+            # than the count is the erasure shape; MORE survivors
+            # than the count is the interrupted-persist shape (crash
+            # between the events append and the sidecar update — an
+            # inherent two-file window) or a stale/replayed sidecar.
+            # Both fail toward suspicious; only the attribution
+            # differs.
+            if (len(usable) > count and max_seq >= count - 1
+                    and not rejected):
+                count_note = (
+                    f"proxy-events stream is AHEAD of its count "
+                    f"sidecar (sidecar says {count} event(s), "
+                    f"{len(usable)} verified surviving) — "
+                    f"interrupted persist (run crashed between the "
+                    f"events append and the sidecar update) or a "
+                    f"stale/replayed sidecar"
+                )
+            else:
+                count_note = (
+                    f"proxy-events stream does not match its written "
+                    f"count (sidecar says {count} event(s), "
+                    f"{len(usable)} verified surviving) — suffix "
+                    f"truncation or whole-file deletion"
+                )
+            return usable, rejected, _INTEGRITY_TAMPERED, count_note
+        return usable, rejected, checked, count_note
+
+    if not events:
+        return _with_count([], 0, _INTEGRITY_VERIFIED)
+    if not any("mac" in e for e in events):
+        if not allow_legacy:
+            return _with_count(
+                [], len(events), _INTEGRITY_TAMPERED)
+        return _with_count(events, 0, _INTEGRITY_LEGACY)
+    usable = [
+        e for e in events
+        if telemetry_mac.verify(
+            telemetry_mac.proxy_event_fields(e, run), e.get("mac"))
+    ]
+    rejected = len(events) - len(usable)
+    integrity = (_INTEGRITY_TAMPERED if rejected
+                 else _INTEGRITY_VERIFIED)
+    # Stream continuity: per-line MACs alone let a target DELETE
+    # incriminating stamped lines and leave a fully-verifying file.
+    # The writer numbers events 0..n-1 inside the MAC; a gap means a
+    # stamped line was removed. The verified events themselves stay
+    # usable — they are genuine — but the stream is flagged tampered
+    # so the verdict carries the tampering signal. Suffix/whole-file
+    # truncation leaves no gap; the count sidecar check above covers
+    # that half.
+    if usable:
+        seqs = []
+        for e in usable:
+            seq = e.get("seq")
+            # The writer emits JSON integers. Coercion would silently turn
+            # booleans, fractional values, or numeric strings into positions.
+            if type(seq) is not int or seq < 0:
+                integrity = _INTEGRITY_TAMPERED
+                count_note = "proxy-events stream has malformed sequence numbers"
+                continue
+            seqs.append(seq)
+        if seqs and (len(set(seqs)) != len(seqs)
+                     or set(seqs) != set(range(min(seqs),
+                                               min(seqs) + len(seqs)))
+                     or min(seqs) != 0):
+            integrity = _INTEGRITY_TAMPERED
+    return _with_count(usable, rejected, integrity)
+
+
+def _verify_summary(
+        summary: dict | None, run: str, *, allow_legacy: bool = True,
+        ) -> tuple[dict | None, str]:
+    """Returns ``(usable_summary, integrity)`` — a summary that fails
+    verification is dropped entirely (its denials are untrusted as a
+    whole; there is no per-record salvage). A summary the WRITER
+    flagged as tamper-suspect (corrupt evidence lines / evidence-file
+    inode mismatch) is dropped the same way even when its MAC
+    verifies: the token only proves the summariser wrote it, and what
+    the summariser wrote is "this run's evidence was tampered with"."""
+    if summary is None:
+        return None, _INTEGRITY_VERIFIED
+    # Shape checks precede both legacy acceptance and MAC construction.
+    # Parsed JSON can still carry values unsuitable for counters or rows.
+    if not isinstance(summary, dict):
+        return None, _INTEGRITY_TAMPERED
+    corrupt_lines = summary.get("corrupt_lines", 0)
+    total_denials = summary.get("total_denials", 0)
+    evidence_write_failure = summary.get("evidence_write_failure", False)
+    denials = summary.get("denials", [])
+    if (type(corrupt_lines) is not int or corrupt_lines < 0
+            or type(total_denials) is not int or total_denials < 0
+            or type(evidence_write_failure) is not bool
+            or type(summary.get("cli_sandbox_disabled", False)) is not bool
+            or not isinstance(summary.get("disable_consent", ""), str)
+            or not isinstance(denials, list)
+            or not all(isinstance(row, dict) for row in denials)
+            or any(row.get(field) is not None
+                   and not isinstance(row[field], str)
+                   for row in denials
+                   for field in ("type", "syscall", "profile", "path"))
+            or any(not valid_syscall_args(row.get("syscall"), row.get("args"))
+                   for row in denials)):
+        return None, _INTEGRITY_TAMPERED
+    if "audit_capture" in summary and not valid_audit_capture(summary["audit_capture"]):
+        return None, _INTEGRITY_TAMPERED
+    inode_mismatch = bool(summary.get("inode_mismatch"))
+    planted_object = str(summary.get("planted_object") or "")
+    writer_flagged = (bool(corrupt_lines) or inode_mismatch
+                      or evidence_write_failure
+                      or bool(planted_object))
+    token = summary.get("mac")
+    if "mac" not in summary:
+        if not allow_legacy:
+            return None, _INTEGRITY_TAMPERED
+        if writer_flagged:
+            return None, _INTEGRITY_TAMPERED
+        return summary, _INTEGRITY_LEGACY
+    posture = summary.get("posture")
+    _refusals = summary.get("floor_refusals") or []
+    fields = telemetry_mac.summary_fields(
+        summary.get("total_denials", 0),
+        _denials_sha256(summary.get("denials", [])),
+        run=run,
+        corrupt_lines=corrupt_lines,
+        inode_mismatch=inode_mismatch,
+        evidence_write_failure=evidence_write_failure,
+        planted_object=planted_object,
+        posture=posture if isinstance(posture, dict) else None,
+        floor_refusals=len(_refusals)
+        if isinstance(_refusals, list) else 0,
+        floor_refusals_sha256=(
+            _denials_sha256(_refusals)
+            if isinstance(_refusals, list) and _refusals else ""),
+        # CLI-disable attribution: recompute each half of the pair
+        # from its own on-disk field so stripping or rewriting either
+        # one (flag or consent-source label) breaks verification.
+        cli_sandbox_disabled=bool(summary.get("cli_sandbox_disabled")),
+        disable_consent=str(summary.get("disable_consent") or ""),
+        **({"audit_capture_sha256": audit_capture_digest(summary["audit_capture"])}
+           if "audit_capture" in summary else {}),
+    )
+    if telemetry_mac.verify(fields, token):
+        if writer_flagged:
+            return None, _INTEGRITY_TAMPERED
+        return summary, _INTEGRITY_VERIFIED
+    return None, _INTEGRITY_TAMPERED
+
+
+def _verify_audit_degraded(
+        marker: dict | None, run: str, *, allow_legacy: bool = True,
+        ) -> tuple[dict | None, str]:
+    if marker is None:
+        return None, _INTEGRITY_VERIFIED
+    # Keep recognized marker text in its writer's string shape before
+    # either legacy acceptance or provenance-field construction.
+    if any(field in marker and not isinstance(marker[field], str)
+           for field in ("reason", "instructions")):
+        return None, _INTEGRITY_TAMPERED
+    token = marker.get("mac")
+    if "mac" not in marker:
+        if not allow_legacy:
+            return None, _INTEGRITY_TAMPERED
+        return marker, _INTEGRITY_LEGACY
+    if telemetry_mac.verify(
+            telemetry_mac.audit_degraded_fields(marker, run), token):
+        return marker, _INTEGRITY_VERIFIED
+    return None, _INTEGRITY_TAMPERED
+
+
+def _cap_evidence(items: list[str]) -> list[str]:
+    """Escape + bound evidence values at the one chokepoint every
+    signal's evidence list passes through. Escaping is structural,
+    not per-consumer: evidence strings can carry target-derived
+    bytes (the Landlock-lane child-append residual means a hostile
+    child can forge whole denial records), and today's consumers
+    printing only sanitised fields is no contract for tomorrow's —
+    raw control bytes must never reach sandbox-triage.json. Escape
+    BEFORE capping so the length bound holds on what is actually
+    emitted."""
+    from core.security.log_sanitisation import escape_nonprintable
+    # Items outside the display cap contribute only to the elision count.
+    # Avoid escaping and allocating strings that will immediately be dropped.
+    capped = []
+    for item in items[:_MAX_EVIDENCE_ITEMS]:
+        prefix = []
+        escaped_len = 0
+        # Escaping is character-local. Count the complete escaped length in
+        # bounded chunks, retaining only the prefix that will be displayed.
+        for offset in range(0, len(item), 4096):
+            chunk = escape_nonprintable(item[offset:offset + 4096])
+            room = _MAX_EVIDENCE_ITEM_LEN - escaped_len
+            if room > 0:
+                prefix.append(chunk[:room])
+            escaped_len += len(chunk)
+        value = "".join(prefix)
+        if escaped_len > _MAX_EVIDENCE_ITEM_LEN:
+            value += f"...[+{escaped_len - _MAX_EVIDENCE_ITEM_LEN} chars]"
+        capped.append(value)
+    if len(items) > _MAX_EVIDENCE_ITEMS:
+        dropped = len(items) - _MAX_EVIDENCE_ITEMS
+        capped.append(f"...[+{dropped} more]")
+    return capped
+
+
+def triage_run(run_dir: Path, *,
+                host_recon_threshold: int | None = None,
+                allow_legacy: bool = True,
+                ) -> dict[str, Any] | None:
+    """Classify a completed run's sandbox telemetry.
+
+    Returns the triage dict (also written to <run_dir>/sandbox-triage.json),
+    or None if none of sandbox-summary.json, proxy-events.jsonl, or the
+    sandbox-audit-degraded.json marker exists for this run_dir — mirrors
+    summarize_and_write's "no denials → None, no file written" convention
+    so file-presence keeps meaning "something happened" across every
+    sibling run-dir artifact. A marker-only run (audit degraded, no other
+    telemetry — exactly what an unaudited fallback produces) yields a
+    report carrying the degradation caveat, never silence. Parent-recorded
+    degradation also yields a report when marker storage is unavailable.
+
+    ``allow_legacy`` keeps the manual ``raptor-sandbox-triage`` surface
+    able to re-triage old pre-provenance runs. Lifecycle callers MUST pass
+    ``False``: the run dir is target-writable while the workload runs, so
+    unstamped current-run artifacts cannot be allowed to drive a verdict.
+
+    ``host_recon_threshold``: explicit override (e.g. from a CLI flag or a
+    test wanting deterministic behaviour) takes precedence exactly as
+    passed. When omitted (the ``None`` default — this is how
+    ``core.run.metadata._finalize_sandbox_triage`` calls this), the
+    threshold is resolved from whichever sandbox profile(s) this run's
+    denial records were attributed to, via
+    ``core.sandbox.profiles.host_recon_threshold_for_profile``.
+
+    A single run_dir can aggregate telemetry from MULTIPLE sandbox()
+    invocations, potentially under different profiles (e.g. mostly
+    ``full``, with one nested ``debug`` call for a crash-analysis step) —
+    there is no single well-defined "the profile" for the run as a whole.
+    Best-effort resolution: take the MIN (most sensitive/tightest)
+    threshold across every profile named in a seccomp-type denial record's
+    ``profile`` field, erring toward flagging real recon over suppressing
+    it. Falls back to DEFAULT_HOST_RECON_THRESHOLD when no denial carries a
+    ``profile`` (clean runs, network-only denials, or a non-seccomp-type
+    run) — this is the same behaviour as before this parameter existed.
+    """
+    run_dir = Path(run_dir)
+    # Re-assert the audit-degraded marker before reading anything: the
+    # marker is written into the target-writable run root BEFORE the
+    # unaudited fallback executes, so the target can delete it. The
+    # parent's in-process record (core.sandbox.summary) is out of the
+    # target's reach; a True return means the on-disk marker had to be
+    # restored at some point this run — tamper evidence in itself.
+    marker_restored = reassert_audit_degraded(run_dir)
+    parent_audit_degraded = get_audit_degraded(run_dir)
+    raw_summary = _load_json(run_dir / SUMMARY_FILE)
+    # The events JSONL streams (per-line MACs make incremental
+    # verification safe) so honest chatty runs above the whole-file
+    # input bound still grade on their real content.
+    events_read_issues: set[str] = set()
+    raw_proxy_events, events_over_bound = _load_jsonl_stream(
+        run_dir / PROXY_EVENTS_FILENAME, issues=events_read_issues)
+    raw_audit_degraded = _load_json(run_dir / AUDIT_DEGRADED_FILE)
+    raw_events_count = _load_json(run_dir / PROXY_EVENTS_COUNT_FILENAME)
+
+    # Existence check runs on the RAW inputs: even a fully-forged
+    # artifact means "something happened" and must produce a report
+    # (carrying the tampering signal), never silence. Presence is
+    # probed with lstat, not "did it parse": MAC forgery already
+    # fails toward suspicious, so destruction (garbage bytes, an
+    # oversized blob, a planted FIFO/symlink) must not fail toward
+    # clean by reading as "no telemetry".
+    summary_present = _artifact_present(run_dir / SUMMARY_FILE)
+    events_present = _artifact_present(run_dir / PROXY_EVENTS_FILENAME)
+    count_present = _artifact_present(run_dir / PROXY_EVENTS_COUNT_FILENAME)
+    summary_destroyed = summary_present and raw_summary is None
+    events_destroyed = events_present and not raw_proxy_events
+    degraded_present = _artifact_present(run_dir / AUDIT_DEGRADED_FILE)
+    degraded_destroyed = degraded_present and raw_audit_degraded is None
+    # The audit-degraded marker joins the existence gate: an unaudited
+    # fallback naturally produces exactly "no summary, no proxy events,
+    # marker only", and returning None here would silently launder
+    # "audit failed, no other telemetry" into no-report. A marker-only
+    # run must yield a report carrying the degradation caveat.
+    # A surviving count sidecar with the events file gone is the
+    # whole-file-deletion shape: events were written, then erased.
+    # It must drive a (tampered) report, never silence.
+    # The parent-memory persist mirror joins the gate too: a target
+    # that erased BOTH the events file and its count sidecar leaves
+    # the on-disk artifacts consistent-empty (the sidecar mechanism's
+    # documented residual) — in-lifecycle, the parent's own record
+    # says events existed, and silence would launder the erasure. Flags
+    # also matter at count zero: an initial persistence failure can leave
+    # no disk artifacts at all, but must still produce a failure report.
+    _pm_persist = get_proxy_persist_state(run_dir)
+    _pm_inode_mismatch = get_evidence_inode_mismatch(run_dir)
+    _pm_write_failure = get_evidence_write_failure(run_dir)
+    if (raw_summary is None and not raw_proxy_events
+            and raw_audit_degraded is None and parent_audit_degraded is None
+            and not marker_restored
+            and not events_read_issues):
+        if not allow_legacy and (summary_destroyed or events_destroyed
+                                 or degraded_destroyed or count_present
+                                 or (_pm_persist or {}).get(
+                                     "expected_count")
+                                 or (_pm_persist or {}).get("flags")
+                                 or _pm_inode_mismatch or _pm_write_failure):
+            pass  # fall through: unusable artifacts drive a report
+        else:
+            if not allow_legacy:
+                _remove_stale_triage_report(run_dir)
+            return None
+
+    # Provenance gates: the run dir is target-writable during the
+    # run, so every input is verified before it may drive a verdict.
+    # The run binding is recomputed from THIS directory — artefacts
+    # replayed from another run carry that run's binding and fail.
+    #
+    # When this install has NO usable telemetry-mac key, verification
+    # is impossible for every artefact, honest or not: that is an
+    # operator-side condition (symlinked/foreign/wrong-length key,
+    # unwritable data dir), and reading it as target tampering would
+    # turn a host misconfiguration into permanent suspicious verdicts.
+    # Inputs are then accepted at legacy confidence and a distinct
+    # MEDIUM provenance_unavailable signal (verdict >= notable) plus a
+    # caveat carry the condition instead.
+    provenance_unavailable = (not allow_legacy
+                              and not telemetry_mac.key_usable())
+    _verify_legacy = allow_legacy or provenance_unavailable
+    _run_binding = telemetry_mac.run_binding(run_dir)
+    summary, summary_integrity = _verify_summary(
+        raw_summary, _run_binding, allow_legacy=_verify_legacy)
+    if _pm_inode_mismatch or _pm_write_failure:
+        # Parent observation is authoritative even if the disk summary is
+        # missing or a later writer omitted its integrity flag.
+        summary = None
+        summary_integrity = _INTEGRITY_TAMPERED
+    # With no usable key the sidecar cannot verify for anyone —
+    # operator-side condition, not tampering; the count check is
+    # skipped and the provenance_unavailable signal carries it.
+    proxy_events, rejected_events, events_integrity, count_note = (
+        _verify_proxy_events(
+            raw_proxy_events, _run_binding, allow_legacy=_verify_legacy,
+            count_record=(None if provenance_unavailable
+                          else raw_events_count),
+            over_bound=events_over_bound))
+    if not allow_legacy and count_present and raw_events_count is None:
+        # Refused/non-object sidecars must not collapse to "no sidecar",
+        # especially when there are no surviving events to trigger a check.
+        events_integrity = _INTEGRITY_TAMPERED
+        unreadable_count_note = (
+            "proxy-events count sidecar is present but unreadable or not "
+            "a JSON object (destroyed/replaced)"
+        )
+        count_note = (f"{count_note}; {unreadable_count_note}"
+                      if count_note else unreadable_count_note)
+    if events_read_issues:
+        events_integrity = _INTEGRITY_TAMPERED
+        read_note = ("proxy-events input incomplete: "
+                     + ", ".join(sorted(events_read_issues)))
+        count_note = f"{count_note}; {read_note}" if count_note else read_note
+    # Parent-memory floor over the sidecar cross-check (one-way: it
+    # may condemn a shortened/erased stream, never excuse anything a
+    # verifier already flagged). Covers the residual the on-disk
+    # mechanism documents: simultaneous erasure of the events file
+    # AND its sidecar is on-disk-consistent, but the parent's own
+    # in-process record still knows how many lines it wrote.
+    if _pm_persist:
+        _pm_expected = int(_pm_persist.get("expected_count") or 0)
+        _pm_found = len(raw_proxy_events or [])
+        if _pm_expected and _pm_found < _pm_expected:
+            events_integrity = _INTEGRITY_TAMPERED
+            if not count_note:
+                count_note = (
+                    f"proxy-events stream is short of the parent-"
+                    f"memory written count ({_pm_found} on disk, "
+                    f"{_pm_expected} persisted by this process) — "
+                    f"erasure of the events file"
+                    + ("" if count_present
+                       else " and its count sidecar"))
+        _pm_flags = [f for f in _pm_persist.get("flags") or []]
+        if _pm_flags and events_integrity != _INTEGRITY_TAMPERED:
+            events_integrity = _INTEGRITY_TAMPERED
+            if not count_note:
+                count_note = (
+                    "writer-flagged proxy-events tampering "
+                    "(parent-memory record): "
+                    + ", ".join(sorted(_pm_flags)))
+
+    audit_degraded, degraded_integrity = (
+        _verify_audit_degraded(
+            raw_audit_degraded, _run_binding, allow_legacy=_verify_legacy))
+    # Parent knowledge survives failed publication or restoration. Keep the
+    # disk verification result independent so this cannot excuse tampering.
+    if parent_audit_degraded is not None:
+        audit_degraded = parent_audit_degraded
+
+    # Key-exposure posture gate: a verifying token only narrows to
+    # "written by the parent" when the run's sandbox posture could
+    # hide the telemetry-MAC key from the child (mount namespace or
+    # restrict_reads read allowlist — see telemetry_mac's module
+    # docstring). On a read-unrestricted run the target could read the
+    # key and mint valid tokens itself, so "verified" would overstate:
+    # demote to the legacy tier, clearly flagged below. The posture
+    # comes from parent memory (record_run_posture — out of the
+    # target's reach); the copy persisted inside the summary is only
+    # as trustworthy as the key itself, so it is trusted ONE-WAY: an
+    # on-disk "exposed" claim may demote (no attacker gains from
+    # forging it), an on-disk "hidden" claim proves nothing and never
+    # upgrades. Unknown posture (fresh-process re-triage, runs
+    # predating posture wiring) keeps today's behaviour.
+    posture = get_run_posture(run_dir)
+    posture_source = "parent-memory" if posture is not None else None
+    if posture is None:
+        _disk_posture = (summary or {}).get("posture")
+        if (isinstance(_disk_posture, dict)
+                and not _disk_posture.get("mac_key_hidden", True)):
+            posture = dict(_disk_posture)
+            posture_source = "summary"
+    key_exposed = (posture is not None
+                   and not posture.get("mac_key_hidden", True))
+    key_demoted: list[str] = []
+    if key_exposed:
+        if (raw_summary is not None
+                and summary_integrity == _INTEGRITY_VERIFIED):
+            summary_integrity = _INTEGRITY_LEGACY
+            key_demoted.append("sandbox_summary")
+        if raw_proxy_events and events_integrity == _INTEGRITY_VERIFIED:
+            events_integrity = _INTEGRITY_LEGACY
+            key_demoted.append("proxy_events")
+        if (raw_audit_degraded is not None
+                and degraded_integrity == _INTEGRITY_VERIFIED):
+            degraded_integrity = _INTEGRITY_LEGACY
+            key_demoted.append("audit_degraded")
+
+    denials = (summary or {}).get("denials", [])
+    enforcement_denials = [d for d in denials
+                            if d.get("type") not in _BUDGET_MARKER_TYPES]
+    budget_markers = [d for d in denials
+                       if d.get("type") in _BUDGET_MARKER_TYPES]
+
+    if host_recon_threshold is None:
+        observed_profiles = {d["profile"] for d in enforcement_denials
+                              if d.get("profile")}
+        host_recon_threshold = min(
+            (host_recon_threshold_for_profile(p, DEFAULT_HOST_RECON_THRESHOLD)
+             for p in observed_profiles),
+            default=DEFAULT_HOST_RECON_THRESHOLD,
+        )
+
+    signals: list[dict[str, Any]] = []
+    signals += _check_escape_primitive(enforcement_denials)
+    signals += _check_hostile_syscall_args(enforcement_denials)
+    signals += _check_seccomp_unattributed(enforcement_denials)
+    signals += _check_resolved_ip_screened(proxy_events)
+    signals += _check_host_recon(proxy_events, host_recon_threshold)
+    signals += _check_credential_path_touch(enforcement_denials)
+    signals += _check_volume_anomaly(summary, budget_markers)
+    signals += _check_audit_capture(summary)
+    signals += _check_escape_burst(enforcement_denials)
+    signals += _check_host_retry(proxy_events)
+    signals += _check_dns_exfil_indicator(proxy_events)
+    signals += _check_udp_posture_gap(posture)
+
+    # Destruction detection: an artifact that exists but yields no
+    # usable content (garbage bytes, oversized blob, FIFO, symlink)
+    # is tampering evidence under fail-closed semantics — MAC forgery
+    # already demotes; destruction must not grade better than forgery.
+    destroyed = []
+    if not allow_legacy:
+        if summary_destroyed:
+            destroyed.append("sandbox_summary")
+            summary_integrity = _INTEGRITY_TAMPERED
+        if events_destroyed:
+            destroyed.append("proxy_events")
+            events_integrity = _INTEGRITY_TAMPERED
+        if degraded_destroyed:
+            destroyed.append("audit_degraded")
+            degraded_integrity = _INTEGRITY_TAMPERED
+    # A restored marker means the parent WROTE the degradation marker
+    # and something in the target-writable run dir later removed or
+    # altered it — deletion of tamper-relevant evidence, regardless of
+    # legacy mode (the restore record lives in parent memory, so it can
+    # only be genuine). The restored content itself still feeds the
+    # degradation caveat below; the integrity demotion carries the
+    # deletion signal.
+    if marker_restored:
+        degraded_integrity = _INTEGRITY_TAMPERED
+
+    integrity = {
+        "sandbox_summary": summary_integrity,
+        "proxy_events": events_integrity,
+        "audit_degraded": degraded_integrity,
+    }
+    tampered = [name for name, state in integrity.items()
+                if state == _INTEGRITY_TAMPERED]
+    if tampered:
+        restored = ["audit_degraded"] if marker_restored else []
+        evidence = [f"{name}: provenance verification failed"
+                    for name in sorted(set(tampered) - set(destroyed)
+                                       - set(restored))]
+        if _pm_inode_mismatch:
+            evidence.append(
+                "sandbox_summary: parent observed an evidence-file verification failure")
+        if _pm_write_failure:
+            evidence.append(
+                "sandbox_summary: parent observed a denial evidence write failure")
+        evidence += [
+            f"{name}: file present but yielded no readable content "
+            f"(destroyed/replaced)" for name in sorted(destroyed)]
+        if marker_restored:
+            evidence.append(
+                "audit_degraded: marker written by the parent was "
+                "missing/altered in the run dir and was restored from "
+                "parent memory (evidence deletion)")
+        if rejected_events:
+            evidence.append(
+                f"{rejected_events} proxy event(s) rejected "
+                f"(missing/invalid provenance token)")
+        if count_note:
+            evidence.append(count_note)
+        signals.append({
+            "type": "telemetry_tampering",
+            "severity": SEVERITY_HIGH,
+            "count": len(tampered),
+            "evidence": evidence,
+        })
+
+    if provenance_unavailable:
+        signals.append({
+            "type": "provenance_unavailable",
+            "severity": SEVERITY_MEDIUM,
+            "count": 1,
+            "evidence": [
+                "no usable telemetry-mac key on this install — "
+                "telemetry accepted at legacy confidence; see the "
+                "warn-once log line from core.sandbox.telemetry_mac "
+                "for the key path and remedy",
+            ],
+        })
+
+    verdict = _derive_verdict(signals)
+
+    report: dict[str, Any] = {
+        "run_dir": str(run_dir),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "verdict": verdict,
+        "signals": signals,
+        "inputs": {
+            "sandbox_summary_present": raw_summary is not None,
+            "proxy_events_present": bool(raw_proxy_events),
+            "total_denials": (summary or {}).get("total_denials", 0),
+            "total_proxy_events": len(proxy_events),
+            "integrity": integrity,
+            "mac_key_posture": (
+                {**posture, "source": posture_source}
+                if posture is not None else "unknown"),
+        },
+        "audit_degraded": audit_degraded is not None,
+        "caveats": [],
+    }
+    # The marker result is MAC-bound; its drop counters are not. Even
+    # zero counters cannot attest completeness after the buffer cap.
+    if any(event.get("result") == "buffer_overflow" for event in proxy_events):
+        report["inputs"]["proxy_capture_unconfirmed"] = True
+        report["caveats"].append(
+            "Proxy capture reached its buffer limit; complete event capture "
+            "cannot be confirmed.")
+    capture = (summary or {}).get("audit_capture")
+    if summary and (summary.get("cli_sandbox_disabled") or summary.get("floor_refusals")):
+        report["inputs"]["sandbox_execution_unavailable"] = True
+    if capture is not None:
+        report["inputs"]["audit_capture"] = capture
+        if capture["capture_incomplete"] or capture["budget_truncated"]:
+            report["caveats"].append("Audit capture dropped or could not confirm records.")
+    legacy = sorted(name for name, state in integrity.items()
+                    if state == _INTEGRITY_LEGACY
+                    and name not in key_demoted)
+    if legacy:
+        report["caveats"].append(
+            "Unstamped telemetry accepted at face value: "
+            + ", ".join(legacy)
+            + " carry no provenance token (pre-provenance run or no "
+            "usable telemetry-mac key). The run dir is writable by "
+            "the sandboxed target, so treat this verdict with "
+            "correspondingly lower confidence."
+        )
+    if key_demoted:
+        report["caveats"].append(
+            "Telemetry provenance demoted to unverified/legacy tier: "
+            + ", ".join(sorted(key_demoted))
+            + " carry valid tokens, but this run's sandbox posture "
+            "could not hide the telemetry-mac key from the target "
+            "(no mount namespace and no restrict_reads read "
+            "allowlist), so the target could have read the key and "
+            "minted valid tokens itself. Token verification proves "
+            "nothing for this run — treat these inputs with the same "
+            "confidence as unstamped telemetry."
+        )
+    if audit_degraded is not None:
+        report["caveats"].append(
+            "Audit tracer did not engage this run "
+            f"(reason: {audit_degraded.get('reason', 'unknown')}); "
+            "syscall-level attribution (escape_primitive_denied) was "
+            "unavailable, so this verdict has lower confidence than a "
+            "run with --audit fully engaged."
+        )
+
+    _write(run_dir / TRIAGE_FILE, report)
+    return report
+
+
+# ---- signal checks (each returns a list of 0 or 1 signal dicts) --------
+
+def _check_escape_primitive(denials: list[dict]) -> list[dict]:
+    hits = [d for d in denials
+            if d.get("syscall") in ESCAPE_PRIMITIVE_SYSCALLS]
+    if not hits:
+        return []
+    return [{
+        "type": "escape_primitive_denied",
+        "severity": SEVERITY_HIGH,
+        "count": len(hits),
+        "evidence": _cap_evidence(sorted({h["syscall"] for h in hits})),
+    }]
+
+
+def _check_hostile_syscall_args(denials: list[dict]) -> list[dict]:
+    # socket()/ioctl() are argument-filtered by seccomp; the generic
+    # syscall name alone cannot distinguish a TIOCSTI tty-injection or
+    # SOCK_RAW attempt from ordinary AF_UNIX noise. Decode from the
+    # record's raw `args` (present on every audit-mode tracer record),
+    # so the check works on both enriched and pre-enrichment records.
+    # Audit-mode only, like escape_primitive_denied: plain enforcement
+    # ERRNOs these in-kernel with no argument capture.
+    labels = []
+    for d in denials:
+        if d.get("syscall") in ("socket", "ioctl"):
+            label = hostile_arg_label(d["syscall"], d.get("args") or [])
+            if label is not None:
+                labels.append(label)
+    if not labels:
+        return []
+    return [{
+        "type": "hostile_syscall_argument",
+        "severity": SEVERITY_HIGH,
+        "count": len(labels),
+        "evidence": _cap_evidence(sorted(set(labels))),
+    }]
+
+
+def _check_seccomp_unattributed(denials: list[dict]) -> list[dict]:
+    hits = [d for d in denials
+            if d.get("type") == "seccomp" and "syscall" not in d]
+    if not hits:
+        return []
+    return [{
+        "type": "seccomp_denied_unattributed",
+        "severity": SEVERITY_LOW,
+        "count": len(hits),
+        "evidence": [
+            "non-audit run: syscall identity unavailable, only "
+            f"profile={hits[0].get('profile')!r} known",
+        ],
+    }]
+
+
+def _check_resolved_ip_screened(proxy_events: list[dict]) -> list[dict]:
+    # ANY occurrence — doc-confirmed purely-attack pattern (see
+    # docs/sandbox.md's audit-mode section), not threshold-based. Read
+    # from proxy-events.jsonl rather than sandbox-summary.json's mirrored
+    # network-type denial: the audit-mode mirror
+    # (_record_proxy_denial -> record_denial(..., "network", ...)) writes
+    # a plain type="network" denial indistinguishable from an ordinary
+    # network-allowlist denial in the summary — resolved_ip is only
+    # reliably present in proxy-events.jsonl's resolved_ip field.
+    hits = [e for e in proxy_events if e.get("result") == "denied_resolved_ip"]
+    if not hits:
+        return []
+    return [{
+        "type": "resolved_ip_screened",
+        "severity": SEVERITY_HIGH,
+        "count": len(hits),
+        "evidence": _cap_evidence(sorted({e["resolved_ip"] for e in hits
+                                          if e.get("resolved_ip")})),
+    }]
+
+
+def _check_host_recon(proxy_events: list[dict], threshold: int) -> list[dict]:
+    hosts = {e.get("host") for e in proxy_events
+             if e.get("result") in ("denied_host", "would_deny_host")
+             and e.get("host")}
+    if len(hosts) < threshold:
+        return []
+    return [{
+        "type": "host_recon_pattern",
+        "severity": SEVERITY_MEDIUM,
+        "count": len(hosts),
+        "evidence": _cap_evidence(sorted(hosts)),  # type: ignore[arg-type]
+    }]
+
+
+def _check_credential_path_touch(denials: list[dict]) -> list[dict]:
+    hits = []
+    for d in denials:
+        path = d.get("path")
+        if not path:
+            continue
+        if is_credential_path(path):
+            hits.append(path)
+    if not hits:
+        return []
+    return [{
+        "type": "credential_path_touch",
+        "severity": SEVERITY_HIGH,
+        "count": len(hits),
+        "evidence": _cap_evidence(sorted(set(hits))),
+    }]
+
+
+def _check_audit_capture(summary: dict | None) -> list[dict]:
+    capture = (summary or {}).get("audit_capture")
+    if not capture or not capture["capture_incomplete"]:
+        return []
+    return [{
+        "type": "audit_capture_incomplete", "severity": SEVERITY_MEDIUM,
+        "count": max(1, capture["malformed_records"]),
+        "evidence": ["audit collection could not confirm complete capture"],
+    }]
+
+
+def _check_volume_anomaly(summary: dict | None,
+                           budget_markers: list[dict]) -> list[dict]:
+    evidence = []
+    total = (summary or {}).get("total_denials", 0)
+    cap_threshold = int(MAX_DENIALS_PER_RUN * _VOLUME_ANOMALY_CAP_FRACTION)
+    if total >= cap_threshold:
+        evidence.append(
+            f"total_denials={total} near/at cap ({MAX_DENIALS_PER_RUN})"
+        )
+    # The caller classifies these records by their required marker type.
+    marker_types = sorted({m["type"] for m in budget_markers
+                            if m.get("type") != "audit_summary"})
+    capture = (summary or {}).get("audit_capture")
+    if capture:
+        marker_types = sorted(set(marker_types) | (set(capture["by_type"]) - {"audit_summary"}))
+        if capture["budget_truncated"]:
+            evidence.append("audit capture reports dropped records")
+    if marker_types:
+        evidence.append(f"audit budget markers present: {marker_types}")
+    if not evidence:
+        return []
+    return [{
+        "type": "volume_anomaly",
+        "severity": SEVERITY_MEDIUM,
+        "count": total,
+        "evidence": evidence,
+    }]
+
+
+def _check_udp_posture_gap(posture: dict | None) -> list[dict]:
+    """Fire when block_network was True but UDP was not blocked."""
+    if posture is None:
+        return []
+    if not posture.get("block_network"):
+        return []
+    if posture.get("udp_block_engaged", True):
+        return []
+    return [{
+        "type": "udp_posture_gap",
+        "severity": SEVERITY_HIGH,
+        "count": 1,
+        "evidence": [
+            "block_network=True but udp_block_engaged=False — "
+            "the child had an unmonitored UDP egress path "
+            "(DNS exfiltration possible)"
+        ],
+    }]
+
+
+def _check_escape_burst(denials: list[dict]) -> list[dict]:
+    """Detect bursts of escape-primitive denials within a short window."""
+    hits = [d for d in denials
+            if d.get("syscall") in ESCAPE_PRIMITIVE_SYSCALLS
+            and d.get("ts") is not None]
+    if len(hits) < _ESCAPE_BURST_COUNT:
+        return []
+    timestamps = []
+    for hit in hits:
+        try:
+            timestamps.append(_parse_ts(hit["ts"]))
+        except (TypeError, ValueError, OverflowError, OSError):
+            # One damaged timestamp must not erase valid peers' timing.
+            continue
+    if len(timestamps) < _ESCAPE_BURST_COUNT:
+        return []
+    timestamps.sort()
+    for i in range(len(timestamps) - _ESCAPE_BURST_COUNT + 1):
+        window = timestamps[i + _ESCAPE_BURST_COUNT - 1] - timestamps[i]
+        if window <= _ESCAPE_BURST_WINDOW_SECS:
+            return [{
+                "type": "escape_burst",
+                "severity": SEVERITY_HIGH,
+                "count": len(timestamps),
+                "evidence": [
+                    f"{_ESCAPE_BURST_COUNT}+ escape-primitive denials "
+                    f"within {window:.1f}s window — scripted sweep"
+                ],
+            }]
+    return []
+
+
+def _check_host_retry(proxy_events: list[dict]) -> list[dict]:
+    """Detect repeated attempts to reach the same denied host."""
+    from collections import Counter
+    host_counts: Counter[str] = Counter()
+    for e in proxy_events:
+        if e.get("result") in ("denied_host", "would_deny_host"):
+            host = e.get("host")
+            if host:
+                host_counts[host] += 1
+    retried = {h: c for h, c in host_counts.items()
+               if c >= _HOST_RETRY_THRESHOLD}
+    if not retried:
+        return []
+    return [{
+        "type": "host_retry_pattern",
+        "severity": SEVERITY_MEDIUM,
+        "count": sum(retried.values()),
+        "evidence": _cap_evidence([
+            f"{host} ({count}x)" for host, count
+            in sorted(retried.items(), key=lambda x: -x[1])
+        ]),
+    }]
+
+
+def _effective_parent(host: str) -> DomainBoundary | None:
+    """Group subdomains, retaining whether the boundary is only heuristic."""
+    boundary = domain_boundary(host, allow_underscores=True)
+    if (boundary.registrable_domain is None
+            or boundary.hostname == boundary.registrable_domain):
+        return None
+    return boundary
+
+
+def _check_dns_exfil_indicator(proxy_events: list[dict]) -> list[dict]:
+    """Detect subdomain-encoding exfiltration through allowed hosts."""
+    from collections import defaultdict
+    allowed = [e for e in proxy_events
+               if e.get("result") in ("allowed", "proxied")
+               and e.get("host")]
+    if not allowed:
+        return []
+    parent_map: dict[str, set[str]] = defaultdict(set)
+    invalid_hosts = 0
+    heuristic_parents: set[str] = set()
+    try:
+        # Preflight also covers IP-only telemetry, whose identity lookups
+        # do not need to read the snapshot themselves.
+        load_suffix_rules()
+        for e in allowed:
+            try:
+                boundary = _effective_parent(e["host"])
+            except InvalidHostname:
+                # A malformed telemetry host must not discard detections
+                # from the valid hosts in this same run.
+                invalid_hosts += 1
+                continue
+            if boundary is not None and boundary.registrable_domain is not None:
+                parent = boundary.registrable_domain
+                parent_map[parent].add(boundary.hostname)
+                if boundary.source == "default":
+                    heuristic_parents.add(parent)
+    except (OSError, ValueError):
+        # Preserve the rest of triage, but never report a clean run
+        # when this detector could not evaluate its domain boundaries.
+        return [{
+            "type": "dns_exfil_unavailable",
+            "severity": SEVERITY_MEDIUM,
+            "count": 1,
+            "evidence": ["DNS-exfiltration grouping unavailable: Public Suffix "
+                         "List data is missing, unreadable, or invalid"],
+        }]
+    incomplete = [{
+        "type": "dns_exfil_unavailable",
+        "severity": SEVERITY_MEDIUM,
+        "count": invalid_hosts,
+        "evidence": ["DNS-exfiltration grouping skipped invalid telemetry hostnames"],
+    }] if invalid_hosts else []
+    suspects = {parent: subs for parent, subs in parent_map.items()
+                if len(subs) >= _DNS_EXFIL_SUBDOMAIN_THRESHOLD}
+    if not suspects:
+        return incomplete
+    return incomplete + [{
+        "type": "dns_exfil_indicator",
+        "severity": SEVERITY_HIGH,
+        "count": sum(len(s) for s in suspects.values()),
+        "evidence": _cap_evidence([
+            f"{parent}: {len(subs)} distinct subdomain(s)"
+            + (" (heuristic grouping: suffix absent from PSL)"
+               if parent in heuristic_parents else "")
+            for parent, subs
+            in sorted(suspects.items(), key=lambda x: -len(x[1]))
+        ]),
+    }]
+
+
+def _derive_verdict(signals: list[dict]) -> str:
+    if any(s["severity"] == SEVERITY_HIGH for s in signals):
+        return VERDICT_SUSPICIOUS
+    if signals:
+        return VERDICT_NOTABLE
+    return VERDICT_CLEAN
+
+
+# ---- I/O helpers ---------------------------------------------------------
+
+# Bound on any single triage input file. Legitimate inputs are far
+# smaller (denials are capped at MAX_DENIALS_PER_RUN records; proxy
+# events at one line per CONNECT) — anything bigger is a planted
+# artifact, and reading it unboundedly hands the target a memory
+# lever over the parent's lifecycle hook.
+_MAX_INPUT_BYTES = 64 * 1024 * 1024
+
+
+def _read_bounded(path: Path) -> bytes | None:
+    """Read a triage input with the same discipline the writers use
+    (see context._persist_proxy_events): the run dir is
+    target-writable, so a plain ``open()`` here would follow a
+    target-planted symlink out of the sandbox boundary, and block the
+    LIFECYCLE (complete_run/fail_run run this in-process) forever on
+    a target-planted FIFO with no writer. Delegates the hardened
+    dance (O_NOFOLLOW + O_NONBLOCK + O_CLOEXEC at open, fstat
+    regular-file and size checks on the actually-opened inode,
+    bounded read) to ``core.security.capped_read``. Any refusal
+    returns None — absent and unreadable collapse to "no input",
+    matching the writers' fail-quiet stance. A file that grows past
+    the cap between fstat and read is REFUSED (None), never returned
+    as a silently-truncated prefix a racing writer could shape.
+    """
+    return read_capped(path, _MAX_INPUT_BYTES)
+
+
+def _load_json(path: Path) -> dict | None:
+    data = _read_bounded(path)
+    if data is None:
+        return None
+    try:
+        loaded = json.loads(
+            data.decode("utf-8"), object_pairs_hook=_unique_evidence_object)
+    except (ValueError, RecursionError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _artifact_present(path: Path) -> bool:
+    """Conservative presence, including uninspectable entries, dangling
+    symlinks, and FIFOs the bounded reader refuses to read. Destruction
+    must not read as absence: a target that replaces its telemetry
+    with a FIFO, an oversized blob, or garbage bytes must land in the
+    tampered path, not the "no telemetry" path."""
+    return path_may_exist(path)
+
+
+# Streaming bounds for the proxy-events JSONL specifically. The count
+# sidecar defence makes honest very-chatty streams legitimate at sizes
+# the whole-file _read_bounded refuses (its 64 MiB bound buffers the
+# entire input) — per-line MACs make incremental verification safe, so
+# the events file is streamed line-by-line instead: constant memory
+# per line, a per-line cap (an oversize line is skipped exactly like a
+# corrupt one), and generous cumulative caps that bound a hostile
+# planted file without misgrading honest chatty runs. Past the
+# cumulative caps the parsed prefix is still returned and the caller
+# fails toward suspicious with a DISTINCT over-bound note — never the
+# truncation/erasure note.
+_MAX_EVENT_LINE_BYTES = 64 * 1024
+_MAX_EVENTS_STREAM_BYTES = 512 * 1024 * 1024
+_MAX_EVENTS_PARSED = 500_000
+
+
+def _load_jsonl_stream(
+        path: Path, *, issues: set[str] | None = None,
+        ) -> tuple[list[dict], bool]:
+    """Stream-parse a JSONL file under the streaming bounds.
+
+    Returns ``(events, over_bound)``. Same open discipline as
+    ``_read_bounded`` (O_NOFOLLOW + O_NONBLOCK at open, fstat
+    regular-file check) but never buffers the whole file.
+    ``over_bound`` is True when input continued past a cumulative cap
+    — the returned events are the verified-parseable prefix. Optional
+    ``issues`` accumulates discarded-record and read-failure reasons."""
+    if issues is None:
+        issues = set()
+    try:
+        fd = os.open(
+            str(path),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        return [], False
+    except OSError:
+        issues.add("read_failure")
+        return [], False
+    out: list[dict] = []
+    over_bound = False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            issues.add("nonregular_input")
+            return [], False
+        carry = b""
+        skipping_oversize_line = False
+        total = 0
+        while True:
+            remaining = _MAX_EVENTS_STREAM_BYTES - total
+            if remaining <= 0 or len(out) >= _MAX_EVENTS_PARSED:
+                over_bound = True  # conservative if the lookahead fails
+                return out, bool(os.read(fd, 1))
+            chunk = os.read(fd, min(1 << 20, remaining))
+            if not chunk:
+                break
+            total += len(chunk)
+            carry += chunk
+            # Scan by offset: repeatedly slicing the unread suffix copies
+            # the same bytes once per record in a busy chunk.
+            start = 0
+            while True:
+                nl = carry.find(b"\n", start)
+                if nl < 0:
+                    break
+                line = carry[start:nl]
+                start = nl + 1
+                if skipping_oversize_line:
+                    # Tail of a line that already blew the per-line
+                    # cap — resynchronise at this newline.
+                    skipping_oversize_line = False
+                    continue
+                _parse_jsonl_line(line, out, issues=issues)
+                if len(out) >= _MAX_EVENTS_PARSED:
+                    # Reaching a cap is not evidence that input was lost.
+                    # Look ahead only when this chunk has no remaining bytes.
+                    over_bound = True  # conservative if the lookahead errors
+                    over_bound = (total > _MAX_EVENTS_STREAM_BYTES
+                                  or start < len(carry) or bool(os.read(fd, 1)))
+                    return out, over_bound
+            carry = carry[start:]
+            if len(carry) > _MAX_EVENT_LINE_BYTES:
+                issues.add("oversized_record")
+                # Oversize line: drop what we have and skip to the
+                # next newline (same treatment as a corrupt line).
+                carry = b""
+                skipping_oversize_line = True
+            if total >= _MAX_EVENTS_STREAM_BYTES:
+                over_bound = True  # conservative if the lookahead errors
+                over_bound = total > _MAX_EVENTS_STREAM_BYTES or bool(os.read(fd, 1))
+                if not over_bound and carry and not skipping_oversize_line:
+                    _parse_jsonl_line(carry, out, issues=issues)
+                return out, over_bound
+        if carry and not skipping_oversize_line:
+            _parse_jsonl_line(carry, out, issues=issues)
+        return out, over_bound
+    except OSError:
+        issues.add("read_failure")
+        return out, over_bound
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _parse_jsonl_line(
+        line: bytes, out: list[dict], *, issues: set[str] | None = None,
+        ) -> None:
+    if issues is None:
+        issues = set()
+    # Bound the original record bytes, matching the incomplete-line guard.
+    # Stripping first made admission depend on how reads split the line.
+    if len(line) > _MAX_EVENT_LINE_BYTES:
+        issues.add("oversized_record")
+        return
+    line = line.strip()
+    if not line:
+        return
+    try:
+        # Reject damaged bytes rather than silently changing JSON keys or
+        # values before provenance and classification checks.
+        record = json.loads(
+            line.decode("utf-8"), object_pairs_hook=_unique_evidence_object)
+    except (ValueError, RecursionError):
+        issues.add("malformed_record")
+        return
+    if isinstance(record, dict):
+        out.append(record)
+    else:
+        issues.add("nonobject_record")
+
+
+
+def _write(path: Path, report: dict) -> None:
+    # Self-stamp: on a no-telemetry run the lifecycle writes no report,
+    # so a target-planted sandbox-triage.json would otherwise survive
+    # to be read by downstream consumers (deep pass, /review, project
+    # views). Those consumers verify via verify_triage_report().
+    token = telemetry_mac.mint(telemetry_mac.triage_report_fields(
+        _report_sha256(report),
+        run=telemetry_mac.run_binding(path.parent),
+    ))
+    if token:
+        report["mac"] = token
+    write_text_atomically(
+        path,
+        dumps_artifact(report, ensure_ascii=True) + "\n",
+        tmp_prefix=".~triage-",
+    )
+
+
+def _remove_stale_triage_report(run_dir: Path) -> None:
+    """Remove a target-planted report on a current run with no telemetry.
+
+    A clean lifecycle run writes no triage report. Without this cleanup a
+    target can pre-plant ``sandbox-triage.json`` and leave it behind for
+    downstream readers after triage correctly decides there was nothing to
+    classify.
+    """
+    try:
+        (run_dir / TRIAGE_FILE).unlink(missing_ok=True)
+    except OSError:
+        # Best-effort only: downstream consumers still verify provenance and
+        # refuse an unstamped report. Never let cleanup fail the lifecycle.
+        pass
+
+
+def _required_evidence_problem(report: dict) -> str | None:
+    """Require positive, authenticated evidence before a CI gate can pass."""
+    inputs = report.get("inputs")
+    if isinstance(inputs, dict) and inputs.get("sandbox_execution_unavailable"):
+        return "sandbox execution was disabled or refused"
+    if not isinstance(inputs, dict) or not (
+        inputs.get("sandbox_summary_present") is True
+        or inputs.get("proxy_events_present") is True
+    ):
+        return "no sandbox summary or proxy-event evidence"
+    integrity = inputs.get("integrity")
+    if not isinstance(integrity, dict) or any(
+        integrity.get(name) != _INTEGRITY_VERIFIED
+        for name in ("sandbox_summary", "proxy_events", "audit_degraded")
+    ):
+        return "telemetry provenance is not fully verified"
+    posture = inputs.get("mac_key_posture")
+    # Preserve existing provenance semantics for a fresh CLI process:
+    # missing parent-memory posture does not prove prior key exposure.
+    # Known exposure already demotes integrity; never promote it here.
+    if isinstance(posture, dict) and posture.get("mac_key_hidden") is False:
+        return "telemetry signing-key posture is explicitly degraded"
+    if inputs.get("proxy_capture_unconfirmed"):
+        return "proxy event capture is unconfirmed"
+    capture = inputs.get("audit_capture")
+    if report.get("audit_degraded") or (capture is not None and (
+        not valid_audit_capture(capture)
+        or capture["capture_incomplete"] or capture["budget_truncated"]
+    )):
+        return "sandbox evidence capture is incomplete"
+    return None
+
+
+def _cli_main(argv: list | None = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit status: 0 for clean or empty input, 1 for input/report "
+            "failures, 2 for argument errors, 3 for notable and 4 for "
+            "suspicious verdicts.\n\n"
+            "Examples:\n"
+            "  raptor-sandbox-triage /path/to/run\n"
+            "  raptor-sandbox-triage /path/to/run --json --deep\n"
+            "  raptor-sandbox-triage /path/to/run --require-evidence --json"
+        ),
+        description="Rules-based triage of a completed run's sandbox "
+                    "telemetry for escape/recon/credential-theft signatures.",
+    )
+    parser.add_argument("run_dir", help="run directory to triage")
+    parser.add_argument(
+        "--require-evidence", action="store_true",
+        help="CI gate: require present, fully authenticated sandbox evidence "
+             "and complete capture; missing or uncertain evidence exits 1. "
+             "Cannot be combined with --legacy.",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="print the full triage report as JSON on stdout "
+             "(the report is also written to sandbox-triage.json); "
+             "emit JSON null when no telemetry exists",
+    )
+    parser.add_argument(
+        "--deep", action="store_true",
+        help="after the rules pass, run the LLM deeper-reasoning pass "
+             "over any non-clean verdict (uses the configured default "
+             "model; writes sandbox-triage-deep.json; advisory only — "
+             "never changes the rules verdict or the exit code)",
+    )
+    parser.add_argument(
+        "--legacy", action="store_true",
+        help="accept unstamped (pre-provenance) telemetry at face "
+             "value. Only for run directories created before "
+             "provenance stamping existed — on current runs an "
+             "attacker who rewrote the telemetry produces exactly "
+             "this unstamped shape, so the default (off) treats it "
+             "as tampering. Do NOT pass this in CI gates.",
+    )
+    try:
+        args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+        if args.require_evidence and args.legacy:
+            parser.error("--require-evidence cannot be combined with --legacy")
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+
+    target = Path(args.run_dir)
+    try:
+        target_is_dir = target.is_dir()
+    except OSError as exc:
+        print(
+            f"error: cannot inspect {sanitise_for_terminal(str(target))}: "
+            f"{sanitise_for_terminal(str(exc))}", file=sys.stderr,
+        )
+        return 1
+    if not target_is_dir:
+        print(f"error: {sanitise_for_terminal(str(target))} is not a directory", file=sys.stderr)
+        return 1
+
+    # Fail-closed by default: this exit code is documented as a CI
+    # gate, and unstamped telemetry on a current run is exactly what
+    # a target that rewrote its own telemetry looks like.
+    try:
+        result = triage_run(target, allow_legacy=args.legacy)
+    except OSError as exc:
+        print(
+            "error: cannot produce triage report for "
+            f"{sanitise_for_terminal(str(target))}: "
+            f"{sanitise_for_terminal(str(exc))}", file=sys.stderr,
+        )
+        return 1
+    if result is None:
+        if args.json:
+            print(dumps_artifact(None, ensure_ascii=True))
+        else:
+            print(f"(no sandbox telemetry found for {sanitise_for_terminal(str(target))})")
+        if args.require_evidence:
+            print("error: required sandbox evidence is missing", file=sys.stderr)
+            return 1
+        return 0
+
+    # Resolve the rules status before optional advisory work. Ordinary
+    # deep-pass I/O/data failures must not replace the CI gate's verdict.
+    exit_code = {VERDICT_CLEAN: 0, VERDICT_NOTABLE: 3,
+                 VERDICT_SUSPICIOUS: 4}[result["verdict"]]
+
+    if args.json:
+        print(dumps_artifact(result, ensure_ascii=True))
+    else:
+        print(f"Verdict: {result['verdict'].title()}  "
+              f"({len(result['signals'])} signal(s)) -> "
+              f"{sanitise_for_terminal(str(target / TRIAGE_FILE))}")
+        for signal in result["signals"]:
+            print(f"  - {signal['type']} [{signal['severity']}] "
+                  f"count={signal['count']}")
+        for caveat in result.get("caveats", []):
+            # Caveat text embeds the audit-degraded reason, read from
+            # a file inside the run dir — which the sandboxed target
+            # may have write access to. Sanitise before a terminal.
+            print(f"  ⚠️  {sanitise_for_terminal(caveat)}")
+    if args.require_evidence:
+        problem = _required_evidence_problem(result)
+        if problem is not None:
+            print(f"error: required sandbox evidence: {problem}", file=sys.stderr)
+            return 1
+    if args.deep:
+        if result["verdict"] == VERDICT_CLEAN:
+            if not args.json:
+                print("(clean verdict — deep pass has nothing to assess)")
+        else:
+            from core.sandbox.triage_deep import deep_analyse
+            try:
+                deep = deep_analyse(target)
+            except (OSError, ValueError) as exc:
+                print(
+                    f"deep pass failed: {type(exc).__name__}: "
+                    f"{sanitise_for_terminal(str(exc))}", file=sys.stderr,
+                )
+                return exit_code
+            if deep is None:
+                print("(deep pass unavailable — no LLM configured, or "
+                      "the triage report failed provenance "
+                      "verification; see log)", file=sys.stderr)
+            elif not args.json:
+                # Deep-report free text is LLM output. The producer
+                # (triage_deep._parse_assessments) escapes and caps it
+                # today, but that is a producer-side contract this
+                # print must not depend on — a new deep-report field or
+                # a consumer reading the report from disk without
+                # re-verification would reach the terminal raw.
+                # Sanitise at the emission site like the caveat print.
+                print(f"Deep assessment ({sanitise_for_terminal(str(deep['model'] or 'LLM'), max_len=128)}) — "
+                      f"advisory, rules verdict stands:")
+                for a in deep["assessments"]:
+                    print(f"  - {sanitise_for_terminal(str(a['signal_type']), max_len=64)}: "
+                          f"{sanitise_for_terminal(str(a['judgement']), max_len=32)} "
+                          f"(confidence {a['confidence']:.2f}) — "
+                          f"{sanitise_for_terminal(str(a['rationale']))}")
+                if deep.get("overall_note"):
+                    print(f"  note: {sanitise_for_terminal(str(deep['overall_note']))}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main())

@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from core.testing.standalone_cli import run_standalone_cli
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SHIM = REPO_ROOT / "libexec" / "raptor-pick-strategies"
@@ -24,10 +24,15 @@ STAGE_B = REPO_ROOT / ".claude" / "skills" / "exploitability-validation" / "stag
 
 def _run(*args, env_extra=None, timeout=30):
     env = dict(os.environ)
-    env["_RAPTOR_TRUSTED"] = "1"
+    env.update(
+        _RAPTOR_TRUSTED="1",
+        _RAPTOR_SCRATCH_AUTH="stale-test-authorization",
+        RAPTOR_SESSION_PID="invalid",
+        RAPTOR_SESSION_TOKEN="stale",
+    )
     if env_extra:
         env.update(env_extra)
-    return subprocess.run(
+    return run_standalone_cli(
         [sys.executable, str(SHIM), *args],
         env=env, capture_output=True, text=True, timeout=timeout,
     )
@@ -100,7 +105,7 @@ class TestHostileInputs:
         """1000 callees — picker scales, output stays bounded."""
         calls = ",".join(["noise_" + str(i) for i in range(1000)]
                           + ["mutex_lock"])
-        r = _run("--calls", calls, timeout=60)
+        r = _run("--calls", calls, "--profile", "linux_kernel", timeout=60)
         assert r.returncode == 0
         # Concurrency strategy fires on the one real signal.
         assert "## Strategy: concurrency" in r.stdout
@@ -170,7 +175,7 @@ class TestOutputValidity:
         (### Key questions / ### Approach / ### Worked examples)."""
         r = _run("--cwe", "CWE-78")
         # At least one strategy block.
-        strategy_headings = re.findall(r"^## Strategy: \S+", r.stdout, re.M)
+        strategy_headings = re.findall(r"^## Strategy: \S+", r.stdout, re.MULTILINE)
         assert len(strategy_headings) >= 1
         # Standard subheadings present somewhere in output.
         assert "### Key questions" in r.stdout
@@ -228,6 +233,7 @@ class TestE2E:
         r = _run(
             "--file", "net/netfilter/nf_tables_api.c",
             "--function", "nft_payload_eval",
+            "--profile", "linux_kernel",
         )
         assert r.returncode == 0
         # input_handling fires on path + function-name keyword.

@@ -9,6 +9,8 @@ from cve_diff.infra.service_health import (
 )
 
 
+from core.testing.module_bindings import patch_module_attribute
+
 def test_health_result_row_renders_status_and_latency() -> None:
     r = HealthResult(name="OSV API", ok=True, latency_ms=320.5, detail="ok")
     row = r.as_row()
@@ -23,6 +25,26 @@ def test_health_result_row_renders_failure() -> None:
     assert "✗" in row
     assert "GitHub API" in row
     assert "http 503" in row
+
+
+def test_health_result_row_escapes_hostile_error_text() -> None:
+    """``detail`` and ``rate_limit`` carry live-network error text
+    (HttpError bodies, response header hints): a proxied/MITM'd
+    endpoint can put ANSI/OSC bytes there, and the row reaches the
+    operator TTY through registered CLI writers. Escaped + bounded at
+    the render, per the terminal-relay (B1) discipline."""
+    r = HealthResult(
+        name="NVD API", ok=False, latency_ms=12.0,
+        detail="\x1b]0;pwned\x07network: err\x1b[31m",
+        rate_limit="x\x1b[0m" + "y" * 200,
+    )
+    row = r.as_row()
+    assert "\x1b" not in row
+    assert "\x07" not in row
+    assert "network" in row
+    # Length still bounded (pre-fix hard [:60] slice; now an escaped
+    # bounded render with an explicit elision marker).
+    assert len(row) < 400
 
 
 def test_render_table_flags_critical_failures() -> None:
@@ -76,8 +98,9 @@ def test_has_critical_failure_detects_critical_only() -> None:
     assert has_critical_failure([]) is False
 
 
-def test_probe_anthropic_requires_api_key(monkeypatch) -> None:
+def test_probe_anthropic_requires_api_key(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("RAPTOR_LLM_SOCKET", raising=False)
     r = service_health.probe_anthropic()
     assert r.ok is False
     assert "ANTHROPIC_API_KEY not set" in r.detail
@@ -99,7 +122,31 @@ def test_probes_tuple_lists_dns_first() -> None:
 
 import json as _json
 
+import pytest
+
 from core.http import HttpError, Response
+
+import cve_diff.llm.auth as _auth_mod
+
+
+@pytest.fixture
+def _anthropic_routed(monkeypatch):
+    """Pin the probe's default-model resolution to an Anthropic model.
+
+    ``probe_anthropic`` consults ``cve_diff.llm.auth.default_model_id()``,
+    which resolves through the shared LLM registry — ambient operator
+    config (``~/.config/raptor/models.json``, provider env keys) and
+    process-global caches primed by OTHER tests in the same run
+    (``core.llm.config._cached_thinking_model``) can steer it to a
+    non-Anthropic provider, flipping the probe onto its informational
+    skip branch. These unit tests exercise the Anthropic probe itself,
+    so the routing decision must be pinned, not inherited from the
+    session (hermeticity: no dependence on host config or sibling-test
+    pollution). The skip branch has its own dedicated tests below.
+    """
+    monkeypatch.setattr(
+        _auth_mod, "default_model_id", lambda: "claude-sonnet-4-6",
+    )
 
 
 def _stub_client(monkeypatch, *, request_fn=None):
@@ -121,10 +168,6 @@ def _ok_response(status=200, body=b"", json_body=None, headers=None):
     return Response(status=status, headers=headers or {}, body=body, url="")
 
 
-def _error_response(status, retry_after=None):
-    raise HttpError(f"http {status}", status=status, retry_after=retry_after)
-
-
 # --- _timed_get ---
 
 def test_timed_get_success_returns_body_and_no_error(monkeypatch) -> None:
@@ -140,7 +183,7 @@ def test_timed_get_network_failure_returns_error_and_no_body(monkeypatch) -> Non
     def boom(m, u, **kw):
         raise HttpError("connection refused")
     _stub_client(monkeypatch, request_fn=boom)
-    latency, body, status, err = service_health._timed_get("https://example.com")
+    latency, body, _status, err = service_health._timed_get("https://example.com")
     assert body is None
     assert "connection refused" in err
     assert latency >= 0
@@ -148,7 +191,7 @@ def test_timed_get_network_failure_returns_error_and_no_body(monkeypatch) -> Non
 
 # --- probe_anthropic (POST, with explicit branches) ---
 
-def test_probe_anthropic_success_when_post_returns_200(monkeypatch) -> None:
+def test_probe_anthropic_success_when_post_returns_200(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     _stub_client(monkeypatch, request_fn=lambda m, u, **kw: _ok_response(200))
     r = service_health.probe_anthropic()
@@ -156,7 +199,7 @@ def test_probe_anthropic_success_when_post_returns_200(monkeypatch) -> None:
     assert "ok" in r.detail
 
 
-def test_probe_anthropic_marks_401_as_auth_failure(monkeypatch) -> None:
+def test_probe_anthropic_marks_401_as_auth_failure(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-bad")
     def raise_401(m, u, **kw):
         raise HttpError("unauthorized", status=401)
@@ -166,7 +209,7 @@ def test_probe_anthropic_marks_401_as_auth_failure(monkeypatch) -> None:
     assert "auth" in r.detail.lower()
 
 
-def test_probe_anthropic_marks_529_as_overloaded(monkeypatch) -> None:
+def test_probe_anthropic_marks_529_as_overloaded(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     def raise_529(m, u, **kw):
         raise HttpError("overloaded", status=529)
@@ -176,7 +219,7 @@ def test_probe_anthropic_marks_529_as_overloaded(monkeypatch) -> None:
     assert "overloaded" in r.detail.lower()
 
 
-def test_probe_anthropic_marks_429_as_rate_limited(monkeypatch) -> None:
+def test_probe_anthropic_marks_429_as_rate_limited(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     def raise_429(m, u, **kw):
         raise HttpError("rate limited", status=429, retry_after=30)
@@ -187,7 +230,7 @@ def test_probe_anthropic_marks_429_as_rate_limited(monkeypatch) -> None:
     assert r.rate_limit == "30"
 
 
-def test_probe_anthropic_marks_other_http_codes_as_failure(monkeypatch) -> None:
+def test_probe_anthropic_marks_other_http_codes_as_failure(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     def raise_503(m, u, **kw):
         raise HttpError("http 503", status=503)
@@ -197,7 +240,7 @@ def test_probe_anthropic_marks_other_http_codes_as_failure(monkeypatch) -> None:
     assert "503" in r.detail
 
 
-def test_probe_anthropic_handles_network_failure(monkeypatch) -> None:
+def test_probe_anthropic_handles_network_failure(monkeypatch, _anthropic_routed) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     def boom(m, u, **kw):
         raise HttpError("dns fail")
@@ -205,6 +248,37 @@ def test_probe_anthropic_handles_network_failure(monkeypatch) -> None:
     r = service_health.probe_anthropic()
     assert r.ok is False
     assert "network" in r.detail
+
+
+def test_probe_anthropic_skips_when_default_routes_elsewhere(monkeypatch) -> None:
+    """When the configured primary model routes to another provider,
+    Anthropic is off the run's critical path: the probe reports an
+    informational skip (ok=True) and never touches the network — even
+    with Anthropic auth present."""
+    monkeypatch.setattr(
+        _auth_mod, "default_model_id", lambda: "gemini-2.5-pro",
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    def no_network(m, u, **kw):
+        raise AssertionError("skip branch must not make network calls")
+    _stub_client(monkeypatch, request_fn=no_network)
+    r = service_health.probe_anthropic()
+    assert r.ok is True
+    assert "skipped" in r.detail
+    assert "gemini" in r.detail
+
+
+def test_probe_anthropic_probes_when_model_resolution_fails(monkeypatch) -> None:
+    """Registry trouble must fall back to the historical behaviour:
+    treat the run as Anthropic-routed and probe for real."""
+    def registry_boom():
+        raise RuntimeError("registry unavailable")
+    monkeypatch.setattr(_auth_mod, "default_model_id", registry_boom)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    _stub_client(monkeypatch, request_fn=lambda m, u, **kw: _ok_response(200))
+    r = service_health.probe_anthropic()
+    assert r.ok is True
+    assert "1-token ping" in r.detail
 
 
 # --- probe_nvd ---
@@ -278,11 +352,11 @@ def _patch_github_token(monkeypatch, *, gh_cli_returns: str | None = None,
     if gh_cli_returns is None:
         def fake_run(*a, **kw):
             raise FileNotFoundError("gh not found")
-        monkeypatch.setattr(service_health.subprocess, "run", fake_run)
+        patch_module_attribute(monkeypatch, service_health, "subprocess", "run", fake_run)
     else:
         class _Result:
             stdout = gh_cli_returns
-        monkeypatch.setattr(service_health.subprocess, "run",
+        patch_module_attribute(monkeypatch, service_health, "subprocess", "run",
                             lambda *a, **kw: _Result())
     if env_token is None:
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
@@ -340,7 +414,7 @@ def test_probe_github_marks_network_error(monkeypatch) -> None:
 def test_probe_github_handles_gh_cli_timeout(monkeypatch) -> None:
     def fake_run(*a, **kw):
         raise service_health.subprocess.TimeoutExpired(cmd="gh", timeout=2.0)
-    monkeypatch.setattr(service_health.subprocess, "run", fake_run)
+    patch_module_attribute(monkeypatch, service_health, "subprocess", "run", fake_run)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_fallback")
     body = {"resources": {"core": {"remaining": 1000, "limit": 5000}}}
     _stub_client(monkeypatch, request_fn=lambda m, u, **kw: _ok_response(200, json_body=body))
@@ -349,8 +423,6 @@ def test_probe_github_handles_gh_cli_timeout(monkeypatch) -> None:
 
 
 # --- probe_debian / probe_ubuntu / probe_redhat (parametrized — same shape) ---
-
-import pytest
 
 
 @pytest.mark.parametrize("probe", [
@@ -395,7 +467,7 @@ def test_distro_probes_handle_network_failure(probe, monkeypatch) -> None:
 # --- probe_dns ---
 
 def test_probe_dns_success(monkeypatch) -> None:
-    monkeypatch.setattr(service_health.socket, "gethostbyname",
+    patch_module_attribute(monkeypatch, service_health, 'socket', "gethostbyname",
                         lambda host: "1.2.3.4")
     r = service_health.probe_dns()
     assert r.ok is True
@@ -404,7 +476,7 @@ def test_probe_dns_success(monkeypatch) -> None:
 def test_probe_dns_failure_on_gaierror(monkeypatch) -> None:
     def fail(host):
         raise service_health.socket.gaierror(8, "nodename nor servname provided")
-    monkeypatch.setattr(service_health.socket, "gethostbyname", fail)
+    patch_module_attribute(monkeypatch, service_health, 'socket', "gethostbyname", fail)
     r = service_health.probe_dns()
     assert r.ok is False
     assert "resolve failure" in r.detail
@@ -432,3 +504,78 @@ def test_run_all_returns_one_result_per_probe(monkeypatch) -> None:
     results = service_health.run_all()
     assert len(results) == 8
     assert results[0].name == "probe_dns"  # DNS first invariant
+
+
+def test_probe_anthropic_recognises_auth_token_spelling(monkeypatch):
+    """A bearer-token-only operator must not see a false
+    'ANTHROPIC_API_KEY not set' health warning."""
+    from cve_diff.infra import service_health as sh
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("RAPTOR_LLM_SOCKET", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-test-bearer")
+    monkeypatch.setattr(sh, "_health_model", lambda: "claude-sonnet-4-6")
+    monkeypatch.setattr(
+        "cve_diff.llm.auth.default_model_id", lambda: "claude-sonnet-4-6"
+    )
+    result = sh.probe_anthropic()
+    assert result.ok is True
+    assert "not set" not in result.detail
+    assert "AUTH_TOKEN" in result.detail
+
+
+# ── sibling-drift sync guards (cve_env twin) ──────────────────────────
+
+
+def _load_env_twin():
+    import sys
+    from pathlib import Path
+
+    from unittest.mock import patch
+
+    with patch.object(sys, "path", list(sys.path)):
+        pkg = Path(__file__).resolve().parents[4] / "cve_env"
+        if not pkg.is_dir():
+            pytest.skip("cve_env package not present in this checkout")
+        if str(pkg) not in sys.path:
+            sys.path.insert(0, str(pkg))
+        from cve_env.infra import service_health as env_sh
+
+        return env_sh
+
+
+def test_health_result_substrate_stays_in_sync_with_cve_env_twin():
+    """The HealthResult dataclass + as_row rendering are the shared
+    substrate of the two service_health twins. This alarm fires when
+    one side's substrate drifts — port the fix to the sibling (named
+    in both module docstrings) or split the substrate deliberately."""
+    import dataclasses
+    import inspect
+
+    from cve_diff.infra import service_health as diff_sh
+
+    env_sh = _load_env_twin()
+    env_fields = [(f.name, f.default) for f in
+                  dataclasses.fields(env_sh.HealthResult)]
+    diff_fields = [(f.name, f.default) for f in
+                   dataclasses.fields(diff_sh.HealthResult)]
+    assert env_fields == diff_fields
+    assert inspect.getsource(env_sh.HealthResult.as_row) == (
+        inspect.getsource(diff_sh.HealthResult.as_row)
+    )
+
+
+def test_grounding_pair_warning_present_in_both_twins():
+    """Either of NVD/OSV suffices to ground a CVE; both twins must warn
+    when BOTH are down (the rule had drifted: only the cve-env copy
+    carried it)."""
+    from cve_diff.infra import service_health as diff_sh
+
+    env_sh = _load_env_twin()
+    for sh in (diff_sh, env_sh):
+        results = [
+            sh.HealthResult("NVD API", False, 1.0, detail="down"),
+            sh.HealthResult("OSV API", False, 1.0, detail="down"),
+        ]
+        table = sh.render_table(results)
+        assert "Both NVD and OSV are unhealthy" in table, sh.__name__

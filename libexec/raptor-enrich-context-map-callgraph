@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Enrich a context-map.json with substrate-derived forward-reachable
 closures per entry point. Runs after raptor-normalize-context-map.
 
@@ -16,7 +18,8 @@ import sys
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
-import os
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -25,13 +28,18 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from core.json import load_json, save_json
-from core.orchestration.context_map_callgraph import (
+import core.startup.process_init  # noqa: E402,F401
+from core.artifacts.context_map_budget import (  # noqa: E402
+    save_context_map,
+)
+from core.json import load_json  # noqa: E402
+from core.orchestration.context_map_callgraph import (  # noqa: E402
     DEFAULT_MAX_DEPTH,
+    enrich_with_call_edges,
     enrich_with_forward_reachable,
 )
 
@@ -78,10 +86,9 @@ def main() -> int:
         )
         return 1
 
-    checklist = load_json(understand_dir / "checklist.json") or {}
-    target_path = (
-        checklist.get("target_path") if isinstance(checklist, dict) else None
-    )
+    from core.inventory import read_checklist
+    checklist = read_checklist(understand_dir)
+    target_path = checklist.get("target_path")
     if not target_path:
         print(
             "raptor-enrich-context-map-callgraph: checklist missing "
@@ -89,20 +96,65 @@ def main() -> int:
         )
         return 0
 
-    enriched = enrich_with_forward_reachable(
-        context_map, Path(target_path), max_depth=args.max_depth,
-    )
-    if enriched:
-        save_json(context_map_path, context_map)
+    # checklist.json is a mutable run artefact — corroborate against
+    # the target_path sealed into .raptor-run.json at run start.
+    from core.run.metadata import corroborate_target_path
+    mismatch = corroborate_target_path(understand_dir, target_path)
+    if mismatch:
         print(
-            f"raptor-enrich-context-map-callgraph: enriched {enriched} "
-            f"entry point(s) in {context_map_path}"
+            f"raptor-enrich-context-map-callgraph: {mismatch}; refusing "
+            "recovered target", file=sys.stderr,
+        )
+        return 1
+
+    # Project mode: route the FULL (uncapped) mechanical edge set into
+    # the project graph store alongside the capped in-artifact list. A
+    # project-owned store resolves OUTSIDE the run dir; a run-local
+    # graph path means no project — storeless compatibility path.
+    graph_store = None
+    try:
+        from core.understand_graph.store import graph_path_for_run
+        candidate = graph_path_for_run(understand_dir, str(target_path))
+        if not candidate.resolve().is_relative_to(understand_dir):
+            graph_store = candidate
+    except Exception:  # noqa: BLE001 — routing is additive; enrichment must survive resolution failure
+        graph_store = None
+
+    edge_count = enrich_with_call_edges(
+        context_map, checklist=checklist,
+        graph_store=graph_store, run_dir=understand_dir,
+        target_path=str(target_path),
+    )
+
+    # Reuse the checklist as the inventory — no re-parse of the
+    # target tree (invariants in core.orchestration.checklist_inventory).
+    from core.orchestration.checklist_inventory import (
+        inventory_from_checklist,
+    )
+    inventory = inventory_from_checklist(checklist)
+
+    enriched = enrich_with_forward_reachable(
+        context_map, Path(target_path), inventory=inventory,
+        max_depth=args.max_depth,
+    )
+
+    if enriched or edge_count:
+        save_context_map(context_map_path, context_map)
+        parts = []
+        if enriched:
+            parts.append(f"{enriched} entry point(s)")
+        if edge_count:
+            parts.append(f"{edge_count} call edges")
+        print(
+            f"raptor-enrich-context-map-callgraph: enriched "
+            f"{', '.join(parts)} in {context_map_path}"
         )
     else:
         print(
             "raptor-enrich-context-map-callgraph: no entries enriched "
             "(no entry_points field, all hosts unresolvable, or inventory "
-            "build skipped)"
+            "build skipped)",
+            file=sys.stderr,
         )
     return 0
 

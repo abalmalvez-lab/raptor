@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
+"""Enrich context-map.json with frida runtime evidence.
+
+Usage:
+    libexec/raptor-enrich-context-map-frida WORKDIR
+
+Discovers frida evidence in WORKDIR, its parent, and sibling run
+directories; merges function-level observations into the context map's
+entry_points and sink_details.  Idempotent; no-ops silently when no
+frida evidence exists.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# ─── trust-marker check (do not import; inline by design) ───
+# fmt: off
+import os  # noqa: E402
+if not (os.environ.get("CLAUDECODE")
+        or os.environ.get("_RAPTOR_TRUSTED")):
+    sys.stderr.write(
+        f"{sys.argv[0]}: internal dispatch script.\n"
+        "  Run via 'bin/raptor' instead.\n"
+        "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
+    )
+    sys.exit(2)
+# fmt: on
+# ─── end trust-marker check ─────────────────────────────────
+
+_RAPTOR_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_RAPTOR_DIR))
+import core.startup.process_init  # noqa: E402,F401
+import logging  # noqa: E402
+
+from core.artifacts.context_map_budget import (  # noqa: E402
+    CONTEXT_MAP_CONSUMER_MAX_BYTES as _MAX_CONTEXT_MAP_BYTES,
+    save_context_map,
+)
+from core.json import load_json  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# checklist.json can grow with the target's function inventory.
+_MAX_CHECKLIST_BYTES = 256 * 1024 * 1024
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(f"usage: {sys.argv[0]} WORKDIR", file=sys.stderr)
+        return 2
+
+    workdir = Path(sys.argv[1]).resolve()
+    ctx_path = workdir / "context-map.json"
+    if not ctx_path.is_file():
+        return 0
+
+    try:
+        from packages.frida.context_bridge import enrich_context_map_with_frida
+    except ImportError:
+        return 0
+
+    # Skip-silent contract: frida enrichment is best-effort — an
+    # oversize, unreadable, or malformed map must not fail the caller's
+    # pipeline; the map's own consumers will surface it.
+    try:
+        ctx = load_json(
+            ctx_path, strict=True, max_bytes=_MAX_CONTEXT_MAP_BYTES,
+        )
+    except (ValueError, OSError) as e:
+        logger.debug("frida enrichment skipped: cannot read %s: %s",
+                     ctx_path, e)
+        return 0
+    if not isinstance(ctx, dict):
+        logger.debug("frida enrichment skipped: %s is not a JSON object",
+                     ctx_path)
+        return 0
+    search_dirs = [workdir, workdir.parent]
+
+    # Meta accessor: best-effort target recovery from either
+    # on-disk checklist form (missing/malformed reads as {}).
+    from core.inventory import read_checklist_meta
+    target_path = read_checklist_meta(workdir).get("target_path")
+
+    # checklist.json is a mutable run artefact — corroborate against
+    # the target_path sealed into .raptor-run.json at run start.
+    if target_path:
+        from core.run.metadata import corroborate_target_path
+        mismatch = corroborate_target_path(workdir, target_path)
+        if mismatch:
+            print(f"✗ {mismatch}; refusing recovered target",
+                  file=sys.stderr)
+            return 1
+
+    # Same skip-silent contract for the merge itself: the map is
+    # LLM-authored and evidence is scavenged from sibling run dirs, so
+    # a malformed element must not fail the caller's pipeline.
+    try:
+        result = enrich_context_map_with_frida(
+            ctx, search_dirs, target_path=target_path)
+    except Exception as e:  # noqa: BLE001 — best-effort by contract
+        logger.debug("frida enrichment skipped: merge failed: %s", e,
+                     exc_info=True)
+        return 0
+    if result != ctx:
+        # A merged map must not leave here over the consumer byte cap —
+        # strict downstream readers (including this shim's next run)
+        # refuse an oversize file.
+        save_context_map(ctx_path, result)
+        enriched = sum(
+            1 for ep in (result.get("entry_points") or [])
+            if isinstance(ep, dict) and ep.get("runtime_confirmed")
+        ) + sum(
+            1 for sd in (result.get("sink_details") or [])
+            if isinstance(sd, dict) and sd.get("runtime_confirmed")
+        )
+        if enriched:
+            print(f"  Frida: {enriched} entry points/sinks runtime-confirmed")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

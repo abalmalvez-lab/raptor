@@ -1,12 +1,41 @@
 """Tests for core.json utilities."""
 
+from core.testing.threads import retiring_threads
+
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
 import json
+import os
+import signal
 import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from core.json import load_json, load_json_with_comments, save_json
+
+import pytest
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_os_patch_targets(monkeypatch):
+    """Keep OS patch decorators and contexts on consumer-owned views."""
+    import core.json.utils as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "os", "getpid", consumer_0.os.getpid,
+    )
+    # The reader delegates its descriptor check; keep the fault local there.
+    import inspect
+
+    reader = inspect.getmodule(consumer_0._read_text_gated_impl)
+    patch_module_attribute(
+        monkeypatch, reader, "os", "fstat",
+        lambda *args, **kwargs: consumer_0.os.fstat(*args, **kwargs),
+    )
 
 
 class TestLoadJson(unittest.TestCase):
@@ -50,6 +79,19 @@ class TestLoadJson(unittest.TestCase):
 
 
 class TestLoadJsonWithComments(unittest.TestCase):
+
+    def test_object_pairs_hook_receives_duplicate_fields_after_comment_stripping(self):
+        seen = []
+
+        def hook(pairs):
+            seen.extend(pairs)
+            return dict(pairs)
+
+        with TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text('// comment\n{"key": 1, "key": 2} # inline\n')
+            self.assertEqual(load_json_with_comments(p, object_pairs_hook=hook), {"key": 2})
+        self.assertEqual(seen, [("key", 1), ("key", 2)])
 
     def test_strips_comments(self):
         with TemporaryDirectory() as d:
@@ -154,9 +196,10 @@ class TestSaveJson(unittest.TestCase):
     def test_serializes_path(self):
         with TemporaryDirectory() as d:
             p = Path(d) / "out.json"
-            save_json(p, {"path": Path("/tmp/test")})
+            target = Path(d) / "target"
+            save_json(p, {"path": target})
             data = json.loads(p.read_text())
-            self.assertEqual(data["path"], "/tmp/test")
+            self.assertEqual(data["path"], str(target))
 
     def test_serializes_datetime(self):
         with TemporaryDirectory() as d:
@@ -202,7 +245,10 @@ class TestSaveJson(unittest.TestCase):
 
             def writer(i: int) -> None:
                 try:
-                    barrier.wait()
+                    try:
+                        barrier.wait()
+                    except _threading.BrokenBarrierError:
+                        return
                     for n in range(50):
                         save_json(p, {"writer": i, "n": n})
                 except BaseException as e:
@@ -210,16 +256,614 @@ class TestSaveJson(unittest.TestCase):
 
             threads = [_threading.Thread(target=writer, args=(i,))
                        for i in range(8)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            with retiring_threads(threads, release=barrier.abort, timeout=5):
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
 
             self.assertEqual(errors, [], f"writer raised: {errors}")
             # Whatever the final winner is, the file MUST parse cleanly.
             data = json.loads(p.read_text())
             self.assertIn("writer", data)
             self.assertIn(data["writer"], range(8))
+
+
+class TestOrjsonBackend(unittest.TestCase):
+    """Verify load/save work with both stdlib json and orjson backends."""
+
+    def test_load_roundtrip_stdlib(self):
+        import core.json.utils as u
+        saved = u._orjson
+        try:
+            u._orjson = None
+            with TemporaryDirectory() as d:
+                p = Path(d) / "data.json"
+                p.write_text('{"a": 1, "b": [2, 3]}')
+                self.assertEqual(load_json(p), {"a": 1, "b": [2, 3]})
+        finally:
+            u._orjson = saved
+
+    def test_save_sort_keys_both_backends(self):
+        """save_json(sort_keys=True) orders keys on both encoder arms
+        (cosmetic — stable operator diffs, never a byte contract)."""
+        import core.json.utils as u
+        overrides = [None] + ([u._orjson] if u._orjson is not None else [])
+        for override in overrides:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with TemporaryDirectory() as d:
+                    p = Path(d) / "out.json"
+                    save_json(p, {"z": 1, "a": 2}, sort_keys=True)
+                    text = p.read_text()
+                    self.assertLess(text.index('"a"'), text.index('"z"'))
+            finally:
+                u._orjson = saved
+
+    def test_save_utf8_parity_both_backends(self):
+        """Non-ASCII writes as raw UTF-8 on BOTH arms. orjson cannot
+        escape, so the stdlib arm passes ensure_ascii=False — otherwise
+        the bytes a save_json call wrote depended on which encoder was
+        installed."""
+        import core.json.utils as u
+        overrides = [None] + ([u._orjson] if u._orjson is not None else [])
+        for override in overrides:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with TemporaryDirectory() as d:
+                    p = Path(d) / "out.json"
+                    save_json(p, {"k": "café"})
+                    self.assertIn("café", p.read_text(encoding="utf-8"))
+            finally:
+                u._orjson = saved
+
+    def test_save_big_int_falls_back_to_stdlib(self):
+        """>64-bit ints are an orjson TypeError — save_json must fall
+        back to the stdlib arm instead of failing the write."""
+        with TemporaryDirectory() as d:
+            p = Path(d) / "out.json"
+            save_json(p, {"n": 2**70})
+            self.assertEqual(json.loads(p.read_text())["n"], 2**70)
+
+    def test_save_roundtrip_stdlib(self):
+        import core.json.utils as u
+        saved = u._orjson
+        try:
+            u._orjson = None
+            with TemporaryDirectory() as d:
+                p = Path(d) / "out.json"
+                save_json(p, {"x": 1, "path": Path("/tmp")})
+                result = json.loads(p.read_text())
+                self.assertEqual(result["x"], 1)
+                self.assertEqual(result["path"], "/tmp")
+        finally:
+            u._orjson = saved
+
+    def test_load_roundtrip_orjson(self):
+        import core.json.utils as u
+        if u._orjson is None:
+            self.skipTest("orjson not installed")
+        with TemporaryDirectory() as d:
+            p = Path(d) / "data.json"
+            p.write_text('{"a": 1, "b": [2, 3]}')
+            self.assertEqual(load_json(p), {"a": 1, "b": [2, 3]})
+
+    def test_save_roundtrip_orjson(self):
+        import core.json.utils as u
+        if u._orjson is None:
+            self.skipTest("orjson not installed")
+        with TemporaryDirectory() as d:
+            p = Path(d) / "out.json"
+            save_json(p, {"x": 1, "path": Path("/tmp")})
+            result = json.loads(p.read_text())
+            self.assertEqual(result["x"], 1)
+            self.assertEqual(result["path"], "/tmp")
+
+    def test_non_finite_rejected_both_backends(self):
+        import core.json.utils as u
+        for backend_name, override in [("stdlib", None), ("orjson", u._orjson)]:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with TemporaryDirectory() as d:
+                    p = Path(d) / "nan.json"
+                    p.write_text('{"val": NaN}')
+                    result = load_json(p)
+                    self.assertIsNone(result, f"NaN should be rejected ({backend_name})")
+            finally:
+                u._orjson = saved
+
+    def test_allow_non_finite_falls_back_to_stdlib(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "nan.json"
+            p.write_text('{"val": NaN}')
+            result = load_json(p, allow_non_finite=True)
+            self.assertIsNotNone(result)
+
+    def test_save_rejects_non_finite_floats_both_backends(self):
+        """NaN/Infinity must raise ValueError on BOTH encoder paths.
+        The stdlib branch already had allow_nan=False; orjson would
+        silently serialise them as null — behaviour depended on which
+        library was installed."""
+        import core.json.utils as u
+        payloads = [
+            {"val": float("nan")},
+            {"val": float("inf")},
+            {"val": float("-inf")},
+            {"nested": [1, {"deep": (float("nan"),)}]},
+            {float("inf"): "non-finite key"},
+        ]
+        backends = [("stdlib", None)]
+        if u._orjson is not None:
+            backends.append(("orjson", u._orjson))
+        for backend_name, override in backends:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with TemporaryDirectory() as d:
+                    for i, payload in enumerate(payloads):
+                        p = Path(d) / f"bad-{i}.json"
+                        with self.assertRaises(
+                            ValueError,
+                            msg=f"{backend_name}: {payload!r}",
+                        ):
+                            save_json(p, payload)
+                        self.assertFalse(
+                            p.exists(),
+                            f"{backend_name}: no partial file on reject",
+                        )
+            finally:
+                u._orjson = saved
+
+    def test_save_accepts_finite_floats_both_backends(self):
+        import core.json.utils as u
+        for override in [None, u._orjson]:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with TemporaryDirectory() as d:
+                    p = Path(d) / "ok.json"
+                    save_json(p, {"val": 1.5, "list": [0.0, -2.25]})
+                    self.assertEqual(
+                        json.loads(p.read_text()),
+                        {"val": 1.5, "list": [0.0, -2.25]},
+                    )
+            finally:
+                u._orjson = saved
+
+    def test_save_datetime_both_backends(self):
+        import core.json.utils as u
+        dt = datetime(2026, 1, 15, 12, 0, 0)
+        for override in [None, u._orjson]:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with TemporaryDirectory() as d:
+                    p = Path(d) / "dt.json"
+                    save_json(p, {"ts": dt})
+                    result = json.loads(p.read_text())
+                    self.assertIn("2026", result["ts"])
+            finally:
+                u._orjson = saved
+
+
+class TestLoads(unittest.TestCase):
+    """Public string-level loads: budget gate, backends, hardening."""
+
+    def _both_backends(self):
+        import core.json.utils as u
+        backends = [("stdlib", None)]
+        if u._orjson is not None:
+            backends.append(("orjson", u._orjson))
+        return u, backends
+
+    def test_parses_str_and_bytes_both_backends(self):
+        from core.json import loads
+        u, backends = self._both_backends()
+        for name, override in backends:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                self.assertEqual(loads('{"a": 1}'), {"a": 1}, name)
+                self.assertEqual(loads(b'{"a": 1}'), {"a": 1}, name)
+            finally:
+                u._orjson = saved
+
+    def test_bom_tolerated_both_backends(self):
+        from core.json import loads
+        u, backends = self._both_backends()
+        for name, override in backends:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                self.assertEqual(loads("\ufeff" + '{"a": 1}'), {"a": 1}, name)
+                self.assertEqual(
+                    loads(b'\xef\xbb\xbf{"a": 1}'), {"a": 1}, name)
+            finally:
+                u._orjson = saved
+
+    def test_budget_breach_raises_and_warns(self):
+        from core.json import JsonBudgetExceededError, loads
+        payload = '{"a": "' + "x" * 64 + '"}'
+        with self.assertLogs("core.json.utils", level="WARNING") as cm:
+            with self.assertRaises(JsonBudgetExceededError):
+                loads(payload, max_bytes=16)
+        self.assertTrue(
+            any("refusing to parse" in line for line in cm.output))
+        # The subclass contract: plain ValueError handlers catch it.
+        self.assertTrue(issubclass(JsonBudgetExceededError, ValueError))
+
+    def test_budget_gate_runs_before_parse(self):
+        from core.json import JsonBudgetExceededError, loads
+        # Malformed AND oversize: the budget error proves the gate
+        # fired before any parse attempt.
+        with self.assertRaises(JsonBudgetExceededError):
+            loads("{" * 64, max_bytes=16)
+
+    def test_under_budget_parses(self):
+        from core.json import loads
+        self.assertEqual(loads('{"a": 1}', max_bytes=8), {"a": 1})
+
+    def test_non_finite_rejected_both_backends(self):
+        from core.json import loads
+        u, backends = self._both_backends()
+        for name, override in backends:
+            saved = u._orjson
+            try:
+                u._orjson = override
+                with self.assertRaises(ValueError, msg=name):
+                    loads('{"v": NaN}')
+            finally:
+                u._orjson = saved
+
+    def test_allow_non_finite_falls_back_to_stdlib(self):
+        import math
+
+        from core.json import loads
+        result = loads('{"v": NaN}', allow_non_finite=True)
+        self.assertTrue(math.isnan(result["v"]))
+
+    def test_malformed_raises(self):
+        from core.json import loads
+        with self.assertRaises(ValueError):
+            loads("{not json")
+
+    def test_budget_error_shared_with_bounded_helpers(self):
+        import core.json.bounded as b
+        from core.json import JsonBudgetExceededError
+        self.assertIs(b.JsonBudgetExceededError, JsonBudgetExceededError)
+
+
+class TestOrjsonBigIntDivergence(unittest.TestCase):
+    """Pin the documented big-int divergence between the two backends.
+
+    orjson parses integer literals outside ``[-2**63, 2**64 - 1]`` as
+    lossy floats; stdlib json returns exact arbitrary-precision ints.
+    There is no cheap guard (orjson raises nothing — see the
+    ``_loads`` docstring), so the divergence is pinned here: if a
+    future orjson release changes this behaviour, or someone tightens
+    ``_loads``, these assertions flag it for a deliberate decision.
+    """
+
+    U64_MAX = 2**64 - 1
+    I64_MIN = -(2**63)
+
+    def _load(self, d: str, literal: str):
+        # Resolve load_json through the module object at call time —
+        # the module-level import would go stale when a sibling test
+        # (test_f046_lazy_reexports) resets sys.modules, making the
+        # _orjson override in these tests a no-op on the old module.
+        import core.json.utils as u
+        p = Path(d) / "n.json"
+        p.write_text(f'{{"n": {literal}}}')
+        data = u.load_json(p)
+        assert data is not None
+        return data["n"]
+
+    def test_orjson_coerces_out_of_range_ints_to_float(self):
+        import core.json.utils as u
+        if u._orjson is None:
+            self.skipTest("orjson not installed")
+        with TemporaryDirectory() as d:
+            for literal in (
+                str(self.U64_MAX + 1),
+                str(self.I64_MIN - 1),
+                str(2**100),
+            ):
+                val = self._load(d, literal)
+                self.assertIsInstance(val, float, literal)
+                self.assertEqual(val, float(int(literal)), literal)
+
+    def test_orjson_exact_inside_64_bit_range(self):
+        import core.json.utils as u
+        if u._orjson is None:
+            self.skipTest("orjson not installed")
+        with TemporaryDirectory() as d:
+            for n in (self.U64_MAX, self.I64_MIN, 0, 2**63 - 1):
+                val = self._load(d, str(n))
+                self.assertIsInstance(val, int, str(n))
+                self.assertEqual(val, n)
+
+    def test_stdlib_exact_at_any_width(self):
+        import core.json.utils as u
+        saved = u._orjson
+        try:
+            u._orjson = None
+            with TemporaryDirectory() as d:
+                for n in (self.U64_MAX + 1, self.I64_MIN - 1, 2**100):
+                    val = self._load(d, str(n))
+                    self.assertIsInstance(val, int, str(n))
+                    self.assertEqual(val, n)
+        finally:
+            u._orjson = saved
+
+    def test_bounded_helpers_stay_stdlib_exact(self):
+        """core.json.bounded is the documented escape hatch for
+        big-int-identity callers — it must never grow the fast path."""
+        from core.json.bounded import load_json_bounded, loads_bounded
+        n = 2**100
+        self.assertEqual(loads_bounded(f'{{"n": {n}}}', max_bytes=64)["n"], n)
+        with TemporaryDirectory() as d:
+            p = Path(d) / "n.json"
+            p.write_text(f'{{"n": {n}}}')
+            self.assertEqual(
+                load_json_bounded(p, max_bytes=64)["n"], n)
+
+
+class TestLoadJsonMaxBytes(unittest.TestCase):
+    """Byte budget: st_size gate BEFORE any read."""
+
+    def test_under_budget_parses(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "data.json"
+            p.write_text('{"key": "value"}')
+            self.assertEqual(
+                load_json(p, max_bytes=1024), {"key": "value"})
+
+    def test_exact_size_parses(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "data.json"
+            p.write_text('{"a": 1}')
+            size = p.stat().st_size
+            self.assertEqual(load_json(p, max_bytes=size), {"a": 1})
+
+    def test_oversize_returns_none(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "big.json"
+            p.write_text('{"pad": "' + "x" * 100 + '"}')
+            self.assertIsNone(load_json(p, max_bytes=10))
+
+    def test_oversize_strict_raises(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "big.json"
+            p.write_text('{"pad": "' + "x" * 100 + '"}')
+            with self.assertRaises(ValueError):
+                load_json(p, strict=True, max_bytes=10)
+
+    def test_oversize_never_read(self):
+        # The gate must fire on stat alone — a FIFO would block any
+        # read attempt forever, so returning promptly proves no read
+        # happened. Instead of a FIFO (fragile in CI), assert on the
+        # cheaper contract: a file of valid JSON over budget is
+        # rejected even though a read+parse would have succeeded.
+        with TemporaryDirectory() as d:
+            p = Path(d) / "valid-but-big.json"
+            p.write_text(json.dumps({"k": "v" * 1000}))
+            self.assertIsNone(load_json(p, max_bytes=100))
+
+    def test_default_unbounded_unchanged(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "big.json"
+            p.write_text(json.dumps({"k": "v" * 100_000}))
+            self.assertEqual(load_json(p)["k"], "v" * 100_000)
+
+    def test_file_grown_past_budget_after_fstat_refused(self):
+        # Grow-window: a file that grows between the fstat gate and
+        # the read must still be refused — the read is capped at
+        # max_bytes + 1 and re-checked, never buffered unbounded.
+        # Simulated by making fstat report a tiny (gate-passing) size
+        # while the file on disk is over budget.
+        import types
+
+        with TemporaryDirectory() as d:
+            p = Path(d) / "grow.json"
+            p.write_text(json.dumps({"k": "v" * 1000}))
+            real_fstat = os.fstat
+
+            def tiny_fstat(fd):
+                st = real_fstat(fd)
+                return types.SimpleNamespace(
+                    st_mode=st.st_mode, st_size=min(st.st_size, 10))
+
+            with mock_module_attribute(_mock_owner('core.json.utils'), 'os', 'fstat', tiny_fstat):
+                self.assertIsNone(load_json(p, max_bytes=100))
+                with self.assertRaises(ValueError):
+                    load_json(p, strict=True, max_bytes=100)
+
+    def test_missing_file_still_none(self):
+        self.assertIsNone(
+            load_json("/nonexistent/path.json", max_bytes=10))
+        self.assertIsNone(
+            load_json("/nonexistent/path.json", strict=True, max_bytes=10))
+
+
+class TestLoadJsonWithCommentsHardening(unittest.TestCase):
+    """Refusal semantics mirror ``load_json`` (non-strict): regular
+    files only, optional byte budget — enforced on the OPEN fd via the
+    shared gated read, so a planted FIFO (stats 0 bytes, then blocks
+    the reader forever) or an oversize file can never hang or bloat a
+    config consumer, INCLUDING when the file is swapped or grown
+    between the existence check and the read (a by-name
+    stat-then-read gate loses exactly that race)."""
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks mkfifo")
+    def test_fifo_refused_without_reading(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "models.json"
+            os.mkfifo(p)
+            # No writer exists: any read attempt would block forever.
+            self.assertIsNone(load_json_with_comments(p))
+
+    def test_oversize_refused(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "big.json"
+            p.write_text(json.dumps({"k": "v" * 1000}))
+            self.assertIsNone(load_json_with_comments(p, max_bytes=100))
+
+    def test_within_budget_with_comments_parses(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "cfg.json"
+            p.write_text('{\n  // note\n  "key": "value"  # trailing\n}\n')
+            self.assertEqual(
+                load_json_with_comments(p, max_bytes=1024),
+                {"key": "value"},
+            )
+
+    def test_default_unbounded_unchanged(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "big.json"
+            p.write_text(json.dumps({"k": "v" * 100_000}))
+            self.assertEqual(
+                load_json_with_comments(p)["k"], "v" * 100_000)
+
+
+# One process-wide audit hook, armed per test via _SWAP_HOOK. Audit
+# hooks cannot be unregistered, so a single shared hook is installed
+# once and stays disarmed (path=None → immediate return, no per-event
+# work beyond one dict lookup) outside the swap-window tests below.
+_SWAP_HOOK: dict = {"installed": False, "path": None, "action": None}
+
+
+def _arm_swap_hook(path: Path, action) -> None:
+    """Run *action* when the file at *path* is next opened.
+
+    This deterministically compresses the check-to-read race: the
+    "open" audit event fires after every BY-NAME pre-check has already
+    passed and before the open itself proceeds, exactly where a
+    concurrent writer would swap the file. The hook disarms itself
+    before running the action so the action's own file operations
+    cannot recurse."""
+    import sys as _sys
+
+    if not _SWAP_HOOK["installed"]:
+        def _hook(event: str, args: tuple) -> None:
+            if event != "open" or _SWAP_HOOK["path"] is None:
+                return
+            target = args[0]
+            if isinstance(target, bytes):
+                try:
+                    target = os.fsdecode(target)
+                except (UnicodeDecodeError, ValueError):
+                    return
+            if not isinstance(target, str) or target != _SWAP_HOOK["path"]:
+                return
+            hook_action = _SWAP_HOOK["action"]
+            _SWAP_HOOK["path"] = None
+            _SWAP_HOOK["action"] = None
+            if hook_action is not None:
+                hook_action()
+
+        _sys.addaudithook(_hook)
+        _SWAP_HOOK["installed"] = True
+    _SWAP_HOOK["path"] = str(path)
+    _SWAP_HOOK["action"] = action
+
+
+class TestLoadJsonWithCommentsSwapWindow(unittest.TestCase):
+    """The by-name gate's lost race, made deterministic: the file is
+    swapped at the moment of the open, after any by-name check has
+    passed. Both failure modes of the old window are pinned refused:
+    grow-past-budget (was: parsed whole, budget bypassed) and
+    swap-to-FIFO (was: reader blocked forever)."""
+
+    def tearDown(self):
+        _SWAP_HOOK["path"] = None
+        _SWAP_HOOK["action"] = None
+
+    def test_grow_after_check_refused(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "cfg.json"
+            p.write_text('{"k": 1}')
+
+            def _grow() -> None:
+                p.write_text('{"k": "' + "x" * 100_000 + '"}')
+
+            _arm_swap_hook(p, _grow)
+            self.assertIsNone(load_json_with_comments(p, max_bytes=64))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks mkfifo")
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "platform lacks SIGALRM")
+    def test_swap_to_fifo_refused_not_hung(self):
+        def _on_alarm(signum: int, frame) -> None:
+            msg = "load_json_with_comments blocked on a swapped-in FIFO"
+            raise AssertionError(msg)
+
+        with TemporaryDirectory() as d:
+            p = Path(d) / "cfg.json"
+            p.write_text('{"k": 1}')
+
+            def _swap_to_fifo() -> None:
+                p.unlink()
+                os.mkfifo(p)
+
+            _arm_swap_hook(p, _swap_to_fifo)
+            from core.testing.signals import alarm_after
+
+            with alarm_after(30, _on_alarm):
+                self.assertIsNone(load_json_with_comments(p))
+
+
+class TestReDatabaseMaxBytes(unittest.TestCase):
+    """RAPTOR_REDB_MAX_BYTES resolution: strict, warn-and-default on
+    garbage, never unlimited."""
+
+    def _resolve(self):
+        from core.json.utils import _resolve_re_database_max_bytes
+        return _resolve_re_database_max_bytes()
+
+    def test_default_when_unset(self):
+        from unittest.mock import patch
+        from core.json.utils import RE_DATABASE_MAX_BYTES_DEFAULT
+        with patch.dict(os.environ):
+            os.environ.pop("RAPTOR_REDB_MAX_BYTES", None)
+            self.assertEqual(self._resolve(), RE_DATABASE_MAX_BYTES_DEFAULT)
+        self.assertEqual(RE_DATABASE_MAX_BYTES_DEFAULT, 512 * 1024 * 1024)
+
+    def test_override_honored(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ,
+                        {"RAPTOR_REDB_MAX_BYTES": "1048576"}):
+            self.assertEqual(self._resolve(), 1048576)
+
+    def test_garbage_warns_and_falls_back(self):
+        from unittest.mock import patch
+        from core.json.utils import RE_DATABASE_MAX_BYTES_DEFAULT
+        # Zero and negatives are garbage too — they must never read
+        # as "unlimited".
+        for bad in ("lots", "1.5", "0", "-5", " "):
+            with patch.dict(os.environ,
+                            {"RAPTOR_REDB_MAX_BYTES": bad}):
+                with self.assertLogs("core.json.utils",
+                                     level="WARNING") as cm:
+                    value = self._resolve()
+            self.assertEqual(value, RE_DATABASE_MAX_BYTES_DEFAULT)
+            self.assertIn("RAPTOR_REDB_MAX_BYTES", "\n".join(cm.output))
+
+    def test_absurd_override_accepted_with_loud_warning(self):
+        """The override is the sanctioned large-memory escape hatch —
+        an absurd value is accepted, but loudly (a typo'd unit must
+        not pass silently)."""
+        from unittest.mock import patch
+        absurd = 65 * 1024 * 1024 * 1024
+        with patch.dict(os.environ,
+                        {"RAPTOR_REDB_MAX_BYTES": str(absurd)}):
+            with self.assertLogs("core.json.utils",
+                                 level="WARNING") as cm:
+                value = self._resolve()
+        self.assertEqual(value, absurd)
+        self.assertIn("64GiB", "\n".join(cm.output))
 
 
 if __name__ == "__main__":

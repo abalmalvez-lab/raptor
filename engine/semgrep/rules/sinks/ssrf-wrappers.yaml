@@ -1,0 +1,155 @@
+rules:
+  # ---------------------------------------------------------------------------
+  # SSRF variants that need explicit taint PROPAGATORS: the tainted value
+  # reaches the outbound-request sink through a mutable builder/collection
+  # (side-effect propagation), which semgrep's default expression
+  # propagation does not track. These complement sinks/ssrf.yaml, which
+  # covers the direct source→sink flows.
+  #
+  # No pattern-sanitizers on purpose: real SSRF guards are branch-style
+  # host/scheme allowlist checks, which taint-mode sanitizers cannot
+  # express faithfully — a name-based sanitizer here would silently
+  # suppress true positives. Guard sufficiency requires review of the
+  # original source, destination policy and actual request behavior.
+  # Conditional charset prescreens, where available, remain diagnostics
+  # rather than source-level proof.
+  # ---------------------------------------------------------------------------
+
+  # Java — request parameter appended into a StringBuilder that becomes
+  # the request URL. $SB.append($X) taints $SB by side effect.
+  - id: raptor.web.ssrf.stringbuilder.java
+    message: >-
+      Request-derived data reaches a URL-related constructor or request API,
+      potentially through mutable string-building operations. Review which URL
+      components are controlled, whether a request is issued and whether its
+      destination passes a strict allowlist.
+    languages: [java]
+    severity: CRITICAL
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: (HttpServletRequest $REQ).getParameter(...)
+          - pattern: (HttpServletRequest $REQ).getHeader(...)
+          - pattern: (HttpServletRequest $REQ).getQueryString()
+          - pattern: (WebRequest $REQ).getParameter(...)
+    pattern-propagators:
+      - pattern: $SB.append($X)
+        from: $X
+        to: $SB
+    pattern-sinks:
+      - pattern-either:
+          - pattern: new URL($SB.toString())
+          - pattern: new URI($SB.toString())
+          - pattern: new HttpGet($SB.toString())
+          - pattern: new HttpPost($SB.toString())
+          - pattern: (RestTemplate $RT).getForObject($SB.toString(), ...)
+          - pattern: (RestTemplate $RT).getForEntity($SB.toString(), ...)
+          - pattern: (RestTemplate $RT).exchange($SB.toString(), ...)
+    metadata:
+      cwe: ["CWE-918"]
+      owasp_top_10: ["A10:2021-Server-Side Request Forgery"]
+      tags: ["security", "ssrf", "taint", "propagator"]
+
+  # JavaScript / TypeScript — tainted value written into a URL object via
+  # searchParams (side effect), then the URL object is fetched. Covers the
+  # "attacker controls a query parameter of an otherwise-fixed URL" shape
+  # only when the tainted value IS the whole URL via URL's first argument,
+  # and the searchParams side-effect shape for completeness of the builder
+  # pattern.
+  - id: raptor.web.ssrf.urlbuilder.javascript
+    message: >-
+      Request-derived data reaches a request API, potentially through URL-object
+      mutation. Review whether it controls the scheme or destination, only a
+      query value, or another component. Enforce a strict destination allowlist
+      where untrusted data can change the request target.
+    languages: [javascript, typescript]
+    severity: CRITICAL
+    mode: taint
+    pattern-sources:
+      # Express — receiver-name anchored: a bare $REQ matches ANY
+      # object, so fully hardcoded code self-taints (same fix as the
+      # Express sources in sinks/ssrf.yaml).
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query.$PROP
+              - pattern: $REQ.query[...]
+              - pattern: $REQ.params.$PROP
+              - pattern: $REQ.params[...]
+              - pattern: $REQ.body.$PROP
+              - pattern: $REQ.body[...]
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: '(?i)^(req|request)$'
+    pattern-propagators:
+      - pattern: $U.searchParams.set($K, $V)
+        from: $V
+        to: $U
+      - pattern: $U.searchParams.append($K, $V)
+        from: $V
+        to: $U
+      - pattern: $U.href = $X
+        from: $X
+        to: $U
+    pattern-sinks:
+      - pattern-either:
+          - pattern: fetch($U, ...)
+          - pattern: axios.get($U, ...)
+          - pattern: axios.post($U, ...)
+          - pattern: http.get($U, ...)
+          - pattern: http.request($U, ...)
+          - pattern: https.get($U, ...)
+          - pattern: https.request($U, ...)
+    metadata:
+      cwe: ["CWE-918"]
+      owasp_top_10: ["A10:2021-Server-Side Request Forgery"]
+      tags: ["security", "ssrf", "taint", "propagator"]
+
+  # Python — tainted URL fragment collected into a list that is joined into
+  # the request URL. $L.append($X) taints $L by side effect; "".join($L)
+  # then carries taint through the default call propagation.
+  - id: raptor.web.ssrf.listjoin.python
+    message: >-
+      Request-derived data reaches a request URL argument, potentially through
+      mutable collection operations. Review the actual propagation path, URL
+      components and destination checks. Enforce a strict destination allowlist
+      where untrusted data can change the request target.
+    languages: [python]
+    severity: CRITICAL
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.GET[...]
+          - pattern: request.GET.get(...)
+          - pattern: request.POST[...]
+          - pattern: request.POST.get(...)
+          - pattern: flask.request.args[...]
+          - pattern: flask.request.args.get(...)
+          - pattern: flask.request.form[...]
+          - pattern: flask.request.form.get(...)
+    pattern-propagators:
+      - pattern: $L.append($X)
+        from: $X
+        to: $L
+      - pattern: $L.extend($X)
+        from: $X
+        to: $L
+      - pattern: $L.insert($I, $X)
+        from: $X
+        to: $L
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.get($URL, ...)
+              - pattern: requests.post($URL, ...)
+              - pattern: requests.request($METHOD, $URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: httpx.get($URL, ...)
+              - pattern: httpx.post($URL, ...)
+          - pattern-not: flask.request.args.get(...)
+          - pattern-not: flask.request.form.get(...)
+          - pattern-not: request.GET.get(...)
+          - pattern-not: request.POST.get(...)
+    metadata:
+      cwe: ["CWE-918"]
+      owasp_top_10: ["A10:2021-Server-Side Request Forgery"]
+      tags: ["security", "ssrf", "taint", "propagator"]

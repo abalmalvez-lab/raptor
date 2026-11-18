@@ -1,0 +1,206 @@
+"""Same-UID gate on the proxy's loopback TCP listeners.
+
+Loopback is shared with every local user: without a peer-credential
+check, any other account on the host could connect to the proxy's
+main listener (or a TCP lane) and ride its allowlisted egress. TCP
+has no SO_PEERCRED, so the proxy reads the peer's UID from its
+/proc/net/tcp{,6} socket row and refuses cross-user connections.
+
+Covers the /proc parsing helpers, the live same-UID accept path, and
+the rejection path (via a monkeypatched foreign UID — tests cannot
+mint a second local user).
+"""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+import os
+import socket
+import sys
+
+import pytest
+
+from core.sandbox import proxy as proxy_mod
+from core.testing.proxy_scope import isolated_proxy_scope
+
+
+@pytest.fixture
+def reset_proxy():
+    with isolated_proxy_scope():
+        yield
+
+
+class TestHexHelpers:
+
+    def test_v4_localhost(self):
+        assert proxy_mod._hex_v4("127.0.0.1") == "0100007F"
+
+    def test_v6_localhost(self):
+        assert proxy_mod._hex_v6("::1") == (
+            "00000000" "00000000" "00000000" "01000000"
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="SO_PEERCRED is Linux-only; _unix_peer_credentials returns "
+           "None (fail-closed) on other platforms",
+)
+class TestUnixPeerCredentials:
+    """struct ucred decode: pid is signed, uid/gid are UNSIGNED
+    32-bit. A signed uid decode ('3i') turned uids >= 2^31 (SSSD /
+    AD-idmap ranges) negative, and the unix-lane peer gate then
+    rejected the sandbox's own children — all sandboxed egress dead
+    on such hosts."""
+
+    class _FakeSock:
+        def __init__(self, raw: bytes) -> None:
+            self._raw = raw
+
+        def getsockopt(self, level, opt, buflen):
+            return self._raw[:buflen]
+
+    def test_ordinary_uid_decodes(self):
+        import struct
+        raw = struct.pack("iII", 1234, 1000, 1000)
+        assert proxy_mod._unix_peer_credentials(
+            self._FakeSock(raw)) == (1234, 1000)
+
+    def test_uid_above_2_31_decodes_unsigned(self):
+        import struct
+        uid = 2**31 + 5
+        raw = struct.pack("iII", 4321, uid, uid)
+        creds = proxy_mod._unix_peer_credentials(self._FakeSock(raw))
+        assert creds == (4321, uid)
+        assert creds[1] >= 0, "uid_t must never decode negative"
+
+
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="/proc/net/tcp is Linux-only")
+class TestLoopbackPeerUidLookup:
+
+    def test_established_loopback_pair_reports_own_uid(self):
+        with ExitStack() as cleanup:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            cleanup.callback(srv.close)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            cli = socket.create_connection(srv.getsockname(), timeout=5.0)
+            cleanup.callback(cli.close)
+            conn, _ = srv.accept()
+            cleanup.callback(conn.close)
+            # From the server's perspective: peer == the client's
+            # (addr, port); sockname == the accepted socket's local end.
+            uid = proxy_mod._loopback_peer_uid(
+                conn.getpeername(), conn.getsockname(),
+            )
+            assert uid == os.geteuid()
+
+    def test_unknown_peer_returns_none(self):
+        # A (peer, sockname) pair that matches no established socket.
+        assert proxy_mod._loopback_peer_uid(
+            ("127.0.0.1", 1), ("127.0.0.1", 2),
+        ) is None
+
+    def test_malformed_tuples_return_none(self):
+        assert proxy_mod._loopback_peer_uid(None, None) is None
+        assert proxy_mod._loopback_peer_uid((), ()) is None
+
+
+def _connect_raw(port: int, timeout: float = 5.0) -> bytes:
+    """Open a TCP connection to the proxy, send a CONNECT, return the
+    raw response bytes ("" when the proxy dropped the connection)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        s.sendall(b"CONNECT denied-host.invalid:443 HTTP/1.1\r\n"
+                  b"Host: denied-host.invalid:443\r\n\r\n")
+        buf = b""
+        try:
+            while b"\r\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 65536:
+                    break
+        except OSError:
+            pass
+        return buf
+    finally:
+        s.close()
+
+
+class TestProxyPeerGate:
+
+    def test_same_uid_peer_is_served(self, reset_proxy):
+        # A same-UID connection must get past the peer gate and reach
+        # the policy gates (403 here — the host is not allowlisted —
+        # which proves the connection was served, not dropped).
+        proxy = proxy_mod.EgressProxy(allowed_hosts={"allowed.example"})
+        try:
+            buf = _connect_raw(proxy.port)
+            assert b"403" in buf.split(b"\r\n", 1)[0]
+        finally:
+            proxy.stop()
+
+    def test_foreign_uid_peer_is_dropped(self, reset_proxy, monkeypatch):
+        # Cannot mint a second local user in a test — simulate the
+        # lookup verdict instead. The connection must be closed with
+        # NO HTTP response (drop, not a policy 403).
+        monkeypatch.setattr(
+            proxy_mod, "_loopback_peer_uid",
+            lambda peer, sockname: os.geteuid() + 1,
+        )
+        proxy = proxy_mod.EgressProxy(allowed_hosts={"allowed.example"})
+        try:
+            buf = _connect_raw(proxy.port)
+            assert buf == b"", (
+                "cross-user loopback peer must be dropped without a "
+                "response")
+        finally:
+            proxy.stop()
+
+    def test_unknown_uid_fails_closed_where_table_exists(
+            self, reset_proxy, monkeypatch):
+        # The second-uid race shape: a peer whose socket row never
+        # becomes visible. On hosts WITH /proc/net/tcp an undetermined
+        # UID is retried once (the row can lag the connect) and then
+        # DROPPED — the old allow-on-None handed a different-uid local
+        # process a deterministic ride on the allowlisted egress.
+        calls: list = []
+
+        def never_resolves(peer, sockname):
+            calls.append(peer)
+            return None
+
+        monkeypatch.setattr(proxy_mod, "_loopback_peer_uid",
+                            never_resolves)
+        monkeypatch.setattr(proxy_mod, "_PEER_UID_TABLE_AVAILABLE", True)
+        proxy = proxy_mod.EgressProxy(allowed_hosts={"allowed.example"})
+        try:
+            buf = _connect_raw(proxy.port)
+            assert buf == b"", (
+                "an unverifiable loopback peer must be dropped on "
+                "hosts where the socket table exists")
+            assert len(calls) == 2, "the lookup must be retried once"
+        finally:
+            proxy.stop()
+
+    def test_unknown_uid_allowed_without_table(
+            self, reset_proxy, monkeypatch):
+        # Platform incapability (macOS: no /proc/net) is not a lookup
+        # failure — every peer resolves None there, so the gate stays
+        # advisory and the connection reaches the policy gates (403 =
+        # served, not dropped).
+        monkeypatch.setattr(
+            proxy_mod, "_loopback_peer_uid",
+            lambda peer, sockname: None,
+        )
+        monkeypatch.setattr(proxy_mod, "_PEER_UID_TABLE_AVAILABLE",
+                            False)
+        proxy = proxy_mod.EgressProxy(allowed_hosts={"allowed.example"})
+        try:
+            buf = _connect_raw(proxy.port)
+            assert b"403" in buf.split(b"\r\n", 1)[0]
+        finally:
+            proxy.stop()

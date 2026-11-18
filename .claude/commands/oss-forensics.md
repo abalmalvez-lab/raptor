@@ -1,5 +1,6 @@
 ---
 description: Evidence-backed forensic investigation for GitHub repositories
+dispatch: skill
 ---
 
 # /oss-forensics - OSS GitHub Forensic Investigation
@@ -18,7 +19,7 @@ You are the ORCHESTRATOR for this investigation. You will spawn specialist agent
 2. **Follow the workflow** defined in that skill exactly
 
 3. **The user's investigation request is:**
-   {rest of command arguments after /oss-forensics}
+   $ARGUMENTS
 
 4. **Parse any flags:**
    - `--max-followups N` (default: 3) - Maximum evidence collection rounds
@@ -47,6 +48,9 @@ Key outputs:
 ## Requirements
 
 - **GOOGLE_APPLICATION_CREDENTIALS**: BigQuery credentials for GH Archive queries
+  - Use a service account holding only the read-only `BigQuery User` role
+  - Queries run through the typed wrapper `libexec/raptor-bq-query`
+    (read-only statement validation, bytes-billed cap, egress-pinned sandbox)
   - See `.claude/skills/oss-forensics/github-archive/SKILL.md` for setup
 - **Internet access**: For GitHub API and Wayback Machine queries
 
@@ -61,9 +65,18 @@ Key outputs:
 
 **Analysis Pipeline** (spawn sequentially):
 - `oss-hypothesis-former-agent`: Forms hypothesis, can request more evidence
-- `oss-evidence-verifier-agent`: Verifies evidence against original sources
+- `oss-evidence-verifier-agent`: Verifies evidence against original sources via `store.verify_all()`
 - `oss-hypothesis-checker-agent`: Validates claims against verified evidence
 - `oss-report-generator-agent`: Produces final forensic report
+
+## Skills
+
+(in `.claude/skills/oss-forensics/`):
+- `orchestration` - Main orchestrator (coordinates the investigator agents)
+- `github-archive` - GH Archive BigQuery queries
+- `github-evidence-kit` - Evidence collection, storage, verification
+- `github-commit-recovery` - Recover deleted commits
+- `github-wayback-recovery` - Recover content from Wayback Machine
 
 ## Examples
 

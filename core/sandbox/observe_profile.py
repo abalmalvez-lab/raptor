@@ -48,18 +48,36 @@ markers both lack ``syscall`` and would over-classify if included.
 
 from __future__ import annotations
 
+import io
 import json
+import logging
 import re
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
 
+from core.security.log_sanitisation import sanitise_for_terminal
+from core.sandbox.audit_control import capture_loss_status
+from core.security.capped_read import CappedReadRefused, path_may_exist, read_capped
+
+from .evidence import _unique_evidence_object
+from .evidence import evidence_write_path as _evidence_write_path
+from .evidence import resolve_read_path as _resolve_evidence_path
+
+logger = logging.getLogger(__name__)
 
 # Filename — must match core.sandbox.tracer._OBSERVE_FILENAME.
 # Duplicated (not imported) so the parser stays free of the tracer
 # import graph (ctypes / seccomp helpers); test_observe_profile.py
 # pins the two values together.
 OBSERVE_FILENAME = ".sandbox-observe.jsonl"
+
+# Nonce-delivery values (sandbox_info["nonce_delivery"]) that mean the
+# per-run nonce was protected from the target: an anonymous fd the
+# target could never name (Linux spawn paths) or parent-process state
+# that never touched disk at all (macOS seatbelt log streamer).
+_PROTECTED_NONCE_DELIVERY = frozenset({"anonymous_fd", "in_process"})
 
 
 # Syscall name → category dispatch. Kept here (not imported from
@@ -94,9 +112,15 @@ _STAT_SYSCALLS = frozenset({
 _CONNECT_SYSCALLS = frozenset({
     # Linux syscall name.
     "connect",
-    # macOS — kext network egress action. The path field in these
-    # records carries the destination string the kext logs (host or
-    # ip:port); _parse_connect_path tolerates either shape.
+    # macOS — kext network egress action. The path field carries the
+    # destination string exactly as the kext logged it: either a
+    # unix-domain socket path ("/private/var/run/mDNSResponder" —
+    # local IPC, deliberately not a connect target) or a
+    # "<host-or-ip>:<port>" destination ("1.2.3.4:443", "*:443",
+    # "[::1]:443", "example.com:443"). The Linux tracer's
+    # "ip:port (family)" shape never appears in macOS records;
+    # _parse_connect_path routes network-outbound paths through
+    # _parse_macos_connect_destination instead.
     "network-outbound",
 })
 
@@ -116,10 +140,7 @@ def _is_macos_write_action(name: str) -> bool:
     classification so the two ends agree on what counts as a write
     on macOS.
     """
-    for prefix in _MACOS_WRITE_PREFIXES:
-        if name.startswith(prefix):
-            return True
-    return False
+    return any(name.startswith(prefix) for prefix in _MACOS_WRITE_PREFIXES)
 
 
 # Match the connect-record path field shape produced by tracer.py:
@@ -129,6 +150,51 @@ def _is_macos_write_action(name: str) -> bool:
 _CONNECT_PATH_RE = re.compile(
     r"^(?P<ip>[^\s]+):(?P<port>\d+)\s+\((?P<family>AF_INET6?)\)$",
 )
+
+# Match the macOS Sandbox.kext network-outbound destination shape:
+# ``"<dest>:<port>"`` with no family suffix (the kext does not report
+# the address family). ``dest`` may be an IPv4 literal, a bracketed
+# or bare IPv6 literal, a hostname, or the SBPL wildcard ``*``. The
+# dest group is greedy so a bare IPv6 literal splits at the LAST
+# colon ("::1:443" → dest "::1", port 443).
+_MACOS_CONNECT_DEST_RE = re.compile(
+    r"^(?P<dest>.+):(?P<port>\d+)$",
+)
+
+# Throttle for the darwin connect-parse-gap diagnostic below. One
+# warning per interval is enough — a probe run that trips the gap
+# does so for every network-outbound record it contains, and batch
+# callers (project merge, calibrate) parse many logs back to back.
+_CONNECT_GAP_WARN_INTERVAL_S = 300.0
+_connect_gap_last_warn = float("-inf")
+
+
+def _warn_darwin_connect_gap(run_dir, unparsed: int) -> None:
+    """Loud (but throttled) diagnostic for the macOS connect parse gap.
+
+    Emitted by parse_observe_log when a darwin-sourced stream carried
+    network-outbound records with non-local destinations, yet parsing
+    produced zero connect targets — historically this failure mode
+    was silent and every macOS egress observation was lost. Throttled
+    via module-global monotonic stamp so repeated parses of the same
+    broken log don't flood operator output.
+    """
+    global _connect_gap_last_warn
+    now = time.monotonic()
+    if now - _connect_gap_last_warn < _CONNECT_GAP_WARN_INTERVAL_S:
+        return
+    _connect_gap_last_warn = now
+    logger.warning(
+        "parse_observe_log: %d macOS network-outbound record(s) in %s "
+        "yielded zero connect targets — the kext destination shape "
+        "matched neither the Linux 'ip:port (family)' form nor the "
+        "macOS 'host:port' / '[v6]:port' / '*:port' forms this parser "
+        "understands. external_reach reporting and egress-allowlist "
+        "derivation for this run are missing ALL macOS egress "
+        "evidence; extend _parse_macos_connect_destination in "
+        "core/sandbox/observe_profile.py to cover the new shape.",
+        unparsed, sanitise_for_terminal(str(run_dir)),
+    )
 
 
 @dataclass(frozen=True)
@@ -147,7 +213,11 @@ class ConnectTarget:
     """
     ip: str
     port: int
-    family: str  # "AF_INET" | "AF_INET6"
+    # "AF_INET" | "AF_INET6". Authoritative for Linux records (the
+    # tracer decodes the sockaddr); inferred from the destination
+    # literal for macOS records (the kext does not report a family —
+    # see _parse_macos_connect_destination).
+    family: str
 
 
 @dataclass
@@ -178,14 +248,26 @@ class ObserveProfile:
         the run (per-category cap or global cap exhausted). When
         True, this profile is INCOMPLETE — operators tuning a probe
         should re-run with a larger ``--audit-budget`` to capture
-        every event. Comes from the end-of-run audit_summary record
-        the tracer writes; absent if the run didn't write a summary
-        (tracer crashed mid-run, audit didn't engage, etc.).
+        every event. Comes from accepted drop markers or end-of-run
+        audit_summary accounting; counts may be unavailable without a tail.
     dropped_by_category
         Per-category drop counts from the audit_summary record. Use
         to understand WHICH category overflowed (e.g. "we lost 2000
         file-read-data records but kept all connects"). Empty dict
-        if no drops.
+        if no counted drops; a drop marker may establish loss without counts.
+    nonce_trusted
+        False when the parser refused nonce-based trust for this run:
+        the sandbox executed on a namespace-less backend AND the
+        nonce was not delivered through a protected channel (see
+        parse_observe_log's ``sandbox_info``), so a hostile target
+        could have learned the nonce and minted matching records.
+        Consumers deriving allowlists from this profile should treat
+        it as unauthenticated observation, not verified evidence.
+    capture_incomplete
+        True when an accepted audit summary reports append/reader failure or an
+        undrained stream, or parsing loses records to read, format, size,
+        schema, or attribution errors, including ambiguity admission drops.
+        Independent of budget drops; sticky across merges.
     """
     paths_read: list = field(default_factory=list)
     paths_written: list = field(default_factory=list)
@@ -193,21 +275,36 @@ class ObserveProfile:
     connect_targets: list = field(default_factory=list)
     budget_truncated: bool = False
     dropped_by_category: dict = field(default_factory=dict)
+    nonce_trusted: bool = True
+    # Capture or parsing loss, independently of budget drops.
+    capture_incomplete: bool = False
 
-    def merge(self, other: "ObserveProfile") -> None:
-        """In-place union — used when concatenating multiple probe runs."""
-        for p in other.paths_read:
-            if p not in self.paths_read:
-                self.paths_read.append(p)
-        for p in other.paths_written:
-            if p not in self.paths_written:
-                self.paths_written.append(p)
-        for p in other.paths_stat:
-            if p not in self.paths_stat:
-                self.paths_stat.append(p)
-        for c in other.connect_targets:
-            if c not in self.connect_targets:
-                self.connect_targets.append(c)
+    def merge(self, other: ObserveProfile) -> None:
+        """In-place stable union of observations from multiple probe runs."""
+        for name in ("paths_read", "paths_written", "paths_stat",
+                     "connect_targets"):
+            incoming = getattr(other, name)
+            if not incoming:
+                continue
+            current = getattr(self, name)
+            # Rebuild per merge: these public lists may have been edited.
+            seen = set(current)
+            for item in incoming:
+                if item not in seen:
+                    current.append(item)
+                    seen.add(item)
+        if other.budget_truncated:
+            self.budget_truncated = True
+        if other.capture_incomplete:
+            self.capture_incomplete = True
+        for cat, count in other.dropped_by_category.items():
+            self.dropped_by_category[cat] = (
+                self.dropped_by_category.get(cat, 0) + count
+            )
+        # Trust is conjunctive: a merged profile is only as trusted
+        # as its least-trusted constituent run.
+        if not other.nonce_trusted:
+            self.nonce_trusted = False
 
 
 # open(2) flag bits — duplicated here (rather than imported from
@@ -221,6 +318,18 @@ _O_RDWR = 0o0000002
 _O_CREAT = 0o0000100
 _O_TRUNC = 0o0001000
 _O_APPEND = 0o0002000
+
+
+def _open_record_flags(record: dict) -> int | None:
+    """Return usable open/openat flags, retaining the legacy fallback otherwise."""
+    name = record.get("syscall")
+    index = 1 if name == "open" else 2 if name == "openat" else None
+    args = record.get("args")
+    if (index is None or not isinstance(args, (list, tuple))
+            or len(args) <= index):
+        return None
+    flags = args[index]
+    return flags if type(flags) is int else None
 
 
 def _open_record_is_write_intent(record: dict) -> bool:
@@ -244,107 +353,193 @@ def _open_record_is_write_intent(record: dict) -> bool:
     tracer's safe-default for openat2 in _is_write_intent.
     """
     name = record.get("syscall")
-    args = record.get("args") or []
-    if name == "open":
-        # open(path, flags, mode) → flags at args[1]
-        if len(args) < 2:
-            return False
-        flags = args[1]
-    elif name == "openat":
-        # openat(dirfd, path, flags, mode) → flags at args[2]
-        if len(args) < 3:
-            return False
-        flags = args[2]
-    elif name == "openat2":
-        # See docstring — conservative.
-        return True
-    else:
-        return False
-    if not isinstance(flags, int):
+    if name not in ("open", "openat"):
+        # openat2: conservative write-classify (see docstring).
+        # Any other syscall name is not an open-family record.
+        return name == "openat2"
+    flags = _open_record_flags(record)
+    if flags is None:
         return False
     if flags & (_O_WRONLY | _O_RDWR):
         return True
-    if flags & (_O_CREAT | _O_TRUNC | _O_APPEND):
-        return True
-    return False
+    return bool(flags & (_O_CREAT | _O_TRUNC | _O_APPEND))
 
 
-def _parse_connect_path(record: dict) -> Optional[ConnectTarget]:
-    """Pull ip:port (family) out of a connect record's path field.
+def _is_local_socket_destination(path) -> bool:
+    """True for macOS network-outbound destinations that name a
+    unix-domain socket (an absolute filesystem path). Local IPC, not
+    egress — such records correctly yield no ConnectTarget and must
+    not trip the connect-parse-gap diagnostic."""
+    return bool(path) and path.startswith("/")
+
+
+def _parse_macos_connect_destination(path: str) -> ConnectTarget | None:
+    """Parse a macOS Sandbox.kext network-outbound destination.
+
+    The kext logs the destination bare — no ``(AF_INET)`` family
+    suffix — so the family is inferred from the literal: a bracketed
+    IPv6 form or a colon inside the host part → ``AF_INET6``;
+    everything else (IPv4 literal, hostname, SBPL wildcard ``*``) →
+    ``AF_INET``. The inferred family is a display / dedup key for
+    downstream consumers, not a socket parameter.
+
+    Returns None for unix-domain socket paths (local IPC, not
+    egress) and for destinations without a trailing ``:<port>``.
+    """
+    if not isinstance(path, str):
+        return None
+    if _is_local_socket_destination(path):
+        return None
+    m = _MACOS_CONNECT_DEST_RE.match(path)
+    if m is None:
+        return None
+    dest = m.group("dest")
+    try:
+        port = int(m.group("port"))
+    except ValueError:
+        return None
+    if dest.startswith("[") and dest.endswith("]"):
+        dest = dest[1:-1]
+        family = "AF_INET6"
+    else:
+        family = "AF_INET6" if ":" in dest else "AF_INET"
+    if not dest:
+        return None
+    return ConnectTarget(ip=dest, port=port, family=family)
+
+
+def _parse_connect_path(record: dict) -> ConnectTarget | None:
+    """Pull a ConnectTarget out of a connect record's path field.
+
+    Two record vocabularies feed this:
+
+      * Linux tracer ``connect`` records — path is
+        ``"<ip>:<port> (<family>)"`` (_CONNECT_PATH_RE).
+      * macOS kext ``network-outbound`` records — path is the raw
+        kext destination (``host:port`` / ``[v6]:port`` / ``*:port``
+        or a unix-socket path); handled by
+        _parse_macos_connect_destination, and only for records whose
+        syscall is ``network-outbound`` so a malformed Linux connect
+        path can never fall through to the looser macOS grammar.
 
     Returns None when the record's ``path`` is absent or doesn't
-    match the expected shape. The tracer skips ``path`` for
+    match either expected shape. The tracer skips ``path`` for
     connect() when sockaddr decode failed (unsupported family,
     stale memory, etc.) — those records carry the raw arg pointer
     in args[1] only, which the parser can't decode at parse time.
     """
     path = record.get("path")
-    if not path:
+    if not isinstance(path, str) or not path:
         return None
     m = _CONNECT_PATH_RE.match(path)
-    if m is None:
-        return None
-    try:
-        port = int(m.group("port"))
-    except ValueError:
-        return None
-    return ConnectTarget(
-        ip=m.group("ip"), port=port, family=m.group("family"),
-    )
+    if m is not None:
+        try:
+            port = int(m.group("port"))
+        except ValueError:
+            return None
+        return ConnectTarget(
+            ip=m.group("ip"), port=port, family=m.group("family"),
+        )
+    if record.get("syscall") == "network-outbound":
+        return _parse_macos_connect_destination(path)
+    return None
 
 
-def _iter_records(path: Path) -> Iterable[dict]:
+# Bounds on the observe JSONL. Legitimate logs are budget-capped by
+# the tracer (AuditBudget hard ceilings) and stay far below these;
+# anything bigger is a planted artifact, and reading it unboundedly
+# hands the target a memory/CPU lever over the parent's parse. Same
+# discipline as triage._read_bounded.
+_MAX_OBSERVE_BYTES = 64 * 1024 * 1024
+# Cap on any single JSONL line/record. Tracer records are small
+# (paths + a few fields); a multi-megabyte line is planted.
+_MAX_RECORD_BYTES = 1 * 1024 * 1024
+
+
+def _iter_records(path: Path, *, profile: ObserveProfile | None = None) -> Iterable[dict]:
     """Yield decoded JSONL records, skipping malformed lines.
+
+    When supplied, mark the profile incomplete if input cannot be read
+    or records must be discarded by the parser.
 
     A partial write at the end of the file (tracer killed mid-event)
     can leave a truncated final line. We swallow JSON decode errors
     and continue — the alternative (raise) would lose every well-
     formed record before the bad line.
 
-    Symlink-TOCTOU defence: open with ``O_NOFOLLOW``. The audit
-    run dir is bind-mounted writable inside the sandbox; a hostile
-    target binary could replace ``.sandbox-observe.jsonl`` with a
-    symlink to ``/etc/passwd`` BEFORE audit engages, and a vanilla
-    ``open()`` would follow it and feed unrelated content to the
-    JSON parser. ``O_NOFOLLOW`` makes the open fail with ELOOP on
-    a symlink. The tracer's write side uses the same flag (+ a
-    dirfd cached at first write); we mirror it on the read side
-    so the two ends agree on the trust contract.
+    Bounded-read discipline (the evidence pathname is child-mutable
+    on Landlock-only hosts — same rationale as triage._read_bounded):
+
+    * ``O_NOFOLLOW``: a planted symlink (e.g. to ``/etc/passwd``)
+      fails the open with ELOOP instead of feeding unrelated content
+      to the JSON parser. The tracer's write side uses the same flag;
+      the two ends agree on the trust contract.
+    * ``O_NONBLOCK`` + fstat ``S_ISREG`` on the OPENED fd: a planted
+      FIFO cannot park the parser until a hostile writer appears
+      (pre-fix a mkfifo at this path hung the parent indefinitely),
+      and devices/directories are refused outright.
+    * Byte caps: at most ``_MAX_OBSERVE_BYTES`` total (oversized
+      planted files are refused, matching triage's stance) and
+      ``_MAX_RECORD_BYTES`` per line (oversized lines are skipped
+      like malformed ones).
     """
-    import os as _os
     try:
-        fd = _os.open(str(path), _os.O_RDONLY | _os.O_NOFOLLOW)
-    except OSError:
-        # Includes ELOOP (symlink rejected) and ENOENT (no log
-        # because audit didn't engage). Both → empty profile.
+        data = read_capped(path, _MAX_OBSERVE_BYTES, raise_on_refusal=True)
+    except CappedReadRefused as exc:
+        if profile is not None:
+            profile.capture_incomplete = True
+        if exc.reason == "not_regular":
+            logger.warning(
+                "observe log %s is not a regular file "
+                "(mode=%o) — planted object? Refusing to parse.",
+                sanitise_for_terminal(str(path)), exc.st_mode)
+        else:
+            logger.warning(
+                "observe log %s exceeds the %d byte cap — "
+                "refusing to parse oversized or growing artifact.",
+                sanitise_for_terminal(str(path)), _MAX_OBSERVE_BYTES)
         return
-    try:
-        f = _os.fdopen(fd, "r", encoding="utf-8")
     except OSError:
+        if profile is not None:
+            profile.capture_incomplete = True
+        return
+    # Iterate without allocating a list proportional to the number of
+    # newlines. The per-record limit excludes its newline terminator.
+    for raw in io.BytesIO(data):
+        size = len(raw) - int(raw.endswith(b"\n"))
+        if size > _MAX_RECORD_BYTES:
+            if profile is not None:
+                profile.capture_incomplete = True
+            continue
+        line = raw.strip()
+        if not line:
+            continue
         try:
-            _os.close(fd)
-        except OSError:
-            pass
-        return
-    with f:
-        for raw in f:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except (ValueError, TypeError):
-                continue
+            # Damaged bytes and ambiguous objects are capture loss, not
+            # rewritten observations or proof of capture completion.
+            yield json.loads(
+                line.decode("utf-8"), object_pairs_hook=_unique_evidence_object)
+        except (ValueError, TypeError, RecursionError):
+            if profile is not None:
+                profile.capture_incomplete = True
+            continue
 
 
 def parse_observe_log(run_dir, *,
                       filename: str = OBSERVE_FILENAME,
-                      expected_nonce: Optional[str] = None,
+                      expected_nonce: str | None = None,
+                      sandbox_info: dict | None = None,
+                      current_run: bool = False,
                       ) -> ObserveProfile:
     """Extract an ObserveProfile from a tracer JSONL log.
 
     `run_dir`: directory the sandbox was given (the parent of the
     JSONL file — same value as ``audit_run_dir`` or ``output``).
+    The JSONL is read from ``<run_dir>/.audit/<filename>`` (the
+    evidence directory the sandboxed child cannot write to — see
+    core/sandbox/evidence.py), with a back-compat fallback to the
+    legacy ``<run_dir>/<filename>`` location for runs produced by
+    older versions.
     `filename`: override the JSONL basename (default matches the
     tracer's ``_OBSERVE_FILENAME``). Tests pass an explicit name
     when reading a synthetic fixture from a path other than the
@@ -352,18 +547,52 @@ def parse_observe_log(run_dir, *,
 
     `expected_nonce`: when set, drop every record whose ``nonce``
     field does not match. Defeats spoofs: a target binary inside
-    the sandbox has write access to the bind-mounted
-    ``audit_run_dir`` and could append fake records to the JSONL
-    (e.g. claim it never connected to evil.com, or that it read a
-    file it didn't). The tracer subprocess reads the per-run nonce
-    from its config tempfile (located in /tmp, NOT visible inside
-    the sandbox), so the target cannot guess it; records written by
-    the target lack the nonce or carry a stale one. Operators get
-    the nonce from ``result.sandbox_info["observe_nonce"]`` after a
+    the sandbox may have write access to the bind-mounted
+    ``audit_run_dir`` and could append fake records to a JSONL it
+    can reach (e.g. claim it never connected to evil.com, or that
+    it read a file it didn't). The tracer subprocess reads the
+    per-run nonce from an anonymous fd the target can never name
+    (see core/sandbox/evidence.anonymous_fd), so the target cannot
+    learn it; records written by the target lack the nonce or carry
+    a stale one. Operators get the nonce from
+    ``result.sandbox_info["observe_nonce"]`` after a
     sandbox(observe=True) run. ``None`` skips validation —
     backward-compat with callers that don't have a nonce, but those
     callers must accept that a hostile binary can spoof their
     profile.
+
+    `current_run`: pass True when parsing the log of a run THIS
+    process just executed (the observe CLI / calibration shape).
+    When the run degraded and produced no nonce
+    (``expected_nonce=None``), a current-run parse (a) refuses the
+    legacy ``<run_dir>/<filename>`` fallback — that location is
+    target-writable, so on a degraded run the probed binary could
+    plant a complete forged log there and have it parsed as the
+    run's profile — and reads only the parent-owned
+    ``<run_dir>/.audit`` location; and (b) marks the resulting
+    profile ``nonce_trusted=False`` so downstream consumers demote
+    it (the records cannot be authenticated without a nonce even
+    when they came from the canonical location). Parses WITH a
+    nonce keep current behaviour — the nonce itself gates every
+    record, so the legacy fallback stays safe there. False
+    (default) preserves the pre-existing behaviour for offline
+    readers of older runs' artifacts. A current-run parse also requires an
+    accepted audit-summary tail; without one, capture_incomplete is True.
+
+    `sandbox_info`: the run's ``result.sandbox_info`` dict, used as
+    a fail-safe backstop on nonce trust. When the run executed on a
+    namespace-less backend (no mount-ns, not macOS seatbelt) AND
+    ``sandbox_info["nonce_delivery"]`` does not record a protected
+    channel ("anonymous_fd" / "in_process"), nonce-matching records
+    cannot be distinguished from target-minted ones (the nonce was
+    exposed at a same-UID-readable location — the pre-relocation
+    /tmp config file, or an unknown future regression). The parser
+    then marks the profile ``nonce_trusted=False`` and logs a
+    warning; records are still parsed so the observation remains
+    available as UNAUTHENTICATED signal. ``None`` (default)
+    preserves the pre-existing behaviour for callers without run
+    metadata. Malformed metadata is not proof of isolation: the mount flag
+    must be boolean True and a protected delivery label must be a string.
 
     Returns an empty profile if the file does not exist or cannot
     be read — a caller with no observe records gets a defaulted
@@ -371,8 +600,52 @@ def parse_observe_log(run_dir, *,
     introspection" contract.
     """
     profile = ObserveProfile()
-    log_path = Path(run_dir) / filename
-    if not log_path.exists():
+    if current_run:
+        # The final descriptor check happens after the JSONL tail is
+        # appended. A clean-looking tail cannot overrule parent-known loss.
+        from .summary import get_evidence_inode_mismatch, get_evidence_write_failure
+        if get_evidence_write_failure(run_dir) or get_evidence_inode_mismatch(run_dir):
+            profile.capture_incomplete = True
+    if expected_nonce is not None and sandbox_info is not None:
+        info = sandbox_info if isinstance(sandbox_info, dict) else {}
+        _isolated = info.get("mount_ns_active") is True or (
+            info.get("backend") == "macos-seatbelt"
+        )
+        _delivery = info.get("nonce_delivery")
+        _protected = isinstance(_delivery, str) and _delivery in _PROTECTED_NONCE_DELIVERY
+        if not _isolated and not _protected:
+            logger.warning(
+                "parse_observe_log: refusing nonce-based trust for %s "
+                "— run lacks a recorded isolated backend and the "
+                "nonce delivery channel (%s) is not recorded as "
+                "protected. Records are parsed but the profile is "
+                "marked unauthenticated (nonce_trusted=False).",
+                sanitise_for_terminal(str(run_dir)),
+                sanitise_for_terminal(repr(_delivery)),
+            )
+            profile.nonce_trusted = False
+    if current_run and expected_nonce is None:
+        # Degraded-audit shape: the run produced no nonce, so no
+        # record can be authenticated AND the legacy run-root
+        # location cannot be distinguished from a forgery planted by
+        # the probed binary. Parse only the parent-owned .audit
+        # location and demote the profile.
+        logger.warning(
+            "parse_observe_log: current-run parse without a nonce "
+            "(audit degraded?) for %s — reading only the parent-owned "
+            ".audit location (legacy run-root fallback refused: it is "
+            "target-writable) and marking the profile unauthenticated "
+            "(nonce_trusted=False).",
+            sanitise_for_terminal(str(run_dir)),
+        )
+        profile.nonce_trusted = False
+        log_path = _evidence_write_path(run_dir, filename)
+    else:
+        log_path = _resolve_evidence_path(run_dir, filename)
+    # Keep unreadable entries for the bounded reader's incomplete flag.
+    if not path_may_exist(log_path):
+        if current_run:
+            profile.capture_incomplete = True
         return profile
 
     seen_read: set = set()
@@ -380,7 +653,19 @@ def parse_observe_log(run_dir, *,
     seen_stat: set = set()
     seen_connect: set = set()
 
-    for rec in _iter_records(log_path):
+    # Darwin connect-parse-gap accounting. network-outbound is a
+    # macOS-only record name, so its presence marks the stream as
+    # darwin-sourced. Unix-socket destinations (local IPC) are
+    # excluded — yielding no target for those is correct, not a gap.
+    darwin_connect_parsed = 0
+    darwin_connect_unparsed = 0
+
+    ambiguous_skipped = 0
+    summary_at_tail = False
+    for rec in _iter_records(log_path, profile=profile):
+        if not isinstance(rec, dict):
+            profile.capture_incomplete = True
+            continue
         # Provenance: when an expected nonce is set, drop records
         # without a matching value. Records the tracer wrote carry
         # the per-run nonce; records the target binary spoofed into
@@ -390,25 +675,73 @@ def parse_observe_log(run_dir, *,
         # of None so a record with `"nonce": null` doesn't equal
         # `expected_nonce=None` by accident. Applied to ALL records
         # including the audit_summary tail.
-        if expected_nonce is not None:
-            if rec.get("nonce", "") != expected_nonce:
-                continue
+        if (expected_nonce is not None
+                and rec.get("nonce", "") != expected_nonce):
+            continue
+
+        # Completion belongs to the last accepted record, not an earlier
+        # summary followed by additional records from the same capture.
+        summary_at_tail = rec.get("type") == "audit_summary"
+        # Truthiness can admit malformed stamps or silently discard records.
+        # Check after the nonce gate so foreign rows cannot claim capture loss.
+        if any(field in rec and type(rec[field]) is not bool
+               for field in ("observe", "parse_ambiguous")):
+            summary_at_tail = False
+            profile.capture_incomplete = True
+            continue
+        if rec.get("parse_ambiguous"):
+            summary_at_tail = False
+            profile.capture_incomplete = True
+            # Tamper-suspect records (unanchorable PID field — see
+            # seatbelt_audit._LOG_LINE_RE) are admitted to the JSONL
+            # as EVIDENCE and get the run nonce stamped, so the nonce
+            # gate has accepted them — but they must never be
+            # POLICY INPUT: an observe-derived allowlist must not
+            # learn paths or hosts from a record whose origin could
+            # not be attributed (any same-host sandboxed process can
+            # mint the ambiguous shape).
+            ambiguous_skipped += 1
+            continue
+
+        marker_type = rec.get("type")
+        if isinstance(marker_type, str) and marker_type in {
+            "category_budget_exceeded", "pid_budget_exceeded",
+            "sampling_budget_exceeded",
+        }:
+            # These markers accompany actual drops. Global and sampling-mode
+            # notices can accompany kept records and do not establish loss.
+            profile.budget_truncated = True
+            continue
+        if marker_type == "parse_ambiguous_cap_exceeded":
+            profile.capture_incomplete = True
+            continue
 
         # Audit-summary tail record carries budget data. Surface
         # `budget_truncated` (any drops) + per-category counts so an
         # operator knows the profile is incomplete.
         if rec.get("type") == "audit_summary":
-            dropped = rec.get("dropped_by_category") or {}
-            if isinstance(dropped, dict) and dropped:
-                # Coerce values to int (JSON re-decode may give us
-                # ints already; guard against floats/strings).
-                profile.dropped_by_category = {
-                    str(k): int(v) for k, v in dropped.items()
-                    if isinstance(v, (int, float))
-                }
-                profile.budget_truncated = any(
-                    profile.dropped_by_category.values()
-                )
+            if capture_loss_status(rec)[0]:
+                profile.capture_incomplete = True
+            dropped = rec.get("dropped_by_category", {})
+            if not isinstance(dropped, dict):
+                profile.capture_incomplete = True
+            elif dropped:
+                # The writers emit nonnegative integer counts. Malformed
+                # accounting is capture loss; retain valid counts without
+                # converting NaN, infinity, booleans, or negative values.
+                # A shared output log may contain multiple audit sessions.
+                # Each tail contributes drops; a later clean tail cannot
+                # make an earlier incomplete observation complete again.
+                for key, count in dropped.items():
+                    if type(count) is not int or count < 0:
+                        profile.capture_incomplete = True
+                        continue
+                    category = str(key)
+                    profile.dropped_by_category[category] = (
+                        profile.dropped_by_category.get(category, 0) + count
+                    )
+                    if count:
+                        profile.budget_truncated = True
             continue
 
         # Skip records that explicitly carry observe=False (defensive
@@ -418,7 +751,15 @@ def parse_observe_log(run_dir, *,
         # syscall is recognised — the JSONL filename is the primary
         # signal.
         name = rec.get("syscall")
-        if not name:
+        if not isinstance(name, str) or not name:
+            # Metadata records legitimately omit syscall; an explicitly
+            # malformed syscall field is a record the parser had to lose.
+            if "syscall" in rec:
+                profile.capture_incomplete = True
+            continue
+        path = rec.get("path")
+        if path is not None and not isinstance(path, str):
+            profile.capture_incomplete = True
             continue
         if "observe" in rec and not rec.get("observe"):
             continue
@@ -427,14 +768,18 @@ def parse_observe_log(run_dir, *,
             path = rec.get("path")
             if not path:
                 continue
+            # Keep the historical read fallback, but distinguish unusable
+            # supplied flags from older writers that omitted args entirely.
+            if (name in ("open", "openat") and "args" in rec
+                    and _open_record_flags(rec) is None):
+                profile.capture_incomplete = True
             if _open_record_is_write_intent(rec):
                 if path not in seen_write:
                     seen_write.add(path)
                     profile.paths_written.append(path)
-            else:
-                if path not in seen_read:
-                    seen_read.add(path)
-                    profile.paths_read.append(path)
+            elif path not in seen_read:
+                seen_read.add(path)
+                profile.paths_read.append(path)
         elif _is_macos_write_action(name):
             # macOS-only branch — kext write actions
             # (file-write-create / file-write-data / file-mknod /
@@ -455,10 +800,40 @@ def parse_observe_log(run_dir, *,
                 profile.paths_stat.append(path)
         elif name in _CONNECT_SYSCALLS:
             target = _parse_connect_path(rec)
+            if (name == "network-outbound"
+                    and not _is_local_socket_destination(rec.get("path"))):
+                if target is None:
+                    # A later valid destination or clean summary cannot
+                    # recover this observation's missing destination.
+                    profile.capture_incomplete = True
+                    darwin_connect_unparsed += 1
+                else:
+                    darwin_connect_parsed += 1
             if target is None:
                 continue
             if target not in seen_connect:
                 seen_connect.add(target)
                 profile.connect_targets.append(target)
+
+    if current_run and not summary_at_tail:
+        # Current writers finish with a summary, even for zero events. Its
+        # absence at the accepted tail means completion is unproven. Offline
+        # readers still accept legacy streams that predate summary tails.
+        profile.capture_incomplete = True
+
+    # Diagnostic: a darwin-sourced stream carried egress evidence but
+    # parsing surfaced none of it. Historically this was silent —
+    # connect_targets came back empty and every downstream consumer
+    # (external_reach, egress-allowlist derivation) lost all macOS
+    # egress evidence with no failure mode visible. Never again.
+    if darwin_connect_unparsed and not darwin_connect_parsed:
+        _warn_darwin_connect_gap(run_dir, darwin_connect_unparsed)
+
+    if ambiguous_skipped:
+        logger.warning(
+            "parse_observe_log: %d tamper-suspect (parse_ambiguous) "
+            "record(s) in %s excluded from profile derivation",
+            ambiguous_skipped, sanitise_for_terminal(str(run_dir)),
+        )
 
     return profile

@@ -14,10 +14,14 @@ the FP distribution — without categories we can't enforce that.
 
 from __future__ import annotations
 
-import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Mapping, Optional
+from typing import Any
+
+from core.json import dumps_artifact, loads
+
+from core.dataflow._schema_checks import check_extra_fields, require_nonempty, unique_object_fields
 
 
 SCHEMA_VERSION = 1
@@ -25,7 +29,7 @@ SCHEMA_VERSION = 1
 
 VERDICT_TRUE_POSITIVE = "true_positive"
 VERDICT_FALSE_POSITIVE = "false_positive"
-VALID_VERDICTS: FrozenSet[str] = frozenset(
+VALID_VERDICTS: frozenset[str] = frozenset(
     {VERDICT_TRUE_POSITIVE, VERDICT_FALSE_POSITIVE}
 )
 
@@ -36,7 +40,7 @@ FP_FRAMEWORK_MITIGATION = "framework_mitigation"
 FP_DEAD_CODE = "dead_code"
 FP_TYPE_CONSTRAINT = "type_constraint"
 FP_REFLECTION_IMPRECISION = "reflection_imprecision"
-VALID_FP_CATEGORIES: FrozenSet[str] = frozenset(
+VALID_FP_CATEGORIES: frozenset[str] = frozenset(
     {
         FP_MISSING_SANITIZER_MODEL,
         FP_INFEASIBLE_BRANCH,
@@ -48,7 +52,7 @@ VALID_FP_CATEGORIES: FrozenSet[str] = frozenset(
 )
 
 
-_GROUND_TRUTH_KEYS: FrozenSet[str] = frozenset(
+_GROUND_TRUTH_KEYS: frozenset[str] = frozenset(
     {
         "schema_version",
         "finding_id",
@@ -57,22 +61,75 @@ _GROUND_TRUTH_KEYS: FrozenSet[str] = frozenset(
         "rationale",
         "labeler",
         "labeled_at",
+        "lifecycle_precondition",
     }
 )
 
 
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_LIFECYCLE_PRECONDITION_KEYS: frozenset[str] = frozenset(
+    {"field", "write_site_guard", "read_site_lacks_guard", "notes"}
+)
 
 
-def _check_extra_fields(name: str, data: Mapping[str, Any], allowed: FrozenSet[str]) -> None:
-    extras = set(data.keys()) - allowed
-    if extras:
-        raise ValueError(f"unknown fields in {name} JSON: {sorted(extras)}")
+@dataclass(frozen=True)
+class LifecyclePrecondition:
+    """Optional, forward-compatible annotation on CWE-476 / CWE-416
+    ground-truth records, capturing the lifecycle invariant whose
+    violation makes the bug shape consume an under-guarded field.
+
+    v1 source_intel verdict policy IGNORES this field; the annotation
+    is precomputed during corpus seeding, while the kernel patch is in
+    the labeler's head, so a future v2 consumer does not have to
+    re-derive it later (CVE-2026-46333 is the canonical example).
+    """
+
+    field: str
+    write_site_guard: str
+    read_site_lacks_guard: bool
+    notes: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty("LifecyclePrecondition.field", self.field)
+        _require_nonempty(
+            "LifecyclePrecondition.write_site_guard", self.write_site_guard
+        )
+        if not isinstance(self.read_site_lacks_guard, bool):
+            msg = "LifecyclePrecondition.read_site_lacks_guard must be bool"
+            raise ValueError(msg)
+        if self.notes is not None and not isinstance(self.notes, str):
+            raise ValueError("LifecyclePrecondition.notes must be a string or null")
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "field": self.field,
+            "write_site_guard": self.write_site_guard,
+            "read_site_lacks_guard": self.read_site_lacks_guard,
+        }
+        if self.notes is not None:
+            d["notes"] = self.notes
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LifecyclePrecondition:
+        _check_extra_fields(
+            "LifecyclePrecondition", data, _LIFECYCLE_PRECONDITION_KEYS
+        )
+        return cls(
+            field=data["field"],
+            write_site_guard=data["write_site_guard"],
+            read_site_lacks_guard=data["read_site_lacks_guard"],
+            notes=data.get("notes"),
+        )
 
 
-def _require_nonempty(label: str, value: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty string")
+_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+# Strict from_dict checks — shared with the sibling value modules via
+# core.dataflow._schema_checks (local underscore names kept: they are
+# these modules' call-site and patch seams).
+_check_extra_fields = check_extra_fields
+_require_nonempty = require_nonempty
 
 
 @dataclass(frozen=True)
@@ -94,38 +151,45 @@ class GroundTruth:
     rationale: str
     labeler: str
     labeled_at: str
-    fp_category: Optional[str] = None
+    fp_category: str | None = None
+    #: Optional forward-compatible annotation for CWE-476 / CWE-416
+    #: fixtures (and structurally-related logic bugs). The v1
+    #: source_intel verdict policy ignores it. See
+    #: `LifecyclePrecondition` for the shape.
+    lifecycle_precondition: LifecyclePrecondition | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty("GroundTruth.finding_id", self.finding_id)
         _require_nonempty("GroundTruth.rationale", self.rationale)
         _require_nonempty("GroundTruth.labeler", self.labeler)
-        if not _ISO_DATE_RE.match(self.labeled_at or ""):
-            raise ValueError(
+        if (self.lifecycle_precondition is not None
+                and not isinstance(self.lifecycle_precondition, LifecyclePrecondition)):
+            raise ValueError("GroundTruth.lifecycle_precondition must be LifecyclePrecondition or null")
+        if not isinstance(self.labeled_at, str) or not _ISO_DATE_RE.fullmatch(self.labeled_at):
+            msg = (
                 f"GroundTruth.labeled_at must be ISO YYYY-MM-DD, "
                 f"got {self.labeled_at!r}"
             )
+            raise ValueError(msg)
         if self.verdict not in VALID_VERDICTS:
-            raise ValueError(
-                f"verdict {self.verdict!r} not in {sorted(VALID_VERDICTS)!r}"
-            )
+            msg = f"verdict {self.verdict!r} not in {sorted(VALID_VERDICTS)!r}"
+            raise ValueError(msg)
         if self.verdict == VERDICT_TRUE_POSITIVE and self.fp_category is not None:
-            raise ValueError(
-                "fp_category must be None for true_positive verdicts"
-            )
+            msg = "fp_category must be None for true_positive verdicts"
+            raise ValueError(msg)
         if self.verdict == VERDICT_FALSE_POSITIVE:
             if self.fp_category is None:
-                raise ValueError(
-                    "fp_category required for false_positive verdicts"
-                )
+                msg = "fp_category required for false_positive verdicts"
+                raise ValueError(msg)
             if self.fp_category not in VALID_FP_CATEGORIES:
-                raise ValueError(
+                msg = (
                     f"fp_category {self.fp_category!r} not in "
                     f"{sorted(VALID_FP_CATEGORIES)!r}"
                 )
+                raise ValueError(msg)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "finding_id": self.finding_id,
             "verdict": self.verdict,
@@ -134,16 +198,23 @@ class GroundTruth:
             "labeler": self.labeler,
             "labeled_at": self.labeled_at,
         }
+        if self.lifecycle_precondition is not None:
+            d["lifecycle_precondition"] = self.lifecycle_precondition.to_dict()
+        return d
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "GroundTruth":
+    def from_dict(cls, data: Mapping[str, Any]) -> GroundTruth:
         _check_extra_fields("GroundTruth", data, _GROUND_TRUTH_KEYS)
         version = data["schema_version"]
-        if version != SCHEMA_VERSION:
-            raise ValueError(
+        if isinstance(version, bool) or not isinstance(version, int) or version != SCHEMA_VERSION:
+            msg = (
                 f"GroundTruth schema_version {version!r} != expected "
                 f"{SCHEMA_VERSION!r}; corpus upgrade required"
             )
+            raise ValueError(msg)
+        lcp = data.get("lifecycle_precondition")
+        if lcp is not None and not isinstance(lcp, Mapping):
+            raise ValueError("lifecycle_precondition must be an object or null")
         return cls(
             finding_id=data["finding_id"],
             verdict=data["verdict"],
@@ -151,11 +222,19 @@ class GroundTruth:
             labeler=data["labeler"],
             labeled_at=data["labeled_at"],
             fp_category=data.get("fp_category"),
+            lifecycle_precondition=(
+                LifecyclePrecondition.from_dict(lcp) if lcp is not None else None
+            ),
         )
 
-    def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), **kwargs)
+    def to_json(self, *, indent: int | None = None) -> str:
+        """Render as JSON. Explicit ``indent`` signature replaces
+        a catch-all ``**kwargs`` — the only kwarg any caller ever
+        passes is ``indent=2`` (corpus generator + handlabel_seed
+        for pretty-printing). The explicit shape lets mypy / ruff
+        catch typos in callers and makes the contract greppable."""
+        return dumps_artifact(self.to_dict(), indent=indent)
 
     @classmethod
-    def from_json(cls, text: str) -> "GroundTruth":
-        return cls.from_dict(json.loads(text))
+    def from_json(cls, text: str) -> GroundTruth:
+        return cls.from_dict(loads(text, object_pairs_hook=unique_object_fields))

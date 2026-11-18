@@ -8,28 +8,42 @@ into a seamless automated pipeline.
 """
 
 import argparse
+import os
 import sys
 import time
-from dataclasses import dataclass, asdict
-from datetime import datetime
-
+from typing import Any, TYPE_CHECKING
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
 
-# Add parent directory to path for imports
-# packages/codeql/agent.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[2]))
+# Path setup for direct CLI invocation. `os.environ["RAPTOR_DIR"]`
+# (no fallback) is the canonical project root marker — see CLAUDE.md
+# "Python path safety"; a KeyError surfaces the configuration problem
+# at startup instead of a positional walk silently breaking.
+if __name__ == "__main__":
+    sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
-from core.json import save_json
-
+from core.build.artifacts import cleanup_build_paths
+from core.build.build_detector import BuildDetector, BuildSystem
 from core.config import RaptorConfig
+from core.json import load_json_bounded, save_json
 from core.logging import get_logger
-from core.run.safe_io import safe_run_mkdir
 from core.run.output import unique_run_suffix as _unique_run_suffix
+from core.run.safe_io import safe_run_mkdir
+from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError
+from core.security.log_sanitisation import sanitise_for_terminal
+from packages.codeql.database_manager import (
+    AUTOBUILD_LANGUAGES,
+    BUILDLESS_DEFAULT_LANGUAGES,
+    SOURCE_EXTRACTED_LANGUAGES,
+    DatabaseManager,
+    DatabaseResult,
+)
 from packages.codeql.language_detector import LanguageDetector, LanguageInfo
-from packages.codeql.build_detector import BuildDetector, BuildSystem
-from packages.codeql.database_manager import DatabaseManager, DatabaseResult
-from packages.codeql.query_runner import QueryRunner, QueryResult
+from packages.codeql.query_runner import QueryResult, QueryRunner
+
+if TYPE_CHECKING:
+    from core.reporting.options import ReportOptions
 
 logger = get_logger()
 
@@ -66,6 +80,48 @@ def _normalise_language(name: str) -> str:
     return _LANGUAGE_ALIASES.get(name.strip().lower(), name.strip().lower())
 
 
+def _write_candidates_sarif(augmented_sarif, new_ids, out_path):
+    """Write the augmented-only results as a candidates SARIF.
+
+    Filters the augmented run's results down to the finding ids the
+    baseline lacked (the learned models exposed them) and stamps each
+    with ``properties.provenance = "learned-model"`` so downstream
+    triage can see why the finding exists. Returns the written path as
+    a string, or None on any failure — candidates are additive signal,
+    never worth failing the pass over.
+    """
+    try:
+        from core.dataflow.adapters.codeql import from_sarif_result
+
+        # SARIF from this run's augmented CodeQL pass; any refusal
+        # (missing, malformed, over budget) lands in the additive-
+        # signal except below.
+        sarif = load_json_bounded(augmented_sarif, max_bytes=256 * 1024 * 1024)
+        kept_any = False
+        for run in sarif.get("runs", []) or []:
+            kept = []
+            for result in run.get("results", []) or []:
+                try:
+                    finding = from_sarif_result(result)
+                except ValueError:
+                    continue
+                if finding is None or finding.finding_id not in new_ids:
+                    continue
+                props = result.setdefault("properties", {})
+                props["provenance"] = "learned-model"
+                kept.append(result)
+            run["results"] = kept
+            kept_any = kept_any or bool(kept)
+        if not kept_any:
+            return None
+        out_path = Path(out_path)
+        save_json(out_path, sarif)
+        return str(out_path)
+    except Exception:  # noqa: BLE001 — additive signal only
+        logger.debug("candidates SARIF write failed", exc_info=True)
+        return None
+
+
 @dataclass
 class CodeQLWorkflowResult:
     """Complete workflow result."""
@@ -73,12 +129,40 @@ class CodeQLWorkflowResult:
     repo_path: str
     timestamp: str
     duration_seconds: float
-    languages_detected: Dict[str, LanguageInfo]
-    databases_created: Dict[str, DatabaseResult]
-    analyses_completed: Dict[str, QueryResult]
+    languages_detected: dict[str, LanguageInfo]
+    databases_created: dict[str, DatabaseResult]
+    analyses_completed: dict[str, QueryResult]
     total_findings: int
-    sarif_files: List[str]
-    errors: List[str]
+    sarif_files: list[str]
+    errors: list[str]
+    # Per-(language, CWE) standard-vs-IRIS finding counts, present only
+    # when the standard pass ran with threat models AND the IRIS pass
+    # produced a SARIF — data for deciding whether IRIS queries are
+    # subsumed by `--threat-model=local`. Additive; consumers tolerate
+    # its absence.
+    threat_model_overlap: dict | None = None
+    # Per-language learned-models measurement (rows emitted/rejected,
+    # baseline-vs-augmented finding diff, count of augmented-only
+    # candidates surfaced). Additive; consumers tolerate its absence.
+    learned_models: dict | None = None
+
+    #: Source-wrapper summaries staged for the standard suite
+    #: (wrappers found, rows emitted, refusal counts).
+    source_summaries: dict | None = None
+
+    #: Taint-pack models-as-data augmentation record: the per-language
+    #: cells of taint-mad-augmentation.json (which sink kinds/classes/
+    #: CWEs the standard suites were given rows for). Present only
+    #: when the --taint-crossfile flag family enabled the pass.
+    #: Additive; consumers tolerate its absence.
+    taint_mad: dict | None = None
+
+    # Languages whose database creation executed repo build logic
+    # (explicit command or CodeQL autobuild) WITHOUT the operator's
+    # trust assertion (--traced-build / --build-command / the
+    # project's `build` trust marker). Recorded so the disclosure
+    # survives into the run report, not just the log stream.
+    untrusted_build_languages: list[str] = field(default_factory=list)
 
     def to_dict(self):
         """
@@ -110,6 +194,7 @@ class CodeQLWorkflowResult:
                 'errors': result.errors,
                 'duration_seconds': result.duration_seconds,
                 'cached': result.cached,
+                'extraction_summary': result.extraction_summary,
             }
             for lang, result in self.databases_created.items()
         }
@@ -122,6 +207,7 @@ class CodeQLWorkflowResult:
                 'database_path': str(result.database_path),
                 'sarif_path': str(result.sarif_path) if result.sarif_path else None,
                 'findings_count': result.findings_count,
+                'skipped_rules': result.skipped_rules,
                 'duration_seconds': result.duration_seconds,
                 'errors': result.errors,
                 'suite_name': result.suite_name,
@@ -130,10 +216,55 @@ class CodeQLWorkflowResult:
             for lang, result in self.analyses_completed.items()
         }
 
-        # CRITICAL: Convert sarif_files (type annotation says List[str], but agent.py:485 creates List[Path])
+        # CRITICAL: Convert sarif_files — the type annotation says
+        # List[str], but the workflow appends Path objects.
         data['sarif_files'] = [str(p) if isinstance(p, Path) else p for p in self.sarif_files]
 
         return data
+
+
+def _collapse_shared_extractor_languages(
+    detected: dict[str, "LanguageInfo"],
+) -> None:
+    """Collapse detected languages that share one extractor AND one
+    query pack into a single database build.
+
+    javascript + typescript both resolve to the javascript extractor
+    and codeql/javascript-queries: keeping both built two databases
+    over the same tree and duplicated every finding in the merged
+    SARIF set. The typescript entry's evidence folds into the
+    javascript one so reporting still reflects both. (kotlin/java is
+    NOT collapsed here: detection never emits kotlin and java for
+    the same files, so the duplicate-DB shape cannot arise.)
+    """
+    if "javascript" in detected and "typescript" in detected:
+        logger.info(
+            "javascript + typescript detected — one javascript "
+            "database covers both (same extractor and query pack); "
+            "collapsing to a single build",
+        )
+        ts_info = detected.pop("typescript")
+        js_info = detected["javascript"]
+        js_info.file_count += ts_info.file_count
+        js_info.extensions_found |= ts_info.extensions_found
+        js_info.confidence = max(js_info.confidence, ts_info.confidence)
+
+
+def _workflow_success(analysis_results: dict[str, QueryResult], *, additional_results=(), database_results=None) -> bool:
+    """Workflow success means at least one language's ANALYSIS
+    succeeded. The previous any-SARIF rule let additive lanes (IRIS,
+    curated packs, learned models) turn a run whose every analyze
+    failed into success=True / exit 0. Offline runs additionally require every
+    requested database and enabled query pass to succeed."""
+    if RaptorConfig.CODEQL_OFFLINE:
+        # Offline setup is coverage-specific: a missing language or selected
+        # companion pack cannot be reported as a successful partial scan.
+        groups = (analysis_results, *additional_results, database_results or {})
+        return bool(analysis_results) and all(r.success for group in groups for r in group.values())
+    return any(r.success for r in analysis_results.values())
+
+
+_SARIF_DATA_UNSET = object()
 
 
 class CodeQLAgent:
@@ -149,12 +280,14 @@ class CodeQLAgent:
     6. Create comprehensive report
     """
 
+    report_options: "ReportOptions | None"
+
     def __init__(
         self,
         repo_path: Path,
-        out_dir: Optional[Path] = None,
-        codeql_cli: Optional[str] = None
-    ):
+        out_dir: Path | None = None,
+        codeql_cli: str | None = None
+    ) -> None:
         """
         Initialize CodeQL agent.
 
@@ -167,7 +300,8 @@ class CodeQLAgent:
         self.start_time = time.time()
 
         if not self.repo_path.exists():
-            raise ValueError(f"Repository path does not exist: {repo_path}")
+            msg = f"Repository path does not exist: {repo_path}"
+            raise ValueError(msg)
 
         # Generate output directory
         if out_dir:
@@ -193,19 +327,57 @@ class CodeQLAgent:
         self.database_manager = DatabaseManager(codeql_cli=codeql_cli)
         self.query_runner = QueryRunner(codeql_cli=codeql_cli)
 
-        logger.info(f"{'=' * 70}")
+        logger.info("%s", '=' * 70)
         logger.info("RAPTOR CODEQL AGENT")
-        logger.info(f"{'=' * 70}")
-        logger.info(f"Repository: {self.repo_path}")
-        logger.info(f"Output: {self.out_dir}")
+        logger.info("%s", '=' * 70)
+        logger.info("Repository: %s", self.repo_path)
+        logger.info("Output: %s", self.out_dir)
 
     def run_autonomous_analysis(
         self,
-        languages: Optional[List[str]] = None,
-        build_commands: Optional[Dict[str, str]] = None,
+        languages: list[str] | None = None,
+        build_commands: dict[str, str] | None = None,
         force_db_creation: bool = False,
         use_extended: bool = False,
-        min_files: int = 3
+        min_files: int = 3,
+        traced_build: bool = False,
+    ) -> CodeQLWorkflowResult:
+        """Run scanning and publish triage data even on early failure paths."""
+        self._reporting_result = None
+        result = self._run_autonomous_analysis(
+            languages=languages, build_commands=build_commands,
+            force_db_creation=force_db_creation, use_extended=use_extended,
+            min_files=min_files, traced_build=traced_build,
+        )
+        from core.reporting.adapters import context_from_sarif
+        from core.reporting.document import StageEnvelope
+        from core.reporting.service import complete_reporting
+        try:
+            context = context_from_sarif(
+                [Path(p) for p in result.sarif_files], kind="codeql",
+                target=str(self.repo_path), run_id=self.out_dir.name,
+                stages=[StageEnvelope("codeql", "completed" if result.success else "failed",
+                                      diagnostics=list(result.errors), duration_seconds=result.duration_seconds)],
+            )
+            context.generated_at = result.timestamp
+            from core.reporting.lifecycle import apply_lifecycle
+            apply_lifecycle(context, self.out_dir, scope={"mode": "scanner-invocation", "target": str(self.repo_path)})
+            self._reporting_result = complete_reporting(context, self.out_dir, stem="codeql-report",
+                                                       options=getattr(self, "report_options", None))
+            for warning in self._reporting_result.diagnostics:
+                logger.warning("%s", warning)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("CodeQL triage reporting failed (%s); SARIF retained", type(exc).__name__)
+        return result
+
+    def _run_autonomous_analysis(
+        self,
+        languages: list[str] | None = None,
+        build_commands: dict[str, str] | None = None,
+        force_db_creation: bool = False,
+        use_extended: bool = False,
+        min_files: int = 3,
+        traced_build: bool = False,
     ) -> CodeQLWorkflowResult:
         """
         Run complete autonomous CodeQL analysis workflow.
@@ -216,17 +388,61 @@ class CodeQLAgent:
             force_db_creation: Force database recreation
             use_extended: Use extended security suites
             min_files: Minimum files to consider a language present
+            traced_build: Opt into traced-build extraction.
+                Default False: C/C++/Java/C# databases are created
+                with ``--build-mode=none`` and JS/TS/Python/Ruby
+                extract from source only — the untrusted repo's build
+                scripts never execute, and build detection is skipped
+                entirely for those languages.  An explicit per-language
+                entry in ``build_commands`` also opts that language in.
 
         Returns:
             CodeQLWorkflowResult with complete analysis results
         """
         errors = []
+        build_cleanup_paths: list[Path] = []
+
+        sage_build_cmd: str | None = None
+        sage_build_langs: str | None = None
+        try:
+            from core.sage.hooks import (
+                infer_codeql_build_from_sage_recall_row,
+                pick_strongest_recall_row,
+                recall_context_for_codeql_build,
+            )
+            rows = recall_context_for_codeql_build(
+                str(self.repo_path), languages)
+            best = pick_strongest_recall_row(rows, min_confidence=0.7)
+            hint = infer_codeql_build_from_sage_recall_row(best)
+            if hint.get("build_command"):
+                sage_build_cmd = hint["build_command"]
+                sage_build_langs = hint.get("languages", "")
+                logger.info(
+                    "SAGE: prior successful build command recalled: %s"
+                    " (languages: %s)",
+                    sage_build_cmd, sage_build_langs or "unknown",
+                )
+            elif hint.get("unverified_build_command"):
+                # Row failed MAC verification (or predates the row-MAC
+                # mechanism) — never auto-execute it. Surface it once
+                # so the operator can opt in explicitly.
+                logger.warning(
+                    "SAGE suggests build command %s (unverified) — "
+                    "pass --build-command to use it",
+                    hint["unverified_build_command"],
+                )
+        except ImportError:
+            # SAGE recall is best-effort. The hooks self-catch all
+            # transport/service failures (returning []/None/{}), so
+            # only a partial install's import can legitimately fail
+            # here; anything else is a wiring bug and must propagate.
+            pass
 
         try:
             # PHASE 1: Language Detection
-            logger.info(f"\n{'=' * 70}")
+            logger.info("\n%s", '=' * 70)
             logger.info("PHASE 1: LANGUAGE DETECTION")
-            logger.info(f"{'=' * 70}")
+            logger.info("%s", '=' * 70)
 
             if languages:
                 # Normalise operator-friendly aliases (c→cpp, js→
@@ -239,11 +455,12 @@ class CodeQLAgent:
                 normalised = [_normalise_language(lang) for lang in languages]
                 if normalised != [lang.strip().lower() for lang in languages]:
                     logger.info(
-                        f"Using specified languages: {', '.join(languages)} "
-                        f"(canonical: {', '.join(normalised)})"
+                        "Using specified languages: %s (canonical: %s)",
+                        ', '.join(languages),
+                        ', '.join(normalised)
                     )
                 else:
-                    logger.info(f"Using specified languages: {', '.join(normalised)}")
+                    logger.info("Using specified languages: %s", ', '.join(normalised))
                 detected = {}
                 for lang in normalised:
                     # Create minimal LanguageInfo for specified languages
@@ -257,24 +474,11 @@ class CodeQLAgent:
                     )
             else:
                 logger.info("Auto-detecting languages...")
-                detected = self.language_detector.detect_languages(min_files=min_files)
-                detected = self.language_detector.filter_codeql_supported(detected)
+                detected = self.language_detector.detect_languages_tiered(
+                    min_files=min_files, codeql_filter=True,
+                )
 
-                # Small-target retry. The default min_files=3 is a
-                # noise floor for monorepos but a footgun on tiny
-                # targets (single-file fixtures, minimal repros) —
-                # the detector sees the file, classifies it, then
-                # silently filters it out. If the first pass
-                # returns empty, drop the floor to 1 and warn so
-                # the operator knows we widened the criterion.
-                if not detected and min_files > 1:
-                    logger.warning(
-                        f"No languages met min_files={min_files} threshold; "
-                        f"retrying with min_files=1 (small target — single-file "
-                        f"fixtures and minimal repros land here)"
-                    )
-                    detected = self.language_detector.detect_languages(min_files=1)
-                    detected = self.language_detector.filter_codeql_supported(detected)
+            _collapse_shared_extractor_languages(detected)
 
             if not detected:
                 error = "No CodeQL-supported languages detected"
@@ -282,7 +486,7 @@ class CodeQLAgent:
                 return CodeQLWorkflowResult(
                     success=False,
                     repo_path=str(self.repo_path),
-                    timestamp=datetime.now().isoformat(),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
                     duration_seconds=time.time() - self.start_time,
                     languages_detected={},
                     databases_created={},
@@ -292,20 +496,79 @@ class CodeQLAgent:
                     errors=[error],
                 )
 
-            logger.info(f"\n✓ Detected {len(detected)} language(s):")
+            logger.info("\n✓ Detected %d language(s):", len(detected))
             for lang, info in detected.items():
-                logger.info(f"  - {lang}: {info.file_count} files (confidence: {info.confidence:.2f})")
+                logger.info(
+                    "  - %s: %s files (confidence: %.2f)", lang, info.file_count, info.confidence
+                )
 
             # PHASE 2: Build System Detection
-            logger.info(f"\n{'=' * 70}")
+            logger.info("\n%s", '=' * 70)
             logger.info("PHASE 2: BUILD SYSTEM DETECTION")
-            logger.info(f"{'=' * 70}")
+            logger.info("%s", '=' * 70)
 
             language_build_map = {}
-            for lang in detected.keys():
+            traced_languages = set()
+            buildless_languages = set()
+            for lang in detected:
+                if traced_build or (build_commands and lang in build_commands):
+                    # Operator explicitly opted this language into a
+                    # traced build (asserts trust in the repo).
+                    traced_languages.add(lang)
+                if (
+                    lang in SOURCE_EXTRACTED_LANGUAGES
+                    and lang not in traced_languages
+                ):
+                    # Source extraction needs no build. Generated sources
+                    # are included only when the operator opts into a
+                    # traced build, so skip build detection by default.
+                    language_build_map[lang] = (
+                        self.build_detector.generate_no_build_config(lang)
+                    )
+                    continue
+                if (
+                    lang in BUILDLESS_DEFAULT_LANGUAGES
+                    and lang not in traced_languages
+                ):
+                    # Buildless default (cpp/java/csharp): never run
+                    # build detection / synthesis for an untrusted
+                    # repo — `codeql database create --build-mode=none`
+                    # extracts without executing any repo code.
+                    supported, detail = (
+                        self.database_manager.supports_buildless(lang)
+                    )
+                    if not supported and lang == "cpp":
+                        # No safe alternative for C/C++ — skip rather
+                        # than silently run the repo's build.
+                        msg = (
+                            f"{lang}: buildless extraction unavailable "
+                            f"({detail}); skipping this language — pass "
+                            "--traced-build or --build-command to run a "
+                            "traced build on a repo you trust"
+                        )
+                        logger.warning(msg)
+                        errors.append(msg)
+                        continue
+                    if supported:
+                        logger.info(
+                            "%s: buildless mode (--build-mode=none) — repo "
+                            "build scripts will not execute", lang,
+                        )
+                        buildless_languages.add(lang)
+                        language_build_map[lang] = (
+                            self.build_detector.generate_no_build_config(lang)
+                        )
+                        continue
+                    # java/csharp on a CLI without buildless: keep the
+                    # pre-existing traced/autobuild behaviour, loudly
+                    # disclosed via the untrusted-build banner below.
+                    logger.warning(
+                        "%s: buildless extraction unavailable (%s) — "
+                        "keeping the traced/autobuild path", lang, detail,
+                    )
                 if build_commands and lang in build_commands:
                     # Use custom build command
-                    logger.info(f"{lang}: Using custom build command")
+                    logger.info("%s: Using custom build command", lang)
                     language_build_map[lang] = BuildSystem(
                         type="custom",
                         command=build_commands[lang],
@@ -318,57 +581,88 @@ class CodeQLAgent:
                     # Auto-detect build system
                     build_system = self.build_detector.detect_build_system(lang)
                     if build_system:
+                        build_cleanup_paths.extend(build_system.cleanup_paths)
                         # Validate build system
                         valid = self.build_detector.validate_build_command(build_system)
                         if not valid:
-                            logger.warning(f"Build system validation failed for {lang}, using no-build mode")
+                            logger.warning(
+                                "Build system validation failed for %s, using no-build mode", lang
+                            )
                             build_system = self.build_detector.generate_no_build_config(lang)
                     else:
                         # Try to synthesise a build command for compiled languages
                         build_system = self.build_detector.synthesise_build_command(lang)
+                        if build_system:
+                            build_cleanup_paths.extend(build_system.cleanup_paths)
+                        _sage_lang_set = {
+                            s.strip()
+                            for s in (sage_build_langs or "").split(",")
+                        } if sage_build_langs else set()
+                        if (
+                            not build_system
+                            and sage_build_cmd
+                            and lang in _sage_lang_set
+                        ):
+                            logger.info(
+                                "SAGE: using prior build command for %s", lang)
+                            build_system = BuildSystem(
+                                type="sage_prior",
+                                command=sage_build_cmd,
+                                working_dir=self.repo_path,
+                                env_vars={},
+                                confidence=0.7,
+                                detected_files=[],
+                            )
                         if not build_system:
                             # Interpreted language or no source files — use no-build mode
                             build_system = self.build_detector.generate_no_build_config(lang)
 
                     language_build_map[lang] = build_system
 
-            # PHASE 3: Database Creation
-            logger.info(f"\n{'=' * 70}")
-            logger.info("PHASE 3: DATABASE CREATION")
-            logger.info(f"{'=' * 70}")
-
-            db_results = self.database_manager.create_databases_parallel(
-                self.repo_path,
-                language_build_map,
-                force=force_db_creation,
-                audit_run_dir=self.out_dir,
+            # Untrusted traced-build disclosure. Any language whose
+            # `database create` will execute repo build logic (an
+            # explicit command or the CodeQL autobuilder) without the
+            # operator's trust assertion gets a loud banner here AND
+            # a record in the run metadata (the per-create chokepoint
+            # in DatabaseManager repeats the warning).
+            untrusted_build_languages = sorted(
+                lang for lang, bs in language_build_map.items()
+                if lang not in traced_languages
+                and lang not in buildless_languages
+                and (
+                    (bs is not None and bs.command)
+                    or lang in AUTOBUILD_LANGUAGES
+                )
             )
+            if untrusted_build_languages:
+                logger.warning("%s", "=" * 70)
+                logger.warning(
+                    "⚠️  Traced build without the build trust marker: %s — "
+                    "the repository's build logic will execute during "
+                    "database creation (sandboxed, network blocked). If "
+                    "you trust this repo, acknowledge with --traced-build "
+                    "or `/project trust build`.",
+                    ", ".join(untrusted_build_languages),
+                )
+                logger.warning("%s", "=" * 70)
 
-            # Clean up synthesised build artifacts. Per-path try
-            # / except so one cleanup failure doesn't abort the
-            # whole sweep, and `is_dir()` / `is_file()` short-
-            # circuit if the path was already removed (idempotent
-            # under retry). `is_*` follows symlinks by default —
-            # use `follow_symlinks=False`-equivalent behaviour
-            # via `is_symlink()` short-circuit so we DELETE the
-            # symlink itself rather than its target (which could
-            # be in the user's repo or somewhere else entirely
-            # that we never put data into).
-            import shutil
-            for bs in language_build_map.values():
-                for p in getattr(bs, 'cleanup_paths', None) or []:
-                    try:
-                        # Symlink → unlink the link, never follow.
-                        if p.is_symlink():
-                            p.unlink()
-                        elif p.is_dir():
-                            shutil.rmtree(p)
-                        elif p.is_file():
-                            p.unlink()
-                    except OSError as e:
-                        logger.debug(
-                            "cleanup of %s failed: %s — continuing", p, e,
-                        )
+            # PHASE 3: Database Creation
+            logger.info("\n%s", '=' * 70)
+            logger.info("PHASE 3: DATABASE CREATION")
+            logger.info("%s", '=' * 70)
+
+            try:
+                db_results = self.database_manager.create_databases_parallel(
+                    self.repo_path,
+                    language_build_map,  # type: ignore[arg-type]
+                    force=force_db_creation,
+                    audit_run_dir=self.out_dir,
+                    traced_languages=traced_languages,
+                )
+            finally:
+                # Release scratch as soon as database creation finishes.
+                # The outer finally covers failures in build detection too.
+                cleanup_build_paths(build_cleanup_paths, preserve_error=sys.exc_info()[0] is not None)
 
             # Check for failures
             successful_dbs = {
@@ -384,9 +678,9 @@ class CodeQLAgent:
             }
 
             if failed_dbs:
-                logger.warning(f"\n⚠ {len(failed_dbs)} database(s) failed to create:")
+                logger.warning("\n⚠ %d database(s) failed to create:", len(failed_dbs))
                 for lang, result in failed_dbs.items():
-                    logger.warning(f"  - {lang}: {', '.join(result.errors[:2])}")
+                    logger.warning("  - %s: %s", lang, ', '.join(result.errors[:2]))
                     errors.extend(result.errors)
 
             if not successful_dbs:
@@ -395,7 +689,7 @@ class CodeQLAgent:
                 return CodeQLWorkflowResult(
                     success=False,
                     repo_path=str(self.repo_path),
-                    timestamp=datetime.now().isoformat(),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
                     duration_seconds=time.time() - self.start_time,
                     languages_detected=detected,
                     databases_created=db_results,
@@ -403,17 +697,37 @@ class CodeQLAgent:
                     total_findings=0,
                     sarif_files=[],
                     errors=[error] + errors,
+                    untrusted_build_languages=untrusted_build_languages,
                 )
 
-            logger.info(f"\n✓ Created {len(successful_dbs)} database(s):")
-            for lang in successful_dbs.keys():
+            logger.info("\n✓ Created %d database(s):", len(successful_dbs))
+            for lang in successful_dbs:
                 cached = " (cached)" if db_results[lang].cached else ""
-                logger.info(f"  - {lang}{cached}")
+                logger.info("  - %s%s", lang, cached)
 
             # PHASE 4: Security Analysis
-            logger.info(f"\n{'=' * 70}")
+            logger.info("\n%s", '=' * 70)
             logger.info("PHASE 4: SECURITY ANALYSIS")
-            logger.info(f"{'=' * 70}")
+            logger.info("%s", '=' * 70)
+
+            # Source-wrapper summaries (mechanical, LLM-free): helper
+            # methods whose return provably carries servlet-request
+            # data become models-as-data sourceModel rows the STANDARD
+            # java suite consumes via --additional-packs — the taint
+            # enters through constructor-stored fields the engine's
+            # default tracking declines. Additive detection only;
+            # failures degrade to a warning.
+            source_summaries_cell = self._run_source_summaries_pass(
+                successful_dbs)
+
+            # Taint-pack models-as-data augmentation (default off; the
+            # --taint-crossfile flag family enables it): the shipped
+            # taint seed packs plus the project's operator-grade IRIS
+            # rows are staged into the standard python/javascript
+            # suites, and the run records exactly which sink surfaces
+            # were augmented. Additive detection only.
+            taint_mad_cell = self._run_taint_pack_models_pass(
+                successful_dbs)
 
             analysis_results = self.query_runner.analyze_all_databases(
                 successful_dbs,
@@ -431,38 +745,113 @@ class CodeQLAgent:
                 successful_dbs, self.out_dir,
             )
 
+            # Curated in-repo query pass — the hand-written packs
+            # under engine/codeql/queries/<lang>/ (cpp use-after-move,
+            # java XXE, ...). Empty dict when no curated pack exists
+            # for any of the languages we built DBs for. Failures
+            # degrade to a warning inside the runner; they never kill
+            # the scan in connected mode. Offline mode treats missing
+            # coverage as failure below.
+            curated_results = self.query_runner.analyze_curated_packs(
+                successful_dbs, self.out_dir,
+            )
+
             # Collect SARIF files and count findings
             sarif_files = []
             total_findings = 0
 
-            for lang, result in analysis_results.items():
-                if result.success and result.sarif_path:
-                    sarif_files.append(str(result.sarif_path))
-                    total_findings += result.findings_count
-                    logger.info(f"  - {lang}: {result.findings_count} findings")
+            for lang, result in analysis_results.items():  # type: ignore[assignment]
+                if result.success and result.sarif_path:  # type: ignore[attr-defined]
+                    sarif_files.append(str(result.sarif_path))  # type: ignore[attr-defined]
+                    total_findings += result.findings_count  # type: ignore[attr-defined]
+                    logger.info("  - %s: %s findings", lang, result.findings_count)  # type: ignore[attr-defined]
                 else:
-                    logger.error(f"  - {lang}: Analysis failed")
+                    logger.error("  - %s: Analysis failed", lang)
                     errors.extend(result.errors)
 
-            for lang, result in iris_results.items():
-                if result.success and result.sarif_path:
-                    sarif_files.append(str(result.sarif_path))
-                    total_findings += result.findings_count
-                    if result.findings_count:
+            for lang, result in iris_results.items():  # type: ignore[assignment]
+                if result.success and result.sarif_path:  # type: ignore[attr-defined]
+                    sarif_files.append(str(result.sarif_path))  # type: ignore[attr-defined]
+                    total_findings += result.findings_count  # type: ignore[attr-defined]
+                    if result.findings_count:  # type: ignore[attr-defined]
                         logger.info(
-                            f"  - {lang} IRIS LocalFlowSource: "
-                            f"{result.findings_count} extra findings"
+                            "  - %s IRIS LocalFlowSource: %s extra findings",
+                            lang,
+                            result.findings_count  # type: ignore[attr-defined]
                         )
 
+            for lang, result in curated_results.items():  # type: ignore[assignment]
+                if result.success and result.sarif_path:  # type: ignore[attr-defined]
+                    sarif_files.append(str(result.sarif_path))  # type: ignore[attr-defined]
+                    total_findings += result.findings_count  # type: ignore[attr-defined]
+                    if result.findings_count:  # type: ignore[attr-defined]
+                        logger.info(
+                            "  - %s curated queries: %s extra findings",
+                            lang,
+                            result.findings_count  # type: ignore[attr-defined]
+                        )
+
+            # Standard-vs-IRIS overlap: when the standard suite ran
+            # with threat models AND the IRIS pass produced SARIFs,
+            # log the per-(lang, CWE) counts. Pure diagnostics for the
+            # "is IRIS subsumed by --threat-model=local?" question.
+            if RaptorConfig.CODEQL_OFFLINE:
+                for label, results in (('IRIS', iris_results), ('curated', curated_results)):
+                    for language, query_result in results.items():
+                        if not query_result.success:
+                            errors.append(f'Offline {label} analysis failed for {language}')
+                            errors.extend(query_result.errors)
+
+            threat_model_overlap = None
+            if self.query_runner.active_threat_models():
+                iris_langs = [
+                    lang for lang, r in iris_results.items()
+                    if r.success and r.sarif_path
+                ]
+                if iris_langs:
+                    from packages.codeql.query_runner import (
+                        iris_overlap_summary,
+                    )
+                    threat_model_overlap = iris_overlap_summary(
+                        self.out_dir, iris_langs,
+                    ) or None
+                    if threat_model_overlap:
+                        for lang, cells in threat_model_overlap.items():
+                            logger.info(
+                                "  - %s standard-vs-IRIS overlap: "
+                                "standard=%s iris=%s",
+                                lang, cells["standard"], cells["iris"],
+                            )
+
+            # Learned-models measurement pass: emit the project's
+            # tool-corroborated IRIS taint specs as a models-as-data
+            # pack and measure baseline-vs-augmented over a small
+            # per-language query set. Augmented-only findings join
+            # sarif_files as candidates (provenance=learned-model);
+            # suppressed ids are recorded, never dropped from the
+            # standard results. Failures degrade to a warning.
+            learned_models = self._run_learned_models_pass(successful_dbs)
+            for lang, cell in (learned_models or {}).items():
+                sarif = cell.get("candidates_sarif")
+                if sarif:
+                    sarif_files.append(sarif)
+                    total_findings += cell.get("candidates", 0)
+                    logger.info(
+                        "  - %s learned models: %s candidate finding(s)",
+                        lang, cell.get("candidates", 0),
+                    )
+
             # PHASE 5: Generate Report
-            logger.info(f"\n{'=' * 70}")
+            logger.info("\n%s", '=' * 70)
             logger.info("PHASE 5: REPORT GENERATION")
-            logger.info(f"{'=' * 70}")
+            logger.info("%s", '=' * 70)
 
             workflow_result = CodeQLWorkflowResult(
-                success=len(sarif_files) > 0,
+                success=_workflow_success(analysis_results,
+                                          additional_results=(iris_results, curated_results),
+                                          database_results=db_results),
                 repo_path=str(self.repo_path),
-                timestamp=datetime.now().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 duration_seconds=time.time() - self.start_time,
                 languages_detected=detected,
                 databases_created=db_results,
@@ -470,6 +859,11 @@ class CodeQLAgent:
                 total_findings=total_findings,
                 sarif_files=sarif_files,
                 errors=errors,
+                threat_model_overlap=threat_model_overlap,
+                learned_models=learned_models,
+                source_summaries=source_summaries_cell,
+                taint_mad=taint_mad_cell,
+                untrusted_build_languages=untrusted_build_languages,
             )
 
             # Save report
@@ -478,11 +872,12 @@ class CodeQLAgent:
             return workflow_result
 
         except Exception as e:
-            logger.error(f"Workflow failed with exception: {e}", exc_info=True)
+            # RaptorLogger has no .exception method
+            logger.error("Workflow failed with exception: %s", e, exc_info=True)  # noqa: G201
             return CodeQLWorkflowResult(
                 success=False,
                 repo_path=str(self.repo_path),
-                timestamp=datetime.now().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 duration_seconds=time.time() - self.start_time,
                 languages_detected={},
                 databases_created={},
@@ -491,8 +886,322 @@ class CodeQLAgent:
                 sarif_files=[],
                 errors=[str(e)] + errors,
             )
+        finally:
+            # Acquired builds belong to this invocation, even if a later
+            # language fails before database creation or cancellation escapes.
+            # Only failed removals remain after the earlier sweep.
+            cleanup_build_paths(build_cleanup_paths, preserve_error=sys.exc_info()[0] is not None)
 
-    def _save_report(self, result: CodeQLWorkflowResult):
+    def _run_source_summaries_pass(self, successful_dbs) -> dict | None:
+        """Derive Java source-wrapper summaries and stage their
+        models-as-data pack for the standard suite run. Returns the
+        report cell (or None when skipped)."""
+        from core.config import RaptorConfig as _RC
+        if not getattr(_RC, "CODEQL_SOURCE_SUMMARIES_ENABLED", True):
+            return None
+        if "java" not in successful_dbs:
+            return None
+        try:
+            from core.analysis.java_source_summaries import (
+                rows_from_source_summaries,
+                scan_tree,
+            )
+            from core.dataflow.extension_pack import write_extension_pack
+            summaries, refusals, scanned = scan_tree(self.repo_path)
+            if not summaries:
+                logger.info(
+                    "source-summaries: no qualifying wrappers "
+                    "(%d files)", scanned)
+                return {"wrappers": 0, "files_scanned": scanned}
+            out = self.out_dir / "source-summaries"
+            result = write_extension_pack(
+                rows_from_source_summaries(summaries),
+                language="java", out_dir=out,
+            )
+            if result.rows_written == 0:
+                logger.warning(
+                    "source-summaries: every derived row was rejected "
+                    "at emission (%d rejections)", len(result.rejected))
+                return {"wrappers": len(summaries), "rows_written": 0}
+            packs = dict(self.query_runner.additional_model_packs or {})
+            packs.setdefault("java", []).append(
+                (str(out), result.pack_name))
+            self.query_runner.additional_model_packs = packs
+            logger.info(
+                "source-summaries: %d wrapper(s) → %d sourceModel "
+                "row(s); pack staged for the java suite",
+                len(summaries), result.rows_written)
+            return {
+                "wrappers": len(summaries),
+                "rows_written": result.rows_written,
+                "pack_dir": str(result.pack_dir),
+                "refusals": dict(refusals),
+            }
+        except Exception as exc:  # noqa: BLE001 — never kill the scan
+            logger.warning("source-summaries pass failed: %s", exc)
+            return None
+
+    def _run_taint_pack_models_pass(self, successful_dbs) -> dict | None:
+        """Stage the taint seed packs as models-as-data for the
+        standard suites, and record what was augmented.
+
+        Per augmentable language (python, javascript) with a
+        successful DB: convert the shipped taint packs
+        (:func:`core.taint.mad_rows.rows_from_pack_set`) plus the
+        project's IRIS taint specs — the IRIS batch passes through
+        :func:`~core.taint.mad_rows.enforce_mad_provenance`, so
+        learned rows may only widen (source/sink) while summary rows
+        require operator-grade provenance and barrier rows never
+        emit. The emitted pack is staged into
+        ``query_runner.additional_model_packs`` so the STANDARD suite
+        run consumes it via ``--additional-packs``, and the run
+        writes ``taint-mad-augmentation.json`` naming exactly which
+        sink kinds/classes/CWEs got rows — the record a consumer
+        needs before treating an augmented no-flow result as
+        informative for a given sink surface.
+
+        Default off (``RaptorConfig.CODEQL_TAINT_MAD_ENABLED``) —
+        zero cost when disabled. Returns the per-language record
+        cells, or None when disabled / no language qualifies / no
+        rows survived. Failures degrade to a warning; they never
+        kill the scan.
+        """
+        if not getattr(RaptorConfig, "CODEQL_TAINT_MAD_ENABLED", False):
+            return None
+        langs = [lang for lang in ("python", "javascript")
+                 if lang in successful_dbs]
+        if not langs:
+            return None
+        try:
+            from core.dataflow.extension_pack import (
+                ROLE_SINK,
+                rows_from_taint_specs,
+                write_extension_pack,
+            )
+            from core.taint.mad_rows import (
+                AugmentationCell,
+                augmented_surfaces,
+                enforce_mad_provenance,
+                rows_from_pack_set,
+                write_augmentation_record,
+            )
+            from core.taint.packs import default_pack_names, load_packs
+        except ImportError:
+            logger.debug("taint-mad pass unavailable", exc_info=True)
+            return None
+
+        specs: list = []
+        try:
+            from core.iris.api import load_project_specs
+            specs = load_project_specs(
+                out_dir=self.out_dir, target_path=self.repo_path,
+            ) or []
+        except Exception:  # noqa: BLE001 — the pack channel still runs
+            logger.debug("taint-mad: IRIS spec load failed", exc_info=True)
+
+        cells = []
+        for lang in langs:
+            try:
+                names = default_pack_names(lang)
+                pack_set = load_packs(names, target_root=self.repo_path)
+                conv = rows_from_pack_set(pack_set, language=lang)
+                rows = list(conv.rows)
+                rejected = list(conv.rejected)
+                iris_rows = 0
+                tier_counts: dict[str, int] = {}
+                if specs:
+                    iris_conv = rows_from_taint_specs(specs, language=lang)
+                    seam = enforce_mad_provenance(
+                        iris_conv.rows, language=lang)
+                    rows.extend(seam.rows)
+                    rejected.extend(iris_conv.rejected)
+                    rejected.extend(seam.rejected)
+                    iris_rows = len(seam.rows)
+                    for spec in specs:
+                        tier = getattr(
+                            spec.evidence_tier, "value",
+                            str(spec.evidence_tier))
+                        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+                if not rows:
+                    logger.info(
+                        "taint-mad: %s produced no rows "
+                        "(%d refusal(s))", lang, len(rejected))
+                    continue
+                out = self.out_dir / "taint-mad" / lang
+                result = write_extension_pack(
+                    rows, language=lang, out_dir=out,
+                    pack_name=f"raptor/taint-mad-{lang}",
+                )
+                rejected.extend(result.rejected)
+                if result.rows_written == 0:
+                    logger.warning(
+                        "taint-mad: every %s row was rejected at "
+                        "emission (%d rejection(s))",
+                        lang, len(result.rejected))
+                    continue
+                packs_cfg = dict(
+                    self.query_runner.additional_model_packs or {})
+                packs_cfg.setdefault(lang, []).append(
+                    (str(out), result.pack_name))
+                self.query_runner.additional_model_packs = packs_cfg
+                classes, cwes, source_kinds = augmented_surfaces(
+                    pack_set, rows)
+                provenance_counts: dict[str, int] = {}
+                for row in rows:
+                    provenance_counts[row.provenance] = (
+                        provenance_counts.get(row.provenance, 0) + 1)
+                cells.append(AugmentationCell(
+                    language=lang,
+                    pack_name=result.pack_name,
+                    pack_dir=str(result.pack_dir),
+                    model_file=str(result.model_file),
+                    packs=tuple(names),
+                    rows_written=result.rows_written,
+                    counts=tuple(sorted(result.counts.items())),
+                    augmented_sink_kinds=tuple(sorted({
+                        r.model_kind for r in rows
+                        if r.role == ROLE_SINK
+                    })),
+                    augmented_sink_classes=classes,
+                    augmented_cwes=cwes,
+                    augmented_source_kinds=source_kinds,
+                    summary_rows=int(
+                        result.counts.get("summaryModel", 0)),
+                    row_provenance=tuple(
+                        sorted(provenance_counts.items())),
+                    iris_specs=len(specs),
+                    iris_rows=iris_rows,
+                    iris_evidence_tiers=tuple(
+                        sorted(tier_counts.items())),
+                    rejected=tuple(rejected),
+                ))
+                logger.info(
+                    "taint-mad: %s pack staged for the standard suite "
+                    "(%d row(s): %s; %d refusal(s))",
+                    lang, result.rows_written,
+                    ", ".join(f"{k}={v}"
+                              for k, v in sorted(result.counts.items())),
+                    len(rejected),
+                )
+            except Exception as exc:  # noqa: BLE001 — never kill the scan
+                logger.warning("taint-mad pass failed for %s: %s",
+                               lang, exc)
+        if not cells:
+            return None
+        try:
+            write_augmentation_record(self.out_dir, cells)
+        except Exception as exc:  # noqa: BLE001 — record is best-effort
+            logger.warning("taint-mad: record write failed: %s", exc)
+        return {c.language: c.to_dict() for c in cells}
+
+    def _run_learned_models_pass(self, successful_dbs) -> dict | None:
+        """Emit learned taint specs as a model pack and measure the diff.
+
+        Per emitter-supported language with a successful DB: load the
+        project's IRIS specs, convert (the converter enforces the
+        XREF_BACKED tier + confidence gates and refuses unverified
+        provenance), run the baseline-vs-augmented measurement over
+        that language's small in-repo query set, and surface
+        augmented-only findings as a candidates SARIF (every result
+        tagged ``provenance=learned-model``) so they enter the normal
+        validation stream. Suppressed ids are recorded in the report
+        cell only — the standard-suite results are never filtered.
+
+        Returns a per-language dict, or None when the pass is disabled,
+        no language qualifies, or no specs survived conversion.
+        Failures degrade to a warning; they never kill the scan.
+        """
+        if not RaptorConfig.CODEQL_LEARNED_MODELS_ENABLED:
+            return None
+        try:
+            from core.dataflow.codeql_augmented_run import (
+                run_learned_models_measurement,
+            )
+            from core.dataflow.extension_pack import (
+                SUPPORTED_LANGUAGES,
+                rows_from_taint_specs,
+            )
+            from core.iris.api import load_project_specs
+        except ImportError:
+            logger.debug("learned-models pass unavailable", exc_info=True)
+            return None
+
+        query_roots = {
+            "cpp": RaptorConfig.CODEQL_QUERIES_DIR / "cpp",
+            "python": (
+                RaptorConfig.EXTRA_CODEQL_PACK_ROOTS[0] / "python-queries"
+                if RaptorConfig.EXTRA_CODEQL_PACK_ROOTS else None
+            ),
+        }
+
+        try:
+            specs = load_project_specs(
+                out_dir=self.out_dir, target_path=self.repo_path,
+            )
+        except Exception:
+            logger.debug("IRIS spec load failed", exc_info=True)
+            return None
+        if not specs:
+            return None
+
+        out: dict[str, dict] = {}
+        for lang, db in successful_dbs.items():
+            if lang not in SUPPORTED_LANGUAGES:
+                continue
+            root = query_roots.get(lang)
+            if root is None or not root.is_dir():
+                continue
+            # successful_dbs maps lang -> database path (dict[str, Path],
+            # the same shape analyze_all_databases consumes) — the values
+            # are NOT result objects, so reading a .database_path
+            # attribute here silently skipped every language and
+            # dead-coded the whole pass.
+            db_path = db
+            if not db_path:
+                continue
+            conv = rows_from_taint_specs(specs, language=lang)
+            if not conv.rows:
+                if conv.rejected:
+                    logger.info(
+                        "  - %s learned models: 0 rows survived "
+                        "conversion (%d rejected)", lang, len(conv.rejected),
+                    )
+                continue
+            try:
+                measurement = run_learned_models_measurement(
+                    Path(db_path),
+                    [str(root)],
+                    conv.rows,
+                    language=lang,
+                    out_dir=self.out_dir / "learned-models" / lang,
+                )
+            except Exception as e:  # noqa: BLE001 — degrade, never kill
+                logger.warning("learned-models measurement failed for %s: %s",
+                               lang, e)
+                continue
+            diff = measurement.diff
+            candidates_sarif = None
+            n_candidates = 0
+            if diff.new_ids:
+                candidates_sarif = _write_candidates_sarif(
+                    measurement.augmented.sarif_path,
+                    set(diff.new_ids),
+                    self.out_dir / f"codeql_{lang}_learned.sarif",
+                )
+                if candidates_sarif:
+                    n_candidates = len(diff.new_ids)
+            out[lang] = {
+                "rows_written": measurement.pack.rows_written,
+                "rows_rejected": len(conv.rejected) + len(measurement.pack.rejected),
+                "baseline_count": diff.baseline_count,
+                "augmented_count": diff.augmented_count,
+                "suppressed_ids": list(diff.suppressed_ids),
+                "candidates": n_candidates,
+                "candidates_sarif": candidates_sarif,
+            }
+        return out or None
+
+    def _save_report(self, result: CodeQLWorkflowResult) -> None:
         """Save workflow report to JSON.
 
         Pre-fix `save_json(..., result.to_dict())` failed entirely if
@@ -515,10 +1224,10 @@ class CodeQLAgent:
 
         try:
             save_json(report_path, result.to_dict())
-            logger.info(f"✓ Report saved: {report_path}")
+            logger.info("✓ Report saved: %s", report_path)
             return
-        except Exception as e:
-            logger.error(f"Failed to save full report: {e}")
+        except Exception as e:  # noqa: BLE001 — fall through to minimal report
+            logger.error("Failed to save full report: %s", e)
         # Fallback: minimal report with stats we know are JSON-safe.
         try:
             minimal = {
@@ -531,28 +1240,33 @@ class CodeQLAgent:
                 "error": "to_dict() raised mid-serialization; see raptor.log",
             }
             save_json(report_path, minimal)
-            logger.info(f"✓ Minimal-fallback report saved: {report_path}")
-        except Exception as e2:
-            logger.error(f"Minimal report also failed: {e2}")
+            logger.info("✓ Minimal-fallback report saved: %s", report_path)
+        except Exception as e2:  # noqa: BLE001 — report is best-effort
+            logger.error("Minimal report also failed: %s", e2)
 
-    def print_summary(self, result: CodeQLWorkflowResult):
+    def print_summary(self, result: CodeQLWorkflowResult) -> None:
         """Print workflow summary."""
+        reporting = getattr(self, "_reporting_result", None)
+        if reporting is not None:
+            from core.reporting.summary import render_operator_summary
+            print(render_operator_summary(reporting.summary), end="")
+            return
         print(f"\n{'=' * 70}")
         print("CODEQL ANALYSIS SUMMARY")
         print(f"{'=' * 70}")
-        print(f"Repository: {result.repo_path}")
+        print(f"Repository: {sanitise_for_terminal(str(result.repo_path))}")
         print(f"Duration: {result.duration_seconds:.1f}s")
         print(f"Status: {'✓ SUCCESS' if result.success else '✗ FAILED'}")
         print(f"\nLanguages detected: {len(result.languages_detected)}")
         print(f"Databases created: {len([r for r in result.databases_created.values() if r.success])}")
         print(f"Analyses completed: {len([r for r in result.analyses_completed.values() if r.success])}")
-        print(f"\nTotal findings: {result.total_findings}")
+        print(f"\nTotal findings: {sanitise_for_terminal(str(result.total_findings))}")
         print(f"SARIF files: {len(result.sarif_files)}")
 
         # Count dataflow paths across all SARIF files
         total_dataflow_paths = 0
         total_dataflow_steps = 0
-        dataflow_examples = []
+        dataflow_examples: list[dict[str, Any]] = []
 
         if result.sarif_files:
             from core.sarif.parser import load_sarif as _load_sarif
@@ -579,7 +1293,7 @@ class CodeQLAgent:
                     dataflow_examples.extend(examples)
 
         if total_dataflow_paths > 0:
-            print(f"\nDataflow Analysis:")
+            print("\nDataflow Analysis:")
             print(f"  Findings with dataflow paths: {total_dataflow_paths}")
             avg_steps = total_dataflow_steps / total_dataflow_paths if total_dataflow_paths > 0 else 0
             print(f"  Average path length: {avg_steps:.1f} steps")
@@ -591,18 +1305,26 @@ class CodeQLAgent:
         if result.sarif_files:
             print("\nSARIF outputs:")
             for sarif in result.sarif_files:
-                print(f"  - {sarif}")
+                print(f"  - {sanitise_for_terminal(str(sarif))}")
 
         if result.errors:
             print(f"\nErrors encountered: {len(result.errors)}")
             for error in result.errors[:5]:  # Show first 5 errors
-                print(f"  - {error[:100]}")
+                # result.errors carry codeql/build stderr — output of
+                # the scanned repo's build scripts on traced builds and
+                # extractor diagnostics quoting hostile source. Escape
+                # before it reaches the operator's terminal (ANSI/OSC/
+                # bidi injection): this is a bare print(), which
+                # bypasses core.logging's console chokepoint
+                # (EscapingConsoleFormatter escapes logger-routed
+                # lines only), so the per-site escape is load-bearing.
+                print(f"  - {sanitise_for_terminal(error, max_len=100)}")
 
-        print(f"\nOutput directory: {self.out_dir}")
+        print(f"\nOutput directory: {sanitise_for_terminal(str(self.out_dir))}")
         print(f"{'=' * 70}\n")
 
     def _extract_dataflow_examples(self, sarif_path: Path, limit: int = 5,
-                                    *, sarif_data: Optional[Dict] = None) -> list:
+                                    *, sarif_data: object = _SARIF_DATA_UNSET) -> list:
         """Extract example dataflow paths from SARIF for visualization.
 
         Pre-fix this always called `load_sarif(sarif_path)`. The
@@ -614,15 +1336,15 @@ class CodeQLAgent:
 
         Accept optional pre-loaded `sarif_data` so the caller can
         share the parse result across both helpers. Falls back to
-        `load_sarif` when the caller doesn't provide it (preserves
-        the standalone-call API).
+        `load_sarif` when the caller omits it (preserves the standalone-call
+        API). Explicit None preserves a failed prior load without reopening.
         """
-        examples = []
+        examples: list[dict[str, Any]] = []
         try:
-            if sarif_data is None:
+            if sarif_data is _SARIF_DATA_UNSET:
                 from core.sarif.parser import load_sarif
                 sarif_data = load_sarif(sarif_path)
-            if not sarif_data:
+            if not sarif_data or not isinstance(sarif_data, dict):
                 return examples
 
             for run in sarif_data.get("runs", []):
@@ -636,7 +1358,7 @@ class CodeQLAgent:
 
                     # Extract path information
                     rule_id = result.get("ruleId", "unknown")
-                    message = result.get("message", {}).get("text", "")
+                    message = (result.get("message") or {}).get("text", "")
 
                     # Get the dataflow path
                     flow = code_flows[0]
@@ -674,53 +1396,79 @@ class CodeQLAgent:
                         if not p:
                             return ""
                         return p.replace("\\", "/").rsplit("/", 1)[-1]
+
+                    # Rule ids, messages, and file paths come from
+                    # SARIF over the untrusted repo and are printed to
+                    # the operator's terminal by _print_dataflow_table
+                    # — escape control/bidi characters at extraction so
+                    # every consumer of the example dicts gets inert
+                    # text.
+                    from core.security.log_sanitisation import (
+                        sanitise_for_terminal as _term,
+                    )
                     examples.append({
-                        "rule": rule_id.split("/")[-1] if "/" in rule_id else rule_id,
-                        "message": message[:60] + "..." if len(message) > 60 else message,
-                        "source": f"{_basename(source_file)}:{source_line}",
-                        "sink": f"{_basename(sink_file)}:{sink_line}",
+                        "rule": _term(
+                            rule_id.split("/")[-1] if "/" in rule_id
+                            else rule_id,
+                            max_len=64,
+                        ),
+                        "message": _term(message, max_len=60),
+                        "source": _term(
+                            f"{_basename(source_file)}:{source_line}",
+                            max_len=80,
+                        ),
+                        "sink": _term(
+                            f"{_basename(sink_file)}:{sink_line}",
+                            max_len=80,
+                        ),
                         "steps": len(locations)
                     })
 
-        except Exception as e:
-            logger.debug(f"Failed to extract dataflow examples: {e}")
+        except Exception as e:  # noqa: BLE001 — display-only helper
+            logger.debug("Failed to extract dataflow examples: %s", e)
 
         return examples
 
-    def _print_dataflow_table(self, dataflow_examples: list):
+    def _print_dataflow_table(self, dataflow_examples: list) -> None:
         """Print dataflow paths in a formatted table."""
+        # Enforce the display boundary even for callers that bypass extraction.
+        dataflow_examples = [
+            {"rule": sanitise_for_terminal(str(example.get("rule", "")), max_len=80),
+             "source": sanitise_for_terminal(str(example.get("source", "")), max_len=80),
+             "sink": sanitise_for_terminal(str(example.get("sink", "")), max_len=80),
+             "steps": example.get("steps") if type(example.get("steps")) is int and example["steps"] >= 0 else 0}
+            for example in dataflow_examples[:5] if isinstance(example, dict)
+        ]
         try:
             from tabulate import tabulate
 
-            print(f"\n  Example Dataflow Paths:")
+            print("\n  Example Dataflow Paths:")
 
-            table_data = []
-            for example in dataflow_examples:
-                table_data.append([
+            table_data = [[
                     example["rule"],
                     example["source"],
-                    "→" * (example["steps"] - 1),
+                    "→" * min(10, max(0, example["steps"] - 1)),
                     example["sink"],
                     example["steps"]
-                ])
+                ] for example in dataflow_examples]
 
             headers = ["Rule", "Source", "Flow", "Sink", "Steps"]
             table = tabulate(table_data, headers=headers, tablefmt="simple", maxcolwidths=[20, 25, 10, 25, 5])
 
             # Indent the table
-            for line in table.split('\n'):
+            for line in table.split('\n'):  # line-model: tabulate-generated display text
                 print(f"  {line}")
 
         except ImportError:
             # Fallback to simple formatting if tabulate not available
-            print(f"\n  Example Dataflow Paths:")
+            print("\n  Example Dataflow Paths:")
             for i, example in enumerate(dataflow_examples, 1):
-                print(f"    {i}. {example['rule']}: {example['source']} → {example['sink']} ({example['steps']} steps)")
-        except Exception as e:
-            logger.debug(f"Failed to print dataflow table: {e}")
+                print(f"    {i}. {sanitise_for_terminal(example['rule'])}: {sanitise_for_terminal(example['source'])} → {sanitise_for_terminal(example['sink'])} ({example['steps']} steps)")
+        except Exception as e:  # noqa: BLE001 — display-only helper
+            logger.debug("Failed to print dataflow table: %s", e)
 
 
-def main():
+def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="RAPTOR CodeQL Agent - Autonomous CodeQL Security Analysis",
@@ -748,6 +1496,19 @@ Examples:
     parser.add_argument("--repo", required=True, help="Repository path to analyze")
     parser.add_argument("--languages", help="Comma-separated languages (auto-detected if not specified)")
     parser.add_argument("--build-command", help="Custom build command")
+    parser.add_argument(
+        "--traced-build", action="store_true",
+        help="Opt into traced-build C/C++ extraction (executes the repo's "
+             "build system — asserts trust in the repo). Default is "
+             "buildless (--build-mode=none): no repo code runs during "
+             "database creation.",
+    )
+    parser.add_argument(
+        "--no-traced-build", action="store_true",
+        help="Force buildless extraction for this run, overriding "
+             "--traced-build. Escape hatch for wrappers that forward "
+             "--traced-build from persisted project trust.",
+    )
     parser.add_argument("--force", action="store_true", help="Force database recreation (ignore cache)")
     parser.add_argument("--extended", action="store_true", help="Use extended security suites")
     parser.add_argument("--out", help="Output directory (auto-generated if not specified)")
@@ -759,6 +1520,41 @@ Examples:
              "Use when the in-repo packs produce noise on a specific target "
              "or when comparing stdlib-only vs LocalFlowSource verdicts.",
     )
+    parser.add_argument(
+        "--no-curated-queries", action="store_true",
+        help="Skip the curated in-repo query pass "
+             "(engine/codeql/queries/<lang>/). Use when a curated query "
+             "produces noise on a specific target or when comparing "
+             "standard-suite-only verdicts.",
+    )
+    parser.add_argument(
+        "--no-learned-models", action="store_true",
+        help="Skip the learned-models measurement pass (IRIS taint "
+             "specs emitted as a models-as-data pack, baseline vs "
+             "augmented diff). Use when the pack's candidate findings "
+             "add noise on a specific target.",
+    )
+    parser.add_argument(
+        "--taint-crossfile-mad", action="store_true",
+        help="Stage the taint seed packs (plus the project's "
+             "operator-grade IRIS taint specs) as models-as-data "
+             "extension packs on the standard python/javascript "
+             "suites, and write taint-mad-augmentation.json naming "
+             "the augmented sink surfaces. Additive detection only; "
+             "default off.",
+    )
+    parser.add_argument(
+        "--threat-models",
+        help="Comma-separated CodeQL threat models to enable on the "
+             "standard suite (default: local). Passed as repeated "
+             "--threat-model flags; skipped automatically on CLIs "
+             "older than 2.15.3.",
+    )
+    parser.add_argument(
+        "--no-threat-models", action="store_true",
+        help="Do not pass any --threat-model flag to codeql database "
+             "analyze (stock remote-only source models).",
+    )
 
     # Sandbox CLI flags (--sandbox / --no-sandbox / --audit / --audit-verbose)
     # so the agentic-driven invocation can propagate audit mode into this
@@ -767,8 +1563,41 @@ Examples:
     from core.sandbox import add_cli_args, apply_cli_args
     add_cli_args(parser)
 
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(parser)
     args = parser.parse_args()
+    report_options = options_from_args(args, parser)
     apply_cli_args(args, parser=parser)
+
+    # Orphan containment: when the spawner opted this agent in (the
+    # agentic pipeline and the scanner's codeql stage pair the env var
+    # with start_new_session), a dead parent takes this whole process
+    # group down instead of stranding codeql children holding cache
+    # locks and gigabytes of memory. Direct operator invocations (no
+    # env var) are untouched.
+    from core.run.parent_liveness import maybe_start_orphan_watchdog
+    maybe_start_orphan_watchdog("codeql-agent")
+
+    if getattr(args, "out", None):
+        # Child of a run: adopt the owning run's pin as the process
+        # override so ambient consumers (IRIS store, trust) follow it
+        #.
+        from core.run.pin import bootstrap_process_pin
+        bootstrap_process_pin(args.out)
+
+    # Project sandbox-floor consent: workers re-read the on-disk
+    # setting at their own run start (the run-pin bootstrap above
+    # resolves the owning project) — the per-run --sandbox-floor
+    # flag, forwarded on this worker's command line by the /agentic
+    # passthrough, wins in both directions at floor resolution.
+    from core.project.trust import apply_project_sandbox_floor
+    apply_project_sandbox_floor(args)
+
+    # Explicit negative beats positive (per-run escape hatch; no
+    # project-marker consumption here — the /agentic and /codeql
+    # entry points resolve markers before forwarding --traced-build).
+    if getattr(args, "no_traced_build", False):
+        args.traced_build = False
 
     # Flip the IRIS Tier 1 master switch for this invocation. The
     # config is process-scoped so /codeql subprocesses don't bleed
@@ -776,6 +1605,37 @@ Examples:
     if args.no_iris_tier1:
         from core.config import RaptorConfig
         RaptorConfig.IRIS_TIER1_ENABLED = False
+
+    # Same process-scoped pattern for the curated in-repo query pass.
+    if args.no_curated_queries:
+        from core.config import RaptorConfig
+        RaptorConfig.CODEQL_CURATED_ENABLED = False
+
+    # Same process-scoped pattern for the learned-models pass.
+    if args.no_learned_models:
+        from core.config import RaptorConfig
+        RaptorConfig.CODEQL_LEARNED_MODELS_ENABLED = False
+
+    # Positive opt-in (default-off direction) for the taint-pack
+    # models-as-data augmentation. The tolerant read of the wider
+    # flag-family member lets a spawner that only knows
+    # --taint-crossfile enable this pass too, without an argparse
+    # dependency between the two flags.
+    if (getattr(args, "taint_crossfile_mad", False)
+            or getattr(args, "taint_crossfile", False)):
+        from core.config import RaptorConfig
+        RaptorConfig.CODEQL_TAINT_MAD_ENABLED = True
+
+    # Same process-scoped pattern for threat models. Explicit negative
+    # beats positive when both are passed.
+    if args.threat_models:
+        from core.config import RaptorConfig
+        RaptorConfig.CODEQL_THREAT_MODELS = tuple(
+            m.strip() for m in args.threat_models.split(",") if m.strip()
+        )
+    if args.no_threat_models:
+        from core.config import RaptorConfig
+        RaptorConfig.CODEQL_THREAT_MODELS_ENABLED = False
 
     # Parse languages
     languages = None
@@ -786,9 +1646,13 @@ Examples:
     build_commands = None
     if args.build_command:
         if not languages or len(languages) != 1:
-            print("Error: --build-command requires exactly one language specified with --languages")
+            print(
+                "✗ --build-command requires exactly one language — pass "
+                "--languages <lang> to pin the traced language",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        build_commands = {languages[0]: args.build_command}
+        build_commands = {_normalise_language(languages[0]): args.build_command}
 
     try:
         # Pre-compute out_dir BEFORE constructing the agent so we
@@ -829,6 +1693,7 @@ Examples:
             out_dir=_precomputed_out_dir,
             codeql_cli=args.codeql_cli
         )
+        agent.report_options = report_options
 
         # Run analysis
         result = agent.run_autonomous_analysis(
@@ -836,7 +1701,8 @@ Examples:
             build_commands=build_commands,
             force_db_creation=args.force,
             use_extended=args.extended,
-            min_files=args.min_files
+            min_files=args.min_files,
+            traced_build=args.traced_build,
         )
 
         # Print summary
@@ -864,11 +1730,20 @@ Examples:
         sys.exit(0 if result.success else 1)
 
     except KeyboardInterrupt:
-        print("\n\nAnalysis interrupted by user")
+        print("\n\nAnalysis interrupted by user", file=sys.stderr)
         sys.exit(130)
+    except SandboxSetupError as e:
+        # Sandbox could not engage. Emit the dedicated exit code so a parent
+        # (/agentic, /scan) translates it back into a fail-loud abort rather
+        # than treating it as a generic codeql failure. The analysis did NOT
+        # run — never let it look like a clean "0 findings".
+        print(f"\n✗ Analysis aborted — sandbox isolation could not engage.\n{sanitise_for_terminal(str(e), max_len=2000)}",
+              file=sys.stderr)
+        sys.exit(SANDBOX_ENGAGE_EXIT_CODE)
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        print(f"\n✗ Fatal error: {e}")
+        # RaptorLogger has no .exception method
+        logger.error("Fatal error: %s", e, exc_info=True)  # noqa: G201
+        print(f"\n✗ Fatal error: {sanitise_for_terminal(str(e), max_len=2000)}", file=sys.stderr)
         sys.exit(1)
 
 

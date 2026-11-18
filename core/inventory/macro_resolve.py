@@ -1,0 +1,439 @@
+"""Resolve macro definitions from a target directory.
+
+Supports:
+- C/C++ #define directives (with transitive resolution)
+- Rust macro_rules! definitions
+
+Scans source files, builds a name→(params, body) table, and resolves
+transitive references used in a given source fragment.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import re
+from collections import OrderedDict, deque
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from core.inventory._walk import iter_regular_files
+from core.source import read_bytes_capped
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+logger = logging.getLogger(__name__)
+
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs in scanned source. Separators and parameters stay
+# within logical lines; build_macro_table joins continuations first.
+# Prefer a non-whitespace body endpoint before a terminal continuation.
+# The fallback preserves the full body when no trailer can be removed,
+# without retrying the whitespace suffix at every position inside a run.
+_MACRO_DEF_RE = re.compile(  # line-model: _read_macro_text uses universal-newline TextIOWrapper before matching.
+    r"^[^\S\n]*#[^\S\n]*define[^\S\n]+(\w+)"
+    r"(?:(\([^)\n]*\))[^\S\n]*|[^\S\n]+)"
+    r"([^\n]*[^\s](?=[^\S\n]*\\$)|[^\n]+)(?:[^\S\n]*\\)?$",
+    re.MULTILINE,
+)
+_MACRO_DEFINE_PREFIX_RE = re.compile(r"#[^\S\n]*define[^\S\n]")
+_MACRO_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+_C_EXTENSIONS = frozenset({
+    ".c", ".h", ".hh", ".cpp", ".cc", ".cxx", ".hpp", ".hxx",
+})
+_RUST_EXTENSIONS = frozenset({".rs"})
+
+_SKIP_IDENTS_C: frozenset[str] = frozenset({
+    "if", "else", "for", "while", "do", "switch", "case", "return",
+    "break", "continue", "goto", "sizeof", "typeof", "void", "int",
+    "char", "unsigned", "signed", "long", "short", "float", "double",
+    "const", "static", "extern", "struct", "enum", "union", "typedef",
+    "NULL", "true", "false", "bool", "size_t", "ssize_t", "uint8_t",
+    "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t",
+    "int64_t", "uintptr_t", "intptr_t", "ptrdiff_t",
+})
+_SKIP_IDENTS_RUST: frozenset[str] = frozenset({
+    "if", "else", "for", "while", "loop", "match", "return", "break",
+    "continue", "let", "mut", "fn", "pub", "use", "mod", "struct",
+    "enum", "impl", "trait", "where", "type", "const", "static",
+    "unsafe", "extern", "crate", "self", "super", "as", "in", "ref",
+    "move", "async", "await", "dyn", "true", "false", "Self",
+    "str", "bool", "u8", "u16", "u32", "u64", "u128", "usize",
+    "i8", "i16", "i32", "i64", "i128", "isize", "f32", "f64",
+    "Option", "Result", "Some", "None", "Ok", "Err", "Vec", "String",
+    "Box", "Rc", "Arc", "println", "eprintln", "format", "write",
+    "writeln", "panic", "assert", "debug_assert", "todo", "unimplemented",
+    "unreachable", "cfg", "derive", "allow", "deny", "warn",
+})
+
+_TABLE_CACHE_MAX = 8
+_table_cache: OrderedDict[str, dict[str, tuple[str, str]]] = OrderedDict()
+
+# Anonymous and named enum enumerator extraction:
+#   enum { FOO = 1, BAR = 2 };
+#   enum limits { MAX_BUF = 256 };
+# Split head-regex + str.find body scan: a single ``[^}]+`` body
+# regex re-scans the text tail from every planted ``enum{`` head —
+# quadratic on a hostile header. The head's tag name is bounded
+# (real enum tags are far shorter than 256 chars; a longer token is
+# not a real tag) so a head probe costs O(1), and the body is
+# located with one linear ``str.find``.
+_ENUM_HEAD_RE = re.compile(r"\benum\s*(?:\w{1,256}\s*)?\{")
+_ENUMERATOR_NAME_RE = re.compile(r"\b(\w+)\s*=\s*")
+
+
+_MACRO_SPARSE_MIN_SOURCE = 16 * 1024
+_MACRO_SPARSE_MIN_CHARS_PER_HASH = 512
+
+
+def _iter_sparse_macro_definitions(
+    text: str, candidate: re.Match[str] | None,
+) -> Iterator[re.Match[str]]:
+    """Apply the original pattern only at prefix-bearing line starts."""
+    while candidate is not None:
+        line_start = text.rfind("\n", 0, candidate.start()) + 1
+        match = _MACRO_DEF_RE.match(text, line_start)
+        if match is not None:
+            yield match
+            pos = match.end()
+        else:
+            # No other start on this LF-delimited line can satisfy '^'.
+            # Skipping it also avoids retrying a long indent repeatedly.
+            line_end = text.find("\n", candidate.start())
+            if line_end < 0:
+                return
+            pos = line_end + 1
+        candidate = _MACRO_DEFINE_PREFIX_RE.search(text, pos)
+
+
+def _iter_macro_definitions(text: str) -> Iterator[re.Match[str]]:
+    """Yield definition matches with the original groups and spans."""
+    if type(text) is str:
+        candidate = _MACRO_DEFINE_PREFIX_RE.search(text)
+        if candidate is None:
+            return iter(())
+        if (len(text) >= _MACRO_SPARSE_MIN_SOURCE
+                and text.count("#") <= len(text) // _MACRO_SPARSE_MIN_CHARS_PER_HASH):
+            return _iter_sparse_macro_definitions(text, candidate)
+    return _MACRO_DEF_RE.finditer(text)
+
+
+_ENUM_SPARSE_MIN_SOURCE = 16 * 1024
+_ENUM_SPARSE_MIN_CHARS_PER_KEYWORD = 512
+
+
+def _iter_enum_bodies(text: str):
+    """Yield ``(block_start, body)`` per enum block, matching the old
+    single-regex semantics (body = shortest non-empty run to the next
+    ``}``, scan resumes after the block) at linear cost."""
+    # The regex starts with this literal keyword. Native substring
+    # search skips the regex pass on enum-free text; possible matches
+    # still use the original bounded parser. Preserve subclass behavior.
+    if type(text) is str and "enum" not in text:
+        return
+    sparse = (type(text) is str and len(text) >= _ENUM_SPARSE_MIN_SOURCE
+              and text.count("enum") <= len(text) // _ENUM_SPARSE_MIN_CHARS_PER_KEYWORD)
+    pos = 0
+    while True:
+        if sparse:
+            while True:
+                candidate = text.find("enum", pos)
+                if candidate < 0:
+                    return
+                head = _ENUM_HEAD_RE.match(text, candidate)
+                if head is not None:
+                    break
+                pos = candidate + 1
+        else:
+            head = _ENUM_HEAD_RE.search(text, pos)
+            if head is None:
+                return
+        close = text.find("}", head.end())
+        if close == -1:
+            return  # no closing brace anywhere: nothing can match
+        if close == head.end():  # empty body: not a block, move on
+            pos = head.start() + 1
+            continue
+        yield head.start(), text[head.end():close]
+        pos = close + 1
+
+
+def _parse_enumerator_value(text: str, start: int) -> str:
+    """Extract value from enumerator, respecting parentheses."""
+    depth = 0
+    i = start
+    # Native strings have immutable length; subclasses keep observable
+    # __len__ behavior on the original loop below.
+    if type(text) is str:
+        size = len(text)
+        while i < size:
+            ch = text[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch in ",}" and depth == 0:
+                break
+            i += 1
+        return text[start:i].strip()
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch in ",}" and depth == 0:
+            break
+        i += 1
+    return text[start:i].strip()
+
+# Rust macro_rules! extraction
+# Matches: macro_rules! name { ... } — we capture the full body between braces
+_RUST_MACRO_RULES_RE = re.compile(
+    r"macro_rules!\s+(\w+)\s*\{",
+)
+# Rust macro invocations in source: name!(...)  name![...]  name!{...}
+_RUST_MACRO_CALL_RE = re.compile(r"\b(\w+)\s*!")
+
+_RUST_TABLE_CACHE_MAX = 8
+_rust_table_cache: OrderedDict[str, dict[str, str]] = OrderedDict()
+
+
+def _extract_braced_body(text: str, open_pos: int) -> str | None:
+    """Extract text between matched braces starting at open_pos."""
+    if open_pos >= len(text) or text[open_pos] != "{":
+        return None
+    depth = 0
+    for i in range(open_pos, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_pos + 1:i].strip()
+    return None
+
+
+_MAX_MACRO_SOURCE_BYTES = 1_048_576
+
+
+def _read_macro_text(path: Path) -> str | None:
+    """Admit a regular-file byte budget before replacement text decoding."""
+    got = read_bytes_capped(path, _MAX_MACRO_SOURCE_BYTES)
+    if got is None or got[1]:
+        return None
+    # Preserve Path.read_text(errors="replace") default encoding and
+    # universal-newline behaviour over the already bounded byte buffer.
+    with io.TextIOWrapper(io.BytesIO(got[0]), errors="replace") as stream:
+        return stream.read()
+
+
+def build_rust_macro_table(target_path: Path) -> dict[str, str]:
+    """Build name→body table of all macro_rules! in the target.
+
+    Results are cached per absolute lexical target location.
+    """
+    try:
+        target_path = Path(target_path).absolute()
+    except OSError:
+        # An unavailable relative location cannot identify a cached target.
+        return {}
+    key = str(target_path)
+    if key in _rust_table_cache:
+        _rust_table_cache.move_to_end(key)
+        return _rust_table_cache[key]
+
+    table: dict[str, str] = {}
+    try:
+        # Symlink-safe enumeration — a hostile `dir -> /` in the
+        # target must not walk the host fs into audit context.
+        for p in iter_regular_files(target_path, _RUST_EXTENSIONS):
+            try:
+                if p.stat().st_size > _MAX_MACRO_SOURCE_BYTES:  # cheap oversize rejection
+                    continue
+                text = _read_macro_text(p)
+                if text is None:
+                    continue
+            except OSError:
+                continue
+            for m in _RUST_MACRO_RULES_RE.finditer(text):
+                name = m.group(1)
+                if name in table:
+                    logger.debug(
+                        "macro_rules! %s redefined in %s "
+                        "(keeping first definition)",
+                        name, p,
+                    )
+                    continue
+                body = _extract_braced_body(text, m.end() - 1)
+                if body:
+                    table[name] = body
+    except OSError:
+        pass
+
+    if len(_rust_table_cache) >= _RUST_TABLE_CACHE_MAX:
+        _rust_table_cache.popitem(last=False)
+    _rust_table_cache[key] = table
+    return table
+
+
+def resolve_rust_macros(
+    target_path: Path,
+    source: str,
+    max_depth: int = 3,
+) -> list[tuple[str, str]]:
+    """Find macro_rules! macros invoked in source, resolve transitively.
+
+    Returns (name, body) tuples by descending minimum source-root distance,
+    then name.
+    """
+    if not source:
+        return []
+
+    table = build_rust_macro_table(target_path)
+    if not table:
+        return []
+
+    called = set(_RUST_MACRO_CALL_RE.findall(source)) - _SKIP_IDENTS_RUST
+
+    resolved: dict[str, tuple[str, str, int]] = {}
+    worklist = deque((name, 0) for name in called if name in table)
+    visited: set = set()
+
+    while worklist:
+        # Visit shortest source-root distances first, preserving depth budget.
+        name, depth = worklist.popleft()
+        if name in visited:
+            continue
+        visited.add(name)
+
+        body = table.get(name)
+        if not body:
+            continue
+        resolved[name] = (name, body, depth)
+
+        if depth < max_depth:
+            child_calls = set(_RUST_MACRO_CALL_RE.findall(body)) - _SKIP_IDENTS_RUST
+            worklist.extend((child, depth + 1) for child in child_calls if child not in visited and child in table)
+
+    if not resolved:
+        return []
+
+    items = sorted(resolved.values(), key=lambda x: (-x[2], x[0]))
+    return [(name, body) for name, body, _ in items]
+
+
+def build_macro_table(target_path: Path) -> dict[str, tuple[str, str]]:
+    """Build name→(params, body) table of all #defines in the target.
+
+    Results are cached per absolute lexical target location, evicting LRU
+    when full. Cached content is not revalidated after edits.
+    """
+    try:
+        target_path = Path(target_path).absolute()
+    except OSError:
+        # An unavailable relative location cannot identify a cached target.
+        return {}
+    key = str(target_path)
+    if key in _table_cache:
+        _table_cache.move_to_end(key)
+        return _table_cache[key]
+
+    table: dict[str, tuple[str, str]] = {}
+    try:
+        # Symlink-safe enumeration — same class as the rust walk above.
+        for p in iter_regular_files(target_path, _C_EXTENSIONS):
+            try:
+                if p.stat().st_size > _MAX_MACRO_SOURCE_BYTES:  # cheap oversize rejection
+                    continue
+                text = _read_macro_text(p)
+                if text is None:
+                    continue
+            except OSError:
+                continue
+            text = text.replace("\\\n", " ")
+            for m in _iter_macro_definitions(text):
+                name = m.group(1)
+                params = m.group(2) or ""
+                body = m.group(3).strip()
+                if not body:
+                    continue
+                if name not in table:
+                    table[name] = (params, body)
+                else:
+                    logger.debug(
+                        "macro %s redefined in %s (keeping first definition)",
+                        name, p,
+                    )
+            for _block_start, body in _iter_enum_bodies(text):
+                for ev in _ENUMERATOR_NAME_RE.finditer(body):
+                    ename = ev.group(1).strip()
+                    evalue = _parse_enumerator_value(body, ev.end())
+                    if ename in _SKIP_IDENTS_C:
+                        continue
+                    if ename not in table:
+                        table[ename] = ("", evalue)
+                    else:
+                        logger.debug(
+                            "enumerator %s redefined in %s "
+                            "(keeping first definition)",
+                            ename, p,
+                        )
+    except OSError:
+        pass
+
+    if len(_table_cache) >= _TABLE_CACHE_MAX:
+        _table_cache.popitem(last=False)
+    _table_cache[key] = table
+    return table
+
+
+def resolve_macros(
+    target_path: Path,
+    source: str,
+    max_depth: int = 3,
+    table: dict[str, tuple[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    """Find macros used in source, resolve transitively.
+
+    Returns (display_name, body) tuples by descending minimum source-root
+    distance, then display name.
+    """
+    if not source:
+        return []
+
+    if table is None:
+        table = build_macro_table(target_path)
+    if not table:
+        return []
+
+    source_idents = set(_MACRO_IDENT_RE.findall(source)) - _SKIP_IDENTS_C
+
+    resolved: dict[str, tuple[str, str, int]] = {}
+    worklist = deque((name, 0) for name in source_idents if name in table)
+    visited: set = set()
+
+    while worklist:
+        # Visit shortest source-root distances first, preserving depth budget.
+        name, depth = worklist.popleft()
+        if name in visited:
+            continue
+        visited.add(name)
+
+        entry = table.get(name)
+        if not entry:
+            continue
+        params, body = entry
+        display = f"{name}{params}" if params else name
+        resolved[name] = (display, body, depth)
+
+        if depth < max_depth:
+            body_idents = set(_MACRO_IDENT_RE.findall(body)) - _SKIP_IDENTS_C
+            worklist.extend((child, depth + 1) for child in body_idents if child not in visited and child in table)
+
+    if not resolved:
+        return []
+
+    items = sorted(resolved.values(), key=lambda x: (-x[2], x[0]))
+    return [(display, body) for display, body, _ in items]

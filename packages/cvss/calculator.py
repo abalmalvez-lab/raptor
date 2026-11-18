@@ -9,7 +9,6 @@ this module computes the numeric score.
 
 import math
 import re
-from typing import Optional
 
 # Metric value weights from CVSS v3.1 specification tables.
 
@@ -20,7 +19,6 @@ _PR_C = {"N": 0.85, "L": 0.68, "H": 0.50}             # Privileges Required (Sco
 _UI = {"N": 0.85, "R": 0.62}                           # User Interaction
 _CIA = {"H": 0.56, "L": 0.22, "N": 0.0}               # Confidentiality, Integrity, Availability
 
-_METRICS = {"AV", "AC", "PR", "UI", "S", "C", "I", "A"}
 _VALID_VALUES = {
     "AV": set(_AV), "AC": set(_AC),
     "PR": {"N", "L", "H"}, "UI": set(_UI),
@@ -33,42 +31,36 @@ _SEVERITY = [
     (7.0, "High"), (9.0, "Critical"),
 ]
 
-_VECTOR_RE = re.compile(
-    # `\A` / `\Z` anchors instead of `^` / `$`. Pre-fix `$` in
-    # Python regex matches end-of-string OR just before a
-    # trailing newline. So a vector like
-    # `"CVSS:3.1/AV:N/AC:L/.../A:H\nrm -rf"` PASSED
-    # validation — the `\n` after `A:H` matched `$`, and the
-    # rest of the string (which could be CLI-injected payload
-    # text or LLM-output trailing junk) was silently ignored
-    # by the regex. Downstream `parse_vector` then split on
-    # `/` and processed `A:H\nrm` as a metric (the colon match
-    # would still parse the key as `A` and value as `H\nrm`).
-    # Strict-end-of-string `\Z` rejects trailing newlines.
-    r"\ACVSS:3\.[01]/"
-    r"AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/"
-    r"C:[NLH]/I:[NLH]/A:[NLH]"
-    # Optional temporal (E, RL, RC) and environmental
-    # (CR/IR/AR, MAV/MAC/MPR/MUI/MS, MC/MI/MA) segments. Real-world
-    # OSV records routinely include these — Log4Shell ships
-    # ``…/A:H/E:H`` — and rejecting them silently degraded scoring to
-    # ``None``. Each extension is ``METRIC:VALUE`` where the metric is
-    # alphabetic and the value is a single token; we accept any such
-    # suffix. ``compute_base_score`` ignores keys it doesn't recognise.
-    r"(?:/[A-Za-z]+:[A-Za-z0-9]+)*"
-    r"\Z"
-)
+# Per-segment shape: METRIC:VALUE, alphabetic metric, alphanumeric value.
+# `\A` / `\Z` anchors instead of `^` / `$`: pre-fix `$` in Python regex
+# matches end-of-string OR just before a trailing newline, so a vector
+# like `"CVSS:3.1/AV:N/AC:L/.../A:H\nrm -rf"` PASSED validation — the
+# `\n` after `A:H` matched `$`, and the rest of the string (which could
+# be CLI-injected payload text or LLM-output trailing junk) was silently
+# ignored. Anchoring each segment with `\Z` rejects any segment carrying
+# a newline or other non-alphanumeric tail.
+_SEGMENT_RE = re.compile(r"\A[A-Za-z]+:[A-Za-z0-9]+\Z")
+
+# The eight mandatory base metrics (CVSS v3.1 spec §6, Table 15).
+_BASE_METRICS = ("AV", "AC", "PR", "UI", "S", "C", "I", "A")
 
 
 def validate_vector(vector: str) -> bool:
     """Check if a CVSS v3.1 vector string is well-formed.
+
+    The spec (§6, Table 15) requires all eight base metrics but allows
+    them in ANY order, so validation is segment-wise rather than a
+    fixed-sequence regex — advisories and LLM output routinely permute
+    metric order, and rejecting those silently degraded scoring to
+    ``None`` (a 9.8-Critical advisory could then gate as a fallback
+    "medium").
 
     Accepts base-only vectors and vectors carrying optional temporal /
     environmental extensions (``/E:H``, ``/RL:O``, ``/CR:H`` …). Only
     the base segments contribute to the numeric score; the extensions
     are tolerated, not consumed.
 
-    Reject vectors with duplicate metric keys. Pre-fix
+    Rejects vectors with duplicate metric keys. Pre-fix
     `parse_vector` built `metrics[key] = value` in a dict, so a
     vector like
     `CVSS:3.1/AV:N/AC:L/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H` (note
@@ -79,20 +71,31 @@ def validate_vector(vector: str) -> bool:
     forgot to remove the old segment, or LLM-generated
     vectors with hallucinated repeats. Stricter validation
     here surfaces the malformation before scoring.
+
+    Tolerates non-string input (returns ``False``): finding dicts are
+    LLM structured output, and a ``cvss_vector`` delivered as a list /
+    dict / number must classify as invalid rather than raise from
+    ``re.match``.
     """
-    if not _VECTOR_RE.match(vector):
+    if not isinstance(vector, str):
         return False
-    # Duplicate-key check.
-    parts = vector.split("/")[1:]  # Skip "CVSS:3.1" prefix.
-    seen = set()
-    for part in parts:
-        if ":" not in part:
-            continue
-        key = part.split(":", 1)[0]
+    parts = vector.split("/")
+    if parts[0] not in ("CVSS:3.0", "CVSS:3.1") or len(parts) < 2:
+        return False
+    seen: dict[str, str] = {}
+    for part in parts[1:]:
+        if not _SEGMENT_RE.match(part):
+            return False
+        key, value = part.split(":", 1)
         if key in seen:
             return False
-        seen.add(key)
-    return True
+        # Base metrics must carry a spec-valid value; unknown keys are
+        # temporal / environmental extensions and any single token is
+        # accepted (``compute_base_score`` ignores them).
+        if key in _VALID_VALUES and value not in _VALID_VALUES[key]:
+            return False
+        seen[key] = value
+    return all(k in seen for k in _BASE_METRICS)
 
 
 def parse_vector(vector: str) -> dict:
@@ -111,13 +114,17 @@ def parse_vector(vector: str) -> dict:
     influence the numeric output.
     """
     if not validate_vector(vector):
-        raise ValueError(f"Invalid CVSS v3.1 vector: {vector}")
+        msg = f"Invalid CVSS v3.1 vector: {vector}"
+        raise ValueError(msg)
 
     parts = vector.split("/")[1:]  # Skip "CVSS:3.1" prefix
     metrics = {}
     for part in parts:
-        key, value = part.split(":")
-        metrics[key] = value
+        kv = part.split(":", 1)
+        if len(kv) != 2:
+            msg = f"Invalid CVSS metric component: {part!r}"
+            raise ValueError(msg)
+        metrics[kv[0]] = kv[1]
     return metrics
 
 
@@ -168,14 +175,55 @@ def compute_base_score(vector: str) -> tuple[float, str]:
     return score, label
 
 
-def compute_score_safe(vector: Optional[str]) -> tuple[Optional[float], Optional[str]]:
-    """Compute CVSS score, returning (None, None) for missing or invalid vectors."""
-    if not vector:
+def compute_score_safe(vector: str | None) -> tuple[float | None, str | None]:
+    """Compute CVSS score, returning (None, None) for missing or invalid vectors.
+
+    "Invalid" includes non-string values: callers feed this straight
+    from LLM-produced finding dicts, where ``cvss_vector`` occasionally
+    arrives as a list / dict / number, and one malformed finding must
+    not abort a whole post-processing loop.
+    """
+    if not isinstance(vector, str) or not vector:
         return None, None
     try:
         return compute_base_score(vector)
     except ValueError:
         return None, None
+
+
+def score_for_label(label: str | None) -> float | None:
+    """Return a representative CVSS numeric for a severity label.
+
+    Inverse-ish of the ``_SEVERITY`` threshold table at the top of
+    this module. Used by consumers that have a tier label
+    (``"CRITICAL"`` / ``"HIGH"`` / etc.) but no parseable vector —
+    typical for OSV / GHSA records on ecosystems where upstream
+    advisories ship a label but no numeric (Cargo / NuGet /
+    Packagist advisories disproportionately so).
+
+    Returns the LOWER BOUND of each tier per ``_SEVERITY`` so the
+    score is conservative (label says "Critical", we return 9.0
+    rather than 10.0). Operators consuming the score get a
+    representative-but-not-inflated value matching what
+    ``compute_base_score`` would have produced for a borderline
+    in-tier vector.
+
+    Returns ``None`` for unknown / empty inputs — callers fall
+    back to their own neutral default. Case-insensitive match
+    (LLM-emitted advisories often capitalise inconsistently).
+    """
+    if not label:
+        return None
+    norm = label.strip().lower()
+    # Build the inverse from the SAME threshold table the forward
+    # direction uses — drift between the two would silently break
+    # the score↔label bijection.
+    inverse = {name.lower(): threshold for threshold, name in _SEVERITY}
+    # ``info`` is operator-convenience: not part of CVSS proper but
+    # used by SCA for commented-out deps and hand-tagged low-risk
+    # findings. Map to a sub-Low value.
+    inverse.setdefault("info", 0.0)
+    return inverse.get(norm)
 
 
 def score_finding(finding: dict) -> None:
@@ -189,6 +237,7 @@ def score_finding(finding: dict) -> None:
         score, label = compute_score_safe(vec)
         if score is not None:
             finding["cvss_score_estimate"] = score
+            assert label is not None
             finding["severity_assessment"] = label.lower()
 
 

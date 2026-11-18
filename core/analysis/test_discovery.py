@@ -1,0 +1,590 @@
+"""Test discovery for spec inference.
+
+Maps functions to their test cases by scanning test directories for
+naming patterns and call references. Tests are executable specifications:
+the assertions encode postconditions.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from io import BytesIO, TextIOWrapper
+from pathlib import Path
+from typing import Dict, List, Sequence
+
+from core.source.gated import read_bytes_gated
+
+logger = logging.getLogger(__name__)
+
+# Enumeration and the opened-file read share the same exclusive byte limit.
+_TEST_FILE_BYTE_LIMIT = 500_000
+_TEST_FILE_COUNT_LIMIT = 500
+
+# ``regress`` covers the OpenBSD/openssh convention (openssh ships a
+# 200+ file ``regress/`` tree; without the pattern the whole suite was
+# invisible to discovery).
+_TEST_DIR_PATTERNS = ("test_", "tests", "test", "testing", "spec",
+                      "specs", "regress")
+
+# Exact-name-only test dirs, no separator variants: ``t`` is the
+# Perl / git convention — giving it the ``t_*`` / ``t-*`` semantics of
+# the patterns above would claim far too many unrelated directories.
+_EXACT_TEST_DIR_NAMES = ("t",)
+
+
+def _dir_matches_test_pattern(part: str) -> bool:
+    """Exact or separator-delimited match against the dir patterns.
+
+    A bare prefix match classified ``special/`` (spec) and
+    ``testimonials/`` (test) as test trees — heuristic FPs that then
+    joined the discovery denominator. Patterns ending in ``_``
+    (``test_``) keep their prefix semantics; the rest match exactly or
+    with a ``_``/``-`` separator (``tests-unit``). ``testing`` joined
+    the list explicitly since it no longer rides the ``test`` prefix.
+    """
+    if part in _EXACT_TEST_DIR_NAMES:
+        return True
+    for pat in _TEST_DIR_PATTERNS:
+        if part == pat:
+            return True
+        if pat.endswith("_"):
+            if part.startswith(pat):
+                return True
+        elif part.startswith((pat + "_", pat + "-")):
+            return True
+    return False
+
+
+def _in_recognized_test_tree(dir_parts: tuple[str, ...]) -> bool:
+    """True when any enclosing directory is a recognized test dir.
+
+    Single provenance predicate for both the discovery walk and the
+    per-case ``in_test_tree`` stamp — the two must never diverge, or a
+    file could be admitted under one rule and trust-graded under
+    another.
+    """
+    return any(_dir_matches_test_pattern(part) for part in dir_parts)
+
+
+def _resolves_within(path: Path, root: Path) -> bool:
+    """Whether *path* resolves inside *root* (which must be resolved).
+
+    A tests/-dir entry that is a symlink to a file OUTSIDE the repo
+    root carries content the repo's test tree does not actually
+    contain — it must not inherit in-tree provenance from the
+    symlink's location. Directory symlinks are not the concern here:
+    the discovery walk does not follow them.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved.is_relative_to(root)
+
+
+# ``\w+Test.php`` is the PHPUnit file convention (class-per-file,
+# suffix mandatory for the default phpunit.xml discovery); the
+# prefix/suffix ``test`` shapes cover the rest of the ecosystems.
+# Name stems bounded at 256: an unbounded \w+ re-scans a hostile
+# name run from every position — quadratic — and real filesystem
+# components cap at 255 bytes anyway.
+_TEST_FILE_PATTERNS = re.compile(
+    r"(?:test_\w{1,256}|_test)\.\w+$|\w{1,256}Test\.php$")
+# Languages the extraction heuristics below understand. Test-tree files
+# in other languages are counted and reported as skipped, not silently
+# dropped — a huge native test suite used to surface as "found 0 test
+# cases for 0 functions in 7 files", which reads as a discovery bug
+# instead of a language-support boundary.
+_SUPPORTED_EXTENSIONS = (
+    ".py", ".js", ".ts", ".go", ".rs", ".rb", ".java",
+    # C/C++ test conventions (regress/, tests/, *_test.c, test_*.c).
+    ".c", ".cc", ".cpp", ".cxx",
+    # PHP test conventions (tests/, *Test.php, PHPUnit test* methods).
+    ".php",
+)
+_ASSERT_PATTERN = re.compile(
+    # Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+    # on blank-line runs in scanned source.
+    r"^[^\S\n]*(?:assert(?:Equal|True|False|Raises|In|NotIn|Is|IsNot|Greater|Less"
+    r"|Regex|Almost|Count|Contains|Not)?|self\.assert\w+|expect\(|assert |"
+    # C-family assertion conventions: libc assert(), openssh-style
+    # ASSERT_INT_EQ / ASSERT_PTR_NE, gtest EXPECT_*/ASSERT_*, check's
+    # ck_assert*, CUnit's CU_ASSERT*, Unity's TEST_ASSERT*. Generic
+    # ecosystem vocabulary (like the def/fn/func keywords above), not
+    # project-specific API lists.
+    r"assert\(|ASSERT_\w+\s*\(|EXPECT_\w+\s*\(|ck_assert\w*\s*\(|"
+    r"CU_ASSERT\w*\s*\(|TEST_ASSERT\w*\s*\(|"
+    # PHPUnit: instance and static assertion/expectation styles.
+    r"\$this\s*->\s*(?:assert|expect)\w+\s*\(|"
+    r"(?:self|static)::assert\w+\s*\()"
+    r"(.+)",
+    re.MULTILINE,
+)
+# Test-function openers. First alternative: keyword-introduced
+# definitions (Python/JS/Rust/Go). Second: C-family definitions —
+# ``[static] void|int|bool test_foo(`` and the ``*_test(s)`` suffix
+# convention. Prototypes also match; they yield an empty body and
+# contribute nothing, which is harmless.
+_TEST_FUNC_PATTERN = re.compile(
+    r"(?:def|function|fn|func)\s+(test_\w+)"
+    r"|(?:static\s+)?(?:void|int|bool)\s+\**(test_\w+|\w+_tests?)\s*\(",
+)
+# PHP variant: ``test[A-Z]\w*`` adds the PHPUnit camelCase method
+# convention (uppercase continuation required, so ``tester``/
+# ``testify`` helpers don't read as tests). Enabled for .php ONLY:
+# in the other ecosystems a lowercase-``test`` camel name is a helper
+# convention, not a test — Go's real tests are ``TestXxx`` and its
+# ``testAccCheck*`` acceptance helpers, JS ``testSetup``-style
+# helpers, and Python's unittest camel methods would either fabricate
+# targets or change long-standing base behaviour.
+_PHP_TEST_FUNC_PATTERN = re.compile(
+    r"(?:def|function|fn|func)\s+(test_\w+|test[A-Z]\w*)"
+    r"|(?:static\s+)?(?:void|int|bool)\s+\**(test_\w+|\w+_tests?)\s*\(",
+)
+# PHP construct / ubiquitous stdlib noise the ``name(`` heuristic
+# would misread as targets in PHPUnit test bodies. Applied to .php
+# only — in other languages these are legitimate project-function
+# names (a Python suite calling its own count() keeps the mapping).
+_PHP_CALL_NOISE = frozenset({
+    "isset", "empty", "unset", "array",
+    "count", "sprintf", "implode", "explode",
+    "in_array", "array_merge",
+})
+
+
+@dataclass
+class TestCase:
+    """A test case that exercises a target function."""
+
+    __test__ = False
+
+    test_file: str
+    test_function: str
+    target_function: str
+    assertions: List[str] = field(default_factory=list)
+    #: Whether the defining file sits under a recognized test dir
+    #: (tests/, regress/, ...). Loose test_* / *_test files elsewhere
+    #: in the tree are still discovered — they must be reviewed as
+    #: code — but their location is the only mechanical provenance
+    #: signal, so spec inference demotes their assertions instead of
+    #: granting executable-spec trust. Defaults False: a case whose
+    #: provenance is unknown must never be promoted.
+    in_test_tree: bool = False
+
+
+def discover_tests(
+    target_path: Path,
+) -> Dict[str, List[TestCase]]:
+    """Discover test cases and map them to target functions.
+
+    Walks test directories and finds tests by:
+    (a) test_<function_name> naming convention
+    (b) direct function call references in test bodies
+
+    Returns {function_name → [TestCase]} map.
+    """
+    target = Path(target_path).resolve()
+    if not target.is_dir():
+        return {}
+
+    test_files, skipped_unsupported = _find_test_files(target)
+    if not test_files:
+        if skipped_unsupported:
+            logger.info(
+                "test_discovery: no test files in a supported language "
+                "(%d test-tree files skipped; discovery reads %s only)",
+                skipped_unsupported,
+                "/".join(_SUPPORTED_EXTENSIONS),
+            )
+        return {}
+
+    result: Dict[str, List[TestCase]] = {}
+
+    for test_file in test_files:
+        rel = test_file.relative_to(target)
+        rel_path = str(rel)
+        in_tree = (
+            _in_recognized_test_tree(rel.parent.parts)
+            and _resolves_within(test_file, target)
+        )
+        try:
+            raw = read_bytes_gated(test_file, max_bytes=_TEST_FILE_BYTE_LIMIT - 1)
+            # Match Path.read_text's default encoding, replacement and
+            # universal-newline behaviour without reopening the pathname.
+            with TextIOWrapper(BytesIO(raw), errors="replace") as text:
+                source = text.read()
+        except (OSError, ValueError):
+            continue
+
+        suffix = test_file.suffix.lower()
+        test_funcs = _extract_test_functions(source, suffix)
+        for test_func_name, test_body in test_funcs:
+            targets = _infer_target_functions(
+                test_func_name, test_body, suffix,
+            )
+            assertions = _extract_assertions(test_body)
+
+            for target_fn in targets:
+                tc = TestCase(
+                    test_file=rel_path,
+                    test_function=test_func_name,
+                    target_function=target_fn,
+                    assertions=assertions[:10],
+                    in_test_tree=in_tree,
+                )
+                result.setdefault(target_fn, []).append(tc)
+
+    skipped_note = (
+        " (%d test-tree files skipped: unsupported language; discovery"
+        " reads %s only)"
+        % (skipped_unsupported, "/".join(_SUPPORTED_EXTENSIONS))
+        if skipped_unsupported else ""
+    )
+    if result:
+        logger.info(
+            "test_discovery: found %d test cases for %d functions in "
+            "%d scanned test files%s",
+            sum(len(v) for v in result.values()),
+            len(result),
+            len(test_files),
+            skipped_note,
+        )
+    else:
+        logger.info(
+            "test_discovery: no test cases matched the naming/call "
+            "heuristics in %d scanned test files%s",
+            len(test_files),
+            skipped_note,
+        )
+
+    return result
+
+
+_CACHE_FILENAME = "test-discovery-cache.json"
+
+
+def _test_tree_fingerprint(target: Path) -> str:
+    """Deterministic fingerprint of the discovery inputs: the test
+    files the walk finds (same enumeration, same 500-file cap) and
+    their contents. Hashing the bytes is a small fraction of the
+    extraction/inference pass over the same files."""
+    from core.audit.prep_cache import content_fingerprint
+
+    test_files, _skipped = _find_test_files(target)
+
+    def _items():
+        for f in test_files:
+            try:
+                yield str(f.relative_to(target)), read_bytes_gated(
+                    f, max_bytes=_TEST_FILE_BYTE_LIMIT - 1,
+                )
+            except (OSError, ValueError):
+                yield str(f), b""
+
+    return content_fingerprint(_items())
+
+
+def discover_tests_cached(
+    target_path: Path,
+    out_dir: Path | str | None = None,
+) -> Dict[str, List[TestCase]]:
+    """:func:`discover_tests` behind the audit prep-cache reload seam.
+
+    A resumed audit segment re-ran the whole extraction/inference pass
+    over every test file even though the tree was unchanged. Reload
+    the mapping on a fingerprint match; rebuild loudly on mismatch or
+    corruption. No ``out_dir`` means no cache — behaviour is exactly
+    the raw discovery.
+    """
+    target = Path(target_path).resolve()
+    if out_dir is None or not target.is_dir():
+        return discover_tests(target_path)
+
+    from core.audit.prep_cache import load_prep_cache, write_prep_cache
+
+    try:
+        fingerprint = _test_tree_fingerprint(target)
+    except Exception:
+        logger.debug("test-discovery fingerprint failed", exc_info=True)
+        return discover_tests(target_path)
+
+    cached = load_prep_cache(
+        out_dir, _CACHE_FILENAME, fingerprint, label="test-discovery",
+    )
+    if isinstance(cached, dict):
+        try:
+            result: Dict[str, List[TestCase]] = {
+                fn: [
+                    TestCase(
+                        test_file=tc.get("test_file", ""),
+                        test_function=tc.get("test_function", ""),
+                        target_function=str(tc.get("target_function") or fn),
+                        assertions=list(tc.get("assertions") or []),
+                        # Deliberately strict: a cache written before
+                        # provenance existed carries no location trust
+                        # grade — the KeyError degrades to the re-scan
+                        # below, which recomputes it from disk rather
+                        # than guessing either direction.
+                        in_test_tree=bool(tc["in_test_tree"]),
+                    )
+                    for tc in cases
+                    if isinstance(tc, dict)
+                ]
+                for fn, cases in cached.items()
+                if isinstance(cases, list)
+            }
+        except Exception:
+            # A json-valid cache with a broken shape must degrade to
+            # the re-scan, never escape into the caller.
+            logger.debug(
+                "test-discovery prep cache reload failed — re-scanning",
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "test_discovery: reloaded %d test cases for %d "
+                "functions from the prep cache (test-tree fingerprint "
+                "match) — extraction pass skipped",
+                sum(len(v) for v in result.values()), len(result),
+            )
+            return result
+
+    result = discover_tests(target_path)
+    write_prep_cache(
+        out_dir, _CACHE_FILENAME, fingerprint,
+        {
+            fn: [
+                {
+                    "test_file": tc.test_file,
+                    "test_function": tc.test_function,
+                    "target_function": tc.target_function,
+                    "assertions": tc.assertions,
+                    "in_test_tree": tc.in_test_tree,
+                }
+                for tc in cases
+            ]
+            for fn, cases in sorted(result.items())
+        },
+        label="test-discovery",
+    )
+    return result
+
+
+def format_tests_for_context(
+    tests: Sequence[TestCase],
+    depth: str = "oneline",
+) -> str:
+    """Render test case summaries for LLM context injection."""
+    if not tests:
+        return ""
+
+    if depth == "oneline":
+        assertion_count = sum(len(t.assertions) for t in tests)
+        return (
+            f"{len(tests)} test(s) found "
+            f"({assertion_count} assertions total)."
+        )
+
+    from core.security.prompt_envelope import neutralize_tag_forgery
+
+    lines = [f"**{len(tests)} test(s):**"]
+    for t in tests[:5]:
+        # File names are repo-controlled and POSIX permits newlines
+        # and `<` in them: collapse whitespace first (a raw newline
+        # would mint a fresh line start inside the trusted block),
+        # then neutralize — neutralization always last. The function
+        # name needs neither: extraction constrains it to \w+.
+        fname = neutralize_tag_forgery(" ".join(t.test_file.split()))
+        lines.append(f"- `{t.test_function}` in `{fname}`")
+        for a in t.assertions[:3]:
+            # Assertion text is lifted verbatim from repo files — in a
+            # hostile repo it can carry envelope-tag / heading forgery
+            # aimed at the trusted prompt region this renders into.
+            lines.append(f"  - assert: {neutralize_tag_forgery(a)}")
+
+    return "\n".join(lines)
+
+
+def _find_test_files(target: Path) -> tuple[List[Path], int]:
+    """Find test files under the target directory.
+
+    Returns ``(supported_test_files, skipped_unsupported)`` where the
+    counter is the number of test-tree files whose language the
+    extraction heuristics don't read — reported so a "0 test cases"
+    summary on a large native suite is attributable to the language
+    boundary rather than looking like a discovery bug.
+    """
+    in_tree_files: List[Path] = []
+    loose_files: List[Path] = []
+    skipped_unsupported = 0
+
+    for root, dirs, files in os.walk(str(target)):
+        root_path = Path(root)
+        rel = root_path.relative_to(target)
+        parts = rel.parts
+
+        # Prune skipped subtrees IN PLACE so os.walk doesn't descend
+        # them — the `continue` alone still paid the full walk cost of
+        # .git / node_modules / vendor trees on big vendored repos.
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".")
+                   and d not in ("node_modules", "vendor")]
+
+        if any(p.startswith(".") for p in parts):
+            continue
+        if "node_modules" in parts or "vendor" in parts:
+            continue
+
+        is_test_dir = _in_recognized_test_tree(parts)
+
+        for fname in files:
+            if not fname.endswith(_SUPPORTED_EXTENSIONS):
+                if is_test_dir or _TEST_FILE_PATTERNS.search(fname):
+                    skipped_unsupported += 1
+                continue
+            if is_test_dir or _TEST_FILE_PATTERNS.search(fname):
+                bucket = in_tree_files if is_test_dir else loose_files
+                # Only this bucket's first capped candidates can survive
+                # the final priority merge. Keep walking to count every
+                # unsupported file and to find higher-priority tree files.
+                if len(bucket) >= _TEST_FILE_COUNT_LIMIT:
+                    continue
+                fpath = root_path / fname
+                try:
+                    size = fpath.stat().st_size
+                except OSError:
+                    # Dangling symlink / vanished file in the scanned
+                    # repo: skip the entry, keep the pass — one bad
+                    # entry used to abort the whole discovery walk
+                    # (ALL test evidence for the target lost).
+                    continue
+                if size < _TEST_FILE_BYTE_LIMIT:
+                    bucket.append(fpath)
+
+    # The result cap must not be walk-ordered: enough planted loose
+    # test files sorting ahead of tests/ in the walk would evict the
+    # entire curated suite from the capped set. Recognized test trees
+    # take the cap first; loose files fill the remainder.
+    return (in_tree_files + loose_files)[:_TEST_FILE_COUNT_LIMIT], skipped_unsupported
+
+
+def _extract_test_functions(source: str, suffix: str = "") -> List[tuple]:
+    """Extract test function names and their bodies from source.
+
+    ``suffix`` selects per-language openers: .php gains the PHPUnit
+    camelCase convention; every other language keeps the base set.
+    """
+    results = []
+
+    pattern = (
+        _PHP_TEST_FUNC_PATTERN if suffix == ".php" else _TEST_FUNC_PATTERN
+    )
+    func_starts = list(pattern.finditer(source))
+    for i, match in enumerate(func_starts):
+        # Group 1: keyword-introduced definitions; group 2: C-family.
+        name = match.group(1) or match.group(2)
+        start = match.start()
+        end = func_starts[i + 1].start() if i + 1 < len(func_starts) else len(source)
+        body = source[start:min(end, start + 5000)]
+        results.append((name, body))
+
+    return results
+
+
+def _infer_target_functions(
+    test_name: str,
+    test_body: str,
+    file_suffix: str = "",
+) -> List[str]:
+    """Infer which function(s) a test exercises.
+
+    Uses naming convention: test_<function_name>[_suffix].
+    ``file_suffix`` scopes per-language call-reference noise: the PHP
+    stoplist applies to .php bodies only, so a project function that
+    shares a PHP builtin's name (``count``, ``sprintf``) keeps its
+    call-reference mapping in every other language.
+    """
+    targets = []
+
+    stripped = test_name
+    if stripped.startswith("test_"):
+        stripped = stripped[5:]
+    elif re.match(r"test[A-Z]", stripped):
+        # PHPUnit camelCase convention: testFindUser exercises
+        # findUser.
+        rest = stripped[4:]
+        stripped = rest[0].lower() + rest[1:]
+    elif stripped.endswith(("_tests", "_test")):
+        # C-family suffix convention (``sshkey_tests``): the driver
+        # name itself is not a target; call references in the body
+        # carry the real mapping.
+        stripped = ""
+
+    for suffix in ("_success", "_failure", "_error", "_empty",
+                   "_null", "_valid", "_invalid", "_basic",
+                   "_edge_case", "_boundary", "_negative"):
+        if stripped.endswith(suffix):
+            stripped = stripped[:len(stripped) - len(suffix)]
+            break
+
+    if stripped and len(stripped) >= 2:
+        targets.append(stripped)
+
+    php = file_suffix == ".php"
+    # \b pins the callee name to a word start: without it an
+    # unanchored scan restarts inside every identifier suffix —
+    # quadratic on a long token — and the dropped mid-word starts
+    # were never real callee names.
+    calls = re.findall(r"\b(\w{2,})\s*\(", test_body)
+    for call in calls:
+        if (
+            call != test_name  # the definition line matches too
+            and not call.startswith("test_")
+            and not call.startswith("assert")
+            and not call.startswith("self")
+            # PHPUnit expectation setup ($this->expectException(...))
+            # is assertion machinery, not a target — same treatment
+            # as the assert prefix above, .php-scoped.
+            and not (php and call.startswith("expect"))
+            and not (php and call in _PHP_CALL_NOISE)
+            and call not in ("print", "len", "str", "int", "list",
+                             "dict", "set", "range", "type", "isinstance",
+                             "hasattr", "getattr", "setattr", "super",
+                             "True", "False", "None", "mock", "patch",
+                             "fixture", "parametrize", "raises", "warns",
+                             "mark", "skip", "xfail",
+                             "open", "sorted", "map", "filter", "zip",
+                             "format", "bytes", "tuple", "os", "json",
+                             "re",
+                             # C keywords / ubiquitous libc noise the
+                             # ``name(`` heuristic would otherwise
+                             # misread as targets in C test bodies.
+                             "if", "for", "while", "switch", "return",
+                             "sizeof", "defined", "free", "malloc",
+                             "calloc", "memset", "memcpy", "strlen",
+                             "strcmp", "printf", "fprintf", "snprintf",
+                             "exit")
+            and call not in targets
+        ):
+            targets.append(call)
+            if len(targets) >= 5:
+                break
+
+    return targets
+
+
+def _extract_assertions(body: str) -> List[str]:
+    """Extract assertion statements from a test body."""
+    assertions = []
+
+    for match in _ASSERT_PATTERN.finditer(body):
+        assertion_text = match.group(0).strip()
+        assertion_text = assertion_text[:120]
+        assertions.append(assertion_text)
+        if len(assertions) >= 10:
+            break
+
+    return assertions

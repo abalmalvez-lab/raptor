@@ -1,0 +1,122 @@
+name: SCA compromise-detection check
+
+# Drives ``packages/sca/scripts/raptor-sca-compromise-check`` against the
+# committed corpus of known supply-chain compromises. Asserts the
+# SCA pipeline still surfaces the expected detection signal(s)
+# for each incident, plus two end-to-end checks:
+#
+#   * report.md ↔ findings.json severity-count parity
+#   * --fail-on-severity info exits 1 on every fixture (CI-gate
+#     machinery end-to-end)
+#
+# Catches the silent-coverage class of bug — the canonical
+# example would be "OSV stopped surfacing log4shell at the
+# expected severity" or "the sentinel-name list lost
+# ua-parser-js" or "the install-hook regex no longer matches
+# ``curl | sh``". These are regressions a unit-test suite
+# wouldn't catch because they're integration-of-detector +
+# external-data shifts.
+#
+# Runs on:
+#   - manual dispatch (workflow_dispatch) — operator-triggered
+#   - weekly cron (Monday 05:00 UTC, one hour after the stress
+#     sweep so they don't queue against each other)
+#   - PR touching the corpus / harness / supply-chain detector —
+#     prevents an incoming change from quietly breaking detection
+#
+# Network: hits OSV + KEV + npm/PyPI registries. Per-fixture
+# wallclock ~10-15s on a warm cache; whole corpus runs in
+# 1-2 minutes once OSV responds.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 5 * * 1'
+  pull_request:
+    paths:
+      - 'packages/sca/scripts/raptor-sca-compromise-check'
+      - 'test/data/sca-e2e/compromise-corpus/**'
+      - 'packages/sca/supply_chain/**'
+      - 'packages/sca/findings.py'
+      - 'packages/sca/thresholds.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'uv.toml'
+      - '.github/workflows/sca-compromise-check.yml'
+      - '.github/actions/setup-venv/action.yml'
+      - '.github/actions/enable-userns/action.yml'
+      - '.github/scripts/ci_cache_key.py'
+
+permissions:
+  contents: read
+
+# A new push or cron firing while a previous run is in-flight
+# supersedes it — the latest state is what matters.
+concurrency:
+  group: sca-compromise-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VENV_PATH: .venv
+
+jobs:
+  compromise-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
+
+      - name: Enable the netns egress tier (unprivileged user namespaces)
+        # The SCA resolvers dry-run untrusted manifests with egress
+        # confined to the sandbox's netns tier, and the sandbox fails
+        # closed when that tier is unavailable (require_proxy_netns —
+        # the port-scoped Landlock fallback cannot enforce the hostname
+        # allowlist). Ubuntu 24.04 runner images block unprivileged
+        # user namespaces via AppArmor by default and the tier needs
+        # newuidmap/newgidmap from the uidmap package.
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - name: Restore or rebuild runtime venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-runtime
+          uv-export-extra-args: --no-dev
+          save-on-rebuild: 'true'
+
+      - name: Expose runtime interpreter to subsequent steps
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
+              output.write(str(Path(os.environ["VENV_PATH"]).resolve() / "bin") + "\n")
+          PYTHON
+
+      - name: Run compromise-detection harness
+        # Trust marker required by ``libexec/*`` scripts. CI is the
+        # trusted-caller analogue of the operator's CLI.
+        env:
+          _RAPTOR_TRUSTED: '1'
+        # The harness exits 1 if any axis (catch / parity / gate)
+        # fails on any fixture — that propagates straight to the
+        # workflow check. The per-fixture report (which signals
+        # matched / missed) is in the run's stdout; operators
+        # reproduce a regression locally via:
+        #   packages/sca/scripts/raptor-sca-compromise-check \
+        #     test/data/sca-e2e/compromise-corpus --only <fixture-name>
+        run: |
+          set -euo pipefail
+          packages/sca/scripts/raptor-sca-compromise-check \
+            test/data/sca-e2e/compromise-corpus \
+            --no-offline

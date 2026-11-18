@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
 
+from core.dataflow._schema_checks import unique_object_fields
 from core.dataflow.sanitizer_evidence import (
     PROVENANCE_LLM,
     SCHEMA_VERSION,
@@ -34,12 +34,19 @@ from core.dataflow.sanitizer_evidence import (
     CandidateValidator,
 )
 from core.inventory.languages import detect_language
+from core.paths import confine
+from core.source import DEFAULT_MAX_SOURCE_CHARS, open_regular_beneath, split_lines
+from core.source.streams import preserving_stream_error
 from core.security.prompt_defense_profiles import CONSERVATIVE, get_profile_for
 from core.security.prompt_envelope import (
     PromptBundle,
     UntrustedBlock,
     build_prompt,
 )
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 # ---------------------------------------------------------------------
@@ -48,6 +55,8 @@ from core.security.prompt_envelope import (
 
 
 _PROMPT_VERSION = "2"
+# Validation changes must invalidate cached responses even without a prompt edit.
+_RESPONSE_SCHEMA_VERSION = 2
 
 _SYSTEM_PROMPT = """\
 You are reviewing one source file for project-specific validator or
@@ -121,7 +130,7 @@ character substitution, the function is partial at best — confidence
 
 
 _PROMPT_VERSION_SHA = hashlib.sha256(
-    f"{_PROMPT_VERSION}:{_SYSTEM_PROMPT}".encode("utf-8")
+    f"{_PROMPT_VERSION}:{_SYSTEM_PROMPT}".encode()
 ).hexdigest()[:16]
 
 
@@ -135,7 +144,7 @@ _PROMPT_VERSION_SHA = hashlib.sha256(
 #: of vendor-side error, etc.). Treat ``""`` as "LLM gave us nothing"
 #: and ``None`` as "extractor itself failed" — both produce no
 #: candidates plus an :data:`extraction_failures` entry.
-ExtractorFn = Callable[[PromptBundle], Optional[str]]
+ExtractorFn = Callable[[PromptBundle], str | None]
 
 
 # ---------------------------------------------------------------------
@@ -148,16 +157,19 @@ def build_cache_key(
     file_content_sha: str,
     language: str,
     model_family: str,
+    file_path: str = "",
 ) -> str:
     """Stable cache key. Bumps to schema_version, prompt template,
-    model family, language, or file content all force re-extraction
+    model family, language, source path, or file content all force re-extraction
     — by design."""
     parts = [
         "sanitizer_evidence",
         f"v{SCHEMA_VERSION}",
+        f"response_v{_RESPONSE_SCHEMA_VERSION}",
         f"prompt_{_PROMPT_VERSION_SHA}",
         f"model_{model_family}",
         f"lang_{language or 'unknown'}",
+        f"source_{hashlib.sha256(file_path.encode('utf-8', errors='surrogatepass')).hexdigest()}",
         file_content_sha,
     ]
     return ":".join(parts)
@@ -204,10 +216,12 @@ def _coerce_semantics_tag(tag: object) -> str:
     return SEMANTICS_OTHER
 
 
-def _coerce_confidence(value: object) -> Optional[float]:
+def _coerce_confidence(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         f = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
     if not (0.0 <= f <= 1.0):
         return None
@@ -218,36 +232,53 @@ def _parse_response(
     raw: str,
     file_path: str,
     line_count: int,
-) -> Tuple[Tuple[CandidateValidator, ...], List[str]]:
+) -> tuple[tuple[CandidateValidator, ...], list[str]]:
     """Parse the LLM's JSON output into CandidateValidators.
 
     Returns ``(candidates, errors)``. Errors are human-readable
     strings suitable for :data:`SanitizerEvidence.extraction_failures`;
     callers thread them up.
     """
-    errors: List[str] = []
+    errors: list[str] = []
 
     try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError as e:
+        obj = json.loads(raw, object_pairs_hook=unique_object_fields)
+    except ValueError as e:
+        # JSONDecodeError and configured integer-decoder limits both
+        # represent response refusals, not a successful empty extraction.
         return (), [f"{file_path}: response not JSON ({e})"]
 
     if not isinstance(obj, dict):
         return (), [f"{file_path}: response top-level is not an object"]
 
-    items = obj.get("validators", [])
+    if "validators" not in obj:
+        return (), [f"{file_path}: response missing 'validators' field"]
+    items = obj["validators"]
     if not isinstance(items, list):
         return (), [f"{file_path}: 'validators' field is not a list"]
 
-    candidates: List[CandidateValidator] = []
+    candidates: list[CandidateValidator] = []
     for i, raw_item in enumerate(items):
         if not isinstance(raw_item, dict):
             errors.append(f"{file_path} item {i}: not an object")
             continue
 
-        name = str(raw_item.get("name", "")).strip()
-        qualified_name = str(raw_item.get("qualified_name", "")).strip() or name
-        semantics_text = str(raw_item.get("semantics_text", "")).strip()
+        name = raw_item.get("name")
+        semantics_text = raw_item.get("semantics_text")
+        if (not isinstance(name, str) or not name.strip()
+                or not isinstance(semantics_text, str) or not semantics_text.strip()):
+            errors.append(f"{file_path} item {i}: name or semantics_text empty or not a string")
+            continue
+        name = name.strip()
+        semantics_text = semantics_text.strip()
+        qualified_name = raw_item.get("qualified_name")
+        if qualified_name is None:
+            qualified_name = name
+        elif not isinstance(qualified_name, str):
+            errors.append(f"{file_path} item {i}: qualified_name not a string")
+            continue
+        else:
+            qualified_name = qualified_name.strip() or name
         semantics_tag = _coerce_semantics_tag(raw_item.get("semantics_tag"))
         confidence = _coerce_confidence(raw_item.get("confidence"))
         source_line = raw_item.get("source_line")
@@ -255,23 +286,17 @@ def _parse_response(
         if confidence is None:
             errors.append(f"{file_path} item {i}: confidence missing or out of range")
             continue
-        if not isinstance(source_line, int) or source_line < 1:
+        if isinstance(source_line, bool) or not isinstance(source_line, int) or source_line < 1:
             errors.append(
                 f"{file_path} item {i}: source_line not a positive integer"
             )
             continue
-        if line_count and source_line > line_count:
+        if source_line > line_count:
             errors.append(
                 f"{file_path} item {i}: source_line {source_line} > file lines "
                 f"{line_count}"
             )
             continue
-        if not name or not semantics_text:
-            errors.append(
-                f"{file_path} item {i}: name or semantics_text empty"
-            )
-            continue
-
         try:
             candidates.append(
                 CandidateValidator(
@@ -302,8 +327,8 @@ def extract_from_content(
     content: str,
     extractor: ExtractorFn,
     model_id: str = "",
-    cache: Optional[Dict[str, Tuple[CandidateValidator, ...]]] = None,
-) -> Tuple[Tuple[CandidateValidator, ...], List[str]]:
+    cache: dict[str, tuple[CandidateValidator, ...]] | None = None,
+) -> tuple[tuple[CandidateValidator, ...], list[str]]:
     """Extract candidates from one file's content.
 
     If ``cache`` is supplied (mutable dict), checks it before calling
@@ -318,6 +343,7 @@ def extract_from_content(
         file_content_sha=sha,
         language=language,
         model_family=model_family,
+        file_path=file_path,
     )
     if cache is not None and cache_key in cache:
         return cache[cache_key], []
@@ -327,13 +353,51 @@ def extract_from_content(
     if raw is None:
         return (), [f"{file_path}: extractor returned no response"]
 
-    line_count = content.count("\n") + 1
+    line_count = len(split_lines(content))
     candidates, errors = _parse_response(raw, file_path, line_count)
 
-    if cache is not None:
+    if cache is not None and not errors:
+        # Only error-free parses are cached. Cache hits return an empty
+        # error list, so caching an errored parse would permanently
+        # record a transient malformed response as "no validators in
+        # this file" and hide the failure from telemetry; leaving the
+        # entry out lets the next call re-extract instead.
         cache[cache_key] = candidates
 
     return candidates, errors
+
+
+def _read_source_prefix(repo_root: Path, full: Path) -> tuple[str, bool] | None:
+    """Read a faithful UTF-8 prefix through an anchored, bounded text stream."""
+    try:
+        base = repo_root.resolve()
+        relative = full.relative_to(base)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    stream = open_regular_beneath(
+        base, relative, "r", encoding="utf-8", errors="strict", newline="",
+    )
+    if stream is None:
+        return None
+    try:
+        with preserving_stream_error(stream):
+            parts: list[str] = []
+            remaining = DEFAULT_MAX_SOURCE_CHARS + 1
+            while remaining > 0:
+                part = stream.read(min(remaining, 64 * 1024))
+                if not part:
+                    break
+                parts.append(part)
+                remaining -= len(part)
+            content = "".join(parts)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if len(content) <= DEFAULT_MAX_SOURCE_CHARS:
+        return content, False
+    content = content[:DEFAULT_MAX_SOURCE_CHARS]
+    if "\n" in content:
+        content = content.rsplit("\n", 1)[0] + "\n"
+    return content, True
 
 
 def extract_from_files(
@@ -342,23 +406,34 @@ def extract_from_files(
     repo_root: Path,
     extractor: ExtractorFn,
     model_id: str = "",
-    cache: Optional[Dict[str, Tuple[CandidateValidator, ...]]] = None,
-) -> Tuple[Tuple[CandidateValidator, ...], List[str]]:
+    cache: dict[str, tuple[CandidateValidator, ...]] | None = None,
+) -> tuple[tuple[CandidateValidator, ...], list[str]]:
     """Extract from multiple files; de-duplicate by ``qualified_name``.
 
     File-read failures are recorded in the returned errors and
-    skipped; the remaining files still contribute candidates.
+    skipped; the remaining files still contribute candidates. Equal names
+    at distinct source locations add an ambiguity diagnostic.
     """
-    all_candidates: List[CandidateValidator] = []
-    all_errors: List[str] = []
+    all_candidates: list[CandidateValidator] = []
+    all_errors: list[str] = []
 
     for rel in file_paths:
-        full = repo_root / rel
-        try:
-            content = full.read_text()
-        except OSError as e:
-            all_errors.append(f"{rel}: read failed ({e})")
+        # Preserve outside-root diagnostics before the anchored read;
+        # paths originate in finding/config records.
+        full = confine(repo_root, rel)
+        if full is None:
+            all_errors.append(f"{rel}: path escapes repo root")
             continue
+        # Capped read (shared default): contained but untrusted repo
+        # content. Prefix candidates remain useful, but downstream
+        # evidence must disclose the incomplete file coverage.
+        got = _read_source_prefix(repo_root, full)
+        if got is None:
+            all_errors.append(f"{rel}: read failed or source is not UTF-8")
+            continue
+        if got[1]:
+            all_errors.append(f"{rel}: source read truncated; extraction covers a prefix only")
+        content = got[0]
 
         candidates, errors = extract_from_content(
             file_path=rel,
@@ -370,9 +445,15 @@ def extract_from_files(
         all_candidates.extend(candidates)
         all_errors.extend(errors)
 
-    by_qname: Dict[str, CandidateValidator] = {}
+    by_qname: dict[str, CandidateValidator] = {}
     for c in all_candidates:
-        # First-seen wins. Acceptable; downstream LLM doesn't reason
-        # about which file a duplicate name was first defined in.
-        by_qname.setdefault(c.qualified_name, c)
+        # Preserve first-seen dedup, but expose distinct source
+        # observations rather than implying a unique callee binding.
+        first = by_qname.setdefault(c.qualified_name, c)
+        if (first.source_file, first.source_line) != (c.source_file, c.source_line):
+            all_errors.append(
+                f"{c.qualified_name}: ambiguous candidate name at "
+                f"{first.source_file}:{first.source_line} and "
+                f"{c.source_file}:{c.source_line}; no callee binding established"
+            )
     return tuple(by_qname.values()), all_errors

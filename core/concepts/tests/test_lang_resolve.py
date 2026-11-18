@@ -1,0 +1,1751 @@
+"""Per-language study resolution — core/concepts/lang_resolve.py.
+
+Fixture trees are built under tmp_path; no LLM, no subprocess.
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from core.concepts.lang_resolve import (
+    STUDY_LANGUAGES,
+    STUDY_SUFFIXES,
+    extract_question_identifiers,
+    identifier_tail,
+    is_study_supported_path,
+    language_for_path,
+    resolve_concept_docs,
+    resolve_identifiers,
+)
+from core.testing import requires_ts
+
+# ------------------------------------------------------------------
+# Language support surface
+# ------------------------------------------------------------------
+
+class TestLanguageSupport:
+    def test_first_class_languages_supported(self) -> None:
+        for lang in ("python", "go", "java", "javascript", "typescript",
+                     "rust", "php", "kotlin", "csharp", "swift"):
+            assert lang in STUDY_LANGUAGES
+
+    def test_suffixes_cover_first_class_languages(self) -> None:
+        for suffix in (".py", ".go", ".java", ".js", ".ts", ".tsx", ".rs",
+                       ".php", ".kt", ".kts", ".cs", ".swift"):
+            assert suffix in STUDY_SUFFIXES
+
+    def test_c_is_not_routed_here(self) -> None:
+        assert language_for_path("a.c") is None
+        assert language_for_path("a.hpp") is None
+
+    def test_c_still_study_supported_overall(self) -> None:
+        assert is_study_supported_path("a.c")
+        assert is_study_supported_path("a.cpp")
+        assert is_study_supported_path("pkg/mod.py")
+        assert is_study_supported_path("x.rs")
+
+    def test_unsupported_language(self) -> None:
+        assert language_for_path("a.rb") is None
+        assert not is_study_supported_path("a.rb")
+        assert not is_study_supported_path("a.lua")
+
+    def test_none_routes_like_unsupported(self) -> None:
+        # Callers feed paths straight from LLM-authored JSON where a
+        # key can be present-but-null; None must answer like an
+        # unsupported path, never reach Path() and crash the caller.
+        assert language_for_path(None) is None
+        assert not is_study_supported_path(None)
+
+    def test_identifier_tail(self) -> None:
+        assert identifier_tail("json.loads") == "loads"
+        assert identifier_tail("Vec::new") == "new"
+        assert identifier_tail("$obj->method") == "method"
+        assert identifier_tail("plain") == "plain"
+
+
+# ------------------------------------------------------------------
+# Question identifier extraction
+# ------------------------------------------------------------------
+
+class TestExtractQuestionIdentifiers:
+    def test_backticks_first(self) -> None:
+        out = extract_question_identifiers(
+            "Does `json.loads` reject NaN by default?",
+        )
+        assert out[0] == "json.loads"
+
+    def test_dotted_and_double_colon(self) -> None:
+        out = extract_question_identifiers(
+            "Does http.Client.Do follow redirects and does Vec::with_capacity zero?",
+        )
+        assert "http.Client.Do" in out
+        assert "Vec::with_capacity" in out
+
+    def test_snake_and_camel_case(self) -> None:
+        out = extract_question_identifiers(
+            "Does parse_config validate before RateLimiter fires?",
+        )
+        assert "parse_config" in out
+        assert "RateLimiter" in out
+
+    def test_prose_words_ignored(self) -> None:
+        out = extract_question_identifiers(
+            "does the buffer overflow when input is long",
+        )
+        assert out == []
+
+    def test_context_contributes(self) -> None:
+        out = extract_question_identifiers(
+            "Is the retry bounded?", "verdict depends on MAX_RETRIES",
+        )
+        assert "MAX_RETRIES" in out
+
+    def test_php_arrow_yields_member_tail(self) -> None:
+        # The receiver of ``$obj->method`` is a runtime value — only
+        # the member name is a resolvable identifier.
+        out = extract_question_identifiers(
+            "Does `$repo->findUser` validate its id argument?",
+        )
+        assert "findUser" in out
+        assert not any(n.startswith("$") for n in out)
+
+    def test_php_static_call_keeps_qualifier(self) -> None:
+        out = extract_question_identifiers(
+            "Does UserStore::findUser check access?",
+        )
+        assert "UserStore::findUser" in out
+
+
+# ------------------------------------------------------------------
+# Fixture helpers
+# ------------------------------------------------------------------
+
+def _write(root: Path, rel: str, text: str) -> Path:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+# ------------------------------------------------------------------
+# Python
+# ------------------------------------------------------------------
+
+class TestPythonResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "pkg/config.py", '''\
+MAX_RETRIES = 5
+
+def parse_config(path):
+    """Parse the config file.
+
+    Raises ValueError on malformed input.
+    """
+    return validate_schema(open(path).read())
+
+class ConfigStore:
+    """Holds parsed configuration."""
+
+    def load(self, path):
+        """Load and cache."""
+        return parse_config(path)
+''')
+        return tmp_path
+
+    def test_function_with_docstring(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["parse_config"])
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert it.file == "pkg/config.py"
+        assert "Raises ValueError" in it.doc_comment
+        assert "def parse_config" in it.definition
+        assert "validate_schema" in it.calls
+        assert not res.unresolved
+
+    def test_method_via_qualified_name(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["ConfigStore.load"])
+        assert [it.name for it in res.items] == ["load"]
+        assert res.items[0].doc_comment == "Load and cache."
+        assert res.items[0].related_items == ["ConfigStore"]
+
+    def test_qualified_mismatch_not_guessed(self, tree: Path) -> None:
+        # OtherClass.load does not exist — the ConfigStore method must
+        # NOT be offered as its definition.
+        res = resolve_identifiers(tree, ["OtherClass.load"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+
+    def test_class_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["ConfigStore"])
+        assert len(res.items) == 1
+        assert res.items[0].kind == "struct"
+        assert "Holds parsed configuration" in res.items[0].doc_comment
+
+    def test_module_constant(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MAX_RETRIES"])
+        assert len(res.items) == 1
+        assert "MAX_RETRIES = 5" in res.items[0].definition
+
+    def test_callers_populated(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["parse_config"])
+        assert "load" in res.items[0].callers
+
+
+class TestTailCollisions:
+    """Identifiers sharing a tail (json.loads / pickle.loads) must
+    EACH be accounted for — resolved or reported unresolved. A
+    tail-keyed lookup used to keep only one and silently drop the
+    other from all accounting."""
+
+    def test_both_colliding_identifiers_resolve(
+        self, tmp_path: Path,
+    ) -> None:
+        _write(tmp_path, "json.py", "def loads(s):\n    return s\n")
+        _write(tmp_path, "pickle.py", "def loads(b):\n    return b\n")
+        res = resolve_identifiers(
+            tmp_path, ["json.loads", "pickle.loads"],
+        )
+        files = {it.file for it in res.items}
+        assert files == {"json.py", "pickle.py"}
+        assert res.unresolved == []
+
+    def test_both_colliding_identifiers_reported_unresolved(
+        self, tmp_path: Path,
+    ) -> None:
+        _write(tmp_path, "other.py", "X = 1\n")
+        res = resolve_identifiers(
+            tmp_path, ["json.loads", "pickle.loads"],
+        )
+        assert res.items == []
+        assert sorted(u["name"] for u in res.unresolved) == [
+            "json.loads", "pickle.loads",
+        ]
+
+    def test_colliding_class_methods_filtered_per_candidate(
+        self, tmp_path: Path,
+    ) -> None:
+        # The qualifier check runs per candidate: Store.load resolves,
+        # Ghost.load is reported unresolved instead of vanishing.
+        _write(tmp_path, "store.py", '''\
+class Store:
+    def load(self, path):
+        return path
+''')
+        res = resolve_identifiers(
+            tmp_path, ["Store.load", "Ghost.load"],
+        )
+        assert [it.name for it in res.items] == ["load"]
+        assert [u["name"] for u in res.unresolved] == ["Ghost.load"]
+
+
+class TestPythonMonkeyPatching:
+    def test_monkey_patch_marked_unresolvable(self, tmp_path: Path) -> None:
+        _write(tmp_path, "patch.py", '''\
+import json
+
+json.loads = lambda s: s
+''')
+        res = resolve_identifiers(tmp_path, ["json.loads"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+        assert "monkey-patching" in res.unresolved[0]["reason"] or (
+            "dynamic attribute assignment" in res.unresolved[0]["reason"]
+        )
+
+    def test_setattr_marked_unresolvable(self, tmp_path: Path) -> None:
+        _write(tmp_path, "patch.py", '''\
+import target
+
+setattr(target, "frobnicate", lambda: None)
+''')
+        res = resolve_identifiers(tmp_path, ["target.frobnicate"])
+        assert res.items == []
+        assert "monkey-patching" in res.unresolved[0]["reason"]
+
+
+# ------------------------------------------------------------------
+# Go
+# ------------------------------------------------------------------
+
+class TestGoResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "server/header.go", '''\
+package server
+
+// MaxHeaderLen bounds the header buffer.
+const MaxHeaderLen = 512
+
+// Header is one parsed wire header.
+type Header struct {
+	Len int
+}
+
+// ParseHeader parses one wire header.
+// It returns an error when the length field exceeds MaxHeaderLen.
+func ParseHeader(b []byte) (*Header, error) {
+	return decodeHeader(b)
+}
+''')
+        return tmp_path
+
+    def test_function_with_doc_comment(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["ParseHeader"])
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert "returns an error" in it.doc_comment
+
+    @requires_ts("go")
+    def test_function_calls_extracted(self, tree: Path) -> None:
+        # Callee extraction needs a tree — without the go grammar the
+        # resolver still yields the item, docs and definition, but the
+        # calls list stays coarse.
+        res = resolve_identifiers(tree, ["ParseHeader"])
+        assert "decodeHeader" in res.items[0].calls
+
+    def test_struct_type(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Header"])
+        assert res.items[0].kind == "struct"
+        assert "type Header struct" in res.items[0].definition
+        assert "parsed wire header" in res.items[0].doc_comment
+
+    def test_constant(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MaxHeaderLen"])
+        assert "const MaxHeaderLen = 512" in res.items[0].definition
+        assert "bounds the header buffer" in res.items[0].doc_comment
+
+
+# ------------------------------------------------------------------
+# Java
+# ------------------------------------------------------------------
+
+class TestJavaResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/Util.java", '''\
+public class Util {
+    public static final int MAX_DEPTH = 32;
+
+    /**
+     * Sanitizes a path against traversal.
+     * @param p raw path
+     */
+    public static String sanitizePath(String p) {
+        return p.replace("..", "");
+    }
+}
+''')
+        return tmp_path
+
+    def test_method_with_javadoc(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Util.sanitizePath"])
+        assert len(res.items) == 1
+        assert "Sanitizes a path" in res.items[0].doc_comment
+        assert res.items[0].kind == "function"
+
+    def test_class(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Util"])
+        assert res.items[0].kind == "struct"
+
+    def test_static_final_constant(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MAX_DEPTH"])
+        assert len(res.items) == 1
+        assert "MAX_DEPTH = 32" in res.items[0].definition
+
+
+# ------------------------------------------------------------------
+# JavaScript / TypeScript
+# ------------------------------------------------------------------
+
+class TestJsTsResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/helpers.ts", '''\
+export const RETRY_LIMIT = 3;
+
+/** Escape HTML entities in user input. */
+export function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;");
+}
+
+/** Token-bucket limiter. */
+export class RateLimiter {
+  take(): boolean { return true; }
+}
+''')
+        _write(tmp_path, "src/legacy.js", '''\
+// Old-style sanitizer used by the legacy pages.
+function legacySanitize(input) {
+  return String(input).trim();
+}
+''')
+        return tmp_path
+
+    def test_ts_function(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["escapeHtml"])
+        assert len(res.items) == 1
+        assert "Escape HTML entities" in res.items[0].doc_comment
+
+    def test_ts_class(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["RateLimiter"])
+        assert res.items[0].kind == "struct"
+        assert "Token-bucket limiter" in res.items[0].doc_comment
+
+    def test_ts_const(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["RETRY_LIMIT"])
+        assert "RETRY_LIMIT = 3" in res.items[0].definition
+
+    def test_js_function(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["legacySanitize"])
+        assert len(res.items) == 1
+        assert "legacy pages" in res.items[0].doc_comment
+
+
+# ------------------------------------------------------------------
+# Rust
+# ------------------------------------------------------------------
+
+class TestRustResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/frame.rs", '''\
+/// Upper bound on frame size.
+pub const MAX_FRAME: usize = 4096;
+
+/// A decoded frame.
+pub struct Frame {
+    len: usize,
+}
+
+/// Decode a frame from the wire.
+///
+/// Returns Err on truncated input.
+pub fn decode_frame(buf: &[u8]) -> Result<Frame, Error> {
+    parse_prefix(buf)
+}
+''')
+        return tmp_path
+
+    def test_function_with_triple_slash_doc(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["decode_frame"])
+        assert len(res.items) == 1
+        assert "Returns Err on truncated input" in res.items[0].doc_comment
+
+    @requires_ts("rust")
+    def test_function_calls_extracted(self, tree: Path) -> None:
+        # Same contract as the Go twin: calls need the rust grammar.
+        res = resolve_identifiers(tree, ["decode_frame"])
+        assert "parse_prefix" in res.items[0].calls
+
+    def test_struct(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Frame"])
+        assert res.items[0].kind == "struct"
+        assert "A decoded frame" in res.items[0].doc_comment
+
+    def test_const(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MAX_FRAME"])
+        assert "MAX_FRAME: usize = 4096" in res.items[0].definition
+
+
+# ------------------------------------------------------------------
+# PHP
+# ------------------------------------------------------------------
+
+class TestPhpResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/Sanitizer.php", '''\
+<?php
+/**
+ * Escapes HTML entities in user input.
+ */
+function sanitize_html(string $s): string {
+    return htmlspecialchars($s, ENT_QUOTES);
+}
+
+const MAX_UPLOAD = 4096;
+define('APP_MODE', 'prod');
+
+/** Persists users. */
+class UserStore {
+    /** Looks up a user by id. */
+    public function findUser(int $id): ?array {
+        return $this->db->fetch($id);
+    }
+}
+
+/** Hashing contract. */
+interface Hasher {
+    public function digest(string $s): string;
+}
+''')
+        return tmp_path
+
+    def test_function_with_phpdoc(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["sanitize_html"])
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert it.file == "src/Sanitizer.php"
+        assert "Escapes HTML entities" in it.doc_comment
+        assert not res.unresolved
+
+    @requires_ts("php")
+    def test_function_calls_extracted(self, tree: Path) -> None:
+        # Same contract as the Go/Rust twins: the definition body (and
+        # so callee extraction) needs the php grammar; the regex
+        # fallback still yields the item, name, and doc comment.
+        res = resolve_identifiers(tree, ["sanitize_html"])
+        assert "function sanitize_html" in res.items[0].definition
+        assert "htmlspecialchars" in res.items[0].calls
+
+    @requires_ts("php")
+    def test_method_via_double_colon(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["UserStore::findUser"])
+        assert [it.name for it in res.items] == ["findUser"]
+        assert res.items[0].doc_comment == "Looks up a user by id."
+        assert res.items[0].related_items == ["UserStore"]
+
+    @requires_ts("php")
+    def test_qualified_mismatch_not_guessed(self, tree: Path) -> None:
+        # OtherStore::findUser does not exist — the UserStore method
+        # must NOT be offered as its definition.
+        res = resolve_identifiers(tree, ["OtherStore::findUser"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+
+    def test_arrow_question_resolves_method(self, tree: Path) -> None:
+        # ``$repo->findUser`` questions reduce to the member tail at
+        # extraction time; the tail resolves to the method item.
+        idents = extract_question_identifiers(
+            "Does `$repo->findUser` check access?",
+        )
+        res = resolve_identifiers(tree, [n for n in idents
+                                         if n == "findUser"])
+        assert [it.name for it in res.items] == ["findUser"]
+
+    def test_class_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["UserStore"])
+        assert len(res.items) == 1
+        assert res.items[0].kind == "struct"
+        assert "Persists users" in res.items[0].doc_comment
+
+    def test_interface_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Hasher"])
+        assert res.items[0].kind == "struct"
+        assert "Hashing contract" in res.items[0].doc_comment
+
+    def test_const(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MAX_UPLOAD"])
+        assert len(res.items) == 1
+        assert "MAX_UPLOAD = 4096" in res.items[0].definition
+
+    def test_define_constant(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["APP_MODE"])
+        assert len(res.items) == 1
+        assert "define('APP_MODE'" in res.items[0].definition
+
+    def test_missing_identifier_unresolved(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["ghost_helper"])
+        assert res.items == []
+        assert "not found" in res.unresolved[0]["reason"]
+
+    def test_dynamic_method_injection_marked_unresolvable(
+        self, tmp_path: Path,
+    ) -> None:
+        _write(tmp_path, "hooks.php", '''\
+<?php
+$handler->onSave = function () { return 1; };
+''')
+        res = resolve_identifiers(tmp_path, ["onSave"])
+        assert res.items == []
+        assert "dynamic attribute assignment" in res.unresolved[0]["reason"]
+
+    def test_ordinary_property_assignment_not_monkeypatching(
+        self, tmp_path: Path,
+    ) -> None:
+        # ``$this->total = 0`` is plain property initialisation — the
+        # closure-RHS requirement keeps it off the monkey-patching
+        # reason; the honest fallback reason applies instead.
+        _write(tmp_path, "acc.php", '''\
+<?php
+class Acc {
+    public function __construct() {
+        $this->total = 0;
+    }
+}
+''')
+        res = resolve_identifiers(tmp_path, ["total"])
+        assert res.items == []
+        assert "dynamic attribute assignment" not in (
+            res.unresolved[0]["reason"]
+        )
+        assert "no static definition" in res.unresolved[0]["reason"]
+
+    def test_grammar_absence_degrades_to_regex_tier(
+        self, tree: Path, monkeypatch,
+    ) -> None:
+        # Without tree_sitter_php the inventory layer falls back to
+        # its regex extractor: the function still resolves (name, doc,
+        # signature line) rather than going dark.
+        import core.inventory.extractors as ex
+        monkeypatch.setattr(ex, "_TS_AVAILABLE", False)
+        res = resolve_identifiers(tree, ["sanitize_html"])
+        assert [it.name for it in res.items] == ["sanitize_html"]
+        assert "Escapes HTML entities" in res.items[0].doc_comment
+
+
+class TestKotlinResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/Frame.kt", '''\
+/** Upper bound on retries. */
+const val MAX_RETRIES = 3
+
+/** A parsed frame. */
+data class Frame(val len: Int)
+
+/** Hashing contract. */
+interface Hasher {
+    fun digest(s: String): String
+}
+
+/** Persists users. */
+class UserStore {
+    /** Looks up a user by id. */
+    fun findUser(id: Int): User? {
+        return db.fetch(id)
+    }
+}
+
+/**
+ * Decode a frame from the wire.
+ *
+ * Returns null on truncated input.
+ */
+fun decodeFrame(buf: ByteArray): Frame? {
+    return parsePrefix(buf)
+}
+''')
+        return tmp_path
+
+    def test_function_with_kdoc(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["decodeFrame"])
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert it.file == "src/Frame.kt"
+        assert "Returns null on truncated input" in it.doc_comment
+        assert not res.unresolved
+
+    @requires_ts("kotlin")
+    def test_function_calls_extracted(self, tree: Path) -> None:
+        # Same contract as the Go/Rust/PHP twins: callee extraction
+        # needs the kotlin grammar; the regex fallback still yields
+        # the item, name, and doc comment.
+        res = resolve_identifiers(tree, ["decodeFrame"])
+        assert "parsePrefix" in res.items[0].calls
+
+    @requires_ts("kotlin")
+    def test_method_via_qualified_name(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["UserStore.findUser"])
+        assert [it.name for it in res.items] == ["findUser"]
+        assert res.items[0].doc_comment == "Looks up a user by id."
+        assert res.items[0].related_items == ["UserStore"]
+
+    @requires_ts("kotlin")
+    def test_qualified_mismatch_not_guessed(self, tree: Path) -> None:
+        # OtherStore.findUser does not exist — the UserStore method
+        # must NOT be offered as its definition.
+        res = resolve_identifiers(tree, ["OtherStore.findUser"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+
+    def test_class_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Frame"])
+        assert len(res.items) == 1
+        assert res.items[0].kind == "struct"
+        assert "A parsed frame" in res.items[0].doc_comment
+
+    def test_interface_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Hasher"])
+        assert res.items[0].kind == "struct"
+        assert "Hashing contract" in res.items[0].doc_comment
+
+    def test_const_val(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MAX_RETRIES"])
+        assert len(res.items) == 1
+        assert "MAX_RETRIES = 3" in res.items[0].definition
+
+    def test_missing_identifier_unresolved(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["ghostHelper"])
+        assert res.items == []
+        assert "not found" in res.unresolved[0]["reason"]
+
+    def test_grammar_absence_degrades_to_regex_tier(
+        self, tree: Path, monkeypatch,
+    ) -> None:
+        # Without tree_sitter_kotlin the inventory layer falls back to
+        # its regex extractor (``fun`` is a GenericExtractor shape):
+        # the function still resolves rather than going dark.
+        import core.inventory.extractors as ex
+        monkeypatch.setattr(ex, "_TS_AVAILABLE", False)
+        res = resolve_identifiers(tree, ["decodeFrame"])
+        assert [it.name for it in res.items] == ["decodeFrame"]
+        assert "Returns null on truncated input" in (
+            res.items[0].doc_comment
+        )
+
+    def test_plain_line_comment_doc_harvested(
+        self, tmp_path: Path,
+    ) -> None:
+        # Doc harvesting must accept plain ``//`` line comments, not
+        # only ``/** KDoc */`` blocks — the block path never consults
+        # the per-language line-comment prefix table, so only a
+        # line-comment fixture exercises the kotlin entry.
+        _write(tmp_path, "src/Limits.kt",
+               "// Ceiling on concurrent sessions.\n"
+               "// Raised only by the operator.\n"
+               "const val MAX_SESSIONS = 8\n")
+        res = resolve_identifiers(tmp_path, ["MAX_SESSIONS"])
+        assert len(res.items) == 1
+        assert "Ceiling on concurrent sessions" in (
+            res.items[0].doc_comment
+        )
+        assert "Raised only by the operator" in (
+            res.items[0].doc_comment
+        )
+
+
+# ------------------------------------------------------------------
+# C#
+# ------------------------------------------------------------------
+
+class TestCSharpResolution:
+    # The fixture is deliberately Allman-style (brace on its own
+    # line): that is the shape GenericExtractor's `type name(...) {`
+    # regex cannot see, so the degradation tests below exercise the
+    # true fallback boundary. K&R-style C# methods DO resolve on the
+    # regex tier — the boundary is brace-style, not language.
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/Store.cs", '''\
+/// <summary>Persists users.</summary>
+class UserStore
+{
+    /// <summary>Looks up a user by id.</summary>
+    public User FindUser(int id)
+    {
+        return _db.Fetch(id);
+    }
+}
+
+/// <summary>Hashing contract.</summary>
+interface IHasher
+{
+    string Digest(string s);
+}
+
+static class Limits
+{
+    /// <summary>Upper bound on retries.</summary>
+    public const int MaxRetries = 3;
+
+    /// <summary>Default frame size.</summary>
+    public static readonly int FrameSize = 4096;
+}
+
+/// <summary>Decodes frames.</summary>
+class Decoder
+{
+    /// <summary>
+    /// Decode a frame from the wire.
+    /// Returns null on truncated input.
+    /// </summary>
+    public Frame DecodeFrame(byte[] buf)
+    {
+        return ParsePrefix(buf);
+    }
+}
+''')
+        return tmp_path
+
+    @requires_ts("csharp")
+    def test_method_with_doc_comment(self, tree: Path) -> None:
+        # Method NAMES resolve on both tiers (GenericExtractor covers
+        # the same-line-brace shape and the Allman head this fixture
+        # uses); the doc-comment extraction asserted here is what the
+        # grammar tier adds.
+        res = resolve_identifiers(tree, ["DecodeFrame"])
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert it.file == "src/Store.cs"
+        assert "Returns null on truncated input" in it.doc_comment
+        assert not res.unresolved
+
+    @requires_ts("csharp")
+    def test_method_calls_extracted(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["DecodeFrame"])
+        assert "ParsePrefix" in res.items[0].calls
+
+    @requires_ts("csharp")
+    def test_method_via_qualified_name(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["UserStore.FindUser"])
+        assert [it.name for it in res.items] == ["FindUser"]
+        assert "Looks up a user by id" in res.items[0].doc_comment
+        assert res.items[0].related_items == ["UserStore"]
+
+    @requires_ts("csharp")
+    def test_qualified_mismatch_not_guessed(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["OtherStore.FindUser"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+
+    def test_class_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["UserStore"])
+        assert len(res.items) == 1
+        assert res.items[0].kind == "struct"
+        assert "Persists users" in res.items[0].doc_comment
+
+    def test_interface_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["IHasher"])
+        assert res.items[0].kind == "struct"
+        assert "Hashing contract" in res.items[0].doc_comment
+
+    def test_const_field(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["MaxRetries"])
+        assert len(res.items) == 1
+        assert "const int MaxRetries = 3" in res.items[0].definition
+
+    def test_static_readonly_field(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["FrameSize"])
+        assert len(res.items) == 1
+        assert "readonly int FrameSize = 4096" in (
+            res.items[0].definition
+        )
+
+    def test_missing_identifier_unresolved(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["GhostHelper"])
+        assert res.items == []
+        assert "not found" in res.unresolved[0]["reason"]
+
+    def test_grammar_absence_degrades_honestly(
+        self, tree: Path, monkeypatch,
+    ) -> None:
+        # Without tree_sitter_c_sharp the type/constant regex passes
+        # still resolve, and methods resolve in BOTH brace styles —
+        # the same-line `type name(...) {` shape and the Allman head
+        # with the brace on the line below (this fixture). Where the
+        # fallback genuinely has no answer, degradation stays honest:
+        # a missing identifier comes back unresolved WITH a reason —
+        # never a crash, never a guessed definition.
+        import core.inventory.extractors as ex
+        monkeypatch.setattr(ex, "_TS_AVAILABLE", False)
+        res = resolve_identifiers(
+            tree,
+            ["UserStore", "MaxRetries", "DecodeFrame", "GhostHelper"],
+        )
+        names = {it.name for it in res.items}
+        assert {"UserStore", "MaxRetries", "DecodeFrame"} <= names
+        assert [u["name"] for u in res.unresolved] == ["GhostHelper"]
+        assert res.unresolved[0]["reason"]
+
+    def test_grammar_absence_knr_method_still_resolves(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # The other side of the brace-style boundary: a K&R-style
+        # method (`{` on the signature line) matches GenericExtractor's
+        # `type name(...) {` shape, so it resolves even without the
+        # grammar.
+        import core.inventory.extractors as ex
+        monkeypatch.setattr(ex, "_TS_AVAILABLE", False)
+        _write(tmp_path, "src/Knr.cs",
+               "class Decoder {\n"
+               "    /// <summary>Decodes one frame.</summary>\n"
+               "    public Frame DecodeFrame(byte[] buf) {\n"
+               "        return ParsePrefix(buf);\n"
+               "    }\n"
+               "}\n")
+        res = resolve_identifiers(tmp_path, ["DecodeFrame"])
+        assert [it.name for it in res.items] == ["DecodeFrame"]
+        assert not res.unresolved
+
+
+# ------------------------------------------------------------------
+# Swift
+# ------------------------------------------------------------------
+
+class TestSwiftResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "src/Frame.swift", '''\
+/// Upper bound on retries.
+let maxRetries = 3
+
+/// A parsed frame.
+struct Frame {
+    let len: Int
+}
+
+/// Hashing contract.
+protocol Hasher {
+    func digest(_ s: String) -> String
+}
+
+/// Persists users.
+class UserStore {
+    /// Looks up a user by id.
+    func findUser(_ id: Int) -> User? {
+        return db.fetch(id)
+    }
+}
+
+/// Decode a frame from the wire.
+///
+/// Returns nil on truncated input.
+func decodeFrame(_ buf: [UInt8]) -> Frame? {
+    return parsePrefix(buf)
+}
+''')
+        return tmp_path
+
+    def test_function_with_doc_comment(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["decodeFrame"])
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert it.file == "src/Frame.swift"
+        assert "Returns nil on truncated input" in it.doc_comment
+        assert not res.unresolved
+
+    @requires_ts("swift")
+    def test_function_calls_extracted(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["decodeFrame"])
+        assert "parsePrefix" in res.items[0].calls
+
+    @requires_ts("swift")
+    def test_method_via_qualified_name(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["UserStore.findUser"])
+        assert [it.name for it in res.items] == ["findUser"]
+        assert res.items[0].doc_comment == "Looks up a user by id."
+        assert res.items[0].related_items == ["UserStore"]
+
+    @requires_ts("swift")
+    def test_qualified_mismatch_not_guessed(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["OtherStore.findUser"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+
+    def test_struct_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Frame"])
+        assert len(res.items) == 1
+        assert res.items[0].kind == "struct"
+        assert "A parsed frame" in res.items[0].doc_comment
+
+    def test_protocol_resolution(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["Hasher"])
+        assert res.items[0].kind == "struct"
+        assert "Hashing contract" in res.items[0].doc_comment
+
+    def test_let_constant(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["maxRetries"])
+        assert len(res.items) == 1
+        assert "maxRetries = 3" in res.items[0].definition
+
+    def test_missing_identifier_unresolved(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["ghostHelper"])
+        assert res.items == []
+        assert "not found" in res.unresolved[0]["reason"]
+
+    def test_grammar_absence_degrades_to_regex_tier(
+        self, tree: Path, monkeypatch,
+    ) -> None:
+        # Without tree_sitter_swift the inventory layer falls back to
+        # its regex extractor (``func`` is a GenericExtractor shape):
+        # the function still resolves rather than going dark.
+        import core.inventory.extractors as ex
+        monkeypatch.setattr(ex, "_TS_AVAILABLE", False)
+        res = resolve_identifiers(tree, ["decodeFrame"])
+        assert [it.name for it in res.items] == ["decodeFrame"]
+        assert "Returns nil on truncated input" in (
+            res.items[0].doc_comment
+        )
+
+
+class TestPhpPatternFloodPerformance:
+    """Keyword floods against the PHP fallback patterns: interior
+    ``\\s+`` under the MULTILINE ^-anchors was quadratic on
+    newline-separated keyword floods (seconds at 64KB). The
+    horizontal-only patterns run in milliseconds; the budget is
+    generous for slow machines yet an order of magnitude below the
+    quadratic variant at this input size."""
+
+    def test_const_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("php", "SENTINEL")
+        assert pat is not None
+        flood = "public\n" * 18724  # ~128KB
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("php", "MAX_N")
+        assert pat is not None
+        assert pat.search("  public const int MAX_N = 3;")
+        assert pat.search("define('MAX_N', 3);")
+
+    def test_type_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("php", "SENTINEL")
+        assert pat is not None
+        flood = "final\n" * 21845  # ~128KB
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_type_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("php", "Widget")
+        assert pat is not None
+        assert pat.search("abstract class Widget {")
+        assert pat.search("  final readonly class Widget")
+        assert pat.search("interface Widget")
+
+
+class TestJavaPatternFloodPerformance:
+    """Keyword floods against the Java fallback patterns: interior
+    ``\\s+`` under the MULTILINE ^-anchors let the modifier loop
+    swallow newline-separated keyword floods from every line's
+    anchor, and the type/name separator overlapped the type class on
+    space floods — each quadratic (seconds at 64KB). The fixed
+    patterns run in milliseconds; the budget is generous for slow
+    machines yet an order of magnitude below the quadratic variants
+    at this input size."""
+
+    def test_const_pattern_on_keyword_floods(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("java", "SENTINEL")
+        assert pat is not None
+        for unit in ("public\n", "static\n", "final\n",
+                     "public static final\n"):
+            flood = unit * (128 * 1024 // len(unit))
+            start = time.monotonic()
+            assert pat.search(flood) is None
+            assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_on_type_whitespace_flood(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("java", "SENTINEL")
+        assert pat is not None
+        flood = "final int" + " " * (128 * 1024)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("java", "MAX_N")
+        assert pat is not None
+        assert pat.search("public static final int MAX_N = 3;")
+        assert pat.search("final Map<String, Integer> MAX_N = of();")
+        assert pat.search("final static long MAX_N = 1L;")
+        assert pat.search("static\tint\tMAX_N = 1;")
+        # Neither static nor final: not a constant.
+        assert pat.search("int MAX_N = 3;") is None
+
+    def test_type_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("java", "SENTINEL")
+        assert pat is not None
+        flood = "abstract\n" * (128 * 1024 // 9)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_type_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("java", "Widget")
+        assert pat is not None
+        assert pat.search("public final class Widget {")
+        assert pat.search("interface Widget {")
+        assert pat.search("public record Widget(int x) {}")
+
+
+class TestRustPatternFloodPerformance:
+    """An unterminated ``pub(`` re-scanned to EOF from every line's
+    anchor when the visibility class could cross newlines —
+    quadratic on ``pub(`` floods."""
+
+    def test_patterns_on_pub_paren_flood(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern, _type_pattern
+        # 256KB: the newline-crossing variant squeaks under the
+        # budget at 128KB on a fast machine, and quadratic scaling
+        # puts 256KB decisively over it.
+        flood = "pub(\n" * (256 * 1024 // 5)
+        for mkpat in (_const_pattern, _type_pattern):
+            pat = mkpat("rust", "SENTINEL")
+            assert pat is not None
+            start = time.monotonic()
+            assert pat.search(flood) is None
+            assert time.monotonic() - start < 2.0
+
+    def test_patterns_still_match_visibility_specs(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern, _type_pattern
+        cpat = _const_pattern("rust", "MAX")
+        assert cpat is not None
+        assert cpat.search("pub const MAX: usize = 10;")
+        assert cpat.search("pub(crate) static MAX: &str = \"x\";")
+        assert cpat.search("pub(in crate::m) const MAX: i32 = 0;")
+        tpat = _type_pattern("rust", "Widget")
+        assert tpat is not None
+        assert tpat.search("pub(crate) enum Widget {")
+        assert tpat.search("pub struct Widget {")
+
+
+class TestKotlinPatternFloodPerformance:
+    """Keyword floods against the Kotlin fallback patterns — the same
+    interior-``\\s+``-under-MULTILINE-anchors trap as the PHP/Java
+    twins; the horizontal-only patterns run in milliseconds and the
+    budget is generous for slow machines."""
+
+    def test_const_pattern_on_keyword_floods(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("kotlin", "SENTINEL")
+        assert pat is not None
+        for unit in ("public\n", "const\n"):
+            flood = unit * (128 * 1024 // len(unit))
+            start = time.monotonic()
+            assert pat.search(flood) is None
+            assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("kotlin", "MAX_N")
+        assert pat is not None
+        assert pat.search("const val MAX_N = 3")
+        assert pat.search("  private val MAX_N = 3")
+        assert pat.search("val MAX_N: Int = 3")
+        # ``var`` is mutable — not a constant.
+        assert pat.search("var MAX_N = 3") is None
+
+    def test_type_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("kotlin", "SENTINEL")
+        assert pat is not None
+        flood = "sealed\n" * (128 * 1024 // 7)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_type_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("kotlin", "Widget")
+        assert pat is not None
+        assert pat.search("data class Widget(")
+        assert pat.search("object Widget {")
+        assert pat.search("internal sealed interface Widget")
+
+
+class TestCSharpPatternFloodPerformance:
+    """Keyword floods against the C# fallback patterns — includes the
+    Java-twin type/whitespace seam (the type class absorbs blanks, so
+    the separator must be a single ``[ \\t]``)."""
+
+    def test_const_pattern_on_keyword_floods(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("csharp", "SENTINEL")
+        assert pat is not None
+        for unit in ("public\n", "static\n"):
+            flood = unit * (128 * 1024 // len(unit))
+            start = time.monotonic()
+            assert pat.search(flood) is None
+            assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_on_type_whitespace_flood(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("csharp", "SENTINEL")
+        assert pat is not None
+        flood = "const int" + " " * (128 * 1024)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("csharp", "MAX_N")
+        assert pat is not None
+        assert pat.search("public const int MAX_N = 3;")
+        assert pat.search("static readonly int MAX_N = 4;")
+        assert pat.search(
+            "readonly Dictionary<string, int> MAX_N = new();",
+        )
+        # Neither const nor readonly: not a constant.
+        assert pat.search("int MAX_N = 3;") is None
+
+    def test_type_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("csharp", "SENTINEL")
+        assert pat is not None
+        flood = "abstract\n" * (128 * 1024 // 9)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_type_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("csharp", "Widget")
+        assert pat is not None
+        assert pat.search("public sealed class Widget {")
+        assert pat.search("record Widget(int x);")
+        assert pat.search("internal readonly struct Widget")
+        assert pat.search("enum Widget {")
+
+
+class TestSwiftPatternFloodPerformance:
+    """Keyword floods against the Swift fallback patterns — same
+    horizontal-only doctrine as the twins above."""
+
+    def test_const_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("swift", "SENTINEL")
+        assert pat is not None
+        flood = "static\n" * (128 * 1024 // 7)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_const_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        pat = _const_pattern("swift", "maxN")
+        assert pat is not None
+        assert pat.search("static let maxN = 3")
+        assert pat.search("public let maxN: Int = 3")
+        assert pat.search("let maxN = 3")
+        # ``var`` is mutable — not a constant.
+        assert pat.search("var maxN = 3") is None
+
+    def test_type_pattern_on_keyword_flood(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("swift", "SENTINEL")
+        assert pat is not None
+        flood = "final\n" * (128 * 1024 // 6)
+        start = time.monotonic()
+        assert pat.search(flood) is None
+        assert time.monotonic() - start < 2.0
+
+    def test_type_pattern_still_matches(self) -> None:
+        from core.concepts.lang_resolve import _type_pattern
+        pat = _type_pattern("swift", "Widget")
+        assert pat is not None
+        assert pat.search("public final class Widget {")
+        assert pat.search("protocol Widget {")
+        assert pat.search("struct Widget {")
+        assert pat.search("actor Widget {")
+        assert pat.search("indirect enum Widget")
+
+
+class TestPatternLineAnchoring:
+    """The ``^``-under-MULTILINE anchor on every fallback pattern is
+    load-bearing twice over: de-anchored, a pattern (a) resolves
+    mid-line garbage (any prose containing ``val NAME`` binds NAME as
+    a declaration) and (b) restarts from every position instead of
+    every line, which is quadratic on whitespace floods. The trailing-
+    span ReDoS census cannot pin this shape — these patterns sit
+    outside its rule scope whether anchored or not, so the anchor
+    needs its own functional pin per pattern."""
+
+    def test_kotlin_const_pattern_is_line_anchored(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.concepts.lang_resolve import _const_pattern
+        # (a) functional: mid-line 'val NAME' is not a declaration.
+        pat = _const_pattern("kotlin", "GRANT_TOKEN")
+        assert pat is not None
+        assert not pat.search(
+            "fun f() { approval GRANT_TOKEN = grant() }\n",
+        )
+        # ... and end-to-end: the identifier stays unresolved.
+        _write(tmp_path, "src/Grant.kt",
+               "fun f() { approval GRANT_TOKEN = grant() }\n")
+        res = resolve_identifiers(tmp_path, ["GRANT_TOKEN"])
+        assert not res.items
+        assert [u["name"] for u in res.unresolved] == ["GRANT_TOKEN"]
+        # (b) performance: linear on a hostile single-line space
+        # flood. Anchored this is ~1 ms; de-anchored it is tens of
+        # seconds — the 2 s bound has orders of magnitude of headroom
+        # in both directions.
+        start = time.monotonic()
+        pat.search(" " * 16384)
+        assert time.monotonic() - start < 2.0, (
+            "kotlin const pattern superlinear on a space flood — "
+            "line anchor lost?"
+        )
+
+    @pytest.mark.parametrize(("language", "kind", "positive", "negative"), [
+        ("kotlin", "const",
+         "const val SENTINEL = 1", "x approval SENTINEL = 1"),
+        ("kotlin", "type",
+         "data class SENTINEL(", "reply as class SENTINEL {"),
+        ("csharp", "const",
+         "public const int SENTINEL = 3;", "x const int SENTINEL = 3;"),
+        ("csharp", "type",
+         "sealed class SENTINEL {", "new class SENTINEL {"),
+        ("swift", "const",
+         "static let SENTINEL = 3", "swap let SENTINEL = 3"),
+        ("swift", "type",
+         "struct SENTINEL {", "like struct SENTINEL {"),
+    ])
+    def test_pattern_only_matches_at_line_start(
+        self, language: str, kind: str, positive: str, negative: str,
+    ) -> None:
+        from core.concepts.lang_resolve import _const_pattern, _type_pattern
+        # Both directions: the canonical declaration matches from the
+        # line anchor; the same declaration preceded by a non-modifier
+        # token on the line does not.
+        mkpat = _const_pattern if kind == "const" else _type_pattern
+        pat = mkpat(language, "SENTINEL")
+        assert pat is not None
+        assert pat.search(positive + "\n")
+        assert not pat.search(negative + "\n")
+        # A mid-file line-start declaration still matches (MULTILINE
+        # anchor, not string-start).
+        assert pat.search("// header\n" + positive + "\n")
+
+
+# ------------------------------------------------------------------
+# Unresolvable semantics
+# ------------------------------------------------------------------
+
+class TestUnresolvable:
+    def test_missing_identifier_has_reason(self, tmp_path: Path) -> None:
+        _write(tmp_path, "a.py", "def real():\n    pass\n")
+        res = resolve_identifiers(tmp_path, ["totally_missing_fn"])
+        assert res.items == []
+        assert len(res.unresolved) == 1
+        rec = res.unresolved[0]
+        assert rec["name"] == "totally_missing_fn"
+        assert "not found" in rec["reason"]
+
+    def test_referenced_but_undefined(self, tmp_path: Path) -> None:
+        _write(tmp_path, "a.py", "x = external_helper(1)\n")
+        res = resolve_identifiers(tmp_path, ["external_helper"])
+        assert res.items == []
+        assert "no static definition" in res.unresolved[0]["reason"]
+
+    def test_empty_tree(self, tmp_path: Path) -> None:
+        res = resolve_identifiers(tmp_path, ["anything_here"])
+        assert res.items == []
+        assert "no study-resolvable source files" in res.unresolved[0]["reason"]
+
+    def test_no_identifiers_no_output(self, tmp_path: Path) -> None:
+        res = resolve_identifiers(tmp_path, [])
+        assert res.items == []
+        assert res.unresolved == []
+
+    def test_vendor_dirs_skipped(self, tmp_path: Path) -> None:
+        _write(tmp_path, "node_modules/lib/index.js",
+               "function vendored() {}\n")
+        res = resolve_identifiers(tmp_path, ["vendored"])
+        assert res.items == []
+
+
+# ------------------------------------------------------------------
+# Concept docs
+# ------------------------------------------------------------------
+
+class TestConceptDocs:
+    def test_readme_matched(self, tmp_path: Path) -> None:
+        _write(tmp_path, "README.md",
+               "# proj\nThe rate limiter uses a token bucket that refills "
+               "every second.\n")
+        docs = resolve_concept_docs(
+            tmp_path, ["How does the rate limiter token bucket refill?"],
+        )
+        assert len(docs) == 1
+        assert docs[0]["file"].endswith("README.md")
+        assert "reason" in docs[0]
+
+    def test_docs_dir_matched(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/protocol.md",
+               "Frame lengths are validated against MAX_FRAME before "
+               "decode_frame runs.\n")
+        docs = resolve_concept_docs(
+            tmp_path, ["Is MAX_FRAME enforced before decode_frame?"],
+        )
+        assert any(d["file"].endswith("protocol.md") for d in docs)
+
+    def test_irrelevant_docs_ignored(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/changelog.md", "v1.0 first release\n")
+        docs = resolve_concept_docs(
+            tmp_path, ["How does the scheduler assign priorities?"],
+        )
+        assert docs == []
+
+    def test_no_questions(self, tmp_path: Path) -> None:
+        assert resolve_concept_docs(tmp_path, []) == []
+
+
+# ------------------------------------------------------------------
+# Study-list merge
+# ------------------------------------------------------------------
+
+class TestMergeIntoStudyList:
+    def _item(self, name: str, file: str = "a.py", line: int = 1):
+        from core.concepts.model import StudyItem
+        return StudyItem(
+            id=f"python_function_{name}_{file}_{line}",
+            kind="function", name=name, file=file, line=line,
+            definition=f"def {name}(): ...",
+        )
+
+    def test_creates_skeleton_when_missing(self, tmp_path: Path) -> None:
+        import json
+
+        from core.concepts.lang_resolve import merge_into_study_list
+        p = tmp_path / "study-list.json"
+        added = merge_into_study_list(p, [self._item("fn_a")])
+        assert added == 1
+        data = json.loads(p.read_text())
+        assert data["items"][0]["name"] == "fn_a"
+
+    def test_merges_into_existing(self, tmp_path: Path) -> None:
+        import json
+
+        from core.concepts.lang_resolve import merge_into_study_list
+        p = tmp_path / "study-list.json"
+        p.write_text(json.dumps({
+            "target": "/t", "source_root": "/t",
+            "items": [{"id": "c_fn_x", "name": "fn_x",
+                       "file": "x.c", "line": 3}],
+        }))
+        added = merge_into_study_list(p, [self._item("fn_a")])
+        assert added == 1
+        data = json.loads(p.read_text())
+        assert {i["name"] for i in data["items"]} == {"fn_x", "fn_a"}
+        assert data["target"] == "/t"
+
+    def test_dedups_by_id_and_location(self, tmp_path: Path) -> None:
+        from core.concepts.lang_resolve import merge_into_study_list
+        p = tmp_path / "study-list.json"
+        merge_into_study_list(p, [self._item("fn_a")])
+        assert merge_into_study_list(p, [self._item("fn_a")]) == 0
+
+    def test_related_docs_and_unresolved_merged(self, tmp_path: Path) -> None:
+        import json
+
+        from core.concepts.lang_resolve import merge_into_study_list
+        p = tmp_path / "study-list.json"
+        merge_into_study_list(
+            p, [],
+            related_docs=[{"file": "README.md", "reason": "r"}],
+            unresolved=[{"name": "ghost", "reason": "not found",
+                         "questions": ["Does ghost exist?"]}],
+        )
+        data = json.loads(p.read_text())
+        assert data["related_docs"][0]["file"] == "README.md"
+        assert data["unresolved_identifiers"][0]["name"] == "ghost"
+        # merging the same records again does not duplicate
+        merge_into_study_list(
+            p, [],
+            related_docs=[{"file": "README.md", "reason": "r"}],
+            unresolved=[{"name": "ghost", "reason": "not found"}],
+        )
+        data = json.loads(p.read_text())
+        assert len(data["related_docs"]) == 1
+        assert len(data["unresolved_identifiers"]) == 1
+
+
+# ------------------------------------------------------------------
+# C (opt-in per-batch splice; default resolution still excludes C)
+# ------------------------------------------------------------------
+
+class TestCResolution:
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        _write(tmp_path, "net/proto/sock.c", '''\
+/* proto_set_level validates and stores the security level.
+ * Levels above PROTO_LEVEL_MAX are rejected with -EINVAL.
+ */
+int proto_set_level(struct proto_sock *ps, unsigned int level)
+{
+	if (level > PROTO_LEVEL_MAX)
+		return -EINVAL;
+	ps->level = level;
+	return 0;
+}
+''')
+        _write(tmp_path, "lib/other.py", "def unrelated():\n    return 1\n")
+        return tmp_path
+
+    def test_default_excludes_c(self, tree: Path) -> None:
+        res = resolve_identifiers(tree, ["proto_set_level"])
+        assert not res.items
+        assert res.unresolved
+
+    def test_include_c_resolves_definition(self, tree: Path) -> None:
+        res = resolve_identifiers(
+            tree, ["proto_set_level"], include_c=True,
+        )
+        assert len(res.items) == 1
+        it = res.items[0]
+        assert it.kind == "function"
+        assert it.file == "net/proto/sock.c"
+        assert "level > PROTO_LEVEL_MAX" in it.definition
+        assert "rejected with -EINVAL" in it.doc_comment
+
+    def test_include_c_scope_limits_search(self, tree: Path) -> None:
+        res = resolve_identifiers(
+            tree, ["proto_set_level"],
+            scope=tree / "lib", include_c=True,
+        )
+        assert not res.items
+
+    def test_include_c_still_resolves_non_c(self, tree: Path) -> None:
+        res = resolve_identifiers(
+            tree, ["unrelated"], include_c=True,
+        )
+        assert len(res.items) == 1
+        assert res.items[0].file == "lib/other.py"
+
+
+# ------------------------------------------------------------------
+# Include-chase scoping + explicit file lists
+# ------------------------------------------------------------------
+
+class TestIncludeScopeFiles:
+    """include_scope_files: the request source file's #include graph."""
+
+    @pytest.fixture()
+    def tree(self, tmp_path: Path) -> Path:
+        # Mirrors the observed shared-header shape: the reviewed file
+        # only reaches the defining header through its include graph
+        # (source.c -> local.h -> <sub/umbrella.h> -> sub/ dir).
+        _write(tmp_path, "drivers/widget/main.c", '''\
+#include <linux/kernel.h>
+#include "main.h"
+
+int widget_prepare(void) { return widget_ref_get(); }
+''')
+        _write(tmp_path, "drivers/widget/main.h", '''\
+#include <linux/widget.h>
+''')
+        _write(tmp_path, "include/linux/kernel.h", "#define K 1\n")
+        _write(tmp_path, "include/linux/widget.h", "/* umbrella */\n")
+        _write(tmp_path, "include/linux/widget/core.h", '''\
+/* widget_ref_get grabs a runtime PM reference. */
+static inline int widget_ref_get(void) { return 0; }
+''')
+        return tmp_path
+
+    def test_chase_reaches_headers(self, tree: Path) -> None:
+        from core.concepts.lang_resolve import include_scope_files
+
+        files = include_scope_files(tree, "drivers/widget/main.c")
+        rel = {str(p.relative_to(tree)) for p in files}
+        assert "drivers/widget/main.h" in rel
+        assert "include/linux/kernel.h" in rel
+        assert "include/linux/widget.h" in rel
+
+    def test_stem_directory_expansion(self, tree: Path) -> None:
+        # linux/widget.h has a sibling directory linux/widget/ — the umbrella-
+        # plus-directory split must pull the directory's headers in.
+        from core.concepts.lang_resolve import include_scope_files
+
+        files = include_scope_files(tree, "drivers/widget/main.c")
+        rel = {str(p.relative_to(tree)) for p in files}
+        assert "include/linux/widget/core.h" in rel
+
+    def test_non_c_source_returns_empty(self, tree: Path) -> None:
+        from core.concepts.lang_resolve import include_scope_files
+
+        _write(tree, "pkg/mod.go", 'package mod\nimport "fmt"\n')
+        assert include_scope_files(tree, "pkg/mod.go") == []
+
+    def test_missing_source_returns_empty(self, tree: Path) -> None:
+        from core.concepts.lang_resolve import include_scope_files
+
+        assert include_scope_files(tree, "no/such/file.c") == []
+
+    def test_escape_via_dotdot_not_followed(self, tmp_path: Path) -> None:
+        from core.concepts.lang_resolve import include_scope_files
+
+        outside = _write(tmp_path, "secrets/priv.h", "#define S 1\n")
+        root = tmp_path / "tree"
+        _write(root, "a.c", '#include "../secrets/priv.h"\n')
+        files = include_scope_files(root, "a.c")
+        assert outside not in files
+
+    def test_escaping_start_file_refused(self, tmp_path: Path) -> None:
+        """source_file is a reading-list item field (LLM/audit-
+        derived) — the chase START must be confined to the root like
+        every candidate, or the escaped file is read and its includes
+        chased."""
+        from core.concepts.lang_resolve import include_scope_files
+
+        # If the escaped start file were read, its include ref would
+        # resolve against the root fallback and surface in the output
+        # — making the out-of-tree read observable.
+        _write(tmp_path, "secrets/priv.c", '#include "leak.h"\n')
+        root = tmp_path / "tree"
+        _write(root, "dummy.c", "int x;\n")
+        _write(root, "leak.h", "#define L 1\n")
+
+        # Relative traversal out of the root.
+        assert include_scope_files(root, "../secrets/priv.c") == []
+        # Absolute path outside the root (Path join lets the absolute
+        # candidate win).
+        assert include_scope_files(
+            root, str(tmp_path / "secrets" / "priv.c"),
+        ) == []
+
+    def test_absolute_start_inside_root_allowed(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.concepts.lang_resolve import include_scope_files
+
+        root = tmp_path / "tree"
+        _write(root, "a.c", '#include "a.h"\n')
+        _write(root, "a.h", "#define A 1\n")
+        files = include_scope_files(root, str(root / "a.c"))
+        rel = {str(p.relative_to(root)) for p in files}
+        assert rel == {"a.h"}
+
+    def test_file_cap_respected(self, tmp_path: Path) -> None:
+        from core.concepts.lang_resolve import include_scope_files
+
+        incs = "".join(f'#include "h{i}.h"\n' for i in range(20))
+        _write(tmp_path, "a.c", incs)
+        for i in range(20):
+            _write(tmp_path, f"h{i}.h", f"#define H{i} {i}\n")
+        files = include_scope_files(tmp_path, "a.c", max_files=5)
+        assert len(files) == 5
+
+    def test_chased_definition_resolves(self, tree: Path) -> None:
+        # End-to-end over the pinned tree: the chased file set hands
+        # the resolver a definition neither the subsystem dir nor a
+        # defeated root scan could supply.
+        from core.concepts.lang_resolve import include_scope_files
+
+        files = include_scope_files(tree, "drivers/widget/main.c")
+        res = resolve_identifiers(
+            tree, ["widget_ref_get"], files=files, include_c=True,
+        )
+        assert [i.name for i in res.items] == ["widget_ref_get"]
+        assert res.items[0].file == "include/linux/widget/core.h"
+
+
+class TestExplicitFileList:
+    def test_files_param_limits_search(self, tmp_path: Path) -> None:
+        _write(tmp_path, "a/one.py", "def alpha():\n    return 1\n")
+        _write(tmp_path, "b/two.py", "def beta():\n    return 2\n")
+        res = resolve_identifiers(
+            tmp_path, ["alpha", "beta"], files=[tmp_path / "a" / "one.py"],
+        )
+        assert [i.name for i in res.items] == ["alpha"]
+        assert {u["name"] for u in res.unresolved} == {"beta"}
+
+    def test_files_param_filters_c_without_include_c(
+        self, tmp_path: Path,
+    ) -> None:
+        c_file = _write(tmp_path, "x.h", "#define X 1\n")
+        res = resolve_identifiers(tmp_path, ["X"], files=[c_file])
+        assert not res.items
+        res = resolve_identifiers(
+            tmp_path, ["X"], files=[c_file], include_c=True,
+        )
+        assert [i.name for i in res.items] == ["X"]
+
+    def test_empty_file_list_is_unresolved(self, tmp_path: Path) -> None:
+        res = resolve_identifiers(tmp_path, ["ghost"], files=[])
+        assert not res.items
+        assert res.unresolved
+
+
+class TestCappedTargetReads:
+    """Every read this module performs over scanned-target content
+    routes through the shared capped reader."""
+
+    def test_resolve_identifiers_reads_are_capped(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.source as core_source
+        from core.concepts.lang_resolve import resolve_identifiers
+
+        (tmp_path / "m.py").write_text(
+            "FRAME_MAX = 4096\n", encoding="utf-8")
+        calls = {"n": 0}
+        orig = core_source.read_text_capped
+
+        def spy(path, *a, **kw):
+            calls["n"] += 1
+            return orig(path, *a, **kw)
+
+        monkeypatch.setattr(core_source, "read_text_capped", spy)
+        resolve_identifiers(tmp_path, ["FRAME_MAX"])
+        assert calls["n"] > 0, (
+            "target file reads bypass the capped reader"
+        )
+
+    def test_read_capped_honours_budget(self, tmp_path):
+        from core.concepts.lang_resolve import _read_capped
+
+        big = tmp_path / "big.txt"
+        big.write_text(("x" * 100 + "\n") * 200, encoding="utf-8")
+        got = _read_capped(big, 512)
+        assert got is not None
+        assert len(got) <= 512
+
+
+def _sl_race_worker(args):
+    idx, path = args
+    from pathlib import Path as _P
+
+    from core.concepts.lang_resolve import merge_into_study_list
+    from core.concepts.model import StudyItem
+    for k in range(10):
+        merge_into_study_list(_P(path), [StudyItem(
+            id=f"w{idx}_i{k}", kind="macro", name=f"N_{idx}_{k}",
+            file=f"f{idx}.c", line=k + 1,
+        )])
+    return idx
+
+
+class TestStudyListMergeSerialised:
+    """merge_into_study_list holds a cross-process lock over its
+    load->merge->save window (shared-out_dir writers)."""
+
+    def test_lock_sibling_created(self, tmp_path):
+        from core.concepts.lang_resolve import merge_into_study_list
+        from core.concepts.model import StudyItem
+        p = tmp_path / "study-list.json"
+        merge_into_study_list(p, [StudyItem(
+            id="a", kind="macro", name="A", file="a.c", line=1)])
+        assert (tmp_path / "study-list.json.lock").is_file()
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="fork start method")
+    def test_concurrent_mergers_lose_no_items(self, tmp_path):
+        import json as _json
+        import multiprocessing as mp
+
+        p = tmp_path / "study-list.json"
+        n = 6
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n) as pool:
+            pool.map(_sl_race_worker, [(i, str(p)) for i in range(n)])
+        data = _json.loads(p.read_text())
+        ids = {i["id"] for i in data["items"]}
+        expected = {f"w{i}_i{k}" for i in range(n) for k in range(10)}
+        missing = expected - ids
+        assert not missing, f"lost {len(missing)} items"

@@ -1,0 +1,463 @@
+"""Calibration validation — measure how well
+``raptor_risk_estimate`` predicts real-world exploitation against
+the ground-truth signals in the corpus.
+
+Two metrics, each with a clear pass/fail threshold:
+
+  1. **Top-N precision.** Of the N highest-scoring findings across
+     all project samples, what fraction have ANY exploitation
+     signal (KEV / Exploit-DB / Metasploit module)? The score
+     SHOULD concentrate true positives at the top — operators
+     triaging top-20 should mostly see real, exploited issues.
+
+  2. **Spearman rank correlation.** Across all findings, does the
+     rank by ``raptor_risk_estimate`` correlate with rank by
+     ground-truth exploitation? Computed with a hand-rolled
+     formula (no scipy dependency — keeps SCA's deps minimal).
+
+The validation function never re-tunes weights itself — it emits
+a JSON report. Re-tuning is an operator-driven decision based on
+the metrics; auto-mutating ``risk.py`` weights from CI would lose
+the human review step that the calibration stamp requires.
+
+Output: ``packages/sca/data/calibration/validation/<date>.json``
+with the full metrics + per-ecosystem breakdown + corpus
+provenance (which snapshot dates of which sources were consulted).
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, TYPE_CHECKING
+
+from core.json import load_json, save_json
+
+
+def _ground_truth_files() -> tuple[str, ...]:
+    """Locator for the ground-truth label sources — the single list
+    shared by the exploited-set loader and the provenance block so the
+    two can never drift apart. Each file is parsed with ``load_json``
+    by both callers.
+    """
+    return (
+        "kev_signals.json",
+        "exploitdb_signals.json",
+        "metasploit_signals.json",
+        "github_poc_signals.json",
+        "osv_evidence_signals.json",
+        "vulnrichment_signals.json",
+    )
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ValidationReport:
+    """Validation snapshot. Field types are JSON-serialisable."""
+
+    snapshot_date: str
+    findings_total: int
+    findings_with_score: int
+    findings_with_signal: int
+    top_20_precision: float
+    top_50_precision: float
+    spearman_rho: float | None
+    by_ecosystem: dict[str, dict[str, Any]] = field(default_factory=dict)
+    corpus_provenance: dict[str, str] = field(default_factory=dict)
+    threshold_top_20: float = 0.5     # operator-tunable
+    threshold_spearman: float = 0.4   # operator-tunable
+    verdict: str = "unverified"       # "validated_v1" | "unverified" | "needs_retune"
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+def validate_corpus(
+    corpus_dir: Path,
+    *,
+    out_path: Path | None = None,
+    update_snapshot: bool = False,
+    threshold_top_20: float = 0.5,
+    threshold_spearman: float = 0.4,
+) -> ValidationReport:
+    """Compute metrics + return a validation report.
+
+    ``corpus_dir`` is the calibration data directory containing
+    ``kev_signals.json`` / ``exploitdb_signals.json`` /
+    ``metasploit_signals.json`` plus a ``project_samples/`` tree.
+
+    Report emission is caller-directed: ``out_path`` writes the
+    report to an explicit file; ``update_snapshot=True`` writes the
+    dated snapshot under ``<corpus_dir>/validation/`` AND prunes
+    that directory to its retention window — that dir is
+    repo-committed, so only the refresh workflow (whose job is to
+    commit a new snapshot) passes it. With neither, no file is
+    written: the natural "verify the committed report reproduces"
+    invocation must not overwrite the committed same-day snapshot
+    or prune committed history as a side effect of reading metrics.
+
+    Thresholds: top-20 precision ≥ 0.5 (half of top-20 findings
+    have exploit evidence) AND Spearman ρ ≥ 0.4 (moderate positive
+    correlation). Below either ⇒ verdict = ``needs_retune``.
+    """
+    if out_path is not None and update_snapshot:
+        msg = "out_path and update_snapshot are mutually exclusive"
+        raise ValueError(msg)
+    snapshot = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    signals = _load_ground_truth(corpus_dir)
+    samples = _load_project_samples(corpus_dir / "project_samples")
+
+    # Flatten all findings into one ranked list, keeping the per-
+    # ecosystem breakdown separately.
+    all_findings: list[tuple[str, float, bool]] = []   # (eco, score, exploited)
+    by_eco: dict[str, list[tuple[float, bool]]] = {}
+    # Per-ecosystem count of findings whose advisory yields ≥1 CVE
+    # join key. ``with_signal`` alone can't distinguish "nothing in
+    # this ecosystem is exploited" from "nothing in this ecosystem
+    # can even JOIN the ground truth" — the latter is a label-
+    # coverage collapse (the distro-primary-id family spent months
+    # at with_cve=0 while the report only showed with_signal=0).
+    with_cve_by_eco: dict[str, int] = {}
+    for sample in samples:
+        for f in sample["findings"]:
+            if not isinstance(f, dict):
+                continue
+            score = f.get("raptor_risk_estimate")
+            if score is None or not isinstance(score, (int, float)):
+                continue
+            eco = f.get("ecosystem") or "?"
+            advisory = f.get("advisory") or {}
+            cve_ids = _extract_cve_ids(advisory)
+            exploited = any(c in signals for c in cve_ids)
+            all_findings.append((eco, float(score), exploited))
+            by_eco.setdefault(eco, []).append((float(score), exploited))
+            if cve_ids:
+                with_cve_by_eco[eco] = with_cve_by_eco.get(eco, 0) + 1
+
+    # Counts.
+    total = sum(len(s["findings"]) for s in samples)
+    with_score = len(all_findings)
+    with_signal = sum(1 for _, _, ex in all_findings if ex)
+
+    # Top-N precision.
+    sorted_by_score = sorted(
+        all_findings, key=lambda t: -t[1],
+    )
+    p20 = _top_n_precision(sorted_by_score, n=20)
+    p50 = _top_n_precision(sorted_by_score, n=50)
+    rho = _spearman_rho(
+        [s for _, s, _ in all_findings],
+        [int(ex) for _, _, ex in all_findings],
+    )
+
+    # Per-ecosystem.
+    eco_breakdown: dict[str, dict[str, Any]] = {}
+    for eco, rows in by_eco.items():
+        sorted_rows = sorted(rows, key=lambda t: -t[0])
+        eco_breakdown[eco] = {
+            "total": len(rows),
+            "with_cve": with_cve_by_eco.get(eco, 0),
+            "with_signal": sum(1 for _, ex in rows if ex),
+            "top_20_precision": _top_n_precision_2(sorted_rows, n=20),
+            "spearman_rho": _spearman_rho(
+                [s for s, _ in rows], [int(ex) for _, ex in rows],
+            ),
+        }
+
+    # Verdict.
+    verdict, notes = _verdict(
+        p20=p20, rho=rho, with_score=with_score,
+        threshold_top_20=threshold_top_20,
+        threshold_spearman=threshold_spearman,
+    )
+
+    report = ValidationReport(
+        snapshot_date=snapshot,
+        findings_total=total,
+        findings_with_score=with_score,
+        findings_with_signal=with_signal,
+        top_20_precision=p20,
+        top_50_precision=p50,
+        spearman_rho=rho,
+        by_ecosystem=eco_breakdown,
+        corpus_provenance=_provenance_summary(corpus_dir),
+        threshold_top_20=threshold_top_20,
+        threshold_spearman=threshold_spearman,
+        verdict=verdict,
+        notes=notes,
+    )
+
+    prune_dir: Path | None = None
+    if update_snapshot:
+        validation_dir = corpus_dir / "validation"
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        out_path = validation_dir / f"{snapshot}.json"
+        prune_dir = validation_dir
+    elif out_path is None:
+        # Metrics-only run — report returned, nothing written.
+        logger.info(
+            "sca.calibration.validate: metrics-only run (no out_path; "
+            "pass update_snapshot=True to write the committed dated "
+            "snapshot)",
+        )
+        return report
+    else:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(out_path, report.to_dict(), sort_keys=True)
+    if prune_dir is not None:
+        # Retention: the dated snapshots accumulate one file per run
+        # with no other pruning mechanism; keep the consumer-visible
+        # window (~6 months of weekly history) bounded. Pruning only
+        # runs on the explicit snapshot-update path — it deletes
+        # committed history, so it must never ride along on a local
+        # verification run.
+        from ._snapshots import VALIDATION_KEEP, prune_dated_snapshots
+        prune_dated_snapshots(prune_dir, keep=VALIDATION_KEEP)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Ground truth + sample loading
+# ---------------------------------------------------------------------------
+
+
+def _load_ground_truth(corpus_dir: Path) -> set[str]:
+    """Union of CVE IDs that have ANY exploitation signal.
+
+    All four sources mirror what ``refit._load_ground_truth`` reads.
+    Pre-fix this loader skipped ``github_poc_signals.json`` even
+    though the file ships in the corpus and refit consumes it —
+    silent drift between validate's exploited-set and refit's would
+    have skewed the precision metric vs the metric refit optimises.
+    """
+    exploited: set[str] = set()
+    for fname in _ground_truth_files():
+        path = corpus_dir / fname
+        if not path.is_file():
+            continue
+        try:
+            # Ground-truth signal snapshot; ValueError also covers
+            # the byte-budget refusal.
+            data = load_json(path, strict=True, max_bytes=64 * 1024 * 1024)
+        except (OSError, ValueError) as e:
+            logger.warning(
+                "sca.calibration.validate: skip %s (%s)", fname, e,
+            )
+            continue
+        signals = data.get("signals") or {}
+        if not isinstance(signals, dict):
+            continue
+        exploited.update(signals.keys())
+    return exploited
+
+
+def _load_project_samples(samples_dir: Path) -> list[dict[str, Any]]:
+    """Read all project-sample JSONs under
+    ``samples_dir/<eco>/<name>.json``."""
+    out: list[dict[str, Any]] = []
+    if not samples_dir.is_dir():
+        return out
+    for path in sorted(samples_dir.rglob("*.json")):
+        # Corpus sample; missing / corrupt / oversize come back as
+        # None and fall into the isinstance guard.
+        data = load_json(path, max_bytes=64 * 1024 * 1024)
+        if not isinstance(data, dict):
+            continue
+        if "findings" not in data or not isinstance(data["findings"], list):
+            continue
+        out.append(data)
+    return out
+
+
+def _extract_cve_ids(advisory: dict[str, Any]) -> list[str]:
+    """Pull CVE IDs out of an advisory summary block.
+
+    Returns an empty list for ``informational`` advisories
+    (RUSTSEC ``unsound`` / ``unmaintained`` / ``notice`` markers,
+    and equivalents on other ecos). Those records aren't security
+    vulnerabilities — including their CVE aliases in the
+    ground-truth ``signals`` set would mark hundreds of
+    non-security findings as ``exploited`` and depress
+    Spearman ρ. The rows themselves stay in the metric population
+    as negatives (only their CVE ids are excluded from the
+    exploited join); see :func:`validate_corpus`.
+
+    Every id resolves through ``models.canonical_cve_id`` — the
+    single owner of the CVE-join key shape — so the corpus label
+    join and the live KEV / EPSS / SSVC enrichment join can never
+    drift: distro-namespaced ``<DISTRO>-CVE-*`` primary ids
+    (Debian / Ubuntu / Alpine secdb, empty alias lists) and
+    lowercase feed spellings both land on the canonical uppercase
+    CVE key here exactly as they do at scan time."""
+    from ..models import canonical_cve_id
+
+    out: list[str] = []
+    if not isinstance(advisory, dict):
+        return out
+    if advisory.get("informational"):
+        return out
+    aliases = advisory.get("aliases") or []
+    if isinstance(aliases, list):
+        for a in aliases:
+            canonical = canonical_cve_id(a)
+            if canonical is not None and canonical not in out:
+                out.append(canonical)
+    # ``findings.py::_advisory_summary`` archives the primary OSV
+    # record id under ``id``; ``osv_id`` is kept as a fallback for
+    # rows/fixtures written before the key settled. Without the
+    # ``id`` read, a CVE-primary OSV record with no CVE alias lost
+    # its exploited label entirely.
+    primary = advisory.get("id") or advisory.get("osv_id") or ""
+    canonical = canonical_cve_id(primary)
+    if canonical is not None and canonical not in out:
+        out.append(canonical)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+def _top_n_precision(
+    sorted_findings: list[tuple[str, float, bool]], n: int,
+) -> float:
+    if not sorted_findings:
+        return 0.0
+    top = sorted_findings[:n]
+    return sum(1 for _, _, ex in top if ex) / len(top)
+
+
+def _top_n_precision_2(
+    sorted_findings: list[tuple[float, bool]], n: int,
+) -> float:
+    if not sorted_findings:
+        return 0.0
+    top = sorted_findings[:n]
+    return sum(1 for _, ex in top if ex) / len(top)
+
+
+def _spearman_rho(
+    x: list[float], y: list[int],
+) -> float | None:
+    """Spearman rank correlation, hand-rolled (no scipy).
+
+    Computed as the Pearson correlation of the average ranks —
+    the correct general form under ties. (The textbook
+    ``1 − 6·Σd² / (n·(n² − 1))`` shortcut is equivalent only when
+    there are NO ties; our binary exploited labels are almost all
+    ties, so the shortcut would be wrong here.)
+
+    Returns None when there are fewer than 2 paired values (not
+    enough to compute a meaningful correlation) or all-x or all-y
+    are constant (correlation undefined).
+    """
+    n = len(x)
+    if n != len(y) or n < 2:
+        return None
+    if len(set(x)) == 1 or len(set(y)) == 1:
+        return None
+    rx = _ranks(x)
+    ry = _ranks(y)
+    mean_rx = sum(rx) / n
+    mean_ry = sum(ry) / n
+    num = sum((rx[i] - mean_rx) * (ry[i] - mean_ry) for i in range(n))
+    den_x = sum((rx[i] - mean_rx) ** 2 for i in range(n)) ** 0.5
+    den_y = sum((ry[i] - mean_ry) ** 2 for i in range(n)) ** 0.5
+    if den_x == 0 or den_y == 0:
+        return None
+    return num / (den_x * den_y)
+
+
+def _ranks(values: list[int] | list[float]) -> list[float]:
+    """Average-rank ranking (handles ties)."""
+    indexed = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i
+        while (j + 1 < len(indexed)
+               and values[indexed[j + 1]] == values[indexed[i]]):
+            j += 1
+        avg = (i + j) / 2 + 1   # 1-based rank, averaged over the tie
+        for k in range(i, j + 1):
+            ranks[indexed[k]] = avg
+        i = j + 1
+    return ranks
+
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+
+
+def _verdict(
+    *,
+    p20: float, rho: float | None, with_score: int,
+    threshold_top_20: float, threshold_spearman: float,
+) -> tuple[str, list[str]]:
+    notes: list[str] = []
+    if with_score < 50:
+        notes.append(
+            f"only {with_score} scored findings — corpus needs more "
+            f"project samples before validation is meaningful "
+            f"(target: ≥ 50)"
+        )
+        return "unverified", notes
+    pass_p20 = p20 >= threshold_top_20
+    pass_rho = rho is not None and rho >= threshold_spearman
+    if not pass_p20:
+        notes.append(
+            f"top-20 precision {p20:.2f} below threshold "
+            f"{threshold_top_20:.2f}"
+        )
+    if not pass_rho:
+        rho_str = f"{rho:.2f}" if rho is not None else "undefined"
+        notes.append(
+            f"Spearman ρ {rho_str} below threshold "
+            f"{threshold_spearman:.2f}"
+        )
+    if pass_p20 and pass_rho:
+        return "validated_v1", notes
+    return "needs_retune", notes
+
+
+# ---------------------------------------------------------------------------
+# Provenance
+# ---------------------------------------------------------------------------
+
+
+def _provenance_summary(corpus_dir: Path) -> dict[str, str]:
+    """Capture which snapshot date each ground-truth source had
+    when validation ran. Lets reviewers reproduce metrics
+    against the same corpus state."""
+    out: dict[str, str] = {}
+    # Every source _load_ground_truth unions, plus epss (a scoring
+    # signal with its own snapshot) — pre-fix the dominant label source
+    # (vulnrichment, ~29k labels) was missing from the provenance
+    # block, making metric shifts unattributable.
+    for fname in _ground_truth_files() + ("epss_signals.json",):
+        path = corpus_dir / fname
+        if not path.is_file():
+            continue
+        try:
+            # Signal snapshot; ValueError also covers the byte-budget
+            # refusal.
+            data = load_json(path, strict=True, max_bytes=64 * 1024 * 1024)
+        except (OSError, ValueError):
+            continue
+        src = data.get("_source") or {}
+        out[fname] = src.get("fetched_at", "unknown")
+    return out
+
+
+__all__ = [
+    "ValidationReport",
+    "validate_corpus",
+]

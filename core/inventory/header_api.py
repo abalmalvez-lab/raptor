@@ -1,0 +1,204 @@
+"""Public API detection from C/C++ header files.
+
+Scans header files (.h, .hpp) in a target directory to identify
+function declarations — the authoritative signal for "this function
+is part of the public API" in C/C++ libraries.
+
+For C/C++ libraries, the set of functions declared in public headers
+is a far more precise entry-point signal than visibility (non-static):
+a library may have hundreds of non-static internal functions, but only
+the ones declared in headers are callable by consumers.
+
+Usage:
+    api = scan_public_api("/path/to/libxml2")
+    if "xmlAddID" in api:
+        ...  # this is a public entry point
+
+The scanner extracts function names from declarations (prototypes
+ending in `;`), ignoring definitions (which have `{`). It handles
+common patterns: macros between return type and name (XMLPUBFUN,
+ZEXTERN), __attribute__ annotations, and multi-line declarations.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+from pathlib import Path
+
+from core.source import read_bytes_capped
+
+logger = logging.getLogger(__name__)
+
+_HEADER_EXTENSIONS = frozenset({".h", ".hpp", ".hxx", ".hh", ".h++"})
+
+# Standard declaration: `[qualifiers] type name(args);`
+# The qualifier/type group accepts keywords, macros (XMLPUBFUN),
+# __declspec, __attribute__, and any identifier (covers library
+# typedefs like xmlIDPtr, z_stream, etc.).
+#
+# The gap after the statement boundary and the pointer/space span
+# before the name are HORIZONTAL-only: with `\s*` there, the
+# MULTILINE `^` branch re-scans a run of blank lines from every line
+# start inside it — worse than quadratic on a planted blank-line
+# header (finditer over whole header content on the inventory build
+# path). A declaration on a later line is still matched by the `^`
+# branch anchoring its own line, and multi-line declarations still
+# match because the qualifier/type group's interior `\s+` separators
+# cross line breaks.
+# Bounded loops and windows on every unbounded-reach span (same
+# discipline as the C-declaration matchers): the qualifier/type loop,
+# attribute chains and their interiors, and the parameter window let
+# every anchor re-scan the remaining text on planted
+# declaration-shaped runs — quadratic. Bounds sit far above real
+# headers (trade-off both directions: larger keeps absurd
+# declarations matching but raises per-anchor reach, smaller drops
+# them); the trailing attribute chain also carries the final
+# whitespace inside its loop iteration so no two spans are adjacent,
+# and the pointer span is stars-only (\**) — a star-space mix is
+# already a qualifier-loop token, so the old horizontal-whitespace
+# span only duplicated the loop's separator and split against it.
+_DECL_RE = re.compile(
+    r"(?a)"
+    r"(?:^|;|\})[^\S\n]*"
+    r"(?:__attribute__\s*\(\([^()]{0,1024}(?:\([^()]{0,1024}\)[^()]{0,1024}){0,8}\)\)\s+){0,8}"
+    r"(?:__declspec\s*\([^)]{0,1024}\)\s+){0,4}"
+    r"(?:(?:\w+|\*)\s+){0,24}?"
+    r"\**"
+    r"(\w+)"                       # capture: function name
+    r"\s*\([^)]{0,4096}\)"         # parameter list
+    r"\s*(?:__attribute__\s*\(\([^()]{0,1024}(?:\([^()]{0,1024}\)[^()]{0,1024}){0,8}\)\)\s*){0,8}"
+    r";",                          # ends with `;`
+    re.MULTILINE,
+)
+
+# zlib-style OF((...)) macro: `ZEXTERN int ZEXPORT inflate OF((args));`
+# \b pins the name to a word start: unanchored, every position in a
+# long identifier run starts a fresh scan — quadratic on hostile
+# headers; a mid-word start is never a real declaration name.
+_OF_DECL_RE = re.compile(
+    r"(?a)\b(\w+)\s+OF\s*\(\(",
+    re.MULTILINE,
+)
+
+# Generic *EXPORT* macro wrapping a declaration. The function name
+# is the identifier immediately before `, (` (the parameter list).
+# Examples:
+#   PNG_EXPORT(1, png_uint_32, png_access_version_number, (void));
+#   MY_API_EXPORT(int, my_function, (int x));
+# Macro-name runs and the argument gap are BOUNDED: unbounded, a
+# hostile header planting EXPORT inside one long macro-name run (or
+# `EXPORT(` heads inside the gap) re-scans the tail per occurrence —
+# quadratic. Real export macro names/prefixes sit far inside 256
+# chars and the pre-name arguments inside 1000; longer spans stop
+# matching (the declaration is skipped) instead of scanning without
+# bound.
+_EXPORT_MACRO_RE = re.compile(
+    r"(?a)\b[A-Z_]{0,256}EXPORT[A-Z_]{0,256}\s*\(.{0,1000}?,\s*(\w+)\s*,\s*\(",
+    re.MULTILINE,
+)
+
+_SKIP_NAMES = frozenset({
+    "if", "for", "while", "switch", "return", "sizeof", "typeof",
+    "defined", "typedef", "else", "do", "case", "goto",
+})
+
+_EXCLUDE_DIRS = frozenset({
+    "test", "tests", "testing", "t", "spec", "specs",
+    "example", "examples", "sample", "samples",
+    "benchmark", "benchmarks", "bench",
+    "doc", "docs", "documentation",
+    "build", "cmake", ".git", "__pycache__",
+    "third_party", "thirdparty", "vendor", "vendored",
+    "internal", "private",
+})
+
+
+def scan_public_api(
+    target_path: str,
+    *,
+    include_dirs: list[str] | None = None,
+) -> frozenset[str]:
+    """Scan header files and return function names declared in them.
+
+    Args:
+        target_path: Root directory of the C/C++ project.
+        include_dirs: If provided, only scan headers under these
+            subdirectories (relative to target_path). When None,
+            scans all headers not under excluded directories.
+
+    Returns:
+        Frozen set of function names declared in public headers.
+    """
+    target = Path(target_path)
+    if not target.is_dir():
+        return frozenset()
+
+    names: set[str] = set()
+    headers_scanned = 0
+
+    for root, dirs, files in os.walk(target):
+        rel_root = Path(root).relative_to(target)
+        parts = set(rel_root.parts)
+
+        if parts & _EXCLUDE_DIRS:
+            dirs.clear()
+            continue
+
+        if include_dirs is not None:
+            rel_str = str(rel_root)
+            in_scope = any(
+                rel_str == d or rel_str.startswith(d + "/")
+                for d in include_dirs
+            )
+            is_ancestor = any(
+                d.startswith(rel_str + "/")
+                for d in include_dirs
+            )
+            if not in_scope and not is_ancestor:
+                continue
+            if is_ancestor and not in_scope:
+                dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
+                continue
+
+        dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
+
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in _HEADER_EXTENSIONS:
+                continue
+
+            fpath = Path(os.path.join(root, fname))
+            if fpath.is_symlink():
+                continue
+            try:
+                if fpath.stat().st_size > 1_048_576:  # 1 MB cap
+                    continue
+                got = read_bytes_capped(fpath, 1_048_576)
+                if got is None or got[1]:
+                    continue
+                with io.TextIOWrapper(io.BytesIO(got[0]), encoding="utf-8", errors="replace") as stream:
+                    content = stream.read()
+            except OSError:
+                continue
+
+            headers_scanned += 1
+            for m in _DECL_RE.finditer(content):
+                name = m.group(1)
+                if name and name not in _SKIP_NAMES and not name.startswith("_"):
+                    names.add(name)
+            for pat in (_OF_DECL_RE, _EXPORT_MACRO_RE):
+                for m in pat.finditer(content):
+                    name = m.group(1)
+                    if name and name not in _SKIP_NAMES and not name.startswith("_"):
+                        names.add(name)
+
+    if headers_scanned > 0:
+        logger.debug(
+            "header_api: scanned %d headers in %s, found %d declared functions",
+            headers_scanned, target_path, len(names),
+        )
+
+    return frozenset(names)

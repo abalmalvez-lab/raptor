@@ -1,66 +1,31 @@
 #!/usr/bin/env python3
 """
-Fuzzing Planner - Autonomous Decision Making
+Fuzzing Planner - Crash Prioritisation
 
-This module transforms RAPTOR from a fixed pipeline into an intelligent agent
-that makes decisions based on fuzzing state and learned knowledge.
+Scores and orders crashes for analysis based on signal, input size,
+and goal alignment. The fuzz loop itself runs on the operator's
+duration timer (raptor_fuzzing.py); this module does not decide when
+fuzzing starts or stops, and the SAGE cross-run AFL-flag prior is
+merged by raptor_fuzzing directly (core.sage.hooks).
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from core.logging import get_logger
 
 logger = get_logger()
 
 
-class Action(Enum):
-    """Actions the fuzzer can take autonomously."""
-
-    # Fuzzing strategy actions
-    CONTINUE_FUZZING = "continue_fuzzing"
-    STOP_FUZZING = "stop_fuzzing"
-    INCREASE_DURATION = "increase_duration"
-    CHANGE_MUTATOR = "change_mutator"
-    ADD_DICTIONARY = "add_dictionary"
-    INTENSIFY_CORPUS = "intensify_corpus"
-
-    # Analysis actions
-    DEEP_ANALYSE_CRASH = "deep_analyse_crash"
-    SKIP_DUPLICATE_CRASH = "skip_duplicate_crash"
-    PRIORITISE_CRASH = "prioritise_crash"
-
-    # Exploit development actions
-    VALIDATE_EXPLOIT = "validate_exploit"
-    REFINE_EXPLOIT = "refine_exploit"
-    TRY_ALTERNATIVE_TECHNIQUE = "try_alternative_technique"
-
-    # Learning actions
-    SAVE_STRATEGY = "save_strategy"
-    LOAD_STRATEGY = "load_strategy"
-
-    # Goal-directed actions
-    FOCUS_ON_PARSER = "focus_on_parser"
-    FOCUS_ON_NETWORK = "focus_on_network"
-    SEARCH_FOR_RCE = "search_for_rce"
-
-
 @dataclass
 class FuzzingState:
-    """Complete state of the fuzzing campaign for decision-making."""
+    """Complete state of the fuzzing campaign, as passed to the
+    crash prioritiser and the campaign report."""
 
     # Fuzzing metrics
     start_time: float
-    current_time: float
     total_execs: int = 0
     execs_per_sec: float = 0.0
-
-    # Coverage metrics
-    total_coverage: int = 0
-    last_coverage_increase: float = 0.0
-    coverage_plateau_duration: float = 0.0
 
     # Crash metrics
     total_crashes: int = 0
@@ -68,27 +33,11 @@ class FuzzingState:
     crashes_last_minute: int = 0
     exploitable_crashes: int = 0
 
-    # Strategy metrics
-    current_strategy: str = "default"
-    strategies_tried: List[str] = field(default_factory=list)
-    successful_strategies: Dict[str, int] = field(default_factory=dict)
-
     # Goal state
-    target_goal: Optional[str] = None
-    goal_progress: float = 0.0
+    target_goal: str | None = None
 
     # Binary characteristics
-    binary_path: Optional[Path] = None
-    has_asan: bool = False
-    has_afl_instrumentation: bool = False
-
-    def elapsed_time(self) -> float:
-        """Calculate elapsed time in seconds."""
-        return self.current_time - self.start_time
-
-    def is_coverage_stalled(self, threshold_seconds: float = 300) -> bool:
-        """Check if coverage hasn't increased in threshold time."""
-        return self.coverage_plateau_duration > threshold_seconds
+    binary_path: Path | None = None
 
     def is_finding_crashes(self) -> bool:
         """Check if we're actively finding crashes."""
@@ -96,134 +45,22 @@ class FuzzingState:
 
 
 class FuzzingPlanner:
+    """Scores and orders crashes for analysis.
+
+    Historic decision-loop methods (decide_next_action /
+    should_continue_fuzzing / select_fuzzing_strategy) were removed:
+    they had no production caller — the fuzz loop runs on the fixed
+    duration timer and the SAGE AFL-flag prior is merged at the
+    raptor_fuzzing call site — and keeping them advertised autonomy
+    that did not exist. Wire a real decision loop into
+    raptor_fuzzing.py before re-growing any of them.
     """
-    Autonomous planner that makes intelligent decisions about fuzzing strategy.
 
-    Instead of following a fixed pipeline, the planner:
-    1. Observes the current fuzzing state
-    2. Reasons about what's working and what's not
-    3. Decides on the next action autonomously
-    4. Learns from successes and failures
-    """
+    def __init__(self) -> None:
+        """Initialise the fuzzing planner."""
+        logger.info("Fuzzing planner initialised")
 
-    def __init__(self, memory=None):
-        """
-        Initialise the fuzzing planner.
-
-        Args:
-            memory: FuzzingMemory instance for learning (optional)
-        """
-        self.memory = memory
-        self.decision_history = []
-        logger.info("Autonomous Fuzzing Planner initialised")
-
-    def decide_next_action(self, state: FuzzingState) -> Action:
-        """
-        Make an autonomous decision about what to do next.
-
-        This is the core of the autonomous system. Instead of a fixed pipeline,
-        we reason about the current state and make intelligent decisions.
-
-        Args:
-            state: Current fuzzing state
-
-        Returns:
-            Action to take next
-        """
-        logger.info("=" * 70)
-        logger.info("AUTONOMOUS DECISION MAKING")
-        logger.info("=" * 70)
-        logger.info(f"Elapsed time: {state.elapsed_time():.1f}s")
-        logger.info(f"Total crashes: {state.total_crashes}")
-        logger.info(f"Unique crashes: {state.unique_crashes}")
-        logger.info(f"Coverage: {state.total_coverage}")
-        logger.info(f"Execs/sec: {state.execs_per_sec:.1f}")
-
-        # Decision tree - prioritise by urgency and impact
-        action = None
-        reasoning = ""
-
-        # 1. Check if we've found interesting crashes recently
-        if state.crashes_last_minute > 0:
-            action = Action.CONTINUE_FUZZING
-            reasoning = f"Found {state.crashes_last_minute} crashes in last minute - keep going"
-
-        # 2. Check if coverage is stalled
-        elif state.is_coverage_stalled(threshold_seconds=180):
-            action = Action.CHANGE_MUTATOR
-            reasoning = f"Coverage stalled for {state.coverage_plateau_duration:.0f}s - try different mutator"
-
-        # 3. Check if we're making progress
-        elif state.total_coverage > 0 and state.execs_per_sec > 10:
-            action = Action.CONTINUE_FUZZING
-            reasoning = "Making steady progress with good throughput"
-
-        # 4. Check if we should stop (no progress, long time)
-        elif state.elapsed_time() > 3600 and state.total_crashes == 0:
-            action = Action.STOP_FUZZING
-            reasoning = "Over 1 hour with no crashes - likely not vulnerable"
-
-        # 5. Default: keep fuzzing
-        else:
-            action = Action.CONTINUE_FUZZING
-            reasoning = "Default strategy: continue fuzzing"
-
-        # Log the decision
-        logger.info(f"Decision: {action.value}")
-        logger.info(f"Reasoning: {reasoning}")
-
-        # Record decision in history
-        self.decision_history.append({
-            "time": state.current_time,
-            "action": action,
-            "reasoning": reasoning,
-            "state_snapshot": {
-                "crashes": state.total_crashes,
-                "coverage": state.total_coverage,
-                "execs_per_sec": state.execs_per_sec,
-            }
-        })
-
-        return action
-
-    def should_continue_fuzzing(self, state: FuzzingState,
-                                target_duration: Optional[float] = None) -> bool:
-        """
-        Decide if fuzzing should continue or stop.
-
-        This replaces the fixed duration timer with intelligent decision-making.
-
-        Args:
-            state: Current fuzzing state
-            target_duration: Target duration in seconds (can be overridden)
-
-        Returns:
-            True if fuzzing should continue
-        """
-        action = self.decide_next_action(state)
-
-        if action == Action.STOP_FUZZING:
-            logger.info("Autonomous decision: STOP fuzzing")
-            return False
-
-        if action == Action.INCREASE_DURATION:
-            logger.info("Autonomous decision: EXTEND fuzzing beyond target duration")
-            return True
-
-        # Check if we've exceeded target duration (if set)
-        if target_duration and state.elapsed_time() >= target_duration:
-            # But if we're finding crashes, keep going!
-            if state.crashes_last_minute > 0:
-                logger.info(f"Target duration reached, but found {state.crashes_last_minute} crashes recently")
-                logger.info("Autonomous decision: CONTINUE fuzzing (overriding duration)")
-                return True
-            else:
-                logger.info("Target duration reached and no recent crashes")
-                return False
-
-        return True
-
-    def recommend_crash_priority(self, crashes: List, state: FuzzingState) -> List:
+    def recommend_crash_priority(self, crashes: list, state: FuzzingState) -> list:
         """
         Intelligently prioritise which crashes to analyse first.
 
@@ -280,65 +117,22 @@ class FuzzingPlanner:
         crash_scores.sort(key=lambda x: x[1], reverse=True)
 
         # Log prioritisation
-        logger.info(f"Crash prioritisation (top 5):")
+        logger.info("Crash prioritisation (top 5):")
         for i, (crash, score, factors) in enumerate(crash_scores[:5], 1):
-            logger.info(f"  {i}. {crash.crash_id} - Score: {score:.1f} - Factors: {', '.join(factors)}")
+            logger.info("  %s. %s - Score: %.1f - Factors: %s", i, crash.crash_id, score, ', '.join(factors))
 
         # Return prioritised list
         return [c for c, s, f in crash_scores]
 
-    def select_fuzzing_strategy(self, state: FuzzingState) -> Dict[str, Any]:
+    def get_decision_summary(self) -> dict:
+        """Return the decision-summary report block.
+
+        Kept for report-shape compatibility (raptor_fuzzing writes it
+        as ``planner_decisions``). No decision loop exists, so the
+        block is always empty — exactly what production runs recorded
+        when the removed decision methods still existed uncalled.
         """
-        Select optimal fuzzing strategy based on current state.
-
-        Instead of always using the same AFL configuration, adapt based on:
-        - What's working
-        - What we've learned
-        - The current goal
-
-        Args:
-            state: Current fuzzing state
-
-        Returns:
-            Dictionary of AFL parameters to use
-        """
-        strategy = {
-            "name": "adaptive",
-            "timeout": 1000,
-            "parallel": 1,
-            "extra_flags": [],
-        }
-
-        # If coverage is stalled, try more aggressive mutations
-        if state.is_coverage_stalled():
-            logger.info("Coverage stalled - using aggressive mutation strategy")
-            strategy["name"] = "aggressive"
-            strategy["extra_flags"].append("-L")  # MOpt mode
-            strategy["extra_flags"].append("-0")  # Zero stack
-
-        # If we have ASAN, reduce timeout (crashes faster)
-        if state.has_asan:
-            logger.info("ASAN detected - reducing timeout")
-            strategy["timeout"] = 500
-
-        # If no AFL instrumentation, use more parallel instances (capped by tuning)
-        if not state.has_afl_instrumentation:
-            from core.tuning import get_tuning
-            ceiling = get_tuning().max_fuzz_parallel
-            strategy["parallel"] = min(4, ceiling)
-            logger.info(f"No AFL instrumentation - parallelisation set to {strategy['parallel']}")
-
-        # Learn from history
-        if self.memory and state.current_strategy in state.successful_strategies:
-            success_count = state.successful_strategies[state.current_strategy]
-            logger.info(f"Current strategy has {success_count} past successes - continuing")
-
-        logger.info(f"Selected strategy: {strategy['name']}")
-        return strategy
-
-    def get_decision_summary(self) -> Dict:
-        """Get summary of all decisions made."""
         return {
-            "total_decisions": len(self.decision_history),
-            "decisions": self.decision_history,
+            "total_decisions": 0,
+            "decisions": [],
         }

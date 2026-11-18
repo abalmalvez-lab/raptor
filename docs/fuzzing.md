@@ -1,0 +1,726 @@
+# Fuzzing
+
+[Documentation index](README.md)
+
+RAPTOR's fuzzing subsystem orchestrates coverage-guided fuzzing campaigns
+against compiled binaries, source-level targets, and Python packages. It
+detects the target type, probes the host for available tooling, selects the
+appropriate fuzzing engine, manages corpus generation, and triages crashes into
+deduplicated, ranked findings wrapped as `core.witness.Witness` objects for
+downstream consumption by [/validate](validation.md) and
+[/crash-analysis](crash-analysis.md).
+
+The canonical entry point is `python3 raptor.py fuzz` (or the `/fuzz` slash
+command).  The legacy `raptor_fuzzing.py` script is still present but
+`raptor.py fuzz` is the recommended path -- it manages the run lifecycle
+automatically.
+
+For a first campaign, check [prerequisites](#prerequisites), then follow
+[Usage](#usage). Consult the engine descriptions below when choosing a
+harness or investigating an engine-specific limitation.
+
+**Related documentation:**
+[Crash Analysis](crash-analysis.md) |
+[Validation](validation.md) |
+[Autonomous Workflow](agentic.md)
+
+**On this page:**
+
+- [Supported Engines](#supported-engines)
+- [Target Detection](#target-detection)
+- [Prerequisites](#prerequisites)
+- [Usage](#usage)
+- [Corpus Management](#corpus-management)
+- [Crash Triage and Replay](#crash-triage-and-replay)
+- [Env Build-on-Demand (source trees)](#env-build-on-demand-source-trees)
+- [Harness Generation](#harness-generation)
+- [Binary Pre-Analysis](#binary-pre-analysis)
+- [Sandbox Integration](#sandbox-integration)
+- [Platform Notes](#platform-notes)
+- [Output Structure](#output-structure)
+
+## Supported Engines
+
+### AFL++
+
+The primary engine on Linux.  RAPTOR wraps `afl-fuzz` with support for:
+
+- **Dictionaries** (`--dict`): AFL dictionary files for structured input
+  formats (JSON tokens, HTTP keywords, etc.).  When `--dict` is not passed,
+  `/fuzz` auto-discovers an audit-generated `fuzz.dict` (own run directory
+  first, then the newest sibling run directory) -- see
+  [Dictionary auto-discovery](#dictionary-auto-discovery).
+- **Parallel instances** (`--parallel N`): runs N AFL++ instances (one main,
+  N-1 secondary) for faster coverage.  N is clamped to the `tuning.json`
+  `max_fuzz_parallel` ceiling with a warning.
+- **CmpLog, power schedules, custom mutators, deterministic mode**:
+  available through the Python API (`AFLRunner` in `packages/fuzzing/`)
+  for pipeline callers; no CLI flags.
+- **Env build-on-demand** (`--env-build`, `--no-env-build`,
+  `--env-asan`, `--env-cmplog`, `--env-target <rel>`,
+  `--keep-env-rootfs`): build a source tree AFL-instrumented in the
+  pinned AFL++ image and fuzz it from the image's rootfs under the
+  sandbox -- see
+  [Env Build-on-Demand](#env-build-on-demand-source-trees).
+
+For best results, compile the target with AFL instrumentation
+(`afl-clang-fast` or `afl-clang-lto`) and AddressSanitizer
+(`-fsanitize=address`).  Uninstrumented binaries work through a
+binary-only tracer — QEMU mode (`-Q`) or FRIDA mode (`-O`) — at a
+significant speed cost.
+
+RAPTOR resolves the tracer at campaign start: `--afl-mode auto` (the
+default) probes the AFL++ install and picks QEMU, then FRIDA, from
+whatever is actually built; `--afl-mode qemu` / `--afl-mode frida`
+force one and fail up front with install guidance when that tracer is
+absent (`qemu_mode/build_qemu_support.sh` or `make -C frida_mode` in
+the AFLplusplus tree).  Exception: env-build rootfs campaigns always
+use QEMU — their tracers live inside the image, so `--afl-mode frida`
+is downgraded with a warning.  Not every distro package ships either
+mode — the capability report (`capability_report.json`) records what
+was found in its `afl_qemu_trace` / `afl_frida_trace` fields.
+
+### libFuzzer
+
+The preferred engine on macOS and for clang-instrumented binaries.  libFuzzer
+requires the target to be compiled with `-fsanitize=fuzzer,address` using a
+clang that ships the libFuzzer runtime.
+
+On macOS, Apple's system clang does **not** include the libFuzzer runtime.
+RAPTOR's capability probe automatically detects Homebrew LLVM
+(`/opt/homebrew/opt/llvm/bin/clang` or `/usr/local/opt/llvm/bin/clang`) and
+uses it when available.
+
+The orchestrator detects libFuzzer-instrumented binaries by scanning for the
+`LLVMFuzzerTestOneInput` symbol.
+
+### Atheris (Python, alpha)
+
+Coverage-guided fuzzing for Python packages via
+[atheris](https://github.com/google/atheris) — libFuzzer driving a Python
+`TestOneInput(data: bytes)` callback.  Detected automatically for `python-pkg`
+targets (a directory with `pyproject.toml` or `setup.py`); force it with
+`--engine atheris`.  Alpha caveats up front: single-instance campaigns that
+stop at the first crash (libFuzzer semantics), no Python coverage bridge yet,
+and no LLM harness synthesis — the harness is yours or a mechanical template.
+
+Atheris needs a harness. Explicit inputs take precedence:
+
+- **Operator harness** (`--py-harness <file>`): a `.py` file you wrote that
+  defines `TestOneInput` and calls `atheris.Setup`/`atheris.Fuzz`.  This is
+  the recommended route for anything beyond the trivial case.
+- **Template scaffold** (`--py-entry module:function`, optionally
+  `--py-input bytes|text`): for the simple case only — a target function
+  taking a single `bytes` or `str` argument.  RAPTOR generates a
+  clearly-marked harness file into the run directory (no LLM involved; the
+  entry point must be a plain dotted-identifier chain).  The scaffold treats
+  EVERY uncaught exception as a crash: if the target legitimately raises on
+  malformed input (a parser's `ValueError`), edit the generated file to
+  swallow the expected types before trusting the crash list.
+
+Without either explicit input, graph memory can supply a source-checked,
+unambiguous top-level function taking one `bytes` or `str` argument.
+Decorators, ambiguous/rebound definitions, stale source, and unsafe module
+shapes are excluded. If no candidate qualifies, supply a harness or entry
+point explicitly. See [graph-based selection](understand-graph.md#pipeline-evidence-and-selection).
+
+```bash
+python3 raptor.py fuzz --binary /path/to/pypkg --py-entry mypkg.parser:parse
+python3 raptor.py fuzz --binary /path/to/pypkg --py-harness ./fuzz_parse.py
+```
+
+Crashes are usually uncaught Python exceptions: the exception type and
+traceback parsed from atheris output become the triage signal on the
+normalized crash records (`atheris/atheris-crashes.json`), and each crash
+artifact is wrapped as a Witness under `<out>/witnesses/`
+(`produced_by: atheris`) — the same record shape and store the AFL++ path
+uses, so `/validate` and `raptor-verified-outcomes` consume atheris crashes
+with no extra wiring.
+
+Containment: atheris executes target code in-process, so the harness
+interpreter itself runs as an untrusted target under the full sandbox —
+network deny, read restriction to the harness/package/corpus/output paths
+plus the Python runtime, write scoping to the run directory, resource
+rlimits, and a scrubbed (never ambient) environment.
+
+atheris is an optional dependency.  When it is not importable the detector
+still reports the target with an install hint (`uv pip install atheris`) and
+the plan blocks instead of running.
+
+### cargo-fuzz (Rust, alpha)
+
+Coverage-guided fuzzing for Rust crates via
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) — the crate's
+`fuzz/fuzz_targets/*.rs` harnesses compiled as native libFuzzer binaries.
+Detected automatically for `rust-crate` targets (a directory with
+`Cargo.toml`); force it with `--engine cargo-fuzz`.  Alpha caveats up front:
+single-instance campaigns that stop at the first crash (libFuzzer
+semantics), no Rust coverage bridge yet, and no harness synthesis — the fuzz
+targets are the crate's own (`cargo fuzz init` / `cargo fuzz add` scaffold
+them in a trusted context).
+
+Target selection: `--fuzz-target <name>` picks one of the crate's fuzz
+targets; a crate with exactly one auto-selects it, several targets block the
+plan with the list (never a silent pick).  Without an operator `--corpus`,
+the crate's own `fuzz/corpus/<target>/` seeds are staged when present
+(through the same bounded, symlink-refusing corpus stager as every other
+engine).
+
+```bash
+python3 raptor.py fuzz --binary /path/to/crate --fuzz-target parse_input
+python3 raptor.py fuzz --binary /path/to/crate            # single target
+```
+
+The campaign has two phases.  The BUILD (`cargo fuzz build <target>`)
+executes target code — `build.rs`, proc macros — so it runs under the full
+sandbox with the network denied and cargo pinned offline
+(`CARGO_NET_OFFLINE`): dependencies must already be in the local cargo cache
+(the failure message says to run `cargo fetch` once in a trusted context).
+Build artifacts are routed into the run directory (`CARGO_TARGET_DIR`), the
+cargo home the build sees is a hermetic run-local copy seeded from the host
+cache's `registry/index` + `registry/cache` (the host `~/.cargo` is never
+build-writable — a hostile `build.rs` could otherwise poison the shared
+registry extraction that later builds silently compile), and the build's
+write scope additionally covers the crate's `fuzz/` workspace — the one
+place cargo itself must write — while the rest of the crate stays
+read-only.  The CAMPAIGN then executes the built binary directly under the
+strict libFuzzer-runner sandbox (cargo never runs inside the campaign).
+
+A nightly Rust toolchain enables cargo-fuzz's default AddressSanitizer
+build; without one the build degrades to `--sanitizer none` with a hint
+(panics and crashes are still caught, ASan findings are not).
+
+Crashes are usually Rust panics: the panic message, location, and
+`RUST_BACKTRACE=1` frames parsed from the harness output become the triage
+signal on the normalized crash records (`cargofuzz/cargofuzz-crashes.json`),
+and each crash artifact is wrapped as a Witness under `<out>/witnesses/`
+(`produced_by: cargo-fuzz`, with the built binary's hash) — the same record
+shape and store the AFL++ and atheris paths use, so `/validate` and
+`raptor-verified-outcomes` consume cargo-fuzz crashes with no extra wiring.
+
+cargo and cargo-fuzz are optional dependencies.  When either is missing the
+detector still reports the target with an install hint
+(`cargo install cargo-fuzz`) and the plan blocks instead of running.
+
+### Jazzer (Java/JVM, alpha)
+
+Coverage-guided fuzzing for Java/Kotlin projects via
+[Jazzer](https://github.com/CodeIntelligenceTesting/jazzer) — a native
+libFuzzer driver loading the JVM and calling a harness class's
+`fuzzerTestOneInput`.  Detected automatically for `java-project` targets (a
+directory with a `pom.xml` / Gradle build marker, or a bare Java/Kotlin
+source tree); force it with `--engine jazzer`.  Alpha caveats up front:
+single-instance campaigns that stop at the first crash (libFuzzer
+semantics), no JVM coverage bridge yet (JaCoCo is a later lane), and no
+harness synthesis — the fuzz targets are the project's own (a class with
+`public static void fuzzerTestOneInput(byte[] data)` or a `@FuzzTest` JUnit
+method).
+
+Target selection: `--fuzz-target <class>` picks one of the project's
+enumerated target classes (fully-qualified, or the simple name when it is
+unambiguous); a project with exactly one auto-selects it, several targets
+block the plan with the list (never a silent pick).  Without an operator
+`--corpus`, the project's own `src/test/resources/<pkg>/<Class>Inputs`
+seeds (the jazzer JUnit convention) are staged when present (through the
+same bounded, symlink-refusing corpus stager as every other engine).
+
+```bash
+python3 raptor.py fuzz --binary /path/to/project --fuzz-target com.example.ParserFuzz
+python3 raptor.py fuzz --binary /path/to/project           # single target
+```
+
+The campaign has two phases.  The BUILD compiles the harness classpath by
+layout — Maven (`mvn -B -o test-compile dependency:build-classpath`),
+Gradle (`gradle --offline --no-daemon` with a RAPTOR init script collecting
+the runtime classpath), or a bare `javac` compile into the run directory —
+and executes target code (Maven plugins ARE code, `build.gradle` IS code),
+so it runs under the full sandbox with the network denied and the tool
+pinned offline: dependencies must already be in the local cache (the
+failure message says to run one trusted-context build first).  The
+dependency caches the build sees are hermetic run-local copies seeded from
+the host `~/.m2/repository` / `~/.gradle/caches` dependency subtree — the
+host caches are never build-writable (a hostile build could otherwise
+poison the shared cache that the operator's own later, trusted builds
+silently consume) — and the build's in-project write scope covers only the
+build tool's own output dirs (module `target/` / `build/` plus the root
+`.gradle/`), while the rest of the project stays read-only.  The repo's own
+`mvnw`/`gradlew` wrappers are never executed.  The CAMPAIGN then executes
+the jazzer binary directly under the strict libFuzzer-runner sandbox with
+`--cp`/`--target_class` (the build tool never runs inside the campaign);
+the classpath entries coming out of the build are vetted — kept only when
+they exist inside the project or the run directory — before jazzer sees
+them.
+
+Crashes are usually uncaught Java exceptions (Jazzer's security detectors
+raise `FuzzerSecurityIssue*` exception types through the same report): the
+exception type, message, and stack frames parsed from the harness output
+become the triage signal on the normalized crash records
+(`jazzer/jazzer-crashes.json`), and each crash artifact is wrapped as a
+Witness under `<out>/witnesses/` (`produced_by: jazzer`, with the harness
+source file's hash) — the same record shape and store the AFL++, atheris,
+and cargo-fuzz paths use, so `/validate` and `raptor-verified-outcomes`
+consume jazzer crashes with no extra wiring.
+
+jazzer and a JVM are optional dependencies.  When either is missing the
+detector still reports the target with an install hint (the standalone
+release from the Jazzer GitHub releases page) and the plan blocks instead
+of running; a missing build tool for the project's layout (`mvn`,
+`gradle`, or `javac` for bare trees) blocks the plan the same way.
+
+## Target Detection
+
+Before any campaign starts, RAPTOR identifies the target and recommends the
+appropriate approach.  The detector recognises:
+
+| Kind | Description | Recommended Fuzzer |
+|------|-------------|--------------------|
+| `elf-linux` | Linux ELF binary | AFL++ |
+| `elf-kmod` | Linux kernel module (.ko) | kAFL / Snapchange (not orchestrated) |
+| `macho` | macOS Mach-O binary (thin or fat/universal) | libFuzzer |
+| `pe-exe` | Windows PE executable | WinAFL (not orchestrated) |
+| `pe-dll` | Windows DLL | WinAFL (not orchestrated) |
+| `pe-sys` | Windows kernel driver (.sys) | kAFL / Snapchange (not orchestrated) |
+| `java-class` | Java class file | Not orchestrated (point at the source tree for Jazzer) |
+| `java-archive` | Java JAR archive | Not orchestrated (point at the source tree for Jazzer) |
+| `apk` | Android APK archive | Not yet orchestrated |
+| `source-c` | C/C++ sources (file or tree) | Env build-on-demand (trees, trust-gated) or harness generation then libFuzzer |
+| `source-cpp` | C++ source / header files | Harness generation then libFuzzer |
+| `rust-crate` | Rust crate (Cargo.toml present) | `cargo-fuzz` |
+| `python-pkg` | Python package (pyproject.toml / setup.py) | Atheris |
+| `java-project` | Java/Kotlin project (Maven / Gradle / bare sources) | Jazzer |
+
+Detection works by reading magic bytes (ELF, Mach-O, PE, PK/ZIP), inspecting
+file extensions, and checking for project markers (`Cargo.toml`,
+`pyproject.toml`).  Fat Mach-O binaries are distinguished from Java class files
+(both share the `0xCAFEBABE` magic) by validating the CPU architecture table.
+
+Each `TargetInfo` result includes `can_fuzz_here` (whether the host can run
+this target), `blockers` (what prevents fuzzing), and `hints` (actionable
+suggestions).
+
+## Prerequisites
+
+A capability probe runs before every campaign, checking for:
+
+**Fuzzing engines:**
+
+- AFL++ -- `afl-fuzz`, `afl-clang-fast` (or `afl-clang-lto`, `afl-gcc`),
+  `afl-showmap`, `afl-cmin`, `afl-tmin`.
+- AFL++ version (extracted from `afl-fuzz --help`).
+- AFL++ shared memory (macOS only) -- tests whether shmget() works.  If it
+  fails, run `sudo afl-system-config`.
+
+**Compiler and sanitiser support:**
+
+- clang with libFuzzer runtime (`-fsanitize=fuzzer`).
+- AddressSanitizer (`-fsanitize=address`).
+- UndefinedBehaviorSanitizer (`-fsanitize=undefined`).
+- MemorySanitizer (`-fsanitize=memory`).
+
+**Coverage tools:**
+
+- `lcov`, `gcov`, `llvm-cov`, `afl-cov`.
+
+**Debuggers and analysis:**
+
+- `gdb`, `rr`.
+- `radare2` with `r2pipe` and `r2ghidra` (for binary pre-analysis).
+
+Use `--plan-only` to see the probe output and campaign plan without
+actually starting a run. The plan warns up front when the target
+binary looks uninstrumented and the AFL++ install ships no
+binary-only tracer (QEMU / FRIDA mode), rather than letting the
+campaign refuse at start time.
+
+## Usage
+
+```bash
+python3 raptor.py fuzz --binary <path> [flags]
+```
+
+### Core flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--binary <path>` | *required* | Path to binary to fuzz |
+| `--corpus <dir>` | built-in / autonomous | Seed corpus directory |
+| `--duration <secs>` | 3600 | Fuzzing duration in seconds |
+| `--parallel <N>` | 1 | Number of parallel AFL++ instances (clamped to the `tuning.json` `max_fuzz_parallel` ceiling) |
+| `--max-crashes <N>` | 10 | Maximum crashes to analyse |
+| `--rank-crashes` | off | LLM re-rank of collected crashes before the analysis cap (ordering only; runs the campaign to a 3× pool and backfills past stack-hash duplicates; needs an external analysis model) |
+| `--timeout <ms>` | 1000 | Per-execution timeout in milliseconds |
+| `--out <dir>` | auto | Output directory |
+| `--input-mode <mode>` | stdin | `stdin` or `file` (uses `@@`) |
+| `--dict <path>` | none | AFL dictionary file |
+
+### Autonomous mode flags
+
+| Flag | Description |
+|------|-------------|
+| `--autonomous` | Enable intelligent corpus generation |
+| `--goal <text>` | Goal-directed fuzzing objective (e.g. "find heap overflow") |
+
+### Orchestrator flags
+
+| Flag | Description |
+|------|-------------|
+| `--orchestrator` | Force the orchestrator pipeline (target detection + capability checks + engine selection) |
+| `--legacy` | Force the legacy AFL++-only path |
+| `--plan-only` | Print the campaign plan and exit without running |
+| `--engine <afl\|libfuzzer\|atheris\|cargo-fuzz\|jazzer>` | Force a specific engine; honoured only when the detected target kind supports it, otherwise the plan blocks. Implies `--orchestrator` |
+| `--py-harness <file>` | Operator-written atheris `TestOneInput` harness for python-pkg targets. Implies `--orchestrator` |
+| `--py-entry <module:function>` | Scaffold a template atheris harness around this entry point (simple bytes/str case only). Implies `--orchestrator` |
+| `--py-input <bytes\|text>` | Payload type the scaffolded harness feeds the entry point (default: bytes) |
+| `--fuzz-target <name>` | In-repo harness to build and run: the cargo-fuzz target name (rust-crate) or the Jazzer target class (java-project; fully-qualified, or the simple name when unambiguous); auto-selected when the project has exactly one. Implies `--orchestrator` |
+
+### Witness and exploit flags
+
+| Flag | Description |
+|------|-------------|
+| `--no-verify-exploits` | Skip compile-verify on LLM-emitted exploits |
+| `--no-judge-intent` | Skip intent-match judge on LLM-emitted exploits |
+| `--no-record-witnesses` | Skip recording LLM-emitted exploits as Witnesses |
+| `--execute-exploits` | Execute each LLM-emitted exploit inside the [sandbox](sandbox.md) |
+| `--execute-timeout <secs>` | Per-exploit execution timeout (default 5s) |
+| `--execute-sanitizers <list>` | Comma-separated sanitisers to compile exploits with (e.g. `address,undefined`) |
+
+### Other flags
+
+| Flag | Description |
+|------|-------------|
+| `--afl-mode <auto\|qemu\|frida>` | Binary-only tracer for uninstrumented targets (default: auto — QEMU, then FRIDA, from what the AFL++ install ships) |
+| `--check-sanitizers` | Check if the binary is compiled with sanitisers |
+| `--recompile-guide` | Print a guide for recompiling with AFL instrumentation and sanitisers |
+| `--use-showmap` | Run `afl-showmap` after fuzzing for coverage analysis |
+| `--export-seed-corpus <dir>` | Export RAPTOR's built-in seed corpus to a directory and exit |
+| `--seed-profile <name>` | Select a built-in seed corpus profile (default: `default`) |
+| `--from-smt-witness <dir>` | Synthesize AFL seeds and dictionary tokens from an audit/validate run's SMT witnesses |
+| `--prepare-corpus` / `--seed-out <dir>` / `--seed-max-size <n>` / `--seed-include-lockfiles` | Build a seed corpus from the target repo without fuzzing |
+
+### Goal options
+
+When using `--autonomous --goal "..."`:
+
+| Goal | Seeds Generated | Target Vulnerabilities |
+|------|-----------------|----------------------|
+| `"find stack overflow"` | 64--1024 byte buffers | Stack buffer overflows |
+| `"find heap overflow"` | 1KB--64KB allocations | Heap corruption |
+| `"find buffer overflow"` | Mixed sizes + format strings | Any buffer overflow |
+| `"find parser bugs"` | Malformed structures, deeply nested | Parser vulnerabilities |
+| `"find use-after-free"` | Realloc triggers, mixed allocations | UAF vulnerabilities |
+| `"find RCE"` | Command injection patterns | Code execution |
+| No goal | Universal seeds only | Any vulnerability |
+
+## Corpus Management
+
+RAPTOR supports three tiers of corpus generation, applied in priority order:
+
+### 1. User-supplied corpus
+
+Pass `--corpus <dir>` to use your own seed inputs.  This takes the highest
+priority and is recommended when you have high-quality, domain-specific inputs.
+Combine with autonomous mode (`--corpus ./seeds --autonomous`) to augment your
+corpus with generated seeds.
+
+### 2. Autonomous generation
+
+Enabled with `--autonomous`.  The generator analyses the binary using `strings`
+to detect input formats and commands, then produces three categories of seeds:
+
+- **Basic seeds** (universal): empty input, single bytes, boundary-length
+  buffers, null bytes, high bytes, special characters.
+- **Format-specific seeds**: tailored to detected formats (JSON, XML, HTTP,
+  YAML, CSV, INI, URL-encoded values).
+- **Goal-directed seeds**: shaped for the specified `--goal` (large buffers for
+  overflow goals, realloc patterns for UAF goals, nested structures for parser
+  goals).
+
+For binaries with command-based input (e.g. `COMMAND:DATA`), autonomous mode
+detects commands and wraps seeds with appropriate prefixes.
+
+### 3. Built-in seed corpus
+
+When neither `--corpus` nor `--autonomous` is provided, RAPTOR falls back to a
+checked-in seed corpus under `packages/fuzzing/data/seed_corpus/`.  This is
+deliberately small and reviewable: text, JSON, XML, HTTP, CSV, INI, URL-encoded
+values, path-ish strings, integer boundaries, format strings, and RAPTOR-style
+command prefixes.
+
+Export the built-in corpus for review or local editing:
+
+```bash
+python3 raptor.py fuzz --export-seed-corpus /tmp/raptor-fuzz-seeds
+```
+
+### Dictionary auto-discovery
+
+`/audit` writes a fuzz handoff at the end of each run: `fuzz-dict.json`
+(structured tokens with provenance, plus seed hints) and `fuzz.dict` -- the
+same tokens in AFL `name="value"` format, mined from unique magic constants,
+parse-shape string literals, and dispatch/switch keys in the audited code.
+
+When the operator does not pass `--dict`, `/fuzz` picks that dictionary up
+automatically: it checks the run's own output directory first (shared-dir
+pipelines), then the newest `fuzz.dict` among sibling run directories under
+the same parent (project layouts).  An explicit `--dict` always wins.
+Discovery is best-effort and bounded -- a missing or oversized (>1 MiB)
+dictionary simply means no `-x` flag, exactly as before.
+
+## Crash Triage and Replay
+
+Crash triage processes the `crashes/` directory from AFL++ output:
+
+1. **Deduplication** -- crashes are deduplicated by SHA-256 hash of the input
+   file (first 16 hex characters).
+2. **Signal parsing** -- crash metadata is extracted from AFL filename
+   conventions (`id:NNNNNN,sig:NN,src:NNNNNN,...`).
+3. **Exploitability ranking** -- crashes are ranked by signal type:
+   - SIGSEGV (11) -- memory access violation (highest priority).
+   - SIGABRT (06) -- assertion failure / heap corruption.
+   - SIGILL (04) -- invalid instruction.
+   - SIGFPE (08) -- floating point exception.
+4. **Witness wrapping** -- each crash is wrapped into a Witness object,
+   stored under `<out>/witnesses/`, and can be consumed by
+   [/validate](validation.md), [/crash-analysis](crash-analysis.md), and
+   [ZKPoX proof-of-exploit bundling](zkpox.md) (the run summary reports
+   how many witnesses are ZKPoX-eligible).
+
+After triage, the top N crashes (controlled by `--max-crashes`) are sent to the
+LLM for exploitability assessment and PoC generation.  The LLM analysis
+produces per-crash JSON reports in `analysis/` and generated exploits in
+`analysis/exploits/`.
+
+When `--execute-exploits` is enabled, each LLM-emitted exploit is
+compile-verified and then executed inside the [sandbox](sandbox.md) (Landlock +
+seccomp + namespaces + network block).  The observed outcome
+(`EXIT_SIGNAL`, `SANITIZER_REPORT`, `NO_OBVIOUS_EFFECT`, etc.) is threaded
+into the recorded Witness.
+
+## Env Build-on-Demand (source trees)
+
+A source tree with no fuzzable binary can be built AFL-instrumented on
+demand and fuzzed at native speed -- no harness required for
+repo-native executables.
+
+```
+/fuzz /path/to/source-repo              # project 'build' marker set
+python3 raptor.py fuzz --binary /path/to/source-repo --env-build
+```
+
+What happens:
+
+1. **Consent gate.** Building a repo executes repo-influenced code, so
+   the build fires only when the project `build` trust marker
+   (`/project trust build`) or the per-run `--env-build` flag
+   authorises it.  `--no-env-build` disables it for one run even with
+   the marker set (negative flag wins).  Without consent the plan
+   declines with a hint and the classic harness route is unchanged.
+2. **Build command resolution.** Operator setting first
+   (`/project set build-command`), detector synthesis otherwise.  A
+   synthesised command is used but loudly labelled GUESSED -- the
+   provenance record (`env-build.json`) and campaign log both carry it.
+3. **Instrumented build.** The repo is copied into a build context and
+   built with `CC=afl-clang-fast CXX=afl-clang-fast++` inside the
+   pinned AFL++ image (`core.env.build.AFL_BUILD_IMAGE`), network
+   disabled.  ELF executables are extracted read-only (0444) with
+   SHA-256 checksums.
+4. **In-image campaign.** The image is exported to a rootfs under the
+   run directory and afl-fuzz runs from it under the sandbox's
+   image-rootfs mode: the binary and afl-fuzz share the image's libc
+   and AFL version by construction, and the campaign keeps the full
+   sandbox observation tier (network deny, Landlock write scoping).
+   The output directory is bound at its original path, so crash
+   collection, telemetry, and stats work exactly as in host-mode
+   campaigns.  Corpus and dictionary are staged under the output
+   directory (only the output bind is visible post-pivot).
+5. **Cleanup.** The exported rootfs is several GB; it is deleted when
+   the campaign ends.  Pass `--keep-env-rootfs` to retain it (e.g. to
+   replay crashes in-image), and `--env-target <rel>` to choose among
+   multiple built binaries.
+
+### Sanitizer and cmplog variants
+
+- `--env-asan` builds the target with AddressSanitizer via the AFL
+  toolchain.  Memory bugs that never crash a plain build (silent
+  over-reads, use-after-free without corruption) surface as recorded
+  crashes; the campaign automatically runs with `-m none` (ASAN's
+  shadow memory is incompatible with AFL's memory limit; `-m` was
+  never a security boundary, and the sandbox's isolation -- network
+  deny, Landlock write scoping -- is unaffected).
+- `--env-cmplog` builds a second, compare-logging twin of the same
+  tree (`/src-cmplog` in the image) and attaches it to the main
+  instance (`-c`).  Input-to-state guidance cracks magic-number,
+  version-check and checksum gates that random mutation practically
+  never finds; the flags combine (`--env-asan --env-cmplog` is the
+  strongest default posture for unknown source trees).
+
+The AFL++ image is digest-pinned, and RAPTOR carries an in-code
+blocklist of AFL builds with known crash-classification defects: after
+every env build the image's `afl-fuzz` binary is scanned, and a
+blocklisted version refuses the campaign loudly (a fuzzer that
+silently drops sanitizer crashes is worse than no fuzzer).  If you see
+`broken_afl_version`, the image resolved to a known-bad build -- use
+the pinned default.
+
+There is no docker fallback for the campaign: if the sandbox's
+image-rootfs mode is unavailable, the env-build path refuses rather
+than running the target under a weaker containment tier.
+
+## Harness Generation
+
+For source code targets that do not have a fuzzable binary, RAPTOR can
+scaffold a libFuzzer harness from a function specification (header
+file, function name, parameter types), producing a self-contained `.c`
+or `.cc` file containing:
+
+- A `LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)` entry point.
+- Input decomposition logic that maps the fuzz input buffer to the target
+  function's parameters.
+- Proper cleanup and a return value of 0 (libFuzzer expects 0 on both success
+  and failure).
+
+Harness generation is LLM-driven: the generator sends the function's
+declaration, surrounding context, and any available documentation to the LLM,
+which produces the harness code.  A fallback template is used when the LLM is
+unavailable.
+
+## Binary Pre-Analysis
+
+When the orchestrator's `binary_understand` option is enabled (the default for
+binary targets), RAPTOR runs a radare2-based binary analysis pass before
+fuzzing starts.  This produces `binary-context-map.json` containing:
+
+- Function list with addresses, sizes, and call counts.
+- Cross-references and call graph edges.
+- String references per function.
+- Import and export tables.
+
+This context informs the LLM's crash analysis, helping it map crash addresses
+to functions and understand the binary's structure.
+
+## Sandbox Integration
+
+All fuzzing operations run inside RAPTOR's [sandbox](sandbox.md).  The sandbox
+applies:
+
+- **Landlock** filesystem restrictions (Linux 5.13+).
+- **Network deny** -- fuzzing processes cannot make network connections.
+- **Resource limits** -- CPU and memory caps prevent runaway processes.
+
+PoC compilation and execution run inside the sandbox, which combines
+namespace isolation with the Landlock policy.  When `--execute-exploits`
+is enabled, generated exploits run under the same sandbox with an additional
+seccomp filter.
+
+## Platform Notes
+
+### Linux
+
+AFL++ is the primary engine and is fully orchestrated.  libFuzzer also works
+when the target is compiled with clang's `-fsanitize=fuzzer`.  Both engines
+benefit from:
+
+- Compiling with `afl-clang-fast` or `afl-clang-lto` for AFL++ instrumentation.
+- AddressSanitizer (`-fsanitize=address`) for precise crash diagnostics.
+- Adjusting `perf_event_paranoid` for AFL++ feedback
+  (`echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`).
+
+### macOS
+
+libFuzzer is the preferred engine.  AFL++ works but requires shared memory
+configuration (`sudo afl-system-config`), and macOS's SIP restricts some
+AFL++ features.
+
+Apple's system clang does not ship the libFuzzer runtime.  Install Homebrew
+LLVM (`brew install llvm`) and RAPTOR will auto-detect it.
+
+## Output Structure
+
+```
+out/fuzz_<binary>_<timestamp>/
+  autonomous_corpus/          -- Generated seeds (--autonomous only)
+    seed_basic_NNN            -- Universal seeds
+    seed_json_NNN             -- Format-specific seeds
+    seed_goal_NNN             -- Goal-directed seeds
+  afl_output/                 -- AFL++ fuzzing results
+    main/
+      crashes/                -- Crash-triggering inputs
+      queue/                  -- Interesting inputs (coverage)
+      fuzzer_stats            -- AFL++ statistics
+    secondaryNN/              -- Parallel instance results
+    merged_crashes/           -- All instances' crashes (hardlinked) when a
+                                 secondary found any; analysis reads this dir
+  analysis/                   -- LLM crash-analysis output
+    analysis/
+      <safe_id>.json          -- Per-crash LLM analysis (<safe_id> is the
+                                 AFL crash id sanitised for filesystem
+                                 use; there is no crash_ prefix)
+    exploits/
+      <safe_id>_exploit.cpp   -- Generated exploit PoCs
+      <safe_id>_exploit_validated.c
+                              -- Refined exploit that passed
+                                 validate-and-refine (--autonomous)
+      <safe_id>_exploit_best_attempt.c
+                              -- Refinement attempted but did not
+                                 validate; best attempt kept
+                                 (--autonomous)
+    witnesses/                -- LLM-exploit Witness objects
+                                 (skipped with --no-record-witnesses)
+  witnesses/                  -- Crash Witness objects for the fuzz
+                                 crashes themselves (always recorded;
+                                 atheris, cargo-fuzz, and jazzer
+                                 campaigns write here too)
+  atheris/                    -- atheris campaign results (python-pkg targets)
+    corpus/                   -- working corpus (seeds staged in)
+    crashes/                  -- crash-* / timeout-* / oom-* artifacts
+    atheris-crashes.json      -- normalized crash records with the
+                                 Python exception triage signal
+  atheris-harness/            -- generated template harness (--py-entry only)
+  cargofuzz/                  -- cargo-fuzz campaign results (rust-crate targets)
+    cargo-target/             -- sandboxed build artifacts (the built
+                                 fuzz-target binary lives here)
+    corpus/                   -- working corpus (seeds staged in)
+    crashes/                  -- crash-* / timeout-* / oom-* artifacts
+    build-stdout.log          -- cargo fuzz build output
+    build-stderr.log
+    cargofuzz-crashes.json    -- normalized crash records with the
+                                 Rust panic triage signal
+  crate-corpus.json           -- record of the crate's own fuzz/corpus/<target>
+                                 seeds being used (cargo-fuzz, no --corpus)
+  jazzer/                     -- jazzer campaign results (java-project targets)
+    classes/                  -- bare-lane javac output (Maven/Gradle
+                                 builds write their module target/ or
+                                 build/ dirs instead)
+    m2-repo/ gradle-home/     -- hermetic run-local dependency caches
+                                 (seeded by copy from the host caches)
+    classpath.txt             -- the build's classpath output (vetted
+                                 before the campaign uses it)
+    corpus/                   -- working corpus (seeds staged in)
+    crashes/                  -- crash-* / timeout-* / oom-* artifacts
+    build-stdout.log          -- build-tool output
+    build-stderr.log
+    jazzer-crashes.json       -- normalized crash records with the
+                                 Java exception triage signal
+  jazzer-corpus.json          -- record of the project's own
+                                 <Class>Inputs seeds being used
+                                 (jazzer, no --corpus)
+  binary-context-map.json     -- radare2 binary analysis (when enabled)
+  coverage-fuzz.json          -- Function-precise runtime coverage record
+                                 (gcov-instrumented targets; reaches the
+                                 durable coverage store as reachability
+                                 evidence — never counts as review)
+  fuzzing_report.json         -- Campaign summary report
+```
+
+### Sandbox requirements
+
+Fuzz campaigns, AFL coverage probes, target replay, Cargo/JVM harness builds
+and synthesized build checks use the untrusted execution floor: `mount-ns`
+on Linux and `seatbelt` on macOS. They refuse to execute when the required
+containment cannot engage. AFL reads are scoped to the declared binary,
+corpus, dictionary, support libraries and tool runtime; custom libraries
+outside those paths must be declared through the existing runner inputs.
+
+On restricted hosts, review the [containment floor and explicit consent
+options](sandbox.md#containment-floor) before accepting weaker isolation.
+Installation protection does not waive these requirements.

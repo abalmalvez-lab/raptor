@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 
 # Regex split-points kept simple + verified by tests; not the full
@@ -38,6 +37,36 @@ _DIGEST_RE = re.compile(
     r"^(?P<algo>[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z0-9]+)*)"
     r":(?P<hex>[A-Fa-f0-9]{32,})$"
 )
+
+# The one digest algorithm the client can actually verify: content
+# addresses are recomputed as sha256 over response bytes, so a pin in
+# any other algorithm (sha512:, md5:, ...) would be fetched and used
+# with NO content authentication. Refused loudly at parse time —
+# a quietly-accepted-but-unverifiable pin is strictly worse than an
+# error the operator can act on.
+_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+# Distribution-spec repository grammar: lowercase path components
+# joined by ``/``, separators inside a component limited to ``.``,
+# one or two ``_``, or runs of ``-``. Enforced at parse time because
+# repository and tag interpolate into AUTHED ``/v2/...`` URL paths —
+# without the grammar, hostile FROM lines carrying ``..`` segments,
+# ``?query`` or ``#fragment`` syntax steer registry requests at
+# attacker-chosen paths (exactly what the strict digest grammar was
+# added to prevent on the digest field).
+_REPO_COMPONENT = r"[a-z0-9]+(?:(?:\.|_{1,2}|-+)[a-z0-9]+)*"
+_REPOSITORY_RE = re.compile(
+    rf"^{_REPO_COMPONENT}(?:/{_REPO_COMPONENT})*$"
+)
+
+# Distribution-spec tag grammar: 128 chars max, alnum/underscore
+# start, then word chars plus ``.`` / ``-``.
+_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+
+# Docker Hub authority aliases collapsed to the canonical name so
+# every downstream table (registry families, realm allowlist, the
+# ``library/`` namespace rule) matches on one spelling.
+_DOCKER_HUB_ALIASES = frozenset({"index.docker.io", "registry-1.docker.io"})
 
 
 @dataclass(frozen=True)
@@ -55,8 +84,8 @@ class ImageRef:
 
     registry: str            # e.g. "docker.io", "ghcr.io"
     repository: str          # e.g. "library/python", "anthropic/claude-code"
-    tag: Optional[str]       # e.g. "3.11", or None when only digest is given
-    digest: Optional[str]    # "sha256:..." or None
+    tag: str | None       # e.g. "3.11", or None when only digest is given
+    digest: str | None    # "sha256:..." or None
 
     def to_canonical(self) -> str:
         """Round-trippable canonical form: ``<registry>/<repo>[:<tag>][@<digest>]``."""
@@ -89,16 +118,29 @@ def parse_image_ref(s: str) -> ImageRef:
     """
     s = s.strip()
     if not s:
-        raise ValueError("empty image reference")
+        msg = "empty image reference"
+        raise ValueError(msg)
 
     # Split off the digest first — it's the unambiguous suffix.
-    digest: Optional[str] = None
+    digest: str | None = None
     if "@" in s:
         s, digest = s.rsplit("@", 1)
-        if not _DIGEST_RE.match(digest):
+        m = _DIGEST_RE.match(digest)
+        if not m:
             raise ValueError(
                 f"malformed digest {digest!r}; expected "
                 f"<algorithm>:<hex>"
+            )
+        # Canonicalise case (hex digests and algorithm names are
+        # case-insensitive in operator input; registries emit
+        # lowercase) before the algorithm gate.
+        digest = digest.lower()
+        if not _SHA256_DIGEST_RE.match(digest):
+            raise ValueError(
+                f"unsupported digest algorithm in {digest!r}: only "
+                f"sha256:<64 hex> pins are supported — content "
+                f"addresses are recomputed as sha256, so any other "
+                f"algorithm cannot be verified"
             )
 
     # The registry is the first ``/``-separated segment IF it looks
@@ -128,7 +170,7 @@ def parse_image_ref(s: str) -> ImageRef:
     # only if it doesn't contain a ``/`` (a colon in the registry
     # part — like ``localhost:5000`` — has already been handled
     # above).
-    tag: Optional[str]
+    tag: str | None
     if ":" in repo_and_tag:
         repository, tag = repo_and_tag.rsplit(":", 1)
         if "/" in tag:
@@ -141,7 +183,28 @@ def parse_image_ref(s: str) -> ImageRef:
         tag = None
 
     if not repository:
-        raise ValueError(f"image reference missing repository: {s!r}")
+        msg = f"image reference missing repository: {s!r}"
+        raise ValueError(msg)
+
+    # Canonicalise the registry: hostnames are case-insensitive (a
+    # mixed-case ``Docker.IO`` previously missed every downstream
+    # exact-match table), and Docker Hub's authority aliases collapse
+    # to the canonical name.
+    registry = registry.lower()
+    if registry in _DOCKER_HUB_ALIASES:
+        registry = "docker.io"
+
+    if not _REPOSITORY_RE.match(repository):
+        raise ValueError(
+            f"malformed repository {repository!r}: must be lowercase "
+            f"path components (alnum with . _ - separators) joined "
+            f"by '/'"
+        )
+    if tag is not None and not _TAG_RE.match(tag):
+        raise ValueError(
+            f"malformed tag {tag!r}: must match "
+            f"[A-Za-z0-9_][A-Za-z0-9._-]{{0,127}}"
+        )
 
     # Docker Hub's "library" prefix for single-segment refs (the
     # ``python`` → ``library/python`` convention).
@@ -158,4 +221,35 @@ def parse_image_ref(s: str) -> ImageRef:
     )
 
 
-__all__ = ["ImageRef", "parse_image_ref"]
+def split_image_ref(ref: str) -> tuple[str, str | None]:
+    """Split an OCI image reference into ``(name, tag-or-digest)``.
+
+    ``postgres:16`` → ``("postgres", "16")``
+    ``ghcr.io/x/y:1.2`` → ``("ghcr.io/x/y", "1.2")``
+    ``alpine`` (no tag) → ``("alpine", None)``
+    ``foo@sha256:abc...`` → ``("foo", "sha256:abc...")``  (digest pin)
+
+    Lightweight, lossy sibling of :func:`parse_image_ref`: no
+    registry / repository canonicalisation, no implicit defaults,
+    never raises. Container-manifest parsers use it to pull a name +
+    pin out of whatever operators wrote, without imposing Docker Hub
+    conventions on the name.
+    """
+    # Digest pin first (``name@sha256:...``).
+    if "@" in ref:
+        name, _, digest = ref.rpartition("@")
+        if ":" in name.rsplit("/", 1)[-1]:
+            name = name.rsplit(":", 1)[0]
+        return name, digest or None
+    # Tag pin (last colon, but only AFTER the last slash so we
+    # don't confuse a registry port like ``localhost:5000``).
+    last_slash = ref.rfind("/")
+    rest = ref[last_slash + 1:] if last_slash >= 0 else ref
+    if ":" in rest:
+        prefix = ref[:last_slash + 1] if last_slash >= 0 else ""
+        rest_name, _, tag = rest.partition(":")
+        return prefix + rest_name, tag or None
+    return ref, None
+
+
+__all__ = ["ImageRef", "parse_image_ref", "split_image_ref"]

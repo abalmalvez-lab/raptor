@@ -1,0 +1,249 @@
+# raptor: confirm-only
+# (silence from this rule never refutes: it adjudicates the
+# attribute-context sub-shape of the CWE-79 class it is dispatched
+# for — body-context and double-quoted-attribute XSS are out of its
+# scope by design, see Scope pins below — so a scanned zero-match
+# answers "not this sub-shape", never "not this class". See
+# run_semgrep_sweep's confirm-only role handling in
+# core/audit/sweep.py.)
+rules:
+  # CWE-79: reflected XSS, attribute-context subset — request data
+  # emitted into a single-quoted or unquoted HTML attribute with NO
+  # output encoding at all. One taint rule, three sink spellings:
+  #   1. concatenation after a single-quoted attribute opener — a
+  #      double-quote-delimited literal whose content opens ...=' and
+  #      never closes it, immediately followed by `.` and the value;
+  #   2. the same for an unquoted attribute opener (literal ends
+  #      attr= with its single quotes BALANCED — unbalanced tails
+  #      belong to shape 1);
+  #   3. double-quoted string INTERPOLATION in an echo/print
+  #      statement: "<font color='$c'>" / '{$_POST[...]}' with the
+  #      interpolation directly in the single-quoted attribute opener
+  #      position.
+  # An embedded quote or whitespace in the value closes the attribute
+  # and adds event-handler attributes — htmlspecialchars alone does
+  # not help in the unquoted context, which is why the fix is
+  # ENT_QUOTES plus a quoted attribute.
+  #
+  # Concatenation follows complete operands while literal continuations
+  # keep the attribute open. It stops before a literal closing that HTML
+  # attribute, so a safe value cannot borrow request taint from body text.
+  # Balanced calls/indexes retain nested arguments and spaced reads;
+  # top-level operands are bounded to 120 atoms and opener segments to 512.
+  # Atomic subroutine atoms avoid flattened-concatenation AST splits and
+  # partial-call matches. Earlier balanced attributes and common PHP
+  # escapes in a double-quoted opener are supported.
+  #
+  # Encoded values belong to php/attr-encoding.yaml (CWE-116), which checks
+  # quote flags and encoded request values in unquoted attributes. Numeric
+  # casts/results and URL-encoded results clear only their return value;
+  # ignored conversions do not sanitize the original request variable.
+  #
+  # Scope: opener literals use PHP double quotes and remain newline-bounded;
+  # comments at the opener/dot/value boundary, printf templates and comma
+  # echo forms remain outside this rule. Concatenations are expression-level,
+  # so a matching value need not be echoed. Arbitrary character reconstruction,
+  # application validators and imported function aliases need separate review.
+  #
+  # Interpolation keeps its existing single-quoted-attribute, echo/print
+  # subset. It is string-granular: a safe interpolation in an attribute
+  # and request data elsewhere in the same string can still report. Do not
+  # replace it with one greedy regex that loses other attribute slots.
+  - id: raptor.php.attr-xss.attr-context
+    mode: taint
+    languages: [php]
+    severity: HIGH
+    message: >
+      Request-derived data reaches a single-quoted or unquoted HTML attribute
+      construction without a recognised output encoder (CWE-79 review candidate).
+      Review whether the string is emitted, the value's allowed characters and
+      context-specific encoding. Quote attributes and encode at emission, for
+      example with htmlspecialchars($v, ENT_QUOTES) where appropriate.
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+      # Split call spellings so shadow checks use a literal function name;
+      # global calls need no application-function shadow search.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: filter_input($INPUT, $NAME)
+                  - pattern-not-inside: |
+                      namespace $N;
+                      $...BEFORE;
+                      function filter_input(...) { ... }
+                      $...AFTER;
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        function filter_input(...) { ... }
+                        ...
+                      }
+              - patterns:
+                  - pattern: $READER($INPUT, $NAME)
+                  - metavariable-regex:
+                      metavariable: $READER
+                      constant-propagation: false
+                      regex: '(?i)^\\filter_input$'
+          - metavariable-regex:
+              metavariable: $INPUT
+              constant-propagation: false
+              regex: '^\\?(?:INPUT_GET|INPUT_POST|INPUT_COOKIE)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $INPUT = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $INPUT = $VALUE;
+                ...
+              }
+        exact: true
+      # Split call spellings so shadow checks use a literal function name;
+      # global calls need no application-function shadow search.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: filter_input($INPUT, $NAME, $FILTER)
+                  - pattern-not-inside: |
+                      namespace $N;
+                      $...BEFORE;
+                      function filter_input(...) { ... }
+                      $...AFTER;
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        function filter_input(...) { ... }
+                        ...
+                      }
+              - patterns:
+                  - pattern: $READER($INPUT, $NAME, $FILTER)
+                  - metavariable-regex:
+                      metavariable: $READER
+                      constant-propagation: false
+                      regex: '(?i)^\\filter_input$'
+          - metavariable-regex:
+              metavariable: $INPUT
+              constant-propagation: false
+              regex: '^\\?(?:INPUT_GET|INPUT_POST|INPUT_COOKIE)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $INPUT = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $INPUT = $VALUE;
+                ...
+              }
+          - metavariable-regex:
+              metavariable: $FILTER
+              constant-propagation: false
+              regex: '^\\?(?:FILTER_DEFAULT|FILTER_UNSAFE_RAW)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $FILTER = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $FILTER = $VALUE;
+                ...
+              }
+        exact: true
+    pattern-sanitizers:
+      - patterns:
+          - pattern: $CONVERTER(...)
+          - metavariable-regex:
+              metavariable: $CONVERTER
+              constant-propagation: false
+              regex: '(?i)^\\?(?:htmlspecialchars|htmlentities|urlencode|rawurlencode|intval|floatval|count|sizeof|strlen)$'
+        exact: true
+      - pattern-either:
+          - pattern: (int) $X
+          - pattern: (float) $X
+          - pattern: (bool) $X
+        exact: true
+      # Return-only assignment specs preserve nested sinks and the original value.
+      - patterns:
+          - pattern: $SAFE = $CONVERTER(...)
+          - metavariable-regex:
+              metavariable: $CONVERTER
+              constant-propagation: false
+              regex: '(?i)^\\?(?:htmlspecialchars|htmlentities|urlencode|rawurlencode|intval|floatval|count|sizeof|strlen)$'
+          - metavariable-regex:
+              metavariable: $SAFE
+              regex: '^\$[A-Za-z_][A-Za-z0-9_]*$'
+        exact: true
+      - patterns:
+          - pattern-either:
+              - pattern: $SAFE = (int) $X
+              - pattern: $SAFE = (float) $X
+              - pattern: $SAFE = (bool) $X
+          - metavariable-regex:
+              metavariable: $SAFE
+              regex: '^\$[A-Za-z_][A-Za-z0-9_]*$'
+        exact: true
+    pattern-sinks:
+      # Follow operands only while literal continuations keep this attribute
+      # open. A closing-attribute literal blocks taint in later body text.
+      # Atomic balanced-call/index atoms avoid partial-expression borrowing.
+      - pattern-regex: |-
+          (?x)
+          "(?1){0,512}<[A-Za-z](?4){0,512}
+          [ \t]+[A-Za-z_:][A-Za-z0-9_:.-]*+[ \t]*+=[ \t]*+'(?2){0,512}"
+          \s*+\.\s*+\K(?!/\*|//|\#)(?9)(?:\.\s*+(?!/\*|//|\#)(?9))*+
+          (?=[ \t\r\n]*(?:\.(?![0-9])|;|,|\)|\]|$))
+          (?(DEFINE)
+          ((?:[^"'\\\n]|\\[\\$nrtvef]|'(?2){0,512}'|\\"(?3){0,512}\\"))
+          ((?:[^'"\\\n]|\\[\\"$nrtvef]))
+          ((?:[^"\\\n]|\\[\\$nrtvef]))
+          ((?:[^<>"'\\\n]|\\[\\$nrtvef]|'(?2){0,512}'|\\"(?3){0,512}\\"))
+          ('(?:[^'\\\n]|\\[^'\n])*+')
+          ("(?:[^'"\\\n]|\\[^'0-7xuU\n])*+")
+          ((?:[^.()\[\]{};'",\s]|[ \t\r\n]|(?5)|(?6)|\((?8)*+\)|\[(?8)*+\]))
+          ((?:[^()\[\]'"\\]|\\.|(?10)|(?11)|\((?8)*+\)|\[(?8)*+\]))
+          ((?7){1,120}+)
+          ('(?:[^'\\\n]|\\.)*+')
+          ("(?:[^"\\\n]|\\.)*+")
+          )
+      - pattern-regex: |-
+          (?x)
+          "(?1){0,512}<[A-Za-z](?4){0,512}
+          [ \t]+[A-Za-z_:][A-Za-z0-9_:.-]*+[ \t]*+=[ \t]*+"
+          \s*+\.\s*+\K(?!/\*|//|\#)(?9)(?:\.\s*+(?!/\*|//|\#)(?9))*+
+          (?=[ \t\r\n]*(?:\.(?![0-9])|;|,|\)|\]|$))
+          (?(DEFINE)
+          ((?:[^"'\\\n]|\\[\\$nrtvef]|'(?2){0,512}'|\\"(?3){0,512}\\"))
+          ((?:[^'"\\\n]|\\[\\"$nrtvef]))
+          ((?:[^"\\\n]|\\[\\$nrtvef]))
+          ((?:[^<>"'\\\n]|\\[\\$nrtvef]|'(?2){0,512}'|\\"(?3){0,512}\\"))
+          ('(?:[^'\\\s<>]|\\[^'\s<>])*+')
+          ("(?:[^'"\\\s<>]|\\[\\$])*+")
+          ((?:[^.()\[\]{};'",\s]|[ \t\r\n]|(?5)|(?6)|\((?8)*+\)|\[(?8)*+\]))
+          ((?:[^()\[\]'"\\]|\\.|(?10)|(?11)|\((?8)*+\)|\[(?8)*+\]))
+          ((?7){1,120}+)
+          ('(?:[^'\\\n]|\\.)*+')
+          ("(?:[^"\\\n]|\\.)*+")
+          )
+      # 3: interpolation in the single-quoted opener position of one
+      # echoed/printed double-quoted string.
+      - patterns:
+          - pattern-either:
+              - pattern: echo $S;
+              - pattern: print $S;
+          - metavariable-regex:
+              metavariable: $S
+              regex: ^"[^"\\]*(?:\\.[^"\\]*)*"$
+          - metavariable-regex:
+              metavariable: $S
+              regex: .*<[a-zA-Z][^>]*='[^']*\{?\$
+    metadata:
+      cwe: ["CWE-79"]

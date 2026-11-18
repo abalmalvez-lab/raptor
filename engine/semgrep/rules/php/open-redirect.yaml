@@ -1,0 +1,456 @@
+rules:
+  # CWE-601: open redirect — a Location response header built from
+  # request-derived data. Sources are the request parameters plus the
+  # attacker-controlled $_SERVER members that commonly seed
+  # "self"-redirect URLs: HTTP_HOST and HTTP_X_FORWARDED_HOST (client
+  # header echoes — a host-header-derived base URL redirects to an
+  # attacker host), HTTP_REFERER (the redirect-back shape — the
+  # header is fully client-chosen), PHP_SELF (carries decoded
+  # PATH_INFO), REQUEST_URI and QUERY_STRING (raw request echoes).
+  #
+  # Sinks — header()/\header() first arguments in four spellings,
+  # each anchored on a case-insensitive Location: literal (header
+  # names are case-insensitive): a literal-led concatenation, an
+  # interpolated "Location: $x" string, a sprintf('Location: %s', ..)
+  # build, and the one-hop variable form ($loc = 'Location: ' . ...;
+  # header($loc)). Every sink focuses the first argument, so taint in
+  # ANY OTHER argument (header('Location: /fixed', true, $code))
+  # never fires.
+  #
+  # Known FP modes:
+  #   - Guard-shaped validation is invisible to taint mode: a strict
+  #     equality/preg_match check on the value in an early-return
+  #     branch still fires. in_array recognizes only strict inline
+  #     string allowlists with rejecting returns/exits or literal
+  #     fallbacks. Other guard shapes can report safe code.
+  #     array_key_exists/isset require rejecting guards but do not
+  #     prove map contents or the complete key domain.
+  #   - urlencode/rawurlencode clear taint on the redirect TARGET
+  #     path assumption (an encoded value cannot introduce a scheme
+  #     or authority); a value encoded and used as the ENTIRE URL
+  #     would be a broken redirect, not a working open one.
+  # Scope pins: the anchor is one Location: literal in the first
+  #   argument (case-insensitive), at most one assignment hop away;
+  #   taint is single-function; non-Location redirects (Refresh:,
+  #   markup, script) are output-encoding shapes, not response-header
+  #   shapes. The negative fixture carries out-of-scope shape pins
+  #   for each boundary — each flips when a matching shape lands.
+  - id: raptor.php.open-redirect.header-location
+    mode: taint
+    languages: [php]
+    severity: MEDIUM
+    message: >-
+      Request-derived data reaches a potential Location response header.
+      Review the effective target, URL parsing and allowed destinations
+      before concluding an open redirect. Use server-controlled destinations
+      or a fixed allowlist of permitted local paths.
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - patterns:
+              - pattern: $_SERVER[$KEY]
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: ^['"](HTTP_HOST|HTTP_X_FORWARDED_HOST|HTTP_REFERER|PHP_SELF|REQUEST_URI|QUERY_STRING)['"]$
+      # Split call spellings so shadow checks use a literal function name;
+      # global calls need no application-function shadow search.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: filter_input($INPUT, $NAME)
+                  - pattern-not-inside: |
+                      namespace $N;
+                      $...BEFORE;
+                      function filter_input(...) { ... }
+                      $...AFTER;
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        function filter_input(...) { ... }
+                        ...
+                      }
+              - patterns:
+                  - pattern: $READER($INPUT, $NAME)
+                  - metavariable-regex:
+                      metavariable: $READER
+                      constant-propagation: false
+                      regex: '(?i)^\\filter_input$'
+          - metavariable-regex:
+              metavariable: $INPUT
+              constant-propagation: false
+              regex: '^\\?(?:INPUT_GET|INPUT_POST|INPUT_COOKIE)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $INPUT = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $INPUT = $VALUE;
+                ...
+              }
+        exact: true
+      # Split call spellings so shadow checks use a literal function name;
+      # global calls need no application-function shadow search.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: filter_input($INPUT, $NAME, $FILTER)
+                  - pattern-not-inside: |
+                      namespace $N;
+                      $...BEFORE;
+                      function filter_input(...) { ... }
+                      $...AFTER;
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        function filter_input(...) { ... }
+                        ...
+                      }
+              - patterns:
+                  - pattern: $READER($INPUT, $NAME, $FILTER)
+                  - metavariable-regex:
+                      metavariable: $READER
+                      constant-propagation: false
+                      regex: '(?i)^\\filter_input$'
+          - metavariable-regex:
+              metavariable: $INPUT
+              constant-propagation: false
+              regex: '^\\?(?:INPUT_GET|INPUT_POST|INPUT_COOKIE)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $INPUT = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $INPUT = $VALUE;
+                ...
+              }
+          - metavariable-regex:
+              metavariable: $FILTER
+              constant-propagation: false
+              regex: '^\\?(?:FILTER_DEFAULT|FILTER_UNSAFE_RAW)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $FILTER = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $FILTER = $VALUE;
+                ...
+              }
+        exact: true
+    pattern-sanitizers:
+      - exact: true
+        pattern-either:
+          - pattern: urlencode(...)
+          - pattern: \urlencode(...)
+          - pattern: rawurlencode(...)
+          - pattern: \rawurlencode(...)
+          - pattern: intval(...)
+          - pattern: \intval(...)
+          - pattern: (int) $X
+      # A check is not a mutation: only a strict literal allowlist
+      # with an exact rejecting branch establishes a value contract.
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: |
+                  if (!$CHECK($V, $ALLOWED, true)) {
+                    return;
+                  }
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        return $TERMINAL;
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        die($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        exit($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        $V = $DEFAULT;
+                      }
+                  - metavariable-regex:
+                      metavariable: $DEFAULT
+                      constant-propagation: false
+                      regex: '\A(?:''[^''\\]*''|"[^"\\$]*")\z'
+          - pattern-either:
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^\\in_array$'
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^in_array$'
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED as $ALIAS;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED as $ALIAS;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      use function $IMPORTED as $ALIAS;
+                      ...
+          - metavariable-regex:
+              metavariable: $V
+              constant-propagation: false
+              regex: '^\$[A-Za-z_][A-Za-z_0-9]*$'
+          - metavariable-regex:
+              metavariable: $ALLOWED
+              constant-propagation: false
+              regex: '\A\[\s*(?:''[^''\\]*''|"[^"\\$]*")(?:\s*,\s*(?:''[^''\\]*''|"[^"\\$]*"))*\s*,?\s*\]\z'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              function $CHECK(...) { ... }
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                function $CHECK(...) { ... }
+                ...
+              }
+          - focus-metavariable: $V
+      # Membership only participates in a rejecting guard. This retains
+      # the existing guarded-map heuristic; map contents are not proven.
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: |
+                  if (!$CHECK($V, $MAP)) {
+                    return;
+                  }
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        return $TERMINAL;
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        die($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        exit($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        $V = $DEFAULT;
+                      }
+                  - metavariable-regex:
+                      metavariable: $DEFAULT
+                      constant-propagation: false
+                      regex: '\A(?:''[^''\\]*''|"[^"\\$]*")\z'
+          - pattern-either:
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^\\array_key_exists$'
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^array_key_exists$'
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED as $ALIAS;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED as $ALIAS;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      use function $IMPORTED as $ALIAS;
+                      ...
+          - metavariable-regex:
+              metavariable: $V
+              constant-propagation: false
+              regex: '^\$[A-Za-z_][A-Za-z_0-9]*$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              function $CHECK(...) { ... }
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                function $CHECK(...) { ... }
+                ...
+              }
+          - focus-metavariable: $V
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: |
+                  if (!isset($MAP[$V])) {
+                    return;
+                  }
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        return $TERMINAL;
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        die($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        exit($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        $V = $DEFAULT;
+                      }
+                  - metavariable-regex:
+                      metavariable: $DEFAULT
+                      constant-propagation: false
+                      regex: '\A(?:''[^''\\]*''|"[^"\\$]*")\z'
+          - metavariable-regex:
+              metavariable: $V
+              constant-propagation: false
+              regex: '^\$[A-Za-z_][A-Za-z_0-9]*$'
+          - focus-metavariable: $V
+    pattern-sinks:
+      # Literal-led concatenation or interpolated string as the first
+      # argument.
+      - patterns:
+          - pattern-either:
+              - pattern: header($ARG, ...)
+              - pattern: \header($ARG, ...)
+          - focus-metavariable: $ARG
+          - metavariable-regex:
+              metavariable: $ARG
+              regex: '^[''"](?i:location)\s*:'
+      # sprintf-built first argument (focused like the others: taint
+      # in a later header() argument must not ride on it).
+      - patterns:
+          - pattern-either:
+              - pattern: header($F, ...)
+              - pattern: \header($F, ...)
+          - focus-metavariable: $F
+          - metavariable-pattern:
+              metavariable: $F
+              patterns:
+                - pattern: sprintf($LIT, ...)
+                - metavariable-regex:
+                    metavariable: $LIT
+                    regex: '^[''"](?i:location)\s*:'
+      # One-hop variable: the Location string is assembled into a
+      # local and passed by name.
+      - patterns:
+          - pattern-inside: |
+              $LOC = $LIT . $REST;
+              ...
+          - pattern-either:
+              - pattern: header($LOC, ...)
+              - pattern: \header($LOC, ...)
+          - focus-metavariable: $LOC
+          - metavariable-regex:
+              metavariable: $LIT
+              regex: '^[''"](?i:location)\s*:'
+    metadata:
+      cwe: ["CWE-601"]

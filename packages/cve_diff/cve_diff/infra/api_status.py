@@ -27,8 +27,9 @@ _events: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 # Per-function cache hit/miss counters. Populated by github_client (and
 # any other callers wired via record_cache_hit / record_cache_miss).
 # Per-process — under ProcessPoolExecutor each worker has its own
-# functools.lru_cache and its own counters; the bench summary reports
-# what each worker saw.
+# functools.lru_cache and its own counters; the bench ships per-CVE
+# deltas back on the result record and the parent absorb()s them into
+# its own globals before rendering the summaries.
 _cache_events: dict[str, dict[str, int]] = defaultdict(
     lambda: {"hits": 0, "misses": 0}
 )
@@ -97,6 +98,68 @@ def reset_rate_limit_events() -> None:
         _events.clear()
 
 
+def counters_snapshot() -> tuple[
+    dict[str, dict[int, int]], dict[str, dict[str, int]]
+]:
+    """Deep-copied ``(rate_limit_events, cache_events)`` pair.
+
+    The counters are per-process module globals; under
+    ``ProcessPoolExecutor`` each worker accumulates its own. The bench
+    snapshots before/after each CVE inside the worker, ships the delta
+    back on the result record, and the parent :func:`absorb`\\ s it —
+    the only way the parent's end-of-run summaries see anything under
+    ``-w > 1``.
+    """
+    with _lock:
+        return (
+            {svc: dict(counts) for svc, counts in _events.items()},
+            {name: dict(counts) for name, counts in _cache_events.items()},
+        )
+
+
+def counters_delta(
+    before: tuple[dict[str, dict[int, int]], dict[str, dict[str, int]]],
+    after: tuple[dict[str, dict[int, int]], dict[str, dict[str, int]]],
+) -> tuple[dict[str, dict[int, int]], dict[str, dict[str, int]]]:
+    """Per-CVE counter delta between two :func:`counters_snapshot` calls
+    (a worker process serves many CVEs sequentially, so absolute values
+    would double-count when summed in the parent)."""
+    events_d: dict[str, dict[int, int]] = {}
+    for svc, counts in after[0].items():
+        base = before[0].get(svc, {})
+        d = {k: v - base.get(k, 0) for k, v in counts.items()
+             if v - base.get(k, 0) > 0}
+        if d:
+            events_d[svc] = d
+    cache_d: dict[str, dict[str, int]] = {}
+    for name, counts in after[1].items():  # type: ignore[assignment]
+        base = before[1].get(name, {})  # type: ignore[assignment]
+        d = {k: v - base.get(k, 0) for k, v in counts.items()
+             if v - base.get(k, 0) > 0}
+        if d:
+            cache_d[name] = d  # type: ignore[assignment]
+    return events_d, cache_d
+
+
+def absorb(
+    rate_limit_delta: dict[str, dict[int, int]] | None,
+    cache_delta: dict[str, dict[str, int]] | None,
+) -> None:
+    """Merge a worker-shipped counter delta into this process's globals.
+
+    Status-code keys may arrive as strings (JSON round-trip of the
+    result record); they are coerced back to int.
+    """
+    with _lock:
+        for svc, counts in (rate_limit_delta or {}).items():
+            for status, n in counts.items():
+                _events[svc][int(status)] += int(n)
+        for name, counts in (cache_delta or {}).items():  # type: ignore[assignment]
+            for kind, n in counts.items():
+                if kind in ("hits", "misses"):
+                    _cache_events[name][kind] += int(n)  # type: ignore[index]
+
+
 def api_key_status() -> list[tuple[ApiKeySpec, bool]]:
     """Return [(spec, present), ...] in declaration order."""
     return [(s, bool(os.environ.get(s.env_var))) for s in _KEYS]
@@ -126,7 +189,7 @@ def llm_auth_status() -> tuple[bool, int, bool]:
     # models when the binary is on PATH; we treat that as
     # operator-facing "always available" rather than probing PATH
     # at startup.
-    any_auth = via_dispatcher or num_configured > 0 or True  # CC fallback
+    any_auth = via_dispatcher or num_configured > 0
     return any_auth, num_configured, via_dispatcher
 
 
@@ -189,8 +252,7 @@ def render_rate_limit_summary() -> str:
         return ""
     lines = ["Rate-limit events (HTTP 429 / 403 / 503):"]
     for svc in sorted(snap):
-        for status in sorted(snap[svc]):
-            lines.append(f"  {svc:<8}  http {status}: {snap[svc][status]} event(s)")
+        lines.extend(f"  {svc:<8}  http {status}: {snap[svc][status]} event(s)" for status in sorted(snap[svc]))
     return "\n".join(lines)
 
 

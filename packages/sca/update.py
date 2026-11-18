@@ -1,0 +1,2589 @@
+"""``raptor-sca fix --cve-only`` — CVE-driven upgrade planner.
+
+Reads a ``findings.json`` (or runs the analyse pipeline) and emits a
+``proposed/`` directory of manifest rewrites that bump every vulnerable
+dependency to the smallest fix version above the installed one.
+
+Modes:
+
+    --minimal     (default) smallest-bump-that-fixes
+    --fix=<adv>   restrict to the specified advisory IDs (comma-separated)
+    --allow-major allow rewrites that cross a major version boundary
+    --pin-only    only rewrite manifests where the dep is currently pinned
+                  (skip wildcard / caret / range entries)
+
+Outputs (under ``--out``):
+
+    proposed/<original-relative-path>   rewritten manifest
+    changes.json                         structured (eco, name, old, new, file)
+    changes.md                           human-readable summary
+
+Per-ecosystem rewriters live in ``_rewrite_*`` functions below. All are
+string-level (no AST) so they preserve operator formatting; complex
+shapes the regex can't safely modify (Maven properties, computed npm
+specifiers) are skipped with a logged note rather than silently
+mangling the file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import logging
+import os
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+from ._md import code_cell, neutralize_inline
+from .naming import pep503_name
+from .parsers._npm_alias import split_npm_alias
+from .resolvers._safe_io import read_regular_text
+from .rows import FindingRow
+from .versions import VersionError
+from .versions import compare as version_compare
+
+from core.json import load_json, save_json
+
+# Self-produced findings budget for the findings.json the in-process
+# analyse prepass (run_sca) just wrote (rationale in kinds.py).
+from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS_BYTES
+
+# Steered-path findings budget for the operator-supplied --findings
+# read (rationale in kinds.py).
+_MAX_FINDINGS_BYTES = 64 * 1024 * 1024
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Sequence
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public entry
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class UpgradeChange:
+    """One concrete dep upgrade to apply to one manifest."""
+
+    ecosystem: str
+    name: str
+    old_version: str
+    new_version: str
+    manifest: Path
+    advisory_ids: tuple[str, ...]
+    skipped_reason: str | None = None  # set when rewrite couldn't apply
+
+
+def main(argv: Sequence[str]) -> int:
+    from .cli import _configure_logging
+
+    args = _parse_args(argv)
+    _configure_logging(args.verbose)
+
+    findings_rows = _load_findings(args)
+    if findings_rows is None:
+        return 2
+
+    out_dir = _resolve_out_dir(args)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"raptor-sca fix --cve-only: cannot create output dir {out_dir}: {e}",
+              file=sys.stderr)
+        return 2
+
+    advisory_filter = _parse_advisory_filter(args.fix)
+    targets = _plan_targets(
+        findings_rows,
+        advisory_filter=advisory_filter,
+        allow_major=args.allow_major,
+    )
+    exclude_root = (Path(args.target).resolve()
+                    if getattr(args, "target", None) else None)
+    targets, excluded_files = _filter_excluded_plans(
+        targets, args.exclude, root=exclude_root,
+    )
+    if excluded_files:
+        print(f"raptor-sca fix: {len(excluded_files)} surface(s) "
+              f"excluded from write by --exclude patterns")
+    cascade_result = external_result = hash_pin_result = None
+    cascade_attempted = external_attempted = hash_pin_attempted = False
+    patch_path = None
+    apply_exit = None
+
+    def report_completion(mode, *, changes=(), compatibility=None, exit_code=0):
+        if args._report_options.enabled and args._report_options.output is not None:
+            from .cve_reporting import complete_cve_report
+            complete_cve_report(args, out_dir=out_dir, targets=targets, excluded_files=excluded_files,
+                                changes=changes, compatibility=compatibility or {}, mode=mode, exit_code=exit_code,
+                                patch_path=patch_path, apply_exit=apply_exit, cascade_result=cascade_result,
+                                external_result=external_result, hash_pin_result=hash_pin_result,
+                                cascade_attempted=cascade_attempted, external_attempted=external_attempted,
+                                hash_pin_attempted=hash_pin_attempted)
+    if not targets:
+        print("raptor-sca fix: no actionable upgrades — every vulnerable dep is "
+              "either unfixed, already at the highest fix, or filtered out by "
+              "--fix.", file=sys.stderr)
+        report_completion("no actionable changes")
+        return 0
+
+    changes = _materialise_changes(
+        targets,
+        findings_rows,
+        out_dir / "proposed",
+        pin_only=args.pin_only,
+    )
+
+    # Per-change upgrade-compat risk signals (semver-major bumps,
+    # dep-set churn). Cheap version-string heuristic always; the
+    # network-gated dep-set diff fires only for online runs against
+    # ecosystems we support (currently PyPI).
+    compat_reports = _compute_compat_reports(
+        changes, offline=args.offline,
+        cache_root=Path(args.cache_root) if args.cache_root else None,
+    )
+
+    save_json(
+        out_dir / "changes.json",
+        [_change_to_dict(c, compat_reports.get(_change_key(c)))
+         for c in changes],
+    )
+    (out_dir / "changes.md").write_text(
+        _render_changes_markdown(changes, compat_reports),
+        encoding="utf-8",
+    )
+
+    applied = [c for c in changes if c.skipped_reason is None]
+    skipped = [c for c in changes if c.skipped_reason is not None]
+    extra = ""
+    repo_root: Path | None = None
+    # ``--apply`` implies ``--git-patch``: you can't apply what wasn't
+    # generated, and forcing operators to remember both flags is just
+    # paperwork.
+    want_patch = args.git_patch or args.apply
+    if want_patch and applied:
+        patch_path, repo_root = _emit_git_patch(applied, out_dir)
+        if patch_path is not None:
+            extra = (
+                f"\nraptor-sca fix: upgrade.patch written to {patch_path}\n"
+                f"          apply with: cd {repo_root} && "
+                f"git apply {patch_path}"
+            )
+    print(f"raptor-sca fix: {len(applied)} change(s) applied, "
+          f"{len(skipped)} skipped — proposed/ written to {out_dir}/proposed"
+          + extra)
+
+    if args.apply:
+        from .patch_apply import apply_patch_to_target
+        # Apply at the patch's repo root (computed by ``_emit_git_patch``
+        # via .git-walk). When no patch was generated (no applicable
+        # changes), the helper handles it as a graceful no-op.
+        rc = apply_patch_to_target(
+            repo_root or Path.cwd(),
+            patch_path,
+            caller_label="raptor-sca fix --cve-only",
+        )
+        apply_exit = rc
+        if rc != 0:
+            report_completion("apply failed", changes=changes, compatibility=compat_reports, exit_code=rc)
+            return rc
+
+    # ``--allow-cascade``: run the proposed manifest through the native
+    # resolver to confirm it satisfies all peer constraints. Reports
+    # success / conflict; when the resolver succeeds, the proposed
+    # lockfile is captured alongside the manifest.
+    if args.allow_cascade and applied:
+        cascade_attempted = True
+        cascade_result = _run_cascade_validation(applied, out_dir)
+
+    # ``--validate-against=<file>``: same shape as cascade but against
+    # an externally-supplied manifest (Dependabot's PR).
+    if args.validate_against:
+        external_attempted = True
+        ext = Path(args.validate_against).resolve()
+        external_result = _run_external_validation(ext, out_dir)
+
+    # ``--format=pr-comment``: emit a separate GitHub-flavoured Markdown
+    # rendering of the change set alongside changes.md.
+    if args.format == "pr-comment":
+        (out_dir / "changes.pr-comment.md").write_text(
+            _render_pr_comment(changes), encoding="utf-8",
+        )
+
+    # ``--hash-pin``: optional second pass that walks .github/workflows
+    # and replaces mutable refs with commit SHAs. Independent of the
+    # CVE-driven plan above — even projects with no vuln findings can
+    # benefit. Requires a target directory; with ``--findings`` only
+    # we don't know where the workflows live.
+    if args.hash_pin:
+        from .hash_pin import hash_pin_workflows
+        target_dir: Path | None = None
+        if args.target:
+            target_dir = Path(args.target).resolve()
+        else:
+            # Fall back to a single common target if all findings agree.
+            files = {Path(r["file"]).resolve()
+                      for r in findings_rows
+                      if isinstance(r.get("file"), str)}
+            common = _common_target(files)
+            target_dir = common
+        if target_dir is None:
+            print("raptor-sca fix: --hash-pin needs a target directory; "
+                  "rerun with --target <repo>", file=sys.stderr)
+        else:
+            hash_pin_attempted = True
+            result = hash_pin_workflows(
+                target_dir, write=args.hash_pin_write,
+            )
+            hash_pin_result = {
+                "changed_files": [str(p) for p in result.changed_files],
+                "changes": [
+                    {"file": str(c.file), "line": c.line,
+                      "action": c.action,
+                      "old_ref": c.old_ref, "new_sha": c.new_sha}
+                    for c in result.changes
+                ],
+                "skipped": [
+                    {"file": str(f), "line": ln, "action": a,
+                      "reason": r}
+                    for f, ln, a, r in result.skipped
+                ],
+            }
+            save_json(out_dir / "hash-pin.json", hash_pin_result)
+            verb = "rewrote" if args.hash_pin_write else "would rewrite"
+            print(f"raptor-sca fix --cve-only --hash-pin: {verb} {len(result.changes)} "
+                  f"ref(s) across {len(result.changed_files)} workflow file"
+                  f"(s); {len(result.skipped)} skipped. Plan: "
+                  f"{out_dir}/hash-pin.json")
+    mode = "proposed export" if not args.apply else ("apply completed" if patch_path is not None else "no patch to apply")
+    report_completion(mode, changes=changes, compatibility=compat_reports)
+    return 0
+
+
+def _run_cascade_validation(
+    applied: list[UpgradeChange], out_dir: Path,
+) -> list[dict[str, Any]]:
+    """Per-ecosystem resolver pass over the proposed manifests.
+
+    Groups applied changes by ecosystem; for each ecosystem, runs the
+    matching resolver against the corresponding proposed manifest in
+    ``out_dir/proposed``. Ecosystems are resolved in parallel via a
+    thread pool — each resolver call sleeps on its sandbox subprocess,
+    so threading buys real wallclock for polyglot upgrade plans
+    (npm + PyPI + Go each ~5-10s; sequential = ~25s; parallel = the
+    slowest one, ~10s). Same pattern as ``transitive._run_cascades_
+    parallel``.
+
+    Reports OK / conflict per ecosystem; the resolver's lockfile (when
+    it produces one) is captured for follow-up consumers.
+    """
+    by_eco: dict[str, list[UpgradeChange]] = defaultdict(list)
+    for c in applied:
+        by_eco[c.ecosystem].append(c)
+    proposed_root = out_dir / "proposed"
+
+    # Resolve eco_root per ecosystem first (sequential — pure path
+    # manipulation, no I/O).
+    work_items: list[tuple[str, Path]] = []
+    for eco, changes in by_eco.items():
+        first_manifest = changes[0].manifest
+        # Same anchoring ``_materialise_changes`` used when writing the
+        # proposed copies, so the resolver runs where they actually are.
+        rel_parent = _proposed_rel_path(first_manifest).parent
+        eco_root = (proposed_root / rel_parent).resolve()
+        if not eco_root.exists():
+            eco_root = proposed_root
+        work_items.append((eco, eco_root))
+
+    summary = _validate_ecosystems_parallel(work_items, out_dir)
+
+    save_json(out_dir / "cascade.json", summary)
+    oks = sum(1 for s in summary if s["verdict"] == "ok")
+    conflicts = sum(1 for s in summary if s["verdict"] == "conflict")
+    print(f"raptor-sca fix --cve-only --allow-cascade: {oks} ecosystem(s) resolve "
+          f"cleanly; {conflicts} have conflicts. Plan: "
+          f"{out_dir}/cascade.json")
+    return summary
+
+
+def _validate_ecosystems_parallel(
+    work_items: list[tuple[str, Path]], out_dir: Path,
+) -> list[dict[str, Any]]:
+    """Dispatch resolver dry-run per ecosystem in parallel.
+
+    Each thread calls one resolver subprocess inside its own sandbox
+    session — no shared mutable state across threads. Returns
+    summary rows in the SAME order as ``work_items`` (input order
+    preservation makes diffs against the previous sequential output
+    deterministic).
+
+    Defensive: a buggy resolver subprocess that raises rather than
+    returning a result fails just that ecosystem with verdict=
+    "error"; other ecosystems still report. Matches the pattern in
+    ``transitive._run_cascades_parallel``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not work_items:
+        return []
+
+    results: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=max(1, len(work_items)),
+        thread_name_prefix="sca-cascade-validate",
+    ) as pool:
+        futs = {
+            pool.submit(_validate_one_ecosystem, eco, eco_root, out_dir): eco
+            for eco, eco_root in work_items
+        }
+        for fut, eco in futs.items():
+            try:
+                results[eco] = fut.result()
+            except Exception as e:                       # noqa: BLE001
+                logger.warning(
+                    "sca.update: cascade validation crashed for %s: %s",
+                    eco, e,
+                )
+                results[eco] = {
+                    "ecosystem": eco, "verdict": "error",
+                    "reason": f"resolver thread crashed: {e}",
+                }
+    return [results[eco] for eco, _ in work_items]
+
+
+def _validate_one_ecosystem(
+    eco: str, eco_root: Path, out_dir: Path,
+) -> dict[str, Any]:
+    """Per-ecosystem cascade body. Runs one resolver dry-run +
+    captures its lockfile if present. Returns the summary row.
+    """
+    from .resolvers import get_resolver
+    # Pass eco_root so multi-tool ecosystems (npm/yarn/pnpm,
+    # pip/poetry, Maven/Gradle) pick the resolver matching the
+    # project's actual lockfile/config.
+    resolver = get_resolver(eco, project_dir=eco_root)
+    if resolver is None:
+        return {
+            "ecosystem": eco, "verdict": "unsupported",
+            "reason": "no resolver wrapper for ecosystem",
+        }
+    if not resolver.is_available():
+        return {
+            "ecosystem": eco, "verdict": "skipped",
+            "reason": f"{eco} toolchain not in PATH",
+        }
+    result = resolver.dry_run(eco_root)
+    row = {
+        "ecosystem": eco,
+        "verdict": "ok" if result.success else "conflict",
+        "error": result.error,
+    }
+    if result.proposed_lockfile is not None:
+        lockfile_dest = out_dir / f"cascade-{eco.lower()}.lock"
+        try:
+            lockfile_dest.write_bytes(result.proposed_lockfile)
+        except OSError:
+            pass
+    return row
+
+
+def _run_external_validation(manifest: Path, out_dir: Path) -> dict[str, Any] | None:
+    """Run the ecosystem's resolver against an externally-supplied
+    manifest (e.g. Dependabot's PR). Detects the ecosystem from the
+    filename."""
+    from .resolvers import get_resolver
+    eco = _detect_ecosystem_from_filename(manifest.name)
+    if eco is None:
+        print(f"raptor-sca fix --cve-only --validate-against: cannot detect ecosystem from "
+              f"{manifest.name!r}; supported names: package.json, "
+              f"requirements.txt, go.mod, Cargo.toml, ...", file=sys.stderr)
+        return None
+    resolver = get_resolver(eco, project_dir=manifest.parent)
+    if resolver is None:
+        print(f"raptor-sca fix --cve-only --validate-against: no resolver wrapper for "
+              f"{eco}", file=sys.stderr)
+        return None
+    if not resolver.is_available():
+        print(f"raptor-sca fix --cve-only --validate-against: {eco} toolchain not in PATH",
+              file=sys.stderr)
+        return None
+    result = resolver.dry_run(manifest.parent)
+    receipt = {
+        "manifest": str(manifest),
+        "ecosystem": eco,
+        "verdict": "ok" if result.success else "conflict",
+        "error": result.error,
+    }
+    save_json(out_dir / "validate-against.json", receipt)
+    verb = "validates" if result.success else "fails"
+    print(f"raptor-sca fix --cve-only --validate-against: {manifest.name} {verb} via "
+          f"{eco} resolver. Detail: {out_dir}/validate-against.json")
+    return receipt
+
+
+def _detect_ecosystem_from_filename(name: str) -> str | None:
+    if name in {"package.json", "package-lock.json"}:
+        return "npm"
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return "PyPI"
+    if name in {"pyproject.toml", "Pipfile", "poetry.lock"}:
+        return "PyPI"
+    if name in {"go.mod", "go.sum"}:
+        return "Go"
+    return None
+
+
+def _render_pr_comment(changes: list[UpgradeChange]) -> str:
+    """GitHub-Markdown rendering of the change set, suitable for posting
+    as a comment on a Dependabot PR.
+
+    Uses collapsible <details> sections so the comment stays scannable
+    when there are many changes.
+    """
+    applied = [c for c in changes if c.skipped_reason is None]
+    skipped = [c for c in changes if c.skipped_reason is not None]
+    out: list[str] = []
+    out.append("## raptor-sca fix --cve-only — proposed plan")
+    out.append("")
+    out.append(f"- **{len(applied)} change(s) applied**")
+    out.append(f"- {len(skipped)} skipped")
+    out.append("")
+    if applied:
+        out.append("<details>")
+        out.append("<summary>Applied changes</summary>")
+        out.append("")
+        out.append("| Ecosystem | Package | From | To | Advisories |")
+        out.append("|---|---|---|---|---|")
+        for c in applied:
+            # Name / versions / advisory ids are manifest- and
+            # registry-sourced — neutralise like the report renderers.
+            advs = (", ".join(
+                neutralize_inline(a, limit=60) for a in c.advisory_ids)
+                if c.advisory_ids else "—")
+            out.append(
+                f"| {c.ecosystem} | {code_cell(c.name)} "
+                f"| {neutralize_inline(c.old_version, limit=60)} | "
+                f"{neutralize_inline(c.new_version, limit=60)} | {advs} |"
+            )
+        out.append("</details>")
+        out.append("")
+    if skipped:
+        out.append("<details>")
+        out.append("<summary>Skipped (with reason)</summary>")
+        out.append("")
+        out.extend(
+            f"- {code_cell(f'{c.ecosystem}:{c.name}')} "
+            f"({neutralize_inline(c.old_version, limit=60)} → "
+            f"{neutralize_inline(c.new_version, limit=60)}): "
+            f"{neutralize_inline(c.skipped_reason)}" for c in skipped)
+        out.append("</details>")
+    return "\n".join(out) + "\n"
+
+
+def _common_target(files: set) -> Path | None:
+    """Best-effort common ancestor for hash-pin to find ``.github/``."""
+    if not files:
+        return None
+    # Walk up from the first file; verify all others share the prefix.
+    first = next(iter(files))
+    cur = first.parent
+    while cur != cur.parent:
+        if all(cur in f.parents for f in files):
+            return cur
+        cur = cur.parent
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def value_flags() -> frozenset[str]:
+    """Option strings of every ``fix --cve-only`` flag that CONSUMES a
+    value — derived from the parser itself so the fix CLI's positional
+    translation can never drift when a flag lands here (a hand-typed
+    copy silently omitted ``--exclude``, so its glob was mistaken for
+    the positional target or swallowed outright).
+
+    ``nargs != 0`` is argparse's own consumption marker: store_true /
+    count / help actions carry ``nargs=0``; plain store actions carry
+    ``None`` (one operand).
+    """
+    parser = _build_parser()
+    return frozenset(
+        opt
+        for action in parser._actions      # noqa: SLF001 — own parser
+        if action.nargs != 0
+        for opt in action.option_strings
+    )
+
+
+def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    p = _build_parser()
+    args = p.parse_args(argv)
+    from core.reporting.options import options_from_args
+    args._report_options = options_from_args(args, p)
+    if args.report_format and args.report_output is None:
+        p.error("--report-format requires --report-output for this command")
+    # ``--allow-cascade`` shells out to npm/pip/go which all need
+    # network to query their registries (the sandbox routes them
+    # through the egress proxy with a per-ecosystem allowlist).
+    # ``--offline`` says "no network at the SCA level". Combining
+    # them is operator confusion: the cascade resolver would always
+    # fail to reach its registry. Reject up-front.
+    if args.offline and args.allow_cascade:
+        p.error("--offline and --allow-cascade are mutually exclusive: "
+                "the cascade resolver shells out to npm/pip/go, all of "
+                "which must reach their registry to resolve dependencies. "
+                "Use one or the other.")
+    return args
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="raptor-sca fix --cve-only",
+        description="CVE-driven upgrade planner.",
+    )
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument(
+        "--findings",
+        help="findings.json from a prior `raptor-sca` run",
+    )
+    g.add_argument(
+        "--target",
+        help="run `raptor-sca <target>` to produce findings before planning",
+    )
+    p.add_argument("--out", help="output dir for proposed/ + changes.* "
+                                 "(default: out/sca-fix-<UTC>/)")
+    p.add_argument("--fix", help="comma-separated advisory IDs to fix; "
+                                 "everything else is left alone")
+    p.add_argument("--minimal", action="store_true", default=True,
+                   help="(default) smallest fix above the installed version")
+    p.add_argument("--allow-major", action="store_true",
+                   help="allow upgrades that cross a major version boundary")
+    p.add_argument("--pin-only", action="store_true",
+                   help="only rewrite manifests where the dep is currently "
+                        "pinned to an exact version")
+    p.add_argument("--git-patch", action="store_true",
+                   help="emit upgrade.patch alongside proposed/ — a "
+                        "git-apply-compatible unified diff")
+    p.add_argument("--exclude", action="append", metavar="GLOB",
+                   default=None,
+                   help="glob of paths to exclude from the WRITE set "
+                        "(no upgrades planned for matching manifests); "
+                        "repeatable. Matched against the target-"
+                        "relative path (or the findings' file path "
+                        "as-is when only --findings is given); * spans "
+                        "/, and a leading **/ also matches at the "
+                        "root. Typical use: protecting test-fixture "
+                        "manifests whose deliberately-old pins are "
+                        "test assertions. Scanning is unaffected.")
+    p.add_argument("--apply", action="store_true",
+                   help="after generating the patch, run ``git apply`` "
+                        "to write the proposed manifest changes back to "
+                        "the source tree. Implies --git-patch. Refuses "
+                        "if the source tree isn't a git checkout (no "
+                        "rollback path); the patch is still written so "
+                        "operators can apply manually.")
+    p.add_argument("--hash-pin", action="store_true",
+                   help="resolve mutable git refs (e.g., GitHub Actions "
+                        "``uses: org/action@v1``) to commit SHAs. "
+                        "Mitigates the Trivy mutable-tag attack pattern. "
+                        "Uses ``git ls-remote`` so it works without "
+                        "GITHUB_TOKEN for public repos. Default: report "
+                        "the rewrite plan; pass --hash-pin-write to "
+                        "modify workflow files in place.")
+    p.add_argument("--hash-pin-write", action="store_true",
+                   help="with --hash-pin, write the pinned workflows "
+                        "in place instead of just reporting the plan")
+    p.add_argument("--allow-cascade", action="store_true",
+                   help="when the proposed plan doesn't resolve cleanly, "
+                        "invoke the language's native resolver "
+                        "(npm/pip/go) and let it suggest additional "
+                        "non-vulnerable peer bumps. Reports the cascade "
+                        "as part of the plan; final resolution depends "
+                        "on the resolver's verdict.")
+    p.add_argument("--validate-against", metavar="MANIFEST",
+                   help="validate an externally-supplied proposed "
+                        "manifest (e.g. Dependabot's PR) by running the "
+                        "ecosystem's resolver against it. Reports OK / "
+                        "conflict.")
+    p.add_argument("--format", choices=["plain", "pr-comment"],
+                   default="plain",
+                   help="output format for the human-readable report. "
+                        "``pr-comment`` emits GitHub-flavoured Markdown "
+                        "with collapsible sections, suitable for posting "
+                        "as a comment on a Dependabot PR.")
+    p.add_argument("--offline", action="store_true",
+                   help="when --target is used, run analyse with --offline")
+    p.add_argument("--cache-root", help="cache root for analyse pre-pass")
+    p.add_argument("--no-llm", action="store_true",
+                   help="(accepted for orthogonality with `fix`; "
+                        "this mode does not consult an LLM)")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(p)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Findings loading
+# ---------------------------------------------------------------------------
+
+def _load_findings(args: argparse.Namespace) -> list[dict[str, Any]] | None:
+    if args.findings:
+        path = Path(args.findings).resolve()
+        if not path.exists():
+            print(f"raptor-sca fix: findings file not found: {path}",
+                  file=sys.stderr)
+            return None
+        try:
+            data = load_json(path, strict=True, max_bytes=_MAX_FINDINGS_BYTES)
+            if data is None:
+                # Strict load_json soft-returns None for a missing file.
+                raise FileNotFoundError(path)
+        except (OSError, ValueError) as e:
+            print(f"raptor-sca fix: cannot read {path}: {e}", file=sys.stderr)
+            return None
+        if not isinstance(data, list):
+            print(f"raptor-sca fix: {path} is not a finding list",
+                  file=sys.stderr)
+            return None
+        args._findings_source = path
+        return data
+
+    target = Path(args.target).resolve()
+    if not target.exists():
+        print(f"raptor-sca fix --cve-only: target does not exist: {target}",
+              file=sys.stderr)
+        return None
+    if not target.is_dir():
+        print(f"raptor-sca fix --cve-only: target is not a directory: {target}",
+              file=sys.stderr)
+        return None
+
+    # Run analyse internally, then read its findings.json.
+    from .pipeline import RunOptions, run_sca
+    pre_out = _resolve_out_dir(args, suffix="-prepass")
+    pre_out.mkdir(parents=True, exist_ok=True)
+    options = RunOptions(
+        offline=args.offline,
+        cache_root=Path(args.cache_root) if args.cache_root else None,
+    )
+    result = run_sca(target=target, output_dir=pre_out, options=options)
+    try:
+        # Self-produced budget: run_sca above just wrote this file.
+        data = load_json(
+            result.findings_path, strict=True,
+            max_bytes=_MAX_SELF_FINDINGS_BYTES,
+        )
+        if data is None:
+            # Strict load_json soft-returns None for a missing file.
+            raise FileNotFoundError(result.findings_path)
+        args._findings_source = result.findings_path
+        return data
+    except (OSError, ValueError) as exc:
+        print(f"raptor-sca fix: cannot read findings: {exc}",
+              file=sys.stderr)
+        return None
+
+
+def _resolve_out_dir(args: argparse.Namespace, *, suffix: str = "") -> Path:
+    if args.out:
+        base = Path(args.out).resolve()
+        return base / suffix.lstrip("-") if suffix else base
+    from core.run.output import unique_run_suffix
+    return Path("out") / f"sca-update-{unique_run_suffix('-')}{suffix}"
+
+
+def _parse_advisory_filter(value: str | None) -> set | None:
+    if not value:
+        return None
+    return {tok.strip() for tok in value.split(",") if tok.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Target selection
+# ---------------------------------------------------------------------------
+
+def _filter_excluded_plans(
+    plans: dict[tuple[str, str, str], "_PlanEntry"],
+    exclude: Sequence[str] | None,
+    *,
+    root: Path | None,
+) -> tuple[dict[tuple[str, str, str], "_PlanEntry"], list[str]]:
+    """Drop plan entries whose manifest matches an ``--exclude`` glob.
+
+    The write-path filter shared by ``fix`` (optimise), ``fix
+    --cve-only`` (this module) and — in spirit — ``fix --harden`` /
+    ``bump`` (which filter at their own enumeration points): the
+    operator's globs remove surfaces from the WRITE set only; scan
+    findings are untouched. Returns ``(kept_plans,
+    excluded_manifest_paths)`` — the excluded list is distinct,
+    order-preserving, for the one-line report (exclusions must be
+    visible, never a silent truncation).
+    """
+    if not exclude:
+        return plans, []
+    from ._exclude import matches_exclude
+    kept: dict[tuple[str, str, str], _PlanEntry] = {}
+    excluded: dict[str, None] = {}
+    for key, entry in plans.items():
+        if matches_exclude(entry.manifest, exclude, root=root):
+            excluded.setdefault(str(entry.manifest), None)
+        else:
+            kept[key] = entry
+    return kept, list(excluded)
+
+
+def _plan_targets(
+    rows: list[dict[str, Any]],
+    *,
+    advisory_filter: set | None,
+    allow_major: bool,
+) -> dict[tuple[str, str, str], _PlanEntry]:
+    """Build ``(ecosystem, name, declared_in) → planned upgrade``.
+
+    Same dep declared in two manifests gets two plan entries (one each)
+    so they can land independently if the chosen target differs.
+    """
+    plans: dict[tuple[str, str, str], _PlanEntry] = {}
+    for raw in rows:
+        row = FindingRow.from_row(raw)
+        if row is None or not row.is_vulnerable_dependency:
+            continue
+        sca = row.sca
+        adv = row.advisory
+        adv_id = adv.get("id")
+        aliases = adv.get("aliases")
+        ids_for_filter = {adv_id, *(a for a in (aliases or [])
+                                     if isinstance(a, str))} - {None}
+        if advisory_filter is not None and not (
+            ids_for_filter & advisory_filter
+        ):
+            continue
+        ecosystem = sca.get("ecosystem")
+        name = sca.get("name")
+        installed = sca.get("version")
+        fix = sca.get("fixed_version")
+        manifest = row.file
+        if not (ecosystem and name and installed and fix and manifest):
+            continue
+        if not allow_major and _crosses_major(ecosystem, installed, fix):
+            continue
+
+        alias = sca.get("alias_name")
+        alias_name = alias if isinstance(alias, str) and alias else None
+
+        key = (ecosystem, name, manifest)
+        entry = plans.get(key)
+        if entry is None:
+            plans[key] = _PlanEntry(
+                ecosystem=ecosystem, name=name,
+                installed=installed, target=fix,
+                manifest=Path(manifest),
+                advisory_ids=[adv_id] if adv_id else [],
+                alias_name=alias_name,
+            )
+            continue
+        # Multiple findings against the same (eco, name, manifest) →
+        # pick the *highest* fix so the upgrade resolves them all.
+        try:
+            cmp = version_compare(ecosystem, fix, entry.target)
+        except VersionError:
+            cmp = 0
+        if cmp > 0:
+            entry.target = fix
+        if adv_id and adv_id not in entry.advisory_ids:
+            entry.advisory_ids.append(adv_id)
+        if entry.alias_name is None and alias_name is not None:
+            entry.alias_name = alias_name
+    return plans
+
+
+@dataclass
+class _PlanEntry:
+    ecosystem: str
+    name: str
+    installed: str
+    target: str
+    manifest: Path
+    advisory_ids: list[str]
+    # Library posture (set by harden for library/hybrid targets): raise the
+    # dependency FLOOR to ``target`` and keep a usable range, rather than
+    # corridor-pinning ``==target``. Pinning a library's deps over-constrains
+    # downstream consumers' resolvers. Default off → ``update`` and the
+    # application path are unchanged. Only the PyPI requirements.txt /
+    # pyproject PEP 508 paths honour it; other forms refuse to rewrite under
+    # floor_raise rather than emit an exact pin (never make a library worse).
+    floor_raise: bool = False
+    # npm alias spelling (``"my-lodash": "npm:lodash@^4.17.21"``). ``name``
+    # is the REAL (installed) package — the advisory identity — but the
+    # manifest keys the spec under the ALIAS, so the package.json rewriter
+    # must anchor on this spelling and write the ``npm:<real>@…`` form back.
+    alias_name: str | None = None
+
+
+def _crosses_major(_ecosystem: str, installed: str, target: str) -> bool:
+    """Heuristic: do the leading numeric segments differ?
+
+    For ecosystems where the comparator understands "major" (semver,
+    pep440), this is the right call. For unknown comparators we
+    conservatively say no major crossing so upgrades aren't blocked
+    silently.
+    """
+    inst_major = _leading_int(installed)
+    tgt_major = _leading_int(target)
+    if inst_major is None or tgt_major is None:
+        return False
+    return tgt_major != inst_major
+
+
+def _leading_int(version: str) -> int | None:
+    m = re.match(r"^v?(\d+)", version.strip())
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+# ---------------------------------------------------------------------------
+# Manifest rewriters
+# ---------------------------------------------------------------------------
+
+def _proposed_rel_path(manifest: Path) -> Path:
+    """Anchor for a manifest's rewritten copy under ``proposed/``.
+
+    Manifests inside the current working directory keep their relative
+    structure. A manifest OUTSIDE cwd has no usable relative path, and
+    anchoring on the bare filename would collapse every same-named
+    manifest onto ONE proposed file (last writer wins) — the git patch
+    would then diff one manifest's original against another manifest's
+    rewritten content, a patch that applies cleanly while rewriting the
+    wrong file wholesale. Disambiguate deterministically with a short
+    hash of the manifest's resolved parent directory instead: same
+    manifest → same anchor across the writer (``_materialise_changes``)
+    and the reader (``_emit_git_patch``), different directories → never
+    collide.
+    """
+    resolved = manifest.resolve()
+    try:
+        return resolved.relative_to(Path.cwd())
+    except ValueError:
+        digest = hashlib.sha256(
+            # fsencode, not utf-8: a hostile repo can carry a dir name
+            # with surrogate bytes, and one UnicodeEncodeError here
+            # would abort materialisation for EVERY manifest.
+            os.fsencode(str(resolved.parent))).hexdigest()[:12]
+        return Path(digest) / resolved.name
+
+
+def _materialise_changes(
+    plans: dict[tuple[str, str, str], _PlanEntry],
+    findings_rows: list[dict[str, Any]],
+    proposed_root: Path,
+    *,
+    pin_only: bool,
+) -> list[UpgradeChange]:
+    out: list[UpgradeChange] = []
+    pin_styles = _pin_styles_by_finding(findings_rows)
+
+    # Group plans by manifest so each file is only opened once.
+    by_manifest: dict[Path, list[_PlanEntry]] = defaultdict(list)
+    for plan in plans.values():
+        by_manifest[plan.manifest].append(plan)
+
+    for manifest, plan_list in by_manifest.items():
+        # lstat-gated, size-bounded read: discovery rejected symlinks
+        # at SCAN time, but this write path runs later (and
+        # ``fix --findings`` takes operator-era paths at face value) —
+        # a symlink swapped in between scan and fix must not route
+        # host-file content into proposed/ and upgrade.patch.
+        original = read_regular_text(manifest)
+        if original is None:
+            out.extend(
+                _skip(plan, "cannot read manifest: refused "
+                            "(symlink / non-regular / oversized) or "
+                            "unreadable")
+                for plan in plan_list)
+            continue
+
+        text = original
+        for plan in plan_list:
+            pin_style = pin_styles.get(
+                (plan.ecosystem, plan.name, str(manifest))
+            )
+            if pin_only and pin_style not in ("exact", None):
+                out.append(_skip(plan, f"--pin-only set, current pin "
+                                       f"is {pin_style!r}"))
+                continue
+            new_text, applied, reason = _rewrite_one(
+                manifest, text, plan,
+            )
+            if applied:
+                text = new_text
+                out.append(UpgradeChange(
+                    ecosystem=plan.ecosystem, name=plan.name,
+                    old_version=plan.installed,
+                    new_version=plan.target,
+                    manifest=manifest,
+                    advisory_ids=tuple(plan.advisory_ids),
+                ))
+            else:
+                out.append(_skip(plan, reason or "rewriter found no match"))
+
+        if text != original:
+            from ._atomic import atomic_write_text
+            target = proposed_root / _proposed_rel_path(manifest)
+            atomic_write_text(target, text)
+    return out
+
+
+def _pin_styles_by_finding(rows: list[dict[str, Any]]) -> dict[tuple[str, str, str], str]:
+    out: dict[tuple[str, str, str], str] = {}
+    for raw in rows:
+        row = FindingRow.from_row(raw)
+        if row is None or not row.is_vulnerable_dependency:
+            continue
+        sca = row.sca
+        key = (sca.get("ecosystem"), sca.get("name"),
+               str(Path(row.file)) if row.file else None)
+        if all(key) and "pin_style" in sca:
+            out[key] = sca["pin_style"]      # type: ignore[index]
+    return out
+
+
+def _skip(plan: _PlanEntry, reason: str) -> UpgradeChange:
+    return UpgradeChange(
+        ecosystem=plan.ecosystem, name=plan.name,
+        old_version=plan.installed, new_version=plan.target,
+        manifest=plan.manifest,
+        advisory_ids=tuple(plan.advisory_ids),
+        skipped_reason=reason,
+    )
+
+
+def _resolve_rewriter(
+    manifest: Path,
+) -> Callable[[Path, str, _PlanEntry], tuple[str, bool, str | None]] | None:
+    """Single source of truth mapping a manifest file to its rewriter.
+
+    ``_rewrite_one`` (the rewrite path) and ``supports_rewrite`` (the
+    predicate harden's planner consults before proposing a bump) both
+    resolve through this one dispatch, so the two can never drift —
+    a drift would make harden silently mark patchable manifests
+    ``unsupported_manifest`` (or promise rewrites that then fail).
+    Returns the handler callable, or ``None`` when the file shape has
+    no rewriter.
+    """
+    name = manifest.name
+    suffix = manifest.suffix.lower()
+    if name == "pom.xml":
+        return lambda m, t, p: _rewrite_pom_xml(t, p)
+    if name == "package.json":
+        return lambda m, t, p: _rewrite_package_json(t, p)
+    if name == "pyproject.toml":
+        return lambda m, t, p: _rewrite_pyproject_toml(t, p)
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return lambda m, t, p: _rewrite_requirements_txt(t, p)
+    # NuGet write surfaces. Two file shapes — caller picks the
+    # right one via ``plan.manifest`` (set by the planner to
+    # match the dep's source-origin field).
+    # ``Directory.Build.targets`` is the pre-CPM central-version table
+    # (<PackageReference Update="X" Version="Y"/>) — same registry
+    # dispatch; the dedicated rewriter
+    # (rewriters/directory_build_targets.py) matches Update= rather
+    # than Include=.
+    if name in ("Directory.Packages.props", "Directory.Build.targets"):
+        return _rewrite_via_registry
+    if suffix in (".csproj", ".fsproj", ".vbproj"):
+        return _rewrite_via_registry
+    # Gradle write surface — libs.versions.toml. Inline
+    # build.gradle / build.gradle.kts edits are NOT supported
+    # by harden today (DSL rewrite is risky given Turing-complete
+    # Groovy / Kotlin). The catalog covers modern projects which
+    # is where most operator demand is.
+    if name == "libs.versions.toml":
+        return _rewrite_via_registry
+    if _is_inline_install_file(manifest):
+        return lambda m, t, p: _rewrite_inline_install(t, p)
+    return None
+
+
+def supports_rewrite(manifest: Path) -> bool:
+    """Whether ``_rewrite_one`` can patch this manifest shape."""
+    return _resolve_rewriter(manifest) is not None
+
+
+def _rewrite_one(
+    manifest: Path, text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    handler = _resolve_rewriter(manifest)
+    if handler is None:
+        return text, False, f"no rewriter for {manifest.name}"
+    refusal = refuse_unsafe_target(plan)
+    if refusal is not None:
+        return text, False, refusal
+    return handler(manifest, text, plan)
+
+
+# dpkg version grammar admitted alongside the shared literal grammar:
+# optional numeric epoch, then a version-charset tail including ``~``.
+_DPKG_VERSION_RE = re.compile(r"(?:\d{1,8}:)?[A-Za-z0-9][A-Za-z0-9.~_+-]{0,127}")
+
+
+def refuse_unsafe_target(plan: _PlanEntry) -> str | None:
+    """Grammar-gate ``plan.target`` before ANY local rewriter runs.
+
+    ``plan.target`` descends from advisory data (``fixed_versions`` is
+    remote and alias-merged) and, on the harden path, from raw registry
+    version lists — both untrusted. The registry rewriters gate every
+    ``new_value`` through ``is_safe_version_literal`` for exactly this
+    threat; the LOCAL rewriters here splice the target between JSON
+    quotes (package.json — a ``"`` escapes the string and can inject a
+    ``scripts.preinstall`` key), into XML text (pom — ``</version>``
+    breaks out of the element) and onto requirements.txt lines (a
+    newline injects ``--extra-index-url``). One check at the shared
+    dispatch covers every handler; ``optimise._pin_bare_name`` (the
+    only rewrite entry point not routed through here) applies the same
+    gate at its own top.
+
+    Returns a skip reason (loud, with a defanged preview of the
+    refused value) or ``None`` when the target is a plain literal.
+    """
+    from ._md import neutralize_inline
+    from .rewriters import is_safe_version_literal
+
+    if is_safe_version_literal(plan.target):
+        return None
+    # dpkg versions legitimately carry an epoch (``4:12.2.0-3``) and
+    # ``~`` pre-release markers (``1.0~rc1``) that the shared literal
+    # grammar excludes. Admit exactly that shape — the splice-relevant
+    # metacharacters (quotes, angle brackets, whitespace/newlines,
+    # braces) stay excluded.
+    if _DPKG_VERSION_RE.fullmatch(plan.target or ""):
+        return None
+    return (
+        "refused: fix version is not a plain version literal "
+        f"(untrusted advisory/registry data): {neutralize_inline(plan.target, limit=80)}"
+    )
+
+
+def _rewrite_via_registry(
+    manifest: Path, text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Bridge to the ``packages/sca/rewriters/`` registry — used
+    by NuGet CPM / csproj / Gradle catalog paths. The registry
+    operates on file paths (it reads + atomic-writes the file
+    itself), but ``_rewrite_one``'s contract is text-in / text-
+    out + bool applied + reason — and this function runs during
+    PLANNING, so the original manifest must never be written here
+    (only ``--apply`` writes the source tree). Adapt by:
+
+      * Synthesise a single ``RewriteEdit`` from the plan.
+      * Copy ``text`` to a scratch file carrying the manifest's
+        filename (registry dispatch keys on the name), and run
+        the registry's dispatcher against the copy.
+      * Read the post-state back from the copy.
+
+    Running against a copy also composes with earlier plans on
+    the same manifest: the registry rewriter sees the caller's
+    working ``text`` rather than re-reading the original file.
+
+    For Gradle catalogs the locator needs a section prefix
+    (``library:<alias>`` / ``version:<key>`` / ``plugin:<alias>``).
+    Harden's plan doesn't carry source-origin metadata today;
+    we default to ``library:<name>`` which covers the common
+    case (catalog libraries with inline versions). version.ref-
+    resolved entries fall through with ``not_found``; the bumper
+    will route them correctly once it learns about the catalog
+    layout (separate piece of work).
+    """
+    from .rewriters import RewriteEdit
+    from .rewriters import rewrite as _rewrite
+
+    if manifest.name == "libs.versions.toml":
+        # Default locator: target the library entry directly.
+        # When the catalog uses ``version.ref`` the rewriter
+        # returns ``not_found``; an operator who hits this can
+        # set the version.ref'd entry by hand or wait for the
+        # bumper-side catalog routing.
+        locator = f"library:{plan.name}"
+    else:
+        locator = plan.name
+
+    edit = RewriteEdit(
+        locator=locator,
+        old_value=plan.installed,
+        new_value=plan.target,
+    )
+    from core.run.scratch import scratch_dir
+    with scratch_dir("raptor-sca-rewrite-plan-") as scratch:
+        scratch_copy = scratch / manifest.name
+        try:
+            scratch_copy.write_text(text, encoding="utf-8")
+        except OSError as e:
+            return text, False, f"error: scratch copy write failed: {e}"
+        results = _rewrite(scratch_copy, [edit])
+        if not results:
+            return text, False, f"no rewriter for {manifest.name}"
+        r = results[0]
+        if r.applied:
+            # Reload the scratch copy for the caller. The rewriter
+            # wrote it atomically; this read is the canonical
+            # post-state. The original manifest is untouched.
+            try:
+                new_text = scratch_copy.read_text(encoding="utf-8")
+            except OSError as e:
+                return text, False, f"error: post-write read failed: {e}"
+            return new_text, True, None
+        return text, False, r.reason
+
+
+def _is_inline_install_file(path: Path) -> bool:
+    """True if this file is one whose ``RUN``/script lines we know how to
+    rewrite via the inline-install path. Mirrors the discovery predicate
+    in ``parsers/inline_installs.py``.
+    """
+    name = path.name
+    if name in ("Dockerfile", "Containerfile"):
+        return True
+    if name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
+        return True
+    if path.suffix in (".dockerfile", ".sh", ".bash"):
+        return True
+    if name in ("devcontainer.json", ".devcontainer.json"):
+        return True
+    if path.suffix in (".yml", ".yaml"):
+        parts = path.parts
+        for j in range(len(parts) - 2):
+            if parts[j] == ".github" and parts[j + 1] == "workflows":
+                return True
+        # Composite actions (``action.yml`` / ``action.yaml``) carry the
+        # same ``run:`` install lines the workflow parser extracts deps
+        # from — without this arm those deps would be discoverable but
+        # never rewritable. Must match the discovery predicate
+        # (``discovery._is_inline_install_source``) and the parser
+        # dispatch (``parsers.inline_installs._is_gha_workflow``).
+        if name in ("action.yml", "action.yaml"):
+            return True
+    return False
+
+
+# ----- pom.xml --------------------------------------------------------------
+
+# Size guard for pom.xml rewrites. A hand-maintained pom is a few
+# hundred KB at the very most; anything larger is either generated or
+# adversarial, and skipping it (with a logged reason) is safer than
+# rewriting it.
+_POM_MAX_CHARS = 1_000_000
+
+# Opening tag of a rewritable pom block. The block ends at the FIRST
+# closing tag of any of the three kinds after the opener — matching
+# the lazy tempered-dot regex this replaced, but located via
+# ``str.find`` so malformed input (many openers, no closers) scans
+# linearly instead of backtracking quadratically.
+# The attribute span is ``[^<>]`` (not ``[^>]``): a raw ``<`` is
+# illegal inside an XML open tag, so real tags match identically,
+# while with ``[^>]`` every planted opener inside an unclosed tag
+# re-scanned the rest of it — quadratic on hostile pom text.
+_POM_BLOCK_OPEN_RE = re.compile(
+    r"<(?:dependency|plugin|parent)\b[^<>]*>")
+_POM_BLOCK_CLOSE_TAGS = ("</dependency>", "</plugin>", "</parent>")
+
+
+def _iter_pom_blocks(text: str) -> Iterable[str]:
+    """Yield non-overlapping <dependency>/<plugin>/<parent> block
+    strings, preserving the previous regex's semantics: each block
+    runs from an opening tag to the first closing tag (of any of the
+    three kinds) that follows it; scanning resumes after that close."""
+    pos = 0
+    while True:
+        m = _POM_BLOCK_OPEN_RE.search(text, pos)
+        if m is None:
+            return
+        close_start = -1
+        close_len = 0
+        for tag in _POM_BLOCK_CLOSE_TAGS:
+            idx = text.find(tag, m.end())
+            if idx != -1 and (close_start == -1 or idx < close_start):
+                close_start = idx
+                close_len = len(tag)
+        if close_start == -1:
+            # No closing tag anywhere after this opener — no later
+            # opener can complete a block either.
+            return
+        pos = close_start + close_len
+        yield text[m.start():pos]
+
+
+def _rewrite_pom_xml(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Find the <dependency> block whose groupId+artifactId match and
+    rewrite its <version>OLD</version> → <version>NEW</version>.
+
+    Skipped (returns False) when the version uses a property reference
+    (``${log4j.version}``) — properties are usually defined elsewhere
+    in the file and we don't try to rewrite the property's value here.
+    """
+    if ":" not in plan.name:
+        return text, False, "Maven coordinate missing groupId:artifactId"
+    group, artifact = plan.name.split(":", 1)
+
+    if len(text) > _POM_MAX_CHARS:
+        logger.warning(
+            "raptor-sca fix: skipping pom.xml rewrite for %s:%s — "
+            "manifest is %d chars (> %d limit)",
+            group, artifact, len(text), _POM_MAX_CHARS,
+        )
+        return text, False, (
+            f"pom.xml exceeds {_POM_MAX_CHARS} characters; edit manually"
+        )
+
+    # A pom legitimately declares the same groupId:artifactId in
+    # several blocks (<dependencyManagement> + <dependencies>,
+    # per-profile overrides). Rewrite EVERY matching block still at
+    # the installed version — stopping at the first one bumped a
+    # single block and left its twin on the vulnerable version while
+    # the run reported applied. A property-referenced version in ANY
+    # matching block still refuses the whole edit (order-independent
+    # now): rewriting only the literal twins while ``${...}`` decides
+    # the effective version elsewhere would produce a half-edited pom.
+    out_text = text
+    rewrote = False
+    for block in _iter_pom_blocks(text):
+        if (f"<groupId>{group}</groupId>" not in block
+                or f"<artifactId>{artifact}</artifactId>" not in block):
+            continue
+        # Bounded property-name body: unbounded ``[^}]+`` re-scanned
+        # every planted ``${`` inside an unclosed reference —
+        # quadratic on hostile pom text. 256 is far above any real
+        # Maven property name.
+        if re.search(r"<version>\s*\$\{[^}]{1,256}\}\s*</version>", block):
+            return text, False, ("Maven version uses a property reference; "
+                                 "edit <properties> manually")
+        new_block, n = re.subn(
+            r"(<version>)\s*" + re.escape(plan.installed)
+            + r"\s*(</version>)",
+            # Callable replacement writes the target verbatim — a
+            # template would reinterpret backslash sequences in it.
+            lambda mm: mm.group(1) + plan.target + mm.group(2),
+            block,
+            count=1,
+        )
+        if n:
+            out_text = out_text.replace(block, new_block, 1)
+            rewrote = True
+    if not rewrote:
+        return text, False, ("no <dependency>/<plugin> block matched "
+                             f"{group}:{artifact}@{plan.installed}")
+    return out_text, True, None
+
+
+# ----- package.json ---------------------------------------------------------
+
+# Sections of package.json whose entries are dependency specs. The
+# rewrite is anchored INSIDE these blocks only: a ``scripts`` entry
+# named after the dep (``"jest": "jest --ci"``) or any other same-named
+# key elsewhere in the file must never be rewritten (turning a script
+# command into a version string) or consume the substitution slot
+# (leaving the real dependency pin untouched).
+_PACKAGE_JSON_DEP_SECTIONS = (
+    "dependencies", "devDependencies", "optionalDependencies",
+    "peerDependencies", "resolutions", "overrides",
+)
+
+
+def _json_object_end(text: str, open_brace: int) -> int | None:
+    """Index just past the ``}`` matching the ``{`` at ``open_brace``.
+
+    String- and escape-aware so braces inside JSON string values don't
+    unbalance the scan. Returns ``None`` for unbalanced input.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(open_brace, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+def _json_brace_depth(text: str, upto: int) -> int:
+    """Object-brace nesting depth at index ``upto`` (string- and
+    escape-aware, same scanning rules as :func:`_json_object_end`).
+
+    Depth 1 == directly inside the root object, i.e. where package.json's
+    real top-level sections live."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(0, min(upto, len(text))):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    return depth
+
+
+def _package_json_dep_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) index spans of the dependency-section object bodies
+    in ``text``, sorted by position."""
+    spans: list[tuple[int, int]] = []
+    for section in _PACKAGE_JSON_DEP_SECTIONS:
+        sec_re = re.compile(r'"' + re.escape(section) + r'"\s*:\s*\{')
+        for m in sec_re.finditer(text):
+            # Only a ROOT-level section key is a dependency section.
+            # The manifest is attacker-authored: a same-named key nested
+            # inside scripts/config/etc. is decoy content that would
+            # consume the substitution while the real top-level pin
+            # stays vulnerable — reported as applied.
+            if _json_brace_depth(text, m.start()) != 1:
+                continue
+            end = _json_object_end(text, m.end() - 1)
+            if end is not None:
+                spans.append((m.end(), end - 1))
+    spans.sort()
+    return spans
+
+
+def _rewrite_package_json(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Replace the dep's spec preserving any leading ``^``/``~``/range
+    operator the operator wrote.
+
+    Operates on the raw text so trailing-newline / indentation
+    conventions are preserved. The dep can live in any of the
+    dependency sections listed in ``_PACKAGE_JSON_DEP_SECTIONS`` — we
+    don't enforce which — but keys OUTSIDE those sections (``scripts``
+    entries etc.) are never touched.
+    """
+    # Capture the value between the colon and the closing quote of the
+    # spec. The `name` may need JSON-string escaping if it contains
+    # special chars; for npm package names those are limited and
+    # ``re.escape`` handles them.
+    #
+    # An aliased dep (``"my-lodash": "npm:lodash@^4.17.21"``) is keyed
+    # by the ALIAS spelling — ``plan.name`` (the installed package, the
+    # advisory identity) never appears as a key. The plan is keyed on
+    # the installed package, so one plan can cover BOTH spellings when
+    # a manifest declares the package aliased AND plain: attempt each
+    # spelling independently and apply every one that matches — fixing
+    # only one would leave the other declaration on the vulnerable
+    # range while reporting applied.
+    key_names = [plan.name]
+    if plan.alias_name and plan.alias_name != plan.name:
+        key_names.insert(0, plan.alias_name)
+    # Collect every qualifying edit on the ORIGINAL text (all spans,
+    # all occurrences — the same key can appear in dependencies AND
+    # devDependencies), then apply back-to-front so offsets stay valid.
+    edits: list[tuple[re.Match, str]] = []
+    matched_any = False
+    spans = _package_json_dep_spans(text)
+    for key_name in key_names:
+        pat = re.compile(
+            r'("' + re.escape(key_name) + r'"\s*:\s*")'
+            r"([^\"]*?)"
+            r'(")'
+        )
+        for start, end in spans:
+            for match in pat.finditer(text, start, end):
+                spec = match.group(2).strip()
+                if spec.startswith("npm:"):
+                    split = split_npm_alias(spec)
+                    if split is None:
+                        # Bare protocol form — found, but manual review.
+                        matched_any = True
+                        continue
+                    if split[0] != plan.name:
+                        # This key aliases a DIFFERENT package
+                        # ("lodash": "npm:left-pad@^1") — writing the
+                        # plan's fix version into another package's
+                        # range would pin left-pad to lodash's version.
+                        # Exact comparison: plan.name comes from the
+                        # same parser output as the alias target, and
+                        # legacy case-colliding npm names (JSONStream
+                        # vs jsonstream) are distinct packages a
+                        # case-folded match would conflate. Not our
+                        # dep; keep looking.
+                        continue
+                elif key_name != plan.name:
+                    # The alias key with a PLAIN spec is a real package
+                    # that happens to share the alias spelling — not an
+                    # install of the plan's package. Keep looking.
+                    continue
+                matched_any = True
+                new_spec = _bump_npm_spec(match.group(2), plan.installed,
+                                          plan.target,
+                                          floor_raise=plan.floor_raise)
+                if new_spec is not None:
+                    edits.append((match, new_spec))
+    for match, new_spec in sorted(edits, key=lambda e: e[0].start(),
+                                  reverse=True):
+        text = (text[:match.start()]
+                + match.group(1) + new_spec + match.group(3)
+                + text[match.end():])
+    if edits:
+        return text, True, None
+    if matched_any:
+        # The dep was found but _bump_npm_spec declined (VCS/tarball/
+        # bare-protocol, or a range whose target falls outside the
+        # operator's declared bounds) — don't mislabel that as 'not
+        # found'.
+        return text, False, ("spec matched but not safely bumpable "
+                             "(out of declared range or unsupported form)")
+    return text, False, "no matching spec found"
+
+
+def _bump_npm_spec(current: str, installed: str, target: str,
+                   floor_raise: bool = False) -> str | None:
+    """Compute the replacement spec.
+
+    Preserves the operator's leading prefix (``^``, ``~``, ``>=``,
+    blank). Returns ``None`` when the current spec is a tarball / git
+    URL — those need manual review.
+
+    An npm-alias spec (``npm:lodash@^4.17.0``) keeps its alias
+    spelling: the range after the alias target is bumped and the
+    ``npm:<real>@`` prefix written back verbatim, so the manifest still
+    installs under the operator's chosen local name. The bare protocol
+    form (``npm:<range>`` with no package name) defers to manual
+    review.
+
+    ``floor_raise`` (library posture, npm + Poetry): a BARE exact spec
+    (``"1.0.0"`` / empty / ``*`` / ``latest``) is an exact pin that
+    over-constrains a library's consumers, so emit a caret RANGE
+    (``^target``) instead of the bare version. Caret/tilde/comparator
+    forms are already ranges, so they're unchanged by this flag.
+    """
+    # Bare result for the no-prefix cases: a caret range under floor_raise.
+    bare = f"^{target}" if floor_raise else target
+    s = current.strip()
+    if not s:
+        return bare
+    if s.startswith("npm:"):
+        split = split_npm_alias(s)
+        if split is None:
+            return None
+        alias_target, inner = split
+        new_inner = _bump_npm_spec(inner, installed, target,
+                                   floor_raise=floor_raise)
+        if new_inner is None:
+            return None
+        return f"npm:{alias_target}@{new_inner}"
+    if s.startswith(("git+", "git@", "git:", "github:", "bitbucket:",
+                     "gitlab:", "gist:", "file:")):
+        return None
+    if s.startswith(("http://", "https://")):
+        return None
+    if s in ("*", "x", "X", "latest"):
+        return bare
+    for prefix in ("^", "~"):
+        if s.startswith(prefix):
+            return f"{prefix}{target}"
+    if any(ch in s for ch in "<>=| "):
+        # Explicit comparator range (caret / tilde already returned
+        # above). Bump the lower bound (``>=`` / ``>``) to the target and
+        # leave any upper bound intact — collapsing ``>=2.0.0 <3.0.0`` to
+        # a bare ``2.8.0`` (the old inline-replace, which fired when
+        # ``installed`` was the whole spec string) silently dropped the
+        # operator's ``<3.0.0`` ceiling. Defer to manual review (None) for
+        # ``||`` (OR) ranges, ranges with no lower bound, and a target
+        # outside the declared corridor (at/above the ceiling, or below
+        # the floor) defer to manual review — never emit an empty/invalid
+        # range like ``>=3.5.0 <3.0.0`` and never silently widen the floor
+        # down past the operator's declared minimum.
+        if "||" in s:
+            return None
+        lo = re.search(r"(>=|>)\s*([0-9][^\s,|]*)", s)
+        if lo is None:
+            return None
+        hi = re.search(r"(<=|<)\s*([0-9][^\s,|]*)", s)
+        try:
+            if hi is not None:
+                cmp = version_compare("npm", target, hi.group(2))
+                if hi.group(1) == "<=" and cmp > 0:
+                    return None
+                if hi.group(1) == "<" and cmp >= 0:
+                    return None
+            if version_compare("npm", target, lo.group(2)) < 0:
+                return None
+        except VersionError:
+            return None
+        return s[:lo.start(2)] + target + s[lo.end(2):]
+    return bare
+
+
+# ----- requirements.txt -----------------------------------------------------
+
+def _rewrite_requirements_txt(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Update the line(s) that pin ``name`` (PEP 503 normalised match)
+    to the target version.
+
+    Includes / pip flags / editable / URL specs are skipped. Commented
+    lines (``# pkg==X``) are also rewritten when they pin a matching
+    name+version — the leading ``#`` is preserved so the line stays
+    commented, but the version is upgraded so an operator following
+    the recipe gets the patched version.
+    """
+    norm = pep503_name(plan.name)
+    out_lines: list[str] = []
+    rewrote = False
+    declined = False
+    for raw in text.splitlines(keepends=True):
+        stripped = raw.strip()
+        if (not stripped
+                or stripped.startswith(("-r", "--requirement",
+                                        "-c", "--constraint",
+                                        "-e ", "--editable ",
+                                        "--", "-i ", "-f "))):
+            out_lines.append(raw)
+            continue
+
+        # Recognise commented lines and try the body for a match. The
+        # leading ``#`` plus any following whitespace is captured so we
+        # can put it back if we rewrite.
+        comment_match = re.match(r"^(\s*#+\s*)(.*)$", stripped)
+        if comment_match:
+            comment_prefix = comment_match.group(1)
+            body = comment_match.group(2).strip()
+            if not body:
+                out_lines.append(raw)
+                continue
+            # (?<!\s) pins the separator to the start of its
+            # whitespace run — a bare unanchored `\s+` re-consumes
+            # the run from every position (quadratic on hostile
+            # requirement lines); the earliest match already starts
+            # at the run start, so the pinned spelling splits
+            # identically.
+            parts = re.split(r"(?<!\s)\s+#", body, maxsplit=1)
+            line_value = parts[0].strip()
+            inline_comment = "  #" + parts[1] if len(parts) > 1 else ""
+        else:
+            comment_prefix = ""
+            parts = re.split(r"(?<!\s)\s+#", stripped, maxsplit=1)
+            line_value = parts[0].strip()
+            inline_comment = "  #" + parts[1] if len(parts) > 1 else ""
+
+        # Name, optional extras (``uvicorn[standard]``), optional version
+        # spec. Extras must be consumed BEFORE the spec so the new pin
+        # splices after them — matching the name alone would leave the
+        # old pin in place after the extras (``uvicorn==NEW[standard]==
+        # OLD``: invalid requirement, vulnerable version retained).
+        # PEP 508 allows whitespace before the extras bracket AND inside
+        # the version spec (``uvicorn [standard] == 0.22.0`` — the
+        # parser accepts both, so findings exist for them). The extras
+        # capture swallows its leading space so the operator's spacing
+        # survives; the spec capture spans spaced operators and spaced
+        # comma-separated clauses so the WHOLE old spec is consumed —
+        # a partial match here splices the new pin mid-line and leaves
+        # the old version text behind (invalid requirement, vulnerable
+        # pin retained, reported applied).
+        m = re.match(
+            r"^([A-Za-z0-9_\-.]+)"
+            r"((?:\s*\[[^\]]*\])?)"
+            r"\s*([<>=!~]=?\s*[^\s;,]+(?:\s*,\s*[<>=!~]=?\s*[^\s;,]+)*)?",
+            line_value,
+        )
+        if not m:
+            out_lines.append(raw)
+            continue
+        if pep503_name(m.group(1)) != norm:
+            out_lines.append(raw)
+            continue
+        if comment_prefix and not plan.installed:
+            out_lines.append(raw)
+            continue
+        if (comment_prefix and not m.group(3)
+                and line_value[m.end():].strip()):
+            # No version specifier AND trailing text after the name →
+            # prose ("# pytest pinned exactly: ..."), not a pin. A bare
+            # "# pytest" (nothing after the name) IS a commented-out dep
+            # and gets pinned so uncommenting yields the safe version.
+            out_lines.append(raw)
+            continue
+        # Preserve any range bounds (floor/ceiling) around the new exact
+        # pin instead of collapsing them — they record the safe corridor
+        # for future up/downgrades. Splicing on the match end keeps any
+        # trailing PEP 508 marker (``; python_version >= ...``) intact.
+        # Normalise internal whitespace out of the captured spec —
+        # the bounds parser works on the compact ``>=1.0,<2.0`` form.
+        old_spec = re.sub(r"\s+", "", m.group(3)) if m.group(3) else ""
+        new_spec = _pypi_pin_preserving_bounds(
+            old_spec, plan.target, floor_raise=plan.floor_raise)
+        if new_spec is None:
+            # Target falls outside the declared corridor — declining
+            # (like the npm rewriter) beats emitting an unsatisfiable
+            # spec such as ``>=2.0,==2.31.0,<2.25``.
+            declined = True
+            out_lines.append(raw)
+            continue
+        new_inner = m.group(1) + m.group(2) + new_spec + line_value[m.end():]
+        new_line = f"{comment_prefix}{new_inner}" if comment_prefix else new_inner
+        new_line += inline_comment
+        out_lines.append(raw.replace(stripped, new_line))
+        rewrote = True
+    if not rewrote:
+        if declined:
+            return text, False, ("spec matched but not safely bumpable "
+                                 "(target outside the declared bounds)")
+        return text, False, "no matching line"
+    return "".join(out_lines), True, None
+
+
+# ---------------------------------------------------------------------------
+# Inline install rewriter (Dockerfile / *.sh / .github/workflows/*.yml /
+# devcontainer.json — anywhere a `pip install foo==X` line might live).
+# ---------------------------------------------------------------------------
+
+# Per-ecosystem regex for "an install command on this line." Matching
+# means we'll consider substituting on the line; non-matching means we
+# leave the line alone (don't accidentally rewrite a comment or a
+# variable named like the dep).
+_INLINE_INSTALL_CMD_RES = {
+    "PyPI": re.compile(
+        r"\b(?:python3?\s+-m\s+)?(?:pip3?|pipx|uv\s+pip)\s+install\b",
+        re.IGNORECASE),
+    "Debian": re.compile(r"\bapt(?:-get)?\s+install\b", re.IGNORECASE),
+    "Red Hat": re.compile(r"\b(?:yum|dnf)\s+install\b", re.IGNORECASE),
+    "Alpine": re.compile(r"\bapk\s+(?:add|install)\b", re.IGNORECASE),
+    "npm": re.compile(
+        r"\b(?:npm\s+(?:install|i|add)|yarn\s+add|pnpm\s+(?:add|install|i)"
+        r"|npx|bunx|pnpm\s+dlx|yarn\s+dlx)\b",
+        re.IGNORECASE),
+    "Homebrew": re.compile(r"\bbrew\s+install\b", re.IGNORECASE),
+    "Go": re.compile(r"\bgo\s+install\b", re.IGNORECASE),
+    "Cargo": re.compile(r"\bcargo\s+install\b", re.IGNORECASE),
+    "RubyGems": re.compile(r"\bgem\s+install\b", re.IGNORECASE),
+    # ``dotnet add package <name> --version <X>`` /
+    # ``nuget install <name> -Version <X>`` /
+    # ``Install-Package <name> -Version <X>`` (PowerShell).
+    "NuGet": re.compile(
+        r"\b(?:dotnet\s+add\s+package|nuget\s+install|Install-Package)\b",
+        re.IGNORECASE),
+    # ``composer require <vendor/pkg>:<version>`` /
+    # ``composer require <vendor/pkg>``.
+    "Packagist": re.compile(r"\bcomposer\s+(?:require|update)\b",
+                              re.IGNORECASE),
+    # ``mvn install:install-file -DgroupId=… -DartifactId=… -Dversion=…``
+    # is the canonical "install a JAR into a local repo" inline form.
+    # ``mvn deploy:deploy-file`` uses the same -D switches and is
+    # equally rewritable. Matched at the goal-name level so ad-hoc
+    # variants (``./mvnw …``) still hit.
+    # The pre-goal token loop is bounded ({0,32}): unbounded, every
+    # planted ``mvn `` token inside a goal-less argument run
+    # re-scanned the rest of the run — quadratic on hostile hook
+    # text. 32 tokens is far above any real mvn invocation's
+    # pre-goal flag count; a longer run stops matching.
+    "Maven": re.compile(
+        r"\bmvn(?:w)?\s+(?:[-\w:]+\s+){0,32}"
+        r"(?:install:install-file|deploy:deploy-file)\b",
+        re.IGNORECASE),
+}
+
+
+_INLINE_SHELL_SEP_RE = re.compile(r"&&|\|\||;|(?<!\|)\|(?!\|)")
+
+
+def _inline_line_continues(raw: str) -> bool:
+    r"""True if ``raw`` ends with a shell line-continuation ``\``
+    (ignoring the trailing newline / whitespace)."""
+    return raw.rstrip().endswith("\\")
+
+
+def _rewrite_inline_install(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    r"""Rewrite the version of ``plan.name`` inside an inline-install file.
+
+    Inline-install files are Dockerfile / Containerfile / ``*.sh`` /
+    ``*.bash`` / ``.github/workflows/*.yml`` / ``devcontainer.json`` —
+    anywhere ``pip install foo==X`` (or ``apt install foo=X``,
+    ``npm install foo@X``, etc.) might live.
+
+    Strategy:
+      1. Walk the file physical line by line, tracking whether we are
+         inside the *argument region* of a matching install command —
+         a region that spans ``\``-continuation lines, so a multi-line
+         ``apt-get install -y \`` … block with one package per line is
+         covered, not just same-line installs.
+      2. On a line carrying the install command, substitute within its
+         same-line args. While inside the continued arg region, each
+         package-on-its-own-line is substituted too.
+      3. ``#`` comment lines inside a continuation are transparent
+         (Docker strips them before the shell runs), so they neither
+         terminate the region nor get rewritten. A shell separator
+         (``&&`` / ``||`` / ``;`` / ``|``) ends the region — a new
+         command starts there.
+      4. Both pinned and unpinned forms are handled; an unpinned
+         ``pip install pkg`` / continuation-line ``pkg`` is rewritten to
+         the pinned form (``pkg==<target>`` / ``pkg=<target>`` /
+         ``pkg@<target>`` per ecosystem).
+
+    GHA YAML and devcontainer.json have richer structure (block
+    scalars, JSON string fields) but ``run:`` block bodies and JSONC
+    string values still parse correctly under line-level processing —
+    the substitutions only fire on lines that contain an actual install
+    command keyword or sit inside its continued args.
+    """
+    eco = plan.ecosystem
+    # Library posture: an inline ``pip install pkg==X`` is inherently an exact
+    # pin; we have no range-preserving form for it, so refuse rather than
+    # over-constrain a library's dep. (Inline installs are an application/
+    # container concern far more than a library one.)
+    if plan.floor_raise:
+        return text, False, (
+            "library floor-raise unsupported for inline-install (would force "
+            "an exact pin); leaving the dependency unpinned"
+        )
+    cmd_re = _INLINE_INSTALL_CMD_RES.get(eco)
+    if cmd_re is None:
+        return text, False, (
+            f"inline rewriter not yet wired for ecosystem {eco!r}"
+        )
+
+    sub_fn = _INLINE_SUB_FNS.get(eco)
+    if sub_fn is None:
+        return text, False, (
+            f"inline rewriter has no substitution for {eco!r}"
+        )
+
+    out_lines: list[str] = []
+    rewrote = False
+    in_args = False   # inside a matching install command's continued args
+    for raw in text.splitlines(keepends=True):
+        m = cmd_re.search(raw)
+        if m is not None:
+            # Install command(s) on this physical line: rewrite each
+            # command's own argument segment, bounded at shell
+            # separators (see ``_rewrite_inline_cmd_line``).
+            new_line, hit, still_open = _rewrite_inline_cmd_line(
+                raw, cmd_re, sub_fn, plan.name, plan.target)
+            rewrote = rewrote or hit
+            out_lines.append(new_line)
+            # A ``\`` continuation only extends the install's args when
+            # the line's LAST install command runs to end-of-line — a
+            # separator after it means the continuation belongs to the
+            # post-separator command, not the install.
+            in_args = still_open and _inline_line_continues(raw)
+            continue
+        if in_args:
+            if raw.lstrip().startswith("#"):
+                # Docker strips ``#`` comment lines inside a RUN
+                # continuation before the shell sees them, so they
+                # neither carry a package nor break the continuation.
+                out_lines.append(raw)
+                continue
+            sep = _INLINE_SHELL_SEP_RE.search(raw)
+            if sep is not None:
+                # A shell separator ends this install's args; a new
+                # command starts. Only the portion before the separator
+                # is still install args (usually just whitespace here).
+                new_before, hit = sub_fn(
+                    raw[: sep.start()], plan.name, plan.target)
+                rewrote = rewrote or hit
+                out_lines.append(new_before + raw[sep.start():])
+                in_args = False
+                continue
+            # A package token on its own continuation line.
+            new_line, hit = sub_fn(raw, plan.name, plan.target)
+            rewrote = rewrote or hit
+            out_lines.append(new_line)
+            in_args = _inline_line_continues(raw)
+            continue
+        out_lines.append(raw)
+    if not rewrote:
+        return text, False, (
+            f"name {plan.name!r} not found in inline {eco} installs"
+        )
+    return "".join(out_lines), True, None
+
+
+def _rewrite_inline_cmd_line(
+    raw: str, cmd_re: re.Pattern, sub_fn: Any,
+    name: str, new_version: str,
+) -> tuple[str, bool, bool]:
+    r"""Rewrite every matching install command's OWN argument segment
+    on one physical line.
+
+    Each command's args end at the first shell separator after it.
+    Substituting into the whole remainder (the old behaviour) let a
+    bare-name match rewrite a LATER command on the same line
+    (``apt-get install -y curl && curl … | bash`` turning the second
+    ``curl`` — a command invocation — into ``curl=<ver>``) and let
+    ``_inline_sub_versioned_flag`` find a ``--version`` flag belonging
+    to a different install (``cargo install a --version X && cargo
+    install b``). Scanning segment-by-segment also covers a second
+    install command after the separator, which the single-prefix
+    rewrite handled only by that same over-broad substitution.
+
+    Returns ``(new_line, any_hit, still_in_args)``; ``still_in_args``
+    is True when the final install command's args run to end-of-line,
+    so a ``\`` continuation extends THEM rather than a post-separator
+    command.
+    """
+    out: list[str] = []
+    pos = 0
+    hit_any = False
+    last_seg_open = False
+    while True:
+        m = cmd_re.search(raw, pos)
+        if m is None:
+            out.append(raw[pos:])
+            break
+        sep = _INLINE_SHELL_SEP_RE.search(raw, m.end())
+        seg_end = sep.start() if sep is not None else len(raw)
+        new_seg, hit = sub_fn(raw[m.end():seg_end], name, new_version)
+        hit_any = hit_any or hit
+        out.append(raw[pos:m.end()])
+        out.append(new_seg)
+        pos = seg_end
+        last_seg_open = sep is None
+    return "".join(out), hit_any, last_seg_open
+
+
+_PYPI_CLAUSE_RE = re.compile(r"^\s*(===|==|>=|<=|~=|!=|>|<)\s*(.+?)\s*$")
+
+
+def _pypi_pin_preserving_bounds(spec: str, target: str,
+                                floor_raise: bool = False) -> str | None:
+    """Return a PEP 440 specifier that pins to ``target`` while keeping
+    any range bounds from ``spec`` as a record of the safe corridor.
+
+    ``floor_raise`` (library posture): instead of adding ``==target``, RAISE
+    the lower bound to ``>=target`` and keep ceilings/excludes — a range,
+    not an exact pin — so a library's downstream consumers can still resolve.
+    Example: ``>=2.0,<3.0`` + target ``2.1`` → ``>=2.1,<3.0`` (vs the default
+    ``>=2.0,==2.1,<3.0``).
+
+    ``spec`` is the specifier text *after* the package name::
+
+        >=2.0,<3.0  ->  >=2.0,==<target>,<3.0   (floor + ceiling kept)
+        >=2.31.0    ->  >=2.31.0,==<target>      (downgrade floor kept)
+        ==2.30.0    ->  ==<target>               (old exact pin replaced)
+        ""/bare     ->  ==<target>
+
+    Bounds (``>=`` ``>`` ``<`` ``<=`` ``!=``) are preserved; existing pin
+    clauses (``==`` ``===`` ``~=``) are dropped and replaced by a single
+    ``==<target>``. The floor lets a future ``degraded_safety`` downgrade
+    know how far down is acceptable; the ceiling stops an auto-jump past
+    a declared major.
+
+    Returns ``None`` (decline — mirror of the npm rewriter) when
+    ``target`` falls outside the declared corridor (at/above a kept
+    ceiling, or below a kept floor) or a bound isn't comparable —
+    never emit an unsatisfiable spec like ``>=2.0,==2.31.0,<2.25``.
+    Harden's selection honours the corridor (see ``_plan_one``); this
+    guard covers findings-driven targets that don't.
+    """
+    lowers, uppers, excludes = [], [], []
+    for part in spec.split(","):
+        cm = _PYPI_CLAUSE_RE.match(part)
+        if cm is None:
+            continue
+        op, ver = cm.group(1), cm.group(2)
+        if op in (">=", ">"):
+            lowers.append((op, ver))
+        elif op in ("<", "<="):
+            uppers.append((op, ver))
+        elif op == "!=":
+            excludes.append(f"{op}{ver}")
+        # ==, ===, ~= are dropped — replaced by the pin/floor below.
+    try:
+        for op, ver in uppers:
+            cmp = version_compare("PyPI", target, ver)
+            if op == "<" and cmp >= 0:
+                return None
+            if op == "<=" and cmp > 0:
+                return None
+        if not floor_raise:
+            for op, ver in lowers:
+                cmp = version_compare("PyPI", target, ver)
+                if op == ">=" and cmp < 0:
+                    return None
+                if op == ">" and cmp <= 0:
+                    return None
+    except VersionError:
+        return None
+    upper_specs = [f"{op}{ver}" for op, ver in uppers]
+    if floor_raise:
+        # Library posture: a single ``>=target`` floor (replacing any old
+        # lowers), keep ceilings/excludes, no exact pin.
+        return ",".join([f">={target}"] + upper_specs + excludes)
+    lower_specs = [f"{op}{ver}" for op, ver in lowers]
+    return ",".join(lower_specs + [f"=={target}"] + upper_specs + excludes)
+
+
+def _inline_sub_pypi(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """``pip install foo==1.0`` / ``pip install 'foo>=2,<3'`` / ``foo``."""
+    name_re = re.escape(name)
+    # 1. Specifier form: ``pkg<spec>`` where <spec> is one or more
+    #    comma-joined PEP 440 clauses. Optional extras between the name
+    #    and the spec (``uvicorn[standard]==0.22``) are captured and
+    #    preserved so the pin splices AFTER them. Capture the WHOLE
+    #    spec so range bounds survive the pin (see
+    #    _pypi_pin_preserving_bounds). ``,`` is excluded from the
+    #    version class so clauses split cleanly; ``;`` stays excluded
+    #    to leave PEP 508 markers untouched.
+    spec_re = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})"
+        # Extras, version and clause-count bounds: separator fills
+        # keep the lookbehind pin live at every planted name, so the
+        # unbounded spans re-scanned per plant — quadratic on hostile
+        # requirements text (bounds far above real specifier rows).
+        rf"((?:\[[^\]\s]{{0,256}}\])?)"
+        # Horizontal whitespace only between clauses — ``\s`` would let
+        # the trailing ``\s*`` swallow the line's newline into the spec.
+        rf"((?:[ \t]*(?:===|==|>=|<=|~=|!=|>|<)[ \t]*[^\s\\;\"',]{{1,256}}[ \t]*,?){{1,32}})",
+        re.IGNORECASE,
+    )
+    declined = False
+
+    def _pin_spec(m: re.Match) -> str:
+        nonlocal declined
+        pinned = _pypi_pin_preserving_bounds(m.group(3), new_version)
+        if pinned is None:
+            # Target outside the declared corridor — leave the spec
+            # alone rather than emit an unsatisfiable one.
+            declined = True
+            return m.group(0)
+        return m.group(1) + m.group(2) + pinned
+
+    new_text, n = spec_re.subn(_pin_spec, text, count=1)
+    if declined:
+        return text, False
+    if n > 0:
+        return new_text, True
+    # 2. Bare name (not part of another identifier or version-separated),
+    #    optionally carrying extras — the pin goes after them
+    #    (``uvicorn[standard]`` → ``uvicorn[standard]==X``). The
+    #    lookahead excludes ``[`` (an unclosed extras bracket is not a
+    #    bare name) and ``=`` (a single-``=`` form is not a pip spec;
+    #    pinning before it would emit ``pkg==X=Y``). ``count=1`` — pin
+    #    the first occurrence only, so a repeat of the name later in
+    #    the segment (e.g. inside a trailing comment) is left alone.
+    bare = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})"
+        # Extras span bounded — same rationale as the specifier form.
+        rf"((?:\[[^\]\s]{{0,256}}\])?)"
+        rf"(?![A-Za-z0-9._@/=\[-])",
+        re.IGNORECASE,
+    )
+    new_text, n = bare.subn(rf"\g<1>\g<2>=={new_version}", text, count=1)
+    return (new_text, True) if n > 0 else (text, False)
+
+
+def _inline_sub_eq_separated(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """Single-``=`` version separator (apt, apk)."""
+    name_re = re.escape(name)
+    pinned = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})=([^\s\\,;\"']+)",
+        re.IGNORECASE,
+    )
+    new_text, n = pinned.subn(rf"\1={new_version}", text)
+    if n > 0:
+        return new_text, True
+    # ``[`` in the lookahead: a name directly followed by a bracket is
+    # some other token shape, not a bare package — refuse rather than
+    # splice a pin into the middle of it.
+    bare = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})(?![A-Za-z0-9._@/=\[-])",
+        re.IGNORECASE,
+    )
+    new_text, n = bare.subn(rf"\1={new_version}", text, count=1)
+    return (new_text, True) if n > 0 else (text, False)
+
+
+def _inline_sub_yum(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """RPM convention: ``pkg-version`` (version starts with a digit)."""
+    name_re = re.escape(name)
+    pinned = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})-(\d[^\s\\,;\"']*)",
+        re.IGNORECASE,
+    )
+    new_text, n = pinned.subn(rf"\1-{new_version}", text)
+    if n > 0:
+        return new_text, True
+    # ``[`` in the lookahead — same rationale as the eq-separated form.
+    bare = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})(?![A-Za-z0-9._@/=\[-])",
+        re.IGNORECASE,
+    )
+    new_text, n = bare.subn(rf"\1-{new_version}", text, count=1)
+    return (new_text, True) if n > 0 else (text, False)
+
+
+def _inline_sub_at_separated(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """``@``-separated version (npm scoped/plain, brew, Go modules).
+
+    For scoped npm (``@anthropic-ai/claude-code@1.0``) the version
+    separator is the LAST ``@``; the leading ``@scope/`` belongs to the
+    name and must be preserved.
+
+    IGNORECASE matches the sibling substituters (pypi / eq-separated /
+    yum): install lines are matched tolerantly on case, and the
+    substitution preserves the file's own spelling via the captured
+    group.
+    """
+    name_re = re.escape(name)
+    pinned = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})@([^\s\\,;\"']+)",
+        re.IGNORECASE,
+    )
+    new_text, n = pinned.subn(rf"\1@{new_version}", text)
+    if n > 0:
+        return new_text, True
+    # ``[`` in the lookahead — same rationale as the eq-separated form.
+    bare = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})(?![A-Za-z0-9._@/=\[-])",
+        re.IGNORECASE,
+    )
+    new_text, n = bare.subn(rf"\1@{new_version}", text, count=1)
+    return (new_text, True) if n > 0 else (text, False)
+
+
+def _inline_sub_versioned_flag(
+    text: str, name: str, new_version: str,
+    *,
+    version_flags: tuple,
+) -> tuple[str, bool]:
+    """Multi-token version: ``cargo install ripgrep --version 14.1.0``.
+
+    Three cases per command:
+      1. Pkg name + existing ``--version <X>`` flag: replace the X token.
+      2. Pkg name + no version flag: append ``--version <new>`` after
+         the package name.
+      3. Pkg name not present: no change.
+
+    Operates on the rest-of-line text after the install-command match —
+    so caller has already pinned us to a single command's args.
+    """
+    name_re = re.escape(name)
+    # Case 1: ``<name> ... --version <X>`` (or ``-v <X>`` / ``--vers <X>``).
+    # The flag may not be adjacent to the name; do a two-step scan.
+    name_pattern = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})(?![A-Za-z0-9._@/=-])",
+        re.IGNORECASE,
+    )
+    if not name_pattern.search(text):
+        return text, False
+    # Look for an existing version flag anywhere in the args.
+    flag_alt = "|".join(re.escape(f) for f in version_flags)
+    flag_re = re.compile(
+        rf"({flag_alt})\s+([^\s\\,;\"']+)",
+    )
+    m = flag_re.search(text)
+    if m:
+        # Replace the value token only.
+        flag = m.group(1)
+        return (
+            text[:m.start()] + f"{flag} {new_version}" + text[m.end():],
+            True,
+        )
+    # Case 2: append ``--version <new>`` after the package name.
+    new_text = name_pattern.sub(
+        rf"\1 --version {new_version}", text, count=1)
+    return new_text, True
+
+
+def _inline_sub_cargo(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    return _inline_sub_versioned_flag(
+        text, name, new_version,
+        version_flags=("--version", "--vers"),
+    )
+
+
+def _inline_sub_gem(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    return _inline_sub_versioned_flag(
+        text, name, new_version,
+        version_flags=("--version", "-v"),
+    )
+
+
+def _inline_sub_nuget(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """``dotnet add package Foo --version X`` /
+    ``nuget install Foo -Version X`` /
+    ``Install-Package Foo -Version X``."""
+    return _inline_sub_versioned_flag(
+        text, name, new_version,
+        version_flags=("--version", "-Version", "-v"),
+    )
+
+
+def _inline_sub_composer(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """``composer require vendor/pkg:1.2.3`` — colon-separated.
+
+    Composer doesn't pin via a separate ``--version`` flag; the version
+    constraint is bundled into the package argument with a colon.
+    """
+    name_re = re.escape(name)
+    pinned = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re}):([^\s\\,;\"']+)",
+    )
+    new_text, n = pinned.subn(rf"\1:{new_version}", text)
+    if n > 0:
+        return new_text, True
+    bare = re.compile(
+        rf"(?<![A-Za-z0-9._-])({name_re})(?![A-Za-z0-9._@/=:-])",
+    )
+    new_text, n = bare.subn(rf"\1:{new_version}", text, count=1)
+    return (new_text, True) if n > 0 else (text, False)
+
+
+def _inline_sub_maven(
+    text: str, name: str, new_version: str,
+) -> tuple[str, bool]:
+    """``mvn install:install-file -DgroupId=g -DartifactId=a -Dversion=X``.
+
+    The OSV ecosystem uses ``groupId:artifactId`` as the dep name, so
+    we split it and require BOTH ``-DgroupId=`` and ``-DartifactId=``
+    to match before bumping ``-Dversion=``. Anything less risks
+    rewriting an unrelated invocation that happens to share one
+    coordinate.
+
+    Single ``=`` between flag and value is the common convention; the
+    space-separated form (``-Dversion 1.0``) is rare and not handled
+    — operators using it can fall back to ``--git-patch`` and edit by
+    hand.
+    """
+    if ":" not in name:
+        return text, False
+    group, artifact = name.split(":", 1)
+    g_re = re.escape(group)
+    a_re = re.escape(artifact)
+    # Both -DgroupId and -DartifactId must be present in the args
+    # block; quoting tolerated.
+    has_group = re.search(
+        rf'-DgroupId\s*=\s*["\']?{g_re}["\']?(?![A-Za-z0-9._-])',
+        text)
+    has_artifact = re.search(
+        rf'-DartifactId\s*=\s*["\']?{a_re}["\']?(?![A-Za-z0-9._-])',
+        text)
+    if not (has_group and has_artifact):
+        return text, False
+    version_re = re.compile(
+        r'(-Dversion\s*=\s*["\']?)([^\s\\,;"\']+)(["\']?)',
+    )
+    new_text, n = version_re.subn(
+        rf'\g<1>{new_version}\g<3>', text, count=1,
+    )
+    return (new_text, True) if n > 0 else (text, False)
+
+
+_INLINE_SUB_FNS: dict[str, Any] = {
+    "PyPI": _inline_sub_pypi,
+    "Debian": _inline_sub_eq_separated,
+    "Alpine": _inline_sub_eq_separated,
+    "Red Hat": _inline_sub_yum,
+    "npm": _inline_sub_at_separated,
+    "Homebrew": _inline_sub_at_separated,
+    "Go": _inline_sub_at_separated,
+    "Cargo": _inline_sub_cargo,
+    "RubyGems": _inline_sub_gem,
+    "NuGet": _inline_sub_nuget,
+    "Packagist": _inline_sub_composer,
+    "Maven": _inline_sub_maven,
+}
+
+
+# ----- pyproject.toml -------------------------------------------------------
+
+def _rewrite_pyproject_toml(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Best-effort string-level rewrite covering PEP 621 dep lists and
+    Poetry-style ``name = "spec"`` lines.
+
+    Poetry entries keep the original spec prefix when present (``^``,
+    ``~``). PEP 621 entries go through ``_pypi_pin_preserving_bounds``
+    so range bounds survive around the new ``==target`` pin (same
+    corridor semantics as the requirements.txt rewriter).
+    """
+    norm = pep503_name(plan.name)
+
+    # 1. Poetry-flavoured ``name = "..."`` form.
+    poetry_re = re.compile(
+        r'^([ \t]*)("?)([A-Za-z0-9_\-.]+)\2\s*=\s*"([^"]*)"',
+        re.MULTILINE,
+    )
+    poetry_hit = False
+
+    def _poetry_sub(m: re.Match) -> str:
+        nonlocal poetry_hit
+        if pep503_name(m.group(3)) != norm:
+            return m.group(0)
+        # Poetry specs are semver (caret/tilde/range), so _bump_npm_spec's
+        # floor_raise handles the library posture: caret/tilde/range forms
+        # stay ranges, a bare exact becomes a caret range.
+        new_spec = _bump_npm_spec(m.group(4), plan.installed, plan.target,
+                                  floor_raise=plan.floor_raise)
+        if new_spec is None:
+            return m.group(0)
+        poetry_hit = True
+        return (f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(2)} "
+                f'= "{new_spec}"')
+
+    new_text = poetry_re.sub(_poetry_sub, text)
+
+    # 2. PEP 621 list form: each entry is a quoted PEP 508 string.
+    pep508_re = re.compile(r'"([A-Za-z0-9_\-.]+)\s*([<>=!~][^"]*)"')
+    pep508_declined = False
+
+    def _pep508_sub(m: re.Match) -> str:
+        nonlocal pep508_declined
+        if pep503_name(m.group(1)) != norm:
+            return m.group(0)
+        spec_and_marker = m.group(2)
+        marker_sep = spec_and_marker.find(";")
+        if marker_sep >= 0:
+            spec_part = spec_and_marker[:marker_sep]
+            marker_part = spec_and_marker[marker_sep:]
+        else:
+            spec_part = spec_and_marker
+            marker_part = ""
+        # Preserve compatible bounds around the new pin — same corridor
+        # semantics as the requirements.txt rewriter. Decline (keep the
+        # entry verbatim) when the target falls outside the declared
+        # bounds rather than emit an unsatisfiable spec.
+        new_spec = _pypi_pin_preserving_bounds(
+            spec_part, plan.target, floor_raise=plan.floor_raise)
+        if new_spec is None:
+            pep508_declined = True
+            return m.group(0)
+        return f'"{m.group(1)}{new_spec}{marker_part}"'
+
+    new_text = pep508_re.sub(_pep508_sub, new_text)
+
+    if new_text == text:
+        if pep508_declined:
+            return text, False, ("spec matched but not safely bumpable "
+                                 "(target outside the declared bounds)")
+        return text, False, "no matching pyproject entry"
+    return new_text, True, None
+
+
+# ---------------------------------------------------------------------------
+# Output rendering
+# ---------------------------------------------------------------------------
+
+def _find_repo_root(start: Path, *, max_walk: int = 20) -> Path:
+    """Walk up looking for a ``.git`` entry; return that directory.
+
+    Falls back to ``start`` after ``max_walk`` levels — enough to find
+    a repo root in any sane layout without unbounded ascent.
+    """
+    cur = start
+    for _ in range(max_walk):
+        if (cur / ".git").exists():
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return start
+
+
+def _emit_git_patch(
+    applied: list[UpgradeChange], out_dir: Path,
+) -> tuple[Path | None, Path | None]:
+    """Write a git-apply-compatible unified diff for every applied
+    change. Paths inside the patch are relative to the longest common
+    ancestor of the touched manifests so ``git apply`` from that
+    ancestor lands them correctly.
+
+    Returns ``(patch_path, repo_root_for_apply)`` or ``(None, None)``
+    when there's nothing patchable.
+    """
+    if not applied:
+        return None, None
+
+    # Gather (manifest_resolved, proposed_in_out_dir) pairs. Multiple
+    # findings against the same manifest collapse to a single pair —
+    # otherwise the same hunks would be emitted N times in the patch
+    # and ``git apply`` would re-apply (or warn).
+    pairs: list[tuple[Path, Path]] = []
+    seen_manifests: set = set()
+    for change in applied:
+        manifest = change.manifest.resolve()
+        if manifest in seen_manifests:
+            continue
+        seen_manifests.add(manifest)
+        # Same anchoring the writer (``_materialise_changes``) used, so
+        # each manifest diffs against ITS OWN proposed copy — never a
+        # same-named copy from another directory.
+        proposed = (out_dir / "proposed"
+                    / _proposed_rel_path(manifest)).resolve()
+        if proposed.exists():
+            pairs.append((manifest, proposed))
+
+    if not pairs:
+        return None, None
+
+    # Find the right base for patch paths. ``git apply`` matches the
+    # ``a/<path>`` and ``b/<path>`` segments against the index, so the
+    # patch must be rooted at the repo root — not at the longest common
+    # ancestor of the manifests, which may be a subdirectory. Walk up
+    # from the LCP looking for a ``.git`` entry; fall back to the LCP
+    # if no repo is found.
+    lcp = Path(os.path.commonpath([str(p[0].parent) for p in pairs]))
+    repo_root = _find_repo_root(lcp)
+
+    diff_lines: list[str] = []
+    for original, proposed in pairs:
+        rel = original.relative_to(repo_root)
+        # ``original`` is the user's manifest re-read AFTER the scan
+        # (TOCTOU window): the lstat-gated bounded read keeps a
+        # swapped-in symlink's target (host files) out of the patch
+        # context lines. ``proposed`` is our own staged output — same
+        # helper for uniformity.
+        old_text = read_regular_text(original)
+        if old_text is None:
+            continue
+        old = old_text.splitlines(keepends=True)
+        new_text = read_regular_text(proposed)
+        if new_text is None:
+            continue
+        new = new_text.splitlines(keepends=True)
+        # Header line (``diff --git a/x b/x``) makes ``git apply``
+        # happy and shows up cleanly in code-review tooling.
+        diff_lines.append(f"diff --git a/{rel} b/{rel}\n")
+        diff_lines.extend(difflib.unified_diff(
+            old, new,
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        ))
+        if diff_lines and not diff_lines[-1].endswith("\n"):
+            diff_lines.append("\n")
+
+    if not diff_lines:
+        return None, None
+    patch_path = out_dir / "upgrade.patch"
+    patch_path.write_text("".join(diff_lines), encoding="utf-8")
+    return patch_path, repo_root
+
+
+def _change_to_dict(
+    c: UpgradeChange,
+    compat: Any | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ecosystem": c.ecosystem,
+        "name": c.name,
+        "old_version": c.old_version,
+        "new_version": c.new_version,
+        "manifest": str(c.manifest),
+        "advisory_ids": list(c.advisory_ids),
+        "skipped_reason": c.skipped_reason,
+    }
+    if compat is not None and compat.risks:
+        out["compat_risks"] = [
+            {"kind": r.kind, "severity": r.severity, "detail": r.detail}
+            for r in compat.risks
+        ]
+        out["compat_overall_severity"] = compat.overall_severity
+    return out
+
+
+def _change_key(c: UpgradeChange) -> tuple[str, str, str, str]:
+    """Stable identity for a change so multiple manifests bumping the
+    same dep share the same compat report (the risk is per X→Y, not
+    per file). Case folds only where the registry does: PyPI names
+    are case-insensitive (PEP 503); npm names are case-SENSITIVE, and
+    folding them made case-distinct packages share one compat report
+    — the package.json rewriter explicitly refuses that conflation."""
+    name = c.name.lower() if c.ecosystem == "PyPI" else c.name
+    return (c.ecosystem, name, c.old_version, c.new_version)
+
+
+def _compute_compat_reports(
+    changes: Iterable[UpgradeChange],
+    *,
+    offline: bool,
+    cache_root: Path | None = None,
+) -> dict[tuple[str, str, str, str], Any]:
+    """Run the api-compat heuristic over every applied change.
+
+    Returns a map of ``_change_key(c) -> UpgradeCompatReport``.
+    Pure version-string analysis (semver bump) is always available;
+    requires_dist-diff is gated on having an HttpClient (skipped in
+    ``--offline``). Only PyPI is wired today; other ecosystems pass
+    through with empty reports.
+    """
+    from .api_compat import check_pypi_api_compat
+
+    out: dict[tuple[str, str, str, str], Any] = {}
+    seen_keys: set = set()
+    http = None
+    cache = None
+    if not offline:
+        try:
+            from core.json import JsonCache
+
+            from . import sca_cache_root, default_client
+            http = default_client()
+            cache = JsonCache(root=cache_root or sca_cache_root())
+        except Exception:
+            logger.debug("api-compat: HttpClient setup failed; "
+                         "running with semver heuristic only",
+                         exc_info=True)
+            http = None
+            cache = None
+
+    for c in changes:
+        if c.skipped_reason is not None:
+            continue
+        key = _change_key(c)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        if c.ecosystem == "PyPI":
+            out[key] = check_pypi_api_compat(
+                c.name, c.old_version, c.new_version,
+                http=http, cache=cache,
+            )
+        else:
+            # Other ecosystems: only the version-string heuristic is
+            # meaningful, but the per-ecosystem semver convention
+            # differs (npm uses semver strictly; Maven doesn't; Cargo
+            # does). Run the PyPI helper without HTTP — it computes
+            # the semver risk from version strings alone, which IS
+            # universally meaningful enough to surface.
+            out[key] = check_pypi_api_compat(
+                c.name, c.old_version, c.new_version,
+                http=None, cache=None,
+            )
+    return out
+
+
+def _render_changes_markdown(
+    changes: Iterable[UpgradeChange],
+    compat_reports: dict[tuple[str, str, str, str], Any] | None = None,
+) -> str:
+    applied = [c for c in changes if c.skipped_reason is None]
+    skipped = [c for c in changes if c.skipped_reason is not None]
+    parts: list[str] = ["# raptor-sca fix --cve-only — proposed changes", ""]
+    parts.append(f"- Applied: **{len(applied)}**")
+    parts.append(f"- Skipped: **{len(skipped)}**")
+    parts.append("")
+    if applied:
+        parts.append("## Applied")
+        parts.append("")
+        parts.append(
+            "| Ecosystem | Name | Old → New | Manifest | Advisories | "
+            "Compat |"
+        )
+        parts.append("|---|---|---|---|---|---|")
+        for c in applied:
+            compat_cell = "—"
+            if compat_reports is not None:
+                rep = compat_reports.get(_change_key(c))
+                if rep is not None and rep.risks:
+                    compat_cell = (
+                        f"**{rep.overall_severity}** "
+                        f"({len(rep.risks)} signal"
+                        f"{'s' if len(rep.risks) > 1 else ''})"
+                    )
+            parts.append(
+                f"| {c.ecosystem} | {code_cell(c.name)} | "
+                f"{neutralize_inline(c.old_version, limit=60)} → "
+                f"{neutralize_inline(c.new_version, limit=60)} | "
+                f"{code_cell(c.manifest)} | "
+                f"{', '.join(neutralize_inline(a, limit=60) for a in c.advisory_ids) or '—'}"
+                f" | {compat_cell} |"
+            )
+        parts.append("")
+        # Detail block for any change with non-empty compat risks.
+        risky = []
+        if compat_reports is not None:
+            seen = set()
+            for c in applied:
+                key = _change_key(c)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rep = compat_reports.get(key)
+                if rep is not None and rep.risks:
+                    risky.append((c, rep))
+        if risky:
+            parts.append("### Upgrade-compat risk detail")
+            parts.append("")
+            parts.append(
+                "Heuristic signals that an upgrade may break the build "
+                "or surface compatibility regressions. Review release "
+                "notes before merging changes flagged ``high``."
+            )
+            parts.append("")
+            for c, rep in risky:
+                parts.append(
+                    f"**{neutralize_inline(f'{c.ecosystem}:{c.name}', limit=120)}** "
+                    f"({neutralize_inline(c.old_version, limit=60)} → "
+                    f"{neutralize_inline(c.new_version, limit=60)})"
+                )
+                parts.extend(
+                    f"- _{r.severity}_ — {neutralize_inline(r.detail)}"
+                    for r in rep.risks)
+                parts.append("")
+    if skipped:
+        parts.append("## Skipped")
+        parts.append("")
+        parts.extend(
+            f"- **{neutralize_inline(f'{c.ecosystem}:{c.name}', limit=120)}** "
+            f"({neutralize_inline(c.old_version, limit=60)} → "
+            f"{neutralize_inline(c.new_version, limit=60)}, "
+            f"{code_cell(c.manifest)}): "
+            f"{neutralize_inline(c.skipped_reason)}" for c in skipped)
+        parts.append("")
+    return "\n".join(parts)
+
+
+__all__ = ["UpgradeChange", "main"]

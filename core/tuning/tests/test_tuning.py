@@ -1,11 +1,16 @@
 """Tests for core.tuning — loader, auto-detection, validation."""
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
 import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from core.json import load_json_with_comments
 from core.tuning import (
     Tuning,
     load_tuning,
@@ -19,21 +24,23 @@ from core.tuning import (
 )
 
 
+
+
+
 class TestLoadTuning(unittest.TestCase):
 
     def test_missing_file_returns_defaults(self):
         t = load_tuning(Path("/nonexistent/tuning.json"))
-        self.assertEqual(t.max_semgrep_workers, 4)
-        self.assertEqual(t.max_codeql_workers, 2)
-        self.assertEqual(t.max_agentic_parallel, 3)
-        self.assertEqual(t.max_fuzz_parallel, 4)
+        self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
+        self.assertEqual(t.max_codeql_workers, _detect_codeql_workers())
+        self.assertEqual(t.max_fuzz_parallel, _detect_fuzz_parallel())
 
     def test_empty_file_returns_defaults(self):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text("")
             t = load_tuning(p)
-            self.assertEqual(t.max_semgrep_workers, 4)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
 
     def test_explicit_values(self):
         with TemporaryDirectory() as d:
@@ -43,7 +50,6 @@ class TestLoadTuning(unittest.TestCase):
                 "codeql_threads": 2,
                 "max_semgrep_workers": 8,
                 "max_codeql_workers": 4,
-                "max_agentic_parallel": 6,
                 "max_fuzz_parallel": 4,
             }))
             t = load_tuning(p)
@@ -51,7 +57,6 @@ class TestLoadTuning(unittest.TestCase):
             self.assertEqual(t.codeql_threads, 2)
             self.assertEqual(t.max_semgrep_workers, 8)
             self.assertEqual(t.max_codeql_workers, 4)
-            self.assertEqual(t.max_agentic_parallel, 6)
             self.assertEqual(t.max_fuzz_parallel, 4)
 
     def test_auto_resolves_ram(self):
@@ -75,7 +80,7 @@ class TestLoadTuning(unittest.TestCase):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_semgrep_workers": "auto"}))
-            with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=16):
+            with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=16):
                 t = load_tuning(p)
             self.assertEqual(t.max_semgrep_workers, 8)
 
@@ -83,7 +88,7 @@ class TestLoadTuning(unittest.TestCase):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_semgrep_workers": "auto"}))
-            with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=None):
+            with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=None):
                 t = load_tuning(p)
             self.assertEqual(t.max_semgrep_workers, 2)
 
@@ -91,7 +96,7 @@ class TestLoadTuning(unittest.TestCase):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_codeql_workers": "auto"}))
-            with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=12), patch("core.tuning._detect_total_ram_mb", return_value=98304), patch("core.tuning._detect_ram_mb", return_value=16384):
+            with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=12), patch("core.tuning._detect_total_ram_mb", return_value=98304), patch("core.tuning._detect_ram_mb", return_value=16384):
                 t = load_tuning(p)
             self.assertEqual(t.max_codeql_workers, 6)
 
@@ -99,7 +104,7 @@ class TestLoadTuning(unittest.TestCase):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_fuzz_parallel": "auto"}))
-            with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=12):
+            with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=12):
                 t = load_tuning(p)
             self.assertEqual(t.max_fuzz_parallel, 6)
 
@@ -111,7 +116,10 @@ class TestLoadTuning(unittest.TestCase):
                 "max_codeql_workers": "auto",
                 "max_fuzz_parallel": "auto",
             }))
-            with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=8):
+            # Mock RAM too: max_codeql_workers is RAM-capped (it's memory-
+            # heavy), so without this the test is non-hermetic and resolves
+            # to 3 on a low-RAM CI runner (~7 GB) instead of the cpu-bound 4.
+            with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=8), patch("core.tuning._detect_total_ram_mb", return_value=98304), patch("core.tuning._detect_ram_mb", return_value=16384):
                 t = load_tuning(p)
             self.assertEqual(t.max_semgrep_workers, 4)
             self.assertEqual(t.max_codeql_workers, 4)
@@ -124,7 +132,7 @@ class TestLoadTuning(unittest.TestCase):
                 "max_codeql_workers": "auto",
                 "max_fuzz_parallel": "auto",
             }))
-            with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=None):
+            with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=None):
                 t = load_tuning(p)
             self.assertEqual(t.max_codeql_workers, 2)
             self.assertEqual(t.max_fuzz_parallel, 2)
@@ -134,7 +142,7 @@ class TestLoadTuning(unittest.TestCase):
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_semgrep_workers": -1}))
             t = load_tuning(p)
-            self.assertEqual(t.max_semgrep_workers, 4)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
 
     def test_zero_threads_accepted(self):
         with TemporaryDirectory() as d:
@@ -148,14 +156,29 @@ class TestLoadTuning(unittest.TestCase):
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_codeql_workers": 0}))
             t = load_tuning(p)
-            self.assertEqual(t.max_codeql_workers, 2)
+            self.assertEqual(t.max_codeql_workers, _detect_codeql_workers())
 
     def test_string_value_falls_back(self):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text(json.dumps({"max_semgrep_workers": "banana"}))
             t = load_tuning(p)
-            self.assertEqual(t.max_semgrep_workers, 4)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
+
+    def test_llm_account_posture_is_valid_passthrough(self):
+        # The posture is a recognised key (no unknown-key warning) but
+        # a passthrough one: consumed raw by core/llm/concurrency.py,
+        # never resolved into the Tuning dataclass.
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({
+                "llm_account_posture": "solo",
+                "max_semgrep_workers": 8,
+            }))
+            with self.assertNoLogs("core.tuning", level="WARNING"):
+                t = load_tuning(p)
+            self.assertEqual(t.max_semgrep_workers, 8)
+            self.assertFalse(hasattr(t, "llm_account_posture"))
 
     def test_unknown_key_warns(self):
         with TemporaryDirectory() as d:
@@ -171,14 +194,14 @@ class TestLoadTuning(unittest.TestCase):
             p = Path(d) / "tuning.json"
             p.write_text("{broken")
             t = load_tuning(p)
-            self.assertEqual(t.max_semgrep_workers, 4)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
 
     def test_non_object_returns_defaults(self):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
             p.write_text("[1, 2, 3]")
             t = load_tuning(p)
-            self.assertEqual(t.max_semgrep_workers, 4)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
 
     def test_comments_in_file(self):
         with TemporaryDirectory() as d:
@@ -200,9 +223,75 @@ class TestLoadTuning(unittest.TestCase):
             p.write_text(json.dumps({"max_fuzz_parallel": 8}))
             t = load_tuning(p)
             self.assertEqual(t.max_fuzz_parallel, 8)
-            self.assertEqual(t.max_semgrep_workers, 4)
-            self.assertEqual(t.max_codeql_workers, 2)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
+            self.assertEqual(t.max_codeql_workers, _detect_codeql_workers())
 
+
+    def test_codeql_enabled_true(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({"codeql_enabled": True}))
+            t = load_tuning(p)
+            self.assertIs(t.codeql_enabled, True)
+
+    def test_codeql_enabled_false(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({"codeql_enabled": False}))
+            t = load_tuning(p)
+            self.assertIs(t.codeql_enabled, False)
+
+    def test_codeql_enabled_rejects_auto(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({"codeql_enabled": "auto"}))
+            t = load_tuning(p)
+            self.assertIs(t.codeql_enabled, True)
+
+    def test_codeql_enabled_rejects_int(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({"codeql_enabled": 0}))
+            t = load_tuning(p)
+            self.assertIs(t.codeql_enabled, True)
+
+    def test_codeql_enabled_rejects_string(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({"codeql_enabled": "false"}))
+            t = load_tuning(p)
+            self.assertIs(t.codeql_enabled, True)
+
+    def test_deprecated_key_stripped_from_config(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({
+                "max_agentic_parallel": 3,
+                "max_semgrep_workers": 8,
+            }))
+            with self.assertLogs("core.tuning", level="INFO") as cm:
+                t = load_tuning(p)
+            self.assertEqual(t.max_semgrep_workers, 8)
+            self.assertFalse(hasattr(t, "max_agentic_parallel"))
+            self.assertTrue(any("deprecated" in m and "max_agentic_parallel" in m for m in cm.output))
+            reloaded = load_json_with_comments(p)
+            self.assertNotIn("max_agentic_parallel", reloaded)
+
+    def test_deprecated_migration_preserves_passthrough_keys(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({
+                "max_agentic_parallel": 3,
+                "max_llm_workers": 6,
+                "throttle_cooldown_s": 5,
+                "max_semgrep_workers": 8,
+            }))
+            load_tuning(p)
+            reloaded = load_json_with_comments(p)
+            self.assertNotIn("max_agentic_parallel", reloaded)
+            self.assertEqual(reloaded["max_llm_workers"], 6)
+            self.assertEqual(reloaded["throttle_cooldown_s"], 5)
+            self.assertEqual(reloaded["max_semgrep_workers"], 8)
 
     def test_auto_creates_default_file(self):
         with TemporaryDirectory() as d:
@@ -211,27 +300,27 @@ class TestLoadTuning(unittest.TestCase):
             with patch("core.tuning._TUNING_PATH", p):
                 t = load_tuning()
             self.assertTrue(p.exists())
-            self.assertEqual(t.max_semgrep_workers, 4)
+            self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
 
 
 class TestAutoDetection(unittest.TestCase):
 
     def test_ram_clamps_low(self):
-        with patch("core.tuning.os.sysconf", side_effect=lambda k: {
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sysconf', side_effect=lambda k: {
             "SC_PHYS_PAGES": 1024 * 1024,
             "SC_PAGE_SIZE": 4096,
         }[k]):
             self.assertEqual(_detect_ram_mb(), 2048)
 
     def test_ram_clamps_high(self):
-        with patch("core.tuning.os.sysconf", side_effect=lambda k: {
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sysconf', side_effect=lambda k: {
             "SC_PHYS_PAGES": 128 * 1024 * 1024,
             "SC_PAGE_SIZE": 4096,
         }[k]):
             self.assertEqual(_detect_ram_mb(), 16384)
 
     def test_ram_fallback_on_error(self):
-        with patch("core.tuning.os.sysconf", side_effect=OSError):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sysconf', side_effect=OSError):
             self.assertEqual(_detect_ram_mb(), 8192)
 
     def test_threads_returns_zero(self):
@@ -245,9 +334,9 @@ class TestAutoDetection(unittest.TestCase):
                 return "250000 100000"
             raise OSError
 
-        with patch("core.tuning.Path.read_text", fake_read_text), patch(
-            "core.tuning.os.sched_getaffinity", return_value=set(range(64)), create=True
-        ), patch("core.tuning.os.cpu_count", return_value=64):
+        with patch("core.tuning.Path.read_text", fake_read_text), mock_module_attribute(
+            _mock_owner('core.tuning'), 'os', 'sched_getaffinity', return_value=set(range(64)), create=True
+        ), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=64):
             self.assertEqual(_detect_cgroup_cpu_quota(), 3)
             self.assertEqual(_detect_available_cpus(), 3)
 
@@ -262,56 +351,56 @@ class TestAutoDetection(unittest.TestCase):
                 return "100000"
             raise OSError
 
-        with patch("core.tuning.Path.read_text", fake_read_text), patch(
-            "core.tuning.os.sched_getaffinity", return_value=set(range(64)), create=True
-        ), patch("core.tuning.os.cpu_count", return_value=64):
+        with patch("core.tuning.Path.read_text", fake_read_text), mock_module_attribute(
+            _mock_owner('core.tuning'), 'os', 'sched_getaffinity', return_value=set(range(64)), create=True
+        ), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=64):
             self.assertEqual(_detect_cgroup_cpu_quota(), 2)
             self.assertEqual(_detect_available_cpus(), 2)
 
     def test_available_cpus_falls_back_when_cpu_unknown(self):
-        with patch("core.tuning.Path.read_text", side_effect=OSError), patch(
-            "core.tuning.os.sched_getaffinity", None, create=True
-        ), patch("core.tuning.os.cpu_count", return_value=None):
+        with patch("core.tuning.Path.read_text", side_effect=OSError), mock_module_attribute(
+            _mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True
+        ), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=None):
             self.assertEqual(_detect_available_cpus(), 4)
 
     def test_semgrep_workers_uses_half_detected_cpus(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=10):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=10):
             self.assertEqual(_detect_semgrep_workers(), 5)
 
     def test_semgrep_workers_respects_affinity_before_host_cpu_count(self):
-        with patch("core.tuning.os.sched_getaffinity", return_value=set(range(8)), create=True), patch("core.tuning.os.cpu_count", return_value=64):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', return_value=set(range(8)), create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=64):
             self.assertEqual(_detect_semgrep_workers(), 4)
 
     def test_semgrep_workers_has_minimum_and_unknown_cpu_fallback(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=1):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=1):
             self.assertEqual(_detect_semgrep_workers(), 1)
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=None):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=None):
             self.assertEqual(_detect_semgrep_workers(), 2)
 
     def test_codeql_workers_uses_half_detected_cpus(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=16), patch("core.tuning._detect_total_ram_mb", return_value=262144), patch("core.tuning._detect_ram_mb", return_value=16384):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=16), patch("core.tuning._detect_total_ram_mb", return_value=262144), patch("core.tuning._detect_ram_mb", return_value=16384):
             self.assertEqual(_detect_codeql_workers(), 8)
 
     def test_codeql_workers_has_memory_and_hard_ceiling(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=256), patch("core.tuning._detect_total_ram_mb", return_value=262144), patch("core.tuning._detect_ram_mb", return_value=16384):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=256), patch("core.tuning._detect_total_ram_mb", return_value=262144), patch("core.tuning._detect_ram_mb", return_value=16384):
             self.assertEqual(_detect_codeql_workers(), 8)
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=64), patch("core.tuning._detect_total_ram_mb", return_value=32768), patch("core.tuning._detect_ram_mb", return_value=16384):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=64), patch("core.tuning._detect_total_ram_mb", return_value=32768), patch("core.tuning._detect_ram_mb", return_value=16384):
             self.assertEqual(_detect_codeql_workers(), 2)
 
     def test_codeql_workers_has_minimum_and_unknown_cpu_fallback(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=1):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=1):
             self.assertEqual(_detect_codeql_workers(), 1)
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=None):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=None):
             self.assertEqual(_detect_codeql_workers(), 2)
 
     def test_fuzz_parallel_uses_half_detected_cpus(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=16):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=16):
             self.assertEqual(_detect_fuzz_parallel(), 8)
 
     def test_fuzz_parallel_has_minimum_and_unknown_cpu_fallback(self):
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=1):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=1):
             self.assertEqual(_detect_fuzz_parallel(), 1)
-        with patch("core.tuning.os.sched_getaffinity", None, create=True), patch("core.tuning.os.cpu_count", return_value=None):
+        with mock_module_attribute(_mock_owner('core.tuning'), 'os', 'sched_getaffinity', None, create=True), mock_module_attribute(_mock_owner('core.tuning'), 'os', 'cpu_count', return_value=None):
             self.assertEqual(_detect_fuzz_parallel(), 2)
 
 
@@ -319,9 +408,19 @@ class TestTuningFrozen(unittest.TestCase):
 
     def test_immutable(self):
         t = Tuning(
+            codeql_enabled=True,
             codeql_ram_mb=8192, codeql_threads=8,
+            codeql_max_disk_cache_mb=0,
+            joern_enabled=True,
+            joern_heap_mb=2048,
+            joern_heap_ceiling_mb=65536,
+            joern_cpg_timeout_s=300,
+            joern_import_timeout_s=900,
+            joern_query_timeout_s=300,
             max_semgrep_workers=4, max_codeql_workers=2,
-            max_agentic_parallel=3, max_fuzz_parallel=1,
+            max_fuzz_parallel=1,
+            max_inventory_workers=4,
+            max_json_memo_mb=256,
         )
         with self.assertRaises(AttributeError):
             t.codeql_ram_mb = 999
@@ -329,3 +428,339 @@ class TestTuningFrozen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJoernHeapDeadZone:
+    """Proportional heap sizing must not land in the compressed-oops
+    dead zone (32-48 GiB): those heaps pay doubled references without
+    holding more objects than the 31 GiB compressed maximum."""
+
+    def _heap_for_total(self, total_mb, monkeypatch):
+        import core.tuning as t
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: total_mb)
+        return t._detect_joern_heap_mb()
+
+    def test_small_host_proportional(self, monkeypatch):
+        assert self._heap_for_total(64 * 1024, monkeypatch) == 16 * 1024
+
+    def test_dead_zone_clamps_down(self, monkeypatch):
+        # 25% of 160 GiB = 40 GiB — inside the dead zone.
+        assert self._heap_for_total(160 * 1024, monkeypatch) == 31 * 1024
+
+    def test_boundary_just_over_32g_clamps(self, monkeypatch):
+        assert self._heap_for_total(132 * 1024, monkeypatch) == 31 * 1024
+
+    def test_above_dead_zone_stays_proportional(self, monkeypatch):
+        # 25% of 495 GiB ≈ 124 GiB — raw capacity beats compressed.
+        total = 495 * 1024
+        assert self._heap_for_total(total, monkeypatch) == total // 4
+
+    def test_floor_untouched(self, monkeypatch):
+        assert self._heap_for_total(1024, monkeypatch) == 1024
+
+
+class TestJoernHeapCeiling:
+    """The heap ceiling caps the DERIVED heap; explicit values pass."""
+
+    def _load(self, tmp_path, monkeypatch, config, total_mb):
+        import core.tuning as t
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: total_mb)
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps(config))
+        return t.load_tuning(path)
+
+    def test_ceiling_default_is_min_quarter_ram_64g(self, monkeypatch):
+        import core.tuning as t
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: 495 * 1024)
+        assert t._detect_joern_heap_ceiling_mb() == 64 * 1024
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: 64 * 1024)
+        assert t._detect_joern_heap_ceiling_mb() == 16 * 1024
+
+    def test_auto_heap_capped_at_default_ceiling(self, tmp_path, monkeypatch):
+        # 25% of 495 GiB ≈ 124 GiB raw derivation — the very heap the
+        # ceiling exists to stop on a fresh install.
+        t = self._load(tmp_path, monkeypatch, {}, total_mb=495 * 1024)
+        assert t.joern_heap_mb == 64 * 1024
+        assert t.joern_heap_ceiling_mb == 64 * 1024
+
+    def test_auto_heap_below_ceiling_untouched(self, tmp_path, monkeypatch):
+        t = self._load(tmp_path, monkeypatch, {}, total_mb=64 * 1024)
+        assert t.joern_heap_mb == 16 * 1024
+
+    def test_explicit_heap_never_capped(self, tmp_path, monkeypatch):
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_mb": 126 * 1024}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 126 * 1024
+
+    def test_explicit_ceiling_caps_auto_heap(self, tmp_path, monkeypatch):
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_ceiling_mb": 8192}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 8192
+
+    def test_ceiling_in_dead_zone_clamps_down(self, tmp_path, monkeypatch):
+        # A capped heap in the compressed-oops dead zone is strictly
+        # worse than the 31 GiB compressed maximum.
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_ceiling_mb": 40 * 1024}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 31 * 1024
+
+    def test_invalid_heap_falls_back_to_capped_auto(self, tmp_path, monkeypatch):
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_mb": -5}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 64 * 1024
+
+    def test_derived_flag_tracks_heap_provenance(self, tmp_path, monkeypatch):
+        # Limit-raising consumers key on this flag: an explicit heap
+        # is an operator assertion, honored both directions.
+        auto = self._load(tmp_path, monkeypatch, {}, total_mb=64 * 1024)
+        assert auto.joern_heap_mb_derived is True
+        explicit = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_mb": 2048}, total_mb=64 * 1024,
+        )
+        assert explicit.joern_heap_mb_derived is False
+
+
+class TestDerivedCpgTimeout:
+    """SLOC-derived CPG-build timeout curve and the auto sentinel."""
+
+    def test_auto_resolves_to_derived_sentinel(self, tmp_path):
+        from core.tuning import JOERN_CPG_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_cpg_timeout_s": "auto"}))
+        t = load_tuning(path)
+        assert t.joern_cpg_timeout_s == JOERN_CPG_TIMEOUT_DERIVED
+
+    def test_default_is_auto_sentinel(self, tmp_path):
+        from core.tuning import JOERN_CPG_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text("{}")
+        assert load_tuning(path).joern_cpg_timeout_s == JOERN_CPG_TIMEOUT_DERIVED
+
+    def test_static_value_unchanged(self, tmp_path):
+        from core.tuning import load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_cpg_timeout_s": 7200}))
+        assert load_tuning(path).joern_cpg_timeout_s == 7200
+
+    def test_curve_floor(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        assert derive_joern_cpg_timeout_s(10_000) == 300
+
+    def test_curve_calibration_point_has_slack(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        # The measured 2,849 s build must clear its own derived wall.
+        derived = derive_joern_cpg_timeout_s(3_000_000)
+        assert derived >= 2 * 2849
+        assert derived <= 14400
+
+    def test_curve_cap(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        assert derive_joern_cpg_timeout_s(40_000_000) == 14400
+
+    def test_unknown_scope_fallback(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        assert derive_joern_cpg_timeout_s(None) == 1800
+        assert derive_joern_cpg_timeout_s(0) == 1800
+
+    def test_knowably_undersized_cap_warns(self, caplog):
+        # When even the PRE-slack estimate exceeds the cap, the
+        # capped wall is knowably undersized — say so at derivation
+        # time so the operator can act before paying it.
+        import logging
+        from core.tuning import derive_joern_cpg_timeout_s
+        with caplog.at_level(logging.WARNING, logger="core.tuning"):
+            assert derive_joern_cpg_timeout_s(38_000_000) == 14400
+        assert "likely undersized" in caplog.text
+
+    def test_in_cap_scopes_do_not_warn(self, caplog):
+        import logging
+        from core.tuning import derive_joern_cpg_timeout_s
+        with caplog.at_level(logging.WARNING, logger="core.tuning"):
+            derive_joern_cpg_timeout_s(3_000_000)
+            # Slack-capped but raw estimate inside the cap: the wall
+            # still carries real headroom, no advisory.
+            derive_joern_cpg_timeout_s(10_000_000)
+        assert not caplog.records
+
+    def test_derived_max_helpers(self, tmp_path, monkeypatch):
+        import core.tuning as t
+        assert t.derived_max_joern_cpg_timeout_s() == 14400
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: 495 * 1024)
+        path = tmp_path / "tuning.json"
+        path.write_text("{}")
+        monkeypatch.setattr(t, "_TUNING_PATH", path)
+        monkeypatch.setattr(t, "_cached", None)
+        monkeypatch.setattr(t, "_cached_stat", None)
+        assert t.derived_max_joern_heap_mb() == 64 * 1024
+
+
+_MIB = 1024 * 1024
+
+
+class TestDerivedImportTimeout:
+    """CPG-size-derived import timeout curve and the auto sentinel."""
+
+    def test_auto_resolves_to_derived_sentinel(self, tmp_path):
+        from core.tuning import JOERN_IMPORT_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_import_timeout_s": "auto"}))
+        t = load_tuning(path)
+        assert t.joern_import_timeout_s == JOERN_IMPORT_TIMEOUT_DERIVED
+
+    def test_default_is_auto_sentinel(self, tmp_path):
+        from core.tuning import JOERN_IMPORT_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text("{}")
+        assert (load_tuning(path).joern_import_timeout_s
+                == JOERN_IMPORT_TIMEOUT_DERIVED)
+
+    def test_static_value_unchanged(self, tmp_path):
+        from core.tuning import load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_import_timeout_s": 3600}))
+        assert load_tuning(path).joern_import_timeout_s == 3600
+
+    def test_curve_floor_keeps_historical_default(self):
+        # Direction 1: small CPGs keep today's 900 s kill latency —
+        # the derivation must never TIGHTEN the historical budget.
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(10 * _MIB) == 900
+        assert derive_joern_import_timeout_s(1) == 900
+
+    def test_kernel_scale_cpg_clears_the_failed_budget(self):
+        # Calibration datum: a ~190 MiB kernel-scale CPG failed to
+        # import within 1800 s. The derived wall must clear that
+        # observed-insufficient budget with real headroom.
+        from core.tuning import derive_joern_import_timeout_s
+        derived = derive_joern_import_timeout_s(190 * _MIB)
+        assert derived >= 2 * 1800
+        assert derived <= 10800
+
+    def test_curve_cap_bounds_hostile_sizes(self):
+        # Direction 2: a hostile / degenerate multi-TB cpg.bin must
+        # not buy unbounded wall — the cap is absolute.
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(4 * 1024**4) == 10800
+
+    def test_unknown_size_falls_back_to_floor(self):
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(None) == 900
+        assert derive_joern_import_timeout_s(0) == 900
+        assert derive_joern_import_timeout_s(-1) == 900
+
+    def test_slope_pinned_exactly_mid_curve(self):
+        # Exact mid-curve pin (100 MiB x 20 s/MiB = 2000 s, between
+        # floor and cap) holds the slope in BOTH directions: the
+        # floor/headroom pins above only fail from below (a silently
+        # doubled slope passes them all), the cap pins only from
+        # above (a halved slope passes those). Any slope change must
+        # move this number and re-argue the calibration.
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(100 * _MIB) == 2000
+
+    def test_derived_max_helper(self):
+        from core.tuning import derived_max_joern_import_timeout_s
+        assert derived_max_joern_import_timeout_s() == 10800
+
+
+class TestDerivedPresweepTimeout:
+    """CPG-size-derived bulk pre-sweep window budget."""
+
+    def test_floor_is_configured_query_timeout(self):
+        # Direction 1: small CPGs keep the configured per-query
+        # budget unchanged (no inflation of the historical default).
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(300, 5 * _MIB) == 300
+        assert derive_joern_presweep_timeout_s(300, None) == 300
+        assert derive_joern_presweep_timeout_s(300, 0) == 300
+
+    def test_operator_raised_floor_stays_authoritative(self):
+        from core.tuning import derive_joern_presweep_timeout_s
+        # An operator-raised query timeout above the derived value
+        # passes through unchanged (floor scaling, upward authority).
+        assert derive_joern_presweep_timeout_s(9000, 190 * _MIB) == 9000
+
+    def test_kernel_scale_cpg_clears_the_killing_budget(self):
+        # Calibration datum: a ~190 MiB kernel-scale CPG's bulk sweep
+        # was killed at a flat 300 s and recorded zero flows. The
+        # tiered query (T0/T1 prune 90%+) needs less budget: 10 s/MiB
+        # gives 1900s for 190 MiB — 6× the killing budget.
+        from core.tuning import derive_joern_presweep_timeout_s
+        derived = derive_joern_presweep_timeout_s(300, 190 * _MIB)
+        assert derived >= 6 * 300
+        assert derived <= 3600
+
+    def test_cap_bounds_hostile_sizes(self):
+        # Direction 2: the REPL is single-threaded — one wedged
+        # window must not park the run beyond the cap, no matter how
+        # large (or hostile) the CPG size signal is.
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(300, 4 * 1024**4) == 3600
+
+    def test_include_import_widens_budget_and_cap(self):
+        from core.tuning import derive_joern_presweep_timeout_s
+        # The subprocess path's single wall covers importCpg + solve:
+        # the import slope is added, and the cap widens accordingly.
+        server_side = derive_joern_presweep_timeout_s(300, 190 * _MIB)
+        local = derive_joern_presweep_timeout_s(
+            300, 190 * _MIB, include_import=True)
+        assert local > server_side
+        assert derive_joern_presweep_timeout_s(
+            300, 4 * 1024**4, include_import=True) == 3600 + 10800
+
+    def test_non_positive_query_timeout_passes_through(self):
+        # 0 is some callers' "no budget" sentinel — never inflate it.
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(0, 10**9) == 0
+        assert derive_joern_presweep_timeout_s(-5, 10**9) == -5
+
+    def test_slope_pinned_exactly_mid_curve(self):
+        # Exact mid-curve pins hold the slope in BOTH directions (the
+        # headroom pins above only fail from below, the cap pins only
+        # from above — a silently doubled or halved slope would pass
+        # every one of them). 100 MiB x 10 s/MiB = 1000 s; the
+        # subprocess path adds the import slope on the same bytes
+        # (30 s/MiB total = 3000 s). Any slope change must move these
+        # numbers and re-argue the calibration.
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(300, 100 * _MIB) == 1000
+        assert derive_joern_presweep_timeout_s(
+            300, 100 * _MIB, include_import=True,
+        ) == 3000
+
+
+class TestDerivedMaxPresweepTimeout:
+    def test_cap_is_the_derivations_upper_bound(self):
+        from core.tuning import (
+            derive_joern_presweep_timeout_s,
+            derived_max_joern_presweep_timeout_s,
+        )
+        huge = 4 * 1024**4
+        assert derived_max_joern_presweep_timeout_s(300) == (
+            derive_joern_presweep_timeout_s(300, huge)
+        )
+        assert derived_max_joern_presweep_timeout_s(
+            300, include_import=True,
+        ) == derive_joern_presweep_timeout_s(
+            300, huge, include_import=True,
+        )
+
+    def test_operator_budget_above_cap_stays_authoritative(self):
+        from core.tuning import derived_max_joern_presweep_timeout_s
+        assert derived_max_joern_presweep_timeout_s(90000) == 90000
+
+
+def test_standing_cost_ceiling_is_a_recognized_passthrough(tmp_path, caplog):
+    config = tmp_path / "tuning.json"
+    config.write_text(json.dumps({"default_max_cost_usd": 12.5}))
+    load_tuning(config)
+    assert 'unknown key "default_max_cost_usd"' not in caplog.text

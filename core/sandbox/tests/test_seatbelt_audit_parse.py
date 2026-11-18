@@ -3,7 +3,7 @@
 These tests exercise ``core.sandbox.seatbelt_audit.parse_log_entry``
 and the JSONL-append behaviour of ``LogStreamer._append_record``
 without spawning ``log stream``. The Darwin-only end-to-end log
-capture lives in test_macos_e2e.py.
+capture lives in test_macos_spawn.py.
 
 Sample entries are reproduced from spike #4 output (run on macOS
 26.4.1 arm64) so the regex and field expectations are anchored to
@@ -13,7 +13,11 @@ real kernel output, not invented.
 from __future__ import annotations
 
 import json
+import os
 
+from core.testing.module_bindings import patch_module_attribute
+
+from core.sandbox import evidence as evidence_mod
 from core.sandbox import seatbelt_audit
 from core.sandbox.seatbelt import SANDBOX_KEXT_SENDER
 
@@ -124,6 +128,105 @@ def test_parse_handles_path_with_spaces():
     assert rec["path"] == "/Users/Bob/Library/Application Support/x"
 
 
+def test_parse_repeat_count_verdict_shape():
+    """The kernel coalesces repeated events as `deny(N) <action>`.
+    Pre-fix the regex required a bare verdict and dropped these
+    records entirely."""
+    entry = _kext_entry(
+        msg="Sandbox: ls(99) deny(12) file-read-data /etc/passwd"
+    )
+    rec = seatbelt_audit.parse_log_entry(entry)
+    assert rec is not None
+    assert rec["verdict"] == "deny"
+    assert rec["syscall"] == "file-read-data"
+    assert rec["path"] == "/etc/passwd"
+    assert rec["target_pid"] == 99
+
+
+def test_parse_process_name_with_spaces():
+    """Process names with spaces are common on macOS (helper apps).
+    Pre-fix the \\S+ name arm failed the match."""
+    entry = _kext_entry(
+        msg="Sandbox: Google Chrome Helper(4242) deny file-read-data /x"
+    )
+    rec = seatbelt_audit.parse_log_entry(entry)
+    assert rec is not None
+    assert rec["process_name"] == "Google Chrome Helper"
+    assert rec["target_pid"] == 4242
+
+
+def test_parse_process_name_with_parens():
+    """Names containing parentheses must not confuse the PID capture —
+    the LAST `(digits)` before the verdict is the PID."""
+    entry = _kext_entry(
+        msg="Sandbox: Helper (Renderer)(77) allow(3) file-write-create /tmp/y"
+    )
+    rec = seatbelt_audit.parse_log_entry(entry)
+    assert rec is not None
+    assert rec["process_name"] == "Helper (Renderer)"
+    assert rec["target_pid"] == 77
+    assert rec["verdict"] == "allow"
+    assert rec["path"] == "/tmp/y"
+
+
+class _FakeLogProc:
+    """Stand-in for the `log stream` Popen: stdout is a plain list of
+    ndjson lines; terminate/wait are no-ops."""
+
+    def __init__(self, lines):
+        self.stdout = list(lines)
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_parse_ratio_diagnostic_on_high_drop(tmp_path, caplog):
+    """When most kext-sender lines fail to parse (format drift), stop()
+    must emit a 'parsed M of N' warning and stamp the counters on the
+    audit_summary record."""
+    import logging
+
+    good = json.dumps(_kext_entry(
+        msg="Sandbox: foo(1) deny file-read-data /etc/passwd"))
+    bad = json.dumps(_kext_entry(msg="Sandbox format drifted entirely"))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer._proc = _FakeLogProc([good] + [bad] * 19)
+    streamer._read_loop()
+    with caplog.at_level(logging.WARNING,
+                         logger="core.sandbox.seatbelt_audit"):
+        streamer.stop()
+    assert any("parsed 1 of 20 kext log lines" in rec.message
+               for rec in caplog.records)
+    lines = (tmp_path / evidence_mod.AUDIT_SUBDIR
+             / seatbelt_audit.DENIALS_FILE).read_text().splitlines()
+    summary = next(json.loads(line) for line in lines
+                   if json.loads(line).get("type") == "audit_summary")
+    assert summary["kext_lines_seen"] == 20
+    assert summary["kext_lines_parsed"] == 1
+
+
+def test_parse_ratio_no_diagnostic_when_healthy(tmp_path, caplog):
+    """A healthy parse ratio must NOT trip the drift warning."""
+    import logging
+
+    good = json.dumps(_kext_entry(
+        msg="Sandbox: foo(1) deny file-read-data /etc/passwd"))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer._proc = _FakeLogProc([good] * 20)
+    streamer._read_loop()
+    with caplog.at_level(logging.WARNING,
+                         logger="core.sandbox.seatbelt_audit"):
+        streamer.stop()
+    assert not any("kext log lines" in rec.message
+                   for rec in caplog.records)
+
+
 def test_parse_uses_entry_timestamp():
     """The kernel-supplied timestamp is preserved when present —
     important for ordering against host-side events. Falls back to
@@ -158,7 +261,8 @@ def test_log_streamer_appends_one_line_per_record(tmp_path):
     rec2 = {"b": 2}
     streamer._append_record(rec1)
     streamer._append_record(rec2)
-    path = tmp_path / seatbelt_audit.DENIALS_FILE
+    path = (tmp_path / evidence_mod.AUDIT_SUBDIR
+            / seatbelt_audit.DENIALS_FILE)
     assert path.exists()
     lines = path.read_text().splitlines()
     assert len(lines) == 2
@@ -174,7 +278,8 @@ def test_log_streamer_creates_run_dir(tmp_path):
     streamer = seatbelt_audit.LogStreamer(new_dir)
     streamer._append_record({"x": 1})
     assert new_dir.exists()
-    assert (new_dir / seatbelt_audit.DENIALS_FILE).exists()
+    assert (new_dir / evidence_mod.AUDIT_SUBDIR
+            / seatbelt_audit.DENIALS_FILE).exists()
 
 
 # --- LogStreamer ↔ AuditBudget integration ----------------------------
@@ -198,9 +303,10 @@ def test_log_streamer_uses_injected_budget_for_summary(tmp_path):
     # No proc started — stop() should still flush the summary.
     streamer.stop()
 
-    lines = (tmp_path / seatbelt_audit.DENIALS_FILE).read_text().splitlines()
-    summaries = [json.loads(l) for l in lines
-                  if json.loads(l).get("type") == "audit_summary"]
+    lines = (tmp_path / evidence_mod.AUDIT_SUBDIR
+             / seatbelt_audit.DENIALS_FILE).read_text().splitlines()
+    summaries = [json.loads(line) for line in lines
+                  if json.loads(line).get("type") == "audit_summary"]
     assert len(summaries) == 1
     s = summaries[0]
     assert s["total_records"] == 3
@@ -222,14 +328,261 @@ def test_log_streamer_default_budget_is_cli_aware(tmp_path):
         state._cli_sandbox_audit_budget = None
 
 
+def test_log_streamer_emits_global_cap_marker_once(tmp_path):
+    """When the GLOBAL cap fires, the streamer must append the
+    one-shot global_budget_exceeded marker in-band — pre-fix only the
+    Linux tracer polled the notice (stderr), so macOS global-cap
+    suppression was markerless."""
+    from core.sandbox import audit_budget
+    budget = audit_budget.AuditBudget(
+        global_cap=2,
+        pid_cap=1000,
+        category_caps={"file-write": 100},
+        refill_rates={"file-write": 0.0},
+        sampling_rates={},
+    )
+    streamer = seatbelt_audit.LogStreamer(tmp_path, budget=budget)
+    streamer._proc = _FakeLogProc([
+        json.dumps(_kext_entry(
+            msg=f"Sandbox: test(999) allow file-write-data /tmp/{i}"))
+        for i in range(6)
+    ])
+    streamer._read_loop()
+    streamer.stop()
+    records = [json.loads(line) for line in
+               (tmp_path / evidence_mod.AUDIT_SUBDIR
+                / seatbelt_audit.DENIALS_FILE)
+               .read_text().splitlines() if line.strip()]
+    markers = [r for r in records
+               if r.get("type") == "global_budget_exceeded"]
+    assert len(markers) == 1, f"records: {records!r}"
+    assert markers[0]["cap"] == 2
+    assert markers[0]["audit"] is True
+
+
+# --- LogStreamer PID scoping ------------------------------------------
+# `log stream` is a host-wide feed: every Sandbox.kext event on the
+# machine matches the sender predicate, including events from
+# unrelated or sibling sandboxed processes. The scoping layers below
+# keep foreign events out of this run's JSONL (and its nonce and
+# budget). Canned records; runs hermetically on Linux.
+
+def _scope_record(pid: int, *, action: str = "file-write-data",
+                  path: str = "/tmp/x", name: str = "proc") -> dict:
+    entry = _kext_entry(msg=f"Sandbox: {name}({pid}) deny {action} {path}")
+    return seatbelt_audit.parse_log_entry(entry)
+
+
+def _no_pgid(monkeypatch):
+    """Pin the exact-PID path: process-group AND session resolution
+    always fail, as they do for a PID that has already exited (or one
+    from a canned record that never existed on the test host)."""
+    def _raise(pid):
+        raise ProcessLookupError(pid)
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "getpgid", _raise)
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "getsid", _raise)
+
+
+def test_unscoped_streamer_accepts_any_pid(tmp_path):
+    """Back-compat: with no scope registered, attribution stays
+    host-wide (documented as unguaranteed in the class docstring)."""
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    assert streamer._record_in_scope(_scope_record(4444)) is True
+
+
+def test_own_pid_event_kept(tmp_path, monkeypatch):
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(1234)
+    assert streamer._record_in_scope(_scope_record(1234)) is True
+
+
+def test_foreign_pid_event_rejected(tmp_path, monkeypatch):
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(1234)
+    assert streamer._record_in_scope(_scope_record(4444)) is False
+
+
+def test_record_without_pid_rejected_when_scoped(tmp_path, monkeypatch):
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(1234)
+    rec = _scope_record(1234)
+    del rec["target_pid"]
+    assert streamer._record_in_scope(rec) is False
+
+
+def test_process_group_widens_scope(tmp_path, monkeypatch):
+    """Children the target forks carry other PIDs but share its
+    process group — the parse-time filter must keep them."""
+    pgids = {1234: 500, 777: 500, 999: 600}
+
+    def fake_getpgid(pid):
+        try:
+            return pgids[pid]
+        except KeyError:
+            raise ProcessLookupError(pid) from None
+
+    def _no_sid(pid):
+        raise ProcessLookupError(pid)
+
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "getpgid", fake_getpgid)
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "getsid", _no_sid)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(1234)
+    assert streamer._record_in_scope(_scope_record(777)) is True   # same pgid
+    assert streamer._record_in_scope(_scope_record(999)) is False  # other pgid
+    assert streamer._record_in_scope(_scope_record(31337)) is False  # gone
+
+
+def test_session_widens_scope(tmp_path, monkeypatch):
+    """The production caller registers the OUTER seatbelt shim, whose
+    sandbox-exec subtree runs in a DIFFERENT process group (the shim
+    forks it into its own group so it can killpg it) but the SAME
+    session. The parse-time filter must keep same-session events and
+    still reject foreign-session ones."""
+    pgids = {1234: 1234, 777: 777, 999: 999}
+    sids = {1234: 1234, 777: 1234, 999: 900}
+
+    def fake_getpgid(pid):
+        try:
+            return pgids[pid]
+        except KeyError:
+            raise ProcessLookupError(pid) from None
+
+    def fake_getsid(pid):
+        try:
+            return sids[pid]
+        except KeyError:
+            raise ProcessLookupError(pid) from None
+
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "getpgid", fake_getpgid)
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "getsid", fake_getsid)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(1234)
+    # Different pgid, same session — the shim-forked sandbox subtree.
+    assert streamer._record_in_scope(_scope_record(777)) is True
+    # Different pgid AND different session — a foreign run.
+    assert streamer._record_in_scope(_scope_record(999)) is False
+
+
+def test_session_widens_scope_real_processes(tmp_path):
+    """Same shape as above but against the real OS: a child moved
+    into its OWN process group (mirroring the shim's fork of
+    sandbox-exec) stays in our session and must remain in scope once
+    our own PID is registered."""
+    import subprocess
+    import sys
+
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(os.getpid())
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        preexec_fn=os.setpgrp,  # own pgrp, same session — shim analogue
+    )
+    try:
+        assert os.getpgid(child.pid) != os.getpgid(os.getpid())
+        assert streamer._record_in_scope(_scope_record(child.pid)) is True
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_require_scope_drops_records_before_registration(tmp_path):
+    """require_scope=True: nothing may be attributed to this run
+    until the caller registers its child — the streamer-start-to-
+    registration window must not stamp foreign host events."""
+    streamer = seatbelt_audit.LogStreamer(
+        tmp_path, require_scope=True, lineage_poll_interval=0,
+    )
+    assert streamer._record_in_scope(_scope_record(4444)) is False
+
+
+def test_require_scope_accepts_registered_pid(tmp_path, monkeypatch):
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(
+        tmp_path, require_scope=True, lineage_poll_interval=0,
+    )
+    streamer.register_target_pid(1234)
+    assert streamer._lineage_poller is None
+    assert streamer._record_in_scope(_scope_record(1234)) is True
+    assert streamer._record_in_scope(_scope_record(4444)) is False
+
+
+def test_read_loop_drops_foreign_pid_records(tmp_path, monkeypatch):
+    """End-to-end through _read_loop with a canned log-stream feed:
+    the foreign-PID event must never be nonce-stamped into this
+    run's JSONL; the own-PID event must land."""
+    import types
+
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(
+        tmp_path, observe_mode=True, observe_nonce="nonce-own-run",
+    )
+    streamer.register_target_pid(1234)
+    own = _kext_entry(
+        msg="Sandbox: mine(1234) deny file-write-data /tmp/mine",
+    )
+    foreign = _kext_entry(
+        msg="Sandbox: other(4444) deny file-write-data /tmp/theirs",
+    )
+    streamer._proc = types.SimpleNamespace(
+        stdout=[json.dumps(own) + "\n", json.dumps(foreign) + "\n"],
+    )
+    streamer._read_loop()
+
+    lines = (tmp_path / evidence_mod.AUDIT_SUBDIR
+             / seatbelt_audit.OBSERVE_FILE).read_text().splitlines()
+    records = [json.loads(line) for line in lines]
+    assert len(records) == 1
+    assert records[0]["target_pid"] == 1234
+    assert records[0]["path"] == "/tmp/mine"
+    assert records[0]["nonce"] == "nonce-own-run"
+
+
+def test_predicate_default_is_sender_scoped_only(tmp_path):
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    predicate = streamer._build_predicate()
+    assert SANDBOX_KEXT_SENDER in predicate
+    assert "eventMessage" not in predicate
+
+
+def test_predicate_pid_scoped_when_target_pid_known(tmp_path):
+    streamer = seatbelt_audit.LogStreamer(tmp_path, target_pid=4242)
+    predicate = streamer._build_predicate()
+    assert SANDBOX_KEXT_SENDER in predicate
+    assert 'eventMessage CONTAINS "(4242) "' in predicate
+
+
+def test_constructor_target_pid_also_registers_parse_scope(tmp_path,
+                                                           monkeypatch):
+    """Defence in depth: a construction-time target_pid engages the
+    parse-time filter too, not just the predicate."""
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path, target_pid=4242)
+    assert streamer._record_in_scope(_scope_record(4242)) is True
+    assert streamer._record_in_scope(_scope_record(4444)) is False
+
+
+def test_start_log_streamer_threads_target_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(seatbelt_audit.LogStreamer, "start",
+                        lambda self: None)
+    streamer = seatbelt_audit.start_log_streamer(tmp_path, target_pid=99)
+    assert streamer._target_pid == 99
+
+
 def test_log_streamer_o_nofollow_blocks_symlink(tmp_path):
-    """Defence in depth: a sandboxed child with write access to
-    run_dir could pre-plant DENIALS_FILE as a symlink to a host
-    file. O_NOFOLLOW must reject the open with ELOOP rather than
-    follow the link and append to the host file."""
+    """Defence in depth: an attacker with write access to the
+    evidence dir could pre-plant DENIALS_FILE as a symlink to a host
+    file. The evidence open (O_EXCL create → O_NOFOLLOW append
+    fallback) must reject it with ELOOP rather than follow the link
+    and append to the host file."""
     target = tmp_path / "target"
     target.write_text("")
-    link = tmp_path / seatbelt_audit.DENIALS_FILE
+    evdir = tmp_path / evidence_mod.AUDIT_SUBDIR
+    evdir.mkdir(mode=0o700)
+    link = evdir / seatbelt_audit.DENIALS_FILE
     link.symlink_to(target)
     streamer = seatbelt_audit.LogStreamer(tmp_path)
     try:
@@ -242,3 +595,378 @@ def test_log_streamer_o_nofollow_blocks_symlink(tmp_path):
         assert e.errno in (40, 62), f"unexpected errno {e.errno}"
     # The symlink target must remain empty (no leak).
     assert target.read_text() == ""
+
+
+# --- Live stderr escalation: credential-path touches -------------------
+# _maybe_escalate_credential_path is pulled out of _read_loop precisely
+# so it's testable against a synthetic record without a real `log
+# stream` subprocess. See core.sandbox.tracer's mirror-image escalation
+# for escape-primitive syscalls (Linux-only, tested in
+# test_tracer_event_loop.py).
+
+def test_credential_path_touch_escalates_once(tmp_path, monkeypatch):
+    writes = []
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", lambda fd, data: writes.append((fd, data)))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    record = {"type": "read", "path": "/Users/x/.ssh/id_rsa",
+              "target_pid": 4242}
+
+    streamer._maybe_escalate_credential_path(record)
+    assert len(writes) == 1
+    assert writes[0][0] == 2
+    assert b".ssh/id_rsa" in writes[0][1]
+
+    # Same path again this run: no second banner.
+    streamer._maybe_escalate_credential_path(record)
+    assert len(writes) == 1, "dedup: one banner per path per run"
+
+
+def test_non_credential_path_does_not_escalate(tmp_path, monkeypatch):
+    writes = []
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", lambda fd, data: writes.append((fd, data)))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    record = {"type": "read", "path": "/tmp/ordinary-file.txt",
+              "target_pid": 4242}
+    streamer._maybe_escalate_credential_path(record)
+    assert writes == []
+
+
+def test_credential_path_escalation_ignores_non_read_write_types(
+        tmp_path, monkeypatch):
+    writes = []
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", lambda fd, data: writes.append((fd, data)))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    # "seccomp" bucket (mach-lookup, process-*, etc.) never carries the
+    # same "did the target actually see file content" implication a
+    # read/write does — see seatbelt_audit.py's comment on why no
+    # macOS escape-primitive-syscall equivalent is fabricated.
+    record = {"type": "seccomp", "path": "/Users/x/.ssh/id_rsa",
+              "target_pid": 4242}
+    streamer._maybe_escalate_credential_path(record)
+    assert writes == []
+
+
+def test_credential_path_escalation_disabled_by_env_var(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RAPTOR_SANDBOX_LIVE_ESCALATION_DISABLED", "1")
+    writes = []
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", lambda fd, data: writes.append((fd, data)))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    record = {"type": "write", "path": "/Users/x/.aws/credentials",
+              "target_pid": 4242}
+    streamer._maybe_escalate_credential_path(record)
+    assert writes == []
+
+
+def test_credential_path_escalation_survives_stderr_write_failure(
+        tmp_path, monkeypatch):
+    def raising_write(fd, data):
+        raise OSError("stderr closed")
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", raising_write)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    record = {"type": "write", "path": "/Users/x/.netrc",
+              "target_pid": 4242}
+    # Must not raise — mirrors tracer.py's
+    # test_escalation_never_raises_out_of_hot_path.
+    streamer._maybe_escalate_credential_path(record)
+    assert record["path"] in streamer._escalated_paths
+
+
+def test_credential_path_banner_sanitises_control_chars(
+        tmp_path, monkeypatch):
+    writes = []
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", lambda fd, data: writes.append((fd, data)))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    # The path is attacker-controlled (the target chose what to touch);
+    # ESC/BEL are ASCII so ascii/replace encoding alone keeps them.
+    record = {"type": "read",
+              "path": "/Users/x/.ssh/\x1b]0;pwned\x07id_rsa",
+              "target_pid": 4242}
+    streamer._maybe_escalate_credential_path(record)
+    assert len(writes) == 1
+    assert b"\x1b" not in writes[0][1]
+    assert b"\x07" not in writes[0][1]
+    assert b"\\x1b" in writes[0][1]
+
+
+def test_credential_banner_lane_is_capped_with_one_shot_notice(
+        tmp_path, monkeypatch):
+    """The banner dedup key is the PATH — attacker-minted (the target
+    chose what to touch, and budget-exempt parse_ambiguous records
+    reach the escalation in-scope) — so "one banner per distinct
+    path" alone is no bound at all. The set is capped at the shared
+    cross-platform _CRED_KEEP_MAX_PATHS with a one-shot exhaustion
+    notice, mirroring the Linux tracer's banner lane."""
+    banners = []
+    monkeypatch.setattr(
+        seatbelt_audit, "_announce_credential_path_touch",
+        lambda path, pid: banners.append(path))
+    notices = []
+    monkeypatch.setattr(
+        seatbelt_audit, "_announce_credential_banner_capped",
+        lambda: notices.append(True))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    cap = seatbelt_audit._CRED_KEEP_MAX_PATHS
+    for i in range(cap + 50):
+        streamer._maybe_escalate_credential_path({
+            "type": "read",
+            "path": f"/Users/x/.aws/credentials_{i:05d}",
+            "target_pid": 123,
+        })
+    assert len(banners) == cap
+    assert len(streamer._escalated_paths) == cap
+    assert len(notices) == 1, "exhaustion must be announced exactly once"
+
+
+def test_ambiguous_counter_counts_a_buffered_record_once(tmp_path):
+    """One pre-registration ambiguous record must count ONCE in
+    parse_ambiguous_records: it is evaluated twice through
+    _filter_and_append (reader pass buffers it; register_target_pid's
+    parent-thread flush re-enters), and counting before the pending
+    gate double-counted it — inflating the operator-facing tamper
+    diagnostic a forensic reader compares against the JSONL's flagged
+    rows, and double-firing the one-shot spoofing warning."""
+    streamer = seatbelt_audit.LogStreamer(
+        tmp_path, require_scope=True, lineage_poll_interval=0,
+    )
+    import os as _os
+    rec = {"path": "/tmp/x", "type": "read",
+           "target_pid": _os.getpid(), "parse_ambiguous": True}
+    streamer._filter_and_append(rec)  # pre-registration: buffered
+    assert streamer._ambiguous_records == 0, (
+        "a buffered (not yet evaluated) record must not be counted")
+    assert len(streamer._pending) == 1
+    streamer.register_target_pid(_os.getpid())  # parent-thread flush
+    assert streamer._lineage_poller is None
+    assert streamer._ambiguous_records == 1, (
+        "one record, one count — the flush re-entry double-counted")
+    assert streamer._ambiguous_admitted == 1
+
+
+def test_credential_banner_cap_matches_linux_tracer(tmp_path):
+    """Both platforms' banner lanes carry the SAME cap — the constant
+    is imported, not copied, so they cannot drift apart silently."""
+    from core.sandbox import tracer
+    assert (seatbelt_audit._CRED_KEEP_MAX_PATHS
+            is tracer._CRED_KEEP_MAX_PATHS)
+
+
+def test_credential_path_escalation_tolerates_missing_target_pid(
+        tmp_path, monkeypatch):
+    writes = []
+    patch_module_attribute(monkeypatch, seatbelt_audit, "os", "write", lambda fd, data: writes.append((fd, data)))
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    # never-raise-out-of-the-hot-path: a record shape without
+    # target_pid must not KeyError the read loop.
+    record = {"type": "read", "path": "/Users/x/.ssh/id_rsa"}
+    streamer._maybe_escalate_credential_path(record)
+    assert len(writes) == 1
+    assert b"pid=-1" in writes[0][1]
+
+
+# ---------------------------------------------------------------
+# PID-field anchoring (parse_ambiguous contract — see _LOG_LINE_RE).
+# The kext line grammar is ambiguous: the process name (target-chosen
+# p_comm) and the path are both attacker-influenced and either can
+# embed the "(digits) <verdict> <token>" shape. These are pure-parser
+# tests and run on every platform.
+
+_SPOOF_NAME_MSG = (
+    "Sandbox: a(1) deny b(4242) deny file-write-create "
+    "/Users/op/.ssh/id_rsa"
+)
+_SPOOF_PATH_MSG = (
+    "Sandbox: sh(4242) deny file-write-create /tmp/x(1) deny y z"
+)
+
+
+def test_parse_name_embedded_shape_flags_ambiguous():
+    """A process name embedding "(digits) deny <token>" must not be
+    silently attributed to the embedded PID: the real PID (4242) must
+    stay visible and the record must carry the tamper flag."""
+    rec = seatbelt_audit.parse_log_entry(_kext_entry(msg=_SPOOF_NAME_MSG))
+    assert rec is not None
+    assert rec["parse_ambiguous"] is True
+    pids = {rec["target_pid"], rec["alt_parse"]["target_pid"]}
+    assert 4242 in pids, "real PID discarded — spoof succeeded"
+    # The greedy arm carries the real parse for this shape.
+    assert rec["alt_parse"]["syscall"] == "file-write-create"
+    assert rec["alt_parse"]["path"] == "/Users/op/.ssh/id_rsa"
+
+
+def test_parse_path_embedded_shape_flags_ambiguous():
+    """The mirror shape: a PATH embedding the "(digits) deny <token>"
+    grammar is equally unanchorable and must be flagged, with the
+    lazy arm (the real parse for this shape) preserved."""
+    rec = seatbelt_audit.parse_log_entry(_kext_entry(msg=_SPOOF_PATH_MSG))
+    assert rec is not None
+    assert rec["parse_ambiguous"] is True
+    assert rec["target_pid"] == 4242
+    assert rec["syscall"] == "file-write-create"
+
+
+def test_parse_ambiguous_verdict_is_condemn_direction():
+    """A name embedding "allow" must not launder a real deny into an
+    allow-report: if either arm read deny, the record counts deny."""
+    rec = seatbelt_audit.parse_log_entry(_kext_entry(
+        msg="Sandbox: a(1) allow b(4242) deny file-read-data /etc/hosts"))
+    assert rec is not None
+    assert rec["parse_ambiguous"] is True
+    assert rec["verdict"] == "deny"
+
+
+def test_parse_unambiguous_lines_carry_no_flag():
+    """The canonical shapes (plain, spaces, non-digit parens,
+    repeat-count verdicts) parse identically in both arms and must
+    not be flagged."""
+    for msg in (
+        "Sandbox: Python(12345) allow file-write-create /private/tmp/x",
+        "Sandbox: Google Chrome Helper(4242) deny file-read-data /x",
+        "Sandbox: Helper (Renderer)(77) allow(3) file-write-create /tmp/y",
+        "Sandbox: mdworker(4242) deny(12) file-read-data /x",
+    ):
+        rec = seatbelt_audit.parse_log_entry(_kext_entry(msg=msg))
+        assert rec is not None, msg
+        assert "parse_ambiguous" not in rec, msg
+        assert "alt_parse" not in rec, msg
+
+
+def test_ambiguous_record_is_in_scope_suspect(tmp_path, monkeypatch):
+    """The scope gate must not silently drop an ambiguous record as
+    foreign: pre-fix, a name-spoofed record parsed with the attacker-
+    chosen PID, failed the scope check, and vanished before the nonce
+    stamp, the budget, the JSONL append and the credential-path
+    escalation — invisible except as a foreign_records_dropped bump."""
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(4242)
+    rec = seatbelt_audit.parse_log_entry(_kext_entry(msg=_SPOOF_NAME_MSG))
+    assert rec["parse_ambiguous"] is True
+    assert streamer._record_in_scope(rec) is True
+    # Control: an unambiguous foreign record still drops.
+    assert streamer._record_in_scope(_scope_record(1)) is False
+
+
+def test_ambiguous_record_appended_and_counted(tmp_path, monkeypatch):
+    """End-to-end through _filter_and_append: the flagged record lands
+    in the JSONL (nonce-stamp path preserved), the tamper counter
+    feeds the summary, and the credential path in the ALTERNATE parse
+    still triggers the stderr escalation."""
+    announced = []
+    monkeypatch.setattr(
+        seatbelt_audit, "_announce_credential_path_touch",
+        lambda path, pid: announced.append((path, pid)))
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(
+        tmp_path, require_scope=True, lineage_poll_interval=0,
+    )
+    streamer.register_target_pid(4242)
+    assert streamer._lineage_poller is None
+    rec = seatbelt_audit.parse_log_entry(_kext_entry(msg=_SPOOF_NAME_MSG))
+    streamer._filter_and_append(rec)
+    jsonl = evidence_mod.resolve_read_path(
+        tmp_path, seatbelt_audit.DENIALS_FILE)
+    lines = [json.loads(x) for x in
+             jsonl.read_text().splitlines() if x.strip()]
+    flagged = [r for r in lines if r.get("parse_ambiguous")]
+    assert len(flagged) == 1
+    assert flagged[0]["alt_parse"]["target_pid"] == 4242
+    assert streamer._ambiguous_records == 1
+    # Credential escalation fired on the alternate parse's path.
+    assert any(".ssh/id_rsa" in path for path, _ in announced)
+
+
+def _read_jsonl(tmp_path) -> list[dict]:
+    jsonl = evidence_mod.resolve_read_path(
+        tmp_path, seatbelt_audit.DENIALS_FILE)
+    return [json.loads(x) for x in
+            jsonl.read_text().splitlines() if x.strip()]
+
+
+def test_ambiguous_flood_does_not_displace_real_denials(
+        tmp_path, monkeypatch):
+    """Budget EXEMPTION for parse_ambiguous records: any same-host
+    sandboxed process can mint the ambiguous line shape at will, so
+    letting flagged records ride the shared audit budget handed it
+    displacement power — a flood consumed the run's budget and later
+    REAL denial records were dropped. The flood must not cost the
+    real records anything."""
+    _no_pgid(monkeypatch)
+    from core.sandbox import audit_budget
+    budget = audit_budget.AuditBudget(
+        global_cap=8,
+        pid_cap=1000,
+        category_caps={"file-write": 100},
+        refill_rates={"file-write": 0.0},
+        sampling_rates={},
+    )
+    streamer = seatbelt_audit.LogStreamer(tmp_path, budget=budget)
+    streamer.register_target_pid(4242)
+    # Flood well past the global budget cap with mintable ambiguous
+    # records...
+    for _ in range(20):
+        rec = seatbelt_audit.parse_log_entry(
+            _kext_entry(msg=_SPOOF_NAME_MSG))
+        streamer._filter_and_append(rec)
+    # ...then deliver a genuine deny. It must still land.
+    real = seatbelt_audit.parse_log_entry(_kext_entry(
+        msg="Sandbox: sh(4242) deny file-write-data /tmp/real-denial"))
+    streamer._filter_and_append(real)
+    lines = _read_jsonl(tmp_path)
+    assert any(r.get("path") == "/tmp/real-denial" for r in lines), (
+        "ambiguous flood displaced a real denial out of the JSONL")
+    assert not any(r.get("type") == "global_budget_exceeded"
+                   for r in lines), (
+        "ambiguous records consumed the shared budget")
+
+
+def test_ambiguous_admission_cap_bounds_flood(tmp_path, monkeypatch):
+    """The dedicated cap (_AMBIGUOUS_ADMIT_MAX) bounds the flood's
+    disk amplification: past the cap, flagged records stop being
+    appended but stay counted — one in-band marker announces the
+    suppression and the summary carries total and dropped counts."""
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(4242)
+    cap = seatbelt_audit._AMBIGUOUS_ADMIT_MAX
+    total = cap + 10
+    for _ in range(total):
+        rec = seatbelt_audit.parse_log_entry(
+            _kext_entry(msg=_SPOOF_NAME_MSG))
+        streamer._filter_and_append(rec)
+    streamer.stop()
+    lines = _read_jsonl(tmp_path)
+    flagged = [r for r in lines if r.get("parse_ambiguous")]
+    assert len(flagged) == cap
+    markers = [r for r in lines
+               if r.get("type") == "parse_ambiguous_cap_exceeded"]
+    assert len(markers) == 1, "cap suppression must be marked exactly once"
+    assert markers[0]["cap"] == cap
+    summary = next(r for r in lines if r.get("type") == "audit_summary")
+    assert summary["parse_ambiguous_records"] == total
+    assert summary["parse_ambiguous_records_dropped"] == 10
+
+
+def test_ambiguous_below_cap_all_admitted_no_marker(
+        tmp_path, monkeypatch):
+    """Two-direction cap regression: below the cap every flagged
+    record is appended, no suppression marker appears, and the
+    summary carries no dropped count — a legitimate ambiguity burst
+    loses nothing."""
+    _no_pgid(monkeypatch)
+    streamer = seatbelt_audit.LogStreamer(tmp_path)
+    streamer.register_target_pid(4242)
+    below = seatbelt_audit._AMBIGUOUS_ADMIT_MAX - 1
+    for _ in range(below):
+        rec = seatbelt_audit.parse_log_entry(
+            _kext_entry(msg=_SPOOF_NAME_MSG))
+        streamer._filter_and_append(rec)
+    streamer.stop()
+    lines = _read_jsonl(tmp_path)
+    flagged = [r for r in lines if r.get("parse_ambiguous")]
+    assert len(flagged) == below
+    assert not any(r.get("type") == "parse_ambiguous_cap_exceeded"
+                   for r in lines)
+    summary = next(r for r in lines if r.get("type") == "audit_summary")
+    assert summary["parse_ambiguous_records"] == below
+    assert "parse_ambiguous_records_dropped" not in summary

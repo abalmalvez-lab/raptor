@@ -8,7 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from core.dataflow import Finding, Step
 from core.dataflow.validator import Validator, ValidatorVerdict
@@ -127,6 +128,38 @@ def test_constructor_accepts_injected_llm_client():
     assert v._injected_llm_client is mock_llm
 
 
+
+def test_falsey_injected_client_is_used_for_lazy_initialization(monkeypatch):
+    client = MagicMock()
+    client.__bool__.return_value = False
+    default_factory = MagicMock(side_effect=AssertionError("unexpected default client"))
+    collector = MagicMock(return_value=object())
+    validator_factory = MagicMock(return_value=object())
+    monkeypatch.setattr(
+        "packages.codeql.evidence_validator._construct_default_llm_client",
+        default_factory,
+    )
+    monkeypatch.setattr(
+        "packages.codeql.evidence_validator.make_evidence_collector", collector
+    )
+    monkeypatch.setattr(
+        "packages.codeql.evidence_validator.DataflowValidator", validator_factory
+    )
+    cache = {}
+    adapter = CodeQLEvidenceValidator(llm_client=client, cache=cache)
+
+    result = adapter._get_dataflow_validator()
+
+    default_factory.assert_not_called()
+    collector.assert_called_once_with(client, cache=cache)
+    validator_factory.assert_called_once_with(
+        client, evidence_collector=collector.return_value
+    )
+    assert result is validator_factory.return_value
+    assert adapter._get_dataflow_validator() is result
+    validator_factory.assert_called_once()
+
+
 def test_constructor_accepts_injected_repo_root(tmp_path: Path):
     v = CodeQLEvidenceValidator(repo_root=tmp_path)
     assert v._repo_root == tmp_path
@@ -194,6 +227,36 @@ def test_validate_maps_is_exploitable_false_to_not_exploitable():
     mock_dv.validate_dataflow_path.return_value = _validation(is_exploitable=False)
     v._validator = mock_dv
     assert v.validate(_finding()) == ValidatorVerdict.NOT_EXPLOITABLE
+
+
+def test_validate_maps_abstained_none_to_uncertain():
+    """A model-emitted literal null lands as None on the dataclass
+    despite the bool annotation (dict-splat construction) — an
+    abstention, not a "not exploitable" ruling. A falsy read counted
+    it as a confident negative in the corpus precision/recall
+    metrics."""
+    v = CodeQLEvidenceValidator()
+    mock_dv = MagicMock()
+    mock_dv.validate_dataflow_path.return_value = _validation(
+        is_exploitable=None,
+    )
+    v._validator = mock_dv
+    assert v.validate(_finding()) == ValidatorVerdict.UNCERTAIN
+
+
+def test_validate_maps_error_state_result_to_uncertain():
+    """validate_dataflow_path returns LLM/transport failures WITHOUT
+    raising: ``error`` is set and ``is_exploitable=False`` is a default,
+    not a verdict (the DataflowValidation no-evidential-weight
+    contract). Such results must map to UNCERTAIN, never to a
+    confident NOT_EXPLOITABLE."""
+    v = CodeQLEvidenceValidator()
+    mock_dv = MagicMock()
+    errored = _validation(is_exploitable=False)
+    errored.error = "transport down"
+    mock_dv.validate_dataflow_path.return_value = errored
+    v._validator = mock_dv
+    assert v.validate(_finding()) == ValidatorVerdict.UNCERTAIN
 
 
 def test_validate_returns_uncertain_on_dataflow_validator_exception():

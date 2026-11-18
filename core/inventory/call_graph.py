@@ -40,26 +40,103 @@ finer granularity buys nothing.
 Pure-AST. We never import / require / eval the target, never look
 at any filesystem outside the source tree. String-shape only.
 
-Languages today: Python (stdlib ``ast``) + JavaScript /
-TypeScript + Go + Java (all tree-sitter-driven for non-Python;
-gracefully empty when the grammar isn't installed). The resolver
-in :mod:`core.inventory.reachability` is language-agnostic.
+Languages today: Python (stdlib ``ast``) plus thirteen
+tree-sitter-driven extractors (JS/TS, Go, Java, Rust, Ruby, C#,
+PHP, C, C++, Lua, Scala, Kotlin, Swift — each gracefully empty
+when its grammar isn't installed). The resolver in
+:mod:`core.analysis.reachability` is language-agnostic.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
+import io
 import logging
+from collections import defaultdict
+import sys
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from tree_sitter import Node
+
+from core.inventory import _ts_cache
+from core.source import read_bytes_capped
 
 logger = logging.getLogger(__name__)
+
+
+# Grammar-import and Parser caching live in core.inventory._ts_cache,
+# SHARED with extractors.py (one failure-caching importer — see that
+# module for the fork-pool deadlock rationale — and one per-thread
+# Parser cache with disjoint key spaces). The thin wrappers below are
+# this module's stable call/monkeypatch seams.
+
+
+def _import_grammar(module_name: str):
+    """Import a tree-sitter grammar module, caching success AND
+    failure (shared cache — core.inventory._ts_cache.import_grammar).
+    Returns the module or ``None`` when not installed."""
+    return _ts_cache.import_grammar(module_name)
+
+
+def _get_ts_parser(language_fn: Any) -> Any:
+    """Return a per-thread cached tree-sitter Parser for *language_fn*
+    (shared cache, keyed by grammar-function identity — ints, so it
+    cannot collide with extractors' language-name keys).
+
+    Raises ``ImportError`` if ``tree_sitter`` itself isn't installed.
+    """
+    def _make_language() -> Any:
+        from tree_sitter import Language
+        return Language(language_fn())
+
+    return _ts_cache.cached_parser(id(language_fn), _make_language)
+
+
+def _ts_tree(content: str, grammar_module: str, label: str,
+             pre_parsed: Any = None) -> Any:
+    """Return a tree-sitter Tree for *content*, or ``None``.
+
+    ``pre_parsed`` is a tree the caller already holds for this exact
+    text, parsed with the grammar ``grammar_module`` provides — the
+    inventory builder threads the tree from ``extract_items`` through
+    so each file is tree-sitter-parsed once per build instead of once
+    by the extractors and again here (the walkers only read
+    ``root_node``, so a tree from either module's Parser is
+    interchangeable). When ``pre_parsed`` is ``None`` the grammar is
+    imported and the text parsed here; ``None`` comes back when the
+    grammar isn't installed or the parse fails (callers degrade to an
+    empty :class:`FileCallGraph`).
+    """
+    if pre_parsed is not None:
+        return pre_parsed
+    mod = _import_grammar(grammar_module)
+    if mod is None:
+        return None
+    try:
+        parser = _get_ts_parser(mod.language)
+        return parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception as e:                          # noqa: BLE001
+        logger.debug("call_graph: %s parse failed (%s)", label, e)
+        return None
 
 
 # Indirection-flag values. Strings (not enum) so they round-trip
 # through JSON cleanly without a from_dict shim.
 INDIRECTION_GETATTR = "getattr"
+# Distinct from ``getattr``: the second argument is NOT a string Constant,
+# so the resolver can't narrow to a specific tail name. This is the truly
+# opaque case and earns blanket masking for any target name in the file's
+# reverse closure. ``getattr`` (with a literal-string arg) populates
+# ``getattr_targets`` and the resolver only taints THAT specific name —
+# unrelated targets in the same file aren't tainted.
+INDIRECTION_GETATTR_OPAQUE = "getattr_opaque"
 INDIRECTION_IMPORTLIB = "importlib"
 INDIRECTION_WILDCARD_IMPORT = "wildcard_import"
 INDIRECTION_DUNDER_IMPORT = "dunder_import"     # __import__("x.y")
@@ -67,11 +144,218 @@ INDIRECTION_DUNDER_IMPORT = "dunder_import"     # __import__("x.y")
 # treats them the same as the Python flags: any present →
 # UNCERTAIN for queries against names this file mentions.
 INDIRECTION_DYNAMIC_IMPORT = "dynamic_import"   # JS import(<var>) / require(<var>)
-INDIRECTION_BRACKET_DISPATCH = "bracket_dispatch"  # JS obj[<var>](...)
+
+# Cap on harvested value chains per module-scope dispatch-table dict
+# literal. Higher captures machine-generated mega-registries exactly
+# but lets one hostile file inflate every inventory record (and every
+# downstream graph's fan-out) with tens of thousands of chains; lower
+# keeps records small but silently drops real handlers from big
+# hand-written tables, losing edges a graph consumer could have
+# originated from. 64 covers every hand-written table observed in
+# real projects; a table that overflows keeps its first 64 values —
+# still an over-approximation SOURCE, never absence evidence.
+_DISPATCH_TABLE_VALUE_CAP = 64
+INDIRECTION_BRACKET_DISPATCH = "bracket_dispatch"  # JS obj[<var>](...) / Py HANDLERS[k]()
 INDIRECTION_EVAL = "eval"                        # JS eval / new Function
 
+# --- argument-fact caps ----------------------------------------------------
+# Bounds on the literal-argument facts harvested per call expression
+# (decorator calls, module-scope constructor assignments, and
+# string+ref-shaped call sites). Each cap trades fact completeness on
+# generated / hostile code against inventory size on every file.
 
-@dataclass
+# Longest literal string recorded as an argument fact. Higher keeps
+# giant hand-written patterns (very long regex URL patterns) usable
+# by consumers; lower stops one embedded blob (a base64 constant
+# passed positionally) from inflating every record it appears in.
+# Over-cap literals are treated as NON-literal — the consumer sees an
+# argument position with no usable literal and degrades exactly as it
+# does for a computed value.
+_ARG_STRING_CAP = 1024
+
+# Positional / keyword argument positions examined per call. Higher
+# covers machine-generated mega-signatures; lower bounds per-call
+# work and record size. Real registration APIs take < 10 arguments.
+_ARG_POSITIONAL_CAP = 32
+_ARG_KEYWORD_CAP = 32
+
+# Elements recorded from a list/tuple keyword literal (e.g.
+# ``methods=["GET", "POST"]``). Higher keeps huge literal lists
+# whole; lower keeps one generated list from dominating the record.
+# The first N are kept — an over-approximation SOURCE for consumers,
+# never absence evidence.
+_ARG_LIST_CAP = 16
+
+# Module-scope constructor assignments recorded per file. Higher
+# keeps every object of a machine-generated module; lower stops a
+# hostile file from minting thousands of records. Real modules bind
+# a handful of framework objects. First N kept; later assignments to
+# an ALREADY-recorded name still overwrite (runtime order).
+_CONSTRUCTED_OBJECT_CAP = 256
+
+# String+ref call sites recorded per file. Higher keeps every
+# registration of a giant generated URL table in one file; lower
+# bounds record growth on log-heavy files (a literal message plus an
+# identifier argument matches the shape too). 2000 covers the
+# largest hand-written URL modules observed; the first N are kept —
+# an over-approximation SOURCE for consumers, never absence evidence.
+_STRING_REF_CALL_CAP = 2000
+
+
+@dataclass(slots=True)
+class CallArgumentFacts:
+    """Literal / reference argument facts for ONE call expression.
+
+    Captures only what a static consumer can act on: literal string
+    arguments (by position or keyword), literal string-list keywords,
+    and name/attribute-chain arguments (function references). A
+    position present in ``arg_count`` but absent from every fact list
+    was something else — a computed value, a non-string literal, a
+    lambda — and consumers must treat it as dynamic.
+
+      * ``arg_count`` — total positional argument count (including
+        unrecorded ones), so "position 0 has no literal" is
+        distinguishable from "there was no argument".
+      * ``string_args`` — ``(position, literal)`` for positional
+        string constants.
+      * ``ref_args`` — ``(position, chain)`` for positional
+        name/attribute chains (``views.detail`` → ``["views",
+        "detail"]``).
+      * ``call_ref_args`` — ``(position, chain)`` for positional
+        CALL arguments whose callee has a chain
+        (``views.MyView.as_view()`` → ``["views", "MyView",
+        "as_view"]``).
+      * ``kw_strings`` / ``kw_string_lists`` / ``kw_refs`` /
+        ``kw_call_refs`` — the keyword-argument counterparts
+        (``methods=["GET"]`` → ``kw_string_lists``;
+        ``view_func=handler`` → ``kw_refs``;
+        ``view_func=V.as_view()`` → ``kw_call_refs``).
+
+    All strings and containers are bounded by the ``_ARG_*`` caps
+    above.
+    """
+    arg_count: int = 0
+    string_args: list[tuple[int, str]] = field(default_factory=list)
+    ref_args: list[tuple[int, list[str]]] = field(default_factory=list)
+    call_ref_args: list[tuple[int, list[str]]] = field(default_factory=list)
+    kw_strings: dict[str, str] = field(default_factory=dict)
+    kw_string_lists: dict[str, list[str]] = field(default_factory=dict)
+    kw_refs: dict[str, list[str]] = field(default_factory=dict)
+    kw_call_refs: dict[str, list[str]] = field(default_factory=dict)
+
+    def has_ref(self) -> bool:
+        """True when any argument is function-reference shaped."""
+        return bool(self.ref_args or self.call_ref_args
+                    or self.kw_refs or self.kw_call_refs)
+
+    def to_dict(self) -> dict:
+        """Serialise, omitting empty fact lists (most calls have a
+        couple of facts at most; empty keys would dominate)."""
+        out: dict = {"arg_count": self.arg_count}
+        if self.string_args:
+            out["string_args"] = [[p, s] for p, s in self.string_args]
+        if self.ref_args:
+            out["ref_args"] = [[p, list(ch)] for p, ch in self.ref_args]
+        if self.call_ref_args:
+            out["call_ref_args"] = [
+                [p, list(ch)] for p, ch in self.call_ref_args
+            ]
+        if self.kw_strings:
+            out["kw_strings"] = dict(self.kw_strings)
+        if self.kw_string_lists:
+            out["kw_string_lists"] = {
+                k: list(v) for k, v in self.kw_string_lists.items()
+            }
+        if self.kw_refs:
+            out["kw_refs"] = {k: list(v) for k, v in self.kw_refs.items()}
+        if self.kw_call_refs:
+            out["kw_call_refs"] = {
+                k: list(v) for k, v in self.kw_call_refs.items()
+            }
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CallArgumentFacts:
+        def _pos_pairs(value: object) -> list[tuple[int, str]]:
+            return [
+                (int(e[0] or 0), str(e[1]))
+                for e in (value if isinstance(value, list) else [])
+                if isinstance(e, (list, tuple)) and len(e) >= 2
+            ]
+
+        def _pos_chains(value: object) -> list[tuple[int, list[str]]]:
+            return [
+                (int(e[0] or 0), [str(p) for p in e[1]])
+                for e in (value if isinstance(value, list) else [])
+                if isinstance(e, (list, tuple)) and len(e) >= 2
+                and isinstance(e[1], (list, tuple))
+            ]
+
+        def _str_map(value: object) -> dict[str, str]:
+            if not isinstance(value, dict):
+                return {}
+            return {str(k): str(v) for k, v in value.items()}
+
+        def _chain_map(value: object) -> dict[str, list[str]]:
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(k): [str(p) for p in v]
+                for k, v in value.items()
+                if isinstance(v, (list, tuple))
+            }
+
+        return cls(
+            arg_count=int(d.get("arg_count") or 0),
+            string_args=_pos_pairs(d.get("string_args")),
+            ref_args=_pos_chains(d.get("ref_args")),
+            call_ref_args=_pos_chains(d.get("call_ref_args")),
+            kw_strings=_str_map(d.get("kw_strings")),
+            kw_string_lists=_chain_map(d.get("kw_string_lists")),
+            kw_refs=_chain_map(d.get("kw_refs")),
+            kw_call_refs=_chain_map(d.get("kw_call_refs")),
+        )
+
+
+@dataclass(slots=True)
+class StringRefCall:
+    """One call site whose first positional argument is a literal
+    string AND that passes at least one function-reference-shaped
+    argument — the structural fingerprint of name→handler
+    registration APIs (URL confs, ``add_url_rule``-style route
+    registration, CLI subcommand tables). Framework-agnostic: the
+    extractor records the SHAPE; classifying a site as an actual
+    registration is the consumer's join against the file's imports.
+
+    ``chain`` is the callee chain (``path(...)`` → ``["path"]``;
+    ``app.add_url_rule(...)`` → ``["app", "add_url_rule"]``).
+    """
+    line: int
+    chain: list[str]
+    caller: str | None = None
+    args: CallArgumentFacts = field(default_factory=CallArgumentFacts)
+
+
+@dataclass(slots=True)
+class ConstructedObject:
+    """One module-scope ``NAME = Chain(...)`` constructor assignment.
+
+    Records which callable a module-level name was bound to
+    (``app = Flask(__name__)`` → chain ``["Flask"]``) plus the
+    constructor call's literal-argument facts (``APIRouter(
+    prefix="/v1")`` keeps the prefix). Consumers join the chain
+    against the file's import map to type the object — the
+    receiver-binding step instance-bound decorator registrars need
+    (``@app.route`` resolves only if ``app``'s construction is
+    known). Module scope matches ``dispatch_tables``: the binding
+    exists at import time.
+    """
+    chain: list[str]
+    line: int
+    args: CallArgumentFacts = field(default_factory=CallArgumentFacts)
+
+
+@dataclass(slots=True)
 class CallSite:
     """One call expression in a file.
 
@@ -94,14 +378,42 @@ class CallSite:
     ``class C.foo`` if B and C are unrelated. ``None`` everywhere
     else — module-level call, non-self chain, longer chain than the
     safe-narrow case.
+
+    ``argument_identifiers`` is the list of bare-identifier
+    arguments at this call site. For ``http.HandleFunc("/x",
+    handler)`` the list is ``["handler"]``; for ``app.use(mw1,
+    mw2)`` it is ``["mw1", "mw2"]``; for ``f("string", 42)`` it
+    is ``[]``. Used by the reachability resolver to detect
+    function-as-argument registration (Express / Fastify / Koa /
+    net/http / gin / echo route handlers) — a function passed as
+    an argument to a recognised registration method is callable
+    via that framework's runtime dispatch even though no static
+    call site invokes it directly. Populated by extractors that
+    bother — empty list when the extractor hasn't been taught to
+    record arguments (backwards-compatible default).
+
+    ``receiver_type`` is the DECLARED type of the call's receiver when
+    the chain is a length-2 instance call (``recv.m()``) and ``recv`` is
+    a simple identifier whose declared type is resolvable in scope — a
+    method parameter, a local variable, or a field of the enclosing
+    class. ``Handler h = ...; h.handle()`` → ``"Handler"``. The simple
+    (unqualified) type name is stored, generics/arrays stripped to their
+    base. Used by the reachability resolver's typed-dispatch resolution
+    (Tier 2) to bind ``recv.m()`` to the implementors in ``recv``'s
+    declared-type hierarchy instead of every same-name override. ``None``
+    when the receiver type isn't statically resolvable (chained call,
+    ``var`` without an explicit type, generic type variable, etc.) — the
+    resolver then falls back to the type-free CHA over-approximation.
     """
     line: int
-    chain: List[str]
-    caller: Optional[str] = None
-    receiver_class: Optional[str] = None
+    chain: list[str]
+    caller: str | None = None
+    receiver_class: str | None = None
+    argument_identifiers: list[str] = field(default_factory=list)
+    receiver_type: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class DecoratedFunction:
     """One ``def`` (sync or async) that carries one or more
     decorators. Methods of classes are tracked the same way —
@@ -112,17 +424,27 @@ class DecoratedFunction:
     ``decorators`` is a list of attribute chains, one per
     ``@decorator`` line. ``@functools.cache`` →
     ``[["functools", "cache"]]``. ``@app.route("/x")`` →
-    ``[["app", "route"]]`` (the call arguments aren't stored;
-    only the chain that names the decorator). Decorators that
-    aren't a plain name/attribute chain (e.g. ``@make_deco()``)
-    are NOT recorded — we have no qualified name to match.
+    ``[["app", "route"]]``. Decorators whose NAME isn't a plain
+    name/attribute chain (e.g. ``@make_deco()(...)`` — the
+    decorator is a call result) are NOT recorded — we have no
+    qualified name to match.
+
+    ``decorator_args`` is index-aligned with ``decorators``: the
+    :class:`CallArgumentFacts` of a decorator that is a CALL
+    (``@app.route("/x", methods=["GET"])``), or ``None`` for a
+    bare decorator (``@staticmethod``). The distinction matters
+    to registration consumers: a bare framework decorator and a
+    zero-argument call are different registration shapes.
     """
     name: str
     line: int
-    decorators: List[List[str]] = field(default_factory=list)
+    decorators: list[list[str]] = field(default_factory=list)
+    decorator_args: list[CallArgumentFacts | None] = field(
+        default_factory=list,
+    )
 
 
-@dataclass
+@dataclass(slots=True)
 class ClassDef:
     """One ``class`` definition in a file.
 
@@ -143,9 +465,147 @@ class ClassDef:
     """
     name: str
     line: int
-    bases: List[str] = field(default_factory=list)
-    methods: List[Tuple[str, int]] = field(default_factory=list)
+    bases: list[str] = field(default_factory=list)
+    methods: list[tuple[str, int]] = field(default_factory=list)
     nested: bool = False
+
+
+@dataclass(slots=True)
+class IncludeEdge:
+    """One structured include/require edge (PHP walker only today).
+
+    ``shape`` is the census classification from
+    :func:`core.inventory.script_handler.classify_include_argument` —
+    a syntactic class, never a resolution verdict (constant prefixes
+    resolve per entry, not per statement). ``target`` is populated
+    only for pure-literal edges anchorable relative to the including
+    file (builder-side; the walker itself has no file path).
+    ``conditional`` is True when ANY enclosing construct at any depth
+    is a branch/loop/try/ternary or the right operand of a logical
+    operator — conservative in the guarantee direction by
+    construction. ``span_hash`` is SHA-256[:12] of the include
+    expression's source text (staleness key).
+    """
+
+    line: int
+    keyword: str
+    raw: str
+    shape: str
+    const_name: str | None = None
+    literal_tail: str | None = None
+    literal_stem: str | None = None
+    target: str | None = None
+    candidates: list[str] = field(default_factory=list)
+    conditional: bool = False
+    position: str = "file_scope"
+    enclosing_function: str | None = None
+    span_hash: str = ""
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "line": self.line,
+            "keyword": self.keyword,
+            "raw": self.raw,
+            "shape": self.shape,
+            "conditional": self.conditional,
+            "position": self.position,
+            "span_hash": self.span_hash,
+        }
+        # Optional fields omitted when unset — most edges carry only
+        # a subset, and the checklist is size-sensitive.
+        if self.const_name is not None:
+            out["const_name"] = self.const_name
+        if self.literal_tail is not None:
+            out["literal_tail"] = self.literal_tail
+        if self.literal_stem is not None:
+            out["literal_stem"] = self.literal_stem
+        if self.target is not None:
+            out["target"] = self.target
+        if self.candidates:
+            out["candidates"] = list(self.candidates)
+        if self.enclosing_function is not None:
+            out["enclosing_function"] = self.enclosing_function
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IncludeEdge":
+        """Checklist JSON is a run-dir artifact (attacker-writable
+        shapes) — coerce types, never trust them."""
+
+        def _s(v: object) -> str | None:
+            return v if isinstance(v, str) else None
+
+        return cls(
+            line=int(d.get("line") or 0)
+            if isinstance(d.get("line"), int) else 0,
+            keyword=_s(d.get("keyword")) or "include",
+            raw=_s(d.get("raw")) or "",
+            shape=_s(d.get("shape")) or "dynamic",
+            const_name=_s(d.get("const_name")),
+            literal_tail=_s(d.get("literal_tail")),
+            literal_stem=_s(d.get("literal_stem")),
+            target=_s(d.get("target")),
+            candidates=[c for c in (d.get("candidates") or [])
+                        if isinstance(c, str)],
+            conditional=bool(d.get("conditional", False)),
+            position=_s(d.get("position")) or "file_scope",
+            enclosing_function=_s(d.get("enclosing_function")),
+            span_hash=_s(d.get("span_hash")) or "",
+        )
+
+
+@dataclass(slots=True)
+class IncludeDefine:
+    """One literal-named ``define('NAME', …)`` statement (PHP).
+
+    The phase-1b per-entry environment walk consumes these in
+    document order: unconditional file-scope defines seed/extend the
+    entry's constant environment; ``fallback`` marks the
+    ``if (!defined('NAME')) define('NAME', …)`` shape (a no-op under
+    a carried binding, a binding supplier standalone). Records are
+    captured completely at Layer 0 so the walk needs no re-parse.
+    ``value`` is set only when the second argument is a single string
+    literal — the only value class the walk propagates; anything else
+    keeps ``value=None`` with the capped ``raw_value`` for honesty.
+    """
+
+    line: int
+    name: str
+    value: str | None = None
+    raw_value: str | None = None
+    conditional: bool = False
+    fallback: bool = False
+    position: str = "file_scope"
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "line": self.line,
+            "name": self.name,
+            "conditional": self.conditional,
+            "fallback": self.fallback,
+            "position": self.position,
+        }
+        if self.value is not None:
+            out["value"] = self.value
+        if self.raw_value is not None:
+            out["raw_value"] = self.raw_value
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IncludeDefine":
+        def _s(v: object) -> str | None:
+            return v if isinstance(v, str) else None
+
+        return cls(
+            line=int(d.get("line") or 0)
+            if isinstance(d.get("line"), int) else 0,
+            name=_s(d.get("name")) or "",
+            value=_s(d.get("value")),
+            raw_value=_s(d.get("raw_value")),
+            conditional=bool(d.get("conditional", False)),
+            fallback=bool(d.get("fallback", False)),
+            position=_s(d.get("position")) or "file_scope",
+        )
 
 
 @dataclass
@@ -158,13 +618,38 @@ class FileCallGraph:
     string dispatch" — a file that contains
     ``getattr(requests, 'get')`` is a confounder for queries about
     ``requests.get`` even if no static call chain has tail ``get``.
+
+    ``dispatch_tables`` / ``subscript_calls`` / ``getattr_calls``
+    (Python only today; other extractors leave them empty) carry the
+    per-site facts behind the file-scoped indirection flags, so a
+    graph assembler can turn the two common literal dynamic-dispatch
+    idioms into explicit lower-confidence edges instead of a blanket
+    "this file is uncertain" verdict:
+
+      * ``dispatch_tables`` — module-scope ``NAME = {...}`` dict
+        literals whose values are name / attribute chains
+        (``HANDLERS = {"a": handle_a}`` → ``{"HANDLERS":
+        [["handle_a"]]}``). Keys are not recorded — consumers
+        over-approximate a ``NAME[k]()`` call as reaching every
+        value, which is the sound direction for edge origination.
+      * ``subscript_calls`` — call sites whose callee is a
+        subscript with a name-chain root (``HANDLERS[k](...)`` →
+        chain ``["HANDLERS"]``). These have no callee name so they
+        are NOT in ``calls``; recording the root name lets a
+        consumer join against ``dispatch_tables``.
+      * ``getattr_calls`` — one ``(line, caller, attr_or_None)``
+        triple per ``getattr(obj, ...)`` site. ``attr`` is the
+        literal second argument when constant, ``None`` when
+        opaque. Unlike the file-scoped ``getattr_targets`` set,
+        each triple keeps the enclosing caller so an edge can be
+        attributed to the function that dispatches.
     """
-    imports: Dict[str, str] = field(default_factory=dict)
-    calls: List[CallSite] = field(default_factory=list)
-    indirection: Set[str] = field(default_factory=set)
-    getattr_targets: Set[str] = field(default_factory=set)
-    classes: List[ClassDef] = field(default_factory=list)
-    decorated_functions: List[DecoratedFunction] = field(default_factory=list)
+    imports: dict[str, str] = field(default_factory=dict)
+    calls: list[CallSite] = field(default_factory=list)
+    indirection: set[str] = field(default_factory=set)
+    getattr_targets: set[str] = field(default_factory=set)
+    classes: list[ClassDef] = field(default_factory=list)
+    decorated_functions: list[DecoratedFunction] = field(default_factory=list)
     # Module/package/namespace declared inside this file. The
     # reachability resolver uses this to canonicalise cross-package
     # references into project-defined functions for languages where
@@ -176,28 +661,121 @@ class FileCallGraph:
     # heuristically. For JS/TS each file IS its module — also
     # path-derivable, so stays ``None``. For Ruby the
     # module/class nesting at file scope.
-    package_name: Optional[str] = None
+    package_name: str | None = None
     # Relative imports (Python ``from . import x`` /
     # ``from ..pkg import y``). Stored as
     # ``(level, module_or_empty, name, asname_or_None)`` quads. Not
     # resolved at extraction time — the package root depends on the
     # file's location in the inventory tree, which the per-file
     # extractor doesn't know. The resolver in
-    # :mod:`core.inventory.reachability` consumes these to model
+    # :mod:`core.analysis.reachability` consumes these to model
     # ``__init__.py`` re-exports.
-    relative_imports: List[Tuple[int, str, str, Optional[str]]] = field(
+    relative_imports: list[tuple[int, str, str, str | None]] = field(
         default_factory=list,
     )
+    # Literal dynamic-dispatch facts — see the class docstring.
+    # ``dispatch_tables``: table name → list of value chains.
+    # ``subscript_calls``: CallSite records whose ``chain`` is the
+    # SUBSCRIPT ROOT (the table being indexed), not a callee name.
+    # ``getattr_calls``: (line, caller_or_None, attr_or_None) triples.
+    dispatch_tables: dict[str, list[list[str]]] = field(default_factory=dict)
+    subscript_calls: list[CallSite] = field(default_factory=list)
+    getattr_calls: list[tuple[int, str | None, str | None]] = field(
+        default_factory=list,
+    )
+    # Registration-shape facts (Python only today; other extractors
+    # leave them empty). ``constructed_objects`` binds module-level
+    # names to their constructor chains so consumers can type
+    # instance receivers (``@app.route`` needs ``app``'s
+    # construction); ``string_ref_calls`` records the
+    # literal-string-plus-function-reference call shape that
+    # name→handler registration APIs share. Both serialise only
+    # when non-empty.
+    constructed_objects: dict[str, ConstructedObject] = field(
+        default_factory=dict,
+    )
+    string_ref_calls: list[StringRefCall] = field(default_factory=list)
+    # Structured include edges + define records (PHP walker only
+    # today; the file-scoped INDIRECTION_DYNAMIC_IMPORT flag stays
+    # for compatibility). ``includes_extracted`` marks that the
+    # walker's include layer RAN — it gates serialization (so the
+    # keys are present, even empty, exactly when extraction
+    # happened) and lets the builder's SHA-reuse path distinguish
+    # "no includes in this file" from "record predates the edge
+    # layer / parse failed" for exact backfill.
+    includes: list[IncludeEdge] = field(default_factory=list)
+    defines: list[IncludeDefine] = field(default_factory=list)
+    includes_extracted: bool = False
+    includes_truncated: bool = False
+    # Phase-1b walk inputs. ``parse_errors`` marks an ERROR-bearing
+    # parse tree (recovery can re-parent statements, so this file's
+    # conditional flags are never guarantee-grade). ``boundaries``
+    # lists the file-scope straight-line boundary statements
+    # (return/exit/die/goto/__halt_compiler) in document order,
+    # capped with an ``overflow`` sentinel entry.
+    parse_errors: bool = False
+    boundaries: list[dict] = field(default_factory=list)
+    # First file-scope direct-access guard, when present:
+    # ``{"line": N, "constant": "IN_APP"}`` for
+    # ``if (!defined('IN_APP')) die(...)`` /
+    # ``defined('IN_APP') or exit`` shapes. Role evidence for the
+    # include graph ("dual" is a query over includer-index +
+    # this field, never a stored label).
+    direct_access_guard: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
-            "imports": dict(self.imports),
-            "calls": [
-                {"line": c.line, "chain": list(c.chain),
-                 "caller": c.caller,
-                 "receiver_class": c.receiver_class}
-                for c in self.calls
-            ],
+        # Default-None fields (``caller``, ``receiver_class``) are
+        # omitted from each call dict — they're set on a small minority
+        # of CallSites (method calls + class-context calls) but the
+        # baseline write emitted them on every call. Consumers all
+        # use ``call.get("caller")`` / ``call.get("receiver_class")``
+        # which returns None for missing keys, so the on-disk +
+        # in-memory shape stays equivalent. Saves ~30% of the call
+        # dict size on call-heavy files (~30k Grafana TS files ×
+        # hundreds of calls/file → ~hundreds of MB peak RSS).
+        #
+        # String interning (``sys.intern``) on the small high-
+        # cardinality tokens — import targets and chain tail names —
+        # collapses thousands of copies of common strings like
+        # ``"lodash"`` / ``"react"`` / ``"requests"`` to one shared
+        # object. The chain head + tail are the most-repeated tokens
+        # across a project; the interior elements are usually less
+        # repetitive so we leave them as plain strings.
+        import sys
+        intern = sys.intern
+        calls: list = []
+        for c in self.calls:
+            chain = list(c.chain)
+            if chain:
+                chain[0] = intern(chain[0])
+                if len(chain) > 1:
+                    chain[-1] = intern(chain[-1])
+            entry: dict = {"line": c.line, "chain": chain}
+            if c.caller is not None:
+                entry["caller"] = intern(c.caller)
+            if c.receiver_class is not None:
+                entry["receiver_class"] = intern(c.receiver_class)
+            if c.receiver_type is not None:
+                entry["receiver_type"] = intern(c.receiver_type)
+            # argument_identifiers omitted from serialised form when
+            # empty — the vast majority of call sites have no
+            # identifier args (constant args, no args, etc.) and
+            # writing empty lists for all of them inflates inventory
+            # JSON size meaningfully on large repos.
+            if c.argument_identifiers:
+                entry["argument_identifiers"] = [
+                    intern(a) for a in c.argument_identifiers
+                ]
+            calls.append(entry)
+
+        # Intern import keys + values — the same dependency name
+        # ("lodash") shows up as a value across thousands of files.
+        out: dict = {
+            "imports": {
+                intern(k): intern(v)
+                for k, v in self.imports.items()
+            },
+            "calls": calls,
             "indirection": sorted(self.indirection),
             "getattr_targets": sorted(self.getattr_targets),
             "classes": [
@@ -209,24 +787,91 @@ class FileCallGraph:
             ],
             "decorated_functions": [
                 {"name": d.name, "line": d.line,
-                 "decorators": [list(ch) for ch in d.decorators]}
+                 "decorators": [list(ch) for ch in d.decorators],
+                 # ``decorator_args`` omitted when no decorator was a
+                 # call — the majority (``@staticmethod``-style), and
+                 # an all-None list carries no information.
+                 **({"decorator_args": [
+                     a.to_dict() if a is not None else None
+                     for a in d.decorator_args
+                 ]} if any(a is not None for a in d.decorator_args)
+                    else {})}
                 for d in self.decorated_functions
             ],
-            "package_name": self.package_name,
             "relative_imports": [list(ri) for ri in self.relative_imports],
         }
+        # Omit ``package_name`` when unset — Python / JS / TS files
+        # all carry ``None`` here, which is the majority of any
+        # mixed-language repo's files.
+        if self.package_name is not None:
+            out["package_name"] = self.package_name
+        # The literal dynamic-dispatch facts are omitted when empty
+        # (the common case for every file that doesn't use the
+        # idiom) — same size rationale as ``argument_identifiers``.
+        if self.dispatch_tables:
+            out["dispatch_tables"] = {
+                name: [list(ch) for ch in chains]
+                for name, chains in self.dispatch_tables.items()
+            }
+        if self.subscript_calls:
+            out["subscript_calls"] = [
+                {"line": c.line, "chain": list(c.chain),
+                 **({"caller": c.caller} if c.caller is not None else {})}
+                for c in self.subscript_calls
+            ]
+        if self.getattr_calls:
+            out["getattr_calls"] = [list(t) for t in self.getattr_calls]
+        if self.constructed_objects:
+            constructed: dict = {}
+            for name, co in self.constructed_objects.items():
+                co_entry: dict = {"chain": list(co.chain), "line": co.line}
+                args = co.args.to_dict()
+                # A zero-argument constructor's facts are all-empty —
+                # omitting them round-trips to the default instance.
+                if args != {"arg_count": 0}:
+                    co_entry["args"] = args
+                constructed[name] = co_entry
+            out["constructed_objects"] = constructed
+        if self.string_ref_calls:
+            out["string_ref_calls"] = [
+                {"line": c.line, "chain": list(c.chain),
+                 **({"caller": c.caller} if c.caller is not None else {}),
+                 "args": c.args.to_dict()}
+                for c in self.string_ref_calls
+            ]
+        # Include layer: keys present exactly when extraction ran
+        # (even if empty), so downstream can tell "no includes" from
+        # "pre-edge-layer record" and backfill only the latter.
+        if self.includes_extracted:
+            out["includes"] = [e.to_dict() for e in self.includes]
+            out["defines"] = [d.to_dict() for d in self.defines]
+            if self.includes_truncated:
+                out["includes_truncated"] = True
+            if self.direct_access_guard is not None:
+                out["direct_access_guard"] = dict(self.direct_access_guard)
+            if self.parse_errors:
+                out["parse_errors"] = True
+            if self.boundaries:
+                out["boundaries"] = [dict(b) for b in self.boundaries]
+        return out
 
     @classmethod
-    def from_dict(cls, d: dict) -> "FileCallGraph":
+    def from_dict(cls, d: dict) -> FileCallGraph:
         rel = d.get("relative_imports") or []
         return cls(
             imports=dict(d.get("imports") or {}),
             calls=[
                 CallSite(
-                    line=int(c.get("line", 0)),
+                    line=int(c.get("line") or 0),
                     chain=list(c.get("chain") or []),
                     caller=c.get("caller"),
                     receiver_class=c.get("receiver_class"),
+                    # Older inventories pre-date argument_identifiers;
+                    # `or []` defaults to empty for backwards compat.
+                    argument_identifiers=list(
+                        c.get("argument_identifiers") or []
+                    ),
+                    receiver_type=c.get("receiver_type"),
                 )
                 for c in (d.get("calls") or [])
             ],
@@ -235,10 +880,10 @@ class FileCallGraph:
             classes=[
                 ClassDef(
                     name=str(k.get("name", "")),
-                    line=int(k.get("line", 0)),
+                    line=int(k.get("line") or 0),
                     bases=list(k.get("bases") or []),
                     methods=[
-                        (str(m[0]), int(m[1]))
+                        (str(m[0]), int(m[1] or 0))
                         for m in (k.get("methods") or [])
                         if isinstance(m, (list, tuple)) and len(m) >= 2
                     ],
@@ -247,23 +892,148 @@ class FileCallGraph:
                 for k in (d.get("classes") or [])
             ],
             decorated_functions=[
-                DecoratedFunction(
-                    name=str(df.get("name", "")),
-                    line=int(df.get("line", 0)),
-                    decorators=[
-                        list(ch) for ch in (df.get("decorators") or [])
-                        if isinstance(ch, (list, tuple))
-                    ],
-                )
+                _decorated_function_from_dict(df)
                 for df in (d.get("decorated_functions") or [])
             ],
             package_name=d.get("package_name"),
             relative_imports=[
-                (int(r[0]), str(r[1] or ""), str(r[2] or ""),
+                (int(r[0] or 0), str(r[1] or ""), str(r[2] or ""),
                  r[3] if len(r) > 3 else None)
                 for r in rel if isinstance(r, (list, tuple)) and len(r) >= 3
             ],
+            # Inventories written before these facts existed simply
+            # lack the keys — default to empty (consumers degrade to
+            # the file-scoped indirection flags, exactly the pre-fact
+            # behaviour).
+            dispatch_tables={
+                str(name): [
+                    [str(p) for p in ch]
+                    for ch in chains if isinstance(ch, (list, tuple))
+                ]
+                for name, chains in (d.get("dispatch_tables") or {}).items()
+                if isinstance(chains, (list, tuple))
+            },
+            subscript_calls=[
+                CallSite(
+                    line=int(c.get("line") or 0),
+                    chain=list(c.get("chain") or []),
+                    caller=c.get("caller"),
+                )
+                for c in (d.get("subscript_calls") or [])
+                if isinstance(c, dict)
+            ],
+            getattr_calls=[
+                (int(t[0] or 0),
+                 str(t[1]) if t[1] is not None else None,
+                 str(t[2]) if t[2] is not None else None)
+                for t in (d.get("getattr_calls") or [])
+                if isinstance(t, (list, tuple)) and len(t) >= 3
+            ],
+            constructed_objects={
+                str(name): ConstructedObject(
+                    chain=[str(p) for p in (co.get("chain") or [])],
+                    line=int(co.get("line") or 0),
+                    args=_argument_facts_from(co.get("args")),
+                )
+                for name, co in (d.get("constructed_objects") or {}).items()
+                if isinstance(co, dict)
+            },
+            string_ref_calls=[
+                StringRefCall(
+                    line=int(c.get("line") or 0),
+                    chain=list(c.get("chain") or []),
+                    caller=c.get("caller"),
+                    args=_argument_facts_from(c.get("args")),
+                )
+                for c in (d.get("string_ref_calls") or [])
+                if isinstance(c, dict)
+            ],
+            includes=[
+                IncludeEdge.from_dict(e)
+                for e in (d.get("includes") or [])
+                if isinstance(e, dict)
+            ],
+            defines=[
+                IncludeDefine.from_dict(x)
+                for x in (d.get("defines") or [])
+                if isinstance(x, dict)
+            ],
+            includes_extracted="includes" in d,
+            includes_truncated=bool(d.get("includes_truncated", False)),
+            direct_access_guard=(
+                dict(d["direct_access_guard"])
+                if isinstance(d.get("direct_access_guard"), dict) else None
+            ),
+            parse_errors=bool(d.get("parse_errors", False)),
+            boundaries=[
+                dict(b) for b in (d.get("boundaries") or [])
+                if isinstance(b, dict)
+            ],
         )
+
+
+def _argument_facts_from(raw: object) -> CallArgumentFacts:
+    """Argument facts from a serialised value of unknown shape —
+    non-dicts degrade to the empty default."""
+    if isinstance(raw, dict):
+        return CallArgumentFacts.from_dict(raw)
+    return CallArgumentFacts()
+
+
+def _decorated_function_from_dict(df: dict) -> DecoratedFunction:
+    """Rebuild one decorated-function record, index-aligning
+    ``decorator_args`` with the kept ``decorators`` (a malformed
+    chain entry drops BOTH its chain and its args so the alignment
+    contract survives hand-corrupted artifacts). Inventories written
+    before ``decorator_args`` existed default every entry to None."""
+    raw_chains = df.get("decorators") or []
+    raw_args = df.get("decorator_args")
+    if not isinstance(raw_args, list) or len(raw_args) != len(raw_chains):
+        raw_args = [None] * len(raw_chains)
+    chains: list[list[str]] = []
+    args: list[CallArgumentFacts | None] = []
+    for ch, a in zip(raw_chains, raw_args):
+        if not isinstance(ch, (list, tuple)):
+            continue
+        chains.append(list(ch))
+        args.append(CallArgumentFacts.from_dict(a)
+                    if isinstance(a, dict) else None)
+    return DecoratedFunction(
+        name=str(df.get("name", "")),
+        line=int(df.get("line") or 0),
+        decorators=chains,
+        decorator_args=args,
+    )
+
+
+def _drive_visit(visitor, root) -> None:
+    """Explicit-stack driver for the generator-based tree-sitter walkers.
+
+    Each walker implements ``_visit(node)`` as a GENERATOR that yields
+    the child nodes to descend into (where the old recursive code
+    called ``self.walk(child)``). Pre-visit work runs before the
+    yields; post-visit work (scope pops in ``finally`` blocks) runs
+    when the generator resumes after its last yield — i.e. after the
+    subtree is fully processed — which reproduces recursive execution
+    order exactly while keeping all state on the heap. Real ASTs
+    (openssl's ssl/s3_lib.c parses >1000 levels deep) blew Python's
+    recursion limit in the old form and got whole files silently
+    dropped from the inventory.
+    """
+    stack = [visitor._visit(root)]
+    try:
+        while stack:
+            try:
+                child = next(stack[-1])
+            except StopIteration:
+                stack.pop()
+            else:
+                stack.append(visitor._visit(child))
+    finally:
+        # On exception, close inner-first so generator ``finally``
+        # blocks run in the same order recursive unwinding would.
+        while stack:
+            stack.pop().close()
 
 
 def extract_call_graph_python(content: str) -> FileCallGraph:
@@ -296,13 +1066,13 @@ class _PythonCallGraph(ast.NodeVisitor):
     def __init__(self) -> None:
         self.graph = FileCallGraph()
         # Stack of enclosing function names, top is innermost.
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
         # Stack of enclosing ClassDefs, top is innermost. Used to
         # tag CallSite.receiver_class for ``self.X()`` calls and to
         # register methods on their owning class. The stack supports
         # nested classes; we only consider the innermost element
         # when tagging calls.
-        self._class_stack: List[ClassDef] = []
+        self._class_stack: list[ClassDef] = []
 
     # ------------------------------------------------------------------
     # Imports
@@ -377,7 +1147,8 @@ class _PythonCallGraph(ast.NodeVisitor):
         # Visit them BEFORE pushing the function name onto
         # ``_enclosing``, otherwise ``@app.route(...)`` looks like
         # a call from inside the decorated function — wrong scope.
-        decorator_chains: List[List[str]] = []
+        decorator_chains: list[list[str]] = []
+        decorator_args: list[CallArgumentFacts | None] = []
         for deco in getattr(node, "decorator_list", []) or []:
             # ``@foo`` → name node
             # ``@foo.bar`` → attribute chain
@@ -386,6 +1157,12 @@ class _PythonCallGraph(ast.NodeVisitor):
             chain = _decorator_chain(deco)
             if chain is not None:
                 decorator_chains.append(chain)
+                # Literal-argument facts, index-aligned with the
+                # chain list; None marks a bare (non-call) decorator.
+                decorator_args.append(
+                    _call_argument_facts(deco)
+                    if isinstance(deco, ast.Call) else None,
+                )
             # Walk the decorator expression in the OUTER scope so
             # any nested calls inside the decorator (e.g.
             # ``@app.route(rule_for("x"))``) attribute to the
@@ -400,6 +1177,7 @@ class _PythonCallGraph(ast.NodeVisitor):
                     name=node.name,
                     line=getattr(node, "lineno", 0),
                     decorators=decorator_chains,
+                    decorator_args=decorator_args,
                 ),
             )
         # Now push the function name and walk the body. Skip the
@@ -453,23 +1231,143 @@ class _PythonCallGraph(ast.NodeVisitor):
             self._class_stack.pop()
 
     # ------------------------------------------------------------------
+    # Dispatch tables
+    # ------------------------------------------------------------------
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # Module-scope ``NAME = {key: fn, ...}`` dict literals whose
+        # values are name / attribute chains — the dict-of-functions
+        # dispatch idiom behind ``NAME[k](...)`` calls. Module scope
+        # means "not inside any def / class body": the two scope
+        # stacks track exactly that, so a table defined under a
+        # module-level ``if`` / ``try`` still qualifies (it binds the
+        # module namespace at import, same as a bare assignment).
+        # Single-Name targets only — tuple unpacking / attribute
+        # targets carry too much ambiguity for a useful join key.
+        # Values that aren't chains (literals, lambdas, calls) are
+        # skipped individually; keys are not recorded (consumers
+        # over-approximate to every value). A later assignment to the
+        # same name overwrites the earlier harvest — runtime order.
+        if (not self._enclosing and not self._class_stack
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Dict)):
+            chains: list[list[str]] = []
+            for value in node.value.values:
+                if len(chains) >= _DISPATCH_TABLE_VALUE_CAP:
+                    break
+                chain = _attribute_chain(value)
+                if chain is not None:
+                    chains.append(chain)
+            if chains:
+                self.graph.dispatch_tables[node.targets[0].id] = chains
+        # Module-scope ``NAME = Chain(...)`` constructor assignments —
+        # the object-binding fact behind instance-receiver joins
+        # (``app = Flask(__name__)`` types every later ``app.<m>``).
+        # Same scoping rule as dispatch tables; single-Name targets
+        # only.
+        if (not self._enclosing and not self._class_stack
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            self._record_constructed(node.targets[0].id, node.value)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        # Annotated form of the constructor assignment
+        # (``app: Flask = Flask(__name__)``) — common in typed
+        # codebases, same binding semantics as the bare form.
+        # Dispatch-table harvesting stays Assign-only (an annotated
+        # dict-of-functions table is rare enough not to warrant the
+        # extra shape).
+        if (not self._enclosing and not self._class_stack
+                and isinstance(node.target, ast.Name)
+                and node.value is not None):
+            self._record_constructed(node.target.id, node.value)
+        self.generic_visit(node)
+
+    def _record_constructed(self, name: str, value: ast.AST) -> None:
+        """Record one module-scope constructor assignment when the
+        value is a call on a name/attribute chain. A later
+        assignment to the same name overwrites (runtime order); new
+        names past the cap are dropped — see _CONSTRUCTED_OBJECT_CAP.
+        """
+        if not isinstance(value, ast.Call):
+            return
+        chain = _attribute_chain(value.func)
+        if chain is None:
+            return
+        table = self.graph.constructed_objects
+        if name not in table and len(table) >= _CONSTRUCTED_OBJECT_CAP:
+            return
+        table[name] = ConstructedObject(
+            chain=chain,
+            line=getattr(value, "lineno", 0),
+            args=_call_argument_facts(value),
+        )
+
+    # ------------------------------------------------------------------
     # Calls + indirection
     # ------------------------------------------------------------------
 
     def visit_Call(self, node: ast.Call) -> None:
         chain = _attribute_chain(node.func)
         if chain is None:
-            # Non-name callee (lambda, subscript, returned function
-            # call, etc.) — nothing for the resolver to match.
+            # Non-name callee — but ``HANDLERS[key](...)`` (Subscript)
+            # is dict-of-functions dispatch, a real opaque-dispatch
+            # channel. Without a tail name to narrow, treat it like
+            # opaque getattr: any target in the file's reverse
+            # closure could be the runtime callee. Other non-name
+            # forms (``(lambda x: …)()``, ``f()()``) carry no
+            # callable-name signal and stay invisible.
+            if isinstance(node.func, ast.Subscript):
+                self.graph.indirection.add(INDIRECTION_BRACKET_DISPATCH)
+                # Record the subscript ROOT when it has a static name
+                # (``HANDLERS[k](...)`` → ``["HANDLERS"]``) so a graph
+                # assembler can join it against ``dispatch_tables``.
+                # A rootless subscript (``f()[0](...)``) has nothing
+                # to join on — the file-level flag is all we keep.
+                root_chain = _attribute_chain(node.func.value)
+                if root_chain is not None:
+                    self.graph.subscript_calls.append(CallSite(
+                        line=getattr(node, "lineno", 0),
+                        chain=root_chain,
+                        caller=(self._enclosing[-1]
+                                if self._enclosing else None),
+                    ))
             self.generic_visit(node)
             return
 
-        # Indirection: getattr(obj, "name")(...)
-        if (chain == ["getattr"] and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and isinstance(node.args[1].value, str)):
-            self.graph.indirection.add(INDIRECTION_GETATTR)
-            self.graph.getattr_targets.add(node.args[1].value)
+        # Indirection: getattr(obj, ...)
+        # Two sub-cases:
+        #   literal:  getattr(obj, "name")    → record "name", flag
+        #             stays narrow (only "name" gets uncertain in
+        #             reverse closure; unrelated targets in same file
+        #             stay claimable).
+        #   opaque:   getattr(obj, var_expr)  → no name to record;
+        #             ANY target in the file's reverse closure could
+        #             be the runtime dispatch — blanket masking.
+        # Aliased forms — ``from builtins import getattr as g`` /
+        # ``import builtins; builtins.getattr(...)`` — resolved via
+        # the file's import map so ``g(obj, …)`` and
+        # ``builtins.getattr(obj, …)`` are also seen.
+        if _is_builtin_call(chain, "getattr", self.graph.imports) and len(node.args) >= 2:
+            second = node.args[1]
+            attr_literal: str | None = None
+            if (isinstance(second, ast.Constant)
+                    and isinstance(second.value, str)):
+                self.graph.indirection.add(INDIRECTION_GETATTR)
+                self.graph.getattr_targets.add(second.value)
+                attr_literal = second.value
+            else:
+                self.graph.indirection.add(INDIRECTION_GETATTR_OPAQUE)
+            # Per-site record keeps the enclosing caller so a graph
+            # assembler can attribute a heuristic edge to the
+            # dispatching function (the file-scoped sets above can't).
+            self.graph.getattr_calls.append((
+                getattr(node, "lineno", 0),
+                self._enclosing[-1] if self._enclosing else None,
+                attr_literal,
+            ))
 
         # Indirection: importlib.import_module("x.y")
         if chain == ["importlib", "import_module"]:
@@ -480,8 +1378,8 @@ class _PythonCallGraph(ast.NodeVisitor):
             if qualified == "importlib.import_module":
                 self.graph.indirection.add(INDIRECTION_IMPORTLIB)
 
-        # Indirection: __import__("x.y")
-        if chain == ["__import__"]:
+        # Indirection: __import__("x.y") — also aliased forms.
+        if _is_builtin_call(chain, "__import__", self.graph.imports):
             self.graph.indirection.add(INDIRECTION_DUNDER_IMPORT)
 
         caller = self._enclosing[-1] if self._enclosing else None
@@ -501,10 +1399,115 @@ class _PythonCallGraph(ast.NodeVisitor):
             caller=caller,
             receiver_class=receiver_class,
         ))
+        # Registration-shape fact: first positional argument is a
+        # literal string AND some argument is function-reference
+        # shaped — ``path("users/", views.detail)``,
+        # ``app.add_url_rule("/x", view_func=h)``. The extractor
+        # records the SHAPE only; whether a site is a real
+        # registration is the consumer's import join. Per-file
+        # capped — see _STRING_REF_CALL_CAP.
+        if (node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and len(self.graph.string_ref_calls)
+                < _STRING_REF_CALL_CAP):
+            arg_facts = _call_argument_facts(node)
+            if arg_facts.has_ref():
+                self.graph.string_ref_calls.append(StringRefCall(
+                    line=getattr(node, "lineno", 0),
+                    chain=chain,
+                    caller=caller,
+                    args=arg_facts,
+                ))
         self.generic_visit(node)
 
 
-def _decorator_chain(deco: ast.AST) -> Optional[List[str]]:
+def _is_builtin_call(
+    chain: list[str], builtin_name: str, imports: dict[str, str],
+) -> bool:
+    """Does ``chain`` resolve to a call of the Python builtin
+    ``builtin_name`` (``getattr``, ``__import__``, …)?
+
+    Matches three forms:
+      - bare:     ``getattr(obj, "x")``               → chain ``["getattr"]``
+      - aliased:  ``from builtins import getattr as g; g(obj, "x")``
+                  → chain ``["g"]`` + ``imports["g"] == "builtins.getattr"``
+      - dotted:   ``import builtins; builtins.getattr(obj, "x")``
+                  → chain ``["builtins", "getattr"]``
+
+    Aliased and dotted forms are easy to miss but real: any project
+    that shadows a builtin name locally (lint workaround,
+    deobfuscation pattern, …) routes its dispatch through this
+    aliased path. Catching them keeps the masking signal honest.
+    """
+    if chain == [builtin_name]:
+        return True
+    if len(chain) == 1:
+        qualified = imports.get(chain[0])
+        if qualified == f"builtins.{builtin_name}":
+            return True
+    return chain == ["builtins", builtin_name]
+
+
+def _call_argument_facts(node: ast.Call) -> CallArgumentFacts:
+    """Harvest the literal / reference argument facts of one call.
+
+    Anything that is neither a bounded literal string, a literal
+    string list, a name/attribute chain, nor a call-on-a-chain is
+    deliberately NOT recorded — its position stays visible through
+    ``arg_count`` (positional) or simply absent (keyword), and
+    consumers treat it as dynamic. Over-cap literals degrade the
+    same way (see _ARG_STRING_CAP).
+    """
+    facts = CallArgumentFacts(arg_count=len(node.args))
+    for pos, arg in enumerate(node.args[:_ARG_POSITIONAL_CAP]):
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            if len(arg.value) <= _ARG_STRING_CAP:
+                facts.string_args.append((pos, arg.value))
+            continue
+        chain = _attribute_chain(arg)
+        if chain is not None:
+            facts.ref_args.append((pos, chain))
+            continue
+        if isinstance(arg, ast.Call):
+            call_chain = _attribute_chain(arg.func)
+            if call_chain is not None:
+                facts.call_ref_args.append((pos, call_chain))
+    for kw in node.keywords[:_ARG_KEYWORD_CAP]:
+        if kw.arg is None:
+            # ``**kwargs`` splat — nothing static to record.
+            continue
+        value = kw.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            if len(value.value) <= _ARG_STRING_CAP:
+                facts.kw_strings[kw.arg] = value.value
+            continue
+        if isinstance(value, (ast.List, ast.Tuple)):
+            elements = value.elts[:_ARG_LIST_CAP]
+            literals = [
+                e.value for e in elements
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                and len(e.value) <= _ARG_STRING_CAP
+            ]
+            # Record only when every examined element is a literal —
+            # a mixed list is not a usable literal fact (recording
+            # the literal half would misstate e.g. an HTTP-method
+            # list). First _ARG_LIST_CAP elements examined.
+            if literals and len(literals) == len(elements):
+                facts.kw_string_lists[kw.arg] = literals
+            continue
+        chain = _attribute_chain(value)
+        if chain is not None:
+            facts.kw_refs[kw.arg] = chain
+            continue
+        if isinstance(value, ast.Call):
+            call_chain = _attribute_chain(value.func)
+            if call_chain is not None:
+                facts.kw_call_refs[kw.arg] = call_chain
+    return facts
+
+
+def _decorator_chain(deco: ast.AST) -> list[str] | None:
     """Return the attribute chain naming a decorator, or ``None``.
 
     ``@foo``                → ``["foo"]``
@@ -519,14 +1522,14 @@ def _decorator_chain(deco: ast.AST) -> Optional[List[str]]:
     return _attribute_chain(deco)
 
 
-def _attribute_chain(node: ast.AST) -> Optional[List[str]]:
+def _attribute_chain(node: ast.AST) -> list[str] | None:
     """Convert ``foo.bar.baz`` into ``["foo", "bar", "baz"]``.
 
     Returns ``None`` for non-name callees (function returns,
     subscripts, lambdas, etc.) — those have no qualified name we
     could resolve against an import map.
     """
-    parts: List[str] = []
+    parts: list[str] = []
     cur = node
     while isinstance(cur, ast.Attribute):
         parts.append(cur.attr)
@@ -542,15 +1545,26 @@ def _attribute_chain(node: ast.AST) -> Optional[List[str]]:
 # ---------------------------------------------------------------------------
 
 
-def extract_call_graph_javascript(content: str) -> FileCallGraph:
-    """Walk a JavaScript / TypeScript source string via tree-sitter
-    and return its :class:`FileCallGraph`.
+def extract_call_graph_javascript(
+    content: str, language: str = "javascript", *,
+    _tree: Any = None,
+) -> FileCallGraph:
+    """Walk a JavaScript / TypeScript / TSX source string via
+    tree-sitter and return its :class:`FileCallGraph`.
+
+    ``language`` selects the grammar: ``javascript`` →
+    tree-sitter-javascript; ``typescript`` / ``tsx`` →
+    tree-sitter-typescript (``language_typescript`` / ``language_tsx``).
+    Using the JS grammar on typed TS produced ERROR nodes and an empty
+    graph (no edges), so TS reachability was blind — pick the matching
+    grammar. The node types the walker keys on (``call_expression``,
+    ``method_definition``, ``import_statement`` …) are shared across
+    both grammars.
 
     Returns an empty graph when:
 
-      * tree-sitter or ``tree_sitter_javascript`` isn't installed
-        (the inventory builder degrades; resolver treats absence
-        as no-evidence)
+      * the matching grammar isn't installed (the inventory builder
+        degrades; resolver treats absence as no-evidence)
       * The file is unparseable
 
     Captures both ES-module imports and CommonJS requires; both
@@ -560,22 +1574,28 @@ def extract_call_graph_javascript(content: str) -> FileCallGraph:
     matching the Python ``from foo import y`` convention so the
     resolver's chain semantics work unchanged.
     """
-    try:
-        import tree_sitter_javascript as ts_js
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter JavaScript grammar not "
-            "installed; returning empty graph",
-        )
-        return FileCallGraph()
+    tree = _tree
+    if tree is None:
+        # Grammar resolution varies by dialect, so this can't route
+        # through _ts_tree's module.language convention.
+        if language in ("typescript", "tsx"):
+            ts_ts = _import_grammar("tree_sitter_typescript")
+            if ts_ts is None:
+                return FileCallGraph()
+            language_fn = (ts_ts.language_typescript
+                           if language == "typescript" else ts_ts.language_tsx)
+        else:
+            ts_js = _import_grammar("tree_sitter_javascript")
+            if ts_js is None:
+                return FileCallGraph()
+            language_fn = ts_js.language
 
-    try:
-        parser = Parser(Language(ts_js.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                          # noqa: BLE001
-        logger.debug("call_graph: JS parse failed (%s)", e)
-        return FileCallGraph()
+        try:
+            parser = _get_ts_parser(language_fn)
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception as e:                          # noqa: BLE001
+            logger.debug("call_graph: %s parse failed (%s)", language, e)
+            return FileCallGraph()
 
     walker = _JsCallGraph()
     walker.walk(tree.root_node)
@@ -611,36 +1631,70 @@ class _JsCallGraph:
     _CLASS_HERITAGE = "class_heritage"
     _METHOD_DEF = "method_definition"
     _THIS_NODE = "this"
+    _FORMAL_PARAMS = "formal_parameters"
+    _PARAM_NODES = ("required_parameter", "optional_parameter")
+    _PUBLIC_FIELD = "public_field_definition"
+    _TYPE_ANNOTATION = "type_annotation"
+    _TYPE_IDENT = "type_identifier"
+    _NESTED_TYPE_IDENT = "nested_type_identifier"
+    _GENERIC_TYPE = "generic_type"
+    _ARRAY_TYPE = "array_type"
+    _PROP_IDENT = "property_identifier"
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
         # Class context for ``class Foo { method() { this.x(); } }``.
         # JS classes are single-inheritance (one ``extends`` target)
         # but mixin patterns mean class_heritage may carry a call
         # expression — we capture the surface identifier when present.
-        self._class_stack: List[ClassDef] = []
+        self._class_stack: list[ClassDef] = []
+        # Typed-dispatch scope tracking (Tier 2). Only TS/TSX carry the
+        # type annotations these read; on plain JS they're always absent
+        # so receiver_type stays None (no effect). ``_field_types`` is a
+        # per-class stack; ``_local_types`` the current function's typed
+        # params + locals.
+        self._field_types: list[dict[str, str]] = []
+        self._local_types: dict[str, str] = {}
 
     def walk(self, node) -> None:
-        """Recursive descent. We push/pop the enclosing-function
-        stack on the way down/up so the ``CallSite.caller`` field
-        is the innermost NAMED enclosing function — anonymous
-        functions / arrows are walked-through without affecting
-        the caller attribution."""
-        if node.type == self._CLASS_DECL:
-            name_node = self._first_child_of_type(node, (self._IDENT_NODE,))
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
+        """Generator visitor (driven by ``_drive_visit``). We push/pop
+        the enclosing-function stack on the way down/up so the
+        ``CallSite.caller`` field is the innermost NAMED enclosing
+        function — anonymous functions / arrows are walked-through
+        without affecting the caller attribution."""
+        if node.type in (self._CLASS_DECL, "abstract_class_declaration"):
+            # TS class names are ``type_identifier`` (JS uses ``identifier``).
+            # Without type_identifier the class was never pushed onto the
+            # class stack, so ``this.method()`` calls got no receiver_class and
+            # intra-class edges (a reachable method calling a private helper)
+            # were lost — every such helper read not_called.
+            name_node = self._first_child_of_type(
+                node, (self._IDENT_NODE, "type_identifier"),
+            )
             if name_node is not None:
-                bases: List[str] = []
+                bases: list[str] = []
                 heritage = self._first_child_of_type(node, (
                     self._CLASS_HERITAGE,
                 ))
                 if heritage is not None:
-                    # ``extends Foo`` → identifier child; ``extends
-                    # mixin(Base)`` → call_expression. Capture the
-                    # innermost identifier where present.
+                    # JS: ``extends Foo`` puts the identifier directly in
+                    # class_heritage. TS wraps bases in ``extends_clause`` /
+                    # ``implements_clause`` (type_identifier children), so a
+                    # TS ``class C extends B implements I`` was capturing NO
+                    # bases at all — CHA never saw the hierarchy, so virtual-
+                    # dispatch overrides in TS read not_called. Capture direct
+                    # identifiers AND the clause-wrapped extends/implements
+                    # type names.
+                    base_node_types = (self._IDENT_NODE, "type_identifier")
                     for hc in heritage.children:
-                        if hc.type == self._IDENT_NODE:
+                        if hc.type in base_node_types:
                             bases.append(hc.text.decode())
+                        elif hc.type in ("extends_clause", "implements_clause"):
+                            bases.extend(gc.text.decode() for gc in hc.children if gc.type in base_node_types)
                 cdef = ClassDef(
                     name=name_node.text.decode(),
                     line=node.start_point[0] + 1,
@@ -649,19 +1703,32 @@ class _JsCallGraph:
                 )
                 self.graph.classes.append(cdef)
                 self._class_stack.append(cdef)
+                # Pre-scan typed fields (TS) so a field used before its
+                # textual declaration still resolves (Tier 2).
+                body = self._first_child_of_type(node, (self._CLASS_BODY,))
+                self._field_types.append(self._collect_field_types(body))
                 try:
                     for child in node.children:
-                        self.walk(child)
+                        yield child
                 finally:
                     self._class_stack.pop()
+                    self._field_types.pop()
                 return
             # Anon class — recurse without push.
             for child in node.children:
-                self.walk(child)
+                yield child
             return
 
         if node.type in self._FUNC_NODES:
             name = self._function_name(node)
+            # Scope the function's typed params (TS) for the duration of
+            # its body, for both named and anonymous functions. A nested
+            # closure that references an outer-scope var sees no binding
+            # (receiver_type None → unresolved → FN-safe).
+            saved_locals = self._local_types
+            self._local_types = self._collect_param_types(
+                self._first_child_of_type(node, (self._FORMAL_PARAMS,)))
+            pushed = False
             if name is not None:
                 # Register method on the immediate class (only when
                 # this is a method_definition, not a nested function
@@ -673,14 +1740,15 @@ class _JsCallGraph:
                         (name, node.start_point[0] + 1),
                     )
                 self._enclosing.append(name)
-                try:
-                    for child in node.children:
-                        self.walk(child)
-                finally:
+                pushed = True
+            try:
+                for child in node.children:
+                    yield child
+            finally:
+                if pushed:
                     self._enclosing.pop()
-                return
-            # Anonymous function / arrow — descend without a frame
-            # so calls inside attribute to the outer named scope.
+                self._local_types = saved_locals
+            return
 
         # Top-level shapes we care about. Calls come first because
         # an import_statement can't contain a call (and we never
@@ -692,6 +1760,8 @@ class _JsCallGraph:
 
         if node.type in self._LEX_DECL_NODES:
             self._visit_lex_decl(node)
+            # Bind typed locals in source order (TS ``const x: T = …``).
+            self._local_types.update(self._collect_local_types(node))
             # Continue descent so calls / functions inside (e.g.
             # ``const x = foo()`` — the ``foo()`` call) are seen.
 
@@ -699,8 +1769,19 @@ class _JsCallGraph:
             self._visit_call(node)
             # Descend into args to capture nested calls.
 
+        if node.type == self._NEW_NODE:
+            # ``new Function("...")`` compiles code at runtime whether
+            # invoked immediately or assigned and called later
+            # (``const f = new Function(...); f()``) — flag eval-style
+            # at CONSTRUCTION so the assigned-then-called form (the
+            # common style) keeps its masking flag. The immediate-
+            # invocation case in _visit_call is a harmless re-add.
+            cls = self._first_child_of_type(node, (self._IDENT_NODE,))
+            if cls is not None and cls.text.decode() == "Function":
+                self.graph.indirection.add(INDIRECTION_EVAL)
+
         for child in node.children:
-            self.walk(child)
+            yield child
 
     # ------------------------------------------------------------------
     # Imports
@@ -798,7 +1879,7 @@ class _JsCallGraph:
                             alias = ids[1].text.decode()
                             self.graph.imports[alias] = f"{module}.{orig}"
 
-    def _synthesise_class_from_expr(self, cls_node, name: str) -> None:
+    def _synthesise_class_from_expr(self, cls_node: Node, name: str) -> None:
         """``const Foo = class extends Bar { method() {} };``
 
         Pulls bases from class_heritage and method names from
@@ -806,16 +1887,14 @@ class _JsCallGraph:
         ``name`` (taken from the variable_declarator's LHS,
         since class expressions are anonymous in the grammar).
         """
-        bases: List[str] = []
+        bases: list[str] = []
         body = None
         for c in cls_node.children:
             if c.type == self._CLASS_HERITAGE:
-                for hc in c.children:
-                    if hc.type == self._IDENT_NODE:
-                        bases.append(hc.text.decode())
+                bases.extend(hc.text.decode() for hc in c.children if hc.type == self._IDENT_NODE)  # type: ignore[union-attr]
             elif c.type == self._CLASS_BODY:
                 body = c
-        methods: List[Tuple[str, int]] = []
+        methods: list[tuple[str, int]] = []
         if body is not None:
             for c in body.children:
                 if c.type != self._METHOD_DEF:
@@ -838,10 +1917,100 @@ class _JsCallGraph:
         ))
 
     # ------------------------------------------------------------------
+    # Typed-dispatch scope (Tier 2) — TS/TSX only (JS has no annotations)
+    # ------------------------------------------------------------------
+
+    def _type_name(self, type_node) -> str | None:
+        """Simple type name from a TS type node, or None for predefined
+        types (``string``/``number``/``void``) and shapes without a single
+        nominal type (unions, literals). ``Array<Foo>`` → ``Array``,
+        ``NS.T`` → ``T``, ``Foo[]`` → ``Foo``."""
+        if type_node is None:
+            return None
+        t = type_node.type
+        if t == self._TYPE_IDENT:
+            return type_node.text.decode("utf-8", errors="replace") or None
+        if t == self._NESTED_TYPE_IDENT:
+            ident = self._last_child_of_type(type_node, (self._TYPE_IDENT,))
+            return ident.text.decode() if ident is not None else None
+        if t == self._GENERIC_TYPE:
+            base = self._first_child_of_type(
+                type_node, (self._TYPE_IDENT, self._NESTED_TYPE_IDENT))
+            return self._type_name(base)
+        if t == self._ARRAY_TYPE:
+            inner = self._first_child_of_type(
+                type_node, (self._TYPE_IDENT, self._NESTED_TYPE_IDENT,
+                            self._GENERIC_TYPE, self._ARRAY_TYPE))
+            return self._type_name(inner)
+        return None  # predefined_type / union_type / literal / etc.
+
+    def _annotation_type(self, ann_node) -> str | None:
+        """Simple type name from a ``type_annotation`` (``: T``)."""
+        if ann_node is None:
+            return None
+        for c in ann_node.children:
+            if c.type != ":":
+                return self._type_name(c)
+        return None
+
+    def _collect_param_types(self, params_node) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if params_node is None:
+            return out
+        for p in params_node.children:
+            if p.type not in self._PARAM_NODES:
+                continue
+            name = self._first_child_of_type(p, (self._IDENT_NODE,))
+            tn = self._annotation_type(
+                self._first_child_of_type(p, (self._TYPE_ANNOTATION,)))
+            if tn and name is not None:
+                out[name.text.decode("utf-8", errors="replace")] = tn
+        return out
+
+    def _collect_field_types(self, class_body) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if class_body is None:
+            return out
+        for member in class_body.children:
+            if member.type != self._PUBLIC_FIELD:
+                continue
+            name = self._first_child_of_type(member, (self._PROP_IDENT,))
+            tn = self._annotation_type(
+                self._first_child_of_type(member, (self._TYPE_ANNOTATION,)))
+            if tn and name is not None:
+                out[name.text.decode("utf-8", errors="replace")] = tn
+        return out
+
+    def _collect_local_types(self, lex_decl_node) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for d in lex_decl_node.children:
+            if d.type != self._VAR_DECLARATOR_NODE:
+                continue
+            name = self._first_child_of_type(d, (self._IDENT_NODE,))
+            tn = self._annotation_type(
+                self._first_child_of_type(d, (self._TYPE_ANNOTATION,)))
+            if tn and name is not None:
+                out[name.text.decode("utf-8", errors="replace")] = tn
+        return out
+
+    def _resolve_receiver_type(self, chain: list[str]) -> str | None:
+        """Declared type of a length-2 ``recv.m()`` receiver — local/param
+        then enclosing-class field. None for this/super receivers, longer
+        chains, or untyped receivers."""
+        if len(chain) != 2 or chain[0] in ("this", "super"):
+            return None
+        recv = chain[0]
+        if recv in self._local_types:
+            return self._local_types[recv]
+        if self._field_types and recv in self._field_types[-1]:
+            return self._field_types[-1][recv]
+        return None
+
+    # ------------------------------------------------------------------
     # Calls + indirection
     # ------------------------------------------------------------------
 
-    def _visit_call(self, node) -> None:
+    def _visit_call(self, node: Node) -> None:
         """Every ``call_expression``. Detect:
 
           * Plain ``foo()`` and ``a.b.c()`` → recorded as CallSite.
@@ -902,23 +2071,34 @@ class _JsCallGraph:
         # does NOT — JS unqualified names resolve through the
         # lexical scope (could be a module-level function, an
         # import, or a closure variable), not via implicit-this.
-        receiver_class: Optional[str] = None
+        # Exactly length 2: in ``this.helper.render()`` the method
+        # belongs to the FIELD's class, not the enclosing one — a
+        # wrong tag makes the resolver drop the real caller edge.
+        receiver_class: str | None = None
         if (self._class_stack and not self._class_stack[-1].nested
                 and self._enclosing
-                and len(chain) >= 2 and chain[0] == "this"):
+                and len(chain) == 2 and chain[0] == "this"):
             receiver_class = self._class_stack[-1].name
+        # Typed dispatch (Tier 2, TS/TSX): declared type of a simple
+        # ``recv.m()`` receiver when not a this-call.
+        receiver_type = (
+            self._resolve_receiver_type(chain)
+            if receiver_class is None else None
+        )
         self.graph.calls.append(CallSite(
             line=node.start_point[0] + 1,
             chain=chain,
             caller=caller,
             receiver_class=receiver_class,
+            argument_identifiers=self._call_identifier_args(node),
+            receiver_type=receiver_type,
         ))
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _function_name(self, node) -> Optional[str]:
+    def _function_name(self, node) -> str | None:
         """Best-effort name extraction for a function-shape node.
 
         ``function foo() {}`` → ``foo``.
@@ -963,7 +2143,7 @@ class _JsCallGraph:
                 return c
         return None
 
-    def _callee_chain(self, callee) -> Optional[List[str]]:
+    def _callee_chain(self, callee) -> list[str] | None:
         """Convert a call's callee node into the dotted attribute
         chain. Returns None for non-name callees (subscripts,
         function returns, ``new_expression``, etc.)."""
@@ -972,7 +2152,7 @@ class _JsCallGraph:
         if callee.type == self._IDENT_NODE:
             return [callee.text.decode()]
         if callee.type == self._MEMBER_NODE:
-            parts: List[str] = []
+            parts: list[str] = []
             cur = callee
             while cur is not None and cur.type == self._MEMBER_NODE:
                 prop = self._last_child_of_type(
@@ -1004,7 +2184,37 @@ class _JsCallGraph:
                 return c.type == self._STRING_NODE
         return False
 
-    def _subscript_string_literal(self, subscript_node) -> Optional[str]:
+    def _call_identifier_args(self, call_node) -> list[str]:
+        """Bare-identifier argument names at this call site, in order.
+
+        ``f(handler)`` → ``["handler"]``.
+        ``app.get('/x', handler)`` → ``["handler"]`` (string literal
+        skipped — only identifiers are recorded).
+        ``app.use(mw1, mw2)`` → ``["mw1", "mw2"]``.
+        ``f(() => {}, 42)`` → ``[]`` (arrow function not an identifier).
+        ``f(obj.method)`` → ``[]`` (member access not a bare ident;
+        recorded as a CALL chain elsewhere when invoked but here as
+        an argument we conservatively skip — bare references to
+        functions defined in the file are the load-bearing case for
+        framework-registration detection).
+
+        Used by the resolver to detect function-as-argument
+        registration patterns (Express ``app.get(path, handler)``,
+        Go ``http.HandleFunc(path, handler)``). Empty list when no
+        identifier args present — vast majority of call sites.
+        """
+        args = self._first_child_of_type(call_node, (self._ARGS_NODE,))
+        if args is None:
+            return []
+        out: list[str] = []
+        for c in args.children:
+            if not c.is_named:
+                continue
+            if c.type == self._IDENT_NODE:
+                out.append(c.text.decode())
+        return out
+
+    def _subscript_string_literal(self, subscript_node) -> str | None:
         """``obj["name"]`` → ``"name"``. Returns None for
         ``obj[var]``."""
         # The subscript_expression children (named) are
@@ -1020,7 +2230,7 @@ class _JsCallGraph:
             return None
         return frag.text.decode()
 
-    def _import_module_name(self, import_node) -> Optional[str]:
+    def _import_module_name(self, import_node) -> str | None:
         """First ``string`` child of an ``import_statement`` carries
         the module path."""
         s = self._first_child_of_type(import_node, (self._STRING_NODE,))
@@ -1041,7 +2251,7 @@ class _JsCallGraph:
             return None
         return named[-1]
 
-    def _require_module_name(self, value_node) -> Optional[str]:
+    def _require_module_name(self, value_node) -> str | None:
         """Detect ``require('foo')`` and return ``'foo'``. Anything
         else (including ``require(variable)``) → None."""
         if value_node.type != self._CALL_NODE:
@@ -1093,7 +2303,7 @@ class _JsCallGraph:
 INDIRECTION_REFLECT = "reflect"
 
 
-def _go_bare_binding_names(path: str) -> List[str]:
+def _go_bare_binding_names(path: str) -> list[str]:
     """Binding names a bare Go ``import "<path>"`` makes available.
 
     Go's nominal rule is "the last path segment is the package
@@ -1123,12 +2333,35 @@ def _go_bare_binding_names(path: str) -> List[str]:
     binds in order without overwriting existing entries — first
     import wins, matching Go's compile-time duplicate-name rule.
     """
-    names: List[str] = []
+    names: list[str] = []
     last = path.rsplit("/", 1)[-1]
     if not last:
         return names
 
     names.append(last)
+
+    def _hyphen_aliases(segment: str) -> list[str]:
+        """Convention aliases for one path segment."""
+        aliases: list[str] = []
+        # ``go-<name>`` repos declare their package WITHOUT the prefix
+        # (go-multierror → package multierror) — the dominant naming
+        # convention for go-* modules; without this alias every call
+        # into such a package fails to resolve.
+        if segment.startswith("go-") and len(segment) > 3:
+            aliases.append(segment[3:])
+            aliases.append(segment[3:].replace("-", ""))
+        # Hyphenated segment: also bind a hyphen-collapsed form (Go
+        # identifiers can't contain hyphens).
+        if "-" in segment:
+            aliases.append(segment.replace("-", ""))
+        # De-dup while preserving order (go-x collapses may coincide).
+        seen: set[str] = set()
+        out: list[str] = []
+        for a in aliases:
+            if a and a not in seen:
+                seen.add(a)
+                out.append(a)
+        return out
 
     # Versioned module suffix: also bind the pre-version segment.
     if last.startswith("v") and len(last) > 1 and last[1:].isdigit():
@@ -1137,17 +2370,31 @@ def _go_bare_binding_names(path: str) -> List[str]:
             pre_v_last = stripped.rsplit("/", 1)[-1]
             if pre_v_last:
                 names.append(pre_v_last)
-                if "-" in pre_v_last:
-                    names.append(pre_v_last.replace("-", ""))
+                names.extend(_hyphen_aliases(pre_v_last))
 
-    # Hyphenated last segment: also bind a hyphen-collapsed form.
-    if "-" in last:
-        names.append(last.replace("-", ""))
+    # gopkg.in-style DOT-VERSIONED segment: ``gopkg.in/yaml.v2``
+    # declares package ``yaml`` — the convention for EVERY gopkg.in
+    # path (``gopkg.in/<pkg>.vN`` and ``gopkg.in/<user>/<pkg>.vN``),
+    # and the ``<name>.vN`` spelling wherever else it appears. The
+    # literal last segment (``yaml.v2``) is not a valid Go
+    # identifier, so bare-last-segment binding missed every call
+    # into such a package. The pre-dot part composes with the
+    # hyphen conventions (``go-git.v4`` → ``go-git`` → ``git`` /
+    # ``gogit``).
+    dot_base, dot, dot_ver = last.rpartition(".")
+    if (dot and dot_base and dot_ver.startswith("v")
+            and len(dot_ver) > 1 and dot_ver[1:].isdigit()):
+        names.append(dot_base)
+        names.extend(_hyphen_aliases(dot_base))
+
+    names.extend(_hyphen_aliases(last))
 
     return names
 
 
-def extract_call_graph_go(content: str) -> FileCallGraph:
+def extract_call_graph_go(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Go source string via tree-sitter and return its
     :class:`FileCallGraph`.
 
@@ -1174,21 +2421,8 @@ def extract_call_graph_go(content: str) -> FileCallGraph:
     so ``http.HandlerFunc(...)`` resolves to ``"net/http" +
     ".HandlerFunc"`` for the resolver's chain comparison.
     """
-    try:
-        import tree_sitter_go as ts_go
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter Go grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_go.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                          # noqa: BLE001
-        logger.debug("call_graph: Go parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_go", "Go", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _GoCallGraph()
@@ -1219,11 +2453,15 @@ class _GoCallGraph:
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
 
     def walk(self, node) -> None:
-        """Recursive descent. Push/pop enclosing-function stack so
-        ``CallSite.caller`` carries the innermost named function."""
+        _drive_visit(self, node)
+
+    def _visit(self, node):
+        """Generator visitor (driven by ``_drive_visit``). Push/pop
+        enclosing-function stack so ``CallSite.caller`` carries the
+        innermost named function."""
         if node.type == self._FUNC_DECL_NODE:
             name = self._first_child_of_type(
                 node, (self._IDENT_NODE,),
@@ -1233,7 +2471,7 @@ class _GoCallGraph:
             )
             try:
                 for child in node.children:
-                    self.walk(child)
+                    yield child
             finally:
                 self._enclosing.pop()
             return
@@ -1249,7 +2487,7 @@ class _GoCallGraph:
             )
             try:
                 for child in node.children:
-                    self.walk(child)
+                    yield child
             finally:
                 self._enclosing.pop()
             return
@@ -1276,7 +2514,9 @@ class _GoCallGraph:
                     self.graph.package_name = pkg_ident.text.decode(
                         "utf-8", errors="replace",
                     ).strip()
-                except Exception:                       # noqa: BLE001
+                except AttributeError:
+                    # tree-sitter Node.text is None on a malformed
+                    # package clause — keep walking.
                     pass
             return
 
@@ -1285,7 +2525,7 @@ class _GoCallGraph:
             # Continue recursion to capture nested calls in args.
 
         for child in node.children:
-            self.walk(child)
+            yield child
 
     # ------------------------------------------------------------------
     # Imports
@@ -1348,7 +2588,7 @@ class _GoCallGraph:
             if name and name not in self.graph.imports:
                 self.graph.imports[name] = path
 
-    def _import_path(self, spec) -> Optional[str]:
+    def _import_path(self, spec) -> str | None:
         """Pull the string literal out of an import_spec."""
         s = self._first_child_of_type(spec, (self._STRING_LIT_NODE,))
         if s is None:
@@ -1364,7 +2604,7 @@ class _GoCallGraph:
     # Calls + indirection
     # ------------------------------------------------------------------
 
-    def _visit_call(self, node) -> None:
+    def _visit_call(self, node: Node) -> None:
         """Every ``call_expression``. Detect:
 
           * Plain ``foo()`` and ``a.b.c()`` → recorded as CallSite.
@@ -1396,6 +2636,7 @@ class _GoCallGraph:
             line=node.start_point[0] + 1,
             chain=chain,
             caller=caller,
+            argument_identifiers=self._call_identifier_args(node),
         ))
 
     def _call_callee(self, call_node):
@@ -1407,14 +2648,48 @@ class _GoCallGraph:
                 return c
         return None
 
-    def _callee_chain(self, callee) -> Optional[List[str]]:
+    def _call_identifier_args(self, call_node) -> list[str]:
+        """Bare-identifier argument names at this call site, in order.
+
+        ``http.HandleFunc("/x", handler)`` → ``["handler"]`` (string
+        literal skipped — only identifiers are recorded).
+        ``router.GET("/users", listUsers, authMW)`` →
+        ``["listUsers", "authMW"]``.
+        ``f(struct{}{})`` → ``[]`` (composite literal not an
+        identifier).
+        ``f(obj.Method)`` → ``[]`` (selector_expression not a bare
+        identifier; method values aren't recorded here — the
+        load-bearing case for framework-registration detection is
+        bare function references defined in the file).
+
+        Used by the resolver to detect function-as-argument
+        registration patterns (net/http ``HandleFunc``, gin/echo
+        ``GET/POST/...``, chi ``Get/Post/...``). Empty list when no
+        identifier args present — vast majority of call sites.
+        """
+        args = None
+        for c in call_node.children:
+            if c.type == self._ARG_LIST_NODE:
+                args = c
+                break
+        if args is None:
+            return []
+        out: list[str] = []
+        for c in args.children:
+            if not c.is_named:
+                continue
+            if c.type == self._IDENT_NODE:
+                out.append(c.text.decode())
+        return out
+
+    def _callee_chain(self, callee) -> list[str] | None:
         """``foo`` → ``["foo"]``;
         ``foo.Bar`` → ``["foo", "Bar"]``;
         ``foo.Bar.Baz`` → ``["foo", "Bar", "Baz"]``."""
         if callee.type == self._IDENT_NODE:
             return [callee.text.decode()]
         if callee.type == self._SELECTOR_NODE:
-            parts: List[str] = []
+            parts: list[str] = []
             cur = callee
             while cur is not None and cur.type == self._SELECTOR_NODE:
                 # ``selector_expression`` → operand + field_identifier.
@@ -1465,7 +2740,9 @@ class _GoCallGraph:
 # ---------------------------------------------------------------------------
 
 
-def extract_call_graph_java(content: str) -> FileCallGraph:
+def extract_call_graph_java(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Java source string via tree-sitter and return its
     :class:`FileCallGraph`.
 
@@ -1504,21 +2781,8 @@ def extract_call_graph_java(content: str) -> FileCallGraph:
     method-on-instance — out of scope; CodeQL is the right tool
     when type-aware reachability matters.
     """
-    try:
-        import tree_sitter_java as ts_java
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter Java grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_java.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                          # noqa: BLE001
-        logger.debug("call_graph: Java parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_java", "Java", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _JavaCallGraph()
@@ -1550,19 +2814,44 @@ class _JavaCallGraph:
     _ASTERISK = "asterisk"
     _STATIC = "static"
     _STRING_LIT = "string_literal"
+    _FORMAL_PARAMS = "formal_parameters"
+    _FORMAL_PARAM = "formal_parameter"
+    _SPREAD_PARAM = "spread_parameter"
+    _FIELD_DECL = "field_declaration"
+    _LOCAL_VAR_DECL = "local_variable_declaration"
+    _VAR_DECLARATOR = "variable_declarator"
+    _CLASS_BODY = "class_body"
+    _SCOPED_TYPE_IDENT = "scoped_type_identifier"
+    _GENERIC_TYPE = "generic_type"
+    _ARRAY_TYPE = "array_type"
+    _TYPE_NODES = (_TYPE_IDENT, _SCOPED_TYPE_IDENT, _GENERIC_TYPE, _ARRAY_TYPE)
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
         # Class-context stack — Java methods always live inside a
         # class. The innermost class is what ``self.method()`` /
         # ``this.method()`` calls dispatch on. Captured for
         # class-aware narrowing parity with Python.
-        self._class_stack: List[ClassDef] = []
+        self._class_stack: list[ClassDef] = []
+        # Typed-dispatch scope tracking (Tier 2). ``_field_types`` is a
+        # stack parallel to ``_class_stack`` — field name → declared
+        # type for the enclosing class (pre-scanned on class entry so a
+        # field used before its textual declaration still resolves).
+        # ``_local_types`` is the current method's param + local-var
+        # name → declared type (reset per method, populated in source
+        # order). A length-2 ``recv.m()`` whose ``recv`` resolves here
+        # gets ``CallSite.receiver_type``.
+        self._field_types: list[dict[str, str]] = []
+        self._local_types: dict[str, str] = {}
 
     def walk(self, node) -> None:
-        """Recursive descent. Push/pop enclosing-method stack so
-        ``CallSite.caller`` carries the innermost named method."""
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
+        """Generator visitor (driven by ``_drive_visit``). Push/pop
+        enclosing-method stack so ``CallSite.caller`` carries the
+        innermost named method."""
         if node.type == self._METHOD_DECL:
             name = self._first_child_of_type(node, (self._IDENT,))
             method_name = name.text.decode() if name else "<anon>"
@@ -1575,11 +2864,15 @@ class _JavaCallGraph:
                     (method_name, node.start_point[0] + 1),
                 )
             self._enclosing.append(method_name)
+            saved_locals = self._local_types
+            self._local_types = self._collect_param_types(
+                self._first_child_of_type(node, (self._FORMAL_PARAMS,)))
             try:
                 for child in node.children:
-                    self.walk(child)
+                    yield child
             finally:
                 self._enclosing.pop()
+                self._local_types = saved_locals
             return
 
         if node.type == self._CONSTRUCTOR_DECL:
@@ -1591,11 +2884,15 @@ class _JavaCallGraph:
                     (ctor_name, node.start_point[0] + 1),
                 )
             self._enclosing.append(ctor_name)
+            saved_locals = self._local_types
+            self._local_types = self._collect_param_types(
+                self._first_child_of_type(node, (self._FORMAL_PARAMS,)))
             try:
                 for child in node.children:
-                    self.walk(child)
+                    yield child
             finally:
                 self._enclosing.pop()
+                self._local_types = saved_locals
             return
 
         if node.type == self._IMPORT_DECL:
@@ -1635,7 +2932,7 @@ class _JavaCallGraph:
                 name_node.text.decode("utf-8", errors="replace")
                 if name_node is not None else None
             )
-            bases: List[str] = []
+            bases: list[str] = []
             for child in node.children:
                 if child.type == self._SUPERCLASS:
                     # ``extends Base`` — direct type_identifier child.
@@ -1645,7 +2942,7 @@ class _JavaCallGraph:
                             text = (
                                 self._scoped_identifier_text(sub)
                                 if sub.type == self._SCOPED_IDENT
-                                else sub.text.decode(
+                                else sub.text.decode(  # type: ignore[union-attr]
                                     "utf-8", errors="replace",
                                 )
                             )
@@ -1664,7 +2961,7 @@ class _JavaCallGraph:
                                 text = (
                                     self._scoped_identifier_text(sub)
                                     if sub.type == self._SCOPED_IDENT
-                                    else sub.text.decode(
+                                    else sub.text.decode(  # type: ignore[union-attr]
                                         "utf-8", errors="replace",
                                     )
                                 )
@@ -1679,15 +2976,33 @@ class _JavaCallGraph:
                 )
                 self.graph.classes.append(cdef)
                 self._class_stack.append(cdef)
+                # Pre-scan depth-1 field declarations so a field used in
+                # a method before its textual declaration still resolves.
+                field_types: dict[str, str] = {}
+                body = self._first_child_of_type(node, (self._CLASS_BODY,))
+                if body is not None:
+                    for member in body.children:
+                        if member.type == self._FIELD_DECL:
+                            field_types.update(self._collect_decl_types(member))
+                self._field_types.append(field_types)
                 try:
                     for child in node.children:
-                        self.walk(child)
+                        yield child
                 finally:
                     self._class_stack.pop()
+                    self._field_types.pop()
                 return
             # Anon / malformed — recurse without class push
             for child in node.children:
-                self.walk(child)
+                yield child
+            return
+
+        if node.type == self._LOCAL_VAR_DECL:
+            # Bind locals in source order; Java requires declare-before-use
+            # so a call earlier in the method correctly sees no binding.
+            self._local_types.update(self._collect_decl_types(node))
+            for child in node.children:
+                yield child
             return
 
         if node.type == self._METHOD_INVOCATION:
@@ -1695,7 +3010,7 @@ class _JavaCallGraph:
             # Continue recursion to capture nested calls in args.
 
         for child in node.children:
-            self.walk(child)
+            yield child
 
     # ------------------------------------------------------------------
     # Imports
@@ -1745,10 +3060,80 @@ class _JavaCallGraph:
             return ""
 
     # ------------------------------------------------------------------
+    # Typed-dispatch scope (Tier 2)
+    # ------------------------------------------------------------------
+
+    def _type_name(self, type_node) -> str | None:
+        """Simple (unqualified) type name from a Java type node, or None
+        for primitives / unresolvable shapes. Strips generics + array
+        dimensions to the base reference type (``List<Foo>`` → ``List``,
+        ``com.x.Handler`` → ``Handler``, ``Foo[]`` → ``Foo``)."""
+        if type_node is None:
+            return None
+        t = type_node.type
+        if t == self._TYPE_IDENT:
+            return type_node.text.decode("utf-8", errors="replace") or None
+        if t == self._SCOPED_TYPE_IDENT:
+            txt = type_node.text.decode("utf-8", errors="replace")
+            return (txt.rsplit(".", 1)[-1].strip() or None) if txt else None
+        if t in (self._GENERIC_TYPE, self._ARRAY_TYPE):
+            base = self._first_child_of_type(
+                type_node, (self._TYPE_IDENT, self._SCOPED_TYPE_IDENT,
+                            self._GENERIC_TYPE, self._ARRAY_TYPE),
+            )
+            return self._type_name(base)
+        return None  # primitives (integral_type/void_type/…) — no dispatch
+
+    def _collect_param_types(self, params_node) -> dict[str, str]:
+        """``name → declared type`` for a ``formal_parameters`` node."""
+        out: dict[str, str] = {}
+        if params_node is None:
+            return out
+        for p in params_node.children:
+            if p.type not in (self._FORMAL_PARAM, self._SPREAD_PARAM):
+                continue
+            type_node = self._first_child_of_type(p, self._TYPE_NODES)
+            name_node = self._first_child_of_type(p, (self._IDENT,))
+            tn = self._type_name(type_node)
+            if tn and name_node is not None:
+                out[name_node.text.decode("utf-8", errors="replace")] = tn
+        return out
+
+    def _collect_decl_types(self, decl_node) -> dict[str, str]:
+        """``name → declared type`` for a ``field_declaration`` or
+        ``local_variable_declaration`` (one type, ≥1 declarators)."""
+        out: dict[str, str] = {}
+        tn = self._type_name(
+            self._first_child_of_type(decl_node, self._TYPE_NODES))
+        if not tn:
+            return out
+        for c in decl_node.children:
+            if c.type != self._VAR_DECLARATOR:
+                continue
+            name_node = self._first_child_of_type(c, (self._IDENT,))
+            if name_node is not None:
+                out[name_node.text.decode("utf-8", errors="replace")] = tn
+        return out
+
+    def _resolve_receiver_type(self, chain: list[str]) -> str | None:
+        """Declared type of a length-2 ``recv.m()`` receiver — a local /
+        param (looked up first) or a field of the enclosing class. None
+        when unresolvable (longer chain, ``this``/``super`` receiver,
+        untyped local)."""
+        if len(chain) != 2 or chain[0] in ("this", "super"):
+            return None
+        recv = chain[0]
+        if recv in self._local_types:
+            return self._local_types[recv]
+        if self._field_types and recv in self._field_types[-1]:
+            return self._field_types[-1][recv]
+        return None
+
+    # ------------------------------------------------------------------
     # Calls + indirection
     # ------------------------------------------------------------------
 
-    def _visit_call(self, node) -> None:
+    def _visit_call(self, node: Node) -> None:
         """Every ``method_invocation``. Detect:
 
           * Plain ``foo()`` — chain ``["foo"]``.
@@ -1772,9 +3157,7 @@ class _JavaCallGraph:
         #     Method.invoke / Constructor.newInstance patterns.
         if chain == ["Class", "forName"]:
             self.graph.indirection.add(INDIRECTION_IMPORTLIB)
-        elif chain[-1:] == ["invoke"] and len(chain) >= 2:
-            self.graph.indirection.add(INDIRECTION_REFLECT)
-        elif chain[-1:] == ["newInstance"] and len(chain) >= 2:
+        elif (chain[-1:] == ["invoke"] and len(chain) >= 2) or (chain[-1:] == ["newInstance"] and len(chain) >= 2):
             self.graph.indirection.add(INDIRECTION_REFLECT)
 
         caller = self._enclosing[-1] if self._enclosing else None
@@ -1784,22 +3167,30 @@ class _JavaCallGraph:
         # dispatch on the innermost non-nested enclosing class.
         # ``super.foo()`` is the parent — leave receiver_class
         # None and let the resolver search bases via the hierarchy.
-        receiver_class: Optional[str] = None
+        receiver_class: str | None = None
         if (self._class_stack and not self._class_stack[-1].nested
-                and self._enclosing):
-            if len(chain) == 1:
-                receiver_class = self._class_stack[-1].name
-            elif len(chain) == 2 and chain[0] == "this":
-                receiver_class = self._class_stack[-1].name
+                and self._enclosing
+                and (len(chain) == 1
+                     or (len(chain) == 2 and chain[0] == "this"))):
+            receiver_class = self._class_stack[-1].name
+
+        # Typed dispatch (Tier 2): when the receiver is a simple
+        # identifier with a declared type in scope (param/local/field),
+        # record it so the resolver can bind to that type's hierarchy.
+        receiver_type = (
+            self._resolve_receiver_type(chain)
+            if receiver_class is None else None
+        )
 
         self.graph.calls.append(CallSite(
             line=node.start_point[0] + 1,
             chain=chain,
             caller=caller,
             receiver_class=receiver_class,
+            receiver_type=receiver_type,
         ))
 
-    def _invocation_chain(self, node) -> Optional[List[str]]:
+    def _invocation_chain(self, node) -> list[str] | None:
         """Convert a ``method_invocation`` node into the dotted
         chain.
 
@@ -1822,7 +3213,7 @@ class _JavaCallGraph:
         # The method name is always the LAST named identifier
         # before the argument_list; preceding names are the
         # receiver chain.
-        named_before_args: List[Any] = []
+        named_before_args: list[Any] = []
         for child in node.children:
             if child.type == self._ARG_LIST:
                 break
@@ -1869,10 +3260,15 @@ class _JavaCallGraph:
 
         return None
 
-    def _field_access_chain(self, node) -> Optional[List[str]]:
-        """``a.b.c`` (a ``field_access`` subtree) → ``["a", "b", "c"]``."""
+    def _field_access_chain(self, node) -> list[str] | None:
+        """``a.b.c`` (a ``field_access`` subtree) → ``["a", "b", "c"]``.
+
+        A ``this``-rooted chain (``this.b.doIt()`` — the standard
+        field-collaborator idiom) terminates in a ``this`` node, not a
+        plain identifier; dropping it lost the whole CallSite and gave
+        methods invoked only through fields a false NOT_CALLED."""
         # field_access children: object + . + field
-        parts: List[str] = []
+        parts: list[str] = []
         cur = node
         while cur is not None and cur.type == self._FIELD_ACCESS:
             field = self._last_child_of_type(cur, (self._IDENT,))
@@ -1888,6 +3284,9 @@ class _JavaCallGraph:
             cur = operand
         if cur is not None and cur.type == self._IDENT:
             parts.append(cur.text.decode())
+            return list(reversed(parts))
+        if cur is not None and cur.type in ("this", "super"):
+            parts.append(cur.type)
             return list(reversed(parts))
         return None
 
@@ -1916,17 +3315,20 @@ class _JavaCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_rust(content: str) -> FileCallGraph:
+def extract_call_graph_rust(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Rust source string via tree-sitter-rust and return its
     :class:`FileCallGraph`.
 
     Returns an empty graph when ``tree_sitter_rust`` isn't installed
     or the file is unparseable.
 
-    Rust shapes:
+    Rust shapes (import-map VALUES are dot-joined — the walker
+    normalises ``::`` paths so OSV symbol matching stays uniform):
 
-      * ``use foo::bar::Baz;`` -> ``imports["Baz"] = "foo::bar::Baz"``
-      * ``use foo::bar as alias;`` -> ``imports["alias"] = "foo::bar"``
+      * ``use foo::bar::Baz;`` -> ``imports["Baz"] = "foo.bar.Baz"``
+      * ``use foo::bar as alias;`` -> ``imports["alias"] = "foo.bar"``
       * ``use foo::{Bar, Baz as B};`` -> binds both
       * ``use foo::*;`` -> ``INDIRECTION_WILDCARD_IMPORT``
       * ``Baz::new()`` (scoped path call) -> chain ``["Baz", "new"]``
@@ -1934,26 +3336,15 @@ def extract_call_graph_rust(content: str) -> FileCallGraph:
       * ``inst.method()`` -> chain ``["inst", "method"]``
         (instance-method limitation as in Java/Go)
 
-    Reflection-style indirection is uncommon in Rust; we don't flag
-    macros (compile-time expansion is genuinely transparent). Type
-    erasure (``Any::downcast_ref``) is rare in CVE-relevant code
-    and emits a normal call chain.
+    Type-erased dispatch (``Any::downcast{,_ref,_mut}``, ``transmute``)
+    hides the concrete target, so a file using it is flagged
+    ``INDIRECTION_REFLECT`` (its functions hedge to UNCERTAIN). Macros are
+    NOT flagged: macro invocations are ubiquitous in Rust and blanket-
+    masking every macro-using file would gut the not_called signal —
+    macro-generated call edges remain a documented limitation.
     """
-    try:
-        import tree_sitter_rust as ts_rust
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter Rust grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_rust.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Rust parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_rust", "Rust", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _RustCallGraph()
@@ -1986,21 +3377,29 @@ class _RustCallGraph:
     _MOD_ITEM = "mod_item"
     _DECL_LIST = "declaration_list"
     _SELF = "self"
+    # Type-erased dispatch primitives — calls whose concrete target is hidden
+    # at runtime; their presence masks the file's functions to UNCERTAIN.
+    _REFLECT_TAILS = frozenset({
+        "downcast", "downcast_ref", "downcast_mut", "transmute",
+    })
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
         # Class context for ``impl Foo { fn m() {} }`` — methods
         # in the impl block belong to ``Foo``. ``impl Trait for
         # Foo`` also belongs to ``Foo`` (the second type_identifier).
         # Same convention as Python / Java class_stack.
-        self._class_stack: List[ClassDef] = []
+        self._class_stack: list[ClassDef] = []
         # Module nesting for mod_item; not threaded into
         # package_name (Rust file modules are path-derived) but
         # used to mark nested classes.
         self._mod_depth: int = 0
 
     def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
         if node.type == self._FUNCTION_ITEM:
             name = self._first_child_of_type(node, (self._IDENT,))
             method_name = name.text.decode() if name else "<anon>"
@@ -2016,7 +3415,7 @@ class _RustCallGraph:
             self._enclosing.append(method_name)
             try:
                 for c in node.children:
-                    self.walk(c)
+                    yield c
             finally:
                 self._enclosing.pop()
             return
@@ -2041,7 +3440,7 @@ class _RustCallGraph:
             self._mod_depth += 1
             try:
                 for c in node.children:
-                    self.walk(c)
+                    yield c
             finally:
                 self._mod_depth -= 1
             return
@@ -2055,7 +3454,7 @@ class _RustCallGraph:
             name_node = self._first_child_of_type(node, (
                 self._TYPE_IDENT,
             ))
-            bases: List[str] = []
+            bases: list[str] = []
             if node.type == self._TRAIT_ITEM:
                 # Trait supertraits live inside a ``trait_bounds``
                 # node — collect type_identifiers there.
@@ -2063,9 +3462,7 @@ class _RustCallGraph:
                     "trait_bounds",
                 ))
                 if bounds is not None:
-                    for sub in bounds.children:
-                        if sub.type == self._TYPE_IDENT:
-                            bases.append(sub.text.decode())
+                    bases.extend(sub.text.decode() for sub in bounds.children if sub.type == self._TYPE_IDENT)
             if name_node is not None:
                 cdef = ClassDef(
                     name=name_node.text.decode(),
@@ -2084,13 +3481,13 @@ class _RustCallGraph:
                 self._class_stack.append(cdef)
                 try:
                     for c in node.children:
-                        self.walk(c)
+                        yield c
                 finally:
                     self._class_stack.pop()
                 return
             # Anon — recurse without push.
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         if node.type == self._IMPL_ITEM:
@@ -2101,10 +3498,10 @@ class _RustCallGraph:
             # impls (``impl<T> Box<T>``) wrap the target in a
             # ``generic_type`` node whose first child is the
             # type_identifier we want.
-            target_names: List[str] = []
+            target_names: list[str] = []
             for c in node.children:
                 if c.type == self._TYPE_IDENT:
-                    target_names.append(c.text.decode())
+                    target_names.append(c.text.decode())  # type: ignore[union-attr]
                 elif c.type == "generic_type":
                     ti = self._first_child_of_type(c, (self._TYPE_IDENT,))
                     if ti is not None:
@@ -2117,9 +3514,20 @@ class _RustCallGraph:
                 # Unsupported shape — skip class binding, still
                 # recurse so calls inside are still captured.
                 for c in node.children:
-                    self.walk(c)
+                    yield c
                 return
             target = target_names[-1]
+            # ``impl Trait for Foo`` (a ``for`` keyword + >=2 type names) is a
+            # TRAIT impl — record the trait as a base of the target so its
+            # methods become virtual-dispatch candidates (a trait method is
+            # reachable via ``&dyn Trait`` / a generic bound even with no
+            # resolved caller). ``impl Foo`` (inherent) records no base.
+            trait_base = (
+                target_names[0]
+                if (len(target_names) >= 2
+                    and any(c.type == "for" for c in node.children))
+                else None
+            )
             # Try to bind to the already-recorded ClassDef
             # (same-file struct/enum) so methods accumulate on a
             # single ClassDef rather than per-impl. If the impl
@@ -2134,14 +3542,17 @@ class _RustCallGraph:
                 target_cls = ClassDef(
                     name=target,
                     line=node.start_point[0] + 1,
-                    bases=[],
+                    bases=[trait_base] if trait_base else [],
                     nested=self._mod_depth > 0,
                 )
                 self.graph.classes.append(target_cls)
+            elif trait_base and trait_base not in target_cls.bases:
+                # Accumulate trait bases across multiple impl blocks.
+                target_cls.bases.append(trait_base)
             self._class_stack.append(target_cls)
             try:
                 for c in node.children:
-                    self.walk(c)
+                    yield c
             finally:
                 self._class_stack.pop()
             return
@@ -2154,7 +3565,7 @@ class _RustCallGraph:
                 # Class-aware: ``self.foo()`` inside a method
                 # dispatches on the enclosing impl target. The
                 # chain shape is ``["self", "foo"]``.
-                receiver_class: Optional[str] = None
+                receiver_class: str | None = None
                 if (self._class_stack and self._enclosing
                         and len(chain) == 2 and chain[0] == "self"):
                     receiver_class = self._class_stack[-1].name
@@ -2164,12 +3575,23 @@ class _RustCallGraph:
                         receiver_class=receiver_class,
                     )
                 )
+            # Type-erased dispatch hides which concrete function runs:
+            # ``Any::downcast{,_ref,_mut}`` (runtime downcast then call) and
+            # ``transmute`` (can fabricate fn pointers). Flag the file →
+            # its functions hedge to UNCERTAIN rather than NOT_CALLED (FN-safe).
+            # Checked off the call NODE (not the chain) so the common turbofish
+            # form ``downcast_ref::<T>()`` — whose ``generic_function`` callee
+            # emits no chain edge — is still caught. (Macros are NOT flagged:
+            # ubiquitous in Rust; blanket-masking would gut the signal — a
+            # documented limitation.)
+            if self._callee_tail(node) in self._REFLECT_TAILS:
+                self.graph.indirection.add(INDIRECTION_REFLECT)
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         for c in node.children:
-            self.walk(c)
+            yield c
 
     # --- use ---
 
@@ -2199,7 +3621,7 @@ class _RustCallGraph:
                 self.graph.imports[name] = name
 
     def _handle_scoped_use_list(self, node) -> None:
-        prefix: List[str] = []
+        prefix: list[str] = []
         list_node = None
         for c in node.children:
             if c.type == self._IDENT:
@@ -2230,8 +3652,8 @@ class _RustCallGraph:
         """``Original as Alias`` (use_as_clause). The original
         side may be a bare identifier (inside a use_list) or a
         scoped_identifier (top-level ``use foo::bar::Baz as Q;``)."""
-        original_parts: List[str] = []
-        alias: Optional[str] = None
+        original_parts: list[str] = []
+        alias: str | None = None
         idents_seen = 0
         for c in node.children:
             if c.type == self._SCOPED_IDENT:
@@ -2247,13 +3669,13 @@ class _RustCallGraph:
         full = ".".join(list(prefix) + original_parts)
         self.graph.imports[alias] = full
 
-    def _scoped_parts(self, node) -> List[str]:
+    def _scoped_parts(self, node) -> list[str]:
         """``foo::bar::Baz`` -> ``["foo", "bar", "Baz"]``."""
-        out: List[str] = []
+        out: list[str] = []
         # Recursive: scoped_identifier nests with deeper scope_identifier
         # on the left.
         cur = node
-        stack: List[List[str]] = []
+        stack: list[list[str]] = []
         # Walk down the LHS scoped_identifier chain.
         while cur is not None and cur.type == self._SCOPED_IDENT:
             named = [c for c in cur.children if c.is_named]
@@ -2276,7 +3698,7 @@ class _RustCallGraph:
 
     # --- calls ---
 
-    def _call_chain(self, node) -> Optional[List[str]]:
+    def _call_chain(self, node) -> list[str] | None:
         """First named child is the callee. ``arguments`` follows."""
         callee = None
         for c in node.children:
@@ -2295,9 +3717,41 @@ class _RustCallGraph:
             return self._field_chain(callee)
         return None
 
-    def _field_chain(self, node) -> Optional[List[str]]:
+    def _callee_tail(self, node) -> str | None:
+        """Trailing method/function name of a call, unwrapping a turbofish
+        ``generic_function`` (``x.downcast_ref::<T>()`` → ``downcast_ref``,
+        ``mem::transmute::<A,B>(x)`` → ``transmute``) — used for the reflect
+        masking flag, which must fire even when the generic callee emits no
+        normal chain edge."""
+        callee = None
+        for c in node.children:
+            if c.type == self._ARGS:
+                break
+            if c.is_named:
+                callee = c
+                break
+        if callee is None:
+            return None
+        if callee.type == "generic_function":
+            inner = next((c for c in callee.children
+                          if c.is_named and c.type != "type_arguments"), None)
+            callee = inner if inner is not None else callee
+        if callee.type == self._FIELD_EXPR:
+            fid = None
+            for c in callee.children:
+                if c.type == self._FIELD_IDENT:
+                    fid = c
+            return fid.text.decode() if fid is not None else None
+        if callee.type == self._SCOPED_IDENT:
+            parts = self._scoped_parts(callee)
+            return parts[-1] if parts else None
+        if callee.type == self._IDENT:
+            return callee.text.decode()
+        return None
+
+    def _field_chain(self, node) -> list[str] | None:
         """``a.b.c`` (field_expression) -> ``["a", "b", "c"]``."""
-        parts: List[str] = []
+        parts: list[str] = []
         cur = node
         while cur is not None and cur.type == self._FIELD_EXPR:
             field = None
@@ -2341,7 +3795,9 @@ class _RustCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_ruby(content: str) -> FileCallGraph:
+def extract_call_graph_ruby(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Ruby source string via tree-sitter-ruby and return its
     :class:`FileCallGraph`.
 
@@ -2365,21 +3821,8 @@ def extract_call_graph_ruby(content: str) -> FileCallGraph:
     ``method_missing`` / etc. produce calls invisible to static
     analysis — same family of limitation as Python ``getattr``.
     """
-    try:
-        import tree_sitter_ruby as ts_ruby
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter Ruby grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_ruby.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Ruby parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_ruby", "Ruby", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _RubyCallGraph()
@@ -2403,27 +3846,39 @@ class _RubyCallGraph:
     _MODULE_NODE = "module"
     _SUPERCLASS = "superclass"
     _SELF = "self"
+    # Sigiled variable receivers (``@ivar.m()`` / ``@@cvar.m()`` /
+    # ``$gvar.m()``). Not consuming these as receivers made the METHOD
+    # identifier read as the receiver, so ``@service.fetch()`` emitted
+    # a bare ``["fetch"]`` chain — a false DEFINITIVE internal edge to
+    # any same-file ``def fetch``. The sigiled text is kept as the
+    # chain head so it can never collide with a real constant/module.
+    _VAR_RECEIVER_NODES = (
+        "instance_variable", "class_variable", "global_variable",
+    )
 
-    _REFLECT_NAMES = {"send", "public_send", "__send__"}
-    _CONST_GET_NAMES = {"const_get"}
-    _EVAL_NAMES = {"eval", "instance_eval", "class_eval", "module_eval"}
-    _REQUIRE_NAMES = {"require", "require_relative", "load"}
+    _REFLECT_NAMES: ClassVar[set[str]] = {"send", "public_send", "__send__"}
+    _CONST_GET_NAMES: ClassVar[set[str]] = {"const_get"}
+    _EVAL_NAMES: ClassVar[set[str]] = {"eval", "instance_eval", "class_eval", "module_eval"}
+    _REQUIRE_NAMES: ClassVar[set[str]] = {"require", "require_relative", "load"}
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
         # Class context. Ruby ``self.foo()`` dispatches on the
         # innermost ``class`` (modules dispatch to module functions
         # but those aren't instance-bound, so we don't tag
         # receiver_class for modules).
-        self._class_stack: List[ClassDef] = []
+        self._class_stack: list[ClassDef] = []
         # Module nesting stack — used to build ``package_name``
         # for nested modules. Ruby's top-level file is its own
         # module; nested ``module Foo; module Bar; ...`` produce
         # ``package_name="Foo.Bar"``.
-        self._mod_stack: List[str] = []
+        self._mod_stack: list[str] = []
 
     def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
         if node.type == self._MODULE_NODE:
             name_node = self._first_child_of_type(node, (
                 self._CONSTANT,
@@ -2439,12 +3894,12 @@ class _RubyCallGraph:
                 self.graph.package_name = ".".join(self._mod_stack)
                 try:
                     for c in node.children:
-                        self.walk(c)
+                        yield c
                 finally:
                     self._mod_stack.pop()
                 return
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         if node.type == self._CLASS_NODE:
@@ -2452,7 +3907,7 @@ class _RubyCallGraph:
                 self._CONSTANT,
             ))
             if name_node is not None:
-                bases: List[str] = []
+                bases: list[str] = []
                 # Ruby is single-inheritance — ``superclass`` carries
                 # exactly one base.
                 supercls = self._first_child_of_type(node, (
@@ -2479,12 +3934,12 @@ class _RubyCallGraph:
                 self._class_stack.append(cdef)
                 try:
                     for c in node.children:
-                        self.walk(c)
+                        yield c
                 finally:
                     self._class_stack.pop()
                 return
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         if node.type in (self._METHOD, self._SINGLETON_METHOD):
@@ -2502,7 +3957,7 @@ class _RubyCallGraph:
             self._enclosing.append(method_name)
             try:
                 for c in node.children:
-                    self.walk(c)
+                    yield c
             finally:
                 self._enclosing.pop()
             return
@@ -2520,11 +3975,11 @@ class _RubyCallGraph:
         if node.type == self._CALL:
             self._handle_call(node)
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         for c in node.children:
-            self.walk(c)
+            yield c
 
     def _handle_call(self, node) -> None:
         # ``call`` shape: receiver + . + method + arguments
@@ -2547,9 +4002,13 @@ class _RubyCallGraph:
                     # ``self.foo`` — keep ``self`` as the receiver
                     # so the chain reads ``["self", "foo"]``.
                     receiver = c
-                elif c.type == self._SCOPE_RES:
+                elif (c.type in self._VAR_RECEIVER_NODES
+                        and receiver is None):
+                    # ``@service.fetch`` — the ivar is the receiver;
+                    # without this the method name landed in the
+                    # receiver slot (see _VAR_RECEIVER_NODES).
                     receiver = c
-                elif c.type == self._CALL:
+                elif c.type in (self._SCOPE_RES, self._CALL):
                     receiver = c
                 else:
                     continue
@@ -2601,15 +4060,19 @@ class _RubyCallGraph:
                         bound = path.split("/")[-1]
                         self.graph.imports[bound] = path
 
-    def _chain_from_node(self, node) -> List[str]:
+    def _chain_from_node(self, node) -> list[str]:
         if node is None:
             return []
         if node.type in (self._IDENT, self._CONSTANT):
             return [node.text.decode()]
         if node.type == self._SELF:
             return ["self"]
+        if node.type in self._VAR_RECEIVER_NODES:
+            # Sigiled text (``@service``) — unresolvable receiver, but
+            # the tail method still feeds method-match evidence.
+            return [node.text.decode()]
         if node.type == self._SCOPE_RES:
-            parts: List[str] = []
+            parts: list[str] = []
             for c in node.children:
                 if c.type in (self._IDENT, self._CONSTANT):
                     parts.append(c.text.decode())
@@ -2621,7 +4084,7 @@ class _RubyCallGraph:
             return self._chain_from_call(node)
         return []
 
-    def _chain_from_call(self, node) -> List[str]:
+    def _chain_from_call(self, node) -> list[str]:
         receiver = None
         method = None
         for c in node.children:
@@ -2630,6 +4093,10 @@ class _RubyCallGraph:
             if c.is_named:
                 if receiver is None and c.type in (
                     self._IDENT, self._CONSTANT, self._SCOPE_RES, self._CALL,
+                    # ``self`` / sigiled-variable heads of nested
+                    # chains (``self.service.fetch`` lost its ``self``
+                    # head without these).
+                    self._SELF, *self._VAR_RECEIVER_NODES,
                 ):
                     receiver = c
                 elif method is None and c.type in (
@@ -2643,7 +4110,7 @@ class _RubyCallGraph:
             return rc
         return rc + [method.text.decode()]
 
-    def _record(self, node, chain: List[str]) -> None:
+    def _record(self, node: Node, chain: list[str]) -> None:
         line = node.start_point[0] + 1
         caller = self._enclosing[-1] if self._enclosing else None
         # ``self.foo()`` inside an instance method → narrow to the
@@ -2651,10 +4118,12 @@ class _RubyCallGraph:
         # Ruby's method-lookup chain (could be from a mixin, the
         # superclass, or the same class); without runtime semantics
         # we can't narrow it, so leave receiver_class None.
-        receiver_class: Optional[str] = None
+        # Exactly length 2: in ``self.service.fetch`` the method
+        # belongs to the field's class, not the enclosing one.
+        receiver_class: str | None = None
         if (self._class_stack and not self._class_stack[-1].nested
                 and self._enclosing
-                and len(chain) >= 2 and chain[0] == "self"):
+                and len(chain) == 2 and chain[0] == "self"):
             receiver_class = self._class_stack[-1].name
         self.graph.calls.append(
             CallSite(
@@ -2676,7 +4145,9 @@ class _RubyCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_csharp(content: str) -> FileCallGraph:
+def extract_call_graph_csharp(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a C# source string via tree-sitter-c-sharp and return
     its :class:`FileCallGraph`.
 
@@ -2694,21 +4165,8 @@ def extract_call_graph_csharp(content: str) -> FileCallGraph:
         ``Activator.CreateInstance(...)`` -> ``INDIRECTION_REFLECT``
       * ``Assembly.Load(...)`` -> ``INDIRECTION_IMPORTLIB``
     """
-    try:
-        import tree_sitter_c_sharp as ts_cs
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter C# grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_cs.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: C# parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_c_sharp", "C#", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _CSharpCallGraph()
@@ -2735,23 +4193,42 @@ class _CSharpCallGraph:
     _RECORD_DECL = "record_declaration"
     _BASE_LIST = "base_list"
     _THIS = "this_expression"
+    _PARAMETER_LIST = "parameter_list"
+    _PARAMETER = "parameter"
+    _FIELD_DECL = "field_declaration"
+    _LOCAL_DECL_STMT = "local_declaration_statement"
+    _VAR_DECLARATION = "variable_declaration"
+    _VAR_DECLARATOR = "variable_declarator"
+    _DECLARATION_LIST = "declaration_list"
+    _GENERIC_NAME = "generic_name"
+    _NULLABLE_TYPE = "nullable_type"
+    _ARRAY_TYPE = "array_type"
 
-    _REFLECT_METHODS = {
+    _REFLECT_METHODS: ClassVar[set[str]] = {
         "Invoke", "GetMethod", "CreateInstance",
         "InvokeMember",
     }
-    _ASSEMBLY_LOAD = {"Load", "LoadFrom", "LoadFile", "LoadWithPartialName"}
+    _ASSEMBLY_LOAD: ClassVar[set[str]] = {"Load", "LoadFrom", "LoadFile", "LoadWithPartialName"}
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
-        self._class_stack: List[ClassDef] = []
+        self._enclosing: list[str] = []
+        self._class_stack: list[ClassDef] = []
         # Namespace nesting; can be ``namespace Foo.Bar { ... }``
         # (one node carrying dotted form) OR nested ``namespace Foo
         # { namespace Bar { ... } }``. Track each segment separately.
-        self._ns_stack: List[str] = []
+        self._ns_stack: list[str] = []
+        # Typed-dispatch scope tracking (Tier 2), mirroring the Java
+        # walker: ``_field_types`` is a per-class stack (field name →
+        # declared type, pre-scanned on class entry); ``_local_types``
+        # is the current method's param + local name → declared type.
+        self._field_types: list[dict[str, str]] = []
+        self._local_types: dict[str, str] = {}
 
     def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
         if node.type == self._FILE_NAMESPACE_DECL:
             # C# 10's file-scoped namespace: ``namespace Foo.Bar;``
             # with no braces. The namespace applies to every
@@ -2787,20 +4264,20 @@ class _CSharpCallGraph:
                 self.graph.package_name = ".".join(self._ns_stack)
                 try:
                     for c in node.children:
-                        self.walk(c)
+                        yield c
                 finally:
                     for _ in parts:
                         self._ns_stack.pop()
                 return
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         if node.type in (self._CLASS_DECL, self._INTERFACE_DECL,
                          self._STRUCT_DECL, self._RECORD_DECL):
             name_node = self._first_child_of_type(node, (self._IDENT,))
             if name_node is not None:
-                bases: List[str] = []
+                bases: list[str] = []
                 bl = self._first_child_of_type(node, (self._BASE_LIST,))
                 if bl is not None:
                     for sub in bl.children:
@@ -2818,14 +4295,26 @@ class _CSharpCallGraph:
                 )
                 self.graph.classes.append(cdef)
                 self._class_stack.append(cdef)
+                # Pre-scan depth-1 fields so a field used before its
+                # textual declaration still resolves (Tier 2).
+                field_types: dict[str, str] = {}
+                body = self._first_child_of_type(node, (self._DECLARATION_LIST,))
+                if body is not None:
+                    for member in body.children:
+                        if member.type == self._FIELD_DECL:
+                            vd = self._first_child_of_type(
+                                member, (self._VAR_DECLARATION,))
+                            field_types.update(self._collect_decl_types(vd))
+                self._field_types.append(field_types)
                 try:
                     for c in node.children:
-                        self.walk(c)
+                        yield c
                 finally:
                     self._class_stack.pop()
+                    self._field_types.pop()
                 return
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         if node.type in (self._METHOD_DECL, self._CONSTRUCTOR_DECL):
@@ -2836,11 +4325,23 @@ class _CSharpCallGraph:
                     (method_name, node.start_point[0] + 1),
                 )
             self._enclosing.append(method_name)
+            saved_locals = self._local_types
+            self._local_types = self._collect_param_types(
+                self._first_child_of_type(node, (self._PARAMETER_LIST,)))
             try:
                 for c in node.children:
-                    self.walk(c)
+                    yield c
             finally:
                 self._enclosing.pop()
+                self._local_types = saved_locals
+            return
+
+        if node.type == self._LOCAL_DECL_STMT:
+            # Bind locals in source order (C# requires declare-before-use).
+            vd = self._first_child_of_type(node, (self._VAR_DECLARATION,))
+            self._local_types.update(self._collect_decl_types(vd))
+            for c in node.children:
+                yield c
             return
 
         if node.type == self._USING:
@@ -2857,18 +4358,24 @@ class _CSharpCallGraph:
                 # also dispatches via implicit-this (no module-
                 # level functions in C#), so tag length-1 chains
                 # too when inside a class.
-                receiver_class: Optional[str] = None
+                receiver_class: str | None = None
                 if (self._class_stack
                         and not self._class_stack[-1].nested
-                        and self._enclosing):
-                    if len(chain) == 1:
-                        receiver_class = self._class_stack[-1].name
-                    elif len(chain) == 2 and chain[0] == "this":
-                        receiver_class = self._class_stack[-1].name
+                        and self._enclosing
+                        and (len(chain) == 1
+                             or (len(chain) == 2 and chain[0] == "this"))):
+                    receiver_class = self._class_stack[-1].name
+                # Typed dispatch (Tier 2): declared type of a simple
+                # ``recv.m()`` receiver, when not a this/implicit call.
+                receiver_type = (
+                    self._resolve_receiver_type(chain)
+                    if receiver_class is None else None
+                )
                 self.graph.calls.append(
                     CallSite(
                         line=line, chain=chain, caller=caller,
                         receiver_class=receiver_class,
+                        receiver_type=receiver_type,
                     )
                 )
                 # Indirection flags
@@ -2891,11 +4398,82 @@ class _CSharpCallGraph:
                 if tail_name in self._REFLECT_METHODS:
                     self.graph.indirection.add(INDIRECTION_REFLECT)
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         for c in node.children:
-            self.walk(c)
+            yield c
+
+    # ------------------------------------------------------------------
+    # Typed-dispatch scope (Tier 2)
+    # ------------------------------------------------------------------
+
+    def _type_name(self, type_node: Node) -> str | None:
+        """Simple type name from a C# type node, or None for predefined
+        types (``int``/``string``/``void``) and unresolvable shapes.
+        ``List<Foo>`` → ``List``, ``Foo.Bar`` → ``Bar``, ``Foo?``/``Foo[]``
+        → ``Foo``."""
+        if type_node is None:
+            return None
+        t = type_node.type
+        if t == self._IDENT:
+            return type_node.text.decode("utf-8", errors="replace") or None  # type: ignore[union-attr]
+        if t == self._QUALIFIED:
+            parts = self._qualified_parts(type_node)
+            return parts[-1] if parts else None
+        if t == self._GENERIC_NAME:
+            ident = self._first_child_of_type(type_node, (self._IDENT,))
+            return ident.text.decode() if ident is not None else None
+        if t in (self._NULLABLE_TYPE, self._ARRAY_TYPE):
+            inner = type_node.child_by_field_name("type") or (
+                type_node.children[0] if type_node.children else None)
+            return self._type_name(inner)  # type: ignore[arg-type]
+        return None  # predefined_type / pointer / tuple / etc.
+
+    def _collect_param_types(self, params_node) -> dict[str, str]:
+        """``name → declared type`` for a ``parameter_list`` node."""
+        out: dict[str, str] = {}
+        if params_node is None:
+            return out
+        for p in params_node.children:
+            if p.type != self._PARAMETER:
+                continue
+            tn = self._type_name(p.child_by_field_name("type"))
+            name = p.child_by_field_name("name")
+            if tn and name is not None:
+                out[name.text.decode("utf-8", errors="replace")] = tn
+        return out
+
+    def _collect_decl_types(self, var_decl_node: Node) -> dict[str, str]:
+        """``name → declared type`` for a ``variable_declaration`` (the
+        node inside a field_declaration / local_declaration_statement)."""
+        out: dict[str, str] = {}
+        if var_decl_node is None:
+            return out
+        tn = self._type_name(var_decl_node.child_by_field_name("type"))  # type: ignore[arg-type]
+        if not tn:
+            return out
+        for c in var_decl_node.children:
+            if c.type != self._VAR_DECLARATOR:
+                continue
+            name = c.child_by_field_name("name") or self._first_child_of_type(
+                c, (self._IDENT,))
+            if name is not None:
+                out[name.text.decode("utf-8", errors="replace")] = tn  # type: ignore[union-attr]
+        return out
+
+    def _resolve_receiver_type(self, chain: list[str]) -> str | None:
+        """Declared type of a length-2 ``recv.m()`` receiver — a local /
+        param then an enclosing-class field. None for ``this``/``base``
+        receivers, longer chains, or untyped receivers."""
+        if len(chain) != 2 or chain[0] in ("this", "base"):
+            return None
+        recv = chain[0]
+        if recv in self._local_types:
+            return self._local_types[recv]
+        if self._field_types and recv in self._field_types[-1]:
+            return self._field_types[-1][recv]
+        return None
 
     def _handle_using(self, node) -> None:
         # ``using System.Text;`` -> binds last component to full name.
@@ -2906,11 +4484,13 @@ class _CSharpCallGraph:
         for c in node.children:
             if c.type == self._QUALIFIED:
                 target = c
-            elif c.type == self._IDENT:
-                # First identifier could be alias name (when followed by '=')
-                if alias is None:
-                    alias = c
+            # First identifier could be alias name (when followed by '=')
+            elif c.type == self._IDENT and alias is None:
+                alias = c
         if target is None:
+            if alias is not None:
+                name = alias.text.decode()
+                self.graph.imports[name] = name
             return
         parts = self._qualified_parts(target)
         if not parts:
@@ -2921,11 +4501,11 @@ class _CSharpCallGraph:
         else:
             self.graph.imports[parts[-1]] = full
 
-    def _qualified_parts(self, node) -> List[str]:
+    def _qualified_parts(self, node) -> list[str]:
         if node.type == self._IDENT:
             return [node.text.decode()]
         if node.type == self._QUALIFIED:
-            parts: List[str] = []
+            parts: list[str] = []
             for c in node.children:
                 if c.type == self._IDENT:
                     parts.append(c.text.decode())
@@ -2934,7 +4514,7 @@ class _CSharpCallGraph:
             return parts
         return []
 
-    def _invocation_chain(self, node) -> Optional[List[str]]:
+    def _invocation_chain(self, node) -> list[str] | None:
         # invocation_expression: function + argument_list
         callee = None
         for c in node.children:
@@ -2953,12 +4533,12 @@ class _CSharpCallGraph:
             return self._qualified_parts(callee) or None
         return None
 
-    def _member_access_chain(self, node) -> Optional[List[str]]:
+    def _member_access_chain(self, node) -> list[str] | None:
         """``a.b.c`` (member_access_expression).
 
         ``this.X`` and ``base.X`` use unnamed keyword tokens for the
         LHS in tree-sitter-c_sharp — special-cased below."""
-        parts: List[str] = []
+        parts: list[str] = []
         cur = node
         while cur is not None and cur.type == self._MEMBER_ACCESS:
             named = [c for c in cur.children if c.is_named]
@@ -3005,7 +4585,7 @@ class _CSharpCallGraph:
             return qparts + list(reversed(parts))
         return None
 
-    def _tail_identifier(self, node) -> Optional[str]:
+    def _tail_identifier(self, node) -> str | None:
         """Return the rightmost simple identifier reachable from
         the invocation's callee subtree. Used as a fallback when
         the chain is too complex to extract cleanly."""
@@ -3052,8 +4632,10 @@ class _CSharpCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_php(content: str) -> FileCallGraph:
-    """Walk a PHP source string via tree-sitter-php and return its
+def extract_call_graph_php(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
+    r"""Walk a PHP source string via tree-sitter-php and return its
     :class:`FileCallGraph`.
 
     Returns an empty graph when ``tree_sitter_php`` isn't installed
@@ -3061,9 +4643,9 @@ def extract_call_graph_php(content: str) -> FileCallGraph:
 
     PHP shapes:
 
-      * ``use Foo\\Bar\\Baz;`` -> ``imports["Baz"] = "Foo\\Bar\\Baz"``
-      * ``use Foo\\Bar as B;`` -> alias
-      * ``use function Foo\\bar;`` / ``use const Foo\\BAR;``
+      * ``use Foo\Bar\Baz;`` -> ``imports["Baz"] = "Foo\Bar\Baz"``
+      * ``use Foo\Bar as B;`` -> alias
+      * ``use function Foo\bar;`` / ``use const Foo\BAR;``
       * ``Baz::method()`` (static) -> chain ``["Baz", "method"]``
       * ``$inst->method()`` -> chain ``["inst", "method"]``
       * ``call_user_func(...)`` /
@@ -3075,30 +4657,42 @@ def extract_call_graph_php(content: str) -> FileCallGraph:
       * ``include`` / ``require`` (with var) ->
         ``INDIRECTION_DYNAMIC_IMPORT``
     """
-    try:
-        import tree_sitter_php as ts_php
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter PHP grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
+    tree = _tree
+    if tree is None:
+        ts_php = _import_grammar('tree_sitter_php')
+        if ts_php is None:
+            return FileCallGraph()
 
-    try:
-        # tree-sitter-php exports php_only / php (with HTML mixed).
-        # For .php files we use php_only, but tolerate either.
-        lang_fn = getattr(ts_php, "language_php", None) or ts_php.language()
-        if callable(lang_fn):
-            lang_fn = lang_fn()
-        parser = Parser(Language(lang_fn))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: PHP parse failed (%s)", e)
-        return FileCallGraph()
+        try:
+            # tree-sitter-php exports php_only / php (with HTML mixed).
+            # For .php files we use php_only, but tolerate either.
+            # NOT routed through _get_ts_parser because the language
+            # resolution path varies (language_php attr vs language()
+            # callable vs already-realised Language object) — cache
+            # identity-keying would either thrash or mis-hit. Per-call
+            # construction here; PHP parses are infrequent enough that
+            # the missed cache opportunity is acceptable.
+            from tree_sitter import Language as _PHPLanguage
+            from tree_sitter import Parser as _PHPParser
+            lang_fn = getattr(ts_php, "language_php", None) or ts_php.language()
+            if callable(lang_fn):
+                lang_fn = lang_fn()
+            from core.inventory._ts_cache import bounded
+            parser = bounded(_PHPParser(_PHPLanguage(lang_fn)), label="php")
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception as e:                              # noqa: BLE001
+            logger.debug("call_graph: PHP parse failed (%s)", e)
+            return FileCallGraph()
 
     walker = _PhpCallGraph()
     walker.walk(tree.root_node)
+    # Prerequisite for every guarantee-direction consumer: ERROR
+    # recovery can re-parent statements, so an ERROR-bearing tree's
+    # conditional flags are census/reachability-usable only.
+    try:
+        walker.graph.parse_errors = bool(tree.root_node.has_error)
+    except AttributeError:
+        walker.graph.parse_errors = True  # unknown ⇒ not guarantee-grade
     return walker.graph
 
 
@@ -3120,6 +4714,7 @@ class _PhpCallGraph:
     _MEMBER_ACCESS = "member_access_expression"
     _ARGS = "arguments"
     _VAR = "variable_name"
+    _DYNAMIC_VAR = "dynamic_variable_name"
     _CLASS_DECL = "class_declaration"
     _INTERFACE_DECL = "interface_declaration"
     _TRAIT_DECL = "trait_declaration"
@@ -3127,21 +4722,103 @@ class _PhpCallGraph:
     _BASE_CLAUSE = "base_clause"
     _CLASS_INTERFACE_CLAUSE = "class_interface_clause"
 
-    _REFLECT_FNS = {
+    _REFLECT_FNS: ClassVar[set[str]] = {
         "call_user_func", "call_user_func_array",
         "ReflectionMethod", "ReflectionClass",
     }
-    _EVAL_FNS = {"eval", "create_function", "assert"}
-    _DYNAMIC_INCLUDE = {
+    _EVAL_FNS: ClassVar[set[str]] = {"eval", "create_function", "assert"}
+    _DYNAMIC_INCLUDE: ClassVar[set[str]] = {
         "include", "include_once", "require", "require_once",
     }
+    _INCLUDE_EXPRS: ClassVar[dict[str, str]] = {
+        "include_expression": "include",
+        "include_once_expression": "include_once",
+        "require_expression": "require",
+        "require_once_expression": "require_once",
+    }
+    # Constructs under which execution is not straight-line. An
+    # include/define with ANY of these as ancestor is flagged
+    # ``conditional`` — conservative in the guarantee direction (a
+    # false ``conditional: true`` only withholds a future guarantee;
+    # a false ``false`` would fabricate one).
+    _CONDITIONAL_NODES: ClassVar[set[str]] = {
+        "if_statement", "else_clause", "else_if_clause",
+        "switch_statement", "switch_block", "case_statement",
+        "default_statement", "while_statement", "do_statement",
+        "for_statement", "foreach_statement", "try_statement",
+        "catch_clause", "finally_clause", "match_expression",
+        "conditional_expression",
+    }
+    # Short-circuit operators: the RIGHT operand only runs when the
+    # left decides so — conditional for edge/define purposes.
+    _LOGICAL_OPS: ClassVar[set[str]] = {"or", "and", "xor",
+                                        "||", "&&", "??"}
+    _ABORT_NAMES: ClassVar[set[str]] = {"die", "exit"}
+    # File-scope statement types that keep the guard-eligible
+    # PROLOGUE open: declaration/definition statements with no
+    # runtime effect on a direct request. Guard evidence is honest
+    # only while the file's straight-line prefix is inert — anything
+    # executable or output-producing before the guard (calls,
+    # assignments, echo/markup, loops, non-guard branches, aborts,
+    # returns, goto/labels) means a direct request runs THAT first,
+    # so a later "guard" protects nothing (bottom-of-file guards)
+    # or never runs at all (post-abort/post-goto plants).
+    #: declare_statement is deliberately absent: it is inert only in
+    #: its bare-directive form (body-aware check in _prologue_inert).
+    _PROLOGUE_INERT_STMTS: ClassVar[set[str]] = {
+        "php_tag", "comment", "namespace_definition",
+        "namespace_use_declaration", "const_declaration",
+        "empty_statement", "function_definition",
+        "class_declaration", "interface_declaration",
+        "trait_declaration", "enum_declaration",
+    }
+    # Hostile-content bounds: a planted file with millions of
+    # include/define statements must not balloon the checklist.
+    _MAX_INCLUDE_EDGES: ClassVar[int] = 4096
+    _MAX_DEFINES: ClassVar[int] = 1024
+    _MAX_RAW_LEN: ClassVar[int] = 300
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        self._enclosing: List[str] = []
-        self._class_stack: List[ClassDef] = []
+        self._enclosing: list[str] = []
+        self._class_stack: list[ClassDef] = []
+        # Include-layer state: depth of enclosing conditional
+        # constructs, and the constant names of enclosing
+        # ``!defined('NAME')`` if-conditions (fallback-define
+        # detection).
+        self._cond_depth = 0
+        self._notdef_guards: list[str] = []
+        # Parallel to the conditional depth: the ``defined()``-guard
+        # condition of each enclosing conditional (name, negated) —
+        # None for non-guard conditionals. Straight-line boundary
+        # records consult the top so the phase-1b walk can treat a
+        # ``!defined(C)`` abort as a no-op under a bound C.
+        self._cond_guard_stack: list[tuple[str, bool] | None] = []
+        # Guard-eligibility window (see _PROLOGUE_INERT_STMTS).
+        self._guard_prologue_open = True
+        self.graph.includes_extracted = True
 
     def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
+        # Guard-prologue tracking happens exactly where file-scope
+        # statements are ITERATED (program children here, braced
+        # namespace bodies in the namespace arm) — never via
+        # node.parent, which py-tree-sitter resolves by walking from
+        # the root (O(depth) per call: a per-node parent check made
+        # extraction quadratic in expression depth). Classification
+        # runs BEFORE the child is visited, so a guard inside an
+        # inert statement still records, while a guard nested in the
+        # first payload statement is already ineligible.
+        if node.type == "program":
+            for c in node.children:
+                if (self._guard_prologue_open and c.is_named
+                        and not self._prologue_inert(c)):
+                    self._guard_prologue_open = False
+                yield c
+            return
+
         if node.type == self._NAMESPACE_DEF:
             # ``namespace Foo\Bar;`` — capture as dotted package
             # name. The namespace_name child carries the parts.
@@ -3154,15 +4831,30 @@ class _PhpCallGraph:
                     self.graph.package_name = ".".join(parts)
             # Descend into the namespace body (declarations live
             # inside compound_statement if braced, or as siblings).
+            # Braced-body children are file-scope statements: they
+            # get the same prologue classification as program
+            # children (yielded directly — the compound wrapper has
+            # no handler of its own). Only NAMED children classify:
+            # the anonymous `{` / `}` brace tokens are not statements,
+            # and classifying them would close the prologue at the
+            # opening brace — every guard inside a braced namespace
+            # would go blind.
             for c in node.children:
-                self.walk(c)
+                if c.type == "compound_statement":
+                    for s in c.children:
+                        if (self._guard_prologue_open and s.is_named
+                                and not self._prologue_inert(s)):
+                            self._guard_prologue_open = False
+                        yield s
+                    continue
+                yield c
             return
 
         if node.type in (self._CLASS_DECL, self._INTERFACE_DECL,
                          self._TRAIT_DECL, self._ENUM_DECL):
             name_node = self._first_child_of_type(node, (self._NAME,))
             if name_node is not None:
-                bases: List[str] = []
+                bases: list[str] = []
                 # ``extends Base`` (single-class inheritance in PHP).
                 bc = self._first_child_of_type(node, (self._BASE_CLAUSE,))
                 if bc is not None:
@@ -3195,15 +4887,22 @@ class _PhpCallGraph:
                 self._class_stack.append(cdef)
                 try:
                     for c in node.children:
-                        self.walk(c)
+                        yield c
                 finally:
                     self._class_stack.pop()
                 return
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
-        if node.type in (self._FUNCTION_DEF, self._METHOD_DECL):
+        if node.type in (self._FUNCTION_DEF, self._METHOD_DECL,
+                         "anonymous_function", "arrow_function"):
+            # Anonymous and arrow functions are enclosing scopes like
+            # any named function: their bodies run at CALL time, so
+            # includes and defines inside them are function_body
+            # facts — recording them as file-scope handed the walk
+            # unconditional-looking statements that a direct request
+            # never executes at load time.
             name = self._first_child_of_type(node, (self._NAME,))
             method_name = name.text.decode() if name else "<anon>"
             if (node.type == self._METHOD_DECL
@@ -3214,7 +4913,7 @@ class _PhpCallGraph:
             self._enclosing.append(method_name)
             try:
                 for c in node.children:
-                    self.walk(c)
+                    yield c
             finally:
                 self._enclosing.pop()
             return
@@ -3228,11 +4927,80 @@ class _PhpCallGraph:
         ):
             self._handle_call(node)
             for c in node.children:
-                self.walk(c)
+                yield c
+            return
+
+        if node.type in self._INCLUDE_EXPRS:
+            self._record_include_edge(node)
+            # The lossy file-scoped flag stays for compatibility with
+            # existing indirection consumers.
+            self.graph.indirection.add(INDIRECTION_DYNAMIC_IMPORT)
+            for c in node.children:
+                yield c
+            return
+
+        if node.type in ("return_statement", "exit_statement",
+                         "goto_statement"):
+            self._record_boundary(
+                node,
+                "goto" if node.type == "goto_statement"
+                else ("return" if node.type == "return_statement"
+                      else "abort"),
+            )
+            for c in node.children:
+                yield c
+            return
+
+        if node.type == "if_statement":
+            guard = self._not_defined_guard_name(node)
+            self._maybe_record_access_guard(node, guard)
+            self._cond_depth += 1
+            self._cond_guard_stack.append(self._defined_condition(node))
+            if guard is not None:
+                self._notdef_guards.append(guard)
+            try:
+                for c in node.children:
+                    yield c
+            finally:
+                if guard is not None:
+                    self._notdef_guards.pop()
+                self._cond_guard_stack.pop()
+                self._cond_depth -= 1
+            return
+
+        if node.type in self._CONDITIONAL_NODES:
+            self._cond_depth += 1
+            self._cond_guard_stack.append(None)
+            try:
+                for c in node.children:
+                    yield c
+            finally:
+                self._cond_guard_stack.pop()
+                self._cond_depth -= 1
+            return
+
+        if node.type == "binary_expression":
+            # ``defined('X') or die(...)`` at file scope is a
+            # direct-access guard; more generally the RIGHT operand
+            # of a short-circuit operator executes conditionally.
+            self._maybe_record_or_die_guard(node)
+            pushed = False
+            try:
+                for c in node.children:
+                    if not pushed and c.type in self._LOGICAL_OPS:
+                        self._cond_depth += 1
+                        self._cond_guard_stack.append(None)
+                        pushed = True
+                        continue
+                    yield c
+            finally:
+                if pushed:
+                    self._cond_guard_stack.pop()
+                    self._cond_depth -= 1
             return
 
         for c in node.children:
-            self.walk(c)
+            yield c
 
     def _handle_use(self, node) -> None:
         for c in node.children:
@@ -3240,29 +5008,37 @@ class _PhpCallGraph:
                 self._handle_use_clause(c)
 
     def _handle_use_clause(self, node) -> None:
-        target_parts: List[str] = []
-        alias_name: Optional[str] = None
+        target_parts: list[str] = []
+        alias_name: str | None = None
         for c in node.children:
             if c.type in (self._QUALIFIED, self._NAMESPACE_NAME):
                 target_parts = self._namespace_parts(c)
-            elif c.type == self._NAME and target_parts:
-                alias_name = c.text.decode()
+            elif c.type == self._NAME:
+                if target_parts:
+                    alias_name = c.text.decode()
+                else:
+                    target_parts = [c.text.decode()]
         if not target_parts:
             return
-        full = "\\".join(target_parts)
+        # Dot-join, matching ``package_name`` and every other
+        # language's import bindings: the cross-language resolver
+        # compares dot-form module paths, so a backslash-joined
+        # binding could never equal any (dot-normalised) OSV symbol
+        # module and guaranteed NOT_CALLED for PHP.
+        full = ".".join(target_parts)
         bound = alias_name or target_parts[-1]
         self.graph.imports[bound] = full
 
-    def _namespace_parts(self, node) -> List[str]:
-        """``Foo\\Bar\\Baz`` (qualified_name with nested
+    def _namespace_parts(self, node) -> list[str]:
+        r"""``Foo\Bar\Baz`` (qualified_name with nested
         namespace_name LHS) -> ``["Foo", "Bar", "Baz"]``.
 
         tree-sitter-php nests deep namespaces: ``qualified_name``
-        contains ``namespace_name`` (Foo\\Bar) plus a trailing
+        contains ``namespace_name`` (Foo\Bar) plus a trailing
         ``name`` (Baz). Recurse into any child of type
         ``qualified_name`` / ``namespace_name`` for the LHS.
         """
-        parts: List[str] = []
+        parts: list[str] = []
         for c in node.children:
             if c.type == self._NAME:
                 parts.append(c.text.decode())
@@ -3270,7 +5046,7 @@ class _PhpCallGraph:
                 parts = self._namespace_parts(c) + parts
         return parts
 
-    def _handle_call(self, node) -> None:
+    def _handle_call(self, node: Node) -> None:
         chain = None
         if node.type == self._FUNCTION_CALL:
             chain = self._function_call_chain(node)
@@ -3291,16 +5067,16 @@ class _PhpCallGraph:
         # also dispatch on the enclosing class; ``parent::X()``
         # dispatches on the parent (leave None, let resolver
         # search bases).
-        receiver_class: Optional[str] = None
+        # Exactly length 2: in ``$this->helper->render()`` the method
+        # belongs to the FIELD's class, not the enclosing one — a
+        # wrong tag makes the resolver drop the real caller edge.
+        receiver_class: str | None = None
         if (self._class_stack and not self._class_stack[-1].nested
                 and self._enclosing
-                and len(chain) >= 2):
-            if (node.type == self._MEMBER_CALL
-                    and chain[0] == "this"):
-                receiver_class = self._class_stack[-1].name
-            elif (node.type == self._SCOPED_CALL
-                  and chain[0] in ("self", "static")):
-                receiver_class = self._class_stack[-1].name
+                and len(chain) == 2) and ((node.type == self._MEMBER_CALL
+                and chain[0] == "this") or (node.type == self._SCOPED_CALL
+              and chain[0] in ("self", "static"))):
+            receiver_class = self._class_stack[-1].name
         self.graph.calls.append(
             CallSite(
                 line=line, chain=chain, caller=caller,
@@ -3315,8 +5091,516 @@ class _PhpCallGraph:
             self.graph.indirection.add(INDIRECTION_EVAL)
         if chain[0] in self._DYNAMIC_INCLUDE:
             self.graph.indirection.add(INDIRECTION_DYNAMIC_IMPORT)
+        # define('NAME', …) — walk input for the include graph's
+        # per-entry constant-environment resolution (phase 1b).
+        if node.type == self._FUNCTION_CALL and len(chain) == 1:
+            head = chain[0].lower()
+            if head == "define":
+                self._record_define(node)
+            elif head in self._ABORT_NAMES:
+                self._record_boundary(node, "abort")
+            elif head == "__halt_compiler":
+                self._record_boundary(node, "halt")
 
-    def _function_call_chain(self, node) -> Optional[List[str]]:
+    # ---- include layer (structured edges, defines, guards) --------
+
+    def _record_include_edge(self, node) -> None:
+        """One include/require expression → structured IncludeEdge.
+
+        Classification goes through the ONE include-argument
+        classifier in :mod:`core.inventory.script_handler` (the
+        wiring test is the other consumer) — a census of syntactic
+        shape, never a resolution verdict.
+        """
+        from core.inventory.script_handler import classify_include_argument
+        if self.graph.includes_truncated:
+            return
+        if len(self.graph.includes) >= self._MAX_INCLUDE_EDGES:
+            self.graph.includes_truncated = True
+            return
+        arg = None
+        for c in node.children:
+            if c.is_named:
+                arg = c
+                break
+        while arg is not None and arg.type == "parenthesized_expression":
+            inner = None
+            for c in arg.children:
+                if c.is_named:
+                    inner = c
+                    break
+            if inner is None:
+                break
+            arg = inner
+        raw_full = (arg.text.decode("utf-8", errors="replace")
+                    if arg is not None else "")
+        cls = classify_include_argument(raw_full)
+        raw = raw_full
+        if len(raw) > self._MAX_RAW_LEN:
+            raw = raw[:self._MAX_RAW_LEN] + "…"
+        # Oversized literal material is planted, not path-shaped —
+        # drop rather than truncate (a truncated tail would silently
+        # mis-match at graph derivation).
+        tail = cls.literal_tail
+        if tail is not None and len(tail) > 512:
+            tail = None
+        stem = cls.literal_stem
+        if stem is not None and len(stem) > 512:
+            stem = None
+        self.graph.includes.append(IncludeEdge(
+            line=node.start_point[0] + 1,
+            keyword=self._INCLUDE_EXPRS[node.type],
+            raw=raw,
+            shape=cls.shape,
+            const_name=cls.const_name,
+            literal_tail=tail,
+            literal_stem=stem,
+            conditional=self._cond_depth > 0,
+            position="function_body" if self._enclosing else "file_scope",
+            enclosing_function=(
+                self._enclosing[-1] if self._enclosing else None),
+            span_hash=hashlib.sha256(node.text).hexdigest()[:12],
+        ))
+
+    def _record_define(self, node) -> None:
+        """Record a literal-named ``define('NAME', …)`` statement."""
+        if len(self.graph.defines) >= self._MAX_DEFINES:
+            return
+        args_node = self._first_child_of_type(node, (self._ARGS,))
+        if args_node is None:
+            return
+        args = [c for c in args_node.children if c.type == "argument"]
+        if len(args) < 2:
+            return
+        name = self._plain_string_value(args[0])
+        if name is None or len(name) > 256:
+            # Dynamic-named defines can never seed a constant
+            # environment; oversized names are planted.
+            return
+        value = self._plain_string_value(args[1])
+        raw_value = None
+        if value is None:
+            raw_value = args[1].text.decode("utf-8", errors="replace")
+            if len(raw_value) > self._MAX_RAW_LEN:
+                raw_value = raw_value[:self._MAX_RAW_LEN] + "…"
+        elif len(value) > 512:
+            # Same planted-material rule as edge tails.
+            value, raw_value = None, value[:self._MAX_RAW_LEN] + "…"  # type: ignore[index]
+        # ``fallback`` is EXACT-SHAPE-ONLY: precisely one enclosing
+        # conditional and it is ``!defined('<same name>')``. Any
+        # extra outer conditional (a request-controlled branch around
+        # the fallback) makes this an ordinary conditional define —
+        # the record cannot express "fallback plus outer condition",
+        # so claiming fallback would let the walk bind a constant a
+        # direct request may never define.
+        exact_fallback = (
+            self._cond_depth == 1
+            and bool(self._cond_guard_stack)
+            and self._cond_guard_stack[-1] == (name, True)
+        )
+        self.graph.defines.append(IncludeDefine(
+            line=node.start_point[0] + 1,
+            name=name,
+            value=value,
+            raw_value=raw_value,
+            conditional=self._cond_depth > 0,
+            fallback=exact_fallback,
+            position="function_body" if self._enclosing else "file_scope",
+        ))
+
+    def _plain_string_value(self, arg_node) -> str | None:
+        """The argument's plain string-literal value, or None."""
+        expr = None
+        for c in arg_node.children:
+            if c.is_named:
+                expr = c
+                break
+        if expr is None or expr.type not in ("string", "encapsed_string"):
+            return None
+        parts: list[str] = []
+        for c in expr.children:
+            if c.type == "string_content":
+                parts.append(c.text.decode("utf-8", errors="replace"))
+            elif c.type == "escape_sequence":
+                t = c.text.decode("utf-8", errors="replace")
+                parts.append({"\\\\": "\\", "\\'": "'", '\\"': '"',
+                              "\\$": "$"}.get(t, t))
+            elif c.is_named:
+                return None  # interpolation hole — not a plain literal
+        return "".join(parts)
+
+    def _unwrap_parens(self, node):
+        cur = node
+        while cur is not None and cur.type == "parenthesized_expression":
+            nxt = None
+            for c in cur.children:
+                if c.is_named:
+                    nxt = c
+                    break
+            cur = nxt
+        return cur
+
+    def _defined_call_constant(self, call_node) -> str | None:
+        """``defined('NAME')`` → ``NAME``; anything else → None."""
+        fn = self._first_child_of_type(call_node, (self._NAME,))
+        if fn is None or fn.text.decode(
+                "utf-8", errors="replace").lower() != "defined":
+            return None
+        args_node = self._first_child_of_type(call_node, (self._ARGS,))
+        if args_node is None:
+            return None
+        args = [c for c in args_node.children if c.type == "argument"]
+        if len(args) != 1:
+            return None
+        return self._plain_string_value(args[0])
+
+    def _prologue_inert(self, node) -> bool:
+        """Whether one file-scope statement keeps guard eligibility
+        open. The one rule: an inert WRAPPER is inert only when its
+        body/values are — a payload can otherwise hide inside a
+        prologue-shaped statement (a declare block body, a
+        side-effectful define() value, a ``!defined(NEVER_SET)``
+        branch body) and execute on a direct request before the
+        guard the wrapper shields."""
+        t = node.type
+        if t in self._PROLOGUE_INERT_STMTS:
+            return True
+        if t == "declare_statement":
+            # Bare-directive form only: ``declare(ticks=1) f();`` /
+            # ``declare(...) { ... }`` execute their body.
+            return not any(
+                c.is_named and c.type not in ("declare_directive",
+                                              "comment")
+                for c in node.children)
+        if t == "if_statement":
+            # ``!defined('N')`` shape AND an inert body: the branch
+            # RUNS on a direct request whenever the probed constant
+            # is undefined, so a payload body would execute first.
+            if self._not_defined_guard_name(node) is None:
+                return False
+            return all(self._inert_simple_stmt(s)
+                       for s in self._if_body_stmts(node))
+        if t == "expression_statement":
+            return self._inert_simple_stmt(node)
+        if t in ("text", "text_interpolation"):
+            # Markup output; whitespace-only chunks (and a bare
+            # close/open tag pair) stay inert.
+            txt = node.text.decode("utf-8", errors="replace")
+            for tag in ("?>", "<?php", "<?=", "<?"):
+                txt = txt.replace(tag, " ")
+            return not txt.strip()
+        return False
+
+    def _inert_simple_stmt(self, stmt) -> bool:
+        """Whether one statement is prologue-inert on its own:
+        abort, include (side-effect-free argument), literal define,
+        or the or-die guard expression."""
+        if stmt.type in ("comment", "empty_statement"):
+            return True
+        if self._stmt_is_abort(stmt):
+            return True
+        expr = stmt
+        while expr is not None and expr.type in (
+            "expression_statement", "error_suppression_expression",
+            "parenthesized_expression",
+        ):
+            nxt = None
+            for c in expr.children:
+                if c.is_named:
+                    nxt = c
+                    break
+            expr = nxt
+        if expr is None:
+            return True  # bare ';'
+        if expr.type in self._INCLUDE_EXPRS:
+            # Adjudication: an include with an inert ARGUMENT of a
+            # RESOLVABLE shape (literal / const_prefix) stays
+            # prologue-inert even though the INCLUDED file's payload
+            # executes before the guard on a direct request. Scoped
+            # precisely, guard evidence claims "THIS file's own
+            # below-guard payload is not directly reachable"; the
+            # included file keeps its own role, guard, and census
+            # attention in the graph, so its exposure is never
+            # hidden behind this file's guard — and refusing
+            # includes would void guard evidence on the dominant
+            # honest idiom (bootstrap requires before the guard).
+            # Two shapes DO close the prologue: a side-effectful
+            # argument (this statement's own execution — a call
+            # computing the path runs right here), and a DYNAMIC
+            # include shape: its target carries no
+            # role/census attention of its own, so the
+            # "included file keeps its own attention" rationale has
+            # nothing to attach to — the pre-guard dispatcher risk
+            # must stay on THIS file.
+            if not self._include_arg_side_effect_free(expr):
+                return False
+            from core.inventory.script_handler import (
+                classify_include_argument,
+            )
+            arg = None
+            for c in expr.children:
+                if c.is_named:
+                    arg = c
+                    break
+            while (arg is not None
+                    and arg.type == "parenthesized_expression"):
+                nxt = None
+                for c in arg.children:
+                    if c.is_named:
+                        nxt = c
+                        break
+                if nxt is None:
+                    break
+                arg = nxt
+            raw = (arg.text.decode("utf-8", errors="replace")
+                   if arg is not None else "")
+            return classify_include_argument(raw).shape in (
+                "literal", "const_prefix")
+        if expr.type == self._FUNCTION_CALL:
+            return self._is_literal_define(expr)
+        if expr.type == "binary_expression":
+            # ``defined('N') or die`` IS the guard — inert.
+            return self._or_die_guard_constant(expr) is not None
+        return False
+
+    #: Argument-subtree node kinds that EXECUTE when the enclosing
+    #: statement runs — a prologue-inert wrapper carrying one is not
+    #: inert (seed set, closed over grammar expression kinds).
+    _SIDE_EFFECT_NODES: ClassVar[set[str]] = {
+        "function_call_expression", "scoped_call_expression",
+        "member_call_expression", "nullsafe_member_call_expression",
+        "object_creation_expression", "assignment_expression",
+        "augmented_assignment_expression", "update_expression",
+        "shell_command_expression", "include_expression",
+        "include_once_expression", "require_expression",
+        "require_once_expression", "ERROR",
+    }
+    _MAX_ARG_SCAN_NODES: ClassVar[int] = 10_000
+
+    def _include_arg_side_effect_free(self, include_node) -> bool:
+        """Whether the include's argument subtree is free of
+        executing constructs (calls, assignments, nested includes,
+        backticks, parse errors). Bounded single pass — each node
+        belongs to at most one file-scope statement, so the total
+        cost across a file stays linear; oversized arguments refuse
+        toward closing the prologue."""
+        stack = [c for c in include_node.children if c.is_named]
+        seen = 0
+        while stack:
+            cur = stack.pop()
+            seen += 1
+            if seen > self._MAX_ARG_SCAN_NODES:
+                return False
+            if cur.type in self._SIDE_EFFECT_NODES:
+                return False
+            stack.extend(c for c in cur.children if c.is_named)
+        return True
+
+    def _is_literal_define(self, call_node) -> bool:
+        """``define('NAME', <scalar literal>[, <scalar literal>])``
+        — the only define shape that is inert on execution (a call
+        or expression value runs on a direct request)."""
+        fn = self._first_child_of_type(call_node, (self._NAME,))
+        if fn is None or fn.text.decode(
+                "utf-8", errors="replace").lower() != "define":
+            return False
+        args_node = self._first_child_of_type(call_node, (self._ARGS,))
+        if args_node is None:
+            return False
+        args = [c for c in args_node.children if c.type == "argument"]
+        if len(args) < 2:
+            return False
+        if self._plain_string_value(args[0]) is None:
+            return False
+        return all(self._literal_scalar_arg(a) for a in args[1:])
+
+    def _literal_scalar_arg(self, arg_node) -> bool:
+        expr = None
+        for c in arg_node.children:
+            if c.is_named:
+                expr = c
+                break
+        if expr is None:
+            return False
+        if expr.type in ("integer", "float", "boolean", "null"):
+            return True
+        if expr.type in ("string", "encapsed_string"):
+            return self._plain_string_value(arg_node) is not None
+        return False
+
+    def _if_body_stmts(self, node) -> list:
+        """The if's consequence statements (braced, colon-syntax, or
+        the brace-less single-statement form); else clauses never
+        participate."""
+        for c in node.children:
+            if c.type in ("compound_statement", "colon_block"):
+                return [s for s in c.children if s.is_named]
+            if c.is_named and c.type not in (
+                "parenthesized_expression", "else_clause",
+                "else_if_clause",
+            ):
+                return [c]
+        return []
+
+    #: Straight-line boundary records are capped; the overflow entry
+    #: keeps the cap honest (the walk treats it as a boundary at that
+    #: line — a missed later boundary must never fabricate a
+    #: guarantee below it).
+    _MAX_BOUNDARIES: ClassVar[int] = 8
+
+    def _record_boundary(self, node, kind: str) -> None:
+        """Record a file-scope straight-line boundary statement —
+        return / exit / die / goto / __halt_compiler — with the
+        enclosing ``defined()``-guard condition when there is exactly
+        one enclosing conditional and it is guard-shaped (the
+        phase-1b walk no-ops a ``!defined(C)`` abort under a bound
+        C, and hard-applies a ``defined(C)`` one)."""
+        if self._enclosing:
+            return
+        bl = self.graph.boundaries
+        if bl and bl[-1].get("kind") == "overflow":
+            return
+        line = node.start_point[0] + 1
+        if len(bl) >= self._MAX_BOUNDARIES:
+            bl.append({"line": line, "kind": "overflow"})
+            return
+        entry: dict = {"line": line, "kind": kind}
+        if kind in ("return", "abort"):
+            if self._cond_depth == 0:
+                entry["kind"] = "terminator"
+            else:
+                entry["kind"] = "conditional_" + kind
+                if (self._cond_depth == 1 and self._cond_guard_stack
+                        and self._cond_guard_stack[-1] is not None):
+                    name, negated = self._cond_guard_stack[-1]
+                    entry["guard_constant"] = name
+                    entry["guard_negated"] = negated
+        bl.append(entry)
+
+    def _defined_condition(self, node) -> tuple[str, bool] | None:
+        """(constant, negated) for an ``if (defined('N'))`` /
+        ``if (!defined('N'))`` condition, else None."""
+        cond = self._first_child_of_type(
+            node, ("parenthesized_expression",))
+        if cond is None:
+            return None
+        expr = self._unwrap_parens(cond)
+        if expr is None:
+            return None
+        if expr.type == self._FUNCTION_CALL:
+            name = self._defined_call_constant(expr)
+            return (name, False) if name is not None else None
+        neg = self._not_defined_guard_name(node)
+        return (neg, True) if neg is not None else None
+
+    def _not_defined_guard_name(self, node) -> str | None:
+        """The N of an ``if (!defined('N'))`` condition, or None."""
+        cond = self._first_child_of_type(
+            node, ("parenthesized_expression",))
+        if cond is None:
+            return None
+        expr = self._unwrap_parens(cond)
+        if expr is None or expr.type != "unary_op_expression":
+            return None
+        if not any(c.type == "!" for c in expr.children):
+            return None
+        operand = None
+        for c in expr.children:
+            if c.is_named:
+                operand = c
+                break
+        # ``!(defined('N'))`` unwraps; ``!!defined('N')`` (inverted —
+        # dies when DEFINED) leaves a unary operand and refuses.
+        operand = self._unwrap_parens(operand)
+        if operand is None or operand.type != self._FUNCTION_CALL:
+            return None
+        return self._defined_call_constant(operand)
+
+    def _maybe_record_access_guard(self, node, guard: str | None) -> None:
+        """``if (!defined('N')) die/exit`` at file scope → the file's
+        direct-access guard (role evidence for the include graph).
+
+        Two positional requirements, both hostile-plant defenses:
+        unconditional file scope (a guard nested under another branch
+        never executes on the plant's terms), and the file's inert
+        PROLOGUE still open (see _PROLOGUE_INERT_STMTS) — a guard
+        after executable file-scope code either never runs
+        (post-abort/post-goto plants) or runs after the payload a
+        direct request already executed (bottom-of-file guards), so
+        recording it would render a web-reachable handler as a
+        guarded library. Adjudicated over demoting guard evidence
+        wholesale: prologue-position guards are exactly the honest
+        idiom, and the rule needs no cross-statement flow analysis.
+        """
+        if (guard is None or self._enclosing or self._cond_depth
+                or not self._guard_prologue_open
+                or self.graph.direct_access_guard is not None):
+            return
+        for stmt in self._if_body_stmts(node):
+            if self._stmt_is_abort(stmt):
+                self.graph.direct_access_guard = {
+                    "line": node.start_point[0] + 1,
+                    "constant": guard,
+                }
+                return
+
+    def _or_die_guard_constant(self, node) -> str | None:
+        """The N of a ``defined('N') or/|| die/exit`` expression, or
+        None when the node is not that shape."""
+        kids = list(node.children)
+        op_i = next((i for i, c in enumerate(kids)
+                     if c.type in ("or", "||")), None)
+        if op_i is None or op_i == 0 or op_i == len(kids) - 1:
+            return None
+        left = kids[op_i - 1]
+        if left.type != self._FUNCTION_CALL:
+            return None
+        const = self._defined_call_constant(left)
+        if const is None:
+            return None
+        return const if self._stmt_is_abort(kids[op_i + 1]) else None
+
+    def _maybe_record_or_die_guard(self, node) -> None:
+        """``defined('N') or die/exit`` at file scope — the other
+        idiomatic direct-access guard spelling. Same positional
+        requirements (unconditional scope + open prologue) as the
+        if form."""
+        if (self._enclosing or self._cond_depth
+                or not self._guard_prologue_open
+                or self.graph.direct_access_guard is not None):
+            return
+        const = self._or_die_guard_constant(node)
+        if const is not None:
+            self.graph.direct_access_guard = {
+                "line": node.start_point[0] + 1,
+                "constant": const,
+            }
+
+    def _stmt_is_abort(self, stmt) -> bool:
+        """Whether a statement/expression is a die/exit abort."""
+        expr = stmt
+        while expr is not None and expr.type in (
+            "expression_statement", "error_suppression_expression",
+            "parenthesized_expression",
+        ):
+            nxt = None
+            for c in expr.children:
+                if c.is_named:
+                    nxt = c
+                    break
+            expr = nxt
+        if expr is None:
+            return False
+        if expr.type == self._NAME:
+            return expr.text.decode(
+                "utf-8", errors="replace").lower() in self._ABORT_NAMES
+        if expr.type == self._FUNCTION_CALL:
+            fn = self._first_child_of_type(expr, (self._NAME,))
+            return (fn is not None and fn.text.decode(
+                "utf-8", errors="replace").lower() in self._ABORT_NAMES)
+        return expr.type == "exit_statement"
+
+    def _function_call_chain(self, node) -> list[str] | None:
         # function_call_expression: function (qualified_name | name | variable) + arguments
         for c in node.children:
             if c.type == self._ARGS:
@@ -3331,9 +5615,17 @@ class _PhpCallGraph:
                 # ``$fn(...)`` — variable callable. Unknowable.
                 self.graph.indirection.add(INDIRECTION_REFLECT)
                 return None
+            if c.type == self._DYNAMIC_VAR:
+                # ``$$fn(...)`` — variable-VARIABLE callable
+                # (dynamic_variable_name node). Same unknowable
+                # dispatch as ``$fn(...)``; without this branch the
+                # call fell through with NO flag and the file lost
+                # its reflect masking.
+                self.graph.indirection.add(INDIRECTION_REFLECT)
+                return None
         return None
 
-    def _scoped_call_chain(self, node) -> Optional[List[str]]:
+    def _scoped_call_chain(self, node) -> list[str] | None:
         # scoped_call_expression: scope (Class) :: name + arguments.
         # PHP's ``self::method()`` / ``static::method()`` /
         # ``parent::method()`` use a ``relative_scope`` node holding
@@ -3371,7 +5663,7 @@ class _PhpCallGraph:
             return None
         return scope_parts + [method.text.decode()]
 
-    def _member_call_chain(self, node) -> Optional[List[str]]:
+    def _member_call_chain(self, node) -> list[str] | None:
         # member_call_expression: object -> name + arguments
         obj = None
         method = None
@@ -3390,17 +5682,14 @@ class _PhpCallGraph:
             return None
         return obj_chain + [method.text.decode()]
 
-    def _object_chain(self, node) -> Optional[List[str]]:
+    def _object_chain(self, node) -> list[str] | None:
         if node.type == self._VAR:
             return [node.text.decode().lstrip("$")]
         if node.type == self._NAME:
             return [node.text.decode()]
         if node.type == self._MEMBER_ACCESS:
-            parts: List[str] = []
-            for c in node.children:
-                if c.is_named:
-                    parts.append(self._object_chain(c) or [])
-            flat: List[str] = []
+            parts: list[list[str]] = [self._object_chain(c) or [] for c in node.children if c.is_named]
+            flat: list[str] = []
             for p in parts:
                 flat.extend(p)
             return flat
@@ -3446,7 +5735,9 @@ class _PhpCallGraph:
 INDIRECTION_FN_POINTER = "fn_pointer"  # C/C++ call through a fn pointer var
 
 
-def extract_call_graph_c(content: str) -> FileCallGraph:
+def extract_call_graph_c(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a C source string via tree-sitter-c and return its
     :class:`FileCallGraph`.
 
@@ -3483,21 +5774,8 @@ def extract_call_graph_c(content: str) -> FileCallGraph:
         but the declarator walk only handles ANSI prototypes for
         signature/parameters extraction.
     """
-    try:
-        import tree_sitter_c as ts_c
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter C grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_c.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: C parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_c", "C", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _CCallGraph()
@@ -3523,6 +5801,8 @@ class _CCallGraph:
     _FUNCTION_DECLARATOR = "function_declarator"
     _POINTER_DECLARATOR = "pointer_declarator"
     _PARENTHESIZED_DECLARATOR = "parenthesized_declarator"
+    _ARRAY_DECLARATOR = "array_declarator"
+    _INIT_DECLARATOR = "init_declarator"
 
     # Expressions.
     _CALL_EXPRESSION = "call_expression"
@@ -3541,16 +5821,117 @@ class _CCallGraph:
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
-        # Stack of lexically-enclosing function names. ``None`` is
-        # never pushed — file-scope ``CallSite``s (initialisers) emit
-        # with ``caller=None``.
-        self._enclosing: List[str] = []
+        self._enclosing: list[str] = []
+        self._fn_ptr_vars: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Pre-pass: collect function-pointer variable declarations
+    # ------------------------------------------------------------------
+
+    def _collect_fn_ptr_declarations(self, node) -> None:
+        """Walk all declaration nodes to find function-pointer variables.
+
+        Matches patterns like ``void (*handler)(int)`` where a
+        pointer_declarator wraps a function_declarator.
+
+        Iterative (explicit stack): deep ASTs — openssl's ssl/s3_lib.c
+        parses >1000 levels deep — blew Python's recursion limit here
+        and dropped the whole file from the inventory.
+        """
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if n.type == "declaration":
+                self._check_fn_ptr_decl(n)
+            stack.extend(n.children)
+
+    def _check_fn_ptr_decl(self, decl_node) -> None:
+        """Check if a declaration contains a function-pointer declarator."""
+        for child in decl_node.children:
+            name = self._extract_fn_ptr_name(child)
+            if name:
+                self._fn_ptr_vars.add(name)
+
+    @staticmethod
+    def _first_child_of_type(node, types):
+        for c in node.children:
+            if c.type in types:
+                return c
+        return None
+
+    def _extract_fn_ptr_name(self, node) -> str | None:
+        """Name of a function-pointer variable declarator, or None.
+
+        tree-sitter-c nests fn-ptr declarators with the
+        ``function_declarator`` OUTERMOST::
+
+            function_declarator
+              parenthesized_declarator      ( * name )
+                pointer_declarator
+                  identifier | array_declarator > identifier
+
+        (an earlier version assumed the inverted nesting —
+        pointer_declarator CONTAINING function_declarator — and never
+        matched anything, so ``fp()`` calls through declared pointers
+        were never flagged as indirection). A pointer RETURN type
+        (``void *(*g)(int)``) wraps the function_declarator in one
+        more pointer_declarator. Plain prototypes
+        (``int proto(int);``) have a bare identifier child, no
+        parenthesized_declarator — correctly not matched.
+        """
+        if node.type == self._INIT_DECLARATOR:
+            for c in node.children:
+                name = self._extract_fn_ptr_name(c)
+                if name:
+                    return name
+            return None
+        if node.type == self._FUNCTION_DECLARATOR:
+            for c in node.children:
+                if c.type == self._PARENTHESIZED_DECLARATOR:
+                    return self._name_inside_ptr_parens(c)
+            return None
+        if node.type == self._POINTER_DECLARATOR:
+            # Pointer return type wrapping the fn-ptr declarator.
+            for c in node.children:
+                if c.type in (self._FUNCTION_DECLARATOR,
+                              self._POINTER_DECLARATOR):
+                    name = self._extract_fn_ptr_name(c)
+                    if name:
+                        return name
+            return None
+        return None
+
+    def _name_inside_ptr_parens(self, paren_node) -> str | None:
+        """Identifier inside ``(*name)`` / ``(**name)`` /
+        ``(*name[N])`` — a parenthesized_declarator that must contain
+        a pointer_declarator (plain parenthesised names aren't
+        function pointers)."""
+        cur = self._first_child_of_type(
+            paren_node, (self._POINTER_DECLARATOR,),
+        )
+        while cur is not None:
+            ident = self._first_child_of_type(cur, (self._IDENTIFIER,))
+            if ident is not None:
+                return ident.text.decode("utf-8", errors="replace")
+            cur = self._first_child_of_type(
+                cur, (self._POINTER_DECLARATOR, self._ARRAY_DECLARATOR,
+                      self._PARENTHESIZED_DECLARATOR),
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Walk dispatch
     # ------------------------------------------------------------------
 
     def walk(self, node) -> None:
+        # One-time pre-pass (was per-node inside the old recursive
+        # walk — O(n^2): the root call already collects every
+        # declaration in the file, so per-node re-collection was
+        # pure waste).
+        self._collect_fn_ptr_declarations(node)
+        _drive_visit(self, node)
+
+    def _visit(self, node):
         """Pre-order traversal. Function definitions push their name
         before children are visited; pop on the way back up."""
         t = node.type
@@ -3564,7 +5945,7 @@ class _CCallGraph:
                 self._enclosing.append(name)
                 try:
                     for child in node.children:
-                        self.walk(child)
+                        yield child
                     return
                 finally:
                     self._enclosing.pop()
@@ -3572,7 +5953,7 @@ class _CCallGraph:
             self._visit_call(node)
             # Fall through so nested calls inside the arg list are visited.
         for child in node.children:
-            self.walk(child)
+            yield child
 
     # ------------------------------------------------------------------
     # Includes
@@ -3607,7 +5988,7 @@ class _CCallGraph:
     # Calls
     # ------------------------------------------------------------------
 
-    def _visit_call(self, node) -> None:
+    def _visit_call(self, node: Node) -> None:
         # call_expression: function (argument_list)
         # The "function" field is the first named child before
         # argument_list.
@@ -3625,7 +6006,7 @@ class _CCallGraph:
         if chain is None:
             return
 
-        if is_fn_pointer:
+        if is_fn_pointer or (len(chain) == 1 and chain[0] in self._fn_ptr_vars):
             self.graph.indirection.add(INDIRECTION_FN_POINTER)
 
         caller = self._enclosing[-1] if self._enclosing else None
@@ -3635,7 +6016,7 @@ class _CCallGraph:
             caller=caller,
         ))
 
-    def _callee_chain(self, node) -> Tuple[Optional[List[str]], bool]:
+    def _callee_chain(self, node) -> tuple[list[str] | None, bool]:
         """Resolve the callee expression to an attribute chain.
 
         Returns (chain, is_fn_pointer). ``chain`` is None when the
@@ -3671,9 +6052,9 @@ class _CCallGraph:
 
         return None, False
 
-    def _field_chain(self, node) -> Optional[List[str]]:
+    def _field_chain(self, node) -> list[str] | None:
         """Resolve ``a.b.c`` / ``a->b->c`` / mixed → ``["a","b","c"]``."""
-        parts: List[str] = []
+        parts: list[str] = []
         cur = node
         # field_expression: argument . | -> field
         while cur is not None and cur.type == self._FIELD_EXPRESSION:
@@ -3704,7 +6085,7 @@ class _CCallGraph:
     # Function name extraction
     # ------------------------------------------------------------------
 
-    def _function_name(self, fn_def_node) -> Optional[str]:
+    def _function_name(self, fn_def_node) -> str | None:
         """Find the function identifier inside a function_definition.
 
         The declarator subtree may be wrapped:
@@ -3727,7 +6108,7 @@ class _CCallGraph:
                     return self._declarator_name(inner)
         return None
 
-    def _declarator_name(self, fn_declarator_node) -> Optional[str]:
+    def _declarator_name(self, fn_declarator_node) -> str | None:
         # function_declarator first named child is the name (identifier)
         # or another declarator that wraps the name.
         for c in fn_declarator_node.children:
@@ -3765,7 +6146,7 @@ class _CCallGraph:
         return None
 
     @staticmethod
-    def _unwrap_string(string_node) -> Optional[str]:
+    def _unwrap_string(string_node) -> str | None:
         """``"foo/bar.h"`` → ``foo/bar.h``."""
         for c in string_node.children:
             if c.type == "string_content":
@@ -3804,7 +6185,9 @@ class _CCallGraph:
 #   * Lambdas are opaque: the call expression they appear in is still
 #     emitted, but a lambda *call* (``[]{...}()``) returns no chain.
 
-def extract_call_graph_cpp(content: str) -> FileCallGraph:
+def extract_call_graph_cpp(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a C++ source string via tree-sitter-cpp and return its
     :class:`FileCallGraph`.
 
@@ -3847,21 +6230,8 @@ def extract_call_graph_cpp(content: str) -> FileCallGraph:
       * ``using namespace ns;`` doesn't fold ``ns::`` qualifiers off
         of subsequent calls.
     """
-    try:
-        import tree_sitter_cpp as ts_cpp
-        from tree_sitter import Language, Parser
-    except ImportError:
-        logger.debug(
-            "call_graph: tree-sitter C++ grammar not installed; "
-            "returning empty graph",
-        )
-        return FileCallGraph()
-
-    try:
-        parser = Parser(Language(ts_cpp.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: C++ parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_cpp", "C++", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _CppCallGraph()
@@ -3905,31 +6275,39 @@ class _CppCallGraph(_CCallGraph):
 
     def __init__(self) -> None:
         super().__init__()
-        self._class_stack: List[ClassDef] = []
+        self._class_stack: list[ClassDef] = []
         # Namespace nesting stack. Each entry is a segment name
         # (e.g. ``ns`` for ``namespace ns { ... }``; ``a``, ``b``
         # for ``namespace a::b { ... }``). The dotted join feeds
         # ``graph.package_name`` for resolver canonicalisation —
         # parity with Java/C#/PHP/Ruby/Go.
-        self._ns_stack: List[str] = []
+        self._ns_stack: list[str] = []
 
     # ------------------------------------------------------------------
     # Walk dispatch
     # ------------------------------------------------------------------
 
     def walk(self, node) -> None:
+        # Same fn-pointer pre-pass as the C walker: this override
+        # previously skipped it, so C++ files never populated
+        # _fn_ptr_vars and ``fp()`` calls through declared pointers
+        # were never flagged INDIRECTION_FN_POINTER.
+        self._collect_fn_ptr_declarations(node)
+        _drive_visit(self, node)
+
+    def _visit(self, node):
         t = node.type
         if t == self._PREPROC_INCLUDE:
             self._visit_include(node)
             return
         if t == self._NAMESPACE_DEFINITION:
-            self._visit_namespace_definition(node)
+            yield from self._visit_namespace_definition(node)
             return
         if t in (self._CLASS_SPECIFIER, self._STRUCT_SPECIFIER):
-            self._visit_class_specifier(node)
+            yield from self._visit_class_specifier(node)
             return  # children are visited inside _visit_class_specifier
         if t == self._FUNCTION_DEFINITION:
-            self._visit_function_definition(node)
+            yield from self._visit_function_definition(node)
             return
         if t == self._CALL_EXPRESSION:
             self._visit_call(node)
@@ -3938,36 +6316,31 @@ class _CppCallGraph(_CCallGraph):
             self._visit_field_initializer(node)
             # Fall through — nested calls inside the argument_list
             # (e.g. ``Base(helper())``) still need to be walked.
-        for child in node.children:
-            self.walk(child)
+        yield from node.children
 
     # ------------------------------------------------------------------
     # Namespace
     # ------------------------------------------------------------------
 
-    def _visit_namespace_definition(self, node) -> None:
+    def _visit_namespace_definition(self, node):
         """``namespace ns { ... }`` / ``namespace a::b { ... }`` —
         push namespace segments and walk the body. Anonymous
         namespaces (``namespace { ... }`` with no name) push
         nothing — the body's symbols have internal linkage but
         no qualified-name prefix in the call graph."""
-        parts: List[str] = []
+        parts: list[str] = []
         for c in node.children:
             if c.type == "namespace_identifier":
                 parts.append(c.text.decode("utf-8", errors="replace"))
             elif c.type == "nested_namespace_specifier":
                 # ``a::b`` — multiple namespace_identifier children.
-                for sub in c.children:
-                    if sub.type == "namespace_identifier":
-                        parts.append(
-                            sub.text.decode("utf-8", errors="replace"),
-                        )
+                parts.extend(sub.text.decode("utf-8", errors="replace") for sub in c.children if sub.type == "namespace_identifier")
         self._ns_stack.extend(parts)
         if self._ns_stack:
             self.graph.package_name = ".".join(self._ns_stack)
         try:
             for c in node.children:
-                self.walk(c)
+                yield c
         finally:
             for _ in parts:
                 self._ns_stack.pop()
@@ -3985,13 +6358,12 @@ class _CppCallGraph(_CCallGraph):
     # Class / struct
     # ------------------------------------------------------------------
 
-    def _visit_class_specifier(self, node) -> None:
+    def _visit_class_specifier(self, node: Node):
         name = self._class_name(node)
         if name is None:
             # Anonymous struct/class — skip class-stack tracking but
             # still descend so inner calls aren't lost.
-            for c in node.children:
-                self.walk(c)
+            yield from node.children
             return
         bases = self._extract_bases(node)
         cdef = ClassDef(
@@ -4010,8 +6382,7 @@ class _CppCallGraph(_CCallGraph):
         self.graph.classes.append(cdef)
         self._class_stack.append(cdef)
         try:
-            for child in node.children:
-                self.walk(child)
+            yield from node.children
         finally:
             self._class_stack.pop()
 
@@ -4068,20 +6439,20 @@ class _CppCallGraph(_CCallGraph):
                         )
                     break
 
-    def _class_name(self, node) -> Optional[str]:
+    def _class_name(self, node) -> str | None:
         # class_specifier: "class" type_identifier base_class_clause? body
         for c in node.children:
             if c.type == self._TYPE_IDENTIFIER:
                 return c.text.decode("utf-8", errors="replace")
         return None
 
-    def _extract_bases(self, node) -> List[str]:
+    def _extract_bases(self, node) -> list[str]:
         """Parse ``: public Foo, protected Bar`` into ``["Foo",
         "Bar"]``. Access specifiers are dropped; only the type names
         survive. ``Foo<T>`` (template_type) base is reduced to
         ``Foo`` — type args are erased for the same reason
         template_function callees emit the bare name."""
-        bases: List[str] = []
+        bases: list[str] = []
         for c in node.children:
             if c.type != self._BASE_CLASS_CLAUSE:
                 continue
@@ -4110,13 +6481,13 @@ class _CppCallGraph(_CCallGraph):
     # Function definitions
     # ------------------------------------------------------------------
 
-    def _visit_function_definition(self, node) -> None:
+    def _visit_function_definition(self, node: Node):
         name = self._function_name(node)
         qualified_class = self._qualified_class_from_declarator(node)
         if name is None:
             # Couldn't resolve; still descend to catch nested calls.
             for c in node.children:
-                self.walk(c)
+                yield c
             return
 
         # In-class inline method: record method on the current
@@ -4146,7 +6517,7 @@ class _CppCallGraph(_CCallGraph):
         # but accepted gap; the lookup falls back to the body-walk
         # collecting the class later in the file, which then helps
         # any subsequent definitions.
-        synthetic_class: Optional[ClassDef] = None
+        synthetic_class: ClassDef | None = None
         if qualified_class is not None and not self._class_in_stack(qualified_class):
             real = self._lookup_class(qualified_class)
             if real is not None:
@@ -4165,20 +6536,20 @@ class _CppCallGraph(_CCallGraph):
         self._enclosing.append(name)
         try:
             for c in node.children:
-                self.walk(c)
+                yield c
         finally:
             self._enclosing.pop()
-            if synthetic_class is not None:
-                # The synthetic class is the top of the stack iff no
-                # other class_specifier pushed during the body.
-                if (self._class_stack
-                        and self._class_stack[-1] is synthetic_class):
-                    self._class_stack.pop()
+            # The synthetic class is the top of the stack iff no
+            # other class_specifier pushed during the body.
+            if (synthetic_class is not None
+                    and self._class_stack
+                    and self._class_stack[-1] is synthetic_class):
+                self._class_stack.pop()
 
     def _class_in_stack(self, name: str) -> bool:
         return any(c.name == name for c in self._class_stack)
 
-    def _lookup_class(self, name: str) -> Optional[ClassDef]:
+    def _lookup_class(self, name: str) -> ClassDef | None:
         """Find a previously-recorded class by name. Returns None on
         forward references (the class hasn't been visited yet)."""
         for c in self.graph.classes:
@@ -4186,7 +6557,7 @@ class _CppCallGraph(_CCallGraph):
                 return c
         return None
 
-    def _function_name(self, fn_def_node) -> Optional[str]:
+    def _function_name(self, fn_def_node) -> str | None:
         """C++ declarators can be qualified (``Foo::bar``), template-
         parameterised, or destructors (``~Foo``). Walk through wrapping
         declarators to find the innermost name."""
@@ -4201,7 +6572,7 @@ class _CppCallGraph(_CCallGraph):
                     return self._declarator_name_cpp(inner)
         return None
 
-    def _declarator_name_cpp(self, fn_declarator_node) -> Optional[str]:
+    def _declarator_name_cpp(self, fn_declarator_node) -> str | None:
         """Like the C version but accepts qualified_identifier
         (returns just the trailing name), destructor_name, and
         operator_name."""
@@ -4231,7 +6602,7 @@ class _CppCallGraph(_CCallGraph):
                             return parts[-1]
         return None
 
-    def _qualified_class_from_declarator(self, fn_def_node) -> Optional[str]:
+    def _qualified_class_from_declarator(self, fn_def_node) -> str | None:
         """If the function's declarator is ``Foo::bar`` (out-of-line
         method), return ``"Foo"``. Otherwise None."""
         for c in fn_def_node.children:
@@ -4245,7 +6616,7 @@ class _CppCallGraph(_CCallGraph):
                     return self._qualified_class_from_fn_declarator(inner)
         return None
 
-    def _qualified_class_from_fn_declarator(self, fn_declarator_node) -> Optional[str]:
+    def _qualified_class_from_fn_declarator(self, fn_declarator_node) -> str | None:
         for c in fn_declarator_node.children:
             if not c.is_named:
                 continue
@@ -4260,7 +6631,7 @@ class _CppCallGraph(_CCallGraph):
     # Qualified-identifier parsing
     # ------------------------------------------------------------------
 
-    def _qualified_parts(self, qualified_node) -> List[str]:
+    def _qualified_parts(self, qualified_node) -> list[str]:
         """``Foo::bar`` → ``["Foo", "bar"]``;
         ``ns::sub::fn`` → ``["ns", "sub", "fn"]``.
 
@@ -4268,7 +6639,7 @@ class _CppCallGraph(_CCallGraph):
         has ``namespace_identifier`` + nested ``qualified_identifier``
         or terminal ``identifier`` / ``destructor_name`` /
         ``field_identifier`` / ``template_function``."""
-        parts: List[str] = []
+        parts: list[str] = []
         cur = qualified_node
         while cur is not None and cur.type == self._QUALIFIED_IDENTIFIER:
             # Pre-order children: namespace_identifier, then nested.
@@ -4318,11 +6689,11 @@ class _CppCallGraph(_CCallGraph):
     # Calls (override to set receiver_class + handle qualified callees)
     # ------------------------------------------------------------------
 
-    def _callee_chain(self, node) -> Tuple[Optional[List[str]], bool]:
+    def _callee_chain(self, node) -> tuple[list[str] | None, bool]:
         # Extension: qualified_identifier as a callee.
         if node.type == self._QUALIFIED_IDENTIFIER:
             parts = self._qualified_parts(node)
-            return (parts if parts else None), False
+            return (parts or None), False
         if node.type == self._FIELD_EXPRESSION:
             # Override C base: field_expression in C++ may root on
             # ``this`` (own node type) rather than an identifier.
@@ -4338,14 +6709,14 @@ class _CppCallGraph(_CCallGraph):
             return None, False
         return super()._callee_chain(node)
 
-    def _field_chain_cpp(self, node) -> Optional[List[str]]:
+    def _field_chain_cpp(self, node) -> list[str] | None:
         """C++ ``a.b.c`` / ``a->b->c`` / ``this->member`` resolution.
 
         Same as the C base's ``_field_chain`` but accepts ``this`` as
         a terminal (rendered as the literal string ``"this"`` in the
         chain), and handles a qualified_identifier at the root
         (``ns::var.field`` is legal C++)."""
-        parts: List[str] = []
+        parts: list[str] = []
         cur = node
         while cur is not None and cur.type == self._FIELD_EXPRESSION:
             # The field side is either a plain ``field_identifier``
@@ -4415,7 +6786,7 @@ class _CppCallGraph(_CCallGraph):
             return None
         return None
 
-    def _compound_literal_type_name(self, node) -> Optional[str]:
+    def _compound_literal_type_name(self, node) -> str | None:
         """Pull the type's bare name from a compound_literal_expression.
         Handles plain ``Foo{}`` (type_identifier) and templated
         ``vector<int>{}`` (template_type → type_identifier)."""
@@ -4428,7 +6799,7 @@ class _CppCallGraph(_CCallGraph):
                         return sub.text.decode("utf-8", errors="replace")
         return None
 
-    def _visit_call(self, node) -> None:
+    def _visit_call(self, node: Node) -> None:
         callee_node = None
         for c in node.children:
             if c.type == "argument_list":
@@ -4443,7 +6814,11 @@ class _CppCallGraph(_CCallGraph):
         if chain is None:
             return
 
-        if is_fn_pointer:
+        # Same declared-pointer check as the C walker: a bare
+        # ``handler(1)`` through a collected fn-ptr variable is
+        # indirect dispatch even without the ``(*handler)`` deref.
+        if is_fn_pointer or (
+                len(chain) == 1 and chain[0] in self._fn_ptr_vars):
             self.graph.indirection.add(INDIRECTION_FN_POINTER)
 
         caller = self._enclosing[-1] if self._enclosing else None
@@ -4456,7 +6831,7 @@ class _CppCallGraph(_CCallGraph):
             receiver_class=receiver_class,
         ))
 
-    def _visit_field_initializer(self, node) -> None:
+    def _visit_field_initializer(self, node: Node) -> None:
         """Constructor initialiser list entry: ``Base(x)`` or
         ``member_(0)``. The field_identifier child names either:
           * a base class (delegating constructor call) — semantically
@@ -4489,7 +6864,7 @@ class _CppCallGraph(_CCallGraph):
                     break
         if name_node is None:
             return
-        name = name_node.text.decode("utf-8", errors="replace")
+        name = name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
         caller = self._enclosing[-1] if self._enclosing else None
         # No receiver_class tag — initialiser-list entries dispatch
         # on the literal name (base class or member), not on the
@@ -4501,7 +6876,7 @@ class _CppCallGraph(_CCallGraph):
             receiver_class=None,
         ))
 
-    def _infer_receiver_class(self, chain: List[str]) -> Optional[str]:
+    def _infer_receiver_class(self, chain: list[str]) -> str | None:
         """Tag ``receiver_class`` when the callee shape pins it.
 
         Rules (deliberately narrow to avoid wrong tags):
@@ -4530,26 +6905,1526 @@ class _CppCallGraph(_CCallGraph):
         return None
 
 
+def extract_call_graph_lua(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
+    """Walk a Lua source string via tree-sitter-lua and return its
+    :class:`FileCallGraph`.
+
+    Returns an empty graph when ``tree_sitter_lua`` isn't installed
+    or the file is unparseable.
+
+    Lua shapes:
+
+      * ``require('luci.model.uci')`` -> import
+      * ``foo(...)`` -> chain ``["foo"]``
+      * ``obj.foo(...)`` -> chain ``["obj", "foo"]`` (dot_index_expression)
+      * ``obj:method(...)`` -> chain ``["obj", "method"]`` (method_index_expression)
+      * ``a.b.c(...)`` -> chain ``["a", "b", "c"]`` (nested dot_index_expression)
+      * ``dofile("x.lua")`` / ``loadfile("x.lua")`` -> import
+      * ``pcall(func, ...)`` / ``xpcall(func, handler, ...)`` ->
+        first/second argument is the real callee
+      * ``loadstring(...)`` / ``load(...)`` -> ``INDIRECTION_EVAL``
+    """
+    tree = _ts_tree(content, "tree_sitter_lua", "Lua", _tree)
+    if tree is None:
+        return FileCallGraph()
+
+    walker = _LuaCallGraph()
+    walker.walk(tree.root_node)
+    return walker.graph
+
+
+class _LuaCallGraph:
+    """Single-pass tree-sitter-lua walk."""
+
+    _FUNC_CALL = "function_call"
+    _FUNC_DECL = "function_declaration"
+    _FUNC_DEF = "function_definition"
+    _IDENT = "identifier"
+    _DOT_INDEX = "dot_index_expression"
+    _METHOD_INDEX = "method_index_expression"
+    _ARGUMENTS = "arguments"
+    _STRING = "string"
+    _STRING_CONTENT = "string_content"
+
+    _REQUIRE_NAMES: ClassVar[set[str]] = {"require", "dofile", "loadfile"}
+    _EVAL_NAMES: ClassVar[set[str]] = {"loadstring", "load"}
+    _PCALL_NAMES: ClassVar[set[str]] = {"pcall", "xpcall"}
+
+    def __init__(self) -> None:
+        self.graph = FileCallGraph()
+        self._enclosing: list[str] = []
+
+    def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node):
+        if node.type == self._FUNC_DECL:
+            name = self._func_decl_name(node)
+            if name:
+                self._enclosing.append(name)
+                try:
+                    for c in node.children:
+                        yield c
+                finally:
+                    self._enclosing.pop()
+                return
+            for c in node.children:
+                yield c
+            return
+
+        if node.type == self._FUNC_DEF:
+            # Anonymous function — try to resolve name from assignment.
+            name = self._assigned_name(node) or "<anon>"
+            self._enclosing.append(name)
+            try:
+                for c in node.children:
+                    yield c
+            finally:
+                self._enclosing.pop()
+            return
+
+        if node.type == self._FUNC_CALL:
+            self._handle_call(node)
+            for c in node.children:
+                yield c
+            return
+
+        for c in node.children:
+            yield c
+
+    def _func_decl_name(self, node) -> str | None:
+        """Extract the name from a function_declaration node."""
+        for c in node.children:
+            if c.type == self._IDENT:
+                return c.text.decode()
+            if c.type == self._DOT_INDEX:
+                return c.text.decode()
+            if c.type == self._METHOD_INDEX:
+                return c.text.decode().replace(":", ".")
+        return None
+
+    def _assigned_name(self, node) -> str | None:
+        """Resolve the name of an anonymous function from its enclosing
+        assignment (``local parse = function(s) ... end``)."""
+        parent = node.parent
+        if parent is not None and parent.type == "expression_list":
+            parent = parent.parent
+        if parent is None or parent.type != "assignment_statement":
+            return None
+        for child in parent.children:
+            if child.type == "variable_list":
+                for v in child.children:
+                    if v.type == self._IDENT:
+                        return v.text.decode()
+                    if v.type == self._DOT_INDEX:
+                        return v.text.decode()
+                break
+        return None
+
+    def _handle_call(self, node) -> None:
+        """Process a function_call node."""
+        # The callee is the first child before the arguments node.
+        callee = None
+        args_node = None
+        for c in node.children:
+            if c.type == self._ARGUMENTS:
+                args_node = c
+                break
+            if c.is_named:
+                callee = c
+
+        if callee is None:
+            return
+
+        chain = self._chain_from_node(callee)
+        if not chain:
+            return
+
+        bare = chain[0] if len(chain) == 1 else None
+
+        # require / dofile / loadfile → import.
+        if bare in self._REQUIRE_NAMES and args_node is not None:
+            self._extract_import(bare, args_node)
+
+        # loadstring / load → eval indirection.
+        if bare in self._EVAL_NAMES:
+            self.graph.indirection.add(INDIRECTION_EVAL)
+
+        # pcall(func, ...) / xpcall(func, handler, ...) — the first
+        # non-string argument is the real callee.
+        if bare in self._PCALL_NAMES and args_node is not None:
+            self._handle_pcall(bare, args_node)
+
+        self._record(node, chain)
+
+    def _handle_pcall(self, _name: str, args_node) -> None:
+        """For pcall/xpcall, record a call to the real callee argument."""
+        real_args = [c for c in args_node.children if c.is_named]
+        if not real_args:
+            return
+        # pcall: first arg is the callee.
+        # xpcall: first arg is the callee, second is the error handler.
+        callee_node = real_args[0]
+        callee_chain = self._chain_from_node(callee_node)
+        if callee_chain:
+            self._record(callee_node, callee_chain)
+
+    def _extract_import(self, func_name: str, args_node) -> None:
+        """Extract import from require/dofile/loadfile arguments."""
+        for c in args_node.children:
+            if c.type == self._STRING:
+                for sc in c.children:
+                    if sc.type == self._STRING_CONTENT:
+                        path = sc.text.decode()
+                        if func_name == "require":
+                            # ``require('luci.model.uci')`` — dot-separated
+                            # module name. Bind the last component.
+                            bound = path.split(".")[-1]
+                        else:
+                            # dofile / loadfile — file path. Bind basename
+                            # sans extension.
+                            bound = path.rsplit("/", 1)[-1]
+                            bound = bound.removesuffix(".lua")
+                        self.graph.imports[bound] = path
+                        return
+
+    def _chain_from_node(self, node) -> list[str]:
+        """Build an attribute chain from a node."""
+        if node.type == self._IDENT:
+            return [node.text.decode()]
+        if node.type == self._DOT_INDEX:
+            parts: list[str] = []
+            for c in node.children:
+                if c.type == self._IDENT:
+                    parts.append(c.text.decode())
+                elif c.type == self._DOT_INDEX:
+                    parts = self._chain_from_node(c) + parts
+            return parts
+        if node.type == self._METHOD_INDEX:
+            parts = []
+            for c in node.children:
+                if c.type == self._IDENT:
+                    parts.append(c.text.decode())
+                elif c.type == self._DOT_INDEX:
+                    parts = self._chain_from_node(c) + parts
+            return parts
+        return []
+
+    def _record(self, node: Node, chain: list[str]) -> None:
+        line = node.start_point[0] + 1
+        caller = self._enclosing[-1] if self._enclosing else None
+        self.graph.calls.append(
+            CallSite(line=line, chain=chain, caller=caller),
+        )
+
+    @staticmethod
+    def _first_child_of_type(node, types: tuple):
+        for c in node.children:
+            if c.type in types:
+                return c
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Scala
+# ---------------------------------------------------------------------------
+
+def extract_call_graph_scala(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
+    """Walk a Scala source string via tree-sitter-scala and return its
+    :class:`FileCallGraph`.
+
+    Returns an empty graph when ``tree_sitter_scala`` isn't installed
+    or the file is unparseable.
+
+    Scala shapes:
+
+      * ``package a.b`` → ``package_name``
+      * ``import a.b.C`` → import; ``import a.b._`` → wildcard flag
+      * ``class C extends Base with T`` / ``object O`` / ``trait T``
+        → ClassDef (bases from the extends_clause)
+      * ``def m(...) = {...}`` → enclosing-function push + method
+        registration on the innermost class/object/trait
+      * ``f()`` → chain ``["f"]``; ``obj.m()`` → ``["obj", "m"]``;
+        ``this.m()`` → receiver_class narrowing like Java
+    """
+    tree = _ts_tree(content, "tree_sitter_scala", "Scala", _tree)
+    if tree is None:
+        return FileCallGraph()
+
+    walker = _ScalaCallGraph()
+    walker.walk(tree.root_node)
+    return walker.graph
+
+
+class _ScalaCallGraph:
+    """Single-pass tree-sitter-scala walk (generator/iterative form)."""
+
+    _CLASS_NODES = ("class_definition", "object_definition",
+                    "trait_definition", "enum_definition")
+    _FUNC_NODE = "function_definition"
+    _CALL_NODE = "call_expression"
+    _IDENT = "identifier"
+    _TYPE_IDENT = "type_identifier"
+    _FIELD_EXPR = "field_expression"
+    _ARGS = "arguments"
+
+    def __init__(self) -> None:
+        self.graph = FileCallGraph()
+        self._enclosing: list[str] = []
+        self._class_stack: list[ClassDef] = []
+
+    def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
+        t = node.type
+        if t == "package_clause":
+            pkg = next((c for c in node.children
+                        if c.type == "package_identifier"), None)
+            if pkg is not None:
+                name = pkg.text.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
+                if name:
+                    self.graph.package_name = name
+            return
+
+        if t == "import_declaration":
+            self._visit_import(node)
+            return
+
+        if t in self._CLASS_NODES:
+            name_node = next((c for c in node.children
+                              if c.type == self._IDENT), None)
+            if name_node is None:
+                for child in node.children:
+                    yield child
+                return
+            bases: list[str] = []
+            ext = next((c for c in node.children
+                        if c.type == "extends_clause"), None)
+            if ext is not None:
+                for sub in ext.children:
+                    if sub.type == self._TYPE_IDENT:
+                        bases.append(sub.text.decode("utf-8",  # type: ignore[union-attr]
+                                                     errors="replace"))
+                    elif sub.type == "generic_type":
+                        ti = next((g for g in sub.children
+                                   if g.type == self._TYPE_IDENT), None)
+                        if ti is not None:
+                            bases.append(ti.text.decode("utf-8",  # type: ignore[union-attr]
+                                                        errors="replace"))
+            cdef = ClassDef(
+                name=name_node.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
+                line=node.start_point[0] + 1,
+                bases=bases,
+                nested=bool(self._class_stack) or bool(self._enclosing),
+            )
+            self.graph.classes.append(cdef)
+            self._class_stack.append(cdef)
+            try:
+                for child in node.children:
+                    yield child
+            finally:
+                self._class_stack.pop()
+            return
+
+        if t == self._FUNC_NODE:
+            name_node = next((c for c in node.children
+                              if c.type == self._IDENT), None)
+            fn_name = (name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+                       if name_node is not None else "<anon>")
+            if self._class_stack and not self._enclosing:
+                self._class_stack[-1].methods.append(
+                    (fn_name, node.start_point[0] + 1),
+                )
+            self._enclosing.append(fn_name)
+            try:
+                for child in node.children:
+                    yield child
+            finally:
+                self._enclosing.pop()
+            return
+
+        if t == self._CALL_NODE:
+            self._visit_call(node)
+            # Fall through — nested calls in the arg list still walked.
+
+        for child in node.children:
+            yield child
+
+    def _visit_import(self, node) -> None:
+        parts: list[str] = []
+        wildcard = False
+        # ``import com.foo.{Bar, Baz => B}`` — the standard Scala
+        # multi-import form. The selector block is a
+        # ``namespace_selectors`` child; ignoring it bound NEITHER
+        # name and minted a phantom ``foo → com.foo`` binding
+        # (parts[-1] was the last PATH segment).
+        selectors: list[tuple[str, str]] = []  # (bound name, original)
+        for c in node.children:
+            if c.type == self._IDENT:
+                parts.append(c.text.decode("utf-8", errors="replace"))
+            elif c.type in ("namespace_wildcard", "wildcard"):
+                wildcard = True
+            elif c.type in ("namespace_selectors", "import_selectors"):
+                for sel in c.children:
+                    if sel.type == self._IDENT:
+                        nm = sel.text.decode("utf-8", errors="replace")
+                        selectors.append((nm, nm))
+                    elif sel.type in ("arrow_renamed_identifier",
+                                      "renamed_identifier"):
+                        ids = [g for g in sel.children
+                               if g.type == self._IDENT]
+                        if len(ids) == 2:
+                            selectors.append((
+                                ids[1].text.decode("utf-8",
+                                                   errors="replace"),
+                                ids[0].text.decode("utf-8",
+                                                   errors="replace"),
+                            ))
+                    elif sel.type in ("namespace_wildcard", "wildcard"):
+                        wildcard = True
+        if wildcard:
+            self.graph.indirection.add(INDIRECTION_WILDCARD_IMPORT)
+            return
+        prefix = ".".join(parts)
+        if selectors:
+            for bound, original in selectors:
+                if bound == "_":
+                    continue  # ``Name => _`` hides the name
+                self.graph.imports[bound] = (
+                    f"{prefix}.{original}" if prefix else original
+                )
+            return
+        if parts:
+            self.graph.imports[parts[-1]] = prefix
+
+    def _visit_call(self, node: Node) -> None:
+        callee = next(
+            (c for c in node.children if c.is_named
+             and c.type != self._ARGS),
+            None,
+        )
+        if callee is None:
+            return
+        chain = _flatten_dotted_chain(
+            callee,
+            ident_types=(self._IDENT,),
+            binary_types=(self._FIELD_EXPR,),
+        )
+        if chain is None:
+            return
+        caller = self._enclosing[-1] if self._enclosing else None
+        receiver_class: str | None = None
+        if self._class_stack and self._enclosing and (
+            len(chain) == 1
+            or (len(chain) == 2 and chain[0] == "this")
+        ):
+            receiver_class = self._class_stack[-1].name
+        args = next((c for c in node.children if c.type == self._ARGS),
+                    None)
+        arg_idents = (
+            [a.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+             for a in args.children if a.type == self._IDENT]
+            if args is not None else []
+        )
+        self.graph.calls.append(CallSite(
+            line=node.start_point[0] + 1,
+            chain=chain,
+            caller=caller,
+            receiver_class=receiver_class,
+            argument_identifiers=arg_idents,
+        ))
+
+
+def _flatten_dotted_chain(node, *, ident_types, binary_types,
+                          this_types=(), member_wrapper=None,
+                          max_len: int=32):
+    """Flatten a left-recursive ``a.b.c`` receiver tree into
+    ``["a", "b", "c"]``, iteratively (chains can be long in
+    generated code; no recursion).
+
+    ``binary_types`` are the dotted-access node types whose FIRST
+    named child is the operand and whose LAST named child is the
+    member name. ``member_wrapper`` unwraps one level when the
+    grammar nests the member ident inside a suffix node (Swift's
+    ``navigation_suffix``). ``this_types`` map to the literal chain
+    segment ``"this"``/``"self"`` (the node's own text is used).
+    Returns None when any link isn't a plain name — call results,
+    subscripts, parenthesised expressions (matches the Java rule:
+    no qualified name to match against).
+    """
+    rev: list[str] = []
+    cur = node
+    while True:
+        if len(rev) > max_len:
+            return None
+        if cur.type in ident_types or cur.type in this_types:
+            rev.append(cur.text.decode("utf-8", errors="replace"))
+            break
+        if cur.type in binary_types:
+            named = [c for c in cur.children if c.is_named]
+            if len(named) < 2:
+                return None
+            member = named[-1]
+            if member_wrapper is not None and member.type == member_wrapper:
+                inner = [c for c in member.children if c.is_named]
+                if len(inner) != 1:
+                    return None
+                member = inner[0]
+            if member.type not in ident_types:
+                return None
+            rev.append(member.text.decode("utf-8", errors="replace"))
+            cur = named[0]
+            continue
+        return None
+    rev.reverse()
+    return rev
+
+
+# ---------------------------------------------------------------------------
+# Kotlin
+# ---------------------------------------------------------------------------
+
+def extract_call_graph_kotlin(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
+    """Walk a Kotlin source string via tree-sitter-kotlin and return
+    its :class:`FileCallGraph`.
+
+    Returns an empty graph when ``tree_sitter_kotlin`` isn't installed
+    or the file is unparseable.
+
+    Kotlin shapes:
+
+      * ``package a.b`` → ``package_name``
+      * ``import a.b.C`` → import; ``import a.b.*`` → wildcard flag
+      * ``class C(...) : Base(), I`` / ``object O`` → ClassDef (bases
+        from the delegation_specifiers)
+      * ``fun m(...) {...}`` / ``constructor(...) {...}`` →
+        enclosing-function push + method registration
+      * ``f()`` → chain ``["f"]``; ``obj.m()`` → ``["obj", "m"]``;
+        ``this.m()`` → receiver_class narrowing like Java
+
+    Grammar note (fwcd tree-sitter-kotlin): some single-line
+    declarations parse under an ERROR wrapper while their children
+    keep real node types — the walker descends ERROR nodes, so those
+    declarations still contribute classes/functions/calls.
+    """
+    tree = _ts_tree(content, "tree_sitter_kotlin", "Kotlin", _tree)
+    if tree is None:
+        return FileCallGraph()
+
+    walker = _KotlinCallGraph()
+    walker.walk(tree.root_node)
+    return walker.graph
+
+
+class _KotlinCallGraph:
+    """Single-pass tree-sitter-kotlin walk (generator/iterative form)."""
+
+    _CLASS_NODES = ("class_declaration", "object_declaration")
+    _FUNC_NODE = "function_declaration"
+    _CTOR_NODE = "secondary_constructor"
+    _CALL_NODE = "call_expression"
+    _IDENT = "identifier"
+    _NAV_EXPR = "navigation_expression"
+    _THIS_EXPR = "this_expression"
+    _ARGS = "value_arguments"
+
+    def __init__(self) -> None:
+        self.graph = FileCallGraph()
+        self._enclosing: list[str] = []
+        self._class_stack: list[ClassDef] = []
+
+    def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
+        t = node.type
+        if t == "package_header":
+            qi = next((c for c in node.children
+                       if c.type == "qualified_identifier"), None)
+            if qi is not None:
+                pkg = qi.text.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
+                if pkg:
+                    self.graph.package_name = pkg
+            return
+
+        if t == "import":
+            self._visit_import(node)
+            return
+
+        if t in self._CLASS_NODES:
+            name_node = next((c for c in node.children
+                              if c.type == self._IDENT), None)
+            if name_node is None:
+                yield from node.children
+                return
+            cdef = ClassDef(
+                name=name_node.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
+                line=node.start_point[0] + 1,
+                bases=self._delegation_bases(node),
+                nested=bool(self._class_stack) or bool(self._enclosing),
+            )
+            self.graph.classes.append(cdef)
+            self._class_stack.append(cdef)
+            try:
+                yield from node.children
+            finally:
+                self._class_stack.pop()
+            return
+
+        if t in (self._FUNC_NODE, self._CTOR_NODE):
+            if t == self._CTOR_NODE:
+                fn_name = "constructor"
+            else:
+                name_node = next((c for c in node.children
+                                  if c.type == self._IDENT), None)
+                fn_name = (
+                    name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+                    if name_node is not None else "<anon>"
+                )
+            if self._class_stack and not self._enclosing:
+                self._class_stack[-1].methods.append(
+                    (fn_name, node.start_point[0] + 1),
+                )
+            self._enclosing.append(fn_name)
+            try:
+                yield from node.children
+            finally:
+                self._enclosing.pop()
+            return
+
+        if t == self._CALL_NODE:
+            self._visit_call(node)
+            # Fall through — nested calls in the arg list still walked.
+
+        yield from node.children
+
+    def _delegation_bases(self, node) -> list[str]:
+        """``: Base(), I`` — delegation_specifiers wrap either a
+        constructor_invocation (superclass call) or a bare user_type
+        (interface)."""
+        bases: list[str] = []
+        specs = next((c for c in node.children
+                      if c.type == "delegation_specifiers"), None)
+        if specs is None:
+            return bases
+        for spec in specs.children:
+            if spec.type != "delegation_specifier":
+                continue
+            target = spec
+            ci = next((c for c in spec.children
+                       if c.type == "constructor_invocation"), None)
+            if ci is not None:
+                target = ci
+            ut = next((c for c in target.children
+                       if c.type == "user_type"), None)
+            if ut is None:
+                continue
+            idents = [c.text.decode("utf-8", errors="replace")
+                      for c in ut.children if c.type == self._IDENT]
+            if idents:
+                bases.append(idents[-1])
+        return bases
+
+    def _visit_import(self, node) -> None:
+        wildcard = any(c.type == "*" for c in node.children)
+        qi = next((c for c in node.children
+                   if c.type == "qualified_identifier"), None)
+        if wildcard:
+            self.graph.indirection.add(INDIRECTION_WILDCARD_IMPORT)
+            return
+        if qi is None:
+            return
+        parts = [c.text.decode("utf-8", errors="replace")
+                 for c in qi.children if c.type == self._IDENT]
+        if parts:
+            self.graph.imports[parts[-1]] = ".".join(parts)
+
+    def _visit_call(self, node: Node) -> None:
+        callee = next(
+            (c for c in node.children
+             if c.is_named and c.type not in (self._ARGS,
+                                              "annotated_lambda",
+                                              "lambda_literal")),
+            None,
+        )
+        if callee is None:
+            return
+        chain = _flatten_dotted_chain(
+            callee,
+            ident_types=(self._IDENT,),
+            binary_types=(self._NAV_EXPR,),
+            this_types=(self._THIS_EXPR,),
+        )
+        if chain is None:
+            return
+        caller = self._enclosing[-1] if self._enclosing else None
+        receiver_class: str | None = None
+        if self._class_stack and self._enclosing and (
+            len(chain) == 1
+            or (len(chain) == 2 and chain[0] == "this")
+        ):
+            receiver_class = self._class_stack[-1].name
+        args = next((c for c in node.children if c.type == self._ARGS),
+                    None)
+        arg_idents: list[str] = []
+        if args is not None:
+            for a in args.children:
+                if a.type == "value_argument":
+                    named = [g for g in a.children if g.is_named]
+                    if len(named) == 1 and named[0].type == self._IDENT:
+                        arg_idents.append(
+                            named[0].text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
+                        )
+        self.graph.calls.append(CallSite(
+            line=node.start_point[0] + 1,
+            chain=chain,
+            caller=caller,
+            receiver_class=receiver_class,
+            argument_identifiers=arg_idents,
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Swift
+# ---------------------------------------------------------------------------
+
+def extract_call_graph_swift(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
+    """Walk a Swift source string via tree-sitter-swift and return its
+    :class:`FileCallGraph`.
+
+    Returns an empty graph when ``tree_sitter_swift`` isn't installed
+    or the file is unparseable.
+
+    Swift shapes:
+
+      * ``import Foundation`` → import
+      * ``class C: Base, P`` / ``struct S`` / ``enum E`` →
+        class_declaration (one node type; keyword child differs);
+        ``protocol P`` → protocol_declaration. Bases from the
+        inheritance_specifiers.
+      * ``extension C { ... }`` → methods bind to the extended type
+        (same convention as Rust ``impl``: reuse the already-recorded
+        ClassDef when the type was declared in this file, else
+        synthesise one so cross-file method matching still works).
+      * ``func m() {...}`` / ``init`` / ``deinit`` →
+        enclosing-function push + method registration
+      * ``f()`` → chain ``["f"]``; ``obj.m()`` → ``["obj", "m"]``;
+        ``self.m()`` → receiver_class narrowing like Rust
+    """
+    tree = _ts_tree(content, "tree_sitter_swift", "Swift", _tree)
+    if tree is None:
+        return FileCallGraph()
+
+    walker = _SwiftCallGraph()
+    walker.walk(tree.root_node)
+    return walker.graph
+
+
+class _SwiftCallGraph:
+    """Single-pass tree-sitter-swift walk (generator/iterative form)."""
+
+    _CLASS_NODE = "class_declaration"
+    _PROTOCOL_NODE = "protocol_declaration"
+    _FUNC_NODES = ("function_declaration", "init_declaration",
+                   "deinit_declaration")
+    _PROTOCOL_FUNC = "protocol_function_declaration"
+    _CALL_NODE = "call_expression"
+    _IDENT = "simple_identifier"
+    _TYPE_IDENT = "type_identifier"
+    _NAV_EXPR = "navigation_expression"
+    _SELF_EXPR = "self_expression"
+    _CALL_SUFFIX = "call_suffix"
+    _ARGS = "value_arguments"
+
+    def __init__(self) -> None:
+        self.graph = FileCallGraph()
+        self._enclosing: list[str] = []
+        self._class_stack: list[ClassDef] = []
+
+    def walk(self, node) -> None:
+        _drive_visit(self, node)
+
+    def _visit(self, node: Node):
+        t = node.type
+        if t == "import_declaration":
+            ident = next((c for c in node.children
+                          if c.type == "identifier"), None)
+            if ident is not None:
+                name = ident.text.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
+                if name:
+                    self.graph.imports[name.split(".")[-1]] = name
+            return
+
+        if t in (self._CLASS_NODE, self._PROTOCOL_NODE):
+            yield from self._visit_type_decl(node)
+            return
+
+        if t in self._FUNC_NODES:
+            if t == "init_declaration":
+                fn_name = "init"
+            elif t == "deinit_declaration":
+                fn_name = "deinit"
+            else:
+                name_node = next((c for c in node.children
+                                  if c.type == self._IDENT), None)
+                fn_name = (
+                    name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+                    if name_node is not None else "<anon>"
+                )
+            if self._class_stack and not self._enclosing:
+                self._class_stack[-1].methods.append(
+                    (fn_name, node.start_point[0] + 1),
+                )
+            self._enclosing.append(fn_name)
+            try:
+                yield from node.children
+            finally:
+                self._enclosing.pop()
+            return
+
+        if t == self._PROTOCOL_FUNC:
+            # Requirement signature (no body) — register as a method of
+            # the protocol so conformance dispatch has candidates, like
+            # Rust trait signatures.
+            name_node = next((c for c in node.children
+                              if c.type == self._IDENT), None)
+            if name_node is not None and self._class_stack:
+                self._class_stack[-1].methods.append(
+                    (name_node.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
+                     node.start_point[0] + 1),
+                )
+            return
+
+        if t == self._CALL_NODE:
+            self._visit_call(node)
+            # Fall through — nested calls in the arg list still walked.
+
+        yield from node.children
+
+    def _visit_type_decl(self, node: Node):
+        """class / struct / enum / extension / protocol declarations —
+        one generator handling name resolution, base capture, and the
+        extension→existing-ClassDef rebinding."""
+        name: str | None = None
+        is_extension = any(c.type == "extension" for c in node.children)
+        ti = next((c for c in node.children
+                   if c.type == self._TYPE_IDENT), None)
+        if ti is not None:
+            name = ti.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+        else:
+            # ``extension C`` wraps the target in user_type.
+            ut = next((c for c in node.children
+                       if c.type == "user_type"), None)
+            if ut is not None:
+                inner = next((g for g in ut.children
+                              if g.type == self._TYPE_IDENT), None)
+                if inner is not None:
+                    name = inner.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
+        if name is None:
+            yield from node.children
+            return
+
+        bases: list[str] = []
+        for c in node.children:
+            if c.type == "inheritance_specifier":
+                ut = next((g for g in c.children
+                           if g.type == "user_type"), None)
+                if ut is not None:
+                    inner = next((g for g in ut.children
+                                  if g.type == self._TYPE_IDENT), None)
+                    if inner is not None:
+                        bases.append(
+                            inner.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
+                        )
+
+        cdef: ClassDef | None = None
+        if is_extension:
+            cdef = next(
+                (c for c in self.graph.classes if c.name == name), None,
+            )
+            if cdef is not None:
+                for b in bases:
+                    if b not in cdef.bases:
+                        cdef.bases.append(b)
+        if cdef is None:
+            cdef = ClassDef(
+                name=name,
+                line=node.start_point[0] + 1,
+                bases=bases,
+                nested=bool(self._class_stack) or bool(self._enclosing),
+            )
+            self.graph.classes.append(cdef)
+        self._class_stack.append(cdef)
+        try:
+            yield from node.children
+        finally:
+            self._class_stack.pop()
+
+    def _visit_call(self, node: Node) -> None:
+        callee = next(
+            (c for c in node.children
+             if c.is_named and c.type != self._CALL_SUFFIX),
+            None,
+        )
+        if callee is None:
+            return
+        chain = _flatten_dotted_chain(
+            callee,
+            ident_types=(self._IDENT,),
+            binary_types=(self._NAV_EXPR,),
+            this_types=(self._SELF_EXPR,),
+            member_wrapper="navigation_suffix",
+        )
+        if chain is None:
+            return
+        caller = self._enclosing[-1] if self._enclosing else None
+        receiver_class: str | None = None
+        if self._class_stack and self._enclosing and (
+            len(chain) == 1
+            or (len(chain) == 2 and chain[0] == "self")
+        ):
+            receiver_class = self._class_stack[-1].name
+        arg_idents: list[str] = []
+        suffix = next((c for c in node.children
+                       if c.type == self._CALL_SUFFIX), None)
+        if suffix is not None:
+            args = next((c for c in suffix.children
+                         if c.type == self._ARGS), None)
+            if args is not None:
+                for a in args.children:
+                    if a.type == "value_argument":
+                        named = [g for g in a.children if g.is_named]
+                        if (len(named) == 1
+                                and named[0].type == self._IDENT):
+                            arg_idents.append(
+                                named[0].text.decode(  # type: ignore[union-attr]
+                                    "utf-8", errors="replace",
+                                ),
+                            )
+        self.graph.calls.append(CallSite(
+            line=node.start_point[0] + 1,
+            chain=chain,
+            caller=caller,
+            receiver_class=receiver_class,
+            argument_identifiers=arg_idents,
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Project-level loader
+# ---------------------------------------------------------------------------
+
+#: Extension → (language label, extractor kwargs) for the loader below.
+_EXT_TO_LANGUAGE: dict[str, tuple[str, dict[str, Any]]] = {
+    ".py": ("python", {}),
+    ".js": ("javascript", {}),
+    ".jsx": ("javascript", {}),
+    ".mjs": ("javascript", {}),
+    ".cjs": ("javascript", {}),
+    ".ts": ("javascript", {"language": "typescript"}),
+    ".tsx": ("javascript", {"language": "tsx"}),
+    ".go": ("go", {}),
+    ".java": ("java", {}),
+    ".rs": ("rust", {}),
+    ".rb": ("ruby", {}),
+    ".cs": ("csharp", {}),
+    ".php": ("php", {}),
+    ".c": ("c", {}),
+    ".h": ("c", {}),
+    ".cc": ("cpp", {}),
+    ".cpp": ("cpp", {}),
+    ".cxx": ("cpp", {}),
+    ".hpp": ("cpp", {}),
+    ".hh": ("cpp", {}),
+    ".hxx": ("cpp", {}),
+    ".lua": ("lua", {}),
+    ".scala": ("scala", {}),
+    ".kt": ("kotlin", {}),
+    ".kts": ("kotlin", {}),
+    ".swift": ("swift", {}),
+}
+
+_LOADER_SKIP_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".tox", ".venv", "venv",
+    "vendor", "third_party", "build", "dist", "out", ".out",
+})
+
+
+def _extractor_for(ext: str):
+    """Extractor callable for a file extension, or None."""
+    entry = _EXT_TO_LANGUAGE.get(ext.lower())
+    if entry is None:
+        return None
+    return _extractor_for_language(entry[0], entry[1])
+
+
+#: Checklist language label → (extractor suffix, kwargs) when they differ.
+_LANG_TO_EXTRACTOR: dict[str, tuple[str, dict[str, Any]]] = {
+    "typescript": ("javascript", {"language": "typescript"}),
+    "tsx": ("javascript", {"language": "tsx"}),
+    "c_sharp": ("csharp", {}),
+}
+
+
+def _extractor_for_language(language: str | None,
+                            kwargs: dict[str, Any] | None = None):
+    """Extractor callable for a checklist language label, or None."""
+    if not language:
+        return None
+    if kwargs is None:
+        language, kwargs = _LANG_TO_EXTRACTOR.get(language, (language, {}))
+    fn = globals().get(f"extract_call_graph_{language}")
+    if fn is None:
+        return None
+    if kwargs:
+        import functools
+
+        return functools.partial(fn, **kwargs)
+    return fn
+
+
+#: Default per-file size gate for :func:`load_call_graphs` — larger
+#: sources are skipped, not parsed. Shared with the audit prep cache's
+#: input fingerprint so both sides agree on which bytes can matter.
+#: Both directions: RAISING it admits generated/amalgamated monsters
+#: (a single sqlite3.c-shaped file costs seconds of regex parsing and
+#: can dominate the retained-byte budget alone — file size is
+#: target-derived, so a hostile tree must not buy unbounded parse
+#: time). LOWERING it drops cross-function context for exactly the
+#: big, central files where it matters most. When the gate binds,
+#: :func:`load_call_graphs` counts the oversize skips and discloses
+#: them with a warning — the gate may bind, but never silently.
+CALL_GRAPH_MAX_FILE_BYTES = 1_500_000
+
+#: Default cumulative retained-byte budget for
+#: :func:`load_call_graphs` — bounds the ESTIMATED in-memory size of
+#: the whole returned mapping (:func:`estimate_call_graph_bytes`),
+#: which the orchestrator caches for the entire run. ``max_bytes``
+#: gates INPUT per file only; retained OUTPUT is what this bounds — a
+#: call-dense file at the input gate measures ~53 MiB retained alone
+#: (a denser shape was measured retaining ~71 MB), so density, not
+#: file count, is the exhaustion vector. Both directions, in the
+#: units the budget actually meters (estimated bytes): LOWER drops
+#: cross-function context on honestly dense trees — a kernel-scale
+#: 20,000-file checklist at the measured kernel average (~15 KiB
+#: retained/file) needs ~300 MiB, and a python-heavy tree at this
+#: repo's own measured density (~42 KiB/file estimated over core/,
+#: deep ~36 KiB) needs ~820 MiB at the checklist ceiling; both must
+#: fit. HIGHER only admits degenerate density (1 GiB already
+#: tolerates ~18 input-cap call-dense monsters at ~57 MiB estimated
+#: each before stopping) while the mapping sits in the orchestrator's
+#: module-level cache for the whole run beside everything else it
+#: holds.
+CALL_GRAPH_MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+
+
+# Retained-size estimation constants, measured on 64-bit CPython
+# (3.14) by comparing the estimate against a dedup-aware deep
+# ``sys.getsizeof`` walk of extracted graphs. Fixture ratios
+# (estimate / measured): minimal-call pathological 1.03, kernel-shaped
+# C 0.87, ordinary python 1.01, chain-dense 1.21, PHP include-heavy
+# 1.25, long-caller-name shapes (380/1000/4000 chars) 1.00, astral
+# (UCS-4) caller 1.00, astral chain 1.86, decorator flood 1.04, ctor
+# flood 0.97, string-ref flood 1.00, this repo's own core/ tree
+# 1.16 — a budget gate needs "right order of magnitude, cheap, mildly
+# conservative", not pympler. String charges go through
+# ``sys.getsizeof`` so wide (UCS-2/UCS-4) identifiers are charged
+# their real bytes, with a small share discount because extracted
+# names repeat heavily within a file (dedup in the measured
+# baseline); container/instance costs fold the slots object, list
+# headers, and the per-entry int objects together.
+_EST_STR_SHARE_DISCOUNT = 21   # portion of the str header assumed shared
+_EST_STR_FLOOR = 8             # never below one pointer per reference
+_EST_CALL_SITE_BYTES = 230     # CallSite + two list headers + line int
+_EST_ENTRY_BYTES = 130         # small tuple/dict-entry shaped records
+_EST_RECORD_BYTES = 190        # slots record instances (ClassDef, ...)
+_EST_GRAPH_BASE_BYTES = 700    # empty FileCallGraph + field containers
+#: Base charge for one :class:`CallArgumentFacts` before per-fact
+#: charges — the measured deep size of an EMPTY instance (96 B slots
+#: object + 28 B int + 3 x 56 B empty lists + 4 x 64 B empty dicts =
+#: 548 B on 64-bit CPython 3.14). Both directions: LOWER re-opens the
+#: decorator-flood under-charge (``@d()`` repeated allocates one
+#: empty-ish facts object per decorator — the only uncapped carrier;
+#: a 200 B base measured est/deep 0.63, ~1.6x budget overshoot);
+#: HIGHER over-charges every constructed-object and string-ref
+#: record too (both capped, so drift is bounded) and pushes honest
+#: decorator/ctor-heavy trees toward tripping the budget early.
+_EST_ARG_FACTS_BASE = 548
+
+
+def _est_strs(seq: "Iterable[str]") -> int:
+    getsizeof = sys.getsizeof
+    return sum(
+        max(getsizeof(s) - _EST_STR_SHARE_DISCOUNT, _EST_STR_FLOOR)
+        for s in seq
+    )
+
+
+def _est_arg_facts(a: CallArgumentFacts) -> int:
+    getsizeof = sys.getsizeof
+    total = _EST_ARG_FACTS_BASE
+    total += sum(30 + getsizeof(s) for _, s in a.string_args)
+    for _, ch in a.ref_args:
+        total += 60 + _est_strs(ch)
+    for _, ch in a.call_ref_args:
+        total += 60 + _est_strs(ch)
+    for k, v in a.kw_strings.items():
+        total += 60 + getsizeof(k) + getsizeof(v)
+    for k, vs in a.kw_string_lists.items():
+        total += 60 + getsizeof(k) + 64 + _est_strs(vs)
+    for k, ch in a.kw_refs.items():
+        total += 60 + getsizeof(k) + 64 + _est_strs(ch)
+    for k, ch in a.kw_call_refs.items():
+        total += 60 + getsizeof(k) + 64 + _est_strs(ch)
+    return total
+
+
+def _est_call_sites(sites: "Iterable[CallSite]") -> int:
+    """Charge one run of :class:`CallSite` records.
+
+    ``caller`` / ``receiver_class`` / ``receiver_type`` are charged
+    byte-aware (``sys.getsizeof`` — UCS-kind aware): the caller is
+    the enclosing function name, arbitrarily long and distinct per
+    function, so leaving it uncharged lets a long-name shape defeat
+    the budget. Extractors bind the SAME string object to every site
+    of one function and sites arrive in file order, so an
+    adjacent-identity check amortizes the shared object to one
+    charge per run — matching the dedup-aware measurement baseline;
+    non-adjacent repeats over-charge, the conservative direction.
+    """
+    getsizeof = sys.getsizeof
+    total = 0
+    prev_caller = None
+    prev_recv_class = None
+    prev_recv_type = None
+    for c in sites:
+        total += (_EST_CALL_SITE_BYTES + _est_strs(c.chain)
+                  + _est_strs(c.argument_identifiers))
+        caller = c.caller
+        if caller is not None and caller is not prev_caller:
+            total += getsizeof(caller)
+        prev_caller = caller
+        rc = c.receiver_class
+        if rc is not None and rc is not prev_recv_class:
+            total += getsizeof(rc)
+        prev_recv_class = rc
+        rt = c.receiver_type
+        if rt is not None and rt is not prev_recv_type:
+            total += getsizeof(rt)
+        prev_recv_type = rt
+    return total
+
+
+def estimate_call_graph_bytes(graph: FileCallGraph) -> int:
+    """Cheap retained-size estimate for one :class:`FileCallGraph`.
+
+    Structural walk over the dataclass fields with measured per-object
+    constants (see above) — O(graph), no allocation, no reflection.
+    Every string is charged byte-aware through ``sys.getsizeof``
+    (wide-build/UCS-4 identifiers cost their real bytes), and the
+    per-site name fields (``caller``/``receiver_class``/
+    ``receiver_type``) are charged with adjacent-share amortization
+    (see :func:`_est_call_sites`). Validated within 2x of a
+    dedup-aware deep ``sys.getsizeof`` on pathological, normal,
+    long-caller-name, and astral-identifier fixtures; the deliberate
+    bias is mildly conservative (overestimate trips the budget early,
+    the safe direction for a memory guard).
+    """
+    getsizeof = sys.getsizeof
+    total = _EST_GRAPH_BASE_BYTES
+    for k, v in graph.imports.items():
+        total += 60 + getsizeof(k) + getsizeof(v)
+    total += _est_call_sites(graph.calls)
+    total += _est_call_sites(graph.subscript_calls)
+    for s in graph.indirection:
+        total += 20 + getsizeof(s)
+    for s in graph.getattr_targets:
+        total += 20 + getsizeof(s)
+    for cls_def in graph.classes:
+        total += (_EST_RECORD_BYTES + getsizeof(cls_def.name)
+                  + _est_strs(cls_def.bases)
+                  + sum(80 + getsizeof(m[0]) for m in cls_def.methods))
+    for d in graph.decorated_functions:
+        total += _EST_RECORD_BYTES + getsizeof(d.name)
+        total += sum(64 + _est_strs(ch) for ch in d.decorators)
+        total += sum(8 if a is None else _est_arg_facts(a)
+                     for a in d.decorator_args)
+    for ri in graph.relative_imports:
+        total += (_EST_ENTRY_BYTES + getsizeof(ri[1])
+                  + getsizeof(ri[2])
+                  + (getsizeof(ri[3]) if ri[3] else 0))
+    for name, chains in graph.dispatch_tables.items():
+        total += (_EST_ENTRY_BYTES + getsizeof(name)
+                  + sum(64 + _est_strs(ch) for ch in chains))
+    for t in graph.getattr_calls:
+        total += (_EST_ENTRY_BYTES
+                  + (getsizeof(t[1]) if t[1] else 0)
+                  + (getsizeof(t[2]) if t[2] else 0))
+    for name, co in graph.constructed_objects.items():
+        total += (_EST_RECORD_BYTES + getsizeof(name)
+                  + _est_strs(co.chain) + _est_arg_facts(co.args))
+    for src in graph.string_ref_calls:
+        total += (_EST_RECORD_BYTES + _est_strs(src.chain)
+                  + _est_arg_facts(src.args))
+        if src.caller is not None:
+            total += getsizeof(src.caller)
+    for e in graph.includes:
+        total += (_EST_RECORD_BYTES + 70 + getsizeof(e.keyword)
+                  + getsizeof(e.raw) + getsizeof(e.shape)
+                  + getsizeof(e.span_hash)
+                  + _est_strs(e.candidates)
+                  + sum(getsizeof(x) for x in (
+                      e.const_name, e.literal_tail, e.literal_stem,
+                      e.target, e.enclosing_function) if x))
+    for de in graph.defines:
+        total += (_EST_RECORD_BYTES + getsizeof(de.name)
+                  + (getsizeof(de.value) if de.value else 0)
+                  + (getsizeof(de.raw_value) if de.raw_value else 0))
+    if graph.package_name:
+        total += 20 + getsizeof(graph.package_name)
+    if graph.direct_access_guard:
+        total += 300
+    return total
+
+
+def iter_call_graph_candidates(
+    target_path: Any,
+    checklist: dict[str, Any] | None = None,
+) -> list[tuple[str, Any, str | None]]:
+    """Candidate files a :func:`load_call_graphs` build would read.
+
+    Returns ``(relative path, absolute path, checklist language or
+    None)`` tuples in extraction order. Shared between the build and
+    the audit prep cache's input fingerprint
+    (:func:`core.audit.detector_cache.call_graph_inputs_fingerprint`)
+    so the two can never drift over which bytes matter.
+    """
+    from pathlib import Path
+
+    root = Path(target_path)
+    candidates: list[tuple[str, Any, str | None]] = []
+
+    if checklist is not None:
+        for file_info in checklist.get("files", []) or []:
+            rel = file_info.get("path", "")
+            if not rel:
+                continue
+            # Run artifacts are data, not authority: an absolute or
+            # parent-escaping path in a checklist would read
+            # out-of-tree content into extraction (Path join with an
+            # absolute rhs REPLACES root). The builder's own scope
+            # handling hard-errors on the same shape; the loader skips
+            # and keeps going (best-effort surface).
+            rel_p = Path(rel)
+            if rel_p.is_absolute() or ".." in rel_p.parts:
+                logger.warning(
+                    "call-graph load: skipping non-relative checklist "
+                    "path %r", rel)
+                continue
+            candidates.append(
+                (rel, root / rel, file_info.get("language")))
+    else:
+        import os as _os
+
+        for dirpath, dirnames, filenames in _os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in _LOADER_SKIP_DIRS
+                and not (Path(dirpath) / d).is_symlink()
+            )
+            for fname in sorted(filenames):
+                p = Path(dirpath) / fname
+                if p.suffix.lower() in _EXT_TO_LANGUAGE:
+                    candidates.append(
+                        (p.relative_to(root).as_posix(), p, None))
+    return candidates
+
+
+# Checklist-mode file-cap ceiling. Both directions: LOWER re-creates
+# the kernel-scale truncation this exists to fix (a 6,002-file scoped
+# checklist ran cross-function detectors on a third of its files —
+# measured cost of the full set: ~8 ms and ~15 KiB per kernel file,
+# i.e. ~49 s wall / ~87 MiB retained, once per run and cached);
+# HIGHER widens the retained-mapping exposure — ~300 MiB at this
+# ceiling on the MEASURED KERNEL AVERAGE (~15 KiB/file), which is an
+# extrapolation, not a bound: max_bytes gates INPUT size only, and a
+# pathological call-dense file near the input gate was measured
+# retaining ~71 MB alone. The mapping lives in the orchestrator's
+# module-level cache for the whole run. Checklist mode only: the
+# checklist already bounds candidates to the run's own reviewed
+# inventory, so the ceiling is a memory guard, not a work bound; the
+# bare tree walk keeps the conservative 2000 default (an unbounded
+# monorepo walk earns no such trust).
+_CHECKLIST_MAX_FILES = 20_000
+
+
+def _derive_max_files(checklist: "dict[str, Any] | None") -> int:
+    """Default file cap: the checklist's own file count up to the
+    checklist-mode ceiling (candidates never exceed the checklist, so
+    below the ceiling the whole checklist is covered); 2000 for a
+    bare tree walk."""
+    if checklist is None:
+        return 2000
+    n_files = len(checklist.get("files") or [])
+    return min(max(n_files, 2000), _CHECKLIST_MAX_FILES)
+
+
+def load_call_graphs(
+    target_path: Any,
+    checklist: dict[str, Any] | None = None,
+    *,
+    max_files: int | None = None,
+    max_bytes: int = CALL_GRAPH_MAX_FILE_BYTES,
+    max_total_bytes: int = CALL_GRAPH_MAX_TOTAL_BYTES,
+) -> dict[str, FileCallGraph]:
+    """Extract per-file call graphs for a target tree.
+
+    Consumers (:class:`core.iris.bypass.CompositionalAnalyzer`, the
+    audit orchestrator's structural detectors) want a
+    ``{relative_path: FileCallGraph}`` mapping keyed the same way the
+    checklist / findings key files.
+
+    Args:
+        target_path: Root of the target codebase.
+        checklist: Parsed ``checklist.json`` (``{"files": [{"path":
+            ...}]}``).  When given, only its files are extracted —
+            keys are the checklist paths verbatim.  When None, the
+            tree is walked (common exclusions pruned) and keys are
+            POSIX relative paths.
+        max_files: Cap on extracted files (checklist order / walk
+            order wins; the rest are skipped with a log line). None —
+            the default — derives the cap: 2000 for a bare tree walk,
+            the checklist's own file count up to
+            ``_CHECKLIST_MAX_FILES`` when a checklist bounds the
+            candidates. An explicit int is honoured verbatim.
+        max_bytes: Per-file size cap — larger sources are skipped.
+        max_total_bytes: Cumulative retained-byte budget over the
+            ESTIMATED in-memory size of the returned mapping
+            (:func:`estimate_call_graph_bytes`). ``max_bytes`` gates
+            input per file only; this bounds the retained output.
+            On exceed, retention stops (already-retained graphs are
+            never dropped; later candidates are skipped and counted)
+            and one warning names the top-offender file. A single
+            graph estimated larger than the whole budget is refused
+            and extraction continues — dropping only the monster
+            keeps cross-function context alive for the small files
+            behind it. An explicit int is honoured verbatim.
+
+    Returns:
+        Mapping of file path → :class:`FileCallGraph`.  Files that
+        fail to read or parse are skipped (extraction is best-effort
+        by design); an empty dict when nothing was extractable.
+    """
+    derived = max_files is None
+    if derived:
+        max_files = _derive_max_files(checklist)
+    candidates = iter_call_graph_candidates(target_path, checklist)
+
+    graphs: dict[str, FileCallGraph] = {}
+    skipped = 0
+    retained_bytes = 0
+    budget_exhausted = False
+    budget_skipped = 0
+    oversize_skipped = 0
+    oversize_example: str | None = None
+    top_offender: tuple[str, int] | None = None
+    for rel, path, decl_language in candidates:
+        if len(graphs) >= max_files:  # type: ignore[operator]
+            skipped += 1
+            continue
+        if budget_exhausted:
+            # Sticky stop: once the cumulative budget is hit, later
+            # candidates are counted without being parsed — retention
+            # order stays checklist/walk order (predictable), and the
+            # parse work for graphs we would discard is not spent.
+            budget_skipped += 1
+            continue
+        # The checklist's language field is content-refined by the
+        # inventory builder (a C++-marker .h routes to cpp, .inc
+        # fragments to php/asm/c) — honour it first; pure-suffix
+        # dispatch is the checklist-less fallback.
+        extractor = _extractor_for_language(decl_language)
+        if extractor is None and path.suffix.lower() not in _EXT_TO_LANGUAGE:
+            continue
+        try:
+            if path.stat().st_size > max_bytes:
+                oversize_skipped += 1
+                if oversize_example is None:
+                    oversize_example = rel
+                continue
+            got = read_bytes_capped(path, max_bytes)
+            if got is None:
+                continue
+            if got[1]:
+                oversize_skipped += 1
+                if oversize_example is None:
+                    oversize_example = rel
+                continue
+            with io.TextIOWrapper(io.BytesIO(got[0]), encoding="utf-8", errors="replace") as stream:
+                content = stream.read()
+        except OSError:
+            continue
+        if extractor is None:
+            if path.suffix.lower() == ".h":
+                # No checklist language for a .h header: apply the same
+                # content refinement the builder uses, so C++ headers
+                # aren't degraded through the C grammar (qualified
+                # chains lost).
+                from .languages import refine_language
+                extractor = _extractor_for_language(
+                    refine_language("c", str(path), content))
+            else:
+                extractor = _extractor_for(path.suffix)
+        if extractor is None:
+            continue
+        try:
+            graph = extractor(content)
+        except Exception:
+            logger.debug("call-graph extraction failed for %s", rel,
+                         exc_info=True)
+            continue
+        estimated = estimate_call_graph_bytes(graph)
+        if top_offender is None or estimated > top_offender[1]:
+            top_offender = (rel, estimated)
+        if estimated > max_total_bytes:
+            # A single graph larger than the WHOLE budget can never
+            # fit: refuse it and keep extracting — dropping only the
+            # monster preserves cross-function context for every
+            # small file behind it (measured: an input-cap call-dense
+            # file retains ~53 MiB while a normal file retains
+            # ~15-36 KiB, so the trade is one degenerate file's
+            # context against thousands of ordinary files').
+            budget_skipped += 1
+            continue
+        if retained_bytes + estimated > max_total_bytes:
+            budget_exhausted = True
+            budget_skipped += 1
+            continue
+        graphs[rel] = graph
+        retained_bytes += estimated
+    if skipped:
+        # Hitting the cap means cross-function context is INCOMPLETE
+        # for every consumer of this mapping — loud, not info-level.
+        # Checklist mode only overflows past _CHECKLIST_MAX_FILES (the
+        # derived cap covers the whole checklist below it); a bare
+        # tree walk on a large target overflows at the 2000 default.
+        logger.warning(
+            "load_call_graphs: file cap (%d) reached — %d candidates "
+            "skipped; cross-function detectors run with partial "
+            "call-graph context (%s)",
+            max_files, skipped,
+            "checklist exceeds the checklist-mode ceiling"
+            if derived and checklist is not None else
+            "explicit max_files caller"
+            if checklist is not None else
+            "pass the run checklist to bound extraction to in-scope "
+            "files",
+        )
+    if oversize_skipped:
+        # The per-file input gate is a coverage gate too: an oversize
+        # source contributes NO call edges, and the biggest files are
+        # often the most central (amalgamations, generated cores).
+        # Loud like its cap/budget siblings — never a silent continue.
+        logger.warning(
+            "load_call_graphs: %d file(s) over the per-file size gate "
+            "(%d bytes) skipped unparsed (e.g. %r); cross-function "
+            "detectors have no call-graph context for them",
+            oversize_skipped, max_bytes, oversize_example,
+        )
+    if budget_skipped:
+        # Hitting the budget means cross-function context is
+        # INCOMPLETE for every consumer of this mapping — loud, not
+        # info-level, and it names the pathological file: max_bytes
+        # already gated input size, so the offender is call-DENSE and
+        # the operator cannot find it by looking at file sizes.
+        top_rel, top_est = top_offender if top_offender else ("?", 0)
+        logger.warning(
+            "load_call_graphs: retained-byte budget (%d bytes) "
+            "reached — %d candidate(s) not retained; cross-function "
+            "detectors run with partial call-graph context "
+            "(retained ~%d bytes across %d graphs; top offender "
+            "%r ~%d bytes)",
+            max_total_bytes, budget_skipped, retained_bytes,
+            len(graphs), top_rel, top_est,
+        )
+    return graphs
+
+
+# At the very end so nothing defined below it can be forgotten — the
+# previous mid-file placement silently omitted every extractor added
+# after it (scala/kotlin/swift) plus load_call_graphs.
 __all__ = [
-    "CallSite",
-    "FileCallGraph",
     "INDIRECTION_BRACKET_DISPATCH",
     "INDIRECTION_DUNDER_IMPORT",
     "INDIRECTION_DYNAMIC_IMPORT",
     "INDIRECTION_EVAL",
     "INDIRECTION_FN_POINTER",
     "INDIRECTION_GETATTR",
+    "INDIRECTION_GETATTR_OPAQUE",
     "INDIRECTION_IMPORTLIB",
     "INDIRECTION_REFLECT",
     "INDIRECTION_WILDCARD_IMPORT",
+    "CALL_GRAPH_MAX_TOTAL_BYTES",
+    "CallSite",
+    "FileCallGraph",
+    "estimate_call_graph_bytes",
     "extract_call_graph_c",
     "extract_call_graph_cpp",
     "extract_call_graph_csharp",
     "extract_call_graph_go",
     "extract_call_graph_java",
     "extract_call_graph_javascript",
+    "extract_call_graph_kotlin",
+    "extract_call_graph_lua",
     "extract_call_graph_php",
     "extract_call_graph_python",
     "extract_call_graph_ruby",
     "extract_call_graph_rust",
+    "extract_call_graph_scala",
+    "extract_call_graph_swift",
+    "load_call_graphs",
+    "build_reverse_edges",
 ]
+
+
+FuncKey = tuple[str, str]
+
+
+def build_reverse_edges(
+    call_graphs: dict[str, FileCallGraph],
+) -> dict[FuncKey, set[FuncKey]]:
+    """Build a reverse call graph: callee → set of callers.
+
+    Each key is ``(file, function)`` and maps to the set of
+    ``(file, function)`` pairs that call it.  Same-file and cross-file
+    edges are included (cross-file via bare-name matching).
+    """
+    reverse: dict[FuncKey, set[FuncKey]] = defaultdict(set)
+    func_defined_in: dict[str, set[str]] = defaultdict(set)
+    for filepath, graph in call_graphs.items():
+        for call in graph.calls:
+            if call.caller and call.caller != "<module>":
+                func_defined_in[call.caller].add(filepath)
+
+    for filepath, graph in call_graphs.items():
+        for call in graph.calls:
+            caller = call.caller or "<module>"
+            caller_key: FuncKey = (filepath, caller)
+            if len(call.chain) == 1:
+                callee_name = call.chain[0]
+                reverse[(filepath, callee_name)].add(caller_key)
+                for other_file in func_defined_in.get(callee_name, ()):
+                    if other_file != filepath:
+                        reverse[(other_file, callee_name)].add(caller_key)
+            elif len(call.chain) == 2 and call.chain[0] in ("self", "this"):
+                reverse[(filepath, call.chain[1])].add(caller_key)
+    return dict(reverse)

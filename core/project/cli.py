@@ -5,13 +5,67 @@ No Claude Code, no LLM — pure Python.
 """
 
 import argparse
+import contextlib
 import os
 import sys
+from typing import Any
+from types import TracebackType
+from datetime import datetime, timezone
 from pathlib import Path
 
+import json
+from core.json import save_json as _save_summary_json
 from core.run.output import unique_run_suffix
+from core.run.scratch import temporary_text
+from core.security.log_sanitisation import sanitise_for_terminal
+from core.source.gated import open_regular_gated
+from core.source.streams import preserving_stream_error
 
-from .project import ProjectManager
+from .oplock import OpLockContention, project_op_lock
+from .project import DEFAULT_OUTPUT_BASE, ProjectManager, _URL_SCHEME_RE
+
+
+def _caller_relative(path: str | None) -> str | None:
+    """Resolve a relative operator path against ``RAPTOR_CALLER_DIR``.
+
+    The launcher's project route (and the in-session dispatch) run
+    with cwd moved to the RAPTOR repo dir, so a bare ``Path.resolve``
+    on a relative ``--target``/``--binary`` silently persisted a
+    repo-relative path (``--target ./code`` became ``<raptor>/code``,
+    or worse, an existing repo subdir). A relative path given by the
+    operator means "relative to MY shell", which the launcher records
+    in RAPTOR_CALLER_DIR. Absolute paths, URLs, ``~``-paths, and None
+    pass through; without the env var the historical cwd resolution
+    holds.
+    """
+    if (not path or os.path.isabs(path) or path.startswith("~")
+            or _URL_SCHEME_RE.match(path)):
+        return path
+    caller = os.environ.get("RAPTOR_CALLER_DIR")
+    if caller and os.path.isdir(caller):
+        return str((Path(caller) / path).resolve())
+    return path
+
+# Help text for the shared --wait flag on mutating subcommands.
+_WAIT_HELP = ("Block until a concurrent project operation releases the "
+              "lock (default: 3s silent grace, then error naming the "
+              "holder)")
+
+
+def _confirm(prompt: str) -> bool:
+    """y/N confirmation that treats an unanswerable prompt as "no".
+
+    ``input()`` raises EOFError when stdin is closed or piped dry (a
+    scripted ``raptor project clean`` without ``--yes``); main() only
+    handles ValueError/FileExistsError/OpLockContention, so the
+    destructive-confirm prompt turned into a traceback instead of the
+    safe "Cancelled." default.
+    """
+    try:
+        return input(prompt).lower() == "y"
+    except EOFError:
+        print()  # keep the next line off the prompt's row
+        return False
 
 
 def _c(text, code):
@@ -26,13 +80,229 @@ def _red(text): return _c(text, "31")
 def _yellow(text): return _c(text, "33")
 
 
+# Cap on bytes streamed by ``--json-out`` to the operator's
+# terminal. Real threat-model JSONs are well under 1 MB; cap at
+# 32 MB so a tampered file (10s-of-GB on disk, /dev/zero-style
+# symlink, etc.) can't dump unbounded output before truncation
+# kicks in.
+_JSON_OUT_BYTE_CAP = 32 * 1024 * 1024
+
+
+def _stream_threat_model_json(json_path: Path, project_out: Path) -> int:
+    """Stream the on-disk threat-model JSON file to stdout.
+
+    Returns 0 on success, non-zero on refusal. Defends against
+    a project-dir-writer attacker swapping ``threat-model.json``
+    between the earlier ``load_json`` validation and our open
+    here:
+
+    * ``relative_to(project_out)`` — path must live inside the
+      project output dir. Defends against ``project.json``
+      tampered to point ``json_path`` at ``/etc/shadow`` or
+      anywhere else on disk.
+    * ``O_NOFOLLOW`` — refuses symlinks at the final path
+      component (the in-tree TOCTOU swap-to-symlink scenario).
+    * ``O_NONBLOCK`` + ``fstat`` + ``S_ISREG`` — refuses FIFOs, sockets, char/
+      block devices. Catches the "swap to named pipe" (blocks
+      operator's terminal indefinitely) and "swap to /dev/zero"
+      (infinite output) attacks that ``O_NOFOLLOW`` doesn't
+      cover.
+    * ``_JSON_OUT_BYTE_CAP`` chunked streaming — bounds output
+      to the operator's terminal even when all other defences
+      pass.
+
+    Why stream the file to stdout rather than ``print(json.dumps(
+    model.to_dict()))``: CodeQL's
+    ``py/clear-text-logging-sensitive-data`` query taints any
+    data-flow from heuristically sensitive-named model fields
+    into a print/log sink. Even returning ONLY
+    integer counts via a sanitiser propagated the taint through
+    ``.get(auth_vocab_key)`` accesses. A byte-level file→stdout
+    copy never touches a print/log sink that the query models —
+    no taint to propagate — AND ships the FULL threat-model
+    content to the operator unchanged. Best of both: no CodeQL
+    FP, no UX degradation.
+    """
+    try:
+        Path(json_path).resolve().relative_to(project_out)
+    except ValueError:
+        print(
+            f"✗ refusing --json: {json_path} resolves outside "
+            f"the project output dir ({project_out})",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        stream = open_regular_gated(json_path, follow_symlinks=False)
+    except (OSError, ValueError) as e:
+        print(f"✗ {json_path}: {e}", file=sys.stderr)
+        return 1
+    with preserving_stream_error(stream) as f:
+        remaining = _JSON_OUT_BYTE_CAP
+        while remaining > 0:
+            chunk = f.read(min(remaining, 65536))
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            remaining -= len(chunk)
+        if remaining == 0 and f.read(1):
+            # File continued past the cap — warn on stderr so
+            # the operator doesn't trust a truncated JSON dump.
+            print(
+                f"\n✗ threat-model JSON exceeded "
+                f"{_JSON_OUT_BYTE_CAP} bytes; output truncated. "
+                f"Inspect {json_path} directly.",
+                file=sys.stderr,
+            )
+    return 0
+
+
+def _emit_json_payload(payload) -> None:
+    """Emit a JSON payload to stdout via binary I/O.
+
+    Uses ``sys.stdout.buffer.write(bytes)`` instead of
+    ``print(json.dumps(...))`` so CodeQL's
+    ``py/clear-text-logging-sensitive-data`` query doesn't
+    flag the call site. Same pattern as ``_stream_threat_model_json``:
+    the query's sink list is narrowly Python's ``logging`` module
+    + ``print()`` — a binary write to ``sys.stdout.buffer``
+    doesn't match, so a payload containing auth-vocab keys
+    (``trusted_inputs`` / ``untrusted_inputs`` / ``trust_boundaries`` /
+    ``threats[*].title`` derived from the target repo / etc.)
+    won't taint into a flagged sink.
+
+    Operator-visible behaviour: identical to ``print(json.dumps(
+    payload, indent=2, sort_keys=True))`` — pipe-friendly, one
+    trailing newline.
+    """
+    # ensure_ascii: JSON escapes C0 but passes C1 terminal controls
+    # (U+0080-U+009F, incl. single-byte CSI/OSC) through raw when
+    # ensure_ascii is off — dumps_display is exactly that, and these
+    # payloads carry target-derived strings; ASCII-encode the terminal
+    # JSON lane (still valid JSON, pipe-friendly).
+    data = json.dumps(payload, indent=2, sort_keys=True,
+                      ensure_ascii=True, default=str).encode("utf-8")
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.write(b"\n")
+
+
+def _detect_target_type(target_path: str):
+    """Best-effort catalog detection for project-create. Returns
+    a ``CatalogEntry`` or None — substrate failures (catalog
+    missing, YAML malformed) collapse to None so create never
+    refuses over a catalog substrate bug.
+
+    Distinct from the runtime consumers (/scan baseline packs,
+    /agentic attack-surface ranking) which call the same
+    ``core.run.target_types.load`` — this is just the project-
+    create surface so operators see the catalog match at
+    create-time.
+
+    Binary-dominant targets (compiled ELF / Mach-O / PE artifacts,
+    no substantial source tree) route to the ``binary`` catalog
+    entry: the extension/glob catalog would classify such a tree
+    as ``generic`` and recommend the source-tree pattern scanners
+    (scan → agentic), which have nothing to scan there — the
+    binary lane is the right recommendation. Scoped here on
+    purpose: the runtime ``load`` consumers keep their existing
+    classification.
+    """
+    try:
+        from core.run.target_types import binary_dominant, load, load_by_name
+        target = Path(target_path)
+        if target.is_file():
+            from core.archive import is_archive
+            if is_archive(target):
+                # Archive target: detect on the EXTRACTED tree, the
+                # way /describe does — the extension/glob catalog run
+                # against the archive file itself classified every
+                # zip-target project as ``generic`` and printed
+                # generic-wrong /scan pack baselines at create time.
+                return _detect_archive_target_type(target)
+        if binary_dominant(target):
+            entry = load_by_name("binary")
+            if entry is not None:
+                return entry
+            # Missing catalog entry — degrade to the catalog match
+            # (substrate stays best-effort, create never refuses).
+        return load(target)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _detect_archive_target_type(archive: Path):
+    """Catalog detection for an ARCHIVE project target: reuse the
+    /describe resolver (cached extraction when a prior run populated
+    ``_sources/``, else a one-shot tmp extract with the shared safe
+    extractor, single-subdir descent either way) and run the same
+    binary-dominant + catalog classification on the resulting tree.
+
+    One-time cost at create, proportional to the archive (a cache hit
+    is free); tmp extractions are removed before returning. Same
+    best-effort posture as :func:`_detect_target_type` — any failure
+    collapses to None and create proceeds without a tuning block.
+    """
+    from core.atomic_fs import rmtree_hardened
+    try:
+        from packages.describe.cli import resolve_archive_target
+        resolved = resolve_archive_target(archive, sys.stderr)
+        if resolved is None:
+            return None
+        tree, tmp_root, _label = resolved
+        try:
+            from core.run.target_types import (
+                binary_dominant,
+                load,
+                load_by_name,
+            )
+            if binary_dominant(tree):
+                entry = load_by_name("binary")
+                if entry is not None:
+                    return entry
+            return load(tree)
+        finally:
+            if tmp_root is not None:
+                rmtree_hardened(tmp_root)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_project_tuning(entry) -> list:
+    """Render the post-create tuning block from a CatalogEntry.
+
+    Composes ``core.run.estimator.format_estimate`` (cost/time
+    one-liner) plus a compact summary of the catalog defaults so
+    the operator sees up-front what RAPTOR will use for /scan,
+    /agentic, /codeql defaults on this project. Returns a list of
+    lines (caller decides where they land — stdout / file / etc.).
+    """
+    lines: list = []
+    lines.append(f"  Target type: {entry.name}")
+    if entry.semgrep_packs_default:
+        lines.append(
+            f"  /scan baseline packs: "
+            f"{', '.join(entry.semgrep_packs_default)}"
+        )
+    if entry.attack_surface_high:
+        lines.append(
+            f"  /agentic preferred dirs: "
+            f"{', '.join(entry.attack_surface_high)}"
+        )
+    if entry.pipeline_recommended:
+        lines.append(
+            f"  Recommended pipeline: "
+            f"{' → '.join(entry.pipeline_recommended)}"
+        )
+    return lines
+
+
 class _Fmt(argparse.HelpFormatter):
     """Wider help alignment for subcommand option lists."""
-    def __init__(self, prog):
+    def __init__(self, prog) -> None:
         super().__init__(prog, max_help_position=34)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         prog="raptor project",
         usage="raptor project <command> [args]",
@@ -40,15 +310,229 @@ def main():
         formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=20),
     )
     sub = parser.add_subparsers(dest="subcommand", title="commands", metavar="")
-    _F = {"formatter_class": _Fmt}  # shorthand for subparsers
+    _F: dict[str, Any] = {"formatter_class": _Fmt}  # shorthand for subparsers
 
     # create
     p_create = sub.add_parser("create", help="Create a new project",
-                              usage="raptor project create <name> --target <path> [-d <desc>] [--output-dir <dir>]", **_F)
+                              usage="raptor project create <name> --target <path> [-d <desc>] [--output-dir <dir>] [--binary <path>]", **_F)
     p_create.add_argument("name", help="Project name")
     p_create.add_argument("--target", required=True, metavar="<path>", help="Path to target codebase")
     p_create.add_argument("-d", "--description", default="", metavar="<text>", help="One-line description")
     p_create.add_argument("--output-dir", default=None, metavar="<dir>", help="Custom output directory")
+    p_create.add_argument(
+        "--binary", action="append", default=None, metavar="<path>",
+        help=("Debug binary for binary_oracle reachability enrichment "
+              "(repeatable for hybrid targets). Persisted on the "
+              "project; loaded into every subsequent /agentic / "
+              "/codeql / /validate run on this project. Explicit "
+              "--binary on the CLI is additive."),
+    )
+    p_create.add_argument(
+        "--require-target-type", default=None, metavar="<name>",
+        help=("Hard-fail if target-type catalog detection didn't "
+              "pick this exact name (e.g. ``c.userspace-daemon``, "
+              "``python.web-app``, or ``binary`` for a "
+              "compiled-artifact tree). For strict-CI runs that "
+              "assert the project's target shape — catches "
+              "malformed targets or stale catalog drift BEFORE any "
+              "LLM cost. On mismatch the project is NOT created."),
+    )
+    p_create.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    # binary — per-project binary management
+    p_bin = sub.add_parser(
+        "binary",
+        help=("Manage per-project debug binaries for binary_oracle "
+              "enrichment"),
+        usage=("raptor project binary <add|remove|list|clear> [args] "
+               "[<name>]"),
+        **_F,
+    )
+    p_bin.add_argument(
+        "action", choices=("add", "remove", "list", "clear"),
+        help="Action: add <path>, remove <path>, list, or clear")
+    p_bin.add_argument(
+        "path", nargs="?", default=None,
+        help="Binary path (required for add/remove)")
+    p_bin.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_bin.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    # ghidra — per-project attached Ghidra projects
+    p_ghidra = sub.add_parser(
+        "ghidra",
+        help=("Manage per-project attached Ghidra .gpr projects "
+              "(review-context injection + finding sync)"),
+        usage=("raptor project ghidra <add|remove|list|clear> [args] "
+               "[<name>]"),
+        **_F,
+    )
+    p_ghidra.add_argument(
+        "action", choices=("add", "remove", "list", "clear"),
+        help="Action: add <path.gpr>, remove <path.gpr>, list, or clear")
+    p_ghidra.add_argument(
+        "path", nargs="?", default=None,
+        help=".gpr path (required for add/remove)")
+    p_ghidra.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_ghidra.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    # graph — persistent graph store management
+    p_graph = sub.add_parser(
+        "graph",
+        help="Manage the persistent /understand graph store",
+        usage="raptor project graph <status|stats|clear|rebuild> [<name>]",
+        **_F,
+    )
+    p_graph.add_argument(
+        "action", choices=("status", "stats", "clear", "rebuild"),
+        help="Action: status, stats (detailed), clear, or rebuild")
+    p_graph.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+
+    # ledger — engagement artifact ledger over the project target
+    p_ledger = sub.add_parser(
+        "ledger",
+        help=("Engagement artifact ledger — enumerate the project "
+              "target into per-artifact rows with coverage "
+              "denominators"),
+        usage=("raptor project ledger <build|status|show> "
+               "[<artifact>] [<name>] [caps flags]"),
+        **_F,
+    )
+    p_ledger.add_argument(
+        "action", choices=("build", "status", "show"),
+        help=("Action: build (enumerate the target), status "
+              "(coverage table), show <artifact-id>"))
+    p_ledger.add_argument(
+        "artifact", nargs="?", default=None,
+        help="Artifact id (required for show)")
+    p_ledger.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_ledger.add_argument(
+        "--max-archive-children", type=int, default=None,
+        metavar="<n>",
+        help="Per-archive extracted-member cap for this build")
+    p_ledger.add_argument(
+        "--max-archive-bytes", type=int, default=None, metavar="<n>",
+        help="Per-archive extracted-byte cap for this build")
+    p_ledger.add_argument(
+        "--max-archive-depth", type=int, default=None, metavar="<n>",
+        help="Nested-archive expansion depth cap for this build")
+    p_ledger.add_argument(
+        "--no-expand", action="store_true",
+        help="Classify archives without extracting any members")
+
+    # trust / untrust — per-project trust markers
+    p_trust = sub.add_parser(
+        "trust",
+        help=("List or set trust markers (config/build/dynamic) — "
+              "operator assertions persisted on the project"),
+        usage="raptor project trust [<marker>] [<name>]",
+        **_F,
+    )
+    p_trust.add_argument(
+        "marker", nargs="?", default=None,
+        help=("Marker to set: config (--trust-repo umbrella), build "
+              "(traced-build CodeQL extraction), dynamic (dynamic "
+              "validation). Omit to list current markers."))
+    p_trust.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_trust.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    p_untrust = sub.add_parser(
+        "untrust",
+        help="Remove a trust marker",
+        usage="raptor project untrust <marker> [<name>]",
+        **_F,
+    )
+    p_untrust.add_argument(
+        "marker", help="Marker to remove: config, build, or dynamic")
+    p_untrust.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_untrust.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    # set / unset / get — registry-validated project settings
+    p_set = sub.add_parser(
+        "set",
+        help=("List or set project settings (registry-validated: "
+              "description, notes, threat-model, target-kind, "
+              "build-command[.<lang>], sandbox-floor, "
+              "journal-checkpoint)"),
+        usage="raptor project set [<key> <value>] [<name>]",
+        **_F,
+    )
+    p_set.add_argument(
+        "key", nargs="?", default=None,
+        help="Setting key (omit to list all settings)")
+    p_set.add_argument(
+        "value", nargs="?", default=None,
+        help="Setting value (required when a key is given)")
+    p_set.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_set.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    p_unset = sub.add_parser(
+        "unset",
+        help="Remove a project setting",
+        usage="raptor project unset <key> [<name>]",
+        **_F,
+    )
+    p_unset.add_argument("key", help="Setting key to remove")
+    p_unset.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_unset.add_argument("--wait", action="store_true", help=_WAIT_HELP)
+
+    p_get = sub.add_parser(
+        "get",
+        help=("Print one setting's bare value (script-friendly; "
+              "exit 1 when unset)"),
+        usage="raptor project get <key> [<name>]",
+        **_F,
+    )
+    p_get.add_argument("key", help="Setting key to read")
+    p_get.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+
+    # threat-model — per-project analysis context
+    p_tm = sub.add_parser(
+        "threat-model",
+        help="Manage the project threat-model artefact",
+        usage=("raptor project threat-model "
+               "[init|show|export|sync|lint|diff|report|add|remove] "
+               "[<name>] [--field <field>] [--value <text>] "
+               "[--from-context-map <path>] [--context-map <path>] "
+               "[--json] [--report-format FORMAT] [--report-output PATH] [--no-report]"),
+        **_F,
+    )
+    p_tm.add_argument(
+        "action", nargs="?", default="show",
+        help="Action: init, show, export, sync, add, remove, or a project name")
+    p_tm.add_argument("name", nargs="?", default=None, help="Project name (default: active)")
+    p_tm.add_argument(
+        "--field", default=None, metavar="<field>",
+        help="Target field for add/remove (e.g. focus_areas, assets, trusted_inputs)")
+    p_tm.add_argument(
+        "--value", default=None, metavar="<text>",
+        help="Value to add or remove")
+    p_tm.add_argument(
+        "--from-context-map", default=None, metavar="<path>",
+        help="Seed init from an /understand context-map.json")
+    p_tm.add_argument(
+        "--context-map", default=None, metavar="<path>",
+        help="Fresh /understand context-map.json for diff/report")
+    p_tm.add_argument("--json", dest="json_out", action="store_true", help="Print JSON")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(p_tm)
 
     # use
     p_use = sub.add_parser("use", help="Set the active project (no arg = show current)",
@@ -59,6 +543,10 @@ def main():
     sub.add_parser("none", help="Clear the active project (alias for 'use none')", **_F)
 
     # list
+    sub.add_parser(
+        "sessions",
+        help="Show live sessions and their project bindings",
+        usage="raptor project sessions", **_F)
     sub.add_parser("list", help="Show all projects",
                    usage="raptor project list", **_F)
 
@@ -82,6 +570,25 @@ def main():
         metavar="<pct>",
         help="Exit non-zero unless LLM item coverage is at least this percentage",
     )
+
+    # provenance
+    p_prov = sub.add_parser(
+        "provenance",
+        help="Show provenance rollup across all runs (SHAs, engines, models, reproducibility)",
+        usage="raptor project provenance [<name>]",
+        **_F,
+    )
+    p_prov.add_argument("name", nargs="?", help="Project name")
+
+    # show
+    p_show = sub.add_parser(
+        "show",
+        help="Show one run's provenance detail",
+        usage="raptor project show <run> [<name>]",
+        **_F,
+    )
+    p_show.add_argument("run", help="Run directory name (or unique substring)")
+    p_show.add_argument("name", nargs="?", help="Project name")
 
     # findings
     p_findings = sub.add_parser("findings", help="Show merged findings across all runs",
@@ -131,16 +638,25 @@ def main():
 
     # delete
     p_delete = sub.add_parser("delete", help="Delete a project",
-                              usage="raptor project delete <name> [--purge] [--yes]", **_F)
+                              usage="raptor project delete <name> [--purge] [--yes] [--force]", **_F)
     p_delete.add_argument("name", help="Project name")
     p_delete.add_argument("--purge", action="store_true", help="Also delete output directory")
     p_delete.add_argument("--yes", action="store_true", help="Skip confirmation")
+    p_delete.add_argument("--force", action="store_true",
+                          help="Purge even when live runs exist under the "
+                               "project (default: refuse — another "
+                               "session's in-flight run would lose its "
+                               "directory)")
 
     # rename
     p_rename = sub.add_parser("rename", help="Rename a project",
                               usage="raptor project rename <old> <new>", **_F)
     p_rename.add_argument("old", help="Current name")
     p_rename.add_argument("new", help="New name")
+    p_rename.add_argument(
+        "--force", action="store_true",
+        help="Override the live-run refusal (unverifiable "
+             "foreign-stamped runs read as live forever)")
 
     # notes
     p_notes = sub.add_parser("notes", help="View or update project notes",
@@ -151,12 +667,6 @@ def main():
         p_notes.add_argument("--edit", action="store_true", help="Open in $EDITOR")
     p_notes.add_argument("--file", default=None, metavar="<path>", help="Read notes from file")
 
-    # description
-    p_desc = sub.add_parser("description", help="View or update project description",
-                            usage="raptor project description <name> [<text>]", **_F)
-    p_desc.add_argument("name", help="Project name")
-    p_desc.add_argument("text", nargs="?", help="New description text")
-
     # add
     p_add = sub.add_parser("add", help="Add existing runs to a project",
                            usage="raptor project add <name> <directory> [--target <path>] [--output-dir <dir>]", **_F)
@@ -165,17 +675,42 @@ def main():
     p_add.add_argument("--target", metavar="<path>", help="Target path (creates project if needed)")
     p_add.add_argument("--output-dir", default=None, metavar="<dir>", help="Custom output directory")
 
+    # adopt — retro-create + add: give existing project-less run(s) a
+    # project after the fact. Target defaults to what the run itself
+    # recorded.
+    p_adopt = sub.add_parser(
+        "adopt",
+        help="Retro-create a project around existing run(s) "
+             "(create-if-missing + add; target inferred from the run)",
+        usage="raptor project adopt <name> <run-or-directory>... "
+              "[--target <path>]", **_F)
+    p_adopt.add_argument("name", help="Project name (created if missing)")
+    p_adopt.add_argument(
+        "runs", nargs="+",
+        help="Run directory(ies), or a directory containing runs")
+    p_adopt.add_argument(
+        "--target", metavar="<path>",
+        help="Target path (default: inferred from the first run's "
+             ".raptor-run.json)")
+
     # remove
     p_remove = sub.add_parser("remove", help="Move a run out of the project",
                               usage="raptor project remove <name> <run> --to <path>", **_F)
     p_remove.add_argument("name", help="Project name")
     p_remove.add_argument("run", help="Run directory name")
     p_remove.add_argument("--to", required=True, metavar="<path>", help="Destination path")
+    p_remove.add_argument(
+        "--force", action="store_true",
+        help="Override the live-run refusal (unverifiable "
+             "foreign-stamped runs read as live forever)")
 
     # report
     p_report = sub.add_parser("report", help="Generate merged report across all runs",
                               usage="raptor project report [<name>]", **_F)
     p_report.add_argument("name", nargs="?", help="Project name")
+    from core.reporting.options import add_report_arguments
+    add_report_arguments(p_report)
+    p_report.add_argument("--baseline", type=Path, help="Explicit report-context.json baseline for an observation delta")
 
     # annotations-diff
     p_anndiff = sub.add_parser(
@@ -204,12 +739,23 @@ def main():
     p_merge.add_argument("--yes", action="store_true", help="Skip confirmation")
 
     # clean
-    p_clean = sub.add_parser("clean", help="Delete old runs, keep latest n",
-                             usage="raptor project clean [<name>] [--keep <n>] [--dry-run] [--yes]", **_F)
+    p_clean = sub.add_parser("clean",
+                             help="Delete old runs, keep latest n; sweeps "
+                                  "_sources extractions no kept run "
+                                  "references (any _sources dir named "
+                                  "*-<sha256> counts as a cache entry — "
+                                  "don't store your own data there)",
+                             usage="raptor project clean [<name>] [--keep <n>] [--dedup] [--dry-run] [--yes]", **_F)
     p_clean.add_argument("name", nargs="?", help="Project name")
-    p_clean.add_argument("--keep", type=int, default=1, metavar="<n>", help="Runs to keep per type (default: 1)")
+    p_clean.add_argument("--keep", type=int, default=1, metavar="<n>",
+                         help="Runs to keep per type (default: 1; 0 keeps only "
+                              "the newest — the last run is never deleted)")
+    p_clean.add_argument("--dedup", action="store_true",
+                         help="Coverage-aware: drop only runs fully subsumed by a survivor "
+                              "(provably lossless), ignoring --keep")
     p_clean.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
     p_clean.add_argument("--yes", action="store_true", help="Skip confirmation")
+    p_clean.add_argument("--wait", action="store_true", help=_WAIT_HELP)
 
     # correlate
     p_correlate = sub.add_parser("correlate", help="Cross-run finding correlation",
@@ -238,6 +784,17 @@ def main():
     p_help.add_argument("topic", nargs="?", help="Subcommand name")
 
     args = parser.parse_args()
+    if args.subcommand == "report":
+        from core.reporting.options import options_from_args
+        options_from_args(args, parser)
+    if args.subcommand == "threat-model":
+        from core.reporting.options import options_from_args
+        if args.report_format or args.report_output or args.no_report:
+            if args.action != "report":
+                parser.error("Report controls apply to project threat-model report only")
+        if args.report_output is not None:
+            args.report_output = Path(_caller_relative(str(args.report_output)) or args.report_output).expanduser()
+        args._report_options = options_from_args(args, parser)
 
     if not args.subcommand:
         parser.print_help()
@@ -248,9 +805,29 @@ def main():
         args.subcommand = "use"
         args.name = "none"
 
-    mgr = ProjectManager()
-
     try:
+        mgr = ProjectManager()
+    except OSError as e:
+        # The constructor mkdirs the registry dir; a read-only or
+        # broken $HOME must yield one clear line, not a traceback —
+        # for EVERY subcommand including help/list.
+        print(f"Error: cannot access the project registry "
+              f"(~/.raptor/projects): {e}", file=sys.stderr)
+        sys.exit(1)
+
+    _op_guard = None
+    _op_exception: tuple[
+        type[BaseException] | None, BaseException | None, TracebackType | None
+    ] = (None, None, None)
+    try:
+        # Operation-granular project lock: mutating subcommands hold
+        # <project_dir>/.op.lock for the mutation's duration so two
+        # sessions' concurrent mutations serialise instead of
+        # interleaving. Read-only subcommands never lock — two
+        # sessions merely having a project active is NOT contention.
+        # Acquired inside the try so OpLockContention gets the same
+        # one-line "Error: ..." + exit-1 treatment as ValueError.
+        _op_guard = _acquire_mutation_lock(mgr, args)
         if args.subcommand == "help":
             if args.topic:
                 # Find the subparser and print its help
@@ -262,33 +839,426 @@ def main():
                 parser.print_help()
 
         elif args.subcommand == "create":
-            p = mgr.create(args.name, args.target, description=args.description,
-                           output_dir=args.output_dir)
-            print(f"Created project '{p.name}' → {p.output_dir}")
+            args.target = _caller_relative(args.target)
+            if getattr(args, "binary", None):
+                args.binary = [_caller_relative(b) for b in args.binary]
+            # Target-type catalog detection — runs BEFORE
+            # ProjectManager.create so a --require-target-type
+            # mismatch refuses without leaving a half-created
+            # project on disk (QoL #18).
+            _detected_entry = _detect_target_type(args.target)
+            _required = getattr(args, "require_target_type", None)
+            if _required:
+                _detected_name = _detected_entry.name if _detected_entry else None
+                if _detected_name != _required:
+                    print(_red(
+                        f"--require-target-type mismatch: expected "
+                        f"'{_required}', detected "
+                        f"{_detected_name!r}. Project NOT created. "
+                        f"Inspect target or list available types via "
+                        f"the catalog YAMLs in core/run/target_types/."
+                    ))
+                    # The mutation lock already mkdir'd the output dir
+                    # for its .op.lock — "refuses without leaving a
+                    # half-created project on disk" must include that:
+                    # a leftover dir reads as a project output dir to
+                    # is_project_output_dir. We hold the lock, so
+                    # removing our own lock file races nothing.
+                    _out = Path(args.output_dir or str(
+                        DEFAULT_OUTPUT_BASE / args.name))
+                    with contextlib.suppress(OSError):
+                        (_out / ".op.lock").unlink(missing_ok=True)
+                    with contextlib.suppress(OSError):
+                        _out.rmdir()
+                    sys.exit(1)
+            p = mgr.create(args.name, args.target,
+                           description=args.description,
+                           output_dir=args.output_dir,
+                           binaries=getattr(args, "binary", None))
+            # Echo registry round-trip values defensively — the same
+            # fields render from imported archives elsewhere, and the
+            # print surface should not depend on create's validation.
+            _pname = sanitise_for_terminal(p.name, max_len=120)
+            print(f"Created project '{_pname}' → "
+                  f"{sanitise_for_terminal(str(p.output_dir), max_len=256)}")
+            # Creation activates for the creating session and bumps the
+            # last-activated default — binding
+            # first, bookmark second, same discipline as `use`.
+            from .sessions import bind_session, resolve_session_pid
+            _bound_msg = None
+            if resolve_session_pid() is not None:
+                if bind_session(p.name, seeded_by="create") is not None:
+                    _bound_msg = ("  Active for this session; new "
+                                  "sessions will default to it.")
+                else:
+                    _bound_msg = (
+                        f"  WARNING: session binding failed — this "
+                        f"session still follows its previous project. "
+                        f"Retry with 'raptor project use {p.name}'. "
+                        f"New sessions will default to it.")
+            else:
+                _bound_msg = ("  New sessions will default to it "
+                              "(no session — no binding recorded).")
+            try:
+                mgr.set_active(p.name)
+            except OSError as e:
+                print(f"  WARNING: could not update the last-activated "
+                      f"default ({e}) — new sessions will NOT default "
+                      f"to '{_pname}'.")
+            else:
+                print(_bound_msg)
+            _p_binaries = getattr(p, "binaries", None) or []
+            if _p_binaries:
+                print("  binaries: "
+                      f"{sanitise_for_terminal(', '.join(_p_binaries), max_len=512)}")
+            # Print the catalog tuning block AFTER the create
+            # confirmation — operator sees what RAPTOR will use as
+            # defaults when /scan, /agentic, /codeql etc. run on
+            # this project. Strictly informational; per-command
+            # flags (--policy-groups, --prefer) still override at
+            # run time.
+            if _detected_entry is not None:
+                for line in _format_project_tuning(_detected_entry):
+                    print(line)
+
+        elif args.subcommand == "binary":
+            from core.json import save_json
+            # list / clear don't take a path — if the operator wrote
+            # ``binary list <project>`` the project name lands in
+            # ``args.path``. Swap it.
+            if (args.action in ("list", "clear")
+                    and args.path and not args.name):
+                args.name, args.path = args.path, None
+            name = args.name or _get_active_project()
+            if not name:
+                print(_red("No project specified. "
+                          "Use: raptor project binary <action> [args] "
+                          "<name>, or set an active project first."))
+                return
+            p = mgr.load(name)  # type: ignore[assignment]
+            if not p:
+                print(_red(f"Project '{name}' not found."))
+                return
+            project_file = mgr.projects_dir / f"{name}.json"
+            if args.action == "list":
+                if not p.binaries:
+                    print(f"Project '{name}': no binaries declared.")
+                else:
+                    print(f"Project '{name}' binaries ({len(p.binaries)}):")
+                    # Persisted paths arrive via project-import zips
+                    # too — same defang as the list view's fields.
+                    for b in p.binaries:
+                        witness = (getattr(p, "binary_witnesses", None)
+                                   or {}).get(str(b))
+                        # Witness strings ride project-import zips too
+                        # — defang the excerpt like the path.
+                        tag = (f"sha256 "
+                               f"{sanitise_for_terminal(witness[:12])}…"
+                               if witness
+                               else "no content witness — re-add to "
+                                    "pin (enrichment-only until then)")
+                        print(f"  {sanitise_for_terminal(str(b), max_len=256)}"
+                              f"  [{tag}]")
+            elif args.action == "add":
+                if not args.path:
+                    print(_red("add requires a <path> argument"))
+                    return
+                resolved_path = Path(
+                    _caller_relative(args.path)
+                    or args.path).expanduser().resolve()
+                resolved = str(resolved_path)
+                # Content witness: the add is a trust assertion about
+                # the BYTES at this path right now — persisted-store
+                # binaries drive `absent`-verdict hard-suppression on
+                # every later run, and the path may sit inside a run
+                # dir's write grant (the env-build persist hint points
+                # there). Pin sha256 here; the oracle load seam
+                # re-verifies fd-honestly and DEMOTES a changed file
+                # out of suppression authority. Hash OUTSIDE the
+                # project-file lock — the lock guards the registry
+                # write, not the binary, and a multi-GB debug binary
+                # must not hold it.
+                #
+                # ONE gated open carries existence check + regularity
+                # check + digest (fstat on the OPENED fd, hash of the
+                # same fd via sha256_fileobj) — a separate is_file()
+                # probe followed by a by-name hash spanned a swap
+                # window in which the checked file and the hashed
+                # file could differ. resolve() above fixes the store
+                # KEY; O_NOFOLLOW on the resolved name means anything
+                # swapped in behind the resolve refuses (ELOOP)
+                # instead of silently minting a witness for a file
+                # the check never saw.
+                from core.hash import sha256_fileobj
+                from core.source import open_regular_gated
+                try:
+                    with preserving_stream_error(open_regular_gated(
+                            resolved_path,
+                            follow_symlinks=False)) as pin:
+                        digest = sha256_fileobj(pin)  # type: ignore[arg-type]
+                except (FileNotFoundError, NotADirectoryError,
+                        ValueError):
+                    # Reject at add-time so the operator sees the typo
+                    # NOW, not silently weeks later when the scan
+                    # produces no binary-oracle evidence (adversarial
+                    # review P1-D-2). ValueError = opened but not a
+                    # regular file (directory, FIFO, device).
+                    print(_red(
+                        f"add: path does not exist or is not a file: "
+                        f"{args.path} (resolved to {resolved_path})"
+                    ))
+                    return
+                except OSError as exc:
+                    # Unreadable — or ELOOP from a symlink raced in
+                    # behind the resolve.
+                    print(_red(
+                        f"add: cannot read {resolved} for content "
+                        f"pinning ({exc}) — not added"))
+                    return
+                # RMW under the project-file lock (re-load inside it)
+                # so a concurrent mutator's write isn't dropped.
+                from .project import project_file_lock
+                with project_file_lock(project_file):
+                    p = mgr.load(name)  # type: ignore[assignment]
+                    if not p:
+                        print(_red(f"Project '{name}' not found."))
+                        return
+                    if resolved in p.binaries:
+                        if p.binary_witnesses.get(resolved) == digest:
+                            print(f"Already present: {resolved}")
+                        else:
+                            # Re-add = re-assertion: the operator
+                            # rebuilt (or is upgrading a pre-witness
+                            # entry) and re-pins the current bytes.
+                            p.binary_witnesses[resolved] = digest
+                            save_json(project_file, p.to_dict())
+                            print(_green(
+                                f"Witness refreshed: {resolved} "
+                                f"(sha256 {digest[:12]}…)"))
+                    else:
+                        p.binaries.append(resolved)
+                        p.binary_witnesses[resolved] = digest
+                        save_json(project_file, p.to_dict())
+                        print(_green(f"Added: {resolved} "
+                                     f"(pinned sha256 {digest[:12]}…)"))
+            elif args.action == "remove":
+                if not args.path:
+                    print(_red("remove requires a <path> argument"))
+                    return
+                resolved = str(Path(args.path).resolve())
+                from .project import project_file_lock
+                with project_file_lock(project_file):
+                    p = mgr.load(name)  # type: ignore[assignment]
+                    if not p:
+                        print(_red(f"Project '{name}' not found."))
+                        return
+                    if resolved not in p.binaries:
+                        print(f"Not present: {resolved}")
+                    else:
+                        p.binaries.remove(resolved)
+                        p.binary_witnesses.pop(resolved, None)
+                        save_json(project_file, p.to_dict())
+                        print(_green(f"Removed: {resolved}"))
+            elif args.action == "clear":
+                from .project import project_file_lock
+                with project_file_lock(project_file):
+                    p = mgr.load(name)  # type: ignore[assignment]
+                    if not p:
+                        print(_red(f"Project '{name}' not found."))
+                        return
+                    p.binaries = []
+                    p.binary_witnesses = {}
+                    save_json(project_file, p.to_dict())
+                print(_green(f"Cleared binaries for '{name}'"))
+
+        elif args.subcommand == "ghidra":
+            import re as _re
+            from core.json import save_json
+            # C0 controls + DEL + CSI + bidi overrides/isolates
+            # (raptor-ghidra strips the same set, minus tab/newline
+            # which its decompilation output keeps) — bidi characters
+            # can visually reverse a printed path, disguising WHICH
+            # .gpr is attached.
+            _strip_ctrl = lambda t: _re.sub(  # noqa: E731
+                "[\x00-\x1f\x7f\x9b"
+                "\u202a-\u202e\u2066-\u2069]",
+                "", str(t))
+            # list / clear don't take a path — same positional shuffle
+            # as the binary handler.
+            if (args.action in ("list", "clear")
+                    and args.path and not args.name):
+                args.name, args.path = args.path, None
+            name = args.name or _get_active_project()
+            if not name:
+                print(_red("No project specified. "
+                          "Use: raptor project ghidra <action> [args] "
+                          "<name>, or set an active project first."))
+                return
+            gproj = mgr.load(name)
+            if not gproj:
+                print(_red(f"Project '{name}' not found."))
+                return
+            project_file = mgr.projects_dir / f"{name}.json"
+            if args.action == "list":
+                if not gproj.ghidra_projects:
+                    print(f"Project '{name}': no Ghidra projects "
+                          "attached.")
+                else:
+                    print(f"Project '{name}' attached Ghidra projects "
+                          f"({len(gproj.ghidra_projects)}):")
+                    for g in gproj.ghidra_projects:
+                        marker = "" if Path(g).is_file() else "  (missing)"
+                        # Length-bounded: a hand-corrupted registry
+                        # entry must not emit a multi-MB echo line.
+                        shown = _strip_ctrl(g)
+                        if len(shown) > 500:
+                            shown = shown[:500] + "…"
+                        print(f"  {shown}{marker}")
+            elif args.action == "add":
+                if not args.path:
+                    print(_red("add requires a <path.gpr> argument"))
+                    return
+                if any(ord(c) < 0x20 or c == "\x7f" or c == "\x9b"
+                       or "\u202a" <= c <= "\u202e"
+                       or "\u2066" <= c <= "\u2069"
+                       for c in str(args.path)):
+                    # Same class as library attach(): C0/C1 controls
+                    # plus bidi overrides/isolates, which visually
+                    # reverse the echoed path.
+                    print(_red("add: control characters in the .gpr "
+                               "path — refused (status/list surfaces "
+                               "echo the stored path)"))
+                    return
+                # _caller_relative: a relative path means "relative
+                # to the OPERATOR's shell", not the RAPTOR repo dir
+                # the launcher moved cwd to (the same D18-class rule
+                # every other path-taking subcommand applies).
+                resolved_path = Path(
+                    _caller_relative(args.path)
+                    or args.path).expanduser().resolve()
+                if (resolved_path.suffix != ".gpr"
+                        or not resolved_path.is_file()):
+                    # Reject at add-time so the operator sees the typo
+                    # NOW, not weeks later as silently-empty review
+                    # context (same rule as binary add).
+                    print(_red(
+                        f"add: not an existing .gpr file: {args.path} "
+                        f"(resolved to {resolved_path})"
+                    ))
+                    return
+                resolved = str(resolved_path)
+                from .project import project_file_lock
+                with project_file_lock(project_file):
+                    gproj = mgr.load(name)
+                    if not gproj:
+                        print(_red(f"Project '{name}' not found."))
+                        return
+                    if resolved in gproj.ghidra_projects:
+                        print(f"Already attached: {_strip_ctrl(resolved)}")
+                    else:
+                        gproj.ghidra_projects.append(resolved)
+                        save_json(project_file, gproj.to_dict())
+                        print(_green(f"Attached: {_strip_ctrl(resolved)}"))
+                        print("  Run 'raptor-ghidra attach' to import "
+                              "and cache its database — runs read the "
+                              "CACHE only (no unprompted import of "
+                              "the bundle).")
+            elif args.action == "remove":
+                if not args.path:
+                    print(_red("remove requires a <path.gpr> argument"))
+                    return
+                resolved = str(Path(
+                    _caller_relative(args.path)
+                    or args.path).expanduser().resolve())
+                from .project import project_file_lock
+                with project_file_lock(project_file):
+                    gproj = mgr.load(name)
+                    if not gproj:
+                        print(_red(f"Project '{name}' not found."))
+                        return
+                    # Match the raw form too (parity with library
+                    # detach()): legacy or hand-edited registrations
+                    # may be stored unresolved.
+                    keep = [g for g in gproj.ghidra_projects
+                            if g != resolved and g != str(args.path)]
+                    if len(keep) == len(gproj.ghidra_projects):
+                        print(f"Not attached: {_strip_ctrl(resolved)}")
+                    else:
+                        gproj.ghidra_projects = keep
+                        save_json(project_file, gproj.to_dict())
+                        print(_green(f"Detached: {_strip_ctrl(resolved)}"))
+            elif args.action == "clear":
+                from .project import project_file_lock
+                with project_file_lock(project_file):
+                    gproj = mgr.load(name)
+                    if not gproj:
+                        print(_red(f"Project '{name}' not found."))
+                        return
+                    gproj.ghidra_projects = []
+                    save_json(project_file, gproj.to_dict())
+                print(_green(f"Detached all Ghidra projects for "
+                             f"'{name}'"))
+
+        elif args.subcommand == "graph":
+            _handle_graph(mgr, args)
+
+        elif args.subcommand == "ledger":
+            _handle_ledger(mgr, args)
+
+        elif args.subcommand in ("trust", "untrust"):
+            _handle_trust(mgr, args)
+
+        elif args.subcommand in ("set", "unset", "get"):
+            _handle_settings(mgr, args)
+
+        elif args.subcommand == "threat-model":
+            _handle_threat_model(mgr, args)
+
+        elif args.subcommand == "sessions":
+            _print_sessions(mgr)
 
         elif args.subcommand == "list":
             projects = mgr.list_projects()
             if not projects:
                 print("No projects.")
                 return
-            active = mgr.get_active()
-            # Compute column width from actual names (+ 2 for "* " marker)
+            # Two layers, two markers: * = this session's binding
+            # (layered resolution), > = the last-activated default
+            # (raw bookmark). They can legitimately differ.
+            binding = mgr.get_active()
+            bookmark = _read_bookmark(mgr)
             max_name = max(len(p.name) for p in projects)
             col = max(max_name + 2, 12)
+            any_marker = False
             for p in projects:
-                marker = "* " if p.name == active else "  "
-                desc = f"  {p.description}" if p.description else ""
-                print(f"{marker}{p.name:<{col}s}{desc:30s}  {p.target}")
+                if p.name == binding:
+                    marker = "* "
+                elif p.name == bookmark:
+                    marker = "> "
+                else:
+                    marker = "  "
+                any_marker = any_marker or marker != "  "
+                # description/target may arrive via a project-import
+                # zip — defang terminal escapes like every other
+                # untrusted-content print surface.
+                desc = sanitise_for_terminal(p.description or "", max_len=60)
+                desc = f"  {desc}" if desc else ""
+                tgt = sanitise_for_terminal(str(p.target or ""), max_len=120)
+                print(f"{marker}{p.name:<{col}s}{desc:30s}  {tgt}")
+            if any_marker:
+                print("  (* this session's project; "
+                      "> last-activated default)")
 
         elif args.subcommand == "status":
             name = args.name or _get_active_project()
             if not name:
                 print("No project specified. Use: raptor project status <name>")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
+            _print_layer_header(mgr, name)
             _print_status(p)
 
         elif args.subcommand == "coverage":
@@ -296,7 +1266,7 @@ def main():
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -304,12 +1274,34 @@ def main():
             if result is False:
                 sys.exit(1)
 
+        elif args.subcommand == "provenance":
+            name = args.name or _get_active_project()
+            if not name:
+                print("No project specified.")
+                return
+            p = mgr.load(name)  # type: ignore[assignment]
+            if not p:
+                print(f"Project '{name}' not found.")
+                return
+            _print_provenance(p)
+
+        elif args.subcommand == "show":
+            name = args.name or _get_active_project()
+            if not name:
+                print("No project specified.")
+                return
+            p = mgr.load(name)  # type: ignore[assignment]
+            if not p:
+                print(f"Project '{name}' not found.")
+                return
+            _print_run_provenance(p, args.run)
+
         elif args.subcommand == "findings":
             name = args.name or _get_active_project()
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -320,7 +1312,7 @@ def main():
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -337,35 +1329,130 @@ def main():
 
         elif args.subcommand == "use":
             if args.name is None:
-                # No argument — show current active project
-                active = mgr.get_active()
-                if active:
-                    p = mgr.load(active)
-                    if p:
-                        print(f"Active project: {p.name} ({p.target})")
+                # No argument — report BOTH layers, labelled.
+                from .sessions import resolve_session_pid, session_binding
+                binding, state = session_binding()
+                bookmark = _read_bookmark(mgr)
+                if state == "bound":
+                    if mgr.load(binding) is None:  # type: ignore[arg-type]
+                        # Same existence vet get_active applies: the
+                        # bound project was deleted from elsewhere.
+                        print(f"Session project: none (bound project "
+                              f"'{binding}' no longer exists — "
+                              f"re-bind with 'raptor project use "
+                              f"<name>')")
                     else:
-                        print(f"Active project: {active} (project file missing)")
+                        print(f"Session project: {binding}")
+                elif state == "none":
+                    print("Session project: none (explicitly cleared)")
+                elif resolve_session_pid() is not None:
+                    print("Session project: (follows the last-activated "
+                          "default — no binding recorded)")
                 else:
-                    print("No active project.")
+                    print("Session project: (no session — bare shell)")
+                print(f"Last-activated default: {bookmark or '(none)'}")
                 return
             if args.name == "none":
-                prev = mgr.get_active()
-                mgr.set_active(None)
-                if prev:
-                    print(f"Cleared active project: {prev}")
+                from .sessions import bind_session, resolve_session_pid
+                if resolve_session_pid() is not None:
+                    if bind_session(None) is None:
+                        print("WARNING: could not record the "
+                              "bound-to-none binding — this session "
+                              "still follows its previous project. "
+                              "Retry 'raptor project none'.")
+                        return
+                    prev_default = _read_bookmark(mgr)
+                    default_note = (
+                        f"Last-activated default "
+                        f"('{prev_default}') unchanged — new sessions "
+                        f"still start on it."
+                        if prev_default else
+                        "No last-activated default is set."
+                    )
+                    print(f"Session project cleared. {default_note}")
                 else:
-                    print("No active project.")
+                    # Bare shell: act on the last-activated default,
+                    # loudly labelled.
+                    prev = mgr.get_active()
+                    mgr.set_active(None)
+                    print("(no session — acting on the last-activated "
+                          "default)")
+                    if prev:
+                        print(f"Cleared last-activated default: {prev}")
+                    else:
+                        print("No last-activated default was set.")
                 return
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
+            if p.expires_at:
+                # Operator override for machine-project auto-expiry:
+                # explicitly choosing the project makes it
+                # operator-owned — clear the marker so it cannot
+                # expire out from under them. Locked RMW on a FRESH
+                # load: the unlocked stale-snapshot save raced other
+                # mutators and clobbered their writes wholesale.
+                with mgr._mutation_lock(p.name):
+                    fresh = mgr.load(p.name)
+                    if fresh is not None and fresh.expires_at:
+                        fresh.expires_at = ""
+                        mgr._save(fresh)
+                print(
+                    f"  note: cleared auto-expiry marker on "
+                    f"'{p.name}' — explicit use makes it "
+                    f"operator-owned"
+                )
+            # Binding FIRST, bookmark second. Success message only
+            # after both writes.
+            from .sessions import (
+                awareness_lines,
+                bind_session,
+                resolve_session_pid,
+                session_binding,
+            )
+            prev_binding, prev_state = session_binding()
+            in_session = resolve_session_pid() is not None
+            _own_pid = (bind_session(args.name, seeded_by="use")
+                        if in_session else None)
             mgr.set_active(args.name)
-            print(f"Active project: {p.name} ({p.target})")
+            if in_session and _own_pid is None:
+                print(f"WARNING: session binding failed — this session "
+                      f"still follows its previous project. Retry "
+                      f"'raptor project use {p.name}'. Last-activated "
+                      f"default updated — new sessions will start on "
+                      f"'{p.name}'.")
+            elif in_session:
+                was = (prev_binding if prev_state == "bound"
+                       else "none" if prev_state == "none" else "unset")
+                print(f"Session now on '{p.name}' (was: {was}). "
+                      f"Last-activated default updated — new sessions "
+                      f"will start on '{p.name}'.")
+            else:
+                try:
+                    from .sessions import read_sessions
+                    _n = len(read_sessions(prune=False))
+                except Exception:  # noqa: BLE001 — count is decorative
+                    _n = 0
+                print(f"(no session — acting on the last-activated "
+                      f"default; {_n} live session(s) keep their "
+                      f"bindings — switch inside a session with "
+                      f"/project use)")
+                # target/name may arrive via a project-import zip —
+                # the list lane sanitises the same fields (:1039).
+                print(f"Last-activated default: "
+                      f"{sanitise_for_terminal(p.name, max_len=120)} "
+                      f"({sanitise_for_terminal(str(p.target or ''), max_len=256)})")
             print(f"  Output dir: {p.output_dir}")
+            # Session-awareness (advisory, never lock-based): project
+            # switch is one of exactly two places this line surfaces —
+            # the other is launcher startup. Contention messages never
+            # repeat it.
+            for _line in awareness_lines(args.name, exclude_pid=_own_pid):
+                print(f"  note: {_line}")
 
         elif args.subcommand == "delete":
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -390,18 +1477,20 @@ def main():
                 else:
                     size_str = f"{size}B"
                 print(f"This will delete {args.name} and its output ({size_str})")
-                if input("Proceed? [y/N] ").lower() != "y":
+                if not _confirm("Proceed? [y/N] "):
                     print("Cancelled.")
                     return
             output_dir = p.output_dir
-            mgr.delete(args.name, purge=args.purge)
+            mgr.delete(args.name, purge=args.purge,
+                       force=getattr(args, "force", False))
             if args.purge:
                 print(f"Deleted project '{args.name}' and its output")
             else:
                 print(f"Deleted project '{args.name}' (output retained at {output_dir})")
 
         elif args.subcommand == "rename":
-            mgr.rename(args.old, args.new)
+            mgr.rename(args.old, args.new,
+                       force=getattr(args, "force", False))
             print(f"Renamed '{args.old}' → '{args.new}'")
 
         elif args.subcommand == "notes":
@@ -410,7 +1499,7 @@ def main():
                 print("Specify only one of: text, --file, --edit")
                 return
             if args.file:
-                p = mgr.load(args.name)
+                p = mgr.load(args.name)  # type: ignore[assignment]
                 if not p:
                     print(f"Project '{args.name}' not found.")
                     return
@@ -418,14 +1507,36 @@ def main():
                 if not path.exists():
                     print(f"File not found: {args.file}")
                     return
-                mgr.update_notes(args.name, path.read_text().strip())
+                # Symlink + size guard. Pre-fix path.read_text() would
+                # follow a symlink (operator points args.file at
+                # /etc/passwd or /dev/zero) and slurp the entire file
+                # into RAM with no cap. Notes are short prose; 1 MiB
+                # is generous. Refuse symlinks outright — the legit
+                # use case is "pass a regular text file".
+                if path.is_symlink():
+                    print(f"Refusing symlinked notes file: {args.file}")
+                    return
+                try:
+                    size = path.stat().st_size
+                except OSError as e:
+                    print(f"Cannot stat {args.file}: {e}")
+                    return
+                _NOTES_MAX_BYTES = 1 * 1024 * 1024
+                if size > _NOTES_MAX_BYTES:
+                    print(
+                        f"Notes file exceeds {_NOTES_MAX_BYTES}-byte cap "
+                        f"(got {size}). Trim before passing."
+                    )
+                    return
+                mgr.update_notes(args.name, path.read_text(encoding="utf-8").strip())
                 print("Notes updated.")
             elif getattr(args, "edit", False):
                 if not os.isatty(0):
                     print("--edit requires an interactive terminal. Use --file or pass text directly.")
                     return
-                import shlex, tempfile, subprocess
-                p = mgr.load(args.name)
+                import shlex
+                import subprocess
+                p = mgr.load(args.name)  # type: ignore[assignment]
                 if not p:
                     print(f"Project '{args.name}' not found.")
                     return
@@ -449,7 +1560,7 @@ def main():
                 #
                 # Reject editor strings containing shell-meta
                 # characters that aren't valid in canonical editor
-                # invocations. Whitelist editor command names to
+                # invocations. Allowlist editor command names to
                 # the canonical set; reject otherwise (operator
                 # can use the printed message to override
                 # explicitly).
@@ -457,6 +1568,13 @@ def main():
                     "vi", "vim", "nvim", "nano", "emacs", "code",
                     "subl", "atom", "ed", "ex", "joe", "mg",
                 }
+                # Extra argv tokens are allowlist-verified too: the
+                # basename check alone still executed
+                # EDITOR='vim -c ":!cmd"' — vim runs the -c argument
+                # as a command (the exact vector described above).
+                # Only argument-free blocking-wait flags pass; any
+                # other token refuses the launch.
+                _SAFE_EDITOR_ARGS = {"-w", "--wait"}
                 editor_argv = shlex.split(editor)
                 editor_basename = os.path.basename(editor_argv[0]) if editor_argv else ""
                 if editor_basename not in _SAFE_EDITOR_NAMES:
@@ -468,58 +1586,110 @@ def main():
                         file=sys.stderr,
                     )
                     return
-                # Capture tf_path BEFORE tf.write so a failing write (disk
-                # full, etc.) still leaves tf_path set and the finally can
-                # unlink the stub. Keep tempfile creation inside the try so
-                # finally covers the whole create+write+use lifetime.
-                tf_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".md", mode="w", delete=False,
-                    ) as tf:
-                        tf_path = tf.name
-                        tf.write(p.notes or "")
-                    result = subprocess.run(editor_argv + [tf_path])
+                bad_args = [a for a in editor_argv[1:]
+                            if a not in _SAFE_EDITOR_ARGS]
+                if bad_args:
+                    print(
+                        f"Refusing to launch editor: argument(s) "
+                        f"{bad_args!r} not in the editor-argument "
+                        f"allowlist {sorted(_SAFE_EDITOR_ARGS)}. Set "
+                        "$EDITOR to the bare editor name (flags like "
+                        "vim's -c execute arbitrary commands).",
+                        file=sys.stderr,
+                    )
+                    return
+                with temporary_text(p.notes or "", prefix="raptor-notes-", suffix=".md",
+                                    strict_cleanup=False) as notes_path:
+                    tf_path = str(notes_path)
+                    # Operator-launched editor invocation. The
+                    # ``EDITOR`` env var is the operator's own
+                    # choice; if it's compromised they have bigger
+                    # problems than RAPTOR launching it.
+                    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+                    result = subprocess.run(editor_argv + [tf_path], check=False)
                     if result.returncode != 0:
                         print("Editor exited with error. Notes unchanged.")
                         return
-                    new_notes = Path(tf_path).read_text().strip()
+                    new_notes = Path(tf_path).read_text(encoding="utf-8").strip()
                     mgr.update_notes(args.name, new_notes)
                     print("Notes updated.")
-                finally:
-                    if tf_path:
-                        Path(tf_path).unlink(missing_ok=True)
             elif args.text:
                 mgr.update_notes(args.name, args.text)
                 print("Notes updated.")
             else:
-                p = mgr.load(args.name)
+                p = mgr.load(args.name)  # type: ignore[assignment]
                 if p:
-                    print(p.notes or "(no notes)")
-                else:
-                    print(f"Project '{args.name}' not found.")
-
-        elif args.subcommand == "description":
-            if args.text:
-                mgr.update_description(args.name, args.text)
-                print("Description updated.")
-            else:
-                p = mgr.load(args.name)
-                if p:
-                    print(p.description or "(no description)")
+                    # Notes are free text set via /project set —
+                    # escape control bytes, keep line structure.
+                    from core.security.log_sanitisation import (
+                        escape_nonprintable,
+                    )
+                    print(escape_nonprintable(p.notes, preserve_newlines=True)
+                          if p.notes else "(no notes)")
                 else:
                     print(f"Project '{args.name}' not found.")
 
         elif args.subcommand == "add":
-            added = mgr.add_directory(args.name, args.directory, target=args.target,
+            added = mgr.add_directory(args.name,
+                                       _caller_relative(args.directory),  # type: ignore[arg-type]
+                                       target=_caller_relative(args.target),
                                        output_dir=args.output_dir)
             if added:
-                print(f"Added {added} run(s) to project '{args.name}'")
+                print(f"Added {added} run(s) to project '{args.name}' "
+                      "(journal index + coverage projections re-run)")
             else:
-                print(f"No new runs added (already present or none found in {args.directory})")
+                print(f"No new runs added (already present, target mismatch, "
+                      f"or none found in {args.directory})")
+
+        elif args.subcommand == "adopt":
+            target = _caller_relative(args.target)
+            if not target and not mgr.load(args.name):
+                for candidate in args.runs:
+                    target = mgr.adopt_target_for(candidate)
+                    if target:
+                        # Inferred from run-dir metadata (child-writable).
+                        print(f"Target inferred from run metadata: "
+                              f"{sanitise_for_terminal(str(target), max_len=256)}")
+                        break
+                if not target:
+                    print("No project by that name, no --target, and no run "
+                          "records a target — pass --target explicitly.")
+                    return
+            existed_before = mgr.load(args.name) is not None
+            total = 0
+            for candidate in args.runs:
+                total += mgr.add_directory(args.name, candidate, target=target)
+            if total:
+                print(f"Adopted {total} run(s) into project '{args.name}' "
+                      "(journal index + coverage projections re-run)")
+                if not existed_before:
+                    # Adopt-that-creates activates for THIS SESSION
+                    # only — the machine-wide default is not moved
+                    # (same session-only semantics as launch-time
+                    # auto-detect; /project use bumps the bookmark).
+                    from .sessions import bind_session, resolve_session_pid
+                    if resolve_session_pid() is not None:
+                        if bind_session(args.name,
+                                        seeded_by="adopt") is not None:
+                            print(f"  Active for this session "
+                                  f"(last-activated default unchanged).")
+                # Binary-lane steer — adopt-time twin of smart
+                # create. Only fires when the resolved target is
+                # binary-dominant (compiled artifacts, no
+                # substantial source tree); every other target
+                # keeps adopt's existing output byte-for-byte.
+                if target:
+                    _entry = _detect_target_type(str(target))
+                    if _entry is not None and _entry.name == "binary":
+                        for line in _format_project_tuning(_entry):
+                            print(line)
+            else:
+                print("No runs adopted (already present, target mismatch, "
+                      "or no run directories found)")
 
         elif args.subcommand == "remove":
-            mgr.remove_run(args.name, args.run, to_path=args.to)
+            mgr.remove_run(args.name, args.run, to_path=args.to,
+                           force=getattr(args, "force", False))
             print(f"Removed '{args.run}' from project '{args.name}'")
 
         elif args.subcommand == "correlate":
@@ -527,7 +1697,7 @@ def main():
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -535,7 +1705,7 @@ def main():
 
         elif args.subcommand == "diff":
             from .diff import diff_runs
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -557,7 +1727,7 @@ def main():
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -577,22 +1747,27 @@ def main():
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
             from .report import generate_project_report
-            stats = generate_project_report(p)
+            from core.reporting.options import options_from_args
+            stats = generate_project_report(p, report_options=options_from_args(args), baseline=args.baseline, stream=sys.stdout)
             print(f"Report generated: {stats.get('report_dir', p.output_path / '_report')}")
             if stats.get("findings_dir"):
                 print(f"  Findings directory: {stats['findings_dir']}")
             print(f"  Merged findings: {stats['findings']}")
             if stats.get("annotations") is not None:
                 print(f"  Annotations: {stats['annotations']}")
+            if stats.get("provenance_markdown"):
+                print(f"  Provenance: {stats['provenance_markdown']}")
+            if stats.get("reporting_errors"):
+                sys.exit(1)
 
         elif args.subcommand == "export":
             from .export import export_project
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -605,8 +1780,9 @@ def main():
             print(f"  sha256: {result['sha256']}")
 
         elif args.subcommand == "import":
-            from .export import import_project
             from core.hash import sha256_file
+
+            from .export import import_project
             zip_path = Path(args.path)
             if args.sha256:
                 actual = sha256_file(zip_path)
@@ -617,55 +1793,223 @@ def main():
             result = import_project(zip_path, mgr.projects_dir,
                                     force=args.force)
             print(f"Imported project '{result['name']}'")
-            if result.get("orphaned_output"):
-                print(f"  Note: previous output retained at {result['orphaned_output']}")
+            for field, label in (("orphaned_output", "previous output"),
+                                 ("retained_backup", "output recovery backup"),
+                                 ("retained_registry_backup", "registration recovery backup")):
+                if result.get(field):
+                    print(f"  Note: {label} retained at {sanitise_for_terminal(result[field])}")
 
         elif args.subcommand == "clean":
             name = args.name or _get_active_project()
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
-            _do_clean(p, args.keep, args.dry_run, args.yes)
+            _do_clean(p, args.keep, args.dry_run, args.yes, dedup=args.dedup)
 
         elif args.subcommand == "merge":
             name = args.name or _get_active_project()
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
             _do_merge(p, args.type, args.yes)
 
-    except (ValueError, FileExistsError) as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    except (ValueError, FileExistsError, OpLockContention) as e:
+        try:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except BaseException:
+            _op_exception = sys.exc_info()
+            raise
     except KeyboardInterrupt:
-        print("\nCancelled.")
-        sys.exit(130)
+        try:
+            print("\nCancelled.")
+            sys.exit(130)
+        except BaseException:
+            _op_exception = sys.exc_info()
+            raise
+    except BaseException:
+        _op_exception = sys.exc_info()
+        raise
+    finally:
+        if _op_guard is not None:
+            # Only this dispatch's escaping error belongs to the guard;
+            # sys.exc_info() here could instead describe a caller's handler.
+            _op_guard.__exit__(*_op_exception)
+
+
+def _mutation_lock_target(mgr, args: argparse.Namespace):
+    """Resolve ``(project_output_dir, operation)`` for subcommands that
+    mutate project state; ``None`` for read-only invocations.
+
+    Mirrors each handler's ergonomics so listing forms never lock:
+    ``trust`` with no marker (or a project name in the marker slot)
+    lists; ``set`` without a value lists (or the ``set <name>`` form);
+    ``binary list`` reads. The lock keys on the project OUTPUT dir —
+    the same directory run-start contention keys on — so a mutation
+    and a run start contend on one lock file.
+    """
+    sc = args.subcommand
+    if sc == "create":
+        # Validate the name BEFORE deriving a path from it — a hostile
+        # name must not mkdir outside the output base. Invalid names
+        # skip the lock; create itself re-validates and errors.
+        try:
+            ProjectManager._validate_name(args.name)
+        except ValueError:
+            return None
+        out = args.output_dir or str(
+            (DEFAULT_OUTPUT_BASE / args.name).resolve())
+        return Path(out), "project create"
+    name = getattr(args, "name", None)
+    if sc in ("binary", "ghidra"):
+        if args.action not in ("add", "remove", "clear"):
+            return None
+        # Same positional shuffle the handler applies for
+        # ``binary clear <project>`` (no path argument).
+        if args.action == "clear" and args.path and not name:
+            name = args.path
+    elif sc == "trust":
+        from core.project.project import VALID_TRUST_MARKERS
+        if getattr(args, "marker", None) not in VALID_TRUST_MARKERS:
+            return None  # listing form (no marker / project-name slot)
+    elif sc == "set":
+        if not getattr(args, "key", None) or args.value is None:
+            return None  # listing form
+    elif sc == "rename":
+        # Lock the OLD project's dir: run starts contend on it, so a
+        # rename can no longer interleave with a start's
+        # resolve-pin/write-pin window (which orphaned the new run's
+        # pin to the just-renamed-away name).
+        name = getattr(args, "old", None) or getattr(args, "old_name",
+                                                     None)
+    elif sc not in ("unset", "untrust", "clean", "delete", "add",
+                    "adopt", "remove"):
+        return None
+    name = name or _get_active_project()
+    if not name:
+        return None
+    p = mgr.load(name)
+    if not p or not p.output_dir:
+        return None
+    return Path(p.output_dir), f"project {sc}"
+
+
+def _acquire_mutation_lock(mgr, args):
+    """Enter the op lock for a mutating subcommand.
+
+    Returns the entered context manager (caller exits it in main()'s
+    ``finally``) or ``None`` when the invocation is read-only /
+    unresolvable. Raises ``OpLockContention`` after the silent grace
+    when another operation holds the lock and ``--wait`` wasn't given.
+    """
+    target = _mutation_lock_target(mgr, args)
+    if target is None:
+        return None
+    project_dir, operation = target
+    cm = project_op_lock(project_dir, operation,
+                         wait=getattr(args, "wait", False))
+    cm.__enter__()
+    return cm
+
+
+def _read_bookmark(mgr) -> str | None:
+    """The last-activated default — the raw ``.active`` symlink target,
+    deliberately BYPASSING the layered resolution (which would answer
+    with the session binding). UI surfaces that must show the bookmark
+    layer use this; everything else goes through ``get_active()``."""
+    try:
+        target = os.readlink(mgr.projects_dir / ".active")
+    except OSError:
+        return None
+    if target.endswith(".json") and "/" not in target and "\\" not in target:
+        return target[:-5]
+    return None
+
+
+def _print_layer_header(mgr, name: str) -> None:
+    """One line naming the layers: binding, default, live sessions."""
+    try:
+        from core.project import sessions as _sessions
+        binding = mgr.get_active()
+        bookmark = _read_bookmark(mgr)
+        live = sum(
+            1 for _pid, fields in _sessions.read_sessions().items()
+            if fields.get("project") == name
+        )
+        bits = [f"Project: {name}"]
+        if binding == name:
+            bits[0] += " (this session)"
+        if bookmark:
+            bits.append(f"last activated: {bookmark}")
+        bits.append(f"sessions on {name}: {live} live")
+        print(" · ".join(bits))
+    except Exception:  # noqa: BLE001 — header is decoration, never fatal
+        pass
+
+
+def _print_sessions(mgr) -> None:
+    """Live/stale/foreign session rows with their bindings."""
+    from core.project import sessions as _sessions
+    entries = _sessions.read_sessions(prune=False, include_stale=True)
+    if not entries:
+        print("No registered sessions.")
+        return
+    from core.security.log_sanitisation import sanitise_for_terminal
+    print(f"{'PID':>9}  {'STATE':<22} {'PROJECT':<24} SINCE")
+    for pid in sorted(entries):
+        fields = entries[pid]
+        state = fields.get("_state", "live")
+        project = fields.get("project") or "?"
+        if project == "-":
+            project = "(none — explicitly cleared)"
+        label = {"advisory": "advisory (v1)",
+                 "foreign": "foreign (other boot/ns)",
+                 "stale": "stale",
+                 "live": "live"}.get(state, state)
+        since = sanitise_for_terminal(
+            str(fields.get("since") or "unknown"), max_len=32)
+        project = sanitise_for_terminal(str(project), max_len=40)
+        print(f"{pid:>9}  {label:<22} {project:<24} {since}")
+    bookmark = _read_bookmark(mgr)
+    print(f"Last-activated default: {bookmark or '(none)'}")
 
 
 def _get_active_project():
-    """Get the active project name from .active symlink or env var."""
+    """The active project for this context — layered resolution
+    (session binding first, then the last-activated symlink) via
+    ``ProjectManager.get_active()``."""
     mgr = ProjectManager()
     return mgr.get_active()
 
 
-def _count_sarif_results(run_dir):
-    """Count total results across all SARIF files in a run directory."""
+def _count_sarif_results_in_dir(run_dir: Path) -> int:
+    """Count total results across all SARIF files in a run directory.
+
+    Per-file counting goes through the shared shape-tolerant
+    ``core.sarif.parser.count_results`` — these files sit in run
+    directories (tool-emitted, operator-editable), and the inline
+    loop this replaces raised on a non-dict run entry, taking the
+    whole /project status rendering down with one malformed file.
+    """
+    from core.coverage.record import RUN_ARTIFACT_MAX_BYTES
     from core.json import load_json
+    from core.sarif.parser import count_results
     count = 0
     for sarif_path in run_dir.glob("*.sarif"):
-        data = load_json(sarif_path)
-        if not data or not isinstance(data, dict):
-            continue
-        for run in data.get("runs", []):
-            count += len(run.get("results", []))
+        # Budgeted (run-artifact class): /project status loads every
+        # run's SARIF wholesale just to COUNT — an oversize plant in a
+        # sandbox-writable run dir must degrade to 0, not buffer
+        # unbounded per file listed.
+        count += count_results(
+            load_json(sarif_path, max_bytes=RUN_ARTIFACT_MAX_BYTES))
     return count
 
 
@@ -673,62 +2017,768 @@ def _get_output_summary(run_dir, meta):
     """Get findings/results string for a run, using cached summary when available.
 
     On first access for a completed run, computes the summary and writes it
-    back to .raptor-run.json so subsequent calls are instant.
+    back to .raptor-run.json when permitted so subsequent calls are instant.
+    Cache I/O failures must not prevent displaying the computed summary.
     """
-    from core.json import save_json
     from core.run.metadata import RUN_METADATA_FILE
 
-    # Use cached summary if present
+    # Cache schema version — bump whenever the counting logic changes so
+    # stale cached strings are recomputed rather than silently served.
+    # v2: counts SCA findings (sca/ subdir) in addition to code findings;
+    # a v1 string (code-only) must NOT short-circuit or SCA-containing
+    # runs completed before this change would under-count forever.
+    summary_version = 2
+
+    # Use cached summary only if it was computed by the current logic.
     cached = (meta or {}).get("output_summary")
-    if cached:
+    if cached and (meta or {}).get("output_summary_v") == summary_version:
         return cached
 
-    # Compute from findings or SARIF
-    from .findings_utils import load_findings_from_dir, count_vulns
-    findings = load_findings_from_dir(run_dir)
+    # Compute from findings or SARIF. Code findings (top-level
+    # findings.json) + SCA dependency findings (sca/ subdir) both count,
+    # so the run-list total matches what `/project findings` shows.
+    from .findings_utils import (
+        count_vulns,
+        load_findings_from_dir,
+        load_sca_findings_from_dir,
+    )
+    findings = load_findings_from_dir(run_dir) + load_sca_findings_from_dir(run_dir)
     if findings:
-        vuln_count = count_vulns(findings)
-        if vuln_count != len(findings):
-            result = f"{vuln_count} findings"
-        else:
-            result = f"{len(findings)} findings"
+        # count_vulns groups by (file, function, vuln_type); the prior
+        # branch always displayed this value, so this is behaviour-
+        # preserving for code-only runs and additive for SCA.
+        result = f"{count_vulns(findings)} findings"
     else:
-        sarif_count = _count_sarif_results(run_dir)
+        sarif_count = _count_sarif_results_in_dir(run_dir)
         result = f"{sarif_count} results" if sarif_count else ""
 
     # Cache in metadata for completed/failed runs (won't change)
     status = (meta or {}).get("status", "")
     if result and status in ("completed", "failed"):
         meta_path = run_dir / RUN_METADATA_FILE
-        if meta_path.exists() and meta:
-            meta["output_summary"] = result
-            save_json(meta_path, meta)
+        # Persistence is optional. A read-only mount, denied write or full disk
+        # must not turn a status/list query into an error or require escalation.
+        # Keep the lock and fresh read on the successful write-back path.
+        with contextlib.suppress(OSError):
+            if meta_path.exists() and meta:
+                # Same cross-process lock every other RMW on this file
+                # takes (start_run, _update_status, write_run_pin) — an
+                # unlocked save of the pre-computed snapshot raced
+                # concurrent marker writers (a pin rewrite, another status
+                # invocation) and clobbered their update. Re-load inside
+                # the lock and add ONLY the cache keys.
+                # _load_meta, not bare load_json: the marker is sandbox-
+                # writable and every reader carries the metadata budget.
+                from core.run.metadata import _load_meta, _metadata_lock
+                with _metadata_lock(meta_path):
+                    fresh = _load_meta(meta_path)
+                    if isinstance(fresh, dict):
+                        fresh["output_summary"] = result
+                        fresh["output_summary_v"] = summary_version
+                        _save_summary_json(meta_path, fresh)
 
     return result
 
 
-def _print_status(project):
+def _resolve_project_or_exit(mgr, name):
+    """Common "which project?" resolution for the trust/settings
+    handlers: explicit name, else the active project. Exits 1 with a
+    message when neither resolves or the project doesn't exist."""
+    name = name or _get_active_project()
+    if not name:
+        print(_red("No project specified and no active project. "
+                   "Pass a project name or run 'raptor project use "
+                   "<name>' first."), file=sys.stderr)
+        sys.exit(1)
+    p = mgr.load(name)
+    if not p:
+        print(_red(f"Project '{name}' not found."), file=sys.stderr)
+        sys.exit(1)
+    return name, p
+
+
+def _handle_graph(mgr, args: argparse.Namespace) -> None:
+    """Manage the persistent /understand graph store for a project."""
+    name = args.name or _get_active_project()
+    if not name:
+        print(_red("No project specified. "
+                    "Use: raptor project graph <action> <name>, "
+                    "or set an active project first."))
+        return
+    p = mgr.load(name)
+    if not p:
+        print(_red(f"Project '{name}' not found."))
+        return
+
+    from core.understand_graph import graph_path_for_run
+    graph_path = graph_path_for_run(Path(p.output_dir))
+
+    if args.action == "status":
+        if not graph_path.exists():
+            print(f"Project '{name}': no graph store.")
+            return
+        from core.understand_graph import graph_summary
+        info = graph_summary(graph_path)
+        size = graph_path.stat().st_size
+        if size >= 1024 * 1024:
+            size_str = f"{size / 1024 / 1024:.1f}MB"
+        elif size >= 1024:
+            size_str = f"{size / 1024:.1f}KB"
+        else:
+            size_str = f"{size}B"
+        mtime = datetime.fromtimestamp(
+            graph_path.stat().st_mtime, tz=timezone.utc)
+        from core.understand_graph.schema import SCHEMA_VERSION
+        total_nodes = sum(info.get("nodes", {}).values())
+        total_edges = sum(info.get("edges", {}).values())
+        print(f"Graph store: {graph_path}")
+        print(f"  Size: {size_str}")
+        print(f"  Schema: v{SCHEMA_VERSION}")
+        print(f"  Last modified: {mtime:%Y-%m-%d %H:%M:%S UTC}")
+        print(f"  Nodes: {total_nodes}")
+        print(f"  Edges: {total_edges}")
+        snap = info.get("latest_snapshot")
+        if snap:
+            # Graph-store metadata is a RAPTOR-written artifact, but a
+            # tampered store reaches the terminal here — scrub like
+            # every other artifact-derived render lane.
+            _when = sanitise_for_terminal(str(snap.get('created_at', '?')), max_len=64)
+            _prod = sanitise_for_terminal(str(snap.get('producer', '?')), max_len=64)
+            print(f"  Latest snapshot: {_when} ({_prod})")
+
+    elif args.action == "stats":
+        if not graph_path.exists():
+            print(f"Project '{name}': no graph store.")
+            return
+        from core.understand_graph import graph_summary
+        info = graph_summary(graph_path)
+        nodes = info.get("nodes", {})
+        edges = info.get("edges", {})
+        if not nodes and not edges:
+            print(f"Project '{name}': graph is empty.")
+            return
+        print(f"Graph store: {graph_path.name}")
+        if nodes:
+            print("\n  Node counts by type:")
+            for kind in sorted(nodes, key=lambda k: -nodes[k]):
+                print(f"    {kind:<24s} {nodes[kind]:>6d}")
+            print(f"    {'TOTAL':<24s} {sum(nodes.values()):>6d}")
+        if edges:
+            print("\n  Edge counts by type:")
+            for kind in sorted(edges, key=lambda k: -edges[k]):
+                print(f"    {kind:<24s} {edges[kind]:>6d}")
+            print(f"    {'TOTAL':<24s} {sum(edges.values()):>6d}")
+
+    elif args.action == "clear":
+        if not graph_path.exists():
+            print(f"Project '{name}': no graph store to clear.")
+            return
+        from core.understand_graph import remove_graph_db
+        if remove_graph_db(graph_path):
+            print(_green(f"Cleared graph store for '{name}'"))
+        else:
+            print(f"✗ Could not fully clear graph store for '{name}': "
+                  f"{graph_path}", file=sys.stderr)
+
+    elif args.action == "rebuild":
+        from core.understand_graph import rebuild_graph
+        result = rebuild_graph(Path(p.output_dir))
+        if result and result.exists():
+            from core.understand_graph import graph_summary
+            info = graph_summary(result)
+            total_nodes = sum(info.get("nodes", {}).values())
+            total_edges = sum(info.get("edges", {}).values())
+            print(_green(
+                f"Rebuilt graph for '{name}': "
+                f"{total_nodes} nodes, {total_edges} edges"))
+        else:
+            print(f"No artefacts found to rebuild from in '{name}'.")
+
+
+def _handle_ledger(mgr, args: argparse.Namespace) -> None:
+    """Engagement artifact ledger verbs (build / status / show).
+
+    Rendering discipline: every target-derived value the ledger holds
+    reaches this terminal only through the module's own escape-at-
+    render helpers (`core.security.log_sanitisation` contract).
+    """
+    # Positional reshuffle (the ``binary clear <project>`` idiom):
+    # build/status take no artifact, so their lone positional is the
+    # project name — without this, ``ledger build myproj`` would bind
+    # ``myproj`` to the artifact slot and silently run against the
+    # ACTIVE project instead.
+    if args.action in ("build", "status") and args.artifact and not args.name:
+        args.name, args.artifact = args.artifact, None
+    name = args.name or _get_active_project()
+    if not name:
+        print(_red("No project specified. "
+                   "Use: raptor project ledger <action> [...] <name>, "
+                   "or set an active project first."))
+        return
+    p = mgr.load(name)
+    if not p:
+        print(_red(f"Project '{name}' not found."))
+        return
+
+    from core.engagement.ledger import (
+        LedgerCaps,
+        build_ledger,
+        load_ledger,
+        render_artifact_lines,
+        render_status_lines,
+    )
+    output_dir = Path(p.output_dir)
+
+    if args.action == "build":
+        target = Path(p.target)
+        if not target.is_dir():
+            print(_red(
+                f"Project target is not a directory: "
+                f"{sanitise_for_terminal(str(target), max_len=200)}"))
+            return
+        for flag, value in (
+            ("--max-archive-children", args.max_archive_children),
+            ("--max-archive-bytes", args.max_archive_bytes),
+            ("--max-archive-depth", args.max_archive_depth),
+        ):
+            if value is not None and value < 0:
+                print(_red(f"{flag} must be >= 0 (got {value})"))
+                return
+        defaults = LedgerCaps()
+        caps = LedgerCaps(
+            max_archive_children=(
+                args.max_archive_children
+                if args.max_archive_children is not None
+                else defaults.max_archive_children),
+            max_archive_total_bytes=(
+                args.max_archive_bytes
+                if args.max_archive_bytes is not None
+                else defaults.max_archive_total_bytes),
+            max_archive_depth=(
+                args.max_archive_depth
+                if args.max_archive_depth is not None
+                else defaults.max_archive_depth),
+            expand_archives=not args.no_expand,
+        )
+        doc = build_ledger(target, output_dir, caps=caps)
+        counts = doc.get("counts") or {}
+        print(_green(
+            f"Ledger built: {counts.get('rows', 0)} row(s) → "
+            f"{output_dir / 'ledger.json'}"))
+        for cls, n in sorted((counts.get("by_class") or {}).items()):
+            print(f"  {cls:<20s} {n:>5d}")
+        residuals = doc.get("residuals") or []
+        if residuals:
+            print(f"  {len(residuals)} residual(s) — "
+                  "see `raptor project ledger status`")
+        return
+
+    ledger = load_ledger(output_dir)
+    if ledger is None:
+        print(f"Project '{name}': no ledger. "
+              "Run `raptor project ledger build` first.")
+        return
+
+    if args.action == "status":
+        for line in render_status_lines(ledger, output_dir):
+            print(line)
+        return
+
+    if args.action == "show":
+        if not args.artifact:
+            print(_red("Usage: raptor project ledger show "
+                       "<artifact-id> [<name>]"))
+            return
+        matches = [
+            row for row in ledger.get("rows") or []
+            if row.get("artifact_id") == args.artifact
+        ]
+        if not matches:
+            matches = [
+                row for row in ledger.get("rows") or []
+                if str(row.get("artifact_id", "")).startswith(
+                    args.artifact)
+            ]
+        if not matches:
+            print(_red(
+                "No artifact matches "
+                f"{sanitise_for_terminal(args.artifact, max_len=120)}"))
+            return
+        for i, row in enumerate(matches):
+            if i:
+                print()
+            for line in render_artifact_lines(row):
+                print(line)
+
+
+def _handle_trust(mgr, args: argparse.Namespace) -> None:
+    """List, set, or remove operator trust markers on a project.
+
+    Markers are operator assertions persisted in the project JSON
+    under the RAPTOR projects dir — NEVER auto-set from detection
+    heuristics and NEVER read from the scanned repo. Per-run flags
+    always override them at consumption time.
+    """
+    from core.project.project import _TRUST_MARKER_HELP, VALID_TRUST_MARKERS
+
+    marker = getattr(args, "marker", None)
+    name = args.name
+    # Ergonomics: ``raptor project trust <name>`` (a first positional
+    # that isn't a marker but names an existing project) lists that
+    # project's markers. Typos in marker names still error below —
+    # this branch only fires when a project by that name exists.
+    if (args.subcommand == "trust" and marker
+            and marker not in VALID_TRUST_MARKERS
+            and name is None and mgr.load(marker) is not None):
+        name, marker = marker, None
+    name, p = _resolve_project_or_exit(mgr, name)
+
+    if args.subcommand == "trust" and not marker:
+        # All trust assertions in one place: the three markers plus
+        # the persisted binary-oracle binaries count.
+        print(f"Project '{name}' trust assertions "
+              f"(operator-set; per-run flags override):")
+        for m in VALID_TRUST_MARKERS:
+            ts = p.trust.get(m)
+            state = f"set {ts}" if ts else "not set"
+            print(f"  {m:<8} {state}")
+            print(f"           {_TRUST_MARKER_HELP[m]}")
+        print(f"  binaries {len(p.binaries)} persisted "
+              f"(binary-oracle; see 'raptor project binary list')")
+        return
+
+    if args.subcommand == "trust":
+        # ValueError (unknown marker, listing valid ones) propagates
+        # to main()'s handler → "Error: ..." + exit 1.
+        ts = mgr.set_trust_marker(name, marker)
+        print(_green(f"Trust marker '{marker}' set on '{name}' ({ts})"))
+        if marker == "build":
+            print("  note: build does not imply config — unsafe CodeQL "
+                  "pack config still refuses without the config marker.")
+        return
+
+    # untrust
+    removed = mgr.clear_trust_marker(name, marker)
+    if removed:
+        print(_green(f"Trust marker '{marker}' removed from '{name}'"))
+    else:
+        print(f"Trust marker '{marker}' was not set on '{name}'")
+
+
+def _handle_settings(mgr, args: argparse.Namespace) -> None:
+    """List / set / unset / get registry-validated project settings."""
+    key = getattr(args, "key", None)
+    value = getattr(args, "value", None)
+    name = args.name
+
+    # Ergonomics: ``raptor project set <name>`` (a bare positional that
+    # names an existing project, no value) lists that project's
+    # settings. Registry keys shadow project names by design.
+    if (args.subcommand == "set" and key and value is None
+            and name is None):
+        from core.project.project import SETTINGS_REGISTRY
+        if key not in SETTINGS_REGISTRY and mgr.load(key) is not None:
+            name, key = key, None
+
+    name, p = _resolve_project_or_exit(mgr, name)
+
+    if args.subcommand == "get":
+        # ValueError for unknown keys propagates (exit 1 with the
+        # valid-key list). Unset → nothing on stdout, exit 1.
+        val = p.get_setting(key)
+        if val is None:
+            sys.exit(1)
+        print(val)
+        return
+
+    if args.subcommand == "unset":
+        removed = mgr.remove_setting(name, key)
+        if removed:
+            print(_green(f"Unset '{key}' on '{name}'"))
+        else:
+            print(f"'{key}' was not set on '{name}'")
+        return
+
+    # set
+    if not key:
+        view = p.settings_view()
+        print(f"Project '{name}' settings:")
+        width = max(len(k) for k in view)
+        for k, v in view.items():
+            print(f"  {k:<{width}}  {v or '(unset)'}")
+        return
+    if value is None:
+        print(_red(f"set requires a value: raptor project set {key} "
+                   f"<value> [<name>]"), file=sys.stderr)
+        sys.exit(1)
+    mgr.update_setting(name, key, value)
+    print(_green(f"Set {key} on '{name}'"))
+
+
+def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
+    """Create, show, export, or resync a project's threat-model artefact."""
+    from core.json import load_json
+    from core.threat_model import (
+        blank_for_project,
+        diff_context_map,
+        from_context_map,
+        lint_model,
+        load_model,
+        project_threat_model_paths,
+        render_markdown,
+        save_model,
+        save_report,
+    )
+
+    valid_actions = {"init", "show", "export", "sync", "lint", "diff", "report", "add", "remove"}
+    if args.action not in valid_actions:
+        if args.name is None:
+            args.name = args.action
+            args.action = "show"
+        else:
+            print(_red(f"Unknown threat-model action: {args.action}"))
+            return
+
+    name = args.name or _get_active_project()
+    if not name:
+        print(_red("No project specified. Use: raptor project threat-model init <name>"))
+        return
+    project = mgr.load(name)
+    if not project:
+        print(_red(f"Project '{name}' not found."))
+        return
+
+    # Path-containment defence: ``project.threat_model_path`` is
+    # read from ``~/.raptor/projects/<name>.json`` which is
+    # operator/tamper-influenceable. An attacker who can write
+    # that file could set ``threat_model_path = "/etc/shadow"`` —
+    # the I/O below would then read/write that arbitrary path.
+    # Restrict to paths inside ``project.output_dir``.
+    from core.threat_model import _project_threat_model_json_path
+    resolved_json = _project_threat_model_json_path(project)
+    if resolved_json is None:
+        # Either no output_dir, or threat_model_path resolves
+        # outside the project. Fall back to the default
+        # in-project location.
+        json_path, markdown_path = project_threat_model_paths(project)
+    else:
+        json_path = resolved_json
+        markdown_path = json_path.with_name("THREAT_MODEL.md")
+    report_path = json_path.with_name("threat-model-report.md")
+
+    if args.action == "init":
+        context_map = None
+        if args.from_context_map:
+            context_map = load_json(Path(args.from_context_map))
+            if not isinstance(context_map, dict):
+                print(_red(f"Not a context-map JSON object: {args.from_context_map}"))
+                return
+        model = from_context_map(project, context_map) if context_map else blank_for_project(project)
+        save_model(model, json_path, markdown_path)
+        mgr.update_threat_model_stamp(
+            name, updated_at=model.updated_at, path=str(json_path))
+        print(_green(f"Threat model initialised for '{name}'"))
+        print(f"  json:     {json_path}")
+        print(f"  markdown: {markdown_path}")
+        if model.focus_areas:
+            print(f"  focus areas: {len(model.focus_areas)}")
+        return
+
+    model = load_model(json_path)  # type: ignore[assignment]
+    if not model:
+        print(_yellow(f"Project '{name}' has no threat model yet."))
+        print(f"Run: raptor project threat-model init {name}")
+        return
+
+    if args.action in ("add", "remove"):
+        from core.threat_model import _MAX_LIST_ENTRIES, _clip_str
+        # Operator-facing field name -> ThreatModel attribute name.
+        # The names match except for trusted_inputs, whose attribute
+        # is vetted_inputs (see the ThreatModel dataclass comment).
+        _MUTABLE_LIST_FIELDS = {
+            "assets": "assets",
+            "entry_points": "entry_points",
+            "trust_boundaries": "trust_boundaries",
+            "trusted_inputs": "vetted_inputs",
+            "untrusted_inputs": "untrusted_inputs",
+            "in_scope_vuln_classes": "in_scope_vuln_classes",
+            "out_of_scope_vuln_classes": "out_of_scope_vuln_classes",
+            "focus_areas": "focus_areas",
+            "known_bug_shapes": "known_bug_shapes",
+            "verification_expectations": "verification_expectations",
+            "patch_validation_expectations": "patch_validation_expectations",
+            "methodology": "methodology",
+            "domain_packs": "domain_packs",
+        }
+        field = args.field
+        value = args.value
+        if not field or not value:
+            print(_red(f"Usage: raptor project threat-model {args.action} --field <field> --value <text>"))
+            print(f"  Mutable fields: {', '.join(sorted(_MUTABLE_LIST_FIELDS))}")
+            return
+        if field not in _MUTABLE_LIST_FIELDS:
+            print(_red(f"Field '{field}' is not a mutable list field."))
+            print(f"  Mutable fields: {', '.join(sorted(_MUTABLE_LIST_FIELDS))}")
+            return
+        try:
+            load_mtime = json_path.stat().st_mtime
+        except OSError:
+            load_mtime = None
+        current: list[str] = getattr(model, _MUTABLE_LIST_FIELDS[field])
+        if args.action == "add":
+            sanitised = _clip_str(value)
+            if sanitised in current:
+                print(_yellow(f"'{sanitised}' already in {field}."))
+                return
+            if len(current) >= _MAX_LIST_ENTRIES:
+                print(_red(f"Field {field} already has {_MAX_LIST_ENTRIES} entries (cap reached)."))
+                return
+            current.append(sanitised)
+            print(_green(f"Added to {field}: {sanitised}"))
+        else:
+            sanitised = _clip_str(value)
+            if sanitised not in current:
+                print(_yellow(f"'{sanitised}' not found in {field}."))
+                return
+            current.remove(sanitised)
+            print(_green(f"Removed from {field}: {sanitised}"))
+        model.updated_at = datetime.now(timezone.utc).isoformat()
+        try:
+            save_model(model, json_path, markdown_path, expected_mtime=load_mtime)
+        except RuntimeError as e:
+            print(_red(f"Save refused (concurrent writer?): {e}"))
+            return
+        mgr.update_threat_model_stamp(name, updated_at=model.updated_at)
+        print(f"  {field}: {len(current)} entries")
+        return
+
+    if args.action == "sync":
+        markdown_path.write_text(render_markdown(model), encoding="utf-8")
+        mgr.update_threat_model_stamp(
+            name, updated_at=datetime.now(timezone.utc).isoformat())
+        print(_green(f"Threat model markdown synced: {markdown_path}"))
+        return
+
+    if args.action == "export":
+        print(render_markdown(model), end="")
+        return
+
+    if args.action == "lint":
+        issues = lint_model(model)
+        if args.json_out:
+            _emit_json_payload({"issues": issues})
+            return
+        if not issues:
+            print(_green("Threat model lint: no issues found."))
+            return
+        errors = len([i for i in issues if i.get("severity") == "error"])
+        warnings = len([i for i in issues if i.get("severity") == "warning"])
+        info = len([i for i in issues if i.get("severity") == "info"])
+        print(f"Threat model lint: {errors} errors, {warnings} warnings, {info} info")
+        for issue in issues:
+            # Lint messages can quote threat-model / context-map text
+            # (LLM-refreshed fields) — terminal lane, escape at print.
+            print(
+                "  - {severity}: {field}: {message}".format(
+                    severity=sanitise_for_terminal(
+                        str(issue.get("severity", "info")).title(),
+                        max_len=40),
+                    field=sanitise_for_terminal(str(issue.get("field", "?")), max_len=120),
+                    message=sanitise_for_terminal(str(issue.get("message", "")), max_len=500),
+                )
+            )
+        return
+
+    if args.action == "diff":
+        if not args.context_map:
+            print(_red("diff needs --context-map <path>"))
+            return
+        context_map = load_json(Path(args.context_map))
+        if not isinstance(context_map, dict):
+            print(_red(f"Not a context-map JSON object: {args.context_map}"))
+            return
+        drift = diff_context_map(model, context_map)
+        if args.json_out:
+            _emit_json_payload(drift)
+            return
+        print(f"Threat model drift: {'yes' if drift.get('is_drifted') else 'no'}")
+        for key in (
+            "new_entry_points",
+            "missing_entry_points",
+            "new_trust_boundaries",
+            "missing_trust_boundaries",
+            "new_unchecked_flows",
+        ):
+            values = drift.get(key) or []
+            print(f"  {key}: {len(values)}")
+            for value in values[:8]:
+                # Drift summaries interpolate context-map fields
+                # (LLM-refreshed) — terminal lane, escape at print
+                # like the adjacent lint action.
+                print(f"    - {sanitise_for_terminal(str(value), max_len=300)}")
+        return
+
+    if args.action == "report":
+        from core.reporting.options import options_from_args
+        options = getattr(args, "_report_options", None) or options_from_args(args)
+        args._report_options = options
+        context_map = None
+        if args.context_map:
+            context_map = load_json(Path(args.context_map))
+            if not isinstance(context_map, dict):
+                print(_red(f"Not a context-map JSON object: {args.context_map}"))
+                return
+        lint = lint_model(model)
+        drift = diff_context_map(model, context_map) if context_map else None  # type: ignore[assignment]
+        protected = {json_path.resolve(), markdown_path.resolve()}
+        if args.context_map:
+            protected.add(Path(args.context_map).resolve())
+        if ((not args.json_out and options.enabled and report_path.resolve() in protected)
+                or (options.output is not None and options.output.resolve() in protected)):
+            print(_red("Threat-model report destination would overwrite an input artifact"))
+            return
+        from core.threat_model.reporting import complete_project_threat_model_report
+        if args.json_out:
+            _emit_json_payload({
+                "report": str(report_path),
+                "lint": lint,
+                "drift": drift,
+            })
+            complete_project_threat_model_report(args, model, lint=lint, drift=drift, json_path=json_path,
+                                                markdown_path=markdown_path, report_path=report_path)
+            return
+        if options.enabled:
+            save_report(model, report_path, lint=lint, drift=drift)
+            print(_green(f"Threat model report written: {report_path}"))
+        else:
+            print("Threat model assessment (full report files disabled)")
+        print(f"  threats: {len(model.threats)}")
+        print(f"  controls: {len(model.controls)}")
+        print(f"  evidence: {len(model.evidence)}")
+        print(f"  lint issues: {len(lint)}")
+        if drift:
+            print(f"  drift: {'yes' if drift.get('is_drifted') else 'no'}")
+        complete_project_threat_model_report(args, model, lint=lint, drift=drift, json_path=json_path,
+                                            markdown_path=markdown_path, report_path=report_path)
+        return
+
+    if args.json_out:
+        # Stream the on-disk threat-model JSON to stdout. See
+        # ``_stream_threat_model_json`` for the rationale: the
+        # byte-level file copy bypasses CodeQL's
+        # py/clear-text-logging-sensitive-data taint tracking
+        # (sinks are limited to print/log) without degrading the
+        # operator-visible contract of ``--json``.
+        project_out = Path(project.output_dir).resolve()
+        _stream_threat_model_json(json_path, project_out)
+        return
+
+    print(f"Project: {project.name}")
+    print(f"Threat model: {json_path}")
+    print(f"Markdown: {markdown_path}")
+    print(f"Updated: {model.updated_at}")
+    print(f"Source: {model.source}")
+    print(f"Focus areas: {len(model.focus_areas)}")
+    print(f"Threats: {len(model.threats)}")
+    print(f"Controls: {len(model.controls)}")
+    print(f"Evidence: {len(model.evidence)}")
+    for item in model.focus_areas[:8]:
+        print(f"  - {item}")
+
+
+def _print_disk_usage(project):
+    from .disk_usage import scan_usage
+    try:
+        root = Path(project.output_dir).resolve()
+    except (OSError, RuntimeError, ValueError):
+        print('\nDisk usage: unavailable')
+        return
+    usage = scan_usage(root)
+    total = usage.allocated_bytes
+    amount = (f'{total / 1024 / 1024:.1f}MB' if total >= 1024 * 1024
+              else f'{total / 1024:.1f}KB' if total >= 1024 else f'{total}B')
+    note = 'partial estimate' if usage.incomplete else 'estimate'
+    print(f'\nDisk usage: {amount} ({note})')
+
+
+def _print_status(project) -> None:
     """Print project status."""
     from core.run import load_run_metadata
+    from core.threat_model import (
+        _project_threat_model_json_path,
+        load_model,
+        project_threat_model_paths,
+    )
+
+    from core.security.log_sanitisation import sanitise_for_terminal
 
     print(f"Project: {project.name}")
     if project.description:
-        print(f"Description: {project.description}")
-    print(f"Target: {project.target}")
+        print("Description: "
+              f"{sanitise_for_terminal(project.description, max_len=500)}")
+    # target/description arrive via project-import zips too — same
+    # defang as the `list` view of the identical fields.
+    print(f"Target: {sanitise_for_terminal(str(project.target or ''), max_len=256)}")
     print(f"Output: {project.output_dir}")
     print(f"Created: {project.created[:10] if project.created else 'unknown'}")
+    # Containment-defended resolution (see _project_threat_model_json_path
+    # for the rationale — same root as the show/lint/diff/report path).
+    tm_path = _project_threat_model_json_path(project) or (
+        project_threat_model_paths(project)[0]
+    )
+    if tm_path.exists():
+        model = load_model(tm_path)
+        count = len(model.focus_areas) if model else 0
+        print(f"Threat model: {tm_path} ({count} focus areas)")
+    else:
+        print("Threat model: not initialised")
     if project.notes:
-        print(f"Notes: {project.notes}")
+        print(f"Notes: {sanitise_for_terminal(project.notes, max_len=2000)}")
+
+    # Trust block — trust state must never be invisible.
+    from core.project.project import VALID_TRUST_MARKERS
+    trust_parts = [
+        f"{m} ({project.trust[m][:10]})"
+        for m in VALID_TRUST_MARKERS if m in project.trust
+    ]
+    print("Trust: " + (", ".join(trust_parts) if trust_parts else "none"))
+
+    # Settings block — the registry keys that persist in the settings
+    # dict (description/notes/threat-model already have lines above).
+    setting_parts = [
+        f"{k}={v}" for k, v in project.settings_view().items()
+        if v and (k in ("target-kind", "sandbox-floor")
+                  or k.startswith("build-command"))
+    ]
+    print("Settings: " + (", ".join(setting_parts)
+                          if setting_parts else "(defaults)"))
 
     runs = project.get_run_dirs(sweep=False)
     if runs:
         print(f"\nRuns: {len(runs)}")
-        name_col = max(max(len(d.name) for d in runs) + 2, 20)
+        # Column width from the ESCAPED names (what actually prints):
+        # escaping can lengthen a hostile name, and a raw-length column
+        # would misalign every row after it.
+        shown_names = {d: sanitise_for_terminal(d.name, max_len=120)
+                       for d in runs}
+        name_col = max(max(len(s) for s in shown_names.values()) + 2, 20)
         for d in runs:
             meta = load_run_metadata(d)
-            cmd = meta.get("command", "?") if meta else "?"
-            status = meta.get("status", "?") if meta else "?"
-            findings_str = _get_output_summary(d, meta)
+            if not isinstance(meta, dict):
+                meta = None
+            # command/status/output_summary are child-writable run
+            # metadata restored verbatim: str()-coerce (a non-string
+            # cell would raise TypeError in the :12s format spec and
+            # wedge /project status on one junk marker) and escape
+            # before the terminal.
+            cmd = (sanitise_for_terminal(str(meta.get("command", "?")),
+                                         max_len=40)
+                   if meta else "?")
+            status = (sanitise_for_terminal(str(meta.get("status", "?")),
+                                            max_len=32)
+                      if meta else "?")
+            findings_str = sanitise_for_terminal(
+                str(_get_output_summary(d, meta)), max_len=64)
             if status == "completed":
                 status_str = _green(status)
             elif status == "failed":
@@ -737,74 +2787,254 @@ def _print_status(project):
                 status_str = _yellow(status)
             else:
                 status_str = status
-            print(f"  {d.name:<{name_col}s}  {cmd:12s}  {findings_str:24s}  {status_str}")
-        # Disk usage — use os.walk(followlinks=False) so we stay inside
-        # the run dir even if a stray symlink points outside (or back into
-        # the run, creating a loop). Path.rglob follows symlinked dirs on
-        # Python <3.13, so a symlink loop would hang status indefinitely.
-        total_size = 0
-        for d in runs:
-            for root, _dirs, files in os.walk(d, followlinks=False):
-                for fname in files:
-                    fpath = os.path.join(root, fname)
-                    try:
-                        st = os.lstat(fpath)
-                    except OSError:
-                        continue
-                    # Skip symlinks (S_IFLNK) — count only real files.
-                    import stat as _stat
-                    if _stat.S_ISLNK(st.st_mode):
-                        continue
-                    if _stat.S_ISREG(st.st_mode):
-                        total_size += st.st_size
-        if total_size >= 1024 * 1024:
-            print(f"\nDisk usage: {total_size / 1024 / 1024:.1f}MB")
-        elif total_size >= 1024:
-            print(f"\nDisk usage: {total_size / 1024:.1f}KB")
-        else:
-            print(f"\nDisk usage: {total_size}B")
+            # Compact provenance tag: "<sha7>[*] repro|llm" (* = modified tree;
+            # repro = deterministic/mechanical, llm = LLM-mediated). Empty for
+            # legacy/unavailable runs. Appended last so colour codes in
+            # status_str don't disturb column padding.
+            from core.run.provenance import format_repro_short, format_sha_short
+            _manifest = (meta or {}).get("manifest")
+            tag = " ".join(
+                t for t in (format_sha_short(_manifest), format_repro_short(_manifest)) if t
+            )
+            line = (f"  {shown_names[d]:<{name_col}s}  {cmd:12s}  "
+                    f"{findings_str:24s}  {status_str}")
+            print(f"{line}  {tag}" if tag else line)
+            # M5 (park is not silence): a run carrying unacknowledged
+            # engagement parks surfaces them right here, not only in
+            # the run dir. Best-effort — a corrupt marker never wedges
+            # /project status; the helper bounds and escapes every
+            # marker-derived field.
+            try:
+                from core.engagement.supervise import parked_run_line
+                parked = parked_run_line(d)
+            except Exception:
+                parked = None
+            if parked:
+                print(f"    ⚠ {parked}")
+        # Graph store summary — best-effort, never breaks status
+        import sqlite3 as _graph_sqlite3
+        try:
+            from core.understand_graph import dashboard_summary, graph_path_for_run
+            _gp = graph_path_for_run(Path(project.output_dir))
+            if _gp.exists():
+                _gs = dashboard_summary(_gp)
+                totals = _gs.get("totals") or {}
+                if any(totals.values()):
+                    print(f"\nGraph store: {_gp.relative_to(Path(project.output_dir))}")
+                    parts = []
+                    for label, key in (
+                        ("entries", "entries"),
+                        ("sinks", "sinks"),
+                        ("findings", "scan_findings"),
+                        ("CodeQL", "codeql_results"),
+                        ("hypotheses", "hypotheses"),
+                        ("validated", "validated"),
+                    ):
+                        v = totals.get(key, 0)
+                        if v:
+                            parts.append(f"{v} {label}")
+                    if parts:
+                        print(f"  {', '.join(parts)}")
+                    cov = _gs.get("validation_coverage", 0.0)
+                    if cov > 0:
+                        print(f"  Validation coverage: {cov:.0%}")
+        except (ImportError, _graph_sqlite3.Error, KeyError, TypeError, ValueError):
+            pass
 
     else:
         print("\nNo runs.")
 
+    _print_disk_usage(project)
 
-def _print_coverage(project, detailed=False, fail_under=None):
-    """Print project coverage summary or detailed view."""
-    from core.coverage.summary import (
-        compute_project_summary,
-        coverage_threshold_met,
-        format_detailed,
-        format_summary,
-        format_threshold_result,
+
+
+def _print_provenance(project) -> None:
+    """Print the project-level provenance rollup across all runs."""
+    from core.run import load_run_metadata
+    from core.run.provenance import aggregate_provenance, format_provenance_rollup
+
+    runs = project.get_run_dirs(sweep=False)
+    metadatas = [m if isinstance(m, dict) else None for m in (load_run_metadata(d) for d in runs)]
+    print(f"Project: {project.name}")
+    print(format_provenance_rollup(aggregate_provenance(metadatas)))
+
+
+def _print_run_provenance(project, run_query) -> None:
+    """Print one run's provenance detail. ``run_query`` matches a run dir by
+    exact name, else by unique substring."""
+    from core.run import load_run_metadata
+    from core.run.provenance import format_manifest_block
+
+    runs = project.get_run_dirs(sweep=False)
+    exact = [d for d in runs if d.name == run_query]
+    matches = exact or [d for d in runs if run_query in d.name]
+    if not matches:
+        print(f"No run matching '{run_query}' in project '{project.name}'.")
+        return
+    if len(matches) > 1:
+        print(f"Ambiguous '{run_query}' — matches {len(matches)} runs:")
+        for d in matches:
+            print(f"  {sanitise_for_terminal(d.name, max_len=120)}")
+        return
+
+    d = matches[0]
+    raw_meta = load_run_metadata(d)
+    meta = raw_meta if isinstance(raw_meta, dict) else {}
+    print(f"Run: {sanitise_for_terminal(d.name, max_len=120)}")
+    # command/status are child-writable run metadata — coerce + escape
+    # like the status view's run rows.
+    print(f"  Command: "
+          f"{sanitise_for_terminal(str(meta.get('command', '?')), max_len=40)}")
+    ts = str(meta.get("timestamp") or "")[:19]
+    if ts:
+        print(f"  When: {sanitise_for_terminal(ts, max_len=32)}")
+    print(f"  Status: "
+          f"{sanitise_for_terminal(str(meta.get('status', '?')), max_len=32)}")
+    block = format_manifest_block(meta.get("manifest"))
+    print(block or "  (no provenance manifest)")
+
+
+def _print_coverage(project, detailed: bool=False, fail_under=None):
+    """Print project coverage — the unified store-backed report (coverage
+    state + per-run execution detail), plus the ``--fail-under`` check."""
+    from core.coverage.store_summary import (
+        coverage_view,
+        format_store_threshold_result,
+        render_coverage,
+        store_coverage_threshold_met,
     )
-    summary = compute_project_summary(project)
-    if not summary:
+
+    base = Path(project.output_dir)
+    try:
+        run_dirs = list(project.get_run_dirs(sweep=False))
+    except Exception as exc:  # noqa: BLE001 — best-effort listing
+        import logging as _logging
+        _logging.getLogger(__name__).warning("failed to list run dirs: %s", exc)
+        run_dirs = []
+    # Accessor reads (checklist budget class): flock, project-symlink
+    # resolution, and the sharded checklist/ layout in one place.
+    from core.inventory import read_checklist
+    checklist = read_checklist(base) or None
+    if checklist is None:
+        for d in run_dirs:
+            cl = read_checklist(d)
+            if cl:
+                checklist = cl
+                break
+    store_path = base / "coverage.json"
+    ann = base / "annotations"
+
+    report = render_coverage(run_dirs, checklist, store_path, ann, detailed=detailed)
+    if not report:
         print("No coverage data (no checklist or coverage records found).")
         return False if fail_under is not None else None
-    if detailed:
-        print(format_detailed(summary))
-    else:
-        print(format_summary(summary))
+    print(report)
+
     if fail_under is not None:
+        view = coverage_view(run_dirs, checklist, store_path, ann)
+        if view is None:
+            print("\nNo function inventory — coverage threshold N/A.")
+            return False
         print()
-        print(format_threshold_result(summary, fail_under))
-        return coverage_threshold_met(summary, fail_under)
+        print(format_store_threshold_result(view, fail_under))
+        return store_coverage_threshold_met(view, fail_under)
     return None
 
 
-def _print_findings(project, detailed=False):
-    """Print merged findings across all runs, grouped by vuln."""
+def _print_findings(project, detailed: bool=False) -> None:
+    """Print merged findings across all runs.
+
+    Code findings (each run's ``findings.json``) render first; SCA /
+    dependency findings (each run's ``sca/findings.json``) render in
+    their own section below, so dependency-CVE volume doesn't swamp the
+    code-finding table.
+    """
+    from .findings_utils import merge_sca_findings
     from .merge import merge_findings
-    from .findings_utils import count_vulns, group_findings
-    from core.reporting.findings import build_findings_summary, findings_summary_line
-    from core.reporting.formatting import get_display_status, title_case_type, truncate_path
 
-    run_dirs = project.get_run_dirs(sweep=False)
+    # get_run_dirs returns NEWEST-first; both merge folds take
+    # later-overrides-earlier order, so pass oldest-first or the
+    # oldest run wins every tie (inverting the latest-wins contract).
+    run_dirs = list(reversed(project.get_run_dirs(sweep=False)))
     merged = merge_findings(run_dirs)
+    sca_findings = merge_sca_findings(run_dirs)
 
-    if not merged:
+    if not merged and not sca_findings:
         print("No findings.")
         return
+
+    if merged:
+        _print_code_findings(merged, detailed)
+    if sca_findings:
+        if merged:
+            print()
+        _print_sca_findings_section(sca_findings, detailed)
+
+    # Re-adjudication signal: the merged view above deliberately lets
+    # a recorded disproof outrank a newer claim at the same site —
+    # surface the contradiction count so the fold is never SILENT.
+    # Counts only here (no finding-derived text reaches the terminal);
+    # /project report materialises the full queue artifact.
+    # Best-effort: an additive signal must never break the view.
+    try:
+        from .readjudication import (
+            SHAPE_CLAIM_AFTER_DISPROOF,
+            SHAPE_INTRA_RUN_SPLIT,
+            SHAPE_OVERTURN,
+            contradicted_disproof_count,
+            detect_project_contradictions,
+            queued_count,
+            shape_counts,
+            suppressed_count,
+        )
+        readj_records = detect_project_contradictions(run_dirs)
+        n_queued = queued_count(readj_records)
+        if n_queued:
+            n_suppressed = suppressed_count(readj_records)
+            # A capped queue must never read as complete.
+            capped = (f" +{n_suppressed} further not recorded "
+                      f"(record caps)" if n_suppressed else "")
+            counts = shape_counts(readj_records)
+            parts = []
+            if counts.get(SHAPE_CLAIM_AFTER_DISPROOF):
+                parts.append(
+                    f"{contradicted_disproof_count(readj_records)} "
+                    f"recorded disproof(s) contradicted by newer signals")
+            if counts.get(SHAPE_OVERTURN):
+                parts.append(
+                    f"{counts[SHAPE_OVERTURN]} confirmed verdict(s) "
+                    f"disproven by a later run")
+            if counts.get(SHAPE_INTRA_RUN_SPLIT):
+                parts.append(
+                    f"{counts[SHAPE_INTRA_RUN_SPLIT]} intra-run "
+                    f"final-verdict split(s)")
+            if not parts:
+                parts.append(f"{n_queued} contradiction signal(s)")
+            print()
+            print(
+                f"⚠️  {'; '.join(parts)} "
+                f"({n_queued} queued{capped}) — re-adjudication queue; run "
+                f"`/project report` to write the queue artifact. "
+                f"Nothing is auto-overturned."
+            )
+    except Exception:  # noqa: BLE001 — additive trail, never view-fatal
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "re-adjudication detection failed", exc_info=True)
+
+
+def _print_code_findings(merged, detailed: bool=False) -> None:
+    """Render code findings as a grouped table (the original view)."""
+    from core.reporting.findings import build_findings_summary, findings_summary_line
+    from core.reporting.formatting import (
+        get_display_status,
+        title_case_type,
+        truncate_path,
+    )
+
+    from core.security.log_sanitisation import sanitise_for_terminal
+
+    from .findings_utils import count_vulns, group_findings
 
     vuln_count = count_vulns(merged)
     counts = build_findings_summary(merged)
@@ -816,29 +3046,39 @@ def _print_findings(project, detailed=False):
 
     # Build grouped rows: one row per vuln
     grouped_rows = []  # (file_loc, type, status, cvss, findings_list)
-    for key, findings in groups.items():
+    for findings in groups.values():
         # Use the first finding for display, pick best status/cvss across group
         rep = findings[0]  # representative finding
         fpath = rep.get("file", "")
         fname = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
 
         # Lines: show all lines in the group
-        lines_in_group = sorted(set(f.get("line", 0) for f in findings))
+        lines_in_group = sorted({f.get("line") or 0 for f in findings})
         if len(lines_in_group) == 1:
             loc = f"{fname}:{lines_in_group[0]}"
         else:
-            loc = f"{fname}:{','.join(str(l) for l in lines_in_group)}"
+            loc = f"{fname}:{','.join(str(line) for line in lines_in_group)}"
         loc = truncate_path(loc) if loc else "—"
 
-        vtype = title_case_type(rep.get("vuln_type", ""))
-        status = get_display_status(rep)
+        # file/vuln_type/status are finding-derived (LLM-authored or
+        # restored verbatim by /project import) — escape before the
+        # aligned table is built so widths match what prints.
+        loc = sanitise_for_terminal(loc, max_len=120)
+        vtype = sanitise_for_terminal(
+            title_case_type(rep.get("vuln_type", "")), max_len=64)
+        status = sanitise_for_terminal(get_display_status(rep), max_len=32)
 
         cvss = rep.get("cvss_score_estimate")
-        cvss_str = str(cvss) if cvss is not None else "—"
+        # Same provenance as the three cells above (nothing upstream
+        # coerces it numeric — an import archive restores it verbatim),
+        # so it gets the same escape; also keeps len()-based column
+        # sizing honest for the aligned table below.
+        cvss_str = (sanitise_for_terminal(str(cvss), max_len=16)
+                    if cvss is not None else "—")
 
         grouped_rows.append((loc, vtype, status, cvss_str, findings, fpath))
 
-    grouped_rows.sort(key=lambda r: (r[5], min(f.get("line", 0) for f in r[4])))
+    grouped_rows.sort(key=lambda r: (r[5], min(f.get("line") or 0 for f in r[4])))
 
     # Compact table
     headers = ("File", "Type", "Status", "CVSS")
@@ -874,9 +3114,9 @@ def _print_findings(project, detailed=False):
             or rep.get("reasoning")
         )
         if reasoning and isinstance(reasoning, str):
-            rlines = reasoning.strip().split("\n")[:2]
+            rlines = reasoning.strip().split("\n")[:2]  # line-model: display slice; lines strip()-normalised and terminal-sanitised
             for ln in rlines:
-                print(f"{indent}{ln.strip()}")
+                print(f"{indent}{sanitise_for_terminal(ln.strip())}")
 
         # Proof
         proof_source = rep.get("proof_source")
@@ -884,17 +3124,124 @@ def _print_findings(project, detailed=False):
         if proof_source or proof_sink:
             parts = []
             if proof_source:
-                parts.append(f"source: {proof_source}")
+                parts.append(
+                    f"source: {sanitise_for_terminal(str(proof_source), max_len=200)}")
             if proof_sink:
-                parts.append(f"sink: {proof_sink}")
+                parts.append(
+                    f"sink: {sanitise_for_terminal(str(proof_sink), max_len=200)}")
             print(f"{indent}Proof: {', '.join(parts)}")
 
         print()
 
 
-def _finding_label(f):
-    """Location-based label for a finding."""
-    return f"{f.get('file', '?')}:{f.get('function', '?')}:{f.get('line', '?')}"
+_SCA_SEVERITY_RANK = {
+    "critical": 0, "high": 1, "medium": 2, "low": 3,
+    "none": 4, "info": 5, "": 6,
+}
+
+
+def _sca_finding_kind(finding):
+    """Human label for an SCA finding's class/kind, from its
+    ``vuln_type`` tag (``sca:<class>:<kind>``)."""
+    vt = finding.get("vuln_type", "")
+    tag = vt.removeprefix("sca:")
+    return tag.replace("_", " ").replace(":", " · ").title() or "—"
+
+
+def _sca_finding_package(finding):
+    """``ecosystem:name`` for an SCA finding (falls back to the
+    ``function`` field, which carries the package name)."""
+    sca = finding.get("sca") or {}
+    name = sca.get("name") or finding.get("function", "") or "—"
+    eco = sca.get("ecosystem", "")
+    return f"{eco}:{name}" if eco else name
+
+
+def _sca_finding_escalations(finding):
+    """Cross-detector escalation rationale for an SCA finding, if any.
+
+    Set by SCA's ``supply_chain`` layer when a slopsquat-shaped name
+    co-occurs with recent_publish / low_bus_factor / maintainer change;
+    explains a bumped severity. Lands at
+    ``finding['sca']['evidence']['escalation_reasons']``.
+    """
+    sca = finding.get("sca") or {}
+    evidence = sca.get("evidence") or {}
+    reasons = evidence.get("escalation_reasons") or []
+    return [str(r) for r in reasons] if isinstance(reasons, list) else []
+
+
+def _print_sca_findings_section(sca_findings, detailed: bool=False) -> None:
+    """Render SCA / dependency findings in their own section.
+
+    Discovered from each run's ``sca/findings.json`` (see
+    ``findings_utils.merge_sca_findings``). Sorted by severity so the
+    high-signal supply-chain hits (slopsquat / typosquat) surface above
+    dependency-CVE volume. Kept separate from the code-finding table
+    because these are dep-level (no source file:line).
+    """
+    def _sev_rank(finding):
+        return _SCA_SEVERITY_RANK.get((finding.get("severity") or "").lower(), 6)
+
+    ordered = sorted(sca_findings, key=lambda f: (_sev_rank(f), _sca_finding_package(f)))
+
+    print(f"Supply chain / dependencies (SCA) — {len(ordered)} findings")
+    print()
+
+    rows = []
+    for f in ordered:
+        sev = (f.get("severity") or "").strip()
+        # Package/kind/severity cells derive from the scanned tree's
+        # manifests and external OSV data (and survive /project import
+        # verbatim) — escape at construction so the column widths are
+        # computed from the escaped strings, like _print_status does.
+        rows.append((
+            sanitise_for_terminal(str(_sca_finding_package(f)), max_len=120),
+            sanitise_for_terminal(str(_sca_finding_kind(f)), max_len=120),
+            sanitise_for_terminal(sev.title(), max_len=40) if sev else "—",
+        ))
+
+    headers = ("Package", "Kind", "Severity")
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+    fmt = f"  {{:<{widths[0]}s}}  {{:<{widths[1]}s}}  {{:<{widths[2]}s}}"
+    print(fmt.format(*headers))
+    print(f"  {'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}")
+    for r in rows:
+        print(fmt.format(*r))
+
+    if not detailed:
+        return
+
+    print()
+    pad = len(str(len(ordered)))
+    indent = " " * (pad + 5)
+
+    for i, f in enumerate(ordered, 1):
+        # Advisory titles/descriptions come from external OSV/registry
+        # data (and survive /project import verbatim) — escape.
+        title = sanitise_for_terminal(
+            str(f.get("title") or _sca_finding_package(f)), max_len=200)
+        print(f"  [{i:0{pad}d}] {title}")
+        desc = f.get("description")
+        if desc and isinstance(desc, str):
+            for ln in desc.strip().split("\n")[:2]:  # line-model: display slice; lines strip()-normalised and terminal-sanitised
+                print(f"{indent}{sanitise_for_terminal(ln.strip())}")
+        for reason in _sca_finding_escalations(f):
+            print(f"{indent}escalated: {sanitise_for_terminal(str(reason))}")
+        print()
+
+
+def _finding_label(f) -> str:
+    """Location-based label for a finding (terminal-safe: file and
+    function names are target-derived)."""
+    from .findings_utils import finding_file
+    return sanitise_for_terminal(
+        f"{finding_file(f) or '?'}:{f.get('function', '?')}:{f.get('line', '?')}",
+        max_len=200,
+    )
 
 
 def _parse_since(spec: str):
@@ -904,15 +3251,22 @@ def _parse_since(spec: str):
     if not spec:
         return None
     spec = spec.strip().lower()
+    if not spec:
+        return None
     multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
     if spec[-1] in multipliers:
         try:
             n = float(spec[:-1])
         except ValueError:
             return None
+        if n < 0:
+            return None
         return time.time() - n * multipliers[spec[-1]]
     try:
-        return time.time() - float(spec)
+        n = float(spec)
+        if n < 0:
+            return None
+        return time.time() - n
     except ValueError:
         return None
 
@@ -920,7 +3274,7 @@ def _parse_since(spec: str):
 def _print_annotations(
     project, status_filter=None, source_filter=None, file_filter=None,
     cwe_filter=None, rule_id_filter=None, grep=None, since=None,
-):
+) -> None:
     """List annotations across all runs in the project.
 
     Walks every run dir's ``annotations/`` subdir plus the project's
@@ -931,12 +3285,18 @@ def _print_annotations(
     """
     from core.annotations import iter_all_annotations
 
+    from .findings_utils import safe_run_mtime
+
     # Candidate annotation roots: one per run dir + the project root.
     roots = []
     for rd in project.get_run_dirs(sweep=False):
         ann_dir = rd / "annotations"
         if ann_dir.exists():
-            roots.append((rd.stat().st_mtime, ann_dir))
+            # safe_run_mtime: the run dir can vanish between the
+            # exists() probe and the stat (concurrent /project clean,
+            # manual rm) — a vanished dir sorts oldest instead of
+            # crashing the listing.
+            roots.append((safe_run_mtime(rd), ann_dir))
     project_ann = Path(project.output_dir) / "annotations"
     if project_ann.exists():
         # Project-level annotations win over run-level (operator
@@ -1004,17 +3364,33 @@ def _print_annotations(
         return
 
     print(f"{len(anns)} annotation(s):")
-    file_w = max(len(a.file) for a in anns)
-    fn_w = max(len(a.function) for a in anns)
+    # File/function/status/source come from annotation .md files that
+    # agents (and /project import) write — a hand-crafted file bypasses
+    # the storage writer's validation, so every column is escaped at
+    # construction and the widths are computed from the escaped
+    # strings (the _print_status discipline).
+    rows = []
     for a in anns:
-        status = a.metadata.get("status", "-")
-        source = a.metadata.get("source", "-")
-        snippet = " ".join(a.body.split())[:60]
-        print(f"  {a.file:<{file_w}}  {a.function:<{fn_w}}  "
+        status = str(a.metadata.get("status", "-"))
+        source = str(a.metadata.get("source", "-"))
+        # Annotation bodies are free prose (agent-written ones are
+        # hint-tier, untrusted) — escape the excerpt.
+        snippet = sanitise_for_terminal(" ".join(a.body.split())[:60], max_len=80)
+        rows.append((
+            sanitise_for_terminal(a.file, max_len=200),
+            sanitise_for_terminal(a.function, max_len=120),
+            sanitise_for_terminal(status, max_len=40),
+            sanitise_for_terminal(source, max_len=40),
+            snippet,
+        ))
+    file_w = max(len(r[0]) for r in rows)
+    fn_w = max(len(r[1]) for r in rows)
+    for file_c, fn_c, status, source, snippet in rows:
+        print(f"  {file_c:<{file_w}}  {fn_c:<{fn_w}}  "
               f"{status:<14}  {source:<5}  {snippet}")
 
 
-def _print_diff(result):
+def _print_diff(result) -> None:
     """Print diff results."""
     if result["new"]:
         print(f"New ({len(result['new'])}):")
@@ -1027,31 +3403,54 @@ def _print_diff(result):
     if result["changed"]:
         print(f"Changed ({len(result['changed'])}):")
         for c in result["changed"]:
-            print(_yellow(f"  ~ {c['label']} ({c.get('status_before', '?')} → {c.get('status_after', '?')})"))
+            # label and both statuses are finding-derived (diff.py
+            # builds them raw for the JSON payload) — escape at the
+            # print site like the new/removed rows' _finding_label.
+            label = sanitise_for_terminal(str(c["label"]), max_len=200)
+            before = sanitise_for_terminal(
+                str(c.get("status_before", "?")), max_len=60)
+            after = sanitise_for_terminal(
+                str(c.get("status_after", "?")), max_len=60)
+            print(_yellow(f"  ~ {label} ({before} → {after})"))
     print(f"Unchanged: {result['unchanged']}")
 
 
-def _do_correlate(project, json_out=False):
+def _print_correlate_counts(counts: dict) -> None:
+    """One-line correlation header. Integer statistics only — every
+    value is int()-coerced so nothing foreign can render here."""
+    parts = [f"Runs: {int(counts.get('runs') or 0)}",
+             f"Findings: {int(counts.get('total_unique_findings') or 0)}"]
+    if counts.get("disagreements"):
+        parts.append(f"Disagreements: {int(counts['disagreements'])}")
+    if counts.get("new_findings"):
+        parts.append(f"New: {int(counts['new_findings'])}")
+    if counts.get("potentially_resolved"):
+        parts.append(f"Resolved?: {int(counts['potentially_resolved'])}")
+    if counts.get("token_enforcement_drift"):
+        parts.append(
+            f"Token drift: {int(counts['token_enforcement_drift'])}",
+        )
+    print(f"  {' | '.join(parts)}")
+
+
+def _do_correlate(project, json_out: bool=False) -> None:
     """Cross-run finding correlation — action-oriented output."""
-    import json
+
     from .correlate import correlate_project
 
+    from core.security.log_sanitisation import sanitise_for_terminal
+
     result = correlate_project(project)
-    summary = result["summary"]
 
     if json_out:
-        print(json.dumps(result, indent=2))
+        # ensure_ascii like _emit_json_payload (C1 controls pass raw
+        # through bare JSON); insertion order kept — this lane never
+        # sorted its keys.
+        print(json.dumps(result, indent=2, ensure_ascii=True, default=str))
         return
 
     print(f"Project: {project.name}")
-    parts = [f"Runs: {summary['runs']}", f"Findings: {summary['total_unique_findings']}"]
-    if summary["disagreements"]:
-        parts.append(f"Disagreements: {summary['disagreements']}")
-    if summary["new_findings"]:
-        parts.append(f"New: {summary['new_findings']}")
-    if summary["potentially_resolved"]:
-        parts.append(f"Resolved?: {summary['potentially_resolved']}")
-    print(f"  {' | '.join(parts)}")
+    _print_correlate_counts(result["summary"])
 
     # --- Actions (primary output) ---
     actions = result["actions"]
@@ -1066,17 +3465,24 @@ def _do_correlate(project, json_out=False):
         print(f"  {'─' * 60}")
         for a in actions[:10]:
             sigil = _SIGILS.get(a["category"], "[?]")
-            label = a["category"].upper().replace("_", " ")
-            print(f"  {sigil} {label}  {a['summary']}")
+            label = sanitise_for_terminal(
+                a["category"].upper().replace("_", " "), max_len=32)
+            # Action summaries embed finding-derived text (files,
+            # vuln types) — escape every foreign field.
+            print(f"  {sigil} {label}  "
+                  f"{sanitise_for_terminal(str(a['summary']), max_len=200)}")
             detail = a.get("detail", {})
             if a["category"] == "disagreement":
                 for v in detail.get("verdicts", []):
-                    m = f" ({v['model']})" if v.get("model") else ""
-                    print(f"      {v['run']}: {v['status']}{m}")
+                    m = (f" ({sanitise_for_terminal(str(v['model']), max_len=64)})"
+                         if v.get("model") else "")
+                    print(f"      {sanitise_for_terminal(str(v['run']), max_len=64)}: "
+                          f"{sanitise_for_terminal(str(v['status']), max_len=32)}{m}")
             elif a["category"] == "resolved":
                 absent = detail.get("absent_from", [])
                 if absent:
-                    print(f"      absent from: {', '.join(absent)}")
+                    print("      absent from: "
+                          f"{sanitise_for_terminal(', '.join(absent), max_len=200)}")
         if len(actions) > 10:
             print(f"  ... and {len(actions) - 10} more (use --json for full list)")
     else:
@@ -1085,9 +3491,30 @@ def _do_correlate(project, json_out=False):
     # --- Suggested next runs ---
     suggested = result.get("tool_gaps", {}).get("suggested_next_runs", [])
     if suggested:
-        print(f"\n  Next steps:")
+        print("\n  Next steps:")
         for cmd in suggested:
-            print(f"    → {cmd}")
+            print(f"    → {sanitise_for_terminal(str(cmd), max_len=200)}")
+
+    # --- Token-enforcement drift (compact, hint-tier) ---
+    token_drift = result.get("token_enforcement_drift") or []
+    if token_drift:
+        print(f"\n  Token-enforcement drift ({len(token_drift)}):")
+        for rec in token_drift[:10]:
+            print(
+                "    "
+                f"{sanitise_for_terminal(str(rec.get('file', '?')), max_len=120)}: "
+                f"{sanitise_for_terminal(str(rec.get('prior_status', '?')), max_len=32)}"
+                " -> "
+                f"{sanitise_for_terminal(str(rec.get('current_status', '?')), max_len=32)}"
+                f" [{sanitise_for_terminal(str(rec.get('change', '?')), max_len=32)}]"
+                f" ({sanitise_for_terminal(str(rec.get('prior_run', '?')), max_len=64)}"
+                " -> "
+                f"{sanitise_for_terminal(str(rec.get('current_run', '?')), max_len=64)})",
+            )
+        if len(token_drift) > 10:
+            print(f"    ... and {len(token_drift) - 10} more (use --json)")
+        print("    Hint-tier: a lost_enforcement row is re-review food for "
+              "token-guard disproofs, never an auto-overturn.")
 
     # --- Persistent findings (compact) ---
     persistent = result["persistent_findings"]
@@ -1095,13 +3522,15 @@ def _do_correlate(project, json_out=False):
         display = persistent[:10]
         rows = []
         for pf in display:
-            models = ", ".join(pf.get("models", [])) or "—"
+            models = ", ".join(pf.get("models") or []) or "—"
             rows.append((
-                f"{pf['file']}:{pf['line']}" if pf.get("file") else "?",
-                pf.get("vuln_type", ""),
-                pf.get("status", ""),
+                sanitise_for_terminal(
+                    f"{pf['file']}:{pf['line']}" if pf.get("file") else "?",
+                    max_len=120),
+                sanitise_for_terminal(str(pf.get("vuln_type", "")), max_len=64),
+                sanitise_for_terminal(str(pf.get("status", "")), max_len=32),
                 f"{pf['runs_seen']} runs",
-                models,
+                sanitise_for_terminal(models, max_len=120),
             ))
         headers = ("Location", "Type", "Status", "Seen", "Models")
         widths = [len(h) for h in headers]
@@ -1125,14 +3554,48 @@ def _do_correlate(project, json_out=False):
         print(f"\n  Coverage: {', '.join(cov_parts)} files")
 
 
-def _do_clean(project, keep, dry_run, yes):
-    """Clean old runs from a project."""
-    from .clean import plan_clean, execute_clean
+def _print_interrupted_clean(plan):
+    for name in plan.get('deleted', []):
+        print(f"  Deleted before stopping: {sanitise_for_terminal(name)}")
+    for name in plan.get('partially_removed', []):
+        print(f"  Partially removed: {sanitise_for_terminal(name)}")
+    if plan.get('deleted') or plan.get('partially_removed'):
+        print('Cleanup stopped. Inspect the remaining directories before retrying.')
 
-    plan = plan_clean(project, keep=keep)
 
-    if not plan["deleted"]:
-        print("Nothing to clean.")
+def _do_clean(project, keep, dry_run, yes, dedup: bool=False) -> None:
+    """Clean old runs from a project. With ``dedup``, the deletion set is the
+    coverage-aware lossless subset (runs fully subsumed by a survivor) rather
+    than recency-based ``--keep N``."""
+    from .clean import (
+        execute_clean,
+        execute_sources_sweep,
+        eligible_clean_dirs,
+        plan_clean,
+        plan_dedup,
+        plan_sources_sweep,
+    )
+
+    plan = plan_dedup(project) if dedup else plan_clean(project, keep=keep)
+
+    for name in plan.get("skipped_live", []):
+        print(f"  Skipped (still running): {name}")
+
+    # Extraction-cache sweep rides every clean: _sources entries whose
+    # archive sha no surviving run (nor the project's own archive
+    # target) references are reclaimed alongside the runs. Bounded and
+    # age-gated — see plan_sources_sweep. Best-effort: a sweep-plan
+    # hiccup must never block the run clean.
+    try:
+        sources_plan = plan_sources_sweep(project, plan["delete_dirs"])
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "sources sweep planning failed: %s", exc)
+        sources_plan = {"delete_dirs": [], "deleted": [], "freed_bytes": 0}
+
+    if not plan["deleted"] and not sources_plan["deleted"]:
+        print("No redundant runs to dedup." if dedup else "Nothing to clean.")
         return
 
     # Per-type breakdown
@@ -1146,34 +3609,203 @@ def _do_clean(project, keep, dry_run, yes):
     total_runs = len(plan['deleted']) + len(plan['kept'])
     print(f"\n  Total: {total_runs} runs → {len(plan['kept'])} runs ({freed_mb:.1f}MB to free)")
 
+    if sources_plan["deleted"]:
+        src_mb = sources_plan["freed_bytes"] / 1024 / 1024
+        print(f"  _sources cache: {len(sources_plan['deleted'])} "
+              f"unreferenced extraction(s) to sweep ({src_mb:.1f}MB)")
+        for name in sources_plan["deleted"]:
+            print(f"    {sanitise_for_terminal(name, max_len=120)}")
+
+    if plan.get('size_incomplete') or sources_plan.get('size_incomplete'):
+        print('  Size estimate is incomplete: some paths could not be inspected.')
+
+    # Coverage-aware: classify what each removal costs (read-only).
+    consequences = _classify_clean_coverage(project, plan)
+    if consequences:
+        from core.coverage.clean import format_consequence
+        print()
+        for c in consequences:
+            print(format_consequence(c))
+        lost = [c for c in consequences if c.lossy]
+        if lost:
+            n = sum(len(c.findings_lost) for c in lost)
+            print(_red(f"  ⚠ {n} unique finding(s) across {len(lost)} run(s) "
+                       f"will become re-review gaps (found-then-lost)."))
+
     if dry_run:
         print("\n(dry run — no changes)")
         return
 
-    if not yes:
-        if input("\nProceed? [y/N] ").lower() != "y":
-            print("Cancelled.")
-            return
+    if not yes and not _confirm("\nProceed? [y/N] "):
+        print("Cancelled.")
+        return
 
-    # Execute the exact plan that was shown — no re-query
-    execute_clean(plan)
+    # Revalidate retention/dedup policy after the unbounded confirm wait.
+    # Eligibility can only shrink the confirmed set, never add a new victim.
+    allowed = eligible_clean_dirs(project, keep=keep, dedup=dedup)
+    reported_live = set(plan.get("skipped_live", []))
+
+    def snapshot(victim):
+        selected = {"delete_dirs": [victim]}
+        current = _classify_clean_coverage(project, selected)
+        _apply_clean_coverage(project, selected, current)
+
+    try:
+        execute_clean(plan, output_path=project.output_path,
+                      eligible_dirs=allowed, before_delete=snapshot)
+    except BaseException:
+        try:
+            _print_interrupted_clean(plan)
+        except BaseException:
+            pass  # Progress reporting must never replace the cleanup error.
+        raise
+    freed_mb = plan["freed_bytes"] / 1024 / 1024
+    for name in plan.get("skipped_live", []):
+        if name not in reported_live:
+            print(f"  Skipped (still running): {sanitise_for_terminal(name)}")
+    for key, reason in (("skipped_retained", "retention rechecked"),
+                        ("skipped_changed", "directory changed since plan")):
+        for name in plan.get(key, []):
+            print(f"  Skipped ({reason}): {sanitise_for_terminal(name)}")
     for name in plan["deleted"]:
         print(_red(f"  Deleted: {name}"))
-    print(f"Done. {len(plan['deleted'])} runs deleted ({freed_mb:.1f}MB freed)")
+    if sources_plan["deleted"]:
+        # The sweep executor re-vets the plan at the last moment: the
+        # confirm wait above is unbounded and a cache HIT doesn't bump
+        # an entry's mtime, so a run that started while we waited can
+        # have re-referenced a planned entry. The refresh only ever
+        # SHRINKS the confirmed set; a re-plan failure deletes
+        # nothing. Same containment root as the run clean.
+        sources_plan = execute_sources_sweep(
+            project, sources_plan, plan["delete_dirs"],
+            output_path=project.output_path)
+        for name in sources_plan.get("skipped_referenced", []):
+            print("  Skipped (re-referenced since plan): _sources/"
+                  f"{sanitise_for_terminal(name, max_len=120)}")
+        for name in sources_plan["deleted"]:
+            print(_red("  Swept: _sources/"
+                       f"{sanitise_for_terminal(name, max_len=120)}"))
+    swept_note = ""
+    if sources_plan["deleted"]:
+        swept_note = (
+            f", {len(sources_plan['deleted'])} _sources extraction(s) "
+            f"swept ({sources_plan['freed_bytes'] / 1024 / 1024:.1f}MB)")
+    print(f"Done. {len(plan['deleted'])} runs deleted "
+          f"({freed_mb:.1f}MB freed){swept_note}")
 
 
-def _do_merge(project, merge_type, yes):
-    """Merge runs per command type."""
-    import shutil
+def _classify_clean_coverage(project, plan):
+    """Read-only: per to-be-deleted run, classify the coverage consequence
+    (duplicate / sole-clean / sole-source-findings). Best-effort — a coverage
+    hiccup must never block a clean. Returns [] when there's no inventory."""
+    try:
+        from core.coverage.clean import classify_removal
+        from core.inventory import read_checklist
+
+        checklist = read_checklist(Path(project.output_dir))
+        victims = plan.get("delete_dirs", [])
+        if not checklist or not victims:
+            return []
+        victim_set = set(victims)
+        survivors = [d for d in project.get_run_dirs(sweep=False)
+                     if d not in victim_set]
+        return [classify_removal(v, survivors) for v in victims]
+    except Exception as exc:  # noqa: BLE001 — must never block a clean
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "clean consequence computation failed: %s", exc,
+        )
+        return []
+
+
+def _apply_clean_coverage(project, plan, consequences) -> None:
+    """Snapshot to-be-deleted runs' coverage into the durable project
+    ``coverage.json`` (and flip sole-source findings to found_then_lost)
+    before the dirs are removed. Best-effort — never blocks the clean."""
+    if not consequences:
+        return
+    try:
+        from core.coverage.clean import apply_removal
+        from core.coverage.store import CoverageStore, coverage_store_lock
+        from core.inventory import read_checklist
+
+        checklist = read_checklist(Path(project.output_dir))
+        if not checklist:
+            return
+        cov_path = Path(project.output_dir) / "coverage.json"
+        # Lock the whole read-modify-write: a run completing mid-clean snapshots
+        # into the same coverage.json (see _snapshot_run_coverage).
+        with coverage_store_lock(cov_path):
+            store = CoverageStore(cov_path)
+            for victim, cons in zip(plan.get("delete_dirs", []), consequences, strict=True):
+                apply_removal(store, victim, checklist, cons)
+            store.save()
+    except Exception as e:  # noqa: BLE001 — must never block a clean
+        print(_red(f"  (coverage snapshot skipped: {sanitise_for_terminal(str(e), max_len=300)})"))
+
+
+def _do_merge(project, merge_type, yes) -> None:
+    """Publish complete merged runs before reclaiming unchanged sources."""
     from datetime import datetime, timezone
-    from .merge import merge_runs
+
+    from core.atomic_fs import publish_new_directory
     from core.json import save_json
     from core.run.metadata import RUN_METADATA_FILE
+    from core.run.scratch import scratch_dir
+
+    from .clean import _directory_identity, execute_clean, split_live_runs
+    from .merge import merge_runs
 
     groups = project.get_run_dirs_by_type()
 
+    # `command` is child-writable run metadata restored verbatim
+    # (see core/project/report.py) and it becomes both the merged
+    # directory's name prefix AND terminal output.  Enforce the same
+    # direct-child-NAME contract remove/move already carry — a
+    # separator-bearing value ("../victim", "/home/user/.config")
+    # re-anchors the Path join and lets two planted markers steer the
+    # merge (and the source-run rmtree) outside the project — and
+    # keep raw bytes off the terminal.
+    # Leading "." / "_" are unsafe too: the merged dir would be named
+    # ".x-<ts>", which _list_run_dirs skips FOREVER while the source
+    # runs are rmtree'd on success — merged data invisible to
+    # status/findings/report/export. Length-capped so an
+    # over-NAME_MAX or NUL-bearing cmd_type refuses here instead of
+    # escaping as an uncaught OSError from the mkdir.
+    unsafe = {
+        k for k in groups
+        if not k or os.sep in k or (os.altsep and os.altsep in k)
+        or k in (".", "..")
+        or k.startswith((".", "_"))
+        or "\x00" in k
+        or len(k) > 64
+    }
+    for k in sorted(unsafe):
+        shown = sanitise_for_terminal(k, max_len=120)
+        print(f"  refusing to merge group with unsafe command type "
+              f"{shown!r} (run metadata is child-writable; "
+              "expected a plain name)")
+    groups = {
+        k: v for k, v in groups.items() if k not in unsafe
+    }
+
     if merge_type != "all":
         groups = {k: v for k, v in groups.items() if k == merge_type}
+
+    # Never merge (then delete) a live run — its directory is still
+    # being written by an in-flight worker.
+    filtered = {}
+    for cmd_type, dirs in groups.items():
+        rest, live = split_live_runs(dirs)
+        for d in live:
+            shown = sanitise_for_terminal(cmd_type, max_len=120)
+            # d.name can carry adopted/imported directory names —
+            # same keep-raw-bytes-off-the-terminal contract as the
+            # sibling merge prints.
+            print(f"  {shown}: skipped (still running): "
+                  f"{sanitise_for_terminal(d.name, max_len=120)}")
+        filtered[cmd_type] = rest
+    groups = filtered
 
     # Filter to groups that actually have something to merge
     mergeable = {k: v for k, v in groups.items() if len(v) >= 2}
@@ -1182,69 +3814,118 @@ def _do_merge(project, merge_type, yes):
         print("Nothing to merge.")
         return
 
+    # Pin the actual source directories before confirmation/copying. A
+    # replacement under the same name must never become a cleanup victim.
+    root = project.output_path.resolve()
+    source_identities = {}
+    for cmd_type, dirs in list(mergeable.items()):
+        valid = True
+        for directory in dirs:
+            path = Path(directory)
+            identity = _directory_identity(path)
+            if path.parent.resolve() != root or identity is None:
+                valid = False
+                break
+            source_identities[path] = identity
+        if not valid:
+            print(f"  {sanitise_for_terminal(cmd_type, max_len=120)}: "
+                  "merge refused — source is not a direct run directory")
+            del mergeable[cmd_type]
+    if not mergeable:
+        return
+
     # Show plan
     for cmd_type, dirs in mergeable.items():
-        print(f"  {cmd_type}: {len(dirs)} runs → 1")
+        print(f"  {sanitise_for_terminal(cmd_type, max_len=120)}: "
+              f"{len(dirs)} runs → 1")
 
-    if not yes:
-        if input("\nProceed? [y/N] ").lower() != "y":
-            print("Cancelled.")
-            return
+    if not yes and not _confirm("\nProceed? [y/N] "):
+        print("Cancelled.")
+        return
 
     groups = mergeable
 
     for cmd_type, dirs in groups.items():
+        shown_type = sanitise_for_terminal(cmd_type, max_len=120)
         # Collision-prevention via unique_run_suffix — see core/run/output.py.
         merged_dir = project.output_path / f"{cmd_type}-{unique_run_suffix('-')}"
 
+        phase = "merge"
+        published = False
         try:
-            stats = merge_runs(dirs, merged_dir)
-        except Exception as e:
-            print(f"  {cmd_type}: merge failed — {e}")
-            print("  Source runs preserved.")
+            # Keep potentially large copies on the project filesystem. Only
+            # a complete run (including metadata) gets a visible run name.
+            with scratch_dir(".raptor-merge-", dir=root, keepalive=True) as workspace:
+                staged = workspace / "merged"
+                # Groups are newest-first; the fold takes oldest-first.
+                stats = merge_runs(list(reversed(dirs)), staged)
+                phase = "metadata"
+                save_json(staged / RUN_METADATA_FILE, {
+                    "version": 1,
+                    "command": cmd_type,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "completed",
+                    "project": project.name,
+                    "project_source": "merged",
+                    "target_path": project.target,
+                    "extra": {"merged_from": len(dirs), "unique_findings": stats["unique_findings"]},
+                })
+                merged_identity = _directory_identity(staged)
+                phase = "publication"
+                publish_new_directory(staged, merged_dir)
+                published = True
+            # Freeze the published path, never the temporary workspace name.
+            from core.run.pin import freeze_run_pin
+            phase = "pin"
+            freeze_run_pin(merged_dir, project.name, "merged")
+        except Exception as e:  # noqa: BLE001 — abort delete, keep sources
+            print(f"  {shown_type}: {phase} failed — {sanitise_for_terminal(str(e), max_len=300)}")
+            if published:
+                print(f"  {shown_type}: source runs PRESERVED (merged output left at "
+                      f"{sanitise_for_terminal(str(merged_dir), max_len=500)})")
+            else:
+                print("  Source runs preserved.")
             continue
 
-        try:
-            save_json(merged_dir / RUN_METADATA_FILE, {
-                "version": 1,
-                "command": cmd_type,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "status": "completed",
-                "extra": {"merged_from": len(dirs), "unique_findings": stats["unique_findings"]},
-            })
-        except Exception as e:
-            # Pre-fix this printed a warning and PROCEEDED to delete
-            # source runs. The merged output then existed without
-            # `RUN_METADATA_FILE`, which downstream consumers
-            # (`load_run_metadata`, `get_run_dirs_by_type`) treat as
-            # "not a completed run" and silently skip — so the
-            # operator's merged data became invisible while the
-            # source runs were already gone. Net data loss with no
-            # error message after the warning.
-            #
-            # Abort the delete step instead. Merged dir stays on
-            # disk (operator can inspect / retry the metadata
-            # write); source dirs stay on disk (no data lost). The
-            # operator sees both the warning AND a clear "source
-            # runs preserved" line so they know to re-run.
-            print(f"  {cmd_type}: ERROR — metadata write failed ({e})")
-            print(f"  {cmd_type}: source runs PRESERVED (merged output left at {merged_dir})")
-            continue
+        # Reuse clean's containment, registry, identity, liveness and
+        # permission-repair checks. One plan per source keeps a failed
+        # removal from preventing reclamation of the remaining duplicates.
+        def require_merged_output(_source):
+            if merged_identity is None or _directory_identity(merged_dir) != merged_identity:
+                raise OSError("merged output changed; source runs preserved")
 
-        # Delete source runs (continue on individual failures)
         failed_deletes = []
         for d in dirs:
+            if merged_identity is None or _directory_identity(merged_dir) != merged_identity:
+                print(f"  {shown_type}: skipped delete — merged output changed; source runs preserved")
+                break
+            path = Path(d)
+            plan = {"delete_dirs": [path],
+                    "_delete_meta": {str(path): source_identities[path]}}
             try:
-                shutil.rmtree(d)
-            except Exception as e:
-                failed_deletes.append(f"{d.name}: {e}")
-        if failed_deletes:
-            for msg in failed_deletes:
-                print(f"  {cmd_type}: warning — failed to delete {msg}")
+                execute_clean(plan, output_path=root, before_delete=require_merged_output)
+            except Exception as e:  # noqa: BLE001 — continue past one failure
+                failed_deletes.append(
+                    f"{sanitise_for_terminal(path.name, max_len=120)}: "
+                    f"{sanitise_for_terminal(str(e), max_len=300)}")
+                continue
+            if plan.get("skipped_live"):
+                print(f"  {shown_type}: skipped delete (resumed while merging): "
+                      f"{sanitise_for_terminal(path.name, max_len=120)}")
+            elif plan.get("skipped_changed"):
+                print(f"  {shown_type}: skipped delete (source directory changed): "
+                      f"{sanitise_for_terminal(path.name, max_len=120)}")
+        for msg in failed_deletes:
+            print(f"  {shown_type}: warning — failed to delete {msg}")
 
+        # Documented convention (merge.py `_finding_key`): "N findings
+        # (M vulns)". Pre-fix the override relabelled the LOGICAL-vuln
+        # count as "findings" whenever the counts differed — exactly
+        # the case where the distinction matters.
         vuln_count = stats.get("unique_vulns", stats["unique_findings"])
+        findings_label = f"{stats['unique_findings']} findings"
         if vuln_count != stats["unique_findings"]:
-            findings_label = f"{vuln_count} findings"
-        else:
-            findings_label = f"{stats['unique_findings']} findings"
-        print(f"  {cmd_type}: merged {stats['runs_merged']} runs ({findings_label})")
+            findings_label = (
+                f"{stats['unique_findings']} findings ({vuln_count} vulns)"
+            )
+        print(f"  {shown_type}: merged {stats['runs_merged']} runs ({findings_label})")

@@ -7,7 +7,7 @@ Collects and deduplicates crashes from AFL output.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from collections.abc import Callable
 
 from core.hash import sha256_file
 from core.logging import get_logger
@@ -20,82 +20,169 @@ class Crash:
     """Represents a unique crash."""
     crash_id: str
     input_file: Path
-    signal: Optional[str] = None
-    stack_hash: Optional[str] = None
+    signal: str | None = None
+    stack_hash: str | None = None
     size: int = 0
-    timestamp: Optional[float] = None
+    timestamp: float | None = None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Crash(id={self.crash_id}, signal={self.signal}, size={self.size})"
 
 
 class CrashCollector:
     """Collects and deduplicates crashes from fuzzing output."""
 
-    def __init__(self, crashes_dir: Path):
+    def __init__(self, crashes_dir: Path) -> None:
         self.crashes_dir = Path(crashes_dir)
         if not self.crashes_dir.exists():
-            raise FileNotFoundError(f"Crashes directory not found: {crashes_dir}")
+            msg = f"Crashes directory not found: {crashes_dir}"
+            raise FileNotFoundError(msg)
 
-    def collect_crashes(self, max_crashes: Optional[int] = None) -> List[Crash]:
+    def collect_crashes(
+        self,
+        max_crashes: int | None = None,
+        stack_hasher: Callable[[Path], str | None] | None = None,
+    ) -> list[Crash]:
         """
         Collect unique crashes from AFL output.
 
+        Deduplication key: the crash's stack hash when analysis is
+        available (``stack_hasher`` — e.g. a wrapper over
+        ``CrashAnalyser._compute_stack_hash`` on the debugger trace),
+        falling back to the input-file content hash otherwise. Two
+        different inputs hitting the same bug share a stack hash but
+        never an input hash, so the fallback under-dedups — callers
+        with a debugger available should pass ``stack_hasher``.
+
+        ``max_crashes`` bounds the number of UNIQUE crashes returned.
+        The cap is applied after dedup: pre-fix the file list was
+        sliced first, so duplicate inputs consumed the budget and a
+        directory whose first N files were duplicates starved the
+        collection of distinct crashes that sorted later.
+
         Args:
-            max_crashes: Maximum number of crashes to collect
+            max_crashes: Maximum number of unique crashes to collect
+            stack_hasher: Optional callable mapping a crash input file
+                to a stack hash (or None when analysis fails); enables
+                root-cause dedup instead of input-content dedup
 
         Returns:
             List of Crash objects
         """
-        logger.info(f"Collecting crashes from: {self.crashes_dir}")
+        logger.info("Collecting crashes from: %s", self.crashes_dir)
 
-        crash_files = sorted([
+        # The crashes dir is written by the (untrusted, possibly
+        # attacker-built) fuzz target: a planted 'id:'-named symlink
+        # would get host-file content hashed here and then persisted
+        # into the witness store / crash-analysis LLM prompts via
+        # witness_adapter.read_bytes. Reject symlinks outright, same
+        # as the corpus stager. is_file() alone follows the link.
+        candidates = sorted(
             f for f in self.crashes_dir.iterdir()
-            if f.name.startswith("id:") and f.is_file()
-        ])
+            if f.name.startswith("id:")
+        )
+        crash_files = []
+        skipped_symlinks = 0
+        for f in candidates:
+            if f.is_symlink():
+                skipped_symlinks += 1
+                continue
+            if f.is_file():
+                crash_files.append(f)
+        if skipped_symlinks:
+            logger.warning(
+                "Skipped %d symlink(s) in crashes dir %s — symlinks in "
+                "target-writable directories are never followed",
+                skipped_symlinks, self.crashes_dir,
+            )
 
         if not crash_files:
             logger.warning("No crashes found!")
             return []
 
-        logger.info(f"Found {len(crash_files)} crash files")
+        logger.info("Found %d crash files", len(crash_files))
 
-        crashes = []
-        seen_hashes = set()
+        crashes: list[Crash] = []
+        seen_keys = set()
 
-        for crash_file in crash_files[:max_crashes] if max_crashes else crash_files:
+        for crash_file in crash_files:
+            if max_crashes is not None and len(crashes) >= max_crashes:
+                break
+
             crash = self._parse_crash_file(crash_file)
+            if crash is None:
+                # Deleted between listing and stat — the crashes dir
+                # is target-writable and live during collection.
+                logger.debug("Crash file vanished: %s", crash_file.name)
+                continue
 
-            # Deduplicate by input hash (simple approach)
-            # In practice, you'd want stack hash deduplication
-            input_hash = self._hash_file(crash_file)
+            if stack_hasher is not None and not crash.stack_hash:
+                try:
+                    crash.stack_hash = stack_hasher(crash_file) or None
+                except Exception as e:  # noqa: BLE001 — analysis is best-effort; fall back to input hash
+                    logger.debug(
+                        "stack_hasher failed for %s: %s", crash_file.name, e,
+                    )
 
-            if input_hash not in seen_hashes:
-                crashes.append(crash)
-                seen_hashes.add(input_hash)
+            # Namespace the key so a stack hash can never collide with
+            # an input hash (both are hex prefixes).
+            if crash.stack_hash:
+                key = ("stack", crash.stack_hash)
             else:
-                logger.debug(f"Skipping duplicate crash: {crash_file.name}")
+                try:
+                    key = ("input", self._hash_file(crash_file))
+                except OSError:
+                    # Same vanish window as above, one read later.
+                    logger.debug(
+                        "Crash file vanished before hashing: %s",
+                        crash_file.name,
+                    )
+                    continue
 
-        logger.info(f"Collected {len(crashes)} unique crashes")
+            if key not in seen_keys:
+                crashes.append(crash)
+                seen_keys.add(key)
+            else:
+                logger.debug("Skipping duplicate crash: %s", crash_file.name)
+
+        logger.info("Collected %d unique crashes", len(crashes))
 
         return crashes
 
-    def _parse_crash_file(self, crash_file: Path) -> Crash:
-        """Parse crash metadata from filename and content."""
+    def _parse_crash_file(self, crash_file: Path) -> Crash | None:
+        """Parse crash metadata from filename and content. Returns
+        ``None`` when the file vanished between directory listing and
+        the stat (target-writable dir, live campaign)."""
         # AFL crash format: id:000000,sig:06,src:000000,op:havoc,rep:16
+        # Merged multi-instance dirs add a trailing ",instance:<name>"
+        # part to disambiguate identical AFL ids across instances.
         parts = crash_file.stem.split(",")
 
         crash_id = None
         signal = None
+        instance = None
 
         for part in parts:
             if part.startswith("id:"):
                 crash_id = part.split(":")[1]
             elif part.startswith("sig:"):
                 signal = part.split(":")[1]
+            elif part.startswith("instance:"):
+                instance = part.split(":", 1)[1]
 
-        size = crash_file.stat().st_size
-        timestamp = crash_file.stat().st_mtime
+        # Carry the instance disambiguator into crash_id: AFL ids are
+        # only unique per instance, and consumers key dicts by crash_id
+        # (SMT-seed attribution, witness records) — two instances' id
+        # 000000 must not collapse into one key.
+        if crash_id and instance:
+            crash_id = f"{crash_id},instance:{instance}"
+
+        try:
+            st = crash_file.stat()
+        except OSError:
+            return None
+        size = st.st_size
+        timestamp = st.st_mtime
 
         return Crash(
             crash_id=crash_id or crash_file.stem,
@@ -109,7 +196,7 @@ class CrashCollector:
         """Short SHA-256 hash of file (first 16 hex chars)."""
         return sha256_file(file_path)[:16]
 
-    def rank_crashes_by_exploitability(self, crashes: List[Crash]) -> List[Crash]:
+    def rank_crashes_by_exploitability(self, crashes: list[Crash]) -> list[Crash]:
         """
         Rank crashes by likely exploitability.
 
@@ -127,18 +214,18 @@ class CrashCollector:
         }
 
         def crash_priority(crash: Crash) -> int:
-            return signal_priority.get(crash.signal, 99)
+            return signal_priority.get(crash.signal or "", 99)
 
         ranked = sorted(crashes, key=crash_priority)
 
         logger.info("Crash ranking:")
         for idx, crash in enumerate(ranked[:10], 1):
             signal_name = self._signal_name(crash.signal)
-            logger.info(f"  {idx}. {crash.crash_id} - {signal_name}")
+            logger.info("  %s. %s - %s", idx, crash.crash_id, signal_name)
 
         return ranked
 
-    def _signal_name(self, signal: Optional[str]) -> str:
+    def _signal_name(self, signal: str | None) -> str:
         """Convert signal number to name."""
         signal_names = {
             "04": "SIGILL (Illegal Instruction)",
@@ -148,4 +235,4 @@ class CrashCollector:
             "08": "SIGFPE (Floating Point Exception)",
             "11": "SIGSEGV (Segmentation Fault)",
         }
-        return signal_names.get(signal, f"Signal {signal}" if signal else "Unknown")
+        return signal_names.get(signal or "", f"Signal {signal}" if signal else "Unknown")

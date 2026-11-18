@@ -1,0 +1,1010 @@
+"""Binary context assembler — the ``binary:`` branch of assemble_context.
+
+Builds context dicts for binary functions from an
+:class:`~packages.ghidra.model.REDatabase` (Ghidra, r2, or objdump
+provenance). Returns the same dict shape :func:`assemble_context`
+produces so downstream consumers (prompt formatting, strategy
+selection, the review loop, the sweep) work unchanged.
+
+Key differences: ``source`` holds decompiled C or a stub (never
+source lines), ``representation`` says which, ``is_binary`` is True,
+and everything derived (names, comments, decompilation) is
+attacker-controlled — consumers must envelope it exactly like source
+from a scanned repo.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import stat
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, BinaryIO, cast
+
+from core.inventory.binary_builder import BINARY_PATH_PREFIX
+from core.source.lines import splitlines_prefix
+
+from .run_memo import BoundedMemo
+from .redb_read_scope import RedbReadScope, database_projection_digest
+
+logger = logging.getLogger(__name__)
+
+#: Cached physical JSON file version → REDatabase so a gap loop over hundreds of
+#: functions parses the JSON once. Bounded + thread-safe with
+#: per-key in-flight collapse — concurrent review workers raced the
+#: previous bare dict's check-then-set into duplicate parses.
+_REDB_MEMO: "BoundedMemo[Any]" = BoundedMemo(32)
+
+#: Target-binary content hashes keyed by path and complete physical version.
+#: Stable repeated lookups reuse a digest; inode replacement or a write with
+#: restored mtime invalidates it. Reads check the opened descriptor and path
+#: before reuse. These checks do not create an immutable binary/build snapshot.
+_TARGET_SHA_MEMO: "BoundedMemo[str]" = BoundedMemo(32)
+
+#: One sandboxed GhidraServer per analysed binary, booted lazily the
+#: first time a checklist function has no cached decompilation and
+#: reused for the rest of the run (JVM boot ~4s once vs per call).
+#: The per-key boot lock keeps concurrent workers from double-booting
+#: the ~4s JVM (the loser leaked until atexit); the cache lock guards
+#: dict operations only.
+_SERVER_CACHE: dict[str, Any] = {}
+_SERVER_CACHE_LOCK = threading.Lock()
+_SERVER_BOOT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _lazy_decompile(
+    binary_path: str, function_name: str, address,
+    out_dir: Path | None = None,
+) -> str | None:
+    """On-demand decompilation through the persistent sandboxed
+    server. Availability-gated (pyghidra + a real project source);
+    any failure degrades to None and the stub text stands."""
+    try:
+        from packages.ghidra.detect import pyghidra_available
+        if not pyghidra_available():
+            return None
+        from packages.ghidra.server import GhidraServer
+    except ImportError:
+        return None
+    key = str(Path(binary_path).resolve())
+    with _SERVER_CACHE_LOCK:
+        srv = _SERVER_CACHE.get(key)
+        boot_lock = _SERVER_BOOT_LOCKS.setdefault(key, threading.Lock())
+    if srv is None:
+        with boot_lock:
+            with _SERVER_CACHE_LOCK:
+                srv = _SERVER_CACHE.get(key)
+            if srv is None:
+                try:
+                    gpr = _project_for_binary(Path(binary_path), out_dir)
+                    if gpr is None:
+                        with _SERVER_CACHE_LOCK:
+                            _SERVER_CACHE[key] = False
+                        return None
+                    srv = GhidraServer(gpr)
+                    srv.start()
+                    import atexit
+                    atexit.register(srv.stop)
+                    srv.open()  # raw-open: not a filesystem open — Ghidra bridge server session
+                    with _SERVER_CACHE_LOCK:
+                        _SERVER_CACHE[key] = srv
+                except Exception:  # noqa: BLE001 — boot failure poisons the cache
+                    logger.debug(
+                        "lazy decompile server boot failed for %s",
+                        binary_path, exc_info=True,
+                    )
+                    with _SERVER_CACHE_LOCK:
+                        _SERVER_CACHE[key] = False
+                    return None
+    if srv is False:
+        return None  # previous BOOT failed — don't retry every call
+    target = address if address is not None else function_name
+    try:
+        return srv.decompile(target)
+    except Exception as e:  # noqa: BLE001 — a per-function miss (unrecovered
+        # name, decompile timeout) must NOT poison the healthy server
+        # for every later function.
+        logger.debug(
+            "lazy decompile failed for %s", function_name, exc_info=True,
+        )
+        # A dead worker (watchdog self-kill on a wedged JVM call,
+        # crash) takes every LATER function with it unless replaced.
+        # One restart attempt; the poisoned function is not retried.
+        try:
+            from packages.ghidra.server import GhidraServerDied
+        except ImportError:
+            return None
+        if isinstance(e, GhidraServerDied):
+            try:
+                srv.restart()
+                logger.info(
+                    "lazy decompile server restarted after worker "
+                    "death on %s", function_name,
+                )
+            except Exception:  # noqa: BLE001 — restart failure poisons
+                logger.debug(
+                    "lazy decompile server restart failed",
+                    exc_info=True,
+                )
+                with _SERVER_CACHE_LOCK:
+                    _SERVER_CACHE[key] = False
+        return None
+
+
+def _project_for_binary(
+    binary_path: Path, out_dir: Path | None = None,
+) -> Path | None:
+    """A Ghidra project for the binary — RAPTOR-owned locations ONLY.
+
+    The binary's own directory is attacker territory: a planted
+    ``.gpr`` there would substitute attacker-authored decompilation
+    into review context (and its clean verdicts would be staleness-
+    anchored to the REAL binary). Same rule as :func:`find_redb`.
+    """
+    import os
+    if binary_path.suffix == ".gpr":
+        return binary_path
+    candidates = []
+    if out_dir:
+        candidates.append(Path(out_dir) / f"{binary_path.stem}.gpr")
+    raptor_dir = os.environ.get("RAPTOR_DIR")
+    if raptor_dir:
+        candidates.append(
+            Path(raptor_dir) / "out"
+            / f"ghidra-import-{binary_path.stem}"
+            / f"{binary_path.stem}.gpr"
+        )
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def find_redb(
+    out_dir: Path | None,
+    target_path: Path | None,
+    *,
+    validate: bool = True,
+    _snapshot_sink: Callable[[Path, Any], None] | None = None,
+) -> Path | None:
+    """Locate the run's re-database.json.
+
+    Search order: the run output directory, its parent (shared
+    pipeline dirs), then the import cache convention for the target
+    binary. Only RAPTOR-owned locations — never the scanned target's
+    own directory.
+
+    Every existing candidate is identity-checked against
+    ``target_path`` before it is accepted (:func:`_accept_redb`):
+    the parent slot is SHARED by every run of a multi-binary
+    project, so the first existing file can be a database built for
+    a different binary, and accepting it builds the run's checklist
+    from the wrong function set. A wrong-binary or content-stale
+    candidate is skipped with a loud warning and the search
+    continues — fail toward rebuild, never a hard error.
+
+    ``validate=False`` keeps the historical existence-probe-only
+    behaviour (no content reads) for callers that only need a size
+    estimate and never authorize cache use (the checklist-build
+    timeout scaler).
+    """
+    import os
+    candidates: list[tuple[Path, str]] = []
+    if out_dir:
+        # The run's own output dir is single-target by construction;
+        # its parent is the shared multi-binary project slot.
+        candidates.append((Path(out_dir) / "re-database.json", "run"))
+        candidates.append(
+            (Path(out_dir).parent / "re-database.json", "shared"))
+    if target_path:
+        # Anchor to the RAPTOR repo's out/ — a cwd-relative path
+        # would resolve inside the scanned target's own directory
+        # when invoked from there, handing the target author the
+        # entire derived database.
+        raptor_dir = os.environ.get("RAPTOR_DIR")
+        if raptor_dir:
+            # Location derived from THIS target's stem — stem-keyed
+            # by construction.
+            candidates.append((
+                Path(raptor_dir) / "out"
+                / f"ghidra-import-{Path(target_path).stem}"
+                / "re-database.json",
+                "stem-keyed",
+            ))
+
+    # Revalidate the physical target version for every candidate. The shared
+    # memo avoids repeated hashing while stable; a per-call digest cell would
+    # miss a target replacement between two candidate identity checks.
+    def _target_sha() -> str | None:
+        return _target_content_sha(Path(target_path)) if target_path is not None else None
+
+    for cand, kind in candidates:
+        if not cand.is_file():
+            continue
+        if not validate or target_path is None:
+            return cand
+        def retain(database: Any, *, candidate: Path = cand) -> None:
+            if _snapshot_sink is not None:
+                _snapshot_sink(candidate, database)
+        if _accept_redb(cand, Path(target_path), kind, _target_sha, _snapshot_sink=retain):
+            return cand
+    return None
+
+
+def find_redb_snapshot(out_dir: Path | None, target_path: Path) -> tuple[Path, Any] | None:
+    """Retain the parsed value actually selected by the existing identity gate.
+
+    This is data capture, not a freshness or extraction receipt. Consumers use
+    this object rather than reopening a path that may now name another file.
+    Legacy identity-unknown context handling remains explicit in the gate.
+    """
+    retained: list[tuple[Path, Any]] = []
+    selected = find_redb(out_dir, target_path,
+        _snapshot_sink=lambda path, database: retained.append((path, database)))
+    if not retained or retained[-1][0] != selected:
+        return None
+    return retained[-1]
+
+
+def _binary_content_version(st: os.stat_result) -> tuple[int, ...]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _target_content_sha(target: Path) -> str | None:
+    """Hash a stable regular descriptor or reuse its exact physical version.
+
+    Unavailable or changing reads remain unknown and are not cached as a
+    successful computation. A final path check also guards cache hits. This is
+    a before/after check, not immutable extraction or build correspondence.
+    """
+    try:
+        before = target.stat()
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        resolved = target.resolve()
+        version = _binary_content_version(before)
+        key = (str(resolved), *version)
+    except (OSError, RuntimeError):
+        return None
+
+    def compute() -> str:
+        from core.hash import sha256_fileobj
+        from core.source import open_regular
+        from core.source.streams import preserving_stream_error
+
+        stream = open_regular(resolved, "rb")
+        if stream is None:
+            raise OSError("binary content unavailable")
+        with preserving_stream_error(stream):
+            if _binary_content_version(os.fstat(stream.fileno())) != version:
+                raise OSError("binary changed before content read")
+            digest = sha256_fileobj(cast(BinaryIO, stream))
+            if (_binary_content_version(os.fstat(stream.fileno())) != version
+                    or _binary_content_version(target.stat()) != version):
+                raise OSError("binary changed during content read")
+        return digest
+
+    try:
+        sha, _cached = _TARGET_SHA_MEMO.get_or_compute(key, compute)
+        if _binary_content_version(target.stat()) != version:
+            return None
+    except OSError:
+        return None
+    return sha
+
+
+def _accept_redb(
+    cand: Path,
+    target: Path,
+    kind: str,
+    target_sha: Callable[[], str | None],
+    *,
+    _snapshot_sink: Callable[[Any], None] | None = None,
+) -> bool:
+    """Identity gate for one existing re-database.json candidate.
+
+    Evidence order:
+
+    1. **Content hash** — a recorded ``metadata.binary_sha256``
+       compared against the target file's current hash decides in
+       both directions: match accepts (regardless of recorded path
+       spelling — the binary merely moved), mismatch skips (binary
+       rebuilt in place, or a foreign cache).
+    2. **Path identity** — the recorded ``binary_path`` versus the
+       target (:func:`_same_recorded_binary`).
+    3. **Identity unknown** — the run's own dir (``kind="run"``) and
+       the ghidra-import cache (``kind="stem-keyed"``, its location
+       is derived from this target's stem) keep their historical
+       acceptance; the shared parent slot (``kind="shared"``) is
+       exactly where a foreign binary's cache lives and is never
+       accepted without verifiable identity.
+
+    Unreadable, malformed, oversized or changing candidates cannot establish
+    identity. Refuse them and continue looking; a later unchecked reload must
+    not turn a transient error into acceptance of a replacement database.
+    """
+    def _skip(why: str) -> bool:
+        from core.security.log_sanitisation import escape_nonprintable
+        logger.warning(
+            "binary-cache: SKIPPING unverified %s — %s (run target: "
+            "%s); falling through toward re-import",
+            # The candidate path is escaped too: the stem-keyed slot
+            # embeds the target-repo-chosen binary stem, so raw
+            # control bytes would ride into the operator's terminal.
+            escape_nonprintable(str(cand)[:300]), why,
+            escape_nonprintable(str(target)[:300]),
+        )
+        return False
+
+    try:
+        db = load_redb(cand)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # Returning an unvalidated path for a later load would let a
+        # replacement bypass this identity gate after a transient parse error.
+        return _skip("analysis cache could not be validated; identity unavailable")
+
+    def _accepted() -> bool:
+        if _snapshot_sink is not None:
+            _snapshot_sink(db)
+        return True
+
+    # Type-gated (belt and braces with REDatabase.from_dict's own
+    # gate): a wrong-typed binary_path in a planted cache must fall
+    # to the identity-unknown slot rule, never into Path().
+    recorded = (
+        db.binary_path
+        if isinstance(db.binary_path, str) and db.binary_path
+        else None
+    )
+    meta = db.metadata if isinstance(db.metadata, dict) else {}
+    stamp = meta.get("binary_sha256")
+    if not (isinstance(stamp, str) and stamp):
+        stamp = None
+
+    if stamp and target.suffix != ".gpr":
+        actual = target_sha()
+        if actual is None:
+            return _skip("recorded binary_sha256 cannot be checked against stable target content")
+        if actual == stamp:
+            return _accepted()
+        return _skip(
+            "recorded binary_sha256 does not match the target's "
+            "current content (rebuilt or different binary)")
+
+    if recorded:
+        from core.security.log_sanitisation import escape_nonprintable
+        verdict = _same_recorded_binary(Path(recorded), target)
+        if verdict is True:
+            return _accepted()
+        if verdict is False:
+            return _skip(
+                "database records a different binary "
+                f"({escape_nonprintable(str(recorded)[:300])})")
+
+    if kind in ("run", "stem-keyed"):
+        return _accepted()
+    return _skip(
+        "no verifiable binary identity in a shared cache location")
+
+
+def _same_recorded_binary(recorded: Path, target: Path) -> bool | None:
+    """Is the database's recorded binary the run's target?
+
+    ``True``/``False`` when decidable; ``None`` when identity is
+    unknown — the target is not a regular file (run-dir spelling),
+    a ``.gpr`` whose recorded binary cannot be tied to an arbitrary
+    foreign name (an operator-named project legitimately differs
+    from its binary's name), or a recorded path that no longer
+    exists but shares the target's stem (moved binary and same-stem
+    foreign binary are indistinguishable by name alone).
+    """
+    import os
+    if target.suffix == ".gpr":
+        # Ghidra records executablePath = the ORIGINAL import source
+        # (never a path inside the project's .rep payload), so a
+        # recorded path merely contained under the .gpr's parent is
+        # NOT identity: that directory is routinely shared by several
+        # projects and their bundled binaries, and containment
+        # accepted a sibling project's binary. A stem match (raptor-
+        # created projects are named after their binary) is the only
+        # affirmative signal; anything else is UNKNOWN — the slot
+        # rule decides (an operator-named project legitimately
+        # differs from its binary's name, so unknown, not foreign).
+        return True if recorded.stem == target.stem else None
+    if not target.is_file():
+        return None
+    try:
+        if recorded.exists() and os.path.samefile(recorded, target):
+            return True
+    except OSError:
+        pass
+    try:
+        if recorded.resolve() == target.resolve():
+            return True
+    except OSError:
+        return None
+    if not recorded.exists():
+        # Recorded binary moved or deleted and no hash decided above:
+        # the name is the only signal left, and an equal name is NOT
+        # proof — a same-stem foreign binary's cache (built for a
+        # deleted /elsewhere/<stem>) is indistinguishable from the
+        # documented moved-binary case. Identity-UNKNOWN: the slot
+        # rule decides, so the run-local and stem-keyed slots keep
+        # the moved-binary acceptance while the shared slot refuses.
+        # A different stem is affirmatively foreign.
+        return None if recorded.stem == target.stem else False
+    return False
+
+
+def stamp_binary_sha256(doc: dict, binary_path: Path) -> None:
+    """Stamp the analysed binary's content hash into a re-database
+    document about to be written, so later cache hits on it are
+    hash-validatable (:func:`_accept_redb`). Best-effort: a missing
+    or unreadable binary, or a foreign metadata shape, leaves the
+    document unchanged.
+
+    Residual (documented): the hash is captured AFTER the import
+    that derived *doc* — a binary swapped mid-import gets the new
+    build's hash stamped over the old build's database, and a later
+    lookup of the swapped binary would accept it. Closing the window
+    means capturing the hash before the importer's first read and
+    threading it through every import lane (including the Ghidra
+    bridge, which is outside this helper); until then the stamp
+    narrows staleness to that import-duration window, it does not
+    eliminate it."""
+    try:
+        if not Path(binary_path).is_file():
+            return
+        meta = doc.setdefault("metadata", {})
+        if not isinstance(meta, dict):
+            return
+        from core.hash import sha256_file
+        meta["binary_sha256"] = sha256_file(Path(binary_path))
+    except OSError:
+        logger.debug("could not hash %s", binary_path, exc_info=True)
+
+
+#: re-database.json read ceiling. RAPTOR-written, but derived from a
+#: hostile binary's decompilation/symbols — a pathological import can
+#: balloon it. Bound to the ONE shared RE-database constant (never a
+#: value copy): a private 64MiB cap here refused the legitimate
+#: --decompile-all artifact the importer itself recommends creating,
+#: erroring the build-checklist lane on it. Imported at the
+#: definition site so the binding and its rationale read as one unit.
+from core.json.utils import (  # noqa: E402
+    RE_DATABASE_MAX_BYTES as _MAX_REDB_BYTES,
+)
+
+
+@dataclass(frozen=True)
+class _ParsedRedb:
+    database: Any
+    projection_sha256: str | None
+
+
+def load_redb(redb_path: Path):
+    """Return the legacy parsed data object without granting read authority."""
+    return load_redb_binding(redb_path).database
+
+
+def load_redb_binding(redb_path: Path) -> RedbReadScope:
+    """Load a bounded analysis artefact through one version-checked descriptor.
+
+    Stable reads reuse the parsed object. File changes or unavailable reads
+    raise rather than supplying data under a different physical cache version.
+    This before/after guard does not create immutable extraction or build facts.
+    """
+    from core.json import load_json_stream_bounded
+    from core.source import open_regular
+    from core.source.streams import preserving_stream_error
+    from packages.ghidra.model import REDatabase
+
+    path = Path(redb_path)
+    version = _binary_content_version(path.stat())
+    try:
+        resolved = path.resolve()
+    except RuntimeError as exc:
+        raise OSError("analysis JSON path unavailable") from exc
+    limit = _MAX_REDB_BYTES
+    key = (str(resolved), *version, limit)
+
+    def compute():
+        stream = open_regular(resolved, "rb")
+        if stream is None:
+            raise OSError("analysis JSON unavailable")
+        with preserving_stream_error(stream):
+            if _binary_content_version(os.fstat(stream.fileno())) != version:
+                raise OSError("analysis JSON changed before read")
+            document = load_json_stream_bounded(cast(BinaryIO, stream), max_bytes=limit)
+            database = REDatabase.from_dict(document)
+            projection = database_projection_digest(database, limit)
+            if (_binary_content_version(os.fstat(stream.fileno())) != version
+                    or _binary_content_version(path.stat()) != version):
+                raise OSError("analysis JSON changed during read")
+        return _ParsedRedb(database, projection)
+
+    parsed, _cached = _REDB_MEMO.get_or_compute(key, compute)
+    if _binary_content_version(path.stat()) != version:
+        raise OSError("analysis JSON changed during cache lookup")
+    return RedbReadScope(path, resolved, version, limit,
+                         parsed.database, parsed.projection_sha256)
+
+
+def assemble_binary_context(
+    *,
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    checklist: dict[str, Any] | None = None,
+    context_map: dict[str, Any] | None = None,
+    annotations_dir: Path | None = None,
+    out_dir: Path | None = None,
+    db=None,
+    cached_only: bool = False,
+    integer_abi=None,
+) -> dict[str, Any]:
+    """Assemble a context slice for one binary function.
+
+    Mirrors :func:`core.audit.context.assemble_context`'s return
+    shape; ``db`` may be passed directly (tests, callers holding one)
+    or is located via :func:`find_redb`.
+    """
+    from .binary_review_scope import capture_binary_module
+
+    module_snapshot = capture_binary_module(target_path)
+    if db is None:
+        try:
+            selected = find_redb_snapshot(out_dir, target_path)
+            if selected is not None:
+                _redb_path, db = selected
+        except (OSError, ValueError, KeyError):
+            logger.warning("could not select analysis cache", exc_info=True)
+
+    analysis_projection = database_projection_digest(db, _MAX_REDB_BYTES) if db is not None else None
+
+    item = _find_item(checklist, file_path, function_name)
+    address = (item or {}).get("address")
+    if address is None:
+        address = ((item or {}).get("metadata") or {}).get("address")
+
+    lookup_name = function_name
+    if address is None and "@0x" in function_name:
+        # Collision-suffixed checklist names (name@0xADDR).
+        base, _, addr_s = function_name.rpartition("@")
+        try:
+            address = int(addr_s, 16)
+            lookup_name = base
+        except ValueError:
+            address = None
+
+    func = None
+    if db is not None:
+        _prepare_function_layout(db)
+        if address is not None:
+            func = db.function_by_address(address)
+        else:
+            # Name-only lookup is advisory and must identify one occurrence.
+            # An explicit address miss must never fall back to another one.
+            matches = (f for f in db.functions if f.name == lookup_name)
+            func = next(matches, None)
+            if next(matches, None) is not None:
+                func = None
+            if func is not None:
+                address = func.address
+
+    ctx: dict[str, Any] = {
+        "file": file_path,
+        "function": function_name,
+        "line_start": 0,
+        "line_end": None,
+        "address": address,
+        "is_binary": True,
+        "target_path": str(target_path),
+    }
+
+    source, representation = (_read_binary_source(func, target_path, out_dir, cached_only=True)
+                              if cached_only else _read_binary_source(func, target_path, out_dir))
+    ctx["source"] = source
+    ctx["representation"] = representation
+
+    metadata = dict((item or {}).get("metadata") or {})
+    metadata.setdefault("name", function_name)
+    if func is not None:
+        metadata.setdefault("address", func.address)
+        metadata.setdefault("size", func.size)
+        if func.signature:
+            metadata.setdefault("signature", func.signature)
+    ctx["metadata"] = metadata
+
+    # Accepted analysis can retain its old path after a hash-valid move.
+    # Relation identities belong to this reviewed module key, not that label.
+    ctx["callers"] = [{**entry, "file": file_path} for entry in _binary_callers(db, func)]
+    ctx["callees"] = [{**entry, "file": file_path} for entry in _binary_callees(db, func)]
+    ctx["existing_annotation"] = _load_annotation(
+        annotations_dir, file_path, function_name, out_dir,
+    )
+    ctx["is_prior_audit_annotation"] = False
+    ctx["sinks"] = _binary_sinks(context_map, function_name, address, func)
+    ctx["threat_model"] = _load_threat_model(target_path)
+    from .binary_threat_inputs import binary_threat_material_digest
+    ctx["_binary_threat_model_sha256"] = binary_threat_material_digest(ctx["threat_model"])
+    from .binary_integer_inputs import capture_binary_integer_context
+    abi_owner = capture_binary_integer_context(integer_abi, target_path=target_path)
+    if abi_owner is not None:
+        ctx["_binary_integer_abi_owner"] = abi_owner
+        ctx["integer_abi_context"] = abi_owner.material
+    ctx["trust_surface"] = []
+    ctx["prior_attempts"] = {}
+    ctx["shared_state"] = {}
+    ctx["crypto_inventory"] = {}
+    ctx["ownership_model"] = {}
+    ctx["role_context"] = ""
+    ctx["type_definitions"] = _related_types(func, db)
+    ctx["macro_definitions"] = ""
+    ctx["flow_traces"] = []
+    ctx["project_context"] = ""
+    ctx["framework_guarantees"] = []
+
+    strategies = None
+    if item:
+        try:
+            from .strategy import learned_vocab, strategies_from_item
+            strategies = strategies_from_item(
+                item, file_path,
+                reachable_sinks=ctx["sinks"],
+                source=source,
+                target_path=target_path,
+                domain_vocab=learned_vocab(out_dir, target_path),
+            )
+        except Exception:
+            logger.debug(
+                "strategy selection failed for %s:%s",
+                file_path, function_name, exc_info=True,
+            )
+    ctx["strategy_exemplars"] = _strategy_exemplars(strategies)
+    ctx["strategy_primers"] = _strategy_primers(strategies)
+
+    comments = _function_comments(db, func)
+    parts = []
+    if func is not None and func.signature:
+        parts.append(f"Signature: {func.signature}")
+    for c in comments[:5]:
+        parts.append(f"[{c['kind']}] {c['text']}")
+    if parts:
+        ctx["ghidra_context"] = "\n".join(parts)
+
+    # Same prompt defences hostile SOURCE gets (control-char strip,
+    # size cap, injection scan): decompilation, database comments,
+    # and callee snippets are attacker-derived text on the same
+    # trust footing.
+    try:
+        from .prompt_defence import sanitise_for_prompt, scan_for_injection
+        location = f"{file_path}:{function_name}"
+        if ctx.get("source"):
+            ctx["source"] = sanitise_for_prompt(
+                ctx["source"], content_type="source",
+                location=location,
+            )
+            injection_warnings = scan_for_injection(
+                ctx["source"], location=location,
+            )
+            if injection_warnings:
+                ctx["injection_warnings"] = injection_warnings
+        if ctx.get("ghidra_context"):
+            ctx["ghidra_context"] = sanitise_for_prompt(
+                ctx["ghidra_context"], content_type="source",
+                location=location,
+            )
+        for callee in ctx.get("callees", []):
+            if callee.get("source_snippet"):
+                callee["source_snippet"] = sanitise_for_prompt(
+                    callee["source_snippet"], content_type="source",
+                    location=location,
+                )
+        # Recovered type bodies are DWARF/Ghidra-derived (type and
+        # field names come from the hostile binary) — same trust
+        # footing as the decompilation above.
+        for td in ctx.get("type_definitions", []):
+            if td.get("source"):
+                td["source"] = sanitise_for_prompt(
+                    td["source"], content_type="source",
+                    location=f"{location} (recovered type "
+                             f"{td.get('name', '?')})",
+                )
+    except Exception:
+        logger.warning("prompt defence failed", exc_info=True)
+
+    # Keep the original physical version through assembly. Never recapture a
+    # changed module as if it produced the implementation view already read.
+    analysis_current = (analysis_projection is None or
+                        database_projection_digest(db, _MAX_REDB_BYTES) == analysis_projection)
+    ctx["_binary_analysis_database"] = db if analysis_current else None
+    # Retain a known original digest even after assembly drift. It must refuse
+    # that binding, rather than acquiring legacy unknown-projection capability.
+    ctx["_binary_analysis_projection_sha256"] = analysis_projection
+    ctx["_binary_module_snapshot"] = (module_snapshot if module_snapshot is not None
+                                      and module_snapshot.current() else None)
+    return ctx
+
+
+def _find_item(checklist, file_path, function_name):
+    selected = None
+    for file_entry in (checklist or {}).get("files", []):
+        if file_entry.get("path") != file_path:
+            continue
+        items = file_entry.get("items", file_entry.get("functions", []))
+        for item in items or []:
+            if item.get("name") == function_name:
+                if selected is not None:
+                    return None
+                selected = item
+    return selected
+
+
+def _read_binary_source(func, target_path=None, out_dir=None, *, cached_only=False):
+    """Return (source_text, representation)."""
+    if func is None:
+        return "(function not found in the binary database)", "unknown"
+    if func.decompilation:
+        return func.decompilation, "decompilation"
+    if target_path is not None and not cached_only:
+        code = _lazy_decompile(
+            str(target_path), func.name, func.address, out_dir,
+        )
+        if code:
+            return code, "decompilation"
+    return (
+        "(no decompilation available for %s at 0x%x, size %d bytes — "
+        "re-import with --decompile-all or use "
+        "'raptor-ghidra decompile' on demand)"
+        % (func.name, func.address, func.size),
+        "stub",
+    )
+
+
+def _prepare_function_layout(db) -> bytes:
+    """Refresh the indexed resolver once per changed audit function layout.
+
+    Snapshot admission already walks the parsed database. Check identity,
+    ordering and extents here, never on each indexed xref lookup. This is a
+    best-effort mutable-cache version, not an immutable analysis guarantee.
+    """
+    from hashlib import sha256
+
+    from core.json import dumps_canonical
+
+    digest = sha256()
+    for function in db.functions:
+        digest.update(dumps_canonical(
+            [id(function), function.address, function.size]).encode("utf-8"))
+        digest.update(b"\n")
+    version = digest.digest()
+    if getattr(db, "_audit_function_layout", None) != version:
+        db.refresh_address_index()
+        db._audit_function_layout = version
+    return version
+
+
+def _xref_call_adjacency(db) -> tuple[dict[Any, list], dict[Any, list]]:
+    """Call-edge adjacency: (to_addr -> [xref], caller_addr -> [xref]).
+
+    Both renderers below used to walk ``db.xrefs`` in full for EVERY
+    reviewed function — N functions x X xrefs per gap loop.  Built
+    once per unchanged ordered edge set and memoised on the database.
+    Edge identity and routing fields invalidate replacement, mutation and
+    reordering even when the row count stays unchanged. Computing the
+    version is linear in functions and xrefs, without repeating function lookups on a
+    cache hit. This is a best-effort cache check, not an immutable snapshot.
+    """
+    from hashlib import sha256
+
+    from core.json import dumps_canonical
+
+    digest = sha256()
+    for xref in db.xrefs:
+        digest.update(dumps_canonical(
+            [id(xref), xref.from_addr, xref.to_addr, xref.kind]).encode("utf-8"))
+        digest.update(b"\n")
+    version = (_prepare_function_layout(db), digest.digest())
+    cached = getattr(db, "_audit_xref_adjacency", None)
+    if cached is not None and cached[0] == version:
+        return cached[1], cached[2]
+    by_callee: dict[Any, list] = {}
+    by_caller: dict[Any, list] = {}
+    for xref in db.xrefs:
+        if xref.kind != "call":
+            continue
+        incoming = by_callee.get(xref.to_addr)
+        if incoming is None:
+            incoming = []
+            by_callee[xref.to_addr] = incoming
+        incoming.append(xref)
+        caller = db.function_containing_address(xref.from_addr)
+        if caller is not None:
+            outgoing = by_caller.get(caller.address)
+            if outgoing is None:
+                outgoing = []
+                by_caller[caller.address] = outgoing
+            outgoing.append(xref)
+    db._audit_xref_adjacency = (version, by_callee, by_caller)
+    return by_callee, by_caller
+
+
+def _binary_callers(db, func) -> list[dict[str, Any]]:
+    if db is None or func is None:
+        return []
+    callers = []
+    seen = set()
+    by_callee, _ = _xref_call_adjacency(db)
+    for xref in by_callee.get(func.address, []):
+        caller = db.function_containing_address(xref.from_addr)
+        if caller and caller.address not in seen:
+            seen.add(caller.address)
+            entry: dict[str, Any] = {
+                "name": caller.name,
+                "file": BINARY_PATH_PREFIX + Path(
+                    db.binary_path or "unknown").stem,
+                "line_start": 0,
+                "address": caller.address,
+            }
+            if caller.signature:
+                entry["signature"] = caller.signature
+            callers.append(entry)
+            if len(callers) == 15:
+                break
+    return callers
+
+
+def _binary_callees(db, func) -> list[dict[str, Any]]:
+    if db is None or func is None:
+        return []
+    callees = []
+    seen = set()
+    _, by_caller = _xref_call_adjacency(db)
+    for xref in by_caller.get(func.address, []):
+        callee = db.function_by_address(xref.to_addr)
+        if callee and callee.address not in seen:
+            seen.add(callee.address)
+            entry: dict[str, Any] = {
+                "name": callee.name,
+                "file": BINARY_PATH_PREFIX + Path(
+                    db.binary_path or "unknown").stem,
+                "line_start": 0,
+                "address": callee.address,
+            }
+            if callee.signature:
+                entry["signature"] = callee.signature
+            if callee.decompilation:
+                entry["source_snippet"] = "\n".join(
+                    splitlines_prefix(callee.decompilation, 20)
+                )
+            callees.append(entry)
+            if len(callees) == 15:
+                break
+    return callees
+
+
+def _binary_sinks(context_map, function_name, address, func=None) -> list[str]:
+    """Sinks reachable from THIS function, as prompt-ready strings.
+
+    Matches the source path's contract (strings, per-function): map
+    sink entries are kept when they name this function or fall inside
+    its address range — returning the whole map would hand every
+    function the input strategy and render dict reprs into the
+    prompt.
+    """
+    if not context_map:
+        return []
+    lo = address if isinstance(address, int) else None
+    hi = None
+    if lo is not None and func is not None:
+        hi = lo + max((func.size or 0) - 1, 0)
+    out = []
+    for sink in context_map.get(
+            "sinks", context_map.get("dangerous_sinks", [])):
+        s_fn = sink.get("function", sink.get("containing_function", ""))
+        s_addr = sink.get("address")
+        if isinstance(s_addr, str):
+            try:
+                s_addr = int(s_addr, 16)
+            except ValueError:
+                s_addr = None
+        matched = bool(s_fn) and s_fn == function_name
+        if not matched and lo is not None and isinstance(s_addr, int):
+            matched = lo <= s_addr <= (hi if hi is not None else lo)
+        if not matched:
+            continue
+        loc = sink.get("location", sink.get("name", ""))
+        kind = sink.get("type", "")
+        out.append(f"{kind} at {loc}" if kind else str(loc))
+    return out[:20]
+
+
+def _load_threat_model(target_path):
+    try:
+        from .context import _load_threat_model as _source_ltm
+        return _source_ltm(Path(target_path))
+    except Exception:
+        logger.debug("threat model load failed", exc_info=True)
+        return None
+
+
+def _load_annotation(annotations_dir, file_path, function_name, out_dir):
+    try:
+        from .context import _load_existing_annotation
+        return _load_existing_annotation(
+            annotations_dir, file_path, function_name, out_dir=out_dir,
+        )
+    except Exception:
+        logger.debug(
+            "annotation load failed for %s:%s",
+            file_path, function_name, exc_info=True,
+        )
+        return None
+
+
+def _related_types(func, db) -> list[dict[str, Any]]:
+    """Types referenced by the function, in the formatter's shape.
+
+    ``format_context_for_prompt`` renders type_definitions entries as
+    ``{name, file, line, source}`` dicts — file/line have no source
+    meaning here, so they carry the recovered-type provenance.
+    """
+    if func is None or db is None or not db.types:
+        return []
+    text = (func.signature or "") + " " + (func.decompilation or "")
+    for ch in "*(),;[]{}":
+        text = text.replace(ch, " ")
+    words = set(text.split())
+    matched = [t for t in db.types if t.name in words]
+    out = []
+    for t in matched[:5]:
+        body = f"{t.kind} {t.name}"
+        if t.size is not None:
+            body += f" /* size: {t.size} */"
+        for fld in (t.fields or []):
+            offset = fld.get("offset")
+            line = (
+                f"  /* {offset:#x} */ " if isinstance(offset, int)
+                else "  "
+            )
+            line += f"{fld.get('type', '?')} {fld.get('name', '?')};"
+            if fld.get("size"):
+                line += f" /* {fld['size']} bytes */"
+            body += "\n" + line
+        out.append({
+            "name": t.name,
+            "file": "ghidra-types",
+            "line": 0,
+            "source": body,
+        })
+    return out
+
+
+def _function_comments(db, func) -> list[dict[str, str]]:
+    if db is None or func is None:
+        return []
+    return [
+        {"kind": c.kind, "text": c.text}
+        for c in db.comments
+        if c.function == func.name
+    ][:10]
+
+
+def _strategy_exemplars(strategies):
+    try:
+        from .context import _load_strategy_exemplars
+        return _load_strategy_exemplars(strategies)
+    except Exception:
+        return []
+
+
+def _strategy_primers(strategies):
+    try:
+        from .context import _load_strategy_primers
+        return _load_strategy_primers(strategies)
+    except Exception:
+        return []

@@ -1,0 +1,2466 @@
+"""Final summary report generation for /audit runs.
+
+Reads the review journal (per-run ``review-journal.jsonl`` and the
+project-level ``review-journal-index.json``), ``findings.json``, and
+annotations to produce a human-readable summary and structured
+report. ``coverage-audit.json`` was removed under the annotation →
+journal migration; the journal is the authoritative LLM review
+store.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+from core.coverage.journal import is_mechanical_echo as _is_mechanical_echo
+from core.coverage.record import READS_MANIFEST, read_manifest_lines
+from core.json import load_json, save_json
+from core.security.prompt_output_sanitise import sanitise_string
+from core.source.streams import preserving_stream_error
+
+from .review_availability import REVIEW_DEFERRAL_LIMITATIONS
+
+# Byte budgets for the report's artifact reads: 1 MiB for run
+# metadata, 8 MiB for small state files, 64 MiB for findings-class
+# documents, 256 MiB for the checklist (largest measured artifact
+# class — mirrors the coverage-store budget).
+_MAX_RUN_META_BYTES = 1024 * 1024
+_MAX_STATE_BYTES = 8 * 1024 * 1024
+_MAX_FINDINGS_BYTES = 64 * 1024 * 1024
+
+# Summary bound for the per-item errored-reviews list. 20 is deep
+# enough to name every errored function on a healthy run (errors are
+# rare — single digits on observed runs) while a systemic failure
+# (thousands of task_exception rows) cannot swamp the console; the
+# JSON report always carries the full list. Raising it floods the
+# end-of-run summary exactly when the run is at its most broken;
+# lowering it elides real per-function failures that would have fit.
+# Two-direction regression tests pin both behaviours
+# (test_report_residue.TestErroredFunctions).
+_MAX_ERRORED_LISTED = 20
+
+logger = logging.getLogger(__name__)
+
+UNACKNOWLEDGED_ASSESSMENTS_LIMITATION = (
+    "new review assessments (journal acknowledgement unavailable)"
+)
+KNOWLEDGE_RETENTION_LIMITATION = "knowledge-processing history (persistence failed)"
+_RETENTION_LIMITATIONS = (
+    KNOWLEDGE_RETENTION_LIMITATION,
+    "new dark verification pass results (persistence failed)",
+    "new differential verification pass results (persistence failed)",
+)
+_PROCESSING_HISTORY_LABELS = (*_RETENTION_LIMITATIONS, UNACKNOWLEDGED_ASSESSMENTS_LIMITATION)
+_PROCESSING_HISTORY_FILE = "processing-completeness.json"
+_PROCESSING_HISTORY_INVALID = "processing completeness record (unreadable or invalid)"
+
+
+def _retained_processing_limitations(out_dir: Path) -> list[str]:
+    """Read only the bounded explicit projection, never infer failures from logs."""
+    path = out_dir / _PROCESSING_HISTORY_FILE
+    try:
+        if not path.exists() and not path.is_symlink():
+            return []
+        data = load_json(path, max_bytes=4096)
+    except OSError:
+        return [_PROCESSING_HISTORY_INVALID]
+    if (not isinstance(data, dict) or type(data.get("schema_version")) is not int
+            or data["schema_version"] != 1 or not isinstance(data.get("limitations"), list)
+            or any(label not in _PROCESSING_HISTORY_LABELS for label in data["limitations"])):
+        return [_PROCESSING_HISTORY_INVALID]
+    return [label for label in _PROCESSING_HISTORY_LABELS if label in data["limitations"]]
+
+
+def _line(value: Any, *, max_chars: int = 300) -> str:
+    """Collapse a finding/journal-derived value to one sanitised line.
+
+    Finding titles, severities, file paths, and function names originate
+    from LLM review output (or from the scanned repo itself) and land in
+    markdown headings / list lines of the audit report. Newlines are
+    collapsed so a multi-line value cannot inject extra heading or list
+    lines; ``sanitise_string`` strips autofetch markup, defangs
+    line-leading markdown, and escapes ANSI/BIDI/control bytes. Same
+    policy as ``core.project.report._md_heading``.
+    """
+    text = " ".join(str(value if value is not None else "").split()).strip()
+    # Backticks are stripped, not escaped: several call sites wrap the
+    # value in a code span, and an embedded backtick would terminate
+    # the span and render the remainder as live markdown. Outside a
+    # span a backtick in these values (paths, names, language ids) is
+    # never meaningful, so stripping loses nothing.
+    return sanitise_string(text.replace("`", ""), max_chars=max_chars)
+
+
+def _cell(value: Any, *, max_chars: int = 300) -> str:
+    """Sanitise a value for a one-line markdown table cell.
+
+    Adds pipe-escaping on top of :func:`_line` so a cell can neither
+    split table columns nor render as live markup — mirrors
+    ``core.project.report._md_escape_inline``.
+    """
+    return _line(value, max_chars=max_chars).replace("|", "\\|")
+
+
+def _tier_title(value: Any) -> str:
+    """Render an evidence-tier enum value for human-readable output.
+
+    JSON keeps the raw snake_case enum (``xref_backed``); markdown and
+    prompt text render Title Case (``Xref Backed``) per the output
+    style rule — never ALL-CAPS. ``smt_proved`` keeps its acronym.
+    """
+    raw = getattr(value, "value", value)
+    title = str(raw or "").replace("_", " ").strip().title()
+    return title.replace("Smt", "SMT")
+
+
+# Tree-class grouping for finding lists: production findings render
+# first, non-production trees follow under labeled subsections with
+# counts. Insertion order here IS the render order.
+_TREE_CLASS_GROUP_LABELS = {
+    "vendored-compat": "Vendored / compat tree",
+    "test-harness": "Test-harness tree",
+}
+
+
+def _finding_tree_class(finding: dict[str, Any]) -> str:
+    """Tree class for report grouping: the finding's own ``tree_class``
+    tag when it carries one, else the path-only classifier — pre-tag
+    findings.json records must group the same way as freshly emitted
+    ones."""
+    tree_class = str(finding.get("tree_class") or "")
+    if tree_class == "production" or tree_class in _TREE_CLASS_GROUP_LABELS:
+        return tree_class
+    try:
+        from .tree_class import classify_tree_class
+        return classify_tree_class(str(finding.get("file") or ""))
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("tree-class fallback failed", exc_info=True)
+        return "production"
+
+
+def _group_findings_by_tree(
+    findings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[tuple[str, list[dict[str, Any]]]]]:
+    """``(production, [(tree_class, findings), ...])`` — grouping only,
+    never a filter: every input finding appears exactly once."""
+    production: list[dict[str, Any]] = []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for finding in findings:
+        tree_class = _finding_tree_class(finding)
+        if tree_class in _TREE_CLASS_GROUP_LABELS:
+            grouped.setdefault(tree_class, []).append(finding)
+        else:
+            production.append(finding)
+    ordered = [
+        (tc, grouped[tc]) for tc in _TREE_CLASS_GROUP_LABELS if tc in grouped
+    ]
+    return production, ordered
+
+
+def generate_report(
+    out_dir: Path,
+    *,
+    target_path: Path | None = None,
+    final_status: str | None = None,
+    processing_limitations: list[str] | None = None,
+    unacknowledged_assessments: bool = False,
+    publication_failures: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Generate the final audit report.
+
+    Returns a dict with:
+        summary: human-readable summary string
+        stats: {reviewed, clean, suspicious, finding, dormant, dark,
+            error, mechanical}
+        findings_count: number of tool-confirmed findings
+        coverage_delta: functions reviewed this run
+        gaps_remaining: number of unreviewed functions
+    """
+    completeness = _assess_completeness(out_dir)
+    if final_status:
+        # The report is deliberately generated BEFORE the lifecycle
+        # transition (a completed stamp must never exist without its
+        # report — the resume --reopen recovery depends on that), so
+        # the on-disk status still reads "running" here. The caller
+        # passes the terminal status it is about to stamp; the
+        # completeness block names the run's real end state instead
+        # of a mid-finalisation snapshot.
+        completeness["run_status"] = final_status
+        # Recompute resumability from the terminal status too: the
+        # on-disk snapshot reads "running" (a resumable status), so
+        # without this a budget/breaker-stopped run baked
+        # run_status="completed" alongside resumable=True and the
+        # report prescribed a `raptor-audit resume` the resume gate
+        # refuses (completed is not in RESUMABLE_STATUSES).
+        completeness["resumable"] = final_status in _RESUMABLE_STATUSES
+        if final_status == "completed":
+            completeness["partial"] = bool(completeness.get("missing"))
+    # Preserve durable assessments while disclosing retention failures and
+    # known dispatch deferrals; neither rewrites review or finding statistics.
+    # Apply after the terminal-status override can reset partial.
+    allowed_limitations = (*_RETENTION_LIMITATIONS, *REVIEW_DEFERRAL_LIMITATIONS)
+    if isinstance(processing_limitations, list):
+        labels = [label for label in allowed_limitations if label in processing_limitations]
+        if labels:
+            completeness["missing"] = list(dict.fromkeys([*completeness.get("missing", []), *labels]))
+            completeness["partial"] = True
+    # The caller supplies only the explicit publication signal. Missing or
+    # mismatched acknowledgements are not necessarily failed disk writes.
+    if unacknowledged_assessments is True or (
+        isinstance(publication_failures, list) and any(
+            isinstance(failure, dict)
+            and failure.get("reason") == "initial_journal_acknowledgement_unavailable"
+            and failure.get("adjudication") == "unverified"
+            for failure in publication_failures
+        )
+    ):
+        completeness["missing"] = list(dict.fromkeys([
+            *completeness.get("missing", []),
+            UNACKNOWLEDGED_ASSESSMENTS_LIMITATION,
+        ]))
+        completeness["partial"] = True
+    retained_limitations = _retained_processing_limitations(out_dir)
+    if retained_limitations:
+        completeness["missing"] = list(dict.fromkeys([
+            *completeness.get("missing", []), *retained_limitations,
+        ]))
+        completeness["partial"] = True
+    segments = _load_segments(out_dir)
+
+    audit_data = _load_review_state(out_dir)
+    findings = _load_findings(out_dir)
+    # JOIN findings with the journal for current-verdict authority.
+    # findings.json is emit-only at /audit run completion; Reflexion
+    # corrections land in the journal only. See amendment §4.
+    #
+    # Drop findings whose journal verdict is now benign
+    # (clean/dormant) — those are Reflexion-refuted and shouldn't
+    # count toward findings_count or appear in the summary list.
+    # The retained findings carry ``_verdict_source="journal"`` when
+    # the journal changed their status (e.g. finding → suspicious).
+    findings = _apply_journal_verdict_overrides(findings, audit_data)
+    gaps = _load_gaps(out_dir)
+
+    stats = _compute_stats(audit_data)
+    gaps_remaining = _count_remaining_gaps(gaps, audit_data)
+
+    unrecorded = _find_unrecorded_reads(out_dir, audit_data, target_path)
+
+    # Budget-truncated tail: functions the --budget cut dropped before
+    # scheduling. They are absent from gaps.json (which holds the
+    # scheduled list), so without this they would be silently missing
+    # from every count — conflated with reviewed code. They count as
+    # remaining gaps (never attempted, still gap-eligible next run).
+    not_attempted = _load_not_attempted(out_dir)
+    not_attempted_count = int(not_attempted.get("count", 0) or 0)
+    gaps_remaining += not_attempted_count
+
+    report = {
+        "stats": stats,
+        "findings_count": len(findings),
+        "coverage_delta": stats["reviewed"],
+        "gaps_remaining": gaps_remaining,
+        "findings": findings,
+        "unrecorded_reads": unrecorded,
+        # Completeness is REPORTED, not assumed: the generator runs
+        # against any partial run dir (interrupted / killed / mid-run)
+        # and states what is missing; the verdict tables above always
+        # reflect whatever the journal holds.
+        "completeness": completeness,
+    }
+    from .assessment_basis_reporting import assessment_basis_summary
+    assessment_bases = assessment_basis_summary(audit_data)
+    if assessment_bases is not None:
+        report["assessment_bases"] = assessment_bases
+    if segments:
+        report["segments"] = segments
+    if not_attempted_count:
+        report["not_attempted"] = {
+            "reason": not_attempted.get("reason", "budget"),
+            "count": not_attempted_count,
+        }
+
+    # Vendored/generated triage decisions (per-function records in
+    # suppressions.jsonl) — the run summary states the counts so
+    # skipped/glanced functions are never silently absent.
+    vendored_triage = _load_vendored_triage(out_dir)
+    if vendored_triage:
+        report["vendored_triage"] = vendored_triage
+
+    # Glance-escalation cap denials (per-function dropped=False
+    # records in suppressions.jsonl) — glance-suspicious functions
+    # that kept their ~500-token glance verdict because the run's
+    # escalation budget was exhausted. Counted here so the depth
+    # downgrade reaches the run summary, not just the scan-time
+    # warning.
+    glance_capped = _load_glance_cap(out_dir)
+    if glance_capped:
+        report["glance_escalation_capped"] = glance_capped
+
+    # Toolchain-screen depth stops (per-function dropped=False records
+    # in suppressions.jsonl) — binary toolchain rows that kept their
+    # glance verdict by DESIGN (name-evidence screen), not because a
+    # budget ran out. Counted here for parity with the cap downgrade
+    # above: both are depth stops the summary must disclose.
+    toolchain_screened = _load_toolchain_screen(out_dir)
+    if toolchain_screened:
+        report["toolchain_glance_screened"] = toolchain_screened
+
+    # Analysis gaps: files a parser abandoned (budget exceeded,
+    # escaped parse error). Counted here so a crafted file that
+    # defeats a parser is visible in the report, never a silent skip.
+    from core.run.gaps import gap_summary
+    analysis_gaps = gap_summary(out_dir)
+    if analysis_gaps:
+        report["analysis_gaps"] = {
+            "count": sum(analysis_gaps.values()),
+            "reasons": analysis_gaps,
+        }
+
+    # Cross-function edge obligations (--edges runs): tier counts,
+    # unreviewed tier-1 edges, and the blind-spot list — the
+    # 2026-05-29 design's headline output. Absent file -> absent key.
+    edge_block = _load_edge_obligations(out_dir)
+    if edge_block:
+        report["edge_obligations"] = edge_block
+
+    # Dark outcomes ("tool-blind, needs concrete verification") from
+    # the graded export — surfaced so the bucket reaches the operator
+    # instead of being tallied invisibly as dormant.
+    dark_findings = _load_dark_findings(out_dir)
+    if dark_findings:
+        report["dark_findings"] = dark_findings
+        # Completeness honesty: dark rows the /validate post-pass never
+        # adjudicated (cap-deferred, or the post-pass never ran) are
+        # stated with the exact follow-up command — they must not
+        # dead-end silently.
+        _annotate_dark_awaiting(
+            completeness, out_dir, len(dark_findings), target_path,
+        )
+
+    # A /validate post-pass that never ran leaves every emitted
+    # finding unvalidated — the skip reason must reach the report
+    # summary, not just the on-disk record (unconditional: a run with
+    # zero dark rows still owes this statement).
+    _annotate_validate_postpass(completeness, out_dir, target_path)
+
+    # Finding-survival metric: per-evidence-channel /validate outcomes
+    # (pure read-side aggregation over the journal — empty until a
+    # /validate feedback import has run).
+    try:
+        from .survival import aggregate_survival
+        survival = aggregate_survival(out_dir)
+    except Exception:  # reporting must not fail the run
+        logger.debug("survival aggregation failed", exc_info=True)
+        survival = {}
+    if survival:
+        report["survival"] = survival
+
+    # Promotion-without-tool-evidence alarms: empty on every
+    # legitimate run — any record is a mechanical-verdict invariant
+    # violation and must be surfaced loudly.
+    try:
+        from .promotion_alarm import load_alarms
+        promotion_alarms = load_alarms(out_dir)
+    except Exception:  # reporting must not fail the run
+        logger.debug("promotion alarm load failed", exc_info=True)
+        promotion_alarms = []
+    if promotion_alarms:
+        report["promotion_alarms"] = promotion_alarms
+
+    eval_path = out_dir / "evaluation.json"
+    if eval_path.is_file():
+        eval_data = load_json(eval_path, max_bytes=_MAX_STATE_BYTES)
+        if eval_data is not None:
+            report["evaluation"] = eval_data
+
+    # Interrupted Joern pre-sweep window (server restart mid-query):
+    # whether the window was re-queued and recovered or lost outright
+    # must reach the operator — a lost window means the run's taint
+    # evidence is incomplete, which reads as "no flows" everywhere
+    # downstream unless stated.
+    try:
+        from .joern_backend import load_presweep_status
+        presweep = load_presweep_status(out_dir)
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("pre-sweep status load failed", exc_info=True)
+        presweep = None
+    if presweep:
+        report["joern_presweep"] = presweep
+
+    # CPG build outcome (failed → the Joern channel was lost for the
+    # run; retried → it was rescued at derived-max limits): channel
+    # loss must be named in the report, not just a mid-run log line —
+    # zero joern receipts otherwise read as "tool found nothing".
+    try:
+        from .joern_backend import load_cpg_build_status
+        cpg_build = load_cpg_build_status(out_dir)
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("CPG build status load failed", exc_info=True)
+        cpg_build = None
+    if cpg_build:
+        report["joern_cpg_build"] = cpg_build
+
+    # Mid-run channel-health trips (the joern gate): a tripped channel
+    # skipped its remaining dispatches for the run — its zero-receipt
+    # tiers mean "channel went down", not "tool found nothing", and
+    # the operator must see that distinction stated.
+    try:
+        tier_diag = load_json(
+            out_dir / "tier-diagnostics.json", max_bytes=_MAX_STATE_BYTES,
+        )
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("tier diagnostics load failed", exc_info=True)
+        tier_diag = None
+    health = (tier_diag or {}).get("channel_health")
+    if isinstance(health, dict):
+        tripped_channels = {
+            name: rec for name, rec in health.items()
+            if isinstance(rec, dict)
+            and (rec.get("tripped") or rec.get("gated_spends"))
+        }
+        if tripped_channels:
+            report["channel_health"] = tripped_channels
+            # Loud completeness surfacing: a channel that ENDED the
+            # run tripped with dispatches skipped behind it means
+            # every one of those verdicts was issued without this
+            # validation leg — that loss belongs next to `missing`,
+            # not only inside the channel_health mechanics block.
+            _annotate_channel_loss(completeness, tripped_channels)
+
+    # Substrate skips: dispatches a tier refused because its
+    # substrate provably cannot model the target (e.g. coccinelle on
+    # a PHP tree). Zero receipts from such a tier mean "could not
+    # look", not "looked and found nothing" — the report must say so.
+    substrate_skips: dict[str, dict[str, Any]] = {}
+    for tier_name, rec in (tier_diag or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        count = rec.get("skipped_substrate")
+        if isinstance(count, int) and count > 0:
+            substrate_skips[tier_name] = {
+                "count": count,
+                "languages": rec.get("substrate_skip_languages") or {},
+            }
+    if substrate_skips:
+        report["substrate_skips"] = substrate_skips
+
+    # CodeQL database provisioning outcome: languages left without a
+    # database (skipped builds, timed-out or failed background builds)
+    # must reach the operator with the flag or marker that would
+    # provide one — the channel never skips silently.
+    try:
+        from .codeql_provision import load_provision_status
+        provision = load_provision_status(out_dir)
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("codeql provision status load failed", exc_info=True)
+        provision = None
+    if provision and (
+        provision.get("skipped")
+        or provision.get("build_timed_out")
+        or provision.get("build_aborted")
+        or provision.get("build_failed")
+    ):
+        report["codeql_provision"] = provision
+
+    # Auto-siblings outcome (binary targets): a degraded pass means
+    # the audit ran UNSEEDED — the sibling-consistency hints this
+    # composition exists to inject never reached the gap queue. The
+    # skip must reach the operator with the manual escape hatch, not
+    # just the run log (same contract as the CodeQL provisioning
+    # block above).
+    try:
+        from .auto_siblings import RECEIPT_FILENAME as _AS_RECEIPT
+        auto_siblings = load_json(
+            out_dir / _AS_RECEIPT, max_bytes=_MAX_RUN_META_BYTES,
+        )
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("auto-siblings receipt load failed", exc_info=True)
+        auto_siblings = None
+    if (
+        isinstance(auto_siblings, dict)
+        and auto_siblings.get("status") == "degraded"
+    ):
+        report["auto_siblings"] = auto_siblings
+
+    # Phase aborts (persistent LLM auth refusal): a listed phase
+    # produced NO trustworthy output — its empty results must not be
+    # read as "phase ran and found nothing". Written at abort time by
+    # the orchestrator (_record_phase_abort).
+    phase_aborts = load_phase_aborts(out_dir)
+    if phase_aborts:
+        report["phase_aborts"] = phase_aborts
+
+    from .analysis_observation_reporting import load_analysis_observations
+    report["analysis_observations"] = load_analysis_observations(out_dir)
+
+    from .source_observation_sidecar import load_saved_source_syntax
+    try:
+        source_syntax = load_saved_source_syntax(out_dir)
+    except Exception:  # Optional saved data cannot replace the audit; cancellation propagates.
+        source_syntax = {"mode": "unavailable", "authority": False, "source_verified": False}
+    if source_syntax is not None:
+        report["source_syntax_observations"] = source_syntax
+
+    from .binary_inventory_reporting import load_binary_inventory
+    binary_inventory = load_binary_inventory(out_dir)
+    if binary_inventory is not None:
+        report["binary_inventory"] = binary_inventory
+
+    # Decomp-tree sweep (binary targets): the tree-wide decompiler
+    # Semgrep pass writes decomp-sweep.json — including its loud-skip
+    # records, which must reach the operator — and the tree's
+    # conformance metric is the honest denominator for the coverage
+    # line (never "files emitted", which over-counts unparseable
+    # pseudo-C the sweep could not actually read).
+    decomp_sweep = _load_decomp_sweep(out_dir)
+    if decomp_sweep:
+        report["decomp_sweep"] = decomp_sweep
+
+    # Errored reviews, per item: a failed review is not a clean
+    # verdict, and a count alone is a dead end — the report names
+    # each (file, function, error_class) so the operator can see
+    # WHICH functions never got a completed review. Full list in the
+    # JSON report; the summary bounds its rendering.
+    errored_functions = sorted(
+        (
+            {
+                "file": rec.get("file") or "",
+                "function": rec.get("function") or "",
+                "error_class": rec.get("error_class"),
+            }
+            for rec in audit_data.get("functions_analysed", [])
+            if not rec.get("mechanical") and rec.get("status") == "error"
+        ),
+        key=lambda r: (r["file"], r["function"]),
+    )
+    if errored_functions:
+        report["errored_functions"] = errored_functions
+
+    # Unverified residue — the per-class index of everything this run
+    # examined but could not fully verify. Counts derive from the
+    # SAME sources as the headline stats (the journal-derived stats
+    # block, the graded export, the dark list) — never a parallel
+    # count that can drift. Always present in the JSON report (zero
+    # counts included) so consumers need no absent-key logic; the
+    # console/summary section renders only when a class is nonzero.
+    report["unverified_residue"] = _build_unverified_residue(
+        stats, audit_data, len(dark_findings),
+        _load_graded_stats(out_dir),
+    )
+
+    from .knowledge_reporting import load_knowledge_processing
+
+    knowledge_processing = load_knowledge_processing(out_dir)
+    if KNOWLEDGE_RETENTION_LIMITATION in completeness.get("missing", []):
+        # The saved artifact may predate the failed final write. Retain its
+        # bytes for recovery, but do not project stale counts as the run's
+        # completed processing. The fixed limitation survives write_report.
+        knowledge_processing = {
+            "state": "unavailable", "artifact": "knowledge-results.json",
+            "reason": "persistence_failed",
+        }
+    if knowledge_processing is not None:
+        report["knowledge_processing"] = knowledge_processing
+    from .claim_presentation import load_claim_presentation
+    claim_projection = load_claim_presentation(out_dir)
+    if claim_projection is not None:
+        report["claim_adjudication"] = claim_projection
+    report["summary"] = _format_summary(report)
+    return report
+
+
+def _load_decomp_sweep(out_dir: Path) -> dict[str, Any] | None:
+    """Summary view of ``decomp-sweep.json`` (+ its conformance
+    denominator) for the report — counts and skip reasons only; the
+    per-finding records stay in the artifact.
+    """
+    path = Path(out_dir) / "decomp-sweep.json"
+    if not path.is_file():
+        return None
+    try:
+        data = load_json(path, max_bytes=_MAX_FINDINGS_BYTES)
+    except Exception:  # noqa: BLE001 — reporting must not fail the run
+        logger.debug("decomp-sweep record load failed", exc_info=True)
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("skipped"):
+        return {"skipped": True,
+                "skip_reason": str(data.get("skip_reason", ""))}
+    out: dict[str, Any] = {
+        "skipped": False,
+        "rules_run": len(data.get("rules_run") or []),
+        "rules_errored": len(data.get("rules_errored") or {}),
+        "findings_total": int(data.get("findings_total", 0) or 0),
+        "mapped": int(data.get("mapped", 0) or 0),
+        "unmapped": int(data.get("unmapped", 0) or 0),
+        "journal_rows": int(data.get("journal_rows", 0) or 0),
+    }
+    tree_root = data.get("tree_root")
+    if tree_root:
+        conf_path = Path(str(tree_root)) / "decomp-tree-conformance.json"
+        try:
+            if conf_path.is_file():
+                conf = load_json(conf_path, max_bytes=_MAX_STATE_BYTES)
+                if isinstance(conf, dict):
+                    out["conformance"] = {
+                        "parsed_rate": conf.get("parsed_rate"),
+                        "files_total": int(
+                            conf.get("files_total", 0) or 0),
+                        "quarantine_total": int(
+                            conf.get("quarantine_total", 0) or 0),
+                    }
+        except Exception:  # noqa: BLE001 — reporting must not fail the run
+            logger.debug("decomp-tree conformance load failed",
+                         exc_info=True)
+    return out
+
+
+def load_phase_aborts(out_dir: Path) -> list[dict[str, Any]]:
+    """Load ``phase-aborts.json`` records from *out_dir* (empty list
+    when absent or unreadable — reporting must not fail the run)."""
+    path = Path(out_dir) / "phase-aborts.json"
+    if not path.is_file():
+        return []
+    loaded = load_json(path, max_bytes=_MAX_STATE_BYTES)
+    if not isinstance(loaded, list):
+        return []
+    return [r for r in loaded if isinstance(r, dict)]
+
+
+def format_summary(report: dict[str, Any]) -> str:
+    """Format a report dict as a human-readable summary."""
+    # Lazy fallback: dict.get's default argument would recompute the
+    # summary on EVERY call even when the report already carries one.
+    summary = report.get("summary")
+    if summary is not None:
+        return summary
+    return _format_summary(report)
+
+
+def _load_edge_obligations(out_dir: Path) -> dict[str, Any] | None:
+    """Summarise edge-obligations.json + the journal's edge entries.
+
+    Reviewed = journal entries carrying ``edge_callee`` (any verdict
+    but ``error``) keyed against tier-1 obligations. Blind spots are
+    surfaced in full count with a bounded sample — never silently
+    truncated without the count saying so.
+    """
+    raw = load_json(
+        out_dir / "edge-obligations.json", max_bytes=_MAX_FINDINGS_BYTES,
+    )
+    if not isinstance(raw, dict):
+        return None
+    tier1 = raw.get("tier1") or []
+    tier2 = raw.get("tier2") or []
+    blind = raw.get("blind_spots") or []
+
+    reviewed_keys: set[str] = set()
+    findings: list[dict[str, Any]] = []
+    try:
+        from core.audit.edge_review import edge_key
+        from core.coverage.journal import load_entries
+        # Latest entry per edge key BEFORE classifying (same discipline
+        # as _load_review_state): the journal is append-only, so a
+        # re-reviewed finding->clean edge would otherwise keep listing
+        # the stale finding row from the superseded entry.
+        latest: dict[str, Any] = {}
+        for entry in load_entries(out_dir):
+            callee_id = getattr(entry, "edge_callee", None)
+            if not callee_id or entry.verdict == "error":
+                continue
+            prev = latest.get(entry.key)
+            if prev is None or entry.ts > prev.ts:
+                latest[entry.key] = entry
+        reviewed_keys = set(latest)
+        for entry in latest.values():
+            if entry.verdict == "finding":
+                findings.append({
+                    "caller": f"{entry.file}:{entry.function}",
+                    "callee": entry.edge_callee,
+                    "cwe": entry.cwe,
+                })
+        unreviewed = [
+            r for r in tier1 if edge_key(r) not in reviewed_keys
+        ]
+    except Exception:  # noqa: BLE001 — journal read is best-effort
+        logger.debug("edge journal summary failed", exc_info=True)
+        unreviewed = list(tier1)
+
+    block: dict[str, Any] = {
+        "tier1_total": len(tier1),
+        "tier1_unreviewed": len(unreviewed),
+        "tier2_total": len(tier2),
+        "blind_spot_count": len(blind),
+        "blind_spots_sample": blind[:25],
+        "stats": raw.get("stats") or {},
+    }
+    if findings:
+        block["edge_findings"] = findings
+    return block
+
+
+def write_report(report: dict[str, Any], out_dir: Path) -> Path:
+    """Write the report to audit-report.json."""
+    path = out_dir / "audit-report.json"
+    serializable = {k: v for k, v in report.items() if k != "summary"}
+    # Processing-history loss is sticky within this run. A later render or a
+    # healthy segment does not reconstruct an earlier unretained assessment.
+    missing = report.get("completeness", {}).get("missing", [])
+    retained = _retained_processing_limitations(out_dir)
+    limitations = [label for label in _PROCESSING_HISTORY_LABELS
+                   if label in missing or label in retained]
+    if limitations:
+        # Persist before replacing the report: a failed projection write must
+        # leave its previous durable report available and fail visibly.
+        save_json(out_dir / _PROCESSING_HISTORY_FILE, {
+            "schema_version": 1, "limitations": limitations,
+        })
+    save_json(path, serializable)
+    return path
+
+
+def write_markdown_report(
+    report: dict[str, Any],
+    out_dir: Path,
+    *,
+    target_path: Path | None = None,
+    model: str = "",
+    duration_minutes: float = 0.0,
+    cost_usd: float = 0.0,
+    capabilities: dict[str, bool] | None = None,
+    suppressions_count: int = 0,
+    report_options=None,
+    reporting_sink=None,
+) -> Path:
+    """Publish the detailed audit report through the shared reporting engine."""
+    from core.reporting.options import ReportOptions
+    from dataclasses import replace
+    from core.reporting.service import capture_failure_summary, complete_reporting
+    from .report_document import build_audit_document
+    options = (report_options or ReportOptions(formats=("markdown", "json"))).validate()
+    options = replace(options, filenames=tuple({"json": "audit-summary.json", **dict(options.filenames)}.items())).validate()
+    try:
+        context, document = build_audit_document(report, Path(out_dir), target_path=target_path, model=model,
+                                                 duration_minutes=duration_minutes, cost_usd=cost_usd,
+                                                 capabilities=capabilities, suppressions_count=suppressions_count)
+    except (ValueError, TypeError, OSError) as exc:
+        reporting = capture_failure_summary("audit", Path(out_dir).name, str(target_path or report.get("target", "")), Path(out_dir), cause=exc,
+                                             artifacts=[{"path": str(Path(out_dir) / "audit-report.json")}], stem="audit-report")
+    else:
+        reporting = complete_reporting(context, Path(out_dir), document=document, stem="audit-report", options=options)
+    if reporting_sink is not None:
+        reporting_sink.append(reporting)
+    if reporting.publication and reporting.publication.outputs:
+        return Path(reporting.publication.outputs.get("markdown") or next(iter(reporting.publication.outputs.values())))
+    return Path(out_dir) / "audit-report.md"
+
+
+def _evidence_distribution(
+    findings: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Count findings per evidence tier."""
+    dist: dict[str, int] = {}
+    for f in findings:
+        # Raw snake_case enum key (matching EvidenceTier values) —
+        # the markdown renderer Title-Cases at display time.
+        tier = f.get("evidence_tier", "heuristic")
+        dist[tier] = dist.get(tier, 0) + 1
+    return dist
+
+
+def _load_review_state(out_dir: Path) -> dict[str, Any]:
+    """Load LLM review state from the review journal.
+
+    Returns a ``coverage-audit.json``-shaped dict
+    (``{"functions_analysed": [...]}``) so the downstream stats /
+    remaining-gap helpers work unchanged. Each journal entry becomes
+    one function record with ``file`` / ``function`` / ``status`` /
+    ``hash`` fields — matches the pre-migration record schema.
+    """
+    try:
+        from .journal import load_entries
+    except Exception:  # noqa: BLE001
+        return {"functions_analysed": []}
+    try:
+        # Latest per SITE — (file, function, line_start) — not per
+        # coarse (file, function): same-named checklist items
+        # (function + prototype, macro redefinitions) are distinct
+        # review subjects, and the coarse collapse made a reviewed
+        # prototype stand in for its unreviewed body in every
+        # report-side count.
+        #
+        # Mechanical echoes collapse in their OWN map: decomp-sweep /
+        # consistency-census rows are journalled AFTER the review
+        # loop, so a single latest-per-site map let a later
+        # mechanical echo shadow the LLM verdict at the same site —
+        # a binary-target run's report counted its LLM-suspicious
+        # and errored reviews as zero because sweep echoes outran
+        # them on timestamp. Every stats consumer already excludes
+        # mechanical rows from verdict authority
+        # (_apply_journal_verdict_overrides, _count_remaining_gaps);
+        # the split keeps both records visible without either
+        # evicting the other.
+        best: dict[tuple, Any] = {}
+        best_mech: dict[tuple, Any] = {}
+        for e in load_entries(out_dir):
+            bucket = best_mech if _is_mechanical_echo(e) else best
+            k = (e.file, e.function, e.line_start or 0)
+            prev = bucket.get(k)
+            if prev is None or e.ts > prev.ts:
+                bucket[k] = e
+        entries = list(best.values()) + list(best_mech.values())
+    except Exception:  # noqa: BLE001
+        return {"functions_analysed": []}
+    if not entries:
+        return {"functions_analysed": []}
+
+    functions: list[dict[str, Any]] = []
+    files_examined: set = set()
+    for entry in entries:
+        record: dict[str, Any] = {
+            "file": entry.file,
+            "function": entry.function,
+            "line_start": entry.line_start or 0,
+            # Span end travels with the record so the verdict-override
+            # join can bind a finding's line to its containing site.
+            "line_end": getattr(entry, "line_end", None),
+            "status": entry.verdict,
+            "hash": entry.source_hash or None,
+            # Machine-readable failure class on error rows — carried
+            # so the report's per-item errored list can state WHY a
+            # review failed without re-reading the journal.
+            "error_class": getattr(entry, "error_class", None),
+            # Post-loop mechanical entries (taint-spec / negative-space
+            # checks journalled after the review loop) are not LLM
+            # reviews — carry the marker so stats can state one
+            # counting rule instead of silently inflating "reviewed".
+            "mechanical": _is_mechanical_echo(entry),
+        }
+        from .assessment_basis_reporting import journal_assessment_basis
+        basis = journal_assessment_basis(entry, out_dir)
+        if basis is not None:
+            record["assessment_basis"] = basis
+        functions.append(record)
+        if entry.file:
+            files_examined.add(entry.file)
+    return {
+        "tool": "audit",
+        "functions_analysed": functions,
+        "files_examined": sorted(files_examined),
+    }
+
+
+_BENIGN_VERDICTS = frozenset({"clean", "dormant"})
+
+
+def _as_line(value: Any) -> int:
+    """``value`` as a non-negative int line number; 0 when unusable."""
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _site_covers(
+    site: dict[str, Any], line: int, *, _start: int | None = None,
+) -> bool:
+    """True when the journal site's span contains ``line``.
+
+    A positioned site without a usable ``line_end`` matches only an
+    exact ``line_start`` hit — the span's extent is unknown, so
+    containment cannot be claimed.
+    """
+    start = _as_line(site.get("line_start")) if _start is None else _start
+    if not start:
+        return False
+    end = _as_line(site.get("line_end"))
+    if end >= start:
+        return start <= line <= end
+    return line == start
+
+
+def _match_journal_site(
+    finding: dict[str, Any],
+    sites: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Pick the journal record for the SITE the finding belongs to.
+
+    Journal review records are kept latest-per-site — (file,
+    function, line_start) — because same-named checklist items
+    (function + prototype, macro redefinitions) are distinct review
+    subjects. Findings carry the vulnerable line, so a lined finding
+    binds only to the site whose span contains that line: a benign
+    verdict on the OTHER same-named site must never override — let
+    alone drop — this one.
+
+    Fallbacks stay in the never-suppress-without-evidence direction:
+
+    - Finding has a line and positioned sites exist, but none covers
+      the line → no match; the finding passes through untouched.
+    - Finding has no line, or every same-name row is span-unknown
+      (``line_start`` 0/absent) → coarse name-level join, preferring
+      a non-benign row over a benign one instead of last-wins, so an
+      unlocatable benign twin never retires a live verdict by mere
+      row order.
+    """
+    if not sites:
+        return None
+    line = _as_line(finding.get("line"))
+    positioned = False
+    best = None
+    best_start = 0
+    for site in sites:
+        start = _as_line(site.get("line_start"))
+        if not start:
+            continue
+        positioned = True
+        if not line:
+            continue
+        if _site_covers(site, line, _start=start) and start > best_start:
+            # Strict comparison preserves max()'s first-wins tie rule.
+            best, best_start = site, start
+    if line and positioned:
+        return best
+    # The legacy coarse join picks the LAST non-benign row, or the
+    # last row overall if all are benign. No candidate lists needed.
+    last_non_benign = None
+    for site in sites:
+        if site.get("status") not in _BENIGN_VERDICTS:
+            last_non_benign = site
+    return last_non_benign if last_non_benign is not None else sites[-1]
+
+
+def _apply_journal_verdict_overrides(
+    findings: list[dict[str, Any]],
+    audit_data: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """JOIN semantics: findings.json is emit-only at /audit run end;
+    the journal is authoritative for current verdict.
+
+    Two behaviours:
+
+    - **Status override**: when the journal's latest entry for a
+      finding's site disagrees with the finding's status, the
+      finding's ``status`` field is overwritten from the journal and
+      ``_verdict_source="journal"`` is stamped for audit-trail
+      visibility. Site resolution is per (file, function,
+      line-span) via :func:`_match_journal_site` — the coarse
+      (file, function) join collapsed same-named sites, letting a
+      clean prototype/macro-twin verdict drop the other site's
+      finding.
+    - **Benign drop**: when the journal reports a benign verdict
+      (``clean``, ``dormant``) — i.e. Reflexion refuted the finding
+      after initial emission — the finding is dropped from the
+      returned list entirely. Without this, ``findings_count`` +
+      the report's Findings section still tally refuted issues,
+      defeating the JOIN's whole purpose.
+
+    Mechanical echo rows carry no verdict authority here — they are
+    pattern-scan echoes journalled for cross-layer visibility, not
+    LLM reviews (the same exclusion the reviewed-stats counting
+    applies).
+
+    Returns the filtered list (never mutates the input list's
+    length in place).
+    """
+    by_name: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for func in audit_data.get("functions_analysed", []):
+        f = func.get("file", "")
+        fn = func.get("function", "")
+        status = func.get("status")
+        if f and fn and status and not func.get("mechanical"):
+            by_name.setdefault((f, fn), []).append(func)
+
+    out: list[dict[str, Any]] = []
+    for finding in findings:
+        # Journal rows carry the AS-REVIEWED checklist-item name; a
+        # finding whose attribution was corrected at the row seam
+        # (stamp_function_attribution) keeps that identity in
+        # claimed_function — join on it, or the corrected name
+        # orphans the row from its own review's verdict updates.
+        sites = by_name.get(
+            (
+                finding.get("file", ""),
+                finding.get("claimed_function")
+                or finding.get("function", ""),
+            ),
+            [],
+        )
+        site = _match_journal_site(finding, sites)
+        journal_verdict = site.get("status") if site else None
+        if journal_verdict and journal_verdict != finding.get("status"):
+            finding["status"] = journal_verdict
+            finding["_verdict_source"] = "journal"
+        if finding.get("status") in _BENIGN_VERDICTS:
+            # Reflexion refuted this finding — drop from active
+            # findings so counts and summaries reflect current state.
+            continue
+        out.append(finding)
+    return out
+
+
+# Artifacts every finished orchestrator run writes. Absence of any of
+# them means the run stopped before its export tail (or the write
+# failed) — the report states this instead of silently rendering the
+# sections empty. The inventory is NOT probed here: its slot has two
+# on-disk forms (single-file checklist.json, or the sharded
+# checklist/ dir whose writer unlinks the single file), so
+# _assess_completeness routes it through
+# core.inventory.checklist_exists instead of a literal file probe.
+_EXPECTED_ARTIFACTS = (
+    ("gaps.json", "gap schedule (gaps.json)"),
+    ("findings-graded.json", "graded findings export (findings-graded.json)"),
+    ("cost-breakdown.json", "cost ledger (cost-breakdown.json)"),
+)
+
+#: Run statuses `raptor-audit resume` can re-enter (mirrors
+#: core.run.metadata.RESUMABLE_STATUSES without importing it here —
+#: the report must render even when run metadata plumbing is absent).
+_RESUMABLE_STATUSES = frozenset({
+    "interrupted", "failed", "cancelled", "running",
+})
+
+
+def _study_starvation_label(out_dir: Path) -> str | None:
+    """Label naming study starvation, or ``None`` when study is fine.
+
+    Starvation = the consumer's persisted stats (``study-stats.json``,
+    written at drain) show zero re-reviews while ``reading-list.json``
+    still carries pending questions. Absent stats (older runs, no
+    study-eligible files) stay silent — absence of evidence is not a
+    gap claim.
+    """
+    try:
+        stats_path = out_dir / "study-stats.json"
+        if not stats_path.is_file():
+            return None
+        stats = load_json(stats_path, max_bytes=_MAX_STATE_BYTES)
+        if not isinstance(stats, dict) or stats.get("re_reviews"):
+            return None
+        from core.concepts.reading_list import ReadingList
+        pending = len(
+            ReadingList.load(out_dir / "reading-list.json").pending(),
+        )
+        if pending <= 0:
+            return None
+        reason = stats.get("stopped_reason") or "unknown"
+        return (
+            f"study results (0 re-reviews; {pending} questions still "
+            f"pending; consumer stopped: {reason})"
+        )
+    except Exception:
+        logger.debug("study starvation assessment failed", exc_info=True)
+        return None
+
+
+def _assess_completeness(out_dir: Path) -> dict[str, Any]:
+    """State how complete this run dir is — never assume.
+
+    Returns ``{"run_status": str|None, "missing": [labels],
+    "no_verdicts": bool, "partial": bool, "resumable": bool}``.
+    ``partial`` is True when the lifecycle status is anything but
+    ``completed`` (including unknown) or an expected export artifact
+    is absent. The verdict tables elsewhere in the report are built
+    from the journal regardless — completeness only *names* the gaps.
+    """
+    status: str | None = None
+    meta_path = out_dir / ".raptor-run.json"
+    if meta_path.is_file():
+        meta = load_json(meta_path, max_bytes=_MAX_RUN_META_BYTES)
+        if isinstance(meta, dict):
+            status = meta.get("status")
+
+    # Inventory probe goes through the sharded-aware accessor (the
+    # idiom _find_unrecorded_reads uses): the sharded checklist writer
+    # removes checklist.json and leaves checklist/index.json, so a
+    # bare .is_file() would mark every sharded run partial.
+    from core.inventory import checklist_exists
+    missing = [] if checklist_exists(out_dir) else [
+        "inventory (checklist.json)",
+    ]
+    missing.extend(
+        label for name, label in _EXPECTED_ARTIFACTS
+        if not (out_dir / name).is_file()
+    )
+    # Study starvation is a completeness gap, not a silent detail: a
+    # run whose study consumer produced zero re-reviews while
+    # questions are still pending reviewed everything hypothesis-blind
+    # (empty invariants). Name it so the operator sees it.
+    study_gap = _study_starvation_label(out_dir)
+    if study_gap:
+        missing.append(study_gap)
+    no_verdicts = not (out_dir / "review-journal.jsonl").is_file()
+    partial = bool(missing) or status != "completed"
+    return {
+        "run_status": status,
+        "missing": missing,
+        "no_verdicts": no_verdicts,
+        "partial": partial,
+        "resumable": status in _RESUMABLE_STATUSES,
+    }
+
+
+def _load_segments(out_dir: Path) -> dict[str, Any] | None:
+    """Segment provenance for resumed runs, from ``extra.resumes``."""
+    meta_path = out_dir / ".raptor-run.json"
+    if not meta_path.is_file():
+        return None
+    meta = load_json(meta_path, max_bytes=_MAX_RUN_META_BYTES)
+    try:
+        resumes = ((meta or {}).get("extra") or {}).get("resumes")
+    except AttributeError:
+        return None
+    if not isinstance(resumes, list) or not resumes:
+        return None
+    rows = [r for r in resumes if isinstance(r, dict)]
+    return {
+        "count": len(rows) + 1,
+        "resumes": rows,
+    }
+
+
+def run_scope_coverage(out_dir: Path) -> tuple[int, int] | None:
+    """``(reviewed, queued)`` over THIS run's scheduled gap queue.
+
+    The run-scope coverage figure: how much of what the run set out
+    to review actually got a completed review. ``queued`` is the
+    gaps.json queue size; ``reviewed`` counts queue items covered by
+    a non-mechanical, non-error journal entry (the same per-site rule
+    as ``_count_remaining_gaps`` — errored reviews and mechanical
+    echoes stay unreviewed / gap-eligible). ``None`` when the run has
+    no scheduled queue (absent or empty gaps.json) — callers fall
+    back to checklist-wide figures.
+    """
+    gaps_data = _load_gaps(out_dir)
+    if not isinstance(gaps_data, dict):
+        return None
+    gaps_list = gaps_data.get("gaps")
+    dict_rows = ([g for g in gaps_list if isinstance(g, dict)]
+                 if isinstance(gaps_list, list) else [])
+    if isinstance(gaps_list, list) and gaps_list:
+        # Same denominator _count_remaining_gaps iterates: the item
+        # list when one exists (dict rows only), else the count.
+        total = len(dict_rows)
+    else:
+        try:
+            total = int(gaps_data.get("count", 0) or 0)
+        except (TypeError, ValueError):
+            total = 0
+    if total <= 0:
+        return None
+    # Delegate on a NORMALISED view, never the raw artifact:
+    # _count_remaining_gaps trusts its input shape (str ``count``
+    # reaches the legacy subtraction raw; a truthy non-list or mixed
+    # ``gaps`` reaches the per-row ``.get``), and gaps.json is a run
+    # artifact a hostile target's build tooling can influence. The
+    # coerced int and the dict-row filter above ARE the shape this
+    # accessor already priced its denominator on — hand the delegate
+    # exactly that, so hostile shapes fall back per the docstring
+    # contract instead of raising.
+    normalised = {"gaps": dict_rows, "count": total}
+    remaining = _count_remaining_gaps(normalised, _load_review_state(out_dir))
+    remaining = min(max(0, remaining), total)
+    return total - remaining, total
+
+
+def _load_graded_stats(out_dir: Path) -> dict[str, Any]:
+    """The ``stats`` block of ``findings-graded.json`` — {} when the
+    export, or the block, is absent or malformed."""
+    path = out_dir / "findings-graded.json"
+    if not path.exists():
+        return {}
+    data = load_json(path, max_bytes=_MAX_FINDINGS_BYTES)
+    stats = data.get("stats") if isinstance(data, dict) else None
+    return stats if isinstance(stats, dict) else {}
+
+
+def _residue_count(value: Any) -> int:
+    """``value`` as a non-negative residue count; 0 when unusable."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
+
+
+# One browse command per residue class: the per-item query surface an
+# operator runs against the run dir. Generic ``{run-dir}`` placeholder
+# by design — the report must not embed operator filesystem paths.
+# Brace form, not ``<run-dir>``: these constants ride the same
+# sanitise seam as target-derived values, which HTML-escapes angle
+# brackets ("&lt;run-dir>" on the console).
+_RESIDUE_BROWSE_FINDINGS = "raptor-review findings --out {run-dir}"
+_RESIDUE_BROWSE_HISTORY = (
+    "raptor-review history {file} {function} --out {run-dir}"
+)
+
+
+def _build_unverified_residue(
+    stats: dict[str, int],
+    audit_data: dict[str, Any],
+    dark_count: int,
+    graded_stats: dict[str, Any],
+) -> dict[str, Any]:
+    """Structured per-class index of the run's unverified residue.
+
+    Classes are VIEWS over the run's artifacts, not a partition — a
+    low-confidence suspicious item counts under both
+    ``llm_suspicious`` and ``graded_low_confidence``. Each class
+    names the artifact holding its per-item records (``detail``) and
+    the query command (``browse``) so a count is never a dead end.
+    Counts reuse the sources the headline stats already derive from
+    (``_compute_stats`` output, ``functions_analysed`` records, the
+    dark list, the graded export's own stats block); this function
+    adds no parallel counting that could drift.
+    """
+    mech_suspicious = sum(
+        1 for rec in audit_data.get("functions_analysed", [])
+        if rec.get("mechanical") and rec.get("status") == "suspicious"
+    )
+    return {
+        "llm_suspicious": {
+            "count": _residue_count(stats.get("suspicious")),
+            "detail": "per-item records in findings-graded.json; "
+                      "journal rows in review-journal.jsonl",
+            "browse": _RESIDUE_BROWSE_FINDINGS,
+        },
+        "mechanical_suspicious": {
+            "count": mech_suspicious,
+            "detail": "[mechanical] rows in review-journal.jsonl; "
+                      "raw pattern matches in decomp-sweep.json",
+            "browse": _RESIDUE_BROWSE_FINDINGS,
+        },
+        "dark": {
+            "count": _residue_count(dark_count),
+            "detail": "status=dark items in findings-graded.json "
+                      "(needs_validation: true — run /validate)",
+            "browse": _RESIDUE_BROWSE_FINDINGS,
+        },
+        "graded_low_confidence": {
+            "count": _residue_count(graded_stats.get("low_confidence")),
+            "detail": "per-item confidence fields in "
+                      "findings-graded.json (stats.low_confidence)",
+            "browse": _RESIDUE_BROWSE_FINDINGS,
+        },
+        "errored": {
+            "count": _residue_count(stats.get("error")),
+            "detail": "verdict=error rows (with error_class) in "
+                      "review-journal.jsonl; surrounding events in "
+                      ".audit-log.jsonl",
+            "browse": _RESIDUE_BROWSE_HISTORY,
+        },
+    }
+
+
+# Render order + operator-facing labels for the residue classes.
+# Insertion order here IS the render order. Public: the run digest
+# renders the same classes under the same names.
+RESIDUE_LABELS = {
+    "llm_suspicious": "LLM suspicious",
+    "mechanical_suspicious": "Mechanical-sweep suspicious",
+    "dark": "Dark (tool-blind)",
+    "graded_low_confidence": "Graded low-confidence",
+    "errored": "Errored reviews",
+}
+
+
+def load_unverified_residue(out_dir: Path) -> dict[str, Any]:
+    """The ``unverified_residue`` block recomputed from the run's
+    artifacts — the exact derivation ``generate_report`` embeds,
+    without building the full report. Consumers that need only the
+    residue view (the run digest) read it here so the two surfaces
+    cannot drift."""
+    audit_data = _load_review_state(out_dir)
+    return _build_unverified_residue(
+        _compute_stats(audit_data),
+        audit_data,
+        len(_load_dark_findings(out_dir)),
+        _load_graded_stats(out_dir),
+    )
+
+
+def journal_present_but_unparsed(out_dir: Path) -> bool:
+    """True when a review journal EXISTS with content yet zero
+    entries parse.
+
+    A wholly-undecodable journal contributes nothing to the residue
+    counts, so a digest reading only the counts would render a bare
+    all-clear over a run whose evidence it could not read. Absent or
+    zero-byte journals return False — a run that never journalled is
+    not "unreadable". Any parsable row also returns False: partial
+    corruption already degrades correctly through the residue
+    classes (the loader skips corrupt lines), and this accessor must
+    not replace that path.
+    """
+    base = Path(out_dir)
+    try:
+        shards = [base / "review-journal.jsonl",
+                  *sorted(base.glob("review-journal.*.jsonl"))]
+        content_bytes = 0
+        for p in shards:
+            try:
+                if p.is_file():
+                    content_bytes += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return False
+    if content_bytes <= 0:
+        return False
+    try:
+        from .journal import load_entries
+        return not load_entries(out_dir)
+    except Exception:  # noqa: BLE001 — a loader failure over a present journal is exactly the unconfirmable case
+        return True
+
+
+def residue_top_items(out_dir: Path,
+                      limit: int = 5) -> list[dict[str, Any]]:
+    """Bounded per-item preview of the unverified residue.
+
+    Items come from the graded export (``findings-graded.json``,
+    status suspicious/dark) where present — those carry curated
+    one-line titles — else from the run journal's latest-per-site
+    non-mechanical suspicious rows (title = first line of the review
+    body). Values are target-derived; callers escape at render.
+    """
+    limit = max(0, limit)
+    items: list[dict[str, Any]] = []
+    path = out_dir / "findings-graded.json"
+    if path.exists():
+        data = load_json(path, max_bytes=_MAX_FINDINGS_BYTES)
+        findings = data.get("findings") if isinstance(data, dict) else None
+        for f in findings if isinstance(findings, list) else []:
+            if not isinstance(f, dict):
+                continue
+            if f.get("status") not in ("suspicious", "dark"):
+                continue
+            items.append({
+                "function": str(f.get("function") or ""),
+                "file": str(f.get("file") or ""),
+                "title": str(f.get("title") or f.get("hypothesis") or ""),
+                "status": str(f.get("status") or ""),
+                "confidence": str(f.get("confidence") or ""),
+            })
+            if len(items) >= limit:
+                break
+    if items:
+        return items
+    # Journal fallback — same collapse rule as _load_review_state:
+    # mechanical echoes never speak for a site, the latest LLM row
+    # holds verdict authority.
+    try:
+        from .journal import load_entries
+        best: dict[tuple, Any] = {}
+        for e in load_entries(out_dir):
+            if _is_mechanical_echo(e):
+                continue
+            k = (e.file, e.function, e.line_start or 0)
+            prev = best.get(k)
+            if prev is None or e.ts > prev.ts:
+                best[k] = e
+        for e in best.values():
+            if e.verdict != "suspicious":
+                continue
+            body_lines = str(getattr(e, "body", "") or "").strip() \
+                .splitlines()
+            items.append({
+                "function": e.function,
+                "file": e.file,
+                "title": body_lines[0] if body_lines else "",
+                "status": "suspicious",
+                "confidence": str(getattr(e, "confidence", None) or ""),
+            })
+            if len(items) >= limit:
+                break
+    except Exception:  # noqa: BLE001 — preview is best-effort, counts still render
+        logger.debug("residue top-item journal fallback failed",
+                     exc_info=True)
+    return items
+
+
+def format_residue_lines(report: dict[str, Any]) -> list[str]:
+    """Console/summary lines for the unverified-residue block.
+
+    THE single render seam for the residue section — the report
+    summary and the end-of-run console both print exactly these
+    lines. Empty when every class is zero (an all-verified run stays
+    silent); otherwise a heading plus one line per nonzero class
+    naming the count, the artifact holding the per-item records, and
+    the browse command. The values are operator-authored constants +
+    integer counts, but they ride through a report dict a consumer
+    may have rebuilt from disk — so they pass the same one-line
+    sanitise seam as every other rendered report value.
+    """
+    residue = report.get("unverified_residue")
+    if not isinstance(residue, dict):
+        return []
+    lines: list[str] = []
+    for key, label in RESIDUE_LABELS.items():
+        rec = residue.get(key)
+        if not isinstance(rec, dict):
+            continue
+        count = _residue_count(rec.get("count"))
+        if count <= 0:
+            continue
+        lines.append(
+            f"  - {label}: {count} — "
+            f"{_line(rec.get('detail', ''), max_chars=200)} "
+            f"(browse: {_line(rec.get('browse', ''), max_chars=120)})"
+        )
+    if not lines:
+        return []
+    return [
+        "Unverified residue — examined but not fully verified "
+        "(not all-clear):",
+        *lines,
+    ]
+
+
+def _load_dark_findings(out_dir: Path) -> list[dict[str, Any]]:
+    """Load status=dark entries from findings-graded.json."""
+    path = out_dir / "findings-graded.json"
+    if not path.exists():
+        return []
+    data = load_json(path, max_bytes=_MAX_FINDINGS_BYTES)
+    findings = data.get("findings", []) if isinstance(data, dict) else []
+    return [
+        f for f in findings
+        if isinstance(f, dict) and f.get("status") == "dark"
+    ]
+
+
+def _annotate_channel_loss(
+    completeness: dict[str, Any],
+    tripped_channels: dict[str, Any],
+) -> None:
+    """Name run-ending validation-channel loss on the completeness block.
+
+    A channel still tripped at report time skipped every dispatch
+    since its trip — each of those reviews issued its verdict WITHOUT
+    this validation leg.  The ``channel_health`` block records the
+    mechanics; the loss itself must sit beside ``missing`` so the
+    summary states it loudly instead of burying it.  A channel that
+    recovered before run end, or tripped with nothing behind it
+    (zero skips), is not a loss.  Values are sanitised here: trip
+    reasons quote channel error strings that can echo target- or
+    server-derived bytes (tier-diagnostics.json is run-dir state).
+    """
+    losses: list[dict[str, Any]] = []
+    for raw_name, rec in sorted(tripped_channels.items()):
+        if not isinstance(rec, dict) or not rec.get("tripped"):
+            continue
+        try:
+            skips = int(rec.get("skips_since_trip") or 0)
+        except (TypeError, ValueError):
+            skips = 0
+        if skips <= 0:
+            continue
+        losses.append({
+            "channel": _line(raw_name, max_chars=40),
+            "skipped_dispatches": skips,
+            "reason": _line(
+                rec.get("trip_reason") or "consecutive dispatch failures",
+                max_chars=200,
+            ),
+        })
+    if losses:
+        completeness["channel_loss"] = losses
+
+
+def _annotate_dark_awaiting(
+    completeness: dict[str, Any],
+    out_dir: Path,
+    dark_total: int,
+    target_path: Path | None,
+) -> None:
+    """State how many dark findings are still awaiting /validate.
+
+    Reads ``validate-postpass.json`` (written by ``core.audit.validate``
+    with the post-pass selection record). When the record is absent —
+    the post-pass never ran, or predates the record — every dark row
+    counts as awaiting. Sets ``dark_awaiting`` + ``dark_followup`` on
+    the completeness block; a zero-awaiting run sets neither.
+    """
+    awaiting = dark_total
+    record = None
+    record_path = out_dir / "validate-postpass.json"
+    if record_path.is_file():
+        record = load_json(record_path, max_bytes=_MAX_RUN_META_BYTES)
+    if isinstance(record, dict):
+        # The record lives in a directory the dispatched CC child and
+        # the target can write mid-run, and the follow-up renders as
+        # an operator-facing EXACT re-run command. The old prefix
+        # gate (accept anything starting "/validate ") let a run-dir
+        # writer splice arbitrary operator instructions into the
+        # remainder — so the recorded value is never consumed at all:
+        # the command is rebuilt locally below from the run's own
+        # metadata, which is exactly what the writer derives it from.
+        try:
+            recorded = int(record.get("dark_awaiting", dark_total))
+            selected = int(record.get("dark_selected", 0))
+        except (TypeError, ValueError):
+            recorded, selected = dark_total, 0
+        # The record is a selection-time snapshot; the run can both
+        # RESOLVE dark rows after it (dark verification runs later)
+        # and ADD new ones (post-loop demotions). Count late-added
+        # rows as awaiting, and never claim more awaiting rows than
+        # the graded export still carries.
+        awaiting = min(max(recorded, dark_total - selected), dark_total)
+    if awaiting <= 0:
+        return
+    # Local rebuild in ALL cases: the run's own metadata carries the
+    # target (the main report path — libexec/raptor-audit's finalise —
+    # does not pass target_path), and the findings path is fixed.
+    target = str(target_path) if target_path else _run_meta_target(out_dir)
+    # NO --include-dark on the suggested command: the validate import
+    # routes dark rows to the witness backlog by default and that
+    # default is the standing design — the flag is the operator's
+    # explicit opt-in, named in the advisory note below so it stays
+    # discoverable without being bulk-suggested.
+    followup = (
+        f"/validate {target or '<target>'} "
+        f"--findings {out_dir / 'findings-graded.json'}"
+    )
+    completeness["dark_awaiting"] = awaiting
+    completeness["dark_followup"] = followup
+    # Locally-built advisory (never read from the child-writable
+    # record): states the routing and names the opt-in flag.
+    from core.audit.validate import DARK_ROUTING_NOTE
+    completeness["dark_followup_note"] = DARK_ROUTING_NOTE
+
+
+def _annotate_validate_postpass(
+    completeness: dict[str, Any],
+    out_dir: Path,
+    target_path: Path | None,
+) -> None:
+    """Surface a skipped /validate post-pass on the completeness block.
+
+    Reads ``validate-postpass.json``. When the post-pass never ran,
+    ``validate_postpass_skipped`` carries the recorded reason and
+    ``validate_postpass_followup`` the exact re-run command — without
+    this the reason lives only in the record file and the summary
+    reads as if the findings had been validated. The record lives in
+    a directory the dispatched CC child can write, so the reason is
+    sanitised at render time and the follow-up command is always
+    rebuilt locally (same policy as the dark followup) — the record's
+    own ``followup_command`` is never consumed.
+    """
+    record_path = out_dir / "validate-postpass.json"
+    if not record_path.is_file():
+        return
+    record = load_json(record_path, max_bytes=_MAX_RUN_META_BYTES)
+    if not isinstance(record, dict) or record.get("ran") is not False:
+        return
+    reason = record.get("skipped_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "unknown (no reason recorded)"
+    completeness["validate_postpass_skipped"] = reason
+    # Local rebuild in ALL cases — same policy (and rationale) as the
+    # dark follow-up: the recorded command sits in a child/target-
+    # writable file and renders as an operator-facing exact re-run
+    # line, and the local derivation is what the writer used anyway.
+    target = str(target_path) if target_path else _run_meta_target(out_dir)
+    # NO --include-dark: the post-pass selection carries finding-status
+    # rows only (dark is not validate-eligible), so the equivalent
+    # re-run is the plain import — dark rows route to the witness
+    # backlog by default, as the dark follow-up's advisory states.
+    followup = (
+        f"/validate {target or '<target>'} "
+        f"--findings {out_dir / 'findings-graded.json'}"
+    )
+    completeness["validate_postpass_followup"] = followup
+
+
+def _run_meta_target(out_dir: Path) -> str:
+    """Target path recorded in the run metadata, or ""."""
+    meta_path = out_dir / ".raptor-run.json"
+    if not meta_path.is_file():
+        return ""
+    meta = load_json(meta_path, max_bytes=_MAX_RUN_META_BYTES)
+    if isinstance(meta, dict):
+        return str(meta.get("target_path") or "")
+    return ""
+
+
+def _load_vendored_triage(out_dir: Path) -> dict[str, int]:
+    """Count vendored/generated triage decisions from the
+    suppressions.jsonl audit trail (rule_id ``audit:vendored-triage``).
+    Returns ``{}`` when the tier made no decisions."""
+    path = out_dir / "suppressions.jsonl"
+    if not path.exists():
+        return {}
+    skipped = glanced = 0
+    try:
+        with preserving_stream_error(Path(path).open(encoding="utf-8")) as f:  # raw-open: RAPTOR-written report artifact in the run dir
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("rule_id") != "audit:vendored-triage":
+                    continue
+                if rec.get("tier") == "skip":
+                    skipped += 1
+                elif rec.get("tier") == "glance":
+                    glanced += 1
+    except OSError:
+        return {}
+    if not (skipped or glanced):
+        return {}
+    return {"skipped": skipped, "glanced": glanced}
+
+
+def _load_glance_cap(out_dir: Path) -> int:
+    """Count glance-escalation-cap denials from the suppressions.jsonl
+    audit trail (rule_id ``audit:glance-escalation-cap``, written
+    ``dropped=False`` — the glance verdict survives; the record marks
+    the withheld full review). Returns ``0`` when the cap never
+    bound."""
+    path = out_dir / "suppressions.jsonl"
+    if not path.exists():
+        return 0
+    capped = 0
+    try:
+        with preserving_stream_error(Path(path).open(encoding="utf-8")) as f:  # raw-open: RAPTOR-written report artifact in the run dir
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("rule_id") == "audit:glance-escalation-cap":
+                    capped += 1
+    except OSError:
+        return 0
+    return capped
+
+
+def _load_toolchain_screen(out_dir: Path) -> int:
+    """Count toolchain glance screens from the suppressions.jsonl
+    audit trail (rule_id ``audit:toolchain-screen``, written
+    ``dropped=False`` — the glance verdict survives; the record marks
+    the by-design withheld full review). Returns ``0`` when nothing
+    was screened."""
+    path = out_dir / "suppressions.jsonl"
+    if not path.exists():
+        return 0
+    screened = 0
+    try:
+        with preserving_stream_error(Path(path).open(encoding="utf-8")) as f:  # raw-open: RAPTOR-written report artifact in the run dir
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("rule_id") == "audit:toolchain-screen":
+                    screened += 1
+    except OSError:
+        return 0
+    return screened
+
+
+def _load_findings(out_dir: Path) -> list[dict[str, Any]]:
+    path = out_dir / "findings.json"
+    if not path.exists():
+        return []
+    data = load_json(path, max_bytes=_MAX_FINDINGS_BYTES)
+    if isinstance(data, list):
+        return data
+    return data.get("findings", []) if isinstance(data, dict) else []
+
+
+def _load_gaps(out_dir: Path) -> dict[str, Any]:
+    path = out_dir / "gaps.json"
+    if not path.exists():
+        return {}
+    data = load_json(path, max_bytes=_MAX_FINDINGS_BYTES)
+    return data if data is not None else {}
+
+
+def _load_not_attempted(out_dir: Path) -> dict[str, Any]:
+    """Load not-attempted.json (budget-truncated tail), or {}."""
+    path = out_dir / "not-attempted.json"
+    if not path.exists():
+        return {}
+    data = load_json(path, max_bytes=_MAX_STATE_BYTES)
+    return data if isinstance(data, dict) else {}
+
+
+def _compute_stats(audit_data: dict[str, Any]) -> dict[str, int]:
+    """Count statuses across all reviewed functions.
+
+    One counting rule, shared with the console summary: ``reviewed``
+    (and the per-status counts) cover LLM reviews only; post-loop
+    mechanical journal entries land in ``mechanical``. Pre-fix the
+    journal-derived report counted every entry as reviewed while the
+    console counted only tallied LLM outcomes — one run printed
+    14 reviewed / 8 suspicious in the report against 9 / 3 on the
+    console for the same journal.
+    """
+    counts = {
+        "reviewed": 0, "clean": 0, "suspicious": 0, "finding": 0,
+        "dormant": 0, "dark": 0, "error": 0, "mechanical": 0,
+    }
+
+    if "files" in audit_data:
+        for file_data in audit_data["files"].values():
+            for func_data in file_data.get("functions", {}).values():
+                counts["reviewed"] += 1
+                status = func_data.get("status", "clean")
+                if status in counts:
+                    counts[status] += 1
+    elif "functions_analysed" in audit_data:
+        for func_data in audit_data["functions_analysed"]:
+            if func_data.get("mechanical"):
+                counts["mechanical"] += 1
+                continue
+            counts["reviewed"] += 1
+            status = func_data.get("status", "clean")
+            if status in counts:
+                counts[status] += 1
+
+    return counts
+
+
+def _count_remaining_gaps(
+    gaps_data: dict[str, Any],
+    audit_data: dict[str, Any],
+) -> int:
+    """Count gaps not covered by this audit run.
+
+    One counting rule, shared with ``_compute_stats``: post-loop
+    mechanical journal echoes are not LLM reviews and must not count
+    as covered gaps — pre-fix each pattern-scan echo shrank
+    ``gaps_remaining`` by one while the reviewed count excluded it,
+    so the two headline numbers disagreed about the same journal.
+    """
+    gaps = gaps_data.get("gaps") or []
+    if not gaps:
+        # Legacy gaps.json without the item list: arithmetic fallback.
+        # Set-blind subtraction is UNSAFE when the list exists — the
+        # journal contains reviews that are not gap items (batch
+        # members, re-reviews, deepen passes), so ``reviewed`` can
+        # exceed ``total_gaps`` while real gap items sit unreviewed;
+        # a 46-hour run reported "0 gaps left" over ~2,300 untouched
+        # priority-0 functions (two of which carried real
+        # vulnerabilities a comparison harness later confirmed).
+        total_gaps = gaps_data.get("count", 0)
+        if "files" in audit_data:
+            reviewed = sum(
+                len(fd.get("functions", {}))
+                for fd in audit_data["files"].values()
+            )
+        elif "functions_analysed" in audit_data:
+            reviewed = sum(
+                1 for func_data in audit_data["functions_analysed"]
+                if not func_data.get("mechanical")
+            )
+        else:
+            reviewed = 0
+        return max(0, total_gaps - reviewed)
+
+    # Set difference, per SITE: a gap counts as remaining unless a
+    # non-mechanical journal record covers its (file, name) — and,
+    # when both sides carry spans, its line_start. Same-named items
+    # (function + prototype, macro redefinitions) must not cover each
+    # other.
+    sites: set = set()
+    spanless: set = set()
+    for rec in audit_data.get("functions_analysed", []):
+        if rec.get("mechanical") or rec.get("status") == "error":
+            continue
+        key = (rec.get("file"), rec.get("function"))
+        ls = rec.get("line_start") or 0
+        if ls:
+            sites.add((key[0], key[1], ls))
+        else:
+            spanless.add(key)
+    if "files" in audit_data:  # pre-migration record shape
+        for fp, fd in audit_data["files"].items():
+            for fn in fd.get("functions", {}):
+                spanless.add((fp, fn))
+    remaining = 0
+    for g in gaps:
+        key = (g.get("file"), g.get("name"))
+        ls = g.get("line_start") or 0
+        if key in spanless or (ls and (key[0], key[1], ls) in sites):
+            continue
+        remaining += 1
+    return remaining
+
+
+def _find_unrecorded_reads(
+    out_dir: Path,
+    audit_data: dict[str, Any],
+    target_path: Path | None,
+) -> list[dict[str, Any]]:
+    """Find functions in files the LLM read but didn't record.
+
+    Cross-references the coverage plugin's .reads-manifest (files the
+    Read tool touched) against journal-derived review state
+    (``audit_data`` from ``_load_review_state`` — coverage-audit.json
+    and the ``raptor-audit record`` CLI were removed by the journal
+    migration).  Returns a list of {file, functions: [name, ...]}
+    dicts for files with unrecorded functions, sorted by number of
+    unrecorded functions descending.
+    """
+    manifest_path = out_dir / READS_MANIFEST
+    from core.inventory import checklist_exists
+    if not manifest_path.exists() or not checklist_exists(out_dir):
+        return []
+
+    # Chokepoint reader, never a bespoke parser: the manifest sits in
+    # the sandbox write grant, and a raw ``.open()`` here followed a
+    # planted symlink, blocked forever on a planted FIFO (wedging
+    # report finalize), and buffered an unbounded plant — exactly the
+    # attacks the shared reader refuses (lstat S_ISREG + 64 MiB cap).
+    read_paths = read_manifest_lines(manifest_path)
+    if not read_paths:
+        return []
+
+    from core.inventory import read_checklist
+    checklist = read_checklist(out_dir)
+    if not checklist:
+        return []
+
+    recorded_funcs: set[str] = set()
+    if "files" in audit_data:
+        for file_path, file_data in audit_data["files"].items():
+            for func_name in file_data.get("functions", {}):
+                recorded_funcs.add(f"{file_path}:{func_name}")
+    elif "functions_analysed" in audit_data:
+        for entry in audit_data["functions_analysed"]:
+            f = entry.get("file", "")
+            fn = entry.get("function", "")
+            if f and fn:
+                recorded_funcs.add(f"{f}:{fn}")
+
+    file_functions: dict[str, list[str]] = {}
+    for file_entry in checklist.get("files", []):
+        rel_path = file_entry.get("path", "")
+        if not rel_path:
+            continue
+        funcs = [
+            item["name"]
+            for item in file_entry.get("items", [])
+            if item.get("kind") in ("function", "method") and item.get("name")
+        ]
+        if funcs:
+            file_functions[rel_path] = funcs
+
+    target_resolved = str(Path(target_path).resolve()) if target_path else None
+
+    result = []
+    for abs_path in read_paths:
+        rel_path = None
+        if target_resolved and abs_path.startswith(target_resolved + os.sep):
+            rel_path = abs_path[len(target_resolved) + 1:]
+        elif target_resolved and abs_path == target_resolved:
+            rel_path = abs_path[len(target_resolved):]
+        if not rel_path:
+            continue
+
+        if rel_path not in file_functions:
+            continue
+
+        unrecorded = [
+            fn for fn in file_functions[rel_path]
+            if f"{rel_path}:{fn}" not in recorded_funcs
+        ]
+        if unrecorded:
+            result.append({"file": rel_path, "functions": unrecorded})
+
+    result.sort(key=lambda x: len(x["functions"]), reverse=True)
+    return result
+
+
+def _completeness_lines(report: dict[str, Any]) -> list[str]:
+    """Shared partial-run / segment statements for summary + markdown."""
+    from .knowledge_reporting import knowledge_processing_lines
+
+    lines: list[str] = knowledge_processing_lines(report)
+    segments = report.get("segments")
+    if segments:
+        lines.append(
+            f"Run segments: {int(segments.get('count', 0) or 0)} "
+            "(resumed run — one report covers all segments)"
+        )
+    completeness = report.get("completeness") or {}
+    if completeness.get("partial"):
+        status = _line(completeness.get("run_status") or "unknown",
+                       max_chars=40)
+        lines.append(
+            f"Partial run — lifecycle status: {status.title()}. "
+            "Verdict counts below reflect the journal as written."
+        )
+        lines.extend(f"  Missing: {_line(label, max_chars=80)}" for label in completeness.get("missing", []))
+        if completeness.get("no_verdicts"):
+            lines.append(
+                "  No review journal — the run stopped before any "
+                "verdict was recorded."
+            )
+        if completeness.get("resumable"):
+            lines.append(
+                "  Resumable: raptor-audit resume <run-dir> re-enters "
+                "this run ($0 verdict re-import, remaining budget)."
+            )
+        else:
+            # Completed-with-gaps (or unknown-status) shape: resume is
+            # refused for this run, so prescribe the path that works —
+            # a NEW run, whose cross-run verdict reuse imports this
+            # run's journal verdicts at $0.
+            lines.append(
+                "  Continue in a new run — cross-run verdict reuse "
+                "imports this run's verdicts at $0."
+            )
+    # Run-ending validation-channel loss: every review behind the
+    # trip issued its verdict without that channel's leg — a
+    # completeness fact, stated as loudly as `missing` (values were
+    # sanitised at annotation; re-applying _line is idempotent on the
+    # escaped text and keeps this renderer safe standalone).
+    for loss in completeness.get("channel_loss") or []:
+        if not isinstance(loss, dict):
+            continue
+        name = _line(loss.get("channel") or "?", max_chars=40)
+        try:
+            skips = int(loss.get("skipped_dispatches") or 0)
+        except (TypeError, ValueError):
+            skips = 0
+        reason = _line(
+            loss.get("reason") or "consecutive dispatch failures",
+            max_chars=200,
+        )
+        lines.append(
+            f"⚠️ Validation channel lost mid-run: {name} — "
+            f"{skips} dispatch(es) skipped after the trip, so the "
+            f"reviews behind them issued verdicts WITHOUT the {name} "
+            f"validation leg (trip: {reason})."
+        )
+        lines.append(
+            f"  Skipped is not refuted — treat the missing {name} "
+            "receipts as unanswered questions, not clean bills."
+        )
+        lines.append(
+            f"  Remedy: restore the {name} backend (server / "
+            "forwarder socket), then re-run or resume — the health "
+            "gate re-probes on a backoff schedule and resumes "
+            "dispatch as soon as the backend answers."
+        )
+    # Dark rows the /validate post-pass never adjudicated — stated
+    # unconditionally (a completed run can still owe these), with the
+    # exact follow-up command.
+    dark_awaiting = int(completeness.get("dark_awaiting", 0) or 0)
+    if dark_awaiting:
+        lines.append(
+            f"{dark_awaiting} dark finding(s) awaiting validation "
+            "(tool-blind — never entered the /validate post-pass)."
+        )
+        followup = completeness.get("dark_followup")
+        if followup:
+            lines.append(f"  Follow up: {_line(followup, max_chars=400)}")
+        note = completeness.get("dark_followup_note")
+        if note:
+            lines.append(f"  ({_line(note, max_chars=300)})")
+    # A skipped /validate post-pass means NO emitted finding was
+    # validated — stated with the recorded reason and the exact
+    # re-run command, never left to the on-disk record alone.
+    skipped = completeness.get("validate_postpass_skipped")
+    if skipped:
+        lines.append(
+            "/validate post-pass skipped — findings were not "
+            f"validated: {_line(skipped, max_chars=300)}"
+        )
+        vp_followup = completeness.get("validate_postpass_followup")
+        if vp_followup:
+            lines.append(
+                f"  Re-run: {_line(vp_followup, max_chars=400)}"
+            )
+    return lines
+
+
+def _summary_finding_line(f: dict[str, Any]) -> str:
+    """One finding's summary list line. LLM-derived values — sanitise
+    so a crafted title / path cannot inject extra lines or live markup
+    into the summary."""
+    severity = _line(str(f.get("severity", "medium")).title(), max_chars=40)
+    return (
+        f"- [{severity}] {_line(f.get('title', 'Untitled'))} "
+        f"({_line(f.get('file', '?'))}:"
+        f"{_line(f.get('line', '?'), max_chars=20)})"
+    )
+
+
+def _format_summary(report: dict[str, Any]) -> str:
+    """Format a human-readable summary."""
+    stats = report.get("stats", {})
+    mech = stats.get("mechanical", 0)
+    mech_s = f" (+{mech} mechanical post-loop)" if mech else ""
+    lines = ["## Audit Summary", ""]
+    state_lines = _completeness_lines(report)
+    if state_lines:
+        lines.extend(state_lines)
+        lines.append("")
+    lines += [
+        f"Functions LLM-reviewed: {stats.get('reviewed', 0)}{mech_s}",
+        f"  Clean: {stats.get('clean', 0)}",
+        f"  Dormant: {stats.get('dormant', 0)}",
+        f"  Dark: {stats.get('dark', 0)}",
+        f"  Suspicious: {stats.get('suspicious', 0)}",
+        f"  Finding: {stats.get('finding', 0)}",
+        f"  Error: {stats.get('error', 0)}",
+        "",
+        f"Tool-confirmed findings: {report.get('findings_count', 0)}",
+        f"Gaps remaining: {report.get('gaps_remaining', 0)}",
+    ]
+
+    # Unverified residue — right under the headline counts, before
+    # any per-class detail section: a zero-findings run with residue
+    # must never read as all-clear. Single render seam shared with
+    # the end-of-run console (format_residue_lines).
+    residue_lines = format_residue_lines(report)
+    if residue_lines:
+        lines.append("")
+        lines.extend(residue_lines)
+
+    errored = report.get("errored_functions", [])
+    if errored:
+        lines.append("")
+        lines.append(
+            f"### Errored reviews ({len(errored)}) — failed, not clean"
+        )
+        lines.append(
+            "These reviews never completed — the absence of a finding "
+            "here is not a clean verdict; they stay gap-eligible."
+        )
+        for rec in errored[:_MAX_ERRORED_LISTED]:
+            # file / function come from the scanned repo's checklist
+            # and error_class from the journal — target-derived, so
+            # each renders through the one-line sanitise seam.
+            lines.append(
+                f"  - {_line(rec.get('file', '?'))}:"
+                f"{_line(rec.get('function', '?'), max_chars=80)} "
+                f"({_line(rec.get('error_class') or 'unclassified', max_chars=40)})"
+            )
+        if len(errored) > _MAX_ERRORED_LISTED:
+            lines.append(
+                f"  ... and {len(errored) - _MAX_ERRORED_LISTED} more "
+                "(full list: errored_functions in audit-report.json)"
+            )
+
+    dark_findings = report.get("dark_findings", [])
+    if dark_findings:
+        lines.append("")
+        lines.append(
+            f"### Dark findings ({len(dark_findings)}) — "
+            f"need concrete verification"
+        )
+        lines.append(
+            "Tool-blind classes (auth bypass, logic, IDOR, ...) no "
+            "mechanical channel can decide. Exported with "
+            "needs_validation: true — run /validate on them."
+        )
+        for f in dark_findings[:10]:
+            lines.append(
+                f"- {_line(f.get('title', 'Untitled'))} "
+                f"({_line(f.get('file', '?'))}:"
+                f"{_line(f.get('line', '?'), max_chars=20)})"
+            )
+        if len(dark_findings) > 10:
+            lines.append(f"  ... and {len(dark_findings) - 10} more")
+    not_attempted = report.get("not_attempted")
+    if not_attempted:
+        lines.append(
+            f"Not attempted ({not_attempted.get('reason', 'budget')}): "
+            f"{not_attempted.get('count', 0)} functions — see "
+            "not-attempted.json; they stay gap-eligible next run"
+        )
+    vendored = report.get("vendored_triage")
+    if vendored:
+        lines.append(
+            f"Vendored/generated triage: {vendored.get('skipped', 0)} "
+            f"functions skipped, {vendored.get('glanced', 0)} routed to "
+            "glance — per-function records in suppressions.jsonl"
+        )
+    glance_capped = report.get("glance_escalation_capped")
+    if glance_capped:
+        lines.append(
+            f"Glance-escalation cap: {glance_capped} glance-suspicious "
+            "function(s) kept their glance verdict without a full "
+            "review (escalation budget exhausted) — per-function "
+            "records in suppressions.jsonl"
+        )
+    toolchain_screened = report.get("toolchain_glance_screened")
+    if toolchain_screened:
+        lines.append(
+            f"Toolchain screen: {toolchain_screened} binary toolchain "
+            "function(s) kept their glance verdict without a full "
+            "review (by-design name-evidence screen, not budget) — "
+            "per-function records in suppressions.jsonl"
+        )
+
+    findings = report.get("findings", [])
+    if findings:
+        lines.append("")
+        lines.append("### Findings")
+        # Production tree first; non-production trees grouped after,
+        # labeled with counts (see _group_findings_by_tree).
+        production, grouped = _group_findings_by_tree(findings)
+        lines.extend(_summary_finding_line(f) for f in production)
+        for tree_class, group in grouped:
+            lines.append(
+                f"{_TREE_CLASS_GROUP_LABELS[tree_class]} ({len(group)}):"
+            )
+            lines.extend(
+                "  " + _summary_finding_line(f) for f in group
+            )
+
+    survival = report.get("survival")
+    if survival:
+        from .survival import format_survival
+        lines.append("")
+        lines.append("### Finding survival (/validate feedback)")
+        lines.extend(format_survival(survival)[1:])
+
+    presweep = report.get("joern_presweep")
+    if presweep:
+        lines.append("")
+        interrupted = presweep.get("interrupted", 0)
+        requeued = presweep.get("requeued", 0)
+        if presweep.get("recovered"):
+            lines.append(
+                f"Joern pre-sweep: interrupted by a server restart "
+                f"({interrupted}x), re-queued and recovered after "
+                f"{requeued} attempt(s) — "
+                f"{presweep.get('flows_recovered', 0)} flow group(s) "
+                f"recovered"
+            )
+        elif interrupted:
+            lines.append(
+                "### ⚠️ Joern pre-sweep window lost"
+            )
+            # reason / query_timeout_s / cpg_bytes are ADDITIVE
+            # status fields — records from before they existed render
+            # the original wording unchanged.
+            if presweep.get("reason") == "query_timeout":
+                window_s = presweep.get("query_timeout_s")
+                window = f" ({window_s}s)" if window_s else ""
+                lines.append(
+                    f"The window's own query budget{window} bound: it "
+                    f"timed out and was NOT recovered after {requeued} "
+                    f"re-queue attempt(s) — this run's taint-flow "
+                    f"evidence is incomplete (functions read as 'no "
+                    f"flows' rather than 'not swept'). Remedy: raise "
+                    f"joern_query_timeout_s in tuning.json (the "
+                    f"CPG-size derivation scales from it), then re-run "
+                    f"/audit or /agentic."
+                )
+            else:
+                lines.append(
+                    f"Interrupted by a server restart and NOT recovered "
+                    f"after {requeued} re-queue attempt(s) — this run's "
+                    f"taint-flow evidence is incomplete (functions read as "
+                    f"'no flows' rather than 'not swept'). Re-run /audit "
+                    f"or /agentic to regenerate the sweep."
+                )
+        else:
+            # Errored (never interrupted): the record exists exactly
+            # because the taint query failed — restart wording here
+            # would misattribute the loss.
+            n_errors = len(presweep.get("errors") or [])
+            lines.append(
+                "### ⚠️ Joern pre-sweep errored"
+            )
+            if presweep.get("reason") == "query_timeout":
+                window_s = presweep.get("query_timeout_s")
+                window = f" after {window_s}s" if window_s else ""
+                lines.append(
+                    f"The taint query timed out{window} — the query "
+                    f"budget is the ceiling that bound. This run's "
+                    f"taint-flow evidence is incomplete (functions "
+                    f"read as 'no flows' rather than 'not swept'). "
+                    f"Remedy: raise joern_query_timeout_s in "
+                    f"tuning.json (the CPG-size derivation scales from "
+                    f"it), then re-run /audit or /agentic."
+                )
+            else:
+                lines.append(
+                    f"The taint query errored ({n_errors} error(s)) — "
+                    f"this run's taint-flow evidence is incomplete "
+                    f"(functions read as 'no flows' rather than "
+                    f"'not swept'). Re-run /audit or /agentic to "
+                    f"regenerate the sweep."
+                )
+
+    cpg_build = report.get("joern_cpg_build")
+    if cpg_build and (cpg_build.get("failed") or cpg_build.get("retried")
+                      or cpg_build.get("import_retried")):
+        lines.append("")
+        first_heap = cpg_build.get("first_heap_mb")
+        first_wall = cpg_build.get("first_timeout_s")
+        retry_heap = cpg_build.get("retry_heap_mb")
+        retry_wall = cpg_build.get("retry_timeout_s")
+        attempts = (
+            f"first attempt heap="
+            f"{first_heap if first_heap else 'default'} MB / "
+            f"timeout={first_wall}s"
+        )
+        if cpg_build.get("retried"):
+            attempts += (
+                f"; derived-max retry heap={retry_heap} MB / "
+                f"timeout={retry_wall}s"
+            )
+        if cpg_build.get("failed"):
+            lines.append("### ⚠️ Joern channel lost — CPG build failed")
+            rec_target = cpg_build.get("target")
+            if rec_target:
+                # Attribution: the record is a per-run-dir singleton;
+                # naming its target lets an operator spot a stale
+                # record from a segment that audited a different
+                # narrowed root.
+                lines.append(f"(build target: {rec_target})")
+            # reason / import_timeout_s / cpg_bytes are ADDITIVE
+            # status fields — a record from before they existed hits
+            # every `else` branch and renders the original wording
+            # unchanged.
+            reason = cpg_build.get("reason")
+            import_phase = cpg_build.get("phase") == "import"
+            if reason == "import_timeout":
+                imp_s = cpg_build.get("import_timeout_s")
+                imp_sz = cpg_build.get("cpg_bytes")
+                detail = f" at {imp_s}s" if imp_s else ""
+                if imp_sz:
+                    detail += f" (CPG {imp_sz} bytes)"
+                what = (
+                    f"The CPG built but the client-side import wall "
+                    f"bound: importCpg timed out{detail}"
+                )
+            elif reason == "import_connection_lost":
+                what = (
+                    "The CPG built but the server connection was lost "
+                    "during import"
+                )
+            elif import_phase:
+                what = "The CPG built but failed to import into the server"
+            else:
+                what = "The CPG build failed"
+            # Import-phase failures are governed by the import wall,
+            # not the build heap/wall — point the remedy at the key
+            # that actually moves the binding ceiling.
+            remedy = (
+                "raise joern_import_timeout_s in tuning.json (or leave "
+                "it on auto and it scales with CPG size), or narrow "
+                "--scope."
+                if import_phase
+                else "raise joern_heap_ceiling_mb / joern_cpg_timeout_s "
+                "in tuning.json, or narrow --scope."
+            )
+            lines.append(
+                f"{what} ({attempts}), so this run carries NO Joern "
+                f"receipts — hypotheses read as 'not looked at', "
+                f"never as refuted. Remedies: {remedy}"
+            )
+        else:
+            # Each rescue gets one line so its doubled wall is
+            # attributable; a plain success (written to retire a
+            # prior segment's stale failure record) prints nothing.
+            if cpg_build.get("retried"):
+                lines.append(
+                    f"Joern CPG build succeeded on the derived-max "
+                    f"retry ({attempts})."
+                )
+            if cpg_build.get("import_retried"):
+                imp_wall = cpg_build.get("import_retry_timeout_s")
+                lines.append(
+                    f"Joern CPG import was rescued by a retry against "
+                    f"a restarted server (import timeout "
+                    f"{imp_wall}s)."
+                )
+
+    channel_health = report.get("channel_health")
+    if channel_health:
+        for raw_name, rec in sorted(channel_health.items()):
+            # trip_reason originates from channel error strings
+            # (Joern/tool stderr that can echo target-derived bytes)
+            # persisted in tier-diagnostics.json — sanitise like every
+            # sibling block; the channel name rides the same records.
+            name = _line(raw_name, max_chars=40)
+            lines.append("")
+            if rec.get("tripped"):
+                lines.append(
+                    f"### ⚠️ {name} channel unhealthy (mid-run trip)"
+                )
+                reason = _line(
+                    rec.get("trip_reason")
+                    or "consecutive dispatch failures",
+                    max_chars=200,
+                )
+                lines.append(
+                    f"The {name} channel tripped its health gate "
+                    f"({reason}) and its remaining dispatches were "
+                    f"skipped — hypotheses after the trip carry no "
+                    f"{name} receipts. Skipped is not refuted: treat "
+                    f"the missing receipts as unanswered questions. "
+                    f"{rec.get('total_successes', 0)} dispatch(es) "
+                    f"completed before the trip, "
+                    f"{rec.get('total_errors', 0)} failed."
+                )
+            else:
+                lines.append(f"### ⚠️ {name} channel down")
+            for phase in rec.get("gated_spends", []):
+                lines.append(
+                    f"  - {_line(phase, max_chars=40)} skipped at $0 — "
+                    f"its LLM spend only pays into the {name} channel, "
+                    f"which was down for this run"
+                )
+
+    provision = report.get("codeql_provision")
+    if provision:
+        lines.append("")
+        lines.append("### ⚠️ CodeQL database(s) missing")
+        for skip in provision.get("skipped", [])[:10]:
+            lines.append(
+                f"  - {_line(skip.get('language', '?'), max_chars=20)}: "
+                f"{_line(skip.get('reason', '?'), max_chars=160)} — "
+                f"{_line(skip.get('remedy', '?'), max_chars=160)}"
+            )
+        if provision.get("build_timed_out"):
+            lines.append(
+                "  - background database build did not finish inside "
+                "this run's wait budget (it completes into the shared "
+                "cache — the next run reuses it)"
+            )
+        if provision.get("build_aborted"):
+            lines.append(
+                "  - background database build wait was interrupted "
+                "by a shutdown request — not a wait-budget timeout"
+            )
+        if provision.get("build_failed"):
+            lines.append(
+                "  - background database build failed (see the run "
+                "log); pass --codeql-db <path> to supply one"
+            )
+        lines.append(
+            "  CodeQL steps for the affected language(s) were skipped, "
+            "not refuted."
+        )
+
+    auto_siblings = report.get("auto_siblings")
+    if auto_siblings:
+        lines.append("")
+        lines.append("### ⚠️ Auto-siblings pass skipped")
+        lines.append(
+            f"  - {_line(auto_siblings.get('reason', '?'), max_chars=40)}: "
+            f"{_line(auto_siblings.get('detail', '?'), max_chars=300)}"
+        )
+        lines.append(
+            "  This audit ran without sibling-consistency hypothesis "
+            "seeds (hints only — no verdict was affected). Manual "
+            "route: `raptor-binary siblings <map-run-dir> --auto`, "
+            "then re-run with --hypothesis-seeds."
+        )
+
+    substrate_skips = report.get("substrate_skips")
+    if substrate_skips:
+        lines.append("")
+        lines.append("### ⚠️ Substrate skips (tier could not look)")
+        for tier_name, rec in sorted(substrate_skips.items()):
+            langs = {
+                k: v for k, v in (rec.get("languages") or {}).items()
+                if isinstance(v, int)
+            }
+            dominant = max(langs, key=langs.__getitem__) if langs else ""
+            lang_note = (
+                f" — dominant unmodeled language "
+                f"`{_line(dominant, max_chars=20)}`"
+                if dominant and dominant != "unknown" else ""
+            )
+            lines.append(
+                f"  - {_line(tier_name, max_chars=30)}: "
+                f"{rec.get('count', 0)} check(s) skipped because the "
+                f"target is outside this tier's substrate{lang_note}; "
+                f"the tier contributed no verdicts to those checks."
+            )
+        lines.append(
+            "  Skipped is not refuted: these hypotheses were never "
+            "examined by the skipping tier."
+        )
+
+    phase_aborts = report.get("phase_aborts")
+    if phase_aborts:
+        lines.append("")
+        lines.append(
+            f"### ⚠️ Phase aborts ({len(phase_aborts)})"
+        )
+        lines.append(
+            "These phases ABORTED on persistent LLM auth refusal "
+            "(expired/revoked credential — every call 401'd). Their "
+            "output is missing, not empty: do not read the absence "
+            "of results as \"phase ran clean\". Fix the credential "
+            "and re-run. See phase-aborts.json."
+        )
+        for rec in phase_aborts[:10]:
+            lines.append(
+                f"  - {_line(rec.get('phase', '?'), max_chars=40)}: "
+                f"{_line(rec.get('error', '?'), max_chars=200)}"
+            )
+
+    promotion_alarms = report.get("promotion_alarms")
+    if promotion_alarms:
+        lines.append("")
+        lines.append(
+            f"### ⚠️ Promotion alarms ({len(promotion_alarms)})"
+        )
+        lines.append(
+            "Findings reached the journal/export without qualifying "
+            "tool evidence — this class is empty on legitimate runs. "
+            "Treat as possible prompt injection or a verdict-gate bug. "
+            "See promotion-alarms.jsonl."
+        )
+        for rec in promotion_alarms[:10]:
+            lines.append(
+                f"  - {_line(rec.get('file', '?'))}:"
+                f"{_line(rec.get('function', '?'), max_chars=60)} "
+                f"[{_line(rec.get('stage', '?'), max_chars=20)}]"
+            )
+        if len(promotion_alarms) > 10:
+            lines.append(f"  ... and {len(promotion_alarms) - 10} more")
+
+    unrecorded = report.get("unrecorded_reads", [])
+    if unrecorded:
+        total_funcs = sum(len(u["functions"]) for u in unrecorded)
+        lines.append("")
+        lines.append(f"### Unrecorded reads ({total_funcs} functions in "
+                     f"{len(unrecorded)} files)")
+        lines.append("Files you read but have functions without a record call.")
+        lines.append("Use `--related-to <primary_file>:<primary_function>` "
+                     "to record ancillary reviews.")
+        for u in unrecorded[:10]:
+            fn_list = ", ".join(_line(fn, max_chars=80) for fn in u["functions"][:5])
+            extra = len(u["functions"]) - 5
+            suffix = f" (+{extra} more)" if extra > 0 else ""
+            lines.append(f"  {_line(u['file'])}: {fn_list}{suffix}")
+        if len(unrecorded) > 10:
+            lines.append(f"  ... and {len(unrecorded) - 10} more files")
+
+    return "\n".join(lines)

@@ -1,0 +1,914 @@
+"""Top-level-only license detection for a scan target."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+# SPDX identifiers we recognise as OSI-approved open-source. Covers
+# the licenses that account for ~95%+ of real-world OSS targets.
+# Used both for SPDX-Identifier header matching and as the trusted
+# allowlist when the detected SPDX is supplied verbatim.
+_OSS_SPDX_IDS = frozenset({
+    # Permissive
+    "MIT", "MIT-0",
+    "Apache-2.0",
+    "BSD-2-Clause", "BSD-3-Clause", "BSD-3-Clause-Clear", "BSD-4-Clause",
+    "ISC",
+    "Unlicense",
+    "CC0-1.0",
+    "Zlib",
+    "BlueOak-1.0.0",
+    # BSL-1.0 is the Boost Software License (OSI-approved) — not the
+    # Business Source License, whose SPDX id is BUSL-1.1.
+    "BSL-1.0",
+    # Weak copyleft
+    "MPL-2.0",
+    "EPL-1.0",
+    "CDDL-1.0", "CDDL-1.1",
+    "LGPL-2.0", "LGPL-2.0-only", "LGPL-2.0-or-later",
+    "LGPL-2.1", "LGPL-2.1-only", "LGPL-2.1-or-later",
+    "LGPL-3.0", "LGPL-3.0-only", "LGPL-3.0-or-later",
+    "EPL-2.0",
+    # Strong copyleft (still OSS; copyleft is a downstream concern,
+    # not a CodeQL-terms concern)
+    "GPL-2.0", "GPL-2.0-only", "GPL-2.0-or-later",
+    "GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later",
+    "AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later",
+})
+
+# Glob patterns we check at the target's top level. Case-insensitive
+# at match-time. Order matters only for tie-breaking when multiple
+# files exist: the SPDX-bearing one wins regardless of name.
+_LICENSE_FILENAME_PATTERNS = (
+    "LICENSE", "LICENSE.txt", "LICENSE.md", "LICENSE.rst",
+    "LICENCE", "LICENCE.txt", "LICENCE.md",
+    # The Unlicense's own convention is a file literally named
+    # UNLICENSE (unlicense.org publishes it that way).
+    "UNLICENSE", "UNLICENSE.*", "UNLICENCE", "UNLICENCE.*",
+    "COPYING", "COPYING.txt", "COPYING.md",
+    "COPYRIGHT", "COPYRIGHT.txt", "COPYRIGHT.md",
+    # Dual-license: many projects ship `LICENSE-MIT` + `LICENSE-APACHE`
+    # at the top level (Rust ecosystem convention).
+    "LICENSE-*", "LICENCE-*",
+    # Per-license filename layout: vte ships ``COPYING.GPL3`` +
+    # ``COPYING.LGPL3``; systemd ships ``LICENSE.GPL2`` +
+    # ``LICENSE.LGPL2.1``. Common across systemd / GNOME /
+    # Linux kernel-adjacent projects. The ``.*`` glob matches
+    # any extension (fnmatch ``*`` includes dots), so this also
+    # subsumes the explicit ``LICENSE.txt`` / ``COPYING.txt``
+    # entries above — they're kept for documentation value.
+    "LICENSE.*", "LICENCE.*", "COPYING.*",
+)
+
+# Cap how many lines we read from each file. SPDX headers + standard
+# license preambles fit in the first ~50 lines; reading more burns
+# IO on the tail of MIT's reproduction-of-copyright clause.
+_LICENSE_READ_LINES = 50
+
+# Proprietary markers — case-insensitive substring match against the
+# first _LICENSE_READ_LINES lines of any detected file. Hits route
+# the file to ``classification="proprietary"`` rather than
+# ``"unknown"``. The markers are deliberately broad: a LICENSE file
+# that says ''All Rights Reserved'' or ''Confidential'' is signalling
+# something other than OSS.
+_PROPRIETARY_MARKERS = (
+    "all rights reserved",
+    "proprietary",
+    "confidential",
+    "internal use only",
+    "no part of this",
+)
+
+# The subset of proprietary markers strong enough to join the
+# earliest-position race against OSS fingerprints (see
+# ``_classify_text``). "all rights reserved" is deliberately EXCLUDED
+# from the race in both directions of the trade-off: it is standard
+# boilerplate ABOVE the intro marker of every BSD-style header (racing
+# it would misclassify BSD texts as proprietary), while as a
+# no-fingerprint fallback it still signals proprietary (dropping it
+# there would stop flagging classic all-rights-reserved notices).
+_STRONG_PROPRIETARY_MARKERS = (
+    "proprietary",
+    "confidential",
+    "internal use only",
+    "no part of this",
+)
+
+# Heuristic text fingerprints for the most common OSS licenses,
+# fallback when no SPDX-Identifier header is present. Each entry is
+# ``(spdx_id, marker_text)``; the first marker that hits wins.
+# Conservative — fingerprints picked from the canonical license
+# preamble, not generic phrases.
+# Non-GPL fingerprints — simple substring → SPDX mapping. GPL
+# family is handled separately because the version is essential
+# (GPL-2.0 vs GPL-3.0 is a material licensing distinction; we
+# can't conflate them to "GPL-3.0" the way we used to). BSD is
+# also handled separately because BSD-2 vs BSD-3 cannot be told
+# apart by a single substring (BSD-3 = BSD-2 + 'neither the
+# name of' clause); see ``_classify_bsd``.
+_TEXT_FINGERPRINTS = (
+    ("MIT", "permission is hereby granted, free of charge"),
+    ("Apache-2.0", "apache license"),
+    ("ISC", "permission to use, copy, modify, and/or distribute"),
+    ("MPL-2.0", "mozilla public license"),
+    ("Unlicense", "this is free and unencumbered software"),
+)
+
+# BSD discriminator. BSD-2 and BSD-3 both start with
+# "redistribution and use in source and binary forms" — the
+# distinguishing clause is BSD-3's "Neither the name of the
+# copyright holder nor the names of its contributors may be
+# used to endorse or promote". When the discriminator is
+# present → BSD-3; absent → BSD-2.
+_BSD_INTRO_MARKER = "redistribution and use in source and binary forms"
+_BSD3_DISCRIMINATOR = "neither the name of"
+
+# GPL-family fingerprints — order matters within this tuple:
+# more-specific names (Lesser / Library / Affero) MUST come
+# before the bare "GNU General Public License" since the bare
+# name appears INSIDE the LGPL/AGPL preamble text. Earliest-
+# position in _classify_text uses the index here only to break
+# pos ties.
+#
+# Each entry is (family_label, family_marker, default_version)
+# — version is filled in by ``_classify_gpl_version`` reading
+# the surrounding text for "Version X". Default is the most-
+# common version for that family if no version marker is found.
+_GPL_FAMILY_FINGERPRINTS = (
+    # Affero before "lesser" before "library" before bare GPL —
+    # AGPL preamble mentions GPL; LGPL preamble mentions GPL.
+    ("AGPL", "gnu affero general public license", "3.0"),
+    ("LGPL", "gnu lesser general public license", "2.1"),
+    # Pre-rename name: LGPL was called "Library GPL" before the
+    # rename in 1999 (LGPL v2 was "Library GPL"; v2.1 onwards
+    # was "Lesser GPL"). "Library" + Version 2 = LGPL-2.0;
+    # "Library" + Version 2.1 = unusual but possible.
+    ("LGPL", "gnu library general public license", "2.0"),
+    ("GPL", "gnu general public license", "2.0"),
+)
+
+_SPDX_HEADER_RE = re.compile(
+    r"SPDX-License-Identifier\s*:\s*([A-Za-z0-9.\-+]+)", re.IGNORECASE,
+)
+
+# Compound headers (``SPDX-License-Identifier: MIT OR Apache-2.0``)
+# need to capture the FULL expression — operators + operands — not
+# just the first id. Matches the shared grammar in
+# ``core/license/spdx.py``, bounded to ONE line: an SPDX header is a
+# single line, and ``\s`` spans newlines — ``MIT\nOR consult ...``
+# prose after a genuine MIT header must not be swallowed into a
+# phantom compound expression.
+_SPDX_COMPOUND_HEADER_RE = re.compile(
+    r"SPDX-License-Identifier[ \t]*:[ \t]*"
+    r"([A-Za-z0-9.+\-]+(?:[ \t]+(?:AND|OR|WITH)[ \t]+[A-Za-z0-9.+\-]+)+)",
+    re.IGNORECASE,
+)
+
+# WITH-exception evaluation needs the AND/OR-joined UNITS of a
+# compound expression (``X WITH Y`` stays one unit, judged by its
+# principal X) — split_compound_expression flattens the operators
+# away, so these splitters recover the structure. Case-insensitive to
+# match the IGNORECASE header regex above.
+# (?<!\s) pins each operator match to the start of its whitespace
+# run: a bare leading \s+ re-consumes a hostile whitespace run from
+# every scan position — quadratic in the expression length. The
+# earliest match always starts at the run start, so the split is
+# unchanged.
+_ANDOR_SPLIT_RE_CI = re.compile(r"(?<!\s)\s+(?:AND|OR)\s+", re.IGNORECASE)
+_WITH_SPLIT_RE_CI = re.compile(r"(?<!\s)\s+WITH\s+", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class TargetLicense:
+    """Detection result for a scan target's top-level license file(s).
+
+    - ``spdx_id``: the SPDX identifier extracted from a header, or
+      inferred from text fingerprints. ``None`` for ``"unknown"`` /
+      ``"missing"`` / ``"proprietary"`` (proprietary licenses aren't
+      typically given SPDX ids).
+    - ``classification``: ``"oss"`` / ``"proprietary"`` / ``"unknown"``
+      / ``"missing"``. Drives the surface-warning shape.
+    - ``source_file``: relative path of the file we read, or ``None``
+      when ``classification="missing"``.
+    - ``confidence``: ``"high"`` (SPDX-Identifier header), ``"medium"``
+      (text fingerprint), ``"low"`` (proprietary marker / nothing
+      matched).
+    - ``additional_files``: other license-named files found at the
+      top level — usually the dual-license case (``LICENSE-MIT`` +
+      ``LICENSE-APACHE``) where we pick one but flag the others.
+    """
+
+    spdx_id: str | None
+    classification: str
+    source_file: str | None
+    confidence: str
+    additional_files: tuple = ()
+
+    def to_dict(self) -> dict:
+        """Serialise for storage in the project record / provenance
+        manifest. Stable shape — additive only."""
+        return {
+            "spdx_id": self.spdx_id,
+            "classification": self.classification,
+            "source_file": self.source_file,
+            "confidence": self.confidence,
+            "additional_files": list(self.additional_files),
+        }
+
+
+def _find_license_files(target_dir: Path) -> list[Path]:
+    """Return license-named files at the top level of ``target_dir``,
+    case-insensitive. Glob first to keep IO bounded; then de-dupe.
+
+    Symlinks: accepted IF they resolve inside ``target_dir`` —
+    REUSE-compliant projects commonly ship ``COPYING`` as a
+    symlink into ``LICENSES/<SPDX>.txt`` (glib, NetworkManager
+    et al.). Refused when the symlink resolves outside the tree
+    (defence against ``LICENSE`` → ``/etc/passwd`` planted on a
+    crafted target). Broken symlinks (resolve fails) are
+    dropped.
+    """
+    found: dict = {}  # name → Path (dedup case-insensitive)
+    if not target_dir.is_dir():
+        return []
+    try:
+        entries = list(target_dir.iterdir())
+        target_resolved = target_dir.resolve()
+    except OSError:
+        return []
+    name_patterns_lower = [p.lower() for p in _LICENSE_FILENAME_PATTERNS]
+    for entry in entries:
+        if not entry.is_file():
+            # is_file follows symlinks; True for symlinks pointing
+            # at regular files (including in-tree REUSE layouts).
+            # False for dangling links + non-regular targets.
+            continue
+        if entry.is_symlink():
+            try:
+                resolved = entry.resolve()
+                # In-tree symlinks ok (REUSE layout). Out-of-tree
+                # ones refused (crafted-target defence).
+                resolved.relative_to(target_resolved)
+            except (OSError, ValueError):
+                continue
+        name_lower = entry.name.lower()
+        for pat in name_patterns_lower:
+            # Match by fnmatch semantics for the wildcard cases
+            # (``license-*``); literal equality otherwise.
+            if "*" in pat:
+                from fnmatch import fnmatchcase
+                if fnmatchcase(name_lower, pat):
+                    found.setdefault(name_lower, entry)
+                    break
+            elif name_lower == pat:
+                found.setdefault(name_lower, entry)
+                break
+    return sorted(found.values(), key=lambda p: p.name.lower())
+
+
+def _read_license_head(path: Path) -> str:
+    """Read the first ``_LICENSE_READ_LINES`` lines of ``path`` as
+    text (original case preserved — SPDX ids are case-sensitive).
+    Best-effort: binary files and encoding errors return ``""`` so
+    the caller's pattern matching falls through to
+    ``classification="unknown"`` cleanly.
+
+    Size-capped: line iteration buffers a whole line per step, so a
+    planted LICENSE that is one multi-GB line loaded itself into host
+    memory at lifecycle start — before any analysis ran — on every
+    untrusted target. The sibling ``_read_license_full`` is byte-
+    capped at 256 KB; the same bound (as a character cap here — with
+    ``errors="replace"`` every character decodes from at least one
+    byte, so memory stays within a small constant factor) dwarfs any
+    legitimate 50-line license header.
+    """
+    # Same fd-guarded open discipline as ``_read_license_full`` (which
+    # this reader's cap rationale already cites): a plain ``open()``
+    # blocks forever when the ``is_file()``-gated path is swapped for a
+    # reader-less FIFO between check and open, so the guard must live
+    # on the fd, not the name. Delegating keeps one implementation of
+    # the O_NOFOLLOW | O_NONBLOCK + fstat(S_ISREG) sequence. In-tree
+    # symlinked license files (REUSE-style ``COPYING`` →
+    # ``LICENSES/<SPDX>.txt``) are a supported shape and the callers'
+    # discovery step already validates in-tree-ness — so resolve
+    # first, then apply the no-follow open to the resolved path (the
+    # standard read-through-symlinks composition documented on
+    # ``core.source.contained``).
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return ""
+    text = _read_license_full(resolved, _INDIRECTION_FILE_BYTES)
+    lines = text.splitlines(keepends=True)[:_LICENSE_READ_LINES]
+    return "".join(lines)
+
+
+def _classify_text(text: str) -> tuple:
+    """Inspect license text content. Returns
+    ``(spdx_id, classification, confidence)``. Caller composes
+    these with the file metadata into a TargetLicense.
+
+    Detection precedence:
+      1. Compound SPDX-Identifier header (``MIT OR Apache-2.0``;
+         OSS only if ALL operands are in the allowlist)
+      2. Single SPDX-Identifier header (OSS allowlist membership)
+      3. Common-license text fingerprint (medium)
+      4. Proprietary marker → ``"proprietary"`` (low)
+      5. Nothing matched → ``"unknown"`` (low)
+    """
+    if not text:
+        return None, "unknown", "low"
+    # SPDX detection runs on original-case text so the extracted
+    # identifier preserves canonical casing (Apache-2.0 vs
+    # apache-2.0).
+    #
+    # Compound header first — order matters because the single-id
+    # regex would otherwise match just the first operand and
+    # silently drop the rest.
+    from .spdx import split_compound_expression
+    compound_m = _SPDX_COMPOUND_HEADER_RE.search(text)
+    if compound_m:
+        expr = compound_m.group(1).strip()
+        # The header regex above is IGNORECASE, so the split must be
+        # too — a case-sensitive split returned ZERO operands for
+        # lowercase operators, and zero operands read as "no non-OSS
+        # operand found" → an oss/high classification of arbitrary
+        # text ("Proprietary and Confidential" included).
+        operands = split_compound_expression(
+            expr, case_insensitive_operators=True,
+        )
+        if not operands:
+            # Belt-and-braces: matched the header shape but not the
+            # expression grammar — never classify from an expression
+            # we could not decompose.
+            return expr, "unknown", "low"
+        # Conservative: all-OSS-operands means the compound is OSS;
+        # any non-OSS operand drops to proprietary. Operators reading
+        # the result see the full expression in ``spdx_id``.
+        non_oss = [
+            op for op in operands
+            if not any(oss.lower() == op.lower() for oss in _OSS_SPDX_IDS)
+        ]
+        if not non_oss:
+            return expr, "oss", "high"
+        # ``X WITH Y`` handling: the exception (Y) often isn't a
+        # standalone SPDX license id, so it must not count as a
+        # non-OSS operand when its principal (X) is OSS. Evaluate
+        # per AND/OR-joined UNIT — each unit is either a bare id or
+        # an ``X WITH Y`` pair judged by its principal — so the
+        # exception is laundered ONLY for its own pair. A bare
+        # \bWITH\b-anywhere check judged the whole expression by
+        # operands[0], letting ``MIT WITH Y AND <proprietary>``
+        # classify oss/high — inverting the conservative
+        # all-operands rule above.
+        if re.search(r"\bWITH\b", expr, re.IGNORECASE):
+            units = [
+                u.strip()
+                for u in _ANDOR_SPLIT_RE_CI.split(expr)
+                if u.strip()
+            ]
+            def _unit_is_oss(unit: str) -> bool:
+                principal = _WITH_SPLIT_RE_CI.split(unit, maxsplit=1)[0]
+                principal = principal.strip()
+                return any(oss.lower() == principal.lower()
+                           for oss in _OSS_SPDX_IDS)
+            if units and all(_unit_is_oss(u) for u in units):
+                return expr, "oss", "high"
+        return expr, "proprietary", "high"
+    m = _SPDX_HEADER_RE.search(text)
+    if m:
+        spdx = m.group(1)
+        canonical = next(
+            (oss for oss in _OSS_SPDX_IDS if oss.lower() == spdx.lower()),
+            None,
+        )
+        if canonical:
+            return canonical, "oss", "high"
+        # SPDX header present but not in our OSS allowlist. The
+        # allowlist is deliberately partial (~95% coverage), so a
+        # miss is far more likely an allowlist GAP (a less-common OSI
+        # license) than a commercial identifier — classify unknown,
+        # never proprietary, unless the body ALSO carries an explicit
+        # proprietary marker. Either way the operator sees the id.
+        if any(marker in text.lower() for marker in _PROPRIETARY_MARKERS):
+            return spdx, "proprietary", "low"
+        return spdx, "unknown", "low"
+    # Fingerprint matching: pick the EARLIEST hit in the text,
+    # not the first in registry order. Pre-fix Firefox's
+    # license.html (which contains both "Mozilla Public License"
+    # at the top and "permission is hereby granted" later in
+    # the bundled-lib aggregation section) classified as MIT
+    # because MIT was first in _TEXT_FINGERPRINTS. The earliest
+    # position is the signal an operator actually wants — the
+    # project's primary license is stated at the top of the
+    # file; bundled-lib notices follow it.
+    lowered = text.lower()
+    earliest_pos: int | None = None
+    earliest_spdx: str | None = None
+    # Non-GPL fingerprints.
+    for spdx, marker in _TEXT_FINGERPRINTS:
+        pos = lowered.find(marker)
+        if pos == -1:
+            continue
+        if earliest_pos is None or pos < earliest_pos:
+            earliest_pos = pos
+            earliest_spdx = spdx
+    # BSD discriminator. Present at the BSD-intro position.
+    # BSD-3 wins over BSD-2 whenever the "neither the name of"
+    # clause is present anywhere in the text — it's strictly
+    # MORE restrictive than BSD-2 (extra clause), so if it
+    # applies, the license IS BSD-3 not BSD-2.
+    bsd_pos = lowered.find(_BSD_INTRO_MARKER)
+    if bsd_pos != -1:
+        spdx = (
+            "BSD-3-Clause"
+            if _BSD3_DISCRIMINATOR in lowered
+            else "BSD-2-Clause"
+        )
+        if earliest_pos is None or bsd_pos < earliest_pos:
+            earliest_pos = bsd_pos
+            earliest_spdx = spdx
+    # GPL-family fingerprints — version-disambiguated. The
+    # version is essential (GPL-2.0 vs GPL-3.0 is a material
+    # licensing distinction). Resolved by scanning the text near
+    # the family marker for ``Version X``.
+    for family, marker, default_ver in _GPL_FAMILY_FINGERPRINTS:
+        pos = lowered.find(marker)
+        if pos == -1:
+            continue
+        if earliest_pos is None or pos < earliest_pos:
+            spdx = _classify_gpl_version(text, family, pos, default_ver)
+            earliest_pos = pos
+            earliest_spdx = spdx
+    # Proprietary declarations join the earliest-position race: a
+    # LICENSE that OPENS with "PROPRIETARY AND CONFIDENTIAL" and later
+    # names a bundled third-party license is proprietary — pre-fix the
+    # markers were consulted only after the fingerprint race, so any
+    # bundled-license mention won and the operator never saw the
+    # CodeQL-terms warning. Strong markers only; see
+    # ``_STRONG_PROPRIETARY_MARKERS`` for why "all rights reserved"
+    # does not race.
+    prop_pos: int | None = None
+    for marker in _STRONG_PROPRIETARY_MARKERS:
+        pos = lowered.find(marker)
+        if pos != -1 and (prop_pos is None or pos < prop_pos):
+            prop_pos = pos
+    if earliest_spdx is not None and earliest_pos is not None and (
+            prop_pos is None or earliest_pos < prop_pos):
+        return earliest_spdx, "oss", "medium"
+    for marker in _PROPRIETARY_MARKERS:
+        if marker in lowered:
+            return None, "proprietary", "low"
+    return None, "unknown", "low"
+
+
+# Version regex: "Version 2", "Version 2.1", "Version 3.0" —
+# common in GNU LICENSE preambles ("GNU GENERAL PUBLIC LICENSE
+# Version 3, 29 June 2007"). Captures the version number.
+_GPL_VERSION_RE = re.compile(
+    r"\bversion\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE,
+)
+
+
+def _classify_gpl_version(
+    text: str, family: str, family_pos: int, default_version: str,
+) -> str:
+    """Resolve the GPL-family SPDX id by looking for a ``Version X``
+    marker near the family preamble. Searches a window starting
+    at the family-marker position so a project that mentions
+    multiple GPL versions doesn't get confused (the version
+    nearest the preamble is the one that classifies the file).
+    Falls back to the family's default version when no version
+    marker is found within the window.
+    """
+    # Window: ~500 chars after the family marker — enough to
+    # capture "Version X" on the line immediately after the
+    # title (every GNU preamble I've seen puts the version on
+    # line 2 or 3).
+    window = text[family_pos: family_pos + 500]
+    m = _GPL_VERSION_RE.search(window)
+    version = m.group(1) if m else default_version
+    # SPDX normalises bare-integer versions to N.0 (the
+    # canonical id is "GPL-3.0", "AGPL-3.0", "LGPL-2.0" —
+    # never "GPL-3"). "LGPL-2.1" keeps its minor because it's
+    # a distinct license version (LGPL changed substantively
+    # from 2.0 → 2.1).
+    if "." not in version:
+        version = f"{version}.0"
+    return f"{family}-{version}"
+
+
+def detect_target_license(target_dir: Path) -> TargetLicense:
+    """Walk the target's top-level dir for license files; return the
+    classification of the strongest signal.
+
+    When multiple license files exist (e.g. dual-licensed
+    ``LICENSE-MIT`` + ``LICENSE-APACHE``), pick the file with the
+    highest-confidence detection and record the others in
+    ``additional_files``. ''Highest confidence'' breaks ties in
+    favour of an SPDX header, then a text fingerprint, then
+    anything else.
+
+    When the strongest top-level file is itself a redirect
+    (e.g. Firefox's ``LICENSE`` → "see toolkit/content/license.html"),
+    follow up to ``_INDIRECTION_DEPTH_LIMIT`` levels of file
+    references, re-classifying each, and adopt the strongest
+    classification found anywhere in the chain. Path-traversal
+    defended: referenced paths must resolve inside ``target_dir``.
+
+    No-match cases:
+      * No license files at top level → ``classification="missing"``
+      * Files present + indirection-followed but still no match →
+        ``classification="unknown"``
+    """
+    target_dir = Path(target_dir).resolve()
+    files = _find_license_files(target_dir)
+    if not files:
+        return TargetLicense(
+            spdx_id=None, classification="missing",
+            source_file=None, confidence="low",
+        )
+
+    # Score each file by detection confidence; pick the
+    # strongest. Dual-license projects (e.g. libgcrypt ships
+    # ``COPYING`` GPL + ``COPYING.LIB`` LGPL; NetworkManager
+    # ships COPYING GPL + COPYING.LGPL) are inherently
+    # ambiguous — there's no general way to know which one is
+    # the operator's intended "project license." We report
+    # whichever has the highest-confidence detection (ties
+    # broken by alphabetical filename for determinism), and
+    # the ``additional_files`` field carries the rest so the
+    # operator can see the layout.
+    _CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+    best = None
+    best_rank = -1
+    for f in files:
+        text = _read_license_head(f)
+        spdx, classification, confidence = _classify_text(text)
+        rank = _CONFIDENCE_RANK[confidence]
+        if rank > best_rank:
+            best = (f, spdx, classification, confidence)
+            best_rank = rank
+    assert best is not None  # files non-empty → loop ran at least once
+    chosen_file, spdx, classification, confidence = best
+    additional = tuple(
+        f.name for f in files if f != chosen_file
+    )
+
+    # Follow LICENSE-file indirections ("see X" / "license is in X"
+    # / "refer to X") when the strongest top-level signal didn't
+    # classify. Common for projects whose root LICENSE points at
+    # a nested file (Firefox → toolkit/content/license.html;
+    # multi-license projects → LICENSES/<spdx>.txt). Returns the
+    # original TargetLicense unchanged when the chain doesn't
+    # improve confidence.
+    if classification == "unknown":
+        follow_result = _follow_license_indirection(
+            target_dir, chosen_file,
+        )
+        if follow_result is not None:
+            spdx, classification, confidence, chosen_path = follow_result
+            return TargetLicense(
+                spdx_id=spdx,
+                classification=classification,
+                # Render as a relative path so the operator can
+                # see the chain hop ("toolkit/content/license.html"
+                # rather than just "license.html").
+                source_file=str(
+                    chosen_path.relative_to(target_dir),
+                ),
+                confidence=confidence,
+                additional_files=additional,
+            )
+
+    return TargetLicense(
+        spdx_id=spdx,
+        classification=classification,
+        source_file=chosen_file.name,
+        confidence=confidence,
+        additional_files=additional,
+    )
+
+
+# Indirection-follow tunables. Bounded recursion + path count
+# prevent a malicious / pathological LICENSE chain from making
+# detection allocate forever.
+_INDIRECTION_DEPTH_LIMIT = 2          # root LICENSE → linked → linked-of-linked
+_INDIRECTION_PATH_LIMIT = 8           # cap referenced paths per file
+# Total files read per chain walk. Needed because directory children
+# enqueue at the SAME depth as the reference that named the directory
+# (the dir is enumerated, not classified), so depth alone no longer
+# bounds a hostile chain of alternating dir references — this cap does.
+_INDIRECTION_TOTAL_FILES = 32
+_INDIRECTION_FILE_BYTES = 256 * 1024  # cap per-file read at 256 KB
+
+
+# Patterns we recognise as "this LICENSE file points elsewhere".
+# Case-insensitive; capture group 1 is the referenced path.
+# Conservative: only match patterns whose intent is unambiguous
+# ("see file X", "refer to X", "license is in X", "license can be
+# found at X"). Don't try to parse free-form prose like "X is the
+# license file" — false positives there are worse than a missed
+# follow.
+# Path shape recognised in "see X" patterns: either a common
+# file extension (txt/md/rst/html/htm), OR a license-naming
+# convention (LICENSE.<id> / LICENCE.<id> / COPYING.<id>) where
+# the suffix is the license id rather than a conventional
+# extension. tracker's COPYING says "See the file COPYING.LGPL"
+# — no .txt/.md/etc. but unambiguously a license-file reference.
+_INDIRECTION_PATH = (
+    r"(?:"
+    r"[A-Za-z0-9_./\-]+\.(?:txt|md|rst|html?|htm)"
+    r"|"
+    r"(?:[A-Za-z0-9_./\-]+/)?(?:LICENSE|LICENCE|COPYING)\.[A-Za-z0-9_\-]+"
+    r")"
+)
+_INDIRECTION_PATTERNS = [
+    re.compile(
+        r"(?:please\s+)?see\s+(?:the\s+file\s+)?(" + _INDIRECTION_PATH + r")",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"licens(?:e|ing)\s+(?:text\s+)?is\s+in\s+("
+        + _INDIRECTION_PATH + r")",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"refer\s+to\s+(" + _INDIRECTION_PATH + r")",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"licens(?:e|ing)\s+(?:can\s+be\s+|may\s+be\s+)?"
+        r"found\s+(?:at|in)\s+(" + _INDIRECTION_PATH + r")",
+        re.IGNORECASE,
+    ),
+    # Plain "see DIR/" pattern — referenced TARGET is a directory.
+    # We resolve to every license-named file inside that dir.
+    re.compile(
+        r"see\s+(?:the\s+)?([A-Za-z0-9_./\-]+/)\s+(?:directory|dir|folder)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _extract_indirection_paths(text: str) -> list[str]:
+    """Return referenced paths from a LICENSE body, capped at
+    ``_INDIRECTION_PATH_LIMIT`` so a malicious file with hundreds
+    of "see X" lines can't make the follow allocate forever."""
+    found: list[str] = []
+    seen: set = set()
+    for pat in _INDIRECTION_PATTERNS:
+        for m in pat.finditer(text):
+            ref = m.group(1)
+            if ref not in seen:
+                seen.add(ref)
+                found.append(ref)
+                if len(found) >= _INDIRECTION_PATH_LIMIT:
+                    return found
+    return found
+
+
+def _read_license_full(path: Path, byte_cap: int) -> str:
+    """Like ``_read_license_head`` but reads up to ``byte_cap``
+    bytes (for indirection-follow we may need the full body of
+    a linked file, not just the header). Best-effort: returns
+    "" on any IO / encoding error.
+
+    Uses ``O_NOFOLLOW`` defence-in-depth — the caller already
+    refuses symlinked indirection targets via is_symlink before
+    resolve, but a TOCTOU swap between the check and the open
+    could otherwise pivot us through a symlink. O_NOFOLLOW
+    refuses to open a symlink at the final path component.
+    ``O_NONBLOCK`` + ``fstat(S_ISREG)`` close the matching FIFO
+    race: the caller's ``is_file()`` gate can be swapped for a
+    FIFO between check and open, and a blocking open/read on a
+    reader-less FIFO hangs detection. (Truncating semantics —
+    read the first ``byte_cap`` bytes of an oversized body — are
+    deliberate here, which is why this is not
+    ``core.security.capped_read.read_capped``: that helper
+    fail-closes to None on oversize.)
+    """
+    from core.source.gated import open_regular_gated
+    from core.source.streams import preserving_stream_error
+
+    try:
+        stream = open_regular_gated(path, follow_symlinks=False)
+    except (OSError, ValueError):
+        return ""
+    try:
+        with preserving_stream_error(stream) as fobj:
+            return fobj.read(byte_cap).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _follow_license_indirection(
+    target_dir: Path, source_file: Path,
+):
+    """Recursively follow ``see X`` / ``license is in X`` /
+    ``refer to X`` references inside license files. Returns
+    ``(spdx, classification, confidence, resolved_path)`` for
+    the strongest classified file in the chain, or None when
+    the chain doesn't improve over the caller's unknown.
+
+    Path-traversal defended: every referenced path is resolved
+    relative to the file containing it, then checked to live
+    inside ``target_dir.resolve()``. Symlinks rejected outright
+    (a malicious LICENSE-redirect chain via symlinks could
+    otherwise escape the target tree).
+    """
+    target_dir = target_dir.resolve()
+    _CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+    best = None
+    best_rank = -1
+
+    # BFS over the chain so we visit every referenced file once,
+    # not depth-first into the first link. Queue entries are
+    # (file_path, depth, is_root) — is_root flags the original
+    # source_file we're trying to improve, so we don't re-
+    # classify it (caller already did that and got unknown).
+    queue: list[tuple] = [(source_file, 0, True)]
+    visited: set = set()
+    visited.add(source_file.resolve())
+
+    files_read = 0
+    while queue:
+        current_file, depth, is_root = queue.pop(0)
+        if depth > _INDIRECTION_DEPTH_LIMIT:
+            continue
+        if files_read >= _INDIRECTION_TOTAL_FILES:
+            break
+        files_read += 1
+
+        # Read the file ONCE — classify_text AND extract refs
+        # both consume the same body. Pre-fix this read each
+        # non-root file twice, doubling IO on the indirection
+        # path (which already includes a per-target walk).
+        text = _read_license_full(current_file, _INDIRECTION_FILE_BYTES)
+        if not text:
+            continue
+
+        # Classify the current file — unless it's the root
+        # (caller already classified it and found unknown).
+        # Earliest-position fingerprint matching in _classify_text
+        # handles multi-license aggregation files correctly
+        # (Firefox's license.html: MPL at top, bundled-lib
+        # notices later → picks MPL). No HTML-specific
+        # downgrade needed here; the position-based picker is
+        # the principled fix.
+        if not is_root:
+            spdx, classification, confidence = _classify_text(text)
+            rank = _CONFIDENCE_RANK[confidence]
+            if rank > best_rank:
+                best = (spdx, classification, confidence, current_file)
+                best_rank = rank
+
+        # Extract this file's own references and enqueue them
+        # for further follow.
+        refs = _extract_indirection_paths(text)
+
+        for ref in refs:
+            # Reject absolute-path refs and `~` expansion at
+            # the regex layer's blind spot — defence in depth
+            # before resolve() canonicalises.
+            if ref.startswith(("/", "~")):
+                continue
+            # Check is_symlink on the RAW (un-resolved) path
+            # FIRST. After .resolve() canonicalises, the result
+            # is the final target, and is_symlink() always
+            # returns False for it — so a post-resolve check
+            # would never fire. A LICENSE redirect via an
+            # in-tree symlink to e.g. ``.env`` would otherwise
+            # bypass our intent to "refuse symlink-pivoted
+            # indirection chains."
+            raw = current_file.parent / ref
+            try:
+                if raw.is_symlink():
+                    continue
+            except OSError:
+                continue
+            # Resolve relative to the file containing the ref,
+            # not the target root — references are usually
+            # written as paths relative to the operator's view
+            # of the repo (LICENSES/MIT.txt under the root,
+            # ./license.html in a nested file).
+            try:
+                candidate = raw.resolve()
+            except (OSError, ValueError):
+                continue
+            if candidate in visited:
+                continue
+            visited.add(candidate)
+
+            # Path-traversal defence: must live inside target_dir.
+            try:
+                candidate.relative_to(target_dir)
+            except ValueError:
+                continue
+
+            # Directory reference: enqueue every license-named
+            # file inside it. Same-depth, NOT depth+1 — the dir
+            # itself isn't being classified, just enumerated;
+            # following INTO the directory's contents is the one
+            # hop this reference costs, charged when the child is
+            # classified at the enqueue depth. Charging an extra
+            # hop made a chain whose directory reference sits at
+            # the depth boundary ("LICENSE → ... → see LICENSES/
+            # directory → MIT.txt") silently drop the contents
+            # step past the limit.
+            #
+            # Capped at ``_INDIRECTION_PATH_LIMIT`` children too —
+            # otherwise a hostile target with 10k files in
+            # LICENSES/ would enqueue all of them, blowing the
+            # per-file caps' intent.
+            if candidate.is_dir():
+                enqueued_from_dir = 0
+                try:
+                    for child in candidate.iterdir():
+                        if enqueued_from_dir >= _INDIRECTION_PATH_LIMIT:
+                            break
+                        if not child.is_file() or child.is_symlink():
+                            continue
+                        if child.suffix.lower() in (".txt", ".md", ".rst", ".html", ".htm") or "license" in child.name.lower() or "copying" in child.name.lower():
+                            if child.resolve() not in visited:
+                                visited.add(child.resolve())
+                                queue.append((child, depth, False))
+                                enqueued_from_dir += 1
+                except OSError:
+                    pass
+                continue
+
+            if not candidate.is_file():
+                continue
+
+            queue.append((candidate, depth + 1, False))
+
+    if best is not None and best[1] != "unknown":
+        return best
+    return None
+
+
+def format_license_summary(lic: TargetLicense, *, command: str = "") -> str:
+    """Render a terse operator-facing one-liner (plus a warning
+    when classification raises CodeQL-license concerns).
+
+    The HOW of detection (source file, confidence tier, additional
+    files) is left to debug-level logging — most operators just
+    want the classification at a glance. ``log_license_details``
+    emits the full record for debugging / forensic review.
+
+    The optional ``command`` argument lets the caller indicate which
+    RAPTOR command is about to run — when it's CodeQL-related (the
+    license terms restrict non-OSS use), the warning text mentions
+    /codeql specifically.
+    """
+    cmd_lower = command.lower()
+    is_codeql_path = "codeql" in cmd_lower or cmd_lower in {"agentic", "scan"}
+    lines: list = []
+
+    if lic.classification == "oss":
+        lines.append(f"Target license: {lic.spdx_id}")
+    elif lic.classification == "proprietary":
+        spdx_part = f" ({lic.spdx_id})" if lic.spdx_id else ""
+        lines.append(f"Target license: proprietary{spdx_part}")
+        if is_codeql_path:
+            lines.append(
+                "  ⚠️  CodeQL terms restrict use on non-OSS code. "
+                "Verify your CodeQL use is licensed (free tier covers "
+                "OSS / research / education only) before continuing."
+            )
+    elif lic.classification == "unknown":
+        lines.append("Target license: undetermined")
+        if is_codeql_path:
+            lines.append(
+                "  ⚠️  RAPTOR can't determine if CodeQL's free-tier "
+                "terms apply. Check the license before running /codeql."
+            )
+    else:  # "missing"
+        lines.append("Target license: not detected")
+        if is_codeql_path:
+            lines.append(
+                "  ⚠️  No license file means RAPTOR can't tell if "
+                "CodeQL's free-tier terms apply. Check before running "
+                "/codeql; for first-party / bug-bounty / pentest use "
+                "this is usually fine, but verify."
+            )
+    return "\n".join(lines)
+
+
+def log_license_details(lic: TargetLicense) -> None:
+    """Emit the detection HOW at debug level — operator-facing
+    summary stays terse via ``format_license_summary``; investigators
+    or anyone running RAPTOR with ``--verbose`` / debug-log enabled
+    can see source file, confidence tier, additional files."""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug(
+        "license-detect: classification=%s spdx_id=%s source=%s "
+        "confidence=%s additional=%s",
+        lic.classification, lic.spdx_id, lic.source_file,
+        lic.confidence,
+        list(lic.additional_files) or None,
+    )

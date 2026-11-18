@@ -1,0 +1,630 @@
+"""Frida-based runtime observation for audit review.
+
+Hooks target functions via Frida to observe argument values, return
+values, and call sequences at runtime.  Positive-only signal: observing
+a function confirms reachability; not observing it is inconclusive
+(observation window bias).
+
+Requires: ``frida`` Python package + a running target process.
+Gate: ``config.dynamic_validation`` + Frida available + process target.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from core.security.env_sanitisation import safe_subprocess_env
+
+logger = logging.getLogger(__name__)
+
+_OBSERVE_TIMEOUT_S = 30
+_ATTACH_TIMEOUT_S = 10
+_MAX_HOOKS = 64
+# Session-log parse budget. Too small and observations from late in the
+# window are silently dropped — a busy process fills a few KiB in the
+# first fraction of a second, so a target function first hit late in
+# the 30s session would read as unobserved and worsen the
+# observation-window bias documented above. Unbounded and a hostile or
+# log-spamming target blows up parser memory. A few MiB covers a full
+# session of send() traffic while keeping the read bounded.
+_MAX_LOG_BYTES = 4 * 1024 * 1024
+# Independent line-count bound so a flood of tiny lines cannot pin the
+# JSON parser even inside the byte budget.
+_MAX_LOG_LINES = 100_000
+
+
+@dataclass
+class FridaObservation:
+    """A single observed function invocation."""
+
+    function: str
+    file: str
+    args: list[str] = field(default_factory=list)
+    retval: str | None = None
+    callees: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FridaObserveResult:
+    """Result of a Frida observation session."""
+
+    attached: bool
+    observations: list[FridaObservation] = field(default_factory=list)
+    observed_functions: frozenset[str] = field(default_factory=frozenset)
+    evidence_strength: str = "inconclusive"
+    duration_s: float = 0.0
+    error: str | None = None
+
+
+def should_run_frida(
+    outcome: Any,
+    config: Any,
+) -> bool:
+    """Gate: should we run Frida observation for this finding?"""
+    if not getattr(config, "dynamic_validation", False):
+        return False
+
+    status = getattr(outcome, "status", "")
+    if status != "finding":
+        return False
+
+    evidence_tool = getattr(outcome, "evidence_tool", "")
+    if evidence_tool and evidence_tool.startswith(("dynamic:sanitizer", "frida:")):
+        return False
+
+    if not _frida_available():
+        return False
+
+    target_pid = _resolve_target_pid(config)
+    return target_pid is not None
+
+
+def run_frida_observation(
+    outcome: Any,
+    ctx: dict[str, Any],
+    config: Any,
+) -> FridaObserveResult | None:
+    """Observe a function via Frida instrumentation.
+
+    Attaches to the target process, hooks the function under review
+    plus its callees, exercises the target (if a trigger is available),
+    and collects observations.
+    """
+    start = time.monotonic()
+    function_name = getattr(outcome, "function", "")
+    file_path = getattr(outcome, "file", "")
+
+    if not function_name:
+        return None
+
+    target_pid = _resolve_target_pid(config)
+    if target_pid is None:
+        return None
+
+    hook_targets = _build_hook_targets(function_name, file_path, ctx)
+
+    script_source = _generate_frida_script(hook_targets)
+
+    log_file = None
+    log_fd = None
+    try:
+        # The fd stays open for the whole session: /tmp is shared
+        # with the observed same-UID target, so every write/read of
+        # the log goes through this fd (original inode), never a
+        # reopen of the swappable path.
+        log_fd, log_path = tempfile.mkstemp(suffix=".frida.jsonl", prefix="raptor_")
+        log_file = Path(log_path)
+
+        success = _run_frida_session(
+            target_pid, script_source, log_fd, config,
+        )
+
+        observations = (
+            _parse_observations(log_file, log_fd=log_fd) if success else []
+        )
+        observed_set: set[str] = set()
+        target_observed = False
+
+        for obs in observations:
+            key = f"{obs.file}:{obs.function}" if obs.file else obs.function
+            observed_set.add(key)
+            if obs.function == function_name:
+                target_observed = True
+
+        evidence_strength = "confirmed" if target_observed else "inconclusive"
+
+        duration = time.monotonic() - start
+        return FridaObserveResult(
+            attached=success,
+            observations=observations,
+            observed_functions=frozenset(observed_set),
+            evidence_strength=evidence_strength,
+            duration_s=duration,
+        )
+
+    except Exception as exc:
+        duration = time.monotonic() - start
+        logger.debug("Frida observation failed: %s", exc, exc_info=True)
+        return FridaObserveResult(
+            attached=False,
+            evidence_strength="inconclusive",
+            duration_s=duration,
+            error=str(exc),
+        )
+    finally:
+        if log_fd is not None:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+        if log_file and log_file.exists():
+            try:
+                log_file.unlink()
+            except OSError:
+                pass
+
+
+def collect_observed_functions(
+    config: Any,
+    functions: list[dict[str, Any]],
+) -> frozenset[str]:
+    """Run a broad Frida session to observe which functions are hit.
+
+    Intended pre-loop populator for the observation set consumed by
+    ``layer_resolution.assign_observation_status`` — NOT currently
+    invoked by the orchestrator (the only production frida entry
+    points are should_run_frida/run_frida_observation). Hooks up to
+    ``_MAX_HOOKS`` functions and collects which ones fire during a
+    test/exercise window.
+    """
+    if not _frida_available():
+        return frozenset()
+
+    target_pid = _resolve_target_pid(config)
+    if target_pid is None:
+        return frozenset()
+
+    hook_targets = []
+    for func in functions[:_MAX_HOOKS]:
+        name = func.get("name", "")
+        if name:
+            hook_targets.append(name)
+
+    if not hook_targets:
+        return frozenset()
+
+    script_source = _generate_frida_script(hook_targets)
+
+    log_file = None
+    log_fd = None
+    try:
+        # Kept-fd discipline — see run_frida_observation above.
+        log_fd, log_path = tempfile.mkstemp(suffix=".frida.jsonl", prefix="raptor_")
+        log_file = Path(log_path)
+
+        success = _run_frida_session(target_pid, script_source, log_fd, config)
+        if not success:
+            return frozenset()
+
+        observations = _parse_observations(log_file, log_fd=log_fd)
+        return frozenset(
+            obs.function for obs in observations
+        )
+    except Exception:
+        logger.debug("broad Frida observation failed", exc_info=True)
+        return frozenset()
+    finally:
+        if log_fd is not None:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+        if log_file and log_file.exists():
+            try:
+                log_file.unlink()
+            except OSError:
+                pass
+
+
+# -- Internal helpers --
+
+
+def _frida_available() -> bool:
+    """Check if the frida Python package is importable."""
+    try:
+        import importlib
+        importlib.import_module("frida")
+        return True
+    except ImportError:
+        return False
+
+
+def _resolve_target_pid(config: Any) -> int | None:
+    """Resolve the target process PID for Frida attachment.
+
+    Checks (in order):
+    1. Explicit ``config.frida_pid``
+    2. ``config.frida_process_name`` — find by name
+
+    (Container-based resolution is not implemented — setting a
+    ``target_container`` on the config has no effect here.)
+    """
+    pid = getattr(config, "frida_pid", None)
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+            return pid
+        except (OSError, PermissionError):
+            return None
+
+    process_name = getattr(config, "frida_process_name", None)
+    if process_name:
+        return _find_pid_by_name(process_name)
+
+    return None
+
+
+def _find_pid_by_name(name: str) -> int | None:
+    """Find a process PID by name via /proc."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            first_line = result.stdout.strip().splitlines()[0]
+            return int(first_line)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    return None
+
+
+def _build_hook_targets(
+    function_name: str,
+    _file_path: str,
+    ctx: dict[str, Any],
+) -> list[str]:
+    """Build the list of function names to hook.
+
+    Includes the target function plus its immediate callees
+    (to observe call sequences).
+    """
+    targets = [function_name]
+
+    callees = ctx.get("callees", [])
+    for ce in callees:
+        name = ce.get("name", "") if isinstance(ce, dict) else str(ce)
+        if name and name not in targets:
+            targets.append(name)
+
+    return targets[:_MAX_HOOKS]
+
+
+def _generate_frida_script(hook_targets: list[str]) -> str:
+    """Generate a Frida instrumentation script.
+
+    Hooks each target function's export, logging arguments on
+    enter and return values on leave.  Output is JSONL to the
+    log file via ``send()``.
+    """
+    targets_json = json.dumps(hook_targets)
+    return f"""\
+'use strict';
+
+var targets = {targets_json};
+var hooked = 0;
+
+function resolveExport(name) {{
+    // Frida >= 17 removed the static Module.findExportByName —
+    // relying on it made every lookup throw into the per-target
+    // catch below, so zero functions were hooked and the whole
+    // channel silently observed nothing. Feature-detect the
+    // replacement and keep the legacy form for older runtimes.
+    if (typeof Module.findGlobalExportByName === 'function') {{
+        return Module.findGlobalExportByName(name);
+    }}
+    var addr = Module.findExportByName(null, name);
+    if (addr) return addr;
+    var matches = [];
+    Process.enumerateModules().forEach(function(m) {{
+        var exp = Module.findExportByName(m.name, name);
+        if (exp) matches.push(exp);
+    }});
+    return matches.length > 0 ? matches[0] : null;
+}}
+
+targets.forEach(function(name) {{
+    var addrs;
+    try {{
+        addrs = resolveExport(name);
+    }} catch(e) {{
+        return;
+    }}
+    if (!addrs) return;
+
+    try {{
+        Interceptor.attach(addrs, {{
+            onEnter: function(args) {{
+                var argv = [];
+                // Log a fixed 6 arg slots; args[i] beyond the real
+                // arity throws and is caught per-slot, padding with '?'.
+                for (var i = 0; i < 6; i++) {{
+                    try {{
+                        argv.push(args[i].toString());
+                    }} catch(e) {{
+                        argv.push('?');
+                    }}
+                }}
+                this._obs = {{
+                    'type': 'call',
+                    'function': name,
+                    'args': argv,
+                    'ts': Date.now()
+                }};
+                send(JSON.stringify(this._obs));
+            }},
+            onLeave: function(retval) {{
+                var obs = {{
+                    'type': 'return',
+                    'function': name,
+                    'retval': retval.toString(),
+                    'ts': Date.now()
+                }};
+                send(JSON.stringify(obs));
+            }}
+        }});
+        hooked++;
+    }} catch(e) {{
+        // Symbol exists but can't be hooked (e.g. inlined)
+    }}
+}});
+
+send(JSON.stringify({{'type': 'ready', 'hooked': hooked}}));
+"""
+
+
+def _run_frida_session(
+    pid: int,
+    script_source: str,
+    log_fd: int,
+    config: Any,
+) -> bool:
+    """Run a Frida session, writing observations through *log_fd*.
+
+    Uses the frida CLI tool (``frida -p PID -l script.js``) rather
+    than the Python API to stay within the sandbox policy (subprocess
+    with timeout rather than in-process attachment).
+
+    *log_fd* is the fd the caller's ``mkstemp`` returned, kept open:
+    the log lives in shared /tmp while the observed SAME-UID target
+    runs, so a close-then-reopen-by-path write would follow a
+    symlink/hardlink swapped in at the tempfile name. Every write and
+    size check here goes through the fd — bound to the original
+    inode, race-free.
+
+    Honest limit: a same-UID target that can reach host /tmp can also
+    open the 0600 stub BY PATH and forge records into the original
+    inode — inherent to same-UID observation, no fd discipline stops
+    it. The fd binding defeats path swaps (write laundering /
+    read-side substitution), not writes to the inode itself;
+    observation evidence stays "the process looked live", never
+    stronger.
+    """
+    script_file = None
+    try:
+        fd, script_path = tempfile.mkstemp(suffix=".js", prefix="raptor_frida_")
+        script_file = Path(script_path)
+        # Same kept-fd rule as the log: write the script through the
+        # fd mkstemp returned, never by reopening the /tmp path.
+        with os.fdopen(fd, "w", encoding="utf-8") as script_fh:
+            script_fh.write(script_source)
+
+        timeout = getattr(config, "frida_timeout_s", _OBSERVE_TIMEOUT_S)
+        # frida exits on its own after the -t window (quiet mode);
+        # the subprocess timeout stays above it as a backstop for a
+        # wedged CLI.
+        session_s = max(1, timeout - 5)
+
+        # No ``--no-pause``: the flag only ever applied to spawn mode
+        # and current CLIs reject it as an unrecognized argument
+        # before attaching — the whole session died on argv parsing.
+        # No ``-o`` either: script ``send()`` payloads are emitted on
+        # the REPL's stdout, not the -o log (which stays empty), so
+        # the captured stdout is persisted to ``log_file`` below for
+        # ``_parse_observations``.
+        cmd = [
+            "frida",
+            "-p", str(pid),
+            "-l", str(script_file),
+            "-q",
+            "-t", str(session_s),
+        ]
+
+        # Sanitised + target-marker-stripped env (shared fail-closed
+        # helper): this is a RAW spawn (no core.sandbox chokepoint)
+        # and frida spawn-mode TARGETS inherit the CLI's environ, so
+        # every RAPTOR-identifying name must go. The helper's
+        # fallback is a minimal allowlist carrying no markers and no
+        # credentials.
+        env = safe_subprocess_env(strip_target_markers=True)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+
+        _write_session_log(log_fd, result.stdout)
+        return result.returncode == 0 or _fd_size(log_fd) > 0
+
+    except subprocess.TimeoutExpired as exc:
+        logger.debug("Frida session timed out after %ds", timeout)
+        partial = exc.stdout
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")  # type: ignore[assignment]
+        if partial:
+            # Keep whatever the killed CLI managed to emit; when the
+            # exception carries nothing, leave any existing log
+            # content untouched rather than clobbering it with "".
+            _write_session_log(log_fd, partial)  # type: ignore[arg-type]
+        return _fd_size(log_fd) > 0
+    except FileNotFoundError:
+        logger.debug("frida CLI not found")
+        return False
+    except Exception as exc:  # noqa: BLE001 — dynamic observation is best-effort: report unobserved
+        logger.debug("Frida session error: %s", exc)
+        return False
+    finally:
+        if script_file and script_file.exists():
+            try:
+                script_file.unlink()
+            except OSError:
+                pass
+
+
+def _fd_size(log_fd: int) -> int:
+    """Size of the log via the kept fd; 0 when unstattable."""
+    try:
+        return os.fstat(log_fd).st_size
+    except OSError:
+        return 0
+
+
+def _write_session_log(log_fd: int, content: str | None) -> None:
+    """Persist a Frida session's captured stdout for parsing.
+
+    Writes through the caller's kept ``mkstemp`` fd (truncate +
+    rewrite of the original inode) — never by reopening the shared
+    /tmp path, which the observed same-UID target can swap.
+    """
+    try:
+        os.lseek(log_fd, 0, os.SEEK_SET)
+        os.ftruncate(log_fd, 0)
+        data = (content or "").encode("utf-8", errors="replace")
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            n = os.write(log_fd, view[written:])
+            if n <= 0:
+                raise OSError(f"short write to session log fd: {n}")
+            written += n
+    except OSError:
+        logger.debug("could not persist frida session log", exc_info=True)
+
+
+def _parse_observations(
+    log_file: Path,
+    *,
+    log_fd: int | None = None,
+) -> list[FridaObservation]:
+    """Parse observations from a Frida session log.
+
+    Accepts both raw JSONL and the frida CLI's stdout framing, where
+    each ``send()`` payload arrives wrapped in a Python-repr line::
+
+        message: {'type': 'send', 'payload': '{"type":"call",...}'} data: None
+
+    The wrapper is single-quoted (not JSON), so the payload — the
+    first ``{"``-opening object on the line — is decoded with
+    ``raw_decode``, which tolerates the trailing wrapper text.
+
+    The log is streamed line by line under ``_MAX_LOG_BYTES`` /
+    ``_MAX_LOG_LINES`` bounds — never slurped whole — so late
+    observations are counted while memory stays bounded.  Each
+    ``readline`` is capped to the remaining byte budget, so an
+    oversized line comes back as a fragment that simply fails to
+    parse instead of ballooning memory.
+    """
+    observations: list[FridaObservation] = []
+
+    call_stack: dict[str, FridaObservation] = {}
+    decoder = json.JSONDecoder()
+
+    try:
+        if log_fd is not None:
+            # Kept-fd read: the session's writes went through this fd
+            # (original mkstemp inode), so the read binds to the same
+            # inode — never a by-path reopen of shared /tmp, which the
+            # observed same-UID target can swap to forge observations.
+            from core.source.streams import adopt_fd
+
+            dup_fd = os.dup(log_fd)
+            try:
+                os.lseek(dup_fd, 0, os.SEEK_SET)
+            except BaseException:
+                try:
+                    os.close(dup_fd)
+                except BaseException:
+                    pass  # Retain the seek failure after consuming the duplicate.
+                raise
+            log_fh = adopt_fd(dup_fd, "rb", os.close)
+        else:
+            if not log_file.exists():
+                return observations
+            log_fh = log_file.open("rb")  # raw-open: RAPTOR-written frida event log in the run dir
+    except OSError:
+        return observations
+
+    read_bytes = 0
+    lines_seen = 0
+    with log_fh:
+        while read_bytes < _MAX_LOG_BYTES and lines_seen < _MAX_LOG_LINES:
+            try:
+                raw = log_fh.readline(_MAX_LOG_BYTES - read_bytes)
+            except OSError:
+                break
+            if not raw:
+                break
+            read_bytes += len(raw)
+            lines_seen += 1
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                msg_start = line.find('{"')
+                if msg_start < 0:
+                    msg_start = line.find("{")
+                if msg_start >= 0:
+                    try:
+                        data, _end = decoder.raw_decode(line[msg_start:])
+                    except json.JSONDecodeError:
+                        continue
+                else:
+                    continue
+
+            if not isinstance(data, dict):
+                continue
+
+            msg_type = data.get("type", "")
+
+            if msg_type == "call":
+                func_name = data.get("function", "")
+                if not func_name:
+                    continue
+                obs = FridaObservation(
+                    function=func_name,
+                    file="",
+                    args=data.get("args", []),
+                )
+                call_stack[func_name] = obs
+                observations.append(obs)
+
+            elif msg_type == "return":
+                func_name = data.get("function", "")
+                pending = call_stack.pop(func_name, None)
+                if pending is not None:
+                    pending.retval = data.get("retval")
+
+    return observations

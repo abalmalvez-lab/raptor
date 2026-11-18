@@ -6,8 +6,11 @@ a SAGE volume reset, or when the setup script is re-invoked) creates
 duplicates in the SAGE consensus store.
 
 `async_memory_exists` lets callers skip the propose step for items
-already stored, keyed by a stable per-memory tag that SAGE's 6.6.0
-tags-as-first-class feature makes queryable.
+already stored, keyed by a stable per-memory tag that SAGE's
+tags-as-first-class feature makes queryable. (Introduced in SAGE
+6.6.0; still present in 11.9.2 — `list_memories(domain, tag, limit=1)`
+remains the supported exact-filter lookup, verified against
+docs/reference/python-sdk.md.)
 
 Caveat: SAGE stores tags as **node-local metadata** (not part of the
 on-chain consensus tx). On a single-node deployment — which is what
@@ -48,5 +51,5 @@ async def async_memory_exists(
         )
         return bool(response.memories)
     except Exception as e:
-        logger.debug(f"SAGE tag existence check failed ({domain_tag}/{tag}): {e}")
+        logger.debug("SAGE tag existence check failed (%s/%s): %s", domain_tag, tag, e)
         return False

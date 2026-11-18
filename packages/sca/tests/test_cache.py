@@ -1,0 +1,186 @@
+"""Tests for ``packages.sca.cache.JsonCache``."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+from core.json import TTL_FOREVER, JsonCache
+
+
+def test_put_and_get_roundtrip(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", {"v": 1}, ttl_seconds=60)
+    assert cache.get("k", ttl_seconds=60) == {"v": 1}
+
+
+def test_get_returns_none_for_missing_key(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    assert cache.get("nope", ttl_seconds=60) is None
+
+
+def test_expired_entry_returns_none(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", "v", ttl_seconds=1)
+    # Force expiry by rewriting the envelope with an old timestamp.
+    p = tmp_path / "k.json"
+    raw = json.loads(p.read_text())
+    raw["written_at"] = time.time() - 10_000
+    p.write_text(json.dumps(raw))
+    assert cache.get("k", ttl_seconds=1) is None
+
+
+def test_caller_can_downgrade_ttl(tmp_path: Path) -> None:
+    """A fresh entry with TTL=86400 is stale under TTL=1."""
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", "v", ttl_seconds=86400)
+    p = tmp_path / "k.json"
+    raw = json.loads(p.read_text())
+    raw["written_at"] = time.time() - 60   # 1 min old
+    p.write_text(json.dumps(raw))
+    assert cache.get("k", ttl_seconds=10) is None
+    assert cache.get("k", ttl_seconds=300) == "v"
+
+
+def test_ttl_forever_is_never_stale(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", "v", ttl_seconds=TTL_FOREVER)
+    p = tmp_path / "k.json"
+    raw = json.loads(p.read_text())
+    raw["written_at"] = 0   # epoch
+    p.write_text(json.dumps(raw))
+    assert cache.get("k", ttl_seconds=TTL_FOREVER) == "v"
+
+
+def test_corrupt_json_treated_as_miss(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    (tmp_path / "k.json").write_text("not json")
+    assert cache.get("k", ttl_seconds=60) is None
+
+
+def test_truncated_envelope_treated_as_miss(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    (tmp_path / "k.json").write_text('{"value": "x"}')   # missing ttl
+    assert cache.get("k", ttl_seconds=60) is None
+
+
+def test_subdirectory_keys(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("vulns/GHSA-xxx", {"id": "GHSA-xxx"}, ttl_seconds=60)
+    assert (tmp_path / "vulns" / "GHSA-xxx.json").exists()
+    assert cache.get("vulns/GHSA-xxx", ttl_seconds=60) == {"id": "GHSA-xxx"}
+
+
+def test_path_traversal_in_key_is_refused(tmp_path: Path) -> None:
+    # Degenerate segments are refused loudly rather than normalised:
+    # dropping them made distinct keys collide onto one file
+    # ("foo/.." used to alias "foo"), letting one entry shadow another.
+    cache = JsonCache(root=tmp_path)
+    with pytest.raises(ValueError):
+        cache.put("../escape", "should-not-escape", ttl_seconds=60)
+    assert not (tmp_path.parent / "escape.json").exists()
+    assert not (tmp_path / "escape.json").exists()
+
+
+def test_empty_key_after_sanitisation_raises(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    with pytest.raises(ValueError):
+        cache.put("../..", "x", ttl_seconds=60)
+
+
+def test_invalidate_removes_entry(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", "v", ttl_seconds=60)
+    cache.invalidate("k")
+    assert cache.get("k", ttl_seconds=60) is None
+
+
+def test_unwritable_root_falls_back_to_no_op(tmp_path: Path) -> None:
+    """If the root can't be created, cache becomes a no-op (warns once)."""
+    bad = tmp_path / "not-a-dir"
+    bad.write_text("file blocking dir creation")
+    cache = JsonCache(root=bad)
+    cache.put("k", "v", ttl_seconds=60)        # silently no-ops
+    assert cache.get("k", ttl_seconds=60) is None
+
+
+def test_atomic_write_does_not_leave_temp_files(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", "v", ttl_seconds=60)
+    leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+    assert leftovers == []
+
+
+def test_keys_with_dotted_segments_do_not_collide(tmp_path: Path) -> None:
+    """Regression: ``4.17.4`` and ``4.17.21`` used to collide on
+    ``4.17.json`` because ``Path.with_suffix(".json")`` treated the
+    trailing ``.4`` / ``.21`` as the existing suffix and replaced it."""
+    cache = JsonCache(root=tmp_path)
+    cache.put("queries/npm/lodash/4.17.4", ["v1"], ttl_seconds=60)
+    cache.put("queries/npm/lodash/4.17.21", ["v2"], ttl_seconds=60)
+    assert cache.get("queries/npm/lodash/4.17.4", ttl_seconds=60) == ["v1"]
+    assert cache.get("queries/npm/lodash/4.17.21", ttl_seconds=60) == ["v2"]
+    # Both files exist under the same parent.
+    parent = tmp_path / "queries" / "npm" / "lodash"
+    names = sorted(p.name for p in parent.iterdir())
+    assert names == ["4.17.21.json", "4.17.4.json"]
+
+
+def test_key_without_dots_still_lands_with_json_suffix(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("vulns/GHSA-test", {"id": "x"}, ttl_seconds=60)
+    assert (tmp_path / "vulns" / "GHSA-test.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Call-time default cache-root resolution (packages.sca.sca_cache_root)
+# ---------------------------------------------------------------------------
+
+def test_sca_cache_root_reads_home_at_call_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """$HOME is read per call, not snapshotted at import: a HOME pin
+    installed after the package was imported redirects the default
+    cache root (fabricated HOME — never the real one)."""
+    import packages.sca as sca_pkg
+    monkeypatch.setattr(sca_pkg, "SCA_CACHE_ROOT", None)
+    home_a = tmp_path / "home-a"
+    home_b = tmp_path / "home-b"
+    monkeypatch.setenv("HOME", str(home_a))
+    assert sca_pkg.sca_cache_root() == home_a / ".raptor" / "cache" / "sca"
+    # Changing HOME after the first call takes effect on the next.
+    monkeypatch.setenv("HOME", str(home_b))
+    assert sca_pkg.sca_cache_root() == home_b / ".raptor" / "cache" / "sca"
+    assert not home_a.exists() and not home_b.exists()
+
+
+def test_sca_cache_root_seam_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A monkeypatched SCA_CACHE_ROOT (the tests' isolation seam)
+    wins over the env-derived default."""
+    import packages.sca as sca_pkg
+    monkeypatch.setenv("HOME", str(tmp_path / "ignored"))
+    monkeypatch.setattr(sca_pkg, "SCA_CACHE_ROOT", tmp_path / "pinned")
+    assert sca_pkg.sca_cache_root() == tmp_path / "pinned"
+
+
+def test_reachability_inventory_cache_dir_follows_call_time_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reachability inventory-cache seam resolves through
+    sca_cache_root() at call time — the decoy-probe writer class this
+    conversion exists for."""
+    import packages.sca as sca_pkg
+    from packages.sca.reachability import _inventory_cache_dir
+    monkeypatch.setattr(sca_pkg, "SCA_CACHE_ROOT", None)
+    fakehome = tmp_path / "fakehome"
+    monkeypatch.setenv("HOME", str(fakehome))
+    target = tmp_path / "repo"
+    target.mkdir()
+    cache = _inventory_cache_dir(target)
+    assert cache.parent == fakehome / ".raptor" / "cache" / "sca" / "inventory"
+    assert not fakehome.exists()

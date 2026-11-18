@@ -44,7 +44,7 @@ def test_redacts_supported_secret_query_parameter_names(param_name):
 
 
 def test_preserves_non_secret_query_parameters_and_fragments():
-    value = "https://example.test/search?q=report&next=/home&page_token=cursor123#section"
+    value = "https://example.test/search?q=report&next=/home&page=cursor123#section"
 
     assert redact_secrets(value) == value
 
@@ -78,7 +78,10 @@ def test_redacts_lowercase_auth_schemes():
 
 
 def test_preserves_short_non_authorization_values():
-    value = "Bearer short basic setup tokenization page_token=cursor123"
+    # `page_token=cursor123` is NOT here: `_token`-suffixed assignments
+    # now redact in free text exactly as they always did in URL query
+    # strings (see test_secret_assignment_shapes_redact).
+    value = "Bearer short basic setup tokenization"
 
     assert redact_secrets(value) == value
 
@@ -112,7 +115,7 @@ class TestRedactUrlSecretsOnly:
     def test_bearer_substring_preserved(self):
         # `redact_secrets` would have replaced this; the path-specific
         # variant leaves it untouched (it's a filename, not a header).
-        value = "/tmp/Bearer abcdefghij1234567890abcdef.dat"
+        value = "./Bearer abcdefghij1234567890abcdef.dat"
         out = redact_url_secrets_only(value)
         assert "abcdefghij1234567890abcdef" in out, (
             f"Bearer-shaped substring wrongly redacted in path: {out!r}"
@@ -138,3 +141,310 @@ class TestRedactUrlSecretsOnly:
         out = redact_url_secrets_only(value)
         assert "abcdefghijklmnop" not in out
         assert "api_key=[REDACTED]" in out
+
+
+class TestVendorShapeCoverage:
+    """Credential shapes from the injection-evasion battery that
+    survived redaction verbatim — each pinned here with its exact
+    repro form plus the shape family around it."""
+
+    @pytest.mark.parametrize("text,fragment", [
+        # AWS secret access key (assignment-context anchored).
+        ("aws_secret_access_key = "
+         "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEYxx", "wJalrXUtnFEMIK7"),
+        ("AWS_SECRET_KEY: wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEYxx",
+         "wJalrXUtnFEMIK7"),
+        ('"aws_secret_access_key": "abcdEFGHijklMNOPqrstUVWXyz0123456789ABCD"',
+         "abcdEFGHijklMNOP"),
+        # PEM private-key blocks, with and without the END line.
+        ("dump:\n-----BEGIN PRIVATE KEY-----\n"
+         "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n"
+         "-----END PRIVATE KEY-----", "MIIEvQIBADAN"),
+        ("truncated:\n-----BEGIN RSA PRIVATE KEY-----\n"
+         "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEA", "MIIEvQIBADAN"),
+        # Azure storage AccountKey and AD client secret.
+        ("AccountKey=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"
+         "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==;EndpointSuffix=core.windows.net",
+         "QUFBQUFBQUFB"),
+        ("client_secret: 8Q~dummYsecretVALUEabcdefghijklmnopqrs",
+         "dummYsecretVALUE"),
+        # Slack browser-session token (xoxc — outside the old class).
+        ("session xoxc-1234567890123-abcdefghijklmnop", "abcdefghijklmnop"),
+        # Google OAuth refresh token.
+        ("refresh: 1//0gABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij-klm",
+         "0gABCDEFGHIJ"),
+        # JWT whose header JSON has whitespace (eyA..., not eyJ...).
+        ("auth eyAiYWxnIjogIkhTMjU2IiB9.eyAic3ViIjogIjEyMzQ1Njc4OTAiIH0."
+         "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c", "SflKxwRJSMe"),
+    ], ids=[
+        "aws-secret-assignment", "aws-secret-uppercase", "aws-secret-json",
+        "private-key-pem", "truncated-rsa-pem", "azure-account-key",
+        "oauth-client-secret", "slack-session", "google-refresh-token",
+        "jwt",
+    ])
+    def test_battery_shape_redacted(self, text, fragment):
+        out = redact_secrets(text)
+        assert fragment not in out, out
+
+    @pytest.mark.parametrize("text,password", [
+        ("postgres://svc:sekrit129@db.internal:5432/app", "sekrit129"),
+        ("mongodb+srv://svc:sekrit130@cluster.example/db", "sekrit130"),
+        ("redis://:sekrit131@cache.internal:6379/0", "sekrit131"),
+        ("amqp://svc:sekrit132@mq.internal:5672/", "sekrit132"),
+        ("ftp://svc:sekrit133@files.example/", "sekrit133"),
+    ])
+    def test_connection_string_password_redacted(self, text, password):
+        # Non-http schemes carry credentials in the same userinfo
+        # position; the http-only URL pattern let them all through.
+        out = redact_secrets(text)
+        assert password not in out, out
+        # Host survives — the redaction targets the credential only.
+        host = text.split("@", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        assert host in out
+
+    def test_connection_string_covered_in_url_only_mode(self):
+        out = redact_url_secrets_only("postgres://u:sekrit142@h/db")
+        assert "sekrit142" not in out
+
+    @pytest.mark.parametrize("benign", [
+        "result = 1//divisor",
+        "half = n//2",
+        "the xox token format is documented at api.example",
+        "AccountKey is required for this API",
+        "aws_secret_access_key = <redacted-elsewhere>",
+    ])
+    def test_benign_code_and_prose_untouched(self, benign):
+        assert redact_secrets(benign) == benign
+
+
+class TestFreeTextAssignments:
+    """is_secret_field_name + assignment wiring for free text (the
+    mechanism URL query redaction always had)."""
+
+    @pytest.mark.parametrize("text,secret", [
+        ("GITLAB_TOKEN=glpat_sekrit201x", "glpat_sekrit201x"),
+        ("npm_token=npmsekrit202", "npmsekrit202"),
+        ("DB_PASSWORD: hunter2hunter2", "hunter2hunter2"),
+        ("api_key: sekrit203abc", "sekrit203abc"),
+        ('"client_secret": "sekrit204abc"', "sekrit204abc"),
+        ("export AWS-SECRET-KEY=sekrit205abc", "sekrit205abc"),
+    ])
+    def test_secret_assignment_shapes_redact(self, text, secret):
+        out = redact_secrets(text)
+        assert secret not in out, out
+        assert "[REDACTED]" in out
+
+    @pytest.mark.parametrize("benign", [
+        # Non-secret names with long values stay put.
+        "version = 1.2.3-release+build99",
+        "hostname: db-primary.internal.example",
+        # Secret-suffixed name but value below the 8-char floor —
+        # prose like "password: short" is not a credential.
+        "password: short",
+        "token: use-it",
+        # Name merely CONTAINING "key" (no secret suffix) stays put.
+        "monkey = bananasplit123",
+    ])
+    def test_benign_assignments_untouched(self, benign):
+        assert redact_secrets(benign) == benign
+
+    def test_json_member_separator_not_swallowed(self):
+        # Unquoted JSON value: pre-fix the value charset included ','
+        # so the replacement consumed the separator and dragged the
+        # next member into [REDACTED].
+        out = redact_secrets('{"access_token": 12345678901, "next": true}')
+        assert "12345678901" not in out
+        assert out == '{"access_token": [REDACTED], "next": true}'
+
+    def test_quoted_json_value_stays_parseable(self):
+        import json as _json
+        out = redact_secrets(
+            '{"access_token": "sekrit212abcd", "next": true}')
+        assert "sekrit212abcd" not in out
+        assert _json.loads(out) == {"access_token": "[REDACTED]",
+                                    "next": True}
+
+    def test_semicolon_separated_assignment_keeps_tail(self):
+        # Cookie/config style `k=v;k2=v2` — the ';' stays outside the
+        # replacement. Trade-off (same as parens): a secret CONTAINING
+        # ','/';' redacts only up to it — this pass is the net under
+        # the URL/vendor passes, not the primary.
+        out = redact_secrets("session_token=sekrit213abc;path=/x")
+        assert "sekrit213abc" not in out
+        assert out.endswith(";path=/x")
+
+
+class TestUrlParensAndCap:
+    def test_paren_wrapped_url_query_secret_redacted(self):
+        out = redact_secrets("(see https://e.example/?token=sekrit210ab)")
+        assert "sekrit210ab" not in out
+        # The prose wrapper survives outside the URL.
+        assert out.endswith(")")
+
+    def test_parens_inside_url_path_do_not_truncate_redaction(self):
+        # Pre-fix the match stopped at '(' and the query escaped whole.
+        out = redact_secrets(
+            "https://e.example/wiki/Foo_(bar)?api_key=sekrit211ab&x=1")
+        assert "sekrit211ab" not in out
+        assert "Foo_(bar)" in out
+
+    def test_paren_url_covered_in_url_only_mode(self):
+        out = redact_url_secrets_only(
+            "https://e.example/a(b)/c?password=sekrit212ab")
+        assert "sekrit212ab" not in out
+
+    def test_secret_beyond_8k_cap_still_redacted(self):
+        # A URL longer than the 8 KB match cap splits; the tail pair
+        # scan must still catch the credential.
+        url = ("https://e.example/?pad=" + "a" * 9000
+               + "&access_token=sekrit213ab")
+        for fn in (redact_secrets, redact_url_secrets_only):
+            out = fn(url)
+            assert "sekrit213ab" not in out, fn.__name__
+
+
+class TestProsePreservingGates:
+    """FP gates added after sample-corruption reports: legitimate
+    prose/code survives while every real credential shape still
+    redacts. Both directions pinned."""
+
+    @pytest.mark.parametrize("benign", [
+        # Prose after "Basic"/"basic": all-one-case digitless words
+        # are not base64 credential encodings.
+        "basic understanding of heap grooming",
+        "Basic understanding of the allocator layout",
+        "a basic assumption underlies the check",
+        # Code expressions under secret-named assignments: dotted
+        # attribute paths and call expressions are diagnostics the
+        # disagreement samples need, not credentials.
+        "token = lexer.next_token()",
+        "signature = inspect.signature(func)",
+        'auth = request.headers.get("Authorization")',
+        "session_token = client.refresh_session()",
+    ])
+    def test_prose_and_code_survive(self, benign):
+        assert redact_secrets(benign) == benign
+
+    @pytest.mark.parametrize("text,secret", [
+        # Real Basic credentials keep redacting (mixed case, digits,
+        # or padding — every realistic base64("user:pass") shape).
+        ("Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+         "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+        ("hdr Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ("hdr Basic abcd1234efgh", "abcd1234efgh"),
+        # Real secret-named assignments keep redacting: random
+        # values are neither dotted identifier paths nor calls.
+        ("session_token = 9f8e7d6c5b4a", "9f8e7d6c5b4a"),
+        ("auth: hunter2hunter2", "hunter2hunter2"),
+    ])
+    def test_real_credentials_still_redact(self, text, secret):
+        out = redact_secrets(text)
+        assert secret not in out, out
+        assert "[REDACTED]" in out
+
+
+class TestFragmentSecrets:
+    """OAuth implicit-flow tokens live in the URL FRAGMENT (that's the
+    spec's point — the fragment never crosses the wire), so fragment
+    key=value pairs get the same secret-name redaction as the query."""
+
+    def test_fragment_access_token_redacted(self):
+        out = redact_secrets(
+            "cb https://app.example/cb#access_token=abcdef123456&state=ok")
+        assert "abcdef123456" not in out
+        assert "access_token=[REDACTED]" in out
+        assert "state=ok" in out
+
+    def test_blank_valued_fragment_secret_pair_survives_redaction(self):
+        # A blank-valued pair must round-trip (key visible, value
+        # redacted-in-place) — dropping blank pairs would silently
+        # rewrite the URL shape in artifacts.
+        out = redact_secrets("see https://app.example/#id_token=&next=/home")
+        assert "id_token=[REDACTED]" in out
+        assert "next=/home" in out
+
+    def test_fragment_without_pairs_untouched(self):
+        out = redact_secrets("doc https://app.example/page#section-2 end")
+        assert "https://app.example/page#section-2" in out
+
+
+class TestBlankQueryValues:
+    def test_blank_valued_query_secret_pair_survives_redaction(self):
+        out = redact_secrets("GET https://api.example/v1?token=&page=2")
+        assert "token=[REDACTED]" in out
+        assert "page=2" in out
+
+
+class TestUserinfoEdgeShapes:
+    def test_multi_at_userinfo_redacts_password_keeps_host(self):
+        # '@' is legal (percent-encoding-optional in practice) inside
+        # userinfo passwords; the HOST is everything after the LAST
+        # '@'. The password — '@'s included — must be redacted whole.
+        out = redact_secrets("dsn https://user:p@ss@db.example/base")
+        assert out == "dsn https://user:[REDACTED]@db.example/base"
+
+
+class TestBalancedParenUrls:
+    def test_balanced_paren_url_not_peeled(self):
+        # Balanced parens are URL content (wikipedia-style paths,
+        # tracking params): the trailing ')' belongs to the URL and is
+        # NOT split off as a prose wrapper. The query value round-trips
+        # percent-encoded by the redaction re-serialisation.
+        out = redact_secrets("go https://api.example/?q=(x) end")
+        assert "https://api.example/?q=%28x%29 end" in out
+
+
+class TestCodeShapedAssignmentValues:
+    def test_call_expression_value_not_redacted(self):
+        # `password = get_pass(ctx)` is a code snippet quoted into a
+        # diagnostic — the "value" is a function call, not a credential.
+        s = "password = get_pass(ctx)"
+        assert redact_secrets(s) == s
+
+    def test_dotted_path_value_not_redacted(self):
+        s = "auth_token = request.headers.auth"
+        assert redact_secrets(s) == s
+
+    def test_literal_secret_value_still_redacted(self):
+        out = redact_secrets("password = hunter2hunter2")
+        assert "hunter2hunter2" not in out
+        assert "[REDACTED]" in out
+
+
+class TestNpmrcAndVendorTokenShapes:
+    """npm's canonical .npmrc secret spellings carry a LEADING
+    underscore; resolver/npm stderr quoting an .npmrc line is a
+    routine leak path into shareable artifacts."""
+
+    def test_npmrc_authtoken_line_redacted(self):
+        out = redact_secrets(
+            "//registry.npmjs.org/:_authToken=npm_secretvalue123456")
+        assert "npm_secretvalue123456" not in out
+        assert "_authToken=[REDACTED]" in out
+
+    def test_npmrc_auth_line_redacted(self):
+        out = redact_secrets("_auth=dXNlcjpodW50ZXIyMjIyMg==")
+        assert "dXNlcjpodW50ZXIyMjIyMg" not in out
+
+    def test_gitlab_pat_redacted(self):
+        out = redact_secrets("using glpat-AbCdEfGhIjKlMnOpQrSt here")
+        assert "AbCdEfGhIjKlMnOpQrSt" not in out
+
+    def test_huggingface_token_redacted_by_shape(self):
+        # By SHAPE, not by a `token=` name prefix.
+        out = redact_secrets(
+            "hf_ABCDEFGHIJabcdefghij0123456789XY pulled the model")
+        assert "ABCDEFGHIJabcdefghij0123456789XY" not in out
+
+    def test_is_secret_field_name_leading_underscore(self):
+        from core.security.redaction import is_secret_field_name
+        assert is_secret_field_name("_authToken")
+        assert is_secret_field_name("_auth")
+        assert is_secret_field_name("-password")
+        # Two-direction: benign names stay benign after the strip.
+        assert not is_secret_field_name("_id")
+        assert not is_secret_field_name("__version__")
+
+    def test_benign_prose_untouched(self):
+        s = "the glpat prefix and hf hub are mentioned in prose"
+        assert redact_secrets(s) == s

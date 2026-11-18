@@ -1,0 +1,114 @@
+rules:
+  # ---------------------------------------------------------------------------
+  # Python — JWT decoded without signature verification (CWE-345)
+  # Recognize explicit bypass settings; trusting the resulting claims
+  # for authentication still depends on the surrounding data flow.
+  # ---------------------------------------------------------------------------
+  - id: raptor.auth.jwt-no-verify.python
+    message: >-
+      JWT signature verification is explicitly disabled for this decode.
+      Treat the claims as untrusted until verified with a trusted key and
+      explicit algorithm; using unverified claims for authentication permits forgery.
+    languages: [python]
+    severity: CRITICAL
+    pattern-either:
+      - pattern: 'jwt.decode(..., options={"verify_signature": False}, ...)'
+      - pattern: 'jwt.decode_complete(..., options={"verify_signature": False}, ...)'
+    metadata:
+      cwe: ["CWE-345"]
+      owasp_top_10: ["A2:2021-Cryptographic Failures"]
+      tags: ["security", "auth", "jwt", "misconfiguration"]
+
+  # verify=False disabled verification in PyJWT 1.x, but is ignored in 2.x.
+  # Keep the legacy lead visible without asserting a modern signature bypass.
+  - id: raptor.auth.jwt-legacy-verify.python
+    message: >-
+      Legacy verify=False disables JWT verification in PyJWT 1.x but is ignored
+      in PyJWT 2.x. Check the target dependency version and verification policy.
+      Use explicit options only when deliberately parsing untrusted claims.
+    languages: [python]
+    severity: MEDIUM
+    patterns:
+      - pattern: jwt.decode(..., verify=False, ...)
+      # The explicit bypass already produces the primary critical finding.
+      - pattern-not: 'jwt.decode(..., options={"verify_signature": False}, ...)'
+    metadata:
+      cwe: ["CWE-345"]
+      owasp_top_10: ["A2:2021-Cryptographic Failures"]
+      tags: ["security", "auth", "jwt", "misconfiguration"]
+
+  # ---------------------------------------------------------------------------
+  # JavaScript / TypeScript — JWT decoded without signature verification
+  # Decode APIs parse claims without signature verification. Empty verification
+  # keys are a separate configuration lead with version-dependent behaviour.
+  # ---------------------------------------------------------------------------
+  - id: raptor.auth.jwt-no-verify.javascript
+    message: >-
+      JWT claims are decoded without signature verification. Use the matching
+      library's verification API (jsonwebtoken verify or jose jwtVerify) with
+      a trusted key and an explicit algorithm policy before using claims for
+      authentication.
+    languages: [javascript, typescript]
+    severity: CRITICAL
+    pattern-either:
+      - patterns:
+          - pattern: $JWT.decode($TOKEN, ...)
+          - pattern-either:
+              - pattern-inside: |
+                  import $JWT from "jsonwebtoken";
+                  ...
+              - pattern-inside: |
+                  import * as $JWT from "jsonwebtoken";
+                  ...
+              - pattern-inside: |
+                  const $JWT = require("jsonwebtoken");
+                  ...
+      - patterns:
+          - pattern: $JOSE.decodeJwt($TOKEN)
+          - pattern-either:
+              - pattern-inside: |
+                  import * as $JOSE from "jose";
+                  ...
+              - pattern-inside: |
+                  const $JOSE = require("jose");
+                  ...
+      - patterns:
+          - pattern: decodeJwt($TOKEN)
+          - pattern-inside: |
+              import { decodeJwt } from "jose";
+              ...
+      - patterns:
+          - pattern: $DECODE($TOKEN)
+          - pattern-inside: |
+              import { decodeJwt as $DECODE } from "jose";
+              ...
+    metadata:
+      cwe: ["CWE-345"]
+      owasp_top_10: ["A2:2021-Cryptographic Failures"]
+      tags: ["security", "auth", "jwt", "misconfiguration"]
+
+  - id: raptor.auth.jwt-empty-secret.javascript
+    message: >-
+      JWT verification is configured with an empty string key. This is a
+      configuration review lead: signed tokens may be rejected, and unsigned
+      token handling depends on the library version and verification options.
+      Check key configuration and the intended algorithm policy before treating
+      this as an authentication bypass.
+    languages: [javascript, typescript]
+    severity: MEDIUM
+    patterns:
+      - pattern: $JWT.verify($TOKEN, "", ...)
+      - pattern-either:
+          - pattern-inside: |
+              import $JWT from "jsonwebtoken";
+              ...
+          - pattern-inside: |
+              import * as $JWT from "jsonwebtoken";
+              ...
+          - pattern-inside: |
+              const $JWT = require("jsonwebtoken");
+              ...
+    metadata:
+      cwe: ["CWE-345"]
+      owasp_top_10: ["A2:2021-Cryptographic Failures"]
+      tags: ["security", "auth", "jwt", "misconfiguration"]

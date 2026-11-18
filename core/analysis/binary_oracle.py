@@ -1,0 +1,1851 @@
+"""Binary-oracle reachability evidence — Inc 1 (classifier + 3-way classify).
+
+Joins the source inventory with a matching debug binary via DWARF + nm to
+produce one verdict per source function:
+
+    symbol_present   the function is present in the binary's symbol table.
+    inlined          DWARF shows the function was absorbed into callers
+                     (DW_TAG_inlined_subroutine instance exists), no
+                     standalone symbol.
+    absent           neither — DCE'd by the compiler/linker.
+    folded           two distinct source functions share one binary address
+                     (ICF / outlining); both classify here, never as ``absent``.
+
+Used asymmetrically by the reachability classifier (Inc 2):
+
+  * ``absent ∧ ¬inlined`` ⇒ dead in THIS build (STRONG HEURISTIC; build-
+    config-specific, so surface-only until corpus precision earns
+    enforcement; never overrides a SOUND witness).
+  * ``inlined`` or ``symbol_present`` ⇒ no demote.
+  * Binary call edges the source graph missed ⇒ promote callee to reachable
+    (Inc 2; not built here).
+
+v1 scope (per design): Linux ELF, native targets (C/C++/Rust/Go). A
+stripped binary (no DWARF) falls back to the nm-only ``symbol_only``
+tier — verdicts still enrich, but never earn ``absent``-suppression;
+macOS Mach-O / PE deferred.
+
+Implementation: shells out to system tools (``readelf``, ``nm``,
+``objdump --dwarf=info``) — no Python DWARF library dependency. The text
+parsing is binutils-version-resilient enough for the fixture matrix; the
+classifier is the consumer-facing contract, not the parsing details.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+
+from core.security.log_sanitisation import escape_nonprintable
+from core.source.streams import preserving_stream_error
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import (
+    Literal,
+TYPE_CHECKING,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator, Mapping
+    from typing import IO
+
+logger = logging.getLogger(__name__)
+
+
+Classification = Literal["symbol_present", "inlined", "absent", "folded"]
+
+
+@dataclass(frozen=True)
+class BinaryOracleWitness:
+    """Per-source-function evidence from a debug binary join.
+
+    Carries provenance (``build_id`` + ``binary_path``) so consumers can spot
+    scope mismatch (e.g. a witness from a different build was reused) and so
+    multi-binary results can be attributed correctly. ``edges_added`` is
+    reserved for Inc 2 (the call-edge promote direction) and stays empty
+    here.
+
+    ``tier`` encodes the evidence quality:
+
+      ``"full"`` — DWARF + nm. All four verdicts (symbol_present,
+                   inlined, absent, folded) emittable. Corpus-earned;
+                   absent verdicts may license downstream suppression.
+
+      ``"symbol_only"`` — stripped binary (no DWARF), nm-only. Cannot
+                   distinguish ``inlined`` (no DW_TAG_inlined_subroutine
+                   info) from ``absent`` (no nm symbol). Conservative:
+                   absent verdicts in this tier do NOT earn suppression
+                   — a stripped-out function could be inlined into a
+                   surviving caller without us knowing. Emits
+                   ``symbol_present`` and ``absent`` only.
+    """
+    classification: Classification
+    build_id: str
+    binary_path: str
+    address: int | None = None
+    edges_added: list[tuple[str, str]] = field(default_factory=list)
+    tier: str = "full"
+
+
+# ---------------------------------------------------------------------------
+# System-tool wrappers (small, defensive, swap-out points if pyelftools ever
+# gets added as a dep).
+# ---------------------------------------------------------------------------
+
+def _run(argv: list[str], timeout: int = 60,
+         binary: Path | str | None = None) -> str:
+    """Capture stdout from a system tool; return ``''`` on any failure
+    rather than raise — the classifier is best-effort and surface-only.
+
+    Runs under the FULL sandbox (network blocked, Landlock, seccomp,
+    rlimits), not ``run_trusted``: the tool binaries (readelf, nm,
+    objdump, c++filt) are RAPTOR-picked, but the BYTES they parse come
+    from the target's build tree — or, for explicit ``--binary``, an
+    operator-supplied path of unverified provenance — and binutils'
+    ELF/DWARF parsers have a long CVE history. A malformed ELF planted
+    in ``build/`` must not get its exploit payload parsed by a process
+    with the user's full filesystem and network (byte-for-byte output
+    parity with the unsandboxed run was verified 2026-08-15; r2 already
+    gets the same treatment in ``binary_oracle_edges``).
+
+    ``binary`` scopes reads to its input directory. Writes, HOME and cwd
+    use private scratch; the shared untrusted floor governs execution.
+    """
+    return _run_status(argv, timeout=timeout, binary=binary)[0]
+
+
+def _run_status(argv: list[str], timeout: int = 60,
+                binary: Path | str | None = None) -> tuple[str, bool]:
+    """Like :func:`_run` but also reports whether the tool COMPLETED
+    cleanly: ``(stdout, ok)``. ``ok=False`` means the tool errored,
+    timed out, or died on a signal — callers that would otherwise
+    treat empty output as legitimately-empty evidence (e.g. the
+    plain-``nm`` fallback) can distinguish the two."""
+    # Lazy import — keep the classifier independently importable in
+    # unit tests that stub the sandbox module.
+    from core.sandbox import run as _sandbox_run
+    from core.binary._inspection_policy import inspection_command, inspection_options
+    from core.security.env_sanitisation import subprocess_tmpdir
+    if binary is not None:
+        argv = [str(Path(binary).resolve()) if str(arg) == str(binary) else arg for arg in argv]
+    try:
+        # errors="replace": tool output over a malformed/hostile ELF can
+        # carry non-UTF-8 bytes; the default strict decode would raise
+        # UnicodeDecodeError instead of degrading to "no evidence".
+        with tempfile.TemporaryDirectory(prefix="raptor-bininspect-", dir=subprocess_tmpdir()) as scratch:
+            proc = _sandbox_run(inspection_command(argv, scratch), **inspection_options(binary, argv[0], scratch),
+                                stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("binary_oracle: %s failed: %s", argv[0], e)
+        return "", False
+    if proc.returncode != 0:
+        # GNU nm exits 1 for a present-but-empty symbol table
+        # ("no symbols") — that's complete evidence of emptiness,
+        # not a tool failure.
+        if argv[0] == "nm" and "no symbols" in (proc.stderr or ""):
+            return "", True
+        # Anything else non-zero (malformed-ELF parse error, OOM /
+        # sandbox rlimit kill, signal death) may have truncated
+        # stdout mid-stream. Consuming the partial output as complete
+        # would mint verdicts from a partial symbol table / DWARF
+        # dump — a function past the cut-off point looks ``absent``.
+        # Treat as no evidence for this tool, matching the
+        # TimeoutExpired path above.
+        # The stderr slice and the trailing argv element are hostile-
+        # ELF-derived (tool output over attacker bytes; a scanned-repo
+        # file path) — escape before they reach the operator's
+        # terminal/log (core.security.log_sanitisation names both as
+        # canonical untrusted inputs).
+        logger.warning(
+            "binary_oracle: %s rc=%s on %s — discarding partial output "
+            "(stderr=%s)",
+            argv[0], proc.returncode,
+            escape_nonprintable(str(argv[-1])),
+            escape_nonprintable((proc.stderr or "")[:200]))
+        return "", False
+    return proc.stdout or "", True
+
+
+# Bound one decoded record without capping legitimate multi-GB DWARF files.
+_MAX_STREAM_LINE_CHARS = 8 * 1024 * 1024
+
+
+class _StreamRefused(RuntimeError):
+    """The output cannot be treated as complete DWARF evidence."""
+
+
+class _OwnedOutputReader(io.RawIOBase):
+    """Read the retained file without trusting its child-shared seek offset.
+
+    The enclosing file context owns the descriptor. Closing this
+    reader closes only the buffering stack, not that retained descriptor.
+    """
+
+    def __init__(self, descriptor: int):
+        super().__init__()
+        self._descriptor = descriptor
+        self._offset = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        data = os.pread(self._descriptor, len(buffer), self._offset)
+        self._offset += len(data)
+        buffer[:len(data)] = data
+        return len(data)
+
+
+@contextlib.contextmanager
+def _owned_output(directory: str) -> Iterator[int]:
+    """Create once and delegate a non-inheritable descriptor above stdio."""
+    with preserving_stream_error(contextlib.ExitStack()) as delegated:
+        with preserving_stream_error(contextlib.ExitStack()) as setup:
+            created = setup.enter_context(preserving_stream_error(
+                tempfile.NamedTemporaryFile(
+                    mode="w+b", prefix="stdout-", dir=directory, delete=False,
+                )
+            ))
+            descriptor = os.dup(created.fileno())
+            while descriptor < 3:
+                setup.callback(os.close, descriptor)
+                descriptor = os.dup(descriptor)
+            delegated.callback(os.close, descriptor)
+        # Setup handles are retired before the child receives its sole output
+        # descriptor. Each close is attempted once, even when another fails.
+        yield descriptor
+
+
+def _stream(argv: list[str], timeout: int,
+            binary: Path | str | None = None) -> Iterator[str]:
+    """Stream a completed tool's large stdout from a parent-owned file.
+
+    Keep multi-GB DWARF output on disk. The child receives an explicit file
+    capability, never a filename for the parent to reopen later. stderr
+    stays on the sandbox's bounded capture path. Stream refusals propagate
+    so the DWARF collector can discard every previously parsed record.
+    """
+    from core.sandbox import run as _sandbox_run
+    from core.security.env_sanitisation import subprocess_tmpdir
+    from core.binary._inspection_policy import inspection_command, inspection_options
+    if binary is not None:
+        argv = [str(Path(binary).resolve()) if str(arg) == str(binary) else arg for arg in argv]
+    with tempfile.TemporaryDirectory(prefix="raptor-bo-stream-", dir=subprocess_tmpdir()) as td, \
+            _owned_output(td) as output_fd:
+        wrapper = ["bash", "-c", 'exec 1>&"$1"; shift; exec "$@"',
+                   "bo-stream", str(output_fd), *argv]
+        try:
+            proc = _sandbox_run(
+                inspection_command(wrapper, td), **inspection_options(binary, argv[0], td),
+                stdin=subprocess.DEVNULL,
+                # The newly created file is within output= and passes the
+                # ordinary descriptor policy; no capability waiver is needed.
+                pass_fds=(output_fd,),
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("binary_oracle: %s failed/timed out: %s",
+                           argv[0], escape_nonprintable(str(exc)))
+            return
+        if proc.returncode != 0:
+            logger.warning(
+                "binary_oracle: %s rc=%s on %s — discarding partial "
+                "output (stderr=%s)",
+                argv[0], proc.returncode,
+                escape_nonprintable(str(argv[-1])),
+                escape_nonprintable((proc.stderr or "")[:200]))
+            return
+        raw = _OwnedOutputReader(output_fd)
+        with io.TextIOWrapper(io.BufferedReader(raw), encoding="utf-8", errors="replace") as reader:
+            while True:
+                line = reader.readline(_MAX_STREAM_LINE_CHARS + 1)
+                if not line:
+                    break
+                if len(line) > _MAX_STREAM_LINE_CHARS:
+                    raise _StreamRefused(f"tool output line exceeds {_MAX_STREAM_LINE_CHARS} characters")
+                yield line.rstrip("\n")
+
+
+def read_build_id(binary_path: Path) -> str | None:
+    """Return the ELF ``.note.gnu.build-id`` (40-hex SHA1), or ``None``."""
+    out = _run(["readelf", "-n", str(binary_path)], binary=binary_path)
+    m = re.search(r"Build ID:\s*([0-9a-fA-F]+)", out)
+    return m.group(1).lower() if m else None
+
+
+# GCC IPA-clone suffixes. ``-O2`` routinely rewrites symbol names with
+# these tails when interprocedural optimisations specialise a function for
+# its callers. Operators analysing any GCC-built binary will hit this — a
+# source ``foo`` may only appear in nm as ``foo.constprop.0``, with no
+# original ``foo`` symbol. Strip the suffix when building the bare-name
+# index so source-name lookup still finds the function.
+#   .constprop.N  — -fipa-cp constant-propagation clone
+#   .isra.N       — -fipa-sra scalar-replacement clone
+#   .part.N       — -fpartial-inlining hot/cold split
+#   .cold / .cold.N
+#   .local.N      — local visibility specialisation
+#   .lto_priv.N   — -flto privatised local clone (common in LTO builds)
+#   .clone.N      — generic GCC clone (target attribute, tail-merge clone)
+#   ._omp_fn.N    — OpenMP outlined function
+#   .resolver     — ifunc resolver indirection
+#   .cfi          — -fcf-protection CFI thunk
+#   .llvm.NN…     — clang/LLVM target attribute / ThinLTO variant suffix
+#                    (numeric tail can be long, allow .\w+)
+_IPA_CLONE_SUFFIX_RE = re.compile(
+    r"\.(?:constprop|isra|part|cold|local|lto_priv|clone|_omp_fn"
+    r"|resolver|cfi)(?:\.\d+)?$"
+    r"|\.llvm\.\w+$"
+)
+
+
+def _strip_ipa_suffix(name: str) -> str:
+    """Repeatedly strip GCC IPA-clone suffixes; e.g.
+    ``gz_skip.constprop.0`` → ``gz_skip``, ``foo.isra.0.constprop.1`` →
+    ``foo``. Returns ``name`` unchanged if no suffix matches."""
+    while True:
+        stripped = _IPA_CLONE_SUFFIX_RE.sub("", name)
+        if stripped == name:
+            return name
+        name = stripped
+
+
+def _strip_params(full: str) -> str:
+    """Strip parameter list from a demangled C++ symbol, preserving
+    ``operator()`` and similar operators whose names contain parens."""
+    if "(" not in full:
+        return full
+    # operator() — the parens are part of the name, not the param list
+    op_marker = "operator()"
+    oi = full.find(op_marker)
+    if oi != -1:
+        after = full[oi + len(op_marker):]
+        prefix = full[: oi + len(op_marker)]
+        return prefix + (after.split("(", 1)[0] if "(" in after else after)
+    return full.split("(", 1)[0]
+
+
+def _nm_symbols(binary_path: Path) -> dict[str, int]:
+    """Back-compat wrapper around :func:`_nm_symbols_status` for callers
+    that only want the symbol table."""
+    return _nm_symbols_status(binary_path)[0]
+
+
+def _nm_symbols_status(binary_path: Path) -> tuple[dict[str, int], bool]:
+    """Name → address for every text symbol (local + global) defined in the
+    binary, plus an ``ok`` flag. Missing tools / non-ELF input return
+    ``({}, False)``: ``ok=False`` means no nm invocation completed
+    cleanly, so the symbol table is UNKNOWN (not known-empty) — the
+    classifier must not mint suppression-grade ``absent`` verdicts
+    from the failed tool's silence.
+
+    Uses ``nm -C`` so C++ source function names (which DWARF
+    ``DW_AT_name`` emits unmangled) match the symbol table entries (which
+    nm emits MANGLED by default — e.g. ``_ZNK6Widget11live_methodEv``).
+    Without ``-C``, every C++ method would classify as ``absent`` because
+    the unmangled lookup never finds the mangled symbol (adversarial-review
+    scenario B). Also indexes by *bare* name so source ``live_method``
+    matches demangled ``Widget::live_method() const``, and so source
+    ``gz_skip`` matches the GCC-cloned ``gz_skip.constprop.0``."""
+    out, ok = _run_status(["nm", "-C", str(binary_path)],
+                          binary=binary_path)
+    if not ok:
+        # Fall back to plain nm only when ``nm -C`` FAILED (-C
+        # unavailable on an exotic nm build, tool crash). A clean run
+        # with legitimately-empty output is complete evidence of an
+        # empty symbol table — rerunning without -C would just repeat
+        # the answer at the cost of another subprocess.
+        out, ok = _run_status(["nm", str(binary_path)],
+                              binary=binary_path)
+    syms: dict[str, int] = {}
+    for line in out.splitlines():
+        # ``<addr> <type> <demangled name (may contain spaces)>``
+        # — split into at most 3 parts so a demangled name with spaces
+        # survives intact for both the full-signature and bare-name lookup.
+        parts = line.split(None, 2)
+        if len(parts) >= 3 and len(parts[1]) == 1 and parts[1] in "tTwW":
+            try:
+                addr = int(parts[0], 16)
+            except ValueError:
+                continue
+            full = parts[2].strip()
+            syms[full] = addr
+            # Three name forms get indexed so source-name lookup hits no
+            # matter which form the caller has:
+            #   full       "snappy::Uncompress(snappy::Source*, snappy::Sink*)"
+            #   qualified  "snappy::Uncompress"   ← what gcov -m emits
+            #   bare       "Uncompress"           ← legacy bare-name lookup
+            # Without ``qualified``, C++ measurement against ``gcov -m``
+            # demangled output couldn't match nm — surfaced in snappy Inc 3c.
+            qualified = _strip_params(full)
+            qualified = _strip_ipa_suffix(qualified)
+            if qualified and qualified != full:
+                syms.setdefault(qualified, addr)
+            bare = (qualified.rsplit("::", 1)[-1]
+                    if "::" in qualified else qualified)
+            if bare and bare not in (full, qualified):
+                syms.setdefault(bare, addr)
+    return syms, ok
+
+
+@dataclass
+class _SubprogramDIE:
+    name: str = ""                            # DW_AT_name (local)
+    namespace_path: str = ""                  # "snappy::Bits" from enclosing scope
+    low_pc: int | None = None
+    has_inline_marker: bool = False           # DW_AT_inline=inlined
+    abstract_origin: int | None = None     # DIE offset (for inline instances)
+    specification: int | None = None       # DIE offset (definition → declaration)
+    linkage_name: str = ""                    # DW_AT_linkage_name (mangled symbol)
+
+    @property
+    def qualified_name(self) -> str:
+        """Fully-qualified C++ name (``snappy::Bits::Log2Floor``) or the
+        bare name for C. Empty if ``name`` is unset (declaration-only
+        DIE that hasn't had its specification resolved yet)."""
+        if not self.name:
+            return ""
+        if not self.namespace_path:
+            return self.name
+        return f"{self.namespace_path}::{self.name}"
+
+
+# ---------------------------------------------------------------------------
+# C++ demangled-name parsing — shared between the classifier and corpus
+# drivers (snappy.py reuses these via import).
+# ---------------------------------------------------------------------------
+
+_METHOD_TRAILING_QUALS = (
+    " const volatile", " const", " volatile",
+    " noexcept", " &&", " &",
+)
+
+
+def _find_arglist_open(name: str) -> int:
+    """Index of the ``(`` opening the function's argument list, or -1.
+    Walks right-to-left tracking ``<>`` / ``()`` / ``[]`` depth so the
+    ``(`` inside ``(anonymous namespace)`` or template args isn't
+    mistaken for the arglist opener. Also recognises ``operator()`` as
+    a name-token: a balance-zero ``(`` immediately following the
+    literal ``operator`` is the call-operator's own paren, not an
+    arglist — returns -1 (no arglist) when it's the only candidate so
+    callers preserve ``operator()`` intact (snappy lambda FP fix)."""
+    if not name.endswith(")"):
+        return -1
+    angle = 0
+    bracket = 0   # [] depth, for ``operator[]``
+    depth = 0
+    for i in range(len(name) - 1, -1, -1):
+        ch = name[i]
+        if ch == ">":
+            angle += 1
+        elif ch == "<" and angle > 0:
+            angle -= 1
+        elif angle == 0:
+            if ch == "]":
+                bracket += 1
+            elif ch == "[" and bracket > 0:
+                bracket -= 1
+            elif bracket == 0:
+                if ch == ")":
+                    depth += 1
+                elif ch == "(":
+                    depth -= 1
+                    if depth == 0:
+                        if name[:i].rstrip().endswith("operator"):
+                            # The ``(`` belongs to ``operator()`` — not
+                            # the function's arglist. There's no arglist
+                            # after the operator name; keep the whole
+                            # ``operator()`` intact in the qualified name.
+                            return -1
+                        return i
+    return -1
+
+
+# Lambda type tags in demangled output: c++filt emits the captured
+# argument types inside ``{lambda(...)#N}`` but ``gcov -m`` emits the
+# bare placeholder ``{lambda()#N}``. Normalise to the gcov form so the
+# two name sources can match.
+# The argument span is bounded: unbounded, every "{lambda(" planted
+# in a hostile name re-scans the rest of it — quadratic. Demangled
+# lambda argument lists sit far below 4000 chars (beyond it the
+# name is left unnormalised, versus an unbounded scan).
+_LAMBDA_ARGS_RE = re.compile(r"\{lambda\([^)]{0,4000}\)(#\d+)\}")
+
+
+def _normalise_lambda_args(name: str) -> str:
+    return _LAMBDA_ARGS_RE.sub(r"{lambda()\1}", name)
+
+
+# Rust crate-id hash embedded in demangled names: c++filt's Rust v0
+# decoder emits ``regex[7e9e1dd283b8ce7a]::Match``. The hash is distinct
+# per build (regenerated on each compile) but carries no information for
+# source-name matching. Strip it so qualified names compare cleanly
+# across rebuilds and align with ``nm -C`` output (which omits
+# the hash). Originally lived in the regex driver; promoted here so every
+# Rust binary + every future Rust corpus driver benefits automatically.
+#
+# Constrained to Rust-shape contexts (hex with optional ``h`` prefix —
+# the rustc convention — and the bracket sits at end-of-name or at a
+# ``::`` boundary). Without this constraint the regex also stripped
+# bracketed hex in C++ template arg lists (e.g. a hypothetical
+# ``foo[deadbeef]::bar``); the constraint anchors to Rust shape.
+_RUST_CRATE_HASH_RE = re.compile(
+    r"\[h?[0-9a-f]{8,}\](?=::|$)"
+)
+
+
+def _strip_rust_crate_hash(name: str) -> str:
+    return _RUST_CRATE_HASH_RE.sub("", name)
+
+
+# Rust impl-block demangler syntax: ``<regex::regex::bytes::Match>::start``
+# is ``impl Match { fn start... }``. DWARF tracks the same hierarchy via
+# DW_TAG_namespace + DW_TAG_structure_type and produces the qualified
+# name ``regex::regex::bytes::Match::start`` (no angle brackets). Strip
+# the brackets so the lookup forms align — without this, accessor
+# methods on Rust types misclassify as ``absent`` because the demangler
+# and the DWARF namespace tracker disagree on syntax (Inc 3g regex
+# corpus finding).
+#
+# Supports nested generics and qualified projections (the common shapes
+# in real-world Rust binaries with heavy generic / trait code — tokio,
+# hyper, etc.):
+#   <crate::Type<T>>::method        — generic instantiation
+#   <&str>::len                      — primitive ref
+#   <[u8; 4]>::iter                  — array type
+#   <dyn Trait>::method              — dyn trait
+#   <<Foo as Trait>::Bar>::method    — qualified projection
+#
+# The bracketed type is balanced — count ``<`` / ``>`` to find the
+# matching close. C++ templates with leading ``<>`` (e.g.
+# ``<vector<int>>::method`` from a hypothetical C++ namespace prefix
+# spelling — vanishingly rare) also benefit from the same handling.
+
+def _strip_impl_block_brackets(name: str) -> str:
+    """Strip the outermost ``<...>`` from a Rust impl-block-qualified
+    name. Returns ``name`` unchanged if the input doesn't start with
+    ``<`` or the bracket isn't followed by ``::``."""
+    if not name.startswith("<"):
+        return name
+    depth = 0
+    close_idx = -1
+    for i, ch in enumerate(name):
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx < 1:
+        return name
+    # Must be followed by ``::`` for this to be an impl-block prefix.
+    if not name[close_idx + 1:].startswith("::"):
+        return name
+    inner = name[1:close_idx]
+    rest = name[close_idx + 3:]
+    # Recurse on inner — Rust qualified projection
+    # ``<<Foo as Trait>::Bar>::method`` strips to ``Foo as Trait::Bar::method``
+    # in the outer pass; the inner ``<Foo as Trait>::Bar`` is itself a
+    # well-formed impl-block prefix.
+    inner = _strip_impl_block_brackets(inner)
+    return f"{inner}::{rest}"
+
+
+
+def _qualified_from_demangled(name: str) -> str:
+    """Strip argument list + trailing method qualifiers + any leading
+    return type from a demangled C++ or Rust name. Returns the
+    qualified-no-args form. Operator names, template args with embedded
+    spaces, anonymous namespaces, trailing ``const`` / ``noexcept``
+    qualifiers, lambda arg-type normalisation, Rust impl-block
+    bracket-strip and Rust crate-hash strip all handled."""
+    name = _strip_impl_block_brackets(
+        _strip_rust_crate_hash(
+            _normalise_lambda_args(name.strip())))
+    changed = True
+    while changed:
+        changed = False
+        for q in _METHOD_TRAILING_QUALS:
+            if name.endswith(q):
+                name = name[:-len(q)].rstrip()
+                changed = True
+                break
+    paren_open = _find_arglist_open(name)
+    head = name if paren_open < 0 else name[:paren_open].strip()
+    depth = 0
+    last_space_at_top = -1
+    for i, ch in enumerate(head):
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]" and depth > 0:
+            depth -= 1
+        elif ch == " " and depth == 0:
+            last_space_at_top = i
+    if last_space_at_top < 0:
+        return head
+    return head[last_space_at_top + 1:]
+
+
+def _demangle_linkage_names(linkage_names: Iterable[str]) -> dict[str, str]:
+    """Batch-demangle DWARF ``DW_AT_linkage_name`` values via ``c++filt``.
+    Returns mangled → demangled. Empty dict if c++filt is missing or
+    if ``linkage_names`` is empty.
+
+    The classifier uses this to also index subprograms under their
+    canonical demangled spelling, because the spelling DWARF emits in
+    ``DW_AT_name`` may differ from what ``gcov -m`` / ``nm -C``
+    produce (e.g. DWARF ``<long unsigned int>`` vs gcov
+    ``<unsigned long>`` — surfaced by snappy's ``DecompressBranchless``
+    template instantiations in Inc 3c)."""
+    seen = sorted({n for n in linkage_names if n})
+    if not seen or not shutil.which("c++filt"):
+        return {}
+    # Mangled names are attacker-derived input too. Use the same private
+    # workspace and untrusted floor as file-based inspection, without any
+    # target-directory read grant. The sandbox spools input into fd 0.
+    from core.sandbox import run as _sandbox_run
+    from core.binary._inspection_policy import inspection_command, inspection_options
+    from core.security.env_sanitisation import subprocess_tmpdir
+    try:
+        # errors="replace": mangled names are attacker-derived bytes; a
+        # non-UTF-8 c++filt echo must degrade, not raise mid-classify.
+        with tempfile.TemporaryDirectory(
+                prefix="raptor-bo-demangle-", dir=subprocess_tmpdir()) as scratch:
+            proc = _sandbox_run(
+                inspection_command(["c++filt"], scratch), **inspection_options(None, "c++filt", scratch),
+                input="\n".join(seen),
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    lines = proc.stdout.splitlines()
+    if len(lines) != len(seen):
+        return {}
+    return dict(zip(seen, lines, strict=True))
+
+
+# DIE tags that introduce a C++ name-scope; subprogram DIEs nested under
+# any of these get their ``namespace_path`` prefixed by the parent's name.
+_SCOPE_TAGS = frozenset({
+    "DW_TAG_namespace",
+    "DW_TAG_class_type",
+    "DW_TAG_structure_type",
+    "DW_TAG_union_type",
+})
+
+
+def _parse_dwarf(binary_path: Path) -> tuple[dict[int, _SubprogramDIE], list[int]]:
+    """Parse ``objdump --dwarf=info`` into:
+
+      * ``subs``: DIE-offset → ``_SubprogramDIE`` for every DW_TAG_subprogram.
+      * ``inline_instance_origins``: list of DIE offsets each
+        DW_TAG_inlined_subroutine instance's ``DW_AT_abstract_origin`` points
+        at (resolved against ``subs`` by the caller to get the inlined fn's
+        name).
+
+    Best-effort text parse; tolerates binutils version drift in formatting
+    by anchoring on the DIE-offset header (``<depth><offset>:`` shape).
+    """
+    # objdump --dwarf=info on a multi-MB binary with full DWARF emits
+    # 1-3 GB of text. ``_run`` would buffer all of it into Python memory
+    # before parsing — OOM on real C++ targets (libLLVM, Chromium).
+    # Stream line-by-line via ``_stream`` so peak memory stays bounded
+    # to ``subs`` + ``inlines`` (a few MB at most). Default 600s timeout
+    # is generous for the largest binaries we expect to see in /agentic.
+    subs: dict[int, _SubprogramDIE] = {}
+    inlines: list[int] = []
+
+    # DIE header: ``<depth><offset>: Abbrev Number: NN (DW_TAG_...)``
+    die_re = re.compile(
+        r"^\s*<(\d+)><([0-9a-fA-F]+)>:\s+Abbrev Number:\s*\d+\s*\((\w+)\)")
+    # An attribute line looks like ``<<offset>>   DW_AT_<name>  : <value>``.
+    attr_re = re.compile(r"DW_AT_(\w+)\s*:?\s*(.*?)\s*$")
+    # Format: ``(indirect string, offset: 0xNNN): the_actual_name``. We
+    # must skip past the parenthesised qualifier AND its trailing colon to
+    # reach the real name. A loose ``[^:]+`` matched only up to the FIRST
+    # colon (inside the paren) — capturing the offset by mistake.
+    # gcc emits ``(indirect string, offset: 0xNNN): the_actual_name``;
+    # clang emits ``(indexed string: 0xN): the_actual_name``. Both are
+    # parenthesised qualifiers followed by ``):`` then the real name — match
+    # either so the parser doesn't silently miss every name in clang DWARF
+    # (adversarial-review finding A: clang-built fixtures classified the
+    # inlined_only case wrong because the parser couldn't read the name).
+    # Capture EVERYTHING after the ``):`` qualifier to end-of-line — a
+    # tighter ``(\S+)`` truncated C++ template names containing internal
+    # whitespace (``DecompressBranchless<long unsigned int>`` clipped to
+    # ``DecompressBranchless<long``), which then mis-classified as absent
+    # because the qualified-name lookup couldn't find them (snappy Inc 3c
+    # followup).
+    # (qualifier span bounded, same trade-off as _LAMBDA_ARGS_RE)
+    name_indirect_re = re.compile(
+        r"\(in(?:direct|dexed) string[^)]{0,4000}\):\s*(.+?)\s*$")
+    # DW_AT_abstract_origin emits an offset that may be ``<0xNN>`` or bare hex.
+    aorig_re = re.compile(r"<0x([0-9a-fA-F]+)>")
+    # DW_AT_low_pc is an address.
+    addr_re = re.compile(r"0x([0-9a-fA-F]+)")
+
+    cur_offset: int | None = None
+    cur_die: _SubprogramDIE | None = None
+    cur_is_inline_instance = False
+    # Namespace-tracking state for C++ qualified-name resolution
+    # (Inc 3c on snappy). ``depth_to_name`` maps DIE-depth → enclosing
+    # scope name. When entering a DW_TAG_namespace/class at depth D we
+    # record its name there; deeper subprogram DIEs read the stack to
+    # build ``snappy::Bits`` style prefixes. We separately track the
+    # pending scope DIE so we can defer assigning its name until
+    # DW_AT_name is parsed (the header arrives before the attributes).
+    depth_to_name: dict[int, str] = {}
+    cur_scope_depth: int | None = None
+    cur_scope_name: str = ""
+
+    def _commit_scope() -> None:
+        # Persist the pending scope's name into the depth map (anonymous
+        # namespace falls back to the C++ convention). Then clear it.
+        nonlocal cur_scope_depth, cur_scope_name
+        if cur_scope_depth is not None:
+            depth_to_name[cur_scope_depth] = (
+                cur_scope_name or "(anonymous namespace)")
+        cur_scope_depth = None
+        cur_scope_name = ""
+
+    def _flush() -> None:
+        nonlocal cur_die, cur_offset, cur_is_inline_instance
+        _commit_scope()
+        # Store even nameless DIEs — they may carry a DW_AT_specification
+        # we resolve to a name in the post-pass. Drop only if BOTH the
+        # name and specification are absent (nothing recoverable).
+        if (cur_die is not None and cur_offset is not None
+                and (cur_die.name or cur_die.specification is not None)):
+            subs[cur_offset] = cur_die
+        cur_die = None
+        cur_offset = None
+        cur_is_inline_instance = False
+
+    def _current_namespace_path(die_depth: int) -> str:
+        # Concatenate scopes at depths strictly less than this DIE's depth.
+        # Stale entries from sibling branches are pruned lazily on depth-
+        # decrease (see header handler below).
+        parts = [depth_to_name[d] for d in sorted(depth_to_name)
+                 if d < die_depth]
+        return "::".join(parts)
+
+    try:
+        for line in _stream(
+                ["objdump", "--dwarf=info", str(binary_path)], timeout=600,
+                binary=binary_path):
+            m = die_re.match(line)
+            if m:
+                _flush()
+                die_depth = int(m.group(1))
+                # Pop stale namespace entries from sibling subtrees we've left.
+                for d in [d for d in depth_to_name if d >= die_depth]:
+                    depth_to_name.pop(d, None)
+                tag = m.group(3)
+                if tag == "DW_TAG_subprogram":
+                    cur_offset = int(m.group(2), 16)
+                    cur_die = _SubprogramDIE(
+                        namespace_path=_current_namespace_path(die_depth))
+                elif tag == "DW_TAG_inlined_subroutine":
+                    cur_is_inline_instance = True
+                elif tag in _SCOPE_TAGS:
+                    cur_scope_depth = die_depth
+                    cur_scope_name = ""
+                continue
+
+            if cur_die is not None:
+                ma = attr_re.search(line)
+                if not ma:
+                    continue
+                attr, value = ma.group(1), ma.group(2)
+                if attr == "name":
+                    # Either inline ``: foo`` or ``(indirect string, ...): foo``.
+                    ind = name_indirect_re.search(value)
+                    cur_die.name = (ind.group(1) if ind else value).strip()
+                elif attr == "linkage_name":
+                    ind = name_indirect_re.search(value)
+                    linkage = (ind.group(1) if ind else value).strip()
+                    cur_die.linkage_name = linkage
+                    # Legacy fallback: if DW_AT_name was missing, the mangled
+                    # linkage name was previously used as the local name.
+                    # Keep that path so existing behaviour is unchanged when
+                    # no demangler is available.
+                    if not cur_die.name:
+                        cur_die.name = linkage
+                elif attr == "low_pc":
+                    ma2 = addr_re.search(value)
+                    if ma2:
+                        cur_die.low_pc = int(ma2.group(1), 16)
+                elif attr == "inline":
+                    # DW_AT_inline integer code, prefixing a human description:
+                    #   0  — not inlined
+                    #   1  — DW_INL_inlined (auto, actually inlined)
+                    #   2  — DW_INL_declared_not_inlined (had ``inline`` keyword
+                    #        but the compiler chose NOT to inline)
+                    #   3  — DW_INL_declared_inlined (declared inline AND inlined)
+                    # Only 1 and 3 mean "an inlined instance exists somewhere".
+                    # The prior substring match ``"inlined" in value`` matched
+                    # the human-readable text of code 2 too ("declared as inline
+                    # but not inlined") — asymmetrically safe (elevates absent →
+                    # inlined rather than dropping findings) but pollutes the
+                    # inlined-vs-absent split. Parse the integer code instead.
+                    v = value.lstrip()
+                    if v.startswith(("1", "3")) and not v.startswith(("10", "30")):
+                        cur_die.has_inline_marker = True
+                elif attr == "specification":
+                    # Definition pointing back to its declaration DIE; resolved
+                    # in the post-pass to inherit name + namespace_path.
+                    mo = aorig_re.search(value)
+                    if mo:
+                        cur_die.specification = int(mo.group(1), 16)
+
+            elif cur_scope_depth is not None:
+                ma = attr_re.search(line)
+                if ma and ma.group(1) == "name":
+                    ind = name_indirect_re.search(ma.group(2))
+                    cur_scope_name = (
+                        ind.group(1) if ind else ma.group(2)).strip()
+
+            elif cur_is_inline_instance:
+                ma = attr_re.search(line)
+                if ma and ma.group(1) == "abstract_origin":
+                    mo = aorig_re.search(ma.group(2))
+                    if mo:
+                        inlines.append(int(mo.group(1), 16))
+
+    except (_StreamRefused, OSError) as exc:
+        logger.warning("binary_oracle: incomplete DWARF for %s — discarding partial output (%s)",
+                       escape_nonprintable(str(binary_path)), escape_nonprintable(str(exc)))
+        return {}, []
+
+    _flush()
+
+    # Resolve DW_AT_specification: definition DIEs inherit name +
+    # namespace_path + linkage_name from their declaration sibling
+    # (the C++ idiom — inlined templates emit a top-level definition
+    # pointing back at the in-class declaration; without this, every
+    # C++ inline method classifies as ``absent`` because the
+    # DW_AT_inline=inlined definition has no name of its own).
+    # ``linkage_name`` inheritance is what lets c++filt canonical-name
+    # aliasing reach DIEs whose DWARF ``DW_AT_name`` uses a different
+    # type-spelling than ``gcov -m`` / ``nm -C`` produce
+    # (``long unsigned int`` vs ``unsigned long`` in snappy Inc 3c
+    # followup).
+    for die in subs.values():
+        if die.specification is None:
+            continue
+        spec = subs.get(die.specification)
+        if spec is None:
+            continue
+        if not die.name and spec.name:
+            die.name = spec.name
+        if not die.namespace_path and spec.namespace_path:
+            die.namespace_path = spec.namespace_path
+        if not die.linkage_name and spec.linkage_name:
+            die.linkage_name = spec.linkage_name
+
+    return subs, inlines
+
+
+# ---------------------------------------------------------------------------
+# Symbol-only tier (stripped-binary fallback)
+# ---------------------------------------------------------------------------
+
+def _dynamic_nm_symbols(binary_path: Path) -> dict[str, int]:
+    """``nm -D`` — dynamic symbol table. Fully-stripped binaries have
+    NO plain-nm symbols (the ``.symtab`` section is removed), but
+    ``.dynsym`` survives (the dynamic linker needs it). For a shared
+    library, this exposes the entire public API. Same demangle +
+    bare-name + qualified-no-args indexing as ``_nm_symbols``; same
+    rerun policy — plain ``nm -D`` only when ``nm -D -C`` failed
+    (clean-but-empty output is complete evidence)."""
+    out, ok = _run_status(["nm", "-D", "-C", str(binary_path)],
+                          binary=binary_path)
+    if not ok:
+        out = _run(["nm", "-D", str(binary_path)], binary=binary_path)
+    syms: dict[str, int] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 3 and len(parts[1]) == 1 and parts[1] in "tTwW":
+            try:
+                addr = int(parts[0], 16)
+            except ValueError:
+                continue
+            full = parts[2].strip()
+            syms[full] = addr
+            qualified = _strip_params(full)
+            qualified = _strip_ipa_suffix(qualified)
+            if qualified and qualified != full:
+                syms.setdefault(qualified, addr)
+            bare = (qualified.rsplit("::", 1)[-1]
+                    if "::" in qualified else qualified)
+            if bare and bare not in (full, qualified):
+                syms.setdefault(bare, addr)
+    return syms
+
+
+def _classify_symbol_only(
+    source_function_names: Iterable[str],
+    binary_path: Path,
+    build_id: str,
+    nm_syms: dict[str, int],
+) -> dict[str, BinaryOracleWitness]:
+    """Classify against an nm-only symbol table (no DWARF). For
+    fully-stripped binaries, plain ``nm`` returns nothing — we union
+    with ``nm -D`` (dynamic symbol table, survives stripping) so the
+    operator at least gets reachability evidence for exported library
+    API functions.
+
+    Emits ``symbol_present`` when the name is in either symbol table,
+    ``absent`` otherwise. Each witness is tagged ``tier="symbol_only"``
+    so downstream consumers know not to license suppression on it (a
+    function absent from nm in a stripped binary could still be
+    inlined into a surviving caller — DWARF would have caught it;
+    we can't)."""
+    # Union of static + dynamic symbol tables.
+    sym_table = dict(_dynamic_nm_symbols(binary_path))
+    sym_table.update(nm_syms)  # plain nm wins on collisions
+    bp = str(binary_path)
+    out: dict[str, BinaryOracleWitness] = {}
+    for name in source_function_names:
+        cls: Classification = (
+            "symbol_present" if name in sym_table else "absent")
+        out[name] = BinaryOracleWitness(
+            classification=cls,
+            build_id=build_id,
+            binary_path=bp,
+            address=sym_table.get(name),
+            tier="symbol_only",
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Classifier entry point
+# ---------------------------------------------------------------------------
+
+def classify_binary_evidence(
+    source_function_names: Iterable[str],
+    binary_path: Path,
+) -> dict[str, BinaryOracleWitness]:
+    """Classify each ``source_function_names`` entry against ``binary_path``.
+
+    Returns a name → ``BinaryOracleWitness`` mapping for every input name.
+    Names not resolvable either way get ``absent`` (the DCE case).
+
+    A stripped binary (no DWARF subprograms found) falls back to the
+    nm-only ``symbol_only`` tier: a full mapping is still returned, but
+    every witness carries ``tier="symbol_only"`` and the suppression
+    chokepoint refuses to hard-suppress on it.
+    """
+    binary_path = Path(binary_path)
+    if not binary_path.is_file():
+        return {}
+    # Resolve symlinks BEFORE handing the path to the sandboxed tools:
+    # the sandbox scopes its read view to the RESOLVED parent directory
+    # (see _run/_stream), so a symlink living elsewhere is not in the
+    # view and every tool silently reads nothing — the classifier then
+    # reported every function ``absent`` on mount-ns hosts.
+    binary_path = binary_path.resolve()
+
+    _missing = [t for t in ("nm", "objdump", "readelf") if not shutil.which(t)]
+    if _missing:
+        import sys as _sys
+        _hint = (" (brew install binutils)"
+                 if _sys.platform == "darwin" else "")
+        logger.warning(
+            "binary_oracle: required tools missing: %s — "
+            "install GNU binutils%s", ", ".join(_missing), _hint)
+        return {}
+
+    build_id = read_build_id(binary_path) or ""
+    nm_syms, nm_ok = _nm_symbols_status(binary_path)
+    subs, inline_origins = _parse_dwarf(binary_path)
+
+    if not subs:
+        # Stripped (or DWARF-less) binary — fall back to symbol-only
+        # tier. We can still answer ``symbol_present`` vs ``absent``
+        # from the nm symbol table alone; we cannot distinguish
+        # ``inlined`` (would need DW_TAG_inlined_subroutine instances)
+        # or ``folded`` (would need DW_AT_low_pc collisions across
+        # source names). Verdicts in this tier are conservative —
+        # the inventory's ``earns_suppression`` flag downgrades to
+        # False if ANY contributing binary is stripped (a function
+        # ``absent`` here might really be inlined into a surviving
+        # caller; suppressing on that risks false negatives).
+        logger.info("binary_oracle: no DWARF subprograms in %s; "
+                    "falling back to symbol-only tier",
+                    binary_path)
+        return _classify_symbol_only(
+            source_function_names, binary_path, build_id, nm_syms,
+        )
+
+    # Reverse-index DWARF subprograms by both qualified and bare names.
+    # Qualified is the primary key (matches the form ``gcov -m`` and
+    # ``nm -C`` emit for C++); bare-name is kept as a fallback
+    # so callers that don't know the namespace still find C functions.
+    # ALSO index under the demangled ``DW_AT_linkage_name`` form — this
+    # gives canonical spelling that matches gcov even when DWARF's
+    # ``DW_AT_name`` uses a different type-spelling (e.g. ``long
+    # unsigned int`` vs ``unsigned long``; Inc 3c snappy fix).
+    by_qualified: dict[str, list[_SubprogramDIE]] = {}
+    by_bare: dict[str, list[_SubprogramDIE]] = {}
+    demangled_map = _demangle_linkage_names(
+        d.linkage_name for d in subs.values() if d.linkage_name)
+    for die in subs.values():
+        q = die.qualified_name
+        if q:
+            by_qualified.setdefault(q, []).append(die)
+        if die.name and die.name != q:
+            by_bare.setdefault(die.name, []).append(die)
+        if die.linkage_name:
+            demangled = demangled_map.get(die.linkage_name)
+            if demangled:
+                canonical = _qualified_from_demangled(demangled)
+                if canonical and canonical != q:
+                    by_qualified.setdefault(canonical, []).append(die)
+
+    # Names actually inlined somewhere. Two sources:
+    #   (a) DW_TAG_inlined_subroutine instances whose abstract_origin
+    #       points back at a DW_TAG_subprogram — function was inlined
+    #       into a caller that survived. Normal case.
+    #   (b) DW_TAG_subprogram with DW_AT_inline=inlined — compiler
+    #       marked the function as always-inlined; the absence of a
+    #       concrete instance means the body was empty or fully folded
+    #       into its caller (e.g. zlib's ``tr_static_init``). Without
+    #       this, such functions misclassify as ``absent``.
+    # In both cases we index by the qualified name so C++ measurement
+    # against gcov -m / nm -C output hits — Inc 3c on snappy
+    # showed every ``snappy::Bits::Log2Floor`` style call misclassifying
+    # as absent without namespace qualification — AND by the bare
+    # trailing component, mirroring the ``by_qualified`` / ``by_bare``
+    # dual indexing above: source inventories frequently carry
+    # namespaced C++/Rust functions under their BARE name, and a
+    # fully-inlined function has no nm symbol and no concrete low_pc,
+    # so a bare-name inventory lookup that misses here falls all the
+    # way through to ``absent`` — a suppression-grade wrong verdict on
+    # live inlined code. The bare index can only rescue a name from
+    # ``absent`` to ``inlined`` (never mints an ``absent``), so a bare-
+    # name collision errs toward analysing, not suppressing.
+    inlined_names: set[str] = set()
+
+    def _note_inlined(die: _SubprogramDIE) -> None:
+        if die.qualified_name:
+            inlined_names.add(die.qualified_name)
+        if die.name and die.name != die.qualified_name:
+            inlined_names.add(die.name)
+        if die.linkage_name:
+            demangled = demangled_map.get(die.linkage_name)
+            if demangled:
+                canonical = _qualified_from_demangled(demangled)
+                if canonical:
+                    inlined_names.add(canonical)
+                    bare = canonical.rsplit("::", 1)[-1]
+                    if bare and bare != canonical:
+                        inlined_names.add(bare)
+
+    for off in inline_origins:
+        sub = subs.get(off)
+        if sub:
+            _note_inlined(sub)
+    for die in subs.values():
+        if die.has_inline_marker:
+            _note_inlined(die)
+
+    # Fold detection: two DISTINCT source functions mapping to the same
+    # address (linker identical-code-folding). Count distinct functions
+    # per address by each DIE's PRIMARY name, not by ``by_qualified``
+    # keys — a single DIE is indexed there under BOTH its DW_AT_name
+    # spelling and the demangled-linkage canonical spelling when they
+    # differ (template-argument spelling drift, e.g. ``long unsigned
+    # int`` vs ``unsigned long``), and two spellings of one DIE are one
+    # function, not a fold. Keying folds on the spellings misread every
+    # such dual-spelled template instantiation as ``folded``.
+    by_addr: dict[int, set[str]] = {}
+    for die in subs.values():
+        if die.low_pc is None:
+            continue
+        primary = die.qualified_name or die.name
+        if primary:
+            by_addr.setdefault(die.low_pc, set()).add(primary)
+    folded_addrs = {a for a, names in by_addr.items() if len(names) > 1}
+    # Mark EVERY indexed spelling of a genuinely-folded address so a
+    # lookup under the alternate (demangled-canonical) spelling still
+    # reads ``folded``.
+    folded_names = {
+        q for q, dies in by_qualified.items()
+        if any(die.low_pc in folded_addrs for die in dies
+               if die.low_pc is not None)
+    }
+
+    if not nm_ok:
+        # nm errored / was killed (NOT merely empty output — that
+        # reads ok=True). The DWARF side may still be complete, but a
+        # function whose only evidence is an nm symbol (hand-written
+        # assembly, a CU compiled without -g) would classify ``absent``
+        # purely because the failed tool's evidence is missing.
+        # ``absent`` verdicts below are downgraded out of the
+        # suppression-grade ``full`` tier.
+        logger.warning(
+            "binary_oracle: nm produced no usable output for %s; "
+            "absent verdicts downgraded to symbol_only tier "
+            "(no suppression licensed)", binary_path)
+
+    out: dict[str, BinaryOracleWitness] = {}
+    bp = str(binary_path)
+    for name in source_function_names:
+        # Qualified lookup is the primary path; bare-name falls back so
+        # plain-C callers (no namespace to provide) still hit.
+        dies = by_qualified.get(name) or by_bare.get(name, [])
+        addr = next((d.low_pc for d in dies if d.low_pc is not None), None)
+        in_nm = name in nm_syms
+
+        if name in folded_names:
+            cls: Classification = "folded"
+        elif in_nm or addr is not None:
+            # ``addr is not None`` = at least one DWARF subprogram DIE has
+            # a concrete ``DW_AT_low_pc``. Internal-linkage helpers
+            # (anonymous-namespace, ``static``) emit code but no nm
+            # symbol; without surfacing DWARF location they misclassify
+            # as ``absent`` (snappy Inc 3c FPs on ``DecompressBranchless
+            # <char*>``, both ``DecompressAllTags`` template variants).
+            cls = "symbol_present"
+        elif name in inlined_names:
+            cls = "inlined"
+        else:
+            cls = "absent"
+
+        out[name] = BinaryOracleWitness(
+            classification=cls,
+            build_id=build_id,
+            binary_path=bp,
+            address=addr if addr is not None else nm_syms.get(name),
+            # A partial-nm + full-DWARF combination must not mint
+            # suppression-grade absent verdicts from the failed
+            # tool's silence (see the nm_ok warning above).
+            tier=("symbol_only" if cls == "absent" and not nm_ok
+                  else "full"),
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Inventory enrichment — Inc 2 (surface-only)
+# ---------------------------------------------------------------------------
+
+# Native-compiled languages where DWARF + the symbol table give a meaningful
+# answer. Others (Python / JS / Java / C#) skip — binary_oracle isn't the
+# right oracle for them.
+_NATIVE_LANGUAGES = frozenset({"c", "cpp", "c++", "rust", "go"})
+
+
+# Priority for combining per-binary verdicts: alive-in-any wins. The
+# combined classification is the strongest evidence across all analysed
+# binaries — symbol_present beats folded beats inlined beats absent.
+# A function is ``absent`` ONLY when EVERY analysed binary lacks it
+# (no symbol, no inlined-subroutine instance) — this is what makes
+# multi-binary suppression sound for hybrid targets (--target-kind=
+# hybrid: library + application, both shipped). Picking the wrong
+# single binary stops being a footgun.
+_CLASS_PRIORITY: dict[str, int] = {
+    "symbol_present": 4,
+    "folded":         3,
+    "inlined":        2,
+    "absent":         1,
+}
+
+
+def _combine_verdicts(
+    entries: Iterable[tuple[str, str]],
+) -> Classification:
+    """Combine per-binary classifications into one. Each entry is a
+    ``(classification, tier)`` pair where tier is ``"full"`` (DWARF +
+    nm; high confidence) or ``"symbol_only"`` (stripped fallback;
+    weaker — symbols can be re-exports / weak aliases / .symver
+    indirections without source evidence).
+
+    Tier weighting: when ANY full-tier entry exists, only full-tier
+    entries are considered. This stops a symbol_only "symbol_present"
+    (from a stripped binary's nm output that picked up an unrelated
+    weak alias) from masking a full-tier "absent" verdict — the
+    full-DWARF evidence is authoritative when it disagrees with the
+    symbol-only evidence. Among same-tier entries the highest-priority
+    classification wins (alive-in-any). Empty input ⇒ ``absent``."""
+    pairs = list(entries)
+    if not pairs:
+        return "absent"
+    # Unknown-classification warn (adversarial review Agent D P2). The
+    # priority dict's ``.get(v, 0)`` silently treats unknown values as
+    # worse than ``absent`` (priority 1). If a new classification ever
+    # lands without a priority entry, every binary's verdict would
+    # silently demote to "worse than absent" — log loudly instead of
+    # silently swallowing.
+    for c, _ in pairs:
+        if c not in _CLASS_PRIORITY:
+            logger.warning(
+                "binary_oracle: unknown classification %r — no priority "
+                "entry; falling back to lowest priority. Add it to "
+                "_CLASS_PRIORITY.", c,
+            )
+    full = [c for c, t in pairs if t == "full"]
+    pool = full or [c for c, _ in pairs]
+    return max(pool, key=lambda v: _CLASS_PRIORITY.get(v, 0))  # type: ignore[arg-type]
+
+
+def _pin_open_verified(
+    bp: Path, pin: tuple[int, int, int, str],
+) -> IO | None:
+    """Fd-honest open of *bp* verified against its identity pin.
+
+    O_NOFOLLOW open (``core.source.open_regular``), fstat of the
+    OPENED fd against the pinned ``(st_dev, st_ino, st_size)``, then
+    a full hash of that same fd against the pinned sha256. Returns
+    the held stream (positioned at EOF) on success — the caller keeps
+    it open across the classify pass — or ``None`` on any mismatch
+    or open failure.
+    """
+    from core.hash import sha256_fileobj
+    from core.source import open_regular
+    fh = open_regular(bp, "rb")
+    if fh is None:
+        return None
+    try:
+        st = os.fstat(fh.fileno())
+        if ((st.st_dev, st.st_ino, st.st_size)
+                == (pin[0], pin[1], pin[2])
+                and sha256_fileobj(fh) == pin[3]):  # type: ignore[arg-type]
+            return fh
+    except OSError:
+        pass
+    except BaseException:
+        try:
+            fh.close()
+        except BaseException:
+            pass  # Retire the unreturned reader without replacing setup failure.
+        raise
+    try:
+        fh.close()
+    except OSError:
+        pass
+    return None
+
+
+def _pin_still_holds(
+    fh: IO, bp: Path, pin: tuple[int, int, int, str],
+) -> bool:
+    """Post-classify half of the identity bracket.
+
+    Two checks: the HELD fd's content still hashes to the pin (an
+    in-place rewrite of the pinned inode would have fed the classify
+    tools different bytes through the same name), and the by-name
+    slot still resolves to the pinned inode (the classify tools
+    re-open by name, so a lingering swap means they read a different
+    file than the one the witness verified).
+    """
+    from core.hash import sha256_fileobj
+    try:
+        fh.seek(0)
+        if sha256_fileobj(fh) != pin[3]:  # type: ignore[arg-type]
+            return False
+        st = os.stat(bp)
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (pin[0], pin[1])
+
+
+def enrich_inventory_with_binary_oracle(
+    inventory: dict,
+    binaries,
+    no_suppression_paths=(),
+    declared_paths=(),
+    identity_pins: Mapping[
+        str, tuple[int, int, int, str] | None] | None = None,
+) -> dict[str, int]:
+    """Annotate each native-language inventory item with its binary-oracle
+    classification, plus a top-level summary on the inventory itself.
+
+    ``binaries`` may be a single ``Path`` / ``str`` (legacy single-binary
+    call) or a sequence (multi-binary; the common case for
+    ``--target-kind=hybrid`` deployments where library + application are
+    BOTH part of the shipping surface). Each binary is classified
+    independently and the per-source-function results are combined:
+
+      - **alive in any binary** ⇒ combined verdict is the strongest
+        (symbol_present > folded > inlined)
+      - **absent from every binary** ⇒ combined verdict is ``absent``
+        — and ONLY then can the downstream chokepoint hard-suppress
+
+    ``declared_paths`` names the binaries the OPERATOR declared
+    (explicit ``--binary`` flags and the project binary store). They
+    are exempt from the source-coverage floor below — the operator
+    asserted trust, and the floor's drop warning names exactly that
+    remedy. When the floor drops a NON-declared binary that produced
+    evidence, every surviving binary's records downgrade to
+    ``suppression_grade: false``: the "absent from every binary"
+    quantifier was silently narrowed, so ``absent`` may still enrich
+    but must not license suppression.
+
+    ``identity_pins`` maps a binary path (as it appears in
+    ``binaries``) to the fstat identity + sha256 recorded from the
+    very fd its project-store content witness was verified on
+    (``RaptorConfig.BINARY_ORACLE_IDENTITY_PINS``), or to ``None``
+    for an entry already demoted at load time. Tuple pins are
+    re-verified BRACKETING this function's classify pass — fd-honest
+    open + fstat + hash before the tools run (fd held across the
+    pass), held-fd re-hash + by-name inode check after — so a swap
+    landing between the witness read and the oracle's own by-name
+    opens DEMOTES the binary (its records lose ``suppression_grade``;
+    enrichment continues at hint tier) instead of silently steering
+    ``absent``-verdict suppression. Residual stated honestly: the
+    classify tools open by name, so a swap-in/swap-back pair that
+    completes entirely within the classify pass evades both bracket
+    checks.
+
+    Storage shape on each item::
+
+      metadata.binary_oracle = {
+        "classification": "absent",   # combined verdict — what consumers read
+        "binaries": [
+          {"path": "...", "build_id": "...", "classification": "absent",
+           "address": null},
+          ...                          # one entry per analysed binary
+        ],
+      }
+
+    Top-level inventory summary::
+
+      inventory.binary_oracle = {
+        "binaries": [{"path": "...", "build_id": "...", "tier": "full",
+                      "suppression_grade": true}, ...],
+        "counts": {"classified": N, "symbol_present": N, "inlined": N,
+                   "absent": N, "folded": N},
+        "skipped_non_native": M,
+        "earns_suppression": True,
+      }
+
+    Non-native items (Python / JS / Java / C#) are skipped — binary_oracle
+    isn't the right oracle for them. Returns the counts dict so callers
+    can log / report what was classified.
+    """
+    # Normalise: single path becomes a list of one.
+    if isinstance(binaries, (str, Path)):
+        binary_paths = [Path(binaries)]
+    else:
+        binary_paths = [Path(b) for b in binaries]
+
+    counts = {"classified": 0, "symbol_present": 0, "inlined": 0,
+              "absent": 0, "folded": 0, "skipped_non_native": 0}
+
+    binary_paths = [p for p in binary_paths if p.is_file()]
+    if not binary_paths:
+        logger.info("binary_oracle: no usable binaries; skipping enrichment")
+        return counts
+
+    # Collect native function names per file. Track (file_idx, item_idx)
+    # back to each name so we can write the combined verdict without re-
+    # scanning.
+    targets: list[tuple[int, int, str]] = []
+    files = inventory.get("files") or []
+    for fi, f in enumerate(files):
+        lang = (f.get("language") or "").lower()
+        if lang not in _NATIVE_LANGUAGES:
+            for it in f.get("items") or []:
+                if it.get("kind", "function") == "function":
+                    counts["skipped_non_native"] += 1
+            continue
+        for ii, item in enumerate(f.get("items") or []):
+            if item.get("kind", "function") != "function":
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                targets.append((fi, ii, name))
+
+    if not targets:
+        return counts
+
+    names = sorted({t[2] for t in targets})
+
+    # Classify once per binary. Each classify_binary_evidence call shells
+    # to nm + objdump (~1-15s per binary depending on size); for the
+    # typical 1-3 binary hybrid case the cost is bounded.
+    #
+    # Identity-pin bracket: a pinned (project-store-witnessed) binary
+    # is re-verified fd-honestly BEFORE the tools run and the fd is
+    # held across the pass; afterwards the held fd is re-hashed and
+    # the by-name slot re-checked against the pinned inode. Any
+    # failure — including a load-time ``None`` pin — DEMOTES the
+    # binary: it keeps enriching (promotions are fail-safe; they keep
+    # findings alive) but every record it contributes drops
+    # ``suppression_grade``, so ``absent`` never hard-suppresses off
+    # bytes the witness did not verify.
+    _pins: dict[str, tuple[int, int, int, str] | None] = dict(
+        identity_pins or {})
+    identity_demoted: set[str] = set()
+    # A pinned path that is not among the analysed binaries is a
+    # witnessed project-store binary that went MISSING (deleted from
+    # its slot — a no-race move for the same run-dir-write attacker
+    # the witness exists to stop). Two flavors reach here:
+    #   - missing AT LOAD: the load seam recorded a ``None`` pin;
+    #   - deleted AFTER a verified load (tuple pin) — the
+    #     ``is_file()`` usability filter above silently dropped the
+    #     path before classification.
+    # Both are pinned-but-not-analysed, and that is the whole test: a
+    # pin exists only because the path was DECLARED for analysis, so
+    # not-analysed can only mean the member vanished. The entry is
+    # skipped, not classified, but the skip narrows the "absent from
+    # EVERY declared binary" quantifier: a function alive only in the
+    # deleted binary would combine to ``absent`` over the survivors.
+    # Account for it like a floor drop of a sibling — the missing
+    # path joins the demotion set (summary accounting) and every
+    # SURVIVING record drops ``suppression_grade`` below.
+    # Demote-not-refuse: enrichment continues at hint tier.
+    _analysed = {str(bp) for bp in binary_paths}
+    witness_missing = {k for k in _pins if k not in _analysed}
+    identity_demoted |= witness_missing
+    per_binary: list[tuple[Path, str, dict[str, BinaryOracleWitness]]] = []
+    for bp in binary_paths:
+        key = str(bp)
+        pin = _pins.get(key)
+        held: IO | None = None
+        if key in _pins and pin is not None:
+            held = _pin_open_verified(bp, pin)
+        try:
+            verdicts = classify_binary_evidence(names, bp)
+        finally:
+            if held is not None and pin is not None:
+                post_failed = False
+                try:
+                    post_ok = _pin_still_holds(held, bp, pin)
+                except BaseException:
+                    post_failed = True
+                    raise
+                finally:
+                    try:
+                        held.close()
+                    except BaseException as exc:
+                        if not post_failed and not isinstance(exc, OSError):
+                            raise
+                if not post_ok:
+                    held = None  # demoted below
+        if key in _pins and held is None:
+            identity_demoted.add(key)
+            if pin is not None:
+                # ``None`` pins were already warned at load time.
+                logger.warning(
+                    "binary_oracle: identity pin for %s did not hold "
+                    "across classification (fd-honest open failed, or "
+                    "content/inode changed between the witness read "
+                    "and the classify pass) — DEMOTED to enrichment-"
+                    "only for this run: verdicts still enrich, "
+                    "'absent' loses suppression authority.",
+                    escape_nonprintable(str(bp)))
+        # Every witness already carries the build_id the classifier
+        # read — reuse it instead of re-running readelf on the binary.
+        if verdicts:
+            build_id = next(iter(verdicts.values())).build_id
+        else:
+            build_id = read_build_id(bp) or ""
+        per_binary.append((bp, build_id, verdicts))
+
+    if not any(verdicts for _, _, verdicts in per_binary):
+        logger.info(
+            "binary_oracle: no binary produced verdicts (stripped? missing "
+            "DWARF? source/binary mismatch?); skipping enrichment")
+        return counts
+
+    # Source-coverage floor (adversarial review P0-D-1: hostile-ELF
+    # attack defense). A binary whose DWARF/symbols match almost none
+    # of the source-side function names is overwhelmingly likely the
+    # WRONG binary — a stray ELF in the target tree (vendored testdata,
+    # prior-project leftover, or a maliciously planted artefact whose
+    # DWARF points to unrelated code). Without this floor, an unrelated
+    # binary returns "absent" for every source function (no match in
+    # foreign DWARF) and downstream chokepoints silently suppress every
+    # native finding.
+    #
+    # Two refinements that make the floor decisive against the
+    # smartest attacker shape (planted binary with ``main`` to inflate
+    # the match rate against small targets):
+    #   1. Exclude universally-common boilerplate names from the
+    #      candidate count — ``main`` exists in every C program and
+    #      a planted binary always has its own ``main``.
+    #   2. Require an absolute minimum of MATCHED names (so a 3-function
+    #      project doesn't pass with a single boilerplate hit).
+    SRC_COVERAGE_FLOOR = 0.05
+    SRC_COVERAGE_MIN_MATCHED = 3
+    # The floor only kicks in once the source has enough non-boilerplate
+    # names to make the planted-binary attack realistic. For a tiny
+    # one-file fixture (a handful of functions) the floor would reject
+    # legitimate small targets — and the planted-binary attack on a
+    # 3-function project isn't a meaningful operator scenario anyway
+    # (an attacker who can plant code in the target tree has bigger
+    # vectors). Real /agentic targets have dozens-to-thousands of
+    # functions and the floor's signal is strong there.
+    SRC_FLOOR_MIN_PROJECT_NAMES = 8
+    _BOILERPLATE_NAMES = frozenset({
+        "main", "_start", "_init", "_fini",
+        "__libc_csu_init", "__libc_csu_fini",
+        "__do_global_dtors_aux", "register_tm_clones",
+        "deregister_tm_clones", "frame_dummy",
+    })
+    project_names = [n for n in names if n not in _BOILERPLATE_NAMES]
+    n_project = len(project_names)
+    _declared = {str(Path(x).resolve()) for x in (declared_paths or ())}
+
+    def _is_declared(p: Path) -> bool:
+        try:
+            return str(p.resolve()) in _declared
+        except OSError:
+            return str(p) in _declared
+
+    floor_dropped: list[str] = []
+    kept: list[tuple[Path, str, dict[str, BinaryOracleWitness]]] = []
+    for bp, build_id, verdicts in per_binary:
+        if not verdicts:
+            kept.append((bp, build_id, verdicts))
+            continue
+        # "Matched" = the binary has *some* evidence (not absent),
+        # excluding universally-common boilerplate names that say
+        # nothing about whether this binary is from this source tree.
+        matched = sum(
+            1 for n in project_names
+            if (w := verdicts.get(n)) is not None
+            and w.classification != "absent"
+        )
+        ratio = matched / n_project if n_project else 0.0
+        # Only enforce the floor on full-tier evidence (symbol-only
+        # binaries systematically under-match because they can't see
+        # inlined-only or DWARF-only names; their earns_suppression
+        # downgrade is the safety net) and only on projects wide
+        # enough for the floor to be meaningful.
+        any_full = any(w.tier == "full" for w in verdicts.values())
+        if (any_full
+                and n_project >= SRC_FLOOR_MIN_PROJECT_NAMES
+                and (matched < SRC_COVERAGE_MIN_MATCHED
+                     or ratio < SRC_COVERAGE_FLOOR)):
+            if _is_declared(bp):
+                # Operator-declared (--binary / project binary store):
+                # the declaration IS the trust assertion the floor's
+                # remedy names, so warn-and-keep. Dropping here would
+                # make the "absent only when EVERY declared binary
+                # lacks it" contract quantify over a set the operator
+                # never saw shrink.
+                logger.warning(
+                    "binary_oracle: declared binary %s matched only %d of "
+                    "%d project source names (%.1f%%, floor %.0f%% / min "
+                    "%d) — kept because the operator declared it, but "
+                    "verify it was built from THIS source tree.",
+                    bp.name, matched, n_project, ratio * 100,
+                    SRC_COVERAGE_FLOOR * 100, SRC_COVERAGE_MIN_MATCHED,
+                )
+                kept.append((bp, build_id, verdicts))
+                continue
+            logger.warning(
+                "binary_oracle: dropping %s — only %d of %d project source "
+                "names matched (%.1f%%, floor %.0f%% / min %d). Likely the "
+                "WRONG binary for this target (unrelated build artefact, "
+                "vendored test binary, or planted ELF). Pass --binary "
+                "explicitly to override.",
+                bp.name, matched, n_project, ratio * 100,
+                SRC_COVERAGE_FLOOR * 100, SRC_COVERAGE_MIN_MATCHED,
+            )
+            floor_dropped.append(str(bp))
+            continue
+        kept.append((bp, build_id, verdicts))
+    per_binary = kept
+    if not per_binary:
+        logger.warning(
+            "binary_oracle: all binaries dropped by source-coverage floor; "
+            "skipping enrichment")
+        return counts
+    if floor_dropped:
+        logger.warning(
+            "binary_oracle: %d binary(s) floor-dropped while %d survived — "
+            "'absent' verdicts from the survivors lose suppression "
+            "authority for this run (a function unique to a dropped "
+            "binary would otherwise hard-suppress). Pass --binary for "
+            "the dropped path(s) to restore it, or --no-binary-oracle "
+            "to disable oracle filtering.",
+            len(floor_dropped), len(per_binary),
+        )
+
+    # Combine + annotate. The combined classification is what downstream
+    # consumers (reach_witness, /codeql autonomous_analyzer, /validate
+    # demoter) read; per-binary detail is preserved for audit / debug.
+    # Track whether ANY contributing binary was symbol-only (stripped);
+    # downgrades the inventory's earns_suppression flag conservatively.
+    any_symbol_only = any(
+        any(w.tier == "symbol_only" for w in verdicts.values())
+        for _, _, verdicts in per_binary
+    )
+    # Env-built binaries whose build COMMAND was guessed (detector
+    # synthesis, not an operator /project set build-command) get the
+    # same conservative treatment: a guessed container configuration
+    # can compile out features the real build includes, so an
+    # ``absent`` there says nothing suppression-grade about the
+    # operator's tree. Enrichment verdicts still count (existence
+    # proofs are safe); only suppression authority downgrades.
+    _no_suppress = {str(x) for x in (no_suppression_paths or ())}
+    any_guessed_build = any(
+        str(bp) in _no_suppress for bp, _, _ in per_binary
+    )
+    any_floor_dropped = bool(floor_dropped)
+    # Identity-demoted binaries (pin failed to verify or to hold
+    # across the classify pass) get the same per-record treatment as
+    # guessed-build entries, but stay a SEPARATE accounting channel —
+    # the summary keys must say what actually happened. Derived from
+    # the demotion SET, not from ``per_binary``: a demoted binary that
+    # also fell to the source-coverage floor (or produced zero
+    # verdicts) still demoted, and the flag must agree with the
+    # ``identity_demoted`` list it summarises.
+    any_identity_demoted = bool(identity_demoted)
+
+    def _binary_suppression_grade(bp: Path) -> bool:
+        """Per-binary authority marker, shared by the per-item records
+        and the summary ``binaries`` entries so the cross-run cache
+        writer (``core.audit.build_id_cache.store_oracle_verdicts``
+        reads the SUMMARY entries) can never resurrect authority the
+        demotion channels stripped."""
+        return (str(bp) not in _no_suppress
+                and str(bp) not in identity_demoted
+                and not any_floor_dropped
+                # A witnessed sibling MISSING (at load, or deleted
+                # after a verified load and dropped by the usability
+                # filter) narrows the every-binary quantifier for
+                # every survivor, exactly like a floor drop (a
+                # PRESENT demoted sibling does not: its hint-tier
+                # evidence still defeats absence via alive-in-any).
+                and not witness_missing)
+    for fi, ii, name in targets:
+        per_binary_entries: list[dict[str, object]] = []
+        for bp, build_id, verdicts in per_binary:
+            w = verdicts.get(name)
+            if w is None:
+                continue
+            per_binary_entries.append({
+                "path":           str(bp),
+                "build_id":       build_id,
+                # Per-item authority marker (adversarial review S5.4
+                # F1): the summary-level earns_suppression is not what
+                # the live gates read — the chokepoint, demoter, and
+                # audit verdict extraction all gate per item, so the
+                # guessed-build downgrade must live here too. A
+                # floor-drop of any sibling binary downgrades EVERY
+                # surviving record the same way: the combined verdict
+                # no longer quantifies over every declared binary.
+                "suppression_grade": _binary_suppression_grade(bp),
+                "classification": w.classification,
+                "address":        w.address,
+                "tier":           w.tier,
+            })
+        if not per_binary_entries:
+            continue
+        combined = _combine_verdicts(
+            (str(entry["classification"]), str(entry["tier"]))
+            for entry in per_binary_entries)
+        # NB: ``setdefault('metadata', {})`` returns the *existing* value
+        # if the key is present — even when that value is ``None``. A
+        # parser-emitted ``metadata: None`` would then crash on item
+        # assignment. Initialise / replace any non-dict explicitly.
+        item = files[fi]["items"][ii]
+        meta = item.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            item["metadata"] = meta
+        meta["binary_oracle"] = {
+            "classification": combined,
+            "binaries":       per_binary_entries,
+        }
+        counts["classified"] += 1
+        counts[combined] = counts.get(combined, 0) + 1
+
+    # Per-binary evidence tier — exposed so consumers (and operator
+    # audits) can see WHICH binaries fell back to symbol-only mode.
+    # Determined by inspecting the first verdict from each binary (all
+    # verdicts from one classify call share a tier).
+    binaries_with_tier: list[dict[str, object]] = []
+    for bp, bid, verdicts in per_binary:
+        first = next(iter(verdicts.values()), None)
+        # When a binary produced zero verdicts (corrupt ELF, sandbox
+        # killed mid-classify, no source-name overlap at all), record
+        # ``tier="unknown"`` rather than misleadingly defaulting to
+        # ``full`` — full implies "full-DWARF evidence ran cleanly",
+        # which is wrong here (adversarial review Agent A P2).
+        binaries_with_tier.append({
+            "path":     str(bp),
+            "build_id": bid,
+            "tier":     first.tier if first else "unknown",
+            # The cross-run oracle-verdicts cache writer derives its
+            # payload grade from THESE entries (defaulting a missing
+            # key to full grade) — omitting the marker here would
+            # launder a demoted binary's verdicts into the cache with
+            # suppression authority restored at rest.
+            "suppression_grade": _binary_suppression_grade(bp),
+        })
+
+    inventory["binary_oracle"] = {
+        "binaries": binaries_with_tier,
+        "counts": {k: v for k, v in counts.items() if k != "skipped_non_native"},
+        "skipped_non_native": counts["skipped_non_native"],
+        # Soundness tier — downstream consumers may hard-suppress on
+        # ``absent``. Evidence base:
+        #
+        #   * 1952/1952 absent verdicts correct across 6 corpora the
+        #     classifier was iteratively tuned against (synthetic,
+        #     zlib, libsodium, snappy, leveldb, regex-rust). This is a
+        #     CONSISTENCY claim, not a generalization estimate —
+        #     classifier patches followed from corpus FPs, so the
+        #     number is a fit, not a hold-out.
+        #
+        #   * 187/187 absent verdicts correct on a held-out corpus
+        #     (zstd v1.5.6) with NO classifier tuning permitted on
+        #     its output. Rule-of-three 95% UB miss rate ≤1.6% on
+        #     first-contact-with-unseen-data — the actual estimator
+        #     of out-of-sample behaviour.
+        #
+        # The earned property is also CONDITIONAL on full-DWARF
+        # evidence — a stripped binary in the analysed set means we
+        # can't distinguish ``inlined`` from ``absent``, so suppression
+        # could license a false negative. Downgrade conservatively
+        # when ANY contributing binary is symbol-only (E1 stripped-
+        # binary fallback).
+        "earns_suppression": (not any_symbol_only and not any_guessed_build
+                              and not any_floor_dropped
+                              and not any_identity_demoted),
+        # Surfaced for operator-visible evidence-tier reporting.
+        "any_symbol_only": any_symbol_only,
+        "any_env_built_guessed": any_guessed_build,
+        # True when a project-store binary's identity pin failed to
+        # verify (or to hold across the classify pass) — its records
+        # enrich at hint tier but never license suppression.
+        "any_identity_demoted": any_identity_demoted,
+        "identity_demoted": sorted(identity_demoted),
+        # True when the source-coverage floor dropped a non-declared
+        # binary that had produced evidence — the surviving verdicts
+        # then enrich but never suppress (see suppression_grade above).
+        "any_floor_dropped": any_floor_dropped,
+        "floor_dropped": list(floor_dropped),
+    }
+    return counts
+
+
+def absent_earns_suppression(per_binary) -> bool:
+    """Single authority for "may this ``absent`` combined verdict
+    license suppression?" — shared by :func:`extract_verdicts`, the
+    reachability chokepoint accessor
+    (``core.analysis.reachability.binary_oracle_absent``) and the
+    ``raptor-audit`` G7 record gate, which previously each hand-copied
+    the rule and drifted (extract_verdicts required only ANY full-tier
+    binary, leaking symbol-only ``absent`` evidence into suppression
+    on hybrid full+stripped runs).
+
+    ``per_binary`` is the item's ``metadata.binary_oracle.binaries``
+    list. True iff:
+
+      * at least one per-binary record exists (a legacy inventory
+        with no tier evidence earns no trust), AND
+      * EVERY contributing binary is full-tier (a symbol-only binary
+        can't distinguish ``inlined`` from ``absent``), AND
+      * no contributing binary is marked ``suppression_grade: false``
+        (env-built with a GUESSED build command, identity-demoted —
+        its content-witness pin failed to verify or to hold across
+        the classify pass — or a sibling binary was floor-dropped so
+        the every-binary quantifier no longer holds; a missing key =
+        legacy record = full grade).
+    """
+    entries = [b for b in (per_binary or []) if isinstance(b, dict)]
+    if not entries:
+        return False
+    if any(b.get("tier") != "full" for b in entries):
+        return False
+    return not any(b.get("suppression_grade") is False for b in entries)
+
+
+def extract_verdicts(inventory: dict) -> dict[str, str]:
+    """Extract a flat {function_name: verdict} dict from an enriched inventory.
+
+    After ``enrich_inventory_with_binary_oracle`` has annotated items,
+    this extracts the combined classification for each function into
+    the shape ``OrchestratorConfig.binary_verdicts`` expects.
+
+    ``absent`` verdicts are only emitted when the per-binary evidence
+    passes :func:`absent_earns_suppression` (every contributing binary
+    full-tier, none guessed-build).
+
+    The consumer applies these verdicts by BARE name to functions of
+    ANY language (the audit G7 dead-code gate keys on the gap's
+    function name alone), so two producer-side guards keep bare-name
+    keying sound:
+
+      * a name whose classifications differ across same-name native
+        items (overloads, per-file statics) collapses to the STRONGEST
+        classification (alive-in-any — mirrors the multi-binary
+        combine), so a live namesake can never be suppressed by a dead
+        one sharing its name;
+      * a name also defined by a NON-native function item (Python / JS
+        / Java namesake of a C function) is dropped entirely — the
+        oracle has no evidence about the non-native function, and the
+        consumer can't tell which one it's looking at.
+    """
+    per_name: dict[str, str] = {}
+    non_native_names: set[str] = set()
+    # Names where at least one namesake item's ``absent`` evidence is
+    # NOT suppression grade (symbol-only / guessed-build) — the bare
+    # key can't say which item a consumer means, so ``absent`` must
+    # not be emitted for the name at all.
+    absent_blocked: set[str] = set()
+    for f in inventory.get("files") or []:
+        lang = (f.get("language") or "").lower()
+        native = lang in _NATIVE_LANGUAGES
+        for item in f.get("items") or []:
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if not native:
+                if item.get("kind", "function") == "function":
+                    non_native_names.add(name)
+                continue
+            bo = (item.get("metadata") or {}).get("binary_oracle")
+            if not (bo and isinstance(bo, dict)):
+                continue
+            # .get: a hand-edited inventory record without the key
+            # must skip, not KeyError — every other field access in
+            # this loop is already guarded.
+            classification = bo.get("classification")
+            if not classification:
+                continue
+            if (classification == "absent"
+                    and not absent_earns_suppression(bo.get("binaries"))):
+                absent_blocked.add(name)
+                continue
+            prev = per_name.get(name)
+            if prev is None or (_CLASS_PRIORITY.get(classification, 0)
+                                > _CLASS_PRIORITY.get(prev, 0)):
+                per_name[name] = classification
+    return {
+        n: v for n, v in per_name.items()
+        if n not in non_native_names
+        and not (v == "absent" and n in absent_blocked)
+    }
+
+
+__all__ = [
+    "BinaryOracleWitness",
+    "absent_earns_suppression",
+    "classify_binary_evidence",
+    "enrich_inventory_with_binary_oracle",
+    "extract_verdicts",
+    "read_build_id",
+]

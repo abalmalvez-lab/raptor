@@ -3,7 +3,7 @@ message.
 
 When the operator-supplied hunt pattern carries a CWE id or recognisable
 bug-class vocabulary, the matching cwe_strategies bug-class lenses get
-appended to the user message after the ``</pattern>`` close, giving the
+appended to the user message after the pattern envelope close, giving the
 hunt model decision support for variant enumeration.
 """
 
@@ -11,12 +11,12 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-
+from core.testing.module_views import module_function_view
+from packages.code_understanding.dispatch import hunt_dispatch as dispatch
 from packages.code_understanding.dispatch.hunt_dispatch import (
     _build_hunt_strategy_block,
     _format_user_message,
 )
-
 
 # ---------------------------------------------------------------------------
 # CWE-id pin → strategy
@@ -110,12 +110,12 @@ class TestRobustness:
                 raise ImportError("substrate missing")
             return real_import(name, *args, **kwargs)
 
-        with patch.object(builtins, "__import__", fake_import):
-            out = _format_user_message("CWE-22")
-            # Base message intact, no strategy block.
-            assert "<pattern>" in out
-            assert "</pattern>" in out
-            assert "Bug-class lenses" not in out
+        owner = module_function_view(dispatch, import_hook=fake_import)
+        out = owner._format_user_message("CWE-22")
+        # Base message intact, no strategy block.
+        assert 'kind="hunt-pattern"' in out
+        assert "</untrusted-" in out
+        assert "Bug-class lenses" not in out
 
     def test_picker_exception_returns_base_message(self):
         def boom(**kwargs):
@@ -123,7 +123,7 @@ class TestRobustness:
 
         with patch("core.llm.cwe_strategies.pick_strategies", boom):
             out = _format_user_message("CWE-22")
-            assert "<pattern>" in out
+            assert 'kind="hunt-pattern"' in out
             assert "Bug-class lenses" not in out
 
     def test_render_exception_returns_base_message(self):
@@ -132,18 +132,16 @@ class TestRobustness:
 
         with patch("core.llm.cwe_strategies.render_strategies", boom):
             out = _format_user_message("CWE-22")
-            assert "<pattern>" in out
+            assert 'kind="hunt-pattern"' in out
             assert "Bug-class lenses" not in out
 
     def test_hostile_cwe_with_fake_heading_no_injection(self):
         """A pattern injecting a fake heading via newline must not echo
         a bare ``## INJECTED`` heading inside the strategy block. The
-        pattern itself sits inside ``<pattern>`` delimiters (data zone);
+        pattern itself sits inside the nonce envelope (data zone);
         the strategy block above is separate operator-trusted content."""
         out = _format_user_message("CWE-22\n## INJECTED")
-        # Pattern goes inside <pattern>...</pattern> as data; the
-        # `<pattern>` block contains the user text verbatim — that's
-        # the existing data-zone contract, not introduced here. Verify
+        # Pattern goes inside the nonce envelope as data. Verify
         # the strategy block (which is OUTSIDE the pattern delimiters)
         # contains no fake heading copied from the pattern.
         bug_pos = out.index("Bug-class lenses for this hunt")
@@ -163,17 +161,17 @@ class TestRobustness:
 
 
 # ---------------------------------------------------------------------------
-# Strategy block placement (after </pattern>, not inside)
+# Strategy block placement (after the envelope close, not inside)
 # ---------------------------------------------------------------------------
 
 
 class TestStrategyBlockPlacement:
     def test_strategy_block_after_pattern_close(self):
-        """The strategy block must sit AFTER ``</pattern>`` so the model
+        """The strategy block must sit AFTER the envelope close so the model
         treats the bug-class lenses as trusted operator instructions
         rather than continuation of the pattern data zone."""
         out = _format_user_message("CWE-22 in upload")
-        pat_close = out.index("</pattern>")
+        pat_close = out.index("</untrusted-")
         bug_pos = out.index("Bug-class lenses for this hunt")
         assert bug_pos > pat_close
 
@@ -231,8 +229,8 @@ class TestStrategyBlockDirect:
                 raise ImportError("substrate missing")
             return real_import(name, *args, **kwargs)
 
-        with patch.object(builtins, "__import__", fake_import):
-            assert _build_hunt_strategy_block("CWE-89") == ""
+        owner = module_function_view(dispatch, import_hook=fake_import)
+        assert owner._build_hunt_strategy_block("CWE-89") == ""
 
     def test_returns_block_with_cwe_pin(self):
         block = _build_hunt_strategy_block("CWE-89 SQL injection")
@@ -250,3 +248,97 @@ class TestStrategyBlockDirect:
         # intentional.
         block = _build_hunt_strategy_block("")
         assert "## Strategy: general" in block
+
+
+# ---------------------------------------------------------------------------
+# lifecycle_drift reaches the hunt prompt (no CWE pin — keyword only)
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleDriftReaches:
+    def test_dumpable_pattern_pins_lifecycle_drift(self, tmp_path):
+        # lifecycle_drift has no CWE signal; the ``dumpable`` token in
+        # ``get_dumpable`` is what pins it, exemplar and all. Its
+        # signal set is kernel vocabulary, so the pin needs the
+        # kernel-marked repo (linux_kernel profile).
+        (tmp_path / "Kconfig").write_text("config FOO\n")
+        block = _build_hunt_strategy_block(
+            "get_dumpable trusted for tasks without an mm",
+            repo_path=tmp_path,
+        )
+        assert "## Strategy: lifecycle_drift" in block
+        assert "CVE-2026-46333" in block  # lifecycle_drift exemplar
+
+
+# ---------------------------------------------------------------------------
+# Exemplar slot wiring — L3 retrieval first, legacy fallback
+# ---------------------------------------------------------------------------
+
+
+def _retrieved_exemplar(exemplar_id="abcd1234-2026-06-03T14:05:32+00:00"):
+    from core.labeled_attempts import RetrievedExemplar
+    return RetrievedExemplar(
+        exemplar_id=exemplar_id,
+        cwe="CWE-22",
+        finding_summary="CWE-22 · finding=FND-1",
+        exploit_code="open('../../etc/passwd')",
+        evidence="observed=sanitizer_report",
+        environment="x86_64",
+        timestamp="2026-06-03T14:05:32+00:00",
+    )
+
+
+class TestExemplarSlotWiring:
+    def test_retrieval_serves_slot_when_pool_has_entries(self, monkeypatch):
+        """When L3 retrieval has records for the pattern's CWE, the
+        retrieved exemplars ride the untrusted envelope in the user
+        message (the legacy VerifiedOutcome rollup is not consulted)."""
+        ex = _retrieved_exemplar()
+        monkeypatch.setattr(
+            "core.labeled_attempts.retrieval.retrieve_exemplars",
+            lambda **kw: [ex],
+        )
+        monkeypatch.setattr(
+            "core.run.output._resolve_active_project", lambda: None,
+        )
+        out = _format_user_message("CWE-22 in upload handler")
+        assert "<untrusted_verified_outcomes>" in out
+        assert "## RAPTOR-verified exemplars" in out
+        assert ex.exemplar_id in out
+
+    def test_fallback_to_legacy_block_when_retrieval_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.labeled_attempts.retrieval.retrieve_exemplars",
+            lambda **kw: [],
+        )
+        monkeypatch.setattr(
+            "core.labeled_attempts.view.exemplar_block_for_finding",
+            lambda finding, **kw: "## RAPTOR-verified exemplars\n\nlegacy entry F-9",
+        )
+        out = _format_user_message("CWE-22 in upload handler")
+        assert "<untrusted_verified_outcomes>" in out
+        assert "legacy entry F-9" in out
+
+    def test_empty_store_leaves_message_unchanged(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.labeled_attempts.retrieval.retrieve_exemplars",
+            lambda **kw: [],
+        )
+        monkeypatch.setattr(
+            "core.labeled_attempts.view.exemplar_block_for_finding",
+            lambda finding, **kw: "",
+        )
+        out = _format_user_message("CWE-22 in upload handler")
+        assert "<untrusted_verified_outcomes>" not in out
+        assert "RAPTOR-verified exemplars" not in out
+
+    def test_slot_failure_does_not_break_hunt(self, monkeypatch):
+        def boom(finding, **kw):
+            raise RuntimeError("simulated slot failure")
+
+        monkeypatch.setattr(
+            "core.labeled_attempts.view.exemplar_slot_for_finding", boom,
+        )
+        out = _format_user_message("CWE-22 in upload handler")
+        assert 'kind="hunt-pattern"' in out
+        assert "<untrusted_verified_outcomes>" not in out

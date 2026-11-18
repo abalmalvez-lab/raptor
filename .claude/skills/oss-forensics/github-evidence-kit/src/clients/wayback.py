@@ -7,6 +7,10 @@ from typing import Any
 
 from ..schema.common import EvidenceSource
 
+# Per-request timeout. Without one, requests waits forever and a stalled
+# connection hangs the collector; archive.org is slow but bounded.
+_TIMEOUT_S = 60
+
 
 class WaybackClient:
     """Client for Wayback Machine CDX API."""
@@ -15,7 +19,7 @@ class WaybackClient:
     AVAILABILITY_URL = "https://archive.org/wayback/available"
     ARCHIVE_URL = "https://web.archive.org/web"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._session: Any = None
 
     @property
@@ -51,7 +55,7 @@ class WaybackClient:
         if to_date:
             params["to"] = to_date
 
-        resp = session.get(self.CDX_URL, params=params)
+        resp = session.get(self.CDX_URL, params=params, timeout=_TIMEOUT_S)
         resp.raise_for_status()
         data = resp.json()
 
@@ -59,13 +63,13 @@ class WaybackClient:
             return []
 
         headers = data[0]
-        return [dict(zip(headers, row)) for row in data[1:]]
+        return [dict(zip(headers, row, strict=True)) for row in data[1:]]
 
     def get_snapshot(self, url: str, timestamp: str) -> str | None:
         """Fetch archived page content."""
         session = self._get_session()
         archive_url = f"{self.ARCHIVE_URL}/{timestamp}/{url}"
-        resp = session.get(archive_url)
+        resp = session.get(archive_url, timeout=_TIMEOUT_S)
         if resp.status_code == 200:
             return resp.text
         return None

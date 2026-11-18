@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
+"""Pre-flight inspection: target type, tool readiness, recommended
+pipeline, and cost estimate. No LLM cost; no side effects.
+
+Usage:
+  raptor-describe --target <path>          Operator-facing text block
+  raptor-describe --target <path> --json   Machine-readable JSON
+
+Mirrors ``raptor.py prepare`` — this libexec form is what the
+``/describe`` slash-command invokes; operators typically use
+``bin/raptor describe --target <path>``.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# ─── trust-marker check (do not import; inline by design) ───
+# fmt: off
+import os  # noqa: E402
+if not (os.environ.get("CLAUDECODE")
+        or os.environ.get("_RAPTOR_TRUSTED")):
+    sys.stderr.write(
+        f"{sys.argv[0]}: internal dispatch script.\n"
+        "  Run via 'bin/raptor' instead.\n"
+        "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
+    )
+    sys.exit(2)
+# fmt: on
+# ─── end trust-marker check ─────────────────────────────────
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="raptor-describe",
+        description=(
+            "Pre-flight inspection: target type, tool readiness, "
+            "recommended pipeline, cost estimate."
+        ),
+    )
+    parser.add_argument(
+        "--target", default=None, metavar="<path>",
+        help=(
+            "Path to the target codebase (directory OR archive: "
+            "tar.gz / zip / …). Optional — falls back to the "
+            "active project's target, then $RAPTOR_CALLER_DIR, "
+            "per CLAUDE.md DEFAULT TARGET DIRECTORY."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit machine-readable JSON instead of the text block",
+    )
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(parser)
+    args = parser.parse_args(argv)
+    report_options = options_from_args(args, parser)
+    explicit_report = bool(args.report_format or args.report_output or args.no_report)
+    if explicit_report and report_options.enabled and report_options.output is None:
+        parser.error("Describe reports require --report-output")
+
+    from core.project.registry_home import RegistryHomeError
+    from packages.describe.cli import describe_main
+    try:
+        return describe_main(args.target, args.json, report_options=report_options) if explicit_report else describe_main(args.target, args.json)
+    except RegistryHomeError as exc:
+        # Invalid operator override refused by default-target
+        # resolution: the designed one-line refusal, never a raw
+        # traceback. (The ``raptor.py describe`` route prints the
+        # same refusal via its own top-level handler.)
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

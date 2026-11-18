@@ -1,0 +1,365 @@
+"""End-to-end: suppression overlay flows through the pipeline into
+``findings.json`` and the markdown report respects the suppressed flag.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from core.json import JsonCache
+from packages.sca.osv import OSV_QUERY_BATCH_URL, OSV_VULN_URL_TEMPLATE
+from packages.sca.pipeline import RunOptions, run_sca
+
+_VULN_RECORD = {
+    "id": "GHSA-fake",
+    "modified": "2024-01-01T00:00:00Z",
+    "aliases": ["CVE-2099-FAKE"],
+    "summary": "Synthetic CVE for the suppression test",
+    "details": "",
+    "affected": [{
+        "package": {"ecosystem": "PyPI", "name": "vuln-pkg"},
+        "ranges": [{"type": "ECOSYSTEM",
+                    "events": [{"introduced": "0"}, {"fixed": "2.0"}]}],
+    }],
+    "severity": [{"type": "CVSS_V3",
+                  "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+    "references": [],
+}
+
+
+class StubHttp:
+    def __init__(self) -> None:
+        self.posts = []
+        self.gets = []
+
+    def post_json(self, url, body, timeout=30):
+        self.posts.append((url, body))
+        if url == OSV_QUERY_BATCH_URL:
+            return {"results": [{"vulns": [{"id": "GHSA-fake"}]}
+                                 for _ in body["queries"]]}
+        raise RuntimeError(url)
+
+    def get_json(self, url, timeout=30):
+        self.gets.append(url)
+        if url == OSV_VULN_URL_TEMPLATE.format("GHSA-fake"):
+            return _VULN_RECORD
+        if "cisa.gov" in url:
+            return {"vulnerabilities": []}
+        if "first.org" in url:
+            return {"data": []}
+        raise RuntimeError(url)
+
+    def get_bytes(self, *a, **k):
+        raise NotImplementedError
+
+
+def _build_target(tmp_path: Path, *, suppress_yaml: str | None = None) -> Path:
+    target = tmp_path / "repo"
+    target.mkdir()
+    (target / "requirements.txt").write_text("vuln-pkg==1.0.0\n",
+                                              encoding="utf-8")
+    if suppress_yaml is not None:
+        (target / ".raptor-sca-suppress.yml").write_text(
+            suppress_yaml, encoding="utf-8",
+        )
+    return target
+
+
+def test_suppression_flows_into_findings_json(tmp_path: Path) -> None:
+    target = _build_target(tmp_path, suppress_yaml="""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: accepted risk for the test
+""")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    # The overlay ships in the scanned tree — only honoured on
+    # repo-trusted runs.
+    result = run_sca(target, out,
+                     RunOptions(enable_llm_review=False,
+                                enable_triage=False, trust_repo=True),
+                     http=StubHttp(), cache=cache)
+    assert result.suppressed_findings >= 1
+
+    rows = json.loads(result.findings_path.read_text())
+    sca_rows = [r for r in rows
+                if r["vuln_type"] == "sca:vulnerable_dependency"]
+    assert sca_rows
+    assert all(r["suppressed"] is True for r in sca_rows)
+    assert sca_rows[0]["suppression_reason"] == "accepted risk for the test"
+
+
+def test_no_suppression_file_means_no_suppressed_findings(
+    tmp_path: Path,
+) -> None:
+    target = _build_target(tmp_path)
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(target, out, RunOptions(enable_llm_review=False, enable_triage=False),
+                     http=StubHttp(), cache=cache)
+    assert result.suppressed_findings == 0
+
+
+def test_suppression_disabled_via_options(tmp_path: Path) -> None:
+    target = _build_target(tmp_path, suppress_yaml="""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: would suppress if enabled
+""")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(
+        target, out, RunOptions(enable_suppressions=False),
+        http=StubHttp(), cache=cache,
+    )
+    assert result.suppressed_findings == 0
+    rows = json.loads(result.findings_path.read_text())
+    sca_rows = [r for r in rows
+                if r["vuln_type"] == "sca:vulnerable_dependency"]
+    assert all(not r["suppressed"] for r in sca_rows)
+
+
+def test_report_summary_lists_suppressed_count(tmp_path: Path) -> None:
+    target = _build_target(tmp_path, suppress_yaml="""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: ack
+""")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    run_sca(target, out,
+            RunOptions(enable_llm_review=False, enable_triage=False,
+                       trust_repo=True),
+            http=StubHttp(), cache=cache)
+    md = (out / "report.md").read_text()
+    assert "Suppressed" in md
+    assert "| Suppressed | True |" in md
+    assert "| Suppression reason | ack |" in md
+
+
+def test_untrusted_run_ignores_target_suppression_file(
+    tmp_path: Path, caplog,
+) -> None:
+    """Default (untrusted) run: the target-tree overlay is never even
+    READ — the finding survives — and a prominent notice is logged."""
+    target = _build_target(tmp_path, suppress_yaml="""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: hostile target trying to hide its own CVE
+""")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    with caplog.at_level("WARNING", logger="packages.sca.pipeline"):
+        result = run_sca(target, out,
+                         RunOptions(enable_llm_review=False,
+                                    enable_triage=False),
+                         http=StubHttp(), cache=cache)
+    assert result.suppressed_findings == 0
+    rows = json.loads(result.findings_path.read_text())
+    sca_rows = [r for r in rows
+                if r["vuln_type"] == "sca:vulnerable_dependency"]
+    assert sca_rows
+    assert all(not r["suppressed"] for r in sca_rows)
+    notices = [r for r in caplog.records
+               if "suppression overlay present but not trusted"
+               in r.getMessage()]
+    assert len(notices) == 1
+    assert "ignored (not read)" in notices[0].getMessage()
+    assert "--trust-repo" in notices[0].getMessage()
+
+
+def test_trusted_run_logs_per_entry_suppression_counts(
+    tmp_path: Path, caplog,
+) -> None:
+    """Trusted run: each overlay entry's hit count is logged."""
+    target = _build_target(tmp_path, suppress_yaml="""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: accepted risk
+  - ecosystem: npm
+    name: never-matches
+    reason: entry with zero hits
+""")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    with caplog.at_level("INFO", logger="packages.sca.pipeline"):
+        result = run_sca(target, out,
+                         RunOptions(enable_llm_review=False,
+                                    enable_triage=False,
+                                    trust_repo=True),
+                         http=StubHttp(), cache=cache)
+    assert result.suppressed_findings >= 1
+    per_entry = [r.getMessage() for r in caplog.records
+                 if "suppression entry" in r.getMessage()]
+    assert any("CVE-2099-FAKE" in m for m in per_entry)
+    assert any("npm:never-matches@*" in m and "0 finding(s)" in m
+               for m in per_entry)
+
+
+def test_untrusted_run_ignores_target_license_policy(
+    tmp_path: Path, caplog,
+) -> None:
+    """A license policy file shipped in the scanned tree is ignored
+    (default policy used) on untrusted runs, with a notice."""
+    target = _build_target(tmp_path)
+    (target / ".raptor-sca-license-policy.yml").write_text(
+        "allow: [MIT]\ndefault: deny\n", encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    with caplog.at_level("WARNING", logger="packages.sca.pipeline"):
+        run_sca(target, out,
+                RunOptions(enable_llm_review=False,
+                           enable_triage=False),
+                http=StubHttp(), cache=cache)
+    assert any("license policy file present but not trusted"
+               in r.getMessage() for r in caplog.records)
+
+
+def test_trusted_run_loads_target_license_policy(
+    tmp_path: Path, caplog,
+) -> None:
+    target = _build_target(tmp_path)
+    (target / ".raptor-sca-license-policy.yml").write_text(
+        "allow: [MIT]\ndefault: deny\n", encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    with caplog.at_level("WARNING", logger="packages.sca.pipeline"):
+        run_sca(target, out,
+                RunOptions(enable_llm_review=False,
+                           enable_triage=False, trust_repo=True),
+                http=StubHttp(), cache=cache)
+    assert not any("license policy file present but not trusted"
+                   in r.getMessage() for r in caplog.records)
+
+
+def test_untrusted_run_never_reads_the_overlay(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The trust gate orders BEFORE the read: on an untrusted run the
+    overlay file is not opened at all — reading it first handed a
+    hostile repo an unbounded read+parse of a committed file (246 MB
+    peak from one 122 MB YAML in the wild repro) with zero trust
+    granted."""
+    from packages.sca import suppressions as _suppressions
+
+    target = _build_target(tmp_path, suppress_yaml="""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: hostile target trying to hide its own CVE
+""")
+
+    calls: list = []
+    real_load = _suppressions.load
+
+    def _spy(path):
+        calls.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(_suppressions, "load", _spy)
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(target, out,
+                     RunOptions(enable_llm_review=False,
+                                enable_triage=False),
+                     http=StubHttp(), cache=cache)
+    assert result.suppressed_findings == 0
+    assert calls == []
+
+
+def test_untrusted_run_notices_a_symlinked_overlay(
+    tmp_path: Path, caplog,
+) -> None:
+    """A dangling-symlink overlay on an untrusted run still triggers
+    the not-trusted notice instead of silently vanishing (exists()
+    alone follows the link and reports missing)."""
+    target = _build_target(tmp_path)
+    (target / ".raptor-sca-suppress.yml").symlink_to(
+        tmp_path / "nowhere.yml")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    with caplog.at_level("WARNING", logger="packages.sca.pipeline"):
+        result = run_sca(target, out,
+                         RunOptions(enable_llm_review=False,
+                                    enable_triage=False),
+                         http=StubHttp(), cache=cache)
+    assert result.suppressed_findings == 0
+    assert any("suppression overlay present but not trusted"
+               in r.getMessage() for r in caplog.records)
+
+
+def test_raptor_config_files_are_not_manifest_candidates() -> None:
+    """The k8s candidate router (which also feeds the image-ref
+    walker) must skip RAPTOR's own config files — otherwise an
+    "ignored when untrusted" overlay was still read (bounded,
+    no-follow) as a generic .yml manifest candidate. Membership is
+    pinned against the owning constants so a rename cannot silently
+    reopen the read."""
+    from pathlib import Path
+
+    from packages.sca.kinds import RAPTOR_CONFIG_FILENAMES
+    from packages.sca.parsers.kubernetes import _is_k8s_manifest
+    from packages.sca.pipeline import _LICENSE_POLICY_FILENAME
+    from packages.sca.suppressions import SUPPRESS_FILENAME
+
+    assert SUPPRESS_FILENAME in RAPTOR_CONFIG_FILENAMES
+    assert _LICENSE_POLICY_FILENAME in RAPTOR_CONFIG_FILENAMES
+    for name in RAPTOR_CONFIG_FILENAMES:
+        assert _is_k8s_manifest(Path("repo") / name) is False, name
+
+
+def test_trusted_run_honours_in_tree_symlinked_overlay(
+    tmp_path: Path,
+) -> None:
+    """Monorepo layouts symlink shared config inside the tree; on a
+    TRUSTED run an overlay symlink whose target stays inside the scan
+    root is honoured (same scan-root containment discipline the
+    manifest readers use). Out-of-tree targets stay refused."""
+    target = _build_target(tmp_path)
+    (target / "shared").mkdir()
+    (target / "shared" / "suppress.yml").write_text("""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: accepted risk — shared monorepo overlay
+""", encoding="utf-8")
+    (target / ".raptor-sca-suppress.yml").symlink_to(
+        target / "shared" / "suppress.yml")
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(target, out,
+                     RunOptions(enable_llm_review=False,
+                                enable_triage=False,
+                                trust_repo=True),
+                     http=StubHttp(), cache=cache)
+    assert result.suppressed_findings == 1
+
+
+def test_trusted_run_still_refuses_out_of_tree_symlinked_overlay(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside.yml"
+    outside.write_text("""
+version: 1
+suppressions:
+  - advisory_id: CVE-2099-FAKE
+    reason: operator file reached through the symlink
+""", encoding="utf-8")
+    target = _build_target(tmp_path)
+    (target / ".raptor-sca-suppress.yml").symlink_to(outside)
+    out = tmp_path / "out"
+    cache = JsonCache(root=tmp_path / "cache")
+    result = run_sca(target, out,
+                     RunOptions(enable_llm_review=False,
+                                enable_triage=False,
+                                trust_repo=True),
+                     http=StubHttp(), cache=cache)
+    assert result.suppressed_findings == 0

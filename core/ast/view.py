@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
 
 from core.ast.model import FunctionView, Return, SCHEMA_VERSION
 from core.inventory.call_graph import (
@@ -53,7 +52,13 @@ from core.inventory.call_graph import (
     extract_call_graph_rust,
 )
 from core.inventory.extractors import extract_functions
+from core.source.contained import read_text_capped
 from core.inventory.languages import detect_language
+from typing import TYPE_CHECKING
+from core.source.lines import split_lines
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +81,7 @@ _CALL_GRAPH_DISPATCH: dict[str, Callable] = {
     "python": extract_call_graph_python,
     "javascript": extract_call_graph_javascript,
     "typescript": extract_call_graph_javascript,
+    "tsx": extract_call_graph_javascript,
     "java": extract_call_graph_java,
     "go": extract_call_graph_go,
     "c": extract_call_graph_c,
@@ -96,9 +102,9 @@ def view(
     path: Path,
     function: str,
     *,
-    at_line: Optional[int] = None,
-    language: Optional[str] = None,
-) -> Optional[FunctionView]:
+    at_line: int | None = None,
+    language: str | None = None,
+) -> FunctionView | None:
     """Return a :class:`FunctionView` for ``function`` in ``path``.
 
     Returns ``None`` when:
@@ -121,13 +127,26 @@ def view(
         if language is None:
             return None
 
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    # Guarded read: ``view`` runs against files inside untrusted
+    # target trees — a bare ``read_text`` blocks forever on a
+    # repo-planted reader-less FIFO and loads a planted multi-GB file
+    # whole. ``read_text_capped`` opens O_NOFOLLOW | O_NONBLOCK with an
+    # fstat(S_ISREG) fd check and caps the read; a function past the
+    # cap of a truncated read simply isn't found (None), the same
+    # degrade as an unreadable file.
+    got = read_text_capped(path)
+    if got is None:
         return None
+    content = got[0]
 
     # Function discovery — inventory handles per-language dispatch.
-    functions = extract_functions(str(path), language, content)
+    # C/C++ consumers below use the same source and grammar. Keep their
+    # tree only for this operation, never in a cross-file/run cache.
+    tree_cache: dict = {}
+    if language in ("c", "cpp"):
+        functions = extract_functions(str(path), language, content, _tree_cache=tree_cache)
+    else:
+        functions = extract_functions(str(path), language, content)
     matches = [f for f in functions if f.name == function]
     if at_line is not None:
         # Narrow to functions whose range encloses at_line. line_end
@@ -145,12 +164,26 @@ def view(
         return None
     fi = matches[0]
 
-    # Calls — filter file-wide graph by the function's line range.
-    calls_made = _filter_calls(content, language, fi.line_start, fi.line_end)
+    # parse_origin: the call-graph and return walkers parse with
+    # tree-sitter; a budget-abandoned parse must name this file on
+    # the run's analysis-gap trail. (Function discovery above
+    # attributes itself — the extractor knows the path.)
+    from core.run.gaps import parse_origin
+    with parse_origin(path):
+        # Calls — filter file-wide graph by the function's line range.
+        calls_made = _filter_calls(
+            content, language, fi.line_start, fi.line_end,
+            _tree=tree_cache.get("tree"),
+        )
 
-    # Returns + inline asm.
-    returns = _walk_returns(content, language, fi.line_start, fi.line_end)
-    has_asm = _has_inline_asm(content, language, fi.line_start, fi.line_end)
+        # Returns + inline asm.
+        returns = _walk_returns(
+            content, language, fi.line_start, fi.line_end,
+            _tree=tree_cache.get("tree"),
+        )
+        has_asm = _has_inline_asm(
+            content, language, fi.line_start, fi.line_end,
+        )
 
     return FunctionView(
         function=fi.name,
@@ -161,7 +194,7 @@ def view(
         # by checking against the source length. Better than tripping
         # downstream assumptions about line_end being None.
         lines=(fi.line_start, fi.line_end if fi.line_end is not None else fi.line_start),
-        signature=fi.signature or "",
+        signature=fi.signature or "",  # type: ignore[attr-defined]
         calls_made=calls_made,
         returns=returns,
         has_inline_asm=has_asm,
@@ -178,8 +211,9 @@ def _filter_calls(
     content: str,
     language: str,
     line_start: int,
-    line_end: Optional[int],
-) -> Tuple:
+    line_end: int | None,
+    *, _tree=None,
+) -> tuple:
     """Return calls inside the function's line range. Empty tuple
     when the language has no call-graph walker or the file is
     unparseable for it."""
@@ -187,7 +221,10 @@ def _filter_calls(
     if extractor is None:
         return ()
     try:
-        graph = extractor(content)
+        if _tree is not None and language in ("c", "cpp"):
+            graph = extractor(content, _tree=_tree)
+        else:
+            graph = extractor(content)
     except Exception:                                       # noqa: BLE001
         return ()
     if line_end is None:
@@ -208,8 +245,9 @@ def _walk_returns(
     content: str,
     language: str,
     line_start: int,
-    line_end: Optional[int],
-) -> Tuple[Return, ...]:
+    line_end: int | None,
+    *, _tree=None,
+) -> tuple[Return, ...]:
     """Return all explicit ``return`` statements inside the function.
 
     Implicit returns (end-of-function fall-through in C/Go, etc.) are
@@ -227,21 +265,26 @@ def _walk_returns(
     grammar = _ts_grammar_module(language)
     if grammar is None:
         return ()
-    return _walk_returns_ts(content, grammar, line_start, line_end)
+    return _walk_returns_ts(content, grammar, line_start, line_end, _tree=_tree)
 
 
 def _walk_returns_python(
     content: str,
     line_start: int,
     line_end: int,
-) -> Tuple[Return, ...]:
+) -> tuple[Return, ...]:
     """Use stdlib ``ast`` for Python — no third-party grammar needed."""
     import ast as _stdlib_ast  # absolute import: shadowed by core.ast namespace
     try:
         tree = _stdlib_ast.parse(content)
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        # Beyond SyntaxError, ast.parse signals its depth/input limits
+        # differently across interpreter versions on attacker-shaped
+        # source: RecursionError or MemoryError for deeply-nested
+        # expressions, ValueError for null bytes (pre-3.12). All mean
+        # "unparseable file" here, not a caller bug.
         return ()
-    out: List[Return] = []
+    out: list[Return] = []
     for node in _stdlib_ast.walk(tree):
         if not isinstance(node, _stdlib_ast.Return):
             continue
@@ -266,7 +309,8 @@ def _walk_returns_ts(
     grammar_module,
     line_start: int,
     line_end: int,
-) -> Tuple[Return, ...]:
+    *, _tree=None,
+) -> tuple[Return, ...]:
     """Generic tree-sitter ``return_statement`` walk.
 
     The grammar's emitted node type is conventionally
@@ -275,21 +319,37 @@ def _walk_returns_ts(
     grammar uses a different name, add it to the tuple below.
     """
     try:
-        from tree_sitter import Language, Parser
-        parser = Parser(Language(grammar_module.language()))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
+        # Route through the call_graph parser cache — grammar is
+        # immutable across the program's lifetime, so a single
+        # Parser per language can be reused across every parse.
+        # Pre-cache, each ``Parser(Language(...))`` allocated
+        # libtree-sitter C state per call across thousands of files,
+        # accumulating RSS in long inventory walks.
+        from core.inventory.call_graph import _get_ts_parser
+        if _tree is None:
+            parser = _get_ts_parser(grammar_module.language)
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+        else:
+            tree = _tree
     except Exception:                                       # noqa: BLE001
         return ()
-    out: List[Return] = []
+    out: list[Return] = []
     return_types = ("return_statement",)
 
-    def visit(node) -> None:
+    # Iterative pre-order walk with an explicit stack: the parse tree
+    # is attacker-shaped (target-repo source), so traversal depth must
+    # not be bound by Python's recursion limit — a recursive visit
+    # overflows on deeply-nested files (e.g. thousands of nested
+    # parens) and crashes the whole view.
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         # Cheap line-range prune: skip subtrees entirely outside
         # [line_start, line_end].
         n_start = node.start_point[0] + 1
         n_end = node.end_point[0] + 1
         if n_start > line_end or n_end < line_start:
-            return
+            continue
         if node.type in return_types:
             line = n_start
             if line_start <= line <= line_end:
@@ -301,10 +361,9 @@ def _walk_returns_ts(
                 out.append(Return(line=line, value_text=value_text))
             # Returns don't nest meaningfully; still descend so nested
             # functions / lambdas inside return expressions are seen.
-        for c in node.children:
-            visit(c)
-
-    visit(tree.root_node)
+        # Reversed so pop() yields children in source order,
+        # preserving the recursive walk's pre-order output.
+        stack.extend(reversed(node.children))
     return tuple(out)
 
 
@@ -317,16 +376,16 @@ def _ts_grammar_module(language: str):
             import tree_sitter_c as m
             return m
         if language == "cpp":
-            import tree_sitter_cpp as m
+            import tree_sitter_cpp as m  # type: ignore[no-redef]
             return m
-        if language in ("javascript", "typescript"):
-            import tree_sitter_javascript as m
+        if language in ("javascript", "typescript", "tsx"):
+            import tree_sitter_javascript as m  # type: ignore[no-redef]
             return m
         if language == "java":
-            import tree_sitter_java as m
+            import tree_sitter_java as m  # type: ignore[no-redef]
             return m
         if language == "go":
-            import tree_sitter_go as m
+            import tree_sitter_go as m  # type: ignore[no-redef]
             return m
     except ImportError:
         return None
@@ -347,8 +406,11 @@ def _ts_grammar_module(language: str):
 # minimum the regex is the right precision/cost trade-off; a future
 # revision can switch to a tree-sitter ``gnu_asm_statement`` walk if
 # false positives surface in real corpora.
+# The optional qualifier gates its own trailing whitespace — the
+# naive ``\s*(?:volatile|goto)?\s*`` put two whitespace spans
+# around it, quadratic on an asm token followed by a whitespace run.
 _ASM_PATTERN = re.compile(
-    r"\b(__asm__|__asm|asm)\b\s*(?:volatile|goto)?\s*[(]",
+    r"\b(__asm__|__asm|asm)\b\s*(?:(?:volatile|goto)\s*)?[(]",
 )
 
 
@@ -356,7 +418,7 @@ def _has_inline_asm(
     content: str,
     language: str,
     line_start: int,
-    line_end: Optional[int],
+    line_end: int | None,
 ) -> bool:
     """True iff a GNU-extension inline-asm construct appears in the
     function body. Non-C/C++ always False."""
@@ -366,6 +428,6 @@ def _has_inline_asm(
         return False
     # Slice the function body by lines (1-indexed). String slicing
     # is cheap relative to parsing the whole file again.
-    lines = content.splitlines()
+    lines = split_lines(content)
     body = "\n".join(lines[line_start - 1: line_end])
     return bool(_ASM_PATTERN.search(body))

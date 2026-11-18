@@ -1,0 +1,795 @@
+"""Phase 14 — inter-procedural evaluate_finding tests.
+
+Exercises the synthetic-binding builder and end-to-end candidate
+lineage through the resolver. Covers the design's named cases:
+sanitizer-in-helper, sanitizer-only-on-some-branches, bypass via
+non-sanitizing callee, recursive/transitive sanitization, and the
+multi-arg positional-mapping correctness that distinguishes a
+sanitized parameter from an unsanitized sibling.
+"""
+from __future__ import annotations
+
+import ast
+
+from core.analysis.cfg_builder import build_python_cfg
+from core.analysis.finding_resolver import (
+    ResolvedFinding,
+    resolve_finding,
+)
+from core.analysis.python_module_callgraph import build_python_module_callgraph
+from core.analysis.interproc import synthetic_sanitizer_bindings
+from core.analysis.taint_summaries import build_taint_summaries
+from core.analysis.sanitizer_cut import (
+    VERDICT_CANDIDATE_ONLY,
+    VERDICT_NO_SUPPRESS,
+    VERDICT_SUPPRESS,
+    evaluate_finding,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — build the (cfg, fn_ast, summaries) triple for one function
+# ---------------------------------------------------------------------------
+
+
+def _bindings_for(src: str, fn_name: str, cwe: str = "CWE-79"):
+    cg = build_python_module_callgraph(src)
+    assert cg is not None
+    summaries = build_taint_summaries(cg, src)
+    tree = ast.parse(src)
+    fn_ast = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == fn_name
+    )
+    cfg = build_python_cfg(src, fn_name)
+    assert cfg is not None
+    bindings = synthetic_sanitizer_bindings(
+        cfg, fn_ast, summaries, cwe, "python",
+    )
+    return cfg, bindings
+
+
+def _evaluate(src, fn_name, source_symbols, sink_arg, sink_line, cwe="CWE-79"):
+    cfg, bindings = _bindings_for(src, fn_name, cwe)
+    sink = next(n for n in cfg.nodes() if n.lineno == sink_line)
+    return evaluate_finding(
+        cfg, [cfg.entry_node], sink,
+        cwe=cwe, language="python",
+        source_symbols=source_symbols, sink_arg=sink_arg,
+        extra_bindings=bindings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Binding generation
+# ---------------------------------------------------------------------------
+
+
+class TestBindingGeneration:
+    def test_helper_sanitizer_produces_binding(self):
+        src = (
+            "import html\n"
+            "def _sanitize(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _sanitize(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+        b = next(iter(bindings))
+        assert b.callable == "_sanitize"
+        assert b.input_symbols == frozenset({"x"})
+        assert b.output_symbols == frozenset({"y"})
+        assert b.unverified_source_contracts == frozenset({"exact_builtin_str_default_call", "html_text_or_quoted_attribute_sink_context_and_policy"})
+
+    def test_passthrough_helper_no_binding(self):
+        # Helper returns its arg unchanged — no sanitization.
+        src = (
+            "def _passthrough(s):\n"
+            "    return s\n"
+            "def handle(x):\n"
+            "    y = _passthrough(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_some_branches_helper_no_binding(self):
+        # Helper sanitizes only on one branch — the direct-return
+        # path means the param can reach return unsanitized.
+        src = (
+            "import html\n"
+            "def _maybe(s, cond):\n"
+            "    if cond:\n"
+            "        return html.escape(s)\n"
+            "    return s\n"
+            "def handle(x, c):\n"
+            "    y = _maybe(x, c)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_mixed_same_param_expression_no_binding(self):
+        # U09-F21: the SAME parameter both sanitized and raw in one
+        # return expression. The merge used to absorb the raw
+        # pass-through atom into the sanitized chain, so this helper
+        # minted a clean-sanitizer binding and the enforced
+        # sanitizer-cut suppressed findings routed through it.
+        src = (
+            "import html\n"
+            "def _mix(s):\n"
+            "    return html.escape(s) + s\n"
+            "def handle(x):\n"
+            "    y = _mix(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_branch_join_single_return_no_binding(self):
+        # Same collapse at the reaching-defs join: sanitize on one
+        # branch, single return of the joined variable.
+        src = (
+            "import html\n"
+            "def _maybe(s):\n"
+            "    if len(s) > 3:\n"
+            "        s = html.escape(s)\n"
+            "    return s\n"
+            "def handle(x):\n"
+            "    y = _maybe(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_non_sanitizer_callable_in_chain_no_binding(self):
+        # Helper wraps the escaped value in an unknown callable —
+        # can't prove the wrapper preserves sanitization.
+        src = (
+            "import html\n"
+            "def _wrap(s):\n"
+            "    return wrap(html.escape(s))\n"
+            "def handle(x):\n"
+            "    y = _wrap(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_wrong_cwe_no_binding(self):
+        # html.escape sanitizes xss (CWE-79), not sqli (CWE-89).
+        src = (
+            "import html\n"
+            "def _sanitize(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _sanitize(x)\n"
+            "    run_query(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle", cwe="CWE-89")
+        assert bindings == frozenset()
+
+    def test_multiarg_helper_maps_correct_position(self):
+        # Helper sanitizes param 1 (b). The binding's input_symbols
+        # must be the arg passed at position 1, not 0.
+        src = (
+            "import html\n"
+            "def _san(a, b):\n"
+            "    return html.escape(b)\n"
+            "def handle(p, q):\n"
+            "    y = _san(p, q)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+        b = next(iter(bindings))
+        # position 1 of the call _san(p, q) is q
+        assert b.input_symbols == frozenset({"q"})
+
+    def test_transitive_sanitizer_produces_binding(self):
+        # outer returns inner's result; inner sanitizes. The chain
+        # is transitive via Phase 13 summaries.
+        src = (
+            "import html\n"
+            "def inner(s):\n"
+            "    return html.escape(s)\n"
+            "def outer(s):\n"
+            "    return inner(s)\n"
+            "def handle(x):\n"
+            "    y = outer(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+        assert next(iter(bindings)).callable == "outer"
+
+    def test_dynamic_helper_no_binding(self):
+        # Helper uses getattr — summary_unknown → no binding.
+        src = (
+            "def _dyn(o, name, s):\n"
+            "    return getattr(o, name)(s)\n"
+            "def handle(o, n, x):\n"
+            "    y = _dyn(o, n, x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_same_symbol_into_sanitized_and_unsanitized_no_binding(self):
+        # Review #1: helper sanitizes param a but passes param b
+        # through unchanged. Called with the SAME symbol x in both
+        # positions, x reaches the return unsanitized via b — so no
+        # binding may be synthesised (would be a false suppression one
+        # inter-proc level deeper than the wrong-variable case).
+        src = (
+            "import html\n"
+            "def helper(a, b):\n"
+            "    return html.escape(a) + b\n"
+            "def handle(x):\n"
+            "    y = helper(x, x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_distinct_symbols_into_multiarg_helper_binds_sanitized(self):
+        # Sibling of the above: distinct symbols, only the sanitized
+        # position's symbol is bound (the unsanitized b-symbol does not
+        # poison the binding for a's symbol).
+        src = (
+            "import html\n"
+            "def helper(a, b):\n"
+            "    return html.escape(a)\n"  # b never reaches return
+            "def handle(p, q):\n"
+            "    y = helper(p, q)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+        assert next(iter(bindings)).input_symbols == frozenset({"p"})
+
+    def test_keyword_dirty_flow_same_symbol_no_binding(self):
+        # x flows clean through positional ``a`` AND dirty through
+        # keyword ``b=x``. Pre-fix the keyword flow was invisible
+        # (only node.args were inspected), so the binding claimed x
+        # sanitized and the gate suppressed a real finding.
+        src = (
+            "import html\n"
+            "def _mix(a, b):\n"
+            "    return html.escape(a) + b\n"
+            "def handle(x):\n"
+            "    y = _mix(x, b=x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_keyword_dirty_flow_distinct_symbol_keeps_binding(self):
+        # A DIFFERENT symbol through the dirty keyword must not poison
+        # the sanitized one — x stays bound, z never appears.
+        src = (
+            "import html\n"
+            "def _mix(a, b):\n"
+            "    return html.escape(a) + b\n"
+            "def handle(x, z):\n"
+            "    y = _mix(x, b=z)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+        b = next(iter(bindings))
+        assert b.input_symbols == frozenset({"x"})
+
+    def test_unknown_keyword_is_uncertainty_no_binding(self):
+        # A keyword that matches no known parameter of the helper is
+        # uncertainty about where the symbol flows — decline to bind.
+        src = (
+            "import html\n"
+            "def _sanitize(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _sanitize(x, extra=x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_two_same_callee_calls_one_line_bind_by_column(self):
+        # Review #3: two calls to the SAME helper on one source line.
+        # Each synthetic binding must attach to its own call's args —
+        # resolved by (lineno, col_offset), not ast.walk order, which
+        # would map both to the first call.
+        src = (
+            "import html\n"
+            "def san(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(p, q):\n"
+            "    y = san(p) if san(q) else None\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert {b.input_symbols for b in bindings} == {
+            frozenset({"p"}), frozenset({"q"}),
+        }
+
+
+# ---------------------------------------------------------------------------
+# End-to-end verdicts
+# ---------------------------------------------------------------------------
+
+
+class TestVerdicts:
+    def test_sanitizer_in_helper_remains_a_structural_candidate(self):
+        src = (
+            "import html\n"
+            "def _sanitize(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _sanitize(x)\n"
+            "    render(y)\n"
+        )
+        result = _evaluate(src, "handle", ["x"], "y", 6)
+        assert result.verdict == VERDICT_CANDIDATE_ONLY, result.reason
+        assert result.suppress is False
+        assert result.value_bound_bindings  # original input/output role proof still holds
+        assert all(binding.unverified_source_contracts == frozenset({"exact_builtin_str_default_call", "html_text_or_quoted_attribute_sink_context_and_policy"})
+                   for binding in result.value_bound_bindings)
+
+    def test_bypass_via_passthrough_no_suppress(self):
+        src = (
+            "def _passthrough(s):\n"
+            "    return s\n"
+            "def handle(x):\n"
+            "    y = _passthrough(x)\n"
+            "    render(y)\n"
+        )
+        result = _evaluate(src, "handle", ["x"], "y", 5)
+        assert result.verdict == VERDICT_NO_SUPPRESS, result.reason
+
+    def test_some_branches_helper_no_suppress(self):
+        src = (
+            "import html\n"
+            "def _maybe(s, cond):\n"
+            "    if cond:\n"
+            "        return html.escape(s)\n"
+            "    return s\n"
+            "def handle(x, c):\n"
+            "    y = _maybe(x, c)\n"
+            "    render(y)\n"
+        )
+        result = _evaluate(src, "handle", ["x"], "y", 8)
+        assert result.verdict == VERDICT_NO_SUPPRESS, result.reason
+
+    def test_transitive_sanitization_preserves_unverified_contracts(self):
+        src = (
+            "import html\n"
+            "def inner(s):\n"
+            "    return html.escape(s)\n"
+            "def outer(s):\n"
+            "    return inner(s)\n"
+            "def handle(x):\n"
+            "    y = outer(x)\n"
+            "    render(y)\n"
+        )
+        result = _evaluate(src, "handle", ["x"], "y", 8)
+        assert result.verdict == VERDICT_CANDIDATE_ONLY, result.reason
+        assert result.suppress is False
+        assert result.value_bound_bindings  # original input/output role proof still holds
+        assert all(binding.unverified_source_contracts == frozenset({"exact_builtin_str_default_call", "html_text_or_quoted_attribute_sink_context_and_policy"})
+                   for binding in result.value_bound_bindings)
+
+    def test_same_symbol_dual_position_not_suppressed(self):
+        # End-to-end of the review #1 repro: taint reaches the sink via
+        # the unsanitized param, so the finding must survive.
+        src = (
+            "import html\n"
+            "def helper(a, b):\n"
+            "    return html.escape(a) + b\n"
+            "def handle(x):\n"
+            "    y = helper(x, x)\n"
+            "    render(y)\n"
+        )
+        result = _evaluate(src, "handle", ["x"], "y", 6)
+        assert result.verdict == VERDICT_NO_SUPPRESS, result.reason
+
+    def test_wrong_variable_via_helper_not_suppressed(self):
+        # Helper sanitizes other, but the sink reads user. The
+        # synthetic binding's output (z) doesn't match the sink_arg
+        # (user) → condition 3 fails → no suppression.
+        src = (
+            "import html\n"
+            "def _sanitize(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(user, other):\n"
+            "    z = _sanitize(other)\n"
+            "    render(user)\n"
+        )
+        result = _evaluate(src, "handle", ["user", "other"], "user", 6)
+        assert result.verdict != VERDICT_SUPPRESS, result.reason
+        assert result.value_bound_bindings == frozenset()  # wrong consumed symbol still fails condition 3
+
+
+# ---------------------------------------------------------------------------
+# Resolver integration — inter_proc_bindings populated end to end
+# ---------------------------------------------------------------------------
+
+
+class TestResolverIntegration:
+    def test_resolver_populates_inter_proc_bindings(self, tmp_path):
+        src = (
+            "import html\n"
+            "def _sanitize(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _sanitize(x)\n"
+            "    render(y)\n"
+        )
+        f = tmp_path / "app.py"
+        f.write_text(src, encoding="utf-8")
+        finding = {
+            "cwe": "CWE-79", "file_path": str(f),
+            "source_line": 4, "sink_line": 6, "language": "python",
+        }
+        resolved = resolve_finding(finding)
+        assert isinstance(resolved, ResolvedFinding)
+        assert len(resolved.inter_proc_bindings) == 1
+        # The summary remains visible, but carries no primitive input proof.
+        result = evaluate_finding(
+            resolved.cfg, [resolved.source_node], resolved.sink_node,
+            cwe=resolved.cwe, language=resolved.language,
+            source_symbols=resolved.source_symbols,
+            sink_arg=resolved.sink_arg,
+            extra_bindings=resolved.inter_proc_bindings,
+        )
+        assert result.verdict == VERDICT_CANDIDATE_ONLY, result.reason
+        assert result.suppress is False
+        assert result.value_bound_bindings
+        assert {binding.callable for binding in result.value_bound_bindings} == {"_sanitize"}
+        assert all(binding.unverified_source_contracts == frozenset({"exact_builtin_str_default_call", "html_text_or_quoted_attribute_sink_context_and_policy"})
+                   for binding in result.value_bound_bindings)
+
+    def test_resolver_no_helper_empty_bindings(self, tmp_path):
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        f = tmp_path / "app.py"
+        f.write_text(src, encoding="utf-8")
+        finding = {
+            "cwe": "CWE-79", "file_path": str(f),
+            "source_line": 2, "sink_line": 4, "language": "python",
+        }
+        resolved = resolve_finding(finding)
+        assert isinstance(resolved, ResolvedFinding)
+        assert resolved.inter_proc_bindings == frozenset()
+
+    def test_cpp_finding_has_empty_inter_proc_bindings(self, tmp_path):
+        src = (
+            "extern char *g_markup_escape_text(const char *, long);\n"
+            "extern void render(const char *);\n"
+            "void handle(const char *x) {\n"
+            "    const char *y = g_markup_escape_text(x, -1);\n"
+            "    render(y);\n"
+            "}\n"
+        )
+        f = tmp_path / "app.c"
+        f.write_text(src, encoding="utf-8")
+        finding = {
+            "cwe": "CWE-79", "file_path": str(f),
+            "source_line": 3, "sink_line": 5, "language": "c",
+        }
+        resolved = resolve_finding(finding)
+        # C/C++ resolution either succeeds (tree-sitter present) with
+        # empty inter_proc_bindings, or fails cleanly. Either way no
+        # crash and no Python inter-proc bindings.
+        if isinstance(resolved, ResolvedFinding):
+            assert resolved.inter_proc_bindings == frozenset()
+
+
+class TestStarredArgsDeclineBinding:
+    def test_star_unpack_before_named_arg_no_binding(self):
+        # ``helper(*rest, x)`` places x at AST index 1 but runtime
+        # position 1 + len(rest) — index-based mapping claims x lands
+        # in the cleanly-sanitized parameter (index 1 here) when at
+        # runtime it lands elsewhere. The sanitized position must be
+        # the one x's AST index hits, or the pre-fix code never minted
+        # a binding and the test was vacuous.
+        src = (
+            "import html\n"
+            "def _clean(raw, s):\n"
+            "    return str(len(raw)) + html.escape(s)\n"
+            "def handle(x, rest):\n"
+            "    y = _clean(*rest, x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_no_star_still_binds(self):
+        src = (
+            "import html\n"
+            "def _clean(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _clean(x)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+
+
+class TestOpaqueArgsDeclineBinding:
+    """Non-Name, non-Constant arguments at return-tainting positions.
+
+    The dirty-symbol exclusion reasons over bare names; an opaque
+    expression (``g(x)``, ``x.attr``, ``x + ""``, ``d[k]``) at a
+    return-tainting unsanitized position carries taint the exclusion
+    cannot see, so the whole binding must decline. ``helper(a, b):
+    return html.escape(a) + b`` called as ``helper(x, g(x))`` binds
+    ``escape(x) + g(x)`` — tainted — into y; a binding claiming x
+    cleanly sanitized would hard-suppress ``render(y)``.
+    """
+
+    _MIX = (
+        "import html\n"
+        "def _mix(a, b):\n"
+        "    return html.escape(a) + b\n"
+    )
+
+    def test_nested_call_at_dirty_position_no_binding(self):
+        src = self._MIX + (
+            "def handle(x):\n"
+            "    y = _mix(x, g(x))\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_attribute_at_dirty_position_no_binding(self):
+        src = self._MIX + (
+            "def handle(x):\n"
+            "    y = _mix(x, x.attr)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_binop_at_dirty_position_no_binding(self):
+        src = self._MIX + (
+            "def handle(x):\n"
+            "    y = _mix(x, x + \"\")\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_keyword_opaque_at_dirty_position_no_binding(self):
+        src = self._MIX + (
+            "def handle(x):\n"
+            "    y = _mix(x, b=g(x))\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_kwargs_expansion_no_binding(self):
+        # ``**opts`` can route taint through its VALUES into any
+        # parameter; excluding the mapping's own name is not enough.
+        src = self._MIX + (
+            "def handle(x, opts):\n"
+            "    y = _mix(x, **opts)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_literal_at_dirty_position_still_binds(self):
+        # A literal cannot carry taint — the exemption keeps the
+        # common ``helper(x, "suffix")`` shape suppressible.
+        src = self._MIX + (
+            "def handle(x):\n"
+            "    y = _mix(x, \"suffix\")\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+        assert next(iter(bindings)).input_symbols == frozenset({"x"})
+
+    def test_opaque_at_non_tainting_position_still_binds(self):
+        # Position b never reaches the return — an opaque value there
+        # is irrelevant to the return's cleanliness.
+        src = (
+            "import html\n"
+            "def _log_and_clean(s, note):\n"
+            "    log(note)\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _log_and_clean(x, g(x))\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert len(bindings) == 1
+
+    def test_extra_positional_args_no_binding(self):
+        # More positional args than the summary has params: the
+        # extras have no parameter mapping (vararg helpers) —
+        # uncertainty declines.
+        src = (
+            "import html\n"
+            "def _clean(s, *rest):\n"
+            "    return html.escape(s)\n"
+            "def handle(x, w):\n"
+            "    y = _clean(x, w, w)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handle")
+        assert bindings == frozenset()
+
+    def test_verdict_not_suppressed_for_opaque_dirty_arg(self):
+        # End-to-end: the gate must not hard-suppress render(y) when
+        # y = escape(x) + g(x) at runtime.
+        src = self._MIX + (
+            "def handle(x):\n"
+            "    y = _mix(x, g(x))\n"
+            "    render(y)\n"
+        )
+        result = _evaluate(src, "handle", ["x"], "y", 5)
+        assert not result.suppress
+
+
+# ---------------------------------------------------------------------------
+# Vararg positional-binding boundary
+# ---------------------------------------------------------------------------
+
+
+class TestVarargBoundary:
+    """The positional-overflow decline compares against the summary's
+    params length — which lists the *vararg and keyword-only names as
+    ordinary entries. An exact-params-length call to a vararg helper
+    therefore passed the check while index mapping walked THROUGH the
+    vararg slot onto a keyword-only param the call never binds,
+    minting a clean-sanitizer binding for a value that rides the
+    vararg tuple unsanitized."""
+
+    def test_exact_length_call_to_vararg_helper_declines(self):
+        src = (
+            "import html\n"
+            "def helper(a, *rest, key=''):\n"
+            "    return html.escape(a) + html.escape(key) + str(rest)\n"
+            "def handler(x, y, z):\n"
+            "    clean = helper(x, y, z)\n"
+            "    render(clean)\n"
+        )
+        _, bindings = _bindings_for(src, "handler")
+        # Pre-fix: positions 0 and 2 read as cleanly sanitized, so a
+        # binding claimed z sanitized while it lands in ``rest``.
+        assert bindings == frozenset()
+
+    def test_call_below_vararg_boundary_still_binds(self):
+        src = (
+            "import html\n"
+            "def helper(a, *rest, key=''):\n"
+            "    return html.escape(a) + html.escape(key) + str(rest)\n"
+            "def handler(x):\n"
+            "    clean = helper(x)\n"
+            "    render(clean)\n"
+        )
+        _, bindings = _bindings_for(src, "handler")
+        assert len(bindings) == 1
+        assert "x" in next(iter(bindings)).input_symbols
+
+    def test_exact_length_vararg_call_never_suppresses_e2e(self):
+        # End-to-end repro of the live false suppression: the helper
+        # sanitizes only ``a`` and returns ``rest[0]`` raw, yet the
+        # exact-length call earned a binding claiming ``x`` sanitized
+        # and the gate suppressed on it while ``w`` reaches the sink
+        # through the vararg tuple unsanitized.
+        src = (
+            "import html\n"
+            "def _mix(a, *rest):\n"
+            "    return html.escape(a) + rest[0]\n"
+            "def handler(x, w):\n"
+            "    y = _mix(x, w)\n"
+            "    render(y)\n"
+        )
+        _, bindings = _bindings_for(src, "handler")
+        assert bindings == frozenset()
+        for source in ({"x"}, {"w"}, {"x", "w"}):
+            result = _evaluate(src, "handler", source, "y", 6)
+            assert result.suppress is False, source
+
+    def test_keyword_naming_the_vararg_slot_declines(self):
+        # ``rest=...`` cannot bind the vararg slot at runtime — a
+        # keyword matching a non-keyword-bindable name is the same
+        # no-trustworthy-position uncertainty as an unknown keyword,
+        # so the whole binding declines (pre-fix it mapped ``rest`` to
+        # its params index and kept the binding).
+        src = (
+            "import html\n"
+            "def helper(a='', *rest):\n"
+            "    return html.escape(a) + str(rest)\n"
+            "def handler(x, y):\n"
+            "    clean = helper(x, rest=y)\n"
+            "    render(clean)\n"
+        )
+        _, bindings = _bindings_for(src, "handler")
+        assert bindings == frozenset()
+
+
+class TestShadowedCalleeNoBinding:
+    """synthetic_sanitizer_bindings joins call-site names against the
+    module summary table. A local binding of the callee's root name
+    in the analysed function means the runtime callee may not be the
+    table's helper — no binding may be minted (the enforced
+    sanitizer-cut consumes these directly)."""
+
+    def _bindings(self, src: str, fn_name: str = "handle"):
+        import ast as _ast
+
+        from core.analysis.cfg_builder import build_python_cfg
+        from core.analysis.interproc import synthetic_sanitizer_bindings
+        from core.analysis.python_module_callgraph import (
+            build_python_module_callgraph,
+        )
+        from core.analysis.taint_summaries import build_taint_summaries
+
+        cg = build_python_module_callgraph(src)
+        assert cg is not None
+        summaries = build_taint_summaries(cg, src)
+        cfg = build_python_cfg(src, fn_name)
+        assert cfg is not None
+        fn_ast = next(
+            n for n in _ast.walk(_ast.parse(src))
+            if isinstance(n, _ast.FunctionDef) and n.name == fn_name
+        )
+        return synthetic_sanitizer_bindings(
+            cfg, fn_ast, summaries, "CWE-79", "python",
+        )
+
+    def test_local_rebind_shadow_no_binding(self):
+        src = (
+            "import html\n"
+            "def esc(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    esc = str\n"
+            "    y = esc(x)\n"
+            "    render(y)\n"
+        )
+        assert self._bindings(src) == frozenset()
+
+    def test_param_shadow_no_binding(self):
+        src = (
+            "import html\n"
+            "def esc(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x, esc):\n"
+            "    y = esc(x)\n"
+            "    render(y)\n"
+        )
+        assert self._bindings(src) == frozenset()
+
+    def test_unshadowed_helper_still_binds(self):
+        src = (
+            "import html\n"
+            "def esc(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = esc(x)\n"
+            "    render(y)\n"
+        )
+        bindings = self._bindings(src)
+        assert len(bindings) == 1
+        assert next(iter(bindings)).callable == "esc"
+
+
+class TestClosureSyntheticBindingIdentity:
+    def test_enclosing_parameter_does_not_select_module_helper_summary(self):
+        source = ('import html\ndef esc(value):\n    return html.escape(value)\n'
+                  'def outer(esc):\n    def handle(x):\n        y = esc(x)\n        render(y)\n    return handle\n')
+        assert TestShadowedCalleeNoBinding()._bindings(source) == frozenset()

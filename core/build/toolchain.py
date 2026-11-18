@@ -7,11 +7,15 @@ broaden exposure for every non-that-language user (prompt-injection
 amplification — see PR #210 threat-model notes).
 
 Instead, each build-system entry in
-`packages/codeql/build_detector.BUILD_SYSTEMS` declares an
+`core/build/build_detector.BUILD_SYSTEMS` declares an
 `env_detect: List[str]` naming the vars it needs. At build time, this
 module resolves each name by filesystem probing — never by reading
-`os.environ` (which would re-admit the operator's shell quirks we're
-trying to keep out of the sandbox).
+the requested variable from `os.environ` (which would re-admit the
+operator's shell quirks we're trying to keep out of the sandbox).
+Two scoped `$HOME` consultations are the documented exceptions, both
+away from the hostile direction: JAVA_HOME REFUSES a resolution that
+is the user's home dir, and RUSTUP_HOME falls back to `$HOME/.rustup`
+only after the kernel-ratified `pwd` lookup fails.
 
 Detection strategy per var:
 
@@ -36,12 +40,16 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from typing import Callable, Dict, Iterable, Optional
+import subprocess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_from_which(cmd: str, strip_suffix: str) -> Optional[str]:
+def _resolve_from_which(cmd: str, strip_suffix: str) -> str | None:
     """Locate `cmd` on PATH, readlink to the real binary, strip a
     trailing path suffix to reveal the install root.
 
@@ -69,7 +77,7 @@ def _resolve_from_which(cmd: str, strip_suffix: str) -> Optional[str]:
     return home or None
 
 
-def detect_JAVA_HOME() -> Optional[str]:
+def detect_JAVA_HOME() -> str | None:
     """Resolve JAVA_HOME from the host. See module docstring for order."""
     import sys as _sys
     # 1. Debian/Ubuntu convention
@@ -90,9 +98,12 @@ def detect_JAVA_HOME() -> Optional[str]:
         macos_helper = "/usr/libexec/java_home"
         if os.path.isfile(macos_helper) and os.access(macos_helper, os.X_OK):
             try:
-                import subprocess
-                r = subprocess.run(
+                # Trusted-probe doctrine (see build_detector._PROBE_CWD):
+                # safe env + neutral cwd, never the caller's.
+                from core.sandbox import run_trusted
+                r = run_trusted(
                     [macos_helper], capture_output=True, text=True, timeout=5,
+                    cwd=os.sep,
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     candidate = r.stdout.strip()
@@ -115,7 +126,7 @@ def detect_JAVA_HOME() -> Optional[str]:
     return None
 
 
-def detect_GOROOT() -> Optional[str]:
+def detect_GOROOT() -> str | None:
     """Resolve GOROOT: readlink of `which go`, strip /bin/go."""
     home = _resolve_from_which("go", "bin/go")
     if home and os.path.isdir(home):
@@ -123,7 +134,7 @@ def detect_GOROOT() -> Optional[str]:
     return None
 
 
-def detect_DOTNET_ROOT() -> Optional[str]:
+def detect_DOTNET_ROOT() -> str | None:
     """Resolve DOTNET_ROOT: dotnet is installed with `dotnet` at the
     root, not under a bin/ subdir on most distros — strip only the
     trailing filename.
@@ -164,7 +175,7 @@ def detect_DOTNET_ROOT() -> Optional[str]:
     return root
 
 
-def detect_RUSTUP_HOME() -> Optional[str]:
+def detect_RUSTUP_HOME() -> str | None:
     """Resolve RUSTUP_HOME. Default is ~/.rustup when rustup is
     installed via rustup-init. Don't probe ~ without checking — some
     hosts have no real home dir (containers, CI). Use
@@ -175,10 +186,12 @@ def detect_RUSTUP_HOME() -> Optional[str]:
     rustup_bin = shutil.which("rustup")
     if rustup_bin:
         try:
-            import subprocess
-            r = subprocess.run(
+            # Trusted-probe doctrine: safe env + neutral cwd.
+            from core.sandbox import run_trusted
+            r = run_trusted(
                 [rustup_bin, "show", "home"],
                 capture_output=True, text=True, timeout=5,
+                cwd=os.sep,
             )
             if r.returncode == 0 and r.stdout.strip():
                 candidate = r.stdout.strip()
@@ -217,7 +230,7 @@ def detect_RUSTUP_HOME() -> Optional[str]:
 # resolve to callables here. Keeping this as a dict (not getattr on
 # module) makes it explicit what's supported and lets tests iterate
 # the set.
-DETECTORS: Dict[str, Callable[[], Optional[str]]] = {
+DETECTORS: dict[str, Callable[[], str | None]] = {
     "JAVA_HOME": detect_JAVA_HOME,
     "GOROOT": detect_GOROOT,
     "DOTNET_ROOT": detect_DOTNET_ROOT,
@@ -225,8 +238,8 @@ DETECTORS: Dict[str, Callable[[], Optional[str]]] = {
 }
 
 
-def apply_toolchain_env(env: Dict[str, str],
-                        var_names: Iterable[str]) -> Dict[str, str]:
+def apply_toolchain_env(env: dict[str, str],
+                        var_names: Iterable[str]) -> dict[str, str]:
     """Merge auto-detected toolchain env vars into `env` in place, return it.
 
     For each name in `var_names`, call the matching detector in
@@ -240,11 +253,12 @@ def apply_toolchain_env(env: Dict[str, str],
     """
     for name in var_names:
         if name not in DETECTORS:
-            raise ValueError(
+            msg = (
                 f"core/build/toolchain.py: no detector for env_detect "
                 f"entry {name!r}. Add a detect_{name}() helper or "
                 f"remove the name from BUILD_SYSTEMS.env_detect."
             )
+            raise ValueError(msg)
         # Treat detector failures as "not found" rather than
         # propagating — a detector crash on an exotic distro (odd
         # filesystem, broken shutil.which, subprocess timeout)
@@ -267,27 +281,77 @@ def apply_toolchain_env(env: Dict[str, str],
             value = DETECTORS[name]()
         except expected_failures as e:
             logger.warning(
-                f"build toolchain: detector for {name} raised "
-                f"{type(e).__name__}: {e} — treating as not found."
-            )
+                "build toolchain: detector for %s raised %s: %s — treating as not found.", name, type(e).__name__, e)
             value = None
-        except Exception as e:  # noqa: BLE001
-            logger.error(
+        except Exception as e:
+            logger.exception(
                 "build toolchain: detector for %s raised "
-                "unexpected %s: %s — treating as not found "
+                "unexpected %s — treating as not found "
                 "(this is likely a programming bug, see traceback)",
-                name, type(e).__name__, e, exc_info=True,
+                name, type(e).__name__,
             )
             value = None
         if value is None:
             logger.warning(
-                f"build toolchain: {name} not found on this host — "
-                f"the build step will likely fail with a missing-"
-                f"toolchain error. Install the toolchain or set "
-                f"{name} explicitly via --build-env-file (future flag) "
-                f"/ via your shell and the sandbox's env= kwarg."
+                "build toolchain: %s not found on this host — the "
+                "build step will likely fail with a "
+                "missing-toolchain error. Install the toolchain, or "
+                "supply your own build via `/project set "
+                "build-command` (callers with a trusted env can also "
+                "pass %s through the sandbox's env= kwarg).",
+                name, name,
             )
             continue
         env[name] = value
-        logger.debug(f"build toolchain: {name}={value}")
+        logger.debug("build toolchain: %s=%s", name, value)
     return env
+
+
+def has_libasan() -> bool:
+    """True when this host can compile with ``-fsanitize=address``.
+
+    gcc may be present but libasan missing (common on minimal CI
+    images) — probe by compiling a no-op program. Used by the
+    exploit-verification harnesses to decide whether sanitizer-backed
+    execution witnesses are available; fail-closed on any surprise.
+    """
+    if shutil.which("gcc") is None:
+        return False
+    try:
+        # Trusted-probe doctrine: safe env + neutral cwd (a probe run
+        # with the caller's cwd inside a scanned repo picks up repo
+        # config; with its env, loader-injection vars).
+        from core.sandbox import run_trusted
+        result = run_trusted(
+            ["gcc", "-fsanitize=address", "-x", "c", "-",
+             "-o", "/dev/null"],
+            input="int main(void){return 0;}",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            cwd=os.sep,
+        )
+        return result.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def macos_sanitizer_timeout_hint(sanitizers: list[str] | None) -> str | None:
+    """Advice for a possible startup hang, never an execution diagnosis.
+
+    Do not probe or change toolchains here: the timed-out program may have
+    looped after startup, and its outcome must stay unknown.
+    """
+    import sys
+
+    if sys.platform != "darwin" or not ({"address", "thread"} & set(sanitizers or ())):
+        return None
+    return (
+        "An older selected Xcode sanitizer runtime can hang before main() on macOS. "
+        "Check xcode-select -p and xcrun clang++ --version; use a fixed toolchain "
+        "(Apple documents Xcode 26.4 or later). Newer Command Line Tools can be "
+        "installed while an older Xcode remains selected. RAPTOR sanitizes "
+        "DEVELOPER_DIR, so setting that variable alone may not select the new tools. "
+        "See docs/developers.md#addresssanitizer-on-macos. "
+        "This is a possible cause, not proof of a runtime failure."
+    )

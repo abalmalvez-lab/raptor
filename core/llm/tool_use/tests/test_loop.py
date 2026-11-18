@@ -8,6 +8,8 @@ those concerns are tested in the provider-specific test files.
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from typing import Any
 
@@ -26,11 +28,14 @@ from core.llm.tool_use import (
     ToolCall,
     ToolCallReturned,
     ToolDef,
+    ToolResult,
     TurnCompleted,
     TurnResponse,
     TurnStarted,
 )
 from core.llm.tool_use.loop import ToolUseLoop
+
+from core.testing.module_bindings import patch_module_attribute
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +175,34 @@ def test_terminates_on_complete_response() -> None:
     assert len(fp.calls) == 1
 
 
+def test_complete_with_tool_calls_still_dispatches() -> None:
+    """OpenAI-compat endpoints can end a turn with finish_reason
+    'stop' (mapped to COMPLETE) while the message still carries tool
+    calls. Returning at COMPLETE left the appended assistant message
+    holding dangling tool_use blocks and ignored the calls the model
+    requested — they must be dispatched like any tool-use turn."""
+    fp = _FakeProvider([
+        TurnResponse(
+            content=[ToolCall(id="c1", name="echo", input={"x": "1"})],
+            stop_reason=StopReason.COMPLETE,
+            input_tokens=10, output_tokens=5,
+        ),
+        _text_response("done"),
+    ])
+    loop = ToolUseLoop(fp, [_echo_tool()])
+    out = loop.run("go")
+    assert out.tool_calls_made == 1
+    assert out.terminated_by == "complete"
+    assert len(fp.calls) == 2
+    # The tool result made it into the history sent on the next turn —
+    # no dangling tool_use.
+    sent_second = fp.calls[1]["messages"]
+    assert any(
+        isinstance(b, ToolResult) and b.tool_use_id == "c1"
+        for m in sent_second for b in m.content
+    )
+
+
 def test_terminates_on_terminal_tool_call() -> None:
     """Loop terminates after dispatching the designated terminal tool;
     its input is surfaced on the result."""
@@ -205,6 +238,84 @@ def test_max_tokens_no_tool_calls_terminates_distinctly() -> None:
     assert out.terminated_by == "max_tokens"
     # final_text still reports the partial response.
     assert out.final_text == "partial..."
+
+
+def _nudge_loop(fp: Any, nudges: int) -> ToolUseLoop:
+    """Typed construction helper for the max_tokens-nudge tests."""
+    return ToolUseLoop(fp, [_echo_tool()], max_tokens_nudges=nudges)
+
+
+def test_max_tokens_nudge_recovers_truncated_turn() -> None:
+    """With ``max_tokens_nudges > 0``, a mid-turn MAX_TOKENS stop
+    injects a be-concise user nudge and continues instead of
+    terminating the run."""
+    fp = _FakeProvider([
+        TurnResponse(
+            content=[TextBlock(text="partial...")],
+            stop_reason=StopReason.MAX_TOKENS,
+            input_tokens=100, output_tokens=4096,
+        ),
+        _text_response("done after nudge"),
+    ])
+    out = _nudge_loop(fp, 2).run("go")
+    assert out.terminated_by == "complete"
+    assert out.final_text == "done after nudge"
+    assert len(fp.calls) == 2
+    # Second call carries the truncated assistant turn plus the nudge.
+    second_msgs = fp.calls[1]["messages"]
+    assert second_msgs[-1].role == "user"
+    assert "cut off" in second_msgs[-1].content[0].text
+    assert second_msgs[-2].role == "assistant"
+
+
+def test_max_tokens_nudge_budget_exhausts_to_terminal() -> None:
+    """The nudge budget is bounded: a model that keeps overflowing
+    still terminates with the honest ``max_tokens`` reason."""
+    truncated = TurnResponse(
+        content=[TextBlock(text="partial...")],
+        stop_reason=StopReason.MAX_TOKENS,
+        input_tokens=100, output_tokens=4096,
+    )
+    fp = _FakeProvider([truncated, truncated])
+    out = _nudge_loop(fp, 1).run("go")
+    assert out.terminated_by == "max_tokens"
+    assert len(fp.calls) == 2
+
+
+def test_max_tokens_nudge_drops_empty_truncated_assistant_turn() -> None:
+    """A truncated turn with no complete content blocks must not leave
+    an empty assistant message in history (providers reject those on
+    the next call)."""
+    fp = _FakeProvider([
+        TurnResponse(
+            content=[],
+            stop_reason=StopReason.MAX_TOKENS,
+            input_tokens=100, output_tokens=4096,
+        ),
+        _text_response("recovered"),
+    ])
+    out = _nudge_loop(fp, 1).run("go")
+    assert out.terminated_by == "complete"
+    second_msgs = fp.calls[1]["messages"]
+    assert all(m.content for m in second_msgs)
+    assert not any(
+        m.role == "assistant" and not m.content for m in second_msgs
+    )
+    # Token-accounting mirror stays zipped with assistant turns.
+    assert len(out.per_turn_tokens) == 1
+
+
+def test_max_tokens_default_stays_terminal() -> None:
+    """Default (``max_tokens_nudges=0``) keeps the pre-existing
+    terminal behaviour — no consumer is opted in silently."""
+    fp = _FakeProvider([TurnResponse(
+        content=[TextBlock(text="partial...")],
+        stop_reason=StopReason.MAX_TOKENS,
+        input_tokens=100, output_tokens=4096,
+    )])
+    out = _nudge_loop(fp, 0).run("go")
+    assert out.terminated_by == "max_tokens"
+    assert len(fp.calls) == 1
 
 
 def test_refused_no_tool_calls_terminates_distinctly() -> None:
@@ -299,6 +410,116 @@ def test_max_cost_usd_terminates_pre_flight() -> None:
     assert len(fp.calls) == 2
 
 
+def test_cost_budget_exception_carries_partial_messages() -> None:
+    """When the cost cap fires mid-run, the exception exposes the
+    partial conversation so callers can persist the trajectory up to
+    termination. Without this, a budget-capped run is invisible —
+    we never see what the model was thrashing on.
+    """
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {}), in_t=1000, out_t=1000),
+        _tool_call_response(("c2", "echo", {}), in_t=1000, out_t=1000),
+        _text_response("never reached", in_t=1000, out_t=1000),
+    ])
+    loop = ToolUseLoop(fp, [_echo_tool()], max_cost_usd=0.020)
+    try:
+        loop.run("expensive")
+        raise AssertionError("expected CostBudgetExceeded")
+    except CostBudgetExceeded as exc:
+        # initial user prompt + 2 assistant turns + 2 user tool-result
+        # turns = 5 messages survived.
+        assert len(exc.messages) == 5
+        assert exc.tool_calls_made == 2
+
+
+# ---------------------------------------------------------------------------
+# Caller-supplied give-up predicate
+# ---------------------------------------------------------------------------
+
+
+def test_should_continue_false_terminates_with_give_up() -> None:
+    """A ``should_continue`` predicate returning False halts the loop
+    cleanly with ``terminated_by='give_up'``. Pre-flight check at the
+    top of each iteration, so the False decision blocks the next
+    provider call rather than mid-turn cleanup."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {})),
+        _tool_call_response(("c2", "echo", {})),  # never reached
+    ])
+    call_count = {"n": 0}
+
+    def predicate() -> bool:
+        call_count["n"] += 1
+        # Continue for one iteration, then give up.
+        return call_count["n"] <= 1
+
+    out = ToolUseLoop(
+        fp, [_echo_tool()], should_continue=predicate,
+    ).run("loop")
+    assert out.terminated_by == "give_up"
+    assert out.iterations == 1
+    assert out.tool_calls_made == 1
+    assert len(fp.calls) == 1  # second response was never consumed
+    assert call_count["n"] == 2  # called pre-iter 0 (True) + pre-iter 1 (False)
+
+
+def test_should_continue_raising_is_non_fatal(caplog) -> None:
+    """A predicate that raises must not crash the loop — the
+    exception is swallowed and the iteration proceeds as if the
+    predicate returned True. Catches programming errors in the
+    caller's predicate without aborting a long-running run. The
+    exception is logged at WARNING so the bug is visible to
+    operators (silent swallow would be a diagnosis hazard)."""
+    fp = _FakeProvider([_text_response("done")])
+
+    def boom() -> bool:
+        raise RuntimeError("predicate crashed")
+
+    with caplog.at_level(logging.WARNING, logger="core.llm.tool_use.loop"):
+        out = ToolUseLoop(
+            fp, [_echo_tool()], should_continue=boom,
+        ).run("safe")
+    assert out.terminated_by == "complete"
+    # The predicate-crash exception must be logged so a buggy
+    # predicate is diagnosable.
+    assert any(
+        "should_continue predicate raised" in r.message
+        for r in caplog.records
+    ), f"expected WARNING about predicate crash, got: {caplog.records}"
+
+
+def test_should_continue_emits_give_up_event() -> None:
+    """The structured event stream surfaces ``LoopTerminated(reason=
+    "give_up")`` so subscribers can distinguish caller-driven
+    termination from cost / time / iteration caps."""
+    events: list[LoopEvent] = []
+    fp = _FakeProvider([_tool_call_response(("c1", "echo", {}))])
+    ToolUseLoop(
+        fp, [_echo_tool()],
+        should_continue=lambda: False,
+        events=events.append,
+    ).run("loop")
+    terminated = [e for e in events if isinstance(e, LoopTerminated)]
+    assert len(terminated) == 1
+    assert terminated[0].reason == "give_up"
+
+
+def test_should_continue_true_is_no_op() -> None:
+    """A predicate that always returns True leaves loop behaviour
+    unchanged — terminates on the model's COMPLETE response, not
+    on the predicate. Regression guard against accidentally
+    short-circuiting valid loops."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {})),
+        _text_response("done"),
+    ])
+    out = ToolUseLoop(
+        fp, [_echo_tool()], should_continue=lambda: True,
+    ).run("loop")
+    assert out.terminated_by == "complete"
+    assert out.tool_calls_made == 1
+
+
 def test_max_seconds_terminates_pre_flight(monkeypatch) -> None:
     """Wall-clock budget caps the whole run. Pre-flight check before
     each iteration; once elapsed >= max_seconds, the loop returns a
@@ -313,7 +534,14 @@ def test_max_seconds_terminates_pre_flight(monkeypatch) -> None:
         v = clock["t"]
         clock["t"] += 4.0
         return v
-    monkeypatch.setattr("core.llm.tool_use.loop.time.monotonic", _tick)
+    # Patch via the imported-module handle rather than the dotted
+    # string. pytest 8+ resolves "core.llm.tool_use.loop.time.monotonic"
+    # by walking the package namespace; ``core.llm.tool_use.__init__``
+    # does not re-export ``loop`` as an attribute, so the walk fails
+    # at the ``.loop`` step. Using the module object directly skips
+    # the resolver and works on every pytest version.
+    from core.llm.tool_use import loop as _loop_mod
+    patch_module_attribute(monkeypatch, _loop_mod, "time", "monotonic", _tick)
 
     fp = _FakeProvider([
         _tool_call_response(("c1", "echo", {})),
@@ -534,6 +762,41 @@ def test_context_overflow_truncate_raises_when_exhausted() -> None:
     assert len(fp.calls) == 0
 
 
+def test_context_overflow_carries_partial_state_after_tool_call() -> None:
+    """When the overflow fires AFTER a tool call has completed, the
+    exception's ``messages`` and ``tool_calls_made`` reflect the
+    partial work — caller can persist the trajectory up to the
+    point of termination, not just the empty-prompt state.
+
+    Covers both pre-flight RAISE paths: the initial estimate gate
+    AND the post-truncation 'still too large' gate share the same
+    partial-state contract.
+    """
+    # Window 50 tokens: the initial prompt + first tool round-trip
+    # fits, but the second iteration's pre-flight estimate (which
+    # includes the echo'd back tool result) tips over.
+    fp = _FakeProvider(
+        [
+            _tool_call_response(("c1", "echo", {"big": "x" * 400})),
+            _text_response("never reached"),
+        ],
+        ctx_window=50,
+    )
+    loop = ToolUseLoop(
+        fp, [_echo_tool()],
+        context_policy=ContextPolicy.RAISE,
+    )
+    try:
+        loop.run("go")
+        raise AssertionError("expected ContextOverflow")
+    except ContextOverflow as exc:
+        # One tool call completed before the overflow.
+        assert exc.tool_calls_made == 1
+        # Messages list includes the partial trajectory up to overflow.
+        # At minimum: initial user + assistant turn 0 + user tool_result.
+        assert len(exc.messages) >= 3
+
+
 def test_context_overflow_truncate_policy_drops_oldest() -> None:
     """TRUNCATE_OLDEST drops oldest history pairs until the request fits.
     The freshest user message is preserved so the model still has the
@@ -566,6 +829,56 @@ def test_context_overflow_truncate_policy_drops_oldest() -> None:
     )
 
 
+def test_truncate_never_leaves_assistant_first() -> None:
+    """In a plain text-turn history, dropping the oldest USER message
+    left an assistant message at the head — providers reject a
+    conversation that opens with an assistant turn, so the first
+    truncation produced a hard request rejection."""
+    # ~100 tokens per history message; window 260 fits after dropping
+    # the first user message, which puts the assistant turn at the head.
+    fp = _FakeProvider([_text_response("ok")], ctx_window=260)
+    loop = ToolUseLoop(fp, [], context_policy=ContextPolicy.TRUNCATE_OLDEST)
+    history = [
+        Message(role="user", content=[TextBlock(text="a" * 400)]),
+        Message(role="assistant", content=[TextBlock(text="b" * 400)]),
+        Message(role="user", content=[TextBlock(text="c" * 400)]),
+    ]
+    out = loop.run_with_history(history, "now")
+    assert out.terminated_by == "complete"
+    sent = fp.calls[0]["messages"]
+    assert sent[0].role == "user"
+    # The freshest user message is still preserved (adjacent
+    # behaviour of the drop-oldest policy unchanged).
+    assert sent[-1].role == "user"
+    assert any(
+        isinstance(b, TextBlock) and "now" in b.text
+        for b in sent[-1].content
+    )
+
+
+def test_truncate_never_leaves_dangling_tool_result_first() -> None:
+    """A tool_result whose tool_use pair was truncated away must not
+    lead the history either — providers reject a tool_result without
+    its matching tool_use."""
+    fp = _FakeProvider([_text_response("ok")], ctx_window=350)
+    loop = ToolUseLoop(fp, [], context_policy=ContextPolicy.TRUNCATE_OLDEST)
+    history = [
+        Message(role="user", content=[TextBlock(text="a" * 400)]),
+        Message(role="assistant", content=[
+            ToolCall(id="c1", name="echo", input={"x": "b" * 380}),
+        ]),
+        Message(role="user", content=[
+            ToolResult(tool_use_id="c1", content="r" * 400),
+        ]),
+        Message(role="user", content=[TextBlock(text="c" * 400)]),
+    ]
+    out = loop.run_with_history(history, "now")
+    assert out.terminated_by == "complete"
+    sent = fp.calls[0]["messages"]
+    assert sent[0].role == "user"
+    assert not any(isinstance(b, ToolResult) for b in sent[0].content)
+
+
 # ---------------------------------------------------------------------------
 # Tool dispatch
 # ---------------------------------------------------------------------------
@@ -592,6 +905,46 @@ def test_handler_error_default_feeds_back_to_model() -> None:
     err = last_user_msg.content[0]
     assert err.is_error is True
     assert "oops" in err.content
+
+
+@pytest.mark.parametrize("bad_return", [None, {"k": "v"}, 42])
+def test_handler_non_str_return_feeds_back_as_error(bad_return) -> None:
+    """A handler returning non-str is a handler failure like any
+    other — pre-fix it reached preflight/wrap_tool_result (typed str)
+    and the TypeError escaped the per-tool containment, killing the
+    whole run with an unattributed traceback instead of an is_error
+    result."""
+    bad = ToolDef(name="bad", description="d", input_schema={},
+                  handler=lambda _inp: bad_return)
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "bad", {})),
+        _text_response("ok"),
+    ])
+    loop = ToolUseLoop(fp, [bad])
+    out = loop.run("go")
+    assert out.terminated_by == "complete"
+    second = fp.calls[1]["messages"]
+    err = second[-1].content[0]
+    assert err.is_error is True
+    assert "expected str" in err.content
+
+
+def test_handler_non_str_return_contained_on_timeout_path() -> None:
+    """Same containment when the handler runs under the timeout
+    watchdog thread."""
+    bad = ToolDef(name="bad", description="d", input_schema={},
+                  handler=lambda _inp: None)
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "bad", {})),
+        _text_response("ok"),
+    ])
+    loop = ToolUseLoop(fp, [bad], tool_timeout_s=5.0)
+    out = loop.run("go")
+    assert out.terminated_by == "complete"
+    second = fp.calls[1]["messages"]
+    err = second[-1].content[0]
+    assert err.is_error is True
+    assert "expected str" in err.content
 
 
 def test_handler_error_terminate_on_error_propagates() -> None:
@@ -636,10 +989,11 @@ def test_unknown_tool_returns_error_result() -> None:
 
 def test_tool_timeout_returns_error_result() -> None:
     """A handler that exceeds ``tool_timeout_s`` produces an
-    ``is_error=True`` :class:`ToolResult` (sleeps in background but
-    we stop waiting)."""
+    ``is_error=True`` :class:`ToolResult`."""
+    release = threading.Event()
+
     def slow_handler(_inp: dict) -> str:
-        time.sleep(0.5)
+        release.wait(10)
         return "too late"
 
     slow = ToolDef(name="slow", description="d", input_schema={}, handler=slow_handler)
@@ -648,12 +1002,18 @@ def test_tool_timeout_returns_error_result() -> None:
         _text_response("ok"),
     ])
     loop = ToolUseLoop(fp, [slow], tool_timeout_s=0.05)
-    out = loop.run("go")
-    assert out.terminated_by == "complete"
-    second = fp.calls[1]["messages"]
-    last = second[-1].content[0]
-    assert last.is_error is True
-    assert "timeout" in last.content
+    try:
+        out = loop.run("go")
+        assert out.terminated_by == "complete"
+        second = fp.calls[1]["messages"]
+        last = second[-1].content[0]
+        assert last.is_error is True
+        assert "timeout" in last.content
+    finally:
+        release.set()
+        for worker in loop._stranded_tool_threads:
+            worker.join(timeout=5)
+            assert not worker.is_alive(), "tool handler did not stop"
 
 
 def test_tool_timeout_terminate_on_handler_error_raises() -> None:
@@ -663,8 +1023,10 @@ def test_tool_timeout_terminate_on_handler_error_raises() -> None:
     ``ToolHandlerTimeout`` instead of converting to a tool_result."""
     from core.llm.tool_use import LoopTerminated, ToolHandlerTimeout
 
+    release = threading.Event()
+
     def slow_handler(_inp: dict) -> str:
-        time.sleep(0.5)
+        release.wait(10)
         return "too late"
 
     slow = ToolDef(name="slow", description="d", input_schema={}, handler=slow_handler)
@@ -676,13 +1038,18 @@ def test_tool_timeout_terminate_on_handler_error_raises() -> None:
         terminate_on_handler_error=True,
         events=seen.append,
     )
-    with pytest.raises(ToolHandlerTimeout, match="exceeded"):
-        loop.run("go")
+    try:
+        with pytest.raises(ToolHandlerTimeout, match="exceeded"):
+            loop.run("go")
 
-    # LoopTerminated event was emitted with reason="tool_error" before
-    # the exception propagated.
-    final = next(e for e in seen if isinstance(e, LoopTerminated))
-    assert final.reason == "tool_error"
+        # LoopTerminated was emitted before the exception propagated.
+        final = next(e for e in seen if isinstance(e, LoopTerminated))
+        assert final.reason == "tool_timeout"
+    finally:
+        release.set()
+        for worker in loop._stranded_tool_threads:
+            worker.join(timeout=5)
+            assert not worker.is_alive(), "tool handler did not stop"
 
 
 def test_parallel_tool_calls_in_one_turn() -> None:
@@ -860,7 +1227,7 @@ def test_cache_breakpoint_count_reflects_optins_when_supported() -> None:
 # x-source provenance validation
 # ---------------------------------------------------------------------------
 
-from core.llm.tool_use import ToolCallBlocked
+from core.llm.tool_use import ToolCallBlocked  # noqa: E402
 
 
 def _discovered_tool(name: str = "lookup") -> ToolDef:
@@ -1088,3 +1455,573 @@ def test_xsource_slash_split_matches_components() -> None:
 
     blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
     assert len(blocked) == 0
+
+
+# ---------------------------------------------------------------------------
+# Submission-discipline hooks: turn-budget-note + no-tool-call nudge
+# ---------------------------------------------------------------------------
+
+
+def test_submission_warning_appended_to_user_message_when_callable_returns_text() -> None:
+    """When ``submission_warning`` is set and returns a non-empty
+    string, that string is appended as a TextBlock to the same user
+    message that carries the tool_results — so the model reads the
+    tool output and the prod-to-submit warning together on the next
+    turn. The text comes AFTER the tool results so the model parses
+    data first, advice second."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+    warning_arg_log: list = []
+
+    def _warn(state) -> str | None:
+        warning_arg_log.append(state)
+        return "SUBMIT SOON"
+
+    loop = ToolUseLoop(
+        fp,
+        [_echo_tool()],
+        max_iterations=5,
+        submission_warning=_warn,
+    )
+    out = loop.run("start")
+    # Callable saw "iters remaining after this turn" — 5 max, iter 0
+    # just finished, so 4 remain. SubmissionState carries the full
+    # context (iters + cost) so consumers can warn on either gate.
+    assert len(warning_arg_log) == 1
+    state = warning_arg_log[0]
+    assert state.iters_remaining == 4
+    assert state.iters_max == 5
+    assert state.cost_so_far > 0  # tool turn already accrued cost
+    assert state.cost_cap is None  # not set on this loop
+    # The user message carrying the tool result also carries the warning.
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    # 1st user is the initial prompt; 2nd is tool_result + warning.
+    tool_user = user_msgs[1]
+    text_blocks = [b for b in tool_user.content if isinstance(b, TextBlock)]
+    assert any(b.text == "SUBMIT SOON" for b in text_blocks)
+
+
+def test_submission_warning_suppressed_when_callable_returns_none() -> None:
+    """A consumer that only wants to warn near the budget cap returns
+    None on early iterations; the user message has no warning TextBlock."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+
+    def _warn_only_near_end(state) -> str | None:
+        return "SUBMIT" if state.iters_remaining <= 2 else None
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=10,
+        submission_warning=_warn_only_near_end,
+    )
+    out = loop.run("start")
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    tool_user = user_msgs[1]
+    text_blocks = [b for b in tool_user.content if isinstance(b, TextBlock)]
+    # 9 iterations remain; warning suppressed.
+    assert text_blocks == []
+
+
+def test_submission_warning_callable_exception_logged_but_does_not_crash_loop(
+    caplog,
+) -> None:
+    """If the submission_warning callable raises, the loop must NOT
+    crash — log a warning and treat this iteration as "no warning."
+    A bug in the consumer's nudge logic can't take down an expensive
+    in-flight run."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+
+    def _broken(state) -> str | None:
+        raise RuntimeError("nudge bug")
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=5,
+        submission_warning=_broken,
+    )
+    with caplog.at_level(logging.WARNING, logger="core.llm.tool_use.loop"):
+        out = loop.run("start")
+    # Loop completed normally.
+    assert out.terminated_by == "complete"
+    # Warning was logged.
+    assert any("submission_warning callable raised" in r.message for r in caplog.records)
+
+
+def test_in_fire_mutator_appended_to_user_message_when_callable_returns_text() -> None:
+    """When ``in_fire_mutator`` is set and returns non-empty text, that
+    text is appended as a TextBlock to the same user message carrying
+    the tool_results — steering hints reach the model interleaved with
+    its own tool output on the next turn."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+    calls: list = []
+
+    def _mutator(ctx) -> str | None:
+        calls.append(ctx)
+        return "researcher note: try shape X"
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=5,
+        in_fire_mutator=_mutator,
+    )
+    out = loop.run("start")
+    assert len(calls) == 1
+    ctx = calls[0]
+    assert ctx.iteration == 0
+    assert ctx.iters_remaining == 4
+    assert ctx.iters_max == 5
+    assert ctx.cost_so_far > 0
+    # tool_results carried through immutably.
+    assert len(ctx.tool_results) == 1
+    # Messages snapshot includes assistant response.
+    assert len(ctx.messages) >= 2
+    # Steering appears in the tool-result user message.
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    tool_user = user_msgs[1]
+    text_blocks = [b for b in tool_user.content if isinstance(b, TextBlock)]
+    assert any(
+        b.text == "researcher note: try shape X" for b in text_blocks
+    )
+
+
+def test_in_fire_mutator_suppressed_when_callable_returns_none() -> None:
+    """A mutator that has nothing to add returns None; the user message
+    reads exactly as it would without the hook (byte-identical semantics
+    for that path)."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=5,
+        in_fire_mutator=lambda ctx: None,
+    )
+    out = loop.run("start")
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    tool_user = user_msgs[1]
+    text_blocks = [b for b in tool_user.content if isinstance(b, TextBlock)]
+    assert text_blocks == []
+
+
+def test_in_fire_mutator_callable_exception_logged_but_does_not_crash_loop(
+    caplog,
+) -> None:
+    """If the mutator raises, log it and continue — a bug in the
+    steering logic must not take down an expensive in-flight run."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+
+    def _broken(ctx) -> str | None:
+        raise RuntimeError("mutator bug")
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=5,
+        in_fire_mutator=_broken,
+    )
+    with caplog.at_level(logging.WARNING, logger="core.llm.tool_use.loop"):
+        out = loop.run("start")
+    assert out.terminated_by == "complete"
+    assert any(
+        "in_fire_mutator callable raised" in r.message
+        for r in caplog.records
+    )
+
+
+def test_in_fire_mutator_skipped_on_terminal_tool_turn() -> None:
+    """When the terminal tool fires, the model has just submitted and
+    the loop is about to exit — a steering nudge after that is noise.
+    Skip the hook on the terminal-tool turn."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "submit_answer", {"answer": "final"})),
+        _text_response("ok"),
+    ])
+    calls: list = []
+
+    def _mutator(ctx) -> str | None:
+        calls.append(ctx)
+        return "steering"
+
+    loop = ToolUseLoop(
+        fp,
+        [_echo_tool(), _echo_tool("submit_answer")],
+        max_iterations=5,
+        terminal_tool="submit_answer",
+        in_fire_mutator=_mutator,
+    )
+    loop.run("start")
+    # No calls — the only iteration fired the terminal tool.
+    assert calls == []
+
+
+def test_submission_warning_state_carries_cost_when_cost_cap_set() -> None:
+    """When ``max_cost_usd`` is set on the loop, the SubmissionState
+    passed to the callable reports both cost_so_far AND cost_cap.
+    Lets consumers warn on cost-near-exhaustion when the model burns
+    cost faster than iterations (opus's profile, vs haiku which
+    typically burns iters faster). One-axis warnings miss this."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        _text_response("ok"),
+    ])
+    seen: list = []
+
+    def _warn(state) -> str | None:
+        seen.append(state)
+        return None
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=10,
+        max_cost_usd=0.50,
+        submission_warning=_warn,
+    )
+    loop.run("start")
+    assert len(seen) == 1
+    state = seen[0]
+    assert state.cost_cap == 0.50
+    # Sample provider charges per-token; just verify the field is
+    # populated and within the cap (not asserting an exact value
+    # since the FakeProvider's pricing is fixture-defined).
+    assert 0 < state.cost_so_far <= 0.50
+    assert state.iters_max == 10
+
+
+def test_nudge_on_no_tool_call_continues_loop_instead_of_terminating() -> None:
+    """When ``nudge_on_no_tool_call`` is set and the assistant turn
+    returns no tool_use blocks AND a soft stop (StopReason.COMPLETE),
+    the loop injects the nudge as a user message and continues —
+    rather than terminating with ``terminated_by="complete"`` which
+    is the default. Gives the model a chance to re-engage the tools
+    before iteration cap.
+
+    Practical wiring uses ``terminal_tool`` alongside the nudge so the
+    loop exits cleanly once the model finalises (e.g. /exploit's
+    ``verify_run`` / ``submit_exploit``). Without a terminal tool the
+    nudge would keep firing every COMPLETE turn until iteration cap,
+    which is the intended behaviour — operators set the nudge
+    explicitly when they want that loop pressure."""
+    submit = ToolDef(
+        name="submit",
+        description="finalise the work",
+        input_schema={"type": "object"},
+        handler=lambda inp: "submitted",
+    )
+    fp = _FakeProvider([
+        # First turn: model emits text only, no tool calls — nudge fires.
+        _text_response("hmm let me think"),
+        # Second turn (post-nudge): model uses the submit terminal tool.
+        _tool_call_response(("c1", "submit", {"answer": "x"})),
+    ])
+    loop = ToolUseLoop(
+        fp, [submit], max_iterations=5,
+        terminal_tool="submit",
+        nudge_on_no_tool_call="Use the tools; do not just emit prose.",
+    )
+    out = loop.run("start")
+    # Terminal tool fires → loop exits cleanly.
+    assert out.terminated_by == "terminal_tool"
+    # Confirm the nudge landed in the conversation exactly once.
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    nudge_text_blocks = [
+        b for m in user_msgs for b in m.content
+        if isinstance(b, TextBlock)
+        and "Use the tools" in b.text
+    ]
+    assert len(nudge_text_blocks) == 1
+
+
+def test_nudge_on_no_tool_call_does_not_fire_on_hard_errors() -> None:
+    """On a HARD stop (max_tokens / refused / provider_error), the
+    nudge does NOT fire — the model literally can't continue, and
+    injecting a nudge would burn budget without recovery. Terminates
+    with the matching reason as it did before the hook landed."""
+    fp = _FakeProvider([TurnResponse(
+        content=[TextBlock(text="partial...")],
+        stop_reason=StopReason.MAX_TOKENS,
+        input_tokens=100, output_tokens=4096,
+    )])
+    loop = ToolUseLoop(
+        fp, [_echo_tool()], max_iterations=5,
+        nudge_on_no_tool_call="SUBMIT",
+    )
+    out = loop.run("start")
+    assert out.terminated_by == "max_tokens"
+    # No nudge injected — the conversation ends at the assistant
+    # max_tokens turn (only initial user + assistant message).
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    assert len(user_msgs) == 1
+
+
+def test_nudge_default_none_preserves_legacy_terminate_on_text_only() -> None:
+    """When ``nudge_on_no_tool_call`` is None (default), text-only +
+    COMPLETE terminates the loop — the existing semantics every
+    other ToolUseLoop consumer depends on. Belt-and-braces vs.
+    accidentally changing the default."""
+    fp = _FakeProvider([_text_response("done")])
+    out = ToolUseLoop(fp, [_echo_tool()]).run("start")
+    assert out.terminated_by == "complete"
+    assert out.iterations == 1
+
+
+def test_both_hooks_compose() -> None:
+    """submission_warning + nudge_on_no_tool_call can be set together
+    on the same loop. The warning runs after every tool-result turn;
+    the nudge runs whenever the model emits text-only mid-task. Real
+    /exploit wiring pairs them with terminal_tool so the loop exits
+    cleanly once submit fires."""
+    submit = ToolDef(
+        name="submit",
+        description="finalise",
+        input_schema={"type": "object"},
+        handler=lambda inp: "submitted",
+    )
+    fp = _FakeProvider([
+        # Turn 1: text only — triggers nudge.
+        _text_response("thinking"),
+        # Turn 2: a regular tool call — triggers submission_warning.
+        _tool_call_response(("c1", "echo", {"a": 1})),
+        # Turn 3: terminal tool — exits.
+        _tool_call_response(("c2", "submit", {"answer": "x"})),
+    ])
+    warning_calls: list = []
+
+    def _warn(state) -> str | None:
+        warning_calls.append(state.iters_remaining)
+        return f"submit ({state.iters_remaining} left)"
+
+    loop = ToolUseLoop(
+        fp, [_echo_tool(), submit], max_iterations=5,
+        terminal_tool="submit",
+        submission_warning=_warn,
+        nudge_on_no_tool_call="use tools",
+    )
+    out = loop.run("start")
+    assert out.terminated_by == "terminal_tool"
+    # Warning was evaluated once — after the echo tool-call turn.
+    # (The submit-terminal turn exits before submission_warning fires.)
+    assert warning_calls == [3]
+    # Nudge text appears in conversation.
+    user_msgs = [m for m in out.messages if m.role == "user"]
+    nudge_count = sum(
+        1 for m in user_msgs for b in m.content
+        if isinstance(b, TextBlock) and "use tools" in b.text
+    )
+    warn_count = sum(
+        1 for m in user_msgs for b in m.content
+        if isinstance(b, TextBlock) and "submit (" in b.text
+    )
+    assert nudge_count == 1
+    assert warn_count == 1
+
+
+# ---------------------------------------------------------------------------
+# x-source: non-string carriers (container recursion)
+# ---------------------------------------------------------------------------
+
+
+def test_xsource_blocks_list_wrapped_value() -> None:
+    """The confirmed-live bypass: a list-wrapped undiscovered URL
+    dispatched while the identical string was blocked. Containers must
+    be recursed before the known_values check."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "lookup",
+                             {"slug": ["hallucinated/repo"]})),
+        _text_response("done"),
+    ])
+    events: list[LoopEvent] = []
+    loop = ToolUseLoop(fp, [_discovered_tool()], events=events.append)
+    loop.run("Analyze CVE-2024-1234")
+
+    blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
+    assert len(blocked) == 1
+    assert "slug" in blocked[0].blocked_fields
+    assert "hallucinated/repo" in blocked[0].blocked_fields["slug"]
+
+
+@pytest.mark.parametrize("carrier", [
+    {"nested": "hallucinated/repo"},                    # dict value
+    {"hallucinated/repo": "x"},                         # dict KEY
+    [["hallucinated/repo"]],                            # nested list
+    {"deep": [{"deeper": ["hallucinated/repo"]}]},      # mixed nesting
+])
+def test_xsource_blocks_container_carriers(carrier) -> None:
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "lookup", {"slug": carrier})),
+        _text_response("done"),
+    ])
+    events: list[LoopEvent] = []
+    loop = ToolUseLoop(fp, [_discovered_tool()], events=events.append)
+    loop.run("Analyze CVE-2024-1234")
+    blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
+    assert len(blocked) == 1, carrier
+
+
+def test_xsource_blocks_undiscovered_number() -> None:
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "lookup", {"slug": 2130706433})),
+        _text_response("done"),
+    ])
+    events: list[LoopEvent] = []
+    loop = ToolUseLoop(fp, [_discovered_tool()], events=events.append)
+    loop.run("Analyze CVE-2024-1234")
+    blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
+    assert len(blocked) == 1
+
+
+def test_xsource_passes_container_of_discovered_values() -> None:
+    """Containers whose every string was discovered still dispatch —
+    the recursion tightens carriers, not legitimate use."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "lookup",
+                             {"slug": ["openssl/openssl"]})),
+        _text_response("done"),
+    ])
+    events: list[LoopEvent] = []
+    loop = ToolUseLoop(fp, [_discovered_tool()], events=events.append)
+    loop.run("Check openssl/openssl for CVE-2024-1234")
+    blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
+    assert blocked == []
+
+
+def test_xsource_passes_none_and_bools() -> None:
+    """Structural scalars (None, booleans) are not value carriers."""
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "lookup",
+                             {"slug": None, "flag": True})),
+        _text_response("done"),
+    ])
+    events: list[LoopEvent] = []
+    loop = ToolUseLoop(fp, [_discovered_tool()], events=events.append)
+    loop.run("Analyze CVE-2024-1234")
+    blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
+    assert blocked == []
+
+
+def test_xsource_absurd_nesting_fails_closed() -> None:
+    payload: object = "hallucinated/repo"
+    for _ in range(30):
+        payload = [payload]
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "lookup", {"slug": payload})),
+        _text_response("done"),
+    ])
+    events: list[LoopEvent] = []
+    loop = ToolUseLoop(fp, [_discovered_tool()], events=events.append)
+    loop.run("Analyze CVE-2024-1234")
+    blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
+    assert len(blocked) == 1
+
+
+def test_truncate_single_orphaned_tool_result_raises_typed_error() -> None:
+    """A pathological history can truncate down to a SINGLE leading
+    tool-result message — a shape every provider rejects. The loop
+    must raise its typed ContextOverflow instead of shipping a
+    guaranteed request rejection."""
+    fp = _FakeProvider([_text_response("ok")], ctx_window=260)
+    loop = ToolUseLoop(fp, [], context_policy=ContextPolicy.TRUNCATE_OLDEST)
+    history = [
+        Message(role="user", content=[TextBlock(text="a" * 800)]),
+        # Plain assistant text (no ToolCall) so the pair-drop does not
+        # remove the trailing tool_result alongside it.
+        Message(role="assistant", content=[TextBlock(text="b" * 800)]),
+        Message(role="user", content=[
+            ToolResult(tool_use_id="c1", content="r" * 100),
+        ]),
+    ]
+    with pytest.raises(ContextOverflow, match="cannot open a conversation"):
+        loop.run_with_history(history, "")
+    assert len(fp.calls) == 0
+
+
+class TestPerTurnTokensScope:
+    """``per_turn_tokens`` covers assistant turns appended THIS RUN —
+    a resumed history contributes turns with no tuple, so the
+    documented contract must not promise a per-``messages`` zip."""
+
+    def test_resumed_history_turns_carry_no_tuple(self):
+        provider = _FakeProvider([_text_response("final", 7, 3)])
+        history = [
+            Message(role="user", content=[TextBlock(text="q1")]),
+            Message(role="assistant", content=[TextBlock(text="a1")]),
+            Message(role="user", content=[TextBlock(text="q2")]),
+            Message(role="assistant", content=[TextBlock(text="a2")]),
+        ]
+        loop = ToolUseLoop(provider, [_echo_tool()], max_iterations=2)
+        result = loop.run_with_history(list(history), "resume")
+        n_assistant = sum(
+            1 for m in result.messages if m.role == "assistant"
+        )
+        assert n_assistant == 3
+        # One tuple for the one turn THIS run added.
+        assert result.per_turn_tokens == ((7, 3),)
+
+
+class TestCacheBreakpointRemapOnTruncation:
+    """``cache_control.history_through_index`` is a message index;
+    truncation pops head messages, so the frozen constructor value
+    must shift down with them — otherwise the breakpoint silently
+    lands on an unintended message (cache-efficiency/telemetry only;
+    the bounds check prevents a crash). The caller's CacheControl is
+    never mutated."""
+
+    def test_index_remapped_after_head_drop(self):
+        provider = _FakeProvider(
+            [_text_response("done", 5, 2)], ctx_window=200,
+        )
+        big = "x" * 2000  # ~500 tokens — forces truncation at window 200
+        history = [
+            Message(role="user", content=[TextBlock(text=big)]),
+            Message(role="assistant", content=[TextBlock(text="a1")]),
+            Message(role="user", content=[TextBlock(text="keep-me")]),
+            Message(role="assistant", content=[TextBlock(text="a2")]),
+        ]
+        cc = CacheControl(history_through_index=3)
+        loop = ToolUseLoop(
+            provider, [_echo_tool()],
+            context_policy=ContextPolicy.TRUNCATE_OLDEST,
+            cache_control=cc, max_iterations=1,
+        )
+        result = loop.run_with_history(list(history), "resume")
+        assert result.terminated_by == "complete"
+        sent = provider.calls[0]
+        dropped = 5 - len(sent["messages"])  # history(4) + next(1)
+        assert dropped >= 2  # the oversized head pair went
+        received = sent["cache_control"]
+        assert received.history_through_index == 3 - dropped
+        # The breakpoint still names the message it originally named.
+        target = sent["messages"][received.history_through_index]
+        assert target.content[0].text == "a2"
+        # Caller's object untouched.
+        assert cc.history_through_index == 3
+
+    def test_breakpoint_dropped_with_its_message(self):
+        provider = _FakeProvider(
+            [_text_response("done", 5, 2)], ctx_window=200,
+        )
+        big = "x" * 2000
+        history = [
+            Message(role="user", content=[TextBlock(text=big)]),
+            Message(role="assistant", content=[TextBlock(text="a1")]),
+            Message(role="user", content=[TextBlock(text="q2")]),
+        ]
+        cc = CacheControl(history_through_index=0)
+        loop = ToolUseLoop(
+            provider, [_echo_tool()],
+            context_policy=ContextPolicy.TRUNCATE_OLDEST,
+            cache_control=cc, max_iterations=1,
+        )
+        loop.run_with_history(list(history), "resume")
+        received = provider.calls[0]["cache_control"]
+        # The indexed message was itself truncated away — no history
+        # breakpoint survives.
+        assert received.history_through_index is None

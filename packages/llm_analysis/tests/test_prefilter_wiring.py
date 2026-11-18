@@ -9,7 +9,7 @@ so the two consumers stay in lock-step on substrate semantics.
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
@@ -20,8 +20,8 @@ from packages.llm_analysis.prefilter import (
     FP_PREFILTER_SCHEMA,
     agentic_fp_analysis,
     prefilter_for_finding,
+    record_prefilter_outcomes,
 )
-
 
 # ---------------------------------------------------------------------------
 # Stub LLM and fixture (parallels test_scorecard_wiring.py:_build_llm)
@@ -95,15 +95,18 @@ def _build_llm(tmp_path):
     cfg.scorecard_shadow_rate = 0.0
 
     client = LLMClient.__new__(LLMClient)
+    from collections import OrderedDict
     client.config = cfg
     client.providers = {}
     client.total_cost = 0.0
     client.request_count = 0
     client.task_type_costs = {}
     client.short_circuits = 0
+    client._daily_quota_exhausted = set()
     client._stats_lock = threading.RLock()
-    client._key_locks = {}
+    client._key_locks = OrderedDict()
     client._key_locks_guard = threading.Lock()
+    client._key_locks_cap = 4096
     client._scorecard = None
 
     prov = _StubProvider()
@@ -112,7 +115,7 @@ def _build_llm(tmp_path):
     return client, prov
 
 
-def _finding(rule_id: str = "py/sql-injection") -> Dict[str, Any]:
+def _finding(rule_id: str = "py/sql-injection") -> dict[str, Any]:
     """A minimal /agentic-shaped finding dict."""
     return {
         "finding_id": "f1",
@@ -189,13 +192,16 @@ def test_learning_mode_returns_none_no_short_circuit(llm):
 def test_short_circuit_on_trusted_cell(llm):
     """Pre-seed scorecard with a trustworthy track record →
     SHORT_CIRCUIT → cheap says clear_fp → returns FP analysis dict and
-    bumps client.short_circuits."""
+    bumps client.short_circuits. Trust is seeded on the SAME target
+    the query names — the diversity gate's same-target grant is what
+    lets a single-repo track record spend here."""
     client, prov = llm
     sc = ModelScorecard(client.config.scorecard_path)
     for _ in range(150):
         sc.record_event(
             "agentic:py/sql-injection", "haiku-stub",
             EventType.CHEAP_SHORT_CIRCUIT, "correct",
+            repo="/proj/alpha",
         )
     client._scorecard = None  # force lazy reload from sidecar
 
@@ -204,7 +210,7 @@ def test_short_circuit_on_trusted_cell(llm):
                  "reasoning": "value is constant 'admin'"}, "raw")
     prov.responder = responder
 
-    result = prefilter_for_finding(client, _finding())
+    result = prefilter_for_finding(client, _finding(), repo="/proj/alpha")
 
     assert result is not None
     assert result["is_true_positive"] is False
@@ -329,3 +335,200 @@ def test_fp_prefilter_schema_matches_codeql():
         FP_PREFILTER_SCHEMA as codeql_schema,
     )
     assert FP_PREFILTER_SCHEMA == codeql_schema
+
+
+# ---------------------------------------------------------------------------
+# Calibration-loop closure: fall-through claims are adjudicated and
+# recorded, so agentic:<rule_id> cells can leave learning mode.
+# ---------------------------------------------------------------------------
+
+
+def test_fall_through_claim_is_stashed(llm):
+    client, prov = llm
+    prov.responder = lambda p, s_, sp: (
+        {"verdict": "clear_fp", "reasoning": "no taint"}, "raw")
+    pending: dict = {}
+    result = prefilter_for_finding(client, _finding(),
+                                   pending_claims=pending)
+    assert result is None
+    assert "f1" in pending
+    assert pending["f1"]["decision_class"] == "agentic:py/sql-injection"
+    assert pending["f1"]["model"] == "haiku-stub"
+
+
+def test_needs_analysis_is_not_stashed(llm):
+    client, prov = llm
+    prov.responder = lambda p, s_, sp: (
+        {"verdict": "needs_analysis", "reasoning": "unsure"}, "raw")
+    pending: dict = {}
+    assert prefilter_for_finding(client, _finding(),
+                                 pending_claims=pending) is None
+    assert pending == {}
+
+
+def test_outcomes_recorded_against_full_verdicts(llm):
+    """The calibration loop must CLOSE: a fall-through clear_fp claim
+    plus the full ANALYSE verdict becomes one CHEAP_SHORT_CIRCUIT
+    event in the scorecard. Before this recording existed the
+    agentic:* cells accumulated nothing and should_short_circuit
+    stayed in learning mode forever."""
+    client, prov = llm
+    prov.responder = lambda p, s_, sp: (
+        {"verdict": "clear_fp", "reasoning": "no taint"}, "raw")
+    pending: dict = {}
+    prefilter_for_finding(client, _finding(), pending_claims=pending)
+    assert pending
+
+    # Full analysis agreed (not a true positive) → correct event.
+    n = record_prefilter_outcomes(client, pending, [
+        {"finding_id": "f1", "is_true_positive": False,
+         "reasoning": "confirmed constant"},
+    ])
+    assert n == 1
+    stats = client.scorecard.get_stat(
+        "agentic:py/sql-injection", "haiku-stub")
+    assert stats is not None
+    ev = (stats.events or {}).get(EventType.CHEAP_SHORT_CIRCUIT)
+    assert ev is not None
+    assert getattr(ev, "correct", 0) == 1
+
+
+def test_disagreement_records_incorrect(llm):
+    client, prov = llm
+    prov.responder = lambda p, s_, sp: (
+        {"verdict": "clear_fp", "reasoning": "no taint"}, "raw")
+    pending: dict = {}
+    prefilter_for_finding(client, _finding(), pending_claims=pending)
+
+    n = record_prefilter_outcomes(client, pending, [
+        {"finding_id": "f1", "is_true_positive": True,
+         "reasoning": "actually exploitable"},
+    ])
+    assert n == 1
+    stats = client.scorecard.get_stat(
+        "agentic:py/sql-injection", "haiku-stub")
+    ev = (stats.events or {}).get(EventType.CHEAP_SHORT_CIRCUIT)
+    assert getattr(ev, "incorrect", 0) == 1
+
+
+def test_error_results_not_adjudicated(llm):
+    client, prov = llm
+    prov.responder = lambda p, s_, sp: (
+        {"verdict": "clear_fp", "reasoning": "no taint"}, "raw")
+    pending: dict = {}
+    prefilter_for_finding(client, _finding(), pending_claims=pending)
+
+    n = record_prefilter_outcomes(client, pending, [
+        {"finding_id": "f1", "error": "timeout"},
+    ])
+    assert n == 0
+
+
+def test_record_outcomes_never_raises_without_scorecard(llm):
+    client, _prov = llm
+    client.config.scorecard_enabled = False
+    assert record_prefilter_outcomes(
+        client, {"f1": {"decision_class": "agentic:x", "model": "m",
+                        "cheap_reasoning": ""}},
+        [{"finding_id": "f1", "is_true_positive": False}],
+    ) == 0
+
+
+# ---------------------------------------------------------------------------
+# Memoized dispatch hook (make_prefilter_fn)
+# ---------------------------------------------------------------------------
+
+
+def test_make_prefilter_fn_one_cheap_call_per_finding(llm):
+    """Dispatch fans out (model x finding) pairs; the cheap FP check
+    is model-independent, so N models re-invoking the hook for the
+    SAME finding must reuse one verdict — not pay N cheap-tier calls
+    and race the pending-claims writes."""
+    from packages.llm_analysis.prefilter import make_prefilter_fn
+
+    client, prov = llm
+    prov.responder = lambda p, s, sp: (
+        {"verdict": "clear_fp", "reasoning": "hardcoded value"}, "raw",
+    )
+    pending: dict[str, dict] = {}
+    hook = make_prefilter_fn(client, pending_claims=pending)
+
+    item = _finding()
+    first = hook(item)
+    second = hook(item)   # second model's work item, same finding
+    third = hook(item)
+
+    assert prov.call_count == 1
+    assert first is second is third
+    # Fall-through claim stashed exactly once.
+    assert list(pending) == ["f1"]
+
+
+def test_make_prefilter_fn_distinct_findings_independent(llm):
+    from packages.llm_analysis.prefilter import make_prefilter_fn
+
+    client, prov = llm
+    prov.responder = lambda p, s, sp: (
+        {"verdict": "needs_analysis", "reasoning": ""}, "raw",
+    )
+    hook = make_prefilter_fn(client, pending_claims={})
+
+    a = _finding()
+    b = dict(_finding(), finding_id="f2")
+    assert hook(a) is None
+    assert hook(b) is None
+    assert prov.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Severity vocabulary + abstention adjudication
+# ---------------------------------------------------------------------------
+
+
+def test_short_circuit_severity_is_canonical_enum_value():
+    from core.schema_constants import SEVERITY_LEVELS
+    analysis = agentic_fp_analysis("clearly hardcoded")
+    assert analysis["severity_assessment"] in SEVERITY_LEVELS
+
+
+def test_abstaining_full_analysis_not_recorded_as_disagreement(llm):
+    """A full-analysis result with a missing / None is_true_positive
+    is an abstention — recording it as 'incorrect' would erode
+    fast-tier trust on zero evidence."""
+    client, prov = llm
+    claims = {
+        "f1": {"decision_class": "agentic:py/sql-injection",
+               "model": "haiku-stub", "cheap_reasoning": "r"},
+        "f2": {"decision_class": "agentic:py/sql-injection",
+               "model": "haiku-stub", "cheap_reasoning": "r"},
+    }
+    results = [
+        {"finding_id": "f1"},                       # missing verdict
+        {"finding_id": "f2", "is_true_positive": None},  # explicit null
+    ]
+    assert record_prefilter_outcomes(client, claims, results) == 0
+
+
+def test_junk_verdict_shape_not_recorded(llm):
+    """A truthy non-bool that survived validation is a non-verdict —
+    recording it adjudicated the cheap claim as 'incorrect'
+    (full_says_fp=False) on a verdict no model produced."""
+    client, prov = llm
+    claims = {
+        "f1": {"decision_class": "agentic:py/sql-injection",
+               "model": "haiku-stub", "cheap_reasoning": "r"},
+    }
+    results = [{"finding_id": "f1", "is_true_positive": "yes"}]
+    assert record_prefilter_outcomes(client, claims, results) == 0
+
+
+def test_real_verdicts_still_adjudicated(llm):
+    # Two-direction: definite verdicts keep recording.
+    client, prov = llm
+    claims = {
+        "f1": {"decision_class": "agentic:py/sql-injection",
+               "model": "haiku-stub", "cheap_reasoning": "r"},
+    }
+    results = [{"finding_id": "f1", "is_true_positive": False,
+                "reasoning": "fp"}]
+    assert record_prefilter_outcomes(client, claims, results) == 1

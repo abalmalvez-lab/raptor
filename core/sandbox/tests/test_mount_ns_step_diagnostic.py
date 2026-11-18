@@ -1,35 +1,52 @@
-"""Static guards for the W36.K.2 step-aware diagnostic in mount_ns.py.
+"""Guards for the extra_ro_paths bind path in mount_ns.py.
 
-The W36.E.1 fail-CLOSED handler on the extra_ro_paths bind path used
-to report any OSError inside the outer try as
-``"extra_ro_paths bind failed (errno=N)"`` — but the same try block
-also runs ``os.makedirs`` and ``os.open``, whose errors were being
-misattributed to "bind". W36.K.2 introduces a ``_step`` local variable
-that names which sub-operation is running, so the diagnostic reads
-``"extra_ro_paths makedirs failed ..."`` when makedirs is the actual
-failure.
+Two groups:
 
-These tests are static — they read ``mount_ns.py`` and assert the
-step-tracking machinery is present. Driving a real ``setup_mount_ns``
-through the failure path requires Linux-only fork + namespace setup;
-those integration tests live in ``test_fork_safe_warn_sites.py``
-(F063b) and rely on a subprocess harness. For W36.K.2 the static
-guard is sufficient: it catches silent regressions of the step
-diagnostic itself, which is the contract this commit added.
+1. Step-aware failure diagnostic. The fail-CLOSED handler on the
+   extra_ro_paths bind path used to report any OSError inside the
+   outer try as ``"extra_ro_paths bind failed (errno=N)"`` — but the
+   same try block also runs ``os.makedirs`` and ``os.open``, whose
+   errors were being misattributed to "bind". A ``_step`` local
+   variable names which sub-operation is running, so the diagnostic
+   reads ``"extra_ro_paths makedirs failed ..."`` when makedirs is
+   the actual failure. These tests are static — they read
+   ``mount_ns.py`` and assert the step-tracking machinery is present.
+   Driving a real ``setup_mount_ns`` through the failure path
+   requires Linux-only fork + namespace setup; those integration
+   tests live in ``test_fork_safe_warn_sites.py`` and rely on a
+   subprocess harness. The static guard catches silent regressions
+   of the step diagnostic itself.
+
+2. Path normalisation. ``extra_ro_paths`` entries get the same
+   ``os.path.abspath`` normalisation as target/output, so a relative
+   or non-normalised entry ("etc", "/tmp/../etc") can neither evade
+   the exact-string ``_shadows_per_ns`` check nor produce a malformed
+   bind target ("{root}etc"). The mount/pivot syscall wrappers are
+   mocked; only the path logic and mount-point directory creation
+   run for real.
 """
 
+import os
 import re
+import shutil
 from pathlib import Path
+
+import pytest
+
+from core.sandbox import mount_ns
 
 
 _MOUNT_NS = Path(__file__).resolve().parent.parent / "mount_ns.py"
 
 
 def _read_extra_ro_block() -> str:
-    """Return the slice of mount_ns.py that handles extra_ro_paths."""
+    """Return the slice of mount_ns.py that handles extra_ro_paths —
+    the per-entry bind helper (the plan itself is normalised and
+    ancestor-ordered before step 8; every entry funnels through this
+    helper, so the step-diagnostic machinery lives here)."""
     src = _MOUNT_NS.read_text()
-    start = src.index("Bind any extra read-only paths")
-    end = src.index("# 9. pivot_root")
+    start = src.index("def _bind_one_extra_ro")
+    end = src.index("# Split the plan")
     return src[start:end]
 
 
@@ -49,8 +66,8 @@ def test_step_variable_initialised_before_try():
 def test_step_assignments_cover_all_failure_sites():
     """Every operation that can OSError inside the outer try must
     have a preceding _step assignment so the diagnostic names the
-    right step. Removing any assignment regresses the contract this
-    commit added."""
+    right step. Removing any assignment regresses the step-diagnostic
+    contract."""
     block = _read_extra_ro_block()
     # ASCII bytes labels per fork-safety design — non-ASCII would
     # require encoding work in the post-fork path.
@@ -89,7 +106,7 @@ def test_outer_except_diagnostic_uses_step_variable():
     # the step-aware diagnostic was reverted to the original
     # always-says-bind form.
     assert (
-        'b"RAPTOR: mount_ns: extra_ro_paths bind failed for "' not in block
+        'b"sandbox: mount_ns: extra_ro_paths bind failed for "' not in block
     ), (
         "outer OSError handler still uses the pre-fix 'bind failed' "
         "literal; the step-aware diagnostic was reverted"
@@ -131,4 +148,134 @@ def test_step_labels_are_bytes_not_str():
     assert not str_assignments, (
         f"_step assignments must be bytes (b\"...\") for fork-safety, "
         f"not str. Found str assignments: {str_assignments}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# extra_ro_paths normalisation — Linux-only (runs setup_mount_ns with
+# the mount/pivot syscall wrappers mocked out)
+# ---------------------------------------------------------------------------
+
+# mount-ns setup logic is Linux-only
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
+
+
+def _run_setup(monkeypatch, tmp_path, extra_ro_paths, cwd=None):
+    mounts: list[tuple] = []
+    monkeypatch.setattr(
+        mount_ns, "_mount",
+        lambda *a, **k: mounts.append(a),
+    )
+    monkeypatch.setattr(mount_ns, "_pivot_root", lambda *a: None)
+    monkeypatch.setattr(mount_ns, "_umount", lambda *a, **k: None)
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.delenv(var, raising=False)
+    root = tmp_path / "sbx-root"
+    # Fresh contents per invocation: with _mount stubbed out, the
+    # tmpfs that normally gives setup a pristine root never mounts,
+    # so the /dev stubs and symlinks a previous invocation created
+    # would collide with this one's O_EXCL creates.
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir()
+    saved_cwd = os.getcwd()
+    try:
+        if cwd is not None:
+            os.chdir(cwd)
+        mount_ns.setup_mount_ns(
+            None, None,
+            extra_ro_paths=extra_ro_paths,
+            root_path=str(root),
+        )
+    finally:
+        os.chdir(saved_cwd)
+    return root, mounts
+
+
+@pytest.mark.linux_native
+def test_dotdot_entry_cannot_evade_shadow_check(monkeypatch, tmp_path):
+    # "/tmp/../etc" normalises to "/etc", which is a per-ns
+    # shadow path and must be skipped entirely.
+    root, mounts = _run_setup(
+        monkeypatch, tmp_path, ["/tmp/../etc"],
+    )
+    baseline_root, baseline = _run_setup(
+        monkeypatch, tmp_path, None,
+    )
+    extra = [m for m in mounts if m[0] == "/tmp/../etc"
+             or (m[1] and "/tmp/../etc" in str(m[1]))]
+    assert extra == [], "non-normalised /etc alias was bind-mounted"
+    assert len(mounts) == len(baseline), (
+        "shadowed entry produced extra mounts"
+    )
+
+
+@pytest.mark.linux_native
+def test_relative_entry_no_malformed_bind_target(monkeypatch, tmp_path):
+    # A relative entry used to produce inside=f"{root}etc" — a
+    # SIBLING of the sandbox root, not a path within it.
+    (tmp_path / "etc").mkdir()
+    root, mounts = _run_setup(
+        monkeypatch, tmp_path, ["etc"], cwd=tmp_path,
+    )
+    malformed = str(root) + "etc"
+    assert not os.path.exists(malformed)
+    assert all(m[1] != malformed for m in mounts)
+    # The normalised absolute path is what gets bound.
+    expected_inside = f"{root}{tmp_path / 'etc'}"
+    bound = [m for m in mounts if m[0] == str(tmp_path / "etc")]
+    assert bound, "normalised entry was not bind-mounted at all"
+    assert bound[0][1] == expected_inside
+
+
+@pytest.mark.linux_native
+def test_relative_and_absolute_spellings_equivalent(monkeypatch, tmp_path):
+    (tmp_path / "ro").mkdir()
+    _, rel_mounts = _run_setup(
+        monkeypatch, tmp_path, ["ro"], cwd=tmp_path,
+    )
+    _, abs_mounts = _run_setup(
+        monkeypatch, tmp_path, [str(tmp_path / "ro")],
+    )
+    rel_targets = sorted(m[1] for m in rel_mounts if m[1])
+    abs_targets = sorted(m[1] for m in abs_mounts if m[1])
+    assert rel_targets == abs_targets
+
+
+@pytest.mark.linux_native
+def test_per_process_procfs_entry_not_bound_without_pins(monkeypatch,
+                                                         tmp_path):
+    # Legacy callers (src_fds=None) reach the extra_ro loop with
+    # mount-time resolution: without the class skip, a /proc/self/*
+    # entry would bind THIS setup process's own pid file over the
+    # magic link, freezing one process's per-reader view for every
+    # sandbox process (and, for cgroup, re-exposing the host-layout
+    # path the fresh cgroup namespace hides). The pinned production
+    # path never gets here for the class (the parent takes no pin),
+    # so this legacy route is the one that keeps the skip live.
+    root, mounts = _run_setup(
+        monkeypatch, tmp_path, ["/proc/self/cgroup"],
+    )
+    _, baseline = _run_setup(monkeypatch, tmp_path, None)
+    assert len(mounts) == len(baseline), (
+        "per-process procfs entry produced extra mounts"
+    )
+    assert not any(
+        m[1] and "/proc/self/cgroup" in str(m[1]) for m in mounts
+    ), "per-process procfs entry was bind-mounted"
+
+
+@pytest.mark.linux_native
+def test_double_slash_procfs_spelling_not_bound(monkeypatch, tmp_path):
+    # "//proc/self/cgroup" survives abspath (POSIX two-slash prefix)
+    # — the classification must catch the spelling here too.
+    root, mounts = _run_setup(
+        monkeypatch, tmp_path, ["//proc/self/cgroup"],
+    )
+    _, baseline = _run_setup(monkeypatch, tmp_path, None)
+    assert len(mounts) == len(baseline)
+    assert not any(
+        m[1] and "proc/self/cgroup" in str(m[1]) for m in mounts
     )

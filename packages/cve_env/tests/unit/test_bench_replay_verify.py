@@ -1,0 +1,227 @@
+"""S29 Phase D — bench-replay verify-dispatch test.
+
+Discovers every ``verify`` tool call recorded in
+``output/agentic/manual-*/CVE-*.jsonl`` audit files, replays each
+through :func:`~cve_env.tools.verify.verify` with all I/O surfaces
+mocked to succeed, and asserts that no step is schema-rejected
+(i.e. no step returns ``"unknown check type"``).
+
+Skipped on a fresh clone where no audit files are present so CI stays
+green without needing a pre-seeded corpus.
+"""
+
+from __future__ import annotations
+
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+import json
+import pathlib
+from contextlib import ExitStack
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cve_env.tools.run_in_container import ExecResult
+from cve_env.tools.verify import verify
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Corpus discovery
+# ---------------------------------------------------------------------------
+
+_AUDIT_ROOT = pathlib.Path(__file__).parent.parent.parent.parent / "output" / "agentic"
+
+# 2026-05-26 build-only purification: the active-probe check types
+# ``http_payload_check`` / ``tcp_payload_check`` were renamed to
+# ``http_request_check`` / ``tcp_probe_check``. Audit recordings made before the
+# rename legitimately use the old names, which the current ``verify()`` now
+# reports as "unknown check type" — by design (no back-compat aliases; the old
+# names are retired). The assertion below TOLERATES these specific retired types
+# so pre-rename recordings still replay (exercising their other, still-valid
+# steps) while a genuinely-unknown type (a real schema regression) still fails.
+_RETIRED_CHECK_TYPES = frozenset({"http_payload_check", "tcp_payload_check"})
+
+
+def _collect_verify_cases(
+    root: pathlib.Path = _AUDIT_ROOT,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return (case_id, verify_kwargs) for every verify call in the corpus."""
+    cases: list[tuple[str, dict[str, Any]]] = []
+    for jsonl in sorted(root.glob("manual-*/CVE-*.jsonl")):
+        run_id = jsonl.parent.name
+        with jsonl.open() as fh:
+            for line in fh:
+                if '"verify"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    # A truncated tail line (an agentic run appending
+                    # to the same audit file mid-collection) must not
+                    # error the whole session at collection time; the
+                    # other, complete recordings still replay.
+                    continue
+                if not isinstance(obj, dict):
+                    continue  # decodable but non-object line (e.g. a bare list)
+                if obj.get("tool_name") != "verify":
+                    continue
+                tool_input = obj.get("tool_input") or {}
+                if not isinstance(tool_input.get("plan"), list):
+                    continue  # result line (empty ti) or double-encoded plan string; skip
+                raw_cve = obj.get("cve_id", "UNKNOWN")
+                cve_id = raw_cve.split()[0]
+                turn = obj.get("turn", 0)
+                cases.append((f"{cve_id}@{run_id}:t{turn}", tool_input))
+    return cases
+
+
+_VERIFY_CASES = _collect_verify_cases()
+
+
+# ---------------------------------------------------------------------------
+# Socket partial-mock (mirrors test_e2e_pipeline._FakeTCPSocket / test_verify)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTCPSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def settimeout(self, _t: float) -> None:
+        pass
+
+    def sendall(self, _data: bytes) -> None:
+        pass
+
+    def recv(self, n: int) -> bytes:
+        return b"+PONG\r\n"[:n]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+# ---------------------------------------------------------------------------
+# I/O mock fixture (mirrors _e2e_io_mocked pattern from test_e2e_pipeline.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _verify_io_mocked() -> Any:
+    """Mock all I/O surfaces so verify() dispatches without real containers."""
+    with ExitStack() as stack:
+        subproc = MagicMock()
+        subproc.return_value.returncode = 0
+        subproc.return_value.stdout = (
+            '{"Status": "running", "Running": true, "ExitCode": 0}'
+        )
+        subproc.return_value.stderr = ""
+        stack.enter_context(mock_module_attribute(_mock_owner('core.container.proc'), 'subprocess', 'run', subproc))
+
+        # stability_wait calls time.sleep — mock it so plans with 90-120s
+        # waits don't hit the pytest 60s timeout.
+        stack.enter_context(mock_module_attribute(_mock_owner('cve_env.tools.verify'), 'time', 'sleep', MagicMock()))
+
+        req_mock = MagicMock(return_value=(200, b"ok"))
+        stack.enter_context(patch("core.env.verify._http_exchange", req_mock))
+
+        stack.enter_context(
+            mock_module_attribute(_mock_owner('core.env.verify'), 'socket', 'create_connection', MagicMock(return_value=_FakeTCPSocket()))
+        )
+
+        exec_mock = MagicMock(
+            return_value=ExecResult(
+                ok=True,
+                container_id="replay_cid",
+                command="id",
+                exit_code=0,
+                stdout="ok",
+                stderr="",
+                duration_s=0.001,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "cve_env.tools.verify._run_in_container.run_in_container",
+                exec_mock,
+            )
+        )
+        yield
+
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not _VERIFY_CASES,
+    reason="no audit JSONLs present — skip on fresh clone / CI without corpus",
+)
+@pytest.mark.parametrize(("case_id", "verify_input"), _VERIFY_CASES)
+def test_bench_replay_verify_no_schema_rejection(
+    case_id: str,
+    verify_input: dict[str, Any],
+    _verify_io_mocked: None,  # noqa: PT019
+) -> None:
+    """Replay a recorded verify call; assert no step is schema-rejected."""
+    result = verify(**verify_input)
+    bad = [
+        r
+        for r in result["results"]
+        if "unknown check type" in (r.get("reason") or "")
+        and r.get("type")
+        not in _RETIRED_CHECK_TYPES  # tolerate intentionally-retired types
+    ]
+    assert not bad, (
+        f"{case_id}: verify() schema-rejected {len(bad)} step(s): "
+        + ", ".join(r.get("reason", "") for r in bad)
+    )
+
+
+def test_collect_tolerates_truncated_tail_line(tmp_path: pathlib.Path) -> None:
+    """A truncated tail line (audit file mid-append) must be skipped,
+    never error collection — pre-fix it raised JSONDecodeError at
+    import time and killed the whole test session."""
+    run_dir = tmp_path / "manual-x"
+    run_dir.mkdir()
+    good = json.dumps(
+        {
+            "tool_name": "verify",
+            "tool_input": {"plan": []},
+            "cve_id": "CVE-0000-0001",
+            "turn": 1,
+        }
+    )
+    truncated = '{"tool_name": "verify", "tool_input": {"pl'
+    (run_dir / "CVE-0000-0001.jsonl").write_text(good + "\n" + truncated)
+    cases = _collect_verify_cases(tmp_path)
+    assert len(cases) == 1
+    assert cases[0][0].startswith("CVE-0000-0001@manual-x")
+
+
+def test_collect_verify_cases_skips_corrupt_lines(tmp_path: pathlib.Path) -> None:
+    """Corpus discovery must tolerate a truncated/corrupt JSONL line
+    (an interrupted bench run truncates its final record) and a
+    decodable non-object line — the parse error previously escaped at
+    COLLECTION time and errored the whole module on any machine
+    holding such a corpus."""
+    run_dir = tmp_path / "manual-x"
+    run_dir.mkdir()
+    good = json.dumps({
+        "tool_name": "verify", "cve_id": "CVE-2020-1", "turn": 1,
+        "tool_input": {"plan": []},
+    })
+    (run_dir / "CVE-2020-1.jsonl").write_text(
+        '{"tool_name": "verify", "truncat\n'      # torn mid-record
+        '["verify"]\n'                             # decodes to a non-dict
+        + good + "\n",
+    )
+    cases = _collect_verify_cases(tmp_path)
+    assert any(cid.startswith("CVE-2020-1@manual-x") for cid, _ in cases)

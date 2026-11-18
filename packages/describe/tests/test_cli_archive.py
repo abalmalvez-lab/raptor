@@ -1,0 +1,476 @@
+"""Tests for ``packages/describe/cli.py`` — shared driver
+covering archive handling.
+
+End-to-end coverage:
+* directory target — happy path (the existing tests already
+  exercise this; here we cover the archive branches)
+* tarball / zip targets — extracted on the fly, described,
+  temp dir cleaned up
+* non-archive binary file — refused with operator-actionable
+  stderr
+* JSON output preserves ``archive_label``
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import tarfile
+import zipfile
+from pathlib import Path
+
+import pytest
+
+import packages.describe.cli as _mock_consumer_tempfile
+from core.testing.module_bindings import patch_module_attribute
+from core.testing.standalone_cli import run_standalone_cli
+from packages.describe.cli import describe_main
+
+
+@pytest.fixture(autouse=True)
+def _archive_report_without_host_probes(monkeypatch):
+    # Archive extraction, target detection and rendering remain real; installed
+    # tool readiness is covered by its own tests, not these path/lifetime pins.
+    monkeypatch.setattr("packages.describe.report.check_tool_readiness", lambda shape: [])
+
+
+def _make_c_daemon_source(d: Path) -> None:
+    """Synthesise a c.userspace-daemon shape inside ``d``."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "configure.ac").write_text("")
+    (d / "Makefile.am").write_text("")
+    src = d / "src"
+    src.mkdir()
+    for i in range(5):
+        (src / f"f{i}.c").write_text("int main(){return 0;}")
+
+
+def _make_tarball(src_dir: Path, dest_archive: Path) -> None:
+    with tarfile.open(dest_archive, "w:gz") as tf:
+        tf.add(src_dir, arcname=src_dir.name)
+
+
+def _make_zip(src_dir: Path, dest_archive: Path) -> None:
+    with zipfile.ZipFile(dest_archive, "w") as zf:
+        for p in src_dir.rglob("*"):
+            zf.write(p, arcname=p.relative_to(src_dir.parent))
+
+
+class TestArchiveHandling:
+    def test_tarball_extracted_and_described(self, tmp_path):
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+        out = out_buf.getvalue()
+        # Operator sees "Source: archive ..." so they know
+        # the rest of the block describes the extracted tree.
+        assert "Source: archive proj.tar.gz" in out
+        # Catalog match still triggers on the extracted tree.
+        assert "Detected type: c.userspace-daemon" in out
+        assert "autotools" in out
+
+    def test_zip_extracted_and_described(self, tmp_path):
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.zip"
+        _make_zip(src, archive)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+        assert "Source: archive proj.zip" in out_buf.getvalue()
+
+    def test_non_archive_binary_refused(self, tmp_path):
+        # Random binary blob (not a recognised archive format).
+        blob = tmp_path / "mystery.bin"
+        blob.write_bytes(b"\x00\x01\x02RANDOMBYTES\xff" * 100)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(blob), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 1
+        err = err_buf.getvalue()
+        assert "not a recognised archive" in err
+
+    def test_nonexistent_target_refused(self, tmp_path):
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(tmp_path / "does-not-exist"), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 1
+        assert "does not exist" in err_buf.getvalue()
+
+    def test_archive_label_surfaces_in_json(self, tmp_path):
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=True,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+        doc = json.loads(out_buf.getvalue())
+        assert doc["archive_label"] == "proj.tar.gz"
+
+    def test_directory_target_archive_label_is_null(self, tmp_path):
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(src), json_output=True,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+        doc = json.loads(out_buf.getvalue())
+        assert doc["archive_label"] is None
+
+    def test_temp_dir_cleaned_up_after_archive_describe(self, tmp_path, monkeypatch):
+        # Track the specific temp dir created by THIS call rather than
+        # globbing /tmp (which races with other xdist workers).
+        import tempfile as _tmp
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+
+        created_tmps: list[Path] = []
+        _real_mkdtemp = _tmp.mkdtemp
+
+        def _tracking_mkdtemp(*args, **kwargs):
+            d = _real_mkdtemp(*args, **kwargs)
+            if "raptor-describe" in d:
+                created_tmps.append(Path(d))
+            return d
+
+        patch_module_attribute(monkeypatch, _mock_consumer_tempfile, 'tempfile', 'mkdtemp', _tracking_mkdtemp)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+
+        assert created_tmps, "expected describe_main to create a temp dir"
+        for d in created_tmps:
+            assert not d.exists(), f"temp extract dir leaked: {d}"
+
+
+class TestSymlinkDefences:
+    """Adversarial-fixture pins for the symlink-safety
+    refactor in cli.py."""
+
+    def test_single_subdir_symlink_not_followed(self, tmp_path):
+        # Pre-fix: a tarball whose only top-level entry is a
+        # symlink named ``proj`` pointing at ``/`` would make
+        # /describe retarget at the host filesystem root.
+        from packages.describe.cli import _descend_single_subdir
+        extract_root = tmp_path / "extract"
+        extract_root.mkdir()
+        (extract_root / "proj").symlink_to("/etc")
+        # Symlink-only entry → no descent; describe stays at root.
+        assert _descend_single_subdir(extract_root) == extract_root
+
+
+class TestArchiveCacheHit:
+    """Pins the cache-reuse contract: when a prior /scan or
+    /agentic on the same archive (same active project) has
+    already extracted to ``<project_out>/_sources/<name>-<sha>``,
+    /describe MUST use that path — not re-extract.
+    """
+
+    def _set_active_project(
+        self, monkeypatch, home: Path, project_out: Path,
+    ) -> None:
+        # Stand up a minimal project.json + .active symlink so
+        # ``_resolve_active_project`` finds it.
+        proj_dir = home / ".raptor" / "projects"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        (proj_dir / "_t.json").write_text(_json.dumps({
+            "name": "_t",
+            "target": "/tmp",
+            "output_dir": str(project_out),
+        }))
+        active = proj_dir / ".active"
+        if active.is_symlink() or active.exists():
+            active.unlink()
+        active.symlink_to("_t.json")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(
+            "core.project.project.PROJECTS_DIR", proj_dir,
+        )
+        monkeypatch.setattr(
+            "core.run.output._resolve_active_project",
+            lambda: (str(project_out), "_t", "/tmp"),
+        )
+
+    def test_cache_hit_skips_extraction(
+        self, tmp_path, monkeypatch,
+    ):
+        # 1. Create a real archive + its content sha + cache
+        #    name (mirroring how /scan would have populated
+        #    the cache via _unpack_archive_target).
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+
+        from core.archive import safe_cache_name
+        from core.run.provenance import archive_snapshot
+        snap = archive_snapshot(archive)
+        assert snap is not None
+        cache_name = safe_cache_name(
+            snap["archive_name"], snap["archive_sha256"],
+        )
+
+        # 2. Pre-populate the cache dir with the same shape
+        #    /scan would have left there (extracted tree).
+        project_out = tmp_path / "project_out"
+        cache_dir = project_out / "_sources" / cache_name
+        cache_dir.mkdir(parents=True)
+        # Mark the cached tree so we can detect /describe used IT
+        # rather than a fresh extract. Catalog content is the same
+        # shape as the source so c.userspace-daemon still matches.
+        _make_c_daemon_source(cache_dir / "proj")
+        (cache_dir / "proj" / "CACHE-MARKER").write_text(
+            "from-cache",
+        )
+
+        # 3. Stand up an active project pointing at project_out.
+        self._set_active_project(
+            monkeypatch, tmp_path / "fakehome", project_out,
+        )
+
+        # 4. Run describe. Expect cache hit → no tmp extract dir
+        #    created. Track via monkeypatch (glob races with xdist).
+        import tempfile as _tmp
+        created_tmps: list[Path] = []
+        _real_mkdtemp = _tmp.mkdtemp
+
+        def _tracking_mkdtemp(*args, **kwargs):
+            d = _real_mkdtemp(*args, **kwargs)
+            if "raptor-describe" in d:
+                created_tmps.append(Path(d))
+            return d
+
+        patch_module_attribute(monkeypatch, _mock_consumer_tempfile, 'tempfile', 'mkdtemp', _tracking_mkdtemp)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+
+        assert not created_tmps, (
+            "cache hit must NOT create a tmp extract dir; "
+            f"created: {created_tmps}"
+        )
+        assert "Source: archive proj.tar.gz" in out_buf.getvalue()
+        assert "c.userspace-daemon" in out_buf.getvalue()
+
+
+class TestRaptorDescribeArchiveE2E:
+    """End-to-end through ``raptor.py describe`` with the
+    real subprocess + argparse path, to confirm the
+    mode_describe → describe_main wiring works."""
+
+    # This deliberately includes cold launcher startup and real archive
+    # detection; the direct describe_main cases cover the fast tier.
+    @pytest.mark.slow
+    def test_subprocess_invocation_on_archive(self, tmp_path):
+        import os
+        import sys as _sys
+
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+
+        repo = Path(__file__).resolve().parents[3]
+        env = os.environ.copy()
+        env["CLAUDECODE"] = "1"
+        env["RAPTOR_DIR"] = str(repo)
+        result = run_standalone_cli(
+            [_sys.executable, str(repo / "raptor.py"),
+             "describe", "--target", str(archive)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Source: archive proj.tar.gz" in result.stdout
+
+
+class TestArchiveAnalysisPointer:
+    """The copy-pastable "To start analysis" command must reference a
+    path that still exists once the report is printed."""
+
+    def test_start_analysis_line_points_at_archive_not_tmpdir(
+        self, tmp_path,
+    ):
+        """Cache-miss archive describe extracts into a temp dir that
+        the CLI deletes right after rendering — the recommended
+        command must name the ARCHIVE (analysis commands extract
+        archives themselves), never the doomed extraction dir."""
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=False,
+            stdout=out_buf, stderr=err_buf,
+        )
+        assert rc == 0, err_buf.getvalue()
+        out = out_buf.getvalue()
+        line = next(
+            ln for ln in out.splitlines() if "To start analysis" in ln
+        )
+        assert f"--repo {archive}" in line
+        # The path in the recommended command exists after describe.
+        repo_arg = line.split("--repo ", 1)[1].split("`", 1)[0].strip()
+        assert Path(repo_arg).exists(), (
+            f"recommended --repo path is gone: {repo_arg}"
+        )
+
+    def test_directory_target_still_points_at_directory(self, tmp_path):
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        out_buf = io.StringIO()
+        rc = describe_main(
+            str(src), json_output=False,
+            stdout=out_buf, stderr=io.StringIO(),
+        )
+        assert rc == 0
+        out = out_buf.getvalue()
+        assert f"--repo {src.resolve()}" in out
+
+    def test_archive_path_surfaces_in_json(self, tmp_path):
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+        out_buf = io.StringIO()
+        rc = describe_main(
+            str(archive), json_output=True,
+            stdout=out_buf, stderr=io.StringIO(),
+        )
+        assert rc == 0
+        doc = json.loads(out_buf.getvalue())
+        assert doc["archive_path"] == str(archive.resolve())
+
+
+class TestArchiveCacheCrossLocation:
+    """Pins the cross-location cache probe: extractions produced by
+    PROJECTLESS runs land in ``<out root>/_sources/<name>-<sha>`` (the
+    run dir's parent), and must be found with or without an active
+    project. Pre-fix ``_find_cached_extraction`` returned None the
+    moment no project was active and never probed the out root, so a
+    content-addressed hit on disk was re-extracted every time."""
+
+    def _snap(self, archive: Path):
+        from core.archive import safe_cache_name
+        from core.run.provenance import archive_snapshot
+        snap = archive_snapshot(archive)
+        assert snap is not None
+        return safe_cache_name(snap["archive_name"], snap["archive_sha256"])
+
+    def _make_archive(self, tmp_path: Path) -> Path:
+        src = tmp_path / "proj"
+        _make_c_daemon_source(src)
+        archive = tmp_path / "proj.tar.gz"
+        _make_tarball(src, archive)
+        return archive
+
+    def test_out_root_cache_found_without_active_project(
+        self, tmp_path, monkeypatch,
+    ):
+        from core.archive import safe_cache_name
+        from packages.describe.cli import _find_cached_extraction
+        archive = self._make_archive(tmp_path)
+        out_root = tmp_path / "outroot"
+        cache_dir = out_root / "_sources" / self._snap(archive)
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setenv("RAPTOR_OUT_DIR", str(out_root))
+        monkeypatch.setattr(
+            "core.run.output._resolve_active_project", lambda: None,
+        )
+        hit = _find_cached_extraction(archive, safe_cache_name)
+        assert hit == cache_dir
+
+    def test_project_miss_falls_through_to_out_root(
+        self, tmp_path, monkeypatch,
+    ):
+        from core.archive import safe_cache_name
+        from packages.describe.cli import _find_cached_extraction
+        archive = self._make_archive(tmp_path)
+        project_out = tmp_path / "project_out"
+        project_out.mkdir()
+        out_root = tmp_path / "outroot"
+        cache_dir = out_root / "_sources" / self._snap(archive)
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setenv("RAPTOR_OUT_DIR", str(out_root))
+        monkeypatch.setattr(
+            "core.run.output._resolve_active_project",
+            lambda: (str(project_out), "_t", "/tmp"),
+        )
+        hit = _find_cached_extraction(archive, safe_cache_name)
+        assert hit == cache_dir
+
+    def test_project_cache_still_preferred(self, tmp_path, monkeypatch):
+        # Order pin: the active project's own extraction wins over the
+        # out-root one (both content-addressed to the same bytes; the
+        # project's copy is the one its runs share).
+        from core.archive import safe_cache_name
+        from packages.describe.cli import _find_cached_extraction
+        archive = self._make_archive(tmp_path)
+        name = self._snap(archive)
+        project_out = tmp_path / "project_out"
+        proj_cache = project_out / "_sources" / name
+        proj_cache.mkdir(parents=True)
+        out_root = tmp_path / "outroot"
+        (out_root / "_sources" / name).mkdir(parents=True)
+        monkeypatch.setenv("RAPTOR_OUT_DIR", str(out_root))
+        monkeypatch.setattr(
+            "core.run.output._resolve_active_project",
+            lambda: (str(project_out), "_t", "/tmp"),
+        )
+        hit = _find_cached_extraction(archive, safe_cache_name)
+        assert hit == proj_cache
+
+    def test_no_cache_anywhere_returns_none(self, tmp_path, monkeypatch):
+        from core.archive import safe_cache_name
+        from packages.describe.cli import _find_cached_extraction
+        archive = self._make_archive(tmp_path)
+        monkeypatch.setenv("RAPTOR_OUT_DIR", str(tmp_path / "outroot"))
+        monkeypatch.setattr(
+            "core.run.output._resolve_active_project", lambda: None,
+        )
+        assert _find_cached_extraction(archive, safe_cache_name) is None

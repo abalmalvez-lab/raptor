@@ -1,0 +1,305 @@
+"""Storage for trajectory records.
+
+One trajectory file per engine run, JSON, written under
+
+    <base>/trajectories/<run_id>/trajectory.json
+
+``<base>`` is caller-chosen: in CLI mode it's ``args.output_dir``
+(per-run dir); when the /exploit command lands as a project-aware
+surface, ``<base>`` will be the project root so trajectories
+accumulate across runs for cross-run analysis.
+
+Atomic-write semantics: O_EXCL + retry on collision, same shape as
+``core/labeled_attempts/store.py``. A trajectory write at the same
+``run_id`` more than once is a programmer error (run_ids must be
+unique per run), but the symptom is a clear OSError rather than a
+silent overwrite.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import secrets
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+from core.atomic_fs import write_text_atomically
+from core.json import dumps_artifact
+from core.llm.tool_use.types import Message, TextBlock, ToolCall, ToolResult
+
+from .types import TrajectoryRecord, TrajectoryStep
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+_log = logging.getLogger(__name__)
+
+__all__ = [
+    "TRAJECTORY_FILENAME",
+    "iter_trajectory_json",
+    "serialize_messages",
+    "trajectory_path",
+    "write_trajectory",
+]
+
+
+TRAJECTORY_FILENAME = "trajectory.json"
+
+# Per-block text cap. Tool results in particular can be enormous
+# (full file dumps, disassembly listings). 64 KB per block keeps the
+# trajectory readable + bounded without losing the operator-visible
+# shape of what happened. A truncation marker is appended so the
+# reader knows.
+_MAX_TEXT_LEN = 64 * 1024
+
+# Read budget for one persisted trajectory file. The writer's own
+# per-payload caps keep legitimate trajectories to a few MB even for
+# long sessions; 64 MiB is generous headroom while keeping a planted
+# run-dir file (the read path is the distiller's iteration over
+# every run's trajectories) from being buffered whole.
+_MAX_TRAJECTORY_BYTES = 64 * 1024 * 1024
+
+
+def _truncate(text: str) -> str:
+    """Cap a single text payload at _MAX_TEXT_LEN with a marker."""
+    if len(text) <= _MAX_TEXT_LEN:
+        return text
+    return (
+        text[:_MAX_TEXT_LEN]
+        + f"\n...[truncated {len(text) - _MAX_TEXT_LEN} chars]"
+    )
+
+
+def serialize_messages(
+    messages: Iterable[Message],
+    *,
+    per_turn_tokens: Iterable[tuple[int, int]] | None = None,
+) -> list[TrajectoryStep]:
+    """Turn a ToolLoopResult.messages list into TrajectoryStep dicts.
+
+    Each Message becomes one step; iteration index counts assistant
+    turns since user turns are interleaved replies to those.
+
+    Tool result content is truncated at :data:`_MAX_TEXT_LEN` per
+    block so a runaway tool (e.g. a `read_file` on a 100 MB file)
+    can't blow up the trajectory size unbounded.
+
+    ``per_turn_tokens`` is an optional sequence of ``(input_tokens,
+    output_tokens)`` tuples, one entry per assistant turn in
+    ``messages`` (user-turn tokens don't exist — they're not model
+    turns). When supplied, the tuples fill the per-step token
+    fields; when missing / too short, tokens default to 0.
+    """
+    tokens_iter = iter(per_turn_tokens) if per_turn_tokens is not None else None
+    steps: list[TrajectoryStep] = []
+    iteration = 0
+    for msg in messages:
+        text_blocks: list[str] = []
+        loop_injected_blocks: list[int] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+        for block in msg.content:
+            if isinstance(block, TextBlock):
+                # Persist loop-injection provenance (see
+                # TrajectoryStep.loop_injected_blocks): a rebuilt
+                # history must be able to tell loop-authored text from
+                # user-authored text.
+                if getattr(block, "loop_injected", False):
+                    loop_injected_blocks.append(len(text_blocks))
+                text_blocks.append(_truncate(block.text))
+            elif isinstance(block, ToolCall):
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+            elif isinstance(block, ToolResult):
+                tool_results.append({
+                    "tool_use_id": block.tool_use_id,
+                    "content": _truncate(block.content),
+                    "is_error": block.is_error,
+                })
+        in_tokens = 0
+        out_tokens = 0
+        if msg.role == "assistant" and tokens_iter is not None:
+            try:
+                in_tokens, out_tokens = next(tokens_iter)
+            except StopIteration:
+                pass
+        steps.append(TrajectoryStep(
+            iteration=iteration,
+            role=msg.role,
+            text_blocks=text_blocks,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+            input_tokens=int(in_tokens),
+            output_tokens=int(out_tokens),
+            loop_injected_blocks=loop_injected_blocks,
+        ))
+        # Count iterations on assistant turns — that's "model turn N".
+        if msg.role == "assistant":
+            iteration += 1
+    return steps
+
+
+def trajectory_path(base: Path, run_id: str) -> Path:
+    """Where the trajectory file for ``run_id`` lives under ``base``.
+
+    Returns the canonical path; doesn't create directories or check
+    existence. Useful for callers that want to advertise the path
+    before writing.
+    """
+    return Path(base) / "trajectories" / run_id / TRAJECTORY_FILENAME
+
+
+def _record_to_json(record: TrajectoryRecord) -> str:
+    return dumps_artifact(asdict(record))
+
+
+def _mkdir_private(path: Path) -> None:
+    """Create *path* (and any missing parents) owner-only (0o700).
+
+    Trajectories embed prompts, tool output, and target details —
+    directories should not be group/world-readable. ``mkdir(mode=...)``
+    is masked by the process umask, so each component this call
+    actually creates gets an explicit ``chmod`` for determinism.
+    Pre-existing directories keep their modes — only new creations
+    change. Same shape as ``core/labeled_attempts/store.py``.
+    """
+    missing: list[Path] = []
+    probe = Path(path)
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    Path(path).mkdir(mode=0o700, parents=True, exist_ok=True)
+    for created in missing:
+        # A concurrent writer may have created (or pruned) the same
+        # component; the chmod is best-effort on our own creations.
+        with contextlib.suppress(OSError):
+            os.chmod(created, 0o700)
+
+
+def _write_atomic(path: Path, payload: str) -> Path:
+    """Publish a complete private record without replacing an existing name.
+
+    Retry one occupied trajectory name with a random suffix and return the
+    actual path. Write failures do not expose a partial final record.
+    """
+    try:
+        write_text_atomically(path, payload, mode=0o600, replace=False)
+    except FileExistsError:
+        suffix = secrets.token_hex(3)
+        path = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
+        write_text_atomically(path, payload, mode=0o600, replace=False)
+    return path
+
+
+def write_trajectory(
+    record: TrajectoryRecord, *, base: Path,
+) -> Path:
+    """Persist ``record`` under ``<base>/trajectories/<run_id>/``.
+
+    Returns the on-disk path actually written. Raises:
+      * ValueError — record itself is invalid (caught at construction
+        anyway; surfaced here for defensive callers). Also raised
+        when the resolved write path escapes ``base`` — e.g. an
+        attacker planted ``<base>/trajectories`` as a symlink before
+        the run.
+      * OSError — filesystem error.
+    """
+    out = trajectory_path(base, record.run_id)
+    _mkdir_private(out.parent)
+
+    # Defence-in-depth against a planted symlink at
+    # ``<base>/trajectories`` (or any parent component above the
+    # trajectory file). ``_write_atomic`` below uses O_NOFOLLOW on
+    # the FINAL component only — that catches someone planting
+    # ``<base>/trajectories/<run>/trajectory.json`` as a symlink,
+    # but not someone planting ``<base>/trajectories`` as a symlink
+    # to /etc/. ``realpath()`` walks every component, so post-mkdir
+    # we can verify the resolved write target still lives inside
+    # the operator's chosen base.
+    base_real = os.path.realpath(base)
+    out_real = os.path.realpath(out)
+    if not (
+        out_real == os.path.join(
+            base_real, "trajectories", record.run_id, TRAJECTORY_FILENAME,
+        )
+        or out_real.startswith(base_real + os.sep)
+    ):
+        msg = (
+            f"refusing to write trajectory outside base: "
+            f"base={base_real!r} out={out_real!r}"
+        )
+        raise ValueError(msg)
+
+    payload = _record_to_json(record)
+    return _write_atomic(out, payload)
+
+
+def iter_trajectory_json(
+    base: Path,
+) -> Iterable[tuple[Path, dict]]:
+    """Yield ``(path, parsed_json_dict)`` for each trajectory under
+    ``<base>/trajectories/``.
+
+    The distiller (``packages/llm_analysis/exploit_engine/distill/
+    trajectory_distill.py``) is the primary consumer — it wants the
+    raw dict shape rather than a typed ``TrajectoryRecord`` so its
+    reward-scoring path can extract fields that changed across
+    schema versions without forcing a schema-migration step at
+    read time.
+
+    Malformed / unreadable files are logged and skipped rather than
+    aborting the iteration — trajectory persistence is best-effort
+    and a corrupt file shouldn't fail an entire distillation run.
+    """
+    root = Path(base) / "trajectories"
+    if not root.is_dir():
+        return
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        # Canonical file first, then salvage files: ``_write_atomic``
+        # falls back to ``trajectory-<hex>.json`` on a run_id collision
+        # or a planted symlink, and data that was written must stay
+        # readable. The salvage glob never matches the canonical name,
+        # so nothing is yielded twice.
+        candidates = [entry / TRAJECTORY_FILENAME]
+        candidates.extend(sorted(entry.glob("trajectory-*.json")))
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            # Budgeted read: trajectory files sit in the run dir
+            # (sandbox write grant), so their SIZE is as untrusted as
+            # their content — an unbounded read_text buffered a
+            # sparse multi-GiB plant whole into the distillation
+            # process. Over-budget or non-regular files skip like
+            # unreadable ones (best-effort contract above).
+            from core.source import read_bytes_capped
+            got = read_bytes_capped(candidate, _MAX_TRAJECTORY_BYTES)
+            if got is None:
+                _log.warning(f"skipping unreadable trajectory {candidate}")
+                continue
+            raw, truncated = got
+            if truncated:
+                _log.warning(
+                    f"skipping trajectory {candidate}: exceeds "
+                    f"{_MAX_TRAJECTORY_BYTES} bytes",
+                )
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, ValueError, RecursionError) as e:
+                _log.warning(
+                    f"skipping unreadable trajectory {candidate}: "
+                    f"{type(e).__name__}: {e}",
+                )
+                continue
+            yield candidate, parsed

@@ -1,0 +1,252 @@
+name: Refresh SCA project samples
+
+# Auto-PR refresh of the calibration corpus's project-sample
+# scans. For each curated OSS project in
+# ``packages/sca/calibration/project_samples.py::PROJECT_SAMPLES``,
+# the workflow:
+#
+#   1. Shallow-clones the project (transient — never stored).
+#   2. Runs raptor-sca against it.
+#   3. Sanitises findings (file paths under the discarded clone
+#      tree are stripped).
+#   4. Writes the result to
+#      ``packages/sca/data/calibration/project_samples/<eco>/<name>.json``.
+#
+# The scan output is RAPTOR-generated and ships under MIT;
+# project source itself is never redistributed.
+#
+# Cadence: monthly. Project deps don't shift weekly, and cloning
+# + scanning ten OSS projects is more expensive than the daily
+# KEV / EPSS refresh; monthly keeps the corpus current without
+# burning CI minutes.
+
+on:
+  schedule:
+    # 1st of each month, 06:00 UTC.
+    - cron: '0 6 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: refresh-sca-project-samples
+  cancel-in-progress: false
+
+env:
+  VENV_PATH: .venv
+
+jobs:
+  collect:
+    # Upstream maintenance only, including manual dispatch.
+    if: github.repository == 'gadievron/raptor'
+    runs-on: ubuntu-latest
+    # Higher than the daily refreshes — cloning + scanning the corpus is
+    # the heaviest job. The collector now scans projects in parallel
+    # (``--jobs``), which cut a sequential ~20-min run to a few minutes;
+    # the headroom stays for cold caches and corpus growth.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The collector clones and scans ~50 third-party OSS projects
+          # with a contents:write token in scope; keep that token out of
+          # .git/config so the scan path can't reach it (same hardening
+          # as refresh-sca-data.yml / sca-self-bump.yml). The push
+          # authenticates explicitly via the gh credential helper (see
+          # Commit + push).
+          persist-credentials: false
+
+      - name: Enable the netns egress tier (unprivileged user namespaces)
+        # The SCA resolvers dry-run untrusted manifests with egress
+        # confined to the sandbox's netns tier, and the sandbox fails
+        # closed when that tier is unavailable (require_proxy_netns —
+        # the port-scoped Landlock fallback cannot enforce the hostname
+        # allowlist). Ubuntu 24.04 runner images block unprivileged
+        # user namespaces via AppArmor by default and the tier needs
+        # newuidmap/newgidmap from the uidmap package.
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'
+
+      # CVSS v4 scoring is a locked project extra; include it in the
+      # cached profile so installs and scoring share the project's pin.
+      - name: Restore or rebuild CVSS venv
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-runtime-cvss
+          uv-export-extra-args: --no-dev --extra cvss
+          save-on-rebuild: 'true'
+
+      - name: Expose runtime interpreter to subsequent steps
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
+              output.write(str(Path(os.environ["VENV_PATH"]).resolve() / "bin") + "\n")
+          PYTHON
+
+      - name: Collect samples
+        # ``-v`` emits per-sample status lines so the PR body can
+        # quote them. Exits 0 when all samples succeeded; 1 when at
+        # least one failed (others may still have written). PARTIAL
+        # failure proceeds to the diff/PR step — partial refresh is
+        # better than no refresh — but TOTAL failure (nonzero exit
+        # AND no sample file changed) must redden the run: a
+        # crash-at-import or all-samples-failed collector writes
+        # nothing, the diff is empty, and an unconditional ``true``
+        # here made a dead collector read green forever (the rot
+        # class the calibration sibling's refresh already guards).
+        run: |
+          set +e
+          # ``--jobs 4`` matches the ubuntu-latest vCPU count. Each project
+          # scans in its own process (full isolation; the egress proxy binds
+          # an ephemeral per-process port) and they share the on-disk cache.
+          packages/sca/scripts/raptor-sca-collect-samples -v --jobs 4
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && \
+             git diff --quiet -- packages/sca/data/calibration/project_samples/; then
+            echo "::error::sample collector exited $rc and wrote no sample changes — total failure, not an empty refresh"
+            exit "$rc"
+          fi
+
+      - name: License-compliance check
+        # Same gate the calibration-corpus refresh uses — verifies
+        # no forbidden field names (``shellcode``, ``payload``,
+        # etc.) appear in any sample output. Defensive against a
+        # scanned project producing finding metadata that happens
+        # to match the forbidden-field heuristic.
+        run: python -m packages.sca.calibration._license_check
+
+      - name: Validate corpus
+        # Re-run validation since project samples just refreshed.
+        # Top-N precision + Spearman ρ depend on the per-project
+        # finding sets being current. Verdict (validated_v1 /
+        # unverified / needs_retune) is quoted in the job log only —
+        # the report goes to a runner-temp path, NOT the tracked
+        # ``validation/`` dir. That dir has exactly ONE committing
+        # writer (refresh-sca-calibration.yml): both workflows
+        # writing the same date-keyed ``validation/<date>.json``
+        # produced an add/add merge conflict whenever they ran the
+        # same day (guaranteed by cron whenever the 1st of a month
+        # is a Tuesday).
+        run: |
+          set +e
+          packages/sca/scripts/raptor-sca-validate-corpus \
+            --out "$RUNNER_TEMP/validation-report.json"
+          echo "validate exit: $?"
+
+      - name: Diff?
+        id: diff
+        run: |
+          if git diff --quiet -- \
+              packages/sca/data/calibration/project_samples/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit + push to refresh branch
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          BRANCH="auto/sca-project-samples-refresh"
+          # persist-credentials:false (see Checkout) kept the token out of
+          # .git/config for the collect step. Install gh CLI's credential
+          # helper, which reads the token from env at push time without
+          # ever embedding it in any URL stored in .git/config.
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add packages/sca/data/calibration/project_samples/
+          git commit -m "chore(sca): refresh calibration project samples
+
+          Auto-generated by .github/workflows/refresh-sca-project-samples.yml.
+          Each sample is the OUR-generated output of running raptor-sca
+          against a curated OSS project; project source is not
+          redistributed. See packages/sca/data/calibration/ATTRIBUTION.md
+          for the project list and licensing posture."
+          # Replay the data commit onto current main before opening the
+          # PR — a branch cut from the dispatch-time checkout can be
+          # merges stale when refresh workflows run back-to-back, and a
+          # stale base turns any file overlap into a PR merge conflict
+          # (exactly how the same-day samples + calibration refreshes
+          # collided on the shared validation snapshot before it moved
+          # to a single writer). Disjoint write sets keep this rebase
+          # conflict-free; a genuine overlap fails HERE, loudly, instead
+          # of opening a conflicted PR.
+          git fetch origin main
+          git rebase origin/main
+          # --force-with-lease (not --force): refuses the push if the
+          # remote branch moved since our fetch — e.g. an operator amended
+          # the open auto-PR — rather than clobbering it. Fetch first to
+          # seed the lease baseline, but only when the branch already exists
+          # remotely: a bare fetch of a missing ref prints a misleading
+          # ``fatal: couldn't find remote ref`` on the first run (or after
+          # the prior auto-PR branch was merged + deleted). When the guard
+          # skips the fetch, the push simply creates the branch.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" || true   # tolerate a transient blip
+          fi
+          git push --force-with-lease origin "$BRANCH"
+
+      - name: Create or update PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          BRANCH="auto/sca-project-samples-refresh"
+          BODY=$(cat <<'EOF'
+          Auto-PR from `.github/workflows/refresh-sca-project-samples.yml`.
+
+          Refreshes the calibration corpus's project-sample scans. Each sample is RAPTOR-generated SCA output against a curated OSS project — project source itself is never redistributed.
+
+          ## Per-sample status
+
+          See the workflow run log for the per-sample `raptor-sca-collect-samples: <eco>/<name> ok (N findings)` output.
+
+          ## License compliance
+
+          The license-compliance check runs in CI and rejects any file with forbidden field names (`body`, `payload`, `shellcode`, `exploit_code`, `poc_code`). Project samples ship under MIT (RAPTOR-generated output).
+
+          ## Why this matters
+
+          The accumulated samples are what the calibration validation function (`raptor-sca-validate-corpus`) uses to compute top-N precision and Spearman correlation against the ground-truth signals. Until ~6 months of weekly snapshots accumulate, validation will report `unverified`; this PR is one of the monthly steps toward `validated_v1`.
+
+          ## Review checklist
+
+          - [ ] Per-sample finding counts look reasonable
+          - [ ] No license-restricted content in the diff
+          - [ ] Tests pass
+          EOF
+          )
+          # --repo pins the running repo: without it gh defaults the base
+          # repo to the upstream parent on a fork, so a manual fork run would
+          # target (and fail against) the parent instead of the fork.
+          if ! gh pr create \
+                --repo "$GITHUB_REPOSITORY" \
+                --base main \
+                --head "$BRANCH" \
+                --title "chore(sca): refresh calibration project samples" \
+                --body "$BODY" 2>/dev/null; then
+            gh pr edit --repo "$GITHUB_REPOSITORY" "$BRANCH" --body "$BODY"
+          fi
+          # Labels best-effort (see sca-self-bump): a missing label must
+          # never block the PR. Create them once under Settings → Labels.
+          for lbl in automated sca data-refresh; do
+            gh pr edit --repo "$GITHUB_REPOSITORY" "$BRANCH" --add-label "$lbl" 2>/dev/null \
+              || echo "label '$lbl' not in repo; skipping (create it under Settings → Labels to auto-apply)"
+          done

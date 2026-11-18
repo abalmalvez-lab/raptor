@@ -34,14 +34,31 @@ class CalculateETATest(unittest.TestCase):
 
 class ClearEOLTest(unittest.TestCase):
     def test_status_line_includes_clear_eol(self) -> None:
-        """Each status line carries `\\033[K` after the carriage
-        return so longer prior lines don't bleed through."""
+        """On a TTY, each status line carries `\\033[K` after the
+        carriage return so longer prior lines don't bleed through."""
         with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            err.isatty = lambda: True
             p = HackerProgress(total=5, operation="t")
             p.start_time = p.start_time - 5.0  # Get past throttle.
             p.last_update = 0
             p.update(current=1)
             self.assertIn("\r\x1b[K", err.getvalue())
+
+    def test_non_tty_update_emits_nothing(self) -> None:
+        """Off a TTY (CI logs, pipes) the per-tick redraw is
+        suppressed entirely — no ANSI litter — while the counter
+        still advances for finish()'s final plain line."""
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            p = HackerProgress(total=5, operation="t")
+            p.start_time = p.start_time - 5.0
+            p.last_update = 0
+            p.update(current=3)
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(p.current, 3)
+            p.finish()
+            out = err.getvalue()
+            self.assertIn("3/5", out)
+            self.assertNotIn("\x1b[K", out)
 
 
 class ExitMessageTest(unittest.TestCase):
@@ -157,7 +174,7 @@ class HackerProgressBarStageLifecycleTest(unittest.TestCase):
             bar.stage("osv")
             bar.done(summary="14 vuln")
             bar.end(summary="all good")
-        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+        lines = [line for line in buf.getvalue().splitlines() if line.strip()]
         # Header + discovery + osv + done footer = 4 lines.
         self.assertEqual(len(lines), 4)
         self.assertIn("sca", lines[0])
@@ -287,3 +304,74 @@ class HackerProgressBarLastStageSideChannelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HOSTILE = "pkg\x1b]0;pwned\x07\x9b2J‮evil@1.0"
+
+
+class ForeignTextEscapedAtChokepointTest(unittest.TestCase):
+    """flash/update/tick/stage carry caller text that can be
+    target-derived (hostile-manifest dependency names, advisory ids)
+    — the module escapes the FIELD values while its own framing
+    (spinner, bar, redraw sequences) stays raw."""
+
+    def _assert_no_raw(self, out: str) -> None:
+        for raw in ("\x1b]", "\x07", "\x9b", "‮"):
+            self.assertNotIn(raw, out)
+
+    def test_flash_message_escaped_but_redraw_ansi_kept(self) -> None:
+        buf = _FakeTTY()
+        with HackerProgressBar(target="x", stream=buf) as bar:
+            bar.stage("kev", total=2)
+            bar.flash("KEV", HOSTILE)
+            bar.done(summary="done")
+        out = buf.getvalue()
+        self._assert_no_raw(out)
+        self.assertIn("\x1b[K", out)  # the bar's OWN clear-EOL survives
+        self.assertIn("pkg", out)
+
+    def test_tick_detail_and_done_summary_escaped(self) -> None:
+        buf = io.StringIO()
+        with HackerProgressBar(target="x", stream=buf) as bar:
+            bar.stage("resolve")
+            bar.tick(detail=HOSTILE)
+            bar.done(summary=HOSTILE)
+        self._assert_no_raw(buf.getvalue())
+
+    def test_stage_name_escaped(self) -> None:
+        buf = io.StringIO()
+        with HackerProgressBar(target="x", stream=buf) as bar:
+            bar.stage(HOSTILE)
+            bar.done(summary="ok")
+        self._assert_no_raw(buf.getvalue())
+
+    def test_hacker_progress_update_message_escaped(self) -> None:
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            p = HackerProgress(total=10, operation="Scanning")
+            p._tty = True
+            p.last_update = 0  # bypass the 1s throttle
+            p.update(current=5, message=HOSTILE)
+            p.finish(message=HOSTILE)
+            out = err.getvalue()
+        self._assert_no_raw(out)
+        self.assertIn("5/10", out)
+
+
+class HeaderTargetEscapedTest(unittest.TestCase):
+    """The construction-time header is a field write like any other —
+    a hostile target string must not reach the stream raw."""
+
+    def test_header_target_escaped(self) -> None:
+        buf = io.StringIO()
+        with HackerProgressBar(target=HOSTILE, stream=buf) as bar:
+            bar.done(summary="ok")
+        out = buf.getvalue()
+        for raw in ("\x1b]", "\x07", "\x9b", "‮"):
+            self.assertNotIn(raw, out)
+        self.assertIn("sca > pkg", out)
+
+    def test_header_legit_target_unchanged(self) -> None:
+        buf = io.StringIO()
+        with HackerProgressBar(target="/src/münchen_μδ", stream=buf) as bar:
+            bar.done(summary="ok")
+        self.assertIn("sca > /src/münchen_μδ\n", buf.getvalue())

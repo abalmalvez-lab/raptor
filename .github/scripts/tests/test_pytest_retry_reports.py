@@ -1,0 +1,494 @@
+"""Targeted retries preserve successes, skips, failures and complete coverage."""
+
+import ast
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
+from types import SimpleNamespace
+import xml.etree.ElementTree as ET
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+SCRIPT = ROOT / '.github/scripts/pytest_retry_reports.py'
+spec = importlib.util.spec_from_file_location('retry_reports_under_test', SCRIPT)
+reports = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(reports)
+
+
+def guard_receipt(directory, **changes):
+    path = directory / 'owned-first-guards.json'
+    value = {'version': 1, 'attempt': 'owned-first-pass', 'complete': True,
+             'guards': {'git_config': True, 'egress': True,
+                        'session_budget': True, 'test_wall_budget': True}}
+    value.update(changes)
+    path.write_text(json.dumps(value))
+    return path
+
+
+def _eligible(path):
+    return reports.eligible(path, guard_receipt(path.parent), 'owned-first-pass')
+
+
+def _main(argv):
+    if argv[0] == 'eligible':
+        argv = [*argv, '--guard-report', str(guard_receipt(Path(argv[1]).parent)),
+                '--attempt', 'owned-first-pass']
+    return reports.main(argv)
+
+
+def report(path, rows):
+    suite = ET.Element('testsuite', name='pytest', time='1.5')
+    for name, outcomes in rows:
+        case = ET.SubElement(suite, 'testcase', classname='owned.tests', name=name, time='0.1')
+        for outcome in outcomes:
+            ET.SubElement(case, outcome, message='owned outcome')
+    suite.attrib.update({key: str(value) for key, value in reports._counts(suite.findall('testcase')).items()})
+    suite.set('tests', str(len(rows)))
+    root = ET.Element('testsuites')
+    root.append(suite)
+    ET.ElementTree(root).write(path)
+    return path
+
+
+def add_collection_skip(path, module='core.tests.test_optional', reason='optional SDK unavailable'):
+    tree = ET.parse(path)
+    suite = tree.find('testsuite')
+    case = ET.SubElement(suite, 'testcase', classname='', name=module, time='0.000')
+    ET.SubElement(case, 'skipped', message='collection skipped').text = reason
+    suite.set('tests', str(int(suite.get('tests')) + 1))
+    suite.set('skipped', str(int(suite.get('skipped')) + 1))
+    tree.write(path)
+    return ET.tostring(case)
+
+
+@pytest.mark.parametrize('repeated', [False, True], ids=['omitted', 'repeated'])
+def test_collection_skips_are_retained_without_becoming_retry_targets(tmp_path, repeated):
+    first = report(tmp_path / 'first.xml', [('passed', []), ('skipped', ['skipped']),
+                                             ('retry', ['failure'])])
+    retained = add_collection_skip(first)
+    retry = report(tmp_path / 'retry.xml', [('retry', [])])
+    if repeated:
+        add_collection_skip(retry)
+    originals = first.read_bytes(), retry.read_bytes()
+    assert _eligible(first) == 1
+    output = tmp_path / 'effective.xml'
+    assert reports.merge(first, retry, output)
+    _, suite, groups = reports._read(output)
+    assert len(groups) == 4
+    assert suite.get('tests') == '4'
+    assert suite.get('skipped') == '2'
+    assert suite.get('failures') == '0'
+    assert ET.tostring(groups[('', 'core.tests.test_optional')][0]) == retained
+    assert (first.read_bytes(), retry.read_bytes()) == originals
+
+
+@pytest.mark.parametrize('outcome', ['failure', 'error'])
+def test_collection_skips_do_not_hide_remaining_retry_failures(tmp_path, outcome):
+    first = report(tmp_path / 'first.xml', [('retry', ['failure'])])
+    retained = add_collection_skip(first)
+    retry = report(tmp_path / 'retry.xml', [('retry', [outcome])])
+    add_collection_skip(retry)
+    output = tmp_path / 'effective.xml'
+    assert not reports.merge(first, retry, output)
+    _, suite, groups = reports._read(output)
+    assert reports.failed_keys(groups) == {('owned.tests', 'retry')}
+    assert suite.get('tests') == '2' and suite.get('skipped') == '1'
+    assert ET.tostring(groups[('', 'core.tests.test_optional')][0]) == retained
+
+
+@pytest.mark.parametrize('kind', ['unexpected', 'changed', 'duplicate'])
+def test_retry_collection_metadata_cannot_change_or_duplicate_coverage(tmp_path, kind):
+    first = report(tmp_path / 'first.xml', [('retry', ['failure'])])
+    add_collection_skip(first)
+    retry = report(tmp_path / 'retry.xml', [('retry', [])])
+    if kind == 'unexpected':
+        add_collection_skip(retry, module='core.tests.test_new')
+    else:
+        add_collection_skip(retry, reason='different reason' if kind == 'changed'
+                            else 'optional SDK unavailable')
+        if kind == 'duplicate':
+            add_collection_skip(retry)
+    output = tmp_path / 'effective.xml'
+    output.write_text('keep existing report')
+    with pytest.raises(ValueError):
+        reports.merge(first, retry, output)
+    assert output.read_text() == 'keep existing report'
+
+
+@pytest.mark.parametrize('kind', ['failure', 'error', 'passed', 'runtime-skip',
+                                 'mixed', 'missing-class', 'runnable-name'])
+def test_empty_classname_cannot_hide_a_runnable_or_failed_case(tmp_path, kind):
+    path = report(tmp_path / 'report.xml', [])
+    add_collection_skip(path)
+    tree = ET.parse(path)
+    suite = tree.find('testsuite')
+    case = suite.find('testcase')
+    if kind in {'failure', 'error', 'passed', 'runtime-skip'}:
+        case.remove(case.find('skipped'))
+        if kind != 'passed':
+            ET.SubElement(case, 'skipped' if kind == 'runtime-skip' else kind,
+                          message='ordinary runtime outcome')
+    elif kind == 'mixed':
+        ET.SubElement(case, 'failure')
+    elif kind == 'missing-class':
+        del case.attrib['classname']
+    else:
+        case.set('name', 'core.tests.test_optional::test_case')
+    suite.attrib.update({name: str(count) for name, count in
+                         reports._counts(suite.findall('testcase')).items()})
+    tree.write(path)
+    with pytest.raises(ValueError, match='unambiguous classname/name'):
+        _eligible(path)
+
+
+@pytest.mark.parametrize('outcomes, expected', [([], 0), (['skipped'], 0), (['failure'], 1), (['error'], 1)])
+def test_eligibility_uses_case_failures(tmp_path, outcomes, expected):
+    path = report(tmp_path / 'first.xml', [('case', outcomes)])
+    assert _eligible(path) == expected
+
+
+@pytest.mark.parametrize('payload', ['<broken', '<root/>', '<testsuite/>',
+    '<testsuite tests="1" failures="1" errors="0" skipped="0"><testcase name="ambiguous"><failure/></testcase></testsuite>'])
+def test_bad_reports_cannot_authorize_retry(tmp_path, payload):
+    path = tmp_path / 'first.xml'
+    path.write_text(payload)
+    assert _main(['eligible', str(path), str(tmp_path / 'cache')]) == 1
+
+
+def test_missing_report_cannot_authorize_retry(tmp_path):
+    assert _main(['eligible', str(tmp_path / 'missing.xml'), str(tmp_path / 'cache')]) == 1
+
+
+def test_merge_retains_first_pass_successes_and_skips(tmp_path):
+    first = report(tmp_path / 'first.xml', [('passed', []), ('skipped', ['skipped']), ('retry', ['failure'])])
+    retry = report(tmp_path / 'retry.xml', [('retry', [])])
+    originals = first.read_bytes(), retry.read_bytes()
+    output = tmp_path / 'effective.xml'
+    assert reports.merge(first, retry, output)
+    _, suite, groups = reports._read(output)
+    assert set(groups) == {('owned.tests', name) for name in ('passed', 'skipped', 'retry')}
+    assert suite.get('skipped') == '1'
+    assert suite.get('failures') == '0'
+    assert suite.get('tests') == '3'
+    assert float(suite.get('time')) == 3
+    assert (first.read_bytes(), retry.read_bytes()) == originals
+
+
+@pytest.mark.parametrize('retry_rows', [[('one', [])], [('one', []), ('two', []), ('extra', [])], []])
+def test_missing_or_unexpected_retry_cases_refuse_effective_report(tmp_path, retry_rows):
+    first = report(tmp_path / 'first.xml', [('one', ['failure']), ('two', ['error'])])
+    retry = report(tmp_path / 'retry.xml', retry_rows)
+    output = tmp_path / 'effective.xml'
+    output.write_bytes(first.read_bytes())
+    with pytest.raises(ValueError, match='exactly'):
+        reports.merge(first, retry, output)
+    assert output.read_bytes() == first.read_bytes()
+
+
+def test_retry_to_skip_is_not_recovered_coverage(tmp_path):
+    first = report(tmp_path / 'first.xml', [('retry', ['failure'])])
+    retry = report(tmp_path / 'retry.xml', [('retry', ['skipped'])])
+    with pytest.raises(ValueError, match='skipped on retry'):
+        reports.merge(first, retry, tmp_path / 'effective.xml')
+
+
+def test_remaining_failure_still_fails_and_keeps_full_report(tmp_path):
+    first = report(tmp_path / 'first.xml', [('passed', []), ('retry', ['failure'])])
+    retry = report(tmp_path / 'retry.xml', [('retry', ['error'])])
+    output = tmp_path / 'effective.xml'
+    assert _main(['merge', str(first), str(retry), str(output)]) == 1
+    _, suite, groups = reports._read(output)
+    assert len(groups) == 2
+    assert suite.get('errors') == '1'
+
+
+def test_duplicate_failed_phase_records_are_replaced_together(tmp_path):
+    first = report(tmp_path / 'first.xml', [('retry', ['failure']), ('retry', ['error']), ('passed', [])])
+    retry = report(tmp_path / 'retry.xml', [('retry', [])])
+    output = tmp_path / 'effective.xml'
+    assert reports.merge(first, retry, output)
+    _, suite, groups = reports._read(output)
+    assert len(groups) == 2 and suite.get('errors') == '0'
+
+
+def test_ambiguous_passed_duplicate_identity_is_refused(tmp_path):
+    path = report(tmp_path / 'first.xml', [('same', []), ('same', ['failure'])])
+    with pytest.raises(ValueError, match='ambiguous duplicate'):
+        _eligible(path)
+
+
+@pytest.mark.parametrize('field,value', [('failures', '99'), ('errors', '-1'), ('skipped', 'bad'), ('tests', '-1'), ('tests', '0'), ('tests', '99'), ('time', 'nan')])
+def test_inconsistent_summary_is_refused(tmp_path, field, value):
+    path = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    tree = ET.parse(path)
+    tree.find('testsuite').set(field, value)
+    tree.write(path)
+    with pytest.raises(ValueError):
+        _eligible(path)
+
+
+def test_raw_attempt_cannot_be_overwritten(tmp_path):
+    first = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    retry = report(tmp_path / 'retry.xml', [('case', [])])
+    with pytest.raises(ValueError, match='overwrite'):
+        reports.merge(first, retry, first)
+
+
+@pytest.mark.parametrize('payload', [None, '{}', '{"wrong": false}', '{broken', '[]'])
+def test_missing_or_inconsistent_cache_cannot_authorize_retry(tmp_path, payload):
+    path = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    cache = tmp_path / 'cache'
+    if payload is not None:
+        (cache / 'v/cache').mkdir(parents=True)
+        (cache / 'v/cache/lastfailed').write_text(payload)
+    assert _main(['eligible', str(path), str(cache)]) == 1
+
+
+def test_matching_failed_cache_authorizes_targeted_retry(tmp_path):
+    path = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    cache = tmp_path / 'cache'
+    (cache / 'v/cache').mkdir(parents=True)
+    (cache / 'v/cache/lastfailed').write_text('{"owned/test_case.py::case": true}')
+    assert _main(['eligible', str(path), str(cache)]) == 0
+
+
+def integration_step():
+    # This CI lane installs pytest only. Read the concrete literal shell block
+    # without importing a YAML parser (or evaluating workflow expressions).
+    source = (ROOT / '.github/workflows/nightly.yml').read_text()
+    jobs = source.split('\njobs:\n', 1)[1]
+    job = re.search(r'^  slow-integration:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)',
+                    jobs, re.M | re.S)
+    assert job is not None, 'slow-integration job missing'
+    steps = re.split(r'^      - ', job[1], flags=re.M)[1:]
+    integration = next(step for step in steps
+                       if re.search(r'^        id: integration_tests$', step, re.M))
+    body = re.search(r'^        run: \|\n((?:          .*\n|\n)+)', integration, re.M)
+    assert body is not None, 'integration command must remain a literal shell block'
+    return textwrap.dedent(body[1]), steps
+
+
+def test_workflow_uses_isolated_cache_and_complete_effective_report():
+    body, steps = integration_step()
+    assert body.count('cache_dir=$RUNNER_TEMP/integration-pytest-cache') == 2
+    assert body.count('--cache-clear') == 1
+    assert body.count('--lf --last-failed-no-failures=none') == 1
+    assert '"$rc" -ne 1' in body
+    assert 'pytest_retry_reports.py eligible' in body
+    assert 'pytest_retry_reports.py merge' in body
+    assert 'exit "$retry_rc"' in body
+    budget = next(step for step in steps if step.startswith('name: Check integration skip count'))
+    assert '--junit-xml "$RUNNER_TEMP/integration.xml"' in budget
+    assert "steps.integration_tests.outcome == 'failure'" in budget
+    upload = next(step for step in steps if step.startswith('name: Upload test results\n'))
+    assert 'integration-attempt-*.xml' in upload
+    assert '/integration.xml' in upload
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize('scenario', ['call-and-teardown', 'teardown-only', 'session-failure',
+                                      'mixed-guard-and-case', 'missing-guard-receipt'])
+def test_real_workflow_retries_only_failed_cases_and_preserves_global_failures(tmp_path, scenario):
+    session_failure = scenario in {'session-failure', 'mixed-guard-and-case'}
+    for directory in ('core', 'packages', 'engine', '.github/tests', '.github/scripts/tests', 'artifacts', 'bin'):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    (tmp_path / '.github/scripts/pytest_retry_reports.py').write_bytes(SCRIPT.read_bytes())
+    (tmp_path / 'pytest.ini').write_text('[pytest]\naddopts = --import-mode=importlib\nmarkers =\n    integration: owned workflow smoke\n')
+    (tmp_path / 'core/test_cases.py').write_text('''
+from pathlib import Path
+import pytest
+pytestmark = pytest.mark.integration
+HERE = Path(__file__).parent
+
+def test_passed_once():
+    path = HERE / 'passed'
+    assert not path.exists(), 'a first-pass success was needlessly rerun'
+    path.write_text('once')
+
+@pytest.fixture
+def phase_error():
+    yield
+    path = HERE / 'teardown'
+    if not SESSION_FAILURE and not path.exists():
+        path.write_text('once')
+        raise RuntimeError('owned first-attempt teardown failure')
+
+def test_retry_case(phase_error):
+    path = HERE / 'retried'
+    if not path.exists():
+        path.write_text('once')
+        assert not CALL_FAILURE, 'owned transient failure'
+
+def test_existing_skip():
+    pytest.skip('owned existing skip')
+'''.replace('SESSION_FAILURE', repr(session_failure)).replace('CALL_FAILURE', repr(scenario in {'call-and-teardown', 'mixed-guard-and-case'})))
+    (tmp_path / 'core/test_missing.py').write_text(
+        "import pytest\npytest.skip('owned module skip', allow_module_level=True)\n")
+    (tmp_path / 'conftest.py').write_text("""import json, os
+from pathlib import Path
+HERE = Path(__file__).parent
+
+def pytest_sessionfinish(session):
+    marker = HERE / 'global-guard-first-pass'
+    failed = SESSION_FAILURE and not marker.exists()
+    if failed:
+        marker.write_text('owned global guard failure')
+        session.exitstatus = 1
+    if not MISSING_GUARD:
+        Path(os.environ['RAPTOR_PYTEST_GUARD_REPORT']).write_text(json.dumps({
+            'version': 1, 'attempt': os.environ['RAPTOR_PYTEST_GUARD_ATTEMPT'],
+            'complete': True, 'guards': {'git_config': True, 'egress': True,
+                'session_budget': not failed, 'test_wall_budget': True}}))
+""".replace('SESSION_FAILURE', repr(session_failure))
+        .replace('MISSING_GUARD', repr(scenario == 'missing-guard-receipt')))
+    sleep = tmp_path / 'bin/sleep'
+    sleep.write_text('#!/bin/sh\nexit 0\n')
+    sleep.chmod(0o700)
+    body, _ = integration_step()
+    env = dict(os.environ, VENV_PATH=str(Path(sys.executable).parent.parent),
+               RUNNER_TEMP=str(tmp_path / 'artifacts'),
+               PATH=str(tmp_path / 'bin') + os.pathsep + os.environ.get('PATH', ''),
+               PYTHONPATH=str(ROOT), PYTEST_DISABLE_PLUGIN_AUTOLOAD='1',
+               PYTEST_ADDOPTS='-p core.testing.llm_tripwire')
+    process = subprocess.run(['/bin/bash', '-e', '-c', body], cwd=tmp_path,
+                             env=env, capture_output=True, text=True, timeout=60)
+    refused = session_failure or scenario == "missing-guard-receipt"
+    assert process.returncode == (1 if refused else 0), process.stdout + process.stderr
+    artifacts = tmp_path / 'artifacts'
+    assert (artifacts / 'integration-attempt-2.xml').exists() is not refused
+    _, suite, groups = reports._read(artifacts / 'integration.xml')
+    assert len(groups) == 4
+    assert suite.get('failures') == ('1' if scenario == 'mixed-guard-and-case' else '0')
+    assert suite.get('skipped') == '2'
+    assert groups[('', 'core.test_missing')][0].find('skipped').get('message') == 'collection skipped'
+    assert (tmp_path / 'core/passed').read_text() == 'once'
+
+
+@pytest.mark.parametrize('field', ['git_config', 'egress', 'session_budget', 'test_wall_budget'])
+def test_failed_global_guard_never_authorizes_case_retry(tmp_path, field):
+    first = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    guard = guard_receipt(tmp_path)
+    value = json.loads(guard.read_text())
+    value['guards'][field] = False
+    guard.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match='global guards failed'):
+        reports.eligible(first, guard, 'owned-first-pass')
+
+
+@pytest.mark.parametrize('kind', ['missing', 'malformed', 'incomplete', 'stale', 'bool-version',
+                                 'wrong-schema', 'nonbool-guard', 'missing-guard', 'extra-guard'])
+def test_guard_receipt_fails_closed(tmp_path, kind):
+    first = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    guard = guard_receipt(tmp_path)
+    value = json.loads(guard.read_text())
+    if kind == 'missing':
+        guard.unlink()
+    elif kind == 'malformed':
+        guard.write_text('{broken')
+    else:
+        if kind == 'incomplete':
+            value['complete'] = False
+        elif kind == 'stale':
+            value['attempt'] = 'different-attempt'
+        elif kind == 'bool-version':
+            value['version'] = True
+        elif kind == 'wrong-schema':
+            value['unexpected'] = True
+        elif kind == 'nonbool-guard':
+            value['guards']['session_budget'] = 1
+        elif kind == 'missing-guard':
+            del value['guards']['egress']
+        else:
+            value['guards']['extra'] = True
+        guard.write_text(json.dumps(value))
+    with pytest.raises(ValueError):
+        reports.eligible(first, guard, 'owned-first-pass')
+
+
+def test_missing_receipt_arguments_refuse_retry_even_with_valid_case_cache(tmp_path):
+    first = report(tmp_path / 'first.xml', [('case', ['failure'])])
+    cache = tmp_path / 'cache'
+    (cache / 'v/cache').mkdir(parents=True)
+    (cache / 'v/cache/lastfailed').write_text('{"owned/test_case.py::case": true}')
+    assert reports.main(['eligible', str(first), str(cache)]) == 1
+
+
+def root_guard_namespace(tmp_path, *, worker=False):
+    tree = ast.parse((ROOT / 'conftest.py').read_text())
+    names = {'pytest_sessionfinish', '_write_global_guard_report'}
+    selected = ast.Module(body=[node for node in tree.body
+                               if isinstance(node, ast.FunctionDef) and node.name in names],
+                          type_ignores=[])
+    assert len(selected.body) == 2
+    guard_path = tmp_path / 'actual-root-guards.json'
+    namespace = {'os': SimpleNamespace(environ={
+        'RAPTOR_PYTEST_GUARD_REPORT': str(guard_path),
+        'RAPTOR_PYTEST_GUARD_ATTEMPT': 'actual-hook-first'}),
+        'Path': Path, '_git_config_drift': [], '_egress_leaks': [],
+        '_session_overrun': None, '_slow_test_overruns': [],
+        '_egress_leak_dir_owner': False, '_egress_leak_dir': None,
+        '_slow_test_threshold': None}
+    exec(compile(selected, '<owned-root-guard-hook>', 'exec'), namespace)
+    config = SimpleNamespace(workerinput={}) if worker else SimpleNamespace()
+    return namespace, SimpleNamespace(config=config, exitstatus=1), guard_path
+
+
+@pytest.mark.parametrize('failed_guard', [None, 'git_config', 'egress', 'session_budget', 'test_wall_budget'])
+def test_actual_controller_hook_retains_guard_result_with_case_failure(tmp_path, failed_guard):
+    namespace, session, path = root_guard_namespace(tmp_path)
+    calls = []
+    def git_guard(session):
+        calls.append('git')
+        if failed_guard == 'git_config':
+            namespace['_git_config_drift'].append('owned drift')
+    def egress_guard(session):
+        calls.append('egress')
+        if failed_guard == 'egress':
+            namespace['_egress_leaks'].append('owned leak')
+    def budget_guard(session):
+        calls.append('budget')
+        if failed_guard == 'session_budget':
+            namespace['_session_overrun'] = 12.0
+    namespace.update(_check_git_config_drift=git_guard, _check_egress_leak=egress_guard,
+                     _check_session_budget=budget_guard)
+    if failed_guard == 'test_wall_budget':
+        namespace['_slow_test_overruns'].append(('owned-case', 'call', 12.0))
+    namespace['pytest_sessionfinish'](session, 1)
+    assert calls == ['git', 'egress', 'budget']
+    assert session.exitstatus == 1  # The original case failure is never cleared.
+    value = json.loads(path.read_text())
+    assert value['complete'] is True and value['attempt'] == 'actual-hook-first'
+    assert {name for name, passed in value['guards'].items() if not passed} == (
+        set() if failed_guard is None else {failed_guard})
+    if failed_guard is None:
+        reports.require_passing_guards(path, 'actual-hook-first')
+    else:
+        with pytest.raises(ValueError, match='global guards failed'):
+            reports.require_passing_guards(path, 'actual-hook-first')
+
+
+def test_incomplete_actual_guard_hook_cannot_authorize_retry(tmp_path):
+    namespace, session, path = root_guard_namespace(tmp_path)
+    failure = OSError('controlled guard failure')
+    def fail(session):
+        raise failure
+    namespace.update(_check_git_config_drift=fail, _check_egress_leak=lambda session: None,
+                     _check_session_budget=lambda session: None)
+    with pytest.raises(OSError) as caught:
+        namespace['pytest_sessionfinish'](session, 1)
+    assert caught.value is failure
+    assert json.loads(path.read_text())['complete'] is False
+    with pytest.raises(ValueError, match='incomplete'):
+        reports.require_passing_guards(path, 'actual-hook-first')
+
+
+def test_worker_cannot_emit_controller_guard_receipt(tmp_path):
+    namespace, session, path = root_guard_namespace(tmp_path, worker=True)
+    namespace['_write_global_guard_report'](session, complete=True)
+    assert not path.exists()

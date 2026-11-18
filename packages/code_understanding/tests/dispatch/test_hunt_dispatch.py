@@ -9,8 +9,8 @@ test scripts a sequence of turns to exercise specific code paths.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +22,6 @@ from core.llm.tool_use.types import (
     ToolCall,
     TurnResponse,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake provider: scripts a sequence of TurnResponse values.
@@ -157,6 +156,130 @@ class TestHappyPath:
                 fake_model_config, "strcpy misuse", str(repo),
             )
         assert result == variants_payload
+
+
+class TestTrajectoryWiring:
+    """Hunt dispatch persists a trajectory under
+    ``$RAPTOR_TRAJECTORY_DIR/trajectories/hunt-<model>/`` when the
+    env var is set, no-op otherwise."""
+
+    def test_trajectory_written_when_env_var_set(
+        self, repo, fake_model_config, tmp_path, monkeypatch,
+    ):
+        from core.trajectories.auto import TRAJECTORY_DIR_ENV
+        from packages.code_understanding.dispatch.hunt_dispatch import (
+            default_hunt_dispatch,
+        )
+
+        monkeypatch.setenv(TRAJECTORY_DIR_ENV, str(tmp_path))
+        turns = [
+            FakeTurn(tool_calls=[("submit_variants", {"variants": []})]),
+        ]
+        with _patch_provider(turns):
+            default_hunt_dispatch(
+                fake_model_config, "strcpy", str(repo),
+            )
+
+        # Trajectory should land at the deterministic path the
+        # dispatch derives from the model name.
+        traj_path = (
+            tmp_path / "trajectories"
+            / f"hunt-{fake_model_config.model_name}"
+            / "trajectory.json"
+        )
+        assert traj_path.exists(), (
+            f"trajectory not at {traj_path}; "
+            f"tree was: {list(tmp_path.rglob('*'))}"
+        )
+        payload = json.loads(traj_path.read_text())
+        assert payload["run_id"] == f"hunt-{fake_model_config.model_name}"
+        assert payload["model_name"] == fake_model_config.model_name
+        # finding_id/cwe are empty because hunt isn't finding-driven.
+        assert payload["finding_id"] == ""
+        assert payload["cwe"] == ""
+
+    def test_unset_env_var_is_noop(
+        self, repo, fake_model_config, tmp_path, monkeypatch,
+    ):
+        """No env var → no trajectory directory created."""
+        from core.trajectories.auto import TRAJECTORY_DIR_ENV
+        from packages.code_understanding.dispatch.hunt_dispatch import (
+            default_hunt_dispatch,
+        )
+
+        monkeypatch.delenv(TRAJECTORY_DIR_ENV, raising=False)
+        turns = [
+            FakeTurn(tool_calls=[("submit_variants", {"variants": []})]),
+        ]
+        # Run from tmp_path so any accidental write would land there.
+        monkeypatch.chdir(tmp_path)
+        with _patch_provider(turns):
+            default_hunt_dispatch(
+                fake_model_config, "strcpy", str(repo),
+            )
+        assert not (tmp_path / "trajectories").exists()
+
+    def test_partial_trajectory_persisted_on_cost_cap(
+        self, repo, fake_model_config, tmp_path, monkeypatch,
+    ):
+        """When the loop raises CostBudgetExceeded, the partial-
+        trajectory helper writes whatever turns survived. This is
+        precisely when the trajectory is most useful for operator
+        debugging ("why did this model burn through its budget?").
+
+        Patches ToolUseLoop.run directly with a side_effect that
+        raises CostBudgetExceeded carrying partial state (PR #828
+        contract). Side-steps the natural-trigger path so the test
+        doesn't depend on cost-arithmetic edge cases of the fake
+        provider."""
+        from unittest.mock import patch as _patch
+
+        from core.llm.tool_use.types import (
+            CostBudgetExceeded,
+            Message,
+            TextBlock,
+        )
+        from core.trajectories.auto import TRAJECTORY_DIR_ENV
+        from packages.code_understanding.dispatch.hunt_dispatch import (
+            default_hunt_dispatch,
+        )
+
+        monkeypatch.setenv(TRAJECTORY_DIR_ENV, str(tmp_path))
+
+        partial_messages = [
+            Message(role="user", content=[TextBlock(text="hunt")]),
+            Message(role="assistant", content=[
+                TextBlock(text="exploring before budget hit"),
+            ]),
+        ]
+        exc = CostBudgetExceeded(
+            "budget", messages=partial_messages, tool_calls_made=0,
+        )
+
+        with _patch_provider([FakeTurn(text="never reached")]), _patch(
+            "core.llm.tool_use.loop.ToolUseLoop.run",
+            side_effect=exc,
+        ):
+            result = default_hunt_dispatch(
+                fake_model_config, "x", str(repo),
+            )
+
+        assert isinstance(result, list) and result and "error" in result[0]
+        assert "cost budget exceeded" in result[0]["error"]
+
+        traj_path = (
+            tmp_path / "trajectories"
+            / f"hunt-{fake_model_config.model_name}"
+            / "trajectory.json"
+        )
+        assert traj_path.exists(), (
+            f"partial trajectory should land on cost-cap; "
+            f"not at {traj_path}\ntree: {list(tmp_path.rglob('*'))}"
+        )
+        payload = json.loads(traj_path.read_text())
+        assert payload["terminated_by"] == "max_cost_usd"
+        # Partial messages survived from the exception.
+        assert len(payload["steps"]) == len(partial_messages)
 
     def test_model_uses_grep_then_submits(self, repo, fake_model_config):
         """Multi-turn: model greps first, then submits."""
@@ -388,6 +511,38 @@ class TestErrorPaths:
         files = {v["file"] for v in result}
         assert files == {"x.c", "ok.c"}
 
+    def test_unhashable_line_values_filtered(self, repo, fake_model_config):
+        """A list/dict line value must be dropped at the boundary: it
+        would end up inside a merge dict key and crash the entire
+        run_multi_model call, discarding every model's results. Digit
+        strings normalise to int so dedup keys agree across models."""
+        from packages.code_understanding.dispatch.hunt_dispatch import (
+            default_hunt_dispatch,
+        )
+
+        turns = [
+            FakeTurn(tool_calls=[("submit_variants", {
+                "variants": [
+                    {"file": "x.c", "line": 1},       # valid
+                    {"file": "y.c", "line": [42]},    # unhashable — filtered
+                    {"file": "z.c", "line": {"n": 1}},  # unhashable — filtered
+                    {"file": "s.c", "line": "42"},    # digit string — coerced
+                    {"file": "w.c", "line": "4a"},    # non-numeric — filtered
+                    {"file": "b.c", "line": True},    # bool — filtered
+                ],
+            })]),
+        ]
+
+        with _patch_provider(turns):
+            result = default_hunt_dispatch(
+                fake_model_config, "any", str(repo),
+            )
+        assert {(v["file"], v["line"]) for v in result} == {
+            ("x.c", 1), ("s.c", 42),
+        }
+        # Every surviving line is an int — safe as a dedup-key member.
+        assert all(isinstance(v["line"], int) for v in result)
+
     def test_provider_exception_caught(self, repo, fake_model_config):
         """If the provider itself raises (e.g. transport error), surface as error entry."""
         from packages.code_understanding.dispatch.hunt_dispatch import (
@@ -408,6 +563,33 @@ class TestErrorPaths:
         assert len(result) == 1
         assert "error" in result[0]
         assert "RuntimeError" in result[0]["error"]
+
+    def test_loop_exception_reports_budget_cap_to_cost_collector(
+        self, repo, fake_model_config,
+    ):
+        """Spend before a mid-loop failure is unobservable; the
+        dispatch must report the cap (fail-safe) rather than $0, so
+        the aggregate budget gate cannot let later models overspend."""
+        from packages.code_understanding.dispatch.hunt_dispatch import (
+            default_hunt_dispatch,
+        )
+
+        class ExplodingProvider(FakeProvider):
+            def turn(self, messages, tools, **kwargs):
+                raise RuntimeError("mid-loop boom")
+
+        collected: list[float] = []
+        with patch(
+            "packages.code_understanding.dispatch.hunt_dispatch.create_provider",
+            return_value=ExplodingProvider([]),
+        ):
+            result = default_hunt_dispatch(
+                fake_model_config, "any", str(repo),
+                max_cost_usd=1.25,
+                cost_collector=collected.append,
+            )
+        assert "error" in result[0]
+        assert collected == [1.25]
 
 
 class TestDirectCallerValidation:
@@ -494,9 +676,9 @@ class TestDirectCallerValidation:
         captured = {}
         original = _format_user_message
 
-        def _capture(p):
+        def _capture(p, repo_path=None):
             captured["pattern"] = p
-            return original(p)
+            return original(p, repo_path)
 
         # Run a happy-path-shaped script; we just need the dispatch to
         # hit _format_user_message before terminating.
@@ -540,3 +722,54 @@ class TestSandboxBoundary:
         read_tool = next(t for t in tools if t.name == "read_file")
         out = json.loads(read_tool.handler({"path": "../../etc/passwd"}))
         assert "error" in out
+
+
+class TestVerboseCallbackScrub:
+    """The verbose callback relays model-authored text and tool-arg
+    summaries, which quote hostile target-file content — the lines
+    must be terminal-safe for ANY logger consumer."""
+
+    def _emit(self, blocks) -> list:
+        from core.llm.tool_use import StopReason, TurnCompleted, TurnResponse
+        from packages.code_understanding.dispatch.hunt_dispatch import (
+            _make_event_callback,
+        )
+        lines: list = []
+        cb = _make_event_callback("m", "hunt", lines.append)
+        cb(TurnCompleted(
+            iteration=1,
+            response=TurnResponse(
+                content=blocks, stop_reason=StopReason.COMPLETE,
+                input_tokens=1, output_tokens=1,
+            ),
+            cost_usd=0.0,
+        ))
+        return lines
+
+    def test_model_text_escaped(self) -> None:
+        from core.llm.tool_use import TextBlock
+        lines = self._emit([TextBlock(text="pwn \x1b[2J\x9bhidden")])
+        assert lines, "text block should log"
+        assert all("\x1b" not in ln and "\x9b" not in ln for ln in lines)
+        assert any("pwn" in ln for ln in lines)
+
+    def test_tool_args_escaped(self) -> None:
+        from core.llm.tool_use import ToolCall
+        lines = self._emit([ToolCall(
+            id="t1", name="Grep",
+            input={"pattern": "x \x1b]0;evil\x07"},
+        )])
+        assert lines, "tool call should log"
+        assert all("\x1b" not in ln and "\x07" not in ln for ln in lines)
+
+    def test_tool_name_escaped(self) -> None:
+        """Tool NAMES are model-minted (the fix's own derivation) —
+        previously both fixtures used a benign name, so reverting the
+        name-lane escape survived the suite."""
+        from core.llm.tool_use import ToolCall
+        lines = self._emit([ToolCall(
+            id="t1", name="Grep\x1b[2J\x9bhidden", input={},
+        )])
+        assert lines, "tool call should log"
+        assert all("\x1b" not in ln and "\x9b" not in ln for ln in lines)
+        assert any("Grep" in ln for ln in lines)

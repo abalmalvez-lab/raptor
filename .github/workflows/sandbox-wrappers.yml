@@ -1,0 +1,269 @@
+name: Sandbox wrapper acceptance
+
+on:
+  merge_group:
+  pull_request:
+    paths: ['core/**', 'packages/**', 'engine/**', 'tuning.json', 'libexec/**', 'bin/**', '*.py', 'test/**', '.github/**', 'pyproject.toml', 'uv.lock', 'conftest.py', 'pytest.ini']
+  push:
+    branches: [main]
+    paths: ['core/**', 'packages/**', 'engine/**', 'tuning.json', 'libexec/**', 'bin/**', '*.py', 'test/**', '.github/**', 'pyproject.toml', 'uv.lock', 'conftest.py', 'pytest.ini']
+  schedule:
+    - cron: '30 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-wrappers-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  PYTHON_VERSION: '3.14'
+  VENV_PATH: .venv
+
+jobs:
+  scope:
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      matrix: ${{ steps.scope.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve verified push base
+        id: push_base
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci_push_base.py --workflow sandbox-wrappers.yml
+
+      - name: Check registration and select affected wrappers
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name != 'push' && (github.event.pull_request.base.sha || github.event.merge_group.base_sha) || steps.push_base.outputs.base }}
+        run: python3 .github/scripts/sandbox_wrapper_scope.py
+
+      - name: Record verified push scope v1
+        if: github.event_name == 'push'
+        run: echo 'Cumulative push scope completed.'
+
+  acceptance:
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    name: wrappers-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      WRAPPER_SELECTION: ${{ toJSON(matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          # Keep parser-built wheels separate from base-only immutable caches.
+          cache-suffix: ${{ (contains(matrix.families, 'gadget-parsers') || contains(matrix.families, 'elf-worker')) && 'sandbox-wrappers' || 'base' }}
+          # All Python parser tools are resolved by the project lockfile.
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
+          # macOS ARM builds Unicorn from source. Retain built wheels without
+          # uploading the much larger set of downloadable binary wheels.
+          prune-cache: ${{ runner.os == 'macOS' && (contains(matrix.families, 'gadget-parsers') || contains(matrix.families, 'elf-worker')) }}
+      - uses: ./.github/actions/enable-userns
+        if: runner.os == 'Linux'
+      - uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-sandbox-wrappers-browser
+          uv-export-extra-args: >-
+            --extra binary --extra r2pipe --extra frida --extra llm --extra grammars --extra web
+            ${{ (contains(matrix.families, 'gadget-parsers') || contains(matrix.families, 'elf-worker')) && '--group sandbox-wrappers' || '' }}
+          save-on-rebuild: 'true'
+      - name: Install Linux parser tools and Chromium dependencies
+        # Contracts include a real confinement check; keep libseccomp2 even
+        # when no native family is selected.
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        env:
+          NEEDS_RADARE2: ${{ contains(matrix.families, 'radare2') }}
+          NEEDS_GADGETS: ${{ contains(matrix.families, 'gadget-parsers') }}
+          NEEDS_BROWSER: ${{ contains(matrix.families, 'playwright-browser') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(binutils libseccomp2)
+          if [[ "$NEEDS_RADARE2" == true ]]; then packages+=(radare2); fi
+          if [[ "$NEEDS_GADGETS" == true ]]; then packages+=(ruby); fi
+          if [[ "$NEEDS_BROWSER" == true ]]; then
+            sudo bash .github/scripts/with-ubuntu-apt.sh packages-playwright \
+              "$GITHUB_WORKSPACE/$VENV_PATH/bin/python" "${packages[@]}"
+          else
+            sudo bash .github/scripts/with-ubuntu-apt.sh packages "${packages[@]}"
+          fi
+      - name: Install macOS parser tools
+        if: runner.os == 'macOS' && toJSON(matrix.families) != '[]'
+        timeout-minutes: 8
+        env:
+          NEEDS_RADARE2: ${{ contains(matrix.families, 'radare2') }}
+          NEEDS_GADGETS: ${{ contains(matrix.families, 'gadget-parsers') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(binutils)
+          if [[ "$NEEDS_RADARE2" == true ]]; then packages+=(radare2); fi
+          if [[ "$NEEDS_GADGETS" == true ]]; then packages+=(ruby); fi
+          brew install "${packages[@]}"
+          if [[ "$NEEDS_GADGETS" == true ]]; then
+            wrapper_ruby_prefix=$(brew --prefix ruby)
+            echo "$wrapper_ruby_prefix/bin" >> "$GITHUB_PATH"
+          fi
+          wrapper_binutils_prefix=$(brew --prefix binutils)
+          echo "$wrapper_binutils_prefix/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: Expose cached Python parser tools
+        # The isolated ELF worker also imports pwntools; it is not solely a
+        # gadget-parser dependency.
+        if: contains(matrix.families, 'gadget-parsers') || contains(matrix.families, 'elf-worker')
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$VENV_PATH/bin/ROPgadget"
+          echo "$GITHUB_WORKSPACE/$VENV_PATH/bin" >> "$GITHUB_PATH"
+      - name: Install Ruby parser dependencies
+        if: contains(matrix.families, 'gadget-parsers')
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          gem install --no-document --install-dir "$RUNNER_TEMP/wrapper-gems" one_gadget -v 1.10.0
+          echo "$RUNNER_TEMP/wrapper-gems/bin" >> "$GITHUB_PATH"
+      - name: Install isolated Chromium runtime
+        if: contains(matrix.families, 'playwright-browser')
+        timeout-minutes: 5
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/wrapper-browsers
+        run: |
+          set -euo pipefail
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+          "$VENV_PATH/bin/python" -m playwright install chromium
+      - name: Exercise registered dispatch contracts
+        id: contracts
+        if: toJSON(matrix.contracts) != '[]'
+        shell: bash
+        run: |
+          "$VENV_PATH/bin/python" .github/scripts/run_sandbox_wrapper_tests.py \
+            --lane contracts --selection-json "$WRAPPER_SELECTION" --report-dir "$RUNNER_TEMP/wrapper-contracts"
+      - name: Exercise real platform confinement
+        id: native
+        if: toJSON(matrix.families) != '[]'
+        shell: bash
+        env:
+          RAPTOR_TEST_GEM_ROOT: ${{ runner.temp }}/wrapper-gems
+          GEM_HOME: ${{ runner.temp }}/wrapper-gems
+        run: |
+          "$VENV_PATH/bin/python" .github/scripts/run_sandbox_wrapper_tests.py \
+            --lane native --jobs 2 --selection-json "$WRAPPER_SELECTION" --report-dir "$RUNNER_TEMP/wrapper-native"
+      - name: Retain coverage and native exclusions
+        if: always() && (steps.contracts.outcome != 'skipped' || steps.native.outcome != 'skipped')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sandbox-wrappers-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/wrapper-contracts
+            ${{ runner.temp }}/wrapper-native
+          if-no-files-found: error
+
+  sandbox-wrappers-passed:
+    if: always()
+    needs: [scope, acceptance]
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify registration and selected acceptance passed
+        env:
+          # Results only: scope outputs can exceed the process environment limit.
+          NEEDS_JSON: >-
+            {
+              "scope": {"result": "${{ needs['scope'].result }}"},
+              "acceptance": {"result": "${{ needs['acceptance'].result }}"}
+            }
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+
+
+          def annotation(level, message):
+              message = str(message).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f"::{level}::{message}", flush=True)
+
+
+          def cell(value):
+              return str(value).replace('\r', ' ').replace('\n', ' ').replace('|', chr(92) + '|')
+
+
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          failed = {name: job['result'] for name, job in needs.items()
+                    if job['result'] not in ('success', 'skipped')}
+          run_url = (f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                     f"/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/"
+                     f"{os.environ['GITHUB_RUN_ATTEMPT']}")
+          summary = ['## Required job results', '', '| Job | Result |', '| --- | --- |']
+          for name, job in sorted(needs.items()):
+              print(f"{name}: {job['result']}", flush=True)
+              summary.append(f"| {cell(name)} | {cell(job['result'])} |")
+          for name, result in sorted(failed.items()):
+              annotation('error', f"Required job {name} reported {result}. Job details: {run_url}")
+          if failed:
+              summary += ['', f'[Inspect upstream jobs and runner annotations]({run_url}).', '']
+              # Fetch the current attempt only: earlier reruns must not supply stale failures.
+              # Diagnostics are best effort; they never change the prerequisite verdict.
+              try:
+                  endpoint = (f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                              f"{os.environ['GITHUB_RUN_ID']}/attempts/"
+                              f"{os.environ['GITHUB_RUN_ATTEMPT']}/jobs?per_page=100")
+                  response = subprocess.run(
+                      ['gh', 'api', '--paginate', '--slurp', endpoint],
+                      capture_output=True, text=True, timeout=30, check=True,
+                  )
+                  for page in json.loads(response.stdout):
+                      for job in page['jobs']:
+                          if job.get('conclusion') not in ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'):
+                              continue
+                          labels = ', '.join(job.get('labels') or []) or 'unknown'
+                          runner = job.get('runner_name') or 'not assigned'
+                          steps = [s['name'] for s in job.get('steps', [])
+                                   if s.get('conclusion') not in (None, 'success', 'skipped')]
+                          detail = ('Failed/cancelled steps: ' + ', '.join(steps) if steps else
+                                    'No failing step was reported; inspect job annotations for runner/service errors.')
+                          message = (f"{job['name']}: {job['conclusion']}; runner={runner}; "
+                                     f"labels={labels}. {detail} {job['html_url']}")
+                          annotation('error', message)
+                          summary.append(f"- {cell(message)}")
+              except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+                  annotation('warning', f"Could not retrieve upstream runner details. Inspect {run_url}. Required-job failures remain blocking.")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('\n'.join(summary) + '\n')
+          sys.exit(1 if failed else 0)

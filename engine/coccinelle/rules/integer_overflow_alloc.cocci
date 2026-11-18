@@ -1,0 +1,253 @@
+// integer_overflow_alloc.cocci — Detect integer overflow in allocation
+// size arguments (malloc, kmalloc, realloc, krealloc, etc.).
+//
+// The pattern: an allocator is called with a product of two
+// expressions (a * b) as the size argument, without a preceding
+// overflow check. If a * b wraps, the allocation is undersized and
+// subsequent writes produce a heap buffer overflow.
+//
+// Safe alternatives: calloc(a, b) checks internally; the kernel's
+// check_mul_overflow() or __builtin_mul_overflow() before the alloc;
+// or a manual SIZE_MAX / b guard.
+//
+// Known limitations:
+// - Division-based guards (SIZE_MAX / b) are only matched in a few
+//   common forms; unusual guard idioms may not be recognised.
+// - Guards must reject overflow with a direct return, on every path to
+//   the allocation, before recognized operand writes or address escapes.
+//   Ignored check results and log-only branches do not protect a product.
+//   Alias writes, caller ranges, operand types and complex cleanup/control
+//   flow still require review; this rule is not a whole-program proof.
+// - Products with a sizeof() factor are excluded wholesale:
+//   `malloc(n * sizeof(T))` is the idiomatic C array allocation, and
+//   whether n is attacker-controlled or already range-limited by the
+//   caller is not decidable from the allocation site. Excluding the
+//   shape trades away real n*sizeof overflows for not flagging every
+//   array allocation in the codebase; kmalloc_array/calloc migration
+//   is a style concern, not an overflow verdict. The remaining
+//   target is a product of two non-sizeof operands with no guard.
+//
+// Covers CWE-190 (Integer Overflow) leading to CWE-122 (Heap Buffer
+// Overflow).
+//
+// Detection role: even the two-variable product can be range-limited
+// by the caller, so a hit is a lead for taint/reachability analysis,
+// not a self-standing confirmed verdict.
+// @role: detection
+// raptor: confirm-only
+
+// --- Find all allocations with a multiplicative size argument ---
+
+@alloc_mul@
+expression E1, E2;
+position p;
+@@
+
+(
+  malloc@p(E1 * E2)
+|
+  kmalloc@p(E1 * E2, ...)
+|
+  kzalloc@p(E1 * E2, ...)
+|
+  vmalloc@p(E1 * E2)
+|
+  realloc@p(..., E1 * E2)
+|
+  krealloc@p(..., E1 * E2, ...)
+)
+
+// A check is protective only when overflow exits before allocation.
+// Require the same operands to remain unchanged along the path.
+// https://gcc.gnu.org/onlinedocs/gcc/Integer-Overflow-Builtins.html
+
+@alloc_check_overwrites_operand@
+expression alloc_mul.E1, alloc_mul.E2;
+position overwritten;
+@@
+\(check_mul_overflow\|__builtin_mul_overflow\)(..., &\(E1\|E2\))@overwritten
+
+// Returning an allocation from the overflow arm is not a rejecting exit.
+@alloc_returning_target@
+position alloc_mul.p;
+position branch;
+@@
+if@branch (...) return <+... \(malloc@p(...)\|kmalloc@p(...)\|kzalloc@p(...)\|vmalloc@p(...)\|realloc@p(...)\|krealloc@p(...)\) ...+>;
+
+@alloc_unguarded_entry exists@
+expression alloc_mul.E1, alloc_mul.E2;
+expression res;
+position alloc_mul.p;
+position checked != alloc_check_overwrites_operand.overwritten;
+position barrier != alloc_returning_target.branch;
+identifier FUNC;
+@@
+FUNC(...) {
+... when any
+    when != if@barrier (\(\(check_mul_overflow\|__builtin_mul_overflow\)(E1, E2, &res)@checked\|\(check_mul_overflow\|__builtin_mul_overflow\)(E2, E1, &res)@checked\)) return ...;
+    when != if@barrier (\(E1 > SIZE_MAX / E2\|E2 > SIZE_MAX / E1\|E1 != 0 && E2 > SIZE_MAX / E1\|E2 != 0 && E1 > SIZE_MAX / E2\)) return ...;
+(
+  malloc@p(...)
+|
+  kmalloc@p(...)
+|
+  kzalloc@p(...)
+|
+  vmalloc@p(...)
+|
+  realloc@p(...)
+|
+  krealloc@p(...)
+)
+... when any
+}
+
+@alloc_operands_changed exists@
+expression alloc_mul.E1, alloc_mul.E2;
+expression res;
+position alloc_mul.p;
+position checked != alloc_check_overwrites_operand.overwritten;
+position barrier != alloc_returning_target.branch;
+assignment operator op;
+expression FN;
+@@
+(
+E1 op ...;
+|
+E2 op ...;
+|
+E1++;
+|
+E2++;
+|
+  ++E1;
+|
+  ++E2;
+|
+E1--;
+|
+E2--;
+|
+  --E1;
+|
+  --E2;
+|
+FN(..., &E1, ...);
+|
+FN(..., &E2, ...);
+)
+... when any
+    when != if@barrier (\(\(check_mul_overflow\|__builtin_mul_overflow\)(E1, E2, &res)@checked\|\(check_mul_overflow\|__builtin_mul_overflow\)(E2, E1, &res)@checked\)) return ...;
+    when != if@barrier (\(E1 > SIZE_MAX / E2\|E2 > SIZE_MAX / E1\|E1 != 0 && E2 > SIZE_MAX / E1\|E2 != 0 && E1 > SIZE_MAX / E2\)) return ...;
+(
+  malloc@p(...)
+|
+  kmalloc@p(...)
+|
+  kzalloc@p(...)
+|
+  vmalloc@p(...)
+|
+  realloc@p(...)
+|
+  krealloc@p(...)
+)
+
+// --- Exclude compile-time constant products (literal * literal) ---
+
+@const_product@
+constant C1, C2;
+position alloc_mul.p;
+@@
+
+(
+  malloc@p(C1 * C2)
+|
+  kmalloc@p(C1 * C2, ...)
+|
+  kzalloc@p(C1 * C2, ...)
+|
+  vmalloc@p(C1 * C2)
+|
+  realloc@p(..., C1 * C2)
+|
+  krealloc@p(..., C1 * C2, ...)
+)
+
+// --- Exclude any product with a sizeof() factor ---
+//
+// K is an arbitrary expression, not just a constant: element-count *
+// element-size is the idiomatic array allocation (see header note).
+
+@sizeof_const_product@
+type T;
+expression SZ;
+expression K;
+position alloc_mul.p;
+@@
+
+(
+  malloc@p(sizeof(T) * K)
+|
+  malloc@p(sizeof(SZ) * K)
+|
+  malloc@p(K * sizeof(T))
+|
+  malloc@p(K * sizeof(SZ))
+|
+  kmalloc@p(sizeof(T) * K, ...)
+|
+  kmalloc@p(sizeof(SZ) * K, ...)
+|
+  kmalloc@p(K * sizeof(T), ...)
+|
+  kmalloc@p(K * sizeof(SZ), ...)
+|
+  kzalloc@p(sizeof(T) * K, ...)
+|
+  kzalloc@p(sizeof(SZ) * K, ...)
+|
+  kzalloc@p(K * sizeof(T), ...)
+|
+  kzalloc@p(K * sizeof(SZ), ...)
+|
+  vmalloc@p(sizeof(T) * K)
+|
+  vmalloc@p(sizeof(SZ) * K)
+|
+  vmalloc@p(K * sizeof(T))
+|
+  vmalloc@p(K * sizeof(SZ))
+|
+  realloc@p(..., sizeof(T) * K)
+|
+  realloc@p(..., sizeof(SZ) * K)
+|
+  realloc@p(..., K * sizeof(T))
+|
+  realloc@p(..., K * sizeof(SZ))
+|
+  krealloc@p(..., sizeof(T) * K, ...)
+|
+  krealloc@p(..., sizeof(SZ) * K, ...)
+|
+  krealloc@p(..., K * sizeof(T), ...)
+|
+  krealloc@p(..., K * sizeof(SZ), ...)
+)
+
+// --- Report unguarded multiplicative allocations ---
+
+@script:python depends on alloc_mul && (alloc_unguarded_entry || alloc_operands_changed) && !const_product && !sizeof_const_product@
+p << alloc_mul.p;
+E1 << alloc_mul.E1;
+E2 << alloc_mul.E2;
+@@
+
+import json, sys
+for _p in p:
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column),
+          "line_end": int(_p.line_end), "col_end": int(_p.column_end),
+          "rule": "integer_overflow_alloc",
+          "message": "Candidate: unchecked multiplication '%s * %s' in allocation — use calloc() or validate product before alloc" % (E1, E2)}
+    sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")

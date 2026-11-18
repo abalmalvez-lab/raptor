@@ -1,0 +1,567 @@
+"""Failure-semantics binding for the return-usage census.
+
+A call-site deviation matters only if the callee's return carries a
+failure signal. This module binds that evidence — the *contract* — to
+a callee, from the strongest source available (design §2.2), with the
+provenance recorded on the receipt:
+
+1. **Harvested / TU-declared ``wur:`` facts** — the target's own
+   headers say ``warn_unused_result`` (``__must_check``, ``__wur``,
+   ``[[nodiscard]]``, … via the curated ``packages.source_intel``
+   alias table). Mechanical, per-target, registry-grade.
+2. **Operator annotations** — prose on the callee that asserts a
+   return contract ("returns NULL on failure", "must check").
+3. **Study domain-model contracts** — ``Contract.output_semantics``
+   prose, mined with the same bounded pattern set the fail-open
+   channel uses (no second pattern list).
+4. **Tier-A universal knowledge** — the *shared* registry in
+   :mod:`core.audit.fail_open_roles` (this module consumes it, it
+   does not grow a second list).
+5. **IRIS/taint specs** — corroborated evidence tiers are
+   registry-grade; heuristic-tier specs bind detection-grade only
+   (the ``-majority`` rule-id variant).
+6. **Majority evidence** — the census itself: the project's own
+   convention says "check". Detection-grade, never promotes alone.
+
+No hardcoded project-API lists anywhere in this module: a
+target-specific name with no learned input resolves to *no* contract
+(``contract-unresolved`` at the verdict layer).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from core.paths import confine
+from core.source import read_text_capped
+from typing import Any
+
+from core.source.lines import split_lines
+
+from .fail_open_roles import (
+    _CORROBORATED_SPEC_TIERS,
+    _MUST_CHECK_PROSE_RE,
+    GRADE_DETECTION,
+    GRADE_REGISTRY,
+    RoleContext,
+    _contract_from_prose,
+    lookup_contract,
+)
+
+logger = logging.getLogger(__name__)
+
+# Contract prose shapes accepted from annotations / domain models —
+# the fail-open channel's bounded pattern set plus the return-signal
+# phrasings the study loop emits (§2.2.2). Bounded by design: coverage
+# gaps are fixed in the learned-vocab plumbing, never by growing this.
+_RETURN_SIGNAL_PROSE_RE = re.compile(
+    r"returns?\s+(?:NULL|nullptr|None|nil|-1|negative|false|an?\s+error"
+    r"|error\s+code|non[- ]?zero)\s+(?:on|when|if)\s+(?:failure|error)"
+    r"|fail(?:s|ure)?\s+is\s+signal+ed\s+by\s+the\s+return",
+    re.IGNORECASE,
+)
+
+# Cap on annotation files scanned per lookup (bounded IO).
+_MAX_ANNOTATION_SCAN = 200
+
+
+@dataclass
+class ContractEvidence:
+    """One failure-semantics binding with source, provenance, grade."""
+
+    source: str        # wur | annotation | domain_model | tier_a
+                       #   | iris_spec | majority
+    provenance: str    # e.g. "wur:harvested", "iris_spec:xref_backed"
+    grade: str         # GRADE_REGISTRY | GRADE_DETECTION
+    detail: str = ""   # contract string when a source records one
+                       #   ("zero_ok", "tristate:…", prose excerpt)
+
+    @property
+    def registry_grade(self) -> bool:
+        return self.grade == GRADE_REGISTRY
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "source": self.source,
+            "provenance": self.provenance,
+            "grade": self.grade,
+        }
+        if self.detail:
+            d["detail"] = self.detail
+        return d
+
+
+# ── wur: facts ───────────────────────────────────────────────────────
+
+
+def harvest_wur_declarations(
+    source_texts: dict[str, str],
+) -> frozenset[str]:
+    """Candidate function names near WUR spellings in admitted code views.
+
+    A known alias donates nearby declaration names within the existing
+    ±2-line heuristic. Comments, strings and preprocessor directive rows
+    are excluded; ambiguous input donates no names, not proof of annotation absence. Names, not positions
+    or preprocessing semantics — the census owns positions.
+    """
+    try:
+        from packages.source_intel.aliases import wur_alias_in
+    except ImportError:
+        return frozenset()
+
+    decl_re = re.compile(r"\b([A-Za-z_]\w{1,})\s*\(")
+    names: set[str] = set()
+    for file_path, source in source_texts.items():
+        if not wur_alias_in(source):
+            continue
+        from core.audit.source_view import sanitized_view_with_status
+        view = sanitized_view_with_status(source, file_path)
+        if view.ambiguous:
+            continue
+        lines = split_lines(view.text)
+        if "#" in view.text:
+            from core.source.lines import iter_source_lines
+            continued_directive = False
+            for idx, (line, raw_line) in enumerate(zip(lines, iter_source_lines(source))):
+                if continued_directive or line.lstrip().startswith("#"):
+                    # Blank rather than remove rows: declaration windows use
+                    # physical coordinates. Raw splices can survive inside
+                    # comments that the code view has already blanked.
+                    lines[idx] = ""
+                    continued_directive = raw_line.endswith("\\")
+        for idx, line in enumerate(lines):
+            if not wur_alias_in(line):
+                continue
+            # The attribute binds to the declaration it annotates: the
+            # alias line itself, else the ±2-line window the docstring
+            # promises (the forward-only window never harvested the
+            # name-before-trailing-attribute style). Direction is
+            # disambiguated by the alias line's own shape: a ``)``
+            # OUTSIDE the attribute text means the declarator's
+            # parameter list closes here (trailing style — the name
+            # sits on this or a preceding line); a bare attribute line
+            # is the attribute-first style (name follows). Never more
+            # than one declaration per alias occurrence.
+            # The attribute body is bounded: unbounded, a line that
+            # repeats ``__attribute__((`` without the closer re-scans
+            # the rest of the line per occurrence — quadratic on
+            # hostile source; real attribute lists sit far inside
+            # 1000 chars.
+            declarator_tail = re.sub(
+                r"__attribute__\s*\(\(.{0,1000}?\)\)", "", line,
+            )
+            if ")" in declarator_tail:
+                nearby = (
+                    lines[max(0, idx - 2):idx][::-1]
+                    + lines[idx + 1:idx + 3]
+                )
+            else:
+                nearby = (
+                    lines[idx + 1:idx + 3]
+                    + lines[max(0, idx - 2):idx][::-1]
+                )
+            for candidate in lines[idx:idx + 1] + nearby:
+                found = [
+                    m.group(1) for m in decl_re.finditer(candidate)
+                    if m.group(1) not in (
+                        "__attribute__", "__declspec", "sizeof",
+                    )
+                ]
+                if found:
+                    names.update(found)
+                    break
+    return frozenset(names)
+
+
+_WUR_SCAN_SUFFIXES = (".h", ".hpp", ".hh", ".hxx")
+# Header-read budget: all matching paths are enumerated and sorted first,
+# so this cap does not bound traversal work or retained path count. When
+# sampling is needed, the read budget is spread evenly across the sorted
+# tree and the selection ratio is disclosed with a warning.
+_MAX_WUR_SCAN_FILES = 4_000
+_MAX_WUR_FILE_CHARS = 400_000  # decoded characters, not UTF-8 bytes
+
+
+def harvest_wur_from_target(target_path: Path) -> frozenset[str]:
+    """Bounded header sweep: the census's source set is the gap files,
+    but warn_unused_result attributes live in headers no gap covers —
+    harvest those too (declarations only, no call sites)."""
+    names: set[str] = set()
+    try:
+        paths = sorted(
+            p for p in Path(target_path).rglob("*")
+            if p.is_file() and p.suffix.lower() in _WUR_SCAN_SUFFIXES
+        )
+    except OSError:
+        return frozenset()
+    if len(paths) > _MAX_WUR_SCAN_FILES:
+        n = len(paths)
+        # Index-based even selection: exactly the budget, spread over
+        # the whole sorted list, first file always included. (NOT a
+        # stride slice — xs[::ceil(n/cap)] under-fills at non-divisible
+        # boundaries: n = cap + 1 selects only ~half the budget. Here
+        # the exact steps are n/cap > 1 apart, so rounding — which
+        # moves each index by < 0.5 — keeps them strictly increasing:
+        # cap distinct indices, always.)
+        sampled = [
+            paths[round(i * n / _MAX_WUR_SCAN_FILES)]
+            for i in range(_MAX_WUR_SCAN_FILES)
+        ]
+        logger.warning(
+            "warn_unused_result harvest capped: scanning %d of %d "
+            "headers (sampled evenly across the sorted tree) — wur "
+            "attributes in unsampled headers are not harvested",
+            len(sampled), n,
+        )
+        paths = sampled
+    seen_inputs: set[tuple[Path, str]] = set()
+    for p in paths:
+        resolved = confine(target_path, p)
+        if resolved is None:
+            continue
+        # Preserve distinct suffix-based view inputs while avoiding repeated
+        # reads of equivalent selected aliases. Selection is not backfilled.
+        key = (resolved, p.suffix.lower())
+        if key in seen_inputs:
+            continue
+        seen_inputs.add(key)
+        got = read_text_capped(resolved, _MAX_WUR_FILE_CHARS)
+        if got is None or got[1]:
+            continue
+        # Harvest each admitted text before reading the next header; the
+        # declaration helper treats files independently and unions names.
+        names.update(harvest_wur_declarations({str(p): got[0]}))
+    return frozenset(names)
+
+
+def _wur_contract(callee: str, ctx: RoleContext) -> ContractEvidence | None:
+    tail = callee.rsplit(".", 1)[-1]
+    if tail in ctx.wur_functions:
+        return ContractEvidence(
+            source="wur",
+            provenance=f"wur:{tail}",
+            grade=GRADE_REGISTRY,
+        )
+    return None
+
+
+# ── operator annotations ────────────────────────────────────────────
+
+
+def _annotation_entries(base: Path) -> list[Any]:
+    """The first ``_MAX_ANNOTATION_SCAN`` annotations under *base*,
+    memoised on a stat fingerprint of the tree — the per-callee
+    rescan re-parsed every annotation file on every lookup. An edited
+    or added note changes the fingerprint and reloads."""
+    fp_items: list[tuple[str, int, int]] = []
+    try:
+        for root, _dirs, files in os.walk(base):
+            for name in files:
+                if not name.endswith(".md"):
+                    continue
+                full = os.path.join(root, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                fp_items.append(
+                    (os.path.relpath(full, base),
+                     st.st_mtime_ns, st.st_size),
+                )
+    except OSError:
+        return []
+    fingerprint = tuple(sorted(fp_items))
+    key = str(base)
+    with _CONTRACT_CACHE_LOCK:
+        cached = _ANNOTATION_SCAN_CACHE.get(key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+    from core.annotations.storage import iter_all_annotations
+    entries: list[Any] = []
+    for ann in iter_all_annotations(base):
+        if len(entries) >= _MAX_ANNOTATION_SCAN:
+            break
+        entries.append(ann)
+    with _CONTRACT_CACHE_LOCK:
+        if len(_ANNOTATION_SCAN_CACHE) >= _CONTRACT_CACHE_MAX:
+            _ANNOTATION_SCAN_CACHE.clear()
+        _ANNOTATION_SCAN_CACHE[key] = (fingerprint, entries)
+    return entries
+
+
+def _annotation_contract(
+    callee: str, ctx: RoleContext,
+) -> ContractEvidence | None:
+    base = ctx.annotations_dir
+    if base is None and ctx.out_dir is not None:
+        candidate = Path(ctx.out_dir) / "annotations"
+        base = candidate if candidate.is_dir() else None
+    if base is None:
+        return None
+    tail = callee.rsplit(".", 1)[-1]
+    try:
+        from core.annotations.provenance import is_human_grade
+        from core.annotations.storage import annotation_file_mtime
+        for ann in _annotation_entries(Path(base)):
+            fn_tail = (ann.function or "").rsplit(".", 1)[-1]
+            if fn_tail != tail:
+                continue
+            prose = ann.body or ""
+            if _RETURN_SIGNAL_PROSE_RE.search(prose) \
+                    or _MUST_CHECK_PROSE_RE.search(prose):
+                # Registry grade is human-grade-gated (the
+                # consistency_prepass sibling gate): agent-written
+                # prose is hint-tier by the annotation doctrine, so
+                # it binds the contract at detection grade only.
+                human = is_human_grade(
+                    ann.metadata or {},
+                    note_mtime=annotation_file_mtime(
+                        Path(base), ann.file or "",
+                    ),
+                )
+                return ContractEvidence(
+                    source="annotation",
+                    provenance="annotation",
+                    grade=GRADE_REGISTRY if human else GRADE_DETECTION,
+                    detail=_contract_from_prose(prose),
+                )
+    except Exception:
+        logger.debug("return contract: annotation scan failed",
+                     exc_info=True)
+    return None
+
+
+# ── study domain-model contracts ────────────────────────────────────
+
+# core.concepts.receipts.TIER_MECHANICAL — inlined to keep the import
+# lazy-free on this hot path; pinned by the fallibility-feed tests.
+_TIER_MECHANICAL = "mechanical"
+
+
+def _fallibility_entry(
+    model: dict[str, Any], tail: str,
+) -> dict[str, Any] | None:
+    for entry in model.get("fallibility_contracts") or []:
+        if isinstance(entry, dict) and \
+                str(entry.get("name") or "").rsplit(".", 1)[-1] == tail:
+            return entry
+    return None
+
+
+def _domain_model_contract(
+    callee: str, ctx: RoleContext,
+) -> ContractEvidence | None:
+    if ctx.out_dir is None:
+        return None
+    tail = callee.rsplit(".", 1)[-1]
+    try:
+        from core.concepts.audit_bridge import _find_domain_model
+        model = _find_domain_model(Path(ctx.out_dir)) or {}
+    except Exception:
+        logger.debug("return contract: domain model load failed",
+                     exc_info=True)
+        return None
+
+    # Structured fallibility contracts first (§2.2.2 phase-3 field):
+    # the study loop's elicited {name, can_fail, convention} entries,
+    # name-verified and tier-stamped. Prose-mining below stays the
+    # fallback, not the mechanism. Tier discipline: the mechanical
+    # tier (a study-prep signal corroborated the claim) is
+    # registry-grade; llm_summarized binds detection-grade only (the
+    # ``-majority`` rule-id variant at the verdict layer). Entries
+    # whose failure signal is exception-borne — or which assert the
+    # callee cannot fail — bind nothing: neither is a return-check
+    # obligation.
+    fallibility = _fallibility_entry(model, tail)
+    if fallibility is not None:
+        can_fail = bool(fallibility.get("can_fail"))
+        convention = str(fallibility.get("convention") or "").lower()
+        if can_fail and convention not in ("", "exception"):
+            tier = str(fallibility.get("provenance") or "")
+            return ContractEvidence(
+                source="domain_model",
+                provenance=(
+                    f"domain_model:fallibility:{tier or 'unstamped'}"
+                ),
+                grade=(
+                    GRADE_REGISTRY if tier == _TIER_MECHANICAL
+                    else GRADE_DETECTION
+                ),
+                detail=convention,
+            )
+
+    for contract in model.get("contracts") or []:
+        if not isinstance(contract, dict):
+            continue
+        if contract.get("function") != tail:
+            continue
+        prose = " ".join(
+            str(contract.get(k) or "")
+            for k in ("output_semantics", "implication", "when")
+        )
+        mined = _contract_from_prose(prose)
+        if mined or _MUST_CHECK_PROSE_RE.search(prose) \
+                or _RETURN_SIGNAL_PROSE_RE.search(prose):
+            return ContractEvidence(
+                source="domain_model",
+                provenance="domain_model:contract",
+                grade=GRADE_REGISTRY,
+                detail=mined,
+            )
+    return None
+
+
+# ── Tier-A registry (imported, never duplicated) ────────────────────
+
+
+def _tier_a_contract(
+    callee: str, language: str, ctx: RoleContext,
+) -> ContractEvidence | None:
+    contract = lookup_contract(callee, language=language, context=ctx)
+    if not contract:
+        return None
+    # lookup_contract consults the domain model first; that source is
+    # reported as domain_model by _domain_model_contract above, so a
+    # hit here that ISN'T in the model is registry/seed knowledge.
+    return ContractEvidence(
+        source="tier_a",
+        provenance=f"tier_a:{contract}",
+        grade=GRADE_REGISTRY,
+        detail=contract,
+    )
+
+
+# ── IRIS/taint specs ────────────────────────────────────────────────
+
+
+#: Stat-stamped reload caches for the per-callee contract sources:
+#: both the IRIS spec file and the annotation tree were re-read and
+#: re-parsed on EVERY callee lookup. Keyed on (path, mtime, size) —
+#: an edited file reloads, an unchanged one is served. Small and
+#: process-scoped; cleared wholesale at the tiny cap.
+_IRIS_SPEC_CACHE: dict[str, tuple[tuple[int, int], list[Any]]] = {}
+_ANNOTATION_SCAN_CACHE: dict[
+    str, tuple[tuple[tuple[str, int, int], ...], list[Any]],
+] = {}
+_CONTRACT_CACHE_LOCK = __import__("threading").Lock()
+_CONTRACT_CACHE_MAX = 8
+
+
+def _iris_specs_cached(spec_path: Path) -> list[Any] | None:
+    """Parsed IRIS specs for *spec_path*, memoised per stat stamp."""
+    try:
+        st = os.stat(spec_path)
+    except OSError:
+        return None
+    stamp = (st.st_mtime_ns, st.st_size)
+    key = str(spec_path)
+    with _CONTRACT_CACHE_LOCK:
+        cached = _IRIS_SPEC_CACHE.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+    try:
+        from core.audit.iris_specs import specs_from_json
+        specs = list(
+            specs_from_json(spec_path.read_text(encoding="utf-8")),  # raw-open: RAPTOR-written IRIS spec artifact in the run out dir
+        )
+    except Exception:
+        logger.debug("return contract: iris spec load failed",
+                     exc_info=True)
+        return None
+    with _CONTRACT_CACHE_LOCK:
+        if len(_IRIS_SPEC_CACHE) >= _CONTRACT_CACHE_MAX:
+            _IRIS_SPEC_CACHE.clear()
+        _IRIS_SPEC_CACHE[key] = (stamp, specs)
+    return specs
+
+
+def _iris_contract(
+    callee: str, ctx: RoleContext,
+) -> ContractEvidence | None:
+    if ctx.out_dir is None:
+        return None
+    spec_path = Path(ctx.out_dir) / "iris-taint-specs.json"
+    if not spec_path.is_file():
+        return None
+    specs = _iris_specs_cached(spec_path)
+    if specs is None:
+        return None
+    tail = callee.rsplit(".", 1)[-1]
+    for spec in specs:
+        if spec.function != tail:
+            continue
+        role = getattr(spec, "role", "")
+        if role not in ("sanitiser", "sink", "source"):
+            continue
+        tier = getattr(spec, "evidence_tier", None)
+        tier_value = getattr(tier, "value", str(tier or "heuristic"))
+        corroborated = tier_value in _CORROBORATED_SPEC_TIERS
+        return ContractEvidence(
+            source="iris_spec",
+            provenance=f"iris_spec:{tier_value}",
+            grade=GRADE_REGISTRY if corroborated else GRADE_DETECTION,
+        )
+    return None
+
+
+# ── majority evidence (the census itself) ───────────────────────────
+
+
+def _majority_contract(census_entry: Any) -> ContractEvidence | None:
+    if census_entry is None:
+        return None
+    if getattr(census_entry, "majority_says_check", False):
+        return ContractEvidence(
+            source="majority",
+            provenance=(
+                f"majority:{census_entry.count('tested')}"
+                f"/{census_entry.considered} sites test"
+            ),
+            grade=GRADE_DETECTION,
+        )
+    return None
+
+
+# ── entry point ─────────────────────────────────────────────────────
+
+
+def bind_return_contract(
+    callee: str,
+    *,
+    language: str = "",
+    context: RoleContext | None = None,
+    census_entry: Any = None,
+) -> ContractEvidence | None:
+    """Bind failure semantics to *callee*, strongest source first.
+
+    ``context.wur_functions`` should already include the harvested
+    facts (:func:`harvest_wur_declarations` over the run's sources,
+    plus any ``SourceIntelResult`` names the caller has). Returns
+    ``None`` when no source binds — the verdict layer then reports
+    ``contract-unresolved``; there is deliberately no fallback list.
+    """
+    ctx = context or RoleContext()
+    if not callee:
+        return None
+
+    checks = (
+        lambda: _wur_contract(callee, ctx),
+        lambda: _annotation_contract(callee, ctx),
+        lambda: _domain_model_contract(callee, ctx),
+        lambda: _tier_a_contract(callee, language, ctx),
+        lambda: _iris_contract(callee, ctx),
+        lambda: _majority_contract(census_entry),
+    )
+    for check in checks:
+        try:
+            evidence = check()
+        except Exception:
+            logger.debug("return contract source failed", exc_info=True)
+            continue
+        if evidence is not None:
+            return evidence
+    return None

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Run exploit feasibility analysis on a binary for a group of findings.
 
 Usage: raptor-run-feasibility <binary_path> <findings.json> <output_dir> [--vuln-type <type>]
@@ -10,7 +12,8 @@ import sys
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
-import os
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -19,30 +22,130 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
+from core.json import load_json, save_json  # noqa: E402
 
-from core.json import load_json, save_json
+
+def _as_dict(value: object) -> dict:
+    """Coerce a possibly-null / non-dict finding field to a dict."""
+    return value if isinstance(value, dict) else {}
+
+
+#: Dismissed-finding spellings across the producing pipelines
+#: (validate rulings, /agentic classifier statuses). Feasibility
+#: analysis must not resurrect a dismissed finding with an
+#: "analyzed" feasibility verdict.
+_NEGATIVE_VERDICTS = frozenset({
+    "disproven", "ruled_out", "false_positive",
+})
+
+
+def _verdict_token(value: object) -> str:
+    """One normalised spelling for a status/ruling verdict."""
+    return str(value or "").strip().lower().replace(
+        "-", "_").replace(" ", "_")
+
+
+def _ruling_dict(finding: dict) -> "dict | None":
+    """The finding's ruling, dict-normalised across both documented
+    shapes: validate writes ``{"status": ...}`` dicts, /agentic
+    rulings can arrive as a bare status string."""
+    ruling = finding.get("ruling")
+    if isinstance(ruling, dict):
+        return ruling
+    if isinstance(ruling, str):
+        return {"status": ruling}
+    return None
+
+
+def _is_dismissed(finding: dict) -> bool:
+    """Whether a finding carries a negative status or ruling."""
+    if _verdict_token(finding.get("status")) in _NEGATIVE_VERDICTS:
+        return True
+    ruling = _ruling_dict(finding) or {}
+    return _verdict_token(ruling.get("status")) in _NEGATIVE_VERDICTS
+
+
+def _map_filename(raw_id: str) -> str:
+    """Filesystem-safe stem for a finding's mitigation-feasibility file.
+
+    Character sanitisation alone is lossy ("vuln:1" and "vuln_1" both
+    map to "vuln_1"), so a later finding would silently overwrite an
+    earlier one's persisted map while both findings' pointers name the
+    same file. Whenever sanitisation changed the id, a short digest of
+    the raw id keeps distinct findings on distinct files.
+    """
+    safe_id = "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in raw_id
+    ) or "unnamed"
+    if safe_id != raw_id:
+        import hashlib
+        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:8]
+        safe_id = f"{safe_id}_{digest}"
+    return safe_id
 
 
 def main():
-    if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} <binary_path> <findings.json> <output_dir> [--vuln-type <type>]")
+    usage = (
+        f"Usage: {sys.argv[0]} <binary_path> <findings.json> "
+        f"<output_dir> [--vuln-type <type>] [--target <path>]"
+    )
+    # Separate flags from positionals BEFORE assigning positionals by
+    # index: a bare len() check lets a flag token stand in for a
+    # forgotten positional (e.g. output_dir becoming the literal
+    # string "--vuln-type"), sending artifacts to a wrong directory.
+    args = sys.argv[1:]
+    positionals: list[str] = []
+    flag_values: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--vuln-type", "--target"):
+            # A trailing valueless flag must error, not be silently
+            # dropped — dropping it skips the requested analysis mode
+            # with no message.
+            if i + 1 >= len(args):
+                print(f"✗ {a} requires a value", file=sys.stderr)
+                print(usage, file=sys.stderr)
+                sys.exit(1)
+            flag_values[a] = args[i + 1]
+            i += 2
+        elif a.startswith("--"):
+            print(f"✗ unknown flag: {a}", file=sys.stderr)
+            print(usage, file=sys.stderr)
+            sys.exit(1)
+        else:
+            positionals.append(a)
+            i += 1
+
+    if len(positionals) != 3:
+        print(usage, file=sys.stderr)
         sys.exit(1)
 
-    binary_path = sys.argv[1]
-    findings_path = Path(sys.argv[2])
-    output_dir = sys.argv[3]
+    binary_path = positionals[0]
+    findings_path = Path(positionals[1])
+    output_dir = positionals[2]
 
-    vuln_type = None
-    if "--vuln-type" in sys.argv:
-        idx = sys.argv.index("--vuln-type")
-        if idx + 1 < len(sys.argv):
-            vuln_type = sys.argv[idx + 1]
+    vuln_type = flag_values.get("--vuln-type")
+
+    # ``--target <path>`` enables the per-finding empirical
+    # mitigation analysis: with a source root we can resolve
+    # ``finding.file`` to an on-disk source file and feed it +
+    # a matching witness to
+    # ``analyze_binary_under_mitigations`` (PR #609). Without
+    # ``--target`` (legacy callers), the empirical step is
+    # silently skipped — the static analyze_binary path runs
+    # unchanged.
+    target_path = None
+    if "--target" in flag_values:
+        target_path = Path(flag_values["--target"]).resolve()
 
     if not Path(binary_path).exists():
-        print(f"ERROR: binary not found: {binary_path}")
+        print(f"✗ binary not found: {binary_path}", file=sys.stderr)
         sys.exit(1)
 
     # Acquire an advisory flock on findings.json before the
@@ -71,90 +174,432 @@ def main():
     # serialises stage transitions, so this script's lock is
     # the only contended writer.
     import fcntl
-    findings_lock_fh = open(findings_path, "rb")
+    import time
+    lock_path = findings_path.with_suffix(".lock")
+    with open(lock_path, "a+b") as findings_lock_fh:
+        try:
+            # Failure to LOCK is failure to RUN: flock errors (ENOLCK
+            # — e.g. NFS without lockd) correlate with exactly the
+            # contended filesystems where the lock matters, and
+            # proceeding unlocked reopens the documented lost-update
+            # race. Bounded retry for transient hiccups, then fail —
+            # the stage orchestrator already tolerates per-binary
+            # failures.
+            lock_error = None
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(0.5 * attempt)
+                try:
+                    fcntl.flock(findings_lock_fh.fileno(), fcntl.LOCK_EX)
+                    lock_error = None
+                    break
+                except OSError as e:
+                    lock_error = e
+            if lock_error is not None:
+                print(
+                    f"✗ could not acquire flock on {lock_path}: "
+                    f"{lock_error} — refusing to run the unlocked "
+                    "read-modify-write (a parallel instance's "
+                    "feasibility merge would be silently lost)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            findings_data = load_json(findings_path)
+            if findings_data is None:
+                print("✗ Cannot load findings", file=sys.stderr)
+                sys.exit(1)
+
+            # Find findings that reference this binary. Findings are
+            # authored across stages — a null or non-dict feasibility/
+            # ruling is expected shape drift (``.get(key, {})`` returns
+            # the null, then ``.get`` on it raises), and one malformed
+            # finding must not abort the whole group. Dismissal covers
+            # every documented negative spelling and BOTH ruling
+            # shapes — the old two-literal filter admitted
+            # false_positive rows and string-shaped rulings into the
+            # analysis flow.
+            group = [
+                f for f in findings_data.get("findings", [])
+                if _as_dict(f.get("feasibility")).get("binary_path")
+                == binary_path
+                and not _is_dismissed(f)
+            ]
+
+            if not group:
+                print(f"No findings reference binary: {binary_path}", file=sys.stderr)
+                return
+
+            # Determine vuln_type from first finding if not specified
+            if not vuln_type:
+                vuln_type = group[0].get("vuln_type", "")
+
+            print(f"Analyzing {binary_path} ({len(group)} finding(s), vuln_type={vuln_type})", file=sys.stderr)
+
+            from packages.exploit_feasibility import (
+                load_exploit_context,
+                map_findings_to_constraints,
+                save_exploit_context,
+            )
+
+            # Run analysis and save context in one call (avoids duplicate analysis)
+            context_file = save_exploit_context(binary_path, output_dir=output_dir, vuln_type=vuln_type)
+            print(f"  Context saved: {context_file}", file=sys.stderr)
+
+            # Load context for mapping
+            constraints = load_exploit_context(context_file)
+            result = constraints
+            print(f"  Binary verdict (generic): {constraints.get('verdict', 'unknown')}", file=sys.stderr)
+            print("  Mapping per-finding verdicts (vuln-type-aware)...", file=sys.stderr)
+            # Forward each finding's ruling (dict-normalised) and
+            # status: the mapper owns a dismissal gate of its own,
+            # and a gate behind a caller that strips rulings protects
+            # nothing — the mapper must see what the finding carries.
+            mapped = map_findings_to_constraints(
+                [
+                    {
+                        "id": f.get("id"),
+                        "vuln_type": f.get("vuln_type", ""),
+                        "status": f.get("status"),
+                        "ruling": _ruling_dict(f),
+                    }
+                    for f in group if f.get("id")
+                ],
+                constraints,
+            )
+
+            # Update findings with feasibility data
+            by_id = {f.get("id"): f for f in findings_data.get("findings", []) if f.get("id")}
+            from core.witness.provenance import stamp_feasibility
+            for assessment in mapped:
+                finding = by_id.get(assessment.finding_id)
+                if finding:
+                    # MERGE over the existing dict: earlier passes of
+                    # this same run attach evidence here (the witness
+                    # synthesis empirical map with its source-binding
+                    # provenance) — a wholesale replace silently
+                    # destroys it.
+                    finding["feasibility"] = {
+                        **(finding.get("feasibility") or {}),
+                        "status": "analyzed",
+                        "binary_path": binary_path,
+                        "context_file": str(context_file),
+                        "verdict": assessment.verdict,
+                        "impact": assessment.impact,
+                        "blockers": assessment.blockers,
+                        "chain_breaks": result.get("chain_breaks", []),
+                        "what_would_help": result.get("what_would_help", []),
+                        "notes": assessment.notes,
+                        "exploitation_paths": [
+                            {"technique": p.technique, "target": p.target}
+                            for p in (assessment.exploitation_paths or [])
+                        ],
+                    }
+                    # A prior binary-less pass leaves skipped-era
+                    # advice ("Binary not found ... Provide --binary")
+                    # that contradicts status=analyzed once the merge
+                    # above keeps it — drop what this analysis
+                    # supersedes.
+                    for stale in ("note", "guidance"):
+                        finding["feasibility"].pop(stale, None)
+                    # Mechanical-provenance stamp: consumers (prepare_F,
+                    # the report chokepoint) verify this before mapping
+                    # the verdict into final_status — an unstamped
+                    # "analyzed" record is demoted as LLM-authored.
+                    stamp_feasibility(
+                        finding, finding["feasibility"], findings_path.parent)
+                    finding["stage_e_summary"] = {
+                        "verdict": assessment.verdict,
+                        "binary_path": binary_path,
+                        "impact": assessment.impact,
+                    }
+                    print(f"  {finding['id']}: {assessment.verdict}", file=sys.stderr)
+
+            # --- One-gadget conditioning (register/memory snapshot) ---
+            # Witness synthesis runs BEFORE this script in the stage
+            # pipeline, so its conditioning pass found no gadget info
+            # to condition. Now that analyze_binary has produced the
+            # one-gadget data, re-run conditioning for findings that
+            # carry a snapshot.
+            _recondition_one_gadgets(group, result)
+
+            # --- Empirical mitigation map (PR #609 consumer) ---
+            # Only attempt when ``--target`` was supplied — without a
+            # source root we can't resolve ``finding.file`` to an on-disk
+            # file. Silent skip per-finding when source or witness is
+            # missing; the static feasibility verdict above is the
+            # baseline either way.
+            if target_path is not None:
+                _enrich_with_empirical_mitigation_map(
+                    group=group,
+                    findings_data=findings_data,
+                    output_dir=Path(output_dir),
+                    target_path=target_path,
+                )
+
+            save_json(findings_path, findings_data)
+            print(f"Updated {len(mapped)} finding(s)", file=sys.stderr)
+        finally:
+            try:
+                fcntl.flock(findings_lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+def _collect_one_gadget_infos(context: dict) -> list:
+    """Every one_gadget_info dict reachable in an exploit context."""
+    found = []
+    if not isinstance(context, dict):
+        return found
+    ogi = context.get("one_gadget_info")
+    if isinstance(ogi, dict) and ogi.get("gadgets"):
+        found.append(ogi)
+    for key in ("analysis", "exploitation_paths"):
+        sub = context.get(key)
+        if isinstance(sub, dict):
+            inner = sub.get("one_gadget_info")
+            if isinstance(inner, dict) and inner.get("gadgets"):
+                found.append(inner)
+            for v in sub.values():
+                if isinstance(v, dict):
+                    vi = v.get("one_gadget_info")
+                    if isinstance(vi, dict) and vi.get("gadgets"):
+                        found.append(vi)
+    return found
+
+
+def _recondition_one_gadgets(group, context):
+    """Condition one-gadget constraints on stored solve snapshots.
+
+    The synthesis pass captured the register/memory state at the
+    hijacked PC; the one-gadget data only exists after analyze_binary
+    runs here. Attaches the gadget info (with its symbolic verdict)
+    under the finding's feasibility so report consumers see both.
+    """
     try:
-        fcntl.flock(findings_lock_fh.fileno(), fcntl.LOCK_EX)
-    except OSError as e:
-        print(f"WARNING: could not acquire flock on {findings_path}: {e} — proceeding without lock")
+        from packages.exploitability_validation.symbolic_witness import (
+            _condition_one_gadgets,
+        )
+    except ImportError:
+        return
+    infos = _collect_one_gadget_infos(context)
+    if not infos:
+        return
+    conditioned = 0
+    for finding in group:
+        record = finding.get("symbolic_witness") or {}
+        snapshot = record.get("register_snapshot")
+        if not snapshot:
+            continue
+        feas = finding.setdefault("feasibility", {})
+        if not isinstance(feas, dict):
+            continue
+        ba = feas.setdefault("binary_analysis", {})
+        # copy: per-finding conditioning must not share mutable state
+        # across findings via the context dict
+        import copy as _copy
+        ba["one_gadget_info"] = _copy.deepcopy(infos[0])
+        if _condition_one_gadgets(
+            finding, snapshot, memory=record.get("memory_snapshot"),
+        ):
+            conditioned += 1
+    if conditioned:
+        print(
+            f"  One-gadget conditioning: {conditioned} finding(s) "
+            "conditioned on solve snapshots",
+            file=sys.stderr,
+        )
 
-    findings_data = load_json(findings_path)
-    if not findings_data:
-        print("ERROR: cannot load findings")
-        sys.exit(1)
 
-    # Find findings that reference this binary
-    group = [
-        f for f in findings_data.get("findings", [])
-        if f.get("feasibility", {}).get("binary_path") == binary_path
-        and f.get("status") != "disproven"
-        and f.get("ruling", {}).get("status") != "ruled_out"
-    ]
+def _enrich_with_empirical_mitigation_map(
+    *,
+    group: list,
+    findings_data: dict,
+    output_dir: Path,
+    target_path: Path,
+) -> None:
+    """Per-finding: resolve source, find best-matching witness
+    (run-local + project-wide), run ``analyze_binary_under_
+    mitigations``, attach summary to ``feasibility.empirical_
+    mitigation_map`` and persist the full FeasibilityMap JSON
+    to ``<output_dir>/mitigation_feasibility/<finding_id>.json``.
 
-    if not group:
-        print(f"No findings reference binary: {binary_path}")
+    Each finding is independent — one bad source or one missing
+    witness doesn't sink the others. All failures are logged
+    + skipped.
+    """
+    try:
+        from core.run.output import _resolve_active_project
+        from core.witness import (
+            best_match_for_finding,
+            discover_witness_stores,
+            iter_visible_witnesses,
+        )
+        from packages.exploit_feasibility.under_mitigations import (
+            analyze_binary_under_mitigations,
+            to_json,
+        )
+    except ImportError as e:
+        print(
+            f"  WARN: empirical mitigation map skipped — "
+            f"import failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
         return
 
-    # Determine vuln_type from first finding if not specified
-    if not vuln_type:
-        vuln_type = group[0].get("vuln_type", "")
-
-    print(f"Analyzing {binary_path} ({len(group)} finding(s), vuln_type={vuln_type})")
-
-    from packages.exploit_feasibility import (
-        save_exploit_context,
-        load_exploit_context,
-        map_findings_to_constraints,
-    )
-
-    # Run analysis and save context in one call (avoids duplicate analysis)
-    context_file = save_exploit_context(binary_path, output_dir=output_dir, vuln_type=vuln_type)
-    print(f"  Context saved: {context_file}")
-
-    # Load context for mapping
-    constraints = load_exploit_context(context_file)
-    result = constraints
-    print(f"  Binary verdict (generic): {constraints.get('verdict', 'unknown')}")
-    print(f"  Mapping per-finding verdicts (vuln-type-aware)...")
-    mapped = map_findings_to_constraints(
-        [{"id": f["id"], "vuln_type": f.get("vuln_type", "")} for f in group],
-        constraints,
-    )
-
-    # Update findings with feasibility data
-    by_id = {f["id"]: f for f in findings_data.get("findings", [])}
-    for assessment in mapped:
-        finding = by_id.get(assessment.finding_id)
-        if finding:
-            finding["feasibility"] = {
-                "status": "analyzed",
-                "binary_path": binary_path,
-                "context_file": str(context_file),
-                "verdict": assessment.verdict,
-                "impact": assessment.impact,
-                "blockers": assessment.blockers,
-                "chain_breaks": result.get("chain_breaks", []),
-                "what_would_help": result.get("what_would_help", []),
-                "notes": assessment.notes,
-                "exploitation_paths": [
-                    {"technique": p.technique, "target": p.target}
-                    for p in (assessment.exploitation_paths or [])
-                ],
-            }
-            finding["stage_e_summary"] = {
-                "verdict": assessment.verdict,
-                "binary_path": binary_path,
-                "impact": assessment.impact,
-            }
-            print(f"  {finding['id']}: {assessment.verdict}")
-
-    save_json(findings_path, findings_data)
-    # Release the advisory flock by closing the lock handle.
+    # Resolve project root if a project is active.
+    project_root = None
     try:
-        fcntl.flock(findings_lock_fh.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
-    findings_lock_fh.close()
-    print(f"Updated {len(mapped)} finding(s)")
+        active = _resolve_active_project()
+        if active:
+            project_root = Path(active[0])
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"  WARN: active project resolution failed "
+            f"({type(e).__name__}: {e}); using run-local stores only",
+            file=sys.stderr,
+        )
+
+    stores = discover_witness_stores(output_dir, project_root=project_root)
+    if not stores:
+        return  # nothing to match against; silent skip
+
+    # Materialise the visible witnesses once — N findings shouldn't
+    # iterate every store N times.
+    visible = list(iter_visible_witnesses(stores))
+    if not visible:
+        return
+
+    feasibility_dir = output_dir / "mitigation_feasibility"
+    feasibility_dir.mkdir(parents=True, exist_ok=True)
+
+    enriched = 0
+    for finding in group:
+        # findings.json is LLM-authored and schema validation is
+        # advisory — an id-less finding must not KeyError this loop:
+        # the exception would escape past the final save_json and the
+        # run's freshly computed feasibility maps would be lost
+        # wholesale. The per-finding map filename below needs a real
+        # id anyway, so skip id-less entries.
+        fid = finding.get("id")
+        if not fid:
+            continue
+        finding_file = finding.get("file") or finding.get("file_path")
+        if not finding_file:
+            continue
+        source = (target_path / finding_file).resolve()
+        try:
+            source.relative_to(target_path.resolve())
+        except ValueError:
+            # Path escapes target_path (absolute finding_file or
+            # traversal). Skip — never analyse something outside
+            # the target tree.
+            print(
+                f"  WARN: finding file {finding_file!r} resolves "
+                f"outside the target; skipping",
+                file=sys.stderr,
+            )
+            continue
+        if not source.is_file():
+            continue
+
+        best = best_match_for_finding(visible, finding)
+        if best is None or not best.is_real:
+            continue
+
+        # The synthesis pass may have already attached a map for
+        # this very witness (same run, richer record: source-binding
+        # provenance rides it). Re-running the rebuild would only
+        # clobber that evidence with a leaner record.
+        existing = (finding.get("feasibility") or {}).get(
+            "empirical_mitigation_map") or {}
+        if existing.get("witness_hash") == best.witness.bytes_hash:
+            print(
+                f"  {fid}: empirical map already attached "
+                "for this witness (synthesis pass) — keeping it",
+                file=sys.stderr,
+            )
+            continue
+
+        # Resolve the witness bytes from the matched store. We need
+        # the raw file path because the bytes aren't on the Witness
+        # itself.
+        from core.witness import WitnessStore
+        try:
+            store = WitnessStore(best.store_root)
+            witness_bytes = store.get_bytes(best.witness.bytes_hash)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"  WARN: {fid}: couldn't load witness "
+                f"bytes ({type(e).__name__}: {e})",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            fmap = analyze_binary_under_mitigations(
+                source,
+                witness_bytes,
+                sandbox_timeout=5,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"  WARN: {fid}: empirical analysis raised "
+                f"({type(e).__name__}: {e}); skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        summary_probe = fmap.summary()
+        if not summary_probe.get("bug_fired_under") and not summary_probe.get(
+                "blocked_under"):
+            # Every profile failed to build (single-file rebuild
+            # contract vs a multi-file target, or no compiler for
+            # the flags) — an all-unbuildable map is noise, not
+            # evidence. Say so instead of attaching it.
+            print(
+                f"  {fid}: empirical map skipped — no "
+                "profile built "
+                f"(unbuildable: {summary_probe.get('unbuildable_profiles')})",
+                file=sys.stderr,
+            )
+            continue
+
+        fmap_file = (
+            feasibility_dir / f"{_map_filename(str(fid))}.json"
+        )
+        # Atomic write (planted-symlink defence at the predictable
+        # artifact name in the reused run dir).
+        from core.atomic_fs import write_text_atomically
+        write_text_atomically(fmap_file, to_json(fmap))
+
+        finding.setdefault("feasibility", {})[
+            "empirical_mitigation_map"
+        ] = {
+            "feasibility_map_file": str(fmap_file),
+            "summary": fmap.summary(),
+            "witness_hash": fmap.witness_hash,
+            "witness_len": fmap.witness_len,
+            "target_source_hash": fmap.target_source_hash,
+            "target_source_path": fmap.target_source_path,
+            "match_score": best.score,
+            "match_reason": best.reason,
+        }
+        summary = fmap.summary()
+        print(
+            f"  {fid}: empirical: "
+            f"fired={summary['bug_fired_under']} "
+            f"blocked={summary['blocked_under']}",
+            file=sys.stderr,
+        )
+        enriched += 1
+
+    if enriched:
+        print(
+            f"  Empirical mitigation map: enriched {enriched}/"
+            f"{len(group)} finding(s)",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

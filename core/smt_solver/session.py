@@ -7,9 +7,14 @@ per-call via ``new_solver(timeout_ms=...)``.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Iterator
+from contextvars import ContextVar
+from time import monotonic
+from typing import Any, TYPE_CHECKING
 
 from .availability import z3
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 DEFAULT_TIMEOUT_MS = 5000
 
@@ -20,10 +25,91 @@ DEFAULT_TIMEOUT_MS = 5000
 _MAX_TIMEOUT_MS = 2 ** 31 - 1
 
 
-def new_solver(timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Any:
+_QUERY_DEADLINE: ContextVar[float | None] = ContextVar("smt_query_deadline", default=None)
+
+
+@contextmanager
+def query_budget(timeout_ms: int) -> Iterator[float]:
+    """Share a soft query budget across path/verb checks and their subqueries.
+
+    Time spent parsing or between queries also consumes the budget. Nested
+    scopes cannot extend an outer deadline. This is not a process wall-time
+    limit: native solver timeouts are cooperative. Use check_solver with
+    factory-created solvers; direct native check() calls are outside it.
+    Yields the effective monotonic deadline for same-host worker handoff;
+    process startup must consume the budget rather than restart it.
+    """
+    if type(timeout_ms) is not int or timeout_ms < 0:
+        raise ValueError("query budget must be a nonnegative integer in milliseconds")
+    deadline = monotonic() + min(timeout_ms, _MAX_TIMEOUT_MS) / 1000
+    outer = _QUERY_DEADLINE.get()
+    deadline = min(deadline, outer) if outer is not None else deadline
+    token = _QUERY_DEADLINE.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _QUERY_DEADLINE.reset(token)
+
+
+def check_solver(solver: Any, *assumptions: Any) -> Any:
+    """Check once, capping the native query by its shared remaining budget.
+
+    Expiry returns unknown without consulting stale native query state.
+    Preserve the factory's per-query cap and restore it after the query.
+    Native models/cores survive timeout-parameter changes. A restoration
+    failure propagates instead of presenting a cleanly completed query.
+    If query and restoration both fail, retain both errors, including
+    cancellation and control-flow exceptions.
+    Optional assumptions are forwarded to this native check only; they do
+    not become persistent assertions or extend the shared query budget.
+    """
+    deadline = _QUERY_DEADLINE.get()
+    if deadline is None:
+        if getattr(solver, "_raptor_budget_exhausted", False) is True:
+            solver._raptor_budget_exhausted = False
+        return solver.check(*assumptions)
+    timeout = getattr(solver, "_raptor_timeout_ms", None)
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError("budgeted checks require a core SMT factory solver")
+    remaining = int((deadline - monotonic()) * 1000)
+    solver._raptor_budget_exhausted = remaining <= 0
+    if remaining <= 0:
+        return z3.unknown
+    solver.set("timeout", min(timeout, remaining))
+    try:
+        result = solver.check(*assumptions)
+    except BaseException as query_error:
+        try:
+            solver.set("timeout", timeout)
+        except BaseException as restore_error:
+            raise BaseExceptionGroup(
+                "check_solver: query and timeout restoration both failed",
+                [query_error, restore_error],
+            ) from None
+        raise
+    else:
+        solver.set("timeout", timeout)
+        return result
+
+
+def solver_reason_unknown(solver: Any) -> str:
+    """Reason for the last managed check, including skipped expired queries."""
+    if getattr(solver, "_raptor_budget_exhausted", False) is True:
+        return "shared query budget exhausted (timeout)"
+    return solver.reason_unknown()
+
+
+def _timeout_value(timeout_ms):
+    if type(timeout_ms) is not int:
+        raise ValueError("timeout_ms must be an integer")
+    return min(_MAX_TIMEOUT_MS, max(1, timeout_ms))
+
+
+def new_solver(timeout_ms: int = DEFAULT_TIMEOUT_MS, *, ctx: Any = None) -> Any:
     """Return a fresh ``z3.Solver()`` with the given timeout applied.
 
-    Caller-supplied ``timeout_ms`` is clamped to ``[1, _MAX_TIMEOUT_MS]``.
+    Caller-supplied ``timeout_ms`` must be an integer and is clamped to
+    ``[1, _MAX_TIMEOUT_MS]``.
 
     Pre-fix:
       * `timeout_ms=0` was forwarded verbatim. Z3 interprets `timeout=0`
@@ -40,16 +126,16 @@ def new_solver(timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Any:
     Clamp to a sensible range so each of those pathological inputs
     becomes a usable per-call timeout.
     """
-    if timeout_ms < 1:
-        timeout_ms = 1
-    elif timeout_ms > _MAX_TIMEOUT_MS:
-        timeout_ms = _MAX_TIMEOUT_MS
-    s = z3.Solver()
+    timeout_ms = _timeout_value(timeout_ms)
+    if ctx is not None and (z3 is None or not isinstance(ctx, z3.Context)):
+        raise ValueError("ctx must be a Z3 context or None")
+    s = z3.Solver() if ctx is None else z3.Solver(ctx=ctx)
     s.set("timeout", timeout_ms)
+    s._raptor_timeout_ms = timeout_ms
     return s
 
 
-def new_optimizer(timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Any:
+def new_optimizer(timeout_ms: int = DEFAULT_TIMEOUT_MS, *, ctx: Any = None) -> Any:
     """Return a fresh ``z3.Optimize()`` with the given timeout applied.
 
     Same clamping behaviour as :func:`new_solver`.  Use when the caller
@@ -66,45 +152,42 @@ def new_optimizer(timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Any:
     work without modification — verified empirically on the Z3 builds
     we ship.
     """
-    if timeout_ms < 1:
-        timeout_ms = 1
-    elif timeout_ms > _MAX_TIMEOUT_MS:
-        timeout_ms = _MAX_TIMEOUT_MS
-    o = z3.Optimize()
+    timeout_ms = _timeout_value(timeout_ms)
+    if ctx is not None and (z3 is None or not isinstance(ctx, z3.Context)):
+        raise ValueError("ctx must be a Z3 context or None")
+    o = z3.Optimize() if ctx is None else z3.Optimize(ctx=ctx)
     o.set("timeout", timeout_ms)
+    o._raptor_timeout_ms = timeout_ms
     return o
+
+
+def _pop_scope(solver):
+    try:
+        solver.pop()
+    except Exception as exc:
+        raise RuntimeError("scoped: solver.pop() failed; solver state was not restored") from exc
 
 
 @contextmanager
 def scoped(solver: Any) -> Iterator[Any]:
-    """Push an assertion scope on ``solver`` for the duration of the block.
+    """Push a temporary assertion scope and require successful rollback.
 
-    On exit (normal or exception), pops the scope — assertions added
-    inside are removed, assertions from before remain. Lets domain
-    encoders try hypothesis constraints and roll back cheaply without
-    discarding the surrounding solver state.
-
-    push() failure is caught and re-raised as RuntimeError with the
-    original chained. Pre-fix push() ran OUTSIDE the try/finally, so
-    a push() failure (rare — invalid solver state, OOM, transport
-    fault on a remote-Z3 build) propagated as a raw `Z3Exception`
-    that the caller could mis-attribute to body code rather than
-    scope setup. Post-fix the caller sees a clear "scope push
-    failed" message; the contract that a failed push means no body
-    runs (and nothing to pop) is preserved.
+    Failed setup never executes the body. Failed cleanup raises an
+    integrity error: callers must not continue assuming temporary facts
+    were removed. If both body and cleanup fail, preserve both failures
+    in an exception group, including cancellation/control-flow exceptions.
     """
     try:
         solver.push()
-    except Exception as e:  # noqa: BLE001 — Z3Exception unavailable cross-version
-        raise RuntimeError(f"scoped: solver.push() failed: {e}") from e
+    except Exception as exc:
+        raise RuntimeError(f"scoped: solver.push() failed: {exc}") from exc
     try:
         yield solver
-    finally:
+    except BaseException as body_error:
         try:
-            solver.pop()
-        except Exception:  # noqa: BLE001
-            # If pop fails (very rare, but possible after a remote-Z3
-            # transport hiccup), re-raising would mask any exception
-            # from the body. Best-effort log via debug-only re-raise:
-            # we let the body's exception propagate.
-            pass
+            _pop_scope(solver)
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup("scoped: body and rollback both failed", [body_error, cleanup_error]) from None
+        raise
+    else:
+        _pop_scope(solver)

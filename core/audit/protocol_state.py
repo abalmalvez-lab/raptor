@@ -1,0 +1,1537 @@
+"""Protocol-state verification channel (CWE-372) — honesty-constrained.
+
+Target class (the ACK-of-unsent shape): a protocol state variable is
+updated from a peer-supplied value without validation against
+locally-authoritative state (``largest_acked_pkt`` set from the
+decoded ACK frame, never compared against ``highest_sent``;
+``highest_sent`` itself written and read nowhere).
+
+**What is mechanically verifiable, with receipts:**
+
+1. *Written-never-read state fields* — from the field index (writes >
+   0, reads = 0 target-wide). NOT a vulnerability; evidence that a
+   defence the author began was never wired into validation.
+   Permanently detection-grade (``protocol_state:dead-state-field``,
+   CWE-563-adjacent).
+2. *Unvalidated peer-sourced state writes* — a state-field write whose
+   rhs provenance traces to a decode/parse source with no dominating
+   guard mentioning a sibling field of the same object. Receipt-backed
+   but a weak proxy (validation can be non-comparative), so
+   permanently detection-grade
+   (``protocol_state:unvalidated-peer-write``).
+3. *Invariant preservation/violation at write sites* — the
+   census-driven multi-site extension of :mod:`core.audit.
+   invariant_smt` (:func:`~core.audit.invariant_smt.
+   check_site_batch`): every write site of every invariant
+   identifier, across functions, gets one inductive step with
+   polarity-resolved dominating guards as pre-conditions. Real
+   verification — but only of *preservation of a stated invariant*.
+
+**What is NOT mechanically verifiable — and is not claimed:** that the
+protocol *requires* the invariant (RFC knowledge). The invariant
+premise is study/LLM knowledge; the machine checks consequences,
+never the premise. Grade accordingly:
+
+* ``protocol_state:invariant-violated`` (registry, promote-capable)
+  ONLY when (a) the invariant's provenance is study-receipted or
+  operator-annotated (provenance ≠ ``llm_prior``, receipt present —
+  the DomainVocabulary provenance rule applied to invariants) AND (b)
+  SMT says violable with a model at a peer-writable site (the leg-2
+  taint witness on that site).
+* An LLM-stated invariant, or a violation without the peer-write
+  witness, confirms only under the ``-unreceipted`` detection variant
+  — an uncorroborated premise may aggregate but never promote alone.
+* Legs 1+2 share the single ``protocol_state`` namespace with leg 3 —
+  two of them can never satisfy the two-independent-namespaces
+  aggregation rule by themselves (the self-corroboration firewall).
+
+The channel-local field index rides regex extraction (the
+``lifecycle_collector.collect_field_sites_from_source`` shape) plus
+per-function attribution. The shared field census
+(``core/audit/field_census.py``, used by ptr_lifecycle) exists and
+offers a tree-sitter tier plus alias-assignment contexts this
+regex-tier index lacks; migrating this module onto
+``build_field_census`` is future work — until then the two censuses
+are maintained separately. Guard-dependent verdicts report
+``census-degraded`` when source guard binding is unavailable rather than
+guessing. No LLM calls; native invariant queries use the confined SMT worker.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from bisect import bisect_right
+# `field` is a receipt attribute name on StateEvidence (§4.2), so the
+# dataclasses helper is imported under an alias.
+from dataclasses import dataclass
+from dataclasses import field as dc_field
+from itertools import chain
+from pathlib import Path
+from typing import Any
+
+from core.json import save_json
+from core.source.lines import slice_text, split_lines
+
+logger = logging.getLogger(__name__)
+
+_STATE_INVARIANT_COMPARISON_RE = re.compile(r"(<=|>=|==|!=|<|>)")
+_STATE_WHITESPACE_RE = re.compile(r"\s+")
+_STATE_INTEGER_LITERAL_RE = re.compile(r"\d+[uUlL]*")
+_STATE_CALL_RHS_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+_STATE_LOCAL_RHS_RE = re.compile(r"([A-Za-z_]\w*)")
+
+RULE_INVARIANT_VIOLATED = "protocol_state:invariant-violated"
+DETECTION_VARIANT_SUFFIX = "-unreceipted"
+RULE_INVARIANT_UNRECEIPTED = (
+    RULE_INVARIANT_VIOLATED + DETECTION_VARIANT_SUFFIX
+)
+RULE_DEAD_STATE = "protocol_state:dead-state-field"
+RULE_PEER_WRITE = "protocol_state:unvalidated-peer-write"
+
+# Permanently detection-grade rule-ids (leads legs + the
+# uncorroborated-premise variant). They aggregate, never promote
+# alone; all share ONE namespace by design.
+_DETECTION_RULE_IDS = frozenset({
+    RULE_INVARIANT_UNRECEIPTED, RULE_DEAD_STATE, RULE_PEER_WRITE,
+})
+
+PROTOCOL_STATE_CWES = frozenset({"CWE-372"})
+DEAD_STATE_LEAD_CWE = "CWE-563"
+
+# Enumerated inconclusive reasons (each a distinct tested string).
+REASON_INVARIANT_UNSTATED = "invariant-unstated"
+REASON_INVARIANT_OUT_OF_SCOPE = "invariant-out-of-scope"
+REASON_AUTHORITY_UNRESOLVED = "authority-unresolved"
+REASON_CENSUS_DEGRADED = "census-degraded"
+REASON_Z3_UNAVAILABLE = "z3-unavailable"
+REASON_HYPOTHESIS_UNBINDABLE = "hypothesis-unbindable"
+
+INCONCLUSIVE_REASONS = frozenset({
+    REASON_INVARIANT_UNSTATED,
+    REASON_INVARIANT_OUT_OF_SCOPE,
+    REASON_AUTHORITY_UNRESOLVED,
+    REASON_CENSUS_DEGRADED,
+    REASON_Z3_UNAVAILABLE,
+    REASON_HYPOTHESIS_UNBINDABLE,
+})
+
+# Cost bounds (§4.6).
+MAX_SITES_PER_INVARIANT = 40
+INVARIANT_BUDGET_S = 15.0
+MAX_DEAD_STATE_LEADS = 20
+MAX_PEER_WRITE_LEADS = 20
+MAX_LEADS_PER_FILE = 3
+MAX_CENSUS_FIELDS = 500
+MAX_SITES_PER_FIELD = 200
+
+_SOURCE_SUFFIXES = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp")
+
+# Hypothesis prose shapes (§4.5).
+_PROTOCOL_STATE_HYPOTHESIS_RE = re.compile(
+    r"(?:(?:protocol|state)\s+(?:invariant|machine)"
+    r"|never\s+sent|not\s+(?:previously\s+)?sent"
+    r"|out.of.window|monoton"
+    # Canonical-split gap (``\w+.{0,40}`` -> one bounded probe per
+    # split point): the ambiguous spelling re-splits against every
+    # stem repeat inside one long word — quadratic on hostile text.
+    # Same language; only a stem buried more than 64 word-characters
+    # before the gap stops matching.
+    r"|acknowledg(?:\w.{0,40}|\w{1,64}.{40})(?:unsent|never|higher\s+than)"
+    r"|peer.{0,40}(?:controls?|sets?|poisons?).{0,30}"
+    r"(?:state|counter|sequence|window))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Protocol-state identifier stems — the dispatch-time gate that gives
+# this channel precedence over the single-function smt_invariant chain
+# for state-field invariants while local buffer invariants
+# (obuf_len <= obuf_size) keep routing to smt_invariant (§4.5).
+_STATE_STEM_RE = re.compile(
+    r"(?:^|_)(?:seq|seqno|ack|acked|sent|recv|rcvd|window|epoch|"
+    r"state|pkt|packet|frame|handshake|largest|highest|next|last)"
+    r"(?:_|$)",
+    re.IGNORECASE,
+)
+
+# Peer-sourced rhs provenance: decode/parse call stems.
+_DECODER_STEM_RE = re.compile(
+    r"(?:ntoh|decode|parse|deserial|unpack|read_|get_u|recv|extract)",
+    re.IGNORECASE,
+)
+
+_FIELD_ACCESS_RE = re.compile(
+    r"([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)",
+)
+# Full access chain (``conn->pktns->largest_acked``): base identifier
+# plus one-or-more field segments.  Each segment repetition starts at
+# a REQUIRED ``->``/``.`` delimiter (an identifier can never begin
+# with ``-`` or ``.``), so unlike the retired
+# ``(?:ident(?:->|.))+name`` shape there is no ambiguous split and
+# matching stays linear.  A pairwise regex saw only the first hop of
+# a multi-level chain — the terminal field's write was censused as a
+# READ of the middle segment, leaving the written field with zero
+# write sites (vacuous preservation from census blindness).
+# (?<![\w.]) pins the scan to chain starts: an unpinned leading
+# identifier re-reads the same hostile run from every offset —
+# quadratic per line.  Mid-word starts only ever fabricated a token
+# (the "xff" tail of a hex literal); a post-dot start is a chain
+# tail the pinned match from the true head already covers.
+_FIELD_CHAIN_RE = re.compile(
+    r"(?<![\w.])([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*)+)",
+)
+# Companion for chains whose receiver ends in a subscript or call
+# (``arr[0].fld.sub``, ``bufs[i].hdr.len``): the pinned pattern cannot
+# span ``[...]``/``(...)``, so the chain AFTER the closing bracket
+# would go uncensused.  Dot connector only — after ``->`` the pin
+# above already admits the identifier (``>`` is outside its class),
+# so a wider companion would double-count.  The closer lookbehind
+# keeps attempts sparse and the bounded chain keeps each linear.
+_FIELD_CHAIN_AFTER_CLOSER_RE = re.compile(
+    r"(?<=[\])])\s*\.\s*([A-Za-z_]\w*)"
+    r"((?:\s*(?:->|\.)\s*[A-Za-z_]\w*){1,32})",
+)
+_CHAIN_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+# Write tails: simple/compound assignment (all C compound operators —
+# ``*=`` ``/=`` ``%=`` included; their omission read multiplicative
+# updates as pure reads) and postfix ``++``/``--``.  Prefix
+# ``++``/``--`` is detected from the text before the chain.
+_WRITE_TAIL_RE = re.compile(r"\s*(\+\+|--|(?:[+\-*/%|&^]|<<|>>)?=(?!=))")
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z_][\w.]*)\s*(?:\(\s*\))?`")
+_IDENT_RE = re.compile(r"\b([A-Za-z_]\w{2,})\b")
+
+
+def is_protocol_state_hypothesis(text: str) -> bool:
+    """True when the hypothesis matches a protocol-state prose shape
+    or states a parseable invariant over state-stemmed identifiers."""
+    fires, _inv = classify_protocol_state_hypothesis(text)
+    return fires
+
+
+def classify_protocol_state_hypothesis(
+    text: str,
+) -> tuple[bool, str | None]:
+    """``(fires, invariant)`` — ``invariant`` is set when the text
+    contains a linear comparison whose sides both carry
+    protocol-state-stemmed identifiers (that invariant then routes to
+    the census-driven multi-site harness INSTEAD of the
+    single-function ``smt_invariant`` chain — the precedence rule)."""
+    if not text:
+        return False, None
+    invariant = None
+    try:
+        from .invariant_smt import extract_invariants
+        candidates = extract_invariants(text)
+        # This channel checks one invariant, not an arbitrary first part
+        # of a statement containing several independent comparisons.
+        if len(candidates) != 1:
+            candidates = []
+        for cand in candidates:
+            m = _STATE_INVARIANT_COMPARISON_RE.search(cand)
+            if not m:
+                continue
+            sides = (cand[:m.start()], cand[m.end():])
+            if all(
+                any(
+                    _STATE_STEM_RE.search(ident)
+                    for ident in _CHAIN_IDENT_RE.findall(side)
+                )
+                for side in sides
+            ):
+                invariant = cand
+                break
+    except ImportError:
+        pass
+    prose = bool(_PROTOCOL_STATE_HYPOTHESIS_RE.search(text))
+    return prose or invariant is not None, invariant
+
+
+def protocol_state_applicable(cwe: str) -> bool:
+    norm = (cwe or "").upper().strip()
+    if norm and not norm.startswith("CWE-"):
+        norm = f"CWE-{norm}"
+    return norm in PROTOCOL_STATE_CWES
+
+
+def is_detection_rule_id(rule_id: str) -> bool:
+    """True for the permanently-detection-grade rule-ids (both lead
+    legs) and the ``-unreceipted`` variant: aggregation-only, never
+    promote-alone."""
+    return rule_id in _DETECTION_RULE_IDS or (
+        rule_id.startswith("protocol_state:")
+        and rule_id.endswith(DETECTION_VARIANT_SUFFIX)
+    )
+
+
+@dataclass
+class StateEvidence:
+    """Aggregate channel verdict for one protocol-state hypothesis."""
+
+    outcome: str                 # confirmed | refuted | inconclusive
+    reason: str
+    rule_id: str = RULE_INVARIANT_VIOLATED
+    field: dict[str, Any] | None = None
+    dead_state: dict[str, Any] | None = None
+    peer_write: dict[str, Any] | None = None
+    invariant: dict[str, Any] | None = None
+    reachability: dict[str, Any] | None = None
+    corroboration: list[Any] = dc_field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "outcome": self.outcome,
+            "reason": self.reason,
+            "rule_id": self.rule_id,
+        }
+        for key in ("field", "dead_state", "peer_write", "invariant",
+                    "reachability"):
+            val = getattr(self, key)
+            if val is not None:
+                d[key] = val
+        if self.corroboration:
+            d["corroboration"] = [
+                c.to_dict() if hasattr(c, "to_dict") else c
+                for c in self.corroboration
+            ]
+        return d
+
+
+def _inconclusive(reason: str, detail: str = "") -> StateEvidence:
+    return StateEvidence(
+        outcome="inconclusive",
+        reason=f"{reason}: {detail}" if detail else reason,
+    )
+
+
+# ── learned protocol-state vocabulary (channel-local parsing) ───────
+
+
+def learned_state_fields(
+    domain_model: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Entries from the optional ``state_fields`` domain-model key
+    ({field, struct, authority: local|peer|derived, monotonic,
+    invariant_refs, provenance, receipt}) — parsed channel-locally,
+    ``llm_prior`` excluded (the DomainVocabulary provenance rule)."""
+    out: dict[str, dict[str, Any]] = {}
+    for entry in (domain_model or {}).get("state_fields") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("field") or "").strip()
+        if not name:
+            continue
+        if str(entry.get("provenance") or "") == "llm_prior":
+            continue
+        out[name] = entry
+    return out
+
+
+def _invariant_receipt(
+    domain_model: dict[str, Any] | None,
+    invariant: str,
+) -> dict[str, Any] | None:
+    """The honesty gate's premise check: find a domain-model
+    ``Invariant`` whose statement carries this comparison with a
+    non-``llm_prior`` provenance AND a receipt. Returns the matching
+    entry (provenance chain embedded verbatim in the evidence) or
+    ``None`` — in which case only the ``-unreceipted`` detection
+    variant may confirm."""
+    norm = _STATE_WHITESPACE_RE.sub("", invariant)
+    if not norm:
+        return None
+    # Token-boundary containment, not bare substring: "x <= 10" is
+    # NOT receipted by "max_x <= 100" (the substring match handed the
+    # unrelated entry's provenance chain and receipt grade to a
+    # different variable's invariant).
+    bounded = re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(norm)}(?![A-Za-z0-9_.])",
+    )
+    for entry in (domain_model or {}).get("invariants") or []:
+        if not isinstance(entry, dict):
+            continue
+        statement = str(entry.get("statement") or "")
+        if not bounded.search(_STATE_WHITESPACE_RE.sub("", statement)):
+            continue
+        provenance = str(entry.get("provenance") or "")
+        if provenance in ("", "llm_prior"):
+            continue
+        if not entry.get("receipt"):
+            continue
+        return entry
+    return None
+
+
+# ── channel-local field index ───────────────────────────────────────
+
+
+def build_state_field_index(
+    source_texts: dict[str, str],
+) -> dict[str, Any]:
+    """Whole-source-set index of struct-field write/read sites with
+    rhs provenance classes — ``{"fields": {name: {"writes": [...],
+    "reads": [...]}}, "tier": ..., "skipped": bool}``.
+
+    Site record: ``{file, line, function, code, base, field,
+    rhs_class, rhs}`` with ``rhs_class`` ∈ from_param /
+    from_call:<callee> / from_field:<field> / from_local:<name> /
+    literal_null / literal_const / unknown."""
+    from .resource_bounds import _c_function_spans, _c_function_spans_from_lines
+
+    fields: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    skipped = False
+
+    for fp, source in sorted(source_texts.items()):
+        if not fp.endswith(_SOURCE_SUFFIXES):
+            continue
+        # Spans are emitted in ascending start order and do not
+        # overlap, so a bisect on start lines replaces the linear
+        # scan the index used to run per field access.
+        if type(source) is str:
+            lines = split_lines(source)
+            spans = _c_function_spans_from_lines(lines)
+        else:
+            spans = _c_function_spans(source)
+            lines = split_lines(source)
+        span_starts = [start for _name, start, _end in spans]
+
+        def _function_at(line: int) -> tuple[str, tuple[str, ...]]:
+            i = bisect_right(span_starts, line) - 1
+            if i >= 0:
+                name, start, end = spans[i]
+                if start <= line <= end:
+                    return name, ()
+            return "", ()
+
+        for line_no, raw in enumerate(lines, start=1):
+            # Comment removal only shortens the line; it cannot create
+            # a field connector absent from the original native text.
+            if type(raw) is str and "." not in raw and "->" not in raw:
+                continue
+            code = raw.split("//", 1)[0]
+            site_code: str | None = None
+            for m in chain(_FIELD_CHAIN_RE.finditer(code),
+                           _FIELD_CHAIN_AFTER_CLOSER_RE.finditer(code)):
+                idents = _CHAIN_IDENT_RE.findall(code, m.start(), m.end())
+                # Parentheses preserve a C lvalue. Scan their closing
+                # delimiters before testing the assignment/update tail;
+                # leaving these as reads can hide a violating mutation.
+                # A linear scan avoids overlapping whitespace regexes.
+                tail_start = m.end()
+                while tail_start < len(code) and (
+                    code[tail_start].isspace() or code[tail_start] == ")"
+                ):
+                    tail_start += 1
+                wm = _WRITE_TAIL_RE.match(code, tail_start)
+                # Prefix increment/decrement writes the terminal field
+                # with no assignment tail (``++conn->pkt_count;``).
+                prefix_end = m.start()
+                while prefix_end > 0 and (
+                    code[prefix_end - 1].isspace() or code[prefix_end - 1] == "("
+                ):
+                    prefix_end -= 1
+                prefix_incdec = code.endswith(("++", "--"), 0, prefix_end)
+                func, _params = _function_at(line_no)
+                # idents[0] is the base identifier; every following
+                # segment is a field.  Non-terminal segments are READS
+                # (the chain dereferences them); only the terminal
+                # segment can be the written field.
+                for depth in range(1, len(idents)):
+                    fld = idents[depth]
+                    if len(fields) >= MAX_CENSUS_FIELDS \
+                            and fld not in fields:
+                        skipped = True
+                        continue
+                    bucket = fields.get(fld)
+                    if bucket is None:
+                        bucket = {"writes": [], "reads": []}
+                        fields[fld] = bucket
+                    terminal = depth == len(idents) - 1
+                    if terminal and wm is not None:
+                        kind = "writes"
+                        op = wm.group(1)
+                    elif terminal and prefix_incdec:
+                        kind = "writes"
+                        op = ""
+                    else:
+                        kind = "reads"
+                    if len(bucket[kind]) >= MAX_SITES_PER_FIELD:
+                        skipped = True
+                        if (kind == "reads" or op == "="
+                                or len(bucket["reads"]) >= MAX_SITES_PER_FIELD):
+                            continue
+                        # A compound update's write is capped, but its
+                        # independent read still has room. Keep only that
+                        # read; no RHS classification is needed.
+                        kind = "reads"
+                    if site_code is None:
+                        site_code = raw.strip()[:200]
+                    site: dict[str, Any] = {
+                        "file": fp,
+                        "line": line_no,
+                        "function": func,
+                        "code": site_code,
+                        "base": idents[depth - 1],
+                        "field": fld,
+                    }
+                    if kind == "writes":
+                        if op != "=" and len(bucket["reads"]) < MAX_SITES_PER_FIELD:
+                            bucket["reads"].append(dict(site))
+                        if wm is not None:
+                            rhs_end = code.find(";", wm.end())
+                            if rhs_end < 0:
+                                rhs_end = len(code)
+                            rhs = code[wm.end():rhs_end].strip()
+                            site["rhs"] = rhs[:200]
+                            site["rhs_class"] = (
+                                "unknown" if op in ("++", "--")
+                                else _classify_rhs(rhs)
+                            )
+                        else:
+                            site["rhs"] = ""
+                            site["rhs_class"] = "unknown"
+                    bucket[kind].append(site)
+
+    return {"fields": fields, "tier": "regex", "skipped": skipped}
+
+
+def _classify_rhs(rhs: str) -> str:
+    rhs = rhs.strip()
+    if not rhs:
+        return "unknown"
+    # "0" deliberately absent: the numeric-literal fullmatch below
+    # already classifies it literal_const, which is what the old
+    # inline conditional here resolved to.  No semicolon variants:
+    # the sole producer splits the statement on ";" before calling.
+    if rhs in ("NULL", "nullptr"):
+        return "literal_null"
+    if _STATE_INTEGER_LITERAL_RE.fullmatch(rhs.rstrip(";")):
+        return "literal_const"
+    m = _STATE_CALL_RHS_RE.match(rhs)
+    if m:
+        return f"from_call:{m.group(1)}"
+    m = _FIELD_ACCESS_RE.match(rhs)
+    if m:
+        return f"from_field:{m.group(2)}"
+    m = _STATE_LOCAL_RHS_RE.fullmatch(rhs.rstrip(";").strip())
+    if m:
+        return f"from_local:{m.group(1)}"
+    return "unknown"
+
+
+_LOCAL_CALL_ASSIGN_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(",
+)
+
+
+def _local_call_sources(source: str, span: tuple[int, int] | None,
+                        ) -> dict[str, str]:
+    """One-hop local provenance: ``v = decode_ack_largest(frame)``
+    → ``{"v": "decode_ack_largest"}`` within the function span."""
+    if (type(source) is str and len(source) >= 16 * 1024
+            and type(span) is tuple and len(span) == 2
+            and type(span[0]) is int and type(span[1]) is int
+            and span[0] > 0 and span[1] >= span[0]):
+        # slice_text already applies split_lines' single-CR trimming.
+        # Raw LF splitting here avoids trimming a second trailing CR.
+        seg = slice_text(source, span[0], span[1]).split("\n")  # line-model: slice_text already trimmed one trailing CR
+    else:
+        lines = split_lines(source)
+        seg = lines[span[0] - 1:span[1]] if span else lines
+    out: dict[str, str] = {}
+    for raw in seg:
+        if type(raw) is str and ("=" not in raw or "(" not in raw):
+            continue
+        for m in _LOCAL_CALL_ASSIGN_RE.finditer(raw.split("//", 1)[0]):
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def _peer_source_chain(
+    site: dict[str, Any],
+    source_texts: dict[str, str],
+    state_vocab: dict[str, dict[str, Any]],
+) -> str | None:
+    """Peer-provenance witness for a write site: a decoder-stem rhs
+    call (directly or via a one-hop local), or a learned
+    ``state_fields`` entry declaring the field peer-authoritative."""
+    vocab_entry = state_vocab.get(site["field"])
+    if vocab_entry and str(vocab_entry.get("authority")) == "peer":
+        return f"state_fields:{site['field']}:authority=peer"
+    rhs_class = str(site.get("rhs_class") or "")
+    if rhs_class.startswith("from_call:"):
+        callee = rhs_class.split(":", 1)[1]
+        if _DECODER_STEM_RE.search(callee):
+            return rhs_class
+        return None
+    if rhs_class.startswith("from_local:"):
+        local = rhs_class.split(":", 1)[1]
+        source = source_texts.get(site["file"], "")
+        try:
+            from .fail_open_lang import c_function_span
+            span = c_function_span(source, site["function"],
+                                   language="c")
+        except ImportError:
+            span = None
+        callee = _local_call_sources(source, span).get(local, "")
+        if callee and _DECODER_STEM_RE.search(callee):
+            return f"from_call:{callee} via {local}"
+    return None
+
+
+# ── source guard extraction with branch polarity ────────────────────
+
+
+def _branch_guards(
+    source: str,
+    function_name: str,
+    line: int,
+) -> list[str] | None:
+    """Source-bound reaching predicates for one unambiguous mutation.
+
+    Branch polarity comes from the source AST, never CFG successor order.
+    Missing or unsupported source bindings decline the whole guard frame.
+    """
+    try:
+        from .invariant_source import guard_snapshot_conditions
+        return guard_snapshot_conditions(source, function_name.rsplit(".", 1)[-1], line)
+    except Exception:
+        logger.debug("protocol_state: source guard binding failed", exc_info=True)
+        return None
+
+
+def _bare_fields(text: str, names: set[str]) -> str:
+    """Normalise ``base->field`` / ``base.field`` chains to bare field
+    names for every invariant identifier, so site code and guards
+    speak the invariant's vocabulary. Size operands retain their object/type
+    identity: ``sizeof(other->field)`` is not the size of bare ``field``.
+
+    Implemented as a manual backward walk over ``ident (->|.)``
+    prefixes. The previous ``(?:ident(?:->|.))+name`` regex carried an
+    ambiguous nested quantifier that backtracked superlinearly on long
+    access chains (tens of seconds on multi-kB guard-condition
+    strings), and the per-invariant budget is only checked between
+    sites — one pathological condition stalled the whole harness."""
+    from .invariant_expression import SIZEOF
+
+    pieces = re.split(rf"(\b{SIZEOF})", text)
+    ordered = sorted(names, key=len, reverse=True)
+    for index in range(0, len(pieces), 2):
+        for name in ordered:
+            pieces[index] = _strip_chain_prefixes(pieces[index], name)
+    return "".join(pieces)
+
+
+def _chain_prefix_start(text: str, pos: int,
+                        cache: dict[int, int]) -> int:
+    """Start offset of the longest ``ident (->|.)`` chain ending at
+    *pos* (*pos* itself when there is no prefix). *cache* memoises
+    chain starts for previously walked end positions so overlapping
+    chains (``name.name.name…``) stay linear overall."""
+    i = pos
+    while True:
+        hit = cache.get(i)
+        if hit is not None:
+            i = hit
+            break
+        j = i
+        while j > 0 and text[j - 1].isspace():
+            j -= 1
+        if j >= 2 and text[j - 2:j] == "->":
+            j -= 2
+        elif j >= 1 and text[j - 1] == ".":
+            j -= 1
+        else:
+            break
+        while j > 0 and text[j - 1].isspace():
+            j -= 1
+        k = j
+        while k > 0 and (text[k - 1].isalnum() or text[k - 1] == "_"):
+            k -= 1
+        # The identifier must start [A-Za-z_]; skip a leading digit
+        # run so ``9a.name`` still strips the valid ``a.`` prefix.
+        while k < j and text[k].isdigit():
+            k += 1
+        if k == j:
+            break
+        i = k
+    cache[pos] = i
+    return i
+
+
+def _strip_chain_prefixes(text: str, name: str) -> str:
+    """Delete every ``ident (->|.)`` chain immediately preceding a
+    whole-word occurrence of *name* (the manual, linear-time
+    equivalent of ``s/(?:ident(?:->|.))+name/name/``)."""
+    cuts: list[list[int]] = []
+    cache: dict[int, int] = {}
+    for m in re.finditer(rf"\b{re.escape(name)}\b", text):
+        start = _chain_prefix_start(text, m.start(), cache)
+        if start >= m.start():
+            continue
+        if cuts and start <= cuts[-1][1]:
+            cuts[-1][0] = min(cuts[-1][0], start)
+            cuts[-1][1] = max(cuts[-1][1], m.start())
+        else:
+            cuts.append([start, m.start()])
+    if not cuts:
+        return text
+    pieces: list[str] = []
+    prev = 0
+    for start, end in cuts:
+        pieces.append(text[prev:start])
+        prev = end
+    pieces.append(text[prev:])
+    return "".join(pieces)
+
+
+# ── leg 3: census-driven multi-site invariant harness ───────────────
+
+
+def _invariant_variables(invariant: str) -> set[str]:
+    return {
+        ident for ident in _CHAIN_IDENT_RE.findall(invariant)
+        if not ident.isdigit()
+    }
+
+
+def check_invariant_multi_site(
+    invariant: str,
+    index: dict[str, Any],
+    source_texts: dict[str, str],
+    *,
+    max_sites: int = MAX_SITES_PER_INVARIANT,
+    budget_s: float = INVARIANT_BUDGET_S,
+    integer_abi=None,
+) -> dict[str, Any]:
+    """Every census write site of every invariant identifier, across
+    functions, gets the existing inductive step
+    (:func:`invariant_smt.check_site_batch`) with
+    polarity-resolved dominating guards. Returns ``{outcome, sites,
+    reason, guard_leg}`` — ``outcome`` ∈ violable | preserved |
+    inconclusive; ``guard_leg`` is False when source guard binding was
+    unavailable (a violable outcome then may NOT confirm:
+    ``census-degraded``). Bare-field projection also requires consistent
+    scalar/object bindings; ambiguous sites retain an explicit refusal
+    receipt and do not enter the solver batch. Source-backed census code
+    must match the selected mutation and cannot add guards absent from it.
+    Preservation also requires no reported collector truncation or missing
+    direct source field writes in a bounded syntax coverage check; a checked
+    counterexample can remain valid without a complete input census."""
+    t0 = time.monotonic()
+    variables = _invariant_variables(invariant)
+    fields = index.get("fields") or {}
+    # The collector can already have dropped fields or sites before this
+    # check's own cap is applied. Only an explicit False establishes that
+    # its completeness marker is clear; retain legacy indexes without it.
+    source_incomplete = index.get("skipped", False) is not False
+    sites: list[dict[str, Any]] = []
+    capped = False
+    for var in sorted(variables):
+        for site in (fields.get(var) or {}).get("writes") or []:
+            if len(sites) >= max_sites:
+                capped = True
+                break
+            sites.append(site)
+        if capped:
+            break
+
+    from .protocol_invariant_bindings import census_coverage_refusal
+
+    def coverage_check():
+        # Universal preservation needs coverage; an admitted counterexample
+        # does not. Spend this budget only before reporting preservation.
+        return census_coverage_refusal(
+            ((path, source) for path, source in source_texts.items() if path.endswith(_SOURCE_SUFFIXES)),
+            variables, fields, deadline=t0 + budget_s, clock=time.monotonic,
+        )
+
+    if not sites:
+        coverage_refusal = coverage_check()
+        source_incomplete = source_incomplete or bool(coverage_refusal)
+        # Vacuous: the regex census found NO write site for any
+        # invariant variable.  That is bounded negative evidence — the
+        # census can be blind (macro-hidden writes, pointer aliases),
+        # so the flag lets the adjudicator keep this away from an
+        # authoritative refutation.
+        return {
+            "outcome": "inconclusive" if source_incomplete or capped else "preserved",
+            "vacuous": True,
+            "sites": [],
+            "reason": (
+                "no checked mutation sites in a partial census "
+                f"({coverage_refusal or 'source index incomplete or analysis cap reached'}) — not refuting"
+                if source_incomplete or capped else
+                "no census write site mutates an invariant variable "
+                "(vacuously preserved; base case not checked)"
+            ),
+            "guard_leg": True,
+        }
+
+    from .invariant_smt import SiteResult, check_site_batch
+    from .protocol_invariant_bindings import census_source_refusal, projection_refusal
+    from .invariant_outcomes import aggregate_verdicts
+
+    guard_leg = True
+    per_site: list[dict[str, Any]] = []
+    prepared = []
+    skipped = 0
+    for site in sites:
+        remaining_s = budget_s - (time.monotonic() - t0)
+        if remaining_s <= 0:
+            skipped += 1
+            continue
+        source = source_texts.get(site["file"], "")
+        guards = _branch_guards(source, site["function"], site["line"]) \
+            if site["function"] else []
+        unavailable_guards = guards is None
+        if guards is None:
+            guard_leg = False
+            guards = []
+        refusal = "source guard binding unavailable or unsupported" if unavailable_guards else ""
+        if not refusal and site["function"]:
+            refusal = census_source_refusal(source, site["function"], site["line"], site["code"])
+        if not refusal:
+            refusal = projection_refusal(site["code"], guards, variables)
+        if refusal:
+            guard_leg = False
+        # Guards over other values can still exclude this mutation; retain
+        # the full admitted conjunction in the worker and witness replay.
+        bare_guards = tuple(_bare_fields(g, variables) for g in guards)
+        code = _bare_fields(site["code"], variables)
+        prepared.append((site, {"code": code, "line": site["line"], "pre_conditions": bare_guards}, refusal))
+
+    runnable = [record for _, record, refusal in prepared if not refusal]
+    if runnable:
+        # One process for the entire census. Guard discovery and worker
+        # startup both consume the outer budget; each site retains its
+        # normal native cap inside the worker.
+        remaining_ms = int(max(0.0, budget_s - (time.monotonic() - t0)) * 1000)
+        results = check_site_batch(invariant, runnable, timeout_ms=remaining_ms, integer_abi=integer_abi)
+        if results is None or len(results) != len(runnable):
+            results = [SiteResult(line=record["line"], code=record["code"], verdict="unknown",
+                                 reason="confined invariant batch unavailable or incomplete")
+                       for record in runnable]
+    else:
+        results = []
+    solved = iter(results)
+    for site, record, refusal in prepared:
+        res = SiteResult(line=record["line"], code=site["code"], verdict="out_of_scope",
+                         reason=refusal) if refusal else next(solved)
+        entry = res.to_dict()
+        entry["file"] = site["file"]
+        entry["function"] = site["function"]
+        entry["rhs_class"] = site.get("rhs_class", "")
+        entry["guards_applied"] = [] if refusal else list(record["pre_conditions"])
+        per_site.append(entry)
+
+    verdicts = {e["verdict"] for e in per_site}
+    aggregate = aggregate_verdicts(verdicts)
+    if aggregate == "violable":
+        # An admitted counterexample survives failures at independent sites.
+        outcome = "violable"
+        reason = (
+            "at least one census write site can break the invariant "
+            "(inductive step, dominating guards encoded)"
+        )
+    elif any(e["verdict"] == "unknown" and "z3" in (e.get("reason") or "")
+             for e in per_site):
+        outcome, reason = "inconclusive", "z3 unavailable"
+    elif aggregate == "preserved":
+        coverage_refusal = coverage_check()
+        source_incomplete = source_incomplete or bool(coverage_refusal)
+        if skipped or capped or source_incomplete:
+            # Budget-skipped or cap-truncated sites were never
+            # checked: "every CHECKED site preserves" over a partial
+            # census is bounded evidence, not a preservation proof —
+            # it must not become an authoritative refutation.  (With
+            # every site skipped, per_site is empty and the vacuous
+            # set comparison above would otherwise claim "all 0
+            # sites preserve".)
+            outcome = "inconclusive"
+            reason = (
+                f"{len(per_site)} checked site(s) preserve the "
+                "invariant but the census was truncated "
+                f"({skipped} skipped on budget, cap "
+                f"{'reached' if capped else 'not reached'}, source index "
+                f"{'incomplete' if source_incomplete else 'complete'}"
+                f"{': ' + coverage_refusal if coverage_refusal else ''}) — "
+                "not refuting on a partial census"
+            )
+        else:
+            outcome = "preserved"
+            reason = (
+                f"all {len(per_site)} census write site(s) preserve "
+                "the invariant (inductive step; base case not checked)"
+            )
+    else:
+        outcome = "inconclusive"
+        undecided = [
+            f"{e['file']}:{e['line']} {e.get('reason') or e['verdict']}"
+            for e in per_site
+            if e["verdict"] in ("unknown", "out_of_scope", "preserved_nonneg")
+        ]
+        reason = "undecided sites — " + "; ".join(undecided[:4])
+    if skipped:
+        reason += f" ({skipped} site(s) skipped on budget)"
+    return {
+        "outcome": outcome,
+        "sites": per_site,
+        "reason": reason,
+        "guard_leg": guard_leg,
+    }
+
+
+# ── channel entry points ────────────────────────────────────────────
+
+
+def _entry_reachability(
+    context: Any,
+    inventory: dict[str, Any] | None,
+    file_path: str,
+    function_name: str,
+) -> dict[str, Any] | None:
+    try:
+        from .fail_open_verify import _entry_reachability as _fo_reach
+    except ImportError:
+        return None
+    try:
+        return _fo_reach(context, inventory, file_path, function_name)
+    except Exception:
+        logger.debug("protocol_state: reachability escalator failed",
+                     exc_info=True)
+        return None
+
+
+def _sibling_fields(
+    index: dict[str, Any], base: str, _function: str, fld: str,
+) -> set[str]:
+    """Fields accessed on the same base identifier anywhere in the
+    index (the struct-membership approximation) minus the written
+    field itself."""
+    siblings: set[str] = set()
+    for name, bucket in (index.get("fields") or {}).items():
+        if name == fld:
+            continue
+        for site in bucket.get("writes", []) + bucket.get("reads", []):
+            if site.get("base") == base:
+                siblings.add(name)
+                break
+    return siblings
+
+
+def _peer_write_verdict(
+    site: dict[str, Any],
+    index: dict[str, Any],
+    source_texts: dict[str, str],
+    state_vocab: dict[str, dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Leg 2 for one write site: ``("confirmed"|"refuted"|
+    "census-degraded"|"not-peer", receipt)``."""
+    chain = _peer_source_chain(site, source_texts, state_vocab)
+    if chain is None:
+        return "not-peer", {}
+    source = source_texts.get(site["file"], "")
+    guards = _branch_guards(source, site["function"], site["line"]) \
+        if site["function"] else []
+    if guards is None:
+        return "census-degraded", {}
+    siblings = _sibling_fields(
+        index, site["base"], site["function"], site["field"],
+    )
+    validating = [
+        g for g in guards
+        if any(re.search(rf"\b{re.escape(s)}\b", g) for s in siblings)
+    ]
+    receipt = {
+        "site": {k: site[k] for k in
+                 ("file", "line", "function", "code")},
+        "source_chain": chain,
+        "guard_conjunction": guards,
+        "sibling_fields": sorted(siblings),
+    }
+    if validating:
+        receipt["validating_guard"] = validating[0]
+        return "refuted", receipt
+    return "confirmed", receipt
+
+
+def _adjudicate_invariant(
+    invariant: str,
+    index: dict[str, Any],
+    source_texts: dict[str, str],
+    domain_model: dict[str, Any] | None,
+    state_vocab: dict[str, dict[str, Any]],
+    *,
+    context: Any = None,
+    inventory: dict[str, Any] | None = None,
+    budget_s: float = INVARIANT_BUDGET_S,
+    integer_abi=None,
+) -> StateEvidence:
+    try:
+        import z3  # noqa: F401
+    except ImportError:
+        return _inconclusive(
+            REASON_Z3_UNAVAILABLE, "pip install z3-solver",
+        )
+
+    multi = check_invariant_multi_site(
+        invariant, index, source_texts, budget_s=budget_s, integer_abi=integer_abi,
+    )
+    receipt_entry = _invariant_receipt(domain_model, invariant)
+    inv_receipt: dict[str, Any] = {
+        "statement": invariant,
+        "provenance": (
+            str(receipt_entry.get("provenance"))
+            if receipt_entry else "llm_stated"
+        ),
+        # The study receipt embedded verbatim (who asserted the
+        # invariant and with what evidence) — or None.
+        "receipt": receipt_entry.get("receipt") if receipt_entry else None,
+        "per_site": multi["sites"],
+    }
+
+    if multi["outcome"] == "preserved":
+        if multi.get("vacuous"):
+            # Zero census write sites is absence of evidence, not a
+            # preservation proof — the census is regex-bounded and can
+            # miss the very mutation the hypothesis names.  Never an
+            # authoritative refutation.
+            return _inconclusive(
+                REASON_CENSUS_DEGRADED,
+                multi["reason"] + " — not refuting on an empty census",
+            )
+        # A complete transition census still proves only the inductive
+        # step. Neither the census nor a study statement establishes the
+        # initial state, so this cannot clear the original source claim.
+        return StateEvidence(
+            outcome="inconclusive",
+            reason=multi["reason"],
+            invariant=inv_receipt,
+        )
+    if multi["outcome"] == "inconclusive":
+        if "z3" in multi["reason"]:
+            return StateEvidence(
+                outcome="inconclusive",
+                reason=f"{REASON_Z3_UNAVAILABLE}: pip install z3-solver",
+                invariant=inv_receipt,
+            )
+        if all(
+            e["verdict"] == "out_of_scope" for e in multi["sites"]
+        ) and multi["sites"]:
+            return StateEvidence(
+                outcome="inconclusive",
+                reason=(
+                    f"{REASON_INVARIANT_OUT_OF_SCOPE}: "
+                    f"{multi['reason']}"
+                ),
+                invariant=inv_receipt,
+            )
+        return StateEvidence(
+            outcome="inconclusive",
+            reason=f"{REASON_INVARIANT_OUT_OF_SCOPE}: {multi['reason']}",
+            invariant=inv_receipt,
+        )
+
+    # violable — the honesty gate decides the grade.
+    if not multi["guard_leg"]:
+        return StateEvidence(
+            outcome="inconclusive",
+            reason=(
+                f"{REASON_CENSUS_DEGRADED}: a violable site exists but "
+                "source guard binding was unavailable — a dominating "
+                "validation could be invisible; not confirming on a "
+                "partial census"
+            ),
+            invariant=inv_receipt,
+        )
+    violable_sites = [
+        e for e in multi["sites"] if e["verdict"] == "violable"
+    ]
+    peer_receipt: dict[str, Any] | None = None
+    peer_site: dict[str, Any] | None = None
+    for entry in violable_sites:
+        fields = index.get("fields") or {}
+        for site in (fields.get(_site_field(entry, fields)) or
+                     {}).get("writes") or []:
+            if (site["file"], site["line"]) == (entry["file"],
+                                                entry["line"]):
+                verdict, receipt = _peer_write_verdict(
+                    site, index, source_texts, state_vocab,
+                )
+                if verdict == "confirmed":
+                    peer_receipt, peer_site = receipt, site
+                break
+        if peer_receipt:
+            break
+
+    receipted = receipt_entry is not None
+    first = violable_sites[0]
+    if receipted and peer_receipt is not None:
+        rule_id = RULE_INVARIANT_VIOLATED
+        grade_note = (
+            "study-receipted invariant, peer-write witness at the "
+            "violable site"
+        )
+    else:
+        rule_id = RULE_INVARIANT_UNRECEIPTED
+        missing = []
+        if not receipted:
+            missing.append("invariant premise is LLM-stated "
+                           "(no study receipt)")
+        if peer_receipt is None:
+            missing.append("no peer-write witness at a violable site")
+        grade_note = "detection-grade: " + "; ".join(missing)
+
+    result = StateEvidence(
+        outcome="confirmed",
+        reason=(
+            f"SMT model breaks `{invariant}` at "
+            f"{first['file']}:{first['line']} ({first['code']}) — "
+            f"{grade_note}"
+        ),
+        rule_id=rule_id,
+        invariant=inv_receipt,
+        peer_write=peer_receipt,
+    )
+    if peer_site is not None:
+        result.field = {
+            "struct": "",
+            "name": peer_site["field"],
+            "authority": str(
+                (state_vocab.get(peer_site["field"]) or {})
+                .get("authority") or "unresolved",
+            ),
+            "provenance": str(
+                (state_vocab.get(peer_site["field"]) or {})
+                .get("provenance") or "",
+            ),
+        }
+        result.reachability = _entry_reachability(
+            context, inventory, peer_site["file"], peer_site["function"],
+        )
+    return result
+
+
+def _site_field(entry: dict[str, Any],
+                fields: dict[str, Any]) -> str:
+    """Recover which census field a per-site entry belongs to."""
+    for name, bucket in fields.items():
+        for site in bucket.get("writes") or []:
+            if (site["file"], site["line"]) == (entry["file"],
+                                                entry["line"]):
+                return name
+    return ""
+
+
+def _gather_source_texts(
+    target_path: Path, primary_file: str,
+) -> dict[str, str]:
+    from .resource_bounds import (
+        _gather_source_texts as _rb_gather,
+    )
+    return _rb_gather(target_path, primary_file)
+
+
+def run_protocol_state_check(
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    *,
+    inventory: dict[str, Any] | None = None,
+    context: Any = None,
+    domain_model: dict[str, Any] | None = None,
+    invariant: str | None = None,
+    source_texts: dict[str, str] | None = None,
+    state_index: dict[str, Any] | None = None,
+    budget_s: float = INVARIANT_BUDGET_S,
+    integer_abi=None,
+) -> StateEvidence:
+    """Adjudicate one protocol-state hypothesis.
+
+    With an invariant (explicit, extracted from the hypothesis, or
+    study-stated) the census-driven multi-site harness runs (leg 3,
+    the only promote-capable path — honesty gate in the module
+    docstring). A hypothesis naming only the suspicious write
+    re-derives the legs-1+2 receipts and confirms at the permanently
+    detection-grade lead rule-ids, or reports
+    ``invariant-unstated``."""
+    if not file_path.endswith(_SOURCE_SUFFIXES):
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"no phase-1 protocol-state analyzer for {file_path}",
+        )
+    if source_texts is None:
+        source_texts = _gather_source_texts(
+            Path(target_path), file_path,
+        )
+    if not source_texts:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"no sources readable under {target_path}",
+        )
+    # *state_index* threads the orchestrator's per-run memo — the
+    # index is a pure function of the source texts and was rebuilt on
+    # every hypothesis dispatch before.
+    index = (
+        state_index if state_index is not None
+        else build_state_field_index(source_texts)
+    )
+    state_vocab = learned_state_fields(domain_model)
+
+    if invariant is None:
+        _fires, invariant = classify_protocol_state_hypothesis(hypothesis)
+
+    if invariant:
+        return _adjudicate_invariant(
+            invariant, index, source_texts, domain_model, state_vocab,
+            context=context, inventory=inventory, budget_s=budget_s, integer_abi=integer_abi,
+        )
+
+    # Legs 1+2 — receipts re-derived, outcome capped at detection
+    # grade (never above `suspicious` downstream).
+    fields = index.get("fields") or {}
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for m in _BACKTICK_IDENT_RE.finditer(hypothesis):
+        name = m.group(1).rsplit(".", 1)[-1]
+        if name in fields and name not in seen:
+            seen.add(name)
+            candidates.append(name)
+    for m in _IDENT_RE.finditer(hypothesis):
+        name = m.group(1)
+        if name in fields and name not in seen:
+            seen.add(name)
+            candidates.append(name)
+    if not candidates:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            "hypothesis names no field present in the field index",
+        )
+
+    refutation: StateEvidence | None = None
+    degraded = False
+    unresolved = False
+    for fld in candidates:
+        bucket = fields[fld]
+        writes = bucket.get("writes") or []
+        reads = bucket.get("reads") or []
+        if writes and not reads:
+            return StateEvidence(
+                outcome="confirmed",
+                reason=(
+                    f"`{fld}` is written at "
+                    + ", ".join(
+                        f"{s['file']}:{s['line']}" for s in writes[:4]
+                    )
+                    + " and read nowhere in the scanned set — a "
+                    "defence the author began was never wired into "
+                    "validation (not itself a vulnerability; "
+                    "permanently detection-grade)"
+                ),
+                rule_id=RULE_DEAD_STATE,
+                field={"struct": "", "name": fld,
+                       "authority": "unresolved", "provenance": ""},
+                dead_state={
+                    "writes": [
+                        {k: s[k] for k in
+                         ("file", "line", "function", "code")}
+                        for s in writes[:6]
+                    ],
+                    "reads": 0,
+                },
+            )
+        for site in writes:
+            verdict, receipt = _peer_write_verdict(
+                site, index, source_texts, state_vocab,
+            )
+            if verdict == "confirmed":
+                return StateEvidence(
+                    outcome="confirmed",
+                    reason=(
+                        f"`{fld}` at {site['file']}:{site['line']} is "
+                        f"assigned from {receipt['source_chain']} with "
+                        "no dominating guard referencing a sibling "
+                        "field — unvalidated peer write (weak proxy; "
+                        "permanently detection-grade)"
+                    ),
+                    rule_id=RULE_PEER_WRITE,
+                    field={"struct": "", "name": fld,
+                           "authority": "peer", "provenance": ""},
+                    peer_write=receipt,
+                )
+            if verdict == "refuted":
+                refutation = StateEvidence(
+                    outcome="refuted",
+                    reason=(
+                        f"peer-sourced write of `{fld}` at "
+                        f"{site['file']}:{site['line']} is dominated "
+                        f"by `{receipt['validating_guard']}` — "
+                        "validation against sibling state present"
+                    ),
+                    rule_id=RULE_PEER_WRITE,
+                    peer_write=receipt,
+                )
+            elif verdict == "census-degraded":
+                degraded = True
+            elif verdict == "not-peer":
+                unresolved = True
+
+    if refutation is not None:
+        return refutation
+    if degraded:
+        return _inconclusive(
+            REASON_CENSUS_DEGRADED,
+            "source guard binding unavailable for the peer-write check",
+        )
+    if unresolved:
+        return _inconclusive(
+            REASON_AUTHORITY_UNRESOLVED,
+            f"cannot classify {', '.join(candidates[:3])} as local- "
+            "or peer-authoritative (rhs provenance inconclusive, no "
+            "state_fields vocabulary)",
+        )
+    return _inconclusive(
+        REASON_INVARIANT_UNSTATED,
+        "legs 1+2 derived no conclusive receipt and nobody supplied "
+        "an invariant relating the named fields",
+    )
+
+
+# ── standing pre-pass (leads only + receipted-invariant harness) ────
+
+
+def run_protocol_state_prepass(
+    source_texts: dict[str, str],
+    *,
+    target_path: Path | None = None,
+    out_dir: Path | None = None,
+    inventory: dict[str, Any] | None = None,
+    context: Any = None,
+    domain_model: dict[str, Any] | None = None,
+    budget_s: float = 30.0,
+    integer_abi=None,
+) -> dict[str, Any]:
+    """Standing pre-pass: legs 1+2 emit **leads only** (they exist to
+    make the LLM form the right hypothesis with receipts attached);
+    leg 3 runs standing for STUDY-RECEIPTED domain-model invariants
+    only. Lead caps ≤20+≤20/run, 3/file (§4.6)."""
+    del target_path  # index is built from the provided source set
+    t0 = time.monotonic()
+    telemetry: dict[str, Any] = {
+        "channel": "protocol_state",
+        "dead_state_leads": 0, "peer_write_leads": 0,
+        "invariants_checked": 0, "confirmed": 0, "refuted": 0,
+        "inconclusive": 0, "budget_exceeded": False,
+        "census_tier": "", "census_degraded_sites": 0,
+    }
+    findings: list[dict[str, Any]] = []
+    leads: list[dict[str, Any]] = []
+    mechanical: list[dict[str, Any]] = []
+
+    index = build_state_field_index(source_texts)
+    telemetry["census_tier"] = index.get("tier", "")
+    state_vocab = learned_state_fields(domain_model)
+    fields = index.get("fields") or {}
+    per_file: dict[str, int] = {}
+
+    def _lead_ok(fp: str, cap_key: str, cap: int) -> bool:
+        if telemetry[cap_key] >= cap:
+            return False
+        if per_file.get(fp, 0) >= MAX_LEADS_PER_FILE:
+            return False
+        per_file[fp] = per_file.get(fp, 0) + 1
+        telemetry[cap_key] += 1
+        return True
+
+    def _stateish(fld: str) -> bool:
+        return bool(_STATE_STEM_RE.search(fld)) or fld in state_vocab
+
+    # Leg 1 — written-never-read state fields (the free census
+    # by-product; CWE-563-adjacent lead, not a hypothesis).
+    for fld in sorted(fields, key=lambda f: (not _stateish(f), f)):
+        if time.monotonic() - t0 > budget_s:
+            telemetry["budget_exceeded"] = True
+            break
+        bucket = fields[fld]
+        writes = bucket.get("writes") or []
+        if not writes or bucket.get("reads"):
+            continue
+        if not _stateish(fld):
+            continue
+        fp = writes[0]["file"]
+        if not _lead_ok(fp, "dead_state_leads", MAX_DEAD_STATE_LEADS):
+            continue
+        sites_desc = ", ".join(
+            f"{s['file']}:{s['line']}" for s in writes[:4]
+        )
+        leads.append({
+            "channel": "protocol_state",
+            "rule_id": RULE_DEAD_STATE,
+            "cwe": DEAD_STATE_LEAD_CWE,
+            "file": fp,
+            "function": writes[0]["function"],
+            "line": writes[0]["line"],
+            "field": fld,
+            "description": (
+                f"`{fld}` is written at {sites_desc} and read "
+                "nowhere in the scanned set"
+            ),
+            "mechanism": (
+                f"`{fld}` is written at {sites_desc} and read nowhere "
+                "— is there a protocol invariant relating it to the "
+                "peer-updated state it was meant to validate?"
+            ),
+        })
+        mechanical.append({
+            "file": fp,
+            "function": writes[0]["function"],
+            "detector": "protocol_state",
+            "line": writes[0]["line"],
+            "description": leads[-1]["description"],
+            "callee": fld,
+            "rule_id": RULE_DEAD_STATE,
+            "cwe": DEAD_STATE_LEAD_CWE,
+        })
+
+    # Leg 2 — unvalidated peer-sourced state writes.
+    if not telemetry["budget_exceeded"]:
+        for fld in sorted(fields, key=lambda f: (not _stateish(f), f)):
+            if time.monotonic() - t0 > budget_s:
+                telemetry["budget_exceeded"] = True
+                break
+            if not _stateish(fld):
+                continue
+            for site in (fields[fld].get("writes") or [])[:4]:
+                verdict, receipt = _peer_write_verdict(
+                    site, index, source_texts, state_vocab,
+                )
+                if verdict == "census-degraded":
+                    telemetry["census_degraded_sites"] += 1
+                    continue
+                if verdict != "confirmed":
+                    continue
+                if not _lead_ok(site["file"], "peer_write_leads",
+                                MAX_PEER_WRITE_LEADS):
+                    continue
+                leads.append({
+                    "channel": "protocol_state",
+                    "rule_id": RULE_PEER_WRITE,
+                    "cwe": "CWE-372",
+                    "file": site["file"],
+                    "function": site["function"],
+                    "line": site["line"],
+                    "field": fld,
+                    "description": (
+                        f"`{fld}` at {site['file']}:{site['line']} is "
+                        f"assigned from {receipt['source_chain']} "
+                        "with no guard referencing a sibling field"
+                    ),
+                    "mechanism": (
+                        f"`{fld}` is assigned from the decoded peer "
+                        f"value at {site['file']}:{site['line']} with "
+                        "no guard referencing a sibling field — is "
+                        "there a protocol invariant relating them?"
+                    ),
+                    "receipts": receipt,
+                })
+                mechanical.append({
+                    "file": site["file"],
+                    "function": site["function"],
+                    "detector": "protocol_state",
+                    "line": site["line"],
+                    "description": leads[-1]["description"],
+                    "callee": fld,
+                    "rule_id": RULE_PEER_WRITE,
+                    "cwe": "CWE-372",
+                })
+
+    # Leg 3 — study-receipted invariants only (the honesty gate).
+    try:
+        from .invariant_smt import extract_invariants
+    except ImportError:
+        extract_invariants = None  # type: ignore[assignment]
+    if extract_invariants is not None:
+        for entry in (domain_model or {}).get("invariants") or []:
+            if telemetry["budget_exceeded"]:
+                break
+            if time.monotonic() - t0 > budget_s:
+                telemetry["budget_exceeded"] = True
+                break
+            if not isinstance(entry, dict):
+                continue
+            statement = str(entry.get("statement") or "")
+            cands = extract_invariants(statement)
+            if len(cands) != 1:
+                continue
+            invariant = cands[0]
+            if _invariant_receipt(domain_model, invariant) is None:
+                # Unreceipted study invariants are not adjudicated
+                # standing — they stay hypothesis-driven (the LLM
+                # must own the premise).
+                continue
+            telemetry["invariants_checked"] += 1
+            res = _adjudicate_invariant(
+                invariant, index, source_texts, domain_model,
+                state_vocab, context=context, inventory=inventory,
+                budget_s=min(INVARIANT_BUDGET_S, budget_s), integer_abi=integer_abi,
+            )
+            telemetry[
+                "confirmed" if res.outcome == "confirmed" else
+                "refuted" if res.outcome == "refuted" else
+                "inconclusive"
+            ] += 1
+            if res.outcome != "confirmed":
+                continue
+            detection = is_detection_rule_id(res.rule_id)
+            status = (
+                "finding"
+                if not detection
+                and (res.reachability or {}).get("status")
+                == "entry_reachable"
+                else "suspicious"
+            )
+            first: dict[str, Any] = next(
+                (s for s in (res.invariant or {}).get("per_site", [])
+                 if s.get("verdict") == "violable"), {},
+            )
+            findings.append({
+                "file": first.get("file", ""),
+                "function": first.get("function", ""),
+                "line": int(first.get("line") or 0),
+                "rule_id": res.rule_id,
+                "evidence_tool": res.rule_id,
+                "status": status,
+                "detection_grade": detection,
+                "cwe": "CWE-372",
+                "hypothesis": (
+                    f"the protocol invariant `{invariant}` is violable "
+                    f"at {first.get('file', '')}:{first.get('line', 0)}"
+                ),
+                "description": res.reason,
+                "receipts": res.to_dict(),
+            })
+
+    telemetry["leads_seeded"] = len(leads)
+    telemetry["wall_time_s"] = round(time.monotonic() - t0, 3)
+    if out_dir is not None and (findings or leads):
+        try:
+            # Atomic write (tempfile + rename via save_json), like the
+            # sibling prepasses: a torn write here surfaces as
+            # "protocol-state.json exists but fails to parse" at
+            # /review time.
+            save_json(
+                Path(out_dir) / "protocol-state.json",
+                {"findings": findings, "leads": leads,
+                 "telemetry": telemetry},
+            )
+        except Exception:
+            logger.debug("protocol-state.json write failed",
+                         exc_info=True)
+    return {
+        "findings": findings,
+        "leads": leads,
+        "mechanical": mechanical,
+        "telemetry": telemetry,
+    }

@@ -1,0 +1,187 @@
+name: Corpus Labels
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  merge_group:
+  schedule:
+    # Weekly full-sweep pin lint over ALL labels with --fetch-missing:
+    # upstream history rewrites and tag deletions surface here as a CI
+    # failure instead of a mid-run surprise during an (expensive)
+    # corpus measurement run.
+    - cron: '0 6 * * 2'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  # Sparse-fetch cache for pin verification (repo@ref-keyed
+  # subdirectories; see core/audit/corpus/lint.py).
+  LINT_CACHE: .corpus-lint-cache
+
+permissions:
+  contents: read
+
+jobs:
+  # Schema lint (blocking, always). Loads every label and checks field
+  # sanity — no fixtures, no network — so it gates every PR regardless
+  # of connectivity. Pure stdlib Python; no setup beyond checkout.
+  schema-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pins_run: ${{ steps.pin_scope.outputs.pins_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Schema-lint corpus labels
+        run: python3 -m core.audit.corpus.lint --mode schema
+
+      - name: Decide whether PR pin lint has work
+        id: pin_scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+        run: python3 .github/scripts/corpus_label_scope.py
+
+  # PR pin lint is allocated only when the schema job finds work.
+  # Corpus tooling/execution changes and unknown history check all labels.
+  # PR pin lint (blocking for the labels the PR touches). Verifies the
+  # changed labels' pins against the pinned upstream trees by fetching
+  # ONLY the labelled files at the pinned refs (sparse, blob-filtered;
+  # see sources.fetch_files) into a cached checkout. A drifted pin
+  # (relocatable/missing) fails the job with a suggested re-pin.
+  #
+  # Degrades gracefully offline: an unreachable remote scores
+  # no-fixture, which the linter treats as a loud warning, not a
+  # failure — schema-lint above still gates. A remote that answers but
+  # no longer serves the pinned ref (history rewrite, tag deletion)
+  # scores missing and DOES fail.
+  pin-lint-pr:
+    needs: schema-lint
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.schema-lint.outputs.pins_run != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
+          # The scope helper fetches only a missing event-base commit.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Reuse earlier label caches only within the same source registry
+      # and fetch implementation. A changed URL or cache layout must not
+      # seed a new key with checkouts belonging to the previous namespace.
+      - name: Cache pinned-source sparse checkouts
+        id: source_cache
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ env.LINT_CACHE }}
+          key: corpus-lint-v2-${{ hashFiles('core/audit/corpus/sources.json', 'core/audit/corpus/sources.py') }}-${{ hashFiles('core/audit/corpus/labels/**/*.label.json') }}
+          restore-keys: |
+            corpus-lint-v2-${{ hashFiles('core/audit/corpus/sources.json', 'core/audit/corpus/sources.py') }}-
+
+      - name: Discard incomplete sparse cache restore
+        if: steps.source_cache.outcome == 'failure'
+        run: rm -rf -- "$LINT_CACHE"
+
+      - name: Pin-lint changed labels
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+        # shell: bash makes GHA run `bash --noprofile --norc -eo pipefail`;
+        # the DEFAULT shell is `bash -e` only (no pipefail), which lets
+        # `| tee` swallow the linter's exit code and turn this blocking
+        # gate into a no-op.
+        shell: bash
+        run: |
+          python3 .github/scripts/corpus_label_scope.py --lint \
+            --cache-dir "$LINT_CACHE" | tee pin-lint.log
+          if grep -q "no-fixture" pin-lint.log; then
+            echo "::warning::pin lint could not verify some labels (no-fixture — network unreachable?); schema lint still gates"
+          fi
+
+  # Weekly full sweep (scheduled): pin lint over ALL labels with
+  # --fetch-missing. Catches upstream drift that happens *between*
+  # PRs — a force-pushed branch, a deleted release tag — while the
+  # labels themselves are untouched.
+  pin-lint-sweep:
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Pin-lint all labels
+        # shell: bash for pipefail — see the pin-lint-pr step above.
+        shell: bash
+        run: |
+          # A warm source cache can satisfy pins without contacting upstream.
+          # The drift sweep must verify fresh fetchability, not cached history.
+          corpus_sweep_cache=$(mktemp -d "$RUNNER_TEMP/corpus-pin-sweep.XXXXXX")
+          trap 'rm -rf -- "$corpus_sweep_cache"' EXIT
+          python3 -m core.audit.corpus.lint --mode pins \
+            --fetch-missing \
+            --cache-dir "$corpus_sweep_cache" \
+            --tree-search | tee pin-lint.log
+          if grep -q "no-fixture" pin-lint.log; then
+            echo "::warning::pin lint could not verify some labels (no-fixture — network unreachable?)"
+          fi
+
+  # Aggregate gate — gives GitHub a single job name to anchor the
+  # workflow result on. Without this, a run where all real jobs are
+  # legitimately skipped by event/path filters has no successful job and GitHub
+  # reports the workflow as failed/skipped, firing notification emails.
+  corpus-labels-passed:
+    name: corpus-labels-passed
+    if: always()
+    needs: [schema-lint, pin-lint-pr, pin-lint-sweep]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify all jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Job results: ${RESULTS}"
+          ok=1
+          for r in ${RESULTS}; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::A corpus-labels job reported '${r}'"; ok=0 ;;
+            esac
+          done
+          [ "$ok" -eq 1 ] || exit 1
+          echo "Corpus labels passed or was legitimately skipped."

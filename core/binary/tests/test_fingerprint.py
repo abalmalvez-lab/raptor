@@ -28,10 +28,11 @@ import pytest
 #   [2] core/
 #   [3] <repo root>         (where ``packages/`` lives)
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+if __name__ == "__main__":
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
-from core.binary.fingerprint import (
+from core.binary.fingerprint import (  # noqa: E402
     BUCKETS,
     CapabilityFingerprint,
     FINGERPRINT_SCHEMA_VERSION,
@@ -39,7 +40,7 @@ from core.binary.fingerprint import (
     bucket_imports,
     capability_fingerprint,
 )
-from packages.binary_analysis.radare2_understand import (
+from packages.binary_analysis.radare2_understand import (  # noqa: E402
     BinaryContextMap,
 )
 
@@ -69,6 +70,45 @@ class TestBucketImports:
     def test_empty_input_empty_output(self):
         assert bucket_imports(set()) == {}
 
+    def test_stream_input_classified(self):
+        out = bucket_imports({"fgets", "getline", "fread"})
+        assert "stream_input" in out
+        # fread is ubiquitous — excluded from the source taxonomy
+        assert out["stream_input"] == {"fgets", "getline"}
+
+    def test_process_boundary_classified(self):
+        """Only `getenv` is the attacker-controlled source; markers
+        (secure_getenv, getauxval) are NOT in the bucket — they
+        live in PROCESS_BOUNDARY_MARKERS and would need a separate
+        bucket if we ever surface them."""
+        out = bucket_imports(
+            {"getenv", "secure_getenv", "getauxval", "malloc"},
+        )
+        assert "process_boundary" in out
+        assert out["process_boundary"] == {"getenv"}
+
+    def test_ipc_classified(self):
+        """shmat triggers; shm_open and pipe deliberately don't
+        (open-not-read / setup primitive)."""
+        out = bucket_imports(
+            {"shmat", "msgrcv", "shm_open", "pipe", "mmap"},
+        )
+        assert "ipc" in out
+        assert out["ipc"] == {"shmat", "msgrcv"}
+
+    def test_kernel_userspace_not_a_user_binary_bucket(self):
+        """KERNEL_USERSPACE_FUNCS is deliberately NOT in BUCKETS —
+        kernel-side symbols don't appear in user-space binary
+        imports, so including them would add a permanently-empty
+        bucket."""
+        out = bucket_imports(
+            {"copy_from_user", "memdup_user", "get_user"},
+        )
+        assert "kernel_userspace" not in out
+        # The whole input maps to zero buckets — kernel symbols in
+        # a user-space binary are typically just unresolved relocs.
+        assert out == {}
+
 
 class TestBucketTaxonomy:
     """The BUCKETS table is shared between fingerprint + SCA bump
@@ -81,6 +121,8 @@ class TestBucketTaxonomy:
             "exec", "network", "string_overflow", "scan",
             "memory_copy", "format_string", "alloc", "parser",
             "integer_parse", "toctou",
+            "stream_input", "process_boundary", "ipc",
+            "runtime_privilege", "kernel_trace",
         ]
 
     def test_high_severity_buckets_subset_of_buckets(self):
@@ -151,7 +193,7 @@ class TestFingerprintSerialisation:
             binary_path="/usr/bin/foo", **kwargs,
         )
         fp_b = CapabilityFingerprint(
-            binary_path="/tmp/dl-xyz/foo", **kwargs,
+            binary_path="dl-xyz/foo", **kwargs,
         )
         assert fp_a.canonical_json() == fp_b.canonical_json()
         # to_dict() does include binary_path (operator-facing
@@ -159,7 +201,7 @@ class TestFingerprintSerialisation:
         # they differ there
         assert fp_a.to_dict() != fp_b.to_dict()
         assert fp_a.to_dict()["binary_path"] == "/usr/bin/foo"
-        assert fp_b.to_dict()["binary_path"] == "/tmp/dl-xyz/foo"
+        assert fp_b.to_dict()["binary_path"] == "dl-xyz/foo"
 
     def test_from_dict_roundtrip(self):
         fp = CapabilityFingerprint(
@@ -317,6 +359,73 @@ class TestCapabilityFingerprint:
         assert fp is not None
         assert fp.capability_buckets == {}
 
+    def test_macho_underscore_imports_reach_buckets(
+        self, patched_analyser, tmp_path,
+    ):
+        """Tier-1 must normalise import names before bucketing —
+        r2 emits Mach-O imports with a leading ``_`` (``_strcpy``)
+        while the taxonomy holds bare names. Pre-fix the buckets
+        came back systematically empty for Mach-O binaries that
+        clearly import dangerous functions."""
+        bin_path = _real_bytes_tempfile(
+            tmp_path, "macho.bin", b"\xcf\xfa\xed\xfe" + b"\x00" * 60,
+        )
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=bin_path,
+            arch="arm64", bits=64, binary_format="mach0",
+            imports=["_strcpy", "_execve", "_objc_msgSend"],
+        )
+        fp = capability_fingerprint(bin_path)
+        assert fp is not None
+        assert set(fp.capability_buckets.get("exec", [])) == {"execve"}
+        assert set(fp.capability_buckets.get("string_overflow", [])) == {
+            "strcpy",
+        }
+
+    def test_pe_import_prefixes_reach_buckets(
+        self, patched_analyser, tmp_path,
+    ):
+        """Same normalisation for the PE-flavoured prefixes r2 can
+        emit (``__imp_`` / ``sym.imp.``)."""
+        bin_path = _real_bytes_tempfile(
+            tmp_path, "pe.bin", b"MZ" + b"\x00" * 60,
+        )
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=bin_path,
+            arch="x86", bits=64, binary_format="pe",
+            imports=["__imp_recv", "sym.imp.system"],
+        )
+        fp = capability_fingerprint(bin_path)
+        assert fp is not None
+        assert set(fp.capability_buckets.get("network", [])) == {"recv"}
+        assert set(fp.capability_buckets.get("exec", [])) == {"system"}
+
+    def test_tier1_buckets_match_manifest_normalisation(
+        self, patched_analyser, tmp_path,
+    ):
+        """The fingerprint and manifest paths bucket the SAME
+        ctx.imports — they must agree on the normalised contents,
+        or capability drift and the manifest disagree about one
+        binary."""
+        from packages.binary_analysis._symbols import strip_import_prefix
+
+        raw_imports = ["_strcpy", "__imp_recv", "sym.imp.system", "recv"]
+        bin_path = _real_bytes_tempfile(
+            tmp_path, "macho2.bin", b"\xcf\xfa\xed\xfe" + b"\x00" * 30,
+        )
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=bin_path,
+            arch="arm64", bits=64, binary_format="mach0",
+            imports=list(raw_imports),
+        )
+        fp = capability_fingerprint(bin_path)
+        manifest_buckets = bucket_imports(
+            {strip_import_prefix(item) for item in raw_imports},
+        )
+        assert {
+            k: set(v) for k, v in fp.capability_buckets.items()
+        } == {k: set(v) for k, v in manifest_buckets.items()}
+
     def test_unparseable_input_returns_none(
         self, patched_analyser, tmp_path,
     ):
@@ -408,6 +517,116 @@ class TestCapabilityFingerprint:
 
 
 # ---------------------------------------------------------------------------
+# Source-side bucket E2E — compiles a small C program with the exact
+# imports we want to surface, then asserts the fingerprint primitive
+# walks all the way through (ELF parse → bucket classification → JSON
+# shape) and produces the right bucket contents. Catches regressions
+# in BUCKETS ordering, taxonomy exclusions, ELF parser drift, and the
+# schema-version constant in one go.
+# ---------------------------------------------------------------------------
+
+
+_SOURCE_SIDE_E2E_SRC = r"""
+/* Exercises every source-side bucket (issue #583). Functions are
+ * intentionally called so the linker emits them in the dynamic
+ * symbol table; the bodies don't have to be sensible. */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/uio.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/msg.h>
+
+int main(int argc, char **argv) {
+    char buf[64];
+    fgets(buf, sizeof(buf), stdin);                 /* stream_input */
+    char *line = NULL; size_t cap = 0;
+    getline(&line, &cap, stdin);                    /* stream_input */
+    struct iovec iov = {buf, sizeof(buf)};
+    readv(0, &iov, 1);                              /* stream_input */
+    const char *home = getenv("HOME");              /* process_boundary */
+    int shmid = shmget(IPC_PRIVATE, 4096, 0666);    /* ipc */
+    void *seg = shmat(shmid, NULL, 0);              /* ipc */
+    struct { long mtype; char mtext[8]; } mbuf;
+    msgrcv(0, &mbuf, sizeof(mbuf.mtext), 1, 0);     /* ipc */
+    if (argc > 1) system(argv[1]);                  /* exec (baseline) */
+    return (int)(size_t)(home != NULL) + (seg != (void*)-1);
+}
+"""
+
+
+class TestSourceSideBucketsE2E:
+    """End-to-end: compile a real ELF that imports every source-side
+    function, fingerprint it via the tier-0 ELF parser (no radare2
+    dependency), assert the three source-side buckets surface with
+    the expected contents."""
+
+    @pytest.fixture(autouse=True)
+    def _gate(self):
+        import shutil
+        if shutil.which("gcc") is None:
+            pytest.skip("gcc not on PATH — needed to build E2E target")
+
+    def test_fingerprint_surfaces_source_side_buckets(self, tmp_path):
+        import subprocess
+        src = tmp_path / "src.c"
+        binary = tmp_path / "source_side_e2e_bin"
+        src.write_text(_SOURCE_SIDE_E2E_SRC)
+        result = subprocess.run(
+            ["gcc", "-O0", str(src), "-o", str(binary)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            pytest.skip(
+                f"gcc build failed (likely missing libc headers in CI):\n"
+                f"{result.stderr}",
+            )
+
+        if binary.read_bytes()[:4] != b"\x7fELF":
+            pytest.skip("fixture requires an ELF-producing compiler")
+        fp = capability_fingerprint(binary)
+        assert fp is not None, (
+            "fingerprint primitive returned None on a freshly-built "
+            "ELF binary — tier-0 ELF parser regression"
+        )
+        assert fp.schema_version == FINGERPRINT_SCHEMA_VERSION
+        assert fp.binary_format == "elf"
+        assert fp.bits == 64
+
+        buckets = {k: set(v) for k, v in fp.capability_buckets.items()}
+
+        # Each source-side bucket must surface its contributors.
+        # Subset assertion rather than equality so a future taxonomy
+        # expansion (e.g. fgetws added to STREAM_INPUT_FUNCS) doesn't
+        # break the test as long as our intentionally-imported
+        # functions still land in their bucket.
+        assert "stream_input" in buckets, (
+            f"stream_input bucket missing from {buckets.keys()}"
+        )
+        assert {"fgets", "getline", "readv"} <= buckets["stream_input"]
+
+        assert "process_boundary" in buckets, (
+            "process_boundary bucket missing"
+        )
+        assert buckets["process_boundary"] == {"getenv"}, (
+            "process_boundary expected only {'getenv'} — markers "
+            "must NOT contaminate this bucket"
+        )
+
+        assert "ipc" in buckets, "ipc bucket missing"
+        assert {"shmat", "shmget", "msgrcv"} <= buckets["ipc"]
+
+        # Baseline: pre-existing exec bucket still works
+        assert "exec" in buckets
+        assert "system" in buckets["exec"]
+
+        # Negative: kernel_userspace is intentionally NOT a bucket
+        assert "kernel_userspace" not in buckets
+
+
+# ---------------------------------------------------------------------------
 # Real-binary integration — gated on radare2 + r2pipe availability
 # ---------------------------------------------------------------------------
 
@@ -437,16 +656,20 @@ class TestRealBinaryFingerprint:
         ls = Path("/bin/ls")
         if not ls.exists():
             pytest.skip("/bin/ls not present on host")
-        t0 = time.time()
+        t0 = time.monotonic()
         fp = capability_fingerprint(ls)
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         assert fp is not None
-        # Be generous — 30s leaves headroom for slow CI runners
-        # while still catching a regression to the multi-minute
-        # default-pipeline path.
-        assert elapsed < 30, (
-            f"quick fingerprint took {elapsed:.1f}s — likely "
-            f"regressed to the full-analysis pipeline"
+        # Quick mode runs in ~1-2s; the regression this pins (the
+        # full `aaa` pipeline) took 5+ minutes. 120s keeps >2x
+        # separation below the regression while giving a loaded
+        # runner real headroom over the healthy path — the r2 work
+        # happens in a child process, so a wall bound (not a CPU
+        # budget) is the only measurable quantity here.
+        from core.testing.wallclock import check_wall_deadline
+        check_wall_deadline(
+            elapsed, 120.0, code_bound_s=300.0,
+            what="quick-mode fingerprint of /bin/ls",
         )
         # Sanity-check the fingerprint shape
         assert fp.schema_version == FINGERPRINT_SCHEMA_VERSION
@@ -504,3 +727,73 @@ class TestSharedTaxonomyParity:
             bucket_imports as fp_bucket_imports,
         )
         assert cdmod.bucket_imports is fp_bucket_imports
+
+
+# ---------------------------------------------------------------------------
+# Tier dispatch — section-header-stripped dynamic binaries
+# ---------------------------------------------------------------------------
+
+
+class TestSectionlessTierDispatch:
+    """A dynamic ELF whose section headers were stripped (sstrip)
+    still imports symbols via PT_DYNAMIC. Tier 0 can't enumerate
+    them, so the fingerprint must come from the radare2 tier —
+    never a success-shaped empty-bucket fingerprint that makes the
+    binary look capability-free."""
+
+    def test_sectionless_dynamic_elf_engages_radare2_tier(
+        self, patched_analyser, tmp_path,
+    ):
+        from core.binary.tests.test_elf import _build_elf64_with_dynsym
+        bin_path = _real_bytes_tempfile(
+            tmp_path, "sstripped.elf",
+            _build_elf64_with_dynsym(sections=False),
+        )
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=bin_path,
+            arch="x86", bits=64, binary_format="elf",
+            imports=["execve", "recv"],
+        )
+        fp = capability_fingerprint(bin_path)
+        assert fp is not None
+        assert "exec" in fp.capability_buckets
+        assert "network" in fp.capability_buckets
+
+    def test_full_elf_stays_on_tier0(self, patched_analyser, tmp_path):
+        """Section headers intact → tier 0 answers by itself; the
+        radare2 tier must not even be consulted."""
+        from core.binary.tests.test_elf import _build_elf64_with_dynsym
+        bin_path = _real_bytes_tempfile(
+            tmp_path, "full.elf", _build_elf64_with_dynsym(sections=True),
+        )
+        patched_analyser["raise"] = AssertionError(
+            "tier 1 must not be consulted for a parseable ELF",
+        )
+        fp = capability_fingerprint(bin_path)
+        assert fp is not None
+        assert fp.capability_buckets.get("exec") == ["execve"]
+        assert fp.capability_buckets.get("network") == ["recv"]
+
+
+# ---------------------------------------------------------------------------
+# Content hash — routed through the repo hash chokepoint
+# ---------------------------------------------------------------------------
+
+
+def test_sha256_of_file_uses_hash_chokepoint(tmp_path, monkeypatch):
+    """``_sha256_of_file`` must route through ``core.hash.sha256_file``
+    (the single streamed-hash chokepoint) so hash-policy changes —
+    chunk sizing, algorithm agility — apply here too."""
+    import core.binary.fingerprint as fp_mod
+
+    calls: list[Path] = []
+
+    def spy(path: Path, chunk_size: int | None = None) -> str:
+        calls.append(Path(path))
+        return "d" * 64
+
+    monkeypatch.setattr(fp_mod, "sha256_file", spy)
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"abc")
+    assert fp_mod._sha256_of_file(f) == "d" * 64
+    assert calls == [f]

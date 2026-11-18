@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 
 # core/hash/tests/test_hash.py -> repo root
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from core.hash import sha256_bytes, sha256_file, sha256_string, sha256_tree
 from core.config import RaptorConfig
@@ -72,8 +73,32 @@ class TestSha256Tree:
 
         assert hash1 != hash2
 
+    def test_name_content_boundary_shift_does_not_collide(self, tmp_path):
+        """Length framing: {'a': 'bc'} and {'ab': 'c'} concatenate to
+        the same raw byte stream — the framed record scheme must keep
+        their digests distinct."""
+        t1 = tmp_path / "t1"
+        t1.mkdir()
+        (t1 / "a").write_bytes(b"bc")
+        t2 = tmp_path / "t2"
+        t2.mkdir()
+        (t2 / "ab").write_bytes(b"c")
+        assert sha256_tree(t1) != sha256_tree(t2)
+
+    def test_identical_trees_still_share_digest(self, tmp_path):
+        """Framing must not break the equality direction: byte-for-byte
+        identical trees at different roots hash identically."""
+        t1 = tmp_path / "t1"
+        t2 = tmp_path / "t2"
+        for t in (t1, t2):
+            (t / "sub").mkdir(parents=True)
+            (t / "a.txt").write_bytes(b"hello")
+            (t / "sub" / "b.bin").write_bytes(b"\x00\x01")
+        assert sha256_tree(t1) == sha256_tree(t2)
+
     def test_hash_file_size_limit(self, tmp_path):
-        """Test that large files are skipped when limit is set."""
+        """Large files' CONTENT is skipped, but their presence still
+        changes the digest (skip record: name + declared size)."""
         # Create a small file
         small_file = tmp_path / "small.txt"
         small_file.write_text("small content")
@@ -84,8 +109,13 @@ class TestSha256Tree:
         large_file.write_text("x" * 200)  # 200 bytes
         hash_with_large = sha256_tree(tmp_path, max_file_size=100)  # 100 byte limit
 
-        # Hash should be same (large file skipped)
-        assert hash_with_small == hash_with_large
+        # Adding the over-cap file must change the digest — silently
+        # omitting it defeated freshness joins built on sha256_tree.
+        assert hash_with_small != hash_with_large
+        # But its CONTENT is not read: same name/size, different
+        # bytes hashes identically.
+        large_file.write_text("y" * 200)
+        assert sha256_tree(tmp_path, max_file_size=100) == hash_with_large
 
     def test_hash_no_size_limit(self, tmp_path):
         """Test that very large max_file_size disables limit."""
@@ -199,6 +229,159 @@ class TestSha256Tree:
         assert len(hash1) == 64
 
 
+def _expected_tree_digest(root: Path) -> str:
+    """Replicate the untruncated on-wire scheme: sorted relpaths,
+    each record length-framed as <name-len (8B LE)> <name bytes>
+    <sha256(content) digest>."""
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or p.is_symlink():
+            continue
+        name = p.relative_to(root).as_posix().encode(
+            "utf-8", errors="surrogateescape")
+        h.update(len(name).to_bytes(8, "little"))
+        h.update(name)
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
+
+
+@pytest.fixture
+def small_cap(monkeypatch):
+    """Force a tiny cumulative cap so truncation triggers cheaply."""
+    monkeypatch.setattr(
+        RaptorConfig, "MAX_TREE_HASH_BYTES", 150, raising=False,
+    )
+
+
+class TestSha256TreeTruncationMarker:
+    """Cumulative-cap truncation marker for sha256_tree.
+
+    Truncated trees must not collide with the untruncated tree that
+    contains only the hashed prefix."""
+
+    def test_truncated_digest_differs_from_prefix_tree(
+            self, tmp_path, small_cap):
+        # Tree: a.txt (100 bytes) hashed, b.txt (100 bytes) trips the
+        # 150-byte cap. Prefix tree: only a.txt.
+        full = tmp_path / "full"
+        full.mkdir()
+        (full / "a.txt").write_bytes(b"x" * 100)
+        (full / "b.txt").write_bytes(b"y" * 100)
+
+        prefix = tmp_path / "prefix"
+        prefix.mkdir()
+        (prefix / "a.txt").write_bytes(b"x" * 100)
+
+        truncated = sha256_tree(full)
+        untruncated_prefix = sha256_tree(prefix)
+
+        # Pre-fix these were byte-for-byte identical.
+        assert truncated != untruncated_prefix
+
+    def test_truncated_digest_differs_from_full_tree(
+            self, tmp_path, small_cap, monkeypatch):
+        (tmp_path / "a.txt").write_bytes(b"x" * 100)
+        (tmp_path / "b.txt").write_bytes(b"y" * 100)
+        truncated = sha256_tree(tmp_path)
+
+        monkeypatch.delattr(RaptorConfig, "MAX_TREE_HASH_BYTES")
+        full = sha256_tree(tmp_path)
+        assert truncated != full
+
+    def test_truncated_digest_is_deterministic(self, tmp_path, small_cap):
+        (tmp_path / "a.txt").write_bytes(b"x" * 100)
+        (tmp_path / "b.txt").write_bytes(b"y" * 100)
+        d1 = sha256_tree(tmp_path)
+        d2 = sha256_tree(tmp_path)
+        assert d1 == d2
+        assert len(d1) == 64
+
+    def test_trees_truncated_at_different_files_differ(
+            self, tmp_path, small_cap):
+        # Identical hashed prefix, cap trips on a differently-named
+        # file — the marker mixes in the tripping relpath.
+        tree_a = tmp_path / "tree_a"
+        tree_a.mkdir()
+        (tree_a / "a.txt").write_bytes(b"x" * 100)
+        (tree_a / "b.txt").write_bytes(b"y" * 100)
+
+        tree_b = tmp_path / "tree_b"
+        tree_b.mkdir()
+        (tree_b / "a.txt").write_bytes(b"x" * 100)
+        (tree_b / "c.txt").write_bytes(b"y" * 100)
+
+        assert sha256_tree(tree_a) != sha256_tree(tree_b)
+
+    def test_untruncated_digest_matches_documented_scheme(self, tmp_path):
+        """Trees under the cap follow the documented length-framed
+        record scheme (no truncation marker mixed in)."""
+        (tmp_path / "a.txt").write_bytes(b"hello")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.txt").write_bytes(b"world")
+        assert sha256_tree(tmp_path) == _expected_tree_digest(tmp_path)
+
+
+class TestSha256TreeFstatBoundedRead:
+    """The read loop must consume at most the fstat'd size, so a file
+    growing between fstat and read cannot defeat the size gates."""
+
+    def test_read_bounded_to_fstat_size(self, tmp_path, monkeypatch):
+        f = tmp_path / "grow.bin"
+        f.write_bytes(b"a" * 10_000)
+
+        # Simulate fstat observing a smaller file than the read sees
+        # (i.e. the file grew in the fstat->read window).
+        real_fstat = os.fstat
+
+        def clamped_fstat(fd):
+            st = real_fstat(fd)
+            fields = list(st)
+            fields[6] = min(st.st_size, 4096)
+            return os.stat_result(fields)
+
+        import core.hash as hash_module
+        from core.testing.module_views import scoped_function_imports
+        with scoped_function_imports(hash_module, ["sha256_tree"], {"os": os}) as imports:
+            monkeypatch.setattr(imports.os, "fstat", clamped_fstat)
+            digest = hash_module.sha256_tree(tmp_path)
+
+        expected = hashlib.sha256()
+        expected.update(len(b"grow.bin").to_bytes(8, "little"))
+        expected.update(b"grow.bin")
+        expected.update(hashlib.sha256(b"a" * 4096).digest())
+        assert digest == expected.hexdigest()
+
+    def test_bounded_read_is_chunk_size_independent(self, tmp_path):
+        f = tmp_path / "x.bin"
+        f.write_bytes(b"z" * 100_000)
+        digests = {
+            sha256_tree(tmp_path, chunk_size=cs)
+            for cs in (512, 8192, 1024 * 1024)
+        }
+        assert len(digests) == 1
+
+    def test_shrunk_file_does_not_hang(self, tmp_path, monkeypatch):
+        """fstat reporting MORE bytes than the file holds (shrank
+        mid-read) must terminate, not loop on empty reads."""
+        f = tmp_path / "shrink.bin"
+        f.write_bytes(b"a" * 100)
+
+        real_fstat = os.fstat
+
+        def inflated_fstat(fd):
+            st = real_fstat(fd)
+            fields = list(st)
+            fields[6] = st.st_size + 4096
+            return os.stat_result(fields)
+
+        import core.hash as hash_module
+        from core.testing.module_views import scoped_function_imports
+        with scoped_function_imports(hash_module, ["sha256_tree"], {"os": os}) as imports:
+            monkeypatch.setattr(imports.os, "fstat", inflated_fstat)
+            digest = hash_module.sha256_tree(tmp_path)
+        assert len(digest) == 64
+
+
 class TestSha256File:
     """Tests for sha256_file() — single-file streamed hash."""
 
@@ -307,3 +490,59 @@ class TestSha256TreeSurrogateescape:
         # The pre-fix implementation raised UnicodeEncodeError here.
         digest = sha256_tree(tmp_path)
         assert len(digest) == 64
+
+
+class TestTreeHashSkippedFiles:
+    """Over-cap files must still be REPRESENTED in the digest.
+
+    The per-file size gate skips a large file's CONTENT, but silently
+    omitting the file entirely made trees differing only in an over-cap
+    file hash identically — defeating every freshness join built on
+    sha256_tree. The skip record mixes name + declared size under a
+    domain-separated marker, and stays content-independent (the whole
+    point of the gate is to never read the bytes).
+    """
+
+    def test_over_cap_file_changes_the_digest(self, tmp_path):
+        from core.hash import sha256_tree
+        tree_a = tmp_path / "a"
+        tree_a.mkdir()
+        (tree_a / "x.txt").write_text("hello")
+        tree_b = tmp_path / "b"
+        tree_b.mkdir()
+        (tree_b / "x.txt").write_text("hello")
+        (tree_b / "huge.bin").write_bytes(b"Z" * 64)
+        assert (sha256_tree(tree_a, max_file_size=16)
+                != sha256_tree(tree_b, max_file_size=16))
+
+    def test_skip_record_is_content_independent(self, tmp_path):
+        from core.hash import sha256_tree
+        tree_a = tmp_path / "a"
+        tree_a.mkdir()
+        (tree_a / "huge.bin").write_bytes(b"Z" * 64)
+        tree_b = tmp_path / "b"
+        tree_b.mkdir()
+        (tree_b / "huge.bin").write_bytes(b"Q" * 64)
+        assert (sha256_tree(tree_a, max_file_size=16)
+                == sha256_tree(tree_b, max_file_size=16))
+
+    def test_skip_record_reflects_declared_size(self, tmp_path):
+        from core.hash import sha256_tree
+        tree_a = tmp_path / "a"
+        tree_a.mkdir()
+        (tree_a / "huge.bin").write_bytes(b"Z" * 64)
+        tree_b = tmp_path / "b"
+        tree_b.mkdir()
+        (tree_b / "huge.bin").write_bytes(b"Z" * 128)
+        assert (sha256_tree(tree_a, max_file_size=16)
+                != sha256_tree(tree_b, max_file_size=16))
+
+    def test_under_cap_trees_keep_their_digest_shape(self, tmp_path):
+        # No skip => no marker: digests of all-under-cap trees are
+        # unaffected by the skip-record scheme.
+        from core.hash import sha256_tree
+        tree = tmp_path / "a"
+        tree.mkdir()
+        (tree / "x.txt").write_text("hello")
+        assert sha256_tree(tree, max_file_size=16) == sha256_tree(
+            tree, max_file_size=1024)

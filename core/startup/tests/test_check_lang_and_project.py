@@ -30,30 +30,38 @@ from core.startup import init as startup_init
 
 
 class CheckLangTest(unittest.TestCase):
-    """`check_lang` — tree-sitter probe; returns formatted line or None."""
+    """`check_lang` — tree-sitter probe; returns (line or None, warnings)."""
 
     def test_returns_check_mark_with_languages(self) -> None:
         with mock.patch(
             "core.inventory.extractors._get_ts_languages",
             return_value=["python", "javascript", "go"],
         ):
-            line = startup_init.check_lang()
+            line, warnings = startup_init.check_lang()
         self.assertIsNotNone(line)
         # Documented format: "  lang: tree-sitter ✓ (lang1, lang2, ...)"
         self.assertIn("tree-sitter", line)
         self.assertIn("✓", line)
         self.assertIn("python", line)
         self.assertIn("javascript", line)
+        # Grammars present — nothing to warn about.
+        self.assertEqual(warnings, [])
 
-    def test_returns_cross_mark_when_no_languages(self) -> None:
+    def test_returns_cross_mark_and_warning_when_no_languages(self) -> None:
+        """Zero grammars is a WARNING, not just a glyph — production
+        inventory silently degrades to regex extraction and operators
+        repeatedly missed the ✗ alone."""
         with mock.patch(
             "core.inventory.extractors._get_ts_languages",
             return_value=[],
         ):
-            line = startup_init.check_lang()
+            line, warnings = startup_init.check_lang()
         self.assertIsNotNone(line)
         self.assertIn("tree-sitter", line)
         self.assertIn("✗", line)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("no tree-sitter grammars installed", warnings[0])
+        self.assertIn("regex extraction", warnings[0])
 
     def test_returns_none_on_exception(self) -> None:
         """check_lang must swallow probe failures and return None.
@@ -67,8 +75,9 @@ class CheckLangTest(unittest.TestCase):
             "core.inventory.extractors._get_ts_languages",
             side_effect=RuntimeError("tree-sitter probe blew up"),
         ):
-            line = startup_init.check_lang()
+            line, warnings = startup_init.check_lang()
         self.assertIsNone(line)
+        self.assertEqual(warnings, [])
 
 
 class CheckActiveProjectTest(unittest.TestCase):
@@ -116,58 +125,105 @@ class CheckActiveProjectTest(unittest.TestCase):
             line = startup_init.check_active_project()
         self.assertIsNone(line)
 
-    def test_auto_marker_matching_name_returns_auto_activated_line(self) -> None:
-        """When `.auto` contains the active project name, the banner
-        shows the `Auto-activated project: ...` variant rather than
-        the plain `Project: ...` variant.
+    def test_project_line_escapes_control_bytes(self) -> None:
+        """The target field is deliberately charset-unrestricted
+        (paths may carry odd bytes), so the READ side owns escaping:
+        a registry target with ESC/OSC/BEL/bidi bytes must render
+        inert on the banner line — which reaches the operator's
+        terminal at every session start and is reprinted verbatim
+        from .startup-output."""
+        import json
+        with TemporaryDirectory() as d:
+            projects_dir = Path(d)
+            name = "demo-proj"
+            hostile_target = "/srv/repo\x1b]0;pwned\x07\x1b[2J‮-clone"
+            (projects_dir / f"{name}.json").write_text(json.dumps(
+                {"version": 1, "name": name, "target": hostile_target}
+            ))
+            with mock.patch("core.startup.get_active_name",
+                            return_value=name), \
+                 mock.patch("core.startup.PROJECTS_DIR", projects_dir):
+                line = startup_init.check_active_project()
+            self.assertIsNotNone(line)
+            for raw in ("\x1b", "\x07", "‮"):
+                self.assertNotIn(raw, line)
+            self.assertIn("pwned", line)  # content survives, escaped
+            self.assertIn("/srv/repo", line)
 
-        Also a regression guard for the bounded-read at init.py:461-478:
-        the function uses a capped `.read(cap)` and decodes/strips ─
-        an oversized hostile `.auto` (symlink to `/dev/zero`, sparse
-        file) MUST NOT OOM the banner. Here we exercise the matching-
-        prefix case directly; the comment at the code site documents
-        the OOM motivation that the read-cap defends against.
-        """
+    def test_seeded_by_auto_returns_auto_detected_line(self) -> None:
+        """The auto-detect variant comes from the session entry's
+        seeded_by field (the retired machine-global `.auto` marker
+        raced concurrent launches — one clearing another's — and could
+        mislabel a later explicit activation)."""
+        import os
+        from core.project import sessions
+        with TemporaryDirectory() as d:
+            projects_dir = Path(d) / "projects"
+            projects_dir.mkdir()
+            sessions_dir = Path(d) / "sessions.d"
+            name = "myproj"
+            (projects_dir / f"{name}.json").write_text(
+                '{"version": 1, "name": "myproj", "target": "/t"}'
+            )
+            with mock.patch("core.startup.get_active_name", return_value=name), \
+                 mock.patch("core.startup.PROJECTS_DIR", projects_dir), \
+                 mock.patch.object(sessions, "SESSIONS_DIR", sessions_dir), \
+                 mock.patch.object(sessions, "resolve_session_pid",
+                                   return_value=os.getpid()), \
+                 mock.patch.object(sessions, "_comm",
+                                   lambda pid: "claude"):
+                sessions.record_session(name, pid=os.getpid(),
+                                        seeded_by="auto")
+                line = startup_init.check_active_project()
+            self.assertIsNotNone(line)
+            self.assertIn("Auto-detected", line)
+            self.assertIn(name, line)
+
+    def test_binding_differs_from_bookmark_names_both_layers(self) -> None:
+        """An auto-detect launch leaves binding != bookmark at t=0 —
+        the banner names both, so the operator sees the divergence."""
+        import os
+        from core.project import sessions
+        with TemporaryDirectory() as d:
+            projects_dir = Path(d) / "projects"
+            projects_dir.mkdir()
+            sessions_dir = Path(d) / "sessions.d"
+            name = "myproj"
+            (projects_dir / f"{name}.json").write_text(
+                '{"version": 1, "name": "myproj", "target": "/t"}'
+            )
+            (projects_dir / "other.json").write_text(
+                '{"version": 1, "name": "other", "target": "/o"}'
+            )
+            (projects_dir / ".active").symlink_to("other.json")
+            with mock.patch("core.startup.get_active_name", return_value=name), \
+                 mock.patch("core.startup.PROJECTS_DIR", projects_dir), \
+                 mock.patch.object(sessions, "SESSIONS_DIR", sessions_dir), \
+                 mock.patch.object(sessions, "resolve_session_pid",
+                                   return_value=os.getpid()), \
+                 mock.patch.object(sessions, "_comm",
+                                   lambda pid: "claude"):
+                sessions.record_session(name, pid=os.getpid(),
+                                        seeded_by="auto")
+                line = startup_init.check_active_project()
+            self.assertIsNotNone(line)
+            self.assertIn("(default: other)", line)
+
+    def test_stale_auto_marker_is_ignored(self) -> None:
+        """A leftover `.auto` file from a pre-series launcher must not
+        produce the auto variant — the marker is retired."""
         with TemporaryDirectory() as d:
             projects_dir = Path(d)
             name = "myproj"
             (projects_dir / f"{name}.json").write_text(
                 '{"version": 1, "name": "myproj", "target": "/t"}'
             )
-            # `.auto` content matches name (with trailing whitespace
-            # that the .strip() in init.py:475 must tolerate).
             (projects_dir / ".auto").write_text(f"{name}\n")
             with mock.patch("core.startup.get_active_name", return_value=name), \
                  mock.patch("core.startup.PROJECTS_DIR", projects_dir):
                 line = startup_init.check_active_project()
             self.assertIsNotNone(line)
-            self.assertIn("Auto-activated", line)
-            self.assertIn(name, line)
-
-    def test_auto_marker_oversize_does_not_match_returns_plain_project(self) -> None:
-        """If `.auto` is larger than the bounded-read cap, the strip
-        comparison cannot equal `name` and the function falls through
-        to the plain `Project: ...` line — never raises.
-        """
-        with TemporaryDirectory() as d:
-            projects_dir = Path(d)
-            name = "myproj"
-            (projects_dir / f"{name}.json").write_text(
-                '{"version": 1, "name": "myproj", "target": "/t"}'
-            )
-            # `.auto` head looks like the name then has padding that
-            # makes the stripped comparison miss. Cap in code is
-            # `max(len(name) + 64, 256)`. 4 KiB of trailing bytes
-            # ensures the strip comparison fails.
-            (projects_dir / ".auto").write_bytes(
-                name.encode() + b"\nUNRELATED_TRAILING_BYTES" + b"X" * 4096
-            )
-            with mock.patch("core.startup.get_active_name", return_value=name), \
-                 mock.patch("core.startup.PROJECTS_DIR", projects_dir):
-                line = startup_init.check_active_project()
-            self.assertIsNotNone(line)
-            # Plain Project: line (NOT Auto-activated)
-            self.assertNotIn("Auto-activated", line)
+            self.assertNotIn("Auto", line)
             self.assertTrue(line.startswith("Project: "))
 
 

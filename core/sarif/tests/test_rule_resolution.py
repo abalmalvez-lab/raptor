@@ -1,0 +1,1225 @@
+"""Result descriptors must stay within the referenced SARIF component."""
+
+import pytest
+
+from core.testing.processes import run_in_process_group as _run_memory_process
+
+from core.sarif.parser import get_result_rule
+
+
+@pytest.fixture
+def run():
+    return {"tool": {
+        "driver": {"name": "driver", "rules": [{"id": "same", "name": "driver-rule"}]},
+        "extensions": [{"name": "extension", "guid": "extension-guid", "rules": [
+            {"id": "same", "guid": "rule-guid", "name": "extension-rule"},
+        ]}],
+    }}
+
+
+@pytest.mark.parametrize("result,expected", [
+    ({"ruleId": "same"}, "driver-rule"),
+    ({"ruleIndex": 0}, "driver-rule"),
+    ({"ruleId": "same", "ruleIndex": -1}, "driver-rule"),
+    ({"rule": {"index": 0, "toolComponent": {"index": 0}}}, "extension-rule"),
+    ({"rule": {"id": "same", "toolComponent": {"name": "extension"}}}, "extension-rule"),
+    ({"rule": {"guid": "rule-guid", "toolComponent": {"guid": "extension-guid"}}}, "extension-rule"),
+    ({"ruleId": "same", "rule": {"toolComponent": {"index": 5}}}, None),
+    ({"ruleId": "same", "rule": {"toolComponent": {"index": True}}}, None),
+    ({"ruleId": "same", "rule": {"toolComponent": {"index": -2}}}, None),
+    ({"ruleId": "same", "rule": {"toolComponent": {"index": 0, "name": "wrong"}}}, None),
+    ({"ruleId": "same", "rule": {"id": "different"}}, None),
+    ({"ruleIndex": True}, None),
+    ({"ruleIndex": -1}, None),
+])
+def test_component_resolution(run, result, expected):
+    assert get_result_rule(run, result).get("name") == expected
+
+
+def test_ambiguous_extension_reference_cannot_borrow_driver(run):
+    run["tool"]["extensions"].append(run["tool"]["extensions"][0])
+    result = {"ruleId": "same", "rule": {"toolComponent": {"name": "extension"}}}
+    assert get_result_rule(run, result) == {}
+
+
+def test_ambiguous_driver_cannot_fall_through_to_extension(run):
+    run["tool"]["driver"]["rules"].append({"id": "same", "name": "duplicate"})
+    assert get_result_rule(run, {"ruleId": "same"}) == {}
+
+
+def test_explicit_index_disambiguates_duplicate_rule_ids(run):
+    rules = run['tool']['driver']['rules']
+    rules.append({'id': 'same', 'name': 'second-rule', 'defaultConfiguration': {'level': 'error'}})
+    assert get_result_rule(run, {'ruleId': 'same', 'ruleIndex': 1}) is rules[1]
+
+
+@pytest.mark.parametrize('result', [
+    {'ruleId': 'same', 'ruleIndex': 1},
+    {'ruleId': 'same', 'ruleIndex': True},
+    {'ruleId': 'same', 'ruleIndex': -2},
+    {'ruleId': 'same', 'ruleIndex': '0'},
+    {'ruleId': 'same', 'ruleIndex': 0, 'rule': {'index': 1}},
+    {'ruleId': 'same', 'ruleIndex': True, 'rule': {'index': 0}},
+])
+def test_invalid_or_conflicting_indexes_cannot_borrow_id_metadata(run, result):
+    assert get_result_rule(run, result) == {}
+
+
+@pytest.mark.parametrize('component', ['driver', 'extension'])
+@pytest.mark.parametrize('identifier,expected', [
+    ('same', True), ('same/subrule', True), ('same/subrule/deeper', False),
+    ('same/', False), ('other', False),
+])
+def test_indexed_reference_validates_readable_rule_id(run, component, identifier, expected):
+    reference = {'id': identifier, 'index': 0}
+    if component == 'extension':
+        reference['toolComponent'] = {'index': 0}
+    result = {'rule': reference}
+    assert bool(get_result_rule(run, result)) is expected
+
+
+@pytest.mark.parametrize('guid,expected', [('rule-guid', True), ('different-guid', False)])
+def test_index_and_guid_must_resolve_to_same_descriptor(run, guid, expected):
+    reference = {'guid': guid, 'index': 0, 'toolComponent': {'index': 0}}
+    assert bool(get_result_rule(run, {'rule': reference})) is expected
+
+
+def test_indexed_reference_does_not_fall_through_to_extension(run):
+    run['tool']['driver']['rules'] = [{'id': 'other'}]
+    assert get_result_rule(run, {'ruleId': 'same', 'ruleIndex': 0}) == {}
+    assert get_result_rule(run, {'ruleId': 'same'})['name'] == 'extension-rule'
+
+
+@pytest.mark.parametrize('reference,level,cwe', [
+    ({'ruleId': 'same', 'ruleIndex': 0}, 'note', 'CWE-79'),
+    ({'ruleId': 'same', 'ruleIndex': 0, 'rule': {'toolComponent': {'index': 0}}}, 'error', 'CWE-78'),
+    ({'rule': {'index': 0, 'toolComponent': {'index': 0}}}, 'error', 'CWE-78'),
+    ({'ruleId': 'same', 'rule': {'toolComponent': {'index': 5}}}, 'warning', None),
+    ({'ruleId': 'same', 'ruleIndex': 0, 'rule': {'index': 1}}, 'warning', None),
+])
+def test_import_and_metrics_use_the_owning_descriptor(tmp_path, run, reference, level, cwe):
+    import json
+    from core.sarif.parser import generate_scan_metrics, parse_sarif_findings
+
+    driver = run['tool']['driver']['rules'][0]
+    extension = run['tool']['extensions'][0]['rules'][0]
+    for rule, severity, weakness in [(driver, 'note', 'CWE-79'), (extension, 'error', 'CWE-78')]:
+        rule.update(defaultConfiguration={'level': severity}, properties={'cwe': weakness})
+    run['results'] = [dict(reference, message={'text': 'finding'}, locations=[{
+        'physicalLocation': {'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1}},
+    }])]
+    path = tmp_path / 'input.sarif'
+    path.write_text(json.dumps({'version': '2.1.0', 'runs': [run]}))
+    findings = parse_sarif_findings(path)
+    assert len(findings) == 1
+    assert (findings[0]['level'], findings[0]['cwe_id']) == (level, cwe)
+    assert generate_scan_metrics([str(path)])['findings_by_severity'][level] == 1
+
+
+@pytest.mark.parametrize('shape', ['normal', 'duplicate-driver', 'duplicate-extension',
+                                 'two-extensions', 'no-driver', 'malformed'])
+def test_run_owned_lookup_matches_shared_resolution_without_mutation(run, shape):
+    import copy
+    from core.sarif.parser import ResultRuleResolver
+
+    if shape == 'duplicate-driver':
+        run['tool']['driver']['rules'].append({'id': 'same', 'name': 'duplicate'})
+    elif shape == 'duplicate-extension':
+        run['tool']['extensions'][0]['rules'].append({'id': 'same', 'name': 'duplicate'})
+    elif shape == 'two-extensions':
+        run['tool']['extensions'].append(copy.deepcopy(run['tool']['extensions'][0]))
+    elif shape == 'no-driver':
+        run['tool'].pop('driver')
+    elif shape == 'malformed':
+        run['tool'] = {'driver': {'rules': [None, {}, {'id': []}]}, 'extensions': [None]}
+    before = copy.deepcopy(run)
+    resolver = ResultRuleResolver(run)
+    for result in [
+        {'ruleId': 'same'}, {'ruleId': 'same', 'ruleIndex': -1}, {'ruleIndex': 0},
+        {'ruleId': 'same', 'ruleIndex': True}, {'ruleId': 'missing'},
+        {'rule': {'id': 'same', 'toolComponent': {'index': 0}}},
+        {'rule': {'index': 0, 'toolComponent': {'index': 0}}},
+        {'ruleId': 'same', 'ruleIndex': 0, 'rule': {'index': 1}}, {},
+    ]:
+        expected = get_result_rule(run, result)
+        actual = resolver.resolve(result)
+        assert actual == expected
+        if expected:
+            assert actual is expected
+    assert run == before
+
+
+def test_run_owned_lookup_does_not_retain_finished_result_payloads(run):
+    import gc
+    import weakref
+    from core.sarif.parser import ResultRuleResolver
+
+    class Tracked(dict):
+        pass
+
+    result = Tracked(ruleId='same')
+    raw_run = Tracked(run, results=[result])
+    run_ref, result_ref = weakref.ref(raw_run), weakref.ref(result)
+    resolver = ResultRuleResolver(raw_run)
+    assert resolver.resolve(result)['name'] == 'driver-rule'
+    del result, raw_run
+    gc.collect(0)
+    assert run_ref() is None and result_ref() is None
+    assert resolver.resolve({'ruleId': 'same'})['name'] == 'driver-rule'
+
+
+@pytest.mark.parametrize('extension', [False, True])
+def test_metadata_cache_distinguishes_same_id_descriptors_in_one_run(tmp_path, run, extension):
+    import copy
+    import json
+    from core.sarif.parser import generate_scan_metrics, parse_sarif_findings
+
+    first = run['tool']['driver']['rules'][0]
+    second = copy.deepcopy(first)
+    first.update(defaultConfiguration={'level': 'note'}, properties={'cwe': 'CWE-79'})
+    second.update(defaultConfiguration={'level': 'error'}, properties={'cwe': 'CWE-78'})
+    if extension:
+        run['tool']['extensions'][0]['rules'] = [second]
+        refs = [{'ruleIndex': 0}, {'ruleIndex': 0, 'rule': {'toolComponent': {'index': 0}}}]
+    else:
+        run['tool']['driver']['rules'].append(second)
+        refs = [{'ruleIndex': 0}, {'ruleIndex': 1}]
+    run['results'] = [dict(ref, ruleId='same', message={'text': 'finding'}, locations=[{
+        'physicalLocation': {'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': i+1}},
+    }]) for i, ref in enumerate(refs)]
+    path = tmp_path / 'cache.sarif'
+    path.write_text(json.dumps({'version': '2.1.0', 'runs': [run]}))
+    assert [(f['level'], f['cwe_id']) for f in parse_sarif_findings(path)] == [
+        ('note', 'CWE-79'), ('error', 'CWE-78'),
+    ]
+    counts = generate_scan_metrics([str(path)])['findings_by_severity']
+    assert (counts['note'], counts['error']) == (1, 1)
+
+
+@pytest.mark.parametrize('extension', [False, True])
+@pytest.mark.parametrize('shared_id', [False, True])
+def test_merge_keeps_rule_reference_namespaces_valid(tmp_path, extension, shared_id):
+    import json
+    from core.sarif.parser import generate_scan_metrics, merge_sarif, parse_sarif_findings
+
+    paths = []
+    for index, (level, cwe) in enumerate([('note', 'CWE-79'), ('error', 'CWE-78')]):
+        rule = {'id': 'same' if shared_id else f'rule-{index}',
+                'defaultConfiguration': {'level': level}, 'properties': {'cwe': cwe}}
+        tool = {'driver': {'name': 'CodeQL', 'rules': [] if extension else [rule]}}
+        reference = {'ruleIndex': 0}
+        if extension:
+            tool['extensions'] = [{'name': 'extension', 'rules': [rule]}]
+            reference['rule'] = {'toolComponent': {'index': 0}}
+        result = dict(reference, message={'text': 'finding'}, locations=[{'physicalLocation': {
+            'artifactLocation': {'uri': f'source-{index}.c'}, 'region': {'startLine': 1},
+        }}])
+        path = tmp_path / f'input-{index}.sarif'
+        path.write_text(json.dumps({'version': '2.1.0', 'runs': [{'tool': tool, 'results': [result]}]}))
+        paths.append(str(path))
+    merged = merge_sarif(paths)
+    assert len(merged['runs']) == 2
+    output = tmp_path / 'merged.sarif'
+    output.write_text(json.dumps(merged))
+    assert [(f['level'], f['cwe_id']) for f in parse_sarif_findings(output)] == [
+        ('note', 'CWE-79'), ('error', 'CWE-78'),
+    ]
+    counts = generate_scan_metrics([str(output)])['findings_by_severity']
+    assert (counts['note'], counts['error']) == (1, 1)
+
+
+def test_merge_exact_qualified_reports_deduplicate_without_reindexing(tmp_path, run):
+    import copy
+    import json
+    from core.sarif.parser import merge_sarif
+
+    result = {'ruleIndex': 0, 'rule': {'toolComponent': {'index': 0}},
+              'message': {'text': 'finding'}, 'locations': [{'physicalLocation': {
+                  'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+              }}]}
+    run['results'] = [result, copy.deepcopy(result)]
+    run['artifacts'] = [{'location': {'uri': 'source.c'}}]
+    path = tmp_path / 'qualified.sarif'
+    path.write_text(json.dumps({'version': '2.1.0', 'runs': [run]}))
+    output = merge_sarif([str(path), str(path)])
+    assert len(output['runs']) == 1
+    assert output['runs'][0]['results'] == [result]
+    assert output['runs'][0]['tool'] == run['tool']
+    assert output['runs'][0]['artifacts'] == run['artifacts']
+
+
+@pytest.mark.parametrize('reference_kind', ['driver-index', 'extension-index', 'qualified-id'])
+def test_referenced_rule_identity_preserves_same_location_findings(tmp_path, reference_kind):
+    import copy
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    rules = [{'id': 'rule-a'}, {'id': 'rule-b'}]
+    tool = {'driver': {'name': 'CodeQL', 'rules': rules}}
+    if reference_kind != 'driver-index':
+        tool = {'driver': {'name': 'CodeQL'}, 'extensions': [{'name': 'pack', 'rules': rules}]}
+    results = []
+    for index, rule in enumerate(rules):
+        if reference_kind == 'driver-index':
+            reference = {'ruleIndex': index}
+        elif reference_kind == 'extension-index':
+            reference = {'rule': {'index': index, 'toolComponent': {'index': 0}}}
+        else:
+            reference = {'rule': {'id': rule['id'], 'toolComponent': {'name': 'pack'}}}
+        results.append(dict(reference, message={'text': 'same message'}, locations=[{
+            'physicalLocation': {'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1}},
+        }]))
+    path = tmp_path / 'identity.sarif'
+    report = {'version': '2.1.0', 'runs': [{'tool': tool, 'results': results}]}
+    before = copy.deepcopy(report)
+    path.write_text(json.dumps(report))
+    findings = parse_sarif_findings(path)
+    assert [finding['rule_id'] for finding in findings] == ['rule-a', 'rule-b']
+    assert len({finding['finding_id'] for finding in findings}) == 2
+    assert len(deduplicate_findings(findings)) == 2
+    assert json.loads(path.read_text()) == before
+
+
+@pytest.mark.parametrize('readable_id', ['same', 'same/child'])
+def test_referenced_rule_identity_matches_explicit_readable_id(tmp_path, run, readable_id):
+    import json
+    from core.sarif.parser import parse_sarif_findings
+
+    result = {'rule': {'id': readable_id, 'index': 0, 'toolComponent': {'index': 0}},
+              'message': {'text': 'finding'}, 'locations': [{'physicalLocation': {
+                  'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+              }}]}
+    path = tmp_path / 'equivalent.sarif'
+
+    def parse(row):
+        path.write_text(json.dumps({'version': '2.1.0', 'runs': [dict(run, results=[row])]}))
+        return parse_sarif_findings(path)[0]
+
+    implicit = parse(result)
+    explicit = parse(dict(result, ruleId=readable_id))
+    assert implicit['rule_id'] == explicit['rule_id'] == readable_id
+    assert implicit['finding_id'] == explicit['finding_id']
+    fingerprinted = parse(dict(result, fingerprints={'matchBasedId/v1': 'tool-fingerprint'}))
+    assert fingerprinted['finding_id'] == 'tool-fingerprint'
+
+
+def test_invalid_reference_cannot_supply_missing_rule_identity(tmp_path, run):
+    import json
+    from core.sarif.parser import parse_sarif_findings
+
+    result = {'rule': {'id': 'invented', 'index': 0}, 'message': {'text': 'finding'}}
+    path = tmp_path / 'invalid.sarif'
+    path.write_text(json.dumps({'version': '2.1.0', 'runs': [dict(run, results=[result])]}))
+    assert parse_sarif_findings(path)[0]['rule_id'] is None
+
+
+def test_distinct_subrules_survive_dedup_and_table_reordering(tmp_path, run):
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    path = tmp_path / 'subrules.sarif'
+
+    def parse(index):
+        results = [{'rule': {'id': child, 'index': index, 'toolComponent': {'index': 0}},
+                    'message': {'text': 'same message'}, 'locations': [{'physicalLocation': {
+                        'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+                    }}]} for child in ['same/first', 'same/second']]
+        path.write_text(json.dumps({'version': '2.1.0', 'runs': [dict(run, results=results)]}))
+        return parse_sarif_findings(path)
+
+    original = parse(0)
+    assert len(deduplicate_findings(original)) == 2
+    assert len({finding['finding_id'] for finding in original}) == 2
+    run['tool']['extensions'][0]['rules'].insert(0, {'id': 'unrelated'})
+    reordered = parse(1)
+    assert [(f['rule_id'], f['finding_id']) for f in reordered] == [
+        (f['rule_id'], f['finding_id']) for f in original
+    ]
+
+
+@pytest.mark.parametrize('level', [None, 'error'])
+@pytest.mark.parametrize('reference,expected', [
+    ({'ruleIndex': 0}, 'same'),
+    ({'rule': {'index': 0, 'toolComponent': {'index': 0}}}, 'same'),
+    ({'rule': {'id': 'same/child', 'index': 0, 'toolComponent': {'index': 0}}}, 'same/child'),
+    ({'ruleId': 'explicit'}, 'explicit'),
+    ({'rule': {'id': 'invented', 'index': 0}}, 'unknown'),
+    ({'ruleIndex': True}, 'unknown'),
+    ({'ruleId': ''}, 'unknown'),
+])
+def test_metrics_rule_counts_match_validated_import_identity(tmp_path, run, reference, expected, level):
+    import json
+    from core.sarif.parser import generate_scan_metrics, parse_sarif_findings
+
+    result = dict(reference, message={'text': 'finding'}, locations=[{'physicalLocation': {
+        'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+    }}])
+    if level is not None:
+        result['level'] = level
+    path = tmp_path / 'metrics-identity.sarif'
+    path.write_text(json.dumps({'version': '2.1.0', 'runs': [dict(run, results=[result])]}))
+    metrics = generate_scan_metrics([str(path)])
+    finding = parse_sarif_findings(path)[0]
+    assert metrics['findings_by_rule'] == {expected: 1}
+    assert (finding['rule_id'] or 'unknown') == expected
+    assert metrics['findings_by_severity'][finding['level']] == 1
+
+
+_SARIF_MEMORY_PROFILES = {"location", "partial-fingerprint", "tool-fingerprint", "merge"}
+
+
+def _run_sarif_memory_proof(case):
+    """Keep native identity measurements out of a borrowed tracing session."""
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    from core.testing.standalone_cli import standalone_cli_env
+
+    assert case in _SARIF_MEMORY_PROFILES
+    root = Path(__file__).resolve().parents[3]
+    script = """\
+import sys
+import tracemalloc
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from pytest import MonkeyPatch
+from core.testing.state_isolation import pin_user_state_dirs
+from core.sarif import parser
+from core.sarif.tests import test_rule_resolution as native
+assert not tracemalloc.is_tracing()
+owned, case = Path(sys.argv[2]), sys.argv[3]
+assert case in native._SARIF_MEMORY_PROFILES
+borrowed = parser.load_sarif
+try:
+    with MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, owned / "memory-child-state")
+        if case == "merge":
+            native.test_merge_identity_does_not_copy_a_whole_rule_table(patch)
+        else:
+            native.test_established_identity_does_not_copy_unused_result_payload(patch, case)
+finally:
+    assert parser.load_sarif is borrowed
+print("sarif-memory-proof-ok")
+"""
+    with standalone_cli_env() as env:
+        result = _run_memory_process(
+            [sys.executable, "-I", "-c", script, str(root), env["TMPDIR"], case],
+            timeout=30, env=env, cwd=root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "sarif-memory-proof-ok", result.stdout
+
+
+@pytest.mark.parametrize('identity', ['location', 'partial-fingerprint', 'tool-fingerprint'])
+def test_established_identity_does_not_copy_unused_result_payload(monkeypatch, identity):
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        _run_sarif_memory_proof(identity)
+        return
+    from pathlib import Path
+    import core.sarif.parser as parser
+
+    result = {'ruleId': 'rule-a', 'message': {'text': 'finding'},
+              'properties': {'tool_details': 'x' * (2 * 1024 * 1024)}}
+    if identity == 'location':
+        result['locations'] = [{'physicalLocation': {
+            'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+        }}]
+    elif identity == 'partial-fingerprint':
+        result['partialFingerprints'] = {'primaryLocationLineHash': 'line-hash'}
+    else:
+        result['fingerprints'] = {'matchBasedId/v1': 'tool-fingerprint'}
+    report = {'runs': [{'tool': {'driver': {'name': 'tool'}}, 'results': [result]}]}
+    # Isolate import work after the bounded loader; the caller-owned raw
+    # document is already resident and must not be duplicated for identity.
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: report)
+    parser.parse_sarif_findings(Path('unused.sarif'))  # Warm imports/caches.
+    try:
+        tracemalloc.start()
+        findings = parser.parse_sarif_findings(Path('unused.sarif'))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(findings) == 1
+    assert findings[0]['message'] == 'finding'
+    assert peak < 1024 * 1024, f'identity copied unused raw payload: {peak} bytes'
+
+
+def test_content_identity_fallback_retains_exact_digest(tmp_path):
+    import hashlib
+    import json
+    from core.sarif.parser import parse_sarif_findings
+
+    result = {'ruleId': 'rule-a', 'message': {'text': 'locationless finding'},
+              'properties': {'details': 'non-ASCII: λ'}}
+    expected = hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    path = tmp_path / 'content-identity.sarif'
+    for row in [result, dict(reversed(list(result.items())))]:
+        path.write_text(json.dumps({'runs': [{'tool': {'driver': {'name': 'tool'}}, 'results': [row]}]}))
+        assert parse_sarif_findings(path)[0]['finding_id'] == expected
+
+
+def test_metrics_can_count_original_artifacts_without_recounting_findings(tmp_path):
+    import json
+    from core.sarif.parser import generate_scan_metrics
+
+    primary = tmp_path / 'combined.sarif'
+    primary.write_text(json.dumps({'runs': [{'tool': {'driver': {'name': 'primary'}},
+        'artifacts': [{'location': {'uri': 'discarded-fallback.c'}}],
+        'results': [{'ruleId': 'kept', 'level': 'error'}]}]}))
+    original = tmp_path / 'original.sarif'
+    original.write_text(json.dumps({'runs': [{'tool': {'driver': {'name': 'original'}},
+        'artifacts': [{'location': {'uri': 'a.c'}}, {'location': {'uri': 'b.c'}}],
+        'results': [{'ruleId': 'raw', 'level': 'warning'}] * 3}]}))
+    metrics = generate_scan_metrics([str(primary)], file_count_paths=[str(original)])
+    assert metrics['total_files_scanned'] == 2
+    assert metrics['total_findings'] == 1
+    assert metrics['tools_used'] == ['primary']
+    assert metrics['findings_by_tool'] == {'primary': 1}
+    assert metrics['findings_by_rule'] == {'kept': 1}
+    assert metrics['findings_by_severity']['error'] == 1
+    assert metrics['findings_by_severity']['warning'] == 0
+
+
+@pytest.mark.parametrize('properties,expected', [
+    (None, 0), ('malformed', 0), ({'nosemgrep': None}, 0),
+    ({'nosemgrep': 'malformed'}, 0), ({'nosemgrep': {'suppressed': False}}, 0),
+    ({'nosemgrep': {'suppressed': 'true'}}, 0), ({'nosemgrep': {'suppressed': 1}}, 0),
+    ({'nosemgrep': {'suppressed': True}}, 1),
+])
+def test_metrics_count_only_literal_suppression_annotations(tmp_path, properties, expected):
+    import json
+    from core.sarif.parser import generate_scan_metrics
+
+    path = tmp_path / 'suppressed.sarif'
+    path.write_text(json.dumps({'runs': [{'tool': {'driver': {'name': 'Semgrep'}},
+        'results': [{'ruleId': 'rule-a', 'level': 'warning', 'properties': properties}]}]}))
+    metrics = generate_scan_metrics([str(path)])
+    assert metrics['nosemgrep_suppressed_count'] == expected
+    assert metrics['total_findings'] == 1
+
+
+def test_artifact_count_inputs_cannot_inflate_suppression_count(tmp_path):
+    import json
+    from core.sarif.parser import generate_scan_metrics
+
+    primary = tmp_path / 'empty.sarif'
+    primary.write_text(json.dumps({'runs': [{'results': []}]}))
+    original = tmp_path / 'original.sarif'
+    original.write_text(json.dumps({'runs': [{'artifacts': [{'location': {'uri': 'a.py'}}],
+        'results': [{'properties': {'nosemgrep': {'suppressed': True}}}]}]}))
+    metrics = generate_scan_metrics([str(primary)], file_count_paths=[str(original)])
+    assert metrics['total_files_scanned'] == 1
+    assert metrics['total_findings'] == metrics['nosemgrep_suppressed_count'] == 0
+
+
+@pytest.mark.parametrize('tool_fingerprint', [False, True])
+def test_cross_tool_collisions_survive_dedup_without_artifact_id_overlap(tmp_path, tool_fingerprint):
+    import copy
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    result = {'ruleId': 'shared-rule', 'message': {'text': 'finding'}, 'locations': [{'physicalLocation': {
+        'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+    }}]}
+    if tool_fingerprint:
+        result['fingerprints'] = {'matchBasedId/v1': 'shared-fingerprint'}
+    path = tmp_path / 'tools.sarif'
+    path.write_text(json.dumps({'runs': [
+        {'tool': {'driver': {'name': name}}, 'results': [result, result]}
+        for name in ['Semgrep', 'CodeQL']
+    ]}))
+    findings = parse_sarif_findings(path)
+    before = copy.deepcopy(findings)
+    assert len({finding['finding_id'] for finding in findings}) == 1
+    retained = deduplicate_findings(findings)
+    assert len(retained) == 2
+    assert {finding['tool'] for finding in retained} == {'Semgrep', 'CodeQL'}
+    # Consumers key analysis files and result maps on finding_id alone.
+    assert len({finding['finding_id']: finding for finding in retained}) == 2
+    assert {finding['source_finding_id'] for finding in retained} == {findings[0]['finding_id']}
+    assert findings == before
+    assert deduplicate_findings(retained) == retained
+    reversed_result = deduplicate_findings(list(reversed(findings)))
+    assert {f['tool']: f['finding_id'] for f in reversed_result} == {
+        f['tool']: f['finding_id'] for f in retained
+    }
+
+
+def test_tool_scoped_ids_do_not_shadow_an_existing_finding_id():
+    import copy
+    from core.sarif.parser import deduplicate_findings
+
+    rows = [dict(file='a.c', startLine=1, endLine=1, rule_id='shared',
+                 finding_id='shared', tool=tool) for tool in ['Semgrep', 'CodeQL']]
+    first = deduplicate_findings(rows)
+    assert len(first) == 2
+    existing = dict(rows[0], file='elsewhere.c', tool='other', finding_id=first[0]['finding_id'])
+    original = copy.deepcopy([*rows, existing])
+    retained = deduplicate_findings([*rows, existing])
+    assert len(retained) == len({f['finding_id'] for f in retained}) == 3
+    assert retained[-1] == existing
+    assert [*rows, existing] == original
+    reversed_result = deduplicate_findings(list(reversed([*rows, existing])))
+    assert {f['tool']: f['finding_id'] for f in reversed_result} == {
+        f['tool']: f['finding_id'] for f in retained
+    }
+
+
+def test_tool_aliases_and_uncollided_ids_keep_existing_identity():
+    from core.sarif.parser import deduplicate_findings
+
+    row = dict(file='a.c', startLine=1, endLine=1, rule_id='rule',
+               finding_id='original-fingerprint', tool='Semgrep OSS')
+    duplicate = dict(row, tool='semgrep')
+    assert deduplicate_findings([row, duplicate]) == [row]
+    assert deduplicate_findings([row])[0] is row
+
+
+def test_legacy_findings_without_ids_remain_separate_across_tools():
+    from core.sarif.parser import deduplicate_findings
+
+    rows = [dict(file='a.c', startLine=1, rule_id='rule', tool=tool)
+            for tool in ['Semgrep', 'CodeQL']]
+    assert deduplicate_findings([*rows, dict(rows[0])]) == rows
+
+
+@pytest.mark.parametrize('same_component', [False, True])
+@pytest.mark.parametrize('tool_fingerprint', [False, True])
+@pytest.mark.parametrize('use_guids', [False, True])
+def test_same_tool_rule_namespaces_keep_independent_evidence(tmp_path, run, same_component, tool_fingerprint, use_guids):
+    import copy
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    driver = run['tool']['driver']['rules'][0]
+    extension = run['tool']['extensions'][0]['rules'][0]
+    driver.update(guid='driver-rule-guid', properties={'cwe': 'CWE-79'})
+    extension.update(properties={'cwe': 'CWE-78'})
+    if not use_guids:
+        driver.pop('guid')
+        extension.pop('guid')
+        run['tool']['extensions'][0].pop('guid')
+    references = [{'ruleId': 'same', 'ruleIndex': 0},
+                  {'ruleId': 'same', 'ruleIndex': 0, 'rule': {'toolComponent': {'index': 0}}}]
+    if same_component:
+        run['tool']['driver']['rules'].append(copy.deepcopy(extension))
+        references[1] = {'ruleId': 'same', 'ruleIndex': 1}
+    rows = [dict(reference, message={'text': 'same message'}, locations=[{'physicalLocation': {
+        'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+    }}]) for reference in references]
+    if tool_fingerprint:
+        for row in rows:
+            row['fingerprints'] = {'matchBasedId/v1': 'shared-fingerprint'}
+    path = tmp_path / 'rule-namespaces.sarif'
+    run['results'] = rows + copy.deepcopy(rows)
+    path.write_text(json.dumps({'runs': [run]}))
+    findings = parse_sarif_findings(path)
+    original = copy.deepcopy(findings)
+    assert len({finding['finding_id'] for finding in findings}) == 1
+    retained = deduplicate_findings(findings)
+    assert len(retained) == len({finding['finding_id'] for finding in retained}) == 2
+    assert {finding['cwe_id'] for finding in retained} == {'CWE-79', 'CWE-78'}
+    assert findings == original
+    assert deduplicate_findings(retained) == retained
+
+
+@pytest.mark.parametrize('use_guids', [False, True])
+def test_rule_scope_is_stable_across_reference_forms_and_table_reordering(tmp_path, run, use_guids):
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    path = tmp_path / 'reordered-components.sarif'
+
+    def parse(reference):
+        row = dict(reference, message={'text': 'finding'}, locations=[{'physicalLocation': {
+            'artifactLocation': {'uri': 'source.c'}, 'region': {'startLine': 1},
+        }}])
+        path.write_text(json.dumps({'runs': [dict(run, results=[row])]}))
+        return parse_sarif_findings(path)[0]
+
+    if not use_guids:
+        run['tool']['extensions'][0].pop('guid')
+        run['tool']['extensions'][0]['rules'][0].pop('guid')
+    by_index = parse({'rule': {'index': 0, 'toolComponent': {'index': 0}}})
+    readable = ({'guid': 'rule-guid', 'toolComponent': {'guid': 'extension-guid'}}
+                if use_guids else {'id': 'same', 'toolComponent': {'name': 'extension'}})
+    by_name = parse({'rule': readable})
+    assert by_index['rule_scope'] == by_name['rule_scope']
+    run['tool']['extensions'][0]['rules'].insert(0, {'id': 'unrelated'})
+    run['tool']['extensions'].insert(0, {'name': 'unrelated', 'rules': []})
+    reordered = parse({'rule': {'index': 1, 'toolComponent': {'index': 1}}})
+    assert reordered['rule_scope'] == by_index['rule_scope']
+    assert deduplicate_findings([by_index, by_name, reordered]) == [by_index]
+
+
+def test_invalid_reference_cannot_borrow_rule_scope(tmp_path, run):
+    import json
+    from core.sarif.parser import parse_sarif_findings
+
+    path = tmp_path / 'invalid-scope.sarif'
+    row = {'ruleId': 'same', 'rule': {'toolComponent': {'index': 99}},
+           'message': {'text': 'finding'}, 'properties': {'rule_scope': 'forged'}}
+    path.write_text(json.dumps({'runs': [dict(run, results=[row])]}))
+    assert 'rule_scope' not in parse_sarif_findings(path)[0]
+
+
+@pytest.mark.parametrize('reference', [{'ruleId': 'same'}, {'ruleId': 'same', 'ruleIndex': 0}])
+def test_unique_driver_keeps_legacy_identity_and_finding_shape(tmp_path, run, reference):
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    path = tmp_path / 'ordinary-driver.sarif'
+    row = dict(reference, message={'text': 'finding'}, fingerprints={'matchBasedId/v1': 'original'})
+    path.write_text(json.dumps({'runs': [dict(run, results=[row])]}))
+    finding = parse_sarif_findings(path)[0]
+    assert finding['finding_id'] == 'original'
+    assert 'rule_scope' not in finding
+    assert deduplicate_findings([finding, dict(finding)]) == [finding]
+
+
+@pytest.mark.parametrize('difference', ['cwe', 'severity'])
+def test_anonymous_duplicate_descriptors_keep_distinct_inherited_evidence(tmp_path, difference):
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    rules = [{'id': 'same', 'properties': {'cwe': cwe}, 'defaultConfiguration': {'level': level}}
+             for cwe, level in [('CWE-79', 'note'),
+                                ('CWE-78', 'note') if difference == 'cwe' else ('CWE-79', 'error')]]
+    rows = [{'ruleId': 'same', 'ruleIndex': index, 'message': {'text': 'finding'},
+             'locations': [{'physicalLocation': {'artifactLocation': {'uri': 'source.c'},
+                                                'region': {'startLine': 1}}}]} for index in range(2)]
+    path = tmp_path / 'anonymous-rules.sarif'
+    path.write_text(json.dumps({'runs': [{'tool': {'driver': {'name': 'tool', 'rules': rules}},
+                                         'results': rows}]}))
+    retained = deduplicate_findings(parse_sarif_findings(path))
+    assert len(retained) == len({finding['finding_id'] for finding in retained}) == 2
+    assert len({(finding['cwe_id'], finding['level']) for finding in retained}) == 2
+
+
+@pytest.mark.parametrize('change', [
+    {'file': 'b.c'}, {'startLine': 2}, {'endLine': 3}, {'rule_id': 'other'},
+    {'file': None}, {'endLine': None},
+])
+def test_reused_id_cannot_overwrite_distinct_retained_locations(change):
+    import copy
+    from core.sarif.parser import deduplicate_findings
+
+    first = dict(tool='Semgrep', file='a.c', startLine=1, endLine=1,
+                 rule_id='rule', finding_id='reused')
+    second = dict(first, **change)
+    rows = [first, second, dict(first), dict(second)]
+    original = copy.deepcopy(rows)
+    retained = deduplicate_findings(rows)
+    assert len(retained) == len({row['finding_id']: row for row in retained}) == 2
+    assert {row['source_finding_id'] for row in retained} == {'reused'}
+    assert rows == original
+    assert deduplicate_findings(retained) == retained
+    fields = ('file', 'startLine', 'endLine', 'rule_id')
+    assert {tuple(row.get(field) for field in fields): row['finding_id']
+            for row in deduplicate_findings(list(reversed(rows)))} == {
+                tuple(row.get(field) for field in fields): row['finding_id'] for row in retained
+            }
+
+
+def test_indexed_files_with_one_tool_fingerprint_keep_distinct_artifact_ids(tmp_path):
+    import json
+    from core.sarif.parser import deduplicate_findings, parse_sarif_findings
+
+    rows = [{'ruleId': 'rule', 'fingerprints': {'matchBasedId/v1': 'shared'},
+             'message': {'text': 'finding'}, 'locations': [{'physicalLocation': {
+                 'artifactLocation': {'index': index}, 'region': {'startLine': 1},
+             }}]} for index in range(2)]
+    path = tmp_path / 'reused-indexed-fingerprint.sarif'
+    path.write_text(json.dumps({'runs': [{'tool': {'driver': {'name': 'Semgrep'}},
+        'artifacts': [{'location': {'uri': file}} for file in ['left.c', 'right.c']],
+        'results': rows}]}))
+    parsed = parse_sarif_findings(path)
+    assert [row['finding_id'] for row in parsed] == ['shared', 'shared']
+    retained = deduplicate_findings(parsed)
+    assert len({row['finding_id']: row for row in retained}) == 2
+    assert {row['file'] for row in retained} == {'left.c', 'right.c'}
+
+
+def test_existing_cross_tool_qualified_ids_keep_their_byte_contract():
+    from core.sarif.parser import deduplicate_findings
+
+    rows = [dict(file='a.c', startLine=1, endLine=1, rule_id='shared',
+                 finding_id='shared', tool=tool) for tool in ['Semgrep', 'CodeQL']]
+    # Captured from the previous implementation before adding location
+    # disambiguation; existing cross-tool artifact names must not drift.
+    assert {row['tool']: row['finding_id'] for row in deduplicate_findings(rows)} == {
+        'Semgrep': 'f14510e0548bdfd624999bb8ab5078c3a683a53042b317c5d688d9a08603e92f',
+        'CodeQL': 'c75351778d4daf94ef68d11e40f5a590c0451e3dd5b343a89377ee24982ba773',
+    }
+
+
+def test_location_qualified_ids_avoid_existing_ids_and_keep_original_provenance():
+    import copy
+    from core.sarif.parser import deduplicate_findings
+
+    rows = [dict(tool='Semgrep', file=file, startLine=1, endLine=1, rule_id='rule',
+                 finding_id='reused', source_finding_id='original-upstream') for file in ['a.c', 'b.c']]
+    initial = deduplicate_findings(rows)
+    existing = dict(rows[0], file='existing.c', finding_id=initial[0]['finding_id'])
+    original = copy.deepcopy([*rows, existing])
+    retained = deduplicate_findings([*rows, existing])
+    assert len(retained) == len({row['finding_id'] for row in retained}) == 3
+    assert retained[-1] is existing
+    assert {row['source_finding_id'] for row in retained[:2]} == {'original-upstream'}
+    assert [*rows, existing] == original
+    assert {row['file']: row['finding_id'] for row in retained} == {
+        row['file']: row['finding_id'] for row in deduplicate_findings(list(reversed([*rows, existing])))
+    }
+
+
+def test_merge_identity_does_not_copy_a_whole_rule_table(monkeypatch):
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        _run_sarif_memory_proof("merge")
+        return
+    import core.sarif.parser as parser
+
+    rules = [{'id': f'rule-{index}', 'shortDescription': {'text': 'x' * 1024}}
+             for index in range(4096)]
+    result = {'ruleIndex': 0, 'ruleId': 'rule-0', 'message': {'text': 'finding'}}
+    report = {'runs': [{'tool': {'driver': {'name': 'CodeQL', 'rules': rules}},
+                        'results': [result, dict(result)]}]}
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: report)
+    parser.merge_sarif(['unused.sarif'])
+    try:
+        tracemalloc.start()
+        merged = parser.merge_sarif(['unused.sarif'])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert merged['runs'][0]['tool'] is report['runs'][0]['tool']
+    assert merged['runs'][0]['results'] == [result]
+    assert peak < 1024 * 1024, f'merge identity copied the rule table: {peak} bytes'
+
+
+def test_merge_restarts_identity_after_a_partial_stream_depth_failure(monkeypatch):
+    import core.sarif.parser as parser
+
+    report = {'runs': [{'tool': {'driver': {'name': 'CodeQL', 'rules': [{'id': 'rule'}]}},
+                        'results': [{'ruleId': 'rule', 'ruleIndex': 0, 'message': {'text': 'finding'}}]}]}
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: report)
+    real_stream = parser.iterencode_canonical
+    failed = False
+
+    def fail_once(value):
+        nonlocal failed
+        if not failed:
+            failed = True
+            yield b'{"tool":'
+            raise RecursionError('synthetic streaming depth limit')
+        yield from real_stream(value)
+
+    monkeypatch.setattr(parser, 'iterencode_canonical', fail_once)
+    merged = parser.merge_sarif(['first.sarif', 'second.sarif'])
+    # A partial-prefix digest would differ from the successful retry and
+    # retain two runs. Both complete identities must still coalesce.
+    assert len(merged['runs']) == 1
+    assert merged['runs'][0]['results'] == report['runs'][0]['results']
+
+
+@pytest.mark.parametrize('qualified', [False, True])
+def test_merge_releases_input_documents_before_loading_the_next(monkeypatch, qualified):
+    import weakref
+    import core.sarif.parser as parser
+
+    class Tracked(dict):
+        pass
+
+    inputs = []
+    latest = []
+
+    def load(path):
+        for document_ref, run_ref in inputs:
+            assert document_ref() is None, 'previous input survived into the next read'
+            assert run_ref() is None, 'previous raw run survived into the next read'
+        result = Tracked(ruleId='rule', message={'text': 'finding'})
+        if qualified:
+            result['ruleIndex'] = 0
+        run = Tracked(tool={'driver': {'name': 'CodeQL', 'rules': [{'id': 'rule'}]}}, results=[result])
+        document = Tracked(runs=[run])
+        inputs.append((weakref.ref(document), weakref.ref(run)))
+        latest.append(weakref.ref(result))
+        return document
+
+    monkeypatch.setattr(parser, 'load_sarif', load)
+    merged = parser.merge_sarif(['first.sarif', 'second.sarif', 'third.sarif'])
+    assert all(document() is None and run() is None for document, run in inputs)
+    assert len(merged['runs']) == 1
+    assert merged['runs'][0]['results'] == [latest[-1]()]
+    assert all(result() is None for result in latest[:-1])
+
+
+def test_merge_releases_unused_duplicate_metadata_but_keeps_the_owned_table(monkeypatch):
+    import weakref
+    import core.sarif.parser as parser
+
+    class Tracked(dict):
+        pass
+
+    rules = []
+
+    def load(path):
+        if len(rules) >= 2:
+            assert rules[0]() is not None, 'retained context lost its rule table'
+            assert rules[-1]() is None, 'unused duplicate rule table survived into the next read'
+        rule = Tracked(id='rule')
+        rules.append(weakref.ref(rule))
+        return {'runs': [{'tool': {'driver': {'name': 'CodeQL', 'rules': [rule]}},
+                          'results': [{'ruleId': 'rule', 'ruleIndex': 0, 'message': {'text': 'finding'}}]}]}
+
+    monkeypatch.setattr(parser, 'load_sarif', load)
+    merged = parser.merge_sarif(['first.sarif', 'second.sarif', 'third.sarif'])
+    assert merged['runs'][0]['tool']['driver']['rules'][0] is rules[0]()
+    assert all(rule() is None for rule in rules[1:])
+
+
+def test_empty_inputs_between_reports_do_not_reset_accumulated_findings(monkeypatch):
+    import core.sarif.parser as parser
+
+    result = {'ruleId': 'rule', 'message': {'text': 'finding'}}
+    valid = {'runs': [{'tool': {'driver': {'name': 'tool'}}, 'results': [result]}]}
+    documents = {'first': valid, 'empty': {'runs': []}, 'missing': None, 'last': valid}
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: documents[str(path)])
+    merged = parser.merge_sarif(['missing', 'first', 'empty', 'missing', 'last', 'empty'])
+    assert merged['runs'][0]['results'] == [result]
+
+
+@pytest.mark.parametrize('separate_file_counts', [False, True], ids=['reports', 'original-file-counts'])
+def test_metrics_release_input_objects_before_the_next_read(monkeypatch, separate_file_counts):
+    import weakref
+    import core.sarif.parser as parser
+
+    class Tracked(dict):
+        pass
+
+    references = []
+
+    def load(path):
+        assert all(ref() is None for ref in references), (
+            'metrics retained a previous document, run, result, artifact or rule table'
+        )
+        rule = Tracked(id='rule', defaultConfiguration={'level': 'error'})
+        result = Tracked(ruleIndex=0, properties={'nosemgrep': {'suppressed': True}})
+        artifact = Tracked(location={'uri': 'a.c'})
+        run = Tracked(tool={'driver': {'name': 'CodeQL', 'rules': [rule]}},
+                      results=[result], artifacts=[artifact])
+        document = Tracked(runs=[run])
+        references.extend(weakref.ref(value) for value in [document, run, rule, result, artifact])
+        return document
+
+    monkeypatch.setattr(parser, 'load_sarif', load)
+    metrics = parser.generate_scan_metrics(
+        ['first.sarif', 'second.sarif'],
+        file_count_paths=['original-a.sarif', 'original-b.sarif'] if separate_file_counts else None,
+    )
+    assert all(ref() is None for ref in references)
+    assert metrics['total_findings'] == 2
+    assert metrics['total_files_scanned'] == 2
+    assert metrics['findings_by_rule'] == {'rule': 2}
+    assert metrics['findings_by_severity']['error'] == 2
+    assert metrics['nosemgrep_suppressed_count'] == 2
+    assert metrics['tools_used'] == ['CodeQL']
+
+
+def test_legacy_merge_releases_replaced_driver_rules_without_mutating_inputs(monkeypatch):
+    import weakref
+    import core.sarif.parser as parser
+
+    class Tracked(dict):
+        pass
+
+    rules = []
+
+    def load(path):
+        if len(rules) >= 2:
+            assert rules[0]() is None, 'first driver table retained a replaced rule'
+            assert rules[-1]() is not None, 'latest definition must remain owned'
+        # Equivalent descriptor objects may replace one another; conflicting
+        # definitions now remain in separate owning contexts.
+        rule = Tracked(id='rule', name='same')
+        rules.append(weakref.ref(rule))
+        return {'runs': [{'tool': {'driver': {'name': 'tool', 'version': '1', 'rules': [rule]}},
+                          'results': [{'ruleId': 'rule', 'message': {'text': 'finding'}}]}]}
+
+    monkeypatch.setattr(parser, 'load_sarif', load)
+    merged = parser.merge_sarif(['first', 'second', 'third'])
+    driver = merged['runs'][0]['tool']['driver']
+    assert driver == {'name': 'tool', 'version': '1', 'rules': [rules[-1]()]}
+    assert all(rule() is None for rule in rules[:-1])
+
+    # Retained caller documents must remain unchanged, even when their table
+    # is removed from the merge's private header.
+    first, second = load('retained-first'), load('retained-second')
+    import copy
+    before = copy.deepcopy([first, second])
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: {'first': first, 'second': second}[str(path)])
+    parser.merge_sarif(['first', 'second'])
+    assert [first, second] == before
+
+
+@pytest.mark.parametrize('results', [[], [None], [{'ruleId': 'rule', 'level': 'error'}]],
+                         ids=['empty', 'malformed-row', 'explicit-fields'])
+def test_metrics_skip_unused_rule_index(monkeypatch, results):
+    import core.sarif.parser as parser
+
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: {
+        'runs': [{'tool': {'driver': {'name': 'tool', 'rules': [{'id': 'rule'}]}}, 'results': results}]
+    })
+
+    def unexpected_index(run):
+        pytest.fail('metrics built a rule index without an inherited field')
+
+    monkeypatch.setattr(parser, 'ResultRuleResolver', unexpected_index)
+    metrics = parser.generate_scan_metrics(['report'])
+    assert metrics['total_findings'] == len(results)
+    assert metrics['findings_by_rule'] == ({'rule': 1} if results and isinstance(results[0], dict) else {})
+
+
+def test_metrics_build_one_rule_index_per_run_when_inheritance_is_needed(monkeypatch):
+    import core.sarif.parser as parser
+
+    runs = [
+        {'tool': {'driver': {'name': 'tool', 'rules': [
+            {'id': rule_id, 'defaultConfiguration': {'level': level}},
+        ]}}, 'results': [{'ruleId': 'explicit', 'level': 'note'}, {'ruleIndex': 0}, {'ruleIndex': 0}]}
+        for rule_id, level in [('first', 'error'), ('second', 'warning')]
+    ]
+    original = parser.ResultRuleResolver
+    indexed = []
+
+    def build(run):
+        indexed.append(run)
+        return original(run)
+
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: {'runs': runs})
+    monkeypatch.setattr(parser, 'ResultRuleResolver', build)
+    metrics = parser.generate_scan_metrics(['report'])
+    assert indexed == runs
+    assert metrics['findings_by_rule'] == {'explicit': 2, 'first': 2, 'second': 2}
+    assert metrics['findings_by_severity'] == {'error': 2, 'warning': 2, 'note': 2, 'none': 0}
+
+
+@pytest.mark.parametrize('rules', [None, [], [None], [{'name': 'no-id'}]],
+                         ids=['null', 'empty', 'non-object', 'missing-id'])
+def test_legacy_merge_preserves_original_rule_table_until_a_valid_union_exists(monkeypatch, rules):
+    import copy
+    import core.sarif.parser as parser
+
+    first = {'tool': {'driver': {'name': 'tool', 'rules': rules, 'version': 'first'}}}
+    later = {'tool': {'driver': {'name': 'tool', 'rules': [{'id': 'valid'}], 'version': 'first'}}}
+    before = copy.deepcopy(first)
+    monkeypatch.setattr(parser, 'load_sarif', lambda path: {'runs': [first if str(path) == 'first' else later]})
+    assert parser.merge_sarif(['first'])['runs'][0]['tool'] == first['tool']
+    driver = parser.merge_sarif(['first', 'later'])['runs'][0]['tool']['driver']
+    assert driver == {'name': 'tool', 'rules': [{'id': 'valid'}], 'version': 'first'}
+    assert first == before
+
+
+@pytest.mark.parametrize('reference', [
+    {'rule': {'id': 'same', 'toolComponent': {'name': 'extension'}}},
+    {'rule': {'guid': 'rule-guid', 'toolComponent': {'guid': 'extension-guid'}}},
+    {'rule': {'index': 0, 'toolComponent': {'name': 'extension'}}},
+    {'rule': {'id': 'absent', 'toolComponent': {'name': 'extension'}}},
+], ids=['qualified-id', 'qualified-guid', 'indexed', 'negative'])
+def test_repeated_qualified_references_validate_once_without_retaining_results(monkeypatch, run, reference):
+    import copy
+    import gc
+    import weakref
+    import core.sarif.parser as parser
+
+    class Tracked(dict):
+        pass
+
+    original = parser.get_result_rule
+    calls = []
+
+    def validate(raw_run, result):
+        calls.append(1)
+        return original(raw_run, result)
+
+    expected = original(run, reference)
+    monkeypatch.setattr(parser, 'get_result_rule', validate)
+    resolver = parser.ResultRuleResolver(run)
+    references = []
+    for number in range(20):
+        result = Tracked(copy.deepcopy(reference), message={'text': str(number)})
+        references.append(weakref.ref(result))
+        assert resolver.resolve(result) == expected
+        del result
+    gc.collect(0)
+    assert all(ref() is None for ref in references)
+    assert len(calls) == 1
+
+
+def test_qualified_reference_cache_preserves_validation_boundaries(run):
+    import core.sarif.parser as parser
+
+    resolver = parser.ResultRuleResolver(run)
+    variants = [
+        {'rule': {'id': 'same'}},
+        {'rule': {'id': 'same', 'toolComponent': {}}},
+        {'rule': {'id': 'same', 'toolComponent': {'index': 0}}},
+        {'rule': {'id': 'same', 'toolComponent': {'index': False}}},
+        {'rule': {'id': 'same', 'index': 0, 'toolComponent': {'index': 0}}},
+        {'ruleIndex': 1, 'rule': {'id': 'same', 'index': 0, 'toolComponent': {'index': 0}}},
+        {'rule': {'guid': 'wrong', 'toolComponent': {'index': 0}}},
+        {'ruleId': 'wrong', 'rule': {'id': 'same', 'toolComponent': {'index': 0}}},
+        {'rule': {'id': 'same', 'toolComponent': {'index': 0, 'name': 'wrong'}}},
+        {'rule': {'id': 'same', 'toolComponent': {'index': 0, 'guid': 'wrong'}}},
+        {'rule': {'id': ['same'], 'toolComponent': {'index': 0}}},
+        {'rule': {'id': 'same', 'toolComponent': None}},
+        {'rule': {'index': -1}}, {'rule': {'index': 0}},
+        {'rule': {'index': None}}, {'rule': {'index': '0'}},
+    ]
+    for result in variants + list(reversed(variants)):
+        expected = parser.get_result_rule(run, result)
+        actual = resolver.resolve(result)
+        assert actual == expected, result
+        if expected:
+            assert actual is expected
+
+
+def test_qualified_reference_cache_is_bounded_and_run_owned(run):
+    import copy
+    import core.sarif.parser as parser
+
+    resolver = parser.ResultRuleResolver(run)
+    for number in range(1000):
+        result = {'rule': {'id': f'absent-{number}', 'toolComponent': {'index': 0}}}
+        assert resolver.resolve(result) == parser.get_result_rule(run, result)
+    assert len(resolver._references) == 256
+    oversized = {'rule': {'id': 'x' * 2048, 'toolComponent': {'index': 0}}}
+    fresh = parser.ResultRuleResolver(run)
+    assert fresh.resolve(oversized) == {}
+    assert fresh._references == {}
+    other_run = copy.deepcopy(run)
+    other_run['tool']['extensions'][0]['rules'][0]['name'] = 'other-run'
+    other = parser.ResultRuleResolver(other_run)
+    result = {'rule': {'id': 'same', 'toolComponent': {'index': 0}}}
+    assert resolver.resolve(result)['name'] == 'extension-rule'
+    assert other.resolve(result)['name'] == 'other-run'
+    # Callers may modify an unresolved return value without poisoning a miss.
+    fresh.resolve(result | {'ruleId': 'wrong'})['id'] = 'forged'
+    assert fresh.resolve(result | {'ruleId': 'wrong'}) == {}
+
+
+def test_fully_indexed_lookup_does_not_build_a_reference_cache_key(monkeypatch, run):
+    import core.sarif.parser as parser
+
+    resolver = parser.ResultRuleResolver(run)
+
+    def unexpected_key(result):
+        pytest.fail('constant-time indexed lookup built a cache key')
+
+    monkeypatch.setattr(resolver, '_reference_key', unexpected_key)
+    for result in [
+        {'ruleIndex': 0},
+        {'rule': {'index': 0, 'toolComponent': {'index': 0}}},
+        {'ruleId': 'wrong', 'rule': {'index': 0, 'toolComponent': {'index': 0}}},
+    ]:
+        assert resolver.resolve(result) == parser.get_result_rule(run, result)
+
+
+def test_parser_and_metrics_reuse_qualified_validation_independently(monkeypatch, tmp_path, run):
+    import json
+    import core.sarif.parser as parser
+
+    run['tool']['extensions'][0]['rules'][0]['defaultConfiguration'] = {'level': 'error'}
+    run['results'] = [
+        {'rule': {'guid': 'rule-guid', 'toolComponent': {'name': 'extension'}},
+         'message': {'text': f'finding-{number}'}}
+        for number in range(10)
+    ]
+    path = tmp_path / 'qualified.sarif'
+    path.write_text(json.dumps({'runs': [run]}))
+    original = parser.get_result_rule
+    calls = []
+
+    def validate(raw_run, result):
+        calls.append(1)
+        return original(raw_run, result)
+
+    monkeypatch.setattr(parser, 'get_result_rule', validate)
+    findings = parser.parse_sarif_findings(path)
+    metrics = parser.generate_scan_metrics([str(path)])
+    assert len(findings) == 10
+    assert {finding['level'] for finding in findings} == {'error'}
+    assert metrics['findings_by_rule'] == {'same': 10}
+    assert metrics['findings_by_severity']['error'] == 10
+    assert len(calls) == 2
+
+
+def test_artifact_resolver_caches_hits_and_misses_without_retaining_results():
+    import gc
+    import weakref
+    from core.sarif.parser import ArtifactUriResolver
+
+    class Tracked(dict):
+        pass
+
+    class Artifacts(list):
+        reads = 0
+
+        def __getitem__(self, index):
+            self.reads += 1
+            return super().__getitem__(index)
+
+    table = Artifacts([{'location': {'uri': 'source.c', 'uriBaseId': 'ROOT'}},
+                       {'location': {'index': 0}}])
+    result = Tracked(ruleId='rule')
+    run = Tracked(artifacts=table, originalUriBaseIds={'ROOT': {'uri': 'src/'}}, results=[result])
+    run_ref, result_ref = weakref.ref(run), weakref.ref(result)
+    resolver = ArtifactUriResolver(run)
+    del run, result
+    gc.collect(0)
+    assert run_ref() is None and result_ref() is None
+    assert resolver.resolve({'uri': 'explicit.c', 'index': 0}) == 'explicit.c'
+    assert table.reads == 0
+    for _ in range(10):
+        assert resolver.resolve({'index': 0}) == 'src/source.c'
+        assert resolver.resolve({'index': 1}) is None
+    assert table.reads == 2
+
+
+def test_resolved_rule_metadata_is_cached_with_the_run(monkeypatch, run):
+    import core.sarif.parser as parser
+
+    descriptor = run['tool']['extensions'][0]['rules'][0]
+    descriptor['properties'] = {'cwe': ['CWE-89']}
+    descriptor['defaultConfiguration'] = {'level': 'error'}
+    original = parser._extract_cwe_from_rule
+    reads = []
+
+    def extract(rule):
+        reads.append(1)
+        return original(rule)
+
+    monkeypatch.setattr(parser, '_extract_cwe_from_rule', extract)
+    resolver = parser.ResultRuleResolver(run)
+    reference = {'rule': {'index': 0, 'toolComponent': {'index': 0}}}
+    metadata = resolver.metadata(resolver.resolve(reference))
+    for _ in range(10):
+        assert resolver.metadata(resolver.resolve(reference)) == metadata
+    assert metadata[:2] == ('CWE-89', 'error')
+    assert metadata[2] is not None
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize('relationships', [None, True, 4, 'invalid', {'invalid': True}],
+                         ids=['null', 'bool', 'integer', 'string', 'object'])
+def test_malformed_relationship_arrays_do_not_break_rule_metadata(relationships):
+    from core.sarif.parser import ResultRuleResolver
+
+    rule = {'id': 'rule', 'relationships': relationships}
+    resolver = ResultRuleResolver({'tool': {'driver': {'rules': [rule]}}})
+    assert resolver.metadata(resolver.resolve({'ruleId': 'rule'})) == (None, None, None)

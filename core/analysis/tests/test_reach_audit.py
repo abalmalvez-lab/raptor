@@ -1,0 +1,386 @@
+"""Reachability audit harness + committed synthetic dead-code corpus.
+
+This is the CI regression gate for the reachability substrate: a small,
+generic, multi-shape corpus of dead and live functions (no relation to any
+external corpus — deprecation stubs, disabled guards, orphans, framework
+handlers). The harness classifies each and the test asserts:
+
+  * coverage == 1.0   — every labelled-dead function is caught, and
+  * false_suppress == 0 — no labelled-live function is wrongly called dead
+    (the false-negative-critical contract).
+
+The Python corpus runs everywhere (stdlib ast). The C dead-island case is
+gated on tree-sitter-c (the call graph it needs), exercising the
+no_path_from_entry witness where the grammar is present.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from core.analysis.reach_audit import audit_corpus, classify_reachability, set_joern_server
+
+
+def _write(root: Path, rel: str, body: str) -> None:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body)
+
+
+def _python_corpus(root: Path) -> dict:
+    # live: called from main / framework handler. dead: orphan / disabled
+    # module / always-false guard.
+    _write(root, "app/main.py",
+           "from app.handlers import live_handler\n"
+           "def main():\n"
+           "    return live_handler(1)\n")
+    _write(root, "app/handlers.py",
+           "def live_handler(x):\n"
+           "    return x + 1\n"
+           "def orphan(x):\n"
+           "    return x - 1\n")
+    _write(root, "app/disabled.py",
+           "raise ImportError('module retired')\n"
+           "def vuln_below(cmd):\n"
+           "    import os; os.system(cmd)\n")
+    _write(root, "app/legacy.py",
+           "if False:\n"
+           "    def dead_guarded(x):\n"
+           "        return x\n"
+           "def used_here():\n"
+           "    return dead_guarded(1)\n")  # references the guarded name
+    _write(root, "app/api.py",
+           "from flask import Flask\n"
+           "app = Flask(__name__)\n"
+           "@app.route('/x')\n"
+           "def route_handler():\n"
+           "    return 'ok'\n")
+    return {
+        ("app/main.py", "main"): "live",
+        ("app/handlers.py", "live_handler"): "live",
+        ("app/handlers.py", "orphan"): "dead",
+        ("app/disabled.py", "vuln_below"): "dead",
+        ("app/legacy.py", "dead_guarded"): "dead",
+        ("app/api.py", "route_handler"): "live",
+    }
+
+
+def test_python_corpus_full_coverage_zero_false_suppress(tmp_path):
+    labels = _python_corpus(tmp_path)
+    report = audit_corpus(str(tmp_path), labels)
+    assert report.false_suppress == 0, (
+        f"live functions wrongly called dead: {report.false_suppress_detail}"
+    )
+    assert report.coverage == 1.0, (
+        f"dead functions missed: {report.missed_detail}"
+    )
+
+
+def test_c_dead_island_caught(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    # static helper reachable only via a static peer that is itself
+    # referenced solely from an unread (static) function-pointer table —
+    # an orphaned dead-island. A non-static function is a live entry.
+    _write(tmp_path, "m.c",
+           "static int read_be(const unsigned char *p){ return p[0]; }\n"
+           "static int parse(const unsigned char *p){ return read_be(p); }\n"
+           "static int (*const table[])(const unsigned char *) = { parse };\n"
+           "int public_api(const unsigned char *p){ return p[1]; }\n")
+    labels = {
+        ("m.c", "read_be"): "dead",
+        ("m.c", "parse"): "dead",
+        ("m.c", "public_api"): "live",
+    }
+    report = audit_corpus(str(tmp_path), labels)
+    assert report.false_suppress == 0, report.false_suppress_detail
+    assert report.coverage == 1.0, report.missed_detail
+    # specifically the dead-island verdict, not just "not_called"
+    assert report.per_verdict.get("no_path_from_entry", 0) >= 1
+
+
+def test_missing_function_is_not_found_not_false_suppress(tmp_path):
+    # A labelled function that the extractor never produced is an
+    # extraction gap, not a reachability misclassification — it must land
+    # in not_found, never in false_suppress (which would falsely fail the
+    # FN gate).
+    _write(tmp_path, "m.py", "def real(): pass\n")
+    report = audit_corpus(str(tmp_path), {
+        ("m.py", "ghost"): "live",   # never extracted
+        ("m.py", "real"): "dead",
+    })
+    assert report.false_suppress == 0
+    assert report.not_found == 1
+    assert ("m.py", "ghost") in report.not_found_detail
+
+
+def test_label_dead_means_statically_dead_not_deployment_isolated(tmp_path):
+    # Boundary doc: "dead" labels mean STATICALLY unreachable. Code that
+    # genuinely runs but is excluded from a deployment (e.g. a non-static C
+    # helper that another TU could link, or Go init() that runs at load)
+    # is correctly "reachable" — the substrate doesn't model deployment
+    # isolation (operator knowledge). Here: a non-static C function is an
+    # entry, so it's reachable, not a coverage miss.
+    pytest.importorskip("tree_sitter_c")
+    _write(tmp_path, "lib.c",
+           "int linkable(int x){ return x; }\n")  # non-static = entry
+    report = audit_corpus(str(tmp_path), {("lib.c", "linkable"): "live"})
+    assert report.false_suppress == 0
+    assert report.live_ok == 1
+
+
+def test_classify_precedence_module_abort_wins(tmp_path):
+    # A function below a top-level abort classifies module_aborts even if
+    # it also reads as called by a peer.
+    _write(tmp_path, "d.py",
+           "raise ImportError('x')\n"
+           "def a():\n"
+           "    return b()\n"
+           "def b():\n"
+           "    return a()\n")
+    import tempfile
+    from core.inventory.builder import build_inventory
+    with tempfile.TemporaryDirectory() as td:
+        inv = build_inventory(str(tmp_path), td)
+    assert classify_reachability(inv, "d.py", "a", 2, "d") == "module_aborts"
+
+
+def test_classify_build_excluded_whole_file():
+    # A build-excluded file (e.g. Go //go:build ignore): every function is
+    # dead, even `main` / `init` which are normally Go entries. Synthetic
+    # inventory keeps this tree-sitter-independent.
+    inv = {"files": [{
+        "path": "go/gen.go", "language": "go",
+        "build_excluded": {"line": 1, "summary": "//go:build ignore"},
+        "items": [{"name": "main", "kind": "function",
+                   "line_start": 3, "line_end": 5}],
+    }]}
+    assert classify_reachability(
+        inv, "go/gen.go", "main", 3, "go.gen") == "build_excluded"
+
+
+def test_classify_sound_witness_beats_build_excluded():
+    # When a function sits below a (sound) module-abort in a file that is ALSO
+    # build-excluded, the sound verdict wins — it can hard-suppress, whereas
+    # build_excluded is heuristic. (A Go file with both a `func init(){panic}`
+    # and a build constraint: functions below the init-panic read
+    # module_aborts; init itself / functions above read build_excluded.)
+    inv = {"files": [{
+        "path": "go/m.go", "language": "go",
+        "module_aborts_on_load": {"line": 2, "summary": "func init(){panic}"},
+        "build_excluded": {"line": 1, "summary": "//go:build ignore"},
+        "items": [{"name": "sink", "kind": "function", "line_start": 4}],
+    }]}
+    assert classify_reachability(
+        inv, "go/m.go", "sink", 4, "go.m") == "module_aborts"
+
+
+class _FakeJoernServer:
+    def __init__(self, raw_output="", errors=None, alive=True):
+        self._raw_output = raw_output
+        self._errors = errors or []
+        self._alive = alive
+
+    def is_alive(self):
+        return self._alive
+
+    def query(self, cpgql, *, timeout=30, validate=False):
+        class _Result:
+            pass
+        r = _Result()
+        r.raw_output = self._raw_output
+        r.errors = self._errors
+        return r
+
+
+class TestJoernCallerOverride:
+    """When Joern finds callers for a not_called function, the verdict
+    should be 'called' instead of 'not_called'."""
+
+    def _make_inventory(self, tmp_path):
+        _write(tmp_path, "src/handler.py", (
+            "def dispatch():\n"
+            "    pass\n"
+            "\n"
+            "def orphan():\n"
+            "    pass\n"
+        ))
+        import tempfile
+        from core.inventory.builder import build_inventory
+        with tempfile.TemporaryDirectory() as td:
+            return build_inventory(str(tmp_path), td)
+
+    def test_not_called_without_joern(self, tmp_path):
+        inv = self._make_inventory(tmp_path)
+        verdict = classify_reachability(
+            inv, "src/handler.py", "orphan", 4, "src.handler",
+        )
+        assert verdict in ("not_called", "uncertain")
+
+    def test_joern_override_rescues_not_called(self, tmp_path):
+        inv = self._make_inventory(tmp_path)
+        stdout = 'JOERN_CALLER:{"caller":"main","file":"src/main.py","line":10,"code":"orphan()"}'
+        server = _FakeJoernServer(raw_output=stdout)
+        set_joern_server(server)
+        try:
+            verdict = classify_reachability(
+                inv, "src/handler.py", "orphan", 4, "src.handler",
+            )
+            assert verdict == "called"
+        finally:
+            set_joern_server(None)
+
+    def test_joern_no_callers_stays_not_called(self, tmp_path):
+        inv = self._make_inventory(tmp_path)
+        server = _FakeJoernServer(raw_output="")
+        set_joern_server(server)
+        try:
+            verdict = classify_reachability(
+                inv, "src/handler.py", "orphan", 4, "src.handler",
+            )
+            assert verdict in ("not_called", "uncertain")
+        finally:
+            set_joern_server(None)
+
+    def test_set_clear_lifecycle(self):
+        server = _FakeJoernServer()
+        set_joern_server(server)
+        set_joern_server(None)
+
+
+def test_module_abort_record_without_line_does_not_suppress():
+    # A module_aborts record missing its line field must NOT suppress:
+    # defaulting the line to 0 made every function in the file read
+    # "below" the abort — a SOUND witness firing on malformed evidence.
+    inv = {"files": [{
+        "path": "go/m.go", "language": "go",
+        "module_aborts_on_load": {"summary": "func init(){panic}"},
+        "items": [{"name": "sink", "kind": "function", "line_start": 4}],
+    }]}
+    assert classify_reachability(
+        inv, "go/m.go", "sink", 4, "go.m") != "module_aborts"
+
+
+def test_module_abort_zero_line_record_does_not_suppress():
+    inv = {"files": [{
+        "path": "go/m.go", "language": "go",
+        "module_aborts_on_load": {"line": 0, "summary": "x"},
+        "items": [{"name": "sink", "kind": "function", "line_start": 4}],
+    }]}
+    assert classify_reachability(
+        inv, "go/m.go", "sink", 4, "go.m") != "module_aborts"
+
+
+def test_module_abort_lineless_query_resolves_item_span():
+    # Callers that don't know the function's line (line=0) still get
+    # the witness when the item's own line_start proves it binds below
+    # the abort — the witness used to be disabled for line-less
+    # queries entirely.
+    inv = {"files": [{
+        "path": "go/m.go", "language": "go",
+        "module_aborts_on_load": {"line": 2, "summary": "panic"},
+        "items": [{"name": "sink", "kind": "function", "line_start": 4}],
+    }]}
+    assert classify_reachability(
+        inv, "go/m.go", "sink", 0, "go.m") == "module_aborts"
+
+
+def test_module_abort_lineless_query_ambiguous_namesakes_declines():
+    # Two same-name items straddling the abort: with no line we can't
+    # know which one the caller means — refuse to suppress.
+    inv = {"files": [{
+        "path": "go/m.go", "language": "go",
+        "module_aborts_on_load": {"line": 5, "summary": "panic"},
+        "items": [
+            {"name": "dup", "kind": "function", "line_start": 2},
+            {"name": "dup", "kind": "function", "line_start": 8},
+        ],
+    }]}
+    assert classify_reachability(
+        inv, "go/m.go", "dup", 0, "go.m") != "module_aborts"
+
+
+# ---------------------------------------------------------------------------
+# _lookup_class_name — finding-line disambiguation
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_class_name_matches_finding_interior_line():
+    """Production callers (the /agentic chokepoint via _finding_coords)
+    pass the line OF THE FINDING — inside the function, not its first
+    line. Exact line_start equality never matched those, so class_name
+    resolved to None and methods lost class-qualified 1-hop resolution.
+    The lookup now routes through the shared _select_item_by_line
+    heuristic."""
+    from core.analysis.reach_audit import _lookup_class_name
+    inventory = {
+        "files": [{
+            "path": "src/svc.py",
+            "items": [
+                {"name": "handle", "kind": "function",
+                 "line_start": 10, "line_end": 30,
+                 "metadata": {"class_name": "Alpha"}},
+                {"name": "handle", "kind": "function",
+                 "line_start": 40, "line_end": 60,
+                 "metadata": {"class_name": "Beta"}},
+            ],
+        }],
+    }
+    # Interior finding lines resolve to the enclosing definition.
+    assert _lookup_class_name(inventory, "src/svc.py", "handle", 17) == "Alpha"
+    assert _lookup_class_name(inventory, "src/svc.py", "handle", 45) == "Beta"
+    # line_start itself still matches (the old exact-equality case).
+    assert _lookup_class_name(inventory, "src/svc.py", "handle", 40) == "Beta"
+    # line == 0 keeps the first-candidate fallback.
+    assert _lookup_class_name(inventory, "src/svc.py", "handle", 0) == "Alpha"
+
+
+def test_module_derivation_miss_routes_to_not_found():
+    """A labelled row whose path derives no module must join the
+    not_found bucket — silently skipping it shrank total, coverage
+    AND the false-suppress denominator without trace."""
+    from core.analysis.reach_audit import audit_corpus
+    inv = {"files": [{"path": "bin/tool", "items": [
+        {"name": "main", "line_start": 1, "kind": "function"},
+    ], "call_graph": {"calls": [], "imports": {}}}]}
+    report = audit_corpus(
+        "/nonexistent", {("bin/tool", "main"): "live"}, inventory=inv,
+    )
+    assert report.total == 0
+    assert report.not_found == 1
+    assert ("bin/tool", "main") in report.not_found_detail
+
+
+def test_duplicated_name_scores_worst_variant():
+    """Two same-name items in one file: a live-labelled row must
+    count as false-suppress when ANY variant classifies dead —
+    last-wins line lookup measured an arbitrary variant."""
+    from unittest import mock
+
+    import core.analysis.reach_audit as ra
+    inv = {"files": [{"path": "pkg/mod.py", "items": [
+        {"name": "f", "line_start": 1, "kind": "function"},
+        {"name": "f", "line_start": 30, "kind": "function"},
+    ], "call_graph": {"calls": [], "imports": {}}}]}
+
+    def fake_classify(inventory, rel, name, line, module):
+        # First variant reads live, the OTHER reads dead.
+        return "reachable" if line == 1 else "lexical_dead"
+
+    with mock.patch.object(
+            ra, "classify_reachability", side_effect=fake_classify):
+        report = ra.audit_corpus(
+            "/nonexistent", {("pkg/mod.py", "f"): "live"},
+            inventory=inv,
+        )
+    assert report.false_suppress == 1
+    # And a dead label is caught only when EVERY variant reads dead.
+    with mock.patch.object(
+            ra, "classify_reachability", side_effect=fake_classify):
+        report = ra.audit_corpus(
+            "/nonexistent", {("pkg/mod.py", "f"): "dead"},
+            inventory=inv,
+        )
+    assert report.missed_dead == 1
+    assert report.caught_dead == 0

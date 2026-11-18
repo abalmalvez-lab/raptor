@@ -1,5 +1,6 @@
 ---
 description: Save a custom approach as a reusable skill
+dispatch: skill
 ---
 
 # /create-skill - Save Custom Approach as Reusable Skill
@@ -63,6 +64,8 @@ Session impact: +___ tokens when auto-loaded
 
 ### Step 5: Create Skill File
 
+**Confirm before writing.** Show the skill preview and take the operator's confirmation (`Create this skill? [Y/n/Customize]`, as in the example below). The preview is LLM-authored from session content — in a scan session that carries target-derived text — so render it with non-printables escaped and bound long excerpts with an explicit elision marker (CLAUDE.md § INTERACTIVE PROMPTS display integrity).
+
 Save to: `.claude/skills/[skill_name]/SKILL.md` (the
 canonical Claude Code skills directory). For
 single-file skills, `.claude/skills/[skill_name].md`
@@ -74,9 +77,9 @@ That path is from an earlier RAPTOR layout that
 predates Claude Code's skills mechanism — files there
 aren't auto-loaded by Claude Code today, so saving
 new skills there would have made them invisible to
-the LLM. Existing files under `tiers/personas/` and
-`tiers/specialists/` are still loaded VIA EXPLICIT
-prompts, but new skills should go under
+the LLM. Existing files under `tiers/personas/` are
+still loaded via explicit prompts and via the Python
+methodology loader, but new skills should go under
 `.claude/skills/` for auto-load.)
 
 **Skill structure:**
@@ -114,7 +117,7 @@ Verify skill will auto-load correctly:
 **Skill size limits:**
 - Minimum: 200 tokens (enough for useful content)
 - Recommended: 300-400 tokens (sweet spot)
-- Maximum: 500 tokens (hard limit, enforced)
+- Maximum: 500 tokens (hard limit — keep to it; not mechanically enforced)
 
 **Total skills warning:**
 - Yellow (5 skills): 1,500-2,000 tokens in skills

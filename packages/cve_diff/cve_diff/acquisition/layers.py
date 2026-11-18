@@ -33,15 +33,19 @@ drops it from Phase 1.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from core.git import clone_repository, fetch_commit, get_safe_git_env
 from core.git.clone import safe_git_command
 
 from cve_diff.core.exceptions import AcquisitionError
-from cve_diff.core.models import RepoRef
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cve_diff.core.models import RepoRef
+    from pathlib import Path
 
 PROGRESSIVE_DEPTHS: tuple[int, ...] = (100, 500)
 TARGETED_DEPTH = 5
@@ -91,7 +95,8 @@ def _clean_dest(dest: Path) -> None:
     a programming error, not a transient failure.
     """
     if not dest.is_absolute() or len(dest.parts) < 3:
-        raise ValueError(f"_clean_dest refusing dangerous path: {dest!r}")
+        msg = f"_clean_dest refusing dangerous path: {dest!r}"
+        raise ValueError(msg)
     # Single lstat() instead of three separate stat-class calls.
     # Pre-fix `is_symlink()` + `exists()` + `is_dir()` was three
     # syscalls with TOCTOU windows between each: a writer could
@@ -105,32 +110,56 @@ def _clean_dest(dest: Path) -> None:
     except FileNotFoundError:
         return  # No-op when dest doesn't exist
     if _stat.S_ISLNK(st.st_mode):
-        raise ValueError(f"_clean_dest refusing symlink: {dest!r}")
+        msg = f"_clean_dest refusing symlink: {dest!r}"
+        raise ValueError(msg)
     if not _stat.S_ISDIR(st.st_mode):
         # `iterdir()` raises NotADirectoryError on regular files.
         # Refuse explicitly so the error is structured.
-        raise ValueError(f"_clean_dest refusing non-directory: {dest!r}")
+        msg = f"_clean_dest refusing non-directory: {dest!r}"
+        raise ValueError(msg)
     if any(dest.iterdir()):
-        # Use absolute path + sanitised env. Pre-fix the bare `rm`
-        # was resolved via PATH — a hostile PATH entry (a CI
-        # environment with `.` early in PATH, an operator-poisoned
-        # ~/.bashrc) could shadow `/usr/bin/rm` with an attacker
-        # binary that the destructive operation then ran.
-        # `shutil.which("rm")` resolves once at module use-time
-        # (not import — keeps the cost off the import critical
-        # path); fallback to `/usr/bin/rm` keeps the operation
-        # working on hosts where shutil.which trips on a weird
-        # PATH config. `env=` to a stripped environment so the
-        # subprocess can't pick up LD_PRELOAD / LD_LIBRARY_PATH /
-        # other code-injection vectors via the parent's env.
+        # ``shutil.rmtree`` rather than spawning ``rm -rf`` via
+        # subprocess. Pre-fix this path was a guarded subprocess
+        # invocation defending against PATH hijack on the ``rm``
+        # binary; that defence is moot once we delegate to the
+        # standard library. shutil.rmtree() is also cheaper (no fork
+        # / exec) and portable.
+        #
+        # On read-only files inside ``dest`` shutil.rmtree raises
+        # ``PermissionError``. ``onerror=`` chmods + retries — same
+        # end-state as ``rm -rf``. Any residual failure is swallowed
+        # by the callback's inner ``except OSError: pass``, so the
+        # rmtree call as a whole stays best-effort and never raises
+        # to the caller — matching the original subprocess(
+        # check=False, capture_output=True) contract that several
+        # callers rely on (e.g. error-path cleanup where the dest
+        # may be in an indeterminate state and raising would mask
+        # the original failure).
+        #
+        # Outer-level guard: a defensive try/except OSError around
+        # the call itself catches the unlikely shape where
+        # ``shutil.rmtree`` raises before reaching the per-entry
+        # walk (e.g. scandir on ``dest`` itself fails after the
+        # lstat guards above pass — racy concurrent-rename
+        # scenario). Best-effort intent preserved end to end.
         import shutil
-        rm_bin = shutil.which("rm") or "/usr/bin/rm"
-        from core.config import RaptorConfig
-        subprocess.run(
-            [rm_bin, "-rf", str(dest)],
-            capture_output=True, check=False, timeout=60,
-            env=RaptorConfig.get_safe_env(),
-        )
+        import stat as _stat_mod
+
+        def _force_remove(func, path, _exc) -> None:
+            try:
+                os.chmod(path, _stat_mod.S_IWRITE | _stat_mod.S_IREAD)
+                func(path)
+            except OSError:
+                pass
+
+        try:
+            shutil.rmtree(dest, onerror=_force_remove)
+        except OSError:
+            # ``onerror`` should have caught per-entry failures; we
+            # only reach here on rmtree's own front-of-walk error
+            # (rare). Swallow to preserve the legacy fire-and-forget
+            # contract of the subprocess-based predecessor.
+            pass
 
 
 @dataclass
@@ -178,6 +207,16 @@ class TargetedFetchLayer(AcquisitionLayer):
                     self.name, False,
                     f"fetch {sha[:12]}: {str(e)[:200]}",
                 )
+            except subprocess.TimeoutExpired:
+                # fetch_commit documents TimeoutExpired propagating
+                # unchanged. A slow/hung remote is a per-layer failure —
+                # the cascade must fall through to the next layer (and
+                # ultimately the API extractors), not abort the whole
+                # run with a raw exception.
+                return LayerReport(
+                    self.name, False,
+                    f"fetch {sha[:12]}: timed out",
+                )
 
         if not _commit_exists(dest, ref.fix_commit):
             return LayerReport(
@@ -208,6 +247,11 @@ class ShallowCloneLayer(AcquisitionLayer):
                 )
             except RuntimeError as e:
                 last_err = str(e)[:200]
+                continue
+            except subprocess.TimeoutExpired:
+                # Same contract as fetch_commit above: a clone timeout
+                # is a per-depth failure, not a run-aborting exception.
+                last_err = f"clone timed out @ depth={depth}"
                 continue
             if _commit_exists(dest, ref.fix_commit):
                 return LayerReport(self.name, True, f"depth={depth}")
@@ -260,6 +304,11 @@ class FullCloneLayer(AcquisitionLayer):
             return LayerReport(self.name, False, f"validation: {e}")
         except RuntimeError as e:
             return LayerReport(self.name, False, str(e)[:200])
+        except subprocess.TimeoutExpired:
+            # Full-history clones are the most timeout-prone tier;
+            # surface as a layer failure so the cascade's error rolls
+            # up as AcquisitionError (which the pipeline handles).
+            return LayerReport(self.name, False, "clone timed out")
         if _commit_exists(dest, ref.fix_commit):
             return LayerReport(self.name, True, "")
         return LayerReport(self.name, False, "fix_commit missing after full clone")

@@ -1,0 +1,129 @@
+// unsafe_list_del.cocci — Find list iteration + deletion without _safe.
+//
+// The pattern: list_for_each_entry is used to iterate, but the loop
+// body removes the current entry (list_del / list_del_init /
+// hlist_del). These helpers unlink or reinitialise links; they do not
+// themselves free the entry. Review cursor identity, saved-link repairs
+// and whether iteration advances before confirming traversal corruption.
+//
+// The head is an expression metavariable: real call sites
+// overwhelmingly spell it `&obj->list` / `&global_list` (an
+// identifier binding matched none of them and left the rule dark on
+// the dominant shape). The delete arms are anchored to the CURSOR
+// via the iteration member — deleting a different node does not
+// invalidate this traversal, so un-anchored `list_del(...)` arms
+// would flag safe non-cursor deletions at verification grade.
+//
+// Covers CWE-416 / CWE-119: use-after-free via unsafe list deletion.
+// Reassignment of the cursor can repair the next iteration; this pattern
+// does not establish the value used by the iterator update.
+// @role: detection
+// raptor: confirm-only
+
+// `exists`: the deletion only needs to happen on SOME path through the
+// loop body (the common shape is a conditional delete); forall-path
+// dots would require a delete on EVERY path and miss it. The trailing
+// break/return/goto guards keep delete-then-leave-the-loop shapes
+// silent — the invalidated cursor is only a bug if iteration continues.
+@unsafe_del_fwd exists@
+iterator name list_for_each_entry;
+identifier cursor, member, lbl;
+expression head;
+position p_del;
+@@
+
+list_for_each_entry(cursor, head, member)
+{
+  ...
+(
+  list_del@p_del(&cursor->member)
+|
+  list_del_init@p_del(&cursor->member)
+|
+  hlist_del@p_del(&cursor->member)
+|
+  hlist_del_init@p_del(&cursor->member)
+)
+  ... when != break;
+      when != return ...;
+      when != goto lbl;
+}
+
+@script:python depends on unsafe_del_fwd@
+p_del << unsafe_del_fwd.p_del;
+cursor << unsafe_del_fwd.cursor;
+@@
+
+import json, sys
+for _p in p_del:
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column),
+           "line_end": int(_p.line_end), "col_end": int(_p.column_end),
+           "rule": "unsafe_list_del",
+           "message": "list_del inside non-_safe iteration over '%s' — review cursor identity, link repair and next-iteration reachability" % cursor}
+    sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
+
+@unsafe_del_rev exists@
+iterator name list_for_each_entry_reverse;
+identifier cursor, member, lbl;
+expression head;
+position p_del;
+@@
+
+list_for_each_entry_reverse(cursor, head, member)
+{
+  ...
+(
+  list_del@p_del(&cursor->member)
+|
+  list_del_init@p_del(&cursor->member)
+)
+  ... when != break;
+      when != return ...;
+      when != goto lbl;
+}
+
+@script:python depends on unsafe_del_rev@
+p_del << unsafe_del_rev.p_del;
+cursor << unsafe_del_rev.cursor;
+@@
+
+import json, sys
+for _p in p_del:
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column),
+           "line_end": int(_p.line_end), "col_end": int(_p.column_end),
+           "rule": "unsafe_list_del",
+           "message": "list_del inside non-_safe reverse iteration over '%s' — review cursor identity, link repair and next-iteration reachability" % cursor}
+    sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")
+
+@unsafe_del_hlist exists@
+iterator name hlist_for_each_entry;
+identifier cursor, member, lbl;
+expression head;
+position p_del;
+@@
+
+hlist_for_each_entry(cursor, head, member)
+{
+  ...
+(
+  hlist_del@p_del(&cursor->member)
+|
+  hlist_del_init@p_del(&cursor->member)
+)
+  ... when != break;
+      when != return ...;
+      when != goto lbl;
+}
+
+@script:python depends on unsafe_del_hlist@
+p_del << unsafe_del_hlist.p_del;
+cursor << unsafe_del_hlist.cursor;
+@@
+
+import json, sys
+for _p in p_del:
+    _m = {"file": _p.file, "line": int(_p.line), "col": int(_p.column),
+           "line_end": int(_p.line_end), "col_end": int(_p.column_end),
+           "rule": "unsafe_list_del",
+           "message": "hlist_del inside non-_safe iteration over '%s' — review cursor identity, link repair and next-iteration reachability" % cursor}
+    sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")

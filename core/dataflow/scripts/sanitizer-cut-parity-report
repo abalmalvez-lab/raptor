@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""CLI shim for the sanitizer-cut parity baseline report generator.
+
+Prints the Markdown report to stdout. Optional --report-format exports
+require an explicit --report-output destination.
+
+Set ``RAPTOR_SANITIZER_CUT=1`` so the value-bound gate is consulted
+(the baseline's sanitizer-cut fixtures need the flag on to suppress).
+
+Dev-tooling only — not invoked by the LLM-driven RAPTOR workflows.
+Co-located with ``core/dataflow/`` (the module it operates on) rather
+than ``libexec/`` (which is reserved for framework-internal shims).
+
+The libexec ``_RAPTOR_TRUSTED`` guard previously gated invocation —
+removed for consistency with the sibling corpus-run / corpus-metrics
+scripts: this class is openly invocable by developers, and the guard
+was defensible only under the "internal dispatch script" framing
+libexec implies.
+"""
+from pathlib import Path
+import sys
+
+# Derive import authority from this developer entry point, not ambient input.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from core.dataflow.parity_report_completion import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

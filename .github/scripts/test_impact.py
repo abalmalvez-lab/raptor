@@ -1,0 +1,703 @@
+"""Evaluate file-level test impact analysis.
+
+Builds the import graph, computes affected test files from a changeset,
+and reports what would run vs what the current tier system runs.  Use
+this to evaluate whether file-level selection can replace tier-based
+test dispatch.
+
+Usage:
+    # What tests would a specific file change trigger?
+    python3 .github/scripts/test_impact.py core/config/__init__.py
+
+    # What tests does the current working-tree diff need?
+    python3 .github/scripts/test_impact.py --diff
+
+    # What tests does a range of commits need?
+    python3 .github/scripts/test_impact.py --diff origin/main..HEAD
+
+    # Compare file-level vs tier-level selection
+    python3 .github/scripts/test_impact.py --diff --compare
+
+    # Show the full affected-file closure (not just tests)
+    python3 .github/scripts/test_impact.py --diff --closure
+
+    # JSON output for tooling
+    python3 .github/scripts/test_impact.py --diff --json
+
+    # Skip graph cache (force rebuild)
+    python3 .github/scripts/test_impact.py --diff --no-cache
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json as json_mod
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from codeql_scope import (
+    build_graph,
+    discover_py_files,
+    init_imports,
+    transitive_dependents,
+)
+from test_scope import (
+    TIERS,
+    build_data_file_map,
+    expand_conftest,
+    file_in_fast_tier,
+    file_matches_tier,
+    is_test_file,
+    resolve_test_drivers,
+    with_private_test_drivers,
+    script_reference_seeds,
+)
+
+_EXTRA_ROOTS = (".github",)
+
+
+def _env_groups_from_tiers() -> dict[str, dict[str, str]]:
+    """Derive environment groups from TIERS metadata."""
+    groups: dict[str, dict[str, str]] = {}
+    for tier_config in TIERS.values():
+        env = tier_config.get("env")
+        if not env:
+            continue
+        groups[env] = {
+            "dirs": tier_config.get("test_dirs", []),
+            "reason": tier_config.get("env_reason", ""),
+        }
+    return groups
+
+
+def classify_env(path: Path, env_groups: dict[str, dict]) -> str:
+    """Map a test file to its environment group."""
+    s = str(path)
+    for group, cfg in env_groups.items():
+        for d in cfg["dirs"]:
+            if s == d or s.startswith(d + "/"):
+                return group
+    return "standard"
+
+
+def get_changed_files_from_diff(diff_spec: str | None) -> list[str]:
+    """Get changed files from git diff (staged + unstaged)."""
+    cmd = ["git", "diff", "--name-only", "-z"]
+    if diff_spec:
+        cmd.append(diff_spec)
+    else:
+        cmd.append("HEAD")
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        print(f"git diff failed: {result.stderr.decode(errors='replace')}", file=sys.stderr)
+        sys.exit(1)
+    return [raw.decode("utf-8", errors="surrogateescape")
+            for raw in result.stdout.split(b"\0") if raw]
+
+
+def tier_for_file(path: Path) -> str | None:
+    """Which CI tier would run this test file?"""
+    for tier_name, tier_config in TIERS.items():
+        if file_matches_tier(path, tier_config):
+            return tier_name
+    if file_in_fast_tier(path):
+        return "python (fast)"
+    return None
+
+
+def tier_test_count(
+    repo: Path,
+    slow_files: set[Path],
+) -> dict[str, int]:
+    """Count total non-slow test files per tier."""
+    counts: dict[str, int] = defaultdict(int)
+    files = [p for p in discover_py_files(repo, extra_roots=_EXTRA_ROOTS)
+             if is_test_file(p)]
+    for p in resolve_test_drivers(files, repo):
+        if p in slow_files:
+            continue
+        tier = tier_for_file(p)
+        if tier:
+            counts[tier] += 1
+    return dict(counts)
+
+
+# -- Slow-test detection --------------------------------------------------
+
+def _is_entirely_slow(path: Path, repo: Path) -> bool:
+    """True if a test file is module-level marked as slow.
+
+    Detects ``pytestmark = pytest.mark.slow`` and list forms like
+    ``pytestmark = [pytest.mark.slow, ...]``.
+    """
+    try:
+        source = (repo / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if "slow" not in source:
+        return False
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except (SyntaxError, ValueError):
+        return False
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "pytestmark"
+            for t in node.targets
+        ):
+            continue
+        val_src = ast.get_source_segment(source, node.value) or ""
+        if "slow" in val_src:
+            return True
+    return False
+
+
+def detect_slow_files(test_files: list[Path], repo: Path) -> set[Path]:
+    """Return the subset that are entirely slow-marked."""
+    return {f for f in test_files if _is_entirely_slow(f, repo)}
+
+
+# -- Graph caching ---------------------------------------------------------
+
+def _cache_path(repo: Path) -> Path | None:
+    """Per-user cache file, or None when caching must be disabled.
+
+    The cache used to live at a predictable world-shared /tmp path —
+    on a multi-user host another local user could squat the filename
+    (blocking writes) or plant a cache whose reverse_graph hides
+    dependents, silently under-selecting tests for a developer's
+    --diff run (the fingerprint is computable from a world-readable
+    checkout). A 0700 per-uid directory closes both; if the directory
+    is squatted by another uid, run uncached rather than trust it.
+    """
+    base = Path(tempfile.gettempdir()) / f"raptor-test-impact-{os.getuid()}"
+    try:
+        base.mkdir(mode=0o700, exist_ok=True)
+        st = base.stat()
+        if st.st_uid != os.getuid() or base.is_symlink() or st.st_mode & 0o077:
+            return None
+    except OSError:
+        return None
+    repo_hash = hashlib.md5(os.fsencode(repo)).hexdigest()[:12]
+    return base / f"graph-{repo_hash}.json"
+
+
+def _files_fingerprint(py_files: list[Path], repo: Path) -> str:
+    """Key source contents and graph-building rules, even when mtimes survive."""
+    digest = hashlib.sha256()
+    digest.update((sys.implementation.name + ":" + sys.version + "\0").encode())
+    inputs = set(py_files) | {Path('.github/scripts') / name for name in
+                              ('test_impact.py', 'test_scope.py', 'codeql_scope.py')}
+    for path in sorted(inputs):
+        digest.update(os.fsencode(path) + b'\0')
+        try:
+            with (repo / path).open('rb') as source:
+                content = hashlib.file_digest(source, 'sha256').digest()
+        except OSError:
+            digest.update(b'missing\0')
+        else:
+            digest.update(b'present\0' + content)
+    return digest.hexdigest()
+
+
+def _load_cached_graph(
+    cache_file: Path, fingerprint: str,
+) -> tuple[dict[Path, set[Path]], int] | None:
+    try:
+        data = json_mod.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json_mod.JSONDecodeError):
+        return None
+    if (not isinstance(data, dict) or type(data.get("version")) is not int
+            or data["version"] != 1 or data.get("fingerprint") != fingerprint):
+        return None
+    graph = data.get("reverse_graph")
+    failures = data.get("parse_failures")
+    if not isinstance(graph, dict) or type(failures) is not int or failures < 0:
+        return None
+
+    def valid_path(value):
+        if not isinstance(value, str) or value in ("", ".") or "\0" in value:
+            return False
+        path = Path(value)
+        return not path.is_absolute() and ".." not in path.parts and str(path) == value
+
+    reverse: dict[Path, set[Path]] = {}
+    for key, values in graph.items():
+        if (not valid_path(key) or not isinstance(values, list)
+                or not all(valid_path(value) for value in values)):
+            return None
+        reverse[Path(key)] = {Path(value) for value in values}
+    return reverse, failures
+
+
+def _save_graph_cache(
+    cache_file: Path,
+    fingerprint: str,
+    reverse: dict[Path, set[Path]],
+    parse_failures: int,
+) -> None:
+    data = {
+        "version": 1,
+        "fingerprint": fingerprint,
+        "parse_failures": parse_failures,
+        "reverse_graph": {
+            str(k): sorted(str(v) for v in vs)
+            for k, vs in reverse.items()
+        },
+    }
+    try:
+        cache_file.write_text(
+            json_mod.dumps(data, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+# -- Test duration loading -------------------------------------------------
+
+def _load_test_durations(repo: Path) -> dict[str, float] | None:
+    """Load pytest-split durations and aggregate by file."""
+    for name in (".test_durations", "test_durations"):
+        dur_path = repo / name
+        if dur_path.is_file():
+            break
+    else:
+        return None
+    try:
+        raw = json_mod.loads(dur_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json_mod.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    per_file: dict[str, float] = defaultdict(float)
+    total = 0.0
+    for node_id, duration in raw.items():
+        if type(duration) not in (int, float):
+            continue
+        try:
+            duration = float(duration)
+        except OverflowError:
+            continue
+        if not math.isfinite(duration) or duration < 0:
+            continue
+        file_part = node_id.split("::")[0]
+        if not file_part:
+            continue
+        per_file[file_part] += duration
+        total += duration
+        if not math.isfinite(total) or not math.isfinite(per_file[file_part]):
+            return None  # Timing data cannot supply a usable estimate.
+    return dict(per_file) if per_file else None
+
+
+def _file_duration(
+    path: Path, durations: dict[str, float] | None,
+) -> float:
+    if durations is None:
+        return 0.0
+    return durations.get(str(path), 0.0)
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds >= 60:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+# -- Main ------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help="Changed files to analyse (relative to repo root)",
+    )
+    parser.add_argument(
+        "--diff",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="RANGE",
+        help="Use git diff to find changed files (optionally with a range)",
+    )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare file-level selection against tier-level selection",
+    )
+    parser.add_argument(
+        "--closure",
+        action="store_true",
+        help="Show all affected files, not just tests",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force graph rebuild (ignore cache)",
+    )
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Repository root (default: .)",
+    )
+    args = parser.parse_args()
+
+    repo = Path(args.repo).resolve()
+    env_groups = _env_groups_from_tiers()
+
+    # Collect changed files.
+    if args.diff is not None:
+        changed = get_changed_files_from_diff(args.diff or None)
+    elif args.files:
+        changed = args.files
+    else:
+        parser.print_help()
+        return 1
+
+    if not changed:
+        print("No changed files.")
+        return 0
+
+    changed_py = {Path(f) for f in changed if f.endswith(".py")}
+    changed_non_py = [f for f in changed if not f.endswith(".py")]
+
+    # Build graph (with caching).
+    t0 = time.monotonic()
+    all_py = discover_py_files(repo, extra_roots=_EXTRA_ROOTS)
+    total_files = len(all_py)
+
+    cache_file = _cache_path(repo)
+    fingerprint = _files_fingerprint(all_py, repo)
+    cached = (
+        None if (args.no_cache or cache_file is None)
+        else _load_cached_graph(cache_file, fingerprint)
+    )
+
+    if cached is not None:
+        reverse_graph, parse_failures = cached
+        cache_status = "hit"
+    else:
+        reverse_graph, parse_failures = build_graph(all_py, repo)
+        if cache_file is not None:
+            _save_graph_cache(
+                cache_file, fingerprint, reverse_graph, parse_failures,
+            )
+        cache_status = "miss"
+    graph_time = time.monotonic() - t0
+
+    reverse_graph = with_private_test_drivers(reverse_graph, repo)
+
+    # conftest.py changes affect all tests in their directory tree
+    # (the repo-root conftest's tree is the whole repo).
+    changed_py |= expand_conftest(changed_py, all_py)
+
+    changed_py |= init_imports(changed_py, all_py)
+
+    # Match the CI dispatcher's entry-script references as well as imports.
+    script_seeds, unmapped_scripts = script_reference_seeds(changed, all_py, repo)
+    changed_py |= script_seeds
+    if unmapped_scripts:
+        # An unreferenced executable is not evidence that no tests are needed.
+        changed_py.update(all_py)
+
+    # Compute closure.
+    closure = transitive_dependents(changed_py, reverse_graph)
+
+    # Outside-graph tiers: prompt_audit and ci_lint have trigger_files
+    # or extra_triggers that the import graph can't see.
+    outside_tests: set[Path] = set()
+    for _tier_name, tier_config in TIERS.items():
+        if not tier_config.get("outside_graph"):
+            continue
+        triggered = False
+        for trigger_dir in tier_config.get("extra_triggers", []):
+            if any(f.startswith(trigger_dir + "/") or f == trigger_dir
+                   for f in changed):
+                triggered = True
+                break
+        if not triggered:
+            trigger_set = set(tier_config.get("trigger_files", []))
+            if trigger_set and any(f in trigger_set for f in changed):
+                triggered = True
+        if not triggered:
+            for f in changed:
+                if file_matches_tier(Path(f), tier_config):
+                    triggered = True
+                    break
+        if triggered:
+            for d in tier_config.get("test_dirs", []):
+                dir_path = repo / d
+                if dir_path.is_dir():
+                    for p in dir_path.rglob("*.py"):
+                        rp = p.relative_to(repo)
+                        if is_test_file(rp):
+                            outside_tests.add(rp)
+            for f in tier_config.get("test_files", []):
+                fp = Path(f)
+                if (repo / fp).is_file() and is_test_file(fp):
+                    outside_tests.add(fp)
+
+    # Non-Python infrastructure changes trigger the full fast tier.
+    infra_triggered = any(
+        f.startswith("requirements") or f == "pyproject.toml"
+        for f in changed_non_py
+    )
+
+    # Data-file dependencies: if a fixture file changed, pull in
+    # the test files that reference its directory.
+    all_test_py = [f for f in all_py if is_test_file(f)]
+    data_map = build_data_file_map(all_test_py, repo)
+    data_triggered: set[Path] = set()
+    changed_all = set(changed)
+    for data_file, test_files in data_map.items():
+        if str(data_file) in changed_all:
+            data_triggered |= test_files
+
+    # Collect candidate tests.
+    all_affected = closure | outside_tests | data_triggered
+    candidate_tests = sorted(
+        f for f in all_affected
+        if is_test_file(f) and f.name != "conftest.py"
+    )
+    if infra_triggered:
+        for af in all_py:
+            if file_in_fast_tier(af) and af not in all_affected:
+                candidate_tests.append(af)
+        candidate_tests = sorted(set(candidate_tests))
+
+    candidate_tests = resolve_test_drivers(candidate_tests, repo)
+
+    # Exclude entirely-slow test files.
+    slow_files = detect_slow_files(candidate_tests, repo)
+    affected_tests = [f for f in candidate_tests if f not in slow_files]
+    affected_source = sorted(f for f in all_affected if not is_test_file(f))
+
+    # Load durations for time-weighted comparison.
+    durations = _load_test_durations(repo)
+
+    # Group tests by environment.
+    by_env: dict[str, list[Path]] = defaultdict(list)
+    for t in affected_tests:
+        by_env[classify_env(t, env_groups)].append(t)
+
+    if args.json:
+        output: dict = {
+            "changed_files": sorted(str(f) for f in changed_py) + changed_non_py,
+            "graph_build_seconds": round(graph_time, 2),
+            "graph_cache": cache_status,
+            "total_python_files": total_files,
+            "closure_size": len(closure),
+            "slow_excluded": len(slow_files),
+            "affected_tests": [str(t) for t in affected_tests],
+            "affected_source": [str(s) for s in affected_source],
+            "by_environment": {
+                env: [str(t) for t in tests]
+                for env, tests in sorted(by_env.items())
+            },
+        }
+        if args.compare:
+            tier_totals = tier_test_count(repo, slow_files)
+            triggered_tiers: dict[str, list[str]] = defaultdict(list)
+            for t in affected_tests:
+                tier = tier_for_file(t)
+                if tier:
+                    triggered_tiers[tier].append(str(t))
+            total_tier = sum(tier_totals.get(t, 0) for t in triggered_tiers)
+            total_affected = len(affected_tests)
+            comparison: dict = {
+                "tier_totals": tier_totals,
+                "triggered_tiers": {
+                    tier: {
+                        "affected": len(files),
+                        "tier_total": tier_totals.get(tier, 0),
+                    }
+                    for tier, files in sorted(triggered_tiers.items())
+                },
+                "total_tier_tests": total_tier,
+                "total_affected_tests": total_affected,
+                "savings_percent": round(
+                    (1 - total_affected / max(1, total_tier)) * 100, 1,
+                ),
+            }
+            if durations:
+                aff_dur = sum(_file_duration(Path(f), durations)
+                              for f in affected_tests)
+                tier_dur = sum(
+                    sum(_file_duration(Path(f), durations)
+                        for f in discover_py_files(repo, extra_roots=_EXTRA_ROOTS)
+                        if is_test_file(f) and f not in slow_files
+                        and tier_for_file(f) == tier)
+                    for tier in triggered_tiers
+                )
+                comparison["affected_duration_s"] = round(aff_dur, 1)
+                comparison["tier_duration_s"] = round(tier_dur, 1)
+                if tier_dur > 0:
+                    comparison["duration_savings_percent"] = round(
+                        (1 - aff_dur / tier_dur) * 100, 1,
+                    )
+            output["comparison"] = comparison
+        print(json_mod.dumps(output, indent=2))
+        return 0
+
+    # Text output.
+    print(f"Graph: {total_files} Python files, built in {graph_time:.1f}s"
+          f" ({parse_failures} parse failures, cache {cache_status})")
+    print(f"Changed: {len(changed_py)} Python files"
+          + (f", {len(changed_non_py)} non-Python" if changed_non_py else ""))
+    print(f"Closure: {len(closure)} files "
+          f"({len(closure) / max(1, total_files) * 100:.0f}% of codebase)")
+    print(f"Affected tests: {len(affected_tests)}"
+          + (f" ({len(slow_files)} slow-only files excluded)"
+             if slow_files else ""))
+    print()
+
+    if args.closure:
+        print("=== Affected source files ===")
+        for s in affected_source:
+            print(f"  {s}")
+        print()
+
+    print("=== Affected tests by environment ===")
+    for env in sorted(by_env):
+        tests = by_env[env]
+        label = env
+        reason = env_groups.get(env, {}).get("reason", "")
+        if reason:
+            label += f"  ({reason})"
+        print(f"\n  {label}: {len(tests)} tests")
+        for t in tests:
+            dur = _file_duration(t, durations)
+            suffix = f"  ({_fmt_duration(dur)})" if dur > 0 else ""
+            print(f"    {t}{suffix}")
+
+    # Emit pytest commands.
+    seed = int(time.monotonic() * 1000) % 2**31
+    print("\n=== Pytest commands ===")
+    print(f"  # Set RAPTOR_RANDOMISE_TESTS={seed} to randomise test order")
+    for env in sorted(by_env):
+        tests = by_env[env]
+        if not tests:
+            continue
+        file_args = " ".join(str(t) for t in tests)
+        if env == "standard":
+            print(f"\n  # Standard environment ({len(tests)} files)")
+        else:
+            print(f"\n  # {env} ({len(tests)} files)")
+        # Mirror pytest.ini's addopts marker expression: a CLI -m
+        # REPLACES addopts' -m entirely, so a bare "not slow" here
+        # would un-deselect the integration and corpus tiers (live
+        # network / minutes-long corpus builds) on equipped hosts.
+        print(
+            "  pytest -m \"not integration and not slow and not corpus\" "
+            f"{file_args}"
+        )
+
+    if args.compare:
+        _print_comparison(repo, affected_tests, slow_files, durations)
+
+    return 0
+
+
+def _print_comparison(
+    repo: Path,
+    affected_tests: list[Path],
+    slow_files: set[Path],
+    durations: dict[str, float] | None,
+) -> None:
+    print("\n=== Tier comparison ===")
+    tier_totals = tier_test_count(repo, slow_files)
+    triggered_tiers: dict[str, list[Path]] = defaultdict(list)
+    for t in affected_tests:
+        tier = tier_for_file(t)
+        if tier:
+            triggered_tiers[tier].append(t)
+
+    has_dur = durations is not None
+    if has_dur:
+        hdr = (f"  {'Tier':<28} {'Affected':>8} {'Total':>8}"
+               f" {'Saving':>8}  {'Time aff.':>9} {'Time tot.':>9}"
+               f" {'Time sav.':>9}")
+        sep = f"  {'-' * 28} {'-' * 8} {'-' * 8} {'-' * 8}  " \
+              f"{'-' * 9} {'-' * 9} {'-' * 9}"
+    else:
+        hdr = f"  {'Tier':<28} {'Affected':>8} {'Total':>8} {'Saving':>8}"
+        sep = f"  {'-' * 28} {'-' * 8} {'-' * 8} {'-' * 8}"
+    print(f"\n{hdr}")
+    print(sep)
+
+    total_tier_would_run = 0
+    total_tier_dur = 0.0
+    total_aff_dur = 0.0
+
+    all_py = resolve_test_drivers(
+        discover_py_files(repo, extra_roots=_EXTRA_ROOTS), repo,
+    )
+
+    for tier in sorted(triggered_tiers):
+        affected = len(triggered_tiers[tier])
+        total = tier_totals.get(tier, 0)
+        total_tier_would_run += total
+        saving = total - affected
+        pct = (saving / max(1, total)) * 100
+
+        if has_dur:
+            aff_d = sum(_file_duration(f, durations) for f in triggered_tiers[tier])
+            tier_d = sum(
+                _file_duration(f, durations)
+                for f in all_py
+                if is_test_file(f)
+                and f not in slow_files
+                and tier_for_file(f) == tier
+            )
+            total_aff_dur += aff_d
+            total_tier_dur += tier_d
+            dur_save = tier_d - aff_d
+            dur_pct = (dur_save / max(0.001, tier_d)) * 100
+            print(f"  {tier:<28} {affected:>8} {total:>8}"
+                  f" {saving:>5} ({pct:2.0f}%)"
+                  f"  {_fmt_duration(aff_d):>9} {_fmt_duration(tier_d):>9}"
+                  f" {_fmt_duration(dur_save):>6} ({dur_pct:2.0f}%)")
+        else:
+            print(f"  {tier:<28} {affected:>8} {total:>8}"
+                  f" {saving:>5} ({pct:.0f}%)")
+
+    total_affected = len(affected_tests)
+    if total_tier_would_run > 0:
+        overall = total_tier_would_run - total_affected
+        overall_pct = (overall / total_tier_would_run) * 100
+        print(f"\n  Total: {total_affected} tests (file-level) vs "
+              f"{total_tier_would_run} tests (tier-level)")
+        print(f"  Saving: {overall} tests ({overall_pct:.0f}%)")
+        if has_dur and total_tier_dur > 0:
+            dur_overall = total_tier_dur - total_aff_dur
+            dur_overall_pct = (dur_overall / total_tier_dur) * 100
+            print(f"  Time: {_fmt_duration(total_aff_dur)} (file-level) vs "
+                  f"{_fmt_duration(total_tier_dur)} (tier-level)")
+            print(f"  Time saving: {_fmt_duration(dur_overall)}"
+                  f" ({dur_overall_pct:.0f}%)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -2,22 +2,35 @@
 AgentLoop — explore-first tool-use loop for CVE → fix-commit discovery.
 
 Delegates to :class:`core.llm.tool_use.loop.ToolUseLoop` for the
-provider-agnostic agentic runner. Domain-specific logic (verified-SHA
-gate, SHA-existence gate, source-class surrender) lives in the
-``submit_result`` handler and events callback, not inside the loop
-itself.
+provider-agnostic agentic runner. Domain-specific logic stays outside
+the generic loop: the verified-SHA and SHA-existence gates live in the
+``submit_result`` handler and events callback, and the source-class
+surrender check runs inline in :meth:`AgentLoop.run` on the loop's
+result.
 
-Dataclasses live in ``agent/types.py``; tools in ``agent/tools.py``.
+The context/result dataclasses (``AgentContext``, ``AgentOutput``,
+``AgentResult``, ``AgentSurrender``) live in ``agent/types.py``
+(``AgentConfig`` and ``AgentLoop`` itself are defined here); tools in
+``agent/tools.py``.
 """
 
 from __future__ import annotations
 
 import json
-import os
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, TYPE_CHECKING
 
+from cve_diff.agent import source_classes
+from cve_diff.agent.types import AgentContext, AgentOutput, AgentResult, AgentSurrender
+from cve_diff.infra import github_client
+from cve_diff.llm.client import MODEL_PRICES
+
+from core.json import dumps_display
+from core.config import env_flag
+from core.json import dumps_artifact
+from core.llm import telemetry
 from core.llm.config import ModelConfig
 from core.llm.providers import create_provider
 from core.llm.tool_use.loop import ToolUseLoop
@@ -31,13 +44,11 @@ from core.llm.tool_use.types import (
     ToolDef,
     TurnCompleted,
 )
-
-from cve_diff.agent import source_classes
-from cve_diff.agent.tools import Tool
-from cve_diff.agent.types import AgentContext, AgentOutput, AgentResult, AgentSurrender
 from core.url_patterns import SHA_DISPLAY_LEN, extract_github_slug
-from cve_diff.infra import github_client
-from cve_diff.llm.client import MODEL_PRICES
+
+if TYPE_CHECKING:
+    from cve_diff.agent.tools import Tool
+    from collections.abc import Callable
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,23 +68,87 @@ class AgentConfig:
 
 
 def _rules_disabled() -> bool:
-    return os.environ.get("CVE_DIFF_DISABLE_RULES") == "1"
+    return env_flag("CVE_DIFF_DISABLE_RULES", default=False)
 
 
 _MAX_UNVERIFIED_SUBMITS = 2
 _MAX_NOT_FOUND_SUBMITS = 2
 
 
+# Minimum abbreviation length accepted by the verified-SHA gate —
+# matches the oracle layers' shared safety floor (12 hex chars is
+# effectively collision-free within one repo; 7 is inside git's own
+# documented ambiguity range).
+_MIN_VERIFIED_SHA_LEN = 12
+
+
 def _is_verified(slug: str, sha: str, verified: list[tuple[str, str]]) -> bool:
+    """True when ``sha`` is one of the run's verified SHAs for ``slug``.
+
+    The submitted sha may equal a verified sha or be a ≥12-char
+    abbreviation of one. It must never merely EXTEND a shorter verified
+    value: verification proves only the prefix, so a hallucinated
+    40-char sha sharing a verified prefix (confabulated middle) would
+    otherwise pass as "verified".
+    """
     if not slug or not sha:
         return False
     sha = sha.lower()
+    if len(sha) < _MIN_VERIFIED_SHA_LEN:
+        return False
     for vslug, vsha in verified:
         if vslug != slug:
             continue
-        if vsha.startswith(sha) or sha.startswith(vsha):
+        if vsha.startswith(sha):
             return True
     return False
+
+
+# cgit serves its error pages with HTTP 200 and ECHOES the requested
+# object id in them, so "sha appears in body" alone cannot verify —
+# these markers are the cgit error-page texts that must be absent.
+_CGIT_ERROR_MARKERS = (
+    "bad object id",
+    "invalid commit reference",
+    "bad commit reference",
+)
+
+_FULL_HEX_RE = re.compile(r"\A[0-9a-f]{7,64}\Z")
+
+
+def _forge_result_confirms_sha(
+    call_name: str,
+    parsed: dict[str, Any],
+    sha: str,
+) -> str | None:
+    """Return the canonical sha a forge tool response confirms, or None.
+
+    ``gitlab_commit``: the GitLab API echoes the commit's canonical
+    ``id``; accept only when it extends the dispatched sha.
+    ``cgit_fetch``: the HTML body must contain the dispatched sha with
+    no cgit error marker present; prefer the full object id displayed
+    on the page over the (possibly abbreviated) dispatched value.
+    """
+    if not sha:
+        return None
+    if call_name == "gitlab_commit":
+        commit_id = parsed.get("id")
+        if isinstance(commit_id, str):
+            commit_id = commit_id.strip().lower()
+            if commit_id.startswith(sha) and _FULL_HEX_RE.match(commit_id):
+                return commit_id
+        return None
+    body = parsed.get("body")
+    if not isinstance(body, str):
+        return None
+    lower = body.lower()
+    if any(marker in lower for marker in _CGIT_ERROR_MARKERS):
+        return None
+    m = re.search(rf"\b{re.escape(sha)}[0-9a-f]*\b", lower)
+    if m is None:
+        return None
+    found = m.group(0)
+    return found if len(found) in (40, 64) else sha
 
 
 def _price(
@@ -83,16 +158,25 @@ def _price(
     cache_create_t: int = 0,
     cache_read_t: int = 0,
 ) -> float:
-    key = model_id.lower()
-    for token, (in_per_M, out_per_M) in MODEL_PRICES.items():
-        if token in key:
-            return (
-                in_t * in_per_M
-                + out_t * out_per_M
-                + cache_create_t * in_per_M * 1.25
-                + cache_read_t * in_per_M * 0.1
-            ) / 1_000_000
-    return 0.0
+    # Authoritative per-model pricing first; the class-token table is
+    # only a fallback for bare aliases price_for can't resolve.
+    from core.llm.model_data import price_for
+
+    in_per_M, out_per_M = price_for(model_id, default=(0.0, 0.0))
+    if (in_per_M, out_per_M) == (0.0, 0.0):
+        key = model_id.lower()
+        for token, (tok_in, tok_out) in MODEL_PRICES.items():
+            if token in key:
+                in_per_M, out_per_M = tok_in, tok_out
+                break
+        else:
+            return 0.0
+    return (
+        in_t * in_per_M
+        + out_t * out_per_M
+        + cache_create_t * in_per_M * 1.25
+        + cache_read_t * in_per_M * 0.1
+    ) / 1_000_000
 
 
 @dataclass
@@ -107,14 +191,16 @@ class AgentLoop:
         tool_calls_with_args: list[tuple[str, str]] = []
         unverified_submits = 0
         not_found_submits = 0
-        last_dispatched_input: list[dict[str, Any] | None] = [None]
-        # call.id → call.name index, populated on ToolCallDispatched
-        # and consumed (popped) on ToolCallReturned. See the
-        # ToolCallReturned arm in _on_event for the rationale —
+        # call.id → (call.name, call.input) index, populated on
+        # ToolCallDispatched and consumed (popped) on ToolCallReturned.
+        # See the ToolCallReturned arm in _on_event for the rationale —
         # call_id matching is correct under parallel dispatch and
-        # out-of-order returns; the prior `tool_call_log[-1]`
-        # ("most recent") was correct only for strictly serial.
-        _dispatch_index: dict[str, str] = {}
+        # out-of-order returns; the prior `tool_call_log[-1]` /
+        # "most recently dispatched input" pair was correct only for
+        # strictly serial dispatch. The input rides along so the
+        # cgit_fetch / gitlab_commit arm recovers the (slug, sha) it
+        # actually dispatched, not whatever was dispatched last.
+        _dispatch_index: dict[str, tuple[str, dict[str, Any]]] = {}
         # Set to non-None when a submit gate wants to hard-stop the loop.
         gate_hard_stop_reason: list[str | None] = [None]
         # The final accepted submit payload.
@@ -141,14 +227,22 @@ class AgentLoop:
                     unverified_submits += 1
                     if unverified_submits > _MAX_UNVERIFIED_SUBMITS:
                         gate_hard_stop_reason[0] = "submit_unverified_sha"
-                        raise ValueError(json.dumps({
+                        # Return normally (NOT raise): a raised handler
+                        # error keeps ToolUseLoop iterating and the
+                        # "hard stop" would keep burning budget until a
+                        # cap fires. A normal return from the terminal
+                        # tool stops the loop right now; the run-level
+                        # mapping below turns the set flag into the
+                        # surrender.
+                        return dumps_display({
                             "submit_rejected": True,
                             "reason": "too many unverified submits",
-                        }))
+                            "final": True,
+                        }, indent=None)
                     verified_brief = ", ".join(
                         f"{vs}@{vh[:SHA_DISPLAY_LEN]}" for vs, vh in verified[:5]
                     ) or "(none)"
-                    raise ValueError(json.dumps({
+                    raise ValueError(dumps_display({
                         "submit_rejected": True,
                         "reason": (
                             "the (slug, sha) you submitted was not "
@@ -163,18 +257,22 @@ class AgentLoop:
                             f"{_MAX_UNVERIFIED_SUBMITS - unverified_submits + 1} "
                             "attempt(s) left."
                         ),
-                    }))
+                    }, indent=None))
 
                 # SHA-existence gate
                 if slug and sha and github_client.commit_exists(slug, sha) is False:
                     not_found_submits += 1
                     if not_found_submits > _MAX_NOT_FOUND_SUBMITS:
                         gate_hard_stop_reason[0] = "sha_not_found_in_repo"
-                        raise ValueError(json.dumps({
+                        # Normal return, same rationale as the
+                        # unverified-submit strikeout above: stop the
+                        # loop immediately instead of iterating on.
+                        return dumps_display({
                             "submit_rejected": True,
                             "reason": "too many sha-not-found submits",
-                        }))
-                    raise ValueError(json.dumps({
+                            "final": True,
+                        }, indent=None)
+                    raise ValueError(dumps_display({
                         "submit_rejected": True,
                         "reason": (
                             "sha_not_found: GitHub returned 404. "
@@ -187,11 +285,11 @@ class AgentLoop:
                             f"have {_MAX_NOT_FOUND_SUBMITS - not_found_submits + 1} "
                             "attempt(s) left."
                         ),
-                    }))
+                    }, indent=None))
 
             # Accept the submission
             submit_payload[0] = args
-            return json.dumps({"accepted": True})
+            return dumps_display({"accepted": True}, indent=None)
 
         # ---- Build ToolDef list from cve-diff Tools + submit handler ----
         tool_defs: list[ToolDef] = [t.to_tool_def() for t in config.tools]
@@ -221,6 +319,9 @@ class AgentLoop:
         cost_usd = 0.0
         tokens_total = 0
         iterations_count = 0
+        # Filled after resolve_auth below; the events callback closes
+        # over it so per-turn telemetry records carry the provider.
+        provider_name: list[str] = [""]
 
         def _on_event(event: LoopEvent) -> None:
             nonlocal cost_usd, tokens_total, iterations_count
@@ -230,17 +331,33 @@ class AgentLoop:
                 cost_usd += event.cost_usd
                 tokens_total += resp.input_tokens + resp.output_tokens + resp.cache_write_tokens + resp.cache_read_tokens
                 iterations_count = event.iteration + 1
+                # One run-local llm-telemetry.jsonl record per provider
+                # round-trip, same shape as core.llm.client's records.
+                # No-op unless the orchestrator installed a sink.
+                telemetry.emit(
+                    event="call",
+                    disposition="ok",
+                    call_class="cve-diff:discovery",
+                    provider=provider_name[0],
+                    model=config.model_id,
+                    iteration=event.iteration,
+                    cost_usd=event.cost_usd,
+                    tokens_in=resp.input_tokens,
+                    tokens_out=resp.output_tokens,
+                    cache_read_tokens=resp.cache_read_tokens,
+                    cache_write_tokens=resp.cache_write_tokens,
+                )
 
             elif isinstance(event, ToolCallDispatched):
                 call = event.call
                 tool_call_log.append(call.name)
-                args_repr = json.dumps(call.input, sort_keys=True, default=str)[:120]
+                args_repr = dumps_artifact(
+                    call.input, indent=None, sort_keys=True)[:120]
                 tool_calls_with_args.append((call.name, args_repr))
-                last_dispatched_input[0] = call.input
                 # Index by call_id so ToolCallReturned can look up the
                 # correct dispatch even when calls overlap (parallel
                 # tool dispatch). See _on_event ToolCallReturned arm.
-                _dispatch_index[call.id] = call.name
+                _dispatch_index[call.id] = (call.name, call.input)
 
             elif isinstance(event, ToolCallReturned):
                 result = event.result
@@ -264,7 +381,9 @@ class AgentLoop:
                 # received. Symptom: agent submits unsupported/
                 # no_evidence on cases where the verification call
                 # actually succeeded.
-                call_name = _dispatch_index.pop(event.call_id, "")
+                call_name, call_input = _dispatch_index.pop(
+                    event.call_id, ("", None),
+                )
                 # Cap before json.loads. Pre-fix the parser ate
                 # whatever the tool returned — `gh_commit_detail`
                 # response from a hostile / malformed cgit mirror,
@@ -280,6 +399,19 @@ class AgentLoop:
                 # 1 MB to leave headroom for unusual cgit responses.
                 _TOOL_RESULT_CAP = 1 * 1024 * 1024
                 content = result.content
+                # Coerce bytes to a length-checked form before the
+                # str-only cap fires. Pre-fix the ``isinstance(str)``
+                # gate skipped bytes/bytearray content entirely, so
+                # a future tool returning bytes (no API change today
+                # but a real future shape) would slip past the cap
+                # and feed the full payload into json.loads below.
+                if isinstance(content, (bytes, bytearray)):
+                    if len(content) > _TOOL_RESULT_CAP:
+                        return
+                    try:
+                        content = content.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return
                 if isinstance(content, str) and len(content) > _TOOL_RESULT_CAP:
                     # Skip parse — over-cap responses are almost
                     # certainly garbage, not legitimate JSON. Returns
@@ -301,12 +433,28 @@ class AgentLoop:
                 elif call_name in ("cgit_fetch", "gitlab_commit") and not result.is_error:
                     try:
                         parsed = json.loads(content)
-                        if isinstance(parsed, dict) and "error" not in parsed and last_dispatched_input[0] is not None:
-                            a = last_dispatched_input[0]
+                        # (slug, sha) come from THIS call's dispatched
+                        # input (call_id-matched above), not from the
+                        # most recently dispatched call — under
+                        # parallel dispatch those can differ, and a
+                        # mismatched pair landing in `verified` would
+                        # corrupt the verified-SHA gate's evidence.
+                        if isinstance(parsed, dict) and "error" not in parsed and call_input is not None:
+                            a = call_input
                             slug = (a.get("slug") or "").strip().lower()
                             sha = (a.get("sha") or "").strip().lower()
-                            if slug and sha and (slug, sha) not in verified:
-                                verified.append((slug, sha))
+                            # A 2xx alone is NOT verification: cgit
+                            # answers nonexistent object ids with HTTP
+                            # 200 + an error page, and any steered 200
+                            # would otherwise mint a bogus verified
+                            # pair AND permanently disable the
+                            # no-evidence surrender rule. Require the
+                            # response CONTENT to confirm the sha.
+                            confirmed = _forge_result_confirms_sha(
+                                call_name, parsed, sha,
+                            )
+                            if slug and confirmed and (slug, confirmed) not in verified:
+                                verified.append((slug, confirmed))
                     except (ValueError, AttributeError):
                         pass
 
@@ -320,6 +468,7 @@ class AgentLoop:
         try:
             from cve_diff.llm.auth import resolve_auth
             decision = resolve_auth(config.model_id)
+            provider_name[0] = decision.provider
             model_config = ModelConfig(
                 provider=decision.provider,
                 model_name=config.model_id,
@@ -327,7 +476,7 @@ class AgentLoop:
                 timeout=int(self.timeout_s),
             )
             provider = create_provider(model_config)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surrender, never crash the loop
             return self._finalize(
                 AgentSurrender(reason="client_init_failed", detail=str(exc)[:200]),
                 0, 0.0, time.monotonic() - start, tuple(tool_call_log),
@@ -364,8 +513,40 @@ class AgentLoop:
             **provider_kw,
         )
 
+        # Trajectory persistence on every exit path — success, cost
+        # cap, and arbitrary exception — so a budget-exceeded run
+        # (where the partial trajectory is MOST useful for operator
+        # debugging) still gets persisted with whatever survived to
+        # the point of termination. No-op unless RAPTOR_TRAJECTORY_DIR
+        # is set.
+        from core.trajectories.auto import (
+            persist_from_loop_result,
+            persist_partial_from_exception,
+        )
+        _traj_run_id = f"cve-diff-{ctx.cve_id}"
         try:
-            loop_result = loop.run(config.user_message)
+            try:
+                loop_result = loop.run(config.user_message)
+            except CostBudgetExceeded as _e:
+                persist_partial_from_exception(
+                    _e, run_id=_traj_run_id, model_name=config.model_id,
+                    finding_id=ctx.cve_id,
+                    terminated_by="max_cost_usd",
+                )
+                raise
+            except Exception as _e:
+                persist_partial_from_exception(
+                    _e, run_id=_traj_run_id, model_name=config.model_id,
+                    finding_id=ctx.cve_id,
+                    terminated_by=f"exception:{type(_e).__name__}",
+                )
+                raise
+            else:
+                persist_from_loop_result(
+                    loop_result,
+                    run_id=_traj_run_id, model_name=config.model_id,
+                    finding_id=ctx.cve_id,
+                )
         except CostBudgetExceeded:
             return self._finalize(
                 AgentSurrender(
@@ -380,7 +561,7 @@ class AgentLoop:
                 unverified_submits=unverified_submits,
                 not_found_submits=not_found_submits,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surrender, never crash the loop
             reason = gate_hard_stop_reason[0] or "llm_error"
             return self._finalize(
                 AgentSurrender(reason=reason, detail=str(exc)[:200]),
@@ -456,7 +637,23 @@ class AgentLoop:
                 not_found_submits=not_found_submits,
             )
 
-        if loop_result.terminated_by in ("complete", "max_tokens", "refused", "provider_error"):
+        if loop_result.terminated_by == "provider_error":
+            # Transient provider failure, NOT a model decision: surface
+            # it as llm_error so both retry layers (pipeline meta-retry
+            # and the bench retry pass) treat it as retryable instead
+            # of recording a conclusive model failure.
+            return self._finalize(
+                AgentSurrender(
+                    reason="llm_error",
+                    detail=loop_result.final_text[:200],
+                ),
+                tokens_total, cost_usd, elapsed_s,
+                tuple(tool_call_log), tuple(verified),
+                iterations=iterations_count,
+                tool_calls_with_args=tuple(tool_calls_with_args),
+            )
+
+        if loop_result.terminated_by in ("complete", "max_tokens", "refused"):
             return self._finalize(
                 AgentSurrender(
                     reason="model_stopped_without_submit",
@@ -519,7 +716,7 @@ class AgentLoop:
             "not_found_submits": not_found_submits,
         }
         if isinstance(result, AgentSurrender):
-            out = AgentSurrender(
+            return AgentSurrender(
                 reason=result.reason,
                 detail=result.detail,
                 tool_calls=result.tool_calls or tool_calls,
@@ -528,8 +725,7 @@ class AgentLoop:
                 elapsed_s=elapsed_s,
                 verified_candidates=result.verified_candidates or verified_candidates,
             )
-            return out
-        out_ok = AgentOutput(
+        return AgentOutput(
             value=result.value,
             rationale=result.rationale,
             tool_calls=result.tool_calls or tool_calls,
@@ -538,4 +734,3 @@ class AgentLoop:
             elapsed_s=elapsed_s,
             verified_candidates=verified_candidates,
         )
-        return out_ok

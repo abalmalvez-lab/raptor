@@ -1,4 +1,4 @@
-"""Tests for packages.codeql.smt_path_validator."""
+"""Tests for core.smt_solver.path_feasibility."""
 
 import sys
 from pathlib import Path
@@ -7,10 +7,11 @@ from unittest.mock import patch
 import pytest
 
 # packages/codeql/tests/ -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from core.smt_solver import RejectionKind, z3_available
-from packages.codeql.smt_path_validator import (
+from core.smt_solver.path_feasibility import (
     PathCondition,
     check_path_feasibility,
 )
@@ -29,7 +30,7 @@ class TestNoZ3:
     """Behaviour when Z3 is unavailable — must degrade gracefully."""
 
     def test_returns_none_feasible(self):
-        with patch("packages.codeql.smt_path_validator._z3_available", return_value=False):
+        with patch("core.smt_solver.path_feasibility._z3_available", return_value=False):
             r = check_path_feasibility([PathCondition("size > 0", step_index=0)])
         assert r.feasible is None
         assert r.smt_available is False
@@ -39,12 +40,12 @@ class TestNoZ3:
             PathCondition("size > 0", step_index=0),
             PathCondition("offset < 1024", step_index=1),
         ]
-        with patch("packages.codeql.smt_path_validator._z3_available", return_value=False):
+        with patch("core.smt_solver.path_feasibility._z3_available", return_value=False):
             r = check_path_feasibility(conditions)
         assert set(r.unknown) == {"size > 0", "offset < 1024"}
 
     def test_empty_conditions_still_returns_none(self):
-        with patch("packages.codeql.smt_path_validator._z3_available", return_value=False):
+        with patch("core.smt_solver.path_feasibility._z3_available", return_value=False):
             r = check_path_feasibility([])
         assert r.feasible is None
         assert r.smt_available is False
@@ -180,35 +181,33 @@ class TestFeasibility:
 
     @_requires_z3
     def test_bitmask_mask_too_wide_for_profile_goes_to_unknown(self):
-        """The bitmask form (``flags & MASK == VAL``) extracts MASK and
-        VAL via its own regex rather than going through ``atom()`` — the
-        same width-range check must apply or 0x100 at uint8 silently
-        wraps to 0, producing a false tautology."""
+        """Grouped bitmask literals retain width checks; 0x100 at uint8
+        must not wrap to zero and produce a false tautology."""
         from core.smt_solver import BVProfile
         r = check_path_feasibility(
-            [PathCondition("flags & 0x100 == 0", step_index=0)],
+            [PathCondition("(flags & 0x100) == 0", step_index=0)],
             profile=BVProfile(width=8, signed=False),
         )
-        assert "flags & 0x100 == 0" in r.unknown
+        assert "(flags & 0x100) == 0" in r.unknown
 
     @_requires_z3
     def test_bitmask_leading_zero_mask_goes_to_unknown(self):
         """Leading-zero literals in the bitmask path used to crash
         ``int(tok, 0)`` with a Python ValueError on tokens like '010';
         now they're rejected cleanly to ``unknown``."""
-        r = check_path_feasibility([PathCondition("flags & 010 == 0", step_index=0)])
-        assert "flags & 010 == 0" in r.unknown
+        r = check_path_feasibility([PathCondition("(flags & 010) == 0", step_index=0)])
+        assert "(flags & 010) == 0" in r.unknown
 
     @_requires_z3
     def test_bitmask_leading_zero_rhs_goes_to_unknown(self):
-        r = check_path_feasibility([PathCondition("flags & 0xff == 010", step_index=0)])
-        assert "flags & 0xff == 010" in r.unknown
+        r = check_path_feasibility([PathCondition("(flags & 0xff) == 010", step_index=0)])
+        assert "(flags & 0xff) == 010" in r.unknown
 
     @_requires_z3
     def test_bitmask_normal_form_still_works(self):
         """Regression check: the bitmask-path validation tightening
         must not break valid bitmask conditions."""
-        r = check_path_feasibility([PathCondition("flags & 0xff == 0", step_index=0)])
+        r = check_path_feasibility([PathCondition("(flags & 0xff) == 0", step_index=0)])
         assert r.feasible is True
         assert (r.model.get("flags", 0) & 0xff) == 0
 
@@ -318,17 +317,17 @@ class TestConditionForms:
 
     @_requires_z3
     def test_bitmask_alignment(self):
-        """rsp & 0xf == 0 — stack alignment check."""
+        """(rsp & 0xf) == 0 — stack alignment check."""
         r = check_path_feasibility([
-            PathCondition("rsp & 0xf == 0", step_index=0),
+            PathCondition("(rsp & 0xf) == 0", step_index=0),
         ])
         assert r.feasible is True
 
     @_requires_z3
     def test_bitmask_infeasible(self):
         r = check_path_feasibility([
-            PathCondition("flags & 0x1 == 0", step_index=0),
-            PathCondition("flags & 0x1 == 1", step_index=1),
+            PathCondition("(flags & 0x1) == 0", step_index=0),
+            PathCondition("(flags & 0x1) == 1", step_index=1),
         ])
         assert r.feasible is False
 
@@ -367,14 +366,14 @@ class TestConditionForms:
 
     @_requires_z3
     def test_bitwise_or_sat(self):
-        """flags | 0x1 != 0 — any flags value satisfies this (OR with 1 is always >=1)."""
-        r = check_path_feasibility([PathCondition("flags | 0x1 != 0", step_index=0)])
+        """(flags | 0x1) != 0 — any flags value satisfies this (OR with 1 is always >=1)."""
+        r = check_path_feasibility([PathCondition("(flags | 0x1) != 0", step_index=0)])
         assert r.feasible is True
 
     @_requires_z3
     def test_bitwise_or_infeasible(self):
-        """flags | 0x1 == 0 — impossible since OR with 1 always sets bit 0."""
-        r = check_path_feasibility([PathCondition("flags | 0x1 == 0", step_index=0)])
+        """(flags | 0x1) == 0 — impossible since OR with 1 always sets bit 0."""
+        r = check_path_feasibility([PathCondition("(flags | 0x1) == 0", step_index=0)])
         assert r.feasible is False
 
     @_requires_z3
@@ -568,10 +567,16 @@ class TestParametricProfile:
             profile=BV_C_UINT32,
         )
         assert r.feasible is True
-        offset, length = r.model["offset"], r.model["length"]
-        # The wraparound is the whole point: (offset + length) mod 2^32 ≤ 64.
-        assert (offset + length) & 0xFFFFFFFF <= 64
-        assert offset > 0x10000 and length > 0x10000
+        m = r.model
+        assert m["sum"] <= 64, f"sum={m['sum']} violates sum<=buffer_size"
+        assert m["buffer_size"] == 64
+        assert m["offset"] > 0x10000, f"offset={m['offset']}"
+        assert m["length"] > 0x10000, f"length={m['length']}"
+        wrap = (m["offset"] + m["length"]) & 0xFFFFFFFF
+        assert m["sum"] == wrap, (
+            f"model inconsistency: sum={m['sum']} but "
+            f"(offset+length) mod 2^32 = {wrap}"
+        )
 
     @_requires_z3
     def test_uint32_profile_catches_mask_wraparound(self):
@@ -579,7 +584,7 @@ class TestParametricProfile:
         from core.smt_solver import BV_C_UINT32
         r = check_path_feasibility(
             [
-                PathCondition("flags & 0x80000000 == 0", step_index=0),
+                PathCondition("(flags & 0x80000000) == 0", step_index=0),
                 PathCondition("size < 4096", step_index=1),
                 PathCondition("base + size <= 8192", step_index=2),
                 PathCondition("base > 0x80000000", step_index=3),
@@ -608,7 +613,7 @@ class TestStructuredRejection:
         """When Z3 is unavailable everything goes to unknown but we
         don't synthesise per-condition rejection reasons — there's no
         parser/solver to assign blame to."""
-        with patch("packages.codeql.smt_path_validator._z3_available", return_value=False):
+        with patch("core.smt_solver.path_feasibility._z3_available", return_value=False):
             r = check_path_feasibility([PathCondition("size > 0", step_index=0)])
         assert r.unknown == ["size > 0"]
         assert r.unknown_reasons == []
@@ -727,28 +732,364 @@ class TestFreeVariableFallback:
         assert r.feasible is True
 
     @_requires_z3
-    def test_two_calls_distinct_free_vars(self):
-        """Two textually-identical calls produce *distinct* placeholders.
+    def test_identical_call_occurrences_do_not_imply_equality(self):
+        """Text cannot establish call purity or unchanged pointed-to memory."""
+        for op in ("==", "!="):
+            result = check_path_feasibility([PathCondition(f"strlen(s) {op} strlen(s)", 0)])
+            assert result.feasible is True
+            assert len(result.anon_var_map) == 2
 
-        Calls aren't assumed pure, so ``strlen(s) == strlen(s)`` is
-        satisfiable — but ``strlen(s) != strlen(s)`` is also satisfiable
-        (different anon vars).  This is the conservative stance: the
-        solver never claims infeasibility from elided subterms.
+    @_requires_z3
+    def test_identical_call_text_does_not_refute_different_evaluations(self):
+        result = check_path_feasibility([
+            PathCondition("strlen(input) > 100", 0),
+            PathCondition("strlen(input) < 50", 1),
+        ])
+        assert result.feasible is True
+        assert len(result.anon_var_map) == 2
+        assert result.unsatisfied == []
+
+    @_requires_z3
+    def test_occurrence_labels_reset_between_batches(self):
+        conditions = [PathCondition("strlen(input) > 100", 0), PathCondition("strlen(input) < 50", 1)]
+        first = check_path_feasibility(conditions)
+        second = check_path_feasibility(conditions)
+        assert first.feasible is True and second.feasible is True
+        assert first.anon_var_map == second.anon_var_map == {
+            "_anon_0": "strlen(input)", "_anon_1": "strlen(input)",
+        }
+
+    @_requires_z3
+    def test_distinct_call_texts_remain_distinct(self):
+        """Different call texts still get distinct placeholders.
+
+        Different function names and arguments retain their own result
+        labels, just as repeated text does.
         """
-        sat_eq = check_path_feasibility([
-            PathCondition("strlen(s) == strlen(s)", step_index=0),
+        r = check_path_feasibility([
+            PathCondition("first(x) != 0", step_index=0),
+            PathCondition("second(y) == 0", step_index=1),
         ])
-        sat_ne = check_path_feasibility([
-            PathCondition("strlen(s) != strlen(s)", step_index=0),
+        assert r.unknown == []
+        assert r.feasible is True
+
+    @_requires_z3
+    def test_occurrences_with_whitespace_and_argument_variations_stay_distinct(self):
+        """Formatting and argument text never supply evaluation identity."""
+        # Whitespace-different forms remain separate occurrences —
+        # the resulting two anon vars let the inequality be sat.
+        r1 = check_path_feasibility([
+            PathCondition("strlen(s) != strlen( s )", step_index=0),
         ])
-        assert sat_eq.feasible is True
-        assert sat_ne.feasible is True
+        assert r1.feasible is True
+        # Different-argument forms remain separate too.
+        r2 = check_path_feasibility([
+            PathCondition("strlen(a) != strlen(b)", step_index=0),
+        ])
+        assert r2.feasible is True
+
+    @_requires_z3
+    def test_anon_counter_progresses_across_distinct_calls(self):
+        """Counter still progresses when call texts differ — keeps the
+        pre-existing 'no index collision' guarantee for the cross-
+        condition case with non-identical call texts."""
+        # Two textually-distinct calls in one batch must produce TWO
+        # placeholders, not one. If both got `_anon_0` they'd share a
+        # Z3 var and the joint constraint
+        # `first(x) != 0 AND second(y) == 0` would still be sat —
+        # but for the wrong reason. The clean signal is two anon
+        # entries in the model.
+        r = check_path_feasibility([
+            PathCondition("first(x) != 0", step_index=0),
+            PathCondition("second(y) == 0", step_index=1),
+        ])
+        assert r.feasible is True
+        anon_names = [k for k in r.model if k.startswith("_anon_")]
+        # At least two distinct anon entries (one per distinct call).
+        # Counts may be higher if model_completion fills extras, but
+        # the lower bound is what matters here.
+        assert len(anon_names) >= 2
+        assert "_anon_0" in r.model
+        assert "_anon_1" in r.model
+
+
+# ---------------------------------------------------------------------------
+# Assignment-shape detection and unmodeled scalar value flow
+# ---------------------------------------------------------------------------
+
+class TestAssignmentShapeBarrier:
+    """Program effects remain rejected and visible as scalar state boundaries.
+
+    Call occurrences are independent on both sides of a mutation, and also
+    within a segment. A mutation warning must not be silently discarded.
+    """
+
+    @_requires_z3
+    @pytest.mark.parametrize("text", [
+        "input = realloc(input, n)",   # bare assignment
+        "x = y + 1",                   # bare assignment, arithmetic rhs
+        "count += 1",                  # compound assignment +=
+        "count -= 1",                  # compound assignment -=
+        "x *= 2",                      # *=
+        "x /= 2",                      # /=
+        "x %= 16",                     # %=
+        "flags &= 0xff",               # &=
+        "flags |= 0x1",                # |=
+        "flags ^= mask",               # ^=
+        "x <<= 4",                     # shift compound
+        "x >>= 4",
+        "i++",                         # post-increment
+        "++i",                         # pre-increment
+        "i--",                         # post-decrement
+        "--i",                         # pre-decrement
+    ])
+    def test_assignment_shape_rejected(self, text):
+        """Each assignment-shape variant goes to ASSIGNMENT_SHAPED,
+        not UNRECOGNIZED_FORM."""
+        r = check_path_feasibility([PathCondition(text, step_index=0)])
+        assert text in r.unknown
+        rej = next(x for x in r.unknown_reasons if x.text == text)
+        assert rej.kind is RejectionKind.ASSIGNMENT_SHAPED, (
+            f"expected ASSIGNMENT_SHAPED, got {rej.kind.value} for {text!r}"
+        )
+        assert "SSA-rename" in rej.hint or "guards" in rej.hint.lower()
+
+    @_requires_z3
+    @pytest.mark.parametrize("text", [
+        "x == 0",                      # equality, NOT assignment
+        "x != 0",                      # inequality
+        "x <= 100",                    # le, NOT shift-compound
+        "x >= 100",                    # ge
+        "x < y",                       # lt, no `--` despite literal
+        "x > -1",                      # gt with negative literal (single `-`)
+        "flags & 0xff == 0",           # bitmask alignment
+        "size > 0",                    # plain relational
+    ])
+    def test_relational_ops_not_misdetected(self, text):
+        """Relational operators must not be misread as assignment."""
+        r = check_path_feasibility([PathCondition(text, step_index=0)])
+        # Either tautology, parsed successfully, or rejected for a
+        # different reason (e.g. range, recognised pattern mismatch),
+        # but NEVER ASSIGNMENT_SHAPED — that would mean the regex
+        # confused a relational operator for an assignment.
+        for rej in r.unknown_reasons:
+            assert rej.kind is not RejectionKind.ASSIGNMENT_SHAPED, (
+                f"relational form misdetected as ASSIGNMENT_SHAPED: {text!r}"
+            )
+
+    @_requires_z3
+    def test_realloc_marker_preserves_distinct_call_occurrences(self):
+        """Calls remain independent and the unmodeled effect stays visible."""
+        r = check_path_feasibility([
+            PathCondition("strlen(input) > 100", step_index=0),
+            PathCondition("input = realloc(input, n)", step_index=1),
+            PathCondition("strlen(input) < 50", step_index=2),
+        ])
+        # The mutation step is flagged structurally.
+        assert "input = realloc(input, n)" in r.unknown
+        mutation_rej = next(
+            x for x in r.unknown_reasons
+            if x.text == "input = realloc(input, n)"
+        )
+        assert mutation_rej.kind is RejectionKind.ASSIGNMENT_SHAPED
+        # The encoded subset is satisfiable, but the mutation is unmodeled.
+        # Do not certify the full path or refute it through merged call values.
+        assert r.feasible is None
+        # Both strlen(input) calls produced anon entries in the
+        # label store so downstream tooling can render meaningful
+        # witnesses.
+        anon_values = set(
+            text for placeholder, text in
+            # `anon_var_map` is the public-facing label store on the
+            # result. Two distinct placeholders → two label entries
+            # for the same text "strlen(input)".
+            r.anon_var_map.items()
+        )
+        assert "strlen(input)" in anon_values
+        # The label store should carry TWO entries with the same
+        # text (one per side of the mutation barrier), even though
+        # the visible-by-text value is one string.
+        strlen_placeholders = [
+            p for p, t in r.anon_var_map.items()
+            if t == "strlen(input)"
+        ]
+        assert len(strlen_placeholders) == 2, (
+            f"expected 2 distinct placeholders for strlen(input) "
+            f"straddling the mutation, got {strlen_placeholders}"
+        )
+
+    @_requires_z3
+    def test_calls_stay_independent_inside_post_mutation_segment(self):
+        result = check_path_feasibility([
+            PathCondition("strlen(input) > 100", 0),
+            PathCondition("input = realloc(input, n)", 1),
+            PathCondition("strlen(input) > 200", 2),
+            PathCondition("strlen(input) < 50", 3),
+        ])
+        assert result.feasible is None
+        assert len(result.anon_var_map) == 3
+        assert result.unknown == ["input = realloc(input, n)"]
+
+    @_requires_z3
+    def test_multiple_mutation_barriers(self):
+        """Three segments, two mutation barriers, three strlen(input)
+        references — each gets its own placeholder."""
+        r = check_path_feasibility([
+            PathCondition("strlen(input) > 100", step_index=0),
+            PathCondition("input = realloc(input, n)", step_index=1),
+            PathCondition("strlen(input) > 50", step_index=2),
+            PathCondition("input = strdup(input)", step_index=3),
+            PathCondition("strlen(input) < 200", step_index=4),
+        ])
+        # All three strlen guards are individually satisfiable and
+        # — because each is in its own segment with a fresh
+        # placeholder — they don't interfere. The full path stays inconclusive.
+        assert r.feasible is None
+        # Both mutation steps recorded.
+        mutation_texts = {
+            x.text for x in r.unknown_reasons
+            if x.kind is RejectionKind.ASSIGNMENT_SHAPED
+        }
+        assert "input = realloc(input, n)" in mutation_texts
+        assert "input = strdup(input)" in mutation_texts
+        # Three placeholders for strlen(input), one per segment.
+        strlen_placeholders = [
+            p for p, t in r.anon_var_map.items()
+            if t == "strlen(input)"
+        ]
+        assert len(strlen_placeholders) == 3
+
+    @_requires_z3
+    def test_ssa_renamed_path_is_feasible_without_barrier(self):
+        """Explicit SSA names keep scalar state separate without a marker."""
+        r = check_path_feasibility([
+            PathCondition("strlen(input_pre) > 100", step_index=0),
+            PathCondition("strlen(input_post) < 50", step_index=1),
+        ])
+        assert r.feasible is True
+        assert all(
+            x.kind is not RejectionKind.ASSIGNMENT_SHAPED
+            for x in r.unknown_reasons
+        )
+
+    @_requires_z3
+    def test_assignment_in_otherwise_well_formed_condition(self):
+        """If an assignment appears EMBEDDED in something that would
+        otherwise be relational, the assignment-shape detector still
+        fires — better safe than to half-parse it.
+
+        Example: a malformed `(x = 1) > 0` is detected before the
+        relational regex sees it, so we get ASSIGNMENT_SHAPED rather
+        than a confusing partial-parse rejection.
+        """
+        r = check_path_feasibility([
+            PathCondition("(x = 1) > 0", step_index=0),
+        ])
+        assert "(x = 1) > 0" in r.unknown
+        rej = next(
+            x for x in r.unknown_reasons if x.text == "(x = 1) > 0"
+        )
+        assert rej.kind is RejectionKind.ASSIGNMENT_SHAPED
+
+
+# ---------------------------------------------------------------------------
+# Pin the incidental assignment-shape coverage so a "simplify this
+# regex" refactor breaks loudly. The cases below all match via
+# substring overlap with a *designed* alternation rather than by a
+# dedicated pattern; dropping the designed alternation that carries
+# them would silently regress coverage.
+#
+# See `_ASSIGNMENT_SHAPED_RE` in smt_path_validator.py for the
+# full table of designed vs incidental matches.
+# ---------------------------------------------------------------------------
+
+class TestAssignmentShapeCoverage:
+    """Pin the incidental + edge-case behaviour of _ASSIGNMENT_SHAPED_RE.
+
+    Every case here is documented as either intentional-incidental
+    coverage we want to keep, or a known-rare false positive we're
+    knowingly accepting. Tests fail if either category drifts.
+    """
+
+    @_requires_z3
+    @pytest.mark.parametrize("text,which_alternation", [
+        # Python language operators not in the designed enumeration:
+        (":=",  "bare `=` (`:` not in lookbehind exclusion)"),
+        ("**=", "trailing `*=` matches `[+\\-*/%&|^]=`"),
+        ("//=", "trailing `/=` matches `[+\\-*/%&|^]=`"),
+        ("@=",  "bare `=` (`@` not in lookbehind exclusion)"),
+        # Java language operator not in the designed enumeration:
+        (">>>=", "trailing `>>=` matches `<<=|>>=`"),
+    ])
+    def test_incidental_assignment_shapes_pinned(self, text, which_alternation):
+        """Each incidental match must keep routing to
+        ASSIGNMENT_SHAPED so a regex refactor can't silently drop
+        coverage of these operators.
+
+        ``which_alternation`` documents WHICH designed alternation
+        carries the incidental coverage — when this test fails after
+        a refactor, the message names the load-bearing pattern that
+        was removed or weakened.
+        """
+        # Wrap in a minimal condition so the parser pipeline runs.
+        # `x text y` ensures the text appears at a position where
+        # any of the alternations could fire.
+        cond_text = f"x {text} y"
+        r = check_path_feasibility([
+            PathCondition(cond_text, step_index=0),
+        ])
+        assert cond_text in r.unknown, (
+            f"expected ASSIGNMENT_SHAPED rejection for {cond_text!r} "
+            f"(carried by: {which_alternation})"
+        )
+        rej = next(x for x in r.unknown_reasons if x.text == cond_text)
+        assert rej.kind is RejectionKind.ASSIGNMENT_SHAPED, (
+            f"{cond_text!r} no longer matches ASSIGNMENT_SHAPED — "
+            f"check whether the regex refactor dropped the alternation "
+            f"that previously carried this case incidentally: "
+            f"{which_alternation}"
+        )
+
+    @_requires_z3
+    def test_numeric_double_negation_flagged_as_assignment(self):
+        """Documented exotic false positive: ``--x > 0`` (numeric
+        double-negation) matches the ``--`` decrement alternation
+        and routes to ASSIGNMENT_SHAPED.
+
+        Effectively never seen in real path-condition input — C
+        rejects ``--literal`` at compile time and LLMs don't emit
+        this shape. Pinned here so a future fix that special-cases
+        it can land with the existing test flipping rather than as
+        a silent behaviour change. If an operator hits this case
+        in the wild, rephrasing as ``x != 0`` or ``0 - x`` in the
+        condition string sidesteps it.
+        """
+        r = check_path_feasibility([
+            PathCondition("--x > 0", step_index=0),
+        ])
+        assert "--x > 0" in r.unknown
+        rej = next(x for x in r.unknown_reasons if x.text == "--x > 0")
+        assert rej.kind is RejectionKind.ASSIGNMENT_SHAPED
+
+    @_requires_z3
+    def test_single_negative_literal_not_misdetected(self):
+        """``x == -1`` and ``offset > -16`` contain a single ``-``
+        but no ``--``; the increment/decrement alternation does NOT
+        match these. Important because ``rejection.parse_literal_value``
+        accepts negative decimal literals at signed profiles."""
+        for text in ("x == -1", "offset > -16", "y >= -128"):
+            r = check_path_feasibility([PathCondition(text, step_index=0)])
+            for rej in r.unknown_reasons:
+                assert rej.kind is not RejectionKind.ASSIGNMENT_SHAPED, (
+                    f"negative literal misdetected as ASSIGNMENT_SHAPED: "
+                    f"{text!r}"
+                )
 
     @_requires_z3
     def test_call_in_bitmask_lhs(self):
-        """Function call in bitmask LHS: ``strlen(s) & 0xff == 0``."""
+        """Function call in bitmask LHS: ``(strlen(s) & 0xff) == 0``."""
         r = check_path_feasibility([
-            PathCondition("strlen(s) & 0xff == 0", step_index=0),
+            PathCondition("(strlen(s) & 0xff) == 0", step_index=0),
         ])
         assert r.unknown == []
         assert r.feasible is True
@@ -806,19 +1147,13 @@ class TestFreeVariableFallback:
         assert r.unknown == []
         assert r.feasible is True
 
-    @_requires_z3
-    def test_anon_counter_progresses_across_conditions(self):
-        """Free-var allocator is seeded from existing ``vars_`` so
-        anon names don't collide across conditions in one path."""
-        # If both calls were assigned `_anon_0`, they'd share a Z3
-        # variable and 'first != 0 AND second == 0' would be unsat-ish
-        # in some encodings.  With distinct vars, both are satisfiable.
-        r = check_path_feasibility([
-            PathCondition("first(x) != 0", step_index=0),
-            PathCondition("second(y) == 0", step_index=1),
-        ])
-        assert r.unknown == []
-        assert r.feasible is True
+# Note: the "anon counter progresses across conditions" assertion
+# previously lived here. The new `test_anon_counter_progresses_across_
+# distinct_calls` (above, in this same class) subsumes it: same input
+# shape (``first(x)`` / ``second(y)``), same feasibility verdict, plus
+# the stronger assertion that two distinct anon entries appear in the
+# model. Keep this stronger occurrence assertion to avoid
+# encoding the same property twice.
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +1224,7 @@ class TestPrecedence:
         the two readings: a=2, b=1, c=2 gives 2|(1+2)=2|3=3, while the
         LTR misparse (2|1)+2 = 3+2 = 5."""
         r = check_path_feasibility([
-            PathCondition("a | b + c == 3", step_index=0),
+            PathCondition("(a | b + c) == 3", step_index=0),
             PathCondition("a == 2", step_index=1),
             PathCondition("b == 1", step_index=2),
             PathCondition("c == 2", step_index=3),
@@ -915,7 +1250,7 @@ class TestPrecedence:
         """``a | b + c * d`` is ``a | (b + (c * d))``.  Values:
         a=0x10, b=2, c=3, d=4 → 0x10 | (2 + 12) = 0x10 | 14 = 0x1E."""
         r = check_path_feasibility([
-            PathCondition("a | b + c * d == 0x1E", step_index=0),
+            PathCondition("(a | b + c * d) == 0x1E", step_index=0),
             PathCondition("a == 0x10", step_index=1),
             PathCondition("b == 2", step_index=2),
             PathCondition("c == 3", step_index=3),
@@ -991,9 +1326,9 @@ class TestParensGrouping:
     @_requires_z3
     def test_parens_in_bitmask_lhs(self):
         """Bitmask form's LHS goes through ``_parse_expr``; parens work
-        there too: ``(a + b) & 0xff == 0``."""
+        there too: ``((a + b) & 0xff) == 0``."""
         r = check_path_feasibility([
-            PathCondition("(a + b) & 0xff == 0", step_index=0),
+            PathCondition("((a + b) & 0xff) == 0", step_index=0),
         ])
         assert r.feasible is True
 
@@ -1079,7 +1414,7 @@ class TestParensGrouping:
     def test_parens_exceeding_depth_limit_rejected(self):
         """Nesting beyond _MAX_PAREN_DEPTH (64) is rejected to prevent
         unbounded recursion from untrusted input."""
-        from packages.codeql.smt_path_validator import _MAX_PAREN_DEPTH
+        from core.smt_solver.path_feasibility import _MAX_PAREN_DEPTH
         inner = "x"
         for _ in range(_MAX_PAREN_DEPTH + 1):
             inner = f"({inner})"
@@ -1108,7 +1443,7 @@ class TestInputLimits:
     @_requires_z3
     def test_condition_length_within_cap_accepted(self):
         """A condition just under ``_MAX_CONDITION_CHARS`` parses normally."""
-        from packages.codeql.smt_path_validator import _MAX_CONDITION_CHARS
+        from core.smt_solver.path_feasibility import _MAX_CONDITION_CHARS
         # Build a condition of length _MAX_CONDITION_CHARS that the parser
         # accepts: ``x + x + x + ... > 0``.  Each ``x + `` token is 4 chars.
         prefix = "x + " * ((_MAX_CONDITION_CHARS - len("x > 0")) // 4)
@@ -1124,7 +1459,7 @@ class TestInputLimits:
     def test_condition_length_over_cap_rejected(self):
         """A condition exceeding ``_MAX_CONDITION_CHARS`` is rejected with
         ``INPUT_TOO_LONG`` before any parser work runs."""
-        from packages.codeql.smt_path_validator import _MAX_CONDITION_CHARS
+        from core.smt_solver.path_feasibility import _MAX_CONDITION_CHARS
         huge = "x" + ("=" * _MAX_CONDITION_CHARS) + "y"
         assert len(huge) > _MAX_CONDITION_CHARS
         r = check_path_feasibility([PathCondition(huge, step_index=0)])
@@ -1140,7 +1475,7 @@ class TestInputLimits:
     @_requires_z3
     def test_condition_count_within_cap_accepted(self):
         """A call with ``_MAX_CONDITIONS_PER_CALL`` items runs normally."""
-        from packages.codeql.smt_path_validator import _MAX_CONDITIONS_PER_CALL
+        from core.smt_solver.path_feasibility import _MAX_CONDITIONS_PER_CALL
         # Use distinct variable names per condition so they trivially
         # satisfy together — focus the test on the count check, not on
         # condition semantics.
@@ -1159,7 +1494,7 @@ class TestInputLimits:
         """A call with more than ``_MAX_CONDITIONS_PER_CALL`` items refuses
         the whole call with ``feasible=None`` and a single
         ``TOO_MANY_CONDITIONS`` rejection."""
-        from packages.codeql.smt_path_validator import _MAX_CONDITIONS_PER_CALL
+        from core.smt_solver.path_feasibility import _MAX_CONDITIONS_PER_CALL
         n = _MAX_CONDITIONS_PER_CALL + 1
         conds = [
             PathCondition(f"x{i} > 0", step_index=i) for i in range(n)
@@ -1194,7 +1529,7 @@ class TestInputLimits:
         whole input.  An adversarial input that's both very long AND has
         deep nesting must short-circuit on length so the balance scan
         never executes."""
-        from packages.codeql.smt_path_validator import (
+        from core.smt_solver.path_feasibility import (
             _MAX_CONDITION_CHARS, _MAX_PAREN_DEPTH,
         )
         # Build a string that's BOTH over the char cap AND has deeper
@@ -1216,15 +1551,16 @@ class TestInputLimits:
         """One oversize condition is rejected without poisoning the rest
         of the call — the other conditions still parse and contribute to
         the joint feasibility verdict."""
-        from packages.codeql.smt_path_validator import _MAX_CONDITION_CHARS
+        from core.smt_solver.path_feasibility import _MAX_CONDITION_CHARS
         huge = "y" + ("=" * _MAX_CONDITION_CHARS) + "0"
         r = check_path_feasibility([
             PathCondition("x > 0", step_index=0),
             PathCondition(huge, step_index=1),
             PathCondition("x < 100", step_index=2),
         ])
-        # The two well-formed conditions are jointly satisfiable.
-        assert r.feasible is True
+        # The two well-formed conditions are jointly satisfiable, but the
+        # rejected condition prevents a full-conjunction SAT verdict.
+        assert r.feasible is None
         # The oversize one is rejected with INPUT_TOO_LONG.
         assert huge in r.unknown
         rej = next(x for x in r.unknown_reasons if x.text == huge)
@@ -1349,3 +1685,620 @@ class TestPreferWitness:
         )
         assert r.feasible is True
         assert r.model.get("count") is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — weakest-precondition predicate extraction
+# ---------------------------------------------------------------------------
+class TestWeakestPrecondition:
+    """WP extraction: the minimal sat-preserving subset of path conjuncts.
+
+    The properties below use ``check_path_feasibility`` itself as the
+    oracle — ``PathCondition(text, negated=True)`` asserts ``¬text``, so
+    feasibility of ``W + [¬c]`` decides whether ``W`` implies ``c``.
+    """
+
+    @staticmethod
+    def _conds(texts):
+        return [PathCondition(t, step_index=i) for i, t in enumerate(texts)]
+
+    @_requires_z3
+    def test_feasible_path_carries_wp_fields(self):
+        r = check_path_feasibility(self._conds(["size > 5", "size < 100"]))
+        assert r.feasible is True
+        assert r.wp_predicate is not None
+        assert r.wp_complete is True
+        assert r.wp_ordering == "canonical-text-lexicographic"
+
+    @_requires_z3
+    def test_redundant_conjunct_dropped(self):
+        # ``size > 5`` implies ``size > 0`` — the weaker bound is redundant.
+        r = check_path_feasibility(self._conds(["size > 5", "size > 0"]))
+        assert r.feasible is True
+        assert r.wp_conjuncts == ["size > 5"]
+
+    @_requires_z3
+    def test_independent_conjuncts_all_kept(self):
+        r = check_path_feasibility(self._conds(["size > 5", "offset < 3"]))
+        assert r.feasible is True
+        assert set(r.wp_conjuncts) == {"size > 5", "offset < 3"}
+
+    @_requires_z3
+    def test_unsat_path_has_no_wp(self):
+        r = check_path_feasibility(self._conds(["size > 5", "size < 0"]))
+        assert r.feasible is False
+        assert r.wp_predicate is None
+        assert r.wp_conjuncts == []
+
+    def test_no_z3_has_no_wp(self):
+        with patch("core.smt_solver.path_feasibility._z3_available",
+                   return_value=False):
+            r = check_path_feasibility([PathCondition("size > 0", step_index=0)])
+        assert r.wp_predicate is None
+        assert r.wp_conjuncts == []
+
+    @_requires_z3
+    def test_deterministic_across_runs(self):
+        conds = self._conds(["size > 5", "size > 0", "offset < 3"])
+        a = check_path_feasibility(conds)
+        b = check_path_feasibility(conds)
+        assert a.wp_conjuncts == b.wp_conjuncts
+        assert a.wp_predicate == b.wp_predicate
+
+    @_requires_z3
+    def test_wp_equivalent_to_full_path(self):
+        # Sat-preserving: ⋀W ⟹ ⋀C, i.e. for every original conjunct c,
+        # ``(⋀W ∧ ¬c)`` is unsat. With W ⊆ C this makes W ≡ C.
+        originals = ["size > 5", "size > 0", "size < 100", "offset < 3"]
+        r = check_path_feasibility(self._conds(originals))
+        assert r.feasible is True
+        W = r.wp_conjuncts
+        for c in originals:
+            probe = self._conds(W) + [
+                PathCondition(c, step_index=len(W), negated=True)]
+            assert check_path_feasibility(probe).feasible is False, (
+                f"W does not imply original conjunct {c!r}")
+
+    @_requires_z3
+    def test_wp_is_minimal(self):
+        # Minimality: for each c_i ∈ W, ``(⋀(W∖{c_i}) ∧ ¬c_i)`` is sat —
+        # dropping c_i would admit models violating it, so it is
+        # load-bearing and could not have been removed.
+        originals = ["size > 5", "size > 0", "size < 100", "offset < 3"]
+        r = check_path_feasibility(self._conds(originals))
+        W = r.wp_conjuncts
+        assert len(W) >= 1
+        for i, c_i in enumerate(W):
+            rest = [c for j, c in enumerate(W) if j != i]
+            probe = self._conds(rest) + [
+                PathCondition(c_i, step_index=len(rest), negated=True)]
+            assert check_path_feasibility(probe).feasible is True, (
+                f"kept conjunct {c_i!r} is implied by the rest — not minimal")
+
+    @_requires_z3
+    def test_cap_marks_incomplete(self):
+        from core.smt_solver.path_feasibility import WP_MAX_SOLVER_CALLS
+        # More independent conjuncts than the deletion-pass cap: the pass
+        # can't test them all, so it must report wp_complete=False.
+        n = WP_MAX_SOLVER_CALLS + 5
+        conds = [PathCondition(f"v{i} > {i}", step_index=i) for i in range(n)]
+        r = check_path_feasibility(conds)
+        assert r.feasible is True
+        assert r.wp_predicate is not None
+        assert r.wp_complete is False
+
+    @_requires_z3
+    def test_all_conjuncts_mutually_implied_returns_true(self):
+        """When every conjunct implies every other (all equivalent), the
+        deletion pass drops all but one.  If the input is crafted so that
+        even the last survivor is a tautology, ``_extract_wp`` returns
+        the ``"true"`` degenerate form."""
+        from core.smt_solver.path_feasibility import _extract_wp
+        import z3
+
+        x = z3.BitVec("x", 32)
+        # Two tautologies: x == x and x >= 0 (unsigned — always true)
+        taut1 = x == x
+        taut2 = z3.UGE(x, z3.BitVecVal(0, 32))
+        wp, conj, complete = _extract_wp([("x == x", taut1), ("x >= 0", taut2)])
+        # Both are tautologies so each implies the other — all dropped.
+        assert wp == "true"
+        assert conj == []
+        assert complete is True
+
+    @_requires_z3
+    def test_solver_timeout_keeps_conjunct(self):
+        """When a redundancy check returns ``unknown`` (e.g. solver
+        timeout), keep the conjunct and mark reduction incomplete."""
+        from core.smt_solver.path_feasibility import _extract_wp
+        import z3
+
+        x = z3.BitVec("x", 32)
+        exprs = [
+            ("x > 5", z3.UGT(x, z3.BitVecVal(5, 32))),
+            ("x > 0", z3.UGT(x, z3.BitVecVal(0, 32))),
+        ]
+        # Every redundancy query returns unknown; none can justify deletion.
+        real_extract = _extract_wp
+        with patch("core.smt_solver.path_feasibility._new_solver") as mock_ns:
+            mock_solver = mock_ns.return_value
+            mock_solver.check.return_value = z3.unknown
+            mock_solver.__enter__ = lambda s: s
+            mock_solver.__exit__ = lambda s, *a: None
+            wp, conj, complete = real_extract(exprs)
+        assert set(conj) == {text for text, _ in exprs}
+        assert wp is not None
+        assert complete is False
+
+
+# ---------------------------------------------------------------------------
+# Call-summary axioms
+# ---------------------------------------------------------------------------
+
+@_requires_z3
+class TestCallSummaries:
+    """Recognised libc/POSIX calls get summary axioms on their
+    placeholder; unknown calls and vacuous profiles keep the free
+    variable untouched."""
+
+    def test_strlen_negative_refuted_at_signed_profile(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [PathCondition("strlen(s) < 0", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert r.feasible is False
+        assert r.summary_axioms == ["summary: strlen(s)"]
+
+    def test_strlen_axiom_skipped_at_unsigned_profile(self):
+        # result >= 0 is vacuous over unsigned bitvectors — asserting
+        # it would be junk, and the path must stay feasible.
+        r = check_path_feasibility(
+            [PathCondition("strlen(s) < 1024", step_index=0)],
+        )
+        assert r.feasible is True
+        assert r.summary_axioms == []
+
+    def test_sizeof_zero_refuted_and_core_names_axiom(self):
+        r = check_path_feasibility(
+            [PathCondition("sizeof(x) == 0", step_index=0)],
+        )
+        assert r.feasible is False
+        assert "summary: sizeof(x)" in r.unsatisfied
+
+    def test_sizeof_axiom_applies_at_signed_profile_too(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [PathCondition("sizeof(x) == 0", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert r.feasible is False
+
+    def test_abs_models_int_min_corner(self):
+        # abs(INT_MIN) == INT_MIN in two's-complement practice, so a
+        # path requiring abs(v) to be INT_MIN must stay feasible...
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [PathCondition("abs(v) == 0x80000000", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert r.feasible is True
+        # ...while any other negative value is refuted.
+        r2 = check_path_feasibility(
+            [PathCondition("abs(v) == 0xFFFFFFFF", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert r2.feasible is False
+
+    def test_min_ite_definition(self):
+        r = check_path_feasibility(
+            [PathCondition("min(a, b) > a", step_index=0)],
+        )
+        assert r.feasible is False
+        r2 = check_path_feasibility(
+            [PathCondition("max(a, b) >= a", step_index=0)],
+        )
+        assert r2.feasible is True
+
+    def test_min_with_unparseable_arg_stays_free(self):
+        # Nested call inside the args — no axiom, free variable as
+        # before, so even min(...) > a is satisfiable.
+        r = check_path_feasibility(
+            [PathCondition("min(strlen(x), b) > b", step_index=0)],
+        )
+        assert r.feasible is True
+        assert r.summary_axioms == []
+
+    def test_unknown_call_unchanged(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [PathCondition("mystery(s) < 0", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert r.feasible is True
+        assert r.summary_axioms == []
+
+    def test_case_sensitive_match(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [PathCondition("STRLEN(s) < 0", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert r.feasible is True
+        assert r.summary_axioms == []
+
+    def test_axiom_recorded_for_each_call_occurrence(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [
+                PathCondition("strlen(s) > 10", step_index=0),
+                PathCondition("strlen(s) < 100", step_index=1),
+            ],
+            profile=BV_C_INT32,
+        )
+        assert r.feasible is True
+        assert r.summary_axioms == ["summary: strlen(s)"] * 2
+
+    def test_wp_drops_axiom_implied_conjuncts(self):
+        # Both conditions are implied by the min() ITE axiom, so the
+        # weakest precondition over the path conjuncts is empty
+        # ("true") — the axiom carries the constraint, and the result
+        # names it in summary_axioms.
+        r = check_path_feasibility(
+            [
+                PathCondition("min(a, b) <= a", step_index=0),
+                PathCondition("min(a, b) <= b", step_index=1),
+            ],
+        )
+        assert r.feasible is True
+        assert r.wp_conjuncts == []
+        assert r.wp_predicate == "true"
+        assert r.summary_axioms == ["summary: min(a, b)"] * 2
+
+    def test_summary_reported_in_reasoning(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility(
+            [PathCondition("strlen(s) > 10", step_index=0)],
+            profile=BV_C_INT32,
+        )
+        assert "1 call summary applied" in r.reasoning
+
+
+# ---------------------------------------------------------------------------
+# check_path_feasibility_dual — signedness-agreement refutation
+# ---------------------------------------------------------------------------
+
+class TestDualSignedness:
+    """A refutation under a GUESSED signedness profile must be confirmed
+    by the signedness-flipped sibling before it is honored — ``ret < 0``
+    (the standard C signed error check) is unsat as ``ULT(ret, 0)``
+    under the default unsigned profile, and a single such guard would
+    otherwise refute (suppress) the whole finding pre-LLM."""
+
+    @_requires_z3
+    def test_signed_guard_unsat_under_default_unsigned_profile(self):
+        # Documents the single-profile hazard the dual check defends
+        # against: unsigned-only evaluation refutes a live signed guard.
+        r = check_path_feasibility([PathCondition("ret < 0", step_index=0)])
+        assert r.feasible is False
+
+    @_requires_z3
+    def test_dual_does_not_refute_signed_guard(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        r = check_path_feasibility_dual(
+            [PathCondition("ret < 0", step_index=0)],
+        )
+        # Satisfiable at the signed sibling profile — never refuted.
+        assert r.feasible is True
+        assert "signedness" in r.reasoning
+
+    @_requires_z3
+    def test_dual_still_refutes_signedness_robust_contradiction(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        r = check_path_feasibility_dual([
+            PathCondition("x == 1", step_index=0),
+            PathCondition("x == 2", step_index=1),
+        ])
+        # Unsat regardless of signedness — the refutation stands.
+        assert r.feasible is False
+        assert "signedness-robust" in r.reasoning
+
+    @_requires_z3
+    def test_dual_sat_path_solves_primary_profile_only(self):
+        import core.smt_solver.path_feasibility as pf
+        calls = []
+        real = pf.check_path_feasibility
+
+        def counting(conditions, **kwargs):
+            calls.append(kwargs.get("profile"))
+            return real(conditions, **kwargs)
+
+        with patch.object(pf, "check_path_feasibility", counting):
+            r = pf.check_path_feasibility_dual(
+                [PathCondition("size > 0", step_index=0)],
+            )
+        assert r.feasible is True
+        assert len(calls) == 1  # sibling never solved on the sat path
+
+    def test_dual_sibling_inconclusive_refuses_refutation(self):
+        import core.smt_solver.path_feasibility as pf
+
+        unsat = pf.PathSMTResult(
+            feasible=False, satisfied=[], unsatisfied=["c"], unknown=[],
+            model={}, smt_available=True, reasoning="unsat",
+        )
+        unknown = pf.PathSMTResult(
+            feasible=None, satisfied=[], unsatisfied=[], unknown=["c"],
+            model={}, smt_available=True, reasoning="timeout",
+        )
+        with patch.object(
+            pf, "check_path_feasibility", side_effect=[unsat, unknown],
+        ):
+            r = pf.check_path_feasibility_dual(
+                [PathCondition("c", step_index=0)],
+            )
+        assert r.feasible is None
+        assert "refusing the refutation" in r.reasoning
+
+    @_requires_z3
+    def test_dual_mixed_signedness_disjoint_cores_not_refuted(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        # ``ssize_t ret`` / ``size_t size``: jointly feasible in C
+        # (ret = -1, size = 2**63) yet unsat under BOTH shared
+        # profiles — the unsigned leg's core is ``ret < 0``, the
+        # signed leg's is the high bound. Each shared profile forces
+        # ALL variables to one signedness; neither core re-solves
+        # unsat under both profiles, so this must not refute. Same
+        # per common C error-guard spellings — the false-refutation
+        # class must stay closed for every one of them.
+        for guard in ("ret", "err", "rc", "fd", "status"):
+            r = check_path_feasibility_dual([
+                PathCondition(f"{guard} < 0", step_index=0),
+                PathCondition("size > 0x7FFFFFFFFFFFFFFF", step_index=1),
+            ])
+            assert r.feasible is None, guard
+            assert "refusing the refutation" in r.reasoning
+
+    @_requires_z3
+    def test_dual_shared_core_condition_alone_not_refuted(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        # ``ssize_t r`` / ``size_t s`` (the C ``ret == len`` mixed
+        # signed/unsigned comparison idiom): satisfiable in compiled C
+        # (r = -1, s = UINT64_MAX) yet unsat under BOTH shared
+        # profiles WITH an overlapping core — the signed leg's core is
+        # the lone high bound, which the unsigned leg's core also
+        # contains. A shared core CONDITION is not a shared
+        # contradiction: the shared subset is satisfiable under the
+        # unsigned profile, so the refutation must be refused.
+        r = check_path_feasibility_dual([
+            PathCondition("r == s", step_index=0),
+            PathCondition("s > 0x7FFFFFFFFFFFFFFF", step_index=1),
+            PathCondition("r <= 0x7FFFFFFFFFFFFFFF", step_index=2),
+        ])
+        assert r.feasible is None
+        assert "refusing the refutation" in r.reasoning
+
+    @_requires_z3
+    def test_dual_pure_contradiction_still_refuted(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        # A single-variable contradiction is unsat under any
+        # signedness; the exhibited-subset rule must keep refuting it.
+        r = check_path_feasibility_dual([
+            PathCondition("x > 5", step_index=0),
+            PathCondition("x < 3", step_index=1),
+        ])
+        assert r.feasible is False
+        assert "signedness-robust" in r.reasoning
+
+    @_requires_z3
+    def test_dual_guarded_contradiction_rescued(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        # A genuinely-infeasible set carrying an independent signed
+        # error-guard — ubiquitous on C paths. The unsigned leg's
+        # minimal core is the lone guard, the signed leg's is the
+        # real contradiction: disjoint. The disjoint-core rescue must
+        # find the contradiction core unsat under BOTH profiles and
+        # keep the refutation; a rule without it refuses every
+        # guard-carrying infeasible path.
+        for guard in ("ret", "err", "rc", "fd", "status"):
+            r = check_path_feasibility_dual([
+                PathCondition(f"{guard} < 0", step_index=0),
+                PathCondition("x > 100", step_index=1),
+                PathCondition("x < 50", step_index=2),
+            ])
+            assert r.feasible is False, guard
+            assert "signedness-robust" in r.reasoning
+
+    @_requires_z3
+    def test_dual_guard_self_contradiction_still_refuted(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        # The contradiction sits ON the guard variable itself: unsat
+        # for signed g (nothing is < 0 and > 10) and for unsigned g
+        # (g < 0 alone). A single identifier means the two profiles
+        # enumerate its whole interpretation space, so the sibling
+        # leg's core exhibits a conclusive contradiction.
+        for guard in ("ret", "err", "len"):
+            r = check_path_feasibility_dual([
+                PathCondition(f"{guard} < 0", step_index=0),
+                PathCondition(f"{guard} > 10", step_index=1),
+            ])
+            assert r.feasible is False, guard
+            assert "signedness-robust" in r.reasoning
+
+    @_requires_z3
+    def test_dual_multi_identifier_contradiction_refused(self):
+        from core.smt_solver.path_feasibility import (
+            check_path_feasibility_dual,
+        )
+        # [x > y, y > x] is infeasible when both comparisons share one
+        # signedness, but the shared-profile encoding cannot exhibit a
+        # per-variable-robust witness of that (a mixed encoding
+        # satisfies it, e.g. x = 2**63 unsigned, y = 1 signed) — so
+        # the dual check refuses and the path is analysed instead.
+        # Documented cost of the exhibited-contradiction rule;
+        # per-variable profiles are the full fix.
+        r = check_path_feasibility_dual([
+            PathCondition("x > y", step_index=0),
+            PathCondition("y > x", step_index=1),
+        ])
+        assert r.feasible is None
+        assert "refusing the refutation" in r.reasoning
+
+    def test_dual_disjoint_core_refutation_refused_without_z3(self):
+        import core.smt_solver.path_feasibility as pf
+
+        unsat_a = pf.PathSMTResult(
+            feasible=False, satisfied=[], unsatisfied=["a < 0"],
+            unknown=[], model={}, smt_available=True, reasoning="unsat",
+        )
+        unsat_b = pf.PathSMTResult(
+            feasible=False, satisfied=[], unsatisfied=["b > 5"],
+            unknown=[], model={}, smt_available=True, reasoning="unsat",
+        )
+        sat_sub = pf.PathSMTResult(
+            feasible=True, satisfied=[], unsatisfied=[],
+            unknown=[], model={}, smt_available=True, reasoning="sat",
+        )
+        # Legs disagree on WHICH condition is contradictory and each
+        # leg's core re-solves sat under the flipped profile — no
+        # exhibited cross-profile contradiction, so the dual check
+        # refuses (two candidate probes, first profile each).
+        with patch.object(
+            pf, "check_path_feasibility",
+            side_effect=[unsat_a, unsat_b, sat_sub, sat_sub],
+        ):
+            r = pf.check_path_feasibility_dual(
+                [PathCondition("a < 0", step_index=0),
+                 PathCondition("b > 5", step_index=1)],
+            )
+        assert r.feasible is None
+        assert "refusing the refutation" in r.reasoning
+
+    def test_dual_disjoint_core_cross_profile_rescue_without_z3(self):
+        import core.smt_solver.path_feasibility as pf
+
+        unsat_guard = pf.PathSMTResult(
+            feasible=False, satisfied=[], unsatisfied=["g < 0"],
+            unknown=[], model={}, smt_available=True, reasoning="unsat",
+        )
+        unsat_pair = pf.PathSMTResult(
+            feasible=False, satisfied=[], unsatisfied=["x > 100", "x < 50"],
+            unknown=[], model={}, smt_available=True, reasoning="unsat",
+        )
+        sat_sub = pf.PathSMTResult(
+            feasible=True, satisfied=[], unsatisfied=[],
+            unknown=[], model={}, smt_available=True, reasoning="sat",
+        )
+        # First candidate (the guard core) fails its first re-solve;
+        # the second candidate (the real contradiction) re-solves
+        # unsat under both profiles — refutation honored.
+        with patch.object(
+            pf, "check_path_feasibility",
+            side_effect=[unsat_guard, unsat_pair,
+                         sat_sub, unsat_pair, unsat_pair],
+        ):
+            r = pf.check_path_feasibility_dual(
+                [PathCondition("g < 0", step_index=0),
+                 PathCondition("x > 100", step_index=1),
+                 PathCondition("x < 50", step_index=2)],
+            )
+        assert r.feasible is False
+        assert "exhibited cross-profile contradiction" in r.reasoning
+
+    def test_dual_shared_core_subset_sat_refused_without_z3(self):
+        import core.smt_solver.path_feasibility as pf
+
+        unsat_all = pf.PathSMTResult(
+            feasible=False, satisfied=[],
+            unsatisfied=["r == s", "s > 9", "r <= 9"],
+            unknown=[], model={}, smt_available=True, reasoning="unsat",
+        )
+        unsat_bound = pf.PathSMTResult(
+            feasible=False, satisfied=[], unsatisfied=["s > 9"],
+            unknown=[], model={}, smt_available=True, reasoning="unsat",
+        )
+        sat_sub = pf.PathSMTResult(
+            feasible=True, satisfied=[], unsatisfied=[],
+            unknown=[], model={}, smt_available=True, reasoning="sat",
+        )
+        # Cores overlap on one condition, but that shared subset
+        # re-solves sat under the first profile: condition-identity is
+        # not contradiction-identity — the refutation is refused.
+        with patch.object(
+            pf, "check_path_feasibility",
+            side_effect=[unsat_all, unsat_bound, sat_sub],
+        ):
+            r = pf.check_path_feasibility_dual(
+                [PathCondition("r == s", step_index=0),
+                 PathCondition("s > 9", step_index=1),
+                 PathCondition("r <= 9", step_index=2)],
+            )
+        assert r.feasible is None
+        assert "refusing the refutation" in r.reasoning
+
+
+class TestSignedProfileHexLiteralPromotion:
+    """C's usual arithmetic conversions: a hex literal that does not
+    fit the signed type has UNSIGNED type, so the whole comparison is
+    unsigned. Encoding ``x <= 0x80000000`` as signed at int32 read the
+    literal as INT_MIN and made ``<=`` equivalent to ``== INT_MIN`` —
+    a false unsat that signed-pinned callers (which skip the dual
+    check) turned directly into suppression."""
+
+    @_requires_z3
+    def test_large_hex_literal_comparison_is_unsigned(self):
+        from core.smt_solver import BV_C_INT32
+        r = check_path_feasibility([
+            PathCondition("x <= 0x80000000", step_index=0),
+            PathCondition("x != 0x80000000", step_index=1),
+        ], profile=BV_C_INT32)
+        # x = 5 satisfies both in C; the signed misread refuted it.
+        assert r.feasible is True
+
+    @_requires_z3
+    def test_in_range_hex_literal_keeps_signed_semantics(self):
+        from core.smt_solver import BV_C_INT32
+        # Discriminator: under SIGNED semantics x = -1 satisfies
+        # ``x < 0x1 && x != 0x0``; under unsigned it is unsat
+        # (x < 1 forces x == 0). An in-signed-range literal must not
+        # flip the comparison to unsigned.
+        r = check_path_feasibility([
+            PathCondition("x < 0x1", step_index=0),
+            PathCondition("x != 0x0", step_index=1),
+        ], profile=BV_C_INT32)
+        assert r.feasible is True
+
+    @_requires_z3
+    def test_unsigned_profile_unaffected(self):
+        r = check_path_feasibility([
+            PathCondition("x < 0x1", step_index=0),
+            PathCondition("x != 0x0", step_index=1),
+        ])  # default 64-bit unsigned
+        assert r.feasible is False
+
+
+@_requires_z3
+@pytest.mark.parametrize('reduce', [False, True])
+def test_pinned_signed_profile_keeps_unsigned_type_inside_compound_guard(reduce):
+    from core.smt_solver import BV_C_INT32
+
+    result = check_path_feasibility([
+        PathCondition('Value == 0', 0),
+        PathCondition('(Value + 0x80000000) > 0', 1),
+    ], profile=BV_C_INT32, reduce_constraints=reduce)
+    assert result.feasible is True
+    assert result.model['Value'] == 0

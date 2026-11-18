@@ -13,9 +13,38 @@ CostTracker.
 """
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
+
+from core.llm.coerce import structured_result
+from core.llm.cost import sanitize_iterations
 
 logger = logging.getLogger(__name__)
+
+
+def _cost_model_key(model: Any) -> str:
+    """Cost-attribution key for a model spec — never its repr.
+
+    The key becomes the ``cost_by_model`` label emitted verbatim into
+    the run report, which operators share when reporting issues.
+    ModelConfig-style dataclasses carry ``api_key`` as a repr-visible
+    field, so falling back to ``str(model)`` would write credential
+    material into that artifact. Read the known name attributes
+    (``model_name`` on ModelConfig, ``model`` on plain client shapes)
+    and otherwise fall back to the class name, which is structurally
+    incapable of carrying secrets. Non-string attribute values are
+    ignored for the same reason — only a plain string name is trusted
+    as a label.
+    """
+    if model is None:
+        return "unknown"
+    if isinstance(model, str):
+        return model or "unknown"
+    for attr in ("model_name", "model"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(model).__name__
 
 
 class DispatchClient:
@@ -29,8 +58,8 @@ class DispatchClient:
             call this adapter makes. The orchestrator selects this once
             per /agentic run; we don't need per-call model selection.
         cost_tracker: Optional CostTracker. When provided, each call's
-            cost is added so the budget guard sees dataflow validation
-            work.
+            cost and token usage are added so budget and telemetry totals
+            include dataflow validation work.
         temperature: Sampling temperature, default 0.0 (deterministic).
             hypothesis_validation generates rules and evaluates evidence;
             both want low entropy.
@@ -41,9 +70,9 @@ class DispatchClient:
         dispatch_fn: Callable,
         model: Any,
         *,
-        cost_tracker: Optional[Any] = None,
+        cost_tracker: Any | None = None,
         temperature: float = 0.0,
-    ):
+    ) -> None:
         self._dispatch_fn = dispatch_fn
         self._model = model
         self._cost_tracker = cost_tracker
@@ -52,11 +81,11 @@ class DispatchClient:
     def generate_structured(
         self,
         prompt: str,
-        schema: Dict[str, Any],
-        system_prompt: Optional[str] = None,
-        task_type: Optional[str] = None,
+        schema: dict[str, Any],
+        system_prompt: str | None = None,
+        task_type: str | None = None,
         **kwargs: Any,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Invoke the orchestrator's dispatch_fn and return the parsed dict.
 
         `task_type` is accepted for protocol compatibility but ignored —
@@ -72,18 +101,25 @@ class DispatchClient:
             response = self._dispatch_fn(
                 prompt, schema, system_prompt, self._temperature, self._model,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — fail-open: any dispatch failure means "no verdict"
             logger.warning("dispatch_fn raised during dataflow validation: %s", e)
             return None
 
         cost = getattr(response, "cost", 0.0) or 0.0
-        if cost and self._cost_tracker is not None:
+        tokens = sanitize_iterations(getattr(response, "tokens", 0))
+        thinking_tokens = sanitize_iterations(getattr(response, "thinking_tokens", 0))
+        if (cost or tokens or thinking_tokens) and self._cost_tracker is not None:
             try:
-                self._cost_tracker.add_cost(cost)
-            except Exception as e:
-                logger.debug("cost_tracker.add_cost failed: %s", e)
+                self._cost_tracker.add_cost(
+                    _cost_model_key(self._model), cost,
+                    tokens=tokens, thinking_tokens=thinking_tokens,
+                )
+            except Exception as e:  # noqa: BLE001 — cost accounting must never sink the validation
+                logger.debug(
+                    "cost_tracker.add_cost failed: %s", e,
+                )
 
-        result = getattr(response, "result", None)
+        result = structured_result(response)
         if not isinstance(result, dict):
             return None
         if "error" in result:

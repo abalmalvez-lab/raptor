@@ -2,21 +2,38 @@
 
 import json
 import os
-import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from core.testing.standalone_cli import run_standalone_cli
 
-REPO_ROOT = Path(os.environ["RAPTOR_DIR"])
+
+# parents[3] climbs: [0] tests/ -> [1] orchestration/ -> [2] core/ -> [3] repo root.
+# Derive from __file__ rather than os.environ["RAPTOR_DIR"]: it doesn't KeyError
+# when the env var is unset, and it correctly resolves to *this* checkout (e.g. a
+# git worktree), not whatever RAPTOR_DIR happens to point at.
+REPO_ROOT = Path(__file__).resolve().parents[3]
 WRAPPER = REPO_ROOT / "libexec" / "raptor-normalize-context-map"
 
 
 def _run(*args, **kwargs):
-    """Invoke the wrapper as a real subprocess (matches how skills call it)."""
-    return subprocess.run(
-        [str(WRAPPER), *args],
-        capture_output=True, text=True, timeout=15, **kwargs,
+    """Invoke the wrapper as a real subprocess (matches how skills call it).
+
+    Timeout: 60s. The wrapper's cold-start cost is dominated by
+    ``core.orchestration.understand_bridge`` import + its transitive
+    dependencies (tree-sitter, model data, sandbox primitives) —
+    ~17s on a typical workstation. The original 15s timeout was set
+    when the import chain was thinner; ran flaky as RAPTOR's
+    inventory substrate grew. 60s leaves comfortable headroom
+    without masking a genuine wedge."""
+    provided_env = kwargs.pop("env", None)
+    env = dict(os.environ if provided_env is None else provided_env)
+    env.update(_RAPTOR_TRUSTED="1", _RAPTOR_SCRATCH_AUTH="stale-test-authorization",
+               RAPTOR_SESSION_PID="invalid", RAPTOR_SESSION_TOKEN="stale")
+    return run_standalone_cli(
+        [str(WRAPPER), *args], env=env,
+        capture_output=True, text=True, timeout=60, **kwargs,
     )
 
 

@@ -1,0 +1,729 @@
+"""Tests for core.concepts.reading_list — shared reading list primitive."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+from core.concepts.reading_list import (
+    Priority,
+    ReadingList,
+    ReadingListItem,
+)
+
+# ------------------------------------------------------------------
+# Fixtures
+# ------------------------------------------------------------------
+
+def _item(
+    id: str,
+    question: str = "what is this?",
+    command: str = "/audit",
+    priority: str = Priority.NORMAL,
+    **kw,
+) -> ReadingListItem:
+    return ReadingListItem(
+        id=id, question=question, source_command=command,
+        priority=priority, **kw,
+    )
+
+
+# ------------------------------------------------------------------
+# ReadingListItem
+# ------------------------------------------------------------------
+
+class TestReadingListItem:
+    def test_defaults(self) -> None:
+        item = _item("rl-001")
+        assert not item.resolved
+        assert item.resolved_concept_id is None
+        assert item.resolved_at is None
+
+    def test_resolve(self) -> None:
+        item = _item("rl-001")
+        item.resolve("page_ownership")
+        assert item.resolved
+        assert item.resolved_concept_id == "page_ownership"
+        assert item.resolved_at is not None
+
+    def test_source_fields(self) -> None:
+        item = ReadingListItem(
+            id="rl-002",
+            question="what does sg_chain do?",
+            source_command="/patch",
+            source_file="crypto/algif_aead.c",
+            source_line=244,
+            source_function="aead_recvmsg",
+            priority=Priority.HIGH,
+            context="generating fix for page-cache corruption",
+        )
+        assert item.source_command == "/patch"
+        assert item.source_file == "crypto/algif_aead.c"
+        assert item.source_line == 244
+        assert item.priority == Priority.HIGH
+
+    def test_null_str_fields_normalised_at_construction(self) -> None:
+        # Producers hand LLM-derived values into the str fields, and
+        # load() rehydrates persisted rows through this constructor:
+        # a present-but-null value must land as the field default, so
+        # a poisoned reading-list.json heals on load instead of
+        # crashing every consumer that trusts the str schema.
+        item = ReadingListItem(**{
+            "id": "rl-003",
+            "question": "what does sg_chain do?",
+            "source_command": "/audit",
+            "source_file": None,
+            "source_function": None,
+            "source_hash": None,
+            "context": None,
+        })
+        assert item.source_file == ""
+        assert item.source_function == ""
+        assert item.source_hash == ""
+        assert item.context == ""
+
+    def test_non_str_leaves_normalised_at_construction(self) -> None:
+        # One step past null in the same LLM drift class: int/list/
+        # dict leaves in the str-typed fields route like absent, and
+        # the enum-backed fields heal to their DEFAULTS (an empty
+        # string is not a valid Priority/Resolution — "" there would
+        # trade a None crash for a ValueError downstream).
+        item = ReadingListItem(**{
+            "id": "rl-004",
+            "question": 42,
+            "source_command": "/audit",
+            "source_file": 9,
+            "source_function": ["f"],
+            "context": {"k": 1},
+            "priority": None,
+            "resolution": None,
+        })
+        assert item.question == ""
+        assert item.source_file == ""
+        assert item.source_function == ""
+        assert item.context == ""
+        assert item.priority == "normal"
+        assert item.resolution == "identifier"
+        assert set(item._healed_fields) == {
+            "question", "source_file", "source_function", "context",
+            "priority", "resolution",
+        }
+
+    def test_clean_construction_heals_nothing(self) -> None:
+        item = ReadingListItem(
+            id="rl-005",
+            question="q?",
+            source_command="/audit",
+        )
+        assert item._healed_fields == ()
+
+
+# ------------------------------------------------------------------
+# ReadingList — queue operations
+# ------------------------------------------------------------------
+
+class TestReadingListQueue:
+    def test_queue_adds_item(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        assert len(rl) == 1
+
+    def test_dedup_same_question(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001", question="what is page ownership?"))
+        rl.queue(_item("rl-002", question="what is page ownership?"))
+        assert len(rl) == 1
+
+    def test_dedup_allows_resolved(self) -> None:
+        rl = ReadingList()
+        item = _item("rl-001", question="what is page ownership?")
+        item.resolve("page_ownership")
+        rl.queue(item)
+        rl.queue(_item("rl-002", question="what is page ownership?"))
+        assert len(rl) == 2
+
+    def test_dedup_escalates_priority(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001", question="what is page ownership?",
+                        priority=Priority.NORMAL))
+        rl.queue(_item("rl-002", question="what is page ownership?",
+                        priority=Priority.CRITICAL))
+        assert len(rl) == 1
+        assert rl.items[0].priority == Priority.CRITICAL
+
+    def test_dedup_does_not_downgrade_priority(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001", question="what is page ownership?",
+                        priority=Priority.CRITICAL))
+        rl.queue(_item("rl-002", question="what is page ownership?",
+                        priority=Priority.LOW))
+        assert len(rl) == 1
+        assert rl.items[0].priority == Priority.CRITICAL
+
+    def test_different_questions_not_deduped(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001", question="what is page ownership?"))
+        rl.queue(_item("rl-002", question="what is scatterlist aliasing?"))
+        assert len(rl) == 2
+
+    def test_pending_excludes_resolved(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        item2 = _item("rl-002", question="q2")
+        item2.resolve("some_concept")
+        rl.queue(item2)
+        assert len(rl.pending()) == 1
+        assert len(rl.resolved()) == 1
+
+    def test_by_command(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001", command="/audit"))
+        rl.queue(_item("rl-002", command="/patch", question="q2"))
+        rl.queue(_item("rl-003", command="/audit", question="q3"))
+        assert len(rl.by_command("/audit")) == 2
+        assert len(rl.by_command("/patch")) == 1
+        assert len(rl.by_command("/exploit")) == 0
+
+
+# ------------------------------------------------------------------
+# ReadingList — drain (priority ordering)
+# ------------------------------------------------------------------
+
+class TestReadingListDrain:
+    def test_drain_returns_priority_order(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-low", question="q1", priority=Priority.LOW))
+        rl.queue(_item("rl-crit", question="q2", priority=Priority.CRITICAL))
+        rl.queue(_item("rl-high", question="q3", priority=Priority.HIGH))
+        rl.queue(_item("rl-norm", question="q4", priority=Priority.NORMAL))
+        drained = rl.drain()
+        assert [d.id for d in drained] == [
+            "rl-crit", "rl-high", "rl-norm", "rl-low",
+        ]
+
+    def test_drain_max_items(self) -> None:
+        rl = ReadingList()
+        for i in range(10):
+            rl.queue(_item(f"rl-{i}", question=f"q{i}"))
+        assert len(rl.drain(max_items=3)) == 3
+
+    def test_drain_excludes_resolved(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.resolve("rl-001", "page_ownership")
+        assert len(rl.drain()) == 0
+
+    def test_drain_empty(self) -> None:
+        rl = ReadingList()
+        assert rl.drain() == []
+
+
+# ------------------------------------------------------------------
+# ReadingList — resolve
+# ------------------------------------------------------------------
+
+class TestReadingListResolve:
+    def test_resolve_marks_item(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        assert rl.resolve("rl-001", "page_ownership")
+        assert rl.items[0].resolved
+        assert rl.items[0].resolved_concept_id == "page_ownership"
+
+    def test_resolve_nonexistent_returns_false(self) -> None:
+        rl = ReadingList()
+        assert not rl.resolve("nonexistent", "page_ownership")
+
+
+# ------------------------------------------------------------------
+# ReadingList — unresolvable semantics
+# ------------------------------------------------------------------
+
+class TestReadingListUnresolvable:
+    """An unresolvable item was attempted and cannot be answered from
+    the source.  It must leave pending() (never re-studied) while
+    NEVER counting as resolved — the assumption stays unverified."""
+
+    def test_mark_unresolvable(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        assert rl.mark_unresolvable("rl-001", "monkey-patched at runtime")
+        item = rl.items[0]
+        assert item.unresolvable
+        assert item.unresolvable_reason == "monkey-patched at runtime"
+
+    def test_unresolvable_leaves_pending(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.mark_unresolvable("rl-001", "reason")
+        assert rl.pending() == []
+
+    def test_unresolvable_is_not_resolved(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.mark_unresolvable("rl-001", "reason")
+        assert rl.resolved() == []
+        assert rl.items[0].resolved_concept_id is None
+        assert len(rl.unresolvable_items()) == 1
+
+    def test_resolved_item_cannot_become_unresolvable(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.resolve("rl-001", "some_concept")
+        assert not rl.mark_unresolvable("rl-001", "reason")
+        assert rl.items[0].resolved
+
+    def test_mark_nonexistent_returns_false(self) -> None:
+        rl = ReadingList()
+        assert not rl.mark_unresolvable("nope", "reason")
+
+    def test_requeue_does_not_revive_unresolvable(self) -> None:
+        rl = ReadingList()
+        rl.queue(_item("rl-001", question="q1"))
+        rl.mark_unresolvable("rl-001", "reason")
+        rl.queue(_item("rl-002", question="q1"))
+        assert rl.pending() == []
+        assert len(rl.items) == 1
+
+    def test_unresolvable_round_trips(self, tmp_path: Path) -> None:
+        p = tmp_path / "reading-list.json"
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.mark_unresolvable("rl-001", "dynamic dispatch")
+        rl.save(p)
+        loaded = ReadingList.load(p)
+        assert loaded.items[0].unresolvable
+        assert loaded.items[0].unresolvable_reason == "dynamic dispatch"
+        assert loaded.pending() == []
+        assert loaded.resolved() == []
+
+
+# ------------------------------------------------------------------
+# ReadingList — persistence
+# ------------------------------------------------------------------
+
+class TestReadingListPersistence:
+    def test_save_and_load(self, tmp_path: Path) -> None:
+        p = tmp_path / "reading-list.json"
+        rl = ReadingList()
+        rl.queue(_item("rl-001", question="what is page ownership?",
+                        command="/audit", priority=Priority.HIGH))
+        rl.queue(_item("rl-002", question="what does sg_chain do?",
+                        command="/patch"))
+        rl.resolve("rl-001", "page_ownership")
+        rl.save(p)
+
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 2
+        assert loaded.items[0].resolved
+        assert loaded.items[0].resolved_concept_id == "page_ownership"
+        assert loaded.items[1].source_command == "/patch"
+
+    def test_load_nonexistent_returns_empty(self, tmp_path: Path) -> None:
+        p = tmp_path / "nonexistent.json"
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 0
+
+    def test_load_heals_persisted_null_fields(self, tmp_path: Path) -> None:
+        # A reading list already poisoned on disk (rows persisted with
+        # source_file/context null before writers normalised) must
+        # rehydrate with the nulls healed to "" — existing run
+        # artifacts recover on load, no re-write required.
+        import json
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [{
+            "id": "study_unresolved_apr_pool.deadbeef1234",
+            "question": "What does `apr_pool_cleanup` guarantee?",
+            "source_command": "/understand --study",
+            "source_file": None,
+            "source_function": None,
+            "context": None,
+            "resolved": False,
+            "resolution": "identifier",
+        }]}))
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 1
+        assert loaded.items[0].source_file == ""
+        assert loaded.items[0].context == ""
+
+    def test_load_warns_when_healing(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        # Once every writer normalises at construction, a healed
+        # field in a PERSISTED artifact is evidence — legacy poison
+        # or an external edit — and must not vanish silently.
+        import json
+        import logging
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [{
+            "id": "rl-1",
+            "question": "q?",
+            "source_command": "/audit",
+            "source_file": None,
+            "context": 7,
+        }]}))
+        with caplog.at_level(logging.WARNING, logger="core.concepts.reading_list"):
+            loaded = ReadingList.load(p)
+        assert len(loaded) == 1
+        healed_lines = [
+            r.message for r in caplog.records if "healed" in r.message
+        ]
+        assert len(healed_lines) == 1
+        # Pin the count in its message context — the line also embeds
+        # a tmp path that can itself contain a bare "2".
+        assert "healed 2 null/non-str" in healed_lines[0]
+
+    def test_load_clean_artifact_no_heal_warning(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        import json
+        import logging
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [{
+            "id": "rl-1",
+            "question": "q?",
+            "source_command": "/audit",
+        }]}))
+        with caplog.at_level(logging.WARNING, logger="core.concepts.reading_list"):
+            ReadingList.load(p)
+        assert not [
+            r for r in caplog.records if "healed" in r.message
+        ]
+
+    def test_atomic_write(self, tmp_path: Path) -> None:
+        p = tmp_path / "reading-list.json"
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.save(p)
+        assert not p.with_suffix(".tmp").exists()
+
+    def test_creates_parent_dirs(self, tmp_path: Path) -> None:
+        p = tmp_path / "nested" / "deep" / "reading-list.json"
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.save(p)
+        assert p.exists()
+
+    def test_save_no_path_raises(self) -> None:
+        rl = ReadingList()
+        with pytest.raises(ValueError, match="no path"):
+            rl.save()
+
+    def test_save_remembers_path(self, tmp_path: Path) -> None:
+        p = tmp_path / "reading-list.json"
+        rl = ReadingList()
+        rl.queue(_item("rl-001"))
+        rl.save(p)
+        rl.queue(_item("rl-002", question="q2"))
+        rl.save()
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 2
+
+    def test_load_ignores_extra_keys(self, tmp_path: Path) -> None:
+        import json
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({
+            "items": [{
+                "id": "rl-001",
+                "question": "what is this?",
+                "source_command": "/audit",
+                "priority": "normal",
+                "resolved": False,
+                "future_field": "should be ignored",
+                "another_new_thing": 42,
+            }],
+        }) + "\n", encoding="utf-8")
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 1
+        assert loaded.items[0].id == "rl-001"
+        assert not hasattr(loaded.items[0], "future_field")
+
+    def test_concurrent_writers_no_clobber(self, tmp_path: Path) -> None:
+        p = tmp_path / "reading-list.json"
+        rl1 = ReadingList()
+        rl1.queue(_item("rl-001"))
+        rl1.save(p)
+        rl2 = ReadingList()
+        rl2.queue(_item("rl-002", question="q2"))
+        rl2.save(p)
+        import os
+        leftover_tmps = [f for f in os.listdir(tmp_path)
+                         if f.endswith(".tmp")]
+        assert leftover_tmps == []
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 1
+        assert loaded.items[0].id == "rl-002"
+
+
+# ------------------------------------------------------------------
+# Multi-consumer scenario
+# ------------------------------------------------------------------
+
+class TestMultiConsumer:
+    def test_audit_patch_exploit_all_queue(self) -> None:
+        rl = ReadingList()
+        rl.queue(ReadingListItem(
+            id="rl-audit-001",
+            question="what is scatterlist page ownership?",
+            source_command="/audit",
+            source_file="crypto/algif_aead.c",
+            source_line=244,
+            priority=Priority.NORMAL,
+        ))
+        rl.queue(ReadingListItem(
+            id="rl-patch-001",
+            question="what does sg_chain do to page references?",
+            source_command="/patch",
+            source_file="crypto/algif_aead.c",
+            source_line=244,
+            priority=Priority.CRITICAL,
+            context="generating fix — need to know if pages are copied or aliased",
+        ))
+        rl.queue(ReadingListItem(
+            id="rl-exploit-001",
+            question="what happens when page-cache pages are corrupted?",
+            source_command="/exploit",
+            priority=Priority.HIGH,
+            context="assessing impact of write-through-shared-pages",
+        ))
+
+        assert len(rl) == 3
+        assert len(rl.by_command("/audit")) == 1
+        assert len(rl.by_command("/patch")) == 1
+        assert len(rl.by_command("/exploit")) == 1
+
+        drained = rl.drain()
+        assert drained[0].id == "rl-patch-001"
+        assert drained[1].id == "rl-exploit-001"
+        assert drained[2].id == "rl-audit-001"
+
+    def test_resolution_visible_to_all_consumers(self, tmp_path: Path) -> None:
+        p = tmp_path / "reading-list.json"
+        rl = ReadingList()
+        rl.queue(_item("rl-audit", question="what is page ownership?",
+                        command="/audit"))
+        rl.queue(_item("rl-patch", question="what is page ownership?",
+                        command="/patch"))
+
+        assert len(rl) == 1
+
+        rl.resolve("rl-audit", "page_ownership")
+        rl.save(p)
+
+        loaded = ReadingList.load(p)
+        assert len(loaded.pending()) == 0
+
+
+# ------------------------------------------------------------------
+# Shared writer lock + merge-save
+# ------------------------------------------------------------------
+
+class TestSharedWriterLock:
+    """Every load-modify-save of one reading-list.json must serialize
+    on READING_LIST_WRITE_LOCK — a per-instance lock does nothing for
+    two writers holding separate instances of the same file."""
+
+    def test_save_merged_folds_in_concurrent_items(
+        self, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "reading-list.json"
+        mine = ReadingList.load(p)
+        mine.queue(_item("rl-mine", question="q-mine"))
+        # Another writer persisted while this instance was live: a
+        # plain save() would overwrite its item.
+        other = ReadingList.load(p)
+        other.queue(_item("rl-other", question="q-other"))
+        other.save(p)
+
+        mine.save_merged(p)
+        loaded = ReadingList.load(p)
+        assert {i.id for i in loaded.items} == {"rl-mine", "rl-other"}
+
+    def test_save_merged_own_mutations_win_for_known_ids(
+        self, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "reading-list.json"
+        seed = ReadingList.load(p)
+        seed.queue(_item("rl-x", question="q-x"))
+        seed.save(p)
+
+        mine = ReadingList.load(p)
+        mine.resolve("rl-x", "concept-1")
+        # A concurrent writer re-saved the still-unresolved rl-x plus
+        # its own new item after this instance loaded.
+        other = ReadingList.load(p)
+        other.queue(_item("rl-y", question="q-y"))
+        other.save(p)
+
+        mine.save_merged(p)
+        by_id = {i.id: i for i in ReadingList.load(p).items}
+        assert by_id["rl-x"].resolved
+        assert "rl-y" in by_id
+
+    def test_save_merged_runs_under_the_shared_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from core.concepts import reading_list as rl_mod
+
+        p = tmp_path / "reading-list.json"
+        held: list[bool] = []
+        real_save = ReadingList.save
+
+        def checking_save(self, path=None):
+            held.append(rl_mod.READING_LIST_WRITE_LOCK.locked())
+            return real_save(self, path)
+
+        monkeypatch.setattr(ReadingList, "save", checking_save)
+        rl = ReadingList.load(p)
+        rl.queue(_item("rl-l", question="q-l"))
+        rl.save_merged(p)
+        assert held == [True]
+
+
+class TestQuestionScopedIdentity:
+    """Distinct questions never share an id; the persistence fold
+    keeps a concurrent writer's distinct question."""
+
+    def test_same_prefix_questions_get_distinct_ids(self):
+        from core.concepts.reading_list import question_scoped_id
+        prefix = "audit-a.c:fn:" + ("what governs the buffer siz"[:30])
+        q1 = "what governs the buffer size on the read path?"
+        q2 = "what governs the buffer size on the write path?"
+        assert question_scoped_id(prefix, q1) != \
+            question_scoped_id(prefix, q2)
+        # Deterministic: the same question always yields the same id.
+        assert question_scoped_id(prefix, q1) == \
+            question_scoped_id(prefix, q1)
+
+    def test_save_merged_keeps_concurrent_distinct_question(
+        self, tmp_path,
+    ):
+        """Two writers, same lossy id, different questions: the merge
+        must keep both (the dropped one previously left its assumption
+        unverified with NO record)."""
+        from core.concepts.reading_list import (
+            ReadingList,
+            ReadingListItem,
+        )
+        path = tmp_path / "reading-list.json"
+
+        # Writer A loads (empty), holds its instance.
+        a = ReadingList.load(path)
+        a.queue(ReadingListItem(
+            id="shared_id", question="Q1: is len checked on read?",
+            source_command="/audit"))
+
+        # Writer B persists a DIFFERENT question under the same id.
+        b = ReadingList.load(path)
+        b.queue(ReadingListItem(
+            id="shared_id", question="Q2: is len checked on write?",
+            source_command="/audit"))
+        b.save(path)
+
+        # A's merge-save must fold B's item in, not destroy it.
+        a.save_merged(path)
+        on_disk = ReadingList.load(path)
+        questions = {i.question for i in on_disk.items}
+        assert questions == {
+            "Q1: is len checked on read?",
+            "Q2: is len checked on write?",
+        }, f"concurrent writer's question dropped: {questions}"
+
+    def test_audit_queue_ids_distinct_for_same_prefix(self, tmp_path):
+        from core.concepts.audit_bridge import queue_reading_list_item
+        from core.concepts.reading_list import ReadingList
+        q_base = "does the ring buffer wrap check hold for "
+        assert queue_reading_list_item(
+            tmp_path, question=q_base + "reads?",
+            source_file="a.c", source_function="ring_read")
+        assert queue_reading_list_item(
+            tmp_path, question=q_base + "writes?",
+            source_file="a.c", source_function="ring_read")
+        rl = ReadingList.load(tmp_path / "reading-list.json")
+        assert len(rl.items) == 2
+        assert len({i.id for i in rl.items}) == 2
+
+
+def _rl_race_worker(args):
+    idx, path = args
+    from core.concepts.audit_bridge import queue_reading_list_item
+    from pathlib import Path as _P
+    for k in range(10):
+        queue_reading_list_item(
+            _P(path), question=f"worker {idx} question {k}?",
+            source_file="a.c", source_function=f"fn{idx}")
+    return idx
+
+
+class TestCrossProcessReadingList:
+    """Concurrent RUNS share the project-level reading list; the
+    load->mutate->save window holds a cross-process file lock so no
+    writer drops another's items."""
+
+    def test_lock_sibling_created(self, tmp_path):
+        from core.concepts.audit_bridge import queue_reading_list_item
+        queue_reading_list_item(
+            tmp_path, question="q?", source_file="a.c",
+            source_function="f")
+        assert (tmp_path / "reading-list.json.lock").is_file()
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="fork start method")
+    def test_concurrent_queuers_lose_no_items(self, tmp_path):
+        import multiprocessing as mp
+
+        n = 6
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n) as pool:
+            pool.map(_rl_race_worker,
+                     [(i, str(tmp_path)) for i in range(n)])
+        from core.concepts.reading_list import ReadingList
+        rl = ReadingList.load(tmp_path / "reading-list.json")
+        questions = {i.question for i in rl.items}
+        expected = {f"worker {i} question {k}?"
+                    for i in range(n) for k in range(10)}
+        missing = expected - questions
+        assert not missing, f"lost {len(missing)} items: " \
+            f"{sorted(missing)[:5]}..."
+
+
+class TestLoadDegradesPerItem:
+    """load's degrade-to-empty contract extends to per-record shape:
+    non-dict entries and entries missing required fields are skipped
+    with a warning, never raised out of queueing."""
+
+    def _write(self, tmp_path, body):
+        import json as _json
+        p = tmp_path / "reading-list.json"
+        p.write_text(_json.dumps(body), encoding="utf-8")
+        return p
+
+    def test_non_dict_items_skipped(self, tmp_path):
+        p = self._write(tmp_path, {"items": ["oops", 42, {
+            "id": "ok", "question": "q?", "source_command": "/audit",
+        }]})
+        rl = ReadingList.load(p)
+        assert [i.id for i in rl.items] == ["ok"]
+
+    def test_missing_required_fields_skipped(self, tmp_path):
+        p = self._write(tmp_path, {"items": [
+            {"question": "no id or command"},
+            {"id": "ok", "question": "q?",
+             "source_command": "/audit"},
+        ]})
+        rl = ReadingList.load(p)
+        assert [i.id for i in rl.items] == ["ok"]
+
+    def test_non_list_items_degrades_empty(self, tmp_path):
+        p = self._write(tmp_path, {"items": {"id": "x"}})
+        assert ReadingList.load(p).items == []
+
+    def test_queue_survives_malformed_disk_state(self, tmp_path):
+        from core.concepts.audit_bridge import queue_reading_list_item
+        self._write(tmp_path, {"items": ["oops"]})
+        assert queue_reading_list_item(
+            tmp_path, question="q?", source_file="a.c",
+            source_function="f")

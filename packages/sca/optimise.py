@@ -1,0 +1,1241 @@
+"""``raptor-sca fix`` — scan + fix CVEs + pin unpinned deps in one pass.
+
+Superset of ``fix --cve-only``:
+
+1. Runs the full analyse pipeline against the target.
+2. Plans CVE-fix upgrades (same logic as ``fix --cve-only``).
+3. Plans pinning for unpinned / loose-pinned deps that have no CVEs
+   (hygiene-only).  Uses the lockfile-resolved version when available,
+   otherwise the version string from the manifest.
+4. Materialises all changes through the existing per-ecosystem rewriters.
+
+The result is a ``proposed/`` tree of rewritten manifests where every
+dep is pinned to an exact, CVE-free version — as close to "perfect" as
+we can get without running language-native resolvers.
+
+Outputs (under ``--out``):
+
+    proposed/<relative-path>   rewritten manifests
+    changes.json               structured change list
+    changes.md                 human-readable summary
+    findings.json              full analyse output (from prepass)
+    report.md                  full analyse report (from prepass)
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+from core.json import load_json, save_json
+
+from .naming import pep503_name
+from .kinds import (
+    HYGIENE_PREFIX,
+    SUPPLY_CHAIN_GHA_ACTION_REF_DRIFT,
+)
+from .rows import FindingRow
+from .update import (
+    UpgradeChange,
+    _change_to_dict,
+    _emit_git_patch,
+    _filter_excluded_plans,
+    _materialise_changes,
+    _plan_targets,
+    _PlanEntry,
+    _proposed_rel_path as _cve_proposed_rel,
+    _rewrite_one,
+    refuse_unsafe_target,
+)
+from ._md import code_cell, neutralize_inline
+from .versions import VersionError
+from .versions import compare as version_compare
+
+# The only findings.json read here is of the file the in-process
+# analyse prepass (run_sca) just wrote — the self-produced budget,
+# not the steered-path one (rationale on both in kinds.py).
+from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS_BYTES
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+logger = logging.getLogger(__name__)
+
+
+def main(argv: Sequence[str]) -> int:
+    from .cli import _configure_logging
+
+    args = _parse_args(argv)
+    _configure_logging(args.verbose)
+
+    if args.apply and args.out:
+        print("raptor-sca fix: --apply and --out are mutually exclusive",
+              file=sys.stderr)
+        return 2
+
+    target = Path(args.target).resolve()
+    if not target.exists():
+        print(f"raptor-sca fix: target does not exist: {target}",
+              file=sys.stderr)
+        return 2
+    if not target.is_dir():
+        print(f"raptor-sca fix: target is not a directory: {target}",
+              file=sys.stderr)
+        return 2
+
+    out_dir = _resolve_out_dir(args.out).resolve()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"raptor-sca fix: cannot create output dir {out_dir}: {e}",
+              file=sys.stderr)
+        return 2
+
+    # ---- Phase 1: analyse ---------------------------------------------------
+    from .pipeline import RunOptions, run_sca
+
+    options = RunOptions(
+        offline=args.offline,
+        no_cache=args.no_cache,
+        cache_root=Path(args.cache_root) if args.cache_root else None,
+        enable_kev=True,
+        enable_epss=True,
+        enable_reachability=True,
+        enable_supply_chain=True,
+        # ``fix`` never uses the scan-phase LLM stages: triage just
+        # ranks findings (we apply all of them regardless), and the
+        # behavioural-review stages enrich findings we don't act on.
+        # Always off here — saves ~7s LLM-client init + variable
+        # per-finding cost on every scan.
+        enable_llm_review=False,
+        enable_triage=False,
+        # ``--llm-inline-installs`` is opt-in: an LLM sweep over
+        # Dockerfiles / shell / GHA workflow ``run:`` blocks to find
+        # deps the mechanical parser missed. Only useful for ``fix``
+        # when the operator suspects coverage gaps; off by default
+        # because of the per-file LLM cost.
+        enable_llm_inline_installs=(
+            args.llm_inline_installs and not args.no_llm
+        ),
+        # Propagate ``--include-commented`` so commented-line
+        # findings flow through to the planner + rewriter. The
+        # rewriter preserves the ``#`` prefix; only the version
+        # gets tightened.
+        include_commented=args.include_commented,
+    )
+    try:
+        result = run_sca(target=target, output_dir=out_dir, options=options)
+    except Exception:
+        logger.exception("raptor-sca fix: analyse prepass failed")
+        return 3
+
+    try:
+        loaded_rows = load_json(
+            result.findings_path, strict=True,
+            max_bytes=_MAX_SELF_FINDINGS_BYTES,
+        )
+        if loaded_rows is None:
+            # Strict load_json soft-returns None for a MISSING file —
+            # a vanished findings file is an error, not zero findings.
+            raise FileNotFoundError(result.findings_path)
+        findings_rows: list[dict[str, Any]] = loaded_rows
+    except (OSError, ValueError) as exc:
+        logger.error("raptor-sca fix: cannot read findings: %s", exc)
+        return 3
+
+    # ---- Phase 2: plan CVE fixes --------------------------------------------
+    vuln_plans = _plan_targets(
+        findings_rows,
+        advisory_filter=None,
+        allow_major=args.allow_major,
+    )
+
+    # Detect CVE fixes blocked by major-version boundary.
+    major_blocked: dict[tuple[str, str, str], _PlanEntry] = {}
+    if not args.allow_major:
+        all_vuln = _plan_targets(
+            findings_rows, advisory_filter=None, allow_major=True,
+        )
+        major_blocked = {
+            k: v for k, v in all_vuln.items() if k not in vuln_plans
+        }
+
+    # ---- Phase 3: plan hygiene pins -----------------------------------------
+    hygiene_plans = _plan_hygiene_pins(findings_rows, vuln_plans)
+
+    # Operator --exclude globs: drop matching surfaces from the WRITE
+    # set (all three plan buckets). Scan findings above are untouched —
+    # the globs only stop edits, e.g. to test-fixture manifests whose
+    # deliberately-old pins are test assertions.
+    if args.exclude:
+        excluded_files: dict[str, None] = {}
+        vuln_plans, dropped = _filter_excluded_plans(
+            vuln_plans, args.exclude, root=target)
+        excluded_files.update((p, None) for p in dropped)
+        hygiene_plans, dropped = _filter_excluded_plans(
+            hygiene_plans, args.exclude, root=target)
+        excluded_files.update((p, None) for p in dropped)
+        major_blocked, dropped = _filter_excluded_plans(
+            major_blocked, args.exclude, root=target)
+        excluded_files.update((p, None) for p in dropped)
+        if excluded_files:
+            print(f"raptor-sca fix: {len(excluded_files)} surface(s) "
+                  f"excluded from write by --exclude patterns")
+
+    # ---- Phase 3a: detect GHA-action-ref drift (independent of pins) -------
+    has_gha_drift = any(
+        fr is not None
+        and fr.vuln_type == SUPPLY_CHAIN_GHA_ACTION_REF_DRIFT
+        for fr in map(FindingRow.from_row, findings_rows)
+    )
+    do_hash_pin = has_gha_drift and not args.no_hash_pin
+    llm_approved: set = set()
+    llm_verdicts: dict[tuple[str, str, str], Any] = {}
+    hp_summary = None
+
+    def report_completion(mode, *, changes=(), exit_code=0):
+        if args._report_options.enabled and args._report_options.output is not None:
+            from .remediation_reporting import complete_fix_report
+            complete_fix_report(args, target=target, out_dir=out_dir, scan_result=result, mode=mode,
+                                vuln_plans=vuln_plans, hygiene_plans=hygiene_plans, major_blocked=major_blocked,
+                                changes=changes, exit_code=exit_code, llm_approved=llm_approved,
+                                llm_verdicts=llm_verdicts, hash_pin_receipt=hp_summary)
+
+    if (not vuln_plans and not hygiene_plans and not major_blocked
+            and not do_hash_pin):
+        print("raptor-sca fix: nothing to do — no CVE-driven upgrades, "
+              "hygiene bumps, or hash-pins pending. (Unpinned-dependency "
+              "hygiene findings, if any, are reported by the scan; fix "
+              "only plans remediations it can safely apply.)",
+              file=sys.stderr)
+        report_completion("no actionable changes")
+        return 0
+
+    # ---- Phase 3b: LLM impact analysis for major-blocked CVEs -----------
+    if major_blocked and not args.no_llm:
+        llm_approved, llm_verdicts = _analyze_major_bumps(
+            major_blocked, vuln_plans, target,
+            promote=args.llm_approve_major,
+        )
+
+    # Default: plan only. --apply writes in-place, --out writes proposed/.
+    if not args.apply and not args.out:
+        _print_dry_run(vuln_plans, hygiene_plans, major_blocked,
+                       llm_approved=llm_approved, llm_verdicts=llm_verdicts)
+        if do_hash_pin:
+            hp_summary = _run_hash_pin(target, out_dir, write=False)
+            if hp_summary:
+                print(hp_summary)
+        # Exit 1 when CVEs remain unresolved (blocked by major version).
+        # CI can use this to detect "needs attention".
+        exit_code = 1 if major_blocked else 0
+        report_completion("plan only", exit_code=exit_code)
+        return exit_code
+
+    from contextlib import nullcontext
+    from core.run.scratch import scratch_dir
+
+    # Apply only files produced by this invocation; old or concurrent staging
+    # belongs to another operation. Review exports deliberately remain on disk.
+    staging = (scratch_dir(prefix="_apply_staging-", dir=out_dir) if args.apply
+               else nullcontext(out_dir / "proposed"))
+    with staging as proposed_root:
+        # ---- Phase 4: materialise all changes -----------------------------------
+        import os
+        saved_cwd = os.getcwd()
+        os.chdir(str(target))
+        all_plans = {**vuln_plans, **hygiene_plans}
+        try:
+            changes = _materialise_changes(
+                all_plans,
+                findings_rows,
+                proposed_root,
+                pin_only=False,
+            )
+        finally:
+            os.chdir(saved_cwd)
+
+        # Second pass: retry hygiene plans that _materialise_changes couldn't
+        # apply (bare names with no version operator).
+        hygiene_keys = set(hygiene_plans)
+        skipped_hygiene = [
+            c for c in changes
+            if c.skipped_reason is not None
+            and (c.ecosystem, c.name, str(c.manifest)) in hygiene_keys
+        ]
+        if skipped_hygiene:
+            retry_plans = {
+                (c.ecosystem, c.name, str(c.manifest)): hygiene_plans[
+                    (c.ecosystem, c.name, str(c.manifest))
+                ]
+                for c in skipped_hygiene
+            }
+            retry_changes = _materialise_pin_changes(
+                retry_plans, proposed_root, target=target,
+            )
+            retry_succeeded = {
+                (c.ecosystem, c.name, str(c.manifest))
+                for c in retry_changes
+                if c.skipped_reason is None
+            }
+            changes = [
+                c for c in changes
+                if (c.ecosystem, c.name, str(c.manifest)) not in retry_succeeded
+            ] + [c for c in retry_changes if c.skipped_reason is None]
+            existing = {(c.ecosystem, c.name, str(c.manifest)) for c in changes}
+            changes += [
+                c for c in retry_changes
+                if c.skipped_reason is not None
+                and (c.ecosystem, c.name, str(c.manifest)) not in existing
+            ]
+
+        applied = [c for c in changes if c.skipped_reason is None]
+        skipped = [c for c in changes if c.skipped_reason is not None]
+        vuln_applied = [c for c in applied if c.advisory_ids]
+        pin_applied = [c for c in applied if not c.advisory_ids]
+
+        # --apply: copy staged files back over the originals.
+        if args.apply and applied:
+            _apply_in_place(proposed_root, target)
+
+    save_json(out_dir / "changes.json", [_change_to_dict(c) for c in changes])
+    (out_dir / "changes.md").write_text(
+        _render_optimise_markdown(changes), encoding="utf-8",
+    )
+
+    extra = ""
+    if args.git_patch and applied:
+        patch_path, repo_root = _emit_git_patch(applied, out_dir)
+        if patch_path is not None:
+            extra = (
+                f"\nraptor-sca fix: upgrade.patch written to {patch_path}\n"
+                f"             apply with: cd {repo_root} && "
+                f"git apply {patch_path}"
+            )
+
+    if do_hash_pin:
+        hp_summary = _run_hash_pin(target, out_dir, write=args.apply)
+        if hp_summary:
+            extra += "\n" + hp_summary
+
+    if major_blocked:
+        n = len(major_blocked)
+        if llm_verdicts:
+            print(f"\nraptor-sca fix: {n} CVE fix(es) need major-version bumps "
+                  f"(LLM: breaking changes) — re-run with --allow-major "
+                  f"to apply anyway", file=sys.stderr)
+        else:
+            print(f"\nraptor-sca fix: {n} CVE fix(es) need major-version bumps "
+                  f"— re-run with --allow-major", file=sys.stderr)
+
+    if args.apply:
+        print(f"raptor-sca fix: {len(vuln_applied)} CVE fix(es), "
+              f"{len(pin_applied)} pin(s) applied in-place, "
+              f"{len(skipped)} skipped" + extra)
+    else:
+        print(f"raptor-sca fix: {len(vuln_applied)} CVE fix(es), "
+              f"{len(pin_applied)} pin(s), "
+              f"{len(skipped)} skipped — written to {proposed_root}"
+              + extra)
+    exit_code = 1 if major_blocked else 0
+    report_completion("applied in place" if args.apply else "proposed export", changes=changes, exit_code=exit_code)
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# Hygiene → pin planning
+# ---------------------------------------------------------------------------
+
+_HYGIENE_PIN_KINDS = frozenset({"unpinned_dependency", "loose_pin"})
+
+
+def _plan_hygiene_pins(
+    rows: list[dict[str, Any]],
+    vuln_plans: dict[tuple[str, str, str], _PlanEntry],
+) -> dict[tuple[str, str, str], _PlanEntry]:
+    """Plan exact-pin rewrites for deps with hygiene findings.
+
+    Skips deps that already have a CVE-fix plan (those are handled by
+    the vuln planner which picks a safe target version).  For the rest,
+    the "target" is the version already installed — we're just tightening
+    the pin style, not changing the version.
+
+    Acts on three hygiene kinds from non-lockfile manifests:
+
+      - ``unpinned_dependency`` — pin to current installed version
+      - ``loose_pin`` — tighten range to current installed version
+      - ``cross_manifest_inconsistency`` — find every manifest that
+        pins this ``(ecosystem, name)``, pick the highest version
+        among them, and pin all of them to that version. This makes
+        ``fix`` actually reconcile the divergence; without this case
+        operators would see the finding repeatedly without an
+        automated path to clear it.
+    """
+    plans: dict[tuple[str, str, str], _PlanEntry] = {}
+
+    # Pre-pass: build a (ecosystem, name) → [(manifest, version), …]
+    # index across ALL findings. Cross-manifest reconciliation needs
+    # this to enumerate every place the dep appears, not just the
+    # one manifest the cross_manifest_inconsistency finding points at.
+    all_dep_locations: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sca = row.get("sca") or {}
+        eco = sca.get("ecosystem")
+        nm = sca.get("name")
+        ver = sca.get("version")
+        mf = row.get("file")
+        if not (eco and nm and ver and mf):
+            continue
+        if sca.get("is_lockfile"):
+            continue
+        all_dep_locations.setdefault((eco, nm), []).append((mf, ver))
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        vt = row.get("vuln_type", "")
+        kind = vt.removeprefix(HYGIENE_PREFIX)
+        if kind not in _HYGIENE_PIN_KINDS and kind != "cross_manifest_inconsistency":
+            continue
+
+        sca = row.get("sca") or {}
+        ecosystem = sca.get("ecosystem")
+        name = sca.get("name")
+        version = sca.get("version")
+        manifest = row.get("file")
+
+        if not (ecosystem and name and version and manifest):
+            continue
+        if sca.get("is_lockfile"):
+            continue
+
+        if kind == "cross_manifest_inconsistency":
+            # Look up every manifest that pins this (eco, name); plan
+            # an update to all of them, targeting the highest version
+            # currently in use across the workspace.
+            locations = all_dep_locations.get((ecosystem, name), [])
+            if len(locations) < 2:
+                # Defensive — finding shouldn't fire for single-manifest
+                # cases, but if it does there's nothing to reconcile.
+                continue
+            target_version = _highest_version(
+                v for (_, v) in locations
+            ) or version
+            for (loc_manifest, _loc_ver) in locations:
+                key = (ecosystem, name, loc_manifest)
+                if key in vuln_plans or key in plans:
+                    continue
+                plans[key] = _PlanEntry(
+                    ecosystem=ecosystem,
+                    name=name,
+                    # ``installed`` is whatever this manifest pins
+                    # today; the rewriter uses (installed → target).
+                    installed=next(
+                        (v for (m, v) in locations
+                         if m == loc_manifest),
+                        version,
+                    ),
+                    target=target_version,
+                    manifest=Path(loc_manifest),
+                    advisory_ids=[],
+                )
+            continue
+
+        key = (ecosystem, name, manifest)
+        if key in vuln_plans:
+            continue
+        if key in plans:
+            continue
+
+        plans[key] = _PlanEntry(
+            ecosystem=ecosystem,
+            name=name,
+            installed=version,
+            target=version,
+            manifest=Path(manifest),
+            advisory_ids=[],
+        )
+
+    # Cross-manifest CVE propagation: if a dep at the same
+    # (ecosystem, name, installed_version) has a CVE-fix target in
+    # another manifest, adopt it here too.  This handles the case
+    # where offline/cache misses cause the vuln finding to appear for
+    # one copy of the dep but not another.
+    vuln_by_dep: dict[tuple[str, str, str], _PlanEntry] = {}
+    for plan in vuln_plans.values():
+        dep_key = (plan.ecosystem, plan.name, plan.installed)
+        existing = vuln_by_dep.get(dep_key)
+        try:
+            is_higher = existing is None or version_compare(
+                plan.ecosystem, plan.target, existing.target,
+            ) > 0
+        except VersionError:
+            is_higher = existing is None
+        if is_higher:
+            vuln_by_dep[dep_key] = plan
+
+    for key, plan in plans.items():
+        dep_key = (plan.ecosystem, plan.name, plan.installed)
+        vuln_match = vuln_by_dep.get(dep_key)
+        if vuln_match is not None:
+            plan.target = vuln_match.target
+            plan.advisory_ids = list(vuln_match.advisory_ids)
+
+    return plans
+
+
+def _run_hash_pin(
+    target: Path, out_dir: Path, *, write: bool,
+) -> str | None:
+    """Rewrite ``.github/workflows/*.yml`` ``uses:`` refs to commit
+    SHAs. Writes a ``hash-pin.json`` artefact alongside the run's
+    other outputs. Returns a one-line human-readable summary, or
+    ``None`` when there was nothing to do.
+
+    Shared between plan-only / --apply / --out modes:
+      - plan-only and ``--out``: ``write=False`` (rewrite plan only)
+      - ``--apply``: ``write=True`` (in-place rewrite of workflow YAMLs)
+    """
+    from .hash_pin import hash_pin_workflows
+    hp_result = hash_pin_workflows(target, write=write)
+    save_json(
+        out_dir / "hash-pin.json",
+        {
+            "changed_files": [str(p) for p in hp_result.changed_files],
+            "changes": [
+                {"file": str(c.file), "line": c.line,
+                 "action": c.action,
+                 "old_ref": c.old_ref, "new_sha": c.new_sha}
+                for c in hp_result.changes
+            ],
+            "skipped": [
+                {"file": str(f), "line": ln, "action": a, "reason": r}
+                for f, ln, a, r in hp_result.skipped
+            ],
+        },
+    )
+    if not hp_result.changes:
+        return None
+    verb = "rewrote" if write else "would rewrite"
+    msg = (
+        f"raptor-sca fix: {verb} {len(hp_result.changes)} "
+        f"GHA action ref(s) across "
+        f"{len(hp_result.changed_files)} workflow file(s)"
+    )
+    if hp_result.skipped:
+        msg += f"; {len(hp_result.skipped)} skipped"
+    msg += f". Plan: {out_dir}/hash-pin.json"
+    return msg
+
+
+def _highest_version(versions) -> str | None:
+    """Return the highest version string by PEP 440 ordering when
+    available, falling back to lexicographic.
+
+    Used for cross-manifest reconciliation — versions like ``2.31``,
+    ``2.31.0``, ``2.33.1`` come from different manifest pins of the
+    same dep and need a single canonical pick.
+    """
+    versions = [v for v in versions if v]
+    if not versions:
+        return None
+    try:
+        from packaging.version import InvalidVersion, Version
+        try:
+            parsed = sorted(versions, key=Version)
+            return parsed[-1]
+        except InvalidVersion:
+            pass
+    except ImportError:
+        pass
+    return max(versions)
+
+
+# ---------------------------------------------------------------------------
+# Materialise hygiene pin changes
+# ---------------------------------------------------------------------------
+
+def _materialise_pin_changes(
+    plans: dict[tuple[str, str, str], _PlanEntry],
+    proposed_root: Path,
+    target: Path | None = None,
+) -> list[UpgradeChange]:
+    """Materialise pin-tightening changes.
+
+    Unlike CVE-fix materialisation (which replaces old→new version),
+    pin-tightening may need to:
+    - Add a version spec to a bare package name (``requests`` → ``requests==2.28.0``)
+    - Replace a loose spec with an exact one (``~=2.28`` → ``==2.28.0``)
+    - Strip npm prefixes (``^1.2.3`` → ``1.2.3``)
+
+    The update-module rewriters handle the loose→exact case for most
+    ecosystems, but miss bare names.  This function tries the standard
+    rewriter first, then falls back to ecosystem-specific pin insertion.
+    """
+    out: list[UpgradeChange] = []
+
+    by_manifest: dict[Path, list[_PlanEntry]] = defaultdict(list)
+    for plan in plans.values():
+        by_manifest[plan.manifest].append(plan)
+
+    for manifest, plan_list in by_manifest.items():
+        # If the CVE phase already wrote a proposed copy, read that
+        # instead so both sets of changes compose.
+        base = target or Path.cwd()
+        try:
+            rel = manifest.resolve().relative_to(base)
+        except ValueError:
+            # A bare-filename anchor would collapse every same-named
+            # out-of-base manifest onto ONE staged file (last writer
+            # wins) and _apply_in_place would then write that mixed
+            # content over ``target/<name>``. Use the shared unique
+            # anchor instead — it also matches where the CVE phase
+            # writes ITS copies, so composition keeps working.
+            rel = _cve_proposed_rel(manifest)
+
+        # The CVE phase anchors its proposed tree with the shared
+        # helper (cwd-relative, hash-disambiguated outside cwd) which
+        # only equals our target-relative ``rel`` when cwd == target.
+        # Probe both locations so pin-tightening composes with CVE
+        # rewrites regardless of the launcher's cwd.
+        read_from = manifest
+        for candidate in (rel, _cve_proposed_rel(manifest)):
+            proposed_copy = proposed_root / candidate
+            if proposed_copy.exists():
+                read_from = proposed_copy
+                break
+        # lstat-gated, size-bounded read: discovery rejected symlinks
+        # at SCAN time, but this write path runs later — a symlink
+        # swapped in between scan and fix must not route host-file
+        # content into the staged rewrites.
+        from .resolvers._safe_io import read_regular_text
+        original = read_regular_text(read_from)
+        if original is None:
+            out.extend(UpgradeChange(
+                    ecosystem=plan.ecosystem, name=plan.name,
+                    old_version=plan.installed, new_version=plan.target,
+                    manifest=plan.manifest,
+                    advisory_ids=tuple(plan.advisory_ids),
+                    skipped_reason=("cannot read manifest: refused "
+                                    "(symlink / non-regular / oversized) "
+                                    "or unreadable"),
+                ) for plan in plan_list)
+            continue
+
+        text = original
+        for plan in plan_list:
+            new_text, applied, reason = _rewrite_one(manifest, text, plan)
+            if not applied or new_text == text:
+                new_text, applied, reason = _pin_bare_name(
+                    manifest, text, plan,
+                )
+            if applied:
+                text = new_text
+                out.append(UpgradeChange(
+                    ecosystem=plan.ecosystem, name=plan.name,
+                    old_version=plan.installed, new_version=plan.target,
+                    manifest=plan.manifest,
+                    advisory_ids=tuple(plan.advisory_ids),
+                ))
+            else:
+                out.append(UpgradeChange(
+                    ecosystem=plan.ecosystem, name=plan.name,
+                    old_version=plan.installed, new_version=plan.target,
+                    manifest=plan.manifest,
+                    advisory_ids=tuple(plan.advisory_ids),
+                    skipped_reason=reason or "rewriter found no match",
+                ))
+
+        if text != original:
+            from ._atomic import atomic_write_text
+            dest = proposed_root / rel
+            atomic_write_text(dest, text)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Bare-name pinning (fallback when the standard rewriter misses)
+# ---------------------------------------------------------------------------
+
+def _pin_bare_name(
+    manifest: Path, text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Insert an exact version pin for a bare (unversioned) dep name."""
+    # Same untrusted-target gate as ``update._rewrite_one`` — this is
+    # the one rewrite entry point that does not route through it (the
+    # bare-name fallback runs precisely when the standard rewriter
+    # declined, including a decline BY the gate itself), so the raw
+    # target would otherwise splice verbatim between JSON/TOML quotes.
+    refusal = refuse_unsafe_target(plan)
+    if refusal is not None:
+        return text, False, refusal
+    name = manifest.name
+
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return _pin_bare_requirements(text, plan)
+    if name == "package.json":
+        return _pin_bare_package_json(text, plan)
+    if name == "pyproject.toml":
+        return _pin_bare_pyproject(text, plan)
+
+    return text, False, f"no bare-name pinner for {name}"
+
+
+def _pin_bare_requirements(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Pin ``name`` (bare, no version) → ``name==target``."""
+    norm = pep503_name(plan.name)
+    out_lines: list[str] = []
+    rewrote = False
+    for raw in text.splitlines(keepends=True):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("#", "-")):
+            out_lines.append(raw)
+            continue
+        # Split off inline comments, preserving them for re-assembly.
+        # (?<!\s) pins the separator to the start of its whitespace
+        # run — a bare unanchored `\s+` re-consumes the run from
+        # every position (quadratic on hostile requirement lines);
+        # the earliest match already starts at the run start, so the
+        # pinned spelling splits identically.
+        comment_split = re.split(r"(?<!\s)(\s+#)", stripped, maxsplit=1)
+        line_value = comment_split[0].strip()
+        comment_tail = "".join(comment_split[1:])  # separator + comment text
+
+        m = re.match(r"^([A-Za-z0-9_\-.]+)\s*$", line_value)
+        if m and pep503_name(m.group(1)) == norm:
+            pinned = f"{m.group(1)}=={plan.target}{comment_tail}"
+            out_lines.append(raw.replace(stripped, pinned))
+            rewrote = True
+        else:
+            out_lines.append(raw)
+    if not rewrote:
+        return text, False, "bare name not found on its own line"
+    return "".join(out_lines), True, None
+
+
+def _pin_bare_package_json(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Pin ``"name": "*"`` or ``"name": ""`` → ``"name": "target"``.
+
+    Confined to the root-level dependency sections via the same span
+    helper the hardened rewriter uses — this fallback runs exactly
+    when that rewriter declined, and a whole-file ``pat.sub`` spliced
+    version pins into same-named keys in ``scripts`` / ``config`` /
+    arbitrary nested objects (decoy content, corrupted data).
+    """
+    from .update import _package_json_dep_spans
+    pat = re.compile(
+        r'("' + re.escape(plan.name) + r'"\s*:\s*")'
+        r'([^"]*?)'
+        r'(")'
+    )
+    rewrote = False
+
+    def _replace(m: re.Match) -> str:
+        nonlocal rewrote
+        current = m.group(2).strip()
+        if current in ("*", "x", "X", "latest", ""):
+            rewrote = True
+            return f"{m.group(1)}{plan.target}{m.group(3)}"
+        return m.group(0)
+
+    spans = _package_json_dep_spans(text)
+    if not spans:
+        return text, False, "no dependency section found"
+    new_text = text
+    # Back-to-front so earlier span offsets stay valid after edits.
+    for start, end in sorted(spans, reverse=True):
+        segment = pat.sub(_replace, new_text[start:end])
+        new_text = new_text[:start] + segment + new_text[end:]
+    if not rewrote:
+        return text, False, "no wildcard/empty spec found"
+    return new_text, True, None
+
+
+# TOML (section, array-key) contexts whose bare-string entries are
+# PEP 508 dependency specs. Everything else (``keywords = [...]``,
+# ``classifiers``, tool config arrays) is data a pin must never be
+# spliced into.
+_PYPROJECT_DEP_SECTION_ARRAYS: tuple[tuple[str, str | None], ...] = (
+    ("project", "dependencies"),
+    # Every array key inside these tables is a dependency group.
+    ("project.optional-dependencies", None),
+    ("dependency-groups", None),
+    ("build-system", "requires"),
+)
+
+
+def _toml_bracket_delta(line: str) -> int:
+    """Net ``[``/``]`` balance of one TOML line, ignoring brackets
+    inside single-line string literals and after a comment ``#``.
+
+    A naive ``count("[") - count("]")`` reads brackets INSIDE strings:
+    a dependency entry like ``"foo[",`` carries a net-positive delta,
+    so the tracker stayed "inside" the dependencies array past its
+    real ``]`` and the stale array context silently rewrote a bare
+    string in a FOLLOWING non-dependency array (``keywords``) in the
+    same section. Basic (``"``) strings honour backslash escapes;
+    literal (``'``) strings have none (TOML rules). Multi-line
+    strings are beyond a line heuristic — a bracket inside one can
+    only inflate the depth, which makes the pinner refuse (array
+    openers are only recognised at depth 0), never mis-splice.
+    """
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    for ch in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "#":
+            break
+        elif ch == "[":
+            delta += 1
+        elif ch == "]":
+            delta -= 1
+    return delta
+
+
+def _pyproject_dep_context(section: str, array_key: str | None) -> bool:
+    """True when a bare string at (``[section]``, ``key = [``) is a
+    dependency spec."""
+    if array_key is None:
+        return False
+    for sec, key in _PYPROJECT_DEP_SECTION_ARRAYS:
+        if section == sec and (key is None or array_key == key):
+            return True
+    return False
+
+
+def _pin_bare_pyproject(
+    text: str, plan: _PlanEntry,
+) -> tuple[str, bool, str | None]:
+    """Pin a bare dep name in pyproject.toml (PEP 621).
+
+    Confined to dependency arrays (``[project] dependencies``,
+    optional-dependency groups, ``[dependency-groups]``,
+    ``[build-system] requires``): the unscoped line rewrite turned a
+    same-named entry in ANY toml array — a multi-line
+    ``keywords = ["requests",]`` — into ``"requests==X",``, corrupting
+    non-dependency data. Poetry's ``name = "^1.0"`` key-value form is
+    not a bare string, so it never matched here.
+    """
+    norm = pep503_name(plan.name)
+
+    out_lines: list[str] = []
+    rewrote = False
+    section = ""
+    array_key: str | None = None
+    bracket_depth = 0
+    for raw in text.splitlines(keepends=True):
+        stripped = raw.strip()
+        # \S-delimited section name: the naive trim spelling
+        # ``\s*([^\]]+?)\s*`` overlaps three unbounded repeats on
+        # whitespace — a '['-opening line ending in a long whitespace
+        # run with no ']' cost every split of the run, cubic in the
+        # line length. Real headers are unchanged; the dropped corner
+        # is a whitespace-only section name ('[  ]'), which stripped
+        # to '' downstream.
+        header = re.match(
+            r"^\[+\s*([^\]\s](?:[^\]]*[^\]\s])?)\s*\]+\s*$",
+            stripped,
+        )
+        if header and bracket_depth == 0:
+            section = header.group(1).strip().strip('"').strip("'")
+            # optional-dependency group headers keep the table prefix.
+            if section.startswith("project.optional-dependencies."):
+                section = "project.optional-dependencies"
+            array_key = None
+            out_lines.append(raw)
+            continue
+        if bracket_depth == 0:
+            opener = re.match(
+                r"""^(['"]?)([A-Za-z0-9_\-.]+)\1\s*=\s*\[""", stripped,
+            )
+            if opener:
+                array_key = opener.group(2)
+        # gated optional comma — the ``\s*,?\s*$`` tail was
+        # quadratic on a dep row ending in a whitespace run
+        m = re.match(
+            r"""^(['"])([A-Za-z0-9_\-.]+)\s*(['"])\s*(?:,\s*)?$""",
+            stripped,
+        )
+        if (m and bracket_depth > 0
+                and _pyproject_dep_context(section, array_key)
+                and pep503_name(m.group(2)) == norm):
+            q = m.group(1)
+            new_val = f"{q}{m.group(2)}=={plan.target}{q}"
+            if stripped.endswith(","):
+                new_val += ","
+            out_lines.append(raw.replace(stripped, new_val))
+            rewrote = True
+        else:
+            out_lines.append(raw)
+        # String- and comment-aware bracket balance tracks whether the
+        # next line is still inside the opened array (see
+        # ``_toml_bracket_delta`` for why naive counting mis-spliced).
+        bracket_depth += _toml_bracket_delta(stripped)
+        if bracket_depth <= 0:
+            bracket_depth = 0
+            array_key = None
+    if rewrote:
+        return "".join(out_lines), True, None
+    return text, False, "bare name not found in a dependency array"
+
+
+# ---------------------------------------------------------------------------
+# LLM impact analysis for major-version-blocked CVE fixes
+# ---------------------------------------------------------------------------
+
+def _analyze_major_bumps(
+    major_blocked: dict[tuple[str, str, str], _PlanEntry],
+    vuln_plans: dict[tuple[str, str, str], _PlanEntry],
+    target: Path,
+    *,
+    promote: bool = False,
+) -> tuple[set, dict]:
+    """Run LLM impact analysis on major-blocked CVE fixes.
+
+    For each blocked dep, asks the LLM whether the major bump is safe
+    given the project's actual call sites. By default every verdict —
+    including a high-confidence "safe" — is ANNOTATION only: the bump
+    stays blocked, because LLM output is not operator consent
+    (``--allow-major`` is the documented opt-in for applying a major
+    bump, and the assessment reads target-tree call sites, so the tree
+    can steer the classification of its own bump). Only with
+    ``promote=True`` (the operator's explicit ``--llm-approve-major``)
+    are high-confidence "safe" verdicts moved from *major_blocked*
+    into *vuln_plans* for application.
+
+    Returns ``(llm_approved_keys, remaining_verdicts)``.  Both are
+    empty when no LLM is available — the caller falls back to
+    mechanical-only mode.
+    """
+    from .llm import get_llm_client
+
+    client = get_llm_client()
+    if client is None:
+        print("raptor-sca fix: no LLM provider configured; "
+              "major-bump CVEs will be flagged for manual review",
+              file=sys.stderr)
+        return set(), {}
+
+    from .llm.upgrade_impact_review import assess_upgrade_impact
+    from .models import Confidence, Dependency, PinStyle
+
+    n = len(major_blocked)
+    print(f"raptor-sca fix: analysing {n} major-bump CVE(s) with LLM...",
+          file=sys.stderr)
+
+    approved: set = set()
+    verdicts: dict[tuple[str, str, str], Any] = {}
+
+    for key, plan in list(major_blocked.items()):
+        dep = Dependency(
+            ecosystem=plan.ecosystem,
+            name=plan.name,
+            version=plan.installed,
+            declared_in=plan.manifest,
+            scope="main",
+            is_lockfile=False,
+            pin_style=PinStyle.EXACT,
+            direct=True,
+            purl=f"pkg:{plan.ecosystem.lower()}/{plan.name}@{plan.installed}",
+            parser_confidence=Confidence(level="medium"),
+        )
+        try:
+            verdict = assess_upgrade_impact(client, dep, plan.target, target)
+        except Exception:
+            logger.exception(
+                "raptor-sca fix: LLM impact analysis failed for %s:%s "
+                "→ %s; treating as needs-review",
+                plan.ecosystem, plan.name, plan.target,
+            )
+            verdict = None
+        if verdict is None:
+            continue
+
+        # Promotion needs BOTH gates: the operator's explicit
+        # ``--llm-approve-major`` (LLM output never substitutes the
+        # documented ``--allow-major`` consent on its own) AND the
+        # high-confidence floor. Trade-off on the floor, both
+        # directions: raising it to high leaves more CVE-fixing bumps
+        # in the manual-review bucket (they still pass
+        # ``refuse_unsafe_target`` and are one flag away); lowering
+        # it back to any-"safe" lets a hedged verdict apply a
+        # breaking major.
+        if (promote and verdict.verdict == "safe"
+                and verdict.confidence == "high"):
+            vuln_plans[key] = major_blocked.pop(key)
+            approved.add(key)
+        else:
+            verdicts[key] = verdict
+
+    if approved:
+        print(f"raptor-sca fix: {len(approved)} major-bump(s) LLM-approved as safe",
+              file=sys.stderr)
+    if verdicts:
+        print(f"raptor-sca fix: {len(verdicts)} major-bump(s) need manual review",
+              file=sys.stderr)
+
+    return approved, verdicts
+
+
+# ---------------------------------------------------------------------------
+# Dry-run summary
+# ---------------------------------------------------------------------------
+
+def _print_dry_run(
+    vuln_plans: dict[tuple[str, str, str], _PlanEntry],
+    hygiene_plans: dict[tuple[str, str, str], _PlanEntry],
+    major_blocked: dict[tuple[str, str, str], _PlanEntry] | None = None,
+    *,
+    llm_approved: set | None = None,
+    llm_verdicts: dict | None = None,
+) -> None:
+    """Print what fix *would* do, grouped by manifest file.
+
+    Every interpolated value below is untrusted for TERMINAL purposes:
+    plan names / installed versions come from the scanned manifests,
+    targets from OSV ``fixed`` strings (the ``refuse_unsafe_target``
+    grammar gate runs only at rewrite time, after this print), verdict
+    summaries / breaking-change notes from the LLM. Escape
+    non-printables (ANSI / OSC) before they reach the operator's
+    terminal; LLM free text takes the full output sanitiser.
+    """
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.prompt_output_sanitise import sanitise_string
+
+    all_plans = list(vuln_plans.values()) + list(hygiene_plans.values())
+    vuln_keys = set(vuln_plans)
+
+    by_manifest: dict[Path, list[_PlanEntry]] = defaultdict(list)
+    for plan in all_plans:
+        by_manifest[plan.manifest].append(plan)
+
+    name_count: dict[str, int] = defaultdict(int)
+    for m in by_manifest:
+        name_count[m.name] += 1
+
+    n_vuln = len(vuln_plans)
+    n_pin = len(hygiene_plans)
+    total = n_vuln + n_pin
+    print(f"raptor-sca fix: {total} change(s) planned "
+          f"({n_vuln} CVE, {n_pin} pin)\n")
+
+    for manifest in sorted(by_manifest):
+        plans = sorted(by_manifest[manifest], key=lambda p: p.name)
+        label = (str(manifest) if name_count[manifest.name] > 1
+                 else manifest.name)
+        print(f"  {escape_nonprintable(label)}")
+        for plan in plans:
+            key = (plan.ecosystem, plan.name, str(plan.manifest))
+            if key in vuln_keys:
+                ids = escape_nonprintable(", ".join(plan.advisory_ids))
+                suffix = ""
+                if llm_approved and key in llm_approved:
+                    suffix = "  (LLM: safe to bump)"
+                line = (f"{plan.name} {plan.installed} → "
+                        f"{plan.target}")
+                print(f"    {escape_nonprintable(line)}  [{ids}]{suffix}")
+            else:
+                print(f"    {escape_nonprintable(plan.name)} "
+                      f"→ =={escape_nonprintable(plan.target)}")
+        print()
+
+    if major_blocked:
+        print(f"  !! {len(major_blocked)} CVE fix(es) blocked "
+              f"(require major version bump):\n")
+        for plan in sorted(major_blocked.values(), key=lambda p: p.name):
+            key = (plan.ecosystem, plan.name, str(plan.manifest))
+            ids = escape_nonprintable(", ".join(plan.advisory_ids))
+            line = f"{plan.name} {plan.installed} → {plan.target}"
+            print(f"    {escape_nonprintable(line)}  [{ids}]")
+            if llm_verdicts and key in llm_verdicts:
+                v = llm_verdicts[key]
+                label = escape_nonprintable(v.verdict.replace("_", " "))
+                print(f"      LLM: {label} "
+                      f"({escape_nonprintable(str(v.confidence))})")
+                if v.summary:
+                    print(f"      {sanitise_string(v.summary)}")
+                for bc in v.breaking_changes[:3]:
+                    site = sanitise_string(bc.site, max_chars=200)
+                    breaks = sanitise_string(bc.what_breaks, max_chars=300)
+                    print(f"        {site}: {breaks}")
+        print("\n  Re-run with --allow-major to include these "
+              "(or --llm-approve-major to apply only the LLM-safe "
+              "subset).\n")
+
+    print("Run with --apply to modify files in-place, "
+          "or --out <dir> to write proposed/ for review.")
+
+
+def _apply_in_place(staged: Path, target: Path) -> None:
+    """Copy staged rewrites back over the original manifests."""
+    # Manifest writes into the user's tree go through atomic_write_text
+    # so an interruption (Ctrl-C, OOM kill, disk full) can never leave
+    # a torn or empty manifest behind. shutil.copy2 would not be atomic.
+    from ._atomic import atomic_write_bytes
+    for staged_file in staged.rglob("*"):
+        if not staged_file.is_file():
+            continue
+        rel = staged_file.relative_to(staged)
+        dest = target / rel
+        atomic_write_bytes(dest, staged_file.read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Output rendering
+# ---------------------------------------------------------------------------
+
+def _render_optimise_markdown(changes: list[UpgradeChange]) -> str:
+    applied = [c for c in changes if c.skipped_reason is None]
+    skipped = [c for c in changes if c.skipped_reason is not None]
+    vuln_applied = [c for c in applied if c.advisory_ids]
+    pin_applied = [c for c in applied if not c.advisory_ids]
+
+    parts: list[str] = ["# sca fix — proposed changes", ""]
+    parts.append(f"- CVE fixes: **{len(vuln_applied)}**")
+    parts.append(f"- Pins tightened: **{len(pin_applied)}**")
+    parts.append(f"- Skipped: **{len(skipped)}**")
+    parts.append("")
+
+    if vuln_applied:
+        parts.append("## CVE Fixes")
+        parts.append("")
+        parts.append("| Ecosystem | Name | Old | New | Advisories |")
+        parts.append("|---|---|---|---|---|")
+        parts.extend(
+            f"| {c.ecosystem} | {code_cell(c.name)} | "
+            f"{neutralize_inline(c.old_version, limit=60)} | "
+            f"{neutralize_inline(c.new_version, limit=60)} | "
+            f"{', '.join(neutralize_inline(a, limit=60) for a in c.advisory_ids)} |"
+            for c in vuln_applied)
+        parts.append("")
+
+    if pin_applied:
+        parts.append("## Pins Tightened")
+        parts.append("")
+        parts.append("| Ecosystem | Name | Pinned To | Manifest |")
+        parts.append("|---|---|---|---|")
+        parts.extend(
+            f"| {c.ecosystem} | {code_cell(c.name)} | "
+            f"{neutralize_inline(c.new_version, limit=60)} | "
+            f"{code_cell(c.manifest)} |" for c in pin_applied)
+        parts.append("")
+
+    if skipped:
+        parts.append("## Skipped")
+        parts.append("")
+        parts.extend(
+            f"- **{neutralize_inline(f'{c.ecosystem}:{c.name}', limit=120)}** "
+            f"({neutralize_inline(c.old_version, limit=60)} → "
+            f"{neutralize_inline(c.new_version, limit=60)}, "
+            f"{code_cell(c.manifest)}): "
+            f"{neutralize_inline(c.skipped_reason)}" for c in skipped)
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="raptor-sca fix",
+        description="Scan + fix CVEs + pin unpinned deps in one pass.",
+        epilog="Modes: 'raptor-sca fix' (default) pins all deps + fixes CVEs. "
+               "Use --cve-only to fix only CVEs without tightening pins. "
+               "Use --harden to upgrade all deps to the latest safe version.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("target", help="path to the project to fix")
+    p.add_argument("--apply", action="store_true",
+                   help="modify manifest files in-place (default: show plan only)")
+    p.add_argument("--out",
+                   help="write proposed/ to this directory for review "
+                        "(mutually exclusive with --apply)")
+    p.add_argument("--llm-approve-major", action="store_true",
+                   help="apply major-bump CVE fixes the LLM assesses "
+                        "safe with high confidence. Without this flag "
+                        "the LLM verdict is annotation only — applying "
+                        "a major bump requires the operator's "
+                        "--allow-major (or this flag).")
+    p.add_argument("--allow-major", action="store_true",
+                   help="allow CVE-fix upgrades that cross a major version")
+    p.add_argument("--git-patch", action="store_true",
+                   help="emit upgrade.patch alongside proposed/")
+    p.add_argument("--exclude", action="append", metavar="GLOB",
+                   default=None,
+                   help="glob of paths to exclude from the WRITE set "
+                        "(no pins / upgrades for matching manifests); "
+                        "repeatable. Matched against the target-"
+                        "relative path; * spans /, and a leading **/ "
+                        "also matches at the target root. Typical use: "
+                        "protecting test-fixture manifests whose "
+                        "deliberately-old pins are test assertions. "
+                        "Scanning is unaffected — findings in excluded "
+                        "trees stay reported.")
+    p.add_argument("--offline", action="store_true",
+                   help="skip all network calls; use cache only")
+    p.add_argument("--no-llm", action="store_true",
+                   help="skip LLM impact analysis on major-bump CVEs "
+                        "(mechanical mode only). Also disables "
+                        "--llm-inline-installs if both are set.")
+    p.add_argument("--llm-inline-installs", action="store_true",
+                   help="run an LLM pass over Dockerfile / shell / "
+                        ".github/workflows ``run:`` blocks to find "
+                        "deps the mechanical parser missed. Off by "
+                        "default; pay-as-you-go LLM cost.")
+    p.add_argument("--no-hash-pin", action="store_true",
+                   help="skip hash-pinning .github/workflows actions "
+                        "(default: rewrite mutable refs like @v6 to "
+                        "commit SHAs when ``gha_action_ref_drift`` "
+                        "findings are present)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="bypass disk cache for this run")
+    p.add_argument("--cache-root", help="override cache root")
+    p.add_argument("--include-commented", action="store_true",
+                   help="parse commented-out version-pinned lines "
+                        "(e.g. ``# pkg>=1.0`` in requirements.txt) as "
+                        "deps. Hygiene findings on commented entries "
+                        "are downgraded to ``info`` (see findings.py), "
+                        "and ``fix`` rewrites them while preserving the "
+                        "leading ``#``. Useful for projects that document "
+                        "optional installs in comment-form and want them "
+                        "auto-pinned alongside active deps.")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    from core.reporting.options import add_report_arguments, options_from_args
+    add_report_arguments(p)
+    args = p.parse_args(argv)
+    args._report_options = options_from_args(args, p)
+    if args.report_format and args.report_output is None:
+        p.error("--report-format requires --report-output for this command")
+    return args
+
+
+def _resolve_out_dir(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).resolve()
+    from core.run.output import unique_run_suffix
+    return Path("out") / f"sca-fix-{unique_run_suffix('-')}"

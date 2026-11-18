@@ -1,0 +1,250 @@
+name: PR preflight
+
+# CI-reality preflight over the PR's CHANGED test files. The main suite
+# (tests.yml) runs the affected tests in a fully provisioned
+# environment; this workflow re-runs just the test files the PR itself
+# touches under the environment hazards a provisioned host hides:
+#
+#   hidden-optional-deps  — anthropic / botocore / instructor / h2 /
+#                           sage_sdk stubbed to raise
+#                           ModuleNotFoundError
+#                           (.github/scripts/hide_modules.py). A changed
+#                           test touching them must SKIP, not fail.
+#   hidden-tree-sitter    — tree-sitter core + every grammar wheel
+#                           pinned in pyproject.toml, same mechanism
+#                           (the set derives from the dependency group,
+#                           so new wheels are hidden
+#                           automatically).
+#   duration-guard        — RAPTOR_MAX_TEST_SECONDS over the changed
+#                           files (root conftest.py flag-not-kill
+#                           guard), single-process so durations are
+#                           honest.
+#   tree-hygiene          — git status --porcelain must be empty after
+#                           the run: tests must not dirty the checkout.
+#   shuffle-a / shuffle-b — two seeded random orders (root conftest.py
+#                           RAPTOR_RANDOMISE_TESTS) to surface
+#                           order-dependence inside the changed files.
+#
+# check_optional_dep_imports.py lints the optional-dep import shapes
+# statically; the hidden-deps legs are its dynamic counterpart. Scope
+# comes from .github/scripts/preflight_scope.py (reuses test_scope.py's
+# is_test_file); a PR with no changed test files skips every leg
+# cleanly. All legs reuse the exact-key base venv and rebuild locked
+# dependencies on a cache miss, so fork PRs do not need access to
+# the private GHCR deps image.
+
+on:
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  VENV_PATH: .venv
+  # Same CI hang net as tests.yml: dump every Python stack if a single
+  # test runs >120s, then let it continue.
+  PYTEST_ADDOPTS: "-o faulthandler_timeout=120"
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 .github/scripts/preflight_scope.py --base "$BASE_SHA" --repo .
+
+  preflight:
+    name: preflight (${{ matrix.sim }})
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One simulation per leg, all over the same changed-file set.
+          # ``hide`` legs name a hide_modules.py set; the guard env
+          # knobs are exported conditionally inside the run step.
+          - sim: hidden-optional-deps
+            hide: optional-deps
+          - sim: hidden-tree-sitter
+            hide: tree-sitter
+          - sim: duration-guard
+            max_test_seconds: "10"
+          - sim: tree-hygiene
+            tree_check: "true"
+          # Two distinct seeds per run, both reproducible from the run
+          # id (the root conftest prints the seed in the pytest
+          # header).
+          - sim: shuffle-a
+            shuffle_seed: "1${{ github.run_id }}"
+          - sim: shuffle-b
+            shuffle_seed: "2${{ github.run_id }}"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
+        with:
+          install-method: sync
+          save-on-rebuild: 'true'
+
+      - name: Run changed tests under simulation
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HIDE_SET: ${{ matrix.hide }}
+          MAX_TEST_SECONDS: ${{ matrix.max_test_seconds }}
+          SHUFFLE_SEED: ${{ matrix.shuffle_seed }}
+        run: |
+          set -euo pipefail
+          source "$VENV_PATH/bin/activate"
+          if [ -n "${HIDE_SET:-}" ]; then
+            stub_dir=$(python3 .github/scripts/hide_modules.py \
+              --dest "$RUNNER_TEMP/preflight-stubs" --set "$HIDE_SET")
+            export PYTHONPATH="${stub_dir}${PYTHONPATH:+:$PYTHONPATH}"
+            echo "Hidden module set '$HIDE_SET' via $stub_dir"
+          fi
+          # Guard knobs are exported conditionally: the root conftest
+          # treats ANY set value of RAPTOR_RANDOMISE_TESTS (even the
+          # empty string) as "shuffle", so legs that don't use a knob
+          # must leave it unset rather than set-but-empty.
+          if [ -n "${MAX_TEST_SECONDS:-}" ]; then
+            export RAPTOR_MAX_TEST_SECONDS="$MAX_TEST_SECONDS"
+          fi
+          if [ -n "${SHUFFLE_SEED:-}" ]; then
+            export RAPTOR_RANDOMISE_TESTS="$SHUFFLE_SEED"
+          fi
+          rc=0
+          # Single process (no -n auto): honest per-test durations for
+          # the duration-guard leg and one deterministic order for the
+          # shuffle legs; the changed-file bound keeps this cheap.
+          # Recompute the same immutable range locally; never transfer a bulk
+          # filename list through job outputs, the environment or exec argv.
+          python .github/scripts/preflight_scope.py \
+            --base "$BASE_SHA" --repo . --run || rc=$?
+          # Exit 5 = "no tests collected" — legitimate when every
+          # changed test file is deselected by the default markers
+          # (slow / integration).
+          if [ "$rc" -eq 5 ]; then exit 0; fi
+          exit "$rc"
+
+      - name: Verify the run left the checkout clean
+        if: matrix.tree_check == 'true'
+        run: |
+          set -euo pipefail
+          status=$(git status --porcelain)
+          if [ -n "$status" ]; then
+            echo "::error::changed tests left the working tree dirty" \
+              "(tests must write only under tmp_path / the run dir):"
+            echo "$status"
+            exit 1
+          fi
+          echo "Working tree clean after the run."
+
+  # Aggregate gate, tests.yml convention: needs both jobs, always runs,
+  # skipped-is-pass (no changed test files), failure or cancellation
+  # blocks. Pin this check in branch protection, not the matrix legs.
+  preflight-passed:
+    name: preflight-passed
+    if: always()
+    needs: [changes, preflight]
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify all simulations passed
+        env:
+          # Results only: scope outputs can exceed the process environment limit.
+          NEEDS_JSON: >-
+            {
+              "changes": {"result": "${{ needs['changes'].result }}"},
+              "preflight": {"result": "${{ needs['preflight'].result }}"}
+            }
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+
+
+          def annotation(level, message):
+              message = str(message).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f"::{level}::{message}", flush=True)
+
+
+          def cell(value):
+              return str(value).replace('\r', ' ').replace('\n', ' ').replace('|', chr(92) + '|')
+
+
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          failed = {name: job['result'] for name, job in needs.items()
+                    if job['result'] not in ('success', 'skipped')}
+          run_url = (f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                     f"/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/"
+                     f"{os.environ['GITHUB_RUN_ATTEMPT']}")
+          summary = ['## Required job results', '', '| Job | Result |', '| --- | --- |']
+          for name, job in sorted(needs.items()):
+              print(f"{name}: {job['result']}", flush=True)
+              summary.append(f"| {cell(name)} | {cell(job['result'])} |")
+          for name, result in sorted(failed.items()):
+              annotation('error', f"Required job {name} reported {result}. Job details: {run_url}")
+          if failed:
+              summary += ['', f'[Inspect upstream jobs and runner annotations]({run_url}).', '']
+              # Fetch the current attempt only: earlier reruns must not supply stale failures.
+              # Diagnostics are best effort; they never change the prerequisite verdict.
+              try:
+                  endpoint = (f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                              f"{os.environ['GITHUB_RUN_ID']}/attempts/"
+                              f"{os.environ['GITHUB_RUN_ATTEMPT']}/jobs?per_page=100")
+                  response = subprocess.run(
+                      ['gh', 'api', '--paginate', '--slurp', endpoint],
+                      capture_output=True, text=True, timeout=30, check=True,
+                  )
+                  for page in json.loads(response.stdout):
+                      for job in page['jobs']:
+                          if job.get('conclusion') not in ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'):
+                              continue
+                          labels = ', '.join(job.get('labels') or []) or 'unknown'
+                          runner = job.get('runner_name') or 'not assigned'
+                          steps = [s['name'] for s in job.get('steps', [])
+                                   if s.get('conclusion') not in (None, 'success', 'skipped')]
+                          detail = ('Failed/cancelled steps: ' + ', '.join(steps) if steps else
+                                    'No failing step was reported; inspect job annotations for runner/service errors.')
+                          message = (f"{job['name']}: {job['conclusion']}; runner={runner}; "
+                                     f"labels={labels}. {detail} {job['html_url']}")
+                          annotation('error', message)
+                          summary.append(f"- {cell(message)}")
+              except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+                  annotation('warning', f"Could not retrieve upstream runner details. Inspect {run_url}. Required-job failures remain blocking.")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('\n'.join(summary) + '\n')
+          sys.exit(1 if failed else 0)

@@ -1,0 +1,51 @@
+name: Nightly (mypy)
+
+# Nightly full-tree type check.  Not a PR gate — regressions found
+# here are fixed when convenient, not blocking merges.  The pyproject
+# [tool.mypy] section owns the config (ignore_missing_imports
+# overrides, excludes).
+#
+# Runs against the full venv so type-checking can resolve imports from
+# installed dependencies.
+
+on:
+  schedule:
+    # 08:00 UTC — an hour after the nightly slow+integration run.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.14'
+  VENV_PATH: .venv
+
+jobs:
+  mypy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
+        with:
+          save-on-rebuild: 'true'
+
+      - name: Run mypy
+        run: |
+          source $VENV_PATH/bin/activate
+          mypy --config-file pyproject.toml core/ packages/

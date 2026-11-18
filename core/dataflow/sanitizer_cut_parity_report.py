@@ -1,0 +1,236 @@
+"""First-window parity report generator — Phase 15 of the
+sanitizer-cut arc.
+
+Produces the committed baseline parity report from a small *labelled*
+fixture set spanning the three proposal shapes:
+
+* ``charset`` — a whole-string allowlist guarded by an ``if not …:
+  return`` block. The lexical validator-dominance check is designed
+  for this shape.
+* ``charset_sub`` — an assignment-form sanitizer (``x = re.sub(…, x)``)
+  with no later rebind. The lexical substitution check targets this.
+* ``sanitizer_cut`` — a catalog sanitizer transforms a value that
+  then flows to the sink (``y = werkzeug.utils.secure_filename(x); open(y)``). The
+  value-bound gate targets this; the lexical checks don't fire.
+
+Each fixture is labelled ``should_suppress`` (genuinely safe) or
+``should_not_suppress`` (a real or unproven issue). For each, we
+compute the pure lexical decision and the value-bound verdict, build
+a :class:`core.dataflow.sanitizer_cut_parity.ParityRecord`, aggregate,
+and render the markdown report.
+
+This is a *baseline* on a synthetic, deliberately-balanced fixture
+set — NOT the gating window. The real Phase 16 gate is collected
+from `/agentic` runs via the shadow log (see the horizon doc). The
+baseline's job is to (a) prove the machinery end-to-end and (b) make
+the value-bound gate's current coverage gap on validator/substitution
+shapes visible.
+"""
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+from typing import NamedTuple
+
+from core.dataflow.sanitizer_cut_parity import (
+    LABEL_SHOULD_NOT_SUPPRESS,
+    LABEL_SHOULD_SUPPRESS,
+    ParityRecord,
+    ParitySummary,
+    aggregate_parity,
+    build_parity_record,
+    value_bound_verdict_for,
+)
+
+
+class _Fixture(NamedTuple):
+    name: str
+    kind: str                  # "charset" | "charset_sub" | "sanitizer_cut"
+    source: str
+    source_line: int
+    sink_line: int
+    cwe: str
+    label: str
+    var_name: str | None = None   # for charset_sub lexical check
+
+
+# Labelled baseline fixtures. Line numbers are 1-indexed into ``source``.
+_FIXTURES: list[_Fixture] = [
+    # --- charset validator shape — lexical fires, value-bound doesn't ---
+    _Fixture(
+        name="validator_guard_safe",
+        kind="charset",
+        source=(
+            "def handle(x):\n"
+            "    if not re.match('^[a-z]+$', x):\n"
+            "        return\n"
+            "    render(x)\n"
+        ),
+        source_line=2, sink_line=4, cwe="CWE-79",
+        label=LABEL_SHOULD_SUPPRESS,
+    ),
+    _Fixture(
+        name="validator_guard_no_exit",
+        kind="charset",
+        source=(
+            "def handle(x):\n"
+            "    if not re.match('^[a-z]+$', x):\n"
+            "        log('bad')\n"
+            "    render(x)\n"
+        ),
+        # Validator doesn't exit on failure → the value still reaches
+        # the sink. Real issue; neither method should suppress.
+        source_line=2, sink_line=4, cwe="CWE-79",
+        label=LABEL_SHOULD_NOT_SUPPRESS,
+    ),
+    # --- substitution shape — lexical fires, value-bound doesn't ---
+    _Fixture(
+        name="substitution_safe",
+        kind="charset_sub",
+        source=(
+            "def handle(x):\n"
+            "    x = re.sub('[<>]', '', x)\n"
+            "    render(x)\n"
+        ),
+        source_line=2, sink_line=3, cwe="CWE-79",
+        label=LABEL_SHOULD_SUPPRESS, var_name="x",
+    ),
+    _Fixture(
+        name="substitution_overwritten",
+        kind="charset_sub",
+        source=(
+            "def handle(x):\n"
+            "    x = re.sub('[<>]', '', x)\n"
+            "    x = raw_input()\n"
+            "    render(x)\n"
+        ),
+        # Sanitized value is rebound before the sink. Real issue.
+        source_line=2, sink_line=4, cwe="CWE-79",
+        label=LABEL_SHOULD_NOT_SUPPRESS, var_name="x",
+    ),
+    # --- sanitizer-cut shape — value-bound fires, lexical doesn't ---
+    # Use the unconditional path-cleaning profile so the direct/helper
+    # positives measure structural coverage, not unresolved HTML input contracts.
+    # (Sources import their sanitizer: an UNBOUND root refuses by
+    # doctrine — builtins are repo-writable — so the shapes must bind
+    # the identity the way legitimate code does.)
+    _Fixture(
+        name="sanitizer_cut_safe",
+        kind="sanitizer_cut",
+        source=(
+            "import werkzeug\n"
+            "def handle(x):\n"
+            "    y = werkzeug.utils.secure_filename(x)\n"
+            "    open(y)\n"
+        ),
+        source_line=2, sink_line=4, cwe="CWE-22",
+        label=LABEL_SHOULD_SUPPRESS,
+    ),
+    _Fixture(
+        name="sanitizer_cut_wrong_variable",
+        kind="sanitizer_cut",
+        source=(
+            "import werkzeug\n"
+            "def handle(user, other):\n"
+            "    safe = werkzeug.utils.secure_filename(other)\n"
+            "    open(user)\n"
+        ),
+        # Sanitizer cleans the wrong symbol; sink reads user. Real bug.
+        source_line=2, sink_line=4, cwe="CWE-22",
+        label=LABEL_SHOULD_NOT_SUPPRESS,
+    ),
+    _Fixture(
+        name="sanitizer_cut_helper",
+        kind="sanitizer_cut",
+        source=(
+            "import werkzeug\n"
+            "def _sanitize(s):\n"
+            "    return werkzeug.utils.secure_filename(s)\n"
+            "def handle(x):\n"
+            "    y = _sanitize(x)\n"
+            "    open(y)\n"
+        ),
+        # Sanitization in a callee — Phase 14 inter-proc suppresses.
+        source_line=4, sink_line=6, cwe="CWE-22",
+        label=LABEL_SHOULD_SUPPRESS,
+    ),
+]
+
+
+def _lexical_decision(fx: _Fixture, _path: str) -> bool:
+    """Pure lexical decision for the fixture's shape. Calls the
+    smt_barrier lexical helpers directly (no value-bound kwargs, so
+    no recursion into the gate)."""
+    from core.dataflow.smt_barrier import (
+        _lexical_substitution_dominates,
+        _lexical_validator_dominates,
+    )
+    if fx.kind == "charset":
+        return _lexical_validator_dominates(
+            fx.source, fx.source_line, fx.sink_line,
+        )
+    if fx.kind == "charset_sub":
+        return _lexical_substitution_dominates(
+            fx.source, fx.source_line, fx.sink_line, fx.var_name or "",
+        )
+    # sanitizer_cut shapes have no lexical-validator form → False.
+    return False
+
+
+def build_baseline_records() -> list[ParityRecord]:
+    """Compute a :class:`ParityRecord` for each labelled fixture."""
+    records: list[ParityRecord] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for fx in _FIXTURES:
+            path = str(Path(tmp) / f"{fx.name}.py")
+            Path(path).write_text(fx.source, encoding="utf-8")
+            lexical = _lexical_decision(fx, path)
+            finding = {
+                "cwe": fx.cwe,
+                "file_path": path,
+                "source_line": fx.source_line,
+                "sink_line": fx.sink_line,
+                "language": "python",
+            }
+            verdict = value_bound_verdict_for(finding)
+            records.append(build_parity_record(
+                finding_id=fx.name,
+                file=f"{fx.name}.py",
+                cwe=fx.cwe,
+                language="python",
+                source_line=fx.source_line,
+                sink_line=fx.sink_line,
+                kind=fx.kind,
+                lexical_suppressed=lexical,
+                value_bound_verdict=verdict,
+                label=fx.label,
+            ))
+    return records
+
+
+def build_baseline_summary() -> ParitySummary:
+    return aggregate_parity(build_baseline_records())
+
+
+def render_baseline_report(
+    summary: ParitySummary | None = None, *, format: str = "markdown",
+) -> str:
+    """Render supplied measurements; the legacy no-argument call builds once.
+
+    Capture with ``build_baseline_summary`` once before requesting several
+    formats. Presentation never changes the caller's sanitizer-cut setting.
+    """
+    from core.reporting.renderers import render_document
+    from .parity_document import build_parity_document
+
+    captured = build_baseline_summary() if summary is None else summary
+    document = build_parity_document(captured, title="Sanitizer-cut parity — first baseline report",
+                                     synthetic_baseline=True)
+    return render_document(document, format).content.decode()
+
+
+__all__ = [
+    "build_baseline_records",
+    "build_baseline_summary",
+    "render_baseline_report",
+]

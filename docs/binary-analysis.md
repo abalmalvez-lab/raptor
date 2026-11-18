@@ -1,0 +1,713 @@
+# Binary Analysis
+
+[Documentation index](README.md)
+
+RAPTOR provides three distinct subsystems for compiled artefacts, each
+solving a different problem: black-box investigation of unknown binaries,
+reachability filtering to suppress dead-code findings in source scans,
+and exploit feasibility profiling to determine what is actually
+exploitable before wasting time on impossible approaches.
+
+These subsystems are independent but complementary. `/binary` produces
+evidence from the artefact itself; the binary oracle joins that evidence
+with source-level findings; exploit feasibility assesses what the
+compiled mitigations actually permit.
+
+Two related surfaces live elsewhere: the Ghidra RE bridge
+([/ghidra](commands.md#ghidra) — attach/import `.gpr` projects,
+cross-version `diff --matched`, findings export) and binary
+`--study` ([/understand](commands.md#understand) — semantic concept
+extraction over a decomp-tree materialized from an imported RE
+database).
+
+**Related documentation:**
+[slash commands](commands.md) |
+[Python CLI](python-cli.md) |
+[validation](validation.md) |
+[Frida](frida.md) |
+[sandbox](sandbox.md)
+
+---
+
+Choose the subsystem that matches your input and question:
+
+| Task | Subsystem |
+|------|-----------|
+| Investigate an unknown compiled artefact | [/binary](#binary----black-box-investigation) |
+| Filter source findings using compiled reachability | [Binary oracle](#binary-oracle----reachability-filtering) |
+| Assess compiled mitigations and exploitation constraints | [Exploit feasibility](#exploit-feasibility) |
+
+**On this page:**
+
+- [/binary -- Black-Box Investigation](#binary----black-box-investigation)
+- [Binary Oracle -- Reachability Filtering](#binary-oracle----reachability-filtering)
+- [Exploit Feasibility](#exploit-feasibility)
+
+## /binary -- Black-Box Investigation
+
+The `/binary` command is the operator-facing surface for evidence-backed
+binary analysis via radare2. It takes a compiled artefact (ELF, Mach-O,
+PE) and builds a structured evidence layer without requiring source code.
+
+### Subcommands
+
+| Command | Purpose |
+|---------|---------|
+| `investigate <binary>` | Map the binary, rank leads, write an evidence-separated investigation report. Default when bare `/binary <path>` is used. |
+| `map <binary>` | Build the binary manifest, context map, decompilations, graph and validation handoff. The lower-level mechanical substrate. |
+| `runtime <binary>` | Run Frida with `binary-flow-trace` to collect input-callsite evidence. |
+| `trace-parser <run-dir>` | Run parser-focused Frida tracing and fold new runtime evidence back into an existing binary run. |
+| `harness <run-dir>` | Turn a recovered ingress candidate into a harness plan. Emits source only when the ABI contract is explicit. |
+| `fuzz <binary>` | Hand off to the `/fuzz` orchestrator for crash witnesses. |
+| `graph <run-dir>` | Query the persistent binary graph (SQLite). |
+| `report <run-dir>` | Print the investigation report from an existing run (the map report when no investigation exists). |
+| `handoff <run-dir>` | Print the validation handoff JSON. |
+| `diagram <run-dir>` | Render Mermaid diagrams from a binary run's JSON outputs. |
+
+### Usage and Flags
+
+```text
+# Default: investigate (static only)
+/binary /path/to/app
+
+# Explicit subcommands
+/binary investigate /path/to/app
+/binary map /path/to/app --out out/binary-app
+
+# Allow dynamic phases
+/binary investigate /path/to/app --runtime
+/binary investigate /path/to/app --fuzz
+/binary investigate /path/to/app --active    # both runtime + fuzzing
+
+# Decompilation control
+/binary map /path/to/app --max-decompile 50
+/binary map /path/to/app --decompile-all
+
+# Quick intake-only mode
+/binary map /path/to/app --quick
+
+# Universal Mach-O: pin architecture
+/binary map /path/to/App.app/Contents/MacOS/App --slice-arch x86_64
+
+# Compare two builds
+/binary map /path/to/new --compare /path/to/old --out out/binary-app
+
+# Add runtime evidence (two approaches)
+/binary trace-parser out/understand_app_.../ --duration 20
+/binary runtime /path/to/app --duration 20
+
+# Add fuzz witnesses
+/binary fuzz /path/to/app --duration 60
+/binary map /path/to/app --out out/binary-app --fuzz-dir out/fuzz-...
+
+# SMT check against explicit conditions
+/binary map /path/to/app --constraint-file conditions.json
+
+# Graph queries
+/binary graph out/binary-app --edges --json
+/binary graph out/binary-app --edges --kind MAY_REACH --json
+/binary graph out/binary-app --evidence --tier replayed_crash --json
+
+# Harness generation
+/binary harness out/understand_app_.../ --ingress BINGRESS-07b2007ea85a
+/binary harness out/understand_codec_.../ --ingress BINGRESS-... --abi buffer-size
+```
+
+Without `--runtime`, `--fuzz` or `--active`, RAPTOR never spawns,
+attaches to or fuzzes the target.
+
+### Output Artefacts
+
+`/binary map` produces:
+
+| File | Purpose |
+|------|---------|
+| `binary-manifest.json` | Byte-bound artefact manifest |
+| `binary-evidence.json` | Evidence ledger with provenance tiers |
+| `context-map.json` | Context-map-compatible bridge (shared with `/understand`) |
+| `binary-context-map.json` | Binary-specific alias of the context map |
+| `binary-checklist.json` | Address-stable checklist: functions, entry points, imports, witnesses |
+| `binary-decompilations.json` | Persisted pseudocode for highest-value recovered functions |
+| `binary-validation-handoff.json` | What evidence is present and what is still missing per candidate |
+| `graph/binary-graph.sqlite` | Queryable graph of functions, xrefs, evidence edges |
+| `binary-analysis-report.md` | Short human-readable report |
+| `binary-diff.json` | Build comparison (when `--compare` is used) |
+
+`/binary investigate` adds:
+
+| File | Purpose |
+|------|---------|
+| `binary-investigation.json` | Evidence-separated investigation record (facts, inferences, hypotheses kept distinct) |
+| `binary-investigation-report.md` | One-screen operator report with ranked surfaces and priority queue of next evidence actions |
+
+### Radare2 Integration
+
+radare2 provides the core mechanical substrate: function recovery,
+cross-references, decompilation hints, and direct call-graph edges. The
+binary analyser uses radare2 for:
+
+- Function boundary recovery and address mapping
+- Import table and export resolution
+- Cross-reference (xref) enumeration
+- Pseudocode generation for selected functions
+- COFF/PE/ELF/Mach-O header parsing
+- Objective-C and Swift class metadata extraction
+
+On deep runs (`extract_cfgs=True` on the analyser API; the `/binary`
+pipeline passes it automatically — quick mode stays metadata-only and
+skips it), radare2 also recovers each interesting function's
+basic-block CFG (`afbj`, cached per content identity — build-id for
+ELF, per-format identity for PE/Mach-O) and surfaces its
+complexity as a `cyclomatic` field on the function records in the
+context map. Cyclomatic complexity is the
+metric of record here because it won a head-to-head evaluation against
+path homology's direction-aware β₁ on real binaries (AUC 0.707 vs
+0.693): Huntsman, "Path homology as a stronger analogue of cyclomatic
+complexity", [arXiv:2003.00944](https://arxiv.org/abs/2003.00944)
+(2020).
+
+For Mach-O universal binaries, radare2 selects a slice automatically;
+use `--slice-arch` to pin a specific architecture.
+
+r2 runs under `core.sandbox.run` (namespace + Landlock + network deny).
+The binary oracle's binutils invocations (readelf, nm, objdump,
+c++filt) run under the full sandbox as well — a malformed ELF planted
+in `build/` must not be parsed by a process with the user's filesystem
+and network. See [sandbox](sandbox.md) for the isolation model.
+
+### Evidence Tiers
+
+Every record in the evidence ledger declares its provenance:
+
+| Tier | Source |
+|------|--------|
+| `observed_runtime` | Frida or a fuzzer observed it during execution |
+| `replayed_crash` | A crash was replayed against the bound binary |
+| `smt_proved` | Z3 checked explicit path conditions and returned a mechanical result |
+| `xref_backed` | radare2 recovered a concrete call/xref relationship |
+| `header_backed` | File header, magic, imports or archive members prove it |
+| `decompiler_inferred` | Pseudocode suggests it, but it is not proof |
+| `heuristic` | Useful lead only, such as a name-based entry point |
+
+Import-backed input channels are candidates until runtime confirms them.
+Direct xrefs to security-relevant imports are call-graph facts, not
+taint facts. Transitive reachability is labelled `may_reach`. No trust
+boundary or unchecked flow is emitted without actual evidence.
+
+### Format Support
+
+| Artefact | Ingress RAPTOR looks for | Fuzz follow-on |
+|----------|--------------------------|----------------|
+| Mach-O app | URL/file handlers, XPC listeners (Obj-C callback and C `xpc_*` import forms), IOKit `externalMethod` dispatch, WebView callbacks, bundle metadata | Trace the handler, then extract a narrow harness |
+| ELF executable | Process entry, imported input channels, exported APIs | Campaign only when an input contract exists |
+| ELF kernel module | `unlocked_ioctl`/`compat_ioctl` dispatchers | IOCTL harness or snapshot fuzzing |
+| PE EXE | Process entry, `ServiceMain` service entries, imported input channels (incl. Winsock and registry reads) | Runtime first unless a harness is already present |
+| PE DLL | Exported APIs bound back to recovered functions | Typed export harness |
+| PE driver | `EvtIoDeviceControl`/`DispatchDeviceControl` dispatchers | IOCTL harness or snapshot fuzzing |
+
+The sink and channel vocabularies are curated SEED sets in
+`core/function_taxonomy` (Win32: shlwapi/MBCS string copies, Rtl
+memory copies, Winsock ingest, registry read primitives, dynamic
+load, SEH markers, `DeviceIoControl`; darwin: IOKit user-client and
+XPC groups) — project-specific vocabulary is learned by the
+study/IRIS channel, never hardcoded. `DeviceIoControl` and
+`IOConnectCall*` classify as boundary-crossing sinks; `LoadLibrary`
+stays a surface (its CVE shape is search-path planting, and its
+ubiquity would drown ranked output).
+
+Architecture is read from the COFF/ELF/Mach-O header, so a 32-bit DLL,
+64-bit EXE and ARM64 driver are not flattened into the same bucket.
+Managed artefacts (JAR/APK, .NET, Go, Rust) are recorded as runtime
+signals for future adapters.
+
+TE (Terse Executable) UEFI images are recognised by their `VZ`
+signature and classified as their own kind, `te` — never as a PE
+variant, so they receive neither the Windows platform label nor the
+Windows driver-symbol probing. Intake records a `te_not_analysed`
+marker: the image is identified (kind, machine architecture) and
+deliberately not parsed further; use a firmware analysis toolchain
+for the image contents.
+
+### PE Signing Facts
+
+The PE facts record carries two signing fields:
+
+- `authenticode_present` — the image's security directory claims an
+  Authenticode certificate blob.
+- `claimed_signer` — the subject common name of the certificate the
+  signature's first SignerInfo names, recovered by a bounded skim of
+  the PKCS#7 structure.
+
+Both are **claims read from the file, not verification results**. No
+signature, digest, or certificate chain is checked, and no trust or
+validity decision is made — a hostile file controls every byte of
+these fields, including the signer name. Treat `claimed_signer` as
+attacker-authored text for correlation and display: it never gates,
+suppresses, or ranks anything, and reports escape it before
+rendering. An empty `claimed_signer` with `authenticode_present`
+true means the blob did not yield a claim; the record's `caps_hit`
+markers (`authenticode_*`, `signer_*`) say why.
+
+### Format Facts (PE / Mach-O / ELF)
+
+Each format tier exposes a shallow facts extractor (header claims
+only, hostile-input bounded, per-field degradation with `caps_hit`
+markers), and `core.binary.facts` normalizes the three into one
+record shape — sizes, sections, linked libraries, import/export
+counts, per-format mitigation map, entry point, stripped-ness and
+debug references. The intake attaches the PE and Mach-O facts to the
+binary manifest as `pe_facts` / `macho_facts` evidence, and
+`/describe` renders the normalized record when pointed at a single
+binary.
+
+Mitigation fields are **header claims, not verification**:
+
+- PE: `aslr` / `high_entropy_va` / `dep` / `cfg` / `no_seh` from
+  DllCharacteristics; `stack_cookie` (a configured /GS SecurityCookie
+  slot) and `safeseh` (PE32 only — PE32+ records unknown by
+  definition, the x64 unwind model replaces SafeSEH) from a bounded
+  load-config skim. Read `no_seh` and `safeseh` together: `no_seh`
+  yes moots a registered handler table (the image uses no SEH at
+  all). Stripped-ness signals: debug-directory presence and the COFF
+  symbol-count claim.
+- Mach-O: `pie` / `allow_stack_execution` / `no_heap_execution` from
+  the mach_header flags; `stack_canary` from a bounded scan of the
+  LC_SYMTAB string-table region for the `___stack_chk_*` names —
+  name-presence evidence a crafted file can plant or omit, never a
+  verified import and never suppression-grade.
+
+A fact a tier cannot answer is `unknown`/`None`, never a fabricated
+no — a capped or unreadable scan window refuses to render a
+confident answer, and a degraded PE optional header renders every
+DllCharacteristics-derived flag unknown rather than a default no.
+
+Two normalized fields keep format-native semantics: `arch` carries
+each extractor's own vocabulary unmapped, and `entrypoint` is the
+AddressOfEntryPoint RVA on PE but the LC_MAIN `entryoff` **file
+offset** on Mach-O — never compare them across formats.
+
+### Parser Boundary Extraction
+
+For GUI apps, XPC listeners, URL handlers and protocol callbacks, the
+useful fuzz target is rarely the framework callback itself. RAPTOR
+retains radare2's direct call graph and looks for bounded paths from
+recovered external ingress to internal functions that directly call
+known parser surfaces.
+
+This produces `parser_boundary_candidates` with: the ingress candidate
+that starts the path, the internal boundary function worth reviewing,
+the parser surface it calls, the bounded call-graph path and depth, and
+the evidence tier (`xref_backed` or `observed_runtime`).
+
+When Swift/ObjC dynamic dispatch hides the static edge, the
+[Frida](frida.md) trace retains target-module backtrace frames for
+parser calls. If the backtrace contains both the recovered ingress and
+the parser caller, RAPTOR can recover an `observed_runtime` parser
+boundary even when the static call graph cannot join the two.
+
+### Harness Generation
+
+`/binary harness` turns a recovered ingress into a harness plan. By
+default it selects the highest-ranked external ingress; use `--ingress`
+to pin one, or `--llm-rank` to LLM re-rank the candidates before the
+selection cascade (ordering only; the cascade's filters still apply
+and an explicit `--ingress` always wins).
+
+RAPTOR only emits source code when the boundary is explicit enough:
+
+- `--abi buffer-size` for exported APIs callable as `(const uint8_t *, size_t)`.
+- `--abi cstring` for NUL-terminated string inputs.
+- `--device` and `--ioctl-code` for driver dispatch boundaries.
+
+For app callbacks, XPC listeners, URL handlers and WebView callbacks,
+the first harness pass normally stops at `needs_runtime_trace`. Once
+RAPTOR recovers a bounded ingress-to-parser path it moves to
+`parser_boundary_candidate` and shows the narrowed function in the
+harness report. The framework callback is real, but the useful fuzz
+boundary is usually the parser or protocol helper behind it, and RAPTOR
+still needs a callable contract before it can emit source honestly.
+
+### Pipeline Integration
+
+`/binary` output feeds into:
+
+- [Exploitability validation](validation.md):
+  `binary-checklist.json` and `binary-validation-handoff.json` provide
+  candidates and evidence gaps for downstream validation.
+- [Frida](frida.md): `trace-parser` uses the `binary-flow-trace` template
+  to collect runtime evidence tied to the mapped binary.
+
+---
+
+## Binary Oracle -- Reachability Filtering
+
+The binary oracle joins source inventory with debug binaries via DWARF
+and nm to suppress dead-code findings before they reach LLM analysis.
+Used by `/agentic` and `/codeql` to filter findings for functions the
+compiler removed.
+
+### How It Works
+
+The classifier examines each function from the source inventory against
+the debug binary's symbol table and DWARF information, producing one of
+four verdicts:
+
+| Verdict | Meaning |
+|---------|---------|
+| `symbol_present` | Function survives compilation with a matching symbol |
+| `inlined` | Function was inlined by the compiler (present in DWARF but no discrete symbol) |
+| `folded` | Function was merged with another via identical code folding (ICF) |
+| `absent` | Compiler or linker removed the function entirely |
+
+The `absent` verdict drives suppression: findings on absent functions
+are hard-suppressed before LLM analysis, saving API cost and avoiding
+false positives on dead code.
+
+The verdict flows through the existing reachability chokepoint:
+`/codeql` and `/agentic` skip LLM analysis on absent-function findings
+(pre-LLM hard-suppress); `/validate`'s demoter clamps attack-path
+proximity; `/understand --map` annotates entry points and sinks with
+the per-binary verdict and tier.
+
+### Auto-Detection
+
+By default (no flags), `/agentic` and `/codeql` auto-detect debug
+binaries under common build directories:
+
+`build/`, `target/release/`, `cmake-build-*/`, `bazel-bin/`,
+`builddir/`, `Debug/`, `Release/`, `out/`, `dist/`, `bin/`,
+Rust `target/<triple>/release` cross-target globs, and the source root.
+
+Auto-detection filters to **locally-built binaries only**: files
+untracked by git. The result cap is 8 binaries.
+
+### Provenance Gate
+
+Git-tracked binaries (committed to the source tree) are dropped from
+auto-detection. This defends against:
+
+- **Attacker-planted binaries**: a malicious binary committed to the
+  repo could steer `absent` verdicts toward suppressing real findings.
+- **Stale committed pre-builds**: old binaries that no longer match the
+  source would produce incorrect verdicts.
+
+The operator can bypass this via explicit `--binary <path>` when they
+have verified provenance.
+
+The gate runs *before* any parsing: tracked binaries are filtered out
+ahead of the DWARF probe, non-ELF candidates are rejected on the magic
+bytes, and the probe itself runs inside the sandbox -- a planted binary
+is never parsed at all.
+
+### Source-Coverage Floor
+
+A source-coverage floor (at least 5% of project source names matched,
+minimum 3 matches, kicking in at 8 or more project names) rejects
+binaries unrelated to the source. A planted ELF for a different project
+is dropped with a warning rather than driving every source function to
+`absent`.
+
+Operator-declared binaries (explicit `--binary` flags and the project
+binary store) are exempt from the floor — the declaration is the trust
+assertion the drop warning names, so a low-match declared binary is
+kept with a warning instead. When the floor drops a non-declared
+binary that produced evidence, the run's `absent` verdicts lose
+suppression authority (`suppression_grade: false` per surviving
+record, `any_floor_dropped` in the summary): "absent only when EVERY
+declared binary lacks it" must not silently narrow to "every
+surviving binary".
+
+### Precision
+
+The `absent` verdict is corpus-validated before it is allowed to
+suppress anything, and the guarantee is conditional on full-DWARF
+evidence -- a stripped binary downgrades to `tier="symbol_only"` and
+the chokepoint refuses to suppress.  Env-built binaries follow the
+same shape on a second axis: suppression authority tracks who chose
+the build configuration.  A build from the operator's
+`/project set build-command` earns suppression like any declared
+binary; a detector-GUESSED command still enriches (existence proofs
+are safe) but `earns_suppression` downgrades and the inventory
+summary carries `any_env_built_guessed` -- a guessed container
+configuration can compile out features the real build includes, so
+`absent` there says nothing suppression-grade about the operator's
+tree.
+
+### CLI Flags
+
+| Flag | Purpose |
+|------|---------|
+| (default, no flags) | Auto-detect locally-built binaries; soft hint when nothing found. When auto-detect AND the project binary store both miss and the project `build` trust marker authorises it, the oracle builds a debug binary on demand (operator `build-command` slot first, detector synthesis second; network-isolated container; run-local artifact + `/project binary add` persist hint). |
+| `--binary <path>` | Explicit debug binary. Repeatable for hybrid targets. Bypasses the git-tracked filter (operator asserts trust). Suppresses default auto-detect. |
+| `--binary-auto` | Same auto-detect + git-filter logic as default, with louder "nothing found" message. Honours `--target-kind`. Warns at result cap (8). |
+| `--binary-edges` | Extract direct call edges and vtable resolution via r2 (single-invocation script-file mode; cached per content identity with cross-target collision check). Required for the `binary_call_edge` REACHABLE promote witness. Slow (~10-30s per binary, then cached). |
+| `--no-binary-oracle` | Disable binary-oracle filtering entirely. Use for library-only targets, runs where every finding should be unfiltered, or build-mismatch scenarios. Overrides `--binary`/`--binary-auto` with a warning if combined. |
+
+For `--target-kind=hybrid` deployments (library + application both
+shipped), declare multiple binaries -- a function is `absent` only when
+every declared binary lacks it. Tier-weighted combine: when full-DWARF
+and symbol-only disagree, full-DWARF wins (`alive-in-any` rule only
+applies same-tier).
+
+### Project Persistence
+
+Per-project binary configuration is managed with `/project binary`:
+
+```text
+/project binary add /path/to/debug/binary
+/project binary list
+/project binary remove /path/to/debug/binary
+/project binary clear
+```
+
+Persisted binaries are auto-loaded by every subsequent `/agentic`,
+`/codeql` and `/validate` run on the project. Paths are
+`is_file()`-validated at add time.
+
+### Audit Trail
+
+`suppressions.jsonl` is written to the run's output directory whenever
+the chokepoint hard-suppresses a finding. Each JSON record contains:
+
+```json
+{
+  "finding_id": "...",
+  "rule_id": "...",
+  "file_path": "...",
+  "line": 42,
+  "function": "process_input",
+  "verdict": "absent",
+  "reason": "..."
+}
+```
+
+Both `/agentic` and `/codeql` write to the same file shape. Query with
+`jq -c . suppressions.jsonl`.
+
+The classifier's per-finding analysis record also carries
+`analysis.reachability_suppression` and
+`analysis.reachability_verdict` for per-finding inspection.
+
+---
+
+## Exploit Feasibility
+
+The exploit feasibility subsystem analyses a compiled binary's
+mitigations, ROP gadget quality, one-gadget constraints and glibc
+version to determine what exploitation techniques are architecturally
+possible. It answers "can this bug actually be weaponised?" before any
+time is spent on technique selection.  Entry point:
+`libexec/raptor-run-feasibility`; the Python API lives in
+`packages/exploit_feasibility`.
+
+### Mitigation Profiling
+
+The analyser runs approximately 30 checks in a few seconds, covering:
+
+- **Binary protections**: RELRO (partial/full), stack canary, NX, PIE,
+  ASLR.
+- **glibc version**: Detected empirically, not just from the binary.
+  Determines which techniques (hooks, safe-linking, tcache keys) are
+  available.
+- **ROP gadget quality**: Total gadgets filtered by bad-byte constraints
+  to count *usable* gadgets.
+- **One-gadget constraints**: Extracted with constraint analysis;
+  optionally validated via Z3/SMT.
+- **Heap mitigations**: Safe-linking, alignment checks, double-free
+  detection (glibc 2.32+).
+- **Input handler constraints**: Bad-byte analysis for strcpy, gets, etc.
+  determines which address ranges are writable.
+
+The output is structured into three categories:
+
+| Field | Purpose |
+|-------|---------|
+| `exploitation_paths` | Per-vulnerability `{technique, target}` pairs that might work |
+| `chain_breaks` | Techniques that are architecturally impossible (do not attempt) |
+| `what_would_help` | Environmental changes or info leaks that could enable exploitation |
+
+### Verdicts
+
+| Verdict | Meaning | Action |
+|---------|---------|--------|
+| Likely Exploitable | Good primitives, clear path | Proceed with suggested techniques |
+| Difficult | Primitives exist but hard to chain | Be honest about challenges, try alternatives |
+| Unlikely | No known viable path | Suggest environment changes or move on |
+
+### Target Profiles
+
+Different exploitation contexts use different analysis strategies:
+
+| Profile | Use case | What changes |
+|---------|----------|--------------|
+| `LOCAL_BINARY` | Local privilege escalation, CTF | Full local detection (default) |
+| `REMOTE_BINARY` | Network services, remote CTF | Uses provided glibc, skips empirical tests |
+| `WEB_APPLICATION` | SQLi, XSS, SSRF | Skips memory mitigations entirely |
+| `KERNEL` | Kernel exploits, LPE | Checks SMEP, SMAP, KASLR, KPTI |
+
+Web vulnerability types (`sql_injection`, `xss`, `ssrf`,
+`path_traversal`, `command_injection`, `xxe`, `ssti`, `idor`, `csrf`,
+`open_redirect`, `deserialization`) are auto-detected and routed to the
+web profile. Memory corruption types use `LOCAL_BINARY` by default.
+
+### Empirical vs Theoretical
+
+The package emphasises empirical verification over static assumptions:
+
+| Check | Theoretical | Empirical |
+|-------|-------------|-----------|
+| %n works? | Check glibc version | Two-probe test: baseline `-U_FORTIFY_SOURCE` + FORTIFY-with-writable-format; cross-checked against ELF's `__printf_chk` presence. Tri-state verdict. |
+| ASLR entropy | Read /proc/sys/kernel/randomize_va_space | Sample multiple addresses |
+| ROP gadgets | Count total gadgets | Filter by bad bytes, count usable |
+| Hooks available | Check glibc version | Check if symbols exist in nm output |
+
+This catches edge cases: custom glibc builds with different flags,
+kernel configurations that override defaults, and binary-specific
+constraints not visible statically.
+
+### SMT Integration
+
+Optional Z3/SMT integration (requires `uv pip install z3-solver`) provides
+two capabilities:
+
+1. **One-gadget feasibility** (`packages/exploit_feasibility/smt_onegadget.py`):
+   Checks whether a one-gadget's register/memory constraints are
+   satisfiable given a crash state. Result appears in
+   `exploitation_paths[vuln].one_gadget_info.smt_feasibility`.
+
+2. **CodeQL dataflow path validation** (`core/smt_solver/path_feasibility.py`,
+   invoked from `packages/codeql/dataflow_validator.py`):
+   Checks whether branch conditions along a dataflow path are jointly
+   satisfiable. `unsat` means false positive (skip LLM); `sat` produces
+   concrete input values fed into the LLM prompt. Best coverage:
+   CWE-190, CWE-120/122, CWE-193, CWE-476.
+
+Both degrade gracefully when Z3 is absent.
+
+### Usage
+
+**Python API:**
+
+```python
+from packages.exploit_feasibility import analyze_binary, format_analysis_summary
+
+result = analyze_binary('/path/to/binary')
+print(format_analysis_summary(result, verbose=True))
+```
+
+**Remote targets (known glibc):**
+
+```python
+from packages.exploit_feasibility import FeasibilityAnalyzer, create_remote_profile
+
+profile = create_remote_profile(
+    binary_path="./challenge",
+    glibc_version="2.31",
+    host="pwn.ctf.com",
+    port=1337,
+)
+analyzer = FeasibilityAnalyzer(profile=profile)
+report = analyzer.full_analysis(vuln_type="format_string")
+```
+
+**Per-finding feasibility mapping:**
+
+```python
+from packages.exploit_feasibility import map_findings_to_constraints, load_exploit_context
+
+constraints = load_exploit_context(context_file)
+mapped = map_findings_to_constraints(findings, constraints)
+```
+
+Each mapped finding carries a two-axis assessment: `verdict` (can you
+trigger it?) and `impact` (what happens -- `code_execution`, `dos`,
+`info_leak`). The two axes avoid conflating triggerability with
+consequence.
+
+**Context persistence for long sessions:**
+
+```python
+from packages.exploit_feasibility import save_exploit_context, load_exploit_context
+
+context_file = save_exploit_context('/path/to/binary')
+ctx = load_exploit_context(context_file)
+```
+
+### Pipeline Integration
+
+- `/exploit` automatically runs feasibility analysis before technique
+  selection.
+- `/validate` Stage E uses feasibility output to assess exploitability.
+- The `check_exploit_viability()` API provides a single-call verdict
+  for pipeline consumers.
+
+### What Feasibility Does Not Do
+
+- Generate exploits (use `/exploit` for that).
+- Find vulnerabilities (use `/scan` for that).
+- Bypass mitigations (tells you what is blocked, not how to bypass).
+
+It tells you what is possible so you do not waste time on what is
+impossible.
+
+`binary map` and `binary investigate` accept portable report options. Add
+`--report-format markdown`, `json` or `xml` to export into the existing run
+directory, or select `--report-output`. Native summaries and artifacts stay
+unchanged. The export records the final map's scope, candidate counts,
+evidence tiers, decompilation coverage and current active-phase outcomes.
+Intermediate map populations are not added together. An older investigation
+receipt is not adopted by a new map export, and a skipped or failed active
+phase stays visible. Reporting does not run analysis, tracing or fuzzing again.
+Choose destinations outside imported runtime/fuzz directories and individual
+active-phase output directories to preserve their native evidence.
+
+`binary runtime` and `binary trace-parser` forward portable report options to
+the existing Frida capture. `--report-format json` stores a receipt in that
+capture's output directory; an explicit `--report-output` is resolved from
+the caller's working directory before the child starts. The destination must
+remain writable under the existing child sandbox. These options do not
+request another trace or change attach/spawn consent. `--no-report` disables
+the portable receipt while retaining native capture artifacts.
+
+When `--no-report` leaves an earlier portable receipt in the run directory,
+RAPTOR warns that those report files were not refreshed. Native summaries and
+evidence remain available. The retained portable files remain an earlier
+snapshot, rather than output from this invocation.
+
+Corpus profiling also accepts `--report-format` and `--report-output`. For example,
+`/binary corpus ./samples --out ./profile --report-format json` adds a portable
+receipt alongside the native profile. It preserves sample/skip totals and caps,
+and includes up to 100 family summaries. It does not repeat profiling or copy
+sample contents, sample filenames or seed bytes into the receipt. Corpus
+statistics remain uncorroborated observations.
+
+`/binary siblings RUN_DIR --report-format json` adds a portable review receipt
+without repeating the comparison. Native `--json` output remains on stdout;
+report summaries go to stderr. Counts and analysis caveats remain visible when
+detail is truncated. Asymmetries are review leads, never confirmed findings;
+consistent clusters remain unexamined. Use the native JSON for complete check
+matrices and disproof recipes.
+
+`/binary hunt RUN_DIR --anchor parse --report-format json` exports the captured
+query views. When anchor and caller queries run together, their populations stay
+separate: overlapping observations are not counted as additional findings.
+Degraded scans and native truncation warnings remain visible. Exporting adds no
+extra hunt; native `--json` still prints one JSON record per query on stdout.
+
+Harness planning accepts the same report flags, for example
+`/binary harness RUN_DIR --report-format json`. The receipt preserves the native
+plan status and outstanding prerequisites. Verification steps are requirements,
+not passed tests. Exporting neither repeats planning or ranking nor builds, runs
+or validates the generated candidate. Source and build scripts remain referenced
+artifacts rather than copied report content.
+
+Graph queries also accept report flags. For example,
+`/binary graph RUN_DIR --evidence --report-format json` keeps native JSON on
+stdout and exports a metadata receipt with up to 100 returned records. Counts
+apply to the selected query, not the whole program. Raw evidence properties
+and free-form evidence summaries stay in native JSON rather than the report.
+No second graph query runs for export.
+
+`/binary diagram RUN_DIR` forwards the same portable report controls as
+`/diagram`. Native preview and overwrite protection stay in place. Diagram
+companions retain captured Mermaid source for offline rendering.

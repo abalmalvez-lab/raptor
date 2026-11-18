@@ -17,13 +17,20 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+
+from core.source.streams import preserving_stream_error
 
 from core.dataflow.label import (
     FP_MISSING_SANITIZER_MODEL,
+    VALID_FP_CATEGORIES,
+    VALID_VERDICTS,
     VERDICT_FALSE_POSITIVE,
     VERDICT_TRUE_POSITIVE,
 )
+
+
+from core.dataflow.run_corpus import verdict_to_label
+from core.dataflow.validator import ValidatorVerdict
 
 
 PIVOT_GATE_THRESHOLD = 0.10
@@ -48,33 +55,68 @@ class Metrics:
     fp_categories: Counter = field(default_factory=Counter)
 
     @property
-    def precision(self) -> Optional[float]:
+    def precision(self) -> float | None:
         denom = self.tp + self.fp
         return None if denom == 0 else self.tp / denom
 
     @property
-    def recall(self) -> Optional[float]:
+    def recall(self) -> float | None:
         denom = self.tp + self.fn
         return None if denom == 0 else self.tp / denom
 
     @property
-    def f1(self) -> Optional[float]:
+    def f1(self) -> float | None:
         p, r = self.precision, self.recall
-        if p is None or r is None or (p + r) == 0:
+        if p is None or r is None:
             return None
+        if p + r == 0:
+            return 0.0
         return 2 * p * r / (p + r)
 
 
 def compute(csv_path: Path) -> Metrics:
     m = Metrics()
-    with csv_path.open() as f:
-        reader = csv.DictReader(f)
+    with preserving_stream_error(csv_path.open(encoding="utf-8", newline="")) as f:
+        reader = csv.DictReader(f, strict=True)
+        columns = reader.fieldnames or []
+        if len(columns) != len(set(columns)):
+            raise ValueError("duplicate CSV column names")
+        seen_ids: set[str] = set()
         for row in reader:
-            m.total += 1
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"CSV row width does not match header at CSV line {reader.line_num}")
+            if "finding_id" in columns:
+                finding_id = row.get("finding_id")
+                if not isinstance(finding_id, str) or not finding_id.strip():
+                    raise ValueError(f"invalid finding_id at CSV line {reader.line_num}")
+                if finding_id in seen_ids:
+                    raise ValueError(f"duplicate finding_id at CSV line {reader.line_num}: {finding_id!r}")
+                seen_ids.add(finding_id)
             label = row["label_verdict"]
             v = row["validator_label"]
-            if label == VERDICT_FALSE_POSITIVE and row["fp_category"]:
-                m.fp_categories[row["fp_category"]] += 1
+            if label not in VALID_VERDICTS:
+                msg = f"invalid label_verdict at CSV line {reader.line_num}: {label!r}"
+                raise ValueError(msg)
+            if v not in VALID_VERDICTS and v != "uncertain":
+                msg = f"invalid validator_label at CSV line {reader.line_num}: {v!r}"
+                raise ValueError(msg)
+            category = row["fp_category"]
+            if label == VERDICT_FALSE_POSITIVE and category not in VALID_FP_CATEGORIES:
+                msg = f"invalid fp_category at CSV line {reader.line_num}: {category!r}"
+                raise ValueError(msg)
+            if label == VERDICT_TRUE_POSITIVE and category != "":
+                raise ValueError(f"fp_category must be empty for true_positive at CSV line {reader.line_num}")
+            if "validator_verdict" in columns:
+                raw = row["validator_verdict"]
+                try:
+                    expected = verdict_to_label(ValidatorVerdict(raw))
+                except ValueError as exc:
+                    raise ValueError(f"invalid validator_verdict at CSV line {reader.line_num}: {raw!r}") from exc
+                if v != expected:
+                    raise ValueError(f"validator_label inconsistent with validator_verdict at CSV line {reader.line_num}")
+            m.total += 1
+            if label == VERDICT_FALSE_POSITIVE:
+                m.fp_categories[category] += 1
             if v == "uncertain":
                 m.uncertain += 1
                 continue
@@ -92,16 +134,16 @@ def compute(csv_path: Path) -> Metrics:
 
 
 def render(m: Metrics) -> str:
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append(f"Total findings: {m.total}")
     tp_total = m.tp + m.fn
     fp_total = m.fp + m.tn
     lines.append(
-        f"  True positives:  {tp_total}  "
+        f"  Classified true-positive labels:  {tp_total}  "
         f"(validator-confirmed: {m.tp}, missed: {m.fn})"
     )
     lines.append(
-        f"  False positives: {fp_total}  "
+        f"  Classified false-positive labels: {fp_total}  "
         f"(suppressed: {m.tn}, leaked: {m.fp})"
     )
     lines.append(f"  Uncertain:       {m.uncertain}")
@@ -114,25 +156,25 @@ def render(m: Metrics) -> str:
     )
     lines.append(
         f"  Recall:    {r:.3f}" if r is not None
-        else "  Recall:    undefined (no positives in labels)"
+        else "  Recall:    undefined (no classified positive labels)"
     )
     lines.append(
         f"  F1:        {fone:.3f}" if fone is not None
         else "  F1:        undefined"
     )
     lines.append("")
-    lines.append("FP category distribution:")
+    lines.append("FP category distribution (including uncertain verdicts):")
     if not m.fp_categories:
         lines.append("  (no labelled FPs in corpus)")
     else:
         total_fps = sum(m.fp_categories.values())
         for cat, count in m.fp_categories.most_common():
-            pct = count / total_fps * 100
+            pct = count / total_fps * 100 if total_fps else 0.0
             lines.append(f"  {cat}: {count} ({pct:.1f}%)")
     return "\n".join(lines)
 
 
-def check_pivot_gate(m: Metrics) -> Tuple[bool, str]:
+def check_pivot_gate(m: Metrics) -> tuple[bool, str]:
     """Return ``(ok, message)``. ``ok`` is True iff
     ``missing_sanitizer_model`` accounts for at least
     :data:`PIVOT_GATE_THRESHOLD` of the labelled FPs.
@@ -153,15 +195,22 @@ def check_pivot_gate(m: Metrics) -> Tuple[bool, str]:
     )
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv", type=Path, help="CSV from run_corpus.py")
+    # Python 3.14's argparse eagerly validates help strings via
+    # ``help % params`` substitution at add_argument time, so a
+    # literal ``%`` not part of a valid format spec raises
+    # ``ValueError: incomplete format``. The ``:.0%`` f-string
+    # format spec resolves to e.g. ``15%`` at runtime — that ``%``
+    # would trip the new validator. Escape via ``%%`` so argparse
+    # sees a literal percent + still renders ``15%`` in help.
     parser.add_argument(
         "--check-pivot-gate",
         action="store_true",
         help=(
             "Exit non-zero if missing_sanitizer_model share is below "
-            f"{PIVOT_GATE_THRESHOLD:.0%}"
+            f"{PIVOT_GATE_THRESHOLD:.0%}".replace("%", "%%")
         ),
     )
     args = parser.parse_args(argv)

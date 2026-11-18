@@ -1,5 +1,6 @@
 ---
 description: Autonomous crash root-cause analysis for C/C++ bugs
+dispatch: skill
 ---
 
 # /crash-analysis - Autonomous Crash Root-Cause Analysis
@@ -14,14 +15,16 @@ Analyzes security bugs from bug tracker reports with full root-cause tracing.
 
 ## What This Does
 
-1. Fetches bug report from the provided URL
-2. Clones the repository from the Git URL
-3. Reads README to determine build process
-4. Rebuilds with AddressSanitizer and debug symbols
-5. Reproduces the crash
-6. Generates execution traces, coverage data, and rr recordings
-7. Performs root-cause analysis with validation loop
-8. Produces confirmed root-cause hypothesis
+1. Dispatches the fetch-only `crash-report-fetcher` agent to retrieve the bug report and write a schema-gated `bug-report.json`
+2. Validates the artifact (`libexec/raptor-validate-schema bug-report`)
+3. Clones the repository via the sandboxed helper (`libexec/raptor-clone-repo`)
+4. Downloads report attachments via `libexec/raptor-fetch-attachment`
+5. Reads README to determine build process
+6. Rebuilds with AddressSanitizer and debug symbols
+7. Reproduces the crash
+8. Generates execution traces, coverage data, and rr recordings
+9. Performs root-cause analysis with validation loop
+10. Produces confirmed root-cause hypothesis
 
 ## Example
 
@@ -32,6 +35,8 @@ Analyzes security bugs from bug tracker reports with full root-cause tracing.
 ## Output
 
 Results are saved to `./crash-analysis-<timestamp>/` directory including:
+- `bug-report.json` - Structured bug-tracker facts (provenance-stamped, schema-gated)
+- `attachments/` - Crash inputs downloaded from the report
 - `rr-trace/` - Deterministic replay recording (can be shared for debugging)
 - `traces/` - Function execution traces (viewable in Perfetto)
 - `gcov/` - Code coverage data
@@ -48,12 +53,21 @@ The following tools must be installed:
 
 ## Workflow Details
 
-This command invokes the `crash-analysis-agent` which orchestrates:
-1. **crash-analyzer-agent**: Performs deep root-cause analysis using rr traces
-2. **crash-analyzer-checker-agent**: Validates the analysis rigorously
-3. **function-trace-generator-agent**: Creates function execution traces
-4. **coverage-analysis-generator-agent**: Generates code coverage data
+This command invokes the `crash-analysis-agent` (no network tools) which orchestrates:
+1. **crash-report-fetcher**: Fetches the bug tracker page (WebFetch pinned to the operator URL's domain) and writes `bug-report.json`
+2. **crash-analyzer**: Performs deep root-cause analysis using rr traces
+3. **crash-analysis-checker**: Validates the analysis rigorously
+4. **function-trace-generator**: Creates function execution traces
+5. **coverage-analyzer**: Generates code coverage data
 
 The analysis follows a hypothesis-validation loop - if the checker rejects a hypothesis, the analyzer is re-invoked with feedback until a valid root cause is confirmed.
+
+## Skills
+
+(in `.claude/skills/crash-analysis/`):
+- `rr-debugger` - Deterministic record-replay debugging
+- `function-tracing` - Function instrumentation with -finstrument-functions
+- `gcov-coverage` - Code coverage collection
+- `line-execution-checker` - Fast line execution queries
 
 ---

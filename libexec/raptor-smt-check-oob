@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF100, I001
+# (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Stage E SMT verb: CWE-125 / CWE-787 array out-of-bounds.
 
 Usage:
   raptor-smt-check-oob --buffer-size SIZE --index INDEX
                        [--profile NAME] [--guard 'condition' ...]
 
-``SIZE`` and ``INDEX`` are identifier or expression strings naming the
-buffer length and the index used at the access site.  Compound
-expressions are accepted (``--index 'offset + length'``) — the parser
-handles arithmetic.
+``SIZE`` and ``INDEX`` name the buffer length and the index used at the
+access site.  Each must be atomic: a single identifier (``count``), a
+numeric literal (``16``, ``0x10``), or a balanced function-call shape
+(``strlen(input)`` — an independent symbol with optional summary theory, so a
+``feasible=true`` verdict involving one is a hint, not proof).  Compound
+arithmetic (``--index 'offset + length'``) is rejected with a clear
+error; introduce a helper variable in ``--guard``
+(``--guard 'idx == offset + length'``) and pass ``--index idx``, or use
+raptor-smt-validate-path directly.
 
 ``--profile`` defaults to ``uint64`` since most modern bounds are
 ``size_t``-shaped.  Override when the index is ``int`` or narrower.
@@ -23,16 +30,18 @@ Output: JSON to stdout matching :func:`validate_path`'s shape.  Of interest:
   feasible=null   Z3 unavailable / unencodable
 
 Notes:
-  Only checks the upper bound (``index >= buffer_size``).  Negative-index
-  escapes need a signed profile AND an explicit guard expression.
+  Unsigned profiles check the upper bound (``index >= buffer_size``).
+  Signed profiles also check negative indices. Signed decimal operands
+  such as ``--index -1`` are accepted only under a signed profile.
 """
 import argparse
-import json
 import sys
+import json
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
-import os
+# fmt: off
+import os  # noqa: E402
 if not (os.environ.get("CLAUDECODE")
         or os.environ.get("_RAPTOR_TRUSTED")):
     sys.stderr.write(
@@ -41,11 +50,13 @@ if not (os.environ.get("CLAUDECODE")
         "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
     )
     sys.exit(2)
+# fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import core.startup.process_init  # noqa: E402,F401
 
-from packages.exploit_feasibility.smt_verbs import check_oob
+from packages.exploit_feasibility.smt_verbs import check_oob  # noqa: E402
 
 
 def main() -> int:
@@ -61,6 +72,9 @@ def main() -> int:
                    help="Bitvector profile name (default: uint64)")
     p.add_argument("--guard", action="append", default=[],
                    help="Visible bounds-check / path condition (repeat)")
+    # Accept --source and --function for compatibility with sweep runner
+    p.add_argument("--source", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--function", default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
 
     try:
@@ -74,7 +88,12 @@ def main() -> int:
         print(f"raptor-smt-check-oob: {e}", file=sys.stderr)
         return 2
 
-    json.dump(result, sys.stdout, indent=2)
+    # ensure_ascii: this JSON goes to the operator terminal; JSON
+    # escapes C0 but passes C1 controls (single-byte CSI/OSC) raw
+    # when ensure_ascii is off (dumps_display is exactly that).
+    # ASCII output stays valid JSON for parsing consumers.
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=True,
+                                default=str))
     sys.stdout.write("\n")
     return 0
 

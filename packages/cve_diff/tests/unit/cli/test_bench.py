@@ -20,7 +20,7 @@ from cve_diff.cli.bench import (
 @pytest.mark.parametrize("err,expected", [
     ("DiscoveryError: CVE-X: agent surrendered (budget_cost_usd): iters=15 ...", "budget_cost_usd"),
     ("DiscoveryError: CVE-X: agent surrendered (budget_iterations): ...", "budget_iterations"),
-    ("DiscoveryError: CVE-X: agent surrendered (budget_tokens): ...", "budget_tokens"),
+    ("DiscoveryError: CVE-X: agent surrendered (budget_s): elapsed=720.4s", "budget_s"),
     ("DiscoveryError: CVE-X: agent surrendered (llm_error): Anthropic 529", "llm_error"),
     ("DiscoveryError: CVE-X: agent surrendered (no_evidence): ...", "no_evidence"),
     ("UnsupportedSource: CVE-X: closed-source", "UnsupportedSource"),
@@ -40,7 +40,7 @@ def test_transient_classes_set() -> None:
     })
     # These must NOT be in the retry set:
     for settled in ("UnsupportedSource", "no_evidence", "budget_cost_usd",
-                    "budget_iterations", "budget_tokens", "PASS"):
+                    "budget_iterations", "budget_s", "PASS"):
         assert settled not in _TRANSIENT_CLASSES
 
 
@@ -89,11 +89,11 @@ def _make_summary() -> _BenchSummary:
         _CveResult(cve_id="CVE-X-001", ok=True, elapsed_s=12.5, files_changed=2, diff_bytes=1500,
                    shape="source", error_class="PASS",
                    agent_tool_calls=("osv_raw", "gh_commit_detail", "submit_result"),
-                   agent_cost_usd=0.32, llm_retries=0),
+                   agent_cost_usd=0.32),
         _CveResult(cve_id="CVE-X-002", ok=True, elapsed_s=18.0, files_changed=1, diff_bytes=800,
                    shape="source", error_class="PASS",
                    agent_tool_calls=("deterministic_hints", "gh_commit_detail", "submit_result"),
-                   agent_cost_usd=0.18, llm_retries=1, meta_retry_attempted=True),
+                   agent_cost_usd=0.18, meta_retry_attempted=True),
         _CveResult(cve_id="CVE-X-003", ok=False, elapsed_s=4.2,
                    error="UnsupportedSource: CVE-X-003: Adobe Flash closed-source",
                    error_class="UnsupportedSource",
@@ -137,8 +137,9 @@ def test_markdown_outcome_distribution_includes_only_present_classes() -> None:
 
 def test_markdown_recovery_layers() -> None:
     md = _render_bench_markdown(_make_summary())
-    # llm_retries: only CVE-X-002 had retries; it passed -> 1 triggered, 1 recovered
-    assert "| In-loop LLM retry (3 attempts, 0/5/15s) | 1 | 1 |" in md
+    # No in-loop LLM retry layer exists in the tool-use engine — the
+    # report must not fabricate a row for it.
+    assert "In-loop LLM retry" not in md
     # meta_retry_attempted: only CVE-X-002; passed -> 1, 1
     assert "| Meta-retry on budget+candidates | 1 | 1 |" in md
     # bench-retry: not exercised in this synthetic summary
@@ -199,7 +200,7 @@ def test_bench_retry_runs_transient_failures(monkeypatch) -> None:
     monkeypatch.setattr("cve_diff.cli.bench._run_one", fake_run_one)
     monkeypatch.setattr("cve_diff.cli.bench.typer.echo", lambda *a, **kw: None)
 
-    _run_bench_retry_pass(summary, "/tmp/x", 95.0, 128 * 1024, 4, lambda: None)
+    _run_bench_retry_pass(summary, "./x", 95.0, 128 * 1024, 4, lambda: None)
 
     # Only the 2 transient CVEs got retried
     assert sorted(rerun_log) == ["CVE-C", "CVE-D"]
@@ -226,7 +227,7 @@ def test_bench_retry_skips_when_no_transient_failures(monkeypatch) -> None:
     calls: list = []
     monkeypatch.setattr("cve_diff.cli.bench._run_one", lambda *a, **kw: calls.append(1) or None)
 
-    _run_bench_retry_pass(summary, "/tmp/x", 95.0, 128 * 1024, 2, lambda: None)
+    _run_bench_retry_pass(summary, "./x", 95.0, 128 * 1024, 2, lambda: None)
 
     assert calls == []  # no retries invoked
     assert summary.passed == 1  # unchanged
@@ -342,18 +343,23 @@ def test_bench_command_breakdown_block_when_mixed_outcomes(
 ) -> None:
     """Mixed PASS / refusal / pipeline-issue prints all three buckets."""
     sample = tmp_path / "sample.json"
-    _write_sample(sample, ["CVE-A", "CVE-B", "CVE-C"])
+    _write_sample(
+        sample, ["CVE-2024-0001", "CVE-2024-0002", "CVE-2024-0003"],
+    )
     out = tmp_path / "out"
 
     canned = {
-        "CVE-A": _CveResult(cve_id="CVE-A", ok=True, elapsed_s=1,
-                            shape="source", error_class="PASS"),
-        "CVE-B": _CveResult(cve_id="CVE-B", ok=False, elapsed_s=1,
-                            error="UnsupportedSource: closed",
-                            error_class="UnsupportedSource"),
-        "CVE-C": _CveResult(cve_id="CVE-C", ok=False, elapsed_s=1,
-                            error="DiscoveryError budget_cost_usd",
-                            error_class="budget_cost_usd"),
+        "CVE-2024-0001": _CveResult(cve_id="CVE-2024-0001", ok=True,
+                                    elapsed_s=1, shape="source",
+                                    error_class="PASS"),
+        "CVE-2024-0002": _CveResult(cve_id="CVE-2024-0002", ok=False,
+                                    elapsed_s=1,
+                                    error="UnsupportedSource: closed",
+                                    error_class="UnsupportedSource"),
+        "CVE-2024-0003": _CveResult(cve_id="CVE-2024-0003", ok=False,
+                                    elapsed_s=1,
+                                    error="DiscoveryError budget_cost_usd",
+                                    error_class="budget_cost_usd"),
     }
     monkeypatch.setattr(_bench_mod, "_run_one",
                         lambda cid, *_a, **_kw: canned[cid])
@@ -406,3 +412,132 @@ def test_render_html_emits_valid_table_for_empty_and_populated() -> None:
     html_pop = _render_html(populated)
     assert "CVE-1" in html_pop
     assert "CVE-2" in html_pop
+
+
+def test_render_html_escapes_tracker_influenced_fields() -> None:
+    """r.error carries exception text embedding the submitted
+    repository_url (hostile OSV data passes on an http(s) prefix
+    alone) — every dynamic field must land in summary.html escaped
+    """
+    from cve_diff.cli.bench import _render_html
+
+    payload = '"><script src=//evil.example></script>'
+    s = _BenchSummary(sample=f"x{payload}.json", total=2, passed=1)
+    s.results = [
+        _CveResult(cve_id=f"CVE-1{payload}", ok=False, elapsed_s=1,
+                   error=f"clone failed: {payload}", error_class="Other"),
+        _CveResult(cve_id="CVE-2", ok=True, elapsed_s=1,
+                   shape=f"source{payload}", error_class="PASS",
+                   extraction_agree=f"agree{payload}"),
+    ]
+    out = _render_html(s)
+    # The raw tag must never survive; the payload appears only in its
+    # escaped, inert form so the operator still sees what happened.
+    assert "<script" not in out
+    assert "&lt;script" in out
+
+
+def test_valid_cve_id_accepts_and_normalises() -> None:
+    from cve_diff.cli.bench import _valid_cve_id
+
+    assert _valid_cve_id("CVE-2024-31337") == "CVE-2024-31337"
+    assert _valid_cve_id("cve-2024-31337") == "CVE-2024-31337"
+    assert _valid_cve_id(" CVE-2024-1234567 ") == "CVE-2024-1234567"
+
+
+def test_valid_cve_id_rejects_filename_hostile_shapes() -> None:
+    """cve_id flows into output filenames and a tempdir prefix — path
+    separators, traversal segments, and free-text must all refuse."""
+    from cve_diff.cli.bench import _valid_cve_id
+
+    for bad in (
+        "../evil",
+        "CVE-2024-1234/../../etc",
+        "CVE-2024-123",          # too-short sequence number
+        "CVE-24-12345",          # two-digit year
+        "CVE-2024-1234x",
+        "no CVE here",
+        "",
+    ):
+        assert _valid_cve_id(bad) is None, bad
+
+
+def test_render_html_battery_variant_payloads_neutralised() -> None:
+    """Evasion variants observed against the pre-fix renderer, pinned
+    one-by-one:
+    cveid-script, error-script (img autofetch), shape-attr,
+    extraction-attr (iframe), error-ansi (terminal injection when the
+    operator cats the file), sample-title-escape."""
+    from cve_diff.cli.bench import _render_html
+
+    s = _BenchSummary(
+        sample='x</title><script>alert(1)</script>.json',
+        total=3, passed=1,
+    )
+    s.results = [
+        # cveid-script
+        _CveResult(cve_id="<script>alert('ZEVIL')</script>", ok=False,
+                   elapsed_s=1, error="e", error_class="Other"),
+        # error-script (img autofetch) + error-ansi
+        _CveResult(cve_id="CVE-2024-0001", ok=False, elapsed_s=1,
+                   error="x <img src=//evil.example/ZEVIL> \x1b[2J y",
+                   error_class="Other"),
+        # shape-attr + extraction-attr (iframe)
+        _CveResult(cve_id="CVE-2024-0002", ok=True, elapsed_s=1,
+                   shape='"><script>ZEVILs</script>',
+                   extraction_agree=(
+                       '"><iframe src=//evil.example/ZEVIL>'
+                   ),
+                   error_class="PASS"),
+    ]
+    out = _render_html(s)
+    assert "<script" not in out
+    assert "<img" not in out
+    assert "<iframe" not in out
+    assert "\x1b" not in out            # raw ANSI never written
+    assert "</title><script" not in out
+    # Evidence stays visible in inert form.
+    assert "&lt;script" in out and "&lt;iframe" in out
+
+
+def test_echo_result_fail_lane_escapes_error(capsys) -> None:
+    """r.error relays agent/tool exception text — hostile ESC/C1/bidi
+    bytes must reach the operator TTY escaped and bounded."""
+    from cve_diff.cli.bench import _CveResult, _echo_result
+
+    hostile = "boom\x1b]0;pwned\x07\x9b2J‮evil " + "A" * 2000
+    r = _CveResult(cve_id="CVE-2024-0001", ok=False, elapsed_s=1.0,
+                   error=hostile, error_class="Other")
+    _echo_result(1, 1, r)
+    err = capsys.readouterr().err
+    assert "CVE-2024-0001" in err and "boom" in err
+    for raw in ("\x1b]", "\x07", "\x9b", "‮"):
+        assert raw not in err
+    assert "...[+" in err  # length-bounded with explicit elision
+
+
+def test_echo_result_pass_lane_unchanged(capsys) -> None:
+    from cve_diff.cli.bench import _CveResult, _echo_result
+
+    r = _CveResult(cve_id="CVE-2024-0002", ok=True, elapsed_s=2.0,
+                   shape="source", error_class="PASS")
+    _echo_result(2, 3, r)
+    assert "[2/3] PASS CVE-2024-0002 (2.0s)" in capsys.readouterr().out
+
+
+def test_bench_unreadable_sample_error_escapes_hostile_path_bytes(
+    tmp_path: _Path,
+) -> None:
+    """The cannot-read-sample lane relays OSError text (which embeds
+    the failing path) to the TTY — same sanitise_for_terminal idiom
+    as the run command's typed-handler relays."""
+    hostile_dir = tmp_path / "s\x1b]0;pwned\x07.json"
+    hostile_dir.mkdir()  # open() on a directory raises IsADirectoryError
+    result = CliRunner().invoke(app, [
+        "bench", "--sample", str(hostile_dir),
+        "--output-dir", str(tmp_path / "out"),
+    ])
+    assert result.exit_code == 1
+    assert "cannot read sample" in result.output
+    for raw in ("\x1b", "\x07"):
+        assert raw not in result.output

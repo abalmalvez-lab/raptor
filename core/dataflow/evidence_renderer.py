@@ -21,13 +21,16 @@ the envelope's separation guarantee.
 
 from __future__ import annotations
 
-from typing import Iterable, List
 
-from core.dataflow.sanitizer_evidence import (
-    CandidateValidator,
-    SanitizerEvidence,
-    StepAnnotation,
-)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.dataflow.sanitizer_evidence import (
+        CandidateValidator,
+        SanitizerEvidence,
+        StepAnnotation,
+    )
+    from collections.abc import Iterable
 
 
 def render_evidence_for_prompt(evidence: SanitizerEvidence) -> str:
@@ -37,7 +40,7 @@ def render_evidence_for_prompt(evidence: SanitizerEvidence) -> str:
     candidates)"`` and similar placeholders rather than collapsing).
     Section order is stable: candidates → step annotations → metadata.
     """
-    sections: List[str] = [
+    sections: list[str] = [
         _render_candidate_pool(evidence.candidate_pool),
         _render_step_annotations(evidence.step_annotations),
         _render_metadata(evidence),
@@ -67,7 +70,12 @@ def _render_candidate_pool(pool: Iterable[CandidateValidator]) -> str:
 
 def _render_step_annotations(annotations: Iterable[StepAnnotation]) -> str:
     annotation_list = list(annotations)
-    lines = ["Path-step annotations:"]
+    lines = [
+        "Path-step annotations:",
+        "  Call matching is best-effort; empty annotations do not prove "
+        "validators are absent. Unsupported or failed parsing can also "
+        "produce an empty annotation.",
+    ]
     if not annotation_list:
         lines.append("  (no steps)")
         return "\n".join(lines)
@@ -80,7 +88,7 @@ def _render_step_annotations(annotations: Iterable[StepAnnotation]) -> str:
                 + "]"
             )
         else:
-            validators_part = "no validators called"
+            validators_part = "no validator calls identified"
         lines.append(f"  step {ann.step_index}: {validators_part}")
         if ann.variables_referenced:
             lines.append(
@@ -101,8 +109,7 @@ def _render_metadata(evidence: SanitizerEvidence) -> str:
     lines = [f"Pool completeness: {evidence.pool_completeness}"]
     if evidence.extraction_failures:
         lines.append("Extraction failures:")
-        for f in evidence.extraction_failures:
-            lines.append(f"  - {f}")
+        lines.extend(f"  - {f}" for f in evidence.extraction_failures)
     else:
         lines.append("Extraction failures: (none)")
     return "\n".join(lines)

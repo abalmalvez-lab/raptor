@@ -200,3 +200,44 @@ def test_tool_loop_result_construction() -> None:
     )
     assert out.terminal_tool_input == {"verdict": "match"}
     assert out.terminated_by == "terminal_tool"
+
+
+# --- Facade completeness ----------------------------------------------
+
+def test_facade_exports_full_loop_event_union() -> None:
+    """Every LoopEvent union member must be importable from the
+    package facade — subscribers isinstance-dispatch on the union
+    and cannot handle members the public surface hides."""
+    import typing
+
+    import core.llm.tool_use as facade
+    from core.llm.tool_use import LoopEvent
+
+    for member in typing.get_args(LoopEvent):
+        assert member.__name__ in facade.__all__, member.__name__
+        assert getattr(facade, member.__name__) is member
+
+
+class TestTerminationReasonSharedAlias:
+    def test_reason_and_terminated_by_share_one_vocabulary(self):
+        """LoopTerminated.reason and ToolLoopResult.terminated_by carry
+        the same string by contract — the annotations must be the ONE
+        shared alias, not two hand-synced unions (a drift channel)."""
+        import typing
+
+        from core.llm.tool_use.types import (
+            LoopTerminated,
+            TerminationReason,
+            ToolLoopResult,
+        )
+        hints_event = typing.get_type_hints(LoopTerminated)
+        hints_result = typing.get_type_hints(ToolLoopResult)
+        assert hints_event["reason"] == TerminationReason
+        assert hints_result["terminated_by"] == TerminationReason
+        assert set(typing.get_args(TerminationReason)) == {
+            "complete", "terminal_tool", "max_iterations",
+            "max_cost_usd", "max_seconds", "max_total_tokens",
+            "max_tokens", "refused", "tool_error", "tool_timeout",
+            "context_overflow", "provider_error", "credit_exhausted",
+            "give_up",
+        }

@@ -1,0 +1,787 @@
+"""Lightweight intra-procedural taint approximation for C/C++.
+
+AST-structural only — no CFG, no fixed point. Walks tree-sitter parse
+trees to find direct parameter-to-callee-argument flows. Deliberately
+conservative: false negatives (misses flows through assignments) but
+not false positives (doesn't claim a flow that doesn't exist) — with
+one named exception: the ``extra_edges`` bridge in transitive
+following guesses same-argument-position when it lacks a parameter
+mapping (marked best-effort at the site). Consumers are
+prompt-context only, never a suppression gate.
+
+For Python, core/inventory/taint_summaries.py provides full CFG-based
+analysis. This module covers the C/C++ gap until Joern (tier 3) or
+CodeQL (tier 4) is available.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+from core.inventory.sink_discovery import _is_dangerous
+
+logger = logging.getLogger(__name__)
+
+MEMORY_SINKS: frozenset = frozenset({
+    "memcpy", "memmove", "memset", "memcmp",
+    "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp",
+    "sprintf", "snprintf", "vsprintf", "vsnprintf",
+    "printf", "fprintf", "syslog",
+    "fread", "fwrite",
+    "read", "write", "recv", "send",
+    "gets", "fgets",
+    "malloc", "calloc", "realloc", "free",
+    "alloca",
+})
+
+_FUNCTION_DEFINITION = "function_definition"
+_CALL_EXPRESSION = "call_expression"
+_COMMENT = "comment"
+_IDENTIFIER = "identifier"
+_FIELD_IDENTIFIER = "field_identifier"
+_QUALIFIED_IDENTIFIER = "qualified_identifier"
+_ARRAY_DECLARATOR = "array_declarator"
+_FIELD_EXPRESSION = "field_expression"
+_POINTER_EXPRESSION = "pointer_expression"
+_PARENTHESIZED_EXPRESSION = "parenthesized_expression"
+_FUNCTION_DECLARATOR = "function_declarator"
+_POINTER_DECLARATOR = "pointer_declarator"
+_PARAMETER_LIST = "parameter_list"
+_PARAMETER_DECLARATION = "parameter_declaration"
+_ARGUMENT_LIST = "argument_list"
+_ASSIGNMENT_EXPRESSION = "assignment_expression"
+_INIT_DECLARATOR = "init_declarator"
+_COMPOUND_STATEMENT = "compound_statement"
+
+
+@dataclass
+class CTaintApprox:
+    """Taint approximation result for a single C/C++ function."""
+
+    function: str
+    params: list[str]
+    direct_flows: dict[int, list[tuple[str, int]]] = field(default_factory=dict)
+    dangerous_flows: dict[int, list[tuple[str, int]]] = field(default_factory=dict)
+    has_opaque_flow: bool = False
+
+    def has_dangerous_param(self, param_idx: int) -> bool:
+        return param_idx in self.dangerous_flows and len(self.dangerous_flows[param_idx]) > 0
+
+    def has_any_dangerous(self) -> bool:
+        return any(len(v) > 0 for v in self.dangerous_flows.values())
+
+    def to_dict(self) -> dict:
+        return {
+            "function": self.function,
+            "params": self.params,
+            "direct_flows": {
+                str(k): [(c, i) for c, i in v]
+                for k, v in self.direct_flows.items()
+            },
+            "dangerous_flows": {
+                str(k): [(c, i) for c, i in v]
+                for k, v in self.dangerous_flows.items()
+            },
+            "has_opaque_flow": self.has_opaque_flow,
+        }
+
+
+def function_key(rel_path: str, func_name: str) -> str:
+    """THE producer join key for per-function taint results.
+
+    ``"<rel_path>:<func_name>"`` — minted by the audit loader when it
+    aggregates per-file extraction results, and the key vocabulary the
+    evidence index joins on. Every producer of a cross-file
+    ``per_function`` map and every consumer that joins against it must
+    construct keys through this function; hand-built f-strings on one
+    side are exactly how the multi-hop lane went silently inert.
+    """
+    return f"{rel_path}:{func_name}"
+
+
+def bare_function_name(key: str) -> str:
+    """Bare function name of a :func:`function_key` (or already-bare) key.
+
+    ``rsplit`` from the right: relative paths may themselves contain
+    colons on exotic filesystems, function names cannot.
+    """
+    return key.rsplit(":", 1)[-1]
+
+
+def extract_taint_approx_c(content: str) -> dict[str, CTaintApprox]:
+    """Extract taint approximations for all functions in C source.
+
+    Returns a dict keyed by function name. Each value is a CTaintApprox
+    describing direct parameter-to-callee-argument flows.
+
+    Returns empty dict when tree-sitter C grammar is not installed.
+    """
+    try:
+        import tree_sitter_c as ts_c
+    except ImportError:
+        logger.debug("taint_approx: tree-sitter C grammar not installed")
+        return {}
+
+    try:
+        from core.inventory.call_graph import _get_ts_parser
+        parser = _get_ts_parser(ts_c.language)
+        tree = parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        logger.debug("taint_approx: C parse failed")
+        return {}
+
+    results: dict[str, CTaintApprox] = {}
+    _walk_top_level(tree.root_node, results)
+    return results
+
+
+def extract_taint_approx_cpp(content: str) -> dict[str, CTaintApprox]:
+    """Extract taint approximations for all functions in C++ source."""
+    try:
+        import tree_sitter_cpp as ts_cpp
+    except ImportError:
+        logger.debug("taint_approx: tree-sitter C++ grammar not installed")
+        return {}
+
+    try:
+        from core.inventory.call_graph import _get_ts_parser
+        parser = _get_ts_parser(ts_cpp.language)
+        tree = parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        logger.debug("taint_approx: C++ parse failed")
+        return {}
+
+    results: dict[str, CTaintApprox] = {}
+    _walk_top_level(tree.root_node, results)
+    return results
+
+
+def _walk_top_level(
+    node,
+    results: dict[str, CTaintApprox],
+) -> None:
+    """Walk top-level nodes looking for function definitions.
+
+    Iterative (explicit stack) — the walk runs on target-controlled
+    parse trees, so recursion depth must not scale with nesting depth
+    (a crafted deeply-nested file would otherwise abort the whole
+    multi-file prep pass with RecursionError).
+    """
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if cur.type == _FUNCTION_DEFINITION:
+            approx = _analyze_function(cur)
+            if approx is not None:
+                results[approx.function] = approx
+            continue
+        stack.extend(reversed(cur.children))
+
+
+def _analyze_function(fn_node) -> CTaintApprox | None:
+    """Analyze a single function definition for taint flows."""
+    name = _function_name(fn_node)
+    if name is None:
+        return None
+
+    params = _extract_params(fn_node)
+    if not params:
+        return CTaintApprox(function=name, params=[])
+
+    param_set: set[str] = set(params)
+    param_index: dict[str, int] = {p: i for i, p in enumerate(params)}
+
+    approx = CTaintApprox(function=name, params=params)
+
+    body = _find_body(fn_node)
+    if body is None:
+        return approx
+
+    _scan_calls(body, param_set, param_index, approx)
+    _scan_opaque_assignments(body, param_set, approx)
+
+    return approx
+
+
+def _function_name(fn_def_node) -> str | None:
+    """Extract the function name from a function_definition node."""
+    for c in fn_def_node.children:
+        if not c.is_named:
+            continue
+        if c.type == _FUNCTION_DECLARATOR:
+            return _declarator_name(c)
+        if c.type == _POINTER_DECLARATOR:
+            inner = _find_function_declarator(c)
+            if inner is not None:
+                return _declarator_name(inner)
+    return None
+
+
+def _declarator_name(fn_declarator_node) -> str | None:
+    """Get the function name from a function_declarator.
+
+    A C free function names the declarator with a plain identifier.
+    C++ class methods use a ``field_identifier`` (in-class
+    definition) or a ``qualified_identifier`` (out-of-line
+    ``Foo::bar``); accepting only the plain identifier silently
+    skipped every class method — no summary, no flows, no opaque
+    marker. The qualified form yields the bare method name (last
+    ``::`` segment) to match the inventory's bare-name keying that
+    consumers join taint approximations against.
+    """
+    for c in fn_declarator_node.children:
+        if not c.is_named:
+            continue
+        if c.type in (_IDENTIFIER, _FIELD_IDENTIFIER):
+            return c.text.decode("utf-8", errors="replace")
+        if c.type == _QUALIFIED_IDENTIFIER:
+            text = c.text.decode("utf-8", errors="replace")
+            name = text.split("::")[-1].strip()
+            return name or None
+    return None
+
+
+def _find_function_declarator(node) -> object | None:
+    """Find the first function_declarator under pointer/paren wrappers
+    (pre-order, iterative — depth is target-controlled)."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if cur.type == _FUNCTION_DECLARATOR:
+            return cur
+        stack.extend(
+            c for c in reversed(cur.children) if c.is_named
+        )
+    return None
+
+
+def _extract_params(fn_node) -> list[str]:
+    """Extract parameter names from a function definition."""
+    decl = None
+    for c in fn_node.children:
+        if c.type in (_FUNCTION_DECLARATOR, _POINTER_DECLARATOR):
+            decl = c
+            break
+    if decl is None:
+        return []
+
+    if decl.type == _POINTER_DECLARATOR:
+        inner = _find_function_declarator(decl)
+        if inner is None:
+            return []
+        decl = inner
+
+    params: list[str] = []
+    for c in decl.children:  # type: ignore[union-attr]
+        if c.type == _PARAMETER_LIST:
+            for pc in c.children:
+                if pc.type == _PARAMETER_DECLARATION:
+                    name = _param_name(pc)
+                    if name:
+                        params.append(name)
+                    elif pc.text != b"void":
+                        # Unnamed / unextractable parameter (abstract
+                        # declarator, exotic shape). Hold its slot with
+                        # a placeholder — "<" can't appear in a C
+                        # identifier, so it never matches a body use —
+                        # because dropping the slot shifted every LATER
+                        # param's index and mis-bound their flows to
+                        # the wrong position. Bare ``void`` is the
+                        # empty parameter list, not a parameter.
+                        params.append(f"<unnamed:{len(params)}>")
+    return params
+
+
+def _param_name(param_decl) -> str | None:
+    """Extract the parameter name from a parameter_declaration.
+
+    Handles: int x, const char *buf, struct foo *ptr, char buf[64],
+    void (*cb)(int), etc. The name is the last identifier, or the
+    first identifier inside a pointer / array / function-pointer
+    declarator (the declaree precedes array sizes and inner
+    parameter lists in pre-order, so the first hit is the name).
+    """
+    last_id = None
+    for c in param_decl.children:
+        if c.type == _IDENTIFIER:
+            last_id = c.text.decode("utf-8", errors="replace")
+        elif c.type in (
+            _POINTER_DECLARATOR, _ARRAY_DECLARATOR, _FUNCTION_DECLARATOR,
+        ):
+            inner_id = _find_identifier(c)
+            if inner_id is not None:
+                last_id = inner_id
+    return last_id
+
+
+def _find_identifier(node) -> str | None:
+    """Find the first identifier leaf in a subtree (pre-order,
+    iterative — depth is target-controlled)."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if cur.type == _IDENTIFIER:
+            return cur.text.decode("utf-8", errors="replace")
+        stack.extend(reversed(cur.children))
+    return None
+
+
+def _find_body(fn_node) -> object | None:
+    """Find the compound_statement (function body) in a function_definition."""
+    for c in fn_node.children:
+        if c.type == _COMPOUND_STATEMENT:
+            return c
+    return None
+
+
+def _scan_calls(
+    node,
+    param_set: set[str],
+    param_index: dict[str, int],
+    approx: CTaintApprox,
+) -> None:
+    """Scan for call_expressions, checking if any argument is a direct
+    use of a function parameter (pre-order, iterative — depth is
+    target-controlled)."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if cur.type == _CALL_EXPRESSION:
+            callee_chain = _callee_chain(cur)
+            if callee_chain is not None:
+                _check_arguments(
+                    cur, callee_chain, param_set, param_index, approx,
+                )
+        stack.extend(reversed(cur.children))
+
+
+def _check_arguments(
+    call_node,
+    callee_chain: list[str],
+    param_set: set[str],
+    param_index: dict[str, int],
+    approx: CTaintApprox,
+) -> None:
+    """Check each argument of a call for direct parameter usage."""
+    callee_name = ".".join(callee_chain)
+    dangerous = _is_dangerous(callee_chain) or (
+        len(callee_chain) == 1 and callee_chain[0] in MEMORY_SINKS
+    )
+
+    for child in call_node.children:
+        if child.type == _ARGUMENT_LIST:
+            arg_idx = 0
+            for arg in child.children:
+                # Comments are NAMED nodes in tree-sitter: counting
+                # them (``f(dst, /* note */ src, n)``) shifted every
+                # later argument's recorded position.
+                if not arg.is_named or arg.type == _COMMENT:
+                    continue
+                param_name = _argument_is_param(arg, param_set)
+                if param_name is not None:
+                    pidx = param_index[param_name]
+                    approx.direct_flows.setdefault(pidx, []).append(
+                        (callee_name, arg_idx)
+                    )
+                    if dangerous:
+                        approx.dangerous_flows.setdefault(pidx, []).append(
+                            (callee_name, arg_idx)
+                        )
+                arg_idx += 1
+
+
+def _argument_is_param(
+    arg_node,
+    param_set: set[str],
+) -> str | None:
+    """Check if an argument node is a direct reference to a parameter.
+
+    Returns the parameter name if it is, None otherwise.
+    Only matches plain identifiers — not &param, *param, param[i],
+    param.field, (type)param, etc. Those are opaque flows.
+    """
+    if arg_node.type == _IDENTIFIER:
+        name = arg_node.text.decode("utf-8", errors="replace")
+        if name in param_set:
+            return name
+    return None
+
+
+def _callee_chain(call_node) -> list[str] | None:
+    """Resolve the callee of a call_expression to a name chain."""
+    callee = None
+    for c in call_node.children:
+        if c.is_named and c.type != _ARGUMENT_LIST:
+            callee = c
+            break
+    if callee is None:
+        return None
+    return _resolve_callee(callee)
+
+
+def _resolve_callee(node) -> list[str] | None:
+    """Resolve an expression node to a dotted name chain.
+
+    Paren / pointer wrappers are unwrapped with a loop (not
+    recursion) — nesting depth is target-controlled.
+    """
+    while node.type in (_PARENTHESIZED_EXPRESSION, _POINTER_EXPRESSION):
+        inner = None
+        for c in node.children:
+            if c.is_named:
+                inner = c
+                break
+        if inner is None:
+            return None
+        node = inner
+
+    if node.type == _IDENTIFIER:
+        return [node.text.decode("utf-8", errors="replace")]
+
+    if node.type == _FIELD_EXPRESSION:
+        parts: list[str] = []
+        cur = node
+        while cur is not None and cur.type == _FIELD_EXPRESSION:
+            field_node = None
+            operand = None
+            for c in cur.children:
+                if c.type == _FIELD_IDENTIFIER:
+                    field_node = c
+                elif c.is_named and c.type != _FIELD_IDENTIFIER:
+                    operand = c
+            if field_node is None:
+                return None
+            parts.append(field_node.text.decode("utf-8", errors="replace"))
+            cur = operand
+        if cur is not None and cur.type == _IDENTIFIER:
+            parts.append(cur.text.decode("utf-8", errors="replace"))
+            return list(reversed(parts))
+        return None
+
+    return None
+
+
+def _scan_opaque_assignments(
+    node,
+    param_set: set[str],
+    approx: CTaintApprox,
+) -> None:
+    """Scan for assignments where a parameter flows through a non-trivial
+    LHS (pointer deref, struct member, cast). Sets has_opaque_flow.
+
+    Iterative (explicit stack) — depth is target-controlled."""
+    stack = [node]
+    while stack:
+        if approx.has_opaque_flow:
+            return
+        cur = stack.pop()
+
+        if cur.type == _ASSIGNMENT_EXPRESSION:
+            rhs = None
+            children = list(cur.children)
+            for c in children:
+                if not c.is_named:
+                    continue
+                if c.text and c.text.decode("utf-8", errors="replace") == "=":
+                    continue
+                rhs = c
+
+            if rhs is not None and rhs.type == _IDENTIFIER:
+                name = rhs.text.decode("utf-8", errors="replace")
+                if name in param_set:
+                    lhs = None
+                    for c in children:
+                        if c.is_named and c != rhs:
+                            lhs = c
+                            break
+                    if lhs is not None and lhs.type != _IDENTIFIER:
+                        approx.has_opaque_flow = True
+                        return
+
+        if cur.type == _INIT_DECLARATOR:
+            for c in cur.children:
+                if c.is_named and c.type == _IDENTIFIER:
+                    continue
+                if c.is_named and c.type == _POINTER_DECLARATOR:
+                    for sc in cur.children:
+                        if sc.is_named and sc.type == _IDENTIFIER:
+                            name = sc.text.decode("utf-8", errors="replace")
+                            if name in param_set:
+                                approx.has_opaque_flow = True
+                                return
+
+        stack.extend(reversed(cur.children))
+
+
+# ---------------------------------------------------------------------------
+# Transitive (cross-function) taint tracking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TaintPath:
+    """A single path from a parameter through intermediates to a dangerous sink."""
+
+    hops: list[str]       # [caller, intermediate, ..., sink]
+    sink_name: str        # the dangerous function at the end
+    sink_arg: int         # which argument position at the sink
+
+
+@dataclass
+class TransitiveTaint:
+    """Transitive taint result for a single function."""
+
+    function: str
+    param_sinks: dict[int, list[TaintPath]]  # param_idx → paths to sinks
+
+
+def compute_transitive_taint(
+    per_function: dict[str, CTaintApprox],
+    call_edges: list[dict[str, str]] | None = None,
+    max_depth: int = 5,
+) -> dict[str, TransitiveTaint]:
+    """Follow taint across function boundaries to find transitive sink paths.
+
+    Builds on per-function ``CTaintApprox`` results: for each function *F*
+    with parameter *P* flowing to callee *C* at argument *A*, if *C* has
+    its own ``CTaintApprox`` and *C*'s param *A* flows further, the chain
+    is extended until it reaches a dangerous sink or ``max_depth`` is hit.
+
+    *call_edges* (optional) provides supplementary caller→callee edges
+    (e.g. from ``context-map.json``) to bridge functions whose
+    ``direct_flows`` only cover intra-file relationships.
+
+    *per_function* accepts both key vocabularies: bare function names
+    and the loader's :func:`function_key` (``"rel/path.c:func"``) —
+    the only production caller passes the latter. ``direct_flows``
+    record callees by BARE name, so hop resolution goes through a
+    bare-name view; result keys always mirror the input keys.
+
+    Returns a dict keyed by the input keys mapping to
+    ``TransitiveTaint``. Only functions with at least one reachable
+    sink path are included.
+    """
+
+    # -- Build a supplementary adjacency set from call_edges ----------------
+    # Maps caller → set of callees (bare names) so we can discover
+    # cross-file edges that the intra-file direct_flows missed.
+    extra_edges: dict[str, set[str]] = {}
+    if call_edges:
+        for edge in call_edges:
+            caller = edge.get("caller", "")
+            callee = edge.get("callee", "")
+            if caller and callee:
+                extra_edges.setdefault(caller, set()).add(callee)
+
+    # -- Bare-name view for hop resolution -----------------------------------
+    # direct_flows name callees bare; joining them against the
+    # producer's path-prefixed keys missed for every project function,
+    # so only the direct 1-hop sink terminal ever fired. Two files
+    # defining the same function name make the bare name ambiguous —
+    # refuse those rather than extending a chain through an arbitrary
+    # same-named function (these results feed review prompts; a
+    # confidently wrong cross-file chain steers worse than a missing
+    # one).
+    hop_view: dict[str, CTaintApprox] = {}
+    ambiguous: set[str] = set()
+    for key, approx in per_function.items():
+        bare = bare_function_name(key)
+        existing = hop_view.get(bare)
+        if existing is not None and existing is not approx:
+            ambiguous.add(bare)
+            continue
+        hop_view[bare] = approx
+    for bare in ambiguous:
+        del hop_view[bare]
+
+    results: dict[str, TransitiveTaint] = {}
+
+    for func_name, approx in per_function.items():
+        param_sinks: dict[int, list[TaintPath]] = {}
+
+        for param_idx, flows in approx.direct_flows.items():
+            paths: list[TaintPath] = []
+            # dict.fromkeys: duplicate (callee, arg) flow entries
+            # (repeated call sites) would multiply identical search
+            # trees — dedupe while preserving order.
+            for callee_name, arg_idx in dict.fromkeys(
+                (c, a) for c, a in flows
+            ):
+                _follow_taint(
+                    callee_name,
+                    arg_idx,
+                    hop_view,
+                    extra_edges,
+                    visited=frozenset({bare_function_name(func_name)}),
+                    hops_so_far=[func_name],
+                    max_depth=max_depth,
+                    out_paths=paths,
+                )
+            if paths:
+                # A callee whose dangerous_flows duplicate its
+                # direct_flows produces the same terminal path via
+                # both branches — keep one of each.
+                unique = {
+                    (tuple(p.hops), p.sink_name, p.sink_arg): p
+                    for p in paths
+                }
+                param_sinks[param_idx] = list(unique.values())
+
+        if param_sinks:
+            results[func_name] = TransitiveTaint(
+                function=func_name,
+                param_sinks=param_sinks,
+            )
+
+    return results
+
+
+_MAX_PATHS_PER_PARAM = 32
+
+
+def _follow_taint(
+    callee: str,
+    arg_idx: int,
+    per_function: dict[str, CTaintApprox],
+    extra_edges: dict[str, set[str]],
+    visited: frozenset,
+    hops_so_far: list[str],
+    max_depth: int,
+    out_paths: list[TaintPath],
+) -> None:
+    """Recursive DFS following taint from *callee* param *arg_idx* to sinks.
+
+    A path is "complete" (appended to *out_paths*) when:
+    - *callee* is in ``MEMORY_SINKS`` or ``_is_dangerous`` matches, or
+    - *callee* has ``dangerous_flows`` for *arg_idx*.
+
+    Otherwise, if *callee* has a ``CTaintApprox`` entry and its param
+    *arg_idx* has ``direct_flows``, the search continues along those edges.
+    """
+
+    # -- Depth / cycle / volume guard ----------------------------------------
+    # _MAX_PATHS_PER_PARAM caps the DFS output: visited is per-PATH, so
+    # branchy call graphs are exponential in max_depth once multi-hop
+    # resolution actually joins. Too low loses alternative sink routes
+    # for genuinely fan-shaped flows (the prompt renderer shows each
+    # path); too high lets one hub function stall the evidence pass.
+    # 32 paths per parameter is already far beyond what a review prompt
+    # can usefully carry.
+    if len(out_paths) >= _MAX_PATHS_PER_PARAM:
+        return
+    if len(hops_so_far) >= max_depth:
+        return
+    if callee in visited:
+        return
+
+    current_hops = hops_so_far + [callee]
+
+    # -- Terminal: callee is itself a dangerous sink ------------------------
+    callee_parts = callee.split(".")
+    is_sink = (
+        callee in MEMORY_SINKS
+        or _is_dangerous(callee_parts) is not None
+    )
+    if is_sink:
+        out_paths.append(TaintPath(
+            hops=list(current_hops),
+            sink_name=callee,
+            sink_arg=arg_idx,
+        ))
+        return
+
+    # -- Check if callee has its own per-function taint info ----------------
+    callee_approx = per_function.get(callee)
+
+    if callee_approx is not None:
+        # Terminal: callee marks this arg position as dangerous
+        if callee_approx.has_dangerous_param(arg_idx):
+            for sink_callee, sink_arg in callee_approx.dangerous_flows[arg_idx]:
+                if len(out_paths) >= _MAX_PATHS_PER_PARAM:
+                    return
+                out_paths.append(TaintPath(
+                    hops=list(current_hops) + [sink_callee],
+                    sink_name=sink_callee,
+                    sink_arg=sink_arg,
+                ))
+
+        # Continue: follow callee's direct_flows for this arg position
+        if arg_idx in callee_approx.direct_flows:
+            new_visited = visited | {callee}
+            for next_callee, next_arg in callee_approx.direct_flows[arg_idx]:
+                _follow_taint(
+                    next_callee,
+                    next_arg,
+                    per_function,
+                    extra_edges,
+                    visited=new_visited,
+                    hops_so_far=current_hops,
+                    max_depth=max_depth,
+                    out_paths=out_paths,
+                )
+        return
+
+    # -- Callee not in per_function: try extra_edges to bridge the gap ------
+    if callee in extra_edges:
+        new_visited = visited | {callee}
+        for bridged_callee in extra_edges[callee]:
+            bridged_approx = per_function.get(bridged_callee)
+            if bridged_approx is not None:
+                # Bridge: treat arg_idx as flowing through to the same
+                # position in the bridged callee (best-effort heuristic
+                # when we lack precise parameter mapping).
+                if arg_idx in bridged_approx.direct_flows:
+                    for next_callee, next_arg in bridged_approx.direct_flows[arg_idx]:
+                        _follow_taint(
+                            next_callee,
+                            next_arg,
+                            per_function,
+                            extra_edges,
+                            visited=new_visited,
+                            hops_so_far=current_hops + [bridged_callee],
+                            max_depth=max_depth,
+                            out_paths=out_paths,
+                        )
+                if bridged_approx.has_dangerous_param(arg_idx):
+                    for sink_callee, sink_arg in bridged_approx.dangerous_flows[arg_idx]:
+                        if len(out_paths) >= _MAX_PATHS_PER_PARAM:
+                            return
+                        out_paths.append(TaintPath(
+                            hops=list(current_hops) + [bridged_callee, sink_callee],
+                            sink_name=sink_callee,
+                            sink_arg=sink_arg,
+                        ))
+            else:
+                # Bridged callee also has no taint info — check if it is
+                # itself a dangerous sink.
+                bridged_parts = bridged_callee.split(".")
+                if (
+                    bridged_callee in MEMORY_SINKS
+                    or _is_dangerous(bridged_parts) is not None
+                ):
+                    out_paths.append(TaintPath(
+                        hops=list(current_hops) + [bridged_callee],
+                        sink_name=bridged_callee,
+                        sink_arg=arg_idx,
+                    ))
+
+
+def format_transitive_taint(tt: TransitiveTaint) -> str:
+    """Render a ``TransitiveTaint`` as prose suitable for an LLM prompt.
+
+    Example output::
+
+        Function `parse_header`:
+        - param index 0 reaches dangerous sink `memcpy` via: \
+parse_header -> copy_data -> memcpy (arg 0)
+    """
+    lines: list[str] = [f"Function `{tt.function}`:"]
+    for param_idx in sorted(tt.param_sinks):
+        for path in tt.param_sinks[param_idx]:
+            chain = " -> ".join(path.hops)
+            lines.append(
+                f"- param index {param_idx} reaches dangerous sink "
+                f"`{path.sink_name}` via: {chain} (arg {path.sink_arg})"
+            )
+    return "\n".join(lines)

@@ -1,0 +1,420 @@
+""".gitmodules parser — git submodule dependencies.
+
+A ``.gitmodules`` file declares git submodules: external repos
+pinned at specific commits and laid out under the parent repo's
+working tree. The file itself is INI-format with sections like:
+
+    [submodule "vendor/zlib"]
+        path = vendor/zlib
+        url = https://github.com/madler/zlib.git
+
+The actual commit pin lives in the parent repo's git tree (as a
+"gitlink" tree entry), not in ``.gitmodules``. We resolve the SHA
+best-effort: first by reading ``.git/modules/<name>/HEAD``, then
+by ``git ls-tree HEAD -- <path>`` (works in fresh clones where
+``.git/modules/`` is absent).
+
+## OSV matching scope
+
+Submodules don't have a clean OSV ecosystem. GHSA-style advisories
+key on registry-published packages (npm, PyPI, etc.); a github.com
+URL pin to a specific repo commit isn't directly queryable.
+
+What this parser DOES today:
+
+  * Parse ``.gitmodules`` and emit a ``Dependency`` row per
+    submodule with ``ecosystem="GitHub"`` (for github.com URLs)
+    or ``"GitGeneric"`` (others).
+  * Record ``source_kind="git_submodule"`` and stash the URL +
+    SHA in ``source_extra`` so reports can show what the operator
+    has vendored.
+  * Emit a purl: ``pkg:github/<owner>/<repo>@<sha>`` for github
+    URLs (the closest thing to a canonical ID for git-pinned
+    code), or ``pkg:generic/<host>/<path>@<sha>`` otherwise.
+
+What this parser does NOT do:
+
+  * Query OSV. The ``GitHub`` / ``GitGeneric`` ecosystem strings
+    are SCA-internal identifiers; OSV won't return matches for
+    them. Submodule findings appear in the SBOM (visibility is
+    half the value) but not in the CVE-matching report. A future
+    iteration could plug into OSV's ``GIT`` range type for direct
+    commit-range matching against advisories that carry git
+    ranges (uncommon, but real for some upstream-tracked CVEs).
+  * Resolve transitive submodules (a submodule with its own
+    ``.gitmodules``). The discovery walker hits each ``.gitmodules``
+    independently anyway, so this falls out for free as long as
+    the operator has run ``git submodule update --recursive``.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse
+
+from ..models import Confidence, Dependency, PinStyle
+from . import _safe_read, register
+from ._base import iter_walk_up
+
+logger = logging.getLogger(__name__)
+
+
+# Map submodule URL host → SBOM ecosystem string. SCA-internal —
+# OSV does not recognise these names.
+_GITHUB_ECOSYSTEM = "GitHub"
+_GENERIC_ECOSYSTEM = "GitGeneric"
+
+_SECTION_RE = re.compile(r'^\[submodule\s+"(.+?)"\s*\]\s*$')
+_KEYVAL_RE = re.compile(r"^\s*([A-Za-z0-9_\-]+)\s*=\s*(.+?)\s*$")
+
+
+@register(filenames=[".gitmodules"])
+def parse(path: Path) -> list[Dependency]:
+    text = _safe_read.read_bounded(path, follow_symlinks=False)
+    if text is None:
+        # ``read_bounded`` already logged the underlying reason.
+        return []
+
+    sections = _parse_sections(text)
+    if not sections:
+        return []
+
+    repo_root = _find_repo_root(path)
+
+    out: list[Dependency] = []
+    for section_name, fields in sections:
+        url = fields.get("url", "").strip()
+        sm_path = fields.get("path", "").strip()
+        if not url or not sm_path:
+            # A malformed section without both url and path can't be
+            # turned into a meaningful Dependency row.
+            continue
+        sha = _resolve_submodule_sha(
+            repo_root, section_name, sm_path=sm_path,
+        ) if repo_root else None
+        dep = _build_dep(
+            section_name=section_name,
+            url=url,
+            sm_path=sm_path,
+            sha=sha,
+            declared_in=path,
+        )
+        if dep is not None:
+            out.append(dep)
+    return out
+
+
+def _parse_sections(text: str) -> list[tuple[str, dict[str, str]]]:
+    """Walk the INI file, return ``[(section_name, {field: value}), ...]``.
+
+    The grammar is git-config syntax: ``[submodule "name"]`` headers
+    followed by indented or unindented ``key = value`` pairs. We
+    skip comments (``#`` / ``;``) and tolerate stray blank lines.
+    """
+    out: list[tuple[str, dict[str, str]]] = []
+    current_name: str | None = None
+    current_fields: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        section_match = _SECTION_RE.match(stripped)
+        if section_match:
+            if current_name is not None:
+                out.append((current_name, current_fields))
+            current_name = section_match.group(1)
+            current_fields = {}
+            continue
+        if current_name is None:
+            continue
+        kv = _KEYVAL_RE.match(raw_line)
+        if kv:
+            current_fields[kv.group(1).lower()] = kv.group(2)
+    if current_name is not None:
+        out.append((current_name, current_fields))
+    return out
+
+
+def _find_repo_root(gitmodules_path: Path) -> Path | None:
+    """Walk up from the .gitmodules path looking for a ``.git``
+    directory or file. Submodules can have ``.git`` as a file
+    (containing ``gitdir: ../<path>``) — handled separately.
+
+    Bounded by ``iter_walk_up`` (active scan root, ``.git``
+    boundary, depth cap, symlink-loop guard) like every other
+    ancestor-walking helper: an unbounded walk made a target
+    WITHOUT its own ``.git`` (extracted tarball, exported subtree)
+    adopt an unrelated repo above the scan root, then ran
+    ``git ls-tree`` and read ``.git/modules`` refs in the
+    OPERATOR'S repo at attacker-chosen submodule paths — data from
+    outside the target landing in ``Dependency.version``."""
+    for cur in iter_walk_up(gitmodules_path.parent):
+        if (cur / ".git").exists():
+            return cur
+    return None
+
+
+def _is_unsafe_path_fragment(fragment: str) -> bool:
+    """True when a ``.gitmodules``-derived path fragment (submodule
+    name or ``ref:`` target) could steer the resolution outside
+    ``.git/modules``: ``..`` segments, absolute prefixes (POSIX or
+    Windows drive-letter — pathlib ``/`` adopts an absolute right
+    operand wholesale), backslashes, or NUL bytes."""
+    if not fragment or "\\" in fragment or "\x00" in fragment:
+        return True
+    if fragment.startswith("/"):
+        return True
+    if ":" in fragment.split("/", 1)[0]:
+        # Windows drive-letter / scheme-like prefix.
+        return True
+    return ".." in fragment.split("/")
+
+
+def _resolve_submodule_sha(
+    repo_root: Path, submodule_name: str,
+    *, sm_path: str | None = None,
+) -> str | None:
+    """Best-effort resolution of the submodule's committed SHA.
+
+    Tries two strategies in order:
+
+    1. Read ``.git/modules/<name>/HEAD`` (fast, no subprocess).
+    2. Fall back to ``git ls-tree HEAD -- <path>`` which reads the
+       commit hash from the parent repo's tree object.  This works
+       in fresh clones and CI checkouts where ``git submodule
+       update`` has not yet been run (the ``.git/modules/`` tree is
+       absent but the tree entry still records the pinned SHA).
+
+    Both the section-header name and the ``ref:`` indirection come
+    straight from attacker-controllable file content — a hostile
+    ``[submodule "../../evil"]`` header or an absolute-path ref
+    must not steer reads outside ``.git/modules``. Fragments with
+    ``..`` segments, absolute prefixes, or backslashes are refused
+    up-front, and every candidate is additionally required to
+    RESOLVE under ``.git/modules`` (catching symlink escapes too).
+
+    Returns the 40-char hex SHA on success, None otherwise.
+    """
+    if _is_unsafe_path_fragment(submodule_name):
+        logger.debug(
+            "sca.parsers.gitmodules: refusing submodule name %r "
+            "(path traversal defence)", submodule_name,
+        )
+        return None
+    # Strategy 1: read from .git/modules/<name>/HEAD.
+    sha = _resolve_from_modules_dir(repo_root, submodule_name)
+    if sha is not None:
+        return sha
+    # Strategy 2: git ls-tree — the tree object always records the
+    # pinned commit even when the submodule hasn't been checked out.
+    if sm_path is not None:
+        sha = _resolve_from_ls_tree(repo_root, sm_path)
+        if sha is not None:
+            return sha
+    return None
+
+
+def _resolve_from_modules_dir(
+    repo_root: Path, submodule_name: str,
+) -> str | None:
+    """Read the submodule SHA from ``.git/modules/<name>/HEAD``."""
+    modules_root = repo_root / ".git" / "modules"
+    candidate = modules_root / submodule_name / "HEAD"
+    if not _is_contained(candidate, modules_root):
+        return None
+    if not candidate.is_file():
+        return None
+    contents = _safe_read.read_bounded(candidate, follow_symlinks=False)
+    if contents is None:
+        return None
+    contents = contents.strip()
+    # HEAD may carry a direct SHA or a ``ref: refs/heads/<branch>``.
+    if contents.startswith("ref:"):
+        ref = contents[4:].strip()
+        if _is_unsafe_path_fragment(ref):
+            logger.debug(
+                "sca.parsers.gitmodules: refusing ref %r in %s "
+                "(path traversal defence)", ref, candidate,
+            )
+            return None
+        ref_path = modules_root / submodule_name / ref
+        if not _is_contained(ref_path, modules_root):
+            return None
+        if not ref_path.is_file():
+            return None
+        ref_contents = _safe_read.read_bounded(
+            ref_path, follow_symlinks=False,
+        )
+        if ref_contents is None:
+            return None
+        return _validate_sha(ref_contents.strip())
+    return _validate_sha(contents)
+
+
+def _resolve_from_ls_tree(
+    repo_root: Path, sm_path: str,
+) -> str | None:
+    """Read the submodule SHA from the parent repo's tree object.
+
+    The scanned repo is untrusted and this git runs INSIDE it: a
+    hostile committed config could point ``core.fsmonitor`` /
+    ``core.hooksPath`` / ``core.sshCommand`` at attacker commands,
+    and the operator's full environment (tokens, GIT_* overrides)
+    must never reach a child spawned for an untrusted tree. Use the
+    strict read-only git overrides (config neutralised, transports
+    refused) with the repo-standard sanitised environment.
+    """
+    if _is_unsafe_path_fragment(sm_path):
+        return None
+    from core.config import RaptorConfig
+    from core.git.clone import safe_git_readonly_command
+    try:
+        result = subprocess.run(
+            safe_git_readonly_command("ls-tree", "HEAD", "--", sm_path),
+            capture_output=True, text=True, timeout=5,
+            cwd=str(repo_root),
+            env=RaptorConfig.get_safe_env(),
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        # Output: "<mode> commit <sha>\t<path>"
+        parts = result.stdout.strip().split()
+        if len(parts) < 3 or parts[1] != "commit":
+            return None
+        return _validate_sha(parts[2])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _is_contained(candidate: Path, bound: Path) -> bool:
+    """True when ``candidate`` RESOLVES under ``bound`` — the final
+    backstop behind the fragment checks (``resolve()`` follows
+    symlinks, so a symlinked modules entry pointing outside the
+    repo is caught here)."""
+    try:
+        candidate.resolve().relative_to(bound.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _validate_sha(text: str) -> str | None:
+    """Return the SHA if it looks like a 40-char hex git SHA. Tolerates
+    a short SHA prefix (>=7 chars) but doesn't expand — treats only
+    full-length SHAs as canonical."""
+    text = text.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40}", text):
+        return text.lower()
+    return None
+
+
+def _build_dep(
+    *, section_name: str, url: str, sm_path: str,
+    sha: str | None, declared_in: Path,
+) -> Dependency | None:
+    ecosystem, name, purl = _classify_url(url, sha)
+    if name is None:
+        return None
+    pin_style = PinStyle.GIT if sha else PinStyle.WILDCARD
+    return Dependency(
+        ecosystem=ecosystem,
+        name=name,
+        version=sha,
+        declared_in=declared_in,
+        scope="main",
+        is_lockfile=bool(sha),         # the SHA is a real pin
+        pin_style=pin_style,
+        direct=True,
+        purl=purl,
+        parser_confidence=Confidence(
+            "high" if sha else "medium",
+            reason=(
+                f"git submodule pinned at {sha[:12]}" if sha
+                else "git submodule URL declared but commit unresolved"
+            ),
+        ),
+        source_kind="git_submodule",
+        source_extra={
+            "url": url,
+            "path": sm_path,
+            "submodule_name": section_name,
+        },
+    )
+
+
+def _classify_url(
+    url: str, sha: str | None,
+) -> tuple[str, str | None, str]:
+    """Classify a submodule URL into (ecosystem, name, purl).
+
+    GitHub URLs get a ``pkg:github/<owner>/<repo>`` purl; others
+    fall back to ``pkg:generic/<host>/<path>``. The ``name`` field
+    (used by SBOM tooling for human display) is ``<owner>/<repo>``
+    for GitHub or the full URL path for generic.
+    """
+    try:
+        parsed = urlparse(_normalise_git_url(url))
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        # ``urlparse`` raises on malformed bracket syntax ("Invalid
+        # IPv6 URL"). URL content is attacker-controlled; one bad URL
+        # must skip its own row, not kill the whole file's parse.
+        logger.warning(
+            "sca.parsers.gitmodules: unparseable submodule URL %r "
+            "— entry skipped", url,
+        )
+        return _GENERIC_ECOSYSTEM, None, ""
+    repo_path = parsed.path.lstrip("/")
+    # Strip a trailing ``.git`` for a cleaner name + purl.
+    repo_path = repo_path.removesuffix(".git")
+    if not repo_path:
+        return _GENERIC_ECOSYSTEM, None, ""
+
+    if host == "github.com" or host.endswith(".github.com"):
+        parts = repo_path.split("/", 1)
+        if len(parts) != 2:
+            return _GENERIC_ECOSYSTEM, f"{host}/{repo_path}", _generic_purl(host, repo_path, sha)
+        owner, repo = parts
+        purl = f"pkg:github/{owner}/{repo}"
+        if sha:
+            purl += f"@{sha}"
+        return _GITHUB_ECOSYSTEM, repo_path, purl
+
+    return _GENERIC_ECOSYSTEM, f"{host}/{repo_path}", _generic_purl(host, repo_path, sha)
+
+
+def _generic_purl(host: str, repo_path: str, sha: str | None) -> str:
+    purl = f"pkg:generic/{host}/{repo_path}"
+    if sha:
+        purl += f"@{sha}"
+    return purl
+
+
+def _normalise_git_url(url: str) -> str:
+    """Convert ``git@github.com:owner/repo.git`` SSH-style refs to a
+    parseable ``https://github.com/owner/repo.git`` form. Leaves
+    ``https://...`` and ``git://...`` URLs alone.
+
+    SCP-style refs may carry a bracketed IPv6 host
+    (``git@[2001:db8::1]:path/repo.git``): the host/path separator is
+    the colon AFTER the closing bracket. Splitting on the first colon
+    produced ``https://[/...`` which ``urlparse`` rejects with
+    ``ValueError: Invalid IPv6 URL``.
+    """
+    if url.startswith("git@") and ":" in url:
+        rest = url[len("git@"):]
+        if rest.startswith("["):
+            bracket_end = rest.find("]:")
+            if bracket_end == -1:
+                # No host/path separator after the bracket — leave the
+                # URL as-is; the caller's ValueError guard skips it.
+                return url
+            host_part = rest[:bracket_end + 1]
+            path_part = rest[bracket_end + 2:]
+            return f"https://{host_part}/{path_part}"
+        host_part, _, path_part = rest.partition(":")
+        return f"https://{host_part}/{path_part}"
+    return url

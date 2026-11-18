@@ -1,23 +1,91 @@
 rules:
-  - id: raptor.crypto.nonce.reuse.gcm.literal.java
-    message: Potential nonce reuse. Detected literal or constant nonce with AES-GCM. Verify unique nonces per key.
+  # Repeated-argument heuristics. Literal nonces are reported separately by
+  # insecure-iv-or-nonce.yaml. Python encrypt APIs differ: the first argument
+  # may be plaintext rather than a nonce. Confirm the API, effective key,
+  # value stability and operation context before concluding nonce reuse.
+
+  - id: raptor.crypto.nonce.reuse.spec.java
+    message: >
+      Candidate nonce reuse: two init calls share a GCMParameterSpec expression.
+      Confirm the receiver APIs, encryption modes, effective keys and value
+      stability before concluding that encryption operations reuse a nonce.
     languages: [java, kotlin]
     severity: HIGH
-    pattern-either:
-      - pattern: new GCMParameterSpec($T, new byte[] { ... })
+    patterns:
+      - pattern: |
+          $S = new GCMParameterSpec(...);
+          ...
+          $C1.init($M1, $K1, $S);
+          ...
+          $C2.init($M2, $K2, $S);
+      - pattern-not: |
+          $S = new GCMParameterSpec(...);
+          ...
+          $C1.init($M1, $K1, $S);
+          ...
+          $S = ...;
+          ...
+          $C2.init($M2, $K2, $S);
     metadata:
-      cwe: ["CWE-323","CWE-330"]
+      cwe: ["CWE-323", "CWE-330"]
       asvs: ["V7.3"]
 
-  - id: raptor.crypto.nonce.reuse.gcm.literal.python
-    message: Potential nonce reuse. Literal nonce used for AEAD. Verify unique nonces per key.
+  - id: raptor.crypto.nonce.reuse.two-calls.python
+    message: >-
+      Candidate: two encrypt calls share a first-argument expression. Confirm
+      that this API takes a nonce in that position, and verify the effective
+      key and argument value across both calls before treating this as nonce reuse.
     languages: [python]
     severity: HIGH
     patterns:
-      - pattern: AESGCM($K).encrypt($NONCE, $PT, $AD)
-      - metavariable-pattern:
+      - pattern: |
+          $C.encrypt($NONCE, ...)
+          ...
+          $C.encrypt($NONCE, ...)
+      - pattern-not: |
+          $C.encrypt($NONCE, ...)
+          ...
+          $NONCE = ...
+          ...
+          $C.encrypt($NONCE, ...)
+      - pattern-not: |
+          $C.encrypt($NONCE, ...)
+          ...
+          $C = ...
+          ...
+          $C.encrypt($NONCE, ...)
+      - metavariable-regex:
           metavariable: $NONCE
-          pattern: b"..."
+          regex: "^[A-Za-z_][A-Za-z0-9_.]*$"
     metadata:
-      cwe: ["CWE-323","CWE-330"]
+      cwe: ["CWE-323", "CWE-330"]
+      asvs: ["V7.3"]
+
+  - id: raptor.crypto.nonce.reuse.loop.python
+    message: >-
+      Candidate: an encrypt call in a loop uses an expression assigned outside
+      the loop. Confirm that this API takes a nonce in that position, and verify
+      multiple iterations and key/value stability before treating this as nonce reuse.
+    languages: [python]
+    severity: HIGH
+    patterns:
+      - pattern: |
+          $NONCE = ...
+          ...
+          for $X in $ITER:
+              ...
+              $C.encrypt($NONCE, ...)
+      - pattern-not: |
+          $NONCE = ...
+          ...
+          for $X in $ITER:
+              ...
+              $NONCE = ...
+              ...
+              $C.encrypt($NONCE, ...)
+      - metavariable-regex:
+          metavariable: $NONCE
+          regex: "^[A-Za-z_][A-Za-z0-9_.]*$"
+    metadata:
+      cwe: ["CWE-323", "CWE-330"]
       asvs: ["V7.3"]

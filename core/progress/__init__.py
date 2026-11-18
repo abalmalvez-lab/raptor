@@ -5,18 +5,35 @@ For operations that take >15 seconds.
 
 import locale
 import sys
+import threading
 import time
 from datetime import datetime
-from typing import Optional
+from types import TracebackType
+from typing import Literal
+
+from core.security.log_sanitisation import sanitise_for_terminal
 
 
-# Module-level "last stage that ran" — readable by out-of-band
+def _scrub(text: object, *, max_len: int = 256) -> str:
+    """Escape + bound caller-supplied text at the module chokepoint.
+
+    Progress output is TTY-only by construction, and callers pass
+    target-derived strings (dependency names, advisory ids, finding
+    ids) — a hostile name carrying ESC/OSC must not drive the
+    operator's terminal. Applied to the FIELD values only; the
+    module's own framing (spinners, bars, \r\033[K redraws) stays
+    raw.
+    """
+    return sanitise_for_terminal(str(text), max_len=max_len)
+
+
+# Thread-local "last stage that ran" — readable by out-of-band
 # exception handlers via :func:`last_stage_name`. See the
 # ``HackerProgressBar`` docstring for the design rationale.
-_LAST_STAGE_NAME: Optional[str] = None
+_stage_local = threading.local()
 
 
-def last_stage_name() -> Optional[str]:
+def last_stage_name() -> str | None:
     """The most-recent stage name that any active or recent
     ``HackerProgressBar`` started, or ``None`` if no bar has
     started a stage in this process.
@@ -30,17 +47,17 @@ def last_stage_name() -> Optional[str]:
     still show context for failures that occurred between stages
     (e.g. while writing an artefact between two ``stage()`` calls).
     """
-    return _LAST_STAGE_NAME
+    return getattr(_stage_local, "name", None)
 
 
 def _stderr_supports_unicode() -> bool:
-    """Probe whether stderr can encode the unicode block characters
+    r"""Probe whether stderr can encode the unicode block characters
     used by the spinner / status decorations.
 
     Returns False under POSIX/C locale, on legacy 7-bit terminals,
     and on platforms where stderr lacks an `encoding` attribute.
     Pre-fix every write to stderr risked
-    `UnicodeEncodeError: 'ascii' codec can't encode character '\\u2588'`
+    `UnicodeEncodeError: 'ascii' codec can't encode character '\u2588'`
     when the operator's locale was `C` (common in containers and
     minimal CI runners), aborting the entire `with HackerProgress`
     block partway through. Detect once at import.
@@ -77,10 +94,10 @@ class HackerProgress:
     _CHECK = '✓' if _UNICODE_OK else '[OK]'
     _CROSS = '✗' if _UNICODE_OK else '[FAIL]'
 
-    def __init__(self, total: Optional[int] = None, operation: str = "Processing",
-                 disabled: bool = False):
+    def __init__(self, total: int | None = None, operation: str = "Processing",
+                 disabled: bool = False) -> None:
         self.total = total
-        self.operation = operation
+        self.operation = _scrub(operation, max_len=120)
         self.disabled = disabled
         self.current = 0
         self.start_time = time.time()
@@ -100,6 +117,11 @@ class HackerProgress:
         # there's real progress to show.
         self.last_update = self.start_time
         self.spinner_idx = 0
+        # Same gate HackerProgressBar applies: the \r\033[K redraws
+        # are TTY furniture — in CI logs / pipes each tick landed as
+        # a fresh ANSI-littered line. Non-TTY keeps the start/finish
+        # lines (plain, no ANSI) and skips per-tick redraws.
+        self._tty = getattr(sys.stderr, "isatty", lambda: False)()
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds as Xm Ys or Xs."""
@@ -129,11 +151,21 @@ class HackerProgress:
             remaining = 0
         return self._format_time(remaining)
 
-    def update(self, current: Optional[int] = None, message: str = ""):
+    def update(self, current: int | None = None, message: str = "") -> None:
         """Update progress display."""
         if self.disabled:
             return
         now = time.time()
+
+        if not self._tty:
+            # Redraw-only surface; counters still advance below for
+            # finish()'s final line, but no per-tick output lands in
+            # non-TTY logs.
+            if current is not None:
+                self.current = current
+            else:
+                self.current += 1
+            return
 
         # Update self.current ALWAYS — only the I/O is throttled. Otherwise
         # rapid `update(current=idx)` calls in a tight loop silently drop
@@ -165,7 +197,7 @@ class HackerProgress:
             status = f"[{timestamp}] {spinner} {self.operation} | Elapsed: {elapsed}"
 
         if message:
-            status += f" | {message}"
+            status += f" | {_scrub(message)}"
 
         # Overwrite previous line. `\033[K` clears from the cursor
         # to end-of-line AFTER the carriage return — without it,
@@ -181,10 +213,34 @@ class HackerProgress:
         sys.stderr.write(f"\r\033[K{status}")
         sys.stderr.flush()
 
-    def finish(self, message: str = "Complete"):
-        """Finish progress and move to new line."""
-        elapsed = self._format_time(time.time() - self.start_time)
-        sys.stderr.write(f"\r\033[K{self._CHECK} {message} ({elapsed})\n")
+    def finish(self, message: str = "Complete") -> None:
+        """Finish progress and move to new line.
+
+        Emits a final state line BEFORE the checkmark so the
+        last counter value is visible even when the throttle
+        (``now - last_update < 1.0`` in ``update()``) suppressed
+        the previous emit. Pre-fix: a tight loop that called
+        ``update(current=N)`` for the last increment and then
+        ``finish()`` <1s later would skip the final ``N/N``
+        render entirely and leave the operator looking at a
+        stale earlier value before the checkmark — e.g.
+        ``9/10 ✓ Complete``.
+        """
+        elapsed_seconds = time.time() - self.start_time
+        elapsed = self._format_time(elapsed_seconds)
+        # Force-flush the final counter line unconditionally
+        # (bypassing the 1s throttle in ``update``).
+        clear = "\r\033[K" if self._tty else ""
+        message = _scrub(message)
+        if self.total:
+            progress = f"{self.current}/{self.total}"
+            sys.stderr.write(
+                f"{clear}{self._CHECK} {message} {progress} ({elapsed})\n"
+            )
+        else:
+            sys.stderr.write(
+                f"{clear}{self._CHECK} {message} ({elapsed})\n"
+            )
         sys.stderr.flush()
 
     def __enter__(self):
@@ -194,7 +250,7 @@ class HackerProgress:
             sys.stderr.flush()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None) -> Literal[False]:
         """Context manager exit."""
         if self.disabled:
             return False
@@ -210,13 +266,17 @@ class HackerProgress:
             # up in stderr but is easy to miss when the progress
             # output is the last visible thing.
             try:
-                exc_repr = repr(exc_val) if exc_val is not None else exc_type.__name__
-            except Exception:
-                exc_repr = "<unrepresentable exception>"
-            sys.stderr.write(
-                f"\r\033[K{self._CROSS} {self.operation} failed: {exc_repr}\n"
-            )
-            sys.stderr.flush()
+                try:
+                    exc_repr = repr(exc_val) if exc_val is not None else exc_type.__name__
+                except Exception:
+                    exc_repr = "<unrepresentable exception>"
+                clear = "\r\033[K" if self._tty else ""
+                sys.stderr.write(
+                    f"{clear}{self._CROSS} {self.operation} failed: {exc_repr}\n"
+                )
+                sys.stderr.flush()
+            except BaseException:
+                pass  # Diagnostics must not replace the active body error.
         return False
 
 
@@ -247,8 +307,8 @@ class HackerProgressBar:
 
     Side-channel last-stage tracking
     -------------------------------
-    On every ``stage()`` call the bar updates a module-level
-    ``_LAST_STAGE_NAME`` so out-of-band exception handlers can
+    On every ``stage()`` call the bar updates the thread-local
+    ``_stage_local.name`` so out-of-band exception handlers can
     surface "which phase was running when this died" without
     threading the bar through every call site. The CLI's outer
     ``except`` reads it via :func:`last_stage_name` to print
@@ -267,10 +327,10 @@ class HackerProgressBar:
     _DONE_GLYPH = "✓" if _UNICODE_OK else "[OK]"
     _FLASH_GLYPH = "↳" if _UNICODE_OK else "->"
 
-    def __init__(self, *, target: Optional[str] = None,
-                 disabled: Optional[bool] = None,
+    def __init__(self, *, target: str | None = None,
+                 disabled: bool | None = None,
                  stream=None,
-                 bar_width: int = 12):
+                 bar_width: int = 12) -> None:
         self._stream = stream if stream is not None else sys.stderr
         # Three modes:
         #   "redraw"  — TTY: rewriting stage lines + flashes + ANSI
@@ -295,8 +355,8 @@ class HackerProgressBar:
         self._target = str(target) if target is not None else None
         self._bar_width = bar_width
         # Per-stage state
-        self._stage: Optional[str] = None
-        self._stage_total: Optional[int] = None
+        self._stage: str | None = None
+        self._stage_total: int | None = None
         self._stage_done: int = 0
         self._stage_start: float = 0.0
         self._stage_detail: str = ""
@@ -314,37 +374,44 @@ class HackerProgressBar:
         # (operator opt-out) but emitted in oneline mode (CI logs
         # benefit from the target prelude).
         if self._mode != "silent" and self._target:
-            self._stream.write(f"sca > {self._target}\n")
+            # The target is caller-supplied (typically an operator
+            # path, but the module contract is fields-escaped) —
+            # scrub like every other field this bar writes.
+            self._stream.write(f"sca > {_scrub(self._target, max_len=256)}\n")
             self._stream.flush()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None) -> Literal[False]:
         # Finalise any in-flight stage so the operator sees its
         # detail rather than the bar.
         if self._stage is not None:
-            self._finalise_stage(detail="interrupted"
-                                  if exc_type else self._stage_detail)
+            try:
+                self._finalise_stage(detail="interrupted"
+                                      if exc_type else self._stage_detail)
+            except BaseException:
+                if exc_type is None:
+                    raise
         return False
 
-    def stage(self, name: str, total: Optional[int] = None) -> None:
+    def stage(self, name: str, total: int | None = None) -> None:
         """Begin a new stage. Finalises any prior in-flight stage."""
         if self._stage is not None:
             self._finalise_stage(detail=self._stage_detail)
+        name = _scrub(name, max_len=64)
         self._stage = name
         self._stage_total = total
         self._stage_done = 0
         self._stage_start = time.time()
         self._stage_detail = ""
         self._last_redraw = 0.0
-        # Update module-level side-channel for out-of-band exception
+        # Update thread-local side-channel for out-of-band exception
         # handlers (see ``last_stage_name``).
-        global _LAST_STAGE_NAME
-        _LAST_STAGE_NAME = name
+        _stage_local.name = name
         self._render()
 
-    def tick(self, done: Optional[int] = None,
+    def tick(self, done: int | None = None,
              detail: str = "") -> None:
         """Advance progress within the current stage. Throttled."""
         if self._stage is None:
@@ -354,7 +421,7 @@ class HackerProgressBar:
         else:
             self._stage_done += 1
         if detail:
-            self._stage_detail = detail
+            self._stage_detail = _scrub(detail)
         if self._disabled:
             return
         now = time.time()
@@ -370,9 +437,9 @@ class HackerProgressBar:
         # Clear the active line, write the flash, leave a newline,
         # then re-render the active stage line below.
         self._clear_active_line()
-        sev = severity.upper()[:5]
+        sev = _scrub(severity.upper()[:5], max_len=8)
         self._stream.write(
-            f"      {self._FLASH_GLYPH} {sev:5s} {message}\n"
+            f"      {self._FLASH_GLYPH} {sev:5s} {_scrub(message)}\n"
         )
         self._stream.flush()
         self._render()
@@ -391,9 +458,10 @@ class HackerProgressBar:
             return
         elapsed = time.time() - self._t0
         mins = int(elapsed // 60)
-        secs = elapsed - mins * 60
-        elapsed_str = (f"{mins}m {secs:.0f}s" if mins
-                       else f"{secs:.1f}s")
+        # Truncate, never round: rounding 119.7s produced "1m 60s".
+        secs = int(elapsed - mins * 60)
+        elapsed_str = (f"{mins}m {secs}s" if mins
+                       else f"{elapsed:.1f}s")
         self._stream.write(
             f"  {self._DONE_GLYPH} done · {elapsed_str}"
             + (f" · {summary}" if summary else "")
@@ -404,6 +472,9 @@ class HackerProgressBar:
     # ----- internals -----
 
     def _finalise_stage(self, *, detail: str) -> None:
+        # done()/end() summaries arrive here unscrubbed; tick details
+        # are already escaped (idempotent on escaped text).
+        detail = _scrub(detail) if detail else detail
         if self._mode == "silent":
             self._stage = None
             return
@@ -430,7 +501,7 @@ class HackerProgressBar:
         self._line_active = True
 
     def _format_line(self, *, final: bool,
-                     detail: Optional[str] = None) -> str:
+                     detail: str | None = None) -> str:
         name = self._stage or ""
         if final:
             text = detail or "..."

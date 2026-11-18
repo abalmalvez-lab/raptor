@@ -160,45 +160,98 @@ class TestEpssErrors:
 
     def test_invalid_score_skipped(self, tmp_path: Path) -> None:
         payload = {"data": [
-            {"cve": "CVE-A", "epss": "not-a-number"},
-            {"cve": "CVE-B", "epss": "0.5"},
+            {"cve": "CVE-2024-11111", "epss": "not-a-number"},
+            {"cve": "CVE-2024-22222", "epss": "0.5"},
         ]}
         epss = EpssClient(
             FakeHttp(payload=payload), JsonCache(root=tmp_path),
         )
-        assert epss.scores(["CVE-A", "CVE-B"]) == {"CVE-B": 0.5}
+        assert epss.scores(["CVE-2024-11111", "CVE-2024-22222"]) == {"CVE-2024-22222": 0.5}
+
+    def test_non_finite_and_out_of_range_scores_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        """Float-parseable poison from a hostile / corrupted feed:
+        ``"NaN"`` reaches findings.json as a bare non-JSON token
+        (strict consumers reject the whole document) and ``"1e999"``
+        parses to ``inf`` (risk estimate pinned to 100.0). EPSS is a
+        probability — anything non-finite or outside [0, 1] is
+        rejected per-row; the good row must still come through."""
+        payload = {"data": [
+            {"cve": "CVE-2024-00001", "epss": "NaN"},
+            {"cve": "CVE-2024-00002", "epss": "inf"},
+            {"cve": "CVE-2024-00003", "epss": "-inf"},
+            {"cve": "CVE-2024-00004", "epss": "1e999"},
+            {"cve": "CVE-2024-00005", "epss": "1.5"},
+            {"cve": "CVE-2024-00006", "epss": "-0.5"},
+            {"cve": "CVE-2024-00007", "epss": "0.5"},
+        ]}
+        epss = EpssClient(
+            FakeHttp(payload=payload), JsonCache(root=tmp_path),
+        )
+        result = epss.scores([f"CVE-2024-{i:05d}" for i in range(1, 8)])
+        assert result == {"CVE-2024-00007": 0.5}
+
+    def test_boundary_scores_accepted(self, tmp_path: Path) -> None:
+        """0.0 and 1.0 are legitimate probabilities — the range
+        check must be inclusive."""
+        payload = {"data": [
+            {"cve": "CVE-2024-00001", "epss": "0.0"},
+            {"cve": "CVE-2024-00002", "epss": "1.0"},
+        ]}
+        epss = EpssClient(
+            FakeHttp(payload=payload), JsonCache(root=tmp_path),
+        )
+        assert epss.scores(["CVE-2024-00001", "CVE-2024-00002"]) == {
+            "CVE-2024-00001": 0.0,
+            "CVE-2024-00002": 1.0,
+        }
+
+    def test_out_of_range_cached_score_not_served(
+        self, tmp_path: Path,
+    ) -> None:
+        """A cache written before ingest validation existed (or
+        corrupted on disk) can hold an out-of-range value — the read
+        side degrades it to 'no signal' instead of serving poison."""
+        cache = JsonCache(root=tmp_path)
+        cache.put("epss/CVE-2024-00001", 1.5, ttl_seconds=3600)
+        epss = EpssClient(
+            FakeHttp(payload={"data": []}), JsonCache(root=tmp_path),
+            offline=True,
+        )
+        assert epss.scores(["CVE-2024-00001"]) == {}
 
     def test_non_dict_response_returns_empty(self, tmp_path: Path) -> None:
         http = FakeHttp(payload="not a dict")  # type: ignore[arg-type]
         epss = EpssClient(http, JsonCache(root=tmp_path))
-        assert epss.scores(["CVE-A"]) == {}
+        assert epss.scores(["CVE-2024-11111"]) == {}
 
     def test_non_list_data_returns_empty(self, tmp_path: Path) -> None:
         http = FakeHttp(payload={"data": "not a list"})
         epss = EpssClient(http, JsonCache(root=tmp_path))
-        assert epss.scores(["CVE-A"]) == {}
+        assert epss.scores(["CVE-2024-11111"]) == {}
 
     def test_non_dict_entries_skipped(self, tmp_path: Path) -> None:
         payload = {"data": [
             "string entry",
             42,
             None,
-            {"cve": "CVE-OK", "epss": "0.5"},
+            {"cve": "CVE-2024-33333", "epss": "0.5"},
         ]}
         epss = EpssClient(
             FakeHttp(payload=payload), JsonCache(root=tmp_path),
         )
-        assert epss.scores(["CVE-OK"]) == {"CVE-OK": 0.5}
+        assert epss.scores(["CVE-2024-33333"]) == {"CVE-2024-33333": 0.5}
 
     def test_non_string_cve_field_skipped(self, tmp_path: Path) -> None:
         payload = {"data": [
             {"cve": 12345, "epss": "0.9"},
-            {"cve": "CVE-OK", "epss": "0.5"},
+            {"cve": "CVE-2024-33333", "epss": "0.5"},
         ]}
         epss = EpssClient(
             FakeHttp(payload=payload), JsonCache(root=tmp_path),
         )
-        assert epss.scores(["CVE-OK"]) == {"CVE-OK": 0.5}
+        assert epss.scores(["CVE-2024-33333"]) == {"CVE-2024-33333": 0.5}
 
 
 # ---------------------------------------------------------------------------
@@ -217,10 +270,10 @@ class TestEpssAdversarial:
         http = FakeHttp(payload={"data": []})
         epss = EpssClient(http, JsonCache(root=tmp_path))
         # ints / None / empty strings get filtered before the API call.
-        epss.scores([None, "", 0, "CVE-VALID"])  # type: ignore[list-item]
+        epss.scores([None, "", 0, "CVE-2024-44444"])  # type: ignore[list-item]
         # One GET, one CVE in the URL.
         assert len(http.gets) == 1
-        assert "CVE-VALID" in http.gets[0]
+        assert "CVE-2024-44444" in http.gets[0]
         assert "None" not in http.gets[0]
 
     def test_huge_cve_id_does_not_crash(self, tmp_path: Path) -> None:
@@ -239,11 +292,27 @@ class TestEpssAdversarial:
     ) -> None:
         cache = JsonCache(root=tmp_path)
         EpssClient(
-            FakeHttp(payload={"data": [{"cve": "CVE-1", "epss": "0.5"}]}),
+            FakeHttp(payload={"data": [{"cve": "CVE-2024-0001", "epss": "0.5"}]}),
             cache,
-        ).scores(["cve-1"])
+        ).scores(["cve-2024-0001"])
         # Cache hit on the upper-case key — second call no network.
         http2 = FakeHttp(payload={})
         epss2 = EpssClient(http2, cache)
-        assert epss2.scores(["CVE-1"]) == {"CVE-1": 0.5}
+        assert epss2.scores(["CVE-2024-0001"]) == {"CVE-2024-0001": 0.5}
         assert http2.gets == []
+
+    def test_malformed_id_does_not_sink_the_batch(
+        self, tmp_path: Path,
+    ) -> None:
+        """One degenerate id (path-shaped, Unicode digits) must not
+        lose its batchmates: it is skipped BEFORE the cache-key and
+        URL layers, ending up simply absent from the dict."""
+        payload = {"data": [{"cve": "CVE-2021-44228", "epss": "0.97"}]}
+        http = FakeHttp(payload=payload)
+        epss = EpssClient(http, JsonCache(root=tmp_path))
+        result = epss.scores(["..", "CVE-2024-1²3", "CVE-2021-44228"])
+        assert result == {"CVE-2021-44228": 0.97}
+        # Only the valid id reached the API.
+        assert len(http.gets) == 1
+        assert "CVE-2021-44228" in http.gets[0]
+        assert ".." not in http.gets[0].split("cve=")[1]

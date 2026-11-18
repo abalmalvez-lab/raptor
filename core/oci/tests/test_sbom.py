@@ -9,11 +9,16 @@ regressions when format quirks shift.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 import struct
 from pathlib import Path
 
+import pytest
+
+import core.oci.sbom as sbom_module
 from core.oci.sbom import (
     LAYER_FILE_PATHS,
+    PackageDbLimitExceeded,
     packages_from_layer_files,
     parse_apk_installed,
     parse_dpkg_status,
@@ -74,7 +79,10 @@ def test_parse_dpkg_emits_only_fully_installed():
     real install with versions OSV can match."""
     pkgs = parse_dpkg_status(_DPKG_FIXTURE)
     names = {p.name for p in pkgs}
-    assert "libc6" in names
+    # libc6 surfaces under its SOURCE package (glibc) — OSV's
+    # Debian / Ubuntu feeds key advisories by source name.
+    assert "glibc" in names
+    assert "libc6" not in names
     assert "openssl" in names
     assert "removed-pkg" not in names
     assert "half-installed" not in names
@@ -83,13 +91,44 @@ def test_parse_dpkg_emits_only_fully_installed():
 def test_parse_dpkg_extracts_version():
     pkgs = parse_dpkg_status(_DPKG_FIXTURE)
     by_name = {p.name: p for p in pkgs}
-    assert by_name["libc6"].version == "2.36-9+deb12u4"
+    assert by_name["glibc"].version == "2.36-9+deb12u4"
     assert by_name["openssl"].version == "3.0.11-1~deb12u2"
+
+
+def test_parse_dpkg_source_name_wins_and_dedups():
+    """Binary packages from one source collapse to one row per
+    (source, version); a versioned Source qualifier is stripped."""
+    fixture = b"""\
+Package: libssl1.1
+Status: install ok installed
+Source: openssl (1.1.0l-1)
+Version: 1.1.0l-1
+
+Package: openssl
+Status: install ok installed
+Source: openssl
+Version: 1.1.0l-1
+
+Package: libssl-dev
+Status: install ok installed
+Source: openssl (1.1.0l-1)
+Version: 1.1.0l-1
+"""
+    pkgs = parse_dpkg_status(fixture)
+    assert [(p.name, p.version) for p in pkgs] == [
+        ("openssl", "1.1.0l-1"),
+    ]
 
 
 def test_parse_dpkg_ecosystem_is_debian():
     pkgs = parse_dpkg_status(_DPKG_FIXTURE)
     assert all(p.ecosystem == "Debian" for p in pkgs)
+
+
+def test_dpkg_source_version_wins_over_binary_rebuild_version():
+    packages = parse_dpkg_status(b"Package: bash\nStatus: install ok installed\n"
+                                 b"Version: 5.2.15-2+b13\nSource: bash (5.2.15-2)\n")
+    assert [(p.name, p.version) for p in packages] == [("bash", "5.2.15-2")]
 
 
 def test_parse_dpkg_handles_missing_fields():
@@ -234,15 +273,14 @@ def _make_rpmdb_sqlite(packages: list) -> bytes:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite") as fp:
         path = Path(fp.name)
     try:
-        conn = sqlite3.connect(str(path))
-        conn.execute("CREATE TABLE Packages (hnum INTEGER, blob BLOB)")
-        for i, (name, ver, rel) in enumerate(packages):
-            blob = _make_rpm_header(name, ver, rel)
-            conn.execute(
-                "INSERT INTO Packages VALUES (?, ?)", (i, blob),
-            )
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(str(path))) as conn:
+            conn.execute("CREATE TABLE Packages (hnum INTEGER, blob BLOB)")
+            for i, (name, ver, rel) in enumerate(packages):
+                blob = _make_rpm_header(name, ver, rel)
+                conn.execute(
+                    "INSERT INTO Packages VALUES (?, ?)", (i, blob),
+                )
+            conn.commit()
         return path.read_bytes()
     finally:
         try:
@@ -276,9 +314,11 @@ def test_parse_rpm_sqlite_no_packages_table_returns_empty():
         path = Path(fp.name)
     try:
         conn = sqlite3.connect(str(path))
-        conn.execute("CREATE TABLE Other (x INTEGER)")
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("CREATE TABLE Other (x INTEGER)")
+            conn.commit()
+        finally:
+            conn.close()
         content = path.read_bytes()
     finally:
         try:
@@ -299,12 +339,14 @@ def test_parse_rpm_sqlite_invalid_blob_skipped():
         fp.write(sqlite_bytes)
     try:
         conn = sqlite3.connect(str(path))
-        conn.execute(
-            "INSERT INTO Packages VALUES (?, ?)",
-            (99, b"not a valid rpm header"),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO Packages VALUES (?, ?)",
+                (99, b"not a valid rpm header"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         content = path.read_bytes()
     finally:
         try:
@@ -328,10 +370,12 @@ def test_packages_from_layer_files_dispatches_correctly():
         "lib/apk/db/installed":
             b"P:bar\nV:2.0\n",
     }
-    pkgs = packages_from_layer_files(layer_files)
-    by_eco = {p.ecosystem: p.name for p in pkgs}
+    result = packages_from_layer_files(layer_files)
+    by_eco = {p.ecosystem: p.name for p in result.packages}
     assert by_eco["Debian"] == "foo"
     assert by_eco["Alpine"] == "bar"
+    assert result.complete
+    assert result.failures == {}
 
 
 def test_packages_from_layer_files_unknown_paths_ignored():
@@ -341,7 +385,9 @@ def test_packages_from_layer_files_unknown_paths_ignored():
         "etc/passwd": b"root:x:0:0\n",
         "var/log/some.log": b"...",
     }
-    assert packages_from_layer_files(layer_files) == []
+    result = packages_from_layer_files(layer_files)
+    assert result.packages == []
+    assert result.failures == {}
 
 
 def test_layer_file_paths_constant_lists_all_three():
@@ -351,3 +397,191 @@ def test_layer_file_paths_constant_lists_all_three():
     assert "var/lib/dpkg/status" in LAYER_FILE_PATHS
     assert "lib/apk/db/installed" in LAYER_FILE_PATHS
     assert "var/lib/rpm/rpmdb.sqlite" in LAYER_FILE_PATHS
+
+
+# ---------------------------------------------------------------------------
+# Failure surfacing + record caps
+# ---------------------------------------------------------------------------
+
+
+def test_failed_parser_surfaced_in_result(monkeypatch):
+    """A package DB that is PRESENT but rejected must be
+    distinguishable from an absent one — pre-fix the failure was a
+    debug log and the caller saw a plain (silently partial) list."""
+    def _boom(content):
+        raise ValueError("synthetic parser failure")
+    monkeypatch.setitem(
+        sbom_module.LAYER_FILE_PATHS, "var/lib/dpkg/status", _boom,
+    )
+    result = packages_from_layer_files({
+        "var/lib/dpkg/status": b"whatever",
+        "lib/apk/db/installed": b"P:bar\nV:2.0\n",
+    })
+    assert not result.complete
+    assert "var/lib/dpkg/status" in result.failures
+    assert "synthetic parser failure" in \
+        result.failures["var/lib/dpkg/status"]
+    # The other DB still parsed.
+    assert [p.name for p in result.packages] == ["bar"]
+
+
+def test_dpkg_record_cap_enforced(monkeypatch):
+    monkeypatch.setattr(sbom_module, "MAX_PACKAGE_RECORDS", 5)
+    stanza = (
+        "Package: p%d\nStatus: install ok installed\nVersion: 1\n\n"
+    )
+    content = "".join(stanza % i for i in range(10)).encode()
+    with pytest.raises(PackageDbLimitExceeded, match="dpkg"):
+        parse_dpkg_status(content)
+
+
+def test_apk_record_cap_enforced(monkeypatch):
+    monkeypatch.setattr(sbom_module, "MAX_PACKAGE_RECORDS", 5)
+    content = "".join(
+        f"P:p{i}\nV:1\n\n" for i in range(10)
+    ).encode()
+    with pytest.raises(PackageDbLimitExceeded, match="apk"):
+        parse_apk_installed(content)
+
+
+def test_record_cap_failure_lands_in_result_failures(monkeypatch):
+    """The cap propagates through the aggregator as a surfaced
+    failure, not a crash and not silence."""
+    monkeypatch.setattr(sbom_module, "MAX_PACKAGE_RECORDS", 5)
+    content = "".join(
+        f"P:p{i}\nV:1\n\n" for i in range(10)
+    ).encode()
+    result = packages_from_layer_files({"lib/apk/db/installed": content})
+    assert result.packages == []
+    assert "lib/apk/db/installed" in result.failures
+    assert "PackageDbLimitExceeded" in \
+        result.failures["lib/apk/db/installed"]
+
+
+def test_record_cap_is_generous_for_real_databases():
+    """Real installed-state files are tens of thousands of records;
+    the cap must not clip them."""
+    assert sbom_module.MAX_PACKAGE_RECORDS >= 100_000
+
+
+def test_continuation_line_accumulation_is_linear():
+    """A stanza that is almost entirely continuation lines must parse
+    in linear time. The pre-fix per-line string rebuild was O(n^2):
+    this 200k-line fixture took minutes; linear accumulation takes
+    milliseconds. The generous wall-clock bound only trips on a
+    quadratic regression."""
+    import time
+    content = (
+        b"Package: foo\n"
+        b"Status: install ok installed\n"
+        b"Version: 1.0\n"
+        b"Description: header\n"
+        + b" continuation-line-padding-0123456789\n" * 200_000
+        + b"\n"
+    )
+    start = time.monotonic()
+    pkgs = parse_dpkg_status(content)
+    elapsed = time.monotonic() - start
+    assert [p.name for p in pkgs] == ["foo"]
+    assert elapsed < 20, (
+        f"continuation-line parse took {elapsed:.1f}s — "
+        f"quadratic accumulation regression"
+    )
+
+
+def test_continuation_lines_still_join_with_newlines():
+    stanza_fields = parse_dpkg_status(
+        b"Package: foo\n"
+        b"Status: install ok installed\n"
+        b"Version: 1.0\n\n"
+    )
+    assert stanza_fields[0].name == "foo"
+    # Direct check of the joining semantics on the private helper.
+    from core.oci.sbom import _parse_rfc822_stanza
+    fields = _parse_rfc822_stanza(
+        "Description: first\n second\n third\nOther: x"
+    )
+    assert fields["Description"] == "first\nsecond\nthird"
+    assert fields["Other"] == "x"
+
+
+# ---------------------------------------------------------------------------
+# os-release distro resolution
+# ---------------------------------------------------------------------------
+
+
+def test_parse_os_release_quoted_values():
+    from core.oci.sbom import parse_os_release
+    got = parse_os_release(
+        b'ID=ubuntu\nVERSION_ID="18.04"\n# comment\nBAD LINE\n'
+        b"PRETTY_NAME='Ubuntu 18.04'\n",
+    )
+    assert got["ID"] == "ubuntu"
+    assert got["VERSION_ID"] == "18.04"
+    assert got["PRETTY_NAME"] == "Ubuntu 18.04"
+
+
+def test_dpkg_rows_resolve_to_ubuntu_from_os_release():
+    from core.oci.sbom import packages_from_layer_files
+    res = packages_from_layer_files({
+        "var/lib/dpkg/status": (
+            b"Package: openssl\nStatus: install ok installed\n"
+            b"Version: 1.1.1-1ubuntu2.1~18.04.23\n"
+        ),
+        "etc/os-release": b'ID=ubuntu\nVERSION_ID="18.04"\n',
+    })
+    (pkg,) = res.packages
+    assert pkg.ecosystem == "Ubuntu:18.04:LTS"
+    assert pkg.name == "openssl"
+
+
+def test_dpkg_rows_stay_debian_without_os_release():
+    from core.oci.sbom import packages_from_layer_files
+    res = packages_from_layer_files({
+        "var/lib/dpkg/status": (
+            b"Package: openssl\nStatus: install ok installed\n"
+            b"Version: 3.0.11-1~deb12u2\n"
+        ),
+    })
+    (pkg,) = res.packages
+    assert pkg.ecosystem == "Debian"
+
+
+def test_apk_rows_get_release_sharded_ecosystem():
+    from core.oci.sbom import packages_from_layer_files
+    res = packages_from_layer_files({
+        "lib/apk/db/installed": (
+            b"P:musl-utils\nV:1.2.3-r0\no:musl\n"
+        ),
+        "etc/os-release": b"ID=alpine\nVERSION_ID=3.16.2\n",
+    })
+    (pkg,) = res.packages
+    # OSV's Alpine index is sharded per release, and advisories key
+    # by the origin (source) package.
+    assert pkg.ecosystem == "Alpine:v3.16"
+    assert pkg.name == "musl"
+
+
+def test_apk_rows_without_release_stay_bare():
+    from core.oci.sbom import packages_from_layer_files
+    res = packages_from_layer_files({
+        "lib/apk/db/installed": b"P:musl\nV:1.2.3-r0\n",
+    })
+    (pkg,) = res.packages
+    assert pkg.ecosystem == "Alpine"
+
+
+def test_dpkg_rows_do_not_guess_parent_release_from_id_like():
+    """A derivative's own VERSION_ID is not its parent's release number."""
+    from core.oci.sbom import packages_from_layer_files
+    res = packages_from_layer_files({
+        "var/lib/dpkg/status": (
+            b"Package: openssl\nStatus: install ok installed\n"
+            b"Version: 1.1.1-1ubuntu2.1\n"
+        ),
+        "etc/os-release": (
+            b'ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID="21.2"\n'
+        ),
+    })
+    (pkg,) = res.packages
+    assert pkg.ecosystem == "Debian"

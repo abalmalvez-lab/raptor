@@ -1,0 +1,154 @@
+name: Nightly (shuffled fast)
+
+# Re-runs the default-tier tests multiple times with distinct random
+# seeds to flush out order-dependent failures.  Each seed gets its own
+# runner via the matrix so the iterations run in parallel — wall-clock
+# is one iteration, not three.
+
+on:
+  schedule:
+    # 07:15 UTC — 15 minutes after the slow+integration nightly so the
+    # two don't compete for the same runner pool at the same instant.
+    - cron: '15 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.14'
+  VENV_PATH: .venv
+
+jobs:
+  shuffled-fast:
+    # Repo variable RAPTOR_FAST_RUNNER (Settings → Variables) upsizes
+    # these runners together with tests.yml's fast-tier batches. Unset
+    # or empty, the expression falls back to ubuntu-latest.
+    runs-on: ${{ vars.RAPTOR_FAST_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        iteration: [1, 2, 3]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable unprivileged user namespaces
+        # Ubuntu 24.04 runners block unprivileged user namespaces via
+        # AppArmor by default; the sandbox's mount-ns backend needs them
+        # (plus newuidmap/newgidmap from uidmap). Without this, the
+        # untrusted-run fresh-procfs contract correctly refuses the
+        # host-procfs-visible fallback and every untrusted-target test
+        # fails at setup.
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore or rebuild venv (with grammars)
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-grammars
+          uv-export-extra-args: --extra grammars
+          install-method: sync
+          save-on-rebuild: 'true'
+
+      # Parallelism: ``-n auto --dist loadfile`` (4 workers on
+      # ubuntu-latest). The tier's purpose is ORDER-DEPENDENCE
+      # detection, so the trade is stated here, not buried:
+      #   * loadfile keeps every FILE on one worker, so the seeded
+      #     shuffle's scope grouping (root conftest) still bounds each
+      #     module/class fixture to one setup (loadscope was measured
+      #     re-running module fixtures once per worker that hosted one
+      #     of the module's classes), and intra-file order stays fully
+      #     randomised per the seed;
+      #   * --no-loadscope-reorder prevents xdist from sorting files
+      #     back into test-count order after the seeded shuffle;
+      #   * file ORDER remains seeded-random, but files split across N
+      #     workers — a given cross-file pair co-locates on a worker
+      #     with ~1/N probability per iteration. Three iterations per
+      #     night with distinct seeds (and fresh seeds nightly) keep
+      #     accumulating cross-file coverage; the single-process shape
+      #     stays one flag away (drop -n) when chasing a specific
+      #     order bug;
+      #   * the egress-leak guard is xdist-ENFORCED (workers report
+      #     through the controller's marker dir — root conftest), so
+      #     parallelism costs no guard power.
+      #
+      # Tier wallclock tripwire (root conftest): flags the session —
+      # with a named summary instead of an opaque runner kill — when
+      # an iteration exceeds the budget. Baseline at the time this was
+      # set: ~19 min single-process locally / ~21.5 min on
+      # ubuntu-latest (42k tests); measured 4.3x on 4 local workers
+      # under loadfile (19:07 → 4:29 — the sleep-bound fat tail
+      # parallelises cleanly), so the expected CI iteration is
+      # ~6-9 min. The 1800s budget carries ~3x headroom over that —
+      # re-baseline after the first few nightly runs. If it fires
+      # without a starved runner, the tier has structurally drifted:
+      # re-measure, fix the drift or consciously raise the budget with
+      # the new baseline.
+      - name: Start LLM hostname tripwire
+        run: |
+          source $VENV_PATH/bin/activate
+          python core/testing/llm_hosts_tripwire.py prepare \
+            --directory "$RUNNER_TEMP/llm-hosts"
+          sudo "$PWD/$VENV_PATH/bin/python" "$PWD/core/testing/llm_hosts_tripwire.py" serve \
+            --directory "$RUNNER_TEMP/llm-hosts" --hosts-file /etc/hosts \
+            > "$RUNNER_TEMP/llm-hosts/server.log" 2>&1 &
+          python core/testing/llm_hosts_tripwire.py wait \
+            --directory "$RUNNER_TEMP/llm-hosts"
+
+      - name: Shuffled default-tier tests (seed ${{ matrix.iteration }})
+        run: |
+          source $VENV_PATH/bin/activate
+          seed="${{ github.run_id }}-${{ matrix.iteration }}"
+          echo "seed=${seed}"
+          RAPTOR_RANDOMISE_TESTS="$seed" \
+          RAPTOR_MAX_SESSION_SECONDS=1800 \
+            python -m pytest core packages engine \
+            -p core.testing.llm_tripwire \
+            --llm-tripwire-dir "$RUNNER_TEMP/llm-tripwire" \
+            --llm-tripwire-host-dir "$RUNNER_TEMP/llm-hosts" \
+            -n auto --dist loadfile --no-loadscope-reorder \
+            -q --durations=25 --tb=short \
+            --junitxml="$RUNNER_TEMP/fast-iter-${{ matrix.iteration }}.xml"
+
+      - name: Stop LLM hostname tripwire and check connections
+        if: always()
+        run: |
+          sudo "$PWD/$VENV_PATH/bin/python" "$PWD/core/testing/llm_hosts_tripwire.py" stop \
+            --directory "$RUNNER_TEMP/llm-hosts"
+
+      # The full default-tier collection in one invocation — the
+      # authoritative skip census for the default markers (the PR
+      # tiers dispatch dynamic subsets, so their per-batch counts are
+      # not stable keys). Every iteration checks: the collection is
+      # identical across seeds, so the counts must be too.
+      - name: Check default-tier skip count against its recorded budget
+        run: |
+          python3 .github/scripts/check_skip_budget.py \
+            --lane nightly-default --full \
+            --junit-xml "$RUNNER_TEMP/fast-iter-${{ matrix.iteration }}.xml"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: nightly-shuffled-fast-iter-${{ matrix.iteration }}
+          path: |
+            ${{ runner.temp }}/fast-iter-${{ matrix.iteration }}.xml
+            ${{ runner.temp }}/llm-tripwire/**/*.jsonl
+            ${{ runner.temp }}/llm-hosts/*.jsonl
+            ${{ runner.temp }}/llm-hosts/endpoints.json
+            ${{ runner.temp }}/llm-hosts/server.log
+          retention-days: 14
+          if-no-files-found: ignore

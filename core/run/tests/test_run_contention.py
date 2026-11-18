@@ -1,0 +1,451 @@
+"""Run-start contention on managed project dirs — hermetic tests.
+
+Design under test (see ``core.run.metadata._project_run_gate``): the
+run itself is represented by its metadata (``status=running`` + a live
+recorded ``session_pid``), NOT by a flock — the stub-based
+``raptor-run-lifecycle start``/``complete`` flow spans processes, so
+no single process could hold a lock for the run's duration. The
+``.op.lock`` flock only guards the [contention check → metadata write]
+window. Consequences pinned here:
+
+* another session's live run refuses a new start IMMEDIATELY, naming
+  the holder;
+* a crashed run (running status, dead pid) never blocks;
+* same-session parallel runs stay legal;
+* ``wait_for_project=True`` queues until the live run finishes;
+* non-project dirs never contend.
+
+PID liveness and session identity are patched — no real claude
+processes are involved.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import json
+import time
+import threading
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from core.json import load_json, save_json
+from core.project.oplock import OpLockContention, ProjectRunContention
+from core.project.project import ProjectManager
+from core.run import metadata
+from core.testing.module_views import module_function_view, scoped_function_imports
+from core.run.metadata import (
+    RUN_METADATA_FILE,
+    _live_conflicting_run,
+    start_run,
+)
+
+SELF_SESSION = 11111
+OTHER_SESSION = 22222
+
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path):
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    with pytest.MonkeyPatch.context() as patch:
+        pin_user_state_dirs(patch, tmp_path)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(_user_state_in_tmp):
+    """Undo body patches before restoring the file-owned registry pins."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
+class RunContentionBase(unittest.TestCase):
+    """Temp project registry + a managed project output dir.
+
+    Liveness is patched by default (OTHER_SESSION alive, all else
+    dead) for BOTH probes — the gate's and _cleanup_abandoned's — so
+    fake siblings neither sweep nor contend for the wrong reason.
+    Set ``LIVENESS_PATCHES = False`` to exercise the real probes.
+    """
+
+    LIVENESS_PATCHES = True
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.projects_dir = root / "projects"
+        target = root / "code"
+        target.mkdir()
+        self.project_out = root / "out" / "myapp"
+        mgr = ProjectManager(projects_dir=self.projects_dir)
+        mgr.create("myapp", str(target), output_dir=str(self.project_out))
+
+        self._patches = [
+            patch("core.project.project.PROJECTS_DIR", self.projects_dir),
+            # We are SELF_SESSION.
+            patch("core.run.metadata._get_session_pid",
+                  lambda: SELF_SESSION),
+        ]
+        if self.LIVENESS_PATCHES:
+            self._patches += [
+                patch("core.run.metadata._gate_session_alive",
+                      lambda pid: pid == OTHER_SESSION),
+                patch("core.run.metadata._pid_alive",
+                      lambda pid: pid == OTHER_SESSION),
+            ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _write_sibling(self, name="scan_20260101_000000",
+                       status="running", session_pid=OTHER_SESSION,
+                       command="scan"):
+        d = self.project_out / name
+        d.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "version": 2,
+            "command": command,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "status": status,
+        }
+        if session_pid is not None:
+            meta["session_pid"] = session_pid
+        save_json(d / RUN_METADATA_FILE, meta)
+        return d
+
+
+class LiveConflictScanTest(RunContentionBase):
+
+    def _scan(self, self_dir="agentic_new"):
+        return _live_conflicting_run(
+            self.project_out, self.project_out / self_dir, SELF_SESSION)
+
+    def test_other_session_live_run_is_contention(self):
+        self._write_sibling()
+        holder = self._scan()
+        self.assertIsNotNone(holder)
+        self.assertEqual(holder["pid"], OTHER_SESSION)
+        self.assertEqual(holder["operation"], "scan")
+        self.assertEqual(holder["run_dir"], "scan_20260101_000000")
+
+    def test_dead_owner_is_not_contention(self):
+        self._write_sibling(session_pid=99999)  # dead per the patch
+        self.assertIsNone(self._scan())
+
+    def test_same_session_is_not_contention(self):
+        self._write_sibling(session_pid=SELF_SESSION)
+        self.assertIsNone(self._scan())
+
+    def test_completed_run_is_not_contention(self):
+        self._write_sibling(status="completed")
+        self.assertIsNone(self._scan())
+
+    def test_no_recorded_pid_is_not_contention(self):
+        self._write_sibling(session_pid=None)
+        self.assertIsNone(self._scan())
+
+    def test_self_dir_is_excluded(self):
+        self._write_sibling(name="agentic_new")
+        self.assertIsNone(self._scan(self_dir="agentic_new"))
+
+    def test_corrupt_sibling_metadata_is_skipped(self):
+        d = self.project_out / "junk_run"
+        d.mkdir(parents=True)
+        (d / RUN_METADATA_FILE).write_text("{not json", encoding="utf-8")
+        self.assertIsNone(self._scan())
+
+
+class StartRunGateTest(RunContentionBase):
+
+    def test_contention_refuses_immediately_with_holder(self):
+        self._write_sibling()
+        out = self.project_out / "agentic_20260102_000000"
+        with self.assertRaises(ProjectRunContention) as cm:
+            start_run(out, "agentic")
+        msg = str(cm.exception)
+        self.assertIn(str(OTHER_SESSION), msg)
+        self.assertIn("scan", msg)
+        self.assertIn("--wait", msg)
+        # ProjectRunContention is an OpLockContention — one handler at
+        # each CLI boundary covers both contention shapes.
+        self.assertIsInstance(cm.exception, OpLockContention)
+        # A refused start leaves nothing behind.
+        self.assertFalse(out.exists())
+
+    def test_crashed_run_does_not_block_start(self):
+        self._write_sibling(session_pid=99999)  # dead pid
+        out = self.project_out / "agentic_20260102_000000"
+        start_run(out, "agentic")
+        meta = load_json(out / RUN_METADATA_FILE)
+        self.assertEqual(meta["status"], "running")
+
+    def test_same_session_parallel_start_allowed(self):
+        self._write_sibling(session_pid=SELF_SESSION)
+        out = self.project_out / "agentic_20260102_000000"
+        start_run(out, "agentic")
+        self.assertTrue((out / RUN_METADATA_FILE).exists())
+
+    def test_non_project_dir_never_contends(self):
+        plain = Path(self._tmp.name) / "plain-out"
+        sibling = plain / "scan_20260101_000000"
+        sibling.mkdir(parents=True)
+        save_json(sibling / RUN_METADATA_FILE, {
+            "version": 2, "command": "scan", "status": "running",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "session_pid": OTHER_SESSION,
+        })
+        out = plain / "agentic_20260102_000000"
+        start_run(out, "agentic")
+        self.assertTrue((out / RUN_METADATA_FILE).exists())
+
+    def test_reentrant_stamp_skips_gate(self):
+        """raptor.py's wrapper start_run()s the dir; the child's
+        start_run() on the SAME dir is an enrich, not a new start —
+        it must pass even with a live conflicting sibling."""
+        from datetime import datetime, timezone
+        self._write_sibling()
+        out = self.project_out / "agentic_20260102_000000"
+        out.mkdir(parents=True)
+        save_json(out / RUN_METADATA_FILE, {
+            "version": 2, "command": "agentic", "status": "running",
+            # Fresh stamp, as in the real flow (the wrapper start_run()s
+            # moments before the child) — also keeps _cleanup_abandoned's
+            # freshness gate from sweeping it as an Esc-abandon.
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_pid": SELF_SESSION,
+        })
+        start_run(out, "agentic")  # must not raise
+        meta = load_json(out / RUN_METADATA_FILE)
+        self.assertEqual(meta["status"], "running")
+
+    def test_wait_queues_until_holder_finishes(self):
+        sibling = self._write_sibling()
+
+        def _finish():
+            meta = json.loads(
+                (sibling / RUN_METADATA_FILE).read_text(encoding="utf-8"))
+            meta["status"] = "completed"
+            save_json(sibling / RUN_METADATA_FILE, meta)
+
+        from core.testing.threads import retiring_threads
+
+        timer = threading.Timer(0.5, _finish)
+        with retiring_threads([timer], release=timer.cancel, timeout=5):
+            timer.start()
+            out = self.project_out / "agentic_20260102_000000"
+            view = module_function_view(metadata, bindings={
+                "_owned_gate": metadata._project_run_gate.__wrapped__,
+            })
+            with (
+                scoped_function_imports(view, ("_owned_gate",), {"time": time}) as imports,
+                patch.object(imports.time, "sleep"),  # collapse only the gate's poll
+                patch.object(metadata, "_project_run_gate", contextmanager(view._owned_gate)),
+                # Git availability is incidental to this contention test.
+                patch("core.run.provenance._git", return_value=None),
+            ):
+                start_run(out, "agentic", wait_for_project=True)
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "running")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class UnsignallablePidGateTest(RunContentionBase):
+    """A recorded session pid we cannot signal must not read as a live
+    session: planted metadata with session_pid=1 (init — EPERM on
+    kill(0), comm is not claude) was a PERMANENT run-start DoS under
+    the cleanup-oriented probe, and --wait queued forever. Real
+    probes on purpose: _pid_alive(1) is True (EPERM = alive), so the
+    planted sibling survives _cleanup_abandoned and the GATE alone
+    must decline it."""
+
+    LIVENESS_PATCHES = False
+
+    def test_planted_init_pid_does_not_block_start(self):
+        self._write_sibling(session_pid=1)
+        out = self.project_out / "agentic_20260102_000000"
+        start_run(out, "agentic")  # must not raise
+        self.assertTrue((out / RUN_METADATA_FILE).exists())
+
+    def test_gate_probe_semantics(self):
+        from core.run.metadata import _gate_session_alive
+        self.assertFalse(_gate_session_alive(1), "init read as a session")
+        self.assertFalse(_gate_session_alive(-5))
+        self.assertFalse(_gate_session_alive(999999999))
+        # Our own (python) pid is signallable but comm isn't claude —
+        # on Linux the comm gate rejects it too.
+        import os
+        if Path(f"/proc/{os.getpid()}/comm").exists():
+            self.assertFalse(_gate_session_alive(os.getpid()))
+
+
+class HostileSiblingMetadataTest(RunContentionBase):
+    """Sibling run metadata is plantable file content — the contention
+    message must never carry raw escape bytes or floods."""
+
+    def test_contention_message_escapes_hostile_fields(self):
+        self._write_sibling(
+            name="scan\x1b[2J_20260101",
+            command="\x1b]0;evil\x07scan" + "B" * 4000,
+        )
+        d = self.project_out / "scan\x1b[2J_20260101"
+        meta = load_json(d / RUN_METADATA_FILE)
+        meta["timestamp"] = "2026-01-01\x1b[31mT00:00:00"
+        save_json(d / RUN_METADATA_FILE, meta)
+        out = self.project_out / "agentic_20260102_000000"
+        with self.assertRaises(ProjectRunContention) as cm:
+            start_run(out, "agentic")
+        msg = str(cm.exception)
+        self.assertNotIn("\x1b", msg, "raw ESC reached the message")
+        self.assertNotIn("\x07", msg)
+        self.assertLess(len(msg), 800, "unbounded field flooded the message")
+
+
+class ForeignStampedHolderTest(RunContentionBase):
+    """Foreign-stamped / import-restored ``status=running`` markers.
+
+    A foreign session stamp (other machine or pid namespace) is
+    unverifiable here and reads fail-open ALIVE to the sweeps — which
+    made one planted or import-restored marker a PERMANENT contention
+    holder: every future start_run refused, forever, with no sweep
+    ever clearing it. The gate now (a) skips import-marked runs, and
+    (b) applies an age ceiling to foreign-stamped holders whose run
+    dir is write-quiet. The sweeps stay fail-open (pinned below).
+    """
+
+    def _write_foreign_sibling(self, name="agentic_20260101_000000",
+                               timestamp="2026-01-01T00:00:00+00:00"):
+        d = self._write_sibling(name=name, command="agentic",
+                                session_pid=4194000)
+        meta = load_json(d / RUN_METADATA_FILE)
+        meta.update({
+            "timestamp": timestamp,
+            "session_start": "123456",
+            "session_boot_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000",
+            "session_pidns": "999999999",
+        })
+        save_json(d / RUN_METADATA_FILE, meta)
+        return d
+
+    def _foreign_patches(self):
+        return [
+            patch("core.project.sessions._foreign_entry",
+                  lambda fields: True),
+            patch("core.project.sessions._prior_boot_entry",
+                  lambda fields: False),
+        ]
+
+    def _scan(self):
+        return _live_conflicting_run(
+            self.project_out, self.project_out / "agentic_new",
+            SELF_SESSION)
+
+    def test_old_quiet_foreign_holder_stops_contending(self):
+        self._write_foreign_sibling()  # year-old timestamp
+        patches = self._foreign_patches() + [
+            patch("core.run.metadata._run_recently_active",
+                  lambda d: False),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertIsNone(self._scan())
+        # Sweep direction stays fail-open: the marker itself is
+        # untouched (status stays running; only the GATE stops
+        # honouring it).
+        d = self.project_out / "agentic_20260101_000000"
+        self.assertEqual(
+            load_json(d / RUN_METADATA_FILE)["status"], "running")
+
+    def test_recent_foreign_holder_still_contends(self):
+        # Two-direction: inside the ceiling the fail-open contention
+        # protection holds (a genuinely live cross-machine run).
+        from datetime import datetime, timezone
+        self._write_foreign_sibling(
+            timestamp=datetime.now(timezone.utc).isoformat())
+        patches = self._foreign_patches() + [
+            patch("core.run.metadata._run_recently_active",
+                  lambda d: False),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertIsNotNone(self._scan())
+
+    def test_active_foreign_holder_still_contends_past_ceiling(self):
+        # Write activity in the run dir keeps the hold even past the
+        # timestamp ceiling — a live run keeps writing.
+        self._write_foreign_sibling()
+        patches = self._foreign_patches() + [
+            patch("core.run.metadata._run_recently_active",
+                  lambda d: True),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertIsNotNone(self._scan())
+
+    def test_missing_timestamp_does_not_extend_the_hold(self):
+        # A forged marker must not earn a LONGER hold by omitting the
+        # field the ceiling reads.
+        d = self._write_foreign_sibling()
+        meta = load_json(d / RUN_METADATA_FILE)
+        del meta["timestamp"]
+        save_json(d / RUN_METADATA_FILE, meta)
+        patches = self._foreign_patches() + [
+            patch("core.run.metadata._run_recently_active",
+                  lambda d: False),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertIsNone(self._scan())
+
+    def test_imported_running_marker_never_contends(self):
+        # Import-restored runs carry the marker; their status describes
+        # the EXPORTING machine's session, never a holder here — even
+        # with an alive-looking local pid.
+        d = self._write_sibling(command="agentic")  # OTHER_SESSION alive
+        from core.project.findings_utils import IMPORTED_RUN_MARKER_FILE
+        save_json(d / IMPORTED_RUN_MARKER_FILE, {"imported": True})
+        self.assertIsNone(self._scan())
+
+    def test_sweep_fail_open_projection_unchanged(self):
+        # _session_alive_for_meta must keep reading foreign as ALIVE
+        # (the sweeps' fail-open contract); the gate consumes the
+        # tri-state instead.
+        from core.run.metadata import (
+            _session_alive_for_meta,
+            _session_liveness_for_meta,
+        )
+        meta = {"session_pid": 4194000, "session_start": "123456",
+                "session_boot_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"}
+        for p in self._foreign_patches():
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertEqual(_session_liveness_for_meta(meta), "foreign")
+        self.assertTrue(_session_alive_for_meta(meta))
+
+    def test_future_dated_stamp_does_not_extend_the_hold(self):
+        # Adversarial shape: a forged FAR-FUTURE timestamp would never
+        # age past the ceiling — the exact infinite hold the ceiling
+        # exists to bound.
+        self._write_foreign_sibling(
+            timestamp="9999-01-01T00:00:00+00:00")
+        patches = self._foreign_patches() + [
+            patch("core.run.metadata._run_recently_active",
+                  lambda d: False),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertIsNone(self._scan())

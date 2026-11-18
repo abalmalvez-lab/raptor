@@ -9,7 +9,32 @@ when unset. No breaking changes to existing callers.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+
+
+def _coerce_polarity(value) -> str:
+    """Coerce an LLM/JSON-supplied polarity to the closed vocabulary.
+
+    Anything outside {"reachability", "infeasibility"} — null, blank,
+    typo, non-string — degrades to "" (undeclared), which the verdict
+    ladder treats fail-closed.
+    """
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in Hypothesis.POLARITIES:
+            return token
+    return ""
+
+
+def _coerce_line(value) -> int:
+    """Best-effort int coercion for LLM-supplied line numbers.
+
+    LLM JSON routinely carries null, "", or non-numeric strings where an
+    int belongs — from_dict must degrade to 0 rather than raise.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 @dataclass
@@ -37,14 +62,14 @@ class Location:
         }
 
     @classmethod
-    def from_dict(cls, d: Optional[dict]) -> "Location":
+    def from_dict(cls, d: dict | None) -> "Location":
         if not d or not isinstance(d, dict):
             return cls()
         return cls(
             kind=(d.get("kind") or ""),
             file=(d.get("file") or ""),
             function=(d.get("function") or ""),
-            line=int(d.get("line") or 0),
+            line=_coerce_line(d.get("line")),
         )
 
 
@@ -73,13 +98,13 @@ class FlowStep:
         }
 
     @classmethod
-    def from_dict(cls, d: Optional[dict]) -> "FlowStep":
+    def from_dict(cls, d: dict | None) -> "FlowStep":
         if not d or not isinstance(d, dict):
             return cls()
         return cls(
             file=(d.get("file") or ""),
             function=(d.get("function") or ""),
-            line=int(d.get("line") or 0),
+            line=_coerce_line(d.get("line")),
             description=(d.get("description") or ""),
         )
 
@@ -116,19 +141,34 @@ class Hypothesis:
         sanitizers: Patterns the LLM expects to see (and which, if
             absent, support the hypothesis).
         smt_constraints: Constraint strings for the SMT adapter.
+        polarity: Declared reading of the claim for tools whose
+            definitive result is an EMPTY match set (SMT unsat):
+            "reachability" — the claim asserts a path/flow IS
+            reachable (unsat mechanically refutes it);
+            "infeasibility" — the claim asserts conditions are
+            mutually exclusive / the path is infeasible (unsat
+            mechanically confirms it); "" — undeclared. Declared at
+            hypothesis-formation time (schema-driven), BEFORE any
+            tool output exists, so the verdict direction of a
+            zero-match conclusive result is mechanical — never the
+            evaluating LLM's phrasing-aware (and injection-steerable)
+            reading after the fact.
     """
+
+    POLARITIES = ("reachability", "infeasibility")
 
     claim: str
     target: Path
     target_function: str = ""
     cwe: str = ""
-    suggested_tools: List[str] = field(default_factory=list)
+    suggested_tools: list[str] = field(default_factory=list)
     context: str = ""
-    source: Optional[Location] = None
-    sink: Optional[Location] = None
-    flow_steps: List[FlowStep] = field(default_factory=list)
-    sanitizers: List[str] = field(default_factory=list)
-    smt_constraints: List[str] = field(default_factory=list)
+    source: Location | None = None
+    sink: Location | None = None
+    flow_steps: list[FlowStep] = field(default_factory=list)
+    sanitizers: list[str] = field(default_factory=list)
+    smt_constraints: list[str] = field(default_factory=list)
+    polarity: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -143,19 +183,21 @@ class Hypothesis:
         # to_dict shape (and round-trip equality) is unchanged for callers
         # that don't use them.
         if self.source is not None:
-            d["source"] = self.source.to_dict()
+            d["source"] = self.source.to_dict()  # type: ignore[assignment]
         if self.sink is not None:
-            d["sink"] = self.sink.to_dict()
+            d["sink"] = self.sink.to_dict()  # type: ignore[assignment]
         if self.flow_steps:
-            d["flow_steps"] = [s.to_dict() for s in self.flow_steps]
+            d["flow_steps"] = [s.to_dict() for s in self.flow_steps]  # type: ignore[misc]
         if self.sanitizers:
             d["sanitizers"] = list(self.sanitizers)
         if self.smt_constraints:
             d["smt_constraints"] = list(self.smt_constraints)
+        if self.polarity:
+            d["polarity"] = self.polarity
         return d
 
     @classmethod
-    def from_dict(cls, d: Optional[dict]) -> "Hypothesis":
+    def from_dict(cls, d: dict | None) -> "Hypothesis":
         if not d or not isinstance(d, dict):
             return cls(claim="", target=Path("."))
         # Use `or fallback` rather than `.get(key, fallback)` so JSON
@@ -179,4 +221,5 @@ class Hypothesis:
             flow_steps=flow_steps,
             sanitizers=list(d.get("sanitizers") or []),
             smt_constraints=list(d.get("smt_constraints") or []),
+            polarity=_coerce_polarity(d.get("polarity")),
         )

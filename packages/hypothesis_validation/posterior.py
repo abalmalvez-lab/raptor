@@ -1,34 +1,31 @@
-"""Bayesian verdict aggregation — Beta-Bernoulli posterior over hypotheses.
+"""Optional Beta-Bernoulli aggregation of supplied tool observations.
 
-The 3-valued verdict ladder in `verdict.py` is the right floor: tool
-failure, confirmed-without-matches, and refuted-with-matches all
-collapse to a known cell of the lattice. But it discards information
-when evidence is plentiful — three confirming runs and one refuting
-run looks identical to one of each, because both collapse to
-inconclusive.
+Each observation contributes to a model: a match adds confirmation,
+absence of a match adds refutation, and tool failure contributes nothing.
+Definitive SMT predicates use the hypothesis's declared polarity instead
+of match presence. The caller chooses the prior and any observation weights.
 
-This module fixes that by aggregating evidence through a Beta-Bernoulli
-posterior. Each piece of evidence contributes a single observation
-(match present → confirmation, match absent → refutation, tool
-failure → no-op). The Beta distribution is the conjugate prior for
-Bernoulli observations, so the posterior update is one line of
-arithmetic and the result is a calibrated probability `p(vuln)`.
+The resulting mean is conditional on this mapping and the Bernoulli model.
+It is not a calibrated probability that source code is vulnerable. Repeated
+or correlated observations do not establish independent evidence, and the
+score does not grant source-reachability or finding-promotion authority.
 
-Math reminder. Beta(α, β) is the prior belief over the unknown
-probability `p` that the hypothesis is a real vulnerability. After one
-positive observation: Beta(α+1, β). After one negative: Beta(α, β+1).
-The posterior mean — `α / (α + β)` — is the point estimate, and the
-total `α + β` is "evidence strength" (higher = more concentrated
-distribution). No MCMC, no integrals; the conjugate update is exact.
+For a Beta(alpha, beta) prior, a positive observation adds its weight to
+alpha and a negative observation adds its weight to beta. The model mean
+is alpha / (alpha + beta); the sum is the model's pseudo-count strength.
+These arithmetic updates do not establish the model's empirical calibration.
 
-This module is standalone. No callers in `runner.py` yet — wiring is
-deliberately deferred until the math is exercised against real
-evidence. Use it directly from a `ValidationResult.evidence` list
-when you need a probability instead of a discrete verdict.
+The helpers are exposed as an optional library API. Neither the hypothesis
+runner nor the audit orchestrator uses these helpers to score or promote
+findings. Callers can use ``posterior_from`` with a ``ValidationResult``
+evidence list when they explicitly want this model, retaining the evidence's
+scope and the assumptions required to interpret the score.
 """
 
+import math
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from .result import Verdict
 
@@ -93,7 +90,15 @@ def update(p: Posterior, *, confirms: bool, weight: float = 1.0) -> Posterior:
     so every evidence item contributes equally; tune per-adapter when
     you have calibrated likelihoods (CodeQL dataflow ≫ Semgrep
     pattern, for example).
+
+    `weight` must be a positive finite number — this is the only
+    mutation point, so validating here is what keeps the documented
+    alpha/beta > 0 invariant true (a negative weight would let `mean`
+    escape [0, 1] and silently flip `verdict_from_posterior`).
     """
+    if not math.isfinite(weight) or weight <= 0:
+        msg = f"weight must be a positive finite number, got {weight!r}"
+        raise ValueError(msg)
     if confirms:
         return Posterior(alpha=p.alpha + weight, beta=p.beta)
     return Posterior(alpha=p.alpha, beta=p.beta + weight)
@@ -102,11 +107,15 @@ def update(p: Posterior, *, confirms: bool, weight: float = 1.0) -> Posterior:
 def posterior_from(
     evidence_list: Iterable[Any],
     prior: Posterior = UNIFORM_PRIOR,
+    *,
+    polarity: str = "",
 ) -> Posterior:
     """Aggregate a list of evidence into a Beta posterior.
 
     Mechanical reading of each evidence item:
       - tool failure (`success=False`)        → no-op
+      - definitive SMT predicates              → declared polarity direction
+        (no declared direction                 → no-op)
       - tool succeeded with matches present   → confirming observation
       - tool succeeded with no matches        → refuting observation
 
@@ -124,6 +133,15 @@ def posterior_from(
     p = prior
     for e in evidence_list:
         if not getattr(e, "success", True):
+            continue
+        if getattr(e, "tool", "") == "smt" and getattr(
+            e, "predicate_verdict", "",
+        ) in ("sat", "unsat"):
+            from .verdict import verdict_from
+
+            direction = verdict_from(e, polarity=polarity)
+            if direction != "inconclusive":
+                p = update(p, confirms=direction == "confirmed")
             continue
         matches = bool(getattr(e, "matches", []) or [])
         p = update(p, confirms=matches)
@@ -148,9 +166,8 @@ def verdict_from_posterior(
     exists for callers that still want a single label.
     """
     if not 0.0 <= refute_threshold < confirm_threshold <= 1.0:
-        raise ValueError(
-            "thresholds must satisfy 0 ≤ refute_threshold < confirm_threshold ≤ 1"
-        )
+        msg = "thresholds must satisfy 0 ≤ refute_threshold < confirm_threshold ≤ 1"
+        raise ValueError(msg)
     m = p.mean
     if m > confirm_threshold:
         return "confirmed"
@@ -160,9 +177,9 @@ def verdict_from_posterior(
 
 
 __all__ = [
-    "Posterior",
     "UNIFORM_PRIOR",
-    "update",
+    "Posterior",
     "posterior_from",
+    "update",
     "verdict_from_posterior",
 ]

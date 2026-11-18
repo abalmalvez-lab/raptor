@@ -1,5 +1,10 @@
 """Tests for capability detection."""
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
+
 import subprocess
 import unittest
 from pathlib import Path
@@ -11,6 +16,31 @@ from packages.fuzzing.capability import (
     probe,
     select_fuzzer,
 )
+
+import pytest
+from core.testing.module_bindings import patch_module_attribute
+
+
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shutil_patch_targets(monkeypatch):
+    """Keep shutil patch decorators and contexts on consumer-owned views."""
+    import packages.fuzzing.capability as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "shutil", "which", consumer_0.shutil.which,
+    )
+    # The capability probe delegates this lookup to the radare2 adapter.
+    # Forward through the private binding rather than the host's shutil.
+    import inspect
+
+    radare2_probe = inspect.getmodule(consumer_0._probe_radare2_capability)
+
+    patch_module_attribute(
+        monkeypatch, radare2_probe, "shutil", "which",
+        lambda *args, **kwargs: consumer_0.shutil.which(*args, **kwargs),
+    )
 
 
 class TestCapabilityReport(unittest.TestCase):
@@ -54,19 +84,32 @@ class TestCapabilityReport(unittest.TestCase):
 
 class TestProbe(unittest.TestCase):
     def test_probe_returns_report(self):
-        report = probe()
-        self.assertIsInstance(report, CapabilityReport)
-        self.assertIsNotNone(report.platform)
-        self.assertIsNotNone(report.arch)
+        # Pin the tool probes (same seams as the no-fuzzer test
+        # below): the real probe runs shutil.which over the fuzzing
+        # toolchain plus a live clang sanitiser-compile per sanitiser
+        # — host-dependent latency and side effects inside a unit
+        # test. The asserted fields are platform-derived either way.
+        with (
+            mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'shutil', 'which') as mock_which,
+        ):
+            mock_which.return_value = None
+            with patch("packages.fuzzing.capability._probe_clang_sanitiser",
+                       return_value=False):
+                report = probe()
+            self.assertIsInstance(report, CapabilityReport)
+            self.assertIsNotNone(report.platform)
+            self.assertIsNotNone(report.arch)
 
-    @patch("packages.fuzzing.capability.shutil.which")
-    def test_probe_detects_no_fuzzer_available(self, mock_which):
-        mock_which.return_value = None
-        with patch("packages.fuzzing.capability._probe_clang_sanitiser",
-                   return_value=False):
-            report = probe()
-        self.assertFalse(report.has_any_fuzzer())
-        self.assertTrue(any("No fuzzer available" in i for i in report.issues))
+    def test_probe_detects_no_fuzzer_available(self):
+        with (
+            mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'shutil', 'which') as mock_which,
+        ):
+            mock_which.return_value = None
+            with patch("packages.fuzzing.capability._probe_clang_sanitiser",
+                       return_value=False):
+                report = probe()
+            self.assertFalse(report.has_any_fuzzer())
+            self.assertTrue(any("No fuzzer available" in i for i in report.issues))
 
     def test_macos_afl_shmem_probe_detects_runtime_failure(self):
         completed = subprocess.CompletedProcess(
@@ -76,7 +119,7 @@ class TestProbe(unittest.TestCase):
             stderr="[-] SYSTEM ERROR : shmget() failed, try running afl-system-config",
         )
         with patch.object(Path, "exists", return_value=True), \
-             patch("packages.fuzzing.capability.subprocess.run",
+             mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'subprocess', 'run',
                    return_value=completed):
             self.assertFalse(_check_macos_afl_shmem("/x/afl-fuzz"))
 
@@ -88,17 +131,72 @@ class TestProbe(unittest.TestCase):
             stderr="",
         )
         with patch.object(Path, "exists", return_value=True), \
-             patch("packages.fuzzing.capability.subprocess.run",
+             mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'subprocess', 'run',
                    return_value=completed):
             self.assertTrue(_check_macos_afl_shmem("/x/afl-fuzz"))
 
 
+def _probe_on(system: str, machine: str):
+    """Run probe() with the host pinned to (system, machine).
+
+    Tool discovery and the per-sanitiser compile probes are stubbed at
+    the same seams as the probe tests above: clang is "found" and
+    every sanitiser probe reports supported, so has_memory_sanitizer
+    starts True and only the platform-policy downgrade can clear it.
+    """
+    with mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'platform', 'system',
+               return_value=system), \
+         mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'platform', 'machine',
+               return_value=machine), \
+         mock_module_attribute(_mock_owner('packages.fuzzing.capability'), 'shutil', 'which',
+               side_effect=lambda name: "/x/clang" if name == "clang" else None), \
+         patch("packages.fuzzing.capability._probe_clang_sanitiser",
+               return_value=True), \
+         patch("packages.fuzzing.capability._probe_version",
+               return_value=""), \
+         patch("packages.fuzzing.capability._probe_radare2_capability",
+               return_value={}):
+        return probe()
+
+
+class TestMemorySanitizerPlatformPolicy(unittest.TestCase):
+    """The downgrade guard must enforce the stated "Linux x86_64 only"
+    rule via is_linux, not merely via is_macos, so exotic hosts (e.g.
+    FreeBSD x86_64) are downgraded too."""
+
+    def test_linux_x86_64_keeps_msan(self):
+        report = _probe_on("Linux", "x86_64")
+        self.assertTrue(report.has_memory_sanitizer)
+
+    def test_linux_amd64_keeps_msan(self):
+        report = _probe_on("Linux", "amd64")
+        self.assertTrue(report.has_memory_sanitizer)
+
+    def test_linux_aarch64_downgrades_msan(self):
+        report = _probe_on("Linux", "aarch64")
+        self.assertFalse(report.has_memory_sanitizer)
+        self.assertTrue(any("MemorySanitizer" in i for i in report.issues))
+
+    def test_macos_downgrades_msan(self):
+        report = _probe_on("Darwin", "x86_64")
+        self.assertFalse(report.has_memory_sanitizer)
+        self.assertTrue(any("MemorySanitizer" in i for i in report.issues))
+
+    def test_non_linux_non_macos_x86_64_downgrades_msan(self):
+        # is_macos alone let e.g. FreeBSD x86_64 keep
+        # has_memory_sanitizer=True against the Linux-x86_64-only policy.
+        report = _probe_on("FreeBSD", "x86_64")
+        self.assertFalse(report.has_memory_sanitizer)
+        self.assertTrue(any("MemorySanitizer" in i for i in report.issues))
+
+
 class TestSelectFuzzer(unittest.TestCase):
     def _report_with(self, **kwargs):
-        defaults = dict(
-            platform="Linux", arch="x86_64", is_macos=False, is_linux=True,
-            afl_shmem_ok=True,
-        )
+        defaults = {
+            "platform": "Linux", "arch": "x86_64",
+            "is_macos": False, "is_linux": True,
+            "afl_shmem_ok": True,
+        }
         defaults.update(kwargs)
         return CapabilityReport(**defaults)
 

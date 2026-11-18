@@ -16,21 +16,24 @@ This module deliberately does NOT decide a verdict. The
 ``SanitizerEvidence`` is fed *into* the existing dataflow validator's
 LLM prompt by :mod:`packages.codeql.dataflow_validator` (PR1c
 integration) — never around it. The rejected verdict-with-short-circuit
-design is documented at ``~/design/dataflow-sanitizer-bypass.md``.
+design is documented at the design memo.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
 
-from core.dataflow.finding import Finding
 from core.dataflow.llm_extractor import ExtractorFn, extract_from_files
 from core.dataflow.path_annotator import annotate_finding
 from core.dataflow.sanitizer_evidence import (
     CandidateValidator,
     SanitizerEvidence,
 )
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.dataflow.finding import Finding
+    from collections.abc import Iterator
+    from pathlib import Path
 
 
 DEFAULT_MAX_FILES = 5
@@ -42,7 +45,7 @@ def collect_sanitizer_evidence(
     repo_root: Path,
     extractor: ExtractorFn,
     model_id: str = "",
-    cache: Optional[Dict[str, Tuple[CandidateValidator, ...]]] = None,
+    cache: dict[str, tuple[CandidateValidator, ...]] | None = None,
     max_files: int = DEFAULT_MAX_FILES,
 ) -> SanitizerEvidence:
     """Build :class:`SanitizerEvidence` for one :class:`Finding`.
@@ -56,7 +59,13 @@ def collect_sanitizer_evidence(
     5. Return a :class:`SanitizerEvidence` with no verdict — the
        validator pipeline (PR1c) decides exploitability with this
        evidence as input, not as a substitute.
+
+    Raises:
+        ValueError: ``max_files`` is not a non-negative integer.
     """
+    if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files < 0:
+        raise ValueError("max_files must be a non-negative integer")
+
     paths_in_order = list(_unique_file_paths(finding))
     truncated = len(paths_in_order) > max_files
     scoped_paths = paths_in_order[:max_files]
@@ -96,12 +105,13 @@ def _unique_file_paths(finding: Finding) -> Iterator[str]:
 def _describe_pool_completeness(*, file_count: int, truncated: bool) -> str:
     """Render the pool-completeness label the downstream LLM reads.
 
-    Distinguishes "we read every referenced file" from "we capped at
-    N files" so the LLM knows whether the absence of a candidate
-    reflects "no validator exists" or "we didn't look at the file
-    that defines it"."""
-    if file_count == 0:
-        return "no_files_in_scope"
+    Counts the selected paths and discloses omissions from the file budget.
+    It does not certify successful or complete reads or extractions;
+    those losses are reported separately in ``extraction_failures``.
+    An empty candidate pool does not establish that no validator exists.
+    """
     if truncated:
         return f"scoped_to_first_{file_count}_files_truncated"
+    if file_count == 0:
+        return "no_files_in_scope"
     return f"scoped_to_{file_count}_files"

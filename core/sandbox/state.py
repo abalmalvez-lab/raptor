@@ -19,6 +19,7 @@ What lives here:
 """
 
 import threading
+from typing import Any
 
 # RLock because check_mount_available() calls check_net_available() while
 # holding it; Lock would deadlock on that nested path.
@@ -31,10 +32,41 @@ _mount_available_cache = None
 # path is usable (i.e. newuidmap/newgidmap binaries are present and
 # user-ns unshare works). None = unchecked, False = not usable.
 _mount_ns_available_cache = None
+# _unshare_engage_cache: maps an exact unshare namespace-flag tuple
+# (e.g. ("--user","--pid","--fork","--ipc","--net")) to a (engages,
+# reason) result. The per-layer probes above (_net_available_cache /
+# _mount_ns_available_cache) test NARROWER operations than a real
+# sandboxed run performs; on rootless podman / distrobox (nested
+# userns) the narrow probe can pass while the full flag-set fails. This
+# cache records whether the ACTUAL flag-set engages, decided by running
+# it against `true`. Dict (not a single slot) because different calls
+# use different flag-sets (block_network on/off, mount on/off).
+_unshare_engage_cache: dict[tuple[str, ...], tuple[bool | None, str]] = {}
 # Landlock cache uses -1 for "unavailable", >0 for ABI version, None for unchecked.
 _landlock_cache = None
+# _unix_scope_cache: True when the AF_UNIX connect-scoping supervisor
+# can run on this host (seccomp user-notify + pidfd_getfd + openat2 —
+# see core/sandbox/_unix_scope.py). None = not probed.
+_unix_scope_cache: bool | None = None
+# _pidns_fresh_proc_cache: True when a fresh procfs can be mounted
+# inside a nested user+mount+pid namespace on this host (kernel policy
+# — refused e.g. under containers with a masked host /proc). None =
+# not probed. Consulted by the pid-ns spawn path to decide whether a
+# grandchild proc-remount failure on the accepted-degrade lane is new
+# signal or the known static host condition (warned once, stamped
+# per run).
+_pidns_fresh_proc_cache: bool | None = None
+# _pidns_supervision_cache: (verdict, reason) for the supervised
+# pid-namespace tier (core.sandbox.supervised) — single-call
+# user+pid unshare + PID-1 round-trip. None = not probed. Only
+# DEFINITIVE verdicts land here (True engaged / False refused);
+# probe infrastructure failures are never cached (the check returns
+# None ad hoc and re-probes next call). A LIVE spawn-path refusal
+# overwrites via probes.note_pidns_supervision_refused — runtime
+# evidence is authoritative over an earlier probe.
+_pidns_supervision_cache: tuple[bool, str] | None = None
 # Seccomp cache: None = unchecked, 0 = unavailable, CDLL handle = available.
-_libseccomp_cache = None
+_libseccomp_cache: Any = None
 # ptrace cache: None = unchecked, True/False = probed result. Used by
 # `--audit` to decide whether b2 (syscall audit via SCMP_ACT_TRACE)
 # and b3 (filesystem audit) can engage. Probed by core.sandbox.ptrace_probe.
@@ -44,36 +76,56 @@ _ptrace_available_cache = None
 # under (allow default) baseline succeeds. Set by check_seatbelt_
 # available() in probes.py. Linux hosts always cache False.
 _seatbelt_available_cache = None
+# raptor-gidmap-allow helper: None = unchecked, False = not available,
+# str = resolved absolute path to the binary (with CAP_SETGID confirmed).
+_gidmap_allow_cache = None
 # User-supplied rlimit overrides from ~/.config/raptor/sandbox.json.
-# `_user_limits_cache_decided_at` carries the wall-clock when the
-# cache was last populated FROM THE FAILURE PATH (parse error,
-# missing file, non-regular file). Pre-fix that path stored `{}` and
+# `_user_limits_cache_decided_at` carries the monotonic time when the
+# cache decision was made. FAILURE paths (parse error, missing file,
+# non-regular file, or rejected known values with no usable overrides)
+# stamp time.monotonic(): pre-fix they stored `{}` and
 # never re-read — operators correcting a malformed sandbox.json had
 # to restart every RAPTOR process to pick up the fix. `_FAIL_TTL_S`
-# bounds the negative cache so a corrected file is honoured within a
-# reasonable window. Successful loads keep no TTL; the assumption is
-# that the operator who edits the config will accept restarting (or
-# clearing the cache via tests / `state._user_limits_cache = None`).
+# bounds that negative cache so a corrected file is honoured within a
+# reasonable window. SUCCESSFUL loads stamp +inf — no TTL (session
+# cache; the operator who edits the config accepts restarting, or
+# clearing the cache via tests / `state._user_limits_cache = None`) —
+# which also keeps a valid config that yields no recognised keys
+# (empty dict) distinguishable from the empty-dict failure sentinel.
 _user_limits_cache = None
 _user_limits_cache_decided_at = 0.0
 # Resolved absolute paths to sandbox-setup binaries. We use absolute paths
 # to prevent PATH hijacking — a polluted PATH (e.g., a malicious .envrc
 # that direnv activated, or `.` in the user's PATH) could otherwise
-# shadow these with attacker binaries. unshare/prlimit are resolved for
-# the namespace-creation step; mount/mkdir for the mount-script setup
+# shadow these with attacker binaries. unshare is resolved for the
+# namespace engagement probe; mount/mkdir for the mount-script setup
 # (only active when mount-ns is available, e.g. not on Ubuntu 24.04 with
 # kernel.apparmor_restrict_unprivileged_userns=1).
 # All are resolved against a hardcoded safe bin-dir list, not PATH.
 _unshare_path_cache = None
-_prlimit_path_cache = None
 _mount_path_cache = None
 _mkdir_path_cache = None
+_sandbox_exec_path_cache = None
+# newuidmap/newgidmap gate the mount-ns tier and are EXECUTED (setuid)
+# in the unsandboxed parent; getcap vouches for the raptor-gidmap-allow
+# helper. Same trusted-dirs resolution as the util-linux binaries above.
+_newuidmap_path_cache = None
+_newgidmap_path_cache = None
+_getcap_path_cache = None
 
 # CLI overrides — set ONLY from entry-point argparse, never from env vars
 # or config files. A malicious .envrc or target repo must not be able to
 # disable its own sandbox.
 _cli_sandbox_disabled = False   # True when --no-sandbox passed
 _cli_sandbox_profile = None     # str profile name when --sandbox <name> passed
+# Consent provenance for an ACCEPTED CLI disable: always "nonce" — a
+# validated minted RAPTOR_NO_SANDBOX_NONCE is the only consent source
+# the gate accepts. None whenever _cli_sandbox_disabled is False.
+# Written ONLY by
+# core.sandbox.cli._set_cli_state — the same entry-point-argparse-only
+# rule as the flags above; the gate that fills it fails closed
+# (core.sandbox.disable_consent.resolve_disable_consent).
+_cli_sandbox_disable_consent: str | None = None
 # Audit flags — orthogonal to profile. `--audit` engages audit mode on
 # the active profile (proxy log-and-allow + SCMP_ACT_TRACE + tracer);
 # `--verbose` (only with --audit) flips the tracer from filtered to
@@ -86,6 +138,31 @@ _cli_sandbox_audit_verbose = False
 # default; positive integer = override. Per-category and per-PID
 # sub-caps scale proportionally inside AuditBudget.__init__.
 _cli_sandbox_audit_budget = None
+# Operator allowlist extensions — the self-service recovery levers for
+# read denials under read-restricting profiles. `--sandbox-readable-path`
+# extends readable_paths on every sandbox() in the process;
+# `--sandbox-tool-path` does the same for tool_paths (read allowlist +
+# mount-ns bind). These LOOSEN isolation, so the same prompt-injection
+# rule applies with extra force: only entry-point argparse sets them,
+# never env/config/repo content. None = no extension; list[str] of
+# validated absolute paths otherwise.
+_cli_sandbox_readable_paths = None
+_cli_sandbox_tool_paths = None
+# Per-run untrusted containment-floor consent: `--sandbox-floor <tier>`
+# (tier label string, e.g. "landlock"; None = flag not passed). The
+# highest-precedence consent surface for the untrusted floor classes
+# (flag > project setting > legacy env var > default-refuse — resolved
+# in core.sandbox.context.resolve_untrusted_floor). Same
+# prompt-injection rule as every slot above: set ONLY from entry-point
+# argparse (core.sandbox.cli.set_cli_sandbox_floor).
+_cli_sandbox_floor: str | None = None
+# Project-surface twin: the active project's registry-validated
+# `sandbox-floor` setting, consumed once at run start by the entry
+# script (core.project.trust.apply_project_sandbox_floor →
+# core.sandbox.cli.set_project_sandbox_floor). Operator-written
+# on-disk project config under ~/.raptor/projects — NEVER read from
+# the scanned repo, never from cwd, and never set by library code.
+_project_sandbox_floor: str | None = None
 
 # Degradation warnings are logged once per process, not once per sandbox()
 # context — kernel capability doesn't change at runtime and scan loops
@@ -95,16 +172,99 @@ _landlock_warned_abi_v4 = False
 _landlock_warned_abi_v3 = False  # TRUNCATE coverage missing (kernel <6.2)
 _landlock_warned_abi_v2 = False  # REFER coverage missing (kernel <5.19)
 _sandbox_unavailable_warned = False
+# AF_UNIX connect scoping unavailable (seccomp user-notify /
+# pidfd_getfd / openat2 missing) — allow_unix downgraded fail-closed.
+_unix_scope_unavailable_warned = False
+# Fresh procfs remount refused inside nested user+pid ns (kernel
+# policy, static per host) — /proc/<ns-pid> ENOENT for ptrace tools
+# in sandboxed children on runs that accept the degrade. Warned once;
+# the per-run stamp pidns_proc_mount_unavailable carries the posture
+# regardless.
+_pidns_proc_mount_unavailable_warned = False
 # Mount-ns unavailable but Landlock did engage — see THREAT_MODEL.md I2-(a).
 # Distinguished from `_mount_unavailable_warned` (which is set by the lower-
 # level mount probe); this flag is for the user-facing warning emitted from
 # the public sandbox() path that names the practical posture and remediation.
 _sandbox_landlock_only_warned = False
+# Namespace-preserving bind-tree fallback. The posture is static enough for a
+# process-level warning; per-call reporting still records every affected run.
+_mountless_backend_warned = False
+# NPROC-pressure twin of the flag above: the bind-tree spawn degraded
+# because the child's forks raced a finite RLIMIT_NPROC (per-uid task
+# count at the ceiling), not because the capability is missing. Its own
+# key so the pressure diagnosis and the genuine capability/policy
+# diagnosis each get their one loud surfacing per process.
+_nproc_pressure_degrade_warned = False
+# Consent banner: a non-default consent source (the
+# RAPTOR_ALLOW_DEGRADED_UNTRUSTED waiver) lowered the untrusted
+# containment floor for this process. Once per process; the per-call
+# consented-degrade warning fires every time the lowered floor bites.
+_floor_lowered_banner_warned = False
+# Explicit-surface twins of the consent banner above: the per-run
+# --sandbox-floor flag / the project sandbox-floor setting is the
+# in-force floor source for this process's untrusted-class calls.
+_floor_flag_banner_warned = False
+_floor_project_banner_warned = False
+# Host-consent twins: the WSL host-consent marker is the in-force
+# floor source. Banner once per process, AND — unlike the other
+# consent sources, whose consented-degrade warning fires per call —
+# the per-call degrade warning collapses to one notice per process:
+# under the marker EVERY untrusted call on the host runs at ns-only,
+# so per-call reporting is pure spam carrying no new information.
+_floor_host_banner_warned = False
+_floor_host_degrade_notice_warned = False
+# Disagreement banner: two consent surfaces named DIFFERENT untrusted
+# floors and the higher-precedence one won (flag > project > env var).
+# Once per process, naming both surfaces and both values.
+_floor_surface_disagreement_warned = False
+# inherit_netns=True dropped the network namespace from a
+# block_network run (sanctioned for netns-coordinator paired runs;
+# a host-netns caller lost the requested block). Once per process;
+# the per-run netns_inherited posture stamp records every instance.
+_inherit_netns_block_warned = False
+# The mountless namespace backend left the achievable set for a call
+# (Landlock ABI below 3 with untrusted/read-restricted write policy)
+# and the demotion continued down the ladder. Once per process; the
+# per-run mount_ns_degraded stamp records every instance.
+_mountless_unachievable_warned = False
+_bare_run_posture_warned = False
 _net_and_tcp_allowlist_warned = False
+# Degraded-mode Landlock TCP-connect deny (block_network without a
+# namespace backend): engaged one-shot warning. When the degraded deny
+# CANNOT engage either, the context refuses the run outright — unless
+# the operator accepted the degraded tier via
+# RAPTOR_ALLOW_DEGRADED_UNTRUSTED, which downgrades the refusal to the
+# second one-shot warning here.
+_degraded_tcp_deny_warned = False
+_degraded_net_open_override_warned = False
+# Landlock-less kernel accepted via RAPTOR_ALLOW_DEGRADED_UNTRUSTED
+# (construction-time enforceability arm).
+_degraded_landlock_override_warned = False
+# Per-call demotion twins of the two construction-time degraded-net
+# arms above (the plain-lane fallback for a namespace-shaped call).
+_demoted_tcp_deny_warned = False
+_demoted_net_open_override_warned = False
+# Trusted-floor Landlock-absence tolerance bit on a policy-carrying
+# call (the requested fs/TCP policy is unenforced on the ns-only lane).
+_tolerated_policy_unenforced_warned = False
+# Egress-proxy tier 2 engaged (Landlock TCP port pin, no netns bridge):
+# the pin is port-scoped, not (host, port)-scoped — weaker guarantee
+# than the netns tier; warned once per process at engagement.
+_proxy_tier2_port_pin_warned = False
 _seccomp_arch_missing_warned = False
+# A REQUESTED seccomp profile could not engage (libseccomp missing or
+# non-functional) on a warn-tier posture: the filter builder returns
+# None and the child runs FILTERLESS. Fail-closed postures (strict,
+# run_untrusted*) refuse before reaching the builder; this latch is the
+# loud once-per-process notice for the default run()/sandbox() paths.
+_seccomp_filter_lost_warned = False
 _mount_unavailable_warned = False
 _ptrace_unavailable_warned = False
+# Set once when check_unshare_engages returns None (the probe couldn't RUN —
+# transient load) and the gate proceeds leniently instead of failing loud.
+_engage_probe_indeterminate_warned = False
 _audit_warned_no_spawn = False
+_gidmap_allow_warned_missing = False
 # NOTE: B's mount-ns Landlock fallback logs at DEBUG (no warn-once
 # flag needed — workflow proceeds correctly at Landlock-only, same
 # posture as Ubuntu defaults). The speculative-C retry uses the
@@ -126,6 +286,23 @@ _audit_warned_no_spawn = False
 _speculative_failure_cache: dict = {}
 
 
+def _require_warn_flag(mod, flag_name: str) -> None:
+    """AttributeError-on-typo defense: if a caller passes a flag name
+    that doesn't exist on this module (typo, refactor missed an
+    update), the bare getattr would raise an opaque AttributeError
+    from inside state.py. Surface a clearer error that names the
+    offending flag so the caller can find their typo immediately."""
+    if not hasattr(mod, flag_name):
+        msg = (
+            f"warn_once: unknown flag {flag_name!r}. Add to "
+            f"core/sandbox/state.py module-level globals before "
+            f"using. (Likely a typo — flag names embed 'warned', "
+            f"most as `_<feature>_<reason>_warned`, some as "
+            f"`_<feature>_warned_<reason>`.)"
+        )
+        raise AttributeError(msg)
+
+
 def warn_once(flag_name: str) -> bool:
     """Atomic test-and-set for a module-level warn-once flag.
 
@@ -140,20 +317,28 @@ def warn_once(flag_name: str) -> bool:
     import sys
     mod = sys.modules[__name__]
     with _cache_lock:
-        # AttributeError-on-typo defense: if a caller passes a flag
-        # name that doesn't exist on this module (typo, refactor
-        # missed an update), the bare getattr would raise an opaque
-        # AttributeError from inside state.py. Surface a clearer
-        # error that names the offending flag so the caller can
-        # find their typo immediately.
-        if not hasattr(mod, flag_name):
-            raise AttributeError(
-                f"warn_once: unknown flag {flag_name!r}. Add to "
-                f"core/sandbox/state.py module-level globals before "
-                f"using. (Likely a typo — most flag names follow "
-                f"the `_<feature>_warned_<reason>` pattern.)"
-            )
+        _require_warn_flag(mod, flag_name)
         if getattr(mod, flag_name):
             return False
         setattr(mod, flag_name, True)
         return True
+
+
+def reset_warn_once(flag_name: str) -> None:
+    """Reset a warn-once latch to its unfired state.
+
+    Test-support API. The latches are once-per-PROCESS by design
+    (kernel capability and tier engagement don't change at runtime),
+    which makes any test that asserts on the warning itself
+    order-dependent: an earlier consumer anywhere in the same process
+    — including test directories whose conftest doesn't snapshot this
+    module's flags — eats the once. A test asserting warn-once
+    behaviour calls this first so it controls its own latch state
+    regardless of suite order. Same typo defense and locking as
+    :func:`warn_once`.
+    """
+    import sys
+    mod = sys.modules[__name__]
+    with _cache_lock:
+        _require_warn_flag(mod, flag_name)
+        setattr(mod, flag_name, False)

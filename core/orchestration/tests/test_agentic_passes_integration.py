@@ -7,6 +7,10 @@ satisfy the bridge's tier-2 sibling discovery — the actual claim the
 lifecycle-proper rewrite makes.
 """
 
+from pkgutil import resolve_name as _mock_owner
+from core.testing.module_bindings import mock_module_attribute
+
+
 import json
 import os
 import unittest
@@ -18,20 +22,59 @@ from core.orchestration.agentic_passes import (
     run_understand_prepass,
     run_validate_postpass,
 )
-from core.orchestration.understand_bridge import find_understand_output, load_understand_context
+from core.orchestration.understand_bridge import (
+    find_understand_output,
+    load_understand_context,
+)
+import pytest
+
+from core.testing.module_bindings import patch_module_attribute
+
+
+@pytest.fixture(autouse=True)
+def _isolate_subprocess_run_patches(monkeypatch):
+    """Keep subprocess run mocks on consumer-owned module bindings."""
+    import core.orchestration.skill_dispatch as consumer_0
+
+    patch_module_attribute(
+        monkeypatch, consumer_0, "subprocess", "run", consumer_0.subprocess.run,
+    )
+
+
+# Dispatch here is stubbed/mocked — pass wiring is under test, so the
+# transport kill switch the root conftest sets is cleared for this
+# module.
+pytestmark = pytest.mark.usefixtures("cc_spawn_machinery_enabled")
 
 # Assume interactive — these tests exercise pass mechanics, not Rule of Two.
 _interactive_patch = None
+_xdg_tmp: TemporaryDirectory | None = None
+_xdg_patch = None
 
 def setUpModule():
-    global _interactive_patch
-    _interactive_patch = patch(
-        "core.security.rule_of_two.is_interactive", return_value=True,
-    )
-    _interactive_patch.start()
+    global _interactive_patch, _xdg_tmp, _xdg_patch
+    from core.testing.module_scope import module_fixture_setup, start_module_patch
+
+    with module_fixture_setup(globals(), ('_interactive_patch', '_xdg_tmp', '_xdg_patch')) as cleanup:
+        # Force the agentic-pass gate open: mock the human-terminal leg True so
+        # the full pass path runs under CI/pytest (no controlling terminal).
+        _interactive_patch = patch(
+            "core.security.rule_of_two._session_has_human_terminal",
+            return_value=True,
+        )
+        start_module_patch(cleanup, _interactive_patch)
+        # Checklist frames are MAC-stamped at the write chokepoint, keyed
+        # off $XDG_DATA_HOME/raptor/checklist-frame-mac.key. Pin the key
+        # dir for the whole module so (a) stamping never mints the
+        # developer's real key and (b) the per-test HOME patches don't
+        # move the key path between the stamp and the read.
+        _xdg_tmp = TemporaryDirectory(prefix="agentic-passes-xdg-")
+        cleanup.callback(_xdg_tmp.cleanup)
+        _xdg_patch = patch.dict(os.environ, {"XDG_DATA_HOME": _xdg_tmp.name})
+        start_module_patch(cleanup, _xdg_patch)
 
 def tearDownModule():
-    _interactive_patch.stop()
+    globals()["_module_fixture_scope"].close()
 
 
 def _make_target(tmp: Path) -> Path:
@@ -46,15 +89,20 @@ def _make_target(tmp: Path) -> Path:
 
 def _make_agentic_out(tmp: Path, target: Path) -> Path:
     """Create a fake agentic out_dir with a checklist that references target."""
+    from core.inventory import save_checklist
+
     out_dir = tmp / "agentic_run"
     out_dir.mkdir()
-    (out_dir / "checklist.json").write_text(json.dumps({
+    # Write through the stamping chokepoint: a raw write_text frame
+    # carries no MAC token and every gated reader downstream (prepass
+    # reuse, bridge discovery) refuses it.
+    save_checklist(out_dir, {
         "target_path": str(target),
         "files": [{
             "path": "handler.py",
             "items": [{"name": "handle_request", "line": 1}],
         }],
-    }))
+    })
     # Mark this dir as command_type=agentic so infer_command_type works correctly.
     (out_dir / ".raptor-run.json").write_text(json.dumps({
         "command": "agentic",
@@ -118,10 +166,12 @@ class PrepassIntegrationTests(unittest.TestCase):
                 "RAPTOR_OUT_DIR": str(tmp / "out"),
             })
             with env_patch, \
-                 patch("core.orchestration.agentic_passes.subprocess.run",
+                 mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=sub_disp), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=sbx_disp):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=sbx_disp), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 result = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -149,7 +199,7 @@ class PrepassIntegrationTests(unittest.TestCase):
             # from a sibling validate-style dir.
             sibling_validate = understand_dir.parent / "validate-sibling"
             sibling_validate.mkdir()
-            found, stale = find_understand_output(
+            found, _stale = find_understand_output(
                 sibling_validate, target_path=str(target),
             )
             self.assertEqual(
@@ -189,10 +239,12 @@ class PrepassIntegrationTests(unittest.TestCase):
                 "RAPTOR_OUT_DIR": str(tmp / "out"),
             })
             with env_patch, \
-                 patch("core.orchestration.agentic_passes.subprocess.run",
+                 mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=sub_disp), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=sbx_disp):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=sbx_disp), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 prepass = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -253,10 +305,12 @@ class PrepassIntegrationTests(unittest.TestCase):
                 "RAPTOR_OUT_DIR": str(tmp / "out"),
             })
             with env_patch, \
-                 patch("core.orchestration.agentic_passes.subprocess.run",
+                 mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=sub_disp), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=sbx_disp):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=sbx_disp), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 result = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -311,10 +365,12 @@ class PostpassIntegrationTests(unittest.TestCase):
                 claude_writes={"context-map.json": ctx_map_payload},
             )
             with env_patch, \
-                 patch("core.orchestration.agentic_passes.subprocess.run",
+                 mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=sub_disp1), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=sbx_disp1):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=sbx_disp1), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 prepass = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -331,10 +387,12 @@ class PostpassIntegrationTests(unittest.TestCase):
                 claude_writes={"validation-report.md": "# Validation\n"},
             )
             with env_patch, \
-                 patch("core.orchestration.agentic_passes.subprocess.run",
+                 mock_module_attribute(_mock_owner('core.orchestration.skill_dispatch'), 'subprocess', 'run',
                        side_effect=sub_disp2), \
-                 patch("core.orchestration.agentic_passes.run_untrusted_networked",
-                       side_effect=sbx_disp2):
+                 patch("core.orchestration.skill_dispatch.run_untrusted_networked",
+                       side_effect=sbx_disp2), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 postpass = run_validate_postpass(
                     target=target, agentic_out_dir=agentic_out,
                     analysis_report=report, claude_bin="/fake/claude",

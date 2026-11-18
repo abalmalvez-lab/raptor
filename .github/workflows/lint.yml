@@ -16,135 +16,72 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  PYTHON_VERSION: '3.12'
+  PYTHON_VERSION: '3.14'
   VENV_PATH: .venv
 
 permissions:
   contents: read
-  # Needed by the pre_check job to query prior workflow runs at the
-  # current SHA via ``gh api repos/.../actions/runs``.
-  actions: read
 
 jobs:
-  # Same dedup pattern as tests.yml — skip a duplicate run of the same
-  # SHA. Inlined rather than refactored into a reusable composite so
-  # each workflow stays self-contained (raptor convention).
-  pre_check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      should_skip: ${{ steps.dup.outputs.should_skip }}
-    steps:
-      - id: dup
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          WORKFLOW: ${{ github.workflow }}
-          SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-          should_skip=false
-          # Never dedup forced-full events: the operator triggered them
-          # deliberately (cron, manual dispatch) or the merge queue needs
-          # an authoritative pass.
-          if [[ "$EVENT" != "schedule" && "$EVENT" != "workflow_dispatch" \
-             && "$EVENT" != "merge_group" ]]; then
-            dup=$(gh api -X GET "repos/${REPO}/actions/runs" \
-                    -f "head_sha=${SHA}" -f "status=success" \
-                    --jq ".workflow_runs[] | select(.name==\"${WORKFLOW}\" and .id != ${RUN_ID}) | .id" \
-                  | head -n1 || true)
-            if [[ -n "${dup:-}" ]]; then
-              should_skip=true
-              echo "Skipping: prior successful run ${dup} already covered SHA ${SHA}"
-            fi
-          fi
-          echo "should_skip=${should_skip}" >> "$GITHUB_OUTPUT"
-
-  # PR diff gate (blocking). Lints ONLY the .py files the PR touches.
-  # This is the required-status-check used by branch protection. A
-  # pre-existing violation in unrelated tree files never blocks an
-  # unrelated PR; only what the PR adds/modifies is judged.
+  # PR diff gate (blocking). Lints changed Python, stub and notebook files;
+  # configuration, deletions and uncertain inputs retain full-tree coverage.
+  # Known changes with no Ruff inputs skip this job. A
+  # Ordinary source edits stay bounded to their changed files; configuration
+  # and uncertain inputs run the full audit before merging.
   #
   # Runs on ``pull_request`` and ``merge_group`` so the same job name
   # satisfies branch-protection's "required status check" both at PR
   # review time and at merge-queue commit time.
   ruff-pr:
-    needs: pre_check
-    if: needs.pre_check.outputs.should_skip != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: [command-metadata]
+    if: >-
+      !cancelled() && needs.command-metadata.outputs.ruff_run == 'true' &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Need merge-base history for ``git diff origin/main...HEAD``.
-          # Depth 200 covers any sane PR; shallower clones miss the base.
-          fetch-depth: 200
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # was v8.1.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
 
       - name: Install ruff
         run: |
-          # Install only ruff (not full requirements-dev.txt) to keep
-          # this job fast and to avoid pulling pytest et al. just to
-          # lint. ruff is pinned to 0.15.12 in requirements-dev.txt —
-          # grep + uv pip install keeps a single source of truth.
+          # Install only ruff (not the full dev set) to keep this job
+          # fast. The pin lives in pyproject.toml — grep keeps a single
+          # source of truth.
           uv venv $VENV_PATH
           source $VENV_PATH/bin/activate
-          uv pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+          uv pip install "$(grep -oE 'ruff==[0-9.]+' pyproject.toml)"
 
-      - name: Compute changed Python files
-        id: changed
-        run: |
-          set -euo pipefail
-          # Fetch main's tip — needed for the merge-base diff. Best-
-          # effort; ``fetch-depth: 200`` above usually already covers it.
-          git fetch origin main:refs/remotes/origin/main --depth=200 2>/dev/null \
-            || git fetch origin main --depth=200 2>/dev/null \
-            || true
-          # Compute changed .py files vs the merge base with origin/main.
-          # Single source for both pull_request and merge_group events —
-          # avoids event-shape branching (pull_request.base.sha vs
-          # merge_group.base_sha).
-          BASE_SHA=$(git merge-base HEAD origin/main 2>/dev/null || echo "")
-          if [[ -z "$BASE_SHA" ]]; then
-            # Shouldn't happen with fetch-depth: 200, but degrade
-            # gracefully by linting the whole touched-by-HEAD tree.
-            echo "WARN: no merge-base found; linting all .py files in HEAD" >&2
-            CHANGED="."
-          else
-            CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA"...HEAD -- '*.py' | tr '\n' ' ')
-          fi
-          echo "files=${CHANGED}" >> "$GITHUB_OUTPUT"
-          echo "Changed .py files vs origin/main: ${CHANGED:-<none>}"
+      - name: Select Ruff inputs
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: python3 .github/scripts/ruff_scope.py --files-out "$RUNNER_TEMP/ruff-files.nul"
 
-      - name: Run ruff (PR diff only)
-        if: steps.changed.outputs.files != ''
+      - name: Run ruff (selected inputs)
         run: |
           source $VENV_PATH/bin/activate
-          # Same rule set as the full-tree audit below — F401 (unused
-          # import), F811 (redef of unused name), F821 (undefined name),
-          # F841 (unused local variable). Limited to the .py files the
-          # PR touches so pre-existing violations elsewhere don't block
-          # unrelated PRs. The weekly ``ruff-tree`` audit (below) is the
-          # safety net for tree-wide drift.
-          ruff check --select F401,F811,F821,F841 \
-            --output-format=github \
-            ${{ steps.changed.outputs.files }}
+          xargs -0 -r ruff check --output-format=github -- < "$RUNNER_TEMP/ruff-files.nul"
 
   # Full-tree audit (informational). Runs on ``push: main``,
   # ``schedule`` (weekly), and ``workflow_dispatch``. Catches drift the
@@ -156,39 +93,230 @@ jobs:
   # NOT a required status check — failure here means "drift, fix when
   # convenient" rather than "this PR is broken." Branch protection
   # gates on ``ruff-pr`` only.
+  #
+  # Full-tree auditing owns main pushes affecting Ruff inputs and deliberate full runs.
+  # A successful PR diff-only lint run cannot replace this coverage.
   ruff-tree:
-    needs: pre_check
-    if: needs.pre_check.outputs.should_skip != 'true' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [command-metadata]
+    if: >-
+      !cancelled() && needs.command-metadata.outputs.ruff_run == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # was v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # was v8.1.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            uv.toml
 
       - name: Install ruff
         run: |
           uv venv $VENV_PATH
           source $VENV_PATH/bin/activate
-          uv pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+          uv pip install "$(grep -oE 'ruff==[0-9.]+' pyproject.toml)"
 
       - name: Run ruff (full tree)
         run: |
           source $VENV_PATH/bin/activate
-          # Full-tree pass. F401,F811,F821,F841 matches the PR-diff
-          # gate's rule selection. E501 (3,204 default-88 violations)
-          # deferred until a separate line-length-policy decision per
-          # notes/_judge/W14-E1-lint-ci-gate-design.md.
-          ruff check --select F401,F811,F821,F841 \
-            --output-format=github \
+          # Rule selection lives in root pyproject.toml.
+          ruff check --output-format=github \
             .
+
+  # Slash-command metadata: enforces every .claude/commands/*.md has a
+  # parseable ``dispatch:`` frontmatter (target exists on disk) and that
+  # commands.md's hardcoded exclusion list matches the frontmatter
+  # ``exclude_from_listing: true`` flags. Catches renamed libexec paths,
+  # missing dispatch fields on new commands, and alias-list drift at PR
+  # time — see CLAUDE.md SLASH-COMMAND DISPATCH for the design.
+  #
+  # Pure stdlib Python; no setup beyond checkout.
+  command-metadata:
+    outputs:
+      ruff_run: ${{ steps.ruff_scope.outputs.ruff_run }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
+
+      - name: Resolve verified push base
+        id: push_base
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci_push_base.py --workflow lint.yml
+
+      - name: Select Ruff work before allocating lint runners
+        id: ruff_scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name != 'push' && (github.event.pull_request.base.sha || github.event.merge_group.base_sha) || steps.push_base.outputs.base }}
+        run: python3 .github/scripts/ruff_scope.py
+
+      - name: Lint slash-command metadata
+        run: python3 .github/scripts/check_command_metadata.py
+
+      - name: Record verified push scope v1
+        if: github.event_name == 'push'
+        run: echo 'Cumulative push scope completed.'
+
+  # Repo-invariant detectors as a PR gate. Every detector below also
+  # runs in the daily scheduled sweep (miswiring-scan.yml, kept as
+  # belt-and-braces + the stale-baseline triage surface; the two step
+  # lists are parity-pinned by test_ci_controls_docs — hand-counted
+  # copies of this set had already drifted), but schedule-only
+  # coverage means a change that
+  # introduces a NEW finding merges green and turns main red at the
+  # next morning's scan — a delayed failure attributed to the scan,
+  # not to the change that caused it. Running them here closes that
+  # gap at review time.
+  #
+  # Keep the workflow and all other invariant detectors global. Only
+  # env-docs and the ReDoS rider use reviewed input-family gates from the
+  # same job; unknown history and scheduled/manual runs retain
+  # both. Documentation references still matter to the miswiring detector.
+  #
+  # Pure stdlib Python plus pytest for the ReDoS rider. Allow ten minutes
+  # for the global checks; each selected detector reports its own failure.
+  repo-invariants:
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve verified push base
+        id: push_base
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci_push_base.py --workflow lint.yml
+
+      - name: Select invariant steps from complete changes
+        id: invariant_scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name != 'push' && (github.event.pull_request.base.sha || github.event.merge_group.base_sha) || steps.push_base.outputs.base }}
+        run: python3 .github/scripts/repo_invariant_scope.py
+
+      # Invocations are verbatim (no flags, pipes, or wrappers) so a
+      # failure surfaces each detector's own report unfiltered, and
+      # local reproduction is exactly the command shown in the log.
+      - name: Run miswiring detector against baseline
+        run: python3 .github/scripts/check_miswiring.py
+
+      - name: Run env-var documentation drift check
+        if: ${{ steps.invariant_scope.outputs.env_docs_run != 'false' }}
+        run: python3 .github/scripts/check_env_docs.py
+
+      - name: Run vocabulary-list guardrail against baseline
+        run: python3 .github/scripts/check_vocab_lists.py
+
+      - name: Run canonical-JSON guardrail against baseline
+        run: python3 .github/scripts/check_canonical_json.py
+
+      - name: Run optional-dep import lint against baseline
+        run: python3 .github/scripts/check_optional_dep_imports.py
+
+      - name: Run report-writer closure gate against baseline
+        run: python3 .github/scripts/check_report_writer_closure.py
+
+      - name: Run console-chokepoint closure gate
+        run: python3 .github/scripts/check_console_chokepoint.py
+
+      - name: Run workflow pipefail lint against baseline
+        run: python3 .github/scripts/check_workflow_pipefail.py
+
+      - name: Run tracked-file census over the rule-pack subsystems
+        # --require-git: CI runs post-checkout, so the exported-tree
+        # notice arm must never be reachable here.
+        run: python3 .github/scripts/check_tracked_file_census.py --require-git
+
+      - name: Run run-dir read census against baseline
+        run: python3 .github/scripts/check_run_dir_reads.py
+
+      # The ReDoS idiom census rides this job rather than keeping its
+      # own single-step job in tests.yml: same whole-repo-invariant
+      # shape (its universe is the runtime tree), same checkout, and
+      # this job's no-paths-filter trigger is a superset of the old
+      # import-graph gate — every runtime-source PR still runs it.
+      # It is a pytest suite, not a check_*.py detector, so it sits
+      # outside the daily-sweep parity set above.
+      - name: Install pytest
+        if: ${{ steps.invariant_scope.outputs.redos_run != 'false' }}
+        # grep + pip install keeps pyproject.toml the single source
+        # of truth for the pytest pin (the ruff idiom above).
+        run: pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
+
+      - name: Run ReDoS idiom census
+        id: redos_census
+        if: ${{ steps.invariant_scope.outputs.redos_run != 'false' }}
+        env:
+          RAPTOR_MAX_SESSION_SECONDS: '120'
+        run: |
+          python -m pytest .github/tests/test_redos_idiom_census.py -q \
+            --junitxml="$RUNNER_TEMP/redos-census.xml"
+
+      - name: Require complete ReDoS census execution
+        if: ${{ !cancelled() && (steps.redos_census.outcome == 'success' || steps.redos_census.outcome == 'failure') }}
+        run: |
+          python3 .github/scripts/check_skip_budget.py --lane redos-census --full \
+            --junit-xml "$RUNNER_TEMP/redos-census.xml"
+
+  # Aggregate gate — gives GitHub a single job name to anchor the
+  # workflow result on. Without this, a run where all real jobs are
+  # legitimately skipped by event/path filters has no successful job and GitHub
+  # reports the workflow as failed/skipped, firing notification emails.
+  lint-passed:
+    name: lint-passed
+    if: always()
+    needs: [ruff-pr, ruff-tree, command-metadata, repo-invariants]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify all jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Job results: ${RESULTS}"
+          ok=1
+          for r in ${RESULTS}; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::A lint job reported '${r}'"; ok=0 ;;
+            esac
+          done
+          [ "$ok" -eq 1 ] || exit 1
+          echo "Lint passed or was legitimately skipped."

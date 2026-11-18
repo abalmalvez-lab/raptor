@@ -39,20 +39,23 @@ the family stay in lock-step.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
+
+from core.run.finding_status import read_verdict
 
 from . import _MAX_REASONING_CHARS
+from ._batch import record_event_batch
 from .scorecard import EventType, ModelScorecard
 
 logger = logging.getLogger(__name__)
 
 
 def record_consensus_outcomes(
-    scorecard: Optional[ModelScorecard],
+    scorecard: ModelScorecard | None,
     *,
-    correlation: Dict[str, Any],
-    results_by_id: Dict[str, Dict],
-    per_finding_results: Optional[Dict[str, Any]] = None,
+    correlation: dict[str, Any],
+    results_by_id: dict[str, dict],
+    per_finding_results: dict[str, Any] | None = None,
     decision_class_prefix: str = "agentic",
 ) -> int:
     """Walk a correlation result; record one
@@ -82,10 +85,11 @@ def record_consensus_outcomes(
     prefilter producer's ``agentic:<rule_id>`` cell shape so consensus
     and prefilter signals share the same cell.
 
-    Failure path: any per-event ``record_event`` exception is logged
-    at debug level and swallowed; one bad event must not abort the
-    whole batch and must never block the calling orchestrator's
-    flow. Operators who care will see the per-event log line.
+    Failure path: events are written as ONE batched
+    ``record_events`` cycle; if the batch is rejected, the producer
+    degrades to per-event writes with per-event WARNING + swallow —
+    one bad event must not abort the rest and must never block the
+    calling orchestrator's flow.
     """
     if scorecard is None or not correlation:
         return 0
@@ -94,20 +98,31 @@ def record_consensus_outcomes(
     if not matrix:
         return 0
 
-    n_recorded = 0
+    pending: list[dict[str, Any]] = []
     for fid, per_model in matrix.items():
         if confidence.get(fid) != "disputed":
             continue
 
-        verdicts: Dict[str, bool] = {}
+        verdicts: dict[str, bool] = {}
         for model, mr in per_model.items():
-            v = mr.get("is_exploitable")
+            # Tri-state read: a result missing the verdict, an
+            # explicit None (handler error / schema failure), or a
+            # junk shape ("false", "no", 1) that bypassed response
+            # validation is an ABSTENTION — the model cast no vote.
+            # bool()-coercing junk minted phantom True votes that
+            # both flipped the panel majority and marked the honest
+            # dissenter ``incorrect``. Same abstention rule as
+            # ``tally_verdict_votes`` in
+            # packages/llm_analysis/correlation.py — kept local
+            # deliberately (a core/llm producer importing
+            # packages.llm_analysis would invert the layering,
+            # and per-model attribution needs the verdict map,
+            # not just counts); do NOT "unify" this onto the
+            # shared tally without solving both.
+            v = read_verdict(mr, "is_exploitable")
             if v is None:
-                # Result missing the verdict (handler error / schema
-                # failure); can't classify against majority, skip
-                # this model for this finding.
                 continue
-            verdicts[str(model)] = bool(v)
+            verdicts[str(model)] = v
         if len(verdicts) < 2:
             # Need at least two models with verdicts to define a
             # majority direction. ``confidence == "disputed"`` should
@@ -145,53 +160,45 @@ def record_consensus_outcomes(
         for model, verdict in verdicts.items():
             with_majority = (verdict == majority_says_exploitable)
             outcome = "correct" if with_majority else "incorrect"
+            # This model's per-finding result — used both for the resolved
+            # model snapshot (model_version) and, on disagreement, the sample.
+            this_model_result = next(
+                (r for r in this_finding_per_model
+                 if str(r.get("analysed_by") or r.get("model") or "") == model),
+                None,
+            )
+            # Concrete snapshot the provider served (e.g. gemini-2.5-pro-002);
+            # None when unavailable so the cell stays alias-keyed, never guessed.
+            model_version = (this_model_result or {}).get("resolved_model")
             sample = None
-            if outcome == "incorrect":
+            if outcome == "incorrect" and this_model_result is not None:
                 # Capture the minority model's OWN reasoning. If we
                 # can't find it in ``per_finding_results`` (caller
                 # didn't supply, or the per-model record is missing),
                 # skip the sample rather than fall back to the
                 # primary's reasoning — that would mis-attribute the
                 # majority's text to the dissenter.
-                this_model_result = next(
-                    (r for r in this_finding_per_model
-                     if str(r.get("analysed_by") or r.get("model") or "") == model),
-                    None,
+                reasoning = str(this_model_result.get("reasoning") or "")
+                truth_label = (
+                    f"majority of {len(verdicts)} models voted "
+                    f"{'exploitable' if majority_says_exploitable else 'not exploitable'}"
                 )
-                if this_model_result is not None:
-                    reasoning = str(this_model_result.get("reasoning") or "")
-                    sample = {
-                        "this_reasoning": reasoning[:_MAX_REASONING_CHARS],
-                        "other_reasoning": (
-                            f"majority of {len(verdicts)} models voted "
-                            f"{'exploitable' if majority_says_exploitable else 'not exploitable'}"
-                        ),
-                    }
-            try:
-                scorecard.record_event(
-                    decision_class=decision_class,
-                    model=model,
-                    event_type=EventType.MULTI_MODEL_CONSENSUS,
-                    outcome=outcome,
-                    sample=sample,
-                )
-                n_recorded += 1
-            except Exception as e:                       # noqa: BLE001
-                # WARNING (not DEBUG): operators rarely run with
-                # DEBUG enabled in production, so a regressed
-                # producer would have been invisible. Per-event
-                # failures here are real signal — the scorecard
-                # write path failed for an attributable
-                # (model, decision_class, finding) cell. If this
-                # logs frequently in practice, the underlying issue
-                # (lock contention, disk full, schema corruption)
-                # warrants attention regardless of log volume.
-                logger.warning(
-                    "record_consensus_outcomes: failed to record %s/%s "
-                    "on %s: %s",
-                    model, decision_class, fid, e,
-                )
-    return n_recorded
+                sample = {
+                    "this_reasoning": reasoning[:_MAX_REASONING_CHARS],
+                    "other_reasoning": truth_label,
+                }
+            pending.append({
+                "decision_class": decision_class,
+                "model": model,
+                "event_type": EventType.MULTI_MODEL_CONSENSUS,
+                "outcome": outcome,
+                "model_version": model_version,
+                "sample": sample,
+            })
+    return record_event_batch(
+        scorecard, pending, log=logger,
+        producer="record_consensus_outcomes",
+    )
 
 
 __all__ = ["record_consensus_outcomes"]

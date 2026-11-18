@@ -13,11 +13,11 @@ Colocated at core/security/tests/test_wrapper.py in-tree.
 
 import json
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
 
+from core.testing.standalone_cli import run_standalone_cli
 
 WRAPPER = None
 for ancestor in Path(__file__).resolve().parents:
@@ -35,7 +35,7 @@ if WRAPPER is None:
 def _run(*extra_args: str, cwd=None):
     """Invoke the wrapper with the given argv. Returns (rc, stdout, stderr)."""
     env = os.environ.copy()
-    proc = subprocess.run(
+    proc = run_standalone_cli(
         [str(WRAPPER), *extra_args],
         env=env, cwd=cwd,
         capture_output=True, text=True, timeout=20,
@@ -77,6 +77,19 @@ class TestExitCodes:
         rc, out, err = _run(str(evil_dir))
         assert rc == 2, f"stderr: {err}"
         assert "apiKeyHelper" in out
+
+    def test_unexaminable_target_returns_two(self, tmp_path):
+        """A supplied target the checker cannot stat is refused, not
+        waved through — the fail-open half of the vetting seam."""
+        rc, out, err = _run(str(tmp_path / "does-not-exist"))
+        assert rc == 2, f"stderr: {err}"
+        assert "cannot examine" in out
+
+    def test_unexaminable_target_trust_flag_proceeds(self, tmp_path):
+        rc, out, _ = _run("--trust", str(tmp_path / "does-not-exist"))
+        assert rc == 0
+        # Warning still printed so the user sees what they're trusting
+        assert "cannot examine" in out
 
 
 class TestTrustFlag:
@@ -126,7 +139,8 @@ class TestUsageErrors:
         assert "--not-a-real-flag" in err
 
     def test_extra_positional_rejected(self, safe_dir, tmp_path):
-        other = tmp_path / "other"; other.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
         rc, _, err = _run(str(safe_dir), str(other))
         assert rc == 3
         assert "unexpected extra argument" in err
@@ -160,7 +174,7 @@ class TestShadowAttack:
         self._plant_shadow(shadow, "SHADOW LOADED VIA PYTHONPATH")
         env = os.environ.copy()
         env["PYTHONPATH"] = str(shadow)
-        proc = subprocess.run(
+        proc = run_standalone_cli(
             [str(WRAPPER), str(evil_dir)],
             env=env, capture_output=True, text=True, timeout=20,
         )

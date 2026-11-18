@@ -90,6 +90,16 @@ def test_extract_via_api_accepts_dotted_repo_names(monkeypatch) -> None:
         "cve_diff.diffing.extract_via_api.github_client.get_commit",
         fake_get_commit,
     )
+    # The bundle build also classifies repo shape, whose fetch is
+    # github_client.get_languages — the ONE unmocked leg here made
+    # this test reach the live GitHub API whenever it ran before the
+    # tests that warm the classifier's cache: green-and-fast usually,
+    # a full network timeout under shuffled order (observed 10s and
+    # 20s call phases — straight into the slow-test guard).
+    monkeypatch.setattr(
+        "cve_diff.diffing.extract_via_api.github_client.get_languages",
+        lambda slug: {"JavaScript": 1000},
+    )
     ref = _ref(repo="https://github.com/socketio/engine.io", sha=sha)
     # Should NOT raise — the dotted repo name must round-trip through
     # the slug extractor and reach the API client unchanged.
@@ -201,3 +211,30 @@ def test_extract_via_api_empty_files(monkeypatch) -> None:
     )
     with pytest.raises(AnalysisError, match="no file changes"):
         extract_via_api("CVE-X", _ref(sha=sha))
+
+
+def test_extract_via_api_tolerates_type_drifted_fields(monkeypatch) -> None:
+    """A tampered / contract-drifted response with non-str filename or
+    patch values must skip those entries — never raise AttributeError
+    past the AnalysisError-only handlers of the agreement cross-check
+    (which would convert an auxiliary check into a hard run failure)."""
+    sha = "19be0eaffa3ac7d8eb6784ad9bdbc7d67ed8e619"
+    payload = {
+        "sha": sha,
+        "parents": [{"sha": "feedfacefeedfacefeedfacefeedfacefeedface"}],
+        "files": [
+            {"filename": ["not", "a", "string"], "patch": "@@ -1 +1 @@\n"},
+            {"filename": "src/ok.c", "patch": 12345},   # numeric patch
+            {"filename": "src/foo.c",
+             "patch": "@@ -1,3 +1,3 @@\n-bad\n+good\n"},
+        ],
+    }
+    monkeypatch.setattr(eva_mod.github_client, "get_commit",
+                        lambda slug, s: payload)
+    monkeypatch.setattr(eva_mod.github_client, "get_languages",
+                        lambda slug: {"C": 1000})
+    bundle = extract_via_api("CVE-2016-5195", _ref(sha=sha))
+    paths = [f.path for f in bundle.files]
+    assert paths == ["src/ok.c", "src/foo.c"]
+    # The numeric patch degrades to "no hunks", the good entry survives.
+    assert "+good" in bundle.diff_text

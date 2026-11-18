@@ -18,8 +18,10 @@ dict directly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -62,3 +64,9 @@ class OsvRecord:
     published: datetime | None
     modified: datetime | None
     raw: dict[str, Any]                          # full original JSON
+    # ``upstream`` ids: the vulnerabilities this record derives from.
+    # Distro-scoped databases (Debian/Ubuntu secdb) publish records with
+    # NO aliases and the CVE identity ONLY here — dropping the field
+    # loses the CVE for those records entirely. Defaulted so existing
+    # constructors stay valid.
+    upstream: tuple[str, ...] = ()

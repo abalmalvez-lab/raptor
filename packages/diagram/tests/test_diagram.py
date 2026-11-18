@@ -1,17 +1,19 @@
-#!/usr/bin/env python3
 """Tests for the diagram generation package."""
 
 import json
 from pathlib import Path
 
-from ..sanitize import sanitize, sanitize_id
-from ..findings_summary import generate_verdict_pie, generate_type_pie
-from ..context_map import generate as gen_context_map
-from ..flow_trace import generate as gen_flow_trace
+from ..attack_paths import generate as gen_attack_paths
+from ..attack_paths import generate_single
 from ..attack_tree import generate as gen_attack_tree
-from ..attack_paths import generate as gen_attack_paths, generate_single
+from ..context_map import generate as gen_context_map
+from ..findings_summary import generate_type_pie, generate_verdict_pie
+from ..flow_trace import generate as gen_flow_trace
+from ..graph_memory import generate_diff as gen_graph_diff
+from ..graph_memory import generate_priority_paths as gen_graph_paths
 from ..hypotheses import generate as gen_hypotheses
-from ..renderer import render_directory, render_and_write
+from ..renderer import render_and_write, render_directory
+from ..sanitize import sanitize, sanitize_id
 
 
 def assert_no_mermaid_directive_injection(output: str) -> None:
@@ -325,6 +327,89 @@ class TestContextMap:
         out = gen_context_map(CONTEXT_MAP_FULL)
         assert ".->" in out or "-.->" in out
 
+    def test_blackbox_binary_candidate_flows_are_labelled_as_candidates(self):
+        data = {
+            "meta": {"analysis_mode": "blackbox_binary"},
+            "entry_points": [
+                {
+                    "id": "BEP-1000",
+                    "name": "main",
+                    "file": "/tmp/target",
+                    "address": "0x1000",
+                    "auth_required": None,
+                },
+            ],
+            "sink_details": [
+                {
+                    "id": "BSINK-2000",
+                    "operation": "sym.imp.memcpy",
+                    "file": "/tmp/target",
+                    "address": "0x2000",
+                },
+            ],
+            "interesting_functions": [
+                {"id": "BFN-1000", "name": "main", "address": "0x1000"},
+                {"id": "BFN-1100", "name": "parse", "address": "0x1100"},
+            ],
+            "candidate_flows": [
+                {"source_function": "BFN-1000", "sink": "BSINK-2000", "relationship": "calls"},
+                {"source_function": "BFN-1100", "sink": "BSINK-2000", "relationship": "may_reach"},
+            ],
+        }
+        out = gen_context_map(data)
+        assert "Candidate Call Edges (xref-backed, not taint proof)" in out
+        assert 'BEP-1000 -. "calls candidate" .-> BSINK-2000' in out
+        assert 'BFN-1100 -. "may_reach candidate" .-> BSINK-2000' in out
+        assert "classDef candidate" in out
+        assert "main [PUBLIC]" not in out
+        assert "target@0x1000" in out
+        assert "target@0x2000" in out
+
+    @staticmethod
+    def _blackbox_data(ep_address, fn_address):
+        return {
+            "meta": {"analysis_mode": "blackbox_binary"},
+            "entry_points": [
+                {"id": "EP-001", "name": "main", "address": ep_address}
+            ],
+            "sink_details": [
+                {"id": "SINK-001", "operation": "system", "file": "", "line": ""}
+            ],
+            "interesting_functions": [
+                {"id": "BFN-1000", "name": "main", "address": fn_address}
+            ],
+            "candidate_flows": [
+                {
+                    "source_function": "BFN-1000",
+                    "sink": "SINK-001",
+                    "relationship": "calls",
+                }
+            ],
+        }
+
+    def test_int_address_joins_entry_to_candidate_flow(self):
+        # The entry_by_address join key normalises via _addr, so integer
+        # addresses join like the hex-string addresses the pipeline also
+        # emits. Same address as int on both sides: the flow source must
+        # resolve to the entry-point node, and no duplicate candidate
+        # node may be emitted for the same function.
+        out = gen_context_map(self._blackbox_data(4096, 4096))
+        assert 'EP-001 -. "calls candidate" .-> SINK-001' in out
+        assert "BFN-1000[" not in out
+
+    def test_hex_string_address_join_unchanged(self):
+        out = gen_context_map(self._blackbox_data("0x1000", "0x1000"))
+        assert 'EP-001 -. "calls candidate" .-> SINK-001' in out
+        assert "BFN-1000[" not in out
+
+    def test_candidate_node_int_address_rendered_as_hex(self):
+        # Unmatched candidate function with an int address renders in
+        # hex, consistent with entry-point location formatting.
+        out = gen_context_map(self._blackbox_data(8192, 4096))
+        assert "BFN-1000[" in out
+        assert "0x1000" in out
+        assert "4096" not in out
+
     def test_public_endpoint_labelled(self):
         out = gen_context_map(CONTEXT_MAP_FULL)
         assert "PUBLIC" in out
@@ -351,6 +436,119 @@ class TestContextMap:
         assert '"test>' not in out
         # HTML-escaped angle brackets should be present
         assert "&lt;" in out or "&gt;" in out
+
+    def test_entry_point_name_used_when_route_fields_absent(self):
+        data = {
+            "entry_points": [
+                {"id": "EP-001", "name": "ap_read_request", "file": "server/protocol.c", "line": 803,
+                 "auth_required": False}
+            ],
+        }
+        out = gen_context_map(data)
+        assert "ap_read_request [PUBLIC]" in out
+        assert "? [PUBLIC]" not in out
+
+    def test_html_entities_are_unescaped_before_mermaid_sanitizing(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "name": "ap_read_request"}],
+            "sink_details": [
+                {"id": "SINK-001", "operation": "ap_get_client_block -&gt; proxy body forwarding",
+                 "reaches_from": ["EP-001"]}
+            ],
+        }
+        out = gen_context_map(data)
+        assert "-&gt;" not in out
+        assert "-> proxy body forwarding" in out
+
+    def test_duplicate_boundary_edges_are_deduplicated(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "name": "route"}],
+            "boundary_details": [
+                {"id": "TB-001", "boundary": "routing", "covers": ["EP-001", "EP-001"]},
+                {"id": "TB-002", "boundary": "routing again", "covers": ["EP-001"]},
+            ],
+            "sink_details": [
+                {"id": "SINK-001", "operation": "redirect", "reaches_from": ["EP-001", "EP-001"]},
+            ],
+        }
+        out = gen_context_map(data)
+        assert out.count("EP-001 --> TB-001") == 1
+        assert out.count("TB-001 --> SINK-001") == 1
+        assert out.count("TB-002 --> SINK-001") == 1
+
+    def test_remote_context_filters_local_support_tool_sinks(self):
+        data = {
+            "meta": {"app_type": "http_server", "target": "/src/httpd-2.0.35"},
+            "entry_points": [{"id": "EP-001", "name": "ap_read_request"}],
+            "sink_details": [
+                {"id": "SINK-001", "operation": "strcpy(connecthost, proxyhost)",
+                 "file": "support/ab.c", "line": 1124, "reaches_from": []},
+                {"id": "SINK-002", "operation": "cgi_environment",
+                 "file": "server/util_script.c", "line": 369, "reaches_from": ["EP-001"]},
+            ],
+            "unchecked_flows": [
+                {"entry_point": "EP-001", "sink": "SINK-001", "missing_boundary": "local CLI"},
+                {"entry_point": "EP-001", "sink": "SINK-002", "missing_boundary": "remote flow"},
+            ],
+        }
+        out = gen_context_map(data)
+        assert "support/ab.c" not in out
+        assert "SINK-001" not in out
+        assert "server/util_script.c" in out
+        assert "SINK-002" in out
+
+    def test_c0_control_chars_from_entity_decode_are_stripped(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "name": "before&#9;after&#12;end"}],
+        }
+        out = gen_context_map(data)
+        assert "\t" not in out
+        assert "\x0c" not in out
+        assert "before after end" in out
+
+    def test_entry_label_method_prefix_not_eaten(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "method": "GET", "name": "GETTER"}],
+        }
+        out = gen_context_map(data)
+        assert "GET GETTER" in out
+
+    def test_entry_label_method_already_in_route_not_duplicated(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "method": "GET", "path": "GET /users"}],
+        }
+        out = gen_context_map(data)
+        assert "GET GET /users" not in out
+        assert "GET /users" in out
+
+    def test_non_dict_items_in_lists_are_skipped(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "name": "real"}, "garbage", 42, None],
+            "sink_details": ["bad", {"id": "SINK-001", "operation": "op"}],
+        }
+        out = gen_context_map(data)
+        assert "EP-001" in out
+        assert "SINK-001" in out
+        assert "flowchart LR" in out
+
+    def test_empty_id_entries_do_not_break_class_line(self):
+        data = {
+            "entry_points": [{"name": "no-id"}, {"id": "EP-001", "name": "has-id"}],
+        }
+        out = gen_context_map(data)
+        assert "class ,EP-001" not in out
+        assert "class EP-001 ep" in out
+
+    def test_support_filter_preserves_all_when_only_support_sinks(self):
+        data = {
+            "meta": {"app_type": "http_server"},
+            "entry_points": [{"id": "EP-001", "name": "handler"}],
+            "sink_details": [
+                {"id": "SINK-001", "operation": "run", "file": "support/tool.c", "reaches_from": []},
+            ],
+        }
+        out = gen_context_map(data)
+        assert "SINK-001" in out
 
     def test_sanitized_context_map_is_still_usable_mermaid(self):
         data = {
@@ -560,6 +758,30 @@ class TestForwardReachableBlocks:
         assert any("EP-A" in t for t in titles)
         assert any("EP-B" in t for t in titles)
 
+    def test_titles_with_quote_and_newline_stay_single_line(self):
+        """ep id / host flow raw from the JSON into the section title;
+        both must be sanitised so the title can't span lines or carry
+        raw quotes into the markdown heading."""
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        fr = {
+            "host": 'evil"\nhost',
+            "internal_count": 1, "external_count": 0,
+            "internal_names": ["src/b.py:g@1"],
+            "external_names": [],
+            "truncated": False,
+        }
+        data = {"entry_points": [
+            self._entry(fr=fr, ep_id='EP-1"\n# injected heading'),
+        ]}
+        title, diagram = generate_forward_reachable_blocks(data)[0]
+        assert "\n" not in title
+        assert '"' not in title
+        assert "EP-1" in title
+        assert "host" in title
+        assert diagram.startswith("flowchart TD")
+
     def test_html_special_chars_in_names_get_sanitised(self):
         """Substrate-emitted identities can contain characters that
         Mermaid would interpret as syntax. Names go through sanitize."""
@@ -580,6 +802,108 @@ class TestForwardReachableBlocks:
         assert 'flowchart TD' in diagram
         # The host appears (with sanitisation applied).
         assert "src/a.py" in diagram
+
+
+class TestForwardReachableLabelCleaning:
+    """Host / internal / external labels (and the per-entry section
+    title) route through the same cleaning ``generate()`` applies via
+    ``_text`` — html-unescape + C0 control-char strip + sanitize — not
+    bare ``sanitize()``."""
+
+    def _entry_with_forward(self, fr_overrides=None, ep_overrides=None):
+        fr = {
+            "host": "handle_request",
+            "internal_count": 1,
+            "external_count": 1,
+            "internal_names": ["parse_input"],
+            "external_names": ["libcurl_send"],
+            "truncated": False,
+        }
+        if fr_overrides:
+            fr.update(fr_overrides)
+        ep = {"id": "EP-001", "path": "/api", "forward_reachable": fr}
+        if ep_overrides:
+            ep.update(ep_overrides)
+        return {"entry_points": [ep]}
+
+    def test_host_label_strips_c0_control_chars(self):
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        data = self._entry_with_forward({"host": "evil\x1b[2Jhost\x00name"})
+        blocks = generate_forward_reachable_blocks(data)
+        assert len(blocks) == 1
+        _, diagram = blocks[0]
+        assert "\x1b" not in diagram
+        assert "\x00" not in diagram
+        assert "HOST[" in diagram
+
+    def test_internal_label_strips_c0_control_chars(self):
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        data = self._entry_with_forward(
+            {"internal_names": ["fn\x1b]0;owned\x07name"]}
+        )
+        _, diagram = generate_forward_reachable_blocks(data)[0]
+        assert "\x1b" not in diagram
+        assert "\x07" not in diagram
+        assert 'INT000["fn' in diagram
+
+    def test_external_label_strips_c0_control_chars(self):
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        data = self._entry_with_forward({"external_names": ["dep\x08\x08call"]})
+        _, diagram = generate_forward_reachable_blocks(data)[0]
+        assert "\x08" not in diagram
+        assert 'EXT000[/"dep' in diagram
+
+    def test_forward_labels_html_unescape_like_generate(self):
+        # generate() unescapes entities before re-sanitizing, so a
+        # pre-escaped name collapses to one level of escaping. The
+        # sibling forward renderer must match.
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        data = self._entry_with_forward({"internal_names": ["a &amp; b"]})
+        _, diagram = generate_forward_reachable_blocks(data)[0]
+        assert 'INT000["a &amp; b"]' in diagram
+        assert "&amp;amp;" not in diagram
+
+    def test_forward_labels_still_escape_mermaid_metachars(self):
+        # Regression guard: cleaning must not weaken the existing
+        # metacharacter escaping.
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        data = self._entry_with_forward(
+            {
+                "host": 'h"ost{x}',
+                "internal_names": ["int<b>"],
+                "external_names": ["ext\nline"],
+            }
+        )
+        _, diagram = generate_forward_reachable_blocks(data)[0]
+        assert 'h"ost' not in diagram
+        assert "{x}" not in diagram
+        assert "&lt;b&gt;" in diagram
+        assert "ext line" in diagram
+
+    def test_section_title_strips_c0_control_chars(self):
+        # The "<ep-id>: <host>" markdown heading is built from the same
+        # untrusted fields, so it gets the same treatment.
+        from packages.diagram.context_map import (
+            generate_forward_reachable_blocks,
+        )
+        data = self._entry_with_forward(
+            {"host": "h\x1bost"}, {"id": "EP\x00-001"}
+        )
+        title, _ = generate_forward_reachable_blocks(data)[0]
+        assert "\x1b" not in title
+        assert "\x00" not in title
+        assert "EP" in title
+        assert "ost" in title
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +942,18 @@ class TestFlowTrace:
     def test_empty_steps(self):
         out = gen_flow_trace({"id": "T1", "name": "empty", "steps": []})
         assert "No steps" in out
+
+    def test_empty_steps_trace_id_is_sanitized(self):
+        payload = 'T"]\n    click E javascript:alert(1)'
+        out = gen_flow_trace({"id": payload, "name": "empty", "steps": []})
+        assert_no_mermaid_directive_injection(out)
+        # The whole diagram stays two lines: header + EMPTY node.
+        lines = out.splitlines()
+        assert len(lines) == 2
+        # The quoted label keeps exactly its opening/closing quotes;
+        # the payload's own quote must not survive raw.
+        assert lines[1].count('"') == 2
+        assert 'T"]' not in out
 
     def test_step_chain_edges(self):
         out = gen_flow_trace(FLOW_TRACE_DATA)
@@ -957,6 +1293,71 @@ class TestAttackPaths:
         assert "P0S1 --> P0S2" in out
 
 
+    def test_heading_fields_are_sanitized_and_single_line(self):
+        payload = 'X"\n## injected heading'
+        out = gen_attack_paths([{
+            "id": payload,
+            "name": payload,
+            "status": payload,
+            "proximity": 9,
+            "steps": [{"step": 1, "type": "entry", "description": "e"}],
+        }])
+        # No line of the rendered markdown may start with the injected heading.
+        assert not any(line.startswith("## injected") for line in out.splitlines())
+        # The raw quote must not survive in the heading line.
+        heading_lines = [line for line in out.splitlines() if line.startswith("#### ")]
+        assert len(heading_lines) == 1
+        assert '"' not in heading_lines[0]
+        assert "Proximity 9/10" in heading_lines[0]
+
+    def test_non_numeric_heading_proximity_coerced_to_zero(self):
+        out = gen_attack_paths([{
+            "id": "PATH-X",
+            "name": "path",
+            "status": "uncertain",
+            "proximity": '9"\nevil',
+            "steps": [{"step": 1, "type": "entry", "description": "e"}],
+        }])
+        assert "Proximity 0/10" in out
+        assert "evil" not in out
+
+    def test_non_numeric_call_count_coerced_to_zero(self):
+        out = generate_single({
+            "id": "PATH-X",
+            "name": "path",
+            "status": "confirmed",
+            "steps": [
+                {
+                    "step": 1,
+                    "type": "entry",
+                    "description": "e",
+                    "runtime_evidence": {
+                        "function_observed": True,
+                        "call_count": '1"]\nevil',
+                    },
+                }
+            ],
+        }, 0)
+        assert "Observed x0" in out
+        assert "evil" not in out
+        assert_no_mermaid_directive_injection(out)
+
+    def test_numeric_string_call_count_still_renders(self):
+        out = generate_single({
+            "id": "PATH-X",
+            "name": "path",
+            "status": "confirmed",
+            "steps": [
+                {
+                    "step": 1,
+                    "type": "entry",
+                    "description": "e",
+                    "runtime_evidence": {"function_observed": True, "call_count": "17"},
+                }
+            ],
+        }, 0)
+        assert "Observed x17" in out
+
     def test_step_type_and_location_are_sanitized(self):
         payload = "X\"]\n    click X javascript:alert(1)\n    Y[\""
         out = generate_single({
@@ -1001,6 +1402,95 @@ class TestAttackPaths:
         assert_no_mermaid_directive_injection(out)
         assert_usable_mermaid_flowchart(out)
 
+    def test_non_dict_runtime_evidence_does_not_crash(self):
+        # runtime_evidence comes raw from attack-paths.json; a string
+        # or list value must degrade to "no runtime evidence", not
+        # crash the whole section.
+        for bad in ("frida saw it", ["e1", "e2"], 7, None):
+            out = generate_single({
+                "id": "PATH-X",
+                "name": "path",
+                "status": "confirmed",
+                "steps": [
+                    {
+                        "step": 1,
+                        "type": "entry",
+                        "description": "e",
+                        "runtime_evidence": bad,
+                    }
+                ],
+            }, 0)
+            assert "Observed x" not in out
+            assert_usable_mermaid_flowchart(out)
+
+    def test_runtime_labels_are_title_case(self):
+        out = generate_single({
+            "id": "PATH-X",
+            "name": "path",
+            "status": "confirmed",
+            "runtime_evidence_available": True,
+            "steps": [
+                {
+                    "step": 1,
+                    "type": "entry",
+                    "description": "e",
+                    "runtime_evidence": {
+                        "function_observed": True,
+                        "call_count": 3,
+                    },
+                }
+            ],
+        }, 0)
+        assert "[Runtime Confirmed]" in out
+        assert "Observed x3" in out
+        # Never ALL-CAPS status text in human-readable output.
+        assert "RUNTIME CONFIRMED" not in out
+        assert "OBSERVED" not in out
+
+
+# ---------------------------------------------------------------------------
+# graph memory tests
+# ---------------------------------------------------------------------------
+
+class TestGraphMemory:
+    def test_graph_priority_paths_render_risk_flow(self):
+        out = gen_graph_paths([{
+            "id": "graph-path-EP-001-SINK-001",
+            "entry": {"id": "EP-001", "label": "GET /search", "location": "routes.py:10"},
+            "sink": {"id": "SINK-001", "label": "template render", "location": "views.py:20"},
+            "risk_score": 80,
+            "confidence": "high",
+            "missing_boundary": "No output encoding",
+        }])
+        assert "flowchart LR" in out
+        assert "GET /search" in out
+        assert "template render" in out
+        assert "risk 80" in out
+        assert_no_mermaid_directive_injection(out)
+
+    def test_graph_diff_renders_new_risks(self):
+        out = gen_graph_diff({
+            "is_diffable": True,
+            "base_snapshot": {"id": "snap:old"},
+            "head_snapshot": {"id": "snap:new"},
+            "new_risks": [{
+                "source": "GET /upload",
+                "sink": "filesystem write",
+                "confidence": "high",
+            }],
+            "reachability": {"added": [], "removed": []},
+            "nodes": {"sink": {"added": [{"id": "SINK-2"}], "removed": []}},
+        })
+        assert "flowchart TD" in out
+        assert "New risk" in out
+        assert "GET /upload" in out
+        assert "filesystem write" in out
+        assert_no_mermaid_directive_injection(out)
+
+    def test_graph_diff_not_diffable_renders_reason(self):
+        out = gen_graph_diff({"is_diffable": False, "reason": "need at least two snapshots"})
+        assert "need at least two snapshots" in out
+
 
 # ---------------------------------------------------------------------------
 # renderer tests
@@ -1019,10 +1509,96 @@ class TestRenderer:
         assert "testapp" in out
         assert "```mermaid" in out
 
+    def test_graph_context_map_is_rendered_before_flat_attack_surface(self, tmp_path):
+        attack_surface = {
+            "sources": [{"type": "http_route", "entry": "GET /flat"}],
+            "sinks": [{"type": "db_query", "location": "src/db.py:10"}],
+            "trust_boundaries": [],
+        }
+        graph_map = {
+            "entry_points": [{"id": "EP-001", "name": "ap_read_request"}],
+            "sink_details": [{"id": "SINK-001", "operation": "cgi_environment"}],
+        }
+        self._make_out_dir(tmp_path, {
+            "attack-surface.json": attack_surface,
+            "context-map.graph.json": graph_map,
+        })
+        out = render_directory(tmp_path)
+        assert out.index("Context Map from Graph Memory") < out.index("Attack Surface (Stage B)")
+        assert "_Source: `context-map.graph.json`_" in out
+
+    def test_renderer_target_metadata_filters_support_tools(self, tmp_path):
+        attack_surface = {
+            "sources": [{"type": "http_route", "entry": "GET /"}],
+            "sinks": [
+                {"type": "unsafe_c_string_copy", "location": "support/ab.c:1124 strcpy(connecthost, proxyhost)"},
+                {"type": "cgi_environment", "location": "server/util_script.c:369 QUERY_STRING from r->args"},
+            ],
+            "trust_boundaries": [],
+        }
+        self._make_out_dir(tmp_path, {"attack-surface.json": attack_surface})
+        out = render_directory(tmp_path, target="httpd-2.0.35")
+        assert "support/ab.c" not in out
+        assert "server/util_script.c" in out
+
+    def test_render_directory_with_graph_priority_paths(self, tmp_path):
+        self._make_out_dir(tmp_path, {
+            "graph-priority-paths.json": [{
+                "id": "graph-path-EP-001-SINK-001",
+                "entry": {"id": "EP-001", "label": "GET /search"},
+                "sink": {"id": "SINK-001", "label": "template render"},
+                "risk_score": 80,
+                "confidence": "high",
+                "missing_boundary": "No output encoding",
+            }]
+        })
+        out = render_directory(tmp_path)
+        assert "Graph Priority Paths" in out
+        assert "GET /search" in out
+        assert "template render" in out
+
+    def test_render_directory_with_graph_diff(self, tmp_path):
+        self._make_out_dir(tmp_path, {
+            "graph-diff.json": {
+                "is_diffable": True,
+                "base_snapshot": {"id": "snap:old"},
+                "head_snapshot": {"id": "snap:new"},
+                "new_risks": [{"source": "GET /upload", "sink": "filesystem write"}],
+                "reachability": {"added": [], "removed": []},
+                "nodes": {},
+            }
+        })
+        out = render_directory(tmp_path)
+        assert "Graph Snapshot Diff" in out
+        assert "GET /upload" in out
+
     def test_render_directory_with_flow_traces(self, tmp_path):
         self._make_out_dir(tmp_path, {"flow-trace-EP-001.json": FLOW_TRACE_DATA})
         out = render_directory(tmp_path)
         assert "Flow Trace" in out or "TRACE-001" in out
+
+    def test_flow_trace_heading_payload_stays_single_line(self, tmp_path):
+        """Trace id/name come raw from flow-trace JSON; the diagrams.md
+        heading built from them must stay one line with no raw quotes,
+        and the Mermaid blocks must remain parseable."""
+        payload_id = 'TRACE-X"\n# injected heading'
+        payload_name = 'evil"\nname'
+        data = dict(FLOW_TRACE_DATA)
+        data["id"] = payload_id
+        data["name"] = payload_name
+        self._make_out_dir(tmp_path, {"flow-trace-EP-001.json": data})
+        out = render_directory(tmp_path)
+        # The payload newline must not have opened a fresh heading line.
+        assert not any(line.startswith("# injected") for line in out.splitlines())
+        # Raw payload quotes must not survive in the heading.
+        heading_lines = [line for line in out.splitlines() if line.startswith("### ")]
+        assert heading_lines
+        assert all('"' not in line for line in heading_lines)
+        assert any("TRACE-X" in line and "evil" in line for line in heading_lines)
+        # Mermaid blocks stay well-formed.
+        blocks = extract_mermaid_blocks(out)
+        assert blocks
+        assert all(block.startswith("flowchart TD") for block in blocks)
 
     def test_render_directory_with_attack_tree(self, tmp_path):
         self._make_out_dir(tmp_path, {"attack-tree.json": ATTACK_TREE_DATA})
@@ -1119,3 +1695,308 @@ class TestRenderer:
         (tmp_path / "context-map.json").write_text("{corrupt json", encoding="utf-8")
         out = render_directory(tmp_path)
         assert "Could not render" in out
+
+
+class TestAttackPathLabelHygiene:
+    def test_ampersand_in_name_not_double_escaped(self):
+        # The sanitizer is not idempotent ('&' -> '&amp;' -> '&amp;amp;');
+        # each raw part must be escaped exactly once.
+        out = generate_single({"name": "A & B", "steps": [], "proximity": 1}, 0)
+        assert "A &amp; B" in out
+        assert "&amp;amp;" not in out
+
+    def test_step_result_rendered(self):
+        # The step outcome is the value-level PoC evidence — it must
+        # appear in the diagram, not just the action.
+        out = generate_single({
+            "name": "p", "proximity": 5,
+            "steps": [{"step": 1, "action": "send 24 bytes",
+                       "result": "RIP=0x41414141"}],
+        }, 0)
+        assert "send 24 bytes" in out
+        assert "RIP=0x41414141" in out
+
+    def test_null_description_not_rendered_as_none(self):
+        out = generate_single({
+            "name": "p", "proximity": 5,
+            "steps": [{"description": None, "type": "call"}],
+        }, 0)
+        assert "None" not in out
+
+
+class TestAttackTreeIdSanitizationParity:
+    @staticmethod
+    def _tree(idfmt):
+        # root -> A,B where A and B have children (grouping eligible).
+        return {
+            "root": idfmt("root"),
+            "nodes": [
+                {"id": idfmt("root"), "goal": "compromise",
+                 "leads_to": f"{idfmt('A')},{idfmt('B')}"},
+                {"id": idfmt("A"), "goal": "a", "status": "confirmed",
+                 "leads_to": idfmt("A1")},
+                {"id": idfmt("A1"), "goal": "a1", "status": "confirmed"},
+                {"id": idfmt("B"), "goal": "b", "status": "exploring",
+                 "leads_to": idfmt("B1")},
+                {"id": idfmt("B1"), "goal": "b1", "status": "unexplored"},
+            ],
+        }
+
+    def test_dotted_ids_group_like_clean_ids(self):
+        # Grouping must not silently degrade to flat rendering when
+        # ids contain chars outside [A-Za-z0-9_-] — the leads_to
+        # membership test needs the same sanitization as the flat path.
+        clean = gen_attack_tree(self._tree(lambda s: s))
+        dotted = gen_attack_tree(self._tree(lambda s: f"FIND-001.{s}"))
+        assert "subgraph" in clean
+        assert "subgraph" in dotted
+
+    def test_enrichment_keys_sanitized_to_match_node_ids(self):
+        tree = {
+            "root": "root",
+            "nodes": [
+                {"id": "root", "goal": "g", "leads_to": "FIND 0001"},
+                {"id": "FIND 0001", "goal": "overflow",
+                 "status": "confirmed"},
+            ],
+        }
+        paths = [{"finding": "FIND 0001", "proximity": 8}]
+        out = gen_attack_tree(tree, attack_paths=paths)
+        # The space sanitizes to '_' on the node id AND the index key,
+        # so the proximity annotation still fires.
+        assert "proximity 8/10" in out
+
+    def test_dead_enrichment_join_is_surfaced(self):
+        tree = {
+            "root": "root",
+            "nodes": [
+                {"id": "root", "goal": "g", "leads_to": "N1"},
+                {"id": "N1", "goal": "n1", "status": "confirmed"},
+            ],
+        }
+        paths = [{"finding": "FIND-001", "proximity": 8}]
+        out = gen_attack_tree(tree, attack_paths=paths)
+        assert "matched no tree node id" in out
+
+
+class TestAttackTreeGroupedEdges:
+    _TREE = {
+        "root": "root",
+        "nodes": [
+            {"id": "root", "goal": "compromise", "leads_to": "A,B"},
+            {"id": "A", "goal": "a", "status": "confirmed", "leads_to": "A1"},
+            {"id": "A1", "goal": "a1", "status": "confirmed"},
+            {"id": "B", "goal": "b", "status": "exploring", "leads_to": "B1"},
+            {"id": "B1", "goal": "b1", "status": "unexplored"},
+        ],
+    }
+
+    def test_root_edges_drawn_exactly_once(self):
+        out = gen_attack_tree(self._TREE)
+        assert out.count("root --> A") == 1
+        assert out.count("root --> B") == 1
+
+    def test_cycle_edge_back_into_root_kept(self):
+        tree = json.loads(json.dumps(self._TREE))
+        tree["nodes"][2]["leads_to"] = "root"  # A1 -> root cycle
+        out = gen_attack_tree(tree)
+        assert "A1 --> root" in out
+
+    def test_orphan_node_declared_not_just_classed(self):
+        tree = json.loads(json.dumps(self._TREE))
+        tree["nodes"].append(
+            {"id": "ORPHAN", "goal": "island", "status": "confirmed"},
+        )
+        out = gen_attack_tree(tree)
+        assert "subgraph" in out  # still grouped mode
+        # Declared as a node, and only then referenced by a class line.
+        assert 'ORPHAN["' in out
+        assert any("ORPHAN" in ln for ln in out.splitlines()
+                   if ln.strip().startswith("class "))
+
+
+class TestContextMapScalarIdFields:
+    def test_scalar_reaches_from_does_not_explode_per_char(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "path": "/api"}],
+            "boundary_details": [],
+            "sink_details": [{"id": "SINK-1", "operation": "exec",
+                              "reaches_from": "EP-001"}],
+            "unchecked_flows": [],
+        }
+        out = gen_context_map(data)
+        assert "EP-001 --> SINK-1" in out
+        # No per-character phantom nodes.
+        assert "\n    E --> SINK-1" not in out
+        assert "\n    P --> SINK-1" not in out
+
+    def test_scalar_covers_treated_as_single_id(self):
+        data = {
+            "entry_points": [{"id": "EP-001", "path": "/api"}],
+            "boundary_details": [{"id": "TB-001", "covers": "EP-001"}],
+            "sink_details": [],
+            "unchecked_flows": [],
+        }
+        out = gen_context_map(data)
+        assert "EP-001 --> TB-001" in out
+        assert "\n    E --> TB-001" not in out
+
+    def test_non_list_id_field_shapes_contribute_nothing(self):
+        # LLM-shaped maps can carry an int/dict where the schema says
+        # array; those shapes must contribute no edges rather than
+        # raising out of generate().
+        data = {
+            "entry_points": [{"id": "EP-001", "path": "/api"}],
+            "boundary_details": [{"id": "TB-001", "covers": 42}],
+            "sink_details": [{"id": "SINK-1", "operation": "exec",
+                              "reaches_from": {"bad": "shape"}}],
+            "unchecked_flows": [],
+        }
+        out = gen_context_map(data)
+        assert "TB-001" in out
+        assert "SINK-1" in out
+        assert "--> TB-001" not in out
+
+
+class TestContextMapCandidateFlows:
+    def test_non_blackbox_candidate_flow_not_drawn_from_undeclared_node(self):
+        data = {
+            "meta": {"analysis_mode": "source"},
+            "entry_points": [{"id": "EP-001", "path": "/api"}],
+            "sink_details": [{"id": "SINK-1", "operation": "system"}],
+            "interesting_functions": [{"id": "fn1", "name": "helper"}],
+            "candidate_flows": [{"source_function": "fn1", "sink": "SINK-1"}],
+        }
+        out = gen_context_map(data)
+        # fn1 was never declared (candidate nodes are blackbox-only),
+        # so no edge may reference it as a bare auto-created node.
+        assert "fn1 -." not in out
+
+    def test_default_relationship_label_not_doubled(self):
+        data = {
+            "meta": {"analysis_mode": "blackbox_binary"},
+            "entry_points": [],
+            "sink_details": [{"id": "SINK-1", "operation": "system"}],
+            "interesting_functions": [{"id": "fn1", "name": "helper"}],
+            "candidate_flows": [{"source_function": "fn1", "sink": "SINK-1"}],
+        }
+        out = gen_context_map(data)
+        assert "candidate candidate" not in out
+        assert '"candidate"' in out
+
+
+class TestFlowTraceBranchCap:
+    def test_branches_capped_with_marker(self):
+        data = {
+            "trace_id": "T1", "name": "t",
+            "steps": [{"step": 1, "call_site": "a.c:1"}],
+            "branches": [
+                {"branch_point": f"a.c:{i}", "condition": f"c{i}"}
+                for i in range(260)
+            ],
+        }
+        out = gen_flow_trace(data)
+        assert out.count("BR") <= 2 * 210  # bounded node/edge count
+        assert "additional branches not shown" in out
+
+    def test_small_branch_list_unaffected(self):
+        data = {
+            "trace_id": "T1", "name": "t",
+            "steps": [{"step": 1, "call_site": "a.c:1"}],
+            "branches": [{"branch_point": "a.c:1", "condition": "x > 0"}],
+        }
+        out = gen_flow_trace(data)
+        assert "additional branches not shown" not in out
+        assert "x &gt; 0" in out or "x > 0" in out
+
+
+class TestHypothesesStatusStyling:
+    def test_idless_hypothesis_gets_status_class(self):
+        out = gen_hypotheses([
+            {"claim": "x", "status": "confirmed", "predictions": []},
+        ])
+        class_lines = [ln for ln in out.splitlines()
+                       if ln.strip().startswith("class ")]
+        assert any("confirmed" in ln for ln in class_lines)
+
+    def test_duplicate_ids_all_classed(self):
+        out = gen_hypotheses([
+            {"id": "H-1", "claim": "a", "status": "confirmed",
+             "predictions": []},
+            {"id": "H-1", "claim": "b", "status": "disproven",
+             "predictions": []},
+        ])
+        class_lines = [ln for ln in out.splitlines()
+                       if ln.strip().startswith("class ")]
+        assert any("confirmed" in ln for ln in class_lines)
+        assert any("disproven" in ln for ln in class_lines)
+
+
+class TestRendererRobustness:
+    def test_non_dict_results_do_not_abort_render(self, tmp_path):
+        (tmp_path / "orchestrated_report.json").write_text(
+            json.dumps({"results": [1, 2, 3]}),
+        )
+        # Must not raise — degrade to no findings summary.
+        out = render_directory(tmp_path)
+        assert isinstance(out, str)
+
+    def test_load_optional_list_prefers_payload_key(self, tmp_path):
+        from ..renderer import _load_optional_list
+        p = tmp_path / "hypotheses.json"
+        p.write_text(json.dumps({
+            "meta": ["not", "the", "payload"],
+            "hypotheses": [{"id": "H-1"}],
+        }))
+        assert _load_optional_list(p) == [{"id": "H-1"}]
+
+    def test_load_optional_list_ambiguous_envelope_returns_none(self, tmp_path):
+        from ..renderer import _load_optional_list
+        p = tmp_path / "other.json"
+        p.write_text(json.dumps({"a": [1], "b": [2]}))
+        assert _load_optional_list(p) is None
+
+    def test_load_optional_list_single_list_envelope_still_works(self, tmp_path):
+        from ..renderer import _load_optional_list
+        p = tmp_path / "wrapped.json"
+        p.write_text(json.dumps({"items": [1, 2]}))
+        assert _load_optional_list(p) == [1, 2]
+
+
+class TestControlBytesAtChokepoint:
+    """sanitize() is the label chokepoint for all six generators —
+    control/bidi bytes must become inert escapes there, because the
+    attack-paths section builds its own fences and never passes the
+    renderer's last-hop _fence."""
+
+    HOSTILE = "step \x1b]0;pwned\x07\x9b2J‮evil end"
+
+    def test_sanitize_escapes_control_and_bidi(self):
+        from packages.diagram.sanitize import sanitize
+        out = sanitize(self.HOSTILE)
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out
+        assert out.startswith("step ") and out.endswith(" end")
+
+    def test_fence_break_zwsp_survives_escaping(self):
+        from packages.diagram.sanitize import sanitize
+        out = sanitize("a```b")
+        # The ZWSP fence-break stays a real (invisible) ZWSP — it must
+        # be inserted AFTER the escape pass or it renders literally.
+        assert "``​`" in out
+
+    def test_attack_paths_section_carries_no_raw_controls(self):
+        from packages.diagram.attack_paths import generate
+        data = [{
+            "path_id": "AP-1",
+            "steps": [
+                {"function": f"parse{self.HOSTILE}", "technique": self.HOSTILE},
+                {"function": "sink", "technique": "overflow"},
+            ],
+            "blockers": [{"description": f"guard {self.HOSTILE}"}],
+            "proximity": 0.9,
+        }]
+        out = generate(data)
+        assert out  # section rendered
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out

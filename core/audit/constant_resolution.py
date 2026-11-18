@@ -1,0 +1,529 @@
+"""Uniqueness-gated constant resolution for SMT predicate equivalence.
+
+Wraps the extraction from ``core.inventory.macro_resolve`` with a
+soundness filter: only constants with a single, unconditional, numeric
+definition are resolved.  A wrong constant value in SMT silently
+produces wrong guard-equivalence verdicts (the dumpability-bug class
+of error), so the gate errs on the side of rejection.
+
+Safety contract: ``ToolSource.CONSTANT_RESOLUTION`` is NOT on the
+suppress allowlist.  Resolved constants feed INTO the proof chain
+(help SMT prove more equivalences) — they never suppress findings.
+"""
+
+from __future__ import annotations
+
+import ast
+import bisect
+import logging
+import operator
+import re
+from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+from core.inventory.macro_resolve import (
+    _C_EXTENSIONS,
+    _ENUMERATOR_NAME_RE,
+    _SKIP_IDENTS_C,
+    _iter_enum_bodies,
+    _iter_macro_definitions,
+    _parse_enumerator_value,
+)
+from core.source.lines import iter_source_lines, split_lines
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs (identical match set per line).
+_IF_RE = re.compile(r"^[^\S\n]*#\s*(?:if|ifdef|ifndef)\b", re.MULTILINE)
+_ENDIF_RE = re.compile(r"^[^\S\n]*#\s*endif\b", re.MULTILINE)
+# A literal prefix lets the regex search skip long non-directive lines.
+# Indentation is checked separately; whitespace after '#' cannot cross LF.
+_CONDITIONAL_DIRECTIVE_RE = re.compile(r"#[^\S\n]*(if|ifdef|ifndef|endif)\b")
+_CONDITIONAL_INDENT_RE = re.compile(r"[^\S\n]*")
+
+_IDENT_RE = re.compile(r"[a-zA-Z_]")
+_INTEGER_LITERAL_RE = re.compile(r"[+-]?(?:0[xX][0-9a-fA-F]+|[0-9]+)")
+_SAFE_ARITH_RE = re.compile(
+    r"^[-()\s0-9a-fA-FxX+*/%|&^~<>]+$"
+)
+
+# Evaluation caps: macro bodies come from the audited (untrusted) repo,
+# so the evaluator must be bounded. Legitimate C macro constants sit far
+# below these limits (typical: (1<<31), 0xFFFFFFFFFFFFFFFF, byte sizes);
+# a body like (1<<0x7fffffff) would otherwise force a huge bigint.
+_MAX_BODY_LEN = 512
+_MAX_LITERAL_MAGNITUDE = 1 << 64
+_MAX_SHIFT_BITS = 256
+_MAX_RESULT_MAGNITUDE = 1 << 128
+
+# House target-source read budget (matches
+# core/audit/context._MAX_SOURCE_FILE_BYTES): anything past it is a
+# planted blob whose only effect is memory exhaustion.
+_MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
+
+_ARITH_BINOPS: dict[type[ast.operator], object] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,
+    ast.BitAnd: operator.and_,
+    ast.BitXor: operator.xor,
+}
+
+
+@dataclass(frozen=True)
+class ResolvedConstant:
+    name: str
+    value: int
+    file: str
+    line: int
+
+
+@dataclass
+class ConstantTable:
+    unique: dict[str, ResolvedConstant] = field(default_factory=dict)
+    rejected: dict[str, str] = field(default_factory=dict)
+
+    def as_int_dict(self) -> dict[str, int]:
+        return {name: rc.value for name, rc in self.unique.items()}
+
+
+_CACHE_MAX = 8
+_cache: OrderedDict[str, ConstantTable] = OrderedDict()
+
+
+@dataclass(frozen=True)
+class _RawDefinition:
+    name: str
+    params: str
+    body: str
+    file: str
+    line: int
+    conditional_depth: int
+
+
+def _eval_arith_node(node: ast.AST) -> int | None:
+    """Bounded bottom-up evaluation of an arithmetic AST node.
+
+    Returns None for any node kind, literal magnitude, shift amount,
+    or intermediate result outside the caps above. Comparison nodes
+    (``<``, ``>``, ...) and bool literals are deliberately unhandled —
+    their results are truth values, not constants.
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        # ``type is int`` (not isinstance): bool is an int subclass
+        # and a truth value must not resolve as a constant.
+        if type(value) is int and abs(value) <= _MAX_LITERAL_MAGNITUDE:
+            return value
+        return None
+
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_arith_node(node.operand)
+        if operand is None:
+            return None
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        if isinstance(node.op, ast.Invert):
+            return ~operand
+        return None
+
+    if isinstance(node, ast.BinOp):
+        left = _eval_arith_node(node.left)
+        if left is None:
+            return None
+        right = _eval_arith_node(node.right)
+        if right is None:
+            return None
+        op_type = type(node.op)
+        fn = _ARITH_BINOPS.get(op_type)
+        if fn is None:
+            return None
+        if op_type in (ast.LShift, ast.RShift) and not (
+            0 <= right <= _MAX_SHIFT_BITS
+        ):
+            return None
+        try:
+            result = fn(left, right)  # type: ignore[operator]
+        except (ZeroDivisionError, ValueError, OverflowError):
+            return None
+        if abs(result) > _MAX_RESULT_MAGNITUDE:
+            return None
+        return result
+
+    return None
+
+
+def _try_evaluate(body: str) -> int | None:
+    """Evaluate a constant body to an integer, or None if unsafe.
+
+    Accepts: integer literals (decimal, hex, negative), and pure
+    arithmetic on integer literals (e.g. ``4 * 1024``, ``(1 << 12)``).
+    Rejects: anything containing identifiers, function calls, casts,
+    sizeof, comparisons (truth values are not constants) — and any
+    body exceeding the evaluation caps (oversized literals, huge shift
+    amounts, results beyond 2**128). The former bare ``eval`` computed
+    shift-bombs like ``(1<<0x7fffffff)`` eagerly, pinning the process
+    on a multi-hundred-megabyte bigint from hostile macro text.
+    """
+    cleaned = body.strip()
+    if not cleaned or len(cleaned) > _MAX_BODY_LEN:
+        return None
+
+    if (type(cleaned) is str and cleaned[0] in "0123456789+-"
+            and _INTEGER_LITERAL_RE.fullmatch(cleaned)):
+        try:
+            # Base zero retains Python's leading-zero and hex rules.
+            value = int(cleaned, 0)
+        except (ValueError, MemoryError):
+            return None
+        return value if abs(value) <= _MAX_LITERAL_MAGNITUDE else None
+
+    if not _SAFE_ARITH_RE.match(cleaned):
+        return None
+
+    if '**' in cleaned:
+        return None
+
+    try:
+        tree = ast.parse(cleaned, mode="eval")
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    return _eval_arith_node(tree.body)
+
+
+def _scan_definitions(target_path: Path) -> dict[str, list[_RawDefinition]]:
+    """Scan all C/C++ files and collect ALL definitions per name."""
+    defs: dict[str, list[_RawDefinition]] = {}
+
+    try:
+        paths = sorted(
+            p for p in target_path.rglob("*")
+            if p.is_file() and p.suffix in _C_EXTENSIONS
+        )
+    except OSError:
+        return defs
+
+    for p in paths:
+        # House-capped read (64 MiB budget, cap+1 probe): every
+        # C/C++ file in the tree is read here on the default prep
+        # path — a planted blob must be refused, not buffered.
+        from core.source import read_bytes_capped
+
+        got = read_bytes_capped(p, _MAX_SOURCE_FILE_BYTES)
+        if got is None:
+            continue
+        raw, truncated = got
+        if truncated:
+            logger.warning(
+                "constant scan: %s exceeds the %d MiB source cap — "
+                "skipped", p, _MAX_SOURCE_FILE_BYTES // (1024 * 1024),
+            )
+            continue
+        # Blanking and continuation folding cannot create these ASCII
+        # keywords. Keep the capped read and oversize warning above, but
+        # avoid decoding and lexical scans when no definition can match.
+        if type(raw) is bytes and b"define" not in raw and b"enum" not in raw:
+            continue
+        raw_text = raw.decode("utf-8", errors="replace")
+        # Comments and string literals are blanked (offsets and
+        # newlines preserved) BEFORE matching: a #define living only
+        # in a comment otherwise resolved as a "provably-unique"
+        # constant and fed SMT guard-equivalence with a value the
+        # compiler never saw. The whole module previously ran its
+        # regexes on raw text.
+        from .source_view import sanitized_view
+
+        text = sanitized_view(raw_text, str(p))
+
+        text_joined = text.replace("\\\n", " ")
+        # Coordinate metadata is needed only once a definition or enum
+        # block actually matches the sanitized source.
+        depth_at_line: Callable[[int], int] | None = None
+        original_line: Callable[[int], int] | None = None
+
+        rel = str(p.relative_to(target_path)) if p.is_relative_to(target_path) else str(p)
+
+        for m in _iter_macro_definitions(text_joined):
+            name = m.group(1)
+            if name in _SKIP_IDENTS_C:
+                continue
+            params = m.group(2) or ""
+            body = m.group(3).strip()
+            if not body:
+                continue
+            if depth_at_line is None:
+                depth_at_line = _conditional_depth_lookup(text)
+            if original_line is None:
+                original_line = _definition_line_lookup(text)
+            line = original_line(m.start())
+            depth = depth_at_line(line)
+            defs.setdefault(name, []).append(
+                _RawDefinition(name, params, body, rel, line, depth)
+            )
+
+        for block_start, body in _iter_enum_bodies(text_joined):
+            # Implicit-only or skipped-name blocks emit no definitions.
+            enum_line: int | None = None
+            block_depth = 0
+            enum_offset = 0
+            for ev in _ENUMERATOR_NAME_RE.finditer(body):
+                ename = ev.group(1).strip()
+                evalue = _parse_enumerator_value(body, ev.end())
+                if ename in _SKIP_IDENTS_C:
+                    continue
+                if enum_line is None:
+                    if depth_at_line is None:
+                        depth_at_line = _conditional_depth_lookup(text)
+                    if original_line is None:
+                        original_line = _definition_line_lookup(text)
+                    enum_line = original_line(block_start)
+                    block_depth = depth_at_line(enum_line)
+                # Retain the existing member-line and block-depth models.
+                offset = ev.start()
+                enum_line += body.count("\n", enum_offset, offset)
+                enum_offset = offset
+                defs.setdefault(ename, []).append(
+                    _RawDefinition(ename, "", evalue, rel, enum_line, block_depth)
+                )
+        # Release the captured text and indexes before reading another file.
+        del original_line
+
+    return defs
+
+
+def _definition_line_lookup(text: str) -> Callable[[int], int]:
+    """Map joined-text offsets to original lines, indexing on demand.
+
+    Continuation offsets grow only as far as queried. Native text uses
+    a count cursor for ordered line queries, switching to the original
+    lazy line index when cumulative rescanning exceeds a bounded budget.
+    Queries can still visit earlier positions. All state belongs to this
+    immutable file text, never a path cache.
+    """
+    joined_cont_offsets: list[int] = []
+    line_starts = [0]
+    next_continuation = -1
+    next_newline = -1
+    initialized = False
+    use_counts = type(text) is str
+    source_length = len(text) if use_counts else 0
+    count_budget = max(64 * 1024, source_length * 4)
+    count_work = 0
+    count_pos = 0
+    count_line = 1
+    max_count_pos = 0
+
+    def lookup(joined_pos: int) -> int:
+        nonlocal initialized, next_continuation, next_newline
+        nonlocal use_counts, count_work, count_pos, count_line, max_count_pos
+        if not initialized:
+            next_continuation = text.find("\\\n")
+            next_newline = text.find("\n")
+            initialized = True
+        # The k-th removed backslash-LF pair becomes a space at off_k-k.
+        # Unknown continuation offsets must stay beyond the query.
+        while (next_continuation >= 0
+               and next_continuation - len(joined_cont_offsets) <= joined_pos):
+            joined_cont_offsets.append(next_continuation - len(joined_cont_offsets))
+            next_continuation = text.find("\\\n", next_continuation + 2)
+        extra = bisect.bisect_right(joined_cont_offsets, joined_pos)
+        original_pos = joined_pos + extra
+        # Ordered passes need only a count cursor. Bound cumulative scans
+        # so repeated backward queries fall back to the original index.
+        if use_counts and type(original_pos) is int:
+            if original_pos < 0:
+                return 0
+            stop = min(original_pos, source_length)
+            if stop >= count_pos:
+                scan_start, base_line = count_pos, count_line
+            else:
+                scan_start, base_line = 0, 1
+            next_work = count_work + stop - scan_start
+            if next_work <= count_budget:
+                count_line = base_line + text.count("\n", scan_start, stop)
+                count_pos = stop
+                count_work = next_work
+                max_count_pos = max(max_count_pos, stop)
+                return count_line
+        use_counts = False
+        # Recreate the prior high-water mark before servicing unusual query
+        # types or switching modes, preserving even legacy bisect behavior.
+        if max_count_pos:
+            while next_newline >= 0 and next_newline + 1 <= max_count_pos:
+                line_starts.append(next_newline + 1)
+                next_newline = text.find("\n", next_newline + 1)
+            max_count_pos = 0
+        # Likewise, no unindexed line start may precede original_pos.
+        while next_newline >= 0 and next_newline + 1 <= original_pos:
+            line_starts.append(next_newline + 1)
+            next_newline = text.find("\n", next_newline + 1)
+        return bisect.bisect_right(line_starts, original_pos)
+
+    return lookup
+
+
+_DEPTH_LINES_IMPL = split_lines
+
+
+def _compute_conditional_depths(text: str) -> dict[int, int]:
+    """Map line numbers to their #if/#ifdef nesting depth.
+
+    Returns a dict with an entry for EVERY line (1-based): the
+    conditional nesting depth at that line. Depth 0 means
+    unconditional. Callers look up #define lines and enum-block
+    start lines by number.
+    """
+    depths: dict[int, int] = {}
+    depth = 0
+    lines = (iter_source_lines(text)
+             if type(text) is str and split_lines is _DEPTH_LINES_IMPL else split_lines(text))
+    for i, raw_line in enumerate(lines, 1):
+        stripped = raw_line.lstrip()
+        if stripped.startswith("#"):
+            if _IF_RE.match(raw_line):
+                depth += 1
+            elif _ENDIF_RE.match(raw_line):
+                depth = max(0, depth - 1)
+        depths[i] = depth
+    return depths
+
+
+def _conditional_depth_lookup(text: str) -> Callable[[int], int]:
+    """Equivalent of dense_depths.get(line, 0), scoped to one text.
+
+    Ordinary source stores depth changes; directive-heavy files retain
+    dense construction. Each directive updates its own line. LF alone
+    separates lines. A final line containing only CR is dropped by
+    split_lines after trimming CR and removing its trailing empty line.
+    """
+    if type(text) is not str:
+        depths = _compute_conditional_depths(text)
+        return lambda line: depths.get(line, 0)
+    if _CONDITIONAL_DIRECTIVE_RE.search(text) is None:
+        return lambda line: 0
+    change_lines: list[int] = []
+    change_depths: list[int] = []
+    line = 1
+    line_offset = 0
+    search_offset = 0
+    line_count = 0
+    sparse_admitted = False
+    depth = 0
+    while True:
+        offset = text.find("#", search_offset)
+        if offset < 0:
+            break
+        # Only the first '#' can follow an all-whitespace prefix. Skip
+        # the rest of its line even when it appears inside an expression.
+        line_end = text.find("\n", offset)
+        search_offset = line_end + 1 if line_end >= 0 else len(text)
+        if offset and text[offset - 1] != "\n":
+            line_start = text.rfind("\n", 0, offset) + 1
+            if _CONDITIONAL_INDENT_RE.fullmatch(text, line_start, offset) is None:
+                continue
+        match = _CONDITIONAL_DIRECTIVE_RE.match(text, offset)
+        if match is None:
+            continue
+        if not sparse_admitted:
+            last_line_present = bool(
+                text and text != "\r" and not text.endswith(("\n", "\n\r"))
+            )
+            line_count = text.count("\n") + last_line_present
+            # Keep dense construction when most lines carry preprocessor
+            # markers; avoid per-directive Python overhead on those files.
+            if text.count("#") > max(32, line_count // 2):
+                depths = _compute_conditional_depths(text)
+                return lambda line: depths.get(line, 0)
+            sparse_admitted = True
+        line += text.count("\n", line_offset, offset)
+        line_offset = offset
+        next_depth = max(0, depth - 1) if match.group(1) == "endif" else depth + 1
+        if next_depth != depth:
+            change_lines.append(line)
+            change_depths.append(next_depth)
+        depth = next_depth
+    if not change_lines:
+        return lambda line: 0
+
+    def lookup(line: int) -> int:
+        if line < 1 or line > line_count:
+            return 0
+        index = bisect.bisect_right(change_lines, line) - 1
+        return change_depths[index] if index >= 0 else 0
+
+    return lookup
+
+
+def build_unique_constants(target_path: Path) -> ConstantTable:
+    """Scan target for constants, return only provably-unique ones.
+
+    Applies rejection filters:
+    1. Function-like macros (have params) — reject
+    2. Multi-definition with different bodies — reject
+    3. Conditional compilation (inside #if/#ifdef) — reject
+    4. Non-evaluable body — reject
+    """
+    from core.audit.safety_contract import assert_boost_only
+    assert_boost_only("constant_resolution")
+
+    key = str(target_path)
+    if key in _cache:
+        _cache.move_to_end(key)
+        return _cache[key]
+
+    all_defs = _scan_definitions(target_path)
+    table = ConstantTable()
+
+    for name, definitions in all_defs.items():
+        if any(d.params for d in definitions):
+            table.rejected[name] = "function-like macro"
+            continue
+
+        if any(d.conditional_depth > 0 for d in definitions):
+            table.rejected[name] = "conditional compilation"
+            continue
+
+        bodies = {d.body for d in definitions}
+        if len(bodies) > 1:
+            table.rejected[name] = "redefined with different value"
+            continue
+
+        body = next(iter(bodies))
+        value = _try_evaluate(body)
+        if value is None:
+            table.rejected[name] = f"non-evaluable body: {body!r}"
+            continue
+
+        first = definitions[0]
+        table.unique[name] = ResolvedConstant(
+            name=name, value=value, file=first.file, line=first.line,
+        )
+
+    if table.unique:
+        logger.info(
+            "constant_resolution: %d unique, %d rejected from %s",
+            len(table.unique), len(table.rejected), target_path,
+        )
+
+    if len(_cache) >= _CACHE_MAX:
+        _cache.popitem(last=False)
+    _cache[key] = table
+    return table
+
+
+def clear_cache() -> None:
+    """Clear the constant table cache (for testing)."""
+    _cache.clear()

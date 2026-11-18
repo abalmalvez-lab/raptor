@@ -36,7 +36,6 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
-from typing import Union
 
 from core.logging import get_logger
 
@@ -47,14 +46,16 @@ class UnsafeRunDirError(PermissionError):
     """Raised when an output dir cannot be created or used safely."""
 
 
-def safe_run_mkdir(path: Union[Path, str]) -> None:
+def safe_run_mkdir(path: Path | str) -> None:
     """Create *path* if absent, or accept it if already present and safe.
 
     Behaviour:
       - If *path* does not exist: created via :func:`os.mkdir` with mode
-        ``0o700``. Any umask in effect can only mask away owner bits, which
-        ``0o700`` already lacks beyond the owner triplet — so the resulting
-        mode is always ``0o700`` regardless of the caller's umask.
+        ``0o700``, then ``fchmod``'d to ``0o700`` through an
+        ``O_DIRECTORY|O_NOFOLLOW`` handle — the mkdir mode alone is
+        masked by the caller's umask (a ``0o277`` umask yielded
+        ``0o500``), and a path-based chmod could follow an entry
+        swapped by a parent-writing attacker.
       - If *path* exists as a real directory owned by the current user and
         not world-writable: accepted (no chmod, no chown).
       - Group-writable existing dirs: accepted with a warning logged.
@@ -70,31 +71,46 @@ def safe_run_mkdir(path: Union[Path, str]) -> None:
 
     try:
         os.mkdir(path, mode=0o700)
-        return
     except FileExistsError:
         pass
+    else:
+        # The mkdir mode is masked by the process umask (0o277 gave
+        # 0o500) — restore the full owner triplet through a handle on
+        # the directory we just created, so a hostile umask cannot
+        # strip our own write bit and an attacker who can rewrite the
+        # parent cannot redirect a path-based chmod.
+        from core.source.streams import owned_fd
+
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY
+                     | getattr(os, "O_NOFOLLOW", 0))
+        with owned_fd(fd, close_fd=os.close):
+            os.fchmod(fd, 0o700)
+        return
 
     st = os.lstat(path)
 
     if not stat.S_ISDIR(st.st_mode):
-        raise UnsafeRunDirError(
+        msg = (
             f"refusing non-directory output path: {path} "
             f"(may be a symlink or regular file)"
         )
+        raise UnsafeRunDirError(msg)
 
     euid = os.geteuid()
     if st.st_uid != euid:
-        raise UnsafeRunDirError(
+        msg = (
             f"output dir not owned by current user "
             f"(uid {st.st_uid} ≠ {euid}): {path}"
         )
+        raise UnsafeRunDirError(msg)
 
     if st.st_mode & 0o002:
-        raise UnsafeRunDirError(
+        msg = (
             f"output dir is world-writable "
             f"(mode {oct(st.st_mode & 0o777)}): {path} "
             f"— chmod o-w to use, or move the dir"
         )
+        raise UnsafeRunDirError(msg)
 
     if st.st_mode & 0o020:
         logger.warning(

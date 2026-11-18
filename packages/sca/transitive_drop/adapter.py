@@ -1,0 +1,132 @@
+"""Convert ``DropOnBumpFinding`` records into the wider
+``SupplyChainFinding`` shape so the existing report / SARIF /
+SBOM / PR-comment renderers pick them up automatically."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from packages.sca.kinds import SUPPLYCHAIN_ID_PREFIX
+from packages.sca.models import (
+    Confidence, Dependency, PinStyle, SupplyChainFinding,
+)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from packages.sca.transitive_drop.detector import DropOnBumpFinding
+    from collections.abc import Iterable
+
+
+def to_supply_chain_findings(
+    drops: Iterable[DropOnBumpFinding],
+) -> list[SupplyChainFinding]:
+    """One ``SupplyChainFinding`` per droppable transitive.
+
+    Severity matches the underlying issue's severity: an HIGH/
+    CRITICAL vuln on the transitive yields an HIGH finding (this
+    IS a real remediation path), while LOW/INFO yields INFO.
+    """
+    out: list[SupplyChainFinding] = [_make_finding(d) for d in drops]
+    return out
+
+
+_ECO_PURL_TYPE = {
+    "PyPI": "pypi", "npm": "npm", "Cargo": "cargo",
+    "Packagist": "composer", "RubyGems": "gem",
+    "Maven": "maven", "NuGet": "nuget", "Go": "golang",
+}
+
+
+def _make_finding(d: DropOnBumpFinding) -> SupplyChainFinding:
+    purl_type = _ECO_PURL_TYPE.get(d.ecosystem, d.ecosystem.lower())
+    placeholder_dep = Dependency(
+        ecosystem=d.ecosystem,
+        name=d.transitive_name,
+        version=d.transitive_version,
+        declared_in=Path("/<transitive_drop>"),
+        scope="main",
+        is_lockfile=False,
+        pin_style=PinStyle.EXACT,
+        direct=False,
+        purl=f"pkg:{purl_type}/{d.transitive_name.replace(':', '/', 1)}@{d.transitive_version}",
+        parser_confidence=Confidence(
+            "high", reason="transitive_drop detector",
+        ),
+    )
+
+    # Severity escalation: an underlying critical/high vuln on the
+    # transitive means the bump is a real fix path, not just
+    # hygiene. Otherwise informational.
+    sev_in = d.transitive_finding_severity
+    if sev_in in ("critical", "high"):
+        severity = "high"
+    elif sev_in == "medium":
+        severity = "medium"
+    else:
+        severity = "info"
+
+    if d.transitive_status_in_latest == "extras-gated":
+        suffix = (
+            f" (now optional behind extra "
+            f"``[{d.extra_name}]`` — operator must opt in to "
+            f"install it)"
+        )
+    else:
+        suffix = " (no longer required at all)"
+    detail = (
+        f"{d.transitive_name}=={d.transitive_version} is required by "
+        f"{d.parent_name}=={d.parent_current_version} but moved out "
+        f"of the unconditional dep set in "
+        f"{d.parent_name}=={d.parent_latest_version}{suffix}. "
+        f"Bumping {d.parent_name} drops {d.transitive_name} from "
+        f"the install set — resolves the underlying "
+        f"{sev_in}-severity finding without an upstream patch."
+    )
+
+    return SupplyChainFinding(
+        finding_id=(
+            f"{SUPPLYCHAIN_ID_PREFIX}transitive_now_optional:{d.ecosystem}:"
+            f"{d.transitive_name}:{d.parent_name}"
+        ),
+        kind="transitive_now_optional",
+        dependency=placeholder_dep,
+        detail=detail,
+        evidence={
+            "transitive_name": d.transitive_name,
+            "transitive_version": d.transitive_version,
+            "parent_name": d.parent_name,
+            "parent_current_version": d.parent_current_version,
+            "parent_latest_version": d.parent_latest_version,
+            "transitive_status_in_latest":
+                d.transitive_status_in_latest,
+            "extra_name": d.extra_name,
+            "underlying_severity": d.transitive_finding_severity,
+        },
+        severity=severity,  # type: ignore[arg-type]
+        confidence=Confidence(
+            "high",
+            reason=(
+                f"{_metadata_source(d.ecosystem)} diff: dep moved "
+                f"behind optional gate"
+                if d.transitive_status_in_latest == "extras-gated"
+                else f"{_metadata_source(d.ecosystem)} diff across "
+                     f"parent versions"
+            ),
+        ),
+    )
+
+
+def _metadata_source(ecosystem: str) -> str:
+    """The operator-facing name of the parent-metadata field the
+    detector actually diffed — per ecosystem, matching the detector's
+    ``_dep_state_in_version`` dispatch (the reason previously claimed
+    ``PyPI requires_dist`` for every ecosystem)."""
+    return {
+        "PyPI": "PyPI requires_dist",
+        "npm": "npm dependencies/optionalDependencies",
+        "Cargo": "Cargo [dependencies]/[features]",
+        "Packagist": "Composer require/require-dev",
+        "RubyGems": "gem dependency-type",
+        "Maven": "Maven dependency scope/optional",
+        "NuGet": "NuGet TFM dependency-group",
+    }.get(ecosystem, f"{ecosystem} parent dependency metadata")

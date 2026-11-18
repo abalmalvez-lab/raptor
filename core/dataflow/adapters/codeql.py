@@ -25,7 +25,10 @@ JSON entries can later be re-parsed by the same adapter without loss.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Mapping, Optional
+import json
+from collections.abc import Mapping
+from typing import Any
+from urllib.parse import unquote
 
 from core.dataflow.finding import Finding, Step
 
@@ -42,60 +45,120 @@ def make_finding_id(
     prefix is sufficient for corpus-scale uniqueness; collisions
     surface via the corpus-integrity test
     (``test_corpus_finding_ids_are_unique``).
+
+    Components containing ``|`` use a structured, versioned key to
+    avoid delimiter ambiguity. Other inputs retain their existing IDs.
+
+    Known limitation: the id is location-anchored (file path + line
+    of source and sink), so a file rename or move — or any edit that
+    shifts those line numbers — yields a new id for the same defect,
+    weakening cross-run correlation. A content-anchored redesign is
+    deliberately deferred.
     """
     key = (
         f"{producer}|{rule_id}|"
         f"{source.file_path}:{source.line}|"
         f"{sink.file_path}:{sink.line}"
     )
+    version = ""
+    if any("|" in value for value in (
+        producer, rule_id, source.file_path, sink.file_path,
+    )):
+        # Preserve existing IDs for ordinary locations. A literal field
+        # delimiter needs structured encoding to keep distinct tuples apart.
+        key = json.dumps([
+            producer, rule_id, source.file_path, source.line,
+            sink.file_path, sink.line,
+        ], ensure_ascii=True, separators=(",", ":"))
+        version = "v2_"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
     rule_slug = rule_id.replace("/", "-").replace(".", "-") or "unknown"
-    return f"{producer}_{rule_slug}_{digest}"
+    return f"{producer}_{rule_slug}_{version}{digest}"
 
 
 def from_sarif_result(
     result: Mapping[str, Any],
     *,
     producer: str = PRODUCER,
-    finding_id: Optional[str] = None,
-) -> Optional[Finding]:
+    finding_id: str | None = None,
+) -> Finding | None:
     """Convert one SARIF ``result`` entry into a :class:`Finding`.
 
-    Returns ``None`` when the result lacks a dataflow code-flow
-    structure (rules emitting a single location without a path are
-    not :class:`Finding` shapes).
+    Converts only the first thread flow of the first code flow; later
+    paths are not represented in the returned finding. Returns ``None``
+    when that first path is absent or has fewer than two locations,
+    without searching later flows for a usable path.
 
     Raises :class:`ValueError` from :class:`Step` validation when the
     SARIF data is structurally a path but contains malformed entries
     (empty URI, ``startLine`` < 1). Better to surface than to silently
     coerce.
     """
-    code_flows = result.get("codeFlows") or []
+    code_flows = result.get("codeFlows")
+    if code_flows is not None and not isinstance(code_flows, (list, tuple)):
+        raise ValueError("SARIF codeFlows must be an array")
+    code_flows = code_flows or []
     if not code_flows:
         return None
 
-    thread_flows = code_flows[0].get("threadFlows") or []
+    if not isinstance(code_flows[0], Mapping):
+        raise ValueError("SARIF codeFlows entry must be an object")
+    thread_flows = code_flows[0].get("threadFlows")
+    if thread_flows is not None and not isinstance(thread_flows, (list, tuple)):
+        raise ValueError("SARIF threadFlows must be an array")
+    thread_flows = thread_flows or []
     if not thread_flows:
         return None
 
-    locations = thread_flows[0].get("locations") or []
+    if not isinstance(thread_flows[0], Mapping):
+        raise ValueError("SARIF threadFlows entry must be an object")
+    locations = thread_flows[0].get("locations")
+    if locations is not None and not isinstance(locations, (list, tuple)):
+        raise ValueError("SARIF locations must be an array")
+    locations = locations or []
     if len(locations) < 2:
         return None
 
-    steps: List[Step] = []
-    for loc_wrapper in locations:
-        loc = loc_wrapper.get("location", {})
-        physical_loc = loc.get("physicalLocation", {})
-        region = physical_loc.get("region", {})
-        artifact = physical_loc.get("artifactLocation", {})
+    def object_or_empty(value: Any, field: str) -> Mapping[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(f"SARIF {field} must be an object")
+        return value
 
-        message_text = loc.get("message", {}).get("text") or ""
+    def text_or_default(value: Any, field: str, default: str) -> str:
+        if value is None:
+            return default
+        if not isinstance(value, str):
+            raise ValueError(f"SARIF {field} must be a string")
+        return value or default
+
+    steps: list[Step] = []
+    for loc_wrapper in locations:
+        if not isinstance(loc_wrapper, Mapping):
+            raise ValueError("SARIF locations entry must be an object")
+        loc = object_or_empty(loc_wrapper.get("location"), "location")
+        physical_loc = object_or_empty(loc.get("physicalLocation"), "physicalLocation")
+        region = object_or_empty(physical_loc.get("region"), "region")
+        artifact = object_or_empty(physical_loc.get("artifactLocation"), "artifactLocation")
+
+        message_text = text_or_default(
+            object_or_empty(loc.get("message"), "location.message").get("text"),
+            "location.message.text", "",
+        )
+        uri = text_or_default(artifact.get("uri"), "artifactLocation.uri", "")
+        column = region.get("startColumn")
+        # Explicit null objects retain their empty defaults; malformed
+        # scalar objects must use the caller's ValueError refusal path.
         steps.append(
             Step(
-                file_path=artifact.get("uri", ""),
-                line=region.get("startLine", 0),
-                column=region.get("startColumn", 0),
-                snippet=region.get("snippet", {}).get("text", ""),
+                file_path=unquote(uri, errors="strict"),
+                line=region.get("startLine") or 0,
+                column=0 if column is None else column,
+                snippet=text_or_default(
+                    object_or_empty(region.get("snippet"), "snippet").get("text"),
+                    "snippet.text", "",
+                ),
                 label=message_text or None,
             )
         )
@@ -104,9 +167,10 @@ def from_sarif_result(
     sink = steps[-1]
     intermediate = tuple(steps[1:-1])
 
-    rule_id = result.get("ruleId") or "unknown"
-    message_obj = result.get("message", {})
-    message = message_obj.get("text") or "(no message)"
+    rule_id = text_or_default(result.get("ruleId"), "ruleId", "unknown")
+    # Explicit null messages retain the documented default.
+    message_obj = object_or_empty(result.get("message"), "result.message")
+    message = text_or_default(message_obj.get("text"), "result.message.text", "(no message)")
 
     if finding_id is None:
         finding_id = make_finding_id(rule_id, source, sink, producer=producer)
@@ -127,7 +191,7 @@ def from_dataflow_path(
     dp: Any,
     *,
     producer: str = PRODUCER,
-    finding_id: Optional[str] = None,
+    finding_id: str | None = None,
 ) -> Finding:
     """Convert ``packages.codeql.dataflow_validator.DataflowPath`` to
     :class:`Finding`.
@@ -144,13 +208,19 @@ def from_dataflow_path(
     sink = _step_from_dp_step(dp.sink)
     intermediate = tuple(_step_from_dp_step(s) for s in dp.intermediate_steps)
 
-    rule_id = getattr(dp, "rule_id", "") or "unknown"
-    message = getattr(dp, "message", "") or "(no message)"
+    rule_id = getattr(dp, "rule_id", None)
+    if rule_id is None or rule_id == "":
+        rule_id = "unknown"
+    if not isinstance(rule_id, str):
+        raise ValueError("DataflowPath.rule_id must be a string")
+    message = getattr(dp, "message", None)
+    if message is None or message == "":
+        message = "(no message)"
 
     if finding_id is None:
         finding_id = make_finding_id(rule_id, source, sink, producer=producer)
 
-    raw: Dict[str, Any] = {}
+    raw: dict[str, Any] = {}
     sanitizers = getattr(dp, "sanitizers", None)
     if sanitizers:
         raw["dataflow_path_sanitizers"] = list(sanitizers)
@@ -173,5 +243,5 @@ def _step_from_dp_step(s: Any) -> Step:
         line=s.line,
         column=s.column,
         snippet=s.snippet,
-        label=(s.label or None),
+        label=None if s.label is None or s.label == "" else s.label,
     )

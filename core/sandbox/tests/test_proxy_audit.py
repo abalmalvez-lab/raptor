@@ -21,30 +21,43 @@ import socket
 
 import pytest
 
+from core.sandbox import evidence as evidence_mod
 from core.sandbox import proxy as proxy_mod
 from core.sandbox import summary as summary_mod
+from core.testing.proxy_scope import isolated_proxy_scope
+
+from core.testing.sandbox_state_scope import isolated_summary_state
 
 
 @pytest.fixture
 def reset_proxy():
-    """Tear down the singleton before AND after each test.
-
-    Many proxy tests construct EgressProxy directly (not via get_proxy),
-    so this primarily exists to scrub any prior singleton state and
-    let each test be hermetic.
-    """
-    proxy_mod._reset_for_tests()
-    yield
-    proxy_mod._reset_for_tests()
+    with isolated_proxy_scope():
+        yield
 
 
 @pytest.fixture
-def active_run(tmp_path):
+def active_run(tmp_path, monkeypatch):
     """Set up an active sandbox-summary recording target so record_denial
     has somewhere to write."""
-    summary_mod.set_active_run_dir(tmp_path)
-    yield tmp_path
-    summary_mod.set_active_run_dir(None)
+    with isolated_summary_state():
+        try:
+            summary_mod.set_active_run_dir(tmp_path)
+            yield tmp_path
+            summary_mod.set_active_run_dir(None)
+        finally:
+            monkeypatch.undo()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_resolver(hermetic_invalid_dns):
+    """Every CONNECT target in this file is a literal IP or an RFC 2606
+    ``.invalid`` name. The conftest stub answers ``.invalid`` instantly,
+    so no test rides the host resolver's NXDOMAIN latency — macOS
+    runners have taken longer than ``_send_connect``'s 5s read budget
+    to fail one, timing the client out before the proxy's 502 arrived.
+    (TestProxyResolverFailureShapes layers its own per-test resolver
+    stub on top — both patches ride the same shared monkeypatch undo
+    stack, so teardown unwinds LIFO back to the pristine method.)"""
 
 
 def _send_connect(port: int, target: str, timeout: float = 5.0) -> tuple:
@@ -101,8 +114,8 @@ class TestProxyAuditModeHostGate:
                 # or upstream connect refused), which is a 502/504, not
                 # the 403 the host-allowlist deny would have produced.
                 assert status != 403, (
-                    f"audit mode incorrectly returned 403 (denied) for "
-                    f"non-allowlisted host; expected fall-through")
+                    "audit mode incorrectly returned 403 (denied) for "
+                    "non-allowlisted host; expected fall-through")
             finally:
                 events = proxy.unregister_sandbox(token)
         finally:
@@ -146,7 +159,8 @@ class TestProxyAuditModeHostGate:
             proxy.stop()
 
         # record_denial wrote to the active run's JSONL
-        jsonl = active_run / summary_mod.DENIALS_FILE
+        jsonl = (active_run / evidence_mod.AUDIT_SUBDIR
+                 / summary_mod.DENIALS_FILE)
         assert jsonl.exists(), "no denials file written by audit-mode proxy"
         records = [json.loads(line) for line in jsonl.read_text().splitlines() if line]
         network_records = [r for r in records if r["type"] == "network"]
@@ -229,7 +243,8 @@ class TestProxyAuditModeResolvedIpGate:
             proxy.stop()
 
         # Audit mode routes the gate-2 deny into the summary too.
-        jsonl = active_run / summary_mod.DENIALS_FILE
+        jsonl = (active_run / evidence_mod.AUDIT_SUBDIR
+                 / summary_mod.DENIALS_FILE)
         assert jsonl.exists(), \
             "audit-mode gate 2 should record_denial into summary"
         records = [json.loads(line) for line in
@@ -274,7 +289,8 @@ class TestProxyAuditModeResolvedIpGate:
         finally:
             proxy.stop()
 
-        jsonl = active_run / summary_mod.DENIALS_FILE
+        jsonl = (active_run / evidence_mod.AUDIT_SUBDIR
+                 / summary_mod.DENIALS_FILE)
         assert not jsonl.exists(), (
             f"enforced-mode proxy unexpectedly wrote summary: "
             f"{jsonl.read_text() if jsonl.exists() else ''}"
@@ -332,7 +348,8 @@ class TestProxyEnforcedModeStillBlocks:
 
         # No JSONL written — proxy didn't call record_denial in
         # enforced mode (that's observe.py's job, post-subprocess).
-        jsonl = active_run / summary_mod.DENIALS_FILE
+        jsonl = (active_run / evidence_mod.AUDIT_SUBDIR
+                 / summary_mod.DENIALS_FILE)
         assert not jsonl.exists(), \
             f"enforced-mode proxy unexpectedly wrote to summary: " \
             f"{jsonl.read_text() if jsonl.exists() else ''}"
@@ -367,7 +384,8 @@ class TestProxyAuditModeAllowedHost:
             f"audit mode emitted would_deny for allowlisted host: {events}"
 
         # No record_denial fired either.
-        jsonl = active_run / summary_mod.DENIALS_FILE
+        jsonl = (active_run / evidence_mod.AUDIT_SUBDIR
+                 / summary_mod.DENIALS_FILE)
         if jsonl.exists():
             records = [json.loads(line) for line in
                        jsonl.read_text().splitlines() if line]
@@ -409,6 +427,57 @@ class TestProxyAuditModeNoActiveRun:
         # depend on the summary).
         would_deny = [e for e in events if e["result"] == "would_deny_host"]
         assert len(would_deny) == 1
+
+
+class TestProxyResolverFailureShapes:
+    """Every resolver-failure shape must produce the 502 response line.
+
+    Platform resolvers differ in exception class as well as message:
+    glibc raises gaierror(-2), macOS raises gaierror(8), a hostname
+    that fails IDNA encoding raises UnicodeError from inside
+    getaddrinfo, and resolver backends can surface plain OSError. A
+    shape that escapes the DNS-failure branch falls through to the
+    generic handler-error path, which closes the client socket with NO
+    status line — the child sees an opaque EOF instead of the
+    documented 502. The resolver is stubbed: no live lookup, so the
+    outcome is deterministic on every platform.
+    """
+
+    @pytest.mark.parametrize("exc", [
+        socket.gaierror(8, "nodename nor servname provided, or not known"),
+        socket.gaierror(-2, "Name or service not known"),
+        OSError("resolver backend failure"),
+        UnicodeError("encoding with 'idna' codec failed"),
+    ], ids=["gaierror-darwin-eai-noname", "gaierror-glibc-eai-noname",
+            "plain-oserror", "idna-unicode-error"])
+    def test_resolver_failure_writes_502(self, reset_proxy, monkeypatch,
+                                         exc):
+        async def _resolver_fails(self, host, port):
+            raise exc
+
+        monkeypatch.setattr(proxy_mod.EgressProxy, "_cached_getaddrinfo",
+                            _resolver_fails)
+        proxy = proxy_mod.EgressProxy(
+            allowed_hosts={"allowed-host.invalid"},
+        )
+        try:
+            token = proxy.register_sandbox(caller_label="test")
+            try:
+                status, _ = _send_connect(proxy.port,
+                                          "allowed-host.invalid:443")
+                assert status == 502, (
+                    f"resolver failure {exc!r} must surface as 502, "
+                    f"got {status}")
+            finally:
+                events = proxy.unregister_sandbox(token)
+        finally:
+            proxy.stop()
+
+        # The failure took the DNS path (dns_failed event), not the
+        # generic handler_error fallback.
+        dns_failed = [e for e in events if e["result"] == "dns_failed"]
+        assert len(dns_failed) == 1, \
+            f"expected 1 dns_failed event, got: {events}"
 
 
 class TestProxyAuditRefCount:
@@ -600,21 +669,16 @@ class TestProxyAuditRefCount:
             # behaviour ("audit count > 0" → audit mode for ALL
             # concurrent CONNECTs).
             #
-            # The right fix for "non-audit sibling stays enforcing"
-            # is per-CONNECT scoping, NOT aggregate ref-counting.
-            # That requires mapping each CONNECT to its originating
-            # sandbox, which the current proxy doesn't do (singleton
-            # design). For now we assert the documented behaviour and
-            # note as a known limit: when ANY audit sandbox is active,
-            # ALL siblings see audit-log mode on the proxy gate.
-            #
-            # Acceptable because:
-            # 1. RAPTOR rarely runs concurrent mixed-profile sandboxes
-            # 2. The aggregate behaviour is "more permissive on the
-            #    network gate when audit is engaged" — acknowledged
-            #    in the audit profile docstring.
-            # 3. Other layers (Landlock, seccomp, mount-ns) remain
-            #    per-sandbox and unaffected.
+            # Per-CONNECT scoping now exists: lanes (see
+            # test_proxy_lanes.py) give each sandbox context its own
+            # audit bit on its own transport, and production no
+            # longer touches this global flag. What this test pins
+            # today is the LEGACY semantics of the global flag for
+            # un-laned connections (the shared main listener): the
+            # ref-count keeps it consistent for direct-construction
+            # users, and in-process consumers are only ever lenient
+            # if something explicitly sets the global flag — which
+            # nothing in production does.
             assert proxy._audit_log_only is True
 
             # When audit sandbox exits, gate returns to enforcing
@@ -783,11 +847,11 @@ class TestProxyAuditModeRecordsSurviveErrors:
 # Before W36.K.1: `bool(env_var)` treated any non-empty string as truthy,
 # so RAPTOR_PROXY_AUDIT_ENFORCE=0 / false / no / off all enabled strict
 # mode — fail-SAFE direction but contrary to operator expectations.
-# After W36.K.1: whitelist of explicit truthy spellings.
+# After W36.K.1: allowlist of explicit truthy spellings.
 
 
 class TestProxyAuditEnforceEnvVarParse:
-    """Regression coverage for the W36.K.1 truthy-whitelist parse."""
+    """Regression coverage for the W36.K.1 truthy-allowlist parse."""
 
     @pytest.mark.parametrize("value", [
         "0",
@@ -801,7 +865,7 @@ class TestProxyAuditEnforceEnvVarParse:
         "",
         "   ",
         "garbage",
-        "2",       # only "1" is truthy by the whitelist
+        "2",       # only "1" is truthy by the allowlist
         "10",
     ])
     def test_non_truthy_value_disables_enforce(

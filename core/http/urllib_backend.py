@@ -17,10 +17,25 @@ Why urllib3 not stdlib urllib:
     bundle and is configured CERT_REQUIRED + hostname-verified by
     default in 2.x.
 
+Operator proxy env: when constructed WITHOUT an injected pool
+manager, UrllibClient snapshots ``https_proxy`` / ``http_proxy`` /
+``all_proxy`` (+ ``no_proxy``) at construction time and routes
+requests through the operator's proxy — mandatory-egress-proxy hosts
+otherwise have no route at all for the direct client (urllib3 never
+reads env at request time). This does NOT weaken the EgressClient
+chokepoint: EgressClient injects its own ``ProxyManager`` via
+``_http``, which disables the env snapshot entirely, so ``no_proxy``
+still cannot bypass the chokepoint. The snapshot is
+construction-time, matching the sandbox egress proxy's
+capture-once semantics.
+
 Honours Retry-After on 429/503; exponential backoff on other transient
 errors; bounded total retry duration; size caps on responses; gzip
-decompression of responses that arrive compressed even when not
-requested (some servers do this).
+decompression only when the response DECLARES Content-Encoding: gzip
+(never by sniffing body magic — content-addressed payloads like OCI
+layer blobs legitimately ARE gzip files and must arrive verbatim).
+Callers can pin ``Accept-Encoding: identity`` to disable transport
+decompression entirely and receive raw bytes.
 
 No allowlist — UrllibClient can reach any host on :443. For
 allowlisted egress, use :class:`core.http.egress_backend.EgressClient`.
@@ -28,24 +43,36 @@ allowlisted egress, use :class:`core.http.egress_backend.EgressClient`.
 
 from __future__ import annotations
 
-import gzip
-import io
 import json
 import logging
+import math
 import re
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from collections import OrderedDict
+from collections.abc import Iterator
+from typing import Any
 from urllib import parse as _urlparse
 
 import urllib3
 from urllib3.exceptions import (
     HTTPError as _U3HTTPError,
+    InvalidHeader,
+)
+from urllib3.exceptions import (
+    LocationValueError as _U3LocationValueError,
+)
+from urllib3.exceptions import (
     MaxRetryError,
-    ProxyError as _U3ProxyError,
     ReadTimeoutError,
     SSLError,
 )
+from urllib3.exceptions import (
+    ProxyError as _U3ProxyError,
+)
+
+from core.http._body import response_body
+from core.http.headers import request_headers
 
 from core.http import (
     DEFAULT_MAX_BYTES,
@@ -57,14 +84,24 @@ from core.http import (
     NotModified,
     Response,
     SizeLimitExceeded,
+    StreamWallclockExceeded,
 )
 
 logger = logging.getLogger(__name__)
 
-# Backoff schedule for transient errors (5xx, 429). Length is chosen so
-# the cumulative sleep (1+2+5+15+60+300 = 383s) fits comfortably under
-# the default total_timeout of 600s — every slot can actually fire
-# under default config. Callers needing longer retry budgets bump
+# Permanent classes inside the urllib3 ``HTTPError`` umbrella that
+# we do NOT want the transient-retry loop to retry. Pre-fix the
+# blanket ``_U3HTTPError`` catch retried every subclass — including
+# config-error shapes like ``LocationValueError`` (raised on a
+# malformed URL the operator can't fix by waiting). Multiplied
+# latency on permanent failures without any chance of recovery.
+_U3_PERMANENT_HTTPERROR = (_U3LocationValueError, InvalidHeader)
+
+
+# Six attempt slots for transient errors (5xx, 429). The final attempt
+# has no trailing sleep, so default sleeps total 1+2+5+15+60 = 83s,
+# leaving room for I/O under the default total_timeout of 600s.
+# Callers needing longer retry budgets bump
 # total_timeout AND retries together; the schedule auto-clips against
 # the wall-clock deadline in _fetch so over-long sleeps can't blow past
 # the caller's budget.
@@ -83,11 +120,52 @@ _BACKOFF_SECONDS = (1, 2, 5, 15, 60, 300)
 # or a schedule slot never reached. Lift to an explicit RuntimeError
 # so the gate fires regardless of `-O`.
 if len(_BACKOFF_SECONDS) != DEFAULT_RETRIES + 1:
-    raise RuntimeError(
+    msg = (
         f"_BACKOFF_SECONDS length ({len(_BACKOFF_SECONDS)}) must equal "
         f"DEFAULT_RETRIES + 1 ({DEFAULT_RETRIES + 1}) — one slot for the "
         f"initial attempt + one per retry; update both together"
     )
+    raise RuntimeError(msg)
+
+
+def _caller_header(headers: dict[str, str] | None, name: str) -> str:
+    """Case-insensitive lookup in a caller-supplied header dict."""
+    if not headers:
+        return ""
+    lname = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lname:
+            return v or ""
+    return ""
+
+
+def _wants_identity(headers: dict[str, str] | None) -> bool:
+    """True when the caller pinned ``Accept-Encoding: identity`` —
+    the raw-bytes contract for content-addressed consumers (OCI
+    blobs). Transport decompression is then disabled end to end so
+    the caller hashes exactly the bytes the server stored."""
+    value = _caller_header(headers, "accept-encoding")
+    return value.strip().lower() == "identity"
+
+
+def _validate_limits(timeout, max_bytes, total_timeout, retries) -> None:
+    """Reject invalid budgets before any transport work; zero bytes is valid."""
+    for name, value, allow_zero in (
+        ("timeout", timeout, False), ("total_timeout", total_timeout, True),
+    ):
+        try:
+            valid = (
+                not isinstance(value, bool) and isinstance(value, (int, float))
+                and math.isfinite(value) and value <= threading.TIMEOUT_MAX
+                and (value >= 0 if allow_zero else value > 0)
+            )
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError(f"{name} must be finite and {'non-negative' if allow_zero else 'positive'}")
+    for name, value in (("max_bytes", max_bytes), ("retries", retries)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
 
 
 def _safe_url_for_log(url: str) -> str:
@@ -100,6 +178,12 @@ def _safe_url_for_log(url: str) -> str:
     return redact_url_secrets_only(url)
 
 
+def _safe_error(error: object) -> str:
+    """Transport exceptions can repeat URLs, query credentials and proxy secrets."""
+    from core.security.redaction import redact_secrets
+    return redact_secrets(str(error))
+
+
 _DEFAULT_POOL_MAXSIZE = 10  # connections per (host, port) — see _new_pool_manager
 
 
@@ -110,11 +194,9 @@ def _new_pool_manager() -> urllib3.PoolManager:
       Retry-After awareness; urllib3's default Retry would fight it.
     - cert_reqs='CERT_REQUIRED' + assert_hostname (urllib3 2.x default) —
       enforces TLS cert + hostname verification.
-    - maxsize=10 — connections-per-host cap. urllib3's default is 1,
-      which serialises concurrent calls to the same host (e.g. SCA
-      hammering api.osv.dev with parallel queries would queue on a
-      single connection). 10 lets up to 10 in-flight per host without
-      thrashing kernel resources.
+    - maxsize=10 — retained connections per host. With urllib3's default
+      block=False this is a cache size, not a concurrency limit; callers
+      must bound their own parallelism.
     """
     # Pre-fix `cert_reqs="CERT_REQUIRED"` enabled validation but
     # didn't pin `ca_certs=`. urllib3 then falls back to the
@@ -150,14 +232,154 @@ def _new_pool_manager() -> urllib3.PoolManager:
     )
 
 
+def _env_proxy_settings() -> tuple[dict[str, str], tuple[str, ...]]:
+    """Snapshot proxy env for the direct client.
+
+    Returns ``({scheme: proxy_url}, no_proxy_entries)``. Lowercase
+    names win (matching curl/requests precedence), ``all_proxy`` is
+    the per-scheme fallback. Empty mapping when no proxy configured.
+    """
+    import os
+
+    def _get(*names: str) -> str | None:
+        for n in names:
+            v = os.environ.get(n)
+            if v:
+                return v
+        return None
+
+    fallback = _get("all_proxy", "ALL_PROXY")
+    mapping: dict[str, str] = {}
+    https_p = _get("https_proxy", "HTTPS_PROXY") or fallback
+    http_p = _get("http_proxy", "HTTP_PROXY") or fallback
+    if https_p:
+        mapping["https"] = https_p
+    if http_p:
+        mapping["http"] = http_p
+    raw = _get("no_proxy", "NO_PROXY") or ""
+    entries = tuple(e.strip() for e in raw.split(",") if e.strip())
+    return mapping, entries
+
+
+def _host_in_no_proxy(host: str, entries: tuple[str, ...], port: int | None = None) -> bool:
+    """Suffix-match ``host`` against no_proxy entries.
+
+    Standard semantics: ``*`` matches everything; entries match the
+    exact host or any subdomain (leading dots optional). Port-qualified
+    entries apply only to that port; bracketed IPv6 entries are supported.
+    """
+    host = host.lower().rstrip(".")
+    for entry in entries:
+        e = entry.lower()
+        if e == "*":
+            return True
+        wanted_port = None
+        if e.startswith("["):
+            end = e.find("]")
+            if end == -1:
+                continue
+            suffix = e[end + 1:]
+            if suffix and not suffix.startswith(":"):
+                continue
+            wanted_port = suffix[1:] if suffix else None
+            e = e[1:end]
+        elif e.count(":") == 1:
+            e, wanted_port = e.rsplit(":", 1)
+        if wanted_port is not None:
+            if not wanted_port.isascii() or not wanted_port.isdigit() or len(wanted_port) > 5:
+                continue
+            if not 1 <= int(wanted_port) <= 65535 or int(wanted_port) != port:
+                continue
+        e = e.lstrip(".").rstrip(".")
+        if not e:
+            continue
+        if host == e or host.endswith("." + e):
+            return True
+    return False
+
+
+def _new_proxy_manager(
+    proxy_url: str, *, manager_class: type[urllib3.ProxyManager] = urllib3.ProxyManager,
+) -> urllib3.ProxyManager:
+    """ProxyManager with the same secure defaults as the direct pool.
+
+    Basic-auth userinfo in the proxy URL (``http://user:pass@corp:8080``)
+    is extracted into ``Proxy-Authorization`` headers — urllib3 does
+    not parse it from the URL itself.
+    """
+    try:
+        import certifi
+        ca_certs = certifi.where()
+    except ImportError:
+        ca_certs = None
+    parsed = _urlparse.urlsplit(proxy_url)
+    proxy_headers = None
+    if parsed.username is not None:
+        auth = _urlparse.unquote(parsed.username)
+        if parsed.password is not None:
+            auth = f"{auth}:{_urlparse.unquote(parsed.password)}"
+        proxy_headers = urllib3.make_headers(proxy_basic_auth=auth)
+        netloc = parsed.hostname or ""
+        if ":" in netloc:
+            netloc = f"[{netloc}]"
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        proxy_url = _urlparse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, parsed.query,
+             parsed.fragment)
+        )
+    return manager_class(
+        proxy_url,
+        retries=False, cert_reqs="CERT_REQUIRED",
+        ca_certs=ca_certs,
+        maxsize=_DEFAULT_POOL_MAXSIZE,
+        proxy_headers=proxy_headers,
+    )
+
+
+def _collapse_headers(resp) -> dict[str, str]:
+    """Lowercase-key, multi-value-aware header collapse.
+
+    ``{k.lower(): v for ...}`` silently dropped duplicate-name headers
+    (last value wins). The operationally-significant case is
+    ``Set-Cookie``: a response can legitimately carry multiple
+    Set-Cookie headers (one per cookie), and the dict comprehension
+    collapsed them to a single value. Other headers (Vary, Link,
+    X-Foo) can also legitimately repeat per RFC 9110 §5.3.
+
+    Aggregates via ``getlist()`` so multi-value headers become
+    newline-joined values; callers split on ``\\n`` for the
+    multi-value cases, single-value headers come back as the bare
+    string.
+    """
+    collapsed: dict[str, str] = {}
+    for key in resp.headers:
+        values = (
+            resp.headers.getlist(key)
+            if hasattr(resp.headers, "getlist") else [resp.headers[key]]
+        )
+        # Already lower-cased after collection — last lowercase wins
+        # if the server somehow sent the same header in multiple cases
+        # (very rare; if so the values are joined together too).
+        lk = key.lower()
+        if lk in collapsed and values:
+            collapsed[lk] = collapsed[lk] + "\n" + "\n".join(values)
+        else:
+            collapsed[lk] = "\n".join(values) if values else ""
+    return collapsed
+
+
 class _HostCircuitBreaker:
     """Per-(host, port) rate-limit circuit breaker.
 
     After ``threshold`` 429/5xx events from the same host within
-    ``window`` seconds, the circuit opens — subsequent requests
+    ``window`` seconds, the circuit opens — SUBSEQUENT requests
     for that host fail-fast for ``cooldown`` seconds instead of
-    retrying through the full backoff schedule (1+2+5+15+60+300 =
-    383s per request).
+    retrying through the full backoff schedule (up to 83s of sleeps
+    plus I/O per request). Granularity is per-request by design: a
+    request already in flight completes its documented backoff
+    schedule (including Retry-After) even if its own failures open
+    the circuit — see the record_failure site in ``_fetch``.
 
     Why this exists: anonymous Docker Hub pulls hit a hard rate
     limit (100 / 6h per IP) that no amount of in-process backoff
@@ -175,6 +397,10 @@ class _HostCircuitBreaker:
     Thread-safe: SCA's OCI fetcher uses an 8-worker ThreadPool
     against a shared HttpClient, so concurrent record_failure /
     is_open calls from different threads must serialise.
+
+    Retains at most ``max_hosts`` failure records using LRU eviction, and
+    at most ``threshold`` timestamps per host. Eviction may forget an old
+    cooldown; this is a retry-cost cache, not an authorisation boundary.
     """
 
     def __init__(
@@ -182,23 +408,35 @@ class _HostCircuitBreaker:
         threshold: int = 2,
         window: float = 60.0,
         cooldown: float = 120.0,
+        max_hosts: int = 4096,
     ) -> None:
+        if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold <= 0:
+            raise ValueError("circuit threshold must be a positive integer")
+        if isinstance(max_hosts, bool) or not isinstance(max_hosts, int) or max_hosts <= 0:
+            raise ValueError("max_hosts must be a positive integer")
+        _validate_limits(window, 0, cooldown, 0)
+        if cooldown <= 0:
+            raise ValueError("circuit cooldown must be positive")
         self._threshold = threshold
         self._window = window
         self._cooldown = cooldown
-        self._failures: Dict[Tuple[str, int], List[float]] = {}
-        self._open_until: Dict[Tuple[str, int], float] = {}
+        self._failures: dict[tuple[str, int], list[float]] = {}
+        self._open_until: dict[tuple[str, int], float] = {}
+        self._max_hosts = max_hosts
+        self._tracked: OrderedDict[tuple[str, int], None] = OrderedDict()
         self._lock = threading.Lock()
 
     @staticmethod
-    def _key(host: str, port: int) -> Tuple[str, int]:
+    def _key(host: str, port: int) -> tuple[str, int]:
         return (host.lower(), port)
 
-    def is_open(self, host: str, port: int) -> Tuple[bool, float]:
+    def is_open(self, host: str, port: int) -> tuple[bool, float]:
         """Return ``(is_open, seconds_remaining)``. When ``is_open``
         is True the caller should raise without making the request."""
         key = self._key(host, port)
         with self._lock:
+            if key in self._tracked:
+                self._tracked.move_to_end(key)
             now = time.monotonic()
             until = self._open_until.get(key, 0.0)
             if now < until:
@@ -218,10 +456,21 @@ class _HostCircuitBreaker:
         """
         key = self._key(host, port)
         with self._lock:
+            if key not in self._tracked:
+                if len(self._tracked) >= self._max_hosts:
+                    old, _ = self._tracked.popitem(last=False)
+                    self._failures.pop(old, None)
+                    self._open_until.pop(old, None)
+                self._tracked[key] = None
+            else:
+                self._tracked.move_to_end(key)
             now = time.monotonic()
             failures = self._failures.setdefault(key, [])
             failures[:] = [t for t in failures if now - t < self._window]
             failures.append(now)
+            # Only the newest threshold timestamps are needed to decide
+            # whether the rolling window opens this circuit.
+            del failures[:-self._threshold]
             if len(failures) >= self._threshold:
                 was_open = (now < self._open_until.get(key, 0.0))
                 self._open_until[key] = now + self._cooldown
@@ -234,6 +483,7 @@ class _HostCircuitBreaker:
         with self._lock:
             self._failures.pop(key, None)
             self._open_until.pop(key, None)
+            self._tracked.pop(key, None)
 
 
 # Module-level singleton circuit breaker — shared across all
@@ -242,11 +492,11 @@ class _HostCircuitBreaker:
 # when nobody constructs a default client. Tests that need state
 # isolation pass a fresh ``_HostCircuitBreaker()`` via the
 # ``circuit_breaker`` kwarg.
-_DEFAULT_CIRCUIT_BREAKER: Optional["_HostCircuitBreaker"] = None
+_DEFAULT_CIRCUIT_BREAKER: _HostCircuitBreaker | None = None
 _DEFAULT_CIRCUIT_BREAKER_LOCK = threading.Lock()
 
 
-def _default_circuit_breaker() -> "_HostCircuitBreaker":
+def _default_circuit_breaker() -> _HostCircuitBreaker:
     global _DEFAULT_CIRCUIT_BREAKER
     if _DEFAULT_CIRCUIT_BREAKER is None:
         with _DEFAULT_CIRCUIT_BREAKER_LOCK:
@@ -270,12 +520,10 @@ class UrllibClient:
     the ``_http`` constructor arg — typically a ``urllib3.ProxyManager``
     pointing at a chokepoint proxy.
 
-    Subclasses may also tighten ``_ALLOWED_SCHEMES`` to restrict
-    accepted URL schemes — UrllibClient accepts http and https
-    (the latter for production, the former for tests/dev paths
-    hitting localhost stubs); EgressClient narrows to https only
-    because its proxy is HTTPS-CONNECT-only and http requests
-    can't be served through it cleanly.
+    Subclasses may tighten ``_ALLOWED_SCHEMES`` to restrict accepted URLs.
+    UrllibClient and EgressClient accept HTTP and HTTPS. EgressClient
+    tunnels both through the enforcement proxy; ordinary operator proxies
+    retain their standard urllib3 forwarding behaviour.
     """
 
     _ALLOWED_SCHEMES = ("http", "https")
@@ -283,14 +531,37 @@ class UrllibClient:
     def __init__(
         self,
         user_agent: str = DEFAULT_USER_AGENT,
-        _http: Optional[urllib3.PoolManager] = None,
+        _http: urllib3.PoolManager | None = None,
         *,
-        circuit_breaker: Optional[_HostCircuitBreaker] = None,
+        circuit_breaker: _HostCircuitBreaker | None = None,
     ) -> None:
         self._ua = user_agent
-        # Subclass / test hook. Lazy default avoids spinning up a pool
-        # manager (and its certifi load) when the client is never used.
-        self._http = _http or _new_pool_manager()
+        # Subclass / test hook. An injected pool manager (EgressClient's
+        # chokepoint ProxyManager, test doubles) is used exclusively —
+        # the operator-proxy env snapshot below is then disabled, so
+        # no_proxy can never bypass the chokepoint.
+        if _http is not None:
+            self._http = _http
+            self._proxy_map: dict[str, str] = {}
+            self._no_proxy: tuple[str, ...] = ()
+        else:
+            self._http = _new_pool_manager()
+            # Proxy env is SNAPSHOTTED here but the ProxyManagers are
+            # built lazily on first proxied request. Eager
+            # construction meant a malformed proxy env (schemeless
+            # ``proxy:3128``, unsupported ``socks5://``) raised
+            # ProxySchemeUnknown out of EVERY UrllibClient(),
+            # including loopback/no_proxy-only uses that never touch
+            # the proxy.
+            self._proxy_map, self._no_proxy = _env_proxy_settings()
+        # One ProxyManager per distinct proxy URL (http and https
+        # usually share one) — schemes map onto the shared pool.
+        # Built on demand by _pool_for; a construction failure is
+        # cached so every proxied request gets the same clear error
+        # without re-raising from an unrelated code path.
+        self._proxy_pools: dict[str, urllib3.ProxyManager] = {}
+        self._proxy_pool_errors: dict[str, str] = {}
+        self._pool_lock = threading.RLock()
         # Per-host rate-limit circuit breaker. Defaults to a module-
         # level singleton so state persists ACROSS HttpClient
         # instances within one process — important for sweep-style
@@ -321,6 +592,71 @@ class UrllibClient:
     # PKCE are ~1.5 KB) and well below the smallest infra cap.
     _MAX_URL_BYTES = 64 * 1024
 
+    def _pool_for(self, url: str) -> urllib3.PoolManager:
+        """Pick the pool for ``url``: the operator-proxy pool when one
+        was detected at construction and the host isn't no_proxy'd,
+        else the direct pool (which is also the injected pool for
+        EgressClient — see ``__init__``).
+
+        Proxy pools are constructed lazily HERE, so a malformed proxy
+        env only fails the requests that would actually use the proxy
+        — with a clear :class:`HttpError` naming the bad value —
+        while direct/no_proxy traffic is unaffected.
+        """
+        with self._pool_lock:
+            return self._pool_for_locked(url)
+
+    def _pool_for_locked(self, url: str) -> urllib3.PoolManager:
+        if not self._proxy_map:
+            return self._http
+        parsed = _urlparse.urlsplit(url)
+        purl = self._proxy_map.get(parsed.scheme)
+        if purl is None:
+            return self._http
+        host = (parsed.hostname or "").lower()
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        if host and _host_in_no_proxy(host, self._no_proxy, port):
+            return self._http
+        pool = self._proxy_pools.get(parsed.scheme)
+        if pool is not None:
+            return pool
+        prior_error = self._proxy_pool_errors.get(purl)
+        if prior_error is not None:
+            raise HttpError(prior_error)
+        try:
+            # Share one manager across schemes pointing at the same
+            # proxy URL.
+            shared = next(
+                (p for s, p in self._proxy_pools.items()
+                 if self._proxy_map.get(s) == purl),
+                None,
+            )
+            pool = shared if shared is not None else _new_proxy_manager(purl)
+        except Exception as exc:
+            from core.security.redaction import redact_secrets
+            msg = (
+                f"invalid proxy configuration for scheme "
+                f"{parsed.scheme!r}: {redact_secrets(str(exc))} — fix "
+                f"the https_proxy/http_proxy/all_proxy value (must be "
+                f"an http(s):// URL) or add the host to no_proxy"
+            )
+            self._proxy_pool_errors[purl] = msg
+            raise HttpError(msg) from None
+        self._proxy_pools[parsed.scheme] = pool
+        return pool
+
+    def close(self) -> None:
+        """Clear owned pools after in-flight requests have finished.
+
+        Does not stop the shared egress proxy. Repeated calls are safe, and
+        a later request can refill the pools. Injected pools are owned by
+        this client too; do not share one across independently closed clients.
+        """
+        with self._pool_lock:
+            pools = {id(pool): pool for pool in (self._http, *self._proxy_pools.values())}
+            for pool in pools.values():
+                pool.clear()
+
     def _validate_url(self, url: str) -> _urlparse.SplitResult:
         """Reject URLs that don't match (allowed-scheme)://host/...
 
@@ -339,11 +675,18 @@ class UrllibClient:
         # CPU through the parser before the rejection lands. Compare
         # encoded bytes (ASCII + percent-encoded) since wire-length
         # is the operationally-meaningful unit.
+        if not isinstance(url, str) or not url:
+            raise HttpError("Refused URL: expected a non-empty string")
+        if len(url) > self._MAX_URL_BYTES:
+            raise HttpError(f"Refused URL exceeding {self._MAX_URL_BYTES}-byte cap")
+        if any(ord(character) <= 32 or ord(character) == 127 for character in url):
+            raise HttpError("Refused URL containing whitespace or control characters")
         if len(url.encode("utf-8", errors="ignore")) > self._MAX_URL_BYTES:
-            raise HttpError(
+            msg = (
                 f"Refused URL exceeding {self._MAX_URL_BYTES}-byte cap "
                 f"(input was {len(url)} chars)"
             )
+            raise HttpError(msg)
         # Pre-fix `_urlparse.urlsplit(url)` raised ValueError
         # directly for malformed inputs:
         #
@@ -359,23 +702,31 @@ class UrllibClient:
         # contract holds.
         try:
             parsed = _urlparse.urlsplit(url)
-        except ValueError as exc:
-            raise HttpError(
-                f"Refused malformed URL: {exc}"
-            ) from exc
+        except ValueError:
+            msg = "Refused malformed URL"
+            raise HttpError(msg) from None
         if parsed.scheme not in self._ALLOWED_SCHEMES:
             permitted = "/".join(self._ALLOWED_SCHEMES)
-            raise HttpError(
+            msg = (
                 f"Refused URL with scheme {parsed.scheme!r}: "
                 f"only {permitted} permitted"
             )
+            raise HttpError(msg)
         if not parsed.hostname:
-            raise HttpError(f"Refused URL with no host: {url!r}")
+            msg = "Refused URL with no host"
+            raise HttpError(msg)
         if parsed.username is not None or parsed.password is not None:
-            raise HttpError(
+            msg = (
                 "Refused URL with embedded credentials; pass credentials via "
                 "an Authorization header, not in the URL authority"
             )
+            raise HttpError(msg)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise HttpError("Refused URL with invalid port") from None
+        if port is not None and not 1 <= port <= 65535:
+            raise HttpError("Refused URL with invalid port")
         return parsed
 
     # -- public API -----------------------------------------------------
@@ -385,8 +736,8 @@ class UrllibClient:
         method: str,
         url: str,
         *,
-        body: Optional[bytes] = None,
-        headers: Optional[Dict[str, str]] = None,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
@@ -397,9 +748,22 @@ class UrllibClient:
     ) -> Response:
         """Low-level HTTP request — returns a full :class:`Response` object.
 
-        Use this when you need response metadata (status, headers, final
-        URL after redirects). Typical case: capturing ``ETag`` /
+        Use this when you need response metadata (status, headers,
+        final URL). Typical case: capturing ``ETag`` /
         ``Last-Modified`` for a subsequent conditional request.
+
+        Redirects are NOT followed by this backend — a 3xx response
+        is returned to the caller as-is (status + ``Location``
+        header), regardless of ``follow_redirects``. This is
+        deliberate: the post-response URL revalidation checks only
+        the generic URL gates (scheme, userinfo, host presence), not
+        caller-level address policy (e.g. the OCI registry SSRF
+        policy), so transparently following a redirect would let any
+        policy-passing host bounce a request at endpoints the caller
+        never validated. Callers that need to follow a redirect must
+        read ``Location``, re-validate the target through their own
+        policy, and issue a new request. ``follow_redirects`` is
+        retained for interface compatibility only.
 
         For arbitrary HTTP methods (DELETE, PUT, PATCH, HEAD, etc.)
         callers can pass them via this method — the convenience methods
@@ -426,9 +790,7 @@ class UrllibClient:
         """
         del stream                      # accepted for compat; no-op
         self._validate_url(url)
-        merged = {"User-Agent": self._ua}
-        if headers:
-            merged.update(headers)
+        merged = request_headers({"User-Agent": self._ua}, headers)
         return self._fetch(
             url, method=method, timeout=timeout, body=body,
             headers=merged, max_bytes=max_bytes,
@@ -441,14 +803,14 @@ class UrllibClient:
     def post_json(
         self,
         url: str,
-        body: Dict[str, Any],
+        body: dict[str, Any],
         timeout: int = DEFAULT_TIMEOUT,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """POST ``body`` as JSON, return decoded JSON response.
 
         NOTE on retry idempotency: ``post_json`` retries on transient
@@ -461,13 +823,11 @@ class UrllibClient:
         """
         self._validate_url(url)
         data = json.dumps(body).encode("utf-8")
-        merged = {
+        merged = request_headers({
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": self._ua,
-        }
-        if headers:
-            merged.update(headers)
+        }, headers)
         resp = self._fetch(url, method="POST", timeout=timeout, body=data,
                            headers=merged, max_bytes=DEFAULT_MAX_BYTES,
                            total_timeout=total_timeout, retries=retries,
@@ -479,17 +839,16 @@ class UrllibClient:
         url: str,
         timeout: int = DEFAULT_TIMEOUT,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
-    ) -> Dict[str, Any]:
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> dict[str, Any]:
         self._validate_url(url)
-        merged = {"Accept": "application/json", "User-Agent": self._ua}
-        if headers:
-            merged.update(headers)
+        merged = request_headers({"Accept": "application/json", "User-Agent": self._ua}, headers)
         resp = self._fetch(url, method="GET", timeout=timeout, body=None,
-                           headers=merged, max_bytes=DEFAULT_MAX_BYTES,
+                           headers=merged, max_bytes=max_bytes,
                            total_timeout=total_timeout, retries=retries,
                            follow_redirects=follow_redirects)
         return resp.json()
@@ -500,15 +859,13 @@ class UrllibClient:
         timeout: int = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
     ) -> bytes:
         self._validate_url(url)
-        merged = {"User-Agent": self._ua}
-        if headers:
-            merged.update(headers)
+        merged = request_headers({"User-Agent": self._ua}, headers)
         resp = self._fetch(url, method="GET", timeout=timeout, body=None,
                            headers=merged, max_bytes=max_bytes,
                            total_timeout=total_timeout, retries=retries,
@@ -521,7 +878,7 @@ class UrllibClient:
         *,
         timeout: int = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = 0,
     ) -> Iterator[bytes]:
@@ -532,12 +889,11 @@ class UrllibClient:
         chunks; exceeding ``max_bytes`` raises :class:`SizeLimitExceeded`
         mid-stream.
 
-        ``timeout`` caps the per-attempt connect+read window. The
-        ``total_timeout`` parameter is accepted for **API symmetry**
-        with the buffered methods but only enforced on connection
-        setup — once the iterator yields its first chunk, the body
-        read is bounded by ``timeout`` alone (urllib3 has no clean
-        knob for "wall-clock cap on streamed reads").
+        ``timeout`` bounds connect and idle reads. ``total_timeout`` also
+        supplies an absolute response-body deadline, including time spent
+        obtaining headers. A watchdog interrupts blocked body reads. The
+        underlying resolver and header parser retain urllib3's I/O timeout
+        semantics. Zero total_timeout means one attempt bounded by timeout.
 
         ``retries`` is accepted for API symmetry but **must be 0** —
         mid-stream failures aren't transparently retryable (would
@@ -566,105 +922,150 @@ class UrllibClient:
         file, which the caller should ``os.unlink`` in the
         except handler.
         """
+        _validate_limits(timeout, max_bytes, total_timeout, retries)
         if retries != 0:
-            raise ValueError(
+            msg = (
                 "stream_bytes does not support retries (mid-stream "
                 "failures aren't transparently resumable). "
                 "Pass retries=0 or wrap the iterator in your own "
                 "retry loop."
             )
+            raise ValueError(msg)
         self._validate_url(url)
-        merged = {"User-Agent": self._ua}
-        if headers:
-            merged.update(headers)
+        merged = request_headers({"User-Agent": self._ua}, headers)
         # Cap per-attempt timeout by remaining total_timeout so a caller
         # tightening total_timeout actually shortens the connect window.
-        effective_timeout = min(timeout, total_timeout)
+        budget = total_timeout if total_timeout > 0 else timeout
+        effective_timeout = min(timeout, budget)
         # Validation runs at call time; the generator below runs at
         # iteration time. Splitting them ensures URL errors fail fast
         # instead of waiting for the first .next() call.
         return self._stream(url, merged, effective_timeout, max_bytes,
-                            wallclock_cap=total_timeout)
+                            wallclock_cap=budget)
 
     def _stream(
         self,
         url: str,
-        headers: Dict[str, str],
+        headers: dict[str, str],
         timeout: int,
         max_bytes: int,
-        wallclock_cap: int = None,
+        wallclock_cap: int | None = None,
     ) -> Iterator[bytes]:
-        resp = self._http.request(
-            "GET", url,
-            headers=headers,
-            timeout=urllib3.Timeout(total=float(timeout)),
-            preload_content=False,
-            decode_content=True,
-            redirect=True,
-            retries=False,
-        )
+        # Same raw-bytes contract as _fetch_once: an explicit
+        # ``Accept-Encoding: identity`` disables transport
+        # decompression so content-addressed downloads hash the
+        # bytes the server stored.
+        decode = not _wants_identity(headers)
+        deadline = time.monotonic() + (timeout if wallclock_cap is None else wallclock_cap)
         try:
+            resp = self._pool_for(url).request(
+                "GET", url,
+                headers=headers,
+                timeout=urllib3.Timeout(total=float(timeout)),
+                preload_content=False,
+                decode_content=decode,
+                # Never follow redirects — same deliberate pin as
+                # `_fetch_once` (see its comment): with retries=False
+                # urllib3 already zeroed the redirect budget, so the old
+                # ``redirect=True`` here was dead weight one retry-
+                # plumbing refactor away from silently chasing 3xx into
+                # endpoints no caller-level address policy ever saw.
+                redirect=False,
+                retries=False,
+            )
+        except (_U3HTTPError, OSError) as e:
+            # Translate raw urllib3 / socket failures (OSError covers
+            # TimeoutError + ConnectionError) to the HttpError
+            # contract every consumer of this backend handles —
+            # `_fetch` does the same for the buffered path; the
+            # stream path used to leak urllib3 types untranslated.
+            msg = (
+                f"stream request failed for {_safe_url_for_log(url)}: {_safe_error(e)}"
+            )
+            raise HttpError(msg) from None
+        with response_body(resp, deadline, clock=time.monotonic) as guard:
+            # Re-validate the final URL BEFORE yielding any body
+            # bytes — same scheme/userinfo/host gates as the initial
+            # request. Defence in depth now that redirects are
+            # pinned off (it would catch a backend regression that
+            # starts following again), and it still resolves the
+            # relative-path shape urllib3's geturl() can return on
+            # 200 responses that carry a ``Location:`` header (same
+            # handling as `_fetch_once`).
+            final_url = resp.geturl() or url
+            if isinstance(final_url, str) and final_url != url:
+                from urllib.parse import urljoin, urlparse
+                if not urlparse(final_url).scheme:
+                    final_url = urljoin(url, final_url)
+                try:
+                    self._validate_url(final_url)
+                except HttpError as exc:
+                    msg = (
+                        f"refused redirect from {_safe_url_for_log(url)} "
+                        f"to {_safe_url_for_log(final_url)}: {exc}"
+                    )
+                    raise HttpError(msg) from None
             if resp.status == 304:
-                raise NotModified(
-                    f"304 Not Modified for {_safe_url_for_log(url)}",
-                )
+                msg = f"304 Not Modified for {_safe_url_for_log(url)}"
+                raise NotModified(msg)
             if resp.status >= 400:
-                snippet = resp.read(512, decode_content=True) or b""
-                reason = resp.reason or "?"
+                # Bounded read for the error message, secrets
+                # redacted — same defang as `_fetch_once`'s 4xx
+                # branch (4xx bodies commonly echo the request
+                # token back). The read itself gets the same
+                # raw-exception translation as the mid-body loop
+                # below: a server that answers error headers then
+                # stalls or resets during the 512-byte body read
+                # raises ReadTimeoutError/ProtocolError — urllib3
+                # types that would otherwise escape every consumer's
+                # ``except HttpError`` (the surrounding try has only
+                # a ``finally``).
+                try:
+                    snippet = resp.read(min(512, max_bytes), decode_content=decode) or b""
+                except (_U3HTTPError, OSError) as e:
+                    msg = (
+                        f"HTTP {resp.status} from "
+                        f"{_safe_url_for_log(url)}: error-body read "
+                        f"failed: {_safe_error(e)}"
+                    )
+                    raise HttpError(msg, status=resp.status) from None
+                from core.security.redaction import redact_secrets
+                reason_safe = redact_secrets(resp.reason or "?", reveal_secrets=False)
+                snippet_text = snippet.decode("utf-8", errors="replace")
+                snippet_safe = redact_secrets(snippet_text, reveal_secrets=False)
                 raise HttpError(
                     f"HTTP {resp.status} from {_safe_url_for_log(url)}: "
-                    f"{reason} {snippet!r}"[:200],
+                    f"{reason_safe!r} {snippet_safe!r}"[:200],
                     status=resp.status,
                 )
-            # Pre-fix the loop honoured ``timeout`` for the
-            # initial connect+read but had NO wall-clock cap on
-            # the streamed body. A slowloris-style server that
-            # trickled bytes (1 byte every 5 seconds, never
-            # idle long enough to trip the per-read timeout)
-            # held the connection open indefinitely. Operators
-            # waiting on the iterator saw "stream stalled"
-            # with no signal to abort.
-            #
-            # Apply ``wallclock_cap`` (passed from the caller's
-            # ``total_timeout``) as a hard ceiling on total
-            # generator lifetime. Aborts with TimeoutError if
-            # the stream takes longer than the cap, matching
-            # the documented contract that ``total_timeout``
-            # bounds the END-TO-END operation.
-            import time as _time
-            _start = _time.monotonic()
             total = 0
-            for chunk in resp.stream(64 * 1024, decode_content=True):
+            # Mid-stream failures (server reset, read timeout, decode
+            # error) surface from ``resp.stream`` as raw urllib3
+            # types — translate to the HttpError contract like the
+            # buffered path. The generator's own control-flow
+            # exceptions (SizeLimitExceeded, the slowloris
+            # TimeoutError) pass through untouched.
+            chunk_iter = resp.stream(64 * 1024, decode_content=decode)
+            while True:
+                try:
+                    chunk = next(chunk_iter)
+                except StopIteration:
+                    break
+                except (_U3HTTPError, OSError) as e:
+                    msg = (
+                        f"stream aborted mid-body for "
+                        f"{_safe_url_for_log(url)}: {_safe_error(e)}"
+                    )
+                    raise HttpError(msg) from None
+                guard.check()
                 total += len(chunk)
                 if total > max_bytes:
-                    raise SizeLimitExceeded(
+                    msg = (
                         f"Stream from {_safe_url_for_log(url)} "
-                        f"exceeded {max_bytes} bytes",
+                        f"exceeded {max_bytes} bytes"
                     )
-                if (wallclock_cap is not None
-                        and _time.monotonic() - _start > wallclock_cap):
-                    raise TimeoutError(
-                        f"Stream from {_safe_url_for_log(url)} exceeded "
-                        f"wallclock cap of {wallclock_cap}s "
-                        f"(slowloris defence)"
-                    )
+                    raise SizeLimitExceeded(msg)
                 yield chunk
-        finally:
-            # Same drain-then-release pattern as `_fetch_once`: a
-            # SizeLimitExceeded / TimeoutError raised mid-stream
-            # leaves bytes in the socket buffer. Releasing without
-            # draining poisons the pool — the next request that
-            # picks up the connection sees the leftover bytes
-            # prepended to its OWN response. Drain (urllib3 caps
-            # internally at ~64KB), then release.
-            try:
-                if hasattr(resp, "drain_conn"):
-                    resp.drain_conn()
-            except Exception:
-                pass
-            # Released whether the generator was fully consumed,
-            # garbage-collected mid-stream, or .close()-d explicitly.
-            resp.release_conn()
 
     # -- internals ------------------------------------------------------
 
@@ -674,48 +1075,64 @@ class UrllibClient:
         method: str,
         timeout: int,
         max_bytes: int,
-        body: Optional[bytes],
-        headers: Dict[str, str],
+        body: bytes | None,
+        headers: dict[str, str],
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
         raise_on_status: bool = True,
     ) -> Response:
+        _validate_limits(timeout, max_bytes, total_timeout, retries)
+        if not isinstance(method, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", method):
+            raise HttpError("invalid HTTP request method")
         # Wall-clock deadline for the whole retry loop. Without this,
         # the full backoff schedule (~1h worst case) can dominate
         # agentic budgets. Caller's total_timeout is authoritative —
         # if they pass total_timeout=2 (fail-fast for a health probe)
         # we honour that even when total_timeout < timeout (per-attempt).
-        deadline = time.monotonic() + total_timeout
+        deadline = time.monotonic() + (total_timeout if total_timeout > 0 else timeout)
         # Caller-cap on the retry count. retries=0 means "single attempt,
         # don't retry anything" — useful for non-idempotent POSTs and
         # health probes. The slice gives the same backoff schedule but
         # truncated; a max() guards against negative values.
-        max_attempts = max(1, min(retries + 1, len(_BACKOFF_SECONDS)))
+        max_attempts = 1 if total_timeout == 0 else min(retries + 1, len(_BACKOFF_SECONDS))
         schedule = _BACKOFF_SECONDS[:max_attempts]
 
         # Per-host circuit-breaker fast-fail. If we recently saw enough
         # 429/5xx from this host to open the circuit, skip the request
-        # entirely — saves the full backoff schedule (~383s) on a host
+        # entirely — saves the full backoff schedule (~83s) on a host
         # that's already known-bad-this-window. Most common case: Docker
         # Hub anonymous-pull rate limit during a multi-image scan.
         parsed_for_cb = _urlparse.urlsplit(url)
         cb_host = (parsed_for_cb.hostname or "").lower()
-        cb_port = parsed_for_cb.port or (
-            443 if parsed_for_cb.scheme == "https" else 80
-        )
+        try:
+            cb_port = parsed_for_cb.port or (
+                443 if parsed_for_cb.scheme == "https" else 80
+            )
+        except ValueError as e:
+            # ``.port`` raises for out-of-range ports (``:99999``) —
+            # translate so callers keep the documented HttpError
+            # contract instead of a raw ValueError.
+            msg = (
+                f"invalid port in URL {_safe_url_for_log(url)}: {_safe_error(e)}"
+            )
+            raise HttpError(msg) from None
         is_open, seconds_left = self._circuit_breaker.is_open(
             cb_host, cb_port,
         )
         if is_open:
-            raise HttpError(
+            msg = (
                 f"Circuit open for {cb_host}:{cb_port} "
                 f"(cooldown {seconds_left:.0f}s remaining); "
                 f"recent 429/5xx history. Skipping request to avoid "
-                f"retry-storm: {_safe_url_for_log(url)}",
+                f"retry-storm: {_safe_url_for_log(url)}"
+            )
+            raise HttpError(
+                msg,
+                circuit_break=True,
             )
 
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         for attempt, delay in enumerate(schedule):
             # Deadline gate. Pre-fix the check was unconditional and
             # used `>=`, which fired BEFORE the first attempt when
@@ -728,10 +1145,11 @@ class UrllibClient:
             # all". Skip the gate on attempt==0 so the first try
             # always runs; check on subsequent iterations only.
             if attempt > 0 and time.monotonic() >= deadline:
-                raise HttpError(
+                msg = (
                     f"Total timeout ({total_timeout}s) exceeded for "
-                    f"{_safe_url_for_log(url)}",
-                ) from last_exc
+                    f"{_safe_url_for_log(url)}"
+                )
+                raise HttpError(msg) from None
             # Each schedule slot represents one attempt and the sleep
             # AFTER it (before the next attempt). On the final slot
             # there is no next attempt, so we skip the post-failure
@@ -746,6 +1164,7 @@ class UrllibClient:
                     body=body, headers=headers,
                     follow_redirects=follow_redirects,
                     raise_on_status=raise_on_status,
+                    deadline=deadline,
                 )
                 # Successful response (or a 4xx-with-raise_on_status=False
                 # that we want to surface). Reset the host's circuit
@@ -762,15 +1181,30 @@ class UrllibClient:
                     or (e.status is not None and 500 <= e.status < 600)
                 )
                 if is_transient:
+                    # Record the failure so the breaker protects OTHER
+                    # requests, but do NOT abort THIS request's retry
+                    # loop when the circuit opens mid-flight. Both
+                    # directions: aborting here capped every 429/5xx
+                    # request at threshold-1 retries, making the
+                    # documented _BACKOFF_SECONDS schedule (and any
+                    # Retry-After beyond the first) unreachable for
+                    # status-driven failures — "retries=5" silently
+                    # meant one retry. Letting the in-flight request
+                    # finish its schedule costs at most one request's
+                    # backoff budget against a hard-down host (bounded
+                    # by total_timeout); the breaker's documented job —
+                    # fail-fast for SUBSEQUENT requests during cooldown
+                    # — is preserved by the is_open gate at _fetch
+                    # entry, and a mid-schedule success still closes
+                    # the circuit via record_success.
                     transitioned = self._circuit_breaker.record_failure(
                         cb_host, cb_port,
                     )
                     if transitioned:
                         logger.warning(
-                            "core.http: opening circuit breaker for "
-                            "%s:%d (recent 429/5xx threshold reached); "
-                            "subsequent requests will fail-fast for the "
-                            "cooldown window",
+                            "core.http: circuit breaker opened for "
+                            "%s:%d — subsequent requests fail fast "
+                            "for cooldown",
                             cb_host, cb_port,
                         )
                 if not is_transient:
@@ -778,9 +1212,8 @@ class UrllibClient:
                 last_exc = e
                 if is_last_attempt:
                     continue
-                # Retry-After honoured by _fetch_once if present.
                 sleep_for = e.retry_after or delay
-                logger.info(
+                logger.debug(
                     "core.http: %s %s -> %d; sleeping %ds (retry %d)",
                     method, _safe_url_for_log(url), e.status,
                     sleep_for, attempt + 1,
@@ -789,10 +1222,11 @@ class UrllibClient:
                 # doesn't blow past total_timeout.
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise HttpError(
+                    msg = (
                         f"Total timeout ({total_timeout}s) exceeded for "
-                        f"{_safe_url_for_log(url)}",
-                    ) from last_exc
+                        f"{_safe_url_for_log(url)}"
+                    )
+                    raise HttpError(msg) from None
                 time.sleep(min(sleep_for, remaining))
                 continue
             except _U3ProxyError as e:
@@ -833,51 +1267,92 @@ class UrllibClient:
                 )
                 if _has_403_status or _has_forbidden_status:
                     host = _urlparse.urlsplit(url).hostname or "?"
-                    raise HttpError(
+                    msg_0 = (
                         f"Egress proxy refused {host!r}: host not on the "
                         f"allowlist. If you're using EgressClient, add "
                         f"this host to allowed_hosts at construction — "
                         f"the chokepoint allowlist supersedes any "
                         f"no_proxy env var by design (closing it would "
                         f"reintroduce the bypass urllib3 was chosen to "
-                        f"prevent). Underlying: {e}",
-                    ) from e
+                        f"prevent). Underlying: {_safe_error(e)}"
+                    )
+                    raise HttpError(msg_0) from None
+                # CONNECT-level 5xx from the (upstream) proxy is the
+                # other hard-refusal shape: the proxy itself answered
+                # and said no (host blocked by upstream policy, or the
+                # upstream cannot reach it). Retrying with backoff just
+                # multiplies a policy decision into minutes of wall
+                # clock — observed as registry probes burning the full
+                # total_timeout per blocked host. Same anchored-pattern
+                # discipline as the 403 branch above.
+                _has_tunnel_5xx = bool(
+                    re.search(r'(?:tunnel|status|http|response)'
+                              r'[^\n]{0,40}\b50[234]\b', msg)
+                )
+                if _has_tunnel_5xx:
+                    host = _urlparse.urlsplit(url).hostname or "?"
+                    msg_0 = (
+                        f"Upstream proxy could not tunnel to {host!r} "
+                        f"(CONNECT-level 5xx — upstream policy or "
+                        f"reachability, not transient). Underlying: {_safe_error(e)}"
+                    )
+                    raise HttpError(msg_0) from None
                 last_exc = e
                 if is_last_attempt:
                     continue
-                logger.info(
+                logger.debug(
                     "core.http: %s %s proxy error: %s; backoff %ds",
-                    method, _safe_url_for_log(url), e, delay,
+                    method, _safe_url_for_log(url), _safe_error(e), delay,
                 )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise HttpError(
+                    msg_0 = (
                         f"Total timeout ({total_timeout}s) exceeded for "
-                        f"{_safe_url_for_log(url)}",
-                    ) from last_exc
+                        f"{_safe_url_for_log(url)}"
+                    )
+                    raise HttpError(msg_0) from None
                 time.sleep(min(delay, remaining))
                 continue
+            except _U3_PERMANENT_HTTPERROR as e:
+                # Permanent — config error (malformed URL, etc.).
+                # Don't retry; fail fast so the caller sees the
+                # immediate cause instead of an "exhausted retries"
+                # wrapper.
+                msg_0 = (
+                    f"core.http: permanent error fetching "
+                    f"{_safe_url_for_log(url)}: {_safe_error(e)}"
+                )
+                raise HttpError(msg_0) from None
             except (MaxRetryError, ReadTimeoutError, SSLError, _U3HTTPError,
                     TimeoutError, ConnectionError) as e:
                 last_exc = e
                 if is_last_attempt:
                     continue
-                logger.info(
+                logger.debug(
                     "core.http: %s %s network error: %s; backoff %ds",
-                    method, _safe_url_for_log(url), e, delay,
+                    method, _safe_url_for_log(url), _safe_error(e), delay,
                 )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise HttpError(
+                    msg_0 = (
                         f"Total timeout ({total_timeout}s) exceeded for "
-                        f"{_safe_url_for_log(url)}",
-                    ) from last_exc
+                        f"{_safe_url_for_log(url)}"
+                    )
+                    raise HttpError(msg_0) from None
                 time.sleep(min(delay, remaining))
                 continue
-        # Exhausted retries
-        raise HttpError(
-            f"Exhausted retries fetching {_safe_url_for_log(url)}: {last_exc}",
-        ) from last_exc
+        # Exhausted retries. With ``raise_on_status=False`` the
+        # documented contract is that transient statuses retry with
+        # backoff but the FINAL attempt's Response (whatever its
+        # status) is handed back instead of raising — honour it when
+        # the last failure was a status (carries a response), not a
+        # network error.
+        if not raise_on_status:
+            final_resp = getattr(last_exc, "response", None)
+            if final_resp is not None:
+                return final_resp
+        msg_0 = f"Exhausted retries fetching {_safe_url_for_log(url)}: {_safe_error(last_exc)}"
+        raise HttpError(msg_0) from None
 
     def _fetch_once(
         self,
@@ -885,11 +1360,16 @@ class UrllibClient:
         method: str,
         timeout: int,
         max_bytes: int,
-        body: Optional[bytes],
-        headers: Dict[str, str],
+        body: bytes | None,
+        headers: dict[str, str],
         follow_redirects: bool = True,
         raise_on_status: bool = True,
+        deadline: float | None = None,
     ) -> Response:
+        deadline = time.monotonic() + timeout if deadline is None else deadline
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StreamWallclockExceeded("Total timeout exceeded while reading HTTP response body")
         # urllib3.Timeout(total=N) caps both connect and read; matches
         # the per-call semantics our public API exposes.
         # preload_content=False normally so we can stream-read for
@@ -901,40 +1381,78 @@ class UrllibClient:
         # decode_content=True so urllib3 transparently decompresses
         # gzip/deflate responses from servers that send them whether
         # or not we asked.
-        # redirect default True follows up to 10 redirects (urllib3 default).
-        # follow_redirects=False lets callers inspect 3xx responses —
-        # useful for security scanning patterns that need to see
-        # Location headers without chasing them.
+        # redirect=False — redirects are never followed by this
+        # backend. Pre-fix the code passed redirect=follow_redirects
+        # (default True) and non-following was ACCIDENTAL: with
+        # retries=False urllib3 zeroes the redirect budget
+        # (Retry.__init__ sets redirect=0, raise_on_redirect=False
+        # when total is False), so the 3xx came back unfollowed no
+        # matter what redirect= said. One refactor of the retry
+        # plumbing away from silently starting to follow — and the
+        # post-redirect revalidation below re-checks only generic
+        # URL gates (scheme/userinfo/host), never caller-level
+        # address policy (e.g. the OCI registry SSRF policy). Pin
+        # the intended behaviour explicitly; 3xx responses surface
+        # to the caller with their Location header intact.
         is_head = method.upper() == "HEAD"
-        resp = self._http.request(
+        # ``Accept-Encoding: identity`` from the caller is the
+        # raw-bytes contract (content-addressed consumers hash the
+        # exact stored bytes): disable transport decompression for
+        # the whole request instead of letting urllib3 second-guess.
+        decode = not _wants_identity(headers)
+        resp = self._pool_for(url).request(
             method, url,
             body=body,
             headers=headers,
-            timeout=urllib3.Timeout(total=float(timeout)),
+            timeout=urllib3.Timeout(total=min(float(timeout), remaining)),
             preload_content=is_head,   # True for HEAD, False otherwise
-            decode_content=True,
-            redirect=follow_redirects,
+            decode_content=decode,
+            redirect=False,            # never follow — see comment above
             retries=False,
         )
-        try:
+        with response_body(resp, deadline, clock=time.monotonic) as guard:
             # 304 Not Modified — caller used If-None-Match / If-Modified-Since
             # and the server says the cached value is still fresh. Surface
             # via NotModified exception so caller can fall back to cache.
             # Important: 304 is NOT >= 400, so this needs to come first
             # before the generic error threshold below.
             if resp.status == 304:
-                raise NotModified(
-                    f"304 Not Modified for {_safe_url_for_log(url)}",
+                msg = f"304 Not Modified for {_safe_url_for_log(url)}"
+                raise NotModified(msg)
+            if resp.status in (429, 503) or (
+                resp.status >= 500 and not raise_on_status
+            ):
+                # Transient statuses raise HttpError so the retry loop
+                # backs off. With ``raise_on_status=False`` the
+                # documented contract is that the FINAL Response is
+                # handed back for any status — attach a bounded-body
+                # Response so the loop can return it after the last
+                # attempt instead of raising "exhausted retries".
+                msg = f"HTTP {resp.status} from {_safe_url_for_log(url)}"
+                retry_after = (
+                    self._parse_retry_after(resp.headers.get("Retry-After"))
+                    if resp.status in (429, 503) else None
                 )
-            if resp.status in (429, 503):
+                attached: Response | None = None
+                if not raise_on_status:
+                    # Error bodies are small; a fixed 64 KiB cap (never
+                    # above the caller's max_bytes) bounds the per-retry
+                    # drain a hostile server could force.
+                    body_cap = min(64 * 1024, max_bytes)
+                    err_body = b"" if is_head else (resp.read(body_cap, decode_content=decode) or b"")
+                    attached = Response(
+                        status=resp.status,
+                        headers=_collapse_headers(resp),
+                        body=err_body,
+                        url=url,
+                    )
                 raise HttpError(
-                    f"HTTP {resp.status} from {_safe_url_for_log(url)}",
+                    msg,
                     status=resp.status,
-                    retry_after=self._parse_retry_after(
-                        resp.headers.get("Retry-After"),
-                    ),
+                    retry_after=retry_after,
+                    response=attached,
                 )
-            # Treat 4xx/5xx as HttpError unless caller opted out via
+            # Treat 4xx as HttpError unless caller opted out via
             # ``raise_on_status=False`` (e.g. OCI client's 401 →
             # token-exchange retry needs to inspect WWW-Authenticate
             # on the 401 response). When opting out we still bound
@@ -942,8 +1460,7 @@ class UrllibClient:
             # an arbitrary body.
             if resp.status >= 400 and raise_on_status:
                 # Drain enough body for the error message — bounded.
-                snippet = resp.read(512, decode_content=True) or b""
-                reason = resp.reason or "?"
+                snippet = b"" if is_head else (resp.read(min(512, max_bytes), decode_content=decode) or b"")
                 # Pre-fix the snippet was interpolated into the
                 # exception message via `repr()` only — no secret
                 # redaction. 4xx responses commonly echo the
@@ -957,11 +1474,14 @@ class UrllibClient:
                 # a non-UTF-8 body (rare but possible for binary
                 # error responses) doesn't itself crash here.
                 from core.security.redaction import redact_secrets
+                # The status reason is peer-controlled too; redact before
+                # repr escapes terminal controls and directional markers.
+                reason_safe = redact_secrets(resp.reason or "?", reveal_secrets=False)
                 snippet_text = snippet.decode("utf-8", errors="replace")
                 snippet_safe = redact_secrets(snippet_text, reveal_secrets=False)
                 raise HttpError(
                     f"HTTP {resp.status} from {_safe_url_for_log(url)}: "
-                    f"{reason} {snippet_safe!r}"[:200],
+                    f"{reason_safe!r} {snippet_safe!r}"[:200],
                     status=resp.status,
                 )
 
@@ -974,86 +1494,42 @@ class UrllibClient:
                 raw = b""
             else:
                 buf = bytearray()
-                for chunk in resp.stream(64 * 1024, decode_content=True):
-                    buf.extend(chunk)
-                    if len(buf) > max_bytes:
-                        raise SizeLimitExceeded(
+                for chunk in resp.stream(64 * 1024, decode_content=decode):
+                    guard.check()
+                    if len(chunk) > max_bytes - len(buf):
+                        msg = (
                             f"Response from {_safe_url_for_log(url)} "
-                            f"exceeded {max_bytes} bytes",
+                            f"exceeded {max_bytes} bytes"
                         )
+                        raise SizeLimitExceeded(msg)
+                    buf.extend(chunk)
                 raw = bytes(buf)
-
-            # Defence in depth: some servers send Content-Encoding: gzip
-            # but urllib3 may not always auto-decode (depends on
-            # decode_content honouring). If body still looks gzip
-            # (magic bytes 1f 8b), decode here. Fall back to the raw
-            # bytes if gzip.decompress raises — the magic-byte check
-            # has a ~1/65k false-positive rate on arbitrary binary
-            # bodies, and we'd rather hand the caller raw data than
-            # corrupt a payload that wasn't actually gzip.
-            if raw.startswith(b"\x1f\x8b"):
-                # Pre-fix `gzip.decompress(raw)` had no output cap.
-                # A decompression bomb (gzip ratio >>1000:1, e.g.
-                # 100KB compressed → 10GB decompressed) consumed
-                # the parent process's full RAM before
-                # decompression finished. The size cap on the
-                # response above (`max_bytes`) bounded the
-                # COMPRESSED bytes but not the decompressed
-                # output.
-                #
-                # Use streaming decompression with a per-call
-                # cap matching `max_bytes` (or 50MB if not set
-                # — pathological-but-bounded ceiling for the
-                # rare un-capped path). Abort and keep the raw
-                # compressed bytes on cap-overflow rather than
-                # raising — the existing fallback semantics
-                # are "if decode fails, hand the caller the
-                # raw bytes".
-                _decomp_cap = max_bytes if max_bytes is not None and max_bytes > 0 else 50 * 1024 * 1024
-                try:
-                    decompressor = gzip.GzipFile(fileobj=io.BytesIO(raw), mode='rb')
-                    out = bytearray()
-                    while True:
-                        block = decompressor.read(64 * 1024)
-                        if not block:
-                            break
-                        out.extend(block)
-                        if len(out) > _decomp_cap:
-                            # Decompression bomb. Keep raw,
-                            # don't materialise the bomb output.
-                            out = None
-                            break
-                    if out is not None:
-                        raw = bytes(out)
-                except (OSError, EOFError):
-                    pass
 
             # Lowercase header keys for predictable case-insensitive
             # lookup — servers send mixed case, callers shouldn't have
             # to remember whether a particular server uses "ETag" or
             # "etag".
-            # urllib3's geturl() returns the post-redirect URL, or the
-            # request URL when no redirect happened. It can return None
-            # (or empty string) if the response object hasn't recorded
-            # the URL yet — fall back to the request URL so callers
-            # always see something parseable. Documented contract on
+            # urllib3's geturl() returns the URL the response was
+            # actually served from (the request URL, since redirects
+            # are pinned off above). It can return None (or empty
+            # string) if the response object hasn't recorded the URL
+            # yet — fall back to the request URL so callers always
+            # see something parseable. Documented contract on
             # Response.url.
             #
-            # Re-validate the post-redirect URL via _validate_url
+            # Re-validate any changed final URL via _validate_url
             # (same scheme/userinfo/host gates as the initial
-            # request). Pre-fix urllib3 would happily follow a 302
-            # `Location: http://attacker.com/...` from an https://
-            # request — a downgrade-to-cleartext that bypasses the
-            # caller's TLS expectation. Even if the host is the
-            # same, the scheme drop leaks the full request +
-            # response body in cleartext to anyone on the network
-            # path.
+            # request). With redirect=False this is defence in
+            # depth: if a backend regression ever starts following
+            # again, an https -> http downgrade redirect
+            # (`Location: http://attacker.com/...`) still gets
+            # refused here instead of silently leaking the request
+            # and response in cleartext.
             #
-            # If post-redirect URL fails validation, raise HttpError
+            # If the final URL fails validation, raise HttpError
             # rather than returning the response — caller's expected
-            # contract (validated URL) was violated by the server's
-            # redirect, and silently returning a downgraded response
-            # would mask the violation.
+            # contract (validated URL) was violated, and silently
+            # returning the response would mask the violation.
             final_url = resp.geturl() or url
             # Only revalidate when the URL actually changed AND
             # is a real string (test fixtures may mock geturl
@@ -1074,16 +1550,17 @@ class UrllibClient:
                 # turning every successful querybatch call into an
                 # empty-result error. Resolve relative paths against
                 # the original request URL before validating.
-                from urllib.parse import urlparse, urljoin
+                from urllib.parse import urljoin, urlparse
                 if not urlparse(final_url).scheme:
                     final_url = urljoin(url, final_url)
                 try:
                     self._validate_url(final_url)
                 except HttpError as exc:
-                    raise HttpError(
+                    msg = (
                         f"refused redirect from {_safe_url_for_log(url)} "
                         f"to {_safe_url_for_log(final_url)}: {exc}"
-                    ) from exc
+                    )
+                    raise HttpError(msg) from None
             # Pre-fix `{k.lower(): v for k, v in resp.headers.items()}`
             # silently dropped duplicate-name headers (last value
             # wins). The operationally-significant case is
@@ -1100,54 +1577,15 @@ class UrllibClient:
             # single-value headers still come back as the bare
             # string. urllib3's HTTPHeaderDict.getlist returns the
             # full list preserving order and casing-insensitive.
-            collapsed_headers: Dict[str, str] = {}
-            for key in resp.headers:
-                values = resp.headers.getlist(key) if hasattr(resp.headers, "getlist") else [resp.headers[key]]
-                # Already lower-cased after collection — last lowercase wins
-                # if the server somehow sent the same header in multiple cases
-                # (very rare; if so the values are joined together too).
-                lk = key.lower()
-                if lk in collapsed_headers and values:
-                    collapsed_headers[lk] = collapsed_headers[lk] + "\n" + "\n".join(values)
-                else:
-                    collapsed_headers[lk] = "\n".join(values) if values else ""
             return Response(
                 status=resp.status,
-                headers=collapsed_headers,
+                headers=_collapse_headers(resp),
                 body=raw,
                 url=final_url,
             )
-        finally:
-            # Drain THEN release. Pre-fix the finally only called
-            # `resp.release_conn()`. release_conn returns the
-            # connection to the pool WITHOUT draining any
-            # remaining body bytes from the socket buffer. The
-            # next request that picks up the connection then saw
-            # the leftover bytes prepended to its OWN response —
-            # parser confusion, wrong status codes, occasional
-            # data leaks across requests sharing the pool.
-            #
-            # Two failure paths that left bytes in the buffer:
-            #   * 4xx snippet branch reads only 512 bytes but a
-            #     larger error body has more in flight.
-            #   * SizeLimitExceeded raises mid-stream with the
-            #     remainder of the body still on the socket.
-            #
-            # `drain_conn()` reads remaining bytes (up to a small
-            # cap inside urllib3, ~64KB by default) so the socket
-            # buffer is empty when release_conn returns the conn
-            # to the pool. If drain itself fails we fall through
-            # to release — better to leak a single connection
-            # than to crash the cleanup path.
-            try:
-                if hasattr(resp, "drain_conn"):
-                    resp.drain_conn()
-            except Exception:
-                pass
-            resp.release_conn()
 
     @staticmethod
-    def _parse_retry_after(value: Optional[str]) -> Optional[int]:
+    def _parse_retry_after(value: str | None) -> int | None:
         """Parse Retry-After header. Both delta-seconds and HTTP-date forms.
 
         RFC 7231 §7.1.3 defines two grammars: a non-negative integer
@@ -1177,8 +1615,8 @@ class UrllibClient:
         # / obs-date subset of RFC 5322. Use email.utils.parsedate_to_datetime
         # which handles all three IMF/RFC 850/asctime variants.
         try:
-            from email.utils import parsedate_to_datetime
             from datetime import datetime, timezone
+            from email.utils import parsedate_to_datetime
             target = parsedate_to_datetime(s)
             if target is None:
                 return None
@@ -1186,7 +1624,10 @@ class UrllibClient:
                 target = target.replace(tzinfo=timezone.utc)
             delta = (target - datetime.now(timezone.utc)).total_seconds()
             return max(1, min(int(delta), 1800))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError catches absurd dates a hostile server can
+            # send (e.g. year=9999999) where parsedate_to_datetime
+            # constructs a datetime that overflows ``int(delta)``.
             return None
 
 

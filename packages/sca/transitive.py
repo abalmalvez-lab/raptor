@@ -1,0 +1,1139 @@
+"""Transitive-dependency expansion orchestrator.
+
+Mode (b) — cascade resolver in sandbox — is the default. The matching
+resolver from ``packages/sca/resolvers/`` runs against the manifest's
+parent dir and emits a real lockfile; we then parse those lockfile
+bytes to extract the transitive dep set with exact resolved versions.
+
+Mode (c) — registry-metadata recursive walk — is the opt-in fallback
+(``--fallback-registry-metadata``) for when (b) can't run (toolchain
+not in PATH, sandbox unavailable, resolver fails or times out, network
+refusal at proxy). Approximation; emits findings tagged
+``source_kind="metadata_walk"`` with low parser_confidence so
+operators know to triage with caution.
+
+Per-manifest, ecosystem-by-ecosystem decision tree:
+
+  1. Sibling lockfile already present? → already parsed by the
+     pipeline; skip orchestration.
+  2. ``--no-resolve-transitive``? → skip; emit hygiene reason
+     ``"resolver disabled by flag"``.
+  3. Run (b) cascade resolver in sandbox.
+     - success → parse generated lockfile bytes; emit transitives
+       with ``source_kind="cascade_resolver"`` and high confidence.
+     - skipped (toolchain unavailable) / failed (registry refused,
+       resolver couldn't satisfy, timeout) → log specific reason,
+       fall through.
+  4. ``--fallback-registry-metadata`` enabled? → run (c). Approximation
+     with low confidence.
+  5. Else → skip; the existing ``lockfile_missing`` hygiene finding
+     surfaces the gap.
+
+Returns ``(transitive_deps, [TransitiveStatus, ...])``. Status rows
+feed the operator-facing report so they can see, per ecosystem,
+whether transitive coverage was real / approximate / missing-and-why.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+
+from .models import Dependency, Manifest
+from .naming import parent_join_key as _parent_join_key
+from .parsers._safe_read import read_bounded
+from typing import TYPE_CHECKING
+from core.source.lines import split_lines
+from core.run.scratch import scratch_dir
+
+if TYPE_CHECKING:
+    from core.json import JsonCache
+    from core.http import HttpClient
+    from collections.abc import Callable, Sequence
+
+    from .resolvers import Resolver
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TransitiveStatus:
+    """Per-(manifest, ecosystem) record of how transitive expansion went."""
+
+    manifest: Path
+    ecosystem: str
+    method: str          # "cascade_resolver" / "metadata_walk" /
+                          # "skipped_lockfile_present" /
+                          # "skipped_resolver_disabled" /
+                          # "skipped_no_method_succeeded"
+    reason: str | None
+    deps_added: int = 0
+    failures: int = 0
+
+
+# ``-r`` / ``-c`` include directives in requirements-style files. Kept
+# in sync with packages/sca/parsers/requirements.py's directive set;
+# used here only for path-membership checks (the file named by the
+# directive is never opened unless it, too, is a discovered manifest).
+_REQ_INCLUDE_PREFIXES = (
+    "-r ", "--requirement ", "--requirement=",
+    "-c ", "--constraint ", "--constraint=",
+)
+# Mirrors the requirements parser's include-depth cap.
+_REQ_INCLUDE_MAX_DEPTH = 5
+
+
+def _parent_map_key(ecosystem: str, name: str) -> str:
+    """Canonical key for the child → parents maps extracted from
+    cascade lockfiles — keys AND parent values.
+
+    Delegates to the shared rule (:func:`packages.sca.naming
+    .parent_join_key`) because the transitive-drop detector joins
+    ``source_extra["via"]`` back against direct deps: producer and
+    consumer must fold identically or mixed-case parents silently
+    lose their linkage.
+    """
+    return _parent_join_key(name, ecosystem)
+
+
+def _requirements_include_targets(path: Path) -> set[Path]:
+    """Resolved ``-r``/``-c`` include targets of one requirements file."""
+    targets: set[Path] = set()
+    # Bounded no-follow read: requirements files come from the scanned
+    # tree — a planted multi-hundred-MB file allocated ~2x its size
+    # here, and a symlink leaked host-file content into the include
+    # resolution.
+    text = read_bounded(path, follow_symlinks=False)
+    if text is None:
+        return targets
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith(_REQ_INCLUDE_PREFIXES):
+            continue
+        if line.startswith(("--requirement=", "--constraint=")):
+            ref = line.split("=", 1)[1].strip()
+        else:
+            parts = line.split(None, 1)
+            ref = parts[1].strip() if len(parts) > 1 else ""
+        if not ref:
+            continue
+        try:
+            targets.add((path.parent / ref).resolve())
+        except OSError:
+            continue
+    return targets
+
+
+def _augment_declared_with_includes(
+    manifests: Sequence[Manifest], declared: set[Path],
+) -> set[Path]:
+    """Count include-only requirements manifests as declaring deps.
+
+    A top-level ``requirements.txt`` containing only ``-r reqs/base.txt``
+    produces deps whose ``declared_in`` is the INCLUDED file, so the
+    top-level path never appears in the declared-path set — yet it is
+    exactly the file the cascade resolver must compile. Walk ``-r``/
+    ``-c`` chains (bounded fixpoint, path comparison only) and add any
+    manifest whose include chain reaches a declared path.
+    """
+    result = set(declared)
+    resolved_declared = set(result)
+    for d in declared:
+        try:
+            resolved_declared.add(d.resolve())
+        except OSError:
+            continue
+    pending = [
+        m for m in manifests
+        if not m.is_lockfile
+        and m.ecosystem == "PyPI"
+        and m.path.suffix in (".txt", ".in")
+        and m.path not in result
+    ]
+    for _ in range(_REQ_INCLUDE_MAX_DEPTH):
+        if not pending:
+            break
+        still_pending = []
+        progressed = False
+        for m in pending:
+            targets = _requirements_include_targets(m.path)
+            if targets & resolved_declared:
+                result.add(m.path)
+                try:
+                    resolved_declared.add(m.path.resolve())
+                except OSError:
+                    pass
+                resolved_declared.add(m.path)
+                progressed = True
+            else:
+                still_pending.append(m)
+        pending = still_pending
+        if not progressed:
+            break
+    return result
+
+
+def _is_cargo_workspace_root(cargo_toml: Path) -> bool:
+    """True if *cargo_toml* declares ``[workspace]``."""
+    text = read_bounded(cargo_toml, follow_symlinks=False)
+    if text is None:
+        return False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "[workspace]":
+            return True
+    return False
+
+
+def _collapse_cargo_workspaces(
+    by_eco_dir: dict[tuple[str, Path], list[Manifest]],
+    lockfile_dirs: dict[tuple[str, Path], Manifest],
+) -> dict[tuple[str, Path], list[Manifest]]:
+    """Remap Cargo workspace members to their workspace root.
+
+    A workspace member (``core/zkpox/guest/Cargo.toml``) doesn't own a
+    ``Cargo.lock`` — the lock lives at the workspace root
+    (``core/zkpox/Cargo.lock``). Spawning ``cargo update`` on the member
+    alone copies only the member's manifest without the workspace root,
+    producing wrong results or an outright failure.
+
+    Walk each Cargo entry's parent chain looking for a ``Cargo.toml``
+    with ``[workspace]`` that has a sibling ``Cargo.lock``. If found,
+    drop the member entry — the root's lockfile is already parsed by
+    the pipeline's lockfile-present gate.
+    """
+    out: dict[tuple[str, Path], list[Manifest]] = {}
+    for (eco, project_dir), eco_manifests in by_eco_dir.items():
+        if eco != "Cargo":
+            out[(eco, project_dir)] = eco_manifests
+            continue
+        # Check if this entry is itself a workspace root with a lockfile
+        if ("Cargo", project_dir) in lockfile_dirs:
+            out[(eco, project_dir)] = eco_manifests
+            continue
+        # Walk parents for a workspace root with a Cargo.lock
+        collapsed = False
+        parent = project_dir.parent
+        for _ in range(10):
+            if parent == parent.parent:
+                break
+            root_toml = parent / "Cargo.toml"
+            if (root_toml.exists() and _is_cargo_workspace_root(root_toml)
+                    and (parent / "Cargo.lock").exists()):
+                logger.debug(
+                    "sca.transitive: collapsing Cargo member %s "
+                    "into workspace root %s (lockfile present)",
+                    project_dir, parent,
+                )
+                collapsed = True
+                break
+            parent = parent.parent
+        if not collapsed:
+            out[(eco, project_dir)] = eco_manifests
+    return out
+
+
+def expand_missing_transitives(
+    manifests: Sequence[Manifest],
+    direct_deps: Sequence[Dependency],
+    *,
+    http: HttpClient | None = None,
+    cache: JsonCache | None = None,
+    enable_resolver: bool = True,
+    enable_metadata_fallback: bool = False,
+) -> tuple[list[Dependency], list[TransitiveStatus]]:
+    """Expand transitive deps for manifests that don't have a sibling
+    lockfile already in ``manifests``.
+
+    Args:
+      manifests: every Manifest discovered by ``find_manifests``,
+        including any lockfiles already on disk.
+      direct_deps: every dep parsed from those manifests (post
+        ``parse_manifest``, pre ``join_deps``). Used to dedup the
+        new transitives against direct deps already declared.
+      http: HttpClient for the metadata-walk fallback. ``None``
+        disables (c) entirely.
+      cache: JsonCache for metadata-walk caching. Optional.
+      enable_resolver: when False, skip mode (b) entirely. Operators
+        running ``--no-resolve-transitive`` get this. Useful for
+        fast CI gates on lockfile-equipped projects.
+      enable_metadata_fallback: when True, fall through to mode (c)
+        when (b) fails. Operators running
+        ``--fallback-registry-metadata`` get this. Default False —
+        approximate findings hurt operator trust by default.
+
+    Returns ``(transitive_deps, statuses)``. Caller merges
+    ``transitive_deps`` into ``direct_deps`` before ``join_deps``.
+    """
+    statuses: list[TransitiveStatus] = []
+    new_transitives: list[Dependency] = []
+
+    # Build the "lockfile already on disk" set keyed by ecosystem-
+    # parent-dir so we can detect "this manifest has a sibling
+    # lockfile, skip transitive expansion".
+    lockfile_dirs: dict[tuple[str, Path], Manifest] = {}
+    for m in manifests:
+        if m.is_lockfile:
+            lockfile_dirs[(m.ecosystem, m.path.parent)] = m
+
+    # We expand per (ecosystem, project_dir) — one cascade run covers
+    # every manifest of that ecosystem in that dir. Group accordingly.
+    # ``Inline`` manifests (Dockerfile / GHA / devcontainer / shell)
+    # are skipped: they don't have an ecosystem in the cascade-resolver
+    # sense (pip / npm / cargo). Inline-extracted deps still join the
+    # direct-dep set; they just don't trigger lockfile generation.
+    # Manifests whose parse produced zero direct deps have nothing
+    # to expand — most commonly YAMLs speculatively routed through
+    # the Kubernetes parser (rule files, CI configs) that it
+    # correctly rejected. Without this filter every such file used
+    # to surface a misleading "no cascade resolver registered for
+    # Kubernetes" skip line.
+    _declared_paths = {d.declared_in for d in direct_deps}
+    # Include-only manifests declare their deps through -r/-c chains;
+    # without this they'd be filtered as "zero direct deps" and lose
+    # transitive expansion entirely.
+    _declared_paths = _augment_declared_with_includes(
+        manifests, _declared_paths,
+    )
+    by_eco_dir: dict[tuple[str, Path], list[Manifest]] = {}
+    for m in manifests:
+        if m.is_lockfile:
+            continue
+        if m.ecosystem == "Inline":
+            continue
+        if m.path not in _declared_paths:
+            continue
+        by_eco_dir.setdefault((m.ecosystem, m.path.parent), []).append(m)
+
+    # Cargo workspace collapse: workspace members (guest/, prover/, …)
+    # don't carry their own Cargo.lock — only the workspace root does.
+    # Without collapsing, each member spawns a standalone `cargo update`
+    # that copies only the member's Cargo.toml, fails or resolves a
+    # wrong dep graph, and wastes CI time. Detect workspace membership
+    # by walking parent dirs for a Cargo.toml containing [workspace].
+    by_eco_dir = _collapse_cargo_workspaces(by_eco_dir, lockfile_dirs)
+
+    # Pre-resolution typosquat gate. The cascade resolver will fetch
+    # PyPI / npm / etc. metadata for every name in the manifest — if
+    # one of those names is a confident typosquat (e.g. ``requessts``
+    # for ``requests``), the operator's manifest is pointing at an
+    # attacker-controlled name. We don't want to silently follow
+    # that into ``pip-compile`` resolution: skip cascade for any
+    # (ecosystem, project_dir) whose direct deps include a
+    # typosquat-flagged name. The mechanical-layer typosquat finding
+    # still surfaces; cascade just doesn't compound it.
+    typosquat_dirs = _typosquat_dirs(direct_deps)
+
+    # First filter pass: drop entries with sibling lockfile / disabled
+    # resolver. Build per-ecosystem work lists for the cascade pass —
+    # one resolver per ecosystem can amortise its setup cost (e.g.
+    # PipResolver builds ONE shared venv across N manifests instead
+    # of one per manifest), so dispatching by ecosystem rather than
+    # by (ecosystem, project_dir) is what unlocks batching.
+    cascade_work: dict[str, list[tuple[Path, Path]]] = {}
+    for (eco, project_dir), eco_manifests in by_eco_dir.items():
+        if (eco, project_dir) in lockfile_dirs:
+            statuses.append(TransitiveStatus(
+                manifest=eco_manifests[0].path, ecosystem=eco,
+                method="skipped_lockfile_present",
+                reason=f"sibling lockfile: {lockfile_dirs[(eco, project_dir)].path.name}",
+            ))
+            continue
+        if not enable_resolver and not enable_metadata_fallback:
+            statuses.append(TransitiveStatus(
+                manifest=eco_manifests[0].path, ecosystem=eco,
+                method="skipped_resolver_disabled",
+                reason="--no-resolve-transitive set and metadata-walk fallback off",
+            ))
+            continue
+        # Pre-resolution typosquat refusal — the manifest's own deps
+        # include a flagged name. Don't follow into resolver; surface
+        # the reason so operators see why transitives are missing.
+        if (eco, project_dir) in typosquat_dirs:
+            squatted = typosquat_dirs[(eco, project_dir)]
+            statuses.append(TransitiveStatus(
+                manifest=eco_manifests[0].path, ecosystem=eco,
+                method="skipped_typosquat_refused",
+                reason=(
+                    f"manifest declares typosquat-flagged name(s) "
+                    f"({', '.join(sorted(squatted))}); refusing to "
+                    f"query resolver. Fix the typosquat before "
+                    f"re-running."
+                ),
+            ))
+            continue
+        cascade_work.setdefault(eco, []).append(
+            (project_dir, eco_manifests[0].path),
+        )
+
+    # Cascade pass — one batch per ecosystem, dispatched in parallel
+    # across ecosystems via threads. Each ecosystem's batch holds the
+    # GIL only briefly to launch the sandbox subprocess, then sleeps
+    # in ``select.epoll`` waiting for it to finish — so threads work
+    # fine here even though Python is GIL-bound. The
+    # cross-ecosystem parallelism matters for polyglot projects;
+    # within an ecosystem, batched dry_run_batch already runs the
+    # per-manifest pip-compile calls concurrently inside one
+    # sandbox session.
+    cascade_results: dict[tuple[str, Path], tuple[list[Dependency] | None, str | None]] = {}
+    if cascade_work and enable_resolver:
+        cascade_results = _run_cascades_parallel(cascade_work, cache=cache)
+
+    # Loop-invariant: the direct-dep key set only depends on the
+    # input ``direct_deps``, so build it once rather than per
+    # (eco, project_dir) iteration.
+    direct_keys = {(d.ecosystem, d.name, d.version or "*")
+                   for d in direct_deps}
+
+    # Second pass: emit transitives + statuses per (eco, project_dir).
+    # ``by_eco_dir`` is the original work list; we look up cascade
+    # results by key. Ordering of statuses still matches input order.
+    for (eco, project_dir), eco_manifests in by_eco_dir.items():
+        if (eco, project_dir) in lockfile_dirs:
+            continue                        # already statused above
+        if not enable_resolver and not enable_metadata_fallback:
+            continue                        # already statused above
+        if (eco, project_dir) in typosquat_dirs:
+            continue                        # already statused above
+
+        added: list[Dependency] | None = None
+        method = "skipped_no_method_succeeded"
+        reason: str | None = None
+        failures = 0
+        cascade_reason: str | None = None
+
+        if enable_resolver:
+            cascade_deps, cascade_reason = cascade_results.get(
+                (eco, project_dir), (None, None),
+            )
+            if cascade_deps is not None:
+                added = cascade_deps
+                method = "cascade_resolver"
+                reason = None
+
+        # Registry-metadata walk — opt-in fallback, approximate.
+        # Use ``added is None`` (sentinel) to distinguish "cascade
+        # didn't run / failed" from "cascade ran, found nothing"
+        # (legitimate empty list).
+        if added is None and enable_metadata_fallback and http is not None:
+            walk_deps, c_failures = _try_metadata_walk(
+                eco, [d for d in direct_deps
+                      if d.ecosystem == eco
+                      and d.declared_in.parent == project_dir],
+                http=http, cache=cache,
+            )
+            failures = c_failures
+            if walk_deps:
+                added = walk_deps
+                method = "metadata_walk"
+                reason = (
+                    "approximate transitive set: cascade resolver "
+                    "unavailable, fell back to registry metadata "
+                    "(less accurate; declared deps not resolved)"
+                )
+
+        # When nothing succeeded, surface the most-informative reason
+        # we have — cascade's specific failure beats the generic
+        # "no method succeeded" message.
+        if added is None and method == "skipped_no_method_succeeded":
+            reason = cascade_reason or (
+                "no transitive-expansion method succeeded"
+            )
+
+        # Normalise sentinel: downstream code expects a list.
+        if added is None:
+            added = []
+
+        # Dedup against direct_deps — emit only NEW deps the project
+        # didn't already declare directly.
+        deduped = [
+            d for d in added
+            if (d.ecosystem, d.name, d.version or "*") not in direct_keys
+        ]
+        new_transitives.extend(deduped)
+
+        statuses.append(TransitiveStatus(
+            manifest=eco_manifests[0].path, ecosystem=eco,
+            method=method, reason=reason,
+            deps_added=len(deduped), failures=failures,
+        ))
+
+    return new_transitives, statuses
+
+
+def _run_cascades_parallel(
+    cascade_work: dict[str, list[tuple[Path, Path]]],
+    cache: JsonCache | None = None,
+) -> dict[tuple[str, Path], tuple[list[Dependency] | None, str | None]]:
+    """Dispatch one batched cascade per ecosystem in parallel.
+
+    Within each ecosystem the resolver's ``dry_run_batch`` (when it
+    has one) shares setup cost across manifests; across ecosystems
+    we use threads because each batch sleeps on its sandbox
+    subprocess.
+
+    Returns ``{(ecosystem, project_dir): (deps_or_None, reason_or_None)}``
+    for every input work item. Call sites match by key.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    out: dict[tuple[str, Path], tuple[list[Dependency] | None, str | None]] = {}
+    if not cascade_work:
+        return out
+
+    # Bound concurrency at the number of ecosystems. ThreadPoolExecutor
+    # context manager joins on exit so per-batch exceptions surface
+    # back to the orchestrator.
+    with ThreadPoolExecutor(
+        max_workers=max(1, len(cascade_work)),
+        thread_name_prefix="sca-cascade",
+    ) as pool:
+        futs = {
+            pool.submit(copy_context().run, _try_cascade_batch, eco, items, cache): eco
+            for eco, items in cascade_work.items()
+        }
+        for fut, eco in futs.items():
+            try:
+                results = fut.result()
+            except Exception as e:                      # noqa: BLE001
+                # Defensive: a batch crash shouldn't abort the whole
+                # transitive pass — surface as a failure for every
+                # work item in that ecosystem so the per-manifest
+                # status row carries a meaningful reason.
+                logger.warning(
+                    "transitive: cascade batch crashed for %s: %s", eco, e,
+                )
+                for project_dir, _host in cascade_work[eco]:
+                    out[(eco, project_dir)] = (
+                        None, f"cascade batch crashed: {e}",
+                    )
+                continue
+            for (pd, _host, deps, reason) in results:
+                out[(eco, pd)] = (deps, reason)
+    return out
+
+
+def _try_cascade_batch(
+    ecosystem: str,
+    work_items: list[tuple[Path, Path]],
+    cache: JsonCache | None = None,
+) -> list[tuple[Path, Path, list[Dependency] | None, str | None]]:
+    """Run cascade resolution for every (project_dir, host_manifest)
+    in a single ecosystem. Uses ``dry_run_batch`` so resolvers that
+    support shared-setup batching (currently :class:`PipResolver`)
+    amortise venv-creation across the batch.
+
+    Returns ``[(project_dir, host_manifest, deps_or_None, reason_or_None), ...]``
+    covering every entry of ``work_items`` (grouped-by-resolver order;
+    the caller matches results by key, not position).
+    """
+    _ensure_lockfile_parsers_loaded()
+    from .resolvers import get_resolver
+
+    out: list[tuple[Path, Path, list[Dependency] | None, str | None]] = []
+    if not work_items:
+        return out
+
+    parser = _LOCKFILE_PARSERS.get(ecosystem)
+    if parser is None:
+        for pd, host in work_items:
+            out.append(
+                (pd, host, None,
+                 (f"no lockfile parser wired for {ecosystem}; transitive "
+                 f"data was generated but cannot be ingested")),
+            )
+        return out
+
+    # Route each project_dir through ``get_resolver``'s per-dir
+    # ``matches()`` selection — a mixed-tool monorepo (poetry dir +
+    # pip dir under PyPI; yarn / pnpm / npm; Maven / Gradle) needs a
+    # different tool per dir, so picking one resolver from the first
+    # dir would run the wrong tool against the rest. Batch per
+    # distinct resolver instance (the registry resolvers are module
+    # singletons, so identity groups every dir that matched the same
+    # tool and keeps shared-setup batching engaged within each group).
+    groups: dict[int, tuple[Resolver, list[tuple[Path, Path]]]] = {}
+    for pd, host in work_items:
+        resolver = get_resolver(ecosystem, project_dir=pd)
+        if resolver is None:
+            out.append(
+                (pd, host, None,
+                 f"no cascade resolver registered for {ecosystem}"),
+            )
+            continue
+        group = groups.setdefault(id(resolver), (resolver, []))
+        group[1].append((pd, host))
+
+    for resolver, group_items in groups.values():
+        out.extend(_run_resolver_group(
+            ecosystem, resolver, group_items, parser, cache,
+        ))
+    return out
+
+
+def _run_resolver_group(
+    ecosystem: str,
+    resolver: Resolver,
+    work_items: list[tuple[Path, Path]],
+    parser: Callable[[Path], list[Dependency]],
+    cache: JsonCache | None,
+) -> list[tuple[Path, Path, list[Dependency] | None, str | None]]:
+    """Run one resolver over the work items that matched it and parse
+    the resulting lockfile bytes."""
+    from .resolvers._cache import cached_dry_run_batch
+
+    out: list[tuple[Path, Path, list[Dependency] | None, str | None]] = []
+    if not resolver.is_available():
+        for pd, host in work_items:
+            out.append(
+                (pd, host, None,
+                 (f"{ecosystem} toolchain not installed (cascade resolver "
+                 f"requires it for transitive resolution)")),
+            )
+        return out
+
+    project_dirs = [pd for pd, _ in work_items]
+    # Common ancestor of every project_dir lets the sandbox cover
+    # them all in one ``target=common_root`` session. When
+    # ``dry_run_batch`` finds it can't honour the batch (mismatched
+    # paths, single item, no-batch resolver), it falls back to
+    # sequential per-dir ``dry_run`` automatically.
+    common_root = _common_ancestor(project_dirs)
+    if cache is not None:
+        results = cached_dry_run_batch(
+            resolver, project_dirs, cache=cache,
+            common_root=common_root,
+        )
+    else:
+        # No cache wired — fall through to the direct subprocess
+        # path. Tests + early-bootstrap callers hit this branch.
+        from .resolvers import dry_run_batch as _dry_run_batch
+        results = _dry_run_batch(
+            resolver, project_dirs, common_root=common_root,
+        )
+    for (pd, host), result in zip(work_items, results, strict=True):
+        if not result.success:
+            out.append((
+                pd, host, None,
+                (f"{ecosystem} resolver failed: "
+                f"{(result.error or 'unknown error')[:140]}"),
+            ))
+            continue
+        if result.proposed_lockfile is None:
+            out.append((
+                pd, host, None,
+                (f"{ecosystem} resolver succeeded but produced no "
+                f"lockfile bytes (transitive ingest not possible)"),
+            ))
+            continue
+        deps = _parse_lockfile_bytes(
+            ecosystem, result.proposed_lockfile, parser, host,
+        )
+        if deps is None:
+            out.append((
+                pd, host, None,
+                (f"{ecosystem} lockfile parse failed for cascade output "
+                f"(unexpected format from resolver)"),
+            ))
+            continue
+        # PyPI cascade outputs (pip-compile) carry ``# via <parent>``
+        # annotations after each transitive; extract that map before
+        # parsing strips comments so we can record parent linkage in
+        # the Dependency's source_extra.
+        parents_by_name: dict[str, list[str]] = {}
+        if ecosystem == "PyPI":
+            parents_by_name = _extract_pip_compile_via(
+                result.proposed_lockfile
+            )
+        elif ecosystem == "npm":
+            parents_by_name = _extract_npm_lock_parents(
+                result.proposed_lockfile
+            )
+        elif ecosystem == "Cargo":
+            parents_by_name = _extract_cargo_lock_parents(
+                result.proposed_lockfile
+            )
+        elif ecosystem == "Packagist":
+            parents_by_name = _extract_composer_lock_parents(
+                result.proposed_lockfile
+            )
+        elif ecosystem == "RubyGems":
+            parents_by_name = _extract_gemfile_lock_parents(
+                result.proposed_lockfile
+            )
+        tagged = [
+            _with_cascade_source(
+                d, host,
+                parents=parents_by_name.get(
+                    _parent_map_key(ecosystem, d.name), [],
+                ),
+            )
+            for d in deps
+        ]
+        out.append((pd, host, tagged, None))
+    return out
+
+
+def _typosquat_dirs(
+    direct_deps: Sequence[Dependency],
+) -> dict[tuple[str, Path], list[str]]:
+    """Run the existing typosquat detector against direct deps and
+    return ``{(ecosystem, project_dir): [flagged_name, ...]}`` for
+    any (eco, project_dir) tuple whose direct deps include at least
+    one confidently-flagged typosquat. Used to gate the cascade
+    resolver — we don't want pip-compile / npm install fetching
+    metadata for attacker-controlled names.
+
+    The detector is medium-confidence at best (Damerau-Levenshtein
+    distance against a popular-names list), so we additionally
+    require the dep to be ``direct=True`` (operator-declared, not
+    inherited). The manifest-author can correct the typo and
+    re-run; meanwhile cascade staying out keeps the network
+    request from happening at all.
+    """
+    from .supply_chain.typosquat import scan_deps as _typo_scan
+    out: dict[tuple[str, Path], list[str]] = {}
+    if not direct_deps:
+        return out
+    findings = _typo_scan(direct_deps)
+    for f in findings:
+        # Only refuse on high-confidence flags. The detector emits
+        # medium for "looks similar to" cases; those should still
+        # surface to the operator but shouldn't block cascade.
+        if f.confidence.level != "high":
+            continue
+        key = (f.dependency.ecosystem, f.dependency.declared_in.parent)
+        out.setdefault(key, []).append(f.dependency.name)
+    return out
+
+
+def _common_ancestor(paths: Sequence[Path]) -> Path | None:
+    """Common-prefix path that every input is under. Used by the
+    cascade batch to size the sandbox cwd to cover all manifests in
+    one session. Single-input collapses to that input's parent (so
+    behaviour matches the sequential per-manifest path).
+
+    Returns ``None`` when the only shared prefix is the filesystem
+    root: sizing the batch sandbox cwd to ``/`` would grant the
+    resolver session filesystem-wide reads. ``None`` makes the batch
+    resolvers take their documented sequential per-dir fallback
+    (each sandboxed to its own manifest dir) instead. The
+    single-input shortcut returns that input itself (matching the
+    sequential per-manifest path) and gets the same root refusal."""
+    if len(paths) == 1:
+        only = paths[0].resolve()
+        return None if only == Path(only.anchor or "/") else paths[0]
+    parts_lists = [p.resolve().parts for p in paths]
+    shortest = min(len(pl) for pl in parts_lists)
+    common: list[str] = []
+    for i in range(shortest):
+        seg = parts_lists[0][i]
+        if all(pl[i] == seg for pl in parts_lists):
+            common.append(seg)
+        else:
+            break
+    ancestor = Path(*common) if common else None
+    if ancestor is None or ancestor == Path(ancestor.anchor or "/"):
+        return None
+    return ancestor
+
+
+# ---------------------------------------------------------------------------
+# Mode (b): cascade resolver in sandbox
+# ---------------------------------------------------------------------------
+
+
+def _extract_cargo_lock_parents(blob: bytes) -> dict[str, list[str]]:
+    """Cargo.lock parent extraction. Each ``[[package]]`` entry
+    has ``dependencies = ["name version checksum", ...]``."""
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[import,no-redef]
+        data = tomllib.loads(blob.decode("utf-8", errors="replace"))
+    except Exception:                                       # noqa: BLE001
+        return {}
+    out: dict[str, list[str]] = {}
+    packages = data.get("package") or []
+    if not isinstance(packages, list):
+        return {}
+    for pkg in packages:
+        if not isinstance(pkg, dict):
+            continue
+        parent_name = pkg.get("name")
+        if not isinstance(parent_name, str):
+            continue
+        for dep_str in pkg.get("dependencies") or []:
+            if not isinstance(dep_str, str):
+                continue
+            # ``"<name> <version> (<source>)"`` or ``"<name>"``.
+            child = dep_str.split(" ", 1)[0]
+            if child:
+                out.setdefault(
+                    _parent_map_key("Cargo", child), [],
+                ).append(_parent_map_key("Cargo", parent_name))
+    return out
+
+
+def _extract_composer_lock_parents(blob: bytes) -> dict[str, list[str]]:
+    """composer.lock parent extraction. JSON shape with
+    ``packages: [{name, require: {...}}, ...]`` and
+    ``packages-dev: [...]``."""
+    import json as _json
+    try:
+        data = _json.loads(blob)
+    except Exception:                                       # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for group in ("packages", "packages-dev"):
+        for pkg in data.get(group) or []:
+            if not isinstance(pkg, dict):
+                continue
+            parent_name = pkg.get("name")
+            if not isinstance(parent_name, str):
+                continue
+            for child_name in (pkg.get("require") or {}):
+                out.setdefault(
+                    _parent_map_key("Packagist", child_name), [],
+                ).append(_parent_map_key("Packagist", parent_name))
+    return out
+
+
+def _extract_gemfile_lock_parents(blob: bytes) -> dict[str, list[str]]:
+    """Gemfile.lock parent extraction. Format:
+
+        GEM
+          remote: https://rubygems.org/
+          specs:
+            actionpack (8.0.1)
+              actionview (= 8.0.1)
+              activesupport (= 8.0.1)
+            actionview (8.0.1)
+              activesupport (= 8.0.1)
+
+    Each top-level (non-indented gem line) names a parent; each
+    child line indented under it is a dependency."""
+    out: dict[str, list[str]] = {}
+    text = blob.decode("utf-8", errors="replace")
+    in_specs = False
+    current_parent: str | None = None
+    import re as _re
+    spec_re = _re.compile(r"^(\s+)([a-zA-Z0-9._-]+)")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "specs:":
+            in_specs = True
+            continue
+        if not in_specs:
+            continue
+        if not line.startswith(" "):
+            # Out of the specs block; reset.
+            in_specs = False
+            current_parent = None
+            continue
+        m = spec_re.match(line)
+        if not m:
+            continue
+        indent, name = m.group(1), m.group(2)
+        # Top-level gems in specs: are 4-space indented;
+        # their children are 6-space indented (2 deeper).
+        if len(indent) == 4:
+            current_parent = _parent_map_key("RubyGems", name)
+        elif len(indent) >= 6 and current_parent is not None:
+            out.setdefault(
+                _parent_map_key("RubyGems", name), [],
+            ).append(current_parent)
+    return out
+
+
+def _extract_npm_lock_parents(blob: bytes) -> dict[str, list[str]]:
+    """Extract child → [parents] map from a package-lock.json blob.
+
+    npm v2/v3 lockfile shape:
+      ``packages: {"": {...}, "node_modules/<pkg>": {dependencies: {...}}, ...}``
+    Each package entry's ``dependencies`` field lists its direct
+    requires (transitive children). We invert that to record the
+    PARENTS of each package, then the transitive-drop detector
+    can ask "if I bump <parent>, does <child> disappear?".
+
+    Returns lowercased names. The root entry ("") is the
+    user's own project — its declared deps are direct, not
+    transitives, so the root → child edges are excluded
+    (a transitive "via" listing the root would be misleading)."""
+    import json as _json
+    try:
+        data = _json.loads(blob)
+    except (ValueError, TypeError):
+        return {}
+    packages = data.get("packages") if isinstance(data, dict) else None
+    if not isinstance(packages, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for path, meta in packages.items():
+        if not isinstance(meta, dict):
+            continue
+        # Root entry has empty path; its deps are direct.
+        if path == "":
+            continue
+        parent_name = path.rsplit("node_modules/", 1)[-1]
+        if not parent_name:
+            continue
+        # Strip nested-namespace: ``node_modules/x/node_modules/y``
+        # means y is a child of x. The path's last segment is the
+        # package name; everything before identifies the parent.
+        for dep_name in (meta.get("dependencies") or {}):
+            child_canon = _parent_map_key("npm", dep_name)
+            out.setdefault(child_canon, []).append(
+                _parent_map_key("npm", parent_name),
+            )
+    return out
+
+
+def _strip_pep508_extras(name: str) -> str:
+    """Drop a PEP 508 extras suffix (``Celery[redis]`` → ``Celery``).
+
+    Extras are requirement syntax, not part of the package name —
+    PEP 503 canonical names never contain brackets, so an extras-
+    carrying name is its own fold fixpoint yet can never equal a
+    direct dep's join key. Strip before folding or the linkage is
+    silently lost."""
+    return name.split("[", 1)[0].strip()
+
+
+def _extract_pip_compile_via(blob: bytes) -> dict[str, list[str]]:
+    """Parse a pip-compile lockfile and return a name → [parents]
+    map from the ``# via <parent>`` annotations.
+
+    pip-compile emits two shapes:
+        diskcache==5.6.3
+            # via instructor
+    OR (multiple parents):
+        requests==2.31.0
+            # via
+            #   instructor
+            #   sphinx
+
+    Pinned lines may carry PEP 508 extras (``celery[redis]==5.3.6``,
+    pip-compile default keeps them) and environment markers
+    (``redis==4.5.0 ; python_version >= "3.9"``); via annotations
+    name the requirement as written, extras included
+    (``# via celery[redis]``). Both are requirement syntax, not part
+    of the name — extras are stripped and markers ignored so the
+    edge still joins.
+
+    We only need the parent list per package; downstream consumers
+    use it to ask "if I bump <parent>, does this transitive
+    disappear?". Keys AND parent values are PEP 503 canonicalised
+    (``_parent_map_key``) so dotted names like ``zope.interface``
+    join with the parser-canonicalised dep names downstream."""
+    import re as _re
+
+    text = blob.decode("utf-8", errors="replace")
+    # Match: ``<name>[extras]==<version> ; marker`` (extras group and
+    # marker tail optional) followed by an indented ``# via`` block,
+    # possibly continuing across lines as ``#   <parent>``. The name
+    # capture excludes the extras group; versions never contain ``;``.
+    pkg_re = _re.compile(
+        r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?"
+        r"==[^\s;]+\s*(?:;.*)?$",
+        _re.MULTILINE,
+    )
+    out: dict[str, list[str]] = {}
+    lines = split_lines(text)
+    for i, line in enumerate(lines):
+        m = pkg_re.match(line.strip())
+        if m is None:
+            continue
+        name = _parent_map_key("PyPI", m.group(1))
+        parents: list[str] = []
+        # Look at subsequent indented ``# via`` block.
+        j = i + 1
+        in_via = False
+        while j < len(lines):
+            sub = lines[j]
+            stripped = sub.lstrip()
+            if not stripped.startswith("#"):
+                break
+            content = stripped.lstrip("#").strip()
+            if content.startswith("via"):
+                rest = content[3:].strip()
+                if rest:
+                    # Single-line form: ``# via <parent>``
+                    for p in rest.split(","):
+                        p = _strip_pep508_extras(p)
+                        if p and not p.startswith("-"):
+                            parents.append(_parent_map_key("PyPI", p))
+                in_via = True
+            elif in_via:
+                # Continuation: ``#   <parent>``
+                parent = _strip_pep508_extras(content)
+                if parent and not parent.startswith("-"):
+                    parents.append(_parent_map_key("PyPI", parent))
+            j += 1
+        if parents:
+            out[name] = parents
+    return out
+
+
+def _parse_lockfile_bytes(
+    ecosystem: str, blob: bytes,
+    parser: Callable[[Path], list[Dependency]],
+    _host_manifest_path: Path,
+) -> list[Dependency] | None:
+    """Most lockfile parsers take a ``Path``. Write the bytes to a
+    temp file matching the parser's expected name, parse, return."""
+    expected_name = _CASCADE_LOCKFILE_NAMES[ecosystem]
+    try:
+        with scratch_dir("raptor-sca-cascade-") as workspace:
+            tmp = workspace / expected_name
+            tmp.write_bytes(blob)
+            return list(parser(tmp))
+    except Exception as e:                          # noqa: BLE001
+        logger.debug(
+            "transitive: cascade lockfile parse failed for %s: %s",
+            ecosystem, e,
+        )
+        return None
+
+
+def _with_cascade_source(
+    d: Dependency, host_manifest_path: Path,
+    *, parents: list[str] | None = None,
+) -> Dependency:
+    """Re-tag a Dependency as cascade_resolver-sourced.
+
+    Three re-tags happen here:
+      - ``source_kind="cascade_resolver"`` — the bytes came from an
+        in-sandbox cascade run, not a checked-in lockfile; the
+        report distinction matters for triage trust.
+      - ``direct=False`` — cascade output is the transitive closure;
+        the orchestrator dedups against the operator's actual
+        direct deps before the result reaches ``join_deps``.
+      - ``declared_in=host_manifest_path`` — the original
+        ``declared_in`` from the parser points at the cascade temp
+        lockfile (``/tmp/raptor-sca-cascade-<rand>/...``), which is
+        deleted before the report renders. The operator-actionable
+        path is the host manifest that triggered the cascade — what
+        they need to edit to change the resolution input.
+
+    ``parents`` (optional, PyPI-only today) records the direct
+    deps that pulled this transitive in, extracted from
+    pip-compile's ``# via <parent>`` annotations. Surfaces via
+    ``source_extra["via"]`` so the transitive-drop detector can
+    suggest parent bumps that drop CVE-bearing transitives.
+    """
+    extra = dict(d.source_extra or {})
+    if parents:
+        extra["via"] = list(parents)
+    return Dependency(
+        ecosystem=d.ecosystem, name=d.name, version=d.version,
+        declared_in=host_manifest_path, scope=d.scope,
+        is_lockfile=d.is_lockfile, pin_style=d.pin_style,
+        direct=False,
+        purl=d.purl,
+        parser_confidence=d.parser_confidence,
+        declared_license=d.declared_license,
+        commented_out=d.commented_out,
+        source_kind="cascade_resolver",
+        source_extra=extra or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode (c): registry metadata walk
+# ---------------------------------------------------------------------------
+
+def _try_metadata_walk(
+    ecosystem: str, eco_direct_deps: list[Dependency],
+    *, http: HttpClient, cache: JsonCache | None,
+) -> tuple[list[Dependency], int]:
+    """Walk the registry metadata for an ecosystem's direct deps.
+    Returns (deps, failures). Empty deps + non-zero failures is
+    "tried, couldn't get data"; empty deps + zero failures is
+    "tried, found no transitives"."""
+    from .registry_metadata_walk import walk_transitive
+    result = walk_transitive(
+        eco_direct_deps, http=http, cache=cache,
+        ecosystems={ecosystem},
+    )
+    return (result.deps_added, result.failures)
+
+
+# ---------------------------------------------------------------------------
+# Per-ecosystem cascade-output parsing
+# ---------------------------------------------------------------------------
+
+# Filename the cascade resolver's bytes should be written under so
+# the matching parser recognises the format. Different per ecosystem
+# because parsers do filename-based dispatch internally.
+_CASCADE_LOCKFILE_NAMES: dict[str, str] = {
+    "PyPI": "requirements.txt",        # pip-compile output is a pinned reqs
+    "npm": "package-lock.json",
+    "Cargo": "Cargo.lock",
+    "Go": "go.sum",
+    "RubyGems": "Gemfile.lock",
+    "Packagist": "composer.lock",
+    "NuGet": "packages.lock.json",
+    # "Maven", "Maven (Gradle)" — the resolvers emit dep-tree text
+    # rather than a structured lockfile; cascade-result parsing for
+    # these is a separate follow-up. Default behaviour: skip with
+    # "no lockfile parser wired" log.
+}
+
+
+def _import_lockfile_parser(ecosystem: str) -> Callable | None:
+    """Lazy-import the matching lockfile parser. Avoids import-time
+    cycles between transitive.py and the parsers package."""
+    if ecosystem == "PyPI":
+        from .parsers.requirements import parse as _parse
+        return _parse
+    if ecosystem == "npm":
+        from .parsers.package_lock_json import parse as _parse  # type: ignore[assignment]
+        return _parse
+    if ecosystem == "Cargo":
+        from .parsers.cargo import parse_lockfile as _parse  # type: ignore[assignment]
+        return _parse
+    if ecosystem == "Go":
+        from .parsers.gomod import parse_lockfile as _parse  # type: ignore[assignment]
+        return _parse
+    if ecosystem == "RubyGems":
+        from .parsers.gemfile import parse_lockfile as _parse  # type: ignore[assignment]
+        return _parse
+    if ecosystem == "Packagist":
+        from .parsers.composer import parse_lockfile as _parse  # type: ignore[assignment]
+        return _parse
+    if ecosystem == "NuGet":
+        from .parsers.nuget import parse_lockfile as _parse  # type: ignore[assignment]
+        return _parse
+    return None
+
+
+# Initialised lazily on first orchestrator call to avoid import-time
+# parser imports leaking into modules that don't need them.
+_LOCKFILE_PARSERS: dict[str, Callable] = {}
+_LOCKFILE_PARSERS_LOCK = threading.Lock()
+
+
+def _ensure_lockfile_parsers_loaded() -> None:
+    if _LOCKFILE_PARSERS:
+        return
+    with _LOCKFILE_PARSERS_LOCK:
+        if _LOCKFILE_PARSERS:
+            return
+        for eco in _CASCADE_LOCKFILE_NAMES:
+            p = _import_lockfile_parser(eco)
+            if p is not None:
+                _LOCKFILE_PARSERS[eco] = p
+
+
+__all__ = [
+    "TransitiveStatus",
+    "expand_missing_transitives",
+]

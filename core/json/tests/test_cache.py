@@ -7,7 +7,10 @@ generic ``core.json.cache`` location.
 
 from __future__ import annotations
 
+from core.testing.threads import retiring_threads
+
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -15,7 +18,8 @@ from pathlib import Path
 import pytest
 
 # core/json/tests/test_cache.py -> repo root
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from core.json import TTL_FOREVER, JsonCache
 
@@ -83,13 +87,27 @@ def test_subdirectory_keys(tmp_path: Path) -> None:
     assert cache.get("vulns/GHSA-xxx", ttl_seconds=60) == {"id": "GHSA-xxx"}
 
 
-def test_path_traversal_in_key_is_blocked(tmp_path: Path) -> None:
+def test_path_traversal_in_key_is_refused(tmp_path: Path) -> None:
+    # Degenerate segments are refused loudly rather than normalised:
+    # silently dropping them made distinct keys collide onto one file
+    # ("foo/.." used to alias "foo"), letting one entry shadow another.
     cache = JsonCache(root=tmp_path)
-    cache.put("../escape", "should-not-escape", ttl_seconds=60)
-    # Either the file lives inside the cache root, or the put silently
-    # discarded the segment; either way, no escape.
+    with pytest.raises(ValueError):
+        cache.put("../escape", "should-not-escape", ttl_seconds=60)
     assert not (tmp_path.parent / "escape.json").exists()
-    assert (tmp_path / "escape.json").exists()
+    assert not (tmp_path / "escape.json").exists()
+
+
+def test_degenerate_segments_cannot_alias_another_key(tmp_path: Path) -> None:
+    cache = JsonCache(root=tmp_path)
+    cache.put("npm-meta:lodash", {"ok": True}, ttl_seconds=60)
+    for alias in ("npm-meta:lodash/..", "npm-meta:lodash/.",
+                  "npm-meta:lodash//", "./npm-meta:lodash"):
+        with pytest.raises(ValueError):
+            cache.put(alias, None, ttl_seconds=60)
+        with pytest.raises(ValueError):
+            cache.get(alias, ttl_seconds=60)
+    assert cache.get("npm-meta:lodash", ttl_seconds=60) == {"ok": True}
 
 
 def test_empty_key_after_sanitisation_raises(tmp_path: Path) -> None:
@@ -117,8 +135,53 @@ def test_unwritable_root_falls_back_to_no_op(tmp_path: Path) -> None:
 def test_atomic_write_does_not_leave_temp_files(tmp_path: Path) -> None:
     cache = JsonCache(root=tmp_path)
     cache.put("k", "v", ttl_seconds=60)
-    leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+    leftovers = [
+        p for p in tmp_path.iterdir()
+        if ".tmp." in p.name or p.name.endswith(".tmp")
+    ]
     assert leftovers == []
+
+
+def test_planted_symlink_at_legacy_tmp_name_not_followed(
+    tmp_path: Path,
+) -> None:
+    """A pre-planted symlink at the legacy predictable tempfile name
+    (``<key>.json.tmp.<pid>.<tid>``) must never be followed: the write
+    goes through core.atomic_fs (random-suffix temp, O_EXCL |
+    O_NOFOLLOW), so the victim file stays untouched and the entry
+    still lands."""
+    import threading
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    entry = tmp_path / "k.json"
+    legacy_tmp = entry.with_suffix(
+        f".tmp.{os.getpid()}.{threading.get_ident()}")
+    legacy_tmp.symlink_to(victim)
+
+    cache = JsonCache(root=tmp_path)
+    cache.put("k", "v", ttl_seconds=60)
+
+    assert victim.read_text() == "precious"
+    assert not entry.is_symlink()
+    assert cache.get("k", ttl_seconds=60) == "v"
+
+
+def test_keyed_subdir_turned_readonly_degrades_not_crashes(
+    tmp_path: Path,
+) -> None:
+    """A cache root that turns read-only AFTER construction must
+    degrade to no-cache (the documented contract), not raise from a
+    keyed-subdir put."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses permission bits")
+    cache = JsonCache(root=tmp_path)
+    tmp_path.chmod(0o500)
+    try:
+        cache.put("vulns/GHSA-x", {"a": 1}, ttl_seconds=60)  # must not raise
+        assert cache.get("vulns/GHSA-x", ttl_seconds=60) is None
+    finally:
+        tmp_path.chmod(0o700)
 
 
 def test_keys_with_dotted_segments_do_not_collide(tmp_path: Path) -> None:
@@ -210,16 +273,20 @@ def test_concurrent_threads_same_key_no_torn_writes(tmp_path: Path) -> None:
     barrier = _threading.Barrier(8)
 
     def writer(i: int) -> None:
-        barrier.wait()
+        try:
+            barrier.wait()
+        except _threading.BrokenBarrierError:
+            return
         for _ in range(50):
             cache.put("hot-key", {"writer": i, "n": _}, ttl_seconds=60)
 
     threads = [_threading.Thread(target=writer, args=(i,))
                for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    with retiring_threads(threads, release=barrier.abort, timeout=5):
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     # Whatever the final winner is, the read MUST succeed (no torn
     # file) and produce a value from one of the writers.
@@ -236,9 +303,18 @@ def test_non_json_serialisable_value_does_not_leak_tempfile(tmp_path: Path) -> N
     # datetime is not JSON-serialisable by default; json.dump will raise
     # TypeError. Older versions of this code only caught OSError, leaking
     # the partial tempfile.
-    cache.put("k", datetime.datetime.now(), ttl_seconds=60)
-    leftovers = sorted(p.name for p in tmp_path.rglob("*") if p.is_file())
-    assert leftovers == [], f"tempfile leak: {leftovers}"
+    cache.put("k", datetime.datetime.now(tz=datetime.timezone.utc),
+              ttl_seconds=60)
+    # Tempfile leak = .tmp.<pid>[.<tid>] shaped leftovers. The reaper's
+    # rate-limit sentinel (``.reap_last_run``) is cache infrastructure,
+    # not a leak — exclude it from the assertion.
+    tempfile_leftovers = sorted(
+        p.name for p in tmp_path.rglob("*")
+        if p.is_file() and ".tmp." in p.name
+    )
+    assert tempfile_leftovers == [], (
+        f"tempfile leak: {tempfile_leftovers}"
+    )
     # And the cache returns None on subsequent get (write was rejected).
     assert cache.get("k", ttl_seconds=60) is None
 
@@ -310,14 +386,160 @@ def test_memo_invalidated_on_invalidate(tmp_path: Path) -> None:
     assert cache.get("k", ttl_seconds=60) is None
 
 
-def test_memo_negative_cached_miss_is_recomputed_after_put(
+def test_memo_miss_is_recomputed_after_put(
     tmp_path: Path,
 ) -> None:
-    """Repeated misses on a never-written key shouldn't trigger
-    repeat disk stat — but a subsequent put on that key must be
-    seen by the next get."""
+    """Repeated misses must not hide a subsequent write to the same key."""
     cache = JsonCache(root=tmp_path)
     assert cache.get("k", ttl_seconds=60) is None
     assert cache.get("k", ttl_seconds=60) is None
     cache.put("k", "v", ttl_seconds=60)
     assert cache.get("k", ttl_seconds=60) == "v"
+
+
+# ---------------------------------------------------------------------------
+# Reaper rate-limit
+# ---------------------------------------------------------------------------
+
+def test_reaper_writes_sentinel_after_first_run(tmp_path: Path) -> None:
+    """First-ever JsonCache construction reaps + drops a sentinel."""
+    JsonCache(root=tmp_path)
+    sentinel = tmp_path / ".reap_last_run"
+    assert sentinel.is_file()
+
+
+def test_reaper_skipped_when_sentinel_is_fresh(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Second construction within the rate-limit window must NOT
+    re-walk the cache. We assert by stubbing the candidate iterator
+    to detect the call."""
+    JsonCache(root=tmp_path)
+    # Sentinel now exists with current mtime.
+    # Patch through the reaper's OWN globals rather than the
+    # sys.modules entry — suites that purge core.json.* from
+    # sys.modules (lazy-reexport tests) leave this file's JsonCache
+    # binding as a class whose function globals belong to a detached
+    # module object; a module-attr patch would
+    # then land on a fresh re-import the spy never observes, making
+    # the no-walk assertion vacuously true.
+    reaper_globals = JsonCache._reap_orphan_tempfiles.__globals__
+    calls: list = []
+    original = reaper_globals["_iter_tempfile_candidates"]
+
+    def spy(root, **kwargs):
+        calls.append(str(root))
+        return original(root, **kwargs)
+
+    monkeypatch.setitem(reaper_globals, "_iter_tempfile_candidates", spy)
+    JsonCache(root=tmp_path)
+    cache_walks = [c for c in calls if str(tmp_path) in c]
+    assert cache_walks == [], (
+        f"reaper was not rate-limit-skipped on warm sentinel: {cache_walks}"
+    )
+
+
+def test_reaper_runs_when_sentinel_is_stale(tmp_path: Path) -> None:
+    """When the sentinel's mtime is older than the rate-limit window,
+    the reaper must run again — verified by checking the sentinel's
+    mtime is updated to ~now after construction."""
+    sentinel = tmp_path / ".reap_last_run"
+    sentinel.touch()
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+
+    before = time.time()
+    JsonCache(root=tmp_path)
+    new_mtime = sentinel.stat().st_mtime
+    assert new_mtime >= before - 1, (
+        f"reaper did not update sentinel on stale mtime: "
+        f"sentinel_mtime={new_mtime:.1f}, expected>={before - 1:.1f}"
+    )
+
+
+def test_reaper_finds_shallow_tempfiles_but_skips_deep(tmp_path: Path) -> None:
+    """Depth-bounded scan picks up depth-1/2 orphans (the SCA cache
+    shape) but stops before walking the whole tree on big caches.
+
+    Also exercises the legacy ``.tmp.<pid>`` shape so a writer crash
+    from an older RAPTOR version still gets cleaned."""
+    # Depth-1 orphan with current shape.
+    (tmp_path / "shallow.json.tmp.12345.99999").write_text("{}")
+    # Depth-2 orphan under a normal SCA subdir.
+    sub = tmp_path / "npm-meta:@scope"
+    sub.mkdir()
+    (sub / "name.json.tmp.12345.99999").write_text("{}")
+    # Backdate both so they're outside the freshness window.
+    import os as _os
+    old = time.time() - 600  # 10 min ago
+    _os.utime(tmp_path / "shallow.json.tmp.12345.99999", (old, old))
+    _os.utime(sub / "name.json.tmp.12345.99999", (old, old))
+    JsonCache(root=tmp_path)
+    assert not (tmp_path / "shallow.json.tmp.12345.99999").exists()
+    assert not (sub / "name.json.tmp.12345.99999").exists()
+
+
+# ---------------------------------------------------------------------------
+# Memo byte-budget LRU
+# ---------------------------------------------------------------------------
+
+def test_memo_evicts_oldest_when_budget_exceeded(tmp_path: Path) -> None:
+    """Once the byte budget is exceeded, the LRU front entry is dropped
+    and ``memo_evictions`` increments. Disk values stay; only the
+    in-process memo is cleared, so a re-read still works."""
+    c = JsonCache(root=tmp_path)
+    # Tight budget makes every entry trigger eviction.
+    c._memo_budget = 256
+    payload = "x" * 200
+    for i in range(5):
+        c.put(f"key_{i}", payload, ttl_seconds=3600)
+        c.get(f"key_{i}", ttl_seconds=3600)  # populate memo
+    # ~200B payload + envelope JSON overhead ~80B = ~280B per entry,
+    # so each get() pushes us past budget and the oldest entry is
+    # evicted. Final state: only the most-recently-inserted entry
+    # survives (a single oversize entry is always kept regardless of
+    # budget — eviction stops before dropping the just-inserted row).
+    assert len(c._memo) == 1
+    assert c.memo_evictions >= 4
+    # A re-read after eviction still works — the disk file is intact.
+    assert c.get("key_0", ttl_seconds=3600) == payload
+
+
+def test_memo_touch_keeps_hot_entry_alive(tmp_path: Path) -> None:
+    """LRU-touched (recently-read) entries survive eviction over
+    cold entries even when the cold entries were inserted later."""
+    c = JsonCache(root=tmp_path)
+    # Budget chosen so two entries (~268B each) fit but a third
+    # triggers eviction of one.
+    c._memo_budget = 700
+    payload = "x" * 200
+    c.put("hot", payload, ttl_seconds=3600)
+    c.get("hot", ttl_seconds=3600)            # memo[hot]
+    c.put("cold_1", payload, ttl_seconds=3600)
+    c.get("cold_1", ttl_seconds=3600)         # memo[hot, cold_1]
+    # Re-read "hot" — now hot is MRU, cold_1 is LRU.
+    c.get("hot", ttl_seconds=3600)            # memo[cold_1, hot]
+    # Third entry forces one eviction; cold_1 (LRU) goes, hot stays.
+    c.put("cold_2", payload, ttl_seconds=3600)
+    c.get("cold_2", ttl_seconds=3600)         # memo[hot, cold_2]
+    assert "hot" in c._memo
+    assert "cold_1" not in c._memo
+    assert c.memo_evictions >= 1
+
+
+def test_nul_byte_key_degrades_never_crashes(tmp_path: Path) -> None:
+    # An embedded NUL survives segment sanitisation (unlike "..", it
+    # aliases nothing — the path simply cannot exist on disk) but the
+    # filesystem call itself raises ValueError, an exception type the
+    # OSError-only degrade handlers did not cover. Keys carry
+    # externally-influenced package names, and the documented
+    # contract is cache-degrades-never-crashes — so a NUL key must be
+    # a silent miss, not a consumer crash. Degenerate segments
+    # (".."), which CAN alias, stay loudly refused (pinned above).
+    cache = JsonCache(root=tmp_path)
+    cache.put("pkg\x00name", {"v": 1}, ttl_seconds=60)
+    assert cache.get("pkg\x00name", ttl_seconds=60) is None
+    cache.invalidate("pkg\x00name")
+    # And the cache still works for sane keys afterwards.
+    cache.put("pkg-name", {"v": 2}, ttl_seconds=60)
+    assert cache.get("pkg-name", ttl_seconds=60) == {"v": 2}

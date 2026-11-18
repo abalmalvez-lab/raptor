@@ -1,11 +1,8 @@
 """Tests for packages/fuzzing/crash_collector.py."""
 
-import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from packages.fuzzing.crash_collector import Crash, CrashCollector
 
@@ -102,6 +99,54 @@ class TestCollectCrashes:
         # N" — so equality is the right check.
         assert len(crashes) == 2
 
+    def test_max_crashes_bounds_unique_not_raw_files(self, tmp_path):
+        # Regression: the file list was sliced to max_crashes BEFORE
+        # dedup, so duplicate inputs consumed the budget. Three
+        # identical files followed by two distinct ones must still
+        # yield two unique crashes at max_crashes=2.
+        dup = b"identical crash content"
+        for i in range(3):
+            _make_crash_file(tmp_path, f"id:{i:06d},sig:11", dup)
+        _make_crash_file(tmp_path, "id:000003,sig:11", b"distinct A")
+        _make_crash_file(tmp_path, "id:000004,sig:11", b"distinct B")
+
+        collector = CrashCollector(tmp_path)
+        crashes = collector.collect_crashes(max_crashes=2)
+        assert len(crashes) == 2
+        assert len({c.crash_id for c in crashes}) == 2
+
+    def test_stack_hasher_dedups_across_different_inputs(self, tmp_path):
+        # Two DIFFERENT inputs hitting the same bug share a stack hash;
+        # a third with a distinct stack survives.
+        _make_crash_file(tmp_path, "id:000000,sig:11", b"input A")
+        _make_crash_file(tmp_path, "id:000001,sig:11", b"input B")
+        _make_crash_file(tmp_path, "id:000002,sig:11", b"input C")
+
+        hashes = {
+            "id:000000,sig:11": "deadbeefcafe0001",
+            "id:000001,sig:11": "deadbeefcafe0001",
+            "id:000002,sig:11": "deadbeefcafe0002",
+        }
+
+        collector = CrashCollector(tmp_path)
+        crashes = collector.collect_crashes(
+            stack_hasher=lambda p: hashes[p.name],
+        )
+        assert len(crashes) == 2
+        assert all(c.stack_hash for c in crashes)
+
+    def test_stack_hasher_failure_falls_back_to_input_hash(self, tmp_path):
+        _make_crash_file(tmp_path, "id:000000,sig:11", b"same bytes")
+        _make_crash_file(tmp_path, "id:000001,sig:11", b"same bytes")
+
+        def broken_hasher(path):
+            raise RuntimeError("debugger unavailable")
+
+        collector = CrashCollector(tmp_path)
+        crashes = collector.collect_crashes(stack_hasher=broken_hasher)
+        # Fallback input-hash dedup still collapses identical content.
+        assert len(crashes) == 1
+
     def test_parses_crash_id_from_filename(self, tmp_path):
         _make_crash_file(tmp_path, "id:000042,sig:11,src:000000,op:havoc,rep:4")
         collector = CrashCollector(tmp_path)
@@ -125,6 +170,31 @@ class TestCollectCrashes:
         collector = CrashCollector(tmp_path)
         crashes = collector.collect_crashes()
         assert crashes[0].timestamp is not None
+
+    def test_symlinks_in_crashes_dir_are_rejected(self, tmp_path):
+        # The crashes dir is target-writable: a hostile fuzz target can
+        # plant an 'id:'-named symlink to a host file, which would be
+        # hashed here and persisted into the witness store / LLM
+        # prompts. Symlinks must never be followed.
+        secret = tmp_path / "host-secret"
+        secret.write_bytes(b"private key material")
+        crashes_dir = tmp_path / "crashes"
+        crashes_dir.mkdir()
+        (crashes_dir / "id:000000,sig:11").symlink_to(secret)
+        collector = CrashCollector(crashes_dir)
+        assert collector.collect_crashes() == []
+
+    def test_regular_files_survive_symlink_filter(self, tmp_path):
+        # Direction two: the guard must not eat real crash files that
+        # sit next to a planted symlink.
+        secret = tmp_path / "host-secret"
+        secret.write_bytes(b"private key material")
+        crashes_dir = tmp_path / "crashes"
+        crashes_dir.mkdir()
+        (crashes_dir / "id:000000,sig:11").symlink_to(secret)
+        _make_crash_file(crashes_dir, "id:000001,sig:06", b"real crash")
+        crashes = CrashCollector(crashes_dir).collect_crashes()
+        assert [c.crash_id for c in crashes] == ["000001"]
 
     def test_crash_input_file_is_path(self, tmp_path):
         _make_crash_file(tmp_path, "id:000000,sig:11")
@@ -228,3 +298,64 @@ class TestHashFile:
         f.write_bytes(b"test")
         collector = CrashCollector(tmp_path)
         assert len(collector._hash_file(f)) == 16
+
+
+# ---------------------------------------------------------------------------
+# Merged multi-instance crash ids
+# ---------------------------------------------------------------------------
+
+class TestMergedInstanceCrashIds:
+    """AFL ids are only unique per instance; merged_crashes filenames
+    carry an ``,instance:<name>`` suffix and crash_id must keep it —
+    consumers key dicts by crash_id (SMT attribution, witnesses) and
+    two instances' ``id:000000`` must not collapse into one key."""
+
+    def test_instance_suffix_carried_into_crash_id(self, tmp_path):
+        _make_crash_file(
+            tmp_path, "id:000000,sig:11,src:000001,instance:main", b"a")
+        _make_crash_file(
+            tmp_path, "id:000000,sig:06,src:000002,instance:secondary1", b"b")
+        crashes = CrashCollector(tmp_path).collect_crashes()
+        ids = sorted(c.crash_id for c in crashes)
+        assert ids == [
+            "000000,instance:main",
+            "000000,instance:secondary1",
+        ]
+
+    def test_single_instance_id_unchanged(self, tmp_path):
+        _make_crash_file(tmp_path, "id:000042,sig:11,src:000001", b"a")
+        crashes = CrashCollector(tmp_path).collect_crashes()
+        assert crashes[0].crash_id == "000042"
+
+
+class TestVanishingFiles:
+    """The crashes dir is target-writable and live during collection —
+    a file deleted between directory listing and stat() must be
+    skipped, not crash the collection pass."""
+
+    def test_parse_crash_file_vanished_returns_none(self, tmp_path):
+        from packages.fuzzing.crash_collector import CrashCollector
+
+        collector = CrashCollector(tmp_path)
+        ghost = tmp_path / "id:000000,sig:11,src:000000"
+        assert collector._parse_crash_file(ghost) is None
+
+    def test_collect_skips_vanishing_file(self, tmp_path, monkeypatch):
+        from packages.fuzzing.crash_collector import CrashCollector
+
+        survivor = tmp_path / "id:000001,sig:06,src:000000"
+        survivor.write_bytes(b"crash-bytes")
+        ghost = tmp_path / "id:000000,sig:11,src:000000"
+        ghost.write_bytes(b"soon-gone")
+
+        collector = CrashCollector(tmp_path)
+        real_parse = collector._parse_crash_file
+
+        def racing_parse(crash_file):
+            if crash_file.name.startswith("id:000000"):
+                crash_file.unlink(missing_ok=True)  # the race
+            return real_parse(crash_file)
+
+        monkeypatch.setattr(collector, "_parse_crash_file", racing_parse)
+        crashes = collector.collect_crashes()
+        assert [c.input_file.name for c in crashes] == [survivor.name]

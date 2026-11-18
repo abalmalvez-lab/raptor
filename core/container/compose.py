@@ -1,0 +1,1887 @@
+"""docker-compose mechanics for multi-service stacks.
+
+Stacks with ``volumes``, ``command``, ``environment``, or multi-service
+``depends_on`` blocks cannot be reduced to a single ``docker pull``.
+This module shells out to ``docker compose`` (V2 plugin, legacy binary
+fallback) to build + start such stacks and picks a primary service so
+callers keep a single-container abstraction.
+
+Before anything launches, ``rewrite_for_localhost`` stages a tmpdir
+copy of the compose dir (symlinks preserved; links escaping the
+staging dir are pruned), gates the FULL resolution graph (the primary
+document plus every transitively ``extends``-referenced document —
+each file reference confined to staging, refused otherwise), resolves
+the effective service model through ``docker compose config`` run with
+a minimal interpolation environment and — where the host supports it —
+inside a read-confined sandbox (interpolation, ``extends``, YAML
+anchors, ``.env`` are applied by compose itself; the sanitizer must
+see what the daemon would run, not the raw text), then rebuilds each
+service from a KEY ALLOWLIST: every published port becomes
+``127.0.0.1:0:<target>``, bind-mount sources must resolve inside the
+staging dir (and may not nest under another container-writable bind —
+the daemon re-resolves sources at container start, so a writable
+parent is a symlink-swap TOCTOU; see
+``_refuse_writable_bind_overlaps``), ``build`` contexts are confined
+to the staging dir,
+``cap_add`` is filtered to a safe-capability allowlist, devices are
+filtered to safe pseudo-devices unless the caller opts out,
+single-container-parity resource limits are injected per service, and
+caller labels are injected per service so label-scoped cleanup finds
+compose-launched containers. Every stack network (including the
+implicit default) is forced ``internal`` — no routed egress; the
+verify endpoint moves to the container's own network address (see
+``up_stack``); the host's bridge gateway address remains reachable
+from inside for host services bound on 0.0.0.0 (documented residual —
+loopback-bound host services are not reachable). Host-resource keys
+(``privileged``, ``pid``, ``network_mode: host``, ``security_opt``,
+``userns_mode``, ``ulimits``, ...) never survive because unknown keys
+are DROPPED, not passed through. Constructs the resolution graph
+cannot be vouched for — ``include:``, out-of-staging or interpolated
+``extends``/``env_file`` references at any depth, external/host-file
+secrets — are REFUSED (fail closed), never passed through.
+
+Project names are caller-derived and deterministic so ``down_stack``
+finds the stack even after crashes; teardown is ``down -v
+--remove-orphans`` for volume + network cleanup.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import stat
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from contextlib import contextmanager
+from collections.abc import Iterator
+from functools import lru_cache
+from pathlib import Path
+
+from core.atomic_fs import rmtree_hardened
+from typing import Any
+
+import yaml
+
+from core.container.proc import docker_child_env, run_cli
+from core.run.scratch import keepalive_register, keepalive_unregister, scratch_dir
+from core.source import open_regular_beneath
+from core.source.streams import preserving_stream_error
+
+logger = logging.getLogger(__name__)
+
+
+class ComposeError(RuntimeError):
+    """Raised when a ``docker compose`` invocation fails. Carries
+    ``stderr`` so callers can forward the raw subprocess stderr without
+    re-parsing ``str(exc)``.
+    """
+
+    def __init__(self, message: str, *, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
+
+
+# Cached for process lifetime. If Docker restarts mid-bench, stale path will cause errors.
+@lru_cache(maxsize=1)
+def _compose_invocation() -> tuple[str, ...]:
+    """Return the argv prefix for compose -- V2 plugin if available,
+    else legacy ``docker-compose`` binary. Cached per process.
+    """
+    # Even probe calls use the allowlisted env. run_cli folds
+    # timeout/OSError into RunOutcome with returncode=None on transport
+    # failure; we just check returncode == 0 for plugin presence, otherwise
+    # fall through to legacy `docker-compose` discovery.
+    docker_bin = shutil.which("docker")
+    if docker_bin is not None:
+        outcome = run_cli(
+            [docker_bin, "compose", "version"],
+            timeout=10.0,
+        )
+        if outcome.returncode == 0:
+            return (docker_bin, "compose")
+    legacy = shutil.which("docker-compose")
+    if legacy is not None:
+        return (legacy,)
+    msg = "neither 'docker compose' plugin nor 'docker-compose' binary found on PATH"
+    raise ComposeError(msg)
+
+
+@dataclass(frozen=True)
+class ComposeContainer:
+    service: str
+    container_id: str
+    host_port: int | None
+    container_port: int | None
+    #: Address the endpoint is reachable at. ``127.0.0.1`` for published
+    #: ports; the container's own network address on internal (no-egress)
+    #: stack networks, where publishing is unavailable — ``host_port``
+    #: then equals ``container_port``.
+    host_ip: str = "127.0.0.1"
+
+
+@dataclass(frozen=True)
+class ComposeStack:
+    project_name: str
+    compose_file: Path
+    staging_dir: Path  # tmpdir from rewrite_for_localhost; caller runs cleanup_staging() on teardown
+    containers: tuple[ComposeContainer, ...]
+    primary: ComposeContainer
+
+
+_PROJECT_NAME_INVALID = re.compile(r"[^a-z0-9_-]")
+_PREFERRED_SERVICE_HINTS: tuple[str, ...] = ("web", "app", "http", "nginx", "server")
+_PREFERRED_CONTAINER_PORTS: frozenset[int] = frozenset(
+    {80, 8080, 8000, 3000, 443, 8443}
+)
+
+
+def project_name(prefix: str, key: str) -> str:
+    """Deterministic compose project name. Compose requires ``[a-z0-9_-]``."""
+    name = key.lower()
+    return f"{prefix}-{_PROJECT_NAME_INVALID.sub('-', name)}"
+
+
+def _extract_container_ports(spec: Any) -> list[int]:
+    """Pull container-side port numbers from a compose ``ports:`` list.
+
+    Compose accepts short (``"80"``, ``"8080:80"``) and long
+    (``{target: 80, published: 8080}``) forms. We only need the
+    *container* port so the override can re-publish on 127.0.0.1:0:<target>.
+    """
+    ports = spec.get("ports") if isinstance(spec, dict) else None
+    if not isinstance(ports, list):
+        return []
+    out: list[int] = []
+    for p in ports:
+        target: int | None = None
+        if isinstance(p, dict):
+            raw = p.get("target")
+            try:
+                target = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                target = None
+        elif isinstance(p, (int, str)):
+            text = str(p)
+            tail = text.rsplit(":", 1)[-1]
+            tail = tail.split("/", 1)[0]  # strip "/tcp"
+            if "-" in tail:
+                # Port range like "80-81": expose every port in the range.
+                # Endpoints are validated BEFORE the range is constructed —
+                # a hostile "0-4000000000" must not spin the worker.
+                parts = tail.split("-", 1)
+                try:
+                    lo, hi = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                if not (1 <= lo <= hi <= 65535):
+                    continue
+                out.extend(range(lo, hi + 1))
+                continue
+            try:
+                target = int(tail)
+            except ValueError:
+                target = None
+        if target is not None and 0 < target < 65536:
+            out.append(target)
+    return out
+
+
+def rewrite_for_localhost(
+    compose_file: Path,
+    *,
+    labels: dict[str, str] | None = None,
+    allow_devices: bool = False,
+) -> tuple[Path, Path]:
+    """Copy ``compose_file``'s parent dir to a tmpdir + rewrite ports to 127.0.0.1:0.
+
+    Returns ``(rewritten_compose_path, staging_dir)``. The staging_dir
+    MUST be cleaned up by the caller (``cleanup_staging``) after ``down_stack``.
+
+    Relative build contexts + volume mounts resolve against the tmpdir
+    copy, so upstream files are never mutated. Host port 0 lets Docker
+    assign an ephemeral port and ``compose ps`` reports it back.
+
+    ``labels`` (when non-empty) are injected per service so the
+    caller's label-scoped cleanup can find compose-launched containers
+    (otherwise the compose path would be exempt from auto-cleanup).
+    """
+    source_dir = compose_file.parent.resolve()
+    _require_stageable_size(source_dir)
+    # Hand-rolled (not scratch_dir): ownership transfers to the caller,
+    # who runs cleanup_staging() after down_stack. The raptor-compose-
+    # prefix is listed in core.run.tmp_reaper's static tuple, so a
+    # SIGKILLed stack strands nothing past the age floor — and the
+    # keepalive is what makes that listing safe: a long-running stack
+    # bind-mounts from this dir while nothing refreshes its top-level
+    # mtime, so the owner keeps it fresh until teardown.
+    staging = Path(tempfile.mkdtemp(prefix="raptor-compose-"))
+    try:
+        keepalive_register(staging)
+        # symlinks=True preserves links AS links — symlinks=False would
+        # DEREFERENCE them, copying arbitrary host files (~/.aws/credentials,
+        # /etc/shadow) into the staging dir where they become build-context /
+        # bind-mount content shipped into a hostile stack.
+        _copy_staging_tree(source_dir, staging)
+        pruned = _prune_escaping_symlinks(staging)
+        if pruned:
+            logger.warning(
+                "compose staging: pruned %d symlink(s) escaping the staging dir",
+                pruned,
+            )
+        staged_compose = staging / compose_file.name
+        _rewrite_ports_in_place(staged_compose, labels=labels,
+                                allow_devices=allow_devices)
+    except BaseException:
+        # Any failure — ComposeError or an unanticipated one — must
+        # release the keepalive-pinned staging dir; a ComposeError-only
+        # clause leaked the tmpdir on e.g. hostile-bytes decode errors.
+        try:
+            cleanup_staging(staging)
+        except BaseException:
+            logger.warning("compose staging cleanup failed for %s", staging, exc_info=True)
+        raise
+    return staged_compose, staging
+
+
+#: Staging copy budget. Trade-off, documented both ways: too low refuses
+#: legitimate compose projects with fat build contexts (2 GiB clears every
+#: vulhub-style stack by orders of magnitude); too high lets a hostile
+#: repo's multi-GiB tree fill a tmpfs-backed /tmp via the pre-sanitize
+#: copytree. The gate runs BEFORE any byte is copied.
+_STAGING_MAX_BYTES = 2 << 30
+
+#: Entry-count twin of the byte budget (files + dirs). Mirrors the
+#: export path's DEFAULT_MAX_ROOTFS_ENTRIES: a compose build context
+#: is the same order of artifact, and 400k entries is far above any
+#: legitimate context while well under tmpfs inode defaults.
+_STAGING_MAX_ENTRIES = 400_000
+
+
+def _require_stageable_size(source_dir: Path) -> None:
+    """Refuse staging when ``source_dir`` exceeds the copy budget.
+
+    Two budgets, because bytes alone miss the inode axis: a hostile
+    tree of millions of zero-byte files passes any byte cap while
+    ``copytree`` exhausts the staging tmpfs's inodes (the export path
+    already carries an entry bound for the same reason). Sums
+    ``lstat`` sizes (symlinks never followed — the copy itself is
+    ``symlinks=True``) and counts entries (files + dirs) in the same
+    walk, stopping as soon as either budget is exceeded, so a huge
+    hostile tree costs a bounded scan, not a full disk accounting.
+    """
+    total = 0
+    entries = 0
+    pending = [source_dir]
+    while pending:
+        # Enumerate incrementally: os.walk materialises a whole directory
+        # before its caller can reject an entry flood.
+        with os.scandir(pending.pop()) as children:
+            for entry in children:
+                entries += 1
+                if entries > _STAGING_MAX_ENTRIES:
+                    raise ComposeError(
+                        f"compose source dir {source_dir} exceeds the "
+                        f"{_STAGING_MAX_ENTRIES}-entry staging budget"
+                    )
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(Path(entry.path))
+                elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    total += info.st_size
+                else:
+                    raise ComposeError(f"compose source contains a special file: {entry.path}")
+                if total > _STAGING_MAX_BYTES:
+                    raise ComposeError(
+                        f"compose source dir {source_dir} exceeds the "
+                        f"{_STAGING_MAX_BYTES}-byte staging budget"
+                    )
+
+
+def _copy_staging_tree(source_dir: Path, staging: Path) -> None:
+    """Enforce aggregate budgets on actual copies, after the preflight too."""
+    if staging.resolve().is_relative_to(source_dir.resolve()):
+        raise ComposeError("compose staging directory must be outside the source tree")
+    copied = 0
+    entries = 0
+
+    def count_entries(directory, names):
+        nonlocal entries, copied
+        entries += len(names)
+        if entries > _STAGING_MAX_ENTRIES:
+            raise ComposeError(f"compose copy exceeds {_STAGING_MAX_ENTRIES}-entry staging budget")
+        for name in names:
+            info = (Path(directory) / name).lstat()
+            if stat.S_ISLNK(info.st_mode):
+                copied += info.st_size
+                if copied > _STAGING_MAX_BYTES:
+                    raise ComposeError(f"compose copy exceeds {_STAGING_MAX_BYTES}-byte staging budget")
+        return ()
+
+    def copy_file(source, destination):
+        nonlocal copied
+        rel = Path(source).relative_to(source_dir)
+        stream = open_regular_beneath(source_dir, rel, "rb")
+        if stream is None:
+            raise ComposeError(f"compose source changed or is not a readable regular file: {source}")
+        with preserving_stream_error(stream):
+            before = os.fstat(stream.fileno())
+            if before.st_size > _STAGING_MAX_BYTES - copied:
+                raise ComposeError(f"compose copy exceeds {_STAGING_MAX_BYTES}-byte staging budget")
+            with preserving_stream_error(open(destination, "xb")) as output:
+                while True:
+                    remaining = _STAGING_MAX_BYTES - copied
+                    chunk = stream.read(min(1024 * 1024, remaining + 1))
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining:
+                        raise ComposeError(f"compose copy exceeds {_STAGING_MAX_BYTES}-byte staging budget")
+                    output.write(chunk)
+                    copied += len(chunk)
+            after = os.fstat(stream.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ComposeError(f"compose source changed while being copied: {source}")
+        os.chmod(destination, stat.S_IMODE(before.st_mode) & 0o777)
+        os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return destination
+
+    shutil.copytree(source_dir, staging, dirs_exist_ok=True, symlinks=True,
+                    copy_function=copy_file, ignore=count_entries)
+
+
+def cleanup_staging(staging: str | Path) -> None:
+    """Release a staging dir made by :func:`rewrite_for_localhost`.
+
+    The one teardown path for staging ownership: drops the keepalive
+    (so a dir this process abandoned can age out for the reaper) and
+    best-effort-removes the tree. Callers run it after ``down_stack``;
+    the rewrite's own failure paths use it too.
+    """
+    interrupted = None
+    try:
+        keepalive_unregister(staging)
+    except BaseException as exc:
+        logger.warning("Cannot unregister compose staging %s", staging, exc_info=True)
+        if not isinstance(exc, Exception):
+            interrupted = exc
+    try:
+        if not rmtree_hardened(staging):
+            logger.warning("Compose staging retained after failed removal: %s", staging)
+    except BaseException as exc:
+        logger.warning("Cannot remove compose staging %s", staging, exc_info=True)
+        if interrupted is None and not isinstance(exc, Exception):
+            interrupted = exc
+    if interrupted is not None:
+        raise interrupted
+
+
+def _prune_escaping_symlinks(staging: Path) -> int:
+    """Remove symlinks under ``staging`` whose resolved target escapes it.
+
+    The staged tree is copied with ``symlinks=True`` (never dereferenced);
+    links that point inside the staging copy keep working, links that point
+    at host paths are unlinked so no later consumer (build context tar,
+    bind-mount source resolution) can be steered at a host file.
+    Returns the number of links removed.
+    """
+    removed = 0
+    staging_real = staging.resolve()
+    prefix = str(staging_real) + os.sep
+    for dirpath, dirnames, filenames in os.walk(staging, followlinks=False):
+        for name in (*dirnames, *filenames):
+            p = Path(dirpath) / name
+            if not p.is_symlink():
+                continue
+            target = os.path.realpath(p)
+            if not target.startswith(prefix):
+                try:
+                    p.unlink()
+                except OSError as exc:
+                    raise ComposeError(f"cannot prune escaping staging link {p}: {exc}") from exc
+                removed += 1
+    return removed
+
+
+def _mounts_docker_socket(volume: Any) -> bool:
+    """True if a compose ``volumes:`` entry binds the host docker socket.
+
+    Superseded as the primary defense by :func:`_filter_volumes` (bind
+    sources are now allowlist-confined to the staging dir), retained as a
+    belt-and-braces named-volume guard and for its importers.
+    Handles the short form ``"src:dst[:mode]"`` and the long
+    form ``{"source": "..."}``.
+    """
+    if isinstance(volume, str):
+        source = volume.split(":", 1)[0]
+    elif isinstance(volume, dict):
+        source = str(volume.get("source", ""))
+    else:
+        return False
+    source = source.strip()
+    if not source:
+        # No source at all (anonymous volume, tmpfs long form) — there is
+        # nothing to bind, so nothing can expose the socket. Without this,
+        # the parent-dir normalization below turns "" into "/" and drops
+        # every sourceless mount.
+        return False
+    if (
+        source in {"/var/run/docker.sock", "docker.sock"} or source.endswith("/docker.sock")
+    ):
+        return True
+    # Parent directory mounts that would expose the docker socket.
+    source_norm = source.rstrip("/") or "/"
+    return source_norm in ('/', '/var', '/var/run', '/run')
+
+
+# Exact-match only: a prefix match would keep "/dev/nullXYZ", and any
+# allowlisted directory prefix would keep "/dev/fd/../../../dev/sda"-style
+# traversals. /dev/fd/<N> children are matched separately after lexical
+# normalization.
+_SAFE_DEVICES: frozenset[str] = frozenset({
+    "/dev/null",
+    "/dev/zero",
+    "/dev/urandom",
+    "/dev/random",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+})
+_SAFE_DEVICE_FD_DIR = "/dev/fd"
+
+
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _safe_device_source(src: str) -> str | None:
+    """The NORMALIZED source when it is an allowlisted pseudo-device,
+    else None.
+
+    Normalized lexically first (``os.path.normpath`` collapses ``..``,
+    ``//`` and trailing separators — ``/dev/fd/../../../dev/sda``
+    becomes ``/dev/sda`` and fails the allowlist). The safe names are
+    then matched EXACTLY; realpath-ing them instead would resolve
+    ``/dev/stdin`` through /proc/self/fd to whatever this process's
+    stdin happens to be, breaking legitimate mappings while the daemon
+    resolves the path in its own context anyway. ``/dev/fd/<N>`` is the
+    one directory family kept, and only with an ASCII-digit child
+    (``str.isdigit`` admits Unicode digit codepoints that mean nothing
+    to the daemon); any other suffix has no legitimate compose use.
+
+    Returning the normalized form (rather than a bool over the raw
+    string) is load-bearing: the KEPT value is what reaches dockerd,
+    and dockerd resolves ``..`` through symlinks — ``/dev/fd/0/../1``
+    normalizes to the allowlisted ``/dev/fd/1`` lexically but names a
+    different object under symlink resolution, so the raw spelling
+    must never be forwarded.
+    """
+    src = src.strip()
+    if not src:
+        return None
+    norm = os.path.normpath(src)
+    if norm in _SAFE_DEVICES:
+        return norm
+    prefix = _SAFE_DEVICE_FD_DIR + "/"
+    if norm.startswith(prefix):
+        child = norm[len(prefix):]
+        if child and all(c in _ASCII_DIGITS for c in child):
+            return norm
+    return None
+
+
+def _filter_devices(spec: dict, *, allow_all: bool = False) -> None:
+    """Strip dangerous device mappings, keep safe pseudo-devices.
+
+    When ``allow_all`` is True (caller opt-in — cve-env exposes it as a
+    tool parameter and an env var), all devices pass through unfiltered.
+    """
+    devices = spec.get("devices")
+    if not isinstance(devices, list) or not devices:
+        spec.pop("devices", None)
+        return
+    if allow_all:
+        return
+    kept = []
+    for dev in devices:
+        if isinstance(dev, str):
+            src, sep, rest = dev.partition(":")
+            norm = _safe_device_source(src)
+            if norm is not None:
+                # Forward the NORMALIZED source — see
+                # _safe_device_source on why the raw spelling must
+                # never reach dockerd.
+                kept.append(f"{norm}{sep}{rest}" if sep else norm)
+                continue
+        elif isinstance(dev, dict):
+            # ``compose config`` normalizes devices to the long form
+            # ``{source, target, permissions}``.
+            norm = _safe_device_source(str(dev.get("source") or ""))
+            if norm is not None:
+                kept.append({**dev, "source": norm})  # type: ignore[arg-type]
+                continue
+        logger.warning("compose sanitize: dropping device %r", dev)
+    if kept:
+        spec["devices"] = kept
+    else:
+        spec.pop("devices", None)
+
+
+# Safe-to-grant cap_add entries: Docker's default capability set (harmless
+# to re-add) plus SYS_NICE. Compared AFTER normalization (upper-case, the
+# optional ``CAP_`` prefix stripped — Docker accepts both spellings, so the
+# filter must too). Everything else — SYS_ADMIN, SYS_PTRACE, NET_ADMIN,
+# NET_RAW, BPF, ALL, ... — is dropped, allowlist-style.
+_SAFE_CAP_ADD: frozenset[str] = frozenset({
+    "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+    "MKNOD", "NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID",
+    "SYS_NICE",
+})
+
+#: Fail-closed cap on stack size — a hostile stack must not fan out
+#: arbitrary services under the host daemon.
+_MAX_SERVICES = 12
+#: Cap the rewritten publish list per service (range forms expand).
+_MAX_PORTS_PER_SERVICE = 64
+
+# Single-container-parity resource limits (containers.py hardened defaults),
+# injected into every compose service. Legacy service-level keys work on both
+# compose V2 (mapped into resources) and the V1 binary.
+_SERVICE_LIMITS: dict[str, Any] = {
+    "mem_limit": "4g",
+    "memswap_limit": "4g",
+    "cpus": 2,
+    "pids_limit": 512,
+}
+
+# Service keys copied through as-is. Everything not listed here and not
+# specially handled below (ports, volumes, build, cap_add, devices,
+# environment, network_mode, ipc, pid, labels, extra_hosts) is DROPPED —
+# privileged, security_opt, userns_mode, cgroup_parent,
+# device_cgroup_rules, volumes_from, runtime, deploy, container_name,
+# oom_kill_disable and any future host-resource key never survive by
+# construction. Notably NOT listed: ``ulimits`` (memlock -1 pins
+# unswappable host RAM past the injected mem_limit) and
+# ``stop_grace_period`` (an attacker-chosen grace outlives ``down``'s
+# timeout and holds the stack alive through teardown).
+_SERVICE_ALLOWED_KEYS: frozenset[str] = frozenset({
+    "image", "command", "entrypoint", "depends_on", "expose", "healthcheck",
+    "links", "networks", "working_dir", "user", "restart", "hostname",
+    "domainname", "stop_signal", "tty", "stdin_open",
+    "init", "platform", "pull_policy", "read_only", "tmpfs", "shm_size",
+    "cap_drop", "dns", "dns_search", "dns_opt",
+    "sysctls", "profiles", "secrets", "configs",
+})
+
+# build: sub-keys copied through (context/dockerfile confined separately).
+# Dropped by omission: ssh, network, privileged, cache_from, cache_to,
+# platforms, tags, entitlements, additional_contexts (refused), ...
+_BUILD_ALLOWED_KEYS: frozenset[str] = frozenset({
+    "context", "dockerfile", "dockerfile_inline", "args", "target",
+    "labels", "no_cache", "pull", "shm_size", "secrets",
+})
+
+
+#: Recursive pre-gate bounds: ``extends`` chains deeper than this refuse
+#: (fail closed), and each gated file is size-capped before parsing.
+_PRE_GATE_MAX_DEPTH = 5
+_PRE_GATE_MAX_FILE_BYTES = 5 << 20  # 5 MiB per gated YAML document
+
+
+def _require_staging_relative(value: Any, staging: Path, *, what: str) -> Path:
+    """Refuse ``value`` unless it is a plain relative path inside ``staging``.
+
+    Guards raw-model path references that the resolver consumes BEFORE the
+    sanitizer sees the resolved output (``env_file``, ``extends.file``,
+    ``label_file``): a host path here reads host files into the effective
+    model. Interpolated values are refused outright — their expansion is
+    not decidable here. Returns the confined resolved path so the gate can
+    recurse into referenced compose documents.
+    """
+    if not isinstance(value, str) or not value:
+        raise ComposeError(f"compose {what} must be a non-empty string")
+    if "${" in value:
+        raise ComposeError(
+            f"compose {what} {value!r} uses interpolation — refusing "
+            "(cannot confine an interpolated path to the staging dir)"
+        )
+    if value.startswith(("/", "~")):
+        raise ComposeError(
+            f"compose {what} {value!r} references a host path — refusing"
+        )
+    staging_real = staging.resolve()
+    resolved = os.path.realpath(os.path.join(staging_real, value))
+    if not resolved.startswith(str(staging_real) + os.sep):
+        raise ComposeError(
+            f"compose {what} {value!r} escapes the staging dir — refusing"
+        )
+    return Path(resolved)
+
+
+def _load_gated_document(path: Path, *, what: str) -> Any:
+    """Bounded parse of a staging-confined YAML document for the pre-gate."""
+    try:
+        if path.stat().st_size > _PRE_GATE_MAX_FILE_BYTES:
+            raise ComposeError(
+                f"compose {what} {path.name!r} exceeds the "
+                f"{_PRE_GATE_MAX_FILE_BYTES}-byte gate budget — refusing"
+            )
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ComposeError(
+            f"compose {what} {path.name!r} is not readable: {exc}"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        # Hostile bytes must fail as ComposeError like every other parse
+        # failure — a raw UnicodeDecodeError bypasses the callers'
+        # ComposeError-scoped staging cleanup.
+        raise ComposeError(
+            f"compose {what} {path.name!r} is not valid UTF-8: {exc}"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ComposeError(
+            f"compose {what} {path.name!r} did not parse as YAML: {exc}"
+        ) from exc
+
+
+def _gate_document(
+    data: Any,
+    staging: Path,
+    *,
+    source: str,
+    seen: set[str],
+    depth: int,
+) -> None:
+    """Gate ONE document's file references and recurse into extends targets.
+
+    The resolver follows ``extends`` chains and reads every referenced
+    document's own ``env_file``/``extends.file``/``label_file`` — gating
+    only the primary file leaves a one-hop bypass: a staged extends
+    target declaring ``env_file: /host/path`` would be read by ``docker
+    compose config``. Every document the resolution graph can touch is
+    gated, depth-capped and cycle-checked, BEFORE the resolver runs.
+    (``label_file`` is ignored by current compose but gated anyway —
+    version drift must not reopen the family.)
+    """
+    if depth > _PRE_GATE_MAX_DEPTH:
+        raise ComposeError(
+            f"compose extends chain exceeds depth {_PRE_GATE_MAX_DEPTH} "
+            f"(at {source}) — refusing"
+        )
+    if not isinstance(data, dict):
+        raise ComposeError(
+            f"compose document {source} did not parse as a mapping — refusing"
+        )
+    if "include" in data:
+        raise ComposeError(
+            f"compose 'include:' in {source} is refused — included files "
+            "bypass staging confinement; inline the services instead"
+        )
+    services = data.get("services")
+    if not isinstance(services, dict):
+        return  # the resolver will produce the authoritative error
+    for name, spec in services.items():
+        if not isinstance(spec, dict):
+            continue
+        for key in ("env_file", "label_file"):
+            value = spec.get(key)
+            if value is None:
+                continue
+            entries = value if isinstance(value, list) else [value]
+            for entry in entries:
+                if entry is None:
+                    continue
+                path = entry.get("path") if isinstance(entry, dict) else entry
+                _require_staging_relative(
+                    path, staging,
+                    what=f"service {name!r} {key} (in {source})",
+                )
+        extends = spec.get("extends")
+        if isinstance(extends, dict) and "file" in extends:
+            target = _require_staging_relative(
+                extends["file"], staging,
+                what=f"service {name!r} extends.file (in {source})",
+            )
+            marker = str(target)
+            if marker in seen:
+                continue  # cycle or already-gated document
+            seen.add(marker)
+            _gate_document(
+                _load_gated_document(target, what="extends target"),
+                staging,
+                source=extends["file"],
+                seen=seen,
+                depth=depth + 1,
+            )
+
+
+def _pre_resolution_gate(data: dict[str, Any], staging: Path) -> None:
+    """Refuse raw-model constructs that make the resolver read host files.
+
+    ``docker compose config`` resolves ``include``, ``extends`` and
+    ``env_file`` by READING the referenced files. The gate walks the FULL
+    resolution graph — the primary document plus every (transitively)
+    ``extends``-referenced document — and confines each file reference to
+    the staging dir, refusing otherwise (fail closed). The sandboxed
+    resolver invocation is the kernel-level backstop for anything this
+    parser-level walk misses.
+    """
+    _gate_document(
+        data, staging, source="the primary compose file", seen=set(), depth=0
+    )
+
+
+#: Static generic PATH for the resolver — the real PATH would leak the
+#: host tool layout through ``${PATH}`` interpolation.
+_RESOLVER_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+_RESOLVER_TIMEOUT_S = 60.0
+
+
+@contextmanager
+def _resolver_scratch_home() -> Iterator[Path]:
+    """Create the resolver's throwaway HOME — always OUTSIDE staging.
+
+    The staging dir is a verbatim ``copytree`` of the (hostile) repo's
+    compose dir, so ANY fixed path under it is attacker-preseedable: a
+    repo shipping ``.raptor-resolver-home/.docker/config.json`` would
+    hand the ``docker compose config`` invocation an attacker-authored
+    CLI config — and docker's ``cliPluginsExtraDirs`` discovery would
+    then EXECUTE a repo-shipped plugin binary at sanitize time (before
+    any allowlist sanitisation, unconfined on hosts where the resolver
+    sandbox cannot engage). ``mkdtemp`` in the system temp dir yields a
+    fresh, empty, mode-0700, RAPTOR-owned dir that no repo content can
+    pre-populate or alias (same construction as core.sandbox's
+    fake_home; freshness per call is what makes the symlink-refusal
+    guard unnecessary here). ``.docker`` is pre-created so config
+    discovery lands on an existing empty RAPTOR-owned dir. Callers own
+    cleanup through the lexical scope, including failed setup.
+    """
+    with scratch_dir("raptor-resolver-home-") as scratch:
+        (scratch / ".docker").mkdir(mode=0o700)
+        yield scratch
+
+
+def _resolver_env(scratch_home: Path) -> dict[str, str]:
+    """Minimal environment for the ``compose config`` resolution step.
+
+    Interpolation reads THIS environment — a hostile compose file's
+    ``${HOME}``/``${PATH}``/``${DOCKER_HOST}`` would otherwise inline the
+    launcher's allowlisted process env into the resolved model and ship
+    it into the container. Only a static generic PATH plus the throwaway
+    RAPTOR-owned HOME/DOCKER_CONFIG (:func:`_resolver_scratch_home` —
+    never inside staging) are provided: unset variables
+    interpolate to empty (compose semantics, with a compose-side
+    warning); ``${VAR:?}`` forms make resolution fail, which refuses the
+    stack (fail closed). ``build``/``up``/``ps``/``down`` keep the normal
+    allowlisted docker env — the sanitized file they consume contains no
+    live interpolation (``$`` survives only ``$$``-escaped).
+
+    Note: a hostile ``${HOME}`` interpolation DOES inline the scratch
+    path string into the resolved model. That is a dead path by the time
+    anything runs (the dir is rmtree'd right after resolution) and leaks
+    only system tmpdir naming layout — the same info class as the
+    staging path itself. Revisit if tmp naming ever becomes sensitive.
+    """
+    return {
+        "PATH": _RESOLVER_PATH,
+        "HOME": str(scratch_home),
+        "DOCKER_CONFIG": str(scratch_home / ".docker"),
+    }
+
+
+def _run_resolver(
+    argv: list[str],
+    staging: Path,
+    env: dict[str, str],
+    *,
+    scratch_home: Path | None = None,
+) -> str:
+    """Run the resolver, sandboxed with reads confined to staging.
+
+    The resolver invocation is itself attack surface — it follows file
+    references in hostile YAML — so it runs under ``core.sandbox`` with
+    ``restrict_reads`` scoped to the staging dir: an out-of-staging read
+    the parser-level gate missed fails at the kernel. ``scratch_home``
+    (the RAPTOR-owned resolver HOME, which lives outside staging) is
+    granted to the read + write sets so docker's config discovery works
+    under the confinement. When the sandbox cannot ENGAGE (unsupported
+    host), resolution proceeds unconfined
+    with the recursive pre-gate as the remaining defense (logged loudly).
+    A non-zero exit INSIDE the sandbox is a resolution failure and
+    refuses the stack — it is never retried unconfined.
+    """
+    try:
+        from core.sandbox import SandboxSetupError
+        from core.sandbox import run as sandbox_run
+    except ImportError:  # pragma: no cover — core.sandbox always ships
+        sandbox_run = None  # type: ignore[assignment]
+        SandboxSetupError = Exception  # type: ignore[misc,assignment]  # noqa: N806
+    if sandbox_run is not None:
+        try:
+            proc = sandbox_run(
+                argv,
+                block_network=True,
+                target=str(staging),
+                restrict_reads=True,
+                # The resolver has no business reading host-identity
+                # files: swap the wholesale /etc read grant for the
+                # loader/TLS minimum. This holds on the Landlock-only
+                # tier too, where no private mount view narrows /etc.
+                omit_etc_reads=True,
+                readable_paths=(
+                    [str(scratch_home)] if scratch_home else None),
+                writable_paths=(
+                    [str(scratch_home)] if scratch_home else None),
+                cwd=str(staging),
+                env=env,
+                # The env is CONSTRUCTED minimal (static PATH + throwaway
+                # HOME/DOCKER_CONFIG), not a passthrough of process env.
+                env_caller_filtered=True,
+                capture_output=True,
+                text=True,
+                timeout=_RESOLVER_TIMEOUT_S,
+                caller_label="compose-config-resolve",
+            )
+        except SandboxSetupError as exc:
+            logger.warning(
+                "compose resolver sandbox could not engage (%s); resolving "
+                "unconfined — the staged-graph pre-gate remains the read "
+                "boundary", exc,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ComposeError(
+                f"compose config timed out after {_RESOLVER_TIMEOUT_S}s",
+                stderr=str(exc),
+            ) from exc
+        else:
+            # The sandbox ENGAGED but may have fallen back from the
+            # mount-ns tier to Landlock-only mid-setup (uid-mapping
+            # failure, missing helpers). The read boundary then loses
+            # the private mount view — surface the degraded tier
+            # instead of letting the fallback stay silent. Not a
+            # refusal: the recursive pre-gate stays the primary
+            # defense and Landlock still confines reads.
+            degraded = getattr(proc, "sandbox_info", {}).get(
+                "mount_ns_degraded")
+            if degraded:
+                logger.warning(
+                    "compose resolver sandbox degraded from mount-ns to "
+                    "the Landlock-only tier (%s) — read confinement is "
+                    "kernel-enforced but has no private mount view for "
+                    "this resolution", degraded,
+                )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()
+                raise ComposeError(
+                    f"compose config failed (rc={proc.returncode}): {stderr}",
+                    stderr=stderr,
+                )
+            return proc.stdout or ""
+    outcome = run_cli(
+        argv, timeout=_RESOLVER_TIMEOUT_S, cwd=str(staging), env=env,
+    )
+    if outcome.timed_out:
+        msg = f"compose config timed out after {_RESOLVER_TIMEOUT_S}s"
+        raise ComposeError(msg, stderr=outcome.stderr)
+    if outcome.returncode != 0:
+        stderr = (outcome.stderr or "").strip()
+        raise ComposeError(
+            f"compose config failed (rc={outcome.returncode}): {stderr}",
+            stderr=stderr,
+        )
+    if outcome.truncated:
+        # The resolved model is PARSED, not sliced for diagnostics — a
+        # head-dropped tail could still be a valid YAML document
+        # describing a SUBSET stack, which would then be sanitized and
+        # launched as if complete. Refuse (fail closed).
+        msg = ("compose config output exceeded the capture bound and was "
+               "truncated — refusing to parse a partial resolved model")
+        raise ComposeError(msg)
+    return outcome.stdout or ""
+
+
+def _resolve_effective_model(compose_file: Path) -> dict[str, Any]:
+    """Resolve the FULL effective service model via ``compose config``.
+
+    Interpolation (``${VAR:-default}``), ``extends``, YAML anchors/merges,
+    ``.env`` and profile gating are applied by compose itself — the
+    sanitizer then operates on what ``up`` would actually run instead of
+    the raw text. The step runs with a minimal interpolation environment
+    (:func:`_resolver_env`) and, where the host supports it, inside a
+    read-confined sandbox (:func:`_run_resolver`). Resolution failure
+    raises :class:`ComposeError` (fail closed): a stack the resolver
+    cannot vouch for never launches.
+    """
+    staging = compose_file.parent
+    prefix = _compose_invocation()
+    with _resolver_scratch_home() as scratch_home:
+        raw = _run_resolver(
+            [*prefix, "-f", str(compose_file), "config"],
+            staging,
+            _resolver_env(scratch_home),
+            scratch_home=scratch_home,
+        )
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ComposeError(
+            f"compose config output for {compose_file} did not parse: {exc}",
+            stderr=str(exc),
+        ) from exc
+    if not isinstance(data, dict):
+        msg = f"compose config output for {compose_file} is not a mapping"
+        raise ComposeError(msg)
+    return data
+
+
+def _filter_volumes(volumes: list[Any], staging: Path) -> list[Any]:
+    """Allowlist-filter a service ``volumes:`` list.
+
+    Kept: named/anonymous volumes, ``tmpfs`` mounts, and bind mounts whose
+    SOURCE resolves (symlinks followed) inside the staging dir. Everything
+    else — absolute host paths (``/etc``), non-canonical evasions
+    (``/var/../var/run``), ``~`` expansions, npipe/cluster types — is
+    dropped. The old docker-socket blocklist is subsumed: a host bind is
+    dropped for not living under staging, whatever its suffix.
+    """
+    staging_real = staging.resolve()
+    prefix = str(staging_real) + os.sep
+
+    def _bind_source_ok(source: str) -> bool:
+        source = source.strip()
+        if not source or source.startswith("~"):
+            return False
+        if source.startswith("/"):
+            resolved = os.path.realpath(source)
+        else:
+            resolved = os.path.realpath(os.path.join(staging_real, source))
+        return resolved == str(staging_real) or resolved.startswith(prefix)
+
+    kept: list[Any] = []
+    for vol in volumes:
+        if isinstance(vol, str):
+            if _mounts_docker_socket(vol):
+                logger.warning("compose sanitize: dropping volume %r", vol)
+                continue
+            parts = vol.split(":")
+            if len(parts) == 1:
+                kept.append(vol)  # anonymous volume, container path only
+                continue
+            source = parts[0].strip()
+            # Any '/'-bearing source is a PATH, never a named volume
+            # (compose volume names are [a-zA-Z0-9._-]). The old
+            # leading-char test classified `foo/../x:/x` as a named
+            # volume — safe only because the sanitizer happens to run
+            # on the RESOLVED model today; align the discriminator
+            # with the grammar so that ordering is not load-bearing.
+            if source.startswith(("/", ".", "~")) or "/" in source:
+                if _bind_source_ok(source):
+                    kept.append(vol)
+                else:
+                    logger.warning(
+                        "compose sanitize: dropping host bind %r", vol)
+            else:
+                kept.append(vol)  # named volume (no path separator)
+        elif isinstance(vol, dict):
+            vtype = str(vol.get("type") or "volume")
+            if vtype in ("volume", "tmpfs"):
+                if _mounts_docker_socket(vol):
+                    logger.warning("compose sanitize: dropping volume %r", vol)
+                    continue
+                kept.append(vol)
+            elif vtype == "bind":
+                source = str(vol.get("source") or "")
+                if _bind_source_ok(source):
+                    kept.append(vol)
+                else:
+                    logger.warning(
+                        "compose sanitize: dropping host bind %r", vol)
+            else:
+                logger.warning(
+                    "compose sanitize: dropping %s mount %r", vtype, vol)
+        # non-str/dict entries dropped
+    return kept
+
+
+def _bind_mounts(
+    volumes: Any, staging_real: str,
+) -> list[tuple[str, str, bool]]:
+    """``(source_text, resolved_source, writable)`` for each bind mount
+    in a sanitized ``volumes:`` list. Named/anonymous volumes and tmpfs
+    entries carry no host path and are skipped. Resolution mirrors
+    :func:`_filter_volumes._bind_source_ok` so both layers judge the
+    same path."""
+    out: list[tuple[str, str, bool]] = []
+    if not isinstance(volumes, list):
+        return out
+    for vol in volumes:
+        if isinstance(vol, str):
+            parts = vol.split(":")
+            if len(parts) < 2:
+                continue
+            source = parts[0].strip()
+            if not source.startswith(("/", ".")):
+                continue  # named volume
+            writable = True
+            if len(parts) >= 3:
+                writable = "ro" not in parts[-1].split(",")
+        elif isinstance(vol, dict):
+            if str(vol.get("type") or "volume") != "bind":
+                continue
+            source = str(vol.get("source") or "").strip()
+            writable = not vol.get("read_only")
+        else:
+            continue
+        if source.startswith("/"):
+            resolved = os.path.realpath(source)
+        else:
+            resolved = os.path.realpath(os.path.join(staging_real, source))
+        out.append((source, resolved, writable))
+    return out
+
+
+def _refuse_writable_bind_overlaps(
+    services: dict[str, Any], staging: Path,
+    file_source_defs: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Refuse bind layouts a container can re-point between sanitize
+    time and daemon mount time (bind-source TOCTOU).
+
+    Bind sources are approved at sanitize time via ``realpath`` — but
+    dockerd re-resolves the source path at every container START
+    (verified against a live daemon: a symlink swapped in after
+    approval is followed, including across ``docker restart``). A
+    service holding a WRITABLE bind of a staging directory can replace
+    any path component beneath it with a symlink to a host path; a
+    bind source nesting under that directory is then steered at the
+    host when its container starts later (``depends_on`` /
+    healthchecks make "later" attacker-schedulable) or restarts.
+    ``_prune_escaping_symlinks`` only removes links present at staging
+    time; this check closes the write channel that plants them
+    afterwards.
+
+    Trade-off, both directions: refusing only CROSS-service overlaps
+    would leave the same-service replay open (tamper, exit, restart
+    policy re-resolves the sibling mount); refusing ALL same-service
+    overlaps would reject common legitimate stacks (one service
+    binding ``./www`` rw plus ``./www/conf`` has no TOCTOU without a
+    restart — its mounts are resolved before its own code runs). So:
+    overlaps across services always refuse; overlaps within one
+    service refuse only when that service carries a restart policy
+    other than ``no``.
+    """
+    staging_real = str(staging.resolve())
+    binds: list[tuple[str, str, str, bool]] = []
+    restartable: dict[str, bool] = {}
+    for svc, spec in services.items():
+        if not isinstance(spec, dict):
+            continue
+        restart = str(spec.get("restart") or "no")
+        restartable[svc] = restart not in ("no", "none")
+        for source, resolved, writable in _bind_mounts(
+            spec.get("volumes"), staging_real,
+        ):
+            binds.append((svc, source, resolved, writable))
+        # Non-swarm ``docker compose`` implements file-based
+        # configs/secrets as BIND MOUNTS of the source file,
+        # re-resolved by the daemon at container start — the same
+        # swap channel as volumes. Feed each service's attached file
+        # sources in as read-only binds so a source nesting under
+        # another service's writable bind refuses like any other
+        # bind (service A binds ./dir rw, secret file ./dir/tok
+        # attached to a later-starting service B: A swaps tok for a
+        # symlink before B starts).
+        for section in ("configs", "secrets"):
+            defs = (file_source_defs or {}).get(section) or {}
+            for att in spec.get(section) or []:
+                if isinstance(att, str):
+                    ref_name = att
+                elif isinstance(att, dict):
+                    ref_name = str(att.get("source") or "")
+                else:
+                    continue
+                file_ref = (defs.get(ref_name) or {}).get("file")
+                if not file_ref:
+                    continue
+                file_ref = str(file_ref)
+                if file_ref.startswith("/"):
+                    resolved = os.path.realpath(file_ref)
+                else:
+                    resolved = os.path.realpath(
+                        os.path.join(staging_real, file_ref))
+                binds.append((svc, file_ref, resolved, False))
+    for svc_w, src_w, res_w, writable in binds:
+        if not writable:
+            continue
+        prefix = res_w + os.sep
+        for svc_o, src_o, res_o, _writable_o in binds:
+            if not res_o.startswith(prefix):
+                continue
+            if svc_o == svc_w and not restartable[svc_o]:
+                continue
+            raise ComposeError(
+                f"compose service {svc_o!r} bind source {src_o!r} lies "
+                f"under service {svc_w!r}'s writable bind {src_w!r} — "
+                "refusing (the writable container can swap a path "
+                "component for a symlink after sanitize-time approval; "
+                "the daemon re-resolves bind sources at container "
+                "start, steering the mount at a host path)"
+            )
+
+
+def _sanitize_build(build: Any, staging: Path, *, service: str) -> dict[str, Any]:
+    """Confine a service ``build:`` block to the staging dir.
+
+    ``docker compose build`` tars the context to the daemon — an absolute
+    (``/home/user``) or escaping (``../../..``) context ships that host
+    directory into an image the hostile stack then reads. Context and
+    dockerfile must resolve inside staging; URLs, ``additional_contexts``
+    and out-of-staging paths are REFUSED (an explicit host-directory
+    request is hostile or broken — refusal beats silent rewriting).
+    """
+    if isinstance(build, str):
+        build = {"context": build}
+    if not isinstance(build, dict):
+        raise ComposeError(
+            f"compose service {service!r} build block is not a mapping")
+    if "additional_contexts" in build:
+        raise ComposeError(
+            f"compose service {service!r} uses build.additional_contexts — "
+            "refusing (extra contexts bypass staging confinement)"
+        )
+    staging_real = staging.resolve()
+    prefix = str(staging_real) + os.sep
+    context = str(build.get("context") or ".")
+    if "://" in context or context.startswith("git@"):
+        raise ComposeError(
+            f"compose service {service!r} build context {context!r} is a "
+            "URL — refusing (remote contexts bypass staging confinement)"
+        )
+    if context.startswith("/"):
+        context_real = os.path.realpath(context)
+    else:
+        context_real = os.path.realpath(os.path.join(staging_real, context))
+    if context_real != str(staging_real) and not context_real.startswith(prefix):
+        raise ComposeError(
+            f"compose service {service!r} build context {context!r} escapes "
+            "the staging dir — refusing"
+        )
+    out: dict[str, Any] = {
+        k: v for k, v in build.items() if k in _BUILD_ALLOWED_KEYS
+    }
+    dropped = sorted(set(build) - set(out))
+    if dropped:
+        logger.warning(
+            "compose sanitize: dropping build key(s) %s from service %r",
+            ", ".join(dropped), service,
+        )
+    out["context"] = context
+    if "dockerfile_inline" in out:
+        out.pop("dockerfile", None)
+    elif "dockerfile" in out:
+        dockerfile = str(out["dockerfile"])
+        if dockerfile.startswith("/"):
+            df_real = os.path.realpath(dockerfile)
+        else:
+            df_real = os.path.realpath(os.path.join(context_real, dockerfile))
+        if not df_real.startswith(prefix):
+            raise ComposeError(
+                f"compose service {service!r} dockerfile {dockerfile!r} "
+                "escapes the staging dir — refusing"
+            )
+    return out
+
+
+def _sanitize_cap_add(cap_add: Any) -> list[str]:
+    """Normalize (``CAP_`` prefix stripped, upper-cased) and allowlist."""
+    if not isinstance(cap_add, list):
+        return []
+    kept: list[str] = []
+    for cap in cap_add:
+        norm = str(cap).strip().upper()
+        if norm.startswith("CAP_"):
+            norm = norm[4:]
+        if norm in _SAFE_CAP_ADD:
+            kept.append(norm)
+        else:
+            logger.warning("compose sanitize: dropping cap_add %r", cap)
+    return kept
+
+
+def _sanitize_environment(env: Any) -> Any:
+    """Drop pass-through (null-valued) environment entries.
+
+    ``environment: [FOO]`` / ``FOO:`` (no value) makes compose forward the
+    launcher's own environment variable into the hostile container at
+    ``up`` time; only explicit values survive.
+    """
+    if isinstance(env, dict):
+        return {k: v for k, v in env.items() if v is not None}
+    if isinstance(env, list):
+        return [e for e in env if isinstance(e, str) and "=" in e]
+    return env
+
+
+def _sanitize_service(
+    name: str,
+    spec: dict[str, Any],
+    staging: Path,
+    *,
+    labels: dict[str, str] | None,
+    allow_devices: bool,
+) -> dict[str, Any]:
+    """Rebuild one RESOLVED service spec from the key allowlist."""
+    out: dict[str, Any] = {
+        k: v for k, v in spec.items() if k in _SERVICE_ALLOWED_KEYS
+    }
+
+    # User-supplied labels are inert metadata — keep them; the caller's
+    # labels are merged on top below (caller wins on collision).
+    if isinstance(spec.get("labels"), (dict, list)):
+        out["labels"] = spec["labels"]
+
+    container_ports = _extract_container_ports(spec)
+    if container_ports:
+        unique = list(dict.fromkeys(container_ports))
+        if len(unique) > _MAX_PORTS_PER_SERVICE:
+            logger.warning(
+                "compose sanitize: service %r publishes %d ports; keeping "
+                "the first %d", name, len(unique), _MAX_PORTS_PER_SERVICE,
+            )
+            unique = unique[:_MAX_PORTS_PER_SERVICE]
+        out["ports"] = [f"127.0.0.1:0:{port}" for port in unique]
+
+    if "environment" in spec:
+        cleaned_env = _sanitize_environment(spec["environment"])
+        if cleaned_env:
+            out["environment"] = cleaned_env
+
+    volumes = spec.get("volumes")
+    if isinstance(volumes, list):
+        kept_volumes = _filter_volumes(volumes, staging)
+        if kept_volumes:
+            out["volumes"] = kept_volumes
+
+    if "build" in spec:
+        out["build"] = _sanitize_build(spec["build"], staging, service=name)
+
+    caps = _sanitize_cap_add(spec.get("cap_add"))
+    if caps:
+        out["cap_add"] = caps
+
+    # network_mode/ipc/pid: safe values only; host/container: forms die
+    # here. "bridge"/"default" are NOT kept — they would detach the
+    # service from the project's internal network onto the masqueraded
+    # default bridge (full egress).
+    net_mode = spec.get("network_mode")
+    if isinstance(net_mode, str) and net_mode == "none":
+        out["network_mode"] = net_mode
+    ipc = spec.get("ipc")
+    if isinstance(ipc, str) and (
+        ipc in ("private", "shareable") or ipc.startswith("service:")
+    ):
+        out["ipc"] = ipc
+    pid = spec.get("pid")
+    if isinstance(pid, str) and pid.startswith("service:"):
+        out["pid"] = pid
+
+    devices = spec.get("devices")
+    if isinstance(devices, list) and devices:
+        probe = {"devices": list(devices)}
+        _filter_devices(probe, allow_all=allow_devices)
+        if probe.get("devices"):
+            out["devices"] = probe["devices"]
+
+    # extra_hosts: keep plain host:ip entries, drop host-gateway mappings —
+    # "hostgw:host-gateway" hands the container a stable name for the
+    # bridge gateway, sweetening host-service reachability.
+    extra_hosts = spec.get("extra_hosts")
+    kept_hosts: Any = None
+    if isinstance(extra_hosts, list):
+        kept_hosts = [
+            e for e in extra_hosts
+            if not (isinstance(e, str) and "host-gateway" in e)
+        ]
+    elif isinstance(extra_hosts, dict):
+        kept_hosts = {
+            k: v for k, v in extra_hosts.items()
+            if "host-gateway" not in str(v)
+        }
+    if kept_hosts is not None:
+        if len(kept_hosts) != len(extra_hosts):  # type: ignore[arg-type]
+            logger.warning(
+                "compose sanitize: dropping host-gateway extra_hosts "
+                "entr%s from service %r",
+                "y" if len(extra_hosts) - len(kept_hosts) == 1 else "ies",  # type: ignore[arg-type]
+                name,
+            )
+        if kept_hosts:
+            out["extra_hosts"] = kept_hosts
+
+    dropped = sorted(set(spec) - set(out) - {"ports", "deploy"})
+    if dropped:
+        logger.warning(
+            "compose sanitize: dropping key(s) %s from service %r",
+            ", ".join(dropped), name,
+        )
+
+    # Single-container-parity resource limits — the compose path must not
+    # be the unlimited path (containers.py enforces the same values).
+    out.update(_SERVICE_LIMITS)
+
+    if labels:
+        inject_labels(out, labels=labels)
+    return out
+
+
+def _sanitize_volume_defs(defs: Any) -> dict[str, Any]:
+    """Top-level ``volumes:`` — keep bare named volumes (labels only).
+
+    ``driver_opts`` (the ``type: none / o: bind / device: /host/path``
+    escape), ``external`` (mounts pre-existing host volumes) and custom
+    drivers are dropped; compose then creates a plain project-scoped volume.
+    """
+    out: dict[str, Any] = {}
+    if not isinstance(defs, dict):
+        return out
+    for name, definition in defs.items():
+        cleaned: dict[str, Any] = {}
+        if isinstance(definition, dict):
+            if isinstance(definition.get("labels"), (dict, list)):
+                cleaned["labels"] = definition["labels"]
+            dropped = sorted(set(definition) - set(cleaned))
+            if dropped:
+                logger.warning(
+                    "compose sanitize: dropping volume-definition key(s) %s "
+                    "from %r", ", ".join(dropped), name,
+                )
+        out[str(name)] = cleaned or None
+    return out
+
+
+def _sanitize_network_defs(defs: Any) -> dict[str, Any]:
+    """Top-level ``networks:`` — internal project-scoped bridges only.
+
+    ``external``/``name`` (attachment to pre-existing networks, including
+    the literal host network), non-bridge drivers, ``driver_opts`` and
+    ``ipam`` (hostile subnet choices can shadow host routes) are dropped,
+    and EVERY definition is forced ``internal: true`` — a hostile stack
+    runs with no routed egress (see :func:`_sanitize_model`).
+    """
+    out: dict[str, Any] = {}
+    if not isinstance(defs, dict):
+        return out
+    for name, definition in defs.items():
+        cleaned: dict[str, Any] = {"internal": True}
+        if isinstance(definition, dict):
+            if isinstance(definition.get("labels"), (dict, list)):
+                cleaned["labels"] = definition["labels"]
+            if definition.get("driver") == "bridge":
+                cleaned["driver"] = "bridge"
+            dropped = sorted(set(definition) - set(cleaned) - {"internal"})
+            if dropped:
+                logger.warning(
+                    "compose sanitize: dropping network-definition key(s) %s "
+                    "from %r", ", ".join(dropped), name,
+                )
+        out[str(name)] = cleaned
+    return out
+
+
+def _sanitize_file_source_defs(
+    defs: Any, staging: Path, *, what: str
+) -> dict[str, Any]:
+    """Top-level ``configs:``/``secrets:`` — staging-confined files only.
+
+    ``external`` and ``environment`` sources are refused (they read
+    pre-existing host state into the stack); ``file`` sources must resolve
+    inside the staging dir. Inline ``content`` is fine — it came from the
+    compose file itself.
+    """
+    out: dict[str, Any] = {}
+    if not isinstance(defs, dict):
+        return out
+    staging_real = staging.resolve()
+    prefix = str(staging_real) + os.sep
+    for name, definition in defs.items():
+        if not isinstance(definition, dict):
+            raise ComposeError(f"compose {what} {name!r} is not a mapping")
+        if definition.get("external"):
+            raise ComposeError(
+                f"compose {what} {name!r} is external — refusing")
+        if "environment" in definition:
+            raise ComposeError(
+                f"compose {what} {name!r} reads a launcher environment "
+                "variable — refusing"
+            )
+        cleaned: dict[str, Any] = {}
+        if "content" in definition:
+            cleaned["content"] = definition["content"]
+        elif "file" in definition:
+            file_ref = str(definition["file"])
+            if file_ref.startswith("~"):
+                raise ComposeError(
+                    f"compose {what} {name!r} file {file_ref!r} references "
+                    "a home path — refusing"
+                )
+            if file_ref.startswith("/"):
+                resolved = os.path.realpath(file_ref)
+            else:
+                resolved = os.path.realpath(
+                    os.path.join(staging_real, file_ref))
+            if not resolved.startswith(prefix):
+                raise ComposeError(
+                    f"compose {what} {name!r} file {file_ref!r} escapes the "
+                    "staging dir — refusing"
+                )
+            cleaned["file"] = file_ref
+        else:
+            raise ComposeError(
+                f"compose {what} {name!r} has no file/content source — "
+                "refusing"
+            )
+        out[str(name)] = cleaned
+    return out
+
+
+def _sanitize_model(
+    data: dict[str, Any],
+    staging: Path,
+    *,
+    labels: dict[str, str] | None,
+    allow_devices: bool,
+) -> dict[str, Any]:
+    """Rebuild the RESOLVED compose model from allowlists (see module doc)."""
+    services = data.get("services")
+    if not isinstance(services, dict) or not services:
+        msg = "resolved compose model has no 'services' mapping"
+        raise ComposeError(msg)
+    if len(services) > _MAX_SERVICES:
+        raise ComposeError(
+            f"compose stack declares {len(services)} services — exceeds the "
+            f"cap of {_MAX_SERVICES}; refusing"
+        )
+    out: dict[str, Any] = {}
+    if isinstance(data.get("name"), str):
+        out["name"] = data["name"]
+    out["services"] = {}
+    for name, spec in services.items():
+        if not isinstance(spec, dict):
+            raise ComposeError(
+                f"compose service {name!r} is not a mapping — refusing")
+        out["services"][str(name)] = _sanitize_service(
+            str(name), spec, staging,
+            labels=labels, allow_devices=allow_devices,
+        )
+    # Sanitize configs/secrets BEFORE the stack-wide bind pass: their
+    # file sources are daemon-re-resolved binds and must join the
+    # writable-overlap refusal below.
+    for section in ("configs", "secrets"):
+        if section in data:
+            out[section] = _sanitize_file_source_defs(
+                data[section], staging, what=section)
+    # Stack-wide pass: per-service volume filtering cannot see the
+    # bind-source TOCTOU one service sets up against another.
+    _refuse_writable_bind_overlaps(
+        out["services"], staging,
+        file_source_defs={
+            "configs": out.get("configs") or {},
+            "secrets": out.get("secrets") or {},
+        },
+    )
+    if "volumes" in data:
+        out["volumes"] = _sanitize_volume_defs(data["volumes"])
+    # Egress isolation: every stack network — including the implicit
+    # project default — is forced ``internal: true``. Routed egress
+    # (LAN / cloud-metadata / Internet) dies; inter-service traffic and
+    # the host->container-IP verify path keep working. Known residual,
+    # stated rather than oversold: the host itself stays reachable at
+    # the network's bridge gateway address, so host services bound on
+    # 0.0.0.0 (including docker-proxy listeners other tools published
+    # on 0.0.0.0) are reachable from inside; loopback-bound host
+    # services are not. Closing that requires host-level firewall
+    # authority (a DOCKER-USER rule) RAPTOR does not own.
+    out["networks"] = _sanitize_network_defs(data.get("networks") or {})
+    out["networks"].setdefault("default", {"internal": True})
+    dropped = sorted(
+        set(data) - set(out) - {"version"}
+    )
+    if dropped:
+        logger.warning(
+            "compose sanitize: dropping top-level key(s) %s",
+            ", ".join(dropped),
+        )
+    return out
+
+
+def _rewrite_ports_in_place(
+    compose_file: Path, *, labels: dict[str, str] | None = None,
+    allow_devices: bool = False,
+) -> None:
+    """Resolve + sanitize ``compose_file`` in place (see module docstring).
+
+    Three stages, each fail-closed:
+
+    1. Raw pre-gate: refuse constructs that would make the resolver read
+       files outside the staging dir (``include``, out-of-staging
+       ``extends.file``/``env_file``, interpolated path references).
+    2. Resolution: ``docker compose config`` produces the FULL effective
+       service model — interpolation, ``extends``, anchors and ``.env``
+       applied. Sanitizing the raw text instead would let
+       ``privileged: ${X:-true}``-style constructs ride through to ``up``.
+    3. Allowlist sanitize: every service is REBUILT from known-safe keys;
+       ports become ``127.0.0.1:0:<target>``, bind sources and build
+       contexts are confined to staging, resource limits are injected.
+    """
+    # The primary document gets the same size budget as every gated
+    # extends/env_file target — without it, a multi-GiB compose file in
+    # a hostile repo is a memory DoS on the sanitizer process.
+    try:
+        raw = _load_gated_document(compose_file, what="file")
+    except ComposeError as exc:
+        msg = f"cannot parse compose file {compose_file} for security rewrite: {exc}"
+        raise ComposeError(
+            msg,
+            stderr=str(exc),
+        ) from exc
+    if not isinstance(raw, dict):
+        msg = f"compose file {compose_file} did not parse as a YAML mapping"
+        raise ComposeError(msg)
+    if not isinstance(raw.get("services"), dict):
+        msg = f"compose file {compose_file} has no 'services' mapping"
+        raise ComposeError(msg)
+    staging = compose_file.parent
+    _pre_resolution_gate(raw, staging)
+    resolved = _resolve_effective_model(compose_file)
+    sanitized = _sanitize_model(
+        resolved, staging, labels=labels, allow_devices=allow_devices)
+    compose_file.write_text(
+        yaml.safe_dump(sanitized, sort_keys=False), encoding="utf-8")
+
+
+def inject_labels(spec: dict[str, Any], *, labels: dict[str, str]) -> None:
+    """Merge the caller's labels into a compose service spec (in-place).
+
+    Preserves any user-supplied labels (collisions on the caller's keys
+    resolve in the caller's favor to keep cleanup matching reliable).
+
+    Handles both compose label schemas:
+      * dict form: ``labels: {key: value}``
+      * list form: ``labels: ["key=value", ...]``
+    Normalizes to dict form for deterministic round-trip.
+    """
+    existing = spec.get("labels")
+    merged: dict[str, str] = {}
+    if isinstance(existing, dict):
+        for k, v in existing.items():
+            merged[str(k)] = str(v)
+    elif isinstance(existing, list):
+        for item in existing:
+            text = str(item)
+            if "=" in text:
+                k, v = text.split("=", 1)
+                merged[k.strip()] = v.strip()
+            else:
+                merged[text] = ""
+    merged.update(labels)
+    spec["labels"] = merged
+
+
+def run_compose(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float = 300.0,
+    platform: str | None = None,
+) -> str:
+    """Invoke compose with ``<args>``; raise on non-zero rc."""
+    # Start from the allowlisted env so HTTPS_PROXY / GIT_SSH_COMMAND /
+    # LD_PRELOAD don't reach docker compose. Layer the DOCKER_DEFAULT_PLATFORM
+    # override on top when an explicit platform was requested.
+    # run_cli turns timeout into outcome.timed_out=True; we re-raise
+    # it as ComposeError.
+    prefix = _compose_invocation()
+    env: dict[str, str] = docker_child_env()
+    if platform:
+        env["DOCKER_DEFAULT_PLATFORM"] = platform
+    outcome = run_cli(
+        [*prefix, *args],
+        timeout=timeout,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+    )
+    if outcome.timed_out:
+        msg = f"compose {args[0]} timed out after {timeout}s"
+        raise ComposeError(msg, stderr=outcome.stderr)
+    if outcome.returncode != 0:
+        stderr = (outcome.stderr or "").strip()
+        stdout = (outcome.stdout or "").strip()
+        msg = (
+            f"compose {args[0]!r} failed (rc={outcome.returncode}): {stderr or stdout}"
+        )
+        raise ComposeError(msg, stderr=stderr or stdout)
+    return outcome.stdout or ""
+
+
+def build_stack(
+    project_name: str,
+    compose_file: Path,
+    *,
+    build_timeout_seconds: float = 900.0,
+    platform: str | None = None,
+) -> None:
+    """``docker compose -p <project> -f <file> build``."""
+    run_compose(
+        ["-p", project_name, "-f", str(compose_file), "build"],
+        timeout=build_timeout_seconds,
+        platform=platform,
+    )
+
+
+def up_stack(
+    project_name: str,
+    compose_file: Path,
+    *,
+    up_timeout_seconds: float = 300.0,
+    platform: str | None = None,
+) -> tuple[tuple[ComposeContainer, ...], ComposeContainer]:
+    """``docker compose up -d`` + parse ``ps --format json``. Returns
+    ``(all_containers, primary)``.
+    """
+    # --pull missing: pull images only when not locally available. Using
+    # "always" breaks locally-built services (compose stacks that `build:`
+    # their own images have no upstream to pull from). Trade-off: a stale
+    # cached registry image won't be refreshed automatically; operator can
+    # `docker compose pull` explicitly when needed.
+    run_compose(
+        ["-p", project_name, "-f", str(compose_file), "up", "-d", "--pull", "missing"],
+        timeout=up_timeout_seconds,
+        platform=platform,
+    )
+    ps_raw = run_compose(
+        ["-p", project_name, "-f", str(compose_file), "ps", "--format", "json"],
+        timeout=30.0,
+    )
+    containers = parse_ps_json(ps_raw)
+    if not containers:
+        msg = f"docker compose ps returned no containers for {project_name}"
+        raise ComposeError(msg)
+    # Sanitized stacks run on internal (no-egress) networks where port
+    # publishing is unavailable — the reachable endpoint is then the
+    # container's own network address (the host holds the bridge-side
+    # interface). Resolve it for the unpublished containers,
+    # best-effort, with ONE batched inspect.
+    containers = _with_container_endpoints(containers)
+    primary = pick_primary(containers)
+    return containers, primary
+
+
+def _with_container_endpoints(
+    containers: tuple[ComposeContainer, ...],
+) -> tuple[ComposeContainer, ...]:
+    """Fill unpublished containers' endpoints from ``docker inspect``.
+
+    One inspect invocation for ALL unpublished containers (docker
+    accepts multiple ids; a per-container spawn paid one subprocess
+    per service). Output lines carry each container's own Id so the
+    mapping survives docker skipping unknown ids (non-zero rc with
+    partial stdout). Containers whose address or exposed port cannot
+    be determined pass through unchanged (callers treat a port-less
+    container as non-primary).
+    """
+    unpublished = [c for c in containers if c.host_port is None]
+    if not unpublished:
+        return containers
+    outcome = run_cli(
+        [
+            "docker", "inspect", "--format",
+            '{"id":{{json .Id}},'
+            '"nets":{{json .NetworkSettings.Networks}},'
+            '"exposed":{{json .Config.ExposedPorts}}}',
+            *[c.container_id for c in unpublished],
+        ],
+        timeout=10.0 + 2.0 * len(unpublished),
+    )
+    if not (outcome.stdout or "").strip():
+        return containers
+    info_by_id: dict[str, dict[str, Any]] = {}
+    for line in outcome.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            info = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(info, dict) and isinstance(info.get("id"), str):
+            info_by_id[info["id"]] = info
+    def _resolve(container: ComposeContainer) -> ComposeContainer:
+        if container.host_port is not None:
+            return container
+        # compose ps ids may be short-form; .Id is the full hash.
+        info = next(
+            (v for k, v in info_by_id.items()
+             if k.startswith(container.container_id)),
+            None,
+        )
+        if info is None:
+            return container
+        return _endpoint_from_inspect(container, info)
+    return tuple(_resolve(c) for c in containers)
+
+
+def _endpoint_from_inspect(
+    container: ComposeContainer, info: dict[str, Any],
+) -> ComposeContainer:
+    """Build the endpoint-carrying container from one inspect record."""
+    ip = ""
+    nets = info.get("nets")
+    if isinstance(nets, dict):
+        for net in nets.values():
+            candidate = (net or {}).get("IPAddress") if isinstance(net, dict) else ""
+            if candidate:
+                ip = str(candidate)
+                break
+    ports: list[int] = []
+    exposed = info.get("exposed")
+    if isinstance(exposed, dict):
+        for spec in exposed:
+            head = str(spec).split("/", 1)[0]
+            try:
+                port = int(head)
+            except ValueError:
+                continue
+            if 0 < port < 65536:
+                ports.append(port)
+    if not ip or not ports:
+        return container
+    preferred = [p for p in ports if p in _PREFERRED_CONTAINER_PORTS]
+    port = preferred[0] if preferred else min(ports)
+    return ComposeContainer(
+        service=container.service,
+        container_id=container.container_id,
+        host_port=port,
+        container_port=port,
+        host_ip=ip,
+    )
+
+
+def down_stack(
+    project_name: str,
+    compose_file: Path,
+    *,
+    timeout_seconds: float = 120.0,
+) -> None:
+    """``docker compose down -v --remove-orphans``. Best-effort; never raises.
+
+    ``--timeout 30`` bounds each container's stop grace so a
+    SIGTERM-ignoring entrypoint cannot hold the stack (and its volumes
+    and networks — ``-v`` runs only when ``down`` completes) alive past
+    teardown.
+    """
+    try:
+        run_compose(
+            [
+                "-p",
+                project_name,
+                "-f",
+                str(compose_file),
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--timeout",
+                "30",
+            ],
+            timeout=timeout_seconds,
+        )
+    except ComposeError as exc:
+        logger.warning("compose down failed for %s: %s", project_name, exc)
+
+
+def parse_ps_json(raw: str) -> tuple[ComposeContainer, ...]:
+    """Parse ``docker compose ps --format json`` (array OR line-delimited)."""
+    text = raw.strip()
+    if not text:
+        return ()
+    entries: list[dict[str, Any]] = []
+    if text.startswith("["):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return ()
+        if isinstance(decoded, list):
+            entries = [e for e in decoded if isinstance(e, dict)]
+    else:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                entries.append(obj)
+    results: list[ComposeContainer] = []
+    for e in entries:
+        service = str(e.get("Service") or "")
+        cid = str(e.get("ID") or "")
+        if not service or not cid:
+            continue
+        host_port, container_port = _pick_host_port(e.get("Publishers"))
+        results.append(
+            ComposeContainer(
+                service=service,
+                container_id=cid,
+                host_port=host_port,
+                container_port=container_port,
+            )
+        )
+    return tuple(results)
+
+
+def _pick_host_port(publishers: Any) -> tuple[int | None, int | None]:
+    """Pick (host_port, container_port) -- prefer HTTP-shaped target ports."""
+    if not isinstance(publishers, list):
+        return None, None
+    best_priority: int | None = None
+    best_published: int | None = None
+    best_target: int | None = None
+    for p in publishers:
+        if not isinstance(p, dict):
+            continue
+        target = p.get("TargetPort")
+        published = p.get("PublishedPort")
+        if target is None or published is None:
+            continue
+        try:
+            tp = int(target)
+            pp = int(published)
+        except (TypeError, ValueError):
+            continue
+        if pp == 0:
+            continue
+        priority = 0 if tp in _PREFERRED_CONTAINER_PORTS else tp
+        if best_priority is None or priority < best_priority:
+            best_priority = priority
+            best_published = pp
+            best_target = tp
+    if best_priority is None:
+        return None, None
+    return best_published, best_target
+
+
+def pick_primary(containers: tuple[ComposeContainer, ...]) -> ComposeContainer:
+    """Pick the HTTP-facing service; fall back to first-with-port, else first."""
+    with_port = [c for c in containers if c.host_port]
+    for hint in _PREFERRED_SERVICE_HINTS:
+        for c in with_port:
+            if hint in c.service.lower():
+                return c
+    if with_port:
+        return with_port[0]
+    return containers[0]
+
+

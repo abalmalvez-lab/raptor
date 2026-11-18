@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +11,8 @@ import pytest
 
 from core.sandbox import calibrate as cal
 from core.sandbox.calibrate_cli import _cli_main
+from core.sandbox.tests.capability import requires_landlock
+from core.testing.standalone_cli import run_standalone_cli
 
 
 def _profile_for(bin_path) -> cal.SandboxProfile:
@@ -245,11 +246,12 @@ class TestSpawnPath:
     sys.platform != "linux",
     reason="Linux ptrace + seccomp tracer — observe is Linux-only here",
 )
+@requires_landlock
 class TestE2EShim:
 
     def test_shim_calibrates_bin_cat(self, tmp_path, monkeypatch):
-        from core.sandbox.seccomp import check_seccomp_available
         from core.sandbox.ptrace_probe import check_ptrace_available
+        from core.sandbox.seccomp import check_seccomp_available
         if not (check_seccomp_available()
                 and check_ptrace_available()):
             pytest.skip("observe prerequisites unavailable")
@@ -263,7 +265,7 @@ class TestE2EShim:
         # subprocess sees it. Easiest: monkeypatch HOME — the cache
         # dir is rooted at Path.home().
         env = {**os.environ, "_RAPTOR_TRUSTED": "1", "HOME": str(tmp_path)}
-        result = subprocess.run(
+        result = run_standalone_cli(
             [str(shim), "--bin", "/bin/cat",
              "--probe-args", "/etc/hosts",
              "--json", "--timeout", "15"],
@@ -277,3 +279,24 @@ class TestE2EShim:
         assert len(payload["binary_sha256"]) == 64
         # cat /etc/hosts must have read at least the file + libc.
         assert len(payload["paths_read"]) > 0
+
+
+class TestForeignFieldsEscaped:
+    def test_hostile_observed_paths_escaped(
+        self, cache_dir, fake_binary, capsys,
+    ):
+        # Observed paths are chosen by the PROBED binary — a hostile
+        # tool that open()s an ESC-named path must not drive the
+        # operator terminal via --show.
+        hostile = "/tmp/\x1b]0;pwned\x07\x9b2J‮evil"
+        prof = _profile_for(fake_binary)
+        prof.paths_read.append(hostile)
+        fp = cal._fingerprint(prof.binary_sha256, prof.env_signature)
+        cal._save_to_cache(fp, prof)
+
+        rc = _cli_main(["--bin", str(fake_binary), "--show"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out
+        assert "pwned" in out  # escaped, not dropped

@@ -13,97 +13,23 @@ calls, then exercises the cache via the real public API
 
 from __future__ import annotations
 
+from core.testing.threads import retiring_threads
+
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Dict, Tuple
 
+from core.testing import (
+    FakeStructuredProvider,
+    install_provider,
+    make_test_client,
+)
 
-from core.llm.client import LLMClient
-from core.llm.config import LLMConfig, ModelConfig
-
-
-class _FakeProvider:
-    """Stand-in provider whose ``generate_structured`` returns a canned
-    result and counts invocations."""
-
-    def __init__(self, result: Dict[str, Any], raw: str = "raw-stub"):
-        self.result = result
-        self.raw = raw
-        self.calls = 0
-        self.total_cost = 0.0
-        self.total_tokens = 0
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        self.call_count = 0
-        self.total_duration = 0.0
-
-    def generate_structured(
-        self, prompt: str, schema: Dict[str, Any],
-        system_prompt: str | None = None,
-        **kwargs,
-    ) -> Tuple[Dict[str, Any], str]:
-        self.calls += 1
-        # Capture last-call kwargs so tests can assert plumbing
-        # (batch 331). Mimic what real providers do: bump
-        # cost/tokens so the client records non-zero deltas.
-        # Cache hits should bypass this entirely.
-        self.last_kwargs = dict(kwargs)
-        self.total_cost += 0.001
-        self.total_tokens += 100
-        return self.result, self.raw
-
-
-def _client(
-    tmp_path: Path, *,
-    enable_caching: bool = True,
-    cache_ttl_seconds: float | None = None,
-    cache_max_entries: int | None = None,
-) -> LLMClient:
-    """Build a minimally-configured LLMClient backed by a single fake
-    provider keyed under the primary_model identity. Skips the real
-    constructor's health-check + provider creation paths so we can run
-    without API keys."""
-    cfg = LLMConfig.__new__(LLMConfig)
-    cfg.primary_model = ModelConfig(
-        provider="anthropic",
-        model_name="test-primary",
-        max_context=200000,
-        api_key="not-used",
-    )
-    cfg.fallback_models = []
-    cfg.specialized_models = {}
-    cfg.enable_fallback = False
-    cfg.max_retries = 1
-    cfg.retry_delay = 0.0
-    cfg.retry_delay_remote = 0.0
-    cfg.enable_caching = enable_caching
-    cfg.cache_dir = tmp_path / "llm_cache"
-    cfg.cache_ttl_seconds = cache_ttl_seconds
-    cfg.cache_max_entries = cache_max_entries
-    cfg.enable_cost_tracking = False
-    cfg.max_cost_per_scan = 100.0
-    cfg.scorecard_enabled = False  # avoid latent class-default pollution if a future code path consults scorecard
-
-    if enable_caching:
-        cfg.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    client = LLMClient.__new__(LLMClient)
-    import threading
-    client.config = cfg
-    client.providers = {}
-    client.total_cost = 0.0
-    client.request_count = 0
-    client.task_type_costs = {}
-    client._stats_lock = threading.RLock()
-    client._key_locks = {}
-    client._key_locks_guard = threading.Lock()
-    return client
-
-
-def _install_provider(client: LLMClient, provider: _FakeProvider) -> None:
-    """Wire a fake provider into ``client.providers`` under the key
-    that ``_get_provider`` looks up."""
-    pm = client.config.primary_model
-    client.providers[f"{pm.provider}:{pm.model_name}"] = provider
+# Shared scaffolding (core/testing) under this suite's historical
+# local names — the definitions used to live here and had already
+# been copy-drifted into sibling suites.
+_FakeProvider = FakeStructuredProvider
+_client = make_test_client
+_install_provider = install_provider
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +55,34 @@ def test_repeat_call_is_served_from_cache(tmp_path: Path) -> None:
     assert r1.raw == r2.raw == '{"verdict":"safe"}'
 
 
+def test_cache_key_no_delimiter_injection(tmp_path: Path) -> None:
+    """Component boundaries must survive content containing the old
+    ``:`` join delimiter: (system='A', prompt='B:C') and
+    (system='A:B', prompt='C') hashed identically pre-fix, replaying
+    the wrong cached response across callers."""
+    client = _client(tmp_path)
+    k1 = client._get_cache_key("B:C", "A", "m")
+    k2 = client._get_cache_key("C", "A:B", "m")
+    assert k1 != k2
+    # Model/system boundary too.
+    k3 = client._get_cache_key("p", "s", "m:x")
+    k4 = client._get_cache_key("p", "x:s", "m")
+    assert k3 != k4
+    # Determinism: same inputs, same key.
+    assert k1 == client._get_cache_key("B:C", "A", "m")
+
+
+def test_structured_cache_key_no_delimiter_injection(
+        tmp_path: Path) -> None:
+    """Structured twin of the delimiter-injection guard above."""
+    client = _client(tmp_path)
+    schema = {"verdict": "string"}
+    k1 = client._get_structured_cache_key("B:C", "A", "m", schema)
+    k2 = client._get_structured_cache_key("C", "A:B", "m", schema)
+    assert k1 != k2
+    assert k1 == client._get_structured_cache_key("B:C", "A", "m", schema)
+
+
 def test_different_schema_does_not_collide(tmp_path: Path) -> None:
     """Same prompt with two different schemas → provider invoked twice.
     A naïve implementation that hashes only the prompt would serve the
@@ -151,7 +105,9 @@ def test_schema_key_order_does_not_affect_cache(tmp_path: Path) -> None:
     to the same key — otherwise consumers that build schemas from
     keyword args would get spurious misses."""
     client = _client(tmp_path)
-    fake = _FakeProvider({"k": "v"})
+    # Result must conform to the schema below — the strict schema floor
+    # rejects responses carrying fields outside the declared properties.
+    fake = _FakeProvider({"a": "v"})
     _install_provider(client, fake)
 
     schema_1 = {"type": "object", "properties": {"a": {"type": "string"},
@@ -282,15 +238,19 @@ class _RecordingHandler:
 
     def __enter__(self):
         import logging
-        self._h = logging.Handler()
-        self._h.handle = lambda r: (self.records.append(r), True)[1]
-        self._lg = logging.getLogger("raptor")
-        self._lg.addHandler(self._h)
-        return self
+
+        with ExitStack() as cleanup:
+            self._h = logging.Handler()
+            cleanup.callback(self._h.close)
+            self._h.handle = lambda r: (self.records.append(r), True)[1]
+            self._lg = logging.getLogger("raptor")
+            cleanup.callback(self._lg.removeHandler, self._h)
+            self._lg.addHandler(self._h)
+            self._cleanup = cleanup.pop_all()
+            return self
 
     def __exit__(self, *exc):
-        self._lg.removeHandler(self._h)
-        return False
+        return self._cleanup.__exit__(*exc)
 
     def messages(self):
         return [r.getMessage() for r in self.records]
@@ -348,12 +308,18 @@ def test_concurrent_same_key_dedupes_to_one_provider_call(
     results: list = []
 
     def worker():
-        barrier.wait()                       # release all 8 at once
+        try:
+            barrier.wait()                       # release all 8 at once
+        except threading.BrokenBarrierError:
+            return
         results.append(client.generate_structured("p", schema))
 
     threads = [threading.Thread(target=worker) for _ in range(8)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    with retiring_threads(threads, release=barrier.abort, timeout=5):
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     assert fake.calls == 1, (
         f"expected dedup to 1 call, got {fake.calls}"
@@ -377,12 +343,18 @@ def test_concurrent_distinct_keys_run_in_parallel(tmp_path: Path) -> None:
     barrier = threading.Barrier(8)
 
     def worker(i: int):
-        barrier.wait()
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            return
         client.generate_structured(f"distinct-prompt-{i}", schema)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    with retiring_threads(threads, release=barrier.abort, timeout=5):
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     assert fake.calls == 8
 
@@ -404,11 +376,18 @@ def test_ttl_expired_entry_treated_as_miss(tmp_path: Path) -> None:
     assert fake.calls == 1
 
     # Back-date the cache entry to 2 minutes ago.
-    import json, time
+    import json
+    import time
     cache_files = list(client.config.cache_dir.glob("structured-*.json"))
     assert len(cache_files) == 1
     data = json.loads(cache_files[0].read_text(encoding="utf-8"))
-    data["timestamp"] = time.time() - 120
+    data["timestamp"] = time.monotonic() - 120
+    # Re-stamp after the edit: the provenance gate
+    # (core.llm.cache_integrity) reads a hand-edited entry as a miss
+    # by design; this test is about TTL semantics, so keep the entry
+    # authenticated.
+    from core.llm import cache_integrity
+    cache_integrity.stamp(cache_files[0].stem, data)
     cache_files[0].write_text(json.dumps(data), encoding="utf-8")
 
     client.generate_structured("p", {"type": "object"})
@@ -428,6 +407,12 @@ def test_ttl_unset_keeps_entries_indefinitely(tmp_path: Path) -> None:
     cache_files = list(client.config.cache_dir.glob("structured-*.json"))
     data = json.loads(cache_files[0].read_text(encoding="utf-8"))
     data["timestamp"] = 0.0
+    # Re-stamp after the edit: the provenance gate
+    # (core.llm.cache_integrity) reads a hand-edited entry as a miss
+    # by design; this test is about TTL semantics, so keep the entry
+    # authenticated.
+    from core.llm import cache_integrity
+    cache_integrity.stamp(cache_files[0].stem, data)
     cache_files[0].write_text(json.dumps(data), encoding="utf-8")
 
     fake.calls = 0
@@ -437,10 +422,12 @@ def test_ttl_unset_keeps_entries_indefinitely(tmp_path: Path) -> None:
 
 
 def test_entries_without_timestamp_serve_as_fresh(tmp_path: Path) -> None:
-    """A pre-existing cache entry that lacks a ``timestamp`` field
-    (written by an older code version) must not be evicted en masse on
-    upgrade — we treat it as fresh and let it serve. TTL only applies
-    going forward."""
+    """An AUTHENTICATED entry that lacks a ``timestamp`` field is
+    treated as fresh (TTL only applies going forward). Note the
+    provenance gate narrows the old contract: an UNSTAMPED legacy
+    entry now reads as a miss (see test_cache_integrity) — the
+    leniency here is only reachable for entries this install's writer
+    stamped."""
     import json
     client = _client(tmp_path, cache_ttl_seconds=1.0)
     fake = _FakeProvider({"k": "v"})
@@ -450,6 +437,12 @@ def test_entries_without_timestamp_serve_as_fresh(tmp_path: Path) -> None:
     cache_files = list(client.config.cache_dir.glob("structured-*.json"))
     data = json.loads(cache_files[0].read_text(encoding="utf-8"))
     del data["timestamp"]
+    # Re-stamp after the edit: the provenance gate
+    # (core.llm.cache_integrity) reads a hand-edited entry as a miss
+    # by design; this test is about TTL semantics, so keep the entry
+    # authenticated.
+    from core.llm import cache_integrity
+    cache_integrity.stamp(cache_files[0].stem, data)
     cache_files[0].write_text(json.dumps(data), encoding="utf-8")
 
     fake.calls = 0
@@ -461,6 +454,7 @@ def test_entries_without_timestamp_serve_as_fresh(tmp_path: Path) -> None:
 def test_eviction_drops_oldest_when_over_cap(tmp_path: Path) -> None:
     """Save N+overflow entries with cache_max_entries=N → directory
     settles at exactly N files, with the oldest evicted."""
+    import os
     import time
     client = _client(tmp_path, cache_max_entries=5)
     fake = _FakeProvider({"k": "v"})
@@ -468,11 +462,17 @@ def test_eviction_drops_oldest_when_over_cap(tmp_path: Path) -> None:
 
     schema = {"type": "object"}
     # 8 distinct entries → after eviction we should keep 5.
-    # time.sleep between writes so mtimes are distinct enough that
-    # "oldest" is unambiguous.
+    # Back-date each new entry's mtime explicitly (like the TTL test
+    # above) so "oldest" is unambiguous even on filesystems with
+    # coarse mtime granularity — sleeping 10ms between writes was not
+    # enough on 1s-granularity mounts.
+    base = time.time() - 1000
+    seen: set[Path] = set()
     for i in range(8):
         client.generate_structured(f"prompt-{i}", schema)
-        time.sleep(0.01)
+        for p in set(client.config.cache_dir.glob("*.json")) - seen:
+            os.utime(p, (base + i, base + i))
+            seen.add(p)
 
     files = list(client.config.cache_dir.glob("*.json"))
     assert len(files) == 5, f"expected 5 entries after eviction, got {len(files)}"
@@ -490,3 +490,77 @@ def test_eviction_disabled_when_cap_unset(tmp_path: Path) -> None:
 
     files = list(client.config.cache_dir.glob("*.json"))
     assert len(files) == 20
+
+
+def test_cache_cap_defaults_to_bounded():
+    """The config default must bound the cache: unbounded growth is
+    opt-in (cache_max_entries=None), not the default. Pre-fix the
+    default was None and out/llm_cache grew for the life of the
+    install."""
+    from core.llm.config import LLMConfig
+    cfg = LLMConfig()
+    assert cfg.cache_max_entries is not None
+    assert cfg.cache_max_entries > 0
+
+
+class TestCacheTtlDefault:
+    """TTL defaults to 24h (operator decision 2026-08-15: most targets
+    aren't re-audited across days, and the cache key already pins the
+    model name — the TTL guards same-name behaviour drift)."""
+
+    def test_default_is_24h(self, monkeypatch):
+        monkeypatch.delenv("RAPTOR_LLM_CACHE_TTL_S", raising=False)
+        from core.llm.config import LLMConfig
+        assert LLMConfig().cache_ttl_seconds == 86_400.0
+
+    def test_env_overrides_seconds(self, monkeypatch):
+        monkeypatch.setenv("RAPTOR_LLM_CACHE_TTL_S", "3600")
+        from core.llm.config import LLMConfig
+        assert LLMConfig().cache_ttl_seconds == 3600.0
+
+    def test_env_none_disables_expiry(self, monkeypatch):
+        for raw in ("none", "off", "0", "-1"):
+            monkeypatch.setenv("RAPTOR_LLM_CACHE_TTL_S", raw)
+            from core.llm.config import LLMConfig
+            assert LLMConfig().cache_ttl_seconds is None, raw
+
+    def test_garbled_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("RAPTOR_LLM_CACHE_TTL_S", "tomorrow")
+        from core.llm.config import LLMConfig
+        assert LLMConfig().cache_ttl_seconds == 86_400.0
+
+
+class TestCacheEnableSwitch:
+    """RAPTOR_LLM_CACHE=off disables response caching for every
+    LLMConfig constructed in the process — the refire lane's cache
+    bypass (a replayed completion is invisible to reruns measuring a
+    fix, so trap verification against cache hits proves nothing)."""
+
+    def test_default_is_on(self, monkeypatch):
+        monkeypatch.delenv("RAPTOR_LLM_CACHE", raising=False)
+        from core.llm.config import LLMConfig
+        assert LLMConfig().enable_caching is True
+
+    def test_env_off_disables(self, monkeypatch):
+        for raw in ("off", "none", "0", "false", "no", "OFF", " Off "):
+            monkeypatch.setenv("RAPTOR_LLM_CACHE", raw)
+            from core.llm.config import LLMConfig
+            assert LLMConfig().enable_caching is False, raw
+
+    def test_other_values_keep_caching_on(self, monkeypatch):
+        for raw in ("on", "1", "true", ""):
+            monkeypatch.setenv("RAPTOR_LLM_CACHE", raw)
+            from core.llm.config import LLMConfig
+            assert LLMConfig().enable_caching is True, raw
+
+    def test_client_honours_the_switch(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RAPTOR_LLM_CACHE", "off")
+        from core.llm.config import LLMConfig
+        # The switch lands on the config; the client consults it on
+        # every cache read. Split assertion so a regression names the
+        # failing half. Client built via the shared substrate builder
+        # (core.testing) — see test_adoption_driftguard.
+        assert LLMConfig().enable_caching is False
+        client = _client(tmp_path, enable_caching=False)
+        assert client._get_cached_response("deadbeef") is None
+        assert client._get_cached_structured_response("deadbeef") is None

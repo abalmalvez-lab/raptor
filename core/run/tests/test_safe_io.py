@@ -6,6 +6,9 @@ import os
 
 import pytest
 
+from core.testing.module_bindings import patch_module_attribute
+from core.run import safe_io as safe_io_module
+
 from core.run.safe_io import safe_run_mkdir, UnsafeRunDirError
 
 
@@ -153,6 +156,25 @@ def test_foreign_uid_refused(tmp_path, monkeypatch):
     p = tmp_path / "a"
     p.mkdir(mode=0o700)
     real_uid = os.lstat(p).st_uid
-    monkeypatch.setattr(os, "geteuid", lambda: real_uid + 1)
+    patch_module_attribute(monkeypatch, safe_io_module, "os", "geteuid", lambda: real_uid + 1)
     with pytest.raises(UnsafeRunDirError, match="not owned by current user"):
         safe_run_mkdir(p)
+
+
+def test_hostile_umask_still_yields_0o700():
+    """The docstring promised 0o700 "regardless of the caller's
+    umask" while the mkdir mode was in fact masked (umask 0o277 gave
+    0o500) — the claim now holds via fchmod on the created handle."""
+    import stat as _stat
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from core.run.safe_io import safe_run_mkdir
+    with TemporaryDirectory() as td:  # parent minted pre-umask
+        old_umask = os.umask(0o277)
+        try:
+            d = Path(td) / "run"
+            safe_run_mkdir(d)
+            assert _stat.S_IMODE(os.lstat(d).st_mode) == 0o700
+        finally:
+            os.umask(old_umask)

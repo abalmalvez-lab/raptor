@@ -1,6 +1,6 @@
 """HTTP client interface — single chokepoint for outbound HTTP from RAPTOR.
 
-Two backends ship today:
+Two general-purpose backends ship today:
 
   - :class:`~core.http.urllib_backend.UrllibClient` — urllib3-backed
     with connection pooling, bounded size, gzip-decompress, and
@@ -15,7 +15,19 @@ Two backends ship today:
     call where the threat model includes "compromised parser
     exfiltrates to attacker host".
 
-Callers depend on the :class:`HttpClient` Protocol only — concrete
+An additional :class:`~core.http.anonymous.AnonymousOriginClient` offers a
+narrower read-only API: anonymous GET/HEAD requests to exact HTTPS origins.
+It reuses EgressClient, refuses credential-bearing request headers, has no
+cookie jar, and exposes per-response and optional aggregate body/request
+budgets. Redirects are returned for the caller to re-authorise. Browser/CLI
+adoption is separate.
+
+For forwarding anonymous resource bodies, ``core.http.headers`` provides
+``anonymous_resource_headers``. It copies only resource/CORS metadata,
+excluding cookies, origin state and transport framing. It is not a document
+proxy and does not rewrite response origins or content encodings.
+
+General-purpose callers depend on the :class:`HttpClient` Protocol — concrete
 backend swap is one factory call, no consumer churn.
 
 Constants below are defaults. Callers may override per-call timeouts
@@ -25,15 +37,17 @@ and per-call max_bytes; the user-agent is fixed at client construction
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Protocol
+from typing import Any, Protocol, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping
 
 # Default size limits — caps protect parser code paths from decompression
 # bombs and pathological response shapes.
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024   # 50MB; covers wheels and source archives
 DEFAULT_TIMEOUT = 30                   # seconds (per-attempt connect+read)
-DEFAULT_TOTAL_TIMEOUT = 600            # seconds (whole-call deadline incl retries)
+DEFAULT_TOTAL_TIMEOUT = 600            # seconds (retry/body deadline; setup uses I/O timeouts)
 # Default count of retries beyond the first attempt — i.e. the default
 # call makes up to (1 + DEFAULT_RETRIES) total attempts. Sized so the
 # default exactly fills the urllib backend's backoff schedule (one slot
@@ -51,8 +65,11 @@ class HttpError(Exception):
     def __init__(
         self,
         message: str,
-        status: Optional[int] = None,
-        retry_after: Optional[int] = None,
+        status: int | None = None,
+        retry_after: int | None = None,
+        *,
+        circuit_break: bool = False,
+        response: Response | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -60,10 +77,26 @@ class HttpError(Exception):
         # backend's retry loop reads this when honouring 429/503; None
         # means "no Retry-After advertised, use our backoff schedule".
         self.retry_after = retry_after
+        self.circuit_break = circuit_break
+        # Backend-internal: with ``raise_on_status=False`` the retry
+        # loop still uses HttpError to drive backoff on transient
+        # statuses; the response rides along here so the FINAL attempt
+        # can hand it back per the documented contract instead of
+        # raising.
+        self.response = response
 
 
 class SizeLimitExceeded(HttpError):
     """Raised when a response exceeds max_bytes before we finish reading."""
+
+
+class StreamWallclockExceeded(HttpError):
+    """Raised when a streamed body exceeds the wallclock cap
+    (slowloris defence). An :class:`HttpError` subclass so every
+    consumer's existing ``except HttpError`` degradation path catches
+    the abort — a builtin ``TimeoutError`` here escaped the OCI blob
+    pull's RegistryError translation and web_fetch's best-effort body
+    fallback, crashing exactly the paths the cap protects."""
 
 
 @dataclass(frozen=True)
@@ -87,9 +120,10 @@ class Response:
     HTTP spec says headers are case-insensitive, and forcing one
     casing keeps caller code simple.
 
-    ``url`` is the final URL after any redirects (or the request URL
-    if redirects were disabled / the backend couldn't determine the
-    final URL).
+    ``url`` is the URL the response was served from — normally the
+    request URL, since the urllib backend never follows redirects
+    (3xx responses are returned as-is with their ``Location``
+    header; see :class:`core.http.urllib_backend.UrllibClient`).
     """
 
     status: int
@@ -98,11 +132,25 @@ class Response:
     url: str
 
     def json(self) -> Any:
-        """Parse body as JSON. Raises HttpError on parse failure."""
+        """Parse body as JSON. Raises HttpError on parse failure.
+
+        Parses through :func:`core.json.loads` — HTTP bodies are one
+        of that chokepoint's named sources: BOM-prefixed bodies parse
+        (the raw ``json.loads`` here used to reject them), non-finite
+        constants (``NaN`` / ``Infinity``) are rejected instead of
+        flowing unguarded into consumers, and both failure shapes —
+        plus a RecursionError from a nesting bomb on recursive-parser
+        Pythons — translate to :class:`HttpError`.
+        """
+        from core.json import loads as _core_loads
+
         try:
-            return json.loads(self.body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise HttpError(f"Response is not valid JSON: {e}") from e
+            return _core_loads(self.body)
+        except (UnicodeDecodeError, ValueError, RecursionError) as e:
+            # json.JSONDecodeError and the non-finite rejection are
+            # ValueError subclasses.
+            msg = f"Response is not valid JSON: {e}"
+            raise HttpError(msg) from e
 
     # ------------------------------------------------------------------
     # ``requests``-compat shim
@@ -139,6 +187,8 @@ class Response:
         in memory at all), use :meth:`HttpClient.stream_bytes`
         instead.
         """
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
         body = self.body
         for i in range(0, len(body), chunk_size):
             yield body[i:i + chunk_size]
@@ -146,7 +196,6 @@ class Response:
     def close(self) -> None:
         """No-op for the buffered backend; matches ``requests.Response``
         which closes the underlying connection."""
-        pass
 
 
 class NotModified(HttpError):
@@ -190,10 +239,17 @@ class HttpClient(Protocol):
         cap the effective attempt count at their own backoff
         schedule length, so values larger than the schedule are
         silently equivalent to "use the whole schedule".
-      - ``follow_redirects``: True (default) follows up to 10 redirects;
-        False surfaces 3xx as ``HttpError`` for caller inspection.
-      - ``total_timeout``: wall-clock cap on the whole retry loop in
-        seconds (default 600).
+      - ``follow_redirects``: accepted for interface compatibility;
+        the urllib backend never follows redirects regardless of the
+        value. 3xx responses surface to the caller (as a
+        ``Response`` from ``request()``; the JSON/bytes conveniences
+        fail on the non-body). Following a redirect transparently
+        would bypass caller-level address policy (e.g. the OCI
+        registry SSRF gate) — callers must re-validate ``Location``
+        themselves and issue a new request.
+      - ``total_timeout``: retry-loop and response-body deadline in seconds
+        (default 600). Resolver and response-header setup retain the
+        underlying backend's I/O timeout semantics.
     """
 
     def request(
@@ -201,33 +257,40 @@ class HttpClient(Protocol):
         method: str,
         url: str,
         *,
-        body: Optional[bytes] = None,
-        headers: Optional[Dict[str, str]] = None,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
-    ) -> "Response":
+        stream: bool = False,
+        raise_on_status: bool = True,
+    ) -> Response:
         """Low-level request — returns :class:`Response` with status, headers, body.
 
         Use for arbitrary HTTP methods (DELETE/PUT/PATCH/HEAD) and when
         response metadata (ETag, Last-Modified) is needed for the next
         conditional request.
+
+        ``stream`` and ``raise_on_status`` mirror the backend's
+        requests-API-compatible knobs (the OCI client passes both);
+        the protocol must declare every parameter callers rely on or
+        type-checked call sites report phantom call-arg errors.
         """
         ...
 
     def post_json(
         self,
         url: str,
-        body: Dict[str, Any],
+        body: dict[str, Any],
         timeout: int = DEFAULT_TIMEOUT,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """POST ``body`` as JSON, return decoded JSON response."""
         ...
 
@@ -236,12 +299,22 @@ class HttpClient(Protocol):
         url: str,
         timeout: int = DEFAULT_TIMEOUT,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
-    ) -> Dict[str, Any]:
-        """GET ``url``, parse response as JSON."""
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> dict[str, Any]:
+        """GET ``url``, parse response as JSON.
+
+        ``max_bytes`` caps the response size at the transport layer.
+        Defaults to ``DEFAULT_MAX_BYTES`` (50 MB) — adequate for
+        ~99.9% of registry-metadata responses. Callers querying
+        endpoints known to exceed that (notably ``registry.npmjs.org``
+        for popular scoped namespaces like ``@grafana/runtime`` which
+        ships > 50 MB of cumulative version metadata) should raise it
+        explicitly.
+        """
         ...
 
     def get_bytes(
@@ -250,7 +323,7 @@ class HttpClient(Protocol):
         timeout: int = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
         *,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         follow_redirects: bool = True,
@@ -264,7 +337,7 @@ class HttpClient(Protocol):
         *,
         timeout: int = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
         retries: int = 0,
     ) -> Iterator[bytes]:
@@ -274,13 +347,16 @@ class HttpClient(Protocol):
         non-zero values raise :class:`ValueError` (mid-stream failures
         aren't transparently resumable). Cumulative size cap is
         enforced across yielded chunks; exceeding ``max_bytes`` raises
-        :class:`SizeLimitExceeded` mid-stream.
+        :class:`SizeLimitExceeded` mid-stream, and exceeding the
+        backend's wallclock cap raises
+        :class:`StreamWallclockExceeded` — both are
+        :class:`HttpError` subclasses.
         """
         ...
 
 
 def default_client(
-    allowed_hosts: Optional[List[str]] = None,
+    allowed_hosts: list[str] | None = None,
 ) -> HttpClient:
     """Construct the right HttpClient backend for the caller.
 

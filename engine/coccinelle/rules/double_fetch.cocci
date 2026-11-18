@@ -1,0 +1,59 @@
+// double_fetch.cocci — Review repeated userspace copies for possible TOCTOU.
+//
+// The pattern: a function calls copy_from_user on the same userspace
+// pointer more than once. A racing thread may change the buffer
+// between reads, but two copies alone do not establish a security
+// decision: review whether first-read validation governs second-read
+// use, and whether concurrent mutation is possible. get_user is NOT
+// covered: it is a macro whose fetch shape differs per size class,
+// and no leg here matches it.
+//
+// CWE-367: TOCTOU review of userspace reads.
+// Direct-copy syntax is not complete coverage of user-read APIs.
+// raptor: confirm-only
+// @role: detection
+
+@first_fetch@
+expression uptr, dst1;
+position p1;
+@@
+
+copy_from_user@p1(dst1, uptr, ...)
+
+@second_fetch@
+expression dst2;
+expression REBOUND : script:python(first_fetch.uptr) { REBOUND != uptr or not uptr.isidentifier() };
+expression first_fetch.uptr;
+expression OFFSET != 0;
+position p2;
+position first_fetch.p1;
+@@
+
+copy_from_user@p1(...)
+// A rebound or advanced pointer between the fetches means the second
+// copy reads a DIFFERENT user region (chunked-read loops advance the
+// cursor) — that is sequential consumption, not a re-fetch of already
+// validated data. Literal zero arithmetic and self-assignment of a
+// simple pointer name keep the same region. Other writes still kill
+// the match conservatively, including writes to complex lvalues.
+... when != uptr = REBOUND
+    when != uptr += OFFSET
+    when != uptr -= OFFSET
+    when != uptr++
+    when != ++uptr
+copy_from_user@p2(dst2, uptr, ...)
+
+@script:python@
+p1 << first_fetch.p1;
+p2 << second_fetch.p2;
+uptr << first_fetch.uptr;
+@@
+
+import json, sys
+for _p2 in p2:
+    for _p1 in p1:
+        _m = {"file": _p2.file, "line": int(_p2.line), "col": int(_p2.column),
+              "line_end": int(_p2.line_end), "col_end": int(_p2.column_end),
+              "rule": "double_fetch",
+              "message": "Repeated copy_from_user from '%s' (first at line %s) — review first-read validation, second-read use, and userspace mutation context" % (uptr, _p1.line)}
+        sys.stderr.write("COCCIRESULT:" + json.dumps(_m) + "\n")

@@ -19,9 +19,23 @@ out/
 .env*
 .claude/*.local.json
 .claude/raptor.env
+# Per-dispatch runtime state (webfetch anchor files + fetch logs)
+.claude/run/
+
+# Compiled test fixtures (rebuilt on demand)
+core/analysis/tests/fixtures/*.o
+core/analysis/tests/fixtures/demo
 
 # Runtime artifacts
+# Joern's importCpg materialises a workspace/ under the JVM's cwd; a
+# query launched with cwd at the repo root drops one here. Root-anchored
+# so a legitimate nested workspace/ source dir (none today) stays visible.
+/workspace/
 codeql_dbs/
+engine/semgrep/rules/registry-cache/c.p.*.json
+# Build-ID binary cache (core/audit/build_id_cache.py; default lives at
+# the install root — override with RAPTOR_BINARY_CACHE_DIR)
+/.cache/
 
 # User-local tuning (regenerate with: raptor tune default)
 tuning.json
@@ -30,3 +44,17 @@ tuning.json
 .mcp.json
 .sage/
 *.sage.key
+*.gcov
+
+# Rendered per-checkout AppArmor profile (make apparmor-profile output;
+# the tracked source is the .template)
+core/sandbox/helpers/raptor-coord-launcher.apparmor
+
+# Local-only replay-eval case corpus (transcripts + verdict
+# expectations supplied per-machine; machinery ships in-tree, case
+# content never does — same convention as the corpus labels)
+core/audit/corpus/replay-cases/
+
+# Corpus labels remain private; publish only the directory placeholder.
+/core/audit/corpus/labels/*
+!/core/audit/corpus/labels/.gitkeep

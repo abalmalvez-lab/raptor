@@ -1,0 +1,450 @@
+rules:
+  # CWE-22: include-injection — cookie/request data concatenated or
+  # interpolated into an include/require(_once) path. Scoped to the
+  # code-inclusion sinks ONLY: a traversal into include executes the
+  # reached file (or a remote/wrapper URL where configuration allows),
+  # which is a code-execution class, not the read/write file-op
+  # traversal the generic CWE-22 file-op shapes cover — fopen/
+  # file_get_contents/readfile sinks are deliberately out of scope
+  # here so this rule never claims that ground.
+  #
+  # A constant directory prefix or a constant '.php' suffix does NOT
+  # neutralize: ../ climbs out of the prefix, and on legacy runtimes
+  # a %00/long-path trick — or simply targeting another in-tree .php
+  # file — defeats the suffix.
+  #
+  # Known FP modes:
+  #   - Sequence-stripping "fixes" (str_replace('..', '', $p) and
+  #     similar) still fire — DELIBERATE: single-pass stripping is
+  #     bypassable (....// survives one round), so clearing taint on
+  #     it would launder the classic broken remediation.
+  #   - A correct character-class allowlist rewrite
+  #     (preg_replace('/[^a-z0-9_]/', '', $p)) also still fires —
+  #     the pattern cannot read regex semantics, so it cannot tell
+  #     the safe rewrite from the bypassable strip. Guard-shaped
+  #     validation (preg_match allowlist in an aborting branch) is
+  #     likewise invisible.
+  #   - in_array recognizes only strict inline string allowlists
+  #     with rejecting returns/exits or literal fallbacks. Other
+  #     guard shapes can report safe code. array_key_exists/isset
+  #     now require rejecting guards, but do not prove map contents
+  #     or the complete key domain.
+  #   - A tainted INDEX taints the element read: an UNCHECKED lookup
+  #     into a literal-keyed map (include $pages[$_GET['k']]) fires
+  #     even though the reachable values are the map's literals (an
+  #     unknown key includes null — a warning, not traversal). The
+  #     recommended form — the same map behind an array_key_exists
+  #     guard — is silent, so the remediation never re-fires.
+  # Sanitizer note: basename() clears taint — it removes the
+  #   traversal and stream-wrapper vectors that make this class
+  #   code-execution (the message still recommends an allowlist on
+  #   top for the remaining same-directory selection).
+  #
+  # Scope pins: taint is single-function, and the sinks are the
+  #   include/require family only (see the scoping note above). The
+  #   negative fixture carries out-of-scope shape pins for both
+  #   boundaries — each flips when a matching shape lands.
+  - id: raptor.php.include-injection.request-path
+    mode: taint
+    languages: [php]
+    severity: HIGH
+    message: >
+      Request data reaches an include/require path. Path traversal
+      sequences (or a stream wrapper, where configuration allows)
+      make the interpreter execute an attacker-chosen file — constant
+      prefixes and .php suffixes do not contain it. Resolve the value
+      through a literal-keyed allowlist map (or basename() plus an
+      allowlist) before including.
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+      # Split call spellings so shadow checks use a literal function name;
+      # global calls need no application-function shadow search.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: filter_input($INPUT, $NAME)
+                  - pattern-not-inside: |
+                      namespace $N;
+                      $...BEFORE;
+                      function filter_input(...) { ... }
+                      $...AFTER;
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        function filter_input(...) { ... }
+                        ...
+                      }
+              - patterns:
+                  - pattern: $READER($INPUT, $NAME)
+                  - metavariable-regex:
+                      metavariable: $READER
+                      constant-propagation: false
+                      regex: '(?i)^\\filter_input$'
+          - metavariable-regex:
+              metavariable: $INPUT
+              constant-propagation: false
+              regex: '^\\?(?:INPUT_GET|INPUT_POST|INPUT_COOKIE)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $INPUT = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $INPUT = $VALUE;
+                ...
+              }
+        exact: true
+      # Split call spellings so shadow checks use a literal function name;
+      # global calls need no application-function shadow search.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: filter_input($INPUT, $NAME, $FILTER)
+                  - pattern-not-inside: |
+                      namespace $N;
+                      $...BEFORE;
+                      function filter_input(...) { ... }
+                      $...AFTER;
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        function filter_input(...) { ... }
+                        ...
+                      }
+              - patterns:
+                  - pattern: $READER($INPUT, $NAME, $FILTER)
+                  - metavariable-regex:
+                      metavariable: $READER
+                      constant-propagation: false
+                      regex: '(?i)^\\filter_input$'
+          - metavariable-regex:
+              metavariable: $INPUT
+              constant-propagation: false
+              regex: '^\\?(?:INPUT_GET|INPUT_POST|INPUT_COOKIE)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $INPUT = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $INPUT = $VALUE;
+                ...
+              }
+          - metavariable-regex:
+              metavariable: $FILTER
+              constant-propagation: false
+              regex: '^\\?(?:FILTER_DEFAULT|FILTER_UNSAFE_RAW)$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              const $FILTER = $VALUE;
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                const $FILTER = $VALUE;
+                ...
+              }
+        exact: true
+    pattern-sanitizers:
+      - exact: true
+        pattern-either:
+          - pattern: basename(...)
+          - pattern: \basename(...)
+          - pattern: intval(...)
+          - pattern: \intval(...)
+          - pattern: (int) $X
+      # A check is not a mutation: only a strict literal allowlist
+      # with an exact rejecting branch establishes a value contract.
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: |
+                  if (!$CHECK($V, $ALLOWED, true)) {
+                    return;
+                  }
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        return $TERMINAL;
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        die($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        exit($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $ALLOWED, true)) {
+                        $V = $DEFAULT;
+                      }
+                  - metavariable-regex:
+                      metavariable: $DEFAULT
+                      constant-propagation: false
+                      regex: '\A(?:''[^''\\]*''|"[^"\\$]*")\z'
+          - pattern-either:
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^\\in_array$'
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^in_array$'
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED as $ALIAS;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED as $ALIAS;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      use function $IMPORTED as $ALIAS;
+                      ...
+          - metavariable-regex:
+              metavariable: $V
+              constant-propagation: false
+              regex: '^\$[A-Za-z_][A-Za-z_0-9]*$'
+          - metavariable-regex:
+              metavariable: $ALLOWED
+              constant-propagation: false
+              regex: '\A\[\s*(?:''[^''\\]*''|"[^"\\$]*")(?:\s*,\s*(?:''[^''\\]*''|"[^"\\$]*"))*\s*,?\s*\]\z'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              function $CHECK(...) { ... }
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                function $CHECK(...) { ... }
+                ...
+              }
+          - focus-metavariable: $V
+      # Membership only participates in a rejecting guard. This retains
+      # the existing guarded-map heuristic; map contents are not proven.
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: |
+                  if (!$CHECK($V, $MAP)) {
+                    return;
+                  }
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        return $TERMINAL;
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        die($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        exit($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!$CHECK($V, $MAP)) {
+                        $V = $DEFAULT;
+                      }
+                  - metavariable-regex:
+                      metavariable: $DEFAULT
+                      constant-propagation: false
+                      regex: '\A(?:''[^''\\]*''|"[^"\\$]*")\z'
+          - pattern-either:
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^\\array_key_exists$'
+              - patterns:
+                  - pattern: $CHECK(...)
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      constant-propagation: false
+                      regex: '(?i)^array_key_exists$'
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N;
+                      ...
+                      use function $IMPORTED as $ALIAS;
+                      ...
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      namespace $N {
+                        ...
+                        use function $IMPORTED as $ALIAS;
+                        ...
+                      }
+                  - pattern-not-inside: |
+                      use function $IMPORTED;
+                      ...
+                  - pattern-not-inside: |
+                      use function $IMPORTED as $ALIAS;
+                      ...
+          - metavariable-regex:
+              metavariable: $V
+              constant-propagation: false
+              regex: '^\$[A-Za-z_][A-Za-z_0-9]*$'
+          - pattern-not-inside: |
+              namespace $N;
+              ...
+              function $CHECK(...) { ... }
+              ...
+          - pattern-not-inside: |
+              namespace $N {
+                ...
+                function $CHECK(...) { ... }
+                ...
+              }
+          - focus-metavariable: $V
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: |
+                  if (!isset($MAP[$V])) {
+                    return;
+                  }
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        return $TERMINAL;
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        die($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        exit($TERMINAL);
+                      }
+                  - metavariable-regex:
+                      metavariable: $TERMINAL
+                      constant-propagation: false
+                      regex: '\A(?:(?:''[^''\\]*''|"[^"\\$]*")|null|true|false|[0-9]+)\z'
+              - patterns:
+                  - pattern: |
+                      if (!isset($MAP[$V])) {
+                        $V = $DEFAULT;
+                      }
+                  - metavariable-regex:
+                      metavariable: $DEFAULT
+                      constant-propagation: false
+                      regex: '\A(?:''[^''\\]*''|"[^"\\$]*")\z'
+          - metavariable-regex:
+              metavariable: $V
+              constant-propagation: false
+              regex: '^\$[A-Za-z_][A-Za-z_0-9]*$'
+          - focus-metavariable: $V
+      # Semgrep 1.177 needs simple-local assignment results marked too.
+      # Exact matching keeps unsafe calls inside the RHS visible.
+      - patterns:
+          - pattern-either:
+              - pattern: $SAFE = basename(...)
+              - pattern: $SAFE = \basename(...)
+              - pattern: $SAFE = intval(...)
+              - pattern: $SAFE = \intval(...)
+              - pattern: $SAFE = (int) $X
+          - metavariable-regex:
+              metavariable: $SAFE
+              regex: '^\$[A-Za-z_][A-Za-z0-9_]*$'
+        exact: true
+    pattern-sinks:
+      # Focus the executed path so a sanitizer on an enclosing assignment
+      # cannot hide an include evaluated inside the sanitizer's arguments.
+      - patterns:
+          - pattern: include $PATH;
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: include_once $PATH;
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: require $PATH;
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: require_once $PATH;
+          - focus-metavariable: $PATH
+    metadata:
+      cwe: ["CWE-22"]

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 CodeQL Dataflow Validator
 
@@ -6,25 +5,49 @@ Validates CodeQL dataflow findings using LLM analysis to determine
 if dataflow paths are truly exploitable beyond theoretical detection.
 """
 
+import os
+import re
 import sys
-from dataclasses import dataclass
+from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from dataclasses import fields as _dataclass_fields
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from types import SimpleNamespace
+from urllib.parse import unquote
 
-from core.smt_solver import BVProfile
-from packages.codeql.smt_path_validator import (
-    PathCondition,
-    check_path_feasibility,
-)
-
-# Add parent directory to path for imports
-# packages/codeql/dataflow_validator.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[2]))
+# Path setup MUST precede every core.* import — pre-fix the
+# core.smt_solver imports sat ABOVE the insert, so direct CLI
+# invocation (`python3 packages/codeql/dataflow_validator.py`) died
+# with ModuleNotFoundError before the path was ever extended.
+# `os.environ["RAPTOR_DIR"]` (no fallback) is the canonical project
+# root marker — see CLAUDE.md "Python path safety"; a KeyError here
+# surfaces the configuration problem at startup instead of a
+# positional `parents[2]` walk silently breaking under relocation.
+if __name__ == "__main__":
+    sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
 from core.dataflow.evidence_renderer import render_evidence_for_prompt
 from core.dataflow.sanitizer_evidence import SanitizerEvidence
+from core.llm.context_window import (
+    DATAFLOW_STEP_CONTEXT_LINES,
+    DATAFLOW_VALIDATION_CONTEXT_LINES,
+)
+from core.llm.methodology import load_methodology
+from core.smt_solver import BVProfile
+from core.smt_solver.path_feasibility import (
+    PathCondition,
+    PathSMTResult,
+    check_path_feasibility,
+    check_path_feasibility_dual,
+)
+from core.llm.scorecard import fast_tier_model_name, run_cheap_fp_check
 from core.llm.task_types import TaskType
 from core.logging import get_logger
+from core.paths import confine
+from core.sarif.parser import _coerce_line, _text_value
+from core.source import read_contained_text_capped, read_text_capped, split_lines
+from core.source.windows import read_text_line_window_capped
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import (
     TaintedString,
@@ -39,10 +62,45 @@ logger = get_logger()
 # ``evidence_collector``, the validator calls it before each LLM round-trip
 # and folds the rendered evidence into the prompt as an additional
 # ``UntrustedBlock``. The collector takes the dataflow path and the repo
-# root and returns a :class:`SanitizerEvidence` (or ``None`` to skip).
+# root and returns one of:
+#   * :class:`SanitizerEvidence` — the legacy PR1 V2 sanitizer-extraction
+#     return type; the validator renders it via ``render_evidence_for_prompt``
+#     and wraps as ``UntrustedBlock(kind="sanitizer-evidence", …)``.
+#   * :class:`UntrustedBlock` — a pre-rendered evidence block; the validator
+#     appends it verbatim. Used by structural evidence producers (e.g.
+#     source_intel) whose evidence does not fit the SanitizerEvidence shape.
+#   * ``None`` — no evidence to contribute for this finding (skip).
 EvidenceCollector = Callable[
-    ["DataflowPath", Path], Optional[SanitizerEvidence]
+    ["DataflowPath", Path],
+    SanitizerEvidence | UntrustedBlock | None,
 ]
+
+
+# System-prompt addendum applied only when a source_intel-evidence block
+# was built (memory-corruption-class findings). Tells the LLM how to weigh
+# RAPTOR's pre-computed cocci-derived structural evidence: each line is a
+# distinct observation (attribute, abort proximity, allocation back-walk,
+# build-flag context), not an LLM extraction. Confidence is encoded in the
+# prose framing; the LLM is not meant to second-guess the structural fact
+# itself, only to integrate it into the exploitability verdict.
+SOURCE_INTEL_EVIDENCE_INSTRUCTIONS = (
+    "\n7. Source_intel structural evidence: A 'source-intel-evidence' "
+    "block lists pre-computed structural observations extracted by "
+    "RAPTOR's cocci-based analyser (function attributes, abort-class "
+    "calls near sink, allocation back-walks, build-flag context). "
+    "These are mechanical facts, not LLM extractions — treat each line "
+    "as a confirmed observation at the cited location. Caveats:\n"
+    "  - 'DOMINATES the sink line' is a strong signal; "
+    "'same_function' is weak (the abort may be on an unrelated path).\n"
+    "  - 'CONDITIONAL: gated by #if* X' means the evidence depends on "
+    "a build-time symbol; downweight unless the actual build enables it.\n"
+    "  - 'Source_intel skipped' or 'no signal' lines mean absence of "
+    "evidence, NOT evidence of unhardened code.\n"
+    "  - Build-flag caveats (FORTIFY_SOURCE, -fdelete-null-pointer-checks, "
+    "-fstack-protector) qualify what the compiler enforces vs. annotates "
+    "only; weigh them when reasoning about whether a primitive survives "
+    "to runtime."
+)
 
 
 # System-prompt addendum applied only when an evidence block is built. The
@@ -73,12 +131,12 @@ SANITIZER_EVIDENCE_INSTRUCTIONS = (
 
 
 def _build_sanitizer_evidence_block(
-    collector: Optional[EvidenceCollector],
+    collector: EvidenceCollector | None,
     dataflow: "DataflowPath",
     repo_path: Path,
     log,
-) -> Optional[UntrustedBlock]:
-    """Build the optional sanitizer-evidence ``UntrustedBlock``.
+) -> UntrustedBlock | None:
+    """Build the optional evidence ``UntrustedBlock``.
 
     Returns ``None`` when:
       * no collector is configured (default for existing call sites);
@@ -88,28 +146,42 @@ def _build_sanitizer_evidence_block(
         proceeds without the evidence rather than failing the whole
         validate_path call over an extraction issue).
 
-    The rendered evidence is wrapped as ``UntrustedBlock`` because its
-    candidate ``name`` / ``qualified_name`` / ``semantics_text`` fields
-    came from LLM extraction over potentially-adversarial source.
+    The collector may return either:
+      * a :class:`SanitizerEvidence` — rendered via the existing renderer
+        and wrapped as ``UntrustedBlock(kind="sanitizer-evidence", …)``.
+        Content came from LLM extraction over potentially-adversarial
+        source, so it is treated as untrusted.
+      * a :class:`UntrustedBlock` — returned verbatim. Structural-evidence
+        producers (source_intel) render their own block content and tag
+        with their own ``kind``.
     """
     if collector is None:
         return None
     try:
         evidence = collector(dataflow, repo_path)
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:  # noqa: BLE001 — pragma: no cover - defensive
         log.warning(
-            "Sanitizer-evidence collection failed: %s; "
+            "Evidence collection failed: %s; "
             "proceeding without evidence block",
             e,
         )
         return None
     if evidence is None:
         return None
-    return UntrustedBlock(
-        content=render_evidence_for_prompt(evidence),
-        kind="sanitizer-evidence",
-        origin="project-source-extracted",
+    if isinstance(evidence, UntrustedBlock):
+        return evidence
+    if isinstance(evidence, SanitizerEvidence):
+        return UntrustedBlock(
+            content=render_evidence_for_prompt(evidence),
+            kind="sanitizer-evidence",
+            origin="project-source-extracted",
+        )
+    log.warning(
+        "Evidence collector returned unexpected type %s; "
+        "expected SanitizerEvidence | UntrustedBlock | None",
+        type(evidence).__name__,
     )
+    return None
 
 
 @dataclass
@@ -127,24 +199,51 @@ class DataflowPath:
     """Complete dataflow path from source to sink."""
     source: DataflowStep
     sink: DataflowStep
-    intermediate_steps: List[DataflowStep]
-    sanitizers: List[str]
+    intermediate_steps: list[DataflowStep]
+    sanitizers: list[str]
     rule_id: str
     message: str
+    # Other (codeFlow, threadFlow) paths from the same SARIF result.
+    # Populated by extract_dataflow_from_sarif; empty for callers that
+    # build a DataflowPath directly. Alternatives never carry their
+    # own alternatives.
+    alternatives: list["DataflowPath"] = field(default_factory=list)
 
 
 @dataclass
 class DataflowValidation:
-    """Result of dataflow validation."""
-    is_exploitable: bool
+    """Result of dataflow validation.
+
+    ``error`` is set when validation itself failed (LLM error, schema
+    failure) — consumers must treat such a result as an error state,
+    NOT as a not-exploitable verdict: ``is_exploitable=False`` with
+    ``error`` set carries no evidential weight.
+    """
+    is_exploitable: bool | None
     confidence: float  # 0.0-1.0
     sanitizers_effective: bool
     bypass_possible: bool
-    bypass_strategy: Optional[str]
+    bypass_strategy: str | None
     attack_complexity: str  # "low", "medium", "high"
     reasoning: str
-    barriers: List[str]
-    prerequisites: List[str]
+    barriers: list[str]
+    prerequisites: list[str]
+    error: str | None = None
+    # Which path (0-based, primary first) the verdict is grounded on,
+    # and how many paths received an SMT diagnostic attempt. Additive —
+    # consumers that predate multi-path checking can ignore these.
+    smt_path_index: int = 0
+    smt_paths_checked: int = 1
+    # Optional mathematical diagnostics; never a source reachability proof.
+    smt_diagnostics: dict | None = None
+
+    def __post_init__(self) -> None:
+        if self.is_exploitable is not None and not isinstance(self.is_exploitable, bool):
+            raise ValueError("is_exploitable must be a boolean or None for abstention")
+        if (isinstance(self.confidence, bool)
+                or not isinstance(self.confidence, (int, float))
+                or not 0 <= self.confidence <= 1):
+            raise ValueError("confidence must be a finite number between 0 and 1")
 
 
 PATH_CONDITIONS_SCHEMA = {
@@ -179,27 +278,23 @@ _OVERFLOW_MARKERS_RE = __import__("re").compile(
 )
 
 
-# Confidence we report alongside an SMT-infeasible verdict.
-#
-# Pre-fix this number was inlined as a magic literal `0.7` at
-# the verdict construction site, with an inline comment "Some
-# confidence since SMT is a strong signal, but not perfect."
-# The same value also appeared in the human-readable
-# `reasoning` string ("Confidence is capped at 0.7 because…").
-# Two copies = drift risk: a future tightening or loosening of
-# the calibration would change one site and silently leave the
-# user-facing reasoning text wrong.
-#
-# The value itself is policy: we trust SMT's `feasible=False`
-# verdict more than an LLM's gut call (so > 0.5) but not as
-# absolute (the verdict is conditional on LLM-extracted path
-# predicates, which can be wrong if the LLM misparses a
-# branch). 0.7 was chosen to match the existing scorecard
-# bucket "high but not certain" — see
-# `docs/scorecard/confidence-bands.md` for the calibration
-# reference (or, if absent, treat this constant as the source
-# of truth that doc should match).
-SMT_INFEASIBLE_CONFIDENCE = 0.7
+# Compatibility constant for older consumers. Unbound predicate diagnostics
+# no longer prune or select SARIF paths, so this does not authorize refutation.
+MAX_SMT_PATHS = 3
+
+
+def _steering_target(conditions: list) -> str | None:
+    """Select a case-sensitive plain identifier from the sink-adjacent guard.
+
+    Calls and quoted literals are opaque. The solver still checks membership
+    in its parsed variable registry before adding an objective.
+    """
+    from core.smt_solver.condition_syntax import plain_condition_identifiers
+
+    if not conditions:
+        return None
+    names = plain_condition_identifiers(conditions[-1].text)
+    return names[0] if names else None
 
 
 def _is_overflow_rule(rule_id: str) -> bool:
@@ -210,7 +305,7 @@ def _is_overflow_rule(rule_id: str) -> bool:
     return bool(_OVERFLOW_MARKERS_RE.search(rule_id or ""))
 
 
-def _infer_bv_profile(rule_id: Optional[str], llm_hint: Dict) -> BVProfile:
+def _infer_bv_profile(rule_id: str | None, llm_hint: dict) -> BVProfile:
     """Build a BVProfile from the LLM's per-path hint, falling back to a
     rule-id heuristic when the hint is missing or invalid.
 
@@ -223,7 +318,7 @@ def _infer_bv_profile(rule_id: Optional[str], llm_hint: Dict) -> BVProfile:
     supplied field and fills the missing one from the heuristic default.
     """
     heuristic_width = 32 if _is_overflow_rule(rule_id or "") else 64
-    heuristic_signed = False  # unsigned is correct for most path conditions
+    heuristic_signed = False  # modeling default, not established source signedness
 
     # Accept only sensible LLM-emitted values; ignore anything else.
     # Pre-fix `raw_width > 0` accepted any positive int including
@@ -253,15 +348,15 @@ def _infer_bv_profile(rule_id: Optional[str], llm_hint: Dict) -> BVProfile:
 
 # Dict schema for LLM structured generation (consistent with other callers)
 DATAFLOW_VALIDATION_SCHEMA = {
-    "is_exploitable": "boolean",
-    "confidence": "float (0.0-1.0)",
-    "sanitizers_effective": "boolean",
-    "bypass_possible": "boolean",
-    "bypass_strategy": "string - strategy to bypass sanitizers, or empty if none",
-    "attack_complexity": "string (low/medium/high)",
     "reasoning": "string",
     "barriers": "list of strings",
     "prerequisites": "list of strings",
+    "bypass_strategy": "string - strategy to bypass sanitizers, or empty if none",
+    "attack_complexity": {"type": "string", "enum": ["low", "medium", "high"]},
+    "sanitizers_effective": "boolean",
+    "bypass_possible": "boolean",
+    "confidence": "float (0.0-1.0)",
+    "is_exploitable": "boolean",
 }
 
 
@@ -269,13 +364,16 @@ DATAFLOW_VALIDATION_SCHEMA = {
 # schema in autonomous_analyzer.py — same asymmetric framing, same
 # verdict literal set, so the scorecard substrate keys uniformly.
 DATAFLOW_FP_PREFILTER_SCHEMA = {
-    "verdict": (
-        "string — one of 'clear_fp' (this dataflow is clearly NOT "
-        "exploitable — source isn't attacker-controlled, sink isn't "
-        "reachable, sanitizers definitively block) or 'needs_analysis' "
-        "(any uncertainty)"
-    ),
     "reasoning": "string — brief justification, 1-2 sentences",
+    "verdict": {
+        "type": "string",
+        "enum": ["clear_fp", "needs_analysis"],
+        "description": (
+            "clear_fp = dataflow is clearly NOT exploitable (source not "
+            "attacker-controlled, sink not reachable, sanitizers block); "
+            "needs_analysis = any uncertainty"
+        ),
+    },
 }
 
 
@@ -293,8 +391,8 @@ class DataflowValidator:
     def __init__(
         self,
         llm_client,
-        evidence_collector: Optional[EvidenceCollector] = None,
-    ):
+        evidence_collector: EvidenceCollector | None = None,
+    ) -> None:
         """
         Initialize dataflow validator.
 
@@ -313,23 +411,14 @@ class DataflowValidator:
         self.logger = get_logger()
 
     def _fast_tier_model_name(self) -> str:
-        """Return the model_name routed to for ``TaskType.VERDICT_BINARY``.
-        Falls back to primary_model when no specialized fast model is
-        configured. Mirrors :meth:`AutonomousCodeQLAnalyzer._fast_tier_model_name`
-        — kept duplicated rather than extracted because both consumers
-        live near the LLM client surface and a shared utility would
-        muddy the dependency direction (codeql → core, not core → codeql)."""
-        cfg = self.llm.config
-        specialized = cfg.specialized_models.get(TaskType.VERDICT_BINARY)
-        if specialized is not None and specialized.enabled:
-            return specialized.model_name
-        if cfg.primary_model is not None:
-            return cfg.primary_model.model_name
-        return ""
+        """The model whose track record the scorecard accumulates
+        against. Delegates to the shared helper (codeql → core.llm —
+        the correct dependency direction)."""
+        return fast_tier_model_name(self.llm.config)
 
     def _cheap_dataflow_fp_check(
         self, dataflow: "DataflowPath",
-    ) -> Optional[Tuple[str, str]]:
+    ) -> tuple[str, str] | None:
         """Ask the fast-tier model whether this dataflow is a clear
         false positive — source not attacker-controlled, sink not
         reachable, sanitizers definitively block. Returns
@@ -338,7 +427,9 @@ class DataflowValidator:
         Deliberately minimal context: rule_id + source/sink labels +
         sanitizer list. The cheap model isn't being asked to do path
         analysis — it's asked to spot the obvious-FP cases (hardcoded
-        sources, locked-down sinks) where a label scan suffices."""
+        sources, locked-down sinks) where a label scan suffices. The
+        envelope + structured-call + verdict-validation mechanics are
+        the shared :func:`core.llm.scorecard.run_cheap_fp_check`."""
         system = (
             "You are reviewing a CodeQL dataflow finding. Your job is "
             "to identify CLEAR false positives — cases where the "
@@ -367,46 +458,21 @@ class DataflowValidator:
             ),
             "sanitizers": TaintedString(value=sanitizer_text, trust="untrusted"),
         }
-        blocks = ()
+        blocks: tuple[UntrustedBlock, ...] = ()
         if dataflow.message:
             blocks = (UntrustedBlock(
                 content=dataflow.message,
                 kind="scanner-message",
                 origin=f"{dataflow.rule_id}:dataflow-validation",
             ),)
-        bundle = build_prompt(
+        return run_cheap_fp_check(
+            self.llm,
             system=system,
-            profile=CONSERVATIVE,
+            schema=DATAFLOW_FP_PREFILTER_SCHEMA,
             untrusted_blocks=blocks,
             slots=slots,
+            log=self.logger,
         )
-        system_prompt = next(
-            (m.content for m in bundle.messages if m.role == "system"), None,
-        )
-        prompt = next(
-            (m.content for m in bundle.messages if m.role == "user"), "",
-        )
-        try:
-            response, _ = self.llm.generate_structured(
-                prompt=prompt,
-                schema=DATAFLOW_FP_PREFILTER_SCHEMA,
-                system_prompt=system_prompt,
-                task_type=TaskType.VERDICT_BINARY,
-            )
-        except Exception as e:                         # noqa: BLE001
-            self.logger.debug(
-                f"Cheap dataflow FP check failed (falling through): {e}"
-            )
-            return None
-        verdict = (response.get("verdict") or "").strip().lower()
-        reasoning = response.get("reasoning") or ""
-        if verdict not in ("clear_fp", "needs_analysis"):
-            self.logger.debug(
-                f"Cheap dataflow FP check returned unexpected verdict "
-                f"{verdict!r} — falling through"
-            )
-            return None
-        return verdict, reasoning
 
     def _short_circuit_fp_dataflow_result(
         self, reasoning: str,
@@ -430,9 +496,78 @@ class DataflowValidator:
             prerequisites=[],
         )
 
-    def extract_dataflow_from_sarif(self, result: Dict) -> Optional[DataflowPath]:
+    def _path_from_locations(
+        self,
+        locations: list[dict],
+        rule_id: str,
+        message: str,
+    ) -> DataflowPath | None:
+        """Parse one threadFlow's locations into a DataflowPath."""
+        if len(locations) < 2:
+            return None
+
+        # Parse locations into steps
+        steps = []
+        for loc_wrapper in locations:
+            loc = loc_wrapper.get("location", {})
+            physical_loc = loc.get("physicalLocation", {})
+
+            region = physical_loc.get("region", {})
+            artifact = physical_loc.get("artifactLocation", {})
+            line = _coerce_line(region.get("startLine", 0))
+            column = _coerce_line(region.get("startColumn", 0))
+            if line is None or column is None:
+                self.logger.warning(
+                    "Invalid SARIF flow coordinates; using 0 for unknown line or column",
+                )
+
+            message_value = loc.get("message")
+            label = _text_value(message_value)
+            if (label is None and message_value is not None
+                    and (not isinstance(message_value, dict) or "text" in message_value)):
+                self.logger.warning("Invalid SARIF flow label; using empty text")
+
+            snippet_value = region.get("snippet")
+            snippet = _text_value(snippet_value)
+            if (snippet is None and snippet_value is not None
+                    and (not isinstance(snippet_value, dict) or "text" in snippet_value)):
+                self.logger.warning("Invalid SARIF flow snippet; using empty text")
+
+            step = DataflowStep(
+                file_path=unquote(artifact.get("uri", ""), errors="strict"),
+                line=line or 0,
+                column=column or 0,
+                snippet=snippet or "",
+                label=label or ""
+            )
+            steps.append(step)
+
+        # First is source, last is sink, rest are intermediate
+        source = steps[0]
+        sink = steps[-1]
+        intermediate = steps[1:-1] if len(steps) > 2 else []
+
+        # Look for sanitizers mentioned in the flow
+        sanitizers = [step.label for step in intermediate if re.search(r'\bsanitiz|\bvalidat', step.label, re.IGNORECASE)]
+
+        return DataflowPath(
+            source=source,
+            sink=sink,
+            intermediate_steps=intermediate,
+            sanitizers=sanitizers,
+            rule_id=rule_id,
+            message=message,
+        )
+
+    def extract_dataflow_from_sarif(self, result: dict) -> DataflowPath | None:
         """
         Extract dataflow path from SARIF result.
+
+        Every (codeFlow, threadFlow) combination is parsed. The first
+        usable path is returned as the primary DataflowPath with the
+        rest attached as ``alternatives`` for per-path observations.
+        Extracted predicate models remain diagnostics; they cannot establish
+        a source-path refutation or replace the primary SARIF path.
 
         Args:
             result: SARIF result object
@@ -446,67 +581,64 @@ class DataflowValidator:
             if not code_flows:
                 return None
 
-            # Extract the first code flow (typically the most relevant)
-            flow = code_flows[0]
-            thread_flows = flow.get("threadFlows", [])
-            if not thread_flows:
+            rule_id = result.get("ruleId", "")
+            message_value = result.get("message")
+            message = _text_value(message_value)
+            if (message is None and message_value is not None
+                    and (not isinstance(message_value, dict) or "text" in message_value)):
+                self.logger.warning("Invalid SARIF result message; using empty text")
+            message = message or ""
+
+            paths: list[DataflowPath] = []
+            malformed_containers = False
+            for flow in code_flows:
+                if not isinstance(flow, dict):
+                    malformed_containers = True
+                    continue
+                thread_flows = flow.get("threadFlows") or []
+                if not isinstance(thread_flows, list):
+                    malformed_containers = True
+                    continue
+                for thread_flow in thread_flows:
+                    if not isinstance(thread_flow, dict):
+                        malformed_containers = True
+                        continue
+                    try:
+                        path = self._path_from_locations(
+                            thread_flow.get("locations", []), rule_id, message,
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        # Reject the malformed path, retaining usable siblings.
+                        malformed_containers = True
+                        continue
+                    if path is not None:
+                        paths.append(path)
+
+            if malformed_containers:
+                self.logger.warning("Skipped malformed SARIF flow containers")
+            if not paths:
                 return None
 
-            locations = thread_flows[0].get("locations", [])
-            if len(locations) < 2:
-                return None
+            primary = paths[0]
+            primary.alternatives = paths[1:]
+            return primary
 
-            # Parse locations into steps
-            steps = []
-            for loc_wrapper in locations:
-                loc = loc_wrapper.get("location", {})
-                physical_loc = loc.get("physicalLocation", {})
-
-                region = physical_loc.get("region", {})
-                artifact = physical_loc.get("artifactLocation", {})
-
-                step = DataflowStep(
-                    file_path=artifact.get("uri", ""),
-                    line=region.get("startLine", 0),
-                    column=region.get("startColumn", 0),
-                    snippet=region.get("snippet", {}).get("text", ""),
-                    label=loc.get("message", {}).get("text", "")
-                )
-                steps.append(step)
-
-            # First is source, last is sink, rest are intermediate
-            source = steps[0]
-            sink = steps[-1]
-            intermediate = steps[1:-1] if len(steps) > 2 else []
-
-            # Look for sanitizers mentioned in the flow
-            sanitizers = []
-            for step in intermediate:
-                if "sanitiz" in step.label.lower() or "validat" in step.label.lower():
-                    sanitizers.append(step.label)
-
-            return DataflowPath(
-                source=source,
-                sink=sink,
-                intermediate_steps=intermediate,
-                sanitizers=sanitizers,
-                rule_id=result.get("ruleId", ""),
-                message=result.get("message", {}).get("text", "")
-            )
-
-        except Exception as e:
-            self.logger.warning(f"Failed to extract dataflow path: {e}")
+        except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the pipeline
+            self.logger.warning("Failed to extract dataflow path: %s", e)
             return None
 
-    def read_source_context(self, file_path: str, line: int, context_lines: int = 10,
-                            repo_root: Optional[Path] = None) -> str:
+    def read_source_context(self, file_path: str, line: int,
+                            context_lines: int = DATAFLOW_VALIDATION_CONTEXT_LINES,
+                            repo_root: Path | None = None) -> str:
         """
         Read source code context around a location.
 
         Args:
             file_path: Path to source file
             line: Line number
-            context_lines: Lines before/after to include
+            context_lines: Lines before/after to include (default:
+                the shared dataflow-validation window — see
+                core.llm.context_window for the sizing rationale)
             repo_root: When provided, refuse to read files outside this root.
                 Callers passing SARIF-derived paths should always set this.
 
@@ -514,59 +646,59 @@ class DataflowValidator:
             Source code snippet with context
         """
         try:
-            resolved = Path(file_path).resolve()
             if repo_root is not None:
-                try:
-                    resolved.relative_to(repo_root.resolve())
-                except ValueError:
+                maybe = confine(repo_root, file_path)
+                if maybe is None:
                     return ""
-            # Cap the source-context read at 10 MB. Pre-fix
-            # `open(...).readlines()` had no upper bound — a
-            # source file > 10 MB (auto-generated lexer tables,
-            # vendored library bundles, single-file compiled JS
-            # blobs) was loaded entirely into memory just to
-            # extract a ~20-line window around `line`.
-            #
-            # 10 MB covers every legitimate human-authored
-            # source file by orders of magnitude (Linux kernel
-            # ~10 MB across ALL files; the largest single C
-            # file ever observed in a major OSS project is
-            # ~3 MB). For pathological files past the cap the
-            # function still produces a context window — just
-            # truncated to the first 10 MB worth of lines.
-            _MAX_SOURCE_BYTES = 10 * 1024 * 1024
-            with open(resolved) as f:
-                content = f.read(_MAX_SOURCE_BYTES + 1)
-            if len(content) > _MAX_SOURCE_BYTES:
-                # Drop the trailing partial line (avoids splitting
-                # in the middle of a token in the rendered context)
-                content = content[:_MAX_SOURCE_BYTES]
-                content = content.rsplit("\n", 1)[0] + "\n"
-                self.logger.warning(
-                    f"Source file {resolved} exceeded "
-                    f"{_MAX_SOURCE_BYTES}-byte cap; context window "
-                    f"reflects truncated read"
+                resolved = maybe
+            else:
+                resolved = Path(file_path).resolve()
+            # Normal coordinates retain only the requested window. Keep the
+            # legacy path for unusual arguments and its negative-bound rules.
+            streaming = (type(line) is int and type(context_lines) is int
+                         and line >= 0 and context_lines >= 0)
+            got: tuple[list[str], bool] | tuple[str, bool] | None
+            if streaming:
+                start = max(0, line - context_lines - 1)
+                got = read_text_line_window_capped(
+                    resolved, start, line + context_lines, target_root=repo_root,
                 )
-            lines = content.splitlines(keepends=True)
-
-            start = max(0, line - context_lines - 1)
-            end = min(len(lines), line + context_lines)
+            else:
+                got = (read_text_capped(resolved, newline="") if repo_root is None
+                       else read_contained_text_capped(repo_root, resolved, newline=""))
+            if got is None:
+                self.logger.warning(
+                    "Failed to read source context at %s", resolved)
+                return ""
+            content, truncated = got
+            if truncated:
+                self.logger.warning(
+                    "Source file %s exceeded the capped read; context window reflects truncated read",
+                    resolved,
+                )
+            if isinstance(content, list):
+                lines = content
+            else:
+                lines = split_lines(content)
+                start = max(0, line - context_lines - 1)
+                end = min(len(lines), line + context_lines)
+                lines = [lines[i] for i in range(start, end)]
 
             context = []
-            for i in range(start, end):
+            for i, source_line in enumerate(lines, start=start):
                 marker = ">>> " if i == line - 1 else "    "
-                context.append(f"{marker}{i + 1:4d}: {lines[i].rstrip()}")
+                context.append(f"{marker}{i + 1:4d}: {source_line.rstrip()}")
 
             return "\n".join(context)
-        except Exception as e:
-            self.logger.warning(f"Failed to read source context: {e}")
+        except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the pipeline
+            self.logger.warning("Failed to read source context: %s", e)
             return ""
 
     def _extract_path_conditions(
         self,
         dataflow: DataflowPath,
         repo_path: Path,
-    ) -> Tuple[List[PathCondition], Dict]:
+    ) -> tuple[list[PathCondition], dict]:
         """Ask the LLM to extract branch conditions + bitvector type hint.
 
         Returns ``(conditions, hint)`` where ``hint`` is a dict with
@@ -584,13 +716,31 @@ class DataflowValidator:
             "reach the sink. Express each as a simple predicate over named variables, "
             "for example:\n"
             '  "size > 0", "offset + length <= buffer_size", "ptr != NULL",\n'
-            '  "flags & 0x80000000 == 0"\n\n'
-            "Also emit two per-path type hints so SMT uses the correct bitvector semantics:\n"
+            '  "(flags & 0x80000000) == 0"\n\n'
+            "Preserve source grouping. Do not turn an ungrouped bitwise comparison "
+            "such as flags & MASK == VAL into (flags & MASK) == VAL; those have "
+            "different C semantics. Leave unsupported source forms unchanged.\n\n"
+            "Emit GUARDS ONLY — Boolean predicates that gate execution. Do NOT emit "
+            "program statements (assignments, function calls without a comparison, "
+            "loops, returns). Statements like `input = realloc(input, n)` are not "
+            "conditions; skip them and instead reflect their effect via SSA-renaming "
+            "(see below).\n\n"
+            "SSA-rename across mutations. The downstream Z3 encoder assumes every "
+            "occurrence of an identifier denotes the same value (single static "
+            "assignment). If a variable is reassigned between two guards in the path, "
+            "rename later occurrences so they read as distinct values:\n"
+            "  GOOD: [\"size_pre > 100\", \"size_post < 50\"]\n"
+            "  BAD:  [\"size > 100\", \"size < 50\"] across a size assignment.\n"
+            "Function-call occurrences are opaque independent results; repeated text "
+            "does not establish that two executions return the same value.\n\n"
+            "Also emit optional per-path modeling hints. These are assumptions, not "
+            "verified source types; a uniform profile cannot represent arbitrary C "
+            "promotions or mixed integer types:\n"
             "  - path_width: 32 when the dominant variables are C int/unsigned int "
             "(CWE-190 32-bit wraparound lives here); 64 for size_t/uint64_t.\n"
             "  - path_signed: true if variables are signed ints (int, int32_t) and "
-            "you want overflow reasoning that matches C's UB semantics; false for "
-            "unsigned / pointer arithmetic. Default false.\n\n"
+            "you want signed comparisons; false for unsigned comparisons. "
+            "These hints do not establish C arithmetic definedness.\n\n"
             "Set negated=true on a condition if it must be FALSE for the path to "
             "proceed (i.e. a check that was bypassed)."
         )
@@ -598,7 +748,12 @@ class DataflowValidator:
         blocks = []
         all_steps = [dataflow.source] + dataflow.intermediate_steps + [dataflow.sink]
         for i, step in enumerate(all_steps):
-            ctx = self.read_source_context(str(repo_path / step.file_path), step.line, context_lines=5,
+            # Tight per-step window (shared with the analysis prompt's
+            # dataflow snippets): condition extraction wants the guards
+            # AT the step, not the whole neighbourhood — see
+            # core.llm.context_window.
+            ctx = self.read_source_context(str(repo_path / step.file_path), step.line,
+                                            context_lines=DATAFLOW_STEP_CONTEXT_LINES,
                                             repo_root=repo_path)
             blocks.append(UntrustedBlock(
                 content=f"({step.label})\n{ctx}",
@@ -637,7 +792,7 @@ class DataflowValidator:
                 PathCondition(
                     text=c.get("condition", ""),
                     step_index=c.get("step_index", 0),
-                    negated=bool(c.get("negated", False)),
+                    negated=c.get("negated", False),
                 )
                 for c in response.get("path_conditions", [])
                 if c.get("condition")
@@ -647,17 +802,156 @@ class DataflowValidator:
                 "signed": response.get("path_signed"),
             }
             return conditions, hint
-        except Exception as e:
-            self.logger.debug(f"Path condition extraction failed: {e}")
+        except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the pipeline
+            self.logger.debug("Path condition extraction failed: %s", e)
             return [], {}
+
+    def _record_charset_models(
+        self, models: list[dict], out_dir: Path | None, request_context: dict,
+        *, producer_claimed_refutation: bool, producer_reason: str,
+    ) -> None:
+        """Retain conditional models without issuing claim or source authority."""
+        if out_dir is None or not models:
+            return
+        try:
+            from core.audit.check_trace import record_check_observation
+
+            for model in models:
+                path = request_context["paths"][model["path_index"]]
+                # Only the producer's location is known. Function, claim
+                # lineage and file-version bindings remain unavailable.
+                scope = SimpleNamespace(
+                    scope=(model["validator_file"], "", model["validator_line"], ""),
+                    source_identity=None,
+                )
+                request = {
+                    "operation": "charset-language-exclusion",
+                    "rule_id": request_context["rule_id"],
+                    "path_index": model["path_index"],
+                    "source": deepcopy(path["source"]),
+                    "sink": deepcopy(path["sink"]),
+                    "kind": model["kind"], "pattern": model["pattern"],
+                    "sink_classes": list(model["sink_classes"]),
+                    "source_input_sha256": model.get("source_input_sha256"),
+                }
+                record_check_observation(
+                    out_dir, scope, tool="smt", verdict="inconclusive",
+                    rule_id="smt:conditional-charset-model", reason=model["reasoning"],
+                    request=request,
+                    result=SimpleNamespace(
+                        outcome="inconclusive", raw_output=deepcopy(model),
+                        details={
+                            "scope": "conditional-charset-language-model",
+                            "source_bound": False,
+                            "producer_claimed_refutation": producer_claimed_refutation,
+                            "producer_reason": producer_reason,
+                            "unverified_source_premises": [
+                                "sink_interpretation", "source_execution_semantics",
+                            ],
+                            "assumptions": {"accepted_charset_model": deepcopy(request)},
+                        },
+                    ),
+                )
+        except Exception:
+            self.logger.warning("Could not retain conditional charset observation", exc_info=True)
+
+    def _injection_prescreen(
+        self,
+        dataflow: DataflowPath,
+        repo_path: Path,
+        *,
+        diagnostics: list[dict] | None = None,
+        diagnostic_quality: dict | None = None,
+        observation_out_dir: Path | None = None,
+    ) -> None:
+        """Collect conditional string models over the result's paths.
+
+        Charset observations do not establish source-effect refutation and
+        ordinary review continues. Optional observation recording and slice
+        collection never confer proof authority. Recording failures must
+        not block that validation flow.
+        """
+        reported_models: int | None = None
+        initial_count = len(diagnostics) if diagnostics is not None else 0
+        try:
+            from core.dataflow.injection_prescreen import (
+                MAX_PRESCREEN_PATHS,
+                MAX_PRESCREEN_STEPS,
+                prescreen_finding,
+            )
+            rule_id = dataflow.rule_id
+            paths = [dataflow, *dataflow.alternatives]
+            request_context: dict = {}
+            if observation_out_dir is not None:
+                # Copy only bounded path inputs, not nested alternatives or
+                # a caller-owned object graph. These are also the inputs
+                # submitted to the producer, so later caller mutation cannot
+                # relabel the recorded request.
+                if len(paths) > MAX_PRESCREEN_PATHS:
+                    return None
+                captured_paths = []
+                for path in paths:
+                    steps = path.intermediate_steps[:MAX_PRESCREEN_STEPS + 1]
+                    if len(steps) > MAX_PRESCREEN_STEPS:
+                        return None
+                    captured_paths.append(replace(
+                        path, source=replace(path.source), sink=replace(path.sink),
+                        intermediate_steps=[replace(step) for step in steps], alternatives=[],
+                    ))
+                paths = captured_paths
+                request_context = {
+                    "rule_id": rule_id,
+                    "paths": [{
+                        "source": {"file": path.source.file_path, "line": path.source.line},
+                        "sink": {"file": path.sink.file_path, "line": path.sink.line},
+                    } for path in paths],
+                }
+            verdict = prescreen_finding(
+                paths=paths,
+                repo_root=repo_path,
+                rule_id=rule_id,
+            )
+            if verdict is None:
+                return None
+            self._record_charset_models(
+                verdict.evidence, observation_out_dir, request_context,
+                producer_claimed_refutation=verdict.refuted, producer_reason=verdict.reason,
+            )
+            if diagnostics is not None:
+                reported_models = len(verdict.diagnostics)
+                diagnostics.extend(deepcopy(verdict.diagnostics))
+                if diagnostic_quality is not None:
+                    diagnostic_quality.update({
+                        "scope": "injection-prescreen-diagnostic-collection",
+                        "complete": True, "reported_models": reported_models,
+                        "retained_models": len(diagnostics) - initial_count,
+                        "discarded_models": 0,
+                    })
+            return None
+        except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the pipeline
+            if diagnostic_quality is not None:
+                retained = len(diagnostics) - initial_count if diagnostics is not None else 0
+                diagnostic_quality.update({
+                    "scope": "injection-prescreen-diagnostic-collection",
+                    "complete": False, "error_type": type(e).__name__,
+                    "reported_models": reported_models, "retained_models": retained,
+                    "discarded_models": (reported_models - retained
+                                         if reported_models is not None else None),
+                })
+            self.logger.warning("Injection prescreen failed: %s", e)
+            return None
 
     def validate_dataflow_path(
         self,
         dataflow: DataflowPath,
-        repo_path: Path
+        repo_path: Path,
+        *, observation_out_dir: Path | None = None,
     ) -> DataflowValidation:
-        """
-        Validate dataflow path exploitability using LLM.
+        """Validate source flow, retaining optional predicate-model diagnostics.
+
+        Extracted predicates and type hints cannot establish a source-path
+        refutation or select a different SARIF path. Conditional charset models
+        remain observations while the existing review policy continues.
 
         Args:
             dataflow: DataflowPath object
@@ -666,40 +960,83 @@ class DataflowValidator:
         Returns:
             DataflowValidation result
         """
-        self.logger.info(f"Validating dataflow path: {dataflow.rule_id}")
-
-        # SMT pre-check: extract path conditions (plus a bitvector type
-        # hint from the LLM) and test joint satisfiability.  If unsat,
-        # the path is provably unreachable — skip the expensive LLM call.
-        conditions, profile_hint = self._extract_path_conditions(dataflow, repo_path)
-        profile = _infer_bv_profile(dataflow.rule_id, profile_hint)
-        smt_result = check_path_feasibility(conditions, profile=profile)
-
-        if smt_result.feasible is False:
-            self.logger.info(
-                f"SMT: path infeasible — {smt_result.reasoning}"
-            )
+        if not isinstance(dataflow.rule_id, str):
+            reason = "Invalid dataflow rule identity; expected a string"
             return DataflowValidation(
-                is_exploitable=False,
-                confidence=SMT_INFEASIBLE_CONFIDENCE,
-                sanitizers_effective=True,
-                bypass_possible=False,
-                bypass_strategy=None,
-                attack_complexity="high",
-                reasoning=(
-                    f"SMT analysis: {smt_result.reasoning}. Path conditions are mutually exclusive. "
-                    f"Confidence is capped at {SMT_INFEASIBLE_CONFIDENCE} because this formal verdict depends on "
-                    "LLM-extracted predicates which may have parsing or coverage limitations."
-                ),
-                barriers=smt_result.unsatisfied,
-                prerequisites=[],
+                is_exploitable=False, confidence=0.0,
+                sanitizers_effective=True, bypass_possible=False,
+                bypass_strategy=None, attack_complexity="high",
+                reasoning=reason, barriers=["Invalid rule identity"],
+                prerequisites=[], error=reason, smt_paths_checked=0,
             )
 
-        # Fast-tier FP prefilter. Runs after SMT (a definitive
-        # infeasibility verdict beats anything the cheap LLM can
-        # offer) but before the source-context disk reads — short-
-        # circuiting saves both the full-tier LLM round-trip and the
-        # context-gathering I/O.
+        from core.reporting.formatting import display_rule_id
+        self.logger.info("Validating dataflow path: %s", display_rule_id(dataflow.rule_id))
+
+        # Charset exclusion is a conditional language model, not sink
+        # interpretation. Retain optional observations, then continue normal
+        # validation rather than deriving a source-effect verdict from it.
+        slice_diagnostics: list[dict] = []
+        slice_diagnostic_quality: dict = {}
+        if observation_out_dir is None:
+            self._injection_prescreen(
+                dataflow, repo_path, diagnostics=slice_diagnostics,
+                diagnostic_quality=slice_diagnostic_quality,
+            )
+        else:
+            self._injection_prescreen(
+                dataflow, repo_path, diagnostics=slice_diagnostics,
+                diagnostic_quality=slice_diagnostic_quality,
+                observation_out_dir=observation_out_dir,
+            )
+
+        # Extracted predicates, scalar identities and type hints are not
+        # source-bound premises. Even an owned UNSAT core proves only a
+        # contradiction in this supplied model. It cannot suppress the
+        # finding or discard the primary SARIF path in favor of another.
+        active_index = 0
+        smt_paths_checked = 1
+        profile = None
+        try:
+            conditions, profile_hint = self._extract_path_conditions(dataflow, repo_path)
+            profile = _infer_bv_profile(dataflow.rule_id, profile_hint)
+            prefer = None
+            if _is_overflow_rule(dataflow.rule_id):
+                target = _steering_target(conditions)
+                if target is not None:
+                    prefer = (target, "max")
+            signed_pinned = isinstance(profile_hint.get("signed"), bool)
+            check = check_path_feasibility if signed_pinned else check_path_feasibility_dual
+            smt_result = check(
+                conditions, profile=profile, prefer_witness=prefer,
+                use_call_summaries=False,
+            )
+        except Exception as exc:
+            # Optional diagnostic work must not abort source validation on
+            # malformed extraction, broken native bindings or solver errors.
+            self.logger.debug("SMT diagnostics unavailable", exc_info=True)
+            smt_result = PathSMTResult(
+                feasible=None, satisfied=[], unsatisfied=[], unknown=[], model={},
+                smt_available=False,
+                reasoning=f"SMT diagnostic unavailable ({type(exc).__name__}); source analysis required",
+            )
+        smt_diagnostics: dict[str, object] = {
+            "oracle_scope": "llm-extracted-predicates",
+            "modeled_feasible": smt_result.feasible,
+            "reasoning": smt_result.reasoning,
+            "model": dict(smt_result.model or {}),
+            "conflicts": list(smt_result.unsatisfied),
+            "unparsed": list(smt_result.unknown),
+            "assumed_width": profile.width if profile is not None else None,
+            "assumed_signed": profile.signed if profile is not None else None,
+        }
+        if slice_diagnostics:
+            smt_diagnostics["string_slice_models"] = slice_diagnostics
+        if slice_diagnostic_quality:
+            smt_diagnostics["injection_prescreen_collection"] = slice_diagnostic_quality
+
+        # The existing fast-tier review policy runs independently of the
+        # mathematical diagnostics, before gathering full source context.
         from core.llm.scorecard import (
             prefilter_decision,
             record_prefilter_outcome,
@@ -717,22 +1054,30 @@ class DataflowValidator:
             decision_class=decision_class,
             model=fast_model_name,
             cheap_says_fp=cheap_says_fp,
+            repo=repo_path,   # diversity gate: the repo under analysis
         )
         if decision.short_circuit:
             self.logger.info(
-                f"Fast-tier short-circuit on dataflow {decision_class} — "
-                f"skipping full validation (cheap verdict trusted by "
-                f"scorecard)"
+                "Fast-tier short-circuit on dataflow %s — skipping full validation (cheap verdict trusted by scorecard)",
+                decision_class
             )
             self.llm.record_short_circuit()
-            return self._short_circuit_fp_dataflow_result(cheap_reasoning)
+            result = self._short_circuit_fp_dataflow_result(cheap_reasoning)
+            result.smt_path_index = active_index
+            result.smt_paths_checked = smt_paths_checked
+            result.smt_diagnostics = smt_diagnostics
+            return result
 
-        # Path is sat or indeterminate — run full LLM analysis.
-        # Pass the SMT model (concrete variable values) as 
-        # candidate inputs. Skip if no Z3.
+        # Mathematical models and conflicts are diagnostic, not executable
+        # source inputs, sanitizer proofs or source reachability verdicts.
         smt_hint = (
-            f"\nSMT pre-analysis: {smt_result.reasoning}"
-            + (f"\nCandidate input values: {smt_result.model}" if smt_result.model else "")
+            "\nSMT diagnostic over LLM-extracted predicates and assumed types "
+            "(not a source reachability or sanitizer proof): "
+            + smt_result.reasoning
+            + (f"\nEncoded conflicts: {smt_result.unsatisfied}" if smt_result.unsatisfied else "")
+            + (f"\nDiagnostic model values: {smt_result.model}" if smt_result.model else "")
+            + "\nRecheck predicates, variable versions and C conversions against the source; "
+              "the diagnostic cannot refute the source path."
         ) if smt_result.smt_available else ""
 
         source_context = self.read_source_context(
@@ -746,6 +1091,7 @@ class DataflowValidator:
             repo_root=repo_path,
         )
 
+        dataflow_methodology = load_methodology("personas/security_researcher.md")
         system = (
             "You are an expert security researcher analyzing dataflow vulnerabilities.\n\n"
             "The user message contains dataflow path details from a CodeQL finding, "
@@ -759,6 +1105,8 @@ class DataflowValidator:
             "5. Bypass Strategy: If there are barriers, how can they be bypassed?\n"
             "6. Prerequisites: What conditions must be met for successful exploitation?"
         )
+        if dataflow_methodology:
+            system += "\n\n" + dataflow_methodology
 
         blocks = []
         if dataflow.message:
@@ -794,16 +1142,22 @@ class DataflowValidator:
                 origin="smt:path-feasibility",
             ))
 
-        # Optional sanitizer-evidence block. Off by default; activated
-        # when DataflowValidator is constructed with an evidence_collector
-        # (PR1c-3 wires the production extractor). System prompt gets the
-        # interpretation instructions only when a block was actually built.
+        # Optional evidence block. Off by default; activated when
+        # DataflowValidator is constructed with an evidence_collector.
+        # The collector may return SanitizerEvidence (PR1 V2 LLM extractor
+        # — injection-class findings) or an UntrustedBlock directly
+        # (source_intel structural evidence — memory-corruption findings).
+        # System prompt gets per-kind interpretation instructions only
+        # when a block was actually built.
         evidence_block = _build_sanitizer_evidence_block(
             self._evidence_collector, dataflow, repo_path, self.logger
         )
         if evidence_block is not None:
             blocks.append(evidence_block)
-            system = system + SANITIZER_EVIDENCE_INSTRUCTIONS
+            if evidence_block.kind == "source-intel-evidence":
+                system = system + SOURCE_INTEL_EVIDENCE_INSTRUCTIONS
+            else:
+                system = system + SANITIZER_EVIDENCE_INSTRUCTIONS
 
         slots = {
             "rule_id": TaintedString(value=dataflow.rule_id, trust="untrusted"),
@@ -840,35 +1194,61 @@ class DataflowValidator:
                 task_type=TaskType.ANALYSE,
             )
 
-            # Parse response
-            validation = DataflowValidation(**response_dict)
+            # Parse response — filter to declared fields so extra
+            # keys returned by the LLM don't cause TypeError. "error"
+            # is validator-owned state, never an LLM-settable field.
+            _valid_keys = {
+                f.name for f in _dataclass_fields(DataflowValidation)
+            } - {"error", "smt_diagnostics"}
+            validation = DataflowValidation(**{
+                k: v for k, v in response_dict.items() if k in _valid_keys
+            })
+            # Path bookkeeping is ours, not the LLM's — overwrite
+            # anything the response happened to carry.
+            validation.smt_path_index = active_index
+            validation.smt_paths_checked = smt_paths_checked
+            validation.smt_diagnostics = smt_diagnostics
 
             self.logger.info(
-                f"Dataflow validation: exploitable={validation.is_exploitable}, "
-                f"confidence={validation.confidence:.2f}"
+                "Dataflow validation: exploitable=%s, confidence=%.2f",
+                validation.is_exploitable,
+                validation.confidence
             )
 
             # Record cheap-vs-full agreement for the scorecard.
             # ``full_says_fp`` for dataflow = full said NOT
             # exploitable. Same shape as autonomous_analyzer's
-            # is_true_positive negation.
-            full_says_fp = not validation.is_exploitable
-            record_prefilter_outcome(
-                self.llm.scorecard,
-                decision_class=decision_class,
-                model=fast_model_name,
-                cheap_says_fp=cheap_says_fp,
-                full_says_fp=full_says_fp,
-                cheap_reasoning=cheap_reasoning,
-                full_reasoning=validation.reasoning,
-            )
+            # is_true_positive negation — including the abstention
+            # guard: the dict-splat construction above lets a
+            # model-emitted literal null land as None despite the
+            # bool annotation, and there is no full verdict to
+            # compare the cheap claim against.
+            if validation.is_exploitable is None:
+                self.logger.debug(
+                    "dataflow validation abstained on is_exploitable "
+                    "— skipping prefilter outcome record",
+                )
+            else:
+                full_says_fp = not validation.is_exploitable
+                record_prefilter_outcome(
+                    self.llm.scorecard,
+                    decision_class=decision_class,
+                    model=fast_model_name,
+                    cheap_says_fp=cheap_says_fp,
+                    full_says_fp=full_says_fp,
+                    cheap_reasoning=cheap_reasoning,
+                    full_reasoning=validation.reasoning,
+                    repo=repo_path,
+                )
 
             return validation
 
-        except Exception as e:
-            self.logger.error(f"Dataflow validation failed: {e}")
+        except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the pipeline
+            self.logger.error("Dataflow validation failed: %s", e)
 
-            # Return conservative default
+            # Explicit error state: an LLM/transport failure is not a
+            # not-exploitable verdict — consumers must not gate exploit
+            # analysis off is_exploitable when error is set.
             return DataflowValidation(
                 is_exploitable=False,
                 confidence=0.0,
@@ -876,16 +1256,21 @@ class DataflowValidator:
                 bypass_possible=False,
                 bypass_strategy=None,
                 attack_complexity="high",
-                reasoning=f"Validation failed: {str(e)}",
+                reasoning=f"Validation failed: {e!s}",
                 barriers=["Analysis failed"],
-                prerequisites=[]
+                prerequisites=[],
+                error=str(e) or type(e).__name__,
+                smt_path_index=active_index,
+                smt_paths_checked=smt_paths_checked,
+                smt_diagnostics=smt_diagnostics,
             )
 
     def validate_finding(
         self,
-        sarif_result: Dict,
-        repo_path: Path
-    ) -> Optional[DataflowValidation]:
+        sarif_result: dict,
+        repo_path: Path,
+        *, observation_out_dir: Path | None = None,
+    ) -> DataflowValidation | None:
         """
         Validate a SARIF finding if it contains dataflow.
 
@@ -904,10 +1289,12 @@ class DataflowValidator:
             return None
 
         # Validate the path
-        return self.validate_dataflow_path(dataflow, repo_path)
+        if observation_out_dir is None:
+            return self.validate_dataflow_path(dataflow, repo_path)
+        return self.validate_dataflow_path(dataflow, repo_path, observation_out_dir=observation_out_dir)
 
 
-def main():
+def main() -> None:
     """CLI entry point for testing."""
     import argparse
 
@@ -938,7 +1325,7 @@ def main():
     # validator = DataflowValidator(llm_client)
     # validation = validator.validate_finding(finding, Path(args.repo))
 
-    print(f"Dataflow validation would analyze finding:")
+    print("Dataflow validation would analyze finding:")
     print(f"  Rule: {finding.get('ruleId')}")
     print(f"  Message: {finding.get('message', {}).get('text')}")
     print(f"  Has dataflow: {bool(finding.get('codeFlows'))}")
